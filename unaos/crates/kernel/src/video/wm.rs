@@ -30284,3 +30284,16 @@ fn alloc_slot(t: &mut Table) -> Option<usize> {
     ROWS_HWM.store(t.rows.len(), core::sync::atomic::Ordering::Release);
     Some(t.rows.len() - 1)
 }
+
+/// DIALOG2 (rmbp-ledger B404): `owner`'s frontmost (highest-z) window — the anchor a bus SHEET slides from.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn front_of_owner(owner: u64) -> Option<WinId> {
+    let t = table();
+    let mut best: Option<(u32, WinId)> = None;
+    for r in t.rows.iter() {
+        if r.used && !r.compat && r.owner_asid == owner && best.map_or(true, |(z, _)| r.z >= z) {
+            best = Some((r.z, r.id));
+        }
+    }
+    best.map(|b| b.1)
+}

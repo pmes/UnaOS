@@ -449,8 +449,8 @@ FORBID :: LOGOUTUI: .* -> FAIL
 FORBID \[users\] logout REFUSED session=root reason=no-users$
 REQUIRE :: LOGOUTDESK: closed=\d+ kernel=\d+ remaining=0 -> PASS ::
 FORBID :: LOGOUTDESK: .* -> FAIL
-# NOTICE — the OS's notice surface: two notices back to back (the second queues), both dismissed by the OK path.
-REQUIRE :: NOTICE: title=Fixture-A lines=2 queued=1 shown=1 dismissed=1 -> PASS ::
+# NOTICE — DIALOG2 (B404): THE router — information becomes a toast, an error the alert (dismissed by its default); the screen never opens.
+REQUIRE :: NOTICE: title=Fixture-A to=toast:1 error=dialog:1 dismissed=1 screen=0 -> PASS ::
 FORBID :: NOTICE: .* -> FAIL
 # SCREENLOCK: lock without ending the session — name read-only, wrong refused, right unlocks, furniture untouched.
 REQUIRE :: SCREENLOCK: user=una locked=1 windows_kept=\d+ wrong=refused unlock=ok furniture_reignited=0 -> PASS ::
@@ -472,7 +472,6 @@ REQUIRE :: FIRSTBOOT-LOGIN: user=una screen_first=true root_wrong=refused wrong=
 FORBID :: FIRSTBOOT-LOGIN: .* -> FAIL
 # LOGINFLOW2 M2/M3 — LOGOUTUI M4 ("logout" in `tests`): the refused alert closes on OK; Log Out -> screen over an empty desktop ->
 # login -> furniture back; LOGOUTDESK-REIGNITE: the session that opens over a swept desktop posts console + shell.
-REQUIRE :: LOGOUTUI: close=ok -> PASS ::
 REQUIRE :: LOGOUT: alert_open=true alert_ok_closes=true session=true screen_back_empty=true relogin=true furniture_back=true -> PASS ::
 FORBID :: LOGOUT: .* -> FAIL
 REQUIRE :: LOGOUTDESK: windows_closed=\d+ reignited=2 console=posted shell=posted -> PASS ::

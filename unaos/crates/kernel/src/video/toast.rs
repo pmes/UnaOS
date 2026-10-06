@@ -10,11 +10,10 @@
 //! the row opens and closes in [`service`] (the storage pass, beside the dialog's). Witness:
 //! `[toast] show title=<t> ms=3000 focus=kept win=<n>` and `[toast] closed by=timeout title=<t>`.
 //!
-//! Also here: the GLASS-LAUNCH provenance `Program stopped` needs — the dock/Quarry verb drain arms
-//! [`note_glass`], the x86 background spawn consumes it into a per-slot bit ([`note_spawn`]), and the fault's
-//! notice reads it for the faulting slot ([`current_is_glass`]).
+//! Also here: the GLASS-LAUNCH provenance `Program stopped` needs — DIALOG2 (B404): read from the spawn's
+//! explicit origin (`crate::origin`, stamped per slot by [`note_spawn`]) for the faulting slot ([`current_is_glass`]).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::{metrics, theme, wm};
 
@@ -27,7 +26,7 @@ const LL: usize = 52;
 const QCAP: usize = 4;
 
 #[derive(Clone, Copy)]
-struct T {
+pub struct T {
     title: [u8; TL],
     tl: u8,
     line: [u8; LL],
@@ -214,25 +213,17 @@ pub fn fixture() -> bool {
 }
 
 // ── glass-launch provenance (`Program stopped` is a dialog only for a program launched from the glass) ──
+//
+// DIALOG2 (B404): the provenance is EXPLICIT now — `crate::origin` (the launch runs inside `origin::with(Glass, …)`,
+// the typed line inside `origin::with(Door, …)`); the 3 s timing window is gone.
 
-/// `arch::ms()` of the last glass launch handed to the shell (the dock's / Quarry's verb drain); `0` none.
-static GLASS_ARMED: AtomicU64 = AtomicU64::new(0);
-/// Per user slot: launched from the glass (bit set) or typed / autostarted (clear).
-static GLASS_SLOTS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// The dock / Quarry handed a launch line to the shell. DIALOG2: a no-op — the drain that runs the line holds the
+/// GLASS scope itself (`main.rs`'s dock drain); kept because the dock's two call sites are DOCK2's lines.
+pub fn note_glass(_verb: &str) {}
 
-/// The dock / Quarry handed a launch line to the shell: the next spawn within 3 s is the glass's.
-pub fn note_glass(_verb: &str) {
-    GLASS_ARMED.store(crate::arch::ms().max(1), Ordering::Release);
-}
-
-/// A background program took `slot`: it is the glass's when a glass launch is armed (consumed), else not.
+/// A program took `slot`: stamp it with the origin in scope (`[spawn] origin=<glass/door/system> slot=<n>`).
 pub fn note_spawn(slot: usize) {
-    let a = GLASS_ARMED.swap(0, Ordering::AcqRel);
-    let glass = a != 0 && crate::arch::ms().saturating_sub(a) < 3000;
-    if slot < 256 {
-        let (w, b) = (slot / 64, 1u64 << (slot % 64));
-        if glass { GLASS_SLOTS[w].fetch_or(b, Ordering::AcqRel); } else { GLASS_SLOTS[w].fetch_and(!b, Ordering::AcqRel); }
-    }
+    let _ = crate::origin::note_spawn(slot);
 }
 
 /// The faulting (current) task's slot was launched from the glass. Atomics only (the fault path).
@@ -240,8 +231,50 @@ pub fn current_is_glass() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         if let Some(s) = crate::arch::memory::current_slot() {
-            return s < 256 && GLASS_SLOTS[s / 64].load(Ordering::Acquire) & (1u64 << (s % 64)) != 0;
+            return crate::origin::of_slot(s) == Some(crate::origin::Origin::Glass);
         }
     }
     false
+}
+
+// ── DIALOG2 fixture helpers (model-only: the dialog's `fixture2` counts what the router queued here) ──
+
+/// Expire the toast on the glass at the next service pass (the fixture's clock).
+pub fn expire_now() {
+    let mut g = TQ.lock();
+    if g.cur.is_some() {
+        g.until = 1;
+    }
+}
+
+/// Toasts waiting (not counting the one showing).
+pub fn queued() -> usize {
+    TQ.lock().n
+}
+
+/// Drop the queue (the fixture's own posts).
+pub fn fixture_drain() {
+    TQ.lock().n = 0;
+}
+
+type Held = ([T; QCAP], usize, Option<T>, wm::WinId, u64, bool);
+
+/// Hold the real queue aside and go model-only; [`fixture_hold_restore`] puts it back.
+pub fn fixture_hold(headless: bool) -> Held {
+    let was = HEADLESS.swap(headless, Ordering::Relaxed);
+    let mut g = TQ.lock();
+    let s = (g.q, g.n, g.cur.take(), core::mem::replace(&mut g.win, wm::WIN_NONE), g.until, was);
+    g.n = 0;
+    s
+}
+
+pub fn fixture_hold_restore(s: Held) {
+    let mut g = TQ.lock();
+    g.q = s.0;
+    g.n = s.1;
+    g.cur = s.2;
+    g.win = s.3;
+    g.until = s.4;
+    drop(g);
+    HEADLESS.store(s.5, Ordering::Relaxed);
 }

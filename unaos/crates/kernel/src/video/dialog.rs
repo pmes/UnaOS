@@ -52,6 +52,10 @@ pub enum Act {
     None,
     /// 1 restart, 2 shut down, 3 log out, 9 the fixture's (acts on nothing).
     Power(u8),
+    /// DIALOG2: a ring-3 (bus) dialog — the answer goes to the owner's input ring with this token.
+    Reply(u8),
+    /// DIALOG2: TEXTEDIT's close sheet (Don't Save · Cancel · Save).
+    EditClose,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,7 +73,8 @@ pub struct Dlg {
     ml: u8,
     info: [[u8; ML]; IL],
     il: [u8; IL],
-    pub btn: [&'static str; 3],
+    bl: [[u8; BL]; 3],
+    bll: [u8; 3],
     pub nb: u8,
     /// The cancel button's index (Esc); `None` = Esc answers the default (a one-button alert).
     pub cancel: Option<u8>,
@@ -82,8 +87,15 @@ pub struct Dlg {
     /// The person caused it (a crystal pick): it may take focus.
     pub user: bool,
     pub act: Act,
-    pub title: &'static [u8],
+    ttl: [u8; TL],
+    tl: u8,
+    /// DIALOG2: raised over the login screen (the power row): the dialog holds the modal ceiling while up.
+    pub screen: bool,
 }
+
+/// DIALOG2: a button label's and the window title's bounds (owned: a bus caller's bytes, a notice's title).
+const BL: usize = 16;
+const TL: usize = 24;
 
 fn copy(dst: &mut [u8; ML], s: &[u8]) -> u8 {
     let n = s.len().min(ML);
@@ -96,23 +108,35 @@ fn copy(dst: &mut [u8; ML], s: &[u8]) -> u8 {
 impl Dlg {
     /// A dialog with `message` and up to three `\n`-separated informative lines; buttons left to right, the
     /// LAST is the default.
-    pub fn new(icon: Icon, title: &'static [u8], message: &[u8], info: &[u8], btn: &[&'static str]) -> Dlg {
-        let mut d = Dlg { icon, msg: [0; ML], ml: 0, info: [[0; ML]; IL], il: [0; IL], btn: [""; 3], nb: 0, cancel: None, owner: 0, sheet_win: wm::WIN_NONE, countdown_s: 0, user: false, act: Act::None, title };
+    pub fn new(icon: Icon, title: &[u8], message: &[u8], info: &[u8], btn: &[&[u8]]) -> Dlg {
+        let mut d = Dlg { icon, msg: [0; ML], ml: 0, info: [[0; ML]; IL], il: [0; IL], bl: [[0; BL]; 3], bll: [0; 3], nb: 0, cancel: None, owner: 0, sheet_win: wm::WIN_NONE, countdown_s: 0, user: false, act: Act::None, ttl: [0; TL], tl: 0, screen: false };
+        let n = title.len().min(TL);
+        for (i, &b) in title[..n].iter().enumerate() {
+            d.ttl[i] = if (0x20..0x7f).contains(&b) { b } else { b'?' };
+        }
+        d.tl = n as u8;
         d.ml = copy(&mut d.msg, message);
         for (i, line) in info.split(|&b| b == b'\n').take(IL).enumerate() {
             d.il[i] = copy(&mut d.info[i], line);
         }
         let n = btn.len().clamp(1, 3);
         for i in 0..n {
-            d.btn[i] = if i < btn.len() { btn[i] } else { "OK" };
+            let l: &[u8] = if i < btn.len() && !btn[i].is_empty() { btn[i] } else { b"OK" };
+            let k = l.len().min(BL);
+            for (j, &b) in l[..k].iter().enumerate() {
+                d.bl[i][j] = if (0x20..0x7f).contains(&b) { b } else { b'?' };
+            }
+            d.bll[i] = k as u8;
         }
         d.nb = n as u8;
         if n >= 2 {
-            d.cancel = Some(0);
+            d.cancel = Some((0..n as u8).find(|&i| d.btn(i) == b"Cancel").unwrap_or(0)); // DIALOG2: Esc is the button named Cancel (Don't Save · Cancel · Save), else the leftmost
         }
         d
     }
     pub fn message(&self) -> &[u8] { &self.msg[..self.ml as usize] }
+    pub fn title(&self) -> &[u8] { &self.ttl[..self.tl as usize] }
+    pub fn btn(&self, i: u8) -> &[u8] { &self.bl[i as usize][..self.bll[i as usize] as usize] }
     pub fn info_lines(&self) -> usize { self.il.iter().filter(|&&l| l != 0).count() }
     pub fn default_ix(&self) -> u8 { self.nb.saturating_sub(1) }
     fn resolve(&self, a: Answer) -> u8 {
@@ -235,7 +259,7 @@ fn paint(d: &Dlg, left_s: u32) {
         fill(px, x, by + h - 1, w, 1, theme::FRAME_LINE);
         fill(px, x, by, 1, h, theme::FRAME_LINE);
         fill(px, x + w - 1, by, 1, h, theme::FRAME_LINE);
-        let l = d.btn[i as usize].as_bytes();
+        let l = d.btn(i);
         let tw = metrics::ladvance(l, false, crate::video::text::Face::Ui);
         text(px, x + w.saturating_sub(tw) / 2, by + 5, l, if def { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT }, false);
     }
@@ -281,8 +305,11 @@ fn open_pending() {
             paint(&d, d.countdown_s);
             let (sw, sh) = (metrics::size(W), metrics::size(H));
             let start_y = y.saturating_sub(slide as usize * metrics::size(SLIDE_PX));
-            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title, x, start_y);
+            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y);
             if win != wm::WIN_NONE {
+                if d.screen {
+                    wm::set_modal_top(win); // DIALOG2: over the login screen — the ceiling is the dialog's while it is up
+                }
                 let _ = wm::present(win);
                 let mut g = ST.lock();
                 g.win = win;
@@ -299,11 +326,11 @@ fn open_pending() {
         FOCUS_THEFT.fetch_add(1, Ordering::Relaxed); // unreachable by `should_focus`; counted so a regression reads on the wire
     }
     let _ = deadline;
-    let kind = match d.act { Act::Power(_) => "power", Act::None => "alert" };
+    let kind = match d.act { Act::Power(_) => "power", Act::None => "alert", Act::Reply(_) => "bus", Act::EditClose => "save" };
     let action = power_word(d.act);
     serial_println!(
-        "[dialog] open kind={} action={} owner={} sheet={} focus={} countdown_s={} buttons={} default=right win={}",
-        kind, action, d.owner, sheet as u8, if take { "taken" } else { "kept" }, d.countdown_s, d.nb, win
+        "[dialog] open kind={} action={} owner={} sheet={} focus={} countdown_s={} buttons={} default=right screen={} win={}",
+        kind, action, d.owner, sheet as u8, if take { "taken" } else { "kept" }, d.countdown_s, d.nb, d.screen as u8, win
     );
 }
 
@@ -312,8 +339,9 @@ fn power_word(a: Act) -> &'static str {
         Act::Power(1) => "restart",
         Act::Power(2) => "shutdown",
         Act::Power(3) => "logout",
+        Act::Power(4) => "sleep",
         Act::Power(_) => "fixture",
-        Act::None => "-",
+        Act::None | Act::Reply(_) | Act::EditClose => "-",
     }
 }
 
@@ -327,7 +355,12 @@ pub fn answer(a: Answer) {
         (d, w)
     };
     if win != wm::WIN_NONE {
+        wm::clear_modal_top(win);
         wm::close(win);
+    }
+    #[cfg(feature = "login")]
+    if d.screen {
+        crate::video::crystal::login::screen_regain(); // DIALOG2: the login screen takes its ceiling back
     }
     let ix = d.resolve(a);
     let ok = ix == d.default_ix() && !(a == Answer::Cancel && d.cancel.is_some());
@@ -342,7 +375,12 @@ pub fn answer(a: Answer) {
             }
         }
         Act::None => {
-            serial_println!("[dialog] answer={} button={} title={}", word, d.btn[ix as usize], core::str::from_utf8(d.title).unwrap_or("?"));
+            serial_println!("[dialog] answer={} button={} title={}", word, core::str::from_utf8(d.btn(ix)).unwrap_or("?"), core::str::from_utf8(d.title()).unwrap_or("?"));
+        }
+        Act::Reply(token) => reply(d.owner, token, ix, word),
+        Act::EditClose => {
+            serial_println!("[dialog] answer={} button={} title={}", word, core::str::from_utf8(d.btn(ix)).unwrap_or("?"), core::str::from_utf8(d.title()).unwrap_or("?"));
+            crate::video::textedit::close_answer(ix);
         }
     }
     open_pending();
@@ -488,13 +526,22 @@ fn unsaved_line(out: &mut [u8; ML]) -> usize {
 /// SHUT DOWN / RESTART / LOG OUT (`kind` 1/2/3, 9 = the fixture's, which acts on nothing): the confirm, with its
 /// 60 s countdown, opened now (window-safe callers: the crystal's press). `true` when it was raised.
 pub fn power_confirm(kind: u8) -> bool {
+    power_confirm_at(kind, false)
+}
+
+/// DIALOG2: the same confirm, raised OVER the login screen (its power row): the dialog holds the modal ceiling.
+pub fn power_confirm_on_screen(kind: u8) -> bool {
+    power_confirm_at(kind, true)
+}
+
+fn power_confirm_at(kind: u8, screen: bool) -> bool {
     let (msg, info, verb): (&[u8], &[u8], &'static str) = match kind {
         1 => (b"Are you sure you want to restart your computer now?", b"If you do nothing, the computer will restart", "Restart"),
         2 => (b"Are you sure you want to shut down your computer now?", b"If you do nothing, the computer will shut down", "Shut Down"),
         3 => (b"Are you sure you want to quit all apps and log out now?", b"If you do nothing, you will be logged out", "Log Out"),
         _ => (b"Fixture: confirm a power action?", b"If you do nothing, the fixture proceeds", "Proceed"),
     };
-    let mut d = Dlg::new(Icon::System, b"UnaOS", msg, info, &["Cancel", verb]);
+    let mut d = Dlg::new(Icon::System, b"UnaOS", msg, info, &[b"Cancel", verb.as_bytes()]);
     if kind == 3 {
         let mut l = [0u8; ML];
         let n = unsaved_line(&mut l);
@@ -505,6 +552,7 @@ pub fn power_confirm(kind: u8) -> bool {
     d.countdown_s = POWER_COUNTDOWN_S;
     d.user = true;
     d.act = Act::Power(kind);
+    d.screen = screen;
     if !post(d) {
         serial_println!("[power] confirm action={} refused (a dialog is already pending)", power_word(d.act));
         return false;
@@ -523,7 +571,7 @@ pub fn post_program_stopped(name: &[u8]) -> bool {
             n += 1;
         }
     }
-    post(Dlg::new(Icon::Stop, b"Program stopped", &m[..n], b"The program was stopped by a fault.\nIts windows have closed.", &["OK"]))
+    post(Dlg::new(Icon::Stop, b"Program stopped", &m[..n], b"The program was stopped by a fault.\nIts windows have closed.", &[b"OK"]))
 }
 
 // ── `tests notice` (M4): the anatomy, the default on the right, Esc, app-modal, the focus rule, the confirm ──
@@ -534,7 +582,7 @@ pub fn fixture() -> (bool, bool, bool, bool, u32, bool) {
     let saved = { let mut g = ST.lock(); (g.cur.take(), g.pend.take(), core::mem::replace(&mut g.win, wm::WIN_NONE), g.deadline) };
     let theft0 = FOCUS_THEFT.load(Ordering::Relaxed);
     // anatomy + default=right
-    let d = Dlg::new(Icon::Caution, b"Fixture", b"Bold message", b"informative one\ninformative two", &["Cancel", "OK"]);
+    let d = Dlg::new(Icon::Caution, b"Fixture", b"Bold message", b"informative one\ninformative two", &[b"Cancel", b"OK"]);
     let anatomy = d.icon == Icon::Caution && d.message() == b"Bold message" && d.info_lines() == 2 && d.nb == 2 && d.cancel == Some(0);
     let right = btn_rect(d.default_ix(), d.nb).0 > btn_rect(0, d.nb).0 && btn_rect(d.default_ix(), d.nb).0 + BW + 20 == W;
     // Esc = cancel, Return = default
@@ -578,4 +626,245 @@ pub fn fixture() -> (bool, bool, bool, bool, u32, bool) {
     }
     HEADLESS.store(was, Ordering::Relaxed);
     (anatomy && passes, right, esc && ret, modal && rule, theft, confirm)
+}
+
+// ── DIALOG2 (rmbp-ledger B404) — every notice SORTED: errors are this alert, information is a toast ──────────
+//
+// The login screen's Alert window is gone. Every caller that used it (`users::screen_notice` for the paths that
+// may not open a window — xHCI, a fault, the store, wincap — and the window-safe Quarry / prtscr / powerui /
+// refused Log Out) calls [`notice`], which reads the ONE sorting table [`SORTED`]. Queue-only on every path.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// An operation failed or was refused: the alert, app-modal to the owner it concerns.
+    Error,
+    /// Something happened: a toast (3 s, top right, no focus).
+    Info,
+}
+
+/// THE sorting table. An untabled title is INFORMATION (the Trash two-step, Get Info).
+pub const SORTED: [(&[u8], Kind); 7] = [
+    (b"Quarry", Kind::Error),
+    (b"Storage read-only", Kind::Error),
+    (b"Log Out", Kind::Error),
+    (b"Screenshot saved", Kind::Info),
+    (b"USB stick removed", Kind::Info),
+    (b"Low Battery", Kind::Info),
+    (b"Too many windows", Kind::Info),
+];
+
+pub fn kind_of(title: &[u8]) -> Kind {
+    SORTED.iter().find(|e| e.0 == title).map(|e| e.1).unwrap_or(Kind::Info)
+}
+
+static TO_DIALOG: AtomicU32 = AtomicU32::new(0);
+static TO_TOAST: AtomicU32 = AtomicU32::new(0);
+
+/// The owner (and sheet window) an error concerns: a Quarry refusal is a sheet on the Quarry window.
+fn owner_of_error(title: &[u8]) -> (u64, wm::WinId, bool) {
+    #[cfg(feature = "quarry")]
+    if title == b"Quarry" {
+        return (super::quarry::live::OWNER, super::quarry::live::win(), false);
+    }
+    (0, wm::WIN_NONE, title == b"Log Out") // the refused Log Out: the person's own pick (crystal or `logout`) — it may take focus
+}
+
+/// THE notice entry (queue-only: no heap, no `wm`): `text` is up to three `\n` lines. `Program stopped` keeps
+/// DIALOG's rule (a dialog only for a program the person launched from the glass), read from the explicit origin.
+pub fn notice(title: &[u8], text: &[u8]) -> bool {
+    if title == b"Program stopped" {
+        let glass = super::toast::current_is_glass();
+        serial_println!("[dialog] program-stopped glass={} -> {}", glass as u8, if glass { "dialog" } else { "toast" });
+        return if glass { post_program_stopped(text) } else { super::toast::post(title, text) };
+    }
+    let kind = kind_of(title);
+    serial_println!("[notice] route title={} kind={} -> {}", core::str::from_utf8(title).unwrap_or("?"), if kind == Kind::Error { "error" } else { "info" }, if kind == Kind::Error { "dialog" } else { "toast" });
+    match kind {
+        Kind::Error => {
+            TO_DIALOG.fetch_add(1, Ordering::Relaxed);
+            let mut d = Dlg::new(Icon::Caution, title, title, text, &[b"OK"]);
+            let (owner, sheet, user) = owner_of_error(title);
+            d.owner = owner;
+            d.sheet_win = sheet;
+            d.user = user;
+            post(d)
+        }
+        Kind::Info => {
+            TO_TOAST.fetch_add(1, Ordering::Relaxed);
+            super::toast::post(title, text)
+        }
+    }
+}
+
+/// Model-only mode for another module's fixture (the LOGOUT fixture): returns the previous setting.
+pub fn headless(on: bool) -> bool {
+    HEADLESS.swap(on, Ordering::Relaxed)
+}
+
+/// Open what is pending now (window-safe callers that must see it up at once: the refused Log Out, fixtures).
+pub fn open_now() {
+    open_pending();
+}
+
+/// The dialog on the glass, if any: (title, owner, sheet).
+pub fn current() -> Option<([u8; TL], usize, u64, bool)> {
+    ST.lock().cur.map(|d| (d.ttl, d.tl as usize, d.owner, d.sheet_win != wm::WIN_NONE))
+}
+
+// ── over the login screen (the power row's confirm) ──
+
+/// A dialog raised over the login screen is up: every key and press is its (the screen is modal anyway).
+pub fn over_screen() -> bool {
+    ST.try_lock().map(|g| g.cur.map(|d| d.screen).unwrap_or(false)).unwrap_or(false)
+}
+
+/// The screen's keys while [`over_screen`]: Return / Esc answer; the rest is swallowed (an alert takes no text).
+pub fn screen_key(c: u8) -> bool {
+    let _ = route_key(c, true);
+    true
+}
+
+// ── the bus verbs: a ring-3 program raises its OWN alert / sheet / toast ──
+
+static BUS_POSTED: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// `BUS_VERB_DIALOG` / `SHEET` / `TOAST` for the kernel-stamped `owner` (the wm key: x86 slot+1, aarch64 asid;
+/// `0` = the door). The reply is status-only and immediate; a dialog's ANSWER arrives later as
+/// `INPUT_EV_DIALOG_ANSWER` on the owner's input ring. `-16` while another dialog is pending, `-22` malformed.
+pub fn bus_fulfil(verb: u8, owner: u64, body: &[u8]) -> i64 {
+    let Some(r) = una_abi::dialog_parse(body) else { return -22 };
+    let mut name = [0u8; wm::MAX_TITLE];
+    let n = if owner != 0 { wm::app_name_of(owner, &mut name) } else { 0 };
+    let title: &[u8] = if n == 0 { b"Program" } else { &name[..n] };
+    let vw = match verb { una_abi::BUS_VERB_SHEET => "sheet", una_abi::BUS_VERB_TOAST => "toast", _ => "dialog" };
+    serial_println!("[dialog] bus verb={} owner={} token={} buttons={}", vw, owner, r.token, r.nb);
+    let ix = match verb { una_abi::BUS_VERB_DIALOG => 0, una_abi::BUS_VERB_SHEET => 1, _ => 2 };
+    BUS_POSTED[ix].fetch_add(1, Ordering::Relaxed);
+    if verb == una_abi::BUS_VERB_TOAST {
+        return if super::toast::post(title, r.message) { 0 } else { -16 };
+    }
+    let mut d = Dlg::new(Icon::Caution, title, r.message, r.info, &r.buttons[..(r.nb.max(1) as usize)]);
+    d.owner = owner;
+    d.act = Act::Reply(r.token);
+    if verb == una_abi::BUS_VERB_SHEET {
+        d.sheet_win = front_of(owner);
+    }
+    if post(d) { 0 } else { -16 }
+}
+
+/// The owner's frontmost window (the sheet's anchor), `WIN_NONE` when it has none (the sheet is then free-standing).
+fn front_of(owner: u64) -> wm::WinId {
+    if owner == 0 {
+        return wm::WIN_NONE;
+    }
+    wm::front_of_owner(owner).unwrap_or(wm::WIN_NONE)
+}
+
+static REPLIED: AtomicU32 = AtomicU32::new(0);
+
+/// Deliver a bus dialog's answer to its poster's input ring (by identity, never to the focused slot).
+fn reply(owner: u64, token: u8, ix: u8, word: &str) {
+    let ev = una_abi::dialog_answer_pack(token, ix);
+    let user = owner != 0 && owner < wm::KERNEL_OWNER_BASE;
+    #[cfg(target_arch = "x86_64")]
+    let delivered = user && !HEADLESS.load(Ordering::Relaxed) && crate::arch::x86_64::syscall::user_input_push_owner(owner, ev);
+    #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
+    let delivered = user && !HEADLESS.load(Ordering::Relaxed) && crate::arch::aarch64::syscall::user_input_push_owner(owner, ev);
+    #[cfg(all(target_arch = "aarch64", not(any(feature = "baremetal", feature = "tegra_el0"))))]
+    let delivered = { let _ = (user, ev); false };
+    REPLIED.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[dialog] answer={} button={} token={} owner={} delivered={}", word, ix, token, owner, delivered as u8);
+}
+
+/// DIALOG2's model-only proof for `tests notice`: (errors routed to the dialog, information routed to the toast,
+/// the three bus verbs each raised their kind and a dialog's answer came back with its token).
+pub fn fixture2() -> (u32, u32, u32) {
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let saved = { let mut g = ST.lock(); (g.cur.take(), g.pend.take(), core::mem::replace(&mut g.win, wm::WIN_NONE), g.deadline) };
+    let tsaved = super::toast::fixture_hold(true);
+    // every SORTED row: an error opens the alert (and is answered), information queues a toast
+    let (mut errs, mut infos) = (0u32, 0u32);
+    for (title, kind) in SORTED.iter() {
+        let (d0, t0) = (TO_DIALOG.load(Ordering::Relaxed), super::toast::queued());
+        let _ = notice(title, b"fixture line");
+        open_pending();
+        match kind {
+            Kind::Error => {
+                let up = matches!(current(), Some((t, n, _, _)) if &t[..n] == *title);
+                if up && TO_DIALOG.load(Ordering::Relaxed) == d0 + 1 {
+                    errs += 1;
+                }
+                answer(Answer::Default);
+            }
+            Kind::Info => {
+                if !is_up() && super::toast::queued() == t0 + 1 {
+                    infos += 1;
+                }
+                super::toast::fixture_drain();
+            }
+        }
+    }
+    // the three bus verbs: dialog (answered with its token), sheet, toast
+    let mut verbs = 0u32;
+    let mut b = [0u8; 96];
+    let r0 = REPLIED.load(Ordering::Relaxed);
+    if let Some(n) = una_abi::dialog_body(9, b"Save changes?", b"fixture", &[b"Don't Save", b"Cancel", b"Save"], &mut b) {
+        if bus_fulfil(una_abi::BUS_VERB_DIALOG, 0x4242, &b[..n]) == 0 {
+            open_pending();
+            let ok = ST.lock().cur.map(|d| d.nb == 3 && d.act == Act::Reply(9) && d.btn(2) == b"Save").unwrap_or(false);
+            answer(Answer::Default);
+            if ok && REPLIED.load(Ordering::Relaxed) == r0 + 1 && LAST.load(Ordering::Relaxed) == 1 {
+                verbs += 1;
+            }
+        }
+        if bus_fulfil(una_abi::BUS_VERB_SHEET, 0x4242, &b[..n]) == 0 {
+            open_pending();
+            if ST.lock().cur.map(|d| d.owner == 0x4242).unwrap_or(false) && blocks_owner(0x4242) {
+                verbs += 1;
+            }
+            answer(Answer::Cancel);
+        }
+        let t0 = super::toast::queued();
+        if bus_fulfil(una_abi::BUS_VERB_TOAST, 0x4242, &b[..n]) == 0 && super::toast::queued() == t0 + 1 && !is_up() {
+            verbs += 1;
+        }
+        super::toast::fixture_drain();
+    }
+    let malformed = bus_fulfil(una_abi::BUS_VERB_DIALOG, 0x4242, &[1, 3, b'x']) == -22;
+    super::toast::fixture_hold_restore(tsaved);
+    {
+        let mut g = ST.lock();
+        g.cur = saved.0;
+        g.pend = saved.1;
+        g.win = saved.2;
+        g.deadline = saved.3;
+    }
+    HEADLESS.store(was, Ordering::Relaxed);
+    (errs, infos, if malformed { verbs } else { 0 })
+}
+
+/// `dialog <alert|sheet|toast> <message>` — the door drives the SAME fulfiller the bus verbs reach (owner 0: the
+/// answer is said on the wire, `[dialog] answer=… token=0 owner=0 delivered=0`). The shell runs on the render task
+/// (window-safe), so the alert opens at once.
+pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
+    let verb = match args.first().copied().unwrap_or("") {
+        "alert" | "dialog" => una_abi::BUS_VERB_DIALOG,
+        "sheet" => una_abi::BUS_VERB_SHEET,
+        "toast" => una_abi::BUS_VERB_TOAST,
+        _ => {
+            console.println("usage: dialog <alert|sheet|toast> <message>");
+            return;
+        }
+    };
+    let msg = args[1..].join(" ");
+    let mut b = [0u8; 192];
+    let Some(n) = una_abi::dialog_body(0, msg.as_bytes(), b"raised at the door", &[b"Cancel", b"OK"], &mut b) else {
+        console.println("dialog: the message is too long");
+        return;
+    };
+    let st = bus_fulfil(verb, 0, &b[..n]);
+    if st == 0 {
+        open_pending();
+    }
+    console.println(&alloc::format!("dialog: {} status={}", args[0], st));
 }

@@ -1084,7 +1084,7 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
 pub fn screen_key(c: u8) -> bool {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
-        if !crate::video::crystal::login::is_open() && crate::video::dialog::key(c) { return true; } // DIALOG (B395): the alert's Return/Esc — only while it (or its owner app) holds focus; the login screen first
+        if crate::video::dialog::over_screen() { return crate::video::dialog::screen_key(c); } if !crate::video::crystal::login::is_open() && crate::video::dialog::key(c) { return true; } // DIALOG2 (B404): the login power row's confirm, over the screen, takes every key while up. DIALOG (B395): the alert's Return/Esc — only while it (or its owner app) holds focus; the login screen first
         return crate::video::crystal::login::consume_key(c);
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1126,7 +1126,7 @@ pub fn screen_key(c: u8) -> bool {
 pub fn screen_press(x: i32, y: i32) -> bool {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
-        if !crate::video::crystal::login::is_open() && crate::video::dialog::press(x, y) { return true; } // DIALOG (B395): the alert's buttons, and the app-modal block on its owner's windows; the login screen first
+        if crate::video::dialog::over_screen() { let _ = crate::video::dialog::press(x, y); return true; } if !crate::video::crystal::login::is_open() && crate::video::dialog::press(x, y) { return true; } // DIALOG2 (B404): over the screen the dialog answers its own presses and swallows the rest. DIALOG (B395): the alert's buttons, and the app-modal block on its owner's windows; the login screen first
         return crate::video::crystal::login::press_swallow(x, y);
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -2755,7 +2755,7 @@ fn store_mount() -> Result<FatFs, FatError> {
 /// on the next key through the screen's pump. A no-op where no desktop is built.
 pub fn screen_notice(title: &[u8], text: &[u8]) {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    crate::video::crystal::login::notice_post(title, text);
+    let _ = crate::video::dialog::notice(title, text); // DIALOG2 (B404): THE router (queue-only) — an error is the alert, information a toast
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let _ = (title, text);
 }
