@@ -315,3 +315,5 @@ pub mod origin;
 pub mod sync;
 // SMALLFIX3 (rmbp-ledger B416): the fold's unique-code checks, the fixture arcs for `tests list` / `help tests`, `tests smallfix3`. Tail statement.
 pub mod smallfix3;
+// SMALLFIX4 (rmbp-ledger B466): `tests smallfix4` — the wave's minted codes unique, a path launch's name. Tail statement.
+pub mod smallfix4;
