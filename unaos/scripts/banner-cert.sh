@@ -306,6 +306,7 @@ beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured
 ftdirx|:: FTDIRX: first byte rx=|-|measured
 usbnet|:: USBNET: bus=xhci slot=|-|measured
 gen7r8|:: gen7: r8 begin rung=R8 wake=|-|measured
+gen7blit|:: GEN7BLIT2: impl=bcs|-|measured
 nvidia-kepler-kfbind|:: KFBIND: pbdma[|-|measured
 nvidia-kepler-kdhead|:: KDHEAD: end rung=KD14|-|measured
 nvidia-kepler-ctrladdr|:: kepler: ctrladdr |-|measured

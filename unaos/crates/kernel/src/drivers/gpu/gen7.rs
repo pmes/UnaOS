@@ -7081,6 +7081,8 @@ pub unsafe fn bank(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8) {
 /// GPUTESTS M1: `tests gen7` — R1..R7 from the boot bank, then R8 (gen7r8), one witness line each.
 pub fn ladder_test() {
     ladder::run();
+    #[cfg(feature = "gen7blit")]
+    blit::test(); // GEN7B (B422): the BCS job, the display capture, KCOMP's second-blitter decision
 }
 
 mod ladder {
@@ -7116,6 +7118,12 @@ mod ladder {
 
     pub(super) fn note_r7(v: &'static str) {
         *R7.lock() = Some(v);
+    }
+
+    /// GEN7B (B422): R7's verdict this boot, for the BCS job's R19 gate.
+    #[cfg(feature = "gen7blit")]
+    pub(super) fn r7_verdict() -> Option<&'static str> {
+        *R7.lock()
     }
 
     fn us_since(t0: u64) -> u64 {
@@ -7177,3 +7185,9 @@ mod ladder {
         super::r8::test();
     }
 }
+
+// GEN7B (B422): the BCS as KCOMP's second `Blitter` — a child of this module so it is built from R7/R8's
+// own helpers. CHARTER line in the file.
+#[cfg(feature = "gen7blit")]
+#[path = "gen7_blit.rs"]
+pub mod blit;
