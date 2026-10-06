@@ -83,8 +83,23 @@ struct Foreign {
 }
 
 static FOREIGN: crate::sync::Mutex<Vec<Foreign>> = crate::sync::Mutex::new(Vec::new());
+/// APPTRUST2 (B478): a session grant is bound to WHAT was trusted, not where it was — the volume's VOLID fingerprint
+/// (`MountTable::volume_id`, what `same_storage` compares), the path, and APPRES's stamp (`<mtime>:<size>`).
+#[derive(Clone, PartialEq)]
+pub struct Bind {
+    pub vol: Option<u64>,
+    pub stamp: String,
+}
+
+/// One `Open` the user said this session.
+#[derive(Clone)]
+struct Grant {
+    path: String,
+    bind: Bind,
+}
+
 /// Programs the user said `Open` to this session (RAM; nothing outlives the boot).
-static GRANTS: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
+static GRANTS: crate::sync::Mutex<Vec<Grant>> = crate::sync::Mutex::new(Vec::new());
 /// Dialogs posted by [`request`].
 static ASKS: AtomicU32 = AtomicU32::new(0);
 
@@ -117,16 +132,42 @@ pub fn foreign_rows(mt: &MountTable, mime: &str) -> Vec<(Registrant, String)> {
     foreign_rows_by(mime, |p| mt.stat(p).is_ok())
 }
 
-/// Did the user say `Open` to `prog` this session?
-pub fn granted(prog: &str) -> bool {
-    GRANTS.lock().iter().any(|g| g == prog)
+/// The program at `prog` as it is NOW: its volume's fingerprint and its stamp (`-` when it does not stat).
+pub fn bind_of(mt: &MountTable, prog: &str) -> Bind {
+    let vol = mt.volume_id(prog).ok().flatten();
+    let stamp = mt.stat(prog).map(|s| alloc::format!("{}:{}", s.mtime.unwrap_or(0), s.size)).unwrap_or_else(|_| String::from("-"));
+    Bind { vol, stamp }
 }
 
-fn grant(prog: &str) {
+fn vol_word(v: Option<u64>) -> String {
+    v.map(|x| alloc::format!("{}", x)).unwrap_or_else(|| String::from("none"))
+}
+
+/// Did the user say `Open` to THIS program (same volume, path and stamp) this session? A grant at the path whose
+/// volume or stamp differs is a different program: it is dropped (said on the wire) and the caller asks again.
+pub fn granted_bound(prog: &str, b: &Bind) -> bool {
     let mut g = GRANTS.lock();
-    if !g.iter().any(|x| x == prog) {
-        g.push(String::from(prog));
+    let Some(i) = g.iter().position(|x| x.path == prog) else { return false };
+    if g[i].bind == *b {
+        return true;
     }
+    let why = if g[i].bind.vol != b.vol { "volume" } else { "stamp" };
+    serial_println!("[apptrust] grant stale path={} reason={} was={}/{} now={}/{} -> ask", prog, why, vol_word(g[i].bind.vol), g[i].bind.stamp, vol_word(b.vol), b.stamp);
+    g.remove(i);
+    false
+}
+
+/// Did the user say `Open` to `prog` this session (any binding; the test's read)?
+pub fn granted(prog: &str) -> bool {
+    GRANTS.lock().iter().any(|g| g.path == prog)
+}
+
+fn grant(prog: &str, volume: &str, b: &Bind) {
+    let mut g = GRANTS.lock();
+    g.retain(|x| x.path != prog);
+    g.push(Grant { path: String::from(prog), bind: b.clone() });
+    drop(g);
+    serial_println!("[apptrust] grant volume={}#{} path={} stamp={}", volume, vol_word(b.vol), prog, b.stamp);
 }
 
 fn leaf(p: &str) -> &str {
@@ -179,7 +220,7 @@ pub struct Ask {
 }
 
 /// `true` = Open (granted), `false` = Copy to Apps.
-static ASKING: crate::sync::Mutex<Option<Ask>> = crate::sync::Mutex::new(None);
+static ASKING: crate::sync::Mutex<Option<(Ask, Bind)>> = crate::sync::Mutex::new(None);
 static PENDING: crate::sync::Mutex<Option<(Ask, bool)>> = crate::sync::Mutex::new(None);
 
 /// A pick of the foreign `prog` for `file`: `true` = granted this session already (the caller opens now);
@@ -187,12 +228,13 @@ static PENDING: crate::sync::Mutex<Option<(Ask, bool)>> = crate::sync::Mutex::ne
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn request(a: Ask) -> bool {
     use crate::video::dialog::{self, Act, Dlg, Icon};
-    if granted(&a.prog) {
+    let bind = bind_of(&crate::shell::vfs_mount_table(), &a.prog); // APPTRUST2 (B478): what is trusted is bound at the ask
+    if granted_bound(&a.prog, &bind) {
         serial_println!("[apptrust] open prog={} file={} granted=session", a.prog, a.file);
         return true;
     }
-    let msg = alloc::format!("Open {} with {} from {}?", leaf(&a.file), leaf(&a.prog), a.volume);
-    let info = alloc::format!("{} is on {}, not on the system volume.\nOpen trusts it until you log out.\nCopy to Apps installs it (administrator).", leaf(&a.prog), a.volume);
+    let msg = if a.file == a.prog { alloc::format!("Open {} from {}?", leaf(&a.prog), a.volume) } else { alloc::format!("Open {} with {} from {}?", leaf(&a.file), leaf(&a.prog), a.volume) };
+    let info = alloc::format!("{} is on {}, not on the system volume.\nOpen trusts this copy of it until you log out.\nCopy to Apps installs it (administrator).", leaf(&a.prog), a.volume);
     let mut d = Dlg::new(Icon::Caution, b"Open With", msg.as_bytes(), info.as_bytes(), &[b"Copy to Apps", b"Open", b"Cancel"]);
     d.user = true;
     d.act = Act::Hook(answer as fn(bool) as usize);
@@ -200,7 +242,7 @@ pub fn request(a: Ask) -> bool {
         let mut g = ASKING.lock();
         let p = dialog::post(d);
         if p {
-            *g = Some(a.clone());
+            *g = Some((a.clone(), bind));
         }
         p
     };
@@ -215,7 +257,7 @@ pub fn request(a: Ask) -> bool {
 /// Copy to Apps from Esc.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn answer(ok: bool) {
-    let Some(a) = ASKING.lock().take() else { return };
+    let Some((a, bind)) = ASKING.lock().take() else { return };
     let ix = crate::video::dialog::last_button();
     let word = match (ok, ix) {
         (false, 0) => "copy",
@@ -225,7 +267,7 @@ fn answer(ok: bool) {
     serial_println!("[apptrust] answer={} prog={}", word, a.prog);
     match word {
         "open" => {
-            grant(&a.prog);
+            grant(&a.prog, &a.volume, &bind);
             *PENDING.lock() = Some((a, true));
         }
         "copy" => *PENDING.lock() = Some((a, false)),
@@ -307,7 +349,7 @@ pub fn selftest() {
         let _ = mt.unlink(&sig_obj, KERNEL_PRINCIPAL);
     }
     FOREIGN.lock().retain(|x| x.path != fpath);
-    GRANTS.lock().retain(|g| g != fpath && !g.ends_with("PROBE2.ELF"));
+    GRANTS.lock().retain(|g| g.path != fpath && !g.path.ends_with("PROBE2.ELF"));
     crate::fs::appres::forget(fpath);
     crate::fs::appres::forget(rpath);
 
