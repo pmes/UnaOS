@@ -19604,3 +19604,7 @@ pub fn service_ehci_hid_pump() {
 /// TRACKPADPANE (rmbp-ledger B412) — the Trackpad pane's gesture stage (speed gain, two-finger scroll, secondary
 /// click, tap to click, three-finger drag), applied after `mt_step` on the vendor route. Tail append.
 pub mod tpgest;
+
+/// BTKEYSEAL (rmbp-ledger B446) — the bond store's link keys as Holocron records (the kernel asks Holocron's verbs). Tail append.
+#[cfg(feature = "btc")]
+pub mod btkeyseal;
