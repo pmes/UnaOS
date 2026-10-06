@@ -798,3 +798,11 @@ the startup volume: on this firmware that is the operator's `bless` from Recover
 (R3, rmbp-ledger A4). And whether this machine's picker lists a FAT volume that is not ESP-typed is a
 **firmware fact we have not measured** — `docs/dev/OS/10_INSTALL/partition-install.md` marks it
 metal-unproven and `--as-esp` exists as the answer if it turns out to be required.
+
+### SECREVIEW (2026-10-06, rmbp-ledger B442 — adversarial review of merge17; findings in `dev/review/SEC-2026-10-06.md`)
+- [x] **F1 HIGH — leaked UI surfaces sliced past their allocation after a live scale rise** (`dialog`, `notify`, `bezel`, `instgui`, `login` `surf()`; trigger: Settings > Display, `dpi::set_live`). Patched: `video::metrics::leaked_surf` keeps the capacity in word 0 and grows. Metal-pending.
+- [x] **F2 MEDIUM — ring 3 (even `anon`) could retag the root's ownerless system trees** (`/system/types/<mime>` `una:opener`, `/apps`, `/lib`). Patched at the one fulfiller: `attrsys::system_tree` → `-EACCES` for a non-kernel `do_set`. The ownerless-is-public ACL posture itself stays owed (ROOTACL).
+- [ ] **F3 MEDIUM — R99's gate is VFS-only** — raw `FatFs` writers (`USERS.DAT`, holocron store, the FAT-LFN boot witness, `src extract`) mutate the sacred boot FAT; `fat_unlock` has no production caller and asks no authority. Arc BOOTFATSEAM.
+- [ ] **F4 MEDIUM — Principia's bus verbs are namespace-blind** — any session program sets `vein.*` / `system.login.items` / `system.display.mode` and replaces another program's PrefDeclare stanza; the kernel's declared map is uncapped. Arc PREFSCAP.
+- [ ] **F5 MEDIUM (HIGH once `wifi2` uploads) — Wi-Fi microcode unpinned, searchable on a removable volume, `violates-layout` still staged.** Arc FWPIN.
+- [ ] **F6 LOW — `quarry/live.rs` views a `Vec<u8>` as `[u32]` on an alignment the allocator does not promise.** One-line `Vec<u32>`.
