@@ -195,7 +195,7 @@ const _: () = assert!(ENV_A_Q16 + ENV_B_Q16 == 65536);
 /// is what `palette.content_fill` rounds to as well. `theme.rs` and engine.md §9 both state the
 /// two agree by construction and that the paper reads its base from `CONTENT_FILL`; this is the
 /// tripwire that says so out loud if a future kit ever separates them.
-const _: () = assert!(theme::content_fill() == crate::video::theme::fixture::PAPER_BASE);
+const _: () = assert!(theme::CONTENT_FILL == crate::video::theme::fixture::PAPER_BASE); // const context: the Light kit value (APPEARANCE)
 
 // ---------------------------------------------------------------------------
 // The tile

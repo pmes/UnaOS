@@ -42,7 +42,7 @@ const OFF_VOLUME: [&str; 2] = ["boot", "volumes"];
 /// The directory `tests rootdisk` makes and removes to prove `rmdir` (ROOTDISK2).
 const RMDIR_PROBE: &str = "rootdisk2-probe";
 
-static COMPAT_HITS: AtomicU32 = AtomicU32::new(0);
+static COMPAT_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static COMPAT_SAID: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// `path` below `prefix` at a component boundary: the remainder (`/` for the prefix itself).
