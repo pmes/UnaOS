@@ -358,7 +358,7 @@ pub fn answer(a: Answer) {
     if d.screen {
         crate::video::crystal::login::screen_regain(); // DIALOG2: the login screen takes its ceiling back
     }
-    let ix = d.resolve(a);
+    let ix = d.resolve(a); LAST_IX.store(ix as u32, Ordering::Relaxed);
     let ok = ix == d.default_ix() && !(a == Answer::Cancel && d.cancel.is_some());
     LAST.store(match a { Answer::Expired => 3, _ if ok => 1, Answer::Cancel => 2, _ => if Some(ix) == d.cancel { 2 } else { 4 } }, Ordering::Relaxed);
     let word = match a { Answer::Expired => "expired", _ if ok => "ok", _ => "cancel" };
@@ -868,4 +868,11 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
         open_pending();
     }
     console.println(&alloc::format!("dialog: {} status={}", args[0], st));
+}
+
+/// APPTRUST (B467): the index of the button the last answer resolved to (an `Act::Hook`'s `fn(bool)` only says
+/// default-or-not; a three-button ask with Cancel the default reads which of the others was pressed here).
+static LAST_IX: AtomicU32 = AtomicU32::new(0);
+pub fn last_button() -> u8 {
+    LAST_IX.load(Ordering::Relaxed) as u8
 }
