@@ -271,6 +271,7 @@ pub fn build(why: &str) -> usize {
     BUILDS.fetch_add(1, Ordering::Relaxed);
     match seed_in(&mt) {
         Ok((n, f)) => {
+            let _ = crate::fs::rootacl::stamp(&mt); // ROOTACL (B456): the system trees take the `system` owner once the registry is built
             serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} ms={}", why, TYPES_DIR, n, f,
                 known_types_in(&mt).len(), crate::arch::ms().saturating_sub(t0));
             n

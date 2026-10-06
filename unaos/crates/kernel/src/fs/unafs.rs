@@ -1410,7 +1410,7 @@ pub fn read_authz(fs: &mut KernelUnaFS, live_id: u64, principal: &str) -> ReadAu
         return ReadAuthz::Permit;
     }
     let owner = match ino.attributes.get("owner") {
-        Some(AttributeValue::String(s)) => s.clone(),
+        Some(AttributeValue::String(s)) if s != crate::fs::rootacl::SYSTEM_OWNER => s.clone(), // ROOTACL (B456): `system` reads for everyone
         // No owner row: a public live object, readable by all (unchanged public
         // semantics). Only ABSENCE OF THE OBJECT (above) fails closed.
         _ => return ReadAuthz::Permit,
