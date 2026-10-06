@@ -768,3 +768,17 @@ pub fn blit_icon_known(px: &mut [u32], stride: usize, h: usize, x: usize, y: usi
 pub fn knows(key: &str) -> bool {
     builtin_app(key).is_some() || REG.try_lock().map(|r| r.iter().any(|a| a.key == key)).unwrap_or(false)
 }
+
+/// SMALLFIX4 item 11 (PREFSCAP fold) — the NAME a program launched by `path` answers to, from APPRES: its
+/// signature's last dotted segment (`org.unaos.lumen` → `lumen`), else its declared name when that is one
+/// token, else `None` (the launcher falls back to `wm::program_name(path)`). A FACT, no UI — the arming is
+/// `wm::app_name_arm_launch`'s.
+pub fn launch_name(path: &str) -> Option<String> {
+    let a = app_at(path)?;
+    let seg = a.signature.rsplit('.').next().unwrap_or("").trim();
+    if !seg.is_empty() && seg.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return Some(seg.to_ascii_lowercase());
+    }
+    let n = a.name.trim();
+    (!n.is_empty() && !n.contains(' ') && !n.contains('.')).then(|| n.to_ascii_lowercase())
+}

@@ -209,7 +209,7 @@ fn spawn_step(img: &[u8]) {
     FAULT_PID.store(0, Ordering::Release);
     crate::serial_line::line_watch_arm(FIRST);
     let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(img) {
-        Ok(t) => t,
+        Ok(t) => { crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1 as u64), IMAGE); t } // SMALLFIX4 item 11: a path launch arms its APPRES name
         Err(e) => {
             crate::serial_line::line_watch_disarm();
             serial_println!(":: LUMENCRASH: reason=spawn-refused ({}) ::", e);
