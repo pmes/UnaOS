@@ -50,3 +50,21 @@ No second drop-down, no second store.
 - Network Turn Off/On: no driver arm exists for usbnet or wifi; the row is shown disabled ("owed").
 - The sink's name: hda::vol carries no codec name; the row says "HDA output".
 - Items toggled in Settings (MACPARITY row 3 "settable"): SETTINGS' schema row, not this arc.
+
+## Built (d8171694 / b00b4645 / 9dcf067c + M4)
+- No new knob: the tray rides the desktop gate (`wc` on x86, `desktop_firmware` on aarch64) beside
+  `status`/`crystal`/`menubar`.
+- Files: `video/status.rs` (Tray tail), `video/statusmenu.rs` (new, `CHARTER: Kernel — wm`),
+  `video/crystal.rs` (panel-mode glue: row press, switch, anchor, slider/grid rows, `statusmenu::generation`
+  in the damage signature), `video/menubar.rs` (slots, paint, press cells, witness), `video/powerui.rs`
+  (`panel_set_lines`), `video/keymap.rs` (`set_pc`/`pc_selected`, read by `active()`), `smolnet.rs`
+  (`lease_ip`), `video/desktop_uefi.rs` (`tray_publish` beside `status::poll`).
+- What the next flight should print (rMBP, no dongle, codec up, RTC anchor):
+  `:: STATUSTRAY: items=5 drawn=4 menus=4 volume=12/16 net=none input=us clock=synced ::`
+  (dongle in with link: `drawn=5 … net=up`); pressing the clock: `[statusmenu] open item=clock rows=9 x=…`
+  and `:: SHARD-MENU: crystal_press=open via=status-clock …`; the volume slider:
+  `[statusmenu] pick item=volume row=1 -> level volume=<n>/16 muted=0 table=crispy`;
+  `tests statustray` -> `:: STATUSTRAY-T: volume=ok slider=ok mute=ok net=ok input=ok clock=ok unset=ok absent=ok … -> PASS ::`.
+- Fold notes: APPEARANCE2 turns `theme::CONST` into accessor calls — statusmenu.rs/menubar.rs tray code
+  uses `theme::ACCENT`, `FRAME_LINE`, `TITLE_TEXT_ACTIVE`, `TITLE_TEXT_INACTIVE`, `BEVEL_LIGHT` (convert at
+  the fold). NOTIFY's band under the bar is untouched (the status panel hangs from the bar like the SHARD menu).
