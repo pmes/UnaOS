@@ -319,6 +319,10 @@ pub fn ignite() {
 }
 
 pub fn selected() -> &'static dyn Blitter {
+    #[cfg(all(target_arch = "x86_64", feature = "gen7blit"))]
+    if SEL_BCS.load(Acquire) {
+        return &crate::drivers::gpu::gen7::blit::BCS; // GEN7B (B422): armed only by `tests gen7`'s decision
+    }
     if SEL_GPU.load(Acquire) {
         &GPU
     } else {
@@ -516,4 +520,24 @@ pub fn selftest() {
         fallback_ok as u8,
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ---- GEN7B (B422) — the second-blitter slot: the Ivy Bridge BCS beside the Kepler CE --------------------
+// The trait and the selection are KCOMP's; the BCS impl is `drivers/gpu/gen7_blit.rs`. The slot is armed
+// only by `tests gen7`'s decision (self-test passed, fastest on the same fixture, AND the hot path's
+// destination is IGD-addressable — never while the gmux gives the panel to the Kepler) and is demoted by a
+// stall, exactly as the CE's `Timeout` demotes `SEL_GPU`.
+#[cfg(all(target_arch = "x86_64", feature = "gen7blit"))]
+static SEL_BCS: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(target_arch = "x86_64", feature = "gen7blit"))]
+pub fn arm_bcs() {
+    IGNITED.store(true, Release);
+    SEL_BCS.store(true, Release);
+    crate::bootlog_println!("[wc] blitter=bcs reason=gen7blit2-armed");
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gen7blit"))]
+pub fn demote_bcs() {
+    SEL_BCS.store(false, Release);
 }

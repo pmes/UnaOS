@@ -1,4 +1,4 @@
-//! CHARTER: Kernel — kernel-by-ruling
+//! CHARTER: Kernel — kernel-by-ruling (B416 SMALLFIX3: the fold's unique-code checks are the kernel's own)
 //!
 //! SMALLFIX3 (rmbp-ledger B416) — the merge17 fold's hygiene, the parts that live in code:
 //!

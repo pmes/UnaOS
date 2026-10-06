@@ -164,6 +164,7 @@ pub mod bootlog;
 // that happens before `apic::calibrate`. Always linked, never gated: the ledger has to exist in the
 // build that actually boots on metal.
 pub mod bootpace;
+pub mod perf; // PERFREVIEW (B443): the `[perf]` budget line at login
 
 pub mod pal;
 pub mod ui;

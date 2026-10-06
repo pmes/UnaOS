@@ -359,7 +359,7 @@ pub fn resolve_edge(
 /// [`super::theme::PC_BINDINGS`] is a change to this function and to nothing else. Such a knob is
 /// NOT this arc — the PC table exists to prove the seam and is selected by nothing.
 pub fn active() -> &'static Table {
-    super::theme::CRISPY_BINDINGS
+    if PC_ROLE.load(core::sync::atomic::Ordering::Relaxed) { super::theme::PC_BINDINGS } else { super::theme::CRISPY_BINDINGS } // STATUSTRAY (B426): the input item's one toggle selects the PC table (R61's Command-role swap)
 }
 
 // --- fixture ---------------------------------------------------------------------------------
@@ -487,4 +487,30 @@ pub fn note_mods(m: u8) {
 /// WINRESIZE M2 — is Shift down per the latest HID report (either side)?
 pub fn shift_held() -> bool {
     HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_SHIFT != 0
+}
+
+// ── STATUSTRAY (B426) — the input item's toggle: the R61 Command-role swap ────────────────────────────
+//
+// `active()` is the ONE selection site; this flag is what it reads. Off = CRISPY (Command = the GUI key on
+// the Apple keyboard); on = PC (Command's role is played by Alt). Boot-static, not persisted: a preference
+// is Principia's (R79), and the Settings row that stores it is owed to SETTINGS, not invented here.
+static PC_ROLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Select the PC table (`true`) or the Mac table (`false`). Returns the table now active.
+pub fn set_pc(on: bool) -> &'static Table {
+    PC_ROLE.store(on, core::sync::atomic::Ordering::Relaxed);
+    let t = active();
+    serial_println!("[keymap] table={} cmd_role={} via=statustray", t.name, if t.cmd_role == HID_MOD_GUI { "gui" } else if t.cmd_role == HID_MOD_ALT { "alt" } else { "other" });
+    t
+}
+
+/// True while the PC table is selected.
+pub fn pc_selected() -> bool {
+    PC_ROLE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// DRAGDROP (B440) — is Option down per the latest HID report (either side)? Option is physically `HID_MOD_ALT`
+/// on both shipped tables; a drag reads it at the drop (Option forces a copy).
+pub fn option_held() -> bool {
+    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_ALT != 0
 }

@@ -13,9 +13,11 @@ buffer in **linear** floating-point. Three container paths are supported:
   [`zune-jpeg`](https://crates.io/crates/zune-jpeg). Hand-rolling these codecs is
   explicitly not this crate's value; lux wraps them and normalizes their output
   into the shared `RgbBuffer` contract.
-- **Sony ARW** (a TIFF/EXIF container) — parsed in-crate: it walks the TIFF
-  header and image file directories (IFDs), locates the raw sensor data, decodes
-  it to a Bayer plane, demosaics that plane to RGB, and normalizes to linear.
+- **Sony ARW** (a TIFF/EXIF container) — RAWCORE (B444): read by `raw_core`
+  (`unaos/libs/media/raw_core`, the `no_std` core the kernel links through
+  pixel_core) and re-exported by `lux::parser`: the TIFF/IFD walk, the raw strip
+  (uncompressed, or Sony cRAW — Compression 32767, 8 bits), a bilinear demosaic,
+  normalized to linear.
 
 `lux::decode` sniffs the container from its magic bytes and dispatches to the
 right path; the per-format entry points (`decode_png`, `decode_jpeg`,
@@ -25,28 +27,18 @@ Because PNG and JPEG store sRGB-encoded samples while `RgbBuffer` is defined as
 linear, the common-format decoders convert every sample through the sRGB EOTF
 (`lux::color`) so all three paths land in the same linear space.
 
-The crate is `#![no_std]`-free host code: it relies on `std`, uses
-[`rayon`](https://crates.io/crates/rayon) to parallelize the demosaic step, and
-declares [`memmap2`](https://crates.io/crates/memmap2) so callers can feed a
+The crate is `#![no_std]`-free host code: it relies on `std` (the ARW path is
+raw_core's, single-threaded since RAWCORE), and declares [`memmap2`](https://crates.io/crates/memmap2) so callers can feed a
 memory-mapped file directly as the input slice.
 
 ## Responsibilities
 
-- **Container parsing.** Read the TIFF header (`II`/`MM` endianness marker, magic
-  `42`, first-IFD offset) and walk up to ten IFDs, extracting `ImageWidth` (256),
-  `ImageLength` (257), `Compression` (259), `StripOffsets` (273), and
-  `StripByteCounts` (279). IFD traversal is bounded and offsets are range-checked
-  to reject corrupt files.
-- **Raw decoding.** Two compression paths are handled:
-  - *Uncompressed* (`Compression == 1`): the raw strip is wrapped zero-copy as a
-    little-endian 16-bit-per-pixel slice.
-  - *ARW2 lossless* (`Compression == 32769`): a baseline block decoder reads the
-    Sony bit-stream (4-bit table index, 11-bit base value, 7-bit signed deltas).
-- **Demosaic.** `demosaic_bilinear` reconstructs three color channels per pixel
-  using bilinear interpolation, assuming an RGGB Bayer pattern. The pass is
-  parallelized per row with Rayon.
-- **Normalization.** Output samples are scaled by the 14-bit maximum (`16383.0`)
-  into linear RGB `f32` in the range `0.0..=1.0`.
+- **ARW** — `raw_core` owns the container, the strips, the preview, the EXIF
+  facts and the demosaic (see its crate docs and
+  `docs/dev/evidence/rmbp-1005/rawcore.md`); `lux::parse_arw` adapts its
+  mosaic to the linear-f32 `RgbBuffer`.
+- **PNG / JPEG** — the `png` and `zune-jpeg` crates, converted to linear
+  through `lux::color` (chicken wire under R83 until pixel_core replaces them).
 
 ## Public API
 
@@ -91,19 +83,11 @@ including an ARW whose header names implausibly large dimensions.
 
 ## Status
 
-**PNG + JPEG: supported. ARW: partial.**
+**PNG + JPEG: supported. ARW: through raw_core (RAWCORE, B444).**
 
 - PNG and JPEG decode to linear `RgbBuffer` via `png` / `zune-jpeg`, with
   format sniffing and dispatch (`decode` / `sniff_format`).
-- TIFF/IFD parsing, the uncompressed ARW path, the RGGB bilinear demosaic, and
-  the `RgbBuffer`/`LuxError` API are implemented. Image dimensions read from tags
-  are now fenced (`≤ 512 MP`, non-zero) before any allocation keyed on them, so a
-  malformed ARW can no longer drive a multi-gigabyte allocation.
-- **ARW2 lossless decoding is unstable.** It is a simplified baseline decoder: it
-  assumes a fixed 16-pixel block layout and does not implement Sony's adaptive
-  max/min delta tables, so the per-block delta bit-width is not honored. Output
-  for genuinely compressed ARW2 files should be treated as approximate and may be
-  visibly wrong; the uncompressed path is the reliable one today.
-- The Bayer pattern is hard-coded to RGGB and the bit depth to 14-bit; other CFA
-  patterns (`UnsupportedCFA`) and bit depths are not yet detected. No RAW formats
-  beyond Sony ARW are supported.
+- ARW: uncompressed and Sony cRAW (Compression 32767, 8 bits) strips, the
+  bilinear demosaic, dimensions fenced (512 MP) before any allocation — all in
+  raw_core, proven on a SYNTHETIC ARW until a real file is committed. Owed: the
+  colour matrix, white balance, lossless-JPEG raw (Compression 7), ARW1.

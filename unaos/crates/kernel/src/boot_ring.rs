@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! CHARTER: Kernel — shared-core (FLIGHTRING B400, R88: the ONE ring of the boot's text both arches' serial seams feed; the console and `UNAOS.LOG` read it)
+//! CHARTER: Kernel — kernel-by-ruling (FLIGHTRING B400, R88: the ONE ring of the boot's text both arches' serial seams feed; the console and `UNAOS.LOG` read it)
 //!
 //! FLIGHTRING (rmbp-ledger B400). The boot's text, kept in ONE ring fed from each arch's one serial print seam
 //! (x86 `arch/x86_64/serial.rs::_print` through `flight_recorder::capture`; aarch64 `arch/aarch64/serial.rs::_print`).

@@ -80,6 +80,10 @@ pub(super) fn refresh(force: bool) {
         let present = matches!(mt.stat(p), Ok(s) if matches!(s.kind, crate::fs::vfs::NodeKind::Dir));
         rows.push(Ent { label: String::from(*l), path: p.clone(), removable: false, present });
     }
+    for p in super::dragdrop::user_favorites() { // DRAGDROP (B440): the folders the user dropped on Favorites (Principia's `system.quarry.favorites`)
+        let present = matches!(mt.stat(&p), Ok(s) if matches!(s.kind, crate::fs::vfs::NodeKind::Dir));
+        rows.push(Ent { label: String::from(p.rsplit('/').next().unwrap_or(&p)), path: p, removable: false, present });
+    }
     rows.push(Ent { label: String::from("Locations"), path: String::new(), removable: false, present: false });
     let removable = crate::fs::removable::mounted_names();
     if let Ok((true, vols)) = super::collect(crate::fs::bootdisk::VOLUMES) {

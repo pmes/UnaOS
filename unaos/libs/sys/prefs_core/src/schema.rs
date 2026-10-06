@@ -79,6 +79,8 @@ pub enum Writer {
     /// The operator: the kernel `pref set` verb, a session program's PREF_SET / host `PrefSet`, a hand
     /// edit of the file.
     Operator,
+    /// The kernel Quarry window (`video/quarry/dragdrop.rs`: a folder dropped on the sidebar's Favorites).
+    Quarry,
 }
 
 impl Writer {
@@ -89,6 +91,7 @@ impl Writer {
             Writer::Keys => "keys",
             Writer::WallpaperVerb => "wallpaper-verb",
             Writer::Operator => "operator",
+            Writer::Quarry => "quarry",
         }
     }
 }
@@ -218,7 +221,17 @@ pub static SCHEMA: &[Key] = &[
     Key {
         ns: "system", key: "notify.dnd", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings], reader: "kernel NOTIFY (`video/notify.rs`)",
-        doc: "Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows) (NOTIFY, MACPARITY row 24). Edited in Settings > General > Do Not Disturb.",
+        doc: "Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows, no sound) (NOTIFY, MACPARITY row 24). Edited in Settings > Notifications; stored in settings/notify (NOTIFYPANE B435).",
+    },
+    Key {
+        ns: "system", key: "notify.dnd_from", kind: Kind::Int { min: 0, max: 23 }, default: Default::Int(0),
+        writers: &[Writer::Settings], reader: "kernel NOTIFYPANE (`video/notifypane.rs`)",
+        doc: "Do Not Disturb's schedule: the local hour it starts (0..23); equal to `notify.dnd_until` = no schedule (NOTIFYPANE B435).",
+    },
+    Key {
+        ns: "system", key: "notify.dnd_until", kind: Kind::Int { min: 0, max: 23 }, default: Default::Int(0),
+        writers: &[Writer::Settings], reader: "kernel NOTIFYPANE (`video/notifypane.rs`)",
+        doc: "Do Not Disturb's schedule: the local hour it ends (0..23, wrapping midnight); equal to `notify.dnd_from` = no schedule (NOTIFYPANE B435).",
     },
     Key {
         ns: "system", key: "pointer.speed", kind: Kind::Int { min: 0, max: 2 }, default: Default::Int(1),
@@ -232,9 +245,15 @@ pub static SCHEMA: &[Key] = &[
         doc: "Battery percent at which the machine shuts down; 0 = off.",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 6 }, default: Default::Int(0),
+        ns: "system", key: "quarry.favorites", kind: Kind::Str { max_len: 512, printable: true },
+        default: Default::Consumer("none — the sidebar's six built-in favorites only"),
+        writers: &[Writer::Quarry], reader: "kernel Quarry sidebar (`video/quarry/sidebar.rs`)",
+        doc: "Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18).",
+    },
+    Key {
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 8 }, default: Default::Int(0),
         writers: &[Writer::Settings], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {

@@ -166,16 +166,7 @@ fn close(now: u64) {
 static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn surf() -> &'static mut [u32] {
     let n = metrics::size(W) * metrics::size(H);
-    let mut p = SURF_AT.load(Ordering::Acquire);
-    if p == 0 {
-        let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice());
-        p = match SURF_AT.compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => b.as_mut_ptr() as usize,
-            Err(won) => won,
-        };
-    }
-    // SAFETY: one leaked buffer of `n` words, painted on the desktop pass, read by `wm`'s composite.
-    unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) }
+    metrics::leaked_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// Physical-pixel painter over the surface (`pw` x `ph`). Shapes test each pixel's centre in LOGICAL px x16

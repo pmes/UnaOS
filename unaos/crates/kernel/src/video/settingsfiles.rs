@@ -26,6 +26,8 @@ fn domains_of(tab: usize) -> Option<&'static str> {
         0 => Some("sound, trackpad, desktop, general"),
         2 => Some("display"),
         4 => Some("login"),
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        t if t == super::settings::NP_TAB => Some("notify"), // NOTIFYPANE (B435)
         _ => None,
     }
 }

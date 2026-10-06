@@ -351,3 +351,20 @@ pub fn going(action: &str) {
     serial_println!(":: POWER: action={} windows_closed={} flushed={} hda_stopped={} -> going ::", action,
         PRE_WIN.load(Ordering::Relaxed), PRE_FLUSH.load(Ordering::Relaxed) as u8, PRE_HDA.load(Ordering::Relaxed) as u8);
 }
+
+// LOGINWINDOW (B430) — the SLEEP lane's two entry points, declared as STUBS until LIDSLEEP (B431) lands: LIDSLEEP's
+// fold REPLACES both bodies (the login window's Sleep button and its greying call only these). `unarmed` = no sleep
+// ladder in this tree; the caller greys the button and says so on the wire.
+/// Sleep the machine (LIDSLEEP's ladder). Returns the lane's word: `unarmed` until LIDSLEEP's fold.
+pub fn sleep_request() -> &'static str {
+    // LIDSLEEP (B431) at the merge18 fold: the backlight-only sleep; S3 is not this arc and the line says so.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    { return crate::video::lidsleep::sleep_request("loginwindow").word(); }
+    #[allow(unreachable_code)]
+    "unarmed"
+}
+
+/// `true` when [`sleep_request`] would act (the login window's Sleep button is live, not greyed).
+pub fn sleep_armed() -> bool {
+    cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))) // LIDSLEEP (B431): the lane blanks the backlight today; the lid ladder itself arms after rung 0 flies
+}

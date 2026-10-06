@@ -15,13 +15,17 @@
 //!   carries the unread count (`menubar::bell_*`), and a press on it opens the Center: the ring newest first,
 //!   grouped by app, with `Clear`.
 //! - **Do Not Disturb** is Principia's `system.notify.dnd` (R79: a preference is Principia's), toggled in Settings >
-//!   General; on, a notification collects silently (the badge counts it, no card shows).
+//!   Notifications (NOTIFYPANE B435; it was a General row); on — or inside its schedule — a notification
+//!   collects silently (the badge counts it, no card shows, no sound).
+//! - **Per-app rules and the alert sound** (NOTIFYPANE B435, `notifypane.rs`): each post reads its app's cached
+//!   rule (allow / banner or center / sound) at post time; an app turned off posts nothing; one alert sound per
+//!   pass through the hda tone path.
 //!
 //! Wire: `[notify] post app=<a> title=<t> dnd=<0|1> -> banner|collected`, `[notify] show win=<n> slot=<i> title=<t>
 //! ms=<ms> focus=kept`, `[notify] closed by=<timeout|click|overflow> title=<t>`, `[notify] action <label> -> <what>`,
 //! `[notify] center open items=<n> apps=<n>` / `[notify] center closed by=<bell|outside|clear>`, and `tests notify` →
 //! `:: NOTIFY: stack_max=4 center=ok ring=100 badge=ok dnd=<0|1> posted=<n> -> PASS ::`.
-//! Design: `docs/dev/evidence/rmbp-1005/notify.md`. The alert sound is owed (MACPARITY row 26).
+//! Design: `docs/dev/evidence/rmbp-1005/notify.md`; the pane and the sound: `notifypane.md`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -218,17 +222,7 @@ static SURF_AT: [AtomicUsize; SURF_N] = [AtomicUsize::new(0), AtomicUsize::new(0
 fn surf(i: usize) -> &'static mut [u32] {
     let (w, h) = if i == STACK_MAX { (CW, CH) } else { (W, H) };
     let n = metrics::size(w) * metrics::size(h);
-    let mut p = SURF_AT[i].load(Ordering::Acquire);
-    if p == 0 {
-        let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice());
-        p = match SURF_AT[i].compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => b.as_mut_ptr() as usize,
-            Err(won) => won,
-        };
-    }
-    // SAFETY: one leaked buffer of `n` words per slot (sized from the scale at first use, as the toast's), painted
-    // on the window-safe pass, read by `wm`'s composite while the row lives.
-    unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) }
+    metrics::leaked_surf(&SURF_AT[i], n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// The unread count the bell's badge shows (lock-free: the bar's painter reads it).
@@ -627,6 +621,7 @@ pub fn service() {
         crate::tests::register("notify", test);
     }
     dnd_load_service();
+    super::notifypane::service(); // NOTIFYPANE (B435): the rules' login load and their latched store writes
     if DND_SAVE_OWED.swap(false, Ordering::AcqRel) {
         let r = crate::prefs_client::pref_set(crate::prefs::NS, KEY_DND, crate::prefs::PrefValue::Bool(dnd()));
         serial_println!("[notify] prefs dnd={} saved={}", dnd() as u8, if r.is_ok() { "ok" } else { "-1" });
@@ -649,7 +644,18 @@ fn pass(now: u64) {
     }
     let Some(mut st) = ST.try_lock() else { return };
     let unread0 = UNREAD.load(Ordering::Relaxed);
+    let mut sound: Option<Note> = None;
     for n in inb[..k].iter_mut() {
+        // NOTIFYPANE (B435): the app's cached rule and DND (manual or scheduled), read at post time.
+        let dnd_now = super::notifypane::dnd_now();
+        let (shown, kept, snd) = prefs_core::notify::route(&super::notifypane::rule_at_post(n.app()), n.quiet, dnd_now);
+        if !kept {
+            if wire() { serial_println!("[notify] post app={} title={} -> blocked(allow=0)", s(n.app()), s(n.title())); }
+            continue;
+        }
+        if snd && sound.is_none() {
+            sound = Some(*n);
+        }
         st.seq = st.seq.wrapping_add(1).max(1);
         n.seq = st.seq;
         n.at = now;
@@ -660,16 +666,19 @@ fn pass(now: u64) {
         if !headless {
             POSTED.fetch_add(1, Ordering::Relaxed);
         }
-        let collect = n.quiet || dnd() || CENTER_OPEN.load(Ordering::Relaxed);
+        let collect = !shown || CENTER_OPEN.load(Ordering::Relaxed);
         if !CENTER_OPEN.load(Ordering::Relaxed) {
             UNREAD.fetch_add(1, Ordering::Relaxed);
         } else {
             CENTER_STALE.store(true, Ordering::Relaxed);
         }
-        if wire() { serial_println!("[notify] post app={} title={} dnd={} -> {}", s(n.app()), s(n.title()), dnd() as u8, if collect { "collected" } else { "banner" }); }
+        if wire() { serial_println!("[notify] post app={} title={} dnd={} -> {}", s(n.app()), s(n.title()), dnd_now as u8, if collect { "collected" } else { "banner" }); }
         if !collect {
             show_card(&mut st, *n, pw);
         }
+    }
+    if let Some(n) = sound {
+        let _ = super::notifypane::sound_for(n.app(), headless); // NOTIFYPANE (B435): one alert sound per pass
     }
     // the press router's requests
     if act != 0 || dis != 0 {
@@ -749,6 +758,7 @@ fn pass(now: u64) {
 type Held = ([Option<Card>; STACK_MAX], Vec<Note>, wm::WinId, u32, bool, bool, bool, [u32; STACK_MAX]);
 
 fn hold() -> Held {
+    super::notifypane::bypass(true, true); // NOTIFYPANE: the fixtures never read the user's rules or schedule
     let mut g = ST.lock();
     let cards = core::mem::replace(&mut g.cards, [None; STACK_MAX]);
     let ring = core::mem::take(&mut g.ring);
@@ -762,6 +772,7 @@ fn hold() -> Held {
 }
 
 fn restore(h: Held) {
+    super::notifypane::bypass(false, false);
     {
         let mut g = ST.lock();
         g.cards = h.0;
@@ -873,4 +884,35 @@ pub fn toast_fixture() -> bool {
     let kept = FOCUS_MOVED.load(Ordering::Relaxed) == moved0;
     restore(h);
     posted && up && gone && kept
+}
+
+/// NOTIFYPANE (B435): `tests notifypane`'s leg over the real pass — `(block, center, sound_gate)`: an app turned
+/// off posts nothing (no card, not in the ring); a center-only app collects without a card; two posts of a
+/// sounding app ask for ONE sound; under DND a post asks for none.
+pub fn pane_leg() -> (bool, bool, bool) {
+    let h = hold();
+    DND.store(false, Ordering::Relaxed);
+    super::notifypane::bypass(false, true);
+    super::notifypane::fixture_rules(true);
+    let t0 = 2_000_000u64;
+    let _ = post_full(b"npoff", b"off fixture", b"never shown", b"", ACT_NONE, b"");
+    pass(t0);
+    let block = banners() == 0 && ST.lock().ring.is_empty();
+    let _ = post_full(b"npctr", b"center fixture", b"collected", b"", ACT_NONE, b"");
+    pass(t0 + 1);
+    let center = banners() == 0 && ST.lock().ring.len() == 1 && unread() == 1;
+    let s0 = super::notifypane::sounds();
+    let _ = post_full(b"npsnd", b"sound fixture", b"one", b"", ACT_NONE, b"");
+    let _ = post_full(b"npsnd", b"sound fixture", b"two", b"", ACT_NONE, b"");
+    pass(t0 + 2);
+    let once = super::notifypane::sounds() == s0 + 1 && banners() == 2;
+    DND.store(true, Ordering::Relaxed);
+    let _ = post_full(b"npsnd", b"sound fixture", b"dnd", b"", ACT_NONE, b"");
+    pass(t0 + 3);
+    let silent = super::notifypane::sounds() == s0 + 1 && banners() == 2;
+    super::notifypane::fixture_rules(false);
+    // the fixture's cards close with the held state (restore puts the user's back)
+    pass(t0 + 3 + CARD_MS + 1);
+    restore(h);
+    (block, center, once && silent)
 }

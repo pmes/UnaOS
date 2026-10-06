@@ -55,7 +55,16 @@ pub mod kepler_ce;
 /// spelled out for GATE-FC2's reason: all three features imply `nvidia-kepler` +
 /// `nvidia-kepler-fifo`, so this `all(...)` admits exactly the configurations the bare
 /// `any(...)` would. Default OFF: the feature is brand-new, so no existing build moves.
-#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-fifo", any(feature = "nvidia-kepler-kfbind", feature = "nvidia-kepler-kfctxbind", feature = "nvidia-kepler-kfunwedge")))]
+///
+/// ⚠ KEPLERGR (B421) WIDENS THE GATE with a second arm: `kepler_fifo::host` (the ONE fifo-init / RAMFC / bind /
+/// decode / unwind path) and `kepler_fifo::kgr` (the GR channel, `tests kgr`) are called by `kepler_gpublit`, so the
+/// module is present on every build `kepler_gpublit` is (x86_64 + `nvidia-kepler` + `nvidia-kepler-takeover`). The
+/// KF27 recon items at the file's top compile on that arm too and are unused there (allowed in-file); the two
+/// submodules `host`/`kgr` carry the takeover arm as their own gate, and `ctxbind`/`unwedge` keep theirs.
+#[cfg(any(
+    all(feature = "nvidia-kepler", feature = "nvidia-kepler-fifo", any(feature = "nvidia-kepler-kfbind", feature = "nvidia-kepler-kfctxbind", feature = "nvidia-kepler-kfunwedge")),
+    all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover")
+))]
 pub mod kepler_fifo;
 
 #[cfg(feature = "intel-ivb")]

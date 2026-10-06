@@ -51,6 +51,9 @@ pub const IMAGE_WEBP: &str = "image/webp";
 pub const IMAGE_QOI: &str = "image/qoi";
 /// SMALLFIX2 (B391, R94): pixel_core's SVG type (`pixel_core::mime_of` under the `svg` feature).
 pub const IMAGE_SVG: &str = "image/svg+xml";
+/// RAWCORE (B444): raw_core's types (`pixel_core::mime_of` -> `raw_core::mime_of`): a Sony raw, a plain TIFF.
+pub const IMAGE_ARW: &str = "image/x-sony-arw";
+pub const IMAGE_TIFF: &str = "image/tiff";
 pub const AUDIO_FLAC: &str = "audio/flac";
 pub const AUDIO_OGG: &str = "audio/ogg";
 pub const AUDIO_MPEG: &str = "audio/mpeg";
@@ -118,6 +121,9 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("bmp", IMAGE_BMP),
     ("webp", IMAGE_WEBP),
     ("qoi", IMAGE_QOI),
+    ("arw", IMAGE_ARW), // RAWCORE (B444)
+    ("tif", IMAGE_TIFF),
+    ("tiff", IMAGE_TIFF),
     ("svg", IMAGE_SVG), // SMALLFIX2 (B391): the bytes speak first — without the `svg` feature an .svg sniffs as its text
     ("flac", AUDIO_FLAC),
     ("ogg", AUDIO_OGG),
@@ -330,6 +336,7 @@ pub fn type_of_in(mt: &MountTable, path: &str) -> (String, Source) {
                     if let (false, Some(e)) = (strong, by_extension(path)) { if e != m { return (String::from(e), Source::Extension); } }
                     // OPENERS (B379): an ISO-BMFF file's `moov` may lie past the sniff window (after the `mdat`):
                     // walk the top-level boxes to it so its tracks decide audio/mp4 against video/mp4.
+                    if m == IMAGE_TIFF && s.size > SNIFF_LEN as u64 { return (String::from(tiff_walk(mt, path, s.size).unwrap_or(m)), Source::Sniffed); } // RAWCORE (B444): IFD0's Make may lie past the sniff window
                     if matches!(m, AUDIO_MP4 | VIDEO_MP4) {
                         return (String::from(iso_walk(mt, path, s.size).unwrap_or(m)), Source::Sniffed);
                     }
@@ -384,11 +391,17 @@ pub fn stamp(path: &str) -> bool {
 }
 
 /// Carry `src`'s `una:type` to `dst` (the `cp` leg; `rename` keeps attributes by inode). Copies
-/// `una:preferred` too: a per-file opener choice belongs to the file. Silent when there is nothing to
-/// carry or the destination takes no attributes.
+/// `una:preferred` too WITHIN one volume (a per-file opener choice belongs to the file); across volumes it is
+/// stripped (OPENERTRUST B447). Silent when there is nothing to carry or the destination takes no attributes.
 pub fn carry_in(mt: &MountTable, src: &str, dst: &str) {
     for k in [TYPE_KEY, crate::fs::assoc::PREFERRED_KEY] {
         if let Ok(v) = mt.get_attr(src, k, KERNEL_PRINCIPAL) {
+            // OPENERTRUST (B447): a per-file opener does not cross volumes — a file brought in from a card or another
+            // disk does not bring its own program. An unknown storage identity counts as foreign (`same_storage`).
+            if k == crate::fs::assoc::PREFERRED_KEY && !matches!(mt.same_volume(src, dst), Ok(true)) {
+                serial_println!("[filetype] carry=strip key={} reason=foreign-volume {} -> {}", k, src, dst);
+                continue;
+            }
             match mt.set_attr(dst, k, v, KERNEL_PRINCIPAL) {
                 Ok(()) => serial_println!("[filetype] carry {} {} -> {}", k, src, dst),
                 Err(VfsError::Unsupported) => serial_println!("[filetype] carry=skip reason=enotsup key={} dst={}", k, dst),
@@ -436,11 +449,14 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("filetype", selftest);
+        #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+        crate::tests::register("rawcore", crate::video::facet::raw::selftest); // RAWCORE (B444)
         crate::fs::attrfacts::ensure_tests(); // ATTRCOLUMNS (B402): `tests attrcolumns` rides this registration
         // QUARRY2 (B336): `tests quarry2` rides this registration (no tests.rs line).
         #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         crate::video::quarry::live::columns::ensure_tests();
-        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); // QUARRY3 (B413): `tests quarry3` rides this registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
+        #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::quarry::live::quarry3_tests(); crate::fs::appres::ensure_tests(); crate::tests::register("filetypes", crate::fs::assoc::selftest); // QUARRY3 (B413): `tests quarry3` rides this · FILETYPES (B423): `tests filetypes` too registration too. APPRES (B398): `tests appres` rides this registration (no tests.rs line).
+        crate::tests::register("openertrust", crate::fs::assoc::openertrust_selftest); // OPENERTRUST (B447): `tests openertrust` rides this registration (no tests.rs line)
     }
 }
 
@@ -530,16 +546,17 @@ pub fn selftest() {
     let override_ok;
     if attrs && asrc == "db" {
         let obj = assoc::object_path(TEXT_PLAIN);
-        let changed = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(String::from("fileview")), k).is_ok()
-            && assoc::opener_for_in(&mt, &note, TEXT_PLAIN).0 == "fileview";
-        let _ = mt.set_attr(&obj, assoc::OPENER_KEY, AttrValue::Str(op0.clone()), k);
+        let was = mt.get_attr(&obj, assoc::PREFERRED_KEY, k).ok();
+        let changed = mt.set_attr(&obj, assoc::PREFERRED_KEY, AttrValue::Str(String::from("org.unaos.fileview")), k).is_ok()
+            && assoc::opener_for_in(&mt, &note, TEXT_PLAIN).0 == "fileview"; // FILETYPES (B423): the registry names a signature
+        if let Some(v) = was { let _ = mt.set_attr(&obj, assoc::PREFERRED_KEY, v, k); }
         assoc_ok = changed && op0 == "textedit";
         // Per-file override wins over the database.
         let set = mt.set_attr(&note, assoc::PREFERRED_KEY, AttrValue::Str(String::from("fileview")), k).is_ok();
         let (op1, s1) = assoc::opener_for_in(&mt, &note, TEXT_PLAIN);
         override_ok = set && op1 == "fileview" && s1 == "override";
     } else {
-        assoc_ok = !attrs && asrc == "builtin" && op0 == "textedit";
+        assoc_ok = !attrs && asrc == "registrant" && op0 == "textedit"; // FILETYPES (B423): no registry → the first registrant
         override_ok = !attrs; // SKIP leg on FAT: there is nowhere to put a per-file choice
     }
     // Quarry's handler function agrees with `opener_for` on every case file.
@@ -650,8 +667,9 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         // The decoding core the handler uses must recognise the bytes (the type and the decoder agree).
         let head = mt.read(&path, 0, core::cmp::min(st.size, SNIFF_LEN as u64) as usize).unwrap_or_default();
         let core: Option<(&str, bool)> = match handler.as_str() {
-            "facet" => Some(("pixel_core", pixel_core::sniff(&head).is_some())),
+            "facet" => Some(("pixel_core", pixel_core::sniff(&head).is_some() || pixel_core::raw::is_raw(&head))),
             "play" => Some(("audio_core", audio_core::sniff(&head) != audio_core::Format::Unknown)),
+            "player" => Some(("demux_core", demux_core::probe(&head).is_some())), // VIDEOPLAYER (B434): the Player's container core
             "textedit" | "fileview" | "markdown" | "json" => Some(("text", looks_text(&head))),
             _ => None,
         };
@@ -688,4 +706,11 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         if owed.is_empty() { "" } else { " reason=no-opener-in-this-tree(video: Stria's player, SR26)" },
         dir
     );
+}
+
+/// RAWCORE (B444): a TIFF's type from a longer head (IFD0's Make string may lie past [`SNIFF_LEN`]):
+/// `image/x-sony-arw` when the make is SONY, else `image/tiff`.
+fn tiff_walk(mt: &MountTable, path: &str, size: u64) -> Option<&'static str> {
+    let head = mt.read(path, 0, core::cmp::min(size, 64 << 10) as usize).ok()?;
+    pixel_core::mime_of(&head)
 }

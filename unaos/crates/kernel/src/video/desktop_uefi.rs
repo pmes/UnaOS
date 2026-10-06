@@ -697,6 +697,7 @@ pub fn desktop_app_service() {
     super::wm::pace_service();
     crate::splash::hold_service(); // SPLASHX86: the 5 s bound on the boot splash hold
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::dock::dockpin_service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::desktopbuild::service(); // DESKTOPBUILT (B387): the desktop's build at login, its first paint's read-back, the battery follow. DOCKPIN — the owed `<home>/.dock` load (login) and save (a Keep/Remove press), VFS work that cannot run in the click router.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::fs::assoc::service(); // FILETYPES (B423): the registry `login ok` owes, built off the click path
 
     // MENUSTAT — the desktop STATUS MODEL's poll, here and for `pace_service`'s reason: this is the
     // `wc`-gated body the ~1 kHz device-service task calls on EVERY pass, and it must run AHEAD of
@@ -724,7 +725,7 @@ pub fn desktop_app_service() {
     // the ~999 passes in between. The FIRST pass finds `LAST_POLL_MS == 0` and sweeps immediately,
     // so the item is resolved before the bar reaches the glass rather than ten seconds after.
     super::status::poll(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::brightkeys::service(); // BRIGHTKEYS — applies a pending backlight step (gmux port I/O belongs on this pass, not in the decoder). ⚠ SAME-LINE fold.
-    super::status::poll(); super::powerui::lowbat_service(); #[cfg(feature = "wc")] super::dock::lp_service(crate::arch::ms()); // DOCKRUN — 600 ms hold on a running dock tile opens its menu.
+    super::status::poll(); super::status::tray_publish(); super::powerui::lowbat_service(); #[cfg(feature = "wc")] super::dock::lp_service(crate::arch::ms()); // DOCKRUN — 600 ms hold on a running dock tile opens its menu.
 
     // Not armed = the activation never completed. Cheapest test first, and it is the one that is
     // false on every boot without the Kepler takeover.

@@ -22,7 +22,7 @@ use crate::{PrefTree, PrefValue};
 pub const DIR: &str = "settings";
 
 /// The six system domains, one per Settings pane family (R98).
-pub const SYSTEM_DOMAINS: [&str; 6] = ["display", "login", "desktop", "sound", "trackpad", "general"];
+pub const SYSTEM_DOMAINS: [&str; 7] = ["display", "login", "desktop", "sound", "trackpad", "notify", "general"];
 
 /// The namespace a program's own settings live in: `app.<name>.<key>` -> `settings/<name>`.
 pub const APP_NS: &str = "app";
@@ -38,6 +38,7 @@ pub fn domain_of(ns: &str, key: &str) -> String {
             "login" => "login",
             "audio" => "sound",
             "pointer" | "trackpad" => "trackpad",
+            "notify" => crate::notify::DOMAIN,
             _ => "general",
         },
         APP_NS => return String::from(first),
@@ -59,6 +60,7 @@ pub fn pane_of(domain: &str) -> &'static str {
         "desktop" => "Settings General pane (dock, wallpaper)",
         "sound" => "Settings General pane (volume)",
         "trackpad" => "Settings General pane (pointer)",
+        "notify" => "Settings Notifications pane",
         "general" => "Settings",
         _ => "a program",
     }
@@ -137,7 +139,7 @@ pub fn render(domain: &str, t: &PrefTree, iso: &str, by: &str, doc: &dyn Fn(&str
 
 /// The schema's `doc` for a declared key (the `doc` closure most callers pass to [`render`]).
 pub fn schema_doc(ns: &str, key: &str) -> Option<String> {
-    crate::schema::lookup(ns, key).map(|k| String::from(k.doc))
+    crate::schema::lookup(ns, key).map(|k| String::from(k.doc)).or_else(|| if ns == "system" { crate::notify::doc(key) } else { None })
 }
 
 /// `(iso, by)` from a rendered file's `# auto-saved <iso> by <by>` line.

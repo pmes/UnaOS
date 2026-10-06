@@ -654,6 +654,8 @@ fn main() {
     // the absence of `:: wifi4:` lines is indistinguishable from a radio that never answered.
     // Default OFF => rung unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WIFI4").is_ok() { feats.push("wifi4"); }
+    // WIFI-5 (WIFI6, B439): the S4i MMIO unwind of a failed S5i step. Implies wifi3; x86_64-only.
+    if std::env::var("UNAOS_WIFI5").is_ok() { feats.push("wifi5"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the
@@ -961,8 +963,12 @@ fn main() {
     if std::env::var("UNAOS_PREFS_RESET").is_ok() { feats.push("prefs_reset"); }
     // PANICSCREEN (B406): UNAOS_PANIC_HOLD=1 holds the panic screen for the bench (no restart). Kept in sync with arroyo.
     if std::env::var("UNAOS_PANIC_HOLD").is_ok() { feats.push("panic_hold"); }
+    // LIDSLEEP (B431): UNAOS_LIDSLEEP=1 arms the MSLD lid read (rung 0, read-only; implies smc). Kept in sync with arroyo.
+    if std::env::var("UNAOS_LIDSLEEP").is_ok() { feats.push("lidsleep"); }
     // SMALLFIX2 (B391, R94): UNAOS_SVG=1 arms pixel_core's `svg` format in the kernel (SVG opens in facet). Kept in sync with arroyo.
     if std::env::var("UNAOS_SVG").is_ok() { feats.push("svg"); }
+    // VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay; links av1_core). Kept in sync with arroyo.
+    if std::env::var("UNAOS_VIDEO").is_ok() { feats.push("videoplayer"); }
     // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.
     if std::env::var("UNAOS_WC_BLITTER").map(|v| v == "gpu").unwrap_or(false) { feats.push("wc_gpublit"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
@@ -991,6 +997,9 @@ fn main() {
     // arroyo's mapping: the builder REBUILDS the kernel for media, so a knob armed only in arroyo
     // ships the rung absent while the banner says otherwise — the s42/INSTGUI failure.
     if std::env::var("UNAOS_IVB3D_R8").is_ok() { feats.push("gen7"); feats.push("gen7r8"); }
+    // GEN7B (B422): UNAOS_IVB3D_BLIT=1 arms the BCS as KCOMP's second Blitter (drivers/gpu/gen7_blit.rs,
+    // `tests gen7` only). Kept in sync with arroyo's mapping (the builder rebuilds the kernel for media).
+    if std::env::var("UNAOS_IVB3D_BLIT").is_ok() { feats.push("gen7"); feats.push("gen7blit"); }
     // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU with an
     // unwind-stack restore on the same call stack (round 13 removed the timed auto-revert).
     // Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob

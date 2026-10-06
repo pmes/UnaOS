@@ -377,6 +377,8 @@ system.dock.autohide = false\n\
 system.dock.position = \"bottom\"\n\
 system.login.items = \"\"\n\
 system.notify.dnd = false\n\
+system.notify.dnd_from = 0\n\
+system.notify.dnd_until = 0\n\
 system.pointer.speed = 1\n\
 system.settings.tab = 0\n\
 system.trackpad.natural_scroll = true\n\
@@ -419,5 +421,49 @@ system.trackpad.three_finger_drag = false\n";
     fn kat_changed_body() {
         assert_eq!(changed_body("system", "display.brightness", &PrefValue::Int(1)), b"system.display.brightness\x001".to_vec());
         assert_eq!(parse_set(&changed_body("vein", "provider", &PrefValue::Str("claude".into()))).unwrap().2, PrefValue::Str("claude".into()));
+    }
+}
+
+// SECREVIEW (B442): a bounded host fuzz of the PREF verbs' ring-3 bodies through THE fulfiller both rings call
+// (`fulfil` over the reference store), plus the PrefDeclare, login-items and TOML-subset parsers it reaches.
+// Fixed seeds, no dependency; a panic on ring-3 bytes is a finding.
+#[cfg(test)]
+mod secreview_fuzz {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn body(&mut self, max: usize) -> Vec<u8> {
+            const A: &[u8] = b"system.app.vein.login.items:int:float:str:enum:bool,\t\n\0=\"[]-+.0123456789e eE_xyz\\\xC3\xFF";
+            let n = (self.next() as usize) % (max + 1);
+            (0..n).map(|_| if self.next() % 6 == 0 { self.next() as u8 } else { A[(self.next() as usize) % A.len()] }).collect()
+        }
+    }
+
+    #[test]
+    fn pref_verbs_never_panic_on_ring3_bytes() {
+        for seed in [3u64, 0x9E37_79B9_7F4A_7C15, 0xC0FF_EE00, 99, 123_456_789] {
+            let mut r = Rng(seed);
+            let mut s = TreeStore::default();
+            for _ in 0..20_000 {
+                let b = r.body(300);
+                let verb = [VERB_GET, VERB_SET, VERB_LIST, VERB_DECLARE, VERB_CHANGED, 0, 255][(r.next() % 7) as usize];
+                let mut out = Vec::new();
+                let st = fulfil(&mut s, verb, &b, r.next() % 2 == 0, &mut out);
+                assert!(st <= 0 && out.len() <= BODY_MAX + 4096);
+                let _ = crate::declare::parse(&b);
+                if let Ok(t) = core::str::from_utf8(&b) {
+                    let _ = crate::login::parse(t);
+                    let _ = PrefValue::from_literal(t);
+                    let _ = crate::PrefTree::parse(t);
+                }
+            }
+        }
     }
 }

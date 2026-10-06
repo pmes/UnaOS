@@ -16753,7 +16753,7 @@ unsafe fn decode_boot_keyboard(
                 }
             }
         }
-        crate::pal::typematic_note_report(newest_press, &held[..hn]); for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::status::volkey_usage(kc); } } // VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
+        crate::pal::typematic_note_report(newest_press, &held[..hn]); for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_EHCI, kc, modifiers); } } // XHCIMEDIA (B438): through the one fn-row router. VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
     }
 
     // The release edges. Bounded by six per report, and a human's key releases are human-rate, so
@@ -19604,3 +19604,7 @@ pub fn service_ehci_hid_pump() {
 /// TRACKPADPANE (rmbp-ledger B412) — the Trackpad pane's gesture stage (speed gain, two-finger scroll, secondary
 /// click, tap to click, three-finger drag), applied after `mt_step` on the vendor route. Tail append.
 pub mod tpgest;
+
+/// BTKEYSEAL (rmbp-ledger B446) — the bond store's link keys as Holocron records (the kernel asks Holocron's verbs). Tail append.
+#[cfg(feature = "btc")]
+pub mod btkeyseal;

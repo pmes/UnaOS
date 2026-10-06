@@ -35,6 +35,11 @@ fn le32(b: &[u8], i: usize) -> Option<u32> {
 /// SVG is read from the root element's `width`/`height` (else its `viewBox`) whether or not the `svg` renderer is
 /// built: the size is a fact of the markup.
 pub fn facts_of(b: &[u8]) -> Option<ImageFacts> {
+    if raw_core::is_tiff(b) {
+        // RAWCORE (B444): the sensor size of a camera raw (or a plain TIFF's IFD0 size), from the head's IFDs.
+        let x = crate::raw::facts(b)?;
+        return Some(ImageFacts { width: x.width?, height: x.height?, animated: false }).filter(|f| f.width <= crate::MAX_DIM && f.height <= crate::MAX_DIM);
+    }
     let f = |w: u32, h: u32, animated: bool| if w > 0 && h > 0 && w <= crate::MAX_DIM && h <= crate::MAX_DIM { Some(ImageFacts { width: w, height: h, animated }) } else { None };
     if b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
         // IHDR is the first chunk (PNG §11.2.2); an `acTL` before the first IDAT makes it an APNG.

@@ -96,6 +96,7 @@
 //!   for the boot (spec §5.4), and a decode slip must not be able to reach it.
 //! * **`ZERO` and `POISON` are printed, never interpreted.** `classify_fecs_word` is the
 //!   single verdict vocabulary, shared with `kepler_ce.rs`.
+#![cfg_attr(not(any(feature = "nvidia-kepler-kfbind", feature = "nvidia-kepler-kfctxbind", feature = "nvidia-kepler-kfunwedge")), allow(dead_code, unused_imports))] // KEPLERGR: the KF27 recon items compile, unused, on the takeover arm (mod.rs)
 
 use super::kepler::{classify_fecs_word, mmio_read, regs};
 
@@ -1976,3 +1977,763 @@ pub fn kfunwedge(bar0: usize) {
     );
 }
 } // mod unwedge
+
+// =====================================================================================================
+// KEPLERGR (rmbp-ledger B421) — THE ONE fifo bind path. Design: docs/dev/evidence/rmbp-1005/keplergr.md.
+// =====================================================================================================
+//
+// GPUBLIT3 (B410) wrote nouveau's fifo-init walls, RAMFC and bind for the copy-engine channel as private
+// code in `kepler_gpublit.rs`; the GR channel needs the SAME set (its September `err=00000002` is the same
+// SNOOP_WITHOUT_BAR1). Both legs now call this module, never a copy: `kepler_gpublit` (chid 2, the CE) and
+// `kgr` below (chid 1, GR). The ONE USERD table 0x2254 names is registered here by the first `fifo_init`
+// and read by every later leg (`utab()`), so the GR channel's USERD moves WITH the table by construction.
+//
+// Gate: x86_64 + `nvidia-kepler` + `nvidia-kepler-takeover` — exactly `kepler_gpublit`'s, the first caller.
+// Hardware facts (LAWS §licence): nouveau v6.10 file:line and NVIDIA open-gpu-doc, read outside the repo;
+// no text copied. Tags per DRIVERS-METHOD §5.
+
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+pub mod host {
+    use super::super::kepler::{mmio_read, mmio_write};
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
+
+    pub const NONE: u32 = u32::MAX;
+
+    // ---- registers (each with its citations) ----------------------------------------------------------
+    /// PFIFO_INTR (W1C) and the bind error code. // nouveau gk104.c:658,662 / :612-613
+    pub const PFIFO_INTR: usize = 0x2100;
+    pub const PFIFO_BIND_ERR: usize = 0x252c;
+    /// USERD BAR1 table: ENABLE bit 28 | BAR1 VA >> 12. // nouveau gk104.c:749 [wire: 0x252c = 2 SNOOP_WITHOUT_BAR1, gk104.c:600]
+    pub const USERD_BAR1: usize = 0x2254;
+    pub const USERD_BAR1_EN: u32 = 0x1000_0000;
+    /// One USERD slot per chid. // nouveau gk104.c:116 (size 0x200), chan.c:463 (`chid * userd->size`)
+    pub const USERD_SLOT: usize = 0x200;
+    /// 4096 chids. // nouveau gk104.c:804
+    pub const USERD_CHIDS: usize = 4096;
+    /// USERD GP_GET / GP_PUT. // nouveau gf100.c:129-130
+    pub const USERD_GP_GET: usize = 0x88;
+    pub const USERD_GP_PUT: usize = 0x8C;
+    /// The OR nouveau writes beside the PBDMA enable. // nouveau gk104.c:740 [ONE-SOURCE]
+    pub const R2A04: usize = 0x2a04;
+    pub const R2A04_OR: u32 = 0xbfff_ffff;
+    /// SCHED_DISABLE: one bit per runlist. // nouveau gk104.c:412,418 [ONE-SOURCE]
+    pub const SCHED_DISABLE: usize = 0x2630;
+    /// PREEMPT: write chid; pending bit 20. // nouveau gf100.c:43, :372 [ONE-SOURCE]
+    pub const PREEMPT: usize = 0x2634;
+    pub const PREEMPT_PENDING: u32 = 0x0010_0000;
+    /// PBDMA init: clear bits 8 and 28 of 0x04013c on each PBDMA. // nouveau gf100.c:357 [ONE-SOURCE]
+    pub const PB_13C: usize = 0x04_013c;
+    pub const PB_13C_CLR: u32 = 0x1000_0100;
+    pub const PB_STRIDE: usize = 0x2000;
+    /// PBDMA i's runlist mask. // nouveau gk104.c:392
+    pub const PB_RUNM: usize = 0x2390;
+    /// PBDMA live words, per i at 0x040000 + i*0x2000: INTR_0 +0x108, HCE +0x148 (gf100.c:315-318, gk104.c:385),
+    /// idle 0x3080 + i*4 busy bits 0xe000 (gk104.c:293).
+    pub const PB_BASE: usize = 0x04_0000;
+    pub const PB_IDLE: usize = 0x3080;
+    /// The channel table `0x800000 + chid*8`: lo = VALID | inst >> 12; hi = RUNLIST 19:16, ENABLE_SET bit 10,
+    /// ENABLE_CLR bit 11. // nouveau gk104.c:68, :77, :52, :44, :60
+    pub const PFIFO_CHAN: usize = 0x80_0000;
+    pub const CHAN_LO_VALID: u32 = 0x8000_0000;
+    pub const CHAN_HI_RUNLIST_SHIFT: u32 = 16;
+    pub const CHAN_HI_RUNLIST_MASK: u32 = 0x000F_0000;
+    pub const CHAN_HI_ENABLE_SET: u32 = 0x0000_0400;
+    pub const CHAN_HI_ENABLE_CLR: u32 = 0x0000_0800;
+    /// RUNLIST commit: base = target << 28 | addr >> 12 (VRAM 0); submit = rl << 20 | count; pending
+    /// 0x2284 + rl*8 bit 20. // nouveau gk104.c:446-447, :426
+    pub const RUNLIST_BASE: usize = 0x2270;
+    pub const RUNLIST_SUBMIT: usize = 0x2274;
+    pub const RUNLIST_INFO: usize = 0x2284;
+    pub const RUNLIST_PENDING: u32 = 0x0010_0000;
+    pub const PMC_ENABLE: usize = 0x200;
+    /// PBDMA enable mask. // nouveau gk104.c:739
+    pub const PMC_PBDMA_ENABLE: usize = 0x204;
+    /// PTOP device-info table, 64 words. // nouveau top/gk104.c:37,45
+    pub const PTOP_INFO: usize = 0x02_2700;
+    /// Engine status 0x2640 + eng*8. // nouveau gk104.c:206-216
+    pub const ENG_STATUS: usize = 0x2640;
+    /// MMU fault mask and per-unit records. // nouveau gf100.c:696-728
+    pub const FAULT_MASK: usize = 0x259c;
+    pub const FAULT_BASE: usize = 0x2800;
+    pub const PBDMA_INTR_MASK: usize = 0x25a0; // gf100.c:737
+    /// MMU fault units the two legs own. // nouveau gk104.c:474 (GR 0x00), :494-495 (CE0 0x15, CE1 0x16)
+    pub const FAULT_UNIT_GR: u32 = 0x00;
+    pub const FAULT_UNIT_CE0: u32 = 0x15;
+    /// The two channels. 1 is GR's (the September leg's id, kept), 2 is GPUBLIT's (`kepler_gpublit::CHID`).
+    pub const CHID_GR: u32 = 1;
+    pub const CHID_CE: u32 = 2;
+
+    /// Sysmem PTE dw1: VOL (bit 32) | aperture HOST 2 at bit 33 = 5; VRAM dw1 = 0.
+    /// // nouveau vmmgf100.c:263 (vol = HOST), :317-318 (vol << 32, aper << 33), :328 (HOST = 2) [ONE-SOURCE: nouveau]
+    pub const PTE_HI_SYSMEM: u32 = 1 | (2 << 1);
+    /// PDE: no big-page table (dw0 = 0); small-page table pointer in dw1, `addr >> 8 | 1` (VRAM).
+    /// // nouveau vmmgf100.c:126-138 (`gf100_vmm_pgd_pde`)
+    #[inline]
+    pub fn pde(spt: usize) -> (u32, u32) {
+        (0, ((spt >> 8) as u32) | 1)
+    }
+    /// PTE: `addr >> 8 | VALID` (vmmgf100.c:35,314); dw1 = PTE_HI_SYSMEM for coherent sysmem, 0 for VRAM.
+    #[inline]
+    pub fn pte(pa: u64, sysmem: bool) -> (u32, u32) {
+        (((pa >> 8) as u32) | 1, if sysmem { PTE_HI_SYSMEM } else { 0 })
+    }
+
+    #[inline]
+    fn mr(bar0: usize, off: usize) -> u32 {
+        unsafe { mmio_read(bar0, off) }
+    }
+    #[inline]
+    fn mw(bar0: usize, off: usize, v: u32) {
+        unsafe { mmio_write(bar0, off, v) }
+    }
+    fn tsc_hz() -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        if hz == 0 { 1_250_000_000 } else { hz }
+    }
+    pub fn cyc_us(c: u64) -> u64 {
+        c.saturating_mul(1_000_000) / tsc_hz()
+    }
+    /// Spin until `(reg & bit) == 0`, bounded by `us` on the TSC. Some(elapsed us) or None ("stuck").
+    fn wait_clear(bar0: usize, reg: usize, bit: u32, us: u64) -> Option<u32> {
+        let t0 = crate::arch::now_cycles();
+        let lim = tsc_hz().saturating_mul(us) / 1_000_000;
+        loop {
+            let dt = crate::arch::now_cycles().saturating_sub(t0);
+            if mr(bar0, reg) & bit == 0 {
+                return Some(cyc_us(dt) as u32);
+            }
+            if dt >= lim {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    // ---- pushbuffer host methods (both legs end a submission with a host semaphore release) --------------
+    /// SEC_OP INC_METHOD (1, bits 31:29) | METHOD_COUNT 28:16 | SUBCHANNEL 15:13 | ADDRESS 11:0 (dwords).
+    /// // open-gpu-doc cla06f.h:160-174
+    #[inline]
+    pub fn pb_hdr(subc: u32, method: u32, count: u32) -> u32 {
+        0x2000_0000 | (count << 16) | (subc << 13) | (method >> 2)
+    }
+    /// Host NOP. // open-gpu-doc cla06f.h:75
+    pub const M_HOST_NOP: u32 = 0x0008;
+    /// Host semaphore SEMAPHOREA..D (ADDR_HI, ADDR_LO, PAYLOAD, OPERATION). // open-gpu-doc cla06f.h:77-83
+    pub const M_HOST_SEM: u32 = 0x0010;
+    /// SEMAPHORED: OPERATION RELEASE (2, bits 3:0) | ACQUIRE_SWITCH (bit 12, inert on a release) |
+    /// RELEASE_WFI EN (bit 20 = 0) | RELEASE_SIZE 16BYTE (bit 24 = 0). // open-gpu-doc cla06f.h:84-97
+    pub const SEM_RELEASE_WFI: u32 = 0x0000_1002;
+
+    // ---- the GMMU PDE span the firmware left (GPUBLIT3 R9) -----------------------------------------------
+    /// bit 0 = 64 KiB big pages. // nouveau fb/gf100.c:72-73
+    pub const FB_BIGPAGE: usize = 0x10_0c80;
+    /// PDE span with small pages: 128 MiB with 128 KiB big pages (SPT 15 bits), 64 MiB with 64 KiB (SPT 14 bits).
+    /// // nouveau vmmgk104.c:41,55 [ONE-SOURCE: nouveau; refuted by a PDE/PDE_SIZE fault]
+    pub fn pde_span(fb_bigpage: u32) -> usize {
+        if fb_bigpage & 1 != 0 { 64 << 20 } else { 128 << 20 }
+    }
+
+    // ---- the ONE USERD table ----------------------------------------------------------------------------
+    static UTAB: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// The USERD table's VRAM (== BAR1, KF24 identity) offset the first `fifo_init` wrote into 0x2254.
+    pub fn utab() -> Option<usize> {
+        let t = UTAB.load(Acquire);
+        if t == usize::MAX { None } else { Some(t) }
+    }
+    /// chid's USERD inside the table. // nouveau chan.c:463
+    #[inline]
+    pub fn userd_slot(utab: usize, chid: u32) -> usize {
+        utab + chid as usize * USERD_SLOT
+    }
+
+    // ---- the pre-image record: a register can only be restored if it was READ first -------------------
+    /// Plain read/write configuration registers the unwind may restore. Anything else (the channel table's
+    /// W1 trigger bits, the runlist doorbell 0x2274, the W1C 0x2100) is unwound by nouveau's sequence in
+    /// [`unwind`], never by writing a pre-image back.
+    fn restorable(reg: usize) -> bool {
+        matches!(reg, PMC_ENABLE | R2A04 | SCHED_DISABLE | USERD_BAR1)
+            || (reg >= PB_13C && reg < PB_13C + 4 * PB_STRIDE && (reg - PB_13C) % PB_STRIDE == 0)
+    }
+    pub const MAXPRE: usize = 12;
+    /// The walls' pre-images, in capture order. Entries are only ever added by [`Pre::capture`], which READS
+    /// the register, and only for a [`restorable`] one — so [`Pre::restore`] cannot write a register whose
+    /// pre-image was not captured (KEPLERGR brief item 3).
+    pub struct Pre {
+        n: usize,
+        regs: [(usize, u32); MAXPRE],
+    }
+    impl Pre {
+        pub const fn new() -> Self {
+            Self { n: 0, regs: [(0, 0); MAXPRE] }
+        }
+        /// Read `reg` and record its pre-image (first read wins). Returns the live value.
+        pub fn capture(&mut self, bar0: usize, reg: usize) -> u32 {
+            let v = mr(bar0, reg);
+            if restorable(reg) && self.get(reg).is_none() && self.n < MAXPRE {
+                self.regs[self.n] = (reg, v);
+                self.n += 1;
+            }
+            v
+        }
+        pub fn get(&self, reg: usize) -> Option<u32> {
+            self.regs[..self.n].iter().find(|(r, _)| *r == reg).map(|(_, v)| *v)
+        }
+        /// Write every captured pre-image back, newest first, and read each back. Returns (written, mismatched)
+        /// and appends ` reg:pre->rb` per entry to `out`.
+        pub fn restore(&self, bar0: usize, out: &mut alloc::string::String) -> (u32, u32) {
+            let (mut w, mut bad) = (0u32, 0u32);
+            for &(reg, pre) in self.regs[..self.n].iter().rev() {
+                if !restorable(reg) {
+                    continue; // unreachable by construction; kept so a future edit cannot widen the write set
+                }
+                mw(bar0, reg, pre);
+                let rb = mr(bar0, reg);
+                w += 1;
+                if rb != pre {
+                    bad += 1;
+                }
+                let _ = core::fmt::Write::write_fmt(out, format_args!(" {:X}:{:08X}->{:08X}", reg, pre, rb));
+            }
+            (w, bad)
+        }
+    }
+
+    // ---- fifo init: the walls nouveau writes and we never did (GPUBLIT3 R3, R5, R6, R7) -----------------
+    /// Pre-bind readings `fifo_init` takes for the walls line.
+    #[derive(Clone, Copy, Default)]
+    pub struct InitOut {
+        pub intr_pre: u32,
+        pub bind_pre: u32,
+    }
+    /// nouveau's order: `init_pbdmas` (0x2a04), runq init (0x04013c on each PBDMA serving `rl`), fifo init
+    /// (0x2254 = the table, 0x2100 bit 0 W1C) — base.c:146-162 — then the runlist allow (0x2630 bit rl).
+    /// `utab` is the table's VRAM offset; the FIRST caller registers it, a later caller with a different
+    /// table is refused (None) without a write: there is ONE table.
+    pub fn fifo_init(bar0: usize, utab: usize, rl: u32, pre: &mut Pre) -> Option<InitOut> {
+        if let Some(t) = self::utab() {
+            if t != utab {
+                return None;
+            }
+        }
+        let r2a04 = pre.capture(bar0, R2A04);
+        mw(bar0, R2A04, r2a04 | R2A04_OR); // gk104.c:740
+        let en = mr(bar0, PMC_PBDMA_ENABLE);
+        for i in 0..4usize {
+            if en & (1 << i) == 0 || rl >= 32 || mr(bar0, PB_RUNM + i * 4) & (1 << rl) == 0 {
+                continue; // only the PBDMA(s) serving this runlist
+            }
+            let a = PB_13C + i * PB_STRIDE;
+            let v = pre.capture(bar0, a);
+            mw(bar0, a, v & !PB_13C_CLR); // gf100.c:357
+        }
+        pre.capture(bar0, USERD_BAR1);
+        // BAR1 offset == VRAM offset (KF24 identity), so the table's BAR1 VA is its VRAM offset. // gk104.c:749
+        mw(bar0, USERD_BAR1, USERD_BAR1_EN | ((utab >> 12) as u32));
+        UTAB.store(utab, Release);
+        // A BIND_ERROR latched before us is recorded, then cleared, so the bind's own verdict is read clean.
+        // W1C bit 0 only. // gk104.c:660-662
+        let out = InitOut { intr_pre: mr(bar0, PFIFO_INTR), bind_pre: mr(bar0, PFIFO_BIND_ERR) };
+        mw(bar0, PFIFO_INTR, 0x0000_0001);
+        if rl < 32 {
+            let sd = pre.capture(bar0, SCHED_DISABLE);
+            mw(bar0, SCHED_DISABLE, sd & !(1u32 << rl)); // gk104.c:412
+        }
+        Some(out)
+    }
+
+    // ---- the instance block ----------------------------------------------------------------------------
+    /// RAMFC exactly as nouveau `gk104_chan_ramfc_write` (gk104.c:88-102; devm 0xfff and priv = true,
+    /// gk104.c:110-111). `vw(offset, value)` writes one word of VRAM through BAR1. [ONE-SOURCE: nouveau;
+    /// layout open-gpu-doc gv100 dev_ram.ref:448-468]
+    pub fn ramfc_write(vw: &dyn Fn(usize, u32), inst: usize, userd: usize, gpfifo: usize, gp_log2: u32, chid: u32) {
+        vw(inst + 0x08, userd as u32); // gk104.c:88
+        vw(inst + 0x0C, (userd >> 32) as u32); // gk104.c:89 (B371 / September ORed 0x80000000)
+        vw(inst + 0x10, 0x0000_face); // gk104.c:90
+        vw(inst + 0x30, 0xffff_f902); // gk104.c:91
+        vw(inst + 0x48, gpfifo as u32); // gk104.c:92
+        vw(inst + 0x4C, ((gpfifo >> 32) as u32) | (gp_log2 << 16)); // gk104.c:93, limit2 = log2(entries)
+        vw(inst + 0x84, 0x2040_0000); // gk104.c:94
+        vw(inst + 0x94, 0x3000_0000 | 0xfff); // gk104.c:95 + devm gk104.c:110
+        vw(inst + 0x9C, 0x0000_0100); // gk104.c:96
+        vw(inst + 0xAC, 0x0000_001f); // gk104.c:97
+        vw(inst + 0xE4, 0x0000_0020); // gk104.c:98, priv = true gk104.c:111
+        vw(inst + 0xB8, 0xf800_0000); // gk104.c:100
+        vw(inst + 0xE8, chid); // gk104.c:99
+        vw(inst + 0xF8, 0x1000_3080); // gk104.c:101
+        vw(inst + 0xFC, 0x1000_0010); // gk104.c:102
+    }
+    /// The page directory pointer: inst+0x200 base (VRAM target 0), +0x208/+0x20C limit.
+    /// // nouveau vmmgf100.c:342-360 (`gf100_vmm_join_`)
+    pub fn inst_pd(vw: &dyn Fn(usize, u32), inst: usize, pd: usize) {
+        vw(inst + 0x200, (pd as u32) & 0xFFFF_F000);
+        vw(inst + 0x204, (pd >> 32) as u32);
+        vw(inst + 0x208, 0xFFFF_FFFF);
+        vw(inst + 0x20C, 0x0000_00FF);
+    }
+
+    // ---- bind / commit / start -------------------------------------------------------------------------
+    static LAST_BIND: [AtomicU32; 4] = [AtomicU32::new(NONE), AtomicU32::new(NONE), AtomicU32::new(NONE), AtomicU32::new(NONE)];
+    /// The bind verdict (0x252c bits 7:0) the last `bind` of `chid` read on this boot; NONE = never bound.
+    pub fn last_bind(chid: u32) -> u32 {
+        LAST_BIND.get(chid as usize).map_or(NONE, |a| a.load(Acquire))
+    }
+    #[derive(Clone, Copy, Default)]
+    pub struct BindOut {
+        pub intr_post: u32,
+        pub bind_post: u32,
+    }
+    /// nouveau's order: unbind (gk104.c:60); the RUNLIST into hi 19:16 (gk104.c:77); VALID | inst page
+    /// (gk104.c:68). The bind's verdict is read at once, before any commit. // nouveau gk104.c:612-613
+    pub fn bind(bar0: usize, chid: u32, rl: u32, inst: usize) -> BindOut {
+        let c = PFIFO_CHAN + chid as usize * 8;
+        mw(bar0, c, 0);
+        mw(bar0, c + 4, (mr(bar0, c + 4) & !CHAN_HI_RUNLIST_MASK) | ((rl << CHAN_HI_RUNLIST_SHIFT) & CHAN_HI_RUNLIST_MASK));
+        mw(bar0, c, CHAN_LO_VALID | ((inst >> 12) as u32));
+        let out = BindOut { intr_post: mr(bar0, PFIFO_INTR), bind_post: mr(bar0, PFIFO_BIND_ERR) };
+        if let Some(a) = LAST_BIND.get(chid as usize) {
+            a.store(out.bind_post & 0xff, Release);
+        }
+        out
+    }
+    /// Commit `count` entries at VRAM `base` onto runlist `rl`; wait the pending bit, bounded 2 ms (nouveau
+    /// `nv50_runl_wait` polls the same bit). Some(us) or None (stuck). // nouveau gk104.c:446-447, :426
+    pub fn runlist_commit(bar0: usize, rl: u32, base: usize, count: u32) -> Option<u32> {
+        mw(bar0, RUNLIST_BASE, (base >> 12) as u32);
+        mw(bar0, RUNLIST_SUBMIT, (rl << 20) | count);
+        wait_clear(bar0, RUNLIST_INFO + rl as usize * 8, RUNLIST_PENDING, 2000)
+    }
+    /// ENABLE_SET. // nouveau gk104.c:52
+    pub fn start(bar0: usize, chid: u32) {
+        let c = PFIFO_CHAN + chid as usize * 8 + 4;
+        mw(bar0, c, mr(bar0, c) | CHAN_HI_ENABLE_SET);
+    }
+
+    // ---- PTOP -------------------------------------------------------------------------------------------
+    /// One PTOP device.
+    #[derive(Clone, Copy)]
+    pub struct Top {
+        pub ty: u32,
+        pub engine: u32,
+        pub runlist: u32,
+        pub reset: u32,
+    }
+    /// Walk the PTOP device-info table exactly as nouveau `gk104_top_parse` (top/gk104.c:37-81) and return the
+    /// device of engine type `want` (0 GR, 1 CE0, 2 CE1 — top/gk104.c:78-80) that names a runlist.
+    pub fn ptop_engine(bar0: usize, want: u32) -> Option<Top> {
+        let (mut ty, mut eng, mut rl, mut rst) = (NONE, NONE, NONE, NONE);
+        for i in 0..64 {
+            let d = mr(bar0, PTOP_INFO + i * 4); // top/gk104.c:45
+            match d & 3 {
+                0 => continue, // NOT_VALID, top/gk104.c:48
+                1 => {}        // DATA (fault/addr), top/gk104.c:50
+                2 => {
+                    // ENUM, top/gk104.c:56-64
+                    if d & 0x20 != 0 {
+                        eng = (d & 0x3c00_0000) >> 26;
+                    }
+                    if d & 0x10 != 0 {
+                        rl = (d & 0x01e0_0000) >> 21;
+                    }
+                    if d & 0x04 != 0 {
+                        rst = (d & 0x0000_3e00) >> 9;
+                    }
+                }
+                _ => ty = (d & 0x7fff_fffc) >> 2, // ENGINE_TYPE, top/gk104.c:66
+            }
+            if d & 0x8000_0000 != 0 {
+                continue; // chained: more words for this device, top/gk104.c:71
+            }
+            if ty == want && rl != NONE {
+                return Some(Top { ty, engine: eng, runlist: rl, reset: rst });
+            }
+            (ty, eng, rl, rst) = (NONE, NONE, NONE, NONE);
+        }
+        None
+    }
+
+    // ---- the unwind (EXECUTED, DRIVERS-METHOD §2/§4) -----------------------------------------------------
+    /// Take `chid` off the hardware in nouveau's order — preempt (gf100.c:43, pending bit 20 :372, bounded
+    /// 2 ms), stop (ENABLE_CLR, gk104.c:44), unbind (lo = 0, gk104.c:60), runlist `rl` committed EMPTY at
+    /// `rl_base` (gk104.c:446-447, count 0) — then restore every pre-image `pre` captured, newest first, each
+    /// read back. Prints one `[kfifo] unwind` line; returns the number of restores that did not read back.
+    pub fn unwind(bar0: usize, chid: u32, rl: u32, rl_base: usize, pre: &Pre) -> u32 {
+        let c = PFIFO_CHAN + chid as usize * 8;
+        mw(bar0, PREEMPT, chid);
+        let preempt = wait_clear(bar0, PREEMPT, PREEMPT_PENDING, 2000);
+        mw(bar0, c + 4, mr(bar0, c + 4) | CHAN_HI_ENABLE_CLR);
+        mw(bar0, c, 0);
+        let commit = if rl < 16 { runlist_commit(bar0, rl, rl_base, 0) } else { None };
+        let mut s = alloc::string::String::new();
+        let (n, bad) = pre.restore(bar0, &mut s);
+        if let Some(a) = LAST_BIND.get(chid as usize) {
+            a.store(NONE, Release);
+        }
+        let us = |v: Option<u32>| v.map_or(alloc::string::String::from("stuck"), |u| alloc::format!("{}us", u));
+        serial_println!(
+            "[kfifo] unwind chid={} preempt={} chan={:08X}/{:08X} rl{}_empty={} bind={:02X} intr={:08X} restored={} mismatch={}{}",
+            chid, us(preempt), mr(bar0, c), mr(bar0, c + 4), rl, us(commit), mr(bar0, PFIFO_BIND_ERR) & 0xff, mr(bar0, PFIFO_INTR), n, bad, s
+        );
+        bad
+    }
+
+    // ---- M2 — the decode line both legs print (lifted from GPUBLIT3's `[gpublit] decode`, DRIVERS-METHOD §7) --
+    /// PFIFO_INTR bits as nouveau `gk104_fifo_intr` takes them. // nouveau gk104.c:660-720
+    pub const PFIFO_INTR_NAMES: &[(u32, &str)] = &[
+        (0x0000_0001, "BIND_ERROR"), (0x0000_0010, "PIO_ERROR"), (0x0000_0100, "SCHED_ERROR"), (0x0001_0000, "CHSW_ERROR"),
+        (0x0080_0000, "FB_FLUSH_TIMEOUT"), (0x0100_0000, "LB_ERROR"), (0x0800_0000, "DROPPED_MMU_FAULT"),
+        (0x1000_0000, "MMU_FAULT"), (0x2000_0000, "PBDMA_INTR"), (0x4000_0000, "RUNLIST_EVENT"), (0x8000_0000, "NONSTALL"),
+    ];
+    /// 0x252c bits 7:0. // nouveau gk104.c:598-605
+    pub const BIND_NAMES: &[(u32, &str)] = &[
+        (0x01, "BIND_NOT_UNBOUND"), (0x02, "SNOOP_WITHOUT_BAR1"), (0x03, "UNBIND_WHILE_RUNNING"), (0x05, "INVALID_RUNLIST"),
+        (0x06, "INVALID_CTX_TGT"), (0x0b, "UNBIND_WHILE_PARKED"),
+    ];
+    /// PBDMA INTR_0 bits. // nouveau gk104.c:335-366
+    pub const PB_INTR0_NAMES: &[(u32, &str)] = &[
+        (0x0000_0001, "MEMREQ"), (0x0000_0002, "MEMACK_TIMEOUT"), (0x0000_0004, "MEMACK_EXTRA"), (0x0000_0008, "MEMDAT_TIMEOUT"),
+        (0x0000_0010, "MEMDAT_EXTRA"), (0x0000_0020, "MEMFLUSH"), (0x0000_0040, "MEMOP"), (0x0000_0080, "LBCONNECT"),
+        (0x0000_0100, "LBREQ"), (0x0000_0200, "LBACK_TIMEOUT"), (0x0000_0400, "LBACK_EXTRA"), (0x0000_0800, "LBDAT_TIMEOUT"),
+        (0x0000_1000, "LBDAT_EXTRA"), (0x0000_2000, "GPFIFO"), (0x0000_4000, "GPPTR"), (0x0000_8000, "GPENTRY"),
+        (0x0001_0000, "GPCRC"), (0x0002_0000, "PBPTR"), (0x0004_0000, "PBENTRY"), (0x0008_0000, "PBCRC"),
+        (0x0010_0000, "XBARCONNECT"), (0x0020_0000, "METHOD"), (0x0040_0000, "METHODCRC"), (0x0080_0000, "DEVICE"),
+        (0x0200_0000, "SEMAPHORE"), (0x0400_0000, "ACQUIRE"), (0x0800_0000, "PRI"), (0x2000_0000, "NO_CTXSW_SEG"),
+        (0x4000_0000, "PBSEG"), (0x8000_0000, "SIGNATURE"),
+    ];
+    /// MMU fault reason (type & 0xf). // nouveau gk104.c:504-521
+    pub const FAULT_REASONS: [&str; 16] = [
+        "PDE", "PDE_SIZE", "PTE", "VA_LIMIT_VIOLATION", "UNBOUND_INST_BLOCK", "PRIV_VIOLATION", "RO_VIOLATION", "WO_VIOLATION",
+        "PITCH_MASK_VIOLATION", "WORK_CREATION", "UNSUPPORTED_APERTURE", "COMPRESSION_FAILURE", "UNSUPPORTED_KIND",
+        "REGION_VIOLATION", "BOTH_PTES_VALID", "INFO_TYPE_POISONED",
+    ];
+    /// Hub clients the two legs can name (type bits 12:8 with hub bit 6). // nouveau gk104.c:525-558
+    fn hub_client(c: u32) -> &'static str {
+        match c {
+            0x01 => "CE0", 0x02 => "CE1", 0x06 => "HOST", 0x07 => "HOST_CPU", 0x08 => "HOST_CPU_NB", 0x0a => "MMU",
+            0x0e => "NISO", 0x18 => "GR_CE", 0x19 => "CE2", 0x1b => "MMU_NB", _ => "other",
+        }
+    }
+
+    /// `a|b|unk:<rest>` for the bits of `v` named in `t`, `-` for none.
+    pub fn names(v: u32, t: &[(u32, &str)]) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        let mut rest = v;
+        for &(b, n) in t {
+            if v & b != 0 {
+                if !s.is_empty() {
+                    s.push('|');
+                }
+                s.push_str(n);
+                rest &= !b;
+            }
+        }
+        if rest != 0 {
+            let sep = if s.is_empty() { "" } else { "|" };
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{}unk:{:08X}", sep, rest));
+        }
+        if s.is_empty() { "-".into() } else { s }
+    }
+    /// The bind reason's name, `-` for 0 / unknown.
+    pub fn bind_name(bind: u32) -> &'static str {
+        BIND_NAMES.iter().find(|(c, _)| *c == bind & 0xff).map_or("-", |(_, n)| *n)
+    }
+
+    fn fault_word(bar0: usize, unit: u32) -> alloc::string::String {
+        let b = FAULT_BASE + unit as usize * 0x10;
+        let (inst, valo, vahi, ty) = (mr(bar0, b), mr(bar0, b + 4), mr(bar0, b + 8), mr(bar0, b + 0xc));
+        let hub = ty & 0x40 != 0;
+        alloc::format!(
+            "u{:02X}:inst={:08X}:va={:X}{:08X}:type={:08X}[{} {} {}{}]",
+            unit, inst, vahi, valo, ty, FAULT_REASONS[(ty & 0xf) as usize], if ty & 0x80 != 0 { "write" } else { "read" },
+            if hub { "hub:" } else { "gpc:" }, if hub { hub_client((ty >> 8) & 0x1f) } else { "-" }
+        )
+    }
+
+    /// KEPLERGR M2 — ONE line, every status word on `chid`'s path named: PFIFO_INTR, the bind reason, the
+    /// channel's hi word, engine `eng`'s status, the PBDMA(s) serving runlist `rl` (intr0 / HCE / idle),
+    /// SCHED_DISABLE, and the MMU fault units (`unit`, the leg's own, always shown; the first other pending
+    /// unit after it). Reads only. Reading order: keplergr.md §3 / gpublit3.md §3.
+    pub fn pfifo_decode(bar0: usize, chid: u32, eng: u32, rl: u32, unit: u32) {
+        let intr = mr(bar0, PFIFO_INTR);
+        let bind = mr(bar0, PFIFO_BIND_ERR);
+        let es = if eng < 32 { mr(bar0, ENG_STATUS + eng as usize * 8) } else { 0 };
+        // gk104.c:208-216
+        let estr = alloc::format!(
+            "{:08X}[busy={} faulted={} chsw={} load={} save={} prev={} next={}]",
+            es, (es >> 31) & 1, (es >> 30) & 1, (es >> 15) & 1, (es >> 13) & 1, (es >> 14) & 1, es & 0xfff, (es >> 16) & 0xfff
+        );
+        let hi = mr(bar0, PFIFO_CHAN + chid as usize * 8 + 4);
+        let mut pb = alloc::string::String::new();
+        for i in 0..4usize {
+            if rl < 32 && mr(bar0, PB_RUNM + i * 4) & (1 << rl) != 0 {
+                let b = PB_BASE + i * PB_STRIDE;
+                let i0 = mr(bar0, b + 0x108);
+                let idle = mr(bar0, PB_IDLE + i * 4);
+                let _ = core::fmt::Write::write_fmt(
+                    &mut pb,
+                    format_args!(" pb{}_intr0={:08X}[{}] pb{}_intr1={:08X} pb{}_idle={:08X}[{}]", i, i0, names(i0, PB_INTR0_NAMES), i, mr(bar0, b + 0x148), i, idle,
+                        if idle & 0xe000 == 0 { "idle" } else { "busy" }),
+                );
+            }
+        }
+        let fm = mr(bar0, FAULT_MASK);
+        let mut faults = fault_word(bar0, unit);
+        if fm != 0 {
+            let first = fm.trailing_zeros();
+            if first != unit {
+                faults.push(' ');
+                faults.push_str(&fault_word(bar0, first));
+            }
+        }
+        let sd = mr(bar0, SCHED_DISABLE);
+        serial_println!(
+            "[kfifo] decode chid={} pfifo_intr={:08X}[{}] bind={:02X}[{}] chan_hi={:08X}[rl={} en={}] eng{}={} pbdma_intr={:08X} preempt={:08X} sched_dis={:08X}[rl{}={}]{} mmu={:08X} fault={}",
+            chid, intr, names(intr, PFIFO_INTR_NAMES), bind & 0xff, bind_name(bind), hi, (hi >> 16) & 0xf, hi & 1, if eng == NONE { 0 } else { eng }, estr,
+            mr(bar0, PBDMA_INTR_MASK), mr(bar0, PREEMPT), sd, rl, if rl < 32 { (sd >> rl) & 1 } else { 0 }, pb, fm, faults
+        );
+    }
+}
+
+// =====================================================================================================
+// KEPLERGR M3 — the GR channel (chid 1) through `host`, behind `tests kgr`. Rung ledger G0..G7, decision
+// tree and unwind: docs/dev/evidence/rmbp-1005/keplergr.md §2/§3/§6. R80: nothing tests at boot — the
+// takeover only reserves the window and prints the one arming line; the fixture runs when the operator asks.
+// DESTRUCTIVE (DRIVERS-METHOD §4): it sets PGRAPH's PMC bit and schedules a channel on GR's runlist with no
+// FECS ucode, so it runs alone, once per boot, after the CE leg, and only when the CE's bind read 00.
+// =====================================================================================================
+
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+pub mod kgr {
+    use super::host as kf;
+    use super::super::kepler::{mmio_read, mmio_write, VramAllocator};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::*};
+
+    // ---- window layout (offsets from the window base, a VRAM offset == BAR1 offset, KF24) ---------------
+    const K_INST: usize = 0x0000; // instance block (RAMFC + PD pointer)
+    const K_RUNL: usize = 0x1000; // runlist page: one entry (chid 1, 0) — nouveau gk104.c:454-455
+    const K_RUNL0: usize = 0x2000; // the page the unwind's EMPTY commit names (count 0: never read)
+    const K_GPFIFO: usize = 0x3000; // 512 entries x 8 B
+    const K_PUSH: usize = 0x4000; // one pushbuffer page
+    const K_SEM: usize = 0x5000; // the host semaphore the NOP's release writes
+    const K_PD: usize = 0x10000; // page directory (64 KiB reserved like GPUBLIT's, first 4 KiB written)
+    const K_PT: usize = 0x20000; // small-page table under PDE[0]: (span >> 12) x 8 B, at most 256 KiB
+    const K_SPAN: usize = K_PT + ((128usize << 20) >> 12) * 8;
+    const GP_LOG2: u32 = 9; // 512 gpfifo entries
+    /// The NOP's semaphore payload ("KGR1"): any value the zeroed page cannot already hold.
+    const NOP_PAYLOAD: u32 = 0x4B47_5231;
+    /// The GR leg's verdict budget for the semaphore. Generous: the host executes NOP + release itself.
+    const NOP_BUDGET_US: u64 = 20_000;
+    /// PFIFO's PMC bit. // nouveau mc/gk104.c:28 { 0x00000100, NVKM_ENGINE_FIFO }
+    const PMC_PFIFO: u32 = 0x100;
+
+    static BAR0: AtomicUsize = AtomicUsize::new(0);
+    static BAR1: AtomicUsize = AtomicUsize::new(0);
+    static WIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static GR_RL: AtomicU32 = AtomicU32::new(kf::NONE);
+    static GR_ENG: AtomicU32 = AtomicU32::new(kf::NONE);
+    static GR_RST: AtomicU32 = AtomicU32::new(kf::NONE);
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    #[inline]
+    fn vw(off: usize, v: u32) {
+        let b = BAR1.load(Relaxed);
+        unsafe { core::ptr::write_volatile((b + off) as *mut u32, v) }
+    }
+    #[inline]
+    fn vr(off: usize) -> u32 {
+        let b = BAR1.load(Relaxed);
+        unsafe { core::ptr::read_volatile((b + off) as *const u32) }
+    }
+    #[inline]
+    fn mr(off: usize) -> u32 {
+        unsafe { mmio_read(BAR0.load(Relaxed), off) }
+    }
+    #[inline]
+    fn mw(off: usize, v: u32) {
+        unsafe { mmio_write(BAR0.load(Relaxed), off, v) }
+    }
+    fn opt(v: u32) -> alloc::string::String {
+        if v == kf::NONE { "-".into() } else { alloc::format!("{}", v) }
+    }
+
+    /// Called ONCE from `kepler::init` right after `kepler_gpublit::arm` (the takeover succeeded). Reads PTOP,
+    /// reserves the window, registers `tests kgr`, prints ONE line. No device write (R80/R87).
+    pub fn arm(bar0: usize, bar1: usize, vram: &mut VramAllocator) {
+        BAR0.store(bar0, Release);
+        BAR1.store(bar1, Release);
+        let top = kf::ptop_engine(bar0, 0); // engine type 0 = GR, top/gk104.c:78
+        if let Some(t) = top {
+            GR_RL.store(t.runlist, Release);
+            GR_ENG.store(t.engine, Release);
+            GR_RST.store(t.reset, Release);
+        }
+        let w = vram.alloc(K_SPAN);
+        if let Some(w) = w {
+            WIN.store(w, Release);
+        }
+        crate::tests::register("kgr", tests_kgr);
+        serial_println!(
+            "[kgr] armed chid={} rl={} eng={} reset={} win={} -> tests kgr (destructive: alone, once, after the CE leg)",
+            kf::CHID_GR, opt(GR_RL.load(Relaxed)), opt(GR_ENG.load(Relaxed)), opt(GR_RST.load(Relaxed)),
+            w.map_or(alloc::string::String::from("none"), |w| alloc::format!("{:#x}", w))
+        );
+    }
+
+    fn witness(bind: &str, get: u32, nop: &str, verdict: &str) {
+        serial_println!(":: KGR: bind={} ramfc_get={} nop={} -> {} ::", bind, get, nop, verdict);
+    }
+
+    /// `tests kgr` — the GR channel bound through the ONE path, a host NOP + semaphore release pushed, the
+    /// verdict read, the decode printed, and on any verdict but PASS the unwind EXECUTED.
+    pub fn tests_kgr() {
+        let refuse = |why: &str| witness(&alloc::format!("refused({})", why), 0, "-", "REFUSED");
+        if RAN.swap(true, AcqRel) {
+            return refuse("ran-this-boot");
+        }
+        let (bar0, w, rl) = (BAR0.load(Acquire), WIN.load(Acquire), GR_RL.load(Acquire));
+        if bar0 == 0 || BAR1.load(Acquire) == 0 {
+            return refuse("no-bars");
+        }
+        if w == usize::MAX {
+            return refuse("no-vram-window");
+        }
+        if rl == kf::NONE || rl >= 16 {
+            return refuse("ptop-no-gr");
+        }
+        // DRIVERS-METHOD §4: the destructive rung runs only after the non-destructive one proved the shared table.
+        let ce = kf::last_bind(kf::CHID_CE);
+        if ce != 0 {
+            return refuse(&if ce == kf::NONE { alloc::format!("ce-unbound") } else { alloc::format!("ce-bind={:02X}", ce) });
+        }
+        let Some(utab) = kf::utab() else { return refuse("no-userd-table") };
+        let fbp = mr(kf::FB_BIGPAGE);
+        let span = kf::pde_span(fbp);
+        if w + K_SPAN > span {
+            return refuse("window-beyond-pde0");
+        }
+
+        // ---- lay down: zero, VM (PDE[0] -> identity PT of this window), RAMFC, runlist ------------------
+        for off in [K_INST, K_RUNL, K_RUNL0, K_GPFIFO, K_PUSH, K_SEM, K_PD] {
+            for i in 0..0x400 {
+                vw(w + off + i * 4, 0);
+            }
+        }
+        for i in 0..(span >> 12) * 2 {
+            vw(w + K_PT + i * 4, 0);
+        }
+        let userd = kf::userd_slot(utab, kf::CHID_GR);
+        for i in 0..kf::USERD_SLOT / 4 {
+            vw(userd + i * 4, 0); // gf100_chan_userd_clear: GP_GET/GP_PUT start at 0 (gf100.c:118-131)
+        }
+        let (d0, d1) = kf::pde(w + K_PT);
+        vw(w + K_PD, d0);
+        vw(w + K_PD + 4, d1);
+        let mut p = w;
+        while p < w + K_SPAN {
+            let (e0, e1) = kf::pte(p as u64, false); // VRAM: dw1 0 (the sysmem dw1 5 is GPUBLIT's window's)
+            vw(w + K_PT + (p >> 12) * 8, e0);
+            vw(w + K_PT + (p >> 12) * 8 + 4, e1);
+            p += 0x1000;
+        }
+        let inst = w + K_INST;
+        kf::ramfc_write(&vw, inst, userd, w + K_GPFIFO, GP_LOG2, kf::CHID_GR);
+        kf::inst_pd(&vw, inst, w + K_PD);
+        vw(w + K_RUNL, kf::CHID_GR); // gk104.c:454-455
+        vw(w + K_RUNL + 4, 0);
+
+        // ---- the walls, every pre-image captured by READING it ---------------------------------------------
+        let mut pre = kf::Pre::new();
+        let rst = GR_RST.load(Acquire);
+        let pmc = pre.capture(bar0, kf::PMC_ENABLE);
+        mw(kf::PMC_ENABLE, pmc | PMC_PFIFO | if rst < 32 { 1u32 << rst } else { 0 }); // mc/base.c:57 BIT(reset)
+        let Some(io) = kf::fifo_init(bar0, utab, rl, &mut pre) else {
+            let mut r = alloc::string::String::new();
+            let _ = pre.restore(bar0, &mut r); // nothing bound yet: only the PMC pre-image to put back
+            serial_println!("[kgr] restore{}", r);
+            return refuse("utab-mismatch");
+        };
+        let bo = kf::bind(bar0, kf::CHID_GR, rl, inst);
+        let bind_ok = bo.bind_post & 0xff == 0;
+        let (mut commit, mut nop, mut nop_us) = (None, "-", 0u32);
+        if bind_ok {
+            commit = kf::runlist_commit(bar0, rl, w + K_RUNL, 1);
+            kf::start(bar0, kf::CHID_GR);
+            // NOP, then the host semaphore release of NOP_PAYLOAD at K_SEM (GPU VA == VRAM offset: identity PT).
+            let (push, sem) = (w + K_PUSH, w + K_SEM);
+            let words = [
+                kf::pb_hdr(0, kf::M_HOST_NOP, 1), 0,
+                kf::pb_hdr(0, kf::M_HOST_SEM, 4), (sem >> 32) as u32, sem as u32, NOP_PAYLOAD, kf::SEM_RELEASE_WFI,
+            ];
+            for (i, v) in words.iter().enumerate() {
+                vw(push + i * 4, *v);
+            }
+            // GP entry: ENTRY0 GET 31:2, ENTRY1 GET_HI 7:0 | LENGTH 30:10 (dwords). // cla06f.h:139-148
+            vw(w + K_GPFIFO, (push as u32) & 0xFFFF_FFFC);
+            vw(w + K_GPFIFO + 4, ((push >> 32) as u32) | ((words.len() as u32) << 10));
+            core::sync::atomic::fence(SeqCst);
+            unsafe { core::arch::x86_64::_mm_mfence() };
+            vw(userd + kf::USERD_GP_PUT, 1);
+            let hz = { let h = crate::arch::apic::tsc_hz(); if h == 0 { 1_250_000_000 } else { h } };
+            let (t0, lim) = (crate::arch::now_cycles(), hz.saturating_mul(NOP_BUDGET_US) / 1_000_000);
+            nop = "stuck";
+            loop {
+                let dt = crate::arch::now_cycles().saturating_sub(t0);
+                if vr(sem) == NOP_PAYLOAD {
+                    nop = "ok";
+                    nop_us = kf::cyc_us(dt) as u32;
+                    break;
+                }
+                if dt >= lim {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        // ---- the dump (before any unwind) --------------------------------------------------------------------
+        let (ugt, ramfc_get) = (vr(userd + kf::USERD_GP_GET), vr(inst + 0x14)); // dev_ram.ref:453 (RAMFC GP_GET +0x14)
+        let mut pbs = alloc::string::String::new();
+        for i in 0..4usize {
+            if mr(kf::PB_RUNM + i * 4) & (1 << rl) != 0 {
+                let b = kf::PB_BASE + i * kf::PB_STRIDE;
+                // CHANNEL +0x120 (gf100.c:315-318), live GP_GET +0x14 / GP_PUT +0x00 (gv100 dev_pbdma.ref:425/468)
+                let _ = core::fmt::Write::write_fmt(&mut pbs, format_args!(" pb{}=chan:{:08X}/get:{}/put:{}", i, mr(b + 0x120), mr(b + 0x14), mr(b)));
+            }
+        }
+        let c = kf::PFIFO_CHAN + kf::CHID_GR as usize * 8;
+        let pg = |r: usize| pre.get(r).map_or(alloc::string::String::from("-"), |v| alloc::format!("{:08X}", v));
+        serial_println!(
+            "[kgr] walls bind_pre={:02X} intr_pre={:08X} bind_post={:02X} intr_post={:08X} r2254={}->{:08X} r2a04={}->{:08X} r2630={}->{:08X} pmc={}->{:08X} chan={:08X}/{:08X} ramfc_08={:08X} ramfc_0c={:08X} ramfc_94={:08X} ramfc_e4={:08X} utab={:#x} userd={:#x} commit_us={} gp_get={} gp_put={} ramfc_get={} sem={:08X} nop_us={} fb_page={} pde_span_mb={}{}",
+            io.bind_pre & 0xff, io.intr_pre, bo.bind_post & 0xff, bo.intr_post,
+            pg(kf::USERD_BAR1), mr(kf::USERD_BAR1), pg(kf::R2A04), mr(kf::R2A04), pg(kf::SCHED_DISABLE), mr(kf::SCHED_DISABLE),
+            pg(kf::PMC_ENABLE), mr(kf::PMC_ENABLE), mr(c), mr(c + 4),
+            vr(inst + 0x08), vr(inst + 0x0C), vr(inst + 0x94), vr(inst + 0xE4), utab, userd,
+            commit.map_or(alloc::string::String::from(if bind_ok { "stuck" } else { "-" }), |u| alloc::format!("{}", u)),
+            ugt, vr(userd + kf::USERD_GP_PUT), ramfc_get, vr(w + K_SEM), nop_us,
+            if fbp & 1 != 0 { 16 } else { 17 }, span >> 20, pbs
+        );
+        kf::pfifo_decode(bar0, kf::CHID_GR, GR_ENG.load(Relaxed), rl, kf::FAULT_UNIT_GR);
+
+        // ---- the verdict (keplergr.md §3), then the unwind on anything but PASS -------------------------------
+        let fetched = ugt > 0 || ramfc_get > 0;
+        let verdict = if !bind_ok {
+            "BIND-WALL"
+        } else if commit.is_none() {
+            "COMMIT-WALL"
+        } else if nop == "ok" {
+            "PASS"
+        } else if !fetched {
+            "FETCH-WALL"
+        } else {
+            "EXEC-WALL"
+        };
+        if verdict != "PASS" {
+            let _ = kf::unwind(bar0, kf::CHID_GR, rl, w + K_RUNL0, &pre);
+        }
+        let bname = if bind_ok {
+            alloc::string::String::from("ok")
+        } else {
+            alloc::format!("{}({:02X})", kf::bind_name(bo.bind_post), bo.bind_post & 0xff)
+        };
+        witness(&bname, core::cmp::max(ugt, ramfc_get), nop, verdict);
+    }
+}

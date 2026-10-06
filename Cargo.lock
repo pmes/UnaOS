@@ -1219,6 +1219,11 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "demux_core"
 version = "0.1.0"
+dependencies = [
+ "audio_core",
+ "av1_core",
+ "vp8_core",
+]
 
 [[package]]
 name = "der"
@@ -2786,6 +2791,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobs_core"
+version = "0.1.0"
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3038,7 +3047,7 @@ version = "0.1.0"
 dependencies = [
  "memmap2",
  "png",
- "rayon",
+ "raw_core",
  "zune-core",
  "zune-jpeg",
 ]
@@ -3099,6 +3108,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mica"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jobs_core",
+ "unafs",
 ]
 
 [[package]]
@@ -3766,6 +3784,7 @@ name = "pixel_core"
 version = "0.1.0"
 dependencies = [
  "image",
+ "raw_core",
  "svg_core",
  "vp8_core",
 ]
@@ -4274,6 +4293,10 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
 ]
+
+[[package]]
+name = "raw_core"
+version = "0.1.0"
 
 [[package]]
 name = "rayon"

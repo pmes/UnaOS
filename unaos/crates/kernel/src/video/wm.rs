@@ -2653,7 +2653,7 @@ pub fn close(id: WinId) -> bool {
     // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
     // token) so the gesture is cancelled while the id still means something; after this point the
     // slot may be re-issued and a live drag would be steering a stranger's window.
-    drag_forget(id); winid_close_teardown(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); winid_close_teardown(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path.
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -17519,7 +17519,7 @@ pub fn drag_end() -> WinId {
     use core::sync::atomic::Ordering;
     let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel); if id != WIN_NONE { resize_finish(id); } // WINRESIZE — print `[wm-act] resize` and clear the zone
     if id != WIN_NONE {
-        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winsnap::end(id); // WINSNAP seam: the release snaps to the zone the pointer is in (video/winsnap.rs)
+        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winsnap::end(id); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::moved(id); // WINSNAP seam: the release snaps to the zone the pointer is in (video/winsnap.rs)
         let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
         let (x, y) = (
             DRAG_LAST_X.load(Ordering::Relaxed),
@@ -17554,7 +17554,7 @@ pub fn drag_cancel(why: &str) {
     use core::sync::atomic::Ordering;
     let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel); if id != WIN_NONE { resize_finish(id); } // WINRESIZE — print `[wm-act] resize` and clear the zone
     if id != WIN_NONE {
-        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winsnap::cancel(id, why); // WINSNAP seam: release-level snaps, any other cancel just clears the preview
+        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winsnap::cancel(id, why); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::moved(id); // WINSNAP seam: release-level snaps, any other cancel just clears the preview
         let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
         // DRAGFLICK — a cancelled drag painted just as much as a placed one, and most of the bench's
         // real gestures end HERE (`release-level`, `focus-key`), so the budget is reported on this arm
@@ -23499,7 +23499,7 @@ fn create_inner(
     // SPAWN-PLACE — resolve the caller's origin BEFORE the table lock (WRITER is never held across
     // it, which is what keeps the WRITER/TABLE order acyclic here as it is in `move_to` and `place`).
     // A framebuffer that is not ready leaves the row to the tiler, exactly as `move_to` declines.
-    let placed = at.and_then(|(x, y)| {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let (at, wmem) = winmemory::resolve(owner_asid, at, compat, native, w, h); let placed = at.and_then(|(x, y)| { // WINMEMORY (B429) — SAME-LINE fold, code first: an unplaced app row is born at its saved frame or centred
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
             return None;
@@ -23609,7 +23609,7 @@ fn create_inner(
     // point where the id demonstrably names something new, for the same class of reason.
     controls_declined_rearm(id);
     t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); let _dockstamp = win_stamp_bump(slot); reassert_modal_top(&mut t, id); // LOGINZ (B223) — ⚠ SAME-LINE fold, line-NEUTRAL, BEFORE the comment: a row born after the login screen or the set-password alert opened is pushed back under it (flight 15: `win=5/6 z=6..10` covered the input-taker); under the guard, beside the publish, so no pass sees the newcomer on top even once. // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE CLAIM SITE IS WHERE THE STAMP IS MINTED, and it is minted INSIDE the guard, beside the generation.** This is the one line in the kernel at which a window row becomes a window, and the stamp has to be taken here or it is not an allocation order at all: taken later it would order the DISCOVERY of rows, which is precisely the defect DOCKID2 fixed one layer up (a rank that was the arrival of the first reconcile pass to SEE a window, not the window's own arrival). Under the guard rather than after it, on `controls_declined_rearm`'s argument at the top of this block: no painter and no `dock_scan` can observe `t.rows[slot]` until the guard drops, so a row can never be scanned with a stale or zero stamp — publish-then-stamp would open exactly that window, and a row read inside it would sort as UNSTAMPED and take table order, which is the bug. It is bound and dropped rather than used: the value the dock wants is read back from the row's slot by [`win_stamp_of`], so nothing in `create`'s ABI moves and no caller learns a new number. The bump is UNCONDITIONAL here and gated in the callee (the twin at this file's tail), which is `winid_slot_bump`'s own shape and keeps this line one call wide. // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
-    drop(t); winid_alloc_witness(id, winid_generation, owner_asid, &minted[..minted_len], title_src); // WINID + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`. ONE call and ONE line: the title rides the alloc witness rather than a second `serial_println!` beside it, because a second print here costs the furniture its compose passes for the rest of the boot — measured, see `winid_alloc_witness`.
+    drop(t); winid_alloc_witness(id, winid_generation, owner_asid, &minted[..minted_len], title_src); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::note(id, wmem); // WINID + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`. ONE call and ONE line: the title rides the alloc witness rather than a second `serial_println!` beside it, because a second print here costs the furniture its compose passes for the rest of the boot — measured, see `winid_alloc_witness`.
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
     // where the id demonstrably names something new.
@@ -30330,3 +30330,7 @@ pub fn front_of_owner(owner: u64) -> Option<WinId> {
     }
     best.map(|b| b.1)
 }
+// WINMEMORY (B429, MACPARITY row 12) — the per-app window frame (restore / centre / cascade, one store write per move-end or close); a CHILD module for WINSNAP's reason. See video/winmemory.rs.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[path = "winmemory.rs"]
+pub mod winmemory;

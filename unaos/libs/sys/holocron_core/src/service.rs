@@ -36,7 +36,8 @@ pub const KIND_ED25519: &str = "ssh-ed25519";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreError;
 
-/// Where ring and secret files live: `/home/<u>/.holocron/.ring` and `/home/<u>/.holocron/<ns>/<name>`.
+/// Where ring and secret files live: `/home/<u>/.holocron/.ring` and `/home/<u>/.holocron/<ns>/<name>` — the
+/// root is [`crate::root`]'s, the one spelling both rings read (B448).
 /// Implementations: the host directory and the UnaFS volume (`handlers/holocron`), [`MemStore`] here,
 /// and on the metal the VFS through SYS_OPEN/SYS_ATTR_SET (owed with HOLOCRON.ELF).
 pub trait Store {
@@ -52,6 +53,11 @@ pub trait Store {
     fn list(&mut self, ns: &str) -> Result<Vec<String>, StoreError>;
     /// Remove one secret; `Ok(false)` when it did not exist.
     fn remove(&mut self, ns: &str, name: &str) -> Result<bool, StoreError>;
+    /// Remove the ring file; `Ok(false)` when it did not exist or the store cannot (HOLOCRONROOT, B448:
+    /// only [`crate::root::migrate`] calls it, on a legacy root it has emptied).
+    fn remove_ring(&mut self) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 }
 
 /// An in-memory store (tests; and the shape every other store mirrors).
@@ -83,6 +89,9 @@ impl Store for MemStore {
     }
     fn remove(&mut self, ns: &str, name: &str) -> Result<bool, StoreError> {
         Ok(self.files.remove(&(ns.into(), name.into())).is_some())
+    }
+    fn remove_ring(&mut self) -> Result<bool, StoreError> {
+        Ok(self.ring.take().is_some())
     }
 }
 

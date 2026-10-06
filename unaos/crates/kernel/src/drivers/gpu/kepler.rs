@@ -1473,6 +1473,11 @@ pub fn init(gpu: &GpuInfo) {
         if let Some(fbo) = fb_offset {
             crate::drivers::gpu::kepler_gpublit::arm(bar0, bar1_base, bar1_size, vram_size, fbo, &mut vram_allocator);
         }
+        // KEPLERGR (B421): the GR channel's window + the one arming line; `tests kgr` runs it (R80: nothing tests at boot).
+        #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-takeover"))]
+        if fb_offset.is_some() {
+            crate::drivers::gpu::kepler_fifo::kgr::arm(bar0, bar1_base, &mut vram_allocator);
+        }
 
         // 7. PGRAPH 2D/3D Engine Init (Placeholder)
         // Kepler requires Falcon microcode to fully initialize PGRAPH.

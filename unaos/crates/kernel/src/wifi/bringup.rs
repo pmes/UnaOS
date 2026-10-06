@@ -592,8 +592,12 @@ impl<F: Fn(u32) -> u32> Erom<F> {
     }
 
     /// One address descriptor of ANY type on ANY port, with its continuation dwords consumed.
-    /// Returns `(type, port, base)`. `None` (cursor unmoved) when the next entry is not an address.
-    fn address(&mut self) -> Option<(u32, u32, u64)> {
+    /// Returns `(type, port, base, size)`. `None` (cursor unmoved) when the next entry is not an address.
+    /// WIFI6 (B439): the size is DECODED now (it was consumed and dropped): [`AD_SZ_MASK`] 0/1/2 =
+    /// 4/8/16 KiB, [`AD_SZ_SZD`] = a following size descriptor whose low dword masked by
+    /// [`AD_ADDR_MASK`] is the size (a nonzero high dword saturates). [LEDGER §S1b / scan.h — the mask
+    /// this file already carried] + the wire's own base gap (f25: d11 0x18001000, next 0x18002000).
+    fn address(&mut self) -> Option<(u32, u32, u64, u64)> {
         let ent = self.peek()?;
         if (ent & ER_VALID) == 0 || (ent & ER_TAGX) != ER_TAG_ADDR {
             return None;
@@ -605,14 +609,19 @@ impl<F: Fn(u32) -> u32> Erom<F> {
         if (ent & AD_AG32) != 0 {
             addr |= (self.take()? as u64) << 32;
         }
+        let size: u64;
         if (ent & AD_SZ_MASK) == AD_SZ_SZD {
             // The size lives in a following descriptor, which itself may be two dwords wide.
             let sz = self.take()?;
+            let mut s = (sz & AD_ADDR_MASK) as u64;
             if (sz & SD_SG32) != 0 {
-                self.take()?;
+                if self.take()? != 0 { s = u64::MAX; }
             }
+            size = s;
+        } else {
+            size = (BCMA_CORE_SIZE as u64) << ((ent & AD_SZ_MASK) >> 4);
         }
-        Some((ty, port, addr))
+        Some((ty, port, addr, size))
     }
 }
 
@@ -627,6 +636,10 @@ struct D11 {
     mwrap: u64,
     swrap: u64,
     rev: u32,
+    /// WIFI6 (B439): the first slave port's decoded size, and the gap from `base` to the nearest
+    /// higher slave base any component declared (0 = none). C2's MMIO bound is derived from both.
+    size: u64,
+    gap: u64,
     /// Did THIS component's observed descriptor counts match the ones its CIB declared?
     ///
     /// Carried out of the walk rather than merely printed, because a MISMATCH on the d11 specifically
@@ -656,6 +669,7 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F, max_entries: u32) -> (u32, Option<D11>)
     let mut arity_mismatch = 0u32;
     let mut stop = "end-tag";
     let mut d11: Option<D11> = None;
+    let mut slave_bases: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 
     loop {
         let cia = match e.ci() {
@@ -695,18 +709,20 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F, max_entries: u32) -> (u32, Option<D11>)
         let mut base: u64 = 0;
         let mut mwrap: u64 = 0;
         let mut swrap: u64 = 0;
+        let mut size: u64 = 0;
         loop {
             if e.master_port().is_some() {
                 obs_mp += 1;
                 continue;
             }
             match e.address() {
-                Some((ty, _port, addr)) => {
+                Some((ty, _port, addr, sz)) => {
+                    if ty == AD_TYPE_SLAVE { slave_bases.push(addr); }
                     if (ty as usize) < obs.len() {
                         obs[ty as usize] += 1;
                     }
                     match ty {
-                        AD_TYPE_SLAVE if base == 0 => base = addr,
+                        AD_TYPE_SLAVE if base == 0 => { base = addr; size = sz; }
                         AD_TYPE_MWRAP if mwrap == 0 => mwrap = addr,
                         AD_TYPE_SWRAP if swrap == 0 => swrap = addr,
                         _ => {}
@@ -730,7 +746,7 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F, max_entries: u32) -> (u32, Option<D11>)
         }
 
         if id == CORE_ID_80211 && d11.is_none() && base != 0 {
-            d11 = Some(D11 { base, mwrap, swrap, rev, arity_ok });
+            d11 = Some(D11 { base, mwrap, swrap, rev, arity_ok, size, gap: 0 });
         }
 
         if cores < EROM_MAX_CORES {
@@ -756,7 +772,24 @@ fn walk_erom<F: Fn(u32) -> u32>(read: F, max_entries: u32) -> (u32, Option<D11>)
         cores, e.i, arity_mismatch, stop,
         if cores == 0 { "WALK-FAILED" } else { "WALK-OK" }, ev, eu
     );
+    if let Some(d) = d11.as_mut() {
+        d.gap = slave_bases.iter().filter(|b| **b > d.base).map(|b| *b - d.base).min().unwrap_or(0);
+    }
     (cores, d11)
+}
+
+/// WIFI6 (B439) — C2's MMIO bound from the enumeration, replacing WIFI5's fixed 0x800. The bound is
+/// the decoded slave-port size ONLY when the walk's own base gap agrees with it, clipped to the BAR0
+/// core aperture ([`BCMA_CORE_SIZE`]); any disagreement keeps 0x800 (the extent WIFI5 named safe).
+/// An unmapped backplane read is the wedge this prevents; within the decoded window the core answers.
+fn derive_c2_bound(d: &D11) {
+    let agree = d.size != 0 && d.size == d.gap;
+    let bound = if agree { d.size.min(BCMA_CORE_SIZE as u64) as u32 } else { 0x800 };
+    super::status::set_c2_bound(bound);
+    serial_println!(
+        "[wifi6] c2-bound d11 sp0-size={:#x} gap-to-next-slave={:#x} aperture={:#x} agree={} -> bound={:#x} (WIFI5's fixed bound was 0x800; offsets 0x800..bound are read by C2 for the first time and no spec page names a register there)",
+        d.size, d.gap, BCMA_CORE_SIZE, agree as u8, bound
+    );
 }
 
 // ── State ───────────────────────────────────────────────────────────────────────────────────────
@@ -1048,6 +1081,7 @@ pub fn bringup_once() {
     }
 
     end_line(&dl, ok, stage, d11_state, &w, if restored_all { "MATCH" } else { "FAILED" });
+    ident::identity_line(); // WIFI6 (B439): S2r's one identity line, after the restore.
 }
 
 /// R3-R7, between the pre-image and the restore.
@@ -1125,6 +1159,9 @@ fn explore(
         match (chipid >> 28) & 0xF { 0 => "ssb/sb", 1 => "bcma/erom", 2 => "bcma-single", _ => "?" },
         ((chipid & 0xFFFF) as u16 == DEVID_BCM4331) as u8,
     );
+    // WIFI6 (B439): S2r — the SPROM shadow, read while the window ALREADY sits on ChipCommon (no
+    // write of its own). The PCI subsystem device id (config 0x2C, high half) is its corroboration.
+    ident::sprom_read(bar0, (unsafe { read_config_32(bus, dev, func, 0x2C) } >> 16) as u16);
 
     // ── R4: the EROM. ───────────────────────────────────────────────────────────────────────────
     if erom == 0 || erom == ER_ALL_ONES {
@@ -1183,6 +1220,7 @@ fn explore(
         d.mwrap, EXPECT_D11_MWRAP, if mwrap_ok { "MATCH" } else { "MISMATCH" },
         d.swrap, if d.arity_ok { "MATCH" } else { "MISMATCH" },
     );
+    derive_c2_bound(&d); // WIFI6 (B439)
     serial_println!(
         ":: wifi2: d11 cross-check base-vs-cfg0x80-preimage={} ({:#010x} vs {:#010x}) mwrap-vs-cfg0xac-preimage={} ({:#010x} vs {:#010x}) — a config register FIRMWARE wrote versus an on-chip ROM WE walked; agreement means the walk measured the backplane rather than decoded a coincidence ::",
         if d.base == pre_win as u64 { "MATCH" } else { "MISMATCH" }, d.base, pre_win,
@@ -1265,6 +1303,7 @@ fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &
         phy, (phy >> 12) & 0xF, phy_type, EXPECT_PHY_TYPE,
         if phy_type == EXPECT_PHY_TYPE { "MATCH" } else { "MISMATCH" }, phy & 0xF,
     );
+    ident::note_phy(phy); // WIFI6 (B439): carried to S2r's identity line.
 
     // ── R5b: the wrapper aperture. ──────────────────────────────────────────────────────────────
     //
@@ -2114,6 +2153,7 @@ fn upload_ucode(bar0: u64, macctl: u32, w: &mut Writes) {
                 ":: wifi2: initvals total wrote={} mismatch={} — bring-up complete past the ucode handshake ::",
                 iw, imm
             );
+            unwind::after_initvals(bar0, iw, imm, w); // WIFI6 (B439): S5i post-check + S4i MMIO unwind.
             upload_verdict(wrote_words, wrote_fnv, psm_run as u8, rev, "UPLOADED", "");
         }
         Some(why) => {
@@ -2378,6 +2418,7 @@ fn phy_once(bar0: u64) {
     // word is printed as the alternative, and `v3-agree=` stays on the wire as the discriminator
     // that would reopen the choice (bcm4331.md §7 row S5a).
     let id_v = id_b;
+    ident::note_radio(id_v); // WIFI6 (B439): the V4 read, carried to S2r's identity line.
     let mfg = id_v & RADIO_ID_MFG;
     let ver = (id_v & RADIO_ID_VER) >> 12;
     let rev = (id_v & RADIO_ID_REV) >> 28;
@@ -2454,3 +2495,9 @@ fn phy_once(bar0: u64) {
 // WIFI5 M3 (B415): the pre-image captures (bcm4331.md §7 "Capture plan").
 #[cfg(feature = "wifi3")]
 mod capture;
+
+// WIFI6 (B439): rung S2r, the SPROM identity on the flown wifi2 path.
+mod ident;
+// WIFI6 (B439): rung S4i's MMIO leg (post-check under wifi3, the unwind under wifi5).
+#[cfg(feature = "wifi3")]
+mod unwind;

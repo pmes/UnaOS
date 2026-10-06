@@ -363,7 +363,7 @@ pub(crate) fn hid_screenshot_chord_edge(
     prev_keys: &[u8; 6],
     modifiers: u8,
 ) -> Option<(crate::video::keymap::Action, &'static str)> {
-    crate::video::keymap::note_mods(modifiers); crate::video::keymap::resolve_edge(crate::video::keymap::active(), cur_keys, prev_keys, modifiers) // WINRESIZE M2 — the latest modifier byte, for Shift-drag aspect
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::appswitch::hid_edge(cur_keys, prev_keys, modifiers); /* APPSWITCH (B428): the Cmd release and Esc edges */ crate::video::keymap::note_mods(modifiers); crate::video::keymap::resolve_edge(crate::video::keymap::active(), cur_keys, prev_keys, modifiers) // WINRESIZE M2 — the latest modifier byte, for Shift-drag aspect
 }
 
 /// KEYMAP — the 0x46 press edge's MEANING, resolved through the theme's table instead of assumed.
@@ -5175,7 +5175,7 @@ impl XhciController {
                                                 report[2], report[3], report[4],
                                                 report[5], report[6], report[7],
                                             ];
-                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys;
+                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_XHCI, kc, modifiers); } } // XHCIMEDIA (B438): F-row press edges through the one router (the EHCI pump calls it at the same point)
 
                                             for i in 2..8 {
                                                 let keycode = report[i];
@@ -5212,7 +5212,7 @@ impl XhciController {
                                                         if !prev_keys.contains(&keycode) { newest_press = ascii; }
                                                     }
                                                 }
-                                                crate::pal::typematic_note_report(newest_press, &held[..hn]); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] for i in 2..8 { let kc = report[i]; if kc > 1 && !prev_keys.contains(&kc) { let _ = crate::video::status::volkey_usage(kc); } } // ARMROUTER (VOLKEYS arm, aarch64): F10/F11/F12 press edges through the same `status::volkey_usage` seam the EHCI decoder calls; the board's backend says `amp_written=false` (no HDA here). Same-line fold, line-neutral.
+                                                crate::pal::typematic_note_report(newest_press, &held[..hn]); // ARMROUTER (VOLKEYS arm, aarch64): moved to `video::fnrow` (XHCIMEDIA B438), called on every arch below; was: F10/F11/F12 press edges through the same `status::volkey_usage` seam the EHCI decoder calls; the board's backend says `amp_written=false` (no HDA here). Same-line fold, line-neutral.
                                             }
 
                                             // HID-KEYS: key-UP edges. A boot report carries the FULL

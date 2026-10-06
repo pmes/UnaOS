@@ -1,0 +1,6 @@
+# FWPIN (rmbp-ledger B455) — SHA-256 pins for the BCM4331 b43 firmware set (wifi/firmware.rs).
+# NO FIRMWARE BYTES live in this tree (CLEAN_ROOM_POLICY §4). Each row is a fact ABOUT a file in Peter's
+# bunker: `<role> <64 lowercase hex>`, roles ucode / initvals / bsinitvals. The kernel stages ONLY a file
+# whose SHA-256 equals its role's row; with no row it refuses with reason=unpinned and prints the digest.
+# The rows come from arroyo's WIFI-FW build line (`⚡ WIFI-FW: <file> sha256=…`) — never typed from memory.
+# Lines starting with `#` and blank lines are ignored.

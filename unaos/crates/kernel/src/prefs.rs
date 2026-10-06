@@ -100,6 +100,8 @@ pub mod key {
     pub const TP_NATURAL: &str = "trackpad.natural_scroll";
     pub const TP_SECONDARY: &str = "trackpad.secondary_click";
     pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
+    /// DRAGDROP (B440): the folders the user dropped on Quarry's sidebar Favorites (R79: a preference is Principia's).
+    pub const QUARRY_FAVORITES: &str = "quarry.favorites";
 }
 
 static TREE: crate::sync::Mutex<PrefTree> = crate::sync::Mutex::new(PrefTree::new());
@@ -114,18 +116,24 @@ const READ_MAX: usize = 64 * 1024;
 
 // ── Where ────────────────────────────────────────────────────────────────────────────────────
 
-fn user_name() -> Option<String> {
+/// PERFREVIEW F3 (B443): the session name read into `buf` — the per-pass compares (prefs, Settings, login items)
+/// allocate nothing (the String-returning `user_name` it replaced allocated per pass).
+pub(crate) const WHO_BUF: usize = 64;
+pub(crate) fn user_name_in(buf: &mut [u8; WHO_BUF]) -> Option<&str> {
     #[cfg(feature = "login")]
     {
         let mut nm = [0u8; crate::fs::users::NAME_MAX];
-        let n = crate::fs::users::whoami(&mut nm)?;
-        return core::str::from_utf8(&nm[..n]).ok().map(String::from);
+        let n = crate::fs::users::whoami(&mut nm)?.min(WHO_BUF);
+        buf[..n].copy_from_slice(&nm[..n]);
+        return core::str::from_utf8(&buf[..n]).ok();
     }
     #[cfg(not(feature = "login"))]
     {
+        let _ = buf;
         None
     }
 }
+
 
 /// The session user's home (from the users table — never a literal), without a trailing `/`.
 pub fn home() -> Option<String> {
@@ -386,11 +394,12 @@ static LOAD_CLAMPED: AtomicU32 = AtomicU32::new(0);
 
 /// Load once per login (and once with no session). Cheap when nothing changed.
 pub fn ensure_loaded() {
-    let u = user_name().unwrap_or_default();
+    let mut wb = [0u8; WHO_BUF];
+    let u = user_name_in(&mut wb).unwrap_or(""); // PERFREVIEW F3 (B443): compared on the stack; a String only when the session changed
     let fresh = {
         let mut g = LOADED_FOR.lock();
-        if g.as_deref() != Some(u.as_str()) {
-            *g = Some(u);
+        if g.as_deref() != Some(u) {
+            *g = Some(String::from(u));
             true
         } else {
             false
@@ -676,6 +685,15 @@ pub fn set_applied(ns: &str, k: &str, v: PrefValue) -> Result<prefs_core::schema
             }
             Err(x) => {
                 serial_println!("[prefs] set {}.{}={} ok=0 why={:?} (declared stanza)", ns, k, v, x);
+                return Err(SetError::Refused(x));
+            }
+        }
+    } else if ns == NS && prefs_core::notify::parse_key(k).is_some() {
+        // NOTIFYPANE (B435): `system.notify.<app>.<field>` is checked by the per-app stanza (`prefs_core::notify`).
+        match prefs_core::notify::check(k, v.clone()) {
+            Ok(a) => a.value,
+            Err(x) => {
+                serial_println!("[prefs] set {}.{}={} ok=0 why={:?} (notify stanza)", ns, k, v, x);
                 return Err(SetError::Refused(x));
             }
         }
@@ -1068,4 +1086,57 @@ fn settingsfiles_selftest() {
         domains, files, MIGRATED.load(Ordering::Acquire) as u8, readable as u8, if reset { "ok" } else { "fail" },
         if app_ok { "ok" } else { "fail" }, alone as u8, path(), if ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// WINMEMORY (B429, MACPARITY row 12): declare ONE key of `app.<name>` on the program's behalf — the window
+/// manager owns the frame, so it declares `window.frame` at the app's first window. MERGES: a stanza the
+/// program declared itself (Lumen's) keeps its rows; a key already there is left as it is. `line` is one
+/// PrefDeclare line (`<key>\t<spec>\t<default>\t<doc>`). Returns whether the key was added.
+pub fn declare_app_key(name: &str, line: &str) -> bool {
+    let mut body = Vec::from(name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(line.as_bytes());
+    let Some((n, keys)) = prefs_core::declare::parse(&body) else { return false };
+    let mut reg = DECLARED.lock();
+    let stanza = reg.entry(n).or_default();
+    let mut added = 0usize;
+    for k in keys {
+        if !stanza.iter().any(|d| d.key == k.key) && stanza.len() < prefs_core::declare::MAX_KEYS {
+            stanza.push(k);
+            added += 1;
+        }
+    }
+    let total = stanza.len();
+    drop(reg);
+    if added > 0 {
+        serial_println!("[prefs] declared app.{} keys={} -> settings/{} (R98, by the window manager)", name, total, name);
+    }
+    added > 0
+}
+// ── LAUNCHERPREFS (B451): the kernel's own programs declare and retire through the one store ──────
+
+/// LAUNCHERPREFS (B451, ARCHREVIEW F7): a kernel-resident program (the Launcher) declares its `app.<name>.*`
+/// stanza — the PrefDeclare body (`prefs_core::declare::body`) — into the same registry the bus verb fills,
+/// as the kernel (no frame; PREFSCAP B454's caller-bound declare names this the kernel's row). `false` = a
+/// malformed stanza. Idempotent: a second declare replaces the first.
+pub fn declare_kernel(body: &[u8]) -> bool {
+    let Some((name, keys)) = prefs_core::declare::parse(body) else {
+        serial_println!("[prefs] declare (kernel) refused: malformed stanza");
+        return false;
+    };
+    let n = keys.len();
+    serial_println!("[prefs] declared app.{} keys={} -> settings/{} (kernel)", name, n, name);
+    DECLARED.lock().insert(name, keys);
+    true
+}
+
+/// LAUNCHERPREFS (B451): drop every key of namespace `ns` from the tree (no save: the caller's next
+/// [`set`] in the same domain rewrites that domain's file without them). Answers the keys removed.
+pub fn retire(ns: &str) -> usize {
+    let mut t = TREE.lock();
+    let gone: Vec<String> = t.list(ns).into_iter().map(|(k, _)| String::from(k)).collect();
+    for k in &gone {
+        t.remove(ns, k);
+    }
+    gone.len()
 }

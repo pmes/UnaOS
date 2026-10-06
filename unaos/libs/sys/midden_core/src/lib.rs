@@ -288,8 +288,8 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // `-ENOTSUP` from its own backend; the word exists everywhere.
     ("getfattr", Avail::Always), ("query", Avail::Always),
     // FILETYPE (B307): `file <path>` — the type and the leg that decided it; `assoc` — the type
-    // database (type -> opener, attributes on /system/types/*). Always: a FAT root answers from the
-    // builtin table and says so.
+    // registry (FILETYPES B423: attributes on /system/filetypes/*; openers are registrants). Always: a FAT root answers from the
+    // registrants' compiled-in resources and says so.
     ("file", Avail::Always), ("assoc", Avail::Always),
     // RELICS (R26 clause 2): the five `usnap*` spellings collapse into ONE verb with subcommands,
     // the way `git` / `ip` / `systemctl` spell a family. `snap list|create|drop|ls|cat`.

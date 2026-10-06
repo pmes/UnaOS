@@ -184,7 +184,7 @@ def load_tree():
     return files
 
 
-SYSTEM_DOMAINS = ("display", "login", "desktop", "sound", "trackpad", "general")
+SYSTEM_DOMAINS = ("display", "login", "desktop", "sound", "trackpad", "notify", "general")
 
 
 def domain_of(full):
@@ -195,7 +195,7 @@ def domain_of(full):
         if key == "display.wallpaper":
             return "desktop"
         return {"display": "display", "dock": "desktop", "login": "login", "audio": "sound",
-                "pointer": "trackpad", "trackpad": "trackpad"}.get(first, "general")
+                "pointer": "trackpad", "trackpad": "trackpad", "notify": "notify"}.get(first, "general")
     if ns == "app":
         return first
     return ns

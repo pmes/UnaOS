@@ -3,7 +3,7 @@
 //! GUID names one of the above; `wValidBitsPerSample` < container width is honoured by an arithmetic
 //! right shift — the samples are stored left-justified).
 use crate::io::ByteStream;
-use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use crate::{SeekPoint, Codec, Error, Format, Info, Pcm, Result, Source};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -22,6 +22,8 @@ pub struct WavDecoder {
     valid: u32,       // valid bits
     left: u64,        // data bytes remaining
     frames: u64,
+    start: u64,       // SEEKTABLE: the data chunk's first byte
+    dlen: u64,        // SEEKTABLE: the data chunk's length (u64::MAX = to EOF)
 }
 
 fn le16(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
@@ -87,7 +89,8 @@ impl WavDecoder {
                     if dlen == 0 && !rf64 { dlen = u64::MAX; } // streamed WAV with an unset size: read to EOF
                     let fb = (ch * container) as u64;
                     let frames = if dlen == u64::MAX { 0 } else { dlen / fb };
-                    return Ok(WavDecoder { s, kind, ch, rate, container, valid, left: dlen, frames });
+                    let start = s.offset();
+                    return Ok(WavDecoder { s, kind, ch, rate, container, valid, left: dlen, frames, start, dlen });
                 }
                 _ => s.skip(len + (len & 1))?,
             }
@@ -160,6 +163,15 @@ impl Source for WavDecoder {
         self.s.consume(nf * fb);
         if self.left != u64::MAX { self.left -= (nf * fb) as u64; }
         Ok(true)
+    }
+    /// SEEKTABLE (rmbp B433): PCM is its own table — the frame's byte offset in the data chunk.
+    fn seek(&mut self, target: u64) -> Result<Option<SeekPoint>> {
+        let fb = (self.ch * self.container) as u64;
+        let t = if self.dlen == u64::MAX { target } else { target.min(self.frames) };
+        let byte = self.start + t * fb;
+        if !self.s.seek(byte)? { return Ok(None); }
+        self.left = if self.dlen == u64::MAX { u64::MAX } else { self.dlen - t * fb };
+        Ok(Some(SeekPoint { byte, sample: t, exact: true, table: "pcm", landed: t }))
     }
 }
 

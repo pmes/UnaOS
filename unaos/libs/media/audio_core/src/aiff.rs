@@ -1,7 +1,7 @@
 //! AIFF 1.3 and AIFF-C: big-endian signed integer PCM 1–32 bits (`NONE`/`twos`), little-endian (`sowt`),
 //! IEEE float (`fl32`/`FL32`, `fl64`/`FL64`). COMM's 80-bit extended sample rate is decoded exactly.
 use crate::io::ByteStream;
-use crate::{Codec, Error, Format, Info, Pcm, Result, Source};
+use crate::{SeekPoint, Codec, Error, Format, Info, Pcm, Result, Source};
 
 pub struct AiffDecoder {
     s: ByteStream,
@@ -13,6 +13,8 @@ pub struct AiffDecoder {
     float: bool,
     left: u64,
     frames: u64,
+    start: u64, // SEEKTABLE: the first sample byte (past SSND's offset)
+    dlen: u64,
 }
 
 fn be16(b: &[u8], o: usize) -> u16 { u16::from_be_bytes([b[o], b[o + 1]]) }
@@ -64,7 +66,8 @@ impl AiffDecoder {
                     s.skip(off)?;
                     let container = (bits as usize).div_ceil(8);
                     let left = (len.saturating_sub(8 + off)).min(frames * (ch * container) as u64);
-                    return Ok(AiffDecoder { s, ch, rate, bits, container, little, float, left, frames });
+                    let start = s.offset();
+                    return Ok(AiffDecoder { s, ch, rate, bits, container, little, float, left, frames, start, dlen: left });
                 }
                 _ => s.skip(len + (len & 1))?,
             }
@@ -107,6 +110,15 @@ impl Source for AiffDecoder {
         self.s.consume(nf * fb);
         self.left -= (nf * fb) as u64;
         Ok(true)
+    }
+    /// SEEKTABLE (rmbp B433): PCM is its own table — the frame's byte offset in SSND.
+    fn seek(&mut self, target: u64) -> Result<Option<SeekPoint>> {
+        let fb = (self.ch * self.container) as u64;
+        let t = target.min(self.dlen / fb.max(1));
+        let byte = self.start + t * fb;
+        if !self.s.seek(byte)? { return Ok(None); }
+        self.left = self.dlen - t * fb;
+        Ok(Some(SeekPoint { byte, sample: t, exact: true, table: "pcm", landed: t }))
     }
 }
 

@@ -11,6 +11,10 @@ name = "audio_core"
 version = "0.1.0"
 
 [[package]]
+name = "av1_core"
+version = "0.1.0"
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -140,6 +144,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobs_core"
+version = "0.1.0"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,6 +214,7 @@ checksum = "f102c477fd4ec864c149803bf606ecc23bc9329602ec0f99073a728abf454abc"
 name = "pixel_core"
 version = "0.1.0"
 dependencies = [
+ "raw_core",
  "svg_core",
  "vp8_core",
 ]
@@ -258,6 +267,10 @@ version = "0.1.0"
 dependencies = [
  "libm",
 ]
+
+[[package]]
+name = "raw_core"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"
@@ -444,6 +457,7 @@ version = "0.1.0"
 dependencies = [
  "amber_core",
  "audio_core",
+ "av1_core",
  "cfg-if",
  "crypto_core",
  "demux_core",
@@ -454,6 +468,7 @@ dependencies = [
  "font8x8",
  "font_core",
  "holocron_core",
+ "jobs_core",
  "lazy_static",
  "ldso_core",
  "linked_list_allocator",
@@ -473,6 +488,7 @@ dependencies = [
  "usbnet_core",
  "vein_core",
  "volatile 0.6.1",
+ "vp8_core",
  "wifi_core",
  "x86_64",
 ]

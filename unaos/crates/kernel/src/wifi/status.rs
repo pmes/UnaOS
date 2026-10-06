@@ -61,3 +61,41 @@ pub fn scan_count() -> Option<u32> {
         n => Some(n),
     }
 }
+
+// ── WIFI6 (B439): S2r, C2's bound, the S4i MMIO unwind — recorded for `tests wifi`. ─────────────
+/// The S2r SPROM verdict: 0 unread, 1 PLAUSIBLE, 2 SUSPECT, 3 BLOCKED, 4 SHORT.
+static SPROM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// C2's MMIO bound in bytes as derived from the EROM (0 = not derived this boot).
+static C2_BOUND: AtomicU32 = AtomicU32::new(0);
+/// The S4i MMIO unwind: 0 not in this image, 1 armed (not needed), 2 ran verified=1, 3 ran verified=0.
+static UNWIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn set_sprom(v: u8) {
+    SPROM.store(v, Ordering::Relaxed);
+}
+pub fn sprom_token() -> &'static str {
+    match SPROM.load(Ordering::Relaxed) {
+        1 => "ok",
+        2 => "suspect",
+        3 => "blocked",
+        4 => "short",
+        _ => "unread",
+    }
+}
+pub fn set_c2_bound(b: u32) {
+    C2_BOUND.store(b, Ordering::Relaxed);
+}
+pub fn c2_bound() -> u32 {
+    C2_BOUND.load(Ordering::Relaxed)
+}
+pub fn set_unwind(v: u8) {
+    UNWIND.store(v, Ordering::Relaxed);
+}
+pub fn unwind_token() -> &'static str {
+    match UNWIND.load(Ordering::Relaxed) {
+        1 => "armed",
+        2 => "ran-verified",
+        3 => "ran-unverified",
+        _ => if cfg!(feature = "wifi5") { "armed-unreached" } else { "off" },
+    }
+}

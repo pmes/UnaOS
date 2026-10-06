@@ -326,6 +326,16 @@ impl Demuxer {
             .iter()
             .position(|t| t.kind == TrackKind::Video)
             .or(if self.tracks.is_empty() { None } else { Some(0) })?;
+        self.seek_track(ref_idx, target_ns)
+    }
+
+    /// SEEKTABLE (rmbp-ledger B433): the same seek with any track as the reference — an audio track's samples
+    /// are all sync samples (no `stss`), so this lands on the access unit whose presentation time is the last at
+    /// or before `target_ns` (`stts` times, `stsc`+`stco`+`stsz` offsets). Returns that sample's pts in ns.
+    pub fn seek_track(&mut self, ref_idx: usize, target_ns: i64) -> Option<i64> {
+        if ref_idx >= self.tracks.len() {
+            return None;
+        }
         let tb = self.tracks[ref_idx].timebase;
         let mut best: Option<(usize, i64)> = None;
         let mut first: Option<(usize, i64)> = None;

@@ -27,3 +27,25 @@ flew / unflown / proven / confirmed / refuted / landed on metal without citing a
 Cells older than the gate are keyed in `docs/dev/STATUS.baseline`, which only shrinks: when you touch one,
 give it a row and cite it, then delete its key. A ladder doc keeps its reasoning (DRIVERS-METHOD §3); its
 rung statuses live here.
+
+## The store is the volume; this table is its export (UNAOSVOLUME, B427)
+
+Peter, 2026-10-06: "can this be a next level jobs queue done within UnaOS using it's handlers and UnaFS? … we could
+use the image we write to our boot disk as the working drive so whenever UnaOS is ready to run on its own everything
+is already in place". The claims, the ledger rows and the queue items are records on a UnaFS volume, under `/jobs`:
+`/jobs/status/ST<n>` (the body is the claim), `/jobs/ledger/<track>/<id>` (the row), `/jobs/queue/<track>/<nnn>-<NAME>`
+(the item), every column a typed `job:*` attribute (`job:status` from the closed set, `job:flight` the bench's number
+or absent, `job:line`, `job:set_by`, `job:refs`, `job:owner`, `job:arc`, `job:seq`). **Mica** (`handlers/mica`,
+CODEX §2's Ledger) is the only writer, over the shared core `unaos/libs/sys/jobs_core` the kernel links to read
+`/jobs`:
+
+    ./arroyo jobs-image                                    # target/jobs-unafs.img from the repo; prints the witness
+    mica jobs add    --img I --set-by S --refs B1 <claim>  # a new ST<n>, status open
+    mica jobs cite   --repo R --img I --set-by S ST<n> confirmed f<n> <the wire line, whole>   # T2/T3/T4 refuse first
+    mica jobs query  --img I status=confirmed flight=f24
+    mica jobs export --repo R --img I                      # writes THIS table and the ledgers' rows back to git
+
+`STATUS.tsv` and the ledgers' status cells are the volume's EXPORT, byte-identical to what `tools/status-check.py`
+reads; the gate runs on the export until UnaOS runs it. The card build puts the same `/jobs` on p2 (the boot disk's
+UnaFS volume), so Quarry lists it with its job columns and `/jobs/queries/Open jobs` is a saved query.
+Host witness: `:: UNAOSVOLUME: records=<n> claims=<n> queue=<n> export=identical verify=<n>/<n> ::`.

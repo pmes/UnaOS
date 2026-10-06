@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! CHARTER: Kernel — wm
+//! CHARTER: Stria — owed B289 (an A/V player window: Stria's domain, CODEX §2; ARCHREVIEW F3 — was declared `Kernel — wm`)
 //!
 //! PLAYER (rmbp-ledger B419, MACPARITY row 30; cloud review §15 "(b) PLAYER (a window with transport controls)").
 //! Quarry's double-click on a sound opened nothing: `hda::play::request_open` played it headless and the only stop
@@ -14,8 +14,9 @@
 //!   close box, or any close the WM makes (Cmd-W, the File menu, Quit: the WINID holder clears [`WIN`]) — stops
 //!   the play. `tests play` keeps its own door path (the queue in `hda_play.rs`), untouched.
 //! * The play stays the HDA driver's (`drivers/hda_play.rs`, its PLAYER tail: `pause`, `seek_to`, `position_ms`,
-//!   `facts`). A coded seek is `method=decode-skip table=none` — audio_core has no seek table and
-//!   `demux_core::Demuxer::seek` is the video container's — a WAV seek `method=pcm-exact`.
+//!   `facts`). A seek is `method=table`: a WAV's byte offset (`table=pcm`), a coded file's container index through
+//!   `audio_core::Decoder::seek` in the `play-dec` job (SEEKTABLE B433: `table=flac|xing|vbri|cbr|mp4`); a format
+//!   with no table there (Ogg, ADTS) is `method=decode-skip table=none`.
 //! * F7/F8/F9 (previous / play-pause / next) reach [`media_key`] from `status::volkey_usage` (atomics only); the
 //!   next pass acts and arms BEZEL's play/pause glyph. With no player open the keys do nothing (said once).
 //! * The info line reads ATTRCOLUMNS' `media:duration_ms` / `media:codec` through `get_attr`; without them, the
@@ -40,6 +41,8 @@ const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_O
 /// Logical geometry (scaled by `crate::ui::px`).
 const W_L: usize = 480;
 const H_L: usize = 172;
+/// VIDEOPLAYER (B434): the video rect's logical height above the transport (16:9 at W_L; other shapes letterbox).
+const VH_L: usize = 270;
 const ICON_L: usize = 48;
 const TEXT_X: usize = 76;
 const SCRUB_Y: usize = 92;
@@ -107,6 +110,12 @@ struct State {
     w: usize,
     h: usize,
     surf: Vec<u32>,
+    /// VIDEOPLAYER (B434): a video's picture rect is the top `oy` rows; the transport paints below it (0 = audio).
+    oy: usize,
+    video: bool,
+    /// The container's facts reached the info line (the `[player] video` line printed).
+    #[allow(dead_code)] // read by the video arm only (UNAOS_VIDEO)
+    vsaid: bool,
 }
 
 // ── the HDA play, behind the one gate that has it ──────────────────────────────────────────────────────────
@@ -182,11 +191,11 @@ fn mmss(ms: u64) -> String {
 fn attr_facts(path: &str) -> (Option<u64>, Option<String>) {
     use crate::fs::vfs::{AttrValue, KERNEL_PRINCIPAL};
     let mt = crate::shell::vfs_mount_table();
-    let d = match mt.get_attr(path, "media:duration_ms", KERNEL_PRINCIPAL) {
+    let d = match mt.get_attr(path, crate::fs::attrfacts::DURATION, KERNEL_PRINCIPAL) {
         Ok(AttrValue::Int(v)) if v > 0 => Some(v as u64),
         _ => None,
     };
-    let c = match mt.get_attr(path, "media:codec", KERNEL_PRINCIPAL) {
+    let c = match mt.get_attr(path, crate::fs::attrfacts::CODEC, KERNEL_PRINCIPAL) {
         Ok(AttrValue::Str(s)) if !s.is_empty() => Some(s),
         _ => None,
     };
@@ -223,17 +232,22 @@ pub fn open(path: &str) -> Result<u32, String> {
     let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
     let (pw, ph) = (pi.width, pi.height);
     let w = px(W_L).min(pw.saturating_sub(2 * wm::BORDER()).max(1));
+    let video = vid::wants(path); // VIDEOPLAYER (B434): a video gets the picture rect above the transport
     let h = px(H_L).min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
+    let h = if video { (h + px(VH_L)).min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER() + crate::ui_status::chrome_h(ph) + crate::ui_status::top_chrome_h(pw, ph)).max(h)) } else { h };
+    let oy = if video { h.saturating_sub(px(H_L)) } else { 0 };
     let len = w * h;
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(len).is_err() {
         return Err(String::from("out of memory"));
     }
     surf.resize(len, theme::content_fill());
+    surf[..oy * w].fill(0);
     if is_open() || STATE.lock().is_some() {
         close("replace");
     }
-    let err = hw::open(path).err();
+    let err = if video { vid::start(path); None } else { hw::open(path).err() }; // VIDEOPLAYER: the video job first; its sound opens when the container names one
+
     let mut st = State {
         path: String::from(path),
         name: String::from(leaf(path)),
@@ -253,8 +267,13 @@ pub fn open(path: &str) -> Result<u32, String> {
         w,
         h,
         surf,
+        oy,
+        video,
+        vsaid: false,
     };
-    let _ = learn(&mut st);
+    if !video {
+        let _ = learn(&mut st);
+    }
     paint(&mut st);
     let (_s, ow, oh) = wm::spawn_geometry_native(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
@@ -294,6 +313,7 @@ pub fn close(by: &str) {
         return;
     }
     hw::stop();
+    vid::stop(); // VIDEOPLAYER (B434): the picture job ends with the window
     if id != wm::WIN_NONE {
         wm::close(id);
     }
@@ -372,6 +392,9 @@ fn tick() {
     if id == wm::WIN_NONE {
         return;
     }
+    if is_video() {
+        return vid::tick(); // VIDEOPLAYER (B434): the picture's clock and present
+    }
     let busy = hw::busy();
     let pos = if busy { hw::position_ms() } else { 0 };
     let Some(mut g) = STATE.try_lock() else { return };
@@ -419,6 +442,9 @@ fn repaint() {
 
 /// Play/pause (Space, the button, F8). An ended or refused play starts again from the top.
 fn toggle() {
+    if is_video() {
+        return vid::toggle(); // VIDEOPLAYER (B434)
+    }
     let (path, playing, ended, err) = match STATE.lock().as_ref() {
         Some(s) => (s.path.clone(), s.playing, s.ended, s.err.is_some()),
         None => return,
@@ -443,6 +469,9 @@ fn toggle() {
 
 /// Seek to `ms` (clamped to the duration); the play resumes there.
 fn seek(ms: u64) -> Option<(u64, &'static str)> {
+    if is_video() {
+        return vid::seek(ms); // VIDEOPLAYER (B434): 0 restarts; elsewhere owed (SEEKTABLE B433)
+    }
     let (path, dur) = match STATE.lock().as_ref() {
         Some(s) => (s.path.clone(), s.dur_ms),
         None => return None,
@@ -473,6 +502,7 @@ fn seek(ms: u64) -> Option<(u64, &'static str)> {
 /// F9 / "next" with one file: the play ends here.
 fn to_end() {
     hw::stop();
+    vid::stop();
     if let Some(s) = STATE.lock().as_mut() {
         s.playing = false;
         s.ended = true;
@@ -534,10 +564,16 @@ pub fn press_route(x: i32, y: i32) -> bool {
         return false;
     }
     wm::focus_changed(OWNER);
-    let (w, dur) = match STATE.lock().as_ref() {
-        Some(s) => (s.w, s.dur_ms),
+    let (w, dur, oy) = match STATE.lock().as_ref() {
+        Some(s) => (s.w, s.dur_ms, s.oy),
         None => return true,
     };
+    if ly < oy {
+        serial_println!("[player] press video -> {}", if playing() { "pause" } else { "play" }); // VIDEOPLAYER (B434): a click on the picture is play/pause
+        post(Act::Toggle);
+        return true;
+    }
+    let ly = ly - oy;
     let (s0, s1) = scrub_x(w);
     let (v0, v1) = vol_x();
     if lx >= px(BTN_X) && lx < px(BTN_X + BTN_D) && ly >= px(BTN_Y) && ly < px(BTN_Y + BTN_D) {
@@ -667,6 +703,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
 // ── the paint ──────────────────────────────────────────────────────────────────────────────────────────────
 
 fn fill(st: &mut State, x: usize, y: usize, w: usize, h: usize, c: u32) {
+    let y = y + st.oy; // VIDEOPLAYER (B434): the transport paints below the picture
     for yy in y..(y + h).min(st.h) {
         let row = yy * st.w;
         for xx in x..(x + w).min(st.w) {
@@ -676,6 +713,7 @@ fn fill(st: &mut State, x: usize, y: usize, w: usize, h: usize, c: u32) {
 }
 
 fn disc(st: &mut State, cx: usize, cy: usize, r: usize, c: u32) {
+    let cy = cy + st.oy;
     let r2 = (r * r) as i64;
     for yy in cy.saturating_sub(r)..(cy + r + 1).min(st.h) {
         for xx in cx.saturating_sub(r)..(cx + r + 1).min(st.w) {
@@ -699,7 +737,7 @@ fn wedge(st: &mut State, x: usize, y: usize, s: usize, c: u32) {
 
 fn text(st: &mut State, x: usize, y: usize, s: &str, ink: u32, bold: bool) -> usize {
     let (w, h) = (st.w, st.h);
-    super::text::draw_text(&mut st.surf, w, w.saturating_sub(px(8)), h, x, y, s.as_bytes(), ink, bold, super::text::Face::Ui)
+    super::text::draw_text(&mut st.surf, w, w.saturating_sub(px(8)), h, x, y + st.oy, s.as_bytes(), ink, bold, super::text::Face::Ui)
 }
 
 fn slider(st: &mut State, x0: usize, x1: usize, y: usize, done: usize, knob: bool) {
@@ -714,12 +752,13 @@ fn slider(st: &mut State, x0: usize, x1: usize, y: usize, done: usize, knob: boo
 }
 
 fn paint(st: &mut State) {
-    for p in st.surf.iter_mut() {
+    let o = st.oy * st.w; // VIDEOPLAYER (B434): the picture rect above `oy` is the job's, never cleared here
+    for p in st.surf[o..].iter_mut() {
         *p = theme::content_fill();
     }
     let (w, h) = (st.w, st.h);
     // the opener's APPRES icon (the player block), a plain tile when the registrar is busy this frame
-    if !crate::fs::appres::blit_key_icon(&mut st.surf, w, h, px(16), px(14), px(ICON_L), "player") {
+    if !crate::fs::appres::blit_key_icon(&mut st.surf, w, h, px(16), px(14) + st.oy, px(ICON_L), "player") {
         fill(st, px(16), px(14), px(ICON_L), px(ICON_L), theme::accent());
     }
     let name = st.name.clone();
@@ -785,12 +824,13 @@ fn ensure_registered() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("player", fixture);
+        vid::register(); // VIDEOPLAYER (B434): `tests videoplayer`
     }
 }
 
 /// `tests player` on TEST.WAV (staged in `/system/test-f`, else the user's home; else the PLAYWAV fixture body
 /// written to a scratch file): open → the window and a running stream; transport → pause clears RUN, play sets
-/// it again; seek → 1000 ms lands pcm-exact and runs; volume → the slider's level is the one model and the amp
+/// it again; seek → 1000 ms lands through the table (`method=table`, exact) and runs; volume → the slider's level is the one model and the amp
 /// reads it back; close → the window and the play are gone.
 pub fn fixture() {
     if !hw::LIVE {
@@ -859,9 +899,9 @@ pub fn fixture() {
     toggle();
     let resumed_ok = playing() && hw::pump_until(1000, hw::run_bit);
     let transport_ok = open_ok && paused_ok && resumed_ok;
-    // seek: 1000 ms, pcm-exact, and the stream runs from there
+    // seek: 1000 ms through the table (a WAV's is its byte offset: exact), and the stream runs from there
     let sk = seek(1000);
-    let seek_ok = matches!(sk, Some((l, "pcm-exact")) if l.abs_diff(1000) <= 1) && hw::pump_until(1000, hw::run_bit)
+    let seek_ok = matches!(sk, Some((l, "table")) if l.abs_diff(1000) <= 1) && hw::pump_until(1000, hw::run_bit)
         && STATE.lock().as_ref().map(|s| s.base_ms == sk.map(|v| v.0).unwrap_or(0)).unwrap_or(false);
     // volume: the slider's level is the model's, and the amp agrees (BEZEL's reading)
     let (l0, m0) = crate::video::status::volume();
@@ -895,8 +935,243 @@ pub fn fixture() {
         path, ran as u8, paused_ok as u8, resumed_ok as u8, sk, l0, target, amp
     );
     serial_println!(
-        ":: PLAYER: open={} transport={} seek={} volume={} close_stops={} -> {} ::",
-        w(open_ok), w(transport_ok), w(seek_ok), if shared { "shared" } else { "split" }, close_stops as u8,
+        ":: PLAYER: open={} transport={} seek={} method={} volume={} close_stops={} -> {} ::",
+        w(open_ok), w(transport_ok), w(seek_ok), sk.map(|v| v.1).unwrap_or("none"), if shared { "shared" } else { "split" }, close_stops as u8,
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// XHCIMEDIA (B438): take the pending media latch (`0` none, `1 + key`) — `tests xhcimedia` reads the router's effect.
+pub fn media_take() -> u8 {
+    MEDIA.swap(0, Ordering::AcqRel)
+}
+
+// ── VIDEOPLAYER (rmbp-ledger B434, MACPARITY row 30) — the Player plays video ─────────────────────────────────
+// The window above gains a picture rect (the top `oy` rows); the job, the queue and the clock are `video::vplay`'s
+// (Stria's fulfiller over demux_core + vp8_core + av1_core, R79). The transport is the audio player's: play/pause
+// drives the ring and the picture clock together; a seek in a video is OWED (SEEKTABLE B433) except to 0 (F7).
+
+fn is_video() -> bool {
+    STATE.lock().as_ref().map(|s| s.video).unwrap_or(false)
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+mod vid {
+    pub fn wants(_: &str) -> bool { false }
+    pub fn start(_: &str) {}
+    pub fn stop() {}
+    pub fn register() {}
+    pub fn tick() {}
+    pub fn toggle() {}
+    pub fn seek(_: u64) -> Option<(u64, &'static str)> { None }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+mod vid {
+    use super::{hw, paint, repaint, wm, Ordering, State, STATE, WIN};
+    use crate::video::vplay;
+    use alloc::string::String;
+
+    /// A video type (`video/*` by the one type check, `fs::filetype`). I/O: the file's head, on the service pass.
+    pub fn wants(path: &str) -> bool {
+        crate::fs::filetype::type_of(path).0.starts_with("video/")
+    }
+    pub fn start(path: &str) {
+        vplay::start(path);
+    }
+    pub fn stop() {
+        vplay::stop();
+    }
+    pub fn register() {
+        crate::tests::register("videoplayer", fixture);
+    }
+
+    fn restart(st: &mut State) {
+        hw::stop();
+        vplay::start(&st.path);
+        st.vsaid = false;
+        st.base_ms = 0;
+        st.shown_ms = 0;
+        st.ended = false;
+        st.playing = true;
+        st.err = None;
+        let o = st.oy * st.w;
+        st.surf[..o].fill(0);
+    }
+
+    /// Play/pause (Space, the button, a click on the picture, F8). An ended or refused video starts again.
+    pub fn toggle() {
+        {
+            let mut g = STATE.lock();
+            let Some(st) = g.as_mut() else { return };
+            if st.ended || st.err.is_some() {
+                restart(st);
+                serial_println!("[player] video restart path={}", st.path);
+            } else {
+                let on = st.playing;
+                if hw::busy() {
+                    let _ = hw::pause(on);
+                }
+                vplay::pause(on);
+                st.playing = !on;
+            }
+        }
+        repaint();
+    }
+
+    /// 0 (F7, Home) restarts; any other point is owed until the container's tables land (SEEKTABLE B433).
+    pub fn seek(ms: u64) -> Option<(u64, &'static str)> {
+        let out = {
+            let mut g = STATE.lock();
+            let st = g.as_mut()?;
+            if ms == 0 {
+                restart(st);
+                serial_println!("[player] seek to_ms=0 landed_ms=0 method=restart video=1");
+                Some((0, "restart"))
+            } else {
+                serial_println!("[player] seek to_ms={} video=owed (SEEKTABLE B433: keyframe seek rides the container's tables)", ms);
+                None
+            }
+        };
+        repaint();
+        out
+    }
+
+    /// The pass: the container's facts (once — the info line, the glass line, the sound), then the clock and at
+    /// most one present.
+    pub fn tick() {
+        let id = WIN.load(Ordering::Relaxed);
+        if id == wm::WIN_NONE {
+            return;
+        }
+        let mut sound: Option<String> = None;
+        let mut dirty = false;
+        {
+            let Some(mut g) = STATE.try_lock() else { return };
+            let Some(st) = g.as_mut() else { return };
+            if !st.vsaid {
+                if let Some(f) = vplay::facts() {
+                    st.vsaid = true;
+                    st.codec = String::from(f.codec);
+                    st.detail = alloc::format!("{}x{}, {} fps, sound {}", f.w, f.h, f.fps(), f.audio);
+                    st.dur_ms = f.dur_ms;
+                    st.src = "container";
+                    serial_println!(
+                        "[player] video codec={} size={}x{} fps={} frames={} duration_ms={} audio={} path={}",
+                        f.codec, f.w, f.h, f.fps(), f.frames, f.dur_ms, f.audio, st.path
+                    );
+                    if f.audio_ok && st.playing {
+                        sound = Some(st.path.clone());
+                    } else {
+                        vplay::audio_expected(false);
+                    }
+                    dirty = true;
+                } else if let Some(e) = vplay::err() {
+                    st.vsaid = true;
+                    serial_println!("[player] video refused path={} reason={}", st.path, e);
+                    st.err = Some(e);
+                    st.playing = false;
+                    dirty = true;
+                }
+                if dirty {
+                    paint(st);
+                }
+            }
+        }
+        if let Some(p) = sound {
+            let r = hw::open(&p);
+            vplay::audio_expected(r.is_ok());
+            serial_println!("[player] video sound={} path={}", match &r { Ok(_) => String::from("container"), Err(e) => alloc::format!("none ({})", e) }, p);
+        }
+        let busy = hw::busy();
+        let pos = if busy { hw::position_ms() } else { u64::MAX };
+        let Some(mut g) = STATE.try_lock() else { return };
+        let Some(st) = g.as_mut() else { return };
+        let audio = if busy && st.playing && pos != u64::MAX && pos > 0 { Some(st.base_ms + pos) } else { None };
+        let (w, oy) = (st.w, st.oy);
+        let (shown, clock) = if st.err.is_none() { vplay::present(&mut st.surf, w, oy, audio, st.playing) } else { (false, st.shown_ms) };
+        dirty |= shown;
+        let mut controls = false;
+        if st.playing && st.vsaid && st.err.is_none() && vplay::finished() && !busy {
+            st.playing = false;
+            st.ended = true;
+            let (dec, pres, drop, sync, smax, clk) = vplay::stats();
+            serial_println!(
+                "[player] ended path={} at_ms={} frames={} presented={} dropped={} av_sync_ms={} max={} clock={}",
+                st.path, clock, dec, pres, drop, sync, smax, clk
+            );
+            controls = true;
+        }
+        let el = if st.ended { st.dur_ms.max(st.shown_ms) } else if st.dur_ms > 0 { clock.min(st.dur_ms) } else { clock };
+        if el / 1000 != st.shown_ms / 1000 || el * 400 / st.dur_ms.max(1) != st.shown_ms * 400 / st.dur_ms.max(1) {
+            controls = true;
+        }
+        st.shown_ms = el;
+        if controls {
+            paint(st);
+        }
+        if dirty || controls {
+            drop(g);
+            let _ = wm::present(id);
+        }
+    }
+
+    /// `tests videoplayer` (R80: typed): TEST.WEBM (then TEST.MP4) in the Player to its end, the pass driven here
+    /// (the shell holds the render task while a test runs). One witness line per file.
+    pub fn fixture() {
+        let mt = crate::shell::vfs_mount_table();
+        let mut any = false;
+        for name in ["TEST.WEBM", "TEST.MP4"] {
+            let mut cands: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+            if let Some(c) = crate::fs::volumes::testf_find(&mt, name) {
+                cands.push(c);
+            }
+            cands.push(alloc::format!("/home/{}", name));
+            let Some(path) = cands.into_iter().find(|c| mt.stat(c).is_ok()) else {
+                serial_println!(":: VIDEOPLAYER: path={} reason=no-file (system/test-f or /home) -> SKIP ::", name);
+                continue;
+            };
+            any = true;
+            run_one(&path);
+        }
+        if !any {
+            serial_println!(":: VIDEOPLAYER: reason=no-TEST.WEBM-or-TEST.MP4 -> SKIP ::");
+        }
+    }
+
+    fn run_one(path: &str) {
+        let t0 = crate::arch::ms();
+        let opened = super::open(path);
+        let open_ok = opened.is_ok() && super::is_open() && super::shown() == path;
+        let mut limit = 20_000u64;
+        loop {
+            hw::pump_until(4, || false); // the HDA service (the ring's feed) — the desktop pass is not running
+            tick();
+            let (vsaid, dur, ended, err) = STATE.lock().as_ref().map(|s| (s.vsaid, s.dur_ms, s.ended, s.err.is_some())).unwrap_or((true, 0, true, true));
+            if vsaid && dur > 0 {
+                limit = limit.min(dur + 8_000);
+            }
+            if ended || err || crate::arch::ms().saturating_sub(t0) > limit {
+                break;
+            }
+            crate::arch::sched::sleep_ms(4);
+        }
+        let f = vplay::facts();
+        let (dec, pres, drop, sync, smax, clk) = vplay::stats();
+        let err = STATE.lock().as_ref().and_then(|s| s.err.clone());
+        let ended = STATE.lock().as_ref().map(|s| s.ended).unwrap_or(false);
+        super::close("fixture");
+        let frames = f.as_ref().map(|f| f.frames).unwrap_or(0);
+        let ok = open_ok && err.is_none() && ended && frames > 0 && dec == frames && pres > 0 && pres + drop == dec;
+        serial_println!(
+            "[player] video fixture path={} codec={} decoded={} presented={} dropped={} av_sync_max_ms={} ms={}{}",
+            path, f.as_ref().map(|f| f.codec).unwrap_or("-"), dec, pres, drop, smax, crate::arch::ms().saturating_sub(t0),
+            err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
+        );
+        serial_println!(
+            ":: VIDEOPLAYER: open={} frames={} dropped={} fps={} av_sync_ms={} clock={} codec={} -> {} ::",
+            if open_ok { "ok" } else { "bad" }, pres, drop, f.as_ref().map(|f| f.fps()).unwrap_or(0), sync, clk,
+            f.as_ref().map(|f| f.codec).unwrap_or("-"), if ok { "PASS" } else { "FAIL" }
+        );
+    }
 }

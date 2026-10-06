@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
-//! CHARTER: Kernel — kernel-by-ruling
+//! CHARTER: Kernel — kernel-by-ruling (B414 LOCKREG: the one kernel lock type)
 //! LOCKREG (rmbp-ledger B414) — ONE spin lock type for the kernel. Design: docs/dev/evidence/rmbp-1005/lockreg.md.
 //!
 //! [`Mutex<T>`] is spin's mutex with the same API (`new` const, `lock`, `try_lock`, `is_locked`, `force_unlock`,

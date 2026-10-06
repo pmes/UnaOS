@@ -74,7 +74,7 @@ static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// a composite read only in the benign present-tear sense every app surface
 /// shares (`wm` copies rows; a mid-paint read shows a mixed frame, corrected by
 /// the follow-up present).
-fn surf() -> &'static mut [u32] { let n = super::metrics::size(W) * super::metrics::size(H); let mut p = SURF_AT.load(Ordering::Acquire); if p == 0 { let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n].into_boxed_slice()); p = match SURF_AT.compare_exchange(0, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire) { Ok(_) => b.as_mut_ptr() as usize, Err(won) => won }; } unsafe { core::slice::from_raw_parts_mut(p as *mut u32, n) } }
+fn surf() -> &'static mut [u32] { super::metrics::leaked_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(H)) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {

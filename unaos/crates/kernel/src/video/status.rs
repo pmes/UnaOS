@@ -641,10 +641,7 @@ pub fn volume() -> (u8, bool) {
 /// Decoder seam: a key usage that just went DOWN. Returns `Some((key, amp_written))` when it was a
 /// volume key (0 up / 1 down / 2 mute). Runs in the polled HID service, never an interrupt.
 pub fn volkey_usage(usage: u8) -> Option<(u8, bool)> {
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    if (0x40..=0x42).contains(&usage) {
-        crate::video::player::media_key(usage - 0x40); // PLAYER (B419): F7/F8/F9 = previous / play-pause / next, latched for the open player
-    }
+    // XHCIMEDIA (B438): F7/F8/F9 (PLAYER B419) are `video::fnrow`'s now — the one router both pumps call.
     let key = match usage {
         0x45 => 0u8,
         0x44 => 1,
@@ -736,3 +733,165 @@ pub fn reading_is_fixture() -> bool {
     SRC.load(Ordering::Relaxed) == SRC_FIXTURE
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// STATUSTRAY (rmbp-ledger B426, MACPARITY row 3) — THE STATUS AREA'S OTHER ITEMS: input, network, volume, clock
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// MENUSTAT's rule, extended: the bar reads THIS MODEL, never a driver. The owners' facts (the codec's captured
+// amps, the dongle's PHY link, the radio's core, the lease, the keymap's table, the civil clock's anchor) are
+// read ONCE per desktop service pass by [`tray_publish`] — the same pass and the same gate as [`poll`] — and
+// stored here as relaxed atomics; the painter's [`tray`] is loads only. An item whose fact is UNKNOWN is `None`
+// and is not drawn (the clock's honest-or-absent rule generalised); the bar keeps its slots.
+
+/// The tray's items, LEFT to right on the bar. `ITEM_BATTERY` is MENUSTAT's item; it sits in this list so the
+/// menu module names every status item one way.
+pub const ITEM_INPUT: u8 = 0;
+pub const ITEM_NET: u8 = 1;
+pub const ITEM_VOLUME: u8 = 2;
+pub const ITEM_BATTERY: u8 = 3;
+pub const ITEM_CLOCK: u8 = 4;
+/// How many status items the model carries (the witness's `items=`).
+pub const ITEMS: u8 = 5;
+/// No item (a menu that is closed).
+pub const ITEM_NONE: u8 = 0xff;
+
+/// The item's wire name.
+pub fn item_name(i: u8) -> &'static str {
+    match i {
+        ITEM_INPUT => "input",
+        ITEM_NET => "net",
+        ITEM_VOLUME => "volume",
+        ITEM_BATTERY => "battery",
+        ITEM_CLOCK => "clock",
+        _ => "none",
+    }
+}
+
+/// The network medium.
+pub const NET_USB: u8 = 1;
+pub const NET_WIFI: u8 = 2;
+
+/// The network item's facts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Net {
+    /// [`NET_USB`] (the USB Ethernet dongle) or [`NET_WIFI`] (the radio).
+    pub medium: u8,
+    /// The PHY link (USB) / an association (Wi-Fi — none is measured yet, so `false`).
+    pub up: bool,
+    /// The leased address, when there is one.
+    pub ip: Option<[u8; 4]>,
+}
+
+/// **What the bar and the menus read** — one snapshot of the tray's facts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tray {
+    /// `(level 0..=16, muted)` once an output amp exists to drive; `None` with no sink.
+    pub volume: Option<(u8, bool)>,
+    /// `None` with no network device at all.
+    pub net: Option<Net>,
+    /// The input item's one fact: the PC table (Command role on Alt) is selected.
+    pub pc: bool,
+    /// The civil clock is anchored (SNTP, RTC or `date -s`).
+    pub clock: bool,
+}
+
+static TRAY_VOL: AtomicU8 = AtomicU8::new(0); // 1 = a sink exists
+static TRAY_NET: AtomicU64 = AtomicU64::new(0); // medium | up<<8 | has_ip<<9 | ip<<16
+static TRAY_CLOCK: AtomicU8 = AtomicU8::new(0);
+static TRAY_SEEN: AtomicU8 = AtomicU8::new(0); // 1 once a pass published
+
+/// **The owners' pass** — called beside [`poll`] on the desktop service pass. Reads only the owners' own
+/// accessors (each a relaxed load: no port, no lock that a composite holds), so it is not throttled.
+pub fn tray_publish() {
+    if !crate::boot::services_gate("status") {
+        return; // INSTALLBARE (R86): furniture's — nothing is published under the setter / the login screen
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "hda"))]
+    let sink = crate::drivers::hda::vol::ready();
+    #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
+    let sink = false;
+    TRAY_VOL.store(sink as u8, Ordering::Relaxed);
+    #[allow(unused_mut)]
+    let mut net: u64 = 0;
+    #[cfg(feature = "usbnet")]
+    {
+        use crate::drivers::xhci::usbnet as u;
+        if u::kind() != 0 || u::is_up() {
+            net = NET_USB as u64 | ((u::link_up() as u64) << 8);
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
+    if net == 0 && crate::wifi::status::d11_up() {
+        net = NET_WIFI as u64; // the radio's core is up; no association is measured, so `up` stays 0
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "smolnet"))]
+    if net != 0 {
+        if let Some(ip) = crate::smolnet::lease_ip() {
+            net |= (1 << 9) | ((u32::from_be_bytes(ip) as u64) << 16);
+        }
+    }
+    TRAY_NET.store(net, Ordering::Relaxed);
+    TRAY_CLOCK.store(crate::clock::try_unix_now().is_some() as u8, Ordering::Relaxed);
+    TRAY_SEEN.store(1, Ordering::Relaxed);
+    super::statusmenu::ensure_registered(); // `tests statustray` (R80: registered on the desktop pass, never run at boot)
+}
+
+/// **The painter's read**: relaxed loads, no lock, no allocation — legal from `strip::compose_all`. Before
+/// the first [`tray_publish`] every item is unknown, so nothing is drawn (the input item included: the
+/// tray appears with the session, not before it).
+pub fn tray() -> Option<Tray> {
+    if TRAY_SEEN.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let n = TRAY_NET.load(Ordering::Relaxed);
+    let net = match (n & 0xff) as u8 {
+        0 => None,
+        medium => Some(Net {
+            medium,
+            up: n & (1 << 8) != 0,
+            ip: if n & (1 << 9) != 0 { Some(((n >> 16) as u32).to_be_bytes()) } else { None },
+        }),
+    };
+    Some(Tray {
+        volume: if TRAY_VOL.load(Ordering::Relaxed) != 0 { Some(volume()) } else { None },
+        net,
+        pc: crate::video::keymap::pc_selected(),
+        clock: TRAY_CLOCK.load(Ordering::Relaxed) != 0,
+    })
+}
+
+/// Is item `i`'s fact known (drawn when the bar can seat it)? The battery answers from MENUSTAT; the clock
+/// is always drawn (CLOCKBAR's `--:--` stands until the anchor) and its menu says when it is not set.
+pub fn item_known(t: &Tray, i: u8) -> bool {
+    match i {
+        ITEM_INPUT | ITEM_CLOCK => true,
+        ITEM_NET => t.net.is_some(),
+        ITEM_VOLUME => t.volume.is_some(),
+        ITEM_BATTERY => bar_item().is_some(),
+        _ => false,
+    }
+}
+
+/// `tests statustray` fixture hook: replace the published facts (the next [`tray_publish`] restores the live ones).
+#[cfg(feature = "witness")]
+pub fn tray_inject(vol: bool, net: u64, clock: bool) {
+    TRAY_VOL.store(vol as u8, Ordering::Relaxed);
+    TRAY_NET.store(net, Ordering::Relaxed);
+    TRAY_CLOCK.store(clock as u8, Ordering::Relaxed);
+    TRAY_SEEN.store(1, Ordering::Relaxed);
+}
+
+/// The raw published words, for the fixture's save/restore.
+#[cfg(feature = "witness")]
+pub fn tray_raw() -> (u8, u64, u8, u8) {
+    (TRAY_VOL.load(Ordering::Relaxed), TRAY_NET.load(Ordering::Relaxed), TRAY_CLOCK.load(Ordering::Relaxed), TRAY_SEEN.load(Ordering::Relaxed))
+}
+
+#[cfg(feature = "witness")]
+pub fn tray_restore(r: (u8, u64, u8, u8)) {
+    TRAY_VOL.store(r.0, Ordering::Relaxed);
+    TRAY_NET.store(r.1, Ordering::Relaxed);
+    TRAY_CLOCK.store(r.2, Ordering::Relaxed);
+    TRAY_SEEN.store(r.3, Ordering::Relaxed);
+}

@@ -19,6 +19,7 @@
 //! | [`service`] | the dispatcher: owner-only, rate-limited unlock, the `Store` seam |
 //! | [`agent`] | the SSH agent protocol framing over the ring's Ed25519 keys |
 //! | [`keysource`] | the consumer rule: ask Holocron first, fall back only on NotFound |
+//! | [`root`] | THE store root (`<home>/.holocron`), named once for both rings, and the one-time legacy migration (B448) |
 //!
 //! Nothing here touches a file, a socket or a syscall; each ring brings its own [`service::Store`] and
 //! transport. One dependency: CRYPTOCORE (UnaOS-built).
@@ -35,6 +36,7 @@ pub mod frame;
 pub mod keysource;
 pub mod name;
 pub mod ring;
+pub mod root;
 pub mod seal;
 pub mod service;
 #[cfg(feature = "test-suite")]

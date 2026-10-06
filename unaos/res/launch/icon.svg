@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Launcher (UnaOS's own design). -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#264653"/>
+<path d="M32 10c8 6 12 16 10 28H22c-2-12 2-22 10-28z" fill="#f4a261"/><circle cx="32" cy="26" r="4" fill="#264653"/><path d="M22 38l-6 10 8-4M42 38l6 10-8-4" fill="#e76f51"/>
+</svg>

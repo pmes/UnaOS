@@ -44,6 +44,7 @@ pub mod files;
 pub mod appearance;
 pub mod login;
 pub mod modes;
+pub mod notify; // NOTIFYPANE (B435): the Notifications pane's rules
 pub mod rules;
 pub mod schema;
 pub mod trackpad; // TRACKPADPANE (B412): the Trackpad pane's rules

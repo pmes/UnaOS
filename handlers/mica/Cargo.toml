@@ -1,0 +1,20 @@
+[package]
+name = "mica"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Mica — CODEX §2's Ledger (structured data). UNAOSVOLUME (rmbp-ledger B427): the jobs on the UnaOS volume — Mica is their only writer."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mica"
+path = "src/main.rs"
+
+[dependencies]
+# The shared core both rings link (the record model, the export, verify, the query translation).
+jobs_core = { path = "../../unaos/libs/sys/jobs_core" }
+# The store: the UnaFS library `tools/unafs` wraps (host FileDevice + the in-memory MemDevice).
+unafs = { path = "../../unaos/libs/fs/unafs" }
+anyhow = "1.0"

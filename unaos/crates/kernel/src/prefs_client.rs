@@ -574,3 +574,58 @@ fn prefs_flush(_: usize) {
         );
     }
 }
+
+// ── BTKEYSEAL (rmbp-ledger B446): a raw relay for another handler's ring-3 tag ─────────────────────
+// The kernel-client row is the ONE row `bus_route` delivers kernel-originated answers to; a second
+// kernel client (the Bluetooth bond store asking Holocron) shares it — and NEXT_CORR, so the answers
+// never collide — instead of minting a second row. `prin` is the kernel's stamp for the caller (built from
+// the session table by the client, never claimed). The outgoing frame is wiped before it is dropped (a
+// SecretPut carries key bytes); the answer's frame too. Errors: the router's own errno (no fulfiller =
+// -ENOENT, full = -EAGAIN), -EINVAL for a tag below the registrable range, -ETIMEDOUT past `wait_ms`.
+#[cfg(feature = "busreg")]
+pub fn relay_tag(tag: u8, prin: [u8; 32], body: &[u8], wait_ms: u64) -> Result<(i32, Vec<u8>), i64> {
+    const ETIMEDOUT: i64 = -110;
+    if tag < una_abi::BUS_VERB_FULFIL_MIN || body.len() > crate::bus::BUS_BODY_MAX {
+        return Err(EINVAL);
+    }
+    let mut corr = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+    if corr == 0 {
+        corr = NEXT_CORR.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut f = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
+    let n = crate::bus::build_request(tag, corr, body, &mut f);
+    let routed = match crate::bus::frame_parse(&f[..n]) {
+        Ok(h) if crate::bus::request_validate(&h).is_ok() => {
+            crate::bus_route::route_request(crate::arch::syscall::busreg_ops(), KCLIENT_ROW, KCLIENT_GEN, prin, &h, &f[BUS_HDR_LEN..n])
+        }
+        _ => crate::bus_route::Route::Reply(EINVAL),
+    };
+    for b in f.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    match routed {
+        crate::bus_route::Route::Relayed => {}
+        crate::bus_route::Route::Reply(e) => return Err(if e == 0 { EINVAL } else { e }),
+        crate::bus_route::Route::Kernel => return Err(EINVAL),
+    }
+    let t0 = crate::arch::ms();
+    let mut spins = 0u32;
+    loop {
+        if let Some(mut fr) = take_reply(corr) {
+            let out = match crate::bus::frame_parse(&fr) {
+                Ok(h) if h.principal[0] == PRIN_KERNEL_REPLY => Ok((h.status, fr[BUS_HDR_LEN..].to_vec())),
+                _ => Err(EIO), // only a KERNEL-stamped reply is an answer
+            };
+            for b in fr.iter_mut() {
+                unsafe { core::ptr::write_volatile(b, 0) };
+            }
+            return out;
+        }
+        spins += 1;
+        if crate::arch::ms().saturating_sub(t0) >= wait_ms || spins >= RELAY_SPIN_MAX {
+            RELAY_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+            return Err(ETIMEDOUT);
+        }
+        core::hint::spin_loop();
+    }
+}

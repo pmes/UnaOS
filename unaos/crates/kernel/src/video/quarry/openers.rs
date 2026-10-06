@@ -4,8 +4,8 @@
 //! routing a file to the thing that opens it is the Finder's job, and it is done here and nowhere
 //! else.
 //!
-//! An opener id comes from `fs::assoc::opener_for` (the file's `una:preferred`, the type database's
-//! `una:opener`, or the builtin table). [`open`] maps it to the request the tree already has:
+//! An opener id comes from `fs::assoc::opener_for` (the file's `una:preferred`, the type
+//! registry's `una:preferred`, or the first registrant — FILETYPES B423). [`open`] maps it to the request the tree already has:
 //!
 //! | id | what runs |
 //! | :--- | :--- |
@@ -14,9 +14,10 @@
 //! | `textedit` | `video::textedit::request_open` when the user may edit the file, else the viewer |
 //! | `markdown` `json` | `video::fileview::request_open_styled` — the viewer with that renderer (QUARRY2) |
 //! | `play` | `drivers::hda::play::request_open` (x86 `UNAOS_HDA` + `UNAOS_HDATONE`) |
+//! | `player` | `video::player::request_open` — a video in the Player's picture window (x86 `UNAOS_VIDEO`, VIDEOPLAYER B434) |
 //! | `launch` | Quarry's `launch` — `arch::syscall::spawn_user_image_bg`, the seam `bg` takes |
 //! | `linux` | refused from the desktop: the Linux ABI runs a foreground session; the line names `linux <path>` |
-//! | `/a/PROGRAM.BIN` | launch that program, then hand it the file (below) |
+//! | `/a/PROGRAM.BIN` | launch that program, then hand it the file (below) — reached only for a REGISTRANT of the file's type (OPENERTRUST B447: `assoc::opener_for_in` refuses any other path a file's `una:preferred` names) |
 //!
 //! A RING-3 PROGRAM CANNOT BE GIVEN AN ARGV: `quarry.md` §7 item 8 — there is no `SYS_EXEC` with an
 //! argv. So the file path is delivered as one `BUS_VERB_NOTICE` frame in the spawned program's
@@ -34,6 +35,7 @@ pub fn available(id: &str) -> bool {
         "markdown" | "json" => true, // QUARRY2 (B336): the text viewer, rendered (`fileview::request_open_styled`)
         "facet" => cfg!(feature = "facet"),
         "play" => cfg!(all(target_arch = "x86_64", feature = "hda-tone")),
+        "player" => cfg!(all(target_arch = "x86_64", feature = "videoplayer")), // VIDEOPLAYER (B434): video in the Player (UNAOS_VIDEO)
         "linux" => cfg!(all(target_arch = "x86_64", feature = "linuxabi")),
         p if p.starts_with('/') => true,
         _ => false,
@@ -108,6 +110,20 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
             #[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
             serial_println!("[quarry] open PLAY path={} -> no audio in this build (UNAOS_HDA+UNAOS_HDATONE arm it)", path);
             alloc::format!("playing {}", leaf)
+        }
+        // VIDEOPLAYER (B434): video opens in the Player's picture window — latched like `play` (the job's I/O runs off the router).
+        "player" => {
+            #[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+            {
+                crate::video::player::request_open(path);
+                serial_println!("[quarry] open VIDEO path={} type={} -> player (latched for the render pass)", path, mime);
+                alloc::format!("playing {}", leaf)
+            }
+            #[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+            {
+                serial_println!("[quarry] open VIDEO path={} -> no video player in this build (UNAOS_VIDEO arms it)", path);
+                String::from("no video player in this build")
+            }
         }
         // FACET — LATCHED, not opened (click-router depth; see `facet::request_open`).
         "facet" => {

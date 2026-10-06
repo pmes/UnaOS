@@ -192,6 +192,30 @@ pub trait Source: Send {
     fn info(&self) -> Info;
     /// Decode the next block into `pcm`; `Ok(false)` at end of stream. A block may hold zero frames.
     fn block(&mut self, pcm: &mut Pcm) -> Result<bool>;
+    /// SEEKTABLE (rmbp B433): restart at a sync point at or before output sample `target`, found from the
+    /// container's own index; the next `block` starts at the returned point's `sample`. `Ok(None)` = this format
+    /// has no table here (the caller decodes from the top instead) — the stream is then unchanged.
+    fn seek(&mut self, _target: u64) -> Result<Option<SeekPoint>> { Ok(None) }
+}
+
+/// SEEKTABLE (rmbp B433): where a seek restarted the decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeekPoint {
+    /// The byte offset of the sync point the decode restarted at (the first pre-roll frame's, if any).
+    pub byte: u64,
+    /// The output sample the source's next block starts at (≤ the target).
+    pub sample: u64,
+    /// `sample` is known exactly (an index that counts samples); `false` = an estimate (Xing TOC, CBR),
+    /// within one frame.
+    pub exact: bool,
+    /// The index that answered: `pcm`, `flac`, `xing`, `vbri`, `cbr`, `mp4`.
+    pub table: &'static str,
+    /// The output sample playback resumes at, after the decoder drops the residual (filled by [`Decoder::seek`]).
+    pub landed: u64,
+}
+
+impl SeekPoint {
+    pub fn landed_ms(&self, rate: u32) -> u64 { if rate == 0 { 0 } else { self.landed * 1000 / rate as u64 } }
 }
 
 /// The one decoder API (Gneiss `dsp::audio`, Stria, PLAYBACK, the kernel's `play`).
@@ -214,13 +238,15 @@ pub struct Decoder {
     pcm: Pcm,
     pos: usize,
     done: bool,
+    /// SEEKTABLE: output frames still to drop after a seek (the residual between the sync point and the target).
+    drop: u64,
 }
 
 impl Decoder {
     /// Open an in-memory file.
     pub fn open_bytes(bytes: Vec<u8>) -> Result<Decoder> { <Decoder as AudioDecoder>::open(Box::new(VecReader::new(bytes))) }
     /// Wrap an already-built codec source.
-    pub fn from_source(src: Box<dyn Source>) -> Decoder { Decoder { src, pcm: Pcm::default(), pos: 0, done: false } }
+    pub fn from_source(src: Box<dyn Source>) -> Decoder { Decoder { src, pcm: Pcm::default(), pos: 0, done: false, drop: 0 } }
 
     fn refill(&mut self) -> Result<bool> {
         while self.pos >= self.pcm.frames {
@@ -228,8 +254,25 @@ impl Decoder {
             self.pos = 0;
             self.pcm.frames = 0;
             if !self.src.block(&mut self.pcm)? { self.done = true; return Ok(false); }
+            if self.drop > 0 { let k = self.drop.min(self.pcm.frames as u64); self.pos = k as usize; self.drop -= k; }
         }
         Ok(true)
+    }
+
+    /// SEEKTABLE (rmbp B433): seek to `ms` from the container's own index. The decode restarts at a sync point
+    /// at or before the target and the residual (under one frame) is decoded and dropped, so an `exact` point
+    /// lands on the target sample. `Ok(None)`: no table for this format (nothing moved; decode from the top).
+    pub fn seek(&mut self, ms: u64) -> Result<Option<SeekPoint>> {
+        let info = self.src.info();
+        let mut target = ms.saturating_mul(info.rate as u64) / 1000;
+        if let Some(t) = info.frames { target = target.min(t); }
+        let Some(mut p) = self.src.seek(target)? else { return Ok(None) };
+        self.pcm.frames = 0;
+        self.pos = 0;
+        self.done = false;
+        self.drop = target.saturating_sub(p.sample);
+        p.landed = p.sample + self.drop;
+        Ok(Some(p))
     }
 }
 

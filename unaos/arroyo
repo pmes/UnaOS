@@ -805,6 +805,10 @@ _feats="${_feats}sdw,"
 # image. Kept in sync with builder/src/main.rs. See
 # docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S5.
 [ -n "${UNAOS_WIFI4:-}" ] && _feats="${_feats}wifi4,"
+# WIFI-5 (WIFI6, B439): UNAOS_WIFI5=1 arms the S4i MMIO unwind of a failed S5i step (C2 pre-image
+# written back; no PHY register). Implies wifi3. x86_64-only, stripped by arm_features. Kept in sync
+# with builder/src/main.rs. OFF the metal line until WIFI5's C1 line reads NON-DISTURBING.
+[ -n "${UNAOS_WIFI5:-}" ] && _feats="${_feats}wifi5,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -1241,8 +1245,12 @@ fi
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
 # PANICSCREEN (B406, R95): UNAOS_PANIC_HOLD=1 holds the plain panic screen for the bench (no countdown, no restart). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PANIC_HOLD:-}" ] && _feats="${_feats}panic_hold,"
+# LIDSLEEP (B431): UNAOS_LIDSLEEP=1 arms rung 0 of the lid ladder — MSLD read-only on a 1 s poll, `[smc] lid=` on change (implies smc). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_LIDSLEEP:-}" ] && _feats="${_feats}lidsleep,"
 # SMALLFIX2 (B391, R94 §3): UNAOS_SVG=1 arms SVG as a picture — pixel_core's `svg` format (svg_core) in the kernel, so `image/svg+xml` types and opens in facet. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
+# VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay over demux_core + vp8_core + av1_core; links av1_core). x86 metal; the K8_FEATS arm in kernel8() compiles the dependency only. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_VIDEO:-}" ] && _feats="${_feats}videoplayer,"
 # KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
 [ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
@@ -1270,6 +1278,11 @@ fi
 # with builder/src/main.rs — a knob armed here but missing there ships the rung DISABLED on MEDIA
 # while the banner claims it is on.
 [ -n "${UNAOS_IVB3D_R8:-}" ] && _feats="${_feats}gen7,gen7r8,"
+# GEN7B (B422): UNAOS_IVB3D_BLIT=1 arms the BCS as KCOMP's second Blitter (drivers/gpu/gen7_blit.rs),
+# run by `tests gen7` only (R80): one BCS job into heap scratch through its own proven-unowned GGTT
+# window, every register restored, the panel never written; plus the read-only `[igpu-dpy] capture`.
+# Kept in sync with builder/src/main.rs. Media is NOT single-use.
+[ -n "${UNAOS_IVB3D_BLIT:-}" ] && _feats="${_feats}gen7,gen7blit,"
 # GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU with an unwind-stack
 # restore on the same call stack — no dwell, no timer (drivers/gpu/igpu.rs; round 13 removed the
 # timed auto-revert). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
@@ -3111,6 +3124,9 @@ arm_features() {
     # contain `,wifi,`, `,wifi2,` or `,wifi3,` as a substring, because the trailing comma is part of
     # every pattern.
     f="${f//,wifi4,/,}"
+    # WIFI-5 (B439) rides the same strip: `wifi5` implies `wifi3` and its only code is
+    # `src/wifi/bringup/unwind.rs`, inside the x86-gated `src/wifi/`.
+    f="${f//,wifi5,/,}"
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -3169,6 +3185,10 @@ arm_features() {
     # the two are order-independent (the patterns cannot overlap — `,gen7,` needs a comma where
     # `,gen7r8,` has an `r`) but neither works alone.
     f="${f//,gen7r8,/,}"
+    # GEN7B (B422): `gen7blit` is `drivers/gpu/gen7_blit.rs`, a child of the x86_64-only gen7.rs, and
+    # its `video/blitter.rs` slot is gated `all(target_arch = "x86_64", feature = "gen7blit")` — same
+    # strip, same reason (`gen7blit = ["gen7"]` would resolve `gen7` back ON).
+    f="${f//,gen7blit,/,}"
     # PCIH / NOASPM rides the same strip, for the same reason: every noaspm-gated byte lives in
     # the x86_64-only half of drivers/gpu/pcihealth.rs, so the feature emits not one byte of
     # aarch64 CODE — but an enabled feature is hashed into cargo's -Cmetadata fingerprint, so
@@ -6283,7 +6303,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -9041,6 +9061,15 @@ BRACEPY
         [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
     fi
 
+    # GATE-ARCH (ARCHREVIEW, B441, 2026-10-06): the CHARTER claims read against the file (a ruling behind
+    #   kernel-by-ruling, a core behind shared-core), `{}/.name` dotfiles, writes into Principia's settings
+    #   folder outside prefs.rs, an undeclared kernel store, a format magic outside the shared cores.
+    #   Shrink-only baseline `scripts/arch.baseline`; selftest first (exit 2 = NO verdict).
+    local _arrc=0
+    python3 "$WORKSPACE_DIR/scripts/arch-check.py" "$WORKSPACE_DIR" || _arrc=$?
+    [ "$_arrc" -eq 2 ] && echo -e "${COLOR_RED}❌ arch gate gave NO VERDICT — its selftest or controls did not fire${COLOR_RESET}"
+    [ "$_arrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a new architecture finding or a stale baseline row (see GATE-ARCH above)${COLOR_RESET}"; return 1; }
+
     # GATE-STATUS (STATUSTABLE, B425, 2026-10-06; Peter: "one status table to rule them all so a false claim
     #   ... can never be made"): every flew/unflown/confirmed/refuted claim in a ledger status cell or a queue
     #   STATE line cites an ST<n> row of docs/dev/STATUS.tsv, and a confirmed/refuted row's quoted line is found
@@ -9314,10 +9343,14 @@ esp_x86_unafs_card() {
         cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
             echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
     done
+    # UNAOSVOLUME (B427): the jobs onto the SAME volume — the working drive IS the boot disk's volume. `mica jobs
+    # build --into` is the one builder `./arroyo jobs-image` runs (records from STATUS.tsv, the ledgers, the queues;
+    # `job:*` attributes; `/jobs/queries/Open jobs`); its witness line is printed, its noise kept in the log.
+    jobs_into_volume "$vol" || return 1
     # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
     # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
     # ucode29_mimo.fw + ht0initvals29.fw + ht0bsinitvals29.fw stages the three files onto the UnaFS root at /FIRMWARE/
-    # (one of the three dirs the kernel's WIFI-1 pass searches — /, /B43/, /FIRMWARE/ — on the program-source volume),
+    # (one of the three dirs the kernel's WIFI-1 pass searches — /, /B43/, /FIRMWARE/ — on the boot card's own volumes; FWPIN),
     # so the dd carries them. Unset => nothing staged, the image byte-identical; set but not absolute, unreadable, or a
     # file missing => the build FAILS LOUDLY naming it (the same rule as UNAOS_XUSB_FW_PATH). No copy lands in the tree.
     # Re-added at merge17 after ROOTDISK2 rewrote this build (the block had landed at bbecdc12 on the dev branch).
@@ -9334,26 +9367,20 @@ esp_x86_unafs_card() {
                 echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put ${fw} failed — no card image${COLOR_RESET}"; return 1; }
         done
         echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
-    fi
-    # WIFI-FW (R95/Peter 2026-10-06 "we have the bunker for this"): the BCM4331 b43 firmware set is BENCH-ONLY and never
-    # in-tree (CLEAN_ROOM_POLICY §4; bcm4331.md §S4 option 1). UNAOS_WIFI_FW_PATH=<absolute dir in the bunker> holding
-    # ucode29_mimo.fw + ht0initvals29.fw + ht0bsinitvals29.fw stages the three files onto the UnaFS root at /FIRMWARE/
-    # (one of the three dirs the kernel's WIFI-1 pass searches — /, /B43/, /FIRMWARE/ — on the program-source volume),
-    # so the dd carries them. Unset => nothing staged, the image byte-identical; set but not absolute, unreadable, or a
-    # file missing => the build FAILS LOUDLY naming it (the same rule as UNAOS_XUSB_FW_PATH). No copy lands in the tree.
-    if [ -n "${UNAOS_WIFI_FW_PATH:-}" ]; then
-        case "$UNAOS_WIFI_FW_PATH" in /*) ;; *) echo -e "${COLOR_RED}❌ WIFI-FW: UNAOS_WIFI_FW_PATH must be absolute: ${UNAOS_WIFI_FW_PATH}${COLOR_RESET}"; return 1;; esac
-        local fw
-        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
-            [ -r "${UNAOS_WIFI_FW_PATH}/${fw}" ] || { echo -e "${COLOR_RED}❌ WIFI-FW: ${UNAOS_WIFI_FW_PATH}/${fw} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
+        # FWPIN (B455): the kernel stages a member ONLY when its SHA-256 equals its row in firmware/b43.pins (a fact about
+        # the bunker file, never its bytes). Print each digest, and say whether the in-tree pins already match; on the first
+        # build they do not (the file ships with no rows) and the kernel refuses with reason=unpinned until the seat pastes them.
+        local role sum bytes pinned pin_state="MATCH"
+        for fw in ucode29_mimo.fw:ucode ht0initvals29.fw:initvals ht0bsinitvals29.fw:bsinitvals; do
+            role="${fw##*:}"; fw="${fw%%:*}"
+            sum=$(sha256sum "${UNAOS_WIFI_FW_PATH}/${fw}" | cut -d' ' -f1)
+            bytes=$(stat -c %s "${UNAOS_WIFI_FW_PATH}/${fw}")
+            echo -e "${COLOR_YELLOW}⚡ WIFI-FW: ${fw} sha256=${sum} bytes=${bytes} pin-row: ${role} ${sum}${COLOR_RESET}"
+            pinned=$(awk -v r="$role" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/b43.pins" 2>/dev/null | head -1)
+            if [ -z "$pinned" ]; then [ "$pin_state" = "MATCH" ] && pin_state="UNPINNED"
+            elif [ "$pinned" != "$sum" ]; then pin_state="MISMATCH"; fi
         done
-        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- mkdir /FIRMWARE -i "$vol" >/dev/null || {
-            echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs mkdir /FIRMWARE failed — no card image${COLOR_RESET}"; return 1; }
-        for fw in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
-            cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${UNAOS_WIFI_FW_PATH}/${fw}" /FIRMWARE -i "$vol" >/dev/null || {
-                echo -e "${COLOR_RED}❌ WIFI-FW: tools/unafs put ${fw} failed — no card image${COLOR_RESET}"; return 1; }
-        done
-        echo -e "${COLOR_YELLOW}⚡ WIFI-FW: b43 set (3 files) from ${UNAOS_WIFI_FW_PATH} onto the UnaFS root at /FIRMWARE/ (bench-only, never in-tree)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}⚡ WIFI-FW: firmware/b43.pins vs the staged set -> ${pin_state} (the kernel stages only a pinned match; UNPINNED/MISMATCH boots read reason=unpinned/pin-mismatch)${COLOR_RESET}"
     fi
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
@@ -11771,6 +11798,10 @@ kernel8() {
         K8_FEATS="${K8_FEATS},svg"
         echo -e "${COLOR_YELLOW}  • UNAOS_SVG: SMALLFIX2 — SVG opens as a picture (pixel_core svg / svg_core)${COLOR_RESET}"
     fi
+    if [ -n "${UNAOS_VIDEO:-}" ]; then
+        K8_FEATS="${K8_FEATS},videoplayer"
+        echo -e "${COLOR_YELLOW}  • UNAOS_VIDEO: VIDEOPLAYER — the video cores linked (the Player's video window is x86's today)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"
         echo -e "${COLOR_YELLOW}  • UNAOS_FATPERF: the FAT/VFS cost instrument ([fatperf] op=list|read path= sectors= us= — measurement only, no behaviour change)${COLOR_RESET}"
@@ -13529,6 +13560,30 @@ knoboff() {
     return $rc
 }
 
+# UNAOSVOLUME (rmbp-ledger B427, Peter 2026-10-06: "we could use the image we write to our boot disk as the working
+# drive so whenever UnaOS is ready to run on its own everything is already in place"): the jobs as a UnaFS volume.
+# `./arroyo jobs-image` builds target/jobs-unafs.img from the repo's records with Mica (handlers/mica, the jobs' only
+# writer, over the shared core unaos/libs/sys/jobs_core): /jobs/status/ST<n>, /jobs/ledger/<track>/<id>,
+# /jobs/queue/<track>/<nnn>-<NAME>, the fields as typed `job:*` attributes, the saved query `/jobs/queries/Open jobs`.
+# The card build puts the same content onto p2 (`jobs_into_volume`). Host witness (both):
+#   :: UNAOSVOLUME: records=<n> claims=<n> queue=<n> export=identical verify=<n>/<n> ::
+# The git text (STATUS.tsv, the ledgers' status cells) is the volume's EXPORT: `mica jobs export --repo .. --img <img>`.
+jobs_into_volume() {
+    local vol="$1" into="${2---into}" log="${WORKSPACE_DIR}/target/jobs-build.log"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cargo run -q --manifest-path "${WORKSPACE_DIR}/../handlers/mica/Cargo.toml" -- \
+        jobs build --repo "${WORKSPACE_DIR}/.." --img "$vol" $into > "$log" 2>&1 || {
+        awk '!index($0,"[UNAFS] Broadcasting")' "$log" | tail -20
+        echo -e "${COLOR_RED}❌ UNAOSVOLUME: mica jobs build failed (${log#${WORKSPACE_DIR}/}) — no volume${COLOR_RESET}"; return 1; }
+    awk 'index($0,"[jobs] ") || index($0,":: UNAOSVOLUME:")' "$log"
+}
+jobs_image() {
+    local img="${WORKSPACE_DIR}/target/jobs-unafs.img"
+    rm -f "$img"
+    jobs_into_volume "$img" "" || return 1
+    echo -e "${COLOR_GREEN}✅ UNAOSVOLUME: ${img}${COLOR_RESET}"
+}
+
 # --- Entry Point ---
 
 case "${1:-}" in
@@ -13658,6 +13713,9 @@ case "${1:-}" in
         # Exit status IS the result (0 identical / 1 moved / 2 no verdict) — see knoboff() above.
         knoboff "${2:-}" "${3:-}" || exit $?
         ;;
+    jobs-image)
+        jobs_image
+        ;;
     clean)
         clean_all
         ;;
@@ -13668,7 +13726,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|jobs-image|clean]"
         exit 1
         ;;
 esac

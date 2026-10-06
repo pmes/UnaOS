@@ -227,7 +227,7 @@ fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("holocron", crate::keyring::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("holocron", crate::keyring::selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); }
     }
 }
 
@@ -307,7 +307,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); }
     }
 }
 
