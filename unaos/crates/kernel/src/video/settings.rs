@@ -1788,6 +1788,7 @@ fn press_appearance(row: usize, cx: usize) {
     };
     super::appearance::choose(kind, i);
     say(key, name, true);
+}
 
 // ── TRACKPADPANE (rmbp-ledger B412, MACPARITY row 16) — the Trackpad tab ───────────────────────────────────────────
 // Row 0 Tracking speed (a slider 1..10 that DRAGS through PREFSUI's capture seam, applied live as one gain on the
