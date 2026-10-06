@@ -148,6 +148,12 @@ enum Commands {
         #[arg(long)]
         repair: bool,
     },
+    /// NAMEINDEX (B432): drop and rebuild the volume's `una:fsname` index (every
+    /// name, lower-cased, per word start) and mark it ready — one commit.
+    Reindex {
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
     /// Grow the volume in place to BLOCKS 4 KiB blocks (UNAFSGROW): the image
     /// file is extended first, then the refcount map, then block 0 (the
     /// superblock, last). Refuses a shrink and a size the map cannot address.
@@ -980,6 +986,7 @@ async fn main() -> Result<()> {
                 println!("  catalog entries scrubbed: {}", report.scrubbed_catalog_entries);
                 println!("  blocks reclaimed     : {}", report.reclaimed_blocks);
                 println!("  parent links restamped: {}", report.bad_parent_links.len());
+                println!("  name index reindexed : {}", !report.name_index_missing.is_empty() || !report.name_index_stale.is_empty());
             } else {
                 let report = fs
                     .fsck(false)
@@ -994,10 +1001,23 @@ async fn main() -> Result<()> {
                 println!("  leaked blocks        : {}", report.leaked_blocks.len());
                 println!("  stale index inodes   : {}", report.orphan_inodes.len());
                 println!("  bad parent links     : {}", report.bad_parent_links.len());
+                let names = fs.name_index_check().map_err(|e| anyhow::anyhow!("name index check failed: {:?}", e))?;
+                println!(
+                    "  name index           : ready={} keys={} expected={} missing={} stale={}",
+                    names.ready, names.indexed, names.expected, report.name_index_missing.len(), report.name_index_stale.len()
+                );
                 if report.is_clean() {
                     println!("  ✅ volume is clean");
                 }
             }
+        }
+        Commands::Reindex { img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let t0 = std::time::Instant::now();
+            let names = fs.reindex_names().map_err(|e| anyhow::anyhow!("reindex failed: {:?}", e))?;
+            let keys = fs.name_index_count().map_err(|e| anyhow::anyhow!("reindex count failed: {:?}", e))?;
+            println!("[unafs] name-index built names={} keys={} ms={} img={}", names, keys, t0.elapsed().as_millis(), img);
         }
         Commands::Snaps { img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
