@@ -233,6 +233,12 @@ pub fn view_lines(records: &[Record], track: Option<&str>, n: usize) -> Vec<Stri
 /// A flight's captures (status-check.py `flight_files`): `docs/dev/evidence/**/f<N>-boot*.log` and
 /// `FLIGHT<a>[-<b>].md` covering N.
 pub fn flight_files(repo: &Path, n: u64) -> Vec<PathBuf> {
+    flight_files_of(repo, 'f', n)
+}
+
+/// STATUSORIN (B476, status-check.py `flight_files`): `kind` is `'f'` (rMBP: `f<N>-boot*.log`, `FLIGHT<a>[-<b>].md`)
+/// or `'r'` (Orin render N: `orin*/**/render<N>-*.log`, `boot-render<N>-*.log`, `FLIGHT-RESULT-render<N>.md`).
+pub fn flight_files_of(repo: &Path, kind: char, n: u64) -> Vec<PathBuf> {
     fn rec(dir: &Path, n: u64, out: &mut Vec<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -260,8 +266,33 @@ pub fn flight_files(repo: &Path, n: u64) -> Vec<PathBuf> {
             }
         }
     }
+    fn rec_orin(dir: &Path, n: u64, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rec_orin(&p, n, out);
+                continue;
+            }
+            let b = e.file_name().to_string_lossy().to_string();
+            let want = format!("render{}-", n);
+            let is_log = b.ends_with(".log") && (b.starts_with(&want) || b.strip_prefix("boot-").is_some_and(|r| r.starts_with(&want)));
+            if is_log || b == format!("FLIGHT-RESULT-render{}.md", n) {
+                out.push(p);
+            }
+        }
+    }
     let mut out = Vec::new();
-    rec(&repo.join("docs/dev/evidence"), n, &mut out);
+    if kind == 'r' {
+        let Ok(rd) = std::fs::read_dir(repo.join("docs/dev/evidence")) else { return out };
+        for e in rd.flatten() {
+            if e.path().is_dir() && e.file_name().to_string_lossy().starts_with("orin") {
+                rec_orin(&e.path(), n, &mut out);
+            }
+        }
+    } else {
+        rec(&repo.join("docs/dev/evidence"), n, &mut out);
+    }
     out.sort();
     out
 }
@@ -276,7 +307,7 @@ pub fn verify(repo: &Path, r: &Record) -> Option<bool> {
         return Some(false);
     }
     let n: u64 = fl[1..].parse().ok()?;
-    let blobs: Vec<Vec<u8>> = flight_files(repo, n).iter().filter_map(|p| std::fs::read(p).ok()).collect();
+    let blobs: Vec<Vec<u8>> = flight_files_of(repo, fl.chars().next().unwrap_or('f'), n).iter().filter_map(|p| std::fs::read(p).ok()).collect();
     let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
     Some(jc::verify_line(line, &refs))
 }
