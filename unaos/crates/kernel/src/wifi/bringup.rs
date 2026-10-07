@@ -863,7 +863,7 @@ fn end_line(dl: &Deadline, ok: bool, stage: &str, d11: &str, w: &Writes, restore
     // this line says where to look rather than leaving a reader to infer "no radio register moved".
     #[cfg(feature = "wifi4")]
     const CORE_REGS_NOTE: &str =
-        "audited — counted at the wifi3 upload rung's sites, the read-only shm-probe select included; RADIO_CONTROL (0x3E2) still has no write site in this file, and wifi4 writes the radio ADDRESS port (0x3F6) instead — counted on the wifi4 end line, not this one";
+        "audited — counted at the wifi3 upload rung's sites, the read-only shm-probe select included; RADIO_CONTROL (0x3E2) still has no write site in this file, and wifi4 writes the radio ADDRESS port (0x3F6) instead — counted on the wifi4 end line, not this one; WIFI7's live.rs SHM_CONTROL selects + restore are counted here";
     let (ev, eu) = fmt_dur(dl.elapsed());
     serial_println!(
         ":: wifi2: end ok={} stage={} d11={} wrote-cfg80={}(selftest={} moves={} restore={}) wrote-cfg0xac={}(moves={} restore={}) wrote-wrapper={}(enable={} unwind={}) wrote-core-regs={}({}) uploaded-bytes={}(audited) restore={} elapsed={}{} ::",
@@ -1470,6 +1470,11 @@ fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &
     // core's register. See [`phy_once`].
     #[cfg(feature = "wifi4")]
     phy_once(bar0);
+    // WIFI7 (B505): S5u, the ucode's revision read back from SHM, and S5d's boot snapshot — AFTER
+    // wifi4's end line (whose audit says it writes no SHM_CONTROL) and inside this arc's `Writes`, so
+    // the selects land in wifi2's audited `wrote-core-regs`. See `bringup/live.rs`.
+    #[cfg(feature = "wifi4")]
+    live::boot(bar0, bus, dev, func, d.base, w);
     true
 }
 
@@ -2471,15 +2476,17 @@ fn phy_once(bar0: u64) {
 
     // ── S5(b), the half that is REFUSED — and what it would take to build it. ────────────────────
     serial_println!(
-        ":: wifi4: phy-reset REFUSED reason=ai-wrapper-phy-reset-bit-UNPINNED — the SEQUENCE is citable: [SPEC-V4 802.11/CoreReset] orders \"reset the core on the backplane using the flags ORed with PHY Clock Enable and PHY Reset\", then \"wait for the PLL to turn on (150 microseconds)\" ([SPEC-V4 802.11/PHY]: \"between putting the PHY into reset and taking it out, there must be at least a 150 uSec delay for the PLL to settle\"), then take the PHY out of reset. The FLAG VALUES are pinned only for the SSB-era TM State Low register ([SPEC-V4 802.11/CoreFlags]: PHY Reset 0x00080000, PHY Clock Enable 0x00040000, MAC PHY Clock Control Enable 0x00100000) and THIS part is socitype 1 — an AI/BCMA part with an EROM (bcm4331.md §0, Boot AJ) — whose equivalent bits live in the AI wrapper IOCTL at +0x408, a register that appears in NEITHER spec generation (§S4-W5 fact 7 / residual 1: both document only the SSB-era backplane). IOCTL flag values are NOT composed from unpinned sources, which is the same rule the wifi3 prologue obeys by preserving the measured word instead of building one. So no PHY reset is performed and none is faked: what stands is the read-back above. WHAT WOULD SETTLE IT: an AI-wrapper IOCTL bit map for the d11 core from a Group-A source, or a metal reading that discriminates the bit ::"
+        ":: wifi4: phy-reset REFUSED reason=ai-wrapper-phy-reset-bit-UNPINNED -> DECLINED(S5r) {} — WIFI7 (B505): the tree's AI-wrapper map (`drivers/bcma.rs` WRAP_IOCTL/IOCTL_*) cites Linux bcma.h and b43, never a SPEC-V4 agent page, so no Group-A pin exists to take; the CoreFlags>>16 decode is coherence with PHY-ALIVE, not a pin; and S5-0's premise (the EFI's PHY tune survives S4) is exactly what a PHY reset would erase while S5c has no table to rebuild it. The SEQUENCE is citable: [SPEC-V4 802.11/CoreReset] orders \"reset the core on the backplane using the flags ORed with PHY Clock Enable and PHY Reset\", then \"wait for the PLL to turn on (150 microseconds)\" ([SPEC-V4 802.11/PHY]: \"between putting the PHY into reset and taking it out, there must be at least a 150 uSec delay for the PLL to settle\"), then take the PHY out of reset. The FLAG VALUES are pinned only for the SSB-era TM State Low register ([SPEC-V4 802.11/CoreFlags]: PHY Reset 0x00080000, PHY Clock Enable 0x00040000, MAC PHY Clock Control Enable 0x00100000) and THIS part is socitype 1 — an AI/BCMA part with an EROM (bcm4331.md §0, Boot AJ) — whose equivalent bits live in the AI wrapper IOCTL at +0x408, a register that appears in NEITHER spec generation (§S4-W5 fact 7 / residual 1: both document only the SSB-era backplane). IOCTL flag values are NOT composed from unpinned sources, which is the same rule the wifi3 prologue obeys by preserving the measured word instead of building one. So no PHY reset is performed and none is faked: what stands is the read-back above. WHAT WOULD SETTLE IT: an AI-wrapper IOCTL bit map for the d11 core from a Group-A source, or a metal reading that discriminates the bit ::",
+        live::s5r_advisory(ioctl)
     );
 
     // ── S5(c) and (d). ──────────────────────────────────────────────────────────────────────────
     serial_println!(
-        ":: wifi4: channel-tune REFUSED reason=htphy-2059-tables-UNPINNED — [SPEC-V4] carries radio pages for 2055/2056/2057/2062/2063 and channel tables for the A and B/G PHYs only; there is no HT-PHY (type 7) channel path and no 2059 radio page in either generation. Checked: /802.11/Radio/, /802.11/Radio/Channel/, /802.11/Radio/Init/, /802.11/Radio/Registers/, /802.11/Radio/RadioID/, /802.11/PHY/, /802.11/CoreReset/, /802.11/CoreFlags/ and the PageIndex on bcm-v4.sipsolutions.net, plus /Radio/, /RadioID/ and /RadioRegister/ on bcm-specs.sipsolutions.net. bcm4331.md §S5 says the tables \"cannot be derived, checked, or reasoned about — only transcribed\", and the only place to transcribe them from is off-limits for this module. NO register is written from a table that exists in no legal source ::"
+        ":: wifi4: channel-tune REFUSED reason=htphy-2059-tables-UNPINNED -> DECLINED(S5c) owed={} — WIFI7 (B505): the tables owed, by name, before any tune is written. [SPEC-V4] carries radio pages for 2055/2056/2057/2062/2063 and channel tables for the A and B/G PHYs only; there is no HT-PHY (type 7) channel path and no 2059 radio page in either generation. Checked: /802.11/Radio/, /802.11/Radio/Channel/, /802.11/Radio/Init/, /802.11/Radio/Registers/, /802.11/Radio/RadioID/, /802.11/PHY/, /802.11/CoreReset/, /802.11/CoreFlags/ and the PageIndex on bcm-v4.sipsolutions.net, plus /Radio/, /RadioID/ and /RadioRegister/ on bcm-specs.sipsolutions.net. bcm4331.md §S5 says the tables \"cannot be derived, checked, or reasoned about — only transcribed\", and the only place to transcribe them from is off-limits for this module. NO register is written from a table that exists in no legal source ::",
+        live::S5C_OWED
     );
     serial_println!(
-        ":: wifi4: rx-chain NOT ATTEMPTED reason=depends-on-channel-tune — §S5(d) sits on top of (c) and has no read-back predicate of its own before S6 in any case (bcm4331.md §S5: \"(c) and (d) do not, until S6\") ::"
+        ":: wifi4: rx-chain NOT ATTEMPTED reason=depends-on-channel-tune instead=s5d-on-efi-channel at=tests-wifi — WIFI7 (B505): the rung that needs no table, a 5 s SHM watch on the channel the firmware left (`[wifi] rx-watch`). §S5(d) sits on top of (c) and has no read-back predicate of its own before S6 in any case (bcm4331.md §S5: \"(c) and (d) do not, until S6\") ::"
     );
 
     phy_end(
@@ -2495,6 +2502,10 @@ fn phy_once(bar0: u64) {
 // WIFI5 M3 (B415): the pre-image captures (bcm4331.md §7 "Capture plan").
 #[cfg(feature = "wifi3")]
 mod capture;
+
+// WIFI7 (B505): S5u/S5r/S5c on the boot, S5d's 5 s SHM watch at `tests wifi`.
+#[cfg(feature = "wifi4")]
+pub(super) mod live;
 
 // WIFI6 (B439): rung S2r, the SPROM identity on the flown wifi2 path.
 mod ident;
