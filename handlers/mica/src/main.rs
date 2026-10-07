@@ -9,6 +9,7 @@
 //!   mica jobs verify  --repo R --img I
 //!   mica jobs list    --img I [claim|ledger|queue]
 //!   mica jobs query   --img I <status=confirmed flight=f24 | UnaFS query text>
+//!   mica jobs view    --img I [rmbp|orin|pi|trunk] [--n N]           the Jobs view: the counts, then the open queue items by rank
 //!   mica jobs export  --repo R --img I [--out DIR]               STATUS.tsv + the ledgers, written back (DIR defaults to R)
 //!   mica jobs witness --repo R [--img I]                         repo → volume → export: the witness line
 //!   mica jobs next    --img I [--repo R] [--track rmbp] [--n 13] [--after-flight N]   JOBSNEXT (B506): the next wave, ranked
@@ -37,10 +38,12 @@ struct Args {
     branch: String,
     status: String,
     tip: String,
+    // JOBSUI (B511): `mica jobs view --n N` (None = jobs_core::VIEW_ITEMS)
+    view_n: Option<usize>,
 }
 
 fn parse(v: &[String]) -> Result<Args> {
-    let mut a = Args { pos: vec![], repo: PathBuf::from("."), img: None, out: None, set_by: String::new(), refs: String::new(), size_mb: None, into: false, track: "rmbp".into(), n: 13, after_flight: None, arc: String::new(), branch: String::new(), status: String::new(), tip: String::new() };
+    let mut a = Args { pos: vec![], repo: PathBuf::from("."), img: None, out: None, set_by: String::new(), refs: String::new(), size_mb: None, into: false, track: "rmbp".into(), n: 13, after_flight: None, arc: String::new(), branch: String::new(), status: String::new(), tip: String::new(), view_n: None };
     let mut i = 0;
     while i < v.len() {
         let next = |i: usize| v.get(i + 1).cloned().ok_or_else(|| anyhow!("{} needs a value", v[i]));
@@ -51,6 +54,7 @@ fn parse(v: &[String]) -> Result<Args> {
             "--set-by" => { a.set_by = next(i)?; i += 1 }
             "--refs" => { a.refs = next(i)?; i += 1 }
             "--size-mb" => { a.size_mb = Some(next(i)?.parse()?); i += 1 }
+            "--view-n" => { a.view_n = Some(next(i)?.parse()?); i += 1 }
             "--into" => a.into = true,
             "--track" => { a.track = next(i)?; i += 1 }
             "--n" => { a.n = next(i)?.parse()?; i += 1 }
@@ -75,7 +79,7 @@ fn mount(img: &Option<String>) -> Result<FileSystem> {
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) != Some("jobs") || argv.len() < 2 {
-        bail!("usage: mica jobs <build|add|cite|verify|list|query|export|witness|next|cut|land|owed> … (see src/main.rs)");
+        bail!("usage: mica jobs <build|add|cite|verify|list|view|query|export|witness|next|cut|land|owed> … (see src/main.rs)");
     }
     let verb = argv[1].clone();
     let a = parse(&argv[2..])?;
@@ -140,6 +144,15 @@ fn main() -> Result<()> {
             let want = a.pos.first().and_then(|w| jc::Kind::from_word(w));
             for r in mica::load(&mut fs)?.iter().filter(|r| want.is_none_or(|k| r.kind == k)) {
                 println!("{}\t{}\t{}\t{}", r.path(), r.get(jc::K_STATUS), r.get(jc::K_FLIGHT), r.get(jc::K_ARC));
+            }
+        }
+        "view" => {
+            // JOBSUI (B511): the same jobs_core view the kernel draws on the glass.
+            let mut fs = mount(&a.img)?;
+            let recs = mica::load(&mut fs)?;
+            let n = a.view_n.unwrap_or(jc::VIEW_ITEMS);
+            for l in mica::view_lines(&recs, a.pos.first().map(String::as_str), n) {
+                println!("{l}");
             }
         }
         "query" => {

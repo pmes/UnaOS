@@ -210,7 +210,7 @@ fn scan(waited_ms: u64) {
 fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, AcqRel) {
-        crate::tests::register("jobscan", selftest);
+        crate::tests::register("jobscan", selftest); crate::tests::register("jobsui", ui_selftest); // JOBSUI (B511): `tests jobsui`
     }
 }
 
@@ -348,4 +348,171 @@ pub fn next_lines(n: usize, track: &str) -> Vec<String> {
         out.push(jobs_core::next_row(&recs, k + 1, t, ""));
     }
     out
+}
+
+// ── JOBSUI (rmbp-ledger B511) — the jobs on the glass ─────────────────────────────────────────────────────────────────
+// Peter (2026-10-07): "what happened to the new jobs queue?" — the counts and the queue's open items, VISIBLE, not only
+// on the wire. Mica (`handlers/mica`, CODEX §2's Ledger) owns the view's shape — `jobs_core`'s `counts_line` /
+// `item_row` / `shown_open` / `last_flight`, which `mica jobs view` renders on the host; the kernel FULFILS the reads
+// (R79): the four counts from the landed scan ([`counts`]), the items straight off `/jobs/queue/<track>` through the
+// VFS. Surfaces: the `jobs` shell verb ([`shell_verb`]) and Quarry's status line under `/jobs` ([`status_text`]).
+// While the scan is pending every surface says `jobs scanning…` (`scanning...` on the glass), never zeros.
+// Wire: `[jobsui] verb=jobs counts=<landed|pending> items_shown=<n> read=<files> ms=<ms>`;
+//       `[jobsui] quarry status=<pending|landed> text=<the line drawn>` (once per change);
+//       `tests jobsui` → `:: JOBSUI: counts=ok pending_said=1 items_shown=<n> -> PASS :: …` (R80: only when asked).
+
+/// Times a surface drew the pending line (the live half of `pending_said`).
+static UI_PENDING_DRAWN: AtomicU32 = AtomicU32::new(0);
+/// The last `jobs` verb's item count.
+static UI_ITEMS_SHOWN: AtomicU32 = AtomicU32::new(0);
+/// Files the item read examines at most (a queue whose first ranks are all closed cannot turn one verb into a scan).
+const UI_READ_CAP: u32 = 160;
+/// Bytes of an item's line read for its done mark and the flight it names.
+const UI_BODY_BYTES: usize = 4096;
+
+/// One open queue item, as the view shows it.
+pub struct ViewItem {
+    pub name: String,
+    pub track: &'static str,
+    pub status: String,
+    pub flight: String,
+}
+
+/// The four counts in `jobs_core`'s view order (records, claims, ledger, queue); `None` while the scan is pending.
+pub fn view_counts() -> Option<[u64; 4]> {
+    counts().map(|c| [c.records as u64, c.claims as u64, c.ledger as u64, c.queue as u64])
+}
+
+/// The counts line a glass surface draws (`jobs records=… claims=… ledger=… queue=…`, or `jobs scanning...`).
+pub fn status_text() -> String {
+    let c = view_counts();
+    if c.is_none() {
+        UI_PENDING_DRAWN.fetch_add(1, Relaxed);
+    }
+    jobs_core::glass(&jobs_core::counts_line(c))
+}
+
+/// The queue's open items by rank (track by track in `jobs_core::QUEUES` order, each in its `job:seq` order), at most
+/// `n`, optionally one `track` only. Reads `/jobs` through the VFS: one listing per track, then per item one attribute
+/// read (its `job:status`) and, for an open one, its line's head. `(items, files examined)`.
+pub fn open_items(n: usize, track: Option<&str>) -> (Vec<ViewItem>, u32) {
+    let mt = crate::shell::vfs_mount_table();
+    let mut out: Vec<ViewItem> = Vec::new();
+    let mut read = 0u32;
+    for (t, _) in jobs_core::QUEUES.iter() {
+        if out.len() >= n || read >= UI_READ_CAP {
+            break;
+        }
+        if track.is_some_and(|w| w != *t) {
+            continue;
+        }
+        let dir = format!("{}/{}/{}", jobs_core::ROOT, jobs_core::QUEUE_DIR, t);
+        let Ok(list) = mt.read_dir_kinds(&dir) else { continue };
+        let mut names: Vec<String> = list.into_iter().filter(|(_, k)| matches!(k, NodeKind::File)).map(|(nm, _)| nm).collect();
+        jobs_core::rank_order(&mut names);
+        for nm in names {
+            if out.len() >= n || read >= UI_READ_CAP {
+                break;
+            }
+            read += 1;
+            let path = format!("{}/{}", dir, nm);
+            let Ok(attrs) = mt.list_attrs(&path, crate::fs::vfs::KERNEL_PRINCIPAL) else { continue };
+            let attr = |k: &str| -> String {
+                attrs.iter().find(|(a, _)| a == k).and_then(|(_, v)| match v {
+                    crate::fs::vfs::AttrValue::Str(s) => Some(s.clone()),
+                    _ => None,
+                }).unwrap_or_default()
+            };
+            let status = attr(jobs_core::K_STATUS);
+            if status != "open" {
+                continue;
+            }
+            let head = mt.read(&path, 0, UI_BODY_BYTES).unwrap_or_default();
+            let body = match core::str::from_utf8(&head) {
+                Ok(s) => s,
+                Err(e) => core::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or(""),
+            };
+            if !jobs_core::shown_open(&status, body) {
+                continue;
+            }
+            let flight = jobs_core::last_flight(&attr(jobs_core::K_FLIGHT), body);
+            out.push(ViewItem { name: jobs_core::queue_name(&nm).1, track: *t, status, flight });
+        }
+    }
+    (out, read)
+}
+
+/// `jobs [<track>|bg|next]` — the read: the counts, then the queue's top ten open items. Returns `true` when the
+/// caller lists its background programs after (bare `jobs` keeps BGRUN-1's reaper; `jobs bg` is that list alone).
+pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) -> bool {
+    let track = match args.first().copied() {
+        None => None,
+        Some("bg") => return true,
+        Some("next") => {
+            console.println("jobs next: the ranked next wave is JOBSNEXT's (rmbp-ledger B506), not in this build — `jobs` is the read");
+            return false;
+        }
+        Some(w) if jobs_core::QUEUES.iter().any(|(t, _)| *t == w) => Some(w),
+        Some(_) => {
+            console.println("usage: jobs [rmbp|orin|pi|trunk|bg|next]   (the jobs on /jobs, then background programs)");
+            return false;
+        }
+    };
+    let t0 = crate::arch::ms();
+    if state() == "idle" {
+        owe(); // asked (R80): a session that never logged in scans now, the same chunked scan
+    }
+    let landed = counts().is_some();
+    console.println(&status_text());
+    let (items, read) = open_items(jobs_core::VIEW_ITEMS, track);
+    if items.is_empty() {
+        console.println("  no open queue items on /jobs");
+    } else {
+        console.println("  open queue items (rank = the queue's order):");
+        for (i, it) in items.iter().enumerate() {
+            console.println(&jobs_core::glass(&jobs_core::item_row(i + 1, &it.name, it.track, &it.status, &it.flight)));
+        }
+    }
+    UI_ITEMS_SHOWN.store(items.len() as u32, Relaxed);
+    serial_println!(
+        "[jobsui] verb=jobs counts={} items_shown={} read={} ms={}",
+        if landed { "landed" } else { "pending" },
+        items.len(),
+        read,
+        crate::arch::ms().saturating_sub(t0)
+    );
+    if track.is_none() {
+        console.println("background programs:");
+    }
+    track.is_none()
+}
+
+/// `tests jobsui` (R80: only when asked) — the counts as drawn, the pending line's words, the items the view shows.
+fn ui_selftest() {
+    let c = view_counts();
+    let counts = match c {
+        Some(v) => {
+            let l = jobs_core::counts_line(Some(v));
+            if v[0] == v[1] + v[2] + v[3] && l.contains(&format!("queue={}", v[3])) && !jobs_core::says_pending(&l) { "ok" } else { "FAIL" }
+        }
+        None => "pending",
+    };
+    // The pending line both surfaces draw (wire and glass spellings): the word, never a number.
+    let pend = jobs_core::counts_line(None);
+    let pending_said = jobs_core::says_pending(&pend) && jobs_core::says_pending(&jobs_core::glass(&pend));
+    let (items, read) = open_items(jobs_core::VIEW_ITEMS, None);
+    let queue = c.map_or(0, |v| v[3]);
+    let pass = counts == "ok" && pending_said && (!items.is_empty() || queue == 0);
+    serial_println!(
+        ":: JOBSUI: counts={} pending_said={} items_shown={} -> {} :: state={} live_pending={} verb_items={} read={} first={}",
+        counts,
+        pending_said as u8,
+        items.len(),
+        if pass { "PASS" } else { "FAIL" },
+        state(),
+        UI_PENDING_DRAWN.load(Relaxed),
+        UI_ITEMS_SHOWN.load(Relaxed),
+        read,
+        items.first().map_or("-", |i| i.name.as_str())
+    );
 }

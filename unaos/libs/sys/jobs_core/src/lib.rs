@@ -518,6 +518,100 @@ pub fn sanitize(s: &str) -> String {
     if t == "." || t == ".." { String::new() } else { t }
 }
 
+// ── the Jobs view (JOBSUI, rmbp-ledger B511) ───────────────────────────────────────────────────────
+// Peter (2026-10-07): "what happened to the new jobs queue?" — the queue on the volume is VISIBLE on the glass.
+// One shape for every surface (R79: one core): the counts at the top, the queue's open items by rank below. Mica
+// (`mica jobs view`) and the kernel (the `jobs` verb, Quarry's status line under `/jobs`) both render through these.
+
+/// What every surface says while the jobs scan has not landed (JOBSCAN B497) — never zeros.
+pub const PENDING: &str = "scanning…";
+/// The open items a view shows below the counts.
+pub const VIEW_ITEMS: usize = 10;
+
+/// The glass spelling of a view line: the kernel faces' ASCII page has no ellipsis.
+pub fn glass(s: &str) -> String {
+    s.replace('…', "...")
+}
+
+/// The counts line: `jobs records=<n> claims=<n> ledger=<n> queue=<n>` (records, claims, ledger, queue), or
+/// `jobs scanning…` while `None` (the scan is pending) — a pending store is never drawn as zeros.
+pub fn counts_line(c: Option<[u64; 4]>) -> String {
+    match c {
+        Some([r, cl, l, q]) => format!("jobs records={} claims={} ledger={} queue={}", r, cl, l, q),
+        None => format!("jobs {}", PENDING),
+    }
+}
+
+/// Does `line` say the pending state the way [`counts_line`] does — the word, and no number at all?
+pub fn says_pending(line: &str) -> bool {
+    line.contains(PENDING.trim_end_matches('…')) && !line.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// A queue file's rank (`job:seq`, the `<nnn>` its name opens with) and its shown name (the arc after the dash,
+/// or `#<nnn>` when the item names none).
+pub fn queue_name(file: &str) -> (i64, String) {
+    let digits: String = file.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let seq = digits.parse::<i64>().unwrap_or(i64::MAX);
+    let rest = file[digits.len()..].trim_start_matches('-');
+    (seq, if rest.is_empty() { format!("#{}", digits) } else { rest.to_string() })
+}
+
+/// The queue folder's files in rank order (the queue's own `job:seq`; JOBSNEXT's ranking, B506, replaces it).
+pub fn rank_order(names: &mut Vec<String>) {
+    names.sort_by_key(|n| queue_name(n).0);
+}
+
+/// Open for the view: `job:status` is `open` and the item's own line does not open with the queue's done mark.
+pub fn shown_open(status: &str, body: &str) -> bool {
+    status == "open" && !body.starts_with('✓')
+}
+
+/// The flight that last touched an item: its `job:flight` when carried, else the last `flight <n>` / `FLIGHT<n>` /
+/// `f<n>` its words name (as `f<n>`), else `-`.
+pub fn last_flight(flight_attr: &str, body: &str) -> String {
+    if !flight_attr.is_empty() {
+        return flight_attr.to_string();
+    }
+    let b = body.as_bytes();
+    let mut last: Option<&str> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let word_start = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let skip = if !word_start {
+            0
+        } else if b.len() - i > 6 && b[i..i + 6].eq_ignore_ascii_case(b"flight") {
+            if b.get(i + 6) == Some(&b' ') { 7 } else { 6 }
+        } else if b[i] == b'f' {
+            1
+        } else {
+            0
+        };
+        if skip > 0 {
+            let s = i + skip;
+            let mut e = s;
+            while e < b.len() && b[e].is_ascii_digit() {
+                e += 1;
+            }
+            if e > s && (e == b.len() || !b[e].is_ascii_alphanumeric()) {
+                last = Some(&body[s..e]);
+                i = e;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    match last {
+        Some(n) => format!("f{}", n),
+        None => String::from("-"),
+    }
+}
+
+/// One item row: `<rank>. <name> <track> <status> <flight>`.
+pub fn item_row(rank: usize, name: &str, track: &str, status: &str, flight: &str) -> String {
+    let short: String = name.chars().take(22).collect();
+    format!("{:>2}. {:<22} {:<5} {:<6} {}", rank, short, track, status, flight)
+}
+
 // ── verbs' pure halves ──────────────────────────────────────────────────────────────────────────────
 
 /// Is `status` in the closed set?
@@ -527,7 +621,7 @@ pub fn status_ok(status: &str) -> bool {
 
 /// `f<n>`?
 pub fn flight_ok(f: &str) -> bool {
-    f.len() > 1 && f.starts_with('f') && f[1..].bytes().all(|b| b.is_ascii_digit())
+    f.len() > 1 && (f.starts_with('f') || f.starts_with('r')) && f[1..].bytes().all(|b| b.is_ascii_digit()) // `f<n>` rMBP, `r<n>` Orin render n (STATUSORIN B476, status-check.py)
 }
 
 /// VERIFY: the quoted line found byte-for-byte in one of the flight's captures (status-check.py T3).

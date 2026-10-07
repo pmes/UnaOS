@@ -211,6 +211,25 @@ pub fn load<D: BlockDevice>(fs: &mut UnaFS<D>) -> Result<Vec<Record>> {
     Ok(out)
 }
 
+/// VIEW (JOBSUI, rmbp-ledger B511) — Mica's Jobs view: the counts at the top, the queue's open items by rank below
+/// (name, track, status, the flight that last touched it). The SAME `jobs_core` shape the kernel draws (the `jobs`
+/// verb, Quarry's status line under `/jobs`); `track` narrows the items to one queue, `n` caps them.
+pub fn view_lines(records: &[Record], track: Option<&str>, n: usize) -> Vec<String> {
+    let c = jc::census(records);
+    let mut out = vec![jc::counts_line(Some([c.records as u64, c.claims as u64, c.ledger as u64, c.queue as u64]))];
+    let rank = |t: &str| jc::QUEUES.iter().position(|(q, _)| *q == t).unwrap_or(usize::MAX);
+    let mut items: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.kind == Kind::Queue && track.is_none_or(|t| r.track == t) && jc::shown_open(r.get(jc::K_STATUS), &r.body))
+        .collect();
+    items.sort_by_key(|r| (rank(&r.track), r.seq));
+    for (i, r) in items.iter().take(n).enumerate() {
+        let flight = jc::last_flight(r.get(jc::K_FLIGHT), &r.body);
+        out.push(jc::item_row(i + 1, &jc::queue_name(&r.id).1, &r.track, r.get(jc::K_STATUS), &flight));
+    }
+    out
+}
+
 /// A flight's captures (status-check.py `flight_files`): `docs/dev/evidence/**/f<N>-boot*.log` and
 /// `FLIGHT<a>[-<b>].md` covering N.
 pub fn flight_files(repo: &Path, n: u64) -> Vec<PathBuf> {
