@@ -41,3 +41,4 @@ b43f32b1e55cb964026b35a2877c056e18dca69b121bbde3f9e4738d4eaa6b49 565655 docs/dev
 888705bc5e0d13f3ce2e2515ac2ebdb6dcfaac93b22a963516b3b9d35059065a 65944 docs/dev/evidence/rmbp-0915/flight26/f26-boot.log src=git@bc5efac2 by=seat-fold-from-hw-rmbp
 2044221162536a6a43e1d07130c42feb572eb9a806746a1d1f95d62e08b58897 246716 docs/dev/evidence/rmbp-0915/flight26/f26-boot2.log src=git@bc5efac2 by=seat-fold-from-hw-rmbp
 0483ad4416954369e7fd84183a256ca399e65226a9af6f9df1ba03a64340dc72 508207 docs/dev/evidence/rmbp-0915/flight26/f26-boot3.log src=git@bc5efac2 by=seat-fold-from-hw-rmbp
+9dfdeb531c6a972fcefa765217fba62576fa9299a87d32a08b5060db15d83419 1046020 docs/dev/evidence/rmbp-0915/flight27/f27-boot1.log src=/home/pmes/unaos-bench/capture/rmbp12-flight8/f27-boot1.slice.log host=toolbx utc=2026-10-07T14:40:11Z by=capture-pin
