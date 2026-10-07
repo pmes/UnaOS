@@ -1255,11 +1255,23 @@ fn restore_vacated(r: Rect) -> bool {
 /// **This function does not retry, defer, or hold anything.** Making a declined vacate arrive is a
 /// change to the damage discipline and belongs to a different arc; this one measures.
 pub fn vacate(name: &str, old: Rect, new: Option<Rect>, owed: bool) -> bool {
+    vacate_by(name, old, new, owed, "vacate", "-")
+}
+
+/// DOCKGONE (B498) — [`vacate`] with its CALLER named on the wire (`by=`, `reason=`), and the erase cut to the
+/// UNCOVERED BANDS: `old` minus `old ∩ new` ([`uncovered_bands`]), never a pixel `new` owns. Flight 27's dock vacate
+/// erased its whole 2770-wide box, the 2496 it was about to repaint included; a paint that then declined left the
+/// strip flat with nothing owing it a pass. A grow uncovers nothing and now erases nothing.
+pub fn vacate_by(name: &str, old: Rect, new: Option<Rect>, owed: bool, by: &str, reason: &str) -> bool {
     let c = &BARS[bar_slot(name)];
     bar_seen(c);
     c.vacates.fetch_add(1, Ordering::Relaxed);
     let px = bar_uncovered(old, new);
-    let erased = erase_rect(old);
+    let (bands, nb) = match new { Some(n) => uncovered_bands(old, n), None => ([old, (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)], 1) };
+    let mut erased = true;
+    for b in bands[..nb].iter() {
+        erased &= erase_rect(*b);
+    }
     if px == 0 {
         // A grow: the new rect covers every pixel the old one held, so nothing is uncovered and a
         // declined erase costs the panel nothing. Counted as a vacate and excluded from every risk
@@ -1277,14 +1289,14 @@ pub fn vacate(name: &str, old: Rect, new: Option<Rect>, owed: bool) -> bool {
             let n = c.forgotten.fetch_add(1, Ordering::Relaxed) + 1;
             if c.said.fetch_or(SAID_STALE, Ordering::Relaxed) & SAID_STALE == 0 {
                 serial_println!(
-                    "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=no owed=no forgotten={} -> STALE-ENDS",
-                    name, ow, oh, ox, oy, px, n
+                    "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=no owed=no forgotten={} by={} reason={} -> STALE-ENDS",
+                    name, ow, oh, ox, oy, px, n, by, reason
                 );
             }
         } else if c.said.fetch_or(SAID_UNERASED, Ordering::Relaxed) & SAID_UNERASED == 0 {
             serial_println!(
-                "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=no owed=yes -> UNERASED",
-                name, ow, oh, ox, oy, px
+                "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=no owed=yes by={} reason={} -> UNERASED",
+                name, ow, oh, ox, oy, px, by, reason
             );
         }
         return erased;
@@ -1303,14 +1315,18 @@ pub fn vacate(name: &str, old: Rect, new: Option<Rect>, owed: bool) -> bool {
     // `flat` is a span left flat. So `flat=0` is the fixed state on every board, and `flat > 0` means
     // a handback was asked for and could not be made — which is a defect the rollup must still be
     // able to report, not a case this arc made unreachable.
-    if restore_vacated(old) {
+    let mut handed = nb > 0;
+    for b in bands[..nb].iter() {
+        handed &= restore_vacated(*b);
+    }
+    if handed {
         c.restored.fetch_add(1, Ordering::Relaxed);
         c.restored_px.fetch_add(px, Ordering::Relaxed);
         if c.said.fetch_or(SAID_RESTORE, Ordering::Relaxed) & SAID_RESTORE == 0 {
             serial_println!(
-                "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=yes src={} -> SCENE-RESTORE",
+                "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=yes src={} by={} reason={} -> SCENE-RESTORE",
                 name, ow, oh, ox, oy, px,
-                if super::desktop_scene_owns_backdrop() { "scene" } else { "flat" }
+                if super::desktop_scene_owns_backdrop() { "scene" } else { "flat" }, by, reason
             );
         }
     } else {
@@ -1333,7 +1349,7 @@ pub fn settle(name: &str, new: Option<Rect>) -> bool {
         return false;
     }
     let old = unpack_rect(v);
-    if !vacate(name, old, new, true) {
+    if !vacate_by(name, old, new, true, "strip::settle", "debt") {
         return false;
     }
     c.owed_rect.store(0, Ordering::Relaxed);
@@ -1969,4 +1985,44 @@ fn lock_rollup(k: usize) {
         ERASE_DECL[LOCK_PANEL].load(Ordering::Relaxed),
         ERASE_DECL[LOCK_SCRATCH].load(Ordering::Relaxed)
     );
+}
+
+// ── DOCKGONE (rmbp-ledger B498) — the uncovered bands of a strip that moved or shrank ─────────────────────────
+
+/// `old` minus `old ∩ new`, as at most four disjoint rects (top, bottom, then the left and right ends of the
+/// overlap rows), in that order; `(bands, n)`. A disjoint `new` uncovers all of `old`; a `new` that covers `old`
+/// uncovers nothing (`n = 0`). The bands' areas sum to [`bar_uncovered`]'s count, by construction.
+pub fn uncovered_bands(old: Rect, new: Rect) -> ([Rect; 4], usize) {
+    let z: Rect = (0, 0, 0, 0);
+    let mut out = [z; 4];
+    let (ox, oy, ow, oh) = old;
+    let (nx, ny, nw, nh) = new;
+    if ow == 0 || oh == 0 {
+        return (out, 0);
+    }
+    let (x0, y0) = (ox.max(nx), oy.max(ny));
+    let (x1, y1) = ((ox + ow).min(nx + nw), (oy + oh).min(ny + nh));
+    if x1 <= x0 || y1 <= y0 {
+        out[0] = old;
+        return (out, 1);
+    }
+    let mut n = 0;
+    if y0 > oy { out[n] = (ox, oy, ow, y0 - oy); n += 1; }
+    if oy + oh > y1 { out[n] = (ox, y1, ow, oy + oh - y1); n += 1; }
+    if x0 > ox { out[n] = (ox, y0, x0 - ox, y1 - y0); n += 1; }
+    if ox + ow > x1 { out[n] = (x1, y0, ox + ow - x1, y1 - y0); n += 1; }
+    (out, n)
+}
+
+/// DOCKGONE — the pure arithmetic `tests dockgone` reads on flight 27's own rects: `(bands, px, none_meets_new)`.
+pub fn bands_check(old: Rect, new: Rect) -> (usize, u64, bool) {
+    let (b, n) = uncovered_bands(old, new);
+    let mut px = 0u64;
+    let mut clear = true;
+    for r in b[..n].iter() {
+        px += (r.2 as u64) * (r.3 as u64);
+        let meets = r.0 < new.0 + new.2 && new.0 < r.0 + r.2 && r.1 < new.1 + new.3 && new.1 < r.1 + r.3;
+        clear &= !meets;
+    }
+    (n, px, clear && px == bar_uncovered(old, Some(new)))
 }
