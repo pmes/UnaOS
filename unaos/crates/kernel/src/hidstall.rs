@@ -109,6 +109,7 @@ pub fn note_masked_since(t0_us: u64) {
 pub fn note_masked(ms: u64) {
     SEC_MASKED_MS.fetch_max(ms, Relaxed);
     MASKED_MAX_MS.fetch_max(ms, Relaxed);
+    SCOPE_MASKED_MS.fetch_max(ms, Relaxed); // REGISTRYCHUNK (B508): the scoped max ([`scope_masked_take`])
 }
 
 /// The second's longest masked UnaFS span, taken (reset) at `lag`'s roll.
@@ -144,4 +145,13 @@ fn selftest() {
         h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed),
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS
     );
+}
+
+/// REGISTRYCHUNK (rmbp-ledger B508): the longest masked UnaFS span on ANY core since the last take — a step reads
+/// it around itself (the registry build: one take before, one per object) to say its `masked_ms=`.
+static SCOPE_MASKED_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The scoped masked max since the last take (ms), reset.
+pub fn scope_masked_take() -> u64 {
+    SCOPE_MASKED_MS.swap(0, Relaxed)
 }

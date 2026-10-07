@@ -40,6 +40,7 @@ static WR_SECTORS: AtomicU64 = AtomicU64::new(0);
 pub fn note_read(sectors: u64) {
     RD_CMDS.fetch_add(1, Ordering::Relaxed);
     RD_SECTORS.fetch_add(sectors, Ordering::Relaxed);
+    scope_note(&SC_RD_CMDS, &SC_RD_SECTORS, sectors); // REGISTRYCHUNK (B508): the armed scope's own share
 }
 
 /// One write command of `sectors` 512 B sectors reached the medium.
@@ -47,6 +48,7 @@ pub fn note_read(sectors: u64) {
 pub fn note_write(sectors: u64) {
     WR_CMDS.fetch_add(1, Ordering::Relaxed);
     WR_SECTORS.fetch_add(sectors, Ordering::Relaxed);
+    scope_note(&SC_WR_CMDS, &SC_WR_SECTORS, sectors); // REGISTRYCHUNK (B508)
 }
 
 /// A snapshot of the medium counters.
@@ -232,4 +234,66 @@ pub fn overlaps(a_ms: u64, b_ms: u64) -> alloc::string::String {
 /// Every kept span, as [`overlaps`] prints them (`tests smallfix6`).
 pub fn spans() -> alloc::string::String {
     overlaps(0, u64::MAX)
+}
+
+// ── REGISTRYCHUNK (rmbp-ledger B508) — one core's share of the medium counters ─────────────────────────────────
+//
+// The counters above are the CARD's: every core's commands. A step that shares the card with another (flight 27:
+// the registry build beside the jobs scan) cannot name its own cost from them. A scope, armed by ONE task on ONE
+// core, also counts what that core issues (x86: `percpu::this_cpu`; elsewhere every command, said `global`).
+// One scope at a time; armed only after login (per-CPU state is up long before). Cost when disarmed: one load.
+
+const SCOPE_OFF: usize = usize::MAX;
+static SCOPE_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(SCOPE_OFF);
+static SC_RD_CMDS: AtomicU64 = AtomicU64::new(0);
+static SC_RD_SECTORS: AtomicU64 = AtomicU64::new(0);
+static SC_WR_CMDS: AtomicU64 = AtomicU64::new(0);
+static SC_WR_SECTORS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn scope_note(cmds: &AtomicU64, sectors: &AtomicU64, n: u64) {
+    let s = SCOPE_CPU.load(Ordering::Relaxed);
+    if s == SCOPE_OFF {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::arch::percpu::this_cpu().cpu_index as usize != s {
+        return;
+    }
+    cmds.fetch_add(1, Ordering::Relaxed);
+    sectors.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Arm the scope on the calling core (`true` = armed; `false` = another scope holds it — use [`io`]).
+pub fn scope_arm() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+    #[cfg(not(target_arch = "x86_64"))]
+    let cpu = 0usize;
+    SCOPE_CPU.compare_exchange(SCOPE_OFF, cpu, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+}
+
+/// Disarm the scope.
+pub fn scope_disarm() {
+    SCOPE_CPU.store(SCOPE_OFF, Ordering::Release);
+}
+
+/// The armed scope's counters now (deltas via [`Io::since`]).
+pub fn scope_io() -> Io {
+    Io {
+        rd_cmds: SC_RD_CMDS.load(Ordering::Relaxed),
+        rd_sectors: SC_RD_SECTORS.load(Ordering::Relaxed),
+        wr_cmds: SC_WR_CMDS.load(Ordering::Relaxed),
+        wr_sectors: SC_WR_SECTORS.load(Ordering::Relaxed),
+    }
+}
+
+/// What the scope's counts mean on the wire: `core<n>` (x86, one core's commands) or `global` (the card's).
+pub fn scope_word() -> alloc::string::String {
+    let s = SCOPE_CPU.load(Ordering::Relaxed);
+    if s == SCOPE_OFF || cfg!(not(target_arch = "x86_64")) {
+        alloc::string::String::from("global")
+    } else {
+        alloc::format!("core{}", s)
+    }
 }
