@@ -820,6 +820,19 @@ fn sec_roll(now_ms: u64) {
     let _ = w;
     let rw = if r[0] >= r[1] && r[0] >= r[2] { 0 } else if r[1] >= r[2] { 1 } else { 2 };
     let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS || seg_pu / 1000 >= STALL_MS; // INPUTSTALL2 M1: a pump step that held the HID pass is a stall second
+    // HIDSTALL2 (B509): `stage=` names what MADE the second a stall. Flight 27 printed `stage=hid stage_ms=2..8` 596 times
+    // because the label was the largest of six small numbers while the trigger was the render handler (`render_ms=108`)
+    // or a pump step; `stage=hid` now means the HID gap itself crossed the bound.
+    if stall && w_ms < STALL_MS {
+        if r[rw] / 1000 >= STALL_MS {
+            w_name = ["render-route", "render-handler", "render-composite"][rw];
+            w_ms = r[rw] / 1000;
+        } else {
+            w_name = "pump";
+            w_ms = seg_pu / 1000;
+        }
+    }
+    let (hold_ms, hold_ix) = crate::hidstall::take_sec_hold();
     // M4b (the seat, R86/QUIETBOOT): before `phase=desktop` a stall second is COUNTED, not printed; the first
     // roll at the desktop says the count in one line. R80: a measurement kept, not a test run.
     let desk = crate::boot::phase() == crate::boot::Phase::Desktop; if desk { crate::hidstall::note_sec(hid, MIN_KEYQ_US.load(Relaxed) / 1000); } // HIDSTALL (B485): the desktop's HID stall seconds and key-queue max
@@ -849,12 +862,13 @@ fn sec_roll(now_ms: u64) {
                 (ms_str(draw), ms_str(pre))
             };
             serial_println!(
-                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={}",
+                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={} holder={} hold_ms={}",
                 t0, now_ms.saturating_sub(t0), w_name, w_ms,
                 ms_str(st[0]), ms_str(st[1]), ms_str(st[2]), ms_str(st[3]), ms_str(st[4]), dw, pr,
                 ["route", "handler", "composite"][rw], ms_str(r[rw]),
                 passes, ms_str(pass_max), beam[3], beam[4], beam[0] / 1000, ms_str(beam[1]), beam[5], yields,
-                valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu), masked
+                valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu), masked,
+                crate::hidstall::HolderName(hold_ix), hold_ms
             );
         }
     }
@@ -862,6 +876,9 @@ fn sec_roll(now_ms: u64) {
     let m0 = MIN_T0_MS.load(Relaxed);
     if now_ms < m0 + MIN_MS || MIN_T0_MS.compare_exchange(m0, now_ms, Relaxed, Relaxed).is_err() {
         return;
+    }
+    if desk {
+        crate::hidstall::census_minute(); // HIDSTALL2 (B509): who held the hid pump's core this minute, every minute
     }
     let ev = MIN_EVENTS.swap(0, Relaxed);
     let kq = MIN_KEYQ_US.swap(0, Relaxed) / 1000;
@@ -877,6 +894,27 @@ fn sec_roll(now_ms: u64) {
         ":: INPUTSTALL: key_queue_max_ms={} comp_max_ms={} hid_gap_max_ms={} strand_pct={} bound={} -> {} :: events={} frames={} strands={} strand_bound_pct={} span={}s",
         kq, cm, hg, pct, STALL_MS, if verdict(kq, cm, hg, pct) { "PASS" } else { "FAIL" },
         ev, fr, sd, STRAND_PCT_BOUND, now_ms.saturating_sub(m0) / 1000
+    );
+}
+
+/// HIDSTALL2 (B509): `tests inputstall` — the LIVE minute's INPUTSTALL reading so far (nothing is reset; the minute line
+/// still prints at its roll). R80: registered by `hidstall::ensure`, run only by the verb.
+pub fn inputstall_selftest() {
+    if !ON {
+        serial_println!(":: INPUTSTALL: -> SKIP :: reason=no-wc via=tests");
+        return;
+    }
+    let ev = MIN_EVENTS.load(Relaxed);
+    let kq = MIN_KEYQ_US.load(Relaxed) / 1000;
+    let cm = MIN_COMP_US.load(Relaxed) / 1000;
+    let hg = MIN_HID_MS.load(Relaxed);
+    let fr = MIN_FRAMES.load(Relaxed) as u64;
+    let sd = MIN_STRANDS.load(Relaxed) as u64;
+    let pct = strand_pct(sd, fr);
+    serial_println!(
+        ":: INPUTSTALL: key_queue_max_ms={} comp_max_ms={} hid_gap_max_ms={} strand_pct={} bound={} -> {} :: events={} frames={} strands={} strand_bound_pct={} span={}s via=tests",
+        kq, cm, hg, pct, STALL_MS, if verdict(kq, cm, hg, pct) { "PASS" } else { "FAIL" },
+        ev, fr, sd, STRAND_PCT_BOUND, crate::arch::ms().saturating_sub(MIN_T0_MS.load(Relaxed)) / 1000
     );
 }
 
@@ -900,7 +938,13 @@ static BOOT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 fn stage_code(name: &str) -> u8 {
     match STAGES.iter().position(|s| *s == name) {
         Some(i) => i as u8,
-        None => 5,
+        None => match name {
+            "render-route" => 10, // HIDSTALL2 (B509): the stall's trigger names, as `stage_word` reads them back
+            "render-handler" => 11,
+            "render-composite" => 12,
+            "pump" => 13,
+            _ => 5,
+        },
     }
 }
 
@@ -910,6 +954,7 @@ fn stage_word(code: u8) -> &'static str {
         10 => "render-route",
         11 => "render-handler",
         12 => "render-composite",
+        13 => "pump",
         _ => "hid",
     }
 }
@@ -995,11 +1040,45 @@ pub fn seg(id: u8) {
     }
 }
 
+/// HIDSTALL2 (B509): the `usb-pump` step IN FLIGHT (its [`PUMP_NAMES`] id; 0 = between passes) — the loop's step order
+/// is fixed (`main.rs`'s `usb_pump`), so the step after the last mark is the one running. Read by the pump core's tick
+/// ISR to name a masked holder (`hidstall::note_hold`).
+static PUMP_CUR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The `usb-pump` loop's step order (`main.rs`'s `usb_pump`, the marks in sequence). Pure.
+pub fn pump_next(id: u8) -> u8 {
+    match id {
+        P_XHCI => P_HID,
+        P_HID => P_TYPEMATIC,
+        P_TYPEMATIC => P_STORE,
+        P_STORE => P_PRTSCR,
+        P_PRTSCR => P_SELFHOST,
+        P_SELFHOST => P_DESKAPP,
+        P_DESKAPP => P_ROOT,
+        P_ROOT => P_FATVERB,
+        P_FATVERB => P_WIFI,
+        P_WIFI => P_BOOTLOG,
+        P_BOOTLOG => P_CONSOLE,
+        P_CONSOLE => P_FLIGHT,
+        P_FLIGHT => P_UPROBES,
+        P_UPROBES => P_SUMMARY,
+        P_SUMMARY => P_NET,
+        _ => 0,
+    }
+}
+
+/// HIDSTALL2: the `usb-pump` step in flight (0 = none / not tracked).
+#[inline]
+pub fn pump_step_now() -> u8 {
+    PUMP_CUR.load(Relaxed)
+}
+
 /// The `usb-pump` loop's top (after its nap): the first step's interval starts here.
 #[inline]
 pub fn pump_top() {
     if ON {
         PUMP_LAST_US.store(now_us(), Relaxed);
+        PUMP_CUR.store(P_XHCI, Relaxed);
     }
 }
 
@@ -1009,6 +1088,7 @@ pub fn pump_seg(id: u8) {
     if !ON {
         return;
     }
+    PUMP_CUR.store(pump_next(id), Relaxed);
     let now = now_us();
     let last = PUMP_LAST_US.swap(now, Relaxed);
     if last != 0 && now > last {

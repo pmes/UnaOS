@@ -231,6 +231,8 @@ mod reg {
         acq: AtomicU64,
         tracked: AtomicU64,
         held_max: AtomicU64,
+        /// HIDSTALL2 (B509): this core's previous timer tick (TSC), for the hid pump core's masked-hold census.
+        tick_t: AtomicU64,
     }
 
     impl Part {
@@ -249,6 +251,7 @@ mod reg {
                 acq: AtomicU64::new(0),
                 tracked: AtomicU64::new(0),
                 held_max: AtomicU64::new(0),
+                tick_t: AtomicU64::new(0),
             }
         }
     }
@@ -560,12 +563,60 @@ mod reg {
         if !ON.load(Relaxed) {
             return;
         }
+        pump_core_hold();
         let now = crate::arch::ms();
         let due = NEXT_SCAN.load(Relaxed);
         if now < due || NEXT_SCAN.compare_exchange(due, now + SCAN_MS, Relaxed, Relaxed).is_err() {
             return;
         }
         scan();
+    }
+
+    /// HIDSTALL2 (B509) — the hid pump core's tick, measured. The LAPIC tick is 1 ms; a masked span on this core holds
+    /// the tick pending, and it is taken the instant interrupts return — on the task that masked them. So a tick-to-tick
+    /// gap here past one tick IS a masked hold, and the current task, the `usb-pump` step in flight and the outermost lock
+    /// the task still holds (its acquire site = the caller's own function) name its holder (`hidstall::note_hold`).
+    /// Every core keeps its stamp; only the pump core charges. Atomics only (ISR).
+    #[inline]
+    fn pump_core_hold() {
+        let Some((tid, cpu)) = who() else { return };
+        let p = &PARTS[cpu];
+        let t = rdtsc();
+        let last = p.tick_t.swap(t, Relaxed);
+        if last == 0 || cpu != crate::hidstall::pump_cpu() {
+            return;
+        }
+        let hz = crate::arch::apic::tsc_hz();
+        if hz < 1000 {
+            return;
+        }
+        let gap_ms = t.wrapping_sub(last) / (hz / 1000);
+        if gap_ms <= 1 + crate::hidstall::HOLD_OVER_MS || gap_ms > (u64::MAX >> 8) {
+            return;
+        }
+        let name = crate::arch::sched::current_name();
+        let step = if matches!(name, Some("usb-pump")) { crate::video::lag::pump_step_now() } else { 0 };
+        crate::hidstall::note_hold(gap_ms - 1, name, outer_site(p, tid), step);
+    }
+
+    /// The acquire site (`&'static Location` as usize, 0 = none) of the OLDEST hold task `tid` has on partition `p`.
+    fn outer_site(p: &Part, tid: u64) -> usize {
+        let (mut best_t, mut site) = (u64::MAX, 0usize);
+        let mut bits = p.mask.load(Acquire);
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let tag = p.tag[i].load(Acquire);
+            if tag == 0 || tag_tid(tag) != tid {
+                continue;
+            }
+            let t0 = p.t0[i].load(Relaxed);
+            if t0 < best_t {
+                best_t = t0;
+                site = p.at[i].load(Relaxed) as usize;
+            }
+        }
+        site
     }
 
     fn scan() {
