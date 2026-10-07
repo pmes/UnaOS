@@ -794,6 +794,7 @@ pub fn hold_release(by: &str) {
     crate::video::wm::clear_modal_top(id);
     crate::video::wm::close(id);
     *HOLD_SURF.lock() = None; // after the row is gone: nothing reads the surface any more
+    OVER_UP.store(false, Ordering::Relaxed); crate::fs::bootstep::splash_released(by); // SPLASHSTALL (B510): the splash's waits (`store-wait`, `first-screen`) end with the glass
     crate::bootlog_println!(
         "[splash] held_ms={} released_by={} fade_ms={}",
         t_rel.saturating_sub(HOLD_T0.load(Ordering::Relaxed)),
@@ -891,6 +892,7 @@ pub fn step_label(text: &str) {
             return;
         }
         let y0 = h - band_h * 3;
+        if OVER_UP.swap(false, Ordering::Relaxed) { over_band_clear(surf, w, y0 + band_h, band_h); } // SPLASHSTALL (B510): a new step's word takes the old step's OVER line off the glass
         let put = |s: &mut alloc::vec::Vec<u8>, o: usize, px: u32| s[o..o + 4].copy_from_slice(&px.to_le_bytes());
         for y in y0..y0 + band_h {
             for x in 0..w {
@@ -915,9 +917,102 @@ pub fn step_label(text: &str) {
         //
         (y0, band_h, w)
     };
-    crate::video::wm::damage_intersecting(0, band.0, band.2, band.1);
+    crate::video::wm::damage_intersecting(0, band.0, band.2, band.1 * 2); // SPLASHSTALL (B510): the word's band and the OVER band under it
     crate::video::wm::composite();
 }
+
+// =================================================================================================
+// SPLASHSTALL (rmbp-ledger B510) — the watchdog's line on the panel, UNDER the step's word. Flight 26's two
+// stalled boots had no wire (the FTDI had not enumerated or had died), so the panel is the only surface a
+// stall can be read from. `fs::bootstep::poll` calls this from the watchdog task, NOT the stepping task, so
+// it may not wait on anything the stepping task can hold: the surface by `try_lock`, the panel handle by
+// `try_lock`, and NO `wm` call (`damage_intersecting` / `composite` lock the window table). The band is
+// written into the held surface (a compositor that is alive re-composites it unchanged) AND straight onto
+// the panel (a compositor that is wedged never would). `""` clears the band.
+
+/// Whether the OVER band is painted (the next step's word clears it).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static OVER_UP: AtomicBool = AtomicBool::new(false);
+
+/// Whether the splash holds the glass (a held row is open) — the steps that are the splash's own waits
+/// (`store-wait`, `first-screen`) exist only while this is true.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn holding() -> bool {
+    HOLD_WIN.load(Ordering::Acquire) != 0
+}
+
+/// Fill the OVER band (rows `y0..y0+band_h`) with the splash's backdrop.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn over_band_clear(surf: &mut alloc::vec::Vec<u8>, w: usize, y0: usize, band_h: usize) {
+    let px = SPLASH_BG.to_le_bytes();
+    for y in y0..y0 + band_h {
+        for x in 0..w {
+            let o = (y * w + x) * 4;
+            if o + 4 <= surf.len() {
+                surf[o..o + 4].copy_from_slice(&px);
+            }
+        }
+    }
+}
+
+/// Paint `text` as the OVER line under the step's word (or clear it with `""`), on the surface and the panel.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn over_label(text: &str) {
+    if HOLD_WIN.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let ch = crate::video::font::Face::Chrome.cell_h();
+    let Some(mut g) = HOLD_SURF.try_lock() else { return };
+    let Some((surf, w, h)) = g.as_mut() else { return };
+    let (w, h) = (*w, *h);
+    let band_h = ch * 2;
+    if w == 0 || h < band_h * 4 || surf.len() < w * h * 4 {
+        return;
+    }
+    let y0 = h - band_h * 2;
+    over_band_clear(surf, w, y0, band_h);
+    if !text.is_empty() {
+        let bytes = text.as_bytes();
+        let n = crate::video::text::fit(bytes, false, crate::video::text::Face::Chrome, w);
+        let x0 = (w - crate::video::text::advance(&bytes[..n], false, crate::video::text::Face::Chrome).min(w)) / 2;
+        let ty = y0 + (band_h - ch) / 2;
+        let put = |s: &mut alloc::vec::Vec<u8>, o: usize, px: u32| s[o..o + 4].copy_from_slice(&px.to_le_bytes());
+        let _ = crate::video::text::draw_with(&bytes[..n], false, crate::video::text::Face::Chrome, x0, ty as isize, w - x0, crate::video::theme::painter::SPLASH_CAPTION_INK, &mut |px, py, a| {
+            if px < 0 || py < 0 || px as usize >= w || py as usize >= h {
+                return;
+            }
+            let o = (py as usize * w + px as usize) * 4;
+            let bg = u32::from_le_bytes([surf[o], surf[o + 1], surf[o + 2], surf[o + 3]]);
+            put(surf, o, crate::video::font::blend(bg, crate::video::theme::painter::SPLASH_CAPTION_INK, a));
+        });
+    }
+    OVER_UP.store(!text.is_empty(), Ordering::Relaxed);
+    // Straight onto the panel: the same handle and geometry test `takeover_blit` uses. A busy handle skips
+    // this look (the next one, 5 s on, tries again); a compositor that is alive carries the surface anyway.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(fbg) = crate::video::WRITER.try_lock() {
+        let fb = *fbg;
+        drop(fbg);
+        let i = fb.info();
+        if fb.is_ready() && i.bytes_per_pixel == 4 && i.width == w && i.height == h {
+            let (row, pitch) = (w * 4, i.stride * 4);
+            for y in y0..y0 + band_h {
+                fb.blit(y * pitch, &surf[y * row..(y + 1) * row]);
+            }
+            fb.flush_rect(0, y0, w, band_h);
+        }
+    }
+}
+
+/// SPLASHSTALL: builds without a compositor hold no glass.
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn holding() -> bool {
+    false
+}
+
+/// SPLASHSTALL: builds without a compositor have no panel line to paint.
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn over_label(_text: &str) {}
 
 /// BOOT80: builds without a compositor hold no glass to label.
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
