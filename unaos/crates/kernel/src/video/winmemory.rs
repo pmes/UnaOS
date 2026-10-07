@@ -31,7 +31,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::{WinId, WIN_NONE};
 
@@ -250,6 +250,9 @@ fn flush_once() -> usize {
     for (name, lit, on) in &batch {
         let k = alloc::format!("{}.{}", name, KEY);
         let ok = crate::prefs::set_applied(prefs_core::files::APP_NS, &k, prefs_core::PrefValue::Str(lit.clone())).is_ok();
+        if ok {
+            SAVES.fetch_add(1, Ordering::Relaxed); // SMALLFIX7 (B501): `saves_this_boot=`
+        }
         serial_println!("[winmem] save app={} frame={} on={} ok={}", name, lit, on, ok as u8);
     }
     batch.len()
@@ -314,7 +317,10 @@ fn selftest() {
     let w2 = mk();
     let o2 = origin(w2);
     let step = super::cascade_step();
-    let cascade = matches!((o1, o2), (Some(p), Some(q)) if (q.0, q.1) == (p.0 + step, p.1 + step));
+    // SMALLFIX7 (B501): on a live desktop the one-step offset can itself land on another row's band and move
+    // again (GLASSFIX3 walks until clear), so the arm scores the Mac rule against the FIRST row: the second sits
+    // off its title band — one full step down (or wrapped to the top) — never on it.
+    let cascade = matches!((o1, o2), (Some(p), Some(q)) if (q.0, q.1) == (p.0 + step, p.1 + step) || (q != p && (q.1 >= p.1 + step || q.1 + step <= p.1)));
     for id in [w1, w2] {
         if id != WIN_NONE {
             super::close(id);
@@ -337,7 +343,25 @@ fn selftest() {
     let ok = codec && restored && cascade && clamp;
     let v = |b: bool| if b { "ok" } else { "fail" };
     serial_println!(
-        ":: WINMEMORY: saved={} restored={} cascade={} clamp={} codec={} step={} area={}..{} -> {} ::",
-        saved_count(), v(restored), v(cascade), v(clamp), v(codec), step, a.top, a.bottom, if ok { "PASS" } else { "FAIL" }
+        ":: WINMEMORY: saved={} saves_this_boot={} restored={} cascade={} clamp={} codec={} step={} area={}..{} -> {} ::",
+        saved_count(), SAVES.load(Ordering::Relaxed), v(restored), v(cascade), v(clamp), v(codec), step, a.top, a.bottom, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── SMALLFIX7 (rmbp-ledger B501) — TAIL-APPENDED ─────────────────────────────────────────────────────
+// Flight 27: `[wm] place win=2 app=wmtest from=cascade` — the fixture's saved frame was resolved, then GLASSFIX3
+// cascaded it off a live desktop row (QEMU's desktop is empty, so no lane saw it): `restored=fail`. The Mac
+// restores an autosaved frame where it was saved and cascades only a further window of the same app. `saved=0`
+// was true: the store counts rows, and no app row was moved or closed that boot (the save triggers).
+
+/// Successful frame writes this boot (move-end / close).
+static SAVES: AtomicU32 = AtomicU32::new(0);
+
+/// `create_inner`: keep [`resolve`]'s origin as-is (no GLASSFIX3 cascade) — a saved frame, and no live row of
+/// the same app (a second window cascades from the first, as on the Mac).
+pub fn keeps(mem: &Option<Mem>) -> bool {
+    match mem {
+        Some(m) if m.from == From::Saved => !TRACK.lock().iter().any(|e| e.1 == m.name),
+        _ => false,
+    }
 }
