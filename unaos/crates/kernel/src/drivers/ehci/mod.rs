@@ -14174,7 +14174,7 @@ impl Controller {
                                 // and identical to the predicate this same call decides to emit a
                                 // `Mouse` event on. This is THE path the boot-3 phantom storm was
                                 // measured on.
-                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); finemotion::note(idx, false, (dx, dy), (dx * finemotion::Q, dy * finemotion::Q), (dx, dy), 1); // FINEMOTION (B496): the legacy lane installs its counts 1:1 — witnessed beside the vendor lane, the route read off the stream
                                 crate::pal::push_pointer_report(
                                     if dx != 0 || dy != 0 {
                                         Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -14223,7 +14223,7 @@ impl Controller {
                                     let mut hb = [0u8; TP_RAW2_HEX_MAX];
                                     serial_println!(":: TPRAW2: fingers={} bytes={} ::", report[WSP2_NFINGER_OFF], tp_hex_raw2(&mut hb, report));
                                 }
-                                let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); // TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
+                                let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); { let l = e.tp.mt_last; finemotion::note(idx, true, (l.0, l.1), (l.2, l.3), (dx, dy), f.fingers); } // TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
                                 if wit {
                                     crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} curve={}/{}@{} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
@@ -17477,6 +17477,10 @@ struct TpCensus {
     raw2_done: bool,
     /// TPDRAG — two-finger `[tp] mt` witnesses emitted (bounded by `TP_2F_WITNESS_MAX`).
     mt_2f_wit: u8,
+    /// FINEMOTION (B496) — the curve's carried Q8 remainder per axis (`finemotion::step`); zeroed with `mt_prev`.
+    mt_res: (i32, i32),
+    /// FINEMOTION — the last frame's raw delta and the Q8 pixels it added, `(rx, ry, qx, qy)`, for the `[ptr]` witness.
+    mt_last: (i32, i32, i32, i32),
 }
 
 impl TpCensus {
@@ -17496,6 +17500,8 @@ impl TpCensus {
         mt_mover: 0,
         raw2_done: false,
         mt_2f_wit: 0,
+        mt_res: (0, 0),
+        mt_last: (0, 0, 0, 0),
     };
 
     /// Which counter a report belongs to. Total: any byte sequence maps somewhere, and a report
@@ -17542,7 +17548,9 @@ impl TpCensus {
         let buttons = if f.button != 0 { 0x01 } else { 0x00 }; // TPDRAG (B219): `ibt` is the pad's physical click — the HELD finger's press — so it drives the button whichever finger moves
         let (mut dx, mut dy) = (0, 0);
         let mut wit_2f = false;
+        self.mt_last = (0, 0, 0, 0);
         if f.fingers == 0 || f.touch0 == 0 {
+            self.mt_res = (0, 0); // FINEMOTION (B496): a lift drops the carried sub-pixel remainder with the baseline
             self.mt_prev = None;
             self.mt_prev1 = None;
             self.mt_mover = 0;
@@ -17570,12 +17578,15 @@ impl TpCensus {
                 self.mt_mover = 0;
                 if was_two {
                     prev = None;
+                    self.mt_res = (0, 0); // FINEMOTION: a re-baseline starts the remainder over
                 }
                 self.mt_prev1 = None;
             }
             if let Some((px, py)) = prev {
-                dx = tp_scale((cur.0 - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP)); // TPSCALE (B214): sensor units -> pointer pixels, see `tp_scale`
-                dy = tp_scale((cur.1 - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP));
+                let (rx, ry) = ((cur.0 - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP), (cur.1 - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP));
+                dx = finemotion::step(rx, &mut self.mt_res.0); // FINEMOTION (B496): TPSCALE's curve in Q8 with the remainder CARRIED — `tp_scale` floored every sub-divisor frame to 0 px, the dead zone of flight 27
+                dy = finemotion::step(ry, &mut self.mt_res.1);
+                self.mt_last = (rx, ry, finemotion::curve_q8(rx), finemotion::curve_q8(ry));
             }
             self.mt_prev = Some(p0);
         }
@@ -17808,7 +17819,7 @@ unsafe fn tpframe_selftest() {
     let seq: [&[u8]; 7] = [&F2, &F3, &F4, &down, &F4, &lift, &F2];
     let want_raw: [(u8, i32, i32); 7] = // the corpus's RAW sensor deltas (flight 12's frames), the fixture's truth
         [(0, 0, 0), (0, -30, -12), (0, -3, -5), (1, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)];
-    let want: [(u8, i32, i32); 7] = core::array::from_fn(|k| (want_raw[k].0, tp_scale(want_raw[k].1), tp_scale(want_raw[k].2))); // TPSCALE (B214): `mt_step` now returns PIXELS — raw/8 toward zero (-30/-12 -> -3/-1, -3/-5 -> 0/0); the witness `d=` prints what the router takes
+    let want: [(u8, i32, i32); 7] = { let mut r = (0, 0); core::array::from_fn(|k| { if k == 5 { r = (0, 0); } (want_raw[k].0, finemotion::step(want_raw[k].1, &mut r.0), finemotion::step(want_raw[k].2, &mut r.1)) }) }; // TPSCALE (B214): `mt_step` now returns PIXELS — raw/8 toward zero (-30/-12 -> -3/-1, -3/-5 -> 0/0); the witness `d=` prints what the router takes
 
     let mut c = TpCensus::EMPTY;
     c.latched = true;
@@ -18434,7 +18445,7 @@ pub fn init() {
     // an absent one, and the same is true of the mechanism under it. This fixture drives the real
     // `isr_service_ep` against a hand-built completion so the ISR path is exercised on every boot,
     // QEMU included. See `isr_selftest`.
-    if !crate::tests::defer("ehciisr", ehci_isr_test) { unsafe { isr_selftest() }; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests ehciisr` fires it.
+    if !crate::tests::defer("ehciisr", ehci_isr_test) { unsafe { isr_selftest() }; } crate::tests::register("finemotion", finemotion::selftest); // QUIETBOOT2 (B325, R80): a boot fixture — `tests ehciisr` fires it.
     // PASSPERIOD: the census's new pair, for the same reason and in the same place. A healthy QEMU
     // boot runs every pass at the tick, so the STALL half of the instrument — the only half that
     // matters — would never execute on any gate this repo runs. See `pass_period_selftest`.
@@ -19663,3 +19674,7 @@ fn tpmode_witness(idx: usize, armed_ms: u64) {
         if pass { "PASS" } else { "FAIL" }
     );
 }
+
+/// FINEMOTION (rmbp-ledger B496) — the vendor lane's sub-pixel curve stage, its `[ptr]` witness and `tests finemotion`.
+/// Tail append.
+mod finemotion;
