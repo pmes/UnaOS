@@ -18,8 +18,8 @@
 //! resources and the source says `registrant`.
 //!
 //! **Built at LOGIN** (R93: the desktop is built at login; R80: nothing at boot): `login ok` owes [`build`], the
-//! x86 device-service pass runs it ([`service`]; elsewhere inline) — every known type's object created in ONE
-//! transaction, a present object's MISSING keys filled, a present key never overwritten (the user's amendment
+//! x86 device-service pass runs it ([`service`]; elsewhere inline) — every known type's object created in its OWN
+//! bounded transaction (REGISTRYCHUNK B508: per object, the task yielding between), a present object's MISSING keys filled, a present key never overwritten (the user's amendment
 //! sticks). Known types = [`TYPE_FACTS`] ∪ every type a registrant declares ∪ what the directory already holds.
 //! Descriptions and glyphs are type FACTS (Be's MIME database shipped them); extensions are
 //! `filetype::EXT_TABLE`'s, listed.
@@ -188,20 +188,23 @@ pub fn known_types_in(mt: &MountTable) -> Vec<String> {
 }
 
 /// The four keys a type's object carries, as built (the preferred one only when something declares the type).
-fn keys_for(mt: &MountTable, mime: &str) -> Vec<(String, AttrValue)> {
+/// `exists = false` (REGISTRYCHUNK B508: the object is not there yet) reads no attribute — the
+/// built-in registrants only, which is all an absent object could name.
+fn keys_for_obj(mt: &MountTable, mime: &str, exists: bool) -> Vec<(String, AttrValue)> {
     let mut kv = alloc::vec![
         (String::from(DESCRIPTION_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.2)).unwrap_or_else(|| String::from(mime)))),
         (String::from(EXTENSIONS_KEY), AttrValue::Str(extensions_of(mime))),
         (String::from(ICON_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.1)).unwrap_or_else(|| String::from("file")))),
     ];
-    if let Some(r) = registrants_in(mt, mime).into_iter().next() {
+    let regs = if exists { registrants_in(mt, mime) } else { appres::builtin_registrants(mime) };
+    if let Some(r) = regs.into_iter().next() {
         kv.push((String::from(PREFERRED_KEY), AttrValue::Str(r.preferred_value())));
     }
     kv
 }
 
-/// Build the registry: `/system`, `/system/filetypes`, every known type's object that does not exist yet (ONE
-/// transaction where the volume has one — BOOT80's shape), and on a present object every MISSING key (a present
+/// Build the registry: `/system`, `/system/filetypes`, every known type's object that does not exist yet (one
+/// bounded transaction PER OBJECT — REGISTRYCHUNK B508, was one for all), and on a present object every MISSING key (a present
 /// key is the user's or an earlier build's and is never overwritten). `Ok((created, filled))`;
 /// `Err(Unsupported)` on a root that takes no attributes (the registrants answer there).
 pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
@@ -218,42 +221,58 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
             }
         }
     }
-    let mut missing: Vec<(String, Vec<(String, AttrValue)>)> = Vec::new();
-    let mut filled = 0usize;
+    // REGISTRYCHUNK (B508): PER OBJECT. Presence from ONE listing of the directory (no `stat` miss per type); each
+    // missing type is its own one-object batch (one bounded transaction, one root flip), each present type its own
+    // `set_attrs` — no 30-object masked hold. On x86 the caller's task yields between objects (interrupts and the
+    // HID pump run between them). One line per object: `[filetypes] type=<mime> made= filled= blocks= cmds= ms= masked_ms=`.
+    let present: Vec<String> = mt.read_dir(TYPES_DIR).map(|v| v.into_iter().map(|e| e.name).collect()).unwrap_or_default();
+    let scoped = crate::fs::bootstep::scope_word() != "global";
+    let sio = || if scoped { crate::fs::bootstep::scope_io() } else { crate::fs::bootstep::io() };
+    let (mut made, mut filled) = (0usize, 0usize);
     for mime in seed_types_in(mt) { // SMALLFIX5 (B480): + the types only a ring-3 program's signature object declares
+        let (t0, io0) = (crate::arch::ms(), sio());
         let obj = object_path(&mime);
-        let want = keys_for(mt, &mime);
-        if mt.stat(&obj).is_err() {
-            missing.push((String::from(&obj[TYPES_DIR.len() + 1..]), want));
-            continue;
+        let leaf = String::from(&obj[TYPES_DIR.len() + 1..]);
+        let exists = present.iter().any(|n| *n == leaf);
+        let want = keys_for_obj(mt, &mime, exists);
+        let (mut m1, mut f1) = (0usize, 0usize);
+        if !exists {
+            match mt.create_files_batch(TYPES_DIR, alloc::vec![(leaf, want.clone())], k) {
+                Ok(n) => m1 = n,
+                Err(VfsError::Unsupported) => { // no batch on this volume: the plain create, then its keys
+                    mt.create(&obj, NodeKind::File, k)?;
+                    for (key, v) in want {
+                        mt.set_attr(&obj, &key, v, k)?;
+                    }
+                    m1 = 1;
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            let have: Vec<(String, AttrValue)> = mt.list_attrs(&obj, k).unwrap_or_default();
+            let fill: Vec<(String, Option<AttrValue>)> = want
+                .into_iter()
+                .filter(|(key, _)| !have.iter().any(|(h, v)| h == key && !matches!(v, AttrValue::Str(s) if s.is_empty())))
+                .map(|(key, v)| (key, Some(v)))
+                .collect();
+            if !fill.is_empty() {
+                f1 = fill.len();
+                mt.set_attrs(&obj, &fill, k)?;
+            }
         }
-        let have: Vec<(String, AttrValue)> = mt.list_attrs(&obj, k).unwrap_or_default();
-        let fill: Vec<(String, Option<AttrValue>)> = want
-            .into_iter()
-            .filter(|(key, _)| !have.iter().any(|(h, v)| h == key && !matches!(v, AttrValue::Str(s) if s.is_empty())))
-            .map(|(key, v)| (key, Some(v)))
-            .collect();
-        if !fill.is_empty() {
-            filled += fill.len();
-            mt.set_attrs(&obj, &fill, k)?;
+        made += m1;
+        filled += f1;
+        let mm = crate::hidstall::scope_masked_take(); // every object's span, said or not
+        PER_TYPE_MASKED.fetch_max(mm, Ordering::Relaxed);
+        if m1 + f1 > 0 {
+            let d = sio().since(io0);
+            serial_println!("[filetypes] type={} made={} filled={} blocks={} cmds={} ms={} masked_ms={}", mime, m1, f1, d.blocks_read(), d.cmds(),
+                crate::arch::ms().saturating_sub(t0), mm);
         }
-    }
-    if missing.is_empty() {
-        return Ok((0, filled));
-    }
-    match mt.create_files_batch(TYPES_DIR, missing.clone(), k) {
-        Ok(n) => return Ok((n, filled)),
-        Err(VfsError::Unsupported) => {} // no batch on this volume: the per-object path below
-        Err(e) => return Err(e),
-    }
-    let mut made = 0usize;
-    for (leaf, attrs) in missing {
-        let obj = alloc::format!("{}/{}", TYPES_DIR, leaf);
-        mt.create(&obj, NodeKind::File, k)?;
-        for (key, v) in attrs {
-            mt.set_attr(&obj, &key, v, k)?;
+        #[cfg(target_arch = "x86_64")]
+        if !crate::arch::irqs_masked() {
+            crate::arch::sched::yield_now(); // between objects, never inside a hold: the HID pump and the render lane run (JOBSCAN's worker runs this build)
         }
-        made += 1;
     }
     Ok((made, filled))
 }
@@ -445,8 +464,10 @@ pub fn view_service() -> bool {
 /// resolved through the registry to a REGISTRANT (or `none` where nothing declares it), a user's amendment surviving
 /// a rebuild, the sniff never overwriting a set `una:type` (ATTRCOLUMNS's refresh), and Open With's list for text.
 ///
-/// `:: FILETYPES: types=<n> preferred=<n> resolved=<ok|why> -> PASS|FAIL :: registry=<dir|none> source=<db|registrants>
-/// sticky=<ok|skip|why> amend=<ok|skip|why> openwith=<n> builds=<n>`.
+/// `:: FILETYPES: types=<n> build_ms=<n> blocks=<n> masked_max_ms=<n> -> PASS|FAIL :: login=<full|stamp|none> preferred=<n>
+/// resolved=<ok|why> registry=<dir|none> objects=<n> source=<db|registrants> sticky=<ok|skip|why> amend=<ok|skip|why> openwith=<n> builds=<n>`
+/// (REGISTRYCHUNK B508: the head is the LOGIN build's measured cost, held to [`BUILD_MS_BOUND`] / [`BUILD_BLOCKS_BOUND`] /
+/// [`MASKED_MS_BOUND`]; this test's own forced build is not recorded).
 pub fn selftest() {
     let mt = crate::shell::vfs_mount_table();
     let k = KERNEL_PRINCIPAL;
@@ -511,10 +532,11 @@ pub fn selftest() {
     };
     let openwith = registrants_in(&mt, ft::TEXT_PLAIN).len();
     let resolved = why.clone().unwrap_or_else(|| String::from("ok"));
-    let pass = why.is_none() && matches!(amend, "ok" | "skip") && matches!(sticky, "ok" | "skip") && openwith >= 2;
+    let (login, build_ms, blocks, masked) = login_cost(); // REGISTRYCHUNK (B508): the LOGIN build's cost (this test's own forced build is not recorded)
+    let pass = why.is_none() && matches!(amend, "ok" | "skip") && matches!(sticky, "ok" | "skip") && openwith >= 2 && login_cost_ok();
     serial_println!(
-        ":: FILETYPES: types={} preferred={} resolved={} -> {} :: registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
-        types.len(), preferred, resolved, if pass { "PASS" } else { "FAIL" },
+        ":: FILETYPES: types={} build_ms={} blocks={} masked_max_ms={} -> {} :: login={} preferred={} resolved={} registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
+        types.len(), build_ms, blocks, masked, if pass { "PASS" } else { "FAIL" }, login, preferred, resolved,
         if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
     );
 }
@@ -679,31 +701,98 @@ pub fn stamp_on_disk(mt: &MountTable) -> Option<String> {
 /// Build unless the stamp matches (`force` builds regardless). `(created, skipped)`; one wire line either way.
 pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
     let t0 = crate::arch::ms();
-    let io0 = crate::fs::bootstep::io();
+    let scoped = crate::fs::bootstep::scope_arm(); // REGISTRYCHUNK (B508): this core's I/O, not the card's (flight 27's 20776 was the jobs scan's too)
+    let iow = if scoped { crate::fs::bootstep::scope_word() } else { String::from("global") };
+    let sio = || if scoped { crate::fs::bootstep::scope_io() } else { crate::fs::bootstep::io() };
+    let io0 = sio();
+    let _ = crate::hidstall::scope_masked_take();
+    PER_TYPE_MASKED.store(0, Ordering::Relaxed); // a `set_preferred_in` seed's leftover is not this build's
+    let mut masked_max = 0u64;
     let mt = crate::shell::vfs_mount_table();
     BUILDS.fetch_add(1, Ordering::Relaxed);
     let want = stamp_now();
+    let done = |masked_max: u64| { if scoped { crate::fs::bootstep::scope_disarm(); } masked_max.max(crate::hidstall::scope_masked_take()) };
     if !force && stamp_on_disk(&mt).as_deref() == Some(want.as_str()) {
-        let d = crate::fs::bootstep::io().since(io0);
-        serial_println!("[filetypes] built at={} dir={} created=0 filled=0 types={} skipped=stamp stamp=v{} blocks_read={} cmds={} ms={}",
-            why, TYPES_DIR, builtin_type_count(), BUILDER_VERSION, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0));
+        let d = sio().since(io0);
+        let mm = done(masked_max);
+        let ms = crate::arch::ms().saturating_sub(t0);
+        note_cost(why, LOGIN_STAMP, ms, d.blocks_read(), mm);
+        serial_println!("[filetypes] built at={} dir={} created=0 filled=0 types={} skipped=stamp stamp=v{} blocks_read={} cmds={} ms={} io={} masked_max_ms={}",
+            why, TYPES_DIR, builtin_type_count(), BUILDER_VERSION, d.blocks_read(), d.cmds(), ms, iow, mm);
         return (0, true);
     }
-    match seed_in(&mt) {
+    let r = seed_in(&mt);
+    masked_max = masked_max.max(crate::hidstall::scope_masked_take());
+    match r {
         Ok((n, f)) => {
             let _ = crate::fs::rootacl::stamp(&mt); // ROOTACL (B456): the system trees take the `system` owner once the registry is built
             let st = match mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(want), KERNEL_PRINCIPAL) {
                 Ok(()) => "written",
                 Err(_) => "refused",
             };
-            let d = crate::fs::bootstep::io().since(io0);
+            let d = sio().since(io0);
+            let mm = done(masked_max.max(PER_TYPE_MASKED.swap(0, Ordering::Relaxed)));
+            let ms = crate::arch::ms().saturating_sub(t0);
+            note_cost(why, LOGIN_FULL, ms, d.blocks_read(), mm);
             crate::fs::bootstep::note_span("filetypes-build", t0, crate::arch::ms()); // SMALLFIX6 (B495): the full build's span, beside the boot steps
-            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={}", why, TYPES_DIR, n, f,
-                known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0));
+            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={} io={} masked_max_ms={}", why, TYPES_DIR, n, f,
+                known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), ms, iow, mm);
             (n, false)
         }
-        Err(VfsError::Unsupported) => { serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); (0, false) }
-        Err(e) => { serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); (0, false) }
+        Err(VfsError::Unsupported) => { done(0); serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); (0, false) }
+        Err(e) => { done(0); serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); (0, false) }
+    }
+}
+
+// ── REGISTRYCHUNK (rmbp-ledger B508) — the login build's measured cost, and the build off the critical path ─────
+//
+// Flight 27: `[filetypes] built at=login … blocks_read=20776 cmds=3599 ms=31154` then `[desktop] built … bar_ms=31205`.
+// The build ran INLINE in the device-service pass that also builds the desktop (the bar waited), and its counters
+// were the card's (the jobs scan shared the window). The build is now per object (`seed_in`: one bounded
+// transaction per type, one `[filetypes] type=` line each) and counted on its own core. WHERE it runs is JOBSCAN's
+// (B497: the bar first, then the `jobs-scan` worker's `build_owed`); this arc makes it cheap. `tests filetypes` reads
+// the cost recorded here.
+
+const LOGIN_NONE: usize = 0;
+const LOGIN_FULL: usize = 1;
+const LOGIN_STAMP: usize = 2;
+static LOGIN_KIND: AtomicUsize = AtomicUsize::new(LOGIN_NONE);
+static LOGIN_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOGIN_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOGIN_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The longest per-object masked span `seed_in` saw (taken by the summary line).
+static PER_TYPE_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record the login build's cost (only `why == "login"`; the `tests` and `verb` builds are not the boot's).
+fn note_cost(why: &str, kind: usize, ms: u64, blocks: u64, masked: u64) {
+    if why != "login" {
+        return;
+    }
+    LOGIN_MS.store(ms, Ordering::Relaxed);
+    LOGIN_BLOCKS.store(blocks, Ordering::Relaxed);
+    LOGIN_MASKED.store(masked, Ordering::Relaxed);
+    LOGIN_KIND.store(kind, Ordering::Release);
+}
+
+/// The login build's cost: `(full|stamp|none, ms, blocks, masked_max_ms)`.
+pub fn login_cost() -> (&'static str, u64, u64, u64) {
+    let k = match LOGIN_KIND.load(Ordering::Acquire) { LOGIN_FULL => "full", LOGIN_STAMP => "stamp", _ => "none" };
+    (k, LOGIN_MS.load(Ordering::Relaxed), LOGIN_BLOCKS.load(Ordering::Relaxed), LOGIN_MASKED.load(Ordering::Relaxed))
+}
+
+/// The bounds `tests filetypes` holds a FULL login build to (the arc's: under a second, under 500 blocks, no masked
+/// span of 50 ms). A stamp hit is held to the ASSOCSTAMP bound (10 ms) and the same block bound.
+pub const BUILD_MS_BOUND: u64 = 1000;
+pub const BUILD_BLOCKS_BOUND: u64 = 500;
+pub const MASKED_MS_BOUND: u64 = 50;
+
+/// Does the recorded login cost pass? `true` when no login build ran (nothing to hold).
+pub fn login_cost_ok() -> bool {
+    let (k, ms, blocks, masked) = login_cost();
+    match k {
+        "full" => ms < BUILD_MS_BOUND && blocks < BUILD_BLOCKS_BOUND && masked < MASKED_MS_BOUND,
+        "stamp" => ms <= 10 && blocks < BUILD_BLOCKS_BOUND && masked < MASKED_MS_BOUND,
+        _ => true,
     }
 }
 
