@@ -37,7 +37,7 @@ pub(super) fn after_initvals(bar0: u64, wrote: u32, mismatch: u32, w: &mut Write
     serial_println!(
         "[wifi6] s5i post-check records={} mismatch={} macctl={:#010x} psm-run={} want=1 -> {} unwind={} (bcm4331.md §8 S5i refute: psm stops or mismatch near records)",
         wrote, mismatch, macctl, psm as u8,
-        if wrote == 0 { "NOT-RUN" } else if pass { "PASS" } else { "FAIL" },
+        if wrote == 0 { "NOT-RUN" } else { crate::tests::boot_word(pass) }, // SMALLFIX7 (B501): a record at boot
         if pass || wrote == 0 { "not-needed" } else if armed { "RUNNING" } else { "not-armed(UNAOS_WIFI5 off; the reboot S4u is the unwind)" }
     );
     if armed {

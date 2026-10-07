@@ -155,7 +155,8 @@ pub fn loginfurn_selftest() {
     let s = SELF_LAUNCHES.load(Relaxed);
     let p = PREFILL_FIRST.load(Relaxed);
     let opened = p != u64::MAX;
-    let pass = w == 0 && s == 0 && BARE.load(Relaxed) >= 1 && (!opened || p > 0);
+    let ring = if opened { 0 } else { ring_tail_lines() }; // SMALLFIX7 (B501): no console this boot — the login's own record
+    let pass = w == 0 && s == 0 && BARE.load(Relaxed) >= 1 && (if opened { p > 0 } else { ring > 0 });
     if !pass {
         serial_println!(
             ":: LOGINFURN: reason=windows={} first_owner={:#x} services={} first_self={} bare={} prefill={} ::",
@@ -164,13 +165,14 @@ pub fn loginfurn_selftest() {
         );
     }
     serial_println!(
-        ":: LOGINFURN: at_login windows={} login_items={} services={} console_prefill_lines={} -> {} ::{}",
+        ":: LOGINFURN: at_login windows={} login_items={} services={} console_prefill_lines={}{} -> {} ::{}",
         w,
         ITEM_WINDOWS.load(Relaxed),
         s,
         if opened { alloc::format!("{}", p) } else { alloc::string::String::from("none") },
+        if opened { alloc::string::String::new() } else { alloc::format!(" ring_tail_lines={}", ring) },
         if pass { "PASS" } else { "FAIL" },
-        if opened { "" } else { " console=unopened (open the console and rerun for the prefill count)" }
+        if opened { "" } else { " console=unopened (ring_tail_lines = what the console's prefill replays when it opens: the current boot's tail in the one ring)" }
     );
 }
 
@@ -196,4 +198,17 @@ fn take_item_credit() -> bool {
         return true;
     }
     false
+}
+
+// ── SMALLFIX7 (rmbp-ledger B501) — TAIL-APPENDED ─────────────────────────────────────────────────────
+// Flight 27: `console_prefill_lines=none (console=unopened)` — the count existed only once a console was minted,
+// and the seat types into the headless door with no console open. The prefill replays `boot_ring::tail`; this
+// reads the same tail at the same height the console asks for, without painting anything.
+
+/// The console grid height this read asks the ring for (a nominal console; the real prefill asks for its own grid).
+const PREFILL_ROWS: usize = 48;
+
+/// Lines the console's prefill would replay if it opened now (0 when the ring is contended or empty).
+pub fn ring_tail_lines() -> usize {
+    crate::boot_ring::tail(PREFILL_ROWS, 0).map_or(0, |t| t.lines)
 }

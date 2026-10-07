@@ -122,7 +122,7 @@ fn say(bar_ms: u64) {
         let pass = !prebuilt && swept == 0 && bar && bar_ms <= PAINT_WAIT_MS && (battery == "painted" || no_source) && dock;
         serial_println!(
             ":: DESKTOPBUILT: prebuilt={} built_at={} bar_first_paint_ms={} battery={} dock={} swept={} -> {} ::",
-            prebuilt as u8, if at_login { "login" } else { "stage" }, bar_ms, (battery == "painted") as u8, dock as u8, swept, if pass { "PASS" } else { "FAIL" }
+            prebuilt as u8, if at_login { "login" } else { "stage" }, bar_ms, (battery == "painted") as u8, dock as u8, swept, crate::tests::boot_word(pass) // SMALLFIX7 (B501): a record at boot
         );
     }
 }

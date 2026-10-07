@@ -1804,3 +1804,108 @@ mod appres_tests {
 
 /// `una_abi::APP_RES_SECTION`: the resource note's section name.
 pub const APPRES_SECTION_NAME: &str = ".note.unaos.res";
+
+// ── SMALLFIX7 (rmbp-ledger B501) — the `tests` registry's pre-heap admission, once, host-tested ───────────
+// Flight 27's first two image-20 cards never booted: the stack guard registered `stackroom` at arm time, BEFORE
+// the kernel heap, and SMALLFIX6's heap-grown table asked the allocator for 96 bytes it did not have. The bench's
+// PREHEAP fix parked such registrations in a fixed stash; the rule lives here so the host can run it (the cloud's
+// QEMU lanes build `tests-at-boot`, whose `register` never reaches the table, which is why no lane saw the panic).
+pub mod fixtures {
+    /// A fixed, allocation-free stash for registrations that arrive before the heap.
+    pub struct Stash<T: Copy, const N: usize> {
+        slots: [Option<T>; N],
+    }
+
+    /// What [`admit`] did with one registration.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Admit {
+        /// No heap yet: parked in the stash (nothing allocated).
+        Parked,
+        /// No heap yet and the stash is full: NOT registered (the caller says so on the wire).
+        Full,
+        /// The heap is up: the stash drained into the table first (`drained` entries, in arrival order), then this one.
+        Tabled { drained: usize },
+    }
+
+    impl<T: Copy, const N: usize> Stash<T, N> {
+        pub const fn new() -> Self {
+            Self { slots: [None; N] }
+        }
+
+        /// Parked entries.
+        pub fn len(&self) -> usize {
+            self.slots.iter().filter(|s| s.is_some()).count()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+    }
+
+    impl<T: Copy, const N: usize> Default for Stash<T, N> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Admit one registration. Before the heap (`heap_up == false`) it parks — `push` is NEVER called, so nothing
+    /// allocates; after it, the stash drains through `push` in arrival order and then `e` follows.
+    pub fn admit<T: Copy, const N: usize>(stash: &mut Stash<T, N>, heap_up: bool, e: T, mut push: impl FnMut(T)) -> Admit {
+        if !heap_up {
+            return match stash.slots.iter_mut().find(|s| s.is_none()) {
+                Some(slot) => {
+                    *slot = Some(e);
+                    Admit::Parked
+                }
+                None => Admit::Full,
+            };
+        }
+        let mut drained = 0;
+        for s in stash.slots.iter_mut() {
+            if let Some(x) = s.take() {
+                push(x);
+                drained += 1;
+            }
+        }
+        push(e);
+        Admit::Tabled { drained }
+    }
+}
+
+#[cfg(test)]
+mod smallfix7_tests {
+    extern crate std;
+    use super::fixtures::{admit, Admit, Stash};
+    use std::vec::Vec;
+
+    /// The flight-27 shape: a fixture registers before the heap flag is set. The table (a growable Vec — the
+    /// allocation that panicked on metal) must not be touched; the first post-heap registration drains the stash
+    /// in order ahead of itself.
+    #[test]
+    fn registers_before_the_heap_without_touching_the_table() {
+        let mut st: Stash<&str, 8> = Stash::new();
+        let mut table: Vec<&str> = Vec::new();
+        let mut pushes = 0;
+        assert_eq!(admit(&mut st, false, "stackroom", |x| { pushes += 1; table.push(x) }), Admit::Parked);
+        assert_eq!(admit(&mut st, false, "lockreg", |x| { pushes += 1; table.push(x) }), Admit::Parked);
+        assert_eq!(pushes, 0, "a pre-heap registration must not allocate");
+        assert!(table.is_empty());
+        assert_eq!(st.len(), 2);
+        assert_eq!(admit(&mut st, true, "winmemory", |x| table.push(x)), Admit::Tabled { drained: 2 });
+        assert_eq!(table, ["stackroom", "lockreg", "winmemory"]);
+        assert!(st.is_empty());
+        assert_eq!(admit(&mut st, true, "prtscr", |x| table.push(x)), Admit::Tabled { drained: 0 });
+        assert_eq!(table.len(), 4);
+    }
+
+    #[test]
+    fn a_full_stash_refuses_and_keeps_what_it_holds() {
+        let mut st: Stash<u8, 2> = Stash::new();
+        let mut table: Vec<u8> = Vec::new();
+        assert_eq!(admit(&mut st, false, 1, |x| table.push(x)), Admit::Parked);
+        assert_eq!(admit(&mut st, false, 2, |x| table.push(x)), Admit::Parked);
+        assert_eq!(admit(&mut st, false, 3, |x| table.push(x)), Admit::Full);
+        assert_eq!(admit(&mut st, true, 4, |x| table.push(x)), Admit::Tabled { drained: 2 });
+        assert_eq!(table, [1, 2, 4]);
+    }
+}

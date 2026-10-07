@@ -19671,7 +19671,7 @@ fn tpmode_witness(idx: usize, armed_ms: u64) {
     serial_println!(
         ":: TPMODE: requests={} timeouts={} first=index0 latched={} armed_ms={} bound={} (ctl={}; expect requests=3 timeouts=0 latched=yes) -> {} ::",
         reqs, tos, if latched { "yes" } else { "no" }, armed_ms, TPMODE_ARMED_BOUND_MS, idx,
-        if pass { "PASS" } else { "FAIL" }
+        crate::tests::boot_word(pass) // SMALLFIX7 (B501): a record at boot, a verdict after the deferral point
     );
 }
 

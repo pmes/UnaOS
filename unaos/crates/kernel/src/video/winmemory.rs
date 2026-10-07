@@ -27,11 +27,11 @@
 //!
 //! Witness: `[wm] place win=<id> app=<name> from=<saved|centre|cascade> frame=<x,y,w,h>` per app window;
 //! `[winmem] save app=<name> frame=<x,y,w,h> on=<move-end|close> ok=<0|1>` per write;
-//! `tests winmemory` → `:: WINMEMORY: saved=<n> restored=<ok> cascade=<ok> clamp=<ok> -> PASS ::`.
+//! `tests winmemory` → `:: WINMEMORY: saved=<n> saves_this_boot=<n> restored=<ok> cascade=<ok> clamp=<ok> codec=<ok> close_save=<ok> … -> PASS ::`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::{WinId, WIN_NONE};
 
@@ -186,6 +186,7 @@ pub fn note(id: WinId, mem: Option<Mem>) {
         t.push((id, m.name.clone(), last));
     }
     serial_println!("[wm] place win={} app={} from={} frame={}", id, m.name, from, frame);
+    kick_queued(); // SMALLFIX7 (B501): a close-time write `closed_rows` left queued (masked teardown) goes now
 }
 
 /// The frame of a remembered row changed hands (move-end) or is about to go (close): queue ONE write when
@@ -195,6 +196,13 @@ fn save(id: WinId, on: &'static str) {
         return;
     }
     let Some(f) = super::frame_of(id) else { return };
+    if save_frame(id, f, on) {
+        kick();
+    }
+}
+
+/// [`save`] with the frame in hand (the row may already be gone): queue the write; `true` when one was queued.
+fn save_frame(id: WinId, f: (usize, usize, usize, usize), on: &'static str) -> bool {
     let lit = enc(f);
     let name = {
         let mut t = TRACK.lock();
@@ -206,7 +214,10 @@ fn save(id: WinId, on: &'static str) {
         e.1.clone()
     };
     if name == TEST_APP {
-        return;
+        if on == "close" {
+            TEST_CLOSE_SEEN.store(true, Ordering::Release); // SMALLFIX7: the fixture's `close_save=` leg
+        }
+        return false;
     }
     {
         let mut q = QUEUE.lock();
@@ -218,7 +229,7 @@ fn save(id: WinId, on: &'static str) {
             None => q.push((name, lit, on)),
         }
     }
-    kick();
+    true
 }
 
 /// `drag_end` / `drag_cancel`, after WINSNAP: the move (or resize) ended.
@@ -250,6 +261,9 @@ fn flush_once() -> usize {
     for (name, lit, on) in &batch {
         let k = alloc::format!("{}.{}", name, KEY);
         let ok = crate::prefs::set_applied(prefs_core::files::APP_NS, &k, prefs_core::PrefValue::Str(lit.clone())).is_ok();
+        if ok {
+            SAVES.fetch_add(1, Ordering::Relaxed); // SMALLFIX7 (B501): `saves_this_boot=`
+        }
         serial_println!("[winmem] save app={} frame={} on={} ok={}", name, lit, on, ok as u8);
     }
     batch.len()
@@ -314,7 +328,20 @@ fn selftest() {
     let w2 = mk();
     let o2 = origin(w2);
     let step = super::cascade_step();
-    let cascade = matches!((o1, o2), (Some(p), Some(q)) if (q.0, q.1) == (p.0 + step, p.1 + step));
+    // SMALLFIX7 (B501): on a live desktop the one-step offset can itself land on another row's band and move
+    // again (GLASSFIX3 walks until clear), so the arm scores the Mac rule against the FIRST row: the second sits
+    // off its title band — one full step down (or wrapped to the top) — never on it.
+    let cascade = matches!((o1, o2), (Some(p), Some(q)) if (q.0, q.1) == (p.0 + step, p.1 + step) || (q != p && (q.1 >= p.1 + step || q.1 + step <= p.1)));
+    // SMALLFIX7 (B501): the close trigger `close_owner` (an app's close disc, an app's exit) reaches — the
+    // fixture's owner is kernel-banded, which `close_owner` refuses, so the seam is called as it calls it.
+    TEST_CLOSE_SEEN.store(false, Ordering::Release);
+    let close_save = match super::frame_of(w2) {
+        Some(f) if w2 != WIN_NONE => {
+            closed_rows(&[w2], &[f]);
+            TEST_CLOSE_SEEN.load(Ordering::Acquire) && !TRACK.lock().iter().any(|e| e.0 == w2)
+        }
+        _ => false,
+    };
     for id in [w1, w2] {
         if id != WIN_NONE {
             super::close(id);
@@ -334,10 +361,63 @@ fn selftest() {
     }
     *TEST_SAVED.lock() = None;
     super::app_name_forget(OWNER);
-    let ok = codec && restored && cascade && clamp;
+    let ok = codec && restored && cascade && clamp && close_save;
     let v = |b: bool| if b { "ok" } else { "fail" };
     serial_println!(
-        ":: WINMEMORY: saved={} restored={} cascade={} clamp={} codec={} step={} area={}..{} -> {} ::",
-        saved_count(), v(restored), v(cascade), v(clamp), v(codec), step, a.top, a.bottom, if ok { "PASS" } else { "FAIL" }
+        ":: WINMEMORY: saved={} saves_this_boot={} restored={} cascade={} clamp={} codec={} close_save={} step={} area={}..{} -> {} ::",
+        saved_count(), SAVES.load(Ordering::Relaxed), v(restored), v(cascade), v(clamp), v(codec), v(close_save), step, a.top, a.bottom, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── SMALLFIX7 (rmbp-ledger B501) — TAIL-APPENDED ─────────────────────────────────────────────────────
+// Flight 27: `[wm] place win=2 app=wmtest from=cascade` — the fixture's saved frame was resolved, then GLASSFIX3
+// cascaded it off a live desktop row (QEMU's desktop is empty, so no lane saw it): `restored=fail`. The Mac
+// restores an autosaved frame where it was saved and cascades only a further window of the same app. `saved=0`
+// was true: the store counts rows, and no app row was moved or closed that boot (the save triggers).
+
+/// Successful frame writes this boot (move-end / close).
+static SAVES: AtomicU32 = AtomicU32::new(0);
+
+/// `create_inner`: keep [`resolve`]'s origin as-is (no GLASSFIX3 cascade) — a saved frame, and no live row of
+/// the same app (a second window cascades from the first, as on the Mac).
+pub fn keeps(mem: &Option<Mem>) -> bool {
+    match mem {
+        Some(m) if m.from == From::Saved => !TRACK.lock().iter().any(|e| e.1 == m.name),
+        _ => false,
+    }
+}
+
+/// The fixture app reached the close save (it is never written; this is the leg's witness).
+static TEST_CLOSE_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// `wm::close_owner`, after the rows are freed: the close trigger for every row it reaped. Flight 27's `saved=0`
+/// was a true census (no app row moved or closed before `tests winmemory`), but the close trigger was dead for
+/// every app: [`closing`] sat only in `close(id)` (kernel rows), while an app's close disc (`wc_close_click`) and
+/// its exit (`clear_handle_row`) reap through `close_owner` — so closing an app never saved its frame. The frames
+/// are the boxes `close_owner` read under its lock (the rows are gone by now). The exit path runs IRQ-masked, so
+/// the flusher is spawned only with interrupts on; otherwise the write waits for the next kick.
+pub fn closed_rows(ids: &[WinId], frames: &[(usize, usize, usize, usize)]) {
+    let mut queued = false;
+    for (&id, &f) in ids.iter().zip(frames) {
+        if id == WIN_NONE {
+            continue;
+        }
+        queued |= save_frame(id, f, "close");
+        TRACK.lock().retain(|e| e.0 != id);
+    }
+    if queued {
+        kick_queued();
+    }
+}
+
+/// Spawn the flusher for a queued write when it is safe to (interrupts on); a masked caller leaves it queued.
+fn kick_queued() {
+    if x86_64::instructions::interrupts::are_enabled() && !QUEUE.lock().is_empty() {
+        kick();
+    }
+}
+
+/// SMALLFIX7: frame writes this boot (`tests smallfix7`'s `saves=`).
+pub fn saves() -> u32 {
+    SAVES.load(Ordering::Relaxed)
 }

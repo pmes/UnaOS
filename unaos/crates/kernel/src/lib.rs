@@ -332,3 +332,5 @@ pub mod loaderstage;
 pub mod smallfix6;
 // SOUNDOPENERS (rmbp-ledger B500): the HDA/play fixtures behind `tests`, and `tests soundopeners`. Tail statement.
 pub mod soundopeners;
+// SMALLFIX7 (rmbp-ledger B501): `tests smallfix7`, `tests prtscr` — flight 27's small reds. Tail statement.
+pub mod smallfix7;

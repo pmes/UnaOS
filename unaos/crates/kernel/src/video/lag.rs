@@ -892,7 +892,7 @@ fn sec_roll(now_ms: u64) {
     let pct = strand_pct(sd, fr);
     serial_println!(
         ":: INPUTSTALL: key_queue_max_ms={} comp_max_ms={} hid_gap_max_ms={} strand_pct={} bound={} -> {} :: events={} frames={} strands={} strand_bound_pct={} span={}s",
-        kq, cm, hg, pct, STALL_MS, if verdict(kq, cm, hg, pct) { "PASS" } else { "FAIL" },
+        kq, cm, hg, pct, STALL_MS, crate::tests::boot_word(verdict(kq, cm, hg, pct)), // SMALLFIX7 (B501): the minute's line is a record before the deferral point
         ev, fr, sd, STRAND_PCT_BOUND, now_ms.saturating_sub(m0) / 1000
     );
 }

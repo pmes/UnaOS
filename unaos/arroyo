@@ -70,7 +70,7 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # list must be checked against that cfg before it is: `witness` is not a free arming on x86.
 case "${1:-}" in
     test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi|test-install|test_install|test-ptr|test_ptr)
-        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT:-1}"; export UNAOS_CENSUS="${UNAOS_CENSUS:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
+        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT-1}";  export UNAOS_CENSUS="${UNAOS_CENSUS:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
 esac
 
 # BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
@@ -13842,6 +13842,9 @@ case "${1:-}" in
         ;;
     gates)
         gates "${2:-}" || exit $?   # GATEPATH (B471): every host gate, one line each; exit = the worst gate's rc
+        ;;
+    bootleg)
+        bash "$WORKSPACE_DIR/scripts/boot-leg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # SMALLFIX7 (B501): the metal feature line BOOTED under QEMU, tests-at-boot OFF (flight 27 PREHEAP). NOT a host gate: the seat's fold gate runs it; `--judge <log>` reads a capture only
         ;;
     clean)
         clean_all

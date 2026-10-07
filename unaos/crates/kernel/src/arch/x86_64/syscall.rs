@@ -15929,7 +15929,8 @@ pub fn u5x_launcher(demo_cpu: usize) {
 
     if witness == U5X_WITNESS_ALL && cleared && killed == 0 {
         serial_println!(
-            ":: U5x: x86 capabilities — write-cap OK, no-cap -EACCES, attenuated grant bounded, revoke enforced, teardown-clear clean -> PASS ::"
+            ":: U5x: x86 capabilities — write-cap OK, no-cap -EACCES, attenuated grant bounded, revoke enforced, teardown-clear clean -> {} ::",
+            crate::tests::boot_word(true) // SMALLFIX7 (B501): `ok` at boot; PASS under tests-at-boot (the specs' lanes)
         );
     } else {
         serial_println!(
@@ -30603,6 +30604,7 @@ fn ladder_arm() {
     static ARMED: AtomicBool = AtomicBool::new(false);
     if !ARMED.swap(true, Ordering::AcqRel) {
         crate::tests::register("ladder", ladder_selftest);
+        crate::tests::source_done(crate::tests::SRC_DESK); // SMALLFIX7 (B501): the desktop source's last registration was `u8x_launcher`'s, now behind `tests ladder` — signalled here, so `TESTS: deferred` prints again
     }
 }
 

@@ -3496,7 +3496,7 @@ pub fn firstuser_witness(why: &str) {
     serial_println!(
         ":: FIRSTUSER: flow=mac first_user={} role={} root={} prompts={} login_window={} migrated={} at={} -> {} ::",
         an.map(|n| wire_name(&ab[..n])).unwrap_or("none"), if an.is_some() { "admin" } else { "NONE" }, if root_locked { "locked" } else { "ROW" },
-        prompts, lw, FU_MIGRATED.load(core::sync::atomic::Ordering::Acquire) as u8, why, if ok { "PASS" } else { "FAIL —" }
+        prompts, lw, FU_MIGRATED.load(core::sync::atomic::Ordering::Acquire) as u8, why, crate::tests::boot_word(ok) // SMALLFIX7 (B501): `tests firstuser` carries the verdict
     );
 }
 

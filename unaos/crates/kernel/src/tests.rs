@@ -41,7 +41,7 @@ static SOURCES_DONE: AtomicU32 = AtomicU32::new(0);
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 /// Called by the verdict tap for every fixture verdict line.
-pub fn tally(pass: bool) { if !ANNOUNCED.load(Ordering::Relaxed) { BOOT_VERDICTS.fetch_add(1, Ordering::Relaxed); }
+pub fn tally(pass: bool) { if !ANNOUNCED.load(Ordering::Relaxed) && !BOOT_OVER.load(Ordering::Relaxed) { BOOT_VERDICTS.fetch_add(1, Ordering::Relaxed); }
     if pass { PASS.fetch_add(1, Ordering::Relaxed); } else {
         FAIL.fetch_add(1, Ordering::Relaxed);
         // TESTFIX2 — remember WHICH fixture failed (the one `run` is executing), de-duplicated, for the summary line.
@@ -76,29 +76,24 @@ pub fn register(name: &'static str, f: fn()) {
         // did not have: `memory allocation of 96 bytes failed`, the panic screen, a 1 s restart loop, nothing on the
         // wire (the probe on image 19's knobs panicked the same way: the tree, not a knob). Until the heap is up a
         // registration parks in this fixed stash; the first post-heap registration drains it into the table.
-        static PRE: crate::sync::Mutex<[Option<(&'static str, fn())>; 8]> = crate::sync::Mutex::new([None; 8]);
-        if crate::allocator::heap_bounds() == (0, 0) {
-            let mut p = PRE.lock();
-            match p.iter_mut().find(|s| s.is_none()) {
-                Some(slot) => { *slot = Some((name, f)); DEFERRED.fetch_add(1, Ordering::Relaxed); }
-                None => serial_println!(":: TESTS: pre-heap stash full (8) — `{}` NOT registered -> FAIL ::", name),
+        // SMALLFIX7 (B501): the admission is `midden_core::fixtures::admit`, the one rule the host test runs.
+        use midden_core::fixtures::{admit, Admit, Stash};
+        static PRE: crate::sync::Mutex<Stash<(&'static str, fn()), 8>> = crate::sync::Mutex::new(Stash::new());
+        let heap_up = crate::allocator::heap_bounds() != (0, 0);
+        let mut t = if heap_up { Some(TABLE.lock()) } else { None };
+        if let Some(t) = t.as_ref() { if t.iter().flatten().any(|e| e.0 == name) { return; } } // SOUNDOPENERS (B500): one entry per name — a fixture registered from two paths runs once
+        let mut p = PRE.lock();
+        let got = admit(&mut p, heap_up, (name, f), |e| {
+            if let Some(t) = t.as_mut() {
+                match t.iter_mut().find(|s| s.is_none()) {
+                    Some(slot) => *slot = Some(e),
+                    None => t.push(Some(e)), // SMALLFIX6 (B495, R90): no fixed cap — the table grows
+                }
             }
-            return;
-        }
-        let mut t = TABLE.lock();
-        {
-            let mut p = PRE.lock();
-            for s in p.iter_mut() {
-                if let Some(e) = s.take() { t.push(Some(e)); }
-            }
-        }
-        if t.iter().flatten().any(|e| e.0 == name) { return; } // SOUNDOPENERS (B500): one entry per name — a fixture registered from two paths (the U8x demo chain and `soundopeners::ensure`) runs once
-        match t.iter_mut().find(|s| s.is_none()) {
-            Some(slot) => {
-                *slot = Some((name, f));
-                DEFERRED.fetch_add(1, Ordering::Relaxed);
-            }
-            None => { t.push(Some((name, f))); DEFERRED.fetch_add(1, Ordering::Relaxed); } // SMALLFIX6 (B495, R90): no fixed cap — the table grows
+        });
+        match got {
+            Admit::Full => serial_println!(":: TESTS: pre-heap stash full (8) — `{}` NOT registered -> FAIL ::", name),
+            Admit::Parked | Admit::Tabled { .. } => { DEFERRED.fetch_add(1, Ordering::Relaxed); }
         }
     }
 }
@@ -119,7 +114,7 @@ pub fn run(name: Option<&str>) -> usize {
         serial_println!(":: TESTS: already running — refused ::");
         return 0;
     }
-    let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
+    BOOT_OVER.store(true, Ordering::Release); let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)); // SMALLFIX7 (B501): a `tests` run ends the boot's verdict window
     *FAILED.lock() = [None; 16]; skip_reset(); RESULTS.lock().clear(); // QUIETBOOT3 (B352): same-line fold.
     let mut ran = 0usize;
     let mut i = 0usize;
@@ -151,7 +146,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         return;
     }
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
-    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
+    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::smallfix7::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); #[cfg(target_arch = "x86_64")] crate::loaderstage::ensure_tests(); crate::soundopeners::ensure(); // LOADERSTALL (B490): `tests loader`. FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::shotmask::ensure_tests(); crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); crate::video::text::ensure_tests(); crate::video::metrics::ensure_tests(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::menubar::ensure_tests(); // MENUBARSLOTS (B499): `tests menubar`. GLASSEYES (B343): `tests shot`. KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
@@ -400,7 +395,7 @@ fn skipped_names() -> alloc::string::String {
 /// pass, a paint): the caller's own `latch` makes every call after the first one relaxed swap, no table scan.
 /// Same answer as `defer`: `false` (run the body) under `tests-at-boot` or while `tests` is running it.
 pub fn defer_fast(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
-    if cfg!(feature = "tests-at-boot") || RUNNING.load(Ordering::Acquire) {
+    if cfg!(feature = "tests-at-boot") || (RUNNING.load(Ordering::Acquire) && running_is(name)) { // SMALLFIX7 (B501): only while THIS fixture runs — flight 27's `prtscrdir` fired inside `tests quarrylive` and held the capture door shut
         return false;
     }
     if !latch.swap(true, Ordering::AcqRel) {
@@ -507,7 +502,103 @@ fn ensure_bootverdicts() {
 pub fn verdicts_selftest() {
     let n = BOOT_VERDICTS.load(Ordering::Relaxed);
     serial_println!(
-        ":: VERDICTS: before_deferred={} moved={} reworded={} -> {} ::",
-        n, VERDICTS_MOVED, VERDICTS_REWORDED, if n == 0 { "PASS" } else { "FAIL" }
+        ":: VERDICTS: before_deferred={} moved={} reworded={} announced={} tags={} -> {} ::",
+        n, VERDICTS_MOVED, VERDICTS_REWORDED + SMALLFIX7_REWORDED, ANNOUNCED.load(Ordering::Relaxed) as u8, boot_tags(), if n == 0 { "PASS" } else { "FAIL" }
     );
+}
+
+// SMALLFIX7 (rmbp-ledger B501) — TAIL-APPENDED. Flight 27 read `VERDICTS: before_deferred=29 -> FAIL` and the wire
+// had NO `TESTS: deferred=` line: the announce waited on `SRC_DESK`, which `u8x_launcher` signalled, and BOOTVERDICTS
+// moved that chain behind `tests ladder` — so `tally` counted the whole session, the seat's own `tests` runs
+// included. Now `ladder_arm` signals the source, the window also closes at the first `tests` run, `tests verdicts`
+// names what it counted, and the six lines the boot itself printed (TPMODE, FIRSTUSER, INPUTSTALL, DESKTOPBUILT,
+// the wifi6 S5i post-check, U5x) print `ok`/`NOT-OK` until the operator's first `tests` run ([`boot_word`]).
+
+/// Set by the first `tests` run: a verdict after it is a fixture's, never the boot's.
+static BOOT_OVER: AtomicBool = AtomicBool::new(false);
+/// The six boot lines SMALLFIX7 reworded through [`boot_word`].
+const SMALLFIX7_REWORDED: u32 = 6;
+const TAG_MAX: usize = 16;
+const TAGS_MAX: usize = 12;
+/// The first [`TAGS_MAX`] counted verdict lines' tags (alloc-free: the tap runs in IRQ-masked print contexts).
+static TAGS: crate::sync::Mutex<([[u8; TAG_MAX]; TAGS_MAX], usize)> = crate::sync::Mutex::new(([[0; TAG_MAX]; TAGS_MAX], 0));
+
+/// Has the operator run `tests` this boot? Always under `tests-at-boot`: the QEMU lanes keep their boot verdicts
+/// and the specs that pin them. NOT the announce: `ladder_arm` can print `TESTS: deferred=` before the login, and a
+/// boot line after it is still the boot's, not a test the operator asked for (R80).
+pub fn boot_over() -> bool {
+    cfg!(feature = "tests-at-boot") || BOOT_OVER.load(Ordering::Relaxed)
+}
+
+/// The verdict word a boot-path witness prints: `PASS`/`FAIL` once [`boot_over`], `ok`/`NOT-OK` before it — the
+/// boot's line is a record there (R80); `tests <name>`, or any later print, carries the verdict.
+pub fn boot_word(pass: bool) -> &'static str {
+    match (boot_over(), pass) {
+        (true, true) => "PASS",
+        (true, false) => "FAIL",
+        (false, true) => "ok",
+        (false, false) => "NOT-OK",
+    }
+}
+
+/// The verdict tap's label for a line [`tally`] counted (same window): its tag, up to the first `:`.
+pub fn boot_tag(label: &str) {
+    if ANNOUNCED.load(Ordering::Relaxed) || BOOT_OVER.load(Ordering::Relaxed) {
+        return;
+    }
+    let tag = label.split(':').next().unwrap_or("").trim();
+    let tag = tag.strip_prefix('[').map(|t| t.split(']').next().unwrap_or(t)).unwrap_or(tag);
+    if let Some(mut g) = TAGS.try_lock() {
+        let n = g.1;
+        if n < TAGS_MAX {
+            let b = tag.as_bytes();
+            let k = b.len().min(TAG_MAX);
+            g.0[n] = [0; TAG_MAX];
+            g.0[n][..k].copy_from_slice(&b[..k]);
+            g.1 = n + 1;
+        }
+    }
+}
+
+fn boot_tags() -> alloc::string::String {
+    let g = TAGS.lock();
+    let mut s = alloc::string::String::new();
+    for t in g.0[..g.1].iter() {
+        let n = t.iter().position(|&c| c == 0).unwrap_or(TAG_MAX);
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(core::str::from_utf8(&t[..n]).unwrap_or("?"));
+    }
+    if s.is_empty() {
+        s.push('-');
+    }
+    s
+}
+
+/// SMALLFIX7 (B501): is `name` the fixture [`run`] is executing now? A hot-path fixture ([`defer_fast`]) runs its
+/// body only then — never inside another fixture's run, where its side effects (a held door) land on the wrong test.
+pub fn running_is(name: &str) -> bool {
+    for _ in 0..64 {
+        if let Some(c) = CUR.try_lock() {
+            return *c == name;
+        }
+        core::hint::spin_loop(); // `run` holds CUR for one store; a few retries, never a sleep (paint paths call this)
+    }
+    false
+}
+
+/// SMALLFIX7: did `TESTS: deferred=` print this boot?
+pub fn announced() -> bool {
+    ANNOUNCED.load(Ordering::Relaxed)
+}
+
+/// SMALLFIX7: the boot's counted verdict lines and their tags (`tests verdicts`' numbers).
+pub fn boot_verdicts() -> (u32, alloc::string::String) {
+    (BOOT_VERDICTS.load(Ordering::Relaxed), boot_tags())
+}
+
+/// SMALLFIX7: is a fixture registered by `name`?
+pub fn registered(name: &str) -> bool {
+    TABLE.lock().iter().flatten().any(|e| e.0 == name)
 }
