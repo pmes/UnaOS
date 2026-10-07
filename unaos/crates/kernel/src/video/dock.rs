@@ -4101,9 +4101,8 @@ fn dock2_service(now: u64) {
 fn dock2_store_service() {
     let now = crate::arch::ms();
     let tgen = crate::fs::trash::generation(); let tseen = TRASH_SEEN.load(Ordering::Relaxed); let _ = now;
-    if tgen != tseen { TRASH_SEEN.store(tgen, Ordering::Relaxed); let t0 = crate::arch::ms();
-        let full = crate::fs::trash::count() > 0;
-        if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); } serial_println!("[dock] trash state why={} full={} took_ms={} (HIDSTALL: read on a change, never on a clock)", if tseen == u64::MAX { "first" } else { "change" }, full as u8, crate::arch::ms().saturating_sub(t0));
+    if tgen != tseen && !TRASH_READER.load(Ordering::Acquire) { TRASH_SEEN.store(tgen, Ordering::Relaxed);
+        if !trash_read_off_pump(tseen == u64::MAX) { trash_read(tseen == u64::MAX, "pump"); } // HIDSTALL2 (B509): the read runs on a worker core, off the hid pump's
     }
     let reveal = REVEAL_OWED.lock().take();
     let open = if TRASH_OPEN_OWED.swap(false, Ordering::AcqRel) { Some(crate::fs::trash::trash_dir()) } else { reveal };
@@ -4120,6 +4119,50 @@ fn dock2_store_service() {
         let b = crate::prefs_client::pref_set(crate::prefs::NS, key::DOCK_AUTOHIDE, P::Bool(autohide()));
         serial_println!("[dock] prefs position={} autohide={} via=settings saved={}", position_word(), autohide() as u8, if a.is_ok() && b.is_ok() { "ok" } else { "-1" });
     }
+}
+
+// ── HIDSTALL2 (rmbp-ledger B509): the Trash read off the hid pump's core ────────────────────────────────────────────────
+//
+// Flight 27: `[dock] trash state why=change full=1 took_ms=1145` beside `[lag] stall … stage=hid stage_ms=447 … pump=desktop-app
+// pump_ms=1147.3 masked_ms=151` — `trash::count()` is a run of IRQ-masked UnaFS transactions, and this service pass runs on
+// the `usb-pump`, which shares its core with the `hid-pump` task: every masked span was a span with no HID pass. The read now
+// runs as a one-shot `dock-trash` task on a worker core that is neither the render core nor the service core
+// (`smp::xhci_worker_cpu`: UnaFS may take the storage loan, so the render/service exclusion that rule enforces applies); with
+// no such core it runs inline as before and says `on=pump`. `TRASH_READER` keeps one read in flight; a change during the
+// read is picked up by the next pass (TRASH_SEEN was stored before the spawn).
+
+static TRASH_READER: AtomicBool = AtomicBool::new(false);
+
+/// The Trash's full/empty read, its glass relight and its line.
+fn trash_read(first: bool, on: &str) {
+    let t0 = crate::arch::ms();
+    let full = crate::fs::trash::count() > 0;
+    if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); }
+    serial_println!("[dock] trash state why={} full={} took_ms={} on={} (HIDSTALL2: read on a change, off the hid pump's core)", if first { "first" } else { "change" }, full as u8, crate::arch::ms().saturating_sub(t0), on);
+}
+
+/// Spawn the read on a worker core; `false` = no worker core apart from the pump's (the caller reads inline).
+fn trash_read_off_pump(first: bool) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != crate::hidstall::pump_cpu()) else { return false };
+        if TRASH_READER.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        crate::arch::sched::spawn("dock-trash", trash_reader, first as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = first;
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn trash_reader(first: usize) {
+    trash_read(first != 0, "worker");
+    TRASH_READER.store(false, Ordering::Release);
 }
 
 /// `system.dock.position` / `system.dock.autohide` at login (with the pins).
@@ -4314,7 +4357,7 @@ fn pin_press_defer(r: &wm::DockEntry, x: i32, y: i32) -> bool {
     let Some(i) = (0..DP_PINS.len()).find(|&i| DP_PINS[i].id == r.id) else { return false };
     PIN_X0.store(x, Ordering::Relaxed); PIN_Y0.store(y, Ordering::Relaxed);
     PIN_DRAG.store(false, Ordering::Relaxed);
-    PIN_T0.store(crate::arch::ms().max(1), Ordering::Relaxed); PIN_IX.store(i as u32, Ordering::Release); // HIDSTALL (B485): the press time the release timeout reads
+    PIN_T0.store(crate::arch::ms().max(1), Ordering::Relaxed); PIN_LANE_SAID.store(false, Ordering::Relaxed); PIN_IX.store(i as u32, Ordering::Release); // HIDSTALL (B485): the press time the release timeout reads. HIDSTALL2 (B509): the in-lane line re-armed
     crate::video::capture::begin(pin_motion, pin_release);
     serial_println!("[dock] press at ({},{}) app={} -> armed (launches on release)", x, y, DP_PINS[i].name);
     true
@@ -4332,8 +4375,16 @@ fn pin_release(x: i32, y: i32) {
     let i = i as usize;
     if !PIN_DRAG.load(Ordering::Relaxed) {
         PIN_BYPASS.store(true, Ordering::Release);
-        let _ = press_at(PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed));
+        let ok = press_at(PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed));
         PIN_BYPASS.store(false, Ordering::Release);
+        // HIDSTALL2 (B509): the release's own line — how long after the press it was routed, and how long it sat in the pal
+        // ring (`lane_ms=`, push to route); `waited=1` when the timeout held off for it.
+        let now = crate::arch::ms();
+        let lane = crate::hidstall::release_lane_ms(now);
+        let after = now.saturating_sub(PIN_T0.load(Ordering::Relaxed));
+        let waited = after >= crate::hidstall::DOCK_RELEASE_TIMEOUT_MS;
+        if waited { crate::hidstall::note_release_waited(lane); }
+        serial_println!("[dock] press at ({},{}) app={} release=edge after_ms={} lane_ms={} waited={} -> {}", PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed), DP_PINS[i].name, after, lane, waited as u8, if ok { "launched" } else { "declined" });
         return;
     }
     let mut to = None;
@@ -4508,6 +4559,19 @@ fn pin_timeout_service(now: u64) {
     if t0 == 0 || now.saturating_sub(t0) < crate::hidstall::DOCK_RELEASE_TIMEOUT_MS {
         return;
     }
+    // HIDSTALL2 (B509): this pass runs on the `usb-pump`; the release is ROUTED by the render task. A release pushed and not
+    // yet routed is IN THE LANE — late, not lost (flight 27: the render lane was busy, `comp=2816`) — so the press waits for
+    // it, bounded by `DOCK_RELEASE_LANE_CAP_MS`; only a press with no release in the lane times out.
+    let (pend, lane) = (crate::pal::release_edge_pending(), crate::hidstall::release_lane_ms(now));
+    if pend > 0 && now.saturating_sub(t0) < crate::hidstall::DOCK_RELEASE_LANE_CAP_MS {
+        if !PIN_LANE_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[dock] press at ({},{}) app={} release=in-lane pend={} after_ms={} lane_ms={} -> waiting (HIDSTALL2: the release is queued in the pal ring; it launches when routed)",
+                PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed), DP_PINS[i as usize].name, pend, now.saturating_sub(t0), lane
+            );
+        }
+        return;
+    }
     if PIN_IX.compare_exchange(i, u32::MAX, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
@@ -4518,7 +4582,10 @@ fn pin_timeout_service(now: u64) {
     PIN_BYPASS.store(false, Ordering::Release);
     crate::hidstall::note_dock_timeout();
     serial_println!(
-        "[dock] press at ({},{}) app={} release=timeout after_ms={} -> {}",
-        x, y, DP_PINS[i as usize].name, now.saturating_sub(t0), if ok { "launched" } else { "declined" }
+        "[dock] press at ({},{}) app={} release=timeout after_ms={} pend={} lane_ms={} -> {}",
+        x, y, DP_PINS[i as usize].name, now.saturating_sub(t0), pend, lane, if ok { "launched" } else { "declined" }
     );
 }
+
+/// HIDSTALL2 (B509): the in-lane line is said once per press (re-armed by the press).
+static PIN_LANE_SAID: AtomicBool = AtomicBool::new(false);

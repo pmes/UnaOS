@@ -14174,7 +14174,7 @@ impl Controller {
                                 // and identical to the predicate this same call decides to emit a
                                 // `Mouse` event on. This is THE path the boot-3 phantom storm was
                                 // measured on.
-                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if (dx != 0 || dy != 0 || buttons != 0) && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=legacy ep={} buttons={:#04x} dx={} dy={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, buttons, dx, dy, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } // HIDSTALL2 (B509): the button edge's push time (the Dock reads how long a release sat in the lane), and the pointer route back on the wire at a low rate
                                 crate::pal::push_pointer_report(
                                     if dx != 0 || dy != 0 {
                                         Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -14230,7 +14230,7 @@ impl Controller {
                                         idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, e.tp.mt_frames
                                     );
                                 }
-                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } // HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
                                 crate::pal::push_pointer_report(
                                     if dx != 0 || dy != 0 {
                                         Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -19608,7 +19608,7 @@ pub fn hid_task_start(cpu: usize) {
     if HID_TASK.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL); crate::hidstall::note_pump_cpu(cpu); // HIDSTALL2 (B509): the core whose masked holds the census names
     serial_println!(
         "[hid] pump task=hid-pump cpu={} cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)",
         cpu
