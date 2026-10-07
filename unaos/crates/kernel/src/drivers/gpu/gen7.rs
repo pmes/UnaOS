@@ -4575,6 +4575,8 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         reclaim_state,
         tlb_verdict
     );
+    #[cfg(feature = "gen7r9")]
+    r9::note_r6(if safety_override { "r6-ring-would-not-disable" } else { exec_verdict }); // GEN7R9 (B504): R9's RCS gate
 
     let next = if safety_override {
         "STOP-ring-would-not-disable-PTEs-LEFT-CLAIMED-under-a-live-ring-do-NOT-reuse-these-pages"
@@ -7367,14 +7369,14 @@ mod ladder {
         if !pass && wake == "gt-woke-noack" {
             let (ack, eco, rc, why) = super::wake_decline().unwrap_or((0, 0, 0, "no-wake-record"));
             serial_println!(
-                ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} -> DECLINED reason={} ack=130040:{:08X} ecobus={:08X} rc={} ::",
-                word, r7, us, replay as u32, why, ack, eco, rc
+                ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={}{} -> DECLINED reason={} ack=130040:{:08X} ecobus={:08X} rc={} ::",
+                word, r7, us, replay as u32, r9_field(), why, ack, eco, rc
             );
             return;
         }
         serial_println!(
-            ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} -> {} ::",
-            word, r7, us, replay as u32, if pass { "PASS" } else { "FAIL" }
+            ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={}{} -> {} ::",
+            word, r7, us, replay as u32, r9_field(), if pass { "PASS" } else { "FAIL" }
         );
     }
 
@@ -7414,11 +7416,21 @@ mod ladder {
             w
         };
         RUNNING.store(false, core::sync::atomic::Ordering::Release);
+        #[cfg(feature = "gen7r9")]
+        super::r9::run(); // GEN7R9 (B504): rung R9 on the RCS, after R6's verdict, before the ladder line
         let us = us_since(t0);
         let r7 = (*R7.lock()).unwrap_or("not-reached");
         *DONE.lock() = Some((wake.name(), r7, us));
         witness(wake.name(), r7, us, false);
         gen7_line(r7, t0);
+    }
+
+    /// GEN7R9 (B504): the ladder line's `r9=` field — empty when R9 is not built (the line is then unchanged).
+    fn r9_field() -> &'static str {
+        #[cfg(feature = "gen7r9")]
+        return super::r9::field();
+        #[cfg(not(feature = "gen7r9"))]
+        return "";
     }
 
     /// GEN7 M1 (B411): the arc's witness — the BCS blits this `tests gen7` verified (R7's 1 KiB, R8's
@@ -7490,3 +7502,9 @@ fn wake_witness(h: &FwHold, rc_entry: u32, ecobus: u32, live: bool) {
 fn wake_decline() -> Option<(u32, u32, u32, &'static str)> {
     *WAKE_WIT.lock()
 }
+
+// GEN7R9 (B504): rung R9 — the first 3D-pipeline step on the RCS, a child of this module like `blit`.
+// CHARTER line in the file.
+#[cfg(feature = "gen7r9")]
+#[path = "gen7_r9.rs"]
+mod r9;
