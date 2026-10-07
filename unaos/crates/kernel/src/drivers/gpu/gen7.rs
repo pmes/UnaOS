@@ -4574,7 +4574,7 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
         if smear_post { 1 } else { 0 },
         reclaim_state,
         tlb_verdict
-    );
+    ); #[cfg(feature = "gen7r9")] r9::note_r6(if safety_override { "r6-ring-would-not-disable" } else { exec_verdict }); // GEN7R9 (B504): R6's verdict is R9's RCS gate (R9 rides R6's ring arm). ⚠ LINE-NEUTRAL append — body in gen7_r9.rs, `mod r9` at the FILE TAIL.
 
     let next = if safety_override {
         "STOP-ring-would-not-disable-PTEs-LEFT-CLAIMED-under-a-live-ring-do-NOT-reuse-these-pages"
@@ -7365,17 +7365,17 @@ mod ladder {
         // write behind it by design, so the ladder DECLINES with the reads that prove it, not FAIL.
         let word = if wake == "gt-woke" { "acked" } else { wake };
         if !pass && wake == "gt-woke-noack" {
-            let (ack, eco, rc, why) = super::wake_decline().unwrap_or((0, 0, 0, "no-wake-record"));
+            let (ack, eco, rc, why) = super::wake_decline().unwrap_or((0, 0, 0, "no-wake-record")); #[cfg(not(feature = "gen7r9"))]
             serial_println!(
                 ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} -> DECLINED reason={} ack=130040:{:08X} ecobus={:08X} rc={} ::",
                 word, r7, us, replay as u32, why, ack, eco, rc
-            );
+            ); #[cfg(feature = "gen7r9")] serial_println!(":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} r9={} -> DECLINED reason={} ack=130040:{:08X} ecobus={:08X} rc={} ::", word, r7, us, replay as u32, super::r9::word(), why, ack, eco, rc); // GEN7R9 (B504): the same line plus `r9=<word>`; knob-off the cfg erases this and keeps the line above as built. ⚠ LINE-NEUTRAL append.
             return;
-        }
+        } #[cfg(not(feature = "gen7r9"))]
         serial_println!(
             ":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} -> {} ::",
             word, r7, us, replay as u32, if pass { "PASS" } else { "FAIL" }
-        );
+        ); #[cfg(feature = "gen7r9")] serial_println!(":: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake={} r7={} us={} replay={} r9={} -> {} ::", word, r7, us, replay as u32, super::r9::word(), if pass { "PASS" } else { "FAIL" }); // GEN7R9 (B504): the same line plus `r9=<word>`. ⚠ LINE-NEUTRAL append.
     }
 
     pub(super) fn run() {
@@ -7413,7 +7413,7 @@ mod ladder {
             super::blit(b.bar0, b.bar0_size, b.bus, b.slot, b.func, w);
             w
         };
-        RUNNING.store(false, core::sync::atomic::Ordering::Release);
+        RUNNING.store(false, core::sync::atomic::Ordering::Release); #[cfg(feature = "gen7r9")] super::r9::run(); // GEN7R9 (B504): rung R9 on the RCS, after R6's verdict, before the ladder line (R80: `tests gen7` only). ⚠ LINE-NEUTRAL append.
         let us = us_since(t0);
         let r7 = (*R7.lock()).unwrap_or("not-reached");
         *DONE.lock() = Some((wake.name(), r7, us));
@@ -7490,3 +7490,9 @@ fn wake_witness(h: &FwHold, rc_entry: u32, ecobus: u32, live: bool) {
 fn wake_decline() -> Option<(u32, u32, u32, &'static str)> {
     *WAKE_WIT.lock()
 }
+
+// GEN7R9 (B504, R101): rung R9 — the first 3D-pipeline step on the RCS, a child of this module like `blit`.
+// FILE-TAIL append: nothing below it moves. CHARTER line in the file.
+#[cfg(feature = "gen7r9")]
+#[path = "gen7_r9.rs"]
+mod r9;

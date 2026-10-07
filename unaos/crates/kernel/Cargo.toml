@@ -367,6 +367,11 @@ gen7r8 = ["gen7"]
 # the read-only `[igpu-dpy] capture`, and the arming decision (`:: GEN7BLIT2: ::`, `:: KCOMP: ::`).
 # DEFAULT OFF => the module, the `video/blitter.rs` slot and the capture vanish.
 gen7blit = ["gen7"]
+# GEN7R9 (B504, R101): rung R9 — the first 3D-pipeline step on the RCS (`UNAOS_IVB3D_R9=1`, mapped in
+# `arroyo` and `builder/src/main.rs`). `drivers/gpu/gen7_r9.rs`, a child of `gen7` (x86_64-only file), run by
+# `tests gen7` after R1-R7. It DECLINES by name while the PRM pages it needs are uncited (R83).
+# DEFAULT OFF => the module, its R6 note and the `r9=` field of GEN7LADDER vanish.
+gen7r9 = ["gen7"]
 # GMUX-IGD: arm the display-mux switch to the INTEGRATED GPU (`UNAOS_GMUX_IGD=1`, already mapped in
 # `arroyo` and `builder/src/main.rs` since ce5c6f49 — this entry is the third leg those two assumed
 # existed). x86_64-only, and only reachable on an `unaos_ivb` build that printed PROTOCOL PROVEN.
