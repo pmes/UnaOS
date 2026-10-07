@@ -206,7 +206,7 @@ fn save_frame(id: WinId, f: (usize, usize, usize, usize), on: &'static str) -> b
     let lit = enc(f);
     let name = {
         let mut t = TRACK.lock();
-        let Some(e) = t.iter_mut().find(|e| e.0 == id) else { return };
+        let Some(e) = t.iter_mut().find(|e| e.0 == id) else { return false }; // E0069 (bench): save_frame returns bool
         if e.2 == lit {
             return;
         }
