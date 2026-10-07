@@ -283,7 +283,7 @@ pub fn owe() {
 
 /// The device-service pass: one relaxed load when nothing is owed.
 pub fn service() {
-    if OWED.load(Ordering::Acquire) && OWED.swap(false, Ordering::AcqRel) {
+    if OWED.load(Ordering::Acquire) && !TAKEN.load(Ordering::Acquire) && bar_first() && OWED.swap(false, Ordering::AcqRel) { // JOBSCAN (B497): the bar first; the jobs worker builds it when it took it
         build("login");
     }
 }
@@ -822,4 +822,34 @@ pub fn stamp_invalidate_for(mt: &MountTable, program: &str, doctypes: &[String])
     }
     serial_println!("[filetypes] stamp invalidated by={} type={} written={}", program, m, ok as u8);
     ok
+}
+
+// JOBSCAN (B497) — flight 27: the first-boot registry build (`blocks_read=20776 … ms=31154`) ran on the device-service
+// pass BEFORE the bar's build got its next turn (`bar_ms=31205`), and held the pass that pumps hid 11 s. The bar
+// paints first; on x86 the `jobs-scan` worker takes the owed build and runs it after its scan.
+static TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The device-service pass waits for the bar (the desktop built and painted) before it builds the owed registry.
+fn bar_first() -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        crate::video::desktopbuild::settled()
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        true
+    }
+}
+
+/// The `jobs-scan` worker takes the owed build (the device-service pass leaves it).
+pub fn take_to_worker() {
+    TAKEN.store(true, Ordering::Release);
+}
+
+/// The worker's turn: build the owed registry, if one is owed (one relaxed load otherwise), and hand the duty back.
+pub fn build_owed() {
+    if OWED.load(Ordering::Acquire) && OWED.swap(false, Ordering::AcqRel) {
+        build("login");
+    }
+    TAKEN.store(false, Ordering::Release);
 }
