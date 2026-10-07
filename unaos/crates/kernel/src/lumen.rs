@@ -412,11 +412,11 @@ pub fn lumenfast() {
             serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=not-spawned ::");
             return;
         };
-        let served0 = crate::video::text::resident_served();
+        let served0 = resident_served();
         match spawn_run(&img, 20_000) {
             Err(e) => serial_println!(":: LUMENFAST: first_line=none -> FAIL reason=spawn-refused ({}) ::", e),
             Ok(r) => {
-                let kib = crate::video::text::resident_served().saturating_sub(served0) / 1024;
+                let kib = resident_served().saturating_sub(served0) / 1024;
                 let pass = r.ok && r.took < BOUND_MS;
                 match r.fault {
                     Some((vec, _)) => serial_println!(":: LUMENFAST: sight_ms={} spawn_ms={} first_line=fault vec={} font_served_kib={} -> FAIL :: bound_ms={}", r.sight_ms, r.spawn_ms, vec, kib, BOUND_MS),
@@ -428,4 +428,13 @@ pub fn lumenfast() {
     }
     #[cfg(not(target_arch = "x86_64"))]
     serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=aarch64-image-owed :: bound_ms={}", BOUND_MS);
+}
+
+/// Resident face bytes the fulfiller served this boot; 0 on a build without `selfdiag` (no SYS_PATH_READ).
+#[cfg(target_arch = "x86_64")]
+fn resident_served() -> u64 {
+    #[cfg(feature = "selfdiag")]
+    return crate::video::text::resident_served();
+    #[cfg(not(feature = "selfdiag"))]
+    0
 }

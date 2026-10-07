@@ -639,8 +639,7 @@ mod tt {
                     let len = v.len();
                     let data: &'static [u8] = alloc::boxed::Box::leak(v.into_boxed_slice());
                     match Font::parse(data) {
-                        Ok(f) => {
-                            super::resident_note(&p, data); // LUMENFAST (B507): the parsed face's bytes, served to ring 3's reads of the same path
+                        Ok(f) => { #[cfg(feature = "selfdiag")] super::resident_note(&p, data); // LUMENFAST (B507): the parsed face's bytes, served to ring 3's SYS_PATH_READ of the same path; folded onto this line, code before comment, so no line below moves
                             eng.add_face(name, role, bold, f);
                             bytes += len;
                             None
@@ -864,17 +863,22 @@ pub fn rescale() -> bool {
 // read of that exact path from this copy. One store: the file as the kernel read it; no second font engine (ring 3
 // still parses with `font_core`). A `SYS_PATH_WRITE` to a noted path forgets it (the next read goes to the volume).
 // Witness, once per face on its first serve: `[kfont] resident path=<p> kib=<n> -> served-from-memory`.
+// Gated on `selfdiag` (the fulfiller's own feature): a build without SYS_PATH_READ carries none of it.
 
+#[cfg(feature = "selfdiag")]
 struct Resident {
     path: alloc::string::String,
     data: &'static [u8],
     said: bool,
 }
 
+#[cfg(feature = "selfdiag")]
 static RESIDENT: crate::sync::Mutex<alloc::vec::Vec<Resident>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+#[cfg(feature = "selfdiag")]
 static RESIDENT_SERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// `tt::load`: face `path` parsed from `data` (the leaked buffer the engine keeps for the boot).
+#[cfg(feature = "selfdiag")]
 pub fn resident_note(path: &str, data: &'static [u8]) {
     let mut r = RESIDENT.lock();
     r.retain(|e| e.path != path);
@@ -882,12 +886,14 @@ pub fn resident_note(path: &str, data: &'static [u8]) {
 }
 
 /// A write reached `path`: the resident copy no longer stands for the file.
+#[cfg(feature = "selfdiag")]
 pub fn resident_forget(path: &str) {
     RESIDENT.lock().retain(|e| e.path != path);
 }
 
 /// `SYS_PATH_READ` of a resident face: up to `cap` bytes at `off` (empty at or past the end), or `None` when
 /// the kernel holds no face at `path` (the volume answers).
+#[cfg(feature = "selfdiag")]
 pub fn resident_read(path: &str, off: u64, cap: usize) -> Option<alloc::vec::Vec<u8>> {
     let mut r = RESIDENT.lock();
     let e = r.iter_mut().find(|e| e.path == path)?;
@@ -902,6 +908,7 @@ pub fn resident_read(path: &str, off: u64, cap: usize) -> Option<alloc::vec::Vec
 }
 
 /// Bytes served from resident faces this boot (`tests lumenfast`).
+#[cfg(feature = "selfdiag")]
 pub fn resident_served() -> u64 {
     RESIDENT_SERVED.load(core::sync::atomic::Ordering::Relaxed)
 }
