@@ -17283,7 +17283,7 @@ impl XhciController {
             };
             usbnet::arm(in_dci, wait_trb_phys);
             usbnet::note_arm(1, in_ep); if let Some(r) = self.slots[slot as usize].bulk_in_ring.as_ref() { usbnet::note_arm_trb(wait_trb_phys, r.get_ptr(), r.cycle_bit(), rx_phys, usbnet::rx_len()); } // USBNET8: `[usbnet] rx arm trb= cycle= buf= len= cross64k=`. USBNET7: `[usbnet] rx_arm n= ep= mps=` once, then a counter
-            self.ring_doorbell(slot, in_dci as u32);
+            self.ring_doorbell(slot, in_dci as u32); self.usbnet_arm_read(slot, in_dci, wait_trb_phys);
         } else { match usbnet::rx_stall_action() { 1 => self.ring_doorbell(slot, in_dci as u32), 2 => self.usbnet_rx_reset(slot, in_dci), _ => {} } } // NETFRAME M3 (B368): an IN TD outstanding past 2 s with the PHY up gets its doorbell rung again; 2 s more with no completion -> Stop Endpoint + Set TR Dequeue + re-arm (flight 22: RX stopped at 35 completions, the 36th TD pending forever on a Running endpoint)
 
         // ── TX (NETCLOCK M3): reap the in-flight TD, then issue at most one more; asynchronous, one TD in flight. ──
@@ -17605,7 +17605,7 @@ impl XhciController {
             2 | 4 => self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx }).1,
             _ => 0,
         };
-        let deq = match self.slots[slot as usize].bulk_in_ring.as_ref() {
+        self.usbnet_reset_read(slot, dci); let deq = match self.slots[slot as usize].bulk_in_ring.as_ref() {
             Some(r) => { let (phys, dcs) = r.dequeue_reset_target(); phys | (dcs as u64) }
             None => { usbnet::note_rx_reset(stop_cc, 0, self.ep_state_of(slot, dci)); return; }
         };

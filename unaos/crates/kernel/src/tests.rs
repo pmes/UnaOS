@@ -337,7 +337,7 @@ fn ensure_usbnet() {
     #[cfg(feature = "usbnet")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("usbnet", crate::drivers::xhci::usbnet::selftest); register("usbnet7", crate::drivers::xhci::usbnet::usbnet7_selftest); register("usbnetftdi", crate::drivers::xhci::usbnet::usbnetftdi_selftest); } // NETFRAME (B368): `tests usbnet7`
+        if !DONE.swap(true, Ordering::AcqRel) { register("usbnet", crate::drivers::xhci::usbnet::selftest); register("usbnet7", crate::drivers::xhci::usbnet::usbnet7_selftest); register("usbnetftdi", crate::drivers::xhci::usbnet::usbnetftdi_selftest); register("usbnetrx", crate::drivers::xhci::usbnet::usbnetrx_selftest); } // NETFRAME (B368): `tests usbnet7`
     }
 }
 
