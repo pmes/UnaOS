@@ -1497,6 +1497,7 @@ pub extern "C" fn _start() -> ! {
     // HOLOCRON2 M2 (B355): Holocron first (`vein/claude.api_key`, keysource::decide); the key file only on
     // NotFound or no fulfiller; LOCKED / DENIED / CORRUPT refuse and the window names the fix.
     let hk = vein_ring3::holocron::claude_key(keybuf);
+    let t_holo = now_ms(); // LUMENFAST (B507): the Holocron round trips end here; the key file's half follows
     let (key, key_n) = match hk {
         vein_ring3::holocron::KeyFrom::Holocron(n) => (KeyState::UnaFs, n),
         vein_ring3::holocron::KeyFrom::Refuse(_) => (KeyState::None, 0),
@@ -1526,7 +1527,7 @@ pub extern "C" fn _start() -> ! {
         }
         Err(w) => Some(w),
     };
-    split_line(&[t_start, t_win, t_bus, t_key, t_tls, t_hist, now_ms()]);
+    split_line(&[t_start, t_win, t_bus, t_key, t_tls, t_hist, now_ms()], t_holo.saturating_sub(t_bus));
 
     let mut l = Line::new(b":: LUMEN: start provider=");
     l.put(sess.provider()).put(b" model=").put(sess.model()).put(b" key=").put(match hk { vein_ring3::holocron::KeyFrom::Holocron(_) => b"holocron" as &[u8], _ => key.as_str().as_bytes() }).put(b" transport=").put(sess.transport());
@@ -1716,12 +1717,14 @@ impl App {
 /// conversation, `font` the faces read off the volume. `start_at_ms` is `_start` on the kernel clock, so the seat
 /// reads the ELF load + APPRES sight as `start_at_ms` minus the spawn (the kernel's `[lumencrash] … spawn_ms=`).
 ///
-/// `[lumen] first_line_ms=<n> start_at_ms=<n> win_ms=<n> bus_ms=<n> key_ms=<n> tls_ms=<n> hist_ms=<n> font_ms=<n>`
-fn split_line(t: &[u64; 7]) {
+/// `[lumen] first_line_ms=<n> start_at_ms=<n> win_ms=<n> bus_ms=<n> key_ms=<n> tls_ms=<n> hist_ms=<n> font_ms=<n> key_holo_ms=<n>`
+/// LUMENFAST (B507): `key_holo_ms` = the Holocron round trips inside `key_ms` (the rest is the key file's stat/read).
+fn split_line(t: &[u64; 7], key_holo_ms: u64) {
     let d = |i: usize| t[i + 1].saturating_sub(t[i]) as i64;
     let mut l = Line::new(b"[lumen] first_line_ms=");
     l.dec(t[6].saturating_sub(t[0]) as i64).put(b" start_at_ms=").dec(t[0] as i64);
     l.put(b" win_ms=").dec(d(0)).put(b" bus_ms=").dec(d(1)).put(b" key_ms=").dec(d(2));
     l.put(b" tls_ms=").dec(d(3)).put(b" hist_ms=").dec(d(4)).put(b" font_ms=").dec(d(5));
+    l.put(b" key_holo_ms=").dec(key_holo_ms as i64);
     l.wire();
 }

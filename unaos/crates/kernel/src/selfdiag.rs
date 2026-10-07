@@ -120,6 +120,15 @@ pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec
     }
     let data = &inb[h + plen..];
     let who = principal_for(path, caller);
+    if nr == una_abi::SYS_PATH_READ && flags == 0 && data.is_empty() && who == KERNEL_PRINCIPAL {
+        if let Some(b) = crate::video::text::resident_read(path, off, cap) {
+            let k = b.len() as i64;
+            return Ok((b, k)); // LUMENFAST (B507): a face the kernel holds, from that copy — no mount table, no volume walk
+        }
+    }
+    if nr == una_abi::SYS_PATH_WRITE {
+        crate::video::text::resident_forget(path); // LUMENFAST (B507): the file changes; the resident copy no longer stands for it
+    }
     let mt = crate::shell::vfs_mount_table();
     if nr == una_abi::SYS_PATH_READ {
         if !data.is_empty() {
