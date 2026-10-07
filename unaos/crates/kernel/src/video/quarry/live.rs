@@ -2893,6 +2893,8 @@ pub fn service() {
     // its own pixels repaints once (the login screen, Quarry, Settings, Activity, the viewer/editor, the installer)
     // and the console repaints its screenful from its cell store. See `font_repaint_pass` at this file's tail.
     font_repaint_pass();
+    #[cfg(feature = "unafs")]
+    jobs_status_service(); // JOBSUI (B511): the counts replace `scanning...` the pass the scan lands
     quicklook::service(); columns::service(); openwith::service(); livedir::service(); // QUARRY3 (B413): the Quick Look panel renders here (I/O); QUARRY2 (B336): the latched column-width / sort preference write
 }
 
@@ -4321,7 +4323,60 @@ fn q3_paint(m: &Model, px: &mut [u32], li: Rect) {
     }
     sidebar::paint(m, px);
     toolbar::paint(m, px);
+    #[cfg(feature = "unafs")]
+    jobs_status(m, px); // JOBSUI (B511): under `/jobs`, the four counts on the path bar's status line
     dragdrop::paint(m, px); // DRAGDROP (B440): the hovered target's outline
+}
+
+// ── JOBSUI (rmbp-ledger B511) — the jobs counts on QUARRY3's status line ─────────────────────────────────────
+// Peter (2026-10-07): "what happened to the new jobs queue?". Quarry already lists `/jobs/...` as folders; with
+// no handler window open, the window that shows the folder shows the four counts (`fs::jobs::status_text`:
+// `jobs records=<n> claims=<n> ledger=<n> queue=<n>`, or `jobs scanning...` while the scan is pending — never
+// zeros), right-aligned on the path bar row, whenever the folder shown is `/jobs` or under it.
+// Wire (once per change): `[jobsui] quarry status=<pending|landed> text=<the line drawn>`.
+
+/// What the status line last drew: 0 = nothing (not under `/jobs`), 1 = the pending line, 2 = the counts.
+#[cfg(feature = "unafs")]
+static JOBS_DRAWN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "unafs")]
+fn under_jobs(cwd: &str) -> bool {
+    cwd == jobs_core::ROOT || cwd.strip_prefix(jobs_core::ROOT).is_some_and(|r| r.starts_with('/'))
+}
+
+#[cfg(feature = "unafs")]
+fn jobs_status(m: &Model, px: &mut [u32]) {
+    if !under_jobs(&m.cwd) || toolbar::search_active() {
+        JOBS_DRAWN.store(0, Ordering::Relaxed);
+        return;
+    }
+    let g = &m.geom;
+    let l = toolbar::layout(g);
+    let line = crate::fs::jobs::status_text();
+    let cw = g.cell_w().max(1);
+    let w = line.len() * cw;
+    // The path's own segments and any activation status ride the left; the counts take the right, only where free.
+    let path_end = toolbar::segments(&m.cwd, PAD(), cw).last().map_or(PAD(), |s| s.1);
+    let tail = m.status.as_ref().map_or(0, |s| (s.len() + 5) * cw);
+    let x = g.w.saturating_sub(PAD() + w);
+    if x < path_end + tail + 2 * cw {
+        return;
+    }
+    let py = l.path.y + l.path.h.saturating_sub(g.cell_h()) / 2;
+    text(px, g, x, py, line.as_bytes(), g.w - PAD(), theme::title_text_inactive());
+    let now = if crate::fs::jobs::counts().is_some() { 2 } else { 1 };
+    if JOBS_DRAWN.swap(now, Ordering::Relaxed) != now {
+        serial_println!("[jobsui] quarry status={} text={}", if now == 2 { "landed" } else { "pending" }, line);
+    }
+}
+
+/// The pending line was drawn and the scan has since landed: repaint once so the counts replace it.
+#[cfg(feature = "unafs")]
+fn jobs_status_service() {
+    if JOBS_DRAWN.load(Ordering::Relaxed) == 1 && crate::fs::jobs::counts().is_some() {
+        JOBS_DRAWN.store(0, Ordering::Relaxed); // the repaint draws (and says) the counts, or nothing when closed
+        repaint();
+    }
 }
 
 /// `tests quarry3` registration (rides `fs::filetype::ensure_tests`, no tests.rs line).

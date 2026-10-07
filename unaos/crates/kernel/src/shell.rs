@@ -6361,7 +6361,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
-            bg_jobs(console);
+            #[cfg(feature = "unafs")] { if crate::fs::jobs::shell_verb(&args, console) { bg_jobs(console); } } #[cfg(not(feature = "unafs"))] bg_jobs(console); // JOBSUI (B511): `jobs` reads the queue on /jobs first (the counts, the top ten open items), then this reaper; `jobs bg` is the reaper alone
         },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "kill" => {
