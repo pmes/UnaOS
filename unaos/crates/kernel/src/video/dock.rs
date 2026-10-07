@@ -889,24 +889,28 @@ pub fn compose() -> bool {
             // TEARSCOPE — `strip::vacate` IS `strip::erase_rect` plus the census; it returns exactly
             // what the erase returned and this arm behaves as it did. `owed=false`: the slot was
             // cleared above, so a declined erase is a span nothing comes back for.
-            Some(v) => { strip::settle("dock", None); strip::vacate("dock", v, None, false) } // B74: pay any owed vacate first
+            Some(v) => { strip::settle("dock", None); gone_note(v, if autohide() { "autohide" } else { "unhostable" }); strip::vacate_by("dock", v, None, false, "dock::compose", if autohide() { "autohide" } else { "unhostable" }) } // B74: pay any owed vacate first
             None => false,
         };
     };
 
     let t1 = crate::arch::now_cycles(); strip::settle("dock", Some(ext_rect(&l, mb))); // B74: a vacate that declined on an earlier pass is retried here, before this pass's own
-    if let Some(v) = vacated {
-        // Erase FIRST, then paint: the new strip lands on top of the cleaned area, so the two never
-        // race to own an overlapping pixel and the panel never shows a half-erased strip.
-        //
-        // TEARSCOPE — accounted, not changed. `owed=false` because `SLOT.store` below re-publishes
-        // this tenant's rect whatever the erase returned, so a decline here strands the ENDS this
-        // centred, tile-sized strip just stopped owning. That is the span Peter watched.
-        strip::vacate("dock", v, Some(ext_rect(&l, mb)), false);
-    }
     thumbs_refresh(&l, &rows[..n]); // DOCK2: the minimised tiles' surfaces, sampled once per repaint
+    // DOCKGONE (B498) — PAINT FIRST, then vacate only the ENDS the new strip no longer owns
+    // (`strip::vacate_by` erases `old` minus `old ∩ new`, never a pixel this paint just laid). WAS: erase
+    // the whole old box, then paint — and a paint that declined (a contended panel/scratch `try_lock`,
+    // composites run masked) left the strip flat with nothing owing it a pass: flight 27's "the taskbar
+    // disappeared". A declined paint now vacates NOTHING (the old strip stays on the glass, the slot keeps
+    // the old rect so the next pass retries both) and arms `PASS_OWED`, which `dock2_service` takes.
     if !paint(&l, &rows[..n], pressed, mnu) {
+        gone_paint_declined(vacated.is_some());
         return false;
+    }
+    PAINTS.fetch_add(1, Ordering::Relaxed);
+    if let Some(v) = vacated {
+        // TEARSCOPE — `owed=false` because `SLOT.store` below re-publishes this tenant's rect whatever the
+        // erase returned; a decline is remembered by `strip` and paid by `settle` on a later pass.
+        strip::vacate_by("dock", v, Some(ext_rect(&l, mb)), false, "dock::compose", "shrink");
     }
     LEDGER.paint(
         crate::arch::now_cycles().saturating_sub(t1),
@@ -3082,7 +3086,7 @@ fn lp_arm(t: usize, owner: u64) {
 /// The button came up: the hold ends.
 pub fn lp_release() { LP_OWNER.store(0, Ordering::Release); }
 /// Poll from the input-drain task: after [`LONGPRESS_MS`] of hold the menu opens. Returns true when it did.
-pub fn lp_service(now_ms: u64) -> bool {
+pub fn lp_service(now_ms: u64) -> bool { dockgone_register(); // DOCKGONE (B498): `tests dockgone`, registered once from the service pass
     dock2_service(now_ms); pin_timeout_service(now_ms); // HIDSTALL (B485): DOCKRELEASE. DOCK2 (B394): the launch pulse and its bound, auto-hide's reveal
     let o = LP_OWNER.load(Ordering::Acquire);
     if o == 0 || now_ms.wrapping_sub(LP_T0.load(Ordering::Relaxed)) < LONGPRESS_MS { return false; }
@@ -3682,7 +3686,8 @@ pub fn vacate_off() -> bool {
     }
     let r = SLOT.rect();
     SLOT.clear();
-    strip::vacate("dock", r, None, false)
+    gone_note(r, "logout");
+    strip::vacate_by("dock", r, None, false, "dock::vacate_off", "logout")
 }
 
 // ── PREFSUI (rmbp-ledger B389, R91) — login items launch through the dock's own seams ──────────────────────────
@@ -4520,5 +4525,92 @@ fn pin_timeout_service(now: u64) {
     serial_println!(
         "[dock] press at ({},{}) app={} release=timeout after_ms={} -> {}",
         x, y, DP_PINS[i as usize].name, now.saturating_sub(t0), if ok { "launched" } else { "declined" }
+    );
+}
+
+// ── DOCKGONE (rmbp-ledger B498) — the dock never leaves the glass on its own ─────────────────────────────────
+//
+// Flight 27: `[strip] vacate tenant=dock box=2770x130+55+1640 … -> SCENE-RESTORE` inside `tests winmemory` (the
+// 10-tile dock shrinking to 9 as its two `wmtest` windows closed), and Peter: "the taskbar disappeared". The
+// vacate rect was the dock's own previous geometry; what it did with it was the defect — the whole box erased
+// before a paint that could decline. See `compose` and `strip::vacate_by`; the design is
+// docs/dev/evidence/rmbp-1005/dockgone.md.
+
+/// Dock paints that landed (any reason), for `tests dockgone`'s `paints=`.
+static PAINTS: AtomicU64 = AtomicU64::new(0);
+/// WHOLE-strip vacates with the desktop built and auto-hide OFF — the Mac's dock never does this; must stay 0.
+static GONE: AtomicU64 = AtomicU64::new(0);
+/// The `paint declined -> OWED` line, said once per boot.
+static DECLINE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// A whole-strip vacate: printed every time (it is rare by construction), counted in [`GONE`] when it is
+/// neither the user's auto-hide nor a Log Out.
+fn gone_note(r: strip::Rect, reason: &str) {
+    let built = {
+        #[cfg(feature = "login")]
+        { super::desktopbuild::built() }
+        #[cfg(not(feature = "login"))]
+        { true }
+    };
+    let defect = built && reason != "autohide" && reason != "logout";
+    if defect {
+        GONE.fetch_add(1, Ordering::Relaxed);
+    }
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !defect && SAID.swap(true, Ordering::Relaxed) {
+        return; // the user's own hide / a Log Out: said once; a DEFECT is said every time
+    }
+    serial_println!(
+        "[dock] gone box={}x{}+{}+{} reason={} session={} -> {}",
+        r.2, r.3, r.0, r.1, reason, if built { "open" } else { "closed" }, if defect { "DEFECT" } else { "ok" }
+    );
+}
+
+/// A paint that declined: nothing was vacated, and the service pass owes the strip a composite.
+fn gone_paint_declined(had_vacate: bool) {
+    PASS_OWED.store(true, Ordering::Release);
+    if !DECLINE_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[dock] paint declined after={} -> OWED (service pass repaints; nothing vacated)",
+            if had_vacate { "shrink" } else { "change" }
+        );
+    }
+}
+
+fn dockgone_register() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.load(Ordering::Relaxed) && !DONE.swap(true, Ordering::AcqRel) {
+        crate::tests::register("dockgone", dockgone_selftest);
+    }
+}
+
+/// `tests dockgone` — 180 simulated seconds of the dock's service passes (one per second: the owed-pass taker
+/// and `wm::service_damage`, with a forced dock pass every 20 s), then: no whole-strip vacate with the session
+/// open, the strip painted (slot holds a signature and the rect the registry reports), and the ends arithmetic
+/// on flight 27's own rects (the 10-tile dock 2770 at +55 shrinking to the 9-tile 2496 at +192: two 137-px ends,
+/// 35620 px, neither touching the new strip).
+fn dockgone_selftest() {
+    let (g0, p0) = (GONE.load(Ordering::Relaxed), PAINTS.load(Ordering::Relaxed));
+    for s in 0..180u32 {
+        if s % 20 == 0 {
+            PASS_OWED.store(true, Ordering::Release);
+        }
+        if PASS_OWED.swap(false, Ordering::AcqRel) {
+            wm::composite();
+        }
+        wm::service_damage();
+    }
+    let vac = GONE.load(Ordering::Relaxed) - g0;
+    let paints = PAINTS.load(Ordering::Relaxed) - p0;
+    let reg = crate::video::panel_info_nonblocking().and_then(|p| strip_rect(p.width, p.height));
+    let present = SLOT.sig() != 0 && SLOT.packed() != 0 && (reg.is_none() || autohide() || reg.map_or(false, |r| {
+        let (sx, sy, sw, sh) = SLOT.rect();
+        sx <= r.0 && sy <= r.1 && sx + sw >= r.0 + r.2 && sy + sh >= r.1 + r.3
+    }));
+    let (ends, ends_px, ends_ok) = strip::bands_check((55, 1640, 2770, 130), (192, 1640, 2496, 130));
+    let pass = vac == 0 && present && ends == 2 && ends_px == 35620 && ends_ok;
+    serial_println!(
+        ":: DOCKGONE: vacates={} paints={} present={} ends={} ends_px={} -> {} ::",
+        vac, paints, present as u8, ends, ends_px, if pass { "PASS" } else { "FAIL" }
     );
 }
