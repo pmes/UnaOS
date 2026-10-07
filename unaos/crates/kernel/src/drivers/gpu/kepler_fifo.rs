@@ -2545,6 +2545,37 @@ pub mod kgr {
     /// PFIFO's PMC bit. // nouveau mc/gk104.c:28 { 0x00000100, NVKM_ENGINE_FIFO }
     const PMC_PFIFO: u32 = 0x100;
 
+    // ---- KEPLERGR3: the first real GR method (keplergr3.md, rungs G8..G11) ---------------------------------
+    /// PMC_BOOT_0 chipset field 27:20; GK107 = E7. // kepler.rs regs::NV_PMC_BOOT_0, nouveau device/base.c
+    const PMC_BOOT_0: usize = 0x0000;
+    const CHIP_GK107: u32 = 0xE7;
+    /// KEPLER_A, the 3D class nouveau's GK104-family GR exposes. // nouveau gr/gk104.c sclass, nvif/class.h [ONE-SOURCE: nouveau]
+    const CLASS_KEPLER_A: u32 = 0xA097;
+    /// FECS CPUCTL (bit 4 HALTED; envytools falcon io CPUCTL) and CHAN_CUR — falcon_microcode_spec.md §2 rows read at rest on this part
+    /// (KFCTXBIND's census, s26/s34); never 0x409504.
+    const FECS_CPUCTL: usize = 0x0040_9100;
+    const FECS_CPUCTL_HALTED: u32 = 1 << 4;
+    const FECS_CHAN_CUR: usize = 0x0040_9B00;
+    /// The instance block's GR engine-context pointer word. // nouveau fifo/gk104.c engine ctx 0x210/0x214
+    const INST_GR_CTX: usize = 0x210;
+    /// PGRAPH_INTR and its ILLEGAL_CLASS bit. // nouveau gr/gf100.c gf100_gr_intr [ONE-SOURCE: nouveau]
+    const PGRAPH_INTR: usize = 0x0040_0100;
+    const PGRAPH_INTR_ILLEGAL_CLASS: u32 = 0x20;
+    /// Subchannel object method; KEPLER_A SET_REPORT_SEMAPHORE_A (A..D at +0/4/8/C).
+    /// // open-gpu-doc cla06f.h (NVA06F SET_OBJECT 0x0000), cl9097.h NV9097_SET_REPORT_SEMAPHORE_A..D
+    const M_SET_OBJECT: u32 = 0x0000;
+    const M_REPORT_SEM: u32 = 0x1B00;
+    /// SEMAPHORE_D: OPERATION RELEASE (1:0 = 0) | STRUCTURE_SIZE ONE_WORD (bit 28). // cl9097.h
+    const REPORT_SEM_RELEASE_ONE_WORD: u32 = 0x1000_0000;
+    const GR_SUBCH: u32 = 0;
+    /// GR's payload ("KGR3") and the host fence's ("KGR4") behind it, in the semaphore page.
+    const GR_PAYLOAD: u32 = 0x4B47_5233;
+    const FENCE_PAYLOAD: u32 = 0x4B47_5234;
+    const K_PUSH_GR: usize = K_PUSH + 0x100;
+    const K_GRSEM: usize = K_SEM + 0x10;
+    const K_FENCE: usize = K_SEM + 0x20;
+    const GR_BUDGET_US: u64 = 20_000;
+
     static BAR0: AtomicUsize = AtomicUsize::new(0);
     static BAR1: AtomicUsize = AtomicUsize::new(0);
     static WIN: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -2598,14 +2629,125 @@ pub mod kgr {
         );
     }
 
-    fn witness(bind: &str, get: u32, nop: &str, verdict: &str) {
-        serial_println!(":: KGR: bind={} ramfc_get={} nop={} -> {} ::", bind, get, nop, verdict);
+    fn witness(bind: &str, get: u32, nop: &str, setobj: &str, method: &str, verdict: &str) {
+        serial_println!(":: KGR: bind={} ramfc_get={} nop={} setobj={} method={} -> {} ::", bind, get, nop, setobj, method, verdict);
+    }
+
+    /// The GR rung's outcome: the two witness words, the verdict (`PASS` or `DECLINED reason=...`), and
+    /// whether a GR push was left unlanded (the caller unwinds).
+    struct GrOut {
+        setobj: alloc::string::String,
+        method: alloc::string::String,
+        verdict: alloc::string::String,
+        stuck: bool,
+    }
+
+    /// G8 + G9 (keplergr3.md): pin the class from the chip and MEASURE the FECS precondition, after the PMC
+    /// raise and the NOP, before any GR push. Reads only. `Ok(class)` admits G10/G11; `Err` is the decline.
+    fn gr_precondition(bar0: usize, inst: usize) -> Result<u32, alloc::string::String> {
+        let boot0 = mr(PMC_BOOT_0);
+        let chip = (boot0 >> 20) & 0xFF;
+        let cpuctl = super::super::kepler::fecs_read(bar0, FECS_CPUCTL);
+        let chan_cur = super::super::kepler::fecs_read(bar0, FECS_CHAN_CUR);
+        let ctx = vr(inst + INST_GR_CTX);
+        let poisoned = |x: u32| (x >> 16) == 0xBADF || (x >> 16) == 0xBAD0;
+        let state = if poisoned(cpuctl) || poisoned(chan_cur) {
+            "poisoned"
+        } else if cpuctl & FECS_CPUCTL_HALTED != 0 {
+            "halted"
+        } else {
+            "running"
+        };
+        serial_println!(
+            "[kgr] fecs chipset={:02X} class={:04X} cpuctl={:08X} chan_cur={:08X} ctx210={:08X} -> {}",
+            chip, CLASS_KEPLER_A, cpuctl, chan_cur, ctx, state
+        );
+        if chip != CHIP_GK107 {
+            return Err(alloc::format!("chip-unpinned boot0={:08X}", boot0));
+        }
+        match state {
+            "poisoned" => Err(alloc::format!("fecs-poisoned cpuctl={:08X} chan_cur={:08X}", cpuctl, chan_cur)),
+            "halted" => Err(alloc::format!("fecs-halted cpuctl={:08X} ctx210={:08X}", cpuctl, ctx)),
+            _ => Ok(CLASS_KEPLER_A),
+        }
+    }
+
+    /// G8..G11. Runs only after `nop=ok` on the bound channel.
+    fn gr_rung(bar0: usize, w: usize, inst: usize, userd: usize) -> GrOut {
+        let declined = |why: alloc::string::String, stuck: bool| GrOut {
+            setobj: alloc::format!("declined"),
+            method: alloc::string::String::from("-"),
+            verdict: alloc::format!("DECLINED reason={}", why),
+            stuck,
+        };
+        let class = match gr_precondition(bar0, inst) {
+            Ok(c) => c,
+            Err(why) => {
+                serial_println!("[kgr] setobj class={:04X} subch={} -> declined({})", CLASS_KEPLER_A, GR_SUBCH, why);
+                serial_println!("[kgr] method=report-semaphore wrote=- sem=- -> declined");
+                return declined(why, false);
+            }
+        };
+        // G10 + G11: SET_OBJECT, the KEPLER_A report semaphore (GR writes GR_PAYLOAD), then a host WFI fence
+        // (the PBDMA releases FENCE_PAYLOAD only after GR went idle on the methods before it). GP entry 1.
+        let (push, grsem, fence) = (w + K_PUSH_GR, w + K_GRSEM, w + K_FENCE);
+        let before = vr(grsem);
+        let words = [
+            kf::pb_hdr(GR_SUBCH, M_SET_OBJECT, 1), class,
+            kf::pb_hdr(GR_SUBCH, M_REPORT_SEM, 4), (grsem >> 32) as u32, grsem as u32, GR_PAYLOAD, REPORT_SEM_RELEASE_ONE_WORD,
+            kf::pb_hdr(GR_SUBCH, kf::M_HOST_SEM, 4), (fence >> 32) as u32, fence as u32, FENCE_PAYLOAD, kf::SEM_RELEASE_WFI,
+        ];
+        for (i, v) in words.iter().enumerate() {
+            vw(push + i * 4, *v);
+        }
+        vw(w + K_GPFIFO + 8, (push as u32) & 0xFFFF_FFFC); // cla06f.h:139-148, as the NOP's entry 0
+        vw(w + K_GPFIFO + 12, ((push >> 32) as u32) | ((words.len() as u32) << 10));
+        core::sync::atomic::fence(SeqCst);
+        unsafe { core::arch::x86_64::_mm_mfence() };
+        vw(userd + kf::USERD_GP_PUT, 2);
+        let hz = { let h = crate::arch::apic::tsc_hz(); if h == 0 { 1_250_000_000 } else { h } };
+        let (t0, lim) = (crate::arch::now_cycles(), hz.saturating_mul(GR_BUDGET_US) / 1_000_000);
+        let mut us = 0u32;
+        let landed = loop {
+            let dt = crate::arch::now_cycles().saturating_sub(t0);
+            if vr(fence) == FENCE_PAYLOAD {
+                us = kf::cyc_us(dt) as u32;
+                break true;
+            }
+            if dt >= lim {
+                break false;
+            }
+            core::hint::spin_loop();
+        };
+        let (after, fv, pgi) = (vr(grsem), vr(fence), mr(PGRAPH_INTR));
+        let setobj = if pgi & PGRAPH_INTR_ILLEGAL_CLASS != 0 {
+            "illegal-class"
+        } else if landed {
+            "ok"
+        } else {
+            "stuck"
+        };
+        let method = if after == GR_PAYLOAD { "executed" } else if landed { "not-executed" } else { "stuck" };
+        serial_println!("[kgr] setobj class={:04X} subch={} -> {}", class, GR_SUBCH, setobj);
+        serial_println!(
+            "[kgr] method=report-semaphore wrote={:08X} sem={:08X}->{:08X} fence={:08X} pgraph_intr={:08X} gp_get={} us={} -> {}",
+            GR_PAYLOAD, before, after, fv, pgi, vr(userd + kf::USERD_GP_GET), us, method
+        );
+        kf::pfifo_decode(bar0, kf::CHID_GR, GR_ENG.load(Relaxed), GR_RL.load(Relaxed), kf::FAULT_UNIT_GR);
+        let verdict = if setobj == "ok" && method == "executed" {
+            alloc::string::String::from("PASS")
+        } else {
+            alloc::format!("DECLINED reason=gr-{} sem={:08X} fence={:08X} pgraph_intr={:08X}", if setobj != "ok" { setobj } else { method }, after, fv, pgi)
+        };
+        GrOut { setobj: setobj.into(), method: method.into(), verdict, stuck: !landed || method != "executed" }
     }
 
     /// `tests kgr` — the GR channel bound through the ONE path, a host NOP + semaphore release pushed, the
-    /// verdict read, the decode printed, and on any verdict but PASS the unwind EXECUTED.
+    /// verdict read, the decode printed, and on any verdict but PASS the unwind EXECUTED (KEPLERGR3: a GR
+    /// rung that DECLINES before any GR push leaves the NOP-PASS state as KEPLERGR left it; a GR push that
+    /// does not land, or lands without the method executing, is unwound).
     pub fn tests_kgr() {
-        let refuse = |why: &str| witness(&alloc::format!("refused({})", why), 0, "-", "REFUSED");
+        let refuse = |why: &str| witness(&alloc::format!("refused({})", why), 0, "-", "-", "-", "REFUSED");
         if RAN.swap(true, AcqRel) {
             return refuse("ran-this-boot");
         }
@@ -2746,7 +2888,9 @@ pub mod kgr {
         } else {
             "EXEC-WALL"
         };
-        if verdict != "PASS" {
+        // KEPLERGR3: past the NOP, the GR rung (G8..G11) decides the verdict; a GR push left stuck is unwound.
+        let gr = if verdict == "PASS" { Some(gr_rung(bar0, w, inst, userd)) } else { None };
+        if verdict != "PASS" || gr.as_ref().map_or(false, |g| g.stuck) {
             let _ = kf::unwind(bar0, kf::CHID_GR, rl, w + K_RUNL0, &pre);
         }
         let bname = if bind_ok {
@@ -2754,6 +2898,9 @@ pub mod kgr {
         } else {
             alloc::format!("{}({:02X})", kf::bind_name(bo.bind_post), bo.bind_post & 0xff)
         };
-        witness(&bname, core::cmp::max(ugt, ramfc_get), nop, verdict);
+        match gr {
+            Some(g) => witness(&bname, core::cmp::max(ugt, ramfc_get), nop, &g.setobj, &g.method, &g.verdict),
+            None => witness(&bname, core::cmp::max(ugt, ramfc_get), nop, "-", "-", verdict),
+        }
     }
 }
