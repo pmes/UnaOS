@@ -103,7 +103,7 @@ pub fn service() {
 }
 
 fn say(bar_ms: u64) {
-    let bar = super::menubar::owns_pixels();
+    LAST_BAR_MS.store(bar_ms.saturating_add(1), Relaxed); let bar = super::menubar::owns_pixels();
     let has_batt = super::status::bar_item().is_some();
     let no_source = super::status::source() == super::status::Source::None;
     let battery = if bar && has_batt { "painted" } else if no_source { "absent" } else { "unpainted" };
@@ -122,7 +122,7 @@ fn say(bar_ms: u64) {
         let pass = !prebuilt && swept == 0 && bar && bar_ms <= PAINT_WAIT_MS && (battery == "painted" || no_source) && dock;
         serial_println!(
             ":: DESKTOPBUILT: prebuilt={} built_at={} bar_first_paint_ms={} battery={} dock={} swept={} -> {} ::",
-            prebuilt as u8, if at_login { "login" } else { "stage" }, bar_ms, (battery == "painted") as u8, dock as u8, swept, if pass { "PASS" } else { "FAIL" }
+            prebuilt as u8, if at_login { "login" } else { "stage" }, bar_ms, (battery == "painted") as u8, dock as u8, swept, crate::tests::boot_word(pass) // SMALLFIX7 (B501): a record at boot
         );
     }
 }
@@ -138,4 +138,21 @@ pub fn teardown(why: &'static str) {
     let off = super::menubar::set_enabled(false);
     super::wm::composite();
     serial_println!("[desktop] torn down why={} bar_off={}", why, off as u8);
+}
+
+// JOBSCAN (B497): the login's deferred work (the jobs scan, the owed filetypes registry) waits for the bar.
+/// The last build's `bar_ms` + 1 (`0` = never said).
+static LAST_BAR_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Is the desktop built and its first paint read back (nothing owed, nothing pending)?
+pub fn settled() -> bool {
+    BUILT.load(Acquire) && OWED_AT.load(Acquire) == 0 && PAINT_AT.load(Acquire) == 0
+}
+
+/// The last build's `bar_ms` (`None` = no build said yet).
+pub fn last_bar_ms() -> Option<u64> {
+    match LAST_BAR_MS.load(Relaxed) {
+        0 => None,
+        n => Some(n - 1),
+    }
 }

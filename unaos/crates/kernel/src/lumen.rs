@@ -199,28 +199,70 @@ pub fn note_ring3_fault(vec: u8, rip: u64) {
 
 #[cfg(target_arch = "x86_64")]
 fn spawn_step(img: &[u8]) {
-    use core::sync::atomic::Ordering;
-    const FIRST: &str = ":: LUMEN: start";
     // SMALLFIX (B380): flight 23's typed `lumen` printed its first line 8 s after the spawn (09:24:43 -> 09:24:51,
     // six vugs storming): the program's `:: LUMEN: start` comes AFTER the window, Principia's prefs, the key, the
     // VEINTLS setup (DRBG seed + the roots and CCADB bundles) and the 1.7 MiB font load. The probe's 2 s bound
     // read that as `timeout`; it now waits for the REAL first line under a 20 s bound and says how long it took.
     const WAIT_MS: u64 = 20_000;
-    FAULT_PID.store(0, Ordering::Release);
-    crate::serial_line::line_watch_arm(FIRST);
-    let t_spawn = crate::arch::ms(); // SMALLFIX6 (B495): the spawn's own cost (the ELF load + APPRES's sight), on the line below
-    let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(img) {
-        Ok(t) => { crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1 as u64), IMAGE); t } // SMALLFIX4 item 11: a path launch arms its APPRES name
+    let r = match spawn_run(img, WAIT_MS) {
+        Ok(r) => r,
         Err(e) => {
-            crate::serial_line::line_watch_disarm();
             serial_println!(":: LUMENCRASH: reason=spawn-refused ({}) ::", e);
             serial_println!(":: LUMENCRASH: spawned=0 first_line=none -> FAIL ::");
             return;
         }
     };
+    serial_println!("[lumencrash] pid={} slot={} entry={:#x} wait_ms={} kill={} spawn_at_ms={} spawn_ms={} sight_ms={}", r.pid, r.slot, r.entry, WAIT_MS, r.killed, r.t_spawn, r.spawn_ms, r.sight_ms);
+    match r.fault {
+        Some((vec, rip)) => serial_println!(
+            ":: LUMENCRASH: spawned=1 first_line=fault vec={} rip=+{:#x} -> FAIL ::",
+            vec,
+            rip.wrapping_sub(r.entry)
+        ),
+        None if r.ok => serial_println!(":: LUMENCRASH: spawned=1 first_line={} -> PASS :: bound_ms={}", r.took, WAIT_MS),
+        None => serial_println!(":: LUMENCRASH: spawned=1 first_line=timeout -> FAIL :: waited_ms={} bound_ms={}", r.took, WAIT_MS),
+    }
+}
+
+/// One spawn of the accepted image and the wait for its first line (LUMENCRASH's step, LUMENFAST's read).
+#[cfg(target_arch = "x86_64")]
+struct SpawnRun {
+    pid: u64,
+    slot: u64,
+    entry: u64,
+    t_spawn: u64,
+    spawn_ms: u64,
+    sight_ms: u64,
+    took: u64,
+    ok: bool,
+    fault: Option<(u64, u64)>,
+    killed: &'static str,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn spawn_run(img: &[u8], wait_ms: u64) -> Result<SpawnRun, &'static str> {
+    use core::sync::atomic::Ordering;
+    const FIRST: &str = ":: LUMEN: start";
+    // LUMENFAST (B507): flight 27's `spawn_ms=6394` was APPRES's FIRST sight of the image (`[appres] sighted` ->
+    // `sight … attrs=18` six seconds later), run inside `app_name_arm_launch` AFTER the spawn — six seconds of
+    // UnaFS attribute writes racing the program's own start. The sight runs FIRST now (what a path launch from
+    // the wm does), timed on its own (`sight_ms=`); the launch-name arm after the spawn finds its stamp cached.
+    let t_sight = crate::arch::ms();
+    crate::fs::appres::sight(IMAGE);
+    let sight_ms = crate::arch::ms().saturating_sub(t_sight);
+    FAULT_PID.store(0, Ordering::Release);
+    crate::serial_line::line_watch_arm(FIRST);
+    let t_spawn = crate::arch::ms(); // SMALLFIX6 (B495): the spawn's own cost (the ELF load), on the line below
+    let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(img) {
+        Ok(t) => { crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1 as u64), IMAGE); t } // SMALLFIX4 item 11: a path launch arms its APPRES name
+        Err(e) => {
+            crate::serial_line::line_watch_disarm();
+            return Err(e);
+        }
+    };
     let spawn_ms = crate::arch::ms().saturating_sub(t_spawn);
     let t0 = crate::arch::ticks();
-    let deadline = t0 + WAIT_MS;
+    let deadline = t0 + wait_ms;
     let mut fault: Option<(u64, u64)> = None;
     let mut ok = false;
     while crate::arch::ticks() < deadline {
@@ -238,16 +280,7 @@ fn spawn_step(img: &[u8]) {
     crate::serial_line::line_watch_disarm();
     // A faulted task is already dead; a live one (PASS or timeout) is killed so the fixture leaves nothing.
     let killed = if fault.is_none() { crate::arch::syscall::bg_kill(pid, slot) } else { "faulted" };
-    serial_println!("[lumencrash] pid={} slot={} entry={:#x} wait_ms={} kill={} spawn_at_ms={} spawn_ms={}", pid, slot, entry, WAIT_MS, killed, t_spawn, spawn_ms);
-    match fault {
-        Some((vec, rip)) => serial_println!(
-            ":: LUMENCRASH: spawned=1 first_line=fault vec={} rip=+{:#x} -> FAIL ::",
-            vec,
-            rip.wrapping_sub(entry)
-        ),
-        None if ok => serial_println!(":: LUMENCRASH: spawned=1 first_line={} -> PASS :: bound_ms={}", took, WAIT_MS),
-        None => serial_println!(":: LUMENCRASH: spawned=1 first_line=timeout -> FAIL :: waited_ms={} bound_ms={}", took, WAIT_MS),
-    }
+    Ok(SpawnRun { pid, slot, entry, t_spawn, spawn_ms, sight_ms, took, ok, fault, killed })
 }
 
 // ── LUMENUX (rmbp-ledger B348) — the window's shared core, re-run in the kernel ──────────────────────────
@@ -362,4 +395,46 @@ fn lumenux() {
         if md_ok && history_ok && clip_ok && scroll_ok { "PASS" } else { "FAIL" },
         font
     );
+}
+
+// ── LUMENFAST (rmbp-ledger B507) — `tests lumenfast`: Lumen's first line under a second ──────────────────────
+// Flight 27 read `[lumen] first_line_ms=17227 … font_ms=15737` and `[lumencrash] … spawn_ms=6394`. The faces now
+// come from the kernel's resident copy (`video::text::resident_read`, served through `SYS_PATH_READ`'s fulfiller)
+// and the APPRES sight runs before the spawn. This verb runs the LUMENCRASH spawn of the accepted image with a
+// ONE-second bound (operator-invoked, R80: never at boot) and reports what the faces cost the kernel.
+// WITNESS. `:: LUMENFAST: sight_ms=<n> spawn_ms=<n> first_line=<n|timeout|fault> font_served_kib=<n> -> PASS|FAIL :: bound_ms=1000`
+// (`font_served_kib` = resident face bytes served this boot; 0 after a Lumen start = the faces came off the volume).
+pub fn lumenfast() {
+    const BOUND_MS: u64 = 1000;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let Some(img) = check() else {
+            serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=not-spawned ::");
+            return;
+        };
+        let served0 = resident_served();
+        match spawn_run(&img, 20_000) {
+            Err(e) => serial_println!(":: LUMENFAST: first_line=none -> FAIL reason=spawn-refused ({}) ::", e),
+            Ok(r) => {
+                let kib = resident_served().saturating_sub(served0) / 1024;
+                let pass = r.ok && r.took < BOUND_MS;
+                match r.fault {
+                    Some((vec, _)) => serial_println!(":: LUMENFAST: sight_ms={} spawn_ms={} first_line=fault vec={} font_served_kib={} -> FAIL :: bound_ms={}", r.sight_ms, r.spawn_ms, vec, kib, BOUND_MS),
+                    None if r.ok => serial_println!(":: LUMENFAST: sight_ms={} spawn_ms={} first_line={} font_served_kib={} -> {} :: bound_ms={}", r.sight_ms, r.spawn_ms, r.took, kib, if pass { "PASS" } else { "FAIL" }, BOUND_MS),
+                    None => serial_println!(":: LUMENFAST: sight_ms={} spawn_ms={} first_line=timeout font_served_kib={} -> FAIL :: bound_ms={}", r.sight_ms, r.spawn_ms, kib, BOUND_MS),
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=aarch64-image-owed :: bound_ms={}", BOUND_MS);
+}
+
+/// Resident face bytes the fulfiller served this boot; 0 on a build without `selfdiag` (no SYS_PATH_READ).
+#[cfg(target_arch = "x86_64")]
+fn resident_served() -> u64 {
+    #[cfg(feature = "selfdiag")]
+    return crate::video::text::resident_served();
+    #[cfg(not(feature = "selfdiag"))]
+    0
 }

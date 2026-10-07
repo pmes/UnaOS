@@ -211,9 +211,34 @@ pub fn load<D: BlockDevice>(fs: &mut UnaFS<D>) -> Result<Vec<Record>> {
     Ok(out)
 }
 
+/// VIEW (JOBSUI, rmbp-ledger B511) — Mica's Jobs view: the counts at the top, the queue's open items by rank below
+/// (name, track, status, the flight that last touched it). The SAME `jobs_core` shape the kernel draws (the `jobs`
+/// verb, Quarry's status line under `/jobs`); `track` narrows the items to one queue, `n` caps them.
+pub fn view_lines(records: &[Record], track: Option<&str>, n: usize) -> Vec<String> {
+    let c = jc::census(records);
+    let mut out = vec![jc::counts_line(Some([c.records as u64, c.claims as u64, c.ledger as u64, c.queue as u64]))];
+    let rank = |t: &str| jc::QUEUES.iter().position(|(q, _)| *q == t).unwrap_or(usize::MAX);
+    let mut items: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.kind == Kind::Queue && track.is_none_or(|t| r.track == t) && jc::shown_open(r.get(jc::K_STATUS), &r.body))
+        .collect();
+    items.sort_by_key(|r| (rank(&r.track), r.seq));
+    for (i, r) in items.iter().take(n).enumerate() {
+        let flight = jc::last_flight(r.get(jc::K_FLIGHT), &r.body);
+        out.push(jc::item_row(i + 1, &jc::queue_name(&r.id).1, &r.track, r.get(jc::K_STATUS), &flight));
+    }
+    out
+}
+
 /// A flight's captures (status-check.py `flight_files`): `docs/dev/evidence/**/f<N>-boot*.log` and
 /// `FLIGHT<a>[-<b>].md` covering N.
 pub fn flight_files(repo: &Path, n: u64) -> Vec<PathBuf> {
+    flight_files_of(repo, 'f', n)
+}
+
+/// STATUSORIN (B476, status-check.py `flight_files`): `kind` is `'f'` (rMBP: `f<N>-boot*.log`, `FLIGHT<a>[-<b>].md`)
+/// or `'r'` (Orin render N: `orin*/**/render<N>-*.log`, `boot-render<N>-*.log`, `FLIGHT-RESULT-render<N>.md`).
+pub fn flight_files_of(repo: &Path, kind: char, n: u64) -> Vec<PathBuf> {
     fn rec(dir: &Path, n: u64, out: &mut Vec<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -241,8 +266,33 @@ pub fn flight_files(repo: &Path, n: u64) -> Vec<PathBuf> {
             }
         }
     }
+    fn rec_orin(dir: &Path, n: u64, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rec_orin(&p, n, out);
+                continue;
+            }
+            let b = e.file_name().to_string_lossy().to_string();
+            let want = format!("render{}-", n);
+            let is_log = b.ends_with(".log") && (b.starts_with(&want) || b.strip_prefix("boot-").is_some_and(|r| r.starts_with(&want)));
+            if is_log || b == format!("FLIGHT-RESULT-render{}.md", n) {
+                out.push(p);
+            }
+        }
+    }
     let mut out = Vec::new();
-    rec(&repo.join("docs/dev/evidence"), n, &mut out);
+    if kind == 'r' {
+        let Ok(rd) = std::fs::read_dir(repo.join("docs/dev/evidence")) else { return out };
+        for e in rd.flatten() {
+            if e.path().is_dir() && e.file_name().to_string_lossy().starts_with("orin") {
+                rec_orin(&e.path(), n, &mut out);
+            }
+        }
+    } else {
+        rec(&repo.join("docs/dev/evidence"), n, &mut out);
+    }
     out.sort();
     out
 }
@@ -257,7 +307,7 @@ pub fn verify(repo: &Path, r: &Record) -> Option<bool> {
         return Some(false);
     }
     let n: u64 = fl[1..].parse().ok()?;
-    let blobs: Vec<Vec<u8>> = flight_files(repo, n).iter().filter_map(|p| std::fs::read(p).ok()).collect();
+    let blobs: Vec<Vec<u8>> = flight_files_of(repo, fl.chars().next().unwrap_or('f'), n).iter().filter_map(|p| std::fs::read(p).ok()).collect();
     let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
     Some(jc::verify_line(line, &refs))
 }
@@ -370,6 +420,188 @@ pub fn cite_claim<D: BlockDevice>(
     probe.set(jc::K_LINE, line);
     let verified = verify(repo, &probe).unwrap_or(true);
     jc::cite(&mut r, status, flight, line, verified, set_by).map_err(|e| anyhow!("{id}: {e}"))?;
+    store(fs, &r)?;
+    fs.commit().map_err(fe)?;
+    Ok(r)
+}
+
+// ── JOBSNEXT (rmbp-ledger B506): next / cut / land / owed ──────────────────────────────────────────────────────
+// Peter, 2026-10-07: "why do i have to tell you that there's more to do after every single boot". The ranking is
+// `jobs_core::rank_next` (the kernel's `jobs next` calls the same function); Mica adds the repo's halves: the
+// flight's §3 from `docs/dev/evidence/**/FLIGHT<n>.md`, the brief path, and the writes (`/jobs/owed`, cut, land).
+
+/// The FLIGHT<n>.md that covers `want` (exact `FLIGHT<n>.md` first, else a `FLIGHT<a>-<b>.md` range), or with
+/// `None` the newest flight the evidence folder holds: (n, path).
+pub fn flight_md(repo: &Path, want: Option<u64>) -> Option<(u64, PathBuf)> {
+    fn rec(dir: &Path, out: &mut Vec<(u64, u64, PathBuf)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rec(&p, out);
+                continue;
+            }
+            let b = e.file_name().to_string_lossy().to_string();
+            if let Some(rest) = b.strip_prefix("FLIGHT").and_then(|r| r.strip_suffix(".md")) {
+                let (a, z) = rest.split_once('-').unwrap_or((rest, rest));
+                if let (Ok(a), Ok(z)) = (a.parse::<u64>(), z.parse::<u64>()) {
+                    out.push((a, z, p));
+                }
+            }
+        }
+    }
+    let mut all = Vec::new();
+    rec(&repo.join("docs/dev/evidence"), &mut all);
+    all.sort();
+    match want {
+        Some(n) => all
+            .iter()
+            .find(|(a, z, _)| *a == n && *z == n)
+            .or_else(|| all.iter().find(|(a, z, _)| *a <= n && n <= *z))
+            .map(|(_, _, p)| (n, p.clone())),
+        None => all.into_iter().max_by_key(|(_, z, _)| *z).map(|(_, z, p)| (z, p)),
+    }
+}
+
+/// The flight's §3 names off the repo: (`f<n>`, names).
+pub fn owed_from_repo(repo: &Path, want: Option<u64>) -> Result<(String, Vec<String>)> {
+    let Some((n, p)) = flight_md(repo, want) else {
+        return match want {
+            Some(n) => bail!("no FLIGHT{n}.md under docs/dev/evidence"),
+            None => Ok((String::new(), Vec::new())),
+        };
+    };
+    let md = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+    Ok((format!("f{n}"), jc::owed_names(&md)))
+}
+
+fn owed_path() -> String {
+    format!("{}/{}", jc::ROOT, jc::OWED_FILE)
+}
+
+/// Write `/jobs/owed`: the names one per line, `job:flight` = the flight, typed text.
+pub fn write_owed<D: BlockDevice>(fs: &mut UnaFS<D>, flight: &str, names: &[String]) -> Result<()> {
+    let root = mkdirs(fs, jc::ROOT)?;
+    let path = owed_path();
+    let id = match fs.resolve_path(&path) {
+        Ok(id) => {
+            fs.truncate_data(id, 0).map_err(fe)?;
+            id
+        }
+        Err(_) => {
+            let id = fs.create_file(root, jc::OWED_FILE.to_string()).map_err(fe)?;
+            fs.set_attribute(id, jc::TYPE_KEY.into(), AttributeValue::String(jc::RECORD_TYPE.into())).map_err(fe)?;
+            id
+        }
+    };
+    let mut body = names.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    fs.write_data(id, 0, body.as_bytes()).map_err(fe)?;
+    fs.set_attribute(id, jc::K_FLIGHT.into(), AttributeValue::String(flight.into())).map_err(fe)?;
+    fs.commit().map_err(fe)?;
+    Ok(())
+}
+
+/// Read `/jobs/owed` back: (`f<n>`, names), or `None` when the volume predates it.
+pub fn read_owed<D: BlockDevice>(fs: &mut UnaFS<D>) -> Result<Option<(String, Vec<String>)>> {
+    let Ok(id) = fs.resolve_path(&owed_path()) else { return Ok(None) };
+    let ino = fs.read_inode(id).map_err(fe)?;
+    let body = String::from_utf8(fs.read_data(id, 0, ino.size).map_err(fe)?).map_err(|_| anyhow!("/jobs/owed is not UTF-8"))?;
+    let flight = match fs.get_attribute(id, jc::K_FLIGHT).map_err(fe)? {
+        Some(AttributeValue::String(s)) => s,
+        _ => String::new(),
+    };
+    Ok(Some((flight, body.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())))
+}
+
+/// The brief an arc has: `docs/dev/evidence/**/<NAME>.md` (case-insensitive stem), repo-relative, newest folder first.
+pub struct Briefs(Vec<(String, String)>);
+
+impl Briefs {
+    pub fn index(repo: &Path) -> Briefs {
+        fn rec(repo: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rec(repo, &p, out);
+                } else if let Some(stem) = p.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".md")) {
+                    let rel = p.strip_prefix(repo).unwrap_or(&p).to_string_lossy().to_string();
+                    out.push((stem.to_ascii_uppercase(), rel));
+                }
+            }
+        }
+        let mut v = Vec::new();
+        rec(repo, &repo.join("docs/dev/evidence"), &mut v);
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        Briefs(v)
+    }
+    pub fn get(&self, name: &str) -> &str {
+        if name.is_empty() {
+            return "";
+        }
+        self.0.iter().find(|(s, _)| s == &name.to_ascii_uppercase()).map(|(_, p)| p.as_str()).unwrap_or("")
+    }
+}
+
+/// `mica jobs next`: the header and the ranked rows (the same `jobs_core` lines the kernel prints, plus the brief).
+pub fn next_lines(records: &[Record], flight: &str, owed: &[String], track: &str, n: usize, briefs: &Briefs) -> Vec<String> {
+    let ranked = jc::rank_next(records, owed, track, n);
+    let mut out = vec![jc::next_header(records, &ranked, flight, owed.len(), track)];
+    for (k, t) in ranked.iter().enumerate() {
+        out.push(jc::next_row(records, k + 1, t, briefs.get(&t.name)));
+    }
+    out
+}
+
+/// Find one record by id (`<id>` or `<track>/<id>`; a claim by `ST<n>`). Refuses an id two tracks share.
+pub fn find<D: BlockDevice>(fs: &mut UnaFS<D>, want: &str, track: &str) -> Result<Record> {
+    let (t, id) = want.split_once('/').unwrap_or((track, want));
+    let all = load(fs)?;
+    let hits: Vec<&Record> = all.iter().filter(|r| r.id == id && (t.is_empty() || r.track == t || r.kind == Kind::Claim)).collect();
+    match hits.as_slice() {
+        [r] => Ok((*r).clone()),
+        [] => bail!("{want}: no such job (track {})", if t.is_empty() { "any" } else { t }),
+        _ => bail!("{want}: {} records carry this id — name it <track>/<id>", hits.len()),
+    }
+}
+
+/// CUT: the executor's cut — `job:status=open`, `job:arc`, `job:branch` (a cut item leaves `next`).
+pub fn cut<D: BlockDevice>(fs: &mut UnaFS<D>, want: &str, track: &str, arc: &str, branch: &str) -> Result<Record> {
+    if branch.is_empty() || branch.contains(['\t', '\n']) || arc.contains(['\t', '\n']) {
+        bail!("cut needs --branch <executor branch> (and an --arc without tabs)");
+    }
+    let mut r = find(fs, want, track)?;
+    if r.kind == Kind::Claim {
+        bail!("{}: a claim is cited, not cut", r.id);
+    }
+    r.set(jc::K_STATUS, "open");
+    if !arc.is_empty() {
+        r.set(jc::K_ARC, arc);
+    }
+    r.set(jc::K_BRANCH, branch);
+    store(fs, &r)?;
+    fs.commit().map_err(fe)?;
+    Ok(r)
+}
+
+/// LAND: the hand-back — `job:status` (the closed set) and `job:tip`. The row's TEXT is untouched, so the ledger
+/// cell and STATUS.tsv still come from `export` (the gate reads the export).
+pub fn land<D: BlockDevice>(fs: &mut UnaFS<D>, want: &str, track: &str, status: &str, tip: &str) -> Result<Record> {
+    if !jc::status_ok(status) || status == "-" {
+        bail!("status '{status}' not in {}", jc::STATUSES[..jc::STATUSES.len() - 1].join("/"));
+    }
+    if tip.len() < 7 || !tip.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("--tip '{tip}' is not a commit sha");
+    }
+    let mut r = find(fs, want, track)?;
+    if r.kind == Kind::Claim {
+        bail!("{}: a claim is cited (`mica jobs cite`), not landed", r.id);
+    }
+    r.set(jc::K_STATUS, status);
+    r.set(jc::K_TIP, tip);
     store(fs, &r)?;
     fs.commit().map_err(fe)?;
     Ok(r)

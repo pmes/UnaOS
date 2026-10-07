@@ -998,6 +998,9 @@ fn main() {
     // GEN7B (B422): UNAOS_IVB3D_BLIT=1 arms the BCS as KCOMP's second Blitter (drivers/gpu/gen7_blit.rs,
     // `tests gen7` only). Kept in sync with arroyo's mapping (the builder rebuilds the kernel for media).
     if std::env::var("UNAOS_IVB3D_BLIT").is_ok() { feats.push("gen7"); feats.push("gen7blit"); }
+    // GEN7R9 (B504): UNAOS_IVB3D_R9=1 arms rung R9 on the RCS (drivers/gpu/gen7_r9.rs, `tests gen7` only).
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_IVB3D_R9").is_ok() { feats.push("gen7"); feats.push("gen7r9"); }
     // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU with an
     // unwind-stack restore on the same call stack (round 13 removed the timed auto-revert).
     // Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob

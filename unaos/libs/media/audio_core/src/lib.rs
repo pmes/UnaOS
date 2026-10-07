@@ -425,3 +425,30 @@ pub fn mime_of(d: &[u8]) -> Option<(&'static str, bool)> {
         Format::Mp4 | Format::Unknown => return None,
     })
 }
+
+/// SOUNDOPENERS (rmbp-ledger B500) — which core opens a sound: the ONE routing predicate both rings ask (R79).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// One of this crate's own readers takes the file whole (RIFF/WAVE, AIFF, FLAC, Ogg, MP3, ADTS) — no demuxer.
+    AudioCore(Format),
+    /// A container (ISO-BMFF/MP4/M4A, Matroska/WebM) that `demux_core` opens; the sound track is read through it.
+    Demux,
+}
+
+impl Route {
+    /// The wire's word: `audiocore` or `demux`.
+    pub fn via(self) -> &'static str {
+        match self {
+            Route::AudioCore(_) => "audiocore",
+            Route::Demux => "demux",
+        }
+    }
+}
+
+/// SOUNDOPENERS (B500): route a sound from its first bytes (`None`: neither this crate nor `demux_core` knows them).
+pub fn route(head: &[u8]) -> Option<Route> {
+    match sniff(head) {
+        Format::Mp4 | Format::Unknown => demux_core::probe(head).map(|_| Route::Demux),
+        f => Some(Route::AudioCore(f)),
+    }
+}

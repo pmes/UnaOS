@@ -735,7 +735,7 @@ pub fn deliver_ax(buf: &[u8]) {
             flagged_once(hdr, &buf[off..(off + len).min(off + 16)]);
         }
         usbnet_core::Pkt::Frame { off, len } => {
-            RX_OK.fetch_add(1, Ordering::Relaxed);
+            RX_OK.fetch_add(1, Ordering::Relaxed); rxr_frame(len);
             deliver(&buf[off..off + len]);
         }
     });
@@ -1357,7 +1357,7 @@ pub fn rx_stall_action() -> u8 {
     let backoff = U9_BACKOFF_MS.load(Ordering::Relaxed).max(U9_BACKOFF_MIN_MS);
     if last != 0 && now.saturating_sub(last) < backoff { return 0; }
     U9_RESET_AT.store(now.max(1), Ordering::Relaxed);
-    U9_BACKOFF_MS.store((backoff * 2).min(U9_BACKOFF_MAX_MS), Ordering::Relaxed);
+    U9_BACKOFF_MS.store(rxr_backoff((backoff * 2).min(U9_BACKOFF_MAX_MS)), Ordering::Relaxed); // USBNETRX M2: held at the floor while no IN completion ever arrived
     U9_RESET_OWED_MS.store(owed_ms, Ordering::Relaxed);
     2
 }
@@ -1814,4 +1814,106 @@ pub fn usbnetftdi_selftest() {
         ":: USBNETFTDI: ftdi_alive={} rx_armed={} events={} beats={} drives={} -> {} ::",
         (beats > 0) as u8, rx_armed as u8, events, beats, DRIVES.load(Ordering::Relaxed) - d0, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── USBNETRX (rmbp-ledger B502) ─────────────────────────────────────────────────────────────────────
+// Flight 27: the first High-Speed attach (`mps=512`, PORTSC speed 3) armed the bulk-IN ring, rang it, kicked it and
+// reset it, and no IN transfer ever completed (`xfers=0`) while the OUT pipe of the same slot completed every DISCOVER.
+// The wire could not say whether the controller FETCHED the armed TRB (its TR Dequeue past it: the completion event was
+// lost) or never did (dequeue == the armed TRB: the device NAKed every IN). These lines are that read (xHCI 1.2 §6.2.3
+// for the endpoint state, §4.6.9/§4.6.10 for Stop and Set TR Dequeue), and the bound on the back-off that hid it.
+static RXR_DOORBELLS: AtomicU64 = AtomicU64::new(0);
+static RXR_LINES: AtomicU64 = AtomicU64::new(0);
+static RXR_AFTER_RESET: AtomicBool = AtomicBool::new(false);
+static RXR_TD: AtomicU8 = AtomicU8::new(0); // 0 unread, 1 untouched (controller dequeue == armed TRB), 2 consumed
+static RXR_DEAD_SAID: AtomicBool = AtomicBool::new(false);
+static RXR_FRAME_SAID: AtomicBool = AtomicBool::new(false);
+/// xHCI 1.2 §6.2.3 Table 6-8, Endpoint Context EP State.
+pub fn ep_state_name(s: u8) -> &'static str {
+    match s { 0 => "disabled", 1 => "running", 2 => "halted", 3 => "stopped", 4 => "error", _ => "unknown" }
+}
+fn rxr_usb() -> &'static str {
+    match IN_MPS.load(Ordering::Relaxed) { 1024 => "ss", 512 => "hs", 0 => "none", _ => "fs" }
+}
+fn rxr_td_name(t: u8) -> &'static str {
+    match t { 1 => "untouched", 2 => "consumed", _ => "unread" }
+}
+/// Index of `phys` in a ring of `n` TRBs at `base`, or `out` when the controller's pointer is not in the ring.
+fn rxr_idx(phys: u64, base: u64, n: usize) -> alloc::string::String {
+    if phys >= base && phys < base + (n as u64) * 16 { alloc::format!("{}", (phys - base) / 16) } else { alloc::string::String::from("out") }
+}
+/// The first delivered frame of the boot: `[usbnet] rx frame n=1 len=<n>` (the witness the arc asks for, once).
+fn rxr_frame(len: usize) {
+    if !RXR_FRAME_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[usbnet] rx frame n=1 len={} usb={} resets={}", len, rxr_usb(), NF_RESETS.load(Ordering::Relaxed));
+    }
+}
+/// While no IN completion has ever arrived, rung two's back-off stays at its floor: zero frames is a FAIL already said,
+/// not a reason to wait 32, 64, 128 s for the next look.
+fn rxr_backoff(doubled: u64) -> u64 {
+    if RX_XFERS.load(Ordering::Relaxed) == 0 { U9_BACKOFF_MIN_MS } else { doubled }
+}
+impl super::XhciController {
+    /// USBNETRX M1: after each arm's doorbell. `[usbnet] rx arm trbs=<idx> cycle=<the TRB's own C bit> pcs=<the ring's
+    /// producer cycle> ep_state=<§6.2.3 name> hw_deq=<the endpoint context's TR Dequeue, as an index> doorbell=rung
+    /// usb=<hs|ss>` — arms 1..8, the first arm after each reset, and every power of two.
+    pub(super) fn usbnet_arm_read(&self, slot: u8, dci: u8, trb_phys: u64) {
+        RXR_DOORBELLS.fetch_add(1, Ordering::Relaxed);
+        let n = RXR_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+        let after = RXR_AFTER_RESET.swap(false, Ordering::Relaxed);
+        if !(n <= 8 || after || n.is_power_of_two()) { return; }
+        let r = match self.slots[slot as usize].bulk_in_ring.as_ref() { Some(r) => r, None => return };
+        let base = r.get_ptr();
+        let c = unsafe { core::ptr::read_volatile((trb_phys + 12) as *const u32) } & 1;
+        let hw = self.ep_ctx_deq(slot, dci);
+        serial_println!("[usbnet] rx arm trbs={} cycle={} pcs={} ep_state={} hw_deq={} dcs={} doorbell=rung usb={} n={}",
+            trb_phys.wrapping_sub(base) / 16, c, r.cycle_bit() as u8, ep_state_name(self.ep_state_of(slot, dci)),
+            rxr_idx(hw & !0xF, base, r.num_trbs()), hw & 1, rxr_usb(), n);
+    }
+    /// USBNETRX M1 + M2: rung two, after the Stop Endpoint and BEFORE the Set TR Dequeue moves the pointer — the one moment
+    /// the controller's own dequeue says whether it fetched the armed TD. `[usbnet] rx reset read armed=<idx> hw_deq=<idx>
+    /// td=<untouched|consumed> stopped_ev=<ccN|none> ep_state=<name>`; on the second fruitless reset with no IN completion
+    /// ever, once: `[usbnet] rx dead resets=<n> xfers=0 td=<…> usb=<…> -> FAIL reason=<device-silent|event-lost>`.
+    pub(super) fn usbnet_reset_read(&self, slot: u8, dci: u8) {
+        let armed = TRB_PHYS.load(Ordering::Relaxed);
+        let hw = self.ep_ctx_deq(slot, dci) & !0xF;
+        let td = if armed == 0 { 0 } else if hw == armed { 1 } else { 2 };
+        RXR_TD.store(td, Ordering::Relaxed);
+        RXR_AFTER_RESET.store(true, Ordering::Relaxed);
+        let ev = if DONE.load(Ordering::Relaxed) { alloc::format!("cc{}", CODE.load(Ordering::Relaxed)) } else { alloc::string::String::from("none") };
+        let r = NF_RESETS.load(Ordering::Relaxed) + 1;
+        if r <= 8 || r.is_power_of_two() {
+            let (ai, hi) = match self.slots[slot as usize].bulk_in_ring.as_ref() {
+                Some(ring) => (rxr_idx(armed, ring.get_ptr(), ring.num_trbs()), rxr_idx(hw, ring.get_ptr(), ring.num_trbs())),
+                None => (alloc::string::String::from("none"), alloc::string::String::from("none")),
+            };
+            serial_println!("[usbnet] rx reset read n={} armed={} hw_deq={} td={} stopped_ev={} ep_state={} usb={}",
+                r, ai, hi, rxr_td_name(td), ev, ep_state_name(self.ep_state_of(slot, dci)), rxr_usb());
+        }
+        if r >= 2 && RX_XFERS.load(Ordering::Relaxed) == 0 && !RXR_DEAD_SAID.swap(true, Ordering::Relaxed) {
+            serial_println!("[usbnet] rx dead resets={} xfers=0 td={} usb={} -> FAIL reason={}", r, rxr_td_name(td), rxr_usb(),
+                match td { 1 => "device-silent", 2 => "event-lost", _ => "unread" });
+        }
+    }
+}
+/// `tests usbnetrx` (B502): drive the link up to 5 s or until a frame arrives, then read the IN endpoint.
+/// `:: USBNETRX: armed=<0|1> doorbell=<0|1> ep_state=<name> frames=<n> td=<…> usb=<hs|ss> -> PASS|FAIL ::`;
+/// no dongle -> `SKIP reason=no-dongle`. PASS = armed, rung, Running, and at least one frame delivered this attach.
+pub fn usbnetrx_selftest() {
+    if !is_up() {
+        serial_println!(":: USBNETRX: armed=0 doorbell=0 ep_state=none frames=0 reason=no-dongle -> SKIP ::");
+        return;
+    }
+    let (f0, t0) = (RX_OK.load(Ordering::Relaxed), crate::arch::ms());
+    while crate::arch::ms().saturating_sub(t0) < 5000 && is_up() && RX_OK.load(Ordering::Relaxed) == f0 {
+        main_pass();
+        for _ in 0..256 { core::hint::spin_loop(); }
+    }
+    let st = match super::claim() { Ok(x) => x.usbnet_ring_state().map(|s| s.3).unwrap_or(0xFF), Err(_) => 0xFF };
+    let armed = (armed() || RX_ARMS.load(Ordering::Relaxed) > 0) as u8;
+    let rung = (RXR_DOORBELLS.load(Ordering::Relaxed) > 0) as u8;
+    let frames = RX_OK.load(Ordering::Relaxed);
+    let ok = armed == 1 && rung == 1 && st == 1 && frames > 0;
+    serial_println!(":: USBNETRX: armed={} doorbell={} ep_state={} frames={} window={} td={} usb={} -> {} ::",
+        armed, rung, ep_state_name(st), frames, frames - f0, rxr_td_name(RXR_TD.load(Ordering::Relaxed)), rxr_usb(), if ok { "PASS" } else { "FAIL" });
 }

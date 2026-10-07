@@ -1729,11 +1729,7 @@ fn clock_rect(r: strip::Rect) -> Option<(usize, usize, usize, usize)> {
 /// [`menus_right_limit`] pair it with [`super::status::bar_item`], so "no source" and "no room" stay
 /// two separate facts with two separate answers.
 fn batt_slot(w: usize) -> Option<usize> {
-    let x0 = clock_slot(w)?.checked_sub(strip::PAD() + BATT_ITEM_W())?;
-    if x0 < TITLE_X0() + CELL_W() {
-        return None;
-    }
-    Some(x0)
+    flow_slot(super::status::ITEM_BATTERY, w).map(|(x0, _)| x0) // MENUBARSLOTS (B499): the battery's place in the ONE flow
 }
 
 /// BRIGHTKEYS — x of the transient level item: left of the battery's (always reserved) item.
@@ -2354,7 +2350,7 @@ pub fn battery_selftest(pw: usize, ph: usize) {
     let slot = batt_slot(bw);
     let clock_x = clock_slot(bw).unwrap_or(0);
     let seat_ok = match slot {
-        Some(x0) => x0 + BATT_ITEM_W() + strip::PAD() == clock_x && x0 >= TITLE_X0() + CELL_W(),
+        Some(x0) => bell_slot(bw) == Some(x0 + BATT_ITEM_W() + strip::PAD()) && clock_x > x0 && x0 >= TITLE_X0() + CELL_W(), // MENUBARSLOTS (B499): one PAD left of the bell, its right neighbour in the flow
         None => false,
     };
 
@@ -3129,8 +3125,8 @@ pub fn volatile_rects(pw: usize, ph: usize) -> (Option<strip::Rect>, Option<stri
 
 // ── NOTIFY (rmbp-ledger B418, MACPARITY row 24) — THE BELL: the Notification Center's status item ─────────────────
 //
-// Left of the battery's slot (reserved whether or not the board has a battery, as the battery item reserves its
-// own), inside the status area `volatile_rects` already masks. The glyph is ours (a 12-cell bell); the badge is
+// MENUBARSLOTS (B499): between the battery and the clock, the Mac's control-centre place ([`flow_slot`]; reserved
+// whether or not the board has a battery, as the battery item reserves its own), inside the status area `volatile_rects` already masks. The glyph is ours (a 12-cell bell); the badge is
 // the unread count in accent ink (`9+` past nine). Lit (active ink) while the Center is open or anything is
 // unread. The press cell is [`bell_box_abs`], read by `notify::press_at` — the first furniture arm.
 
@@ -3153,11 +3149,7 @@ const BELL_BITS: [u16; 12] = [
 
 /// The bell item's left inset inside a bar `w` px wide, or `None` when the bar cannot seat it.
 fn bell_slot(w: usize) -> Option<usize> {
-    let x0 = batt_slot(w)?.checked_sub(strip::PAD() + BELL_ITEM_W())?;
-    if x0 < TITLE_X0() + CELL_W() {
-        return None;
-    }
-    Some(x0)
+    flow_slot(super::status::ITEM_NOTIFY, w).map(|(x0, _)| x0) // MENUBARSLOTS (B499): right of the battery, left of the clock (the Mac's order)
 }
 
 /// NOTIFY — the bell's PRESS cell on the panel (`None` when the bar is off or cannot seat it).
@@ -3202,8 +3194,8 @@ fn bell_count(out: &mut [u32], w: usize, sy: usize) {
 // STATUSTRAY (rmbp-ledger B426, MACPARITY row 3) — the tray's items LEFT of the battery: volume, network, input
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 //
-// Fixed slots, right to left from the battery's: one PAD, the volume glyph, one PAD, the network label, one
-// PAD, the input label. The slots are RESERVED (they do not close up when an item is unknown), so no item
+// MENUBARSLOTS (B499): placed by [`flow_slot`] — right to left from the battery's: one PAD, the network label, one
+// PAD, the volume glyph, one PAD, the input label (the Mac's order). The slots are RESERVED (they do not close up when an item is unknown), so no item
 // moves when another comes or goes and the titles' right limit is one number. An item whose fact is unknown
 // (`status::item_known`) is not drawn and has no press cell; a slot the panel cannot seat (left of the first
 // title glyph) declines like the battery's. Every colour is the status area's token ink.
@@ -3212,27 +3204,12 @@ fn bell_count(out: &mut [u32], w: usize, sy: usize) {
 #[allow(non_snake_case)] #[inline] fn TRAY_NET_W() -> usize { 4 * CELL_W() }
 #[allow(non_snake_case)] #[inline] fn TRAY_IN_W() -> usize { 2 * CELL_W() }
 
-/// The battery slot's left edge without its seat test (the tray is placed from it whether or not a battery
-/// exists, so the reserved slots are a function of the width alone).
-fn tray_base(w: usize) -> Option<usize> {
-    clock_slot(w)?.checked_sub(strip::PAD() + BATT_ITEM_W())
-}
-
 /// Item `i`'s slot `(x0, width)` inside a bar `w` wide, or `None` when the panel cannot seat it.
 fn tray_slot(i: u8, w: usize) -> Option<(usize, usize)> {
-    use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_INPUT, ITEM_NET, ITEM_VOLUME};
-    let (x0, sw) = match i {
-        ITEM_CLOCK => return clock_slot(w).map(|x| (x, CLOCK_GLYPHS * CELL_W())),
-        ITEM_BATTERY => return batt_slot(w).map(|x| (x, BATT_ITEM_W())),
-        ITEM_VOLUME => (tray_base(w)?.checked_sub(strip::PAD() + TRAY_VOL_W())?, TRAY_VOL_W()),
-        ITEM_NET => (tray_base(w)?.checked_sub(2 * strip::PAD() + TRAY_VOL_W() + TRAY_NET_W())?, TRAY_NET_W()),
-        ITEM_INPUT => (tray_base(w)?.checked_sub(3 * strip::PAD() + TRAY_VOL_W() + TRAY_NET_W() + TRAY_IN_W())?, TRAY_IN_W()),
-        _ => return None,
-    };
-    if x0 < TITLE_X0() + CELL_W() {
-        return None;
+    if i == super::status::ITEM_NOTIFY {
+        return None; // the bell is not a tray (statusmenu) item: its press cell is `bell_box_abs`
     }
-    Some((x0, sw))
+    flow_slot(i, w) // MENUBARSLOTS (B499): every status item from the ONE flow
 }
 
 /// The tray's left edge (the input slot's x), once the tray has been published and the panel seats it.
@@ -3333,20 +3310,21 @@ fn tray_speaker(out: &mut [u32], w: usize, sy: usize, x0: usize, lv: u8, muted: 
 //
 // Flight 26 boot 2: `[desktop] built … battery=painted`, then the battery gone and no line said so. The bar now
 // states its drawn item set on every CHANGE of that set (an edge, never periodic):
-// `[strip] paint tenant=menubar items=input,net,volume,battery,clock battery=live` — `battery=` is `live`, `held
+// `[strip] paint tenant=menubar items=input,volume,net,battery,notify,clock x=<x,…> battery=live` — `battery=` is `live`, `held
 // age_s=<n>` (a stale SMC reading kept on the bar — `status::latest`), `none` (no source) or `noseat` (the panel
 // cannot seat it). The tray's item list (`status::ITEMS`, STATUSTRAY B426) is what is enumerated.
 
 static ITEMS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn strip_items_witness(m: &Model, rect: Option<strip::Rect>) {
-    use super::status::{self, ITEMS, ITEM_BATTERY, ITEM_CLOCK};
+    use super::status::{self, ITEM_BATTERY, ITEM_CLOCK, ITEM_NOTIFY};
     let Some((_, _, w, _)) = rect else { return };
     let mut mask = 0u64;
-    for i in 0..ITEMS {
+    for &i in FLOW.iter() {
         let drawn = match i {
             ITEM_BATTERY => m.batt.is_some() && batt_slot(w).is_some(),
             ITEM_CLOCK => clock_slot(w).is_some(),
+            ITEM_NOTIFY => bell_slot(w).is_some(),
             _ => m.tray.map(|t| status::item_known(&t, i)).unwrap_or(false) && tray_slot(i, w).is_some(),
         };
         if drawn {
@@ -3355,26 +3333,150 @@ fn strip_items_witness(m: &Model, rect: Option<strip::Rect>) {
     }
     let held = status::held_age();
     let bword: u64 = if batt_slot(w).is_none() { 3 } else if m.batt.is_none() { 2 } else if held.is_some() { 1 } else { 0 };
-    let key = mask | (bword << 8);
+    let key = mask | (bword << 8) | ((w as u64) << 16); // MENUBARSLOTS (B499): the x list is a function of the width
     if ITEMS_KEY.swap(key, Ordering::Relaxed) == key {
         return;
     }
+    // MENUBARSLOTS (B499): LEFT to right (the flow reversed), each item's left x in bar pixels beside its name.
     let mut list = alloc::string::String::new();
-    for i in 0..ITEMS {
+    let mut xs = alloc::string::String::new();
+    for &i in FLOW.iter().rev() {
         if mask & (1 << i) != 0 {
             if !list.is_empty() {
                 list.push(',');
+                xs.push(',');
             }
             list.push_str(status::item_name(i));
+            let _ = core::fmt::Write::write_fmt(&mut xs, format_args!("{}", flow_slot(i, w).map(|(x, _)| x).unwrap_or(0)));
         }
     }
     if list.is_empty() {
         list.push('-');
+        xs.push('-');
     }
     match bword {
-        0 => serial_println!("[strip] paint tenant=menubar items={} battery=live", list),
-        1 => serial_println!("[strip] paint tenant=menubar items={} battery=held age_s={}", list, held.unwrap_or(0) / 1000),
-        2 => serial_println!("[strip] paint tenant=menubar items={} battery=none src={}", list, status::source().as_str()),
-        _ => serial_println!("[strip] paint tenant=menubar items={} battery=noseat", list),
+        0 => serial_println!("[strip] paint tenant=menubar items={} x={} battery=live", list, xs),
+        1 => serial_println!("[strip] paint tenant=menubar items={} x={} battery=held age_s={}", list, xs, held.unwrap_or(0) / 1000),
+        2 => serial_println!("[strip] paint tenant=menubar items={} x={} battery=none src={}", list, xs, status::source().as_str()),
+        _ => serial_println!("[strip] paint tenant=menubar items={} x={} battery=noseat", list, xs),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// MENUBARSLOTS (rmbp-ledger B499) — THE STATUS ITEMS ARE ONE RIGHT-TO-LEFT FLOW
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Flight 27, Peter: "the wifi and notify icons overlap." NOTIFY (B418) placed the bell one PAD left of the battery
+// and STATUSTRAY (B426) placed the volume glyph one PAD left of the battery: two arcs, one slot. Now every status
+// item is placed by [`flow_slot`] from ONE list, [`FLOW`], right to left in the Mac's order; each item measures its
+// own width ([`flow_w`]) and sits one [`strip::PAD`] left of its right neighbour. The slots are reserved (a
+// function of the bar width alone), so no item moves when another's fact comes or goes.
+
+/// The status items, RIGHT to left: clock, the Notification Center's bell, battery, network, volume, input.
+const FLOW: [u8; 6] = {
+    use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_INPUT, ITEM_NET, ITEM_NOTIFY, ITEM_VOLUME};
+    [ITEM_CLOCK, ITEM_NOTIFY, ITEM_BATTERY, ITEM_NET, ITEM_VOLUME, ITEM_INPUT]
+};
+
+/// Item `i`'s own width in bar pixels (0 for an item not in [`FLOW`]).
+fn flow_w(i: u8) -> usize {
+    use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_INPUT, ITEM_NET, ITEM_NOTIFY, ITEM_VOLUME};
+    match i {
+        ITEM_CLOCK => CLOCK_GLYPHS * CELL_W(),
+        ITEM_NOTIFY => BELL_ITEM_W(),
+        ITEM_BATTERY => BATT_ITEM_W(),
+        ITEM_NET => TRAY_NET_W(),
+        ITEM_VOLUME => TRAY_VOL_W(),
+        ITEM_INPUT => TRAY_IN_W(),
+        _ => 0,
+    }
+}
+
+/// **Item `i`'s slot `(x0, width)` inside a bar `w` px wide** — the ONE status-item layout. The clock keeps
+/// [`clock_slot`]'s own test; every other item sits one PAD left of the item to its right and declines (`None`)
+/// when it would cross the caption's first glyph past [`TITLE_X0`] — and every item left of a declined one
+/// declines with it.
+fn flow_slot(i: u8, w: usize) -> Option<(usize, usize)> {
+    let mut right = clock_slot(w)?;
+    for &k in FLOW.iter() {
+        let iw = flow_w(k);
+        let x0 = if k == super::status::ITEM_CLOCK {
+            right
+        } else {
+            let x0 = right.checked_sub(strip::PAD() + iw)?;
+            if x0 < TITLE_X0() + CELL_W() {
+                return None;
+            }
+            x0
+        };
+        if k == i {
+            return Some((x0, iw));
+        }
+        right = x0;
+    }
+    None
+}
+
+/// MENUBARSLOTS — `tests menubar`: every seated status item's rect against every other, on the live bar width and
+/// the floor width, from the SAME accessors the painter and the press cells use. `overlaps=0` or FAIL.
+pub fn slots_selftest() {
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        (fb.width(), fb.height())
+    };
+    let live = strip_rect(pw, ph).map(|(_, _, w, _)| w).unwrap_or(pw);
+    let mut items = 0usize;
+    let mut overlaps = 0usize;
+    let mut xs = alloc::string::String::new();
+    for (pass, w) in [live, FLOOR_W(), FLOOR_W() + 6 * 64].into_iter().enumerate() {
+        let mut r: [Option<(usize, usize)>; 6] = [None; 6];
+        for (k, &i) in FLOW.iter().enumerate() {
+            r[k] = match i {
+                super::status::ITEM_CLOCK => clock_slot(w).map(|x| (x, CLOCK_GLYPHS * CELL_W())),
+                super::status::ITEM_BATTERY => batt_slot(w).map(|x| (x, BATT_ITEM_W())),
+                super::status::ITEM_NOTIFY => bell_slot(w).map(|x| (x, BELL_ITEM_W())),
+                _ => tray_slot(i, w),
+            };
+        }
+        for a in 0..6 {
+            for b in a + 1..6 {
+                if let (Some((xa, wa)), Some((xb, wb))) = (r[a], r[b]) {
+                    if xa < xb + wb && xb < xa + wa {
+                        overlaps += 1;
+                        serial_println!("[menubar] overlap w={} {}@{}+{} {}@{}+{}", w, super::status::item_name(FLOW[a]), xa, wa, super::status::item_name(FLOW[b]), xb, wb);
+                    }
+                }
+            }
+            // An item must also stay inside the bar and right of the titles' floor.
+            if let Some((x, iw)) = r[a] {
+                if x + iw > w || x < TITLE_X0() {
+                    overlaps += 1;
+                }
+            }
+        }
+        if pass == 0 {
+            for k in (0..6).rev() {
+                if let Some((x, _)) = r[k] {
+                    items += 1;
+                    if !xs.is_empty() {
+                        xs.push(',');
+                    }
+                    let _ = core::fmt::Write::write_fmt(&mut xs, format_args!("{}:{}", super::status::item_name(FLOW[k]), x));
+                }
+            }
+        }
+    }
+    serial_println!(
+        ":: MENUBAR: items={} overlaps={} w={} x={} -> {} ::",
+        items, overlaps, live, if xs.is_empty() { "-" } else { xs.as_str() },
+        if overlaps == 0 && items > 0 { "PASS" } else { "FAIL" }
+    );
+}
+
+/// MENUBARSLOTS — register `tests menubar` once (deferred behind the verb; R80: nothing tests at boot).
+pub fn ensure_tests() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) {
+        crate::tests::register("menubar", slots_selftest);
     }
 }

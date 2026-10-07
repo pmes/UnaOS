@@ -2781,7 +2781,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // and still be reading those surfaces. Raise the phase barrier and drain before returning: the
     // caller is about to unmap the ASID's memory, and today that would be a stale read, but under
     // WC-B's per-ASID surface mappings it becomes a kernel abort mid-blit.
-    let barrier = DrainBarrier::drain();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closed_rows(&ids[..n], &vacated[..n]); let barrier = DrainBarrier::drain(); // SMALLFIX7 (B501) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST: the close trigger for every app row reaped here (the close disc, an exit); `closing` sat only in `close(id)`, so closing an app never saved its frame
     #[cfg(feature = "witness")]
     serial_println!(
         "[wc-a] close_owner asid={:#x} closed={} ids={:?} refused={}",
@@ -23499,7 +23499,7 @@ fn create_inner(
     // SPAWN-PLACE — resolve the caller's origin BEFORE the table lock (WRITER is never held across
     // it, which is what keeps the WRITER/TABLE order acyclic here as it is in `move_to` and `place`).
     // A framebuffer that is not ready leaves the row to the tiler, exactly as `move_to` declines.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let (at, wmem) = winmemory::resolve(owner_asid, at, compat, native, w, h); let placed = at.and_then(|(x, y)| { // WINMEMORY (B429) — SAME-LINE fold, code first: an unplaced app row is born at its saved frame or centred
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let (at, wmem) = winmemory::resolve(owner_asid, at, compat, native, w, h); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let wmem_keep = winmemory::keeps(&wmem); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let wmem_keep = false; let placed = at.and_then(|(x, y)| { // WINMEMORY (B429) — SAME-LINE fold, code first: an unplaced app row is born at its saved frame or centred
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
             return None;
@@ -23584,7 +23584,7 @@ fn create_inner(
     row.title[..minted_len].copy_from_slice(&minted[..minted_len]); title_source_store(id, title_src); // WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The provenance is published WITH the caption and under the same guard, so `title_source_of` can never name a clause the row's bytes did not come from. It is stored for EVERY create, including a recycled slot, which is what keeps a dead tenant's `from=` from surviving under a live id.
     // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
     // and the `composite` below paints it exactly once, where it stays.
-    if let Some((x, y, scale, pw, ph)) = placed { let (x, y) = glassfix3_cascade(&t, x, y, w.saturating_mul(scale), h.saturating_mul(scale), pw, ph); // GLASSFIX3 — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. The Mac cascade: a request whose box would cover a live row's title band is offset down-right by one band from that row until it covers none. See the GLASSFIX3 block at this file's tail.
+    if let Some((x, y, scale, pw, ph)) = placed { let (x, y) = if wmem_keep { (x, y) } else { glassfix3_cascade(&t, x, y, w.saturating_mul(scale), h.saturating_mul(scale), pw, ph) }; /* SMALLFIX7 (B501): a saved frame with no live row of its app is restored where it was saved (the Mac), never cascaded */ // GLASSFIX3 — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. The Mac cascade: a request whose box would cover a live row's title band is offset down-right by one band from that row until it covers none. See the GLASSFIX3 block at this file's tail.
         row.x = x;
         row.y = y;
         row.scale = scale;

@@ -179,11 +179,14 @@ fn leaf(p: &str) -> &str {
 /// APPTRUST2 (B478): the principal Copy to Apps writes as — the logged-in session's `user:<name>` when ROOTACL
 /// (B456) calls it the administrator (`rootacl::admin_principal`, R100); otherwise the copy is refused.
 pub fn copy_principal() -> Result<String, &'static str> {
+    #[cfg(not(feature = "login"))] { Err("no-admin-session") } // no session store without `login`
+    #[cfg(feature = "login")] {
     let mut nb = [0u8; crate::fs::users::NAME_MAX];
     let Some(n) = crate::fs::users::whoami(&mut nb) else { return Err("no-admin-session") };
     let name = core::str::from_utf8(&nb[..n]).map_err(|_| "no-admin-session")?;
     let p = alloc::format!("user:{}", name);
     if crate::fs::rootacl::admin_principal(&p) { Ok(p) } else { Err("not-admin") }
+    }
 }
 
 /// **Copy to Apps**: the administrator's act that makes a foreign program a registrant. APPTRUST2 (B478): the

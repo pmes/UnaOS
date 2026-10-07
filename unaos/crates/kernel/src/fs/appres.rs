@@ -908,3 +908,10 @@ fn stamp_check(mt: &MountTable, app: &App) {
         let _ = crate::fs::assoc::stamp_invalidate_for(mt, &app.path, &app.doctypes);
     }
 }
+
+/// REGISTRYCHUNK (rmbp-ledger B508): [`registrants`] for a type whose registry object does not exist yet — the
+/// built-ins only (an absent object carries no `una:apps` lines), with no VFS read: the per-object build's first-boot
+/// path skips a path-resolve miss per type. Pure.
+pub fn builtin_registrants(mime: &str) -> Vec<Registrant> {
+    BUILTIN.iter().filter(|(_, b)| declares(b, mime)).map(|(k, b)| builtin_registrant(k, b)).collect()
+}

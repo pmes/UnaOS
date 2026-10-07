@@ -889,24 +889,28 @@ pub fn compose() -> bool {
             // TEARSCOPE — `strip::vacate` IS `strip::erase_rect` plus the census; it returns exactly
             // what the erase returned and this arm behaves as it did. `owed=false`: the slot was
             // cleared above, so a declined erase is a span nothing comes back for.
-            Some(v) => { strip::settle("dock", None); strip::vacate("dock", v, None, false) } // B74: pay any owed vacate first
+            Some(v) => { strip::settle("dock", None); gone_note(v, if autohide() { "autohide" } else { "unhostable" }); strip::vacate_by("dock", v, None, false, "dock::compose", if autohide() { "autohide" } else { "unhostable" }) } // B74: pay any owed vacate first
             None => false,
         };
     };
 
     let t1 = crate::arch::now_cycles(); strip::settle("dock", Some(ext_rect(&l, mb))); // B74: a vacate that declined on an earlier pass is retried here, before this pass's own
-    if let Some(v) = vacated {
-        // Erase FIRST, then paint: the new strip lands on top of the cleaned area, so the two never
-        // race to own an overlapping pixel and the panel never shows a half-erased strip.
-        //
-        // TEARSCOPE — accounted, not changed. `owed=false` because `SLOT.store` below re-publishes
-        // this tenant's rect whatever the erase returned, so a decline here strands the ENDS this
-        // centred, tile-sized strip just stopped owning. That is the span Peter watched.
-        strip::vacate("dock", v, Some(ext_rect(&l, mb)), false);
-    }
     thumbs_refresh(&l, &rows[..n]); // DOCK2: the minimised tiles' surfaces, sampled once per repaint
+    // DOCKGONE (B498) — PAINT FIRST, then vacate only the ENDS the new strip no longer owns
+    // (`strip::vacate_by` erases `old` minus `old ∩ new`, never a pixel this paint just laid). WAS: erase
+    // the whole old box, then paint — and a paint that declined (a contended panel/scratch `try_lock`,
+    // composites run masked) left the strip flat with nothing owing it a pass: flight 27's "the taskbar
+    // disappeared". A declined paint now vacates NOTHING (the old strip stays on the glass, the slot keeps
+    // the old rect so the next pass retries both) and arms `PASS_OWED`, which `dock2_service` takes.
     if !paint(&l, &rows[..n], pressed, mnu) {
+        gone_paint_declined(vacated.is_some());
         return false;
+    }
+    PAINTS.fetch_add(1, Ordering::Relaxed);
+    if let Some(v) = vacated {
+        // TEARSCOPE — `owed=false` because `SLOT.store` below re-publishes this tenant's rect whatever the
+        // erase returned; a decline is remembered by `strip` and paid by `settle` on a later pass.
+        strip::vacate_by("dock", v, Some(ext_rect(&l, mb)), false, "dock::compose", "shrink");
     }
     LEDGER.paint(
         crate::arch::now_cycles().saturating_sub(t1),
@@ -3082,7 +3086,7 @@ fn lp_arm(t: usize, owner: u64) {
 /// The button came up: the hold ends.
 pub fn lp_release() { LP_OWNER.store(0, Ordering::Release); }
 /// Poll from the input-drain task: after [`LONGPRESS_MS`] of hold the menu opens. Returns true when it did.
-pub fn lp_service(now_ms: u64) -> bool {
+pub fn lp_service(now_ms: u64) -> bool { dockgone_register(); // DOCKGONE (B498): `tests dockgone`, registered once from the service pass
     dock2_service(now_ms); pin_timeout_service(now_ms); // HIDSTALL (B485): DOCKRELEASE. DOCK2 (B394): the launch pulse and its bound, auto-hide's reveal
     let o = LP_OWNER.load(Ordering::Acquire);
     if o == 0 || now_ms.wrapping_sub(LP_T0.load(Ordering::Relaxed)) < LONGPRESS_MS { return false; }
@@ -3682,7 +3686,8 @@ pub fn vacate_off() -> bool {
     }
     let r = SLOT.rect();
     SLOT.clear();
-    strip::vacate("dock", r, None, false)
+    gone_note(r, "logout");
+    strip::vacate_by("dock", r, None, false, "dock::vacate_off", "logout")
 }
 
 // ── PREFSUI (rmbp-ledger B389, R91) — login items launch through the dock's own seams ──────────────────────────
@@ -4101,9 +4106,8 @@ fn dock2_service(now: u64) {
 fn dock2_store_service() {
     let now = crate::arch::ms();
     let tgen = crate::fs::trash::generation(); let tseen = TRASH_SEEN.load(Ordering::Relaxed); let _ = now;
-    if tgen != tseen { TRASH_SEEN.store(tgen, Ordering::Relaxed); let t0 = crate::arch::ms();
-        let full = crate::fs::trash::count() > 0;
-        if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); } serial_println!("[dock] trash state why={} full={} took_ms={} (HIDSTALL: read on a change, never on a clock)", if tseen == u64::MAX { "first" } else { "change" }, full as u8, crate::arch::ms().saturating_sub(t0));
+    if tgen != tseen && !TRASH_READER.load(Ordering::Acquire) { TRASH_SEEN.store(tgen, Ordering::Relaxed);
+        if !trash_read_off_pump(tseen == u64::MAX) { trash_read(tseen == u64::MAX, "pump"); } // HIDSTALL2 (B509): the read runs on a worker core, off the hid pump's
     }
     let reveal = REVEAL_OWED.lock().take();
     let open = if TRASH_OPEN_OWED.swap(false, Ordering::AcqRel) { Some(crate::fs::trash::trash_dir()) } else { reveal };
@@ -4120,6 +4124,50 @@ fn dock2_store_service() {
         let b = crate::prefs_client::pref_set(crate::prefs::NS, key::DOCK_AUTOHIDE, P::Bool(autohide()));
         serial_println!("[dock] prefs position={} autohide={} via=settings saved={}", position_word(), autohide() as u8, if a.is_ok() && b.is_ok() { "ok" } else { "-1" });
     }
+}
+
+// ── HIDSTALL2 (rmbp-ledger B509): the Trash read off the hid pump's core ────────────────────────────────────────────────
+//
+// Flight 27: `[dock] trash state why=change full=1 took_ms=1145` beside `[lag] stall … stage=hid stage_ms=447 … pump=desktop-app
+// pump_ms=1147.3 masked_ms=151` — `trash::count()` is a run of IRQ-masked UnaFS transactions, and this service pass runs on
+// the `usb-pump`, which shares its core with the `hid-pump` task: every masked span was a span with no HID pass. The read now
+// runs as a one-shot `dock-trash` task on a worker core that is neither the render core nor the service core
+// (`smp::xhci_worker_cpu`: UnaFS may take the storage loan, so the render/service exclusion that rule enforces applies); with
+// no such core it runs inline as before and says `on=pump`. `TRASH_READER` keeps one read in flight; a change during the
+// read is picked up by the next pass (TRASH_SEEN was stored before the spawn).
+
+static TRASH_READER: AtomicBool = AtomicBool::new(false);
+
+/// The Trash's full/empty read, its glass relight and its line.
+fn trash_read(first: bool, on: &str) {
+    let t0 = crate::arch::ms();
+    let full = crate::fs::trash::count() > 0;
+    if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); }
+    serial_println!("[dock] trash state why={} full={} took_ms={} on={} (HIDSTALL2: read on a change, off the hid pump's core)", if first { "first" } else { "change" }, full as u8, crate::arch::ms().saturating_sub(t0), on);
+}
+
+/// Spawn the read on a worker core; `false` = no worker core apart from the pump's (the caller reads inline).
+fn trash_read_off_pump(first: bool) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != crate::hidstall::pump_cpu()) else { return false };
+        if TRASH_READER.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        crate::arch::sched::spawn("dock-trash", trash_reader, first as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = first;
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn trash_reader(first: usize) {
+    trash_read(first != 0, "worker");
+    TRASH_READER.store(false, Ordering::Release);
 }
 
 /// `system.dock.position` / `system.dock.autohide` at login (with the pins).
@@ -4314,7 +4362,7 @@ fn pin_press_defer(r: &wm::DockEntry, x: i32, y: i32) -> bool {
     let Some(i) = (0..DP_PINS.len()).find(|&i| DP_PINS[i].id == r.id) else { return false };
     PIN_X0.store(x, Ordering::Relaxed); PIN_Y0.store(y, Ordering::Relaxed);
     PIN_DRAG.store(false, Ordering::Relaxed);
-    PIN_T0.store(crate::arch::ms().max(1), Ordering::Relaxed); PIN_IX.store(i as u32, Ordering::Release); // HIDSTALL (B485): the press time the release timeout reads
+    PIN_T0.store(crate::arch::ms().max(1), Ordering::Relaxed); PIN_LANE_SAID.store(false, Ordering::Relaxed); PIN_IX.store(i as u32, Ordering::Release); // HIDSTALL (B485): the press time the release timeout reads. HIDSTALL2 (B509): the in-lane line re-armed
     crate::video::capture::begin(pin_motion, pin_release);
     serial_println!("[dock] press at ({},{}) app={} -> armed (launches on release)", x, y, DP_PINS[i].name);
     true
@@ -4332,8 +4380,16 @@ fn pin_release(x: i32, y: i32) {
     let i = i as usize;
     if !PIN_DRAG.load(Ordering::Relaxed) {
         PIN_BYPASS.store(true, Ordering::Release);
-        let _ = press_at(PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed));
+        let ok = press_at(PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed));
         PIN_BYPASS.store(false, Ordering::Release);
+        // HIDSTALL2 (B509): the release's own line — how long after the press it was routed, and how long it sat in the pal
+        // ring (`lane_ms=`, push to route); `waited=1` when the timeout held off for it.
+        let now = crate::arch::ms();
+        let lane = crate::hidstall::release_lane_ms(now);
+        let after = now.saturating_sub(PIN_T0.load(Ordering::Relaxed));
+        let waited = after >= crate::hidstall::DOCK_RELEASE_TIMEOUT_MS;
+        if waited { crate::hidstall::note_release_waited(lane); }
+        serial_println!("[dock] press at ({},{}) app={} release=edge after_ms={} lane_ms={} waited={} -> {}", PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed), DP_PINS[i].name, after, lane, waited as u8, if ok { "launched" } else { "declined" });
         return;
     }
     let mut to = None;
@@ -4508,6 +4564,19 @@ fn pin_timeout_service(now: u64) {
     if t0 == 0 || now.saturating_sub(t0) < crate::hidstall::DOCK_RELEASE_TIMEOUT_MS {
         return;
     }
+    // HIDSTALL2 (B509): this pass runs on the `usb-pump`; the release is ROUTED by the render task. A release pushed and not
+    // yet routed is IN THE LANE — late, not lost (flight 27: the render lane was busy, `comp=2816`) — so the press waits for
+    // it, bounded by `DOCK_RELEASE_LANE_CAP_MS`; only a press with no release in the lane times out.
+    let (pend, lane) = (crate::pal::release_edge_pending(), crate::hidstall::release_lane_ms(now));
+    if pend > 0 && now.saturating_sub(t0) < crate::hidstall::DOCK_RELEASE_LANE_CAP_MS {
+        if !PIN_LANE_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[dock] press at ({},{}) app={} release=in-lane pend={} after_ms={} lane_ms={} -> waiting (HIDSTALL2: the release is queued in the pal ring; it launches when routed)",
+                PIN_X0.load(Ordering::Relaxed), PIN_Y0.load(Ordering::Relaxed), DP_PINS[i as usize].name, pend, now.saturating_sub(t0), lane
+            );
+        }
+        return;
+    }
     if PIN_IX.compare_exchange(i, u32::MAX, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
@@ -4518,7 +4587,97 @@ fn pin_timeout_service(now: u64) {
     PIN_BYPASS.store(false, Ordering::Release);
     crate::hidstall::note_dock_timeout();
     serial_println!(
-        "[dock] press at ({},{}) app={} release=timeout after_ms={} -> {}",
-        x, y, DP_PINS[i as usize].name, now.saturating_sub(t0), if ok { "launched" } else { "declined" }
+        "[dock] press at ({},{}) app={} release=timeout after_ms={} pend={} lane_ms={} -> {}",
+        x, y, DP_PINS[i as usize].name, now.saturating_sub(t0), pend, lane, if ok { "launched" } else { "declined" }
     );
 }
+
+// ── DOCKGONE (rmbp-ledger B498) — the dock never leaves the glass on its own ─────────────────────────────────
+//
+// Flight 27: `[strip] vacate tenant=dock box=2770x130+55+1640 … -> SCENE-RESTORE` inside `tests winmemory` (the
+// 10-tile dock shrinking to 9 as its two `wmtest` windows closed), and Peter: "the taskbar disappeared". The
+// vacate rect was the dock's own previous geometry; what it did with it was the defect — the whole box erased
+// before a paint that could decline. See `compose` and `strip::vacate_by`; the design is
+// docs/dev/evidence/rmbp-1005/dockgone.md.
+
+/// Dock paints that landed (any reason), for `tests dockgone`'s `paints=`.
+static PAINTS: AtomicU64 = AtomicU64::new(0);
+/// WHOLE-strip vacates with the desktop built and auto-hide OFF — the Mac's dock never does this; must stay 0.
+static GONE: AtomicU64 = AtomicU64::new(0);
+/// The `paint declined -> OWED` line, said once per boot.
+static DECLINE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// A whole-strip vacate: printed every time (it is rare by construction), counted in [`GONE`] when it is
+/// neither the user's auto-hide nor a Log Out.
+fn gone_note(r: strip::Rect, reason: &str) {
+    let built = {
+        #[cfg(feature = "login")]
+        { super::desktopbuild::built() }
+        #[cfg(not(feature = "login"))]
+        { true }
+    };
+    let defect = built && reason != "autohide" && reason != "logout";
+    if defect {
+        GONE.fetch_add(1, Ordering::Relaxed);
+    }
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !defect && SAID.swap(true, Ordering::Relaxed) {
+        return; // the user's own hide / a Log Out: said once; a DEFECT is said every time
+    }
+    serial_println!(
+        "[dock] gone box={}x{}+{}+{} reason={} session={} -> {}",
+        r.2, r.3, r.0, r.1, reason, if built { "open" } else { "closed" }, if defect { "DEFECT" } else { "ok" }
+    );
+}
+
+/// A paint that declined: nothing was vacated, and the service pass owes the strip a composite.
+fn gone_paint_declined(had_vacate: bool) {
+    PASS_OWED.store(true, Ordering::Release);
+    if !DECLINE_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[dock] paint declined after={} -> OWED (service pass repaints; nothing vacated)",
+            if had_vacate { "shrink" } else { "change" }
+        );
+    }
+}
+
+fn dockgone_register() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.load(Ordering::Relaxed) && !DONE.swap(true, Ordering::AcqRel) {
+        crate::tests::register("dockgone", dockgone_selftest);
+    }
+}
+
+/// `tests dockgone` — 180 simulated seconds of the dock's service passes (one per second: the owed-pass taker
+/// and `wm::service_damage`, with a forced dock pass every 20 s), then: no whole-strip vacate with the session
+/// open, the strip painted (slot holds a signature and the rect the registry reports), and the ends arithmetic
+/// on flight 27's own rects (the 10-tile dock 2770 at +55 shrinking to the 9-tile 2496 at +192: two 137-px ends,
+/// 35620 px, neither touching the new strip).
+fn dockgone_selftest() {
+    let (g0, p0) = (GONE.load(Ordering::Relaxed), PAINTS.load(Ordering::Relaxed));
+    for s in 0..180u32 {
+        if s % 20 == 0 {
+            PASS_OWED.store(true, Ordering::Release);
+        }
+        if PASS_OWED.swap(false, Ordering::AcqRel) {
+            wm::composite();
+        }
+        wm::service_damage();
+    }
+    let vac = GONE.load(Ordering::Relaxed) - g0;
+    let paints = PAINTS.load(Ordering::Relaxed) - p0;
+    let reg = crate::video::panel_info_nonblocking().and_then(|p| strip_rect(p.width, p.height));
+    let present = SLOT.sig() != 0 && SLOT.packed() != 0 && (reg.is_none() || autohide() || reg.map_or(false, |r| {
+        let (sx, sy, sw, sh) = SLOT.rect();
+        sx <= r.0 && sy <= r.1 && sx + sw >= r.0 + r.2 && sy + sh >= r.1 + r.3
+    }));
+    let (ends, ends_px, ends_ok) = strip::bands_check((55, 1640, 2770, 130), (192, 1640, 2496, 130));
+    let pass = vac == 0 && present && ends == 2 && ends_px == 35620 && ends_ok;
+    serial_println!(
+        ":: DOCKGONE: vacates={} paints={} present={} ends={} ends_px={} -> {} ::",
+        vac, paints, present as u8, ends, ends_px, if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// HIDSTALL2 (B509): the in-lane line is said once per press (re-armed by the press).
+static PIN_LANE_SAID: AtomicBool = AtomicBool::new(false);

@@ -207,6 +207,12 @@ pub trait VfsBackend {
     /// [`VfsError::NotADirectory`] (a file).
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError>;
 
+    /// JOBSCAN (B497): names and kinds only — no size, no mtime. Default = [`read_dir`](Self::read_dir); the UnaFS
+    /// arm answers from the directory blob alone (one transaction, no inode read per row).
+    fn read_dir_kinds(&self, rel: &str) -> Result<Vec<(String, NodeKind)>, VfsError> {
+        Ok(self.read_dir(rel)?.into_iter().map(|e| (e.name, e.kind)).collect())
+    }
+
     /// Metadata for the node at `rel`.
     fn stat(&self, rel: &str) -> Result<Stat, VfsError>;
 
@@ -586,6 +592,12 @@ impl MountTable {
     pub fn read_dir(&self, path: &str) -> Result<Vec<DirEnt>, VfsError> {
         let (b, rel) = self.resolve(path)?;
         crate::fs::perf_op("list", path, || b.read_dir(rel)) // FATFIX M2: measured, not guessed
+    }
+
+    /// JOBSCAN (B497): [`VfsBackend::read_dir_kinds`] at `path` — the count-only listing.
+    pub fn read_dir_kinds(&self, path: &str) -> Result<Vec<(String, NodeKind)>, VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.read_dir_kinds(rel)
     }
 
     pub fn stat(&self, path: &str) -> Result<Stat, VfsError> {
@@ -1771,6 +1783,17 @@ impl VfsBackend for NativeBackend {
         })
         .map_err(unafs_err)?
     }
+
+    fn read_dir_kinds(&self, rel: &str) -> Result<Vec<(String, NodeKind)>, VfsError> {
+        let path = native_abs(rel); // JOBSCAN (B497): the directory blob alone — one bounded transaction, no inode read per row
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            let entries = fs.ls(id).map_err(|_| VfsError::NotADirectory)?;
+            Ok(entries.into_iter().filter(|e| e.name != "." && e.name != ".." && e.kind != ::unafs::FileKind::System).map(|e| (e.name, native_kind(e.kind))).collect())
+        })
+        .map_err(unafs_err)?
+    }
+
 
     fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
         let path = native_abs(rel);

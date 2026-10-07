@@ -1242,14 +1242,14 @@ pub fn service() {
     // one load and prints nothing. (The VFS mount table is deliberately NOT consulted here at all —
     // LEDGER SO33: `bootdisk::bind` caches its first survey for the boot, and an early call would latch
     // an EMPTY root for every later caller, the shell's own verbs included.)
-    if !store_ready() { return; } // LOGIN15 (rmbp-ledger B213, flight 13 §1): readiness is "a store volume can mount", NOT the global slot — on the rMBP nothing sets BLOCK_DEVICE (SDHC and AHCI register beside it) and this guard held the whole LOGIN chain shut for two flights; `store_ready` is at this file's tail with its fixture.
+    if !store_ready() { crate::fs::bootstep::open("store-wait", "Waiting for the disk"); return; } crate::fs::bootstep::close("store-wait", "ready"); // SPLASHSTALL (B510): the splash up and the store not yet answering is a step too. LOGIN15 (rmbp-ledger B213, flight 13 §1): readiness is "a store volume can mount", NOT the global slot — on the rMBP nothing sets BLOCK_DEVICE (SDHC and AHCI register beside it) and this guard held the whole LOGIN chain shut for two flights; `store_ready` is at this file's tail with its fixture.
     #[cfg(feature = "witness")] usersready_fixture(); // LOGIN15: the pure predicate against the three shapes (rMBP, QEMU, none) and the OLD guard as the go-red — once, on the first ready pass.
     // The block registry answers before the volume is quietly mountable: the moment a stick registers,
     // the driver loan is still held by the enumeration pump and `fat::mount()` answers `Busy` (measured on
     // QEMU virt, gate-4 capture: the first pass after `MISSION SUCCESS` refused). So the mount is RETRIED
     // across passes and only a BOUND of refusals is a verdict — the `HCRON_DEFER_STUCK` idiom, and the
     // last error is named so the line says which refusal it was.
-    let step = crate::fs::bootstep::begin("users-load", "Loading users"); // BOOT80 (B350): the boot's own line for this step
+    let step = crate::fs::bootstep::begin("users-load", "Reading the volume"); // BOOT80 (B350): the boot's own line for this step. SPLASHSTALL (B510): the Mac's words
     match try_load() {
         Ok(()) => {
             step.end(&alloc::format!("store=fat via={} users={}", store_via().name(), count()));
@@ -1264,7 +1264,7 @@ pub fn service() {
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
         #[cfg(all(feature = "loginst", feature = "tests-at-boot"))] LOGINST_LIVE.store(true, Ordering::Release); // LOGINFLOW2 — boot 2's screen is up from the resolution to the fixtures below; the press battery waits (the chain's tail drops it)
-        { let st = crate::fs::bootstep::begin("stage-resolve", "Starting"); stage_resolve("store-loaded"); st.end(stage_name()); } // BOOT80 (B350). FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
+        { let st = crate::fs::bootstep::begin("stage-resolve", "Resolving the session"); stage_resolve("store-loaded"); st.end(stage_name()); crate::fs::bootstep::open("first-screen", "Preparing the screen"); } // SPLASHSTALL (B510): "Starting" is the step's own words now, and the stretch from the stage to the first painted screen is its own step (`splash::hold_release` ends it). BOOT80 (B350). FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::tests::register("boot2-login", boot2_login_entry); crate::tests::register("logout", logout_entry); } // LOGINFLOW2 M1/M2 — boot 2's login through the screen (BEFORE the chain's second pass: it needs the screen up), then LOGOUTUI M4
             #[cfg(feature = "loginst")] { crate::tests::register("login-chain", loginst_chain); crate::tests::source_done(crate::tests::SRC_LOGIN); } // R77 M3 — the loginst fixture chain is a registered test (`tests login-chain`); `tests-at-boot` runs it here, as before. Body: `loginst_chain`, this file's tail.
             #[cfg(not(feature = "loginst"))] crate::tests::source_done(crate::tests::SRC_LOGIN); // no loginst on the flight image: the login source has nothing to register and must not be waited on (boot 17 compile fix)
@@ -1278,7 +1278,7 @@ pub fn service() {
                 // (a raw signed pattern image; `UNAOS_FATIMG=sf` gives it one; the x86 default carries a FAT32 volume since DEFAULTMEDIUM instead) — that is SKIPPED, a non-forbid, because a
                 // leg red for a disk the harness never attached is wrong-strict. Any other refusal on a
                 // registered disk (`Io`, `BadChain`, `Unsupported`, …) IS a defect and takes the FAIL form.
-                SERVICED.store(true, Ordering::Relaxed);
+                SERVICED.store(true, Ordering::Relaxed); step.end(&alloc::format!("store=none passes={}", n)); // SPLASHSTALL (B510): the retried step ends with its verdict, never left live
                 stage_no_store(); // FIRSTBOOT (R77): no store to install into — the machine is a Desktop
                 #[cfg(feature = "loginst")]
                 crate::tests::source_done(crate::tests::SRC_LOGIN); // R77 M3 — nothing will register on a boot with no store
@@ -3023,7 +3023,7 @@ fn stage_publish(st: BootStage, why: &str) {
     if prev == st as u8 {
         return;
     }
-    stage_witness(why);
+    crate::fs::bootstep::witness("stage-witness"); stage_witness(why); crate::fs::bootstep::witness("published"); // SPLASHSTALL (B510)
     if why == "store-has-users" {
         serial_println!("[login] installer: stage=login-screen (R86: the login dialog only; the desktop ignites at the first login)"); // INSTALLBARE: was the stray `stage=desktop` at boot 2's login screen
     } else {
@@ -3038,7 +3038,7 @@ fn stage_publish(st: BootStage, why: &str) {
         // a window (the R86/R88 latch and sweep, and R92's unconditional enable, are gone). The Desktop stage asks for the
         // build (idempotent after `login ok` asked; the store-less Desktop's only ask); boot 2's login screen builds nothing.
         if st == BootStage::Desktop && why != "store-has-users" {
-            crate::video::desktopbuild::build("stage");
+            crate::fs::bootstep::witness("desktop-build"); crate::video::desktopbuild::build("stage"); // SPLASHSTALL (B510)
         }
         if st == BootStage::Desktop { crate::splash::hold_release("first-screen"); } // SPLASH2 M3: the desktop is asked for above (DESKTOPBUILT) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
     }
@@ -3047,7 +3047,7 @@ fn stage_publish(st: BootStage, why: &str) {
 /// Read the stage from the store and publish it; open the create-user form when that is the stage.
 /// Called once at the end of [`service`]'s load arm (after the `loginst` chain), and by the advance below.
 pub fn stage_resolve(why: &str) {
-    let st = stage_of_store();
+    let st = stage_of_store(); crate::fs::bootstep::witness("store-read"); // SPLASHSTALL (B510): the OVER line's `last=` (stage-resolve's sub-stages, here and in `stage_publish`)
     // LOGINFLOW2 M1 — BOOT 2: a store with root's password AND users resolves to the LOGIN SCREEN, over an empty desktop (R64/R65;
     // R77 "root is not the assumed login"). `user-created` is the installer's own advance (the form already logged that user in).
     let boot2 = st == BootStage::Desktop && why == "store-loaded" && user_count() > 0;
@@ -3055,7 +3055,7 @@ pub fn stage_resolve(why: &str) {
     stage_publish(st, if boot2 { "store-has-users" } else { why });
     if boot2 {
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
-            screen_boot2();
+            crate::fs::bootstep::witness("login-screen"); screen_boot2(); // SPLASHSTALL (B510)
         } else {
             BOOT2_PENDING.store(true, core::sync::atomic::Ordering::Release);
             serial_println!("[login] boot 2: login screen deferred to the glass (the screen's window needs the surface)");
@@ -3063,7 +3063,7 @@ pub fn stage_resolve(why: &str) {
     }
     if st == BootStage::Installer && TABLE.lock().loaded { // FIRSTUSER (R100): the Installer's one screen is the first-user form
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
-            screen_create_user();
+            crate::fs::bootstep::witness("create-user-form"); screen_create_user(); // SPLASHSTALL (B510)
         } else {
             CREATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
             serial_println!("[login] installer: create-user form deferred to the glass (the setter's window needs the surface)");
@@ -3279,7 +3279,7 @@ fn ensure_home_native(name: &[u8]) -> Option<Result<&'static str, UsersError>> {
 /// UnaFS transactions, each rewriting the whole refcount map one sector per command.
 fn boot80_root_and_seed() {
     let s = crate::fs::bootstep::begin("root-mount", "Mounting the system volume");
-    let mt = crate::shell::vfs_mount_table();
+    let mt = crate::shell::vfs_mount_table(); crate::fs::bootstep::witness("mount-table"); // SPLASHSTALL (B510): the OVER line's `last=`
     let attrs = mt.list_attrs("/", crate::fs::vfs::KERNEL_PRINCIPAL).is_ok();
     s.end(if attrs { "root=attrs" } else { "root=plain" });
     // FILETYPES (B423, R80/R93): the type registry is no longer written at boot — `login ok` builds it
@@ -3496,7 +3496,7 @@ pub fn firstuser_witness(why: &str) {
     serial_println!(
         ":: FIRSTUSER: flow=mac first_user={} role={} root={} prompts={} login_window={} migrated={} at={} -> {} ::",
         an.map(|n| wire_name(&ab[..n])).unwrap_or("none"), if an.is_some() { "admin" } else { "NONE" }, if root_locked { "locked" } else { "ROW" },
-        prompts, lw, FU_MIGRATED.load(core::sync::atomic::Ordering::Acquire) as u8, why, if ok { "PASS" } else { "FAIL —" }
+        prompts, lw, FU_MIGRATED.load(core::sync::atomic::Ordering::Acquire) as u8, why, crate::tests::boot_word(ok) // SMALLFIX7 (B501): `tests firstuser` carries the verdict
     );
 }
 

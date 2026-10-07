@@ -70,7 +70,7 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # list must be checked against that cfg before it is: `witness` is not a free arming on x86.
 case "${1:-}" in
     test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi|test-install|test_install|test-ptr|test_ptr)
-        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT:-1}"; export UNAOS_CENSUS="${UNAOS_CENSUS:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
+        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT-1}";  export UNAOS_CENSUS="${UNAOS_CENSUS:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
 esac
 
 # BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
@@ -1281,6 +1281,10 @@ fi
 # window, every register restored, the panel never written; plus the read-only `[igpu-dpy] capture`.
 # Kept in sync with builder/src/main.rs. Media is NOT single-use.
 [ -n "${UNAOS_IVB3D_BLIT:-}" ] && _feats="${_feats}gen7,gen7blit,"
+# GEN7R9 (B504): UNAOS_IVB3D_R9=1 arms rung R9 — PIPELINE_SELECT/STATE_BASE_ADDRESS/PIPE_CONTROL on the RCS
+# (drivers/gpu/gen7_r9.rs), `tests gen7` only (R80); it declines by name while its PRM pages are uncited.
+# Kept in sync with builder/src/main.rs. Media is NOT single-use.
+[ -n "${UNAOS_IVB3D_R9:-}" ] && _feats="${_feats}gen7,gen7r9,"
 # GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU with an unwind-stack
 # restore on the same call stack — no dwell, no timer (drivers/gpu/igpu.rs; round 13 removed the
 # timed auto-revert). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
@@ -3187,6 +3191,8 @@ arm_features() {
     # its `video/blitter.rs` slot is gated `all(target_arch = "x86_64", feature = "gen7blit")` — same
     # strip, same reason (`gen7blit = ["gen7"]` would resolve `gen7` back ON).
     f="${f//,gen7blit,/,}"
+    # GEN7R9 (B504): `gen7r9` is drivers/gpu/gen7_r9.rs, a child of the x86_64-only gen7.rs — same strip.
+    f="${f//,gen7r9,/,}"
     # PCIH / NOASPM rides the same strip, for the same reason: every noaspm-gated byte lives in
     # the x86_64-only half of drivers/gpu/pcihealth.rs, so the feature emits not one byte of
     # aarch64 CODE — but an enabled feature is hashed into cargo's -Cmetadata fingerprint, so
@@ -6346,7 +6352,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -10711,7 +10717,7 @@ build_user_blob() {
     # lands, then mv (atomic on one filesystem) — an interrupted build can no longer leave a
     # truncated-but-nonempty user_blob.bin that `ensure_user_blob`'s -s test would accept forever.
     "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
-      "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/user-blob" \
+      "${CARGO_TARGET_DIR:-${WORKSPACE_DIR}/crates/user-blob/target}/aarch64-base/release/user-blob" \
       "${WORKSPACE_DIR}/target/user_blob.bin.tmp"
     # The flat blob must exist and begin EXACTLY at _start's first instruction — the kernel enters the
     # copy at offset 0, so a stray byte ahead of _start (a future toolchain reordering objcopy output)
@@ -13836,6 +13842,9 @@ case "${1:-}" in
         ;;
     gates)
         gates "${2:-}" || exit $?   # GATEPATH (B471): every host gate, one line each; exit = the worst gate's rc
+        ;;
+    bootleg)
+        bash "$WORKSPACE_DIR/scripts/boot-leg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # SMALLFIX7 (B501): the metal feature line BOOTED under QEMU, tests-at-boot OFF (flight 27 PREHEAP). NOT a host gate: the seat's fold gate runs it; `--judge <log>` reads a capture only
         ;;
     clean)
         clean_all
