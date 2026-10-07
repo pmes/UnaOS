@@ -46,13 +46,9 @@ pub(super) fn note_r6(v: &'static str) {
     *R6.lock() = Some(v);
 }
 
-/// The `r9=` field of the ladder line: ` r9=<word>`.
-pub(super) fn field() -> &'static str {
-    match *WORD.lock() {
-        Some("declined") => " r9=declined",
-        Some("gated") => " r9=gated",
-        _ => " r9=not-reached",
-    }
+/// The `r9=` word on the `GEN7LADDER` line (`declined`, `gated`, or `not-reached` before R9 ran).
+pub(super) fn word() -> &'static str {
+    (*WORD.lock()).unwrap_or("not-reached")
 }
 
 /// R9 under `tests gen7`: gate on R6, then the citation table; one `[gen7] r9` witness line. Writes nothing.

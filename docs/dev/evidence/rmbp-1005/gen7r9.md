@@ -37,11 +37,21 @@ R9 holds a citation table — one row per command it needs (`PIPELINE_SELECT`, `
 - M1 — design (this file).
 - M2 — the knob (Cargo `gen7r9 = ["gen7"]`, arroyo `_feats` arm + aarch64 strip, builder arm, k8-reach NA row).
 - M3 — `gen7_r9.rs`: the table, the gate, the decline, the witness; the R6 note and the ladder hook.
+- M4 — the gen7.rs hooks made LINE-NEUTRAL (the card line carries `gen7`+`gen7r8`, so the gen7-on, R9-off image is
+  the one that must not move): the R6 note, the `r9::run()` call and the two `GEN7LADDER` variants are same-line
+  `#[cfg]` folds BEFORE each line's first `//` (gen7.rs:4577, 7368/7372, 7374/7378, 7416); the original ladder prints
+  stay byte-for-byte as built under `#[cfg(not(feature = "gen7r9"))]` attached from the line above (no column
+  moves); `mod r9` is a FILE-TAIL append (gen7.rs:7493-7498). `diff` against 668cdd95's gen7.rs: 6 lines changed in
+  place, 6 appended at the tail, none inserted.
 
 ## Witness (the next metal boot, `UNAOS_IVB3D_R9=1`, type `tests gen7`)
 
     [gen7] r9 ring=rcs r6=r6-sentinel-hit select=uncited sba=uncited pipe_control=uncited sync_val=- read=- writes=0 -> DECLINED reason=page-PIPELINE_SELECT-uncited
     :: GEN7LADDER: rungs=R1-R7 ggtt=boot-bank wake=… r7=r7-blit-verified us=… replay=0 r9=declined -> PASS ::
+
+On a run where R6 did not read `r6-sentinel-hit` (or never reached its verdict) the line reads
+`… writes=0 -> GATED reason=r6-did-not-execute-on-the-rcs` and the ladder carries `r9=gated`. Built without the
+knob, both lines are exactly flight 27's (no `[gen7] r9`, no `r9=` field).
 
 The executing form, once the three rows carry a source:
 `[gen7] r9 ring=rcs select=3d sba=ok pipe_control=posted sync_val=<hex> read=<hex> -> executed`.
