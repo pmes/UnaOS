@@ -248,6 +248,12 @@ fn open_accepts_files_and_refuses_dirs() {
 #[test]
 fn write_to_readonly_dir_surfaces_loud_denial() {
     use std::os::unix::fs::PermissionsExt;
+    // root bypasses mode bits (CAP_DAC_OVERRIDE): the OS refuses nothing, so this test cannot prove the denial
+    // there (the cloud fold gate runs as uid 0). It is a fact about the runner, not the finder.
+    if std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0).unwrap_or(false) {
+        eprintln!("skipped: running as root, mode bits do not deny");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let ro = root.join("ro");

@@ -316,6 +316,8 @@ pub fn scope_word() -> alloc::string::String {
     } else {
         alloc::format!("core{}", s)
     }
+}
+
 // ── SPLASHSTALL (rmbp-ledger B510) — the steps under the splash, their budgets, and the watchdog ─────────
 // Flight 26 (FLIGHT26.md §2 LOADERSTALL, re-read by B490): two boots sat on the held splash's "Starting" for
 // minutes with no wire. "Starting" was `stage-resolve`'s word, painted at ~13 s; the splash's own 5 s bound
