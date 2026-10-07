@@ -313,6 +313,7 @@ pub fn open_wav(path: &str) -> Result<(), String> {
         Ok(e) => e,
         Err(r) => { serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r); return Err(String::from(r)); }
     };
+    serial_println!("[play] route type={} via=riff dec=pcm rate={} ch={}", crate::fs::filetype::type_of(path).0, w.rate, w.ch); // SOUNDOPENERS (B500) M2: a PCM RIFF is read directly — no demuxer
     serial_println!("[play] open path={} rate={} ch={} bits={} bytes={} chunk={} eff_rate={} resampled={}", path, w.rate, w.ch, w.bits, w.data_len, w.chunk, eff, (eff != w.rate) as u8);
     *WAV.lock() = Some(w);
     ACTIVE.store(true, Ordering::Release);
@@ -375,10 +376,10 @@ pub fn shell_verb(args: &[&str], path: &str, console: &mut crate::console::Conso
     match args.first().copied() {
         None => console.println("usage: play <file: wav flac ogg opus mp3 aac m4a aiff> | play stop"),
         Some("stop") => { let q = { let mut t = TQ.lock(); let n = t.len(); t.clear(); n }; stop(); dec_stop(); console.println(&alloc::format!("play: stopped (tests queue dropped {})", q)); } // DECJOBHANG M3: stop ends the `tests play` queue too
-        Some(_) => match open_wav(path) {
+        Some(a) => { let path = &resolve(a, path); if crate::shell::vfs_mount_table().stat(path).is_err() { serial_println!(":: PLAYWAV: path={} reason=no such file (not in the cwd, not in system/test-f) -> REFUSED ::", path); console.println(&alloc::format!("play: {}: no such file", path)); return; } match open_wav(path) { // SOUNDOPENERS (B500) M2: a bare name the cwd lacks is looked up in system/test-f; a missing file is refused before a decoder job
             Ok(()) => console.println(&alloc::format!("play: {} — streaming (watch the serial for :: PLAYWAV ::)", path)),
             Err(r) => console.println(&alloc::format!("play: {}: {}", path, r)),
-        },
+        } }
     }
 }
 
@@ -696,6 +697,7 @@ fn dec_task(arg: usize) {
         }
     };
     let info = dec.info();
+    route_line(&path, &info); // SOUNDOPENERS (B500) M2: the core that opened it, named
     let step = (info.rate as usize).div_ceil(48_000).max(1);
     let out_ch = if info.channels >= 2 { 2 } else { 1 };
     if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.info = Some(info); o.step = step; o.out_ch = out_ch; }
@@ -1358,3 +1360,55 @@ fn probe_task(_: usize) {
     };
     if let Some(p) = PROBE.lock().as_mut().filter(|p| p.0 == path) { p.2 = Some(r); }
 }
+
+// ── SOUNDOPENERS (rmbp-ledger B500) — the route named, the sample found, a sound opened off the shell ─────────────
+
+/// M2: `play TEST.M4A` typed at `/` asked for `/TEST.M4A` (flight 27: `stat: NoSuchPath`). A bare name the cwd
+/// lacks is looked up in system/test-f (`volumes::testf_find`) and the wire says so.
+fn resolve(arg: &str, path: &str) -> String {
+    let mt = crate::shell::vfs_mount_table();
+    if arg.contains('/') || mt.stat(path).is_ok() {
+        return String::from(path);
+    }
+    match crate::fs::volumes::testf_find(&mt, arg) {
+        Some(p) => {
+            serial_println!("[play] resolve arg={} cwd-miss={} -> {}", arg, path, p);
+            p
+        }
+        None => String::from(path),
+    }
+}
+
+/// M2: which core opened `path` — `audio_core::route` on its head; the live picture job's share is the demuxer's.
+fn route_via(path: &str) -> &'static str {
+    let head = crate::shell::vfs_mount_table().read(path, 0, 64).unwrap_or_default();
+    audio_core::route(&head).map_or("demux", audio_core::Route::via)
+}
+
+/// M2: `[play] route type=<t> via=<audiocore|demux> dec=<codec> rate=<hz> ch=<n>` — once the decoder has opened.
+fn route_line(path: &str, info: &audio_core::Info) {
+    serial_println!(
+        "[play] route type={} via={} dec={} rate={} ch={}",
+        crate::fs::filetype::type_of(path).0,
+        route_via(path),
+        alloc::format!("{:?}", info.codec).to_ascii_lowercase(),
+        info.rate,
+        info.channels
+    );
+}
+
+/// M3: open `path` the way `play-dec` does (`Decoder::open`, then a Matroska file's track) and return its facts —
+/// called ONLY from a task with a `DEC_STACK` stack (`soundopeners::open_task`), never from the shell.
+pub fn open_facts(path: &str) -> Result<audio_core::Info, String> {
+    use audio_core::AudioDecoder;
+    let opened = audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: String::from(path), off: 0 }));
+    #[cfg(all(feature = "wc", feature = "videoplayer"))]
+    let opened = opened.or_else(|e| crate::video::vplay::container_audio(path).map(audio_core::Decoder::from_source).ok_or(e));
+    match opened {
+        Ok(d) => Ok(d.info()),
+        Err(e) => Err(alloc::format!("{:?}", e)),
+    }
+}
+
+/// M3: the stack `open_facts` needs (the decoder's own, measured — `DEC_STACK`).
+pub const OPEN_STACK: usize = DEC_STACK;

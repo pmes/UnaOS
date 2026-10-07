@@ -460,6 +460,7 @@ pub fn openers_witness(dir: &str, names: &[&str]) {
         let core: Option<(&str, bool)> = match handler.as_str() {
             "facet" => Some(("pixel_core", pixel_core::sniff(&head).is_some() || pixel_core::raw::is_raw(&head))),
             "play" => Some(("audio_core", audio_core::sniff(&head) != audio_core::Format::Unknown)),
+            "player" if !m.starts_with("video/") => Some(match audio_core::route(&head) { Some(audio_core::Route::Demux) => ("demux_core", true), Some(_) => ("audio_core", true), None => ("audio_core", false) }), // SOUNDOPENERS (B500): a sound in the Player is audio_core's (its own reader, or demux_core for MP4/Matroska) — never the picture demuxer's alone
             "player" => Some(("demux_core", demux_core::probe(&head).is_some())), // VIDEOPLAYER (B434): the Player's container core
             "textedit" | "fileview" | "markdown" | "json" => Some(("text", looks_text(&head))),
             _ => None,

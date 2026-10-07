@@ -330,3 +330,5 @@ pub mod hidstall;
 pub mod loaderstage;
 // SMALLFIX6 (rmbp-ledger B495): `tests windowcap`, `tests smallfix6` — flight 26's small reds, read back. Tail statement.
 pub mod smallfix6;
+// SOUNDOPENERS (rmbp-ledger B500): the HDA/play fixtures behind `tests`, and `tests soundopeners`. Tail statement.
+pub mod soundopeners;
