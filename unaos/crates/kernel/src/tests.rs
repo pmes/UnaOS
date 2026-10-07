@@ -71,7 +71,27 @@ pub fn register(name: &'static str, f: fn()) {
     }
     #[cfg(not(feature = "tests-at-boot"))]
     {
+        // PREHEAP (flight 27, image 20): SMALLFIX6 made TABLE a Vec, and the stack guard registers `stackroom` (and
+        // `lockreg`) at arm time — BEFORE `KERNEL HEAP ALLOCATED`. The first push asked the allocator for 96 bytes it
+        // did not have: `memory allocation of 96 bytes failed`, the panic screen, a 1 s restart loop, nothing on the
+        // wire (the probe on image 19's knobs panicked the same way: the tree, not a knob). Until the heap is up a
+        // registration parks in this fixed stash; the first post-heap registration drains it into the table.
+        static PRE: crate::sync::Mutex<[Option<(&'static str, fn())>; 8]> = crate::sync::Mutex::new([None; 8]);
+        if crate::allocator::heap_bounds() == (0, 0) {
+            let mut p = PRE.lock();
+            match p.iter_mut().find(|s| s.is_none()) {
+                Some(slot) => { *slot = Some((name, f)); DEFERRED.fetch_add(1, Ordering::Relaxed); }
+                None => serial_println!(":: TESTS: pre-heap stash full (8) — `{}` NOT registered -> FAIL ::", name),
+            }
+            return;
+        }
         let mut t = TABLE.lock();
+        {
+            let mut p = PRE.lock();
+            for s in p.iter_mut() {
+                if let Some(e) = s.take() { t.push(Some(e)); }
+            }
+        }
         match t.iter_mut().find(|s| s.is_none()) {
             Some(slot) => {
                 *slot = Some((name, f));
