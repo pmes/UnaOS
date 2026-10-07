@@ -18,7 +18,7 @@
 //! `:: SMALLFIX7: deferred=<announced|MISSING> verdicts=<n>:<tags> word=<ok|FAIL> ownrun=<ok|FAIL> prtscr=<registered|MISSING>
 //! ring=<n> preheap=<parked|FAIL> saves=<n|-> -> PASS|FAIL ::`
 
-/// Register `tests smallfix7` (and `tests prtscr`, latched with `dir_fixture`'s own arm) once.
+/// Register `tests smallfix7` and `tests prtscr` once (the `tests` verb's ensure line; never a service pass).
 pub fn ensure() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);

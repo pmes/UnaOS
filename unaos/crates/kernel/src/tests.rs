@@ -511,7 +511,7 @@ pub fn verdicts_selftest() {
 // moved that chain behind `tests ladder` — so `tally` counted the whole session, the seat's own `tests` runs
 // included. Now `ladder_arm` signals the source, the window also closes at the first `tests` run, `tests verdicts`
 // names what it counted, and the six lines the boot itself printed (TPMODE, FIRSTUSER, INPUTSTALL, DESKTOPBUILT,
-// the wifi6 S5i post-check, U5x) print `ok`/`NOT-OK` before the deferral point ([`boot_word`]).
+// the wifi6 S5i post-check, U5x) print `ok`/`NOT-OK` until the operator's first `tests` run ([`boot_word`]).
 
 /// Set by the first `tests` run: a verdict after it is a fixture's, never the boot's.
 static BOOT_OVER: AtomicBool = AtomicBool::new(false);
@@ -522,10 +522,11 @@ const TAGS_MAX: usize = 12;
 /// The first [`TAGS_MAX`] counted verdict lines' tags (alloc-free: the tap runs in IRQ-masked print contexts).
 static TAGS: crate::sync::Mutex<([[u8; TAG_MAX]; TAGS_MAX], usize)> = crate::sync::Mutex::new(([[0; TAG_MAX]; TAGS_MAX], 0));
 
-/// Has the boot's verdict window closed (the deferred line announced, or a `tests` run begun)? Always under
-/// `tests-at-boot`: the QEMU lanes keep their boot verdicts and the specs that pin them.
+/// Has the operator run `tests` this boot? Always under `tests-at-boot`: the QEMU lanes keep their boot verdicts
+/// and the specs that pin them. NOT the announce: `ladder_arm` can print `TESTS: deferred=` before the login, and a
+/// boot line after it is still the boot's, not a test the operator asked for (R80).
 pub fn boot_over() -> bool {
-    cfg!(feature = "tests-at-boot") || ANNOUNCED.load(Ordering::Relaxed) || BOOT_OVER.load(Ordering::Relaxed)
+    cfg!(feature = "tests-at-boot") || BOOT_OVER.load(Ordering::Relaxed)
 }
 
 /// The verdict word a boot-path witness prints: `PASS`/`FAIL` once [`boot_over`], `ok`/`NOT-OK` before it — the
@@ -577,7 +578,13 @@ fn boot_tags() -> alloc::string::String {
 /// SMALLFIX7 (B501): is `name` the fixture [`run`] is executing now? A hot-path fixture ([`defer_fast`]) runs its
 /// body only then — never inside another fixture's run, where its side effects (a held door) land on the wrong test.
 pub fn running_is(name: &str) -> bool {
-    CUR.try_lock().map_or(false, |c| *c == name)
+    for _ in 0..64 {
+        if let Some(c) = CUR.try_lock() {
+            return *c == name;
+        }
+        core::hint::spin_loop(); // `run` holds CUR for one store; a few retries, never a sleep (paint paths call this)
+    }
+    false
 }
 
 /// SMALLFIX7: did `TESTS: deferred=` print this boot?

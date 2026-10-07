@@ -2781,7 +2781,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     // and still be reading those surfaces. Raise the phase barrier and drain before returning: the
     // caller is about to unmap the ASID's memory, and today that would be a stale read, but under
     // WC-B's per-ASID surface mappings it becomes a kernel abort mid-blit.
-    let barrier = DrainBarrier::drain();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closed_rows(&ids[..n], &vacated[..n]); let barrier = DrainBarrier::drain(); // SMALLFIX7 (B501) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST: the close trigger for every app row reaped here (the close disc, an exit); `closing` sat only in `close(id)`, so closing an app never saved its frame
     #[cfg(feature = "witness")]
     serial_println!(
         "[wc-a] close_owner asid={:#x} closed={} ids={:?} refused={}",

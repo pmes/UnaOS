@@ -2252,7 +2252,7 @@ fn dir_refused(plan: &DirPlan, path: &str, at: &str, why: &str) {
 /// the volume and any directory entry. GO RED by giving `plan_dir` a fallback destination for
 /// `None` — the shared-folder hack Peter refused — which turns the `Err` assertion false and the
 /// capture into an attempted write; that is the mutation this arm exists to catch.
-pub fn dir_fixture() { prtscr_fixture_arm(); static QB2: AtomicBool = AtomicBool::new(false); if crate::tests::defer_fast("prtscrdir", dir_fixture, &QB2) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests prtscrdir` fires it.
+pub fn dir_fixture() { static QB2: AtomicBool = AtomicBool::new(false); if crate::tests::defer_fast("prtscrdir", dir_fixture, &QB2) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests prtscrdir` fires it.
     static DONE: AtomicBool = AtomicBool::new(false);
     // A relaxed load in steady state; the RMW happens exactly once, on the first pass.
     if DONE.load(Ordering::Relaxed) || DONE.swap(true, Ordering::Relaxed) {
@@ -2559,8 +2559,10 @@ fn home_rel(p: &str) -> String {
 // ran, holding the door shut on purpose. `defer_fast` now runs a body only while its own fixture runs, and this
 // fixture is the door test by name: it WAITS (bounded) for any real capture to finish, TAKES the door the way
 // `capture` does (compare-exchange), presents a request to `service`, and scores the one counted refusal.
+// Registered from the `tests` verb's ensure line (`smallfix7::ensure`), never from the service pass: under
+// `tests-at-boot` a registration RUNS, and running this inside `service` would nest `prtscrdir`'s own door arm.
 
-/// Register `tests prtscr` once (folded into `dir_fixture`'s first statement: the service pass that arms it).
+/// Register `tests prtscr` once.
 pub fn prtscr_fixture_arm() {
     static ARMED: AtomicBool = AtomicBool::new(false);
     if !ARMED.swap(true, Ordering::AcqRel) {
@@ -2570,14 +2572,14 @@ pub fn prtscr_fixture_arm() {
 
 /// `tests prtscr`: wait for the capture door, take it, and read the refusal a request meets while it is held.
 pub fn prtscr_selftest() {
-    const WAIT_TICKS: u64 = 10_000;
-    let t0 = crate::arch::ticks();
-    while (IN_FLIGHT.load(Ordering::Acquire) || SLICING.load(Ordering::Acquire)) && crate::arch::ticks() < t0 + WAIT_TICKS {
+    const WAIT_MS: u64 = 10_000;
+    let t0 = crate::arch::ms();
+    while (IN_FLIGHT.load(Ordering::Acquire) || SLICING.load(Ordering::Acquire)) && crate::arch::ms() < t0 + WAIT_MS {
         crate::arch::sched::yield_now();
     }
-    let waited = crate::arch::ticks().saturating_sub(t0);
+    let waited = crate::arch::ms().saturating_sub(t0);
     if SLICING.load(Ordering::Acquire) || IN_FLIGHT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        serial_println!(":: PRTSCR: fixture door=held waited_ticks={} took=0 -> SKIP reason=capture-in-flight (a real capture held the door past the wait) ::", waited);
+        serial_println!(":: PRTSCR: fixture door=held waited_ms={} took=0 -> SKIP reason=capture-in-flight (a real capture held the door past the wait) ::", waited);
         return;
     }
     let (_, _, r0) = census();
@@ -2590,7 +2592,7 @@ pub fn prtscr_selftest() {
     IN_FLIGHT.store(false, Ordering::Release);
     let refused = r1.wrapping_sub(r0);
     serial_println!(
-        ":: PRTSCR: fixture door=free waited_ticks={} took=1 refused={} released=1 -> {} ::",
+        ":: PRTSCR: fixture door=free waited_ms={} took=1 refused={} released=1 -> {} ::",
         waited, refused, if refused == 1 { "PASS" } else { "FAIL" }
     );
 }

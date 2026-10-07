@@ -13,15 +13,12 @@
 # the deferred announce or a `:: BOOT:` line; PASS otherwise. arroyo's own spec verdict is NOT this gate's (the
 # x86 specs pin boot-time fixtures this leg deliberately defers).
 #
-# usage: boot-leg.sh <unaos dir> [--judge <serial log>]    (exit 0 PASS, 1 FAIL, 127 no qemu / no arroyo)
-# `--judge` reads a captured log only (no build, no QEMU). `./arroyo gates --selftest` plants a panic log at
-# <repo>/zzgateplant/bootleg.log, which this gate judges in place of a boot.
+# usage: ./arroyo bootleg [--judge <serial log>]  (= boot-leg.sh <unaos dir> …; exit 0 PASS, 1 FAIL, 127 no qemu / no arroyo)
+# `--judge` reads a captured log only (no build, no QEMU): `./arroyo bootleg --judge <log>`.
 set -u
 U="${1:?usage: boot-leg.sh <unaos dir> [--judge <serial log>]}"; shift || true
 JUDGE=""
 [ "${1:-}" = "--judge" ] && JUDGE="${2:?--judge needs a log}"
-PLANT="$(cd "$U/.." 2>/dev/null && pwd)/zzgateplant/bootleg.log"
-[ -z "$JUDGE" ] && [ -f "$PLANT" ] && JUDGE="$PLANT"
 METAL="wc,quarry,ftdirx,login,loginst,nvidia-kepler-vblank,smc,usbnet,hda,hda-tone,facet,beam,sdw,sdwrite,sdhcblk,selfhost,linuxabi,ahci,unafs,busreg,lumen,netring3,prefs_reset,census,installdemo,instgui,witness,selfdiag,ahciroot,btc,kvblank_trace,nvidia-kepler-ce,intel-ivb,unaos_ivb,gmux_igd,gen7,gen7r8,gen7blit,lidsleep,videoplayer,nvidia-kepler,nvidia-kepler-takeover,smolnet,ahci-write,wifi,wcdvalve,ehcihid,holocron,kbdwit,usbdebug,svg"
 SECS="${UNAOS_BOOTLEG_SECS:-120}"
 
