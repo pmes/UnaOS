@@ -4,3 +4,9 @@
 # whose SHA-256 equals its role's row; with no row it refuses with reason=unpinned and prints the digest.
 # The rows come from arroyo's WIFI-FW build line (`⚡ WIFI-FW: <file> sha256=…`) — never typed from memory.
 # Lines starting with `#` and blank lines are ignored.
+
+# rows written by the rmbp seat 2026-10-07 from the bunker's drivers/broadcom-b43/SHA256SUMS (bunker 412d4e0; the set cut 2026-08-12
+# with b43-fwcutter 020 from broadcom-wl-5.100.138); arroyo's WIFI-FW line on image 20 is the check: -> MATCH
+ucode 1123beb0af9dfe2da80253afda356174d14f745e698015979aad54283f0c087c
+initvals 0b6ed6d71199f6515921e836c6afd7ce1d06fde4e2b8986583d4839befea2de8
+bsinitvals b04de77575a66ae133c1598ced929e3bf335e6b17282630fa247dfab2d48517e
