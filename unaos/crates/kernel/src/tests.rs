@@ -399,7 +399,7 @@ fn skipped_names() -> alloc::string::String {
 /// pass, a paint): the caller's own `latch` makes every call after the first one relaxed swap, no table scan.
 /// Same answer as `defer`: `false` (run the body) under `tests-at-boot` or while `tests` is running it.
 pub fn defer_fast(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
-    if cfg!(feature = "tests-at-boot") || RUNNING.load(Ordering::Acquire) {
+    if cfg!(feature = "tests-at-boot") || (RUNNING.load(Ordering::Acquire) && running_is(name)) { // SMALLFIX7 (B501): only while THIS fixture runs — flight 27's `prtscrdir` fired inside `tests quarrylive` and held the capture door shut
         return false;
     }
     if !latch.swap(true, Ordering::AcqRel) {
@@ -577,4 +577,10 @@ fn boot_tags() -> alloc::string::String {
         s.push('-');
     }
     s
+}
+
+/// SMALLFIX7 (B501): is `name` the fixture [`run`] is executing now? A hot-path fixture ([`defer_fast`]) runs its
+/// body only then — never inside another fixture's run, where its side effects (a held door) land on the wrong test.
+fn running_is(name: &str) -> bool {
+    CUR.try_lock().map_or(false, |c| *c == name)
 }
