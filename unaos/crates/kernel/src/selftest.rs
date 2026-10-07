@@ -254,7 +254,7 @@ pub fn capture(args: fmt::Arguments) {
     if let Some(rest) = label.strip_prefix(":: ") {
         label = rest;
     }
-    let label = label.trim();
+    let label = label.trim(); crate::tests::boot_tag(label); // SMALLFIX7 (B501): `tests verdicts` names what the boot counted
 
     // Fit the label into NAME_MAX. If the whole label fits, store it verbatim. Otherwise truncate
     // at the last WORD boundary that leaves room for a trailing ellipsis marker, so a clipped

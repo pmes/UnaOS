@@ -41,7 +41,7 @@ static SOURCES_DONE: AtomicU32 = AtomicU32::new(0);
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 /// Called by the verdict tap for every fixture verdict line.
-pub fn tally(pass: bool) { if !ANNOUNCED.load(Ordering::Relaxed) { BOOT_VERDICTS.fetch_add(1, Ordering::Relaxed); }
+pub fn tally(pass: bool) { if !ANNOUNCED.load(Ordering::Relaxed) && !BOOT_OVER.load(Ordering::Relaxed) { BOOT_VERDICTS.fetch_add(1, Ordering::Relaxed); }
     if pass { PASS.fetch_add(1, Ordering::Relaxed); } else {
         FAIL.fetch_add(1, Ordering::Relaxed);
         // TESTFIX2 — remember WHICH fixture failed (the one `run` is executing), de-duplicated, for the summary line.
@@ -118,7 +118,7 @@ pub fn run(name: Option<&str>) -> usize {
         serial_println!(":: TESTS: already running — refused ::");
         return 0;
     }
-    let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
+    BOOT_OVER.store(true, Ordering::Release); let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)); // SMALLFIX7 (B501): a `tests` run ends the boot's verdict window
     *FAILED.lock() = [None; 16]; skip_reset(); RESULTS.lock().clear(); // QUIETBOOT3 (B352): same-line fold.
     let mut ran = 0usize;
     let mut i = 0usize;
@@ -506,7 +506,75 @@ fn ensure_bootverdicts() {
 pub fn verdicts_selftest() {
     let n = BOOT_VERDICTS.load(Ordering::Relaxed);
     serial_println!(
-        ":: VERDICTS: before_deferred={} moved={} reworded={} -> {} ::",
-        n, VERDICTS_MOVED, VERDICTS_REWORDED, if n == 0 { "PASS" } else { "FAIL" }
+        ":: VERDICTS: before_deferred={} moved={} reworded={} announced={} tags={} -> {} ::",
+        n, VERDICTS_MOVED, VERDICTS_REWORDED + SMALLFIX7_REWORDED, ANNOUNCED.load(Ordering::Relaxed) as u8, boot_tags(), if n == 0 { "PASS" } else { "FAIL" }
     );
+}
+
+// SMALLFIX7 (rmbp-ledger B501) — TAIL-APPENDED. Flight 27 read `VERDICTS: before_deferred=29 -> FAIL` and the wire
+// had NO `TESTS: deferred=` line: the announce waited on `SRC_DESK`, which `u8x_launcher` signalled, and BOOTVERDICTS
+// moved that chain behind `tests ladder` — so `tally` counted the whole session, the seat's own `tests` runs
+// included. Now `ladder_arm` signals the source, the window also closes at the first `tests` run, `tests verdicts`
+// names what it counted, and the six lines the boot itself printed (TPMODE, FIRSTUSER, INPUTSTALL, DESKTOPBUILT,
+// the wifi6 S5i post-check, U5x) print `ok`/`NOT-OK` before the deferral point ([`boot_word`]).
+
+/// Set by the first `tests` run: a verdict after it is a fixture's, never the boot's.
+static BOOT_OVER: AtomicBool = AtomicBool::new(false);
+/// The six boot lines SMALLFIX7 reworded through [`boot_word`].
+const SMALLFIX7_REWORDED: u32 = 6;
+const TAG_MAX: usize = 16;
+const TAGS_MAX: usize = 12;
+/// The first [`TAGS_MAX`] counted verdict lines' tags (alloc-free: the tap runs in IRQ-masked print contexts).
+static TAGS: crate::sync::Mutex<([[u8; TAG_MAX]; TAGS_MAX], usize)> = crate::sync::Mutex::new(([[0; TAG_MAX]; TAGS_MAX], 0));
+
+/// Has the boot's verdict window closed (the deferred line announced, or a `tests` run begun)? Always under
+/// `tests-at-boot`: the QEMU lanes keep their boot verdicts and the specs that pin them.
+pub fn boot_over() -> bool {
+    cfg!(feature = "tests-at-boot") || ANNOUNCED.load(Ordering::Relaxed) || BOOT_OVER.load(Ordering::Relaxed)
+}
+
+/// The verdict word a boot-path witness prints: `PASS`/`FAIL` once [`boot_over`], `ok`/`NOT-OK` before it — the
+/// boot's line is a record there (R80); `tests <name>`, or any later print, carries the verdict.
+pub fn boot_word(pass: bool) -> &'static str {
+    match (boot_over(), pass) {
+        (true, true) => "PASS",
+        (true, false) => "FAIL",
+        (false, true) => "ok",
+        (false, false) => "NOT-OK",
+    }
+}
+
+/// The verdict tap's label for a line [`tally`] counted (same window): its tag, up to the first `:`.
+pub fn boot_tag(label: &str) {
+    if ANNOUNCED.load(Ordering::Relaxed) || BOOT_OVER.load(Ordering::Relaxed) {
+        return;
+    }
+    let tag = label.split(':').next().unwrap_or("").trim();
+    let tag = tag.strip_prefix('[').map(|t| t.split(']').next().unwrap_or(t)).unwrap_or(tag);
+    if let Some(mut g) = TAGS.try_lock() {
+        let n = g.1;
+        if n < TAGS_MAX {
+            let b = tag.as_bytes();
+            let k = b.len().min(TAG_MAX);
+            g.0[n] = [0; TAG_MAX];
+            g.0[n][..k].copy_from_slice(&b[..k]);
+            g.1 = n + 1;
+        }
+    }
+}
+
+fn boot_tags() -> alloc::string::String {
+    let g = TAGS.lock();
+    let mut s = alloc::string::String::new();
+    for t in g.0[..g.1].iter() {
+        let n = t.iter().position(|&c| c == 0).unwrap_or(TAG_MAX);
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(core::str::from_utf8(&t[..n]).unwrap_or("?"));
+    }
+    if s.is_empty() {
+        s.push('-');
+    }
+    s
 }
