@@ -655,7 +655,7 @@ pub fn owed_names(md: &str) -> Vec<String> {
     let mut item = String::new();
     let (mut depth, mut tick) = (0i32, false);
     let chars: Vec<char> = sec.chars().collect();
-    let mut flush = |item: &mut String, out: &mut Vec<String>| {
+    let flush = |item: &mut String, out: &mut Vec<String>| {
         let n = arc_name(item);
         if !n.is_empty() && !out.contains(&n) {
             out.push(n);
@@ -705,12 +705,21 @@ fn has_word(hay: &str, w: &str) -> bool {
     false
 }
 
-/// Is this record CUT — an executor already holds it (`job:branch`, or a ledger cell that names its branch)?
+/// Is this record CUT — an executor already holds it (open with a `job:branch`, or open and its own words name its
+/// executor branch)?
 pub fn running(r: &Record) -> bool {
-    if !r.get(K_BRANCH).is_empty() {
+    // a LANDED item keeps its `job:branch` (the hand-back's record); only an open one is still held — a §3 name
+    // whose landed item flew red again is owed again, never skipped for ever
+    if r.get(K_STATUS) == "open" && !r.get(K_BRANCH).is_empty() {
         return true;
     }
-    r.kind == Kind::Ledger && r.get(K_STATUS) == "open" && r.body.to_ascii_lowercase().contains("on branch ")
+    let head: String = r.body.chars().take(200).collect::<String>().to_ascii_lowercase();
+    r.get(K_STATUS) == "open"
+        && match r.kind {
+            Kind::Ledger => r.body.to_ascii_lowercase().contains("on branch "),
+            // a queue item that names its executor branch in its head was cut (`· SPECPINS2 (branch exec-rmbp-…`)
+            _ => head.contains("branch exec-") || head.contains("`exec-"),
+        }
 }
 
 /// Open for the next wave: `job:status` is `open`, not [`running`], and its own words do not close it (`✓`, or a
@@ -741,9 +750,10 @@ impl Gpu {
     }
 }
 
-/// Which GPU ladder a record is a rung of, by its own words (case-insensitive).
+/// Which GPU ladder a record is a rung of, by the words of its HEAD (its first 160 characters, case-insensitive) —
+/// a passing mention deep in a long item ("the Intel font") is not a rung.
 pub fn gpu_lane(r: &Record) -> Option<Gpu> {
-    let t = r.body.to_ascii_lowercase();
+    let t = r.body.chars().take(160).collect::<String>().to_ascii_lowercase();
     if ["kepler", "gk107", "nvidia"].iter().any(|w| t.contains(w)) {
         Some(Gpu::Kepler)
     } else if ["gen7", "ivb", "intel", "hd 4000"].iter().any(|w| t.contains(w)) {
@@ -785,6 +795,9 @@ pub struct Ranked {
     /// 0 = Peter's §3 order, 1 = an R101 GPU slot, 2 = the queue's `job:seq`.
     pub tier: u8,
     pub lane: Option<Gpu>,
+    /// For a §3 name with no open record: the newest record of the track that carries the name (any status), whose
+    /// ledger row the row cites.
+    pub cite: Option<usize>,
 }
 
 impl Ranked {
@@ -819,7 +832,8 @@ pub fn rank_next(records: &[Record], owed: &[String], track: &str, n: usize) -> 
         if rec.is_some_and(|i| tier_a.iter().any(|t| t.rec == Some(i))) {
             continue;
         }
-        tier_a.push(Ranked { rec, name: name.clone(), tier: 0, lane: rec.and_then(|i| gpu_lane(&records[i])) });
+        let cite = if rec.is_some() { None } else { (0..records.len()).filter(|i| mine(&records[*i]) && has(i)).max_by_key(|&i| (records[i].kind == Kind::Ledger, records[i].seq)) };
+        tier_a.push(Ranked { rec, name: name.clone(), tier: 0, lane: rec.and_then(|i| gpu_lane(&records[i])), cite });
     }
     let mut gpu: Vec<Ranked> = Vec::new();
     for lane in [Gpu::Kepler, Gpu::Intel] {
@@ -827,7 +841,7 @@ pub fn rank_next(records: &[Record], owed: &[String], track: &str, n: usize) -> 
             continue;
         }
         if let Some(&i) = queue.iter().find(|&&i| gpu_lane(&records[i]) == Some(lane)) {
-            gpu.push(Ranked { rec: Some(i), name: records[i].get(K_ARC).to_string(), tier: 1, lane: Some(lane) });
+            gpu.push(Ranked { rec: Some(i), name: records[i].get(K_ARC).to_string(), tier: 1, lane: Some(lane), cite: None });
         }
     }
     let keep_a = n.saturating_sub(gpu.len().min(n)).min(tier_a.len());
@@ -838,7 +852,7 @@ pub fn rank_next(records: &[Record], owed: &[String], track: &str, n: usize) -> 
             break;
         }
         if !out.iter().any(|t| t.rec == Some(i)) {
-            out.push(Ranked { rec: Some(i), name: records[i].get(K_ARC).to_string(), tier: 2, lane: gpu_lane(&records[i]) });
+            out.push(Ranked { rec: Some(i), name: records[i].get(K_ARC).to_string(), tier: 2, lane: gpu_lane(&records[i]), cite: None });
         }
     }
     out
@@ -867,7 +881,7 @@ pub fn next_header(records: &[Record], ranked: &[Ranked], flight: &str, owed: us
 pub fn next_row(records: &[Record], rank: usize, t: &Ranked, brief: &str) -> String {
     let (id, lref) = match t.rec {
         Some(i) => (records[i].id.as_str(), ledger_ref(&records[i])),
-        None => ("-", String::from("-")),
+        None => ("-", t.cite.map(|i| ledger_ref(&records[i])).unwrap_or_else(|| String::from("-"))),
     };
     let tag = match (t.tier, t.lane) {
         (1, Some(l)) => format!(" [gpu:{}]", l.word()),

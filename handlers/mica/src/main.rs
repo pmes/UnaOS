@@ -11,6 +11,10 @@
 //!   mica jobs query   --img I <status=confirmed flight=f24 | UnaFS query text>
 //!   mica jobs export  --repo R --img I [--out DIR]               STATUS.tsv + the ledgers, written back (DIR defaults to R)
 //!   mica jobs witness --repo R [--img I]                         repo → volume → export: the witness line
+//!   mica jobs next    --img I [--repo R] [--track rmbp] [--n 13] [--after-flight N]   JOBSNEXT (B506): the next wave, ranked
+//!   mica jobs cut     --img I [--track T] <id> --branch B [--arc A]                  the executor's cut (leaves `next`)
+//!   mica jobs land    --img I [--track T] <id> --status S --tip SHA                  the hand-back (export still writes the cell)
+//!   mica jobs owed    --repo R --img I [--after-flight N]                            the flight's §3 order → /jobs/owed
 use anyhow::{Context, Result, anyhow, bail};
 use jobs_core as jc;
 use std::path::{Path, PathBuf};
@@ -25,10 +29,18 @@ struct Args {
     refs: String,
     size_mb: Option<u64>,
     into: bool,
+    // JOBSNEXT (B506)
+    track: String,
+    n: usize,
+    after_flight: Option<u64>,
+    arc: String,
+    branch: String,
+    status: String,
+    tip: String,
 }
 
 fn parse(v: &[String]) -> Result<Args> {
-    let mut a = Args { pos: vec![], repo: PathBuf::from("."), img: None, out: None, set_by: String::new(), refs: String::new(), size_mb: None, into: false };
+    let mut a = Args { pos: vec![], repo: PathBuf::from("."), img: None, out: None, set_by: String::new(), refs: String::new(), size_mb: None, into: false, track: "rmbp".into(), n: 13, after_flight: None, arc: String::new(), branch: String::new(), status: String::new(), tip: String::new() };
     let mut i = 0;
     while i < v.len() {
         let next = |i: usize| v.get(i + 1).cloned().ok_or_else(|| anyhow!("{} needs a value", v[i]));
@@ -40,6 +52,13 @@ fn parse(v: &[String]) -> Result<Args> {
             "--refs" => { a.refs = next(i)?; i += 1 }
             "--size-mb" => { a.size_mb = Some(next(i)?.parse()?); i += 1 }
             "--into" => a.into = true,
+            "--track" => { a.track = next(i)?; i += 1 }
+            "--n" => { a.n = next(i)?.parse()?; i += 1 }
+            "--after-flight" => { a.after_flight = Some(next(i)?.trim_start_matches('f').parse()?); i += 1 }
+            "--arc" => { a.arc = next(i)?; i += 1 }
+            "--branch" => { a.branch = next(i)?; i += 1 }
+            "--status" => { a.status = next(i)?; i += 1 }
+            "--tip" => { a.tip = next(i)?; i += 1 }
             _ => a.pos.push(v[i].clone()),
         }
         i += 1;
@@ -56,7 +75,7 @@ fn mount(img: &Option<String>) -> Result<FileSystem> {
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) != Some("jobs") || argv.len() < 2 {
-        bail!("usage: mica jobs <build|add|cite|verify|list|query|export|witness> … (see src/main.rs)");
+        bail!("usage: mica jobs <build|add|cite|verify|list|query|export|witness|next|cut|land|owed> … (see src/main.rs)");
     }
     let verb = argv[1].clone();
     let a = parse(&argv[2..])?;
@@ -77,6 +96,8 @@ fn main() -> Result<()> {
             }
             let mut fs = mount(&a.img)?;
             mica::populate(&mut fs, &recs)?;
+            let (fl, owed) = mica::owed_from_repo(&a.repo, None)?; // JOBSNEXT (B506): the latest §3 → /jobs/owed
+            mica::write_owed(&mut fs, &fl, &owed)?;
             let w = mica::witness_on(&a.repo, &src, &mut fs)?;
             for id in &w.failed {
                 eprintln!("[jobs] verify FAILED {id}");
@@ -162,6 +183,34 @@ fn main() -> Result<()> {
             if !w.identical || !w.failed.is_empty() {
                 std::process::exit(1);
             }
+        }
+        // JOBSNEXT (B506): the next wave, the cut, the hand-back, the §3 order.
+        "next" => {
+            let mut fs = mount(&a.img)?;
+            let recs = mica::load(&mut fs)?;
+            let (fl, owed) = match (a.after_flight, mica::read_owed(&mut fs)?) {
+                (None, Some(o)) => o,
+                (want, _) => mica::owed_from_repo(&a.repo, want)?,
+            };
+            let briefs = mica::Briefs::index(&a.repo);
+            for l in mica::next_lines(&recs, &fl, &owed, &a.track, a.n, &briefs) {
+                println!("{l}");
+            }
+        }
+        "cut" => {
+            let id = a.pos.first().ok_or_else(|| anyhow!("usage: mica jobs cut --img I <id> --branch B [--arc A]"))?;
+            let r = mica::cut(&mut mount(&a.img)?, id, &a.track, &a.arc, &a.branch)?;
+            println!("[jobs] cut {} status=open arc={} branch={}", r.path(), r.get(jc::K_ARC), r.get(jc::K_BRANCH));
+        }
+        "land" => {
+            let id = a.pos.first().ok_or_else(|| anyhow!("usage: mica jobs land --img I <id> --status S --tip SHA"))?;
+            let r = mica::land(&mut mount(&a.img)?, id, &a.track, &a.status, &a.tip)?;
+            println!("[jobs] land {} status={} tip={}", r.path(), r.get(jc::K_STATUS), r.get(jc::K_TIP));
+        }
+        "owed" => {
+            let (fl, owed) = mica::owed_from_repo(&a.repo, a.after_flight)?;
+            mica::write_owed(&mut mount(&a.img)?, &fl, &owed)?;
+            println!("[jobs] owed flight={} names={} {}", if fl.is_empty() { "-" } else { &fl }, owed.len(), owed.join(","));
         }
         v => bail!("unknown verb {v}"),
     }

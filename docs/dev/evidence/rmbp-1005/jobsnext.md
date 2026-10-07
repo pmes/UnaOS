@@ -37,15 +37,21 @@ it cites, the brief (`docs/dev/evidence/**/<NAME>.md`, host only) or `-`.
   --arc A --branch B`, `jobs land --img I <id> --status S --tip T`, `jobs owed --repo R --img I [--after-flight N]`;
   `build` writes `/jobs/owed`; host tests over a fixture volume. Export unchanged: the ledger cell and STATUS.tsv
   still come from `export` (cut/land change attributes, never the row's text).
-- **M3** kernel: the shell's `jobs next [n]` reads `/jobs/owed` and the records through the VFS and prints the same
-  ranking via `jobs_core::rank_next`. Plain `jobs` is unchanged (the background-program reaper). No new knob
-  (`fs::jobs` already rides `unafs`).
+- **M3** kernel: the shell's `jobs next [n] [track]` reads `/jobs/owed` and the records through the VFS and prints
+  the same ranking via `jobs_core::rank_next`. Plain `jobs` is unchanged (the background-program reaper). No new
+  knob (`fs::jobs` already rides `unafs`). The kernel NEVER walks the store (JOBSCAN B497 measured a whole-folder
+  walk at 1675 inode reads, 17 s, IRQ-masked): it asks the attribute index for `job:status == "open"` and for
+  `job:arc == "<NAME>"` per §3 name, keeps the hits under the track's queue and ledger folders, and reads each
+  record on its own. That subset is exactly what `rank_next` reads (open candidates and the header's open count;
+  the running check and the cited row of a §3 name), so the glass ranks what the host ranks. A volume that answers
+  no queries falls back to walking the track's two folders (`via=walk`).
 
 ## The witness
 
 Host: `[jobs] next flight=f27 track=rmbp owed=<k> open=<m> ranked=<n> gpu=kepler:<id>,intel:<id>` then one row
 per rank. Metal (Peter types `jobs next` at the shell after login, nothing at boot — R80): the same header with
-`flight=f<n>` read off `/jobs/owed`, e.g. `[jobs] next flight=f27 track=rmbp owed=11 open=<m> ranked=13 gpu=…`;
+`flight=f<n>` read off `/jobs/owed`, then the kernel's cost, e.g.
+`[jobs] next flight=f27 track=rmbp owed=<k> open=<m> ranked=13 gpu=kepler:<id>,intel:<id> read=<r> via=index ms=<t>`;
 `flight=-` means the card's volume predates `/jobs/owed` (a rebuilt card carries it).
 
 ## Owed

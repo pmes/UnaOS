@@ -125,7 +125,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("run", "system", "load an ELF64 user program and run it in the foreground, reporting its exit status", "run <path>", &["run /apps/ELFHELLO.ELF"]),
     d("bg", "system", "run a user program in the background; its window stays open", "bg <path>", &["bg /apps/VUG.ELF"]),
     d("storm", "system", "launch a fleet of background vug programs (default 6) and measure headroom", "storm [n]", &["storm", "storm 12"]),
-    d("jobs", "system", "list background programs and reap the exited ones", "jobs", &["jobs"]),
+    d("jobs", "system", "list background programs and reap the exited ones; `jobs next [n] [track]` ranks the next wave off /jobs", "jobs [next [n] [track]]", &["jobs", "jobs next"]),
     d("kill", "system", "kill a background program by pid (see `jobs`)", "kill <pid>", &["kill 3"]),
     d("shutdown", "system", "power off through the platform firmware", "shutdown", &["shutdown"]),
     d("off", "system", "alias of shutdown", "off", &["off"]),
