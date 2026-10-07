@@ -6361,7 +6361,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
-            bg_jobs(console);
+            if !jobs_next_verb(console, &args) { bg_jobs(console); } // JOBSNEXT (B506): `jobs next [n] [track]`
         },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "kill" => {
@@ -9001,4 +9001,32 @@ fn x86bind_test() {
 /// `Avail` filter `plan` uses), so the shell task's routing cannot disagree with the dispatcher.
 pub fn program_word(word: &str) -> bool {
     !midden_core::is_verb(&midden_core::canon_verb(word), &midden_facts())
+}
+
+/// JOBSNEXT (rmbp-ledger B506): `jobs next [n] [track]` — the next wave, ranked off `/jobs` by
+/// `jobs_core::rank_next` (the ranking `mica jobs next` prints on the host). Plain `jobs` stays the
+/// background-program reaper. `true` = handled.
+#[cfg(feature = "unafs")]
+#[allow(dead_code)]
+fn jobs_next_verb(console: &mut Console, args: &[&str]) -> bool {
+    if args.first().copied() != Some("next") {
+        return false;
+    }
+    let n = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(13).clamp(1, 64);
+    let track = args.get(2).copied().unwrap_or(crate::fs::jobs::NEXT_TRACK);
+    for l in crate::fs::jobs::next_lines(n, track) {
+        serial_println!("{}", l);
+        console.println(&l.replace('\t', "  "));
+    }
+    true
+}
+
+#[cfg(not(feature = "unafs"))]
+#[allow(dead_code)]
+fn jobs_next_verb(console: &mut Console, args: &[&str]) -> bool {
+    if args.first().copied() != Some("next") {
+        return false;
+    }
+    console.println("jobs next: this kernel has no UnaFS (/jobs is on the UnaFS volume)");
+    true
 }

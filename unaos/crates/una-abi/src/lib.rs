@@ -2081,6 +2081,9 @@ pub mod attr_keys {
     pub const JOB_OWNER: &str = "job:owner";
     pub const JOB_ARC: &str = "job:arc";
     pub const JOB_TRACK: &str = "job:track";
+    /// JOBSNEXT (B506): the executor's branch a `mica jobs cut` names, and the tip a `mica jobs land` records.
+    pub const JOB_BRANCH: &str = "job:branch";
+    pub const JOB_TIP: &str = "job:tip";
 
     /// FILETYPES (B423): a type object's description and its user-added extensions (merge19).
     pub const DESCRIPTION: &str = "una:description";
@@ -2111,6 +2114,7 @@ pub mod attr_keys {
         EMBED_MODEL, EMBED_DIMS, MEDIA_WIDTH, MEDIA_HEIGHT, MEDIA_DURATION_MS, MEDIA_CODEC, DOC_TITLE,
         IMAGE_ANIMATED, BT_LINKKEY, BT_KEYTYPE, BT_CLASS, BT_NAME, BT_HIDDESC, JOB_KIND, JOB_ID, JOB_SEQ,
         JOB_STATUS, JOB_FLIGHT, JOB_LINE, JOB_SET_BY, JOB_REFS, JOB_OWNER, JOB_ARC, JOB_TRACK,
+        JOB_BRANCH, JOB_TIP,
         DESCRIPTION, EXTENSIONS, MEDIA_CAMERA, MEDIA_LENS, MEDIA_EXPOSURE, MEDIA_ISO, MEDIA_FOCAL_MM, MEDIA_TAKEN, FSNAME, FSNAME_INDEX, VIEW_MODE, VIEW_COLUMNS, VIEW_SORT, VIEW_FRAME, FILETYPES_STAMP, DROPTYPES,
     ];
 
