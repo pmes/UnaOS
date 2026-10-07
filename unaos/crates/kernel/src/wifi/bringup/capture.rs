@@ -132,6 +132,8 @@ pub(super) fn pre_image(bar0: u64, words: u32, staged_fnv: u32, w: &mut Writes) 
         ":: WIFI5: c2 shared[+0x00]={:#010x} lo16={:#06x} (the shm-probe's r16 read 0x0288 on f13-f20; equal ⇒ the dword stream starts where the probe read) ::",
         shared[0], shared[0] & 0xFFFF
     );
+    #[cfg(feature = "wifi4")]
+    super::live::note_pre(shared[0]); // WIFI7 (B505): S5u's pre-image.
 
     // ── C1: the resident ucode, exactly the words our stream will overwrite. ────────────────────
     unsafe { w32(bar0, D11_SHM_CONTROL, SHM_ROUTE_UCODE << 16) };

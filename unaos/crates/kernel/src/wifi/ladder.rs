@@ -89,9 +89,17 @@ pub fn witness() {
         Some(_) => " (UNAOS_WIFI_FW_PATH stages the set onto the card's /FIRMWARE/)",
         None => "",
     };
+    // WIFI7 (B505): S5u's revision and S5d's 5 s SHM watch (bringup/live.rs). The RX-frame counter's
+    // SHM offset is pinned by no Group-A page, so the field names the movers, never a decoded count.
+    #[cfg(feature = "wifi4")]
+    let (urev, mv) = super::bringup::live::watch();
+    #[cfg(not(feature = "wifi4"))]
+    let (urev, mv): (Option<u32>, Option<u32>) = (None, None);
+    let urev = urev.map(|r| alloc::format!("{}", r)).unwrap_or_else(|| alloc::string::String::from("none"));
+    let rx5 = mv.map(|n| alloc::format!("unpinned(movers={})", n)).unwrap_or_else(|| alloc::string::String::from("not-watched"));
     serial_println!(
-        ":: WIFI5: rungs={} confirmed={} refuted={} open={} parked={} upload_unwind={} staged={}/3 {} uploaded_this_boot={} -> {}{} ::",
-        LEDGER.len(), c, r, o, p, unwind, staged, fw, uploaded as u8,
+        ":: WIFI5: rungs={} confirmed={} refuted={} open={} parked={} upload_unwind={} staged={}/3 {} uploaded_this_boot={} ucode_rev={} rx_frames_5s={} -> {}{} ::",
+        LEDGER.len(), c, r, o, p, unwind, staged, fw, uploaded as u8, urev, rx5,
         if reason.is_none() { "READY" } else { "NOT-READY" },
         reason.map(|s| alloc::format!(" reason={}{}", s, hint)).unwrap_or_default()
     );
