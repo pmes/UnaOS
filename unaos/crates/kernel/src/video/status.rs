@@ -756,6 +756,9 @@ pub const ITEM_CLOCK: u8 = 4;
 pub const ITEMS: u8 = 5;
 /// No item (a menu that is closed).
 pub const ITEM_NONE: u8 = 0xff;
+/// MENUBARSLOTS (B499): the Notification Center's bell — a BAR item (menubar's flow, the wire's `items=`), not a
+/// statusmenu item, so it sits past [`ITEMS`].
+pub const ITEM_NOTIFY: u8 = 5;
 
 /// The item's wire name.
 pub fn item_name(i: u8) -> &'static str {
@@ -765,6 +768,7 @@ pub fn item_name(i: u8) -> &'static str {
         ITEM_VOLUME => "volume",
         ITEM_BATTERY => "battery",
         ITEM_CLOCK => "clock",
+        ITEM_NOTIFY => "notify",
         _ => "none",
     }
 }
