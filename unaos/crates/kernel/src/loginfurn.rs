@@ -205,7 +205,7 @@ fn take_item_credit() -> bool {
 // and the seat types into the headless door with no console open. The prefill replays `boot_ring::tail`; this
 // reads the same tail at the same height the console asks for, without painting anything.
 
-/// The console grid height the prefill asks the ring for (the shipping console's rows at 2880x1800).
+/// The console grid height this read asks the ring for (a nominal console; the real prefill asks for its own grid).
 const PREFILL_ROWS: usize = 48;
 
 /// Lines the console's prefill would replay if it opened now (0 when the ring is contended or empty).

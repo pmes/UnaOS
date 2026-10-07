@@ -70,7 +70,7 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # list must be checked against that cfg before it is: `witness` is not a free arming on x86.
 case "${1:-}" in
     test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi|test-install|test_install|test-ptr|test_ptr)
-        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT:-1}"; export UNAOS_CENSUS="${UNAOS_CENSUS:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
+        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT-1}";  export UNAOS_CENSUS="${UNAOS_CENSUS:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
 esac
 
 # BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
@@ -13617,14 +13617,14 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py bootleg:unaos/scripts/boot-leg.sh" # SMALLFIX7 (B501): bootleg = the metal feature line BOOTED under QEMU with tests-at-boot OFF (flight 27 PREHEAP)
 _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary line, returns the gate's rc
     local R="$1" n="$2" log="$3" p rc=0 e
     p="$(printf '%s\n' $GATES_SET | awk -F: -v n="$n" '$1==n{print $2}')"
     if [ -z "$p" ] || [ ! -f "$R/$p" ]; then echo "gate=${n} rc=127 MISSING ${p:-<not in GATES_SET>}"; return 127; fi
     case "$p" in *.py) command -v python3 >/dev/null 2>&1 || { echo "gate=${n} rc=127 MISSING python3"; return 127; } ;; esac
     case "$n" in
-        charter|arch|attrkeys|appearance|verbs|sanity) e=("$R/unaos") ;;
+        charter|arch|attrkeys|appearance|verbs|sanity|bootleg) e=("$R/unaos") ;;
         deps) e=(--check) ;;
         banner) e=(--registry "${_feats%,}") ;;
         *) e=() ;;
@@ -13651,6 +13651,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         banner)     sed -i '/^bc_table() {$/,/^TABLE$/ s/^\(ahci|AHCI: selfcheck|-|measured\)$/\1\nzzgateplant|:: ZZGATEPLANT: row for no feature|-|measured/' "$C/unaos/scripts/banner-cert.sh"; echo zzgateplant ;;
         k8reach)    sed -i 's/^_feats=""$/&\n[ -n "${UNAOS_ZZGATEPLANT:-}" ] \&\& _feats="${_feats}zzgateplant,"/' "$C/unaos/arroyo"; echo ZZGATEPLANT ;;
         sanity)     printf 'pub fn p() { assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 2); }\n' > "$K/video/zz_gateplant_sanity.rs"; echo zz_gateplant_sanity ;; # SANITYLEGS (B488): flight 26's reboot-loop assert, planted as a runtime assert over consts
+        bootleg)    mkdir -p "$C/zzgateplant" && printf 'memory allocation of 96 bytes failed zzgateplant\nUnaOS stopped. It will restart in 1 s.\n' > "$C/zzgateplant/bootleg.log"; echo zzgateplant ;; # SMALLFIX7 (B501): flight 27's pre-heap panic, judged in place of a boot
         *) return 1 ;;
     esac
 }

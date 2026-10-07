@@ -76,28 +76,23 @@ pub fn register(name: &'static str, f: fn()) {
         // did not have: `memory allocation of 96 bytes failed`, the panic screen, a 1 s restart loop, nothing on the
         // wire (the probe on image 19's knobs panicked the same way: the tree, not a knob). Until the heap is up a
         // registration parks in this fixed stash; the first post-heap registration drains it into the table.
-        static PRE: crate::sync::Mutex<[Option<(&'static str, fn())>; 8]> = crate::sync::Mutex::new([None; 8]);
-        if crate::allocator::heap_bounds() == (0, 0) {
-            let mut p = PRE.lock();
-            match p.iter_mut().find(|s| s.is_none()) {
-                Some(slot) => { *slot = Some((name, f)); DEFERRED.fetch_add(1, Ordering::Relaxed); }
-                None => serial_println!(":: TESTS: pre-heap stash full (8) — `{}` NOT registered -> FAIL ::", name),
+        // SMALLFIX7 (B501): the admission is `midden_core::fixtures::admit`, the one rule the host test runs.
+        use midden_core::fixtures::{admit, Admit, Stash};
+        static PRE: crate::sync::Mutex<Stash<(&'static str, fn()), 8>> = crate::sync::Mutex::new(Stash::new());
+        let heap_up = crate::allocator::heap_bounds() != (0, 0);
+        let mut t = if heap_up { Some(TABLE.lock()) } else { None };
+        let mut p = PRE.lock();
+        let got = admit(&mut p, heap_up, (name, f), |e| {
+            if let Some(t) = t.as_mut() {
+                match t.iter_mut().find(|s| s.is_none()) {
+                    Some(slot) => *slot = Some(e),
+                    None => t.push(Some(e)), // SMALLFIX6 (B495, R90): no fixed cap — the table grows
+                }
             }
-            return;
-        }
-        let mut t = TABLE.lock();
-        {
-            let mut p = PRE.lock();
-            for s in p.iter_mut() {
-                if let Some(e) = s.take() { t.push(Some(e)); }
-            }
-        }
-        match t.iter_mut().find(|s| s.is_none()) {
-            Some(slot) => {
-                *slot = Some((name, f));
-                DEFERRED.fetch_add(1, Ordering::Relaxed);
-            }
-            None => { t.push(Some((name, f))); DEFERRED.fetch_add(1, Ordering::Relaxed); } // SMALLFIX6 (B495, R90): no fixed cap — the table grows
+        });
+        match got {
+            Admit::Full => serial_println!(":: TESTS: pre-heap stash full (8) — `{}` NOT registered -> FAIL ::", name),
+            Admit::Parked | Admit::Tabled { .. } => { DEFERRED.fetch_add(1, Ordering::Relaxed); }
         }
     }
 }
