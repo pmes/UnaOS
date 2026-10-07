@@ -10711,7 +10711,7 @@ build_user_blob() {
     # lands, then mv (atomic on one filesystem) — an interrupted build can no longer leave a
     # truncated-but-nonempty user_blob.bin that `ensure_user_blob`'s -s test would accept forever.
     "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
-      "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/user-blob" \
+      "${CARGO_TARGET_DIR:-${WORKSPACE_DIR}/crates/user-blob/target}/aarch64-base/release/user-blob" \
       "${WORKSPACE_DIR}/target/user_blob.bin.tmp"
     # The flat blob must exist and begin EXACTLY at _start's first instruction — the kernel enters the
     # copy at offset 0, so a stray byte ahead of _start (a future toolchain reordering objcopy output)

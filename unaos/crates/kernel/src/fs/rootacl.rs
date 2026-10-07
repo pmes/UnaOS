@@ -66,7 +66,8 @@ pub fn under_system(fs: &mut crate::fs::unafs::KernelUnaFS, id: u64) -> bool {
 pub fn admin_principal(principal: &str) -> bool {
     let Some(rest) = principal.strip_prefix("user:") else { return false };
     let name = rest.split('#').next().unwrap_or("");
-    !name.is_empty() && crate::fs::users::role_of(name.as_bytes()) == Some(crate::fs::users::Role::Admin)
+    #[cfg(feature = "login")] { !name.is_empty() && crate::fs::users::role_of(name.as_bytes()) == Some(crate::fs::users::Role::Admin) }
+    #[cfg(not(feature = "login"))] { let _ = name; false } // no user store without `login`: nobody is the administrator
 }
 
 /// `native_write_authz`'s question for a non-kernel `principal` on `ino`: `None` = not system-owned (the ordinary
@@ -133,8 +134,9 @@ pub fn selftest() {
     let a = matches!(mt.set_attr(F, una_abi::attr_keys::OPENER, AttrValue::Str(String::from("X")), anon), Err(VfsError::Denied));
     let u = matches!(mt.unlink(F, anon), Err(VfsError::Denied));
     let r = mt.open_read(F, anon).is_ok();
-    let mut nb = [0u8; crate::fs::users::NAME_MAX];
-    let admin = crate::fs::users::admin_name(&mut nb).and_then(|n| core::str::from_utf8(&nb[..n]).ok().map(String::from));
+    #[cfg(feature = "login")] let mut nb = [0u8; crate::fs::users::NAME_MAX];
+    #[cfg(feature = "login")] let admin = crate::fs::users::admin_name(&mut nb).and_then(|n| core::str::from_utf8(&nb[..n]).ok().map(String::from));
+    #[cfg(not(feature = "login"))] let admin: Option<String> = None;
     let admin_tok = match &admin {
         Some(n) => {
             let p = alloc::format!("user:{}#0", n);

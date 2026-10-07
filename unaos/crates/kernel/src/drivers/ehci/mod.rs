@@ -13883,7 +13883,7 @@ impl Controller {
                             // print on every boot; see the KBDFLAP section comment for the full derivation.
                             let h_chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
                             let (h_addr, h_ep) = (h_chars & 0x7F, (h_chars >> 8) & 0xF);
-                            let (h_class, h_recoverable) = halt_class(tok); let h_proxy = crate::hidstall::is_proxy(h_class, e.reports, e.mps, self.bt_radio.is_some()); crate::hidstall::note_halt(ep_i); // HIDSTALL (B485): the BT HID proxy told apart; the halt stamped for `after_ms=`
+                            let (h_class, h_recoverable) = halt_class(tok); let h_proxy = crate::hidstall::is_proxy(h_class, e.reports, e.mps, { #[cfg(feature = "bt")] let r = self.bt_radio.is_some(); #[cfg(not(feature = "bt"))] let r = false; r }); crate::hidstall::note_halt(ep_i); // HIDSTALL (B485): the BT HID proxy told apart; the halt stamped for `after_ms=`
                             // Recover only the class §9.4.5 actually answers, only while budget remains, and
                             // only if the deferred-clear array has room. `n_clr` can reach `MAX_INT_EPS` only
                             // if every armed endpoint stalls in the SAME pass, in which case the last one is
