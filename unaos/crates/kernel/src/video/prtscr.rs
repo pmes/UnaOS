@@ -2561,7 +2561,7 @@ fn home_rel(p: &str) -> String {
 // `capture` does (compare-exchange), presents a request to `service`, and scores the one counted refusal.
 
 /// Register `tests prtscr` once (folded into `dir_fixture`'s first statement: the service pass that arms it).
-fn prtscr_fixture_arm() {
+pub fn prtscr_fixture_arm() {
     static ARMED: AtomicBool = AtomicBool::new(false);
     if !ARMED.swap(true, Ordering::AcqRel) {
         crate::tests::register("prtscr", prtscr_selftest);

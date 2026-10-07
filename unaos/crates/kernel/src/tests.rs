@@ -145,7 +145,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         return;
     }
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
-    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
+    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::smallfix7::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); #[cfg(target_arch = "x86_64")] crate::loaderstage::ensure_tests(); // LOADERSTALL (B490): `tests loader`. FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::shotmask::ensure_tests(); crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); crate::video::text::ensure_tests(); crate::video::metrics::ensure_tests(); // GLASSEYES (B343): `tests shot`. KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
@@ -576,6 +576,21 @@ fn boot_tags() -> alloc::string::String {
 
 /// SMALLFIX7 (B501): is `name` the fixture [`run`] is executing now? A hot-path fixture ([`defer_fast`]) runs its
 /// body only then — never inside another fixture's run, where its side effects (a held door) land on the wrong test.
-fn running_is(name: &str) -> bool {
+pub fn running_is(name: &str) -> bool {
     CUR.try_lock().map_or(false, |c| *c == name)
+}
+
+/// SMALLFIX7: did `TESTS: deferred=` print this boot?
+pub fn announced() -> bool {
+    ANNOUNCED.load(Ordering::Relaxed)
+}
+
+/// SMALLFIX7: the boot's counted verdict lines and their tags (`tests verdicts`' numbers).
+pub fn boot_verdicts() -> (u32, alloc::string::String) {
+    (BOOT_VERDICTS.load(Ordering::Relaxed), boot_tags())
+}
+
+/// SMALLFIX7: is a fixture registered by `name`?
+pub fn registered(name: &str) -> bool {
+    TABLE.lock().iter().flatten().any(|e| e.0 == name)
 }

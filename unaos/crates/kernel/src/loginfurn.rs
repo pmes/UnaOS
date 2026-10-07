@@ -209,6 +209,6 @@ fn take_item_credit() -> bool {
 const PREFILL_ROWS: usize = 48;
 
 /// Lines the console's prefill would replay if it opened now (0 when the ring is contended or empty).
-fn ring_tail_lines() -> usize {
+pub fn ring_tail_lines() -> usize {
     crate::boot_ring::tail(PREFILL_ROWS, 0).map_or(0, |t| t.lines)
 }

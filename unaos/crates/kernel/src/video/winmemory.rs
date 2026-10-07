@@ -365,3 +365,8 @@ pub fn keeps(mem: &Option<Mem>) -> bool {
         _ => false,
     }
 }
+
+/// SMALLFIX7: frame writes this boot (`tests smallfix7`'s `saves=`).
+pub fn saves() -> u32 {
+    SAVES.load(Ordering::Relaxed)
+}

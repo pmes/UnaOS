@@ -330,3 +330,5 @@ pub mod hidstall;
 pub mod loaderstage;
 // SMALLFIX6 (rmbp-ledger B495): `tests windowcap`, `tests smallfix6` — flight 26's small reds, read back. Tail statement.
 pub mod smallfix6;
+// SMALLFIX7 (rmbp-ledger B501): `tests smallfix7`, `tests prtscr` — flight 27's small reds. Tail statement.
+pub mod smallfix7;
