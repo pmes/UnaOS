@@ -1399,13 +1399,13 @@ fn route_line(path: &str, info: &audio_core::Info) {
 
 /// M3: open `path` the way `play-dec` does (`Decoder::open`, then a Matroska file's track) and return its facts —
 /// called ONLY from a task with a `DEC_STACK` stack (`soundopeners::open_task`), never from the shell.
-pub fn open_facts(path: &str) -> Result<(audio_core::Info, &'static str), String> {
+pub fn open_facts(path: &str) -> Result<audio_core::Info, String> {
     use audio_core::AudioDecoder;
     let opened = audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: String::from(path), off: 0 }));
     #[cfg(all(feature = "wc", feature = "videoplayer"))]
     let opened = opened.or_else(|e| crate::video::vplay::container_audio(path).map(audio_core::Decoder::from_source).ok_or(e));
     match opened {
-        Ok(d) => Ok((d.info(), route_via(path))),
+        Ok(d) => Ok(d.info()),
         Err(e) => Err(alloc::format!("{:?}", e)),
     }
 }
