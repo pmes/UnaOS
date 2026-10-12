@@ -117,24 +117,22 @@ mod tests {
         // Verify focus
         assert!(engine.focused_node.is_some(), "Field should be focused");
         
-        // Type text
+        // The click put the caret at the field's left edge; End moves it after the value, then type.
+        assert_eq!(engine.edit.caret, 0, "a click at the field's left edge puts the caret at 0");
+        engine.handle_event(crate::api::events::Event::KeyDown("End".to_string()));
         engine.handle_event(crate::api::events::Event::Text(" world".to_string()));
-        
-        // Verify text was added
+
+        // The typed text is the field's (dirty) VALUE; the `value` attribute stays the default.
         {
             let focused_node = engine.focused_node.as_ref().unwrap();
+            assert_eq!(forms::control_value(focused_node), "hello world");
             let el = focused_node.as_element().unwrap();
-            assert_eq!(el.attributes.borrow().get("value"), Some("hello world"));
+            assert_eq!(el.attributes.borrow().get("value"), Some("hello"), "the default value is untouched");
         }
-        
+
         // Backspace
         engine.handle_event(crate::api::events::Event::KeyDown("BackSpace".to_string()));
-        
-        {
-            let focused_node = engine.focused_node.as_ref().unwrap();
-            let el = focused_node.as_element().unwrap();
-            assert_eq!(el.attributes.borrow().get("value"), Some("hello worl"));
-        }
+        assert_eq!(forms::control_value(engine.focused_node.as_ref().unwrap()), "hello worl");
         
         // Enter stages the form submission (the shell performs it async —
         // blocking on the engine thread killed it on current-thread runtimes).
@@ -2680,5 +2678,284 @@ mod tests {
         assert_eq!(marker_text(7, 1994), "mcmxciv. ");
         assert_eq!(marker_text(8, 4), "IV. ");
         assert_eq!(marker_text(9, 7), "07. ");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // AETHERINPUT (SR68): the editing model, mouse submission, checkable controls, keyboard scrolling.
+    // ---------------------------------------------------------------------------------------------
+
+    fn dom_by_id(engine: &crate::AetherEngine, id: &str) -> crate::dom::NodeRef {
+        engine
+            .document
+            .as_ref()
+            .unwrap()
+            .descendants()
+            .find(|n| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some(id)))
+            .unwrap_or_else(|| panic!("#{id}"))
+    }
+
+    /// A click (MouseDown + MouseUp) at the centre of `#id`'s box, in viewport coordinates.
+    fn click_id(engine: &mut crate::AetherEngine, id: &str) {
+        let n = dom_by_id(engine, id);
+        let (x, y, w, h) = engine.box_of(&n).expect("box");
+        let (cx, cy) = ((x + w / 2.0) as f64 - engine.scroll_x, (y + h / 2.0) as f64 - engine.scroll_y);
+        engine.handle_event(crate::api::events::Event::MouseDown(cx, cy));
+        engine.handle_event(crate::api::events::Event::MouseUp(cx, cy));
+    }
+
+    fn key(engine: &mut crate::AetherEngine, k: &str) {
+        engine.handle_event(crate::api::events::Event::KeyDown(k.to_string()));
+    }
+
+    /// Caret movement is by grapheme cluster: a combining sequence, an emoji ZWJ sequence and a flag
+    /// are each ONE step; Backspace removes a combining mark alone (Blink's BackspaceStateMachine) but
+    /// an emoji sequence whole; Delete removes the next whole cluster.
+    #[test]
+    fn edit_caret_moves_by_grapheme_kat() {
+        use forms::edit::EditState;
+        // "e" + COMBINING ACUTE, a family (man ZWJ woman ZWJ girl), the flag of Norway, "x"
+        let t0 = "e\u{301}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{1F1F3}\u{1F1F4}x";
+        let mut t = t0.to_string();
+        let mut e = EditState::at(0);
+        let stops: Vec<usize> = (0..5)
+            .map(|_| {
+                e.key(&mut t, "Right", false);
+                e.caret
+            })
+            .collect();
+        assert_eq!(stops, vec![3, 3 + 18, 3 + 18 + 8, 3 + 18 + 8 + 1, 30], "one Right per cluster");
+        assert_eq!(t, t0, "moving never edits");
+        e.key(&mut t, "Left", false);
+        e.key(&mut t, "Left", false);
+        assert_eq!(e.caret, 21, "Left steps back over the flag whole");
+        // Backspace before the flag removes the WHOLE family sequence
+        e.key(&mut t, "BackSpace", false);
+        assert_eq!(t, "e\u{301}\u{1F1F3}\u{1F1F4}x");
+        assert_eq!(e.caret, 3);
+        // Backspace after "é" (decomposed) removes only the accent
+        e.key(&mut t, "BackSpace", false);
+        assert_eq!(t, "e\u{1F1F3}\u{1F1F4}x");
+        // Delete removes the next whole cluster (the flag)
+        e.key(&mut t, "Delete", false);
+        assert_eq!(t, "ex");
+        assert_eq!(e.caret, 1);
+        // a caret set inside a cluster snaps to its start before it moves
+        let mut t = "a\u{1F468}\u{200D}\u{1F469}b".to_string();
+        let mut e = EditState::at(3);
+        e.key(&mut t, "Right", false);
+        assert_eq!(e.caret, t.len() - 1, "snapped to the cluster start, then stepped over it");
+    }
+
+    /// Mid-string insertion and deletion, Shift selection, word moves, Home/End, Ctrl+A, and the
+    /// textarea's logical-line keys.
+    #[test]
+    fn edit_insert_delete_select_words_kat() {
+        use forms::edit::{EditState, Outcome};
+        let mut t = "hello world".to_string();
+        let mut e = EditState::at(5);
+        e.insert(&mut t, ",");
+        assert_eq!((t.as_str(), e.caret), ("hello, world", 6));
+        assert_eq!(e.key(&mut t, "Ctrl+Right", false), Outcome::Moved);
+        assert_eq!(e.caret, 12, "Unix Ctrl+Right stops at the word's END");
+        e.key(&mut t, "Ctrl+Left", false);
+        assert_eq!(e.caret, 7, "Ctrl+Left goes to the word's start");
+        e.key(&mut t, "Alt+Left", false);
+        assert_eq!(e.caret, 0, "Alt is a word move too, over the comma and space");
+        e.key(&mut t, "Shift+End", false);
+        assert_eq!(e.selection(), (0, 12));
+        e.key(&mut t, "Left", false);
+        assert_eq!((e.caret, e.has_selection()), (0, false), "Left collapses to the selection start");
+        e.key(&mut t, "Shift+Ctrl+Right", false);
+        e.insert(&mut t, "HELLO");
+        assert_eq!(t, "HELLO, world", "typing replaces the selection");
+        e.key(&mut t, "Ctrl+a", false);
+        e.key(&mut t, "Delete", false);
+        assert_eq!((t.as_str(), e.caret), ("", 0), "Ctrl+A then Delete empties the field");
+        assert_eq!(e.key(&mut t, "BackSpace", false), Outcome::Consumed, "Backspace at 0 is a no-op");
+        // Ctrl+Backspace deletes the word before the caret
+        let mut t = "one two three".to_string();
+        let mut e = EditState::at(t.len());
+        e.key(&mut t, "Ctrl+BackSpace", false);
+        assert_eq!(t, "one two ");
+        // textarea: Return inserts LF; Home/End are the logical line's; Up/Down keep the column
+        let mut t = "ab\ncdef".to_string();
+        let mut e = EditState::at(t.len());
+        e.key(&mut t, "Home", true);
+        assert_eq!(e.caret, 3);
+        e.key(&mut t, "Right", true);
+        e.key(&mut t, "Right", true);
+        e.key(&mut t, "Up", true);
+        assert_eq!(e.caret, 2, "column 2 of line 0 (its end)");
+        e.key(&mut t, "Down", true);
+        assert_eq!(e.caret, 5);
+        assert_eq!(e.key(&mut t, "Return", true), Outcome::Edited);
+        assert_eq!(t, "ab\ncd\nef");
+        let mut one = "x".to_string();
+        assert_eq!(EditState::at(1).key(&mut one, "Return", false), Outcome::Submit, "Return submits a single-line field");
+        assert_eq!(forms::edit::sanitize_insert("a\r\nb\rc", true), "a\nb\nc");
+        assert_eq!(forms::edit::sanitize_insert("a\r\nb\nc", false), "abc");
+    }
+
+    /// The engine end to end: a textarea takes typing (it did not: Text gated on <input>), a mid-string
+    /// insert after arrow moves, multi-line paste; an input's paste strips line breaks; Return in a
+    /// textarea is a newline, not a submit; the submission carries both values CRLF-normalized.
+    #[test]
+    fn edit_engine_textarea_typing_and_paste() {
+        let html = r#"<html><body><form action="/s" method="get">
+            <input id="i" name="i" value="ab">
+            <textarea id="t" name="t" rows="3" cols="20">xy</textarea>
+            <input type="submit" id="go" name="go" value="Go">
+        </form></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://example.com/p", html, true);
+        engine.render_frame();
+        click_id(&mut engine, "t");
+        let t = dom_by_id(&engine, "t");
+        assert_eq!(engine.focused_node.as_ref(), Some(&t));
+        key(&mut engine, "Ctrl+End");
+        engine.handle_event(crate::api::events::Event::Text("z".into()));
+        key(&mut engine, "Left");
+        key(&mut engine, "Left");
+        engine.handle_event(crate::api::events::Event::Text("-".into()));
+        assert_eq!(forms::control_value(&t), "x-yz", "typed mid-string in a textarea");
+        key(&mut engine, "Ctrl+End");
+        key(&mut engine, "Return");
+        assert!(engine.take_pending_nav().is_none(), "Return in a textarea does not submit");
+        engine.paste("one\r\ntwo");
+        assert_eq!(forms::control_value(&t), "x-yz\none\ntwo");
+        assert_eq!(engine.edit.caret, "x-yz\none\ntwo".len());
+        // the input: paste strips line breaks, Return submits through the default button
+        click_id(&mut engine, "i");
+        key(&mut engine, "End");
+        engine.paste("c\nd");
+        assert_eq!(forms::control_value(&dom_by_id(&engine, "i")), "abcd");
+        key(&mut engine, "Return");
+        let nav = engine.take_pending_nav().expect("Return submits");
+        assert_eq!(nav.url, "https://example.com/s?i=abcd&t=x-yz%0D%0Aone%0D%0Atwo&go=Go", "the default button is the submitter");
+        // painting: the focused field shows a caret column in its text colour
+        engine.damage_rects.push((0, 0, engine.width, engine.height));
+        engine.render_frame();
+    }
+
+    /// A click on a submit button submits with the button as the submitter; checkboxes and radios
+    /// toggle on click, radios exclusively, and only checked ones submit; a click on a label activates
+    /// its control; `formmethod`/`formenctype` on the submitter win.
+    #[test]
+    fn click_submits_and_toggles_checkables() {
+        let html = r#"<html><body><form action="/go" method="get">
+            <input type="checkbox" id="c" name="c">
+            <input type="checkbox" id="d" name="d" value="dv" checked>
+            <input type="radio" id="r1" name="r" value="1" checked>
+            <input type="radio" id="r2" name="r" value="2">
+            <label id="lab" for="c">tick c</label>
+            <select name="s"><option>A</option><option value="bee" selected>B</option></select>
+            <button id="b" name="act" value="save">Save</button>
+            <button id="p" name="act" value="post" formmethod="post" formenctype="text/plain">Post</button>
+            <button type="button" id="nb">Nothing</button>
+        </form></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://example.com/x/y", html, true);
+        engine.render_frame();
+        let (c, d, r1, r2) = (dom_by_id(&engine, "c"), dom_by_id(&engine, "d"), dom_by_id(&engine, "r1"), dom_by_id(&engine, "r2"));
+        assert!(!forms::checkedness(&c) && forms::checkedness(&d));
+        click_id(&mut engine, "c");
+        click_id(&mut engine, "d");
+        click_id(&mut engine, "r2");
+        assert!(forms::checkedness(&c), "click checks");
+        assert!(!forms::checkedness(&d), "click unchecks");
+        assert!(forms::checkedness(&r2) && !forms::checkedness(&r1), "a radio group is exclusive");
+        assert!(d.as_element().unwrap().attributes.borrow().get("checked").is_some(), "the attribute stays the default");
+        click_id(&mut engine, "nb");
+        assert!(engine.take_pending_nav().is_none(), "a type=button button does not submit");
+        click_id(&mut engine, "b");
+        let nav = engine.take_pending_nav().expect("the submit button submits");
+        assert_eq!(nav.url, "https://example.com/go?c=on&r=2&s=bee&act=save");
+        click_id(&mut engine, "lab");
+        assert!(!forms::checkedness(&c), "a label click toggles its control");
+        click_id(&mut engine, "p");
+        let nav = engine.take_pending_nav().expect("post");
+        assert_eq!(nav.method, forms::HttpMethod::Post);
+        assert_eq!(nav.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(nav.body.as_deref(), Some("r=2\r\ns=bee\r\nact=post\r\n"));
+    }
+
+    /// A `submit` listener that cancels keeps the page (a scripted form submits itself).
+    #[test]
+    fn canceled_submit_event_stages_no_navigation() {
+        let html = r#"<html><body><form id="f" action="/go"><input name="q" value="1"><button id="b">Go</button></form>
+            <script>document.getElementById('f').addEventListener('submit', function (e) { e.preventDefault(); document.title = 'handled'; });</script>
+            </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        click_id(&mut engine, "b");
+        assert!(engine.take_pending_nav().is_none(), "preventDefault on submit cancels the navigation");
+        let f = dom_by_id(&engine, "f");
+        assert!(f.as_element().unwrap().attributes.borrow().get("data-aether-submitting").is_none(), "no tag left behind");
+    }
+
+    /// Keyboard scrolling is the engine's: Space / Page Down move 87.5 % of the viewport, Down 40 px,
+    /// Shift+Space and Page Up back, End to the bottom, Home to the top — and none of it while a text
+    /// field holds the keys. `autofocus` focuses on load with the caret at 0.
+    #[test]
+    fn keys_scroll_the_page_unless_a_field_is_focused() {
+        let html = r#"<html><body style="margin:0"><input id="f" autofocus value="abc"><div style="height:5000px"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let f = dom_by_id(&engine, "f");
+        assert_eq!(engine.focused_node.as_ref(), Some(&f), "autofocus");
+        assert_eq!(engine.edit.caret, 0, "Chromium's autofocus caret is at 0");
+        key(&mut engine, "space");
+        key(&mut engine, "Page_Down");
+        assert_eq!(engine.scroll_y, 0.0, "a focused field keeps Space and Page Down");
+        // blur by clicking the empty page below the field
+        engine.handle_event(crate::api::events::Event::MouseUp(400.0, 300.0));
+        assert!(engine.focused_node.is_none(), "a click outside a control blurs");
+        key(&mut engine, "space");
+        assert_eq!(engine.scroll_y, 525.0);
+        key(&mut engine, "Page_Down");
+        assert_eq!(engine.scroll_y, 1050.0);
+        key(&mut engine, "Down");
+        assert_eq!(engine.scroll_y, 1090.0);
+        key(&mut engine, "Shift+space");
+        assert_eq!(engine.scroll_y, 565.0);
+        key(&mut engine, "Up");
+        key(&mut engine, "Page_Up");
+        assert_eq!(engine.scroll_y, 0.0);
+        key(&mut engine, "End");
+        let max = engine.scroll_y;
+        assert!(max >= 5000.0 - 600.0, "End reaches the bottom: {max}");
+        key(&mut engine, "Home");
+        assert_eq!(engine.scroll_y, 0.0);
+    }
+
+    /// The focused field paints a caret: one column of the text colour at the caret's x, gone in the
+    /// blink's off phase; a focused field also carries the 2px #101010 focus ring.
+    #[test]
+    fn focused_field_paints_caret_and_ring() {
+        let html = r#"<html><body style="margin:0"><input id="f" autofocus style="margin:10px" value=""></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(200, 60));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let f = dom_by_id(&engine, "f");
+        let (x, y, w, h) = engine.box_of(&f).unwrap();
+        let px = |e: &crate::AetherEngine, px: u32, py: u32| {
+            let i = ((py * e.width + px) * 4) as usize;
+            (e.surface[i + 2], e.surface[i + 1], e.surface[i])
+        };
+        assert_eq!(px(&engine, x as u32, (y + h / 2.0) as u32), (16, 16, 16), "focus ring on the left edge");
+        // the caret column: the first dark column inside the content box at mid-height
+        let mid = (y + h / 2.0) as u32;
+        let dark: Vec<u32> = ((x as u32 + 2)..((x + w) as u32 - 2)).filter(|&cx| px(&engine, cx, mid).0 < 60).collect();
+        assert_eq!(dark.len(), 1, "exactly one caret column in an empty field: {dark:?}");
+        // off phase: no caret
+        engine.caret_on_for_test(false);
+        engine.damage_rects.push((0, 0, engine.width, engine.height));
+        engine.render_frame();
+        let dark = ((x as u32 + 2)..((x + w) as u32 - 2)).filter(|&cx| px(&engine, cx, mid).0 < 60).count();
+        assert_eq!(dark, 0, "the blink's off phase paints no caret");
     }
 }

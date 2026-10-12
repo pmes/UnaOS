@@ -103,6 +103,120 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
     }
 }
 
+/// The inherited paint state at the root of the box tree (the UA's initial values).
+fn root_inherited() -> Inherited {
+    Inherited {
+        color: (0, 0, 0),
+        font_size: 16.0,
+        weight: 400,
+        italic: false,
+        stretch: 100,
+        word_spacing: 0.0,
+        rtl: false,
+        text_shadow: None,
+        line_height: 0.0, // natural
+        underline: false,
+        nowrap: false,
+        white_space: 0,
+        word_break: 0,
+        overflow_wrap: 0,
+        letter_spacing: 0.0,
+        line_through: false,
+        shift_y: 0.0,
+        list_style: 1,
+        family: crate::fonts::STANDARD, // the default standard font (Times New Roman)
+        text_hidden: false,
+        text_transform: 0,
+        center_box: None,
+    }
+}
+
+/// The Advancer a form control's value is painted with: the inherited font state along the box
+/// tree's path from the root to `id` (the engine hit-tests a click into a field's text on it).
+pub fn control_advancer(layout: &LayoutTree, id: NodeId) -> Option<Advancer> {
+    let mut path = vec![id];
+    let mut n = layout.taffy.parent(id);
+    while let Some(p) = n {
+        path.push(p);
+        n = layout.taffy.parent(p);
+    }
+    let mut inh = root_inherited();
+    for p in path.into_iter().rev() {
+        if let Some(dn) = layout.node_map.get(&p) {
+            if let Some(el) = dn.as_element() {
+                let spec = layout.paint_map.get(&p).cloned().unwrap_or_default();
+                inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn, p);
+            }
+        }
+    }
+    Some(inh.advancer())
+}
+
+/// The focused text control's editing state, as the engine hands it to paint (AETHERINPUT, SR68): the
+/// control, its caret and selection anchor (byte offsets into its value, on grapheme boundaries), and
+/// whether the blinking caret is in its visible phase.
+#[derive(Clone, Debug)]
+pub struct FocusPaint {
+    pub node: crate::dom::NodeRef,
+    pub caret: usize,
+    pub anchor: usize,
+    pub caret_visible: bool,
+}
+
+/// A focused field's selection highlight: Chromium's default active selection colour, translucent so the
+/// glyphs over it keep their own colour.
+const SELECTION_BG: (u8, u8, u8) = (0x33, 0x90, 0xFF);
+const SELECTION_ALPHA: u8 = 102;
+
+thread_local! {
+    static FOCUS: std::cell::RefCell<Option<FocusPaint>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets (or clears) the focused text control the next frames paint a caret and selection in.
+pub fn set_focus(f: Option<FocusPaint>) {
+    FOCUS.with(|c| *c.borrow_mut() = f);
+}
+
+fn focus_of(node: &crate::dom::NodeRef) -> Option<FocusPaint> {
+    FOCUS.with(|c| c.borrow().as_ref().filter(|f| &f.node == node).cloned())
+}
+
+/// Fills the screen rect [x0, x1) x [y0, y1) with `color` at `alpha`, inside the damage and the clip.
+#[allow(clippy::too_many_arguments)]
+fn fill_rect(
+    x0: f32, y0: f32, x1: f32, y1: f32, color: (u8, u8, u8), alpha: u8,
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    let (xa, ya) = (x0.max(0.0) as u32, y0.max(0.0) as u32);
+    let (xb, yb) = ((x1.max(0.0) as u32).min(width), (y1.max(0.0) as u32).min(height));
+    for y in ya..yb {
+        for x in xa..xb {
+            if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
+                if alpha == 255 {
+                    put_px(surface, width, x, y, color);
+                } else {
+                    blend_px(surface, width, x, y, color, alpha);
+                }
+            }
+        }
+    }
+}
+
+/// Where the caret before byte `idx` of a textarea's value sits: (line index, x from the content box's
+/// left), on the same pre-wrap line breaking the value is painted with.
+fn textarea_caret(text: &str, idx: usize, adv: &Advancer, max_w: f32, mode: &crate::fonts::lines::TextMode) -> (usize, f32) {
+    let prefix = &text[..idx.min(text.len())];
+    let breaks = |s: &str| if s.is_empty() { Vec::new() } else { crate::fonts::lines::break_lines(adv, s, mode, max_w) };
+    let mut segs: Vec<&str> = prefix.split('\n').collect();
+    let cur = segs.pop().unwrap_or("");
+    let above: usize = segs.iter().map(|l| breaks(l).len().max(1)).sum();
+    let ls = breaks(cur);
+    match ls.last() {
+        Some(last) => (above + ls.len() - 1, adv.str(&last.text)),
+        None => (above, 0.0),
+    }
+}
+
 /// Draws `text` shaped (font_core: bidi, fallback, kerning, ligatures) with its pen at
 /// (`origin_x`, `baseline_y`), glyphs at quarter-pixel x phases through Skia's A8 pre-blend for `color`
 /// (fonts::raster). Returns the advance drawn.
@@ -836,7 +950,7 @@ fn paint_checkable(
         return;
     }
     boxpaint::paint(x, y, w, h, r, [None; 4], Some(blue), width, height, &mut blend_at);
-    // The tick: (3, 6.5) -> (5.5, 9) -> (10, 4) in the 13px box, 1.5px thick.
+    // The tick: (3, 6.7) -> (5.4, 9.4) -> (10.3, 3) in the 13px box (fitted to Chromium's 1x pixels).
     let seg = |p: (f32, f32), q: (f32, f32), blend: &mut dyn FnMut(u32, u32, (u8, u8, u8), f32)| {
         let (x0, y0, x1, y1) = (x + p.0 * w / 13.0, y + p.1 * h / 13.0, x + q.0 * w / 13.0, y + q.1 * h / 13.0);
         let (minx, maxx) = (x0.min(x1).floor() - 1.0, x0.max(x1).ceil() + 1.0);
@@ -860,8 +974,8 @@ fn paint_checkable(
             yy += 1.0;
         }
     };
-    seg((3.0, 6.5), (5.5, 9.0), &mut blend_at);
-    seg((5.5, 9.0), (10.0, 4.0), &mut blend_at);
+    seg((3.0, 6.7), (5.4, 9.4), &mut blend_at);
+    seg((5.4, 9.4), (10.3, 3.0), &mut blend_at);
 }
 
 /// Single-line advance width of `text`, measured EXACTLY the way `draw_text`
@@ -1788,41 +1902,75 @@ pub fn render_frame(
                 }
 
                 if checkable {
-                    let checked = el.attributes.borrow().get("checked").is_some();
+                    // Checkedness, not the attribute: a click (or script) toggles the dirty
+                    // checkedness and the `checked` attribute stays the default (HTML §4.10.5.1.15).
+                    let checked = crate::forms::checkedness(dom_node);
                     let radio = kind == Some(crate::layout::Control::Radio);
                     paint_checkable(box_sx, box_sy, bw, bh, radio, checked, surface, width, height, damage_rects, clip);
                 }
                 if kind == Some(crate::layout::Control::Select) {
-                    // The drop-down arrow: a 2px chevron 9px wide, centred
-                    // vertically, its right end 8px inside the right edge.
-                    let cx = box_sx + bw - 8.0 - 4.5;
-                    let cy = box_sy + bh / 2.0;
-                    for i in 0..=8 {
-                        let dx = i as f32 - 4.0;
-                        let y = cy - 2.0 + (4.0 - dx.abs());
-                        for t in 0..2 {
-                            let (x, yy) = ((cx + dx).round(), (y + t as f32).round());
-                            if x >= 0.0 && yy >= 0.0 && (x as u32) < width && (yy as u32) < height {
-                                let (xu, yu) = (x as u32, yy as u32);
-                                if in_damage(xu, yu, damage_rects) && in_clip(xu, yu, clip) {
-                                    put_px(surface, width, xu, yu, (0, 0, 0));
-                                }
+                    // The drop-down arrow: Chromium's menulist chevron, pixel for pixel (its ink
+                    // coverage as rendered at 1x), its last column 4px inside the right border and
+                    // its middle row on the box's middle row.
+                    const ARROW: [[u8; 10]; 7] = [
+                        [255, 141, 231, 255, 255, 255, 255, 231, 143, 255],
+                        [150, 0, 36, 230, 255, 255, 230, 36, 0, 154],
+                        [231, 32, 0, 36, 231, 231, 36, 0, 36, 231],
+                        [255, 227, 35, 0, 33, 33, 0, 35, 230, 255],
+                        [255, 255, 226, 33, 0, 0, 35, 227, 255, 255],
+                        [255, 255, 255, 227, 28, 32, 227, 255, 255, 255],
+                        [255, 255, 255, 255, 222, 226, 255, 255, 255, 255],
+                    ];
+                    let right = (box_sx + bw).round() - 1.0;
+                    let x0 = right - 13.0;
+                    let y0 = (box_sy.round() + ((bh.round() - 1.0) / 2.0).floor()) - 3.0;
+                    let ink = spec.color.unwrap_or((0, 0, 0));
+                    for (r, row) in ARROW.iter().enumerate() {
+                        for (c, &v) in row.iter().enumerate() {
+                            let (x, y) = (x0 + c as f32, y0 + r as f32);
+                            if v == 255 || x < 0.0 || y < 0.0 || x as u32 >= width || y as u32 >= height {
+                                continue;
+                            }
+                            let (xu, yu) = (x as u32, y as u32);
+                            if in_damage(xu, yu, damage_rects) && in_clip(xu, yu, clip) {
+                                blend_px(surface, width, xu, yu, ink, 255 - v);
                             }
                         }
                     }
                 }
                 if tag == "textarea" {
-                    // The value: the element's text, pre-wrap, from the
-                    // content box's top-left, in the monospace control font.
-                    let text = dom_node.text_contents();
-                    let fs = inherited.font_size;
-                    let _ = fs;
+                    // The value (the dirty value the user typed, else the element's text), pre-wrap,
+                    // from the content box's top-left, in the monospace control font.
+                    let text = crate::forms::control_value(dom_node);
                     let mode = crate::fonts::lines::TextMode { white_space: 3, ..Default::default() };
+                    let adv = inherited.advancer();
+                    let color = spec.color.unwrap_or((0, 0, 0));
+                    let focus = focus_of(dom_node);
+                    let lh = crate::fonts::face(&adv.sel).map(|f| crate::fonts::line_height(f, adv.size, 0.0)).unwrap_or(adv.size * 1.2);
+                    let max_w = content_w.max(1.0);
+                    if let Some(f) = focus.as_ref().filter(|f| f.caret != f.anchor) {
+                        // The selection: one band per visual line it covers.
+                        let (a, b) = (f.caret.min(f.anchor), f.caret.max(f.anchor));
+                        let (la, xa) = textarea_caret(&text, a, &adv, max_w, &mode);
+                        let (lb, xb) = textarea_caret(&text, b, &adv, max_w, &mode);
+                        for l in la..=lb {
+                            let x0 = if l == la { xa } else { 0.0 };
+                            let x1 = if l == lb { xb } else { content_w };
+                            let y0 = content_y + l as f32 * lh;
+                            fill_rect(content_x + x0, y0, content_x + x1, y0 + lh, SELECTION_BG, SELECTION_ALPHA, surface, width, height, damage_rects, clip);
+                        }
+                    }
                     draw_lines(
-                        text.trim_start_matches('\n'), content_x, content_y, content_w.max(1.0), &inherited.advancer(),
-                        0.0, spec.color.unwrap_or((0, 0, 0)), &mode, Deco::default(), &[],
+                        &text, content_x, content_y, max_w, &adv,
+                        0.0, color, &mode, Deco::default(), &[],
                         surface, width, height, damage_rects, clip,
                     );
+                    if let Some(f) = focus.filter(|f| f.caret_visible) {
+                        let (l, x) = textarea_caret(&text, f.caret, &adv, max_w, &mode);
+                        let cx = (content_x + x).floor().min(content_x + content_w - 1.0);
+                        let cy = content_y + l as f32 * lh;
+                        fill_rect(cx, cy, cx + 1.0, cy + lh, color, 255, surface, width, height, damage_rects, clip);
+                    }
                 }
                 if is_control && tag != "button" && !checkable && tag != "textarea" {
                     let face = crate::fonts::face(&inherited.sel());
@@ -1855,8 +2003,10 @@ pub fn render_frame(
                         // Field text is black (FieldText), a placeholder
                         // #757575 (html.css ::placeholder darkGray).
                         let value_color = if is_placeholder { (117, 117, 117) } else { spec.color.unwrap_or((0, 0, 0)) };
-                        if !value.is_empty() {
-                            let fs = inherited.font_size;
+                        let fs = inherited.font_size;
+                        let is_field = kind == Some(crate::layout::Control::Field);
+                        let focus = if is_field { focus_of(dom_node) } else { None };
+                        if !value.is_empty() || focus.is_some() {
                             let text_w = measure_text_width(&value, &adv);
                             // <input>/<select> are single-line by definition —
                             // their value rides the vertical middle however
@@ -1864,6 +2014,7 @@ pub fn render_frame(
                             // native fields do. A <textarea> is a multi-line
                             // edit surface: its text starts at the top.
                             let single_line = tag != "textarea" && content_h > 0.0;
+                            let lh = crate::fonts::line_height(font, fs, 0.0);
                             let (tx, ty, max_w) = if is_push_button && text_w <= content_w {
                                 (
                                     content_x + (content_w - text_w) / 2.0,
@@ -1873,7 +2024,6 @@ pub fn render_frame(
                             } else {
                                 // The value's line box is centred in the
                                 // content box (a single-line field).
-                                let lh = crate::fonts::line_height(font, fs, 0.0);
                                 let ty = if single_line {
                                     content_y + ((content_h - lh) / 2.0).floor()
                                 } else {
@@ -1882,25 +2032,77 @@ pub fn render_frame(
                                 let left = if tag == "select" { content_x + 4.0 } else { content_x };
                                 (left, ty, f32::MAX)
                             };
-                            draw_text(
-                                &value,
-                                tx,
-                                ty,
-                                max_w,
-                                &adv,
-                                0.0,
-                                value_color,
-                                false,
-                                surface,
-                                width,
-                                height,
-                                damage_rects,
-                                clip,
-                            );
+                            if is_field {
+                                // A text field's value keeps its spaces (white-space: pre, as the
+                                // inner editor's): the caret measures on exactly this run. A password
+                                // paints one bullet per character, so its caret counts characters.
+                                let real = if is_placeholder { String::new() } else { crate::forms::control_value(dom_node) };
+                                let x_at = |i: usize| -> f32 {
+                                    let i = i.min(real.len());
+                                    let prefix = if password { "\u{2022}".repeat(real[..i].chars().count()) } else { real[..i].to_string() };
+                                    tx + adv.str(&prefix)
+                                };
+                                if let Some(f) = focus.as_ref().filter(|f| f.caret != f.anchor && !is_placeholder) {
+                                    let (a, b) = (f.caret.min(f.anchor), f.caret.max(f.anchor));
+                                    fill_rect(x_at(a), ty, x_at(b), ty + lh, SELECTION_BG, SELECTION_ALPHA, surface, width, height, damage_rects, clip);
+                                }
+                                if !value.is_empty() {
+                                    let mode = crate::fonts::lines::TextMode { white_space: 2, ..Default::default() };
+                                    draw_lines(
+                                        &value, tx, ty, f32::MAX, &adv, 0.0, value_color, &mode, Deco::default(), &[],
+                                        surface, width, height, damage_rects, clip,
+                                    );
+                                }
+                                if let Some(f) = focus.filter(|f| f.caret_visible) {
+                                    let caret = if is_placeholder { 0 } else { f.caret };
+                                    let cx = x_at(caret).floor().min(content_x + content_w - 1.0).max(content_x);
+                                    let color = spec.color.unwrap_or((0, 0, 0));
+                                    fill_rect(cx, ty, cx + 1.0, ty + lh, color, 255, surface, width, height, damage_rects, clip);
+                                }
+                            } else {
+                                draw_text(
+                                    &value,
+                                    tx,
+                                    ty,
+                                    max_w,
+                                    &adv,
+                                    0.0,
+                                    value_color,
+                                    false,
+                                    surface,
+                                    width,
+                                    height,
+                                    damage_rects,
+                                    clip,
+                                );
+                            }
                         }
                     }
                 }
 
+                // A focused text field shows Chromium's focus ring (`:focus-visible` always matches a
+                // text field): 2px #101010 over the border box's outer edge.
+                let focused_field = is_control && focus_of(dom_node).is_some();
+                if focused_field {
+                    border = Some([Some((2.0, (16, 16, 16))); 4]);
+                }
+                // Chromium's control frame (fields, selects, textareas) is a rounded rect whose four
+                // corner pixels stay unpainted: keep what is under them.
+                let ua_frame = is_control && !checkable && !is_push_button && spec.border.is_none() && !focused_field;
+                let corners: Vec<(u32, u32, [u8; 4])> = if ua_frame {
+                    let (x0, y0) = (box_sx.round(), box_sy.round());
+                    let (x1, y1) = ((box_sx + bw).round() - 1.0, (box_sy + bh).round() - 1.0);
+                    [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+                        .into_iter()
+                        .filter(|&(x, y)| x >= 0.0 && y >= 0.0 && (x as u32) < width && (y as u32) < height)
+                        .map(|(x, y)| {
+                            let i = ((y as u32 * width + x as u32) * 4) as usize;
+                            (x as u32, y as u32, [surface[i], surface[i + 1], surface[i + 2], surface[i + 3]])
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 if let (true, Some(sides)) = (fancy, border) {
                     let styles = spec.border_style.unwrap_or([0; 4]);
                     let mut bs: [boxpaint::Side; 4] = [None; 4];
@@ -1971,6 +2173,30 @@ pub fn render_frame(
                     }
                     if let Some((w, c)) = sides[1].filter(|(w, _)| *w > 0.0) {
                         stroke(bx1 - px(w), by0, bx1, by1, c);
+                    }
+                }
+                for (x, y, p) in corners {
+                    if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
+                        let i = ((y * width + x) * 4) as usize;
+                        surface[i..i + 4].copy_from_slice(&p);
+                    }
+                }
+                if tag == "textarea" && ua_frame {
+                    // The resize grip: two #666 diagonals in the bottom-right corner of the padding box.
+                    let (ix, iy) = ((box_sx + bw).round() - 2.0, (box_sy + bh).round() - 2.0);
+                    let mut dot = |x: f32, y: f32| {
+                        if x >= 0.0 && y >= 0.0 && (x as u32) < width && (y as u32) < height {
+                            let (xu, yu) = (x as u32, y as u32);
+                            if in_damage(xu, yu, damage_rects) && in_clip(xu, yu, clip) {
+                                put_px(surface, width, xu, yu, (102, 102, 102));
+                            }
+                        }
+                    };
+                    for k in 0..7 {
+                        dot(ix - 1.0 - k as f32, iy - 7.0 + k as f32);
+                    }
+                    for k in 0..3 {
+                        dot(ix - 1.0 - k as f32, iy - 3.0 + k as f32);
                     }
                 }
                 // css-lists-3 §3.1: an outside ::marker for a list item,
@@ -2363,30 +2589,7 @@ pub fn render_frame(
         finish_round_clip(surface);
     }
 
-    let root_inherited = Inherited {
-        color: (0, 0, 0),
-        font_size: 16.0,
-        weight: 400,
-        italic: false,
-        stretch: 100,
-        word_spacing: 0.0,
-        rtl: false,
-        text_shadow: None,
-        line_height: 0.0, // natural
-        underline: false,
-        nowrap: false,
-        white_space: 0,
-        word_break: 0,
-        overflow_wrap: 0,
-        letter_spacing: 0.0,
-        line_through: false,
-        shift_y: 0.0,
-        list_style: 1,
-        family: crate::fonts::STANDARD, // the default standard font (Times New Roman)
-        text_hidden: false,
-        text_transform: 0,
-        center_box: None,
-    };
+    let root_inherited = root_inherited();
     draw_node(
         layout.root_node,
         0.0,

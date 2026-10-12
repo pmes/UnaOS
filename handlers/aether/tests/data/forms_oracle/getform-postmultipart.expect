@@ -1,0 +1,4 @@
+METHOD POST
+URL http://oracle.test/submit
+CONTENT-TYPE multipart/form-data; boundary=<B>
+BODY-BASE64 LS08Qj4NCkNvbnRlbnQtRGlzcG9zaXRpb246IGZvcm0tZGF0YTsgbmFtZT0iaSINCg0KYSBiDQotLTxCPg0KQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPSJ2Ig0KDQoyDQotLTxCPi0tDQo=

@@ -1,0 +1,4 @@
+METHOD GET
+URL http://oracle.test/submit?q=a+b%2Bc%2Fd%3Fe&c=on&s=Submit
+CONTENT-TYPE 
+BODY-BASE64 

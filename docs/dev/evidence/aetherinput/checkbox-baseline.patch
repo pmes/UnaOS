@@ -1,0 +1,16 @@
+diff --git a/handlers/aether/src/layout/inline.rs b/handlers/aether/src/layout/inline.rs
+index c9e7e7cb..217b948e 100644
+--- a/handlers/aether/src/layout/inline.rs
++++ b/handlers/aether/src/layout/inline.rs
+@@ -285,8 +285,9 @@ fn atomic_box(tree: &LayoutTree, ctx: &Ctx, id: NodeId, fallback: &TextRun) -> (
+     } else if matches!(t.as_deref(), Some("input" | "select" | "button" | "textarea")) {
+         let kind = tree.node_map.get(&id).and_then(super::control_kind);
+         if matches!(kind, Some(super::Control::Checkbox | super::Control::Radio)) {
+-            // Blink: a checkbox/radio's baseline is its bottom margin edge.
+-            h
++            // Blink: a checkbox/radio's baseline is its border-box bottom (its bottom margin hangs
++            // below the baseline) — measured against Chromium's 1x pixels (EYES 05-form/26-controls).
++            l.margin.top + l.size.height
+         } else {
+             let run = run_of(ctx, id, fallback);
+             let m = metrics(run);

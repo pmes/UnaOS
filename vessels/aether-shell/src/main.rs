@@ -239,6 +239,11 @@ fn main() {
                                 SMessage::BrowserText(text) => {
                                     engine.handle_event(aether::api::events::Event::Text(text));
                                 }
+                                // The platform clipboard's text (Ctrl/Cmd+V): inserted at the focused
+                                // field's caret, line breaks kept only in a textarea.
+                                SMessage::BrowserPaste(text) => {
+                                    engine.paste(&text);
+                                }
                                 _ => {}
                             }
                             // A link click or form submit staged a navigation;
@@ -257,8 +262,11 @@ fn main() {
                                     }
                                     aether::forms::HttpMethod::Post => {
                                         let body = nav.body.unwrap_or_default();
-                                        match aether::net::post_document(&nav.url, &body).await {
-                                            Ok(html) => engine.load_html(&nav.url, &html, true),
+                                        let ct = nav.content_type.as_deref().unwrap_or("application/x-www-form-urlencoded");
+                                        // The response document's URL is the FINAL one (a POST is
+                                        // usually answered 303 → a GET page).
+                                        match aether::net::post_document_typed(&nav.url, ct, &body).await {
+                                            Ok((html, final_url)) => engine.load_html(&final_url, &html, true),
                                             Err(e) => engine.load_error_page(&nav.url, &e.to_string()),
                                         }
                                     }

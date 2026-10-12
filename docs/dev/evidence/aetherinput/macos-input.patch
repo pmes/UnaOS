@@ -1,0 +1,78 @@
+--- a/libs/quartzite/src/platforms/macos/image_view.rs	2026-10-12 19:49:48.018451897 +0000
++++ b/libs/quartzite/src/platforms/macos/image_view.rs	2026-10-12 19:49:48.085061662 +0000
+@@ -329,21 +329,65 @@
+             let chars: Option<Retained<NSString>> =
+                 unsafe { msg_send![event, charactersIgnoringModifiers] };
+             let text = chars.map(|s| s.to_string()).unwrap_or_default();
+-            // Browser surface: keys are page input (focused field editing),
+-            // not viewer shortcuts.
++            // Browser surface: keys are page input (focused field editing, keyboard scrolling),
++            // not viewer shortcuts. AETHERINPUT (SR68): GDK keysym names with modifier prefixes,
++            // the engine's key vocabulary; Cmd+V pastes the general pasteboard's string.
+             if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
++                let flags: usize = unsafe { msg_send![event, modifierFlags] };
++                // NSEventModifierFlag: Shift 1<<17, Control 1<<18, Option 1<<19, Command 1<<20.
++                let (shift, ctrl, alt, cmd) =
++                    (flags & (1 << 17) != 0, flags & (1 << 18) != 0, flags & (1 << 19) != 0, flags & (1 << 20) != 0);
++                if cmd && text.eq_ignore_ascii_case("v") {
++                    let pb: *mut AnyObject = unsafe { msg_send![class!(NSPasteboard), generalPasteboard] };
++                    let ty = NSString::from_str("public.utf8-plain-text");
++                    let s: Option<Retained<NSString>> = unsafe { msg_send![pb, stringForType: &*ty] };
++                    if let Some(s) = s {
++                        syn.fire(bandy::SMessage::BrowserPaste(s.to_string()));
++                    }
++                    return;
++                }
++                // macOS word moves are Option+arrow; Cmd+Left/Right are Home/End, Cmd+Up/Down the
++                // document's ends.
+                 let mut it = text.chars();
+-                match (it.next(), it.next()) {
+-                    (Some('\u{7f}'), None) | (Some('\u{8}'), None) => {
+-                        syn.fire(bandy::SMessage::BrowserKey("BackSpace".into()));
++                let named = match (it.next(), it.next()) {
++                    (Some('\u{7f}'), None) | (Some('\u{8}'), None) => Some("BackSpace"),
++                    (Some('\r'), None) | (Some('\n'), None) | (Some('\u{3}'), None) => Some("Return"),
++                    (Some('\u{F702}'), None) => Some(if cmd { "Home" } else { "Left" }),
++                    (Some('\u{F703}'), None) => Some(if cmd { "End" } else { "Right" }),
++                    (Some('\u{F700}'), None) => Some(if cmd { "Home" } else { "Up" }),
++                    (Some('\u{F701}'), None) => Some(if cmd { "End" } else { "Down" }),
++                    (Some('\u{F728}'), None) => Some("Delete"),
++                    (Some('\u{F729}'), None) => Some("Home"),
++                    (Some('\u{F72B}'), None) => Some("End"),
++                    (Some('\u{F72C}'), None) => Some("Page_Up"),
++                    (Some('\u{F72D}'), None) => Some("Page_Down"),
++                    (Some(' '), None) => Some("space"),
++                    (Some('a'), None) | (Some('A'), None) if cmd => Some("a"),
++                    _ => None,
++                };
++                if let Some(k) = named {
++                    let up_down = matches!(text.chars().next(), Some('\u{F700}' | '\u{F701}'));
++                    let mut key = String::new();
++                    // Cmd+A selects all (the engine's Ctrl+A); Cmd+Up/Down reach the value's ends.
++                    if (cmd && k == "a") || (cmd && up_down) {
++                        key.push_str("Ctrl+");
+                     }
+-                    (Some('\r'), None) | (Some('\n'), None) => {
+-                        syn.fire(bandy::SMessage::BrowserKey("Return".into()));
++                    if ctrl {
++                        key.push_str("Ctrl+");
+                     }
+-                    (Some(c), _) if !c.is_control() => {
+-                        syn.fire(bandy::SMessage::BrowserText(text));
++                    if alt {
++                        key.push_str("Alt+");
+                     }
+-                    _ => {}
++                    if shift {
++                        key.push_str("Shift+");
++                    }
++                    key.push_str(k);
++                    syn.fire(bandy::SMessage::BrowserKey(key));
++                }
++                let typed: Option<Retained<NSString>> = unsafe { msg_send![event, characters] };
++                let typed = typed.map(|s| s.to_string()).unwrap_or_default();
++                if !cmd && !ctrl && typed.chars().next().is_some_and(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&c)) {
++                    syn.fire(bandy::SMessage::BrowserText(typed));
+                 }
+                 return;
+             }

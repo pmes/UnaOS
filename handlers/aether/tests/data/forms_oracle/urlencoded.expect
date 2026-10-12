@@ -1,0 +1,4 @@
+METHOD POST
+URL http://oracle.test/submit?old=1
+CONTENT-TYPE application/x-www-form-urlencoded
+BODY-BASE64 cT11bmErb3MrJTI2K21vcmUlM0R5ZXMrJUUyJTlDJTkzKyVDMyVBOSZfY2hhcnNldF89VVRGLTgmaD1oaWQrZGVuJmMxPW9uJmMzPXYzJnI9YiZzPTImbT14Jm09enomb2c9cStyJnQ9bGluZStvbmUlMEQlMEFsaW5lK3R3byZwdz1wJTQwc3Mrd29yZCZlbT1hJTQwYi5jJm51bT00MiZhY3Q9Z28rbm93

@@ -157,6 +157,9 @@ pub enum SMessage {
     BrowserResize(u32, u32),
     BrowserKey(String),
     BrowserText(String),
+    /// Chrome → engine: the platform clipboard's text, pasted at the focused field's caret (the shell
+    /// reads the clipboard on Ctrl/Cmd+V; AETHERINPUT, SR68).
+    BrowserPaste(String),
     /// Engine → chrome: the current document url changed (link click,
     /// back/forward, redirect); the address bar mirrors it.
     BrowserUrlChanged(String),
