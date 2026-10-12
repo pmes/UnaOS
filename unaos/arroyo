@@ -4330,6 +4330,8 @@ build_user_midden_x86() {
     user_elf_window_check "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF" "MIDDEN-X86.ELF"
     una_res_stamp "${WORKSPACE_DIR}/crates/user-midden" "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF"  # APPRES (B398): Midden's icon, name, signature, version
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Midden app: MIDDEN-X86.ELF${COLOR_RESET}"
+}
+
 # AETHERMETAL (LEDGER SR66): build AETHER.ELF — Aether, the browser, as ONE ring-3 program (crates/user-aether linking
 # html_core + css_core + font_core: parse, cascade, a CSS2 block + inline formatter, paint into one compositor
 # window). The build_user_lumen_x86 shape: linked at the ELF-window VA (user-aether-x86.ld, no PHDRS, 256 KiB stack
