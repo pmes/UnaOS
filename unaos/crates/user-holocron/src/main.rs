@@ -39,7 +39,8 @@ static HEAP: vein_ring3::heap::Heap = vein_ring3::heap::Heap::sbrk();
 //
 // WIRE. `:: HOLOCRON: serve ring=<unafs|none> verbs=8 owner=<user> state=<none|locked|unlocked> ::` (the
 // fulfiller), `[holocron] <verb> -> <status>` per verb, `[holocron] relay verb=<v> caller=<user|other> ->
-// <status>` per relayed request; a refusal `:: HOLOCRON: <why> -> refused ::`.
+// <status> medium_reads=<n> ms=<n>` per relayed request (LUMENFAST2, B515: 0 reads = the session cache answered);
+// a refusal `:: HOLOCRON: <why> -> refused ::`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -47,7 +48,7 @@ use holocron_core::cc::{CryptoCore, DrbgEntropy};
 use holocron_core::format::Meta;
 use holocron_core::frame;
 use holocron_core::seal::{EntropyError, KdfParams, SealError, Sealer, NONCE_LEN, SALT_LEN};
-use holocron_core::service::{Holocron, Store, StoreError};
+use holocron_core::service::{Holocron, SessionStore, Store, StoreError};
 use holocron_core::wire::{self, status, Request, RingState};
 use holocron_core::zero::Key;
 use una_abi::{
@@ -489,7 +490,7 @@ fn getrandom(b: &mut [u8]) -> isize {
 }
 
 type Rng = DrbgEntropy<crypto_core::drbg::GetrandomEntropy<fn(&mut [u8]) -> isize>>;
-type Svc = Holocron<MetalSealer, CryptoCore, PathStore, Rng>;
+type Svc = Holocron<MetalSealer, CryptoCore, SessionStore<PathStore>, Rng>; // LUMENFAST2 (B515): the session cache in front of UnaFS
 
 fn rng() -> Result<Rng, EntropyError> {
     let f: fn(&mut [u8]) -> isize = getrandom;
@@ -633,7 +634,9 @@ pub extern "C" fn _start() -> ! {
         write(b":: HOLOCRON: entropy=refused (SYS_GETRANDOM could not seed the DRBG) -> refused ::\n");
         exit(1);
     };
-    let mut svc: Svc = Holocron::new(MetalSealer, CryptoCore, store, rng, who.owner.clone(), METAL_KDF); // WINDOW2: rings the window can unlock in ring 3
+    // WINDOW2: rings the window can unlock in ring 3. LUMENFAST2 (B515): THIS process is the store's only writer while
+    // it serves, so it holds the sealed files for the session (`holocron_core::service::SessionStore`; wiped at lock).
+    let mut svc: Svc = Holocron::new(MetalSealer, CryptoCore, SessionStore::new(store), rng, who.owner.clone(), METAL_KDF);
     let me = Some(who.owner.as_str());
     if let Some(r) = &req {
         let mut a = svc.handle(me, r.verb(), &r.encode_body(), vein_ring3::sys::now_ms(), now_unix());
@@ -651,7 +654,7 @@ pub extern "C" fn _start() -> ! {
         2 => b" kdf=kernel(sys_kdf=used,legacy-ring)" as &[u8],
         _ => b" kdf=ring3 sys_kdf=unused",
     });
-    l.put(b" ::");
+    l.put(b" cache=session ::");
     l.wire();
     loop {
         let n = recv();
@@ -666,7 +669,9 @@ pub extern "C" fn _start() -> ! {
             continue; // replies to our own NOTICEs, and anything not Holocron's
         }
         let caller = frame::caller(&p);
+        let (t0, reads0) = (vein_ring3::sys::now_ms(), svc.store_mut().medium_reads());
         let mut a = svc.handle(caller, p.verb, p.body, vein_ring3::sys::now_ms(), now_unix());
+        let (ms, reads) = (vein_ring3::sys::now_ms().saturating_sub(t0), svc.store_mut().medium_reads() - reads0);
         let mut out = frame::reply(p.verb, p.corr, a.status, &a.body);
         let s = send(&out);
         holocron_core::zero::wipe(&mut a.body);
@@ -676,6 +681,7 @@ pub extern "C" fn _start() -> ! {
         if s != 0 {
             l.put(b" send=").dec(s);
         }
+        l.put(b" medium_reads=").dec(reads as i64).put(b" ms=").dec(ms as i64); // LUMENFAST2 (B515): 0 reads = answered from the session cache
         l.wire();
         r[..n as usize].fill(0);
     }
