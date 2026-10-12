@@ -63,6 +63,129 @@ pub trait Store {
     fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
         Err(StoreError)
     }
+    /// LUMENFAST2 (B515): drop anything the store holds in memory (a [`SessionStore`]'s cache), wiping it. The
+    /// service calls it at every lock and before every unlock, so a lock (and the next session's unlock) reads
+    /// the medium afresh. A store that caches nothing has nothing to forget.
+    fn forget(&mut self) {}
+}
+
+/// LUMENFAST2 (B515): the session cache in front of a [`Store`] — the SEALED bytes of the ring file and of every
+/// secret file read or written this session, and the "absent" answers, held in the secrets handler's own memory
+/// until [`Store::forget`] (every lock, every unlock) wipes them. On the metal a request used to re-read the ring
+/// file (each request's header re-check) and the secret file over SYS_PATH_READ, each call a fresh mount-table and
+/// UnaFS walk: flight 28's `key_holo_ms=901` was five of them, not a KDF (the login's one derivation already held
+/// the key — RINGLOGIN, B465). Behind this, a session's second request for a secret touches no medium.
+///
+/// Only the sealed bytes are cached: a plaintext still exists only for the one request that opens it, under the
+/// key the ring already holds. The rule this relies on is the metal's: the fulfiller that holds the cache is the
+/// store's ONLY writer while it runs (every mutating verb goes through it; a second `holocron` is its bus client),
+/// so every write passes through here and updates the cache. A file put behind its back (a restore by copy) is
+/// seen at the next lock/unlock. The host daemon, whose store other writers share, keeps reading the medium.
+pub struct SessionStore<T: Store> {
+    inner: T,
+    ring: Option<Option<Vec<u8>>>,
+    files: BTreeMap<(String, String), Option<Vec<u8>>>,
+    medium_reads: u64,
+}
+
+impl<T: Store> SessionStore<T> {
+    /// A cache in front of `inner`, empty.
+    pub fn new(inner: T) -> Self {
+        SessionStore { inner, ring: None, files: BTreeMap::new(), medium_reads: 0 }
+    }
+    /// The store behind the cache.
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+    /// Reads that went to the medium (ring + secret files; the witness and the host tests).
+    pub fn medium_reads(&self) -> u64 {
+        self.medium_reads
+    }
+    /// True when nothing is cached (after a [`Store::forget`]).
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_none() && self.files.is_empty()
+    }
+}
+
+fn wipe_opt(v: &mut Option<Vec<u8>>) {
+    if let Some(b) = v.as_mut() {
+        crate::zero::wipe(b);
+    }
+}
+
+impl<T: Store> Store for SessionStore<T> {
+    fn read_ring(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
+        if let Some(r) = &self.ring {
+            return Ok(r.clone());
+        }
+        self.medium_reads += 1;
+        let r = self.inner.read_ring()?;
+        self.ring = Some(r.clone());
+        Ok(r)
+    }
+    fn write_ring(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        if let Some(r) = self.ring.as_mut() {
+            wipe_opt(r);
+        }
+        self.ring = None; // a failed write leaves the medium unknown: the next read goes to it
+        self.inner.write_ring(bytes)?;
+        self.ring = Some(Some(bytes.to_vec()));
+        Ok(())
+    }
+    fn read(&mut self, ns: &str, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let k = (String::from(ns), String::from(name));
+        if let Some(f) = self.files.get(&k) {
+            return Ok(f.clone());
+        }
+        self.medium_reads += 1;
+        let f = self.inner.read(ns, name)?;
+        self.files.insert(k, f.clone());
+        Ok(f)
+    }
+    fn write(&mut self, ns: &str, name: &str, file: &[u8], meta: &Meta) -> Result<(), StoreError> {
+        let k = (String::from(ns), String::from(name));
+        if let Some(mut old) = self.files.remove(&k) {
+            wipe_opt(&mut old);
+        }
+        self.inner.write(ns, name, file, meta)?;
+        self.files.insert(k, Some(file.to_vec()));
+        Ok(())
+    }
+    fn list(&mut self, ns: &str) -> Result<Vec<String>, StoreError> {
+        self.inner.list(ns)
+    }
+    fn remove(&mut self, ns: &str, name: &str) -> Result<bool, StoreError> {
+        let k = (String::from(ns), String::from(name));
+        if let Some(mut old) = self.files.remove(&k) {
+            wipe_opt(&mut old);
+        }
+        let r = self.inner.remove(ns, name)?;
+        self.files.insert(k, None);
+        Ok(r)
+    }
+    fn remove_ring(&mut self) -> Result<bool, StoreError> {
+        if let Some(r) = self.ring.as_mut() {
+            wipe_opt(r);
+        }
+        self.ring = None;
+        let r = self.inner.remove_ring()?;
+        self.ring = Some(None);
+        Ok(r)
+    }
+    fn namespaces(&mut self) -> Result<Vec<String>, StoreError> {
+        self.inner.namespaces()
+    }
+    fn forget(&mut self) {
+        if let Some(r) = self.ring.as_mut() {
+            wipe_opt(r);
+        }
+        self.ring = None;
+        for (_, f) in self.files.iter_mut() {
+            wipe_opt(f);
+        }
+        self.files.clear();
+        self.inner.forget();
+    }
 }
 
 /// An in-memory store (tests; and the shape every other store mirrors).
@@ -203,6 +326,7 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
     /// Lock from the transport side (idle timer, session end, signal) — no caller check.
     pub fn lock_now(&mut self) {
         self.ring.lock();
+        self.store.forget(); // LUMENFAST2 (B515): the session cache goes with the key
     }
 
     /// True when the key is in memory.
@@ -261,6 +385,7 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
             }
             Request::Lock => {
                 self.ring.lock();
+                self.store.forget(); // LUMENFAST2 (B515)
                 Ok(Vec::new())
             }
             Request::Unlock { create, password } => self.unlock(*create, password, now_ms).map(|_| Vec::new()),
@@ -297,6 +422,7 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
         if self.limiter.check(now_ms).is_err() {
             return Err(status::RATE_LIMITED);
         }
+        self.store.forget(); // LUMENFAST2 (B515): an unlock reads the medium afresh
         let existing = self.store.read_ring().map_err(|_| status::IO)?;
         if create {
             if existing.is_some() {
@@ -330,6 +456,7 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
     /// is [`Holocron::handle`]'s Unlock: `EXISTS` when asked to create over a ring, `NO_RING` when asked to open
     /// none, `BAD_PASSWORD` when the key does not open the verifier (a ring made under another password).
     pub fn unlock_with_key(&mut self, create: bool, salt: [u8; crate::seal::SALT_LEN], params: KdfParams, key: crate::zero::Key) -> Result<(), i32> {
+        self.store.forget(); // LUMENFAST2 (B515): an unlock reads the medium afresh
         let existing = self.store.read_ring().map_err(|_| status::IO)?;
         if create {
             if existing.is_some() {

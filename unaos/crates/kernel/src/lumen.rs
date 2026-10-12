@@ -402,8 +402,14 @@ fn lumenux() {
 // come from the kernel's resident copy (`video::text::resident_read`, served through `SYS_PATH_READ`'s fulfiller)
 // and the APPRES sight runs before the spawn. This verb runs the LUMENCRASH spawn of the accepted image with a
 // ONE-second bound (operator-invoked, R80: never at boot) and reports what the faces cost the kernel.
-// WITNESS. `:: LUMENFAST: sight_ms=<n> spawn_ms=<n> first_line=<n|timeout|fault> font_served_kib=<n> -> PASS|FAIL :: bound_ms=1000`
-// (`font_served_kib` = resident face bytes served this boot; 0 after a Lumen start = the faces came off the volume).
+// LUMENFAST2 (B515): flight 28 judged the test's OWN cold path (`sight_ms=3139`, the image's first APPRES sight, and
+// Holocron's first read of the secret). The verb now spawns TWICE: the first is the cold start, reported
+// (`cold_sight_ms=`, `cold_first_line=`) and never judged; the second is the start a user's every later launch is
+// (the sight cached, Holocron's session cache warm) and its `first_line=` is judged against the bound. Lumen's own
+// `[lumen] first_line_ms= … key_holo_ms=` line precedes each verdict.
+// WITNESS. `:: LUMENFAST: cold_sight_ms=<n> cold_first_line=<n|timeout|fault> sight_ms=<n> spawn_ms=<n>
+// first_line=<n|timeout|fault> font_served_kib=<n> -> PASS|FAIL :: bound_ms=1000`
+// (`font_served_kib` = resident face bytes served during the judged start; 0 = the faces came off the volume).
 pub fn lumenfast() {
     const BOUND_MS: u64 = 1000;
     #[cfg(target_arch = "x86_64")]
@@ -412,16 +418,28 @@ pub fn lumenfast() {
             serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=not-spawned ::");
             return;
         };
+        let cold = match spawn_run(&img, 20_000) {
+            Err(e) => {
+                serial_println!(":: LUMENFAST: first_line=none -> FAIL reason=spawn-refused ({}) ::", e);
+                return;
+            }
+            Ok(r) => r,
+        };
+        let cl = match (cold.fault, cold.ok) {
+            (Some(_), _) => alloc::string::String::from("fault"),
+            (None, true) => alloc::format!("{}", cold.took),
+            (None, false) => alloc::string::String::from("timeout"),
+        };
         let served0 = resident_served();
         match spawn_run(&img, 20_000) {
-            Err(e) => serial_println!(":: LUMENFAST: first_line=none -> FAIL reason=spawn-refused ({}) ::", e),
+            Err(e) => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} first_line=none -> FAIL reason=spawn-refused ({}) ::", cold.sight_ms, cl, e),
             Ok(r) => {
                 let kib = resident_served().saturating_sub(served0) / 1024;
                 let pass = r.ok && r.took < BOUND_MS;
                 match r.fault {
-                    Some((vec, _)) => serial_println!(":: LUMENFAST: sight_ms={} spawn_ms={} first_line=fault vec={} font_served_kib={} -> FAIL :: bound_ms={}", r.sight_ms, r.spawn_ms, vec, kib, BOUND_MS),
-                    None if r.ok => serial_println!(":: LUMENFAST: sight_ms={} spawn_ms={} first_line={} font_served_kib={} -> {} :: bound_ms={}", r.sight_ms, r.spawn_ms, r.took, kib, if pass { "PASS" } else { "FAIL" }, BOUND_MS),
-                    None => serial_println!(":: LUMENFAST: sight_ms={} spawn_ms={} first_line=timeout font_served_kib={} -> FAIL :: bound_ms={}", r.sight_ms, r.spawn_ms, kib, BOUND_MS),
+                    Some((vec, _)) => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} sight_ms={} spawn_ms={} first_line=fault vec={} font_served_kib={} -> FAIL :: bound_ms={}", cold.sight_ms, cl, r.sight_ms, r.spawn_ms, vec, kib, BOUND_MS),
+                    None if r.ok => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} sight_ms={} spawn_ms={} first_line={} font_served_kib={} -> {} :: bound_ms={}", cold.sight_ms, cl, r.sight_ms, r.spawn_ms, r.took, kib, if pass { "PASS" } else { "FAIL" }, BOUND_MS),
+                    None => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} sight_ms={} spawn_ms={} first_line=timeout font_served_kib={} -> FAIL :: bound_ms={}", cold.sight_ms, cl, r.sight_ms, r.spawn_ms, kib, BOUND_MS),
                 }
             }
         }

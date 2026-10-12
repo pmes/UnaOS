@@ -1,0 +1,54 @@
+test name::tests::alphabet ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test identities_and_sign_through_the_agent ... ok
+test kat_blobs_and_frames ... ok
+test parse_requests ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test decode_refusals ... ok
+test kat_bodies_field_by_field ... ok
+test limiter_schedule_caps ... ok
+test principal_records ... ok
+test ring_of_another_owner_is_denied ... ok
+test states_and_statuses ... ok
+test unlock_rate_limit ... ok
+test reply_bodies ... ok
+test owner_only_before_decode ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test cc_signer_rfc8032_vectors ... ok
+test cc_agent_signs_rfc8032_test1 ... ok
+test cc_ring_round_trip_and_refusals ... ok
+test cc_entropy_failure_refuses_to_seal ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+test golden_secret_get_request ... ok
+test parser_refuses ... ok
+test relayed_request_through_the_service ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test another_ring_cannot_open ... ok
+test kat1_secret_header_encode ... ok
+test kat2_secret_header_parse ... ok
+test kat4_secret_parser_refusals ... ok
+test kat3_ring_header_encode_parse ... ok
+test kat5_ring_parser_refusals ... ok
+test limits ... ok
+test locked_ring_opens_nothing ... ok
+test ring_create_unlock_lock ... ok
+test ring_refuses_tampered_ring_file ... ok
+test secret_round_trip_and_binding ... ok
+test testsuite_pins ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test ringlogin_a_typed_init_ring_opens_with_the_login_key ... ok
+test ringlogin2_rekey_keeps_salt_and_secrets ... ok
+test ringlogin_one_derivation_both_ways ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.98s
+test a_different_ring_at_the_new_root_moves_nothing ... ok
+test an_interrupted_move_finishes ... ok
+test migrate_moves_everything_once_and_it_still_opens ... ok
+test an_unparseable_file_stays_and_keeps_the_ring_with_it ... ok
+test namespaces_from_a_listing ... ok
+test one_root_both_rings_spell ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/session.rs (target/debug/deps/session-713452d87599a3f7)
+test session_kdf_once_reads_once_lock_wipes ... ok
+test session_login_door_runs_no_kdf_and_reads_afresh ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
