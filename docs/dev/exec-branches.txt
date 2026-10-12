@@ -348,3 +348,6 @@ refs/heads/exec-host-aetherselect           5c96bb9b IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-host-aethernet              5c96bb9b IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-host-aethergen              5c96bb9b IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-host-aetherwpt              5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-editcore               39e56a33 IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-tabulabus              39e56a33 IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-rmbp-middentwin             39e56a33 IN-FLIGHT rmbp 2026-10-12

@@ -249,7 +249,6 @@ fn selftest() {
 
 use crate::fs::vfs::AttrValue;
 use alloc::string::ToString;
-use alloc::vec::Vec;
 
 /// The track the glass ranks when none is typed (the rMBP's own queue).
 pub const NEXT_TRACK: &str = "rmbp";
