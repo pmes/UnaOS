@@ -5878,11 +5878,11 @@ fn x86_typematic_pump() {
 /// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
 #[cfg(target_arch = "x86_64")]
 fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi body above; `usb_pump` is gone.
-    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); // INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
+    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); unaos_kernel::drivers::xhci::poll_task_start(cpu); // QUEUESLEEP (B512): the xHCI input poll gets its own task too, so no step of this loop can hold an xHCI key, click or serial-door byte.  INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
-        unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); // INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
+        unaos_kernel::video::lag::pump_nap(); unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); // QUEUESLEEP (B512): the nap is measured (`pump_what=nap pump_wait=hlt` when the core kept the loop past the tick).  INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
         // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
         // safe non-event context).
         //
@@ -5893,9 +5893,9 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // family). A failed `claim()` means another context holds the loan, or the controller is not
         // installed yet; either way this pass skips, exactly as the old `if let Some` did on an
         // empty slot.
-        if let Ok(mut loan) = unaos_kernel::drivers::xhci::claim() {
+        if let Ok(mut loan) = unaos_kernel::drivers::xhci::claim_noted() { // QUEUESLEEP (B512): a Busy refusal is stamped (`pump_wait=claim-busy`); the xhci-poll task retries it next tick
             let xhci = &mut *loan;
-            xhci.poll_events();
+            xhci.poll_events(); unaos_kernel::video::lag::xhci_polled(); // QUEUESLEEP (B512): the poll gap is measured
             // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
             // is armed before the deferred SCSI bring-up puts its multi-second chain on the wire.
             xhci.service_ftdi();
@@ -5937,7 +5937,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // `ui_tick_service()` lands this moves there; the call belongs on a per-pass service body
         // either way, and this task is that body.
         #[cfg(all(target_arch = "x86_64", feature = "smc"))]
-        unaos_kernel::drivers::smc::battery::refresh_if_due(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_TYPEMATIC);
+        unaos_kernel::drivers::smc::battery_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_TYPEMATIC); // PUMPWITNESS (B518): the SMC accountant runs on its own `smc-batt` task (smc.rs tail); the pump only posts it once
         // STOR-1 (irqstorage knob): bring up the interrupt-driven storage service task once a block
         // device is present, then run the `bx-blockreq` self-test once. Both one-shot + gated.
         #[cfg(feature = "irqstorage")]
@@ -5979,11 +5979,11 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // FAT volume and must do so with no driver lock held. It latches only on a pass that HAD
         // a volume, so an early pass before storage enumerates does not burn the one attempt.
         #[cfg(feature = "prtscrst")]
-        unaos_kernel::video::prtscr::selftest_once();
+        unaos_kernel::video::prtscr::selftest_post(); // PUMPWITNESS (B518): posted to a one-shot worker task (prtscr.rs tail), never run on the pump
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
-        unaos_kernel::selfhost::verify_source_once(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SELFHOST);
+        unaos_kernel::selfhost::verify_source_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SELFHOST); // PUMPWITNESS (B518): posted to a one-shot worker task (selfhost/mod.rs), never run on the pump — flight 28 ran it here for 28.4 s
         // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `desktop_uefi::activate`
         // used to open a kernel-drawn demo window at the Kepler takeover seam; it now ARMS a launch
         // there and this pass performs it, putting `STAT.ELF` on the desktop as a real ring-3 process
@@ -6005,7 +6005,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // depends on its knobs, so the call sits at all three and the latch inside makes it speak
         // exactly once. Mutates nothing.
         #[cfg(all(target_arch = "x86_64", feature = "witness"))]
-        unaos_kernel::shell::fatverb_storage_witness(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_FATVERB);
+        unaos_kernel::shell::fatverb_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_FATVERB); // PUMPWITNESS (B518): posted to a one-shot worker task (shell.rs tail), never run on the pump
         // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second loop
         // site. Third of the three storage-ready passes; the forward-only state machine inside makes
         // it speak exactly once whichever pass a given build reaches. Read-only in arc 1.
@@ -6210,7 +6210,7 @@ fn input_service(cpu: usize) { // ONEOS5 (R16, SR21): ONE name, two cfg-EXCLUSIV
                 }
             }
         }
-        unaos_kernel::arch::sched::sleep_ticks(1); // ~1 ms at the calibrated 1 kHz tick
+        unaos_kernel::video::lag::input_wait(if SCREEN_APP_ACTIVE.load(Ordering::Relaxed) { unaos_kernel::video::lag::W_APPGATE } else if owed_event.is_some() || owed_motion.is_some() { unaos_kernel::video::lag::W_CHANFULL } else { unaos_kernel::video::lag::W_HLT }); unaos_kernel::arch::sched::sleep_ticks(1); // QUEUESLEEP (B512): where a waiting key sits, stamped before the nap. ~1 ms at the calibrated 1 kHz tick
     }
 }
 
@@ -9732,7 +9732,7 @@ fn shellwin_service_rearm(
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
 fn console_launch_drain(who: &'static str) {
-    let _ = unaos_kernel::video::dock::console_launch_service(who); #[cfg(all(target_arch = "x86_64", feature = "quarry"))] unaos_kernel::video::quarry::service(); // FILEVIEW2 (boot 18: `open TEXT path=/hello.txt -> fileview (latched…)` and nothing) — the x86 render pass NEVER drained Quarry's latches: `quarry::service()` ran only from the dock-press arm (arch/x86_64/syscall.rs:7511) and the Orin pass, so a double-click latched fileview/textedit/facet and they waited for the next DOCK press (the PNG latched at 398 s opened at 416 s). Drained here, from the pass both x86 loops already run; folded on this line, line count unchanged.
+    { let _w = unaos_kernel::video::loginrender::stamp(unaos_kernel::video::loginrender::W_DOCK_CONSOLE); let _ = unaos_kernel::video::dock::console_launch_service(who); } #[cfg(all(target_arch = "x86_64", feature = "quarry"))] { let _w = unaos_kernel::video::loginrender::stamp(unaos_kernel::video::loginrender::W_QUARRY); unaos_kernel::video::quarry::service(); } // LOGINRENDER (B514): each drain stamps its name for the stall line's `handler_what=` (same-line fold, inside this fn's wc cfg). FILEVIEW2 (boot 18: `open TEXT path=/hello.txt -> fileview (latched…)` and nothing) — the x86 render pass NEVER drained Quarry's latches: `quarry::service()` ran only from the dock-press arm (arch/x86_64/syscall.rs:7511) and the Orin pass, so a double-click latched fileview/textedit/facet and they waited for the next DOCK press (the PNG latched at 398 s opened at 416 s). Drained here, from the pass both x86 loops already run; folded on this line, line count unchanged.
 }
 
 /// APPPIN — the knob-off twin, so the folds at the three call sites cost the knob-off

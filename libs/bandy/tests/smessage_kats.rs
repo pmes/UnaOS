@@ -31,7 +31,7 @@ use std::sync::Arc;
 use bandy::ontology::WeightedSkeleton;
 use bandy::signals::{
     FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom, LogEvent, MatrixEvent, PrefValue,
-    PrincipiaCommand, SMessage,
+    PrincipiaCommand, SMessage, TabulaCommand,
 };
 use bandy::state::{
     BrowseEntry, BrowseKind, BrowseListing, DispatchRecord, FsOutcome, FsVerb, LogLine, LogSource,
@@ -978,6 +978,120 @@ fn facet_open_image_association() {
     assert!(!FacetCommand::ImageExported { receipt_id: 1, handle: 1, path: "a".into(), bytes: 0 }.is_request());
 }
 
+// --- TABULA (TABULABUS, SR74) ---
+
+kat!(
+    kat_tabula_editor_open,
+    SMessage::Tabula(TabulaCommand::EditorOpen { principal: Origin::LocalUser("una".into()), path: "/una/x.rs".into() }),
+    r#"{"Tabula":{"EditorOpen":{"principal":{"LocalUser":"una"},"path":"/una/x.rs"}}}"#
+);
+kat!(
+    kat_tabula_editor_loaded,
+    SMessage::Tabula(TabulaCommand::EditorLoaded {
+        path: "/una/x.rs".into(),
+        content: "fn main() {}\n".into(),
+        lines: 1,
+        language: "rust".into(),
+        read_only: false,
+    }),
+    r#"{"Tabula":{"EditorLoaded":{"path":"/una/x.rs","content":"fn main() {}\n","lines":1,"language":"rust","read_only":false}}}"#
+);
+kat!(
+    kat_tabula_editor_loaded_log,
+    SMessage::Tabula(TabulaCommand::EditorLoaded {
+        path: "/mnt/UNAOS.LOG".into(),
+        content: ":: log ::\n".into(),
+        lines: 1,
+        language: "txt".into(),
+        read_only: true,
+    }),
+    r#"{"Tabula":{"EditorLoaded":{"path":"/mnt/UNAOS.LOG","content":":: log ::\n","lines":1,"language":"txt","read_only":true}}}"#
+);
+kat!(
+    kat_tabula_editor_save,
+    SMessage::Tabula(TabulaCommand::EditorSave { principal: Origin::LocalUser("una".into()), path: "/una/x.rs".into() }),
+    r#"{"Tabula":{"EditorSave":{"principal":{"LocalUser":"una"},"path":"/una/x.rs"}}}"#
+);
+kat!(
+    kat_tabula_editor_saved,
+    SMessage::Tabula(TabulaCommand::EditorSaved { path: "/una/x.rs".into() }),
+    r#"{"Tabula":{"EditorSaved":{"path":"/una/x.rs"}}}"#
+);
+kat!(
+    kat_tabula_editor_goto,
+    SMessage::Tabula(TabulaCommand::EditorGoto {
+        principal: Origin::System("vein".into()),
+        path: "/una/x.rs".into(),
+        line: 3,
+        col: 7,
+    }),
+    r#"{"Tabula":{"EditorGoto":{"principal":{"System":"vein"},"path":"/una/x.rs","line":3,"col":7}}}"#
+);
+kat!(
+    kat_tabula_editor_insert,
+    SMessage::Tabula(TabulaCommand::EditorInsert {
+        principal: Origin::LocalUser("una".into()),
+        path: "/una/x.rs".into(),
+        text: "// hi\n".into(),
+    }),
+    r#"{"Tabula":{"EditorInsert":{"principal":{"LocalUser":"una"},"path":"/una/x.rs","text":"// hi\n"}}}"#
+);
+kat!(
+    kat_tabula_editor_dirty,
+    SMessage::Tabula(TabulaCommand::EditorDirty { path: "/una/x.rs".into(), dirty: true }),
+    r#"{"Tabula":{"EditorDirty":{"path":"/una/x.rs","dirty":true}}}"#
+);
+kat!(
+    kat_tabula_editor_closed,
+    SMessage::Tabula(TabulaCommand::EditorClosed { path: "/una/x.rs".into() }),
+    r#"{"Tabula":{"EditorClosed":{"path":"/una/x.rs"}}}"#
+);
+kat!(
+    kat_tabula_editor_error,
+    SMessage::Tabula(TabulaCommand::EditorError { path: "/una/nope.rs".into(), why: "No such file or directory (os error 2)".into() }),
+    r#"{"Tabula":{"EditorError":{"path":"/una/nope.rs","why":"No such file or directory (os error 2)"}}}"#
+);
+
+fn tabula_variant_name(c: &TabulaCommand) -> &'static str {
+    match c {
+        TabulaCommand::EditorOpen { .. } => "EditorOpen",
+        TabulaCommand::EditorLoaded { .. } => "EditorLoaded",
+        TabulaCommand::EditorSave { .. } => "EditorSave",
+        TabulaCommand::EditorSaved { .. } => "EditorSaved",
+        TabulaCommand::EditorGoto { .. } => "EditorGoto",
+        TabulaCommand::EditorInsert { .. } => "EditorInsert",
+        TabulaCommand::EditorDirty { .. } => "EditorDirty",
+        TabulaCommand::EditorClosed { .. } => "EditorClosed",
+        TabulaCommand::EditorError { .. } => "EditorError",
+    }
+}
+
+#[test]
+fn tabula_vocabulary_complete_and_requests_split() {
+    let p = || Origin::LocalUser("una".into());
+    let reqs = [
+        TabulaCommand::EditorOpen { principal: p(), path: "a".into() },
+        TabulaCommand::EditorSave { principal: p(), path: "a".into() },
+        TabulaCommand::EditorGoto { principal: p(), path: "a".into(), line: 1, col: 1 },
+        TabulaCommand::EditorInsert { principal: p(), path: "a".into(), text: "x".into() },
+        TabulaCommand::EditorClosed { path: "a".into() },
+    ];
+    let answers = [
+        TabulaCommand::EditorLoaded { path: "a".into(), content: String::new(), lines: 0, language: "txt".into(), read_only: false },
+        TabulaCommand::EditorSaved { path: "a".into() },
+        TabulaCommand::EditorDirty { path: "a".into(), dirty: false },
+        TabulaCommand::EditorError { path: "a".into(), why: "w".into() },
+    ];
+    for r in &reqs {
+        assert!(r.is_request(), "{} must be served", tabula_variant_name(r));
+        assert_eq!(r.path(), "a");
+    }
+    for a in &answers {
+        assert!(!a.is_request(), "{} is an answer, inert as input", tabula_variant_name(a));
+        assert_eq!(a.path(), "a");
+    }
+}
+
 // --- COMPLETENESS GUARD ------------------------------------------------------
 //
 // Exhaustive matches over the message vocabulary, with NO wildcard arm.
@@ -1072,6 +1186,9 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::DispatchPayload(_) => "DispatchPayload",
         SMessage::ToggleMatrixNode(_) => "ToggleMatrixNode",
         SMessage::UiReady => "UiReady",
+        SMessage::Tabula(_) => "Tabula",
+        SMessage::BrowserMouseMove(_, _) => "BrowserMouseMove",
+        SMessage::BrowserCursorChanged(_) => "BrowserCursorChanged", // AETHERHOVER (SR67) fold: the exhaustive match gains the two motion variants
     }
 }
 

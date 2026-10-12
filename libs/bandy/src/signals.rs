@@ -169,6 +169,14 @@ pub enum SMessage {
     /// Fetched *after* the page is delivered, so it never delays a load; an
     /// absent or undecodable icon simply fires nothing.
     BrowserFaviconChanged { width: u32, height: u32, rgba: Vec<u8> },
+    /// Chrome → engine: the pointer moved over the page surface, in surface
+    /// pixels (top-left origin) — hover, `:hover` style, the cursor shape and
+    /// the page's mouseover/mouseout/mouseenter/mouseleave/mousemove (SR67).
+    BrowserMouseMove(f64, f64),
+    /// Engine → chrome: the cursor the hovered element asks for changed. A
+    /// css-ui-4 `cursor` keyword (`default`, `pointer`, `text`, `wait`, …),
+    /// which is also the freedesktop/GTK cursor name; deduped by the engine.
+    BrowserCursorChanged(String),
 
     // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
     // A session is keyed by the media `url` the request named (the same string `PlayMedia`
@@ -311,6 +319,12 @@ pub enum SMessage {
     DispatchPayload(String),
     ToggleMatrixNode(String),
     UiReady,
+
+    // --- TABULA (The Text handler, ledger SR74 TABULABUS) ---
+    /// The Text handler's channel: open/goto/insert/save/close a document by path, and the answers
+    /// Tabula gives. APPENDED after `UiReady` so no earlier wire tag moves. Mirrors the
+    /// [`SMessage::Facet`] sub-enum shape: one outer variant, the verbs inside it.
+    Tabula(TabulaCommand),
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -715,4 +729,73 @@ pub enum LogEvent {
 /// The trait that defines a "Nerve Ending" in the system.
 pub trait BandyMember {
     fn publish(&self, topic: &str, msg: SMessage) -> anyhow::Result<()>;
+}
+
+/// TABULABUS (SR74) — the Text handler's bus vocabulary (`handlers/tabula`, `tabula::ignite`).
+///
+/// Documents are keyed by `path` (the string the opener named). Requests carry `principal`
+/// (the message-security law the Finder and Facet verbs follow). Every request that fails is
+/// answered by [`TabulaCommand::EditorError`] for the same path — never silence. Answers are inert
+/// as input: Tabula hears its own replies on the bus and does not act on them.
+///
+/// Tabula also keeps the older pane vocabulary alive: after every [`TabulaCommand::EditorLoaded`]
+/// it fires [`SMessage::EditorLoad`], the message quartzite's editor pane renders, and it applies
+/// [`SMessage::EditorEdited`] (the view's full-buffer echo) to the document it last loaded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TabulaCommand {
+    /// Open `path` (or re-present it, unsaved edits included, when it is already open). A console
+    /// or serial log (`UNAOS.LOG`, `*.log`, squawk `*.out`) is name-routed to the read-only Console
+    /// view. Answered by [`TabulaCommand::EditorLoaded`] or [`TabulaCommand::EditorError`].
+    EditorOpen { principal: Origin, path: String },
+    /// The answer to an open: the whole buffer, its line count (`str::lines`), the language id and
+    /// whether the document refuses writes (a log).
+    EditorLoaded { path: String, content: String, lines: u32, language: String, read_only: bool },
+    /// Write the held buffer back to `path`. Answered by [`TabulaCommand::EditorSaved`] (then
+    /// [`TabulaCommand::EditorDirty`] `false` when it was dirty) or [`TabulaCommand::EditorError`].
+    EditorSave { principal: Origin, path: String },
+    /// The answer to a save that reached the disk.
+    EditorSaved { path: String },
+    /// Move the document's cursor to `line`, `col` — both 1-based, `col` counted in chars,
+    /// clamped to the text. No answer on success; the view may scroll on hearing it.
+    EditorGoto { principal: Origin, path: String, line: u32, col: u32 },
+    /// Insert `text` at the document's cursor and advance the cursor past it. Answered by
+    /// [`TabulaCommand::EditorDirty`] `true` when the document was clean (and the new buffer as
+    /// [`SMessage::EditorLoad`] when it is the pane's document).
+    EditorInsert { principal: Origin, path: String, text: String },
+    /// The document's unsaved-edits flag changed.
+    EditorDirty { path: String, dirty: bool },
+    /// A fact the vessel announces: the document left the pane. Tabula drops it (no answer).
+    EditorClosed { path: String },
+    /// A refused request, by path, with the reason.
+    EditorError { path: String, why: String },
+}
+
+impl TabulaCommand {
+    /// The document path this message names.
+    pub fn path(&self) -> &str {
+        match self {
+            TabulaCommand::EditorOpen { path, .. }
+            | TabulaCommand::EditorLoaded { path, .. }
+            | TabulaCommand::EditorSave { path, .. }
+            | TabulaCommand::EditorSaved { path }
+            | TabulaCommand::EditorGoto { path, .. }
+            | TabulaCommand::EditorInsert { path, .. }
+            | TabulaCommand::EditorDirty { path, .. }
+            | TabulaCommand::EditorClosed { path }
+            | TabulaCommand::EditorError { path, .. } => path,
+        }
+    }
+
+    /// True for what Tabula consumes (the requests, plus the vessel's `EditorClosed` fact); the
+    /// rest are its own answers, inert as input.
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            TabulaCommand::EditorOpen { .. }
+                | TabulaCommand::EditorSave { .. }
+                | TabulaCommand::EditorGoto { .. }
+                | TabulaCommand::EditorInsert { .. }
+                | TabulaCommand::EditorClosed { .. }
+        )
+    }
 }

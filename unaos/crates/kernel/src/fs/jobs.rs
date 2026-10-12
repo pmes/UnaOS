@@ -224,7 +224,7 @@ fn selftest() {
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let bar_ms: Option<u64> = None;
     let bar_ok = bar_ms.map_or(true, |b| b <= 200);
-    let pass = landed && on == "worker" && max_ms <= 50 && bar_ok;
+    let pass = landed && on == "worker" && max_ms <= 50 && bar_ok; // VFSTXCOST (B522): the chunk bound is 50 again — the fixed per-transaction cost was the one-window read-ahead cache (fs/unafs.rs `RaSet`)
     let bar = bar_ms.map_or(String::from("none"), |b| format!("{}", b));
     serial_println!(
         ":: JOBSCAN: on={} chunks={} max_chunk_ms={} bar_ms={} -> {} :: state={}",
@@ -238,13 +238,24 @@ fn selftest() {
 // prints `jobs_core::rank_next` — the SAME ranking `mica jobs next` prints on the host (R79: one ranker). A verb
 // Peter types, never a boot step (R80).
 //
-// JOBSCAN (B497) measured what a whole-directory walk costs on this volume (1675 inode reads, 17 s, IRQ-masked), so
-// the kernel never walks: it asks the volume's attribute index for exactly the records `rank_next` reads — every
-// OPEN record (`job:status == "open"`: the queue candidates, the open ledger rows, the header's open count) and
-// every record carrying a §3 name (`job:arc == "<NAME>"`: the running check and the cited row of a name with no
-// open record) — kept to the track's queue and ledger folders. On that subset `rank_next` returns what it returns
-// on the whole store. Each record is then its own short read (attributes, body), never one long transaction.
-// Wire: `[jobs] next flight=f<n> track=rmbp owed=<k> open=<m> ranked=<n> gpu=kepler:<id>,intel:<id> read=<r> via=index ms=<t>`
+// JOBSNEXTMASK (rmbp-ledger B519). Flight 28 (f28-boot1.log 12:22:43–12:23:14Z): `jobs next` asked the volume's
+// attribute index (`mt.query`) — ONE `with_unafs` transaction per expression, each a whole-volume walk under the
+// IRQ mask (`job:status == "open"` matches across all 1707 records) — and the render task's console-launch step sat
+// behind that hold 35 s (`handler=console-launch masked_ms=36303`); the whole verb took 111 s. Now `jobs next` reads
+// the way JOBSCAN does: the track's two folders one directory blob per chunk (`read_dir_kinds`, no inode read per
+// row), then one record per chunk (its attributes; for a record `rank_next` reads — `job:status == "open"` or a §3
+// `job:arc` — its body), the core unmasked and a 1 ms sleep between chunks. The subset is the one the index returned,
+// so `rank_next` returns what it returned. It never runs on the render task: on the x86 desktop the verb POSTS the
+// read to a `jobs-read` task on JOBSCAN's worker core (`smp::worker_cpu(0)`, never the render core), says so, and
+// returns; the worker prints the ranked wave to the wire and into the shell transcript (`shelltask::out`) when done.
+// The records it read stay RESIDENT (the kernel only reads `/jobs` — Mica writes it on the host, a new card is a new
+// boot): the next `jobs next` for that track ranks from them without touching the volume (`via=resident`). JOBSCAN's
+// own scan keeps names and counts only, not records, so the first `jobs next` of a boot always reads.
+// LOCKREG (B414): each chunk's transaction holds `unafs::MOUNT` (a `sync::Mutex`, so a registered class) under the
+// mask; a hold over 50 ms is named by `[lock] held-too-long name=unafs.rs:…` and the line's `max_chunk_ms` bounds it.
+// Wire: `[jobs] next posted track=<t> n=<n> on=worker cpu=<c>` (the shell's line), then
+// `[jobs] next flight=f<n> track=rmbp owed=<k> open=<m> ranked=<n> gpu=kepler:<id>,intel:<id> read=<r>
+//  via=<walk|resident> on=<worker|inline|resident> ms=<t> chunks=<n> max_chunk_ms=<ms>`
 // then one tab-separated row per rank (`<rank> <id> <name> <status> <ledger row> -`).
 
 use crate::fs::vfs::AttrValue;
@@ -253,15 +264,34 @@ use alloc::string::ToString;
 /// The track the glass ranks when none is typed (the rMBP's own queue).
 pub const NEXT_TRACK: &str = "rmbp";
 
-/// `arch::ticks()` is milliseconds on x86 (the calibrated 1 kHz APIC); on aarch64 it is the ~250 Hz heartbeat.
-#[cfg(target_arch = "x86_64")]
-const TICK_WORD: &str = "ms";
-#[cfg(not(target_arch = "x86_64"))]
-const TICK_WORD: &str = "ticks";
+/// What a `jobs next` read left resident: the track, `/jobs/owed`'s flight and names, the records `rank_next` reads.
+struct Resident {
+    track: String,
+    flight: String,
+    names: Vec<String>,
+    recs: Vec<jobs_core::Record>,
+}
 
-/// One record off the volume by path (its `job:*` attributes and its body).
-fn load_one(mt: &MountTable, path: &str) -> Option<jobs_core::Record> {
-    let kv = mt.list_attrs(path, crate::fs::vfs::KERNEL_PRINCIPAL).ok()?;
+static RESIDENT: crate::sync::Mutex<Option<Resident>> = crate::sync::Mutex::new(None);
+/// A `jobs-read` task is running (one at a time; a second ask is told so, never queued behind it).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static READ_BUSY: AtomicBool = AtomicBool::new(false);
+/// The posted read: (`0` = `jobs next`, `1` = the `jobs` items), n, track (`""` = every queue).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static READ_REQ: crate::sync::Mutex<Option<(u8, usize, String)>> = crate::sync::Mutex::new(None);
+
+/// Between a read's chunks: on the worker, the core is unmasked and the scheduler runs the rest.
+fn rest(on_worker: bool) {
+    #[cfg(target_arch = "x86_64")]
+    if on_worker {
+        crate::arch::sched::sleep_ms(1);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = on_worker;
+}
+
+/// A record from its `list_attrs` answer and its body.
+fn record_of(kv: Vec<(String, AttrValue)>, body: String) -> Option<jobs_core::Record> {
     let mut attrs: Vec<(String, String)> = Vec::new();
     let mut seq = 0i64;
     for (k, v) in kv {
@@ -271,19 +301,13 @@ fn load_one(mt: &MountTable, path: &str) -> Option<jobs_core::Record> {
             _ => {}
         }
     }
-    let size = mt.stat(path).map(|s| s.size as usize).unwrap_or(0);
-    let body = mt.read(path, 0, size).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
     jobs_core::record_from_volume(&attrs, seq, body)
 }
 
-/// The fallback when the volume answers no queries: the track's two folders, walked.
-fn walk(mt: &MountTable, dir: &str, paths: &mut Vec<String>) {
-    let Ok(list) = mt.read_dir(dir) else { return };
-    for e in list {
-        if matches!(e.kind, NodeKind::File) {
-            paths.push(format!("{}/{}", dir, e.name));
-        }
-    }
+/// A file's body (one `stat`, one `read`: two short transactions).
+fn body_of(mt: &MountTable, path: &str) -> String {
+    let size = mt.stat(path).map(|s| s.size as usize).unwrap_or(0);
+    mt.read(path, 0, size).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default()
 }
 
 /// `/jobs/owed` back: (`f<n>`, names); empty when the card's volume predates it.
@@ -293,60 +317,153 @@ fn owed(mt: &MountTable) -> (String, Vec<String>) {
         Ok(AttrValue::Str(s)) => s,
         _ => String::new(),
     };
-    let size = mt.stat(&path).map(|s| s.size as usize).unwrap_or(0);
-    let body = mt.read(&path, 0, size).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    let body = body_of(mt, &path);
     (flight, body.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect())
 }
 
-/// The ranked lines (header first), or the one absent line. Both the console and the serial wire get them.
-pub fn next_lines(n: usize, track: &str) -> Vec<String> {
-    let t0 = crate::arch::ticks();
+/// The ranked lines (header first) from records in hand.
+fn rank_lines(r: &Resident, n: usize, read: usize, via: &str, on: &str, t0: u64, chunks: u32, max_ms: u64) -> Vec<String> {
+    let ranked = jobs_core::rank_next(&r.recs, &r.names, &r.track, n);
+    let head = jobs_core::next_header(&r.recs, &ranked, &r.flight, r.names.len(), &r.track);
+    let mut out = alloc::vec![format!(
+        "{} read={} via={} on={} ms={} chunks={} max_chunk_ms={}",
+        head,
+        read,
+        via,
+        on,
+        crate::arch::ms().saturating_sub(t0),
+        chunks,
+        max_ms
+    )];
+    for (k, t) in ranked.iter().enumerate() {
+        out.push(jobs_core::next_row(&r.recs, k + 1, t, ""));
+    }
+    out
+}
+
+/// The resident records' ranking for `track`, or `None` (nothing resident for it). Touches no volume.
+fn next_resident(n: usize, track: &str) -> Option<Vec<String>> {
+    let t0 = crate::arch::ms();
+    let g = RESIDENT.lock();
+    let r = g.as_ref().filter(|r| r.track == track)?;
+    Some(rank_lines(r, n, r.recs.len(), "resident", "resident", t0, 0, 0))
+}
+
+/// THE READ, chunked: `/jobs/owed`, the track's queue and ledger folders one blob each, then one record per chunk.
+fn next_read(n: usize, track: &str, on_worker: bool) -> Vec<String> {
+    let t0 = crate::arch::ms();
     let mt = crate::shell::vfs_mount_table();
     if !matches!(mt.stat(jobs_core::ROOT), Ok(s) if matches!(s.kind, NodeKind::Dir)) {
         return alloc::vec![String::from("[jobs] next volume=absent ranked=0")];
     }
+    let mut chunks = 1u32;
+    let c0 = crate::arch::ms();
     let (flight, names) = owed(&mt);
-    let q_dir = format!("{}/{}", sub(jobs_core::QUEUE_DIR), track);
-    let l_dir = format!("{}/{}", sub(jobs_core::LEDGER_DIR), track);
-    let mine = |p: &str| {
-        p.rsplit_once('/').is_some_and(|(d, f)| !f.is_empty() && (d == q_dir.as_str() || d == l_dir.as_str()))
-    };
+    let mut max_ms = crate::arch::ms().saturating_sub(c0);
+    rest(on_worker);
     let mut paths: Vec<String> = Vec::new();
-    let mut via = "index";
-    let mut exprs = alloc::vec![format!("{} == \"open\"", jobs_core::K_STATUS)];
-    for nm in &names {
-        if !nm.contains('"') {
-            exprs.push(format!("{} == \"{}\"", jobs_core::K_ARC, nm));
+    for top in [jobs_core::QUEUE_DIR, jobs_core::LEDGER_DIR] {
+        let dir = format!("{}/{}", sub(top), track);
+        let c0 = crate::arch::ms();
+        if let Ok(list) = mt.read_dir_kinds(&dir) {
+            paths.extend(list.into_iter().filter(|(_, k)| matches!(k, NodeKind::File)).map(|(nm, _)| format!("{}/{}", dir, nm)));
         }
+        chunks += 1;
+        max_ms = max_ms.max(crate::arch::ms().saturating_sub(c0));
+        rest(on_worker);
     }
-    for e in &exprs {
-        match mt.query(e, crate::fs::vfs::KERNEL_PRINCIPAL) {
-            Ok(hits) => {
-                for (_, p) in hits {
-                    if mine(&p) && !paths.contains(&p) {
-                        paths.push(p);
-                    }
+    let mut recs: Vec<jobs_core::Record> = Vec::new();
+    for p in &paths {
+        let c0 = crate::arch::ms();
+        if let Ok(kv) = mt.list_attrs(p, crate::fs::vfs::KERNEL_PRINCIPAL) {
+            // The index's subset: every OPEN record and every record carrying a §3 name.
+            let s = |key: &str| kv.iter().find(|(a, _)| a == key).and_then(|(_, v)| match v {
+                AttrValue::Str(s) => Some(s.as_str()),
+                _ => None,
+            });
+            let keep = s(jobs_core::K_STATUS) == Some("open") || s(jobs_core::K_ARC).is_some_and(|a| names.iter().any(|nm| nm == a));
+            if keep {
+                if let Some(r) = record_of(kv, body_of(&mt, p)) {
+                    recs.push(r);
                 }
             }
-            Err(_) => {
-                via = "walk";
-                break;
+        }
+        chunks += 1;
+        max_ms = max_ms.max(crate::arch::ms().saturating_sub(c0));
+        rest(on_worker);
+    }
+    let r = Resident { track: track.to_string(), flight, names, recs };
+    let out = rank_lines(&r, n, r.recs.len(), "walk", if on_worker { "worker" } else { "inline" }, t0, chunks, max_ms);
+    *RESIDENT.lock() = Some(r);
+    out
+}
+
+/// Post a read to the `jobs-read` task on JOBSCAN's worker core; `Some(cpu)` when posted, `None` when this build has
+/// no worker (the caller reads inline, still chunked). `Err` = a read is already running.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn post(kind: u8, n: usize, track: &str) -> Result<Option<usize>, ()> {
+    let Some(cpu) = crate::arch::smp::worker_cpu(0) else { return Ok(None) };
+    if READ_BUSY.swap(true, AcqRel) {
+        return Err(());
+    }
+    *READ_REQ.lock() = Some((kind, n, track.to_string()));
+    crate::arch::sched::spawn("jobs-read", read_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    Ok(Some(cpu))
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+fn post(_kind: u8, _n: usize, _track: &str) -> Result<Option<usize>, ()> {
+    Ok(None)
+}
+
+/// A line the worker answers with: the wire, and the shell transcript (the render pass drains it, never waits).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn say(l: &str) {
+    serial_println!("{}", l);
+    crate::shelltask::out(&l.replace('\t', "  "));
+}
+
+/// `jobs-read`: run the posted read, print its answer, exit.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn read_worker(_: usize) {
+    let req = READ_REQ.lock().take();
+    if let Some((kind, n, track)) = req {
+        if kind == 0 {
+            for l in next_read(n, &track, true) {
+                say(&l);
             }
+        } else {
+            let t0 = crate::arch::ms();
+            let (items, read, chunks, max_ms) = open_items_at(n, if track.is_empty() { None } else { Some(track.as_str()) }, true);
+            for l in item_lines(&items) {
+                say(&l);
+            }
+            UI_ITEMS_SHOWN.store(items.len() as u32, Relaxed);
+            serial_println!(
+                "[jobsui] verb=jobs items_shown={} read={} on=worker chunks={} max_chunk_ms={} ms={}",
+                items.len(),
+                read,
+                chunks,
+                max_ms,
+                crate::arch::ms().saturating_sub(t0)
+            );
         }
     }
-    if via == "walk" {
-        paths.clear();
-        walk(&mt, &q_dir, &mut paths);
-        walk(&mt, &l_dir, &mut paths);
+    READ_BUSY.store(false, Release);
+}
+
+/// `jobs next [n] [track]` from the shell: the resident ranking if there is one (no volume), else the read POSTED to
+/// the worker (one line back: `[jobs] next posted …`; the wave prints when it lands), else — no worker in this build —
+/// the same chunked read inline. Both the console and the serial wire get the lines returned.
+pub fn next_lines(n: usize, track: &str) -> Vec<String> {
+    if let Some(l) = next_resident(n, track) {
+        return l;
     }
-    let recs: Vec<jobs_core::Record> = paths.iter().filter_map(|p| load_one(&mt, p)).collect();
-    let ranked = jobs_core::rank_next(&recs, &names, track, n);
-    let head = jobs_core::next_header(&recs, &ranked, &flight, names.len(), track);
-    let mut out = alloc::vec![format!("{} read={} via={} {}={}", head, recs.len(), via, TICK_WORD, crate::arch::ticks().saturating_sub(t0))];
-    for (k, t) in ranked.iter().enumerate() {
-        out.push(jobs_core::next_row(&recs, k + 1, t, ""));
+    match post(0, n, track) {
+        Ok(Some(cpu)) => alloc::vec![format!("[jobs] next posted track={} n={} on=worker cpu={} (the wave prints when the worker lands it)", track, n, cpu)],
+        Err(()) => alloc::vec![String::from("[jobs] next busy: a /jobs read is running on the worker — its answer prints when it lands")],
+        Ok(None) => next_read(n, track, false),
     }
-    out
 }
 
 // ── JOBSUI (rmbp-ledger B511) — the jobs on the glass ─────────────────────────────────────────────────────────────────
@@ -395,9 +512,17 @@ pub fn status_text() -> String {
 /// `n`, optionally one `track` only. Reads `/jobs` through the VFS: one listing per track, then per item one attribute
 /// read (its `job:status`) and, for an open one, its line's head. `(items, files examined)`.
 pub fn open_items(n: usize, track: Option<&str>) -> (Vec<ViewItem>, u32) {
+    let (items, read, _, _) = open_items_at(n, track, false);
+    (items, read)
+}
+
+/// [`open_items`] as JOBSCAN's chunked reader (JOBSNEXTMASK, B519): each listing and each item is its own chunk, and
+/// on the worker ([`rest`]) the core sleeps 1 ms between them. `(items, files examined, chunks, max_chunk_ms)`.
+fn open_items_at(n: usize, track: Option<&str>, on_worker: bool) -> (Vec<ViewItem>, u32, u32, u64) {
     let mt = crate::shell::vfs_mount_table();
     let mut out: Vec<ViewItem> = Vec::new();
     let mut read = 0u32;
+    let (mut chunks, mut max_ms) = (0u32, 0u64);
     for (t, _) in jobs_core::QUEUES.iter() {
         if out.len() >= n || read >= UI_READ_CAP {
             break;
@@ -406,7 +531,12 @@ pub fn open_items(n: usize, track: Option<&str>) -> (Vec<ViewItem>, u32) {
             continue;
         }
         let dir = format!("{}/{}/{}", jobs_core::ROOT, jobs_core::QUEUE_DIR, t);
-        let Ok(list) = mt.read_dir_kinds(&dir) else { continue };
+        let c0 = crate::arch::ms();
+        let listed = mt.read_dir_kinds(&dir);
+        chunks += 1;
+        max_ms = max_ms.max(crate::arch::ms().saturating_sub(c0));
+        rest(on_worker);
+        let Ok(list) = listed else { continue };
         let mut names: Vec<String> = list.into_iter().filter(|(_, k)| matches!(k, NodeKind::File)).map(|(nm, _)| nm).collect();
         jobs_core::rank_order(&mut names);
         for nm in names {
@@ -415,30 +545,54 @@ pub fn open_items(n: usize, track: Option<&str>) -> (Vec<ViewItem>, u32) {
             }
             read += 1;
             let path = format!("{}/{}", dir, nm);
-            let Ok(attrs) = mt.list_attrs(&path, crate::fs::vfs::KERNEL_PRINCIPAL) else { continue };
-            let attr = |k: &str| -> String {
-                attrs.iter().find(|(a, _)| a == k).and_then(|(_, v)| match v {
-                    crate::fs::vfs::AttrValue::Str(s) => Some(s.clone()),
-                    _ => None,
-                }).unwrap_or_default()
-            };
-            let status = attr(jobs_core::K_STATUS);
-            if status != "open" {
-                continue;
+            let c0 = crate::arch::ms();
+            let item = open_item(&mt, &path, &nm, *t);
+            chunks += 1;
+            max_ms = max_ms.max(crate::arch::ms().saturating_sub(c0));
+            rest(on_worker);
+            if let Some(it) = item {
+                out.push(it);
             }
-            let head = mt.read(&path, 0, UI_BODY_BYTES).unwrap_or_default();
-            let body = match core::str::from_utf8(&head) {
-                Ok(s) => s,
-                Err(e) => core::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or(""),
-            };
-            if !jobs_core::shown_open(&status, body) {
-                continue;
-            }
-            let flight = jobs_core::last_flight(&attr(jobs_core::K_FLIGHT), body);
-            out.push(ViewItem { name: jobs_core::queue_name(&nm).1, track: *t, status, flight });
         }
     }
-    (out, read)
+    (out, read, chunks, max_ms)
+}
+
+/// One queue file as a view item, or `None` (unreadable, not open, or marked done in its line).
+fn open_item(mt: &MountTable, path: &str, nm: &str, t: &'static str) -> Option<ViewItem> {
+    let Ok(attrs) = mt.list_attrs(path, crate::fs::vfs::KERNEL_PRINCIPAL) else { return None };
+    let attr = |k: &str| -> String {
+        attrs.iter().find(|(a, _)| a == k).and_then(|(_, v)| match v {
+            crate::fs::vfs::AttrValue::Str(s) => Some(s.clone()),
+            _ => None,
+        }).unwrap_or_default()
+    };
+    let status = attr(jobs_core::K_STATUS);
+    if status != "open" {
+        return None;
+    }
+    let head = mt.read(path, 0, UI_BODY_BYTES).unwrap_or_default();
+    let body = match core::str::from_utf8(&head) {
+        Ok(s) => s,
+        Err(e) => core::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or(""),
+    };
+    if !jobs_core::shown_open(&status, body) {
+        return None;
+    }
+    let flight = jobs_core::last_flight(&attr(jobs_core::K_FLIGHT), body);
+    Some(ViewItem { name: jobs_core::queue_name(nm).1, track: t, status, flight })
+}
+
+/// The item section the `jobs` verb prints (the same words inline or from the worker).
+fn item_lines(items: &[ViewItem]) -> Vec<String> {
+    if items.is_empty() {
+        return alloc::vec![String::from("  no open queue items on /jobs")];
+    }
+    let mut out = alloc::vec![String::from("  open queue items (rank = the queue's order):")];
+    for (i, it) in items.iter().enumerate() {
+        out.push(jobs_core::glass(&jobs_core::item_row(i + 1, &it.name, it.track, &it.status, &it.flight)));
+    }
+    out
 }
 
 /// `jobs [<track>|bg|next]` — the read: the counts, then the queue's top ten open items. Returns `true` when the
@@ -448,7 +602,12 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) -> bool 
         None => None,
         Some("bg") => return true,
         Some("next") => {
-            console.println("jobs next: the ranked next wave is JOBSNEXT's (rmbp-ledger B506), not in this build — `jobs` is the read");
+            // `shell::jobs_next_verb` answers `jobs next` before this verb is reached; the same post if one arrives here.
+            let n = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(13).clamp(1, 64);
+            for l in next_lines(n, args.get(2).copied().unwrap_or(NEXT_TRACK)) {
+                serial_println!("{}", l);
+                console.println(&l.replace('\t', "  "));
+            }
             return false;
         }
         Some(w) if jobs_core::QUEUES.iter().any(|(t, _)| *t == w) => Some(w),
@@ -463,23 +622,28 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) -> bool 
     }
     let landed = counts().is_some();
     console.println(&status_text());
-    let (items, read) = open_items(jobs_core::VIEW_ITEMS, track);
-    if items.is_empty() {
-        console.println("  no open queue items on /jobs");
-    } else {
-        console.println("  open queue items (rank = the queue's order):");
-        for (i, it) in items.iter().enumerate() {
-            console.println(&jobs_core::glass(&jobs_core::item_row(i + 1, &it.name, it.track, &it.status, &it.flight)));
+    // JOBSNEXTMASK (B519): the item read goes to the worker (JOBSCAN's chunked reader); the counts above are resident.
+    match post(1, jobs_core::VIEW_ITEMS, track.unwrap_or("")) {
+        Ok(Some(cpu)) => {
+            console.println("  open queue items: reading /jobs on the worker — they print when it lands");
+            serial_println!("[jobsui] verb=jobs counts={} items=posted on=worker cpu={} ms={}", if landed { "landed" } else { "pending" }, cpu, crate::arch::ms().saturating_sub(t0));
+        }
+        Err(()) => console.println("  open queue items: a /jobs read is running on the worker — its answer prints when it lands"),
+        Ok(None) => {
+            let (items, read) = open_items(jobs_core::VIEW_ITEMS, track);
+            for l in item_lines(&items) {
+                console.println(&l);
+            }
+            UI_ITEMS_SHOWN.store(items.len() as u32, Relaxed);
+            serial_println!(
+                "[jobsui] verb=jobs counts={} items_shown={} read={} ms={}",
+                if landed { "landed" } else { "pending" },
+                items.len(),
+                read,
+                crate::arch::ms().saturating_sub(t0)
+            );
         }
     }
-    UI_ITEMS_SHOWN.store(items.len() as u32, Relaxed);
-    serial_println!(
-        "[jobsui] verb=jobs counts={} items_shown={} read={} ms={}",
-        if landed { "landed" } else { "pending" },
-        items.len(),
-        read,
-        crate::arch::ms().saturating_sub(t0)
-    );
     if track.is_none() {
         console.println("background programs:");
     }

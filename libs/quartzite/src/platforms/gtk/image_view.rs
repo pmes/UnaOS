@@ -41,18 +41,34 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
         }
     });
 
+    // SR67: pointer motion over the page surface goes to the engine in surface pixels (the frame
+    // is painted 1:1 at the widget origin), for hover, `:hover` and the page's mouse events.
+    let motion = gtk4::EventControllerMotion::new();
+    let motion_syn = synapse.clone();
+    motion.connect_motion(move |_, x, y| {
+        motion_syn.fire(SMessage::BrowserMouseMove(x, y));
+    });
+    drawing_area.add_controller(motion);
+
     let da_clone = drawing_area.clone();
     let mut rx = synapse.subscribe();
     
     let target_id = id.to_string();
     gtk4::glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
-            if let SMessage::SurfaceBlit { url, width, height, pixels } = msg {
-                if url == target_id {
+            match msg {
+                SMessage::SurfaceBlit { url, width, height, pixels } if url == target_id => {
                     *buffer.borrow_mut() = pixels;
                     *dim.borrow_mut() = (width, height);
                     da_clone.queue_draw();
                 }
+                // SR67: the hovered element's css-ui-4 cursor keyword IS the GTK cursor name
+                // (GTK uses the CSS names, as `glyph.rs` does with "text"); `auto` is the arrow.
+                SMessage::BrowserCursorChanged(name) => {
+                    let name = if name == "auto" { "default" } else { name.as_str() };
+                    da_clone.set_cursor_from_name(Some(name));
+                }
+                _ => {}
             }
         }
     });

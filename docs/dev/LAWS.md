@@ -700,6 +700,11 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   recorded **after QEMU exited and was `wait`ed, immediately before the replay** —
   written at the exit decision instead, it would mismatch on every run (late
   flush, teardown) and a check that fires every time gets deleted within the week.
+- **The image build line is ONE file and every fold builds under it** (FOLDBUILD, rmbp-ledger B517; image 21 did not
+  compile though every fold leg was green — the image's knob set was no leg's): `unaos/scripts/image-line.env` holds the
+  line, a STATE cites it as `image-line.env @<sha>` and never restates it, `./arroyo gates` row `image-line` checks it
+  against arroyo's knob map and the builder's, and `./arroyo foldleg` (the x86 kernel + loader built under it) is a fold
+  leg beside the compile legs.
 
 ## 6. Bench, media, serial
 

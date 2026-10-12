@@ -2051,8 +2051,8 @@ pub fn next_event() -> Option<Event> {
 pub fn pump_and_poll() -> Option<Event> {
     // WEDGE-8 (F3): claim, don't lock — a Busy claim (a BOT transaction in flight elsewhere)
     // skips this poll rather than spinning on a preemptible holder; the caller polls again.
-    if let Ok(mut x) = crate::drivers::xhci::claim() {
-        x.poll_events();
+    if let Ok(mut x) = crate::drivers::xhci::claim_noted() { // QUEUESLEEP (B512): a Busy skip is stamped (`pump_wait=claim-busy`); the xhci-poll task retries it next tick
+        x.poll_events(); crate::video::lag::xhci_polled(); // QUEUESLEEP (B512): the poll gap is measured
     }
     // RMBP-FIX M3 (x86 EHCI): the internal rMBP keyboard/trackpad ride the EHCI HID path, not xHCI.
     // The outer console loop services them beside the xHCI hooks, but a full-screen demo (vug/pulse)

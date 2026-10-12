@@ -39,7 +39,17 @@ enum Commands {
         /// Viewport height
         #[arg(long, default_value_t = 600)]
         height: u32,
+        /// Hold the pointer at viewport X,Y before rendering (hover, `:hover`, mouse events, cursor)
+        #[arg(long, value_parser = parse_point)]
+        pointer: Option<(f64, f64)>,
     },
+}
+
+/// `X,Y` (viewport px) for `render --pointer`.
+fn parse_point(s: &str) -> Result<(f64, f64), String> {
+    let (x, y) = s.split_once(',').ok_or_else(|| format!("expected X,Y, got {s:?}"))?;
+    let n = |v: &str| v.trim().parse::<f64>().map_err(|e| format!("{v:?}: {e}"));
+    Ok((n(x)?, n(y)?))
 }
 
 use bandy::synapse::Synapse;
@@ -114,9 +124,9 @@ async fn main() -> Result<()> {
             
             ignite(synapse).await?;
         }
-        Commands::Render { url, html, out, ledger, scroll, width, height } => {
-            let (w, h, missing) = aether::headless::render_headless_opts(
-                url.as_deref(), html.as_deref(), out, ledger, *scroll, *width, *height,
+        Commands::Render { url, html, out, ledger, scroll, width, height, pointer } => {
+            let (w, h, missing) = aether::headless::render_headless_pointer(
+                url.as_deref(), html.as_deref(), out, ledger, *scroll, *width, *height, *pointer,
             ).await?;
             println!(
                 "rendered {}x{} -> {} | {} missing APIs -> {}",

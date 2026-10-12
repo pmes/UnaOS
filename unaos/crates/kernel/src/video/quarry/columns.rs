@@ -811,8 +811,35 @@ fn leg_types() -> Result<&'static str, String> {
     Ok("+markdown,+json")
 }
 
+/// RENDERWEDGE (B520): the disk leg's scratch file, released on EVERY path. Flight 28's `tests quarry2` stopped
+/// after `[trash] op=trash ok=1` and never printed its restore: a leg that leaves `Q2NOTE.MD` in the user's Trash
+/// leaves the Trash non-empty for every later reader (the Dock's, Quarry's). Created right after the `create`, so
+/// every `?`, every early `return` and the end unlink the file — restored out of the Trash first if it is there.
+struct Scratch {
+    md: String,
+    trashed: Option<String>,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let mt = crate::shell::vfs_mount_table();
+        if let Some(name) = self.trashed.take() {
+            if crate::fs::trash::restore(&name).is_err() {
+                let _ = mt.unlink(&join(&crate::fs::trash::trash_dir(), &name), KERNEL_PRINCIPAL);
+            }
+        }
+        let _ = mt.unlink(&self.md, KERNEL_PRINCIPAL);
+    }
+}
+
+/// The disk leg's bound (RENDERWEDGE B520). Flight 28 ran it in about 2 s (12:27:53 → the trash at :55); the
+/// shell job waits at most this for it and then reports `disk FAIL: timeout` — the leg is abandoned on its own
+/// task, the shell is not.
+const DISK_BOUND_MS: u64 = 10_000;
+
 /// Leg (needs a home volume): a real Markdown file comes out `Markdown` in the listing's facts, and a
-/// trashed file's row carries its origin. `Ok(None)` = no volume (SKIP).
+/// trashed file's row carries its origin. `Ok(None)` = no volume (SKIP). Runs on its own task under
+/// [`DISK_BOUND_MS`] ([`crate::video::renderwedge::run_bounded`]); the file is a [`Scratch`].
 fn leg_disk() -> Result<Option<(String, String)>, String> {
     let mt = crate::shell::vfs_mount_table();
     let home = crate::fs::trash::home_base();
@@ -822,33 +849,35 @@ fn leg_disk() -> Result<Option<(String, String)>, String> {
     let md = join(dir, "Q2NOTE.MD");
     let _ = mt.unlink(&md, k);
     mt.create(&md, NodeKind::File, k).map_err(|e| alloc::format!("create {}: {:?}", md, e))?;
+    let mut scratch = Scratch { md: md.clone(), trashed: None }; // from here, every exit releases the file
     let body = b"# QUARRY2\n- a list\n";
     mt.write(&md, 0, body, k).map_err(|e| alloc::format!("write {}: {:?}", md, e))?;
     let list = alloc::vec![DirEnt { name: String::from("Q2NOTE.MD"), kind: NodeKind::File, size: body.len() as u64, mtime: None }];
     let meta = compute_meta(&mt, dir, &list, &[]);
     let ty = meta.first().map(|m| m.type_name.clone()).unwrap_or_default();
     if meta.first().map(|m| m.mime.as_str()) != Some(crate::fs::filetype::TEXT_MARKDOWN) {
-        let _ = mt.unlink(&md, k);
         return Err(alloc::format!("listing typed {} as {:?}", md, meta.first().map(|m| m.mime.clone())));
     }
     // ORIGIN: trash the file, read the Trash's facts, restore it, delete it.
     let origin = match crate::fs::trash::trash(&md) {
         Ok(name) => {
+            scratch.trashed = Some(name.clone());
             let td = crate::fs::trash::trash_dir();
             let origins: Vec<(String, String)> = crate::fs::trash::entries().into_iter().map(|e| (e.name, e.orig)).collect();
             let tl = alloc::vec![DirEnt { name: name.clone(), kind: NodeKind::File, size: body.len() as u64, mtime: None }];
             let tm = compute_meta(&mt, &td, &tl, &origins);
             let got = tm.first().and_then(|m| m.origin.clone()).unwrap_or_default();
-            let _ = crate::fs::trash::restore(&name);
+            if crate::fs::trash::restore(&name).is_ok() {
+                scratch.trashed = None;
+            }
             if !got.eq_ignore_ascii_case(&md) {
-                let _ = mt.unlink(&md, k);
                 return Err(alloc::format!("origin of {} read {:?} want {} (store={})", name, got, md, crate::fs::trash::store().name()));
             }
             alloc::format!("ok({})", crate::fs::trash::store().name())
         }
         Err(e) => alloc::format!("skip({})", e),
     };
-    let _ = mt.unlink(&md, k);
+    drop(scratch);
     Ok(Some((ty, origin)))
 }
 
@@ -881,13 +910,19 @@ pub fn selftest() {
     };
     #[cfg(not(feature = "facet"))]
     let (gif, stepper) = (String::from("skip"), String::from("skip(no-facet)"));
-    let (disk_ty, origin) = match leg_disk() {
-        Ok(Some((t, o))) => (t, o),
-        Ok(None) => (String::from("skip"), String::from("skip(no-volume)")),
-        Err(e) => {
+    let (disk_ty, origin) = match crate::video::renderwedge::run_bounded("quarry2-disk", leg_disk, DISK_BOUND_MS) {
+        crate::video::renderwedge::Bounded::Done(Ok(Some((t, o)))) => (t, o),
+        crate::video::renderwedge::Bounded::Done(Ok(None)) => (String::from("skip"), String::from("skip(no-volume)")),
+        crate::video::renderwedge::Bounded::Done(Err(e)) => {
             serial_println!("[quarry2] fixture disk FAIL: {}", e);
             fails.push(String::from("disk"));
             (String::from("FAIL"), String::from("FAIL"))
+        }
+        crate::video::renderwedge::Bounded::Timeout(t) => {
+            // RENDERWEDGE (B520): flight 28's wedge — the leg never came back; the shell job does.
+            serial_println!("[quarry2] fixture disk FAIL: timeout ms={} job={} holder={} (the leg is abandoned on its own task)", t.ms, t.job_tid, t.holder);
+            fails.push(String::from("disk"));
+            (String::from("FAIL"), String::from("FAIL(timeout)"))
         }
     };
     serial_println!(

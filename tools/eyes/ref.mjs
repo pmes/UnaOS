@@ -1,5 +1,6 @@
 // Reference renderer: Chromium (Playwright, pre-installed) screenshots each job.
-// usage: node ref.mjs <jobs.tsv>   (lines: <url>\t<out.png>\t<width>\t<height>)
+// usage: node ref.mjs <jobs.tsv>   (lines: <url>\t<out.png>\t<width>\t<height>[\t<hoverX,Y>])
+// A hover column (SR67) parks the mouse there before the shot, so the reference holds `:hover`.
 import { createRequire } from 'module';
 import { readFileSync } from 'fs';
 const require = createRequire(import.meta.url);
@@ -13,10 +14,16 @@ const browser = await chromium.launch({
   args: ['--font-render-hinting=none', '--disable-lcd-text', '--force-device-scale-factor=1'],
 });
 let failed = 0;
-for (const [url, out, w, h] of jobs) {
+for (const [url, out, w, h, hover] of jobs) {
   const page = await browser.newPage({ viewport: { width: +w, height: +h }, deviceScaleFactor: 1 });
   try {
     await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+    if (hover) {
+      const [x, y] = hover.split(',').map(Number);
+      await page.mouse.move(x, y);
+      // two frames: the hover's style recalc and paint land before the shot
+      await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+    }
     await page.screenshot({ path: out });
   } catch (e) { failed++; console.error(`ref FAIL ${url}: ${e.message.split('\n')[0]}`); }
   await page.close();

@@ -1,0 +1,16 @@
+[package]
+name = "edit_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "UnaOS's own text-editing core: piece-table buffer, line index, UAX #29 motion, cursors, undo, search, viewport — no_std + alloc, zero dependencies."
+
+# EDITCORE (LEDGER SR73, R104). CHARTER: Tabula owns Text (docs/CODEX.md §2); seam `shared-core` — the html_core /
+# midden_core shape: `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, zero dependencies, builds for
+# `aarch64-unknown-none-softfloat` so a ring-3 app on the image links the same core the host Tabula links.
+# The Unicode tables (src/tables.rs) and the UAX #29 conformance vectors (tests/data/*.txt) are generated DATA
+# from UCD 17.0.0 by tools/gen_tables.py (inputs sha256-pinned in the script). Syntax is a later core (R105).
+#
+# Dependencies: none. Dev-dependencies: none.
+
+[dependencies]

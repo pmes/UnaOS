@@ -53,6 +53,78 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── --line <file>: GATE-IMAGE-LINE (FOLDBUILD, rmbp-ledger B517) ───────────────────────────────
+# The image build line lives in ONE file (scripts/image-line.env). This entry checks that file
+# against the SAME two vocabularies this script reads below, keyed by KNOB rather than feature:
+#   (a') arroyo's knob map    `[ -n "${UNAOS_X:-}" ] && _feats="${_feats}<names>,"` at column 0
+#   (b') the builder's map     `std::env::var("UNAOS_X")` on a line that also `feats.push(...)`es,
+#                              each line truncated at its first `//` first (the commented-push lesson
+#                              below applies unchanged: a commented-out mapping is UNWIRED)
+# Every line must be `export UNAOS_X=1  # <who added it>` (a kernel knob: in (a') AND in (b')) or
+# `export UNAOS_X="${UNAOS_X:?…}"  # [media] <who>` (a bench-local value: arroyo reads it, the
+# builder and the kernel sources never do, so it cannot change what cargo compiles). Red (exit 1):
+# a malformed line, a line with no comment, a duplicate, a kernel knob missing from (a') or (b'),
+# a `[media]` knob the builder or the kernel reads, a knob arroyo never names (UNKNOWN), knobs out
+# of arroyo's order. Exit 2: a control probe (UNAOS_WC in both maps) failed — a parser broke.
+# usage: knob-parity.sh --line <image-line.env> [<workspace-dir>]
+if [ "${1:-}" = "--line" ]; then
+    LINE="${2:?usage: knob-parity.sh --line <image-line.env> [<workspace-dir>]}"
+    WS="${3:-$(dirname "$HERE")}"
+    ARROYO="${WS}/arroyo"; BUILDER="${WS}/builder/src/main.rs"; KSRC="${WS}/crates/kernel/src"
+    for f in "$LINE" "$ARROYO" "$BUILDER"; do
+        [ -f "$f" ] || { echo "❌ image-line: NO VERDICT — missing ${f}"; exit 2; }
+    done
+    amap="$(awk '/^\[ -n "\$\{UNAOS_[A-Z0-9_]+:-\}" \] && _feats="\$\{_feats\}/ {
+                 match($0, /UNAOS_[A-Z0-9_]+/); k = substr($0, RSTART, RLENGTH); if (!(k in s)) { s[k] = 1; print k "|" NR } }' "$ARROYO")"
+    bmap="$(awk '{ l = $0; i = index(l, "//"); if (i > 0) l = substr(l, 1, i - 1)
+                   if (index(l, "feats.push(") && match(l, /env::var\("UNAOS_[A-Z0-9_]+"\)/)) {
+                       k = substr(l, RSTART + 10, RLENGTH - 12); if (!(k in s)) { s[k] = 1; print k "|" NR } } }' "$BUILDER")"
+    printf '%s\n' "$amap" | grep -q '^UNAOS_WC|' || { echo "❌ image-line: NO VERDICT — control probe: UNAOS_WC not in arroyo's knob map (parser broke)"; exit 2; }
+    printf '%s\n' "$bmap" | grep -q '^UNAOS_WC|' || { echo "❌ image-line: NO VERDICT — control probe: UNAOS_WC not in the builder's env→feature map (parser broke)"; exit 2; }
+    rc=0 n=0 nk=0 nm=0 prev=0 prevk="" seen=" "
+    red() { echo "❌ image-line: $*"; rc=1; }
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        n=$((n+1))
+        case "$raw" in ''|'#'*) continue ;; esac
+        if [[ "$raw" =~ ^export\ (UNAOS_[A-Z0-9_]+)=1[[:space:]]+#\ (.+)$ ]]; then
+            k="${BASH_REMATCH[1]}"; cls=kernel
+        elif [[ "$raw" =~ ^export\ (UNAOS_[A-Z0-9_]+)=\"\$\{(UNAOS_[A-Z0-9_]+):\?[^}]+\}\"[[:space:]]+#\ \[media\]\ (.+)$ ]]; then
+            k="${BASH_REMATCH[1]}"; cls=media
+            [ "$k" = "${BASH_REMATCH[2]}" ] || { red "line ${n}: ${k} takes its value from ${BASH_REMATCH[2]}"; continue; }
+        else
+            red "line ${n}: MALFORMED (want \`export UNAOS_X=1  # <who added it>\` or the [media] form): ${raw:0:100}"; continue
+        fi
+        case "$seen" in *" $k "*) red "line ${n}: ${k} DUPLICATE"; continue ;; esac
+        seen="${seen}${k} "
+        al="$(printf '%s\n' "$amap" | awk -F'|' -v k="$k" '$1==k{print $2; exit}')"
+        bl="$(printf '%s\n' "$bmap" | awk -F'|' -v k="$k" '$1==k{print $2; exit}')"
+        if [ "$cls" = kernel ]; then
+            nk=$((nk+1))
+            if [ -z "$al" ] && [ -z "$bl" ]; then
+                if grep -q "\${${k}[:}]" "$ARROYO"; then red "line ${n}: ${k} UNKNOWN as a kernel knob (arroyo names it but maps no feature to it, nor does the builder) — mark it [media] if it only stages the medium"
+                else red "line ${n}: ${k} UNKNOWN — in neither arroyo's knob map nor the builder's env→feature map"; fi
+                continue
+            fi
+            [ -n "$al" ] || red "line ${n}: ${k} — builder/src/main.rs:${bl} maps it, arroyo's knob map does not (the banner would not name it)"
+            [ -n "$bl" ] || red "line ${n}: ${k} — arroyo:${al} maps it, builder/src/main.rs does not (the image would be built WITHOUT it)"
+            pos="${al:-0}"
+        else
+            nm=$((nm+1))
+            pos="$(grep -n "\${${k}[:}]" "$ARROYO" | head -1 | cut -d: -f1)"
+            [ -n "$pos" ] || { red "line ${n}: ${k} UNKNOWN — [media] but arroyo never reads it"; continue; }
+            if [ -n "$bl" ] || grep -q "\"${k}\"" "$BUILDER"; then red "line ${n}: ${k} is marked [media] but builder/src/main.rs reads it"; fi
+            if grep -rqs "env!(\"${k}\")" "$KSRC"; then red "line ${n}: ${k} is marked [media] but the kernel reads it with env!/option_env!"; fi
+        fi
+        if [ "$pos" -lt "$prev" ]; then red "line ${n}: ${k} (arroyo:${pos}) OUT OF ORDER after ${prevk} (arroyo:${prev}) — the file is in arroyo's knob order"
+        else prev="$pos"; prevk="$k"; fi
+    done < "$LINE"
+    [ $((nk+nm)) -gt 0 ] || red "${LINE} holds no knob"
+    if [ "$rc" -eq 0 ]; then echo "✅ image-line OK: ${nk} kernel knobs in arroyo's map AND the builder's, ${nm} [media] knob(s) arroyo stages and nothing compiles, nothing unknown, in knob order"
+    else echo "❌ image-line: $(basename "$LINE") -> FAIL"; fi
+    exit "$rc"
+fi
+
 WS="${1:-$(dirname "$HERE")}"
 ARROYO="${WS}/arroyo"
 BUILDER="${WS}/builder/src/main.rs"

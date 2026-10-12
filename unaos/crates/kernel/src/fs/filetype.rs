@@ -513,6 +513,7 @@ fn tiff_walk(mt: &MountTable, path: &str, size: u64) -> Option<&'static str> {
 /// the registry is absent (a FAT root, before the first login). One `[filetype] ext=user` line when it decides.
 pub fn by_user_extension_in(mt: &MountTable, path: &str) -> Option<String> {
     let e = ext_of(path)?;
+    if !crate::fs::assoc::registry_readable() { return None; } // FILETYPES2 (B513): unpublished (a stamp miss, the worker's build owed) reads as absent
     for d in mt.read_dir(type_core::TYPES_DIR).ok()? {
         let Some((t, st)) = type_core::mime_leaf(&d.name) else { continue };
         let obj = alloc::format!("{}/{}", type_core::TYPES_DIR, d.name);

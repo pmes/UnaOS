@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# AETHERMETAL M1 (LEDGER SR66): `APPS/AETHER.ELF` — Aether, UnaOS's browser, as ONE ring-3 program on the image,
+# in the LUMENAPP shape (B323, R82): one compositor window (SYS_WIN_CREATE .. SYS_WIN_PRESENT, the INPUT_EV_*
+# ring), the DejaVu faces off the volume through font_core::ui, linked in the ELF window (user-aether-x86.ld).
+# It opens an HTML file off the volume (/system/doc/welcome.html), parses it with html_core, cascades it with
+# css_core (a UA sheet inside the crate + the page's <style> + style=""), lays it out with a CSS2 block + inline
+# formatter written HERE (src/layout.rs — taffy is std; the host engine's layout is M2's port question), and
+# paints it with font_core. The host Aether (handlers/aether) is untouched.
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent workspace never builds
+# this no_std/no_main program for the host during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-aether"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-aether"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+
+# una-abi: the syscall numbers, the INPUT_EV_* layout, the window landmarks (zero bytes).
+# html_core / css_core / font_core: the shared no_std cores (CODEX §2 seam `shared-core`) — the SAME crates the
+# host engine's swap targets and the kernel's video::text links (font_core).
+# font8x8: the glyph grid when no face is on the volume (the SAME crate Lumen and the kernel link).
+[dependencies]
+una-abi = { path = "../una-abi" }
+html_core = { path = "../../libs/web/html_core" }
+css_core = { path = "../../libs/web/css_core" }
+font_core = { path = "../../libs/text/font_core" }
+font8x8 = { version = "0.3.1", default-features = false }
+
+# SR66: `cryptocore` is RESERVED (the media build line is Lumen's; M1 opens no connection, so it gates nothing).
+[features]
+cryptocore = []

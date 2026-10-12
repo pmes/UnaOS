@@ -42,6 +42,14 @@ pub struct AetherEngine {
     /// where tokio::task::block_in_place panics — the old inline block here
     /// killed the engine thread on the first link click.
     pending_nav: Option<forms::OpenDocument>,
+    /// AETHERHOVER (SR67): the hover path — the element under the pointer, then each ancestor element
+    /// (innermost first). Empty when the pointer is over nothing or has not moved yet.
+    pub hover_path: Vec<crate::dom::NodeRef>,
+    /// The last pointer position (viewport px) a `MouseMove` delivered.
+    pub pointer: Option<(f64, f64)>,
+    /// The cursor keyword the shell was last told about, and one it has not been told about yet.
+    cursor: String,
+    pending_cursor: Option<String>,
 }
 
 impl AetherEngine {
@@ -63,6 +71,10 @@ impl AetherEngine {
             surface: vec![255; 800 * 600 * 4],
             stylesheets: Vec::new(),
             pending_nav: None,
+            hover_path: Vec::new(),
+            pointer: None,
+            cursor: "default".to_string(),
+            pending_cursor: None,
         }
     }
 
@@ -191,44 +203,135 @@ impl AetherEngine {
         needs_repaint
     }
     
+    /// The element a pointer at viewport (`x`, `y`) hits — see [`Self::hit_test_at`].
     fn hit_test(&self, x: f64, y: f64) -> Option<crate::dom::NodeRef> {
+        self.hit_test_at(x, y).map(|(n, _)| n)
+    }
+
+    /// AETHERHOVER (SR67): hit testing in PAINT order (CSS 2.2 Appendix E, the order
+    /// `render::render_frame` paints in), not tree order: within a stacking context the topmost
+    /// thing painted wins — positioned / z-indexed layers by (z, order) above the normal flow (z >= 0)
+    /// or below it (z < 0), and in the flow a later box over an earlier one, an atomic inline over its
+    /// line, a glyph run over its inline box. `visibility: hidden` and `display: none` subtrees are not
+    /// targets, an `overflow` clip bounds its descendants. Returns the hit ELEMENT (a text run resolves
+    /// to its parent element, as UI Events targets do) and whether the point is over a glyph run (the
+    /// `auto` cursor's I-beam). A point inside the viewport over no box hits the root element.
+    pub fn hit_test_at(&self, x: f64, y: f64) -> Option<(crate::dom::NodeRef, bool)> {
         let layout = self.layout_tree.as_ref()?;
-        let abs_x = x + self.scroll_x;
-        let abs_y = y + self.scroll_y;
-        
-        let mut hit = None;
-        fn walk(
-            node_id: taffy::prelude::NodeId, 
-            cx: f32, 
-            cy: f32, 
-            abs_x: f64, 
-            abs_y: f64, 
-            layout: &layout::LayoutTree,
-            hit: &mut Option<crate::dom::NodeRef>
-        ) {
-            if let Ok(l) = layout.taffy.layout(node_id) {
-                let nx = cx + l.location.x;
-                let ny = cy + l.location.y;
-                let nw = l.size.width;
-                let nh = l.size.height;
-                
-                if abs_x >= nx as f64 && abs_x <= (nx + nw) as f64 &&
-                   abs_y >= ny as f64 && abs_y <= (ny + nh) as f64 {
-                    if let Some(dom_node) = layout.node_map.get(&node_id) {
-                        *hit = Some(dom_node.clone());
-                    }
+        let cx = HitCtx {
+            layout,
+            px: (x + self.scroll_x) as f32,
+            py: (y + self.scroll_y) as f32,
+            sx: self.scroll_x as i32 as f32,
+            sy: self.scroll_y as i32 as f32,
+            vw: self.width as f32,
+            vh: self.height as f32,
+        };
+        let all = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
+        let (mut tid, over_text) = hit_context(&cx, layout.root_node, (0.0, 0.0), all).unwrap_or((layout.root_node, false));
+        loop {
+            if let Some(n) = layout.node_map.get(&tid) {
+                if n.is_element() {
+                    return Some((n.clone(), over_text));
                 }
-                
-                if let Ok(children) = layout.taffy.children(node_id) {
-                    for child in children {
-                        walk(child, nx, ny, abs_x, abs_y, layout, hit);
-                    }
+                if let Some(p) = n.parent().filter(|p| p.is_element()) {
+                    return Some((p, over_text));
+                }
+                // The layout root is the Document: the canvas hits the document element.
+                if n.as_document().is_some() {
+                    return n.children().find(|c| c.is_element()).map(|e| (e, false));
                 }
             }
+            tid = layout.taffy.parent(tid)?;
         }
-        
-        walk(layout.root_node, 0.0, 0.0, abs_x, abs_y, layout, &mut hit);
-        hit
+    }
+
+    /// AETHERHOVER (SR67): the pointer moved to viewport (`x`, `y`). Hit tests in paint order; when the
+    /// hovered element changes, fires UI Events §5.3's boundary events at the page — `mouseout` at the
+    /// old target, `mouseleave` at each element left (innermost first), `mouseover` at the new target,
+    /// `mouseenter` at each element entered (outermost first), Chromium's order — moves css_core's
+    /// `:hover` flag onto the new path and re-styles ONCE (only when the page has a `:hover` rule or a
+    /// listener mutated the DOM); then `mousemove` at the target, and the cursor on the hovered element
+    /// is recomputed (a change is staged for [`Self::take_cursor_change`]). A motion that stays on the
+    /// same element costs one hit test and one `mousemove`.
+    pub fn pointer_moved(&mut self, x: f64, y: f64) {
+        self.pointer = Some((x, y));
+        let hit = self.hit_test_at(x, y);
+        let target = hit.as_ref().map(|(n, _)| n.clone());
+        let new_path: Vec<crate::dom::NodeRef> = match &target {
+            Some(t) => std::iter::once(t.clone()).chain(t.ancestors().filter(|a| a.is_element())).collect(),
+            None => Vec::new(),
+        };
+        let client = (x, y);
+        let mut mutated = false;
+        if new_path != self.hover_path {
+            let old_path = std::mem::replace(&mut self.hover_path, new_path.clone());
+            if let Some(js_engine) = &mut self.js_engine {
+                js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+                let vm = &mut js_engine.vm;
+                let id = |n: &crate::dom::NodeRef| n.id().0;
+                let (old_t, new_t) = (old_path.first().map(id), new_path.first().map(id));
+                if let Some(o) = old_t {
+                    js::events::user_mouse(vm, o, "mouseout", client, new_t);
+                }
+                for n in old_path.iter().filter(|n| !new_path.contains(n)) {
+                    js::events::user_mouse(vm, id(n), "mouseleave", client, new_t);
+                }
+                if let Some(t) = new_t {
+                    js::events::user_mouse(vm, t, "mouseover", client, old_t);
+                }
+                for n in new_path.iter().rev().filter(|n| !old_path.contains(n)) {
+                    js::events::user_mouse(vm, id(n), "mouseenter", client, old_t);
+                }
+                mutated = js::take_mutated();
+            }
+            self.apply_hover_chain();
+            if mutated || self.stylesheets.iter().any(|s| s.contains(":hover")) {
+                self.relayout();
+                mutated = false;
+            }
+        }
+        if let (Some(t), Some(js_engine)) = (&target, &mut self.js_engine) {
+            js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+            js::events::user_mouse(&mut js_engine.vm, t.id().0, "mousemove", client, None);
+            mutated |= js::take_mutated();
+        }
+        if mutated {
+            self.relayout();
+        }
+        if let Some(url) = js::take_script_navigation() {
+            self.pending_nav = Some(forms::OpenDocument { url, method: forms::HttpMethod::Get, body: None });
+        }
+        let cursor = match &target {
+            Some(t) => css::cursor_for(t, hit.as_ref().is_some_and(|(_, text)| *text)),
+            None => "default".to_string(),
+        };
+        if cursor != self.cursor {
+            self.cursor = cursor.clone();
+            self.pending_cursor = Some(cursor);
+        }
+    }
+
+    /// Sets css_core's `:hover` state to the current hover path (the matcher reads it per element).
+    fn apply_hover_chain(&self) {
+        match self.hover_path.first() {
+            Some(t) => {
+                let ids: Vec<html_core::NodeId> = self.hover_path.iter().map(|n| n.id()).collect();
+                t.with_doc(|doc, _| crate::dom::El::set_hover_chain(doc, &ids));
+            }
+            None => crate::dom::El::clear_hover_chain(),
+        }
+    }
+
+    /// The cursor keyword (css-ui-4 §5.1; also the GTK/freedesktop cursor name) the hovered element
+    /// asks for, when it changed since the last call. The shell raises it as `BrowserCursorChanged`.
+    pub fn take_cursor_change(&mut self) -> Option<String> {
+        self.pending_cursor.take()
+    }
+
+    /// The cursor keyword over the hovered element right now.
+    pub fn cursor(&self) -> &str {
+        &self.cursor
     }
 
     pub fn handle_event(&mut self, event: api::events::Event) {
@@ -315,7 +418,7 @@ impl AetherEngine {
                     }
                 }
             }
-            api::events::Event::MouseMove(_x, _y) => {}
+            api::events::Event::MouseMove(x, y) => self.pointer_moved(x, y),
             api::events::Event::MouseDown(_x, _y) => {}
             api::events::Event::MouseUp(x, y) => {
                 if let Some(node) = self.hit_test(x, y) {
@@ -545,6 +648,9 @@ impl AetherEngine {
         
         // The previous document's media stop; this one's register below.
         media::reset("Aether Browser");
+        // Nothing of the new document is hovered until the pointer moves over it (SR67).
+        self.hover_path.clear();
+        crate::dom::El::clear_hover_chain();
 
         // AETHERJS (SR63): the document is parsed with its scripts executing in HTML §4.12.1 order
         // (parser-blocking, defer, async, module; document.write during parse), then "the end"
@@ -627,3 +733,220 @@ impl AetherEngine {
     }
 }
 
+// =================================================================================================
+// AETHERHOVER (SR67): the paint-order hit test behind `AetherEngine::hit_test_at`.
+// =================================================================================================
+
+/// Document-space rect (x0, y0, x1, y1).
+type HitRect = (f32, f32, f32, f32);
+
+struct HitCtx<'a> {
+    layout: &'a layout::LayoutTree,
+    /// The pointer in document coordinates.
+    px: f32,
+    py: f32,
+    /// The scroll offset render paints at (truncated), and the viewport (fixed boxes resolve against it).
+    sx: f32,
+    sy: f32,
+    vw: f32,
+    vh: f32,
+}
+
+impl HitCtx<'_> {
+    fn inside(&self, r: HitRect, clip: HitRect) -> bool {
+        let (x, y) = (self.px, self.py);
+        x >= r.0.max(clip.0) && x < r.2.min(clip.2) && y >= r.1.max(clip.1) && y < r.3.min(clip.3)
+    }
+}
+
+/// One flow item of a stacking context, in paint order.
+enum HitEntry {
+    /// A box's border box (and the clip its ancestors impose).
+    Box(taffy::prelude::NodeId, HitRect, HitRect),
+    /// An inline formatting context: its glyph runs and inline-box fragments, from its content origin.
+    Ifc(taffy::prelude::NodeId, (f32, f32), HitRect),
+}
+
+/// A layer of a stacking context: hit as its own context (its subtree whole).
+struct HitLayer {
+    z: i32,
+    node: taffy::prelude::NodeId,
+    parent_origin: (f32, f32),
+    clip: HitRect,
+}
+
+fn hit_skipped(layout: &layout::LayoutTree, id: taffy::prelude::NodeId) -> bool {
+    layout.paint_map.get(&id).and_then(|p| p.hidden).unwrap_or(false)
+        || layout.taffy.style(id).map(|s| s.display == taffy::style::Display::None).unwrap_or(false)
+}
+
+/// Painted as a layer of its stacking context (render's `is_layered`).
+fn hit_layered(layout: &layout::LayoutTree, id: taffy::prelude::NodeId) -> bool {
+    layout.paint_map.get(&id).and_then(|p| p.position_kind).is_some_and(|k| k != 0)
+        || render::is_stacking_context(layout, id)
+}
+
+/// `id`'s border-box origin given its parent's: `location` from the parent, or for `position: fixed`
+/// the viewport (render's rule: insets against the viewport, scroll ignored).
+fn hit_origin(cx: &HitCtx, id: taffy::prelude::NodeId, parent: (f32, f32)) -> (f32, f32) {
+    let layout = cx.layout;
+    let Ok(l) = layout.taffy.layout(id) else { return parent };
+    let (mut x, mut y) = (parent.0 + l.location.x, parent.1 + l.location.y);
+    if layout.paint_map.get(&id).and_then(|p| p.position_kind) == Some(3) {
+        if let Ok(st) = layout.taffy.style(id) {
+            let len = |v: taffy::style::LengthPercentageAuto, basis: f32| -> Option<f32> {
+                let raw = v.into_raw();
+                match raw.tag() {
+                    taffy::style::CompactLength::LENGTH_TAG => Some(raw.value()),
+                    taffy::style::CompactLength::PERCENT_TAG => Some(raw.value() * basis),
+                    _ => None,
+                }
+            };
+            let (w, h) = (l.size.width, l.size.height);
+            if let Some(v) = len(st.inset.left, cx.vw) {
+                x = cx.sx + v;
+            } else if let Some(v) = len(st.inset.right, cx.vw) {
+                x = cx.sx + cx.vw - v - w;
+            }
+            if let Some(v) = len(st.inset.top, cx.vh) {
+                y = cx.sy + v;
+            } else if let Some(v) = len(st.inset.bottom, cx.vh) {
+                y = cx.sy + cx.vh - v - h;
+            }
+        }
+    }
+    (x, y)
+}
+
+/// The children of `node` (border box at `o`) with the parent origin each is placed from — render's
+/// `collect_layers` walk: an IFC root's atomic inlines and floats from their fragments, its
+/// absolute/fixed children from taffy; any other box's taffy children.
+fn hit_kids(layout: &layout::LayoutTree, node: taffy::prelude::NodeId, o: (f32, f32)) -> Vec<(taffy::prelude::NodeId, (f32, f32))> {
+    let mut kids = Vec::new();
+    let Ok(lb) = layout.taffy.layout(node) else { return kids };
+    if let Some(il) = layout.inline.get(&node) {
+        let (cx, cy) = (o.0 + lb.border.left + lb.padding.left, o.1 + lb.border.top + lb.padding.top);
+        for f in &il.frags {
+            if let layout::inline::Frag::Atomic { node: a, x, y } = f {
+                let loc = layout.taffy.layout(*a).map(|l| l.location).unwrap_or(taffy::Point { x: 0.0, y: 0.0 });
+                kids.push((*a, (cx + x - loc.x, cy + y - loc.y)));
+            }
+        }
+        for c in layout.taffy.children(node).unwrap_or_default() {
+            if matches!(layout.paint_map.get(&c).and_then(|p| p.position_kind), Some(2 | 3)) {
+                kids.push((c, o));
+            }
+        }
+    } else {
+        for c in layout.taffy.children(node).unwrap_or_default() {
+            kids.push((c, o));
+        }
+    }
+    kids
+}
+
+fn hit_box_entries(cx: &HitCtx, id: taffy::prelude::NodeId, o: (f32, f32), clip: HitRect, out: &mut Vec<HitEntry>) -> HitRect {
+    let layout = cx.layout;
+    let Ok(l) = layout.taffy.layout(id) else { return clip };
+    let r = (o.0, o.1, o.0 + l.size.width, o.1 + l.size.height);
+    out.push(HitEntry::Box(id, r, clip));
+    let inner = if layout.paint_map.get(&id).and_then(|p| p.clip).unwrap_or(false) {
+        (clip.0.max(r.0), clip.1.max(r.1), clip.2.min(r.2), clip.3.min(r.3))
+    } else {
+        clip
+    };
+    if layout.inline.contains_key(&id) {
+        let content = (o.0 + l.border.left + l.padding.left, o.1 + l.border.top + l.padding.top);
+        out.push(HitEntry::Ifc(id, content, inner));
+    }
+    inner
+}
+
+/// The normal-flow entries under `node` (paint order) and the layers it hoists.
+fn hit_collect(cx: &HitCtx, node: taffy::prelude::NodeId, o: (f32, f32), clip: HitRect, out: &mut Vec<HitEntry>, layers: &mut Vec<HitLayer>) {
+    for (c, po) in hit_kids(cx.layout, node, o) {
+        if hit_skipped(cx.layout, c) {
+            continue;
+        }
+        if hit_layered(cx.layout, c) {
+            let z = cx.layout.paint_map.get(&c).and_then(|p| p.z_index).flatten().unwrap_or(0);
+            layers.push(HitLayer { z, node: c, parent_origin: po, clip });
+            continue;
+        }
+        let co = hit_origin(cx, c, po);
+        let inner = hit_box_entries(cx, c, co, clip, out);
+        hit_collect(cx, c, co, inner, out, layers);
+    }
+}
+
+/// Hits one inline formatting context: a glyph run (its text node; `true`), else the deepest inline
+/// box fragment under the point.
+fn hit_ifc(cx: &HitCtx, root: taffy::prelude::NodeId, content: (f32, f32), clip: HitRect) -> Option<(taffy::prelude::NodeId, bool)> {
+    let layout = cx.layout;
+    let il = layout.inline.get(&root)?;
+    for f in il.frags.iter().rev() {
+        if let layout::inline::Frag::Text { node, x, baseline, width, .. } = f {
+            let Some(&(top, h, _)) = il.lines.iter().find(|(t, h, _)| *baseline >= *t && *baseline <= *t + *h) else { continue };
+            let r = (content.0 + x, content.1 + top, content.0 + x + width, content.1 + top + h);
+            if cx.inside(r, clip) {
+                return Some((*node, true));
+            }
+        }
+    }
+    let depth = |mut n: taffy::prelude::NodeId| {
+        let mut d = 0;
+        while let Some(p) = layout.taffy.parent(n) {
+            d += 1;
+            n = p;
+        }
+        d
+    };
+    let mut best: Option<(usize, taffy::prelude::NodeId)> = None;
+    for f in &il.frags {
+        if let layout::inline::Frag::Box { node, x, y, w, h, .. } = f {
+            let r = (content.0 + x, content.1 + y, content.0 + x + w, content.1 + y + h);
+            if cx.inside(r, clip) && !hit_skipped(layout, *node) {
+                let d = depth(*node);
+                if best.is_none_or(|(bd, _)| d >= bd) {
+                    best = Some((d, *node));
+                }
+            }
+        }
+    }
+    best.map(|(_, n)| (n, false))
+}
+
+/// Hits the stacking context (or layer) rooted at `node`, placed from `parent` under `clip`:
+/// z >= 0 layers topmost first, then the flow from the last painted, then z < 0 layers, then the
+/// root's own box.
+fn hit_context(cx: &HitCtx, node: taffy::prelude::NodeId, parent: (f32, f32), clip: HitRect) -> Option<(taffy::prelude::NodeId, bool)> {
+    if hit_skipped(cx.layout, node) {
+        return None;
+    }
+    let o = hit_origin(cx, node, parent);
+    let mut entries = Vec::new();
+    let mut layers = Vec::new();
+    let inner = hit_box_entries(cx, node, o, clip, &mut entries);
+    hit_collect(cx, node, o, inner, &mut entries, &mut layers);
+    layers.sort_by_key(|l| l.z); // stable: equal z keeps tree order
+    let hit_entry = |e: &HitEntry| match *e {
+        HitEntry::Box(id, r, c) => cx.inside(r, c).then_some((id, false)),
+        HitEntry::Ifc(id, content, c) => hit_ifc(cx, id, content, c),
+    };
+    for l in layers.iter().rev().filter(|l| l.z >= 0) {
+        if let Some(h) = hit_context(cx, l.node, l.parent_origin, l.clip) {
+            return Some(h);
+        }
+    }
+    for e in entries.iter().skip(1).rev() {
+        if let Some(h) = hit_entry(e) {
+            return Some(h);
+        }
+    }
+    for l in layers.iter().rev().filter(|l| l.z < 0) {
+        if let Some(h) = hit_context(cx, l.node, l.parent_origin, l.clip) {
+            return Some(h);
+        }
+    }
+    entries.first().and_then(hit_entry)
+}

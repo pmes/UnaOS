@@ -27,15 +27,17 @@
 //! the `WorkspaceState`. In this repo the cwd resolves to a recognized project
 //! (`Layout::Code`) → left pane Matrix topology, right pane **Editor**. An
 //! unrecognized directory (the Void → `Layout::Comms`) falls back to a Stream
-//! on the right. When a sidebar *file* is activated, the brain loop loads it
-//! through `tabula::TabulaDocument` and broadcasts `SMessage::EditorLoad` so
-//! quartzite's editor pane renders it.
+//! on the right. When a sidebar *file* is activated, the brain loop speaks
+//! Tabula's bus verb (`TabulaCommand::EditorOpen`, TABULABUS SR74); Tabula
+//! (`tabula::ignite`, the Text handler) owns the document, answers
+//! `EditorLoaded`, and fires `SMessage::EditorLoad` so quartzite's editor pane
+//! renders it. Saves go the same way: `EditorSave` → `EditorSaved`/`EditorError`.
 //!
 //! A path may also be named on the command line. There are **no option flags**:
 //! opening a log is not a mode you type. A console/serial log (`UNAOS.LOG`, a
 //! `ttyUSB*.log` capture, a squawk `*.out`) is *name-routed* to Tabula's
-//! read-only Console view by `TabulaDocument::open`, so `una UNAOS.LOG` opens it
-//! read-only on its own. That case overrides the Layout's right pane, because a
+//! read-only Console view by Tabula (its `EditorOpen` routes through
+//! `TabulaDocument::open`), so `una UNAOS.LOG` opens it read-only on its own. That case overrides the Layout's right pane, because a
 //! log's directory is not a `Layout::Code` project.
 //!
 //! The read-only treatment is **not an app policy**: on the shard a kernel
@@ -60,6 +62,15 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
 const APP_ID: &str = "org.unaos.UnaIDE";
+
+/// The pane's document as Tabula last presented it (`TabulaCommand::EditorLoaded`).
+#[derive(Debug, Clone)]
+struct EditorPane {
+    path: String,
+    content: String,
+    language: String,
+    read_only: bool,
+}
 
 /// Resolve the command line into `(workspace_root, file_to_open)`.
 ///
@@ -227,31 +238,50 @@ fn main() {
     //     of which resolves to a `Layout::Code` project, so the Editor has to
     //     be asked for. Seeding `EditorState` here — rather than firing
     //     `EditorLoad` after `UiReady` — puts the text in the FIRST frame.
-    let initial_document = open_arg.as_ref().and_then(|path| {
-        // `open` name-routes: a log opens read-only in the Console view, any
-        // other file opens editable. There is no flag override — a log is
-        // read-only because it is not the viewer's to write, not because argv
-        // said so.
-        match tabula::TabulaDocument::open(path) {
-            Ok(doc) => {
-                println!(
-                    "[UNA] Opened {} ({} byte(s){})",
-                    path.display(),
-                    doc.buffer.len(),
-                    if doc.read_only { ", read-only console view" } else { "" }
-                );
-                Some(doc)
+    //
+    //     The document is Tabula's (TABULABUS, SR74): ignite the Text handler,
+    //     speak `EditorOpen`, and wait for its answer. `serve` subscribes before
+    //     it is spawned, so the request cannot outrun the handler. Tabula's
+    //     open name-routes: a log opens read-only in the Console view, any other
+    //     file opens editable. There is no flag override — a log is read-only
+    //     because it is not the viewer's to write, not because argv said so.
+    let principal = bandy::Origin::LocalUser(std::env::var("USER").unwrap_or_else(|_| "una".into()));
+    let tabula_handle = rt.spawn(tabula::bus::serve(synapse.clone()));
+    let initial_document: Option<EditorPane> = open_arg.as_ref().and_then(|path| {
+        let want = path.to_string_lossy().into_owned();
+        let mut rx = synapse.subscribe();
+        synapse.fire(SMessage::Tabula(bandy::TabulaCommand::EditorOpen {
+            principal: principal.clone(),
+            path: want.clone(),
+        }));
+        rt.block_on(async {
+            loop {
+                match rx.recv().await {
+                    Ok(SMessage::Tabula(bandy::TabulaCommand::EditorLoaded { path, content, lines, language, read_only })) if path == want => {
+                        println!(
+                            "[UNA] Opened {} ({} byte(s), {} line(s){})",
+                            path,
+                            content.len(),
+                            lines,
+                            if read_only { ", read-only console view" } else { "" }
+                        );
+                        return Some(EditorPane { path, content, language, read_only });
+                    }
+                    Ok(SMessage::Tabula(bandy::TabulaCommand::EditorError { path, why })) if path == want => {
+                        eprintln!("[UNA] cannot open {}: {}", path, why);
+                        return None;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("lagged") => {}
+                    Err(_) => return None,
+                }
             }
-            Err(e) => {
-                eprintln!("[UNA] cannot open {}: {}", path.display(), e);
-                None
-            }
-        }
+        })
     });
     if let Some(doc) = &initial_document {
         workspace_state.right_pane = bandy::state::ViewEntity::Editor(bandy::state::EditorState {
-            path: doc.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            content: doc.buffer.clone(),
+            path: Some(doc.path.clone()),
+            content: doc.content.clone(),
             language: doc.language.clone(),
         });
     }
@@ -279,12 +309,14 @@ fn main() {
         let mut midden = midden::Midden::new_at(brain_root.as_ref().clone());
         let aule = aule::Aule::new(brain_root.as_path());
 
-        // The live editor document. Empty until a file is activated. Only
+        // The pane's document as Tabula last presented it (`EditorLoaded`).
+        // Tabula holds the document of record; this mirror is what `UiReady`
+        // re-asserts and what tells a save request which path it names. Only
         // meaningful when the right pane is an Editor (Layout::Code); harmless
         // otherwise.
         let editor_active =
             matches!(workspace_state.right_pane, bandy::state::ViewEntity::Editor(_));
-        let mut document = initial_document.unwrap_or_else(tabula::TabulaDocument::new);
+        let mut pane: Option<EditorPane> = initial_document;
 
         loop {
             tokio::select! {
@@ -309,9 +341,9 @@ fn main() {
                                 // named file) when it was.
                                 if editor_active {
                                     synapse_event_loop.fire(bandy::SMessage::EditorLoad {
-                                        path: document.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                                        content: document.buffer.clone(),
-                                        language: document.language.clone(),
+                                        path: pane.as_ref().map(|d| d.path.clone()),
+                                        content: pane.as_ref().map(|d| d.content.clone()).unwrap_or_default(),
+                                        language: pane.as_ref().map(|d| d.language.clone()).unwrap_or_else(|| "txt".to_string()),
                                     });
                                 }
                             }
@@ -332,35 +364,27 @@ fn main() {
                                         //     file's symbols into the topology.
                                         synapse_event_loop.fire(bandy::SMessage::Matrix(bandy::MatrixEvent::FocusSector(id.clone())));
 
-                                        // (b) When an Editor pane is live, load the
-                                        //     file through the portable Tabula core
-                                        //     and broadcast it for quartzite to render.
-                                        //     `open` routes console/serial logs
-                                        //     (`UNAOS.LOG`, `*.log`, squawk `*.out`)
-                                        //     into the read-only Console view.
+                                        // (b) When an Editor pane is live, ask Tabula
+                                        //     to open it. Tabula answers EditorLoaded
+                                        //     (mirrored below) and fires EditorLoad for
+                                        //     quartzite to render; it routes console/
+                                        //     serial logs (`UNAOS.LOG`, `*.log`, squawk
+                                        //     `*.out`) into the read-only Console view.
                                         if editor_active {
-                                            match tabula::TabulaDocument::open(&id) {
-                                                Ok(doc) => {
-                                                    document = doc;
-                                                    synapse_event_loop.fire(bandy::SMessage::EditorLoad {
-                                                        path: document.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                                                        content: document.buffer.clone(),
-                                                        language: document.language.clone(),
-                                                    });
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("[UNA] editor load failed for {:?}: {}", id, e);
-                                                }
-                                            }
+                                            synapse_event_loop.fire(bandy::SMessage::Tabula(bandy::TabulaCommand::EditorOpen {
+                                                principal: principal.clone(),
+                                                path: id.clone(),
+                                            }));
                                         }
                                     }
                                 }
                             }
                             // Editor round-trip. The view fires EditorEdited on
-                            // every text change; we mirror it into the held
+                            // every text change, on the UI channel; it goes onto
+                            // the Synapse so Tabula applies it to the pane's
                             // document (which marks it dirty).
                             bandy::SMessage::EditorEdited { content } => {
-                                document.set_buffer(content);
+                                synapse_event_loop.fire(bandy::SMessage::EditorEdited { content });
                             }
                             // Cmd+S: persist the buffer and echo the outcome to
                             // the console so saves are visible. With no file
@@ -373,25 +397,23 @@ fn main() {
                             // log is root-owned, so the filesystem ACL would
                             // refuse it there too. State both without claiming
                             // an ACL acted on a write the view never issued.
-                            bandy::SMessage::EditorSaveRequest if document.read_only => {
-                                let name = document.path.as_ref()
-                                    .map(|p| p.display().to_string())
+                            bandy::SMessage::EditorSaveRequest if pane.as_ref().is_some_and(|d| d.read_only) => {
+                                let name = pane.as_ref()
+                                    .map(|d| d.path.clone())
                                     .unwrap_or_else(|| "<log>".to_string());
                                 synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(
                                     format!("[una] {} is a kernel log — read-only; this view won't write it, and on the shard it is root-owned so the filesystem ACL would refuse the write as well", name)));
                             }
-                            bandy::SMessage::EditorSaveRequest => {
-                                let line = match document.save() {
-                                    Ok(()) => {
-                                        let name = document.path.as_ref()
-                                            .map(|p| p.display().to_string())
-                                            .unwrap_or_else(|| "<untitled>".to_string());
-                                        format!("[una] saved {}", name)
-                                    }
-                                    Err(e) => format!("[una] save failed: {}", e),
-                                };
-                                synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(line));
-                            }
+                            // Tabula does the write: EditorSave answers
+                            // EditorSaved or EditorError (both echoed below).
+                            bandy::SMessage::EditorSaveRequest => match pane.as_ref() {
+                                Some(d) => synapse_event_loop.fire(bandy::SMessage::Tabula(bandy::TabulaCommand::EditorSave {
+                                    principal: principal.clone(),
+                                    path: d.path.clone(),
+                                })),
+                                None => synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(
+                                    "[una] save failed: no file is open".to_string())),
+                            },
                             // Console input. Built-ins first (`forge` → aule),
                             // everything else → midden (the held shell).
                             bandy::SMessage::ConsoleInput(raw) => {
@@ -439,7 +461,22 @@ fn main() {
                     }
                 }
                 // Matrix events that mutate UI structure are grafted locally.
+                // Tabula's answers: mirror what the pane shows, echo the
+                // save outcome and every refusal to the console.
                 msg = synapse_rx.recv() => {
+                    match &msg {
+                        Ok(bandy::SMessage::Tabula(bandy::TabulaCommand::EditorLoaded { path, content, language, read_only, .. })) => {
+                            pane = Some(EditorPane { path: path.clone(), content: content.clone(), language: language.clone(), read_only: *read_only });
+                        }
+                        Ok(bandy::SMessage::Tabula(bandy::TabulaCommand::EditorSaved { path })) => {
+                            synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(format!("[una] saved {}", path)));
+                        }
+                        Ok(bandy::SMessage::Tabula(bandy::TabulaCommand::EditorError { path, why })) => {
+                            eprintln!("[UNA] editor: {}: {}", path, why);
+                            synapse_event_loop.fire(bandy::SMessage::ConsoleAppend(format!("[una] {}: {}", path, why)));
+                        }
+                        _ => {}
+                    }
                     if let Ok(bandy::SMessage::Matrix(bandy::MatrixEvent::GraftTopology { target_id, payload })) = msg
                         && let bandy::state::ViewEntity::Topology(ref mut matrix) = workspace_state.left_pane
                         && matrix::graft::apply_graft(&mut matrix.tree.roots, &target_id, &payload)
@@ -509,6 +546,7 @@ fn main() {
         let _ = brain_loop_handle.await;
         matrix_handle.abort();
         console_handle.abort();
+        tabula_handle.abort();
     });
 }
 

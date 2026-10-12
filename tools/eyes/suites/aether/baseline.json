@@ -119,6 +119,11 @@
       "mismatch": 1.22,
       "missing": 0,
       "ssim": 0.9919
+    },
+    "25-hover": {
+      "mismatch": 0.03,
+      "missing": 0,
+      "ssim": 0.9988
     }
   },
   "thresholds": {

@@ -600,23 +600,192 @@ mod tests {
         assert_eq!(img.get_pixel(1, 1).0, [0, 255, 0, 255]);
     }
 
-    /// :hover/:focus rules must not apply to a static render.
+    /// AETHERHOVER (SR67): a render with no pointer matches no `:hover` (and `:focus` never matches);
+    /// a pointer on the link puts `:hover` on the link AND its ancestors (Selectors 4 §9.1) and
+    /// re-styles; moving off clears it.
     #[test]
-    fn test_hover_focus_not_applied() {
-        let html = r#"<html><body><a id="x" href="/">link</a></body></html>"#;
-        let document = dom::parse_html(html);
-        let mut layout_tree = layout::compute_layout(&document);
-        css::apply_css(&mut layout_tree, r#"
+    fn test_hover_applies_on_the_pointer_path_only() {
+        let html = r#"<html><head><style>
+            body { margin: 0; }
+            a { display: block; height: 40px; font-size: 20px; }
             a:hover { color: red; }
-            a:focus { color: yellow; }
-            a { font-size: 20px; }
-        "#);
-        let paint = layout_tree.node_map.iter()
-            .find(|(_, n)| n.as_element().map_or(false, |e| e.name.local.as_ref() == "a"))
-            .map(|(id, _)| layout_tree.paint_map.get(id).cloned().unwrap_or_default())
-            .unwrap();
-        assert_eq!(paint.color, None, ":hover/:focus must not match a static render");
-        assert_eq!(paint.font_size, Some(20.0), "plain tag rule still applies");
+            a:focus { background-color: yellow; }
+            p { height: 40px; margin: 0; }
+        </style></head><body><a id="x" href="/">link</a><p id="y">other</p></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://hover", html, true);
+        let paint_of = |engine: &crate::AetherEngine, id: &str| {
+            let layout = engine.layout_tree.as_ref().unwrap();
+            layout.node_map.iter()
+                .find(|(_, n)| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some(id)))
+                .map(|(t, _)| layout.paint_map.get(t).cloned().unwrap_or_default())
+                .unwrap()
+        };
+        assert_eq!(paint_of(&engine, "x").color, None, "no pointer: :hover matches nothing");
+        assert_eq!(paint_of(&engine, "x").font_size, Some(20.0), "plain tag rule still applies");
+
+        engine.handle_event(crate::api::events::Event::MouseMove(10.0, 10.0));
+        assert_eq!(paint_of(&engine, "x").color, Some((255, 0, 0)), "pointer on the link: a:hover applies");
+        assert_eq!(paint_of(&engine, "x").background, None, ":focus still never matches");
+        let js = engine.js_engine.as_mut().unwrap();
+        assert_eq!(
+            js.eval_string("Array.from(document.querySelectorAll(':hover')).map(e => e.localName).join(',')").unwrap(),
+            "html,body,a",
+            "the hover chain is the hit element and every ancestor"
+        );
+
+        engine.handle_event(crate::api::events::Event::MouseMove(10.0, 50.0));
+        assert_eq!(paint_of(&engine, "x").color, None, "pointer off the link: :hover cleared");
+        let js = engine.js_engine.as_mut().unwrap();
+        assert_eq!(js.eval_string("document.querySelector('p').matches(':hover')").unwrap(), "true");
+    }
+
+    /// The page with UI Events §5.3.3's nested A > B > C, each listening for the five motion events.
+    /// The bubbling three are logged where they are targeted (`currentTarget == target`), with
+    /// their relatedTarget; mouseenter/mouseleave are logged wherever they land (they never bubble).
+    const NESTED_ABC: &str = r#"<html><head><style>
+        body { margin: 0; }
+        #a { padding: 40px; height: 200px; }
+        #b { padding: 40px; height: 120px; }
+        #c { height: 40px; }
+    </style></head><body><div id="a"><div id="b"><div id="c"></div></div></div>
+    <script>
+        var log = [], bubbled = [];
+        for (const id of ["a", "b", "c"]) {
+            const el = document.getElementById(id);
+            for (const ty of ["mouseover", "mouseout", "mouseenter", "mouseleave", "mousemove"]) {
+                el.addEventListener(ty, function (e) {
+                    if (e.currentTarget !== e.target) { bubbled.push(ty + ":" + e.target.id + "@" + id); return; }
+                    var rel = (ty === "mouseover" || ty === "mouseout") ? "<" + (e.relatedTarget ? (e.relatedTarget.id || e.relatedTarget.localName) : "null") : "";
+                    log.push(ty + " " + id + rel + (e.bubbles ? "" : " nobubble"));
+                });
+            }
+        }
+    </script></body></html>"#;
+
+    /// UI Events §5.3.3.1's event order for a pointer that moves into A, into nested B, into nested C,
+    /// then out of all three: a KAT, sequence for sequence (Chromium's order: out, leave…, over,
+    /// enter…, move).
+    #[test]
+    fn test_mouse_boundary_events_follow_ui_events_order() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://abc", NESTED_ABC, true);
+        let mv = |e: &mut crate::AetherEngine, x: f64, y: f64| e.handle_event(crate::api::events::Event::MouseMove(x, y));
+        mv(&mut engine, 10.0, 400.0); // below A: over body/html, none of A/B/C
+        mv(&mut engine, 10.0, 10.0); // into A
+        mv(&mut engine, 20.0, 20.0); // still A: a mousemove, no boundary
+        mv(&mut engine, 50.0, 50.0); // into B
+        mv(&mut engine, 90.0, 90.0); // into C
+        mv(&mut engine, 10.0, 400.0); // out of C, B and A at once
+        let js = engine.js_engine.as_mut().unwrap();
+        let log = js.eval_string("log.join('|')").unwrap();
+        let want = [
+            "mouseover a<html", "mouseenter a nobubble", "mousemove a",
+            "mousemove a",
+            "mouseout a<b", "mouseover b<a", "mouseenter b nobubble", "mousemove b",
+            "mouseout b<c", "mouseover c<b", "mouseenter c nobubble", "mousemove c",
+            "mouseout c<html", "mouseleave c nobubble", "mouseleave b nobubble", "mouseleave a nobubble",
+        ]
+        .join("|");
+        assert_eq!(log, want);
+    }
+
+    /// mouseover/mouseout/mousemove bubble to every ancestor's listener; mouseenter/mouseleave never
+    /// do (each element hears only its own boundary), so A hears C's over/out but not C's enter.
+    #[test]
+    fn test_mouse_enter_leave_do_not_bubble() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://abc", NESTED_ABC, true);
+        engine.handle_event(crate::api::events::Event::MouseMove(90.0, 90.0)); // straight into C
+        let js = engine.js_engine.as_mut().unwrap();
+        // The first motion enters C (and A, B) from nowhere: relatedTarget null, three non-bubbling
+        // enters, outermost first.
+        assert_eq!(
+            js.eval_string("log.join('|')").unwrap(),
+            "mouseover c<null|mouseenter a nobubble|mouseenter b nobubble|mouseenter c nobubble|mousemove c"
+        );
+        assert_eq!(
+            js.eval_string("bubbled.join('|')").unwrap(),
+            "mouseover:c@b|mouseover:c@a|mousemove:c@b|mousemove:c@a",
+            "over/move bubble C -> B -> A; enter does not"
+        );
+    }
+
+    /// AETHERHOVER (SR67): hit testing follows PAINT order. A positioned box painted over a later
+    /// in-flow block wins (tree order picked the later block); between two positioned siblings the
+    /// higher z-index wins regardless of tree order; a hidden box is no target.
+    #[test]
+    fn test_hit_test_is_paint_order() {
+        let html = r#"<html><head><style>
+            body { margin: 0; }
+            #over { position: absolute; top: 0; left: 0; width: 100px; height: 100px; }
+            #flow { height: 200px; }
+            #hi { position: absolute; top: 300px; left: 0; width: 100px; height: 100px; z-index: 2; }
+            #lo { position: absolute; top: 300px; left: 0; width: 100px; height: 100px; z-index: 1; }
+            #ghost { position: absolute; top: 450px; left: 0; width: 100px; height: 100px; visibility: hidden; }
+            #floor { position: absolute; top: 450px; left: 0; width: 100px; height: 100px; z-index: -1; }
+        </style></head><body><div id="over"></div><div id="flow"></div><div id="hi"></div><div id="lo"></div>
+        <div id="floor"></div><div id="ghost"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://hit", html, true);
+        let id_at = |e: &crate::AetherEngine, x: f64, y: f64| {
+            e.hit_test_at(x, y)
+                .and_then(|(n, _)| n.as_element().map(|el| el.attributes.borrow().get("id").unwrap_or("").to_string()))
+                .unwrap_or_default()
+        };
+        assert_eq!(id_at(&engine, 50.0, 50.0), "over", "positioned layer paints above the later in-flow block");
+        assert_eq!(id_at(&engine, 50.0, 150.0), "flow");
+        assert_eq!(id_at(&engine, 50.0, 350.0), "hi", "z-index 2 above the later z-index 1 sibling");
+        assert_eq!(id_at(&engine, 50.0, 500.0), "floor", "a visibility:hidden box is not a target");
+    }
+
+    /// AETHERHOVER (SR67): `cursor` is computed on the hovered element (inherited; a link carries the
+    /// UA's `pointer`; `auto` is the I-beam over text, the arrow elsewhere; a url list falls back to
+    /// its keyword) and a change is raised once.
+    #[test]
+    fn test_cursor_follows_the_hovered_element() {
+        let html = r#"<html><head><style>
+            body { margin: 0; font-size: 16px; }
+            div { height: 40px; }
+            .busy { cursor: wait; }
+            .img { cursor: url(hand.cur) 4 4, move; }
+            a.plain { cursor: default; }
+        </style></head><body>
+            <div id="blank"></div>
+            <div class="busy"><span>child inherits</span></div>
+            <div class="img"></div>
+            <div><a href="/" style="display:block;height:40px"></a></div>
+            <div><a class="plain" href="/" style="display:block;height:40px"></a></div>
+            <div>Text Text Text</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://cursor", html, true);
+        let mut at = |y: f64| {
+            engine.handle_event(crate::api::events::Event::MouseMove(5.0, y));
+            (engine.cursor().to_string(), engine.take_cursor_change())
+        };
+        assert_eq!(at(20.0), ("default".into(), None), "an empty block: the arrow, no change raised");
+        assert_eq!(at(45.0).0, "wait", "inherited from the .busy parent");
+        assert_eq!(at(100.0), ("move".into(), Some("move".into())), "url list falls back to its keyword");
+        assert_eq!(at(101.0), ("move".into(), None), "same cursor: nothing raised again");
+        assert_eq!(at(140.0).0, "pointer", "a link carries the UA cursor: pointer");
+        assert_eq!(at(180.0).0, "default", "an author cursor on the link beats the UA's");
+        assert_eq!(at(210.0).0, "text", "auto over a glyph run is the I-beam");
+    }
+
+    /// The re-style happens when the hover PATH changes, not per motion: a move inside the same
+    /// element neither relayouts nor repaints.
+    #[test]
+    fn test_hover_restyles_only_when_the_path_changes() {
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://abc", &NESTED_ABC.replace("</style>", "#a:hover { background-color: red; }</style>"), true);
+        engine.handle_event(crate::api::events::Event::MouseMove(10.0, 10.0));
+        assert!(engine.needs_repaint, "entering A re-styles (a :hover rule exists)");
+        engine.needs_repaint = false;
+        engine.handle_event(crate::api::events::Event::MouseMove(12.0, 14.0));
+        assert!(!engine.needs_repaint, "moving within A: same path, no re-style");
+        engine.handle_event(crate::api::events::Event::MouseMove(50.0, 50.0));
+        assert!(engine.needs_repaint, "into B: the path changed");
     }
 
     /// Custom properties resolve through var() (flat page-global map),

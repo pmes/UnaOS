@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Midden (UnaOS's own design): a prompt and a caret on a slate tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#1e2430"/>
+<path d="M14 22 L26 32 L14 42" fill="none" stroke="#9fe6b0" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="30" y="39" width="20" height="5" rx="2" fill="#b08cff"/>
+</svg>
