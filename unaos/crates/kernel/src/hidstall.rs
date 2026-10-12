@@ -149,7 +149,7 @@ pub fn verdict(halted: u32, hid_stall_s: u32, keyq_ms: u64) -> bool {
 pub fn ensure() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        crate::tests::register("hidstall", selftest);
+        crate::tests::register("hidstall", selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::renderwedge::ensure_tests(); // RENDERWEDGE (B520): `tests renderwedge` (same-line fold)
         crate::tests::register("inputstall", crate::video::lag::inputstall_selftest);
     }
 }
