@@ -224,7 +224,7 @@ fn selftest() {
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let bar_ms: Option<u64> = None;
     let bar_ok = bar_ms.map_or(true, |b| b <= 200);
-    let pass = landed && on == "worker" && max_ms <= 50 && bar_ok;
+    let pass = landed && on == "worker" && max_ms <= 50 && bar_ok; // VFSTXCOST (B522): the chunk bound is 50 again — the fixed per-transaction cost was the one-window read-ahead cache (fs/unafs.rs `RaSet`)
     let bar = bar_ms.map_or(String::from("none"), |b| format!("{}", b));
     serial_println!(
         ":: JOBSCAN: on={} chunks={} max_chunk_ms={} bar_ms={} -> {} :: state={}",

@@ -127,7 +127,7 @@ pub struct SdSectorDevice {
     sectors: u64,
     /// BOOT80 (B350): the read-ahead window (one multi-block command's worth of sectors) — armed on
     /// the SD card's handle only, where a command costs what a sector does; window 0 elsewhere.
-    ra: unafs::readahead::ReadAheadCache,
+    ra: RaSet, // VFSTXCOST (B522): sixteen such windows, LRU, write-through — see `RaSet` at this file's tail
 }
 
 /// SDSEAM: the live geometry row for `handle`.
@@ -258,7 +258,7 @@ impl SdSectorDevice {
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
             block::BlockHandle::SdMmc => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => dev.num_blocks, // UNAFSX86: a dedicated per-port row
         };
-        Ok(Self { handle, sectors, ra: unafs::readahead::ReadAheadCache::new(ra_window(handle)) })
+        Ok(Self { handle, sectors, ra: RaSet::new(ra_window(handle)) })
     }
 
     /// The handle this device reads, writes and was sized from. Exposed so a caller that built a
@@ -326,7 +326,7 @@ impl SectorDevice for SdSectorDevice {
     /// BOOT80 (B350): a 4 KiB block in one call. On the SD card: served from the read-ahead window, or
     /// ONE multi-block read (CMD18) of the window that holds it; elsewhere the per-sector loop.
     fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
-        if self.ra.window_sectors() <= 1 {
+        if self.ra.window_sectors() <= 1 { TX_FILLS.fetch_add(1, Ordering::Relaxed);
             for (i, c) in buf.chunks_mut(512).enumerate() {
                 let at = lba.checked_add(i as u64).ok_or(SectorError::OutOfBounds(lba))?;
                 match handle_read(self.handle, at, c) {
@@ -2883,4 +2883,98 @@ pub fn lockowner_release() {
         }
     });
     TXN_BUSY.store(false, Ordering::Relaxed);
+}
+
+// =================================================================================================
+// VFSTXCOST (rmbp-ledger B522) — the read-ahead window becomes a SET of windows.
+//
+// SMALLFIX8 (B516) measured a FIXED 76–103 ms per JOBSCAN chunk (one `with_unafs` transaction:
+// `resolve_path` + `ls`) whatever the record count. The cost is the device, not the walk: every
+// `ls_via` step reads the directory's INODE block and then its DATA blocks (`unafs/src/fs.rs`
+// `ls_via` -> `read_inode_via` + `read_data_via`), and `resolve_path` runs one `ls_via` per path
+// component from the root — so `/jobs/ledger/<track>` touches root inode, root data, `/jobs` inode,
+// `/jobs` data, `ledger` inode, `ledger` data, the target's inode and (non-empty) its data: 7–8
+// distinct metadata blocks, scattered by copy-on-write. BOOT80's cache held ONE 64-sector window, so
+// every one of those blocks was a miss and every miss a whole 32 KiB CMD18 on a 1-bit, 25 MHz PIO bus
+// (`drivers/sdhc.rs` §"1-bit bus, no high-speed"): ~11 ms each — BOOT80's own line on flight 28 reads
+// `mount_ms=120 mount_cmds=11`, 10.9 ms per window. 7 × 10.9 = 76 ms, 9 × 10.9 = 98 ms: the measured
+// band. And nothing survived to the next transaction, so the NEXT chunk re-read the same root and
+// `/jobs` blocks from the card again.
+//
+// The fix keeps sixteen windows (512 KiB at most, grown only as touched), most recent first; a hit in
+// any of them is served from RAM and moves it to the front, a miss refills the least recent. The
+// shared ancestors a listing walks (root, `/jobs`, `/jobs/ledger`) stay resident across transactions,
+// so a chunk costs its own directory's blocks and nothing else.
+//
+// COHERENCE — the same rule as BOOT80's one window, unchanged: the set lives inside the ONE mount's
+// device (two live mounts are already forbidden), every write the device issues is mirrored into
+// every window it overlaps (`write_through`), a failed write drops all of them, a failed fetch caches
+// nothing, and a remount (K9 discard, UNAFSTXN abort, `force_remount`) builds a fresh device. It is a
+// mirror of the MEDIUM, so it is never a second writer and never older than the card; under K8a
+// copy-on-write a committed block is never rewritten in place, so the only blocks whose bytes change
+// under it are the ones this device itself writes (fresh CoW blocks, the 512 B root-slot flip) — and
+// those pass through `write_through`. A generation key would invalidate strictly MORE (every commit,
+// i.e. every bootlog flush) and cover nothing this does not.
+// =================================================================================================
+
+/// VFSTXCOST: windows kept per device.
+const RA_SLOTS: usize = 16;
+
+/// VFSTXCOST: medium fetches by the mount's device (a read-ahead window fill on the SD card; a whole
+/// block read on a windowless handle). Read as deltas by `fs::vfs`'s `[vfs] tx` line.
+static TX_FILLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// VFSTXCOST: block reads served from a resident window without touching the medium.
+static TX_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VFSTXCOST: `(fills, hits)` so far this boot — the `blocks=` / `hits=` of `[vfs] tx`.
+pub fn tx_io() -> (u64, u64) {
+    (TX_FILLS.load(Ordering::Relaxed), TX_HITS.load(Ordering::Relaxed))
+}
+
+/// VFSTXCOST: up to [`RA_SLOTS`] read-ahead windows, most recently used first. The API is
+/// `ReadAheadCache`'s, so `SdSectorDevice`'s BOOT80 call sites are unchanged.
+pub struct RaSet {
+    window: u64,
+    slots: alloc::vec::Vec<unafs::readahead::ReadAheadCache>,
+}
+
+impl RaSet {
+    fn new(window: u64) -> Self {
+        Self { window, slots: alloc::vec::Vec::new() }
+    }
+
+    fn window_sectors(&self) -> u64 {
+        self.window
+    }
+
+    fn invalidate(&mut self) {
+        self.slots.iter_mut().for_each(|s| s.invalidate());
+    }
+
+    fn write_through(&mut self, lba: u64, data: &[u8]) {
+        self.slots.iter_mut().for_each(|s| s.write_through(lba, data));
+    }
+
+    fn read<F>(&mut self, lba: u64, out: &mut [u8], dev_sectors: u64, mut fetch: F) -> Result<(), SectorError>
+    where
+        F: FnMut(u64, &mut [u8]) -> Result<(), SectorError>,
+    {
+        if let Some(i) = self.slots.iter().position(|s| s.lookup(lba, out)) {
+            TX_HITS.fetch_add(1, Ordering::Relaxed);
+            let s = self.slots.remove(i);
+            self.slots.insert(0, s);
+            return Ok(());
+        }
+        let mut s = if self.slots.len() >= RA_SLOTS {
+            self.slots.pop().expect("RA_SLOTS > 0")
+        } else {
+            unafs::readahead::ReadAheadCache::new(self.window)
+        };
+        let r = s.read(lba, out, dev_sectors, |start, b| {
+            TX_FILLS.fetch_add(1, Ordering::Relaxed);
+            fetch(start, b)
+        });
+        self.slots.insert(0, s);
+        r
+    }
 }
