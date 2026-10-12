@@ -2396,3 +2396,40 @@ pub const RING_KDF_T: u32 = WINDOW2_KDF_T;
 /// HOLOCRONARM: lanes for a new ring.
 pub const RING_KDF_P: u32 = WINDOW2_KDF_P;
 const _: () = assert!(RING_KDF_M_KIB <= WINDOW2_KDF_M_KIB && RING_KDF_M_KIB >= 19 * 1024 && RING_KDF_M_KIB >= 8 * RING_KDF_P);
+
+// =================================================================================================
+// RING3EXEC (rmbp-ledger B521) — spawn by PATH for ring 3. `SYS_SPAWN` (8) instantiates only the fixed staged
+// HELLO.BIN; a ring-3 shell (MIDDEN.ELF) needs `run <path>` and bare names. The kernel resolves the path in the
+// live namespace, reads the image AS THE CALLER (the VFS ACL: owner/grants, ROOTACL's `system` reads for
+// everyone), applies the shell's `run`/bare-name pre-checks (regular file, non-empty, within the user image cap,
+// short read, ELF64 magic/class/data/e_machine), APPTRUST's direct-launch door (a program off the system volume
+// is launched only once the user said Open this session), and spawns it DETACHED — the `bg` body — under the
+// CALLER's principal (an anonymous caller's child is anonymous). x86 only; elsewhere the unknown-syscall default.
+// Appended at the file tail so no existing line moves. Design: docs/dev/OS/02_KERNEL_CORE/userspace.md §RING3EXEC.
+//
+//   `SYS_SPAWN_PATH(path_ptr, path_len, argv_ptr, argc)` -> the child's pid (> 0) or -errno.
+//     path    absolute, 2..=PATH_IO_PATH_MAX bytes of UTF-8, no empty / `.` / `..` component.
+//     argv    `argc` (0..=ARGS_MAX) descriptors of [`SpawnArg`] (`[ptr u64][len u64]`, each string
+//             1..=SPAWN_ARG_MAX bytes of UTF-8); argc 0 = argv `[path]`. argv[0] is the word that named it.
+//     errors  -EINVAL (bad path/argv shape), -EFAULT (a pointer outside the caller's window), -ENOENT,
+//             -EISDIR, -EACCES (the ACL refused the read, or APPTRUST did not grant the launch), -E2BIG
+//             (image over the cap / argv over the args page), -ENOEXEC (not an ELF64 image for this arch),
+//             -EIO (short read), -EAGAIN (the loader refused: process table, slots, memory's limit).
+// =================================================================================================
+
+/// `SYS_SPAWN_PATH(path_ptr, path_len, argv_ptr, argc)` — see the block above.
+pub const SYS_SPAWN_PATH: u64 = 68; // after RINGLOGIN's SYS_RINGKEY (67)
+/// One argv descriptor in the caller's memory.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpawnArg {
+    pub ptr: u64,
+    pub len: u64,
+}
+/// Bytes of one argv string at most.
+pub const SPAWN_ARG_MAX: usize = 255;
+/// Argument list too long / image over the cap.
+pub const E2BIG: i64 = -7;
+/// Not an executable image for this arch.
+pub const ENOEXEC: i64 = -8;
+const _: () = assert!(SYS_SPAWN_PATH == SYS_RINGKEY + 1 && core::mem::size_of::<SpawnArg>() == 16);

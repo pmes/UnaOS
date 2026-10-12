@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -16969,7 +16969,7 @@ pub fn run_user_image_argv(
 /// runs the BGRUN-SCAV sweep before refusing, reclaiming `bg_owned` rows that exited and were never
 /// reaped. So a shell that never runs `jobs` loses exit STATUSES, not launch capacity.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, false, &[])
+    spawn_user_image_bg_inner(bytes, false, &[], None)
 }
 
 /// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
@@ -16986,17 +16986,17 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 /// and has exactly one caller — and it is `wc`-gated, because that caller is.
 #[cfg(feature = "wc")]
 pub fn spawn_user_image_bg_no_autofocus(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, true, &[])
+    spawn_user_image_bg_inner(bytes, true, &[], None)
 }
 
 fn spawn_user_image_bg_inner(
     bytes: &[u8],
     no_autofocus: bool,
-    argv: &[&str],
+    argv: &[&str], as_row: Option<usize>,
 ) -> Result<(u64, u64, u64), &'static str> {
     let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists
-    let (mapped, pi) = load_program_common(bytes)?; super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    let (mapped, pi) = load_program_common(bytes)?; super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
     // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
     // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
@@ -30093,7 +30093,7 @@ pub fn run_user_image(name: &'static str, bytes: &[u8], deadline_ms: u64) -> Res
 /// RING3ABI2 M2: the background launcher WITH words — `bg <path> a b`, and a bare name that detaches.
 /// `argv[0]` is the word that named the program. Otherwise exactly [`spawn_user_image_bg`].
 pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, false, argv)
+    spawn_user_image_bg_inner(bytes, false, argv, None)
 }
 
 /// RING3ABI2 M3: `SYS_WHOAMI(buf, len)` — who the CALLER's slot runs as. With `login`, a slot stamped
@@ -30659,3 +30659,219 @@ pub fn fg_live() -> bool {
     FG_RUN.try_lock().map(|g| g.is_some()).unwrap_or(true)
 }
 
+
+// =================================================================================================
+// RING3EXEC (rmbp-ledger B521) — TAIL-APPENDED, so no panic Location above moves. Two ring-3 doors a shell needs:
+//
+// * `SYS_SPAWN_PATH` (68; una-abi's RING3EXEC block) — spawn a program BY PATH. The checks are the shell's own,
+//   in its order (`shell.rs` `read_el0_image` → `bare_exec` → `bg_image`): the path is opened for read AS THE
+//   CALLER (`MountTable::open_read` — the VFS ACL: native `owner`/`grants:` rows through `unafs::read_authz`,
+//   ROOTACL's `system` trees read for everyone, a foreign volume its mount capability); a directory, an empty
+//   file, an image over `user_image_cap()` (the ELF window) and a short read are refused; the image must carry the
+//   ELF64 magic (`bare_exec`'s rule: ring 3 never reaches the flat-blob path), class 2, little-endian and
+//   EM_X86_64. Then APPTRUST's direct-launch door (`apptrust::launch_gate`, the one Quarry's double-click asks): a
+//   program off the system volume launches only once the user said Open this session. Then `bg`'s body —
+//   `spawn_user_image_bg_inner`, DETACHED, the app note read for the wire — with the child stamped from the
+//   CALLER's live principal (`slot_user_inherit`): a ring-3 program launches only as what it already is, so an
+//   anonymous program's child is anonymous even while a session is open. Refusals print `[spawnpath] … ->
+//   refused=<why>` beside the `[apptrust]` line the gate prints.
+// * `SYS_PATH_READ` (59) on the default kernel — read and LIST only, always under the caller's principal. The
+//   `selfdiag` gate protected two things and both stay behind it: `SYS_PATH_WRITE` (60) and `principal_for`'s
+//   installer grant (the kernel's authority over `/SRC`, `/system`, `/var/log/diag.*`). Without `selfdiag`
+//   no ring-3 program writes through a path or reads with the kernel's authority; with it, `sys_pathio` above
+//   answers exactly as before (its listing now under the same ACL, `selfdiag::list_dir`).
+// =================================================================================================
+
+/// RING3EXEC: a path the ring-3 path doors accept — absolute, at most `PATH_IO_PATH_MAX` bytes, no empty / `.` /
+/// `..` component (`selfdiag::path_ok`'s rule; `/` itself only where a caller allows it).
+fn ring3_path_ok(p: &str) -> bool {
+    p.starts_with('/') && p.len() >= 2 && p.len() <= una_abi::PATH_IO_PATH_MAX && p[1..].split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// RING3EXEC: the child of a ring-3 launch carries the CALLER's live user (0 = anonymous), not the session's.
+/// Runs right after `slot_user_stamp`, before the task exists; the epoch that call wrote stays (the child belongs
+/// to the live session's lifetime, as its parent does). `None` = a kernel launch: the session stamp stands.
+#[cfg(feature = "login")]
+fn slot_user_inherit(slot: usize, from: Option<usize>) {
+    if let Some(caller) = from {
+        if row_known(slot) {
+            SLOT_USER[slot].store(slot_user_live(caller), Ordering::Release);
+        }
+    }
+}
+
+/// RING3EXEC: `SYS_PATH_READ(req_ptr, req_len, out_ptr, out_cap)` on a kernel without `selfdiag` — the same
+/// request layout (una-abi's SELFDIAG block), READ and `PATH_R_LIST` only, the caller's principal only.
+#[cfg(not(feature = "selfdiag"))]
+fn sys_pathread(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let h = una_abi::PATH_IO_HDR_LEN;
+    let n = a1 as usize;
+    if n <= h || n > h + una_abi::PATH_IO_PATH_MAX {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if let Err(e) = copy_from_user(&mut inb, a0) {
+        return e;
+    }
+    let plen = u16::from_le_bytes([inb[0], inb[1]]) as usize;
+    let flags = u16::from_le_bytes([inb[2], inb[3]]);
+    let rsv = u32::from_le_bytes([inb[4], inb[5], inb[6], inb[7]]);
+    let mut o8 = [0u8; 8];
+    o8.copy_from_slice(&inb[8..16]);
+    let off = u64::from_le_bytes(o8);
+    let list = flags & una_abi::PATH_R_LIST != 0;
+    if rsv != 0 || plen == 0 || n != h + plen || flags & !una_abi::PATH_R_LIST != 0 {
+        return EINVAL;
+    }
+    let Ok(path) = core::str::from_utf8(&inb[h..]) else {
+        return EINVAL;
+    };
+    if !(ring3_path_ok(path) || (list && path == "/")) {
+        return EINVAL;
+    }
+    let cap = (a3 as usize).min(una_abi::PATH_IO_MAX);
+    let who = attrsurf_principal(caller_row());
+    let mt = crate::shell::vfs_mount_table();
+    let errno = |e: crate::fs::vfs::VfsError| crate::fs::attrsys::errno_of(&e);
+    let out = if list {
+        match mt.list_as(path, &who) {
+            Ok(ents) => crate::fs::vfs::listing_window(&ents, off, cap),
+            Err(e) => return errno(e),
+        }
+    } else {
+        let st = match mt.open_read(path, &who) {
+            Ok(s) => s,
+            Err(e) => return errno(e),
+        };
+        if st.kind == crate::fs::vfs::NodeKind::Dir {
+            return una_abi::EISDIR;
+        }
+        if off >= st.size || cap == 0 {
+            return 0;
+        }
+        match mt.read(path, off, ((st.size - off) as usize).min(cap)) {
+            Ok(b) => b,
+            Err(e) => return errno(e),
+        }
+    };
+    if !out.is_empty() {
+        if let Err(e) = copy_to_user(a2, &out) {
+            return e;
+        }
+    }
+    out.len() as i64
+}
+
+/// RING3EXEC: `SYS_SPAWN_PATH(path_ptr, path_len, argv_ptr, argc)` — copy the path and the argv in through the
+/// read seam (`copy_from_user`, `SYS_OPEN`'s name discipline: the whole range validated, then copied), then
+/// [`spawn_path_checked`]. The pid, or a negative errno.
+fn sys_spawn_path(path_ptr: u64, path_len: u64, argv_ptr: u64, argc: u64) -> i64 {
+    let row = caller_row();
+    let n = path_len as usize;
+    if n < 2 || n > una_abi::PATH_IO_PATH_MAX {
+        return EINVAL;
+    }
+    let mut pb = [0u8; una_abi::PATH_IO_PATH_MAX];
+    if let Err(e) = copy_from_user(&mut pb[..n], path_ptr) {
+        return e;
+    }
+    let Ok(path) = core::str::from_utf8(&pb[..n]) else {
+        return EINVAL;
+    };
+    if !ring3_path_ok(path) {
+        return EINVAL;
+    }
+    let argc = argc as usize;
+    if argc > una_abi::ARGS_MAX {
+        return una_abi::E2BIG;
+    }
+    let mut words: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::with_capacity(argc.max(1));
+    if argc == 0 {
+        words.push(alloc::string::String::from(path));
+    } else {
+        let mut desc = alloc::vec![0u8; argc * core::mem::size_of::<una_abi::SpawnArg>()];
+        if let Err(e) = copy_from_user(&mut desc, argv_ptr) {
+            return e;
+        }
+        for d in desc.chunks_exact(16) {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&d[0..8]);
+            let p = u64::from_le_bytes(w);
+            w.copy_from_slice(&d[8..16]);
+            let l = u64::from_le_bytes(w) as usize;
+            if l == 0 || l > una_abi::SPAWN_ARG_MAX {
+                return EINVAL;
+            }
+            let mut b = alloc::vec![0u8; l];
+            if let Err(e) = copy_from_user(&mut b, p) {
+                return e;
+            }
+            match alloc::string::String::from_utf8(b) {
+                Ok(s) if !s.contains('\0') => words.push(s),
+                _ => return EINVAL,
+            }
+        }
+    }
+    let who = attrsurf_principal(row);
+    match spawn_path_checked(path, &words, &who, row) {
+        Ok(pid) => pid as i64,
+        Err((e, why)) => {
+            serial_println!("[spawnpath] path={} principal={} argc={} -> refused={} errno={}", path, who, words.len(), why, e);
+            e
+        }
+    }
+}
+
+/// RING3EXEC: the shell's checks on `path` as `who`, APPTRUST's door, then `bg`'s body under the caller's
+/// principal (see the block above). `Ok(pid)` once the child is spawned.
+fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, row: usize) -> Result<u64, (i64, &'static str)> {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let mt = crate::shell::vfs_mount_table();
+    let st = mt.open_read(path, who).map_err(|e| (crate::fs::attrsys::errno_of(&e), if matches!(e, VfsError::Denied) { "acl-read" } else { "open" }))?;
+    if st.kind == NodeKind::Dir {
+        return Err((una_abi::EISDIR, "is-a-directory"));
+    }
+    if st.size == 0 {
+        return Err((una_abi::ENOEXEC, "empty-file"));
+    }
+    if st.size > user_image_cap() as u64 {
+        return Err((una_abi::E2BIG, "over-image-cap"));
+    }
+    if !crate::fs::apptrust::launch_gate(&mt, path) {
+        return Err((una_abi::EACCES, "apptrust"));
+    }
+    let bytes = mt.read(path, 0, st.size as usize).map_err(|e| (crate::fs::attrsys::errno_of(&e), "read"))?;
+    if bytes.len() as u64 != st.size {
+        return Err((EIO, "short-read"));
+    }
+    if !(bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F']) {
+        return Err((una_abi::ENOEXEC, "not-elf"));
+    }
+    if bytes[4] != 2 {
+        return Err((una_abi::ENOEXEC, "not-elf64"));
+    }
+    if bytes[5] != 1 {
+        return Err((una_abi::ENOEXEC, "not-little-endian"));
+    }
+    if u16::from_le_bytes([bytes[18], bytes[19]]) != 62 {
+        return Err((una_abi::ENOEXEC, "not-x86-64"));
+    }
+    let note = super::elf::app_flags(&bytes);
+    let argv: alloc::vec::Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    crate::prof::launching(path);
+    match spawn_user_image_bg_inner(&bytes, false, &argv, Some(row)) {
+        Ok((pid, slot, entry)) => {
+            crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), path);
+            crate::fs::appres::sight(path);
+            serial_println!(
+                "[spawnpath] path={} principal={} bytes={} note={} pid={} slot={} entry={:#x} argc={} -> started",
+                path, who, bytes.len(), note, pid, slot, entry, argv.len()
+            );
+            Ok(pid)
+        }
+        Err(why) => {
+            serial_println!("[spawnpath] path={} loader={}", path, why);
+            Err((if why.contains("args page") { una_abi::E2BIG } else { EAGAIN }, "loader"))
+        }
+    }
+}
