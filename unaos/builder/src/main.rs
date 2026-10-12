@@ -1104,6 +1104,9 @@ fn main() {
     if !bootloader_status.success() {
         panic!("Bootloader build failed");
     }
+    // FOLDBUILD (B517): `--build-only` stops HERE — the same two cargo builds every media path runs, with this file's own
+    // env→feature derivation above, and nothing after: no ESP, no staging, no fetch, no QEMU (`./arroyo foldleg`, a fold leg).
+    if std::env::args().any(|a| a == "--build-only") { println!("✅ x86_64 kernel + bootloader built (--build-only: no ESP, no QEMU)"); return; }
 
     let kernel_bin = target_dir.join("x86_64-unaos/release/unaos-kernel");
     let bootloader_bin = target_dir.join("x86_64-unknown-uefi/release/bootloader.efi");

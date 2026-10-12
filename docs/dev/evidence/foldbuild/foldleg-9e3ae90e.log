@@ -1,0 +1,17 @@
+FOLDLEG: tree=/root/unaos-bench/scratch/cloud/foldbuild/wt-9e3ae90e/unaos line=/home/user/exec/foldbuild/unaos/scripts/image-line.env @untracked knobs=44 caller_knobs_cleared=0 skipped=UNAOS_WIFI_FW_PATH (media-only: no compile reads it — arroyo stages it onto the card)
+FOLDLEG: note — this tree's builder predates --build-only; ran with UNAOS_PACKAGE_ONLY=1 UNAOS_TESTF=0 UNAOS_NOSRC=1 (no QEMU, no fetch)
+⚡ kernel features: witness,selfhost,wcg-paygo,wcdvalve,logts,ehcihid,kbdwit,smc,sdw,sdhcblk,bt,btc,login,installdemo,smolnet,wifi,wifi2,wifi3,wifi4,nvidia-kepler,nvidia-kepler-takeover,noaspm,wc,nvidia-kepler-vblank,deadman,instgui,linuxabi,busreg,lumen,netring3,selfdiag,lidsleep,videoplayer,intel-ivb,unaos_ivb,gen7,gen7r8,gen7blit,gmux_igd,beam,quarry,facet,sdwrite,ftdirx,usbnet,ahci,ahci-write,unafs,hda,hda-tone,ioapic
+FOLDLEG: builder features (the list cargo got): witness,selfhost,logts,wcg-paygo,wcdvalve,quarry,facet,ehcihid,kbdwit,smc,sdwrite,sdw,sdhcblk,ahci,ahci-write,unafs,hda,hda-tone,usbnet,wifi,wifi2,wifi3,wifi4,bt,btc,login,nvidia-kepler,nvidia-kepler-takeover,beam,wc,noaspm,nvidia-kepler-vblank,deadman,instgui,linuxabi,busreg,lumen,netring3,selfdiag,lidsleep,videoplayer,intel-ivb,unaos_ivb,gen7,gen7,gen7r8,gen7,gen7blit,gmux_igd,installdemo,smolnet,ftdirx,ioapic
+FOLDLEG: error[E0252]: the name `Vec` is defined multiple times
+FOLDLEG:      --> crates/kernel/src/fs/jobs.rs:252:5
+FOLDLEG: error[E0069]: `return;` in a function whose return type is not `()`
+FOLDLEG:      --> crates/kernel/src/video/winmemory.rs:209:63
+FOLDLEG: error: could not compile `unaos-kernel` (lib) due to 2 previous errors; 68 warnings emitted
+FOLDLEG: selfbuild=not-armed path=builder --build-only llvm_src_touched=no build_s=581 log=target/foldleg-builder.log
+FOLDLEG: x86 kernel+loader built under image-line.env @untracked features=53 -> FAIL rc=101
+FOLDLEG: runtime_s=583
+
+real	9m44.983s
+user	3m19.088s
+sys	0m10.568s
+rc=1
