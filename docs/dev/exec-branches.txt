@@ -341,3 +341,10 @@ refs/heads/exec-rmbp-f3f4               d8dadacc FOLDED-BY-HAND rmbp            
 refs/heads/exec-rmbp-merge7             d7a5ae12 FOLDED-BY-HAND rmbp                      2026-10-02
 refs/heads/exec-rmbp-merge8             a2cbebf5 FOLDED-BY-HAND rmbp                      2026-10-02
 refs/heads/exec-rmbp-merge9             7ef8db88 FOLDED-BY-HAND rmbp                      2026-10-02
+refs/heads/exec-rmbp-aethermetal            5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aetherhover            5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aetherinput            5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aetherselect           5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aethernet              5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aethergen              5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aetherwpt              5c96bb9b IN-FLIGHT rmbp 2026-10-12
