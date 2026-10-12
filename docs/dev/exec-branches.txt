@@ -343,10 +343,10 @@ refs/heads/exec-rmbp-merge8             a2cbebf5 FOLDED-BY-HAND rmbp            
 refs/heads/exec-rmbp-merge9             7ef8db88 FOLDED-BY-HAND rmbp                      2026-10-02
 refs/heads/exec-rmbp-aethermetal            75326410 FOLDED-BY-HAND db66e678 2026-10-12
 refs/heads/exec-host-aetherhover            7ca72388 FOLDED-BY-HAND db66e678 2026-10-12
-refs/heads/exec-host-aetherinput            5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aetherinput            14d4a31c FOLDED-BY-HAND 75af8a58 2026-10-12
 refs/heads/exec-host-aetherselect           011d5c84 FOLDED-BY-HAND 631922a1 2026-10-12
-refs/heads/exec-host-aethernet              5c96bb9b IN-FLIGHT rmbp 2026-10-12
-refs/heads/exec-host-aethergen              5c96bb9b IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-host-aethernet              25596358 FOLDED-BY-HAND 0c4acb9e 2026-10-12
+refs/heads/exec-host-aethergen              1479425d FOLDED-BY-HAND 56368d7b 2026-10-12
 refs/heads/exec-host-aetherwpt              30c19103 FOLDED-BY-HAND d27d943c 2026-10-12
 refs/heads/exec-host-editcore               022bea1e FOLDED-BY-HAND db66e678 2026-10-12
 refs/heads/exec-host-tabulabus              167b6475 FOLDED-BY-HAND db66e678 2026-10-12
