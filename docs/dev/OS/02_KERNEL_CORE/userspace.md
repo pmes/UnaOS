@@ -4022,3 +4022,35 @@ holds una-abi, the kernel, arroyo and the builder to it. Linux ABI (x86 `linuxab
 ET_EXEC may load in `0x10000..64 MiB` (`IMAGE_LIMIT`, checked to be free RAM outside the kernel heap; the
 user frame pool starts above it); a static-PIE ET_DYN loads at `PIE_BASE` in the process's private
 PML4[2] half. Design and numbers: `docs/dev/evidence/rmbp-1005/WINDOW2.md`.
+
+## RING3EXEC — spawn by path, and the listing under the ACL (rmbp-ledger B521, 2026-10-12, x86)
+
+The ring-3 syscall table gains one number; the next free syscall number is **69**.
+
+| nr | name | args | returns | x86 | aarch64 |
+|---|---|---|---|---|---|
+| 59 | `SYS_PATH_READ` | `req_ptr, req_len, out_ptr, out_cap` (una-abi SELFDIAG layout; flags 0 = file bytes, `PATH_R_LIST` = directory names) | bytes copied out (0 = end) / -errno | **default kernel:** read + list, caller's principal only; **`selfdiag`:** `sys_pathio` as before (installer grant, writes) | `selfdiag` only |
+| 60 | `SYS_PATH_WRITE` | `req_ptr, req_len` | bytes written / -errno | `selfdiag` only | `selfdiag` only |
+| 68 | `SYS_SPAWN_PATH` | `path_ptr, path_len, argv_ptr, argc` (`argc` × `SpawnArg {ptr u64, len u64}`, 0..=`ARGS_MAX`; argc 0 = argv `[path]`) | child pid (> 0) / -errno | always | unknown-syscall default |
+
+**`SYS_SPAWN_PATH`** (`arch/x86_64/syscall.rs` tail, `sys_spawn_path` → `spawn_path_checked`). The path
+(2..=`PATH_IO_PATH_MAX` bytes, absolute, no empty/`.`/`..` component) and every argv string (1..=`SPAWN_ARG_MAX`
+bytes, UTF-8, no NUL) come in through `copy_from_user` — the `SYS_OPEN` name discipline. Then, in the order the
+shell's `run`/bare-name path applies them (`shell.rs` `read_el0_image`, `bare_exec`, `bg_image`): open-for-read AS
+THE CALLER (`MountTable::open_read`, the VFS ACL — `-EACCES` refused=acl-read); a directory `-EISDIR`; empty
+`-ENOEXEC`; over `user_image_cap()` `-E2BIG`; APPTRUST's direct-launch door (`apptrust::launch_gate`, `-EACCES`
+refused=apptrust — on a `wc` build the user is asked once and a retry after Open launches); the read, short read
+`-EIO`; ELF64 magic (ring 3 never takes the flat path), class 2, little-endian, EM_X86_64 (`-ENOEXEC`). The launch
+is `bg`'s body (`spawn_user_image_bg_inner`, detached, `bg_owned` so BGRUN-SCAV reaps it), the window named from
+the path, APPRES sighting it; the child's user stamp is the CALLER's live user (`slot_user_inherit`, after the
+LOGIN M1 stamp), never the session's by default. Loader refusals are `-EAGAIN` (`-E2BIG` for an argv over the
+args page). Wire: `[spawnpath] path=<p> principal=<who> bytes=<n> note=<flags> pid=<pid> slot=<s> entry=<va>
+argc=<n> -> started`, or `[spawnpath] path=<p> principal=<who> argc=<n> -> refused=<why> errno=<e>`.
+
+**`PATH_R_LIST` under the ACL** (`fs/vfs.rs` tail `MountTable::list_as` + `listing_window`, used by the default
+x86 `sys_pathread` and by `selfdiag::list_dir`): the directory is opened for read as the caller and listed only if
+the ACL permits — HOLOCRON2's home-only rule is retired. `/` itself is a legal path for a listing.
+
+The ring-3 shell (`crates/user-midden`, MIDDENTWIN) uses both: `run <path> [args]` and bare names launch through
+`SYS_SPAWN_PATH` (`:: MIDDEN: plan=Exec verb=<run|typed> served=1 pid=<n> ::`), `ls <dir>` reads the ACL listing.
+The program change is `docs/dev/evidence/ring3exec/user-midden.patch`, applied at the fold after MIDDENTWIN.

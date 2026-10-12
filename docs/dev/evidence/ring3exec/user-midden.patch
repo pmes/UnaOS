@@ -1,0 +1,184 @@
+RING3EXEC (rmbp-ledger B521) — user-midden's half, as a patch against MIDDENTWIN's program
+(exec-rmbp-middentwin @07c514e7, unaos/crates/user-midden/src/main.rs). The crate is not on RING3EXEC's base;
+the seat applies this at the fold, after MIDDENTWIN lands:  git apply docs/dev/evidence/ring3exec/user-midden.patch
+What it does: Facts::ring3 with exec ON (x86: the kernel carries SYS_SPAWN_PATH); `run <path> [args]` served
+through midden_core::resolve_exec + SYS_SPAWN_PATH; bare names (Plan::Exec) launched the same way; the wire line
+`:: MIDDEN: plan=Exec verb=<run|typed> served=1 pid=<n> ::` (or `served=0 err=<errno>`); `ls <dir>` unchanged in
+code (SYS_PATH_READ + PATH_R_LIST), now governed kernel-side by the ownership ACL; errno texts updated.
+Built: crates/user-midden, cargo +nightly build --release -Z json-target-spec --target x86_64-unknown-none.json
+with build_user_midden_x86's RUSTFLAGS, over 07c514e7's tree + RING3EXEC's una-abi -> rc=0, no warnings.
+
+diff --git a/unaos/crates/user-midden/src/main.rs b/unaos/crates/user-midden/src/main.rs
+--- a/unaos/crates/user-midden/src/main.rs
++++ b/unaos/crates/user-midden/src/main.rs
+@@ -9,23 +9,27 @@
+ //
+ // WHAT IT IS. One compositor window: a scrollback ring over a prompt line with a caret. Every typed line goes
+ // through `midden_core::plan(line, &facts, &mut vol)`:
+-//   * `facts` = `Facts::ring3(x86)` — what the ring-3 ABI can do. There is no spawn-by-path syscall
+-//     (`SYS_SPAWN` loads only the fixed staged program), so the process verbs and bare-name launch are OFF and
+-//     the core answers them with its own refusal; `help` is the core's text for those facts.
++//   * `facts` = `Facts::ring3(x86)` with `exec` ON where the kernel carries `SYS_SPAWN_PATH` (RING3EXEC,
++//     rmbp-ledger B521: x86) — a bare name the core's `resolve_exec` finds is launched by path, and `run <path>`
++//     is served here through the same syscall (the kernel applies the shell's own checks under this program's
++//     principal and answers a pid or an errno). `bg`/`jobs`/`kill`/`storm` stay off (`proc_verbs`): ring 3
++//     holds no job table; a launched program is detached, the kernel's `bg` body.
+ //   * `vol` = a `Volume` over `SYS_STAT` on the cwd-resolved path (a regular file = kind 0).
+ //   * the plan is executed through the syscalls it names: `Say` renders the core's text; `Host` verbs in
+ //     `midden_core::ring3::SERVED` are fulfilled here (`ls`/`dir` = SYS_PATH_READ + PATH_R_LIST, `cat`/`type` =
+ //     SYS_PATH_READ, `cd` = SYS_STAT kind 1, `stat` = SYS_STAT, `pwd`/`clear`/`history` are the window's own
+ //     state); every other verb prints `midden_core::ring3::refusal(verb)` — the core's text, never a stub.
+-//     Each refusal from the kernel names its errno and the reason (e.g. a listing outside the caller's home is
+-//     -EACCES: PATH_R_LIST is home-scoped; a kernel without `selfdiag` answers SYS_PATH_* with -ENOSYS).
++//     Each refusal from the kernel names its errno and the reason (RING3EXEC: a listing is governed by the
++//     volume's ownership ACL — a directory this program's principal may not read is -EACCES by the ACL's word;
++//     SYS_PATH_READ is on the default x86 kernel, SYS_PATH_WRITE only under `selfdiag`).
+ //
+ // KEYS. Printable ASCII inserts at the caret; Backspace deletes; Left/Right move the caret; Up/Down walk the
+ // history; Enter runs the line; Ctrl+C clears the line (`^C`); `exit`/`quit` (the core's CLOSES) close the
+ // window and exit; a window close request does the same.
+ //
+ // WIRE. `:: MIDDEN: start window=<id> font=<face|font8x8 font_why=<w>> facts=ring3 cwd=<p> ::` once, then per
+-// line `:: MIDDEN: plan=<Nothing|Say|Host|Exec> verb=<v> served=<1|0> rows=<n> ::`, and on exit
++// line `:: MIDDEN: plan=<Nothing|Say|Host> verb=<v> served=<1|0> rows=<n> ::` — a launch (`run <path>` or a bare
++// name) is `:: MIDDEN: plan=Exec verb=<run|typed> served=1 pid=<n> ::`, or `served=0 err=<errno>` — and on exit
+ // `:: MIDDEN: exit status=<s> rows=<n> cmds=<n> ::`. The exit status packs the same facts
+ // (`midden_core::ring3::status`) — the channel `tests midden` (kernel `middenapp.rs`) reads back.
+ 
+@@ -159,8 +163,12 @@
+ /// An errno's name and the ring-3 reason it most often carries here.
+ fn errno_text(e: i64) -> &'static str {
+     match e {
+-        una_abi::ENOSYS => "ENOSYS (this kernel offers ring 3 no SYS_PATH_* — built without `selfdiag`)",
+-        una_abi::EACCES => "EACCES (ring 3 lists and reads only what its principal may: PATH_R_LIST is home-scoped)",
++        una_abi::ENOSYS => "ENOSYS (this kernel does not carry that syscall for ring 3)",
++        una_abi::EACCES => "EACCES (refused by the ownership ACL for this program's principal, or APPTRUST: answer the Open question first)",
++        una_abi::E2BIG => "E2BIG (the image exceeds the user window, or the words exceed the args page)",
++        una_abi::ENOEXEC => "ENOEXEC (not an ELF64 program for this machine)",
++        una_abi::EAGAIN => "EAGAIN (the loader refused: process table or memory's limit)",
++        una_abi::EIO => "EIO (short read)",
+         una_abi::ENOENT => "ENOENT (no such file or directory)",
+         una_abi::EISDIR => "EISDIR (a directory: use ls)",
+         una_abi::ENOTDIR => "ENOTDIR (not a directory)",
+@@ -254,11 +262,28 @@
+             }
+         }
+         let facts = self.facts;
++        let word = midden_core::canon_verb(line.split_whitespace().next().unwrap_or(""));
++        if word == "run" && facts.exec {
++            // RING3EXEC (B521): `run <path> [args]` — not a verb on `Facts::ring3` (no job table), served here: the
++            // core's resolver finds the program, SYS_SPAWN_PATH launches it with argv = the words after `run`.
++            let words: Vec<&str> = line.split_whitespace().skip(1).collect();
++            let r = match words.first() {
++                None => {
++                    self.say(Tone::Err, "usage: run <path> [args]");
++                    Err(una_abi::EINVAL)
++                }
++                Some(&prog) => {
++                    let found = midden_core::resolve_exec(prog, &mut R3Vol { cwd: &self.cwd });
++                    self.launch("run", prog, found.as_deref(), &words)
++                }
++            };
++            self.exec_done("run", r);
++            return;
++        }
+         let p = {
+             let mut vol = R3Vol { cwd: &self.cwd };
+             plan(line, &facts, &mut vol)
+         };
+-        let word = midden_core::canon_verb(line.split_whitespace().next().unwrap_or(""));
+         if let Plan::Say(_) = p {
+             if ring3::CLOSES.contains(&word.as_str()) {
+                 self.close();
+@@ -270,6 +295,9 @@
+                 self.msg(m);
+                 if word == "help" {
+                     self.say(Tone::Out, &alloc::format!("MIDDEN.ELF serves: {} (+ the core's own words above)", ring3::SERVED.join(" ")));
++                    if facts.exec {
++                        self.say(Tone::Out, "MIDDEN.ELF launches: run <path> [args], and bare names (detached, as this program's user)");
++                    }
+                 }
+                 (1, word.clone(), true)
+             }
+@@ -283,11 +311,13 @@
+                 }
+                 (2, verb.clone(), served)
+             }
+-            // `Facts::ring3` has `exec == false`, so the core never plans a launch here; the refusal is the core's.
+-            Plan::Exec { typed, .. } => {
+-                let r = ring3::refusal(typed);
+-                self.msg(&r);
+-                (3, typed.clone(), false)
++            // RING3EXEC (B521): a bare name the core resolved — launched by path, argv[0] = the word typed.
++            Plan::Exec { typed, name, args } => {
++                let mut argv: Vec<&str> = alloc::vec![typed.as_str()];
++                argv.extend(args.iter().map(|a| a.as_str()));
++                let r = self.launch(typed, typed, Some(name.as_str()), &argv);
++                self.exec_done(typed, r);
++                return;
+             }
+         };
+         if kind != 0 {
+@@ -301,6 +331,40 @@
+         l.wire();
+     }
+ 
++    /// RING3EXEC (B521): launch `found` (the core's resolution of `typed`, cwd-relative) with `argv` through
++    /// SYS_SPAWN_PATH. The pid, or the errno the kernel answered (its refusal line is on the wire beside ours).
++    fn launch(&mut self, verb: &str, typed: &str, found: Option<&str>, argv: &[&str]) -> Result<i64, i64> {
++        let Some(name) = found else {
++            self.say(Tone::Err, &alloc::format!("{}: {}: {}", verb, typed, errno_text(una_abi::ENOENT)));
++            return Err(una_abi::ENOENT);
++        };
++        let path = resolve(&self.cwd, name);
++        let r = spawn_path(&path, argv);
++        if r > 0 {
++            self.say(Tone::Out, &alloc::format!("{}: {} started - pid {}", verb, path, r));
++            Ok(r)
++        } else {
++            self.say(Tone::Err, &alloc::format!("{}: {}: {} {}", verb, path, r, errno_text(r)));
++            Err(r)
++        }
++    }
++
++    /// RING3EXEC (B521): account a launch line and put it on the wire —
++    /// `:: MIDDEN: plan=Exec verb=<v> served=1 pid=<n> ::` or `served=0 err=<errno>`.
++    fn exec_done(&mut self, verb: &str, r: Result<i64, i64>) {
++        self.cmds += 1;
++        self.last_kind = 3;
++        self.last_verb = ring3::verb_code(verb);
++        let mut l = Line::new(b":: MIDDEN: plan=Exec verb=");
++        l.put(verb.as_bytes());
++        match r {
++            Ok(pid) => l.put(b" served=1 pid=").dec(pid),
++            Err(e) => l.put(b" served=0 err=").dec(e),
++        };
++        l.put(b" ::");
++        l.wire();
++    }
++
+     fn host(&mut self, verb: &str, rest: &str) {
+         let args: Vec<&str> = rest.split_whitespace().collect();
+         let operand = args.iter().copied().find(|a| !a.starts_with('-'));
+@@ -584,6 +648,12 @@
+     Ok(out)
+ }
+ 
++/// RING3EXEC (B521): `SYS_SPAWN_PATH(path, len, argv, argc)` — the argv descriptors point at the words in place.
++fn spawn_path(path: &str, argv: &[&str]) -> i64 {
++    let descs: Vec<una_abi::SpawnArg> = argv.iter().map(|a| una_abi::SpawnArg { ptr: a.as_ptr() as u64, len: a.len() as u64 }).collect();
++    sys(una_abi::SYS_SPAWN_PATH, path.as_ptr() as u64, path.len() as u64, descs.as_ptr() as u64, descs.len() as u64)
++}
++
+ /// The start cwd: the session home (SYS_WHOAMI) when a user is logged in, else the root.
+ fn home() -> String {
+     let mut rec = [0u8; una_abi::WHOAMI_MAX];
+@@ -644,7 +714,7 @@
+         hist: VecDeque::new(),
+         hist_at: None,
+         cwd: home(),
+-        facts: Facts::ring3(cfg!(target_arch = "x86_64")),
++        facts: Facts { exec: cfg!(target_arch = "x86_64"), ..Facts::ring3(cfg!(target_arch = "x86_64")) }, // RING3EXEC (B521): SYS_SPAWN_PATH is x86's
+         cmds: 0,
+         last_kind: 0,
+         last_verb: 0,

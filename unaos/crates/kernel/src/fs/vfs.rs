@@ -3709,3 +3709,44 @@ impl TxCost {
         );
     }
 }
+// =================================================================================================
+// RING3EXEC (rmbp-ledger B521) — the ring-3 directory listing under the ownership ACL. TAIL-APPENDED: this file's
+// panic Locations are line-pinned, so nothing above moves. HOLOCRON2 (B355) confined `PATH_R_LIST` to the
+// caller's home because the listing read the directory with NO principal at all (`read_dir` is kernel-mode);
+// the home rule stood in for an ACL check that was never made. This is that check: the DIRECTORY is opened for
+// read AS THE CALLER through the resolved backend's `open_read` — native UnaFS asks `unafs::read_authz` on the
+// directory's own inode (`owner` / `grants:<principal>` with the read right; ROOTACL's `system` reads for
+// everyone), a foreign volume its mount capability — and only a permitted directory is listed. Shared by
+// `selfdiag::list_dir` (the selfdiag build) and the x86 default kernel's `SYS_PATH_READ` (`arch/x86_64/syscall.rs`).
+// =================================================================================================
+
+impl MountTable {
+    /// The entries of the directory `path` if `principal` may read it: `Denied` by the ACL's word,
+    /// `NotADirectory` for a file, else the backend's listing.
+    pub fn list_as(&self, path: &str, principal: &str) -> Result<Vec<DirEnt>, VfsError> {
+        let st = self.open_read(path, principal)?;
+        if st.kind != NodeKind::Dir {
+            return Err(VfsError::NotADirectory);
+        }
+        self.read_dir(path)
+    }
+}
+
+/// The `PATH_R_LIST` wire body for `ents`: names `\n`-terminated, a directory's with a trailing `/`, `.` and
+/// `..` left out; the window from byte `off`, at most `cap` bytes.
+pub fn listing_window(ents: &[DirEnt], off: u64, cap: usize) -> Vec<u8> {
+    let mut all = Vec::new();
+    for e in ents {
+        if e.name == "." || e.name == ".." {
+            continue;
+        }
+        all.extend_from_slice(e.name.as_bytes());
+        if e.kind == NodeKind::Dir {
+            all.push(b'/');
+        }
+        all.push(b'\n');
+    }
+    let o = (off as usize).min(all.len());
+    let n = (all.len() - o).min(cap);
+    all[o..o + n].to_vec()
+}
