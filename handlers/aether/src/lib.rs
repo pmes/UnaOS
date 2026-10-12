@@ -67,14 +67,6 @@ pub struct AetherEngine {
     /// (the frame whose text fragments a pointer is hit-tested against).
     layout_epoch: u64,
     painted_epoch: u64,
-}
-
-/// A selection drag (AETHERSELECT).
-#[derive(Clone, Copy, Debug)]
-struct SelDrag {
-    granularity: u8,
-    lo: selection::Point,
-    hi: selection::Point,
     /// AETHERINPUT (SR68): the focused text control's caret and selection anchor (byte offsets into its
     /// value; see `forms::edit`).
     pub edit: forms::edit::EditState,
@@ -83,6 +75,14 @@ struct SelDrag {
     caret_epoch: std::time::Instant,
     /// The blink phase the last frame painted.
     caret_on: bool,
+}
+
+/// A selection drag (AETHERSELECT).
+#[derive(Clone, Copy, Debug)]
+struct SelDrag {
+    granularity: u8,
+    lo: selection::Point,
+    hi: selection::Point,
 }
 
 /// Chromium's caret blink half-period (`LayoutTheme::CaretBlinkInterval`, 500 ms).
@@ -502,7 +502,7 @@ impl AetherEngine {
             self.relayout();
         }
         if let Some(url) = js::take_script_navigation() {
-            self.pending_nav = Some(forms::OpenDocument { url, method: forms::HttpMethod::Get, body: None });
+            self.pending_nav = Some(forms::OpenDocument { url, method: forms::HttpMethod::Get, body: None, content_type: None });
         }
         let cursor = match &target {
             Some(t) => css::cursor_for(t, hit.as_ref().is_some_and(|(_, text)| *text)),

@@ -2979,6 +2979,7 @@ mod tests {
         e.select_all();
         e.tick();
         assert_eq!(js(&mut e, "String(window.n)"), "2");
+    }
 
     // ---- AETHERGEN (SR71): generated content, counters, quotes, ::marker, focus states ----
 
