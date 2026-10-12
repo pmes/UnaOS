@@ -5148,11 +5148,13 @@ dependencies = [
 name = "tabula"
 version = "0.1.0"
 dependencies = [
+ "bandy",
  "elessar",
  "glib",
  "gtk4",
  "libspelling",
  "sourceview5",
+ "tokio",
 ]
 
 [[package]]

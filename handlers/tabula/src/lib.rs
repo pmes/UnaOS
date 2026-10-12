@@ -14,8 +14,10 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod bus;
 pub mod document;
 pub mod logview;
+pub use bus::ignite;
 pub use document::TabulaDocument;
 pub use logview::{default_console_log, is_log_path, LogText};
 
