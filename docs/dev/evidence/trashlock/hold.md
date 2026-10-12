@@ -26,8 +26,12 @@ Why LOCKREG said nothing: the MOUNT holder's spin on sdhc.rs:997 had ALREADY bee
 
 Honest limit: f28 does not print T's identity, so steps 1 and 2 are inferred from the code and the wire. The next boot's per-minute `[lock] spin-wait name=sdhc.rs:997 … on=<tid>@cpu<n>` and `[lock] held-too-long name=unafs.rs:567` confirm or refute it.
 
-## The fix at the source (OUTSIDE this brief's files, STOP-reported)
-In drivers/sdhc.rs, every `CARD.lock()` (:1008, :1013, :1019, :1025, :1039, :1537, :1704, :2231, :2241, :2650, :2773, :3383, :3431, :3623) is taken inside `crate::arch::without_interrupts`. A card holder then cannot be preempted (MOUNT's own discipline, sched.rs:32), so the masked MOUNT holder's spin on CARD is bounded by one SD command.
+## The release (drivers/sdhc.rs, granted into FILES by the coordinator)
+Every `CARD.lock()` is now taken under `crate::arch::without_interrupts`:
+- **Expression sites** are wrapped in place: :1008, :1013, :1019, :1025, :1039-1041, :2241, :3383 and :3431.
+- **Functions that hold the guard across a body** get a same-line wrapper. The public name masks, then runs the body under its new name `<name>_held`. These are `read_block_512` :1536, `read_blocks_512_pio` :1703, `read_blocks_512_adma` :2230, `read_blocks_512` :2637, `write_block_512` :2772 and `write_blocks_512` :3622. For the last two, the `_held` body keeps `#[cfg(feature = "sdw")]`.
+
+The rule: a CARD holder is never preemptible, so a masked spin on CARD is bounded by one SD command. This is sched.rs:32's rule for the mount, applied to the card. No line moved.
 
 ## Wire, next boot
 - Any wedge: `[lock] held-too-long name=unafs.rs:567 at=unafs.rs:794 by=<tid>@cpu<n>` once a minute while held, plus `[lock] spin-wait name=sdhc.rs:997 at=sdhc.rs:2650 waiter=<tid> on=<tid>@cpu<n>`.

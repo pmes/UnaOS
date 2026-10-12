@@ -1005,24 +1005,24 @@ static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
 /// (`drivers::block::SDHC_BLOCK_DEVICE`, reached through `read_block_sdhc`) that no pre-existing caller
 /// reads, so `block::info()` still names the boot volume and every current FAT user is untouched.
 pub fn card_num_blocks() -> Option<u64> {
-    CARD.lock().as_ref().map(|c| c.num_blocks)
+    crate::arch::without_interrupts(|| CARD.lock().as_ref().map(|c| c.num_blocks)) // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
 }
 
 /// Whether the identified card is block-addressed (SDHC/SDXC) rather than byte-addressed (SDSC).
 pub fn card_block_addressed() -> Option<bool> {
-    CARD.lock().as_ref().map(|c| c.block_addressing)
+    crate::arch::without_interrupts(|| CARD.lock().as_ref().map(|c| c.block_addressing)) // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
 }
 
 /// Whether the identified card implements SD Physical Layer 2.00 or later (it answered CMD8).
 /// `Some(false)` is a pre-v2.00 card identified through the v1.x branch — not a failure.
 pub fn card_spec_v2() -> Option<bool> {
-    CARD.lock().as_ref().map(|c| c.spec_v2)
+    crate::arch::without_interrupts(|| CARD.lock().as_ref().map(|c| c.spec_v2)) // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
 }
 
 /// SDHC-4a — whether the identified card declares itself write-protected in its own CSD:
 /// `(PERM_WRITE_PROTECT, TMP_WRITE_PROTECT)`. Either being true is a refusal for every write path.
 pub fn card_csd_write_protect() -> Option<(bool, bool)> {
-    CARD.lock().as_ref().map(|c| (c.csd_perm_wp, c.csd_tmp_wp))
+    crate::arch::without_interrupts(|| CARD.lock().as_ref().map(|c| (c.csd_perm_wp, c.csd_tmp_wp))) // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
 }
 
 /// SDHC-4a — the WRITE PROTECT SWITCH on the card's shell, read live from Present State bit 19.
@@ -1036,9 +1036,9 @@ pub fn card_csd_write_protect() -> Option<(bool, bool)> {
 /// Read fresh on every call rather than cached from bring-up: a slider is a physical
 /// thing and the only reading that can justify a write is the one taken next to it.
 pub fn card_write_protected() -> Option<bool> {
-    CARD.lock()
+    crate::arch::without_interrupts(|| CARD.lock() // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
         .as_ref()
-        .map(|c| r32(c.base, REG_PRESENT_STATE) & PS_WRITE_PROTECT == 0)
+        .map(|c| r32(c.base, REG_PRESENT_STATE) & PS_WRITE_PROTECT == 0)) // TRASHLOCK (B523): closes the masked span opened at :1039
 }
 
 // ===================================================================================
@@ -1533,7 +1533,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
 /// The addressing mode is taken from the card's CCS, which `identify` refused to guess at — an LBA
 /// handed to a byte-addressed card as if it were a block index reads the wrong 512 bytes without
 /// erroring, which is why that cross-check had to pass before this function could exist.
-pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_block_512_held(lba, buf)) } fn read_block_512_held(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = CARD.lock();
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if lba >= card.num_blocks {
@@ -1700,7 +1700,7 @@ fn abort_data_transfer(base: u64) {
 ///
 /// Every failure path prints the RAW Interrupt Status word that convicted it and then closes the
 /// card's side with [`abort_data_transfer`], so a failure here cannot poison the next command.
-fn read_blocks_512_pio(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> {
+fn read_blocks_512_pio(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_blocks_512_pio_held(lba, count, buf)) } fn read_blocks_512_pio_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = CARD.lock();
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     read_blocks_pio_on(card, lba, count, buf)
@@ -2227,7 +2227,7 @@ fn read_blocks_adma_on(
 }
 
 /// [`read_blocks_adma_on`] against the published card.
-fn read_blocks_512_adma(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> {
+fn read_blocks_512_adma(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { crate::arch::without_interrupts(|| read_blocks_512_adma_held(lba, count, buf)) } fn read_blocks_512_adma_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = CARD.lock();
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if card.adma != Adma2State::Ready {
@@ -2238,7 +2238,7 @@ fn read_blocks_512_adma(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, 
 
 /// The engine's state, copied out from under the lock.
 fn adma_state() -> Option<Adma2State> {
-    CARD.lock().as_ref().map(|c| c.adma)
+    crate::arch::without_interrupts(|| CARD.lock().as_ref().map(|c| c.adma)) // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
 }
 
 /// One in-boot DMA transfer, so a metal log says whether the engine ever ran at all.
@@ -2634,7 +2634,7 @@ fn verify_adma_ab(num_blocks: u64) {
 /// rather than re-failing (and re-printing) on every subsequent read.
 ///
 /// Deliberately NOT published into `drivers::block::BLOCK_DEVICE` — see [`card_num_blocks`].
-pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> {
+pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_blocks_512_held(lba, count, buf)) } fn read_blocks_512_held(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     if count == 0 {
         return Ok(0);
     }
@@ -2769,7 +2769,7 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
 ///   a card still programming answers CMD13 with a clean R1 whose state field says `prg`, and a
 ///   check that only masks for errors reads that as success.
 #[cfg(feature = "sdw")]
-pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> { crate::arch::without_interrupts(|| write_block_512_held(lba, buf)) } #[cfg(feature = "sdw")] fn write_block_512_held(lba: u64, buf: &[u8]) -> Result<(), BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = CARD.lock();
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if lba >= card.num_blocks {
@@ -3380,7 +3380,7 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     // anything) and BEFORE publication (so the card is never visible with a half-built engine).
     // Refusal is not failure: an unavailable engine names itself and the PIO path serves every read.
     adma2_init(&mut card, &caps);
-    *CARD.lock() = Some(card);
+    crate::arch::without_interrupts(|| *CARD.lock() = Some(card)); // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
 
     // Verification goes through the PUBLIC read path, after the card is published, so what the
     // witness exercises is exactly what a later caller would get — not a private shortcut.
@@ -3428,7 +3428,7 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     // `:: SDHCBLK: no FAT volume … ::`, which already separates NotFat from Io.
     #[cfg(feature = "sdhcblk")]
     {
-        let block_addressed = CARD.lock().as_ref().map(|c| c.block_addressing).unwrap_or(false);
+        let block_addressed = crate::arch::without_interrupts(|| CARD.lock().as_ref().map(|c| c.block_addressing).unwrap_or(false)); // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
         let registered = crate::drivers::block::register_sdhc(num_blocks, block_addressed);
         serial_println!(
             ":: SDHCREG: handle=built register={} blocks={} addressing={} — the internal card {} \
@@ -3619,7 +3619,7 @@ fn wait_prog_busy_ms(base: u64, budget_ms: u64) -> Option<u64> {
 /// `abort_data_transfer`'s own doc comment exists to prevent, and the one delta from the `emmc2`
 /// twin that [`write_block_512`] already carries.
 #[cfg(feature = "sdw")]
-pub fn write_blocks_512(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> {
+pub fn write_blocks_512(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { crate::arch::without_interrupts(|| write_blocks_512_held(lba, count, buf)) } #[cfg(feature = "sdw")] fn write_blocks_512_held(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
     let guard = CARD.lock();
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
 
