@@ -8885,7 +8885,7 @@ BRACEPY
             && TMPDIR="$(pwd)/target/host-tests-tmp" cargo test \
                 -p gneiss_pal -p quartzite -p elessar -p unafs -p ibus -p helm -p pca9685 \
                 -p bandy -p euclase -p vein -p matrix -p comscan -p aule -p tabula -p midden \
-                -p principia -p vertex -p foreman -p pulse -p lux); then
+                -p principia -p vertex -p foreman -p pulse -p lux -p edit_core); then
         echo -e "${COLOR_GREEN}  ✅ host suites, root workspace (20 crates)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ a root-workspace host test suite FAILED${COLOR_RESET}"

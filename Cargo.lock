@@ -1374,6 +1374,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "edit_core"
+version = "0.1.0"
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5148,6 +5152,7 @@ dependencies = [
 name = "tabula"
 version = "0.1.0"
 dependencies = [
+ "edit_core",
  "elessar",
  "glib",
  "gtk4",
