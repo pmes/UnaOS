@@ -13,6 +13,12 @@
 //! - an interval re-arms from its fire time, so a queue that fell behind never bursts to catch up;
 //! - every task runs under js_core's instruction budget (`js::TASK_BUDGET`), and the microtask
 //!   checkpoint after it is bounded too.
+//!
+//! The networking task source (AETHERNET, SR70) is `js::net`: body chunks, socket messages and
+//! server-sent events queued by worker threads run as tasks from [`Engine::tick`], the boot drain and
+//! [`settle`]. While network operations are in flight and nothing else is runnable, [`settle`] waits on
+//! real time (the virtual clock advancing with it), so a page's socket or stream can deliver before the
+//! budget runs out; with no operation in flight it behaves exactly as before.
 
 use crate::js::Engine;
 use js_core::vm::{Value, Vm};
@@ -26,6 +32,9 @@ pub const MAX_FIRES_PER_TICK: usize = 256;
 /// first layout, and the clock advance per pass.
 pub const BOOT_PASSES: u32 = 8;
 pub const BOOT_PASS_MS: u64 = 16;
+
+/// Real milliseconds [`settle`] sleeps per round while it waits on network operations in flight.
+pub const NET_WAIT_MS: u64 = 2;
 
 thread_local! {
     /// Monotonic origin for this thread.
@@ -158,7 +167,7 @@ pub fn boot_drain(engine: &mut Engine) {
             break;
         }
         advance_clock(BOOT_PASS_MS);
-        let tasks = engine.run_tasks();
+        let tasks = engine.run_tasks() + engine.run_network_tasks();
         let fired = fire_due_timers(&mut engine.vm);
         engine.checkpoint();
         if tasks == 0 && fired == 0 && engine.vm.timers.is_empty() && !engine.has_tasks() {
@@ -179,6 +188,7 @@ pub fn settle(engine: &mut Engine, budget_ms: u64) {
             break;
         }
         let mut n = engine.run_tasks();
+        n += engine.run_network_tasks();
         n += fire_due_timers(&mut engine.vm);
         engine.checkpoint();
         n += engine.drain_raf_once();
@@ -187,6 +197,15 @@ pub fn settle(engine: &mut Engine, budget_ms: u64) {
             continue;
         }
         if engine.has_tasks() {
+            continue;
+        }
+        if crate::js::net::active() {
+            // Network operations in flight: wait a little real time for them, the page clock keeping pace,
+            // so a timer due meanwhile still fires in order.
+            let t0 = Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(NET_WAIT_MS));
+            advance_clock((t0.elapsed().as_millis() as u64).max(1));
+            idle_rounds = 0;
             continue;
         }
         match next_due(&engine.vm) {

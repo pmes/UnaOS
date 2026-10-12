@@ -1026,7 +1026,8 @@ mod tests {
     }
 
     /// The fetch wrapper is whatwg-shaped: Promise → Response.ok/json(),
-    /// verified offline by mocking the native layer underneath it.
+    /// verified offline through a `data:` URL (fetched without a network; AETHERNET's streaming
+    /// fetch over a live server is `tests/net.rs`).
     #[test]
     fn test_fetch_wrapper_shape() {
         let mut engine = crate::AetherEngine::new();
@@ -1038,10 +1039,7 @@ mod tests {
         );
         let js = engine.js_engine.as_mut().unwrap();
         js.execute(r#"
-            __native_fetch = function (u, m, b) {
-                return { status: 200, url: u, body: '{"n": 7, "method": "' + m + '"}' };
-            };
-            fetch('/api/data', { method: 'POST', body: 'p=1' })
+            fetch('data:application/json,{"n": 7, "method": "POST"}', { method: 'POST', body: 'p=1' })
                 .then(function (r) { return r.ok ? r.json() : null; })
                 .then(function (j) {
                     document.getElementById('x').setAttribute('data-n', String(j.n) + j.method);
@@ -1056,7 +1054,8 @@ mod tests {
 
     /// rAF callbacks fire once per load in bounded passes: a framework
     /// paint lands in the DOM; a self-re-registering animation loop
-    /// terminates instead of recursing; XHR completes synchronously.
+    /// terminates instead of recursing; an asynchronous XHR completes on the
+    /// event loop (the boot drain), not inside `send()` (XHR §3.5.6).
     #[test]
     fn test_raf_bounded_drain_and_xhr() {
         let mut engine = crate::AetherEngine::new();
@@ -1071,12 +1070,12 @@ mod tests {
                    document.getElementById('x').setAttribute('data-paint', 'ts' + (ts > 0));
                  });
                  var xhr = new XMLHttpRequest();
-                 xhr.open('GET', '/api');
+                 xhr.open('GET', 'data:text/plain,ok');
                  xhr.onload = function () {
-                   document.getElementById('x').setAttribute('data-xhr', 'state' + xhr.readyState);
+                   document.getElementById('x').setAttribute('data-xhr', 'state' + xhr.readyState + xhr.responseText);
                  };
-                 __native_fetch = function () { return { status: 200, url: '/api', body: 'ok' }; };
                  xhr.send();
+                 document.getElementById('x').setAttribute('data-xhr-sync', String(xhr.readyState));
                  document.getElementById('x').setAttribute('data-loops-pre', String(loops));
                </script></body></html>"#,
             &[],
@@ -1086,7 +1085,8 @@ mod tests {
         let x = doc.select("#x").unwrap().next().unwrap();
         let attrs = x.attributes.borrow();
         assert_eq!(attrs.get("data-paint"), Some("tstrue"), "one-shot rAF must fire with a timestamp");
-        assert_eq!(attrs.get("data-xhr"), Some("state4"), "XHR onload must fire synchronously");
+        assert_eq!(attrs.get("data-xhr"), Some("state4ok"), "XHR onload fires on the event loop with the body");
+        assert_eq!(attrs.get("data-xhr-sync"), Some("1"), "an async XHR is still OPENED when send() returns");
         assert_eq!(attrs.get("data-loops-pre"), Some("0"), "rAF must NOT fire during script execution");
         // The animation loop ran bounded passes (8) and stopped — the load
         // completing at all proves termination.
@@ -1632,7 +1632,9 @@ mod tests {
         assert_eq!(f[0], "false", "signal starts unaborted");
         assert_eq!(f[1], "true", "abort flips aborted");
         assert_eq!(f[2], "why", "reason is recorded");
-        assert_eq!(f[3], "onabort,l1", "abort dispatches once, to onabort then listeners");
+        // DOM §2.10 / HTML §8.1.8.1: the `onabort` handler's listener is registered when the handler is
+        // first set — after `l1` here — so it runs second (AETHERNET made AbortSignal a real EventTarget).
+        assert_eq!(f[3], "l1,onabort", "abort dispatches once, to listeners in registration order");
         assert_eq!(f[4], "parsed", "DOMParser document answers querySelector");
         assert_eq!(f[5], "y", "DOMParser document answers getElementById");
         assert_eq!(f[6], "true", "getRandomValues stays inside the element width");

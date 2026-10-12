@@ -85,13 +85,7 @@ impl SseDecoder {
         if line.starts_with(':') {
             return; // comment / keep-alive
         }
-        let (field, value) = match line.find(':') {
-            Some(i) => {
-                let v = &line[i + 1..];
-                (&line[..i], v.strip_prefix(' ').unwrap_or(v))
-            }
-            None => (line, ""),
-        };
+        let (field, value) = split_field(line);
         match field {
             "event" => self.cur.event = Some(value.to_string()),
             "data" => {
@@ -102,6 +96,174 @@ impl SseDecoder {
                 self.has_data = true;
             }
             _ => {} // id, retry: unused
+        }
+    }
+}
+
+/// One field line (HTML §9.2.6): the name up to the first colon, the value after it with one leading space
+/// removed; a line with no colon is a field with an empty value. Shared by [`SseDecoder`] and
+/// [`EventStreamDecoder`].
+fn split_field(line: &str) -> (&str, &str) {
+    match line.find(':') {
+        Some(i) => {
+            let v = &line[i + 1..];
+            (&line[..i], v.strip_prefix(' ').unwrap_or(v))
+        }
+        None => (line, ""),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTML §9.2.6 "interpreting an event stream" — the parser `EventSource` runs (AETHERNET, SR70)
+// ---------------------------------------------------------------------------
+
+/// One event as `EventSource` dispatches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEvent {
+    /// The event type (`"message"` when the stream named none, or named the empty string).
+    pub ty: String,
+    /// The data buffer with its final LF removed.
+    pub data: String,
+    /// The last event ID buffer at dispatch (it persists across events until an `id:` changes it).
+    pub last_event_id: String,
+}
+
+/// The full HTML event-stream interpreter: a UTF-8 decode that strips one leading BOM, lines ending in CRLF,
+/// a lone LF or a lone CR (a CR at the end of a chunk waits to see whether an LF follows), the `event`,
+/// `data`, `id` (refused when it carries U+0000) and `retry` (ASCII digits only) fields, and dispatch only
+/// when the data buffer is non-empty. The [`SseDecoder`] above keeps Vein's looser provider semantics.
+#[derive(Debug, Default)]
+pub struct EventStreamDecoder {
+    buf: Vec<u8>,
+    started: bool,
+    /// A CR ended the previous chunk: an LF opening the next one belongs to it.
+    pending_cr: bool,
+    ty: String,
+    data: String,
+    /// The last event ID buffer (an `id:` line sets it).
+    last_id: String,
+    /// The event source's last event ID string: the buffer as of the last dispatch — what an event's
+    /// `lastEventId` carries and a reconnect sends as `Last-Event-ID`. A new stream's buffer starts from it,
+    /// so an `id:` whose event never dispatched does not survive the reconnect.
+    id_string: String,
+    retry: Option<u64>,
+}
+
+impl EventStreamDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A decoder whose last event ID string starts at `id` (HTML §9.2.3).
+    pub fn with_last_event_id(id: &str) -> Self {
+        EventStreamDecoder { last_id: id.to_string(), id_string: id.to_string(), ..Self::default() }
+    }
+
+    /// The last event ID string (what a reconnect sends as `Last-Event-ID`).
+    pub fn last_event_id(&self) -> &str {
+        &self.id_string
+    }
+
+    /// A reconnection time a `retry:` field set since the last call.
+    pub fn take_retry(&mut self) -> Option<u64> {
+        self.retry.take()
+    }
+
+    /// A new connection's stream: the BOM check and the per-event buffers start over; the last event ID
+    /// buffer restarts from the last event ID string.
+    pub fn reset_stream(&mut self) {
+        self.buf.clear();
+        self.started = false;
+        self.pending_cr = false;
+        self.ty.clear();
+        self.data.clear();
+        self.last_id = self.id_string.clone();
+    }
+
+    /// Feed bytes; answer every event they completed.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
+        let mut bytes = bytes;
+        if self.pending_cr && !bytes.is_empty() {
+            self.pending_cr = false;
+            if bytes[0] == b'\n' {
+                bytes = &bytes[1..];
+            }
+        }
+        self.buf.extend_from_slice(bytes);
+        if !self.started {
+            if self.buf.len() < 3 && b"\xEF\xBB\xBF".starts_with(&self.buf) {
+                return Vec::new();
+            }
+            if self.buf.starts_with(b"\xEF\xBB\xBF") {
+                self.buf.drain(..3);
+            }
+            self.started = true;
+        }
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut i = 0;
+        while i < self.buf.len() {
+            let b = self.buf[i];
+            if b == b'\n' || b == b'\r' {
+                let line = String::from_utf8_lossy(&self.buf[start..i]).into_owned();
+                let mut next = i + 1;
+                if b == b'\r' {
+                    if next < self.buf.len() {
+                        if self.buf[next] == b'\n' {
+                            next += 1;
+                        }
+                    } else {
+                        self.pending_cr = true;
+                    }
+                }
+                self.line(&line, &mut out);
+                start = next;
+                i = next;
+                continue;
+            }
+            i += 1;
+        }
+        self.buf.drain(..start);
+        out
+    }
+
+    fn line(&mut self, line: &str, out: &mut Vec<StreamEvent>) {
+        if line.is_empty() {
+            // Dispatch (§9.2.6): an empty data buffer resets the buffers and dispatches nothing.
+            if self.data.is_empty() {
+                self.ty.clear();
+                return;
+            }
+            if self.data.ends_with('\n') {
+                self.data.pop();
+            }
+            let ty = if self.ty.is_empty() { "message".to_string() } else { std::mem::take(&mut self.ty) };
+            self.ty.clear();
+            self.id_string = self.last_id.clone();
+            out.push(StreamEvent { ty, data: std::mem::take(&mut self.data), last_event_id: self.id_string.clone() });
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = split_field(line);
+        match field {
+            "event" => self.ty = value.to_string(),
+            "data" => {
+                self.data.push_str(value);
+                self.data.push('\n');
+            }
+            "id" => {
+                if !value.contains('\0') {
+                    self.last_id = value.to_string();
+                }
+            }
+            "retry" => {
+                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                    self.retry = value.parse().ok().or(Some(u64::MAX));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -133,6 +295,33 @@ mod tests {
         let (a, b) = s.split_at(10); // inside the two-byte é
         assert!(d.push(a).is_empty());
         assert_eq!(d.push(b)[0].data, "caf\u{e9}");
+    }
+
+    #[test]
+    fn event_stream_html_semantics() {
+        let mut d = EventStreamDecoder::new();
+        // BOM split across chunks, a lone CR line end at a chunk boundary followed by LF, CR-only lines.
+        let mut got = d.push(b"\xEF\xBB");
+        got.extend(d.push(b"\xBFid: 7\rretry: 1500\r"));
+        got.extend(d.push(b"\ndata: a\r\ndata\r\n\revent: \ndata: b\n\n"));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], StreamEvent { ty: "message".into(), data: "a\n".into(), last_event_id: "7".into() });
+        assert_eq!(got[1], StreamEvent { ty: "message".into(), data: "b".into(), last_event_id: "7".into() });
+        assert_eq!(d.take_retry(), Some(1500));
+        assert_eq!(d.take_retry(), None);
+        // event-only blocks dispatch nothing; ids with NUL are ignored; bogus retry ignored; named events.
+        let got = d.push(b"event: x\n\nid: a\0b\nretry: 12a\nevent: named\ndata: q\n\n");
+        assert_eq!(got, vec![StreamEvent { ty: "named".into(), data: "q".into(), last_event_id: "7".into() }]);
+        assert_eq!(d.take_retry(), None);
+        // A reconnect keeps the last event id string and drops a half-built event; an `id:` whose event
+        // never dispatched does not survive the reconnect.
+        d.push(b"id: lost\ndata: partial");
+        assert_eq!(d.last_event_id(), "7");
+        d.reset_stream();
+        let got = d.push(b"data: y\n\nid\ndata: z\n\n");
+        assert_eq!((got[0].data.as_str(), got[0].last_event_id.as_str()), ("y", "7"));
+        assert_eq!((got[1].data.as_str(), got[1].last_event_id.as_str()), ("z", ""));
+        assert_eq!(d.last_event_id(), "");
     }
 
     #[test]

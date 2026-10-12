@@ -1,0 +1,64 @@
+file	variant	pass	total	harness	skipped
+eventsource/dedicated-worker/eventsource-close.htm		0	0	-	workers
+eventsource/dedicated-worker/eventsource-close2.htm		0	0	-	workers
+eventsource/dedicated-worker/eventsource-constructor-no-new.any.js		1	1	OK	
+eventsource/dedicated-worker/eventsource-constructor-non-same-origin.htm		0	0	-	workers
+eventsource/dedicated-worker/eventsource-eventtarget.worker.js		0	0	-	workers
+eventsource/dedicated-worker/eventsource-onmessage.htm		0	0	-	workers
+eventsource/dedicated-worker/eventsource-onopen.htm		0	0	-	workers
+eventsource/dedicated-worker/eventsource-prototype.htm		0	0	-	workers
+eventsource/dedicated-worker/eventsource-url.htm		0	0	-	workers
+eventsource/event-data.any.js		1	1	OK	
+eventsource/eventsource-close.window.js		2	2	OK	
+eventsource/eventsource-constructor-document-domain.window.js		0	0	-	frames / browsing contexts / document.domain
+eventsource/eventsource-constructor-empty-url.any.js		1	1	OK	
+eventsource/eventsource-constructor-non-same-origin.window.js		4	4	OK	
+eventsource/eventsource-constructor-stringify.window.js		4	4	OK	
+eventsource/eventsource-constructor-url-bogus.any.js		1	1	OK	
+eventsource/eventsource-constructor-url-multi-window.htm		0	0	-	frames / browsing contexts / document.domain
+eventsource/eventsource-cross-origin-redirect-origin.any.js		0	0	-	cross-origin (no second origin with CORS in the stand-in)
+eventsource/eventsource-cross-origin.window.js		0	0	-	cross-origin (no second origin with CORS in the stand-in)
+eventsource/eventsource-eventtarget.any.js		1	1	OK	
+eventsource/eventsource-onmessage-realm.htm		0	0	-	frames / browsing contexts / document.domain
+eventsource/eventsource-onmessage-trusted.any.js		1	1	OK	
+eventsource/eventsource-onmessage.any.js		1	1	OK	
+eventsource/eventsource-onopen.any.js		1	1	OK	
+eventsource/eventsource-prototype.any.js		1	1	OK	
+eventsource/eventsource-reconnect.window.js		2	2	OK	
+eventsource/eventsource-request-cancellation.window.js		0	1	OK	
+eventsource/eventsource-url.any.js		1	1	OK	
+eventsource/format-bom-2.any.js		1	1	OK	
+eventsource/format-bom.any.js		1	1	OK	
+eventsource/format-comments.any.js		1	1	OK	
+eventsource/format-data-before-final-empty-line.any.js		0	1	OK	
+eventsource/format-field-data.any.js		1	1	OK	
+eventsource/format-field-event-empty.any.js		1	1	OK	
+eventsource/format-field-event.any.js		1	1	OK	
+eventsource/format-field-id-2.any.js		1	1	OK	
+eventsource/format-field-id-3.window.js		3	3	OK	
+eventsource/format-field-id-null.window.js		5	5	OK	
+eventsource/format-field-id.any.js		1	1	OK	
+eventsource/format-field-parsing.any.js		1	1	OK	
+eventsource/format-field-retry-bogus.any.js		1	1	OK	
+eventsource/format-field-retry-empty.any.js		1	1	OK	
+eventsource/format-field-retry.any.js		1	1	OK	
+eventsource/format-field-unknown.any.js		1	1	OK	
+eventsource/format-leading-space.any.js		1	1	OK	
+eventsource/format-mime-bogus.any.js		1	1	OK	
+eventsource/format-mime-trailing-semicolon.any.js		1	1	OK	
+eventsource/format-mime-valid-bogus.any.js		1	1	OK	
+eventsource/format-newlines.any.js		1	1	OK	
+eventsource/format-null-character.any.js		1	1	OK	
+eventsource/format-utf-8.any.js		1	1	OK	
+eventsource/request-accept.any.js		1	1	OK	
+eventsource/request-cache-control.any.js		0	0	-	needs wptserve handler eventsource/resources/cors.py
+eventsource/request-credentials.window.js		0	0	-	needs wptserve handler eventsource/resources/cors-cookie.py
+eventsource/request-redirect.window.js		4	4	OK	
+eventsource/request-status-error.window.js		7	7	OK	
+eventsource/shared-worker/eventsource-close.htm		0	0	-	workers
+eventsource/shared-worker/eventsource-constructor-non-same-origin.htm		0	0	-	workers
+eventsource/shared-worker/eventsource-eventtarget.htm		0	0	-	workers
+eventsource/shared-worker/eventsource-onmessage.htm		0	0	-	workers
+eventsource/shared-worker/eventsource-onopen.htm		0	0	-	workers
+eventsource/shared-worker/eventsource-prototype.htm		0	0	-	workers
+eventsource/shared-worker/eventsource-url.htm		0	0	-	workers
