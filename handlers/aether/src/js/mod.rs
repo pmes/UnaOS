@@ -19,6 +19,10 @@
 //!   handlers, "report the exception".
 //! - [`window`] — the global object (Window), Location, History, Navigator, Screen, timers,
 //!   `requestAnimationFrame`, `queueMicrotask`, `matchMedia`, the platform preludes (fetch, URL, …).
+//! - [`range`] — AbstractRange/StaticRange/Range and the live-range mutation rules (AETHERWPT, SR72).
+//! - [`traversal`] — NodeFilter, NodeIterator, TreeWalker (SR72).
+//! - [`reflect`] — HTML §2.6.1 reflection of every reflected IDL attribute (SR72).
+//! - [`controls`] — form controls' DOM half: value modes, selection, constraint validation (SR72).
 //! - [`loader`] — HTML §4.12.1 script processing driven by the parser: parser-blocking, `defer`,
 //!   `async` and module scripts, `document.write` during parse, dynamically inserted scripts, and
 //!   §13.2.7 "the end" (DOMContentLoaded, load).
@@ -29,6 +33,7 @@
 //! engine (no more script on this page; the DOM still renders) instead of ending the process, and a
 //! per-task instruction budget turns a runaway script into a reported, uncatchable termination.
 
+pub mod controls;
 pub mod cssom;
 pub mod dom;
 pub mod events;
@@ -36,6 +41,9 @@ pub mod host;
 pub mod html;
 pub mod idl;
 pub mod loader;
+pub mod range;
+pub mod reflect;
+pub mod traversal;
 pub mod window;
 
 use crate::dom::NodeRef;
@@ -484,6 +492,10 @@ impl Engine {
             p.ready_state = "loading";
         });
         idl::reset();
+        range::reset();
+        traversal::reset();
+        controls::reset();
+        events::reset_clock();
         clear_poison();
         crate::api::fetch::reset_budget();
         crate::event_loop::reset();
@@ -493,7 +505,11 @@ impl Engine {
         idl::install_domexception(&mut vm);
         events::install(&mut vm);
         dom::install(&mut vm);
+        range::install(&mut vm);
+        traversal::install(&mut vm);
         html::install(&mut vm);
+        reflect::install(&mut vm);
+        controls::install(&mut vm);
         cssom::install(&mut vm);
         window::install(&mut vm);
         Engine { vm }

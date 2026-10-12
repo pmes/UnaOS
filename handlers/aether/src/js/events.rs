@@ -49,7 +49,24 @@ fn set_flag(vm: &mut Vm, e: Obj, f: u32, on: bool) {
 /// Milliseconds since the page's time origin (DOMHighResTimeStamp).
 pub fn now_hr() -> f64 {
     let origin = page(|p| p.time_origin);
-    crate::event_loop::now_ms().saturating_sub(origin) as f64
+    let clock = crate::event_loop::now_ms().saturating_sub(origin) as f64;
+    // The page clock has millisecond grain and stands still inside a task in virtual time; a script that
+    // polls it would spin forever. Successive readings advance by at least 5 µs (the coarsening floor
+    // timing-attack mitigations require) and never run backwards.
+    LAST_HR.with(|l| {
+        let v = if clock > l.get() { clock } else { l.get() + 0.005 };
+        let v = (v * 1000.0).round() / 1000.0;
+        l.set(v);
+        v
+    })
+}
+
+thread_local! {
+    static LAST_HR: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
+}
+
+pub fn reset_clock() {
+    LAST_HR.with(|l| l.set(-1.0));
 }
 
 // =================================================================================================
@@ -113,16 +130,33 @@ fn event_target_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 // =================================================================================================
 
 /// Flattens `options` (boolean or dictionary) into (capture, once, passive, signal).
-fn flatten_options(vm: &mut Vm, v: &Value) -> JsResult<(bool, bool, bool, Value)> {
+fn flatten_options(vm: &mut Vm, v: &Value) -> JsResult<(bool, bool, Option<bool>, Value)> {
     match v {
         Value::Object(_) => {
             let c = dict_member(vm, v, "capture")?;
             let o = dict_member(vm, v, "once")?;
             let p = dict_member(vm, v, "passive")?;
             let sig = dict_member(vm, v, "signal")?;
-            Ok((vm.to_boolean(&c), vm.to_boolean(&o), vm.to_boolean(&p), sig))
+            let passive = if p.is_undefined() { None } else { Some(vm.to_boolean(&p)) };
+            Ok((vm.to_boolean(&c), vm.to_boolean(&o), passive, sig))
         }
-        other => Ok((vm.to_boolean(other), false, false, Value::Undefined)),
+        other => Ok((vm.to_boolean(other), false, None, Value::Undefined)),
+    }
+}
+
+/// DOM "default passive value": touchstart/touchmove/wheel/mousewheel listeners on the Window, the
+/// Document, its document element or its body are passive unless the options say otherwise.
+fn default_passive(t: TargetKey, ty: &str) -> bool {
+    if !matches!(ty, "touchstart" | "touchmove" | "wheel" | "mousewheel") {
+        return false;
+    }
+    match t {
+        TargetKey::Window => true,
+        TargetKey::Node(n) => {
+            let d = dom::node_document(n);
+            n == d || dom::document_element_of(d) == Some(n) || dom::body_of(d) == Some(n)
+        }
+        TargetKey::Other(_) => false,
     }
 }
 
@@ -182,6 +216,7 @@ fn add_event_listener(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let cb = arg(vm, ctx, 1);
     let opts = arg(vm, ctx, 2);
     let (capture, once, passive, signal) = flatten_options(vm, &opts)?;
+    let passive = passive.unwrap_or_else(|| default_passive(t, &ty));
     if cb.is_null() {
         return Ok(Value::Undefined);
     }
@@ -502,6 +537,18 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
             _ => {}
         }
     }
+    // DOM §2.9 steps 5.4/5.9.5: a MouseEvent `click` has an activation target — the target or the
+    // nearest inclusive ancestor with activation behavior — whose legacy-pre-activation behavior runs
+    // before the listeners and whose activation (or legacy-canceled-activation) behavior runs after.
+    let activation = if ty == "click" && is_mouse_event(vm, e) {
+        path.iter().find_map(|k| match k {
+            TargetKey::Node(n) if has_activation_behavior(*n) => Some(*n),
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let legacy = activation.and_then(|a| legacy_pre_activation(vm, a));
     let mut ran = false;
     let bubbles = flags(vm, e) & F_BUBBLES != 0;
     for (i, k) in path.iter().enumerate().rev() {
@@ -526,7 +573,205 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
     set_flag(vm, e, F_DISPATCH, false);
     set_flag(vm, e, F_STOP, false);
     set_flag(vm, e, F_STOP_IMMEDIATE, false);
-    (flags(vm, e) & F_CANCELED == 0, ran)
+    let ok = flags(vm, e) & F_CANCELED == 0;
+    if let Some(a) = activation {
+        if ok {
+            let target = if let TargetKey::Node(n) = t { n } else { a };
+            let trusted = flags(vm, e) & F_TRUSTED != 0;
+            activation_behavior(vm, a, target, trusted, legacy);
+        } else if let Some(l) = legacy {
+            legacy_canceled_activation(vm, a, l);
+        }
+    }
+    (ok, ran)
+}
+
+fn is_mouse_event(vm: &Vm, e: Obj) -> bool {
+    let Some(mp) = dom::iface("MouseEvent").map(|i| i.proto) else { return false };
+    let mut p = vm.heap.get(e).proto;
+    while let Some(o) = p {
+        if o == mp {
+            return true;
+        }
+        p = vm.heap.get(o).proto;
+    }
+    false
+}
+
+fn html_tag(n: usize) -> Option<String> {
+    dom::with_doc(|d| d.element(html_core::NodeId(n)).filter(|e| e.ns == html_core::Namespace::Html).map(|e| e.local.to_string()))
+}
+
+/// The summary that is its details' summary (HTML §4.11.2).
+fn is_details_summary(n: usize) -> bool {
+    let Some(p) = parent_of(n) else { return false };
+    if html_tag(p).as_deref() != Some("details") {
+        return false;
+    }
+    dom::children_of(p).into_iter().find(|c| html_tag(*c).as_deref() == Some("summary")) == Some(n)
+}
+
+/// Elements with activation behavior (HTML: a/area with href, buttons, the input types that act on a
+/// click, a details' summary, label).
+fn has_activation_behavior(n: usize) -> bool {
+    match html_tag(n).as_deref() {
+        Some("a" | "area") => dom::attr_value(n, "href").is_some(),
+        Some("button" | "label") => true,
+        Some("input") => matches!(super::controls::input_type(n), "checkbox" | "radio" | "submit" | "image" | "reset" | "button" | "color" | "file"),
+        Some("summary") => is_details_summary(n),
+        _ => false,
+    }
+}
+
+/// What legacy-pre-activation behavior changed, to undo on cancel.
+#[derive(Clone, Copy)]
+pub enum Legacy {
+    Checkbox(bool),
+    Radio(Option<usize>),
+}
+
+fn legacy_pre_activation(vm: &mut Vm, a: usize) -> Option<Legacy> {
+    if html_tag(a).as_deref() != Some("input") {
+        return None;
+    }
+    match super::controls::input_type(a) {
+        "checkbox" => {
+            let old = super::html::checkedness(a);
+            super::html::set_checkedness(vm, a, !old);
+            super::controls::set_indeterminate(a, false);
+            Some(Legacy::Checkbox(old))
+        }
+        "radio" => {
+            let prev = super::controls::checked_radio_in_group(a);
+            super::html::set_checkedness(vm, a, true);
+            Some(Legacy::Radio(prev))
+        }
+        _ => None,
+    }
+}
+
+fn legacy_canceled_activation(vm: &mut Vm, a: usize, l: Legacy) {
+    match l {
+        Legacy::Checkbox(old) => super::html::set_checkedness(vm, a, old),
+        Legacy::Radio(prev) => {
+            if prev != Some(a) {
+                page(|p| p.checked.insert(a, false));
+                super::touch();
+            }
+            if let Some(p) = prev.filter(|p| *p != a) {
+                if super::controls::input_type(p) == "radio" {
+                    super::html::set_checkedness(vm, p, true);
+                }
+            }
+        }
+    }
+}
+
+/// Interactive content (HTML §3.2.5.2.7) for the label activation rule.
+fn interactive(n: usize) -> bool {
+    match html_tag(n).as_deref() {
+        Some("a") => dom::attr_value(n, "href").is_some(),
+        Some("button" | "details" | "embed" | "iframe" | "label" | "select" | "textarea") => true,
+        Some("input") => super::controls::input_type(n) != "hidden",
+        Some("audio" | "video") => dom::attr_value(n, "controls").is_some(),
+        Some("img") => dom::attr_value(n, "usemap").is_some(),
+        _ => false,
+    }
+}
+
+fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, legacy: Option<Legacy>) {
+    let tag = html_tag(a).unwrap_or_default();
+    match tag.as_str() {
+        "input" => match super::controls::input_type(a) {
+            "checkbox" | "radio" => {
+                if dom::is_connected(a) && legacy.is_some() {
+                    let changed = match legacy {
+                        Some(Legacy::Checkbox(old)) => super::html::checkedness(a) != old,
+                        Some(Legacy::Radio(prev)) => prev != Some(a),
+                        None => false,
+                    };
+                    if !changed {
+                        return;
+                    }
+                    fire_bubbling_composed(vm, a, "input");
+                    fire_simple(vm, TargetKey::Node(a), "change", true, false);
+                }
+            }
+            "submit" | "image" => {
+                if !super::controls::disabled(a) {
+                    if let Some(f) = super::controls::form_owner(a) {
+                        super::controls::submit_form(vm, f, Some(a));
+                    }
+                }
+            }
+            "reset" => {
+                if !super::controls::disabled(a) {
+                    if let Some(f) = super::controls::form_owner(a) {
+                        super::controls::reset_form(vm, f);
+                    }
+                }
+            }
+            _ => {}
+        },
+        "button" => {
+            if super::controls::disabled(a) {
+                return;
+            }
+            let ty = dom::attr_value(a, "type").unwrap_or_default().to_ascii_lowercase();
+            if let Some(f) = super::controls::form_owner(a) {
+                match ty.as_str() {
+                    "reset" => super::controls::reset_form(vm, f),
+                    "button" => {}
+                    _ => super::controls::submit_form(vm, f, Some(a)),
+                }
+            }
+        }
+        "a" | "area" => {
+            // A user's click follows the link in the shell; a script-dispatched click navigates here
+            // (fragment navigations stay in the document).
+            if !trusted {
+                if let Some(href) = dom::attr_value(a, "href") {
+                    let _ = super::window::navigate_from_link(vm, &href);
+                }
+            }
+        }
+        "summary" => {
+            let Some(d) = parent_of(a) else { return };
+            if dom::attr_value(d, "open").is_some() {
+                dom::remove_attr(vm, d, "open");
+            } else {
+                dom::set_attr(vm, d, "open", "");
+            }
+        }
+        "label" => {
+            let control = dom::with_doc(|d| super::controls::label_control_in(d, a));
+            let Some(c) = control else { return };
+            if target == c || super::controls::disabled(c) {
+                return;
+            }
+            // A click on interactive content inside the label belongs to that content.
+            let mut cur = Some(target);
+            while let Some(n) = cur {
+                if n == a {
+                    break;
+                }
+                if interactive(n) {
+                    return;
+                }
+                cur = parent_of(n);
+            }
+            synthetic_click(vm, c);
+        }
+        _ => {}
+    }
+}
+
+fn fire_bubbling_composed(vm: &mut Vm, n: usize, ty: &str) {
+    let e = new_event(vm, "Event", ty, true, false, None);
+    set_flag(vm, e, F_COMPOSED, true);
+    let r = root(vm, Value::Object(e));
+    dispatch(vm, e, TargetKey::Node(n));
+    unroot(vm, r);
 }
 
 /// DOM "invoke" + "inner invoke" for one path entry and phase (`capturing` = the capture pass).
@@ -587,6 +832,13 @@ fn invoke_listeners(vm: &mut Vm, e: Obj, t: TargetKey, ty: &str, capturing: bool
 
 #[allow(clippy::too_many_arguments)]
 fn call_listener(vm: &mut Vm, e: Obj, this: &Value, cb: &Value, passive: bool, t: TargetKey, ty: &str, is_handler: bool) {
+    let saved = CURRENT_EVENT.with(|c| c.replace(Some(e)));
+    call_listener_inner(vm, e, this, cb, passive, t, ty, is_handler);
+    CURRENT_EVENT.with(|c| c.set(saved));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_listener_inner(vm: &mut Vm, e: Obj, this: &Value, cb: &Value, passive: bool, t: TargetKey, ty: &str, is_handler: bool) {
     if passive {
         set_flag(vm, e, F_PASSIVE, true);
     }
@@ -667,6 +919,18 @@ pub fn new_event(vm: &mut Vm, iface: &str, ty: &str, bubbles: bool, cancelable: 
 }
 
 /// Fires a simple trusted event (HTML "fire an event"). Returns whether any listener ran.
+/// Fires a trusted, cancelable, non-bubbling event; returns false when a listener canceled it.
+pub fn fire_simple_cancelable(vm: &mut Vm, t: TargetKey, ty: &str) -> bool {
+    if super::engine_poisoned() {
+        return true;
+    }
+    let e = new_event(vm, "Event", ty, false, true, None);
+    let r = root(vm, Value::Object(e));
+    let (ok, _) = dispatch(vm, e, t);
+    unroot(vm, r);
+    ok
+}
+
 pub fn fire_simple(vm: &mut Vm, t: TargetKey, ty: &str, bubbles: bool, cancelable: bool) -> bool {
     if super::engine_poisoned() {
         return false;
@@ -692,6 +956,11 @@ pub fn synthetic_click(vm: &mut Vm, n: usize) {
 /// Fires `click` at `n` with the checkbox/radio legacy-pre-activation behavior and the `input`/`change`
 /// events that follow (HTML §4.10.5.1.15/16). Returns (not canceled, ran).
 fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
+    // HTMLElement.click(): the "click in progress" flag stops re-entrant clicks.
+    if CLICKING.with(|c| c.borrow().contains(&n)) {
+        return (true, false);
+    }
+    CLICKING.with(|c| c.borrow_mut().insert(n));
     let init = vm.new_plain_object();
     let _ = vm.create_data_property(init, PropertyKey::from_str("detail"), num(1.0));
     let e = new_event(vm, "MouseEvent", "click", true, true, Some(init));
@@ -700,27 +969,22 @@ fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
         set_flag(vm, e, F_TRUSTED, false);
     }
     let r = root(vm, Value::Object(e));
-    let checkable = super::html::checkable_type(n);
-    let old = checkable.map(|_| super::html::checkedness(n));
-    if let Some(kind) = checkable {
-        if kind == "checkbox" {
-            super::html::set_checkedness(vm, n, !old.unwrap_or(false));
-        } else {
-            super::html::set_checkedness(vm, n, true);
-        }
-    }
     let (ok, ran) = dispatch(vm, e, TargetKey::Node(n));
     unroot(vm, r);
-    if let Some(prev) = old {
-        if !ok {
-            super::html::set_checkedness(vm, n, prev);
-        } else if super::html::checkedness(n) != prev {
-            fire_simple(vm, TargetKey::Node(n), "input", true, false);
-            fire_simple(vm, TargetKey::Node(n), "change", true, false);
-        }
-    }
+    CLICKING.with(|c| c.borrow_mut().remove(&n));
     page(|p| p.last_click_canceled = !ok);
     (ok, ran)
+}
+
+thread_local! {
+    static CLICKING: std::cell::RefCell<std::collections::HashSet<usize>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The Window's "current event" (HTML `window.event`).
+    static CURRENT_EVENT: std::cell::Cell<Option<Obj>> = const { std::cell::Cell::new(None) };
+}
+
+/// `window.event`: the event whose listener is running, else undefined.
+pub fn current_event() -> Value {
+    CURRENT_EVENT.with(|c| c.get()).map(Value::Object).unwrap_or(Value::Undefined)
 }
 
 // =================================================================================================
@@ -753,6 +1017,20 @@ fn convert_member(vm: &mut Vm, v: Value, kind: char) -> JsResult<Value> {
                 num(vm.to_int32(&v)? as f64)
             }
         }
+        'u' => {
+            if v.is_undefined() {
+                num(0.0)
+            } else {
+                num(vm.to_uint32(&v)? as f64)
+            }
+        }
+        '1' => {
+            if v.is_undefined() {
+                num(1.0)
+            } else {
+                num(vm.to_number(&v)?)
+            }
+        }
         's' => {
             if v.is_undefined() {
                 s("")
@@ -782,7 +1060,22 @@ fn members(iface: &str) -> &'static [(&'static str, char)] {
     match iface {
         "CustomEvent" => &[("detail", 'a')],
         "UIEvent" => &[("view", 'o'), ("detail", 'l'), ("which", 'l')],
-        "MouseEvent" | "WheelEvent" | "PointerEvent" | "DragEvent" => &[
+        "WheelEvent" => &[("deltaX", 'n'), ("deltaY", 'n'), ("deltaZ", 'n'), ("deltaMode", 'u')],
+        "PointerEvent" => &[
+            ("pointerId", 'l'),
+            ("width", '1'),
+            ("height", '1'),
+            ("pressure", 'n'),
+            ("tangentialPressure", 'n'),
+            ("tiltX", 'l'),
+            ("tiltY", 'l'),
+            ("twist", 'l'),
+            ("pointerType", 's'),
+            ("isPrimary", 'b'),
+        ],
+        "DragEvent" => &[("dataTransfer", 'o')],
+        "CompositionEvent" => &[("data", 's')],
+        "MouseEvent" => &[
             ("screenX", 'n'),
             ("screenY", 'n'),
             ("clientX", 'n'),
@@ -833,7 +1126,7 @@ fn parent_event(iface: &str) -> Option<&'static str> {
         "UIEvent" | "CustomEvent" | "ErrorEvent" | "PromiseRejectionEvent" | "PopStateEvent" | "HashChangeEvent"
         | "ProgressEvent" | "MessageEvent" | "PageTransitionEvent" | "SubmitEvent" | "AnimationEvent"
         | "TransitionEvent" | "StorageEvent" | "CloseEvent" => "Event",
-        "MouseEvent" | "KeyboardEvent" | "FocusEvent" | "InputEvent" => "UIEvent",
+        "MouseEvent" | "KeyboardEvent" | "FocusEvent" | "InputEvent" | "CompositionEvent" => "UIEvent",
         "WheelEvent" | "PointerEvent" | "DragEvent" => "MouseEvent",
         _ => return None,
     })
@@ -872,6 +1165,9 @@ fn event_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     for i in chain.iter().rev() {
         for (m, k) in members(i) {
             let v = dict_member(vm, &dict, m)?;
+            if *m == "view" && !v.is_nullish() && v.as_object() != Some(vm.realm().global) {
+                return vm.throw_type(&format!("Failed to construct '{iface}': member view is not of type Window."));
+            }
             let cv = convert_member(vm, v, *k)?;
             vm.create_data_property(init, PropertyKey::from_str(m), cv)?;
         }
@@ -993,8 +1289,11 @@ fn ev_init_event(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 fn ev_init_custom_event(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    ev_init_event(vm, ctx)?;
     let e = this_event(vm, ctx)?;
+    if flags(vm, e) & F_DISPATCH != 0 {
+        return Ok(Value::Undefined);
+    }
+    ev_init_event(vm, ctx)?;
     let detail = arg(vm, ctx, 3);
     let init = match slot(vm, e, E_INIT) {
         Value::Object(o) => o,
@@ -1006,6 +1305,57 @@ fn ev_init_custom_event(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     };
     let detail = if detail.is_undefined() { Value::Null } else { detail };
     vm.create_data_property(init, PropertyKey::from_str("detail"), detail)?;
+    Ok(Value::Undefined)
+}
+
+/// The legacy `initUIEvent` / `initMouseEvent` / `initKeyboardEvent`: initEvent, then the positional
+/// members (a no-op while dispatching).
+fn ev_init_legacy(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let e = this_event(vm, ctx)?;
+    if flags(vm, e) & F_DISPATCH != 0 {
+        return Ok(Value::Undefined);
+    }
+    ev_init_event(vm, ctx)?;
+    let which = callee_str(vm, ctx);
+    let names: &[(&str, char)] = match which.as_str() {
+        "initMouseEvent" => &[
+            ("view", 'o'),
+            ("detail", 'l'),
+            ("screenX", 'l'),
+            ("screenY", 'l'),
+            ("clientX", 'l'),
+            ("clientY", 'l'),
+            ("ctrlKey", 'b'),
+            ("altKey", 'b'),
+            ("shiftKey", 'b'),
+            ("metaKey", 'b'),
+            ("button", 'l'),
+            ("relatedTarget", 'o'),
+        ],
+        "initKeyboardEvent" => &[
+            ("view", 'o'),
+            ("key", 's'),
+            ("location", 'u'),
+            ("ctrlKey", 'b'),
+            ("altKey", 'b'),
+            ("shiftKey", 'b'),
+            ("metaKey", 'b'),
+        ],
+        _ => &[("view", 'o'), ("detail", 'l')],
+    };
+    let init = match slot(vm, e, E_INIT) {
+        Value::Object(o) => o,
+        _ => {
+            let o = vm.new_plain_object();
+            set_slot(vm, e, E_INIT, Value::Object(o));
+            o
+        }
+    };
+    for (i, (m, k)) in names.iter().enumerate() {
+        let v = arg(vm, ctx, 3 + i);
+        let cv = convert_member(vm, v, *k)?;
+        vm.create_data_property(init, PropertyKey::from_str(m), cv)?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -1030,7 +1380,9 @@ fn default_member(name: &str) -> Value {
         "message" | "filename" | "inputType" | "code" | "oldURL" | "newURL" | "origin" | "lastEventId"
         | "animationName" | "propertyName" | "pseudoElement" | "url" | "key" => s(""),
         "lineno" | "colno" | "button" | "buttons" | "location" | "charCode" | "keyCode" | "which" | "screenX"
-        | "screenY" | "clientX" | "clientY" | "movementX" | "movementY" | "loaded" | "total" | "elapsedTime" => {
+        | "screenY" | "clientX" | "clientY" | "movementX" | "movementY" | "loaded" | "total" | "elapsedTime" | "deltaX"
+        | "deltaY" | "deltaZ" | "deltaMode" | "pointerId" | "pressure" | "tangentialPressure" | "tiltX" | "tiltY"
+        | "twist" => {
             num(0.0)
         }
         "ctrlKey" | "shiftKey" | "altKey" | "metaKey" | "repeat" | "isComposing" | "lengthComputable" | "persisted"
@@ -1185,6 +1537,7 @@ pub fn install(vm: &mut Vm) {
         "DragEvent",
         "ErrorEvent",
         "PromiseRejectionEvent",
+        "CompositionEvent",
         "PopStateEvent",
         "HashChangeEvent",
         "ProgressEvent",
@@ -1207,6 +1560,20 @@ pub fn install(vm: &mut Vm) {
         }
         if name == "CustomEvent" {
             op(vm, i.proto, "initCustomEvent", 1, ev_init_custom_event);
+        }
+        if name == "WheelEvent" {
+            for (n, v) in [("DOM_DELTA_PIXEL", 0.0), ("DOM_DELTA_LINE", 1.0), ("DOM_DELTA_PAGE", 2.0)] {
+                konst(vm, i, n, v);
+            }
+        }
+        let legacy_init = match name {
+            "UIEvent" => Some(("initUIEvent", 1)),
+            "MouseEvent" => Some(("initMouseEvent", 1)),
+            "KeyboardEvent" => Some(("initKeyboardEvent", 1)),
+            _ => None,
+        };
+        if let Some((m, len)) = legacy_init {
+            idl::op_with(vm, i.proto, m, len, ev_init_legacy, s(m));
         }
         if matches!(name, "MouseEvent" | "KeyboardEvent") {
             op(vm, i.proto, "getModifierState", 1, ev_get_modifier_state);

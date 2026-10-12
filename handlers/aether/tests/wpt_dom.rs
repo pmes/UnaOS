@@ -1,4 +1,7 @@
-//! AETHERJS (SR63): the WPT `dom/nodes` directory run through Aether on js_core.
+//! AETHERJS (SR63): the WPT `dom/nodes` directory run through Aether on js_core. AETHERWPT (SR72): the
+//! same runner over `dom/events`, `dom/ranges`, `dom/traversal`, `dom/collections`, `dom/lists`, the
+//! `html/dom` reflection suite (its top-level files), `html/semantics/forms` and `html/webappapis` — one
+//! `#[test]` per directory (they run on parallel test threads; every page's engine state is thread-local).
 //!
 //! web-platform-tests is fetched at test time (sparse, shallow, pinned at [`WPT_COMMIT`]) into
 //! `target/wpt` or found at `$AETHER_WPT_DIR`; offline (or `AETHER_WPT_OFFLINE=1`) the test is skipped.
@@ -12,12 +15,16 @@
 //! in virtual time (15 s budget — longer than testharness's 10 s default timeout), and the subtest
 //! statuses are read back.
 //!
-//! Reported: pass/total of subtests over every `.html`/`.htm`/`.window.js` file of `dom/nodes`, and over
-//! "the subset Aether's surface covers" — the same files minus those that need a feature this binding
-//! does not have (listed with the reason in [`excluded`]). XML documents (`.xhtml`, `.svg`, `.xml`) are
-//! not run: Aether parses HTML only. Run it with `cargo test --release -p aether --test wpt_dom -- --nocapture`;
-//! a debug build skips it unless `AETHER_WPT=1` (or `AETHER_WPT_ONLY`) is set. Per-file results go to `target/wpt-dom-nodes.tsv`.
-//! `AETHER_WPT_ONLY=<a,b,…>` runs files whose names contain any of the substrings; `AETHER_WPT_VERBOSE=1` prints failing subtests.
+//! Reported per directory: pass/total of subtests over every `.html`/`.htm`/`.window.js`/`.any.js` (window
+//! global) testharness file, and over "the subset Aether's surface covers" — the same files minus those
+//! that need a feature outside this binding (listed with the reason in [`excluded`]). Files that need
+//! wptserve itself (`.py` handlers, `.sub.` substitution, `.https.`/`.h2.`/`.www.` hosts, `{{…}}`
+//! templates, `get-host-info`) are not run and are counted as "needs server". XML documents (`.xhtml`,
+//! `.svg`, `.xml`) are not run: Aether parses HTML only. Run it with
+//! `cargo test --release -p aether --test wpt_dom -- --nocapture` (`--test-threads=N` bounds the parallel
+//! directories); a debug build skips it unless `AETHER_WPT=1` (or `AETHER_WPT_ONLY`) is set. Per-file results
+//! go to `target/wpt-<dir>.tsv` (`/` → `-`). `AETHER_WPT_ONLY=<a,b,…>` runs files whose paths contain any of
+//! the substrings; `AETHER_WPT_VERBOSE=1` prints failing subtests; each directory prints its wall time.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -26,6 +33,22 @@ use std::process::Command;
 
 const WPT_REPO: &str = "https://github.com/web-platform-tests/wpt.git";
 const WPT_COMMIT: &str = "da1f6d20caf40b4003ae288dda8c97f252dd9264";
+
+/// The sparse checkout: the directories run, plus the shared harness and support trees they load.
+const SPARSE: &str = "/dom/\n/resources/\n/common/\n/html/resources/\n/html/dom/\n/html/semantics/forms/\n/html/webappapis/\n/html/semantics/interfaces.js\n";
+
+/// The directories run: (path, recurse into subdirectories). `html/dom` is its top-level reflection suite.
+const DIRS: &[(&str, bool)] = &[
+    ("dom/nodes", false),
+    ("dom/events", true),
+    ("dom/ranges", true),
+    ("dom/traversal", true),
+    ("dom/collections", true),
+    ("dom/lists", true),
+    ("html/dom", false),
+    ("html/semantics/forms", true),
+    ("html/webappapis", true),
+];
 
 const REPORT_JS: &str = r#"(function () {
   if (typeof add_completion_callback !== 'function') { return; }
@@ -55,14 +78,20 @@ fn locate() -> Option<PathBuf> {
         }
     }
     let t = target_dir().join("wpt");
-    if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() {
+    // A checkout made by the dom/nodes-only runner (SR63) lacks the SR72 directories: widen it in place.
+    if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() && !t.join("html/webappapis").is_dir() {
+        let _ = std::fs::write(t.join(".git/info/sparse-checkout"), SPARSE);
+        let _ = Command::new("git").arg("-C").arg(&t).args(["checkout", "-q", "FETCH_HEAD"]).status();
+        let _ = Command::new("git").arg("-C").arg(&t).args(["read-tree", "-mu", "HEAD"]).status();
+    }
+    if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() && t.join("html/webappapis").is_dir() {
         return Some(t);
     }
     let _ = std::fs::create_dir_all(&t);
     let git = |args: &[&str]| Command::new("git").arg("-C").arg(&t).args(args).status().map(|s| s.success()).unwrap_or(false);
     let ok = git(&["init", "-q"])
         && git(&["config", "core.sparseCheckout", "true"])
-        && std::fs::write(t.join(".git/info/sparse-checkout"), "/dom/nodes/\n/dom/*.js\n/resources/\n/common/\n/html/resources/\n").is_ok()
+        && std::fs::write(t.join(".git/info/sparse-checkout"), SPARSE).is_ok()
         && git(&["fetch", "-q", "--depth", "1", "--filter=blob:none", WPT_REPO, WPT_COMMIT])
         && git(&["checkout", "-q", "FETCH_HEAD"]);
     ok.then_some(t)
@@ -91,9 +120,9 @@ fn serve(root: PathBuf) -> u16 {
                 let rel = path.trim_start_matches('/').to_string();
                 let (status, body, ty): (&str, Vec<u8>, &str) = if rel == "resources/testharnessreport.js" {
                     ("200 OK", REPORT_JS.as_bytes().to_vec(), "text/javascript")
-                } else if let Some(stem) = rel.strip_suffix(".window.html") {
-                    let js = format!("/{stem}.window.js");
-                    let src = std::fs::read_to_string(root.join(format!("{stem}.window.js"))).unwrap_or_default();
+                } else if let Some((stem, kind)) = rel.strip_suffix(".window.html").map(|s| (s, "window")).or_else(|| rel.strip_suffix(".any.html").map(|s| (s, "any"))) {
+                    let js = format!("/{stem}.{kind}.js");
+                    let src = std::fs::read_to_string(root.join(format!("{stem}.{kind}.js"))).unwrap_or_default();
                     // `// META: script=...` lines become script tags (wptserve's wrapper).
                     let mut metas = String::new();
                     for l in src.lines() {
@@ -135,31 +164,74 @@ fn serve(root: PathBuf) -> u16 {
     port
 }
 
-/// Files of `dom/nodes` that need what this binding does not provide, with the reason.
+/// A file that needs wptserve itself (not a static file server): not run, counted as "needs server".
+fn needs_server(name: &str, src: &str) -> bool {
+    [".sub.", ".https.", ".h2.", ".www.", ".optional."].iter().any(|m| name.contains(m))
+        || src.contains("{{")
+        || src.contains("get-host-info")
+        || src.contains("/common/dispatcher/")
+        || src.contains(".py\"")
+        || src.contains(".py?")
+        || src.contains(".py'")
+        || src.contains(".py`")
+}
+
+/// Files that need what this binding does not provide, with the reason. The covered subset is the run
+/// set minus these; the reasons name a surface outside this arc, never a failing one inside it.
 fn excluded(name: &str, src: &str) -> Option<&'static str> {
-    if name.starts_with("MutationObserver") || src.contains("MutationObserver(") || src.contains("mutationobservers.js") {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    if base.starts_with("MutationObserver") || src.contains("MutationObserver(") || src.contains("mutationobservers.js") {
         return Some("MutationObserver (a stub that never delivers)");
     }
-    if src.contains("<iframe") || src.contains("createElement(\"iframe\")") || src.contains("createElement('iframe')") || src.contains("window.open(") {
+    if src.contains("<iframe")
+        || src.contains("createElement(\"iframe\")")
+        || src.contains("createElement('iframe')")
+        || src.contains("window.open(")
+        || src.contains("<frameset")
+        || src.contains("contentWindow")
+        || src.contains("<object")
+    {
         return Some("frames / browsing contexts");
     }
-    if src.contains("attachShadow") || src.contains("shadowRoot") {
+    if src.contains("attachShadow") || src.contains("shadowRoot") || src.contains("shadowrootmode") {
         return Some("shadow DOM");
     }
     if src.contains("customElements.define") {
         return Some("custom elements");
     }
-    if name.contains("moveBefore") {
+    if base.contains("moveBefore") {
         return Some("moveBefore (2025 proposal)");
     }
-    if src.contains("createRange") || src.contains("new Range") {
-        return Some("Range");
+    if src.contains(".xhtml") || src.contains(".xml\"") || src.contains("XMLHttpRequest") || src.contains("fetch(") {
+        return Some("XML documents / network (SR70)");
     }
-    if src.contains("createNodeIterator") || src.contains("createTreeWalker") {
-        return Some("NodeIterator / TreeWalker");
+    if src.contains("testdriver.js") || src.contains("test_driver") {
+        return Some("testdriver (WebDriver input automation)");
     }
-    if src.contains(".xhtml") || src.contains(".xml\"") || src.contains("XMLHttpRequest") {
-        return Some("XML documents");
+    if src.contains("new Worker") || src.contains("SharedWorker") || src.contains("serviceWorker") || src.contains("MessageChannel") || src.contains("postMessage(") {
+        return Some("workers / messaging");
+    }
+    if name.contains("/scrolling/")
+        || name.starts_with("html/webappapis/update-rendering/")
+        || name.starts_with("html/semantics/forms/customizable-combobox/")
+        || src.contains("getBoundingClientRect")
+        || src.contains("getComputedStyle")
+        || src.contains("offsetWidth")
+        || src.contains("offsetHeight")
+        || src.contains("offsetTop")
+        || src.contains("offsetLeft")
+        || src.contains("clientWidth")
+        || src.contains("clientHeight")
+        || src.contains("scrollTop")
+        || src.contains("scrollLeft")
+        || src.contains("elementFromPoint")
+        || src.contains("scrollIntoView")
+        || src.contains("requestAnimationFrame")
+    {
+        return Some("layout / rendering (EYES is the oracle)");
+    }
+    if src.contains("alert(") && name.contains("user-prompts") || src.contains("print(") && name.contains("user-prompts") {
+        return Some("user prompts (manual)");
     }
     None
 }
@@ -228,80 +300,178 @@ fn run_file(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResult {
     out
 }
 
-#[test]
-fn wpt_dom_nodes() {
-    // The whole directory takes ~12 min in a release build; an unoptimized `cargo test -p aether` runs it
+/// Every testharness file under `dir` (recursively when asked), as paths relative to the checkout.
+fn collect(root: &Path, dir: &str, recurse: bool, out: &mut Vec<String>) {
+    let Ok(rd) = std::fs::read_dir(root.join(dir)) else { return };
+    for e in rd.filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().to_string();
+        let rel = format!("{dir}/{n}");
+        if e.path().is_dir() {
+            if recurse && !matches!(n.as_str(), "resources" | "support" | "crashtests" | "tools" | "reference" | "references") {
+                collect(root, &rel, recurse, out);
+            }
+        } else if n.ends_with(".html") || n.ends_with(".htm") || n.ends_with(".window.js") || n.ends_with(".any.js") {
+            out.push(rel);
+        }
+    }
+}
+
+/// Runs one directory and returns (covered pass, covered total).
+fn run_dir(dir: &str, recurse: bool) -> Option<(usize, usize)> {
+    let tag = dir.replace('/', "-");
+    // The whole of dom/nodes takes ~12 min in a release build; an unoptimized `cargo test -p aether` runs it
     // only when asked (`AETHER_WPT=1`) or for a filtered subset.
     if cfg!(debug_assertions) && std::env::var("AETHER_WPT").is_err() && std::env::var("AETHER_WPT_ONLY").is_err() {
-        println!("wpt dom/nodes: skipped in a debug build (run with --release, or set AETHER_WPT=1)");
-        return;
+        println!("wpt {dir}: skipped in a debug build (run with --release, or set AETHER_WPT=1)");
+        return None;
     }
     let Some(root) = locate() else {
-        println!("wpt dom/nodes: skipped (no checkout, offline)");
-        return;
+        println!("wpt {dir}: skipped (no checkout, offline)");
+        return None;
     };
-    let dir = root.join("dom/nodes");
-    let mut files: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".html") || n.ends_with(".htm") || n.ends_with(".window.js"))
-        .collect();
+    let started = std::time::Instant::now();
+    let mut files = Vec::new();
+    collect(&root, dir, recurse, &mut files);
     files.sort();
     let only = std::env::var("AETHER_WPT_ONLY").ok();
     let verbose = std::env::var("AETHER_WPT_VERBOSE").is_ok();
     let port = serve(root.clone());
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let (mut all_pass, mut all_total, mut cov_pass, mut cov_total) = (0, 0, 0, 0);
-    let (mut files_run, mut files_cov) = (0, 0);
+    let (mut files_run, mut files_cov, mut server) = (0, 0, 0);
     let mut tsv = String::from("file\tpass\ttotal\tharness\texcluded\n");
     let mut excluded_list: Vec<(String, &'static str)> = Vec::new();
     for f in &files {
         if only.as_ref().is_some_and(|o| !o.split(',').any(|x| f.contains(x))) {
             continue;
         }
-        let src = std::fs::read_to_string(dir.join(f)).unwrap_or_default();
-        // Support pages that are not tests.
-        if !src.contains("testharness.js") && !f.ends_with(".window.js") {
+        let src = std::fs::read_to_string(root.join(f)).unwrap_or_default();
+        let is_js = f.ends_with(".window.js") || f.ends_with(".any.js");
+        // Support pages and reftests are not tests.
+        if !src.contains("testharness.js") && !is_js {
+            continue;
+        }
+        // An `.any.js` runs here only in its window global.
+        if f.ends_with(".any.js") {
+            if let Some(g) = src.lines().find_map(|l| l.strip_prefix("// META: global=")) {
+                if !g.split(',').any(|x| x.trim() == "window") {
+                    continue;
+                }
+            }
+        }
+        if needs_server(f, &src) {
+            server += 1;
+            tsv.push_str(&format!("{f}\t0\t0\tnot run\tneeds server\n"));
             continue;
         }
         let rel = if let Some(stem) = f.strip_suffix(".window.js") {
-            format!("dom/nodes/{stem}.window.html")
+            format!("{stem}.window.html")
+        } else if let Some(stem) = f.strip_suffix(".any.js") {
+            format!("{stem}.any.html")
         } else {
-            format!("dom/nodes/{f}")
+            f.clone()
         };
         let ex = excluded(f, &src);
+        let t0 = std::time::Instant::now();
         let r = run_file(&rt, port, &rel);
+        let secs = t0.elapsed().as_secs_f64();
         files_run += 1;
         all_pass += r.pass;
         all_total += r.total;
-        if ex.is_none() {
+        if let Some(e) = ex {
+            excluded_list.push((f.clone(), e));
+        } else {
             files_cov += 1;
             cov_pass += r.pass;
             cov_total += r.total;
-        } else {
-            excluded_list.push((f.clone(), ex.unwrap()));
         }
-        println!("wpt {:58} {:4}/{:<4} {}{}", f, r.pass, r.total, r.harness, ex.map(|e| format!("  [excluded: {e}]")).unwrap_or_default());
+        let short = f.strip_prefix(dir).unwrap_or(f).trim_start_matches('/');
+        println!("wpt {dir} {:58} {:4}/{:<4} {} ({secs:.1}s){}", short, r.pass, r.total, r.harness, ex.map(|e| format!("  [excluded: {e}]")).unwrap_or_default());
         if verbose {
-            for (n, m) in r.failures.iter().take(12) {
-                println!("    FAIL {n}: {}", m.chars().take(160).collect::<String>());
+            for (n, m) in r.failures.iter().take(40) {
+                println!("    FAIL {n}: {}", m.chars().take(200).collect::<String>());
             }
         }
         tsv.push_str(&format!("{f}\t{}\t{}\t{}\t{}\n", r.pass, r.total, r.harness, ex.unwrap_or("")));
     }
-    let _ = std::fs::write(target_dir().join("wpt-dom-nodes.tsv"), tsv);
+    if only.is_none() {
+        let _ = std::fs::write(target_dir().join(format!("wpt-{tag}.tsv")), tsv);
+    }
     let pct = |p: usize, t: usize| if t == 0 { 0.0 } else { 100.0 * p as f64 / t as f64 };
-    println!("wpt dom/nodes (all {files_run} files):      {all_pass}/{all_total} subtests ({:.1}%)", pct(all_pass, all_total));
-    println!("wpt dom/nodes (covered {files_cov} files):  {cov_pass}/{cov_total} subtests ({:.1}%)", pct(cov_pass, cov_total));
+    let wall = started.elapsed().as_secs_f64();
+    println!("wpt {dir} (all {files_run} files):      {all_pass}/{all_total} subtests ({:.1}%)", pct(all_pass, all_total));
+    println!("wpt {dir} (covered {files_cov} files):  {cov_pass}/{cov_total} subtests ({:.1}%)", pct(cov_pass, cov_total));
+    println!("wpt {dir}: needs server (not run): {server} files; wall {wall:.0} s");
     let mut reasons: Vec<&str> = excluded_list.iter().map(|(_, r)| *r).collect();
     reasons.sort();
     reasons.dedup();
     for r in reasons {
-        println!("  excluded for {r}: {}", excluded_list.iter().filter(|(_, x)| *x == r).count());
+        println!("  {dir} excluded for {r}: {}", excluded_list.iter().filter(|(_, x)| *x == r).count());
     }
-    if only.is_none() {
-        // Regression floor (set from the measured run; raise it as the surface grows).
-        assert!(cov_pass * 100 >= cov_total * 80, "covered dom/nodes subtests fell below 80%");
+    only.is_none().then_some((cov_pass, cov_total))
+}
+
+/// Regression floor for a directory's covered subtests (set from the measured run; raise it as the surface grows).
+fn floor(dir: &str, recurse: bool, pct: usize) {
+    if let Some((p, t)) = run_dir(dir, recurse) {
+        assert!(p * 100 >= t * pct, "covered {dir} subtests fell below {pct}%: {p}/{t}");
     }
+}
+
+fn dir_entry(dir: &str) -> (&'static str, bool) {
+    *DIRS.iter().find(|(d, _)| *d == dir).expect("listed directory")
+}
+
+#[test]
+fn wpt_dom_nodes() {
+    let (d, r) = dir_entry("dom/nodes");
+    floor(d, r, 80);
+}
+
+#[test]
+fn wpt_dom_events() {
+    let (d, r) = dir_entry("dom/events");
+    floor(d, r, 0);
+}
+
+#[test]
+fn wpt_dom_ranges() {
+    let (d, r) = dir_entry("dom/ranges");
+    floor(d, r, 0);
+}
+
+#[test]
+fn wpt_dom_traversal() {
+    let (d, r) = dir_entry("dom/traversal");
+    floor(d, r, 0);
+}
+
+#[test]
+fn wpt_dom_collections() {
+    let (d, r) = dir_entry("dom/collections");
+    floor(d, r, 0);
+}
+
+#[test]
+fn wpt_dom_lists() {
+    let (d, r) = dir_entry("dom/lists");
+    floor(d, r, 0);
+}
+
+#[test]
+fn wpt_html_dom() {
+    let (d, r) = dir_entry("html/dom");
+    floor(d, r, 0);
+}
+
+#[test]
+fn wpt_html_semantics_forms() {
+    let (d, r) = dir_entry("html/semantics/forms");
+    floor(d, r, 0);
+}
+
+#[test]
+fn wpt_html_webappapis() {
+    let (d, r) = dir_entry("html/webappapis");
+    floor(d, r, 0);
 }

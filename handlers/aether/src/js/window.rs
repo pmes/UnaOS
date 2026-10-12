@@ -567,6 +567,23 @@ fn navigate(vm: &mut Vm, target: &str, _replace: bool) -> JsResult<()> {
     Ok(())
 }
 
+/// Following a hyperlink from a script-dispatched click (fragment links stay in the document).
+pub(crate) fn navigate_from_link(vm: &mut Vm, href: &str) -> JsResult<()> {
+    navigate(vm, href, false)
+}
+
+/// `window.event` ([Replaceable]): the current event while a listener runs.
+fn window_event_get(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
+    Ok(super::events::current_event())
+}
+
+fn window_event_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let v = arg(vm, ctx, 0);
+    let g = vm.realm().global;
+    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("event"), Prop::data(v, WEC));
+    Ok(Value::Undefined)
+}
+
 fn fire_hashchange(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let init = vm.native_slot(ctx.callee, 0).as_object();
     let e = super::events::new_event(vm, "HashChangeEvent", "hashchange", true, false, init);
@@ -1068,6 +1085,7 @@ pub fn install(vm: &mut Vm) {
     register_iface("Window", window);
     let g = vm.realm().global;
     vm.heap.get_mut(g).proto = Some(window.proto);
+    attr(vm, window.proto, "event", window_event_get, Some(window_event_set));
 
     // [LegacyUnforgeable] window, document, location, top.
     global_accessor(vm, "window", global_self, None, None, true);
@@ -1138,7 +1156,14 @@ pub fn install(vm: &mut Vm) {
     register_iface("Performance", perf_i);
     op(vm, perf_i.proto, "now", 0, performance_now);
     attr(vm, perf_i.proto, "timeOrigin", performance_time_origin, None);
-    let perf = vm.new_object(Some(perf_i.proto));
+    // The Performance object is an EventTarget (HR-TIME): a platform target with its own serial.
+    let perf_id = page(|p| {
+        p.target_serial += 1;
+        p.target_serial
+    });
+    let perf = idl::host_obj(vm, perf_i.proto, idl::T_ETARGET, vec![num(perf_id as f64)]);
+    let perf_root = root(vm, Value::Object(perf));
+    page(|p| p.other_targets.insert(perf_id, (perf, perf_root)));
     data(vm, g, "performance", Value::Object(perf), WEC);
 
     // MediaQueryList
