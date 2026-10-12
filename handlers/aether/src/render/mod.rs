@@ -67,6 +67,34 @@ fn ui_sel() -> FontSel {
 /// Screen-space clip rect (x0, y0, x1, y1), already scroll-adjusted.
 type Clip = (f32, f32, f32, f32);
 
+/// One text fragment the last frame painted (AETHERSELECT, SR69): the paint-order record a pointer is
+/// hit-tested against. Geometry is in viewport px at the frame's scroll offset (`scroll`).
+#[derive(Clone, Debug)]
+pub struct TextBox {
+    /// The inline formatting context root and the fragment's index in its `frags`.
+    pub ifc: NodeId,
+    pub frag: usize,
+    /// The text node's box.
+    pub node: NodeId,
+    /// Pen origin x and advance width of the fragment.
+    pub x: f32,
+    pub w: f32,
+    /// The line box the fragment sits on.
+    pub top: f32,
+    pub bottom: f32,
+    pub adv: Advancer,
+    pub scroll: (i32, i32),
+}
+
+thread_local! {
+    static TEXT_BOXES: std::cell::RefCell<Vec<TextBox>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The text fragments the last full frame painted, in paint order (topmost last).
+pub fn text_boxes() -> Vec<TextBox> {
+    TEXT_BOXES.with(|t| t.borrow().clone())
+}
+
 mod boxpaint;
 pub(crate) mod effects;
 
@@ -1268,6 +1296,7 @@ pub fn render_frame(
         return;
     }
     dump_layout(layout);
+    TEXT_BOXES.with(|t| t.borrow_mut().clear());
 
     // Clear damaged regions to the CANVAS background: the root element's
     // background, else body's (CSS Backgrounds §2.11.2 — the root/body
@@ -2219,7 +2248,9 @@ pub fn render_frame(
             let mut root_inh = inherited;
             root_inh.shift_y = 0.0;
             walk_inh(layout, node_id, root_inh, false, &mut inh, &mut skip);
-            for frag in &ifc.frags {
+            // AETHERSELECT: the selected part of each text fragment (empty without a selection).
+            let sel_plan = crate::selection::plan_ifc(layout, node_id);
+            for (fi, frag) in ifc.frags.iter().enumerate() {
                 match frag {
                     crate::layout::inline::Frag::Box { node, x, y, w, h, first, last } => {
                         if skip.contains(node) {
@@ -2315,20 +2346,59 @@ pub fn render_frame(
                         if i.text_hidden {
                             continue;
                         }
-                        draw_glyph_run(
-                            text,
-                            content_x + x - sx as f32,
-                            (exact_content_y + baseline).round() - sy as f32,
-                            &i.advancer(),
-                            i.color,
-                            Deco { underline: i.underline, line_through: i.line_through },
-                            i.shadows(layout),
-                            surface,
-                            width,
-                            height,
-                            damage_rects,
-                            child_clip,
-                        );
+                        let adv = i.advancer();
+                        let ox = content_x + x - sx as f32;
+                        let by = (exact_content_y + baseline).round() - sy as f32;
+                        // The line box the fragment sits on (selection highlights span it, as Blink's do).
+                        let (ltop, lbot) = match crate::selection::line_of(ifc, *baseline) {
+                            Some((_, t, h)) => ((exact_content_y + t).round() - sy as f32, (exact_content_y + t + h).round() - sy as f32),
+                            None => (by - i.font_size, by + i.font_size * 0.25),
+                        };
+                        let fw = match frag {
+                            crate::layout::inline::Frag::Text { width: w, .. } => *w,
+                            _ => 0.0,
+                        };
+                        TEXT_BOXES.with(|t| {
+                            t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox, w: fw, top: ltop, bottom: lbot, adv, scroll: (sx, sy) })
+                        });
+                        let deco = Deco { underline: i.underline, line_through: i.line_through };
+                        match sel_plan.get(&fi) {
+                            None => {
+                                draw_glyph_run(text, ox, by, &adv, i.color, deco, i.shadows(layout), surface, width, height, damage_rects, child_clip);
+                            }
+                            Some(fs) => {
+                                // Inverse video: the highlight behind the glyphs (pixel-snapped, the line
+                                // box tall, a space wider when the line break is selected), the selected
+                                // glyphs in the highlight text colour, the rest as they were.
+                                let mut x1 = crate::selection::caret_x(&adv, text, fs.end);
+                                if fs.newline {
+                                    x1 += adv.char(' ');
+                                }
+                                let (hx0, hx1) = ((ox + crate::selection::caret_x(&adv, text, fs.start)).round(), (ox + x1).round());
+                                let (hy0, hy1) = (ltop, lbot);
+                                let (ax, ay) = (hx0.max(child_clip.0).max(0.0) as u32, hy0.max(child_clip.1).max(0.0) as u32);
+                                let (bx, by1) = ((hx1.min(child_clip.2).max(0.0) as u32).min(width), (hy1.min(child_clip.3).max(0.0) as u32).min(height));
+                                for yy in ay..by1 {
+                                    for xx in ax..bx {
+                                        if in_damage(xx, yy, damage_rects) {
+                                            blend_px(surface, width, xx, yy, crate::selection::HIGHLIGHT, crate::selection::HIGHLIGHT_ALPHA);
+                                        }
+                                    }
+                                }
+                                let left = (child_clip.0, child_clip.1, child_clip.2.min(hx0), child_clip.3);
+                                let mid = (child_clip.0.max(hx0), child_clip.1, child_clip.2.min(hx1), child_clip.3);
+                                let right = (child_clip.0.max(hx1), child_clip.1, child_clip.2, child_clip.3);
+                                for (c, color, shadows) in [
+                                    (left, i.color, i.shadows(layout)),
+                                    (right, i.color, i.shadows(layout)),
+                                    (mid, crate::selection::HIGHLIGHT_TEXT, &[][..]),
+                                ] {
+                                    if c.2 > c.0 {
+                                        draw_glyph_run(text, ox, by, &adv, color, deco, shadows, surface, width, height, damage_rects, c);
+                                    }
+                                }
+                            }
+                        }
                     }
                     crate::layout::inline::Frag::Atomic { node, x, y } => {
                         if skip.contains(node) || is_layered(layout, *node) {

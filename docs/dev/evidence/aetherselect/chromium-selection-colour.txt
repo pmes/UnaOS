@@ -1,0 +1,24 @@
+AETHERSELECT (SR69) — Chromium's selection paint on Linux, measured from its own pixels
+Browser: Playwright chromium-1194 (/opt/pw-browsers), headless, flags as EYES (--font-render-hinting=none
+--disable-lcd-text --force-device-scale-factor=1), 2026-10-12. Probe: probe2.mjs + png.mjs (this dir):
+  node probe2.mjs '<page>' '<script that calls getSelection().setBaseAndExtent(...)>' out.png <col> <row>
+
+1. Colour. Page: <p style="margin:10px;width:150px">MMMMM <b>bold</b> text and more words here</p>
+   selection p.firstChild[2] .. p.lastChild[8].
+   Highlight pixels over the white canvas:            (51,103,209)
+   Earlier probe, highlight over a #000 background:    (0,52,158)
+   => source-over of rgb(0,65,198) at alpha 0.8 (204/255): 255*0.2 = 51; 65*0.8+51 = 103; 197.5*0.8+51 = 209;
+      over black 0.8*(0,65,197.5) = (0,52,158). (The brief's #3390FF is not what this Chromium paints.)
+   Selected glyph pixels inside the highlight: 255,255,255 (white text); the selected link's underline
+   (row 25 of a 16px link) is white too. ::selection computed style reads rgba(0,0,0,0) (the UA paints
+   its theme colour).
+
+2. Geometry. 16px Liberation Sans, line-height normal: line 1 highlight rows 10..27, line 2 rows 28..45 —
+   the LINE BOX height (18 px), tiled with no gap, although each text rect is 17 px tall
+   (getClientRects: [36.66,10,44.44,17] ... [10,28,17.80,17]). Horizontal edges are pixel-snapped
+   (36.66 -> first highlighted column 37; 150.18 -> last column 149).
+
+3. Line break. When the selection runs past a line's end, Chromium paints one space advance (4.45 px at
+   16px Liberation Sans) after the line's last glyph: line 1 ends at 145.09 (text) and the highlight runs
+   to column 149; a paragraph's last line followed by a selected next paragraph gets the same
+   (56.27 + 4.45 -> column 60). The margin between paragraphs is not painted.

@@ -2850,4 +2850,134 @@ mod tests {
         assert_eq!(marker_text(8, 4), "IV. ");
         assert_eq!(marker_text(9, 7), "07. ");
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // AETHERSELECT (SR69): the selection model, its paint, copy and the script API
+    // ---------------------------------------------------------------------------------------------
+
+    const SEL_PAGE: &str = r#"<!DOCTYPE html><html><body style="margin:0;font:16px sans-serif">
+<p id="p" style="margin:10px;width:200px">alpha beta <b>gamma</b> delta epsilon zeta eta theta</p>
+<p id="q" style="margin:10px">second</p></body></html>"#;
+
+    fn sel_engine(html: &str) -> crate::AetherEngine {
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 200));
+        e.load_html("file:///sel.html", html, true);
+        e.render_frame();
+        e
+    }
+
+    fn mid(b: &crate::render::TextBox) -> f64 {
+        ((b.top + b.bottom) / 2.0) as f64
+    }
+
+    #[test]
+    fn test_selection_drag_paints_and_copies() {
+        let mut e = sel_engine(SEL_PAGE);
+        let boxes = crate::render::text_boxes();
+        assert!(boxes.len() >= 3, "the paragraph's fragments are on record: {}", boxes.len());
+        let first = boxes[0].clone();
+        let last_line = boxes.iter().filter(|b| b.top > first.top && b.top < first.top + 40.0).last().cloned().expect("a second line");
+        // MouseDown (this arc's arm) at the first glyph, motion to the end of the second line, release.
+        e.handle_event(crate::api::events::Event::MouseDown(first.x as f64 + 0.5, mid(&first)));
+        let s = crate::selection::get().expect("a press places a caret");
+        assert!(s.is_collapsed() && s.anchor.offset == 0, "{s:?}");
+        e.pointer_moved((last_line.x + last_line.w) as f64 + 30.0, mid(&last_line));
+        e.pointer_released();
+        let text = e.selected_text();
+        assert!(text.starts_with("alpha beta gamma delta"), "{text:?}");
+        assert!(!text.contains("second"), "{text:?}");
+        // Motion after the release does not extend.
+        e.pointer_moved(5.0, 190.0);
+        assert_eq!(e.selected_text(), text);
+        // Paint: the highlight (rgb(0,65,198) at 204/255 over white = 51,103,209; BGRA) on both lines.
+        assert!(e.tick(), "the selection change repaints");
+        e.render_frame();
+        let w = e.width as usize;
+        let hl = |y: f32, x0: f32, x1: f32| {
+            let y = y as usize;
+            (x0 as usize..x1 as usize).any(|x| e.surface[(y * w + x) * 4..(y * w + x) * 4 + 3] == [209, 103, 51])
+        };
+        assert!(hl(first.top + 1.0, first.x, first.x + 30.0), "line 1 highlighted");
+        assert!(hl(last_line.top + 1.0, last_line.x, last_line.x + 30.0), "line 2 highlighted");
+        // Copy: BrowserClipboardSet carries the innerText serialization.
+        match e.copy_selection() {
+            Some(bandy::SMessage::BrowserClipboardSet(t)) => assert_eq!(t, text),
+            other => panic!("copy: {other:?}"),
+        }
+        // A plain click elsewhere collapses it: nothing to copy, nothing painted.
+        e.press_at(first.x as f64 + 0.5, mid(&first), 1, false);
+        e.pointer_released();
+        assert!(e.copy_selection().is_none());
+    }
+
+    #[test]
+    fn test_selection_word_block_shift_and_select_all() {
+        let mut e = sel_engine(SEL_PAGE);
+        let first = crate::render::text_boxes()[0].clone();
+        // "alpha beta " — a point inside "beta".
+        let beta_x = first.x as f64 + crate::selection::caret_x(&first.adv, "alpha be", 8) as f64;
+        e.press_at(beta_x, mid(&first), 2, false);
+        assert_eq!(e.selected_text(), "beta", "double click: the word");
+        e.pointer_released();
+        e.press_at(beta_x, mid(&first), 3, false);
+        assert_eq!(e.selected_text(), "alpha beta gamma delta epsilon zeta eta theta", "triple click: the block");
+        e.pointer_released();
+        // Shift+click extends from the caret.
+        e.press_at(first.x as f64 + 0.5, mid(&first), 1, false);
+        e.pointer_released();
+        e.press_at(beta_x, mid(&first), 1, true);
+        e.pointer_released();
+        assert_eq!(e.selected_text(), "alpha be");
+        // Ctrl/Cmd+A.
+        e.select_all();
+        assert_eq!(e.selected_text(), "alpha beta gamma delta epsilon zeta eta theta\n\nsecond");
+        // A drag after a double click extends by words.
+        e.press_at(first.x as f64 + 1.0, mid(&first), 2, false);
+        e.pointer_moved(beta_x, mid(&first));
+        e.pointer_released();
+        assert_eq!(e.selected_text(), "alpha beta");
+    }
+
+    #[test]
+    fn test_selection_script_api_and_selectionchange() {
+        let page = SEL_PAGE.replace(
+            "</body>",
+            "<script>window.n = 0; document.addEventListener('selectionchange', () => { window.n++; });</script></body>",
+        );
+        let mut e = sel_engine(&page);
+        let js = |e: &mut crate::AetherEngine, src: &str| e.js_engine.as_mut().unwrap().eval_string(src).unwrap();
+        assert_eq!(js(&mut e, "[getSelection().rangeCount, getSelection().type, getSelection().anchorNode].join()"), "0,None,");
+        assert_eq!(js(&mut e, "getSelection() === document.getSelection() && getSelection() instanceof Selection"), "true");
+        let r = js(
+            &mut e,
+            "var t = document.getElementById('p').firstChild; var s = getSelection(); s.setBaseAndExtent(t, 0, t, 5); \
+             [s.anchorNode === t, s.anchorOffset, s.focusOffset, s.isCollapsed, s.rangeCount, s.toString(), s.type, s.direction].join()",
+        );
+        assert_eq!(r, "true,0,5,false,1,alpha,Range,forward");
+        // The engine sees the script's selection (and repaints for it).
+        let sel = crate::selection::get().unwrap();
+        assert_eq!((sel.anchor.offset, sel.focus.offset), (0, 5));
+        assert_eq!(e.selected_text(), "alpha");
+        js(&mut e, "s.collapse(t, 2); s.extend(t, 4);");
+        assert_eq!(js(&mut e, "[s.toString(), s.isCollapsed, s.type].join()"), "ph,false,Range");
+        js(&mut e, "s.extend(t, 0)");
+        assert_eq!(js(&mut e, "[s.toString(), s.direction, s.getRangeAt(0).startOffset, s.getRangeAt(0).endOffset].join()"), "al,backward,0,2");
+        js(&mut e, "s.removeAllRanges()");
+        assert_eq!(js(&mut e, "[s.rangeCount, s.anchorNode, s.isCollapsed].join()"), "0,,true");
+        js(&mut e, "var r = document.createRange(); r.setStart(t, 1); r.setEnd(t, 3); s.addRange(r);");
+        assert_eq!(js(&mut e, "[s.toString(), r.toString(), r instanceof Range, s.getRangeAt(0).toString(), s.containsNode(t, true), s.containsNode(t)].join()"), "lp,lp,true,lp,true,false");
+        assert_eq!(js(&mut e, "try { s.collapse(t, 999); 'no' } catch (x) { x.name }"), "IndexSizeError");
+        assert_eq!(js(&mut e, "try { s.getRangeAt(1); 'no' } catch (x) { x.name }"), "IndexSizeError");
+        js(&mut e, "s.selectAllChildren(document.getElementById('q'))");
+        assert_eq!(js(&mut e, "s.toString()"), "second");
+        // selectionchange: a task, coalesced while one is queued.
+        assert_eq!(js(&mut e, "String(window.n)"), "0");
+        e.tick();
+        assert_eq!(js(&mut e, "String(window.n)"), "1");
+        // A user selection fires it too.
+        e.select_all();
+        e.tick();
+        assert_eq!(js(&mut e, "String(window.n)"), "2");
+    }
 }

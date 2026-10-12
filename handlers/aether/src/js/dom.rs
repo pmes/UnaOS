@@ -17,6 +17,10 @@
 
 use super::idl::*;
 use super::{page, touch};
+
+/// AETHERSELECT (SR69): `Selection`, `Range`, `getSelection()` over the engine's selection.
+#[path = "selection.rs"]
+pub mod selection;
 use crate::dom::{Arena, NodeRef, Selectors};
 use html_core::{Attribute, Document, Namespace, NodeData, NodeId};
 use js_core::string::JsStr;
@@ -3922,6 +3926,8 @@ pub fn install(vm: &mut Vm) {
     op(vm, dimpl.proto, "createDocument", 2, impl_create_document);
     op(vm, dimpl.proto, "createHTMLDocument", 0, impl_create_html_document);
     op(vm, dimpl.proto, "hasFeature", 0, impl_has_feature);
+
+    selection::install(vm);
 }
 
 fn parent_node_mixin(vm: &mut Vm, p: Obj) {

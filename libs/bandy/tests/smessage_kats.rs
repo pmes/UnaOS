@@ -341,6 +341,13 @@ kat!(
     },
     r#"{"BrowserFaviconChanged":{"width":1,"height":1,"rgba":[255,0,0,255]}}"#
 );
+kat!(kat_browser_copy, SMessage::BrowserCopy, r#""BrowserCopy""#);
+kat!(kat_browser_select_all, SMessage::BrowserSelectAll, r#""BrowserSelectAll""#);
+kat!(
+    kat_browser_clipboard_set,
+    SMessage::BrowserClipboardSet("line one\nline two".to_string()),
+    r#"{"BrowserClipboardSet":"line one\nline two"}"#
+);
 
 // --- STRIA (A/V playback) ---
 
@@ -1143,6 +1150,9 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserUrlChanged(_) => "BrowserUrlChanged",
         SMessage::BrowserTitleChanged(_) => "BrowserTitleChanged",
         SMessage::BrowserFaviconChanged { .. } => "BrowserFaviconChanged",
+        SMessage::BrowserCopy => "BrowserCopy",
+        SMessage::BrowserSelectAll => "BrowserSelectAll",
+        SMessage::BrowserClipboardSet(_) => "BrowserClipboardSet",
         SMessage::MediaPoster { .. } => "MediaPoster",
         SMessage::MediaPause { .. } => "MediaPause",
         SMessage::MediaResume { .. } => "MediaResume",

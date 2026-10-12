@@ -42,6 +42,9 @@ enum Commands {
         /// Hold the pointer at viewport X,Y before rendering (hover, `:hover`, mouse events, cursor)
         #[arg(long, value_parser = parse_point)]
         pointer: Option<(f64, f64)>,
+        /// Hold a selection: press at X1,Y1, drag to X2,Y2, release (viewport px), then render
+        #[arg(long, value_name = "X1,Y1,X2,Y2")]
+        select: Option<String>,
     },
 }
 
@@ -124,9 +127,17 @@ async fn main() -> Result<()> {
             
             ignite(synapse).await?;
         }
-        Commands::Render { url, html, out, ledger, scroll, width, height, pointer } => {
-            let (w, h, missing) = aether::headless::render_headless_pointer(
-                url.as_deref(), html.as_deref(), out, ledger, *scroll, *width, *height, *pointer,
+        Commands::Render { url, html, out, ledger, scroll, width, height, pointer, select } => {
+            let select = match select {
+                Some(s) => {
+                    let v: Vec<f64> = s.split(',').map(|t| t.trim().parse::<f64>()).collect::<Result<_, _>>()?;
+                    anyhow::ensure!(v.len() == 4, "--select wants X1,Y1,X2,Y2");
+                    Some((v[0], v[1], v[2], v[3]))
+                }
+                None => None,
+            };
+            let (w, h, missing) = aether::headless::render_headless_with(
+                url.as_deref(), html.as_deref(), out, ledger, *scroll, *width, *height, *pointer, select,
             ).await?;
             println!(
                 "rendered {}x{} -> {} | {} missing APIs -> {}",

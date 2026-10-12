@@ -34,7 +34,7 @@ pub async fn render_headless_opts(
     width: u32,
     height: u32,
 ) -> anyhow::Result<(u32, u32, usize)> {
-    render_headless_pointer(url, html_file, out, ledger_path, scroll, width, height, None).await
+    render_headless_with(url, html_file, out, ledger_path, scroll, width, height, None, None).await
 }
 
 /// render_headless_opts with the pointer held at a viewport position (AETHERHOVER, SR67): after the
@@ -43,7 +43,7 @@ pub async fn render_headless_opts(
 /// the PNG shows the page as a user resting the mouse at that point sees it. The hovered element and
 /// cursor go to stderr as `[pointer] X,Y -> <tag#id.class> cursor=<keyword>`.
 #[allow(clippy::too_many_arguments)]
-pub async fn render_headless_pointer(
+pub async fn render_headless_with(
     url: Option<&str>,
     html_file: Option<&Path>,
     out: &Path,
@@ -52,6 +52,7 @@ pub async fn render_headless_pointer(
     width: u32,
     height: u32,
     pointer: Option<(f64, f64)>,
+    select: Option<(f64, f64, f64, f64)>,
 ) -> anyhow::Result<(u32, u32, usize)> {
     crate::ledger::reset();
     let mut engine = AetherEngine::new();
@@ -96,6 +97,14 @@ pub async fn render_headless_pointer(
         eprintln!("[pointer] {},{} -> {} cursor={}", x, y, what.as_deref().unwrap_or("-"), engine.cursor());
     }
     engine.render_frame();
+    // AETHERSELECT (SR69): a press at (x1, y1), a drag to (x2, y2), a release — the selection painted.
+    if let Some((x1, y1, x2, y2)) = select {
+        engine.press_at(x1, y1, 1, false);
+        engine.pointer_moved(x2, y2);
+        engine.pointer_released();
+        engine.tick();
+        engine.render_frame();
+    }
 
     let (w, h) = (engine.width, engine.height);
     // The engine surface is BGRA (see render::draw_node); PNG wants RGBA.
@@ -110,4 +119,16 @@ pub async fn render_headless_pointer(
     let snapshot = crate::ledger::snapshot();
     snapshot.dump_to_file(ledger_path)?;
     Ok((w, h, snapshot.len()))
+}
+
+/// `render_headless_with` holding the pointer only (AETHERHOVER, SR67).
+#[allow(clippy::too_many_arguments)]
+pub async fn render_headless_pointer(url: Option<&str>, html_file: Option<&Path>, out: &Path, ledger_path: &Path, scroll: f64, width: u32, height: u32, pointer: Option<(f64, f64)>) -> anyhow::Result<(u32, u32, usize)> {
+    render_headless_with(url, html_file, out, ledger_path, scroll, width, height, pointer, None).await
+}
+
+/// `render_headless_with` holding a selection only (AETHERSELECT, SR69): `select = (x1, y1, x2, y2)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_headless_select(url: Option<&str>, html_file: Option<&Path>, out: &Path, ledger_path: &Path, scroll: f64, width: u32, height: u32, select: Option<(f64, f64, f64, f64)>) -> anyhow::Result<(u32, u32, usize)> {
+    render_headless_with(url, html_file, out, ledger_path, scroll, width, height, None, select).await
 }

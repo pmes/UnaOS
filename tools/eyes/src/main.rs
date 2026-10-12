@@ -37,6 +37,9 @@ struct Source {
     /// Chromium oracle only (SR67): hold the mouse at viewport "X,Y" before the screenshot, so a
     /// `:hover` state is in the reference (the subject holds the same point, e.g. `--pointer X,Y`).
     hover: Option<String>,
+    /// `chromium` oracle: a script the page evaluates after load, before the screenshot (a selection
+    /// set by `document.getSelection().setBaseAndExtent(...)`, say). One line; tabs become spaces.
+    script: Option<String>,
 }
 
 impl Source {
@@ -55,6 +58,7 @@ impl Source {
             wait_ms: self.wait_ms.or(base.wait_ms),
             timeout_s: self.timeout_s.or(base.timeout_s),
             hover: self.hover.clone().or(base.hover.clone()),
+            script: self.script.clone().or(base.script.clone()),
         }
     }
 }
@@ -285,7 +289,8 @@ fn run(suite_name: &str, args: &[String]) -> ExitCode {
                     let _ = std::fs::remove_file(&refp);
                     let url = c.fill(c.oracle.url.as_deref().unwrap_or("{url}"));
                     let hover = c.oracle.hover.as_deref().unwrap_or("");
-                    tsv.push_str(&format!("{url}\t{}\t{}\t{}\t{hover}\n", refp.display(), c.w, c.h));
+                    let script = c.oracle.script.as_deref().unwrap_or("").replace(['\t', '\n', '\r'], " ");
+                    tsv.push_str(&format!("{url}\t{}\t{}\t{}\t{hover}\t{script}\n", refp.display(), c.w, c.h));
                 }
             }
             Some("golden") => {

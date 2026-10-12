@@ -107,3 +107,12 @@ name = "25-hover"
 page = "corpus/25-hover.html"
 subject.run = "{repo}/target/release/aether render --html {page} --width {w} --height {h} --pointer 190,24 --out {out} --ledger {outdir}/{case}.ledger.txt"
 oracle.hover = "190,24"
+# AETHERSELECT (SR69): a user selection. The subject drags from (52,68) to (280.6,86) — "The |quick" on
+# line 1 to "from|" on line 2, across the bold run and the link — and the oracle sets the same range by
+# script. The page lives outside corpus/ (whose 22 pages tests/dom_oracle.rs pins against html_core's
+# Chromium goldens).
+[[case]]
+name = "27-selection"
+page = "interact/27-selection.html"
+subject = { run = "{repo}/target/release/aether render --html {page} --width {w} --height {h} --select 52,68,280.6,86 --out {out} --ledger {outdir}/{case}.ledger.txt" }
+oracle = { script = "(() => { const p = document.getElementById('sel'); document.getSelection().setBaseAndExtent(p.firstChild, 4, p.lastChild, 23); })()" }

@@ -1,0 +1,42 @@
+{
+ "01-paragraphs.html": {
+  "innerText": "The title\n\nA first paragraph with bold, italic and a link.\n\nA second paragraph.",
+  "selection": "The title\nA first paragraph with bold, italic and a link.\n\nA second paragraph."
+ },
+ "02-whitespace.html": {
+  "innerText": "leading and trailing spaces\none two threefour five\ntab and newline collapse\n\nnested spaces",
+  "selection": "leading and trailing spaces\none two threefour five\ntab and newline collapse\nnested spaces"
+ },
+ "03-br.html": {
+  "innerText": "line one\nline two\n\nline four\n\nafter\na break with spaces\n\nend",
+  "selection": "line one\nline two\n\nline four\n\nafter\na break with spaces\nend"
+ },
+ "04-pre.html": {
+  "innerText": "  keep   these\n\ttabs too\n\npre-line keeps\nnewlines only\npre-wrap  keeps  spaces\nnormal again",
+  "selection": "  keep   these\n\ttabs too\npre-line keeps\nnewlines only\npre-wrap  keeps  spaces\nnormal again"
+ },
+ "05-lists.html": {
+  "innerText": "apple\nbanana\nripe\ngreen\ncherry\n\nafter the list",
+  "selection": "apple\nbanana\nripe\ngreen\ncherry\nafter the list"
+ },
+ "06-table.html": {
+  "innerText": "Before\n\nName\tQty\nApples\t3\nPears\t12\n\nAfter",
+  "selection": "Before\n\nName\tQty\nApples\t3\nPears\t12\nAfter"
+ },
+ "07-divs.html": {
+  "innerText": "outer\ninner one\ninner two\ntail\nbox a box b\ninline\nblock\ninline again",
+  "selection": "outer\ninner one\ninner two\ntail\nbox a box b\ninline\nblock\ninline again"
+ },
+ "08-hidden.html": {
+  "innerText": "shown text\n\nlast",
+  "selection": "shown text\n\nlast"
+ },
+ "09-transform.html": {
+  "innerText": "SHOUT THIS\n\nwhisper this\n\nEvery Word Starts Big\n\nplain MIXED case",
+  "selection": "SHOUT THIS\n\nwhisper this\n\nEvery Word Starts Big\n\nplain MIXED case"
+ },
+ "10-mixed.html": {
+  "innerText": "Heading\nA quote with code() inside.\n\nAn image  sits inline.\n\nSmall heading\n\nUnicode: café — naïve 😀 done.",
+  "selection": "Heading\nA quote with code() inside.\nAn image  sits inline.\n\nSmall heading\nUnicode: café — naïve 😀 done."
+ }
+}

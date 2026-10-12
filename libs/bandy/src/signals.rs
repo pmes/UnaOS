@@ -177,6 +177,14 @@ pub enum SMessage {
     /// css-ui-4 `cursor` keyword (`default`, `pointer`, `text`, `wait`, …),
     /// which is also the freedesktop/GTK cursor name; deduped by the engine.
     BrowserCursorChanged(String),
+    /// Chrome → engine: copy the page's selection (Ctrl/Cmd+C on the viewport). The engine answers
+    /// with [`SMessage::BrowserClipboardSet`] when something is selected (AETHERSELECT, LEDGER SR69).
+    BrowserCopy,
+    /// Chrome → engine: select the document's contents (Ctrl/Cmd+A on the viewport).
+    BrowserSelectAll,
+    /// Engine → chrome: put `text` (the selection serialized per the HTML `innerText` algorithm) on
+    /// the platform clipboard.
+    BrowserClipboardSet(String),
 
     // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
     // A session is keyed by the media `url` the request named (the same string `PlayMedia`
