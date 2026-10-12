@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# AETHERMETAL (SR66): the bare x86_64 build, self-contained — build-std (core + alloc: html_core, css_core and
+# font_core are no_std + alloc) and the workspace-root bare x86_64 spec as the default target. arroyo's
+# build_user_aether_x86 passes the same --target explicitly and the linker script via RUSTFLAGS.
+[build]
+target = "../../x86_64-unknown-none.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

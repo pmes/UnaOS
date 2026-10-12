@@ -3756,6 +3756,15 @@ busreg = []
 # Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 lumen = ["dep:vein_core", "dep:holocron_core"] # HOLOCRON2 (B355): + holocron_core — SYS_KDF (66), the login launch of APPS/HOLOCRON.ELF and `tests holocron` (crate::keyring)
 
+# AETHERMETAL (LEDGER SR66): UNAOS_AETHER=1 arms `tests aether` (crate::aether) — APPS/AETHER.ELF, the browser as ONE
+# ring-3 program (crates/user-aether: html_core + css_core + font_core, a CSS2 block + inline formatter), validated
+# by the production loader in the ELF-window model, spawned as `bg` spawns it, its page report read at the console
+# seam (`:: AETHERAPP: … painted=<n> lines=<n> -> PASS ::`). Implies `selfdiag`: SYS_PATH_READ is the file surface
+# the program reads /system/doc/welcome.html and the faces through. The program and its staging exist on every
+# build; the knob adds the fixture only. x86 runs it (aarch64 prints SKIP: no AETHER.ELF for that loader yet).
+# Kept in sync with `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
+aether = ["selfdiag"]
+
 # SELFDIAG (rmbp-ledger B324, R82): UNAOS_SELFDIAG=1 arms the smart installer's diagnosis loop's kernel half —
 # the BOOT LOG ON DISK (crate::bootwit: every `:: TAG: ... -> PASS|FAIL|SKIP ::` line and the `:: BOOT:`
 # line of a boot written to /var/log/boot.<n>.witness on a UnaFS root at desktop-ready and at reboot /

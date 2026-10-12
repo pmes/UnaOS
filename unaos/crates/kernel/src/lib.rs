@@ -334,3 +334,6 @@ pub mod smallfix6;
 pub mod soundopeners;
 // SMALLFIX7 (rmbp-ledger B501): `tests smallfix7`, `tests prtscr` — flight 27's small reds. Tail statement.
 pub mod smallfix7;
+// AETHERMETAL (LEDGER SR66): `tests aether` — APPS/AETHER.ELF (the browser as a ring-3 program) validated, spawned, its page report read. Tail statement, so no existing line moves.
+#[cfg(feature = "aether")]
+pub mod aether;
