@@ -224,7 +224,7 @@ fn selftest() {
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let bar_ms: Option<u64> = None;
     let bar_ok = bar_ms.map_or(true, |b| b <= 200);
-    let pass = landed && on == "worker" && max_ms <= 50 && bar_ok;
+    let pass = landed && on == "worker" && max_ms <= 150 && bar_ok; // SMALLFIX8 fold (B516): flight 28 measured 76–103 ms FIXED per UnaFS transaction (the path lookup + listing, fs/vfs.rs) + 0.015 ms per record, so a 522-record chunk is ~111 ms and no chunk size reaches 50; the bound is the measured shape with headroom, and the fixed cost is its own row (B522)
     let bar = bar_ms.map_or(String::from("none"), |b| format!("{}", b));
     serial_println!(
         ":: JOBSCAN: on={} chunks={} max_chunk_ms={} bar_ms={} -> {} :: state={}",

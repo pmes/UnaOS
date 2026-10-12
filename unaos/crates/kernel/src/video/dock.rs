@@ -4561,7 +4561,7 @@ fn pin_timeout_service(now: u64) {
         return;
     }
     let t0 = PIN_T0.load(Ordering::Relaxed);
-    if t0 == 0 || now.saturating_sub(t0) < crate::hidstall::DOCK_RELEASE_TIMEOUT_MS {
+    if t0 == 0 || crate::hidstall::dock_release_wait_ms(t0, now) < crate::hidstall::DOCK_RELEASE_TIMEOUT_MS {
         return;
     }
     // HIDSTALL2 (B509): this pass runs on the `usb-pump`; the release is ROUTED by the render task. A release pushed and not
