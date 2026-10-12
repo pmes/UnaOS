@@ -1,0 +1,24 @@
+AETHERGEN (SR71) — pseudo-element ledger, before/after, offline corpus.
+
+The live 11-page corpus (AETHER-GAPS §B) is unreachable from this sandbox: every https CONNECT is
+refused by the egress proxy (curl: "CONNECT tunnel failed, response 403", example.com and
+news.ycombinator.com, 2026-10-12; tools/eyes/suites/aether/cases/live.toml records the same refusal
+on 2026-10-04). The substitute corpus (25 pages) is:
+  - the 22 EYES corpus pages + 28-generated (tools/eyes/suites/aether/corpus/*.html);
+  - wikipedia-2.html (tests/vectors.txt, sha256 2d49814707297841baa04e1332e19a9dc2aeb7a622c6f078960f27c37ed81f66);
+  - wikipedia-2+bootstrap.html: that article's <body> under bootstrap-5.3.3.css inlined as one <style>
+    (tests/vectors.txt, sha256 18a105d7cb38e01e5ed0ca255c092992a2e211b39594a7fa57262bfc6fc4ea9c),
+    the same pairing tests/style_time.rs measures.
+Command per page:  aether render --html <page> --out <png> --ledger <dir>/<page>.ledger.txt
+  before = a release build of the tip 39e56a33 (the aetherwpt worktree's binary, whose only changes are
+           a test file and two untracked, unreferenced js files); after = this branch.
+Count:  awk -F'|' 'index($2,"pseudo-element-rule"){s+=$3} END{print s}' ledger-*/<page>.ledger.txt
+
+                            before (pseudo-element-rule, any kind)   after (by kind)
+  28-generated              9                                        0
+  wikipedia-2+bootstrap     56                                       8 (file-selector-button 6, placeholder 2)
+  the other 23 pages        0                                        0
+  TOTAL                     65                                       8
+
+::before/::after/::marker misses: 65 - 8 = 57 before -> 0 after (the old key did not split by kind; the
+8 left are pseudo-elements Aether still generates nothing for, now ledgered by name).

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 mod blockwidth;
 mod collapse;
+pub(crate) mod generated;
 pub mod inline;
 mod table;
 
@@ -158,6 +159,11 @@ pub struct PaintStyle {
     pub rtl: Option<bool>,
     /// text-shadow (css-text-decor-3 §4): none = Some(empty).
     pub text_shadows: Option<Vec<crate::render::effects::Shadow>>,
+    /// AETHERGEN (SR71): the author-styled `::marker` of a list item (`generated::generate`).
+    pub marker: Option<std::rc::Rc<generated::MarkerPaint>>,
+    /// clear (CSS 2.2 §9.5.2): 0 none, 1 left, 2 right, 3 both. Acted on for a generated clearfix
+    /// box at the end of an inline formatting context (`generated`, `clear_floats`).
+    pub clear: Option<u8>,
 }
 
 /// A `font-weight` value as specified (css-fonts-4 §2.2).
@@ -413,298 +419,6 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
     let mut node_map = HashMap::new();
     let mut paint_map = HashMap::new();
 
-    fn build_taffy_tree(
-        dom_node: &NodeRef,
-        taffy: &mut taffy::TaffyTree,
-        node_map: &mut HashMap<taffy::NodeId, NodeRef>,
-        paint_map: &mut HashMap<taffy::NodeId, PaintStyle>,
-        quirks: bool,
-    ) -> Option<taffy::NodeId> {
-        if let Some(el) = dom_node.as_element() {
-            if is_non_rendered(el.name.local.as_ref()) {
-                return None;
-            }
-            // The HTML hidden attribute / aria-hidden remove the subtree.
-            let attrs = el.attributes.borrow();
-            if attrs.get("hidden").is_some() || attrs.get("aria-hidden") == Some("true") {
-                return None;
-            }
-            // <input type=hidden> is a form value carrier, not a control:
-            // the UA sheet gives it display:none. Pages carry many of them
-            // (tokens, locale, charset); boxed, they paint as a stack of
-            // phantom fields above the real content.
-            if el.name.local.as_ref() == "input"
-                && attrs
-                    .get("type")
-                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden"))
-            {
-                return None;
-            }
-            // <audio> without `controls` is display:none in the UA sheet.
-            if el.name.local.as_ref() == "audio" && attrs.get("controls").is_none() {
-                return None;
-            }
-        } else if dom_node.as_comment().is_some()
-            || dom_node.as_doctype().is_some()
-        {
-            // Comments and the doctype are not
-            // rendered (they generate no box). Boxed, an empty block between
-            // inline siblings split their line into anonymous blocks and
-            // moved absolutely positioned media off their insets.
-            return None;
-        } else if dom_node.as_text().is_some() {
-            // Whitespace-only text produces no box — except between two
-            // inline siblings, where it is the word space of the line
-            // ("<b>a</b> <i>b</i>"; css-text-3 §4.1.1 collapses it to one
-            // space, or to nothing, in the whitespace pass).
-            if dom_node.text_contents().trim().is_empty() && !is_interelement_space(dom_node) {
-                return None;
-            }
-        }
-        // <video>/<audio> are replaced elements: their <source>/<track>
-        // children and fallback content never render.
-        let replaced_media = dom_node
-            .as_element()
-            .is_some_and(|el| matches!(el.name.local.as_ref(), "video" | "audio"));
-
-        let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
-        // A textarea's text is its VALUE, painted inside the control, not
-        // flow content (the control is a leaf with an intrinsic size).
-        let is_textarea = dom_node.as_element().is_some_and(|e| e.name.local.as_ref() == "textarea");
-        for child in dom_node.children().filter(|_| !is_textarea && !replaced_media) {
-            if let Some(id) = build_taffy_tree(&child, taffy, node_map, paint_map, quirks) {
-                kids.push((id, is_inline_node(&child)));
-            }
-        }
-        let any_inline = kids.iter().any(|&(_, i)| i);
-        let any_block = kids.iter().any(|&(_, i)| !i);
-        // Mixed inline and block siblings: CSS wraps each run of consecutive
-        // inline children in an ANONYMOUS BLOCK BOX, which is what keeps them
-        // flowing on a shared line. Without it the whole container fell back
-        // to a column and every inline sibling got its own full-width row —
-        // two submit buttons meant to sit side by side stacked instead.
-        let parent_tag = dom_node.as_element().map(|el| el.name.local.as_ref().to_string());
-        let table_container = parent_tag
-            .as_deref()
-            .is_some_and(|t| is_table_part(t) && !matches!(t, "td" | "th" | "caption"));
-        let child_ids: Vec<taffy::NodeId> = if any_inline && any_block && !table_container {
-            let mut out: Vec<taffy::NodeId> = Vec::new();
-            let mut run: Vec<taffy::NodeId> = Vec::new();
-            let mut flush = |run: &mut Vec<taffy::NodeId>,
-                             out: &mut Vec<taffy::NodeId>,
-                             taffy: &mut taffy::TaffyTree| {
-                // A run of ONE keeps its place as a direct child: it already
-                // had a line to itself, and boxing it would hide its own
-                // alignment (the float/align_self approximation) from the
-                // real container. Only runs that must SHARE a line need the
-                // anonymous box.
-                if run.len() < 2 {
-                    out.append(run);
-                    return;
-                }
-                let anon = Style {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    flex_wrap: taffy::style::FlexWrap::Wrap,
-                    align_items: Some(taffy::style::AlignItems::BASELINE),
-                    size: Size { width: Dimension::percent(1.0), height: Dimension::auto() },
-                    ..Default::default()
-                };
-                if let Ok(id) = taffy.new_with_children(anon, run) {
-                    paint_map.insert(id, PaintStyle::default());
-                    out.push(id);
-                } else {
-                    out.append(run);
-                }
-                run.clear();
-            };
-            for &(id, inline) in &kids {
-                if inline {
-                    run.push(id);
-                } else {
-                    flush(&mut run, &mut out, taffy);
-                    out.push(id);
-                }
-            }
-            flush(&mut run, &mut out, taffy);
-            out
-        } else {
-            kids.iter().map(|&(id, _)| id).collect()
-        };
-
-        // A text run that is its box's ONLY child may shrink to the box's
-        // width and wrap inside it (its min-content is its widest word).
-        // With shrink 0 its flex base size was its max-content width capped
-        // at the VIEWPORT, so every paragraph narrower than the viewport
-        // painted past its own right edge. Runs that share a line with
-        // siblings keep shrink 0: shrunk side by side, each would wrap into
-        // its own column instead of flowing onto the next line.
-        if let [only] = child_ids.as_slice() {
-            let only_is_text = dom_node
-                .children()
-                .filter(|c| generates_box(c))
-                .exactly_one_text();
-            if only_is_text {
-                if let Ok(st) = taffy.style(*only) {
-                    let mut st = st.clone();
-                    st.flex_shrink = 1.0;
-                    let _ = taffy.set_style(*only, st);
-                }
-            }
-        }
-
-        let tag = dom_node
-            .as_element()
-            .map(|el| el.name.local.as_ref().to_string())
-            .unwrap_or_default();
-        let inline = is_inline_node(dom_node);
-        // A box whose rendered children are all inline content flows them as
-        // a wrapping row (the inline-formatting-context approximation).
-        let children_inline = dom_node.children().any(|_| true)
-            && dom_node
-                .children()
-                .filter(|c| {
-                    c.as_element().is_some()
-                        || c.as_text().is_some() && !c.text_contents().trim().is_empty()
-                })
-                .all(|c| is_inline_node(&c));
-
-        let mut style = Style {
-            display: Display::Flex,
-            flex_direction: if tag == "tr" || (children_inline && !child_ids.is_empty()) {
-                FlexDirection::Row
-            } else {
-                FlexDirection::Column
-            },
-            flex_wrap: if children_inline && !child_ids.is_empty() {
-                taffy::style::FlexWrap::Wrap
-            } else {
-                taffy::style::FlexWrap::NoWrap
-            },
-            align_items: if children_inline && !child_ids.is_empty() {
-                Some(taffy::style::AlignItems::BASELINE)
-            } else {
-                None
-            },
-            // Inline boxes keep their measured width; the row wraps instead
-            // of shrinking them (shrunk text would draw more lines than the
-            // measured height and overlap the next block).
-            flex_shrink: if inline { 0.0 } else { 1.0 },
-            // CSS initial `box-sizing: content-box` (taffy defaults to
-            // border-box). html.css makes push buttons and selects
-            // border-box; their UA min sizes below are border-box sizes.
-            box_sizing: if ua_border_box(dom_node, &tag) {
-                taffy::style::BoxSizing::BorderBox
-            } else {
-                taffy::style::BoxSizing::ContentBox
-            },
-            size: Size {
-                width: if inline { Dimension::auto() } else { Dimension::percent(1.0) },
-                height: Dimension::auto(),
-            },
-            // No UA minimum: an empty block box is zero-tall in CSS (form
-            // controls get their intrinsic sizes in ua_control below).
-            min_size: Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
-            margin: {
-                let [t, r, b, l] = if inline { [0.0; 4] } else { ua_margin(&tag, nested_list(dom_node)) };
-                Rect {
-                    top: LengthPercentageAuto::length(t),
-                    right: LengthPercentageAuto::length(r),
-                    bottom: LengthPercentageAuto::length(b),
-                    left: LengthPercentageAuto::length(l),
-                }
-            },
-            padding: if matches!(tag.as_str(), "td" | "th") {
-                // html.css: `td, th { padding: 1px }`.
-                Rect::length(1.0)
-            } else {
-                Rect {
-                    left: LengthPercentage::length(if !inline && matches!(tag.as_str(), "ul" | "ol" | "menu" | "dir") { 40.0 } else { 0.0 }),
-                    right: LengthPercentage::length(0.0),
-                    top: LengthPercentage::length(0.0),
-                    bottom: LengthPercentage::length(0.0),
-                }
-            },
-            border: if tag == "hr" {
-                Rect { left: LengthPercentage::length(1.0), right: LengthPercentage::length(1.0), top: LengthPercentage::length(1.0), bottom: LengthPercentage::length(1.0) }
-            } else {
-                Rect::zero()
-            },
-            ..Default::default()
-        };
-
-        ua_control(dom_node, &tag, &mut style);
-
-        // <br>: a zero-height full-width item forces a wrap break in the
-        // inline row without adding vertical space of its own.
-        if tag == "br" {
-            style.size.width = Dimension::percent(1.0);
-            style.size.height = Dimension::length(0.0);
-            style.min_size = Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::length(0.0) };
-        }
-
-        // Inline style="..." — paint properties plus width/height.
-        let mut paint = PaintStyle::default();
-        if !inline {
-            if let Some(k) = ua_margin_em(&tag, nested_list(dom_node)) {
-                let built = ua_margin(&tag, nested_list(dom_node))[0];
-                paint.ua_vmargin = Some((k, built));
-            }
-        }
-        if control_kind(dom_node) == Some(Control::Button) {
-            // Chromium's ButtonFace.
-            paint.background = Some((239, 239, 239));
-        }
-        if tag == "mark" {
-            // html.css: `mark { background-color: yellow; color: black }`.
-            paint.background = Some((255, 255, 0));
-            paint.color = Some((0, 0, 0));
-        }
-        if tag == "hr" {
-            // html.css: `hr { color: gray; border-style: inset; border-width: 1px }`
-            // — an inset stroke paints its top/left darker than its bottom/right.
-            let (dark, light) = ((154, 154, 154), (238, 238, 238));
-            paint.border = Some([Some((1.0, dark)), Some((1.0, light)), Some((1.0, light)), Some((1.0, dark))]);
-        }
-        if let Some(el) = dom_node.as_element() {
-            // UA / presentational alignment defaults, applied BEFORE the
-            // author cascade so any real rule wins: <center> and <th> centre
-            // their content, and the legacy align="" attribute still aligns.
-            paint.text_align = match tag.as_str() {
-                "center" | "th" => Some(1),
-                // The quirks-mode table quirk: a table does NOT inherit
-                // text-align from its ancestors. Every legacy page that
-                // wraps its layout table in <center> (Hacker News) relies
-                // on it — without the reset the whole page centres.
-                "table" if quirks => Some(0),
-                _ => None,
-            };
-            if let Some(a) = el.attributes.borrow().get("align") {
-                match a.trim().to_ascii_lowercase().as_str() {
-                    "center" | "middle" => paint.text_align = Some(1),
-                    "right" => paint.text_align = Some(2),
-                    "left" => paint.text_align = Some(4),
-                    _ => {}
-                }
-            }
-            if let Some(inline) = el.attributes.borrow().get("style") {
-                let saved = paint.text_align;
-                apply_inline_style(inline, &mut style, &mut paint);
-                if paint.text_align.is_none() {
-                    paint.text_align = saved;
-                }
-            }
-        }
-
-        if let Ok(node_id) = taffy.new_with_children(style, &child_ids) {
-            node_map.insert(node_id, dom_node.clone());
-            paint_map.insert(node_id, paint);
-            Some(node_id)
-        } else {
-            None
-        }
-    }
-
     let root_node = build_taffy_tree(dom, &mut taffy, &mut node_map, &mut paint_map, is_quirks(dom))
         .unwrap_or_else(|| taffy.new_leaf(Style::default()).unwrap());
 
@@ -716,6 +430,300 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
         viewport: (vw, vh),
         dirty: false,
         inline: HashMap::new(),
+    }
+}
+
+/// Builds the box (taffy node) subtree of one DOM node from TAG defaults and its `style` attribute;
+/// `None` when the node generates no box. Also builds generated-content boxes (`generated`, SR71).
+pub(crate) fn build_taffy_tree(
+    dom_node: &NodeRef,
+    taffy: &mut taffy::TaffyTree,
+    node_map: &mut HashMap<taffy::NodeId, NodeRef>,
+    paint_map: &mut HashMap<taffy::NodeId, PaintStyle>,
+    quirks: bool,
+) -> Option<taffy::NodeId> {
+    if let Some(el) = dom_node.as_element() {
+        if is_non_rendered(el.name.local.as_ref()) {
+            return None;
+        }
+        // The HTML hidden attribute / aria-hidden remove the subtree.
+        let attrs = el.attributes.borrow();
+        if attrs.get("hidden").is_some() || attrs.get("aria-hidden") == Some("true") {
+            return None;
+        }
+        // <input type=hidden> is a form value carrier, not a control:
+        // the UA sheet gives it display:none. Pages carry many of them
+        // (tokens, locale, charset); boxed, they paint as a stack of
+        // phantom fields above the real content.
+        if el.name.local.as_ref() == "input"
+            && attrs
+                .get("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden"))
+        {
+            return None;
+        }
+        // <audio> without `controls` is display:none in the UA sheet.
+        if el.name.local.as_ref() == "audio" && attrs.get("controls").is_none() {
+            return None;
+        }
+    } else if dom_node.as_comment().is_some()
+        || dom_node.as_doctype().is_some()
+    {
+        // Comments and the doctype are not
+        // rendered (they generate no box). Boxed, an empty block between
+        // inline siblings split their line into anonymous blocks and
+        // moved absolutely positioned media off their insets.
+        return None;
+    } else if dom_node.as_text().is_some() {
+        // Whitespace-only text produces no box — except between two
+        // inline siblings, where it is the word space of the line
+        // ("<b>a</b> <i>b</i>"; css-text-3 §4.1.1 collapses it to one
+        // space, or to nothing, in the whitespace pass).
+        if dom_node.text_contents().trim().is_empty() && !is_interelement_space(dom_node) {
+            return None;
+        }
+    }
+    // <video>/<audio> are replaced elements: their <source>/<track>
+    // children and fallback content never render.
+    let replaced_media = dom_node
+        .as_element()
+        .is_some_and(|el| matches!(el.name.local.as_ref(), "video" | "audio"));
+
+    let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
+    // A textarea's text is its VALUE, painted inside the control, not
+    // flow content (the control is a leaf with an intrinsic size).
+    let is_textarea = dom_node.as_element().is_some_and(|e| e.name.local.as_ref() == "textarea");
+    for child in dom_node.children().filter(|_| !is_textarea && !replaced_media) {
+        if let Some(id) = build_taffy_tree(&child, taffy, node_map, paint_map, quirks) {
+            kids.push((id, is_inline_node(&child)));
+        }
+    }
+    let any_inline = kids.iter().any(|&(_, i)| i);
+    let any_block = kids.iter().any(|&(_, i)| !i);
+    // Mixed inline and block siblings: CSS wraps each run of consecutive
+    // inline children in an ANONYMOUS BLOCK BOX, which is what keeps them
+    // flowing on a shared line. Without it the whole container fell back
+    // to a column and every inline sibling got its own full-width row —
+    // two submit buttons meant to sit side by side stacked instead.
+    let parent_tag = dom_node.as_element().map(|el| el.name.local.as_ref().to_string());
+    let table_container = parent_tag
+        .as_deref()
+        .is_some_and(|t| is_table_part(t) && !matches!(t, "td" | "th" | "caption"));
+    let child_ids: Vec<taffy::NodeId> = if any_inline && any_block && !table_container {
+        let mut out: Vec<taffy::NodeId> = Vec::new();
+        let mut run: Vec<taffy::NodeId> = Vec::new();
+        let mut flush = |run: &mut Vec<taffy::NodeId>,
+                         out: &mut Vec<taffy::NodeId>,
+                         taffy: &mut taffy::TaffyTree| {
+            // A run of ONE keeps its place as a direct child: it already
+            // had a line to itself, and boxing it would hide its own
+            // alignment (the float/align_self approximation) from the
+            // real container. Only runs that must SHARE a line need the
+            // anonymous box.
+            if run.len() < 2 {
+                out.append(run);
+                return;
+            }
+            let anon = Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                flex_wrap: taffy::style::FlexWrap::Wrap,
+                align_items: Some(taffy::style::AlignItems::BASELINE),
+                size: Size { width: Dimension::percent(1.0), height: Dimension::auto() },
+                ..Default::default()
+            };
+            if let Ok(id) = taffy.new_with_children(anon, run) {
+                paint_map.insert(id, PaintStyle::default());
+                out.push(id);
+            } else {
+                out.append(run);
+            }
+            run.clear();
+        };
+        for &(id, inline) in &kids {
+            if inline {
+                run.push(id);
+            } else {
+                flush(&mut run, &mut out, taffy);
+                out.push(id);
+            }
+        }
+        flush(&mut run, &mut out, taffy);
+        out
+    } else {
+        kids.iter().map(|&(id, _)| id).collect()
+    };
+
+    // A text run that is its box's ONLY child may shrink to the box's
+    // width and wrap inside it (its min-content is its widest word).
+    // With shrink 0 its flex base size was its max-content width capped
+    // at the VIEWPORT, so every paragraph narrower than the viewport
+    // painted past its own right edge. Runs that share a line with
+    // siblings keep shrink 0: shrunk side by side, each would wrap into
+    // its own column instead of flowing onto the next line.
+    if let [only] = child_ids.as_slice() {
+        let only_is_text = dom_node
+            .children()
+            .filter(|c| generates_box(c))
+            .exactly_one_text();
+        if only_is_text {
+            if let Ok(st) = taffy.style(*only) {
+                let mut st = st.clone();
+                st.flex_shrink = 1.0;
+                let _ = taffy.set_style(*only, st);
+            }
+        }
+    }
+
+    let tag = dom_node
+        .as_element()
+        .map(|el| el.name.local.as_ref().to_string())
+        .unwrap_or_default();
+    let inline = is_inline_node(dom_node);
+    // A box whose rendered children are all inline content flows them as
+    // a wrapping row (the inline-formatting-context approximation).
+    let children_inline = dom_node.children().any(|_| true)
+        && dom_node
+            .children()
+            .filter(|c| {
+                c.as_element().is_some()
+                    || c.as_text().is_some() && !c.text_contents().trim().is_empty()
+            })
+            .all(|c| is_inline_node(&c));
+
+    let mut style = Style {
+        display: Display::Flex,
+        flex_direction: if tag == "tr" || (children_inline && !child_ids.is_empty()) {
+            FlexDirection::Row
+        } else {
+            FlexDirection::Column
+        },
+        flex_wrap: if children_inline && !child_ids.is_empty() {
+            taffy::style::FlexWrap::Wrap
+        } else {
+            taffy::style::FlexWrap::NoWrap
+        },
+        align_items: if children_inline && !child_ids.is_empty() {
+            Some(taffy::style::AlignItems::BASELINE)
+        } else {
+            None
+        },
+        // Inline boxes keep their measured width; the row wraps instead
+        // of shrinking them (shrunk text would draw more lines than the
+        // measured height and overlap the next block).
+        flex_shrink: if inline { 0.0 } else { 1.0 },
+        // CSS initial `box-sizing: content-box` (taffy defaults to
+        // border-box). html.css makes push buttons and selects
+        // border-box; their UA min sizes below are border-box sizes.
+        box_sizing: if ua_border_box(dom_node, &tag) {
+            taffy::style::BoxSizing::BorderBox
+        } else {
+            taffy::style::BoxSizing::ContentBox
+        },
+        size: Size {
+            width: if inline { Dimension::auto() } else { Dimension::percent(1.0) },
+            height: Dimension::auto(),
+        },
+        // No UA minimum: an empty block box is zero-tall in CSS (form
+        // controls get their intrinsic sizes in ua_control below).
+        min_size: Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::auto() },
+        margin: {
+            let [t, r, b, l] = if inline { [0.0; 4] } else { ua_margin(&tag, nested_list(dom_node)) };
+            Rect {
+                top: LengthPercentageAuto::length(t),
+                right: LengthPercentageAuto::length(r),
+                bottom: LengthPercentageAuto::length(b),
+                left: LengthPercentageAuto::length(l),
+            }
+        },
+        padding: if matches!(tag.as_str(), "td" | "th") {
+            // html.css: `td, th { padding: 1px }`.
+            Rect::length(1.0)
+        } else {
+            Rect {
+                left: LengthPercentage::length(if !inline && matches!(tag.as_str(), "ul" | "ol" | "menu" | "dir") { 40.0 } else { 0.0 }),
+                right: LengthPercentage::length(0.0),
+                top: LengthPercentage::length(0.0),
+                bottom: LengthPercentage::length(0.0),
+            }
+        },
+        border: if tag == "hr" {
+            Rect { left: LengthPercentage::length(1.0), right: LengthPercentage::length(1.0), top: LengthPercentage::length(1.0), bottom: LengthPercentage::length(1.0) }
+        } else {
+            Rect::zero()
+        },
+        ..Default::default()
+    };
+
+    ua_control(dom_node, &tag, &mut style);
+
+    // <br>: a zero-height full-width item forces a wrap break in the
+    // inline row without adding vertical space of its own.
+    if tag == "br" {
+        style.size.width = Dimension::percent(1.0);
+        style.size.height = Dimension::length(0.0);
+        style.min_size = Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::length(0.0) };
+    }
+
+    // Inline style="..." — paint properties plus width/height.
+    let mut paint = PaintStyle::default();
+    if !inline {
+        if let Some(k) = ua_margin_em(&tag, nested_list(dom_node)) {
+            let built = ua_margin(&tag, nested_list(dom_node))[0];
+            paint.ua_vmargin = Some((k, built));
+        }
+    }
+    if control_kind(dom_node) == Some(Control::Button) {
+        // Chromium's ButtonFace.
+        paint.background = Some((239, 239, 239));
+    }
+    if tag == "mark" {
+        // html.css: `mark { background-color: yellow; color: black }`.
+        paint.background = Some((255, 255, 0));
+        paint.color = Some((0, 0, 0));
+    }
+    if tag == "hr" {
+        // html.css: `hr { color: gray; border-style: inset; border-width: 1px }`
+        // — an inset stroke paints its top/left darker than its bottom/right.
+        let (dark, light) = ((154, 154, 154), (238, 238, 238));
+        paint.border = Some([Some((1.0, dark)), Some((1.0, light)), Some((1.0, light)), Some((1.0, dark))]);
+    }
+    if let Some(el) = dom_node.as_element() {
+        // UA / presentational alignment defaults, applied BEFORE the
+        // author cascade so any real rule wins: <center> and <th> centre
+        // their content, and the legacy align="" attribute still aligns.
+        paint.text_align = match tag.as_str() {
+            "center" | "th" => Some(1),
+            // The quirks-mode table quirk: a table does NOT inherit
+            // text-align from its ancestors. Every legacy page that
+            // wraps its layout table in <center> (Hacker News) relies
+            // on it — without the reset the whole page centres.
+            "table" if quirks => Some(0),
+            _ => None,
+        };
+        if let Some(a) = el.attributes.borrow().get("align") {
+            match a.trim().to_ascii_lowercase().as_str() {
+                "center" | "middle" => paint.text_align = Some(1),
+                "right" => paint.text_align = Some(2),
+                "left" => paint.text_align = Some(4),
+                _ => {}
+            }
+        }
+        if let Some(inline) = el.attributes.borrow().get("style") {
+            let saved = paint.text_align;
+            apply_inline_style(inline, &mut style, &mut paint);
+            if paint.text_align.is_none() {
+                paint.text_align = saved;
+            }
+        }
+    }
+
+    if let Ok(node_id) = taffy.new_with_children(style, &child_ids) {
+        node_map.insert(node_id, dom_node.clone());
+        paint_map.insert(node_id, paint);
+        Some(node_id)
+    } else {
+        None
     }
 }
 
@@ -1760,6 +1768,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
         let heights = inline::layout_all(tree, &text_info, &elem_info);
         let mut changed = false;
         for (id, h) in heights {
+            let h = clear_floats(tree, id, h);
             let Ok(st) = tree.taffy.style(id) else { continue };
             if is_cell(tree, id) {
                 // A table cell stretches to its row (§17.5.3): its line boxes
@@ -1829,6 +1838,35 @@ pub fn remeasure(tree: &mut LayoutTree) {
     }
     collapse::restore(tree, collapsed);
     blockwidth::restore(tree, widths);
+}
+
+/// AETHERGEN (SR71): an inline formatting context whose content ends with a clearing box (the
+/// `::after { content: ""; clear: both }` clearfix, which `generated` keeps in the line content as an
+/// empty inline box) grows to the bottom of the floats that box clears — the height CSS 2.2 §9.5.2
+/// clearance gives the clearfix's container.
+fn clear_floats(tree: &LayoutTree, root: taffy::NodeId, h: f32) -> f32 {
+    let kids = tree.taffy.children(root).unwrap_or_default();
+    let Some(clear) = kids
+        .last()
+        .filter(|k| generated::is_generated_box(tree, **k))
+        .and_then(|k| tree.paint_map.get(k).and_then(|p| p.clear))
+        .filter(|&c| c != 0)
+    else {
+        return h;
+    };
+    let Some(il) = tree.inline.get(&root) else { return h };
+    let mut bottom = h;
+    for f in &il.frags {
+        let inline::Frag::Atomic { node, y, .. } = f else { continue };
+        let side = tree.paint_map.get(node).and_then(|p| p.float).unwrap_or(0);
+        if side == 0 || (clear != 3 && clear != side) {
+            continue;
+        }
+        if let Ok(l) = tree.taffy.layout(*node) {
+            bottom = bottom.max(y + l.size.height + l.margin.bottom);
+        }
+    }
+    bottom
 }
 
 /// One text run's resolved text properties (inherited down the box tree the

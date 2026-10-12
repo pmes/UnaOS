@@ -1,0 +1,63 @@
+Aether M5 API Ledger: Honest Failures
+=====================================
+Category | API Name                                 | Call Count
+----------------------------------------------------------------------
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/c/ca/An | 3
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/0 | 9
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/1 | 12
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/2 | 15
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/3 | 24
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/4 | 18
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/5 | 2
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/6 | 8
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/7 | 18
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/8 | 21
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/9 | 3
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/a | 11
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/b | 6
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/d | 15
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/e | 6
+DOM      | img-missing://upload.wikimedia.org/wikipedia/commons/thumb/f | 9
+DOM      | img-missing://upload.wikimedia.org/wikipedia/en/thumb/0/06/W | 3
+DOM      | img-missing://upload.wikimedia.org/wikipedia/en/thumb/1/1b/S | 3
+DOM      | img-missing://upload.wikimedia.org/wikipedia/en/thumb/4/4a/C | 6
+DOM      | img-missing://upload.wikimedia.org/wikipedia/en/thumb/8/8a/O | 3
+DOM      | img-missing://upload.wikimedia.org/wikipedia/en/thumb/9/94/S | 3
+DOM      | img-missing:/static/images/poweredby_mediawiki_132x47.png | 3
+DOM      | img-missing:/static/images/wikimedia-button-1.5x.png | 3
+CSS      | at-rule:@keyframes                       | 5
+CSS      | background-value:lightblue               | 2
+CSS      | background-value:none transparent        | 36
+CSS      | color-value:darkblue                     | 2
+CSS      | color-value:darkgreen                    | 2
+CSS      | font-size-value:inherit                  | 4
+CSS      | line-height-value:inherit                | 4
+CSS      | named-color:darkblue                     | 2
+CSS      | named-color:darkgreen                    | 2
+CSS      | named-color:lightblue                    | 4
+CSS      | named-color:none transparent             | 36
+CSS      | property:-moz-box-shadow                 | 36
+CSS      | property:-moz-column-width               | 6
+CSS      | property:-webkit-appearance              | 2
+CSS      | property:-webkit-column-break-inside     | 14
+CSS      | property:-webkit-column-width            | 6
+CSS      | property:-webkit-tap-highlight-color     | 1
+CSS      | property:-webkit-text-decoration         | 19
+CSS      | property:-webkit-text-decoration-skip-ink | 19
+CSS      | property:-webkit-text-size-adjust        | 1
+CSS      | property:break-inside                    | 14
+CSS      | property:caption-side                    | 25
+CSS      | property:clear                           | 16
+CSS      | property:column-width                    | 6
+CSS      | property:cursor                          | 21
+CSS      | property:outline-offset                  | 1
+CSS      | property:page-break-inside               | 14
+CSS      | property:scroll-behavior                 | 1
+CSS      | property:text-decoration-skip-ink        | 19
+CSS      | pseudo-element-rule:file-selector-button | 6
+CSS      | pseudo-element-rule:placeholder          | 2
+CSS      | text-align:-webkit-match-parent          | 55
+CSS      | var-unresolved:color                     | 44
+CSS      | var-unresolved:text-align                | 1
+JS       | console.error:Uncaught SyntaxError: unexpected Lt | 2
+JS       | script-error:SyntaxError: unexpected Lt  | 2
