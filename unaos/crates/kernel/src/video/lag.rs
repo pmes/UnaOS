@@ -633,7 +633,7 @@ fn render_entry(now: u64) {
     let ex = RENDER_EXIT_US.swap(0, Relaxed); RENDER_PARKED.store(false, Relaxed); // QUEUESLEEP (B512): the render task is off the channel
     if ex != 0 && now > ex {
         SEC_R_HANDLER_US.fetch_max(now - ex, Relaxed);
-        boot_handler_note(now - ex); // SMALLFIX6 (B495): the boot's longest handler interval and when it ended
+        boot_handler_note(now - ex); crate::video::loginrender::turn(ex, now); // LOGINRENDER (B514): the turn, measured for `tests loginrender` (same-line fold). SMALLFIX6 (B495): the boot's longest handler interval and when it ended
     }
 }
 
@@ -655,7 +655,7 @@ fn sec_pass(t0: u64, now: u64, render: bool) {
     let d = now.saturating_sub(t0);
     SEC_PASSES.fetch_add(1, Relaxed);
     SEC_PASS_MAX_US.fetch_max(d, Relaxed);
-    crate::perf::note_frame(d); // PERFREVIEW (B443)
+    crate::perf::note_frame(d); crate::video::loginrender::pass(now); // LOGINRENDER (B514): a pass ended inside the turn or not (same-line fold). PERFREVIEW (B443)
     if render {
         SEC_R_COMP_US.fetch_max(d, Relaxed);
     }
@@ -862,13 +862,13 @@ fn sec_roll(now_ms: u64) {
                 (ms_str(draw), ms_str(pre))
             };
             serial_println!(
-                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={} holder={} hold_ms={}{}",
+                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={} holder={} hold_ms={}{}{}",
                 t0, now_ms.saturating_sub(t0), w_name, w_ms,
                 ms_str(st[0]), ms_str(st[1]), ms_str(st[2]), ms_str(st[3]), ms_str(st[4]), dw, pr,
                 ["route", "handler", "composite"][rw], ms_str(r[rw]),
                 passes, ms_str(pass_max), beam[3], beam[4], beam[0] / 1000, ms_str(beam[1]), beam[5], yields,
                 valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu), masked,
-                crate::hidstall::HolderName(hold_ix), hold_ms, QsField(w_name, masked) // QUEUESLEEP (B512): ` pump_what= pump_wait=` when the stage is pump or queue
+                crate::hidstall::HolderName(hold_ix), hold_ms, QsField(w_name, masked), crate::video::loginrender::StallWhat(w_name == "render-handler", t0) // QUEUESLEEP (B512): ` pump_what= pump_wait=` when the stage is pump or queue; LOGINRENDER (B514): the trailing ` handler_what=<name>:<ms>` token stays LAST
             );
         }
     }

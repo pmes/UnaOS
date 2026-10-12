@@ -112,10 +112,44 @@ fn poll() {
     if OFF.load(Ordering::Relaxed) {
         return;
     }
+    // LOGINRENDER (B514): the probe is two volume stats (and a decode when found) — flight 28's render task held
+    // 1.3–1.9 s in `Screen::flush` with zero passes, every RETRY_MS, while the jobs worker's registry build held the
+    // UnaFS volume. On x86 the try runs on a one-shot `wall-probe` task on a worker core (JOBSCAN's shape); the flush
+    // only posts it and later picks up `STALE`. Inline (stamped) where there is no worker core.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(cpu) = crate::arch::smp::worker_cpu(0) {
+        if !PROBING.swap(true, Ordering::AcqRel) {
+            crate::arch::sched::spawn_stack("wall-probe", probe_task, cpu, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::RENDER_PATH_STACK_SIZE); // the render task's stack: the decode ran there
+        }
+        return;
+    }
+    let _w = crate::video::loginrender::stamp(crate::video::loginrender::W_WALLPAPER);
+    probe(None);
+}
+
+/// LOGINRENDER (B514): a default-probe try is in flight on its worker.
+#[cfg(target_arch = "x86_64")]
+static PROBING: AtomicBool = AtomicBool::new(false);
+
+/// LOGINRENDER (B514): the `wall-probe` task — one try, then exit.
+#[cfg(target_arch = "x86_64")]
+fn probe_task(cpu: usize) {
+    crate::video::loginrender::moved(crate::video::loginrender::W_WALLPAPER);
+    probe(Some(cpu));
+    PROBING.store(false, Ordering::Release);
+}
+
+/// One default-probe try. `cpu` = the worker core it ran on (`None` = inline).
+fn probe(cpu: Option<usize>) {
+    let t0 = crate::arch::ms();
     // An empty namespace COUNTS as a try (a QEMU boot with no disk must still reach the `src=none`
     // witness after MAX_TRIES * RETRY_MS); painting is what `desktop_scene_owns_backdrop` gates, not probing.
     let n = TRIES.fetch_add(1, Ordering::Relaxed) + 1;
     let found = !crate::shell::vfs_mount_table().prefixes().is_empty() && load_default();
+    match cpu {
+        Some(c) => serial_println!("[wallpaper] probe try={} found={} on=worker cpu={} ms={}", n, found as u8, c, crate::arch::ms().saturating_sub(t0)),
+        None => serial_println!("[wallpaper] probe try={} found={} on=inline ms={}", n, found as u8, crate::arch::ms().saturating_sub(t0)),
+    }
     if found || n >= MAX_TRIES {
         DONE.store(true, Ordering::Release);
         if !found && !active() {

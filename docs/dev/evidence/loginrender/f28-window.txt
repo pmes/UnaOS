@@ -1,0 +1,73 @@
+# LOGINRENDER (B514) — the f28-boot1.log window 12:18:25Z..12:18:48Z, the lines that name the hold (awk-filtered: [users] login ok, [desktop] built, [jobs], [filetypes], [lag] stall, WALLPAPER)
+[12:18:25Z] [users] login ok user=una id=8043618 principal=user:una#8043618
+[12:18:26Z] [dock] trash state why=change full=0 took_ms=304 on=worker (HIDSTALL2: read on a change, off the hid pump's core)
+[12:18:31Z] [jobs] scan pending at=login on=worker cpu=2
+[12:18:31Z] [desktop] built at=login ok bar_ms=71 battery=painted dock=painted pins=7
+[12:18:31Z] [jobs] scan chunk=1/12 records=398 ms=92
+[12:18:31Z] [jobs] scan chunk=2/12 records=0 ms=90
+[12:18:31Z] [jobs] scan chunk=3/12 records=0 ms=103
+[12:18:31Z] [jobs] scan chunk=4/12 records=1 ms=92
+[12:18:31Z] [jobs] scan chunk=5/12 records=100 ms=80
+[12:18:31Z] [lag] stall boot_suppressed=21 worst_stage=render-handler worst_ms=5283 handler_span_ms=3123..8406 overlaps=root-mount:192,stage-resolve:310
+[12:18:31Z] [lag] stall at_ms=33730 span_ms=1017 stage=hid stage_ms=56 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=366.3 passes=11 pass_ms_max=16.6 rows=8825 full=0 beam_ms=70 beam_max_ms=8.6 capped=0 yielded=0 valve=open hid_gap_ms=56 strand=0/0 handler=panel-render handler_ms=366.2 pump=net-hda pump_ms=21.7 masked_ms=186 holder=- hold_ms=0
+[12:18:31Z] [jobs] scan chunk=6/12 records=8 ms=76
+[12:18:31Z] [jobs] scan chunk=7/12 records=522 ms=98
+[12:18:31Z] [jobs] scan chunk=8/12 records=160 ms=76
+[12:18:32Z] [jobs] scan chunk=9/12 records=168 ms=119
+[12:18:32Z] [jobs] scan chunk=10/12 records=24 ms=76
+[12:18:32Z] [jobs] scan chunk=11/12 records=176 ms=87
+[12:18:32Z] [jobs] scan chunk=12/12 records=151 ms=87
+[12:18:32Z] [jobs] volume=/jobs records=1707 claims=398 ledger=790 queue=519 queries=1 on=worker chunks=12 max_chunk_ms=119 waited_ms=80 ms=1178
+[12:18:32Z] [lag] stall at_ms=34747 span_ms=1003 stage=render-handler stage_ms=115 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=115.9 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=8 strand=0/0 handler=console-launch handler_ms=115.9 pump=wifi pump_ms=817.9 masked_ms=219 holder=- hold_ms=0
+[12:18:33Z] [filetypes] type=text/plain made=1 filled=0 blocks=280 cmds=82 ms=529 masked_ms=529
+[12:18:33Z] [filetypes] type=image/png made=1 filled=0 blocks=288 cmds=83 ms=541 masked_ms=540
+[12:18:34Z] [filetypes] type=audio/wav made=1 filled=0 blocks=296 cmds=84 ms=560 masked_ms=560
+[12:18:34Z] [lag] stall at_ms=35750 span_ms=1773 stage=render-handler stage_ms=1269 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=1269.1 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=5 strand=0/0 handler=panel-render handler_ms=1269.1 pump=xhci pump_ms=5.0 masked_ms=560 holder=- hold_ms=0
+[12:18:35Z] [filetypes] type=application/x-unaos-elf made=1 filled=0 blocks=352 cmds=98 ms=666 masked_ms=666
+[12:18:35Z] [filetypes] type=application/x-unaos-bin made=1 filled=0 blocks=328 cmds=93 ms=609 masked_ms=608
+[12:18:36Z] [filetypes] type=application/x-linux-elf made=1 filled=0 blocks=344 cmds=94 ms=628 masked_ms=628
+[12:18:36Z] [filetypes] type=inode/directory made=1 filled=0 blocks=288 cmds=80 ms=543 masked_ms=542
+[12:18:36Z] [lag] stall at_ms=37523 span_ms=2446 stage=render-handler stage_ms=1711 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=1711.3 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=6 strand=0/0 handler=panel-render handler_ms=1711.3 pump=xhci pump_ms=5.0 masked_ms=666 holder=- hold_ms=0
+[12:18:37Z] [filetypes] type=application/gzip made=1 filled=0 blocks=240 cmds=68 ms=475 masked_ms=520
+[12:18:37Z] [filetypes] type=application/x-tar made=1 filled=0 blocks=264 cmds=74 ms=493 masked_ms=493
+[12:18:38Z] [filetypes] type=application/octet-stream made=1 filled=0 blocks=232 cmds=69 ms=447 masked_ms=447
+[12:18:38Z] [filetypes] type=text/markdown made=1 filled=0 blocks=248 cmds=74 ms=488 masked_ms=487
+[12:18:38Z] [lag] stall at_ms=39969 span_ms=1903 stage=render-handler stage_ms=1903 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=1903.9 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=6 strand=0/0 handler=panel-render handler_ms=1450.1 pump=xhci pump_ms=5.0 masked_ms=493 holder=- hold_ms=0
+[12:18:39Z] [filetypes] type=application/json made=1 filled=0 blocks=288 cmds=79 ms=553 masked_ms=553
+[12:18:39Z] [filetypes] type=image/gif made=1 filled=0 blocks=272 cmds=77 ms=510 masked_ms=509
+[12:18:40Z] [filetypes] type=image/jpeg made=1 filled=0 blocks=264 cmds=76 ms=499 masked_ms=499
+[12:18:40Z] [filetypes] type=image/bmp made=1 filled=0 blocks=256 cmds=75 ms=498 masked_ms=498
+[12:18:40Z] [lag] stall at_ms=41872 span_ms=2060 stage=render-handler stage_ms=1403 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=1403.4 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=6 strand=0/0 handler=panel-render handler_ms=1403.4 pump=xhci pump_ms=5.0 masked_ms=553 holder=- hold_ms=0
+[12:18:41Z] [filetypes] type=image/webp made=1 filled=0 blocks=256 cmds=75 ms=510 masked_ms=509
+[12:18:41Z] [filetypes] type=image/qoi made=1 filled=0 blocks=280 cmds=77 ms=484 masked_ms=483
+[12:18:42Z] [lag] stall at_ms=43932 span_ms=1105 stage=render-handler stage_ms=386 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=386.8 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=5 strand=0/0 handler=console-launch handler_ms=386.8 pump=xhci pump_ms=9.0 masked_ms=509 holder=- hold_ms=0
+[12:18:42Z] [filetypes] type=image/svg+xml made=1 filled=0 blocks=264 cmds=75 ms=466 masked_ms=466
+[12:18:42Z] [filetypes] type=audio/flac made=1 filled=0 blocks=248 cmds=73 ms=439 masked_ms=439
+[12:18:43Z] [filetypes] type=audio/ogg made=1 filled=0 blocks=232 cmds=71 ms=452 masked_ms=452
+[12:18:43Z] [filetypes] type=audio/mpeg made=1 filled=0 blocks=256 cmds=75 ms=454 masked_ms=454
+[12:18:44Z] [lag] stall at_ms=46041 span_ms=1004 stage=render-handler stage_ms=220 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=220.3 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=6 strand=0/0 handler=console-launch handler_ms=220.3 pump=xhci pump_ms=5.0 masked_ms=454 holder=- hold_ms=0
+[12:18:44Z] [filetypes] type=audio/aac made=1 filled=0 blocks=256 cmds=74 ms=452 masked_ms=452
+[12:18:44Z] [filetypes] type=audio/mp4 made=1 filled=0 blocks=248 cmds=73 ms=442 masked_ms=441
+[12:18:45Z] [filetypes] type=audio/aiff made=1 filled=0 blocks=280 cmds=77 ms=518 masked_ms=518
+[12:18:45Z] [filetypes] type=video/mp4 made=1 filled=0 blocks=240 cmds=72 ms=430 masked_ms=430
+[12:18:46Z] [filetypes] type=video/webm made=1 filled=0 blocks=272 cmds=76 ms=474 masked_ms=474
+[12:18:46Z] [lag] stall at_ms=48045 span_ms=1014 stage=app stage_ms=228 queue=0.0 wm=0.0 app=228.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=82.2 passes=0 pass_ms_max=0.0 rows=0 full=0 beam_ms=0 beam_max_ms=0.0 capped=0 yielded=0 valve=open hid_gap_ms=8 strand=0/0 handler=console-launch handler_ms=82.2 pump=xhci pump_ms=9.0 masked_ms=518 holder=- hold_ms=0
+[12:18:46Z] [filetypes] type=video/x-matroska made=1 filled=0 blocks=224 cmds=73 ms=418 masked_ms=417
+[12:18:46Z] [filetypes] type=image/x-sony-arw made=1 filled=0 blocks=312 cmds=87 ms=543 masked_ms=543
+[12:18:47Z] [lag] stall at_ms=49059 span_ms=1006 stage=app stage_ms=478 queue=0.0 wm=0.0 app=478.8 comp=0.0 present=4.2 draw=- pre=- render=composite render_ms=329.5 passes=5 pass_ms_max=329.5 rows=5270 full=0 beam_ms=19 beam_max_ms=11.1 capped=0 yielded=0 valve=closed hid_gap_ms=8 strand=0/0 handler=shell-launch handler_ms=393.4 pump=bootlog pump_ms=18.7 masked_ms=543 holder=- hold_ms=0
+[12:18:47Z] [filetypes] type=image/tiff made=1 filled=0 blocks=264 cmds=75 ms=495 masked_ms=495
+[12:18:47Z] [filetypes] type=audio/opus made=1 filled=0 blocks=280 cmds=77 ms=485 masked_ms=484
+[12:18:48Z] [lag] stall at_ms=50065 span_ms=1000 stage=render-handler stage_ms=422 queue=0.0 wm=0.0 app=0.0 comp=0.0 present=0.0 draw=- pre=- render=handler render_ms=422.6 passes=4 pass_ms_max=20.6 rows=3872 full=0 beam_ms=17 beam_max_ms=10.0 capped=0 yielded=0 valve=closed hid_gap_ms=8 strand=0/0 handler=console-launch handler_ms=422.1 pump=bootlog pump_ms=20.6 masked_ms=495 holder=- hold_ms=0
+[12:18:48Z] [filetypes] built at=login dir=/system/filetypes created=30 filled=0 types=30 stamp=written blocks_read=8832 cmds=2458 ms=16134 io=core2 masked_max_ms=666
+# WALLPAPER witness anywhere on the boot:
+# (none: `:: WALLPAPER:` is census_println — silent on the metal line, which arms neither census nor tests-at-boot;
+#  facet IS armed there — `[openers] … opener=facet(db)` — so wallpaper::poll ran from Screen::flush on the render task.)
+# READING (the executor's, before the instrument): the four zero-pass holds (stage_ms 1269/1711/1903/1403, all
+# handler=panel-render = pal.render() = Screen::flush) start ~0.5 s after the 2 s marks counted from `[desktop] built`
+# (at_ms 34111: desktopbuild re-arms the wallpaper probe; RETRY_MS=2000, MAX_TRIES=5) and each spans 2–3 of the
+# `[filetypes] type=…` objects (masked_ms 447..666 each, one UnaFS transaction on the jobs worker, io=core2):
+# the probe's MountTable::stat of ~/Desktop/WALL.PNG and /WALL.PNG waited on the volume the registry build held.
+# Not the suspects: the dock trash read (on=worker, 304 ms, 12:18:26, before the window), the jobs scan
+# (chunks ≤119 ms on the worker, landed 12:18:32), Holocron (12:18:26–30, before the desktop), the login furniture
+# (furniture=none). The 12:18:42–48 console-launch holds (386/220/82 ms, zero passes) are the other step; the
+# stamps dock-console and quarry split it on the next flight.
