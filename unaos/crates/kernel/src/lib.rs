@@ -337,3 +337,6 @@ pub mod smallfix7;
 // QUEUESLEEP (rmbp-ledger B512, R103 §2): `tests queuesleep` — the input path on an idle desktop, then one key, timed. Tail statement.
 pub mod queuesleep;
 #[cfg(all(feature = "midden", target_arch = "x86_64"))] pub mod middenapp; // MIDDENTWIN (LEDGER SR75): `tests midden` — APPS/MIDDEN.ELF, the ring-3 shell over midden_core, driven and read back. Tail statement, so no existing line moves.
+// AETHERMETAL (LEDGER SR66): `tests aether` — APPS/AETHER.ELF (the browser as a ring-3 program) validated, spawned, its page report read. Tail statement, so no existing line moves.
+#[cfg(feature = "aether")]
+pub mod aether;

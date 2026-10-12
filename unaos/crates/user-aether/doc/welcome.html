@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Welcome to Aether</title>
+<!-- AETHERMETAL M1 (LEDGER SR66): the page the builder stages as /system/doc/welcome.html — the fixture
+     APPS/AETHER.ELF opens and the demo it paints. It exercises what the M1 formatter draws: two heading
+     levels, paragraphs with em/strong/a/code, a nested ul/ol, a blockquote, a pre block, and author colours,
+     margins, padding and borders from this <style>, a class, an id and a style attribute. -->
+<style>
+  body { background: #f6f4ee; color: #222222; margin: 10px; }
+  h1 { color: #123a5c; font-size: 22px; margin: 4px 0 6px 0; border-bottom: 2px solid #2f8fd8; padding-bottom: 4px; }
+  h2 { color: #2f6f9f; font-size: 15px; margin-top: 14px; margin-bottom: 4px; }
+  p { margin: 6px 0; line-height: 1.35; }
+  .lede { color: #444444; font-style: italic; }
+  a { color: #0b62b5; }
+  code { background: #e6e1d3; color: #5a2a00; }
+  ul, ol { margin: 4px 0; padding-left: 22px; }
+  li { margin: 2px 0; }
+  li li { color: #555555; }
+  blockquote { margin: 10px 4px; padding: 6px 8px; background: #fff8dc; border-left: 4px solid #d9a400; color: #4a3b00; }
+  pre { background: #1e2430; color: #d8e1ee; padding: 6px; margin: 8px 0; font-size: 11px; line-height: 1.3; }
+  #foot { margin-top: 12px; padding-top: 6px; border-top: 1px solid #c8c2b0; font-size: 11px; color: #6b6555; text-align: center; }
+</style>
+</head>
+<body>
+<h1>Welcome to Aether</h1>
+<p class="lede">The UnaOS browser, running as a ring-3 program on the image.</p>
+
+<p>This page was read off the volume, parsed by <strong>html_core</strong>, styled by <strong>css_core</strong>
+and drawn with <em>font_core</em> &mdash; three <code>no_std</code> cores that both rings link. The
+<a href="https://unaos.org/aether">layout</a> is a CSS2 block and inline formatter written for this program.</p>
+
+<h2>What M1 draws</h2>
+<ul>
+  <li>Block boxes with <strong>margins</strong>, <strong>padding</strong> and borders</li>
+  <li>Inline runs that wrap at spaces, in <em>italic</em>, <strong>bold</strong> and <code>mono</code></li>
+  <li>Lists, nested:
+    <ol>
+      <li>numbered items</li>
+      <li>inside bullets</li>
+    </ol>
+  </li>
+  <li>Author colours from a <code>&lt;style&gt;</code> element</li>
+</ul>
+
+<h2>Keys</h2>
+<p>Arrows scroll a line, <strong>Page Up</strong> and <strong>Page Down</strong> a window,
+<strong>Home</strong> and <strong>End</strong> the ends. <em>Esc</em> closes the window.</p>
+
+<blockquote>A browser is a document reader first. The rest of the web is layered on that.</blockquote>
+
+<pre>fn main() {
+  let html = read("welcome.html");
+  let dom = parse(&amp;html);
+  paint(layout(cascade(&amp;dom)));
+}</pre>
+
+<p style="color: #7a2048">Next: the host engine's layout, ported behind one seam (M2).</p>
+
+<p id="foot">Aether on UnaOS &middot; AETHERMETAL M1</p>
+</body>
+</html>

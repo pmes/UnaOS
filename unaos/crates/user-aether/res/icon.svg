@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Aether (UnaOS's own design): a globe of meridians and parallels on a deep-sky tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#123a5c"/>
+<circle cx="32" cy="32" r="20" fill="#2f8fd8"/>
+<ellipse cx="32" cy="32" rx="9" ry="20" fill="none" stroke="#e8f4ff" stroke-width="2.5"/>
+<rect x="30.75" y="12" width="2.5" height="40" fill="#e8f4ff"/>
+<rect x="12" y="30.75" width="40" height="2.5" fill="#e8f4ff"/>
+<rect x="15" y="21" width="34" height="2" rx="1" fill="#e8f4ff"/>
+<rect x="15" y="41" width="34" height="2" rx="1" fill="#e8f4ff"/>
+<circle cx="32" cy="32" r="20" fill="none" stroke="#e8f4ff" stroke-width="2.5"/>
+</svg>
