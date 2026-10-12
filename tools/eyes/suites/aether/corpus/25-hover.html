@@ -1,0 +1,30 @@
+<!-- tests: pointer hover (SR67): a nav whose "Products" item opens a :hover submenu (display:none to block, absolute under the trigger, over the page), the trigger's :hover colours, cursor:pointer links; rendered with the pointer resting on the trigger -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Hover menu</title>
+<style>
+body { margin: 0; font-family: sans-serif; }
+nav { background: #1d3557; height: 48px; }
+nav > ul { display: flex; list-style: none; margin: 0; padding: 0 16px; }
+nav li { position: relative; width: 120px; }
+nav li > a { display: block; height: 48px; padding: 0 16px; line-height: 48px; color: #f1faee; text-decoration: none; font-size: 15px; cursor: pointer; }
+nav li:hover > a { background: #e63946; color: #ffffff; }
+nav ul.sub { display: none; position: absolute; top: 48px; left: 0; width: 200px; margin: 0; padding: 6px 0; list-style: none; background: #f1faee; border: 1px solid #a8dadc; z-index: 10; }
+nav li:hover > ul.sub { display: block; }
+nav ul.sub li { width: 200px; }
+nav ul.sub a { display: block; height: 36px; line-height: 36px; padding: 0 16px; color: #1d3557; font-size: 14px; }
+section { padding: 16px 24px; }
+section p { line-height: 1.6; color: #333; }
+.cta { display: inline-block; background: #457b9d; color: white; padding: 10px 18px; text-decoration: none; cursor: pointer; }
+.cta:hover { background: #e63946; }
+</style></head><body>
+<nav><ul>
+  <li><a href="#">Home</a></li>
+  <li><a href="#">Products</a>
+    <ul class="sub"><li><a href="#">Laptops</a></li><li><a href="#">Phones</a></li><li><a href="#">Watches</a></li></ul></li>
+  <li><a href="#">About</a></li>
+  <li><a href="#">Contact</a></li>
+</ul></nav>
+<section><h2>Hover menus</h2><p>The pointer rests on Products: its item turns red and the submenu drops down over this paragraph. With no pointer the submenu is display none and the page reads straight through.</p>
+<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+<p><a class="cta" href="#">Call to action</a></p></section>
+</body></html>

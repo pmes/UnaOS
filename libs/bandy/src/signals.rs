@@ -169,6 +169,14 @@ pub enum SMessage {
     /// Fetched *after* the page is delivered, so it never delays a load; an
     /// absent or undecodable icon simply fires nothing.
     BrowserFaviconChanged { width: u32, height: u32, rgba: Vec<u8> },
+    /// Chrome → engine: the pointer moved over the page surface, in surface
+    /// pixels (top-left origin) — hover, `:hover` style, the cursor shape and
+    /// the page's mouseover/mouseout/mouseenter/mouseleave/mousemove (SR67).
+    BrowserMouseMove(f64, f64),
+    /// Engine → chrome: the cursor the hovered element asks for changed. A
+    /// css-ui-4 `cursor` keyword (`default`, `pointer`, `text`, `wait`, …),
+    /// which is also the freedesktop/GTK cursor name; deduped by the engine.
+    BrowserCursorChanged(String),
 
     // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
     // A session is keyed by the media `url` the request named (the same string `PlayMedia`

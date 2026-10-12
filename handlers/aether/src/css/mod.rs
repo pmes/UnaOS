@@ -53,6 +53,9 @@ pub(crate) struct SpecifiedStyle {
     pub flex_shrink: Option<f32>,
     pub flex_basis: Option<Dimension>,
     pub paint: PaintStyle,
+    /// `cursor` (css-ui-4 §5.1, inherited): the keyword the cascade chose, `auto` included; read
+    /// back per element by [`cursor_for`] for the hovered element (AETHERHOVER, SR67).
+    pub cursor: Option<&'static str>,
 }
 
 impl SpecifiedStyle {
@@ -1031,6 +1034,17 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
             }
         }
         "border-style" => {} // stroke style is uniform; nothing to record
+        // css-ui-4 §5.1: `[<url> [<x> <y>]?,]* <keyword>` — images are not loaded, so the fallback
+        // keyword (the last comma-separated item) is the cursor; `inherit`/`unset` leave it to the
+        // parent (it is inherited), an unknown keyword invalidates the declaration.
+        "cursor" => {
+            let kw = value.rsplit(',').next().unwrap_or("").trim().to_ascii_lowercase();
+            match cursor_keyword(&kw) {
+                Some(k) => style.cursor = Some(k),
+                None if matches!(kw.as_str(), "inherit" | "unset") => {}
+                None => crate::ledger::record_css(&format!("cursor-value:{}", clip(value))),
+            }
+        }
         // Vendor-prefixed spellings of properties this engine implements
         // with the SAME value grammar. Only these are aliased: the old
         // `-webkit-box-*` flexbox properties (box-flex/box-align/box-pack)
@@ -1477,6 +1491,11 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
         }
     });
 
+    LAST_CURSORS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.clear();
+        c.extend(styles.iter().filter_map(|(id, s)| s.cursor.map(|k| (*id, k))));
+    });
     let mut acc: std::collections::HashMap<taffy::NodeId, std::rc::Rc<SpecifiedStyle>> = std::collections::HashMap::new();
     for (dom_id, style) in styles {
         for tid in boxes.get(&dom_id).into_iter().flatten() {
@@ -1506,6 +1525,77 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     // set_style only marks nodes dirty; re-lay out with text measurement.
     crate::layout::remeasure(layout_tree);
     STYLE_TIMING.with(|t| t.set((t1 - t0, t1.elapsed())));
+}
+
+thread_local! {
+    /// The `cursor` keyword each element's own winning declarations chose, from the last
+    /// `apply_stylesheets` (AETHERHOVER, SR67) — inheritance and `auto` are resolved by [`cursor_for`].
+    static LAST_CURSORS: std::cell::RefCell<std::collections::HashMap<html_core::NodeId, &'static str>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// css-ui-4 §5.1's cursor keywords (plus the legacy `hand` and the `-webkit-` grab spellings Chromium
+/// still accepts), interned.
+fn cursor_keyword(kw: &str) -> Option<&'static str> {
+    const KW: [&str; 36] = [
+        "auto", "default", "none", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text",
+        "vertical-text", "alias", "copy", "move", "no-drop", "not-allowed", "grab", "grabbing", "e-resize",
+        "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize", "sw-resize", "w-resize", "ew-resize",
+        "ns-resize", "nesw-resize", "nwse-resize", "col-resize", "row-resize", "all-scroll", "zoom-in", "zoom-out",
+    ];
+    let kw = match kw {
+        "hand" => "pointer",
+        "initial" => "auto",
+        "-webkit-grab" => "grab",
+        "-webkit-grabbing" => "grabbing",
+        "-webkit-zoom-in" => "zoom-in",
+        "-webkit-zoom-out" => "zoom-out",
+        k => k,
+    };
+    KW.iter().copied().find(|k| *k == kw)
+}
+
+/// The used cursor over `node` (AETHERHOVER, SR67): the nearest element, from `node` outward, whose own
+/// declarations set `cursor` (it is inherited), where a link (`a`/`area` with `href`) carries the UA
+/// sheet's `cursor: pointer` (Chromium's `:any-link`; an author declaration on the same element wins).
+/// `auto` resolves as css-ui-4 §5.1 leaves it to the UA: the I-beam over text (`over_text`, or an
+/// editable text control), the arrow otherwise. The result is a css-ui-4 keyword, which is also the
+/// GTK/freedesktop cursor name the shell hands the platform.
+pub fn cursor_for(node: &crate::dom::NodeRef, over_text: bool) -> String {
+    let set = LAST_CURSORS.with(|c| {
+        let c = c.borrow();
+        node.with_doc(|doc, id| {
+            let mut cur = if doc.element(id).is_some() { Some(id) } else { doc.parent_element(id) };
+            while let Some(e) = cur {
+                if let Some(k) = c.get(&e) {
+                    return Some(*k);
+                }
+                if let Some(el) = doc.element(e) {
+                    if matches!(el.local.as_str(), "a" | "area") && el.attr("href").is_some() {
+                        return Some("pointer");
+                    }
+                }
+                cur = doc.parent_element(e);
+            }
+            None
+        })
+    });
+    match set {
+        Some(k) if k != "auto" => k.to_string(),
+        _ => {
+            let editable = node.with_doc(|doc, id| {
+                doc.element(id).is_some_and(|el| match el.local.as_str() {
+                    "textarea" => true,
+                    "input" => !matches!(
+                        el.attr("type").map(|t| t.to_ascii_lowercase()).as_deref(),
+                        Some("checkbox" | "radio" | "submit" | "button" | "reset" | "image" | "file" | "color" | "range" | "hidden")
+                    ),
+                    _ => false,
+                })
+            });
+            if over_text || editable { "text" } else { "default" }.to_string()
+        }
+    }
 }
 
 thread_local! {
@@ -1850,6 +1940,7 @@ fn property_supported(prop: &str) -> bool {
             | "text-shadow"
             | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
             | "gap" | "row-gap" | "column-gap"
+            | "cursor"
     )
 }
 

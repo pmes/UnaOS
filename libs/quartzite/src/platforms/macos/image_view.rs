@@ -99,6 +99,9 @@ pub struct FacetImageIvars {
     /// this synapse (clicks as surface-pixel BrowserClick, wheel as
     /// BrowserScroll) instead of driving facet zoom/pan.
     synapse: RefCell<Option<bandy::Synapse>>,
+    /// Browser mode (SR67): the css-ui-4 cursor keyword the hovered page element asks for
+    /// (`BrowserCursorChanged`), re-asserted on every move over the surface.
+    page_cursor: RefCell<String>,
 
     /// True between `viewWillStartLiveResize` and `viewDidEndLiveResize` —
     /// i.e. while the user is dragging a window edge. Resize notifications to
@@ -136,6 +139,7 @@ define_class!(
                 drag_anchor: Cell::new(None),
                 tracking: RefCell::new(None),
                 synapse: RefCell::new(None),
+                page_cursor: RefCell::new(String::from("default")),
                 live_resize: Cell::new(false),
                 last_resize_fire: Cell::new(None),
                 last_resize_sent: Cell::new(None),
@@ -314,6 +318,17 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &AnyObject) {
+            let syn = self.ivars().synapse.borrow().clone();
+            if let Some(syn) = syn {
+                // Browser surface (SR67): the pointer goes to the engine in surface pixels
+                // (hover, `:hover`, the page's mouse events); the page's cursor is re-asserted
+                // (AppKit resets it to the arrow as the pointer crosses views).
+                if let Some((px, py)) = self.surface_point(event) {
+                    syn.fire(bandy::SMessage::BrowserMouseMove(px, py));
+                }
+                self.apply_page_cursor();
+                return;
+            }
             self.ivars().cursor.set(Some(self.event_point(event)));
             self.setNeedsDisplay(true);
         }
@@ -579,6 +594,59 @@ impl FacetImageView {
         (p.x, p.y)
     }
 
+    /// Browser mode (SR67): an event's location in surface pixels (top-left origin, the engine's
+    /// space) through the same 1:1 top-pinned placement `image_dest` draws with; `None` off the frame.
+    fn surface_point(&self, event: &AnyObject) -> Option<(f64, f64)> {
+        let (vx, vy) = self.event_point(event);
+        let (dx, dy, dw, dh) = self.image_dest(self.bounds())?;
+        let (iw, ih) = *self.ivars().size.borrow();
+        if dw <= 0.0 || dh <= 0.0 || iw == 0 || ih == 0 {
+            return None;
+        }
+        let px = (vx - dx) / dw * iw as f64;
+        let py = ih as f64 - ((vy - dy) / dh * ih as f64);
+        (px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64).then_some((px, py))
+    }
+
+    /// Browser mode (SR67): the page asked for cursor `name` (a css-ui-4 keyword). Main thread only.
+    pub fn set_page_cursor(&self, name: &str) {
+        *self.ivars().page_cursor.borrow_mut() = name.to_string();
+        self.apply_page_cursor();
+    }
+
+    /// Sets the AppKit cursor for the current page cursor keyword: the NSCursor class cursors
+    /// that exist for css-ui-4's shapes; one AppKit lacks (`wait`, `help`, `progress`, the zooms,
+    /// diagonal resizes) falls back to the arrow.
+    fn apply_page_cursor(&self) {
+        let name = self.ivars().page_cursor.borrow().clone();
+        let cls = class!(NSCursor);
+        unsafe {
+            if name == "none" {
+                let _: () = msg_send![cls, hide];
+                return;
+            }
+            let _: () = msg_send![cls, unhide];
+            let c: *mut AnyObject = match name.as_str() {
+                "pointer" => msg_send![cls, pointingHandCursor],
+                "text" => msg_send![cls, IBeamCursor],
+                "vertical-text" => msg_send![cls, IBeamCursorForVerticalLayout],
+                "crosshair" | "cell" => msg_send![cls, crosshairCursor],
+                "grab" | "move" | "all-scroll" => msg_send![cls, openHandCursor],
+                "grabbing" => msg_send![cls, closedHandCursor],
+                "not-allowed" | "no-drop" => msg_send![cls, operationNotAllowedCursor],
+                "copy" => msg_send![cls, dragCopyCursor],
+                "alias" => msg_send![cls, dragLinkCursor],
+                "context-menu" => msg_send![cls, contextualMenuCursor],
+                "ew-resize" | "col-resize" | "e-resize" | "w-resize" => msg_send![cls, resizeLeftRightCursor],
+                "ns-resize" | "row-resize" | "n-resize" | "s-resize" => msg_send![cls, resizeUpDownCursor],
+                _ => msg_send![cls, arrowCursor],
+            };
+            if let Some(c) = c.as_ref() {
+                let _: () = msg_send![c, set];
+            }
+        }
+    }
+
     /// The raw window-space location of an `NSEvent` (for drag deltas, which we
     /// want independent of the view's own transform).
     fn event_window_point(&self, event: &AnyObject) -> (f64, f64) {
@@ -827,6 +895,13 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
         rt.block_on(async move {
         loop {
             match rx.recv().await {
+                Ok(bandy::SMessage::BrowserCursorChanged(name)) => {
+                    let bound = bound.clone();
+                    dispatch2::DispatchQueue::main().exec_async(move || {
+                        let mtm = MainThreadMarker::new().unwrap();
+                        bound.get(mtm).set_page_cursor(&name);
+                    });
+                }
                 Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels }) => {
                     if url == target_id {
                         let bound = bound.clone();

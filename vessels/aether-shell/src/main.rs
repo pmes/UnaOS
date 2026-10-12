@@ -26,6 +26,11 @@ use aether::AetherEngine;
 ///     their deltas — a scroll is a *displacement*, so dropping one would
 ///     lose distance. Non-adjacent scrolls (something happened in between)
 ///     are left alone.
+///   * **Pointer motion: last wins among neighbours.** Adjacent
+///     `BrowserMouseMove` messages collapse to the latest — a pointer is a
+///     *position*, and the page's hover follows where it is, not the path
+///     it took while the engine was busy (SR67). A move separated by a click
+///     or anything else is kept, so the click lands on what it hovered.
 ///
 /// Everything else passes through untouched, in order.
 fn coalesce(batch: Vec<SMessage>) -> Vec<SMessage> {
@@ -42,6 +47,13 @@ fn coalesce(batch: Vec<SMessage>) -> Vec<SMessage> {
                     *py += dy;
                 } else {
                     out.push(SMessage::BrowserScroll(dx, dy));
+                }
+            }
+            SMessage::BrowserMouseMove(x, y) => {
+                if let Some(SMessage::BrowserMouseMove(px, py)) = out.last_mut() {
+                    (*px, *py) = (x, y);
+                } else {
+                    out.push(SMessage::BrowserMouseMove(x, y));
                 }
             }
             other => out.push(other),
@@ -239,6 +251,10 @@ fn main() {
                                 SMessage::BrowserText(text) => {
                                     engine.handle_event(aether::api::events::Event::Text(text));
                                 }
+                                // SR67: hover, `:hover` re-style, the page's mouse events.
+                                SMessage::BrowserMouseMove(x, y) => {
+                                    engine.handle_event(aether::api::events::Event::MouseMove(x, y));
+                                }
                                 _ => {}
                             }
                             // A link click or form submit staged a navigation;
@@ -271,6 +287,11 @@ fn main() {
                 // stops on navigation) go to Stria — the page's own streams, no site code.
                 for req in engine.take_media_requests() {
                     engine_tx.fire(req);
+                }
+                // The hovered element's cursor changed (SR67): the surface maps the css-ui-4
+                // keyword to the platform cursor (GTK by name, macOS NSCursor).
+                if let Some(cursor) = engine.take_cursor_change() {
+                    engine_tx.fire(SMessage::BrowserCursorChanged(cursor));
                 }
                 // One choke point for the address bar: whatever the last turn
                 // of the loop did — link click, form submit, Back, Forward,
@@ -341,4 +362,38 @@ fn main() {
     ]);
     
     quartzite::Backend::new_tetra_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), aether_ui, synapse.clone()).run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SR67: adjacent pointer motion collapses to the last position; a click between two moves keeps
+    /// both (the click lands on what the first move hovered).
+    #[test]
+    fn coalesce_keeps_the_last_of_adjacent_pointer_moves() {
+        let out = coalesce(vec![
+            SMessage::BrowserMouseMove(1.0, 1.0),
+            SMessage::BrowserMouseMove(2.0, 3.0),
+            SMessage::BrowserMouseMove(5.0, 8.0),
+            SMessage::BrowserClick(5.0, 8.0),
+            SMessage::BrowserMouseMove(9.0, 9.0),
+        ]);
+        let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
+        assert_eq!(shape, ["BrowserMouseMove(5.0, 8.0)", "BrowserClick(5.0, 8.0)", "BrowserMouseMove(9.0, 9.0)"]);
+    }
+
+    /// Scroll still sums and resize still keeps only the last geometry alongside pointer motion.
+    #[test]
+    fn coalesce_pointer_motion_leaves_scroll_and_resize_rules_alone() {
+        let out = coalesce(vec![
+            SMessage::BrowserResize(10, 10),
+            SMessage::BrowserScroll(0.0, 1.0),
+            SMessage::BrowserScroll(0.0, 2.0),
+            SMessage::BrowserMouseMove(4.0, 4.0),
+            SMessage::BrowserResize(20, 20),
+        ]);
+        let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
+        assert_eq!(shape, ["BrowserScroll(0.0, 3.0)", "BrowserMouseMove(4.0, 4.0)", "BrowserResize(20, 20)"]);
+    }
 }
