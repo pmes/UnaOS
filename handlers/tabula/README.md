@@ -6,11 +6,33 @@ editor view for source files, prose, and read-only logs.
 
 ## Status
 
-**Partial / view-only.** The crate currently provides an embeddable editor
-widget built on GTK4 and GtkSourceView (`sourceview5`). It is **not yet wired to
-the Synapse**: there is no `ignite(...)` entry point, and it neither subscribes
-to nor emits any `SMessage`. A vessel embeds `TabulaView` directly today; bus
-integration is future work.
+**On the Synapse (TABULABUS, SR74).** `tabula::ignite(synapse)` (`src/bus.rs`) is the
+handler's entry point: a task subscribed to the Synapse that owns every document it
+opens, keyed by path, and serves the Editor verbs carried by
+`SMessage::Tabula(TabulaCommand)` (`libs/bandy/src/signals.rs`). The document core
+is today's `TabulaDocument`; the GTK4/GtkSourceView `TabulaView` stays as the
+other-OS face (R104). The `una` vessel speaks the verbs instead of calling
+`TabulaDocument::open` itself.
+
+## The bus
+
+| Verb | Direction | Answer |
+| --- | --- | --- |
+| `EditorOpen { principal, path }` | → Tabula | `EditorLoaded { path, content, lines, language, read_only }`, then `SMessage::EditorLoad` for quartzite's pane; or `EditorError` |
+| `EditorSave { principal, path }` | → Tabula | `EditorSaved`, then `EditorDirty false` if it was dirty; or `EditorError` (a log answers it: read-only) |
+| `EditorGoto { principal, path, line, col }` | → Tabula | none (1-based, `col` in chars, clamped); sets the cursor |
+| `EditorInsert { principal, path, text }` | → Tabula | `EditorDirty true` when it was clean, and `EditorLoad` when it is the pane's document; or `EditorError` |
+| `EditorClosed { path }` | vessel's fact | none; Tabula drops the document |
+| `EditorError { path, why }` | Tabula → | every refused request (unreadable path, not open, read-only) |
+
+`EditorLoad`, `EditorEdited` and `EditorSaveRequest` (the pane's older vocabulary)
+keep their wire shape: Tabula fires `EditorLoad` after every `EditorLoaded`, and
+applies `EditorEdited` (a full-buffer echo without a path) to the document it last
+loaded. Opening a path already held re-presents it, unsaved edits included.
+`tabula::bus::serve(synapse)` subscribes at the call and returns the loop, so a
+vessel can fire `EditorOpen` immediately after spawning it. The read-only log route
+is unchanged: `EditorOpen` goes through `TabulaDocument::open`, which name-routes
+`UNAOS.LOG`/`*.log`/`*.out` to the Console view.
 
 ## What it provides
 
@@ -126,19 +148,9 @@ Live follow (tail -f behaviour), level/source filtering, and log **structure**
 (the `LogRecord` triple) are `handlers/comscan`'s `LogViewState`. This is the
 static-file incarnation only.
 
-## How it is meant to plug into the bus
-
-Per the userspace architecture
-([`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)),
-a handler is a domain-service crate that exposes an async entry point (by
-convention `ignite(...)`) and communicates over **Bandy** — the `SMessage` enum
-carried on the **Synapse** broadcast bus — rather than calling other handlers
-directly. Tabula does not yet implement this seam. When it does, it is expected
-to react to open/save requests and surface its editor view to a vessel's GUI via
-that bus; the relevant `SMessage` variants are not defined here yet.
-
 ## Dependencies
 
+- `bandy` — the `SMessage` vocabulary and the Synapse `ignite` serves.
 - `gtk4`, `sourceview5`, `glib` — the GUI toolkit and source editor backend.
 - `elessar` (workspace/context detection) and `libspelling` (spell checking) are
   declared in `Cargo.toml` but not yet referenced from `src/`; they are reserved
