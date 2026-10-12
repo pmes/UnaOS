@@ -377,7 +377,7 @@ mod imp {
             if !FIRED.swap(true, AcqRel) {
                 WEDGES.fetch_add(1, Relaxed);
                 let w = WAIT_WHAT.load(Relaxed);
-                let holder = if w == W_UNAFS || w == 0 { unafs_holder() } else { Holder::NONE };
+                let holder = match (if w == W_UNAFS || w == 0 { unafs_holder() } else { Holder::NONE }, crate::sync::waits_on(RENDER_TID.load(Relaxed) as u32)) { (h, _) if h.tid != 0 => h, (_, Some((site, t, c))) if t != 0 => Holder { lock: site, label: label_of(t as u64), tid: t as u64, cpu: c as usize }, (h, _) => h }; // TRASHLOCK (B523): any other registered lock the render task spins on names its holder through LOCKREG's `waits_on` (was `untracked`)
                 let h = LAST_HANDLER.load(Relaxed) as usize;
                 say(now.saturating_sub(since), crate::video::lag::SEG_NAMES.get(h).copied().unwrap_or("-"), holder, false);
                 let rt = RENDER_TID.load(Relaxed);

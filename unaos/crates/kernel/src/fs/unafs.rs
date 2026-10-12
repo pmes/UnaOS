@@ -635,7 +635,7 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
 
 /// UNAFSBIND: the handle the live cached mount is riding, or `None` if no mount is currently bound.
 /// A read-only peek (masked, like every `MOUNT` touch); it never triggers the lazy bind.
-pub fn mount_bound_handle() -> Option<block::BlockHandle> {
+pub fn mount_bound_handle() -> Option<block::BlockHandle> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return None; } } // TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape) — the render task never spins unbounded on MOUNT here; past MOUNT_BOUND_MS `[render] wait-timeout what=unafs-mount` and "none bound". ⚠ SAME-LINE fold: :639's `MOUNT.lock()` keeps its line and column
     crate::arch::without_interrupts(|| MOUNT.lock().as_ref().map(|b| b.handle))
 }
 
@@ -1013,7 +1013,7 @@ pub static TEST_FAIL_MIDSTAGE: core::sync::atomic::AtomicBool =
 /// actually reached the medium. This is the durability-proof primitive the K4
 /// witness uses to prove a write survived being committed to the block device.
 pub fn force_remount() {
-    crate::arch::without_interrupts(|| {
+    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return ; } } // TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape); past the bound the remount is skipped (nothing was touched). ⚠ SAME-LINE fold: :1017's `MOUNT.lock()` keeps its line and column
         *MOUNT.lock() = None;
     });
 }
@@ -2877,7 +2877,7 @@ pub fn ra_window_bound() -> u64 {
 /// `with_unafs` re-binds from it.
 pub fn lockowner_release() {
     unsafe { MOUNT.force_unlock() };
-    crate::arch::without_interrupts(|| {
+    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return ; } } // TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape); past the bound the leak is left to the next `with_unafs` (the lock was force-released above). ⚠ SAME-LINE fold: :2881's `MOUNT.lock()` keeps its line and column
         if let Some(m) = MOUNT.lock().take() {
             core::mem::forget(m);
         }

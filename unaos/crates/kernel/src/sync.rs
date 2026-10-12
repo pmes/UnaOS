@@ -189,7 +189,7 @@ impl<T: ?Sized + core::fmt::Display, R> core::fmt::Display for MutexGuard<'_, T,
 // core, CLOCKCORE's per-core tick) through `serial_println!` (try_lock sinks): never from inside `lock()`.
 
 #[cfg(target_arch = "x86_64")]
-pub use reg::{arm, ensure_tests, here_tid, isr_tick, name_task, release_task};
+pub use reg::{arm, ensure_tests, here_tid, isr_tick, name_task, release_task, waits_on}; // TRASHLOCK (B523): `waits_on` — LINE-NEUTRAL append
 
 #[cfg(target_arch = "x86_64")]
 mod reg {
@@ -270,7 +270,7 @@ mod reg {
     static INV_SAID: AtomicU32 = AtomicU32::new(0);
     /// The scan: the next due ms, the lines said, the once-per-site record (site pointer | kind in bit 0..1).
     static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
-    static LINES: AtomicU32 = AtomicU32::new(0);
+    static LINES: AtomicU32 = AtomicU32::new(0); static LINES_MIN: AtomicU64 = AtomicU64::new(0); // TRASHLOCK (B523): the minute LINES and SAID were last reset in (the cap is per minute, not per boot) — LINE-NEUTRAL append
     static SAID: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
     /// The last lock NAME the scan saw held past 50 ms (for `tests lockreg`), and the test's own name (never capped).
     static SEEN_LONG: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
@@ -555,7 +555,7 @@ mod reg {
             }
         }
         None
-    }
+    } /* TRASHLOCK (B523): what task `tid` spins on — (the lock's name = its construction file, holder tid, holder cpu); holder 0 = untracked. `None` = not spinning in `Mutex::lock`. */ pub fn waits_on(tid: u32) -> Option<(&'static str, u32, u32)> { for p in PARTS.iter() { let addr = p.w_lock.load(Acquire); if addr == 0 || p.w_tid.load(Relaxed) != tid as u64 { continue; } let n = p.w_name.load(Relaxed); let site = if n.is_null() { "?" } else { let l: &'static Loc = unsafe { &*n }; let f = l.file(); f.rsplit('/').next().unwrap_or(f) }; let (ht, hc) = holder_of(addr).unwrap_or((0, 0)); return Some((site, ht as u32, hc as u32)); } None } // LINE-NEUTRAL append (SAFETY: `w_name` is a `&'static Location` or null)
 
     /// Timer ISR, every core (after CLOCKCORE's `isr_tick`): every 50 ms ONE core reads every partition.
     #[inline]
@@ -625,7 +625,7 @@ mod reg {
             return;
         }
         let ms = |c: u64| c / (hz / 1000).max(1);
-        let t = rdtsc();
+        let t = rdtsc(); let minute = crate::arch::ms() / 60_000; if LINES_MIN.swap(minute, Relaxed) != minute { LINES.store(0, Relaxed); for s in SAID.iter() { s.store(0, Relaxed); } } // TRASHLOCK (B523): LINE_CAP (unchanged, 16) and the once-per-site record reset each minute — f28's wedge went unnamed because both were spent by 12:22:36. LINE-NEUTRAL append
         for p in PARTS.iter() {
             let mut bits = p.mask.load(Acquire);
             while bits != 0 {
