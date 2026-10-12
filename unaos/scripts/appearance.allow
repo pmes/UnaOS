@@ -21,3 +21,4 @@ wm.rs           0x165667B1      the xxhash32 PRIME32_5 in the window-identity ha
 ../selftest.rs  0x9E37_79B9  the golden-ratio hash prime that fills the heap vector
 ../selftest.rs  0x1234_5678  the RwLock round-trip marker word
 ../selftest.rs  0xC0FFEE     the channel round-trip token
+loginrender.rs  0xff_ffff    the 24-bit duration field of a stamp ring word (LOGINRENDER B514), a mask, not a pixel
