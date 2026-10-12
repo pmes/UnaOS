@@ -1187,6 +1187,8 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::ToggleMatrixNode(_) => "ToggleMatrixNode",
         SMessage::UiReady => "UiReady",
         SMessage::Tabula(_) => "Tabula",
+        SMessage::BrowserMouseMove(_, _) => "BrowserMouseMove",
+        SMessage::BrowserCursorChanged(_) => "BrowserCursorChanged", // AETHERHOVER (SR67) fold: the exhaustive match gains the two motion variants
     }
 }
 
