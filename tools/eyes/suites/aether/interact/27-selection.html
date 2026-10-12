@@ -1,0 +1,13 @@
+<!-- tests: a user selection (AETHERSELECT, SR69) across a wrapped paragraph run with inline bold and a link: the highlight per line box behind the glyphs, the selected glyphs and the link underline inverted, the selected line break -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Selection</title>
+<style>
+body { font-family: sans-serif; font-size: 16px; margin: 20px; width: 420px; }
+h1 { font-size: 24px; margin: 0 0 12px; }
+p { margin: 0 0 12px; }
+</style></head>
+<body>
+<h1>Selecting text</h1>
+<p id="sel">The quick brown fox jumps over the <b>lazy dog</b> while the <a href="#top">patient reader</a> drags a selection from one line to the next and lets go of it.</p>
+<p>A second paragraph stays unselected, as does the heading above it.</p>
+</body></html>

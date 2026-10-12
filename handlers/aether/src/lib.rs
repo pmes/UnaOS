@@ -16,6 +16,7 @@ pub mod event_loop;
 pub mod fonts;
 pub mod api;
 pub mod media;
+pub mod selection;
 
 #[cfg(test)]
 mod engine_tests;
@@ -42,6 +43,30 @@ pub struct AetherEngine {
     /// where tokio::task::block_in_place panics — the old inline block here
     /// killed the engine thread on the first link click.
     pending_nav: Option<forms::OpenDocument>,
+    /// AETHERSELECT (SR69): the engine's own "button down" flag — motion extends the selection only
+    /// while it is set (`pointer_moved`), and release clears it (`pointer_released`).
+    button_down: bool,
+    /// The drag in progress: its granularity (1 character, 2 word, 3 block) and the range the press
+    /// selected (a word or block drag keeps it whole on either side).
+    sel_drag: Option<SelDrag>,
+    /// The last press (when, where, click count) — two presses within 500 ms and 4 px count up.
+    last_press: Option<(std::time::Instant, f64, f64, u8)>,
+    /// Shift held by the shell's pointer: a press extends the selection instead of starting one.
+    pub shift_held: bool,
+    /// The selection generation last painted.
+    sel_gen: u64,
+    /// Bumped whenever the layout tree is replaced; `painted_epoch` is the one the last full frame drew
+    /// (the frame whose text fragments a pointer is hit-tested against).
+    layout_epoch: u64,
+    painted_epoch: u64,
+}
+
+/// A selection drag (AETHERSELECT).
+#[derive(Clone, Copy, Debug)]
+struct SelDrag {
+    granularity: u8,
+    lo: selection::Point,
+    hi: selection::Point,
 }
 
 impl AetherEngine {
@@ -63,6 +88,13 @@ impl AetherEngine {
             surface: vec![255; 800 * 600 * 4],
             stylesheets: Vec::new(),
             pending_nav: None,
+            button_down: false,
+            sel_drag: None,
+            last_press: None,
+            shift_held: false,
+            sel_gen: selection::generation(),
+            layout_epoch: 1,
+            painted_epoch: 0,
         }
     }
 
@@ -76,8 +108,150 @@ impl AetherEngine {
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
         css::apply_stylesheets(&mut layout_tree, &self.stylesheets);
         self.layout_tree = Some(layout_tree);
+        self.layout_epoch += 1;
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // AETHERSELECT (SR69): the selection the pointer makes
+    // ---------------------------------------------------------------------------------------------
+
+    /// Paints a full frame when the text fragments on record are not this layout's (a pointer is
+    /// hit-tested against what was painted).
+    fn ensure_painted(&mut self) {
+        if self.layout_tree.is_some() && self.painted_epoch != self.layout_epoch {
+            self.damage_rects.push((0, 0, self.width, self.height));
+            self.render_frame();
+        }
+    }
+
+    /// Repaints when the selection changed since the last paint (by the pointer or by script).
+    fn sel_changed(&mut self) {
+        let g = selection::generation();
+        if g != self.sel_gen {
+            self.sel_gen = g;
+            self.needs_repaint = true;
+            self.damage_rects.push((0, 0, self.width, self.height));
+        }
+    }
+
+    fn hit_text(&mut self, x: f64, y: f64) -> Option<selection::Hit> {
+        self.ensure_painted();
+        let layout = self.layout_tree.as_ref()?;
+        selection::hit(layout, &render::text_boxes(), (self.scroll_x, self.scroll_y), x, y)
+    }
+
+    /// The whole block a triple click selects: its first and last boundary points.
+    fn block_range(&self, block: usize) -> Option<(selection::Point, selection::Point)> {
+        let doc = self.document.as_ref()?;
+        let len = doc.with_doc(|d, _| selection::node_length(d, block));
+        Some((selection::Point { node: block, offset: 0 }, selection::Point { node: block, offset: len }))
+    }
+
+    /// The press at viewport (`x`, `y`) with a click count and Shift state: one click places a caret (a
+    /// collapsed selection), two select the word (UAX #29) and three the block under the pointer, and
+    /// Shift extends the current selection's focus to the pointer. The drag that follows extends it at
+    /// the same granularity while the button is held.
+    pub fn press_at(&mut self, x: f64, y: f64, clicks: u8, shift: bool) {
+        self.button_down = true;
+        let Some(hit) = self.hit_text(x, y) else {
+            selection::set(None);
+            self.sel_drag = None;
+            self.sel_changed();
+            return;
+        };
+        if shift {
+            if let Some(cur) = selection::get() {
+                selection::set(Some(selection::Selection { anchor: cur.anchor, focus: hit.point }));
+                self.sel_drag = Some(SelDrag { granularity: 1, lo: cur.anchor, hi: cur.anchor });
+                self.sel_changed();
+                return;
+            }
+        }
+        let (lo, hi, granularity) = match clicks {
+            2 => (hit.word.0, hit.word.1, 2),
+            3 => match hit.block.and_then(|b| self.block_range(b)) {
+                Some((a, b)) => (a, b, 3),
+                None => (hit.word.0, hit.word.1, 2),
+            },
+            _ => (hit.point, hit.point, 1),
+        };
+        selection::set(Some(selection::Selection { anchor: lo, focus: hi }));
+        self.sel_drag = Some(SelDrag { granularity, lo, hi });
+        self.sel_changed();
+    }
+
+    /// A press from the shell: the click count comes from the time and distance since the last one.
+    fn selection_press(&mut self, x: f64, y: f64) {
+        let now = std::time::Instant::now();
+        let clicks = match self.last_press {
+            Some((t, px, py, n)) if now.duration_since(t) < std::time::Duration::from_millis(500) && (px - x).abs() <= 4.0 && (py - y).abs() <= 4.0 => n % 3 + 1,
+            _ => 1,
+        };
+        self.last_press = Some((now, x, y, clicks));
+        self.press_at(x, y, clicks, self.shift_held);
+    }
+
+    /// Pointer motion (viewport px). While the button is held, extends the selection's focus to the
+    /// pointer at the press's granularity. SR67's `MouseMove` arm calls this.
+    pub fn pointer_moved(&mut self, x: f64, y: f64) {
+        if !self.button_down {
+            return;
+        }
+        let Some(drag) = self.sel_drag else { return };
+        let Some(hit) = self.hit_text(x, y) else { return };
+        let Some(doc) = self.document.clone() else { return };
+        let ord = selection::order(&doc);
+        let before = doc.with_doc(|d, _| match (ord.key(d, hit.point), ord.key(d, drag.lo)) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        });
+        let (anchor, focus) = match drag.granularity {
+            2 => if before { (drag.hi, hit.word.0) } else { (drag.lo, hit.word.1) },
+            3 => match hit.block.and_then(|b| self.block_range(b)) {
+                Some((a, b)) => if before { (drag.hi, a) } else { (drag.lo, b) },
+                None => (drag.lo, hit.point),
+            },
+            _ => (drag.lo, hit.point),
+        };
+        selection::set(Some(selection::Selection { anchor, focus }));
+        self.sel_changed();
+    }
+
+    /// The button went up: the drag ends (the selection stays). SR68's `MouseUp` arm calls this.
+    pub fn pointer_released(&mut self) {
+        self.button_down = false;
+    }
+
+    /// Ctrl/Cmd+A: select the document's contents (the body's children).
+    pub fn select_all(&mut self) {
+        let Some(doc) = self.document.clone() else { return };
+        let root = doc.select_first("body").map(|b| b.as_node().clone()).ok().or_else(|| doc.first_child());
+        let Some(root) = root else { return };
+        let len = root.with_doc(|d, id| selection::node_length(d, id.0));
+        let id = root.id().0;
+        selection::set(Some(selection::Selection {
+            anchor: selection::Point { node: id, offset: 0 },
+            focus: selection::Point { node: id, offset: len },
+        }));
+        self.sel_drag = None;
+        self.sel_changed();
+    }
+
+    /// The selected text, serialized per the HTML `innerText` algorithm (`Selection.toString()`).
+    pub fn selected_text(&self) -> String {
+        match (&self.layout_tree, &self.document) {
+            (Some(l), Some(d)) => selection::selection_text(l, d),
+            _ => String::new(),
+        }
+    }
+
+    /// `BrowserCopy`: the selected text for the shell's clipboard, as `BrowserClipboardSet`; None when
+    /// nothing is selected.
+    pub fn copy_selection(&self) -> Option<bandy::SMessage> {
+        let t = self.selected_text();
+        (!t.is_empty()).then_some(bandy::SMessage::BrowserClipboardSet(t))
     }
 
     /// Requests for Stria queued by the page's media elements (posters on layout, play/pause
@@ -185,6 +359,7 @@ impl AetherEngine {
         if js::take_mutated() {
             self.relayout();
         }
+        self.sel_changed();
 
         let needs_repaint = self.needs_repaint;
         self.needs_repaint = false;
@@ -316,7 +491,7 @@ impl AetherEngine {
                 }
             }
             api::events::Event::MouseMove(_x, _y) => {}
-            api::events::Event::MouseDown(_x, _y) => {}
+            api::events::Event::MouseDown(x, y) => self.selection_press(x, y),
             api::events::Event::MouseUp(x, y) => {
                 if let Some(node) = self.hit_test(x, y) {
                     // Script click handlers run first (bubbling); a handled
@@ -545,6 +720,10 @@ impl AetherEngine {
         
         // The previous document's media stop; this one's register below.
         media::reset("Aether Browser");
+        // A new document has no selection.
+        selection::reset();
+        self.sel_drag = None;
+        self.button_down = false;
 
         // AETHERJS (SR63): the document is parsed with its scripts executing in HTML §4.12.1 order
         // (parser-blocking, defer, async, module; document.write during parse), then "the end"
@@ -559,6 +738,8 @@ impl AetherEngine {
         }
         let (document, mut js_engine) =
             js::loader::load(url, html, pre, (self.width as f32, self.height as f32), external_css.to_vec());
+        // AETHERSELECT: `getSelection()` answers with the live Selection (window.rs installs a stub).
+        js::dom::selection::bind_get_selection(&mut js_engine.vm);
         self.title = "Aether Browser".to_string();
         if let Ok(mut titles) = document.select("title") {
             if let Some(title_node) = titles.next() {
@@ -598,6 +779,7 @@ impl AetherEngine {
         
         self.document = Some(document);
         self.layout_tree = Some(layout_tree);
+        self.layout_epoch += 1;
         self.js_engine = Some(js_engine);
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
@@ -610,6 +792,9 @@ impl AetherEngine {
         
         if let Some(layout) = &self.layout_tree {
             render::render_frame(layout, &mut self.surface, self.width, self.height, self.scroll_x, self.scroll_y, &damages);
+            if !damages.is_empty() {
+                self.painted_epoch = self.layout_epoch;
+            }
         } else {
             for chunk in self.surface.chunks_exact_mut(4) {
                 chunk[0] = 255;

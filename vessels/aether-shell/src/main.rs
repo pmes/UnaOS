@@ -239,6 +239,17 @@ fn main() {
                                 SMessage::BrowserText(text) => {
                                     engine.handle_event(aether::api::events::Event::Text(text));
                                 }
+                                // AETHERSELECT (SR69): Ctrl/Cmd+C copies the page selection (innerText
+                                // serialization) to the platform clipboard through the chrome; Ctrl/Cmd+A
+                                // selects the document.
+                                SMessage::BrowserCopy => {
+                                    if let Some(set) = engine.copy_selection() {
+                                        engine_tx.fire(set);
+                                    }
+                                }
+                                SMessage::BrowserSelectAll => {
+                                    engine.select_all();
+                                }
                                 _ => {}
                             }
                             // A link click or form submit staged a navigation;

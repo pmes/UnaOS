@@ -332,6 +332,17 @@ define_class!(
             // Browser surface: keys are page input (focused field editing),
             // not viewer shortcuts.
             if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
+                // AETHERSELECT (SR69): Cmd+C copies the page selection (the engine answers with
+                // BrowserClipboardSet), Cmd+A selects the document. NSEventModifierFlagCommand = 1 << 20.
+                let flags: usize = unsafe { msg_send![event, modifierFlags] };
+                if flags & (1 << 20) != 0 {
+                    match text.as_str() {
+                        "c" | "C" => syn.fire(bandy::SMessage::BrowserCopy),
+                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll),
+                        _ => {}
+                    }
+                    return;
+                }
                 let mut it = text.chars();
                 match (it.next(), it.next()) {
                     (Some('\u{7f}'), None) | (Some('\u{8}'), None) => {
@@ -835,6 +846,19 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                             bound.get(mtm).set_frame(&pixels, &[], width, height);
                         });
                     }
+                }
+                // AETHERSELECT (SR69): the engine's copy lands on the general pasteboard as plain text.
+                Ok(bandy::SMessage::BrowserClipboardSet(text)) => {
+                    dispatch2::DispatchQueue::main().exec_async(move || unsafe {
+                        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+                        if pb.is_null() {
+                            return;
+                        }
+                        let _: isize = msg_send![pb, clearContents];
+                        let s = NSString::from_str(&text);
+                        let ty = NSString::from_str("public.utf8-plain-text");
+                        let _: bool = msg_send![pb, setString: &*s, forType: &*ty];
+                    });
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

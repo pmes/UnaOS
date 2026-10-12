@@ -34,6 +34,9 @@ struct Source {
     ledger: Option<String>,
     wait_ms: Option<u64>,
     timeout_s: Option<u64>,
+    /// `chromium` oracle: a script the page evaluates after load, before the screenshot (a selection
+    /// set by `document.getSelection().setBaseAndExtent(...)`, say). One line; tabs become spaces.
+    script: Option<String>,
 }
 
 impl Source {
@@ -51,6 +54,7 @@ impl Source {
             ledger: self.ledger.clone().or(base.ledger.clone()),
             wait_ms: self.wait_ms.or(base.wait_ms),
             timeout_s: self.timeout_s.or(base.timeout_s),
+            script: self.script.clone().or(base.script.clone()),
         }
     }
 }
@@ -280,7 +284,8 @@ fn run(suite_name: &str, args: &[String]) -> ExitCode {
                 if !fresh {
                     let _ = std::fs::remove_file(&refp);
                     let url = c.fill(c.oracle.url.as_deref().unwrap_or("{url}"));
-                    tsv.push_str(&format!("{url}\t{}\t{}\t{}\n", refp.display(), c.w, c.h));
+                    let script = c.oracle.script.as_deref().unwrap_or("").replace(['\t', '\n', '\r'], " ");
+                    tsv.push_str(&format!("{url}\t{}\t{}\t{}\t{script}\n", refp.display(), c.w, c.h));
                 }
             }
             Some("golden") => {

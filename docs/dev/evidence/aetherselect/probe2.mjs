@@ -1,0 +1,15 @@
+import { createRequire } from 'module';
+import { decode } from './png.mjs';
+const require = createRequire(import.meta.url);
+const { chromium } = require('/opt/node22/lib/node_modules/playwright');
+const browser = await chromium.launch({ args: ['--font-render-hinting=none','--disable-lcd-text','--force-device-scale-factor=1'] });
+const page = await browser.newPage({ viewport: { width: 400, height: 200 }, deviceScaleFactor: 1 });
+await page.setContent(process.argv[2]);
+await page.evaluate(process.argv[3]);
+const img = decode(await page.screenshot({path: process.argv[4]||'p.png'}));
+const col = +process.argv[5]||11;
+let s=''; for(let y=0;y<80;y++) s+=`${y}:${img.px(col,y).join(',')} `; console.log('col',col,s);
+const row = +process.argv[6]||20;
+s=''; for(let x=0;x<260;x++) s+=`${x}:${img.px(x,row).join(',')} `; console.log('row',row,s);
+console.log(await page.evaluate(()=>{const r=getSelection().getRangeAt(0).getClientRects();return JSON.stringify([...r].map(q=>[q.x,q.y,q.width,q.height]))}));
+await browser.close();

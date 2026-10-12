@@ -34,6 +34,22 @@ pub async fn render_headless_opts(
     width: u32,
     height: u32,
 ) -> anyhow::Result<(u32, u32, usize)> {
+    render_headless_select(url, html_file, out, ledger_path, scroll, width, height, None).await
+}
+
+/// `render_headless_opts` holding a selection (AETHERSELECT, SR69): `select = (x1, y1, x2, y2)` in
+/// viewport px is a press at (x1, y1), a drag to (x2, y2) and a release — the user's selection, painted.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_headless_select(
+    url: Option<&str>,
+    html_file: Option<&Path>,
+    out: &Path,
+    ledger_path: &Path,
+    scroll: f64,
+    width: u32,
+    height: u32,
+    select: Option<(f64, f64, f64, f64)>,
+) -> anyhow::Result<(u32, u32, usize)> {
     crate::ledger::reset();
     let mut engine = AetherEngine::new();
     engine.handle_event(crate::api::events::Event::Resize(width, height));
@@ -58,6 +74,13 @@ pub async fn render_headless_opts(
         engine.damage_rects.push((0, 0, engine.width, engine.height));
     }
     engine.render_frame();
+    if let Some((x1, y1, x2, y2)) = select {
+        engine.press_at(x1, y1, 1, false);
+        engine.pointer_moved(x2, y2);
+        engine.pointer_released();
+        engine.tick();
+        engine.render_frame();
+    }
 
     let (w, h) = (engine.width, engine.height);
     // The engine surface is BGRA (see render::draw_node); PNG wants RGBA.

@@ -41,18 +41,53 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
         }
     });
 
+    // AETHERSELECT (SR69): the page's copy and select-all. The viewport takes keyboard focus when
+    // pressed; Ctrl+C asks the engine for its selection (`BrowserCopy`, answered below with
+    // `BrowserClipboardSet`) and Ctrl+A selects the document (`BrowserSelectAll`).
+    drawing_area.set_focusable(true);
+    let press = gtk4::GestureClick::new();
+    let da_focus = drawing_area.clone();
+    press.connect_pressed(move |_, _, _, _| {
+        da_focus.grab_focus();
+    });
+    drawing_area.add_controller(press);
+    let keys = gtk4::EventControllerKey::new();
+    let key_syn = synapse.clone();
+    keys.connect_key_pressed(move |_, keyval, _code, mods| {
+        if !mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+            return gtk4::glib::Propagation::Proceed;
+        }
+        match keyval {
+            gtk4::gdk::Key::c | gtk4::gdk::Key::C => {
+                key_syn.fire(SMessage::BrowserCopy);
+                gtk4::glib::Propagation::Stop
+            }
+            gtk4::gdk::Key::a | gtk4::gdk::Key::A => {
+                key_syn.fire(SMessage::BrowserSelectAll);
+                gtk4::glib::Propagation::Stop
+            }
+            _ => gtk4::glib::Propagation::Proceed,
+        }
+    });
+    drawing_area.add_controller(keys);
+
     let da_clone = drawing_area.clone();
     let mut rx = synapse.subscribe();
     
     let target_id = id.to_string();
     gtk4::glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
-            if let SMessage::SurfaceBlit { url, width, height, pixels } = msg {
-                if url == target_id {
-                    *buffer.borrow_mut() = pixels;
-                    *dim.borrow_mut() = (width, height);
-                    da_clone.queue_draw();
+            match msg {
+                SMessage::SurfaceBlit { url, width, height, pixels } => {
+                    if url == target_id {
+                        *buffer.borrow_mut() = pixels;
+                        *dim.borrow_mut() = (width, height);
+                        da_clone.queue_draw();
+                    }
                 }
+                // The engine's answer to BrowserCopy: the display's clipboard.
+                SMessage::BrowserClipboardSet(text) => da_clone.clipboard().set_text(&text),
+                _ => {}
             }
         }
     });

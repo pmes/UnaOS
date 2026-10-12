@@ -169,6 +169,14 @@ pub enum SMessage {
     /// Fetched *after* the page is delivered, so it never delays a load; an
     /// absent or undecodable icon simply fires nothing.
     BrowserFaviconChanged { width: u32, height: u32, rgba: Vec<u8> },
+    /// Chrome → engine: copy the page's selection (Ctrl/Cmd+C on the viewport). The engine answers
+    /// with [`SMessage::BrowserClipboardSet`] when something is selected (AETHERSELECT, LEDGER SR69).
+    BrowserCopy,
+    /// Chrome → engine: select the document's contents (Ctrl/Cmd+A on the viewport).
+    BrowserSelectAll,
+    /// Engine → chrome: put `text` (the selection serialized per the HTML `innerText` algorithm) on
+    /// the platform clipboard.
+    BrowserClipboardSet(String),
 
     // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
     // A session is keyed by the media `url` the request named (the same string `PlayMedia`
