@@ -214,7 +214,7 @@ pub fn route(ev: &Event) -> RouteGuard {
         return RouteGuard(None, 0, false);
     }
     let now = now_us();
-    let r = render_here();
+    let r = render_here(); qs_probe_route(ev); // QUEUESLEEP (B512): the fixture's probe key is timed to its route
     if r {
         render_entry(now); seg_anchor(now, true); // INPUTSTALL M1: the previous event's handler ended here (INPUTSTALL2 M1: the route's first door is timed from here)
     }
@@ -630,7 +630,7 @@ fn render_here() -> bool {
 
 /// The render task started something new (a route, a pass) or parked: the handler interval closes.
 fn render_entry(now: u64) {
-    let ex = RENDER_EXIT_US.swap(0, Relaxed);
+    let ex = RENDER_EXIT_US.swap(0, Relaxed); RENDER_PARKED.store(false, Relaxed); // QUEUESLEEP (B512): the render task is off the channel
     if ex != 0 && now > ex {
         SEC_R_HANDLER_US.fetch_max(now - ex, Relaxed);
         boot_handler_note(now - ex); // SMALLFIX6 (B495): the boot's longest handler interval and when it ended
@@ -647,7 +647,7 @@ fn render_route_done(t0: u64, now: u64) {
 pub fn render_idle() {
     if ON {
         render_entry(now_us());
-        seg_anchor(0, false); // INPUTSTALL2 M1: the park is not a step
+        seg_anchor(0, false); RENDER_PARKED.store(true, Relaxed); // QUEUESLEEP (B512): parked on the channel. INPUTSTALL2 M1: the park is not a step
     }
 }
 
@@ -674,7 +674,7 @@ fn sec_event(kind: u8, d: &[u64; 5], split: Option<(u64, u64)>) {
     if kind == K_KEY {
         MIN_KEYQ_US.fetch_max(d[0], Relaxed);
     }
-    MIN_COMP_US.fetch_max(d[3], Relaxed);
+    MIN_COMP_US.fetch_max(d[3], Relaxed); QS_QUEUE_US.fetch_max(d[0], Relaxed); // QUEUESLEEP (B512): the fixture window's queue max
 }
 
 /// `wm::present` — a kernel surface asked for its pass. The first request inside an event's `comp`
@@ -790,7 +790,7 @@ fn sec_roll(now_ms: u64) {
         if i < 5 {
             let since = s.t[i].load(Relaxed);
             if since != 0 && nu > since {
-                st[i] = st[i].max(nu - since);
+                st[i] = st[i].max(nu - since); if i == 0 { QS_QUEUE_US.fetch_max(nu - since, Relaxed); } // QUEUESLEEP (B512): a key still in the queue counts while it sits
                 if i == 0 && c == C_KEY {
                     MIN_KEYQ_US.fetch_max(nu - since, Relaxed);
                 }
@@ -862,13 +862,13 @@ fn sec_roll(now_ms: u64) {
                 (ms_str(draw), ms_str(pre))
             };
             serial_println!(
-                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={} holder={} hold_ms={}",
+                "[lag] stall at_ms={} span_ms={} stage={} stage_ms={} queue={} wm={} app={} comp={} present={} draw={} pre={} render={} render_ms={} passes={} pass_ms_max={} rows={} full={} beam_ms={} beam_max_ms={} capped={} yielded={} valve={} hid_gap_ms={} strand={}/{} handler={} handler_ms={} pump={} pump_ms={} masked_ms={} holder={} hold_ms={}{}",
                 t0, now_ms.saturating_sub(t0), w_name, w_ms,
                 ms_str(st[0]), ms_str(st[1]), ms_str(st[2]), ms_str(st[3]), ms_str(st[4]), dw, pr,
                 ["route", "handler", "composite"][rw], ms_str(r[rw]),
                 passes, ms_str(pass_max), beam[3], beam[4], beam[0] / 1000, ms_str(beam[1]), beam[5], yields,
                 valve_word(), hid, strands, frames, seg_h, ms_str(seg_hu), seg_p, ms_str(seg_pu), masked,
-                crate::hidstall::HolderName(hold_ix), hold_ms
+                crate::hidstall::HolderName(hold_ix), hold_ms, QsField(w_name, masked) // QUEUESLEEP (B512): ` pump_what= pump_wait=` when the stage is pump or queue
             );
         }
     }
@@ -1031,7 +1031,7 @@ pub fn seg(id: u8) {
         return;
     }
     let now = now_us();
-    let last = SEG_LAST_US.swap(now, Relaxed);
+    let last = SEG_LAST_US.swap(now, Relaxed); RENDER_LAST_SEG.store(id, Relaxed); // QUEUESLEEP (B512): the render task's last finished step
     if last != 0 && now > last {
         SEC_SEG.fetch_max(((now - last) << 8) | id as u64, Relaxed);
         if id == S_CONSOLE {
@@ -1077,7 +1077,7 @@ pub fn pump_step_now() -> u8 {
 #[inline]
 pub fn pump_top() {
     if ON {
-        PUMP_LAST_US.store(now_us(), Relaxed);
+        let t = now_us(); PUMP_LAST_US.store(t, Relaxed); qs_nap_end(t); // QUEUESLEEP (B512): the nap that just ended, measured
         PUMP_CUR.store(P_XHCI, Relaxed);
     }
 }
@@ -1090,7 +1090,7 @@ pub fn pump_seg(id: u8) {
     }
     PUMP_CUR.store(pump_next(id), Relaxed);
     let now = now_us();
-    let last = PUMP_LAST_US.swap(now, Relaxed);
+    let last = PUMP_LAST_US.swap(now, Relaxed); qs_step(id, now, last); // QUEUESLEEP (B512): what the input waited on during this step
     if last != 0 && now > last {
         SEC_PUMP.fetch_max(((now - last) << 8) | id as u64, Relaxed);
     }
@@ -1105,7 +1105,7 @@ pub fn seg_unpack(w: u64, names: &[&'static str]) -> (&'static str, u64) {
 /// The second's two worst steps, taken (reset) at the roll: `(handler, handler_us, pump, pump_us)`.
 fn seg_take() -> (&'static str, u64, &'static str, u64) {
     let (h, hu) = seg_unpack(SEC_SEG.swap(0, Relaxed), &SEG_NAMES);
-    let (p, pu) = seg_unpack(SEC_PUMP.swap(0, Relaxed), &PUMP_NAMES);
+    let (p, pu) = qs_roll(seg_unpack(SEC_PUMP.swap(0, Relaxed), &PUMP_NAMES)); // QUEUESLEEP (B512): an overslept nap is a pump stall too; the second's waits are taken here
     (h, hu, p, pu)
 }
 
@@ -1137,4 +1137,278 @@ fn boot_handler_note(d_us: u64) {
 /// `tests smallfix6`: the boot's longest render-handler interval `(ms, end_ms)`.
 pub fn boot_handler_span() -> (u64, u64) {
     (BOOT_H_US.load(Relaxed) / 1000, BOOT_H_END_MS.load(Relaxed))
+}
+
+// ── QUEUESLEEP (rmbp-ledger B512, R103 §2): NAME what the input waited on ─────────────────────────────────────────────
+//
+// Flight 28, an idle desktop: `stage=pump stage_ms=28440 pump=selfhost`, `stage=queue stage_ms=3090` and `stage_ms=35413`,
+// and `span_ms=24156` gaps — and the line said WHICH step held the loop but not what the INPUT was waiting on while it did.
+// This section stamps every wait on the input path in one atomic each (HIDSTALL2's shape) and puts the answer on the
+// stall line, only when the stage is `pump` or `queue`: ` pump_what=<fn> pump_wait=<word>`.
+//
+// * `pump` — the second's longest `usb-pump` interval: a step ([`pump_seg`]) or the loop's nap ([`pump_nap`] →
+//   [`pump_top`], `pump_what=nap pump_wait=hlt` when the core did not give the loop back within the tick). For a step,
+//   `pump_wait` is what the xHCI INPUT poll did meanwhile: `run` (it kept polling elsewhere — the step held only the
+//   loop), `poll-gap` (no poll for an input interval, [`HID_INTERVAL_US`]) or `claim-busy` (the controller was on loan
+//   for that long, every retry refused).
+// * `queue` — a key or press is in the ring and not routed. `pump_what=input` with `pump_wait=app-gate` (a full-screen
+//   app owns the ring), or `hlt` (the input task has not come back from its nap); `pump_what=render@<last step>` with
+//   `channel-full` (the channel refused: the render task is not taking), `hlt` (parked on the channel, not woken),
+//   `lock` (off the channel in the second an IRQ-masked UnaFS span passed the bound) or `handler` (off the channel,
+//   inside the step after the one named).
+//
+// `tests queuesleep` (crate::queuesleep) reads the same stamps over a 30 s idle window. R80: the stamps are atomics on
+// paths that already run; nothing here prints at boot.
+
+/// `pump_wait=` words, indexed by the `W_*` codes.
+pub const WAIT_NAMES: [&str; 9] = ["-", "hlt", "lock", "poll-gap", "claim-busy", "app-gate", "channel-full", "handler", "run"];
+pub const W_NONE: u8 = 0;
+pub const W_HLT: u8 = 1;
+pub const W_LOCK: u8 = 2;
+pub const W_POLLGAP: u8 = 3;
+pub const W_CLAIM: u8 = 4;
+pub const W_APPGATE: u8 = 5;
+pub const W_CHANFULL: u8 = 6;
+pub const W_HANDLER: u8 = 7;
+pub const W_RUN: u8 = 8;
+/// One HID input interval (a boot mouse's / keyboard's 8 ms `bInterval`): the longest the xHCI input poll may wait.
+pub const HID_INTERVAL_US: u64 = 8_000;
+/// The `usb-pump` loop's nap, as a step id (beyond [`PUMP_NAMES`]).
+const STEP_NAP: u8 = 0xFE;
+/// The input task's stamp older than this means it has not come back from its nap.
+const INPUT_STALE_MS: u64 = 50;
+/// The fixture's probe: a `KeyUp` with this payload (no key carries it; every consumer ignores a `KeyUp`).
+pub const PROBE_KEY: u8 = 0;
+
+static RENDER_PARKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static RENDER_LAST_SEG: AtomicU8 = AtomicU8::new(0);
+static NAP_T0_US: AtomicU64 = AtomicU64::new(0);
+static XPOLL_LAST_US: AtomicU64 = AtomicU64::new(0);
+static XBUSY_SINCE_US: AtomicU64 = AtomicU64::new(0);
+/// The input task's last stamp: `ms << 8 | W_*`.
+static INPUT_WAIT: AtomicU64 = AtomicU64::new(0);
+/// The second's worst pump interval, packed by [`qs_pack`]; taken at the roll into [`ROLL_PWAIT`] for the line.
+static SEC_PWAIT: AtomicU64 = AtomicU64::new(0);
+static ROLL_PWAIT: AtomicU64 = AtomicU64::new(0);
+// The fixture's window (reset by `qs_window_reset`).
+static QS_PUMP: AtomicU64 = AtomicU64::new(0);
+static QS_QUEUE_US: AtomicU64 = AtomicU64::new(0);
+static QS_XGAP_US: AtomicU64 = AtomicU64::new(0);
+static QS_BUSY: AtomicU32 = AtomicU32::new(0);
+static QS_NAP_US: AtomicU64 = AtomicU64::new(0);
+static PROBE_T0_US: AtomicU64 = AtomicU64::new(0);
+static PROBE_DONE_US: AtomicU64 = AtomicU64::new(0);
+
+/// `us << 16 | step << 8 | code` — the longest interval wins a `fetch_max`, and its step and wait travel with it. Pure.
+pub fn qs_pack(us: u64, step: u8, code: u8) -> u64 {
+    (us.min(u64::MAX >> 16) << 16) | ((step as u64) << 8) | code as u64
+}
+
+/// `(us, step, code)` from [`qs_pack`]. Pure.
+pub fn qs_unpack(w: u64) -> (u64, u8, u8) {
+    (w >> 16, ((w >> 8) & 0xff) as u8, (w & 0xff) as u8)
+}
+
+/// A pump step id as the line names it (`nap` for the loop's nap). Pure.
+pub fn qs_step_name(step: u8) -> &'static str {
+    if step == STEP_NAP { "nap" } else { PUMP_NAMES.get(step as usize).copied().unwrap_or("-") }
+}
+
+/// A `W_*` code's word. Pure.
+pub fn wait_name(code: u8) -> &'static str {
+    WAIT_NAMES.get(code as usize).copied().unwrap_or("-")
+}
+
+/// What a pump step's input poll did, from the poll gap and the Busy streak at the step's end. Pure.
+pub fn qs_step_wait(xgap_us: u64, busy_us: u64) -> u8 {
+    if xgap_us < HID_INTERVAL_US {
+        W_RUN
+    } else if busy_us >= HID_INTERVAL_US {
+        W_CLAIM
+    } else {
+        W_POLLGAP
+    }
+}
+
+/// Where a key sits when it is not routed, from the input task's and the render task's stamps. Pure.
+/// `input` = the input task's last `W_*`, `stale` = that stamp is older than [`INPUT_STALE_MS`].
+/// Returns `(render?, code)`: `false` names the input task, `true` the render task.
+pub fn qs_queue_wait(input: u8, stale: bool, parked: bool, masked_ms: u64) -> (bool, u8) {
+    if input == W_APPGATE {
+        (false, W_APPGATE)
+    } else if stale {
+        (false, W_HLT)
+    } else if input == W_CHANFULL {
+        (true, W_CHANFULL)
+    } else if parked {
+        (true, W_HLT)
+    } else if masked_ms >= STALL_MS {
+        (true, W_LOCK)
+    } else {
+        (true, W_HANDLER)
+    }
+}
+
+/// The `usb-pump` loop is about to nap (`main.rs`'s `usb_pump`, before `sleep_ticks(1)`).
+#[inline]
+pub fn pump_nap() {
+    if ON {
+        NAP_T0_US.store(now_us(), Relaxed);
+    }
+}
+
+fn qs_nap_end(t: u64) {
+    let t0 = NAP_T0_US.swap(0, Relaxed);
+    if t0 != 0 && t > t0 {
+        let w = qs_pack(t - t0, STEP_NAP, W_HLT);
+        QS_NAP_US.fetch_max(t - t0, Relaxed);
+        SEC_PWAIT.fetch_max(w, Relaxed);
+        QS_PUMP.fetch_max(w, Relaxed);
+    }
+}
+
+fn qs_step(id: u8, now: u64, last: u64) {
+    if last == 0 || now <= last {
+        return;
+    }
+    let xl = XPOLL_LAST_US.load(Relaxed);
+    let xgap = if xl == 0 { 0 } else { now.saturating_sub(xl) };
+    let bs = XBUSY_SINCE_US.load(Relaxed);
+    let busy = if bs == 0 { 0 } else { now.saturating_sub(bs) };
+    let w = qs_pack(now - last, id, qs_step_wait(xgap, busy));
+    SEC_PWAIT.fetch_max(w, Relaxed);
+    QS_PUMP.fetch_max(w, Relaxed);
+}
+
+/// A successful xHCI event poll (the `usb-pump`'s, the `xhci-poll` task's, a full-screen app's `pump_and_poll`).
+#[inline]
+pub fn xhci_polled() {
+    if !ON {
+        return;
+    }
+    let now = now_us();
+    let prev = XPOLL_LAST_US.swap(now, Relaxed);
+    if prev != 0 && now > prev {
+        QS_XGAP_US.fetch_max(now - prev, Relaxed);
+    }
+    XBUSY_SINCE_US.store(0, Relaxed);
+}
+
+/// An xHCI claim refused `Busy` (the controller is on loan to another context).
+#[inline]
+pub fn xhci_busy() {
+    if ON {
+        let _ = XBUSY_SINCE_US.compare_exchange(0, now_us().max(1), Relaxed, Relaxed);
+        QS_BUSY.fetch_add(1, Relaxed);
+    }
+}
+
+/// The input task's state at the end of its pass (`main.rs`'s `input_service`): `W_APPGATE`, `W_CHANFULL` or `W_HLT`.
+#[inline]
+pub fn input_wait(code: u8) {
+    if ON {
+        INPUT_WAIT.store(crate::arch::ms() << 8 | code as u64, Relaxed);
+    }
+}
+
+/// The roll's pump word: an overslept nap longer than every step is the second's pump interval. Takes the second's waits.
+fn qs_roll(step: (&'static str, u64)) -> (&'static str, u64) {
+    let w = SEC_PWAIT.swap(0, Relaxed);
+    ROLL_PWAIT.store(w, Relaxed);
+    let (us, s, _) = qs_unpack(w);
+    if s == STEP_NAP && us > step.1 { ("nap", us) } else { step }
+}
+
+/// The queue's word now: `(what, wait)` — `input` or `render@<last step>`.
+pub fn qs_queue_word(masked_ms: u64) -> (alloc::string::String, &'static str) {
+    let iw = INPUT_WAIT.load(Relaxed);
+    let stale = iw != 0 && crate::arch::ms().saturating_sub(iw >> 8) > INPUT_STALE_MS;
+    let (render, code) = qs_queue_wait((iw & 0xff) as u8, stale, RENDER_PARKED.load(Relaxed), masked_ms);
+    let what = if render {
+        alloc::format!("render@{}", SEG_NAMES.get(RENDER_LAST_SEG.load(Relaxed) as usize).copied().unwrap_or("-"))
+    } else {
+        alloc::string::String::from("input")
+    };
+    (what, wait_name(code))
+}
+
+/// The stall line's QUEUESLEEP field: ` pump_what=<fn> pump_wait=<word>` for a `pump` or `queue` stage, empty otherwise.
+struct QsField(&'static str, u64);
+impl core::fmt::Display for QsField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            "pump" => {
+                let (_, s, c) = qs_unpack(ROLL_PWAIT.load(Relaxed));
+                write!(f, " pump_what={} pump_wait={}", qs_step_name(s), wait_name(c))
+            }
+            "queue" => {
+                let (what, wait) = qs_queue_word(self.1);
+                write!(f, " pump_what={} pump_wait={}", what, wait)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// `route`'s probe check: the fixture's `KeyUp(PROBE_KEY)` reached the router.
+#[inline]
+fn qs_probe_route(ev: &Event) {
+    if matches!(ev, Event::KeyUp(k) if *k == PROBE_KEY) && PROBE_T0_US.load(Relaxed) != 0 {
+        let _ = PROBE_DONE_US.compare_exchange(0, now_us().max(1), Relaxed, Relaxed);
+    }
+}
+
+/// Is the instrument live (x86 + `wc`)?
+pub fn qs_on() -> bool {
+    ON
+}
+
+/// The fixture's window starts: every window maximum is reset.
+pub fn qs_window_reset() {
+    for a in [&QS_PUMP, &QS_QUEUE_US, &QS_XGAP_US, &QS_NAP_US] {
+        a.store(0, Relaxed);
+    }
+    QS_BUSY.store(0, Relaxed);
+}
+
+/// The window so far: `(pump packed, queue_us, xhci poll gap max us, busy claims, nap max us)`.
+pub fn qs_window() -> (u64, u64, u64, u32, u64) {
+    (QS_PUMP.load(Relaxed), QS_QUEUE_US.load(Relaxed), QS_XGAP_US.load(Relaxed), QS_BUSY.load(Relaxed), QS_NAP_US.load(Relaxed))
+}
+
+/// The oldest key or press still in the queue right now, in us (0 = none) — the in-flight charge, without a roll.
+pub fn qs_queue_now_us() -> u64 {
+    let nu = now_us();
+    let mut m = 0;
+    for s in &SLOTS {
+        if s.stage.load(Acquire) == ISR {
+            let t = s.t[0].load(Relaxed);
+            if t != 0 && nu > t {
+                m = m.max(nu - t);
+            }
+        }
+    }
+    m
+}
+
+/// Arm the probe at `now_us`: the next `KeyUp(PROBE_KEY)` the router takes is timed from here.
+pub fn qs_probe_arm() -> u64 {
+    PROBE_DONE_US.store(0, Relaxed);
+    let t = now_us().max(1);
+    PROBE_T0_US.store(t, Relaxed);
+    t
+}
+
+/// The probe's route stamp (0 = not yet); disarms when read non-zero.
+pub fn qs_probe_done() -> u64 {
+    let d = PROBE_DONE_US.load(Relaxed);
+    if d != 0 {
+        PROBE_T0_US.store(0, Relaxed);
+    }
+    d
+}
+
+/// The microsecond clock the stamps use.
+pub fn qs_now_us() -> u64 {
+    now_us()
 }

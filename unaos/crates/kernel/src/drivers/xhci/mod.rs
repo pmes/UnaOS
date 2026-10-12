@@ -17785,3 +17785,47 @@ impl XhciController {
 fn hubwit_is_net(slot: u8) -> bool { usbnet::is_link_slot(slot) }
 #[cfg(not(feature = "usbnet"))]
 fn hubwit_is_net(_slot: u8) -> bool { false }
+
+// ── QUEUESLEEP (rmbp-ledger B512, R103 §2): the xHCI INPUT poll never waits on a `usb-pump` step ─────────────────────
+//
+// Flight 28 (f28-boot1.log 12:21:11Z): `stage=pump stage_ms=28440 pump=selfhost` — a 28 s one-shot ran INLINE on the
+// `usb-pump` loop, and that loop was the only context that polled the xHCI event ring, so every xHCI-borne key, click
+// and serial-door byte waited behind it. The x86 MSI-X goes to the BSP and its handler only acks (lock-free by design,
+// `xhci_msi_handler`), so nothing but a poll ever drains the ring. The EHCI pass got its own task in INPUTSTALL2 M2
+// (`ehci::hid_task_start`); this is the xHCI twin: a task that polls the event ring every tick and, on a `Busy` claim (the
+// controller on loan to the pump's storage chain or a full-screen app), retries on the NEXT tick — never the next
+// unrelated pass. Both input controllers are now polled at the 1 kHz tick by a task no service step can hold. The
+// pump keeps its own poll (the services that follow it need the drained events in the same pass).
+
+/// `claim`, with a refusal stamped for the stall line (`pump_wait=claim-busy`).
+pub fn claim_noted() -> Result<XhciLoan, XhciClaimError> {
+    let r = claim();
+    if matches!(r, Err(XhciClaimError::Busy)) {
+        crate::video::lag::xhci_busy();
+    }
+    r
+}
+
+#[cfg(target_arch = "x86_64")]
+static POLL_TASK: AtomicBool = AtomicBool::new(false);
+
+/// Start the `xhci-poll` task on `cpu` (the `usb-pump`'s core, beside `hid-pump`), once.
+#[cfg(target_arch = "x86_64")]
+pub fn poll_task_start(cpu: usize) {
+    if POLL_TASK.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::arch::sched::spawn("xhci-poll", poll_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    crate::bootlog_println!("[qsleep] xhci-poll task cpu={} cadence=1tick busy_retry=1tick (QUEUESLEEP: the xHCI input poll never waits on a usb-pump step)", cpu);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn poll_task(_: usize) {
+    loop {
+        crate::arch::sched::sleep_ticks(1);
+        if let Ok(mut x) = claim_noted() {
+            x.poll_events();
+            crate::video::lag::xhci_polled();
+        }
+    }
+}

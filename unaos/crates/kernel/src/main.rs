@@ -5878,11 +5878,11 @@ fn x86_typematic_pump() {
 /// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
 #[cfg(target_arch = "x86_64")]
 fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi body above; `usb_pump` is gone.
-    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); // INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
+    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); unaos_kernel::drivers::xhci::poll_task_start(cpu); // QUEUESLEEP (B512): the xHCI input poll gets its own task too, so no step of this loop can hold an xHCI key, click or serial-door byte.  INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
-        unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); // INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
+        unaos_kernel::video::lag::pump_nap(); unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); // QUEUESLEEP (B512): the nap is measured (`pump_what=nap pump_wait=hlt` when the core kept the loop past the tick).  INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
         // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
         // safe non-event context).
         //
@@ -5893,9 +5893,9 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // family). A failed `claim()` means another context holds the loan, or the controller is not
         // installed yet; either way this pass skips, exactly as the old `if let Some` did on an
         // empty slot.
-        if let Ok(mut loan) = unaos_kernel::drivers::xhci::claim() {
+        if let Ok(mut loan) = unaos_kernel::drivers::xhci::claim_noted() { // QUEUESLEEP (B512): a Busy refusal is stamped (`pump_wait=claim-busy`); the xhci-poll task retries it next tick
             let xhci = &mut *loan;
-            xhci.poll_events();
+            xhci.poll_events(); unaos_kernel::video::lag::xhci_polled(); // QUEUESLEEP (B512): the poll gap is measured
             // BOOTPACE M2 — CONSOLE-FIRST: `service_ftdi` ahead of `service_storage`, so the console
             // is armed before the deferred SCSI bring-up puts its multi-second chain on the wire.
             xhci.service_ftdi();
@@ -6210,7 +6210,7 @@ fn input_service(cpu: usize) { // ONEOS5 (R16, SR21): ONE name, two cfg-EXCLUSIV
                 }
             }
         }
-        unaos_kernel::arch::sched::sleep_ticks(1); // ~1 ms at the calibrated 1 kHz tick
+        unaos_kernel::video::lag::input_wait(if SCREEN_APP_ACTIVE.load(Ordering::Relaxed) { unaos_kernel::video::lag::W_APPGATE } else if owed_event.is_some() || owed_motion.is_some() { unaos_kernel::video::lag::W_CHANFULL } else { unaos_kernel::video::lag::W_HLT }); unaos_kernel::arch::sched::sleep_ticks(1); // QUEUESLEEP (B512): where a waiting key sits, stamped before the nap. ~1 ms at the calibrated 1 kHz tick
     }
 }
 
