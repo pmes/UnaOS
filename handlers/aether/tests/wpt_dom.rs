@@ -88,6 +88,7 @@ fn locate() -> Option<PathBuf> {
         }
     }
     let t = target_dir().join("wpt");
+    let git = |args: &[&str]| Command::new("git").arg("-C").arg(&t).args(args).status().map(|s| s.success()).unwrap_or(false);
     // A checkout made by an earlier runner lacks the SR72 directories or the AETHERNET ones: widen it in place.
     if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() && (!t.join("html/webappapis").is_dir() || !NET_DIRS.iter().all(|d| t.join(d).is_dir())) {
         let _ = std::fs::write(t.join(".git/info/sparse-checkout"), SPARSE);
@@ -486,6 +487,8 @@ fn wpt_html_semantics_forms() {
 fn wpt_html_webappapis() {
     let (d, r) = dir_entry("html/webappapis");
     floor(d, r, 0);
+}
+
 // =================================================================================================
 // AETHERNET (SR70): websockets/, eventsource/, xhr/ through the wptserve stand-in (`wpt_net`)
 // =================================================================================================
