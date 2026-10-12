@@ -17,15 +17,17 @@
 //! needed to open a file (a FAT root, a card before its first login): the registrants answer from the compiled-in
 //! resources and the source says `registrant`.
 //!
-//! **Built at LOGIN** (R93: the desktop is built at login; R80: nothing at boot): `login ok` owes [`build`], the
-//! x86 device-service pass runs it ([`service`]; elsewhere inline) — every known type's object created in its OWN
+//! **Owed at LOGIN, built AFTER THE BAR** (R93; R80: nothing at boot; FILETYPES2 B513): `login ok` reads the stamp
+//! ([`owe`]) and builds nothing — a match publishes the stored registry, a miss leaves it unpublished (the resolver
+//! answers from the facts) and the `jobs-scan` worker builds it after the bar ([`build_owed`]; the device-service
+//! pass [`service`] when no worker took it; inline off x86), publishing it with one store when done — every known type's object created in its OWN
 //! bounded transaction (REGISTRYCHUNK B508: per object, the task yielding between), a present object's MISSING keys filled, a present key never overwritten (the user's amendment
 //! sticks). Known types = [`TYPE_FACTS`] ∪ every type a registrant declares ∪ what the directory already holds.
 //! Descriptions and glyphs are type FACTS (Be's MIME database shipped them); extensions are
 //! `filetype::EXT_TABLE`'s, listed.
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use crate::fs::appres::{self, Registrant};
 use crate::fs::filetype as ft;
@@ -107,6 +109,16 @@ fn str_attr(mt: &MountTable, path: &str, key: &str) -> Option<String> {
     }
 }
 
+/// FILETYPES2 (B513): `key` on `mime`'s registry object — only while the registry is PUBLISHED ([`registry_readable`]);
+/// `None` while the login found no current stamp and the worker's build has not swapped in (the resolver then answers
+/// from the type facts, the extension table and the registrants: the empty-but-valid registry).
+fn reg_attr(mt: &MountTable, mime: &str, key: &str) -> Option<String> {
+    if !registry_readable() {
+        return None;
+    }
+    str_attr(mt, &object_path(mime), key)
+}
+
 /// The registrants of `mime` (built-ins by their resources, then APPRES's ring-3 programs).
 pub fn registrants_in(mt: &MountTable, mime: &str) -> Vec<Registrant> {
     appres::registrants(mt, mime, &object_path(mime))
@@ -125,7 +137,7 @@ pub fn opener_for_in(mt: &MountTable, path: &str, mime: &str) -> (String, &'stat
             }
         }
     }
-    if let Some(v) = str_attr(mt, &obj, PREFERRED_KEY) {
+    if let Some(v) = reg_attr(mt, mime, PREFERRED_KEY) { // FILETYPES2 (B513): the published registry only
         let op = appres::opener_of_preferred(mt, &v);
         if !crate::fs::apptrust::is_foreign(mt, &op) { return (op, "db"); } // APPTRUST (B467): the registry's choice never names a program off the system volume
     }
@@ -142,21 +154,21 @@ pub fn opener_for(path: &str, mime: &str) -> (String, &'static str) {
 
 /// The type's description (`una:description` from the registry, else the facts row, else the MIME string).
 pub fn name_of_in(mt: &MountTable, mime: &str) -> String {
-    str_attr(mt, &object_path(mime), DESCRIPTION_KEY)
+    reg_attr(mt, mime, DESCRIPTION_KEY)
         .or_else(|| facts(mime).map(|r| String::from(r.2)))
         .unwrap_or_else(|| String::from(mime))
 }
 
 /// The type's icon glyph name, same order as [`name_of_in`].
 pub fn icon_of_in(mt: &MountTable, mime: &str) -> String {
-    str_attr(mt, &object_path(mime), ICON_KEY)
+    reg_attr(mt, mime, ICON_KEY)
         .or_else(|| facts(mime).map(|r| String::from(r.1)))
         .unwrap_or_else(|| String::from("file"))
 }
 
 /// The type's extensions (the registry's `una:extensions`, else the extension table's).
 pub fn extensions_in(mt: &MountTable, mime: &str) -> String {
-    str_attr(mt, &object_path(mime), EXTENSIONS_KEY).unwrap_or_else(|| extensions_of(mime))
+    reg_attr(mt, mime, EXTENSIONS_KEY).unwrap_or_else(|| extensions_of(mime))
 }
 
 /// Does the root volume take attributes (the registry can live there)?
@@ -190,17 +202,58 @@ pub fn known_types_in(mt: &MountTable) -> Vec<String> {
 /// The four keys a type's object carries, as built (the preferred one only when something declares the type).
 /// `exists = false` (REGISTRYCHUNK B508: the object is not there yet) reads no attribute — the
 /// built-in registrants only, which is all an absent object could name.
-fn keys_for_obj(mt: &MountTable, mime: &str, exists: bool) -> Vec<(String, AttrValue)> {
+///
+/// FILETYPES2 (B513): a type with no extension in the table (`inode/directory`, `application/octet-stream`,
+/// `audio/opus`) carries NO `una:extensions` key — an empty one read as missing to the fill below, so every full build
+/// re-wrote those three objects (flight 28: `built at=tests … created=0 filled=3`). A type only a ring-3 program
+/// declares names that program (`sigs`: its signature object's signature and path) — the built-ins alone named
+/// nobody, so the object stayed without `una:preferred` and SMALLFIX5's sighting invalidated the stamp on every boot.
+fn keys_for_obj(mt: &MountTable, mime: &str, exists: bool, sigs: &[SigDecl]) -> Vec<(String, AttrValue)> {
     let mut kv = alloc::vec![
         (String::from(DESCRIPTION_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.2)).unwrap_or_else(|| String::from(mime)))),
-        (String::from(EXTENSIONS_KEY), AttrValue::Str(extensions_of(mime))),
         (String::from(ICON_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.1)).unwrap_or_else(|| String::from("file")))),
     ];
+    let ext = extensions_of(mime);
+    if !ext.is_empty() {
+        kv.push((String::from(EXTENSIONS_KEY), AttrValue::Str(ext)));
+    }
     let regs = if exists { registrants_in(mt, mime) } else { appres::builtin_registrants(mime) };
     if let Some(r) = regs.into_iter().next() {
         kv.push((String::from(PREFERRED_KEY), AttrValue::Str(r.preferred_value())));
+    } else if let Some(d) = sigs.iter().find(|d| d.types.iter().any(|t| t == mime)) {
+        kv.push((String::from(PREFERRED_KEY), AttrValue::Str(d.sig.clone())));
+        if !d.path.is_empty() {
+            kv.push((String::from(appres::KEY_APPS), AttrValue::Str(d.path.clone())));
+        }
     }
     kv
+}
+
+/// A ring-3 program's signature object in [`TYPES_DIR`]: its signature, its root path (empty when foreign or
+/// unrecorded) and the doc types it declares that the stamp does not cover.
+pub struct SigDecl {
+    pub sig: String,
+    pub path: String,
+    pub types: Vec<String>,
+}
+
+/// Every signature object's uncovered declared types (one listing, one or two attribute reads per signature object;
+/// full builds only).
+fn sig_decls(mt: &MountTable) -> Vec<SigDecl> {
+    let mut out = Vec::new();
+    if let Ok(ents) = mt.read_dir(TYPES_DIR) {
+        for e in ents.iter().filter(|e| e.name.starts_with("application-x-vnd.")) {
+            let obj = alloc::format!("{}/{}", TYPES_DIR, e.name);
+            let decl: Vec<String> = str_attr(mt, &obj, midden_core::RES_KEY_DOCTYPES).unwrap_or_default().lines().map(String::from).collect();
+            let types = uncovered_types(&decl);
+            if types.is_empty() {
+                continue;
+            }
+            let path = str_attr(mt, &obj, appres::KEY_APP_PATH).filter(|p| !crate::fs::apptrust::is_foreign(mt, p)).unwrap_or_default();
+            out.push(SigDecl { sig: String::from(&e.name["application-x-vnd.".len()..]), path, types });
+        }
+    }
+    out
 }
 
 /// Build the registry: `/system`, `/system/filetypes`, every known type's object that does not exist yet (one
@@ -212,15 +265,7 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
         return Err(VfsError::Unsupported);
     }
     let k = KERNEL_PRINCIPAL;
-    for d in ["/system", TYPES_DIR] {
-        match mt.stat(d) {
-            Ok(s) if matches!(s.kind, NodeKind::Dir) => {}
-            Ok(_) => return Err(VfsError::NotADirectory),
-            Err(_) => {
-                mt.create(d, NodeKind::Dir, k)?;
-            }
-        }
-    }
+    ensure_dirs(mt)?;
     // REGISTRYCHUNK (B508): PER OBJECT. Presence from ONE listing of the directory (no `stat` miss per type); each
     // missing type is its own one-object batch (one bounded transaction, one root flip), each present type its own
     // `set_attrs` — no 30-object masked hold. On x86 the caller's task yields between objects (interrupts and the
@@ -229,12 +274,13 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
     let scoped = crate::fs::bootstep::scope_word() != "global";
     let sio = || if scoped { crate::fs::bootstep::scope_io() } else { crate::fs::bootstep::io() };
     let (mut made, mut filled) = (0usize, 0usize);
+    let sigs = sig_decls(mt); // FILETYPES2 (B513): who declares the uncovered types (their objects name that program)
     for mime in seed_types_in(mt) { // SMALLFIX5 (B480): + the types only a ring-3 program's signature object declares
         let (t0, io0) = (crate::arch::ms(), sio());
         let obj = object_path(&mime);
         let leaf = String::from(&obj[TYPES_DIR.len() + 1..]);
         let exists = present.iter().any(|n| *n == leaf);
-        let want = keys_for_obj(mt, &mime, exists);
+        let want = keys_for_obj(mt, &mime, exists, &sigs);
         let (mut m1, mut f1) = (0usize, 0usize);
         if !exists {
             match mt.create_files_batch(TYPES_DIR, alloc::vec![(leaf, want.clone())], k) {
@@ -277,6 +323,20 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
     Ok((made, filled))
 }
 
+/// `/system` and [`TYPES_DIR`], created when absent.
+fn ensure_dirs(mt: &MountTable) -> Result<(), VfsError> {
+    for d in ["/system", TYPES_DIR] {
+        match mt.stat(d) {
+            Ok(s) if matches!(s.kind, NodeKind::Dir) => {}
+            Ok(_) => return Err(VfsError::NotADirectory),
+            Err(_) => {
+                mt.create(d, NodeKind::Dir, KERNEL_PRINCIPAL)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 static BUILDS: AtomicUsize = AtomicUsize::new(0);
 static OWED: AtomicBool = AtomicBool::new(false);
 
@@ -291,26 +351,65 @@ pub fn build(why: &str) -> usize {
     build_stamped(why, why == "tests").0
 }
 
-/// `login ok` (`login::close_into_session`): the registry is owed. On x86 with the compositor the device-service
-/// pass builds it ([`service`]) — VFS work never runs in the click router; elsewhere it builds inline.
+/// `login ok` (`login::close_into_session`, video/login.rs:761). FILETYPES2 (B513): the login BUILDS NOTHING — it
+/// reads the registry's stamp (ONE attribute read on [`TYPES_DIR`]). A match publishes the stored registry
+/// (`login=stamp`); a miss (absent, stale or invalidated) leaves the registry UNPUBLISHED — the resolver answers
+/// from the facts, the extension table and the registrants — and owes the full build: on x86 with the compositor
+/// the `jobs-scan` worker runs it after the bar ([`build_owed`]; the device-service pass when no worker took it,
+/// still after the bar); elsewhere it builds inline (said `login=full`). One line:
+/// `[filetypes] login=<stamp|none|full> stamp=<match|stale|absent> blocks_read= ms= owed=<no|after-bar|inline>`.
 pub fn owe() {
+    let (state, blocks, ms) = login_read(&crate::shell::vfs_mount_table());
+    if state == "match" {
+        REG.store(REG_LIVE, Ordering::Release);
+        note_login(LOGIN_STAMP, ms, blocks);
+        serial_println!("[filetypes] login=stamp stamp=match blocks_read={} ms={} owed=no", blocks, ms);
+        return;
+    }
+    REG.store(REG_NONE, Ordering::Release);
+    BUILD_STATE.store(BUILD_PENDING, Ordering::Release);
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    OWED.store(true, Ordering::Release);
+    {
+        note_login(LOGIN_NONE, ms, blocks);
+        serial_println!("[filetypes] login=none stamp={} blocks_read={} ms={} owed=after-bar", state, blocks, ms);
+        OWED.store(true, Ordering::Release);
+    }
     #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
-    build("login");
-}
-
-/// The device-service pass: one relaxed load when nothing is owed.
-pub fn service() {
-    if OWED.load(Ordering::Acquire) && !TAKEN.load(Ordering::Acquire) && bar_first() && OWED.swap(false, Ordering::AcqRel) { // JOBSCAN (B497): the bar first; the jobs worker builds it when it took it
-        build("login");
+    {
+        serial_println!("[filetypes] login=full stamp={} blocks_read={} ms={} owed=inline", state, blocks, ms);
+        build_stamped("login", true);
     }
 }
 
-/// Build once per boot unless a login already did (the verbs and fixtures ask before they read).
+/// The login's read of the stamp: `(match|stale|absent, blocks_read, ms)` — ONE attribute read, nothing published.
+/// Why THIS key: the stamp hashes everything `seed_in` derives an object from (the type facts, the extension table,
+/// every built-in's resource block), and the one input outside the hash (a ring-3 program's own doc type) replaces
+/// it when sighted unfilled (SMALLFIX5). The volume's commit generation moves on every commit (the login itself
+/// writes the seat store and the home), so keyed on it the registry would rebuild on every boot; the apps folder's
+/// count/mtime moves on every program install whether or not it declares a type, and SMALLFIX5 already covers the
+/// install that does.
+pub fn login_read(mt: &MountTable) -> (&'static str, u64, u64) {
+    let (t0, io0) = (crate::arch::ms(), crate::fs::bootstep::io());
+    let have = stamp_on_disk(mt);
+    let want = stamp_now();
+    let state = match &have { Some(h) if *h == want => "match", Some(_) => "stale", None => "absent" };
+    (state, crate::fs::bootstep::io().since(io0).blocks_read(), crate::arch::ms().saturating_sub(t0))
+}
+
+/// The device-service pass: one relaxed load when nothing is owed. Builds only when the `jobs-scan` worker did
+/// not take the build, and only after the bar.
+pub fn service() {
+    if OWED.load(Ordering::Acquire) && !TAKEN.load(Ordering::Acquire) && bar_first() && OWED.swap(false, Ordering::AcqRel) { // JOBSCAN (B497): the bar first; the jobs worker builds it when it took it
+        build_stamped("service", false);
+    }
+}
+
+/// Build once per boot unless a login already did (the verbs and fixtures ask before they read). FILETYPES2
+/// (B513): once the login has read the stamp nothing here builds — the registry is published, or the worker's
+/// build is owed (a verb never runs a second, concurrent build).
 pub fn seed_once() -> usize {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::AcqRel) || builds() > 0 {
+    if DONE.swap(true, Ordering::AcqRel) || builds() > 0 || REG.load(Ordering::Acquire) != REG_UNKNOWN {
         return 0;
     }
     build("verb")
@@ -324,8 +423,10 @@ pub fn set_preferred_in(mt: &MountTable, mime: &str, v: &str) -> Result<String, 
     }
     let obj = object_path(mime);
     if mt.stat(&obj).is_err() {
-        let _ = seed_in(mt);
-        if mt.stat(&obj).is_err() {
+        // FILETYPES2 (B513): ONE object, never the whole build (a click on the File Types pane is not the registry build).
+        ensure_dirs(mt)?;
+        let leaf = String::from(&obj[TYPES_DIR.len() + 1..]);
+        if !matches!(mt.create_files_batch(TYPES_DIR, alloc::vec![(leaf, keys_for_obj(mt, mime, false, &[]))], KERNEL_PRINCIPAL), Ok(1)) && mt.stat(&obj).is_err() {
             mt.create(&obj, NodeKind::File, KERNEL_PRINCIPAL)?;
         }
     }
@@ -409,7 +510,7 @@ fn rows_in(mt: &MountTable) -> Vec<TypeRow> {
         .into_iter()
         .map(|mime| {
             let regs = registrants_in(mt, &mime);
-            let preferred = str_attr(mt, &object_path(&mime), PREFERRED_KEY).or_else(|| regs.first().map(|r| r.preferred_value())).unwrap_or_default();
+            let preferred = reg_attr(mt, &mime, PREFERRED_KEY).or_else(|| regs.first().map(|r| r.preferred_value())).unwrap_or_default();
             let op = appres::opener_of_preferred(mt, &preferred);
             let preferred_name = regs.iter().find(|r| r.opener == op).map(|r| r.name.clone()).unwrap_or_else(|| preferred.clone());
             TypeRow {
@@ -464,14 +565,18 @@ pub fn view_service() -> bool {
 /// resolved through the registry to a REGISTRANT (or `none` where nothing declares it), a user's amendment surviving
 /// a rebuild, the sniff never overwriting a set `una:type` (ATTRCOLUMNS's refresh), and Open With's list for text.
 ///
-/// `:: FILETYPES: types=<n> build_ms=<n> blocks=<n> masked_max_ms=<n> -> PASS|FAIL :: login=<full|stamp|none> preferred=<n>
-/// resolved=<ok|why> registry=<dir|none> objects=<n> source=<db|registrants> sticky=<ok|skip|why> amend=<ok|skip|why> openwith=<n> builds=<n>`
-/// (REGISTRYCHUNK B508: the head is the LOGIN build's measured cost, held to [`BUILD_MS_BOUND`] / [`BUILD_BLOCKS_BOUND`] /
-/// [`MASKED_MS_BOUND`]; this test's own forced build is not recorded).
+/// `:: FILETYPES: types=<n> build_ms=<n> blocks=<n> masked_max_ms=<n> -> PASS|FAIL :: login=<stamp|none|full|-> worker=<none|pending|built|failed>
+/// on=<worker|service|login|-> login_ms=<n> login_blocks=<n> bound_ms=20000 masked_bound_ms=50 bar_ms=<n|none> preferred=<n> resolved=<ok|why>
+/// registry=<dir|none> objects=<n> source=<db|registrants> sticky=<ok|skip|why> amend=<ok|skip|why> openwith=<n> builds=<n>`
+/// FILETYPES2 (B513): the head is the OWED build's cost (the worker's, after the bar; zeros on a stamp hit), read
+/// BEFORE this test's own forced build (which is not recorded); [`verdict`] decides.
 pub fn selftest() {
     let mt = crate::shell::vfs_mount_table();
     let k = KERNEL_PRINCIPAL;
     let attrs = root_takes_attrs(&mt);
+    let (login, login_ms, login_blocks) = login_cost(); // FILETYPES2 (B513): the boot's record, before this test builds
+    let (wstate, won, build_ms, blocks, masked) = build_cost();
+    let cost_ok = verdict(login, wstate, won, build_ms, masked);
     build("tests");
     let types = known_types_in(&mt);
     let mut objects = 0usize;
@@ -532,12 +637,16 @@ pub fn selftest() {
     };
     let openwith = registrants_in(&mt, ft::TEXT_PLAIN).len();
     let resolved = why.clone().unwrap_or_else(|| String::from("ok"));
-    let (login, build_ms, blocks, masked) = login_cost(); // REGISTRYCHUNK (B508): the LOGIN build's cost (this test's own forced build is not recorded)
-    let pass = why.is_none() && matches!(amend, "ok" | "skip") && matches!(sticky, "ok" | "skip") && openwith >= 2 && login_cost_ok();
+    let pass = why.is_none() && matches!(amend, "ok" | "skip") && matches!(sticky, "ok" | "skip") && openwith >= 2 && cost_ok;
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    let bar_ms = crate::video::desktopbuild::last_bar_ms();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let bar_ms: Option<u64> = None;
+    let bar = bar_ms.map_or(String::from("none"), |b| alloc::format!("{}", b));
     serial_println!(
-        ":: FILETYPES: types={} build_ms={} blocks={} masked_max_ms={} -> {} :: login={} preferred={} resolved={} registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
-        types.len(), build_ms, blocks, masked, if pass { "PASS" } else { "FAIL" }, login, preferred, resolved,
-        if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
+        ":: FILETYPES: types={} build_ms={} blocks={} masked_max_ms={} -> {} :: login={} worker={} on={} login_ms={} login_blocks={} bound_ms={} masked_bound_ms={} bar_ms={} preferred={} resolved={} registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
+        types.len(), build_ms, blocks, masked, if pass { "PASS" } else { "FAIL" }, login, wstate, won, login_ms, login_blocks, BUILD_MS_BOUND, MASKED_MS_BOUND, bar,
+        preferred, resolved, if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
     );
 }
 
@@ -716,7 +825,10 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
         let d = sio().since(io0);
         let mm = done(masked_max);
         let ms = crate::arch::ms().saturating_sub(t0);
-        note_cost(why, LOGIN_STAMP, ms, d.blocks_read(), mm);
+        note_cost(why, ms, d.blocks_read(), mm, false);
+        if REG.swap(REG_LIVE, Ordering::AcqRel) == REG_NONE { // FILETYPES2 (B513): the stored registry is current — published
+            serial_println!("[filetypes] swap registry=live on={} build_ms=0 skipped=stamp", why);
+        }
         serial_println!("[filetypes] built at={} dir={} created=0 filled=0 types={} skipped=stamp stamp=v{} blocks_read={} cmds={} ms={} io={} masked_max_ms={}",
             why, TYPES_DIR, builtin_type_count(), BUILDER_VERSION, d.blocks_read(), d.cmds(), ms, iow, mm);
         return (0, true);
@@ -733,14 +845,23 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
             let d = sio().since(io0);
             let mm = done(masked_max.max(PER_TYPE_MASKED.swap(0, Ordering::Relaxed)));
             let ms = crate::arch::ms().saturating_sub(t0);
-            note_cost(why, LOGIN_FULL, ms, d.blocks_read(), mm);
+            note_cost(why, ms, d.blocks_read(), mm, true);
             crate::fs::bootstep::note_span("filetypes-build", t0, crate::arch::ms()); // SMALLFIX6 (B495): the full build's span, beside the boot steps
             serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={} io={} masked_max_ms={}", why, TYPES_DIR, n, f,
                 known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), ms, iow, mm);
+            if st == "written" {
+                // FILETYPES2 (B513): THE SWAP — every object and the stamp are on the volume; ONE Release store publishes
+                // the registry. Readers Acquire it in `reg_attr`: before it they answer from the facts, after it from the
+                // registry — old or new, never a half-built directory.
+                let was = REG.swap(REG_LIVE, Ordering::AcqRel);
+                if was == REG_NONE {
+                    serial_println!("[filetypes] swap registry=live on={} build_ms={} blocks_read={} masked_max_ms={}", why, ms, d.blocks_read(), mm);
+                }
+            }
             (n, false)
         }
-        Err(VfsError::Unsupported) => { done(0); serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); (0, false) }
-        Err(e) => { done(0); serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); (0, false) }
+        Err(VfsError::Unsupported) => { done(0); note_failed(why); serial_println!("[filetypes] built at={} dir=none reason=enotsup (root takes no attributes) source=registrants", why); (0, false) }
+        Err(e) => { done(0); note_failed(why); serial_println!("[filetypes] built at={} FAILED ({}) source=registrants", why, crate::fs::attrsys::refusal(&e)); (0, false) }
     }
 }
 
@@ -753,47 +874,119 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
 // (B497: the bar first, then the `jobs-scan` worker's `build_owed`); this arc makes it cheap. `tests filetypes` reads
 // the cost recorded here.
 
-const LOGIN_NONE: usize = 0;
+// FILETYPES2 (rmbp-ledger B513) — flight 28: `:: FILETYPES: types=30 build_ms=16134 … -> FAIL :: login=full`. The build
+// had ALREADY left the login path (it ran on the jobs-scan worker after the bar: `[desktop] built … bar_ms=71` at
+// 12:18:31, the worker's per-type lines 12:18:33–12:18:48) but `build_owed` called it `login` and `note_cost` filed
+// every `login` build as the LOGIN's full build, held to REGISTRYCHUNK's 1000 ms bound. The card was a FIRST boot
+// (`[users] seat … src=fresh users=0`, the installer form): no stamp, so the build was owed — not a stamp miss.
+// Now the login's own act (a stamp read) and the owed build are two records.
+
+const LOGIN_UNSET: usize = 0;
 const LOGIN_FULL: usize = 1;
 const LOGIN_STAMP: usize = 2;
-static LOGIN_KIND: AtomicUsize = AtomicUsize::new(LOGIN_NONE);
+const LOGIN_NONE: usize = 3;
+static LOGIN_KIND: AtomicUsize = AtomicUsize::new(LOGIN_UNSET);
 static LOGIN_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LOGIN_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static LOGIN_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The longest per-object masked span `seed_in` saw (taken by the summary line).
 static PER_TYPE_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Record the login build's cost (only `why == "login"`; the `tests` and `verb` builds are not the boot's).
-fn note_cost(why: &str, kind: usize, ms: u64, blocks: u64, masked: u64) {
-    if why != "login" {
-        return;
-    }
+/// The registry's publication: UNKNOWN before any login read the stamp (the disk is read as it stands), NONE while
+/// the login found no current stamp and the owed build has not swapped in, LIVE once the stamp matched or a full
+/// build wrote it.
+const REG_UNKNOWN: u8 = 0;
+const REG_NONE: u8 = 1;
+const REG_LIVE: u8 = 2;
+static REG: AtomicU8 = AtomicU8::new(REG_UNKNOWN);
+
+/// May readers take the registry's objects? `false` only between a stamp miss at login and the build's swap.
+pub fn registry_readable() -> bool {
+    REG.load(Ordering::Acquire) != REG_NONE
+}
+
+/// The owed build's state: none owed, pending, built, failed.
+const BUILD_NONE: u8 = 0;
+const BUILD_PENDING: u8 = 1;
+const BUILD_DONE: u8 = 2;
+const BUILD_FAILED: u8 = 3;
+static BUILD_STATE: AtomicU8 = AtomicU8::new(BUILD_NONE);
+/// Where the owed build ran: 0 none, 1 worker, 2 service, 3 login (inline).
+static BUILD_ON: AtomicU8 = AtomicU8::new(0);
+static BUILD_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BUILD_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BUILD_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn on_code(why: &str) -> u8 {
+    match why { "worker" => 1, "service" => 2, "login" => 3, _ => 0 }
+}
+
+fn note_login(kind: usize, ms: u64, blocks: u64) {
     LOGIN_MS.store(ms, Ordering::Relaxed);
     LOGIN_BLOCKS.store(blocks, Ordering::Relaxed);
-    LOGIN_MASKED.store(masked, Ordering::Relaxed);
     LOGIN_KIND.store(kind, Ordering::Release);
 }
 
-/// The login build's cost: `(full|stamp|none, ms, blocks, masked_max_ms)`.
-pub fn login_cost() -> (&'static str, u64, u64, u64) {
-    let k = match LOGIN_KIND.load(Ordering::Acquire) { LOGIN_FULL => "full", LOGIN_STAMP => "stamp", _ => "none" };
-    (k, LOGIN_MS.load(Ordering::Relaxed), LOGIN_BLOCKS.load(Ordering::Relaxed), LOGIN_MASKED.load(Ordering::Relaxed))
+/// Record the owed build's cost (`why` = `worker` · `service` · `login`; the `tests` and `verb` builds are not the
+/// boot's). `full` = a full build ran (a stamp hit records nothing but the state). An inline `login` build is the
+/// login's own full build.
+fn note_cost(why: &str, ms: u64, blocks: u64, masked: u64, full: bool) {
+    let on = on_code(why);
+    if on == 0 {
+        return;
+    }
+    if on == 3 && full {
+        note_login(LOGIN_FULL, ms, blocks);
+    }
+    if full {
+        BUILD_MS.store(ms, Ordering::Relaxed);
+        BUILD_BLOCKS.store(blocks, Ordering::Relaxed);
+        BUILD_MASKED.store(masked, Ordering::Relaxed);
+    }
+    BUILD_ON.store(on, Ordering::Relaxed);
+    BUILD_STATE.store(BUILD_DONE, Ordering::Release);
 }
 
-/// The bounds `tests filetypes` holds a FULL login build to (the arc's: under a second, under 500 blocks, no masked
-/// span of 50 ms). A stamp hit is held to the ASSOCSTAMP bound (10 ms) and the same block bound.
-pub const BUILD_MS_BOUND: u64 = 1000;
-pub const BUILD_BLOCKS_BOUND: u64 = 500;
+fn note_failed(why: &str) {
+    let on = on_code(why);
+    if on != 0 {
+        BUILD_ON.store(on, Ordering::Relaxed);
+        BUILD_STATE.store(BUILD_FAILED, Ordering::Release);
+    }
+}
+
+/// What the login did: `(full|stamp|none|-, ms, blocks)` (`-` = no login read the stamp this boot).
+pub fn login_cost() -> (&'static str, u64, u64) {
+    let k = match LOGIN_KIND.load(Ordering::Acquire) { LOGIN_FULL => "full", LOGIN_STAMP => "stamp", LOGIN_NONE => "none", _ => "-" };
+    (k, LOGIN_MS.load(Ordering::Relaxed), LOGIN_BLOCKS.load(Ordering::Relaxed))
+}
+
+/// The owed build: `(none|pending|built|failed, on, ms, blocks, masked_max_ms)`.
+pub fn build_cost() -> (&'static str, &'static str, u64, u64, u64) {
+    let st = match BUILD_STATE.load(Ordering::Acquire) { BUILD_PENDING => "pending", BUILD_DONE => "built", BUILD_FAILED => "failed", _ => "none" };
+    let on = match BUILD_ON.load(Ordering::Relaxed) { 1 => "worker", 2 => "service", 3 => "login", _ => "-" };
+    (st, on, BUILD_MS.load(Ordering::Relaxed), BUILD_BLOCKS.load(Ordering::Relaxed), BUILD_MASKED.load(Ordering::Relaxed))
+}
+
+/// The arc's bounds: the owed build finishes under 20 s with no interrupts-off span over 50 ms.
+pub const BUILD_MS_BOUND: u64 = 20_000;
 pub const MASKED_MS_BOUND: u64 = 50;
 
-/// Does the recorded login cost pass? `true` when no login build ran (nothing to hold).
+/// FILETYPES2 (B513): PASS iff the login did no full build, and the owed build (when one was owed) finished off the
+/// login under [`BUILD_MS_BOUND`] with masked_max_ms ≤ [`MASKED_MS_BOUND`]. A stamp hit owes nothing and passes.
+pub fn verdict(login: &str, build: &str, on: &str, ms: u64, masked: u64) -> bool {
+    login != "full"
+        && match build {
+            "none" => true,
+            "built" => on != "login" && ms < BUILD_MS_BOUND && masked <= MASKED_MS_BOUND,
+            _ => false,
+        }
+}
+
+/// Does the recorded boot cost pass?
 pub fn login_cost_ok() -> bool {
-    let (k, ms, blocks, masked) = login_cost();
-    match k {
-        "full" => ms < BUILD_MS_BOUND && blocks < BUILD_BLOCKS_BOUND && masked < MASKED_MS_BOUND,
-        "stamp" => ms <= 10 && blocks < BUILD_BLOCKS_BOUND && masked < MASKED_MS_BOUND,
-        _ => true,
-    }
+    let (login, _, _) = login_cost();
+    let (b, on, ms, _, masked) = build_cost();
+    verdict(login, b, on, ms, masked)
 }
 
 /// `tests assocstamp` (R80: run only when asked) — the registry built in full (the stamp written), the stamp check
@@ -826,9 +1019,40 @@ pub fn stamp_selftest() {
         }
     };
     let rehit = if build_stamped("tests", false).1 { "ok" } else { "built-again" };
-    let pass = state == "match" && stale == "rebuilt" && rehit == "ok" && ms <= 10;
-    serial_println!(":: ASSOCSTAMP: stamp={} blocks_read={} ms={} -> {} :: cmds={} stale={} rehit={} bound_ms=10 stamp=v{} n={}",
-        state, d.blocks_read(), ms, if pass { "PASS" } else { "FAIL" }, d.cmds(), stale, rehit, BUILDER_VERSION, builtin_type_count());
+    // FILETYPES2 (B513): the LOGIN PATH over this volume, the boot's record untouched — a current stamp reads `match`
+    // (the login publishes the stored registry and owes nothing); a stale one reads `stale`, the registry goes
+    // unpublished (the resolver answers `registrant`, the empty-but-valid registry) until a build's one store swaps it
+    // in (`db`), and the next login reads `match` again: the steady state is a stamp hit on every boot.
+    let saved = REG.load(Ordering::Acquire);
+    let (hit, hit_blocks, hit_ms) = login_read(&mt);
+    let _ = mt.set_attr(TYPES_DIR, STAMP_KEY, AttrValue::Str(String::from("v0 h=stale n=0")), KERNEL_PRINCIPAL);
+    let (miss, _, _) = login_read(&mt);
+    REG.store(REG_NONE, Ordering::Release);
+    let probe = object_path(ft::TEXT_PLAIN);
+    let none_src = opener_for_in(&mt, &probe, ft::TEXT_PLAIN).1;
+    let swapped = !build_stamped("tests", false).1 && registry_readable();
+    let live_src = opener_for_in(&mt, &probe, ft::TEXT_PLAIN).1;
+    let (again, _, _) = login_read(&mt);
+    REG.store(saved, Ordering::Release); // the boot's publication as it was (a pending worker build then hits the stamp this wrote and publishes)
+    let login_path = if hit != "match" {
+        alloc::format!("hit:{}", hit)
+    } else if miss != "stale" {
+        alloc::format!("miss:{}", miss)
+    } else if none_src != "registrant" {
+        alloc::format!("unpublished:{}", none_src)
+    } else if !swapped {
+        String::from("no-swap")
+    } else if live_src != "db" {
+        alloc::format!("live:{}", live_src)
+    } else if again != "match" {
+        alloc::format!("next-login:{}", again)
+    } else {
+        String::from("ok")
+    };
+    let pass = state == "match" && stale == "rebuilt" && rehit == "ok" && ms <= 10 && login_path == "ok";
+    serial_println!(":: ASSOCSTAMP: stamp={} blocks_read={} ms={} -> {} :: cmds={} stale={} rehit={} bound_ms=10 stamp=v{} n={} login_path={} login_hit_blocks={} login_hit_ms={} unpublished_src={} live_src={}",
+        state, d.blocks_read(), ms, if pass { "PASS" } else { "FAIL" }, d.cmds(), stale, rehit, BUILDER_VERSION, builtin_type_count(),
+        login_path, hit_blocks, hit_ms, none_src, live_src);
 }
 
 /// REFUSALUI (B468): the wire's words when `path`'s own `una:preferred` is refused for type `mime`
@@ -938,7 +1162,7 @@ pub fn take_to_worker() {
 /// The worker's turn: build the owed registry, if one is owed (one relaxed load otherwise), and hand the duty back.
 pub fn build_owed() {
     if OWED.load(Ordering::Acquire) && OWED.swap(false, Ordering::AcqRel) {
-        build("login");
+        build_stamped("worker", false); // FILETYPES2 (B513): the worker's build, recorded as the worker's (never the login's)
     }
     TAKEN.store(false, Ordering::Release);
 }
