@@ -5937,7 +5937,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // `ui_tick_service()` lands this moves there; the call belongs on a per-pass service body
         // either way, and this task is that body.
         #[cfg(all(target_arch = "x86_64", feature = "smc"))]
-        unaos_kernel::drivers::smc::battery::refresh_if_due(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_TYPEMATIC);
+        unaos_kernel::drivers::smc::battery_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_TYPEMATIC); // PUMPWITNESS (B518): the SMC accountant runs on its own `smc-batt` task (smc.rs tail); the pump only posts it once
         // STOR-1 (irqstorage knob): bring up the interrupt-driven storage service task once a block
         // device is present, then run the `bx-blockreq` self-test once. Both one-shot + gated.
         #[cfg(feature = "irqstorage")]
@@ -5979,11 +5979,11 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // FAT volume and must do so with no driver lock held. It latches only on a pass that HAD
         // a volume, so an early pass before storage enumerates does not burn the one attempt.
         #[cfg(feature = "prtscrst")]
-        unaos_kernel::video::prtscr::selftest_once();
+        unaos_kernel::video::prtscr::selftest_post(); // PUMPWITNESS (B518): posted to a one-shot worker task (prtscr.rs tail), never run on the pump
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
-        unaos_kernel::selfhost::verify_source_once(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SELFHOST);
+        unaos_kernel::selfhost::verify_source_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SELFHOST); // PUMPWITNESS (B518): posted to a one-shot worker task (selfhost/mod.rs), never run on the pump — flight 28 ran it here for 28.4 s
         // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `desktop_uefi::activate`
         // used to open a kernel-drawn demo window at the Kepler takeover seam; it now ARMS a launch
         // there and this pass performs it, putting `STAT.ELF` on the desktop as a real ring-3 process
@@ -6005,7 +6005,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // depends on its knobs, so the call sits at all three and the latch inside makes it speak
         // exactly once. Mutates nothing.
         #[cfg(all(target_arch = "x86_64", feature = "witness"))]
-        unaos_kernel::shell::fatverb_storage_witness(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_FATVERB);
+        unaos_kernel::shell::fatverb_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_FATVERB); // PUMPWITNESS (B518): posted to a one-shot worker task (shell.rs tail), never run on the pump
         // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second loop
         // site. Third of the three storage-ready passes; the forward-only state machine inside makes
         // it speak exactly once whichever pass a given build reaches. Read-only in arc 1.

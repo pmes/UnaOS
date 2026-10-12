@@ -2126,3 +2126,41 @@ pub mod adapter {
         DcIn { mw, src, pdtr, id0r, vd0r }
     }
 }
+
+// PUMPWITNESS (rmbp-ledger B518) — the battery ACCOUNTANT on its own cadence task, off the usb-pump.
+// FILE TAIL, so no line above moves: the lock-class names (`[lock] … name=smc.rs:1279`) and every
+// `panic::Location` keep their lines. Flight 28: the pump's `battery::refresh_if_due` held the pump step
+// 85–148 ms every 10–20 s (`pump=typematic-smc`; the sweep's port I/O plus the witness/rollup prints under
+// `WITNESSED` + `LAST_STATE`, `[lock] held-too-long name=smc.rs:1279 at=smc.rs:1656 by=9@cpu7 ms=85`).
+// No SMC cadence task existed (BATTLIVE's 1 s menu sweep and MENUSTAT's poll ride the same device-service
+// pass), so this is one: the pump calls `battery_post`, whose first call starts `smc-batt` on
+// `smp::worker_cpu(0)` and whose every later call is one relaxed load. The task runs the SAME
+// `refresh_if_due` (its own 1 s .. 32 s throttle and BATMON-HOLD untouched) on a 100 ms nap, so the
+// `:: PWR:` accrual and the `SMC-BATT` witness are unchanged; readers keep `battery::cached()` (a copy
+// under each short lock). The SMC conversation stays serialized on `TXN` across cores. No worker core:
+// the pump refreshes inline, exactly as before.
+#[cfg(target_arch = "x86_64")]
+pub fn battery_post() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static POSTED: AtomicBool = AtomicBool::new(false);
+    if POSTED.load(Ordering::Relaxed) {
+        return;
+    }
+    match crate::arch::smp::worker_cpu(0) {
+        Some(cpu) => {
+            if !POSTED.swap(true, Ordering::AcqRel) {
+                crate::arch::sched::spawn("smc-batt", battery_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+            }
+        }
+        None => battery::refresh_if_due(),
+    }
+}
+
+/// PUMPWITNESS: `smc-batt`, the accountant's cadence. Never returns.
+#[cfg(target_arch = "x86_64")]
+fn battery_task(_: usize) {
+    loop {
+        battery::refresh_if_due();
+        crate::arch::sched::sleep_ms(100);
+    }
+}

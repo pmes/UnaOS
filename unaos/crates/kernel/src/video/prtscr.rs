@@ -1542,7 +1542,7 @@ impl Job {
 /// and never a false FAIL.
 #[cfg(feature = "prtscrst")]
 pub fn selftest_once() {
-    static DONE: AtomicBool = AtomicBool::new(false); if crate::tests::defer("prtscr", selftest_once) { return; } // QUIETBOOT (R80): a boot witness — `tests prtscr` fires it.
+    use self::ST_DONE as DONE; if crate::tests::defer("prtscr", selftest_once) { return; } // QUIETBOOT (R80): a boot witness — `tests prtscr` fires it.
     static SAID_NO_VOLUME: AtomicBool = AtomicBool::new(false);
     static SAID_READ_ONLY: AtomicBool = AtomicBool::new(false);
     static SAID_NO_SESSION: AtomicBool = AtomicBool::new(false);
@@ -1561,9 +1561,9 @@ pub fn selftest_once() {
         if !SAID_NO_SESSION.swap(true, Ordering::Relaxed) {
             why.report();
             serial_println!(
-                ":: PRTSCR-ST: SKIPPED — no user session yet, so there is no {} to capture into (theme={}); still waiting, and this selftest runs on the first pass after a login ::",
+                ":: PRTSCR-ST: SKIPPED — no user session yet, so there is no {} to capture into (theme={}); still waiting, and this selftest runs on the first pass after a login ::{}",
                 DIR_CAPTURE.0,
-                crate::video::theme::NAME
+                crate::video::theme::NAME, st_on()
             );
         }
         return;
@@ -1573,9 +1573,9 @@ pub fn selftest_once() {
         Err(Refusal::NoVolume(e)) => {
             if !SAID_NO_VOLUME.swap(true, Ordering::Relaxed) {
                 serial_println!(
-                    ":: PRTSCR-ST: no FAT volume on the program-source or USB handles ({:?}; handles={}) — still waiting; a boot that never gets one leaves the capture selftest SKIPPED ::",
+                    ":: PRTSCR-ST: no FAT volume on the program-source or USB handles ({:?}; handles={}) — still waiting; a boot that never gets one leaves the capture selftest SKIPPED ::{}",
                     e,
-                    crate::drivers::block::source_census()
+                    crate::drivers::block::source_census(), st_on()
                 );
             }
             return;
@@ -1583,10 +1583,10 @@ pub fn selftest_once() {
         Err(Refusal::ReadOnly(v, _, why)) => {
             if !SAID_READ_ONLY.swap(true, Ordering::Relaxed) {
                 serial_println!(
-                    ":: PRTSCR-ST: program source is {} (serial=0x{:08X}) and vetoes writes ({}) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::",
+                    ":: PRTSCR-ST: program source is {} (serial=0x{:08X}) and vetoes writes ({}) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::{}",
                     v.source,
                     v.serial,
-                    why
+                    why, st_on()
                 );
             }
             return;
@@ -1606,10 +1606,10 @@ pub fn selftest_once() {
     if SAID_NO_VOLUME.load(Ordering::Relaxed) || SAID_READ_ONLY.load(Ordering::Relaxed) {
         let label = fs.label();
         serial_println!(
-            ":: PRTSCR-ST: writable volume arrived (source={} serial=0x{:08X} label={}) — running the deferred capture selftest ::",
+            ":: PRTSCR-ST: writable volume arrived (source={} serial=0x{:08X} label={}) — running the deferred capture selftest ::{}",
             fs.source_name(),
             fs.volume_fingerprint().0,
-            if label.is_empty() { "-" } else { label.as_str() }
+            if label.is_empty() { "-" } else { label.as_str() }, st_on()
         );
     }
 
@@ -1617,7 +1617,7 @@ pub fn selftest_once() {
         Ok(shot) => shot,
         Err(why) => {
             why.report();
-            serial_println!(":: PRTSCR-ST: FAIL — the capture itself refused (line above) ::");
+            serial_println!(":: PRTSCR-ST: FAIL — the capture itself refused (line above) ::{}", st_on());
             return;
         }
     };
@@ -1634,16 +1634,16 @@ pub fn selftest_once() {
         Ok(hit) => hit,
         Err(e) => {
             serial_println!(
-                ":: PRTSCR-ST: FAIL — {} is not in {} after the write ({:?}) ::",
-                shot.name, shot.dir, e
+                ":: PRTSCR-ST: FAIL — {} is not in {} after the write ({:?}) ::{}",
+                shot.name, shot.dir, e, st_on()
             );
             return;
         }
     };
     if de.size as usize != shot.bytes {
         serial_println!(
-            ":: PRTSCR-ST: FAIL — {} is {} bytes on disk, {} were written ::",
-            shot.name, de.size, shot.bytes
+            ":: PRTSCR-ST: FAIL — {} is {} bytes on disk, {} were written ::{}",
+            shot.name, de.size, shot.bytes, st_on()
         );
         return;
     }
@@ -1652,7 +1652,7 @@ pub fn selftest_once() {
     if fs.read_at(de.first_cluster(), de.size, 0, &mut head, 33).is_err()
         || fs.read_at(de.first_cluster(), de.size, de.size - 12, &mut tail, 12).is_err()
     {
-        serial_println!(":: PRTSCR-ST: FAIL — {} could not be read back ::", shot.name);
+        serial_println!(":: PRTSCR-ST: FAIL — {} could not be read back ::{}", shot.name, st_on());
         return;
     }
     let sig_ok = head.len() >= 33 && head[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -1665,13 +1665,13 @@ pub fn selftest_once() {
 
     if sig_ok && ihdr_ok && colour_ok && dims_ok && iend_ok {
         serial_println!(
-            ":: PRTSCR-ST: {}/{} on the medium — {} bytes, PNG signature OK, IHDR {}x{} depth 8 colour 2 non-interlaced, IEND OK -> PASS ::",
-            shot.dir, shot.name, de.size, w, h
+            ":: PRTSCR-ST: {}/{} on the medium — {} bytes, PNG signature OK, IHDR {}x{} depth 8 colour 2 non-interlaced, IEND OK -> PASS ::{}",
+            shot.dir, shot.name, de.size, w, h, st_on()
         );
     } else {
         serial_println!(
-            ":: PRTSCR-ST: FAIL — {} sig={} ihdr={} colour={} dims={}x{} (want {}x{}) iend={} ::",
-            shot.name, sig_ok, ihdr_ok, colour_ok, w, h, shot.width, shot.height, iend_ok
+            ":: PRTSCR-ST: FAIL — {} sig={} ihdr={} colour={} dims={}x{} (want {}x{}) iend={} ::{}",
+            shot.name, sig_ok, ihdr_ok, colour_ok, w, h, shot.width, shot.height, iend_ok, st_on()
         );
     }
 }
@@ -2595,4 +2595,51 @@ pub fn prtscr_selftest() {
         ":: PRTSCR: fixture door=free waited_ms={} took=1 refused={} released=1 -> {} ::",
         waited, refused, if refused == 1 { "PASS" } else { "FAIL" }
     );
+}
+
+// PUMPWITNESS (rmbp-ledger B518) — the capture selftest off the usb-pump. FILE TAIL, so no line above moves.
+// The pump's storage-ready pass called `selftest_once` inline every pass (a PNG encode + FAT write and
+// read-back when it fires); it now calls `selftest_post`, which posts ONE `prtscr-witness` task on
+// `smp::worker_cpu(0)` (JOBSCAN's `spawn` shape, fs/jobs.rs) and forgets it. The task re-asks the selftest
+// on a 20 ms nap — its own waits (no session, no volume, read-only source) are unchanged — and exits once
+// it has latched (`ST_DONE`, hoisted here from the fn so the task can read it) or `tests prtscr` has been
+// registered (the deferred build: R80). Every `:: PRTSCR-ST:` line it prints ends in ` on=worker`. No
+// worker core: the call stays inline on the pass, as before, and is retried next pass.
+#[cfg(feature = "prtscrst")]
+static ST_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "prtscrst")]
+static ST_ON_WORKER: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "prtscrst")]
+fn st_on() -> &'static str {
+    if ST_ON_WORKER.load(Ordering::Relaxed) { " on=worker" } else { "" }
+}
+
+/// PUMPWITNESS: the usb-pump's door to `selftest_once` — post once, never run it on the pump.
+#[cfg(feature = "prtscrst")]
+pub fn selftest_post() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static POSTED: AtomicBool = AtomicBool::new(false);
+        if POSTED.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(cpu) = crate::arch::smp::worker_cpu(0) {
+            if !POSTED.swap(true, Ordering::AcqRel) {
+                crate::arch::sched::spawn("prtscr-witness", selftest_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+            }
+            return;
+        }
+    }
+    selftest_once();
+}
+
+#[cfg(all(feature = "prtscrst", target_arch = "x86_64"))]
+fn selftest_worker(_: usize) {
+    ST_ON_WORKER.store(true, Ordering::Relaxed);
+    while !ST_DONE.load(Ordering::Relaxed) && !crate::tests::defer("prtscr", selftest_once) {
+        selftest_once();
+        crate::arch::sched::sleep_ms(20);
+    }
+    ST_ON_WORKER.store(false, Ordering::Relaxed);
 }
