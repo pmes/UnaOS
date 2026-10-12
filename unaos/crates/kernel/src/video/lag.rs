@@ -819,7 +819,7 @@ fn sec_roll(now_ms: u64) {
     }
     let _ = w;
     let rw = if r[0] >= r[1] && r[0] >= r[2] { 0 } else if r[1] >= r[2] { 1 } else { 2 };
-    let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS || seg_pu / 1000 >= STALL_MS; // INPUTSTALL2 M1: a pump step that held the HID pass is a stall second
+    let stall = w_ms >= STALL_MS || r[rw] / 1000 >= STALL_MS || seg_pu / 1000 >= STALL_MS; #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::renderwedge::roll(st[0], r[0].max(r[1]).max(r[2]), seg_h, now_ms); // RENDERWEDGE (B520): every roll feeds the render-watch (the queue age, the render task's work, its step), same-line fold. INPUTSTALL2 M1: a pump step that held the HID pass is a stall second
     // HIDSTALL2 (B509): `stage=` names what MADE the second a stall. Flight 27 printed `stage=hid stage_ms=2..8` 596 times
     // because the label was the largest of six small numbers while the trigger was the render handler (`render_ms=108`)
     // or a pump step; `stage=hid` now means the HID gap itself crossed the bound.
