@@ -115,8 +115,8 @@ pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec
         return Err(una_abi::EINVAL);
     }
     let path = core::str::from_utf8(&inb[h..h + plen]).map_err(|_| una_abi::EINVAL)?;
-    if !path_ok(path) {
-        return Err(una_abi::EINVAL);
+    if !path_ok(path) && !(path == "/" && nr == una_abi::SYS_PATH_READ && flags & una_abi::PATH_R_LIST != 0) {
+        return Err(una_abi::EINVAL); // RING3EXEC (B521): `/` itself is a path only for a listing (`ls /`)
     }
     let data = &inb[h + plen..];
     let who = principal_for(path, caller);
@@ -135,7 +135,7 @@ pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec
             return Err(una_abi::EINVAL);
         }
         if flags & una_abi::PATH_R_LIST != 0 {
-            return list_dir(&mt, path, caller, off, cap); // HOLOCRON2 (B355): a directory's names, inside the caller's home
+            return list_dir(&mt, path, caller, off, cap); // HOLOCRON2 (B355): a directory's names — RING3EXEC (B521): under the ownership ACL, as the caller
         }
         let st = if who == KERNEL_PRINCIPAL { mt.stat(path) } else { mt.open_read(path, who) }.map_err(|e| errno(&e))?;
         if st.kind == NodeKind::Dir {
@@ -375,53 +375,20 @@ pub fn tree_root(mt: &MountTable) -> Option<String> {
     None
 }
 
-// ── HOLOCRON2 (rmbp-ledger B355): `PATH_R_LIST` ─────────────────────────────────────────────────────
+// ── HOLOCRON2 (rmbp-ledger B355): `PATH_R_LIST` — RING3EXEC (B521): under the ownership ACL ─────────────
 /// A directory's entry names for ring 3 (`\n`-joined; a directory gets a trailing `/`), from byte `off` of
-/// that listing, at most `cap` bytes. Only inside the CALLER's own home: `caller` is the ATTRSURF principal
-/// `user:<name>#<uid>`, the home is the users store's record for `<name>` (never a `/home/<name>` literal),
-/// and an anonymous caller lists nothing. Names are what the directory holds — the medium's authority, so
-/// Holocron's `SecretList` has no index file to drift from it.
+/// that listing, at most `cap` bytes. RING3EXEC (B521): the directory is listed iff `caller` (the ATTRSURF
+/// principal `user:<name>#<uid>`, or `anon`) may READ it by the volume's ACL — `MountTable::list_as` opens it
+/// as the caller (native: the directory inode's `owner`/`grants:` rows through `unafs::read_authz`, ROOTACL's
+/// `system` public; foreign: the mount capability); a refusal is `-EACCES` by the ACL's word. HOLOCRON2's
+/// home-only rule is retired: it stood in for this check (the old body read the directory with no principal),
+/// and a home the user owns still lists because its owner row says so. Always the CALLER's principal, never
+/// `principal_for`'s installer grant — the grant is a write authority and stays scoped to `path_fulfil`'s
+/// file verbs. Names are what the directory holds — the medium's authority, so Holocron's `SecretList` has no
+/// index file to drift from it.
 fn list_dir(mt: &MountTable, path: &str, caller: &str, off: u64, cap: usize) -> Result<(Vec<u8>, i64), i64> {
-    if !in_own_home(path, caller) {
-        return Err(una_abi::EACCES);
-    }
-    let st = mt.stat(path).map_err(|e| errno(&e))?;
-    if st.kind != NodeKind::Dir {
-        return Err(una_abi::ENOTDIR);
-    }
-    let ents = mt.read_dir(path).map_err(|e| errno(&e))?;
-    let mut all = Vec::new();
-    for e in ents {
-        if e.name == "." || e.name == ".." {
-            continue;
-        }
-        all.extend_from_slice(e.name.as_bytes());
-        if e.kind == NodeKind::Dir {
-            all.push(b'/');
-        }
-        all.push(b'\n');
-    }
-    let o = (off as usize).min(all.len());
-    let n = (all.len() - o).min(cap);
-    let out = all[o..o + n].to_vec();
-    Ok((out, n as i64))
-}
-
-/// Is `path` the caller's home or below it?
-fn in_own_home(path: &str, caller: &str) -> bool {
-    #[cfg(feature = "login")]
-    {
-        let Some(rest) = caller.strip_prefix("user:") else { return false };
-        let name = rest.split('#').next().unwrap_or("");
-        let mut h = [0u8; crate::fs::users::HOME_MAX];
-        let Some(n) = crate::fs::users::home_of(name.as_bytes(), &mut h) else { return false };
-        let Ok(home) = core::str::from_utf8(&h[..n]) else { return false };
-        let home = home.trim_end_matches('/');
-        return !home.is_empty() && (path == home || (path.starts_with(home) && path.as_bytes().get(home.len()) == Some(&b'/')));
-    }
-    #[cfg(not(feature = "login"))]
-    {
-        let _ = (path, caller);
-        false
-    }
+    let ents = mt.list_as(path, caller).map_err(|e| errno(&e))?;
+    let out = crate::fs::vfs::listing_window(&ents, off, cap);
+    let n = out.len() as i64;
+    Ok((out, n))
 }

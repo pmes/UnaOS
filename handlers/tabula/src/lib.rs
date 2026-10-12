@@ -14,8 +14,10 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+pub mod bus;
 pub mod document;
 pub mod logview;
+pub use bus::ignite;
 pub use document::TabulaDocument;
 pub use logview::{default_console_log, is_log_path, LogText};
 
@@ -28,9 +30,11 @@ use sourceview5::prelude::*;
 #[cfg(feature = "gtk")]
 use sourceview5::{LanguageManager, View as SourceView};
 #[cfg(feature = "gtk")]
-use std::fs;
+use std::cell::{Cell, RefCell};
 #[cfg(feature = "gtk")]
 use std::path::Path;
+#[cfg(feature = "gtk")]
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub enum EditorMode {
@@ -46,6 +50,27 @@ pub struct TabulaView {
     /// The mode this view was built in — kept so `load_file` can restore the
     /// view after `load_log` has put it in the read-only Console treatment.
     mode: EditorMode,
+    /// EDITCORE (SR73, R104): the buffer of record. GtkSourceView keeps doing
+    /// the editing on this OS; every GtkTextBuffer insert/delete is mirrored
+    /// into this document's `edit_core::Buffer`, and every core edit made
+    /// through [`TabulaView::edit`] is replayed into the GtkTextBuffer.
+    doc: Rc<RefCell<TabulaDocument>>,
+    /// Set while the view applies a core change (or loads a file) so the
+    /// GtkTextBuffer signals it raises are not echoed back into the core.
+    guard: Rc<Cell<bool>>,
+}
+
+/// The byte offset in the core of a GtkTextIter. GTK and the core agree on
+/// lines when their line counts agree (both end lines at LF, a CRLF being one
+/// ending), so the iter's (line, byte-in-line) maps straight to a `Pos`; when
+/// they do not (a lone CR, which GTK also breaks on), count the bytes before it.
+#[cfg(feature = "gtk")]
+fn iter_byte_offset(buf: &gtk4::TextBuffer, core: &edit_core::Buffer, it: &gtk4::TextIter) -> usize {
+    if buf.line_count().max(0) as usize == core.line_count() {
+        core.pos_to_offset(edit_core::Pos::new(it.line().max(0) as usize, it.line_index().max(0) as usize))
+    } else {
+        buf.text(&buf.start_iter(), it, true).len()
+    }
 }
 
 #[cfg(feature = "gtk")]
@@ -88,11 +113,91 @@ impl TabulaView {
             .vexpand(true)
             .build();
 
+        // The mirror, GTK → core. Both handlers run BEFORE the default
+        // handler, so the iters still describe the text the core holds.
+        let doc = Rc::new(RefCell::new(TabulaDocument::new()));
+        let guard = Rc::new(Cell::new(false));
+        let buffer = view.buffer();
+        {
+            let (doc, guard) = (doc.clone(), guard.clone());
+            buffer.connect_insert_text(move |buf, iter, text| {
+                if guard.get() {
+                    return;
+                }
+                let mut d = doc.borrow_mut();
+                let at = iter_byte_offset(buf, &d.core, iter);
+                d.replace_range(at..at, text);
+            });
+        }
+        {
+            let (doc, guard) = (doc.clone(), guard.clone());
+            buffer.connect_delete_range(move |buf, start, end| {
+                if guard.get() {
+                    return;
+                }
+                let mut d = doc.borrow_mut();
+                let a = iter_byte_offset(buf, &d.core, start);
+                let b = iter_byte_offset(buf, &d.core, end);
+                d.replace_range(a.min(b)..a.max(b), "");
+            });
+        }
+
         Self {
             view,
             container,
             mode,
+            doc,
+            guard,
         }
+    }
+
+    /// The document of record behind this view (shared with the mirror).
+    pub fn document(&self) -> Rc<RefCell<TabulaDocument>> {
+        self.doc.clone()
+    }
+
+    /// The mirror, core → GTK: run an edit on the buffer of record and replay
+    /// its changes into the GtkTextBuffer, replacing only each changed range.
+    pub fn edit(&self, f: impl FnOnce(&mut edit_core::Buffer) -> Vec<edit_core::Change>) -> Vec<edit_core::Change> {
+        let changes = self.doc.borrow_mut().edit(f);
+        self.replay(&changes);
+        changes
+    }
+
+    fn replay(&self, changes: &[edit_core::Change]) {
+        let buf = self.view.buffer();
+        self.guard.set(true);
+        let mut in_step = true;
+        for c in changes {
+            let s = buf.iter_at_line_index(c.start_pos.line as i32, c.start_pos.byte as i32);
+            let e = buf.iter_at_line_index(c.old_end_pos.line as i32, c.old_end_pos.byte as i32);
+            match (s, e) {
+                (Some(mut s), Some(mut e)) => {
+                    buf.delete(&mut s, &mut e);
+                    buf.insert(&mut s, &c.text);
+                }
+                _ => {
+                    in_step = false;
+                    break;
+                }
+            }
+        }
+        let d = self.doc.borrow();
+        if !in_step || buf.line_count().max(0) as usize != d.core.line_count() {
+            // The view and the record disagree on structure: resync wholesale.
+            buf.set_text(&d.text());
+        }
+        self.guard.set(false);
+    }
+
+    /// Show `doc` in the view and make it the record, without echoing the
+    /// load back into the core as an edit.
+    fn show_document(&self, doc: TabulaDocument) {
+        let text = doc.text();
+        *self.doc.borrow_mut() = doc;
+        self.guard.set(true);
+        self.view.buffer().set_text(&text);
+        self.guard.set(false);
     }
 
     pub fn widget(&self) -> Widget {
@@ -149,12 +254,15 @@ impl TabulaView {
             }
         }
 
-        match fs::read_to_string(path) {
-            Ok(content) => buffer.set_text(&content),
-            Err(e) => buffer.set_text(&format!(
+        // EDITCORE: the file loads into the buffer of record and the view
+        // shows it; a read failure becomes a clean, path-less document so the
+        // view and the record still hold the same text.
+        match TabulaDocument::load(path) {
+            Ok(doc) => self.show_document(doc),
+            Err(e) => self.show_document(TabulaDocument::with_text(&format!(
                 "// UNAOS: FAILED TO LOAD {:?}\n// ERROR: {}",
                 path, e
-            )),
+            ))),
         }
     }
 
@@ -175,9 +283,14 @@ impl TabulaView {
         self.view.set_editable(false);
         self.view.set_wrap_mode(gtk4::WrapMode::WordChar);
 
-        match crate::logview::load_log(path) {
-            Ok(log) => buffer.set_text(&log.text),
-            Err(e) => buffer.set_text(&format!(":: TABULA: cannot read {:?} — {} ::\n", path, e)),
+        match TabulaDocument::load_log(path) {
+            Ok(doc) => self.show_document(doc),
+            Err(e) => {
+                let mut doc =
+                    TabulaDocument::with_text(&format!(":: TABULA: cannot read {:?} — {} ::\n", path, e));
+                doc.read_only = true;
+                self.show_document(doc);
+            }
         }
     }
 }

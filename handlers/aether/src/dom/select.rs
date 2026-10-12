@@ -8,15 +8,15 @@
 //! has its own test DOM), the impl needs nothing but html_core's public traversal hooks
 //! (`parent_element`, `prev/next_sibling_element`, `element_children`, the attribute list), and the
 //! states a matcher asks about beyond the attributes (`:hover`, `:focus`, `:target`) are a property of
-//! Aether's event loop, not of either core. A newtype in the one crate that links both keeps both
+//! Aether's event loop, not of either core (`:hover` reads the engine's hover chain, [`El::set_hover_chain`]). A newtype in the one crate that links both keeps both
 //! cores unaware of each other.
 //!
 //! `El` borrows the arena (`&Document`) instead of holding the `Rc<RefCell<…>>`, so a whole cascade
 //! or query walks the tree under ONE shared borrow and the matcher allocates nothing per hop.
 
 use super::NodeRef;
-use css_core::matching::{matches_list, Element, MatchContext};
-use css_core::selectors::{parse_selector_str, Namespaces, SelectorList};
+use css_core::matching::{html_state, matches_list, Element, MatchContext};
+use css_core::selectors::{parse_selector_str, ElementState, Namespaces, SelectorList};
 use html_core::{Document, NodeData, NodeId};
 
 /// An element of an html_core arena, as the css_core matcher sees it.
@@ -104,9 +104,47 @@ impl Element for El<'_> {
     fn has_class(&self, class: &str) -> bool {
         self.element().and_then(|e| e.attr("class")).is_some_and(|v| v.split(is_html_ws).any(|c| c == class))
     }
-    // `state` stays css_core's `html_state`: the attribute-derived states (`:link`, `:checked`,
-    // `:disabled`/`:enabled`, `:required`, `:read-only`, `:placeholder-shown`, …). A static render has
-    // no pointer, focus or fragment target, so `:hover`/`:focus`/`:target` never match.
+    // `state` is css_core's `html_state` (the attribute-derived states: `:link`, `:checked`,
+    // `:disabled`/`:enabled`, `:required`, `:read-only`, `:placeholder-shown`, …) plus the one user-action
+    // state the event loop now drives: `:hover` (AETHERHOVER, SR67) — the element under the pointer and
+    // every ancestor of it (Selectors 4 §9.1), as the engine last set it with [`El::set_hover_chain`]. A
+    // render with no pointer has an empty chain, so `:hover` matches nothing; `:focus`/`:target` still
+    // never match.
+    fn state(&self, s: ElementState) -> bool {
+        match s {
+            ElementState::Hover => is_hovered(self.doc, self.id),
+            _ => html_state(self, s),
+        }
+    }
+}
+
+thread_local! {
+    /// The hover chain (AETHERHOVER, SR67): the arena it belongs to (its address — a chain never matches
+    /// another document's elements) and the hit element's id followed by its ancestor elements' ids.
+    static HOVER_CHAIN: std::cell::RefCell<(usize, Vec<NodeId>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+// The chain's setters are associated with `El` (re-exported by `dom`) so the engine reaches them
+// through the one name the module already publishes.
+impl El<'_> {
+    /// Sets the elements `:hover` matches: `ids` (the hit element and its ancestors) of arena `doc`. An
+    /// empty `ids` clears it. The caller re-styles (the cascade reads this through `Element::state`).
+    pub fn set_hover_chain(doc: &Document, ids: &[NodeId]) {
+        let key = if ids.is_empty() { 0 } else { doc as *const Document as usize };
+        HOVER_CHAIN.with(|h| *h.borrow_mut() = (key, ids.to_vec()));
+    }
+
+    /// Clears the hover chain (a new document, a pointer that left the viewport).
+    pub fn clear_hover_chain() {
+        HOVER_CHAIN.with(|h| *h.borrow_mut() = (0, Vec::new()));
+    }
+}
+
+fn is_hovered(doc: &Document, id: NodeId) -> bool {
+    HOVER_CHAIN.with(|h| {
+        let h = h.borrow();
+        h.0 != 0 && h.0 == doc as *const Document as usize && h.1.contains(&id)
+    })
 }
 
 /// A compiled selector list (css_core's Selectors 4 grammar, HTML namespace defaults).

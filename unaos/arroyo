@@ -1237,6 +1237,9 @@ fi
 [ -n "${UNAOS_BUSREG:-}" ] && _feats="${_feats}busreg,"
 # LUMENBIN: UNAOS_LUMEN=1 arms the Lumen chat window's dock pin by default and `tests lumen` (crate::lumen). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LUMEN:-}" ] && _feats="${_feats}lumen,"
+[ -n "${UNAOS_MIDDEN:-}" ] && _feats="${_feats}midden,"   # MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs: MIDDEN.ELF spawned, `help` + `ls` typed into it, its exit read back). x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
+# AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (crate::aether: APPS/AETHER.ELF validated, spawned, its page report read; implies selfdiag for SYS_PATH_READ). x86 (no K8_FEATS arm: scripts/k8-reach.registry NA row). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_AETHER:-}" ] && _feats="${_feats}aether,"
 # NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
 # SELFDIAG (B324, R82): UNAOS_SELFDIAG=1 arms the boot log on disk (/var/log/boot.<n>.witness on a UnaFS root), SYS_PATH_READ 59 / SYS_PATH_WRITE 60 for APPS/DIAG.ELF and `tests selfdiag`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
@@ -4304,6 +4307,57 @@ build_user_lumen_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
 }
 
+# MIDDENTWIN (LEDGER SR75, R104): build MIDDEN.ELF — Midden, the Shell, as a ring-3 program (crates/user-midden
+# linking midden_core, the core the kernel's shell links): one window, a prompt and a scrollback, every line planned
+# by midden_core::plan with Facts::ring3. Cloned from build_user_lumen_x86 (ELF window, syms, strip, e_machine,
+# window check, APPRES stamp) → target/MIDDEN-X86.ELF, staged by the builder as APPS/MIDDEN.ELF. Inert until
+# launched (`run /apps/MIDDEN.ELF`); UNAOS_MIDDEN=1 adds the `tests midden` fixture (kernel middenapp.rs).
+build_user_midden_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Midden app (crates/user-midden → target/MIDDEN-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-midden"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-midden/target/x86_64-unknown-none/release/user-midden" MIDDEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-midden/target/x86_64-unknown-none/release/user-midden" \
+      "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: MIDDEN-X86.ELF missing/empty — x86 MIDDEN build failed${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: MIDDEN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF" "MIDDEN-X86.ELF"
+    una_res_stamp "${WORKSPACE_DIR}/crates/user-midden" "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF"  # APPRES (B398): Midden's icon, name, signature, version
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 Midden app: MIDDEN-X86.ELF${COLOR_RESET}"
+}
+
+# AETHERMETAL (LEDGER SR66): build AETHER.ELF — Aether, the browser, as ONE ring-3 program (crates/user-aether linking
+# html_core + css_core + font_core: parse, cascade, a CSS2 block + inline formatter, paint into one compositor
+# window). The build_user_lumen_x86 shape: linked at the ELF-window VA (user-aether-x86.ld, no PHDRS, 256 KiB stack
+# from -z stack-size), syms before the strip, e_machine, the window check, the APPRES stamp (res/: name, icon).
+# target/AETHER-X86.ELF, staged by the builder as APPS/AETHER.ELF with /system/doc/welcome.html. Inert until
+# launched; UNAOS_AETHER=1 adds the `tests aether` fixture.
+build_user_aether_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Aether app (crates/user-aether → target/AETHER-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-aether"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-aether/target/x86_64-unknown-none/release/user-aether" AETHER  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-aether/target/x86_64-unknown-none/release/user-aether" \
+      "${WORKSPACE_DIR}/target/AETHER-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/AETHER-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: AETHER-X86.ELF missing/empty — x86 AETHER build failed${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/AETHER-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: AETHER-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/AETHER-X86.ELF" "AETHER-X86.ELF"
+    una_res_stamp "${WORKSPACE_DIR}/crates/user-aether" "${WORKSPACE_DIR}/target/AETHER-X86.ELF"  # APPRES (B398): Aether's icon, name, signature, version
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 Aether app: AETHER-X86.ELF${COLOR_RESET}"
+}
+
 # HOLOCRON2 (rmbp-ledger B355, R82): build HOLOCRON.ELF — Holocron, the metal's secrets handler (crates/user-holocron
 # linking holocron_core: verbs 144..=151 over the BANDY3 mailbox, the store over SYS_PATH_* on the UnaFS root, the
 # ring KDF through SYS_KDF) → target/HOLOCRON-X86.ELF, staged by the builder as APPS/HOLOCRON.ELF. The
@@ -4488,6 +4542,7 @@ launch_x86_64() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -5458,6 +5513,8 @@ test_x86_64() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
+    build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -5924,6 +5981,8 @@ USER_CHECK_MATRIX=(
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-midden   x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-aether   x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-diag     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
@@ -8885,7 +8944,7 @@ BRACEPY
             && TMPDIR="$(pwd)/target/host-tests-tmp" cargo test \
                 -p gneiss_pal -p quartzite -p elessar -p unafs -p ibus -p helm -p pca9685 \
                 -p bandy -p euclase -p vein -p matrix -p comscan -p aule -p tabula -p midden \
-                -p principia -p vertex -p foreman -p pulse -p lux); then
+                -p principia -p vertex -p foreman -p pulse -p lux -p edit_core); then
         echo -e "${COLOR_GREEN}  ✅ host suites, root workspace (20 crates)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ a root-workspace host test suite FAILED${COLOR_RESET}"
@@ -9471,6 +9530,8 @@ esp_x86() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
+    build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -9534,6 +9595,7 @@ vm_image() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -9581,6 +9643,7 @@ fat_img() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -13623,7 +13686,7 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh"
 _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary line, returns the gate's rc
     local R="$1" n="$2" log="$3" p rc=0 e
     p="$(printf '%s\n' $GATES_SET | awk -F: -v n="$n" '$1==n{print $2}')"
@@ -13633,6 +13696,7 @@ _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary li
         charter|arch|attrkeys|appearance|verbs|sanity) e=("$R/unaos") ;;
         deps) e=(--check) ;;
         banner) e=(--registry "${_feats%,}") ;;
+        image-line) e=(--line "$R/unaos/scripts/image-line.env") ;;   # FOLDBUILD (B517): the image build line's file against arroyo's knob map and the builder's
         *) e=() ;;
     esac
     case "$p" in
@@ -13657,6 +13721,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         banner)     sed -i '/^bc_table() {$/,/^TABLE$/ s/^\(ahci|AHCI: selfcheck|-|measured\)$/\1\nzzgateplant|:: ZZGATEPLANT: row for no feature|-|measured/' "$C/unaos/scripts/banner-cert.sh"; echo zzgateplant ;;
         k8reach)    sed -i 's/^_feats=""$/&\n[ -n "${UNAOS_ZZGATEPLANT:-}" ] \&\& _feats="${_feats}zzgateplant,"/' "$C/unaos/arroyo"; echo ZZGATEPLANT ;;
         sanity)     printf 'pub fn p() { assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 2); }\n' > "$K/video/zz_gateplant_sanity.rs"; echo zz_gateplant_sanity ;; # SANITYLEGS (B488): flight 26's reboot-loop assert, planted as a runtime assert over consts
+        image-line) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line.env"; echo ZZGATEPLANT ;; # FOLDBUILD (B517); last in GATES_SET, so no restore is owed
         *) return 1 ;;
     esac
 }
@@ -13845,6 +13910,9 @@ case "${1:-}" in
         ;;
     bootleg)
         bash "$WORKSPACE_DIR/scripts/boot-leg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # SMALLFIX7 (B501): the metal feature line BOOTED under QEMU, tests-at-boot OFF (flight 27 PREHEAP). NOT a host gate: the seat's fold gate runs it; `--judge <log>` reads a capture only
+        ;;
+    foldleg)
+        bash "$WORKSPACE_DIR/scripts/foldleg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # FOLDBUILD (B517): the x86 kernel + loader BUILT under scripts/image-line.env (the builder's own derivation, --build-only), a fold leg beside the compile legs; no media, no QEMU, never SELFBUILD's staging. The banner arroyo printed above is the CALLER's env; the leg prints the line's own
         ;;
     clean)
         clean_all

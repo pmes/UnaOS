@@ -1756,9 +1756,9 @@ impl VfsBackend for NativeBackend {
     }
 
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
-        let path = native_abs(rel);
+        let path = native_abs(rel); let mut tx = TxCost::default();
         crate::fs::unafs::with_unafs(|fs| {
-            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let entries = fs.ls(id).map_err(|_| VfsError::NotADirectory)?;
             Ok(entries
                 .into_iter()
@@ -1781,24 +1781,24 @@ impl VfsBackend for NativeBackend {
                 } })
                 .collect())
         })
-        .map_err(unafs_err)?
+        .map_err(unafs_err).and_then(|r| { tx.report("list", &path); r }) // VFSTXCOST (B522): `[vfs] tx` over 20 ms, after the hold
     }
 
     fn read_dir_kinds(&self, rel: &str) -> Result<Vec<(String, NodeKind)>, VfsError> {
-        let path = native_abs(rel); // JOBSCAN (B497): the directory blob alone — one bounded transaction, no inode read per row
+        let path = native_abs(rel); let mut tx = TxCost::default(); // JOBSCAN (B497): the directory blob alone — one bounded transaction, no inode read per row
         crate::fs::unafs::with_unafs(|fs| {
-            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let entries = fs.ls(id).map_err(|_| VfsError::NotADirectory)?;
             Ok(entries.into_iter().filter(|e| e.name != "." && e.name != ".." && e.kind != ::unafs::FileKind::System).map(|e| (e.name, native_kind(e.kind))).collect())
         })
-        .map_err(unafs_err)?
+        .map_err(unafs_err).and_then(|r| { tx.report("list", &path); r }) // VFSTXCOST (B522): `[vfs] tx` over 20 ms, after the hold
     }
 
 
     fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
-        let path = native_abs(rel);
+        let path = native_abs(rel); let mut tx = TxCost::default();
         crate::fs::unafs::with_unafs(|fs| {
-            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
             Ok(Stat {
                 kind: native_kind(ino.kind),
@@ -1807,13 +1807,13 @@ impl VfsBackend for NativeBackend {
                 mtime: if ino.mtime == 0 { None } else { Some(ino.mtime) }, // UNAFSTIME (B308): the inode's stamp
             })
         })
-        .map_err(unafs_err)?
+        .map_err(unafs_err).and_then(|r| { tx.report("resolve", &path); r }) // VFSTXCOST (B522): `[vfs] tx` over 20 ms, after the hold
     }
 
     fn read(&self, rel: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
-        let path = native_abs(rel);
+        let path = native_abs(rel); let mut tx = TxCost::default();
         crate::fs::unafs::with_unafs(|fs| {
-            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
             if matches!(native_kind(ino.kind), NodeKind::Dir) {
                 return Err(VfsError::IsADirectory);
@@ -1821,7 +1821,7 @@ impl VfsBackend for NativeBackend {
             fs.read_data(id, offset, len as u64)
                 .map_err(|_| VfsError::Backend("unafs-read"))
         })
-        .map_err(unafs_err)?
+        .map_err(unafs_err).and_then(|r| { tx.report("read", &path); r }) // VFSTXCOST (B522): `[vfs] tx` over 20 ms, after the hold
     }
 
     fn authorize_read(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
@@ -3644,4 +3644,109 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// VFSTXCOST (rmbp-ledger B522) — the `[vfs] tx` line: one UnaFS read transaction's cost, split.
+//
+// Printed for any native read transaction (`read_dir`, `read_dir_kinds`, `stat`, `read`) over
+// `TX_LINE_MS`, AFTER the `with_unafs` hold is released (a serial line inside the IRQ-masked hold
+// would lengthen the very span it reports). One line, the LOCKREG stamp shape:
+//   `[vfs] tx what=<list|resolve|read> path=<p> resolve_ms=<n> list_ms=<n> blocks=<n> hits=<n> gen=<n>`
+// `resolve_ms` is `resolve_path` (one `ls_via` per component from the root), `list_ms` the rest of
+// the closure (the listing, the inode reads, the data read); `blocks` the medium fetches the device
+// issued (a 32 KiB read-ahead window on the SD card, one block elsewhere) and `hits` the block reads a
+// resident window served (`fs::unafs::tx_io`); `gen` the committed root generation the transaction read.
+// The fields are counted from the last attempt's start, so an UNAFSTXN restart reports its final run.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// VFSTXCOST: a transaction slower than this prints its `[vfs] tx` line.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+const TX_LINE_MS: u64 = 20;
+
+/// VFSTXCOST: the marks one native read transaction takes inside its hold.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+#[derive(Default)]
+struct TxCost {
+    t0: u64,
+    t1: u64,
+    f0: u64,
+    h0: u64,
+    root_gen: u64,
+}
+
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+impl TxCost {
+    /// At the attempt's first step, inside the hold.
+    fn start(&mut self) {
+        let (f0, h0) = crate::fs::unafs::tx_io();
+        *self = TxCost { t0: crate::hidstall::now_us(), t1: 0, f0, h0, root_gen: 0 };
+    }
+
+    /// `resolve_path` returned (found or not) at committed generation `root_gen`.
+    fn resolved(&mut self, root_gen: u64) {
+        self.t1 = crate::hidstall::now_us();
+        self.root_gen = root_gen;
+    }
+
+    /// After the hold: print the line if the transaction took longer than [`TX_LINE_MS`].
+    fn report(&self, what: &str, path: &str) {
+        let t2 = crate::hidstall::now_us();
+        if self.t0 == 0 || t2.saturating_sub(self.t0) <= TX_LINE_MS * 1000 {
+            return;
+        }
+        let (f, h) = crate::fs::unafs::tx_io();
+        let t1 = if self.t1 == 0 { t2 } else { self.t1 };
+        serial_println!(
+            "[vfs] tx what={} path={} resolve_ms={} list_ms={} blocks={} hits={} gen={}",
+            what,
+            path,
+            t1.saturating_sub(self.t0) / 1000,
+            t2.saturating_sub(t1) / 1000,
+            f.wrapping_sub(self.f0),
+            h.wrapping_sub(self.h0),
+            self.root_gen
+        );
+    }
+}
+// =================================================================================================
+// RING3EXEC (rmbp-ledger B521) — the ring-3 directory listing under the ownership ACL. TAIL-APPENDED: this file's
+// panic Locations are line-pinned, so nothing above moves. HOLOCRON2 (B355) confined `PATH_R_LIST` to the
+// caller's home because the listing read the directory with NO principal at all (`read_dir` is kernel-mode);
+// the home rule stood in for an ACL check that was never made. This is that check: the DIRECTORY is opened for
+// read AS THE CALLER through the resolved backend's `open_read` — native UnaFS asks `unafs::read_authz` on the
+// directory's own inode (`owner` / `grants:<principal>` with the read right; ROOTACL's `system` reads for
+// everyone), a foreign volume its mount capability — and only a permitted directory is listed. Shared by
+// `selfdiag::list_dir` (the selfdiag build) and the x86 default kernel's `SYS_PATH_READ` (`arch/x86_64/syscall.rs`).
+// =================================================================================================
+
+impl MountTable {
+    /// The entries of the directory `path` if `principal` may read it: `Denied` by the ACL's word,
+    /// `NotADirectory` for a file, else the backend's listing.
+    pub fn list_as(&self, path: &str, principal: &str) -> Result<Vec<DirEnt>, VfsError> {
+        let st = self.open_read(path, principal)?;
+        if st.kind != NodeKind::Dir {
+            return Err(VfsError::NotADirectory);
+        }
+        self.read_dir(path)
+    }
+}
+
+/// The `PATH_R_LIST` wire body for `ents`: names `\n`-terminated, a directory's with a trailing `/`, `.` and
+/// `..` left out; the window from byte `off`, at most `cap` bytes.
+pub fn listing_window(ents: &[DirEnt], off: u64, cap: usize) -> Vec<u8> {
+    let mut all = Vec::new();
+    for e in ents {
+        if e.name == "." || e.name == ".." {
+            continue;
+        }
+        all.extend_from_slice(e.name.as_bytes());
+        if e.kind == NodeKind::Dir {
+            all.push(b'/');
+        }
+        all.push(b'\n');
+    }
+    let o = (off as usize).min(all.len());
+    let n = (all.len() - o).min(cap);
+    all[o..o + n].to_vec()
 }

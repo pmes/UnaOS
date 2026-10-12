@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# MIDDENTWIN (LEDGER SR75, R104): `APPS/MIDDEN.ELF` — Midden, the Shell (CODEX §2), as a ring-3 program on
+# UnaOS: one compositor window (SYS_WIN_CREATE .. SYS_WIN_PRESENT, the INPUT_EV_* ring) whose every typed line
+# is planned by `midden_core` — the SAME core the kernel's shell links (`crates/kernel/src/shell.rs`) and the
+# host Midden links. The LUMENAPP shape (crates/user-lumen, rmbp-ledger B323): own workspace root, no_std/
+# no_main, linked in the ELF window (user-midden-x86.ld), text through font_core::ui from the DejaVu faces on
+# the volume with the font8x8 grid as fallback.
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent workspace never builds
+# this no_std/no_main program for the host during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-midden"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-midden"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+
+# una-abi: the syscall numbers, the INPUT_EV_* layout, the window landmarks, UserStat, WHOAMI (zero bytes).
+# midden_core: the shell core — Facts, plan, help, the ring-3 served set (default-features off, as the kernel).
+# vein_ring3: only its ring-3 plumbing — the syscall stub (`sys`), the SYS_SBRK size-class heap and the
+#   SYS_PATH_READ request (`files::path_read`), the ones LUMEN.ELF uses; no network or TLS code is called.
+# font_core: the window's text (KERNELFONT2's engine); font8x8: the grid when no face is on the volume.
+[dependencies]
+una-abi = { path = "../una-abi" }
+midden_core = { path = "../../libs/sys/midden_core", default-features = false }
+vein_ring3 = { path = "../../libs/sys/vein_ring3" }
+font_core = { path = "../../libs/text/font_core" }
+font8x8 = { version = "0.3.1", default-features = false }

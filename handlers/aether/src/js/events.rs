@@ -689,6 +689,38 @@ pub fn synthetic_click(vm: &mut Vm, n: usize) {
     click_with_activation(vm, n, false);
 }
 
+/// A trusted pointer-motion event at element `n` (UI Events §5.3, AETHERHOVER SR67): `mousemove`,
+/// `mouseover` and `mouseout` bubble, are cancelable and composed; `mouseenter` and `mouseleave` do
+/// neither (§5.3.4: the engine fires one per element entered / left, so an ancestor's listener hears its
+/// own boundary, not a bubbled child's). `client` is the viewport position (`clientX/Y`, mirrored into
+/// `screenX/Y`, and `pageX/x/offsetX` alias it); `related` the element the pointer came from or went to
+/// (`relatedTarget`, null at the viewport edge). Returns whether any listener ran.
+pub fn user_mouse(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64), related: Option<usize>) -> bool {
+    if super::engine_poisoned() {
+        return false;
+    }
+    let boundary_pair = matches!(ty, "mouseenter" | "mouseleave");
+    let init = vm.new_plain_object();
+    let ri = root(vm, Value::Object(init));
+    for (k, v) in [("clientX", client.0), ("clientY", client.1), ("screenX", client.0), ("screenY", client.1)] {
+        let _ = vm.create_data_property(init, PropertyKey::from_str(k), num(v));
+    }
+    let rel = match related {
+        Some(r) => target_value(vm, TargetKey::Node(r)),
+        None => Value::Null,
+    };
+    let _ = vm.create_data_property(init, PropertyKey::from_str("relatedTarget"), rel);
+    let e = new_event(vm, "MouseEvent", ty, !boundary_pair, !boundary_pair, Some(init));
+    if !boundary_pair {
+        set_flag(vm, e, F_COMPOSED, true);
+    }
+    let r = root(vm, Value::Object(e));
+    let (_, ran) = dispatch(vm, e, TargetKey::Node(n));
+    unroot(vm, r);
+    unroot(vm, ri);
+    ran
+}
+
 /// Fires `click` at `n` with the checkbox/radio legacy-pre-activation behavior and the `input`/`change`
 /// events that follow (HTML §4.10.5.1.15/16). Returns (not canceled, ran).
 fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {

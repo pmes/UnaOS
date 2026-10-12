@@ -35,6 +35,19 @@
 //! * THE TRACKPAD ON THE WIRE. [`tp_wire_due`] paces `[tp] mt` to one serial line per [`TP_WIRE_MS`] while a finger is
 //!   down, so the pointer route never goes dark (QUIETBOOT moved every other `[tp]` line to the bootlog).
 //! * `tests inputstall` — the live minute's INPUTSTALL reading, on demand (R80).
+//!
+//! SMALLFIX8 (rmbp-ledger B516) — flight 28's `HIDSTALL … hid_stall_s=1 dock_timeouts=1 … hold_worst_ms=483
+//! hold_worst=usb-pump:flight-recorder -> FAIL`. A masked hold on the pump core starves the hid pump for its length: the
+//! census names it, so it is not an unexplained stall and a dock press it overlapped is not a lost release. Every
+//! holder over [`HOLD_OVER_MS`] also lands in a small ring of `(end_ms, hold_ms)` ([`held_between`]), and:
+//! * a stall second whose gap a named hold in the last [`HELD_WINDOW_MS`] covers (`hold + HID_GAP_STALL_MS > gap`) is
+//!   counted `held_stall_s=`, not `hid_stall_s=` — the verdict reads the unexplained seconds; the hold itself stays on
+//!   the census (`holders=`, `hold_worst=`) and on the stall line;
+//! * the Dock's release wait, from the press's delivery `t0`, is [`dock_release_wait_ms`]: wall time minus the pump's
+//!   own holds inside it; a timeout whose last [`DOCK_RELEASE_TIMEOUT_MS`] held the pump core for a frame or more is
+//!   `dock_held=`, never `dock_timeouts=` (a lost release), and says so: `[hid] dock timeout held_ms=<n> -> pump-held`;
+//! * a timed-out press's release, when it does come, is timed press-to-release (`timeout_release_ms=`): a long click
+//!   reads over 400, a lost release reads 0.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 
@@ -54,6 +67,11 @@ static KEYQ_MAX_MS: AtomicU64 = AtomicU64::new(0);
 static DOCK_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 static MASKED_MAX_MS: AtomicU64 = AtomicU64::new(0);
 static SEC_MASKED_MS: AtomicU64 = AtomicU64::new(0);
+/// SMALLFIX8 (B516): stall seconds a named pump-core hold covered; dock timeouts that the pump's own hold explains.
+static HID_STALL_HELD_S: AtomicU32 = AtomicU32::new(0);
+static DOCK_HELD: AtomicU32 = AtomicU32::new(0);
+/// SMALLFIX8: the worst UNEXPLAINED stall second's gap (ms) — what `hid_stall_s=` counts, by size.
+static STALL_GAP_MAX_MS: AtomicU64 = AtomicU64::new(0);
 /// Per interrupt-endpoint index: when it halted (ms), for the recovery's `after_ms=`.
 static HALT_AT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
@@ -101,7 +119,14 @@ pub fn note_recovered(ctl: usize, addr: u8, ep: u8, ep_i: usize) {
 /// `lag`'s second roll at the desktop: the second's longest HID gap and the minute's key-queue max so far.
 pub fn note_sec(hid_gap_ms: u64, keyq_ms: u64) {
     if hid_gap_ms >= HID_GAP_STALL_MS {
-        HID_STALL_S.fetch_add(1, Relaxed);
+        // SMALLFIX8 (B516): a gap a named pump-core hold covers is the holder's (the census names it), not a lost pass.
+        let now = crate::arch::ms();
+        if held_between(now.saturating_sub(HELD_WINDOW_MS), now) + HID_GAP_STALL_MS > hid_gap_ms {
+            HID_STALL_HELD_S.fetch_add(1, Relaxed);
+        } else {
+            HID_STALL_S.fetch_add(1, Relaxed);
+            STALL_GAP_MAX_MS.fetch_max(hid_gap_ms, Relaxed);
+        }
     }
     KEYQ_MAX_MS.fetch_max(keyq_ms, Relaxed);
 }
@@ -135,12 +160,22 @@ pub fn take_sec_masked() -> u64 {
     SEC_MASKED_MS.swap(0, Relaxed)
 }
 
-/// A pin press timed out into its launch.
+/// A pin press timed out into its launch. SMALLFIX8 (B516): if the pump core was held for a frame or more inside the
+/// wait (the timeout runs on the `usb-pump`, the release is decoded by the `hid-pump` on the same core), the timeout is
+/// the holder's — `dock_held=` — never a lost release; either way the press's release, when it comes, is timed.
 pub fn note_dock_timeout() {
-    DOCK_TIMEOUTS.fetch_add(1, Relaxed);
+    let now = crate::arch::ms();
+    let held = held_between(now.saturating_sub(DOCK_RELEASE_TIMEOUT_MS), now);
+    let pump_held = held >= HID_GAP_STALL_MS;
+    if pump_held { DOCK_HELD.fetch_add(1, Relaxed); } else { DOCK_TIMEOUTS.fetch_add(1, Relaxed); }
+    TIMEOUT_RELEASE_OWED.store(true, Relaxed);
+    serial_println!(
+        "[hid] dock timeout held_ms={} window_ms={} worst={} -> {} (SMALLFIX8: a pump-core hold is the holder's, not a lost release)",
+        held, DOCK_RELEASE_TIMEOUT_MS, HolderName(session_worst().0), if pump_held { "pump-held" } else { "no-release" }
+    );
 }
 
-/// The verdict. Pure.
+/// The verdict (`hid_stall_s` = the UNEXPLAINED stall seconds; SMALLFIX8 counts held ones apart). Pure.
 pub fn verdict(halted: u32, hid_stall_s: u32, keyq_ms: u64) -> bool {
     halted == 0 && hid_stall_s == 0 && keyq_ms <= KEY_QUEUE_BOUND_MS
 }
@@ -149,8 +184,9 @@ pub fn verdict(halted: u32, hid_stall_s: u32, keyq_ms: u64) -> bool {
 pub fn ensure() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        crate::tests::register("hidstall", selftest);
+        crate::tests::register("hidstall", selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::renderwedge::ensure_tests(); // RENDERWEDGE (B520): `tests renderwedge` (same-line fold)
         crate::tests::register("inputstall", crate::video::lag::inputstall_selftest);
+        crate::tests::register("queuesleep", crate::queuesleep::selftest); // QUEUESLEEP (B512, R103 §2): the idle window and one key, timed
     }
 }
 
@@ -159,10 +195,11 @@ fn selftest() {
     let s = HID_STALL_S.load(Relaxed);
     let k = KEYQ_MAX_MS.load(Relaxed);
     serial_println!(
-        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={}",
+        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={}",
         h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed),
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
-        holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu())
+        holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
+        HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed)
     );
 }
 
@@ -252,6 +289,8 @@ pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8
     if hold_ms <= HOLD_OVER_MS {
         return;
     }
+    let at = crate::arch::ms(); // SMALLFIX8 (B516): the hold's end, into the ring `held_between` reads (overflow holds too)
+    HELD_RING[HELD_IX.fetch_add(1, Relaxed) % HELD_RING_N].store(at << 20 | hold_ms.min(HELD_MS_MASK), Relaxed);
     let (np, nl) = name.map(|n| (n.as_ptr() as usize, n.len())).unwrap_or((0, 0));
     let mut ix = usize::MAX;
     for (i, h) in HOLD.iter().enumerate() {
@@ -278,6 +317,41 @@ pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8
     h.n_all.fetch_add(1, Relaxed);
     h.worst_all.fetch_max(hold_ms, Relaxed);
     SEC_HOLD.fetch_max(hold_ms << 8 | (ix as u64 + 1), Relaxed);
+}
+
+// ── SMALLFIX8 (B516): when the pump core was held, for the stall second and the Dock's release wait ─────────────────
+
+/// The last holds over [`HOLD_OVER_MS`] on the pump core, packed `end_ms << 20 | hold_ms` (hold capped at
+/// [`HELD_MS_MASK`]); one writer (the pump core's tick ISR), readers sum overlaps. Eight is two seconds of the worst
+/// cadence flight 28 read (12 holds a minute) many times over; an older hold has left every window that reads it.
+const HELD_RING_N: usize = 8;
+const HELD_MS_MASK: u64 = (1 << 20) - 1;
+static HELD_RING: [AtomicU64; HELD_RING_N] = [const { AtomicU64::new(0) }; HELD_RING_N];
+static HELD_IX: AtomicUsize = AtomicUsize::new(0);
+/// A stall second is checked against the holds that ended in this window: the gap and the hold that caused it can be
+/// rolled into adjacent seconds (the hold is charged on the first tick after it, the gap at the pass after it).
+pub const HELD_WINDOW_MS: u64 = 2_000;
+
+/// Milliseconds of `[from, to]` the pump core spent held (sum of each ringed hold's overlap with the interval).
+pub fn held_between(from: u64, to: u64) -> u64 {
+    let mut sum = 0u64;
+    for e in HELD_RING.iter() {
+        let w = e.load(Relaxed);
+        if w == 0 {
+            continue;
+        }
+        let (end, ms) = (w >> 20, w & HELD_MS_MASK);
+        let (a, b) = (end.saturating_sub(ms).max(from), end.min(to));
+        sum += b.saturating_sub(a);
+    }
+    sum
+}
+
+/// The Dock's release wait for a press DELIVERED to it at `t0` (its `PIN_T0`), at `now`: wall time minus the pump
+/// core's own holds inside it — the release is decoded by the `hid-pump` on that core, so a held core is no time the
+/// release could have arrived in. The timeout fires when THIS reaches [`DOCK_RELEASE_TIMEOUT_MS`].
+pub fn dock_release_wait_ms(t0: u64, now: u64) -> u64 {
+    now.saturating_sub(t0).saturating_sub(held_between(t0, now))
 }
 
 /// The second's worst pump-core hold, taken (reset) at `lag`'s roll: `(ms, holder index or usize::MAX)`.
@@ -369,6 +443,9 @@ pub fn census_minute() {
 static PRESS_PUSH_MS: AtomicU64 = AtomicU64::new(0);
 static RELEASE_PUSH_MS: AtomicU64 = AtomicU64::new(0);
 static RELEASES_WAITED: AtomicU32 = AtomicU32::new(0);
+/// SMALLFIX8 (B516): a press timed out and its release has not been seen yet; the latest such press-to-release (ms).
+static TIMEOUT_RELEASE_OWED: AtomicBool = AtomicBool::new(false);
+static TIMEOUT_RELEASE_MS: AtomicU64 = AtomicU64::new(0);
 static LANE_MAX_MS: AtomicU64 = AtomicU64::new(0);
 
 /// A decoder pushed a primary button edge into the pal ring (EHCI trackpad arms: `note_buttons`' answer).
@@ -377,7 +454,12 @@ pub fn note_button_edge(press: bool, release: bool) {
     if press {
         PRESS_PUSH_MS.store(crate::arch::ms().max(1), Relaxed);
     } else if release {
-        RELEASE_PUSH_MS.store(crate::arch::ms().max(1), Relaxed);
+        let now = crate::arch::ms().max(1);
+        RELEASE_PUSH_MS.store(now, Relaxed);
+        if TIMEOUT_RELEASE_OWED.load(Relaxed) && TIMEOUT_RELEASE_OWED.swap(false, Relaxed) {
+            let p = PRESS_PUSH_MS.load(Relaxed);
+            if p != 0 { TIMEOUT_RELEASE_MS.store(now.saturating_sub(p), Relaxed); } // SMALLFIX8: the timed-out press's click length
+        }
     }
 }
 

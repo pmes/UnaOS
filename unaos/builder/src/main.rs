@@ -98,6 +98,21 @@ fn kfont_licences(family: &str) -> &'static [&'static str] {
     }
 }
 
+/// AETHERMETAL (LEDGER SR66): the page APPS/AETHER.ELF opens — `crates/user-aether/doc/welcome.html`, the M1
+/// fixture and demo (headings, paragraphs with em/strong/a/code, a nested ul/ol, a blockquote, a pre block, author
+/// colours/margins/padding in a <style>) — staged as `<volume>/system/doc/welcome.html`. Returns whether it was.
+fn stage_welcome(workspace_dir: &std::path::Path, volume: &std::path::Path) -> bool {
+    let src = workspace_dir.join("crates/user-aether/doc/welcome.html");
+    if !src.exists() {
+        println!("   AETHER: {} absent — no system/doc/welcome.html on {}", src.display(), volume.display());
+        return false;
+    }
+    let dir = volume.join("system/doc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(&src, dir.join("welcome.html")).unwrap();
+    true
+}
+
 /// Stage the KERNELFONT faces into `<volume>/system/fonts/`; returns the files staged.
 fn stage_fonts(extra_dirs: &[std::path::PathBuf], volume: &std::path::Path) -> Vec<String> {
     let mut dirs: Vec<std::path::PathBuf> = extra_dirs.to_vec();
@@ -955,6 +970,9 @@ fn main() {
     if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
     // LUMENBIN: UNAOS_LUMEN=1 arms the lumen dock pin by default and `tests lumen`. Kept in sync with arroyo.
     if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
+    if std::env::var("UNAOS_MIDDEN").is_ok() { feats.push("midden"); } // MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs). Kept in sync with arroyo.
+    // AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (APPS/AETHER.ELF validated, spawned, its page report read). Kept in sync with arroyo.
+    if std::env::var("UNAOS_AETHER").is_ok() { feats.push("aether"); }
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.
     if std::env::var("UNAOS_NETRING3").is_ok() { feats.push("netring3"); }
     // SELFDIAG (B324): UNAOS_SELFDIAG=1 arms the boot log on disk, SYS_PATH_READ/WRITE and `tests selfdiag`. Kept in sync with arroyo.
@@ -1103,6 +1121,9 @@ fn main() {
     if !bootloader_status.success() {
         panic!("Bootloader build failed");
     }
+    // FOLDBUILD (B517): `--build-only` stops HERE — the same two cargo builds every media path runs, with this file's own
+    // env→feature derivation above, and nothing after: no ESP, no staging, no fetch, no QEMU (`./arroyo foldleg`, a fold leg).
+    if std::env::args().any(|a| a == "--build-only") { println!("✅ x86_64 kernel + bootloader built (--build-only: no ESP, no QEMU)"); return; }
 
     let kernel_bin = target_dir.join("x86_64-unaos/release/unaos-kernel");
     let bootloader_bin = target_dir.join("x86_64-unknown-uefi/release/bootloader.efi");
@@ -1346,6 +1367,17 @@ fn main() {
     } else {
         println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.ELF (run via ./arroyo esp-x86)");
     }
+    // AETHERMETAL (SR66): Aether, the browser, as ONE ring-3 program (crates/user-aether, built by arroyo's
+    // build_user_aether_x86 to target/AETHER-X86.ELF), staged as APPS/AETHER.ELF — a bare `aether` or
+    // `run /apps/AETHER.ELF` opens /system/doc/welcome.html (staged beside it, below) in a window.
+    let aether_elf = target_dir.join("AETHER-X86.ELF");
+    if aether_elf.exists() {
+        std::fs::copy(&aether_elf, esp_apps.join("AETHER.ELF")).unwrap();
+        println!("   AETHER: copied AETHER.ELF into APPS/ on the ESP (aether)");
+    } else {
+        println!("   AETHER: target/AETHER-X86.ELF absent — ESP has no AETHER.ELF (run via ./arroyo esp-x86)");
+    }
+    let _ = stage_welcome(&workspace_dir, &esp_dir);
     // NETRING3 M3 (B306): the ring-3 network client (crates/user-net, built by arroyo's build_user_net_x86 to
     // target/NET-X86.ELF), staged as APPS/NET.ELF — `bg /apps/NET.ELF` resolves, connects :80 and prints
     // the `:: NETRING3:` verdict (UNAOS_NETRING3=1).
@@ -1456,6 +1488,7 @@ fn main() {
         (target_dir.join("PREFS-X86.ELF"), "PREFS.ELF"),
         // LUMENBIN: the chat window rides the DATA volume too — `lumen` reads it there.
         (target_dir.join("LUMEN-X86.ELF"), "LUMEN.ELF"),
+        (target_dir.join("MIDDEN-X86.ELF"), "MIDDEN.ELF"), // MIDDENTWIN (SR75): the ring-3 shell — `run /apps/MIDDEN.ELF` and `tests midden` read it here
         // NETRING3 M3: the network client rides the DATA volume too — `bg /apps/NET.ELF` reads it there.
         (target_dir.join("NET-X86.ELF"), "NET.ELF"),
         // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.ELF there.
@@ -1464,6 +1497,8 @@ fn main() {
         (target_dir.join("DIAG-X86.ELF"), "DIAG.ELF"),
         // HOLOCRON2 (B355): the secrets handler rides the DATA volume too — the login launch and `holocron` read it there.
         (target_dir.join("HOLOCRON-X86.ELF"), "HOLOCRON.ELF"),
+        // AETHERMETAL (SR66): the browser rides the DATA volume too — `aether` and `tests aether` read it there.
+        (target_dir.join("AETHER-X86.ELF"), "AETHER.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
@@ -1479,6 +1514,10 @@ fn main() {
     if trust_ok {
         stage_trust(&trust_src, &data_dir);
         staged_data.push("system/trust/roots.pem");
+    }
+    // AETHERMETAL (SR66): the page AETHER.ELF opens rides the DATA volume too (system/doc/welcome.html).
+    if stage_welcome(&workspace_dir, &data_dir) {
+        staged_data.push("system/doc/welcome.html");
     }
     // KERNELFONT (B359): the faces ride the DATA volume too — `video::text` reads /system/fonts there.
     if !stage_fonts(&kfont_dirs_env(), &data_dir).is_empty() {

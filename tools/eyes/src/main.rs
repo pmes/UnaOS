@@ -34,6 +34,9 @@ struct Source {
     ledger: Option<String>,
     wait_ms: Option<u64>,
     timeout_s: Option<u64>,
+    /// Chromium oracle only (SR67): hold the mouse at viewport "X,Y" before the screenshot, so a
+    /// `:hover` state is in the reference (the subject holds the same point, e.g. `--pointer X,Y`).
+    hover: Option<String>,
 }
 
 impl Source {
@@ -51,6 +54,7 @@ impl Source {
             ledger: self.ledger.clone().or(base.ledger.clone()),
             wait_ms: self.wait_ms.or(base.wait_ms),
             timeout_s: self.timeout_s.or(base.timeout_s),
+            hover: self.hover.clone().or(base.hover.clone()),
         }
     }
 }
@@ -280,7 +284,8 @@ fn run(suite_name: &str, args: &[String]) -> ExitCode {
                 if !fresh {
                     let _ = std::fs::remove_file(&refp);
                     let url = c.fill(c.oracle.url.as_deref().unwrap_or("{url}"));
-                    tsv.push_str(&format!("{url}\t{}\t{}\t{}\n", refp.display(), c.w, c.h));
+                    let hover = c.oracle.hover.as_deref().unwrap_or("");
+                    tsv.push_str(&format!("{url}\t{}\t{}\t{}\t{hover}\n", refp.display(), c.w, c.h));
                 }
             }
             Some("golden") => {
