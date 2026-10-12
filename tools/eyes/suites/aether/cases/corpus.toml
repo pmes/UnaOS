@@ -119,3 +119,6 @@ oracle = { script = "(() => { const p = document.getElementById('sel'); document
 [[case]]
 name = "28-generated"
 page = "corpus/28-generated.html"
+[[case]]
+name = "26-controls"
+page = "corpus/26-controls.html"

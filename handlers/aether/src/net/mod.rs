@@ -72,6 +72,13 @@ pub fn normalize_url(input: &str) -> Vec<String> {
 }
 
 pub async fn fetch_document(input: &str) -> Result<String> {
+    fetch_document_final(input).await.map(|(text, _)| text)
+}
+
+/// [`fetch_document`] that also returns the FINAL response URL — after redirects (and after the
+/// https-then-http guess for a scheme-less input): the document's URL, which its relative URLs resolve
+/// against and the address bar shows (HTML §7.4.1, the response's URL).
+pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
     if input.starts_with("file://") {
         anyhow::bail!("file:// fetches are disabled for security reasons.");
     }
@@ -88,6 +95,7 @@ pub async fn fetch_document(input: &str) -> Result<String> {
                 if !response.status().is_success() {
                     return Err(anyhow::anyhow!("HTTP Error: {}", response.status()));
                 }
+                let final_url = response.url().to_string();
                 
                 if response.content_length().unwrap_or(0) > 10 * 1024 * 1024 {
                     anyhow::bail!("Response exceeds size limit");
@@ -99,7 +107,7 @@ pub async fn fetch_document(input: &str) -> Result<String> {
                 }
                 
                 let text = String::from_utf8(bytes).context("Invalid UTF-8")?;
-                return Ok(text);
+                return Ok((text, final_url));
             }
             Err(e) => {
                 last_err = Some(anyhow::anyhow!(e).context("Connection failure"));
@@ -112,20 +120,27 @@ pub async fn fetch_document(input: &str) -> Result<String> {
 
 /// POSTs a urlencoded form body and returns the response document.
 pub async fn post_document(url: &str, body: &str) -> Result<String> {
+    post_document_typed(url, "application/x-www-form-urlencoded", body).await.map(|(html, _)| html)
+}
+
+/// POSTs a form submission body of `content_type` (its enctype; multipart names its boundary) and
+/// returns (response document, final URL after redirects — a 303 after a POST lands on a GET page).
+pub async fn post_document_typed(url: &str, content_type: &str, body: &str) -> Result<(String, String)> {
     let response = client()
         .post(url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Content-Type", content_type)
         .body(body.to_string())
         .send()
         .await?;
     if !response.status().is_success() {
         anyhow::bail!("HTTP Error: {}", response.status());
     }
+    let final_url = response.url().to_string();
     let bytes = response.bytes().await.context("Failed to read body")?;
     if bytes.len() > 10 * 1024 * 1024 {
         anyhow::bail!("Response body exceeds size limit");
     }
-    String::from_utf8(bytes).context("Invalid UTF-8")
+    Ok((String::from_utf8(bytes).context("Invalid UTF-8")?, final_url))
 }
 
 /// Collects absolute URLs of `<link rel="stylesheet">` sheets in `html`,
@@ -564,11 +579,9 @@ pub async fn fetch_image_bytes(url: &str) -> Result<Vec<u8>> {
 /// half of the fetch-then-apply pattern. Resource failures are skipped
 /// (and ledgered), never fatal to the page load.
 pub async fn fetch_page(input: &str) -> Result<Page> {
-    let html = fetch_document(input).await?;
-    let base = normalize_url(input)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| input.to_string());
+    // The page's base is the FINAL response URL (after redirects): relative stylesheet, script,
+    // image and link URLs resolve against it, and it is the history entry the address bar shows.
+    let (html, base) = fetch_document_final(input).await?;
     // All stylesheets fetch CONCURRENTLY (a page with a dozen sheets paid
     // a dozen round-trips in series before this).
     let sheet_results = futures_util::future::join_all(

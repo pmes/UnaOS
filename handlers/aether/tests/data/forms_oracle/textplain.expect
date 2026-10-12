@@ -1,0 +1,4 @@
+METHOD POST
+URL http://oracle.test/submit
+CONTENT-TYPE text/plain
+BODY-BASE64 cT11bmEgb3MNCnQ9eA0KeQ0Kcj0xDQpiPTENCg==

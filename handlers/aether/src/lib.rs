@@ -75,7 +75,22 @@ struct SelDrag {
     granularity: u8,
     lo: selection::Point,
     hi: selection::Point,
+    /// AETHERINPUT (SR68): the focused text control's caret and selection anchor (byte offsets into its
+    /// value; see `forms::edit`).
+    pub edit: forms::edit::EditState,
+    /// When the caret last moved or the value changed: the blink phase counts from here (it restarts
+    /// visible on every edit, as Chromium's does).
+    caret_epoch: std::time::Instant,
+    /// The blink phase the last frame painted.
+    caret_on: bool,
 }
+
+/// Chromium's caret blink half-period (`LayoutTheme::CaretBlinkInterval`, 500 ms).
+const CARET_BLINK_MS: u128 = 500;
+/// Chromium's keyboard scroll steps: a line is 40 px (`kPixelsPerLineStep`), a page 87.5 % of the
+/// viewport (`kMinFractionToStepWhenPaging`).
+const LINE_STEP: f64 = 40.0;
+const PAGE_FRACTION: f64 = 0.875;
 
 impl AetherEngine {
     pub fn new() -> Self {
@@ -107,6 +122,9 @@ impl AetherEngine {
             sel_gen: selection::generation(),
             layout_epoch: 1,
             painted_epoch: 0,
+            edit: forms::edit::EditState::default(),
+            caret_epoch: std::time::Instant::now(),
+            caret_on: true,
         }
     }
 
@@ -366,12 +384,20 @@ impl AetherEngine {
             js.tick();
         }
         if let Some(url) = js::take_script_navigation() {
-            self.pending_nav = Some(forms::OpenDocument { url, method: forms::HttpMethod::Get, body: None });
+            self.pending_nav = Some(forms::OpenDocument::get(url));
         }
         if js::take_mutated() {
             self.relayout();
         }
         self.sel_changed();
+        // The focused field's caret blinks: repaint its box when the phase flips.
+        if let Some(node) = self.editing_node() {
+            let on = (self.caret_epoch.elapsed().as_millis() / CARET_BLINK_MS) % 2 == 0;
+            if on != self.caret_on {
+                self.caret_on = on;
+                self.damage_node(&node);
+            }
+        }
 
         let needs_repaint = self.needs_repaint;
         self.needs_repaint = false;
@@ -559,148 +585,446 @@ impl AetherEngine {
                 self.relayout();
             }
             api::events::Event::Text(text) => {
-                if let Some(node) = &self.focused_node {
-                    if let Some(el) = node.as_element() {
-                        if &*el.name.local == "input" {
-                            let mut attrs = el.attributes.borrow_mut();
-                            let mut val = attrs.get("value").unwrap_or("").to_string();
-                            val.push_str(&text);
-                            attrs.insert("value", val);
-                            self.needs_repaint = true;
-                            // Approximate field damage rect: push full for now, layout mapping is needed
-                            self.damage_rects.push((0, 0, self.width, self.height));
-                        }
-                    }
-                }
+                // Typed characters land at the caret of the focused text control (input or textarea
+                // alike), replacing the selection.
+                self.insert_text(&text);
             }
             api::events::Event::KeyDown(key) => {
-                let focused = self.focused_node.clone();
-                if let Some(node) = focused.as_ref() {
-                    if let Some(el) = node.as_element() {
-                        if &*el.name.local == "input" {
-                            if key == "BackSpace" {
-                                let mut attrs = el.attributes.borrow_mut();
-                                let mut val = attrs.get("value").unwrap_or("").to_string();
-                                val.pop();
-                                attrs.insert("value", val);
-                                self.needs_repaint = true;
-                                self.damage_rects.push((0, 0, self.width, self.height));
-                            } else if key == "Return" {
-                                if let Some(doc_req) = self.build_form_submission(node) {
-                                    self.pending_nav = Some(doc_req);
-                                }
+                // A focused text control takes its editing keys first (forms::edit); the page only
+                // scrolls by keyboard when no field holds the keys.
+                if let Some(node) = self.editing_node() {
+                    let multiline = Self::is_textarea(&node);
+                    let mut value = forms::control_value(&node);
+                    let before = value.clone();
+                    match self.edit.key(&mut value, &key, multiline) {
+                        forms::edit::Outcome::Edited => {
+                            if value != before {
+                                js::set_control_value(&node, value);
+                                self.after_edit(&node, true);
+                            } else {
+                                self.after_edit(&node, false);
                             }
+                            return;
                         }
+                        forms::edit::Outcome::Moved | forms::edit::Outcome::Consumed => {
+                            self.after_edit(&node, false);
+                            return;
+                        }
+                        forms::edit::Outcome::Submit => {
+                            self.implicit_submission(&node);
+                            return;
+                        }
+                        forms::edit::Outcome::Unhandled => {}
+                    }
+                } else if let Some(node) = self.focused_node.clone() {
+                    // A focused checkbox, radio or button: Space (and Return on a button) activates it.
+                    let (_, k) = forms::edit::parse_key(&key);
+                    let checkable = matches!(
+                        layout::control_kind(&node),
+                        Some(layout::Control::Checkbox | layout::Control::Radio)
+                    );
+                    let button = layout::control_kind(&node) == Some(layout::Control::Button);
+                    if (k == Some(forms::edit::Key::Space) && (checkable || button))
+                        || (k == Some(forms::edit::Key::Return) && button)
+                    {
+                        self.activate(&node, (0, 0));
+                        return;
                     }
                 }
+                self.key_scroll(&key);
             }
             api::events::Event::MouseMove(x, y) => self.pointer_moved(x, y),
             api::events::Event::MouseDown(x, y) => self.selection_press(x, y),
             api::events::Event::MouseUp(x, y) => {
                 self.pointer_released(); // AETHERSELECT (SR69): the drag ends before the click is routed
-                if let Some(node) = self.hit_test(x, y) {
-                    // Script click handlers run first (bubbling); a handled
-                    // click still follows links, matching default behavior.
-                    let mut canceled = false;
-                    if let Some(js_engine) = &mut self.js_engine {
-                        js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
-                        js_engine.click(&node);
-                        canceled = js::last_click_canceled();
-                        if js::take_mutated() {
-                            self.relayout();
-                        }
+                css::note_focus_modality(true); // AETHERGEN (SR71): click focus is pointer-modal
+                let Some(node) = self.hit_test(x, y) else {
+                    self.set_focus(None);
+                    return;
+                };
+                // Script click handlers run first (bubbling); a handled
+                // click still follows links, matching default behavior.
+                // The click's activation behavior runs here too: a checkbox
+                // toggles (a radio checks, unchecking its group) before the
+                // listeners see it, reverted if one cancels.
+                let mut canceled = false;
+                if let Some(js_engine) = &mut self.js_engine {
+                    js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+                    js_engine.click(&node);
+                    canceled = js::last_click_canceled();
+                    if js::take_mutated() {
+                        self.relayout();
                     }
-                    if canceled {
-                        return;
-                    }
-                    // A click on (or inside) a media element toggles it:
-                    // play (PlayMedia toward Stria — the page's own stream,
-                    // no site code) when not playing, MediaPause when it is.
-                    media::toggle(&node);
-                    // The hit is the DEEPEST box — usually the text run
-                    // inside the link — so walk ancestors for the <a>.
-                    let mut cur = Some(node.clone());
-                    while let Some(n) = cur {
-                        if let Some(el) = n.as_element() {
-                            match el.name.local.as_ref() {
-                                "a" => {
-                                    if let Some(href) = el.attributes.borrow().get("href") {
-                                        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
-                                        let url = images::resolve(&base, href);
-                                        self.pending_nav = Some(forms::OpenDocument {
-                                            url,
-                                            method: forms::HttpMethod::Get,
-                                            body: None,
-                                        });
-                                    }
-                                    break;
+                }
+                if canceled {
+                    return;
+                }
+                // A click on (or inside) a media element toggles it:
+                // play (PlayMedia toward Stria — the page's own stream,
+                // no site code) when not playing, MediaPause when it is.
+                media::toggle(&node);
+                // The hit is the DEEPEST box — usually the text run
+                // inside the link or the button — so walk ancestors for
+                // the element whose default action the click runs.
+                let mut cur = Some(node.clone());
+                while let Some(n) = cur {
+                    if let Some(el) = n.as_element() {
+                        match el.name.local.as_ref() {
+                            "a" => {
+                                self.set_focus(None);
+                                if let Some(href) = el.attributes.borrow().get("href") {
+                                    let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+                                    let url = images::resolve(&base, href);
+                                    self.pending_nav = Some(forms::OpenDocument::get(url));
                                 }
-                                "input" | "textarea" | "select" => {
-                                    self.focused_node = Some(n.clone());
-                                    css::note_focus_modality(true); // AETHERGEN (SR71) fold: click focus is pointer-modal (:focus-visible stays off)
-                                    break;
-                                }
-                                _ => {}
+                                return;
                             }
+                            "input" | "textarea" | "select" | "button" => {
+                                if forms::is_disabled(&n) {
+                                    return;
+                                }
+                                let coords = self
+                                    .box_of(&n)
+                                    .map(|(bx, by, _, _)| {
+                                        ((x + self.scroll_x - bx as f64).max(0.0) as i32, (y + self.scroll_y - by as f64).max(0.0) as i32)
+                                    })
+                                    .unwrap_or((0, 0));
+                                self.set_focus(Some(n.clone()));
+                                if forms::is_text_editable(&n) {
+                                    // The caret goes where the click landed (the nearest grapheme
+                                    // boundary on the painted run).
+                                    let at = self.caret_from_point(&n, x, y);
+                                    self.edit = forms::edit::EditState::at(at);
+                                    self.after_edit(&n, false);
+                                } else {
+                                    self.control_clicked(&n, coords);
+                                }
+                                return;
+                            }
+                            "label" => {
+                                // A label's activation behavior: the click goes on to its control.
+                                if let Some(control) = Self::labeled_control(&n) {
+                                    if forms::is_text_editable(&control) {
+                                        self.set_focus(Some(control.clone()));
+                                    } else if !forms::is_disabled(&control) {
+                                        self.set_focus(Some(control.clone()));
+                                        self.activate(&control, (0, 0));
+                                    }
+                                    return;
+                                }
+                            }
+                            _ => {}
                         }
-                        cur = n.parent();
                     }
+                    cur = n.parent();
+                }
+                self.set_focus(None);
+            }
+        }
+    }
+
+    /// The focused control when it is a text control the user can type into.
+    fn editing_node(&self) -> Option<crate::dom::NodeRef> {
+        self.focused_node.clone().filter(forms::is_text_editable)
+    }
+
+    fn is_textarea(node: &crate::dom::NodeRef) -> bool {
+        node.as_element().is_some_and(|e| &*e.name.local == "textarea")
+    }
+
+    /// Moves focus (None blurs). A newly focused text control gets a collapsed caret at the start of its
+    /// value (Chromium restores a never-set selection to 0 on `focus()`/autofocus; a click then places it).
+    fn set_focus(&mut self, node: Option<crate::dom::NodeRef>) {
+        if self.focused_node == node {
+            return;
+        }
+        if let Some(old) = self.focused_node.take() {
+            self.damage_node(&old);
+        }
+        if let Some(n) = &node {
+            self.edit = forms::edit::EditState::at(0);
+            self.caret_epoch = std::time::Instant::now();
+            self.caret_on = true;
+            self.damage_node(n);
+        }
+        self.focused_node = node;
+    }
+
+    /// Marks `node`'s box damaged for the next frame.
+    fn damage_node(&mut self, node: &crate::dom::NodeRef) {
+        if let Some(r) = self.screen_rect_of(node) {
+            self.damage_rects.push(r);
+        }
+        self.needs_repaint = true;
+    }
+
+    /// After a key or text changed the focused field (`changed`: its value): the caret restarts its
+    /// blink visible, the page hears `input`, and the field repaints.
+    fn after_edit(&mut self, node: &crate::dom::NodeRef, changed: bool) {
+        self.caret_epoch = std::time::Instant::now();
+        self.caret_on = true;
+        if changed {
+            if let Some(js_engine) = &mut self.js_engine {
+                js_engine.fire(node, "input", true);
+                if js::take_mutated() {
+                    self.relayout();
+                }
+            }
+        }
+        self.damage_node(node);
+    }
+
+    /// Inserts `text` at the focused text control's caret (replacing its selection): line breaks are
+    /// stripped in a single-line field and normalized to LF in a textarea; `maxlength` is honored.
+    fn insert_text(&mut self, text: &str) {
+        let Some(node) = self.editing_node() else { return };
+        let multiline = Self::is_textarea(&node);
+        let mut ins = forms::edit::sanitize_insert(text, multiline);
+        let mut value = forms::control_value(&node);
+        self.edit.clamp(&value);
+        let max = node
+            .as_element()
+            .and_then(|e| e.attributes.borrow().get("maxlength").and_then(|m| m.trim().parse::<usize>().ok()));
+        if let Some(max) = max {
+            // maxlength counts UTF-16 code units (HTML §4.10.18.3); the selection is replaced.
+            let (a, b) = self.edit.selection();
+            let kept = value.encode_utf16().count() - value[a..b].encode_utf16().count();
+            let room = max.saturating_sub(kept);
+            let mut used = 0;
+            let mut cut = 0;
+            for (i, c) in ins.char_indices() {
+                if used + c.len_utf16() > room {
+                    break;
+                }
+                used += c.len_utf16();
+                cut = i + c.len_utf8();
+            }
+            ins.truncate(cut);
+        }
+        if ins.is_empty() && !self.edit.has_selection() {
+            return;
+        }
+        self.edit.insert(&mut value, &ins);
+        js::set_control_value(&node, value);
+        self.after_edit(&node, true);
+    }
+
+    /// Pastes `text` (the shell's `BrowserPaste`, from the platform clipboard) into the focused text
+    /// control at its caret: the same insertion as typing, line breaks kept only in a textarea.
+    pub fn paste(&mut self, text: &str) {
+        self.insert_text(text);
+    }
+
+    /// The caret position (byte offset into the value) nearest to the viewport point (`x`, `y`) inside
+    /// text control `node`: the grapheme boundary whose caret x is closest on the painted run (the
+    /// `text_host::line::Line::hit` rule), on the logical line under `y` in a textarea.
+    fn caret_from_point(&self, node: &crate::dom::NodeRef, x: f64, y: f64) -> usize {
+        let value = forms::control_value(node);
+        let Some((bx, by, _, _)) = self.box_of(node) else { return value.len() };
+        let Some(adv) = self.control_advancer(node) else { return value.len() };
+        let (pad_l, pad_t) = self.control_insets(node);
+        let lx = (x + self.scroll_x) as f32 - bx - pad_l;
+        let (start, end) = if Self::is_textarea(node) {
+            let line_h = crate::fonts::face(&adv.sel).map(|f| crate::fonts::line_height(f, adv.size, 0.0)).unwrap_or(adv.size * 1.2);
+            let row = (((y + self.scroll_y) as f32 - by - pad_t) / line_h).floor().max(0.0) as usize;
+            let mut s = 0;
+            for _ in 0..row {
+                match value[s..].find('\n') {
+                    Some(p) => s += p + 1,
+                    None => break,
+                }
+            }
+            (s, forms::edit::line_end(&value, s))
+        } else {
+            (0, value.len())
+        };
+        let password = forms::input_type(node) == "password" && !Self::is_textarea(node);
+        let line = &value[start..end];
+        let mut best = (f32::INFINITY, end);
+        let bounds = font_core::grapheme::clusters(line).into_iter().map(|(a, _)| a).chain(std::iter::once(line.len()));
+        for b in bounds {
+            let prefix = if password { "\u{2022}".repeat(line[..b].chars().count()) } else { line[..b].to_string() };
+            let d = (adv.str(&prefix) - lx).abs();
+            if d < best.0 {
+                best = (d, start + b);
+            }
+        }
+        best.1
+    }
+
+    /// The Advancer the control's value is painted with (its computed font).
+    fn control_advancer(&self, node: &crate::dom::NodeRef) -> Option<crate::fonts::lines::Advancer> {
+        let layout = self.layout_tree.as_ref()?;
+        let id = layout.node_map.iter().find(|(_, n)| *n == node).map(|(id, _)| *id)?;
+        render::control_advancer(layout, id)
+    }
+
+    /// (left, top) inset of the control's content box: border plus padding.
+    fn control_insets(&self, node: &crate::dom::NodeRef) -> (f32, f32) {
+        let Some(layout) = self.layout_tree.as_ref() else { return (0.0, 0.0) };
+        let Some(id) = layout.node_map.iter().find(|(_, n)| *n == node).map(|(id, _)| *id) else { return (0.0, 0.0) };
+        layout
+            .taffy
+            .layout(id)
+            .map(|l| (l.padding.left + l.border.left, l.padding.top + l.border.top))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// The control a `<label>` labels: the element its `for` names, else its first labelable descendant.
+    fn labeled_control(label: &crate::dom::NodeRef) -> Option<crate::dom::NodeRef> {
+        let labelable = |n: &crate::dom::NodeRef| {
+            n.as_element().is_some_and(|e| {
+                matches!(e.name.local.as_ref(), "button" | "select" | "textarea")
+                    || (&*e.name.local == "input" && forms::input_type(n) != "hidden")
+            })
+        };
+        let for_id = label.as_element().and_then(|e| e.attributes.borrow().get("for").map(str::to_string));
+        match for_id {
+            Some(id) => label
+                .document_node()
+                .descendants()
+                .find(|n| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some(id.as_str())))
+                .filter(labelable),
+            None => label.descendants().find(labelable),
+        }
+    }
+
+    /// Activation of a control by label, Space or Return: the click event (with its checkbox/radio
+    /// pre-activation, which a listener may cancel), then the control's default action.
+    fn activate(&mut self, node: &crate::dom::NodeRef, coords: (i32, i32)) {
+        if let Some(js_engine) = &mut self.js_engine {
+            js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+            js_engine.click(node);
+            let canceled = js::last_click_canceled();
+            if js::take_mutated() {
+                self.relayout();
+            }
+            if canceled {
+                return;
+            }
+        }
+        self.control_clicked(node, coords);
+    }
+
+    /// A click's default action on a non-text control (the click event already ran): a submit button
+    /// submits its form with itself as the submitter; a checkbox or radio repaints (its checkedness
+    /// toggled in the click's pre-activation, radio groups going exclusive).
+    fn control_clicked(&mut self, node: &crate::dom::NodeRef, coords: (i32, i32)) {
+        if forms::is_submit_button(node) {
+            self.submit_form(node, Some(node), coords);
+            return;
+        }
+        if matches!(layout::control_kind(node), Some(layout::Control::Checkbox | layout::Control::Radio)) {
+            // A radio's group mates may sit anywhere in the form: repaint the form.
+            match forms::form_owner(node) {
+                Some(f) => self.damage_node(&f),
+                None => {
+                    self.damage_rects.push((0, 0, self.width, self.height));
+                    self.needs_repaint = true;
                 }
             }
         }
     }
 
-    /// Builds a form submission from the focused control's enclosing <form>:
-    /// collects named inputs, resolves the action against the current page.
-    fn build_form_submission(&self, control: &crate::dom::NodeRef) -> Option<forms::OpenDocument> {
-        // Walk up to the enclosing form.
-        let mut cur = Some(control.clone());
-        let form_node = loop {
-            let n = cur?;
-            if let Some(el) = n.as_element() {
-                if &*el.name.local == "form" {
-                    break n;
-                }
+    /// Return in a single-line field (HTML §4.10.21.2 implicit submission): the form's default button
+    /// (its first submit button) is clicked; with none, the form submits itself — unless more than one
+    /// of its fields blocks implicit submission.
+    fn implicit_submission(&mut self, field: &crate::dom::NodeRef) {
+        let Some(form) = forms::form_owner(field) else { return };
+        let controls = forms::form_controls(&form);
+        if let Some(default) = controls.iter().find(|c| forms::is_submit_button(c)).cloned() {
+            if !forms::is_disabled(&default) {
+                self.activate(&default, (0, 0));
             }
-            cur = n.parent();
-        };
-
-        let form_el = form_node.as_element()?;
-        let attrs = form_el.attributes.borrow();
-        let action = attrs.get("action").unwrap_or("").to_string();
-        let method = if attrs.get("method").map(|m| m.eq_ignore_ascii_case("post")).unwrap_or(false) {
-            forms::HttpMethod::Post
-        } else {
-            forms::HttpMethod::Get
-        };
-        drop(attrs);
-
-        // Resolve action against the current page URL.
-        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
-        let resolved = if action.is_empty() {
-            base.clone()
-        } else {
-            url::Url::parse(&base)
-                .and_then(|b| b.join(&action))
-                .map(|u| u.to_string())
-                .unwrap_or(action)
-        };
-
-        let mut form = forms::Form::new(resolved, method);
-        if let Ok(inputs) = form_node.select("input, textarea, select") {
-            for input in inputs {
-                let dirty = js::control_value(input.as_node()).or_else(|| {
-                    (&*input.name.local == "select")
-                        .then(|| layout::select_selected_option(input.as_node()).map(|(v, _)| v))
-                        .flatten()
-                });
-                let attrs = input.attributes.borrow();
-                let Some(name) = attrs.get("name") else { continue };
-                let value = dirty.unwrap_or_else(|| attrs.get("value").unwrap_or("").to_string());
-                form.add_input(name.to_string(), value);
-            }
+            return;
         }
-        Some(form.submit())
+        let blocking = controls
+            .iter()
+            .filter(|c| {
+                c.as_element().is_some_and(|e| &*e.name.local == "input")
+                    && matches!(
+                        forms::input_type(c).as_str(),
+                        "text" | "search" | "url" | "tel" | "email" | "password" | "date" | "month" | "week" | "time"
+                            | "datetime-local" | "number"
+                    )
+            })
+            .count();
+        if blocking <= 1 {
+            self.submit_form(field, None, (0, 0));
+        }
+    }
+
+    /// Submits `control`'s form (HTML §4.10.21.3): the cancelable `submit` event at the form, then the
+    /// navigation `forms::build_form_submission` builds, staged for the shell.
+    fn submit_form(&mut self, control: &crate::dom::NodeRef, submitter: Option<&crate::dom::NodeRef>, coords: (i32, i32)) {
+        let Some(form) = forms::form_owner(submitter.unwrap_or(control)) else { return };
+        if !self.fire_submit(&form) {
+            return;
+        }
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        if let Some(nav) = forms::build_form_submission(&base, control, submitter, coords) {
+            self.pending_nav = Some(nav);
+        }
+    }
+
+    /// Fires a bubbling, cancelable `submit` at `form`; false when a listener canceled it (a scripted
+    /// form handles its own submission). The script engine's `fire` reports no cancelation, so the
+    /// event is dispatched from script: the form is tagged for one lookup and the tag removed before
+    /// any listener runs.
+    fn fire_submit(&mut self, form: &crate::dom::NodeRef) -> bool {
+        let Some(js_engine) = &mut self.js_engine else { return true };
+        let Some(el) = form.as_element() else { return true };
+        el.attributes.borrow_mut().insert("data-aether-submitting", "1".to_string());
+        let r = js_engine.eval_string(
+            "(function(){var f=document.querySelector('form[data-aether-submitting]');if(!f)return true;\
+             f.removeAttribute('data-aether-submitting');\
+             var e=typeof SubmitEvent==='function'?new SubmitEvent('submit',{bubbles:true,cancelable:true}):new Event('submit',{bubbles:true,cancelable:true});\
+             return f.dispatchEvent(e);})()",
+        );
+        el.attributes.borrow_mut().remove("data-aether-submitting");
+        if js::take_mutated() {
+            self.relayout();
+        }
+        !matches!(r.as_deref(), Ok("false"))
+    }
+
+    /// Keyboard page scrolling (no field holds the keys): Space / Shift+Space and Page Down / Page Up
+    /// move a page (87.5 % of the viewport), Down / Up a 40 px line, Home / End to the top / bottom —
+    /// Chromium's steps, in the engine so every shell gets them.
+    fn key_scroll(&mut self, key: &str) {
+        use forms::edit::Key;
+        let (m, Some(k)) = forms::edit::parse_key(key) else { return };
+        if m.alt || m.meta {
+            return;
+        }
+        let page = (self.height as f64 * PAGE_FRACTION).max(1.0);
+        let dy = match k {
+            Key::Space if m.ctrl => return,
+            Key::Space if m.shift => -page,
+            Key::Space | Key::PageDown => page,
+            Key::PageUp => -page,
+            Key::Down => LINE_STEP,
+            Key::Up => -LINE_STEP,
+            Key::Home => -self.scroll_y,
+            Key::End => f64::MAX / 4.0,
+            _ => return,
+        };
+        self.handle_event(api::events::Event::Scroll(0.0, dy));
+    }
+
+    /// Builds the submission of `control`'s form with no submitter (HTML §4.10.21.3 through
+    /// `forms::build_form_submission`), against the current page URL.
+    pub fn build_form_submission(&self, control: &crate::dom::NodeRef) -> Option<forms::OpenDocument> {
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        forms::build_form_submission(&base, control, None, (0, 0))
+    }
+
+    /// The submission a click on submit button `submitter` performs (its name/value in the entry list,
+    /// its `formaction`/`formmethod`/`formenctype` in force) — what the click stages, without the
+    /// `submit` event.
+    pub fn submission_for(&self, submitter: &crate::dom::NodeRef) -> Option<forms::OpenDocument> {
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        forms::build_form_submission(&base, submitter, Some(submitter), (0, 0))
     }
 
     pub async fn go_back(&mut self) {
@@ -866,7 +1190,7 @@ impl AetherEngine {
             }
         }
         if let Some(nav) = js::take_script_navigation() {
-            self.pending_nav = Some(forms::OpenDocument { url: nav, method: forms::HttpMethod::Get, body: None });
+            self.pending_nav = Some(forms::OpenDocument::get(nav));
         }
         js::take_mutated();
 
@@ -894,10 +1218,38 @@ impl AetherEngine {
         self.scroll_y = 0.0;
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
+        // Focus never survives a navigation; the new document's first `autofocus` control that can
+        // take focus gets it (HTML §6.6.8 "flush autofocus candidates").
+        self.focused_node = None;
+        let autofocus = self.document.as_ref().and_then(|d| {
+            d.descendants().find(|n| {
+                n.as_element().is_some_and(|e| {
+                    matches!(e.name.local.as_ref(), "input" | "textarea" | "select" | "button")
+                        && e.attributes.borrow().get("autofocus").is_some()
+                }) && !forms::is_disabled(n)
+                    && forms::input_type(n) != "hidden"
+            })
+        });
+        self.set_focus(autofocus);
+    }
+
+    /// Test hook: force the caret's blink phase.
+    #[cfg(test)]
+    pub(crate) fn caret_on_for_test(&mut self, on: bool) {
+        self.caret_on = on;
+    }
+
+    /// The paint-side view of the focused text control: caret, selection anchor and blink phase.
+    fn focus_paint(&self) -> Option<render::FocusPaint> {
+        let node = self.editing_node()?;
+        let mut e = self.edit;
+        e.clamp(&forms::control_value(&node));
+        Some(render::FocusPaint { node, caret: e.caret, anchor: e.anchor, caret_visible: self.caret_on })
     }
 
     pub fn render_frame(&mut self) -> Vec<(u32, u32, u32, u32)> {
         let damages = std::mem::take(&mut self.damage_rects);
+        render::set_focus(self.focus_paint());
         
         if let Some(layout) = &self.layout_tree {
             render::render_frame(layout, &mut self.surface, self.width, self.height, self.scroll_x, self.scroll_y, &damages);

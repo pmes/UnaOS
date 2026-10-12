@@ -1,0 +1,19 @@
+<!-- tests: form control STATE: a checked checkbox beside an unchecked one, a radio group with its second choice checked, a select showing its selected (not first) option, a textarea holding two lines, and an autofocused text input (focused: focus ring; Playwright hides Chromium's blinking caret, so the 1px caret Aether paints is the one expected difference) -->
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Controls</title>
+<style>
+body { font-family: sans-serif; padding: 20px; font-size: 14px; }
+form { width: 320px; }
+label { display: block; margin-top: 10px; }
+select, textarea, input[type=text] { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; }
+.row { margin-top: 10px; }
+</style></head><body>
+<form action="/submit">
+<div class="row"><input type="checkbox" name="news" checked> News <input type="checkbox" name="offers"> Offers</div>
+<div class="row"><input type="radio" name="plan" value="m"> Monthly <input type="radio" name="plan" value="y" checked> Yearly <input type="radio" name="plan" value="l"> Lifetime</div>
+<label for="s">Size</label><select id="s" name="size"><option>Small</option><option selected>Medium</option><option>Large</option></select>
+<label for="n">Notes</label><textarea id="n" name="notes" rows="3">First line
+Second line</textarea>
+<label for="q">Search</label><input type="text" id="q" name="q" value="aether" autofocus>
+</form>
+</body></html>

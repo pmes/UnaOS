@@ -323,6 +323,11 @@ kat!(
     r#"{"BrowserText":"una"}"#
 );
 kat!(
+    kat_browser_paste,
+    SMessage::BrowserPaste("una\nos".to_string()),
+    r#"{"BrowserPaste":"una\nos"}"#
+);
+kat!(
     kat_browser_url_changed,
     SMessage::BrowserUrlChanged("https://una.os/next".to_string()),
     r#"{"BrowserUrlChanged":"https://una.os/next"}"#
@@ -1147,6 +1152,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserResize(_, _) => "BrowserResize",
         SMessage::BrowserKey(_) => "BrowserKey",
         SMessage::BrowserText(_) => "BrowserText",
+        SMessage::BrowserPaste(_) => "BrowserPaste",
         SMessage::BrowserUrlChanged(_) => "BrowserUrlChanged",
         SMessage::BrowserTitleChanged(_) => "BrowserTitleChanged",
         SMessage::BrowserFaviconChanged { .. } => "BrowserFaviconChanged",

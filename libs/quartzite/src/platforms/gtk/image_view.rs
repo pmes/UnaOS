@@ -49,35 +49,68 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
         motion_syn.fire(SMessage::BrowserMouseMove(x, y));
     });
     drawing_area.add_controller(motion);
-    // AETHERSELECT (SR69): the page's copy and select-all. The viewport takes keyboard focus when
-    // pressed; Ctrl+C asks the engine for its selection (`BrowserCopy`, answered below with
-    // `BrowserClipboardSet`) and Ctrl+A selects the document (`BrowserSelectAll`).
+    // AETHERINPUT (SR68): the surface takes the page's input. A click (fired on release) focuses the
+    // surface and reaches the engine; every key goes as `BrowserKey` — its keysym name with `Ctrl+`,
+    // `Alt+`, `Shift+`, `Meta+` prefixes — and an unmodified printable key also as `BrowserText`;
+    // Ctrl+V reads the clipboard and sends its text as `BrowserPaste`.
     drawing_area.set_focusable(true);
-    let press = gtk4::GestureClick::new();
-    let da_focus = drawing_area.clone();
-    press.connect_pressed(move |_, _, _, _| {
-        da_focus.grab_focus();
-    });
-    drawing_area.add_controller(press);
-    let keys = gtk4::EventControllerKey::new();
-    let key_syn = synapse.clone();
-    keys.connect_key_pressed(move |_, keyval, _code, mods| {
-        if !mods.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-            return gtk4::glib::Propagation::Proceed;
-        }
-        match keyval {
-            gtk4::gdk::Key::c | gtk4::gdk::Key::C => {
-                key_syn.fire(SMessage::BrowserCopy);
-                gtk4::glib::Propagation::Stop
+    drawing_area.set_can_focus(true);
+    {
+        let click = gtk4::GestureClick::new();
+        let syn = synapse.clone();
+        let da = drawing_area.clone();
+        click.connect_released(move |_, _n, x, y| {
+            da.grab_focus();
+            syn.fire(SMessage::BrowserClick(x, y));
+        });
+        drawing_area.add_controller(click);
+    }
+    {
+        let key = gtk4::EventControllerKey::new();
+        let syn = synapse.clone();
+        let da = drawing_area.clone();
+        key.connect_key_pressed(move |_, keyval, _code, mods| {
+            use gtk4::gdk::{Key, ModifierType};
+            let ctrl = mods.contains(ModifierType::CONTROL_MASK);
+            let alt = mods.contains(ModifierType::ALT_MASK);
+            let shift = mods.contains(ModifierType::SHIFT_MASK);
+            let meta = mods.intersects(ModifierType::META_MASK | ModifierType::SUPER_MASK);
+            // AETHERSELECT (SR69): Ctrl/Cmd+C copies the page selection, Ctrl/Cmd+A selects the document.
+            if (ctrl || meta) && matches!(keyval, Key::c | Key::C) {
+                syn.fire(SMessage::BrowserCopy);
+                return gtk4::glib::Propagation::Stop;
             }
-            gtk4::gdk::Key::a | gtk4::gdk::Key::A => {
-                key_syn.fire(SMessage::BrowserSelectAll);
-                gtk4::glib::Propagation::Stop
+            if (ctrl || meta) && matches!(keyval, Key::a | Key::A) {
+                syn.fire(SMessage::BrowserSelectAll);
+                return gtk4::glib::Propagation::Stop;
             }
-            _ => gtk4::glib::Propagation::Proceed,
-        }
-    });
-    drawing_area.add_controller(keys);
+            if (ctrl || meta) && matches!(keyval, Key::v | Key::V) {
+                let syn = syn.clone();
+                da.clipboard().read_text_async(None::<&gtk4::gio::Cancellable>, move |r| {
+                    if let Ok(Some(text)) = r {
+                        syn.fire(SMessage::BrowserPaste(text.to_string()));
+                    }
+                });
+                return gtk4::glib::Propagation::Stop;
+            }
+            let Some(name) = keyval.name() else { return gtk4::glib::Propagation::Proceed };
+            let mut key = String::new();
+            for (on, p) in [(ctrl, "Ctrl+"), (alt, "Alt+"), (shift, "Shift+"), (meta, "Meta+")] {
+                if on {
+                    key.push_str(p);
+                }
+            }
+            key.push_str(name.as_str());
+            syn.fire(SMessage::BrowserKey(key));
+            if !ctrl && !alt && !meta {
+                if let Some(c) = keyval.to_unicode().filter(|c| !c.is_control()) {
+                    syn.fire(SMessage::BrowserText(c.to_string()));
+                }
+            }
+            gtk4::glib::Propagation::Stop
+        });
+        drawing_area.add_controller(key);
+    }
 
     let da_clone = drawing_area.clone();
     let mut rx = synapse.subscribe();
