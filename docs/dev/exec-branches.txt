@@ -362,4 +362,4 @@ refs/heads/exec-rmbp-jobsnextmask           74ac3680 FOLDED-BY-HAND db66e678 202
 refs/heads/exec-rmbp-renderwedge            521d98de FOLDED-BY-HAND db66e678 2026-10-12
 refs/heads/exec-rmbp-ring3exec              d079c4a7 FOLDED-BY-HAND db66e678 2026-10-12
 refs/heads/exec-rmbp-vfstxcost              3736f0d1 FOLDED-BY-HAND db66e678 2026-10-12
-refs/heads/exec-rmbp-trashlock              21dbec79 IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-rmbp-trashlock              c416a2cc FOLDED-BY-HAND FOLD 2026-10-12
