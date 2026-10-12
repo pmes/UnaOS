@@ -412,7 +412,7 @@ pub fn create_comment(doc: usize, s: String) -> usize {
 /// `doc`.
 pub fn adopt(node: usize, doc: usize) {
     if parent_of(node).is_some() {
-        with_doc_mut(|d| d.detach(NodeId(node)));
+        detach_node(node);
     }
     if node_document(node) == doc && kind(node) != NK::Document {
         return;
@@ -475,6 +475,7 @@ pub fn clone_node(id: usize, deep: bool, doc: Option<usize>) -> usize {
                 p.checked.insert(dst, c);
             }
         });
+        super::controls::cloned(src, dst);
         if let Some(t) = with_doc(|d| d.element(NodeId(dst)).and_then(|e| e.template_contents)) {
             set_node_doc(t.0, doc);
         }
@@ -642,6 +643,31 @@ fn ensure_validity(vm: &mut Vm, node: usize, parent: usize, child: Option<usize>
     }
 }
 
+/// Takes `node` out of its parent, running the removing steps live ranges (DOM §5) and node
+/// iterators (§6.1) need first (AETHERWPT). Every tree removal goes through here.
+pub fn detach_node(node: usize) {
+    let Some(parent) = parent_of(node) else { return };
+    let index = super::range::index_of(node);
+    super::traversal::removing(node);
+    super::range::removing(node, parent, index);
+    with_doc_mut(|d| d.detach(NodeId(node)));
+}
+
+/// Inserts `n` into `parent` before `child` (arena only) and runs the live-range insert step.
+fn insert_one(n: usize, parent: usize, child: Option<usize>) {
+    if parent_of(n).is_some() {
+        detach_node(n);
+    }
+    with_doc_mut(|d| d.insert_before(NodeId(parent), NodeId(n), child.map(NodeId)));
+    let index = super::range::index_of(n);
+    super::range::inserted(parent, index, 1);
+}
+
+/// "ensure pre-insertion validity" (for Range.insertNode).
+pub fn ensure_pre_insert_validity(vm: &mut Vm, node: usize, parent: usize, child: Option<usize>) -> JsResult<()> {
+    ensure_validity(vm, node, parent, child, false)
+}
+
 /// DOM "insert" (§4.2.3): `node` (or a fragment's children) into `parent` before `child`.
 pub fn insert(vm: &mut Vm, node: usize, parent: usize, child: Option<usize>) {
     let nodes: Vec<usize> = if kind(node) == NK::Fragment { children_of(node) } else { vec![node] };
@@ -651,7 +677,7 @@ pub fn insert(vm: &mut Vm, node: usize, parent: usize, child: Option<usize>) {
     let doc = node_document(parent);
     for &n in &nodes {
         adopt(n, doc);
-        with_doc_mut(|d| d.insert_before(NodeId(parent), NodeId(n), child.map(NodeId)));
+        insert_one(n, parent, child);
     }
     touch();
     // Post-insertion steps: scripts that became connected are prepared (HTML §4.12.1).
@@ -681,7 +707,7 @@ pub fn remove(vm: &mut Vm, node: usize) {
             page(|p| p.focused = None);
         }
     }
-    with_doc_mut(|d| d.detach(NodeId(node)));
+    detach_node(node);
     touch();
     super::loader::children_changed(vm, parent);
 }
@@ -706,7 +732,7 @@ pub fn replace_child(vm: &mut Vm, child: usize, node: usize, parent: usize) -> J
         reference = with_doc(|d| d.next_sibling(NodeId(node)).map(|n| n.0));
     }
     if child != node {
-        with_doc_mut(|d| d.detach(NodeId(child)));
+        detach_node(child);
     }
     insert(vm, node, parent, reference);
     touch();
@@ -719,11 +745,9 @@ pub fn replace_all(vm: &mut Vm, node: Option<usize>, parent: usize) {
         adopt(n, node_document(parent));
     }
     let kids = children_of(parent);
-    with_doc_mut(|d| {
-        for k in &kids {
-            d.detach(NodeId(*k));
-        }
-    });
+    for k in &kids {
+        detach_node(*k);
+    }
     touch();
     if let Some(n) = node {
         insert(vm, n, parent, None);
@@ -941,35 +965,47 @@ fn text_content_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn normalize(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let n = this_node(vm, ctx)?;
-    // DOM §4.4 normalize: for each exclusive Text descendant: drop empty ones, merge contiguous runs.
+    // DOM §4.4 normalize, with the live-range steps: for each exclusive Text descendant, drop it when
+    // empty, else fold the contiguous exclusive Text siblings that follow into it.
     let texts: Vec<usize> = with_doc(|d| {
         d.descendants(NodeId(n)).filter(|c| matches!(d.data(*c), NodeData::Text(_))).map(|c| c.0).collect()
     });
     let mut changed = false;
     for t in texts {
         // Skip nodes already merged away (detached by an earlier step).
-        if parent_of(t).is_none() {
+        if parent_of(t).is_none() || !with_doc(|d| is_inclusive_ancestor(d, n, t)) {
             continue;
         }
-        let len = with_doc(|d| char_data(d, t).len());
-        if len == 0 {
-            with_doc_mut(|d| d.detach(NodeId(t)));
+        let mut length = with_doc(|d| char_data(d, t)).encode_utf16().count() as u32;
+        if length == 0 {
+            detach_node(t);
             changed = true;
             continue;
         }
-        let mut data = with_doc(|d| char_data(d, t));
+        let mut run = Vec::new();
         let mut cur = with_doc(|d| d.next_sibling(NodeId(t)).map(|c| c.0));
         while let Some(c) = cur {
             if kind(c) != NK::Text {
                 break;
             }
-            data.push_str(&with_doc(|d| char_data(d, c)));
-            let next = with_doc(|d| d.next_sibling(NodeId(c)).map(|x| x.0));
-            with_doc_mut(|d| d.detach(NodeId(c)));
-            changed = true;
-            cur = next;
+            run.push(c);
+            cur = with_doc(|d| d.next_sibling(NodeId(c)).map(|x| x.0));
         }
-        with_doc_mut(|d| set_char_data(d, t, data));
+        if run.is_empty() {
+            continue;
+        }
+        let data: String = run.iter().map(|c| with_doc(|d| char_data(d, *c))).collect();
+        replace_data(vm, t, length, 0, &data)?;
+        let parent = parent_of(t).unwrap_or(n);
+        for &c in &run {
+            let idx = super::range::index_of(c);
+            super::range::merged(t, c, parent, idx, length);
+            length += with_doc(|d| char_data(d, c)).encode_utf16().count() as u32;
+        }
+        for c in run {
+            detach_node(c);
+        }
+        changed = true;
     }
     if changed {
         touch();
@@ -1419,10 +1455,13 @@ pub fn replace_data(vm: &mut Vm, n: usize, offset: u32, count: u32, data: &str) 
         return throw_dom(vm, "IndexSizeError", "The offset is greater than the node's length.");
     }
     let count = count.min(len - offset);
+    let added = utf16(data);
+    let added_len = added.len() as u32;
     let mut out = cur[..offset as usize].to_vec();
-    out.extend(utf16(data));
+    out.extend(added);
     out.extend_from_slice(&cur[(offset + count) as usize..]);
     with_doc_mut(|d| set_char_data(d, n, from_utf16(&out)));
+    super::range::replaced_data(n, offset, count, added_len);
     touch();
     if let Some(p) = parent_of(n) {
         super::loader::children_changed(vm, p);
@@ -1533,10 +1572,8 @@ fn comment_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(wrap(vm, id))
 }
 
-fn split_text(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let n = this_kind(vm, ctx, &[NK::Text])?;
-    need(vm, ctx, 1, "Text", "splitText")?;
-    let o = unsigned_long(vm, &arg(vm, ctx, 0))?;
+/// DOM "split a Text node" (§4.11) with the live-range steps; returns the new node.
+pub fn split_text_at(vm: &mut Vm, n: usize, o: u32) -> JsResult<usize> {
     let cur = utf16(&with_doc(|d| char_data(d, n)));
     let len = cur.len() as u32;
     if o > len {
@@ -1544,11 +1581,25 @@ fn split_text(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     let new_data = from_utf16(&cur[o as usize..]);
     let new_node = create_text(node_document(n), new_data);
-    if let Some(p) = parent_of(n) {
+    let parent = parent_of(n);
+    if let Some(p) = parent {
         let next = with_doc(|d| d.next_sibling(NodeId(n)).map(|c| c.0));
-        with_doc_mut(|d| d.insert_before(NodeId(p), NodeId(new_node), next.map(NodeId)));
+        insert_one(new_node, p, next);
+        super::range::split(n, new_node, o, Some(p));
     }
     replace_data(vm, n, o, len - o, "")?;
+    if let Some(p) = parent {
+        touch();
+        super::loader::children_changed(vm, p);
+    }
+    Ok(new_node)
+}
+
+fn split_text(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let n = this_kind(vm, ctx, &[NK::Text])?;
+    need(vm, ctx, 1, "Text", "splitText")?;
+    let o = unsigned_long(vm, &arg(vm, ctx, 0))?;
+    let new_node = split_text_at(vm, n, o)?;
     Ok(wrap(vm, new_node))
 }
 
@@ -1663,6 +1714,9 @@ pub fn attr_at(el: usize, i: usize) -> Option<Attribute> {
 /// HTML "attribute change steps" hook: event handler attributes, form-control default values.
 fn attribute_changed(vm: &mut Vm, el: usize, local: &str, ns: Namespace, old: Option<String>, new: Option<String>) {
     touch();
+    if ns == Namespace::None {
+        super::controls::attribute_changed(el, local, &old, &new);
+    }
     if ns == Namespace::None && local.starts_with("on") {
         super::events::handler_attribute_changed(vm, el, &local[2..], new.is_some());
     }
@@ -2518,7 +2572,7 @@ fn adopt_node(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         return throw_dom(vm, "NotSupportedError", "The node provided is a document, which may not be adopted.");
     }
     if let Some(p) = parent_of(n) {
-        with_doc_mut(|doc| doc.detach(NodeId(n)));
+        detach_node(n);
         touch();
         super::loader::children_changed(vm, p);
     }
@@ -2892,6 +2946,8 @@ pub const CK_NAME: u8 = 7;
 pub const CK_DOCFILTER: u8 = 8;
 pub const CK_TOKENS: u8 = 9;
 pub const CK_SELECTOR: u8 = 10;
+/// A select's HTMLOptionsCollection (AETHERWPT): its list of options.
+pub const CK_OPTIONS: u8 = 11;
 
 thread_local! {
     static COLL_HANDLER: std::cell::Cell<Option<Obj>> = const { std::cell::Cell::new(None) };
@@ -2902,6 +2958,7 @@ fn coll_proto(k: u8) -> Obj {
         CK_CHILDNODES | CK_STATIC | CK_NAME => "NodeList",
         CK_ATTRMAP => "NamedNodeMap",
         CK_TOKENS => "DOMTokenList",
+        CK_OPTIONS => "HTMLOptionsCollection",
         _ => "HTMLCollection",
     };
     iface(name).unwrap().proto
@@ -3057,6 +3114,11 @@ fn coll_items(vm: &Vm, t: Obj) -> Vec<usize> {
             })
             .map(|c| c.0)
             .collect(),
+        CK_OPTIONS => super::controls::list_of_options_in(d, root),
+        CK_DOCFILTER if a == "selectedoptions" => super::controls::selected_options_in(d, root),
+        CK_DOCFILTER if a == "formelements" => super::controls::form_elements_in(d, root),
+        CK_DOCFILTER if a == "fieldsetelements" => super::controls::fieldset_elements_in(d, root),
+        CK_DOCFILTER if a == "labels" => super::controls::labels_in(d, root),
         CK_DOCFILTER if a == "options" => d
             .descendants(NodeId(root))
             .filter(|i| d.element(*i).is_some_and(|e| e.is_html("option")))
@@ -3292,7 +3354,13 @@ fn trap_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let key = vm.to_property_key(&kv)?;
     let v = vm.arg(ctx, 2);
     let receiver = vm.arg(ctx, 3);
-    if key_index(&key).is_some() {
+    if let Some(i) = key_index(&key) {
+        // HTMLOptionsCollection's indexed setter (HTML §2.7.2.2).
+        if coll_kind(vm, t) == CK_OPTIONS {
+            let root = slot_num(vm, t, 1) as usize;
+            super::controls::options_set_index(vm, root, i as usize, &v)?;
+            return Ok(Value::Bool(true));
+        }
         return Ok(Value::Bool(false));
     }
     if let Some(name) = key_name(&key) {
