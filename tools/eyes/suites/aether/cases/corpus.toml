@@ -99,3 +99,11 @@ page = "corpus/21-paint-effects.html"
 [[case]]
 name = "22-fonts"
 page = "corpus/22-fonts.html"
+
+# SR67 (AETHERHOVER): the pointer rests on the "Products" trigger — the subject holds it with
+# `--pointer`, the Chromium oracle parks the mouse at the same point (`oracle.hover`).
+[[case]]
+name = "25-hover"
+page = "corpus/25-hover.html"
+subject.run = "{repo}/target/release/aether render --html {page} --width {w} --height {h} --pointer 190,24 --out {out} --ledger {outdir}/{case}.ledger.txt"
+oracle.hover = "190,24"

@@ -34,6 +34,25 @@ pub async fn render_headless_opts(
     width: u32,
     height: u32,
 ) -> anyhow::Result<(u32, u32, usize)> {
+    render_headless_pointer(url, html_file, out, ledger_path, scroll, width, height, None).await
+}
+
+/// render_headless_opts with the pointer held at a viewport position (AETHERHOVER, SR67): after the
+/// load (and scroll) the engine takes one `MouseMove` there — the hover path, `:hover` re-style, the
+/// page's mouseover/mouseenter/mousemove listeners and the cursor — before the frame is painted, so
+/// the PNG shows the page as a user resting the mouse at that point sees it. The hovered element and
+/// cursor go to stderr as `[pointer] X,Y -> <tag#id.class> cursor=<keyword>`.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_headless_pointer(
+    url: Option<&str>,
+    html_file: Option<&Path>,
+    out: &Path,
+    ledger_path: &Path,
+    scroll: f64,
+    width: u32,
+    height: u32,
+    pointer: Option<(f64, f64)>,
+) -> anyhow::Result<(u32, u32, usize)> {
     crate::ledger::reset();
     let mut engine = AetherEngine::new();
     engine.handle_event(crate::api::events::Event::Resize(width, height));
@@ -56,6 +75,25 @@ pub async fn render_headless_opts(
     if scroll > 0.0 {
         engine.scroll_y = scroll;
         engine.damage_rects.push((0, 0, engine.width, engine.height));
+    }
+    if let Some((x, y)) = pointer {
+        engine.handle_event(crate::api::events::Event::MouseMove(x, y));
+        let what = engine.hover_path.first().and_then(|n| n.as_element().map(|e| {
+            let attrs = e.attributes.borrow();
+            let mut s = e.name.local.to_string();
+            if let Some(id) = attrs.get("id") {
+                s.push('#');
+                s.push_str(id);
+            }
+            if let Some(c) = attrs.get("class") {
+                for c in c.split_whitespace() {
+                    s.push('.');
+                    s.push_str(c);
+                }
+            }
+            s
+        }));
+        eprintln!("[pointer] {},{} -> {} cursor={}", x, y, what.as_deref().unwrap_or("-"), engine.cursor());
     }
     engine.render_frame();
 
