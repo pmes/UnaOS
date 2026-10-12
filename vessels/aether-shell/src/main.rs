@@ -254,6 +254,7 @@ fn main() {
                                 // SR67: hover, `:hover` re-style, the page's mouse events.
                                 SMessage::BrowserMouseMove(x, y) => {
                                     engine.handle_event(aether::api::events::Event::MouseMove(x, y));
+                                }
                                 // AETHERSELECT (SR69): Ctrl/Cmd+C copies the page selection (innerText
                                 // serialization) to the platform clipboard through the chrome; Ctrl/Cmd+A
                                 // selects the document.
@@ -264,6 +265,7 @@ fn main() {
                                 }
                                 SMessage::BrowserSelectAll => {
                                     engine.select_all();
+                                }
                                 // The platform clipboard's text (Ctrl/Cmd+V): inserted at the focused
                                 // field's caret, line breaks kept only in a textarea.
                                 SMessage::BrowserPaste(text) => {
