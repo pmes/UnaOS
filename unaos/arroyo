@@ -1237,6 +1237,7 @@ fi
 [ -n "${UNAOS_BUSREG:-}" ] && _feats="${_feats}busreg,"
 # LUMENBIN: UNAOS_LUMEN=1 arms the Lumen chat window's dock pin by default and `tests lumen` (crate::lumen). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LUMEN:-}" ] && _feats="${_feats}lumen,"
+[ -n "${UNAOS_MIDDEN:-}" ] && _feats="${_feats}midden,"   # MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs: MIDDEN.ELF spawned, `help` + `ls` typed into it, its exit read back). x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
 # NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
 # SELFDIAG (B324, R82): UNAOS_SELFDIAG=1 arms the boot log on disk (/var/log/boot.<n>.witness on a UnaFS root), SYS_PATH_READ 59 / SYS_PATH_WRITE 60 for APPS/DIAG.ELF and `tests selfdiag`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
@@ -4304,6 +4305,31 @@ build_user_lumen_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
 }
 
+# MIDDENTWIN (LEDGER SR75, R104): build MIDDEN.ELF — Midden, the Shell, as a ring-3 program (crates/user-midden
+# linking midden_core, the core the kernel's shell links): one window, a prompt and a scrollback, every line planned
+# by midden_core::plan with Facts::ring3. Cloned from build_user_lumen_x86 (ELF window, syms, strip, e_machine,
+# window check, APPRES stamp) → target/MIDDEN-X86.ELF, staged by the builder as APPS/MIDDEN.ELF. Inert until
+# launched (`run /apps/MIDDEN.ELF`); UNAOS_MIDDEN=1 adds the `tests midden` fixture (kernel middenapp.rs).
+build_user_midden_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Midden app (crates/user-midden → target/MIDDEN-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-midden"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-midden/target/x86_64-unknown-none/release/user-midden" MIDDEN  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-midden/target/x86_64-unknown-none/release/user-midden" \
+      "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: MIDDEN-X86.ELF missing/empty — x86 MIDDEN build failed${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: MIDDEN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF" "MIDDEN-X86.ELF"
+    una_res_stamp "${WORKSPACE_DIR}/crates/user-midden" "${WORKSPACE_DIR}/target/MIDDEN-X86.ELF"  # APPRES (B398): Midden's icon, name, signature, version
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 Midden app: MIDDEN-X86.ELF${COLOR_RESET}"
+}
+
 # HOLOCRON2 (rmbp-ledger B355, R82): build HOLOCRON.ELF — Holocron, the metal's secrets handler (crates/user-holocron
 # linking holocron_core: verbs 144..=151 over the BANDY3 mailbox, the store over SYS_PATH_* on the UnaFS root, the
 # ring KDF through SYS_KDF) → target/HOLOCRON-X86.ELF, staged by the builder as APPS/HOLOCRON.ELF. The
@@ -5458,6 +5484,7 @@ test_x86_64() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -9471,6 +9498,7 @@ esp_x86() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF

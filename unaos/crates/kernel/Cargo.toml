@@ -3755,6 +3755,7 @@ busreg = []
 # crates/user-lumen, ONE program that talks to the provider) and the `lumen` verb exist on every build.
 # Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 lumen = ["dep:vein_core", "dep:holocron_core"] # HOLOCRON2 (B355): + holocron_core — SYS_KDF (66), the login launch of APPS/HOLOCRON.ELF and `tests holocron` (crate::keyring)
+midden = [] # MIDDENTWIN (LEDGER SR75, R104): `tests midden` (crate::middenapp, x86) — APPS/MIDDEN.ELF (crates/user-midden, the ring-3 shell over midden_core) validated, spawned, `help` + `ls` typed into it, its exit read back. The program exists on every build. Kept in sync with `unaos/arroyo` and `unaos/builder/src/main.rs`.
 
 # SELFDIAG (rmbp-ledger B324, R82): UNAOS_SELFDIAG=1 arms the smart installer's diagnosis loop's kernel half —
 # the BOOT LOG ON DISK (crate::bootwit: every `:: TAG: ... -> PASS|FAIL|SKIP ::` line and the `:: BOOT:`

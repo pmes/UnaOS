@@ -334,3 +334,4 @@ pub mod smallfix6;
 pub mod soundopeners;
 // SMALLFIX7 (rmbp-ledger B501): `tests smallfix7`, `tests prtscr` — flight 27's small reds. Tail statement.
 pub mod smallfix7;
+#[cfg(all(feature = "midden", target_arch = "x86_64"))] pub mod middenapp; // MIDDENTWIN (LEDGER SR75): `tests midden` — APPS/MIDDEN.ELF, the ring-3 shell over midden_core, driven and read back. Tail statement, so no existing line moves.

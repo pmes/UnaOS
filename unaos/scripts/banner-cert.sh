@@ -363,6 +363,7 @@ wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the kn
 selfhost|:: SELFHOST:|-|measured
 unafs|:: UNAFSX86: root=|-|measured
 lumen|:: LUMEN:|-|measured
+midden|:: MIDDENAPP: image=|@arch:x86_64|unmeasured-here
 netring3|:: ENTROPY:|-|measured
 selfdiag|:: SELFDIAG:|-|measured
 installdemo|:: INSTALLVERB: census disk=|-|measured(4)

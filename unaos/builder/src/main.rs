@@ -955,6 +955,7 @@ fn main() {
     if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
     // LUMENBIN: UNAOS_LUMEN=1 arms the lumen dock pin by default and `tests lumen`. Kept in sync with arroyo.
     if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
+    if std::env::var("UNAOS_MIDDEN").is_ok() { feats.push("midden"); } // MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs). Kept in sync with arroyo.
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.
     if std::env::var("UNAOS_NETRING3").is_ok() { feats.push("netring3"); }
     // SELFDIAG (B324): UNAOS_SELFDIAG=1 arms the boot log on disk, SYS_PATH_READ/WRITE and `tests selfdiag`. Kept in sync with arroyo.
@@ -1456,6 +1457,7 @@ fn main() {
         (target_dir.join("PREFS-X86.ELF"), "PREFS.ELF"),
         // LUMENBIN: the chat window rides the DATA volume too — `lumen` reads it there.
         (target_dir.join("LUMEN-X86.ELF"), "LUMEN.ELF"),
+        (target_dir.join("MIDDEN-X86.ELF"), "MIDDEN.ELF"), // MIDDENTWIN (SR75): the ring-3 shell — `run /apps/MIDDEN.ELF` and `tests midden` read it here
         // NETRING3 M3: the network client rides the DATA volume too — `bg /apps/NET.ELF` reads it there.
         (target_dir.join("NET-X86.ELF"), "NET.ELF"),
         // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.ELF there.
