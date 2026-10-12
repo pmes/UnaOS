@@ -5020,8 +5020,8 @@ pub fn fatverb_storage_witness() {
     // replay spec no gate command runs — a silent landmine — and editing that spec is outside this
     // change's brief. One extra line costs a capture nothing and keeps both facts greppable.
     serial_println!(
-        ":: [fatverb] storage settle: waited={}ms settled={} handles={} ::",
-        waited, settled, census
+        ":: [fatverb] storage settle: waited={}ms settled={} handles={} ::{}",
+        waited, settled, census, fatverb_on()
     );
 
     // VFSROUTE: the routing transcript rides THIS site on x86, and for the same reason the FATVERB
@@ -9029,4 +9029,49 @@ fn jobs_next_verb(console: &mut Console, args: &[&str]) -> bool {
     }
     console.println("jobs next: this kernel has no UnaFS (/jobs is on the UnaFS volume)");
     true
+}
+
+// PUMPWITNESS (rmbp-ledger B518) — FATVERB off the usb-pump. FILE TAIL for this file's stated reason (the
+// FILE TAIL note above: `panic::Location` embeds lines). The pump's storage-ready pass called
+// `fatverb_storage_witness` inline every pass; it now calls `fatverb_post`, which posts ONE `fatverb-witness`
+// task on `smp::worker_cpu(0)` (JOBSCAN's `spawn` shape, fs/jobs.rs) and forgets it. The task re-asks the
+// witness on a 1 ms nap — the witness's own bounded storage wait (`STORAGE_WAIT_MS`, `settle_reason`) is
+// unchanged and still decides when it speaks — and exits once it has spoken or `tests fatverb` has been
+// registered (the deferred build: R80, nothing at boot). Its `[fatverb] storage settle:` line ends in
+// ` on=worker`. No worker core: the call stays inline on the pass, as before, and is retried next pass.
+#[cfg(target_arch = "x86_64")]
+static FATVERB_ON_WORKER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "x86_64")]
+fn fatverb_on() -> &'static str {
+    if FATVERB_ON_WORKER.load(core::sync::atomic::Ordering::Relaxed) { " on=worker" } else { "" }
+}
+
+/// PUMPWITNESS: the usb-pump's door to `fatverb_storage_witness` — post once, never run it on the pump.
+#[cfg(target_arch = "x86_64")]
+pub fn fatverb_post() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static POSTED: AtomicBool = AtomicBool::new(false);
+    if POSTED.load(Ordering::Relaxed) {
+        return;
+    }
+    match crate::arch::smp::worker_cpu(0) {
+        Some(cpu) => {
+            if !POSTED.swap(true, Ordering::AcqRel) {
+                crate::arch::sched::spawn("fatverb-witness", fatverb_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+            }
+        }
+        None => fatverb_storage_witness(),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fatverb_worker(_: usize) {
+    use core::sync::atomic::Ordering;
+    FATVERB_ON_WORKER.store(true, Ordering::Relaxed);
+    while !FATVERB_WITNESS_DONE.load(Ordering::Acquire) && !crate::tests::defer("fatverb", fatverb_storage_witness) {
+        fatverb_storage_witness();
+        crate::arch::sched::sleep_ms(1);
+    }
+    FATVERB_ON_WORKER.store(false, Ordering::Relaxed);
 }

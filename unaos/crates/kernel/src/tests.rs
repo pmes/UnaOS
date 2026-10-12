@@ -272,7 +272,7 @@ fn ensure_ring3win() {
 /// fixture (so the registered `f` re-entering here runs its body). Otherwise registers `f` under `name`
 /// ONCE and returns `true`: the boot prints nothing and `tests <name>` fires it.
 pub fn defer(name: &'static str, f: fn()) -> bool {
-    if cfg!(feature = "tests-at-boot") || RUNNING.load(Ordering::Acquire) {
+    if cfg!(feature = "tests-at-boot") || (RUNNING.load(Ordering::Acquire) && running_is(name)) {
         return false;
     }
     let present = TABLE.lock().iter().flatten().any(|e| e.0 == name);

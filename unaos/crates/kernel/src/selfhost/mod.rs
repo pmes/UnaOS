@@ -226,6 +226,44 @@ pub fn verify_source_once() {
     run();
 }
 
+/// PUMPWITNESS (rmbp-ledger B518): set while `selfhost-witness` runs the check, so every `:: SELFHOST:`
+/// line it prints ends in ` on=worker`; the same line from `tests selfhost` (or a single-core inline
+/// fallback) prints unchanged.
+static ON_WORKER: AtomicBool = AtomicBool::new(false);
+
+fn on() -> &'static str {
+    if ON_WORKER.load(Ordering::Relaxed) { " on=worker" } else { "" }
+}
+
+/// PUMPWITNESS (rmbp-ledger B518): the usb-pump's door to the source check. Flight 28 ran
+/// `verify_source_once` INLINE on the pump for 28.4 s (`stage=pump stage_ms=28440 pump=selfhost`).
+/// The pump now posts it ONCE to a one-shot `selfhost-witness` task on `smp::worker_cpu(0)` (JOBSCAN's
+/// `spawn` shape, fs/jobs.rs) and forgets: the task calls `verify_source_once` exactly as the pump's
+/// first pass did (deferred builds register `tests selfhost` and return; `tests-at-boot` builds run the
+/// check there) and exits. No worker core: the call stays inline, as before, and is retried next pass.
+#[cfg(target_arch = "x86_64")]
+pub fn verify_source_post() {
+    static POSTED: AtomicBool = AtomicBool::new(false);
+    if POSTED.load(Ordering::Relaxed) {
+        return;
+    }
+    match crate::arch::smp::worker_cpu(0) {
+        Some(cpu) => {
+            if !POSTED.swap(true, Ordering::AcqRel) {
+                crate::arch::sched::spawn("selfhost-witness", verify_source_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+            }
+        }
+        None => verify_source_once(),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_source_worker(_: usize) {
+    ON_WORKER.store(true, Ordering::Relaxed);
+    verify_source_once();
+    ON_WORKER.store(false, Ordering::Relaxed);
+}
+
 fn run() {
     let fs = match fat::mount_program_source() {
         Ok(fs) => fs,
@@ -233,8 +271,8 @@ fn run() {
             // No volume is not a verification failure — there is nothing to verify. Say so plainly;
             // this line must never read as a fault to the suite's scanner.
             serial_println!(
-                ":: SELFHOST: no program-source volume ({}) — no source payload to verify ::",
-                fat_reason(e)
+                ":: SELFHOST: no program-source volume ({}) — no source payload to verify ::{}",
+                fat_reason(e), on()
             );
             return;
         }
@@ -257,9 +295,9 @@ fn run() {
         .copied();
     if let Some(e) = hard_error {
         serial_println!(
-            ":: SELFHOST: root directory of {} unreadable ({}) — cannot tell an absent payload from a broken volume -> FAIL ::",
+            ":: SELFHOST: root directory of {} unreadable ({}) — cannot tell an absent payload from a broken volume -> FAIL ::{}",
             fs.source_name(),
-            fat_reason(e)
+            fat_reason(e), on()
         );
         return;
     }
@@ -270,20 +308,20 @@ fn run() {
             // Both NotFound by the check above. A UNAOS_NOSRC medium (the FAT fixtures, vm-image,
             // the Pi card) legitimately carries neither file. Honest, not a fault.
             serial_println!(
-                ":: SELFHOST: no SRC.TGZ/SRC.SHA on {} — SOURCE-ALONG not packed on this medium ::",
-                fs.source_name()
+                ":: SELFHOST: no SRC.TGZ/SRC.SHA on {} — SOURCE-ALONG not packed on this medium ::{}",
+                fs.source_name(), on()
             );
             return;
         }
         (Ok(_), Err(_)) => {
             serial_println!(
-                ":: SELFHOST: SRC.TGZ present but SRC.SHA is MISSING — an unverifiable source payload -> FAIL ::"
+                ":: SELFHOST: SRC.TGZ present but SRC.SHA is MISSING — an unverifiable source payload -> FAIL ::{}", on()
             );
             return;
         }
         (Err(_), Ok(_)) => {
             serial_println!(
-                ":: SELFHOST: SRC.SHA present but SRC.TGZ is MISSING — a stamp with nothing to stamp -> FAIL ::"
+                ":: SELFHOST: SRC.SHA present but SRC.TGZ is MISSING — a stamp with nothing to stamp -> FAIL ::{}", on()
             );
             return;
         }
@@ -292,20 +330,20 @@ fn run() {
     // --- the stamp ---
     let mut raw = Vec::new();
     if let Err(e) = fs.read_file(&shafile, &mut raw, SHA_FILE_MAX) {
-        serial_println!(":: SELFHOST: SRC.SHA unreadable ({}) -> FAIL ::", fat_reason(e));
+        serial_println!(":: SELFHOST: SRC.SHA unreadable ({}) -> FAIL ::{}", fat_reason(e), on());
         return;
     }
     let text = match core::str::from_utf8(&raw) {
         Ok(t) => t,
         Err(_) => {
-            serial_println!(":: SELFHOST: SRC.SHA is not UTF-8 -> FAIL ::");
+            serial_println!(":: SELFHOST: SRC.SHA is not UTF-8 -> FAIL ::{}", on());
             return;
         }
     };
     let stamp = match parse_stamp(text) {
         Some(s) => s,
         None => {
-            serial_println!(":: SELFHOST: SRC.SHA carries no 64-hex sha256 on line 1 -> FAIL ::");
+            serial_println!(":: SELFHOST: SRC.SHA carries no 64-hex sha256 on line 1 -> FAIL ::{}", on());
             return;
         }
     };
@@ -330,10 +368,10 @@ fn run() {
                 _ => inflate::inflate_reason(e),
             };
             serial_println!(
-                ":: SELFHOST: SRC.TGZ walk aborted ({}) after files={} sha_match={} -> FAIL ::",
+                ":: SELFHOST: SRC.TGZ walk aborted ({}) after files={} sha_match={} -> FAIL ::{}",
                 detail,
                 walk.census().files,
-                sha_ok as u8
+                sha_ok as u8, on()
             );
             return;
         }
@@ -343,8 +381,8 @@ fn run() {
         Ok(v) => v,
         Err(e) => {
             serial_println!(
-                ":: SELFHOST: SRC.TGZ is not a complete tar archive ({}) -> FAIL ::",
-                tar::tar_reason(e)
+                ":: SELFHOST: SRC.TGZ is not a complete tar archive ({}) -> FAIL ::{}",
+                tar::tar_reason(e), on()
             );
             return;
         }
@@ -353,43 +391,43 @@ fn run() {
     let describe = if stamp.describe.is_empty() { "?" } else { stamp.describe.as_str() };
     let commit7 = stamp.commit.get(..7).unwrap_or("?");
     serial_println!(
-        ":: SELFHOST: SRC.TGZ on {} tgz={} raw={} crc=0x{:08x} commit={} describe={} first={} ::",
+        ":: SELFHOST: SRC.TGZ on {} tgz={} raw={} crc=0x{:08x} commit={} describe={} first={} ::{}",
         fs.source_name(),
         gz.compressed,
         gz.uncompressed,
         gz.crc,
         commit7,
         describe,
-        first_name.as_deref().unwrap_or("-")
+        first_name.as_deref().unwrap_or("-"), on()
     );
 
     if !sha_ok {
         serial_println!(
-            ":: SELFHOST: src sha256 MISMATCH want={} got={} -> FAIL ::",
+            ":: SELFHOST: src sha256 MISMATCH want={} got={} -> FAIL ::{}",
             hex32(&stamp.sha),
-            hex32(&got_sha)
+            hex32(&got_sha), on()
         );
         return;
     }
     if census.target_members != 0 {
         // source_along.md: `tar -tzf SRC.TGZ | awk '/^target\//' | wc -l` must be 0.
         serial_println!(
-            ":: SELFHOST: src payload carries {} member(s) under target/ — build output was archived -> FAIL ::",
-            census.target_members
+            ":: SELFHOST: src payload carries {} member(s) under target/ — build output was archived -> FAIL ::{}",
+            census.target_members, on()
         );
         return;
     }
     if census.files == 0 {
-        serial_println!(":: SELFHOST: src payload holds no regular files -> FAIL ::");
+        serial_println!(":: SELFHOST: src payload holds no regular files -> FAIL ::{}", on());
         return;
     }
 
     serial_println!(
-        ":: SELFHOST: src verified sha={} files={} dirs={} bytes={} target=0 crc=ok -> PASS ::",
+        ":: SELFHOST: src verified sha={} files={} dirs={} bytes={} target=0 crc=ok -> PASS ::{}",
         hex32(&got_sha),
         census.files,
         census.dirs,
-        census.bytes
+        census.bytes, on()
     );
 
     // SRCEXTRACT: the payload is good, so register the extraction DRY RUN as `tests srcextract` (runs
