@@ -1909,3 +1909,223 @@ mod smallfix7_tests {
         assert_eq!(table, [1, 2, 4]);
     }
 }
+
+// ── MIDDENTWIN (LEDGER SR75, R104) — the ring-3 shell's facts, its served set and its refusal ────────────────
+// `APPS/MIDDEN.ELF` (crates/user-midden) is the second ring that plans every line through THIS core: the
+// kernel's shell builds its `Facts` from `cfg!` (`shell.rs` `midden_facts()`), the ring-3 program from what the
+// ring-3 ABI can do, which is this constructor. The core still decides what a line MEANS; this block only
+// states, once and host-tested, which `Plan::Host` verbs the ring-3 program fulfils and the text it prints for
+// the rest. Appended at the file tail so no existing line (and no panic Location the kernel links) moves.
+
+impl Facts {
+    /// What a ring-3 program can do through the ring-3 ABI (una-abi's syscall list), on the arch it was built for.
+    ///
+    /// * `proc_verbs` / `exec` are FALSE: ring 3 has no spawn-by-path. `SYS_SPAWN` (8) loads only the fixed
+    ///   staged program (HELLO.BIN), so `run`/`bg`/`jobs`/`kill`/`storm` and bare-name launch are verbs of the
+    ///   kernel's shell only, and the core gives the ring-3 caller its own answer for them ("Unknown command").
+    /// * `v3d` is false: the GPU battery replay is a kernel arm.
+    /// * `proc_rows` is 0 beside `proc_verbs == false`, the kernel's own spelling for "no process table here".
+    pub const fn ring3(x86: bool) -> Self {
+        Facts { aarch64: !x86, x86, v3d: false, proc_verbs: false, proc_rows: 0, exec: false }
+    }
+}
+
+/// The ring-3 shell's half of the table: what MIDDEN.ELF fulfils, what it refuses, and the witness codes.
+pub mod ring3 {
+    use super::{Message, CORE_VERBS, HOST_VERBS};
+    use alloc::format;
+
+    /// The `Plan::Host` verbs MIDDEN.ELF fulfils through the ring-3 ABI: `clear`/`history` are its own state,
+    /// `pwd`/`cd` its cwd (`cd` checks the target with `SYS_STAT`), `ls`/`dir` read a listing with
+    /// `SYS_PATH_READ` + `PATH_R_LIST`, `cat`/`type` the file with `SYS_PATH_READ`, `stat` is `SYS_STAT`.
+    pub const SERVED: &[&str] = &["clear", "history", "pwd", "cd", "ls", "dir", "cat", "type", "stat"];
+
+    /// The core verbs whose ring-3 meaning is "close this window": a window HAS a parent to return to (the
+    /// desktop), which the framebuffer console the core's `exit` sentence describes does not.
+    pub const CLOSES: &[&str] = &["exit", "quit"];
+
+    /// Does MIDDEN.ELF fulfil this (canonical) `Plan::Host` verb?
+    pub fn serves(verb: &str) -> bool {
+        SERVED.contains(&verb)
+    }
+
+    /// The refusal for a verb the core registers on this build but the ring-3 ABI cannot fulfil. The kernel's
+    /// drift net prints the same shape with "this kernel" (`shell.rs` `other =>`); ring 3 names its own carrier.
+    pub fn refusal(verb: &str) -> Message {
+        Message::TerminalError(format!(
+            "{}: not available on this build (the verb exists; the ring-3 ABI does not carry it)",
+            verb
+        ))
+    }
+
+    /// The witness code of a verb: 1 + its index in `CORE_VERBS` then `HOST_VERBS`, 0 for no verb. The
+    /// feature-gated `HOST_VERBS` rows sit at the table's TAIL, so every code below them is the same number in
+    /// a kernel built with `login`/`installdemo` and in a program built without them.
+    pub fn verb_code(verb: &str) -> u8 {
+        let i = CORE_VERBS.iter().position(|v| *v == verb).or_else(|| {
+            HOST_VERBS.iter().position(|(n, _)| *n == verb).map(|i| CORE_VERBS.len() + i)
+        });
+        match i {
+            Some(i) if i < 255 => (i + 1) as u8,
+            _ => 0,
+        }
+    }
+
+    /// The verb a witness code names ([`verb_code`]'s inverse).
+    pub fn verb_of(code: u8) -> Option<&'static str> {
+        let i = (code as usize).checked_sub(1)?;
+        CORE_VERBS.get(i).copied().or_else(|| HOST_VERBS.get(i - CORE_VERBS.len()).map(|(n, _)| *n))
+    }
+
+    /// The program's exit status after `exit`, the one channel the kernel's `tests midden` reads back
+    /// (`bg_poll`'s `Exited(i32)`; bit 31 stays clear): `rows` scrollback rows `[9:0]`, `cmds` lines planned
+    /// `[15:10]` (an `exit` that closes is not counted), the last plan's kind `[17:16]` (0 Nothing, 1 Say,
+    /// 2 Host, 3 Exec), its verb code `[25:18]`, `window` `[26]`, a loaded face `[27]`.
+    pub const fn status(rows: u32, cmds: u32, kind: u32, verb: u8, window: bool, face: bool) -> i32 {
+        let r = if rows > 0x3FF { 0x3FF } else { rows };
+        let c = if cmds > 0x3F { 0x3F } else { cmds };
+        (r | (c << 10) | ((kind & 3) << 16) | ((verb as u32) << 18) | ((window as u32) << 26) | ((face as u32) << 27)) as i32
+    }
+
+    /// [`status`] read back: `(rows, cmds, kind, verb, window, face)`.
+    pub const fn status_parse(s: i32) -> (u32, u32, u32, u8, bool, bool) {
+        let s = s as u32;
+        (s & 0x3FF, (s >> 10) & 0x3F, (s >> 16) & 3, ((s >> 18) & 0xFF) as u8, (s >> 26) & 1 != 0, (s >> 27) & 1 != 0)
+    }
+
+    /// The kind field's name.
+    pub const fn kind_name(kind: u32) -> &'static str {
+        match kind {
+            1 => "Say",
+            2 => "Host",
+            3 => "Exec",
+            _ => "Nothing",
+        }
+    }
+}
+
+// ── MIDDENTWIN: the equivalence B171 wanted — ten lines through both rings' Facts over ONE fixture Volume ─────
+#[cfg(test)]
+mod middentwin_tests {
+    extern crate std;
+    use super::*;
+    use std::println;
+
+    /// The kernel shell's facts on an x86 build, field for field from `shell.rs` `midden_facts()`: the process
+    /// verbs and bare-name launch exist on x86; `proc_rows` is `proc_table_rows()` at run time (memory's limit,
+    /// WINDOWCAP3) — 16 here, and it reaches only the `storm` help line.
+    const KERNEL_X86: Facts = Facts { aarch64: false, x86: true, v3d: false, proc_verbs: true, proc_rows: 16, exec: true };
+
+    /// The ten lines. Each is planned by both rings over the same Volume.
+    const LINES: [&str; 10] = [
+        "",
+        "help",
+        "echo hello twin",
+        "exit",
+        "LS -l",
+        "cat README.TXT",
+        "cd /apps",
+        "vug",
+        "run /apps/VUG.ELF",
+        "ping 10.0.2.2",
+    ];
+
+    fn vol() -> NameList<'static> {
+        NameList(&["VUG.ELF", "STAT.ELF", "README.TXT"])
+    }
+
+    /// What a ring DOES with a plan: the plan's debug text when it fulfils it, the printed text when it refuses.
+    fn kernel_outcome(p: &Plan) -> std::string::String {
+        std::format!("{:?}", p) // the kernel's shell fulfils every verb its own facts register
+    }
+    fn ring3_outcome(p: &Plan) -> std::string::String {
+        match p {
+            Plan::Host { verb, .. } if !ring3::serves(verb) => std::format!("REFUSED {:?}", ring3::refusal(verb)),
+            Plan::Exec { .. } => std::string::String::from("REFUSED exec"), // unreachable: Facts::ring3 has exec = false
+            other => std::format!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn ten_lines_plan_the_same_where_both_rings_can_and_refuse_in_the_cores_words_where_one_cannot() {
+        let r3 = Facts::ring3(true);
+        let unknown = Plan::Say(Message::TerminalError("Unknown command. Type 'help' for assistance.".into()));
+        let mut differ: std::vec::Vec<&str> = std::vec::Vec::new();
+        for line in LINES {
+            let kp = plan(line, &KERNEL_X86, &mut vol());
+            let rp = plan(line, &r3, &mut vol());
+            let (ko, ro) = (kernel_outcome(&kp), ring3_outcome(&rp));
+            let same = ko == ro;
+            let short = |o: &str| if o.len() > 160 { std::format!("{}... ({} bytes)", &o[..48], o.len()) } else { std::string::String::from(o) };
+            println!("MIDDENTWIN-KAT | {:<20} | {} | kernel={} | ring3={}", std::format!("{:?}", line), if same { "same" } else { "DIFF" }, short(&ko), short(&ro));
+            if same {
+                continue;
+            }
+            differ.push(line);
+            match line {
+                // Both rings answer `help` in full; the texts differ ONLY in the lines keyed on the two facts ring 3
+                // does not have (proc_verbs, exec) — the PROC line, the two bare-name lines and the storm line.
+                "help" => {
+                    let (Plan::Say(Message::TerminalOutput(k)), Plan::Say(Message::TerminalOutput(r))) = (&kp, &rp) else {
+                        panic!("help must be a core answer on both rings")
+                    };
+                    let only_k: std::vec::Vec<&str> = k.lines().filter(|l| !r.lines().any(|x| x == *l)).collect();
+                    let only_r: std::vec::Vec<&str> = r.lines().filter(|l| !k.lines().any(|x| x == *l)).collect();
+                    assert!(only_r.is_empty(), "ring 3's help must be a subset of the kernel's: {:?}", only_r);
+                    assert_eq!(only_k.len(), 4, "{:?}", only_k);
+                    assert!(only_k[0].starts_with("PROC:"));
+                    assert!(only_k[1].contains("<name>") && only_k[2].contains(".elf is optional") && only_k[3].contains("storm"));
+                    println!("MIDDENTWIN-KAT | help lines only the kernel prints: {:?}", only_k);
+                }
+                // A bare program name and `run`: the kernel launches; ring 3 has no spawn-by-path, so the core
+                // gives it the core's own refusal (the word is not a verb on these facts, and exec is off).
+                "vug" => {
+                    assert!(matches!(&kp, Plan::Exec { name, .. } if name == "VUG.ELF"));
+                    assert_eq!(rp, unknown);
+                }
+                "run /apps/VUG.ELF" => {
+                    assert_eq!(kp, Plan::Host { verb: "run".into(), rest: "/apps/VUG.ELF".into() });
+                    assert_eq!(rp, unknown);
+                }
+                // The SAME plan on both rings; only the kernel carries a NIC verb, and ring 3 prints the core's refusal.
+                "ping 10.0.2.2" => {
+                    assert_eq!(kp, rp, "the plan itself is identical");
+                    assert_eq!(ro, std::format!("REFUSED {:?}", ring3::refusal("ping")));
+                }
+                other => panic!("unexpected difference on {:?}: kernel={} ring3={}", other, ko, ro),
+            }
+        }
+        assert_eq!(differ, ["help", "vug", "run /apps/VUG.ELF", "ping 10.0.2.2"], "the documented difference set");
+        println!("MIDDENTWIN-KAT | lines={} same={} differ={:?}", LINES.len(), LINES.len() - differ.len(), differ);
+    }
+
+    #[test]
+    fn ring3_facts_say_what_the_abi_can_do() {
+        let f = Facts::ring3(true);
+        assert!(f.x86 && !f.aarch64 && !f.exec && !f.proc_verbs && f.proc_rows == 0);
+        let a = Facts::ring3(false);
+        assert!(a.aarch64 && !a.x86);
+        // Every served verb is a verb on the ring-3 facts (no served word the core would not route to Host).
+        for v in ring3::SERVED {
+            assert!(HOST_VERBS.iter().any(|(n, av)| n == v && av.on(&f)), "{} is served but not a host verb", v);
+        }
+        for v in ring3::CLOSES {
+            assert!(CORE_VERBS.contains(v));
+        }
+    }
+
+    #[test]
+    fn the_witness_codes_round_trip() {
+        for v in CORE_VERBS.iter().chain(HOST_VERBS.iter().map(|(n, _)| n)) {
+            let c = ring3::verb_code(v);
+            assert!(c != 0);
+            assert_eq!(ring3::verb_of(c), Some(*v));
+        }
+        assert_eq!(ring3::verb_code("frobnicate"), 0);
+        assert_eq!(ring3::verb_of(0), None);
+        let s = ring3::status(37, 2, 2, ring3::verb_code("ls"), true, false);
+        assert!(s > 0);
+        assert_eq!(ring3::status_parse(s), (37, 2, 2, ring3::verb_code("ls"), true, false));
+        assert_eq!(ring3::status_parse(ring3::status(5000, 99, 1, 0, false, true)), (0x3FF, 0x3F, 1, 0, false, true));
+    }
+}

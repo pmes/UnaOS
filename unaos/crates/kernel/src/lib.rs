@@ -336,3 +336,4 @@ pub mod soundopeners;
 pub mod smallfix7;
 // QUEUESLEEP (rmbp-ledger B512, R103 §2): `tests queuesleep` — the input path on an idle desktop, then one key, timed. Tail statement.
 pub mod queuesleep;
+#[cfg(all(feature = "midden", target_arch = "x86_64"))] pub mod middenapp; // MIDDENTWIN (LEDGER SR75): `tests midden` — APPS/MIDDEN.ELF, the ring-3 shell over midden_core, driven and read back. Tail statement, so no existing line moves.
