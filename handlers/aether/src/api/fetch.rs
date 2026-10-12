@@ -1,162 +1,975 @@
-use js_core::vm::*;
-use crate::js::idl;
-use std::cell::Cell;
+//! The Fetch Standard's page-facing half (AETHERNET, LEDGER SR70): `fetch()` whose `Response.body` is a
+//! `ReadableStream` fed chunk by chunk as the connection delivers it, `Headers`, `Request`, `Response`,
+//! the Streams Standard's default `ReadableStream` / reader / controller, `AbortController` /
+//! `AbortSignal` wired through, and a minimal `Blob` / `FileReader`.
+//!
+//! The worker half is here too: [`spawn_http`] runs one exchange on its own thread through
+//! gneiss_pal::api::http's blocking client (the shared cookie jar, http_core + tls_core underneath) and
+//! posts `head` / `data` / `end` | `error` messages into the page's network queue (`js::net`), so script
+//! sees the first chunk while the server is still sending the rest. `XMLHttpRequest` (`api::xhr`) runs on
+//! the same worker, and its synchronous mode on [`http_sync`].
 
-thread_local! {
-    /// Per-page fetch budget; reset when a new JS engine boots.
-    static FETCH_COUNT: Cell<u32> = const { Cell::new(0) };
+use crate::js::net::{NetArg, Poster};
+use std::time::Duration;
+
+/// Most bytes a synchronous XHR buffers (an asynchronous body streams and has no cap).
+const SYNC_BODY_CAP: usize = 64 * 1024 * 1024;
+
+/// Kept for `Engine::with_viewport` (the per-page budget became `js::net::MAX_OPS` in flight).
+pub fn reset_budget() {}
+
+/// The platform-prelude hook `window::install` calls; the network preludes install from
+/// `js::net::install` (after the platform prelude, which they supersede).
+pub fn init(_vm: &mut js_core::vm::Vm) {}
+
+/// One request as the page built it.
+pub struct HttpReq {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// The request's redirect mode: `follow`, `error` or `manual`.
+    pub redirect: String,
+    /// 0 = none (XHR `timeout` is enforced on the page clock; this is the transport's idle limit).
+    pub timeout_ms: u64,
 }
 
-const FETCH_CAP: u32 = 20;
-const BODY_CAP: usize = 5 * 1024 * 1024;
-
-pub fn reset_budget() {
-    FETCH_COUNT.with(|c| c.set(0));
+fn client(req: &HttpReq) -> Result<gneiss_pal::api::http::blocking::Client, String> {
+    let mut b = crate::net::blocking_client_builder();
+    // A long poll or a server-sent stream over fetch may sit idle for minutes between chunks.
+    b = b.timeout(Duration::from_millis(if req.timeout_ms > 0 { req.timeout_ms } else { 300_000 }));
+    if req.redirect != "follow" {
+        b = b.max_redirects(0);
+    }
+    b.build().map_err(|e| e.to_string())
 }
 
-/// Synchronous HTTP for the JS `fetch` wrapper. Runs the request on a
-/// scoped thread with its own blocking client (the engine thread sits
-/// inside a tokio runtime, which forbids blocking directly). Fetch-then-
-/// apply semantics: page boot blocks on its own requests, like the rest
-/// of the load path.
-fn native_fetch(url: &str, method: &str, body: &str) -> Option<(u16, String, String)> {
-    let n = FETCH_COUNT.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    if n >= FETCH_CAP {
-        crate::ledger::record_js("fetch-cap-reached");
-        return None;
+fn header_list(h: &gneiss_pal::api::http::Headers) -> Vec<String> {
+    let mut out = Vec::with_capacity(h.len() * 2);
+    for (k, v) in h.iter() {
+        out.push(k.to_string());
+        out.push(v.to_string());
     }
-    let base = crate::images::page_base();
-    let abs = crate::images::resolve(&base, url);
-    if !(abs.starts_with("http://") || abs.starts_with("https://")) {
-        crate::ledger::record_js("fetch-bad-url");
-        return None;
+    out
+}
+
+fn send(req: &HttpReq) -> Result<gneiss_pal::api::http::blocking::Response, String> {
+    let c = client(req)?;
+    let mut rb = c.request(&req.method, &req.url);
+    for (k, v) in &req.headers {
+        rb = rb.header(k, v);
     }
-    let method = method.to_ascii_uppercase();
-    let body = body.to_string();
-    let abs_thread = abs.clone();
-    let result = std::thread::spawn(move || -> Option<(u16, String)> {
-        // Shared jar: JS-initiated requests carry and record the same
-        // cookies as the page load that spawned them.
-        let client = crate::net::blocking_client_builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .ok()?;
-        let req = match method.as_str() {
-            "POST" => client.post(&abs_thread).body(body),
-            _ => client.get(&abs_thread),
+    if !req.body.is_empty() || !matches!(req.method.as_str(), "GET" | "HEAD") {
+        rb = rb.body(req.body.clone());
+    }
+    let resp = rb.send().map_err(|e| e.to_string())?;
+    let st = resp.status().as_u16();
+    if req.redirect == "error" && (300..400).contains(&st) && resp.headers().contains("location") {
+        return Err("redirect in redirect mode \"error\"".into());
+    }
+    Ok(resp)
+}
+
+/// Runs `req` on its own thread, posting `head(status, statusText, url, [k, v, …], redirected)`, a
+/// `data(ArrayBuffer)` per chunk as it arrives, then `end` — or `error(message)` — as the last message.
+pub fn spawn_http(req: HttpReq, p: Poster) {
+    std::thread::spawn(move || {
+        let mut resp = match send(&req) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::ledger::record_js(&format!("fetch-failed:{}", crate::js::clip(&req.url, 48)));
+                p.finish("error", vec![NetArg::Str(e)]);
+                return;
+            }
         };
-        let resp = req.send().ok()?;
-        let status = resp.status().as_u16();
-        let text = resp.text().ok()?;
-        if text.len() > BODY_CAP {
-            return None;
+        let st = resp.status().as_u16();
+        let url = resp.url().href();
+        let redirected = url != req.url;
+        let head = vec![
+            NetArg::Num(st as f64),
+            NetArg::Str(resp.reason().to_string()),
+            NetArg::Str(url),
+            NetArg::List(header_list(resp.headers())),
+            NetArg::Bool(redirected),
+        ];
+        if !p.post("head", head) {
+            return;
         }
-        Some((status, text))
+        loop {
+            if p.cancelled() {
+                return;
+            }
+            match resp.chunk() {
+                Ok(Some(c)) => {
+                    if c.is_empty() {
+                        continue;
+                    }
+                    if !p.post("data", vec![NetArg::Bytes(c)]) {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    p.finish("end", vec![]);
+                    return;
+                }
+                Err(e) => {
+                    p.finish("error", vec![NetArg::Str(e.to_string())]);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// A whole response (synchronous XHR).
+pub struct SyncResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub url: String,
+    pub headers: Vec<String>,
+    pub body: Vec<u8>,
+}
+
+/// Runs `req` to completion on a scoped thread (the engine thread may sit inside a tokio runtime, which
+/// forbids blocking directly) and joins it.
+pub fn http_sync(req: HttpReq) -> Result<SyncResponse, String> {
+    std::thread::spawn(move || -> Result<SyncResponse, String> {
+        let mut resp = send(&req)?;
+        let mut body = Vec::new();
+        while let Some(c) = resp.chunk().map_err(|e| e.to_string())? {
+            body.extend_from_slice(&c);
+            if body.len() > SYNC_BODY_CAP {
+                return Err("synchronous response body larger than 64 MiB".into());
+            }
+        }
+        Ok(SyncResponse {
+            status: resp.status().as_u16(),
+            status_text: resp.reason().to_string(),
+            url: resp.url().href(),
+            headers: header_list(resp.headers()),
+            body,
+        })
     })
     .join()
-    .ok()
-    .flatten();
-    match result {
-        Some((status, text)) => Some((status, abs, text)),
-        None => {
-            crate::ledger::record_js(&format!("fetch-failed:{}", &abs[..abs.len().min(48)]));
-            None
+    .map_err(|_| "fetch thread panicked".to_string())?
+}
+
+/// The WHATWG shapes: AbortSignal/AbortController, Blob, Headers, the Streams Standard's default
+/// ReadableStream, Request, Response and `fetch`.
+pub const PRELUDE: &str = r#"
+(function () {
+    var hide = function (o, name, v) {
+        Object.defineProperty(o, name, { value: v, writable: true, configurable: true, enumerable: false });
+    };
+    var ST = new WeakMap();
+    var st = function (o, what) {
+        var s = (o !== null && typeof o === 'object') ? ST.get(o) : undefined;
+        if (s === undefined) { throw new TypeError("Illegal invocation" + (what ? ' (' + what + ')' : '')); }
+        return s;
+    };
+    var getter = function (proto, name, f) {
+        Object.defineProperty(proto, name, { get: f, enumerable: true, configurable: true });
+    };
+    var method = function (proto, name, f) {
+        Object.defineProperty(proto, name, { value: f, writable: true, enumerable: true, configurable: true });
+    };
+    var abortError = function () { return new DOMException('signal is aborted without reason', 'AbortError'); };
+    var utf8 = function (s) { return new TextEncoder().encode(String(s)); };
+    var concat = function (chunks) {
+        var n = 0, i;
+        for (i = 0; i < chunks.length; i++) { n += chunks[i].byteLength; }
+        var out = new Uint8Array(n), at = 0;
+        for (i = 0; i < chunks.length; i++) { out.set(chunks[i], at); at += chunks[i].byteLength; }
+        return out;
+    };
+    var toBytes = function (v) {
+        if (v instanceof ArrayBuffer) { return new Uint8Array(v.slice(0)); }
+        if (ArrayBuffer.isView(v)) { return new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)); }
+        return null;
+    };
+    hide(globalThis, '__to_bytes', toBytes);
+
+    // ---- AbortController / AbortSignal (DOM §3.1–3.2) ------------------------------------------------
+    var creatingSignal = false;
+    class AbortSignal extends EventTarget {
+        constructor() {
+            if (!creatingSignal) { throw new TypeError('Illegal constructor'); }
+            super();
+            ST.set(this, { aborted: false, reason: undefined, algos: [] });
         }
-    }
-}
-
-fn native_fetch_js(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let a0 = vm.arg(ctx, 0);
-    let url = vm.to_string(&a0)?.to_rust();
-    let a1 = vm.arg(ctx, 1);
-    let method = if a1.is_undefined() { String::new() } else { vm.to_string(&a1)?.to_rust() };
-    let a2 = vm.arg(ctx, 2);
-    let body = if a2.is_undefined() { String::new() } else { vm.to_string(&a2)?.to_rust() };
-    match native_fetch(&url, &method, &body) {
-        Some((status, final_url, text)) => {
-            let o = vm.new_plain_object();
-            vm.create_data_property(o, PropertyKey::from_str("status"), Value::Number(status as f64))?;
-            vm.create_data_property(o, PropertyKey::from_str("url"), idl::s(&final_url))?;
-            vm.create_data_property(o, PropertyKey::from_str("body"), idl::s(&text))?;
-            Ok(Value::Object(o))
+        get aborted() { return st(this).aborted; }
+        get reason() { return st(this).reason; }
+        throwIfAborted() { var s = st(this); if (s.aborted) { throw s.reason; } }
+        static abort(reason) {
+            var sig = newSignal();
+            var s = st(sig);
+            s.aborted = true;
+            s.reason = reason === undefined ? abortError() : reason;
+            return sig;
         }
-        None => Ok(Value::Null),
-    }
-}
-
-/// Installs `__native_fetch` and the WHATWG-shaped `fetch` / `XMLHttpRequest` wrapper over it.
-pub fn init(vm: &mut Vm) {
-    let f = vm.make_native("__native_fetch", 3, native_fetch_js, false);
-    let g = vm.realm().global;
-    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("__native_fetch"), Prop::data(Value::Object(f), WC));
-    if let Err(e) = vm.run_script_str(PRELUDE) {
-        let m = vm.error_string(&e);
-        crate::ledger::record_js(&format!("fetch-prelude-failed:{m}"));
-    }
-}
-
-/// The whatwg-shaped wrapper: promises, Response.text/json, XHR over the same native layer.
-const PRELUDE: &str = r#"
-        globalThis.fetch = function (url, opts) {
-            var method = (opts && opts.method) ? String(opts.method) : 'GET';
-            var reqBody = (opts && opts.body != null) ? String(opts.body) : '';
-            var r = __native_fetch(String(url), method, reqBody);
-            if (!r) {
-                return Promise.reject(new TypeError('fetch failed'));
+        static timeout(ms) {
+            var sig = newSignal();
+            setTimeout(function () { signalAbort(sig, new DOMException('signal timed out', 'TimeoutError')); }, Number(ms) || 0);
+            return sig;
+        }
+        static any(signals) {
+            var out = newSignal();
+            var list = Array.from(signals);
+            for (var i = 0; i < list.length; i++) {
+                if (st(list[i]).aborted) { signalAbort(out, st(list[i]).reason); return out; }
             }
-            var resp = {
-                ok: r.status >= 200 && r.status < 300,
-                status: r.status,
-                url: r.url,
-                headers: { get: function () { return null; } },
-                text: function () { return Promise.resolve(r.body); },
-                json: function () {
-                    try { return Promise.resolve(JSON.parse(r.body)); }
-                    catch (e) { return Promise.reject(e); }
+            list.forEach(function (sg) { st(sg).algos.push(function () { signalAbort(out, st(sg).reason); }); });
+            return out;
+        }
+    }
+    var newSignal = function () {
+        creatingSignal = true;
+        try { return new AbortSignal(); } finally { creatingSignal = false; }
+    };
+    var signalAbort = function (sig, reason) {
+        var s = st(sig);
+        if (s.aborted) { return; }
+        s.aborted = true;
+        s.reason = reason === undefined ? abortError() : reason;
+        var algos = s.algos.splice(0);
+        for (var i = 0; i < algos.length; i++) { try { algos[i](); } catch (e) { reportError(e); } }
+        __net_fire(sig, 'Event', 'abort', undefined);
+    };
+    __net_handlers(AbortSignal.prototype, ['abort']);
+    Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, { value: 'AbortSignal', configurable: true });
+    class AbortController {
+        constructor() { ST.set(this, { signal: newSignal() }); }
+        get signal() { return st(this).signal; }
+        abort(reason) { signalAbort(st(this).signal, reason); }
+    }
+    Object.defineProperty(AbortController.prototype, Symbol.toStringTag, { value: 'AbortController', configurable: true });
+    hide(globalThis, 'AbortSignal', AbortSignal);
+    hide(globalThis, 'AbortController', AbortController);
+    hide(globalThis, '__abortSignal', signalAbort);
+    var onAbort = function (sig, f) { if (sig) { st(sig).algos.push(f); } };
+
+    // ---- Blob (File API §3, the parts this platform needs: bytes, type, slice, readers) ---------------
+    if (typeof Blob === 'undefined') {
+        class Blob {
+            constructor(parts, opts) {
+                var chunks = [];
+                if (parts !== undefined) {
+                    if (parts === null || typeof parts !== 'object') { throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence."); }
+                    Array.from(parts).forEach(function (p) {
+                        var b = toBytes(p);
+                        if (b) { chunks.push(b); }
+                        else if (p instanceof Blob) { chunks.push(st(p).bytes); }
+                        else { chunks.push(utf8(p)); }
+                    });
+                }
+                var type = opts && opts.type !== undefined ? String(opts.type) : '';
+                if (/[^ -~]/.test(type)) { type = ''; }
+                ST.set(this, { bytes: concat(chunks), type: type.toLowerCase() });
+            }
+            get size() { return st(this).bytes.byteLength; }
+            get type() { return st(this).type; }
+            slice(start, end, type) {
+                var b = st(this).bytes, n = b.byteLength;
+                var rel = function (v, d) { if (v === undefined) { return d; } v = Math.trunc(Number(v)) || 0; return v < 0 ? Math.max(n + v, 0) : Math.min(v, n); };
+                var s = rel(start, 0), e = rel(end, n);
+                var out = new Blob([], { type: type === undefined ? '' : String(type) });
+                st(out).bytes = b.slice(s, Math.max(s, e));
+                return out;
+            }
+            arrayBuffer() { return Promise.resolve(st(this).bytes.slice().buffer); }
+            bytes() { return Promise.resolve(st(this).bytes.slice()); }
+            text() { return Promise.resolve(new TextDecoder().decode(st(this).bytes)); }
+            stream() {
+                var b = st(this).bytes.slice();
+                return new ReadableStream({ start: function (c) { if (b.byteLength) { c.enqueue(b); } c.close(); } });
+            }
+        }
+        Object.defineProperty(Blob.prototype, Symbol.toStringTag, { value: 'Blob', configurable: true });
+        hide(globalThis, 'Blob', Blob);
+        hide(globalThis, '__blob_bytes', function (b) { return st(b).bytes; });
+    }
+
+    // ---- FileReader (File API §6: the asynchronous reads, as tasks) ------------------------------------
+    if (typeof FileReader === 'undefined' && typeof __blob_bytes === 'function') {
+        class FileReader extends EventTarget {
+            constructor() { super(); ST.set(this, { readyState: 0, result: null, error: null, gen: 0 }); }
+            get readyState() { return st(this).readyState; }
+            get result() { return st(this).result; }
+            get error() { return st(this).error; }
+            abort() {
+                var s = st(this);
+                if (s.readyState !== 1) { return; }
+                s.gen++; s.readyState = 2; s.result = null;
+                __net_fire(this, 'ProgressEvent', 'abort', undefined);
+                __net_fire(this, 'ProgressEvent', 'loadend', undefined);
+            }
+        }
+        var read = function (fr, blob, how, label) {
+            var s = st(fr);
+            if (!(blob instanceof Blob)) { throw new TypeError("Failed to execute '" + label + "' on 'FileReader': parameter 1 is not of type 'Blob'."); }
+            if (s.readyState === 1) { throw new DOMException("Failed to execute '" + label + "' on 'FileReader': The object is already busy reading Blobs.", 'InvalidStateError'); }
+            s.readyState = 1; s.result = null; s.error = null;
+            var gen = ++s.gen, bytes = __blob_bytes(blob).slice(), type = blob.type;
+            setTimeout(function () {
+                if (s.gen !== gen) { return; }
+                __net_fire(fr, 'ProgressEvent', 'loadstart', { lengthComputable: true, loaded: 0, total: bytes.byteLength });
+                if (s.gen !== gen) { return; }
+                if (how === 'text') { s.result = new TextDecoder().decode(bytes); }
+                else if (how === 'buffer') { s.result = bytes.buffer; }
+                else if (how === 'binary') { var b = ''; for (var i = 0; i < bytes.length; i++) { b += String.fromCharCode(bytes[i]); } s.result = b; }
+                else {
+                    var bin = '';
+                    for (var j = 0; j < bytes.length; j++) { bin += String.fromCharCode(bytes[j]); }
+                    s.result = 'data:' + (type || 'application/octet-stream') + ';base64,' + btoa(bin);
+                }
+                s.readyState = 2;
+                __net_fire(fr, 'ProgressEvent', 'progress', { lengthComputable: true, loaded: bytes.byteLength, total: bytes.byteLength });
+                __net_fire(fr, 'ProgressEvent', 'load', { lengthComputable: true, loaded: bytes.byteLength, total: bytes.byteLength });
+                if (s.readyState === 2) { __net_fire(fr, 'ProgressEvent', 'loadend', { lengthComputable: true, loaded: bytes.byteLength, total: bytes.byteLength }); }
+            }, 0);
+        };
+        FileReader.prototype.readAsText = function (b) { read(this, b, 'text', 'readAsText'); };
+        FileReader.prototype.readAsArrayBuffer = function (b) { read(this, b, 'buffer', 'readAsArrayBuffer'); };
+        FileReader.prototype.readAsBinaryString = function (b) { read(this, b, 'binary', 'readAsBinaryString'); };
+        FileReader.prototype.readAsDataURL = function (b) { read(this, b, 'url', 'readAsDataURL'); };
+        ['EMPTY', 'LOADING', 'DONE'].forEach(function (n, i) {
+            Object.defineProperty(FileReader, n, { value: i, enumerable: true });
+            Object.defineProperty(FileReader.prototype, n, { value: i, enumerable: true });
+        });
+        __net_handlers(FileReader.prototype, ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']);
+        Object.defineProperty(FileReader.prototype, Symbol.toStringTag, { value: 'FileReader', configurable: true });
+        hide(globalThis, 'FileReader', FileReader);
+    }
+
+    // ---- Headers (Fetch §5.2) -------------------------------------------------------------------------
+    var TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+    var normValue = function (v) { return String(v).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, ''); };
+    class Headers {
+        constructor(init) {
+            ST.set(this, { list: [], guard: 'none' });
+            if (init === undefined || init === null) { return; }
+            if (typeof init !== 'object' && typeof init !== 'function') { throw new TypeError("Failed to construct 'Headers': The provided value is not of type '(record<ByteString, ByteString> or sequence<sequence<ByteString>>)'."); }
+            var self = this;
+            if (init instanceof Headers) {
+                st(init).list.forEach(function (p) { self.append(p[0], p[1]); });
+            } else if (typeof init[Symbol.iterator] === 'function') {
+                Array.from(init).forEach(function (pair) {
+                    var p = Array.from(pair);
+                    if (p.length !== 2) { throw new TypeError("Failed to construct 'Headers': Invalid value"); }
+                    self.append(p[0], p[1]);
+                });
+            } else {
+                Object.keys(init).forEach(function (k) { self.append(k, init[k]); });
+            }
+        }
+        append(name, value) {
+            var s = st(this);
+            name = String(name); value = normValue(value);
+            if (!TOKEN.test(name)) { throw new TypeError("Failed to execute 'append' on 'Headers': Invalid name"); }
+            if (/[\0\r\n]/.test(value)) { throw new TypeError("Failed to execute 'append' on 'Headers': Invalid value"); }
+            if (s.guard === 'immutable') { throw new TypeError("Failed to execute 'append' on 'Headers': Headers are immutable"); }
+            s.list.push([name.toLowerCase(), value]);
+        }
+        delete(name) {
+            var s = st(this);
+            name = String(name);
+            if (!TOKEN.test(name)) { throw new TypeError("Failed to execute 'delete' on 'Headers': Invalid name"); }
+            if (s.guard === 'immutable') { throw new TypeError("Failed to execute 'delete' on 'Headers': Headers are immutable"); }
+            var n = name.toLowerCase();
+            s.list = s.list.filter(function (p) { return p[0] !== n; });
+        }
+        get(name) {
+            name = String(name);
+            if (!TOKEN.test(name)) { throw new TypeError("Failed to execute 'get' on 'Headers': Invalid name"); }
+            var n = name.toLowerCase();
+            var vals = st(this).list.filter(function (p) { return p[0] === n; }).map(function (p) { return p[1]; });
+            return vals.length ? vals.join(', ') : null;
+        }
+        getSetCookie() {
+            return st(this).list.filter(function (p) { return p[0] === 'set-cookie'; }).map(function (p) { return p[1]; });
+        }
+        has(name) {
+            name = String(name);
+            if (!TOKEN.test(name)) { throw new TypeError("Failed to execute 'has' on 'Headers': Invalid name"); }
+            var n = name.toLowerCase();
+            return st(this).list.some(function (p) { return p[0] === n; });
+        }
+        set(name, value) {
+            var s = st(this);
+            name = String(name); value = normValue(value);
+            if (!TOKEN.test(name)) { throw new TypeError("Failed to execute 'set' on 'Headers': Invalid name"); }
+            if (/[\0\r\n]/.test(value)) { throw new TypeError("Failed to execute 'set' on 'Headers': Invalid value"); }
+            if (s.guard === 'immutable') { throw new TypeError("Failed to execute 'set' on 'Headers': Headers are immutable"); }
+            var n = name.toLowerCase(), done = false;
+            s.list = s.list.filter(function (p) {
+                if (p[0] !== n) { return true; }
+                if (!done) { done = true; p[1] = value; return true; }
+                return false;
+            });
+            if (!done) { s.list.push([n, value]); }
+        }
+        forEach(cb, thisArg) {
+            var e = sorted(this);
+            for (var i = 0; i < e.length; i++) { cb.call(thisArg, e[i][1], e[i][0], this); }
+        }
+        entries() { return sorted(this)[Symbol.iterator](); }
+        keys() { return sorted(this).map(function (p) { return p[0]; })[Symbol.iterator](); }
+        values() { return sorted(this).map(function (p) { return p[1]; })[Symbol.iterator](); }
+        [Symbol.iterator]() { return this.entries(); }
+    }
+    // "sort and combine" (Fetch §2.2.2): names lowercased and sorted, values combined, set-cookie apart.
+    var sorted = function (h) {
+        var list = st(h).list, names = [], out = [];
+        list.forEach(function (p) { if (names.indexOf(p[0]) < 0) { names.push(p[0]); } });
+        names.sort();
+        names.forEach(function (n) {
+            if (n === 'set-cookie') {
+                list.forEach(function (p) { if (p[0] === n) { out.push([n, p[1]]); } });
+            } else {
+                out.push([n, h.get(n)]);
+            }
+        });
+        return out;
+    };
+    Object.defineProperty(Headers.prototype, Symbol.toStringTag, { value: 'Headers', configurable: true });
+    hide(globalThis, 'Headers', Headers);
+    var headersFrom = function (list, guard) {
+        var h = new Headers();
+        var s = st(h);
+        for (var i = 0; i + 1 < list.length; i += 2) { s.list.push([String(list[i]).toLowerCase(), list[i + 1]]); }
+        s.guard = guard;
+        return h;
+    };
+    hide(globalThis, '__headers_from', headersFrom);
+
+    // ---- ReadableStream (Streams §4: the default stream, controller and reader) ------------------------
+    var creatingInternal = false;
+    var pullIfNeeded, closeStream, errorStream, fulfillRead, cancelStream;
+    class ReadableStreamDefaultController {
+        constructor() { if (!creatingInternal) { throw new TypeError('Illegal constructor'); } }
+        get desiredSize() {
+            var s = st(st(this).stream);
+            if (s.state === 'errored') { return null; }
+            if (s.state === 'closed') { return 0; }
+            return s.hwm - s.queue.length;
+        }
+        enqueue(chunk) {
+            var stream = st(this).stream, s = st(stream);
+            if (s.closeRequested || s.state !== 'readable') {
+                throw new TypeError("Failed to execute 'enqueue' on 'ReadableStreamDefaultController': Cannot enqueue a chunk into a closed stream");
+            }
+            if (s.reader && st(s.reader).reads.length) {
+                fulfillRead(stream, chunk, false);
+            } else {
+                s.queue.push(chunk);
+            }
+            pullIfNeeded(stream);
+        }
+        close() {
+            var stream = st(this).stream, s = st(stream);
+            if (s.closeRequested || s.state !== 'readable') {
+                throw new TypeError("Failed to execute 'close' on 'ReadableStreamDefaultController': Cannot close a closed stream");
+            }
+            s.closeRequested = true;
+            if (!s.queue.length) { closeStream(stream); }
+        }
+        error(e) {
+            var stream = st(this).stream;
+            if (st(stream).state === 'readable') { errorStream(stream, e); }
+        }
+    }
+    class ReadableStreamDefaultReader {
+        constructor(stream) {
+            if (!(stream instanceof ReadableStream)) { throw new TypeError("Failed to construct 'ReadableStreamDefaultReader': parameter 1 is not of type 'ReadableStream'."); }
+            var s = st(stream);
+            if (s.reader) { throw new TypeError("Failed to construct 'ReadableStreamDefaultReader': ReadableStreamDefaultReader constructor can only accept readable streams that are not yet locked to a reader"); }
+            var rs = { stream: stream, reads: [], closed: null, closedResolve: null, closedReject: null };
+            rs.closed = new Promise(function (res, rej) { rs.closedResolve = res; rs.closedReject = rej; });
+            ST.set(this, rs);
+            s.reader = this;
+            if (s.state === 'closed') { rs.closedResolve(undefined); }
+            else if (s.state === 'errored') { rs.closedReject(s.error); rs.closed.catch(function () {}); }
+        }
+        get closed() { return st(this).closed; }
+        read() {
+            var rs = st(this);
+            if (!rs.stream) { return Promise.reject(new TypeError('This readable stream reader has been released and cannot be used to read from its previous owner stream')); }
+            var stream = rs.stream, s = st(stream);
+            s.disturbed = true;
+            if (s.state === 'closed') { return Promise.resolve({ value: undefined, done: true }); }
+            if (s.state === 'errored') { return Promise.reject(s.error); }
+            if (s.queue.length) {
+                var chunk = s.queue.shift();
+                if (s.closeRequested && !s.queue.length) { closeStream(stream); } else { pullIfNeeded(stream); }
+                return Promise.resolve({ value: chunk, done: false });
+            }
+            var p = new Promise(function (res, rej) { rs.reads.push({ res: res, rej: rej }); });
+            pullIfNeeded(stream);
+            return p;
+        }
+        releaseLock() {
+            var rs = st(this);
+            if (!rs.stream) { return; }
+            var e = new TypeError('Releasing reader');
+            rs.reads.splice(0).forEach(function (r) { r.rej(e); });
+            if (st(rs.stream).state === 'readable') { rs.closedReject(e); }
+            rs.closed = Promise.reject(e);
+            rs.closed.catch(function () {});
+            st(rs.stream).reader = null;
+            rs.stream = null;
+        }
+        cancel(reason) {
+            var rs = st(this);
+            if (!rs.stream) { return Promise.reject(new TypeError('This readable stream reader has been released')); }
+            return cancelStream(rs.stream, reason);
+        }
+    }
+    class ReadableStream {
+        constructor(source, strategy) {
+            source = source === undefined || source === null ? {} : source;
+            var hwm = strategy && strategy.highWaterMark !== undefined ? Number(strategy.highWaterMark) : 1;
+            if (isNaN(hwm) || hwm < 0) { throw new RangeError('Invalid highWaterMark'); }
+            if (source.type !== undefined && String(source.type) === 'bytes') { __ledger('ReadableStream-byte-source-as-default'); }
+            creatingInternal = true;
+            var controller;
+            try { controller = new ReadableStreamDefaultController(); } finally { creatingInternal = false; }
+            var s = { state: 'readable', queue: [], reader: null, error: undefined, disturbed: false, closeRequested: false,
+                      started: false, pulling: false, pullAgain: false, hwm: hwm, source: source, controller: controller };
+            ST.set(this, s);
+            ST.set(controller, { stream: this });
+            var self = this;
+            var start = typeof source.start === 'function' ? source.start.call(source, controller) : undefined;
+            Promise.resolve(start).then(function () {
+                s.started = true;
+                pullIfNeeded(self);
+            }, function (e) { if (s.state === 'readable') { errorStream(self, e); } });
+        }
+        get locked() { return st(this).reader !== null; }
+        cancel(reason) {
+            if (st(this).reader) { return Promise.reject(new TypeError("Failed to execute 'cancel' on 'ReadableStream': Cannot cancel a locked stream")); }
+            return cancelStream(this, reason);
+        }
+        getReader(opts) {
+            if (opts && opts.mode !== undefined) {
+                if (String(opts.mode) === 'byob') {
+                    __ledger('ReadableStream-byob-reader');
+                    throw new TypeError("Failed to execute 'getReader' on 'ReadableStream': Cannot get a BYOB reader for a stream that does not have an underlying byte source");
+                }
+                throw new TypeError("Failed to execute 'getReader' on 'ReadableStream': The provided value is not a valid enum value of type ReadableStreamReaderMode.");
+            }
+            return new ReadableStreamDefaultReader(this);
+        }
+        tee() {
+            var reader = this.getReader();
+            var c1, c2, canceled1 = false, canceled2 = false, reason1, reason2, reading = false, cancelResolve;
+            var cancelPromise = new Promise(function (r) { cancelResolve = r; });
+            var pull = function () {
+                if (reading) { return Promise.resolve(); }
+                reading = true;
+                return reader.read().then(function (r) {
+                    reading = false;
+                    if (r.done) {
+                        if (!canceled1) { try { c1.close(); } catch (e) {} }
+                        if (!canceled2) { try { c2.close(); } catch (e) {} }
+                        return;
+                    }
+                    if (!canceled1) { c1.enqueue(r.value); }
+                    if (!canceled2) { c2.enqueue(r.value); }
+                }, function (e) {
+                    reading = false;
+                    try { c1.error(e); } catch (x) {}
+                    try { c2.error(e); } catch (x) {}
+                });
+            };
+            var b1 = new ReadableStream({
+                start: function (c) { c1 = c; }, pull: pull,
+                cancel: function (r) { canceled1 = true; reason1 = r; if (canceled2) { cancelResolve(reader.cancel([reason1, reason2])); } return cancelPromise; },
+            });
+            var b2 = new ReadableStream({
+                start: function (c) { c2 = c; }, pull: pull,
+                cancel: function (r) { canceled2 = true; reason2 = r; if (canceled1) { cancelResolve(reader.cancel([reason1, reason2])); } return cancelPromise; },
+            });
+            return [b1, b2];
+        }
+        values(opts) {
+            var reader = this.getReader(), prevent = !!(opts && opts.preventCancel);
+            var it = {
+                next: function () {
+                    return reader.read().then(function (r) {
+                        if (r.done) { reader.releaseLock(); }
+                        return r;
+                    });
+                },
+                return: function (v) {
+                    var p = prevent ? Promise.resolve() : reader.cancel(v);
+                    return p.then(function () { reader.releaseLock(); return { value: v, done: true }; });
                 },
             };
-            return Promise.resolve(resp);
-        };
+            it[Symbol.asyncIterator] = function () { return it; };
+            return it;
+        }
+        [Symbol.asyncIterator](opts) { return this.values(opts); }
+        static from(iterable) {
+            var it = iterable[Symbol.asyncIterator] ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator]();
+            return new ReadableStream({
+                pull: function (c) {
+                    return Promise.resolve(it.next()).then(function (r) {
+                        if (r.done) { c.close(); } else { return Promise.resolve(r.value).then(function (v) { c.enqueue(v); }); }
+                    });
+                },
+                cancel: function (r) { if (typeof it.return === 'function') { return Promise.resolve(it.return(r)).then(function () {}); } },
+            });
+        }
+    }
+    fulfillRead = function (stream, chunk, done) {
+        var r = st(st(stream).reader).reads.shift();
+        r.res({ value: chunk, done: done });
+    };
+    closeStream = function (stream) {
+        var s = st(stream);
+        if (s.state !== 'readable') { return; }
+        s.state = 'closed';
+        if (s.reader) {
+            var rs = st(s.reader);
+            rs.reads.splice(0).forEach(function (r) { r.res({ value: undefined, done: true }); });
+            rs.closedResolve(undefined);
+        }
+    };
+    errorStream = function (stream, e) {
+        var s = st(stream);
+        if (s.state !== 'readable') { return; }
+        s.state = 'errored';
+        s.error = e;
+        s.queue = [];
+        if (s.reader) {
+            var rs = st(s.reader);
+            rs.reads.splice(0).forEach(function (r) { r.rej(e); });
+            rs.closedReject(e);
+            rs.closed.catch(function () {});
+        }
+    };
+    cancelStream = function (stream, reason) {
+        var s = st(stream);
+        s.disturbed = true;
+        if (s.state === 'closed') { return Promise.resolve(undefined); }
+        if (s.state === 'errored') { return Promise.reject(s.error); }
+        s.queue = [];
+        closeStream(stream);
+        var src = s.source;
+        var r;
+        try { r = typeof src.cancel === 'function' ? src.cancel.call(src, reason) : undefined; }
+        catch (e) { return Promise.reject(e); }
+        return Promise.resolve(r).then(function () { return undefined; });
+    };
+    pullIfNeeded = function (stream) {
+        var s = st(stream);
+        if (!s.started || s.state !== 'readable' || s.closeRequested) { return; }
+        var wants = (s.reader && st(s.reader).reads.length > 0) || (s.hwm - s.queue.length > 0);
+        if (!wants || typeof s.source.pull !== 'function') { return; }
+        if (s.pulling) { s.pullAgain = true; return; }
+        s.pulling = true;
+        var r;
+        try { r = s.source.pull.call(s.source, s.controller); }
+        catch (e) { errorStream(stream, e); return; }
+        Promise.resolve(r).then(function () {
+            s.pulling = false;
+            if (s.pullAgain) { s.pullAgain = false; pullIfNeeded(stream); }
+        }, function (e) { errorStream(stream, e); });
+    };
+    [ReadableStream, ReadableStreamDefaultReader, ReadableStreamDefaultController].forEach(function (C) {
+        Object.defineProperty(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
+        hide(globalThis, C.name, C);
+    });
+    var disturbed = function (stream) { return st(stream).disturbed; };
 
-        // XMLHttpRequest over the same native layer (sync completion —
-        // handlers fire from send(), matching our fetch-then-apply model).
-        globalThis.XMLHttpRequest = function () {
-            this.readyState = 0;
-            this.status = 0;
-            this.responseText = '';
-            this.response = '';
-            this._listeners = {};
+    // ---- Body (Fetch §5.3) ----------------------------------------------------------------------------
+    // Extracts a body: [stream or null, bytes or null, content type or null].
+    var extract = function (body) {
+        if (body instanceof ReadableStream) { return [body, null, null]; }
+        var b = toBytes(body);
+        if (b) { return [null, b, null]; }
+        if (typeof Blob !== 'undefined' && body instanceof Blob) {
+            return [null, typeof __blob_bytes === 'function' ? __blob_bytes(body).slice() : new Uint8Array(0), body.type || null];
+        }
+        if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+            return [null, utf8(body.toString()), 'application/x-www-form-urlencoded;charset=UTF-8'];
+        }
+        if (typeof FormData !== 'undefined' && body instanceof FormData) {
+            __ledger('fetch-formdata-body-unencoded');
+        }
+        return [null, utf8(body), 'text/plain;charset=UTF-8'];
+    };
+    hide(globalThis, '__extract_body', extract);
+    var streamOf = function (bytes) {
+        return new ReadableStream({ start: function (c) { if (bytes.byteLength) { c.enqueue(bytes); } c.close(); } });
+    };
+    var consume = function (o, who) {
+        var s = st(o);
+        if (s.body === null) { return Promise.resolve(new Uint8Array(0)); }
+        if (disturbed(s.body) || s.body.locked) {
+            return Promise.reject(new TypeError("Failed to execute '" + who + "' on '" + (o instanceof Response ? 'Response' : 'Request') + "': body stream already read"));
+        }
+        var reader = s.body.getReader(), chunks = [];
+        var step = function () {
+            return reader.read().then(function (r) {
+                if (r.done) { return concat(chunks); }
+                var c = r.value;
+                if (!(c instanceof Uint8Array)) {
+                    var b = toBytes(c);
+                    if (!b) { throw new TypeError('Received non-Uint8Array chunk'); }
+                    c = b;
+                }
+                chunks.push(c);
+                return step();
+            });
         };
-        XMLHttpRequest.prototype.open = function (method, url) {
-            this._method = String(method || 'GET');
-            this._url = String(url || '');
-            this.readyState = 1;
-        };
-        XMLHttpRequest.prototype.setRequestHeader = function () {};
-        XMLHttpRequest.prototype.getResponseHeader = function () { return null; };
-        XMLHttpRequest.prototype.addEventListener = function (ev, cb) {
-            (this._listeners[ev] = this._listeners[ev] || []).push(cb);
-        };
-        XMLHttpRequest.prototype.send = function (body) {
-            var r = __native_fetch(this._url, this._method, body != null ? String(body) : '');
-            if (r) {
-                this.status = r.status;
-                this.responseText = r.body;
-                this.response = r.body;
+        return step();
+    };
+    var mixBody = function (C) {
+        getter(C.prototype, 'body', function () { return st(this).body; });
+        getter(C.prototype, 'bodyUsed', function () { var b = st(this).body; return b !== null && disturbed(b); });
+        method(C.prototype, 'arrayBuffer', function () { return consume(this, 'arrayBuffer').then(function (b) { return b.buffer; }); });
+        method(C.prototype, 'bytes', function () { return consume(this, 'bytes'); });
+        method(C.prototype, 'text', function () { return consume(this, 'text').then(function (b) { return new TextDecoder().decode(b); }); });
+        method(C.prototype, 'json', function () { return this.text().then(function (t) { return JSON.parse(t); }); });
+        method(C.prototype, 'blob', function () {
+            var ty = this.headers.get('content-type') || '';
+            return consume(this, 'blob').then(function (b) { return new Blob([b], { type: ty }); });
+        });
+        method(C.prototype, 'formData', function () {
+            __ledger('fetch-formData-unimplemented');
+            return Promise.reject(new TypeError('formData() is not supported'));
+        });
+    };
+
+    // ---- Request (Fetch §5.4) -------------------------------------------------------------------------
+    var METHODS = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'];
+    var baseURL = function () { try { return document.baseURI; } catch (e) { return location.href; } };
+    class Request {
+        constructor(input, init) {
+            init = init === undefined || init === null ? {} : init;
+            var src = input instanceof Request ? st(input) : null;
+            var url;
+            if (src) { url = src.url; }
+            else {
+                try { url = new URL(String(input), baseURL()).href; }
+                catch (e) { throw new TypeError("Failed to construct 'Request': Invalid URL"); }
+                if (/^[a-z][a-z0-9+.\-]*:\/\/[^\/?#]*@/i.test(url)) { throw new TypeError("Failed to construct 'Request': Request cannot be constructed from a URL that includes credentials"); }
             }
-            this.readyState = 4;
-            var self_ = this;
-            var fire = function (name) {
-                if (typeof self_['on' + name] === 'function') { try { self_['on' + name](); } catch (e) {} }
-                var ls = self_._listeners[name] || [];
-                for (var i = 0; i < ls.length; i++) { try { ls[i].call(self_); } catch (e) {} }
-            };
-            fire('readystatechange');
-            fire(r ? 'load' : 'error');
-            fire('loadend');
-        };
-        "#;
+            var m = init.method !== undefined ? String(init.method) : (src ? src.method : 'GET');
+            if (!TOKEN.test(m)) { throw new TypeError("Failed to construct 'Request': '" + m + "' is not a valid HTTP method."); }
+            if (METHODS.indexOf(m.toUpperCase()) >= 0) { m = m.toUpperCase(); }
+            if (['CONNECT', 'TRACE', 'TRACK'].indexOf(m.toUpperCase()) >= 0) { throw new TypeError("Failed to construct 'Request': '" + m + "' HTTP method is unsupported."); }
+            var headers = new Headers(init.headers !== undefined ? init.headers : (src ? src.headers : undefined));
+            var body = null, bytes = null;
+            var hasBody = init.body !== undefined && init.body !== null;
+            if (hasBody && (m === 'GET' || m === 'HEAD')) { throw new TypeError("Failed to construct 'Request': Request with GET/HEAD method cannot have body."); }
+            if (hasBody) {
+                var ex = extract(init.body);
+                if (ex[0]) { body = ex[0]; } else { bytes = ex[1]; body = streamOf(bytes); }
+                if (ex[2] && !headers.has('content-type')) { headers.append('content-type', ex[2]); }
+            } else if (src && init.body === undefined) {
+                body = src.body; bytes = src.bytes;
+            }
+            var signal = init.signal !== undefined ? init.signal : (src ? src.signal : null);
+            if (signal !== null && signal !== undefined && !(signal instanceof AbortSignal)) {
+                throw new TypeError("Failed to construct 'Request': member signal is not of type AbortSignal.");
+            }
+            var own = newSignal();
+            if (signal) {
+                if (st(signal).aborted) { signalAbort(own, st(signal).reason); }
+                else { onAbort(signal, function () { signalAbort(own, st(signal).reason); }); }
+            }
+            var redirect = init.redirect !== undefined ? String(init.redirect) : (src ? src.redirect : 'follow');
+            if (['follow', 'error', 'manual'].indexOf(redirect) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + redirect + "' is not a valid enum value of type RequestRedirect."); }
+            ST.set(this, {
+                url: url, method: m, headers: headers, body: body, bytes: bytes, signal: own, redirect: redirect,
+                credentials: init.credentials !== undefined ? String(init.credentials) : (src ? src.credentials : 'same-origin'),
+                mode: init.mode !== undefined ? String(init.mode) : (src ? src.mode : 'cors'),
+                cache: init.cache !== undefined ? String(init.cache) : (src ? src.cache : 'default'),
+                keepalive: !!init.keepalive,
+            });
+        }
+        get url() { return st(this).url; }
+        get method() { return st(this).method; }
+        get headers() { return st(this).headers; }
+        get signal() { return st(this).signal; }
+        get redirect() { return st(this).redirect; }
+        get credentials() { return st(this).credentials; }
+        get mode() { return st(this).mode; }
+        get cache() { return st(this).cache; }
+        get keepalive() { return st(this).keepalive; }
+        get destination() { return ''; }
+        get referrer() { return 'about:client'; }
+        get referrerPolicy() { return ''; }
+        get integrity() { return ''; }
+        clone() {
+            var s = st(this);
+            if (s.body && (disturbed(s.body) || s.body.locked)) { throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used"); }
+            var r = new Request(this);
+            if (s.body) {
+                var t = s.body.tee();
+                s.body = t[0];
+                st(r).body = t[1];
+            }
+            return r;
+        }
+    }
+    mixBody(Request);
+    Object.defineProperty(Request.prototype, Symbol.toStringTag, { value: 'Request', configurable: true });
+    hide(globalThis, 'Request', Request);
+
+    // ---- Response (Fetch §5.5) ------------------------------------------------------------------------
+    var NULL_BODY = [101, 103, 204, 205, 304];
+    var creatingResponse = null;
+    class Response {
+        constructor(body, init) {
+            if (creatingResponse) { ST.set(this, creatingResponse); creatingResponse = null; return; }
+            init = init === undefined || init === null ? {} : init;
+            var status = init.status !== undefined ? Number(init.status) : 200;
+            if (!(status >= 200 && status <= 599) || Math.floor(status) !== status) {
+                throw new RangeError("Failed to construct 'Response': The status provided (" + init.status + ") is outside the range [200, 599].");
+            }
+            var statusText = init.statusText !== undefined ? String(init.statusText) : '';
+            if (/[^\t -~\u0080-ÿ]/.test(statusText)) { throw new TypeError("Failed to construct 'Response': Invalid statusText"); }
+            var headers = new Headers(init.headers);
+            var stream = null;
+            if (body !== undefined && body !== null) {
+                if (NULL_BODY.indexOf(status) >= 0) { throw new TypeError("Failed to construct 'Response': Response with null body status cannot have body"); }
+                var ex = extract(body);
+                stream = ex[0] || streamOf(ex[1]);
+                if (ex[2] && !headers.has('content-type')) { headers.append('content-type', ex[2]); }
+            }
+            ST.set(this, { type: 'default', url: '', redirected: false, status: status, statusText: statusText, headers: headers, body: stream });
+        }
+        get type() { return st(this).type; }
+        get url() { return st(this).url; }
+        get redirected() { return st(this).redirected; }
+        get status() { return st(this).status; }
+        get ok() { var s = st(this).status; return s >= 200 && s <= 299; }
+        get statusText() { return st(this).statusText; }
+        get headers() { return st(this).headers; }
+        clone() {
+            var s = st(this);
+            if (s.body && (disturbed(s.body) || s.body.locked)) { throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used"); }
+            var copy = {};
+            for (var k in s) { copy[k] = s[k]; }
+            copy.headers = new Headers(s.headers);
+            st(copy.headers).guard = st(s.headers).guard;
+            if (s.body) { var t = s.body.tee(); s.body = t[0]; copy.body = t[1]; }
+            creatingResponse = copy;
+            return new Response();
+        }
+        static error() {
+            var h = new Headers(); st(h).guard = 'immutable';
+            creatingResponse = { type: 'error', url: '', redirected: false, status: 0, statusText: '', headers: h, body: null };
+            return new Response();
+        }
+        static redirect(url, status) {
+            status = status === undefined ? 302 : Number(status);
+            if ([301, 302, 303, 307, 308].indexOf(status) < 0) { throw new RangeError("Failed to execute 'redirect' on 'Response': Invalid status code"); }
+            var u;
+            try { u = new URL(String(url), baseURL()).href; } catch (e) { throw new TypeError("Failed to execute 'redirect' on 'Response': Invalid URL"); }
+            var h = new Headers({ location: u }); st(h).guard = 'immutable';
+            creatingResponse = { type: 'default', url: '', redirected: false, status: status, statusText: '', headers: h, body: null };
+            return new Response();
+        }
+        static json(data, init) {
+            var text = JSON.stringify(data);
+            if (text === undefined) { throw new TypeError("Failed to execute 'json' on 'Response': The data is not JSON serializable"); }
+            var r = new Response(text, init);
+            st(r).headers.set('content-type', 'application/json');
+            return r;
+        }
+    }
+    mixBody(Response);
+    Object.defineProperty(Response.prototype, Symbol.toStringTag, { value: 'Response', configurable: true });
+    hide(globalThis, 'Response', Response);
+
+    // ---- fetch (Fetch §5.6) ---------------------------------------------------------------------------
+    var dataURL = function (url) {
+        var m = /^data:([^,]*?)(;base64)?,([\s\S]*)$/i.exec(url);
+        if (!m) { return null; }
+        var type = m[1] || 'text/plain;charset=US-ASCII', bytes;
+        if (m[2]) {
+            var bin = atob(decodeURIComponent(m[3]).replace(/[\t\n\f\r ]/g, ''));
+            bytes = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+        } else {
+            bytes = utf8(decodeURIComponent(m[3]));
+        }
+        return [type, bytes];
+    };
+    hide(globalThis, '__data_url', dataURL);
+    var fetch = function fetch(input, init) {
+        return new Promise(function (resolve, reject) {
+            var req;
+            try { req = new Request(input, init); } catch (e) { reject(e); return; }
+            var rs = st(req), signal = rs.signal;
+            if (st(signal).aborted) { reject(st(signal).reason); return; }
+            var url = rs.url;
+            if (/^data:/i.test(url)) {
+                var d;
+                try { d = dataURL(url); } catch (e) { d = null; }
+                if (!d) { reject(new TypeError('Failed to fetch')); return; }
+                var hh = headersFrom(['content-type', d[0]], 'immutable');
+                creatingResponse = { type: 'basic', url: url, redirected: false, status: 200, statusText: 'OK', headers: hh, body: streamOf(d[1]) };
+                resolve(new Response());
+                return;
+            }
+            if (!/^https?:/i.test(url)) { reject(new TypeError('Failed to fetch')); return; }
+            if (rs.body && !rs.bytes) {
+                __ledger('fetch-streaming-request-body');
+                reject(new TypeError('Failed to fetch: streaming request bodies are not supported'));
+                return;
+            }
+            var flat = [];
+            st(rs.headers).list.forEach(function (p) { flat.push(p[0], p[1]); });
+            var id = __net_http(rs.method, url.replace(/#.*$/, ''), flat, rs.bytes, rs.redirect);
+            if (!id) { reject(new TypeError('Failed to fetch')); return; }
+            var resp = null, controller = null, done = false;
+            __net_register(id, {
+                __net: function (kind, a) {
+                    if (kind === 'head') {
+                        var status = a[0];
+                        var h = headersFrom(a[3], 'immutable');
+                        var type = 'basic';
+                        if (rs.redirect === 'manual' && status >= 300 && status < 400 && h.has('location')) {
+                            type = 'opaqueredirect';
+                        }
+                        var body = NULL_BODY.indexOf(status) >= 0 || rs.method === 'HEAD' || type === 'opaqueredirect' ? null :
+                            new ReadableStream({
+                                start: function (c) { controller = c; },
+                                cancel: function () { done = true; __net_cancel(id); __net_forget(id); },
+                            }, { highWaterMark: 0 });
+                        creatingResponse = type === 'opaqueredirect' ?
+                            { type: type, url: a[2], redirected: false, status: 0, statusText: '', headers: headersFrom([], 'immutable'), body: null } :
+                            { type: type, url: a[2], redirected: !!a[4], status: status, statusText: a[1], headers: h, body: body };
+                        resp = new Response();
+                        resolve(resp);
+                    } else if (kind === 'data') {
+                        if (controller && !done) { controller.enqueue(new Uint8Array(a[0])); }
+                    } else if (kind === 'end') {
+                        done = true;
+                        if (controller) { try { controller.close(); } catch (e) {} }
+                    } else if (kind === 'error') {
+                        done = true;
+                        if (!resp) { reject(new TypeError('Failed to fetch')); }
+                        else if (controller) { try { controller.error(new TypeError('network error')); } catch (e) {} }
+                    }
+                },
+            });
+            onAbort(signal, function () {
+                if (done) { return; }
+                done = true;
+                __net_cancel(id);
+                __net_forget(id);
+                var reason = st(signal).reason;
+                if (!resp) { reject(reason); }
+                else if (controller) { try { controller.error(reason); } catch (e) {} }
+            });
+        });
+    };
+    Object.defineProperty(globalThis, 'fetch', { value: fetch, writable: true, configurable: true, enumerable: true });
+})();
+"#;

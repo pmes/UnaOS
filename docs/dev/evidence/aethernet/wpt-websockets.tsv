@@ -1,0 +1,119 @@
+file	variant	pass	total	harness	skipped
+websockets/Close-1000-reason.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1000-reason.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1000-reason.any.js	?default	1	1	OK	
+websockets/Close-1000-verify-code.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1000-verify-code.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1000-verify-code.any.js	?default	1	1	OK	
+websockets/Close-1000.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1000.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1000.any.js	?default	1	1	OK	
+websockets/Close-1005-verify-code.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1005-verify-code.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1005-verify-code.any.js	?default	1	1	OK	
+websockets/Close-1005.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1005.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-1005.any.js	?default	1	1	OK	
+websockets/Close-2999-reason.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-2999-reason.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-2999-reason.any.js	?default	1	1	OK	
+websockets/Close-3000-reason.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-3000-reason.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-3000-reason.any.js	?default	1	1	OK	
+websockets/Close-3000-verify-code.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-3000-verify-code.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-3000-verify-code.any.js	?default	1	1	OK	
+websockets/Close-4999-reason.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-4999-reason.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-4999-reason.any.js	?default	1	1	OK	
+websockets/Close-Reason-124Bytes.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-Reason-124Bytes.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-Reason-124Bytes.any.js	?default	1	1	OK	
+websockets/Close-delayed.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-delayed.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-delayed.any.js	?default	1	1	OK	
+websockets/Close-onlyReason.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-onlyReason.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-onlyReason.any.js	?default	1	1	OK	
+websockets/Close-readyState-Closed.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-readyState-Closed.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-readyState-Closed.any.js	?default	1	1	OK	
+websockets/Close-readyState-Closing.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-readyState-Closing.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-readyState-Closing.any.js	?default	1	1	OK	
+websockets/Close-reason-unpaired-surrogates.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-reason-unpaired-surrogates.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-reason-unpaired-surrogates.any.js	?default	1	1	OK	
+websockets/Close-server-initiated-close.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-server-initiated-close.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-server-initiated-close.any.js	?default	1	1	OK	
+websockets/Close-undefined.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-undefined.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Close-undefined.any.js	?default	1	1	OK	
+websockets/Create-asciiSep-protocol-string.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-asciiSep-protocol-string.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-asciiSep-protocol-string.any.js	?default	1	1	OK	
+websockets/Create-blocked-port.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-blocked-port.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-blocked-port.any.js	?default	84	84	OK	
+websockets/Create-extensions-empty.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-extensions-empty.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-extensions-empty.any.js	?default	1	1	OK	
+websockets/Create-http-urls.any.js		1	1	OK	
+websockets/Create-invalid-urls.any.js		8	8	OK	
+websockets/Create-non-absolute-url.any.js		5	5	OK	
+websockets/Create-nonAscii-protocol-string.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-nonAscii-protocol-string.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-nonAscii-protocol-string.any.js	?default	1	1	OK	
+websockets/Create-on-worker-shutdown.any.js		0	0	-	workers
+websockets/Create-protocol-with-space.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-protocol-with-space.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-protocol-with-space.any.js	?default	1	1	OK	
+websockets/Create-protocols-repeated-case-insensitive.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-protocols-repeated-case-insensitive.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-protocols-repeated-case-insensitive.any.js	?default	1	1	OK	
+websockets/Create-protocols-repeated.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-protocols-repeated.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-protocols-repeated.any.js	?default	1	1	OK	
+websockets/Create-url-with-space.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-url-with-space.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-url-with-space.any.js	?default	1	1	OK	
+websockets/Create-url-with-windows-1252-encoding.html		1	1	OK	
+websockets/Create-valid-url-array-protocols.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-array-protocols.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-array-protocols.any.js	?default	1	1	OK	
+websockets/Create-valid-url-binaryType-blob.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-binaryType-blob.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-binaryType-blob.any.js	?default	1	1	OK	
+websockets/Create-valid-url-protocol-empty.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol-empty.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol-empty.any.js	?default	1	1	OK	
+websockets/Create-valid-url-protocol-setCorrectly.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol-setCorrectly.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol-setCorrectly.any.js	?default	1	1	OK	
+websockets/Create-valid-url-protocol-string.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol-string.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol-string.any.js	?default	1	1	OK	
+websockets/Create-valid-url-protocol.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url-protocol.any.js	?default	1	1	OK	
+websockets/Create-valid-url.any.js	?wpt_flags=h2	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/Create-valid-url.any.js	?default	1	1	OK	
+websockets/closing-handshake/004.html		0	1	OK	
+websockets/constructor/014.html		0	1	OK	
+websockets/constructor/option-bag.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/constructor/option-bag.any.js	?default	0	2	OK	
+websockets/constructor/target-address-space.any.js	?wss	0	0	-	needs a TLS server (wss / h2 variant)
+websockets/constructor/target-address-space.any.js	?default	0	6	OK	
+websockets/cookies/007.html		0	1	OK	
+websockets/interfaces/WebSocket/close/close-multiple.html		0	1	harness did not complete	
+websockets/interfaces/WebSocket/events/003.html		0	1	OK	
+websockets/interfaces/WebSocket/events/007.html		0	1	OK	
+websockets/interfaces/WebSocket/events/008.html		0	1	OK	
+websockets/interfaces/WebSocket/events/009.html		0	1	OK	
+websockets/interfaces/WebSocket/events/013.html		0	4	OK	
+websockets/interfaces/WebSocket/events/015.html		0	1	OK	
+websockets/keeping-connection-open/001.html		0	1	harness did not complete	
+websockets/opening-handshake/003-sets-origin.worker.js		0	0	-	workers
+websockets/opening-handshake/003.html		0	1	OK	

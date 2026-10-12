@@ -44,6 +44,7 @@ pub mod loader;
 pub mod range;
 pub mod reflect;
 pub mod traversal;
+pub mod net;
 pub mod window;
 
 use crate::dom::NodeRef;
@@ -498,6 +499,7 @@ impl Engine {
         events::reset_clock();
         clear_poison();
         crate::api::fetch::reset_budget();
+        net::reset();
         crate::event_loop::reset();
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
@@ -512,6 +514,7 @@ impl Engine {
         controls::install(&mut vm);
         cssom::install(&mut vm);
         window::install(&mut vm);
+        net::install(&mut vm);
         Engine { vm }
     }
 
@@ -559,6 +562,7 @@ impl Engine {
             let root = p.doc.as_ref().map(|d| d.id().0).unwrap_or(0);
             p.docs.insert(root, DocMeta { html: true, content_type: "text/html".into(), url: url.to_string(), quirks: false });
         });
+        net::note_url(url);
     }
 
     /// A microtask checkpoint.
@@ -597,6 +601,7 @@ impl Engine {
     /// each followed by a microtask checkpoint.
     pub fn tick(&mut self) -> usize {
         let mut n = self.run_tasks();
+        n += net::poll(&mut self.vm);
         n += crate::event_loop::fire_due_timers(&mut self.vm);
         checkpoint(&mut self.vm);
         n
@@ -630,6 +635,12 @@ impl Engine {
     /// Whether tasks are queued.
     pub fn has_tasks(&self) -> bool {
         page(|p| !p.tasks.is_empty())
+    }
+
+    /// Runs the queued network tasks (body chunks, socket messages, server-sent events, storage events
+    /// from other documents). Returns how many ran.
+    pub fn run_network_tasks(&mut self) -> usize {
+        net::poll(&mut self.vm)
     }
 
     /// Records a same-document URL change (fragment navigation, `history.pushState`).
