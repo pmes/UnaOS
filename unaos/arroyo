@@ -13623,7 +13623,7 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh"
 _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary line, returns the gate's rc
     local R="$1" n="$2" log="$3" p rc=0 e
     p="$(printf '%s\n' $GATES_SET | awk -F: -v n="$n" '$1==n{print $2}')"
@@ -13633,6 +13633,7 @@ _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary li
         charter|arch|attrkeys|appearance|verbs|sanity) e=("$R/unaos") ;;
         deps) e=(--check) ;;
         banner) e=(--registry "${_feats%,}") ;;
+        image-line) e=(--line "$R/unaos/scripts/image-line.env") ;;   # FOLDBUILD (B517): the image build line's file against arroyo's knob map and the builder's
         *) e=() ;;
     esac
     case "$p" in
@@ -13657,6 +13658,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         banner)     sed -i '/^bc_table() {$/,/^TABLE$/ s/^\(ahci|AHCI: selfcheck|-|measured\)$/\1\nzzgateplant|:: ZZGATEPLANT: row for no feature|-|measured/' "$C/unaos/scripts/banner-cert.sh"; echo zzgateplant ;;
         k8reach)    sed -i 's/^_feats=""$/&\n[ -n "${UNAOS_ZZGATEPLANT:-}" ] \&\& _feats="${_feats}zzgateplant,"/' "$C/unaos/arroyo"; echo ZZGATEPLANT ;;
         sanity)     printf 'pub fn p() { assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 2); }\n' > "$K/video/zz_gateplant_sanity.rs"; echo zz_gateplant_sanity ;; # SANITYLEGS (B488): flight 26's reboot-loop assert, planted as a runtime assert over consts
+        image-line) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line.env"; echo ZZGATEPLANT ;; # FOLDBUILD (B517); last in GATES_SET, so no restore is owed
         *) return 1 ;;
     esac
 }
@@ -13845,6 +13847,9 @@ case "${1:-}" in
         ;;
     bootleg)
         bash "$WORKSPACE_DIR/scripts/boot-leg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # SMALLFIX7 (B501): the metal feature line BOOTED under QEMU, tests-at-boot OFF (flight 27 PREHEAP). NOT a host gate: the seat's fold gate runs it; `--judge <log>` reads a capture only
+        ;;
+    foldleg)
+        bash "$WORKSPACE_DIR/scripts/foldleg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # FOLDBUILD (B517): the x86 kernel + loader BUILT under scripts/image-line.env (the builder's own derivation, --build-only), a fold leg beside the compile legs; no media, no QEMU, never SELFBUILD's staging. The banner arroyo printed above is the CALLER's env; the leg prints the line's own
         ;;
     clean)
         clean_all
