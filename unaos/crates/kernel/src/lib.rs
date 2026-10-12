@@ -334,3 +334,5 @@ pub mod smallfix6;
 pub mod soundopeners;
 // SMALLFIX7 (rmbp-ledger B501): `tests smallfix7`, `tests prtscr` — flight 27's small reds. Tail statement.
 pub mod smallfix7;
+// QUEUESLEEP (rmbp-ledger B512, R103 §2): `tests queuesleep` — the input path on an idle desktop, then one key, timed. Tail statement.
+pub mod queuesleep;
