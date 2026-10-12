@@ -56,6 +56,195 @@ pub(crate) struct SpecifiedStyle {
     /// `cursor` (css-ui-4 §5.1, inherited): the keyword the cascade chose, `auto` included; read
     /// back per element by [`cursor_for`] for the hovered element (AETHERHOVER, SR67).
     pub cursor: Option<&'static str>,
+    /// AETHERGEN (SR71): the generated-content properties (css-content-3, css-lists-3).
+    pub generated: GenStyle,
+}
+
+/// The generated-content properties of one element or pseudo-element, as specified: `content`
+/// (css-content-3 §2), `counter-reset`/`counter-increment`/`counter-set` (css-lists-3 §4) and `quotes`
+/// (css-content-3 §3, inherited — `layout::generated` walks it down the tree).
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(crate) struct GenStyle {
+    pub content: Option<Content>,
+    pub counter_reset: Option<Vec<(String, i32)>>,
+    pub counter_increment: Option<Vec<(String, i32)>>,
+    pub counter_set: Option<Vec<(String, i32)>>,
+    pub quotes: Option<Quotes>,
+}
+
+/// A `content` value (css-content-3 §2): `normal`, `none`, or a list of content items (the `/ alt`
+/// text after them is accessibility text and generates nothing).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Content {
+    Normal,
+    None,
+    Items(Vec<ContentItem>),
+}
+
+/// One `content` item. Counter styles are the css-counter-styles-3 predefined styles, coded as
+/// `PaintStyle::list_style` codes (0 none, 1 disc, 2 circle, 3 square, 4 decimal, 5/6 lower/upper
+/// alpha, 7/8 lower/upper roman, 9 decimal-leading-zero, 10 lower-greek).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ContentItem {
+    Str(String),
+    /// `attr(<name>)`: the originating element's attribute (css-values-5 §7.7; "" when absent).
+    Attr(String),
+    Counter(String, u8),
+    Counters(String, String, u8),
+    OpenQuote,
+    CloseQuote,
+    NoOpenQuote,
+    NoCloseQuote,
+    /// `url()`: a replaced inline image, through the page's image store.
+    Url(String),
+}
+
+/// A `quotes` value (css-content-3 §3.1): `auto` (the UA's pairs for the content language), `none`,
+/// or explicit open/close pairs, outermost first.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Quotes {
+    Auto,
+    None,
+    Pairs(Vec<(String, String)>),
+}
+
+/// A css-counter-styles-3 predefined counter style name as a `list_style` code; `None` = not one.
+pub(crate) fn counter_style_code(name: &str) -> Option<u8> {
+    Some(match name {
+        "none" => 0,
+        "disc" => 1,
+        "circle" => 2,
+        "square" => 3,
+        "decimal" => 4,
+        "lower-alpha" | "lower-latin" => 5,
+        "upper-alpha" | "upper-latin" => 6,
+        "lower-roman" => 7,
+        "upper-roman" => 8,
+        "decimal-leading-zero" => 9,
+        "lower-greek" => 10,
+        _ => return None,
+    })
+}
+
+/// Parses a `content` value from its CSS text (re-tokenized by css_core, so strings arrive unescaped:
+/// `"\\2713"` is U+2713). `None` = invalid (the declaration is ignored, css-syntax-3 §8).
+pub(crate) fn parse_content(value: &str) -> Option<Content> {
+    use css_core::{Token, CV};
+    let cvs = css_core::parser::parse_component_values(value);
+    let toks: Vec<&CV> = cvs.iter().filter(|c| !c.is_whitespace()).collect();
+    if let [CV::Token(Token::Ident(k))] = toks.as_slice() {
+        match k.to_ascii_lowercase().as_str() {
+            "normal" | "initial" | "unset" | "revert" => return Some(Content::Normal),
+            "none" => return Some(Content::None),
+            _ => {}
+        }
+    }
+    // A function's arguments: idents and strings, commas dropped.
+    fn args(a: &[CV]) -> Vec<&CV> {
+        a.iter().filter(|c| !c.is_whitespace() && !matches!(c, CV::Token(Token::Comma))).collect()
+    }
+    let style_of = |c: Option<&&CV>| -> Option<u8> {
+        match c {
+            None => Some(4),
+            Some(CV::Token(Token::Ident(s))) => Some(counter_style_code(&s.to_ascii_lowercase()).unwrap_or(4)),
+            _ => None,
+        }
+    };
+    let mut items = Vec::new();
+    for c in toks {
+        let item = match c {
+            CV::Token(Token::String(s)) => ContentItem::Str(s.clone()),
+            CV::Token(Token::Url(u)) => ContentItem::Url(u.clone()),
+            CV::Token(Token::Delim('/')) => break,
+            CV::Token(Token::Ident(k)) => match k.to_ascii_lowercase().as_str() {
+                "open-quote" => ContentItem::OpenQuote,
+                "close-quote" => ContentItem::CloseQuote,
+                "no-open-quote" => ContentItem::NoOpenQuote,
+                "no-close-quote" => ContentItem::NoCloseQuote,
+                _ => return None,
+            },
+            CV::Function(f, a) => {
+                let a = args(a);
+                match (f.to_ascii_lowercase().as_str(), a.as_slice()) {
+                    ("url", [CV::Token(Token::String(u))]) => ContentItem::Url(u.clone()),
+                    ("attr", [CV::Token(Token::Ident(n)), ..]) => ContentItem::Attr(n.to_ascii_lowercase()),
+                    ("counter", [CV::Token(Token::Ident(n)), rest @ ..]) if rest.len() <= 1 => {
+                        ContentItem::Counter(n.clone(), style_of(rest.first())?)
+                    }
+                    ("counters", [CV::Token(Token::Ident(n)), CV::Token(Token::String(sep)), rest @ ..]) if rest.len() <= 1 => {
+                        ContentItem::Counters(n.clone(), sep.clone(), style_of(rest.first())?)
+                    }
+                    (other, _) => {
+                        crate::ledger::record_css(&format!("content-value:{}()", clip(other)));
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        };
+        items.push(item);
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(Content::Items(items))
+}
+
+/// Parses `counter-reset` / `counter-increment` / `counter-set` (css-lists-3 §4.1-4.3): `none`, or
+/// counter names each optionally followed by an integer (`default` when omitted).
+pub(crate) fn parse_counter_list(value: &str, default: i32) -> Option<Vec<(String, i32)>> {
+    use css_core::{Token, CV};
+    let cvs = css_core::parser::parse_component_values(value);
+    let toks: Vec<&CV> = cvs.iter().filter(|c| !c.is_whitespace()).collect();
+    if let [CV::Token(Token::Ident(k))] = toks.as_slice() {
+        if matches!(k.to_ascii_lowercase().as_str(), "none" | "initial" | "unset" | "revert") {
+            return Some(Vec::new());
+        }
+    }
+    let mut out: Vec<(String, i32)> = Vec::new();
+    for c in toks {
+        match c {
+            CV::Token(Token::Ident(n)) if !matches!(n.to_ascii_lowercase().as_str(), "none" | "inherit") => {
+                out.push((n.clone(), default));
+            }
+            // `reversed(<name>)` (css-lists-3 §4.1): counted as the plain counter here.
+            CV::Function(f, a) if f.eq_ignore_ascii_case("reversed") => {
+                let n = a.iter().find_map(|c| c.ident())?;
+                out.push((n.to_string(), default));
+            }
+            CV::Token(Token::Number(n)) => {
+                let last = out.last_mut()?;
+                last.1 = n.value as i32;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Parses `quotes` (css-content-3 §3.1).
+pub(crate) fn parse_quotes(value: &str) -> Option<Quotes> {
+    use css_core::{Token, CV};
+    let cvs = css_core::parser::parse_component_values(value);
+    let toks: Vec<&CV> = cvs.iter().filter(|c| !c.is_whitespace()).collect();
+    if let [CV::Token(Token::Ident(k))] = toks.as_slice() {
+        return match k.to_ascii_lowercase().as_str() {
+            "auto" | "match-parent" | "initial" | "unset" | "revert" => Some(Quotes::Auto),
+            "none" => Some(Quotes::None),
+            _ => None,
+        };
+    }
+    let strs: Vec<String> = toks
+        .iter()
+        .map(|c| match c {
+            CV::Token(Token::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if strs.is_empty() || strs.len() % 2 != 0 {
+        return None;
+    }
+    Some(Quotes::Pairs(strs.chunks(2).map(|p| (p[0].clone(), p[1].clone())).collect()))
 }
 
 impl SpecifiedStyle {
@@ -187,6 +376,27 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 if code.is_some() {
                     style.paint.list_style = code;
                 }
+            }
+        }
+        // AETHERGEN (SR71): generated content (css-content-3) and counters (css-lists-3 §4).
+        "content" => {
+            if let Some(c) = parse_content(value) {
+                style.generated.content = Some(c);
+            }
+        }
+        "counter-reset" | "counter-set" | "counter-increment" => {
+            let list = parse_counter_list(value, if prop == "counter-increment" { 1 } else { 0 });
+            if let Some(list) = list {
+                match prop {
+                    "counter-reset" => style.generated.counter_reset = Some(list),
+                    "counter-set" => style.generated.counter_set = Some(list),
+                    _ => style.generated.counter_increment = Some(list),
+                }
+            }
+        }
+        "quotes" => {
+            if let Some(q) = parse_quotes(value) {
+                style.generated.quotes = Some(q);
             }
         }
         "flex-direction" => match value {
@@ -361,6 +571,18 @@ pub(crate) fn apply_declaration(prop: &str, value: &str, style: &mut SpecifiedSt
                 v if v.ends_with('%') => v.trim_end_matches('%').trim().parse::<f32>().ok().map(|p| (9, p / 100.0)),
                 v => parse_px(v).map(|px| (8, px)),
             };
+        }
+        // `clear` (CSS 2.2 §9.5.2) is consumed only by a generated clearfix box (`layout::generated`);
+        // a real element's clearance is still unimplemented, so it stays ledgered.
+        "clear" => {
+            style.paint.clear = match value {
+                "none" => Some(0),
+                "left" | "inline-start" => Some(1),
+                "right" | "inline-end" => Some(2),
+                "both" => Some(3),
+                _ => style.paint.clear,
+            };
+            crate::ledger::record_css("property:clear");
         }
         "float" => match value {
             "left" => {
@@ -1240,6 +1462,24 @@ pub fn last_style_timing() -> (std::time::Duration, std::time::Duration) {
     STYLE_TIMING.with(|t| t.get())
 }
 
+thread_local! {
+    /// How focus last moved: `true` after a pointer interaction (a click that focused), `false` after
+    /// the keyboard or script. The `:focus-visible` heuristic (`dom::select`) reads it (AETHERGEN, SR71).
+    static POINTER_FOCUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records the modality of the interaction that moved focus (Selectors 4 §9.4 `:focus-visible`):
+/// `true` for a mouse/touch focus, `false` for keyboard navigation. The engine calls this where it
+/// moves focus; script focus leaves the last modality in place, as the HTML heuristic does.
+pub fn note_focus_modality(pointer: bool) {
+    POINTER_FOCUS.with(|p| p.set(pointer));
+}
+
+/// The modality [`note_focus_modality`] last recorded.
+pub(crate) fn pointer_focus() -> bool {
+    POINTER_FOCUS.with(|p| p.get())
+}
+
 /// What `@media` is evaluated against: Aether's viewport, a light colour scheme, no reduced motion, a
 /// fine pointer that can hover, `screen`, scripting enabled (css_core's desktop defaults).
 pub(crate) fn media_environment(vw: f32, vh: f32) -> css_core::media::Environment {
@@ -1247,14 +1487,32 @@ pub(crate) fn media_environment(vw: f32, vh: f32) -> css_core::media::Environmen
 }
 
 /// Ledgers what a sheet asks for that Aether does not do with it: rules that style a pseudo-element
-/// (no generated boxes yet) and at-rules css_core parses into data Aether does not consume.
+/// Aether generates no box for (`pseudo-element-rule:<name>`; `::before`/`::after`/`::marker` are
+/// generated since AETHERGEN, SR71) and at-rules css_core parses into data Aether does not consume.
 fn ledger_rules(rules: &[css_core::stylesheet::CssRule]) {
+    use css_core::selectors::PseudoElement as PE;
     use css_core::stylesheet::CssRule;
     for r in rules {
         match r {
             CssRule::Style(s) => {
-                if s.selectors.0.iter().any(|sel| sel.pseudo_element.is_some()) {
-                    crate::ledger::record_css("pseudo-element-rule");
+                let mut seen: Vec<&str> = Vec::new();
+                for sel in &s.selectors.0 {
+                    let name = match &sel.pseudo_element {
+                        None | Some(PE::Before | PE::After | PE::Marker) => continue,
+                        Some(PE::FirstLine) => "first-line",
+                        Some(PE::FirstLetter) => "first-letter",
+                        Some(PE::Placeholder) => "placeholder",
+                        Some(PE::Selection) => "selection",
+                        Some(PE::Backdrop) => "backdrop",
+                        Some(PE::FileSelectorButton) => "file-selector-button",
+                        Some(PE::Slotted(_)) => "slotted",
+                        Some(PE::Part(_)) => "part",
+                        Some(PE::Highlight(_)) => "highlight",
+                    };
+                    if !seen.contains(&name) {
+                        seen.push(name);
+                        crate::ledger::record_css(&format!("pseudo-element-rule:{name}"));
+                    }
                 }
                 ledger_rules(&s.children);
             }
@@ -1323,7 +1581,7 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
-        stretch, word_spacing, rtl,
+        stretch, word_spacing, rtl, clear,
     );
     clone!(text_shadows);
     if let Some(src_list) = &src.font_rel {
@@ -1349,10 +1607,12 @@ pub(crate) fn merge_paint(dst: &mut PaintStyle, src: &PaintStyle) {
 fn cascade_document(
     doc: &html_core::Document,
     rules: &css_core::cascade::RuleSet<'_>,
+    pseudo_rules: &[css_core::cascade::RuleSet<'_>; 3],
     boxed: &std::collections::HashSet<html_core::NodeId>,
 ) -> (
     std::collections::HashMap<html_core::NodeId, std::rc::Rc<SpecifiedStyle>>,
     std::collections::BTreeMap<String, Vec<css_core::CV>>,
+    std::collections::HashMap<html_core::NodeId, PseudoStyles>,
 ) {
     use css_core::values::{compute_custom_properties, contains_var, substitute_vars};
     use std::collections::{BTreeMap, HashMap};
@@ -1364,6 +1624,13 @@ fn cascade_document(
     let mut child_filter: HashMap<html_core::NodeId, css_core::cascade::AncestorFilter> = HashMap::new();
     let mut shared: HashMap<Vec<usize>, Rc<SpecifiedStyle>> = HashMap::new();
     let mut out = HashMap::new();
+    let mut pseudo_out: HashMap<html_core::NodeId, PseudoStyles> = HashMap::new();
+    let mut pshared: HashMap<(usize, Vec<usize>), Rc<SpecifiedStyle>> = HashMap::new();
+    let pseudo_kinds = [
+        css_core::selectors::PseudoElement::Marker,
+        css_core::selectors::PseudoElement::Before,
+        css_core::selectors::PseudoElement::After,
+    ];
     let mut root_customs = BTreeMap::new();
     for id in doc.descendants(html_core::Document::ROOT) {
         let Some(el) = doc.element(id) else { continue };
@@ -1386,6 +1653,56 @@ fn cascade_document(
         if !boxed.contains(&id) {
             customs.insert(id, mine);
             continue;
+        }
+        // AETHERGEN (SR71): the ::marker / ::before / ::after of this element, cascaded on their own
+        // (css_core matches a pseudo-element selector against its originating element). A
+        // pseudo-element's custom properties inherit from the originating element's.
+        let mut ps: PseudoStyles = Default::default();
+        for (k, prs) in pseudo_rules.iter().enumerate() {
+            if prs.entries.is_empty() {
+                continue;
+            }
+            let applied = css_core::cascade::cascade_filtered(prs, &me_el, &[], Some(&pseudo_kinds[k]), Some(&filter));
+            if applied.is_empty() {
+                continue;
+            }
+            // Shared like element styles: the same winning declarations, no var(), one folded style
+            // (`*::before, *::after { box-sizing: border-box }` matches every element of a page).
+            let pkey: Vec<usize> = applied.iter().map(|a| a.declaration as *const _ as usize).collect();
+            let pshareable = !applied.iter().any(|a| a.declaration.name.starts_with("--") || contains_var(&a.declaration.value));
+            if pshareable {
+                if let Some(st) = pshared.get(&(k, pkey.clone())) {
+                    ps[k] = Some(st.clone());
+                    continue;
+                }
+            }
+            let own: Vec<(String, Vec<css_core::CV>)> = applied
+                .iter()
+                .filter(|a| a.declaration.name.starts_with("--"))
+                .map(|a| (a.declaration.name.clone(), a.declaration.value.clone()))
+                .collect();
+            let pc = if own.is_empty() { mine.clone() } else { Rc::new(compute_custom_properties(&own, &mine)) };
+            let mut s = SpecifiedStyle::default();
+            for a in applied.iter().filter(|a| !a.declaration.name.starts_with("--")) {
+                let d = a.declaration;
+                let name = d.name.to_ascii_lowercase();
+                if contains_var(&d.value) {
+                    match substitute_vars(&d.value, &|n| pc.get(n).cloned()) {
+                        Ok(v) => apply_declaration(&name, &value_text(&v), &mut s),
+                        Err(()) => crate::ledger::record_css(&format!("var-unresolved:{}", clip(&name))),
+                    }
+                } else {
+                    apply_declaration(&name, &value_text(&d.value), &mut s);
+                }
+            }
+            let s = Rc::new(s);
+            if pshareable {
+                pshared.insert((k, pkey), s.clone());
+            }
+            ps[k] = Some(s);
+        }
+        if ps.iter().any(Option::is_some) {
+            pseudo_out.insert(id, ps);
         }
         let decls: Vec<&css_core::parser::Declaration> =
             applied.iter().map(|a| a.declaration).filter(|d| !d.name.starts_with("--")).collect();
@@ -1425,8 +1742,12 @@ fn cascade_document(
         out.insert(id, style);
         customs.insert(id, mine);
     }
-    (out, root_customs)
+    (out, root_customs, pseudo_out)
 }
+
+/// The cascaded styles of an element's ::marker, ::before and ::after (in that order; `None` = no
+/// rule styles it).
+pub(crate) type PseudoStyles = [Option<std::rc::Rc<SpecifiedStyle>>; 3];
 
 /// Applies a set of stylesheets (document order, author origin) as ONE cascade through css_core, with
 /// each element's `style` attribute at its CSS priority (above normal rules, below `!important` ones;
@@ -1471,8 +1792,33 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
         return;
     };
     let boxed: std::collections::HashSet<html_core::NodeId> = boxes.keys().copied().collect();
+    // AETHERGEN (SR71): the rules that style ::marker, ::before and ::after, one hashed set each.
+    let pseudo_rules: [css_core::cascade::RuleSet<'_>; 3] = std::array::from_fn(|k| {
+        use css_core::selectors::PseudoElement as PE;
+        let mut set = css_core::cascade::RuleSet::new();
+        for e in &rules.entries {
+            let hit = match (&e.selector.pseudo_element, k) {
+                (Some(PE::Marker), 0) | (Some(PE::Before), 1) | (Some(PE::After), 2) => true,
+                _ => false,
+            };
+            if hit {
+                set.entries.push(css_core::cascade::RuleEntry {
+                    selector: e.selector,
+                    declarations: e.declarations,
+                    origin: e.origin,
+                    layer: e.layer.clone(),
+                    order: e.order,
+                });
+            }
+        }
+        if std::env::var_os("AETHER_NO_RULE_INDEX").is_none() {
+            set.build_index();
+        }
+        set
+    });
     let t_c = std::time::Instant::now();
-    let (styles, root_customs) = any.with_doc(|doc, _| cascade_document(doc, &rules, &boxed));
+    let (styles, root_customs, pseudo_styles) =
+        any.with_doc(|doc, _| cascade_document(doc, &rules, &pseudo_rules, &boxed));
     if std::env::var_os("AETHER_STYLE_PROFILE").is_some() {
         eprintln!(
             "[style] parse + rule set {:?}, cascade {:?}, {} selector entries, rule hash {}",
@@ -1496,12 +1842,16 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
         c.clear();
         c.extend(styles.iter().filter_map(|(id, s)| s.cursor.map(|k| (*id, k))));
     });
+    // AETHERGEN (SR71): counters, quotes and the ::marker/::before/::after boxes (layout::generated),
+    // the generated boxes folded with their pseudo-element's cascaded style below like any other box.
+    let generated = crate::layout::generated::generate(layout_tree, &any, &styles, &pseudo_styles, &boxes);
     let mut acc: std::collections::HashMap<taffy::NodeId, std::rc::Rc<SpecifiedStyle>> = std::collections::HashMap::new();
     for (dom_id, style) in styles {
         for tid in boxes.get(&dom_id).into_iter().flatten() {
             acc.insert(*tid, style.clone());
         }
     }
+    acc.extend(generated);
     let mut abs_nodes = std::collections::HashSet::new();
     let mut inset_nodes = std::collections::HashSet::new();
     for (node_id, spec) in &acc {
@@ -1908,6 +2258,12 @@ fn merge_specified(dst: &mut SpecifiedStyle, src: &SpecifiedStyle) {
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis);
     merge_paint(&mut dst.paint, &src.paint);
+    let (d, g) = (&mut dst.generated, &src.generated);
+    if g.content.is_some() { d.content = g.content.clone(); }
+    if g.counter_reset.is_some() { d.counter_reset = g.counter_reset.clone(); }
+    if g.counter_increment.is_some() { d.counter_increment = g.counter_increment.clone(); }
+    if g.counter_set.is_some() { d.counter_set = g.counter_set.clone(); }
+    if g.quotes.is_some() { d.quotes = g.quotes.clone(); }
 }
 
 /// Properties this engine genuinely implements (the honest support set
@@ -1941,6 +2297,7 @@ fn property_supported(prop: &str) -> bool {
             | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
             | "gap" | "row-gap" | "column-gap"
             | "cursor"
+            | "content" | "counter-reset" | "counter-increment" | "counter-set" | "quotes"
     )
 }
 
@@ -2699,17 +3056,28 @@ mod tests {
 
     /// A selector list with an INVALID member is an invalid selector, and the
     /// whole style rule is dropped (Selectors 4 §4.1, what Chromium does); a
-    /// member that is valid but never matches (`::before`, `:focus-visible`)
-    /// leaves its siblings alone. Pseudo-element rules are ledgered: Aether
-    /// generates no `::before`/`::after` boxes yet.
+    /// member that is valid but does not match the element (`::before`,
+    /// `:focus-visible`) leaves its siblings alone. AETHERGEN (SR71): `.x::before`
+    /// styles a generated box — the first child of `#a`'s box, carrying the rule's
+    /// colour and the `content` text — and is no longer ledgered; a pseudo-element
+    /// Aether generates no box for is ledgered by name.
     #[test]
     fn test_selector_list_validity() {
         crate::ledger::reset();
-        let css = ".x::before, .y:focus-visible, .y { color: rgb(1, 2, 3); }";
+        let css = ".x::before, .y:focus-visible, .y { color: rgb(1, 2, 3); content: \"\\2713\"; } p::selection { color: red; }";
         assert_eq!(color_of(LOWER_HTML, css, "b"), Some((1, 2, 3)));
         assert_eq!(color_of(LOWER_HTML, css, "a"), None);
+        let mut tree = crate::layout::compute_layout(&crate::dom::parse_html(LOWER_HTML));
+        apply_css(&mut tree, css);
+        let a = tree.node_map.iter().find(|(_, n)| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some("a"))).map(|(t, _)| *t).unwrap();
+        let first = tree.taffy.children(a).unwrap()[0];
+        let gbox = tree.node_map.get(&first).expect("the ::before box is a node of the tree");
+        assert!(gbox.parent().is_none(), "a generated box is not in the DOM");
+        assert_eq!(gbox.text_contents(), "\u{2713}");
+        assert_eq!(tree.paint_map.get(&first).and_then(|p| p.color), Some((1, 2, 3)));
         let dump = format!("{:?}", crate::ledger::snapshot());
-        assert!(dump.contains("pseudo-element-rule"), "{dump}");
+        assert!(!dump.contains("pseudo-element-rule:before"), "{dump}");
+        assert!(dump.contains("pseudo-element-rule:selection"), "{dump}");
         let css = ".x:-moz-ui-invalid, .y { color: rgb(1, 2, 3); }";
         assert_eq!(color_of(LOWER_HTML, css, "b"), None, "an unknown pseudo-class invalidates the rule");
         let css = ".x:is(:-moz-ui-invalid, .x), .y { color: rgb(1, 2, 3); }";

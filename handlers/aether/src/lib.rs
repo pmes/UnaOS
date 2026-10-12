@@ -637,6 +637,7 @@ impl AetherEngine {
                                 }
                                 "input" | "textarea" | "select" => {
                                     self.focused_node = Some(n.clone());
+                                    css::note_focus_modality(true); // AETHERGEN (SR71) fold: click focus is pointer-modal (:focus-visible stays off)
                                     break;
                                 }
                                 _ => {}

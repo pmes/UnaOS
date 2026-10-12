@@ -2979,5 +2979,189 @@ mod tests {
         e.select_all();
         e.tick();
         assert_eq!(js(&mut e, "String(window.n)"), "2");
+
+    // ---- AETHERGEN (SR71): generated content, counters, quotes, ::marker, focus states ----
+
+    fn gen_tree(html: &str, css_text: &str) -> layout::LayoutTree {
+        let doc = dom::parse_html(html);
+        let mut t = layout::build_tree(&doc, 800.0, 600.0);
+        css::apply_stylesheets(&mut t, &[css_text.to_string()]);
+        t
+    }
+
+    fn tid_of(tree: &layout::LayoutTree, id: &str) -> taffy::NodeId {
+        tree.node_map
+            .iter()
+            .find(|(_, n)| n.as_element().is_some_and(|e| e.attributes.borrow().get("id") == Some(id)))
+            .map(|(t, _)| *t)
+            .unwrap_or_else(|| panic!("no box for #{id}"))
+    }
+
+    /// A generated box: a detached element of the tree (no DOM parent).
+    fn is_generated(tree: &layout::LayoutTree, t: taffy::NodeId) -> bool {
+        tree.node_map.get(&t).is_some_and(|n| n.as_element().is_some() && n.parent().is_none())
+    }
+
+    /// The text of every generated box under `id`'s box, in box-tree order.
+    fn generated_texts(tree: &layout::LayoutTree, id: &str) -> Vec<String> {
+        fn walk(tree: &layout::LayoutTree, t: taffy::NodeId, out: &mut Vec<String>) {
+            if is_generated(tree, t) {
+                out.push(tree.node_map[&t].text_contents());
+                return;
+            }
+            for k in tree.taffy.children(t).unwrap_or_default() {
+                walk(tree, k, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree, tid_of(tree, id), &mut out);
+        out
+    }
+
+    /// css-content-3 §2: strings and attr() make ::before/::after boxes, the first and last child
+    /// of the originating element's box, inline, styled by their own rules.
+    #[test]
+    fn test_generated_before_after_boxes() {
+        let html = r#"<html><body><p id="p" data-x="X">mid</p><div id="d"><p>block</p></div></body></html>"#;
+        let t = gen_tree(html, r#"#p::before { content: "[" attr(data-x) "]"; color: rgb(1, 2, 3); }
+            #p::after { content: "!" attr(data-missing); }
+            #d::after { content: ""; display: block; height: 7px; }"#);
+        assert_eq!(generated_texts(&t, "p"), vec!["[X]".to_string(), "!".to_string()]);
+        let p = tid_of(&t, "p");
+        let kids = t.taffy.children(p).unwrap();
+        assert!(is_generated(&t, kids[0]) && is_generated(&t, *kids.last().unwrap()), "first and last child");
+        assert_eq!(t.paint_map[&kids[0]].color, Some((1, 2, 3)));
+        // The ::before text is laid out in the paragraph's line box, ahead of "mid".
+        let frags = &t.inline.get(&p).expect("p is an inline formatting context").frags;
+        let texts: Vec<&str> = frags.iter().filter_map(|f| match f { layout::inline::Frag::Text { text, .. } => Some(text.as_str()), _ => None }).collect();
+        assert_eq!(texts.first().map(|s| s.trim()), Some("[X]"), "{texts:?}");
+        // A block-level ::after is a block box with its own height.
+        let d = tid_of(&t, "d");
+        let last = *t.taffy.children(d).unwrap().last().unwrap();
+        assert!(is_generated(&t, last));
+        assert_eq!(t.taffy.layout(last).unwrap().size.height, 7.0);
+    }
+
+    /// `content: none | normal`, no `content` at all, and `display: none` generate no box; a
+    /// replaced element takes none.
+    #[test]
+    fn test_generated_suppression() {
+        let html = r#"<html><body><p id="a">a</p><p id="b">b</p><p id="c">c</p><p id="e">e</p><span id="w"><img id="i" src="x.png"></span></body></html>"#;
+        let t = gen_tree(html, r#"#a::before { content: none; } #b::before { content: normal; }
+            #c::before { color: red; } #e::before { content: "x"; display: none; }
+            img::before { content: "no"; }"#);
+        for id in ["a", "b", "c", "e", "w"] {
+            assert!(generated_texts(&t, id).is_empty(), "#{id}");
+        }
+    }
+
+    /// css-lists-3 §4: counter-reset/-increment/-set, nested scopes through counters(), the
+    /// predefined counter styles, and the implicit list-item counter (ol start, li value).
+    #[test]
+    fn test_generated_counters() {
+        let html = r#"<html><body><ol id="o">
+            <li>a<ol><li>a1</li><li>a2</li></ol></li>
+            <li>b<ol><li>b1<ol><li>b11</li></ol></li></ol></li>
+        </ol>
+        <div id="s"><span class="r"></span><span class="r"></span><span class="r"></span><span class="z"></span></div>
+        <ol id="l" start="3"><li>x</li><li value="10">y</li><li>z</li></ol>
+        </body></html>"#;
+        let t = gen_tree(html, r#"#o, #o ol { counter-reset: item; list-style: none; }
+            #o li { counter-increment: item; }
+            #o li::before { content: counters(item, ".") " "; }
+            #s { counter-reset: n 1; }
+            .r { counter-increment: n 2; }
+            .r::before { content: counter(n, lower-roman) "/" counter(n, upper-alpha) "/" counter(n, decimal-leading-zero) "/" counter(n, disc); }
+            .z { counter-set: n 40; }
+            .z::after { content: counter(n, lower-greek) counter(none-such); }
+            #l li::before { content: counter(list-item) ":"; }"#);
+        let got: Vec<String> = generated_texts(&t, "o").iter().map(|s| s.trim().to_string()).collect();
+        assert_eq!(got, ["1", "1.1", "1.2", "2", "2.1", "2.1.1"]);
+        assert_eq!(generated_texts(&t, "s"), ["iii/C/03/\u{2022}", "v/E/05/\u{2022}", "vii/G/07/\u{2022}", "\u{3BC}0"]);
+        assert_eq!(generated_texts(&t, "l"), ["3:", "10:", "11:"]);
+    }
+
+    /// css-content-3 §3: open/close quotes nest through one depth, by `quotes` or the UA pairs of
+    /// the language; `<q>` quotes itself through the UA sheet.
+    #[test]
+    fn test_generated_quotes() {
+        let html = r#"<html><body><p id="en"><q>a <q>b</q> c</q></p>
+            <p id="de" lang="de"><q>a <q>b</q></q></p>
+            <p id="cu"><q>x</q><span class="n"></span></p></body></html>"#;
+        let t = gen_tree(html, r##"#cu { quotes: "<" ">" "(" ")"; } .n::before { content: no-open-quote close-quote; }"##);
+        assert_eq!(generated_texts(&t, "en"), ["\u{201C}", "\u{2018}", "\u{2019}", "\u{201D}"]);
+        assert_eq!(generated_texts(&t, "de"), ["\u{201E}", "\u{201A}", "\u{2018}", "\u{201C}"]);
+        assert_eq!(generated_texts(&t, "cu"), ["<", ">", ">"]);
+    }
+
+    /// `content: url()` is a replaced inline image (here a data: SVG, decoded by the image store).
+    #[test]
+    fn test_generated_url_image() {
+        let html = r#"<html><body><p id="p">t</p></body></html>"#;
+        let t = gen_tree(html, r#"#p::before { content: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='10'><rect width='12' height='10' fill='red'/></svg>"); }"#);
+        let p = tid_of(&t, "p");
+        let g = t.taffy.children(p).unwrap()[0];
+        assert!(is_generated(&t, g));
+        let img = t.taffy.children(g).unwrap()[0];
+        assert_eq!(t.node_map[&img].local_name().as_deref(), Some("img"));
+        let l = t.taffy.layout(img).unwrap();
+        assert_eq!((l.size.width, l.size.height), (12.0, 10.0));
+    }
+
+    /// css-lists-3 §3.1: an author-styled ::marker carries its content, colour and font to the
+    /// item; rendered, the marker paints in its colour left of the content edge.
+    #[test]
+    fn test_generated_marker() {
+        let html = r#"<html><body><ul><li id="a">one</li><li id="b">two</li></ul><ol><li id="c">x</li></ol></body></html>"#;
+        let t = gen_tree(html, r#"#a::marker { content: "> "; color: rgb(250, 0, 0); font-size: 20px; }
+            #b::marker { color: rgb(0, 0, 250); } #c::marker { content: none; }"#);
+        let mk = |id: &str| t.paint_map[&tid_of(&t, id)].marker.clone().expect("marker paint");
+        assert_eq!(mk("a").text.as_deref(), Some("> "));
+        assert_eq!(mk("a").color, Some((250, 0, 0)));
+        assert_eq!(mk("a").size(16.0), 20.0);
+        assert_eq!(mk("b").text, None);
+        assert!(mk("c").none);
+        let mut surface = vec![0u8; 300 * 120 * 4];
+        render::render_frame(&t, &mut surface, 300, 120, 0.0, 0.0, &[(0, 0, 300, 120)]);
+        let content_x = t.taffy.layout(tid_of(&t, "a")).unwrap().location.x;
+        let colored = |r: u8, b: u8| surface.chunks_exact(4).enumerate().any(|(i, p)| {
+            ((i % 300) as f32) < content_x + 40.0 && p[2] > 200 && p[1] < 60 && p[0] < 60 && r > 0
+                || ((i % 300) as f32) < content_x + 40.0 && p[0] > 200 && p[1] < 60 && p[2] < 60 && b > 0
+        });
+        assert!(colored(1, 0), "a red marker (BGRA)");
+        assert!(colored(0, 1), "a blue bullet");
+    }
+
+    /// :focus, :focus-visible and :focus-within follow the engine's focus (the page's active
+    /// element); focus-visible drops after a pointer focus except on a text field.
+    #[test]
+    fn test_focus_visible_within() {
+        let html = r#"<html><body><form id="f"><input id="i"><button id="b">go</button></form><p id="o">o</p></body></html>"#;
+        let doc = dom::parse_html(html);
+        let id_of = |id: &str| doc.select_first(&format!("#{id}")).unwrap().as_node().id().0;
+        let css_text = "#i:focus-visible, #b:focus-visible { color: rgb(1, 1, 1); } #f:focus-within { color: rgb(2, 2, 2); } #o:focus-within { color: rgb(3, 3, 3); } #b:focus { font-size: 30px; }";
+        let color = |focus: Option<usize>, pointer: bool, id: &str| {
+            crate::js::page(|p| {
+                p.doc = Some(doc.clone());
+                p.focused = focus;
+            });
+            css::note_focus_modality(pointer);
+            let mut t = layout::build_tree(&doc, 800.0, 600.0);
+            css::apply_stylesheets(&mut t, &[css_text.to_string()]);
+            let p = t.paint_map[&tid_of(&t, id)].clone();
+            (p.color, p.font_size)
+        };
+        assert_eq!(color(None, false, "f").0, None, "nothing focused");
+        assert_eq!(color(Some(id_of("i")), false, "i").0, Some((1, 1, 1)));
+        assert_eq!(color(Some(id_of("i")), false, "f").0, Some((2, 2, 2)));
+        assert_eq!(color(Some(id_of("i")), false, "o").0, None);
+        assert_eq!(color(Some(id_of("b")), false, "b"), (Some((1, 1, 1)), Some(30.0)));
+        assert_eq!(color(Some(id_of("b")), true, "b"), (None, Some(30.0)), "pointer focus on a button");
+        assert_eq!(color(Some(id_of("i")), true, "i").0, Some((1, 1, 1)), "a text field always shows focus");
+        crate::js::page(|p| {
+            p.doc = None;
+            p.focused = None;
+        });
+        css::note_focus_modality(false);
     }
 }

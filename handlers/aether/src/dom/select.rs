@@ -105,14 +105,21 @@ impl Element for El<'_> {
         self.element().and_then(|e| e.attr("class")).is_some_and(|v| v.split(is_html_ws).any(|c| c == class))
     }
     // `state` is css_core's `html_state` (the attribute-derived states: `:link`, `:checked`,
-    // `:disabled`/`:enabled`, `:required`, `:read-only`, `:placeholder-shown`, …) plus the one user-action
-    // state the event loop now drives: `:hover` (AETHERHOVER, SR67) — the element under the pointer and
-    // every ancestor of it (Selectors 4 §9.1), as the engine last set it with [`El::set_hover_chain`]. A
-    // render with no pointer has an empty chain, so `:hover` matches nothing; `:focus`/`:target` still
-    // never match.
+    // `:disabled`/`:enabled`, `:required`, `:read-only`, `:placeholder-shown`, …) plus the user-action
+    // states the engine drives: `:hover` (AETHERHOVER, SR67 — the element under the pointer and its
+    // ancestors, as [`El::set_hover_chain`] last set it) and the focus states read from the engine's
+    // focus (AETHERGEN, SR71). A static render has no pointer and no focus, so neither matches.
     fn state(&self, s: ElementState) -> bool {
         match s {
             ElementState::Hover => is_hovered(self.doc, self.id),
+            ElementState::Focus | ElementState::FocusVisible | ElementState::FocusWithin => {
+                let Some(f) = focused_in(self.doc) else { return false };
+                match s {
+                    ElementState::Focus => f == self.id,
+                    ElementState::FocusVisible => f == self.id && focus_visible(self),
+                    _ => self.doc.is_inclusive_ancestor(self.id, f),
+                }
+            }
             _ => html_state(self, s),
         }
     }
@@ -145,6 +152,35 @@ fn is_hovered(doc: &Document, id: NodeId) -> bool {
         let h = h.borrow();
         h.0 != 0 && h.0 == doc as *const Document as usize && h.1.contains(&id)
     })
+}
+
+/// The engine's focused element (`document.activeElement` when it is an element — the page state
+/// `focus()`/`blur()` maintain) when `doc` is that page's document.
+fn focused_in(doc: &Document) -> Option<NodeId> {
+    crate::js::PAGE.with(|p| {
+        let p = p.try_borrow().ok()?;
+        let page_doc = p.doc.as_ref()?;
+        if !std::ptr::eq(page_doc.doc.as_ptr() as *const Document, doc) {
+            return None;
+        }
+        let f = NodeId(p.focused?);
+        doc.element(f).is_some().then_some(f)
+    })
+}
+
+/// The `:focus-visible` heuristic (Selectors 4 §9.4, as browsers implement it): an element that takes
+/// keyboard text input always shows its focus; otherwise focus is visible unless it came from a
+/// pointer interaction.
+fn focus_visible(el: &El<'_>) -> bool {
+    let text_entry = match el.local_name() {
+        "textarea" => true,
+        "input" => !matches!(
+            el.attr("type").map(|t| t.to_ascii_lowercase()).as_deref(),
+            Some("checkbox" | "radio" | "button" | "submit" | "reset" | "image" | "file" | "range" | "color" | "hidden")
+        ),
+        _ => el.attr("contenteditable").is_some_and(|v| !v.eq_ignore_ascii_case("false")),
+    };
+    text_entry || !crate::css::pointer_focus()
 }
 
 /// A compiled selector list (css_core's Selectors 4 grammar, HTML namespace defaults).

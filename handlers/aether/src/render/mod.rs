@@ -778,15 +778,38 @@ fn alpha(n: i64) -> String {
 /// The marker text of a counter style (css-counter-styles-3 §6-7 for the
 /// predefined styles): "3. ", "c. ", "iv. ", "03. ".
 pub(crate) fn marker_text(style: u8, n: i64) -> String {
-    let body = match style {
+    format!("{}. ", counter_text(style.max(4), n))
+}
+
+/// A counter's representation in a predefined counter style (css-counter-styles-3 §6-7), for
+/// `counter()`/`counters()` (AETHERGEN, SR71): the `list_style` codes; disc/circle/square are the
+/// UA's bullet characters, `none` is empty, a value outside an alphabetic/additive style's range
+/// falls back to decimal.
+pub(crate) fn counter_text(style: u8, n: i64) -> String {
+    match style {
+        0 => String::new(),
+        1 => "\u{2022}".into(),
+        2 => "\u{25E6}".into(),
+        3 => "\u{25AA}".into(),
         5 => alpha(n),
         6 => alpha(n).to_uppercase(),
         7 => roman(n),
         8 => roman(n).to_uppercase(),
         9 if (0..10).contains(&n) => format!("0{n}"),
+        9 if (-9..0).contains(&n) => format!("-0{}", -n),
+        10 if n > 0 => {
+            const GREEK: [char; 24] = ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω'];
+            let mut n = n;
+            let mut s = Vec::new();
+            while n > 0 {
+                n -= 1;
+                s.push(GREEK[(n % 24) as usize]);
+                n /= 24;
+            }
+            s.iter().rev().collect()
+        }
         _ => n.to_string(),
-    };
-    format!("{body}. ")
+    }
 }
 
 /// Paints an outside list marker. Bullets are Blink's shapes — a disc,
@@ -2005,7 +2028,35 @@ pub fn render_frame(
                 // css-lists-3 §3.1: an outside ::marker for a list item,
                 // its first line's baseline, ending at the content edge.
                 let is_item = spec.list_item.unwrap_or(tag == "li");
-                if is_item && inherited.list_style != 0 && !inherited.text_hidden {
+                // AETHERGEN (SR71): an author-styled ::marker — `content` text replaces the
+                // list-style marker (even under `list-style-type: none`), `content: none` removes
+                // it, and its colour and font apply to it.
+                if let Some(mk) = spec.marker.as_deref().filter(|_| is_item && !inherited.text_hidden) {
+                    let mut sel = inherited.sel();
+                    if let Some(w) = mk.weight { sel.weight = w.resolve(inherited.weight); }
+                    if let Some(i) = mk.italic { sel.italic = i; }
+                    if let Some(f) = mk.family { sel.family = f; }
+                    let fs = mk.size(inherited.font_size);
+                    let color = mk.color.unwrap_or(inherited.color);
+                    let draw = !mk.none && (mk.text.is_some() || inherited.list_style != 0);
+                    if let (true, Some(item_face)) = (draw, crate::fonts::face(&inherited.sel())) {
+                        let base = match layout.inline.get(&node_id).and_then(|l| l.first_baseline) {
+                            Some(b) => content_y + b,
+                            None => content_y + crate::fonts::baseline_offset(item_face, inherited.font_size, inherited.line_height),
+                        };
+                        let adv = Advancer::new(sel, fs, 0.0).with_dir(inherited.rtl);
+                        match &mk.text {
+                            Some(t) => {
+                                let w = adv.str(t);
+                                draw_shaped(t, &adv, content_x - w, base.round(), color, surface, width, height, damage_rects, clip);
+                            }
+                            None => paint_marker(
+                                dom_node, inherited.list_style, content_x, base.round(), &adv,
+                                color, surface, width, height, damage_rects, clip,
+                            ),
+                        }
+                    }
+                } else if is_item && inherited.list_style != 0 && !inherited.text_hidden {
                     if let Some(f) = crate::fonts::face(&inherited.sel()) {
                         let fs = inherited.font_size;
                         let base = match layout.inline.get(&node_id).and_then(|l| l.first_baseline) {

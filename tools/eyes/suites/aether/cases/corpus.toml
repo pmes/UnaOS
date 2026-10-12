@@ -116,3 +116,6 @@ name = "27-selection"
 page = "interact/27-selection.html"
 subject = { run = "{repo}/target/release/aether render --html {page} --width {w} --height {h} --select 52,68,280.6,86 --out {out} --ledger {outdir}/{case}.ledger.txt" }
 oracle = { script = "(() => { const p = document.getElementById('sel'); document.getSelection().setBaseAndExtent(p.firstChild, 4, p.lastChild, 23); })()" }
+[[case]]
+name = "28-generated"
+page = "corpus/28-generated.html"

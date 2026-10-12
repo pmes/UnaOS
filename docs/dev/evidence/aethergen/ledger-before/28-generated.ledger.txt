@@ -1,0 +1,7 @@
+Aether M5 API Ledger: Honest Failures
+=====================================
+Category | API Name                                 | Call Count
+----------------------------------------------------------------------
+CSS      | property:counter-increment               | 1
+CSS      | property:counter-reset                   | 2
+CSS      | pseudo-element-rule                      | 9

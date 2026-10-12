@@ -1,0 +1,47 @@
+<!-- tests: generated content: ::before icon glyphs (content:"\2713"), content: attr(data-x), counters() on a nested ol, quotes on nested q, a styled ::marker, an ::after clearfix -->
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Generated content</title>
+<style>
+body { font-family: sans-serif; margin: 16px 24px; color: #222; font-size: 16px; line-height: 22px; background: #fff; }
+h2 { font-size: 18px; line-height: 24px; margin: 14px 0 6px; }
+.checks { list-style: none; padding: 0; margin: 0; }
+.checks li::before { content: "\2713"; color: #1a7f37; margin-right: 8px; }
+.checks li.no::before { content: "\2717"; color: #cf222e; }
+.tag::after { content: " [" attr(data-x) "]"; color: #0550ae; }
+.badge::before { content: "\2605"; color: #bf8700; padding-right: 4px; }
+ol.toc { counter-reset: item; list-style: none; padding-left: 0; margin: 0; }
+ol.toc ol { counter-reset: item; list-style: none; padding-left: 24px; margin: 0; }
+ol.toc li { counter-increment: item; }
+ol.toc li::before { content: counters(item, ".") ". "; color: #6639ba; }
+ul.fancy { margin: 0; padding-left: 32px; }
+ul.fancy li::marker { color: #d1242f; }
+ul.arrows { margin: 4px 0 0; padding-left: 32px; }
+ul.arrows li::marker { content: "\2192  "; color: #0969da; font-weight: bold; }
+.row { background: #eef3f8; border: 1px solid #b6c8da; padding: 6px; margin-top: 8px; }
+.row::after { content: ""; display: table; clear: both; }
+.box { float: left; width: 120px; height: 36px; margin-right: 10px; background: #8fb4d9; }
+.sep::before { content: "\00a7"; color: #888; margin-right: 6px; }
+</style></head><body>
+<h2 class="sep">Icons and attributes</h2>
+<ul class="checks">
+  <li>Strings render as generated boxes</li>
+  <li class="no">Nothing is missing</li>
+  <li><span class="tag" data-x="attr">Attribute text</span> and a <span class="badge">badge</span></li>
+</ul>
+<h2 class="sep">Counters</h2>
+<ol class="toc">
+  <li>Introduction
+    <ol><li>Scope</li><li>Terms</li></ol>
+  </li>
+  <li>Design
+    <ol><li>Boxes</li><li>Counters
+      <ol><li>Nesting</li></ol>
+    </li></ol>
+  </li>
+</ol>
+<h2 class="sep">Quotes and markers</h2>
+<p>She said <q>the box was <q>generated</q> here</q> and left.</p>
+<ul class="fancy"><li>A red, larger bullet</li><li>Second item</li></ul>
+<ul class="arrows"><li>Arrow marker</li><li>Another arrow</li></ul>
+<div class="row"><div class="box"></div><div class="box"></div><div class="box"></div></div>
+</body></html>
