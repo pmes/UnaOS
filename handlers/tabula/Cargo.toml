@@ -9,6 +9,8 @@ license = "LGPL-3.0-or-later"
 gtk = ["dep:gtk4", "dep:glib", "dep:sourceview5", "dep:libspelling"]
 
 [dependencies]
+# EDITCORE (SR73): the UnaOS text-editing core — `TabulaDocument`'s buffer of record (no_std, zero deps).
+edit_core = { path = "../../unaos/libs/text/edit_core" }
 elessar = { path = "../../libs/elessar" }
 # TABULABUS (SR74): `tabula::ignite` serves the Editor verbs on the Synapse.
 bandy = { path = "../../libs/bandy" }

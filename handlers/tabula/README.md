@@ -34,6 +34,19 @@ vessel can fire `EditorOpen` immediately after spawning it. The read-only log ro
 is unchanged: `EditorOpen` goes through `TabulaDocument::open`, which name-routes
 `UNAOS.LOG`/`*.log`/`*.out` to the Console view.
 
+**Buffer of record: UnaOS's own editing core (EDITCORE, SR73; R104).**
+`TabulaDocument` holds an `edit_core::Buffer` (`unaos/libs/text/edit_core` — a
+no_std, zero-dependency piece table with an incremental line index, UAX #29
+grapheme/word motion, multiple cursors, grouped undo/redo, search, and a
+soft-wrapping `Viewport`) as the text of record: `load`, `save`, `set_buffer`
+and `edit`/`replace_range`/`undo`/`redo` all go through it, and CRLF is kept
+per line as loaded. The GtkSourceView view **stays** as the other-OS face and
+mirrors the core both ways: a GtkTextBuffer insert/delete becomes the same core
+edit, and a core edit made through `TabulaView::edit` is replayed into the
+GtkTextBuffer range by range (one guard flag stops the echo). The `buffer`
+`String` field is a snapshot folded forward from the core for readers that
+still take a `String` (`vessels/una`); `save()` writes the core, not it.
+
 ## What it provides
 
 The public API lives in `src/lib.rs`:

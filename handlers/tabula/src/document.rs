@@ -20,17 +20,32 @@
 //! buffer, a language id, and a dirty flag. It has no GTK/sourceview
 //! dependency, so it builds anywhere. The GTK `TabulaView` (behind the `gtk`
 //! feature) is a rendering shell over this state.
+//!
+//! EDITCORE (SR73, R104): the buffer of record is [`edit_core::Buffer`] — UnaOS's
+//! own no_std editing core (`unaos/libs/text/edit_core`), the same bytes a
+//! ring-3 editor on the image links. `load`, `save`, `set_buffer` and every
+//! edit go through it; the GTK view mirrors it both ways (`src/lib.rs`).
 
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+
+pub use edit_core::{Buffer as EditBuffer, Change};
 
 /// An in-memory editor document, decoupled from any UI toolkit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabulaDocument {
     /// Backing file, if this document has been loaded from / bound to one.
     pub path: Option<PathBuf>,
-    /// The full text content of the buffer.
+    /// The buffer of record: UnaOS's editing core (text, line index,
+    /// cursors, grouped undo). `save()` writes THIS.
+    pub core: edit_core::Buffer,
+    /// A plain-`String` snapshot of `core`'s text, folded forward on every
+    /// edit made through this type, for readers that still take a `String`
+    /// (`vessels/una/src/main.rs` reads `doc.buffer`; TABULABUS SR74 moves it
+    /// onto [`Self::text`] and this snapshot goes). It is not the record:
+    /// writing it changes nothing that is saved.
     pub buffer: String,
     /// sourceview-style language id (e.g. "rust", "toml", "txt").
     pub language: String,
@@ -63,12 +78,69 @@ impl Default for TabulaDocument {
 impl TabulaDocument {
     /// A fresh, empty, path-less document with the fallback language.
     pub fn new() -> Self {
+        Self::with_text("")
+    }
+
+    /// A clean, path-less document holding `text` exactly (line endings kept).
+    pub fn with_text(text: &str) -> Self {
         Self {
             path: None,
-            buffer: String::new(),
+            core: edit_core::Buffer::new(text),
+            buffer: text.to_string(),
             language: "txt".to_string(),
             dirty: false,
             read_only: false,
+        }
+    }
+
+    /// The text of record, as a `String`.
+    pub fn text(&self) -> String {
+        self.core.to_string()
+    }
+
+    /// Run an edit on the core and fold its [`Change`]s into the snapshot;
+    /// marks the document dirty when anything changed. Inert (no changes) on
+    /// a read-only document. The returned changes are what a view replays.
+    pub fn edit(&mut self, f: impl FnOnce(&mut edit_core::Buffer) -> Vec<Change>) -> Vec<Change> {
+        if self.read_only {
+            return Vec::new();
+        }
+        let changes = f(&mut self.core);
+        self.fold(&changes);
+        changes
+    }
+
+    /// Replace a byte range of the record (one undo group) — the entry the
+    /// host view's mirror uses for a toolkit-side insert or delete.
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str) -> Vec<Change> {
+        self.edit(|b| b.replace(range, text))
+    }
+
+    /// Undo the core's newest group.
+    pub fn undo(&mut self) -> Vec<Change> {
+        self.edit(|b| b.undo().unwrap_or_default())
+    }
+
+    /// Redo the core's newest undone group.
+    pub fn redo(&mut self) -> Vec<Change> {
+        self.edit(|b| b.redo().unwrap_or_default())
+    }
+
+    fn fold(&mut self, changes: &[Change]) {
+        for c in changes {
+            if c.old_end <= self.buffer.len()
+                && self.buffer.is_char_boundary(c.start)
+                && self.buffer.is_char_boundary(c.old_end)
+            {
+                self.buffer.replace_range(c.start..c.old_end, &c.text);
+            } else {
+                // The snapshot was written from outside; re-derive it from the record.
+                self.buffer = self.core.to_string();
+                break;
+            }
+        }
+        if !changes.is_empty() {
+            self.dirty = true;
         }
     }
 
@@ -102,6 +174,7 @@ impl TabulaDocument {
             .to_string();
         Ok(Self {
             path: Some(path.to_path_buf()),
+            core: edit_core::Buffer::new(&buffer),
             buffer,
             language,
             dirty: false,
@@ -117,6 +190,7 @@ impl TabulaDocument {
         let rendered = crate::logview::load_log(path)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
+            core: edit_core::Buffer::new(&rendered.text),
             buffer: rendered.text,
             language: "txt".to_string(),
             dirty: false,
@@ -138,13 +212,18 @@ impl TabulaDocument {
 
     /// Replace the buffer contents, marking the document dirty.
     ///
+    /// Goes through the core as ONE minimal edit (common prefix and suffix
+    /// kept), so it is a single undo group and a view re-renders only the
+    /// lines that differ.
+    ///
     /// Inert on a read-only document: the view may still be editable in the
     /// host toolkit, but a log's held state stays exactly what was read.
     pub fn set_buffer(&mut self, content: impl Into<String>) {
         if self.read_only {
             return;
         }
-        self.buffer = content.into();
+        let content = content.into();
+        self.edit(|b| b.set_text(&content));
         self.dirty = true;
     }
 
@@ -160,7 +239,7 @@ impl TabulaDocument {
         let path = self.path.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "TabulaDocument has no path to save to")
         })?;
-        fs::write(path, self.buffer.as_bytes())?;
+        fs::write(path, self.core.to_string().as_bytes())?;
         self.dirty = false;
         Ok(())
     }
@@ -307,6 +386,60 @@ mod tests {
         assert!(!doc.dirty);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn core_is_the_record_and_the_snapshot_follows() {
+        let path = scratch_path("record.rs");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"fn a() {}\r\nfn b() {}\n").unwrap();
+        let mut doc = TabulaDocument::load(&path).unwrap();
+        assert_eq!(doc.text(), "fn a() {}\r\nfn b() {}\n");
+        assert_eq!(doc.core.line_count(), 3);
+
+        // An edit through the core API: the snapshot follows, the doc is dirty.
+        let changes = doc.edit(|b| {
+            b.set_cursor(b.pos_to_offset(edit_core::Pos::new(1, 9)));
+            b.newline()
+        });
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].text, "\n", "the line's own ending (LF) is repeated");
+        assert_eq!(doc.buffer, doc.text());
+        assert!(doc.dirty);
+
+        // A view-side edit (the mirror's entry) and undo.
+        doc.replace_range(0..2, "pub fn");
+        assert_eq!(doc.buffer, "pub fn a() {}\r\nfn b() {}\n\n");
+        doc.undo();
+        assert_eq!(doc.buffer, "fn a() {}\r\nfn b() {}\n\n");
+
+        // Writing the snapshot from outside is not the record: save writes the core.
+        doc.buffer.push_str("NOT SAVED");
+        doc.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"fn a() {}\r\nfn b() {}\n\n", "CRLF kept byte-exact");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_buffer_is_one_minimal_undoable_edit() {
+        let mut doc = TabulaDocument::with_text("alpha\nbeta\ngamma\n");
+        doc.set_buffer("alpha\nBETA\ngamma\n");
+        assert_eq!(doc.core.undo_depth(), 1);
+        let undo = doc.undo();
+        assert_eq!(undo.len(), 1);
+        assert_eq!((undo[0].first_line, undo[0].new_last_line), (1, 1), "only line 1 re-renders");
+        assert_eq!(doc.buffer, "alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn read_only_refuses_core_edits() {
+        let mut doc = TabulaDocument::with_text("log line\n");
+        doc.read_only = true;
+        assert!(doc.replace_range(0..3, "X").is_empty());
+        assert!(doc.edit(|b| b.insert("x")).is_empty());
+        doc.set_buffer("other");
+        assert_eq!(doc.text(), "log line\n");
+        assert!(!doc.dirty);
     }
 
     #[test]
