@@ -472,3 +472,7 @@ refs/heads/exec-host-aetherwpt2               fe30fa59 FOLDED-BY-HAND 897a565d
 refs/heads/exec-host-webgl1                   558dbdd0 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-intlcldr                 2a436e4a IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-aetherwpt3               e3925d80 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-qemuskip                 cb833ebb IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-kvmlat                   cb833ebb IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-uireds26                 cb833ebb IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-pi-piwm                       cb833ebb IN-FLIGHT cloud 2026-10-13
