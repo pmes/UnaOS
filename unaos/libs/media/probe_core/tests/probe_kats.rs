@@ -188,3 +188,68 @@ fn imu_reports_read_in_si_units() {
     assert_eq!(imu::parse_report(&r, imu::GYRO_DPS_PER_LSB_OLD), None, "report id 3 is not a motion sensor");
     assert_eq!(imu::parse_report(&r[..31], imu::GYRO_DPS_PER_LSB_OLD), None);
 }
+
+// ── SONDE2 (LEDGER SR105) ──
+
+#[test]
+fn uvc_fourcc_names_the_d400_functions() {
+    assert_eq!(StreamKind::of_uvc_fourcc(*b"Z16 "), Some(StreamKind::Depth));
+    assert_eq!(StreamKind::of_uvc_fourcc(*b"GREY"), Some(StreamKind::Infrared));
+    assert_eq!(StreamKind::of_uvc_fourcc(*b"Y8I "), Some(StreamKind::Infrared));
+    assert_eq!(StreamKind::of_uvc_fourcc(*b"Y16 "), Some(StreamKind::Infrared));
+    assert_eq!(StreamKind::of_uvc_fourcc(*b"YUY2"), Some(StreamKind::Color));
+    assert_eq!(StreamKind::of_uvc_fourcc(*b"UYVY"), Some(StreamKind::Color));
+    assert_eq!(StreamKind::of_uvc_fourcc(*b"MJPG"), None);
+}
+
+#[test]
+fn z16_stats_min_max_lower_median_and_holes() {
+    // 4x2: 0 (hole), 300, 1000, 260 / 0 (hole), 0x0105, 2000, 255 — valid sorted:
+    // 255, 260, 261, 300, 1000, 2000 -> lower median rank (6-1)/2 = 2 -> 261 (0x0105, a different
+    // high-byte bucket from 255 so the two-pass walk crosses a bucket edge).
+    let px: [u16; 8] = [0, 300, 1000, 260, 0, 0x0105, 2000, 255];
+    let mut data = Vec::new();
+    for v in px {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let f = Frame::packed(StreamKind::Depth, PixelFormat::Z16, 4, 2, 0, 0, data).unwrap();
+    let s = depth::z16_stats(&f).unwrap();
+    assert_eq!((s.valid, s.holes, s.min_raw, s.max_raw, s.median_raw), (6, 2, 255, 2000, 261));
+    assert_eq!(s.valid_permille(), 750);
+    assert_eq!(depth::Z16Stats::mm(2000, 1000), 2000);
+    assert_eq!(depth::Z16Stats::mm(2000, 100), 200);
+    // An all-hole frame: zeros, not u16::MAX.
+    let h = Frame::packed(StreamKind::Depth, PixelFormat::Z16, 2, 1, 0, 0, vec![0; 4]).unwrap();
+    assert_eq!(depth::z16_stats(&h).unwrap(), depth::Z16Stats { valid: 0, holes: 2, ..Default::default() });
+    // Not depth: no statistics.
+    let y = Frame::packed(StreamKind::Infrared, PixelFormat::Y8, 2, 1, 0, 0, vec![1, 2]).unwrap();
+    assert!(depth::z16_stats(&y).is_none());
+    // The replay plane agrees with a sort.
+    let p = replay::depth_plane(64, 48, 400, 3, 5);
+    let mut v: Vec<u16> = (0..48).flat_map(|y| (0..64).map(move |x| (x, y))).filter_map(|(x, y)| p.u16_at(x, y)).filter(|&r| r != 0).collect();
+    v.sort_unstable();
+    assert_eq!(depth::z16_stats(&p).unwrap().median_raw, v[(v.len() - 1) / 2]);
+}
+
+#[test]
+fn wire_header_round_trips_and_refuses() {
+    use probe_core::wire;
+    let f = replay::depth_plane(8, 4, 500, 10, 3);
+    let h = wire::encode(&f, "uvc:8086:0b3a", 1000, Some([421.5, 421.5, 424.0, 240.0])).unwrap();
+    assert_eq!(&h[0..4], b"PRB1");
+    let d = wire::decode(&h).unwrap();
+    assert_eq!((d.width, d.height, d.stride, d.seq, d.data_len), (8, 4, 16, 3, 64));
+    assert_eq!((d.stream, d.format, d.depth_units_um), (StreamKind::Depth, PixelFormat::Z16, 1000));
+    assert_eq!(d.id_str(), "uvc:8086:0b3a");
+    assert_eq!(d.intrinsics, Some([421.5, 421.5, 424.0, 240.0]));
+    assert_eq!(d.frame(f.data.clone()).unwrap(), f);
+    assert_eq!(d.depth_scale().unwrap().micrometres(), 1000);
+    let mut bad = h;
+    bad[0] = b'X';
+    assert_eq!(wire::decode(&bad), Err(wire::WireError::Magic));
+    let mut bad = h;
+    bad[40] = 63; // one byte short of 8x4 Z16
+    assert_eq!(wire::decode(&bad), Err(wire::WireError::Geometry));
+    assert_eq!(wire::decode(&h[..79]), Err(wire::WireError::Short));
+    assert_eq!(wire::encode(&f, "an-id-of-seventeen", 1000, None), Err(wire::WireError::Id));
+}

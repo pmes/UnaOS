@@ -3725,7 +3725,7 @@ uvc = []
 # `tests sonde` registration are `feature = "sonde"` alone, and `uvc::probe_iso` carries the same two folds as
 # `uvc::probe`, so a D400 on xHCI (every board's USB-A ports) is recorded too. FIVE places (LAWS §4): this line, `unaos/arroyo`'s `_feats`,
 # `unaos/builder/src/main.rs`, `scripts/banner-cert.sh`, `scripts/k8-reach.registry`.
-sonde = ["uvc"]
+sonde = ["uvc", "dep:probe_core"] # SONDE2 (LEDGER SR105): + probe_core — the census's stream classification, the Z16 statistics and the `/dev/probe/depth0` record are the shared core's; a `dep:` so a knob-off image carries none of it
 # IOAPIC (rmbp-ledger B147): `UNAOS_IOAPIC=1` arms `arch/x86_64/ioapic.rs` — the Intel 82093AA
 # I/O APIC redirection table, which this kernel has never had. Until this feature, `apic.rs` drove
 # the LOCAL APIC only and `drivers/pci.rs` could enable MSI/MSI-X, so a PCI function offering no
@@ -3885,6 +3885,7 @@ holocron_core = { path = "../../libs/sys/holocron_core", optional = true }
 # IEEE 802.11 frame codec, the same crate the host tests link. `optional`, pulled only by `wifi`.
 wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optional = true }
 usbnet_core = { path = "../../libs/sys/usbnet_core", default-features = false, optional = true } # NETFRAME (B368)
+probe_core = { path = "../../libs/media/probe_core", optional = true } # SONDE2 (LEDGER SR105): Sonde's probe core (no_std + alloc, zero deps, the crate handlers/sonde links) — pulled only by `sonde`
 # SELFDIAG (B324): the diagnosis core — witness grammar, owners table, prompt, diff parser + hunk locator +
 # streaming emitter, record, Echo fixture — the SAME crate APPS/DIAG.ELF links. no_std, zero deps.
 diag_core = { path = "../../libs/sys/diag_core", optional = true }

@@ -234,6 +234,10 @@ name = "prefs_core"
 version = "0.1.0"
 
 [[package]]
+name = "probe_core"
+version = "0.1.0"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -501,6 +505,7 @@ dependencies = [
  "noto-sans-mono-bitmap",
  "pixel_core",
  "prefs_core",
+ "probe_core",
  "rast",
  "smoltcp",
  "spin 0.12.3",
