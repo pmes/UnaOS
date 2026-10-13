@@ -16,8 +16,8 @@
 //! program did (`midden_core::ring3::status`): scrollback rows, lines planned, the last plan's kind and verb.
 //!
 //! PASS = the loader takes the image in the ELF model with the windowed note, the program starts, both lines
-//! are planned, it exits on `exit`, the last plan is `Host ls` (the core routed `ls` to the ring, which serves
-//! it — whatever the listing then answers), and the scrollback holds more rows than the core's ring-3 `help`
+//! are planned, it exits on `exit`, the last plan is `Host wc` after the MIDDEN2 drives (before them it was `Host
+//! ls`: the core routed `ls` to the ring, which serves it — whatever the listing then answers), and the scrollback holds more rows than the core's ring-3 `help`
 //! text alone (so `help` drew). The single-producer note: the router is the ring's one producer; this fixture
 //! is a second one for the length of the test, which is safe while no operator types into the new window (the
 //! QEMU lanes have no keyboard input; on the bench, do not type during `tests midden`).
@@ -27,9 +27,19 @@
 //! the child writes the core's help to its console and exits, and the shell's `pump` drains the pipe into its
 //! scrollback line by line, then says `:: MIDDEN: pipe eof ok=1 …` only when at least one line arrived and none was
 //! dropped — the watched prefix [`W_RUN`] (the child prints no `pipe` line: only the launcher reads a pipe). The
-//! status then carries cmds=3 (help, run, ls), the last plan still `Host ls`.
+//! status then carried cmds=3 (help, run, ls), the last plan `Host ls` — MIDDEN2 adds five lines after it (below).
 //!
-//! WITNESS. `:: MIDDENAPP: image=/apps/MIDDEN.ELF window=<elf|fixed|bad> lines=<n> plan=<verb> run=<ok|step> -> PASS|FAIL ::`
+//! MIDDEN2 (LEDGER SR120) — THE SHELL DRIVES, after `ls` and before `exit`, each typed into the ring and waited on the
+//! program's own wire line carrying the expected values ([`DRIVES`]): `cd` (`cd /apps⏎` -> `:: MIDDEN: cd ok=1
+//! cwd=/apps ::`), completion (`histo` + Tab -> `complete ok=1 word=histo got=history`, then ⏎ runs it -> `plan=Host
+//! verb=history`), history recall (Ctrl+R `cd` -> `recall ok=1 via=search line=cd /apps`, ⏎ runs it -> the cd line
+//! again; Up -> `recall ok=1 via=up line=cd /apps`), and a pipeline (Ctrl+U, `echo alpha beta gamma | wc⏎` ->
+//! `pipeline stages=2 last=wc rows=1 ok=1` — the core's echo captured and counted by the served `wc`). Tab is pushed as
+//! byte 0x09 straight into the ring: on the glass the window system takes a bare Tab (x86 `wc_focus_key`) and the
+//! operator presses Ctrl+Tab, which the program binds to the same completion. The status then carries cmds=8 (help,
+//! run, ls, cd, history, cd, echo, wc) and the last plan `Host wc`.
+//!
+//! WITNESS. `:: MIDDENAPP: image=/apps/MIDDEN.ELF window=<elf|fixed|bad> lines=<n> plan=<verb> run=<ok|step> drives=<name:ok|step,…> -> PASS|FAIL ::`
 //! preceded by `[middenapp] …` (pid, slot, timings, the decoded status) and, on FAIL/SKIP, `:: MIDDENAPP:
 //! reason=… ::`. No `MIDDEN.ELF` on the volume is a SKIP (the builder stages it; a bare kernel has none).
 
@@ -47,6 +57,21 @@ const EXIT_MS: u64 = 5_000;
 const RUN_LINE: &[u8] = b"run /apps/MIDDEN.ELF -c help\n";
 const W_RUN: &str = ":: MIDDEN: pipe eof ok=1 ";
 const RUN_MS: u64 = 10_000;
+/// MIDDEN2 (SR120): the shell drives — `(name, keys typed, the watched wire prefix)`, in order. 0x09 Tab, 0x12 Ctrl+R,
+/// 0x1F Up (una_abi::KEY_UP), 0x15 Ctrl+U (kill the recalled line before the pipeline is typed).
+const DRIVES: [(&str, &[u8], &str); 7] = [
+    ("cd", b"cd /apps\n", ":: MIDDEN: cd ok=1 cwd=/apps ::"),
+    ("complete", b"histo\t", ":: MIDDEN: complete ok=1 word=histo got=history "),
+    ("complete-run", b"\n", ":: MIDDEN: plan=Host verb=history served=1 "),
+    ("search", b"\x12cd", ":: MIDDEN: recall ok=1 via=search line=cd /apps "),
+    ("search-run", b"\n", ":: MIDDEN: cd ok=1 cwd=/apps ::"),
+    ("up", b"\x1f", ":: MIDDEN: recall ok=1 via=up line=cd /apps "),
+    ("pipe", b"\x15echo alpha beta gamma | wc\n", ":: MIDDEN: pipeline stages=2 last=wc rows=1 ok=1 ::"),
+];
+const DRIVE_MS: u64 = 5_000;
+/// MIDDEN2: what the drives leave in the exit status — eight planned lines, the last `Host wc`.
+const WANT_CMDS: u32 = 8;
+const WANT_VERB: &str = "wc";
 
 /// Register `tests midden` once (`tests::ensure_shellux`'s line; `tests-at-boot` runs it there).
 pub fn ensure() {
@@ -58,12 +83,12 @@ pub fn ensure() {
 }
 
 fn verdict(window: &str, lines: u32, plan: &str, v: &str) {
-    verdict_run(window, lines, plan, "unrun", v)
+    verdict_run(window, lines, plan, "unrun", "unrun", v)
 }
 
-/// RING3PIPE: the witness with the Run drive's word.
-fn verdict_run(window: &str, lines: u32, plan: &str, run: &str, v: &str) {
-    serial_println!(":: MIDDENAPP: image={} window={} lines={} plan={} run={} -> {} ::", IMAGE, window, lines, plan, run, v);
+/// RING3PIPE: the witness with the Run drive's word; MIDDEN2: and the shell drives' (`name:ok|step,…`).
+fn verdict_run(window: &str, lines: u32, plan: &str, run: &str, drives: &str, v: &str) {
+    serial_println!(":: MIDDENAPP: image={} window={} lines={} plan={} run={} drives={} -> {} ::", IMAGE, window, lines, plan, run, drives, v);
 }
 
 fn why(r: &str) {
@@ -189,6 +214,37 @@ pub fn selftest() {
             }
         }
     }
+    // MIDDEN2 (SR120): the shell drives — cd, completion, history recall (search and Up), a pipeline.
+    let mut drives = alloc::string::String::new();
+    let mut drives_ok = fail.is_none();
+    if fail.is_none() {
+        for &(name, keys, watch) in DRIVES.iter() {
+            crate::serial_line::line_watch_arm(watch);
+            let r = if type_line(slot, keys) { wait_line(pid, DRIVE_MS) } else { Err("input-ring-full") };
+            if !drives.is_empty() {
+                drives.push(',');
+            }
+            drives.push_str(name);
+            drives.push(':');
+            match r {
+                Ok(ms) => {
+                    drives.push_str("ok");
+                    serial_println!("[middenapp] drive={} ms={} watched={}", name, ms, watch.trim_end());
+                }
+                Err(e) => {
+                    drives_ok = false;
+                    drives.push_str(e);
+                    serial_println!("[middenapp] drive={} -> {} (watched `{}`)", name, e, watch.trim_end());
+                    if matches!(e, "faulted" | "exited-early" | "gone") {
+                        fail = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        drives.push_str("unrun");
+    }
     crate::serial_line::line_watch_disarm();
     // `exit` closes the window and exits with the packed status; the reap is `jobs`'s.
     let mut status: Option<i32> = None;
@@ -224,14 +280,16 @@ pub fn selftest() {
     );
     serial_println!("[middenapp] run={} run_ms={:?} line={}", run, run_ms, core::str::from_utf8(RUN_LINE).unwrap_or("?").trim_end());
     let help_rows = midden_core::help(&midden_core::Facts::ring3(true)).lines().count() as u32;
-    let base = fail.is_none() && status.is_some() && win_ok && cmds == 3 && kind == 2 && verb == "ls" && rows > help_rows;
-    let ok = base && run == "ok";
+    let base = fail.is_none() && status.is_some() && win_ok && cmds == WANT_CMDS && kind == 2 && verb == WANT_VERB && rows > help_rows;
+    let ok = base && run == "ok" && drives_ok;
     if let Some(r) = fail {
         why(r);
+    } else if !drives_ok {
+        serial_println!(":: MIDDENAPP: reason=drive-mismatch (drives={}) ::", drives);
     } else if !base {
-        serial_println!(":: MIDDENAPP: reason=status-mismatch (want cmds=3 kind=Host verb=ls rows>{}) ::", help_rows);
+        serial_println!(":: MIDDENAPP: reason=status-mismatch (want cmds={} kind=Host verb={} rows>{}) ::", WANT_CMDS, WANT_VERB, help_rows);
     } else if !ok {
         serial_println!(":: MIDDENAPP: reason=run-mismatch (run={}: want `{}` from `run`'s pipe) ::", run, W_RUN.trim_end());
     }
-    verdict_run(window, rows, verb, run, if ok { "PASS" } else { "FAIL" });
+    verdict_run(window, rows, verb, run, &drives, if ok { "PASS" } else { "FAIL" });
 }
