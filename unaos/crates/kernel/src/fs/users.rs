@@ -1266,7 +1266,7 @@ pub fn service() {
         #[cfg(all(feature = "loginst", feature = "tests-at-boot"))] LOGINST_LIVE.store(true, Ordering::Release); // LOGINFLOW2 — boot 2's screen is up from the resolution to the fixtures below; the press battery waits (the chain's tail drops it)
         { let st = crate::fs::bootstep::begin("stage-resolve", "Resolving the session"); stage_resolve("store-loaded"); st.end(stage_name()); crate::fs::bootstep::open("first-screen", "Preparing the screen"); } // SPLASHSTALL (B510): "Starting" is the step's own words now, and the stretch from the stage to the first painted screen is its own step (`splash::hold_release` ends it). BOOT80 (B350). FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::tests::register("boot2-login", boot2_login_entry); crate::tests::register("logout", logout_entry); } // LOGINFLOW2 M1/M2 — boot 2's login through the screen (BEFORE the chain's second pass: it needs the screen up), then LOGOUTUI M4
-            #[cfg(feature = "loginst")] { crate::tests::register("login-chain", loginst_chain); crate::tests::source_done(crate::tests::SRC_LOGIN); } // R77 M3 — the loginst fixture chain is a registered test (`tests login-chain`); `tests-at-boot` runs it here, as before. Body: `loginst_chain`, this file's tail.
+            #[cfg(feature = "loginst")] { crate::tests::register("login-chain", loginst_chain); #[cfg(feature = "unafs")] crate::tests::register("users", homepriv_fixture); crate::tests::source_done(crate::tests::SRC_LOGIN); } // R77 M3 — the loginst fixture chain is a registered test (`tests login-chain`); `tests-at-boot` runs it here, as before. Body: `loginst_chain`, this file's tail. HOMEPRIV (B528): `tests users` (unafs), body at this file's tail.
             #[cfg(not(feature = "loginst"))] crate::tests::source_done(crate::tests::SRC_LOGIN); // no loginst on the flight image: the login source has nothing to register and must not be waited on (boot 17 compile fix)
         }
         Err(e) => {
@@ -3250,14 +3250,14 @@ fn ensure_home_native(name: &[u8]) -> Option<Result<&'static str, UsersError>> {
         Ok(l) => l,
         Err(_) => return Some(Err(UsersError::BadName)),
     };
-    let child = alloc::format!("{}/{}", HOME_ROOT, leaf);
+    let child = alloc::format!("{}/{}", HOME_ROOT, leaf); let owner = home_principal(name); // HOMEPRIV (B528, R109 §2): `user:<name>#<uid>`, the leaf is created AS it (vfs NativeBackend::create writes the owner row). ⚠ LINE-NEUTRAL fold
     let mut verdict = "exists";
     for p in [HOME_ROOT, child.as_str()] {
         match mt.stat(p) {
             Ok(st) if st.kind == NodeKind::Dir => {}
             Ok(_) => return Some(Err(UsersError::Volume)),
             Err(VfsError::NoSuchPath) => {
-                if mt.create(p, NodeKind::Dir, KERNEL_PRINCIPAL).is_err() {
+                if mt.create(p, NodeKind::Dir, home_creator(p, &owner)).or_else(|_| mt.create(p, NodeKind::Dir, KERNEL_PRINCIPAL)).is_err() { // HOMEPRIV (B528): `/home` kernel-made and public, `/home/<name>` its user's; a refused user create retries as the kernel and `home_owner_row` writes the row. ⚠ LINE-NEUTRAL fold
                     serial_println!("[users] home=/home/{} NOT created reason=native-create volume=unafs", leaf);
                     return Some(Err(UsersError::Volume));
                 }
@@ -3266,7 +3266,7 @@ fn ensure_home_native(name: &[u8]) -> Option<Result<&'static str, UsersError>> {
             Err(_) => return Some(Err(UsersError::Volume)),
         }
     }
-    serial_println!("[users] home=/home/{} {} volume=unafs", leaf, verdict);
+    serial_println!("[users] home=/home/{} {} volume=unafs", leaf, verdict); home_owner_row(&mt, &child, leaf, owner.as_deref(), verdict); // HOMEPRIV (B528): a home with no owner row gains one, once (`[users] home=<name> owner=set`). ⚠ LINE-NEUTRAL fold
     Some(Ok(verdict))
 }
 
@@ -3639,3 +3639,128 @@ fn flush_unafs(t: &mut Table) -> Result<(), UsersError> {
 /// (login, logout), so a per-pass "did the session change" is one load (`prefs::SessionSeen`), not a locked
 /// `whoami` and a locked compare.
 pub static SESSION_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// =========================================================================================
+// HOMEPRIV (rmbp-ledger B528, R109 §2) — `/home/<name>` is its user's. TAIL-APPENDED under `unafs`: this file is in
+// the default image and its panic Locations are line-pinned (the LOGINFLOW note above), so the three call sites in
+// `ensure_home_native` and the `tests users` registration are line-neutral folds and every body is here.
+//
+// The leaf is created AS `user:<name>#<uid>` (the principal both arches mint for a session user), so
+// `vfs::NativeBackend::create`'s one owner-row writer records it with no `grants:` row — the private-create shape.
+// A home that predates this (or that a kernel retry made) gains the row at the next `ensure_home` (login, adduser)
+// through `MountTable::set_attr` at kernel authority, ROOTACL's migration shape (`rootacl::stamp`), only when the
+// row is ABSENT. The refusal is not here: `unafs::read_authz` denies a principal that is neither the owner nor a
+// read grantee, which is what `MountTable::list_as` / `open_read` ask. The FAT fallback never reaches this code.
+// =========================================================================================
+
+/// HOMEPRIV: the owner value of `name`'s home — `user:<name>#<uid>` — or `None` for a name with no row (root).
+#[cfg(feature = "unafs")]
+fn home_principal(name: &[u8]) -> Option<alloc::string::String> {
+    let n = core::str::from_utf8(name).ok()?;
+    id_of(name).map(|uid| alloc::format!("user:{}#{}", n, uid))
+}
+
+/// HOMEPRIV: who creates `p` in `ensure_home_native` — `/home` the kernel (public), the leaf its user.
+#[cfg(feature = "unafs")]
+fn home_creator<'a>(p: &str, owner: &'a Option<alloc::string::String>) -> &'a str {
+    match owner {
+        Some(o) if p != HOME_ROOT => o.as_str(),
+        _ => crate::fs::vfs::KERNEL_PRINCIPAL,
+    }
+}
+
+/// HOMEPRIV: the `owner` row on `path`, read at kernel authority: `Ok(Some(row))`, `Ok(None)` when the key is
+/// absent (the native arm's `Backend("no-attr")`), `Err` for any other failure (nothing is written on that).
+#[cfg(feature = "unafs")]
+fn home_owner_of(mt: &crate::fs::vfs::MountTable, path: &str) -> Result<Option<alloc::string::String>, crate::fs::vfs::VfsError> {
+    use crate::fs::vfs::{AttrValue, VfsError, KERNEL_PRINCIPAL};
+    match mt.get_attr(path, "owner", KERNEL_PRINCIPAL) {
+        Ok(AttrValue::Str(s)) => Ok(Some(s)),
+        Ok(_) => Ok(Some(alloc::string::String::from("?"))), // a non-string row is still a row: never overwritten
+        Err(VfsError::Backend("no-attr")) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// HOMEPRIV: the uid an owner value names (`user:<name>#<uid>` → `<uid>`), `"none"` when it names none.
+#[cfg(feature = "unafs")]
+fn home_owner_uid(row: &str) -> &str {
+    match row.strip_prefix("user:").and_then(|r| r.rsplit_once('#')) {
+        Some((_, uid)) if !uid.is_empty() => uid,
+        _ => "none",
+    }
+}
+
+/// HOMEPRIV: give the home at `path` its owner row when it has none — idempotent, said once per home. `verdict` is
+/// `ensure_home_native`'s (`created` when a kernel retry made the leaf, `exists` for the migration).
+#[cfg(feature = "unafs")]
+fn home_owner_row(mt: &crate::fs::vfs::MountTable, path: &str, leaf: &str, owner: Option<&str>, verdict: &str) {
+    use crate::fs::vfs::{AttrValue, KERNEL_PRINCIPAL};
+    let Some(want) = owner else { return };
+    if !matches!(home_owner_of(mt, path), Ok(None)) {
+        return; // a row is there (this user's, or a deleted uid's: never rewritten), or the read failed
+    }
+    match mt.set_attr(path, "owner", AttrValue::Str(alloc::string::String::from(want)), KERNEL_PRINCIPAL) {
+        Ok(()) => serial_println!("[users] home={} owner=set uid={} was={}", leaf, home_owner_uid(want), verdict),
+        Err(e) => serial_println!("[users] home={} owner=FAILED reason={:?} (the home stays public)", leaf, e),
+    }
+}
+
+/// HOMEPRIV (`tests users`): the subject's home carries `owner=user:<n>#<uid>`, the owner lists it, and the
+/// store's other existing user is refused the list by the ACL (`-EACCES`); no other user → that probe SKIPs.
+#[cfg(all(feature = "unafs", feature = "loginst"))]
+fn homepriv_fixture() {
+    use crate::fs::vfs::VfsError;
+    let mt = crate::shell::vfs_mount_table();
+    if mt.volume_name("/").ok().as_deref() != Some("native") {
+        serial_println!(":: HOMEPRIV: root=fat home_owner=n/a -> SKIP (a FAT root carries no owner row, SO35) ::");
+        return;
+    }
+    let names: alloc::vec::Vec<alloc::vec::Vec<u8>> = {
+        let t = TABLE.lock();
+        (0..t.count as usize).map(|i| t.rows[i].name().to_vec()).filter(|n| n.as_slice() != ROOT_NAME).collect()
+    };
+    let mut nb = [0u8; NAME_MAX];
+    let session = whoami(&mut nb).map(|n| nb[..n].to_vec()).filter(|n| id_of(n).is_some());
+    let subj = session
+        .or_else(|| names.iter().find(|n| n.as_slice() == b"una").cloned())
+        .or_else(|| names.first().cloned());
+    let Some(subj) = subj else {
+        serial_println!(":: HOMEPRIV: home_owner=n/a -> SKIP (no user in the store) ::");
+        return;
+    };
+    let leaf = core::str::from_utf8(&subj).unwrap_or("?");
+    let home = alloc::format!("{}/{}", HOME_ROOT, leaf);
+    let ensured = ensure_home(&subj).is_ok();
+    let want = home_principal(&subj);
+    let row = home_owner_of(&mt, &home).ok().flatten();
+    let owned = row.is_some() && row == want;
+    let uid = row.as_deref().map(home_owner_uid).unwrap_or("none");
+    let self_list = want.as_deref().map(|p| mt.list_as(&home, p).is_ok()).unwrap_or(false);
+    let other = names.iter().find(|n| n.as_slice() != subj.as_slice());
+    let (cross, cross_ok) = match other {
+        None => (alloc::string::String::from("list as <other> -> SKIP(no-second-user)"), true),
+        Some(o) => {
+            let on = core::str::from_utf8(o).unwrap_or("?");
+            match home_principal(o) {
+                None => (alloc::format!("list as {} -> SKIP(no-uid)", on), true),
+                Some(op) => match mt.list_as(&home, &op) {
+                    Err(VfsError::Denied) => (alloc::format!("list as {} -> EACCES", on), true),
+                    Ok(_) => (alloc::format!("list as {} -> ADMITTED", on), false),
+                    Err(e) => (alloc::format!("list as {} -> {:?}", on, e), false),
+                },
+            }
+        }
+    };
+    let pass = ensured && owned && self_list && cross_ok;
+    serial_println!(
+        ":: HOMEPRIV: home=/home/{} home_owner={} self_list={} {} -> {} :: row={} ensured={} ::",
+        leaf,
+        uid,
+        if self_list { "ok" } else { "REFUSED" },
+        cross,
+        if pass { "PASS" } else { "FAIL" },
+        row.as_deref().unwrap_or("none"),
+        ensured,
+    );
+}
