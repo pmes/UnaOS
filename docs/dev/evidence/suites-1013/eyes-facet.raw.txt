@@ -1,0 +1,49 @@
+eyes: build: cargo build --release -q -p facet --bin facet
+eyes: chromium oracle could not start `node`: No such file or directory (os error 2) (no reference frames this run)
+card-actual@chromium       ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-zoom400@chromium      ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-rotate90@chromium     ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-fliph@chromium        ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+photo-o6@chromium          ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+photo-o5@chromium          ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-crop@chromium         ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-adjust@chromium       ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-resize@chromium       ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-fit@chromium          ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-pan@chromium          ssim 0.000  mismatch 100.0%  (0.1s)  [no reference frame]
+card-actual                ssim 1.000  mismatch   0.0%  (0.1s)
+card-zoom400               ssim 1.000  mismatch   0.0%  (0.1s)
+card-rotate90              ssim 1.000  mismatch   0.0%  (0.1s)
+card-fliph                 ssim 1.000  mismatch   0.0%  (0.1s)
+photo-o6                   ssim 1.000  mismatch   0.0%  (0.1s)
+photo-o5                   ssim 1.000  mismatch   0.0%  (0.1s)
+card-crop                  ssim 1.000  mismatch   0.0%  (0.1s)
+card-adjust                ssim 1.000  mismatch   0.0%  (0.1s)
+card-resize                ssim 1.000  mismatch   0.0%  (0.1s)
+card-fit                   ssim 1.000  mismatch   0.0%  (0.1s)
+card-pan                   ssim 1.000  mismatch   0.0%  (0.1s)
+eyes: wrote /home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/tools/eyes/out/facet/SCORE.md
+card-actual                ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-actual@chromium       REGRESSED ssim 1.000 -> 0.000
+card-adjust                ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-adjust@chromium       REGRESSED ssim 1.000 -> 0.000
+card-crop                  ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-crop@chromium         REGRESSED ssim 1.000 -> 0.000
+card-fit                   ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-fit@chromium          REGRESSED ssim 1.000 -> 0.000
+card-fliph                 ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-fliph@chromium        REGRESSED ssim 1.000 -> 0.000
+card-pan                   ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-pan@chromium          REGRESSED ssim 1.000 -> 0.000
+card-resize                ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-resize@chromium       REGRESSED ssim 0.995 -> 0.000
+card-rotate90              ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-rotate90@chromium     REGRESSED ssim 1.000 -> 0.000
+card-zoom400               ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+card-zoom400@chromium      REGRESSED ssim 1.000 -> 0.000
+photo-o5                   ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+photo-o5@chromium          REGRESSED ssim 1.000 -> 0.000
+photo-o6                   ok  ssim 1.000 -> 1.000  mismatch 0.0% -> 0.0%
+photo-o6@chromium          REGRESSED ssim 1.000 -> 0.000
+gate: RED — 11 case(s) regressed past /home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/tools/eyes/suites/facet/baseline.json (ssim_drop 0.02, mismatch_rise 2)
+rc=1 wall=1s

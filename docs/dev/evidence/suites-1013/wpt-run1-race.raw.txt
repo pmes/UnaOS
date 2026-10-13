@@ -1,0 +1,555 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling autocfg v1.5.1
+   Compiling cfg-if v1.0.5
+   Compiling crossbeam-utils v0.8.23
+   Compiling smallvec v1.16.2
+   Compiling memchr v2.8.3
+   Compiling version_check v0.9.5
+   Compiling arrayvec v0.7.8
+   Compiling simd-adler32 v0.3.10
+   Compiling log v0.4.34
+   Compiling adler2 v2.0.1
+   Compiling crc32fast v1.5.2
+   Compiling crossbeam-epoch v0.9.21
+   Compiling anyhow v1.0.104
+   Compiling bitflags v2.13.2
+   Compiling crossbeam-deque v0.8.8
+   Compiling paste v1.0.15
+   Compiling rayon-core v1.13.0
+   Compiling pin-project-lite v0.2.17
+   Compiling zerocopy v0.8.59
+   Compiling miniz_oxide v0.9.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling serde_core v1.0.229
+   Compiling parking_lot_core v0.9.12
+   Compiling thiserror v2.0.21
+   Compiling either v1.18.0
+   Compiling as-slice v0.2.1
+   Compiling miniz_oxide v0.8.9
+   Compiling float-cmp v0.9.0
+   Compiling slotmap v1.1.1
+   Compiling scopeguard v1.2.0
+   Compiling zmij v1.0.23
+   Compiling libm v0.2.16
+   Compiling num-traits v0.2.19
+   Compiling parking v2.2.1
+   Compiling built v0.8.1
+   Compiling quick-error v2.0.1
+   Compiling av-scenechange v0.14.1
+   Compiling once_cell v1.21.4
+   Compiling event-listener v5.4.2
+   Compiling nom v8.0.0
+   Compiling no_std_io2 v0.9.4
+   Compiling strict-num v0.1.1
+   Compiling lock_api v0.4.14
+   Compiling aligned v0.4.3
+   Compiling pulp v0.22.3
+   Compiling polycool v0.4.0
+   Compiling fdeflate v0.3.7
+   Compiling pastey v0.1.1
+   Compiling futures-core v0.3.34
+   Compiling serde_json v1.0.154
+   Compiling arrayref v0.3.9
+   Compiling flate2 v1.1.10
+   Compiling utf8parse v0.2.2
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+   Compiling y4m v0.8.0
+   Compiling rav1e v0.8.1
+   Compiling roxmltree v0.20.0
+   Compiling weezl v0.1.12
+   Compiling serde v1.0.229
+   Compiling zune-core v0.5.3
+   Compiling simd_helpers v0.1.0
+   Compiling anstyle-parse v1.0.0
+   Compiling num-integer v0.1.47
+   Compiling errno v0.3.14
+   Compiling png v0.18.1
+   Compiling zune-jpeg v0.5.15
+   Compiling socket2 v0.6.5
+   Compiling signal-hook-registry v1.4.8
+   Compiling memmap2 v0.9.11
+   Compiling mio v1.2.4
+   Compiling num-bigint v0.4.8
+   Compiling parking_lot v0.12.5
+   Compiling concurrent-queue v2.5.0
+   Compiling fontconfig-parser v0.5.8
+   Compiling kurbo v0.13.1
+   Compiling event-listener-strategy v0.5.4
+   Compiling bitstream-io v4.10.0
+   Compiling itertools v0.14.0
+   Compiling rayon v1.12.0
+   Compiling raw-cpuid v11.6.0
+   Compiling maybe-rayon v0.1.1
+   Compiling colorchoice v1.0.5
+   Compiling tinyvec v1.13.3
+   Compiling raw_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/raw_core)
+   Compiling new_debug_unreachable v1.0.6
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/crypto_core)
+   Compiling iana-time-zone v0.1.65
+   Compiling pulp-wasm-simd-flag v0.1.1
+   Compiling reborrow v0.5.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling vp8_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/vp8_core)
+   Compiling elf_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/elf_core)
+   Compiling itoa v1.0.18
+   Compiling noop_proc_macro v0.3.0
+   Compiling anstyle v1.0.14
+   Compiling imgref v1.12.3
+   Compiling bytes v1.12.1
+   Compiling byteorder-lite v0.1.0
+   Compiling num-rational v0.4.2
+   Compiling anstyle-query v1.1.5
+   Compiling siphasher v1.0.4
+   Compiling color_quant v1.1.0
+   Compiling anstream v1.0.0
+   Compiling image-webp v0.2.4
+   Compiling svgtypes v0.16.1
+   Compiling tls_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/tls_core)
+   Compiling gif v0.14.2
+   Compiling loop9 v0.1.5
+   Compiling pixel_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/pixel_core)
+   Compiling type_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/type_core)
+   Compiling fontdb v0.24.0
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling chrono v0.4.45
+   Compiling bytemuck_derive v1.12.1
+   Compiling thiserror-impl v2.0.21
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling futures-macro v0.3.34
+   Compiling tokio v1.53.2
+   Compiling async-channel v2.5.0
+   Compiling roxmltree v0.21.1
+   Compiling avif-serialize v0.8.9
+   Compiling simplecss v0.2.2
+   Compiling zune-inflate v0.2.54
+   Compiling futures-task v0.3.34
+   Compiling bytemuck v1.25.2
+   Compiling heck v0.5.0
+   Compiling lebe v0.5.3
+   Compiling equator-macro v0.4.2
+   Compiling zerocopy-derive v0.8.59
+   Compiling font-types v0.12.6
+   Compiling arg_enum_proc_macro v0.3.4
+   Compiling profiling-procmacros v1.0.18
+   Compiling tiny-skia-path v0.12.0
+   Compiling num-complex v0.4.6
+   Compiling profiling v1.0.18
+   Compiling rgb v0.8.53
+   Compiling equator v0.4.2
+   Compiling read-fonts v0.41.0
+   Compiling num-derive v0.4.2
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/text/font_core)
+   Compiling html_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/html_core)
+   Compiling slab v0.4.12
+   Compiling aligned-vec v0.6.4
+   Compiling fax v0.2.7
+   Compiling pxfm v0.1.30
+   Compiling v_frame v0.3.9
+   Compiling demux_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/demux_core)
+   Compiling clap_lex v1.1.1
+   Compiling data-url v0.3.2
+   Compiling av1-grain v0.2.5
+   Compiling base64 v0.23.1
+   Compiling bit_field v0.10.3
+   Compiling strsim v0.11.1
+   Compiling unicode-bidi v0.3.18
+   Compiling unicode-script v0.5.8
+   Compiling imagesize v0.15.0
+   Compiling pico-args v0.5.0
+   Compiling option-ext v0.2.0
+   Compiling psl_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/net/psl_core)
+   Compiling unicode-vo v0.1.0
+   Compiling xmlwriter v0.1.0
+   Compiling dirs-sys v0.5.0
+   Compiling clap_builder v4.6.7
+   Compiling audio_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/audio_core)
+   Compiling http_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/net/http_core)
+   Compiling futures-util v0.3.34
+   Compiling tiny-skia v0.12.0
+   Compiling clap_derive v4.6.7
+   Compiling qoi v0.4.1
+   Compiling taffy v0.15.0
+   Compiling moxcms v0.8.1
+   Compiling css_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/css_core)
+   Compiling text_host v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/libs/text_host)
+   Compiling directories v6.0.0
+   Compiling kvstore_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/fs/kvstore_core)
+   Compiling js_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/js_core)
+   Compiling clap v4.6.7
+   Compiling half v2.7.1
+warning: `tls_core` (lib) generated 1 warning
+   Compiling layout_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/layout_core)
+   Compiling tiff v0.11.3
+   Compiling exr v1.74.2
+warning: unreachable pattern
+    --> unaos/libs/web/layout_core/src/css.rs:1408:9
+     |
+1359 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1408 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling bandy v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/libs/bandy)
+   Compiling ravif v0.13.0
+   Compiling harfrust v0.12.0
+warning: field `is_arrow` is never read
+  --> unaos/libs/web/js_core/src/parser/mod.rs:65:9
+   |
+50 | pub(crate) struct Ctx {
+   |                   --- field in this struct
+...
+65 |     pub is_arrow: bool,
+   |         ^^^^^^^^
+   |
+   = note: `Ctx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Params` is never constructed
+  --> unaos/libs/web/js_core/src/parser/mod.rs:86:5
+   |
+77 | pub(crate) enum ScopeKind {
+   |                 --------- variant in this enum
+...
+86 |     Params,
+   |     ^^^^^^
+   |
+   = note: `ScopeKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `ui` is never read
+   --> unaos/libs/web/js_core/src/regexp/parser.rs:215:5
+    |
+202 | struct P<'a> {
+    |        - field in this struct
+...
+215 |     ui: bool,
+    |     ^^
+
+warning: field `is_switch` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:44:48
+   |
+44 |     Target { labels: Vec<Atom>, is_loop: bool, is_switch: bool, breaks: Vec<usize>, continues: Vec<usize>, scope: u32, labelled_only...
+   |     ------ field in this variant               ^^^^^^^^^
+
+warning: field `kind` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:65:9
+   |
+55 | pub(crate) struct FnState {
+   |                   ------- field in this struct
+...
+65 |     pub kind: FnKind,
+   |         ^^^^
+
+warning: enum `Flow` is never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:13:6
+   |
+13 | enum Flow {
+   |      ^^^^
+
+warning: methods `fr` and `frm` are never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:29:8
+   |
+19 | impl Vm {
+   | ------- methods in this implementation
+...
+29 |     fn fr(&self) -> &Frame {
+   |        ^^
+...
+33 |     fn frm(&mut self) -> &mut Frame {
+   |        ^^^
+
+   Compiling skrifa v0.44.0
+warning: `layout_core` (lib) generated 1 warning
+   Compiling image v0.25.10
+   Compiling gneiss_pal v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/libs/gneiss_pal)
+   Compiling usvg v0.48.1
+   Compiling resvg v0.48.1
+   Compiling aether v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/handlers/aether)
+warning: `js_core` (lib) generated 7 warnings
+warning: field `timer_count` is never read
+   --> handlers/aether/src/js/mod.rs:258:9
+    |
+189 | pub(crate) struct PageState {
+    |                   --------- field in this struct
+...
+258 |     pub timer_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aether` (lib) generated 1 warning
+warning: use of deprecated method `aether::AetherEngine::load_url`: use aether::net::fetch_document and engine.load_html instead to prevent borrow panics
+  --> handlers/aether/src/main.rs:73:48
+   |
+73 |                         if let Err(e) = engine.load_url(&url).await {
+   |                                                ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: `aether` (bin "aether") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 1m 34s
+     Running tests/wpt_dom.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/release/build/aether/33d6b249f6bb11e3/out/wpt_dom-33d6b249f6bb11e3)
+
+running 12 tests
+fatal: cannot copy '/usr/share/git-core/templates/description' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/description': File exists
+fatal: cannot copy '/usr/share/git-core/templates/description' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/description': File exists
+fatal: cannot copy '/usr/share/git-core/templates/description' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/description': File exists
+wpt dom/lists: skipped (no checkout, offline)
+wpt dom/nodes: skipped (no checkout, offline)
+test wpt_dom_lists ... ok
+wpt dom/events: skipped (no checkout, offline)
+test wpt_dom_nodes ... ok
+test wpt_dom_events ... ok
+fatal: cannot copy '/usr/share/git-core/templates/hooks/applypatch-msg.sample' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/hooks/applypatch-msg.sample': File exists
+fatal: cannot copy '/usr/share/git-core/templates/hooks/applypatch-msg.sample' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/hooks/applypatch-msg.sample': File exists
+fatal: cannot copy '/usr/share/git-core/templates/hooks/applypatch-msg.sample' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/hooks/applypatch-msg.sample': File exists
+wpt dom/ranges: skipped (no checkout, offline)
+wpt eventsource: skipped (no checkout, offline)
+wpt dom/traversal: skipped (no checkout, offline)
+test wpt_dom_ranges ... ok
+test wpt_eventsource ... ok
+test wpt_dom_traversal ... ok
+fatal: cannot copy '/usr/share/git-core/templates/info/exclude' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/info/exclude': File exists
+fatal: cannot copy '/usr/share/git-core/templates/info/exclude' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/info/exclude': File exists
+fatal: cannot copy '/usr/share/git-core/templates/info/exclude' to '/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/info/exclude': File exists
+wpt html/webappapis: skipped (no checkout, offline)
+wpt dom/collections: skipped (no checkout, offline)
+wpt html/dom: skipped (no checkout, offline)
+test wpt_html_webappapis ... ok
+test wpt_dom_collections ... ok
+test wpt_html_dom ... ok
+error: could not lock config file /home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/wpt/.git/config: File exists
+fatal: could not set 'core.repositoryformatversion' to '0'
+error: could not lock config file .git/config: File exists
+wpt xhr: skipped (no checkout, offline)
+test wpt_xhr ... ok
+wpt html/semantics/forms: skipped (no checkout, offline)
+test wpt_html_semantics_forms ... ok
+wpt websockets/Close-1000-reason.any.js?default                         1/1    OK
+wpt websockets/Close-1000-verify-code.any.js?default                    1/1    OK
+wpt websockets/Close-1000.any.js?default                                1/1    OK
+wpt websockets/Close-1005-verify-code.any.js?default                    1/1    OK
+wpt websockets/Close-1005.any.js?default                                1/1    OK
+wpt websockets/Close-2999-reason.any.js?default                         1/1    OK
+wpt websockets/Close-3000-reason.any.js?default                         1/1    OK
+wpt websockets/Close-3000-verify-code.any.js?default                    1/1    OK
+wpt websockets/Close-4999-reason.any.js?default                         1/1    OK
+wpt websockets/Close-Reason-124Bytes.any.js?default                     1/1    OK
+wpt websockets/Close-delayed.any.js?default                             1/1    OK
+wpt websockets/Close-onlyReason.any.js?default                          1/1    OK
+wpt websockets/Close-readyState-Closed.any.js?default                   1/1    OK
+wpt websockets/Close-readyState-Closing.any.js?default                  1/1    OK
+wpt websockets/Close-reason-unpaired-surrogates.any.js?default          1/1    OK
+wpt websockets/Close-server-initiated-close.any.js?default              1/1    OK
+wpt websockets/Close-undefined.any.js?default                           1/1    OK
+wpt websockets/Create-asciiSep-protocol-string.any.js?default           1/1    OK
+wpt websockets/Create-blocked-port.any.js?default                      84/84   OK
+wpt websockets/Create-extensions-empty.any.js?default                   1/1    OK
+wpt websockets/Create-http-urls.any.js                                  1/1    OK
+wpt websockets/Create-invalid-urls.any.js                               8/8    OK
+wpt websockets/Create-non-absolute-url.any.js                           5/5    OK
+wpt websockets/Create-nonAscii-protocol-string.any.js?default           1/1    OK
+wpt websockets/Create-protocol-with-space.any.js?default                1/1    OK
+wpt websockets/Create-protocols-repeated-case-insensitive.any.js?default    1/1    OK
+wpt websockets/Create-protocols-repeated.any.js?default                 1/1    OK
+wpt websockets/Create-url-with-space.any.js?default                     1/1    OK
+wpt websockets/Create-url-with-windows-1252-encoding.html               1/1    OK
+wpt websockets/Create-valid-url-array-protocols.any.js?default          1/1    OK
+wpt websockets/Create-valid-url-binaryType-blob.any.js?default          1/1    OK
+wpt websockets/Create-valid-url-protocol-empty.any.js?default           1/1    OK
+wpt websockets/Create-valid-url-protocol-setCorrectly.any.js?default    1/1    OK
+wpt websockets/Create-valid-url-protocol-string.any.js?default          1/1    OK
+wpt websockets/Create-valid-url-protocol.any.js?default                 1/1    OK
+wpt websockets/Create-valid-url.any.js?default                          1/1    OK
+wpt websockets/Send-0byte-data.any.js?default                           1/1    OK
+wpt websockets/Send-65K-data.any.js?default                             1/1    OK
+wpt websockets/Send-before-open.any.js?default                          1/1    OK
+wpt websockets/Send-binary-65K-arraybuffer.any.js?default               1/1    OK
+wpt websockets/Send-binary-arraybuffer.any.js?default                   1/1    OK
+wpt websockets/Send-binary-arraybufferview-float16.any.js?default       1/1    OK
+wpt websockets/Send-binary-arraybufferview-float32.any.js?default       1/1    OK
+wpt websockets/Send-binary-arraybufferview-float64.any.js?default       1/1    OK
+wpt websockets/Send-binary-arraybufferview-int16-offset.any.js?default    1/1    OK
+wpt websockets/Send-binary-arraybufferview-int32.any.js?default         1/1    OK
+wpt websockets/Send-binary-arraybufferview-int8.any.js?default          1/1    OK
+wpt websockets/Send-binary-arraybufferview-uint16-offset-length.any.js?default    1/1    OK
+wpt websockets/Send-binary-arraybufferview-uint32-offset.any.js?default    1/1    OK
+wpt websockets/Send-binary-arraybufferview-uint8-offset-length.any.js?default    1/1    OK
+wpt websockets/Send-binary-arraybufferview-uint8-offset.any.js?default    1/1    OK
+wpt websockets/Send-binary-blob.any.js?default                          1/1    OK
+wpt websockets/Send-data.any.js?default                                 1/1    OK
+wpt websockets/Send-null.any.js?default                                 1/1    OK
+wpt websockets/Send-paired-surrogates.any.js?default                    1/1    OK
+wpt websockets/Send-unicode-data.any.js?default                         1/1    OK
+wpt websockets/Send-unpaired-surrogates.any.js?default                  1/1    OK
+wpt websockets/binary/001.html?default                                  1/1    OK
+wpt websockets/binary/002.html?default                                  1/1    OK
+wpt websockets/binary/004.html?default                                  1/1    OK
+wpt websockets/binary/005.html?default                                  1/1    OK
+wpt websockets/binaryType-wrong-value.any.js?default                    1/1    OK
+wpt websockets/bufferedAmount-unchanged-by-sync-xhr.any.js?default      1/1    OK
+wpt websockets/close-invalid.any.js?default                             6/6    OK
+wpt websockets/closing-handshake/002.html?default                       1/1    OK
+wpt websockets/closing-handshake/003.html?default                       1/1    OK
+wpt websockets/closing-handshake/004.html?default                       1/1    OK
+wpt websockets/constructor.any.js?default                               1/1    OK
+wpt websockets/constructor/001.html?default                             1/1    OK
+wpt websockets/constructor/004.html?default                           161/161  OK
+wpt websockets/constructor/005.html?default                             1/1    OK
+wpt websockets/constructor/006.html?default                             1/1    OK
+wpt websockets/constructor/007.html?default                             1/1    OK
+wpt websockets/constructor/008.html?default                             4/4    OK
+wpt websockets/constructor/009.html?default                             1/1    OK
+wpt websockets/constructor/010.html?default                             1/1    OK
+wpt websockets/constructor/011.html?default                             1/1    OK
+wpt websockets/constructor/012.html?default                             1/1    OK
+wpt websockets/constructor/013.html?default                             1/1    OK
+wpt websockets/constructor/014.html?default                             1/1    OK
+wpt websockets/constructor/017.html?default                             2/2    OK
+wpt websockets/constructor/018.html?default                             1/1    OK
+wpt websockets/constructor/019.html?default                             1/1    OK
+wpt websockets/constructor/020.html?default                             1/1    OK
+wpt websockets/constructor/021.html?default                             1/1    OK
+wpt websockets/constructor/022.html?default                             1/1    OK
+wpt websockets/constructor/option-bag.any.js?default                    2/2    OK
+wpt websockets/constructor/target-address-space.any.js?default          6/6    OK
+wpt websockets/constructor/third-param-ignored.any.js?default           3/3    OK
+wpt websockets/cookies/001.html?default                                 1/1    OK
+wpt websockets/cookies/002.html?default                                 1/1    OK
+wpt websockets/cookies/006.html?default                                 0/1    OK
+    FAIL WebSockets: setting Secure cookie with document.cookie, checking ws request: assert_false: cookie should not have been visible to ws expected false got true
+wpt websockets/cookies/007.html?default                                 1/1    OK
+wpt websockets/eventhandlers.any.js?default                             4/4    OK
+wpt websockets/extended-payload-length.html?default                     4/4    OK
+wpt websockets/interfaces/CloseEvent/clean-close.html?default           1/1    OK
+wpt websockets/interfaces/CloseEvent/constructor.html                   2/2    OK
+wpt websockets/interfaces/CloseEvent/historical.html                    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-arraybuffer.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-blob.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-defineProperty-getter.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-defineProperty-setter.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-deleting.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-getting.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-initial.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-large.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-readonly.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-unicode.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/close/close-basic.html?default      1/1    OK
+wpt websockets/interfaces/WebSocket/close/close-connecting-async.any.js?default    1/1    OK
+wpt websockets/interfaces/WebSocket/close/close-multiple.html?default    0/1    harness did not complete
+wpt websockets/interfaces/WebSocket/close/close-nested.html?default     1/1    OK
+wpt websockets/interfaces/WebSocket/close/close-replace.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/close/close-return.html?default     1/1    OK
+wpt websockets/interfaces/WebSocket/constants/001.html?default          4/4    OK
+wpt websockets/interfaces/WebSocket/constants/002.html?default          4/4    OK
+wpt websockets/interfaces/WebSocket/constants/003.html?default          4/4    OK
+wpt websockets/interfaces/WebSocket/constants/004.html?default          8/8    OK
+wpt websockets/interfaces/WebSocket/constants/005.html?default          4/4    OK
+wpt websockets/interfaces/WebSocket/constants/006.html?default          4/4    OK
+wpt websockets/interfaces/WebSocket/events/001.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/002.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/003.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/004.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/006.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/007.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/008.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/009.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/010.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/011.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/012.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/013.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/014.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/015.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/016.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/017.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/018.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/events/019.html?default             4/4    OK
+wpt websockets/interfaces/WebSocket/events/020.html?default             1/1    OK
+wpt websockets/interfaces/WebSocket/extensions/001.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/protocol/protocol-initial.html?default    1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/001.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/002.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/003.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/004.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/005.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/006.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/007.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/readyState/008.html?default         1/1    OK
+wpt websockets/interfaces/WebSocket/send/001.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/002.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/003.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/004.html?default               3/3    OK
+wpt websockets/interfaces/WebSocket/send/005.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/006.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/007.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/008.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/009.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/010.html?default              11/11   OK
+wpt websockets/interfaces/WebSocket/send/011.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/send/012.html?default               1/1    OK
+wpt websockets/interfaces/WebSocket/url/001.html?default                1/1    OK
+wpt websockets/interfaces/WebSocket/url/003.html?default                1/1    OK
+wpt websockets/interfaces/WebSocket/url/004.html?default                1/1    OK
+wpt websockets/interfaces/WebSocket/url/005.html?default                1/1    OK
+wpt websockets/interfaces/WebSocket/url/006.html?default                1/1    OK
+wpt websockets/interfaces/WebSocket/url/resolve.html?default            1/1    OK
+test wpt_websockets has been running for over 60 seconds
+wpt websockets/keeping-connection-open/001.html?default                 0/1    harness did not complete
+wpt websockets/multi-globals/message-received.html                      0/2    OK
+    FAIL ArrayBuffer should be created in the relevant realm of the WebSocket: assert_equals: expected function "function ArrayBuffer() { [native code] }" but got function "function String() { [native code] }"
+    FAIL Blob should be created in the relevant realm of the WebSocket: assert_equals: expected function "class Blob {
+            constructor(parts, opts) {
+                var chunks = [];
+                if (parts !== undefined) {
+                    if (parts === null
+wpt websockets/multi-globals/url-parsing/url-parsing.html               0/1    OK
+    FAIL Multiple globals for base URL in WebSocket constructor: assert_equals: expected "ws://127.0.0.1:45667/websockets/multi-globals/url-parsing/current/foo" but got "ws://127.0.0.1:45667/websockets/multi-globals/url-parsing/foo"
+wpt websockets/opening-handshake/001.html?default                       1/1    OK
+wpt websockets/opening-handshake/002.html?default                       1/1    OK
+wpt websockets/opening-handshake/005.html?default                       1/1    OK
+wpt websockets/referrer.any.js                                          1/1    OK
+wpt websockets/security/001.html?default                                1/1    OK
+wpt websockets/send-data-isolation.sub.html                             3/3    OK
+wpt websockets/unload-a-document/003.html                               0/1    OK
+    FAIL WebSockets: navigating nested browsing context: assert_unreached: document was not discarded Reached unreachable code
+wpt websockets/unload-a-document/004.html                               0/1    harness did not complete
+wpt websockets (served 178 test pages): 509/517 subtests (98.5%)
+wpt websockets: 345 test pages skipped (the stand-in cannot serve them):
+  skipped for WebSocketStream (not this arc) (5): websockets/stream/tentative/close.any.js?default websockets/stream/tentative/read.any.js?default websockets/stream/tentative/remote-close.any.js?default websockets/stream/tentative/websocket-error.any.js websockets/stream/tentative/write.any.js?default
+  skipped for an IDN subdomain of the test host (needs web-platform.test DNS) (1): websockets/opening-handshake/003.html?default
+  skipped for bfcache / remote browsing contexts (6): websockets/back-forward-cache-closes-open-websocket-connection.tentative.window.js websockets/back-forward-cache-with-closed-websocket-connection-ccns.tentative.window.js websockets/back-forward-cache-with-closed-websocket-connection.window.js websockets/back-forward-cache-with-open-websocket-connection-and-close-it-in-pagehide.window.js websockets/back-forward-cache-with-open-websocket-connection-ccns.tentative.window.js websockets/back-forward-cache-with-open-websocket-connection.window.js
+  skipped for cross-origin (no second origin with CORS in the stand-in) (1): websockets/cookies/cross-origin-cookie-set.html
+  skipped for frames / browsing contexts / document.domain (3): websockets/unload-a-document/001.html?default websockets/unload-a-document/002.html?default websockets/unload-a-document/005.html?default
+  skipped for idlharness (interfaces/*.idl are not in the checkout) (1): websockets/idlharness.any.js
+  skipped for needs a TLS server (https / h2) (2): websockets/cookies/third-party-cookie-accepted.https.html websockets/mixed-content.https.any.js
+  skipped for needs a TLS server (wss / h2 variant) (313): websockets/Close-1000-reason.any.js?wss websockets/Close-1000-reason.any.js?wpt_flags=h2 websockets/Close-1000-verify-code.any.js?wss websockets/Close-1000-verify-code.any.js?wpt_flags=h2 websockets/Close-1000.any.js?wss websockets/Close-1000.any.js?wpt_flags=h2 websockets/Close-1005-verify-code.any.js?wss websockets/Close-1005-verify-code.any.js?wpt_flags=h2 websockets/Close-1005.any.js?wss websockets/Close-1005.any.js?wpt_flags=h2 websockets/Close-2999-reason.any.js?wss websockets/Close-2999-reason.any.js?wpt_flags=h2 websockets/Close-3000-reason.any.js?wss websockets/Close-3000-reason.any.js?wpt_flags=h2 websockets/Close-3000-verify-code.any.js?wss websockets/Close-3000-verify-code.any.js?wpt_flags=h2 websockets/Close-4999-reason.any.js?wss websockets/Close-4999-reason.any.js?wpt_flags=h2 websockets/Close-Reason-124Bytes.any.js?wpt_flags=h2 websockets/Close-Reason-124Bytes.any.js?wss websockets/Close-delayed.any.js?wss websockets/Close-delayed.any.js?wpt_flags=h2 websockets/Close-onlyReason.any.js?wss websockets/Close-onlyReason.any.js?wpt_flags=h2 websockets/Close-readyState-Closed.any.js?wss websockets/Close-readyState-Closed.any.js?wpt_flags=h2 websockets/Close-readyState-Closing.any.js?wss websockets/Close-readyState-Closing.any.js?wpt_flags=h2 websockets/Close-reason-unpaired-surrogates.any.js?wss websockets/Close-reason-unpaired-surrogates.any.js?wpt_flags=h2 websockets/Close-server-initiated-close.any.js?wpt_flags=h2 websockets/Close-server-initiated-close.any.js?wss websockets/Close-undefined.any.js?wpt_flags=h2 websockets/Close-undefined.any.js?wss websockets/Create-asciiSep-protocol-string.any.js?wss websockets/Create-asciiSep-protocol-string.any.js?wpt_flags=h2 websockets/Create-blocked-port.any.js?wss websockets/Create-blocked-port.any.js?wpt_flags=h2 websockets/Create-extensions-empty.any.js?wpt_flags=h2 websockets/Create-extensions-empty.any.js?wss websockets/Create-nonAscii-protocol-string.any.js?wss websockets/Create-nonAscii-protocol-string.any.js?wpt_flags=h2 websockets/Create-protocol-with-space.any.js?wpt_flags=h2 websockets/Create-protocol-with-space.any.js?wss websockets/Create-protocols-repeated-case-insensitive.any.js?wss websockets/Create-protocols-repeated-case-insensitive.any.js?wpt_flags=h2 websockets/Create-protocols-repeated.any.js?wss websockets/Create-protocols-repeated.any.js?wpt_flags=h2 websockets/Create-url-with-space.any.js?wpt_flags=h2 websockets/Create-url-with-space.any.js?wss websockets/Create-valid-url-array-protocols.any.js?wpt_flags=h2 websockets/Create-valid-url-array-protocols.any.js?wss websockets/Create-valid-url-binaryType-blob.any.js?wpt_flags=h2 websockets/Create-valid-url-binaryType-blob.any.js?wss websockets/Create-valid-url-protocol-empty.any.js?wpt_flags=h2 websockets/Create-valid-url-protocol-empty.any.js?wss websockets/Create-valid-url-protocol-setCorrectly.any.js?wpt_flags=h2 websockets/Create-valid-url-protocol-setCorrectly.any.js?wss websockets/Create-valid-url-protocol-string.any.js?wss websockets/Create-valid-url-protocol-string.any.js?wpt_flags=h2 websockets/Create-valid-url-protocol.any.js?wpt_flags=h2 websockets/Create-valid-url-protocol.any.js?wss websockets/Create-valid-url.any.js?wpt_flags=h2 websockets/Create-valid-url.any.js?wss websockets/Send-0byte-data.any.js?wss websockets/Send-0byte-data.any.js?wpt_flags=h2 websockets/Send-65K-data.any.js?wpt_flags=h2 websockets/Send-65K-data.any.js?wss websockets/Send-before-open.any.js?wss websockets/Send-before-open.any.js?wpt_flags=h2 websockets/Send-binary-65K-arraybuffer.any.js?wpt_flags=h2 websockets/Send-binary-65K-arraybuffer.any.js?wss websockets/Send-binary-arraybuffer.any.js?wpt_flags=h2 websockets/Send-binary-arraybuffer.any.js?wss websockets/Send-binary-arraybufferview-float16.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-float16.any.js?wss websockets/Send-binary-arraybufferview-float32.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-float32.any.js?wss websockets/Send-binary-arraybufferview-float64.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-float64.any.js?wss websockets/Send-binary-arraybufferview-int16-offset.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-int16-offset.any.js?wss websockets/Send-binary-arraybufferview-int32.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-int32.any.js?wss websockets/Send-binary-arraybufferview-int8.any.js?wss websockets/Send-binary-arraybufferview-int8.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-uint16-offset-length.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-uint16-offset-length.any.js?wss websockets/Send-binary-arraybufferview-uint32-offset.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-uint32-offset.any.js?wss websockets/Send-binary-arraybufferview-uint8-offset-length.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-uint8-offset-length.any.js?wss websockets/Send-binary-arraybufferview-uint8-offset.any.js?wpt_flags=h2 websockets/Send-binary-arraybufferview-uint8-offset.any.js?wss websockets/Send-binary-blob.any.js?wpt_flags=h2 websockets/Send-binary-blob.any.js?wss websockets/Send-data.any.js?wss websockets/Send-data.any.js?wpt_flags=h2 websockets/Send-data.worker.js?wss websockets/Send-data.worker.js?wpt_flags=h2 websockets/Send-null.any.js?wpt_flags=h2 websockets/Send-null.any.js?wss websockets/Send-paired-surrogates.any.js?wpt_flags=h2 websockets/Send-paired-surrogates.any.js?wss websockets/Send-unicode-data.any.js?wpt_flags=h2 websockets/Send-unicode-data.any.js?wss websockets/Send-unpaired-surrogates.any.js?wss websockets/Send-unpaired-surrogates.any.js?wpt_flags=h2 websockets/basic-auth.any.js?wss websockets/basic-auth.any.js?wpt_flags=h2 websockets/binary/001.html?wss websockets/binary/001.html?wpt_flags=h2 websockets/binary/002.html?wss websockets/binary/002.html?wpt_flags=h2 websockets/binary/004.html?wss websockets/binary/004.html?wpt_flags=h2 websockets/binary/005.html?wss websockets/binary/005.html?wpt_flags=h2 websockets/binaryType-wrong-value.any.js?wss websockets/binaryType-wrong-value.any.js?wpt_flags=h2 websockets/bufferedAmount-unchanged-by-sync-xhr.any.js?wss websockets/bufferedAmount-unchanged-by-sync-xhr.any.js?wpt_flags=h2 websockets/close-invalid.any.js?wss websockets/close-invalid.any.js?wpt_flags=h2 websockets/closing-handshake/002.html?wss websockets/closing-handshake/002.html?wpt_flags=h2 websockets/closing-handshake/003.html?wss websockets/closing-handshake/003.html?wpt_flags=h2 websockets/closing-handshake/004.html?wss websockets/closing-handshake/004.html?wpt_flags=h2 websockets/constructor.any.js?wss websockets/constructor.any.js?wpt_flags=h2 websockets/constructor/001.html?wss websockets/constructor/001.html?wpt_flags=h2 websockets/constructor/004.html?wss websockets/constructor/004.html?wpt_flags=h2 websockets/constructor/005.html?wss websockets/constructor/005.html?wpt_flags=h2 websockets/constructor/006.html?wss websockets/constructor/006.html?wpt_flags=h2 websockets/constructor/007.html?wss websockets/constructor/007.html?wpt_flags=h2 websockets/constructor/008.html?wss websockets/constructor/009.html?wss websockets/constructor/009.html?wpt_flags=h2 websockets/constructor/010.html?wss websockets/constructor/010.html?wpt_flags=h2 websockets/constructor/011.html?wss websockets/constructor/011.html?wpt_flags=h2 websockets/constructor/012.html?wss websockets/constructor/012.html?wpt_flags=h2 websockets/constructor/013.html?wss websockets/constructor/013.html?wpt_flags=h2 websockets/constructor/014.html?wss websockets/constructor/017.html?wss websockets/constructor/017.html?wpt_flags=h2 websockets/constructor/018.html?wss websockets/constructor/018.html?wpt_flags=h2 websockets/constructor/019.html?wss websockets/constructor/019.html?wpt_flags=h2 websockets/constructor/020.html?wss websockets/constructor/020.html?wpt_flags=h2 websockets/constructor/021.html?wss websockets/constructor/021.html?wpt_flags=h2 websockets/constructor/022.html?wss websockets/constructor/022.html?wpt_flags=h2 websockets/constructor/option-bag.any.js?wss websockets/constructor/target-address-space.any.js?wss websockets/constructor/third-param-ignored.any.js?wss websockets/cookies/001.html?wss&wpt_flags=https websockets/cookies/001.html?wpt_flags=h2 websockets/cookies/002.html?wss&wpt_flags=https websockets/cookies/002.html?wpt_flags=h2 websockets/cookies/003.html?wss&wpt_flags=https websockets/cookies/003.html?wpt_flags=h2 websockets/cookies/004.html?wss&wpt_flags=https websockets/cookies/005.html?wss&wpt_flags=https websockets/cookies/006.html?wss&wpt_flags=https websockets/cookies/006.html?wpt_flags=h2 websockets/cookies/007.html?wss&wpt_flags=https websockets/cookies/007.html?wpt_flags=h2 websockets/eventhandlers.any.js?wss websockets/eventhandlers.any.js?wpt_flags=h2 websockets/extended-payload-length.html?wss websockets/extended-payload-length.html?wpt_flags=h2 websockets/interfaces/CloseEvent/clean-close.html?wss websockets/interfaces/CloseEvent/clean-close.html?wpt_flags=h2 websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-arraybuffer.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-arraybuffer.html?wpt_flags=h2 websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-blob.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-blob.html?wpt_flags=h2 websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-defineProperty-getter.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-defineProperty-setter.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-deleting.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-getting.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-getting.html?wpt_flags=h2 websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-initial.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-large.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-large.html?wpt_flags=h2 websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-readonly.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-unicode.html?wss websockets/interfaces/WebSocket/bufferedAmount/bufferedAmount-unicode.html?wpt_flags=h2 websockets/interfaces/WebSocket/close/close-basic.html?wss websockets/interfaces/WebSocket/close/close-connecting-async.any.js?wpt_flags=h2 websockets/interfaces/WebSocket/close/close-connecting-async.any.js?wss websockets/interfaces/WebSocket/close/close-connecting.html?wss websockets/interfaces/WebSocket/close/close-multiple.html?wss websockets/interfaces/WebSocket/close/close-nested.html?wss websockets/interfaces/WebSocket/close/close-replace.html?wss websockets/interfaces/WebSocket/close/close-return.html?wss websockets/interfaces/WebSocket/constants/001.html?wss websockets/interfaces/WebSocket/constants/002.html?wss websockets/interfaces/WebSocket/constants/003.html?wss websockets/interfaces/WebSocket/constants/004.html?wss websockets/interfaces/WebSocket/constants/005.html?wss websockets/interfaces/WebSocket/constants/006.html?wss websockets/interfaces/WebSocket/events/001.html?wss websockets/interfaces/WebSocket/events/001.html?wpt_flags=h2 websockets/interfaces/WebSocket/events/002.html?wss websockets/interfaces/WebSocket/events/002.html?wpt_flags=h2 websockets/interfaces/WebSocket/events/003.html?wss websockets/interfaces/WebSocket/events/004.html?wss websockets/interfaces/WebSocket/events/006.html?wss websockets/interfaces/WebSocket/events/007.html?wss websockets/interfaces/WebSocket/events/007.html?wpt_flags=h2 websockets/interfaces/WebSocket/events/008.html?wss websockets/interfaces/WebSocket/events/009.html?wss websockets/interfaces/WebSocket/events/010.html?wss websockets/interfaces/WebSocket/events/011.html?wss websockets/interfaces/WebSocket/events/012.html?wss websockets/interfaces/WebSocket/events/013.html?wss websockets/interfaces/WebSocket/events/014.html?wss websockets/interfaces/WebSocket/events/015.html?wss websockets/interfaces/WebSocket/events/015.html?wpt_flags=h2 websockets/interfaces/WebSocket/events/016.html?wss websockets/interfaces/WebSocket/events/016.html?wpt_flags=h2 websockets/interfaces/WebSocket/events/017.html?wss websockets/interfaces/WebSocket/events/017.html?wpt_flags=h2 websockets/interfaces/WebSocket/events/018.html?wss websockets/interfaces/WebSocket/events/018.html?wpt_flags=h2 websockets/interfaces/WebSocket/events/019.html?wss websockets/interfaces/WebSocket/events/020.html?wss websockets/interfaces/WebSocket/extensions/001.html?wss websockets/interfaces/WebSocket/protocol/protocol-initial.html?wss websockets/interfaces/WebSocket/readyState/001.html?wss websockets/interfaces/WebSocket/readyState/002.html?wss websockets/interfaces/WebSocket/readyState/003.html?wss websockets/interfaces/WebSocket/readyState/004.html?wss websockets/interfaces/WebSocket/readyState/005.html?wss websockets/interfaces/WebSocket/readyState/006.html?wss websockets/interfaces/WebSocket/readyState/007.html?wss websockets/interfaces/WebSocket/readyState/008.html?wss websockets/interfaces/WebSocket/send/001.html?wss websockets/interfaces/WebSocket/send/002.html?wss websockets/interfaces/WebSocket/send/003.html?wss websockets/interfaces/WebSocket/send/004.html?wss websockets/interfaces/WebSocket/send/005.html?wss websockets/interfaces/WebSocket/send/006.html?wss websockets/interfaces/WebSocket/send/006.html?wpt_flags=h2 websockets/interfaces/WebSocket/send/007.html?wss websockets/interfaces/WebSocket/send/007.html?wpt_flags=h2 websockets/interfaces/WebSocket/send/008.html?wss websockets/interfaces/WebSocket/send/009.html?wss websockets/interfaces/WebSocket/send/009.html?wpt_flags=h2 websockets/interfaces/WebSocket/send/010.html?wss websockets/interfaces/WebSocket/send/011.html?wss websockets/interfaces/WebSocket/send/011.html?wpt_flags=h2 websockets/interfaces/WebSocket/send/012.html?wss websockets/interfaces/WebSocket/send/012.html?wpt_flags=h2 websockets/interfaces/WebSocket/url/001.html?wss websockets/interfaces/WebSocket/url/002.html?wss websockets/interfaces/WebSocket/url/003.html?wss websockets/interfaces/WebSocket/url/004.html?wss websockets/interfaces/WebSocket/url/005.html?wss websockets/interfaces/WebSocket/url/006.html?wss websockets/interfaces/WebSocket/url/resolve.html?wss websockets/keeping-connection-open/001.html?wss websockets/keeping-connection-open/001.html?wpt_flags=h2 websockets/opening-handshake/001.html?wss websockets/opening-handshake/001.html?wpt_flags=h2 websockets/opening-handshake/002.html?wss websockets/opening-handshake/002.html?wpt_flags=h2 websockets/opening-handshake/003.html?wss websockets/opening-handshake/005.html?wss websockets/opening-handshake/006.html?wss websockets/remove-own-iframe-during-onerror.window.js?wss websockets/remove-own-iframe-during-onerror.window.js?wpt_flags=h2 websockets/security/001.html?wss websockets/security/002.html?wss websockets/send-many-64K-messages-with-backpressure.any.js?wss websockets/send-many-64K-messages-with-backpressure.any.js?wpt_flags=h2 websockets/stream/tentative/abort.any.js?wss websockets/stream/tentative/abort.any.js?wpt_flags=h2 websockets/stream/tentative/backpressure-receive.any.js?wss websockets/stream/tentative/backpressure-receive.any.js?wpt_flags=h2 websockets/stream/tentative/backpressure-send.any.js?wss websockets/stream/tentative/backpressure-send.any.js?wpt_flags=h2 websockets/stream/tentative/close.any.js?wss websockets/stream/tentative/close.any.js?wpt_flags=h2 websockets/stream/tentative/constructor.any.js?wss websockets/stream/tentative/constructor.any.js?wpt_flags=h2 websockets/stream/tentative/read.any.js?wss websockets/stream/tentative/read.any.js?wpt_flags=h2 websockets/stream/tentative/remote-close.any.js?wss websockets/stream/tentative/remote-close.any.js?wpt_flags=h2 websockets/stream/tentative/write.any.js?wss websockets/stream/tentative/write.any.js?wpt_flags=h2 websockets/unload-a-document/001.html?wss websockets/unload-a-document/001.html?wpt_flags=h2 websockets/unload-a-document/002.html?wss websockets/unload-a-document/002.html?wpt_flags=h2 websockets/unload-a-document/005.html?wss websockets/unload-a-document/005.html?wpt_flags=h2
+  skipped for needs pywebsocket handler does-not-exist (1): websockets/remove-own-iframe-during-onerror.window.js?default
+  skipped for needs pywebsocket handler invalid1 (1): websockets/opening-handshake/006.html?default
+  skipped for needs pywebsocket handler receive-many-with-backpressure (1): websockets/send-many-64K-messages-with-backpressure.any.js?default
+  skipped for needs pywebsocket handler sleep_10_v13 (1): websockets/interfaces/WebSocket/close/close-connecting.html?default
+  skipped for needs pywebsocket handler test (1): websockets/interfaces/WebSocket/url/002.html?default
+  skipped for needs wptserve handler websockets/cookies/support/set-cookie.py (3): websockets/cookies/003.html?default websockets/cookies/004.html?default websockets/cookies/005.html?default
+  skipped for needs wptserve handler websockets/opening-handshake/resources/redirect_response.py (1): websockets/opening-handshake/received-301-code.html
+  skipped for needs wptserve handler websockets/security/check.py (1): websockets/security/002.html?default
+  skipped for workers (3): websockets/Create-on-worker-shutdown.any.js websockets/Send-data.worker.js?default websockets/opening-handshake/003-sets-origin.worker.js
+test wpt_websockets ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 107.97s
+
+rc=0 wall=202s
+
+[TRUNCATED at 50 KB of 50147 bytes; the remainder is the websockets skip list]

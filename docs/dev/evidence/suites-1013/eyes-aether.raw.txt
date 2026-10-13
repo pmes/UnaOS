@@ -1,0 +1,161 @@
+eyes: build: cargo build --release -q -p aether --bin aether
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `is_arrow` is never read
+  --> unaos/libs/web/js_core/src/parser/mod.rs:65:9
+   |
+50 | pub(crate) struct Ctx {
+   |                   --- field in this struct
+...
+65 |     pub is_arrow: bool,
+   |         ^^^^^^^^
+   |
+   = note: `Ctx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Params` is never constructed
+  --> unaos/libs/web/js_core/src/parser/mod.rs:86:5
+   |
+77 | pub(crate) enum ScopeKind {
+   |                 --------- variant in this enum
+...
+86 |     Params,
+   |     ^^^^^^
+   |
+   = note: `ScopeKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `ui` is never read
+   --> unaos/libs/web/js_core/src/regexp/parser.rs:215:5
+    |
+202 | struct P<'a> {
+    |        - field in this struct
+...
+215 |     ui: bool,
+    |     ^^
+
+warning: field `is_switch` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:44:48
+   |
+44 |     Target { labels: Vec<Atom>, is_loop: bool, is_switch: bool, breaks: Vec<usize>, continues: Vec<usize>, scope: u32, labelled_only...
+   |     ------ field in this variant               ^^^^^^^^^
+
+warning: field `kind` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:65:9
+   |
+55 | pub(crate) struct FnState {
+   |                   ------- field in this struct
+...
+65 |     pub kind: FnKind,
+   |         ^^^^
+
+warning: enum `Flow` is never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:13:6
+   |
+13 | enum Flow {
+   |      ^^^^
+
+warning: methods `fr` and `frm` are never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:29:8
+   |
+19 | impl Vm {
+   | ------- methods in this implementation
+...
+29 |     fn fr(&self) -> &Frame {
+   |        ^^
+...
+33 |     fn frm(&mut self) -> &mut Frame {
+   |        ^^^
+
+warning: unreachable pattern
+    --> unaos/libs/web/layout_core/src/css.rs:1408:9
+     |
+1359 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1408 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `timer_count` is never read
+   --> handlers/aether/src/js/mod.rs:258:9
+    |
+189 | pub(crate) struct PageState {
+    |                   --------- field in this struct
+...
+258 |     pub timer_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated method `aether::AetherEngine::load_url`: use aether::net::fetch_document and engine.load_html instead to prevent borrow panics
+  --> handlers/aether/src/main.rs:73:48
+   |
+73 |                         if let Err(e) = engine.load_url(&url).await {
+   |                                                ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+eyes: chromium oracle could not start `node`: No such file or directory (os error 2) (no reference frames this run)
+01-blog-article            ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+02-flex-two-column         ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+03-card-gallery            ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+04-sticky-nav              ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+05-form                    ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+06-table-zebra             ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+07-images-svg              ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+08-inline-wrap             ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+09-media-queries           ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+09-media-queries@375       ssim 0.000  mismatch 100.0%  missing   0  (0.1s)  [no reference frame]
+10-calc-clamp              ssim 0.000  mismatch 100.0%  missing   0  (0.1s)  [no reference frame]
+10-calc-clamp@375          ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+11-non-latin               ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+12-js-mutation             ssim 0.000  mismatch 100.0%  missing   0  (0.1s)  [no reference frame]
+13-ua-defaults             ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+14-boxes                   ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+15-landing                 ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+16-positioned              ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+17-inline-continue         ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+18-stacking                ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+19-em-units                ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+20-table-spans             ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+21-paint-effects           ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+22-fonts                   ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+25-hover                   ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+27-selection               ssim 0.000  mismatch 100.0%  missing   0  (0.1s)  [no reference frame]
+28-generated               ssim 0.000  mismatch 100.0%  missing   1  (0.2s)  [no reference frame]
+26-controls                ssim 0.000  mismatch 100.0%  missing   0  (0.2s)  [no reference frame]
+eyes: wrote /home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/tools/eyes/out/aether/SCORE.md
+01-blog-article            REGRESSED ssim 0.994 -> 0.000
+02-flex-two-column         REGRESSED ssim 0.999 -> 0.000
+03-card-gallery            REGRESSED ssim 0.999 -> 0.000
+04-sticky-nav              REGRESSED ssim 0.993 -> 0.000
+05-form                    REGRESSED ssim 0.955 -> 0.000
+06-table-zebra             REGRESSED ssim 0.994 -> 0.000
+07-images-svg              REGRESSED ssim 0.940 -> 0.000
+08-inline-wrap             REGRESSED ssim 0.995 -> 0.000
+09-media-queries           REGRESSED ssim 0.998 -> 0.000
+09-media-queries@375       REGRESSED ssim 0.998 -> 0.000
+10-calc-clamp              REGRESSED ssim 0.999 -> 0.000
+10-calc-clamp@375          REGRESSED ssim 0.999 -> 0.000
+11-non-latin               REGRESSED ssim 0.990 -> 0.000
+12-js-mutation             REGRESSED ssim 0.997 -> 0.000
+13-ua-defaults             REGRESSED ssim 0.997 -> 0.000
+14-boxes                   REGRESSED ssim 0.977 -> 0.000
+15-landing                 REGRESSED ssim 0.996 -> 0.000
+16-positioned              REGRESSED ssim 0.999 -> 0.000
+17-inline-continue         REGRESSED ssim 0.993 -> 0.000
+18-stacking                REGRESSED ssim 0.999 -> 0.000
+19-em-units                REGRESSED ssim 0.999 -> 0.000
+20-table-spans             REGRESSED ssim 0.991 -> 0.000
+21-paint-effects           REGRESSED ssim 1.000 -> 0.000
+22-fonts                   REGRESSED ssim 0.992 -> 0.000
+25-hover                   REGRESSED ssim 0.999 -> 0.000
+gate: RED — 25 case(s) regressed past /home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/tools/eyes/suites/aether/baseline.json (ssim_drop 0.02, mismatch_rise 2)
+rc=1 wall=5s
