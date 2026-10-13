@@ -37,7 +37,7 @@ pub mod table;
 mod tree;
 
 pub use map::{Entry, NodeMap};
-pub use paint::{FontWeight, MarkerPaint, PaintStyle};
+pub use paint::{ClipShape, FontWeight, MarkerPaint, PaintStyle, ShapeRadius, TransformOp};
 pub use tree::*;
 
 pub(crate) mod prelude {

@@ -8,6 +8,7 @@
 //! build-time `style=""` pass come from [`Host::custom_prop`]; coverage gaps go to [`Host::record_css`].
 
 use crate::prelude::*;
+use crate::paint::{ClipShape, LenPct, ShapeRadius, TransformOp, IDENTITY};
 use crate::{FontWeight, Host, PaintStyle};
 use taffy::geometry::Rect;
 use taffy::prelude::*;
@@ -84,6 +85,8 @@ pub struct SpecifiedStyle<H: Host> {
     pub flex_grow: Option<f32>,
     pub flex_shrink: Option<f32>,
     pub flex_basis: Option<Dimension>,
+    /// `aspect-ratio` (css-sizing-4 §5): Some(None) = `auto`, Some(Some(w / h)) = a preferred ratio.
+    pub aspect_ratio: Option<Option<f32>>,
     pub paint: PaintStyle<H>,
     /// `cursor` (css-ui-4 §5.1, inherited): the keyword the cascade chose, `auto` included; read
     /// back per element by [`cursor_for`] for the hovered element (AETHERHOVER, SR67).
@@ -331,10 +334,17 @@ impl<H: Host> SpecifiedStyle<H> {
         if let Some(pos) = self.position {
             node_style.position = pos;
         }
-        if let Some(v) = self.inset_top { node_style.inset.top = v; }
-        if let Some(v) = self.inset_left { node_style.inset.left = v; }
-        if let Some(v) = self.inset_right { node_style.inset.right = v; }
-        if let Some(v) = self.inset_bottom { node_style.inset.bottom = v; }
+        if let Some(r) = self.aspect_ratio {
+            node_style.aspect_ratio = r;
+        }
+        // css-position-3 §3.4: a sticky box sits at its normal-flow place; its insets are the sticky
+        // constraint the painter applies (`PaintStyle::inset_px`), not a relative offset.
+        if self.paint.position_kind != Some(4) {
+            if let Some(v) = self.inset_top { node_style.inset.top = v; }
+            if let Some(v) = self.inset_left { node_style.inset.left = v; }
+            if let Some(v) = self.inset_right { node_style.inset.right = v; }
+            if let Some(v) = self.inset_bottom { node_style.inset.bottom = v; }
+        }
         if let Some(j) = self.justify {
             node_style.justify_content = j;
         }
@@ -583,10 +593,101 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.z_index = Some(Some(z));
             }
         }
-        "top" => style.inset_top = parse_length_percentage_auto_str(value, cx),
-        "left" => style.inset_left = parse_length_percentage_auto_str(value, cx),
-        "right" => style.inset_right = parse_length_percentage_auto_str(value, cx),
-        "bottom" => style.inset_bottom = parse_length_percentage_auto_str(value, cx),
+        "top" | "right" | "bottom" | "left" => {
+            let v = parse_length_percentage_auto_str(value, cx);
+            match prop {
+                "top" => style.inset_top = v,
+                "right" => style.inset_right = v,
+                "bottom" => style.inset_bottom = v,
+                _ => style.inset_left = v,
+            }
+            let side = match prop { "top" => 0, "right" => 1, "bottom" => 2, _ => 3 };
+            set_inset_px(style, side, value, cx);
+        }
+        // css-position-3 §3.1: the 1-4 value shorthand of top/right/bottom/left.
+        "inset" => match parse_sides(value, |v| parse_length_percentage_auto_str(v, cx)) {
+            Some(r) => {
+                style.inset_top = Some(r.top);
+                style.inset_right = Some(r.right);
+                style.inset_bottom = Some(r.bottom);
+                style.inset_left = Some(r.left);
+                let parts = split_top_level(value);
+                let pick = |i: usize| -> &str {
+                    match (parts.len(), i) {
+                        (1, _) => parts[0],
+                        (2, 0 | 2) | (3, 0) => parts[0],
+                        (2, _) | (3, 1 | 3) => parts[1],
+                        (3, _) => parts[2],
+                        _ => parts[i],
+                    }
+                };
+                for i in 0..4 {
+                    set_inset_px(style, i, pick(i), cx);
+                }
+            }
+            None => {
+                if !is_neutral_keyword(value) {
+                    H::record_css(&format!("inset-value:{}", clip(value)));
+                }
+            }
+        },
+        // css-sizing-4 §5: `auto` | `<ratio>` | `auto && <ratio>`.
+        "aspect-ratio" => match parse_aspect_ratio(value) {
+            Some(r) => style.aspect_ratio = Some(r),
+            None => {
+                if !is_neutral_keyword(value) {
+                    H::record_css(&format!("aspect-ratio-value:{}", clip(value)));
+                }
+            }
+        },
+        // css-transforms-1 §5 / css-transforms-2 §5.1 (AETHERSTYLE2, SR95): parsed here, drawn by the painter.
+        "transform" => match parse_transform_list(value, cx) {
+            Some(list) => style.paint.transform = Some(list),
+            None => {
+                if !matches!(value, "inherit" | "initial" | "unset" | "revert") {
+                    H::record_css(&format!("transform-value:{}", clip(value)));
+                }
+            }
+        },
+        "translate" | "rotate" | "scale" => match parse_individual_transform(prop, value, cx) {
+            Some(op) => match prop {
+                "translate" => style.paint.tf_translate = Some(op),
+                "rotate" => style.paint.tf_rotate = Some(op),
+                _ => style.paint.tf_scale = Some(op),
+            },
+            None => {
+                if !matches!(value, "inherit" | "initial" | "unset" | "revert") {
+                    H::record_css(&format!("{}-value:{}", prop, clip(value)));
+                }
+            }
+        },
+        "transform-origin" => match parse_position_pair(value, cx, true) {
+            Some(o) => style.paint.transform_origin = Some(o),
+            None => {
+                if !matches!(value, "inherit" | "initial" | "unset" | "revert") {
+                    H::record_css(&format!("transform-origin-value:{}", clip(value)));
+                }
+            }
+        },
+        // css-transforms-2 §4: a flattened 3D context and the hidden back face are what 2D paints anyway.
+        "transform-style" | "backface-visibility" | "perspective" | "perspective-origin" | "transform-box" => {}
+        // css-masking-1 §5.1: a basic shape against the border box.
+        "clip-path" => match parse_clip_path(value, cx) {
+            Some(shape) => style.paint.clip_path = Some(shape),
+            None => {
+                if !matches!(value, "inherit" | "initial" | "unset" | "revert") {
+                    let what = if value.contains("url(") { "url" } else { clip(value) };
+                    H::record_css(&format!("clip-path-value:{}", what));
+                }
+            }
+        },
+        // css-will-change-1 §2: a hint a UA may ignore.
+        "will-change" => {}
+        // css-break-3 §3: break controls apply only to fragmented flows; Aether paginates nothing and
+        // lays out no columns, so there is nothing for them to do (the column-* properties stay ledgered).
+        "break-before" | "break-after" | "break-inside" | "page-break-before" | "page-break-after"
+        | "page-break-inside" | "-webkit-column-break-before" | "-webkit-column-break-after"
+        | "-webkit-column-break-inside" => {}
         // Float approximation: no real float layout (text does not wrap
         // around the box), but a floated box sizes to content and hugs its
         // edge instead of stretching full width.
@@ -671,7 +772,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.justify = Some(taffy::style::JustifyContent::START);
                 style.paint.text_align = Some(0);
             }
-            "inherit" | "initial" | "unset" | "revert" => {}
+            // css-text-4 §6.1: match-parent is the parent's value — inheritance, which an unspecified
+            // text-align already is (the parent's start/end against ITS direction is the nuance left).
+            "inherit" | "initial" | "unset" | "revert" | "match-parent" | "-webkit-match-parent" => {}
             other => H::record_css(&format!("text-align:{}", other)),
         },
         "justify-content" => match value {
@@ -799,6 +902,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     )
                 {
                     continue;
+                }
+                // `transparent` is a colour layer at alpha 0 (`background: none transparent`).
+                if part.eq_ignore_ascii_case("transparent") {
+                    style.paint.bg_alpha = Some(0.0);
+                    got_color = true;
+                    break;
                 }
                 if let Some(c) = parse_color_str::<H>(part) {
                     style.paint.background = Some(c);
@@ -952,6 +1061,13 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             None => match value.trim() {
                 "smaller" => style.paint.font_size_rel = Some((0, 1.0 / 1.2)),
                 "larger" => style.paint.font_size_rel = Some((0, 1.2)),
+                // font-size is inherited: `inherit`/`unset` are the unspecified value; `initial` and
+                // `revert` (the UA's) are `medium`.
+                "inherit" | "unset" => {}
+                "initial" | "revert" => {
+                    style.paint.font_size = Some(BASE_FONT_PX);
+                    style.paint.font_size_rel = Some((2, 0.0));
+                }
                 _ => H::record_css(&format!("font-size-value:{}", clip(value))),
             },
         },
@@ -989,7 +1105,10 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             // Stored as > 0 multiplier, < 0 = -(px), 0 = normal.
             let v = value.trim();
             let (em, ..) = cx.font;
-            let lh = if v == "normal" {
+            if matches!(v, "inherit" | "unset") {
+                return; // inherited: the unspecified value
+            }
+            let lh = if matches!(v, "normal" | "initial" | "revert") {
                 Some(0.0)
             } else if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
                 Some(-(pct / 100.0 * em))
@@ -1316,6 +1435,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                             | "align-self" | "justify-content" | "flex-direction"
                             | "flex-wrap" | "opacity" | "border-radius" | "flex" | "flex-grow"
                             | "flex-shrink" | "flex-basis" | "flex-flow" | "gap"
+                            | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
+                            | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
+                            | "backface-visibility" | "perspective" | "perspective-origin"
                     )
                 }) =>
         {
@@ -1326,8 +1448,492 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 .trim_start_matches("-o-");
             apply_declaration(base, value, style, cx);
         }
-        other => H::record_css(&format!("property:{}", other)),
+        other => {
+            if !apply_logical(other, value, style, cx) {
+                H::record_css(&format!("property:{}", other));
+            }
+        }
     }
+}
+
+/// css-logical-1 §4-§6 in horizontal-tb (Aether lays out no vertical writing mode): a flow-relative
+/// property is re-applied as its physical longhand(s). The inline axis is horizontal and its start is
+/// `left`, or `right` when this element's own declarations already set `direction: rtl` (an inherited
+/// rtl is not visible at declaration time). `false` = not a logical property this engine maps.
+fn apply_logical<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) -> bool {
+    let size = match prop {
+        "inline-size" => Some("width"),
+        "block-size" => Some("height"),
+        "min-inline-size" => Some("min-width"),
+        "min-block-size" => Some("min-height"),
+        "max-inline-size" => Some("max-width"),
+        "max-block-size" => Some("max-height"),
+        _ => None,
+    };
+    if let Some(p) = size {
+        apply_declaration(p, value, style, cx);
+        return true;
+    }
+    let rtl = style.paint.rtl == Some(true);
+    for fam in ["margin", "padding", "inset", "border"] {
+        let Some(rest) = prop.strip_prefix(fam).and_then(|r| r.strip_prefix('-')) else { continue };
+        let (inline, rest) = if let Some(r) = rest.strip_prefix("inline") {
+            (true, r)
+        } else if let Some(r) = rest.strip_prefix("block") {
+            (false, r)
+        } else {
+            return false;
+        };
+        let (start, end) = match (inline, rtl) {
+            (true, false) => ("left", "right"),
+            (true, true) => ("right", "left"),
+            (false, _) => ("top", "bottom"),
+        };
+        let (edge, suffix) = if let Some(s) = rest.strip_prefix("-start") {
+            (1u8, s)
+        } else if let Some(s) = rest.strip_prefix("-end") {
+            (2, s)
+        } else {
+            (0, rest)
+        };
+        let suffix_ok = match fam {
+            "border" => matches!(suffix, "" | "-width" | "-style"),
+            _ => suffix.is_empty(),
+        };
+        if !suffix_ok {
+            return false;
+        }
+        let phys = |side: &str| -> String {
+            if fam == "inset" { side.to_string() } else { format!("{fam}-{side}{suffix}") }
+        };
+        match edge {
+            1 => apply_declaration(&phys(start), value, style, cx),
+            2 => apply_declaration(&phys(end), value, style, cx),
+            _ if fam == "border" => {
+                apply_declaration(&phys(start), value, style, cx);
+                apply_declaration(&phys(end), value, style, cx);
+            }
+            _ => {
+                // `margin-inline: <start> <end>?` (css-logical-1 §4.2)
+                let parts = split_top_level(value);
+                let (a, b) = match parts.as_slice() {
+                    [a] => (*a, *a),
+                    [a, b] => (*a, *b),
+                    _ => {
+                        H::record_css(&format!("{}-value:{}", prop, clip(value)));
+                        return true;
+                    }
+                };
+                apply_declaration(&phys(start), a, style, cx);
+                apply_declaration(&phys(end), b, style, cx);
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Records one side's px inset for the sticky painter (`PaintStyle::inset_px`): a length is kept, a
+/// percentage or `auto` clears the side.
+fn set_inset_px<H: Host>(style: &mut SpecifiedStyle<H>, side: usize, value: &str, cx: &ParseCx) {
+    let v = value.trim();
+    let px = if v.ends_with('%') || v == "auto" { None } else { parse_px(v, cx) };
+    let mut sides = style.paint.inset_px.unwrap_or([None; 4]);
+    sides[side] = px;
+    style.paint.inset_px = Some(sides);
+}
+
+/// `aspect-ratio` (css-sizing-4 §5.1): Some(None) = `auto`; a degenerate ratio (a zero term) is `auto`.
+pub fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
+    let v = value.trim().to_ascii_lowercase();
+    let rest: String = v.split_whitespace().filter(|t| *t != "auto").collect::<Vec<_>>().join(" ");
+    if rest.is_empty() {
+        return if v.split_whitespace().any(|t| t == "auto") { Some(None) } else { None };
+    }
+    let (a, b) = match rest.split_once('/') {
+        Some((a, b)) => (a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?),
+        None => (rest.trim().parse::<f32>().ok()?, 1.0),
+    };
+    if a < 0.0 || b < 0.0 || !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+    Some(if a == 0.0 || b == 0.0 { None } else { Some(a / b) })
+}
+
+/// A `<length-percentage>` as a paint-time [`LenPct`].
+fn len_pct(v: &str, cx: &ParseCx) -> Option<LenPct> {
+    let v = v.trim();
+    if let Some(p) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+        return Some([0.0, p / 100.0]);
+    }
+    parse_px(v, cx).filter(|x| x.is_finite()).map(|px| [px, 0.0])
+}
+
+/// An `<angle>` in radians (css-values-4 §7.1); a unitless 0 is accepted (css-transforms-1 §7).
+fn parse_angle(v: &str) -> Option<f32> {
+    let v = v.trim();
+    let num = |s: &str| s.trim().parse::<f32>().ok();
+    let r = if let Some(n) = v.strip_suffix("deg") {
+        num(n)?.to_radians()
+    } else if let Some(n) = v.strip_suffix("grad") {
+        num(n)? * core::f32::consts::PI / 200.0
+    } else if let Some(n) = v.strip_suffix("rad") {
+        num(n)?
+    } else if let Some(n) = v.strip_suffix("turn") {
+        num(n)? * core::f32::consts::TAU
+    } else if num(v) == Some(0.0) {
+        0.0
+    } else {
+        return None;
+    };
+    r.is_finite().then_some(r)
+}
+
+/// A `<number> | <percentage>` scale factor (css-transforms-2 §5.1).
+fn parse_factor(v: &str) -> Option<f32> {
+    let v = v.trim();
+    let f = match v.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f32>().ok()? / 100.0,
+        None => v.parse::<f32>().ok()?,
+    };
+    f.is_finite().then_some(f)
+}
+
+/// Splits a function's arguments on top-level commas, or on whitespace when there are none.
+fn func_args(args: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start, mut comma) = (0i32, 0usize, false);
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(args[start..i].trim());
+                start = i + 1;
+                comma = true;
+            }
+            _ => {}
+        }
+    }
+    if comma {
+        out.push(args[start..].trim());
+        out
+    } else {
+        split_top_level(args)
+    }
+}
+
+/// Splits a value into `name(args)` function calls; `None` when anything else is in it.
+fn split_functions(value: &str) -> Option<Vec<(String, &str)>> {
+    let mut out = Vec::new();
+    let mut rest = value.trim();
+    while !rest.is_empty() {
+        let open = rest.find('(')?;
+        let name = rest[..open].trim().to_ascii_lowercase();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, c) in rest[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        out.push((name, &rest[open + 1..close]));
+        rest = rest[close + 1..].trim_start();
+    }
+    Some(out)
+}
+
+/// The 2D part of a `rotate3d(x, y, z, a)` (css-transforms-2 §12): the upper-left 2x2 of the 3x3
+/// rotation matrix — what the flattened (orthographic) box shows.
+fn rotate3d(x: f32, y: f32, z: f32, a: f32) -> Option<[f32; 6]> {
+    let len = crate::paint::sqrt(x * x + y * y + z * z);
+    if len == 0.0 {
+        return None;
+    }
+    let (x, y, z) = (x / len, y / len, z / len);
+    let (s, c) = crate::paint::sin_cos(a);
+    let t = 1.0 - c;
+    let m11 = t * x * x + c;
+    let m12 = t * x * y + s * z;
+    let m21 = t * x * y - s * z;
+    let m22 = t * y * y + c;
+    Some([m11, m12, m21, m22, 0.0, 0.0])
+}
+
+/// `transform` (css-transforms-1 §7, -2 §12) → its function list; `none` = empty. 3D functions flatten.
+pub fn parse_transform_list(value: &str, cx: &ParseCx) -> Option<Vec<TransformOp>> {
+    use TransformOp::{Matrix, Translate};
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for (name, args) in split_functions(v)? {
+        let a = func_args(args);
+        let n = |i: usize| a.get(i).and_then(|s| s.trim().parse::<f32>().ok()).filter(|f| f.is_finite());
+        let op = match (name.as_str(), a.len()) {
+            ("matrix", 6) => Matrix([n(0)?, n(1)?, n(2)?, n(3)?, n(4)?, n(5)?]),
+            ("matrix3d", 16) => Matrix([n(0)?, n(1)?, n(4)?, n(5)?, n(12)?, n(13)?]),
+            ("translate", 1) => Translate(len_pct(a[0], cx)?, [0.0, 0.0]),
+            ("translate", 2) => Translate(len_pct(a[0], cx)?, len_pct(a[1], cx)?),
+            ("translate3d", 3) => {
+                parse_px(a[2], cx)?;
+                Translate(len_pct(a[0], cx)?, len_pct(a[1], cx)?)
+            }
+            ("translatex", 1) => Translate(len_pct(a[0], cx)?, [0.0, 0.0]),
+            ("translatey", 1) => Translate([0.0, 0.0], len_pct(a[0], cx)?),
+            ("translatez", 1) => {
+                parse_px(a[0], cx)?;
+                Matrix(IDENTITY)
+            }
+            ("scale", 1) => {
+                let f = parse_factor(a[0])?;
+                Matrix([f, 0.0, 0.0, f, 0.0, 0.0])
+            }
+            ("scale", 2) | ("scale3d", 3) => Matrix([parse_factor(a[0])?, 0.0, 0.0, parse_factor(a[1])?, 0.0, 0.0]),
+            ("scalex", 1) => Matrix([parse_factor(a[0])?, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            ("scaley", 1) => Matrix([1.0, 0.0, 0.0, parse_factor(a[0])?, 0.0, 0.0]),
+            ("scalez", 1) => {
+                parse_factor(a[0])?;
+                Matrix(IDENTITY)
+            }
+            ("rotate", 1) | ("rotatez", 1) => {
+                let (s, c) = crate::paint::sin_cos(parse_angle(a[0])?);
+                Matrix([c, s, -s, c, 0.0, 0.0])
+            }
+            ("rotatex", 1) => Matrix(rotate3d(1.0, 0.0, 0.0, parse_angle(a[0])?)?),
+            ("rotatey", 1) => Matrix(rotate3d(0.0, 1.0, 0.0, parse_angle(a[0])?)?),
+            ("rotate3d", 4) => Matrix(rotate3d(n(0)?, n(1)?, n(2)?, parse_angle(a[3])?).unwrap_or(IDENTITY)),
+            ("skew", 1 | 2) => {
+                let ax = parse_angle(a[0])?;
+                let ay = match a.get(1) {
+                    Some(s) => parse_angle(s)?,
+                    None => 0.0,
+                };
+                Matrix([1.0, tan(ay)?, tan(ax)?, 1.0, 0.0, 0.0])
+            }
+            ("skewx", 1) => Matrix([1.0, 0.0, tan(parse_angle(a[0])?)?, 1.0, 0.0, 0.0]),
+            ("skewy", 1) => Matrix([1.0, tan(parse_angle(a[0])?)?, 0.0, 1.0, 0.0, 0.0]),
+            // css-transforms-2 §12: a flattened box shows no perspective foreshortening.
+            ("perspective", 1) => Matrix(IDENTITY),
+            _ => return None,
+        };
+        out.push(op);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// tan, `None` at the poles (an infinite skew is invalid at paint, css-transforms-1 §7.1).
+fn tan(a: f32) -> Option<f32> {
+    let (s, c) = crate::paint::sin_cos(a);
+    if c.abs() < 1e-6 {
+        return None;
+    }
+    Some(s / c)
+}
+
+/// The individual `translate` / `rotate` / `scale` properties (css-transforms-2 §5.1); `none` = identity.
+pub fn parse_individual_transform(prop: &str, value: &str, cx: &ParseCx) -> Option<TransformOp> {
+    let v = value.trim().to_ascii_lowercase();
+    if v == "none" {
+        return Some(TransformOp::Matrix(IDENTITY));
+    }
+    let parts = split_top_level(&v);
+    match prop {
+        "translate" => match parts.as_slice() {
+            [x] => Some(TransformOp::Translate(len_pct(x, cx)?, [0.0, 0.0])),
+            [x, y] => Some(TransformOp::Translate(len_pct(x, cx)?, len_pct(y, cx)?)),
+            [x, y, z] => {
+                parse_px(z, cx)?;
+                Some(TransformOp::Translate(len_pct(x, cx)?, len_pct(y, cx)?))
+            }
+            _ => None,
+        },
+        "rotate" => {
+            // `<angle> | [x | y | z | <number>{3}] && <angle>`: the angle is the first or the last part
+            let has_unit = |p: &str| p.parse::<f32>().is_err() && parse_angle(p).is_some();
+            let (a, rest): (f32, &[&str]) = match parts.as_slice() {
+                [] => return None,
+                [.., last] if has_unit(*last) => (parse_angle(last)?, &parts[..parts.len() - 1]),
+                [first, ..] if has_unit(*first) => (parse_angle(first)?, &parts[1..]),
+                _ => return None,
+            };
+            let m = match rest {
+                [] | ["z"] => rotate3d(0.0, 0.0, 1.0, a),
+                ["x"] => rotate3d(1.0, 0.0, 0.0, a),
+                ["y"] => rotate3d(0.0, 1.0, 0.0, a),
+                [x, y, z] => rotate3d(x.parse().ok()?, y.parse().ok()?, z.parse().ok()?, a),
+                _ => return None,
+            };
+            Some(TransformOp::Matrix(m.unwrap_or(IDENTITY)))
+        }
+        _ => match parts.as_slice() {
+            [f] => {
+                let f = parse_factor(f)?;
+                Some(TransformOp::Matrix([f, 0.0, 0.0, f, 0.0, 0.0]))
+            }
+            [x, y] | [x, y, _] => Some(TransformOp::Matrix([parse_factor(x)?, 0.0, 0.0, parse_factor(y)?, 0.0, 0.0])),
+            _ => None,
+        },
+    }
+}
+
+/// One `<position>` component keyword as a fraction, with its axis (0 x, 1 y, 2 either).
+fn position_keyword(k: &str) -> Option<(u8, f32)> {
+    Some(match k {
+        "left" => (0, 0.0),
+        "right" => (0, 1.0),
+        "top" => (1, 0.0),
+        "bottom" => (1, 1.0),
+        "center" => (2, 0.5),
+        _ => return None,
+    })
+}
+
+/// A 1-2 value `<position>` (css-values-4 §9.1) — or, for `transform-origin` (css-transforms-1 §6),
+/// 1-3 values with the z length ignored — as [x, y] length-percentages. Omitted axes are `center`.
+pub fn parse_position_pair(value: &str, cx: &ParseCx, allow_z: bool) -> Option<[LenPct; 2]> {
+    let v = value.trim().to_ascii_lowercase();
+    let mut parts = split_top_level(&v);
+    if allow_z && parts.len() == 3 {
+        parse_px(parts[2], cx)?;
+        parts.truncate(2);
+    }
+    let comp = |s: &str| -> Option<(u8, LenPct)> {
+        match position_keyword(s) {
+            Some((axis, f)) => Some((axis, [0.0, f])),
+            None => len_pct(s, cx).map(|lp| (3, lp)),
+        }
+    };
+    let center = [0.0, 0.5];
+    match parts.as_slice() {
+        [a] => {
+            let (axis, lp) = comp(*a)?;
+            Some(if axis == 1 { [center, lp] } else { [lp, center] })
+        }
+        [a, b] => {
+            let (ax, la) = comp(*a)?;
+            let (bx, lb) = comp(*b)?;
+            // x then y; keywords alone may come y first (`top left`, `center left`)
+            if ax != 1 && bx != 0 {
+                Some([la, lb])
+            } else if matches!(ax, 1 | 2) && matches!(bx, 0 | 2) {
+                Some([lb, la])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `clip-path` (css-masking-1 §5.1): `none` = Some(None); a basic shape (css-shapes-1 §3.1) with an
+/// optional geometry-box keyword (read as the border box). `url()` and anything else are `None`.
+pub fn parse_clip_path(value: &str, cx: &ParseCx) -> Option<Option<ClipShape>> {
+    let v = value.trim().to_ascii_lowercase();
+    if v == "none" {
+        return Some(None);
+    }
+    if v.contains("url(") {
+        return None;
+    }
+    // drop a trailing or leading geometry-box keyword
+    let boxes = ["border-box", "padding-box", "content-box", "margin-box", "fill-box", "stroke-box", "view-box"];
+    let mut shape_text = v.as_str();
+    for b in boxes {
+        if let Some(r) = shape_text.strip_suffix(b) {
+            shape_text = r.trim();
+        } else if let Some(r) = shape_text.strip_prefix(b) {
+            shape_text = r.trim();
+        }
+    }
+    let funcs = split_functions(shape_text)?;
+    let [(name, args)] = funcs.as_slice() else { return None };
+    let radius = |s: &str| -> Option<ShapeRadius> {
+        match s {
+            "closest-side" => Some(ShapeRadius::ClosestSide),
+            "farthest-side" => Some(ShapeRadius::FarthestSide),
+            _ => len_pct(s, cx).filter(|lp| lp[0] >= 0.0 && lp[1] >= 0.0).map(ShapeRadius::Len),
+        }
+    };
+    let (shape_part, at) = match args.split_once(" at ") {
+        Some((s, p)) => (s.trim(), Some(p.trim())),
+        None if args.trim_start().starts_with("at ") => ("", Some(args.trim_start()[3..].trim())),
+        None => (args.trim(), None),
+    };
+    let center = match at {
+        Some(p) => parse_position_pair(p, cx, false)?,
+        None => [[0.0, 0.5], [0.0, 0.5]],
+    };
+    let shape = match name.as_str() {
+        "inset" => {
+            let (ins, round) = match args.split_once(" round ") {
+                Some((i, r)) => (i.trim(), Some(r.trim())),
+                None => (args.trim(), None),
+            };
+            let r = parse_sides(ins, |p| len_pct(p, cx))?;
+            let rad = match round {
+                Some(r) => len_pct(split_top_level(r.split('/').next().unwrap_or(r)).first()?, cx)?,
+                None => [0.0, 0.0],
+            };
+            ClipShape::Inset([r.top, r.right, r.bottom, r.left], rad)
+        }
+        "circle" => {
+            let r = match split_top_level(shape_part).as_slice() {
+                [] => ShapeRadius::ClosestSide,
+                [r] => radius(*r)?,
+                _ => return None,
+            };
+            ClipShape::Circle(r, center)
+        }
+        "ellipse" => {
+            let (rx, ry) = match split_top_level(shape_part).as_slice() {
+                [] => (ShapeRadius::ClosestSide, ShapeRadius::ClosestSide),
+                [a, b] => (radius(*a)?, radius(*b)?),
+                _ => return None,
+            };
+            ClipShape::Ellipse(rx, ry, center)
+        }
+        "polygon" => {
+            let mut items: Vec<&str> = args.split(',').map(str::trim).collect();
+            let mut evenodd = false;
+            if let Some(first) = items.first().copied() {
+                if first == "evenodd" || first == "nonzero" {
+                    evenodd = first == "evenodd";
+                    items.remove(0);
+                }
+            }
+            let pts: Option<Vec<[LenPct; 2]>> = items
+                .iter()
+                .map(|it| match split_top_level(it).as_slice() {
+                    [x, y] => Some([len_pct(x, cx)?, len_pct(y, cx)?]),
+                    _ => None,
+                })
+                .collect();
+            let pts = pts?;
+            if pts.len() < 3 {
+                return None;
+            }
+            ClipShape::Polygon(pts, evenodd)
+        }
+        _ => return None,
+    };
+    Some(Some(shape))
 }
 
 
@@ -1479,9 +2085,9 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
-        stretch, word_spacing, rtl, clear,
+        stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
     );
-    clone!(text_shadows);
+    clone!(text_shadows, transform, clip_path);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -1621,7 +2227,7 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
     take!(display, flex_direction, width, height, position,
           inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
           max_width, max_height, min_width, min_height, box_sizing,
-          flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis);
+          flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis, aspect_ratio);
     merge_paint(&mut dst.paint, &src.paint);
     let (d, g) = (&mut dst.generated, &src.generated);
     if g.content.is_some() { d.content = g.content.clone(); }
@@ -1666,6 +2272,14 @@ pub fn parse_color_str<H: Host>(value: &str) -> Option<(u8, u8, u8)> {
             }
         }
         return None;
+    }
+    // Function notations the arm above does not read (hsl(), hwb(), the modern syntaxes): css_core's
+    // parser; fully transparent paints nothing, as above.
+    if lower.contains('(') {
+        return match H::parse_color_alpha(v) {
+            Some((c, a)) if a > 0.0 => Some(c),
+            _ => None,
+        };
     }
     named_color::<H>(&lower)
 }
@@ -2217,10 +2831,18 @@ fn named_color<H: Host>(name: &str) -> Option<(u8, u8, u8)> {
         // here. They are answered, not missing — ledgering them buried the
         // real unknown-colour misses under `transparent` noise.
         "transparent" | "currentcolor" | "inherit" | "initial" | "unset" | "revert" | "none" => None,
-        other => {
-            H::record_css(&format!("named-color:{}", clip(other)));
-            None
-        }
+        // css-color-4 §6.1: the full named-colour table is css_core's.
+        other => match css_core::color::named(other) {
+            Some(c) if c.a > 0.0 => {
+                let ch = |x: f64| -> u8 { if x <= 0.0 { 0 } else if x >= 255.0 { 255 } else { (x + 0.5) as u8 } };
+                Some((ch(c.r), ch(c.g), ch(c.b)))
+            }
+            Some(_) => None,
+            None => {
+                H::record_css(&format!("named-color:{}", clip(other)));
+                None
+            }
+        },
     }
 }
 

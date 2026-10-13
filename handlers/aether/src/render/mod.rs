@@ -751,6 +751,15 @@ pub(crate) fn is_stacking_context(layout: &LayoutTree, id: NodeId) -> bool {
     if p.opacity.is_some_and(|o| o < 1.0) {
         return true;
     }
+    // css-transforms-1 §3 / css-masking-1 §5: a transform or a clip-path other than none.
+    if p.transform.as_ref().is_some_and(|t| !t.is_empty())
+        || p.tf_translate.is_some()
+        || p.tf_rotate.is_some()
+        || p.tf_scale.is_some()
+        || p.clip_path.as_ref().is_some_and(|c| c.is_some())
+    {
+        return true;
+    }
     z.is_some()
         && layout
             .taffy
@@ -1420,6 +1429,93 @@ fn paint_audio_controls(
     }
 }
 
+/// Where a box's border box sits in page coordinates: its laid-out place (`abs` + its location), except
+/// `position: fixed` — the containing block is the viewport (CSS 2.2 §10.1): insets resolve against it
+/// and the box ignores scrolling — and `position: sticky` (css-position-3 §3.4, AETHERSTYLE2 SR95): the
+/// box keeps its normal-flow place until scrolling would carry it past an inset edge of the scrollport
+/// (the viewport; Aether has no inner scrollers), then holds at that edge, never leaving its containing
+/// block (the parent's content box).
+#[allow(clippy::too_many_arguments)]
+fn placed_origin(
+    layout: &LayoutTree,
+    node_id: NodeId,
+    abs_x: f32,
+    abs_y: f32,
+    layout_box: &taffy::Layout,
+    width: u32,
+    height: u32,
+    sx: i32,
+    sy: i32,
+) -> (f32, f32) {
+    let mut current_x = abs_x + layout_box.location.x;
+    let mut current_y = abs_y + layout_box.location.y;
+    let paint = layout.paint_map.get(&node_id);
+    let (vw, vh) = (width as f32, height as f32);
+    let (w, h) = (layout_box.size.width, layout_box.size.height);
+    match paint.and_then(|p| p.position_kind) {
+        Some(3) => {
+            if let Ok(st) = layout.taffy.style(node_id) {
+                let len = |v: taffy::style::LengthPercentageAuto, basis: f32| -> Option<f32> {
+                    let raw = v.into_raw();
+                    match raw.tag() {
+                        taffy::style::CompactLength::LENGTH_TAG => Some(raw.value()),
+                        taffy::style::CompactLength::PERCENT_TAG => Some(raw.value() * basis),
+                        _ => None,
+                    }
+                };
+                if let Some(l) = len(st.inset.left, vw) {
+                    current_x = sx as f32 + l;
+                } else if let Some(r) = len(st.inset.right, vw) {
+                    current_x = sx as f32 + vw - r - w;
+                }
+                if let Some(t) = len(st.inset.top, vh) {
+                    current_y = sy as f32 + t;
+                } else if let Some(b) = len(st.inset.bottom, vh) {
+                    current_y = sy as f32 + vh - b - h;
+                }
+            }
+        }
+        Some(4) => {
+            let Some(ins) = paint.and_then(|p| p.inset_px) else { return (current_x, current_y) };
+            // the containing block: the parent's content box (abs is the parent's border-box origin)
+            let (cb_l, cb_t, cb_r, cb_b) = match layout.taffy.parent(node_id).and_then(|p| layout.taffy.layout(p).ok()) {
+                Some(pl) => (
+                    abs_x + pl.border.left + pl.padding.left,
+                    abs_y + pl.border.top + pl.padding.top,
+                    abs_x + pl.size.width - pl.border.right - pl.padding.right,
+                    abs_y + pl.size.height - pl.border.bottom - pl.padding.bottom,
+                ),
+                None => (f32::MIN, f32::MIN, f32::MAX, f32::MAX),
+            };
+            let (nx, ny) = (current_x, current_y);
+            if let Some(t) = ins[0] {
+                let target = sy as f32 + t;
+                if ny < target {
+                    current_y = target.min(cb_b - h).max(ny);
+                }
+            } else if let Some(b) = ins[2] {
+                let target = sy as f32 + vh - b - h;
+                if ny > target {
+                    current_y = target.max(cb_t).min(ny);
+                }
+            }
+            if let Some(l) = ins[3] {
+                let target = sx as f32 + l;
+                if nx < target {
+                    current_x = target.min(cb_r - w).max(nx);
+                }
+            } else if let Some(r) = ins[1] {
+                let target = sx as f32 + vw - r - w;
+                if nx > target {
+                    current_x = target.max(cb_l).min(nx);
+                }
+            }
+        }
+        _ => {}
+    }
+    (current_x, current_y)
+}
+
 pub fn render_frame(
     layout: &LayoutTree,
     surface: &mut [u8],
@@ -1460,8 +1556,114 @@ pub fn render_frame(
     /// backdrop and then mixing with a snapshot of the backdrop by the
     /// opacity is exact: per pixel, `b(1-a) + a(g·ga + b(1-ga))` =
     /// `b(1 - a·ga) + a·ga·g`, which is source-over of the group at a·ga.
+    /// AETHERSTYLE2 (SR95): a transformed or clip-pathed box paints as a GROUP, the opacity group's
+    /// shape: the subtree (its opacity included) is drawn onto the surface, the changed pixels are the
+    /// group, the surface goes back to its snapshot, then the clip-path shape (box-local, so it moves
+    /// with the box) drops the group pixels outside it and the transform maps the rest to their place —
+    /// every destination pixel of the transformed bounds samples the group through the inverse matrix
+    /// (nearest). The group is drawn where the untransformed box sits, so what the surface edge or an
+    /// ancestor clip cut off there is not in the group.
     #[allow(clippy::too_many_arguments)]
     fn draw_node(
+        node_id: NodeId,
+        abs_x: f32,
+        abs_y: f32,
+        inherited: Inherited,
+        layout: &LayoutTree,
+        font: &Option<&'static Font>,
+        font_bold: &Option<&'static Font>,
+        surface: &mut [u8],
+        width: u32,
+        height: u32,
+        sx: i32,
+        sy: i32,
+        damage_rects: &[(u32, u32, u32, u32)],
+        clip: Clip,
+    ) {
+        let paint = layout.paint_map.get(&node_id);
+        let lb = layout.taffy.layout(node_id).ok().copied();
+        let shape = paint.and_then(|p| p.clip_path.clone()).flatten();
+        let tf = match (paint, lb) {
+            (Some(p), Some(lb)) => p.transform_matrix(lb.size.width, lb.size.height),
+            _ => None,
+        };
+        let (Some(lb), true) = (lb, tf.is_some() || shape.is_some()) else {
+            draw_node_op(
+                node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+                damage_rects, clip,
+            );
+            return;
+        };
+        let (w, h) = (lb.size.width, lb.size.height);
+        let (ox, oy) = placed_origin(layout, node_id, abs_x, abs_y, &lb, width, height, sx, sy);
+        let (bx, by) = (ox - sx as f32, oy - sy as f32);
+        let snap = surface.to_vec();
+        draw_node_op(
+            node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+            damage_rects, clip,
+        );
+        let changed = |surface: &[u8], i: usize| surface[i..i + 3] != snap[i..i + 3];
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..height {
+            for x in 0..width {
+                if changed(surface, ((y * width + x) * 4) as usize) {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        if x0 > x1 || y0 > y1 {
+            return; // the group drew nothing
+        }
+        if let Some(shape) = &shape {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    if !shape.contains(x as f32 + 0.5 - bx, y as f32 + 0.5 - by, w, h) {
+                        let i = ((y * width + x) * 4) as usize;
+                        surface[i..i + 4].copy_from_slice(&snap[i..i + 4]);
+                    }
+                }
+            }
+        }
+        let Some(m) = tf else { return };
+        use layout_core::paint::{mat_apply, mat_invert, mat_mul};
+        let group = surface.to_vec();
+        surface.copy_from_slice(&snap);
+        // the box-local matrix in screen space: T(b) · m · T(-b)
+        let screen = mat_mul(mat_mul([1.0, 0.0, 0.0, 1.0, bx, by], m), [1.0, 0.0, 0.0, 1.0, -bx, -by]);
+        let Some(inv) = mat_invert(screen) else { return }; // singular (scale(0)): nothing paints
+        let (fx0, fy0, fx1, fy1) = (x0 as f32, y0 as f32, (x1 + 1) as f32, (y1 + 1) as f32);
+        let mut dmin = (f32::MAX, f32::MAX);
+        let mut dmax = (f32::MIN, f32::MIN);
+        for (cx, cy) in [(fx0, fy0), (fx1, fy0), (fx0, fy1), (fx1, fy1)] {
+            let (dx, dy) = mat_apply(screen, cx, cy);
+            dmin = (dmin.0.min(dx), dmin.1.min(dy));
+            dmax = (dmax.0.max(dx), dmax.1.max(dy));
+        }
+        let ax = dmin.0.max(clip.0).max(0.0).floor() as u32;
+        let ay = dmin.1.max(clip.1).max(0.0).floor() as u32;
+        let ex = (dmax.0.min(clip.2).max(0.0).ceil() as u32).min(width);
+        let ey = (dmax.1.min(clip.3).max(0.0).ceil() as u32).min(height);
+        for y in ay..ey {
+            for x in ax..ex {
+                let (sxp, syp) = mat_apply(inv, x as f32 + 0.5, y as f32 + 0.5);
+                if sxp < fx0 || syp < fy0 || sxp >= fx1 || syp >= fy1 {
+                    continue;
+                }
+                let si = ((syp as u32 * width + sxp as u32) * 4) as usize;
+                if group[si..si + 3] != snap[si..si + 3] {
+                    let di = ((y * width + x) * 4) as usize;
+                    surface[di..di + 3].copy_from_slice(&group[si..si + 3]);
+                }
+            }
+        }
+    }
+
+    /// `opacity` < 1 as a composited group (see `render_frame`'s note above), else the box as is.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_node_op(
         node_id: NodeId,
         abs_x: f32,
         abs_y: f32,
@@ -1648,34 +1850,7 @@ pub fn render_frame(
             return;
         }
         let Ok(layout_box) = layout.taffy.layout(node_id) else { return };
-        let mut current_x = abs_x + layout_box.location.x;
-        let mut current_y = abs_y + layout_box.location.y;
-        // position: fixed — the containing block is the viewport (CSS 2.2
-        // §10.1): insets resolve against it and the box ignores scrolling.
-        if layout.paint_map.get(&node_id).and_then(|p| p.position_kind) == Some(3) {
-            if let Ok(st) = layout.taffy.style(node_id) {
-                let len = |v: taffy::style::LengthPercentageAuto, basis: f32| -> Option<f32> {
-                    let raw = v.into_raw();
-                    match raw.tag() {
-                        taffy::style::CompactLength::LENGTH_TAG => Some(raw.value()),
-                        taffy::style::CompactLength::PERCENT_TAG => Some(raw.value() * basis),
-                        _ => None,
-                    }
-                };
-                let (vw, vh) = (width as f32, height as f32);
-                let (w, h) = (layout_box.size.width, layout_box.size.height);
-                if let Some(l) = len(st.inset.left, vw) {
-                    current_x = sx as f32 + l;
-                } else if let Some(r) = len(st.inset.right, vw) {
-                    current_x = sx as f32 + vw - r - w;
-                }
-                if let Some(t) = len(st.inset.top, vh) {
-                    current_y = sy as f32 + t;
-                } else if let Some(b) = len(st.inset.bottom, vh) {
-                    current_y = sy as f32 + vh - b - h;
-                }
-            }
-        }
+        let (current_x, current_y) = placed_origin(layout, node_id, abs_x, abs_y, layout_box, width, height, sx, sy);
 
         let mut inherited = inherited;
 

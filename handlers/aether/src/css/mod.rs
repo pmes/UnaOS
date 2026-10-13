@@ -690,6 +690,14 @@ fn property_supported(prop: &str) -> bool {
             | "gap" | "row-gap" | "column-gap"
             | "cursor"
             | "content" | "counter-reset" | "counter-increment" | "counter-set" | "quotes"
+            // AETHERSTYLE2 (SR95)
+            | "inset" | "aspect-ratio" | "transform" | "transform-origin" | "translate" | "rotate" | "scale"
+            | "clip-path" | "inline-size" | "block-size" | "min-inline-size" | "min-block-size"
+            | "max-inline-size" | "max-block-size" | "margin-inline" | "margin-block" | "margin-inline-start"
+            | "margin-inline-end" | "margin-block-start" | "margin-block-end" | "padding-inline"
+            | "padding-block" | "padding-inline-start" | "padding-inline-end" | "padding-block-start"
+            | "padding-block-end" | "inset-inline" | "inset-block" | "inset-inline-start" | "inset-inline-end"
+            | "inset-block-start" | "inset-block-end"
     )
 }
 
