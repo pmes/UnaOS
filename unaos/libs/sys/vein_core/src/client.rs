@@ -6,7 +6,7 @@
 //! The transport is the caller's: `vein_ring3` gives the TCP and TLS ones over the ring-3 syscalls, a
 //! host test gives a fake. Nothing here blocks except inside the transport.
 
-use crate::claude::{self, Event, Stop, StreamDecoder};
+use crate::claude::{self, Dialect, Event, Stop, StreamDecoder};
 use crate::http::{self, Chunked};
 
 /// A byte stream to the endpoint (already connected; plain TCP or TLS).
@@ -51,6 +51,14 @@ enum Body<'b> {
 /// Run one request. `rx` is the receive buffer (it must hold the whole response head; 2 KiB is ample),
 /// `line` the stream decoder's line buffer (also the error body's buffer on a non-200).
 pub fn exchange<T: Transport + ?Sized>(t: &mut T, head: &[u8], body: &[u8], rx: &mut [u8], line: &mut [u8], on: &mut dyn FnMut(Event<'_>)) -> Outcome {
+    exchange_dialect(t, Dialect::Claude, head, body, rx, line, on)
+}
+
+/// LUMEN2 (LEDGER SR121): [`exchange`] for either provider's stream — the body is decoded by a
+/// [`StreamDecoder`] of `dialect`, every text piece handed to `on` the moment its `data:` line completes (the
+/// incremental read: nothing waits for the whole answer). An error body is `{"error":{"message":..}}` in both
+/// dialects, so the non-200 path is shared.
+pub fn exchange_dialect<T: Transport + ?Sized>(t: &mut T, dialect: Dialect, head: &[u8], body: &[u8], rx: &mut [u8], line: &mut [u8], on: &mut dyn FnMut(Event<'_>)) -> Outcome {
     let mut out = Outcome { status: 0, stop: None, text_bytes: 0, retry_after: None, fail: None, input_tokens: None, output_tokens: None };
     if let Err(e) = t.send_all(head).and_then(|_| t.send_all(body)) {
         out.fail = Some(Fail::Send(e));
@@ -80,7 +88,7 @@ pub fn exchange<T: Transport + ?Sized>(t: &mut T, head: &[u8], body: &[u8], rx: 
     };
     out.status = h.status;
     out.retry_after = h.retry_after;
-    let mut b = if h.status == 200 { Body::Sse(StreamDecoder::new(line)) } else { Body::Err { buf: line, n: 0 } };
+    let mut b = if h.status == 200 { Body::Sse(StreamDecoder::with_dialect(line, dialect)) } else { Body::Err { buf: line, n: 0 } };
     let mut ck = Chunked::new();
     let mut left = h.content_length;
     let mut framing_bad = false;

@@ -121,6 +121,34 @@ pub fn get<'a>(obj: &'a [u8], key: &str) -> Option<&'a [u8]> {
     }
 }
 
+/// LUMEN2 (LEDGER SR121): element `i` of a JSON array value (`[a, b, ...]`), or `None` past its end or when
+/// `arr` is not an array. Nested values are skipped whole, as [`get`] skips them.
+pub fn index(arr: &[u8], i: usize) -> Option<&[u8]> {
+    let mut p = ws(arr, 0);
+    if arr.get(p) != Some(&b'[') {
+        return None;
+    }
+    p += 1;
+    let mut k = 0usize;
+    loop {
+        p = ws(arr, p);
+        match *arr.get(p)? {
+            b']' => return None,
+            b',' => {
+                p += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let ve = skip_value(arr, p)?;
+        if k == i {
+            return Some(&arr[p..ve]);
+        }
+        k += 1;
+        p = ve;
+    }
+}
+
 /// A raw string value without escapes, as `&str` (for short tag values like `"text_delta"`).
 pub fn plain_str(v: &[u8]) -> Option<&str> {
     if v.len() < 2 || v[0] != b'"' || v[v.len() - 1] != b'"' || v.contains(&b'\\') {
@@ -206,6 +234,17 @@ mod tests {
         escape_into(b"a\"b\\c\nd\x01", &mut o);
         let n = o.done().unwrap();
         assert_eq!(&b[..n], b"a\\\"b\\\\c\\nd\\u0001");
+    }
+
+    #[test]
+    fn index_walks_arrays() {
+        let a = br#"[ {"a":[1,2]}, "x,y", 3 ]"#;
+        assert_eq!(index(a, 0), Some(br#"{"a":[1,2]}"#.as_slice()));
+        assert_eq!(index(a, 1), Some(br#""x,y""#.as_slice()));
+        assert_eq!(index(a, 2), Some(b"3".as_slice()));
+        assert_eq!(index(a, 3), None);
+        assert_eq!(index(b"{}", 0), None);
+        assert_eq!(index(b"[]", 0), None);
     }
 
     #[test]

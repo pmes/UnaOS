@@ -160,12 +160,172 @@ pub fn title(file: &[u8], max: usize) -> &[u8] {
     b""
 }
 
+// ── LUMEN2 (LEDGER SR121): per-conversation settings in the file ─────────────────────────────────────────────
+// A conversation carries its own title (the sidebar's rename), model and system prompt as SETTING blocks: a
+// marker line `<!-- lumen:set <name> -->` and the value's lines. [`parse`] already skips them (an unknown marker
+// ends the turn and its lines are not reported), so a file with settings reads exactly as before to every older
+// reader. Blocks are written right after the header ([`rewrite`]: the caller rewrites a file it holds whole)
+// or appended (a file too long to hold); the LAST block of a name wins ([`setting`]).
+
+/// A per-conversation setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    Title,
+    Model,
+    System,
+}
+
+impl Setting {
+    pub const ALL: [Setting; 3] = [Setting::Title, Setting::Model, Setting::System];
+    pub fn name(self) -> &'static [u8] {
+        match self {
+            Setting::Title => b"title",
+            Setting::Model => b"model",
+            Setting::System => b"system",
+        }
+    }
+}
+
+const SET: &[u8] = b"<!-- lumen:set ";
+
+/// One setting block: its marker line, the value (marker-shaped lines escaped as in [`turn`]), a blank line.
+pub fn set(s: Setting, value: &[u8], o: &mut Out<'_>) {
+    o.put(SET);
+    o.put(s.name());
+    o.put(b" -->\n");
+    for l in trim_nl(value).split(|&c| c == b'\n') {
+        let l = l.strip_suffix(b"\r").unwrap_or(l);
+        if l.starts_with(MARK) || (l.first() == Some(&b' ') && l.trim_ascii_start().starts_with(MARK)) {
+            o.put(b" ");
+        }
+        o.put(l);
+        o.put(b"\n");
+    }
+    o.put(b"\n");
+}
+
+/// The value of the LAST `s` block in `file` (its lines as written, trailing blank lines dropped), if any.
+pub fn setting(file: &[u8], s: Setting) -> Option<&[u8]> {
+    let mut found: Option<(usize, usize)> = None;
+    let mut open: Option<usize> = None;
+    let mut pos = 0usize;
+    let close = |open: &mut Option<usize>, end: usize, found: &mut Option<(usize, usize)>| {
+        if let Some(a) = open.take() {
+            let mut e = end.max(a);
+            while e > a && matches!(file[e - 1], b'\n' | b'\r') {
+                e -= 1;
+            }
+            *found = Some((a, e));
+        }
+    };
+    for l in file.split(|&c| c == b'\n') {
+        let start = pos;
+        pos += l.len() + 1;
+        if l.starts_with(MARK) {
+            close(&mut open, start, &mut found);
+            if let Some(rest) = l.strip_prefix(SET) {
+                if rest.starts_with(s.name()) && rest[s.name().len()..].starts_with(b" ") {
+                    open = Some(pos.min(file.len()));
+                }
+            }
+        }
+    }
+    close(&mut open, file.len(), &mut found);
+    found.map(|(a, e)| &file[a..e])
+}
+
+/// [`title`], with a `title` setting taking precedence (the sidebar's rename).
+pub fn title_of(file: &[u8], max: usize) -> &[u8] {
+    match setting(file, Setting::Title).map(|t| t.split(|&c| c == b'\n').next().unwrap_or(b"").trim_ascii()) {
+        Some(t) if !t.is_empty() => &t[..t.len().min(max)],
+        _ => title(file, max),
+    }
+}
+
+/// Rewrite a whole conversation file with `values` as its settings: the header line(s) (everything before the
+/// first marker that is not the conversation marker), then one block per `Some` value, then every turn — every
+/// old setting block dropped. A value of `None` keeps that setting's current value from `file`.
+pub fn rewrite(file: &[u8], values: &[(Setting, Option<&[u8]>)], o: &mut Out<'_>) {
+    // the header: up to the first `<!-- lumen:` line after the conversation marker
+    let mut pos = 0usize;
+    let mut head_end = 0usize;
+    for (i, l) in file.split(|&c| c == b'\n').enumerate() {
+        let start = pos;
+        pos += l.len() + 1;
+        if l.starts_with(MARK) && !(i == 0 && l.starts_with(b"<!-- lumen:conversation")) {
+            head_end = start;
+            break;
+        }
+        head_end = pos.min(file.len());
+    }
+    o.put(&file[..head_end]);
+    for s in Setting::ALL {
+        let v = match values.iter().find(|(k, _)| *k == s) {
+            Some((_, Some(v))) => Some(*v),
+            Some((_, None)) | None => setting(file, s),
+        };
+        if let Some(v) = v.filter(|v| !v.is_empty()) {
+            set(s, v, o);
+        }
+    }
+    // the rest, minus every setting block
+    let mut skip = false;
+    let mut pos = head_end;
+    for l in file[head_end..].split(|&c| c == b'\n') {
+        let start = pos;
+        pos += l.len() + 1;
+        if l.starts_with(MARK) {
+            skip = l.starts_with(SET);
+        }
+        if !skip {
+            o.put(&file[start..pos.min(file.len())]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     extern crate std;
     use std::string::String;
     use std::vec::Vec;
+
+    #[test]
+    fn settings_ride_in_the_file_and_older_parsers_skip_them() {
+        let mut buf = [0u8; 1024];
+        let mut o = Out::new(&mut buf);
+        header(4, 9, &mut o);
+        turn(Who::User, b"first question", &mut o);
+        set(Setting::Model, b"gemini-2.5-flash", &mut o);
+        turn(Who::Assistant, b"answer", &mut o);
+        set(Setting::Title, b"Renamed", &mut o);
+        set(Setting::Title, b"Renamed twice", &mut o);
+        let n = o.done().unwrap();
+        let file = &buf[..n];
+        assert_eq!(setting(file, Setting::Title), Some(b"Renamed twice".as_slice()));
+        assert_eq!(setting(file, Setting::Model), Some(b"gemini-2.5-flash".as_slice()));
+        assert_eq!(setting(file, Setting::System), None);
+        assert_eq!(title_of(file, 40), b"Renamed twice");
+        assert_eq!(title(file, 40), b"first question");
+        let mut turns = 0;
+        let mut lines = std::vec::Vec::new();
+        parse(file, &mut |e| match e {
+            Ev::Begin(_) => turns += 1,
+            Ev::Line(l) => lines.push(l.to_vec()),
+        });
+        assert_eq!(turns, 2);
+        assert_eq!(lines, [b"first question".to_vec(), b"answer".to_vec()]);
+        // rewrite: settings move to the head, one block each, turns kept
+        let mut out = [0u8; 1024];
+        let mut o = Out::new(&mut out);
+        rewrite(file, &[(Setting::System, Some(b"Be terse.\nNo tables.".as_slice()))], &mut o);
+        let m = o.done().unwrap();
+        let re = core::str::from_utf8(&out[..m]).unwrap();
+        assert!(re.starts_with("<!-- lumen:conversation v1 seq=4 boot_ms=9 -->\n# Lumen conversation 4\n\n<!-- lumen:set title -->\nRenamed twice\n\n<!-- lumen:set model -->\ngemini-2.5-flash\n\n<!-- lumen:set system -->\nBe terse.\nNo tables.\n\n<!-- lumen:user -->\nfirst question\n"), "{re}");
+        assert_eq!(re.matches("lumen:set").count(), 3);
+        assert_eq!(setting(&out[..m], Setting::System), Some(b"Be terse.\nNo tables.".as_slice()));
+        assert!(re.ends_with("<!-- lumen:assistant -->\nanswer\n\n"));
+    }
 
     #[test]
     fn path_fits_the_ring3_open_cap() {
