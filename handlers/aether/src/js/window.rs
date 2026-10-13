@@ -9,6 +9,12 @@
 //! properties of the global object; its prototype chain is Window.prototype → WindowProperties (the
 //! named-properties object: `window.foo` finds `<div id=foo>`) → EventTarget.prototype.
 
+/// AETHERFRAMES (SR83): the browsing-context tree's script half (nested realms, `contentWindow`,
+/// `postMessage`, the cross-origin WindowProxy subset) — `js/frames.rs`, declared here beside the
+/// Window it extends.
+#[path = "frames.rs"]
+pub mod frames;
+
 use super::dom::{self, iface, register_iface, with_doc, wrap};
 use super::idl::{self, *};
 use super::{page, TargetKey};
@@ -296,6 +302,11 @@ fn global_zero(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
     Ok(num(0.0))
 }
 
+/// `window.length` (HTML §7.2.4): the number of document-tree child navigables.
+fn global_frames_length(vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
+    Ok(num(frames::child_count(vm, crate::frames::TOP) as f64))
+}
+
 fn global_origin(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
     let u = super::page_url();
     Ok(s(&url::Url::parse(&u).map(|u| super::html::url_part(&u, "origin")).unwrap_or_else(|_| "null".into())))
@@ -341,27 +352,11 @@ fn window_scroll(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
+/// HTML §9.3.3 on the top window: targetOrigin, the structured clone, the incumbent window as
+/// `source` (AETHERFRAMES: a nested document posting to `parent` is the source), queued on the posted
+/// message task source — `frames::post_message`.
 fn post_message(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    need(vm, ctx, 1, "Window", "postMessage")?;
-    let data = arg(vm, ctx, 0);
-    // HTML §9.3.3: a MessageEvent at the window, queued on the posted message task source.
-    let fp = vm.intr().function_proto;
-    let f = vm.make_native_with("", 0, deliver_message, false, Some(fp), vec![data]);
-    let r = root(vm, Value::Object(f));
-    page(|p| p.tasks.push_back(super::Task::Callback(r)));
-    Ok(Value::Undefined)
-}
-
-fn deliver_message(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let data = vm.native_slot(ctx.callee, 0);
-    let init = vm.new_plain_object();
-    vm.create_data_property(init, PropertyKey::from_str("data"), data)?;
-    let origin = global_origin(vm, ctx)?;
-    vm.create_data_property(init, PropertyKey::from_str("origin"), origin)?;
-    vm.create_data_property(init, PropertyKey::from_str("source"), Value::Object(vm.realm().global))?;
-    let e = super::events::new_event(vm, "MessageEvent", "message", false, false, Some(init));
-    super::events::dispatch(vm, e, TargetKey::Window);
-    Ok(Value::Undefined)
+    frames::post_message(vm, ctx, crate::frames::TOP)
 }
 
 fn ledger_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -780,23 +775,30 @@ fn this_doc(vm: &mut Vm, ctx: &CallCtx) -> JsResult<usize> {
 fn ready_state(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let d = this_doc(vm, ctx)?;
     if d != dom::main_doc() {
-        return Ok(s("complete"));
+        // A nested document reads its context's readiness; any other document is "complete".
+        return Ok(s(frames::readiness_of_document(d)));
     }
     Ok(s(page(|p| p.ready_state)))
 }
 
 fn current_script_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let d = this_doc(vm, ctx)?;
-    if d != dom::main_doc() {
-        return Ok(Value::Null);
-    }
     let c = page(|p| p.current_script);
+    if d != dom::main_doc() {
+        // A nested document's own script (AETHERFRAMES runs them with `currentScript` set).
+        let mine = c.filter(|&el| dom::node_document(el) == d && frames::url_of_document(d).is_some());
+        return Ok(dom::wrap_opt(vm, mine));
+    }
     Ok(dom::wrap_opt(vm, c))
 }
 
 fn default_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let d = this_doc(vm, ctx)?;
-    Ok(if d == dom::main_doc() { Value::Object(vm.realm().global) } else { Value::Null })
+    if d == dom::main_doc() {
+        return Ok(Value::Object(vm.realm().global));
+    }
+    // A nested document's window (AETHERFRAMES); null for a document with no browsing context.
+    Ok(frames::window_of_document(vm, d))
 }
 
 fn cookie_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -818,12 +820,22 @@ fn cookie_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
+/// The URL of document `d`: the page's for the main document, a nested context's or a created
+/// document's own otherwise.
+fn doc_url_of(d: usize) -> Option<url::Url> {
+    if d == dom::main_doc() {
+        return current_url();
+    }
+    let u = page(|p| p.docs.get(&d).map(|m| m.url.clone())).unwrap_or_else(super::page_url);
+    url::Url::parse(&u).ok()
+}
+
 fn doc_str(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_doc(vm, ctx)?;
+    let d = this_doc(vm, ctx)?;
     let which = callee_str(vm, ctx);
     Ok(s(&match which.as_str() {
         "referrer" => String::new(),
-        "domain" => current_url().map(|u| u.hostname()).unwrap_or_default(),
+        "domain" => doc_url_of(d).map(|u| u.hostname()).unwrap_or_default(),
         "visibilityState" => "visible".into(),
         "designMode" => "off".into(),
         "lastModified" => {
@@ -835,6 +847,26 @@ fn doc_str(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
         _ => String::new(),
     }))
+}
+
+/// `document.domain = v` (HTML §7.5.2) — refused. A document with no host (opaque origin, sandboxed)
+/// throws "SecurityError"; so does a value that is neither the host nor a dot-boundary suffix of it.
+/// A permitted value changes nothing: Aether's agent clusters are origin-keyed (Chromium's default
+/// since 2022), where the setter does not relax the same-origin check.
+fn doc_domain_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let d = this_doc(vm, ctx)?;
+    let v = string(vm, &arg(vm, ctx, 0))?.to_ascii_lowercase();
+    let host = doc_url_of(d).and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
+    let sandboxed = crate::frames::by_document(d).and_then(crate::frames::get).is_some_and(|c| c.origin.starts_with("null"));
+    if host.is_empty() || sandboxed {
+        return throw_dom(vm, "SecurityError", "Failed to set the 'domain' property on 'Document': Assignment is forbidden for sandboxed iframes.");
+    }
+    let suffix = v == host || (!v.is_empty() && v.contains('.') && host.ends_with(&format!(".{v}")) && host.parse::<std::net::IpAddr>().is_err());
+    if !suffix {
+        return throw_dom(vm, "SecurityError", &format!("Failed to set the 'domain' property on 'Document': '{v}' is not a suffix of '{host}'."));
+    }
+    crate::ledger::record_dom("document.domain-setter-no-effect");
+    Ok(Value::Undefined)
 }
 
 /// Days since 1970-01-01 → (year, month, day) (proleptic Gregorian).
@@ -864,7 +896,12 @@ fn doc_has_focus(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn active_element(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let d = this_doc(vm, ctx)?;
     if d != dom::main_doc() {
-        return Ok(Value::Null);
+        // A nested document has no focused area of its own here: its body (else its root element).
+        if frames::url_of_document(d).is_none() {
+            return Ok(Value::Null);
+        }
+        let f = dom::body_of(d).or_else(|| dom::document_element_of(d));
+        return Ok(dom::wrap_opt(vm, f));
     }
     let f = page(|p| p.focused).filter(|&f| dom::is_connected(f)).or_else(|| dom::body_of(d)).or_else(|| dom::document_element_of(d));
     Ok(dom::wrap_opt(vm, f))
@@ -873,7 +910,7 @@ fn active_element(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn doc_location(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let d = this_doc(vm, ctx)?;
     if d != dom::main_doc() {
-        return Ok(Value::Null);
+        return Ok(frames::location_of_document(vm, d));
     }
     Ok(location_obj(vm))
 }
@@ -949,10 +986,14 @@ thread_local! {
 /// The element `window[name]` names: the first element with that id, or an `embed`/`form`/`img`/
 /// `object` with that name.
 fn named_element(name: &str) -> Option<usize> {
+    named_element_in(dom::main_doc(), name)
+}
+
+/// [`named_element`] over document `doc` (a nested context's window names its own document's elements).
+fn named_element_in(doc: usize, name: &str) -> Option<usize> {
     if name.is_empty() {
         return None;
     }
-    let doc = dom::main_doc();
     with_doc(|d| {
         d.query_first(html_core::NodeId(doc), |d, i| {
             d.element(i).is_some_and(|e| {
@@ -983,8 +1024,14 @@ fn wp_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if vm.has_property(t, &key)? {
         return vm.get_with_receiver(t, &key, &recv);
     }
+    // AETHERFRAMES: the receiver is the top window or a nested one; its child navigables come first
+    // (`window[0]`, `window["frameName"]`), then its document's named elements.
+    let owner = recv.as_object().and_then(frames::ctx_of_global).unwrap_or(crate::frames::TOP);
+    if let Some(w) = frames::named_or_indexed(vm, owner, &key) {
+        return Ok(w);
+    }
     if let Some(n) = wp_name(vm, ctx)? {
-        if let Some(el) = named_element(&n) {
+        if let Some(el) = named_element_in(frames::document_of(owner), &n) {
             return Ok(wrap(vm, el));
         }
     }
@@ -998,6 +1045,9 @@ fn wp_has(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if vm.has_property(t, &key)? {
         return Ok(Value::Bool(true));
     }
+    if frames::named_or_indexed(vm, crate::frames::TOP, &key).is_some() {
+        return Ok(Value::Bool(true));
+    }
     Ok(Value::Bool(wp_name(vm, ctx)?.and_then(|n| named_element(&n)).is_some()))
 }
 
@@ -1008,8 +1058,12 @@ fn wp_gopd(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if let Some(d) = vm.get_own_property(t, &key)? {
         return Ok(vm.from_property_descriptor(&d));
     }
-    if let Some(el) = wp_name(vm, ctx)?.and_then(|n| named_element(&n)) {
-        let v = wrap(vm, el);
+    let frame = frames::named_or_indexed(vm, crate::frames::TOP, &key);
+    let named = match frame {
+        Some(w) => Some(w),
+        None => wp_name(vm, ctx)?.and_then(|n| named_element(&n)).map(|el| wrap(vm, el)),
+    };
+    if let Some(v) = named {
         let o = vm.new_plain_object();
         vm.create_data_property(o, PropertyKey::from_str("value"), v)?;
         vm.create_data_property(o, PropertyKey::from_str("writable"), Value::Bool(true))?;
@@ -1099,7 +1153,7 @@ pub fn install(vm: &mut Vm) {
     for name in ["innerWidth", "innerHeight", "outerWidth", "outerHeight", "scrollX", "scrollY", "pageXOffset", "pageYOffset", "devicePixelRatio", "screenX", "screenY", "screenLeft", "screenTop"] {
         global_accessor(vm, name, global_number, Some(replaceable_set), Some(name), false);
     }
-    global_accessor(vm, "length", global_zero, Some(replaceable_set), Some("length"), false);
+    global_accessor(vm, "length", global_frames_length, Some(replaceable_set), Some("length"), false);
     global_accessor(vm, "opener", global_null, Some(replaceable_set), Some("opener"), false);
     global_accessor(vm, "frameElement", global_null, None, None, false);
     global_accessor(vm, "closed", global_false, None, None, false);
@@ -1228,9 +1282,10 @@ pub fn install(vm: &mut Vm) {
     attr(vm, dp, "currentScript", current_script_get, None);
     attr(vm, dp, "defaultView", default_view, None);
     attr(vm, dp, "cookie", cookie_get, Some(cookie_set));
-    for name in ["referrer", "domain", "lastModified", "visibilityState", "designMode"] {
+    for name in ["referrer", "lastModified", "visibilityState", "designMode"] {
         attr_with(vm, dp, name, doc_str, None, s(name));
     }
+    attr_with(vm, dp, "domain", doc_str, Some(doc_domain_set), s("domain"));
     attr(vm, dp, "hidden", doc_hidden, None);
     op(vm, dp, "hasFocus", 0, doc_has_focus);
     attr(vm, dp, "activeElement", active_element, None);
@@ -1259,4 +1314,8 @@ pub fn install(vm: &mut Vm) {
     // crypto, fetch/XMLHttpRequest, storage, MessageChannel, the observer stubs, structuredClone.
     crate::api::fetch::init(vm);
     crate::api::platform::init(vm);
+
+    // AETHERFRAMES (SR83): `contentDocument`/`contentWindow`, the clone and cross-origin helpers, and
+    // the top context's record (after the preludes, which the nested realms share).
+    frames::install(vm);
 }

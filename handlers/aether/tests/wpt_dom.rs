@@ -193,12 +193,8 @@ fn needs_server(name: &str, src: &str) -> bool {
 /// set minus these; the reasons name a surface outside this arc, never a failing one inside it.
 fn excluded(name: &str, src: &str) -> Option<&'static str> {
     let base = name.rsplit('/').next().unwrap_or(name);
-    if src.contains("<iframe")
-        || src.contains("createElement(\"iframe\")")
-        || src.contains("createElement('iframe')")
-        || src.contains("window.open(")
+    if src.contains("window.open(")
         || src.contains("<frameset")
-        || src.contains("contentWindow")
         || src.contains("<object")
     {
         return Some("frames / browsing contexts");
@@ -621,7 +617,7 @@ fn net_excluded(rel: &str, src: &str) -> Option<String> {
     if src.contains("RemoteContextHelper") || name.contains("back-forward-cache") {
         return Some("bfcache / remote browsing contexts".into());
     }
-    if src.contains("<iframe") || src.contains("createElement('iframe')") || src.contains("createElement(\"iframe\")") || src.contains("window.open(") || src.contains("document.domain") || src.contains("frames[") || src.contains("contentWindow") {
+    if src.contains("window.open(") || src.contains("document.domain") {
         return Some("frames / browsing contexts / document.domain".into());
     }
     if src.contains("://天気") || src.contains("\\u5929") {
