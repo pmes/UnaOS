@@ -36,18 +36,37 @@ pub const WINDOW_MS: u64 = 30_000;
 pub const BOUND_MS: u64 = 100;
 
 /// Stamp names ([`stamp`] ids index this). A new non-render job on the render task adds its name here.
-pub const WHAT_NAMES: [&str; 4] = ["-", "wallpaper-probe", "dock-console", "quarry"];
+pub const WHAT_NAMES: [&str; 10] = ["-", "wallpaper-probe", "dock-console", "quarry", "quarry.open", "quarry.viewers", "quarry.settings", "quarry.font", "quarry.activity", "quarry.panes"];
 /// WALLPAPER's default probe (`~/Desktop/WALL.PNG`, `/WALL.PNG`): two volume stats and, when found, a decode.
 pub const W_WALLPAPER: u8 = 1;
 /// The dock's console launch drain (`dock::console_launch_service`).
 pub const W_DOCK_CONSOLE: u8 = 2;
 /// Quarry's latch drain (`quarry::service`: an open is a panel read and two `read_dir`s).
 pub const W_QUARRY: u8 = 3;
+/// SMALLFIX10 (B539 item 3): the parts of `quarry::service`, stamped INSIDE the `quarry` stamp (a nested stamp —
+/// see [`Stamp`]). Flight 31 named only `quarry:225`, the whole furniture drain; these say which drain it was.
+/// `reap_jobs` + the dock's reopen latch (`open` reads the panel and two `read_dir`s).
+pub const W_Q_OPEN: u8 = 4;
+/// The viewers' latches: facet, fileview, player (and its `tick`), textedit.
+pub const W_Q_VIEWERS: u8 = 5;
+/// `settings::service`: launcher, appswitch, the filetype view, the name index, prefs (its 2 s delete watch:
+/// two `stat`s per domain file under `SAVE_LOCK`), login items, settings files, appearance, brightness.
+pub const W_Q_SETTINGS: u8 = 6;
+/// The font path: `text::service` (the TrueType service), `metrics::ignite`, the KERNELFONT2 repaint pass.
+pub const W_Q_FONT: u8 = 7;
+/// Activity's once-a-second census repaint.
+pub const W_Q_ACTIVITY: u8 = 8;
+/// Quarry's own panes: the jobs status line, Quick Look, columns, open-with, the live directory relist.
+pub const W_Q_PANES: u8 = 9;
 /// The jobs this arc moved OFF the render task (their runs on the worker are counted by [`moved`]).
 const MOVED_IDS: [u8; 1] = [W_WALLPAPER];
 
-/// The stamp in flight on the render task, packed `start_ms << 8 | id` (0 = none).
+/// The stamp in flight on the render task, packed `start_ms << 8 | id` (0 = none). A nested stamp replaces it
+/// and puts the enclosing one back when it drops (SMALLFIX10), so it always names the INNERMOST job in flight.
 static CUR: AtomicU64 = AtomicU64::new(0);
+/// SMALLFIX10 (B539 item 3): the longest nested stamp that finished inside the stamp in flight, packed
+/// `dur_ms << 8 | id`; the enclosing stamp takes it (and clears it) when it drops.
+static INNER: AtomicU64 = AtomicU64::new(0);
 /// The last finished stamps, packed `start_ms << 32 | dur_ms << 8 | id` (ms fit 32/24 bits: 49 days / 4.6 h).
 static RING: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static RING_HEAD: AtomicU32 = AtomicU32::new(0);
@@ -67,7 +86,7 @@ static WIN_CLOSED: AtomicBool = AtomicBool::new(false);
 /// The end of the last composite pass (lag's us clock).
 static LAST_PASS_US: AtomicU64 = AtomicU64::new(0);
 /// Runs of each moved job on its worker (index = stamp id).
-static MOVED: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static MOVED: [AtomicU32; WHAT_NAMES.len()] = [const { AtomicU32::new(0) }; WHAT_NAMES.len()];
 static REG: AtomicBool = AtomicBool::new(false);
 
 /// Is this the render task (`render`, or its re-homed twin)? lag's own test, repeated (lag's is private).
@@ -84,17 +103,26 @@ fn render_here() -> bool {
 }
 
 /// A stamp in flight; dropping it records the job's interval. Inert off the render task.
-pub struct Stamp(u64);
+///
+/// SMALLFIX10 (B539 item 3) — NESTING. `.1` is the stamp this one interrupted (0 = none). A nested stamp is not
+/// a ring record of its own (six sub-drains a pass would evict the ring's eight records every pass); it feeds
+/// [`INNER`], and the enclosing stamp, when it drops, is RECORDED UNDER ITS LONGEST CHILD'S NAME if that child
+/// took at least half of it — so the stall line and the witness say `quarry.settings:225`, not `quarry:225`,
+/// and a stamp whose time was spread across its parts keeps its own name.
+pub struct Stamp(u64, u64);
 
 /// A non-render job begins on the render task: its name goes in [`CUR`] until the returned [`Stamp`] drops.
 #[inline]
 pub fn stamp(id: u8) -> Stamp {
     if !ON || !render_here() {
-        return Stamp(0);
+        return Stamp(0, 0);
     }
     let w = (crate::arch::ms().max(1) << 8) | id as u64;
-    CUR.store(w, Release);
-    Stamp(w)
+    let outer = CUR.swap(w, AcqRel);
+    if outer == 0 {
+        INNER.store(0, Release); // a fresh outermost stamp: no child of an earlier one is charged to it
+    }
+    Stamp(w, outer)
 }
 
 impl Drop for Stamp {
@@ -102,9 +130,17 @@ impl Drop for Stamp {
         if self.0 == 0 {
             return;
         }
-        let _ = CUR.compare_exchange(self.0, 0, AcqRel, Relaxed);
-        let (start, id) = (self.0 >> 8, self.0 & 0xff);
+        let _ = CUR.compare_exchange(self.0, self.1, AcqRel, Relaxed); // SMALLFIX10: the enclosing stamp is in flight again
+        let (start, mut id) = (self.0 >> 8, self.0 & 0xff);
         let dur = crate::arch::ms().saturating_sub(start).min(0xff_ffff);
+        if self.1 != 0 {
+            INNER.fetch_max((dur << 8) | id, Relaxed); // SMALLFIX10: a child — charged to its parent's record, not the ring
+            return;
+        }
+        let inner = INNER.swap(0, AcqRel);
+        if inner != 0 && (inner >> 8) * 2 >= dur {
+            id = inner & 0xff; // SMALLFIX10: the child that took at least half names the record
+        }
         let i = (RING_HEAD.fetch_add(1, Relaxed) as usize) % RING.len();
         RING[i].store(((start & 0xffff_ffff) << 32) | (dur << 8) | id, Release);
         let l0 = LOGIN_MS.load(Acquire);
