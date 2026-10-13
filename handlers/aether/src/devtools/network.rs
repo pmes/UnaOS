@@ -14,6 +14,12 @@
 //! non-GET, a `file:` / `data:` load. The cache's times are Unix seconds, so `time_ms` has one-second
 //! resolution for those rows.
 //!
+//! AETHERDEVTOOLS3 (SR128): each row recorded in the cache also carries the response fields as stored (the
+//! `Entry`'s headers, content codings already decoded, `Set-Cookie` removed), the request fields the
+//! cache kept (only the ones the response's `Vary` named — the cache stores no other request field, so
+//! no other is shown), and a body preview ([`preview`]: JSON pretty-printed, text as is, an image as its
+//! format and pixel size read from its header, anything else as its byte count).
+//!
 //! Requests script makes (`fetch`, XHR, a synchronous exchange) come from `api::fetch::request_log`
 //! (AETHERDEVTOOLS2): the per-request log the fetch worker keeps as each exchange runs — method, status,
 //! Content-Type, bytes and wall time in ms — so a `no-store` answer, a POST or a failed request appears
@@ -71,7 +77,34 @@ pub struct Request {
     pub blocked: Option<String>,
     /// Why a script request failed (a refusal, a network error, `cancelled`).
     pub error: Option<String>,
+    /// The stored response fields, in stored order (empty: not recorded).
+    pub response_headers: Vec<(String, String)>,
+    /// The request fields the cache kept (those the response's `Vary` named, absent ones as `(absent)`).
+    pub request_headers: Vec<(String, String)>,
+    /// The stored body's preview (None: no body recorded).
+    pub preview: Option<Preview>,
 }
+
+/// A response body as the Network panel previews it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preview {
+    /// A zero-length body.
+    Empty,
+    /// JSON, pretty-printed (two-space indent).
+    Json(String),
+    /// Text as delivered (at most [`PREVIEW_BYTES`]).
+    Text(String),
+    /// An image: its format and pixel size from its header.
+    Image { format: &'static str, width: u32, height: u32 },
+    /// Anything else: the byte count.
+    Binary(usize),
+}
+
+/// Bytes of a text body the preview keeps.
+pub const PREVIEW_BYTES: usize = 64 * 1024;
+
+/// Preview lines [`Request::detail_lines`] shows before it clips.
+pub const PREVIEW_LINES: usize = 12;
 
 impl Request {
     /// The row as the text face's columns.
@@ -94,6 +127,200 @@ impl Request {
         }
         s
     }
+
+    /// Whether the cache recorded the exchange's headers or body.
+    pub fn has_detail(&self) -> bool {
+        !self.response_headers.is_empty() || !self.request_headers.is_empty() || self.preview.is_some()
+    }
+
+    /// The row's detail block, indented under it: the response headers, the request headers the cache
+    /// kept, and the body preview (at most [`PREVIEW_LINES`] lines of it). A row the cache holds nothing of
+    /// says so.
+    pub fn detail_lines(&self) -> Vec<String> {
+        if !self.has_detail() {
+            return vec!["    headers and body: not recorded".to_string()];
+        }
+        let mut out = vec![format!("    Response headers ({})", self.response_headers.len())];
+        for (k, v) in &self.response_headers {
+            out.push(format!("      {k}: {v}"));
+        }
+        if !self.request_headers.is_empty() {
+            out.push(format!("    Request headers ({}, the ones Vary named)", self.request_headers.len()));
+            for (k, v) in &self.request_headers {
+                out.push(format!("      {k}: {v}"));
+            }
+        }
+        let body = |out: &mut Vec<String>, kind: &str, text: &str| {
+            let lines: Vec<&str> = text.lines().collect();
+            out.push(format!("    Preview ({kind}, {} lines)", lines.len()));
+            for l in lines.iter().take(PREVIEW_LINES) {
+                out.push(format!("      {l}"));
+            }
+            if lines.len() > PREVIEW_LINES {
+                out.push(format!("      … {} more lines", lines.len() - PREVIEW_LINES));
+            }
+        };
+        match &self.preview {
+            None => out.push("    Preview: no body recorded".to_string()),
+            Some(Preview::Empty) => out.push("    Preview: empty body".to_string()),
+            Some(Preview::Json(t)) => body(&mut out, "JSON", t),
+            Some(Preview::Text(t)) => body(&mut out, "text", t),
+            Some(Preview::Image { format, width, height }) => out.push(format!("    Preview: {format} image, {width} x {height}")),
+            Some(Preview::Binary(n)) => out.push(format!("    Preview: {n} bytes, binary")),
+        }
+        out
+    }
+}
+
+/// The preview of a body of type `mime`: an image by its signature (whatever the type says), JSON
+/// pretty-printed when the type is JSON (`application/json`, `text/json`, `*+json`) or an untyped / plain
+/// text body that parses as a JSON object or array, text when it is UTF-8 with no NUL, else its byte count.
+pub fn preview(mime: Option<&str>, body: &[u8]) -> Preview {
+    if body.is_empty() {
+        return Preview::Empty;
+    }
+    if let Some((format, width, height)) = image_size(body) {
+        return Preview::Image { format, width, height };
+    }
+    let essence = mime.unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let Ok(text) = std::str::from_utf8(body) else { return Preview::Binary(body.len()) };
+    if text.contains('\0') {
+        return Preview::Binary(body.len());
+    }
+    let jsonish = matches!(essence.as_str(), "application/json" | "text/json") || essence.ends_with("+json");
+    let looks = matches!(essence.as_str(), "" | "text/plain") && matches!(text.trim_start().chars().next(), Some('{' | '['));
+    if jsonish || looks {
+        if let Some(p) = pretty_json(text) {
+            return Preview::Json(p);
+        }
+    }
+    let mut end = text.len().min(PREVIEW_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Preview::Text(text[..end].to_string())
+}
+
+/// `text` re-indented as JSON (two spaces per level, `"key": value`, empty containers kept `{}` / `[]`).
+/// None when it is not well-formed structurally: an unterminated string, a bracket that does not match,
+/// text after the value, or a top level that is not an object or array.
+pub fn pretty_json(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut stack: Vec<char> = Vec::new();
+    let mut chars = text.trim().chars().peekable();
+    if !matches!(chars.peek(), Some('{' | '[')) {
+        return None;
+    }
+    let indent = |out: &mut String, n: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(n));
+    };
+    let mut done = false;
+    while let Some(c) = chars.next() {
+        if done && !c.is_whitespace() {
+            return None;
+        }
+        match c {
+            '"' => {
+                out.push('"');
+                loop {
+                    let d = chars.next()?;
+                    out.push(d);
+                    match d {
+                        '\\' => out.push(chars.next()?),
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '{' | '[' => {
+                stack.push(c);
+                out.push(c);
+                while chars.next_if(|n| n.is_whitespace()).is_some() {}
+                let close = if c == '{' { '}' } else { ']' };
+                if chars.peek() == Some(&close) {
+                    chars.next();
+                    stack.pop();
+                    out.push(close);
+                    done = stack.is_empty();
+                } else {
+                    indent(&mut out, stack.len());
+                }
+            }
+            '}' | ']' => {
+                let open = stack.pop()?;
+                if (open == '{') != (c == '}') {
+                    return None;
+                }
+                indent(&mut out, stack.len());
+                out.push(c);
+                done = stack.is_empty();
+            }
+            ',' => {
+                if stack.is_empty() {
+                    return None;
+                }
+                out.push(',');
+                indent(&mut out, stack.len());
+            }
+            ':' => out.push_str(": "),
+            c if c.is_whitespace() => {}
+            c => out.push(c),
+        }
+    }
+    (done && stack.is_empty()).then_some(out)
+}
+
+/// An image's format and pixel size from its header: PNG (IHDR), GIF (logical screen), JPEG (the first SOFn
+/// segment), WebP (VP8, VP8L, VP8X) and BMP. None for anything else or a header cut short.
+pub fn image_size(b: &[u8]) -> Option<(&'static str, u32, u32)> {
+    let be16 = |i: usize| -> Option<u32> { Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32) };
+    let le16 = |i: usize| -> Option<u32> { Some(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32) };
+    let be32 = |i: usize| -> Option<u32> { Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?)) };
+    let le32 = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(i..i + 4)?.try_into().ok()?)) };
+    let le24 = |i: usize| -> Option<u32> { Some(le16(i)? | (*b.get(i + 2)? as u32) << 16) };
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") && b.get(12..16) == Some(&b"IHDR"[..]) {
+        return Some(("PNG", be32(16)?, be32(20)?));
+    }
+    if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        return Some(("GIF", le16(6)?, le16(8)?));
+    }
+    if b.starts_with(b"RIFF") && b.get(8..12) == Some(&b"WEBP"[..]) {
+        return match b.get(12..16)? {
+            b"VP8 " => Some(("WebP", le16(26)? & 0x3fff, le16(28)? & 0x3fff)),
+            b"VP8L" => {
+                let (b0, b1, b2, b3) = (*b.get(21)? as u32, *b.get(22)? as u32, *b.get(23)? as u32, *b.get(24)? as u32);
+                Some(("WebP", 1 + (((b1 & 0x3f) << 8) | b0), 1 + (((b3 & 0xf) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))))
+            }
+            b"VP8X" => Some(("WebP", 1 + le24(24)?, 1 + le24(27)?)),
+            _ => None,
+        };
+    }
+    if b.starts_with(b"BM") && b.len() >= 26 {
+        return Some(("BMP", (le32(18)? as i32).unsigned_abs(), (le32(22)? as i32).unsigned_abs()));
+    }
+    if b.starts_with(&[0xff, 0xd8]) {
+        let mut i = 2;
+        while i + 3 < b.len() {
+            if b[i] != 0xff {
+                return None;
+            }
+            let m = b[i + 1];
+            if m == 0xff {
+                i += 1;
+                continue;
+            }
+            if matches!(m, 0xc0..=0xcf) && !matches!(m, 0xc4 | 0xc8 | 0xcc) {
+                return Some(("JPEG", be16(i + 7)?, be16(i + 5)?));
+            }
+            if matches!(m, 0x01 | 0xd0..=0xd8) {
+                i += 2;
+                continue;
+            }
+            i += 2 + be16(i + 2)? as usize;
+        }
+    }
+    None
 }
 
 /// The resource references of the document, in tree order (the document first), deduplicated.
@@ -190,7 +417,20 @@ pub fn requests(engine: &AetherEngine) -> Vec<Request> {
     let mut out: Vec<Request> = references(engine)
         .into_iter()
         .map(|(initiator, url)| {
-            let mut r = Request { url: url.clone(), method: "GET", initiator, status: None, mime: None, size: None, time_ms: None, blocked: blocked_for(&url), error: None };
+            let mut r = Request {
+                url: url.clone(),
+                method: "GET",
+                initiator,
+                status: None,
+                mime: None,
+                size: None,
+                time_ms: None,
+                blocked: blocked_for(&url),
+                error: None,
+                response_headers: Vec::new(),
+                request_headers: Vec::new(),
+                preview: None,
+            };
             if let Ok(u) = html_core::url::Url::parse(&url) {
                 if matches!(u.scheme(), "http" | "https") {
                     let part = partition.clone().or_else(|| gneiss_pal::api::http::site_of(&url)).unwrap_or_default();
@@ -200,6 +440,9 @@ pub fn requests(engine: &AetherEngine) -> Vec<Request> {
                         r.mime = e.headers.get("content-type").map(str::to_string);
                         r.size = Some(e.body.len());
                         r.time_ms = Some((e.response_time - e.request_time).max(0) * 1000);
+                        r.response_headers = e.headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        r.request_headers = e.vary.iter().map(|(k, v)| (k.clone(), v.clone().unwrap_or_else(|| "(absent)".to_string()))).collect();
+                        r.preview = Some(preview(r.mime.as_deref(), &e.body));
                     }
                 }
             }
@@ -218,6 +461,9 @@ pub fn requests(engine: &AetherEngine) -> Vec<Request> {
                 time_ms: None,
                 blocked: Some(rule),
                 error: None,
+                response_headers: Vec::new(),
+                request_headers: Vec::new(),
+                preview: None,
             });
         }
     }
@@ -233,6 +479,10 @@ pub fn requests(engine: &AetherEngine) -> Vec<Request> {
             blocked: None,
             error: q.error,
             url: q.url,
+            // The fetch worker's log keeps no fields or body (api/fetch.rs `ScriptRequest`).
+            response_headers: Vec::new(),
+            request_headers: Vec::new(),
+            preview: None,
         });
     }
     out

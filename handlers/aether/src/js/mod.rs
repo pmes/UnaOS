@@ -383,6 +383,13 @@ fn script_file() -> String {
     page_url()
 }
 
+/// AETHERDEVTOOLS3 (SR128): the devtools Sources panel's goto hook — the source the engine ran under the
+/// frame file name `file` (the latest per name, as the console excerpt reads it), else the external script
+/// the loader pre-fetched under that absolute URL. None when it holds neither.
+pub fn ran_source(file: &str) -> Option<std::rc::Rc<str>> {
+    page(|p| p.ran_sources.get(file).cloned().or_else(|| p.script_sources.get(file).map(|s| std::rc::Rc::from(s.as_str()))))
+}
+
 /// Keeps `src` as the source of `file` for console excerpts (bounded by [`RAN_SOURCES_CAP`]).
 fn remember_source(file: &str, src: &str) {
     page(|p| {
