@@ -1,0 +1,451 @@
+[      ?ms] :: video: edid present=0 hdr=- sum=- native=- len=0 ::
+[      ?ms] :: WXN-M3B: xseg=[0x7973F000,0x7A276000) xpages=2871 armed=0 huge_leaves=5 absent=0 already_ro=0 -> REFUSED (the executable extent is not the all-4K-present-writable map this stage models; no entry written, map unmodified) ::
+[      ?ms] :: SPLASH: stage=gop at_ms=0 paint_ms=5 WxH=2880x1800 ::
+[      ?ms] :: FRGUARD: boot volume serial=0x663975e3 — Default-write substitution guard ARMED ::
+[      ?ms] [ioapic] census ioapics=1 isos=2 gsis=24 nmis=8 dropped=0 madt_entries=11 == witness ::
+[    158ms] :: BOOTCLOCK: firmware->loader=13802ms loader-read=2693ms loader-jump=36ms kernel-entry=44538500611 tsc_hz=2693850140(measured) ::
+[05:56:50Z] :: LOADER: firmware->loader=13802ms loader->kernel=2730ms stages=firmware:11ms,gop:9ms,volumes:4ms,kernel:2669ms,elf:6ms,discover:5ms,jump:24ms volumes=8 kernel_bytes=16022960 uart=none retries=0 timeouts=0 ::
+[05:56:50Z] [tlb] shootdown pages=1 cpus=1 acked=1 us=0
+[05:56:50Z] [clock] source=tsc hz=2693850140 invariant=1 per_core_tick=1 cores=8 skew_max_cycles=40 sync_timeouts=0 offsets=none (CLOCKCORE)
+[05:56:50Z] :: EHCI-HID: [0] EP0 DATA error addr=2 req=0xa1/0x82 token=0x80228d40 (halted/xact — likely STALL) ::
+[05:56:50Z] [uvc] probe stage=min req=0x82 wValue=0x0100 wIndex=1 wLength=34 STALLED reason=stall — sequence ended, NOT retried
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=0 alt=0 alts=1 class=0xff/0x01/0x01 neps=3 eps=[IN1/int/16 IN2/blk/64 OUT2/blk/64] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=1 alt=0 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/0 OUT3/iso/0] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=1 alt=1 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/9 OUT3/iso/9] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=1 alt=2 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/17 OUT3/iso/17] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=1 alt=3 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/25 OUT3/iso/25] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=1 alt=4 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/33 OUT3/iso/33] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=1 alt=5 alts=6 class=0xe0/0x01/0x01 neps=2 eps=[IN3/iso/49 OUT3/iso/49] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=2 alt=0 alts=1 class=0xff/0xff/0xff neps=2 eps=[IN4/blk/32 OUT4/blk/32] == witness ::
+[05:56:51Z] :: bt-l0: [1] census addr=7 intf=3 alt=0 alts=1 class=0xfe/0x01/0x01 neps=0 eps=[] == witness ::
+[05:56:51Z] :: bt-l0: [1] claim addr=7 intf=0 alt=0 class=0xff/0x01/0x01 evt_ep=IN1 -> selected by ENDPOINT EVIDENCE, tier 2 (vendor-classed: RF/Bluetooth subclass+protocol + int-IN/bulk-IN/bulk-OUT HCI fingerprint) == witness ::
+[05:56:51Z] :: bt-l0: [1] reachability addr=7 spd=FS intf=0 class=0xff/0x01/0x01 evt_ep=IN1 mps=16 interval=1 bulk_in=IN2/64 bulk_out=OUT2/64 parent=(hub 4 port 3) tt=(hub 3 port 1) -> TT-INHERITED(parent hub is not high speed; TT is the nearest HS ancestor) == witness ::
+[05:56:51Z] :: EHCI-HID: [1] [tp] mode req=1 rt=0xa1/0x01 addr=8 if=1 widx=0 wValue=0x0300 status=ok got=8b ms=0 ::
+[05:56:51Z] :: EHCI-HID: [1] [tp] mode req=2 rt=0x21/0x09 addr=8 if=1 widx=0 wValue=0x0300 status=ok got=8b ms=0 ::
+[05:56:51Z] :: EHCI-HID: [1] [tp] mode req=3 rt=0xa1/0x01 addr=8 if=1 widx=0 wValue=0x0300 status=ok got=8b ms=1 ::
+[05:56:51Z] :: TPMODE: requests=3 timeouts=0 first=index0 latched=yes armed_ms=1655 bound=2500 (ctl=1; expect requests=3 timeouts=0 latched=yes) -> ok ::
+[05:56:51Z] :: SMC-BATT: present=true soc=84% volt=11771mV amp=-2508mA full=9962mAh rem=8351mAh ac=derived:discharging retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=1090 busy=31 late=0 == witness ::
+[05:56:51Z] :: igpu: VERDICT: Device reachable and powered (D-State: D0)
+[05:56:51Z] [gen7] arm=banked bdf=0:2.0 ggtt_banked=1 r8=built writes=0 ladder=tests-gen7
+[05:56:51Z] [pcih] aspm cleared rp 0043->0040 ep 0043->0040
+[05:56:51Z] :: SPLASH: arch=x86_64 WxH=2880x1800 ms=9 -> painted ::
+[05:56:51Z] :: SPLASH: stage=takeover at_ms=1934 ::
+[05:56:51Z] [irq] masked section fn=fbcon.rs:1765 ms=23 cpu=0 live=0
+[05:56:51Z] :: fbcon: glyphs-active base=90020000 pitch=16384 cell=7x16 cols=411 rows=112 face=noto16-aa ::
+[05:56:51Z] :: [    1573 ms] ehci:kbd-armed ::
+[05:56:51Z] :: [    1596 ms] ehci:mouse-armed ::
+[05:56:51Z] :: [    1653 ms] ehci:kbd-armed ::
+[05:56:51Z] :: [    1655 ms] ehci:trackpad-armed ::
+[05:56:51Z] :: [    1760 ms] portsw:flip ::
+[05:56:52Z] :: BEAMX86: head=0 vtotal=1852 samples=21878 vblank_delta=2 -> ARMED :: max_vline=1851 adv=5105 panel_h=1800 evo_size=00000000 size_hi=0 size_lo=0 sample_ms=45 census_adv=[5105,0,0,0] census_vbd=[2,0,0,0] — vtotal is SAMPLED (max vline + 1 over 45 ms, rnndb cites no lines-per-frame register in HEAD_STAT); evo_size is the ACTIVE raster readback, so vtotal >= the matching half by the vblank rows is the expected relation, never equality. arch::scanout_beam() now answers and every panel present is bracketed. READ-ONLY: writes=0 ::
+[05:56:52Z] [splash] hold OPEN win=1 2880x1800 (until users::stage_resolve; 5000 ms bound)
+[05:56:52Z] [wc-x] activate bare phase=setter console=none bar=none (R93: nothing of the desktop exists; it is built at login)
+[05:56:52Z] :: GPUBLIT: selftest=ok ce_us=20 cpu_us=197 -> blitter=gpu ::
+[05:56:52Z] [kgr] armed chid=1 rl=0 eng=0 reset=12 win=0x2380000 -> tests kgr (destructive: alone, once, after the CE leg)
+[05:56:52Z] :: KEPLER: fold lines=0 families=0 kept=0 dropped=0 replay=tests keplerlog ::
+[05:56:52Z] :: igpu-dpy: rung=00 name=census ok=1 bdsm=0x8BA00001 ggc=0x00000211 ggtt0=0x8BA00003 ggtt1=0x8BA01003 aux_ctl=0x014300C8 frmcnt=0x00000000 ::
+[05:56:52Z] :: igpu: [GMUX] running Unwind stack self-test ::
+[05:56:52Z] :: igpu: [GMUX] Unwind stack MMIO self-test passed ::
+[05:56:52Z] :: igpu: [GMUX] Unwind stack gmux-dispatch=REACHED (Gmux restore path executed without faulting, not implying restore verified) ::
+[05:56:52Z] :: igpu-dpy: rung=03 name=pp ok=1 pp_write=DECLINED why=panel-not-handed-to-igd bits=cited:IHD-OS-V3-Pt4-sec2.4-pp38-43 pp_window=KEYED delays_programmed=0 pp_unwind=0 pp_ctl=0xABCD0008 pp_sts=0x00000000 on_delays=0x00000000 off_delays=0x00000000 div=0x00186904 ::
+[05:56:52Z] :: igpu-dpy: rung=04 name=dpcd try=1/7 ok=1 dpcd_rev=0x11 elapsed_ms=214 ::
+[05:56:52Z] :: igpu-dpy: rung=06 name=link ok=1 window=DPCD(0x000-0x00F) dpcd_rev=0x11 rate_raw=0x0A rate_decode=TBV-tree-table lanes=4 lanes_plausible=1 enhanced_frame=1 tps3=0 downspread=1 no_aux_tl=1 edp_cfg_cap=0x01 elapsed_ms=217 ::
+[05:56:52Z] :: igpu-dpy: rung=07 name=pps-on ok=1 pp_write=DECLINED why=panel-not-handed-to-igd bits=cited writes=0 pp_unwind=0 t_source=NONE t_dpcd=absent t_edid=absent pp_ctl=0xABCD0008 pp_sts=0x00000000 on_delays=0x00000000 off_delays=0x00000000 div=0x00186904 elapsed_ms=217 ::
+[05:56:52Z] :: igpu-dpy: rung=07b name=pps-read ok=1 writes=0 sample=rung07 doc=IHD-OS-V3-Pt-4-05-12 cite=sec2.4-pp38-43 elapsed_ms=217 ::
+[05:56:52Z] :: igpu-dpy: rung=08 name=link-train-dry ok=1 DRY writes=0 aux_writes=0 pp_unwind=0 gated_on=pps=DECLINED:panel-not-handed-to-igd elapsed_ms=217 ::
+[05:56:52Z] :: igpu-dpy: rung=08b name=modeset-read ok=1 writes=0 doc=IHD-OS-V3-Pt-3-05-12 pipe=A pipe_sel_raw=0 elapsed_ms=217 ::
+[05:56:52Z] :: igpu: [AUX] PRE-SWITCH DPCD Read Failed: aux-timeout-error (status: 0x5D4000C8) ::
+[05:56:52Z] :: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD (panel BLANKED/FLICKERED) ::
+[05:56:52Z] :: igpu: [GMUX] switch read-back mismatch (DDC is the only echo proven on this machine; DISP/EXT are advisory — see the AUX rungs for whether the mux moved): DDC=0x01 DISP=0x02 EXT=0x01 ::
+[05:56:52Z] :: igpu: [AUX] PCH_PP_STATUS/CONTROL Before AUX: STATUS=0x00000000 CONTROL=0xABCD0008 ::
+[05:56:52Z] :: igpu: [AUX] PCH_PP_STATUS/CONTROL After AUX:  STATUS=0x00000000 CONTROL=0xABCD0008 ::
+[05:56:52Z] :: igpu: [AUX] DPCD REV: 0x11 ::
+[05:56:52Z] :: igpu: [AUX] EDID Dump ::
+[05:56:52Z] :: igpu: [AUX] 000: 00 FF FF FF FF FF FF 00 06 10 0E A0 00 00 00 00 ::
+[05:56:52Z] :: igpu: [AUX] 010: 10 15 01 04 A5 21 15 78 02 6F B1 A7 55 4C 9E 25 ::
+[05:56:52Z] :: igpu: [AUX] 020: 0C 50 54 00 00 00 01 01 01 01 01 01 01 01 01 01 ::
+[05:56:52Z] :: igpu: [AUX] 030: 01 01 01 01 01 01 EF 83 40 A0 B0 08 34 70 30 20 ::
+[05:56:52Z] :: igpu: [AUX] 040: 36 00 4B CF 10 00 00 1A 00 00 00 FC 00 43 6F 6C ::
+[05:56:52Z] :: igpu: [AUX] 050: 6F 72 20 4C 43 44 0A 20 20 20 00 00 00 10 00 00 ::
+[05:56:52Z] :: igpu: [AUX] 060: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10 ::
+[05:56:52Z] :: igpu: [AUX] 070: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 E8 ::
+[05:56:52Z] :: video: edid-aux hdr=OK sum=OK native=2880x1800 ppi=221 fw=absent -> published relatch=1.0->2.5 console=160x45 ::
+[05:56:52Z] :: igpu: [GMUX] revert read-back: DDC=0x02 SWITCH_DISP=0x03 READ_DISP=0x03 SWITCH_EXT=0x01 READ_EXT=0x21 (TBV) ::
+[05:56:52Z] :: igpu: [GMUX] EXTERNAL restore=SKIPPED (write-target port, no state read) — SWITCH_EXT(0x40) 0x01->0x01 was NOT written back and does not vote; READ_EXT(0x41) 0x21->0x21 state kepler-owned->kepler-owned ::
+[05:56:52Z] :: igpu-dpy: LADDER highest=10/10 name=end ok=1 pending=2 gmux=MATCH why=none elapsed_ms=219 pp_seen=both pp=0xABCD0008/0x00000000->0xABCD0008/0x00000000 pp_settle_ms=210 aux_port=DPA(0x64010) aux_div=0x0C8 dpcd_tries=1 pps=DECLINED:panel-not-handed-to-igd pending_items=gmux:SWITCH_DDC@0x28<-0x02,gmux:SWITCH_DISPLAY@0x10<-0x03 ::
+[05:56:52Z] :: sdhc: card v2.00+ SDHC block-addressed blocks=60868608 size=29721 MiB rca=0x59b4 ::
+[05:56:52Z] :: SDHCREG: handle=built register=ok blocks=60868608 addressing=block — the internal card IS a program source this boot ::
+[05:56:52Z] :: AHCI: selfcheck port=0 identify=ok sector0=GPT -> armed ::
+[05:56:52Z] [hid] pump task=hid-pump cpu=7 cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)
+[05:56:52Z] [stack] guards armed tasks=12 aps=7 ist=32 bsp=armed page=4096
+[05:56:52Z] [lock] registry armed classes=0 cap=256 (LOCKREG)
+[05:56:52Z] :: PTRLOST: window=1:0 furniture=0:1 backdrop=0:0 furn_subtracted=1 sprite_owns_paint=1 lost_reachable=0 :: PASS ::
+[05:56:52Z] [vfs] root-pass HOLD probe=bt-campaign at=2443ms :: BOOTSLOW: this probe does not serve the root and waits for the root pass's verdict ::
+[05:56:52Z] [boot] step=users-load begin at_ms=2458 budget_ms=249
+[05:56:52Z] [irq] masked section fn=sdhc.rs:2637 ms=11 cpu=2 live=0
+[05:56:52Z] [irq] masked section fn=sdhc.rs:1536 ms=11 cpu=7 live=0
+[05:56:52Z] [users] store pinned via=sdhc vol=0x663975e30003f01e (STOREMOVE B530: every later mount of the store asks this rung and this volume, for the boot)
+[05:56:52Z] :: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none (the pin is read ONCE, at the mount; 4a/4b re-read it at every write — SDHCPOST/SDHCRW, first, once) ::
+[05:56:52Z] [boot] step=users-load end ms=87 budget_ms=249 over=0 blocks_read=37 blocks_written=0 cmds=80 store=fat via=sdhc users=0
+[05:56:52Z] [lock] spin-wait name=sdhc.rs:997 at=sdhc.rs:1537 waiter=9@cpu7 on=12@cpu1 ms=18
+[05:56:52Z] [irq] masked section fn=with_unafs@unafs.rs:793 ms=18 cpu=2 live=1
+[05:56:52Z] :: PART: unafs span check — base LBA 264192 is NOT the start of any accepted MBR partition (blocks=1048576) ::
+[05:56:52Z] [lock] held-too-long name=unafs.rs:567 at=unafs.rs:794 by=15@cpu2 ms=88 waiters=0
+[05:56:53Z] :: [unafsbind] mount=native handle=sdhc ::
+[05:56:53Z] [vfs] root = boot volume serial=0x663975e3 source=sdhc match=/KERNEL.ELF sha=34927a4c unafs=present matches=1 home=- files=1 aliased=- window_off=0x799146c0 window_len=4096 file_off=0x1d46c0 candidates=4 disks=global=absent usb=absent sdhc=present tegra-sd=unbuilt ahci0=present ::
+[05:56:53Z] [vfs] volume mounted /volumes/EFI source=ahci0 rw=no ::
+[05:56:53Z] [vfs] root mount / = native unafs volume source=sdhc rw=yes ::
+[05:56:53Z] :: UNAFSX86: root=unafs disk=sdhc blocks=1048576 gen=26 home=/home -> mounted ::
+[05:56:53Z] [boot] fat sacred: /boot and /volumes/boot are read-only for every principal; writes only through fat_unlock (R99) ::
+[05:56:53Z] [vfs] apps+lib on the native root: /apps /lib are directories of / source=sdhc (R94: real, no links) ::
+[05:56:53Z] [vfs] boot mount /boot = fat boot volume source=sdhc rw=yes ::
+[05:56:53Z] [vfs] volume alias /volumes/boot = fat boot volume source=sdhc (Volumes shows boot/efi only) ::
+[05:56:53Z] [vfs] volume alias /volumes/UnaOS = native unafs root source=sdhc ::
+[05:56:53Z] [vfs] volume /volumes/EFI withdrawn — another disk's EFI system partition is not a volume (R89: Volumes = UnaOS + boot) ::
+[05:56:53Z] [wc-h] vbl_src=irq why=first-need irq=61 vbl_delta=60 ratio_pct=101 wire=msi armed_ms=1020
+[05:56:53Z] [wallpaper] probe try=1 found=0 on=worker cpu=2 ms=708
+[05:56:53Z] [vfs] root = boot volume serial=0x663975e3 source=sdhc match=/KERNEL.ELF sha=34927a4c unafs=present matches=1 home=- files=1 aliased=- window_off=0x799146c0 window_len=4096 file_off=0x1d46c0 candidates=4 disks=global=absent usb=absent sdhc=present tegra-sd=unbuilt ahci0=present ::
+[05:56:53Z] [lock] held-too-long name=users.rs:364 at=users.rs:3548 by=9@cpu7 ms=64 waiters=0
+[05:56:53Z] [vfs] tx what=resolve path=/system/USERS.DAT resolve_ms=23 list_ms=0 blocks=2 hits=4 gen=26
+[05:56:53Z] [users] seat store=unafs:/system/USERS.DAT src=fresh users=0 (the first save writes it; FAT copy untouched, R99) ::
+[05:56:53Z] [login] root locked (R100: no row, no prompt, no set-password; the first user is the administrator)
+[05:56:53Z] [boot] step=root-mount begin at_ms=3462 budget_ms=3891
+[05:56:53Z] [vfs] root = boot volume serial=0x663975e3 source=sdhc match=/KERNEL.ELF sha=34927a4c unafs=present matches=1 home=- files=1 aliased=- window_off=0x799146c0 window_len=4096 file_off=0x1d46c0 candidates=4 disks=global=absent usb=absent sdhc=present tegra-sd=unbuilt ahci0=present ::
+[05:56:53Z] [boot] step=root-mount end ms=60 budget_ms=3891 over=0 blocks_read=48 blocks_written=0 cmds=6 root=attrs
+[05:56:53Z] [tlb] shootdown pages=1 cpus=7 acked=6 us=2000 timeout=1 timeouts=1 missing_mask=2 (the tick catches them up)
+[05:56:53Z] [tlb] shootdown pages=1 cpus=7 acked=6 us=2000 timeout=1 timeouts=2 missing_mask=2 (the tick catches them up)
+[05:56:53Z] [dock] prefs position=bottom autohide=0 via=login
+[05:56:53Z] [dock] dockpin login
+[05:56:53Z] :: DOCKPIN: left=10 minimized=0 pinned=10 running=0 loaded=0 saved=0 -> held ::
+[05:56:53Z] [backlight] seed readback=248 max=1023 level=3 (GLASSLAG: the first step moves from the panel's own level)
+[05:56:53Z] [dock] trash state why=first full=0 took_ms=62 on=worker (HIDSTALL2: read on a change, off the hid pump's core)
+[05:56:53Z] [prefs] load clamped=0
+[05:56:53Z] :: PREFS: path=/settings domains=0 loaded=0 saved=0 ns=system -> loaded ::
+[05:56:53Z] [vfs] tx what=resolve path=/system/fonts/DejaVuSans.ttf resolve_ms=23 list_ms=11 blocks=3 hits=7 gen=26
+[05:56:53Z] [vfs] tx what=read path=/system/fonts/DejaVuSans.ttf resolve_ms=0 list_ms=116 blocks=10 hits=65 gen=26
+[05:56:53Z] :: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (29721 MiB): FAT32 vol@LBA2048 volsec=262144 bps=512 spc=1 nfat=2 fatsz=2017sec reserved=32 fat@LBA2080 data@LBA6114 clusters=258078 rootclus=2 ::
+[05:56:54Z] :: SDHCBLK: sdhc root directory (12 entries) ::
+[05:56:54Z] :: SDHCBLK:   <DIR>              EFI ::
+[05:56:54Z] :: SDHCBLK:   <DIR>              FIRMWARE ::
+[05:56:54Z] :: SDHCBLK:             72       HELLO.BIN ::
+[05:56:54Z] :: SDHCBLK:            157       SRC.SHA ::
+[05:56:54Z] :: SDHCBLK:       38256806       SRC.TGZ ::
+[05:56:54Z] :: SDHCBLK:            109       HELLO.TXT ::
+[05:56:54Z] :: SDHCBLK:       16022960       KERNEL.ELF ::
+[05:56:54Z] :: SDHCBLK:            197       BLOCK.TXT ::
+[05:56:54Z] :: SDHCBLK:            512       GROW.BIN ::
+[05:56:54Z] :: SDHCBLK:             64       S8W.BIN ::
+[05:56:54Z] :: SDHCBLK:           1024       SCRATCH.BIN ::
+[05:56:54Z] :: SDHCBLK:             59       README.TXT ::
+[05:56:54Z] :: SDHC4C-ROOT: NAME=UNALOG.BIN not matched on vol=FAT32@LBA2048 volsec=262144 label=UNAOS serial=0x663975e3 | walk: read=OK sectors=1 slots=13 entries=12 terminator=slot#13 | first8: EFI FIRMWARE HELLO.BIN SRC.SHA SRC.TGZ HELLO.TXT KERNEL.ELF BLOCK.TXT ::
+[05:56:54Z] [vfs] root-pass HOLD probe=witness-fixture at=4073ms :: BOOTSLOW: this probe does not serve the root and waits for the root pass's verdict ::
+[05:56:54Z] [vfs] root-pass BOUND source=sdhc match=/KERNEL.ELF at=4073ms source_seen_at=4073ms wait_ms=0ms pass=1 held=bt-campaign,witness-fixture :: BOOTSLOW: the root is bound on its own pass; the probes named in held= run after it ::
+[05:56:54Z] [tlb] shootdown pages=1 cpus=7 acked=6 us=2000 timeout=1 timeouts=3 missing_mask=2 (the tick catches them up)
+[05:56:54Z] :: BOOTLOG: 6 milestone(s) recorded (GUI-WITNESS ring) ::
+[05:56:54Z] :: BOOTLOG: [    1573 ms] ehci:kbd-armed ::
+[05:56:54Z] :: BOOTLOG: [    1596 ms] ehci:mouse-armed ::
+[05:56:54Z] :: BOOTLOG: [    1653 ms] ehci:kbd-armed ::
+[05:56:54Z] :: BOOTLOG: [    1655 ms] ehci:trackpad-armed ::
+[05:56:54Z] :: BOOTLOG: [    1760 ms] portsw:flip ::
+[05:56:54Z] :: BOOTLOG: [    2435 ms] gui:handoff ::
+[05:56:54Z] :: CLOCK-X1: TSC invariant, ~2693 MHz; monotone (rdtsc +10803535170); uptime 16->20 s (JD17 x86-frozen clock now advances) [paygo: deferred 4010 ms TSC / 4010 ms APIC, uptime +4 s, core=7 — CONSISTENT] == witness ::
+[05:56:54Z] [smc] lid=open raw=0 len=1 at=boot key=MSLD (rung 0: nonzero=closed is the hypothesis)
+[05:56:54Z] :: BPACE: entry t=0ms d=0ms ::
+[05:56:54Z] :: BPACE: fb-wc t=0ms d=0ms ::
+[05:56:54Z] :: BPACE: fb-wc-done t=0ms d=0ms ::
+[05:56:54Z] :: BPACE: core-init t=14ms d=13ms ::
+[05:56:54Z] :: BPACE: mem-init t=57ms d=42ms ::
+[05:56:54Z] :: BPACE: heap t=57ms d=0ms ::
+[05:56:54Z] :: BPACE: acpi t=58ms d=0ms ::
+[05:56:54Z] :: BPACE: calib t=158ms d=100ms ::
+[05:56:54Z] :: BPACE: smp t=218ms d=59ms ::
+[05:56:54Z] :: BPACE: sched t=218ms d=0ms ::
+[05:56:54Z] :: BPACE: pci-enter t=268ms d=50ms ::
+[05:56:54Z] :: BPACE: ehci-hid t=268ms d=0ms ::
+[05:56:54Z] :: BPACE: ehci-hid-done t=1808ms d=1540ms ::
+[05:56:54Z] :: BPACE: pci-probes t=1913ms d=105ms ::
+[05:56:54Z] :: BPACE: pci-scan t=1913ms d=0ms ::
+[05:56:54Z] :: BPACE: portsw t=1913ms d=0ms ::
+[05:56:54Z] :: BPACE: xhci-handoff t=1913ms d=0ms ::
+[05:56:54Z] :: BPACE: xhci-halt t=1913ms d=0ms ::
+[05:56:54Z] :: BPACE: xhci-hcrst t=1914ms d=1ms ::
+[05:56:54Z] :: BPACE: xhci-cnr t=1914ms d=0ms ::
+[05:56:54Z] :: BPACE: xhci-ptrs t=1914ms d=0ms ::
+[05:56:54Z] :: BPACE: xhci-run t=1914ms d=0ms ::
+[05:56:54Z] :: BPACE: xhci-portpwr t=1914ms d=0ms ::
+[05:56:54Z] :: BPACE: xhci-settle t=2014ms d=100ms ::
+[05:56:54Z] :: BPACE: enum:p2 t=2014ms d=0ms ::
+[05:56:54Z] :: BPACE: pci-usb t=2573ms d=558ms ::
+[05:56:54Z] :: BPACE: gui t=2588ms d=15ms ::
+[05:56:54Z] :: BPACE: root-bind t=3171ms d=582ms ::
+[05:56:54Z] :: BPACE: total gui=2588ms ftdi=none n=28 dropped=0 hz=2693850140 result=LEDGER ::
+[05:56:54Z] [flight] ring rolling_kib=2772 pinned_head_kib=64 heap_free_mib=173 captured=18991 (FLIGHTRING B400: the newest 2772 KiB always held, the boot's first 64 KiB pinned)
+[05:56:54Z] :: DRAINCAP: SKIP — no 16550 on this machine, nothing is ever staged (SERWIT-1D); budget=192 B still compiled and its truth table still asserted ::
+[05:56:54Z] :: SERWIT-1B: SKIP — no 16550 on this machine, the contended path is DECLINED before it is reached (SERWIT-1D); the policy truth table is asserted at compile time ::
+[05:56:54Z] :: PWRDRAIN: SKIP — no 16550 on this machine, so there is no staged line for a power verb to lose (SERWIT-1D); the budget arithmetic is asserted at compile time ::
+[05:56:54Z] :: S5DRAIN: SKIP — no 16550 on this machine, so there is no staged line for the direct S5 route to lose (SERWIT-1D); the flush is compiled and its arithmetic asserted ::
+[05:56:54Z] :: SERWIRE: SKIP — no 16550 on this machine, so no drain reaches a wire to be charged for (SERWIT-1D); the cap arithmetic is asserted at compile time ::
+[05:56:54Z] :: SERIALTX: SKIP — no 16550 on this machine, so no byte of this transport reaches a wire masked or unmasked (SERWIT-1D); the one-FIFO budget is asserted at compile time and the `[sertx]` census still reports the post-mask taps, which are that board's only carrier ::
+[05:56:54Z] [vfs] tx what=read path=/system/fonts/DejaVuSans-Bold.ttf resolve_ms=0 list_ms=208 blocks=18 hits=57 gen=26
+[05:56:54Z] [block] boot medium=sdhc kept; usb slot=- separate (R95)
+[05:56:54Z] [flight] service on=worker cpu=2 pace_ms=1 hid_pump_cpu=7 (POINTERFEEL: the flight-recorder step leaves the hid pump's core) ::
+[05:56:54Z] :: TESTS: deferred=99 fire=tests at_boot=0 ::
+[05:56:54Z] xHCI: !!! ENUM RECOVERY: port 2 failed at 'reset-settle' (watchdog-timeout, code 0) PORTSC=0x00000603 !!!
+[05:56:55Z] [kfont] load dir=/system/fonts faces=10/10 fallback=none scripts_missing=none font_kib=3341 cache_kib=2048 ppi=221 scale=2.5 cell=18x40 grid=160x45 panel=2880x1800 font=sans font_size=13 body=dejavu-mono-11.50 chrome=dejavu-sans-36.00 ui=dejavu-sans-29.93 console=dejavu-mono-29.75 ms=1574
+[05:56:55Z] :: KFONTPPI: edid_src=aux ppi=221 scale=2.5 cell=18x40 grid=160x45 -> armed ::
+[05:56:55Z] [ui] metrics ppi=221 scale=2.5 s2=5 bar=85 title=85 frame=13 gap=30 disc=30 chrome=23x50 cell=18x40 glyph=2 win=1300x1120 consts=0 asserts=tests
+[05:56:55Z] [kfont] repaint epoch=1 console_rows=0 windows=quarry,settings,activity,fileview,textedit,login face=dejavu-sans-29.93
+[05:56:55Z] [wallpaper] probe try=2 found=0 on=worker cpu=2 ms=65
+[05:56:55Z] [vfs] root-pass fixture n=1 held_ms=1200 at=4505ms verdict=bound :: BOOTSLOW: a synthetic probe that does not serve the root; bound is the ordering; a pending verdict is a probe that ran ahead of the root ::
+[05:56:55Z] >>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+[05:56:55Z] >>> [CONTACT ESTABLISHED] SLOT 1
+[05:56:55Z] >>> VENDOR ID : [0403]
+[05:56:55Z] >>> PRODUCT ID: [6001]
+[05:56:55Z] :: U2.5: FTDI console up (0403:6001, 115200 8N1) ::
+[05:56:55Z] :: FTDI: tx pump budget=5387700280 used=2183471 n=1 timeouts=0 yields=0 result=OK ::
+[05:56:55Z] :: FTDI: tx pump budget=5387700280 used=10756908 n=3 timeouts=0 yields=0 result=OK ::
+[05:56:55Z] [boot] step=stage-resolve waited_ms=2300 for=console console=up bound_ms=8000
+[05:56:55Z] [boot] step=stage-resolve begin at_ms=5846 budget_ms=927
+[05:56:55Z] [users] stage-resolve sub=store-read why=store-loaded stage=installer users=0 at_ms=5846
+[05:56:55Z] [users] stage-resolve sub=stage-witness why=store-loaded at_ms=5846
+[05:56:55Z] :: FIRSTBOOT: stage=installer root=locked users=0 desktop_ignited=false why=store-loaded -> coherent ::
+[05:56:55Z] :: BOOT: firmware->loader=13802ms loader->desktop=8729ms total=22532ms lines=211 steps=2 slowest=users-load:87 over=0 ::
+[05:56:55Z] [users] stage-resolve sub=published why=store-loaded at_ms=5846
+[05:56:55Z] [login] installer: stage=installer (R77: R100: no user — the first-user form is the whole glass (that user is the administrator; root is locked); no desktop, no programs, no fixtures)
+[05:56:55Z] [users] stage-resolve sub=create-user-form at_ms=5846
+[05:56:55Z] [lock] held-too-long name=wm.rs:30196 at=wm.rs:30207 by=9@cpu7 ms=83 waiters=0
+[05:56:55Z] [lock] held-too-long name=wm.rs:30381 at=wm.rs:30399 by=9@cpu7 ms=83 waiters=0
+[05:56:55Z] [lock] held-too-long name=wm.rs:30384 at=wm.rs:30399 by=9@cpu7 ms=83 waiters=0
+[05:56:55Z] [lock] held-too-long name=wm.rs:30385 at=wm.rs:30399 by=9@cpu7 ms=83 waiters=0
+[05:56:55Z] [lock] held-too-long name=wm.rs:30383 at=wm.rs:30399 by=9@cpu7 ms=83 waiters=0
+[05:56:55Z] [login] screen open window=2 box=1126x861 at (877,313) modal=true power_row=0
+[05:56:56Z] [fbdirect] clear painter=splash-word rect=0,1680,2880x80 -> damage handed=1 painted=1
+[05:56:56Z] [fbdirect] expose why=screen-open rects=1 px=230400 handed=2 painted=1
+[05:56:56Z] [login] installer: first-user form open (R100: name, password, retype; that user is the administrator; root is locked; the desktop ignites for them)
+[05:56:56Z] [wc-h] rollup win=2 scope=window emit=1 age_ms=166 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=4 beamwaits=3 beamwait_us=25889 beammaxwait_us=10589 beamgiveup=0 beamcross_ppk=1909 blitter=cpu blit_us=7912 gpu_fallback=0 fixture=1 whole=3 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2646 minpresent_us=2634 presspread=1 presspop=3 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[05:56:56Z] [users] stage-resolve sub=done why=store-loaded at_ms=6045
+[05:56:56Z] [boot] step=stage-resolve end ms=199 budget_ms=927 over=0 blocks_read=0 blocks_written=0 cmds=0 installer
+[05:56:56Z] :: BOOTLOG: 7 milestone(s) recorded (GUI-WITNESS ring) ::
+[05:56:56Z] :: BOOTLOG: [    1573 ms] ehci:kbd-armed ::
+[05:56:56Z] :: BOOTLOG: [    1596 ms] ehci:mouse-armed ::
+[05:56:56Z] :: BOOTLOG: [    1653 ms] ehci:kbd-armed ::
+[05:56:56Z] :: BOOTLOG: [    1655 ms] ehci:trackpad-armed ::
+[05:56:56Z] :: BOOTLOG: [    1760 ms] portsw:flip ::
+[05:56:56Z] :: BOOTLOG: [    2435 ms] gui:handoff ::
+[05:56:56Z] :: BOOTLOG: [    5816 ms] ftdi:console-up ::
+[05:56:56Z] :: BPACE: entry t=0ms d=0ms ::
+[05:56:56Z] :: BPACE: fb-wc t=0ms d=0ms ::
+[05:56:56Z] :: BPACE: fb-wc-done t=0ms d=0ms ::
+[05:56:56Z] :: BPACE: core-init t=14ms d=13ms ::
+[05:56:56Z] :: BPACE: mem-init t=57ms d=42ms ::
+[05:56:56Z] :: BPACE: heap t=57ms d=0ms ::
+[05:56:56Z] :: BPACE: acpi t=58ms d=0ms ::
+[05:56:56Z] :: BPACE: calib t=158ms d=100ms ::
+[05:56:56Z] :: BPACE: smp t=218ms d=59ms ::
+[05:56:56Z] :: BPACE: sched t=218ms d=0ms ::
+[05:56:56Z] :: BPACE: pci-enter t=268ms d=50ms ::
+[05:56:56Z] :: BPACE: ehci-hid t=268ms d=0ms ::
+[05:56:56Z] :: BPACE: ehci-hid-done t=1808ms d=1540ms ::
+[05:56:56Z] :: BPACE: pci-probes t=1913ms d=105ms ::
+[05:56:56Z] :: BPACE: pci-scan t=1913ms d=0ms ::
+[05:56:56Z] :: BPACE: portsw t=1913ms d=0ms ::
+[05:56:56Z] :: BPACE: xhci-handoff t=1913ms d=0ms ::
+[05:56:56Z] :: BPACE: xhci-halt t=1913ms d=0ms ::
+[05:56:56Z] :: BPACE: xhci-hcrst t=1914ms d=1ms ::
+[05:56:56Z] :: BPACE: xhci-cnr t=1914ms d=0ms ::
+[05:56:56Z] :: BPACE: xhci-ptrs t=1914ms d=0ms ::
+[05:56:56Z] :: BPACE: xhci-run t=1914ms d=0ms ::
+[05:56:56Z] :: BPACE: xhci-portpwr t=1914ms d=0ms ::
+[05:56:56Z] :: BPACE: xhci-settle t=2014ms d=100ms ::
+[05:56:56Z] :: BPACE: enum:p2 t=2014ms d=0ms ::
+[05:56:56Z] :: BPACE: pci-usb t=2573ms d=558ms ::
+[05:56:56Z] :: BPACE: gui t=2588ms d=15ms ::
+[05:56:56Z] :: BPACE: root-bind t=3171ms d=582ms ::
+[05:56:56Z] :: BPACE: enum:p2-done t=5969ms d=2798ms ::
+[05:56:56Z] :: BPACE: ftdi-up t=5969ms d=0ms ::
+[05:56:56Z] :: BPACE: total gui=2588ms ftdi=5969ms n=30 dropped=0 hz=2693850140 result=LEDGER ::
+[05:56:56Z] [vfs] tx what=resolve path=/var/log resolve_ms=32 list_ms=0 blocks=3 hits=1 gen=27
+[05:56:57Z] [wallpaper] probe try=3 found=0 on=worker cpu=2 ms=66
+[05:56:58Z] :: FTDI-CAP: replayed=26975 cap=1048576 lost=0 head_cut=n ::
+[05:56:59Z] [wallpaper] probe try=4 found=0 on=worker cpu=2 ms=65
+[05:57:00Z] :: SMC-BATT: present=true soc=83% volt=11779mV amp=-2163mA full=9962mAh rem=8343mAh ac=derived:discharging retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 gap=1105 busy=31 late=0 == witness ::
+[05:57:00Z] :: BOT: pump budget=0 peak=0 sum=0 mean=0 n=0 nowait=0 timeouts=0 storage_slot=0 route=0x0 depth=0 tag_mismatch=0 bad_sig=0 abandoned_in=0 abandoned_out=0 undrained=0 short_in=0 short_out=0 ev_late=0 ev_unaddressed=0 cbw_fault=0 db_in=0 db_out=0 ev_stopped=0 ev_stopped_li=0 ev_any=676 wrap_push=44 wrap_db=0 w=0/0/0/0/0/0/0/0/0/0/0/0 result=SUMMARY ::
+[05:57:00Z] :: USB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>=2 (the ladder's verdict on two whole generations) | ladders>=6 (retry entries across all generations) | ms>=45000 (pump wall-clock charged to the identity) | dead>=8 (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>=2 additionally CUTS the pump budget to 1/8 of base — read dead= not dead_streak= when asking why a device did or did not park. named=no used to mean hub-downstream (no VID:PID banner) and be normal; XHCIHUB (S2) stores the downstream identity, so named=no is now a real anomaly. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after 60000 ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::
+[05:57:00Z] :: BOT: park rollup accounts=0 parked=0 refused=0 backoff_refused=0 pass_refused=0 aborts=0 capped=0 yields=0 pump_refused=0 anon=0 ladder_max=6 surrender_max=2 cycle_max_ms=45000 dead_max=8 pass_ms=10000 pass_pump_ms=2000 reprobes=0 dead_forgiven=0 reprobe_ms=60000 result=CENSUS ::
+[05:57:00Z] :: BOT: tx single=0 multi=0 maxlen=0 wrapped_tx=0 rd_sectors=0 wr_sectors=0 max_blocks=64 result=SIZES ::
+[05:57:00Z] :: EHCI-HID: [1] [tp] mode-mismatch readback=vendor stream=legacy -> route=legacy (the wire beats the register) == witness ::
+[05:57:00Z] [ptr] delta route=legacy in=2,0 scaled=2.00,0.00 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] fine ep=1 n=1 moved=1 carried=0 lost=0 floor=none rel=1 vendor=0 rebase=0 div=5.07u/px range=x-3243..4069,y-141..6165 -> OK (route evidence: reports by stream since boot; POINTERSCALE: one scale from the pad's range, jumps re-baselined, no clamp)
+[05:57:00Z] [tp] mt route=legacy ep=1 buttons=0x00 dx=2 dy=0 ids=02:1,44:0,other:1 (HIDSTALL2: one line per 10 s while a finger is down)
+[05:57:00Z] :: EHCI-HID: [1] [tp] mode req=4 rt=0xa1/0x01 addr=8 if=1 widx=0 wValue=0x0300 status=ok got=8b ms=1 ::
+[05:57:00Z] :: EHCI-HID: [1] [tp] mode req=5 rt=0x21/0x09 addr=8 if=1 widx=0 wValue=0x0300 status=ok got=8b ms=0 ::
+[05:57:00Z] :: FTDI: tx pump budget=5387700280 used=21523399 n=446 timeouts=0 yields=434 result=OK ::
+[05:57:00Z] :: EHCI-HID: [1] [tp] mode req=6 rt=0x21/0x09 addr=8 if=1 widx=0 wValue=0x0300 status=ok got=8b ms=0 ::
+[05:57:00Z] [cursor] armed x=1442 y=900
+[05:57:00Z] :: EHCI-HID: [1] [tp] mode req=7 rt=0xa1/0x01 addr=8 if=1 widx=0 wValue=0x0300 status=ok got=8b ms=0 ::
+[05:57:00Z] [tp] mode reassert n=1 why=stream-legacy addr=8 if=1 was=0x01 normal=ok vendor=ok readback=0x01 readback_ok=true latched=yes ms=12 (POINTERFEEL: the pad latched vendor and streamed HID-mode reports; the selector written off then on)
+[05:57:00Z] [ptr] delta route=vendor in=42,-5 scaled=14.18,-1.68 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=40,-5 scaled=13.13,-1.64 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=67,-9 scaled=27.32,-3.66 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=96,-12 scaled=42.56,-5.32 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=88,-12 scaled=38.35,-5.23 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=47,-6 scaled=16.81,-2.14 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=46,-7 scaled=16.28,-2.47 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=45,-6 scaled=15.76,-2.10 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=94,-15 scaled=41.59,-6.63 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=92,-18 scaled=40.54,-7.92 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=45,-12 scaled=15.92,-4.24 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=45,-14 scaled=16.09,-5.00 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=45,-16 scaled=16.09,-5.72 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=45,-17 scaled=16.25,-6.13 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=46,-20 scaled=16.91,-7.35 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=93,-45 scaled=41.75,-20.19 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=95,-59 scaled=43.17,-26.81 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=46,-32 scaled=17.69,-12.30 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:00Z] [ptr] delta route=vendor in=43,-36 scaled=16.53,-13.84 moved=1 why=px div=5.07u/px range=7312 (FINEMOTION: every delta moves the pointer; sub-pixel travel is carried, never floored. POINTERSCALE: one gain on the vector, both axes)
+[05:57:01Z] [wallpaper] probe try=5 found=0 on=worker cpu=2 ms=66
+[05:57:04Z] [wc-h] rollup win=2 scope=window emit=2 age_ms=9087 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=5 beamwaits=4 beamwait_us=36753 beammaxwait_us=10864 beamgiveup=0 beamcross_ppk=2545 blitter=cpu blit_us=10550 gpu_fallback=0 fixture=1 whole=4 banded=0 lines=4 minspan=0 minspan_bytes=0 maxpresent_us=2646 minpresent_us=2634 presspread=1 presspop=4 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[05:57:04Z] [ptr] fine ep=1 n=56 moved=56 carried=0 lost=0 floor=none rel=1 vendor=57 rebase=1 div=5.07u/px range=x-3243..4069,y-141..6165 -> OK (route evidence: reports by stream since boot; POINTERSCALE: one scale from the pad's range, jumps re-baselined, no clamp)
+[05:57:05Z] [cursor] restore src=flat rect=18x18+1175+1021 n=1 scene=0 flat=1 deferred=0 unclocked=0 floor_ms=8 -> HANDED-BACK
+[05:57:05Z] [ptrown] at=(1179,996) panel=2880x1800 row=1 furniture=0 subtracted=1 paint=compositor composited=1 n=1/12 -> window (SO46 — the desktop present subtracts windows AND furniture; only the compositor sprite can paint over either, so `subtracted=1 paint=backbuffer` is the lost pointer)
+[05:57:05Z] [wc-h] rollup win=2 scope=window-band emit=3 age_ms=9375 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,1,0,0,0,0,0,0] beam=obs beamobs=10 beamwaits=5 beamwait_us=45382 beammaxwait_us=10864 beamgiveup=0 beamcross_ppk=3317 blitter=cpu blit_us=13753 gpu_fallback=0 fixture=1 whole=5 banded=4 lines=8 minspan=43 minspan_bytes=193672 maxpresent_us=2646 minpresent_us=134 presspread=1 presspop=9 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[05:57:05Z] [ptrown] at=(432,407) panel=2880x1800 row=0 furniture=0 subtracted=0 paint=compositor composited=1 n=2/12 -> backdrop (SO46 — the desktop present subtracts windows AND furniture; only the compositor sprite can paint over either, so `subtracted=1 paint=backbuffer` is the lost pointer)
+[05:57:05Z] [wc-i] rollup scope=live windowed_flushes=8 stale=0 intrusions=0 cursor_passes=23 cursor_brackets=11 -> CLEAN
+[05:57:05Z] [lockfix] composite scope=live drain_skip=0 reserved_assumed=0 pass_skip=0 -> QUIET
+[05:57:05Z] [cursor5] rollup scope=live stale_compose=0 adopt_incoh=1 selfsave=0 masked_nosession=0 drain_insession=0 -> COHERENT
+[05:57:05Z] [cursor6] rollup scope=live present_over=0 masked=11 repaired=1 desktop_over=0 mismatch=0 uncover_lost=0/11 -> INTACT
+[05:57:05Z] [cursor8] repair rate scope=live requests=1 repairs=1 suppressed_stale=0 suppressed_rate=0 unclocked=0 floor_ms=8 flush_kb=5479 -> PACED
+[05:57:05Z] [cursor11] compose-through scope=live passes=11 bracketed=1 px_deferred=1584 px_installed=0 px_redrawn=1440 flicker_frames=0 px_absorbed=0 absorb_refused=0 -> BRACKETED
+[05:57:05Z] [wedge9] sprite-claim scope=live refused=1 masked=0 retried=0 owed=0 serviced=1 -> DEFERRED
+[05:57:05Z] [ptrpaint] sprite-nowait scope=live nowait_ok=72 nowait_owed=0 owed_cashed=0 owed_cashed_us_max=0 bounded_entries=0 owing=0 -> UNCONTENDED
+[05:57:05Z] [cursorghost] orphan scope=live declined=0 restored_px=0 restored_on_refuse=0 damaged=0 -> QUIET
+[05:57:05Z] [wedge11] overlay-claim scope=live refused=0 masked=0 waited=0 abandoned=0 owed=0 closed=0 -> QUIET
+[05:57:05Z] [cursor12] offer scope=live adm=baseline passes=23 nosprite=11 hidden=11 nohit=1 reserved=0 nosession=0 planned=11 excl_probe=11 excl_unverified=11 cum=23 -> witness-exclusion
+[05:57:05Z] [flick2] scope=live down_max=2002ms down_slow=1 down_last_at=14966ms sess_undraws=1 sess_px=0 sess_lockmiss=0 mask_sess=0 compose_through=0 ct_owner=0 flush_undraw=0 flush_skip=81 drains=1 drain_skip=1 drain_masked=0 burst_last=0ms burst_max=0ms -> SLOW
+[05:57:05Z] [vugmin] wm scope=live hides=0 unhides=0 presents_skipped=0 hidden_now=0 -> DORMANT
+[05:57:05Z] [wedge1] dwell drains=1 spun=0 spin_max=0 note=65536 in_spin=0 tripwire=silent bound=1073741824 abandoned=0 mvbound=33554432 mvgiveup=0 mvskip=0 ywait=0 ydrain=0 scskip=0 rescued=0 grace=2097152 latched=false span=9491ms -> QUIET
+[05:57:05Z] [cursor11] compose-through scope=desk passes=11 bracketed=1 px_deferred=1584 px_installed=0 px_redrawn=1440 flicker_frames=0 px_absorbed=0 absorb_refused=0 -> BRACKETED
+[05:57:05Z] [wedge9] sprite-claim scope=desk refused=1 masked=0 retried=0 owed=0 serviced=1 -> DEFERRED
+[05:57:05Z] [ptrpaint] sprite-nowait scope=desk nowait_ok=72 nowait_owed=0 owed_cashed=0 owed_cashed_us_max=0 bounded_entries=0 owing=0 -> UNCONTENDED
+[05:57:05Z] [cursorghost] orphan scope=desk declined=0 restored_px=0 restored_on_refuse=0 damaged=0 -> QUIET
+[05:57:05Z] [wedge11] overlay-claim scope=desk refused=0 masked=0 waited=0 abandoned=0 owed=0 closed=0 -> QUIET
+[05:57:05Z] [ptr] fine ep=1 n=98 moved=98 carried=0 lost=0 floor=none rel=1 vendor=100 rebase=2 div=5.07u/px range=x-3243..4069,y-141..6165 -> OK (route evidence: reports by stream since boot; POINTERSCALE: one scale from the pad's range, jumps re-baselined, no clamp)
+[05:57:06Z] [ptrown] at=(1921,1090) panel=2880x1800 row=1 furniture=0 subtracted=1 paint=compositor composited=1 n=3/12 -> window (SO46 — the desktop present subtracts windows AND furniture; only the compositor sprite can paint over either, so `subtracted=1 paint=backbuffer` is the lost pointer)
+[05:57:06Z] [ptrown] at=(1739,1174) panel=2880x1800 row=0 furniture=0 subtracted=0 paint=compositor composited=1 n=4/12 -> backdrop (SO46 — the desktop present subtracts windows AND furniture; only the compositor sprite can paint over either, so `subtracted=1 paint=backbuffer` is the lost pointer)
+[05:57:06Z] [ptr] fine ep=1 n=222 moved=222 carried=0 lost=0 floor=none rel=1 vendor=224 rebase=2 div=5.61u/px range=x-3243..4846,y-141..6165 -> OK (route evidence: reports by stream since boot; POINTERSCALE: one scale from the pad's range, jumps re-baselined, no clamp)
+[05:57:07Z] [ptrown] at=(1427,884) panel=2880x1800 row=1 furniture=0 subtracted=1 paint=compositor composited=1 n=5/12 -> window (SO46 — the desktop present subtracts windows AND furniture; only the compositor sprite can paint over either, so `subtracted=1 paint=backbuffer` is the lost pointer)
+[05:57:08Z] [ptr] fine ep=1 n=331 moved=331 carried=0 lost=0 floor=none rel=1 vendor=334 rebase=3 div=5.61u/px range=x-3243..4846,y-141..6165 -> OK (route evidence: reports by stream since boot; POINTERSCALE: one scale from the pad's range, jumps re-baselined, no clamp)
+[05:57:09Z] [ptr] fine ep=1 n=336 moved=336 carried=0 lost=0 floor=none rel=1 vendor=343 rebase=7 div=5.88u/px range=x-3243..5231,y-141..6165 -> OK (route evidence: reports by stream since boot; POINTERSCALE: one scale from the pad's range, jumps re-baselined, no clamp)
+[05:57:09Z] [ptrown] at=(2264,929) panel=2880x1800 row=0 furniture=0 subtracted=0 paint=compositor composited=1 n=6/12 -> backdrop (SO46 — the desktop present subtracts windows AND furniture; only the compositor sprite can paint over either, so `subtracted=1 paint=backbuffer` is the lost pointer)
+[05:57:10Z] [wc-h] rollup win=2 scope=window emit=4 age_ms=14421 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=59 beamwaits=26 beamwait_us=187058 beammaxwait_us=10864 beamgiveup=0 beamcross_ppk=16840 blitter=cpu blit_us=69774 gpu_fallback=0 fixture=1 whole=25 banded=33 lines=8 minspan=18 minspan_bytes=81072 maxpresent_us=2646 minpresent_us=57 presspread=1 presspop=58 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[05:57:10Z] [cursor11] compose-through scope=desk passes=41 bracketed=3 px_deferred=5810 px_installed=0 px_redrawn=5378 flicker_frames=0 px_absorbed=9 absorb_refused=1 -> BRACKETED
+[05:57:10Z] [wedge9] sprite-claim scope=desk refused=3 masked=0 retried=0 owed=0 serviced=3 -> DEFERRED
+[05:57:10Z] [ptrpaint] sprite-nowait scope=desk nowait_ok=345 nowait_owed=0 owed_cashed=1 owed_cashed_us_max=0 bounded_entries=0 owing=0 -> UNCONTENDED
+[05:57:10Z] [cursorghost] orphan scope=desk declined=0 restored_px=0 restored_on_refuse=0 damaged=0 -> QUIET
+[05:57:10Z] [wedge11] overlay-claim scope=desk refused=0 masked=0 waited=0 abandoned=0 owed=0 closed=0 -> QUIET
+[05:57:12Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:12Z] [login] key latency ms=2 max=2 n=1 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:12Z] [login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)
+[05:57:12Z] [lag] key→echo ms=136.9 queue=1.9 wm=18.2 app=0.0 comp=100.7 present=15.9 worst=comp
+[05:57:12Z] :: LAG: n=1 key=1 click=0 launch=0 menu=0 p50=136 p95=136 max=136 max_kind=key→echo worst_stage=comp stage_ms=[queue:1,wm:18,app:0,comp:100,present:15] timeout=0 orphan=0 coalesced=0 lost=0 span=5s ::
+[05:57:12Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:12Z] [login] key latency ms=2 max=2 n=2 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:12Z] [lag] key→echo ms=217.2 queue=1.9 wm=15.1 app=0.0 comp=183.9 present=16.2 worst=comp
+[05:57:13Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:13Z] [login] key latency ms=2 max=2 n=3 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:13Z] [lag] key→echo ms=161.4 queue=1.9 wm=9.3 app=0.0 comp=133.6 present=16.4 worst=comp
+[05:57:14Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:14Z] [login] key latency ms=2 max=2 n=4 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:14Z] [lag] key→echo ms=113.9 queue=1.9 wm=11.8 app=0.0 comp=84.1 present=15.9 worst=comp
+[05:57:14Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:14Z] [login] key latency ms=2 max=2 n=5 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:15Z] [lag] key→echo ms=205.1 queue=1.9 wm=19.7 app=0.0 comp=167.2 present=16.1 worst=comp
+[05:57:15Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:15Z] [login] key latency ms=2 max=2 n=6 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:15Z] [wc-h] rollup win=2 scope=window emit=5 age_ms=19460 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,1,0,0,0,0,0,0] beam=obs beamobs=83 beamwaits=49 beamwait_us=364746 beammaxwait_us=10864 beamgiveup=0 beamcross_ppk=32111 blitter=cpu blit_us=133047 gpu_fallback=0 fixture=1 whole=49 banded=33 lines=8 minspan=18 minspan_bytes=81072 maxpresent_us=2756 minpresent_us=57 presspread=1 presspop=82 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[05:57:15Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:15Z] [login] key latency ms=1 max=2 n=7 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:15Z] [lag] key→echo ms=165.3 queue=1.0 wm=14.3 app=0.0 comp=133.7 present=16.3 worst=comp
+[05:57:16Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:16Z] [login] key latency ms=2 max=2 n=8 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:16Z] [lag] key→echo ms=270.2 queue=1.9 wm=33.5 app=0.0 comp=222.5 present=12.1 worst=comp
+[05:57:16Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:16Z] [login] key latency ms=2 max=2 n=9 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:16Z] [lag] key→echo ms=188.9 queue=1.9 wm=9.0 app=0.0 comp=162.0 present=15.9 worst=comp
+[05:57:16Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:16Z] [login] key latency ms=2 max=2 n=10 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:16Z] [lag] key→echo ms=91.6 queue=1.9 wm=8.8 app=0.0 comp=64.1 present=16.6 worst=comp
+[05:57:17Z] :: LAG: n=9 key=9 click=0 launch=0 menu=0 p50=165 p95=270 max=270 max_kind=key→echo worst_stage=comp stage_ms=[queue:16,wm:130,app:0,comp:1169,present:136] timeout=0 orphan=0 coalesced=0 lost=0 span=5s ::
+[05:57:17Z] [wc-h] rollup win=2 scope=window emit=6 age_ms=21606 pop=budgeted samples=4 budget=4 pop=all-presents torn=1 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=96 beamwaits=60 beamwait_us=443802 beammaxwait_us=10864 beamgiveup=0 beamcross_ppk=40385 blitter=cpu blit_us=167354 gpu_fallback=0 fixture=1 whole=62 banded=33 lines=8 minspan=18 minspan_bytes=81072 maxpresent_us=2756 minpresent_us=57 presspread=1 presspop=95 pop=constant frame_us=16667 stallbound_us=33334 -> AT-RISK
+[05:57:17Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:17Z] [login] key latency ms=1 max=2 n=11 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:17Z] [lag] key→echo ms=131.9 queue=1.0 wm=14.1 app=0.0 comp=100.8 present=15.8 worst=comp
+[05:57:18Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:18Z] [login] key latency ms=2 max=2 n=12 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:18Z] [lag] key→echo ms=205.3 queue=1.9 wm=8.8 app=0.0 comp=178.1 present=16.3 worst=comp
+[05:57:18Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:18Z] [login] key latency ms=2 max=2 n=13 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:18Z] [lag] key→echo ms=100.1 queue=1.9 wm=14.7 app=0.0 comp=67.2 present=16.1 worst=comp
+[05:57:18Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:18Z] [login] key latency ms=4 max=4 n=14 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:19Z] [lag] key→echo ms=270.6 queue=3.8 wm=16.6 app=0.0 comp=233.5 present=16.6 worst=comp
+[05:57:19Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:19Z] [login] key latency ms=2 max=4 n=15 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:19Z] [lag] key→echo ms=160.3 queue=1.9 wm=8.8 app=0.0 comp=133.2 present=16.3 worst=comp
+[05:57:19Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:19Z] [login] key latency ms=2 max=4 n=16 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:19Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:19Z] [login] key latency ms=2 max=4 n=17 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:20Z] [lag] key→echo ms=200.5 queue=1.9 wm=15.1 app=0.0 comp=166.8 present=16.5 worst=comp
+[05:57:20Z] EHCI-HID: KEY withheld (a secret is being typed)
+[05:57:20Z] [login] key latency ms=2 max=4 n=18 hid_gap_max_ms=407 hid_gap_holder=usb-pump:flight-recorder/held_ms=144 bound=50 (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)
+[05:57:20Z] [lag] key→echo ms=149.4 queue=1.9 wm=31.3 app=0.0 comp=99.6 present=16.4 worst=comp
+[05:57:21Z] [users] home=/home/una created volume=unafs
+[05:57:21Z] [users] adduser user=una id=3433385 home=/home/una created=true password=unset (R63/R65: root added it; the password is chosen at the first login, never on the line)
+[05:57:21Z] [users] role user=una role=admin (R100: the first user is the administrator)
+[05:57:21Z] [users] kdf calibrated iters=166666 ms=250 (probe=16000 took 24 ms; target 250 ms; floor 10000)
+[05:57:22Z] :: LAG: n=8 key=8 click=0 launch=0 menu=0 p50=149 p95=270 max=270 max_kind=key→echo worst_stage=comp stage_ms=[queue:16,wm:118,app:0,comp:980,present:129] timeout=0 orphan=0 coalesced=0 lost=0 span=5s ::
+[05:57:22Z] [users] password set user=una first=true (LOGIN14/R65: chosen at the keyboard, never on the line or the wire)
+[05:57:22Z] [login] installer: create-user user=una id=3433385 home_created=true
+[05:57:22Z] [wc-h] rollup win=2 scope=window emit=7 age_ms=26673 pop=budgeted samples=4 budget=4 pop=all-presents torn=1 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 shrunk=0 blitnet=[0,0,0,0,0,0,0,1] beam=obs beamobs=124 beamwaits=85 beamwait_us=630888 beammaxwait_us=10864 beamgiveup=0 beamcross_ppk=58198 blitter=cpu blit_us=241140 gpu_fallback=0 fixture=1 whole=90 banded=33 lines=8 minspan=18 minspan_bytes=81072 maxpresent_us=2756 minpresent_us=57 presspread=1 presspop=123 pop=constant frame_us=16667 stallbound_us=33334 -> AT-RISK
+[05:57:22Z] [vfs] tx what=resolve path=/home/una resolve_ms=0 list_ms=21 blocks=1 hits=6 gen=44
+[05:57:22Z] [users] home=/home/una exists volume=unafs
+[05:57:22Z] [users] login ok user=una id=3433385 principal=user:una#3433385
+[05:57:22Z] [prefs] load clamped=0
+[05:57:22Z] :: PREFS: path=/home/una/settings domains=0 loaded=0 saved=0 ns=system -> loaded ::
+[05:57:22Z] [notify] dnd=0 via=login
+[05:57:22Z] [notifypane] loaded apps=0 dnd=0 dnd_window=0-0 via=login
+[05:57:22Z] [lock] spin-wait name=sdhc.rs:997 at=sdhc.rs:2650 waiter=9@cpu7 on=12@cpu1 ms=51
+[05:57:22Z] [unafs] name-index ready (marked)
+[05:57:22Z] [loginrender] window open anchor=login-ok window_ms=30000 bound_ms=100
+[05:57:22Z] :: BTHID: store loaded bonds=0 sealed_pending=0 from /home/una/.config/unaos/bt ::
+[05:57:22Z] :: BTKEYSEAL: waiting reason=none pending=0 unsealed=0 plain_left=0 ::
+[05:57:22Z] [rand] drbg=sha256 seed=rdrand reseed=65536
+[05:57:23Z] [dock] trash state why=change full=0 took_ms=403 on=worker (HIDSTALL2: read on a change, off the hid pump's core)
+[05:57:23Z] [holocron] door kdf=kernel mode=create m_kib=49152 t=3 p=4 ms=563 -> posted (the password is dropped here; HOLOCRON.ELF takes the key)
+[05:57:23Z] [vfs] tx what=resolve path=/apps/HOLOCRON.ELF resolve_ms=21 list_ms=10 blocks=3 hits=4 gen=44
+[05:57:23Z] [vfs] tx what=read path=/apps/HOLOCRON.ELF resolve_ms=0 list_ms=43 blocks=4 hits=32 gen=44
+[05:57:23Z] [wm] limit windows=145 procs=46 from=mem:185 (R90)
+[05:57:23Z] :: STORMFAULT: plan model=elf segs=3 bss=4353 stack=[0x41c0000,0x4200000) guard=true ::
+[05:57:23Z] :: WXAUDIT-SLOT: ring-3 window W^X verified (slot 0, leaves=5, wx=0, nxe=1) ::
+[05:57:23Z] :: RING3WIN: model=elf slot=0 segs=3 span=110897 stack=262144 heap=[0x1000021c000,0x100041bf000) frames=92 ::
+[05:57:23Z] [spawn] origin=system slot=0
+[05:57:23Z] :: SCHEDPLACE-X86: 'bg-user' -> c1 (ld=0 cred=0 load=0% from c2) ::
+[05:57:23Z] :: SYSCALL: nr=61 — ring-3 -> ring-0 path live ::
+[05:57:23Z] [appres] sighted /apps/HOLOCRON.ELF volume=native trust=root
+[05:57:23Z] [net3] first syscall sys=56(GETRANDOM) task=42 cpu=1 masked=1
+[05:57:23Z] [settings] loaded n=0 user=una store=/home/una/settings
+[05:57:23Z] :: [smpbal] steal 'bg-user' c1->c0 (m=1) ::
+[05:57:23Z] [backlight] login keep readback=248 max=1023 slider=24% stored=- wrote=0
+[05:57:23Z] [settings] trackpad loaded speed=5 tap=0 natural=1 secondary=two-finger three_drag=0 applied=1
+[05:57:24Z] [holocron] ring=created at=login user=una ms=1336
+[05:57:24Z] :: HOLOCRON: serve ring=unafs verbs=8 owner=una state=unlocked root=.holocron kdf=ring3 sys_kdf=unused cache=session ::
+[05:57:24Z] [vfs] tx what=read path=/apps/HOLOCRON.ELF resolve_ms=10 list_ms=55 blocks=6 hits=135 gen=49
+[05:57:24Z] [appres] sight path=/apps/HOLOCRON.ELF res=no source=elf attrs=9 on=inode sig=-
+[05:57:24Z] [wm] launch-name owner=1 path=/apps/HOLOCRON.ELF name=HOLOCRON via=path armed=1
+[05:57:24Z] [holocron] login user=una ring=unafs -> started pid=42 slot=0
+[05:57:25Z] [login] submit kdf_ms=2479 adduser_ms=1549 on=worker input_blocked_ms=0 kind=create
+[05:57:25Z] [login] session open user=una role=admin (R100: the first user is the administrator; root is locked)
+[05:57:25Z] :: WINDOWCAP: fixed_cap=none limit=145 procs=46 from=mem:185 opens_refused=0 -> armed ::
+[05:57:25Z] [boot] phase=desktop from=setter why=session at=35088ms pre_wi
+=== SQUAWK MARK 2026-10-13T05:58:02Z mark seat-type: tests pointerfeel ===
