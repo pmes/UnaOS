@@ -309,6 +309,9 @@ fn best_fit(request: &str, lookup: &'static str) -> &'static str {
         return lookup;
     }
     let lang = request.split('-').next().unwrap_or("").to_ascii_lowercase();
+    if let Some((t, _)) = crate::cldr::available(&format!("{lang}-{want}")) {
+        return t;
+    }
     for t in crate::cldr::available_tags() {
         if t.split('-').next() == Some(lang.as_str()) && likely_script(t).as_deref() == Some(want.as_str()) {
             return t;

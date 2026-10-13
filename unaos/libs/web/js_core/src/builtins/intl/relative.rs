@@ -73,9 +73,14 @@ pub fn parts(f: &RelFmt, v: f64, unit: &'static str) -> (Vec<(String, String)>, 
         .or_else(|| f.loc.relative(fi, 0, base + ci))
         .or_else(|| f.loc.relative(fi, 0, base + 5))
         .unwrap_or("{0}");
-    let (pre, post) = pat.split_once("{0}").unwrap_or(("", ""));
     let mut out = Vec::new();
     let mut units = Vec::new();
+    // A pattern without the number ("خلال يومين", "לפני שעתיים") is all literal.
+    let Some((pre, post)) = pat.split_once("{0}") else {
+        out.push((String::from("literal"), String::from(pat)));
+        units.push(String::new());
+        return (out, units);
+    };
     if !pre.is_empty() {
         out.push((String::from("literal"), String::from(pre)));
         units.push(String::new());
