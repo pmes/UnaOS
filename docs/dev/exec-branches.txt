@@ -480,7 +480,7 @@ refs/heads/exec-rmbp-bootverdicts2            37adc602 FOLDED-BY-HAND 6aa3de5c
 refs/heads/exec-rmbp-kvmlat2                  37adc602 FOLDED-BY-HAND 7d11d9d6
 refs/heads/exec-pi-pispec                     37adc602 FOLDED-BY-HAND da10c8ac
 refs/heads/exec-rmbp-striametal               0d88e0c9 FOLDED-BY-HAND e6eab096
-refs/heads/exec-rmbp-install4                 513ca5f8 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-install4                 513ca5f8 FOLDED-BY-HAND 6b35b738
 refs/heads/exec-rmbp-dragnomove                 d616bf98 IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-dockshell2                 d616bf98 IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-notifycenter               d616bf98 IN-FLIGHT cloud 2026-10-14
