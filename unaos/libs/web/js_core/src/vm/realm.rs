@@ -42,7 +42,11 @@ intrinsics!(
     finreg_ctor, array_buffer_proto, array_buffer_ctor, shared_array_buffer_proto, shared_array_buffer_ctor,
     data_view_proto, data_view_ctor, typed_array_proto, typed_array_ctor, proxy_ctor, reflect, math, json,
     eval_fn, throw_type_error, array_proto_values, promise_then, object_proto_to_string, atomics,
-    for_in_iterator_proto,
+    for_in_iterator_proto, intl_number_format_proto, intl_date_time_format_proto, intl_collator_proto,
+    intl_plural_rules_proto, intl_list_format_proto, intl_relative_time_format_proto, intl_segmenter_proto,
+    intl_segments_proto, intl_segment_iterator_proto, intl_locale_proto, intl_duration_format_proto,
+    intl_display_names_proto, disposable_stack_proto, async_disposable_stack_proto, suppressed_error_proto,
+    suppressed_error_ctor,
 );
 
 pub struct Realm {

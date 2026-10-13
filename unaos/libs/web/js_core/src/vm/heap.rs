@@ -377,6 +377,10 @@ pub enum Kind {
     GlobalEnv(Box<GlobalEnvData>),
     /// A revoked-proxy holder / generic internal record.
     Internal(Vec<Value>),
+    /// The internal slots of an ECMA-402 object (Intl.NumberFormat, DateTimeFormat, …).
+    Intl(Box<crate::builtins::intl::IntlObj>),
+    /// [[DisposableState]] + [[DisposeCapability]] of a DisposableStack / AsyncDisposableStack (ES2026).
+    Disposable(Box<crate::builtins::es2026::DisposeData>),
 }
 
 pub struct ObjectData {
@@ -569,6 +573,17 @@ impl ObjectData {
                 }
             }
             Kind::Internal(vs) => vs.iter().for_each(|x| v(x, out)),
+            Kind::Intl(i) => {
+                if let Some(b) = i.bound {
+                    out.push(b);
+                }
+            }
+            Kind::Disposable(d) => {
+                for (x, m, _) in &d.res {
+                    v(x, out);
+                    v(m, out);
+                }
+            }
             _ => {}
         }
     }

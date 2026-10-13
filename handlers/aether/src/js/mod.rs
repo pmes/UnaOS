@@ -56,6 +56,7 @@ pub mod host;
 pub mod html;
 pub mod idb;
 pub mod idl;
+pub mod importmap;
 pub mod loader;
 pub mod locks;
 pub mod mutation;
@@ -183,6 +184,10 @@ pub enum Task {
     Event(TargetKey, String, bool),
     /// Invoke a rooted callback with no arguments.
     Callback(usize),
+    /// HTML §8.1.5.7 "notify about rejected promises": fire `unhandledrejection` for the rooted promise.
+    Rejection(usize),
+    /// A reported promise was handled later: fire `rejectionhandled` for it.
+    RejectionHandled(usize),
 }
 
 #[derive(Default)]
@@ -222,6 +227,12 @@ pub(crate) struct PageState {
     /// requestAnimationFrame callbacks: (handle, root).
     pub raf: Vec<(u32, usize)>,
     pub raf_seq: u32,
+    /// Handles canceled while their frame's callbacks are running (HTML "run the animation frame
+    /// callbacks" skips a callback an earlier one of the same frame canceled).
+    pub raf_cancelled: HashSet<u32>,
+    /// HTML's outstanding rejected promises weak set: promises whose `unhandledrejection` fired and that
+    /// are still unhandled, rooted until handled (`rejectionhandled`) or the page goes.
+    pub outstanding_rejections: Vec<(Obj, usize)>,
     /// Form-control values with the dirty flag set (HTML §4.10.5.4), by element.
     pub values: HashMap<usize, String>,
     /// Checkedness of checkboxes/radios whose dirty checkedness flag is set.
@@ -496,19 +507,76 @@ pub(crate) fn checkpoint(vm: &mut Vm) {
         }
     }
     vm.kept_alive.clear();
+    // HTML §8.1.5.7 "notify about rejected promises": each promise still unhandled at the end of the
+    // checkpoint gets a task (DOM manipulation task source) that fires a cancelable `unhandledrejection`
+    // at the Window; only an uncanceled one reaches the console (`fire_rejection`).
     let pending: Vec<Obj> = std::mem::take(&mut vm.rejected_unhandled);
     for p in pending {
-        let reason = match &vm.heap.get(p).kind {
-            Kind::Promise(d) if !d.handled => Some(d.result.clone()),
-            _ => None,
-        };
-        if let Some(reason) = reason {
-            let msg = enter(vm, "rejection", |vm| vm.error_string(&reason)).unwrap_or_default();
-            host::console_out(2, &format!("Uncaught (in promise) {msg}"));
-            crate::ledger::record_js(&format!("unhandled-rejection:{}", clip(&msg, 64)));
+        let unhandled = matches!(&vm.heap.get(p).kind, Kind::Promise(d) if !d.handled);
+        if unhandled {
+            let r = idl::root(vm, Value::Object(p));
+            page(|pg| pg.tasks.push_back(Task::Rejection(r)));
         }
     }
     page(|p| p.in_checkpoint = false);
+}
+
+/// The `unhandledrejection` (or, `handled_event`, the `rejectionhandled`) task for the rooted promise `r`
+/// (HTML §8.1.5.7): a PromiseRejectionEvent {promise, reason} at the Window. An `unhandledrejection` nobody
+/// canceled is reported to the console; a promise still unhandled after it joins the outstanding set.
+pub(crate) fn fire_rejection(vm: &mut Vm, r: usize, handled_event: bool) {
+    let Value::Object(p) = idl::rooted(vm, r) else {
+        idl::unroot(vm, r);
+        return;
+    };
+    let (is_handled, reason) = match &vm.heap.get(p).kind {
+        Kind::Promise(d) => (d.handled, d.result.clone()),
+        _ => (true, Value::Undefined),
+    };
+    if !handled_event && is_handled {
+        idl::unroot(vm, r);
+        return;
+    }
+    let mut not_canceled = true;
+    if !engine_poisoned() {
+        let init = vm.new_plain_object();
+        let _ = vm.create_data_property(init, PropertyKey::from_str("promise"), Value::Object(p));
+        let _ = vm.create_data_property(init, PropertyKey::from_str("reason"), reason.clone());
+        let ty = if handled_event { "rejectionhandled" } else { "unhandledrejection" };
+        let e = events::new_event(vm, "PromiseRejectionEvent", ty, false, !handled_event, Some(init));
+        let er = idl::root(vm, Value::Object(e));
+        not_canceled = events::dispatch(vm, e, TargetKey::Window).0;
+        idl::unroot(vm, er);
+    }
+    if handled_event {
+        idl::unroot(vm, r);
+        return;
+    }
+    if not_canceled {
+        let msg = enter(vm, "rejection", |vm| vm.error_string(&reason)).unwrap_or_default();
+        host::console_out(2, &format!("Uncaught (in promise) {msg}"));
+        crate::ledger::record_js(&format!("unhandled-rejection:{}", clip(&msg, 64)));
+    }
+    let still = matches!(&vm.heap.get(p).kind, Kind::Promise(d) if !d.handled);
+    if still {
+        page(|pg| pg.outstanding_rejections.push((p, r)));
+    } else {
+        idl::unroot(vm, r);
+    }
+}
+
+/// HostPromiseRejectionTracker "handle" from the host: a promise in the outstanding rejected promises set
+/// leaves it, and a `rejectionhandled` task is queued. (Called from inside js_core; the page state may be
+/// borrowed by the binding that attached the handler, so the borrow is tried, never forced.)
+pub(crate) fn rejection_handled(promise: Obj) {
+    PAGE.with(|pg| {
+        if let Ok(mut pg) = pg.try_borrow_mut() {
+            if let Some(i) = pg.outstanding_rejections.iter().position(|(q, _)| *q == promise) {
+                let (_, r) = pg.outstanding_rejections.remove(i);
+                pg.tasks.push_back(Task::RejectionHandled(r));
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -546,6 +614,7 @@ impl Engine {
         crate::api::fetch::reset_budget();
         net::reset();
         crate::event_loop::reset();
+        importmap::reset();
         crate::dom::mutation::reset();
         crate::dom::custom::reset(document.arena());
         page(|p| p.time_origin = crate::event_loop::now_ms());
@@ -554,6 +623,8 @@ impl Engine {
         idl::install_domexception(&mut vm);
         events::install(&mut vm);
         dom::install(&mut vm);
+        // AETHERJS2: [Unscopable] members of ParentNode / ChildNode / Element (WebIDL §3.7.3).
+        dom::install_unscopables(&mut vm);
         range::install(&mut vm);
         traversal::install(&mut vm);
         html::install(&mut vm);
@@ -562,6 +633,7 @@ impl Engine {
         cssom::install(&mut vm);
         window::install(&mut vm);
         net::install(&mut vm);
+        window::install_scheduler(&mut vm);
         forms::install(&mut vm);
         // AETHERDEBT SR93: DataTransfer (its FileList feeds `input.files`) — after forms: File exists.
         controls::install_data_transfer(&mut vm);
@@ -652,6 +724,8 @@ impl Engine {
                     idl::unroot(&mut self.vm, r);
                     invoke(&mut self.vm, "task", &f, &Value::Undefined, &[]);
                 }
+                Task::Rejection(r) => fire_rejection(&mut self.vm, r, false),
+                Task::RejectionHandled(r) => fire_rejection(&mut self.vm, r, true),
             }
             checkpoint(&mut self.vm);
         }

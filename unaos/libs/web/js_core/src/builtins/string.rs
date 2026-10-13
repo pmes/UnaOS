@@ -369,14 +369,10 @@ fn locale_compare(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let s = this_str(vm, ctx)?;
     let ta = vm.arg(ctx, 0);
     let t = vm.to_string(&ta)?;
-    // Without Intl: compare canonically equivalent strings as equal (NFD), ordering by code point.
-    let a = unicode::normalize(&code_points(s.units()), 1);
-    let b = unicode::normalize(&code_points(t.units()), 1);
-    Ok(Value::Number(match a.cmp(&b) {
-        core::cmp::Ordering::Less => -1.0,
-        core::cmp::Ordering::Equal => 0.0,
-        core::cmp::Ordering::Greater => 1.0,
-    }))
+    // ECMA-402 §19.1.1: Intl.Collator with the arguments (canonically equivalent strings compare equal).
+    let l = vm.arg(ctx, 1);
+    let o = vm.arg(ctx, 2);
+    crate::builtins::intl::collator::locale_compare(vm, &s, &t, &l, &o)
 }
 
 fn normalize(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {

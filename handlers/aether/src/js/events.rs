@@ -475,7 +475,7 @@ fn handler_value(vm: &mut Vm, t: TargetKey, ty: &str) -> Value {
         let compiled = crate::security::compiling_trusted(|| {
             super::enter(vm, "handler-compile", |vm| vm.construct(&Value::Object(fc), &[s(params), Value::String(body.clone())], None))
         });
-        let f = match compiled {
+        let mut f = match compiled {
             Some(Ok(f)) => f,
             Some(Err(e)) => {
                 report_exception(vm, &e);
@@ -483,7 +483,15 @@ fn handler_value(vm: &mut Vm, t: TargetKey, ty: &str) -> Value {
             }
             None => Value::Null,
         };
-        crate::ledger::record_dom("inline-handler-scope-chain-approximated");
+        // HTML §8.1.8.1 step 1.10: an element's handler is scoped by its document, its form owner (a
+        // form-associated element) and the element itself — object environments, outermost first, as
+        // `with` statements build them. The body parsed alone above, so it cannot close the wrapper's
+        // braces; the wrapper only adds the scopes and names the function for the handler.
+        if let (Value::Object(_), TargetKey::Node(n)) = (&f, t) {
+            if let Some(scoped) = scoped_handler(vm, n, ty, params, body) {
+                f = scoped;
+            }
+        }
         // The internal raw uncompiled handler's function is named for the handler ("onclick").
         if let Value::Object(fo) = &f {
             let name = format!("on{ty}");
@@ -493,6 +501,40 @@ fn handler_value(vm: &mut Vm, t: TargetKey, ty: &str) -> Value {
         return f;
     }
     v
+}
+
+/// Compiles `body` as `function on<ty>(<params>) { body }` inside `with (document) with (form) with (element)`.
+fn scoped_handler(vm: &mut Vm, el: usize, ty: &str, params: &str, body: &js_core::string::JsStr) -> Option<Value> {
+    let local = dom::with_doc(|d| d.element(html_core::NodeId(el)).map(|e| e.local.clone()))?;
+    let element = wrap(vm, el);
+    let document = wrap(vm, dom::node_document(el));
+    let form = match &element {
+        Value::Object(o) => {
+            let o = *o;
+            let is_form_associated =
+                matches!(local.as_str(), "button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea" | "img");
+            if is_form_associated {
+                super::enter(vm, "handler-form", |vm| vm.get(o, &PropertyKey::from_str("form"))).and_then(|r| r.ok()).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        }
+        _ => return None,
+    };
+    let form = if form.is_object() { form } else { Value::Object(vm.new_object(None)) };
+    let src = format!(
+        "with (__aether_doc) with (__aether_form) with (__aether_el) {{ return function on{ty}({params}) {{\n{}\n}}; }}",
+        body.to_rust()
+    );
+    let fc = vm.intr().function_ctor;
+    let maker = crate::security::compiling_trusted(|| {
+        super::enter(vm, "handler-compile", |vm| {
+            vm.construct(&Value::Object(fc), &[s("__aether_doc, __aether_form, __aether_el"), s(&src)], None)
+        })
+    })?
+    .ok()?;
+    let f = super::enter(vm, "handler-scope", |vm| vm.call(&maker, &Value::Undefined, &[document, form, element]))?.ok()?;
+    f.is_object().then_some(f)
 }
 
 fn handler_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {

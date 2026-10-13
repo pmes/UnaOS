@@ -4113,3 +4113,29 @@ fn child_node_mixin(vm: &mut Vm, p: Obj) {
     op(vm, p, "replaceWith", 0, replace_with_op);
     op(vm, p, "remove", 0, remove_op);
 }
+
+/// WebIDL §3.7.3 [Unscopable]: `Element.prototype[@@unscopables]` and its ParentNode / ChildNode siblings —
+/// null-prototype objects naming the members a `with` scope (and an inline event handler's scope chain,
+/// HTML §8.1.8.1) must not capture: `onclick="append(x)"` still reaches the outer `append`.
+pub fn install_unscopables(vm: &mut Vm) {
+    const CHILD: &[&str] = &["after", "before", "remove", "replaceWith"];
+    const PARENT: &[&str] = &["append", "prepend", "replaceChildren"];
+    let sets: [(&str, Vec<&str>); 5] = [
+        ("Element", [CHILD, PARENT, &["slot"]].concat()),
+        ("Document", PARENT.to_vec()),
+        ("DocumentFragment", PARENT.to_vec()),
+        ("CharacterData", CHILD.to_vec()),
+        ("DocumentType", CHILD.to_vec()),
+    ];
+    let key = PropertyKey::Sym(vm.wk.unscopables.clone());
+    for (name, members) in sets {
+        let Some(i) = iface(name) else { continue };
+        let o = vm.new_object(None);
+        let mut ms = members;
+        ms.sort_unstable();
+        for m in ms {
+            vm.heap.get_mut(o).props.insert(PropertyKey::from_str(m), Prop::data(Value::Bool(true), WEC));
+        }
+        vm.heap.get_mut(i.proto).props.insert(key.clone(), Prop::data(Value::Object(o), C));
+    }
+}

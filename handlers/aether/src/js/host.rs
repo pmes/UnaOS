@@ -5,11 +5,13 @@
 //! - HostLoadImportedModule resolves a specifier against its referrer (the importing module's URL, or
 //!   the document URL for inline module scripts) with the URL Standard parser and fetches the source:
 //!   `http(s):` through http_core (the same blocking client `fetch` uses), `file:` from disk, `data:`
-//!   inline; bare specifiers are an error (no import maps);
+//!   inline; specifiers resolve through the page's import map (`importmap`, HTML §8.1.5.3 — AETHERJS2), whose
+//!   integrity metadata the module fetch carries; `import.meta.resolve` is the same resolution;
+//! - HostPromiseRejectionTracker: a rejection that was reported unhandled and is handled later queues the
+//!   `rejectionhandled` task (HTML §8.1.5.7);
 //! - the clock is the wall clock (`Date.now`); local time is UTC (this host has no zone database);
 //! - `Math.random` is seeded from the OS entropy pool.
 
-use html_core::url;
 use js_core::vm::{Host, Obj};
 
 /// Most module fetches one page may make.
@@ -36,20 +38,17 @@ pub fn console_out(level: u8, msg: &str) {
     });
 }
 
-/// Resolves `specifier` against `base` per the HTML "resolve a module specifier" algorithm (relative
-/// and absolute URLs only — no import maps).
+/// Resolves `specifier` against `base` per HTML "resolve a module specifier" (§8.1.5.3): the page's import
+/// map first (scopes, then top-level imports), then relative and absolute URLs. An inline module script's
+/// name carries an `#inline-module-N` fragment; its base URL is the document's, so that is stripped.
 pub fn resolve_specifier(base: &str, specifier: &str) -> Result<String, String> {
-    let is_relative = specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../");
-    if is_relative {
-        let b = url::Url::parse(base).map_err(|e| format!("bad module base {base}: {e}"))?;
-        return b.join(specifier).map(|u| u.to_string()).map_err(|e| format!("cannot resolve {specifier}: {e}"));
-    }
-    match url::Url::parse(specifier) {
-        Ok(u) => Ok(u.to_string()),
-        Err(_) => Err(format!(
-            "Failed to resolve module specifier \"{specifier}\". Relative references must start with either \"/\", \"./\", or \"../\"."
-        )),
-    }
+    let base = match base.find("#inline-module-") {
+        Some(i) => &base[..i],
+        None => base,
+    };
+    // An unparsable base (a page with no URL) still resolves absolute specifiers and mapped bare ones;
+    // only a relative specifier needs it, and importmap::resolve refuses that one with a TypeError.
+    super::importmap::resolve(base, specifier)
 }
 
 /// Fetches a script resource (module or classic) as text: `file:`, `data:` and `http(s):` URLs.
@@ -153,7 +152,8 @@ impl Host for AetherHost {
             crate::ledger::record_js("module-fetch-cap-reached");
             return Err(format!("module fetch cap reached loading {resolved}"));
         }
-        let src = fetch_script(&resolved, true, None, "").map_err(|e| {
+        let integrity = super::importmap::integrity_for(&resolved);
+        let src = fetch_script(&resolved, true, None, &integrity).map_err(|e| {
             crate::ledger::record_js(&format!("module-fetch-failed:{}", super::clip(&resolved, 48)));
             e
         })?;
@@ -168,7 +168,25 @@ impl Host for AetherHost {
             .unwrap_or(0.0)
     }
 
-    fn promise_rejection(&mut self, _promise: Obj, _operation: u8) {}
+    /// HostPromiseRejectionTracker "handle" (HTML §8.1.5.7): a promise in the outstanding rejected promises
+    /// set (its `unhandledrejection` already fired) gets a handler — queue `rejectionhandled`.
+    fn promise_rejection(&mut self, promise: Obj, operation: u8) {
+        if operation == 1 {
+            super::rejection_handled(promise);
+        }
+    }
+
+    fn has_import_meta_resolve(&self) -> bool {
+        true
+    }
+
+    fn resolve_module_specifier(&mut self, referrer: Option<&str>, specifier: &str) -> Result<String, String> {
+        let base = match referrer {
+            Some(r) => r.to_string(),
+            None => super::page_url(),
+        };
+        resolve_specifier(&base, specifier)
+    }
 
     /// HostEnsureCanCompileStrings (AETHERDEBT SR93): the document's CSP decides eval / new Function
     /// (`'unsafe-eval'`); the refusal is reported (console, ledger, report POSTs, the violation event

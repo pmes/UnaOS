@@ -855,7 +855,12 @@ impl Vm {
         }
         let o = self.heap.alloc(ObjectData::new(None, Kind::Ordinary));
         let name = self.mr(m).name.clone();
-        self.heap.get_mut(o).props.insert(PropertyKey::from_str("url"), Prop::data(Value::String(name), WEC));
+        self.heap.get_mut(o).props.insert(PropertyKey::from_str("url"), Prop::data(Value::String(name.clone()), WEC));
+        // HostGetImportMetaProperties (HTML §8.1.5.4): a web host adds import.meta.resolve(specifier).
+        if self.host.has_import_meta_resolve() {
+            let f = self.make_native_closure("resolve", 1, import_meta_resolve, alloc::vec![Value::String(name)]);
+            self.heap.get_mut(o).props.insert(PropertyKey::from_str("resolve"), Prop::data(Value::Object(f), WEC));
+        }
         self.mr_mut(m).meta = Some(o);
         Ok(Value::Object(o))
     }
@@ -866,6 +871,22 @@ impl Vm {
         self.load_requested(m)?;
         self.link_module(m)?;
         self.evaluate_module(m)
+    }
+}
+
+/// import.meta.resolve(specifier) (HTML §8.1.5.4.1): the host's module specifier resolution against this
+/// module's URL, import maps included; a failure is a TypeError.
+fn import_meta_resolve(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let base = vm.native_slot(ctx.callee, 0);
+    let base = match &base {
+        Value::String(s) => s.to_rust(),
+        _ => alloc::string::String::new(),
+    };
+    let sv = vm.arg(ctx, 0);
+    let spec = vm.to_string(&sv)?.to_rust();
+    match vm.host.resolve_module_specifier(Some(&base), &spec) {
+        Ok(u) => Ok(Value::str(&u)),
+        Err(msg) => vm.throw_type(&msg),
     }
 }
 
