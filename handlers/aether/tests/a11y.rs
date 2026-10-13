@@ -641,3 +641,42 @@ fn outline_none_and_author_outlines_replace_the_ring() {
     assert_ne!(band[4], red, "{band:?}");
     assert!(!band.contains(&ring), "the author's outline replaces the ring: {band:?}");
 }
+
+/// A11YFACE (SR124): the reading keys reach the shell's verbs through the keydown default — Alt+1 skips to content,
+/// H / Shift+H walk headings, D / Shift+D landmarks — and a focused text field or `<select>` keeps its letters.
+#[test]
+fn reading_keys_drive_the_shell_verbs() {
+    let mut e = page(
+        r#"<body><nav id="n"><a href="/a">A</a></nav><main id="main"><h1 id="t">Title</h1><h2 id="s">Sub</h2>
+<input id="q"><select id="sel"><option>h</option></select></main><footer id="f">f</footer></body>"#,
+    );
+    let main = dom(&e, "main").id().0;
+    assert_eq!(keyboard::reading_key(&e, "Alt+1"), Some(bandy::A11yVerb::Skip));
+    assert!(keyboard::handle_key(&mut e, "Alt+1"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(main), "Alt+1: skip to content");
+    assert!(keyboard::handle_key(&mut e, "h"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "t").id().0), "H: the next heading");
+    assert!(keyboard::handle_key(&mut e, "h"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "s").id().0));
+    assert!(keyboard::handle_key(&mut e, "Shift+H"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "t").id().0), "Shift+H: back");
+    assert!(keyboard::handle_key(&mut e, "d"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "f").id().0), "D: the next landmark");
+    assert!(keyboard::handle_key(&mut e, "Shift+D"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(main), "Shift+D: back");
+    // The verbs answer the face with the node's line.
+    assert_eq!(nav::run(&mut e, &bandy::A11yVerb::NextHeading { backward: false, level: Some(2) }), vec!["heading \"Sub\" level=2".to_string()]);
+    assert!(nav::run(&mut e, &bandy::A11yVerb::Tree).iter().any(|l| l.trim_start() == "heading \"Title\" level=1"));
+    // A text field or a select keeps its letters.
+    let n = dom(&e, "q");
+    focus::focus(&mut e, Some(n), true);
+    assert_eq!(keyboard::reading_key(&e, "h"), None);
+    assert!(!keyboard::handle_key(&mut e, "h"));
+    let n = dom(&e, "sel");
+    focus::focus(&mut e, Some(n), true);
+    assert_eq!(keyboard::reading_key(&e, "d"), None);
+    assert_eq!(keyboard::reading_key(&e, "Ctrl+h"), None);
+    // The face's rows: the witness the shell prints.
+    let p = A11yPrefs::from_rows(true, "more", false);
+    assert_eq!(p.witness(), ":: a11y: prefs contrast=more forced=none motion=reduce -> applied ::");
+}

@@ -318,27 +318,27 @@ impl AxTree {
 
     /// One line per node, indented: `role "name" state…` — the plain-text form a face or test reads.
     pub fn lines(&self) -> Vec<String> {
-        self.walk()
-            .into_iter()
-            .map(|(i, d)| {
-                let n = &self.nodes[i];
-                let mut s = format!("{}{}", "  ".repeat(d), n.role);
-                if !n.name.is_empty() {
-                    s.push_str(&format!(" \"{}\"", n.name));
-                }
-                if let Some(l) = n.level {
-                    s.push_str(&format!(" level={l}"));
-                }
-                if let Some(v) = n.value.as_ref().filter(|v| !v.is_empty()) {
-                    s.push_str(&format!(" value=\"{v}\""));
-                }
-                for t in n.states.tokens() {
-                    s.push(' ');
-                    s.push_str(&t);
-                }
-                s
-            })
-            .collect()
+        self.walk().into_iter().map(|(i, d)| format!("{}{}", "  ".repeat(d), Self::line(&self.nodes[i]))).collect()
+    }
+
+    /// One node's line, unindented: `role "name" level=N value="…" state…` (A11YFACE SR124: the answer of a
+    /// reading verb names the node it moved to in this form).
+    pub fn line(n: &AxNode) -> String {
+        let mut s = n.role.to_string();
+        if !n.name.is_empty() {
+            s.push_str(&format!(" \"{}\"", n.name));
+        }
+        if let Some(l) = n.level {
+            s.push_str(&format!(" level={l}"));
+        }
+        if let Some(v) = n.value.as_ref().filter(|v| !v.is_empty()) {
+            s.push_str(&format!(" value=\"{v}\""));
+        }
+        for t in n.states.tokens() {
+            s.push(' ');
+            s.push_str(&t);
+        }
+        s
     }
 }
 

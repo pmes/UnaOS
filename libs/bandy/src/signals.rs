@@ -252,6 +252,16 @@ pub enum SMessage {
     BrowserDevtoolsLayout { bottom: bool, page: (u32, u32, u32, u32), pane: Option<(u32, u32, u32, u32)> },
     /// Engine → chrome: the pane's text, one line per row (`DevTools::render`), sent when it changes.
     BrowserDevtoolsLines(Vec<String>),
+    // A11YFACE (SR124): the accessibility verbs and Principia's accessibility rows on the glass. The engine side is
+    // `aether::dom::a11y` (the tree, `nav`'s reading verbs, `prefs`); these verbs are the seam to the face.
+    /// Chrome → engine: one accessibility verb ([`A11yVerb::parse`] reads the typed `a11y …` spelling).
+    BrowserA11y(A11yVerb),
+    /// Engine → chrome: a verb's answer — the tree's lines for `a11y tree`, else the line of the node the
+    /// reading position moved to (empty when there was nothing to move to).
+    BrowserA11yLines(Vec<String>),
+    /// Chrome → shell: Principia's `system.accessibility.*` rows as the face read them, at start and on every
+    /// change (`contrast` in its stored spelling: `no-preference` / `more` / `less`).
+    BrowserA11yPrefs { reduce_motion: bool, contrast: String, forced_colors: bool },
 
     // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
     // A session is keyed by the media `url` the request named (the same string `PlayMedia`
@@ -491,6 +501,60 @@ impl From<f64> for PrefValue {
 impl From<bool> for PrefValue {
     fn from(v: bool) -> Self {
         PrefValue::Bool(v)
+    }
+}
+
+/// A11YFACE (SR124): an accessibility verb ([`SMessage::BrowserA11y`]); [`A11yVerb::TABLE`] is the `a11y` rows of
+/// the verb table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum A11yVerb {
+    /// `a11y tree`: the accessibility tree's lines.
+    Tree,
+    /// `a11y skip`: skip to content (the main landmark, else the page's skip link, else the first h1).
+    Skip,
+    /// `a11y next heading [N]` / `a11y previous heading [N]` (N: only headings of level N).
+    NextHeading { backward: bool, level: Option<u32> },
+    /// `a11y next landmark` / `a11y previous landmark`.
+    NextLandmark { backward: bool },
+}
+
+impl A11yVerb {
+    /// The verb table: each spelling and its verb.
+    pub const TABLE: [(&'static str, A11yVerb); 6] = [
+        ("a11y tree", A11yVerb::Tree),
+        ("a11y skip", A11yVerb::Skip),
+        ("a11y next heading", A11yVerb::NextHeading { backward: false, level: None }),
+        ("a11y previous heading", A11yVerb::NextHeading { backward: true, level: None }),
+        ("a11y next landmark", A11yVerb::NextLandmark { backward: false }),
+        ("a11y previous landmark", A11yVerb::NextLandmark { backward: true }),
+    ];
+
+    /// Reads a typed verb: a [`A11yVerb::TABLE`] spelling (whitespace and ASCII case folded); a heading verb may
+    /// end in a level 1–6 (`a11y next heading 2`).
+    pub fn parse(s: &str) -> Option<A11yVerb> {
+        let words: Vec<String> = s.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
+        let (body, level) = match words.last().and_then(|w| w.parse::<u32>().ok()) {
+            Some(l) if (1..=6).contains(&l) => (&words[..words.len() - 1], Some(l)),
+            Some(_) => return None,
+            None => (&words[..], None),
+        };
+        let joined = body.join(" ");
+        let (_, verb) = Self::TABLE.iter().find(|(spelling, _)| *spelling == joined)?;
+        match (*verb, level) {
+            (A11yVerb::NextHeading { backward, .. }, level) => Some(A11yVerb::NextHeading { backward, level }),
+            (v, None) => Some(v),
+            (_, Some(_)) => None,
+        }
+    }
+
+    /// The verb's spelling (the inverse of [`A11yVerb::parse`]).
+    pub fn spelling(&self) -> String {
+        match *self {
+            A11yVerb::NextHeading { backward, level: Some(l) } => {
+                format!("a11y {} heading {l}", if backward { "previous" } else { "next" })
+            }
+            v => Self::TABLE.iter().find(|(_, t)| *t == v).map(|(s, _)| s.to_string()).unwrap_or_default(),
+        }
     }
 }
 

@@ -499,6 +499,24 @@ impl Tab {
                 let (secure, summary) = chrome::host::page_info(&url);
                 self.show(SMessage::BrowserPageInfo { url, secure, summary });
             }
+            // A11YFACE (SR124): an accessibility verb (`a11y tree`, `a11y skip`, heading / landmark moves) on this
+            // tab's page; the answer goes back to the face.
+            SMessage::BrowserA11y(verb) => {
+                let lines = aether::dom::a11y::nav::run(&mut self.engine, &verb);
+                self.show(SMessage::BrowserA11yLines(lines));
+            }
+            // A11YFACE (SR124): Principia's accessibility rows (the face read them): the media features and the
+            // focus ring follow, and the page restyles (`A11yPrefs::apply`).
+            SMessage::BrowserA11yPrefs { reduce_motion, contrast, forced_colors } => {
+                let p = aether::dom::a11y::prefs::A11yPrefs::from_rows(reduce_motion, &contrast, forced_colors);
+                p.apply(Some(&mut self.engine));
+                let (w, h) = (self.engine.width, self.engine.height);
+                self.engine.damage_rects.push((0, 0, w, h));
+                self.engine.needs_repaint = true;
+                if self.is_active() {
+                    eprintln!("{}", p.witness());
+                }
+            }
             _ => {}
         }
         // A link click or form submit staged a navigation; a page's `history.back()` may have staged a
@@ -602,6 +620,8 @@ struct Coordinator {
     last_resize: Option<(u32, u32)>,
     /// AETHERDEVTOOLS2 (SR112): the window's developer-tools chrome (open, dock, share).
     devtools: chrome::DevtoolsChrome,
+    /// A11YFACE (SR124): the last accessibility rows the face sent (every new tab gets them).
+    a11y_prefs: Option<SMessage>,
 }
 
 /// AETHERDEVTOOLS2 (SR112): the face's layout for the pane — `DevtoolsChrome::split` of the content area
@@ -653,6 +673,9 @@ impl Coordinator {
     fn open_tab(&mut self) {
         let id = self.strip.open();
         let tx = spawn_tab(id, self.bus.clone(), self.active.clone(), self.reports.clone());
+        if let Some(p) = &self.a11y_prefs {
+            let _ = tx.send(TabCmd::Msg(p.clone()));
+        }
         self.tabs.insert(id, tx);
         self.activate(id);
     }
@@ -748,6 +771,14 @@ impl Coordinator {
                 let tab = c.receipt_id().map(receipt_tab).unwrap_or(0);
                 self.send(tab, TabCmd::Msg(SMessage::Facet(c)));
             }
+            // A11YFACE (SR124): the accessibility rows are every tab's (each engine thread keeps its own focus-ring
+            // theme and restyles its own page); kept for the tabs opened later.
+            SMessage::BrowserA11yPrefs { .. } => {
+                for tx in self.tabs.values() {
+                    let _ = tx.send(TabCmd::Msg(m.clone()));
+                }
+                self.a11y_prefs = Some(m);
+            }
             // Stria's answers are keyed by media url; every tab's engine takes the ones it asked for.
             SMessage::MediaOpened { .. } | SMessage::MediaFrame { .. } | SMessage::MediaEnded { .. } | SMessage::MediaError { .. } => {
                 for tx in self.tabs.values() {
@@ -772,7 +803,8 @@ impl Coordinator {
             | SMessage::BrowserFindClose
             | SMessage::BrowserPageInfoAsk
             | SMessage::BrowserDevtoolsPanel(_)
-            | SMessage::BrowserDevtoolsEval(_) => self.to_active(m),
+            | SMessage::BrowserDevtoolsEval(_)
+            | SMessage::BrowserA11y(_) => self.to_active(m),
             _ => {}
         }
     }
@@ -882,6 +914,7 @@ fn main() {
                     next_download: 0,
                     last_resize: None,
                     devtools: chrome::DevtoolsChrome::default(),
+                    a11y_prefs: None,
                 };
                 local.block_on(&rt, coordinator.run(bus_rx, reports_rx));
             })

@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use bandy::ontology::WeightedSkeleton;
 use bandy::signals::{
-    FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom, LogEvent, MatrixEvent, PrefValue,
+    A11yVerb, FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom, LogEvent, MatrixEvent, PrefValue,
     PrincipiaCommand, SMessage, TabulaCommand,
 };
 use bandy::state::{
@@ -432,6 +432,46 @@ kat!(
     SMessage::BrowserDevtoolsLines(vec!["[Elements]  Console".to_string(), " <html>".to_string()]),
     r#"{"BrowserDevtoolsLines":["[Elements]  Console"," <html>"]}"#
 );
+
+// A11YFACE (SR124): the accessibility verbs and Principia's accessibility rows.
+kat!(kat_browser_a11y_tree, SMessage::BrowserA11y(A11yVerb::Tree), r#"{"BrowserA11y":"Tree"}"#);
+kat!(kat_browser_a11y_skip, SMessage::BrowserA11y(A11yVerb::Skip), r#"{"BrowserA11y":"Skip"}"#);
+kat!(
+    kat_browser_a11y_heading,
+    SMessage::BrowserA11y(A11yVerb::NextHeading { backward: true, level: Some(2) }),
+    r#"{"BrowserA11y":{"NextHeading":{"backward":true,"level":2}}}"#
+);
+kat!(
+    kat_browser_a11y_landmark,
+    SMessage::BrowserA11y(A11yVerb::NextLandmark { backward: false }),
+    r#"{"BrowserA11y":{"NextLandmark":{"backward":false}}}"#
+);
+kat!(
+    kat_browser_a11y_lines,
+    SMessage::BrowserA11yLines(vec!["RootWebArea".to_string(), "  main".to_string()]),
+    r#"{"BrowserA11yLines":["RootWebArea","  main"]}"#
+);
+kat!(
+    kat_browser_a11y_prefs,
+    SMessage::BrowserA11yPrefs { reduce_motion: true, contrast: "more".to_string(), forced_colors: false },
+    r#"{"BrowserA11yPrefs":{"reduce_motion":true,"contrast":"more","forced_colors":false}}"#
+);
+
+/// A11YFACE (SR124): the `a11y` verb table reads every spelling back to its verb, a heading level, and nothing else.
+#[test]
+fn a11y_verb_table_round_trips() {
+    for (spelling, verb) in A11yVerb::TABLE {
+        assert_eq!(A11yVerb::parse(spelling), Some(verb), "{spelling}");
+        assert_eq!(verb.spelling(), spelling);
+    }
+    let h2 = A11yVerb::NextHeading { backward: false, level: Some(2) };
+    assert_eq!(A11yVerb::parse("  A11Y next   heading 2 "), Some(h2));
+    assert_eq!(h2.spelling(), "a11y next heading 2");
+    assert_eq!(A11yVerb::parse("a11y next heading 7"), None);
+    assert_eq!(A11yVerb::parse("a11y skip 2"), None);
+    assert_eq!(A11yVerb::parse("a11y"), None);
+    assert_eq!(A11yVerb::parse(""), None);
+}
 
 // --- STRIA (A/V playback) ---
 
@@ -1384,6 +1424,9 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserDevtoolsEval(_) => "BrowserDevtoolsEval",
         SMessage::BrowserDevtoolsLayout { .. } => "BrowserDevtoolsLayout",
         SMessage::BrowserDevtoolsLines(_) => "BrowserDevtoolsLines",
+        SMessage::BrowserA11y(_) => "BrowserA11y", // A11YFACE (SR124): the accessibility verbs and rows
+        SMessage::BrowserA11yLines(_) => "BrowserA11yLines",
+        SMessage::BrowserA11yPrefs { .. } => "BrowserA11yPrefs",
     }
 }
 
