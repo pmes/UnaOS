@@ -33,6 +33,10 @@
 //!     arrives) and the worker's CSP is its script response's (`eval`, `fetch`, `importScripts`), not the
 //!     document's;
 //! 16. a `data:` worker has an opaque origin: IndexedDB and the Cache API refuse with SecurityError;
+//! 17. ImageBitmap (serializable and transferable) and OffscreenCanvas (transferable) through structuredClone
+//!     and a MessagePort, the detach rules, a ReadableStream refused by name, `messageerror` in a worker realm;
+//! 18. port garbage collection in a worker realm: an unreachable local pair is closed by the realm's collector,
+//!     a port whose peer is in the page is kept until that peer closes;
 //! No WPT: the seat runs the suites. Storage lives under CARGO_TARGET_TMPDIR.
 
 use std::io::{Read, Write};
@@ -762,4 +766,96 @@ fn a_data_worker_has_an_opaque_origin_and_no_storage() {
     );
     let mut p = page(PAGE, &format!("var got = null; var w = new Worker('{w}'); w.onmessage = function (e) {{ got = e.data; }};"));
     assert_eq!(run_until(&mut p, "got !== null", "got", 20), "caches:SecurityError|idb:SecurityError");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS3 (SR129) item 4
+
+/// HTML §2.7 / §4.12.5.3: an ImageBitmap is serializable (a copy keeps its pixels) and transferable (the
+/// source is closed; a closed one cannot be transferred or cloned again); an OffscreenCanvas is transferable
+/// only (the receiver gets its size, the source is detached and refuses `getContext`; one with a context
+/// throws InvalidStateError; cloning one without transfer throws DataCloneError); a ReadableStream in the
+/// transfer list is refused by name. Across a page MessageChannel the bitmap arrives whole; posted to a worker
+/// (whose realm has no canvas objects) it fires `messageerror` there.
+#[test]
+fn image_bitmaps_and_offscreen_canvases_transfer() {
+    let w = data_url("onmessage = function () { postMessage('message'); }; onmessageerror = function () { postMessage('messageerror'); };");
+    let mut p = page(
+        PAGE,
+        &format!(
+            "var oc = new OffscreenCanvas(2, 1); var cx = oc.getContext('2d');
+             cx.fillStyle = 'rgb(255, 0, 0)'; cx.fillRect(0, 0, 1, 1); cx.fillStyle = 'rgb(0, 0, 255)'; cx.fillRect(1, 0, 1, 1);
+             var bmp = oc.transferToImageBitmap();
+             var px = function (b) {{ var c = new OffscreenCanvas(b.width, b.height).getContext('2d'); c.drawImage(b, 0, 0); return Array.from(c.getImageData(0, 0, b.width, b.height).data).join(','); }};
+             var copy = structuredClone(bmp);
+             var r1 = [copy instanceof ImageBitmap, copy.width, copy.height, px(copy), bmp.width].join('|');
+             var moved = structuredClone(bmp, {{ transfer: [bmp] }});
+             var r2 = [moved.width, px(moved), bmp.width, bmp.height].join('|');
+             var e1 = 'none'; try {{ structuredClone(bmp, {{ transfer: [bmp] }}); }} catch (x) {{ e1 = x.name; }}
+             var e2 = 'none'; try {{ structuredClone(bmp); }} catch (x) {{ e2 = x.name; }}
+             var o2 = new OffscreenCanvas(3, 4);
+             var t2 = structuredClone({{ c: o2 }}, {{ transfer: [o2] }}).c;
+             var r3 = [t2 instanceof OffscreenCanvas, t2.width, t2.height, o2.width, o2.height].join('|');
+             var e3 = 'none'; try {{ o2.getContext('2d'); }} catch (x) {{ e3 = x.name; }}
+             var e4 = 'none'; try {{ structuredClone(oc, {{ transfer: [oc] }}); }} catch (x) {{ e4 = x.name; }}
+             var e5 = 'none'; try {{ structuredClone(new OffscreenCanvas(1, 1)); }} catch (x) {{ e5 = x.name; }}
+             var rs = new ReadableStream();
+             var e6 = 'none'; try {{ structuredClone(rs, {{ transfer: [rs] }}); }} catch (x) {{ e6 = x.name + ':' + /stream/.test(x.message); }}
+             var viaPort = null; var ch = new MessageChannel();
+             ch.port2.onmessage = function (e) {{ viaPort = [e.data.b instanceof ImageBitmap, e.data.b.width, px(e.data.b)].join('|'); }};
+             var b3 = moved; ch.port1.postMessage({{ b: b3 }}, [b3]);
+             var r4 = b3.width;
+             var toWorker = null; var w = new Worker('{w}'); w.onmessage = function (e) {{ toWorker = e.data; }};
+             var b5 = (function () {{ var c = new OffscreenCanvas(1, 1); c.getContext('2d').fillRect(0, 0, 1, 1); return c.transferToImageBitmap(); }})();
+             w.postMessage(b5, [b5]);"
+        ),
+    );
+    assert_eq!(eval(&mut p, "r1"), "true|2|1|255,0,0,255,0,0,255,255|2", "a cloned ImageBitmap keeps its pixels; the source stays open");
+    assert_eq!(eval(&mut p, "r2"), "2|255,0,0,255,0,0,255,255|0|0", "a transferred ImageBitmap closes its source");
+    assert_eq!(eval(&mut p, "[e1, e2].join('|')"), "DataCloneError|DataCloneError", "a closed ImageBitmap is neither transferable nor serializable");
+    assert_eq!(eval(&mut p, "r3"), "true|3|4|0|0", "a transferred OffscreenCanvas: the size moves, the source is detached");
+    assert_eq!(eval(&mut p, "[e3, e4, e5].join('|')"), "InvalidStateError|InvalidStateError|DataCloneError");
+    assert_eq!(eval(&mut p, "e6"), "DataCloneError:true", "a ReadableStream is refused by name");
+    assert_eq!(eval(&mut p, "r4"), "0");
+    assert_eq!(run_until(&mut p, "viaPort !== null", "viaPort", 20), "true|2|255,0,0,255,0,0,255,255");
+    assert_eq!(run_until(&mut p, "toWorker !== null", "toWorker", 20), "messageerror", "a worker realm has no canvas objects to receive");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS3 (SR129) item 5
+
+/// HTML §9.4.6 in a worker realm: forty MessageChannels nobody references are closed by the realm's collector
+/// (FinalizationRegistry → `__port('collected')`) once garbage forces a collection; a referenced pair stays;
+/// a port whose peer is the page's stays while that peer lives (the global holds it), and is collected
+/// after the page closes its peer (`port-unentangled`). The counts are the registry's, for this realm.
+#[test]
+fn an_unreachable_port_pair_in_a_worker_is_closed_by_its_collector() {
+    let w = data_url(
+        "var junk = function () { var j = null; for (var i = 0; i < 300000; i++) { j = { a: i, b: [i] }; } return j; };
+         var settle = function (want, tag, n) {
+             junk();
+             setTimeout(function () {
+                 var live = __port('live');
+                 if (live <= want || n > 40) { postMessage(tag + ':' + live); } else { settle(want, tag, n + 1); }
+             }, 0);
+         };
+         onmessage = function (e) {
+             if (e.data === 'start') {
+                 self.keep = new MessageChannel();
+                 (function () { for (var i = 0; i < 40; i++) { new MessageChannel(); } })();
+                 postMessage('before:' + __port('live'));
+                 settle(3, 'after', 0);
+             } else if (e.data === 'again') {
+                 settle(2, 'unentangled', 0);
+             }
+         };",
+    );
+    let mut p = page(
+        PAGE,
+        &format!(
+            "var got = []; var w = new Worker('{w}'); w.onmessage = function (e) {{ got.push(e.data); }};
+             var c = new MessageChannel(); w.postMessage('start', [c.port2]);"
+        ),
+    );
+    assert_eq!(run_until(&mut p, "got.length >= 2", "got.join(',')", 60), "before:83,after:3", "the 80 unreachable ports are collected; keep and the cross-realm port stay");
+    eval(&mut p, "c.port1.close(); w.postMessage('again');");
+    assert_eq!(run_until(&mut p, "got.length >= 3", "got[2]", 60), "unentangled:2", "an unentangled port is collectable");
 }

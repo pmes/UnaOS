@@ -333,8 +333,6 @@ struct WState {
     shared: Arc<Shared>,
     closing: bool,
     start: Instant,
-    /// AETHERWORKERS3 (SR129): a shared worker's thread.
-    is_shared: bool,
 }
 
 thread_local! {
@@ -785,6 +783,11 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
     // AETHERWORKERS2 (SR125): the inbox dispatcher and BroadcastChannel over this thread's serial, and `Worker`
     // itself — a nested worker's spawn path reads this worker's captured facts (`creator`).
     crate::js::broadcast::install_worker(&mut vm);
+    // AETHERWORKERS3 (SR129): the ports prelude ran before the inbox existed here; a port whose peer went
+    // (`js::ports` notify_unentangled) becomes collectable through this realm's inbox.
+    if let Err(e) = vm.run_script_str("__inbox_on('port-unentangled', function (m) { __port_unentangled(m.port); });") {
+        eprintln!("[aether-worker] port inbox failed: {}", vm.error_string(&e));
+    }
     // IndexedDB (and navigator.storage) and Web Locks over the owner document's storage key: the bindings the
     // page runs, whose natives read `storage::page_storage_key` / `js::broadcast::doc` — this thread's worker
     // client and inbox serial. `Navigator` names WorkerNavigator only while their preludes look it up.
@@ -890,7 +893,6 @@ fn worker_main(mut sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
             shared: shared.clone(),
             closing: false,
             start: Instant::now(),
-            is_shared: sp.shared,
         })
     });
     let mut vm = build(&sp, &shared);

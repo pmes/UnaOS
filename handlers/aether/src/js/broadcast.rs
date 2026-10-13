@@ -289,10 +289,21 @@ pub const SERIALIZE: &str = r#"
         if (n === 0 && 1 / n < 0) { return { t: 'N', v: '-0' }; }
         return n;
     };
+    // AETHERWORKERS3 (SR129): an ImageBitmap's pixels (HTML §2.7.3 serialization steps: "set serialized.[[BitmapData]]
+    // to a copy of value's bitmap data"), read through AETHERCANVAS's public surface: drawn onto a scratch
+    // OffscreenCanvas, read back with getImageData (RGBA, row-major).
+    var bitmapBytes = function (b) {
+        var c = new OffscreenCanvas(b.width, b.height).getContext('2d');
+        c.drawImage(b, 0, 0);
+        return c.getImageData(0, 0, b.width, b.height).data;
+    };
     // AETHERWORKERS (SR123): `xp` (optional) maps each transferred MessagePort to its index in the message's
     // port list; such a port serializes as `{t:'P', x}` and `de(text, ports)` answers `ports[x]`. Without `xp`
     // a port is a platform object and throws DataCloneError as before.
-    var ser = function (value, xp) {
+    // AETHERWORKERS3 (SR129): an ImageBitmap serializes by value (`{t:'IB', w, h, b}`; a closed one — width 0 —
+    // throws DataCloneError); an OffscreenCanvas only when `xo` (optional, a Set) lists it as transferred
+    // (`{t:'OC', w, h}`; OffscreenCanvas is transferable, not serializable).
+    var ser = function (value, xp, xo) {
         var mem = new Map(), next = 0;
         var walk = function (v) {
             var ty = typeof v;
@@ -313,6 +324,14 @@ pub const SERIALIZE: &str = r#"
             if (tag === 'BigInt') { return { t: 'BI', v: String(BigInt.prototype.valueOf.call(v)), i: id }; }
             if (tag === 'Date') { return { t: 'D', v: num(Date.prototype.getTime.call(v)), i: id }; }
             if (tag === 'RegExp') { return { t: 'R', s: v.source, f: v.flags, i: id }; }
+            if (typeof ImageBitmap === 'function' && v instanceof ImageBitmap) {
+                if (!(v.width > 0 && v.height > 0)) { throw err('An ImageBitmap that is detached'); }
+                return { t: 'IB', w: v.width, h: v.height, b: hex(bitmapBytes(v)), i: id };
+            }
+            if (typeof OffscreenCanvas === 'function' && v instanceof OffscreenCanvas) {
+                if (!xo || !xo.has(v)) { throw err('An OffscreenCanvas (transferable only)'); }
+                return { t: 'OC', w: v.width, h: v.height, i: id };
+            }
             if (tag === 'ArrayBuffer') {
                 if (typeof v.detached === 'boolean' && v.detached) { throw err('A detached ArrayBuffer'); }
                 return { t: 'AB', b: hex(new Uint8Array(v)), i: id };
@@ -396,6 +415,19 @@ pub const SERIALIZE: &str = r#"
                 }
                 case 'Fi': o = new File([unhex(n.b)], n.n, { type: n.ty, lastModified: n.lm }); break;
                 case 'Bl': o = new Blob([unhex(n.b)], { type: n.ty }); break;
+                // AETHERWORKERS3 (SR129): a realm without AETHERCANVAS's objects (a worker) cannot hold these:
+                // DataCloneError, which the message task turns into `messageerror`.
+                case 'IB': {
+                    if (typeof OffscreenCanvas !== 'function' || typeof ImageData !== 'function') { throw err('An ImageBitmap (no canvas in this realm)'); }
+                    var oc = new OffscreenCanvas(n.w, n.h);
+                    oc.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(unhex(n.b).buffer), n.w, n.h), 0, 0);
+                    o = oc.transferToImageBitmap();
+                    break;
+                }
+                case 'OC':
+                    if (typeof OffscreenCanvas !== 'function') { throw err('An OffscreenCanvas (no canvas in this realm)'); }
+                    o = new OffscreenCanvas(n.w, n.h);
+                    break;
                 case 'A': o = new Array(n.l); mem[n.i] = o; n.p.forEach(function (kv) { o[kv[0]] = walk(kv[1]); }); return o;
                 case 'O': o = {}; mem[n.i] = o; n.p.forEach(function (kv) { o[kv[0]] = walk(kv[1]); }); return o;
                 default: throw err('A serialized value');

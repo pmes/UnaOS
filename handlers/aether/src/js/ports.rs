@@ -31,6 +31,19 @@
 //! MessageEventInit has it since AETHERWORKERS2, SR125, so `new MessageEvent(type, { ports })` from script
 //! carries its ports too and the per-dispatch stash is gone), in a worker through that realm's own
 //! MessageEvent.
+//!
+//! # AETHERWORKERS3 (SR129)
+//! - Transfer of ImageBitmap (closed on the sender) and OffscreenCanvas (detached: width/height 0,
+//!   `getContext` / `transferToImageBitmap` throw InvalidStateError; one with a rendering context throws
+//!   InvalidStateError) beside ArrayBuffer and MessagePort; `js::broadcast`'s serializer carries the bitmap's
+//!   pixels and the canvas's size. A ReadableStream in a transfer list is a named DataCloneError.
+//!   `structuredClone(value, { transfer })` runs this same pack.
+//! - Port garbage collection (HTML §9.4.6), see the prelude's REG: a local pair holds itself, a port whose
+//!   peer is elsewhere or in transit is held by the global, an unentangled one by nothing; the realm's
+//!   FinalizationRegistry closes a collected port here (`collected`), and a port whose peer goes hears it
+//!   (`port-unentangled`, [`notify_unentangled`]). Page-realm ports stay rooted by `js::events`'s
+//!   EventTarget constructor (`other_targets`), so this collects worker-realm ports.
+//! - A shared worker's client port closing ends its client ([`close`] → `workers::shared::port_closed`).
 
 use super::idl::{arg, num};
 use js_core::vm::*;
@@ -92,44 +105,76 @@ fn deliver(owner: Owner, port: u64, data: &str, ports: &str) -> bool {
     }
 }
 
+/// AETHERWORKERS3 (SR129): removes `id` from the registry (the caller holds the lock) and disentangles its peer;
+/// answers (whether it was there, the peer that lost its partner and that peer's owner).
+fn unlink(r: &mut HashMap<u64, Ent>, id: u64) -> (bool, Option<(u64, Owner)>) {
+    let Some(e) = r.remove(&id) else { return (false, None) };
+    let mut lost = None;
+    if let Some(pid) = e.peer {
+        if let Some(p) = r.get_mut(&pid) {
+            p.peer = None;
+            lost = Some((pid, p.owner));
+        }
+    }
+    (true, lost)
+}
+
+/// AETHERWORKERS3 (SR129): tells the realm owning `port` that its peer is gone (HTML §9.4.6: an unentangled port
+/// is no longer kept alive by its peer), so that realm's collector may close it when nothing else holds it.
+fn notify_unentangled(port: u64, owner: Owner) {
+    let payload = json!({ "port": port }).to_string();
+    match owner {
+        Owner::Doc(d) => {
+            super::broadcast::post(d, "port-unentangled", payload);
+        }
+        Owner::Worker(w) => {
+            crate::workers::dedicated::deliver_inbox(w, "port-unentangled", payload);
+        }
+        // Adopted later: `adopt` answers 0 for its peer.
+        Owner::Transit => {}
+    }
+}
+
 /// Disentangles every port `owner` held (a document retired, a worker ended).
 pub fn owner_gone(owner: Owner) {
-    let gone: Vec<u64> = {
+    let (gone, lost): (Vec<u64>, Vec<(u64, Owner)>) = {
         let mut r = reg();
         let gone: Vec<u64> = r.iter().filter(|(_, e)| e.owner == owner).map(|(id, _)| *id).collect();
+        let mut lost = Vec::new();
         for id in &gone {
-            if let Some(e) = r.remove(id) {
-                if let Some(p) = e.peer.and_then(|p| r.get_mut(&p)) {
-                    p.peer = None;
-                }
+            if let (_, Some(l)) = unlink(&mut r, *id) {
+                lost.push(l);
             }
         }
-        gone
+        (gone, lost)
     };
-    // AETHERWORKERS3 (SR129): outside the registry lock — a shared worker whose last client port this was ends.
+    // AETHERWORKERS3 (SR129): outside the registry lock — a shared worker whose last client port this was ends,
+    // and the surviving peers' realms hear that they are unentangled.
     for id in gone {
         crate::workers::shared::port_closed(id);
+    }
+    for (port, o) in lost {
+        if o != owner {
+            notify_unentangled(port, o);
+        }
     }
 }
 
 /// AETHERWORKERS3 (SR129): closes port `id` from the engine side (both ends disentangle) — a shared worker
 /// connection that failed closes the inside port it had shipped.
 pub fn close(id: u64) {
-    let removed = {
-        let mut r = reg();
-        match r.remove(&id) {
-            Some(e) => {
-                if let Some(p) = e.peer.and_then(|p| r.get_mut(&p)) {
-                    p.peer = None;
-                }
-                true
-            }
-            None => false,
-        }
-    };
+    let (removed, lost) = unlink(&mut reg(), id);
     if removed {
         crate::workers::shared::port_closed(id);
     }
+    if let Some((port, owner)) = lost {
+        notify_unentangled(port, owner);
+    }
+}
+
+/// AETHERWORKERS3 (SR129): how many registered ports `owner` holds (host tests observe port collection).
+pub fn owned_by(owner: Owner) -> usize {
+    reg().values().filter(|e| e.owner == owner).count()
 }
 
 /// `broadcast::retire`'s hook: the document's ports disentangle.
@@ -196,17 +241,30 @@ fn port_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             Ok(Value::Undefined)
         }
         "adopt" => {
+            // AETHERWORKERS3 (SR129): answers the port's peer id (0: unentangled), so the adopting realm knows
+            // whether the pair is local to it (collectable together) or spans realms (held by the global).
             let id = id_arg(vm, ctx, 1)?;
             let owner = here();
             let mut r = reg();
+            let mut peer = 0u64;
             if let Some(e) = r.get_mut(&id) {
                 e.owner = owner;
+                peer = e.peer.unwrap_or(0);
                 for (data, ports) in std::mem::take(&mut e.pending) {
                     deliver(owner, id, &data, &ports);
                 }
             }
+            Ok(num(peer as f64))
+        }
+        // AETHERWORKERS3 (SR129): the realm's collector found port `id` unreachable (its FinalizationRegistry
+        // callback): it closes as `close()` would.
+        "collected" => {
+            let id = id_arg(vm, ctx, 1)?;
+            close(id);
             Ok(Value::Undefined)
         }
+        // AETHERWORKERS3 (SR129): how many registered ports this realm owns.
+        "live" => Ok(num(owned_by(here()) as f64)),
         "close" => {
             let id = id_arg(vm, ctx, 1)?;
             close(id);
@@ -244,6 +302,56 @@ pub const PRELUDE: &str = r#"
     var PAGE = typeof __net_fire === 'function';
     var TOKEN = {};
     var ST = new WeakMap(), BY_ID = new Map(), CH = new WeakMap();
+    // ---- AETHERWORKERS3 (SR129): ports and garbage collection (HTML §9.4.6). A port whose entangled peer lives in
+    // this realm is held by that peer (`s.peer`, a strong edge in the ST ephemeron): the pair is collected
+    // together when neither is reachable. A port whose peer is in another realm or in transit is held by the
+    // global ("as if the relevant global object has a strong reference": BY_ID holds it). An unentangled port
+    // is held by nothing. BY_ID otherwise holds a WeakRef; the FinalizationRegistry closes a collected port in
+    // the registry (`__port('collected')`). Page-realm ports are rooted by js/events.rs's EventTarget
+    // constructor (`other_targets`), so in practice this collects worker-realm ports.
+    var REG = (typeof FinalizationRegistry === 'function' && typeof WeakRef === 'function')
+        ? new FinalizationRegistry(function (id) { __port('collected', id); }) : null;
+    var holdStrong = function (p, s) { BY_ID.set(s.id, { w: null, s: p }); };
+    var holdWeak = function (p, s) { BY_ID.set(s.id, REG === null ? { w: null, s: p } : { w: new WeakRef(p), s: null }); };
+    var portOf = function (id) {
+        var e = BY_ID.get(Number(id));
+        if (!e) { return undefined; }
+        return e.s || e.w.deref();
+    };
+    var unpair = function (s) {
+        var q = s.peer;
+        if (!q) { return; }
+        s.peer = null;
+        var qs = ST.get(q);
+        qs.peer = null;
+        if (!qs.closed && !qs.shipped) { holdStrong(q, qs); }
+    };
+    // ---- AETHERWORKERS3 (SR129): OffscreenCanvas transfer state (HTML §4.12.5.3.2): a canvas with a rendering
+    // context cannot be transferred; a transferred (detached) one has no bitmap and refuses getContext.
+    var OCX = new WeakSet(), DET = new WeakSet();
+    if (typeof OffscreenCanvas === 'function') {
+        (function () {
+            var P = OffscreenCanvas.prototype;
+            var gd = Object.getOwnPropertyDescriptor(P, 'getContext');
+            var td = Object.getOwnPropertyDescriptor(P, 'transferToImageBitmap');
+            if (gd && typeof gd.value === 'function') {
+                var gc = gd.value;
+                Object.defineProperty(P, 'getContext', { value: function getContext(contextId) {
+                    if (DET.has(this)) { throw new DOMException("Failed to execute 'getContext' on 'OffscreenCanvas': Cannot get a context from a detached OffscreenCanvas.", 'InvalidStateError'); }
+                    var c = gc.apply(this, arguments);
+                    if (c !== null && c !== undefined) { OCX.add(this); }
+                    return c;
+                }, writable: gd.writable, enumerable: gd.enumerable, configurable: gd.configurable });
+            }
+            if (td && typeof td.value === 'function') {
+                var tb = td.value;
+                Object.defineProperty(P, 'transferToImageBitmap', { value: function transferToImageBitmap() {
+                    if (DET.has(this)) { throw new DOMException("Failed to execute 'transferToImageBitmap' on 'OffscreenCanvas': Cannot transfer an ImageBitmap from a detached OffscreenCanvas.", 'InvalidStateError'); }
+                    return tb.apply(this, arguments);
+                }, writable: td.writable, enumerable: td.enumerable, configurable: td.configurable });
+            }
+        })();
+    }
     var EMPTY = Object.freeze([]);
     var dce = function (m) { return new DOMException(m, 'DataCloneError'); };
     var tagOf = function (x) { return Object.prototype.toString.call(x).slice(8, -1); };
@@ -275,7 +383,7 @@ pub const PRELUDE: &str = r#"
         return t.transfer === undefined ? [] : Array.from(t.transfer);
     };
     var pack = function (message, list) {
-        var xp = new Map(), bufs = [];
+        var xp = new Map(), bufs = [], bmps = [], ocs = new Set();
         list.forEach(function (x, i) {
             if (x instanceof MessagePort) {
                 if (xp.has(x)) { throw dce('Port at index ' + i + ' is a duplicate of an earlier port.'); }
@@ -285,23 +393,41 @@ pub const PRELUDE: &str = r#"
                 if (bufs.indexOf(x) >= 0) { throw dce('ArrayBuffer at index ' + i + ' is a duplicate of an earlier ArrayBuffer.'); }
                 if (typeof x.detached === 'boolean' && x.detached) { throw dce('ArrayBuffer at index ' + i + ' is already detached.'); }
                 bufs.push(x);
+            } else if (typeof ImageBitmap === 'function' && x instanceof ImageBitmap) {
+                // AETHERWORKERS3 (SR129): HTML §4.12.5.3.4 ImageBitmap transfer steps (the source is closed after).
+                if (bmps.indexOf(x) >= 0) { throw dce('ImageBitmap at index ' + i + ' is a duplicate of an earlier ImageBitmap.'); }
+                if (!(x.width > 0 && x.height > 0)) { throw dce('ImageBitmap at index ' + i + ' is already detached.'); }
+                bmps.push(x);
+            } else if (typeof OffscreenCanvas === 'function' && x instanceof OffscreenCanvas) {
+                // AETHERWORKERS3 (SR129): HTML §4.12.5.3.2 OffscreenCanvas transfer steps.
+                if (ocs.has(x)) { throw dce('OffscreenCanvas at index ' + i + ' is a duplicate of an earlier OffscreenCanvas.'); }
+                if (DET.has(x)) { throw dce('OffscreenCanvas at index ' + i + ' is already detached.'); }
+                if (OCX.has(x)) { throw new DOMException('OffscreenCanvas at index ' + i + ' could not be transferred because it has a rendering context.', 'InvalidStateError'); }
+                ocs.add(x);
+            } else if (typeof ReadableStream === 'function' && x instanceof ReadableStream) {
+                // AETHERWORKERS3 (SR129): refused by name — see the evidence table (transferable streams).
+                throw dce('ReadableStream at index ' + i + ' could not be transferred: transferable streams are not supported.');
             } else {
                 throw dce('Value at index ' + i + ' does not have a transferable type.');
             }
         });
-        var text = __sc_ser(message, xp);
+        var text = __sc_ser(message, xp, ocs);
         var ids = [];
         xp.forEach(function (i, p) {
             var s = ST.get(p);
             s.shipped = true;
             s.closed = true;
             BY_ID.delete(s.id);
+            if (REG !== null) { REG.unregister(p); }
+            unpair(s);
             ids[i] = s.id;
             // What this realm received but has not dispatched travels with the port.
             __port('ship', s.id, JSON.stringify(s.q));
             s.q = [];
         });
         bufs.forEach(function (b) { ArrayBuffer.prototype.transfer.call(b, 0); });
+        bmps.forEach(function (b) { b.close(); });
+        ocs.forEach(function (c) { DET.add(c); c.width = 0; c.height = 0; });
         return { data: text, ports: ids.join(',') };
     };
     var adoptAll = function (csv) {
@@ -309,7 +435,18 @@ pub const PRELUDE: &str = r#"
         return String(csv).split(',').map(function (x) {
             var id = Number(x);
             var p = new MessagePort(TOKEN, id);
-            __port('adopt', id);
+            var peer = Number(__port('adopt', id));
+            var s = ST.get(p);
+            var q = peer ? portOf(peer) : undefined;
+            if (!peer) {
+                holdWeak(p, s);
+            } else if (q !== undefined && !ST.get(q).shipped && !ST.get(q).closed) {
+                // Both ends now live in this realm: they hold each other.
+                s.peer = q;
+                ST.get(q).peer = p;
+                holdWeak(p, s);
+                holdWeak(q, ST.get(q));
+            }
             return p;
         });
     };
@@ -340,8 +477,10 @@ pub const PRELUDE: &str = r#"
         constructor(token, id) {
             if (token !== TOKEN) { throw new TypeError('Illegal constructor'); }
             super();
-            ST.set(this, { id: id, started: false, closed: false, shipped: false, q: [], backlog: 0 });
-            BY_ID.set(id, this);
+            var s = { id: id, started: false, closed: false, shipped: false, q: [], backlog: 0, peer: null };
+            ST.set(this, s);
+            holdStrong(this, s);
+            if (REG !== null) { REG.register(this, id, this); }
         }
         postMessage(message, transfer) {
             var s = st(this);
@@ -366,6 +505,11 @@ pub const PRELUDE: &str = r#"
             if (s.closed) { return; }
             s.closed = true;
             s.q = [];
+            BY_ID.delete(s.id);
+            if (REG !== null) { REG.unregister(this); }
+            // The surviving local peer is unentangled: nothing holds it any more but script.
+            var q = s.peer;
+            if (q) { s.peer = null; ST.get(q).peer = null; holdWeak(q, ST.get(q)); }
             __port('close', s.id);
         }
     }
@@ -382,7 +526,13 @@ pub const PRELUDE: &str = r#"
     class MessageChannel {
         constructor() {
             var ids = __port('pair');
-            CH.set(this, [new MessagePort(TOKEN, ids[0]), new MessagePort(TOKEN, ids[1])]);
+            var a = new MessagePort(TOKEN, ids[0]), b = new MessagePort(TOKEN, ids[1]);
+            var sa = ST.get(a), sb = ST.get(b);
+            sa.peer = b;
+            sb.peer = a;
+            holdWeak(a, sa);
+            holdWeak(b, sb);
+            CH.set(this, [a, b]);
         }
         get port1() { var c = CH.get(this); if (!c) { throw new TypeError('Illegal invocation'); } return c[0]; }
         get port2() { var c = CH.get(this); if (!c) { throw new TypeError('Illegal invocation'); } return c[1]; }
@@ -394,7 +544,7 @@ pub const PRELUDE: &str = r#"
     // A message for port `id` arrived on this realm's event loop (inbox / worker command): queued until the port
     // is started, dispatched as its own task after any backlog.
     hide('__port_deliver', function (id, text, csv) {
-        var p = BY_ID.get(Number(id));
+        var p = portOf(id);
         if (!p) { return; }
         var s = ST.get(p);
         if (s.closed) { return; }
@@ -410,8 +560,37 @@ pub const PRELUDE: &str = r#"
     // AETHERWORKERS3 (SR129): a shared worker's `connect` adopts its inside port; SharedWorker reads a port's id.
     hide('__msg_adopt', adoptAll);
     hide('__port_id', function (p) { return st(p).id; });
+    // AETHERWORKERS3 (SR129): the peer of port `id` is gone (closed, collected, its realm ended): the port is
+    // unentangled, held by nothing but script.
+    hide('__port_unentangled', function (id) {
+        var p = portOf(id);
+        if (!p) { return; }
+        var s = ST.get(p);
+        if (s.closed || s.shipped) { return; }
+        if (s.peer) { ST.get(s.peer).peer = null; s.peer = null; }
+        holdWeak(p, s);
+    });
+    // AETHERWORKERS3 (SR129): structuredClone(value, { transfer }) over the same StructuredSerializeWithTransfer
+    // as postMessage (HTML §2.7.11): ArrayBuffers, MessagePorts (re-adopted in this realm), ImageBitmaps and
+    // OffscreenCanvases move; anything else in the list throws DataCloneError.
+    Object.defineProperty(globalThis, 'structuredClone', {
+        value: function structuredClone(value, options) {
+            if (arguments.length < 1) { throw new TypeError("Failed to execute 'structuredClone': 1 argument required, but only 0 present."); }
+            var list = [];
+            if (options !== undefined && options !== null) {
+                if (typeof options !== 'object' && typeof options !== 'function') {
+                    throw new TypeError("Failed to execute 'structuredClone': The provided value is not of type 'StructuredSerializeOptions'.");
+                }
+                if (options.transfer !== undefined) { list = Array.from(options.transfer); }
+            }
+            var pkt = pack(value, list);
+            return __sc_de(pkt.data, adoptAll(pkt.ports));
+        },
+        writable: true, configurable: true, enumerable: false,
+    });
     if (typeof __inbox_on === 'function') {
         __inbox_on('port-message', function (m) { __port_deliver(m.port, m.data, m.ports); });
+        __inbox_on('port-unentangled', function (m) { __port_unentangled(m.port); });
     }
 })();
 "#;
