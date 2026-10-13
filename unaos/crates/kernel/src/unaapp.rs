@@ -47,7 +47,22 @@
 //!      (whole-word leaves `alphabet`: 2 of the 3 substring hits);
 //!   f. SAVE the second tab — Esc, Ctrl+S -> `:: UNA: save path=<fix2> `, and after the exit [`FIX2_PATH`] must read
 //!      [`FIX2_SAVED`] byte-exact.
+//!   g. RENAME — RING3RENAME (rmbp-ledger B561): Ctrl+1 (the tree), Up, Up, Down (the selection on `fix2.txt`), `r`,
+//!      eight Backspaces over the prefilled name, `moved.txt`, Enter -> `:: UNA: tree op=rename
+//!      path=/var/tmp/una/fix2.txt to=/var/tmp/una/moved.txt via=rename rc=0 ` (SYS_PATH_WRITE + PATH_W_RENAME).
+//!      After the exit [`FIX2_PATH`] is GONE and [`MOVED_PATH`] reads [`FIX2_SAVED`] byte-exact with the SAME object id
+//!      `fix2.txt` had before the drive (`id=same`: the owner / grants / attribute rows on the object travel).
 //! PASS on a UnaFS root also needs every drive (`ide=ok`); the first one that times out is named (`ide=<step>`).
+//!
+//! RING3RENAME (B561) — THE TRASH DRIVE, on a UnaFS root, after the first window's exit: trash_core moves only files
+//! under the trasher's home (`/home/<user>`, or `/home` with no session — trash_core's `Ctx`, the rule UNA.ELF's tree
+//! applies), and the first window's tree is rooted at [`FIX_DIR`], outside every home. So a SECOND window is spawned
+//! on [`TRASH_LEAF`] laid with KERNEL authority in `<home>/`[`TRASH_FIX_DIR`] (its tree: that one file, selected),
+//! and driven: Ctrl+1, Delete -> `:: UNA: tree op=trash path=<home>/.una-trashfix/unatrash.txt
+//! to=<home>/.Trash/unatrash.txt via=rename rc=0 `, Ctrl+Q. After the exit the old path is GONE, the Trash path reads
+//! [`TRASH_SRC`] byte-exact with the same object id, and carries `una:trash-origin` = the old path (trash_core's
+//! record on the object). With no session `<home>/.Trash` = `/home/.Trash` is laid (kernel authority, when absent) so
+//! the drive does not hang on `/home`'s ACL. `[unaapp] trash=<ok|bad|skip|step> id=<same|moved|n/a> home=<h> …`.
 //!
 //! WITNESS. `:: UNAAPP: image=/apps/UNA.ELF window=<elf|fixed|bad> panes=<n> lines=<n> saved=<1|0|skip>
 //! highlight=<n> ide=<ok|skip|step> -> PASS|FAIL|SKIP ::` preceded by `[unaapp] …` (pid, slot, timings, the decoded status, the bytes
@@ -79,6 +94,13 @@ const W_FIND: &str = ":: UNA: find needle=main word=0 hits=1 at=2:4 ";
 const W_GOTO: &str = ":: UNA: goto line=1 ";
 const W_REPL: &str = ":: UNA: replace needle=alpha with=omega word=1 n=2 ";
 const W_SAVE2: &str = ":: UNA: save path=/var/tmp/una/fix2.txt ";
+/// RING3RENAME (B561): drive g's new path and its watched prefix.
+const MOVED_PATH: &str = "/var/tmp/una/moved.txt";
+const W_RENAME: &str = ":: UNA: tree op=rename path=/var/tmp/una/fix2.txt to=/var/tmp/una/moved.txt via=rename rc=0 ";
+/// RING3RENAME (B561): the trash drive's folder under the home, its file, and its text.
+const TRASH_FIX_DIR: &str = ".una-trashfix";
+const TRASH_LEAF: &str = "unatrash.txt";
+const TRASH_SRC: &[u8] = b"trash me\n";
 /// UNAMETAL2: the ACL leg's probe — a name under ROOTACL's `system` tree `/apps`, which `anon` may not create.
 const ACL_PROBE: &str = "/apps/UNAPROBE.TXT";
 /// The window, one mono face off the volume and the workspace's first listing come before the start line.
@@ -145,6 +167,10 @@ fn lay_fixture(mt: &crate::fs::vfs::MountTable) -> Result<(), &'static str> {
         Ok(n) if n == FIX_SRC.len() => {}
         _ => return Err("fixture-write"),
     }
+    // RING3RENAME (B561): drive g's leftover from an earlier run, so the name is free again.
+    if mt.stat(MOVED_PATH).is_ok() {
+        mt.unlink(MOVED_PATH, K).map_err(|_| "fixture-unlink-moved")?;
+    }
     // UNAIDE2: the second file the drives open from the tree.
     if mt.stat(FIX2_PATH).is_ok() {
         mt.unlink(FIX2_PATH, K).map_err(|_| "fixture-unlink2")?;
@@ -168,6 +194,116 @@ fn acl_leg(mt: &crate::fs::vfs::MountTable) -> &'static str {
     } else {
         "error"
     }
+}
+
+/// RING3RENAME (B561): the home UNA.ELF's Trash uses — SYS_WHOAMI's home for the session a new slot is stamped with
+/// (trailing `/` trimmed), else `/home` (trash_core's `Ctx`: "`/home` with no session"); tree.rs `Tree::trash`'s rule.
+fn trash_home() -> alloc::string::String {
+    if let Ok(rec) = crate::ring3abi::whoami_record(crate::ring3abi::session_uid()) {
+        if let Some(w) = una_abi::whoami_parse(&rec) {
+            if let Ok(h) = core::str::from_utf8(w.home) {
+                let h = h.trim_end_matches('/');
+                if h.starts_with('/') && h.len() > 1 {
+                    return alloc::string::String::from(h);
+                }
+            }
+        }
+    }
+    alloc::string::String::from("/home")
+}
+
+/// RING3RENAME (B561): drive g — the rename of `fix2.txt` from the first window's tree. The ms taken, or the step.
+fn rename_drive(pid: u64, slot: u64) -> Result<u64, &'static str> {
+    use una_abi::{INPUT_EV_KEY_DOWN as D, INPUT_EV_KEY_UP as U, KEY_CTRL_DIGIT, KEY_DOWN, KEY_UP};
+    let mut ev = alloc::vec![(D, KEY_CTRL_DIGIT | 1), (U, b'1'), (D, KEY_UP), (D, KEY_UP), (D, KEY_DOWN), (D, b'r')];
+    ev.extend(core::iter::repeat((D, 0x08u8)).take("fix2.txt".len()));
+    ev.extend(b"moved.txt\n".iter().map(|&b| (D, b)));
+    drive(pid, slot, W_RENAME, &ev).map_err(|_| "rename")
+}
+
+/// RING3RENAME (B561): the trash drive (module doc) — lay, spawn the second window, Ctrl+1 + Delete, Ctrl+Q, read
+/// back. The word for the witness (`ok`, `bad`, or the step that failed) and the id check's word.
+fn trash_leg(mt: &crate::fs::vfs::MountTable, img: &[u8]) -> (&'static str, &'static str) {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as K};
+    use una_abi::{INPUT_EV_KEY_DOWN as D, INPUT_EV_KEY_UP as U, KEY_CTRL_DIGIT};
+    let home = trash_home();
+    let dir = alloc::format!("{}/{}", home, TRASH_FIX_DIR);
+    let victim = alloc::format!("{}/{}", dir, TRASH_LEAF);
+    let tdir = alloc::format!("{}/{}", home, una_abi::TRASH_DIR_NAME);
+    let trashed = alloc::format!("{}/{}", tdir, TRASH_LEAF);
+    // Lay: the home (no session: `/home`) and the fixture folder when absent, the old Trash copy gone, the file fresh.
+    let mut dirs: alloc::vec::Vec<&str> = alloc::vec![home.as_str(), dir.as_str()];
+    if home == "/home" {
+        dirs.push(tdir.as_str());
+    }
+    for d in dirs {
+        if mt.stat(d).is_err() && mt.create(d, NodeKind::Dir, K).is_err() {
+            return ("lay-dir", "n/a");
+        }
+    }
+    for p in [victim.as_str(), trashed.as_str()] {
+        if mt.stat(p).is_ok() && mt.unlink(p, K).is_err() {
+            return ("lay-unlink", "n/a");
+        }
+    }
+    if mt.create(&victim, NodeKind::File, K).is_err() || !matches!(mt.write(&victim, 0, TRASH_SRC, K), Ok(n) if n == TRASH_SRC.len()) {
+        return ("lay-file", "n/a");
+    }
+    let id_before = mt.stat(&victim).ok().and_then(|s| s.id);
+    // The watched line carries the two paths, so it is built here and kept for the life of the kernel (the watch
+    // holds a `&'static str`; one small string per `tests una`).
+    let watch: &'static str = alloc::boxed::Box::leak(
+        alloc::format!(":: UNA: tree op=trash path={} to={} via=rename rc=0 ", victim, trashed).into_boxed_str(),
+    );
+    crate::serial_line::line_watch_arm(OPENED);
+    let (pid, slot, _) = match sc::spawn_user_image_bg_argv(img, &["UNA.ELF", victim.as_str()]) {
+        Ok(t) => {
+            crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1), IMAGE);
+            t
+        }
+        Err(_) => {
+            crate::serial_line::line_watch_disarm();
+            return ("spawn", "n/a");
+        }
+    };
+    let mut step: Option<&'static str> = wait_line(pid, START_MS).err().map(|_| "trash-start");
+    if step.is_none() && drive(pid, slot, watch, &[(D, KEY_CTRL_DIGIT | 1), (U, b'1'), (D, 0x7f)]).is_err() {
+        step = Some("trash");
+    }
+    crate::serial_line::line_watch_disarm();
+    let mut exited = false;
+    if type_line(slot, &[0x11]) {
+        let t0 = crate::arch::ticks();
+        while crate::arch::ticks() < t0 + EXIT_MS {
+            match sc::bg_poll(pid, true) {
+                BgPoll::Running => crate::arch::sched::yield_now(),
+                BgPoll::Exited(_) => {
+                    exited = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    if !exited {
+        let _ = sc::bg_kill(pid, slot);
+    }
+    let id_word = match (id_before, mt.stat(&trashed).ok().and_then(|s| s.id)) {
+        (Some(a), Some(b)) if a == b => "same",
+        (Some(_), _) => "moved",
+        _ => "n/a",
+    };
+    let bytes_ok = matches!(mt.read(&trashed, 0, TRASH_SRC.len() + 64), Ok(b) if b.as_slice() == TRASH_SRC);
+    let origin_ok = matches!(mt.get_attr(&trashed, una_abi::ATTR_KEY_TRASH_ORIGIN, K), Ok(crate::fs::vfs::AttrValue::Str(ref o)) if *o == victim);
+    let gone = mt.stat(&victim).is_err();
+    serial_println!(
+        "[unaapp] trash home={} path={} to={} gone={} bytes={} origin={} id={} exited={} step={}",
+        home, victim, trashed, gone, bytes_ok, origin_ok, id_word, exited, step.unwrap_or("none")
+    );
+    if let Some(s) = step {
+        return (s, id_word);
+    }
+    (if gone && bytes_ok && origin_ok && id_word == "same" { "ok" } else { "bad" }, id_word)
 }
 
 fn why(r: &str) {
@@ -341,6 +477,15 @@ pub fn selftest() {
             Err(step) => ide = step,
         }
     }
+    // RING3RENAME (B561): drive g after the IDE drives, on the same window; `fix2.txt`'s id taken first.
+    let id_before = if laid.is_ok() { mt.stat(FIX2_PATH).ok().and_then(|s| s.id) } else { None };
+    let mut ren_ms: Option<u64> = None;
+    if fail.is_none() && ide == "ok" {
+        match rename_drive(pid, slot) {
+            Ok(ms) => ren_ms = Some(ms),
+            Err(step) => ide = step,
+        }
+    }
     if fail.is_none() {
         // Ctrl+3 as the decoder delivers it (a bare release of `3`), then the line into the console.
         crate::serial_line::line_watch_arm(PLANNED);
@@ -384,8 +529,25 @@ pub fn selftest() {
     let verb = midden_core::ring3::verb_of(code).unwrap_or("none");
     // UNAMETAL2: what the save left on the volume.
     let bytes_ok = laid.is_ok() && matches!(mt.read(FIX_PATH, 0, FIX_SAVED.len() + 64), Ok(b) if b.as_slice() == FIX_SAVED);
-    // UNAIDE2: what the replace-all and the second save left on the volume.
-    let bytes2_ok = laid.is_ok() && matches!(mt.read(FIX2_PATH, 0, FIX2_SAVED.len() + 64), Ok(b) if b.as_slice() == FIX2_SAVED);
+    // UNAIDE2: what the replace-all and the second save left on the volume — RING3RENAME (B561): read at the file's
+    // new path (drive g renamed it), the old path gone, the object id the one `fix2.txt` had.
+    let bytes2_ok = laid.is_ok() && matches!(mt.read(MOVED_PATH, 0, FIX2_SAVED.len() + 64), Ok(b) if b.as_slice() == FIX2_SAVED);
+    let rename_ok = laid.is_ok() && mt.stat(FIX2_PATH).is_err() && mt.stat(MOVED_PATH).is_ok();
+    let id_word = match (id_before, mt.stat(MOVED_PATH).ok().and_then(|s| s.id)) {
+        (Some(a), Some(b)) if a == b => "same",
+        (Some(_), _) => "moved",
+        _ => "n/a",
+    };
+    // RING3RENAME (B561): the trash drive, a second window, once the first has gone (UnaFS root, every earlier leg green).
+    let (trash_word, trash_id) = if laid.is_ok() && status.is_some() && ide == "ok" { trash_leg(&mt, &img) } else { ("skip", "n/a") };
+    serial_println!(
+        "[unaapp] rename={} id={} ms(rename)={:?} trash={} trash_id={}",
+        if laid.is_err() { "n/a" } else if rename_ok { "ok" } else { "bad" },
+        id_word,
+        ren_ms,
+        trash_word,
+        trash_id
+    );
     serial_println!(
         "[unaapp] ide={} ms(open2,switch,find,goto,switch2,replace,save2)={:?} bytes2={}",
         ide,
@@ -400,7 +562,7 @@ pub fn selftest() {
     let help_rows = midden_core::help(&midden_core::Facts::ring3(true)).lines().count() as u32;
     let base = fail.is_none() && status.is_some() && win_ok && panes == PANES && cmds == 1 && kind == 1 && verb == "help" && rows > help_rows;
     let save_ok = laid.is_err() || (saved && bytes_ok && spans > 0);
-    let ide_ok = laid.is_err() || (ide == "ok" && bytes2_ok);
+    let ide_ok = laid.is_err() || (ide == "ok" && bytes2_ok && rename_ok && id_word == "same" && trash_word == "ok");
     let ok = base && save_ok && ide_ok;
     if let Some(r) = fail {
         why(r);
@@ -409,7 +571,7 @@ pub fn selftest() {
     } else if !save_ok {
         serial_println!(":: UNAAPP: reason=save-mismatch (want saved=1 bytes=ok highlight>0 at {}) ::", FIX_PATH);
     } else if !ide_ok {
-        serial_println!(":: UNAAPP: reason=ide-mismatch (step={} bytes2={} at {}) ::", ide, if bytes2_ok { "ok" } else { "bad" }, FIX2_PATH);
+        serial_println!(":: UNAAPP: reason=ide-mismatch (step={} bytes2={} at {} rename={} id={} trash={}) ::", ide, if bytes2_ok { "ok" } else { "bad" }, MOVED_PATH, rename_ok, id_word, trash_word);
     }
     let saved_word = if laid.is_err() { "skip" } else if saved { "1" } else { "0" };
     verdict_ide(window, panes, rows, saved_word, spans, ide, if ok { "PASS" } else { "FAIL" });

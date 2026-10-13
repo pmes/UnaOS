@@ -71,6 +71,13 @@ name = "tls_core"
 version = "0.1.0"
 
 [[package]]
+name = "trash_core"
+version = "0.1.0"
+dependencies = [
+ "una-abi",
+]
+
+[[package]]
 name = "una-abi"
 version = "0.1.0"
 
@@ -86,6 +93,7 @@ dependencies = [
  "midden_core",
  "palette_core",
  "syntax_core",
+ "trash_core",
  "una-abi",
  "vein_ring3",
 ]

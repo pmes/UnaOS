@@ -30901,7 +30901,7 @@ pub fn path_write_as(path: &str, flags: u16, off: u64, data: &[u8], who: &str) -
     if !ring3_path_ok(path) || data.len() > una_abi::PATH_IO_MAX {
         return EINVAL;
     }
-    if flags & !(una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS | una_abi::PATH_W_UNLINK) != 0 {
+    if flags == una_abi::PATH_W_RENAME { return crate::fs::vfs::ring3_rename(&crate::shell::vfs_mount_table(), path, off, data, who); } if flags & !(una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS | una_abi::PATH_W_UNLINK) != 0 { // RING3RENAME (B561): `PATH_W_RENAME` alone — `from` = the path, `to` = the data — through the one body `selfdiag::path_fulfil` calls on both arches (fs/vfs.rs tail). LINE-NEUTRAL append, before this comment.
         return EINVAL;
     }
     let mt = crate::shell::vfs_mount_table();

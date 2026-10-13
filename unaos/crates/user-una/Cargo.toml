@@ -52,3 +52,7 @@ matrix_core = { path = "../../libs/fs/matrix_core" }
 # off): the index, blob ids, loose and packed objects, gitignore and git's line diff for the tree's marks and the
 # console's read-only `git status` / `git diff`; the I/O is the program's own (src/git.rs over SYS_PATH_*).
 git_core = { path = "../../libs/vcs/git_core" }
+# RING3RENAME (rmbp-ledger B561): trash_core — the ONE Trash (TRASHCORE B449, Matrix's shared core, the rule the kernel's
+# fs/trash.rs and the host VaultTrash link): the tree's Delete runs `trash_core::trash` over src/fs.rs's ring-3 doors
+# (SYS_PATH_WRITE + PATH_W_RENAME for the move, SYS_ATTR_SET/GET for the `una:trash-*` record on the object).
+trash_core = { path = "../../libs/fs/trash_core" }
