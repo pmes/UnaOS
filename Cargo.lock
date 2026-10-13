@@ -1997,6 +1997,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "vp8_core",
+ "vp9_core",
 ]
 
 [[package]]
@@ -5155,6 +5156,13 @@ dependencies = [
 [[package]]
 name = "vp8_core"
 version = "0.1.0"
+
+[[package]]
+name = "vp9_core"
+version = "0.1.0"
+dependencies = [
+ "demux_core",
+]
 
 [[package]]
 name = "walkdir"
