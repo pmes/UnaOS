@@ -2873,26 +2873,57 @@ pub fn request_open() {
 /// Consume a pending open request. Idempotent, and safe to call every pass: a quiet pass is one
 /// relaxed load.
 pub fn service() {
-    reap_jobs();
-    if REOPEN.swap(false, Ordering::AcqRel) {
-        open();
+    // SMALLFIX10 (B539 item 3): each drain below runs under its own NESTED loginrender stamp (inside the render
+    // pass's `quarry` stamp, main.rs `console_launch_drain`), so a long one is named on the `[lag] stall` line and
+    // in `:: LOGINRENDER: … worst_what=` as `quarry.<part>` — flight 31 said only `quarry:225`. Inert off the
+    // render task and off x86+wc (`loginrender::stamp`). The ORDER of the drains is unchanged.
+    use crate::video::loginrender as lr;
+    {
+        let _s = lr::stamp(lr::W_Q_OPEN);
+        reap_jobs();
+        if REOPEN.swap(false, Ordering::AcqRel) {
+            open();
+        }
     }
     // FACET — the viewer's latch drains HERE, and it needs no drain site of its own for the reason
     // its press routing needs no router arm: this function is ALREADY called from both places this
     // desktop services furniture (`main.rs`'s Orin render pass and `arch/aarch64/syscall.rs`'s
     // strip-press arm), and neither file may gain a line. A quiet pass costs one uncontended lock.
-    #[cfg(feature = "facet")]
-    crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service(); crate::video::player::service(); crate::video::settings::service(); crate::video::text::service(); crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
+    {
+        let _s = lr::stamp(lr::W_Q_VIEWERS);
+        #[cfg(feature = "facet")]
+        crate::video::facet::service();
+        crate::video::fileview::service();
+        crate::video::player::service();
+    }
+    {
+        let _s = lr::stamp(lr::W_Q_SETTINGS);
+        crate::video::settings::service();
+    }
+    {
+        let _s = lr::stamp(lr::W_Q_FONT);
+        crate::video::text::service();
+        crate::video::metrics::ignite(); // UIMETRICS (B372): the furniture's runtime asserts on the latched metrics + `[ui] metrics`, once, on the first desktop service pass
+    }
     // TEXTEDIT — the editor's latch drains on the same pass.
-    crate::video::textedit::service();
+    {
+        let _s = lr::stamp(lr::W_Q_VIEWERS);
+        crate::video::textedit::service();
+    }
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
-    crate::video::activity::service();
+    {
+        let _s = lr::stamp(lr::W_Q_ACTIVITY);
+        crate::video::activity::service();
+    }
     // KERNELFONT2 (B363) M4 — the faces loaded or were restyled since the last pass: every kernel window that caches
     // its own pixels repaints once (the login screen, Quarry, Settings, Activity, the viewer/editor, the installer)
     // and the console repaints its screenful from its cell store. See `font_repaint_pass` at this file's tail.
-    font_repaint_pass();
+    {
+        let _s = lr::stamp(lr::W_Q_FONT);
+        font_repaint_pass();
+    }
+    let _s = lr::stamp(lr::W_Q_PANES);
     #[cfg(feature = "unafs")]
     jobs_status_service(); // JOBSUI (B511): the counts replace `scanning...` the pass the scan lands
     quicklook::service(); columns::service(); openwith::service(); livedir::service(); // QUARRY3 (B413): the Quick Look panel renders here (I/O); QUARRY2 (B336): the latched column-width / sort preference write

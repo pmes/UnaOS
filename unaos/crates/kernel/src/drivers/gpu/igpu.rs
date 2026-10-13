@@ -1236,7 +1236,7 @@ pub unsafe fn gmux_igd_switch() {
         // category error this commit removes from the GATE, kept only so old and new captures
         // compare field for field. `gate=` is the verdict that now decides.
         let gate = gmux_preswitch_decode(p_ddc, disp, ext);
-        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} SW_DISP=0x{:02X} SW_EXT=0x{:02X} SW_EXT_ST=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} sw_ext_state={} ext_state={} gate={} ::",
+        crate::bootlog_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} SW_DISP=0x{:02X} SW_EXT=0x{:02X} SW_EXT_ST=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} sw_ext_state={} ext_state={} gate={} ::",
             p_ddc, p_disp, p_ext, ext, disp, ext, ext_state_name(p_ext), ext_state_name(ext), gate.token());
 
         // THE GATE SCORES STATE READS ONLY, AND THE UNWIND RESTORES ONLY WHAT IT READ AS STATE.
@@ -1267,7 +1267,7 @@ pub unsafe fn gmux_igd_switch() {
         pre_ext_status = Some(ext);
         ext_restore = ext_restore_target(ext);
         if ext_restore.is_none() {
-            serial_println!(":: igpu-dpy: restore ext=SKIPPED (write-target port, no state read) SW_EXT=0x{:02X} SW_EXT_ST=0x{:02X} ext_state={} ::",
+            crate::bootlog_println!(":: igpu-dpy: restore ext=SKIPPED (write-target port, no state read) SW_EXT=0x{:02X} SW_EXT_ST=0x{:02X} ext_state={} ::",
                 p_ext, ext, ext_state_name(ext));
         }
 
@@ -1472,7 +1472,7 @@ pub unsafe fn gmux_igd_switch() {
         let pp_ctl_settled = mmio_read(bar0, regs::PCH_PP_CONTROL);
         let pp_sts_settled = mmio_read(bar0, regs::PCH_PP_STATUS);
         let pp_moved = if pp_ctl_settled != pp_ctl_entry || pp_sts_settled != pp_sts_entry { 1 } else { 0 };
-        serial_println!(":: igpu-dpy: rung=03 name=pp SETTLE ms={} budget=not-a-cited-T3 moved={} pp_ctl=0x{:08X}->0x{:08X} pp_sts=0x{:08X}->0x{:08X} elapsed_ms={} ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=03 name=pp SETTLE ms={} budget=not-a-cited-T3 moved={} pp_ctl=0x{:08X}->0x{:08X} pp_sts=0x{:08X}->0x{:08X} elapsed_ms={} ::",
             PP_SETTLE_MS, pp_moved, pp_ctl_entry, pp_ctl_settled, pp_sts_entry, pp_sts_settled, get_elapsed_ms());
 
         highest = 4;
@@ -1627,10 +1627,10 @@ pub unsafe fn gmux_igd_switch() {
 
         serial_println!(":: igpu-dpy: rung=06 name=link ok=1 window=DPCD(0x000-0x00F) dpcd_rev=0x{:02X} rate_raw=0x{:02X} rate_decode=TBV-tree-table lanes={} lanes_plausible={} enhanced_frame={} tps3={} downspread={} no_aux_tl={} edp_cfg_cap=0x{:02X} elapsed_ms={} ::",
             cap_rev, cap_rate, cap_lanes, cap_lanes_plausible, cap_enhanced, cap_tps3, cap_downspread, cap_no_aux_tl, cap_edp_cfg, get_elapsed_ms());
-        serial_print!(":: igpu-dpy: rung=06 name=link CAP 000:");
+        if cfg!(any(feature = "bootlog", feature = "tests-at-boot")) { serial_print!(":: igpu-dpy: rung=06 name=link CAP 000:"); // SMALLFIX10 (B539 item 7): the CAP bytes ride the bootlog with the other detail rows (bootlog_println's own gate)
         for b in dpcd_cap.iter() { serial_print!(" {:02X}", b); }
-        serial_println!(" ::");
-        serial_println!(":: igpu-dpy: rung=06 name=link STATUS addr=DPCD(0x202-0x207) bits=uncited lane01=0x{:02X} lane23=0x{:02X} align=0x{:02X} sink=0x{:02X} adj01=0x{:02X} adj23=0x{:02X} ::",
+        serial_println!(" ::"); }
+        crate::bootlog_println!(":: igpu-dpy: rung=06 name=link STATUS addr=DPCD(0x202-0x207) bits=uncited lane01=0x{:02X} lane23=0x{:02X} align=0x{:02X} sink=0x{:02X} adj01=0x{:02X} adj23=0x{:02X} ::",
             link_status[0], link_status[1], link_status[2], link_status[3], link_status[4], link_status[5]);
 
         // ═══════════════════════════════════════════════════════════════════════════════════
@@ -1683,7 +1683,7 @@ pub unsafe fn gmux_igd_switch() {
         // GEN7 M3 (B411): the MISSING line, answered by rung 07b's own citations (two sources each: the PRM
         // section and the firmware capture `pp_ctl=0xABCD0008`, flights 8-25). The write stays declined on
         // the two legs that are NOT citations: `gmux=kepler` and `t_source=NONE`.
-        serial_println!(":: igpu-dpy: rung=07 name=pps-on CITED doc=IHD-OS-V3-Pt4-05-12 pp_control=0xC7204:[31:16]=key,bit3=vdd-override,bit2=backlight,bit1=pd-on-reset,bit0=power-target:sec2.4.2-pp39-41 on_delays=0xC7208:[31:30]=port-sel,[28:16]=T3,[12:0]=pwron-to-bl:sec2.4.3-pp41-42 off_delays=0xC720C:[28:16]=T10,[12:0]=T9:sec2.4.4-p42 divisor=0xC7210:[4:0]=T12:sec2.4.5-p43 gmux=kepler t_source=NONE — the write waits for a gmux hand-off to the IGD and a T-value source; no PPS write on any boot of this build ::");
+        crate::bootlog_println!(":: igpu-dpy: rung=07 name=pps-on CITED doc=IHD-OS-V3-Pt4-05-12 pp_control=0xC7204:[31:16]=key,bit3=vdd-override,bit2=backlight,bit1=pd-on-reset,bit0=power-target:sec2.4.2-pp39-41 on_delays=0xC7208:[31:30]=port-sel,[28:16]=T3,[12:0]=pwron-to-bl:sec2.4.3-pp41-42 off_delays=0xC720C:[28:16]=T10,[12:0]=T9:sec2.4.4-p42 divisor=0xC7210:[4:0]=T12:sec2.4.5-p43 gmux=kepler t_source=NONE — the write waits for a gmux hand-off to the IGD and a T-value source; no PPS write on any boot of this build ::");
 
         // ═══════════════════════════════════════════════════════════════════════════════════
         // RUNG 07b — `pps-read`: THE CITATION RUNG 07 COULD NOT MAKE, MADE — AND THE PANEL'S
@@ -1750,25 +1750,25 @@ pub unsafe fn gmux_igd_switch() {
 
         serial_println!(":: igpu-dpy: rung=07b name=pps-read ok=1 writes=0 sample=rung07 doc=IHD-OS-V3-Pt-4-05-12 cite=sec2.4-pp38-43 elapsed_ms={} ::",
             get_elapsed_ms());
-        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_status@0x{:05X}=0x{:08X} power_on={} assets={}(ignored-on-DPA-p38) seq={} cycle_delay_t4={} cite=sec2.4.1-pp38-39 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_status@0x{:05X}=0x{:08X} power_on={} assets={}(ignored-on-DPA-p38) seq={} cycle_delay_t4={} cite=sec2.4.1-pp38-39 ::",
             regs::PCH_PP_STATUS, pps_sts,
             if pp_power_on == 1 { "ON" } else { "OFF" },
             if pp_assets == 1 { "ready" } else { "not-ready" },
             pp_seq_name(pp_seq),
             if pp_cycle_active == 1 { "active" } else { "not-active" });
-        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_control@0x{:05X}=0x{:08X} wp_key=0x{:04X} write_protect={} vdd_override={} backlight={} pd_on_reset={} power_target={} cite=sec2.4.2-pp39-41 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_control@0x{:05X}=0x{:08X} wp_key=0x{:04X} write_protect={} vdd_override={} backlight={} pd_on_reset={} power_target={} cite=sec2.4.2-pp39-41 ::",
             regs::PCH_PP_CONTROL, pps_ctl, pp_wp_key,
             if pp_wp_key == 0xABCD { "DISABLED-key-ABCD" } else { "ENABLED" },
             if pp_vdd_force == 1 { "FORCE" } else { "not-force" },
             if pp_backlight == 1 { "enable" } else { "disable" },
             if pp_pd_on_reset == 1 { "run" } else { "do-not-run" },
             if pp_target == 1 { "ON" } else { "OFF" });
-        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_on_delays@0x{:05X}=0x{:08X} port_sel={} t3_powerup_raw={} t3_us={} pwron_to_bl_raw={} pwron_to_bl_us={} unit=100us cite=sec2.4.3-pp41-42 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_on_delays@0x{:05X}=0x{:08X} port_sel={} t3_powerup_raw={} t3_us={} pwron_to_bl_raw={} pwron_to_bl_us={} unit=100us cite=sec2.4.3-pp41-42 ::",
             regs::PCH_PP_ON_DELAYS, pps_on, pp_port_name(pp_port_sel),
             pp_t3_raw, pp_t3_raw * 100, pp_bl_on_raw, pp_bl_on_raw * 100);
-        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_off_delays@0x{:05X}=0x{:08X} t10_video_off_to_power_off_raw={} t10_us={} t9_bl_off_to_video_off_raw={} t9_us={} unit=100us cite=sec2.4.4-p42 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_off_delays@0x{:05X}=0x{:08X} t10_video_off_to_power_off_raw={} t10_us={} t9_bl_off_to_video_off_raw={} t9_us={} unit=100us cite=sec2.4.4-p42 ::",
             regs::PCH_PP_OFF_DELAYS, pps_off, pp_t10_raw, pp_t10_raw * 100, pp_t9_raw, pp_t9_raw * 100);
-        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_divisor@0x{:05X}=0x{:08X} refdiv=0x{:06X} refclk_mhz={} t12_power_cycle_raw=0x{:02X} t12_ms={} t12_law=prm-two-points unit=100ms cite=sec2.4.5-p43 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_divisor@0x{:05X}=0x{:08X} refdiv=0x{:06X} refclk_mhz={} t12_power_cycle_raw=0x{:02X} t12_ms={} t12_law=prm-two-points unit=100ms cite=sec2.4.5-p43 ::",
             regs::PCH_PP_DIVISOR, pps_div, pp_refdiv, pp_refclk_mhz, pp_t12_raw, pp_t12_ms);
         // THE ROLLUP LINE, and it is the one a write rung has to obey. `panel_powered_by_fw=` is
         // the single fact the brief asked this rung to establish: what a later `pps-on` must
@@ -1781,7 +1781,7 @@ pub unsafe fn gmux_igd_switch() {
         // `PP_ON_DELAYS[31:30] = 01b DisplayPort A`, so a key of ABCD sitting above a port select
         // of LVDS is a half-configured sequencer, and the write rung must program the port select
         // (and real T values) before it touches the power-state target.
-        serial_println!(":: igpu-dpy: rung=07b name=pps-read ROLLUP panel_powered_by_fw={} vdd_forced_by_fw={} wp_window={} delays_programmed={}/3 t_source=PRM-fields-not-firmware-values port_sel_conflict={} preserve=pp_control=0x{:08X} ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=07b name=pps-read ROLLUP panel_powered_by_fw={} vdd_forced_by_fw={} wp_window={} delays_programmed={}/3 t_source=PRM-fields-not-firmware-values port_sel_conflict={} preserve=pp_control=0x{:08X} ::",
             if pp_power_on == 1 { "yes" } else { "no" },
             if pp_vdd_force == 1 { "yes" } else { "no" },
             if pp_wp_key == 0xABCD { "KEYED" } else { "PROTECTED" },
@@ -1826,23 +1826,23 @@ pub unsafe fn gmux_igd_switch() {
 
         serial_println!(":: igpu-dpy: rung=08 name=link-train-dry ok=1 DRY writes=0 aux_writes=0 pp_unwind=0 gated_on=pps={} elapsed_ms={} ::",
             pps_verdict, get_elapsed_ms());
-        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-SET rate=0x{:02X}(DPCD 0x001 verbatim; no MHz conversion, decode TBV) lanes={} enhanced_frame={} tps3={} downspread={} seq=TPS1-CR/TPS2-EQ/pattern-off cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-SET rate=0x{:02X}(DPCD 0x001 verbatim; no MHz conversion, decode TBV) lanes={} enhanced_frame={} tps3={} downspread={} seq=TPS1-CR/TPS2-EQ/pattern-off cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::",
             cap_rate, cap_lanes, cap_enhanced, cap_tps3, cap_downspread);
-        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-WRITE-DPCD link_bw_set=0x100 lane_count_set=0x101 training_pattern_set=0x102 training_lane0_3_set=0x103-0x106 cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::");
-        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dp_a@0x{:05X}=0x{:08X} dplla@0x{:05X}=0x{:08X} fpa0@0x{:05X}=0x{:08X} fpa1@0x{:05X}=0x{:08X} pipeaconf@0x{:05X}=0x{:08X} pipeasrc@0x{:05X}=0x{:08X} ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-WRITE-DPCD link_bw_set=0x100 lane_count_set=0x101 training_pattern_set=0x102 training_lane0_3_set=0x103-0x106 cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::");
+        crate::bootlog_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dp_a@0x{:05X}=0x{:08X} dplla@0x{:05X}=0x{:08X} fpa0@0x{:05X}=0x{:08X} fpa1@0x{:05X}=0x{:08X} pipeaconf@0x{:05X}=0x{:08X} pipeasrc@0x{:05X}=0x{:08X} ::",
             regs::DP_A, mmio_read(bar0, regs::DP_A),
             regs::DPLL_A_CTRL, mmio_read(bar0, regs::DPLL_A_CTRL),
             regs::FPA0, mmio_read(bar0, regs::FPA0),
             regs::FPA1, mmio_read(bar0, regs::FPA1),
             regs::PIPEACONF, mmio_read(bar0, regs::PIPEACONF),
             regs::PIPEASRC, mmio_read(bar0, regs::PIPEASRC));
-        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dspacntr@0x{:05X}=0x{:08X} dspastride@0x{:05X}=0x{:08X} dspalinoff@0x{:05X}=0x{:08X} dspatileoff@0x{:05X}=0x{:08X} dspasurf@0x{:05X}=0x{:08X} ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dspacntr@0x{:05X}=0x{:08X} dspastride@0x{:05X}=0x{:08X} dspalinoff@0x{:05X}=0x{:08X} dspatileoff@0x{:05X}=0x{:08X} dspasurf@0x{:05X}=0x{:08X} ::",
             regs::DSPACNTR, mmio_read(bar0, regs::DSPACNTR),
             regs::DSPASTRIDE, mmio_read(bar0, regs::DSPASTRIDE),
             regs::DSPALINOFF, mmio_read(bar0, regs::DSPALINOFF),
             regs::DSPATILEOFF, mmio_read(bar0, regs::DSPATILEOFF),
             regs::DSPASURF, mmio_read(bar0, regs::DSPASURF));
-        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry NOT-IN-TREE (none) LANDED-BY-GMUX8 htotal hblank hsync vtotal vblank vsync link_m link_n — population=igpu.rs-regs-module, read decoded at rung=08b; NOT-IN-IVB-PRM transcoder dp_tp_ctl dp_tp_status — population=IVB-PRM-V3Pt3+V3Pt4, hits=0, so they are absent from the SILICON's public spec and not merely from this tree ::");
+        crate::bootlog_println!(":: igpu-dpy: rung=08 name=link-train-dry NOT-IN-TREE (none) LANDED-BY-GMUX8 htotal hblank hsync vtotal vblank vsync link_m link_n — population=igpu.rs-regs-module, read decoded at rung=08b; NOT-IN-IVB-PRM transcoder dp_tp_ctl dp_tp_status — population=IVB-PRM-V3Pt3+V3Pt4, hits=0, so they are absent from the SILICON's public spec and not merely from this tree ::");
 
         // ═══════════════════════════════════════════════════════════════════════════════════
         // RUNG 08b — `modeset-read`: THE DRY MODE-SET, READ OFF THE RUNNING MACHINE.
@@ -1905,7 +1905,7 @@ pub unsafe fn gmux_igd_switch() {
 
         serial_println!(":: igpu-dpy: rung=08b name=modeset-read ok=1 writes=0 doc=IHD-OS-V3-Pt-3-05-12 pipe={} pipe_sel_raw={} elapsed_ms={} ::",
             p.name, dp_pipe_sel, get_elapsed_ms());
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read PORT dp_a@0x{:05X}=0x{:08X} enable={} pipe={} lanes={} enhanced_frame={} pll_freq={} pll_enable={} reversed={} train_pattern={} sync_pol=0x{:X} detected={} cite=sec4.4.1-pp82-86 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read PORT dp_a@0x{:05X}=0x{:08X} enable={} pipe={} lanes={} enhanced_frame={} pll_freq={} pll_enable={} reversed={} train_pattern={} sync_pol=0x{:X} detected={} cite=sec4.4.1-pp82-86 ::",
             regs::DP_A, dp_a_val,
             if dp_enable == 1 { "ENABLED" } else { "disabled" },
             p.name, dp_width_name(dp_width),
@@ -1924,7 +1924,7 @@ pub unsafe fn gmux_igd_switch() {
         let conf_drrs = (conf >> 20) & 1;
         let conf_bpc = (conf >> 5) & 0x7;
         let mn_set = if conf_drrs == 1 { 2 } else { 1 };
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read PIPECONF conf@0x{:05X}=0x{:08X} pipe_enable={} pipe_state={} bpc={} interlace=0x{:X} drrs_power_mode={} mn_set={} frame_start_delay={} cite=sec5.1.3-pp100-103 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read PIPECONF conf@0x{:05X}=0x{:08X} pipe_enable={} pipe_state={} bpc={} interlace=0x{:X} drrs_power_mode={} mn_set={} frame_start_delay={} cite=sec5.1.3-pp100-103 ::",
             p.conf, conf,
             if conf_enable == 1 { "ENABLED" } else { "disabled" },
             if conf_state == 1 { "ENABLED" } else { "disabled" },
@@ -1941,7 +1941,7 @@ pub unsafe fn gmux_igd_switch() {
         let hsy = mmio_read(bar0, p.hsync);
         let h_active = (htot & 0xFFF) + 1;
         let h_total = ((htot >> 16) & 0x1FFF) + 1;
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read TIMING-H htotal@0x{:05X}=0x{:08X} hblank@0x{:05X}=0x{:08X} hsync@0x{:05X}=0x{:08X} active={} total={} blank_start={} blank_end={} sync_start={} sync_end={} minus_one_undone=yes cite=sec4.1.1-4.1.3-pp66-68 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read TIMING-H htotal@0x{:05X}=0x{:08X} hblank@0x{:05X}=0x{:08X} hsync@0x{:05X}=0x{:08X} active={} total={} blank_start={} blank_end={} sync_start={} sync_end={} minus_one_undone=yes cite=sec4.1.1-4.1.3-pp66-68 ::",
             p.htotal, htot, p.hblank, hbl, p.hsync, hsy,
             h_active, h_total, hbl & 0x1FFF, (hbl >> 16) & 0x1FFF, hsy & 0x1FFF, (hsy >> 16) & 0x1FFF);
 
@@ -1950,12 +1950,12 @@ pub unsafe fn gmux_igd_switch() {
         let vsy = mmio_read(bar0, p.vsync);
         let v_active = (vtot & 0xFFF) + 1;
         let v_total = ((vtot >> 16) & 0x1FFF) + 1;
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read TIMING-V vtotal@0x{:05X}=0x{:08X} vblank@0x{:05X}=0x{:08X} vsync@0x{:05X}=0x{:08X} active={} total={} blank_start={} blank_end={} sync_start={} sync_end={} minus_one_undone=yes cite=sec4.1.4-4.1.6-pp69-71 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read TIMING-V vtotal@0x{:05X}=0x{:08X} vblank@0x{:05X}=0x{:08X} vsync@0x{:05X}=0x{:08X} active={} total={} blank_start={} blank_end={} sync_start={} sync_end={} minus_one_undone=yes cite=sec4.1.4-4.1.6-pp69-71 ::",
             p.vtotal, vtot, p.vblank, vbl, p.vsync, vsy,
             v_active, v_total, vbl & 0x1FFF, (vbl >> 16) & 0x1FFF, vsy & 0x1FFF, (vsy >> 16) & 0x1FFF);
 
         let srcsz = mmio_read(bar0, p.srcsz);
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read SRCSZ srcsz@0x{:05X}=0x{:08X} h={} v={} minus_one_undone=yes cite=sec4.1.7-p72 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read SRCSZ srcsz@0x{:05X}=0x{:08X} h={} v={} minus_one_undone=yes cite=sec4.1.7-p72 ::",
             p.srcsz, srcsz, ((srcsz >> 16) & 0xFFF) + 1, (srcsz & 0xFFF) + 1);
 
         let dm1 = mmio_read(bar0, p.datam1);
@@ -1966,12 +1966,12 @@ pub unsafe fn gmux_igd_switch() {
         let dn2 = mmio_read(bar0, p.datan2);
         let lm2 = mmio_read(bar0, p.linkm2);
         let ln2 = mmio_read(bar0, p.linkn2);
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read MN1 datam1@0x{:05X}=0x{:08X} tu_size={} data_m={} datan1@0x{:05X}=0x{:08X} data_n={} linkm1@0x{:05X}=0x{:08X} link_m={} linkn1@0x{:05X}=0x{:08X} link_n={} cite=sec4.2.1-4.2.4-pp74-77 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read MN1 datam1@0x{:05X}=0x{:08X} tu_size={} data_m={} datan1@0x{:05X}=0x{:08X} data_n={} linkm1@0x{:05X}=0x{:08X} link_m={} linkn1@0x{:05X}=0x{:08X} link_n={} cite=sec4.2.1-4.2.4-pp74-77 ::",
             p.datam1, dm1, ((dm1 >> 25) & 0x3F) + 1, dm1 & 0xFFFFFF,
             p.datan1, dn1, dn1 & 0xFFFFFF,
             p.linkm1, lm1, lm1 & 0xFFFFFF,
             p.linkn1, ln1, ln1 & 0xFFFFFF);
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read MN2 datam2@0x{:05X}=0x{:08X} tu_size={} data_m={} datan2@0x{:05X}=0x{:08X} data_n={} linkm2@0x{:05X}=0x{:08X} link_m={} linkn2@0x{:05X}=0x{:08X} link_n={} cite=sec4.2.1-4.2.4-pp74-77 ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read MN2 datam2@0x{:05X}=0x{:08X} tu_size={} data_m={} datan2@0x{:05X}=0x{:08X} data_n={} linkm2@0x{:05X}=0x{:08X} link_m={} linkn2@0x{:05X}=0x{:08X} link_n={} cite=sec4.2.1-4.2.4-pp74-77 ::",
             p.datam2, dm2, ((dm2 >> 25) & 0x3F) + 1, dm2 & 0xFFFFFF,
             p.datan2, dn2, dn2 & 0xFFFFFF,
             p.linkm2, lm2, lm2 & 0xFFFFFF,
@@ -1992,9 +1992,9 @@ pub unsafe fn gmux_igd_switch() {
             else if live_ln == 0 { "link_n=0" }
             else if px_per_frame == 0 { "htotal-or-vtotal=0" }
             else { "none" };
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read MODE active={}x{} total={}x{} mn_set={} ls_clk_khz={} dot_clock_khz={} refresh_mhz={} undefined_why={} law=LinkM/N=dotclock/ls_clk(sec4.2-p74)+DP_CTL[17:16](sec4.4.1-p85) dpcd_rate_raw=0x{:02X}(rate_decode=TBV-tree-table) dpcd_lanes={} ::",
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read MODE active={}x{} total={}x{} mn_set={} ls_clk_khz={} dot_clock_khz={} refresh_mhz={} undefined_why={} law=LinkM/N=dotclock/ls_clk(sec4.2-p74)+DP_CTL[17:16](sec4.4.1-p85) dpcd_rate_raw=0x{:02X}(rate_decode=TBV-tree-table) dpcd_lanes={} ::",
             h_active, v_active, h_total, v_total, mn_set, ls_clk_khz, dot_khz, refresh_mhz, mode_why, cap_rate, cap_lanes);
-        serial_println!(":: igpu-dpy: rung=08b name=modeset-read NOT-IN-IVB-PRM dp_tp_ctl dp_tp_status trans_ddi_func_ctl — population=IVB-PRM-V3Pt3(North)+V3Pt4(South), hits=0; those are Haswell DDI registers, and on Ivy Bridge eDP link training is DP_CTL_A[9:8] (sec4.4.1 pp.85-86) with the port CPU-attached, so no PCH transcoder is in the eDP path and the write rung must not look for one ::");
+        crate::bootlog_println!(":: igpu-dpy: rung=08b name=modeset-read NOT-IN-IVB-PRM dp_tp_ctl dp_tp_status trans_ddi_func_ctl — population=IVB-PRM-V3Pt3(North)+V3Pt4(South), hits=0; those are Haswell DDI registers, and on Ivy Bridge eDP link training is DP_CTL_A[9:8] (sec4.4.1 pp.85-86) with the port CPU-attached, so no PCH transcoder is in the eDP path and the write rung must not look for one ::");
 
         highest = 10;
         rung_name = "end";

@@ -166,12 +166,12 @@ pub fn take_sec_masked() -> u64 {
 pub fn note_dock_timeout() {
     let now = crate::arch::ms();
     let held = held_between(now.saturating_sub(DOCK_RELEASE_TIMEOUT_MS), now);
-    let pump_held = held >= HID_GAP_STALL_MS;
-    if pump_held { DOCK_HELD.fetch_add(1, Relaxed); } else { DOCK_TIMEOUTS.fetch_add(1, Relaxed); }
+    let pump_held = held >= HID_GAP_STALL_MS; let undecoded = !pump_held && release_undecoded(now); // SMALLFIX10 (B539 item 4): the decoder never pushed this press's release (file tail)
+    if pump_held { DOCK_HELD.fetch_add(1, Relaxed); } else if undecoded { DOCK_UNDECODED.fetch_add(1, Relaxed); } else { DOCK_TIMEOUTS.fetch_add(1, Relaxed); }
     TIMEOUT_RELEASE_OWED.store(true, Relaxed);
     serial_println!(
-        "[hid] dock timeout held_ms={} window_ms={} worst={} -> {} (SMALLFIX8: a pump-core hold is the holder's, not a lost release)",
-        held, DOCK_RELEASE_TIMEOUT_MS, HolderName(session_worst().0), if pump_held { "pump-held" } else { "no-release" }
+        "[hid] dock timeout held_ms={} window_ms={} worst={} decoded={} -> {} (SMALLFIX8: a pump-core hold is the holder's, not a lost release; SMALLFIX10: undecoded = the pad sent no release report, the stream's loss, not the router's)",
+        held, DOCK_RELEASE_TIMEOUT_MS, HolderName(session_worst().0), (!undecoded) as u8, if pump_held { "pump-held" } else if undecoded { "undecoded" } else { "unrouted" }
     );
 }
 
@@ -195,11 +195,11 @@ fn selftest() {
     let s = HID_STALL_S.load(Relaxed);
     let k = KEYQ_MAX_MS.load(Relaxed);
     serial_println!(
-        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={}",
+        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={} dock_undecoded={}",
         h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed),
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
         holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
-        HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed)
+        HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed)
     );
 }
 
@@ -509,4 +509,27 @@ pub fn holder_between(from: u64, to: u64) -> (u64, usize) {
         }
     }
     best
+
+// ── SMALLFIX10 (rmbp-ledger B539 item 4): a timeout whose release the decoder never pushed ─────────────────────────────
+//
+// TAIL-APPENDED (this file is in every image; nothing above it moves). Flight 31 boot 1: two pin presses timed out
+// (`[hid] dock timeout held_ms=0 … -> no-release`, then `[dock] … release=timeout after_ms=400 pend=0 lane_ms=0`) and
+// the verdict read `dock_timeouts=1 … dock_held=0 timeout_release_ms=0`. SMALLFIX8's rule did not hold because its
+// premise did not: the wait held the pump core 0 ms (`held_ms=0`), nothing was queued (`pend=0`), and `lane_ms=0` is
+// `release_lane_ms`'s `r < p` arm — NO release edge was pushed after the press. `timeout_release_ms=0` 127 s later says
+// none came at all, and the wire agrees: no `[ptr] fine` and no `[tp] mt` line from 02:09:38 to 02:12:13 — the pad sent
+// no report after the click's down report. The release was lost UPSTREAM of every router (the pad's lift report never
+// reached the decoder: POINTERFEEL's report stream), and the Dock's timeout did its job (`-> launched`). Such a timeout
+// is now counted `dock_undecoded=`, apart from `dock_timeouts=` (a release the decoder pushed and no router delivered
+// in the window — the kernel's own loss, still the red one) and `dock_held=` (SMALLFIX8's pump hold).
+
+/// SMALLFIX10: pin timeouts whose release the decoder never pushed (the input stream's loss).
+static DOCK_UNDECODED: AtomicU32 = AtomicU32::new(0);
+
+/// SMALLFIX10: at a timeout at `now`, did the decoder push a press recently and NO release since it? Only a decoder that
+/// stamps its edges ([`note_button_edge`], the EHCI trackpad arms) can answer; a press it did not stamp (an xHCI or boot
+/// mouse) leaves `p` stale or 0 and reads `false`, so the timeout stays `dock_timeouts=` — the conservative side.
+fn release_undecoded(now: u64) -> bool {
+    let (p, r) = (PRESS_PUSH_MS.load(Relaxed), RELEASE_PUSH_MS.load(Relaxed));
+    p != 0 && r < p && now.saturating_sub(p) <= DOCK_RELEASE_TIMEOUT_MS + HELD_WINDOW_MS
 }

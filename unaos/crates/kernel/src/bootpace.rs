@@ -305,7 +305,7 @@ impl core::fmt::Display for Dur {
 /// Last ledger length surfaced by `service_dump` (sentinel so the first call always prints).
 static LAST_DUMPED_LEN: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// Main-loop SERVICE: re-print the WHOLE ledger whenever it has grown since the last print.
+/// Main-loop SERVICE: print the ledger's NEW stamps whenever it has grown, and the WHOLE ledger on the dump carrying `ftdi-up` (SMALLFIX10).
 ///
 /// Re-emitting the full block on growth (rather than one line per stamp, or a single one-shot dump)
 /// is load-bearing, for a reason specific to how this kernel reaches a second host. Every line the
@@ -344,13 +344,13 @@ pub fn service_dump() {
 
     let mut buf = [(0u64, ""); CAP];
     let n = snapshot(&mut buf);
-    if LAST_DUMPED_LEN.swap(n, Ordering::AcqRel) == n {
+    let from = LAST_DUMPED_LEN.swap(n, Ordering::AcqRel); if from == n {
         return;
     }
     let hz = counter_hz();
     let origin = ORIGIN.load(Ordering::Relaxed);
-    let mut prev = origin;
-    for (c, tag) in &buf[..n] {
+    let from = if from < n && !buf[from..n].iter().any(|(_, t)| *t == "ftdi-up") { from } else { 0 }; let mut prev = if from > 0 { buf[from - 1].0 } else { origin }; // SMALLFIX10 (B539 item 7, QUIETBOOT): a re-dump prints only the stamps NEW since the last one (f31: the whole ledger re-printed = BPACE:59 of the boot's 275 lines) — EXCEPT the dump that carries `ftdi-up`, which prints the WHOLE block once more, so the load-bearing full block still rides the live wire after the console arms (the doc above); `total n=` always says the whole count
+    for (c, tag) in &buf[from..n] {
         let t = c.wrapping_sub(origin);
         let d = c.wrapping_sub(prev);
         serial_println!(
