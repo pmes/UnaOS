@@ -129,7 +129,7 @@ static SPAN: crate::sync::Mutex<Span> = crate::sync::Mutex::new(Span { n: 0, by_
 static TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 static ORPHANS: AtomicU32 = AtomicU32::new(0);
 static COALESCED: AtomicU32 = AtomicU32::new(0);
-static LOST: AtomicU32 = AtomicU32::new(0);
+static LOST: AtomicU32 = AtomicU32::new(0); #[cfg(all(feature = "ftdirx", feature = "wc", target_arch = "x86_64"))] static ROUTE_DOOR0: AtomicU64 = AtomicU64::new(0); // QUEUEWEDGE (B533 SMALLFIX9): the door's claimed-byte count at the route's entry; the guard's drop reads it again to know the route took a door byte
 static NEXT_ROLLUP_MS: AtomicU64 = AtomicU64::new(0);
 /// A finished event whose line is owed (printed from an unmasked context): packed by `finish`.
 static OWED: crate::sync::Mutex<[Option<Done>; 4]> = crate::sync::Mutex::new([None; 4]);
@@ -214,7 +214,7 @@ pub fn route(ev: &Event) -> RouteGuard {
         return RouteGuard(None, 0, false);
     }
     let now = now_us();
-    let r = render_here(); qs_probe_route(ev); // QUEUESLEEP (B512): the fixture's probe key is timed to its route
+    let r = render_here(); qs_probe_route(ev); #[cfg(all(feature = "ftdirx", feature = "wc", target_arch = "x86_64"))] ROUTE_DOOR0.store(crate::drivers::xhci::ftdi::ftdirx::origin_census().0, Relaxed); // QUEUEWEDGE (B533): snapshot the door's claim count. QUEUESLEEP (B512): the fixture's probe key is timed to its route
     if r {
         render_entry(now); seg_anchor(now, true); // INPUTSTALL M1: the previous event's handler ended here (INPUTSTALL2 M1: the route's first door is timed from here)
     }
@@ -229,7 +229,7 @@ impl Drop for RouteGuard {
     fn drop(&mut self) {
         let now = now_us();
         if let Some(c) = self.0 {
-            let _ = SLOTS[c].advance(QUEUE, APP, now);
+            let _ = SLOTS[c].advance(QUEUE, APP, now); #[cfg(all(feature = "ftdirx", feature = "wc", target_arch = "x86_64"))] if crate::drivers::xhci::ftdi::ftdirx::origin_census().0 != ROUTE_DOOR0.load(Relaxed) && crate::serialdoor::route_word() == "headless" && SLOTS[c].advance(APP, COMP, now) && SLOTS[c].stage.compare_exchange(COMP, IDLE, AcqRel, Relaxed).is_ok() { SLOTS[c].t[5].store(now, Relaxed); finish(&SLOTS[c], None); } // QUEUEWEDGE (B533 SMALLFIX9) — ⚠ SAME-LINE fold, line-NEUTRAL: a door byte routed to the HEADLESS console (no shell window) has nothing to draw, and no composite pass runs on an idle desktop, so its timing ends HERE at the route (comp = present = 0) instead of being charged to `comp` until the 3 s timeout
         }
         if self.2 {
             render_route_done(self.1, now); // INPUTSTALL M1
