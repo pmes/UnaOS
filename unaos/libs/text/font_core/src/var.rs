@@ -9,6 +9,9 @@
 //!   segment maps ([`Avar`], version 1 maps) and rounded again.
 //! * [`ItemVariationStore`]: region lists and delta sets (16/8-bit and 32/16-bit rows); [`region_scalar`].
 //! * [`Hvar`]: advance-width deltas through the optional DeltaSetIndexMap.
+//! * [`Mvar`] (FONTS2, B650): the metrics variations table — per-instance deltas of the line metrics (`hasc`,
+//!   `hdsc`, `hlgp`), the clipping box (`hcla`, `hcld`), x-height and cap height (`xhgt`, `cpht`), the underline
+//!   (`undo`, `unds`) and every other tag the table carries, through its own ItemVariationStore.
 //! * [`Gvar`]: per-glyph tuple variations — shared and embedded peaks, intermediate regions, shared and private
 //!   packed point numbers, packed deltas (zero / byte / word / long runs) and the interpolation of untouched points
 //!   (IUP) contour by contour; the four phantom points carry the advance when a face has no `HVAR`.
@@ -358,6 +361,85 @@ impl<'a> Hvar<'a> {
             None => (0, gid),
         };
         self.store.delta(outer, inner, coords)
+    }
+}
+
+/// `MVAR` — metrics variations (OpenType 1.9, "MVAR — Metrics Variations Table", FONTS2 B650). The header is
+/// majorVersion 1, minorVersion, reserved, valueRecordSize (≥ 8), valueRecordCount, itemVariationStoreOffset
+/// (Offset16 from the table start); then valueRecordCount ValueRecords of valueTag, deltaSetOuterIndex,
+/// deltaSetInnerIndex, sorted by tag. A metric's delta at an instance is its delta set interpolated in the store;
+/// a tag the table does not carry has delta 0, as does a table without a store.
+#[derive(Clone, Copy, Debug)]
+pub struct Mvar<'a> {
+    data: &'a [u8],
+    rec_size: usize,
+    rec_count: usize,
+    store: ItemVariationStore<'a>,
+}
+
+/// The `MVAR` value tags the kernel's text seam reads (the spec's table of tags; each names the sfnt field it moves).
+pub const MVAR_HASC: [u8; 4] = *b"hasc";
+pub const MVAR_HDSC: [u8; 4] = *b"hdsc";
+pub const MVAR_HLGP: [u8; 4] = *b"hlgp";
+pub const MVAR_HCLA: [u8; 4] = *b"hcla";
+pub const MVAR_HCLD: [u8; 4] = *b"hcld";
+pub const MVAR_XHGT: [u8; 4] = *b"xhgt";
+pub const MVAR_CPHT: [u8; 4] = *b"cpht";
+pub const MVAR_UNDO: [u8; 4] = *b"undo";
+pub const MVAR_UNDS: [u8; 4] = *b"unds";
+
+impl<'a> Mvar<'a> {
+    pub fn parse(d: &'a [u8]) -> Option<Self> {
+        if u16_at(d, 0)? != 1 {
+            return None;
+        }
+        let rec_size = u16_at(d, 6)? as usize;
+        let rec_count = u16_at(d, 8)? as usize;
+        let ivs = u16_at(d, 10)? as usize;
+        if rec_size < 8 || ivs == 0 {
+            return None;
+        }
+        slice(d, 12, rec_count * rec_size)?;
+        let store = ItemVariationStore::parse(d.get(ivs..)?)?;
+        Some(Mvar { data: d, rec_size, rec_count, store })
+    }
+
+    /// How many value records the table carries.
+    pub fn record_count(&self) -> usize {
+        self.rec_count
+    }
+
+    /// The value tags, in table order.
+    pub fn tags(&self) -> Vec<[u8; 4]> {
+        (0..self.rec_count)
+            .filter_map(|i| {
+                let t = slice(self.data, 12 + i * self.rec_size, 4)?;
+                Some([t[0], t[1], t[2], t[3]])
+            })
+            .collect()
+    }
+
+    /// The table carries `tag`.
+    pub fn has(&self, tag: [u8; 4]) -> bool {
+        self.record(tag).is_some()
+    }
+
+    fn record(&self, tag: [u8; 4]) -> Option<(u16, u16)> {
+        for i in 0..self.rec_count {
+            let o = 12 + i * self.rec_size;
+            if slice(self.data, o, 4)? == tag {
+                return Some((u16_at(self.data, o + 4)?, u16_at(self.data, o + 6)?));
+            }
+        }
+        None
+    }
+
+    /// The delta of metric `tag` at `coords`, in fractional font units (0 for a tag the table does not carry).
+    pub fn delta(&self, tag: [u8; 4], coords: &[f32]) -> f32 {
+        match self.record(tag) {
+            Some((outer, inner)) => self.store.delta(outer, inner, coords),
+            None => 0.0,
+        }
     }
 }
 

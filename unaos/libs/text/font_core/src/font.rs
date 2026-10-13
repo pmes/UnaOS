@@ -7,7 +7,8 @@ use crate::glyf::Glyf;
 use crate::layout::{Gdef, Gpos, Gsub, Kern};
 use crate::path::{OutlineSink, Path};
 use crate::reader::{i16_at, slice, u16_at, u32_at};
-use crate::var::{Avar, Axis, Fvar, Gvar, Hvar, ItemVariationStore, MAX_AXES};
+use crate::var::{Avar, Axis, Fvar, Gvar, Hvar, ItemVariationStore, Mvar, MAX_AXES};
+use crate::var::{MVAR_CPHT, MVAR_HASC, MVAR_HCLA, MVAR_HCLD, MVAR_HDSC, MVAR_HLGP, MVAR_UNDO, MVAR_UNDS, MVAR_XHGT};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -91,6 +92,8 @@ pub struct Font<'a> {
     pub avar: Option<Avar<'a>>,
     pub gvar: Option<Gvar<'a>>,
     pub hvar: Option<Hvar<'a>>,
+    /// FONTS2 (B650): `MVAR`, the metrics variations — line metrics, x-height, cap height, underline per instance …
+    pub mvar: Option<Mvar<'a>>,
     /// … `GDEF`'s ItemVariationStore (GPOS ValueRecord / Anchor device deltas) …
     pub layout_store: Option<ItemVariationStore<'a>>,
     /// … and this instance's normalized coordinates, one per `fvar` axis (all 0 = the default instance).
@@ -159,6 +162,7 @@ impl<'a> Font<'a> {
             avar: None,
             gvar: None,
             hvar: None,
+            mvar: None,
             layout_store: None,
             coords: [0.0; MAX_AXES],
         };
@@ -222,6 +226,7 @@ impl<'a> Font<'a> {
                 f.gvar = f.table(b"gvar").and_then(Gvar::parse);
             }
             f.hvar = f.table(b"HVAR").and_then(Hvar::parse);
+            f.mvar = f.table(b"MVAR").and_then(Mvar::parse); // FONTS2 (B650)
             f.layout_store = f.table(b"GDEF").and_then(gdef_var_store);
         }
         Ok(f)
@@ -468,15 +473,60 @@ impl<'a> Font<'a> {
         }
     }
 
-    /// Line metrics in font units, chosen the way browsers do: OS/2 typo metrics when USE_TYPO_METRICS
-    /// (fsSelection bit 7) is set, else hhea.
-    pub fn line_metrics(&self) -> (i16, i16, i16) {
-        if let Some(o) = self.os2 {
-            if o.fs_selection & 0x80 != 0 {
-                return (o.typo_ascender, o.typo_descender, o.typo_line_gap);
-            }
+    /// FONTS2 (B650): the `MVAR` delta of metric `tag` at this instance, in fractional font units — 0 for a static
+    /// face, the default instance, a face without `MVAR`, or a tag the table does not carry.
+    pub fn metric_delta(&self, tag: [u8; 4]) -> f32 {
+        if !self.is_instanced() {
+            return 0.0;
         }
-        (self.ascender, self.descender, self.line_gap)
+        match &self.mvar {
+            Some(m) => m.delta(tag, self.coords()),
+            None => 0.0,
+        }
+    }
+
+    /// `v` moved by the rounded `MVAR` delta of `tag` at this instance (the spec: apply the delta, then round).
+    fn metric(&self, v: i16, tag: [u8; 4]) -> i16 {
+        let d = self.metric_delta(tag);
+        if d == 0.0 {
+            return v;
+        }
+        crate::fmath::round(v as f32 + d).clamp(-32768.0, 32767.0) as i16
+    }
+
+    /// Line metrics in font units, chosen the way browsers do: OS/2 typo metrics when USE_TYPO_METRICS
+    /// (fsSelection bit 7) is set, else hhea. FONTS2 (B650): at an instance the `MVAR` deltas `hasc` / `hdsc` /
+    /// `hlgp` move whichever source was chosen, HarfBuzz's `hb_ot_metrics_get_position` rule — the tags name the
+    /// OS/2 typo fields in the spec, and a face that varies its typo metrics means its line box to follow.
+    pub fn line_metrics(&self) -> (i16, i16, i16) {
+        let (a, d, g) = match self.os2 {
+            Some(o) if o.fs_selection & 0x80 != 0 => (o.typo_ascender, o.typo_descender, o.typo_line_gap),
+            _ => (self.ascender, self.descender, self.line_gap),
+        };
+        (self.metric(a, MVAR_HASC), self.metric(d, MVAR_HDSC), self.metric(g, MVAR_HLGP))
+    }
+
+    /// FONTS2 (B650): OS/2 `usWinAscent` / `usWinDescent` (the clipping box) at this instance (`hcla`, `hcld`).
+    pub fn win_metrics(&self) -> Option<(u16, u16)> {
+        let o = self.os2?;
+        let f = |v: u16, t: [u8; 4]| crate::fmath::round(v as f32 + self.metric_delta(t)).clamp(0.0, 65535.0) as u16;
+        Some((f(o.win_ascent, MVAR_HCLA), f(o.win_descent, MVAR_HCLD)))
+    }
+
+    /// FONTS2 (B650): OS/2 `sxHeight` at this instance (`xhgt`); `None` when the OS/2 table is older than version 2.
+    pub fn x_height(&self) -> Option<i16> {
+        Some(self.metric(self.os2?.x_height?, MVAR_XHGT))
+    }
+
+    /// FONTS2 (B650): OS/2 `sCapHeight` at this instance (`cpht`).
+    pub fn cap_height(&self) -> Option<i16> {
+        Some(self.metric(self.os2?.cap_height?, MVAR_CPHT))
+    }
+
+    /// FONTS2 (B650): `post` underline (position, thickness) at this instance (`undo`, `unds`).
+    pub fn underline(&self) -> Option<(i16, i16)> {
+        let p = self.post?;
+        Some((self.metric(p.underline_position, MVAR_UNDO), self.metric(p.underline_thickness, MVAR_UNDS)))
     }
 }
 
