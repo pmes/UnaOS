@@ -868,16 +868,24 @@ fn knob(s: &mut Surf, r: Rect, st: ControlState) {
 
 /// A switch at `(x, y)`: the track (the accent when `on`), the knob at the end it is set to. Returns its rect.
 pub fn toggle(s: &mut Surf, x: i32, y: i32, on: bool, st: ControlState) -> Rect {
+    toggle_at(s, x, y, if on { motion::ONE } else { 0 }, st)
+}
+
+/// MOTIONKIT (B648): [`toggle`] with its knob `pos` of the way along its travel (Q16: 0 the off end,
+/// [`motion::ONE`] the on end) — one frame of a slide. The track's colour and its off hairline follow the knob, so
+/// the face reads as one thing moving, not a knob over a switched track. At 0 and `ONE` it is [`toggle`] exactly.
+pub fn toggle_at(s: &mut Surf, x: i32, y: i32, pos: u32, st: ControlState) -> Rect {
     let r = Rect::new(x, y, d(DIMS.toggle_w), d(DIMS.toggle_h));
     let (rad, a) = (r.h / 2, st.alpha());
-    let track = st.face(if on { theme::accent() } else { theme::control_track() });
+    let on = pos.min(motion::ONE) * 255 / motion::ONE;
+    let track = st.face(if on == 255 { theme::accent() } else if on == 0 { theme::control_track() } else { blend(theme::control_track(), theme::accent(), on) });
     fill_rrect_alpha(s, r, rad, track, a);
-    if !on {
-        stroke_rrect(s, r, rad, DIMS.hairline_dev as i32, Ink::argb(theme::hairline()).fade(a));
+    if on < 255 {
+        stroke_rrect(s, r, rad, DIMS.hairline_dev as i32, Ink::argb(theme::hairline()).fade(mul255(a, 255 - on)));
     }
     let i = d(DIMS.toggle_inset);
     let k = r.h - 2 * i;
-    let kx = if on { r.right() - i - k } else { r.x + i };
+    let kx = motion::lerp(r.x + i, r.right() - i - k, pos);
     knob(s, Rect::new(kx, r.y + i, k, k), ControlState { hover: false, pressed: false, ..st });
     focus_ring(s, r, rad, st);
     r
@@ -969,24 +977,35 @@ pub fn segmented(s: &mut Surf, x: i32, y: i32, labels: &[&[u8]], sel: usize, st:
 /// SETTINGSCRAFT (B630): [`segmented`] `w` device px wide, split into equal segments — for a window whose press
 /// router already maps `x / (w / n)` to a segment, so the painted segments and the hit segments are one geometry.
 pub fn segmented_w(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel: usize, st: ControlState) -> Rect {
+    let sw = w / labels.len().max(1) as i32;
+    segmented_at(s, x, y, w, labels, sel, x + sw * sel.min(labels.len().saturating_sub(1)) as i32, st)
+}
+
+/// MOTIONKIT (B648): [`segmented_w`] with its thumb's left edge at `thumb_x` (device px, anywhere along the well)
+/// — one frame of a slide. `sel` still names the segment whose label is raised; the hairlines the thumb covers are
+/// not drawn. With `thumb_x` at segment `sel`'s left edge it is [`segmented_w`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn segmented_at(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel: usize, thumb_x: i32, st: ControlState) -> Rect {
     let n = labels.len().max(1) as i32;
     let sw = w / n;
     let r = Rect::new(x, y, sw * n, d(DIMS.seg_h));
     let (rad, a, i) = (d(DIMS.seg_radius), st.alpha(), d(DIMS.seg_inset));
     let well = theme::control_track();
     fill_rrect_alpha(s, r, rad, well, a);
+    let thumb = Rect::new(thumb_x.clamp(r.x, r.right() - sw), r.y, sw, r.h);
+    for k in 1..n {
+        let hx = r.x + sw * k;
+        if hx >= thumb.x && hx <= thumb.right() { continue; }
+        hairline_v(s, hx, r.y + 2 * i, r.h - 4 * i, Ink::argb(theme::control_edge()).fade(a));
+    }
+    let pill = thumb.inset(i);
+    if !st.disabled {
+        shadow_rrect(s, pill.offset(0, d(DIMS.knob_drop)), rad - i, d(DIMS.button_blur), theme::shadow_soft());
+    }
+    fill_rrect_alpha(s, pill, rad - i, st.face(theme::knob_face()), a);
     for (k, l) in labels.iter().enumerate() {
         let seg = Rect::new(r.x + sw * k as i32, r.y, sw, r.h);
         let on = k == sel;
-        if on {
-            let pill = seg.inset(i);
-            if !st.disabled {
-                shadow_rrect(s, pill.offset(0, d(DIMS.knob_drop)), rad - i, d(DIMS.button_blur), theme::shadow_soft());
-            }
-            fill_rrect_alpha(s, pill, rad - i, st.face(theme::knob_face()), a);
-        } else if k > 0 && k != sel + 1 {
-            hairline_v(s, seg.x, seg.y + 2 * i, seg.h - 4 * i, Ink::argb(theme::control_edge()).fade(a));
-        }
         let bg = if on { theme::knob_face() } else { well };
         label(s, seg.x + (sw - label_w(l, on)) / 2, label_top(seg), l, label_ink(theme::content_text(), bg, st), on);
     }
@@ -1286,3 +1305,9 @@ fn cost() {
         clock, a, b, c, e, l, k, sh / 1000, BUDGET_US, WIN_W / 2, WIN_H / 2, WIN_BLUR
     );
 }
+
+// ── (9) MOTIONKIT (B648): the motion primitive — `draw::motion`, in video/motion.rs ─────────────────────────────
+// Declared from this file's tail (not video/mod.rs, the module root every image lexes) so it rides the kit's own
+// desktop gate and no line above it moves. The tween, the curves, the glides, the frame gate and `tests motion`.
+#[path = "motion.rs"]
+pub mod motion;
