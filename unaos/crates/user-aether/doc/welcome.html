@@ -6,7 +6,9 @@
 <!-- AETHERMETAL M1 (LEDGER SR66): the page the builder stages as /system/doc/welcome.html — the fixture
      APPS/AETHER.ELF opens and the demo it paints. It exercises what the M1 formatter draws: two heading
      levels, paragraphs with em/strong/a/code, a nested ul/ol, a blockquote, a pre block, and author colours,
-     margins, padding and borders from this <style>, a class, an id and a style attribute. -->
+     margins, padding and borders from this <style>, a class, an id and a style attribute.
+     AETHERMETAL M3 (LEDGER SR96): the FIRST link in document order is relative (keys.html, staged beside this
+     page) — `tests aether` Tabs to it, hovers it, drag-selects its text and clicks it (hover=1 nav=1 select=<n>). -->
 <style>
   body { background: #f6f4ee; color: #222222; margin: 10px; }
   h1 { color: #123a5c; font-size: 22px; margin: 4px 0 6px 0; border-bottom: 2px solid #2f8fd8; padding-bottom: 4px; }
@@ -20,11 +22,13 @@
   li li { color: #555555; }
   blockquote { margin: 10px 4px; padding: 6px 8px; background: #fff8dc; border-left: 4px solid #d9a400; color: #4a3b00; }
   pre { background: #1e2430; color: #d8e1ee; padding: 6px; margin: 8px 0; font-size: 11px; line-height: 1.3; }
+  .nav { margin: 2px 0; font-size: 13px; }
   #foot { margin-top: 12px; padding-top: 6px; border-top: 1px solid #c8c2b0; font-size: 11px; color: #6b6555; text-align: center; }
 </style>
 </head>
 <body>
 <h1>Welcome to Aether</h1>
+<p class="nav">Read <a href="keys.html">the keys page</a> next.</p>
 <p class="lede">The UnaOS browser, running as a ring-3 program on the image.</p>
 
 <p>This page was read off the volume, parsed by <strong>html_core</strong>, styled by <strong>css_core</strong>
@@ -46,7 +50,8 @@ and drawn with <em>font_core</em> &mdash; three <code>no_std</code> cores that b
 
 <h2>Keys</h2>
 <p>Arrows scroll a line, <strong>Page Up</strong> and <strong>Page Down</strong> a window,
-<strong>Home</strong> and <strong>End</strong> the ends. <em>Esc</em> closes the window.</p>
+<strong>Home</strong> and <strong>End</strong> the ends. <em>Esc</em> closes the window.
+The pointer, links, selection and find are on <a href="keys.html">the keys page</a>.</p>
 
 <blockquote>A browser is a document reader first. The rest of the web is layered on that.</blockquote>
 

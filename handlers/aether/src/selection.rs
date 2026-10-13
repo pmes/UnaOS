@@ -15,6 +15,10 @@
 //!   whitespace runs (WB3d) and one ideograph per word are applied here).
 //! - Text (copy, `Selection.toString()`): the HTML "rendered text collection steps" (`innerText`) over the
 //!   laid-out tree, clipped to the selected range ([`range_text`]).
+//!
+//! AETHERMETAL M3 (SR96): the hit test, the fragment alignment, the word segmenter, the offset conversions and
+//! [`Point`] are `layout_core::hit` — ONE function both rings call (APPS/AETHER.ELF hit-tests with it on the
+//! image); this file keeps the selection state, the document order, the paint plan and the text collector.
 
 use crate::dom::NodeRef;
 use crate::layout::LayoutTree;
@@ -23,12 +27,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// A DOM boundary point: `node` is an arena id, `offset` a UTF-16 offset (character data) or child index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Point {
-    pub node: usize,
-    pub offset: u32,
-}
+/// A DOM boundary point (AETHERMETAL M3, SR96: the type is `layout_core::hit::Point`, shared with APPS/AETHER.ELF).
+pub use layout_core::hit::Point;
 
 /// The selection: where it started (anchor) and where it was extended to (focus).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,20 +196,8 @@ fn local_range(pre: u32, len: u32, ks: Key, ke: Key) -> Option<(i64, i64)> {
 // UTF-16 / byte offsets
 // =================================================================================================
 
-pub fn utf16_to_byte(s: &str, u: u32) -> usize {
-    let mut n = 0u32;
-    for (b, c) in s.char_indices() {
-        if n >= u {
-            return b;
-        }
-        n += c.len_utf16() as u32;
-    }
-    s.len()
-}
-
-pub fn byte_to_utf16(s: &str, b: usize) -> u32 {
-    s[..b.min(s.len())].encode_utf16().count() as u32
-}
+// AETHERMETAL M3 (SR96): the offset conversions live in `layout_core::hit` (both rings).
+pub use layout_core::hit::{byte_to_utf16, utf16_to_byte};
 
 // =================================================================================================
 // Fragment text ↔ DOM offsets
@@ -219,65 +207,8 @@ fn is_ws(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')
 }
 
-/// Aligns the texts a Text node's line fragments draw (whitespace collapsed, line-end spaces trimmed,
-/// tabs expanded — `fonts::lines`) with the node's `data`: for each fragment, the UTF-16 offset in
-/// `data` of each of its char boundaries (`chars + 1` entries). A space the layout carried in from a
-/// neighbouring node (`lead`) has zero width here; a character text-transform changed maps one to one.
-pub fn align(data: &str, frags: &[&str], collapse: bool) -> Vec<Vec<u32>> {
-    let src: Vec<(u32, char)> = {
-        let mut v = Vec::with_capacity(data.len());
-        let mut u = 0u32;
-        for c in data.chars() {
-            v.push((u, c));
-            u += c.len_utf16() as u32;
-        }
-        v
-    };
-    let total = data.encode_utf16().count() as u32;
-    let off = |i: usize| if i < src.len() { src[i].0 } else { total };
-    let mut i = 0usize;
-    let mut out = Vec::with_capacity(frags.len());
-    for f in frags {
-        let mut v = Vec::with_capacity(f.len() + 1);
-        let mut in_tab = false;
-        for c in f.chars() {
-            if collapse {
-                if c == ' ' {
-                    v.push(off(i));
-                    while i < src.len() && is_ws(src[i].1) {
-                        i += 1;
-                    }
-                    continue;
-                }
-                while i < src.len() && is_ws(src[i].1) {
-                    i += 1;
-                }
-            } else {
-                while i < src.len() && matches!(src[i].1, '\n' | '\r') && c != src[i].1 {
-                    i += 1;
-                }
-                if c == ' ' && in_tab && (i >= src.len() || src[i].1 != ' ') {
-                    v.push(off(i));
-                    continue;
-                }
-                in_tab = false;
-                if c == ' ' && i < src.len() && src[i].1 == '\t' {
-                    v.push(off(i));
-                    i += 1;
-                    in_tab = true;
-                    continue;
-                }
-            }
-            v.push(off(i));
-            if i < src.len() {
-                i += 1;
-            }
-        }
-        v.push(off(i));
-        out.push(v);
-    }
-    out
-}
+/// Aligns a Text node's line fragments with its data (AETHERMETAL M3, SR96: `layout_core::hit::align`).
+pub use layout_core::hit::align;
 
 /// The x of the caret before byte `b` of `text` laid out by `adv` (the pen before the first glyph of the
 /// cluster at or after `b`; the run's advance at the end).
@@ -301,128 +232,15 @@ pub fn caret_x(adv: &crate::fonts::lines::Advancer, text: &str, b: usize) -> f32
 /// The grapheme boundary of `text` nearest to `x` (byte offset), and the byte offset of the grapheme
 /// under `x`.
 pub fn hit_text(adv: &crate::fonts::lines::Advancer, text: &str, x: f32) -> (usize, usize) {
-    let bounds: Vec<usize> =
-        font_core::grapheme::clusters(text).into_iter().map(|(a, _)| a).chain(std::iter::once(text.len())).collect();
-    let xs: Vec<f32> = bounds.iter().map(|&b| caret_x(adv, text, b)).collect();
-    let mut near = (f32::INFINITY, 0usize);
-    for (k, &b) in bounds.iter().enumerate() {
-        let d = (xs[k] - x).abs();
-        if d < near.0 {
-            near = (d, b);
-        }
-    }
-    let mut under = bounds.first().copied().unwrap_or(0);
-    for k in 0..bounds.len().saturating_sub(1) {
-        if x >= xs[k] {
-            under = bounds[k];
-        }
-    }
-    (near.1, under)
+    layout_core::hit::hit_text(text, x, |b| caret_x(adv, text, b))
 }
 
 // =================================================================================================
 // Words (UAX #29, simplified to the rules a click needs)
 // =================================================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Wb {
-    Letter,
-    Numeric,
-    MidLetter,
-    MidNum,
-    MidNumLet,
-    ExtendNumLet,
-    Space,
-    Ideo,
-    Other,
-}
-
-fn wb(c: char) -> Wb {
-    let u = c as u32;
-    if matches!(u, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FFFF) {
-        return Wb::Ideo;
-    }
-    match c {
-        ' ' | '\t' | '\u{a0}' | '\u{3000}' | '\u{2000}'..='\u{200a}' => Wb::Space,
-        '\n' | '\r' | '\x0c' => Wb::Other,
-        ':' | '\u{b7}' | '\u{387}' | '\u{5f4}' | '\u{2027}' | '\u{fe13}' | '\u{fe55}' | '\u{ff1a}' => Wb::MidLetter,
-        ',' | ';' | '\u{37e}' | '\u{589}' | '\u{60c}' | '\u{60d}' | '\u{66c}' | '\u{7f8}' | '\u{2044}' | '\u{fe10}'
-        | '\u{fe14}' | '\u{fe50}' | '\u{fe54}' | '\u{ff0c}' | '\u{ff1b}' => Wb::MidNum,
-        '.' | '\'' | '\u{2018}' | '\u{2019}' | '\u{2024}' | '\u{fe52}' | '\u{ff07}' | '\u{ff0e}' => Wb::MidNumLet,
-        '_' | '\u{203f}' | '\u{2040}' | '\u{2054}' | '\u{fe33}' | '\u{fe34}' | '\u{fe4d}'..='\u{fe4f}' | '\u{ff3f}' => {
-            Wb::ExtendNumLet
-        }
-        _ if c.is_numeric() => Wb::Numeric,
-        _ if c.is_alphabetic() => Wb::Letter,
-        _ => Wb::Other,
-    }
-}
-
-/// UAX #29 word segments of `text` as byte ranges (over grapheme clusters, so marks stay with their base).
-pub fn words(text: &str) -> Vec<(usize, usize)> {
-    let gs: Vec<(usize, usize, Wb)> = font_core::grapheme::clusters(text)
-        .into_iter()
-        .map(|(a, b)| (a, b, text[a..b].chars().next().map(wb).unwrap_or(Wb::Other)))
-        .collect();
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    let ah = |w: Wb| w == Wb::Letter;
-    while i < gs.len() {
-        let start = gs[i].0;
-        let c = gs[i].2;
-        let mut j = i + 1;
-        match c {
-            Wb::Space => {
-                while j < gs.len() && gs[j].2 == Wb::Space {
-                    j += 1;
-                }
-            }
-            Wb::Letter | Wb::Numeric | Wb::ExtendNumLet => loop {
-                if j >= gs.len() {
-                    break;
-                }
-                let prev = gs[j - 1].2;
-                let cur = gs[j].2;
-                let next = gs.get(j + 1).map(|g| g.2);
-                let joins = match (prev, cur) {
-                    // WB5, WB8, WB9, WB10, WB13a, WB13b
-                    (Wb::Letter | Wb::Numeric | Wb::ExtendNumLet, Wb::Letter | Wb::Numeric | Wb::ExtendNumLet) => true,
-                    // WB6/WB7: letter (MidLetter | MidNumLet) letter
-                    (p, Wb::MidLetter | Wb::MidNumLet) if ah(p) && next.is_some_and(ah) => {
-                        j += 1;
-                        true
-                    }
-                    // WB11/WB12: digit (MidNum | MidNumLet) digit
-                    (Wb::Numeric, Wb::MidNum | Wb::MidNumLet) if next == Some(Wb::Numeric) => {
-                        j += 1;
-                        true
-                    }
-                    _ => false,
-                };
-                if !joins {
-                    break;
-                }
-                j += 1;
-            },
-            _ => {}
-        }
-        let end = if j <= gs.len() { gs[j - 1].1 } else { text.len() };
-        out.push((start, end));
-        i = j;
-    }
-    out
-}
-
-/// The word segment holding the grapheme at byte `b` (the last one when `b` is the end).
-pub fn word_at(text: &str, b: usize) -> (usize, usize) {
-    let ws = words(text);
-    for &(s, e) in &ws {
-        if b >= s && b < e {
-            return (s, e);
-        }
-    }
-    ws.last().copied().unwrap_or((b, b))
-}
+// AETHERMETAL M3 (SR96): the UAX #29 word segmenter lives in `layout_core::hit` (both rings).
+pub use layout_core::hit::{word_at, words};
 
 // =================================================================================================
 // Painting: which glyphs of an inline formatting context are selected
@@ -438,47 +256,12 @@ pub struct FragSel {
     pub newline: bool,
 }
 
-/// The line box (top, height) of the IFC `il` a fragment with baseline `baseline` sits on.
-pub fn line_of(il: &crate::layout::inline::InlineLayout, baseline: f32) -> Option<(usize, f32, f32)> {
-    let mut best: Option<(usize, f32, f32, f32)> = None;
-    for (i, &(top, h, _)) in il.lines.iter().enumerate() {
-        let d = if baseline < top {
-            top - baseline
-        } else if baseline > top + h {
-            baseline - top - h
-        } else {
-            0.0
-        };
-        if best.is_none_or(|b| d < b.3) {
-            best = Some((i, top, h, d));
-        }
-    }
-    best.map(|(i, t, h, _)| (i, t, h))
-}
+/// The line box (index, top, height) a fragment's baseline sits on (AETHERMETAL M3, SR96: `layout_core::hit::line_of`).
+pub use layout_core::hit::line_of;
 
 /// Whether text in `tid`'s white-space mode collapses (normal / nowrap / pre-line).
 fn collapses_at(layout: &LayoutTree, tid: taffy::NodeId) -> bool {
-    let mut ws = None;
-    let mut n = layout.taffy.parent(tid);
-    let mut chain = Vec::new();
-    while let Some(p) = n {
-        chain.push(p);
-        n = layout.taffy.parent(p);
-    }
-    let mut cur = 0u8;
-    for p in chain.into_iter().rev() {
-        if let Some(dn) = layout.node_map.get(&p) {
-            if let Some(el) = dn.as_element() {
-                cur = layout
-                    .paint_map
-                    .get(&p)
-                    .and_then(|s| s.white_space)
-                    .unwrap_or_else(|| crate::layout::default_white_space(el.name.local.as_ref(), cur));
-                ws = Some(cur);
-            }
-        }
-    }
-    matches!(ws.unwrap_or(0), 0 | 1 | 4)
+    layout_core::hit::collapses_at(layout, tid)
 }
 
 /// For every text fragment of the IFC rooted at `root`, the selected part (indexed like `il.frags`).
@@ -574,81 +357,19 @@ pub struct Hit {
 }
 
 pub fn hit(layout: &LayoutTree, boxes: &[crate::render::TextBox], scroll: (f64, f64), x: f64, y: f64) -> Option<Hit> {
-    if boxes.is_empty() {
-        return None;
-    }
+    // AETHERMETAL M3 (SR96): the hit is `layout_core::hit::hit`, the function APPS/AETHER.ELF calls; this ring
+    // hands it the boxes the last frame painted, each with its recorded scroll, and its shaper's caret.
+    let core: Vec<layout_core::hit::TextBox> = boxes
+        .iter()
+        .map(|b| layout_core::hit::TextBox { ifc: b.ifc, frag: b.frag, node: b.node, x: b.x, w: b.w, top: b.top, bottom: b.bottom })
+        .collect();
     // Document coordinates of the pointer, against each box's recorded scroll.
-    let pt = |b: &crate::render::TextBox| -> (f32, f32) {
+    let pt = |i: usize| -> (f32, f32) {
+        let b = &boxes[i];
         ((x + scroll.0 - b.scroll.0 as f64) as f32, (y + scroll.1 - b.scroll.1 as f64) as f32)
     };
-    let mut pick: Option<(usize, f32, f32)> = None; // (box, dy, dx)
-    for (i, b) in boxes.iter().enumerate() {
-        let (px, py) = pt(b);
-        let dy = if py < b.top {
-            b.top - py
-        } else if py >= b.bottom {
-            py - b.bottom + 0.001
-        } else {
-            0.0
-        };
-        let dx = if px < b.x {
-            b.x - px
-        } else if px > b.x + b.w {
-            px - b.x - b.w
-        } else {
-            0.0
-        };
-        // Later boxes paint on top: a tie goes to the later one.
-        if pick.is_none_or(|(_, pdy, pdx)| dy < pdy || (dy == pdy && dx <= pdx)) {
-            pick = Some((i, dy, dx));
-        }
-    }
-    let (i, _, _) = pick?;
-    let b = &boxes[i];
-    let il = layout.inline.get(&b.ifc)?;
-    let crate::layout::inline::Frag::Text { text, .. } = il.frags.get(b.frag)? else { return None };
-    let dn = layout.node_map.get(&b.node)?;
-    let (px, _) = pt(b);
-    let (near, under) = hit_text(&b.adv, text, px - b.x);
-    // Map the fragment's bytes to the node's offsets: align every fragment of this node in the IFC.
-    let idxs: Vec<usize> = il
-        .frags
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| matches!(f, crate::layout::inline::Frag::Text { node, .. } if *node == b.node))
-        .map(|(k, _)| k)
-        .collect();
-    let texts: Vec<&str> = idxs
-        .iter()
-        .map(|&k| match &il.frags[k] {
-            crate::layout::inline::Frag::Text { text, .. } => text.as_str(),
-            _ => "",
-        })
-        .collect();
-    let data = dn.text_contents();
-    let maps = align(&data, &texts, collapses_at(layout, b.node));
-    let k = idxs.iter().position(|&f| f == b.frag)?;
-    let char_ix = |byte: usize| text[..byte.min(text.len())].chars().count();
-    let to16 = |byte: usize| maps[k][char_ix(byte).min(maps[k].len() - 1)];
-    let id = dn.id().0;
-    let point = Point { node: id, offset: to16(near) };
-    let u = utf16_to_byte(&data, to16(under));
-    let (ws, we) = word_at(&data, u);
-    let word = (Point { node: id, offset: byte_to_utf16(&data, ws) }, Point { node: id, offset: byte_to_utf16(&data, we) });
-    let mut block = layout.node_map.get(&b.ifc).map(|n| n.id().0);
-    if block.is_none() {
-        let mut n = dn.parent();
-        while let Some(p) = n {
-            if let Some(el) = p.as_element() {
-                if !crate::layout::is_inline(el.name.local.as_ref()) {
-                    block = Some(p.id().0);
-                    break;
-                }
-            }
-            n = p.parent();
-        }
-    }
-    Some(Hit { point, word, block })
+    let h = layout_core::hit::hit(layout, &core, pt, |i, text, b| caret_x(&boxes[i].adv, text, b), |n| n.id().0)?;
+    Some(Hit { point: h.point, word: h.word, block: h.block })
 }
 
 // =================================================================================================
