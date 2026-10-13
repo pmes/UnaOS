@@ -783,10 +783,10 @@ REQUIRE \[storm\] boot-baseline \| busy
 # ---   races its own exit. Leg 3 keeps the persistence proof regardless: STAT.ELF has no exit condition
 # ---   AT ALL, focused or not, where VUG's persistence is conditional on the detached bit.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
-# --- PROCS-6: the cap itself, pinned. The reclaim leg below drives MAX_PROCS+2 launches, so its own
-# ---   PASS text cannot tell you which capacity it exercised; this line can, and a silent regression
-# ---   of the cap back to 4 (or a raise past the EL0 slot pool) fails HERE rather than mysteriously.
-REQUIRE BGRUN-ST: process table capacity = 6 rows \(bg programs alive at once; EL0 slots 8\)
+# --- PROCS-6 -> R90 (PISPEC, pi-ledger PI15): the cap is no longer a literal. WINDOWCAP3 M5 (9a9d7930) moved the aarch64
+# ---   table to the heap: the value is video::wincap::proc_limit() (memory's limit; 12 on QEMU raspi4b, `[wm] limit
+# ---   ... procs=12 from=mem:47`) and the text says `EL0 slots=heap, R90`. Pinned: a count, the heap text; :1983 FORBIDs 0 and the fixed-pool text.
+REQUIRE BGRUN-ST: process table capacity = [1-9][0-9]* rows \(bg programs alive at once; EL0 slots=heap, R90\)
 # --- BGRUN-SCAV: exited-but-unreaped rows must not deny a launch the machine can satisfy. MAX_PROCS+2
 # ---   bg launches with NO intervening reap; every one must succeed (8 launches at the PROCS-6 cap, the
 # ---   last two served only by the PEXITED scavenge). Goes red on the pre-fix kernel.
@@ -1980,7 +1980,7 @@ FORBID K4-ready:.*prefix\) FAIL
 FORBID :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?:$|[^0]|0(?:$|[^x]|x(?:$|[^f]|f(?:$|[^1]|1(?:$|[^8]|8(?:$|[^f]|f(?:$|[^9]|9(?:$|[^8]|8(?:$|[^3]|3(?:$|[^5]|5(?:$|[^5]|5(?:$|[^7]|7(?:$|[^b]|b(?:$|[^8]|8(?:$|[^7]|7(?:$|[^a]|a(?:$|[^5]|5(?:$|[^5]))))))))))))))))))
 FORBID \[inroute\] router window — (?:$|[^r]|r(?:$|[^o]|o(?:$|[^u]|u(?:$|[^t]|t(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^s]|s(?:$|[^t]|t(?:$|[^a]|a(?:$|[^l]|l(?:$|[^e]|e(?:$|[^_]|_(?:$|[^d]|d(?:$|[^r]|r(?:$|[^o]|o(?:$|[^p]|p(?:$|[^p]|p(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^1]|1(?:$|[^ ]| (?:$|[^r]|r(?:$|[^e]|e(?:$|[^v]|v(?:$|[^o]|o(?:$|[^k]|k(?:$|[^e]|e(?:$|[^s]|s(?:$|[^=]|=(?:$|[^0]))))))))))))))))))))))))))))))))))
 FORBID \[wc-c\] side-by-side (?:$|[^w]|w(?:$|[^i]|i(?:$|[^n]|n(?:$|[^d]|d(?:$|[^o]|o(?:$|[^w]|w(?:$|[^s]|s(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^d]|d(?:$|[^r]|r(?:$|[^a]|a(?:$|[^w]|w(?:$|[^n]|n(?:$|[^=]|=(?:$|[^2])))))))))))))))))
-FORBID BGRUN-ST: process table capacity = (?:$|[^6]|6(?:$|[^ ]| (?:$|[^r]|r(?:$|[^o]|o(?:$|[^w]|w(?:$|[^s]))))))
+FORBID BGRUN-ST: process table capacity = (?:0 rows|[0-9]+ rows \(bg programs alive at once; EL0 slots [0-9])
 FORBID \[wc-e\] fb-geometry .*row_ok=false
 FORBID \[wc-e\] fb-geometry .*fit_ok=false
 FORBID \[cursor3\] .*-> INCOHERENT
