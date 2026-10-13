@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix_core"
+version = "0.1.0"
+
+[[package]]
 name = "midden_core"
 version = "0.1.0"
 dependencies = [
@@ -49,6 +53,7 @@ dependencies = [
  "edit_core",
  "font8x8",
  "font_core",
+ "matrix_core",
  "midden_core",
  "una-abi",
  "vein_ring3",

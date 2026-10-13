@@ -3090,6 +3090,7 @@ dependencies = [
  "gneiss_pal",
  "gtk4",
  "log",
+ "matrix_core",
  "serde",
  "tempfile",
  "tokio",
@@ -3097,6 +3098,10 @@ dependencies = [
  "una-abi",
  "unafs",
 ]
+
+[[package]]
+name = "matrix_core"
+version = "0.1.0"
 
 [[package]]
 name = "maybe-rayon"

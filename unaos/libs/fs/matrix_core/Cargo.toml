@@ -1,0 +1,17 @@
+[package]
+name = "matrix_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Matrix core: the workspace tree model (Volume, genesis tree, ignore rules), the Finder's listing and sandbox, the token indexer and the query model, shared by the host Matrix handler and ring 3."
+
+# MATRIXCORE (LEDGER SR99, R104). CHARTER: Matrix owns The Map — files, the workspace indexer and finder
+# (docs/CODEX.md §2); seam `shared-core` — the midden_core / edit_core shape: `#![no_std]` + `alloc`,
+# `#![forbid(unsafe_code)]`, zero dependencies, a member of the ROOT host workspace (handlers/matrix links it,
+# the host KATs run there) and a path dep of the ring-3 Una IDE (crates/user-una, its own workspace), whose tree
+# pane lists over SYS_PATH_* through the same `Volume` seam. The host face (handlers/matrix: the std volume, the
+# bus loop, GTK in the vessels) stays (R104).
+#
+# Dependencies: none. Dev-dependencies: none.
+
+[dependencies]

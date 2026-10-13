@@ -47,8 +47,11 @@ use bandy::state::{BrowseEntry, BrowseKind, BrowseListing, FsOutcome, FsVerb};
 use bandy::MatrixEvent;
 use bandy::Origin;
 
-/// Directory names the Finder never lists — the genesis build-noise set.
-const EXCLUDED: &[&str] = &["target", ".git", "node_modules"];
+use crate::volume::StdVolume;
+
+// MATRIXCORE (SR99): the listing (exclusion, classification, order), the sandboxed resolver, the listing frame and
+// the bare-name rule are `matrix_core`'s — the Finder is their std face (outcomes, io errors, the verbs' I/O).
+// The names the Finder never lists are the core's build-noise set (`matrix_core::BUILD_NOISE`).
 
 /// A file-browser cursor anchored at an absolute workspace root. All paths in
 /// and out of the Finder are workspace-relative (`""` = the root itself).
@@ -80,11 +83,7 @@ fn io_outcome(e: &std::io::Error, verb: &str) -> FsOutcome {
 /// Validate a bare filename (rename target / new folder name): no separators,
 /// no traversal, non-empty.
 fn bare_name(name: &str) -> Result<&str, FsOutcome> {
-    let n = name.trim();
-    if n.is_empty() || n == "." || n == ".." || n.contains('/') || n.contains('\\') || n.contains('\0') {
-        return Err(deny(format!("invalid name: {name:?}")));
-    }
-    Ok(n)
+    matrix_core::bare_name(name).ok_or_else(|| deny(format!("invalid name: {name:?}")))
 }
 
 impl Finder {
@@ -137,33 +136,12 @@ impl Finder {
         // WCK-REVIEW NIT: an absolute path is a caller error, not a root-relative
         // request. Refuse it explicitly rather than silently re-anchoring under root
         // (`open("/etc/passwd")` must read as a refusal, not as an in-root miss).
-        if rel.starts_with('/') {
-            return Err(FsOutcome::Denied {
-                reason: "absolute paths are not root-relative — refused".into(),
-            });
-        }
-        let rel = rel.trim_start_matches('/');
-        let mut acc = self.root.clone();
-        if rel.is_empty() {
-            return Ok(acc);
-        }
-        for comp in rel.split('/') {
-            if comp.is_empty() || comp == "." {
-                continue;
-            }
-            if comp == ".." {
-                return Err(deny("path escapes the workspace root"));
-            }
-            acc.push(comp);
-            // Symlink guard: never follow a link component (the genesis law,
-            // extended to navigation and ops).
-            if let Ok(meta) = std::fs::symlink_metadata(&acc) {
-                if meta.file_type().is_symlink() {
-                    return Err(deny("path crosses a symlink (never followed)"));
-                }
-            }
-        }
-        Ok(acc)
+        // MATRIXCORE: the rules are `matrix_core::resolve`'s (absolute refused, `..` refused, ``/`.` folded,
+        // an existing symlink component refused — stat'ed without following, the genesis law extended to
+        // navigation and ops); the reasons are its verbatim.
+        let mut vol = StdVolume::new(self.root.clone());
+        let norm = matrix_core::resolve(&mut vol, rel).map_err(deny)?;
+        Ok(vol.abs(&norm))
     }
 
     /// Workspace-relative form of an absolute path under the root.
@@ -187,68 +165,28 @@ impl Finder {
             return Err(deny("not a directory"));
         }
 
-        let mut dirs: Vec<BrowseEntry> = Vec::new();
-        let mut files: Vec<BrowseEntry> = Vec::new();
-
-        let read = std::fs::read_dir(&dir).map_err(|e| io_outcome(&e, "list"))?;
-        for entry in read.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if EXCLUDED.contains(&name.as_str()) {
-                continue;
-            }
-            let Ok(ft) = entry.file_type() else { continue };
-            let is_symlink = ft.is_symlink();
-            let abs = entry.path();
-            let rel_path = self.rel_of(&abs);
-
-            if is_symlink {
-                // Classify the link by ITS OWN type — never the target's.
-                files.push(BrowseEntry {
-                    path: rel_path,
-                    name,
-                    kind: BrowseKind::Other,
-                    size: 0,
-                    is_symlink: true,
-                });
-            } else if ft.is_dir() {
-                dirs.push(BrowseEntry { path: rel_path, name, kind: BrowseKind::Dir, size: 0, is_symlink: false });
-            } else if ft.is_file() {
-                // `entry.metadata()` does not traverse symlinks; here the entry
-                // is a plain file anyway.
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                files.push(BrowseEntry { path: rel_path, name, kind: BrowseKind::File, size, is_symlink: false });
-            } else {
-                files.push(BrowseEntry { path: rel_path, name, kind: BrowseKind::Other, size: 0, is_symlink: false });
-            }
-        }
-
-        dirs.sort_by(|a, b| a.name.cmp(&b.name));
-        files.sort_by(|a, b| a.name.cmp(&b.name));
-        dirs.append(&mut files);
-
+        // MATRIXCORE: the core lists (build noise excluded, links classified by their OWN type and never
+        // followed, dirs first then the rest, each by name) and frames (parent, breadcrumbs: root first, then
+        // each descended segment with its rel path).
         let rel_norm = self.rel_of(&dir);
-        let parent = if rel_norm.is_empty() {
-            None
-        } else {
-            Some(
-                rel_norm
-                    .rsplit_once('/')
-                    .map(|(p, _)| p.to_string())
-                    .unwrap_or_default(),
-            )
-        };
+        let mut vol = StdVolume::new(self.root.clone());
+        let items = matrix_core::list_dir(&mut vol, &rel_norm, &matrix_core::Ignore::build_noise())
+            .map_err(|e| io_outcome(&e, "list"))?;
+        let entries = items
+            .into_iter()
+            .map(|it| {
+                let (kind, is_symlink) = match it.kind {
+                    matrix_core::Kind::Dir => (BrowseKind::Dir, false),
+                    matrix_core::Kind::File => (BrowseKind::File, false),
+                    matrix_core::Kind::Symlink => (BrowseKind::Other, true),
+                    matrix_core::Kind::Other => (BrowseKind::Other, false),
+                };
+                BrowseEntry { path: it.path, name: it.name, kind, size: it.size, is_symlink }
+            })
+            .collect();
+        let (parent, breadcrumbs) = matrix_core::breadcrumbs(&rel_norm);
 
-        // Breadcrumbs: root first, then each descended segment with its rel path.
-        let mut breadcrumbs = vec![(String::new(), String::new())];
-        if !rel_norm.is_empty() {
-            let mut acc = String::new();
-            for seg in rel_norm.split('/') {
-                acc = if acc.is_empty() { seg.to_string() } else { format!("{acc}/{seg}") };
-                breadcrumbs.push((seg.to_string(), acc.clone()));
-            }
-        }
-
-        Ok(BrowseListing { path: rel_norm, parent, breadcrumbs, entries: dirs })
+        Ok(BrowseListing { path: rel_norm, parent, breadcrumbs, entries })
     }
 
     // --- FILE OPERATIONS ----------------------------------------------------
@@ -526,10 +464,7 @@ pub fn event_principal(event: &MatrixEvent) -> Option<&Origin> {
 /// Workspace-relative parent of a `/`-joined relative path (`""` for a
 /// top-level entry or the root itself).
 fn parent_rel(rel: &str) -> String {
-    rel.trim_end_matches('/')
-        .rsplit_once('/')
-        .map(|(p, _)| p.to_string())
-        .unwrap_or_default()
+    matrix_core::parent_rel(rel)
 }
 
 /// Recursively copy `src` dir to `dst` (created fresh). Symlinks encountered
