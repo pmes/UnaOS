@@ -3266,7 +3266,7 @@ fn ensure_home_native(name: &[u8]) -> Option<Result<&'static str, UsersError>> {
             Err(_) => return Some(Err(UsersError::Volume)),
         }
     }
-    serial_println!("[users] home=/home/{} {} volume=unafs", leaf, verdict); home_owner_row(&mt, &child, leaf, owner.as_deref(), verdict); // HOMEPRIV (B528): a home with no owner row gains one, once (`[users] home=<name> owner=set`). ⚠ LINE-NEUTRAL fold
+    serial_println!("[users] home=/home/{} {} volume=unafs", leaf, verdict); home_owner_row(&mt, &child, leaf, owner.as_deref(), verdict); home_kernel_rows(&mt, &child, leaf, owner.as_deref()); // SMALLFIX9 (B533): the kernel-made files inside the home gain the same row. HOMEPRIV (B528): a home with no owner row gains one, once (`[users] home=<name> owner=set`). ⚠ LINE-NEUTRAL fold
     Some(Ok(verdict))
 }
 
@@ -3763,4 +3763,46 @@ fn homepriv_fixture() {
         row.as_deref().unwrap_or("none"),
         ensured,
     );
+}
+
+/// SMALLFIX9 (rmbp-ledger B533, HOMEPRIV's owed note) — THE KERNEL-MADE FILES INSIDE A HOME. `NativeBackend::create`
+/// writes an `owner` row only for a non-kernel creator, so what the kernel makes inside `/home/<name>` at kernel
+/// authority — the settings folder and its domain files (`prefs::path`, `<home>/settings/<domain>`, R98) and Holocron's
+/// store (`<home>/.holocron`, `holocron_core::root::DIR`, and its `.ring`) — carries no row, and `unafs::read_authz`
+/// answers Permit for an ownerless object to every principal that knows the path. Each such object, the folder and
+/// its direct children, gains `owner=<the home's owner>` through `home_owner_of` / `MountTable::set_attr` at kernel
+/// authority — HOMEPRIV's own migration shape: written only where the row is ABSENT, never over a row (a user
+/// program's own file already carries this user's; a deleted uid's row stays). The home's user runs as the same
+/// `user:<name>#<uid>` principal (x86 `attrsurf_principal`), so the files stay its own to read and write; the kernel
+/// reads them at `KERNEL_PRINCIPAL` as before. Runs at every `ensure_home` (login, adduser); a file the kernel makes
+/// mid-session is stamped at the next one. One line, only when a row was written or refused:
+/// `[users] home=<name> kernel-files stamped=<n> already=<n> failed=<n>`.
+#[cfg(feature = "unafs")]
+fn home_kernel_rows(mt: &crate::fs::vfs::MountTable, home: &str, leaf: &str, owner: Option<&str>) {
+    use crate::fs::vfs::{AttrValue, NodeKind, KERNEL_PRINCIPAL};
+    let Some(want) = owner else { return };
+    let (mut stamped, mut already, mut failed) = (0u32, 0u32, 0u32);
+    let mut one = |p: &str| match home_owner_of(mt, p) {
+        Ok(None) => match mt.set_attr(p, "owner", AttrValue::Str(alloc::string::String::from(want)), KERNEL_PRINCIPAL) {
+            Ok(()) => stamped += 1,
+            Err(_) => failed += 1,
+        },
+        Ok(Some(_)) => already += 1,
+        Err(_) => {}
+    };
+    for rel in [prefs_core::files::DIR, ".holocron"] {
+        let dir = alloc::format!("{}/{}", home, rel);
+        if !matches!(mt.stat(&dir), Ok(st) if st.kind == NodeKind::Dir) {
+            continue;
+        }
+        one(&dir);
+        if let Ok(ents) = mt.list_as(&dir, KERNEL_PRINCIPAL) {
+            for e in ents.iter().take(64) {
+                one(&alloc::format!("{}/{}", dir, e.name));
+            }
+        }
+    }
+    if stamped + failed > 0 {
+        serial_println!("[users] home={} kernel-files stamped={} already={} failed={}", leaf, stamped, already, failed);
+    }
 }
