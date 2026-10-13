@@ -72,13 +72,32 @@ pub struct Probe {
     pub unafs_present: bool,
 }
 
+/// INSTALL4 (B619): the SATA disk `install ssd` names — the first one that is NOT the boot disk, else the
+/// first one (so the refusal still names it). Index 0 alone named the q35 boot ESP (`ide.0` = AHCI port 0)
+/// on every QEMU lane and never the virtual SSD beside it; on the rMBP (SSD = port 0, boot = the SD card)
+/// the answer is the one it always was.
 fn first_ahci() -> Option<(u8, BlockDeviceId)> {
+    let mut first = None;
     for ix in 0..block::MAX_AHCI_DISKS {
         if let Some(d) = block::ahci_disk(ix) {
-            return Some((d.port, d.info.id(BlockHandle::Ahci { port: d.port })));
+            let id = d.info.id(BlockHandle::Ahci { port: d.port });
+            if !is_boot_disk(id) {
+                return Some((d.port, id));
+            }
+            first = first.or(Some((d.port, id)));
         }
     }
-    None
+    first
+}
+
+/// INSTALL4 (B619): is this SATA disk the one the system booted from? `selfguard` answers for the handles
+/// it enumerates; for a SATA handle the installer's own serial check (`partition::sata_is_boot_device`).
+fn is_boot_disk(id: BlockDeviceId) -> bool {
+    #[cfg(feature = "ahci-write")]
+    if partition::sata_is_boot_device(id.handle) {
+        return true;
+    }
+    super::selfguard::refuses(id)
 }
 
 fn has(entries: &[crate::fs::fat::DirEntry], name: &str, dir: bool) -> bool {
@@ -197,16 +216,21 @@ fn running_source() -> Option<BlockSource> {
     }
 }
 
-fn source_is_ahci(s: BlockSource) -> bool {
-    matches!(s, BlockSource::Ahci(_))
+/// INSTALL4 (B619): is the running volume on the TARGET disk? Only that is refused: a system booted from
+/// one SATA disk (every QEMU lane, an rMBP booted off an installed SSD) may clone onto ANOTHER one.
+fn source_on_port(s: BlockSource, port: u8) -> bool {
+    matches!(s, BlockSource::Ahci(p) if p == port)
 }
 
 fn plan_text(p: &Probe) -> String {
+    if let Verdict::Stranger(_) = &p.verdict {
+        return beside_text(p); // INSTALL4 (B619): the stranger's plan is BESIDE, or a named refusal — never a wipe
+    }
     if !p.verdict.writable() {
         return String::from("REFUSE(stranger: R20, no destructive work on a disk that is not ours)");
     }
     let Some(src) = running_source() else { return String::from("NO-SOURCE(running volume not found)") };
-    if source_is_ahci(src) {
+    if source_on_port(src, p.port) {
         return String::from("NO-SOURCE(already running from the SSD)");
     }
     let (mut files, mut bytes) = (0usize, 0u64);
@@ -245,7 +269,7 @@ pub fn dry_run(out: &mut dyn FnMut(&str)) -> Option<Probe> {
                 p.port, p.model, p.sectors, p.gpt, p.verdict.tag()
             ));
             out(&alloc::format!("  plan: {}", plan));
-            print_plan(&p, out);
+            if matches!(p.verdict, Verdict::Stranger(_)) { print_beside(&p, out); } else { print_plan(&p, out); } // INSTALL4 (B619): a stranger's disk never gets the whole-disk layout printed as its plan
             Some(p)
         }
     }
@@ -361,7 +385,8 @@ fn write_ssd_inner(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str
         // R20: no destructive work on a disk that is not ours.
         serial_println!("[install] REFUSED target=ahci:{} verdict=stranger saw: {} — nothing was written (R20) ::", port, why);
         out(&alloc::format!("install ssd --write: REFUSED — this disk is not ours ({}). Nothing was written.", why));
-        #[cfg(feature = "ahciroot")] out(&alloc::format!("  to ERASE it anyway (everything on it is lost): install ssd --write --erase-stranger {}", stranger_token(port, p.sectors))); // AHCIROOT (B332): the glass asks; the operator types
+        #[cfg(feature = "ahciroot")] out(&alloc::format!("  to install BESIDE it (every partition on it kept): `install ssd --dry-run` prints the plan, then install ssd --write --beside {}", beside_token(port, p.sectors))); // INSTALL4 (B619): the additive path first
+        #[cfg(feature = "ahciroot")] out(&alloc::format!("  to ERASE the WHOLE disk instead (every OS and file on it is lost): install ssd --write --erase-stranger {}", stranger_token(port, p.sectors))); // AHCIROOT (B332): the glass asks; the operator types
         stage("guard", "refused (not ours, and not confirmed)");
         return oc(false, false, "the disk is not ours and the erase was not confirmed");
     }
@@ -415,7 +440,7 @@ fn write_ssd_inner(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str
     let t0 = crate::arch::ticks();
     // Source: the running card's volume, buffered whole BEFORE any destructive write.
     let Some(src_id) = running_source() else { fail(out, "running volume not found"); stage("snapshot", "fail (running volume not found)"); return oc(false, false, "running volume not found") };
-    if source_is_ahci(src_id) {
+    if source_on_port(src_id, port) {
         fail(out, "already running from the SSD; boot the card to clone");
         stage("snapshot", "fail (already running from the SSD)");
         return oc(false, false, "already running from the SSD");
@@ -541,7 +566,11 @@ pub fn verb(out: &mut dyn FnMut(&str), args: &[&str]) {
         Some("--write") if args.len() == 2 && args[1] == "--force" => write_ssd(out, true),
         #[cfg(feature = "ahciroot")]
         Some("--write") if args.len() == 3 && args[1] == "--erase-stranger" => write_ssd_confirmed(out, false, Some(args[2])),
-        _ => out("usage: install ssd --dry-run | install ssd --write [--force]   (the SSD install: ESP + UnaFS; --write needs UNAOS_AHCI_WRITE=1, refuses a stranger's disk, and needs --force over an existing UnaFS volume)"),
+        #[cfg(feature = "ahciroot")]
+        Some("--write") if args.len() == 3 && args[1] == "--beside" => write_beside(out, args[2]), // INSTALL4 (B619)
+        #[cfg(not(feature = "ahciroot"))]
+        Some("--write") if args.len() == 3 && args[1] == "--beside" => out("install ssd --write --beside: this build has no beside install (rebuild with UNAOS_AHCIROOT=1)"),
+        _ => out("usage: install ssd --dry-run | install ssd --write [--force] | install ssd --write --beside <token>   (the SSD install: ESP + UnaFS; --write needs UNAOS_AHCI_WRITE=1, refuses a stranger's disk — the dry run prints the beside plan and its token — and needs --force over an existing UnaFS volume)"),
     }
 }
 
@@ -596,6 +625,9 @@ fn witness(plan: &amber_core::Plan, cloned_mib: u64, fsck: &str, verdict: &str) 
 pub fn plan_lines() -> Option<alloc::vec::Vec<String>> {
     let (port, sel) = first_ahci()?;
     let p = probe(sel, port).ok()?;
+    if matches!(p.verdict, Verdict::Stranger(_)) {
+        return Some(beside_lines(&p)); // INSTALL4 (B619)
+    }
     #[cfg(feature = "unafs")] let ufs = super::unafsmirror::source().filter(|s| !s.is_ahci()); #[cfg(not(feature = "unafs"))] let ufs: Option<()> = None;
     #[cfg(feature = "unafs")] let n = ufs.map(|s| s.sectors()); #[cfg(not(feature = "unafs"))] let n: Option<u64> = { let _ = ufs; None };
     let plan = ssd_plan(p.sectors, n).ok()?;
@@ -881,4 +913,314 @@ impl AhciDisk {
         let grant = partition::mint_disk_grant_quiet(sel, rd.capacity_sectors(), v).ok_or(InstallError::NotBlank)?;
         Ok(Self { rd, grant })
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// INSTALL4 (rmbp-ledger B619) — BESIDE A STRANGER, never over it. R25: a non-UnaOS disk changes only by
+// the operator's explicit act; the arc's rule on top of it: a stranger's disk gets an ADDITIVE plan (an
+// ESP and a UnaFS partition in free space, every existing partition kept) or a named refusal — the
+// whole-disk layout is never printed as its plan. The write takes the typed `BESIDE-<port>-<sectors>`
+// token, mints grants that cover only free space and the two GPT tables (`partition::mint_beside_*`),
+// adds two entries in empty slots (`gpt::add_entries`), then runs the SAME ESP and UnaFS legs the
+// whole-disk install runs, through an `AhciDisk` whose grant is the new partitions only. File tail.
+// ---------------------------------------------------------------------------------------------
+
+/// The token `install ssd --write --beside` must repeat: the port and the disk's exact sector count.
+pub fn beside_token(port: u8, sectors: u64) -> String {
+    alloc::format!("BESIDE-{}-{}", port, sectors)
+}
+
+/// The additive plan: two partitions laid in the largest free extent, in two empty slots.
+pub struct BesidePlan {
+    pub plan: amber_core::Plan,
+    pub free: (u64, u64),
+    pub slots: [u32; 2],
+    pub existing: usize,
+}
+
+/// The beside plan for a table, or the named refusal (`<token> (<words>)`). The ESP is 512 MiB at the
+/// free extent's first 1 MiB boundary, the UnaFS partition runs from the next boundary to the extent's
+/// end and must hold [`p2_min_sectors`] (the volume to mirror, or the fresh one, plus the scratch tail).
+pub fn beside_plan(rt: &super::gpt::RawTable, unafs_sectors: Option<u64>) -> Result<BesidePlan, String> {
+    use amber_core::gpt::{derive_guid, ALIGN};
+    use amber_core::{sectors_mib, Part, PartKind};
+    let slots = rt.empty_slots();
+    if slots.len() < 2 {
+        return Err(String::from("no-free-slot (the partition table has fewer than two empty entries)"));
+    }
+    let need = p2_min_sectors(unafs_sectors).max(1);
+    let want_mib = sectors_mib(ESP_SECTORS + need + 2 * ALIGN);
+    let align = |x: u64| x.div_ceil(ALIGN) * ALIGN;
+    let Some((a, b)) = rt.free_extents().into_iter().max_by_key(|&(a, b)| b - a) else {
+        return Err(alloc::format!("no-free-space (have=0 MiB need={} MiB; make room in macOS first: diskutil apfs resizeContainer <container> <smaller size>)", want_mib));
+    };
+    let esp_first = align(a);
+    let esp_last = esp_first.saturating_add(ESP_SECTORS - 1);
+    let ufs_first = align(esp_last.saturating_add(1));
+    if ufs_first > b || b - ufs_first + 1 < need {
+        return Err(alloc::format!(
+            "no-free-space (have={} MiB need={} MiB; make room in macOS first: diskutil apfs resizeContainer <container> <smaller size>)",
+            sectors_mib(b - a + 1), want_mib
+        ));
+    }
+    let esp = Part { kind: PartKind::Esp, first: esp_first, last: esp_last, guid: derive_guid(b"UNAOS-BESIDE-ESP"), name: String::from("UNAOS-ESP") };
+    let ufs = Part { kind: PartKind::UnaFS, first: ufs_first, last: b, guid: derive_guid(b"UNAOS-BESIDE-UFS"), name: String::from("UNAOS-UNAFS") };
+    let plan = amber_core::Plan { disk_sectors: rt.total_sectors, disk_guid: rt.primary.disk_guid, parts: alloc::vec![esp, ufs] };
+    Ok(BesidePlan { plan, free: (a, b), slots: [slots[0], slots[1]], existing: rt.entries.len() })
+}
+
+/// The beside plan for the probed disk: its raw table read and cross-checked, then [`beside_plan`].
+fn beside_for(p: &Probe) -> Result<BesidePlan, String> {
+    if p.unafs_present {
+        return Err(String::from("beside-present (a UnaFS partition is already on this disk; a re-install beside a stranger is owed)"));
+    }
+    let t = super::BlockTarget::bind_id(p.id).map_err(|e| alloc::format!("unreadable ({:?})", e))?;
+    let rt = super::gpt::read_raw_table(&t)
+        .map_err(|_| String::from("gpt-not-standard (no self-consistent primary + backup table pair, or an array where a standard table does not keep it)"))?;
+    beside_plan(&rt, mirror_source_sectors())
+}
+
+fn beside_reason(why: &str) -> &str {
+    why.split(' ').next().unwrap_or(why)
+}
+
+/// The `plan=` field of the dry run's target line for a stranger.
+fn beside_text(p: &Probe) -> String {
+    match beside_for(p) {
+        Ok(b) => alloc::format!(
+            "beside(free={}..{} {} MiB: esp {} MiB + unafs {} MiB in empty slots {},{}; the {} existing partitions untouched) then --write --beside {}",
+            b.free.0, b.free.1, amber_core::sectors_mib(b.free.1 - b.free.0 + 1),
+            amber_core::sectors_mib(b.plan.parts[0].sectors()), amber_core::sectors_mib(b.plan.parts[1].sectors()),
+            b.slots[0], b.slots[1], b.existing, beside_token(p.port, p.sectors)
+        ),
+        Err(why) => alloc::format!("REFUSE(stranger: {} — never a wipe)", why),
+    }
+}
+
+/// The dry run's beside block: the extent, the plan's lines, the token, the witness.
+fn print_beside(p: &Probe, out: &mut dyn FnMut(&str)) {
+    match beside_for(p) {
+        Ok(b) => {
+            serial_println!(
+                "[install] beside free={}..{} ({} MiB) slots={},{} existing={} — LBA 0 and every existing partition stay outside every write",
+                b.free.0, b.free.1, amber_core::sectors_mib(b.free.1 - b.free.0 + 1), b.slots[0], b.slots[1], b.existing
+            );
+            out(&alloc::format!("  beside: the {} existing partitions stay as they are; UnaOS goes in the free space", b.existing));
+            for line in b.plan.lines() {
+                serial_println!("[install] {}", line);
+                out(&alloc::format!("  {}", line));
+            }
+            let tok = beside_token(p.port, p.sectors);
+            serial_println!("[install] beside token={}", tok);
+            out(&alloc::format!("  to install it (administrator; UNAOS_AHCIROOT build): install ssd --write --beside {}", tok));
+            serial_println!(
+                ":: INSTALL4: beside port={} free={}..{} esp={} unafs={} slots={},{} existing={} -> DRY ::",
+                p.port, b.free.0, b.free.1,
+                amber_core::sectors_mib(b.plan.parts[0].sectors()), amber_core::sectors_mib(b.plan.parts[1].sectors()),
+                b.slots[0], b.slots[1], b.existing
+            );
+        }
+        Err(why) => {
+            serial_println!(":: INSTALL4: beside port={} reason={} -> REFUSED ::", p.port, beside_reason(&why));
+            serial_println!("[install] beside refused: {}", why);
+            out(&alloc::format!("  beside: REFUSED — {}", why));
+        }
+    }
+}
+
+/// The installer window's plan view for a stranger.
+fn beside_lines(p: &Probe) -> alloc::vec::Vec<String> {
+    match beside_for(p) {
+        Ok(b) => {
+            let mut v = b.plan.lines();
+            v.push(alloc::format!("  beside: the {} existing partitions stay; then install ssd --write --beside {}", b.existing, beside_token(p.port, p.sectors)));
+            v
+        }
+        Err(why) => alloc::vec![alloc::format!("REFUSE(stranger: {} — never a wipe)", why)],
+    }
+}
+
+/// The operator's typed consent to an install BESIDE a stranger's partitions on ONE disk. The fields are
+/// private and [`beside_consent`] is the only constructor: the beside grants take one (`partition.rs`).
+#[cfg(feature = "ahciroot")]
+pub struct BesideConsent {
+    port: u8,
+    sectors: u64,
+}
+
+#[cfg(feature = "ahciroot")]
+impl BesideConsent {
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+    pub fn sectors(&self) -> u64 {
+        self.sectors
+    }
+}
+
+#[cfg(feature = "ahciroot")]
+fn beside_consent(port: u8, sectors: u64, typed: &str) -> Option<BesideConsent> {
+    // Case-blind: the token binds the port and the exact sector count, not the shift key (the QEMU typist
+    // types letters lower-case, and so may a person).
+    typed.eq_ignore_ascii_case(&beside_token(port, sectors)).then_some(BesideConsent { port, sectors })
+}
+
+/// The table editor's target: reads through the disk, writes ONLY through the two table grants.
+#[cfg(feature = "ahciroot")]
+struct TableTarget {
+    rd: super::BlockTarget,
+    head: block::WriteGrant,
+    tail: block::WriteGrant,
+}
+
+#[cfg(feature = "ahciroot")]
+impl InstallTarget for TableTarget {
+    fn capacity_sectors(&self) -> u64 {
+        self.rd.capacity_sectors()
+    }
+    fn id(&self) -> String {
+        self.rd.id()
+    }
+    fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), InstallError> {
+        self.rd.read_sectors(lba, buf)
+    }
+    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), InstallError> {
+        let g = if self.head.allows(lba) { &self.head } else { &self.tail };
+        block::write_sectors_granted(g, lba, buf).map_err(|_| InstallError::Io)
+    }
+}
+
+/// SHA-256 of LBA 0 (slot `u32::MAX`) and of every in-use partition's first 4 KiB — read before and after.
+#[cfg(feature = "ahciroot")]
+fn part_heads<T: InstallTarget>(t: &T, rt: &super::gpt::RawTable) -> Option<alloc::vec::Vec<(u32, [u8; 32])>> {
+    let mut v = alloc::vec::Vec::new();
+    let mut lba0 = [0u8; 512];
+    t.read_sectors(0, &mut lba0).ok()?;
+    v.push((u32::MAX, super::hash::sha256(&lba0)));
+    for (slot, e) in &rt.entries {
+        let n = core::cmp::min(8, e.last_lba - e.first_lba + 1) as usize;
+        let mut buf = alloc::vec![0u8; n * 512];
+        t.read_sectors(e.first_lba, &mut buf).ok()?;
+        v.push((*slot, super::hash::sha256(&buf)));
+    }
+    Some(v)
+}
+
+#[cfg(feature = "ahciroot")]
+fn beside_refuse(out: &mut dyn FnMut(&str), why: &str) {
+    serial_println!(":: INSTALL4: beside REFUSED reason={} — nothing written ::", beside_reason(why));
+    serial_println!("[install] beside refused: {}", why);
+    out(&alloc::format!("install ssd --write --beside: REFUSED — {}. Nothing was written.", why));
+}
+
+/// `install ssd --write --beside <token>`: every refusal before the first write, then table → ESP →
+/// UnaFS → the neighbours read back. The verb's `login` gate (R100) runs before this.
+#[cfg(feature = "ahciroot")]
+pub fn write_beside(out: &mut dyn FnMut(&str), typed: &str) {
+    let Some((port, sel)) = first_ahci() else { return beside_refuse(out, "no-disk (no AHCI disk is registered)") };
+    let p = match probe(sel, port) {
+        Ok(p) => p,
+        Err(_) => return beside_refuse(out, "unreadable (the disk cannot be read)"),
+    };
+    serial_println!("[install] beside target=ahci:{} model={} sectors={} gpt={} verdict={} saw={}", port, p.model, p.sectors, p.gpt, p.verdict.tag(), p.saw);
+    if !matches!(p.verdict, Verdict::Stranger(_)) {
+        return beside_refuse(out, &alloc::format!("not-a-stranger (verdict={}; a blank or ours disk takes `install ssd --write`)", p.verdict.tag()));
+    }
+    if is_boot_disk(sel) {
+        return beside_refuse(out, "boot-device (this disk is the one the system booted from)");
+    }
+    if let Some((gp, _, _, k)) = block::ahci_live_grant() {
+        return beside_refuse(out, &alloc::format!("grant-slot-held (port {} kind={})", gp, k.tag()));
+    }
+    let Some(consent) = beside_consent(port, p.sectors, typed) else {
+        return beside_refuse(out, "token-mismatch (`install ssd --dry-run` prints this disk's token)");
+    };
+    if p.unafs_present {
+        return beside_refuse(out, "beside-present (a UnaFS partition is already on this disk)");
+    }
+    let rd = match super::BlockTarget::bind_id(sel) {
+        Ok(t) => t,
+        Err(_) => return beside_refuse(out, "target-gone (the disk left the registry)"),
+    };
+    let rt = match super::gpt::read_raw_table(&rd) {
+        Ok(rt) => rt,
+        Err(_) => return beside_refuse(out, "gpt-not-standard (no self-consistent primary + backup table pair)"),
+    };
+    let unafs_src = super::unafsmirror::source().filter(|s| !s.is_ahci());
+    let bp = match beside_plan(&rt, unafs_src.map(|s| s.sectors())) {
+        Ok(b) => b,
+        Err(why) => return beside_refuse(out, &why),
+    };
+    let (esp, ufs) = (bp.plan.parts[0].clone(), bp.plan.parts[1].clone());
+    for line in bp.plan.lines() {
+        serial_println!("[install] {}", line);
+    }
+    let Some(before) = part_heads(&rd, &rt) else { return beside_refuse(out, "unreadable (a partition head could not be read)") };
+    // The payload, buffered whole BEFORE the first write.
+    let Some(src) = running_source() else { return beside_refuse(out, "no-source (the running volume was not found)") };
+    if source_on_port(src, port) {
+        return beside_refuse(out, "source-on-target (the running volume is on this disk)");
+    }
+    let tree = match fat::mount_source(src).map_err(|_| InstallError::Io).and_then(|fs| super::clone::snapshot_capped(&fs, SNAP_MAX_FILE, SNAP_MAX_TOTAL)) {
+        Ok(t) if tree_has_boot_files(&t) => t,
+        Ok(_) => return beside_refuse(out, "not-bootable (the running volume lacks EFI/BOOT/BOOTX64.EFI or kernel.elf)"),
+        Err(_) => return beside_refuse(out, "snapshot-failed (the running volume could not be read whole)"),
+    };
+    serial_println!("[install] snapshot src={} files={} bytes={}", src.name(), tree.file_count, tree.total_bytes);
+    // The grants: free space (both new partitions; the UnaFS one alone for the slot) and the two tables.
+    let Some(pg) = partition::mint_beside_part_grant(&consent, &rt, esp.first, ufs.last) else { return beside_refuse(out, "grant-refused (the planned extent is not free space)") };
+    let Some(ug) = partition::mint_beside_part_grant(&consent, &rt, ufs.first, ufs.last) else { return beside_refuse(out, "grant-refused (the UnaFS extent is not free space)") };
+    let Some((hg, tg)) = partition::mint_beside_table_grants(&consent, &rt) else { return beside_refuse(out, "grant-refused (the tables are not outside the usable range)") };
+    let Some(_hold) = block::hold_ahci_grant(ug, block::GrantKind::Install) else { return beside_refuse(out, "grant-slot-held") };
+    let t0 = crate::arch::ticks();
+    let tt_rd = match super::BlockTarget::bind_id(sel) {
+        Ok(t) => t,
+        Err(_) => return beside_refuse(out, "target-gone (the disk left the registry)"),
+    };
+    let mut tt = TableTarget { rd: tt_rd, head: hg, tail: tg };
+    if let Err(e) = super::gpt::add_entries(&mut tt, &rt, &[(bp.slots[0], esp.entry()), (bp.slots[1], ufs.entry())]) {
+        serial_println!(":: INSTALL4: beside port={} table=fail err={:?} (the table read before the edit was written back) -> FAIL ::", port, e);
+        out("install ssd --write --beside: the partition-table edit FAILED; the table was put back as it was read and nothing else was written");
+        return;
+    }
+    serial_println!("[install] beside table=ok slots={},{} esp={}..{} unafs={}..{} (both headers, both arrays, CRCs, re-read)", bp.slots[0], bp.slots[1], esp.first, esp.last, ufs.first, ufs.last);
+    let mut disk = AhciDisk { rd, grant: pg };
+    let entry = super::gpt::GptEntryView { index: bp.slots[0], type_guid: super::gpt::ESP_TYPE_GUID, first_lba: esp.first, last_lba: esp.last };
+    let w = match partition::write_partition(&mut disk, &entry, &tree, partition::no_grant()) {
+        Ok(w) => w,
+        Err(e) => {
+            serial_println!(":: INSTALL4: beside port={} table=ok esp=fail err={:?} -> FAIL ::", port, e);
+            out("install ssd --write --beside: the ESP format/clone FAILED — the new partitions are not trustworthy (the stranger's partitions were not written)");
+            return;
+        }
+    };
+    let (cloned_mib, fsck_tag, unafs_ok) = if unafs_src.is_some() { mirror_unafs(&mut disk, &bp.plan, unafs_src, out) } else { fresh_unafs(&mut disk, &bp.plan, port, out) };
+    drop(tree);
+    let unafs_ok = if unafs_ok && fsck_tag == "ok" {
+        let (what, ok) = grow_unafs(&mut disk, &bp.plan);
+        serial_println!("[install] beside grow {}", what);
+        ok
+    } else {
+        unafs_ok
+    };
+    let after = part_heads(&disk.rd, &rt);
+    let untouched = after.as_ref().map_or(0, |a| before.iter().filter(|&h| a.contains(h)).count());
+    let ms = crate::arch::ticks().wrapping_sub(t0);
+    let pass = w.files > 0 && w.verified == w.files && unafs_ok && fsck_tag == "ok" && untouched == before.len();
+    serial_println!(
+        ":: INSTALL4: beside port={} table=ok old={}/{} untouched={}/{} esp={} unafs={} cloned={} files={} verified={} fsck={} ms={} -> {} ::",
+        port, rt.entries.len(), rt.entries.len(), untouched, before.len(),
+        amber_core::sectors_mib(esp.sectors()), amber_core::sectors_mib(ufs.sectors()), cloned_mib,
+        w.files, w.verified, fsck_tag, ms, if pass { "PASS" } else { "FAIL" }
+    );
+    serial_println!(
+        ":: SELFINSTALL: files={} bytes={} ms={} verified={} -> {} ::",
+        w.files, w.bytes, ms, w.verified, if pass { "PASS" } else { "FAIL" }
+    );
+    out(&alloc::format!(
+        "install ssd --write --beside: {} files verified {}/{}, UnaFS fsck={}, the {} existing partitions {}{}",
+        w.files, w.verified, w.files, fsck_tag, rt.entries.len(),
+        if untouched == before.len() { "byte-identical" } else { "CHANGED" },
+        if pass { " — reboot holding Option and pick EFI Boot" } else { " — NOT trustworthy" }
+    ));
 }

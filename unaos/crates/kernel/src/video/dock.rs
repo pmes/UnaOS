@@ -3228,7 +3228,7 @@ pub enum DpKind { KernelWindow, Ring3Program }
 
 pub struct DpSpec { pub name: &'static str, pub initial: u8, pub kind: DpKind, pub verb: &'static str, pub id: wm::WinId }
 
-pub const DP_PINS: [DpSpec; 10] = [
+pub const DP_PINS: [DpSpec; 11] = [
     DpSpec { name: "console",  initial: b'C', kind: DpKind::KernelWindow, verb: "",         id: CONSOLE_PIN_ID },
     DpSpec { name: "shell",    initial: b'S', kind: DpKind::KernelWindow, verb: "",         id: SHELL_PIN_ID },
     DpSpec { name: "quarry",   initial: b'Q', kind: DpKind::KernelWindow, verb: "",         id: QUARRY_PIN_ID },

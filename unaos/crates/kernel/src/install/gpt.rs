@@ -231,3 +231,155 @@ pub fn set_entry_type_guid<T: InstallTarget>(t: &mut T, index: u32, type_guid: &
         _ => Err(InstallError::VerifyFailed),
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// INSTALL4 (rmbp-ledger B619) — THE ADDITIVE EDITOR: new entries in EMPTY slots of an existing table,
+// inside free space, beside partitions it never names. File tail: nothing above moves.
+//
+// `read_raw_table` reads BOTH headers and BOTH arrays and refuses any table whose two copies disagree or
+// whose arrays are not where a standard table keeps them (the primary array before `first_usable`, the
+// backup array after `last_usable` and before the backup header) — so the extents the editor writes are
+// provably outside every partition. `add_entries` encodes the new entries into all-zero slots only,
+// refuses any extent an in-use entry overlaps, writes the BACKUP array then the BACKUP header, then the
+// PRIMARY array then the PRIMARY header (at every instant one header + array pair is self-consistent),
+// re-reads the whole table and checks every pre-existing entry is byte-identical and every new one is
+// present; on any failure after the first write it puts the original bytes back.
+// ---------------------------------------------------------------------------------------------
+
+/// An existing table read raw and cross-checked: both headers, the primary array (`raw`), the in-use
+/// entries with their SLOT index.
+pub struct RawTable {
+    pub primary: Header,
+    pub backup: Header,
+    pub raw: alloc::vec::Vec<u8>,
+    pub entries: alloc::vec::Vec<(u32, core_gpt::Entry)>,
+    pub total_sectors: u64,
+}
+
+impl RawTable {
+    /// Last LBA of the primary array (inclusive).
+    pub fn primary_end(&self) -> u64 {
+        self.primary.entries_lba + self.primary.array_sectors() - 1
+    }
+    /// The slots whose 128 bytes are ALL zero, lowest first (a zero type GUID alone is "unused" to UEFI,
+    /// but a slot carrying any other byte is not one this editor overwrites).
+    pub fn empty_slots(&self) -> alloc::vec::Vec<u32> {
+        let es = self.primary.entry_size as usize;
+        (0..self.primary.num_entries)
+            .filter(|&i| {
+                let o = i as usize * es;
+                self.raw.get(o..o + es).is_some_and(|b| b.iter().all(|&x| x == 0))
+            })
+            .collect()
+    }
+    /// Does `[first, last]` overlap any in-use entry?
+    pub fn overlaps(&self, first: u64, last: u64) -> bool {
+        self.entries.iter().any(|(_, e)| first <= e.last_lba && e.first_lba <= last)
+    }
+    /// The extents of `[first_usable, last_usable]` no in-use entry covers (inclusive, in LBA order).
+    pub fn free_extents(&self) -> alloc::vec::Vec<(u64, u64)> {
+        let mut used: alloc::vec::Vec<(u64, u64)> = self.entries.iter().map(|(_, e)| (e.first_lba, e.last_lba)).collect();
+        used.sort_unstable();
+        let mut out = alloc::vec::Vec::new();
+        let mut cursor = self.primary.first_usable;
+        for (a, b) in used {
+            if a > cursor {
+                out.push((cursor, a - 1));
+            }
+            cursor = cursor.max(b.saturating_add(1));
+        }
+        if cursor <= self.primary.last_usable {
+            out.push((cursor, self.primary.last_usable));
+        }
+        out
+    }
+}
+
+/// INSTALL4: read and cross-check a whole existing table. `VerifyFailed` for anything this editor would
+/// not write beside: a header that does not validate, the two headers not naming each other, different
+/// usable ranges / disk GUID / entry geometry / array CRC, an entry size other than 128, an array that is
+/// not outside the usable range, or two arrays that are not byte-equal.
+pub fn read_raw_table<T: InstallTarget>(t: &T) -> Result<RawTable, InstallError> {
+    let total = t.capacity_sectors();
+    if total < 2 + 2 * GPT_ARRAY_SECTORS + 2 {
+        return Err(InstallError::TooSmall);
+    }
+    let bad = |_| InstallError::VerifyFailed;
+    let mut s = [0u8; SECTOR];
+    t.read_sectors(1, &mut s)?;
+    let p = Header::decode(&s, total).map_err(bad)?;
+    if p.current_lba != 1 || p.entry_size != GPT_ENTRY_SIZE || p.backup_lba >= total || p.backup_lba <= p.last_usable {
+        return Err(InstallError::VerifyFailed);
+    }
+    t.read_sectors(p.backup_lba, &mut s)?;
+    let b = Header::decode(&s, total).map_err(bad)?;
+    if b.current_lba != p.backup_lba
+        || b.backup_lba != 1
+        || b.first_usable != p.first_usable
+        || b.last_usable != p.last_usable
+        || b.disk_guid != p.disk_guid
+        || b.num_entries != p.num_entries
+        || b.entry_size != p.entry_size
+        || b.entries_crc != p.entries_crc
+    {
+        return Err(InstallError::VerifyFailed);
+    }
+    let n = p.array_sectors();
+    if p.entries_lba < 2 || p.entries_lba + n > p.first_usable || b.entries_lba <= p.last_usable || b.entries_lba + n > b.current_lba {
+        return Err(InstallError::VerifyFailed);
+    }
+    let mut raw = alloc::vec![0u8; (n as usize) * SECTOR];
+    t.read_sectors(p.entries_lba, &mut raw)?;
+    let entries = core_gpt::decode_array(&raw, &p).map_err(bad)?;
+    let mut braw = alloc::vec![0u8; (n as usize) * SECTOR];
+    t.read_sectors(b.entries_lba, &mut braw)?;
+    if braw[..p.array_bytes()] != raw[..p.array_bytes()] {
+        return Err(InstallError::VerifyFailed);
+    }
+    Ok(RawTable { primary: p, backup: b, raw, entries, total_sectors: total })
+}
+
+/// INSTALL4: add `add` = `(slot, entry)` to the table `rt` was read from, on `t` (which should admit
+/// writes to the two table extents only). See the section head for the order and the re-read.
+pub fn add_entries<T: InstallTarget>(t: &mut T, rt: &RawTable, add: &[(u32, core_gpt::Entry)]) -> Result<(), InstallError> {
+    let es = rt.primary.entry_size as usize;
+    let empty = rt.empty_slots();
+    for (i, (slot, e)) in add.iter().enumerate() {
+        let inside = e.first_lba <= e.last_lba && e.first_lba >= rt.primary.first_usable && e.last_lba <= rt.primary.last_usable;
+        let clash = add[..i].iter().any(|(s2, e2)| s2 == slot || (e.first_lba <= e2.last_lba && e2.first_lba <= e.last_lba));
+        if !empty.contains(slot) || !inside || clash || rt.overlaps(e.first_lba, e.last_lba) || e.type_guid == [0u8; 16] {
+            return Err(InstallError::BadArg);
+        }
+    }
+    let mut raw = rt.raw.clone();
+    for (slot, e) in add {
+        let o = *slot as usize * es;
+        e.encode_into(&mut raw[o..o + es]);
+    }
+    let crc = amber_core::crc32(&raw[..rt.primary.array_bytes()]);
+    let primary = Header { entries_crc: crc, ..rt.primary };
+    let backup = Header { entries_crc: crc, ..rt.backup };
+    let wrote = (|| -> Result<(), InstallError> {
+        t.write_sectors(rt.backup.entries_lba, &raw)?;
+        t.write_sectors(rt.backup.current_lba, &backup.encode())?;
+        t.write_sectors(rt.primary.entries_lba, &raw)?;
+        t.write_sectors(1, &primary.encode())?;
+        let back = read_raw_table(t)?;
+        let kept = rt.entries.iter().all(|(s, e)| back.entries.iter().any(|(s2, e2)| s2 == s && e2 == e));
+        let added = add.iter().all(|(s, e)| back.entries.iter().any(|(s2, e2)| s2 == s && e2 == e));
+        if kept && added && back.entries.len() == rt.entries.len() + add.len() {
+            Ok(())
+        } else {
+            Err(InstallError::VerifyFailed)
+        }
+    })();
+    if wrote.is_err() {
+        // Put the table back exactly as it was read (the original headers re-encode to their own bytes:
+        // same fields, recomputed CRC over the same 92 bytes).
+        let _ = t.write_sectors(rt.backup.entries_lba, &rt.raw);
+        let _ = t.write_sectors(rt.backup.current_lba, &rt.backup.encode());
+        let _ = t.write_sectors(rt.primary.entries_lba, &rt.raw);
+        let _ = t.write_sectors(1, &rt.primary.encode());
+    }
+    wrote
+}

@@ -1646,3 +1646,57 @@ pub fn mint_scratch_grant(port: u8, first: u64, last: u64) -> Option<block::Writ
     }
     Some(grant_range(port, s, last))
 }
+
+// ---------------------------------------------------------------------------------------------
+// INSTALL4 (rmbp-ledger B619) — the BESIDE grants: free space, and the two table extents, of a
+// stranger's disk. Minted through `grant_range` (the audit grep still prints declaration + that one
+// line), only for a `selfinstall::BesideConsent` (the operator's typed token for THIS disk), never for
+// the boot disk, and each refuses an extent any in-use entry of the PRE-edit table overlaps — so the
+// stranger's partitions and LBA 0 are outside every grant this section can produce. File tail.
+// ---------------------------------------------------------------------------------------------
+
+/// INSTALL4: a grant over `first..=last` on the consented disk, refused unless that extent is FREE in the
+/// table `rt` was read off (inside the usable range, no in-use entry overlapping it).
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn mint_beside_part_grant(
+    c: &super::selfinstall::BesideConsent,
+    rt: &gpt::RawTable,
+    first: u64,
+    last: u64,
+) -> Option<block::WriteGrant> {
+    let port = c.port();
+    if rt.total_sectors != c.sectors() || first > last || first < rt.primary.first_usable || last > rt.primary.last_usable || rt.overlaps(first, last) {
+        return None;
+    }
+    if sata_is_boot_device(block::BlockHandle::Ahci { port }) {
+        return None;
+    }
+    serial_println!(
+        ":: INSTALL: grant minted transport=ahci port={} BESIDE lba={}..{} — free space only, every in-use partition outside it ::",
+        port, first, last
+    );
+    Some(grant_range(port, first, last))
+}
+
+/// INSTALL4: the two grants `gpt::add_entries` writes through — `1..=primary array end` (below
+/// `first_usable`) and `backup array..=backup header` (above `last_usable`). LBA 0 is in neither.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn mint_beside_table_grants(
+    c: &super::selfinstall::BesideConsent,
+    rt: &gpt::RawTable,
+) -> Option<(block::WriteGrant, block::WriteGrant)> {
+    let port = c.port();
+    let head_last = rt.primary_end();
+    let (tail_first, tail_last) = (rt.backup.entries_lba, rt.backup.current_lba);
+    if rt.total_sectors != c.sectors() || head_last >= rt.primary.first_usable || tail_first <= rt.primary.last_usable || tail_last >= rt.total_sectors || tail_first > tail_last {
+        return None;
+    }
+    if sata_is_boot_device(block::BlockHandle::Ahci { port }) {
+        return None;
+    }
+    serial_println!(
+        ":: INSTALL: grant minted transport=ahci port={} GPT lba=1..{} and lba={}..{} — the two tables only, LBA 0 and every partition outside ::",
+        port, head_last, tail_first, tail_last
+    );
+    Some((grant_range(port, 1, head_last), grant_range(port, tail_first, tail_last)))
+}

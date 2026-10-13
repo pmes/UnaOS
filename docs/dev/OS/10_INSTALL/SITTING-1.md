@@ -1,5 +1,7 @@
 # SITTING-1 — the first install of UnaOS into a Disk-Utility partition on Peter's internal SSD
 
+> **INSTALL4 (rmbp-ledger B619, 2026-10-13): the procedure for the rMBP's SSD is now [FLIGHT35-INSTALL.md](FLIGHT35-INSTALL.md)** — `install ssd --dry-run` then `install ssd --write --beside <token>`: an ESP and a UnaFS partition in FREE space beside macOS, the real running system (not `demo_tree`). This file's STOP 1 is closed (the unattended boot fixture writes nothing without `tests-at-boot`); its STOP 2 still describes `install <disk> <slot>`, which flight 35 does not use. Its line numbers are `11ca67f1`'s.
+
 The operator brief for rmbp-queue's `PARTINSTALL METAL` row: **Peter's sitting, ATTENDED,
 DESTRUCTIVE, and a FRESH GO every time.** Peter's goal, verbatim in rmbp-ledger **B89**: *"i do not
 want to run catalina, i want unaos on the internal hd — then later boot an experimental version from

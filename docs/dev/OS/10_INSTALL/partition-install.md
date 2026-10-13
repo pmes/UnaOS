@@ -1,5 +1,7 @@
 # PARTINSTALL — installing UnaOS into an existing GPT partition
 
+> **INSTALL4 (rmbp-ledger B619, 2026-10-13):** for the rMBP's internal SSD the operator path is `install ssd` — [FLIGHT35-INSTALL.md](FLIGHT35-INSTALL.md): the dry run classifies the disk and, for a stranger's (macOS's), plans an ESP + UnaFS in FREE space; `install ssd --write --beside <token>` adds two GPT entries in empty slots and writes only inside them. The per-partition verb below (`install <disk> <slot>`) still writes the synthetic test tree and is not the flight-35 path. The audit is `docs/dev/evidence/install4/AUDIT.md`.
+
 **What this is for.** rmbp-ledger **B89** records Peter's goal in his own words: *"i do not want to
 run catalina, i want unaos on the internal hd — then later boot an experimental version from the sd
 card slot"*, and he named it himself as a test of *"whether the OS is booting truly dumb or still
