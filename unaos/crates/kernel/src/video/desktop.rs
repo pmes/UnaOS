@@ -16,9 +16,12 @@
 //! row's fields; `video/mod.rs` does not move. Same gate as `draw` (x86 `wc`, aarch64 `desktop_firmware`).
 //!
 //! * [`chrome_paint`] — from `wm::paint_window`, the Una arm beside Softy's (one LINE-NEUTRAL fold): the head, a flat
-//!   `surface.window` title band with rounded top corners (square when zoomed), the 1-device-px outline
-//!   (`line.strong` @ 60 % on Light, `rim.dark` on Dark), the three discs, the centred title and the title rule. The
-//!   corner pixels outside the arc are the desktop's (the wallpaper under every shadow that reaches them).
+//!   `surface.window` title band with rounded top corners (square when zoomed), the head's stretch of the EDGE
+//!   ([`edge_ink`]), the three discs, the centred title and the title rule. The corner pixels outside the arc are the
+//!   desktop's (the wallpaper under every shadow that reaches them).
+//! * [`edge_paint`] — from `wm::paint_window`'s tail, after the content (WINEDGE B659): the window's EDGE below the
+//!   head — a 1-device-px hairline down both sides and along the foot, [`edge_ink`], inside the box, so the edge is
+//!   one line all the way round and the shadow lies beyond it.
 //!   Softy keeps its own painter (`look::is_softy()` decides first).
 //! * [`hover_track`] — from `dock::compose` (Una only): the disc group under the pointer, latched; a change damages
 //!   the heads involved so their glyphs appear and go.
@@ -42,7 +45,16 @@
 //! that fill (`wm::defer_erase`), which the same pass drains (clipped by every window box and the furniture) and
 //! whose `damage_intersecting` repaints the windows the extent crosses. `wm::occluders` reports the extents, so the
 //! desktop layer's own presents never paint over a shadow. A shadow falls on the desktop, not on a lower window
-//! (the fill is clipped by every box): the 1-px outline and the shadow's edge on the desktop carry the depth.
+//! (the fill is clipped by every box): the 1-px EDGE and the shadow's edge on the desktop carry the depth.
+//!
+//! THE EDGE (WINEDGE B659; DESIGN-LANGUAGE §2.9's 2026-10-13 amendment). Peter, flight 35: *"new prefs panel looking
+//! very nice. new borders not so much."* — DESIGNAPPLY's frameless box with only the outside shadow did not read as a
+//! window edge to him. A window now has a VISIBLE EDGE: a 1-device-px hairline (`line.strong` on Light,
+//! `line.subtle` on Dark — [`edge_ink`], never a literal) round the whole box at every scale. The head draws its
+//! stretch (the rounded top, in [`chrome_row`]); the rest is drawn over the content's outermost pixels after the
+//! content by [`edge_paint`], because with `wm::BORDER()` = 0 the content reaches the box's sides and foot and would
+//! paint over anything laid before it (DESIGNAPPLY's own outline ran only down the head for that reason). The edge is
+//! inside the box, so the shadow's margin, the resize band and the occluder extents do not move.
 //!
 //! THE TILES. A shadow is never computed per frame (§2.4). Per (radius, level, scale, theme) one [`Tiles`] is
 //! rendered once and kept (bounded: [`TILE_SLOTS`]): the top and bottom CORNER tiles (left; the right mirrors) and
@@ -90,8 +102,6 @@ pub struct Craft {
     pub win_radius_softy: usize,
     /// The elevation levels: `[level][dark as usize][layer]` (§2.4's table, alphas of 255).
     pub elev: [[[Layer; 2]; 2]; 4],
-    /// A window's outline on Light: `line.strong` at this opacity (60 %).
-    pub outline_alpha: u32,
     /// A hovered disc's glyph: black at this opacity (50 %, §3.1).
     pub glyph_alpha: u32,
     /// The VEIL's tint (§2.4): `surface.window` at 72 % (Light) / 78 % (Dark) — the menu bar and the dock.
@@ -121,12 +131,11 @@ pub const CRAFT: Craft = Craft {
         [[ly(1, 2, 36), ly(0, 1, 26)], [ly(1, 2, 102), NO_LAYER]],
         // elev.2 overlay (menus, popovers, toasts): 0 0 2 @ 12 % + 0 8 24 @ 18 %; Dark @ 30 % / 45 % (+ rim.dark)
         [[ly(0, 2, 31), ly(8, 24, 46)], [ly(0, 2, 77), ly(8, 24, 115)]],
-        // elev.3 window, focused: 0 0 2 @ 12 % + 0 16 40 @ 26 % (+ outline); Dark @ 40 % / 55 % (+ rim.dark)
+        // elev.3 window, focused: 0 0 2 @ 12 % + 0 16 40 @ 26 %; Dark @ 40 % / 55 % (+ the edge, `edge_ink`, both)
         [[ly(0, 2, 31), ly(16, 40, 66)], [ly(0, 2, 102), ly(16, 40, 140)]],
         // elev.3i window, unfocused: 0 0 2 @ 8 % + 0 8 20 @ 14 %; Dark @ 30 % / 35 %
         [[ly(0, 2, 20), ly(8, 20, 36)], [ly(0, 2, 77), ly(8, 20, 89)]],
     ],
-    outline_alpha: 153,
     glyph_alpha: 128,
     veil_tint: (184, 199),
     dock_radius: 18,
@@ -793,13 +802,13 @@ pub fn chrome_row(row: &mut [u32], h: &Head, j: usize, bx: usize, by: usize, bac
     let band_r = Rect::new(0, -jj, bw as i32, t);
     let radii = Radii::new(rad, rad, 0, 0);
     draw::fill_rrect(&mut s, band_r, radii, theme::surface_window());
-    // The outline, one device px, run past the band's foot so its lower arcs never land: `line.strong` @ 60 % on
-    // Light, `rim.dark` (white @ 8 %) on Dark (§3.1).
-    let edge = if theme::is_dark() { Ink::new(theme::RIM_DARK, theme::RIM_DARK_ALPHA) } else { Ink::new(theme::line_strong(), CRAFT.outline_alpha) };
-    draw::stroke_rrect(&mut s, Rect::new(0, -jj, bw as i32, t + rad + 2), radii, 1, edge);
-    // The rule between the title band and the content.
+    // The head's stretch of the EDGE (WINEDGE B659, §2.9 amended): one device px, opaque [`edge_ink`], run past the
+    // band's foot so its lower arcs never land; [`edge_paint`] carries it on down the sides and along the foot. It was
+    // `line.strong` @ 60 % (Light) / `rim.dark` (Dark) until flight 35 — too faint to read as an edge (Peter).
+    draw::stroke_rrect(&mut s, Rect::new(0, -jj, bw as i32, t + rad + 2), radii, 1, Ink::solid(edge_ink()));
+    // The rule between the title band and the content, between the two edge columns (the edge stays one line).
     if jj == t - 1 {
-        draw::hairline_h(&mut s, 0, 0, bw as i32, theme::line_subtle());
+        draw::hairline_h(&mut s, 1, 0, bw as i32 - 2, theme::line_subtle());
     }
     // The three discs, anti-aliased; the glyphs (black @ 50 %) while the pointer is over the group.
     for (k, c) in h.ctrls.iter().enumerate() {
@@ -867,6 +876,54 @@ pub fn paint_box(h: &Head, bx: usize, by: usize, back: Option<&Back>, casts: &Ca
         }
         chrome_row(row, h, j, bx, by, back, casts);
         sink(j, 0, &row[..bw]);
+    }
+}
+
+/// WINEDGE (B659) — the window EDGE's ink: `line.strong` on Light, `line.subtle` on Dark (DESIGN-LANGUAGE §2.3's
+/// roles; §2.9 as amended 2026-10-13). One function, read by the head's stroke ([`chrome_row`]), the body's
+/// ([`edge_paint`]) and the fixture's `edge=` clause, so the three can never disagree.
+pub fn edge_ink() -> u32 {
+    if theme::is_dark() { theme::line_subtle() } else { theme::line_strong() }
+}
+
+/// WINEDGE (B659) — the box-local column spans `(x0, len)` of the EDGE on box row `j` of a `bw x bh` box, BELOW the
+/// head (the head's rows are [`chrome_row`]'s stroke): the two side columns on every content row, the whole row on
+/// the foot. Empty above the head, outside the box, or for a box too small to have an inside.
+pub fn edge_spans(bw: usize, bh: usize, j: usize) -> [(usize, usize); 2] {
+    let head = super::TITLE_H().min(bh);
+    if bw < 2 || bh < 2 || j < head || j >= bh {
+        return [(0, 0); 2];
+    }
+    if j + 1 == bh {
+        return [(0, bw), (0, 0)];
+    }
+    [(0, 1), (bw - 1, 1)]
+}
+
+/// **The window EDGE below the head** (WINEDGE B659) into `dst` (a band whose origin is panel `(ox, oy)`): from
+/// `wm::paint_window`'s TAIL, after the content upscale — the content reaches the box's sides and foot now that
+/// `wm::BORDER()` is 0, so an edge laid before it (the keyline's old seat) would be painted over on every present.
+/// Inside the box (the box's outermost column each side and its last row), so nothing outside the box moves: the
+/// shadow still starts on the first pixel past it, the resize band is still outside it. Una only: Softy's painter
+/// draws its own 1 px border (`softy::chrome`), and a compat row has no chrome. Cost: two pixels per content row and
+/// one row at the foot, per compose of the band that holds them.
+pub(super) fn edge_paint(dst: &crate::video::FrameBuffer, r: &Window, ox: usize, oy: usize) {
+    if r.compat || crate::video::look::is_softy() {
+        return;
+    }
+    let (bx, by, bw, bh) = super::outer_box(r);
+    let Some(lx) = bx.checked_sub(ox) else { return };
+    let ink = edge_ink();
+    let dh = dst.info().height;
+    let j0 = oy.saturating_sub(by).max(super::TITLE_H().min(bh));
+    let j1 = (oy + dh).saturating_sub(by).min(bh);
+    for j in j0..j1 {
+        let y = by + j - oy;
+        for (x0, len) in edge_spans(bw, bh, j) {
+            for i in 0..len {
+                dst.put_pixel(lx + x0 + i, y, ink);
+            }
+        }
     }
 }
 
@@ -1229,14 +1286,27 @@ struct FixWin {
 /// the dock's plate with nine tiles. It asserts the invariants and prints the paint cost on the running machine
 /// against the 60 Hz frame (16 667 us):
 ///
-/// `:: DESKTOPCRAFT: corners=ok shadow=ok hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
-/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> frame=<n> track_fills=<n> black_runs=<n> -> UNDER|OVER ::`
+/// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
+/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> -> UNDER|OVER ::`
 ///
 /// * **corners** — the focused window's top-left box pixel (outside the rounded head) is the desktop under the
 ///   shadows (exactly the fill's value there), and the head's face one radius in is not;
-/// * **shadow** — below the focused window at mid-width, the darkness (wallpaper minus panel, three channels) is
-///   positive on the first row outside the box, never grows going down (within 3), and is (about) nothing at the
-///   margin's last row — the shadow lies OUTSIDE the box and fades to zero inside its margin (DESIGNAPPLY B639);
+/// * **shadow** — WINEDGE (B659) re-derived it against what the tiles CAST. Below the focused window at mid-width,
+///   over the bottom margin's `bot` rows: the cast's own alpha there (its bottom ramp, read through
+///   [`Cast::for_each_alpha`] — the reader the fill uses) is positive on the first row outside the box, never rises
+///   row to row (no tolerance: the ramp is integer tile data, not a dithered measurement), and is at most 2 of 255 on
+///   the margin's last row; and every one of those panel pixels is EXACTLY the wallpaper under every cast's shade
+///   there (the fill's value, as `corners` reads it). The darkness (wallpaper minus panel, three channels) on the
+///   first and last row is printed on the cost line (`ramp_dark=`) beside the alpha (`ramp_a=`), not asserted: the
+///   wallpaper is ordered-dithered, so its row-to-row step is the dither's, not the shadow's. The clause it replaces
+///   (DESIGNAPPLY's) started `prev` at `i64::MAX` and tested `dk > prev + 3`: in the `--release` kernel the add
+///   wraps to `i64::MIN + 2`, so the FIRST row always failed — flight 35's `shadow=FAIL` at 2.0, and every other
+///   scale (`docs/dev/evidence/winedge/edgecheck.out`);
+/// * **edge** — WINEDGE (B659): the focused window's EDGE is one device px of [`edge_ink`] — the box's outermost
+///   column at mid-content on both sides, its last row at mid-width, and the head's side one pixel below the corner
+///   arc are the ink; one pixel further in is the content (or the head's face), so it is ONE px; and one pixel
+///   outside, on the left and below, is the shaded desktop (the edge is inside the box, the shadow outside it).
+///   Printed `edge=ok(1px)`;
 /// * **hairline** — the dock plate's top edge is a line over the plate;
 /// * **black** — no run of pure `#000000` longer than 2 px outside a glyph zone.
 pub fn selftest() {
@@ -1276,7 +1346,9 @@ pub fn selftest() {
         return;
     }
     row.resize(pw, 0u32);
-    let (mut corners, mut shadow, mut hairline, mut black) = (true, true, true, true);
+    let (mut corners, mut shadow, mut edge, mut hairline, mut black) = (true, true, true, true, true);
+    // WINEDGE (B659): the focused window's bottom ramp, first/last row — the cast's alpha and the darkness it paints.
+    let (mut ramp_a, mut ramp_dark) = ((0u32, 0u32), (0i64, 0i64));
     let mut glyph_rects: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new();
     // The casts the compositor would publish for these three boxes (the live theme, scale and look).
     let dark = theme::is_dark();
@@ -1381,6 +1453,14 @@ pub fn selftest() {
         for y in fy + t..fy + bh {
             frame[y * pw + fx..y * pw + fx + bw].fill(cf);
         }
+        // The EDGE below the head, after the content — `edge_paint`'s spans and ink, as `wm::paint_window`'s tail.
+        let ink = edge_ink();
+        for j in t.min(bh)..bh {
+            for (x0, len) in edge_spans(bw, bh, j) {
+                let o = (fy + j) * pw + fx + x0;
+                frame[o..o + len].fill(ink);
+            }
+        }
         chrome_ns += now_ns().0.saturating_sub(c0);
         if fw.focused {
             // corners: the box's top-left pixel is the desktop under the shadows, exactly the fill's value there.
@@ -1392,25 +1472,53 @@ pub fn selftest() {
             if rr == 0 || px != want[0] || inside == px || inside != theme::surface_window() { // `inside`: one radius in from the top-RIGHT corner (the discs sit top-left)
                 corners = false;
             }
-            // shadow: below the box at mid-width, the darkness is positive next to the box and falls monotonically
-            // to (about) nothing at the margin's last row.
+            // shadow (WINEDGE B659): below the box at mid-width, the CAST's ramp — positive next to the box, never
+            // rising, <= 2 on the margin's last row — and each panel pixel exactly the wallpaper under every cast there.
             let mx = fx + bw / 2;
             let dark_of = |a: u32, b: u32| [16u32, 8, 0].iter().map(|&s| ((a >> s) & 255) as i64 - ((b >> s) & 255) as i64).sum::<i64>();
-            let bot = casts.iter().find(|c| c.x0 == fx as i32 && c.y0 == fy as i32).map_or(0, |c| c.t.bot) as usize;
-            let mut prev = i64::MAX;
-            let mut first = 0i64;
+            let me = casts.iter().find(|c| c.x0 == fx as i32 && c.y0 == fy as i32).copied();
+            let bot = me.map_or(0, |c| c.t.bot) as usize;
+            let mut prev: Option<u32> = None;
+            let (mut a_first, mut a_last, mut d_first, mut d_last) = (0u32, 0u32, 0i64, 0i64);
             for (n, y) in (fy + bh..(fy + bh + bot).min(ph)).enumerate() {
+                let mut a = 0u32;
+                if let Some(c) = me {
+                    c.for_each_alpha(y as i32, mx as i32, mx as i32 + 1, |_, al| a = al);
+                }
+                let mut want = [wall[y * pw + mx]];
+                shade_words(&casts, &mut want, y as i32, mx as i32);
                 let dk = dark_of(wall[y * pw + mx], frame[y * pw + mx]);
                 if n == 0 {
-                    first = dk;
+                    (a_first, d_first) = (a, dk);
                 }
-                if dk > prev + 3 || dk < 0 {
+                if prev.is_some_and(|p| a > p) || frame[y * pw + mx] != want[0] {
                     shadow = false;
                 }
-                prev = dk;
+                prev = Some(a);
+                (a_last, d_last) = (a, dk);
             }
-            if bot == 0 || first <= 0 || prev > 3 {
+            if bot == 0 || a_first == 0 || a_last > 2 || prev.is_none() {
                 shadow = false;
+            }
+            (ramp_a, ramp_dark) = ((a_first, a_last), (d_first, d_last));
+            // edge (WINEDGE B659): one device px of `edge_ink` round the box, inside it, the shaded desktop outside.
+            let ym = fy + (t + bh) / 2;
+            let ylast = fy + bh - 1;
+            let jh = rr.max(1) + 1;
+            let desk = |x: usize, y: usize| {
+                let mut w = [wall[y * pw + x]];
+                shade_words(&casts, &mut w, y as i32, x as i32);
+                w[0]
+            };
+            if bh <= t + 2 || bw < 4 || ym == 0 {
+                edge = false;
+            } else {
+                let on = frame[ym * pw + fx] == ink && frame[ym * pw + fx + bw - 1] == ink && frame[ylast * pw + mx] == ink;
+                let thin = frame[ym * pw + fx + 1] == cf && frame[ym * pw + fx + bw - 2] == cf && frame[(ylast - 1) * pw + mx] == cf;
+                let head = jh >= t || (frame[(fy + jh) * pw + fx] == ink && frame[(fy + jh) * pw + fx + 1] != ink);
+                let out = fx == 0 || (frame[ym * pw + fx - 1] == desk(fx - 1, ym) && frame[ym * pw + fx - 1] != ink);
+                let below = ylast + 1 >= ph || frame[(ylast + 1) * pw + mx] == desk(mx, ylast + 1);
+                edge = on && thin && head && out && below;
             }
         }
         // The title's text band is a glyph zone for the black census.
@@ -1459,11 +1567,11 @@ pub fn selftest() {
     if runs > 0 {
         black = false;
     }
-    let ok = corners && shadow && hairline && black;
+    let ok = corners && shadow && edge && hairline && black;
     let fl = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: DESKTOPCRAFT: corners={} shadow={} hairline={} black={} windows={} surface={}x{} -> {} ::",
-        fl(corners), fl(shadow), fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
+        ":: DESKTOPCRAFT: corners={} shadow={} edge={} hairline={} black={} windows={} surface={}x{} -> {} ::",
+        fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
     );
     let frame_us = f4.saturating_sub(f0) / 1000;
     const BUDGET_US: u64 = 16_667;
@@ -1471,7 +1579,7 @@ pub fn selftest() {
     let (mt, ms, mb) = margins(ELEV_WINDOW, dark, s2);
     let (it, is, ib) = margins(ELEV_IDLE, dark, s2);
     serial_println!(
-        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} frame={} track_fills={} black_runs={} -> {} ::",
+        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} ramp_a={}/{} ramp_dark={}/{} frame={} track_fills={} black_runs={} -> {} ::",
         clock,
         frame_us,
         BUDGET_US,
@@ -1490,6 +1598,10 @@ pub fn selftest() {
         it,
         is,
         ib,
+        ramp_a.0,
+        ramp_a.1,
+        ramp_dark.0,
+        ramp_dark.1,
         super::BORDER(),
         TRACK_FILLS.load(Ordering::Relaxed),
         runs,

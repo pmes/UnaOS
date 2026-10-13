@@ -20486,7 +20486,7 @@ fn paint_window(
         // in — `BORDER()` is 0, the box is the head and the content, and the window's edge on the desktop is its
         // SHADOW, which lies outside the box (`wm::desktop`, the fill's shading). The arc keyline below keeps one
         // ink, `line.strong`, for the stock head (the Una and Softy painters draw their own outline over it).
-        let kl = super::theme::line_strong();
+        let kl = super::theme::line_strong(); // WINEDGE (B659): the window's EDGE is back (§2.9 amended) — not here, where the content would paint over it, but at this function's TAIL (`desktop::edge_paint`, after the content) and in the head painter's stroke (`desktop::chrome_row`); this ink stays the stock head's arc only.
         //
         // WHAT STOOD HERE UNTIL B639, as the record: a `theme::BEVEL`-thick KEYLINE (`frame_line`) on all four
         // edges of the outer box, then the two BEVEL hairlines inside it — `bevel_light` along the top and left,
@@ -20901,7 +20901,7 @@ fn paint_window(
             dst.blit((y * dw + cx) * dbpp, line);
         }
     }
-    comp_mark(r.id, mk + PW_EXIT);
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if !r.compat { comp_mark(r.id, mk + PW_FRAME); self::desktop::edge_paint(dst, r, ox, oy); } comp_mark(r.id, mk + PW_EXIT); // WINEDGE (rmbp-ledger B659; DESIGN-LANGUAGE §2.9 amended 2026-10-13, Peter flight 35: "new borders not so much"): the window EDGE below the head — 1 device px of `desktop::edge_ink` (`line.strong` Light / `line.subtle` Dark) down both sides and along the foot, INSIDE the box, drawn HERE at the tail because with `BORDER()` = 0 the content upscale above reaches the box edge and would overpaint it anywhere earlier (the keyline's old seat, PW_FRAME, whose phase this stamps again). Una only (Softy draws its own border). ⚠ LINE-NEUTRAL fold, code first, cfg = the desktop arm's.
 }
 
 /// WC-H — the back-layer path: compose the window into cached RAM, then present its clipped outer

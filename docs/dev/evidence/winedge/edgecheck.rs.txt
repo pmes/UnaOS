@@ -1,0 +1,192 @@
+// WINEDGE (rmbp-ledger B659) evidence: the DESIGNAPPLY host copy of video/desktop.rs's pure tile functions (designapply/tilecheck.rs.txt, verbatim) plus wall_gen, keep_rgb/keep_of and the `tests desktopcraft` shadow clause, old and new. Build: rustc -O -C overflow-checks=off --edition 2021 --crate-name edgecheck edgecheck.rs.txt -o edgecheck && ./edgecheck  (output: edgecheck.out). Light/crispy tokens (palette_core) for the wallpaper; the Dark rows reuse the Light wallpaper (the fixture's wallpaper is token-derived; the clause under test is the ramp, not the colour).
+fn isqrt(n: u64) -> u64 {
+    if n < 2 { return n; }
+    let mut x = 1u64 << (64 - n.leading_zeros()).div_ceil(2);
+    loop { let y = (x + n / x) / 2; if y >= x { return x; } x = y; }
+}
+fn px_at(n: usize, s2: u32) -> usize { (n * s2 as usize + 1) / 2 }
+#[derive(Clone, Copy)] struct Layer { dy: usize, blur: usize, alpha: u32 }
+const fn ly(dy: usize, blur: usize, alpha: u32) -> Layer { Layer { dy, blur, alpha } }
+const NO: Layer = ly(0, 0, 0);
+const ELEV: [[[Layer; 2]; 2]; 4] = [
+    [[ly(1, 2, 36), ly(0, 1, 26)], [ly(1, 2, 102), NO]],
+    [[ly(0, 2, 31), ly(8, 24, 46)], [ly(0, 2, 77), ly(8, 24, 115)]],
+    [[ly(0, 2, 31), ly(16, 40, 66)], [ly(0, 2, 102), ly(16, 40, 140)]],
+    [[ly(0, 2, 20), ly(8, 20, 36)], [ly(0, 2, 77), ly(8, 20, 89)]],
+];
+fn layers_px(level: usize, dark: bool, s2: u32) -> [(i32, i32, u32); 2] {
+    let mut out = [(0i32, 0i32, 0u32); 2];
+    for (k, l) in ELEV[level][dark as usize].iter().enumerate() {
+        if l.alpha == 0 || l.blur == 0 { continue; }
+        let px = |n: usize| px_at(n, s2) as i32;
+        out[k] = (px(l.dy), px(l.blur).max(1), l.alpha.min(255));
+    }
+    out
+}
+fn margins(level: usize, dark: bool, s2: u32) -> (i32, i32, i32) {
+    let (mut t, mut s, mut b) = (0i32, 0i32, 0i32);
+    for &(dy, bl, a) in layers_px(level, dark, s2).iter() {
+        if a == 0 { continue; }
+        s = s.max(bl); t = t.max(bl - dy); b = b.max(bl + dy);
+    }
+    (t, s, b)
+}
+fn fall(sd4: i64, blur: i32, alpha: u32) -> u32 {
+    let b4 = 4 * blur as i64;
+    let t = (((sd4 + b4).clamp(0, 2 * b4) << 16) / (2 * b4).max(1)) as u64;
+    let ss = (t * t >> 16) * (3 * 65536 - 2 * t) >> 16;
+    ((alpha as u64 * (65536 - ss.min(65536)) + 32768) >> 16) as u32
+}
+fn sd_corner(qx: i64, qy: i64, r4: i64) -> i64 {
+    let (ox, oy) = (qx.max(0), qy.max(0));
+    let out = isqrt((ox * ox + oy * oy) as u64) as i64;
+    out + qx.max(qy).min(0) - r4
+}
+fn combine(ls: &[(i32, i32, u32); 2], mut each: impl FnMut(i32, i32) -> i64) -> u8 {
+    let mut keep = 255u32;
+    for &(dy, bl, a) in ls.iter() {
+        if a == 0 { continue; }
+        let ak = fall(each(dy, bl), bl, a);
+        keep = keep * (255 - ak.min(255)) / 255;
+    }
+    (255 - keep) as u8
+}
+struct Tiles { top: i32, side: i32, bot: i32, r: i32, cw: i32, th: i32, bh: i32, top_c: Vec<u8>, bot_c: Vec<u8>, side_r: Vec<u8>, top_r: Vec<u8>, bot_r: Vec<u8> }
+fn build(level: usize, dark: bool, s2: u32, r: i32) -> Tiles {
+    let ls = layers_px(level, dark, s2);
+    let (top, side, bot) = margins(level, dark, s2);
+    let dymax = ls.iter().map(|l| l.0).max().unwrap_or(0);
+    let (cw, th, bh) = (side + r, top + r + dymax, r + bot);
+    let (cwu, thu, bhu) = (cw as usize, th as usize, bh as usize);
+    let (mut top_c, mut bot_c, mut side_r, mut top_r, mut bot_r) = (vec![0u8; thu * cwu], vec![0u8; bhu * cwu], vec![0u8; cwu], vec![0u8; thu], vec![0u8; bhu]);
+    let r4 = 4 * r as i64;
+    let (x0, yt, yb) = (4 * side as i64, 4 * top as i64, 4 * r as i64);
+    for v in 0..thu {
+        let py = 4 * v as i64 + 2;
+        for u in 0..cwu {
+            let px = 4 * u as i64 + 2;
+            top_c[v * cwu + u] = combine(&ls, |dy, _| { let (cx, cy) = (x0 + r4, yt + 4 * dy as i64 + r4); sd_corner(cx - px, cy - py, r4) });
+        }
+        top_r[v] = combine(&ls, |dy, _| yt + 4 * dy as i64 - py);
+    }
+    for w in 0..bhu {
+        let py = 4 * w as i64 + 2;
+        for u in 0..cwu {
+            let px = 4 * u as i64 + 2;
+            bot_c[w * cwu + u] = combine(&ls, |dy, _| { let (cx, cy) = (x0 + r4, yb + 4 * dy as i64 - r4); sd_corner(cx - px, py - cy, r4) });
+        }
+        bot_r[w] = combine(&ls, |dy, _| py - (yb + 4 * dy as i64));
+    }
+    for u in 0..cwu { let px = 4 * u as i64 + 2; side_r[u] = combine(&ls, |_, _| x0 - px); }
+    Tiles { top, side, bot, r, cw, th, bh, top_c, bot_c, side_r, top_r, bot_r }
+}
+struct Cast<'a> { x0: i32, y0: i32, x1: i32, y1: i32, t: &'a Tiles }
+impl Cast<'_> {
+    fn for_each_alpha(&self, y: i32, a: i32, b: i32, mut f: impl FnMut(i32, u32)) {
+        let t = self.t;
+        if y < self.y0 - t.top || y >= self.y1 + t.bot { return; }
+        let cw = t.cw as usize;
+        let (tile_row, ramp): (&[u8], u32) = if y < self.y0 - t.top + t.th {
+            let ri = (y - (self.y0 - t.top)) as usize;
+            (t.top_c.get(ri * cw..(ri + 1) * cw).unwrap_or(&[]), t.top_r.get(ri).copied().unwrap_or(0) as u32)
+        } else if y >= self.y1 - t.r {
+            let ri = (y - (self.y1 - t.r)) as usize;
+            (t.bot_c.get(ri * cw..(ri + 1) * cw).unwrap_or(&[]), t.bot_r.get(ri).copied().unwrap_or(0) as u32)
+        } else { (&t.side_r[..], 0) };
+        if tile_row.len() < cw { return; }
+        let (lx0, rx1) = (self.x0 - t.side, self.x1 + t.side);
+        let (lx1, rx0) = (lx0 + t.cw, rx1 - t.cw);
+        for x in a.max(lx0)..b.min(lx1) { f(x, tile_row[(x - lx0) as usize] as u32); }
+        if ramp != 0 { for x in a.max(lx1)..b.min(rx0) { f(x, ramp); } }
+        for x in a.max(rx0).max(lx1)..b.min(rx1) { f(x, tile_row[(rx1 - 1 - x) as usize] as u32); }
+    }
+    fn alpha(&self, x: i32, y: i32) -> u32 {
+        let t = self.t;
+        let (row, ri) = if y < self.y0 - t.top || y >= self.y1 + t.bot { return 0; }
+            else if y < self.y0 - t.top + t.th { (0u8, y - (self.y0 - t.top)) }
+            else if y >= self.y1 - t.r { (1, y - (self.y1 - t.r)) } else { (2, 0) };
+        let (corner, ci) = if x < self.x0 - t.side || x >= self.x1 + t.side { return 0; }
+            else if x < self.x0 - t.side + t.cw { (true, x - (self.x0 - t.side)) }
+            else if x >= self.x1 + t.side - t.cw { (true, (self.x1 + t.side - 1) - x) } else { (false, 0) };
+        let (cw, ci, ri) = (t.cw as usize, ci as usize, ri as usize);
+        let a = match (row, corner) {
+            (0, true) => t.top_c.get(ri * cw + ci), (1, true) => t.bot_c.get(ri * cw + ci), (2, true) => t.side_r.get(ci),
+            (0, false) => t.top_r.get(ri), (1, false) => t.bot_r.get(ri), _ => None };
+        a.copied().unwrap_or(0) as u32
+    }
+}
+const BAYER: [u32; 16] = [8, 136, 40, 168, 200, 72, 232, 104, 56, 184, 24, 152, 248, 120, 216, 88];
+const DESKTOP_BG: u32 = 0x002D2B55;
+static mut ACCENT: u32 = 0x004E6DD3;
+const KNOB_LIGHT: u32 = 0x00FFFFFF;
+fn blend(dst: u32, src: u32, a: u32) -> u32 {
+    if a == 0 { return dst; }
+    if a >= 255 { return src & 0xFFFFFF; }
+    let a = a + (a >> 7); let na = 256 - a;
+    let rb = (((src & 0x00FF_00FF) * a + (dst & 0x00FF_00FF) * na) >> 8) & 0x00FF_00FF;
+    let g = (((src & 0x0000_FF00) * a + (dst & 0x0000_FF00) * na) >> 8) & 0x0000_FF00;
+    rb | g
+}
+fn wall_gen(px: &mut [u32], w: usize, h: usize) {
+    let t0 = blend(DESKTOP_BG, 0, 90); let acc = unsafe { ACCENT }; let t1 = blend(DESKTOP_BG, acc, 96); let glow = blend(acc, KNOB_LIGHT, 48);
+    let ch = |c: u32, s: u32| ((c >> s) & 255) as i64;
+    let (a0, a1) = ([ch(t0, 16), ch(t0, 8), ch(t0, 0)], [ch(t1, 16), ch(t1, 8), ch(t1, 0)]);
+    let gl = [ch(glow, 16), ch(glow, 8), ch(glow, 0)];
+    let tx: Vec<i64> = (0..w).map(|x| ((x as u64 * 32768) / w.max(2) as u64) as i64).collect();
+    let rad = (h * 620 / 1000).max(1) as i64;
+    let (gx, gy) = ((w * 300 / 1000) as i64, (h * 760 / 1000) as i64);
+    let r2 = rad * rad; let inv = (1i64 << 40) / r2.max(1);
+    for y in 0..h {
+        let ty = (y as i64 * 32768) / h.max(2) as i64; let dy = y as i64 - gy; let dy2 = dy * dy; let in_rows = dy2 < r2;
+        for x in 0..w {
+            let t = tx[x] + ty; let mut c = [0i64; 3];
+            for k in 0..3 { c[k] = (a0[k] << 8) + ((a1[k] - a0[k]) * t >> 8); }
+            if in_rows { let dx = x as i64 - gx; let d2 = dx * dx + dy2; if d2 < r2 {
+                let q = 256 - ((d2 * inv) >> 32).min(256); let f = q * q * q >> 16; let a = f * 150 >> 8;
+                for k in 0..3 { c[k] += ((gl[k] << 8) - c[k]) * a >> 8; } } }
+            let dth = BAYER[((y & 3) << 2) | (x & 3)] as i64;
+            let q = |v: i64| (((v + dth) >> 8).clamp(0, 255)) as u32;
+            px[y * w + x] = (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2]);
+        }
+    }
+}
+fn keep_rgb(c: u32, keep: u32) -> u32 { let rb = ((c & 0x00FF_00FF) * keep >> 8) & 0x00FF_00FF; let g = ((c & 0x0000_FF00) * keep >> 8) & 0x0000_FF00; rb | g }
+fn keep_of(a: u32) -> u32 { 256 - (a + (a >> 7)).min(256) }
+fn main() {
+    // The fixture's frame below the focused window at mid-width (`tests desktopcraft`, 2880x1800, k = x2), both themes,
+    // scale 1.0 (s2=2) and 2.0 (s2=4, the rMBP): the OLD shadow clause run literally (release: wrapping, no overflow
+    // checks) and the NEW one (WINEDGE: the tile ramp read from the cast, the painted pixel equal to the cast's shade).
+    let (pw, ph) = (2880usize, 1800usize);
+    let mut wall = vec![0u32; pw * ph]; wall_gen(&mut wall, pw, ph);
+    for &s2 in &[2u32, 4] { for dark in [false, true] {
+        let k = |v: usize| v * pw / 1440;
+        let r = px_at(12, s2) as i32;
+        let tf = build(2, dark, s2, r); let ti = build(3, dark, s2, r);
+        let wins = [(k(1010), k(250), k(380), k(520), &ti), (k(640), k(170), k(760), k(520), &ti), (k(120), k(110), k(900), k(600), &tf)];
+        let casts: Vec<Cast> = wins.iter().map(|&(x, y, w, h, t)| Cast { x0: x as i32, y0: y as i32, x1: (x + w.min(pw - x)) as i32, y1: (y + h.min(ph - y)) as i32, t }).collect();
+        let (fx, fy, bw, bh, _) = wins[2];
+        let mx = fx + bw / 2;
+        let bot = tf.bot as usize;
+        let shade = |y: usize, x: usize| { let mut p = wall[y * pw + x]; for c in casts.iter() { c.for_each_alpha(y as i32, x as i32, x as i32 + 1, |_, a| if a != 0 { p = keep_rgb(p, keep_of(a)); }); } p };
+        let dark_of = |a: u32, b: u32| [16u32, 8, 0].iter().map(|&s| ((a >> s) & 255) as i64 - ((b >> s) & 255) as i64).sum::<i64>();
+        // OLD (desktop.rs before WINEDGE), literally: prev starts at i64::MAX and `prev + 3` wraps.
+        let mut old = true; let mut prev = i64::MAX; let mut first = 0i64;
+        for (n, y) in (fy + bh..(fy + bh + bot).min(ph)).enumerate() {
+            let dk = dark_of(wall[y * pw + mx], shade(y, mx));
+            if n == 0 { first = dk; }
+            if dk > prev.wrapping_add(3) || dk < 0 { old = false; }
+            prev = dk;
+        }
+        if bot == 0 || first <= 0 || prev > 3 { old = false; }
+        // NEW: the cast's own ramp at (mx, y1 + n), and the painted pixel equal to the shade of every cast there.
+        let c = &casts[2];
+        let mut ramp = vec![];
+        for n in 0..bot { let mut a = 0; c.for_each_alpha(c.y1 + n as i32, mx as i32, mx as i32 + 1, |_, al| a = al); ramp.push(a); }
+        let mono = ramp.windows(2).all(|w| w[1] <= w[0]);
+        let new = ramp[0] > 0 && mono && ramp[bot - 1] <= 2;
+        let d0 = dark_of(wall[(fy + bh) * pw + mx], shade(fy + bh, mx));
+        let dl = dark_of(wall[(fy + bh + bot - 1) * pw + mx], shade(fy + bh + bot - 1, mx));
+        println!("s2={} dark={} bot={} old_clause={} (first={} last={}) new_clause={} ramp_a={}/{} ramp_dark={}/{} mono={}",
+            s2, dark as u8, bot, if old { "ok" } else { "FAIL" }, first, prev, if new { "ok" } else { "FAIL" }, ramp[0], ramp[bot - 1], d0, dl, mono);
+    }}
+}

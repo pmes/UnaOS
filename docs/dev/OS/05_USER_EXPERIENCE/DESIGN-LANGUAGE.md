@@ -397,6 +397,16 @@ the Pi on a TV.
 The window-control discs are 12 pt to the eye but answer **20 pt hit boxes** (the macOS minimum control size [S1]).
 The resize edge is an invisible 6 pt band outside the window plus the 12 pt corner squares.
 
+**AMENDMENT 2026-10-13 — A WINDOW HAS A VISIBLE EDGE** (WINEDGE, rmbp-ledger B659). Peter, flight 35, on the
+frameless window with only the outside shadow (DESIGNAPPLY B639): *"new prefs panel looking very nice. new borders not
+so much."* The shadow alone does not read as a window's edge. So every window carries a **1-device-px hairline round
+the whole box at every scale** — `line.strong` on Light, `line.subtle` on Dark (§2.3's roles; `wm::desktop::edge_ink`,
+never a literal) — opaque, INSIDE the box (its outermost column each side, its last row, and the rounded head's
+stroke): the content is painted first and the edge over it, so the content cannot hide it. The shadow
+(§2.4) still starts on the first pixel outside the box, and the resize band above stays outside it, invisible. This
+replaces §3.1's "`line.strong` @ 60 % (light); `rim.dark` inside (dark)" outline for windows (overlays keep
+`rim.dark`). Peter's eyes on the next staged screenshot decide whether this edge is the one he asked for.
+
 ---
 
 ## 3. THE COMPONENT CATALOGUE
@@ -410,7 +420,7 @@ token. Every state follows §2.7, and every motion follows §2.6.
 |---|---|---|
 | Title bar | 32 tall. Unified title + toolbar 52 | 32 tall [S46]. Toolbar below, 44 |
 | Body | `surface.window`, radius 12, `elev.3` / `elev.3i` | `surface.window`, radius 8, `elev.3` / `elev.3i` |
-| Outline | 1 device px `line.strong` @ 60 % (light); `rim.dark` inside (dark) | same |
+| Outline | the EDGE (§2.9, amended 2026-10-13): 1 device px `line.strong` (light) / `line.subtle` (dark), opaque, round the whole box. Was `line.strong` @ 60 % / `rim.dark` | Softy's own 1 px border (`softy::chrome`) |
 | Title text | `type.body-strong`, centred, `text.primary` (focused) / `text.tertiary` (unfocused), ellipsis | `type.body`, left at 12 after a 16 app icon at 12 from the edge (Windows' 16 px icon-to-title [S46]) |
 | Controls | Three **discs** top-left, Ø 12, 8 apart edge to edge, first at 12 from the edge, centred in the bar; 20 hit boxes. Fills close/min/zoom (§2.3). Unfocused: all three `line.strong`. Hover on the group shows glyphs ×, −, and two diagonal arrows, at 1.25 stroke, black @ 50 % | Three **caption buttons** top-right, 46×32 each (*via search* [S46]): minimise, maximise/restore, close. Glyphs 10, 1 pt stroke. Hover + 6 %. Close hover `status.critical` fill, white glyph. The maximise button opens **snap layouts** on hover (Windows idiom [S80b]) |
 | Maximized / snapped | square corners, no shadow (`winsnap.rs`) | same |
