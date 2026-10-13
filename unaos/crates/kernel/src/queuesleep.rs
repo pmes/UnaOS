@@ -136,18 +136,18 @@ fn run(via: &str) {
         return;
     }
     // The idle window: nothing synthetic, the stamps read what the machine does on its own.
-    lag::qs_window_reset();
+    lag::qs_window_reset(); let busy0 = Busy::now(); let mut held: Option<(alloc::string::String, &'static str)> = None; // QUEUESLEEP2 (B557): the window's operator traffic, and the holder named AT the worst sample (same-line fold)
     let t0 = crate::arch::ms();
     let mut q_seen = 0u64;
     while crate::arch::ms().saturating_sub(t0) < IDLE_S * 1000 {
         sleep_ms(100);
-        q_seen = q_seen.max(lag::qs_queue_now_us());
+        let s = lag::qs_queue_now_us(); if s > q_seen { q_seen = s; held = Some(lag::qs_queue_word(0)); } // QUEUESLEEP2 (B557): the word is read WHILE the key sits, not after the window
         watch_stamp();
     }
     let (pump, q_us, xgap_us, busy, nap_us) = lag::qs_window();
     let q_us = q_us.max(q_seen).max(lag::qs_queue_now_us());
     let (p_us, p_step, p_code) = lag::qs_unpack(pump);
-    let (q_what, q_wait) = lag::qs_queue_word(0);
+    let (e_what, e_wait) = lag::qs_queue_word(0); let traffic = Busy::now().since(&busy0); let (q_what, q_wait) = held_word(&held, q_seen, q_us); // QUEUESLEEP2 (B557): `queue_end` is the old verdict-time reading (the render loop's idle end state)
     // One key through the synthetic door; the router's stamp says when the whole path took it.
     let t = lag::qs_probe_arm();
     crate::pal::push_event(crate::pal::Event::KeyUp(lag::PROBE_KEY));
@@ -164,9 +164,9 @@ fn run(via: &str) {
     let worst = if queue_ms > pump_ms && queue_ms > BOUND_MS { q_wait } else { lag::wait_name(p_code) };
     let (tw_what, tw_wait) = if done == 0 { lag::qs_queue_word(0) } else { (alloc::string::String::from("-"), "-") };
     serial_println!(
-        ":: QUEUESLEEP: idle_s={} wake_ms={} pump_max_ms={} queue_max_ms={} pump_wait_worst={} -> {} :: bound_ms={} pump_what_worst={} xhci_poll_gap_max_ms={} claim_busy={} nap_max_ms={} queue_what={} queue_wait={} timeout_what={} timeout_wait={} via={}",
+        ":: QUEUESLEEP: idle_s={} wake_ms={} pump_max_ms={} queue_max_ms={} pump_wait_worst={} -> {} :: bound_ms={} pump_what_worst={} xhci_poll_gap_max_ms={} claim_busy={} nap_max_ms={} queue_what={} queue_wait={} timeout_what={} timeout_wait={} via={} queue_end={}/{} {}",
         IDLE_S, WakeWord(wake_ms), pump_ms, queue_ms, worst, if verdict(wake_ms, pump_ms, queue_ms) { "PASS" } else { "FAIL" },
-        BOUND_MS, lag::qs_step_name(p_step), xgap_us / 1000, busy, nap_us / 1000, q_what, q_wait, tw_what, tw_wait, via
+        BOUND_MS, lag::qs_step_name(p_step), xgap_us / 1000, busy, nap_us / 1000, q_what, q_wait, tw_what, tw_wait, via, e_what, e_wait, traffic
     );
     RUNNING.store(false, Ordering::Release);
 }
@@ -178,5 +178,66 @@ impl core::fmt::Display for WakeWord {
             Some(ms) => write!(f, "{}", ms),
             None => write!(f, "timeout"),
         }
+    }
+}
+
+// QUEUESLEEP2 (rmbp-ledger B557) — the measurement, made to say what it saw. FILE TAIL, so no line above moves.
+// Flight 33 (FLIGHT33.md §3) read `queue_max_ms=73 queue_what=render@shell-present queue_wait=hlt pump_what_worst=prtscr`
+// and the window was NOT idle: Cmd-Shift-3 at +9 s (`PRTSCR: chord=cmd-shift-3 -> capture armed`, the PRTSCR-VOL ladder
+// and its refusal on the pump: the 23 ms `prtscr` step) and two dock presses at +26 s (Quarry's launch, `handler=console-launch
+// handler_ms=496`, and the raise press behind it, `[lag] click→window-shown ms=121.5 queue=73.0`). `queue_what` was read
+// ONCE, after the window, so it named the render loop's idle END state (parked after its last mark, `shell-present`), never
+// the step that held the 73 ms. Now: the word is taken at the worst in-flight sample (`held`), `queue_end=` keeps the old
+// reading, and `window=idle|busy` with the operator's own traffic over the 30 s says whether the window measured an idle
+// desktop at all (R103 §2: this fixture's premise). The verdict rule is unchanged.
+
+/// The window's operator traffic, as the counters already kept elsewhere read it.
+struct Busy {
+    keys: u64,
+    ptr: u64,
+    chords: u32,
+    stalls: u32,
+}
+
+impl Busy {
+    fn now() -> Busy {
+        let (ptr, keys, _, _, _) = crate::pal::event_queue_stats();
+        Busy { keys, ptr, chords: crate::video::prtscr::census().0, stalls: lag::handler_stalls() }
+    }
+
+    fn since(&self, t0: &Busy) -> Busy {
+        Busy {
+            keys: self.keys.wrapping_sub(t0.keys),
+            ptr: self.ptr.wrapping_sub(t0.ptr),
+            chords: self.chords.wrapping_sub(t0.chords),
+            stalls: self.stalls.wrapping_sub(t0.stalls),
+        }
+    }
+
+    /// No key, pointer report, capture chord or render-handler stall second in the window. Pure.
+    fn idle(&self) -> bool {
+        self.keys == 0 && self.ptr == 0 && self.chords == 0 && self.stalls == 0
+    }
+}
+
+impl core::fmt::Display for Busy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "window={} keys={} ptr={} capture_chords={} handler_stalls={}",
+            if self.idle() { "idle" } else { "busy" },
+            self.keys, self.ptr, self.chords, self.stalls
+        )
+    }
+}
+
+/// `(queue_what, queue_wait)`: the word read at the worst in-flight sample when that sample IS the window's queue max
+/// (`seen_us >= max_us`); `unsampled` when the worst key finished between two 100 ms samples (its holder was never
+/// observed in flight — `queue_end` and the `[lag] stall` line of that second name it); `-` for an empty window.
+fn held_word(held: &Option<(alloc::string::String, &'static str)>, seen_us: u64, max_us: u64) -> (alloc::string::String, &'static str) {
+    match held {
+        Some((w, c)) if seen_us >= max_us => (w.clone(), c),
+        _ if max_us == 0 => (alloc::string::String::from("-"), "-"),
+        _ => (alloc::string::String::from("unsampled"), "-"),
     }
 }
