@@ -43,6 +43,7 @@ pub mod idl;
 pub mod loader;
 pub mod range;
 pub mod reflect;
+mod reflect_table;
 pub mod traversal;
 pub mod net;
 pub mod window;
