@@ -413,7 +413,7 @@ refs/heads/exec-rmbp-splashword2              f416f182 FOLDED-BY-HAND 2996a71c 2
 refs/heads/exec-rmbp-dockpins                 8fae9ef3 FOLDED-BY-HAND 023b318d 2026-10-13
 refs/heads/exec-rmbp-usbnetrx2                36f2e5b7 FOLDED-BY-HAND d72be074 2026-10-13
 refs/heads/exec-rmbp-aetherptr2               abcb8d33 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-rmbp-cursorarm                abcb8d33 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-cursorarm                ed9d3384 FOLDED-BY-HAND 0cbfe003 2026-10-13
 refs/heads/exec-rmbp-bootlogcard              6372ae0d FOLDED-BY-HAND da5885ed 2026-10-13
 refs/heads/exec-rmbp-cursorshape              abcb8d33 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-jobscan2                 1a9eaeb7 FOLDED-BY-HAND ceaecdc7 2026-10-13
