@@ -37,16 +37,32 @@
 //! `gf100_gr_init_csdata`) — nouveau's own falcon code, not these files; it is not used. The golden context
 //! (`gf100_grctx_generate`, ctxgf100.c:1436-1558, with gk104's lists in ctxgk104.c) needs `gk104_gr_init` first and
 //! is the next rung; until it exists `kgr` gates the SET_OBJECT with `reason=no-golden-context`.
+//! KEPLERGOLD (B656, R127) built that rung as `kepler_ctx.rs`: `golden()` below is its runtime verdict.
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::super::kepler::{fecs_read, fecs_write, mmio_write};
 
-/// Whether this tree generates a golden context image for the GR channel (`gf100_grctx_generate`, ctxgf100.c:1436-1558).
-/// It does not yet (keplerucode.md §3): `kgr` gates the SET_OBJECT on this, so KEPLERGR4's push never runs against an
-/// instance block whose GR context pointer (0x210) is 0. The generator's arc flips it.
-pub const GOLDEN_CONTEXT: bool = false;
+/// KEPLERGOLD (B656): the golden context is a RUNTIME verdict, no longer a constant. `kepler_ctx::generate`
+/// (`gf100_grctx_generate`, ctxgf100.c:1436-1558) sets it only after FECS saved the image and the channel's context was
+/// bound at the instance block's 0x210; `kgr` gates the SET_OBJECT on `golden()`, so KEPLERGR4's push never runs
+/// against an instance block whose GR context pointer is 0.
+static GOLDEN_VA: AtomicU64 = AtomicU64::new(0);
+static GOLDEN_SIZE: AtomicU32 = AtomicU32::new(0);
+
+/// `(channel context VA, image size)` once this boot generated and bound a golden context, else `None`.
+pub fn golden() -> Option<(u64, u32)> {
+    let s = GOLDEN_SIZE.load(Ordering::Acquire);
+    if s == 0 { None } else { Some((GOLDEN_VA.load(Ordering::Acquire), s)) }
+}
+
+/// Called by `kepler_ctx::generate` alone, after the save and the channel bind.
+pub fn set_golden(va: u64, size: u32) {
+    GOLDEN_VA.store(va, Ordering::Release);
+    GOLDEN_SIZE.store(size, Ordering::Release);
+}
 
 /// `(role, file)` — the pin roles and the names nouveau requests behind NvGrUseFW (gr/gf100.c:2603-2606).
 pub const SET: [(&str, &str); 4] = [
@@ -288,7 +304,8 @@ fn hz() -> u64 {
 }
 
 /// Poll `f` until it returns `Some` or `budget_us` passes. Returns the value and the microseconds it took.
-fn poll<T>(budget_us: u64, mut f: impl FnMut() -> Option<T>) -> Option<(T, u64)> {
+/// `kepler_ctx` (KEPLERGOLD) polls through this one too.
+pub(super) fn poll<T>(budget_us: u64, mut f: impl FnMut() -> Option<T>) -> Option<(T, u64)> {
     let (t0, lim) = (crate::arch::now_cycles(), hz().saturating_mul(budget_us) / 1_000_000);
     loop {
         let dt = crate::arch::now_cycles().saturating_sub(t0);

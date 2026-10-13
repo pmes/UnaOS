@@ -2584,6 +2584,12 @@ pub mod gr4;
 #[path = "kepler_ucode.rs"]
 pub mod ucode;
 
+/// KEPLERGOLD (rmbp-ledger B656, R119 + R127) — the GR golden context generator (`gf100_grctx_generate` for gk104) run
+/// once after the ucode's ext start, before any channel is bound; `kgr` below is its only caller. Same gate as `kgr`.
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+#[path = "kepler_ctx.rs"]
+pub mod ctx;
+
 #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
 pub mod kgr {
     use super::host as kf;
@@ -2642,6 +2648,8 @@ pub mod kgr {
     static BAR0: AtomicUsize = AtomicUsize::new(0);
     static BAR1: AtomicUsize = AtomicUsize::new(0);
     static WIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// KEPLERGOLD: the golden context's own window (`ctx::GOLD_SPAN`: image, channel copy, bundle, pagepool, attrib_cb).
+    static GOLD: AtomicUsize = AtomicUsize::new(usize::MAX);
     static GR_RL: AtomicU32 = AtomicU32::new(kf::NONE);
     static GR_ENG: AtomicU32 = AtomicU32::new(kf::NONE);
     static GR_RST: AtomicU32 = AtomicU32::new(kf::NONE);
@@ -2684,16 +2692,54 @@ pub mod kgr {
         if let Some(w) = w {
             WIN.store(w, Release);
         }
+        let g = vram.alloc(super::ctx::GOLD_SPAN);
+        if let Some(g) = g {
+            GOLD.store(g, Release);
+        }
         crate::tests::register("kgr", tests_kgr);
         serial_println!(
-            "[kgr] armed chid={} rl={} eng={} reset={} win={} -> tests kgr (destructive: alone, once, after the CE leg)",
+            "[kgr] armed chid={} rl={} eng={} reset={} win={} gold={} -> tests kgr (destructive: alone, once, after the CE leg)",
             kf::CHID_GR, opt(GR_RL.load(Relaxed)), opt(GR_ENG.load(Relaxed)), opt(GR_RST.load(Relaxed)),
-            w.map_or(alloc::string::String::from("none"), |w| alloc::format!("{:#x}", w))
+            w.map_or(alloc::string::String::from("none"), |w| alloc::format!("{:#x}", w)),
+            g.map_or(alloc::string::String::from("none"), |g| alloc::format!("{:#x}", g))
         );
     }
 
-    fn witness(bind: &str, get: u32, nop: &str, setobj: &str, method: &str, verdict: &str) {
-        serial_println!(":: KGR: bind={} ramfc_get={} nop={} setobj={} method={} -> {} ::", bind, get, nop, setobj, method, verdict);
+    /// KEPLERGOLD (B656): the head words `fw= ext-start= golden= set-object=` name the firmware, its start, the golden
+    /// context and the SET_OBJECT; KEPLERGR's words follow unchanged (no spec pins this line: `unaos/scripts/specs` read).
+    fn witness(gw: &Gold, bind: &str, get: u32, nop: &str, setobj: &str, method: &str, verdict: &str) {
+        serial_println!(
+            ":: KGR: fw={} ext-start={} golden={} set-object={} bind={} ramfc_get={} nop={} setobj={} method={} -> {} ::",
+            gw.fw, gw.ext, gw.golden, setobj, bind, get, nop, setobj, method, verdict
+        );
+    }
+
+    /// The firmware / start / golden words of the witness head.
+    struct Gold {
+        fw: alloc::string::String,
+        ext: alloc::string::String,
+        golden: alloc::string::String,
+    }
+    impl Gold {
+        fn none() -> Self {
+            Gold { fw: "-".into(), ext: "-".into(), golden: "-".into() }
+        }
+        /// `uc` = `ucode::load_and_start`'s outcome; the staging refusals (ucode `stage`) are fw words, the rest
+        /// ext-start words. `g` = the generator's outcome (`None` = not attempted).
+        fn of(uc: &Result<u32, alloc::string::String>, g: &Option<Result<u32, alloc::string::String>>) -> Self {
+            const STAGING: [&str; 6] = ["absent", "unpinned", "pin-mismatch", "size", "unreadable", "no-esp"];
+            let (fw, ext) = match uc {
+                Ok(_) => ("MATCH".into(), "ok".into()),
+                Err(w) if STAGING.contains(&w.as_str()) => (w.clone(), "-".into()),
+                Err(w) => ("MATCH".into(), w.clone()),
+            };
+            let golden = match g {
+                None => "-".into(),
+                Some(Ok(sz)) => alloc::format!("ok(size={:#x})", sz),
+                Some(Err(why)) => alloc::format!("refused({})", why),
+            };
+            Gold { fw, ext, golden }
+        }
     }
 
     /// The GR rung's outcome: the two witness words, the verdict (`PASS` or `DECLINED reason=...`), and
@@ -2782,12 +2828,13 @@ pub mod kgr {
                 };
             }
         };
-        // KEPLERUCODE (B637): FECS reads running. Nouveau never names a GR object before a golden context image
-        // exists for the channel (gf100.c:440-443; `gf100_grctx_generate`, ctxgf100.c:1436-1558, writes the instance
+        // KEPLERUCODE (B637): FECS reads running. KEPLERGOLD (B656): `ucode::golden()` is `Some` only when `ctx::generate`
+        // saved the image and bound the channel's context at 0x210 this boot. Nouveau never names a GR object before a
+        // golden context image exists for the channel (gf100.c:440-443; `gf100_grctx_generate`, ctxgf100.c:1436-1558, writes the instance
         // block's 0x210/0x214 context pointer at :1488-1489 and asks FECS to save the image at :1531). This tree has
         // no generator yet (keplerucode.md §3), and the instance block's ctx210 is 0 — so the SET_OBJECT is GATED,
         // never pushed, whether FECS runs our firmware (`ucode=running`) or was found running some other way.
-        if !super::ucode::GOLDEN_CONTEXT {
+        if super::ucode::golden().is_none() {
             let why = if uc.is_ok() { "no-golden-context" } else { "fecs-running-without-our-ucode" };
             serial_println!("[kgr] setobj class={:04X} subch={} -> gated({}; ctx210={:08X})", class, GR_SUBCH, why, vr(inst + INST_GR_CTX));
             return GrOut {
@@ -2884,7 +2931,7 @@ pub mod kgr {
     /// does not land, or lands without the method executing, is unwound).
     pub fn tests_kgr() {
         let refuse = |why: &str| {
-            witness(&alloc::format!("refused({})", why), 0, "-", "-", "-", "REFUSED");
+            witness(&Gold::none(), &alloc::format!("refused({})", why), 0, "-", "-", "-", "REFUSED");
             super::gr4::witness("-", "-", 0, "-", "-", "-", "REFUSED");
         };
         if RAN.swap(true, AcqRel) {
@@ -2935,6 +2982,18 @@ pub mod kgr {
             vw(w + K_PT + (p >> 12) * 8 + 4, e1);
             p += 0x1000;
         }
+        // KEPLERGOLD (B656): the GOLD window mapped identity under the same PDE[0], when it lies inside its span.
+        let gold = GOLD.load(Acquire);
+        let gold_mapped = gold != usize::MAX && gold + super::ctx::GOLD_SPAN <= span;
+        if gold_mapped {
+            let mut p = gold;
+            while p < gold + super::ctx::GOLD_SPAN {
+                let (e0, e1) = kf::pte(p as u64, false);
+                vw(w + K_PT + (p >> 12) * 8, e0);
+                vw(w + K_PT + (p >> 12) * 8 + 4, e1);
+                p += 0x1000;
+            }
+        }
         let inst = w + K_INST;
         kf::ramfc_write(&vw, inst, userd, w + K_GPFIFO, GP_LOG2, kf::CHID_GR);
         kf::inst_pd(&vw, inst, w + K_PD);
@@ -2951,6 +3010,22 @@ pub mod kgr {
         // end of GR init, ahead of every channel: gf100.c:2463), the pinned FW/KEPLER set is uploaded and started.
         // A set that is absent or unpinned writes nothing and the rung reads exactly as KEPLERGR4 left it.
         let uc = super::ucode::load_and_start(bar0);
+        // KEPLERGOLD (B656): with the firmware answering, the golden context is generated ONCE, before any channel is
+        // bound (nouveau: `gf100_gr_chan_new` -> `gf100_grctx_generate`, after `gf100_gr_init_ctxctl_ext`). It binds this
+        // channel's instance block to FECS for the save and leaves 0x210 pointing at the channel's copy of the image.
+        let golden_out = match &uc {
+            Ok(sz) if gold == usize::MAX => {
+                serial_println!("[kgr] ctx stage=window rows=0 ctx_size={:#x} -> refused(no-gold-window)", sz);
+                Some(Err(alloc::string::String::from("no-gold-window")))
+            }
+            Ok(sz) if !gold_mapped => {
+                serial_println!("[kgr] ctx stage=window rows=0 ctx_size={:#x} gold={:#x} span={:#x} -> refused(gold-beyond-pde0)", sz, gold, span);
+                Some(Err(alloc::string::String::from("gold-beyond-pde0")))
+            }
+            Ok(sz) => Some(super::ctx::generate(bar0, vw, vr, inst, gold, *sz)),
+            Err(_) => None,
+        };
+        let gw = Gold::of(&uc, &golden_out);
         let Some(io) = kf::fifo_init(bar0, utab, rl, &mut pre) else {
             let mut r = alloc::string::String::new();
             let _ = pre.restore(bar0, &mut r); // nothing bound yet: only the preamble's PMC + 0x204 pre-images to put back
@@ -3044,12 +3119,12 @@ pub mod kgr {
         };
         match gr {
             Some(g) => {
-                witness(&bname, core::cmp::max(ugt, ramfc_get), nop, &g.setobj, &g.method, &g.verdict);
+                witness(&gw, &bname, core::cmp::max(ugt, ramfc_get), nop, &g.setobj, &g.method, &g.verdict);
                 let cls = alloc::format!("0x{:04X}", super::gr4::CLASS);
                 super::gr4::witness(&cls, &g.k4_setobj, super::gr4::BYTES, &g.k4_landed, pa.word(), &g.k4_fecs, &g.k4_verdict);
             }
             None => {
-                witness(&bname, core::cmp::max(ugt, ramfc_get), nop, "-", "-", verdict);
+                witness(&gw, &bname, core::cmp::max(ugt, ramfc_get), nop, "-", "-", verdict);
                 let why = alloc::format!("DECLINED reason=kgr-{}", verdict.to_ascii_lowercase());
                 super::gr4::witness("-", "-", 0, "-", pa.word(), "-", &why);
             }
