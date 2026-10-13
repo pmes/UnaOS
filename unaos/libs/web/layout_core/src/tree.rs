@@ -1267,7 +1267,7 @@ fn reresolve_font_relative<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>,
         } else {
             (fs * 0.5, fs * 0.5)
         };
-        let cx = ParseCx { viewport, font: (fs, root_fs, ex, ch) };
+        let cx = ParseCx { viewport, font: (fs, root_fs, ex, ch), container: (None, None) };
         let spec: SpecifiedStyle<H> = css::reapply_declarations(&decls, &cx);
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();
@@ -1637,6 +1637,11 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
     if has_tables && table::fix_rowspans(tree) {
         run_pass(tree);
     }
+    // AETHERSTYLE3B (SR115): container-relative lengths resolve against the query containers this layout
+    // sized (css-contain-3 §6.1), then the tree lays out again.
+    if reresolve_container_units(tree, &elem_info, root_fs, fonts) {
+        run_pass(tree);
+    }
     // AETHERSTYLE3 (SR103): a block multicol container lays its in-flow children out in ONE column of the
     // used column width (css-multicol-1 §3.4); they keep their content height (no shrinking into it). The
     // IFC-root multicol container narrows its own lines in `inline::layout_root`.
@@ -1835,6 +1840,71 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
     crate::writing::restore(tree, writing_saved);
     collapse::restore(tree, collapsed);
     blockwidth::restore(tree, widths);
+}
+
+/// AETHERSTYLE3B (SR115): every element holding a container-relative length re-applies its length
+/// declarations (cascade order, `PaintStyle::font_rel`) with the content-box size of its query containers as
+/// laid out now: the nearest ancestor whose `container-type` gives a width (`size`, `inline-size`) for
+/// cqw / cqi, the nearest that gives a height (`size`) for cqh / cqb; its own font for em / ex / ch. `true`
+/// when any element did.
+fn reresolve_container_units<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, elems: &NodeMap<TextRun>, root_fs: f32, fonts: &F) -> bool {
+    let todo: Vec<(taffy::NodeId, Vec<(String, String)>)> = tree
+        .paint_map
+        .iter()
+        .filter_map(|(id, p)| {
+            let list = p.font_rel.as_ref()?;
+            list.iter().any(|(_, v)| css::is_container_relative(v)).then(|| (*id, list.clone()))
+        })
+        .collect();
+    if todo.is_empty() {
+        return false;
+    }
+    let viewport = ParseCx::new(tree.viewport.0, tree.viewport.1).viewport;
+    for (id, decls) in todo {
+        let (mut qw, mut qh) = (None, None);
+        let mut cur = tree.taffy.parent(id);
+        while let Some(p) = cur {
+            let ty = tree.paint_map.get(&p).and_then(|s| s.container_type).unwrap_or(0);
+            if ty != 0 {
+                if let Ok(l) = tree.taffy.layout(p) {
+                    if qw.is_none() {
+                        qw = Some((l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right).max(0.0));
+                    }
+                    if qh.is_none() && ty == 1 {
+                        qh = Some((l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom).max(0.0));
+                    }
+                }
+            }
+            if qw.is_some() && qh.is_some() {
+                break;
+            }
+            cur = tree.taffy.parent(p);
+        }
+        let font = match elems.get(&id) {
+            Some(run) => {
+                let fs = run.font_size;
+                let (ex, ch) = if fonts.has_face(run.sel()) {
+                    let ex = fonts.x_height(run.sel(), fs);
+                    (if ex > 0.0 { ex } else { fs * 0.5 }, fonts.measure("0", &Adv::new(run.sel(), fs, 0.0)))
+                } else {
+                    (fs * 0.5, fs * 0.5)
+                };
+                (fs, root_fs, ex, ch)
+            }
+            None => ParseCx::default().font,
+        };
+        let cx = ParseCx { viewport, font, container: (qw, qh) };
+        let spec: SpecifiedStyle<H> = css::reapply_declarations(&decls, &cx);
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            spec.fold_into(&mut st);
+            let _ = tree.taffy.set_style(id, st);
+        }
+        if let Some(p) = tree.paint_map.get_mut(&id) {
+            css::merge_paint(p, &spec.paint);
+        }
+    }
+    true
 }
 
 /// True for a box the host's generated-content pass made (a detached element standing in the box tree).

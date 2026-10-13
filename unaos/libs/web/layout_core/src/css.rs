@@ -21,11 +21,15 @@ use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPe
 pub struct ParseCx {
     pub viewport: (f32, f32),
     pub font: (f32, f32, f32, f32),
+    /// AETHERSTYLE3B (SR115): the query container's content-box (width, height) for the container-relative
+    /// units (css-contain-3 §6.1: cqw / cqi on the nearest container with a width, cqh / cqb on the nearest
+    /// with a height; None = the small viewport's axis). `remeasure` fills it per element after a first layout.
+    pub container: (Option<f32>, Option<f32>),
 }
 
 impl Default for ParseCx {
     fn default() -> Self {
-        ParseCx { viewport: (800.0, 600.0), font: (16.0, 16.0, 8.0, 8.0) }
+        ParseCx { viewport: (800.0, 600.0), font: (16.0, 16.0, 8.0, 8.0), container: (None, None) }
     }
 }
 
@@ -912,10 +916,8 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         "text-orientation" => match value {
             "mixed" => style.paint.text_orientation = Some(0),
-            "upright" => {
-                style.paint.text_orientation = Some(1);
-                H::record_css("text-orientation-value:upright");
-            }
+            // AETHERSTYLE3B (SR115): painted upright (`writing::upright`).
+            "upright" => style.paint.text_orientation = Some(1),
             "sideways" | "sideways-right" => style.paint.text_orientation = Some(2),
             _ => {}
         },
@@ -2713,6 +2715,29 @@ pub fn is_font_relative(value: &str) -> bool {
     false
 }
 
+/// AETHERSTYLE3B (SR115): a value holding a container-relative length (cqw, cqh, cqi, cqb, cqmin, cqmax).
+pub fn is_container_relative(value: &str) -> bool {
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() || (b[i] == b'.' && b.get(i + 1).is_some_and(|c| c.is_ascii_digit())) {
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if matches!(value[start..i].to_ascii_lowercase().as_str(), "cqw" | "cqh" | "cqi" | "cqb" | "cqmin" | "cqmax") {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Properties whose value can be a length: their declarations are kept in
 /// cascade order (`PaintStyle::font_rel`) so the font-relative ones can be
 /// re-resolved against the element's own font.
@@ -2822,8 +2847,13 @@ pub fn parse_px(value: &str, cx: &ParseCx) -> Option<f32> {
 pub fn parse_viewport_length(v: &str, cx: &ParseCx) -> Option<f32> {
     let v = v.trim();
     let (vw, vh) = cx.viewport;
+    // AETHERSTYLE3B (SR115): the container-relative units (css-contain-3 §6.1), the small viewport's axis
+    // when no container answers (horizontal writing: cqi = cqw, cqb = cqh).
+    let (qw, qh) = (cx.container.0.unwrap_or(vw), cx.container.1.unwrap_or(vh));
     // Longest suffixes first: `dvh` must not be read as `vh` with a stray d.
     for (unit, basis) in [
+        ("cqmin", qw.min(qh)), ("cqmax", qw.max(qh)),
+        ("cqw", qw), ("cqi", qw), ("cqh", qh), ("cqb", qh),
         ("dvmin", vw.min(vh)), ("svmin", vw.min(vh)), ("lvmin", vw.min(vh)),
         ("dvmax", vw.max(vh)), ("svmax", vw.max(vh)), ("lvmax", vw.max(vh)),
         ("vmin", vw.min(vh)), ("vmax", vw.max(vh)),
