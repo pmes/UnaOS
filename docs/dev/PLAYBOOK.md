@@ -44,6 +44,9 @@ worktree `../UnaOS` (main), tracks `../UnaOS-orin` (hw-jetson), `../UnaOS-hw-pi4
    `./arroyo gates` rc=0 on the merged tree (GATE-GATEPATH), the fold's knob line in front of it.
    `./arroyo foldleg` rc=0 on the merged tree (FOLDBUILD, B517): the x86 kernel + loader built under
    `unaos/scripts/image-line.env`, a fold leg beside the compile legs; the STATE cites the line as `image-line.env @<sha>`.
+   `./arroyo twoboot` on the merged tree beside `foldleg` (TWOBOOT, B526): the image line BOOTED twice under QEMU — boot 1
+   on a fresh volume through the first-user form to `[desktop] built` + services, boot 2 of the same image on the same
+   volume to the login screen; quote its `TWOBOOT: … -> PASS|FAIL` line (a FAIL quotes the last serial line) in the merge.
 3. Commit the merge with a message that carries the executor's rc list. One fold gate on the WHOLE fold
    before any card (R38), not one per branch.
 

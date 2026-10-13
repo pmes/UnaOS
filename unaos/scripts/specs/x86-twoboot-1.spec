@@ -1,0 +1,30 @@
+# x86-twoboot-1.spec — TWOBOOT (rmbp-ledger B526), BOOT 1 of the two-boot fold leg: a FRESH volume, no user, the
+# first-user form typed by the leg's QMP typist, through `[login] desktop bare` to the desktop and its services.
+#
+#   QEMU gate:  ./arroyo twoboot   (arroyo names this file in its `twoboot)` case, so GATE-SPECROOTS resolves it GATED)
+#               → unaos/target/twoboot-1.log; the builder's `qemu_test_wall` stops reading at this file's COMPLETE
+#               marker (FASTTEST) and `scripts/twoboot.sh` judges the capture.
+#
+# WHY. Flight 29's boot 1 (FLIGHT29.md §2, SESSIONWEDGE B525): the first user was created, `[boot] phase=desktop
+# from=setter why=session` printed, `[login] desktop bare: furniture=none (R88) why=sessio` was CUT MID-WORD and the
+# kernel printed nothing more — no `[desktop] built`, no `[boot] services up`. `./arroyo test` boots once with no user
+# and never reaches this path; this file is the end of the path that wedged. Every line below was read off the kernel's
+# own print sites on this tree (fs/users.rs, video/login.rs, loginfurn.rs, video/desktopbuild.rs, boot.rs) and off
+# f29-boot1.log, never invented.
+#
+# The leg's typist types `una` / `correct-horse` twice into the form (the store's first user, the administrator: R100).
+
+# The Installer stage on the fresh volume, and the form the typist types into.
+REQUIRE :: FIRSTBOOT: stage=installer root=locked users=0 desktop_ignited=false why=store-loaded -> coherent ::
+REQUIRE \[login\] installer: first-user form open
+REQUIRE \[login\] key taken by the screen
+# The first user, written to the volume — boot 2 stands on this row.
+REQUIRE \[login\] installer: create-user user=una id=\d+ home_created=true
+REQUIRE \[login\] session open user=una role=admin
+REQUIRE \[boot\] phase=desktop from=setter why=session
+REQUIRE \[login\] desktop bare: furniture=none \(R88\) why=session
+# SESSIONWEDGE's missing lines: the desktop object built, then the services.
+REQUIRE \[desktop\] built at=
+FORBID :: LOGIN: users\+session -> FAIL
+FORBID :: FIRSTBOOT: .* -> incoherent
+COMPLETE \[boot\] services up first=
