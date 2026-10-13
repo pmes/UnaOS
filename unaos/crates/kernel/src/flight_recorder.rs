@@ -427,7 +427,7 @@ pub fn service() { #[cfg(feature = "unafs")] if worker::off_this_task() { return
     crate::serial_ring::mirror_service(); #[cfg(target_arch = "x86_64")] crate::fs::removable::service(); // USBSTOR (B384): pin the boot medium, then mount/unmount removable disks on a registry change — unmasked, lock-free, ahead of the storage gate (a machine whose only disk is the internal card has no global slot).
 
     if crate::drivers::block::info().is_none() {
-        #[cfg(feature = "unafs")] worker::hand(); return; // PUMPHOLE (B541): hand the body to the `flightrec` worker HERE too — on a machine whose only disk is the internal card the global slot stays empty for the whole boot (flight 32: no FRGUARD slot verdict, no `[flight] service` line, `fr=inline`), so the hand below `divert` never ran and this body (mirror_service + USBSTOR) stayed on the hid pump's core (`usb-pump:flight-recorder` 209 ms). LINE-NEUTRAL fold, code first. Storage not up yet — nothing to flush to
+        #[cfg(feature = "unafs")] worker::hand(); #[cfg(feature = "unafs")] worker::card_bootlog(); return; // BOOTLOGCARD (B549): on that same card-only boot the boot log goes to /var/log/boot-<n>.log on the UnaFS root from the `flightrec` worker only (never the pump, never the FAT). PUMPHOLE (B541): hand the body to the `flightrec` worker HERE too — on a machine whose only disk is the internal card the global slot stays empty for the whole boot (flight 32: no FRGUARD slot verdict, no `[flight] service` line, `fr=inline`), so the hand below `divert` never ran and this body (mirror_service + USBSTOR) stayed on the hid pump's core (`usb-pump:flight-recorder` 209 ms). LINE-NEUTRAL fold, code first. Storage not up yet — nothing to flush to
     }
 
     // FRGUARD (GR21): derive the boot-medium verdict before asking for it. This is THE unmasked,
@@ -687,6 +687,17 @@ mod worker {
         };
         crate::arch::sched::spawn("flightrec", run, 0, c, crate::arch::sched::PRIO_NORMAL);
         serial_println!("[flight] service on=worker cpu={} pace_ms={} hid_pump_cpu={} (POINTERFEEL: the flight-recorder step leaves the hid pump's core) ::", c, PACE_MS, pump);
+    }
+
+    /// BOOTLOGCARD (rmbp-ledger B549): the boot-log flush for a boot with no global slot (the card-only boot, where the
+    /// body returns at `block::info().is_none()` and never reaches `divert`). Runs ONLY on the `flightrec` worker (by task
+    /// id): the pump's passes before the hand do nothing here, so the UnaFS write is never on the hid pump's core, and it
+    /// is below the FAT reservation's gate by construction (that path is never reached on this branch).
+    pub fn card_bootlog() {
+        let o = OWNER.load(Ordering::Acquire);
+        if o != 0 && crate::arch::sched::current_id() == Some(o) {
+            crate::fs::bootlog::divert_on_worker(super::snapshot);
+        }
     }
 
     fn run(_: usize) {
