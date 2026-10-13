@@ -13964,7 +13964,7 @@ impl XhciController {
     /// counter deadline, never unbounded.
     fn pump_until_ep0_done(&mut self) -> Result<(), ()> {
         let start = crate::arch::now_cycles();
-        let budget = crate::arch::hw_wait_budget();
+        let budget = crate::arch::hw_wait_budget(); #[cfg(feature = "usbnet")] let budget = usbnet::sync_budget(budget); // PUMPRETRY (B537): inside the link's service pass the EP0 wait is capped (budget/4, and never past the pass deadline) so a dongle that stops answering cannot hold the pump past PUMPWEDGE's bound; outside it, unchanged. LINE-NEUTRAL append (knob-off: the cfg erases it)
         // BOOTPACE M3: the ~200 µs pre-hlt spin window, hoisted (see `spin_window`). EP0 matters
         // most of the three: enumeration is dozens of control transfers per device, each of which
         // used to cost a full APIC tick no matter how fast the device answered.
@@ -13986,7 +13986,7 @@ impl XhciController {
             crate::hlt(); // yield to QEMU so it can DMA the completion into the event ring
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
-                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget);
+                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget); #[cfg(feature = "usbnet")] usbnet::note_ep0_timeout(); // PUMPRETRY (B537): counted into the bring-up try that saw it (`ep0_timeouts=`), which also arms the EP0 ring reset before the retry. LINE-NEUTRAL append
                 return Err(());
             }
         }
@@ -14024,7 +14024,7 @@ impl XhciController {
     /// ADDRESS_DEVICE / CONFIGURE_ENDPOINT, i.e. every command a behind-hub block device needs.
     fn pump_until_cmd_done(&mut self) -> Result<(), ()> {
         let start = crate::arch::now_cycles();
-        let budget = crate::arch::hw_wait_budget();
+        let budget = crate::arch::hw_wait_budget(); #[cfg(feature = "usbnet")] let budget = usbnet::sync_budget(budget); // PUMPRETRY (B537): the EP0 ring reset's Stop/Reset Endpoint + Set TR Dequeue run under the same pass cap. LINE-NEUTRAL append
         // BOOTPACE M3: the ~200 µs pre-hlt spin window, hoisted (see `spin_window`).
         let spin_window = Self::spin_window();
         loop {
@@ -17218,9 +17218,9 @@ impl XhciController {
     }
 
     /// The per-pass service: bring-up once, then frames both ways. Idempotent no-op with no link.
-    pub fn service_usbnet(&mut self) {
+    pub fn service_usbnet(&mut self) { let _pass = usbnet::PassScope::enter(); // PUMPRETRY (B537): the pass deadline every EP0/command wait below is capped to (dropped on every return)
         if let Some(slot) = usbnet::bringup_pending() {
-            self.usbnet_bringup(slot);
+            self.usbnet_bringup_try(slot); // PUMPRETRY (B537): one bring-up TRY per pass (EP0 ring reset first after a timed-out try); a refusal re-offers the device after 250/500/1000 ms, then declines it (final)
         }
         if !usbnet::is_up() {
             return;
