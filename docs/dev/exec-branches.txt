@@ -533,5 +533,5 @@ refs/heads/exec-rmbp-gatesteal                    45e03964 FOLDED-BY-HAND 5c10f2
 refs/heads/exec-rmbp-dongleboot                   45e03964 FOLDED-BY-HAND 715c69ff
 refs/heads/exec-rmbp-winedge                      45e03964 FOLDED-BY-HAND 62cff5f5
 refs/heads/exec-rmbp-quarryio                     45e03964 FOLDED-BY-HAND 331cd2a8
-refs/heads/exec-rmbp-starfield                    23fe38b3 IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-host-temple                       23fe38b3 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-starfield                    23fe38b3 FOLDED-BY-HAND 7f4c0df5
+refs/heads/exec-host-temple                       23fe38b3 FOLDED-BY-HAND 0316f96e
