@@ -91,6 +91,8 @@ pub(crate) fn restore_scroll(tree: &mut LayoutTree) {
 pub(crate) fn forget_scroll() {
     SCROLLED.with(|m| m.borrow_mut().clear());
     SCROLL_DRAG.with(|d| d.set(None));
+    SCROLL_REQUESTS.with(|r| r.borrow_mut().clear());
+    SMOOTH.with(|s| s.borrow_mut().clear());
 }
 
 /// A thumb drag starts on box `id` along `axis` at pointer coordinate `at` with the offset `start`.
@@ -119,6 +121,89 @@ pub(crate) fn continue_scroll_drag(tree: &mut LayoutTree, px: f32, py: f32) -> b
 /// The button went up: the drag ends.
 pub(crate) fn end_scroll_drag() {
     SCROLL_DRAG.with(|d| d.set(None));
+}
+
+// ---- AETHERSTYLE3B (SR115): programmatic scrolling of an element (CSSOM View §7) --------------------------------
+
+/// How a programmatic scroll moves (CSSOM View §5.1 `ScrollBehavior`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollBehavior {
+    /// The element's `scroll-behavior` decides.
+    Auto,
+    Instant,
+    Smooth,
+}
+
+thread_local! {
+    /// Scrolls asked for since the last frame: (element, x or keep, y or keep, behavior).
+    static SCROLL_REQUESTS: std::cell::RefCell<Vec<(html_core::NodeId, Option<f32>, Option<f32>, ScrollBehavior)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Smooth scrolls in flight, by element.
+    static SMOOTH: std::cell::RefCell<std::collections::HashMap<html_core::NodeId, layout_core::scroll::SmoothScroll>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// An element's scroll offset (`scrollLeft`, `scrollTop`) as the page's laid-out tree last recorded it —
+/// mid-way through a smooth scroll, where it is now. (0, 0) for an element that is not scrolled.
+pub fn element_scroll_offset(el: html_core::NodeId) -> (f32, f32) {
+    SCROLLED.with(|m| m.borrow().get(&el).copied()).unwrap_or((0.0, 0.0))
+}
+
+/// A script scrolls `el` to `x` / `y` (None: that axis stays): `scrollTop =`, `scrollLeft =`, `scrollTo()`,
+/// `scroll()`; `scrollBy()` passes the current offset plus its delta. Applied on the next frame
+/// ([`scroll_frame`]) against the page's tree — clamped, snapped on a snap container, animated when smooth.
+pub fn request_element_scroll(el: html_core::NodeId, x: Option<f32>, y: Option<f32>, behavior: ScrollBehavior) {
+    SCROLL_REQUESTS.with(|r| r.borrow_mut().push((el, x, y, behavior)));
+}
+
+/// One frame of programmatic scrolling: the queued requests start (or jump), the smooth scrolls advance.
+/// `true` when an offset moved (the frame repaints).
+pub(crate) fn scroll_frame(tree: &mut LayoutTree) -> bool {
+    let reqs = SCROLL_REQUESTS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    let busy = SMOOTH.with(|s| !s.borrow().is_empty());
+    if reqs.is_empty() && !busy {
+        return false;
+    }
+    let now = crate::css::anim::now_ms();
+    let tid_of = |tree: &LayoutTree, el: html_core::NodeId| tree.node_map.iter().find(|(_, n)| n.id() == el && n.is_element()).map(|(t, _)| *t);
+    let mut moved = false;
+    for (el, x, y, behavior) in reqs {
+        let Some(tid) = tid_of(tree, el) else { continue };
+        let cur = layout_core::scroll::offset(tree, tid);
+        let to = layout_core::scroll::scroll_target(tree, tid, x.unwrap_or(cur.0), y.unwrap_or(cur.1));
+        let smooth = match behavior {
+            ScrollBehavior::Smooth => true,
+            ScrollBehavior::Instant => false,
+            ScrollBehavior::Auto => layout_core::scroll::smooth_behavior(tree, tid),
+        };
+        if smooth && to != cur {
+            SMOOTH.with(|s| s.borrow_mut().insert(el, layout_core::scroll::SmoothScroll::new(cur, to, now)));
+        } else {
+            SMOOTH.with(|s| s.borrow_mut().remove(&el));
+            moved |= layout_core::scroll::set_offset(tree, tid, to.0, to.1) != cur;
+        }
+    }
+    let flights: Vec<(html_core::NodeId, layout_core::scroll::SmoothScroll)> = SMOOTH.with(|s| s.borrow().iter().map(|(k, v)| (*k, *v)).collect());
+    for (el, f) in flights {
+        let ((x, y), done) = f.at(now);
+        match tid_of(tree, el) {
+            Some(tid) => {
+                let cur = layout_core::scroll::offset(tree, tid);
+                moved |= layout_core::scroll::set_offset(tree, tid, x, y) != cur;
+            }
+            None => {
+                SMOOTH.with(|s| s.borrow_mut().remove(&el));
+                continue;
+            }
+        }
+        if done {
+            SMOOTH.with(|s| s.borrow_mut().remove(&el));
+        }
+    }
+    if moved {
+        remember_scroll(tree);
+    }
+    moved || SMOOTH.with(|s| !s.borrow().is_empty())
 }
 
 /// The (submit value, display label) of a `<select>`'s selected option (`layout_core::select_selected_option`).

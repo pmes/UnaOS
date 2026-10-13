@@ -545,8 +545,15 @@ fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], conta
 }
 
 /// AETHERSTYLE3 (SR103): one animation frame (`anim::frame`) — the engine repaints or relayouts on its answer.
+///
+/// AETHERSTYLE3B (SR115): the frame also advances programmatic scrolling (`layout::scroll_frame`: script
+/// scrolls start, smooth scrolls step) — a moved offset repaints.
 pub(crate) fn animation_frame(tree: &mut LayoutTree) -> anim::Frame {
-    anim::frame(tree)
+    let scrolled = crate::layout::scroll_frame(tree);
+    match anim::frame(tree) {
+        anim::Frame::Idle if scrolled => anim::Frame::Repaint,
+        f => f,
+    }
 }
 
 /// AETHERSTYLE3 (SR103): the transition / animation events queued since the last call.
