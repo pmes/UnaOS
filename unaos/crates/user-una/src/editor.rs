@@ -9,15 +9,26 @@
 // FILES. Open = SYS_PATH_READ of the whole file (EDIT_MAX bound, refused past it rather than truncated — a
 // truncated document saved back would destroy the tail), lossy UTF-8 (the status says so), `Buffer::new`. Save =
 // `Buffer` text -> SYS_PATH_WRITE (truncate, then chunks) — UNAMETAL2 (LEDGER SR98): on the default x86 kernel too,
-// as this program's principal under the volume's write ACL (a refusal is EACCES in the status). Opening over unsaved
-// edits is refused once ("Ctrl+O again discards").
+// as this program's principal under the volume's write ACL (a refusal is EACCES in the status). UNAIDE2 (LEDGER
+// SR111): one Editor is one TAB (main.rs `tabs`); a document is never opened over another, so the old "Ctrl+O again
+// discards" guard is gone and `close_armed` asks once before Ctrl+W drops unsaved edits.
 //
 // KEYS (focused). Printable ASCII inserts; Enter = `newline` (the core's auto-indent); Backspace = delete one
 // grapheme back; Tab = four spaces; arrows = `move_cursors`; Ctrl+A / Ctrl+E line start / end; Ctrl+K delete the
-// line; Ctrl+Z undo, Ctrl+Y redo; Ctrl+F a find prompt in the status line (Enter finds forward from the caret,
-// wrapping, and selects the match; Esc leaves it), Ctrl+G finds the next match. Selection rides the desktop's
+// line; Ctrl+Z undo, Ctrl+Y redo. Selection rides the desktop's
 // resolved actions (INPUT_EV_ACTION, APPCLIP/TERMSEL): select-all, select-left/right, select-line-start/end,
 // deselect, and TERMSEL2's caret moves — the ring carries no modifier bits, so Shift+arrow arrives that way.
+//
+// THE PROMPT — UNAIDE2 (LEDGER SR111). Ctrl+F opens it on the FIND field, Ctrl+L on the REPLACE field (Ctrl+H, the
+// usual chord, never reaches ring 3: the HID fold carves Ctrl-H/I/J/M out, drivers/xhci/mod.rs:237-238, because 0x08
+// is Backspace), Ctrl+G on the LINE field. The needle and the replacement live on the tab, so Ctrl+F then Enter is
+// "find next". In the prompt: printable edits the field, Backspace, Tab swaps find/replace, Ctrl+W toggles
+// whole-word (edit_core's word-edge rule), Esc closes it. Regex is off — edit_core's search is literal and
+// case-sensitive. Enter on FIND selects the next match (wrapping); Enter on REPLACE replaces the selection when it
+// IS a match (one undo group) and selects the next; Ctrl+A replaces all (one `set_text` edit, one undo group);
+// Enter on LINE goes to `L` or `L:C` (1-based, clamped) and closes. Keys the prompt does not take fall through to
+// the IDE (`wants`). Wire: `:: UNA: find needle=<s> word=<0|1> hits=<k> at=<l>:<c> ::`, `:: UNA: replace
+// needle=<s> with=<s> word=<0|1> n=<k> ::`, `:: UNA: goto line=<l> of=<n> ::`.
 //
 // HIGHLIGHT — UNAMETAL2 (LEDGER SR98) fills SYNTAXCORE's (SR89) seam with the core itself: `highlight` holds the
 // grammar (`syntax_core::language_for_id`, chosen from the file's extension by Tabula's table) and the incremental
@@ -34,7 +45,7 @@ use crate::Line;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use edit_core::{Buffer, Change, Direction, Motion, SearchOpts, Selection, Unit};
+use edit_core::{Buffer, Change, Direction, Motion, Pos, SearchOpts, Selection, Unit};
 use syntax_core::{HighlightKind, Highlighter, Language, Source, Theme};
 use una_abi::{KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
@@ -101,6 +112,14 @@ impl Syntax {
     }
 }
 
+/// UNAIDE2: the prompt's fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Find,
+    Repl,
+    Line,
+}
+
 pub struct Editor {
     pub buf: Buffer,
     pub path: Option<String>,
@@ -108,11 +127,15 @@ pub struct Editor {
     /// First visible line and first visible column (cells).
     pub top: usize,
     pub left: usize,
-    /// The find prompt while it is open.
-    pub search: Option<String>,
-    needle: String,
+    /// UNAIDE2: the prompt's open field (`None` = closed), the needle, the replacement, whole-word, the line field.
+    pub prompt: Option<Field>,
+    pub needle: String,
+    pub repl: String,
+    pub whole: bool,
+    goto: String,
     pub msg: String,
-    discard_armed: bool,
+    /// UNAIDE2: Ctrl+W met unsaved edits once; the next Ctrl+W discards (cleared by any edit).
+    pub close_armed: bool,
     /// UNAMETAL2: the open document's syntax core (`None` = a language with no grammar, or no document).
     pub highlight: Option<Syntax>,
     /// UNAKEYS (B552): kind -> appearance token, Principia's `tabula.theme.<kind>` applied (`theme::syntax_map`).
@@ -130,10 +153,13 @@ impl Editor {
             dirty: false,
             top: 0,
             left: 0,
-            search: None,
+            prompt: None,
             needle: String::new(),
+            repl: String::new(),
+            whole: false,
+            goto: String::new(),
             msg: String::from("Ctrl+1 tree, Enter opens a file"),
-            discard_armed: false,
+            close_armed: false,
             highlight: None,
             map: Theme::default(),
             saved: false,
@@ -165,14 +191,9 @@ impl Editor {
         }
     }
 
-    pub fn open(&mut self, path: &str) {
-        if self.dirty && !self.discard_armed {
-            self.discard_armed = true;
-            self.msg = String::from("unsaved: Ctrl+S, or Ctrl+O again discards");
-            self.repaint = true;
-            return;
-        }
-        self.discard_armed = false;
+    /// Load `path` into this tab (the IDE opens into a blank or a new tab). `true` = loaded.
+    pub fn open(&mut self, path: &str) -> bool {
+        let mut ok = false;
         let mut l = Line::new(b":: UNA: open path=");
         l.put(path.as_bytes());
         match read_file(path, EDIT_MAX, true) {
@@ -185,7 +206,9 @@ impl Editor {
                 self.dirty = false;
                 self.top = 0;
                 self.left = 0;
-                self.search = None;
+                self.prompt = None;
+                self.close_armed = false;
+                ok = true;
                 self.msg = if lossy { String::from("opened (not UTF-8: shown lossy)") } else { String::from("opened") };
                 l.put(b" bytes=").dec(bytes.len() as i64).put(b" lines=").dec(self.buf.line_count() as i64);
                 l.put(b" lang=").put(self.highlight.as_ref().map_or("none", |h| h.id()).as_bytes());
@@ -198,6 +221,17 @@ impl Editor {
         }
         l.wire();
         self.repaint = true;
+        ok
+    }
+
+    /// True for a tab holding nothing: no file, no edits, no text (the IDE loads into it in place).
+    pub fn blank(&self) -> bool {
+        self.path.is_none() && !self.dirty && self.buf.len() == 0
+    }
+
+    /// The tab's label: the file's leaf, or `untitled`.
+    pub fn name(&self) -> &str {
+        self.path.as_deref().map_or("untitled", |p| p.rsplit('/').next().unwrap_or(p))
     }
 
     pub fn save(&mut self) {
@@ -212,7 +246,7 @@ impl Editor {
         match write_file(&path, text.as_bytes()) {
             Ok(_) => {
                 self.dirty = false;
-                self.discard_armed = false;
+                self.close_armed = false;
                 self.saved = true;
                 self.msg = String::from("saved");
                 l.put(b" rc=0 ::");
@@ -233,25 +267,198 @@ impl Editor {
             return;
         }
         self.dirty = true;
-        self.discard_armed = false;
+        self.close_armed = false;
         if let Some(h) = self.highlight.as_mut() {
             h.sync(&self.buf, &changes);
         }
     }
 
+    fn opts(&self) -> SearchOpts {
+        SearchOpts { case_insensitive: false, whole_word: self.whole }
+    }
+
+    /// (line, column in chars), 1-based, of byte offset `off`.
+    fn lc1(&self, off: usize) -> (usize, usize) {
+        let p = self.buf.offset_to_pos(off);
+        let l = self.buf.line(p.line);
+        (p.line + 1, l.get(..p.byte.min(l.len())).map_or(0, |s| s.chars().count()) + 1)
+    }
+
+    /// The next match after the selection (wrapping), selected. `:: UNA: find … ::`.
     fn find_next(&mut self) {
         if self.needle.is_empty() {
-            self.msg = String::from("Ctrl+F to find");
+            self.msg = String::from("type what to find");
             return;
         }
+        let opts = self.opts();
         let from = self.buf.selections().first().map_or(0, |s| s.end());
-        match self.buf.find(&self.needle, SearchOpts::default(), from, Direction::Forward, true) {
+        let n = self.buf.find_all(&self.needle, opts).len();
+        let hit = self.buf.find(&self.needle, opts, from, Direction::Forward, true);
+        let (al, ac) = match &hit {
             Some(r) => {
                 self.buf.set_selections(&[Selection::new(r.start, r.end)]);
-                let n = self.buf.find_all(&self.needle, SearchOpts::default()).len();
                 self.msg = alloc::format!("found ({} in file)", n);
+                self.lc1(r.start)
             }
-            None => self.msg = alloc::format!("not found: {}", self.needle),
+            None => {
+                self.msg = alloc::format!("not found: {}", self.needle);
+                (0, 0)
+            }
+        };
+        let mut l = Line::new(b":: UNA: find needle=");
+        l.put(self.needle.as_bytes()).put(b" word=").dec(self.whole as i64).put(b" hits=").dec(n as i64);
+        l.put(b" at=").dec(al as i64).put(b":").dec(ac as i64).put(b" ::");
+        l.wire();
+    }
+
+    fn replace_wire(&self, n: usize) {
+        let mut l = Line::new(b":: UNA: replace needle=");
+        l.put(self.needle.as_bytes()).put(b" with=").put(self.repl.as_bytes()).put(b" word=").dec(self.whole as i64);
+        l.put(b" n=").dec(n as i64).put(b" ::");
+        l.wire();
+    }
+
+    /// Enter on the replace field: the selection, when it IS a match, becomes the replacement (one undo group);
+    /// then the next match is selected.
+    fn replace_one(&mut self) {
+        if self.needle.is_empty() {
+            self.msg = String::from("type what to find (Tab)");
+            return;
+        }
+        let sel = self.buf.selections().first().map(|s| s.range());
+        let all = self.buf.find_all(&self.needle, self.opts());
+        let mut n = 0;
+        if let Some(r) = sel.filter(|r| all.contains(r)) {
+            let at = r.start;
+            let c = self.buf.replace(r, &self.repl);
+            self.edited(c);
+            self.buf.set_cursor(at + self.repl.len());
+            n = 1;
+        }
+        self.replace_wire(n);
+        self.find_next();
+        if n == 1 {
+            self.msg = alloc::format!("replaced 1; {}", self.msg);
+        }
+    }
+
+    /// Ctrl+A on the prompt: every match replaced in ONE edit (`set_text`, one undo group).
+    fn replace_all(&mut self) {
+        if self.needle.is_empty() {
+            self.msg = String::from("type what to find");
+            return;
+        }
+        let all = self.buf.find_all(&self.needle, self.opts());
+        if !all.is_empty() {
+            let old = self.buf.text().to_string_lossless();
+            let mut new = String::with_capacity(old.len());
+            let mut at = 0;
+            for r in &all {
+                new.push_str(&old[at..r.start]);
+                new.push_str(&self.repl);
+                at = r.end;
+            }
+            new.push_str(&old[at..]);
+            let caret = self.buf.cursor().min(new.len());
+            let c = self.buf.set_text(&new);
+            self.edited(c);
+            let caret = if new.is_char_boundary(caret) { caret } else { 0 };
+            self.buf.set_cursor(caret);
+        }
+        self.msg = alloc::format!("replaced {}", all.len());
+        self.replace_wire(all.len());
+    }
+
+    /// Enter on the line field: the caret to `L` or `L:C` (1-based, clamped). `:: UNA: goto … ::`.
+    fn goto_line(&mut self) {
+        let mut it = self.goto.split(':');
+        let l: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let c: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let n = self.buf.line_count();
+        if l == 0 {
+            self.msg = String::from("line: a number, or line:col");
+            return;
+        }
+        let l = l.min(n.max(1));
+        self.click(l - 1, c.max(1) - 1);
+        self.msg = alloc::format!("line {} of {}", l, n);
+        let mut w = Line::new(b":: UNA: goto line=");
+        w.dec(l as i64).put(b" of=").dec(n as i64).put(b" ::");
+        w.wire();
+    }
+
+    /// The caret to `line`, `col` chars in (0-based, clamped) — Ctrl+G and a press in the text (B543's pointer).
+    pub fn click(&mut self, line: usize, col: usize) {
+        let n = self.buf.line_count().max(1);
+        let line = line.min(n - 1);
+        let text = self.buf.line(line);
+        let byte = text.char_indices().nth(col).map_or(text.len(), |(b, _)| b);
+        let off = self.buf.pos_to_offset(Pos::new(line, byte));
+        self.buf.set_cursor(off);
+        self.repaint = true;
+    }
+
+    /// Open the prompt on `f` (Ctrl+F / Ctrl+L / Ctrl+G).
+    pub fn ask(&mut self, f: Field) {
+        if f == Field::Line {
+            self.goto.clear();
+        }
+        self.prompt = Some(f);
+        self.msg = String::new();
+        self.repaint = true;
+    }
+
+    /// Does the open prompt take key `k`? (Everything else falls through to the IDE's keys.)
+    pub fn wants(&self, k: u8) -> bool {
+        self.prompt.is_some() && matches!(k, 0x20..=0x7e | 0x08 | 0x7f | b'\n' | b'\r' | 0x09 | 0x17 | 0x01)
+    }
+
+    /// The status line's prompt text while it is open.
+    pub fn prompt_text(&self) -> Option<String> {
+        let w = if self.whole { "[w]" } else { "" };
+        Some(match self.prompt? {
+            Field::Find => alloc::format!("find{}: {}_  repl: {}", w, self.needle, self.repl),
+            Field::Repl => alloc::format!("repl{}: {} -> {}_", w, self.needle, self.repl),
+            Field::Line => alloc::format!("line: {}_", self.goto),
+        })
+    }
+
+    fn prompt_key(&mut self, f: Field, k: u8) {
+        match k {
+            b'\n' | b'\r' => match f {
+                Field::Find => self.find_next(),
+                Field::Repl => self.replace_one(),
+                Field::Line => {
+                    self.goto_line();
+                    self.prompt = None;
+                }
+            },
+            0x09 => {
+                self.prompt = Some(match f {
+                    Field::Find => Field::Repl,
+                    Field::Repl => Field::Find,
+                    Field::Line => Field::Line,
+                })
+            }
+            0x17 if f != Field::Line => self.whole = !self.whole,
+            0x01 if f != Field::Line => self.replace_all(),
+            0x08 | 0x7f => {
+                match f {
+                    Field::Find => self.needle.pop(),
+                    Field::Repl => self.repl.pop(),
+                    Field::Line => self.goto.pop(),
+                };
+            }
+            0x20..=0x7e => match f {
+                Field::Find => self.needle.push(k as char),
+                Field::Repl => self.repl.push(k as char),
+                Field::Line => {
+                    if k.is_ascii_digit() || k == b':' {
+                        self.goto.push(k as char)
+                    }
+                }
+            },
+            _ => {}
         }
     }
 
@@ -279,9 +486,9 @@ impl Editor {
         self.repaint = true;
     }
 
-    /// Esc: close the find prompt. `false` = no prompt was open (the IDE then cycles focus).
+    /// Esc: close the prompt. `false` = no prompt was open (the IDE then cycles focus).
     pub fn escape(&mut self) -> bool {
-        if self.search.take().is_some() {
+        if self.prompt.take().is_some() {
             self.msg = String::new();
             self.repaint = true;
             return true;
@@ -291,20 +498,10 @@ impl Editor {
 
     pub fn key(&mut self, k: u8) {
         self.repaint = true;
-        if let Some(q) = self.search.as_mut() {
-            match k {
-                b'\n' | b'\r' => {
-                    self.needle = core::mem::take(q);
-                    self.search = None;
-                    self.find_next();
-                }
-                0x08 | 0x7f => {
-                    q.pop();
-                }
-                0x20..=0x7e => q.push(k as char),
-                _ => {}
+        if let Some(f) = self.prompt {
+            if self.wants(k) {
+                return self.prompt_key(f, k);
             }
-            return;
         }
         match k {
             b'\n' | b'\r' => {
@@ -345,11 +542,9 @@ impl Editor {
                 }
                 None => self.msg = String::from("nothing to redo"),
             },
-            0x06 => {
-                self.search = Some(String::new());
-                self.msg = String::new();
-            }
-            0x07 => self.find_next(),
+            0x06 => self.ask(Field::Find),
+            0x0C => self.ask(Field::Repl),
+            0x07 => self.ask(Field::Line),
             0x20..=0x7e => {
                 let mut s = [0u8; 4];
                 let c = self.buf.insert((k as char).encode_utf8(&mut s));

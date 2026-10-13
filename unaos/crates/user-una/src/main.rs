@@ -35,8 +35,18 @@
 // CURSORSHAPE (rmbp-ledger B550): each one also asks the compositor for the pointer's shape (`SYS_CURSOR_SHAPE`) —
 // the text beam over the editor pane, the arrow over the tree, the console and outside the window.
 //
-// GLOBAL KEYS. Ctrl+S save the editor's file; Ctrl+O open the tree's selected file; Ctrl+Q quit (and a window
+// GLOBAL KEYS. Ctrl+S save the active tab's file; Ctrl+O open the tree's selected file; Ctrl+Q quit (and a window
 // close request). Everything else goes to the focused pane (tree.rs, editor.rs, console.rs say their keys).
+//
+// TABS — UNAIDE2 (LEDGER SR111). The editor pane holds `tabs` (one `editor::Editor` — one edit_core Buffer — per
+// document) under a tab strip along its top: each label is the file's leaf, `*` when dirty, the active one on the
+// editor ground under the accent bar. Opening a file already open switches to its tab; a blank active tab is loaded
+// in place; anything else opens a new tab (TAB_MAX). Ctrl+T next tab (Ctrl+Tab never reaches ring 3: the HID fold
+// suppresses Ctrl with a non-letter other than a main-row digit, drivers/xhci/mod.rs:231-232), Ctrl+4..Ctrl+9 tab
+// 1..6 (KEY_CTRL_DIGIT presses), a click on a label; Ctrl+W closes the active tab (asking once over unsaved edits);
+// Ctrl+F / Ctrl+L / Ctrl+G open the editor's find / replace / line prompt from any pane (editor.rs THE PROMPT).
+// Wire: `:: UNA: tab active=<i> tabs=<n> path=<p|untitled> dirty=<0|1> ::` on every switch, open and close, and
+// `:: UNA: close path=<p> dirty=<0|1> tabs=<n> ::`. A press in the editor's text places the caret under the pointer.
 //
 // THEME. Every colour is a field of `theme::Theme` (theme.rs: Principia's `system.appearance.*` and Tabula's
 // `tabula.theme.<kind>` over the PREFS bus, the kernel palette's Light/Dark rows) — read once at start and again when
@@ -79,6 +89,8 @@ const STRIDE: usize = W as usize * 4;
 const SIDE_W: i32 = 86;
 const CON_Y: i32 = 190;
 const PANES: u32 = 3;
+/// UNAIDE2: the most tabs open at once (a further open is refused by name).
+const TAB_MAX: usize = 12;
 
 static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY;
 
@@ -109,7 +121,9 @@ impl Line {
     }
 }
 
-/// The exit status `tests una` reads back (`bg_poll`'s `Exited(i32)`; bit 31 stays clear). UNAMETAL2 (LEDGER SR98)
+/// The exit status `tests una` reads back (`bg_poll`'s `Exited(i32)`; bit 31 stays clear). UNAIDE2 (SR111): SAVED is
+/// the IDE's last Ctrl+S on any tab, HIGHLIGHT the largest span count over the open tabs; the layout is unchanged.
+/// UNAMETAL2 (LEDGER SR98)
 /// repacked it to carry the save and the highlight: the console's scrollback rows `[9:0]`, its lines planned
 /// `[11:10]` (cap 3), the last plan's kind `[13:12]` (0 Nothing, 1 Say, 2 Host, 3 Exec), its verb code `[21:14]`
 /// (`midden_core::ring3::verb_code`), the pane count `[23:22]`, a window `[24]`, a loaded face `[25]`, SAVED `[26]`
@@ -168,7 +182,13 @@ struct App {
     face: Option<txt::Txt>,
     focus: Pane,
     tree: tree::Tree,
-    ed: editor::Editor,
+    /// UNAIDE2: the open documents and the active one (never empty).
+    tabs: Vec<editor::Editor>,
+    cur: usize,
+    /// UNAIDE2: each visible tab label's rect, for a click (filled by the painter).
+    tab_hits: Vec<(Rect, usize)>,
+    /// UNAIDE2: the last Ctrl+S on any tab answered rc=0 (the exit status's SAVED bit).
+    saved: bool,
     con: console::Console,
     /// Bytes whose KEY_DOWN this program saw and whose KEY_UP it has not (the modified-digit chord test).
     down: [bool; 128],
@@ -188,11 +208,19 @@ impl App {
     fn cols_in(&self, w: i32) -> usize {
         (((w - 8).max(0) as f32) / self.cell()) as usize
     }
-    /// The editor's status line top and its visible text rows.
+    /// UNAIDE2: the tab strip's height (the top of the editor pane).
+    fn tab_h(&self) -> i32 {
+        self.lh() + 3
+    }
+    /// The editor's status line top and its visible text rows (below the tab strip).
     fn ed_geom(&self) -> (i32, usize) {
         let lh = self.lh();
         let sy = R_ED.y + R_ED.h - lh - 2;
-        (sy, ((sy - 3) / lh).max(1) as usize)
+        (sy, ((sy - self.tab_h() - 3) / lh).max(1) as usize)
+    }
+    /// The first text row's top.
+    fn text_y0(&self) -> i32 {
+        R_ED.y + self.tab_h() + 2
     }
     fn tree_rows(&self) -> usize {
         ((R_TREE.h - 4) / self.lh() - 1).max(1) as usize
@@ -213,26 +241,99 @@ impl App {
         self.set_focus(n);
     }
 
+    /// The active tab.
+    fn ed(&mut self) -> &mut editor::Editor {
+        &mut self.tabs[self.cur]
+    }
+    /// A status-line message on the active tab.
+    fn say(&mut self, m: String) {
+        let e = self.ed();
+        e.msg = m;
+        e.repaint = true;
+    }
+
+    /// `:: UNA: tab active=<i> tabs=<n> path=<p|untitled> dirty=<0|1> ::` (1-based).
+    fn tab_wire(&self) {
+        let e = &self.tabs[self.cur];
+        let mut l = Line::new(b":: UNA: tab active=");
+        l.dec(self.cur as i64 + 1).put(b" tabs=").dec(self.tabs.len() as i64).put(b" path=");
+        l.put(e.path.as_deref().unwrap_or("untitled").as_bytes()).put(b" dirty=").dec(e.dirty as i64).put(b" ::");
+        l.wire();
+    }
+    fn switch_to(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.cur = i;
+            self.tabs[i].repaint = true;
+            self.dirty = true;
+            self.tab_wire();
+        }
+    }
+
+    /// UNAIDE2: open `p` — its tab if one has it, else the blank active tab, else a new tab.
+    fn open_path(&mut self, p: &str) {
+        if let Some(i) = self.tabs.iter().position(|e| e.path.as_deref() == Some(p)) {
+            self.switch_to(i);
+        } else if self.tabs[self.cur].blank() {
+            let c = self.cur;
+            self.tabs[c].open(p);
+            self.dirty = true;
+            self.tab_wire();
+        } else if self.tabs.len() >= TAB_MAX {
+            self.say(alloc::format!("{} tabs open: close one (Ctrl+W)", TAB_MAX));
+        } else {
+            let mut e = editor::Editor::new();
+            e.map = self.tabs[self.cur].map.clone();
+            if e.open(p) {
+                self.tabs.push(e);
+                self.cur = self.tabs.len() - 1;
+                self.dirty = true;
+                self.tab_wire();
+            } else {
+                let m = e.msg.clone();
+                self.say(m);
+            }
+        }
+        self.set_focus(Pane::Editor);
+    }
+
+    /// UNAIDE2: Ctrl+W — close the active tab, asking once over unsaved edits; the last one leaves a blank tab.
+    fn close_tab(&mut self) {
+        let e = &mut self.tabs[self.cur];
+        if e.dirty && !e.close_armed {
+            e.close_armed = true;
+            e.msg = String::from("unsaved: Ctrl+S, or Ctrl+W again discards");
+            e.repaint = true;
+            return;
+        }
+        let mut l = Line::new(b":: UNA: close path=");
+        l.put(e.path.as_deref().unwrap_or("untitled").as_bytes()).put(b" dirty=").dec(e.dirty as i64);
+        let map = e.map.clone();
+        self.tabs.remove(self.cur);
+        if self.tabs.is_empty() {
+            let mut b = editor::Editor::new();
+            b.map = map;
+            self.tabs.push(b);
+        }
+        l.put(b" tabs=").dec(self.tabs.len() as i64).put(b" ::");
+        l.wire();
+        let n = self.cur.min(self.tabs.len() - 1);
+        self.switch_to(n);
+    }
+
     fn open_selected(&mut self) {
         match self.tree.selected_file().map(String::from) {
-            Some(p) => {
-                self.ed.open(&p);
-                self.set_focus(Pane::Editor);
-            }
-            None => {
-                self.ed.msg = String::from("select a file in the tree (Ctrl+1)");
-                self.ed.repaint = true;
-            }
+            Some(p) => self.open_path(&p),
+            None => self.say(String::from("select a file in the tree (Ctrl+1)")),
         }
     }
 
     fn quit(&mut self) -> ! {
         let rows = self.con.rows.len() as u32;
-        let spans = self.ed.highlight.as_ref().map_or(0, |h| h.spans()) as u32;
-        let st = status(rows, self.con.cmds, self.con.last_kind, self.con.last_verb, PANES, self.win >= 0, self.face.is_some(), self.ed.saved, spans);
+        let spans = self.tabs.iter().map(|e| e.highlight.as_ref().map_or(0, |h| h.spans())).max().unwrap_or(0) as u32;
+        let st = status(rows, self.con.cmds, self.con.last_kind, self.con.last_verb, PANES, self.win >= 0, self.face.is_some(), self.saved, spans);
         let mut l = Line::new(b":: UNA: exit status=");
         l.dec(st as i64).put(b" panes=").dec(PANES as i64).put(b" lines=").dec(rows as i64);
-        l.put(b" saved=").dec(self.ed.saved as i64).put(b" spans=").dec(spans as i64);
+        l.put(b" saved=").dec(self.saved as i64).put(b" spans=").dec(spans as i64).put(b" tabs=").dec(self.tabs.len() as i64);
         l.put(b" cmds=").dec(self.con.cmds as i64).put(b" focus=").put(self.focus.name()).put(b" ::");
         l.wire();
         exit(st)
@@ -248,6 +349,7 @@ impl App {
                 1 => self.set_focus(Pane::Tree),
                 2 => self.set_focus(Pane::Editor),
                 3 => self.set_focus(Pane::Console),
+                4..=9 => self.switch_to((d - 4) as usize), // UNAIDE2: Ctrl+4..Ctrl+9 = tab 1..6
                 _ => {}
             }
             return;
@@ -255,12 +357,33 @@ impl App {
         if (k as usize) < self.down.len() {
             self.down[k as usize] = true;
         }
+        // UNAIDE2: the editor's open prompt takes its own keys first (editor.rs `wants`).
+        if self.focus == Pane::Editor && self.tabs[self.cur].wants(k) {
+            return self.ed().key(k);
+        }
         match k {
-            0x11 => self.quit(),           // Ctrl+Q
-            0x13 => return self.ed.save(), // Ctrl+S
+            0x11 => self.quit(), // Ctrl+Q
+            0x13 => {
+                // Ctrl+S
+                self.ed().save();
+                self.saved = self.tabs[self.cur].saved && !self.tabs[self.cur].dirty;
+                self.dirty = true;
+                return;
+            }
             0x0F => return self.open_selected(), // Ctrl+O
+            0x14 => {
+                // UNAIDE2: Ctrl+T — the next tab, wrapping
+                let n = (self.cur + 1) % self.tabs.len();
+                return self.switch_to(n);
+            }
+            0x17 => return self.close_tab(), // UNAIDE2: Ctrl+W
+            0x06 | 0x0C | 0x07 => {
+                // UNAIDE2: Ctrl+F / Ctrl+L / Ctrl+G — the editor's find / replace / line prompt, from any pane
+                self.set_focus(Pane::Editor);
+                return self.ed().key(k);
+            }
             KEY_ESC => {
-                if !(self.focus == Pane::Editor && self.ed.escape()) {
+                if !(self.focus == Pane::Editor && self.ed().escape()) {
                     self.cycle_focus();
                 }
                 return;
@@ -270,11 +393,10 @@ impl App {
         match self.focus {
             Pane::Tree => {
                 if let tree::Act::Open(p) = self.tree.key(k) {
-                    self.ed.open(&p);
-                    self.set_focus(Pane::Editor);
+                    self.open_path(&p);
                 }
             }
-            Pane::Editor => self.ed.key(k),
+            Pane::Editor => self.ed().key(k),
             Pane::Console => {
                 if let console::Act::Quit = self.con.key(k) {
                     self.quit();
@@ -314,6 +436,23 @@ impl App {
             }
         } else if R_ED.has(x, y) {
             self.set_focus(Pane::Editor);
+            if y < R_ED.y + self.tab_h() {
+                // UNAIDE2: a press on a tab label switches to it.
+                if let Some(&(_, i)) = self.tab_hits.iter().find(|(r, _)| r.has(x, y)) {
+                    self.switch_to(i);
+                }
+            } else {
+                // UNAIDE2: a press in the text places the caret under the delivered pointer (B543).
+                let (sy, _) = self.ed_geom();
+                let y0 = self.text_y0();
+                if y >= y0 && y < sy {
+                    let row = ((y - y0) / self.lh()) as usize;
+                    let col = (((x - R_ED.x - 4).max(0) as f32) / self.cell() + 0.5) as usize;
+                    let e = &mut self.tabs[self.cur];
+                    let (l, c) = (e.top + row, e.left + col);
+                    e.click(l, c);
+                }
+            }
         } else if R_CON.has(x, y) {
             self.set_focus(Pane::Console);
         }
@@ -406,27 +545,78 @@ impl App {
         }
     }
 
+    /// UNAIDE2: the tab strip — each label the file's leaf (`*` when dirty), the active one on the editor ground under
+    /// the accent bar; when the labels overflow, the first one shown slides right until the active one fits.
+    fn paint_tabs(&mut self) {
+        let th = theme::cur();
+        let r = Rect { x: R_ED.x, y: R_ED.y, w: R_ED.w, h: self.tab_h() };
+        self.fill(r, th.status_bg);
+        let cell = self.cell();
+        let labels: Vec<Vec<u8>> = self
+            .tabs
+            .iter()
+            .map(|e| {
+                let mut s: Vec<u8> = e.name().bytes().map(|b| if (0x20..=0x7e).contains(&b) { b } else { b'?' }).take(14).collect();
+                if e.dirty {
+                    s.push(b'*');
+                }
+                s
+            })
+            .collect();
+        let width = |s: &Vec<u8>| ((s.len() + 2) as f32 * cell) as i32 + 1;
+        let mut first = 0;
+        loop {
+            let used: i32 = labels[first..=self.cur].iter().map(width).sum();
+            if used <= r.w || first == self.cur {
+                break;
+            }
+            first += 1;
+        }
+        self.tab_hits.clear();
+        let mut x = r.x;
+        for (i, s) in labels.iter().enumerate().skip(first) {
+            if x >= r.x + r.w {
+                break;
+            }
+            let w = width(s);
+            let tr = Rect { x, y: r.y, w: (w - 1).min(r.x + r.w - x), h: r.h };
+            let active = i == self.cur;
+            if active {
+                self.fill(tr, th.ed_bg);
+                self.fill(Rect { x, y: r.y, w: tr.w, h: 2 }, th.caret);
+            }
+            self.text(x + cell as i32, r.y + 2, s, if active { th.ink } else { th.dim_ink }, tr);
+            self.fill(Rect { x: x + w - 1, y: r.y + 3, w: 1, h: r.h - 6 }, th.rule);
+            self.tab_hits.push((tr, i));
+            x += w;
+        }
+        self.fill(Rect { x: r.x, y: r.y + r.h - 1, w: r.w, h: 1 }, th.rule);
+    }
+
     fn paint_editor(&mut self) {
         let th = theme::cur();
         let lh = self.lh();
         let r = R_ED;
         self.fill(r, th.ed_bg);
+        self.paint_tabs();
         let (sy, rows) = self.ed_geom();
         let cols = self.cols_in(r.w);
-        self.ed.view(rows, cols);
+        let cur = self.cur;
+        self.tabs[cur].view(rows, cols);
         let x0 = r.x + 4;
-        let text_clip = Rect { x: r.x, y: r.y, w: r.w, h: sy - r.y };
-        let sels: Vec<(usize, usize)> = self.ed.buf.selections().iter().filter(|s| !s.is_empty()).map(|s| (s.start(), s.end())).collect();
-        let nlines = self.ed.buf.line_count();
-        let (left, top) = (self.ed.left, self.ed.top);
+        let y0 = self.text_y0();
+        let text_clip = Rect { x: r.x, y: y0, w: r.w, h: sy - y0 };
+        let sels: Vec<(usize, usize)> = self.tabs[cur].buf.selections().iter().filter(|s| !s.is_empty()).map(|s| (s.start(), s.end())).collect();
+        let nlines = self.tabs[cur].buf.line_count();
+        let (left, top) = (self.tabs[cur].left, self.tabs[cur].top);
         for row in 0..rows {
             let l = top + row;
             if l >= nlines {
                 break;
             }
-            let y = r.y + 2 + row as i32 * lh;
-            let line = self.ed.buf.line(l);
-            let ls = self.ed.buf.pos_to_offset(edit_core::Pos::new(l, 0));
+            let y = y0 + row as i32 * lh;
+            let line = self.tabs[cur].buf.line(l);
+            let ls = self.tabs[cur].buf.pos_to_offset(edit_core::Pos::new(l, 0));
             let idx: Vec<(usize, char)> = line.char_indices().skip(left).take(cols).collect();
             // The selection behind the text.
             for &(a, b) in &sels {
@@ -442,8 +632,8 @@ impl App {
             let glyphs: Vec<u8> = idx.iter().map(|&(_, ch)| if (' '..='~').contains(&ch) { ch as u8 } else if ch == '\t' { b' ' } else { b'?' }).collect();
             // UNAMETAL2 (SR98): each char's ink is its syntax_core token's appearance token; runs of one ink draw once.
             // UNAKEYS (B552): kind -> token through Principia's map, token -> ink through the live look.
-            let map = &self.ed.map;
-            let inks: Option<Vec<u32>> = self.ed.highlight.as_ref().map(|h| idx.iter().map(|&(bi, _)| th.token_ink(map.token(h.kind_at(l, bi)))).collect());
+            let map = &self.tabs[cur].map;
+            let inks: Option<Vec<u32>> = self.tabs[cur].highlight.as_ref().map(|h| idx.iter().map(|&(bi, _)| th.token_ink(map.token(h.kind_at(l, bi)))).collect());
             match inks {
                 Some(inks) => {
                     let mut a = 0;
@@ -461,24 +651,24 @@ impl App {
             }
         }
         // The caret (full on focus, dim otherwise).
-        let (cl, cc) = self.ed.caret_lc();
+        let (cl, cc) = self.tabs[cur].caret_lc();
         if cl >= top && cl < top + rows && cc >= left {
             let x = self.cx(x0, cc - left);
-            let y = r.y + 2 + (cl - top) as i32 * lh;
+            let y = y0 + (cl - top) as i32 * lh;
             self.fill(Rect { x, y, w: 2, h: lh - 1 }, if self.focus == Pane::Editor { th.caret } else { th.rule });
         }
         // The status line: the find prompt, or path / dirty / line:col / message.
         let sr = Rect { x: r.x, y: sy, w: r.w, h: r.y + r.h - sy };
         self.fill(sr, th.status_bg);
-        let s = match &self.ed.search {
-            Some(q) => alloc::format!("find: {}_", q),
-            None => {
-                let name = self.ed.path.as_deref().map_or("untitled", |p| p.rsplit('/').next().unwrap_or(p));
-                alloc::format!("{}{} {}:{} {}", name, if self.ed.dirty { "*" } else { "" }, cl + 1, cc + 1, self.ed.msg)
-            }
+        let e = &self.tabs[cur];
+        let prompt = e.prompt_text();
+        let asking = prompt.is_some();
+        let s = match prompt {
+            Some(q) => q,
+            None => alloc::format!("{}{} {}:{} {}", e.name(), if e.dirty { "*" } else { "" }, cl + 1, cc + 1, e.msg),
         };
         let s: Vec<u8> = s.bytes().map(|b| if (0x20..=0x7e).contains(&b) { b } else { b'?' }).take(cols).collect();
-        self.text(x0, sy + 1, &s, if self.ed.search.is_some() { th.echo_ink } else { th.dim_ink }, sr);
+        self.text(x0, sy + 1, &s, if asking { th.echo_ink } else { th.dim_ink }, sr);
     }
 
     fn paint_console(&mut self) {
@@ -517,7 +707,7 @@ impl App {
     }
 
     fn paint(&mut self) {
-        let any = self.dirty || self.tree.dirty || self.ed.repaint || self.con.dirty;
+        let any = self.dirty || self.tree.dirty || self.tabs[self.cur].repaint || self.con.dirty;
         if !any {
             return;
         }
@@ -536,7 +726,7 @@ impl App {
         self.fill(Rect { x: f.x, y: f.y, w: f.w, h: 2 }, th.caret);
         self.dirty = false;
         self.tree.dirty = false;
-        self.ed.repaint = false;
+        self.tabs[self.cur].repaint = false;
         self.con.dirty = false;
         sys(SYS_WIN_PRESENT, self.win as u64, 0, 0, 0);
     }
@@ -604,14 +794,17 @@ pub extern "C" fn _start() -> ! {
         face,
         focus: Pane::Editor,
         tree: tree::Tree::new(root.clone()),
-        ed: editor::Editor::new(),
+        tabs: alloc::vec![editor::Editor::new()],
+        cur: 0,
+        tab_hits: Vec::new(),
+        saved: false,
         con: console::Console::new(root.clone(), con_cols),
         down: [false; 128],
         ptr: None,
         buttons: 0,
         dirty: true,
     };
-    app.ed.map = map;
+    app.tabs[0].map = map;
     let mut l = Line::new(b":: UNA: start window=");
     l.dec(win).put(b" font=");
     match (&app.face, &why) {
@@ -634,7 +827,7 @@ pub extern "C" fn _start() -> ! {
     l.wire();
     app.con.say(console::Tone::Out, "Una on UnaOS - the console is Midden. Type help.");
     if let Some(f) = file {
-        app.ed.open(&f);
+        app.open_path(&f);
     }
     app.paint();
 
@@ -652,7 +845,7 @@ pub extern "C" fn _start() -> ! {
                 INPUT_EV_KEY_UP => app.key_up(p as u8),
                 INPUT_EV_ACTION => {
                     if app.focus == Pane::Editor {
-                        app.ed.action(p as u8);
+                        app.ed().action(p as u8);
                     }
                 }
                 INPUT_EV_MOUSE_ABS => {
@@ -674,8 +867,10 @@ pub extern "C" fn _start() -> ! {
         if theme::due(now_ms()) {
             let moved = theme::load();
             let map = theme::syntax_map();
-            if moved || map != app.ed.map {
-                app.ed.map = map;
+            if moved || map != app.tabs[0].map {
+                for e in app.tabs.iter_mut() {
+                    e.map = map.clone();
+                }
                 app.dirty = true;
                 theme_wire();
             }

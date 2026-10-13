@@ -165,6 +165,7 @@ impl Console {
                         self.say(Tone::Out, "UNA.ELF console launches: run <path> [args], and bare names (detached)");
                     }
                     self.say(Tone::Out, "keys: Ctrl+1 tree, Ctrl+2 editor, Ctrl+3 console (Esc cycles), Ctrl+O open, Ctrl+S save, Ctrl+Q quit");
+                    self.say(Tone::Out, "tabs: Ctrl+T next, Ctrl+4..9 tab 1..6, Ctrl+W close; Ctrl+F find, Ctrl+L replace (Tab swaps, Ctrl+W whole-word, Ctrl+A all), Ctrl+G line");
                 }
                 (1, word.clone(), true)
             }
