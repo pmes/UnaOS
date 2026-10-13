@@ -247,6 +247,12 @@ pub enum SMessage {
     /// AUDIOTRACK (SR45): silence (`muted`) or restore the session's audio. The clock keeps
     /// running on the device — a muted `<video>` stays in sync — only the samples are zeroed.
     MediaMute { url: String, muted: bool },
+    /// AETHERMEDIA (SR107): the session's output gain, 0.0..=1.0 (HTMLMediaElement.volume); linear,
+    /// applied to the samples after decode. Mute is separate (`MediaMute`) and wins.
+    MediaVolume { url: String, volume: f32 },
+    /// AETHERMEDIA (SR107): the session's playback rate (HTMLMediaElement.playbackRate). 0 holds the
+    /// clock (the session stays playing); other values scale the clock and the frame schedule.
+    MediaRate { url: String, rate: f64 },
     /// Stria → requester: the stream is open. `video` / `audio` name the codecs ("" when the
     /// track is absent); `real_video` is false when the frames are the labelled test-pattern
     /// stand-in (no decoder for the codec yet); `audio_clock` is true when audio is playing and

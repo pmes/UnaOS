@@ -2032,7 +2032,7 @@ pub fn render_frame(
                 }
 
                 if tag == "img" {
-                    let src = crate::images::effective_img_src(&el.attributes.borrow());
+                    let src = crate::images::img_source(dom_node, crate::images::SELECTION_VIEWPORT); // AETHERMEDIA SR107: <picture>
                     if let Some(img) = src.as_deref().and_then(crate::images::get) {
                         // The painted SPAN clamps to the viewport; the box
                         // ORIGIN must not. Clamping the origin re-anchors a

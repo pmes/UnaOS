@@ -104,7 +104,28 @@ pub fn decode_raster(bytes: &[u8]) -> Option<image::RgbaImage> {
             Err(_) => {}
         }
     }
+    // AETHERMEDIA (SR107): AVIF through av1_core (AVCODEC, SR24) — never the image crate.
+    if is_avif(bytes) {
+        return match av1_core::image::decode_avif(bytes) {
+            Ok(img) => image::RgbaImage::from_raw(img.w, img.h, img.rgba),
+            Err(e) => {
+                crate::ledger::record_dom(&format!("img-avif-refused:{e:?}"));
+                None
+            }
+        };
+    }
     image::load_from_memory(bytes).ok().map(|i| i.to_rgba8())
+}
+
+/// An ISOBMFF file whose `ftyp` major or compatible brands name AVIF (`avif`, `avis`).
+pub fn is_avif(bytes: &[u8]) -> bool {
+    if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let end = size.clamp(16, bytes.len());
+    let brand = |b: &[u8]| b == b"avif" || b == b"avis";
+    brand(&bytes[8..12]) || bytes[16..end].chunks_exact(4).any(brand)
 }
 
 /// Minimal %XX decoder for data: URI payloads ('+' left as-is per RFC 2397).
@@ -389,8 +410,7 @@ pub fn effective_img_src(attrs: &crate::dom::Attributes) -> Option<String> {
 
 /// Image MIME types `decode_raster` / `decode_svg` take, for a `<picture>`'s `<source type>`:
 /// pixel_core's formats (PNG, JPEG, GIF, BMP, QOI, WebP), the `image` crate fallback's
-/// (ICO, TIFF) and SVG when the `svg` feature rasterises it. AVIF is refused here until Aether
-/// links av1_core's `decode_avif`, so a `<picture>` falls through to its next source.
+/// (ICO, TIFF), SVG when the `svg` feature rasterises it, and AVIF through av1_core.
 pub fn can_decode_type(mime: &str) -> bool {
     let base = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     match base.as_str() {
@@ -398,6 +418,7 @@ pub fn can_decode_type(mime: &str) -> bool {
         | "image/webp" | "image/qoi" => true,
         "image/x-icon" | "image/vnd.microsoft.icon" | "image/tiff" => cfg!(feature = "image-fallback"),
         "image/svg+xml" => cfg!(feature = "svg"),
+        "image/avif" => true,
         _ => false,
     }
 }
@@ -457,6 +478,71 @@ pub fn is_lazy(attrs: &crate::dom::Attributes) -> bool {
 pub fn lazy_should_load(box_y: f32, box_h: f32, scroll_y: f32, viewport_h: f32) -> bool {
     const MARGIN: f32 = 1250.0;
     box_y + box_h >= scroll_y - MARGIN && box_y <= scroll_y + viewport_h + MARGIN
+}
+
+// ------------------------------------------------------------------ loading=lazy (AETHERMEDIA SR107)
+
+/// Lazy images asked for (absolute urls) and the ones decoded off-thread, waiting for the engine.
+static LAZY_ASKED: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+static LAZY_DONE: std::sync::Mutex<Vec<(String, image::RgbaImage)>> = std::sync::Mutex::new(Vec::new());
+
+/// True when `abs` is decoded in the current page's store.
+pub fn has(abs: &str) -> bool {
+    STORE.with(|s| s.borrow().images.contains_key(abs))
+}
+
+/// Fetch and decode one lazy image off the engine thread (once per url per process); the result
+/// lands in the page store at the engine's next [`take_lazy_loaded`]. A refused, failed or
+/// undecodable image is ledgered.
+pub fn request_lazy(abs: &str) {
+    let Some(url) = crate::security::subresource_url(abs, "image") else { return };
+    {
+        let mut asked = LAZY_ASKED.lock().unwrap();
+        if !asked.get_or_insert_with(Default::default).insert(abs.to_string()) {
+            return;
+        }
+    }
+    let key = abs.to_string();
+    std::thread::Builder::new()
+        .name("aether-lazy-img".into())
+        .spawn(move || {
+            use std::io::Read;
+            let fetched = (|| -> Result<Vec<u8>, String> {
+                let client = crate::net::blocking_client_builder().build().map_err(|e| e.to_string())?;
+                let mut resp = client.get(&url).send().map_err(|e| e.to_string())?;
+                let status = resp.status().as_u16();
+                if !(200..300).contains(&status) {
+                    return Err(format!("HTTP {status}"));
+                }
+                let mut body = Vec::new();
+                resp.read_to_end(&mut body).map_err(|e| e.to_string())?;
+                Ok(body)
+            })();
+            match fetched {
+                Ok(bytes) => match decode_raster(&bytes).or_else(|| decode_svg(&bytes)) {
+                    Some(img) => LAZY_DONE.lock().unwrap().push((key, img)),
+                    None => crate::ledger::record_dom(&format!("img-lazy-decode-failed:{}", &key[..key.len().min(48)])),
+                },
+                Err(e) => crate::ledger::record_dom(&format!("img-lazy-fetch-failed:{}: {e}", &key[..key.len().min(48)])),
+            }
+        })
+        .ok();
+}
+
+/// Install the lazy images decoded since the last call into this page's store; returns how many
+/// (the engine relayouts when any arrived).
+pub fn take_lazy_loaded() -> usize {
+    let done: Vec<(String, image::RgbaImage)> = std::mem::take(&mut *LAZY_DONE.lock().unwrap());
+    let n = done.len();
+    if n > 0 {
+        STORE.with(|s| {
+            let mut s = s.borrow_mut();
+            for (k, img) in done {
+                s.images.insert(k, Rc::new(img));
+            }
+        });
+    }
+    n
 }
 
 /// The current page's base url (set by set_page).

@@ -531,8 +531,12 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(imgs) = document.select("img") {
         for img in imgs {
-            let attrs = img.attributes.borrow();
-            let Some(src) = crate::images::effective_img_src(&attrs) else { continue };
+            // AETHERMEDIA (SR107): `loading=lazy` waits for its box to near the viewport (the
+            // engine's lazy pass fetches it); `<picture>` picks its source by media and type.
+            if crate::images::is_lazy(&img.attributes.borrow()) {
+                continue;
+            }
+            let Some(src) = crate::images::img_source(img.as_node(), crate::images::SELECTION_VIEWPORT) else { continue };
             let src = src.as_str();
             if src.starts_with("data:") {
                 continue; // decoded synchronously at load, no fetch needed

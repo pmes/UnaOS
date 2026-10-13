@@ -53,6 +53,9 @@ font_core = { path = "../../unaos/libs/text/font_core" }
 text_host = { path = "../../libs/text_host" }
 # AETHERFONT: WOFF 1.0 tables inflate through PIXELCORE's zlib (in-tree).
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }
+# AETHERMEDIA (SR107): `<img>` AVIF decodes through AVCODEC's own reader + decoder (`av1_core::image::decode_avif`,
+# no_std, zero deps) ahead of the `image` crate fallback.
+av1_core = { path = "../../unaos/libs/media/av1_core" }
 base64 = "0.23"
 resvg = { version = "0.48.1", optional = true }  # EYES bumped to latest stable (R83); PIXELCORE keeps it behind `svg`
 # HTTPCORE (SR51): tokio-tungstenite deleted — no live caller (api/websockets.rs is a stub); an RFC 6455 client is owed.

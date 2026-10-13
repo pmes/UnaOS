@@ -51,10 +51,10 @@
 //! * `loop` (read live from the attribute, so `el.loop = true` works through reflection): at
 //!   `MediaEnded` the element seeks to 0 and plays on — no `ended`, no `pause`.
 //! * `currentTime` during a seek reads the target (the frame follows); `seeking` until it lands.
-//! * `volume`: there is no volume verb on the bus, so volume 0 is forwarded as `MediaMute` (the
-//!   effective mute is `muted || volume == 0`), other levels are kept page-side and ledgered.
-//! * `playbackRate`: no rate verb either; rate 0 pauses the stream on the wire (the element stays
-//!   "potentially playing", as HTML says), other rates are kept page-side and ledgered.
+//! * `volume` → `MediaVolume` (Stria scales the samples; `muted` stays its own `MediaMute`).
+//! * `playbackRate` → `MediaRate` (Stria: 0 holds the clock while the element stays "potentially
+//!   playing", as HTML says; other rates scale the clock where Stria can, see `Player::set_rate`).
+//!   Both reach a session that opens later with its opening request.
 //!
 //! Decoding is never Aether's: every picture and sample comes from Stria, which decodes through
 //! the owned cores (`gneiss_pal::dsp` = `demux_core`, `vp8_core`, `av1_core` behind its `av1`
@@ -146,8 +146,6 @@ pub struct Element {
     pub last_timeupdate_ns: i64,
     /// A play happened and `playing` has not been fired for it yet.
     pub playing_owed: bool,
-    /// The mute state last sent to Stria (`muted || volume == 0`).
-    pub wire_muted: bool,
     /// Every media event fired at this element, in order (tests, the headless report).
     pub events: Vec<&'static str>,
 }
@@ -419,8 +417,20 @@ fn open_requests(out: &mut Vec<SMessage>, e: &Element, what: Deferred, title: &s
         Deferred::Poster => out.push(SMessage::MediaPoster { url: e.url.clone() }),
         Deferred::Play => out.push(SMessage::PlayMedia { url: e.url.clone(), title: title.to_string(), mime: e.mime.clone() }),
     }
+    settings_requests(out, e);
+}
+
+/// What a session needs to match the element's script-set state when it opens: `MediaMute` when
+/// muted, `MediaVolume` / `MediaRate` (AETHERMEDIA SR107) when not the defaults.
+fn settings_requests(out: &mut Vec<SMessage>, e: &Element) {
     if e.muted {
         out.push(SMessage::MediaMute { url: e.url.clone(), muted: true });
+    }
+    if e.volume != 1.0 {
+        out.push(SMessage::MediaVolume { url: e.url.clone(), volume: e.volume as f32 });
+    }
+    if e.rate != 1.0 {
+        out.push(SMessage::MediaRate { url: e.url.clone(), rate: e.rate });
     }
 }
 
@@ -627,7 +637,6 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
                 error_code: 0,
                 last_timeupdate_ns: 0,
                 playing_owed: autoplays,
-                wire_muted: muted,
                 events: Vec::new(),
             };
             // HTML §4.8.11.5 resource selection: networkState LOADING and `loadstart`; under
@@ -846,8 +855,10 @@ pub fn play(node: &NodeRef) -> bool {
         }
         let title = r.title.clone();
         r.outbox.push(SMessage::PlayMedia { url: url.clone(), title, mime });
-        if r.elements[i].wire_muted && state == State::Idle {
-            r.outbox.push(SMessage::MediaMute { url, muted: true });
+        if state == State::Idle {
+            let mut out = Vec::new();
+            settings_requests(&mut out, &r.elements[i]);
+            r.outbox.extend(out);
         }
         let e = &mut r.elements[i];
         if state == State::Ended {
@@ -922,20 +933,17 @@ pub fn set_muted(node: &NodeRef, muted: bool) -> bool {
         let Some(i) = find(&r, node) else { return false };
         let open = !matches!(r.elements[i].state, State::Idle);
         r.elements[i].muted = muted;
-        // the effective mute: muted, or volume 0 (no volume verb on the bus)
-        let wire = muted || r.elements[i].volume == 0.0;
-        r.elements[i].wire_muted = wire;
         if open {
             let url = r.elements[i].url.clone();
-            r.outbox.push(SMessage::MediaMute { url, muted: wire });
+            r.outbox.push(SMessage::MediaMute { url, muted });
         }
         true
     })
 }
 
 /// Set `node`'s element `volume` (HTMLMediaElement.volume). `Err` when outside 0..=1 (the binding
-/// throws IndexSizeError). Fires `volumechange`; volume 0 is forwarded to Stria as `MediaMute`
-/// (there is no volume verb on the bus), other levels are page-side and ledgered.
+/// throws IndexSizeError). Fires `volumechange`; an open session gets `MediaVolume` (Stria scales
+/// the samples; mute stays separate and wins), an unopened one gets it with its opening request.
 pub fn set_volume(node: &NodeRef, volume: f64) -> Result<bool, ()> {
     if !(0.0..=1.0).contains(&volume) {
         return Err(());
@@ -947,26 +955,18 @@ pub fn set_volume(node: &NodeRef, volume: f64) -> Result<bool, ()> {
             return true;
         }
         r.elements[i].volume = volume;
-        if volume != 0.0 && volume != 1.0 {
-            crate::ledger::record_dom("media-volume-level-page-side");
-        }
-        let wire = r.elements[i].muted || volume == 0.0;
-        let open = !matches!(r.elements[i].state, State::Idle);
-        if wire != r.elements[i].wire_muted {
-            r.elements[i].wire_muted = wire;
-            if open {
-                let url = r.elements[i].url.clone();
-                r.outbox.push(SMessage::MediaMute { url, muted: wire });
-            }
+        if !matches!(r.elements[i].state, State::Idle) {
+            let url = r.elements[i].url.clone();
+            r.outbox.push(SMessage::MediaVolume { url, volume: volume as f32 });
         }
         fire(&mut r.elements[i], "volumechange");
         true
     }))
 }
 
-/// Set `node`'s element `playbackRate`. Fires `ratechange`. Rate 0 pauses the stream on the wire
-/// while the element stays playing (HTML: not paused, but not advancing); a non-zero rate resumes
-/// it. Rates other than 0 and 1 are page-side and ledgered: the bus has no rate verb.
+/// Set `node`'s element `playbackRate`. Fires `ratechange`; an open session gets `MediaRate`
+/// (Stria: 0 holds the clock with the element still playing, as HTML says; another rate scales the
+/// clock — see Stria's `Player::set_rate` for what it refuses).
 pub fn set_playback_rate(node: &NodeRef, rate: f64) -> bool {
     if !rate.is_finite() {
         return false;
@@ -979,16 +979,9 @@ pub fn set_playback_rate(node: &NodeRef, rate: f64) -> bool {
             return true;
         }
         r.elements[i].rate = rate;
-        if rate != 0.0 && rate != 1.0 {
-            crate::ledger::record_dom("media-playbackrate-page-side");
-        }
-        if r.elements[i].state == State::Playing {
+        if !matches!(r.elements[i].state, State::Idle) {
             let url = r.elements[i].url.clone();
-            if rate == 0.0 && old != 0.0 {
-                r.outbox.push(SMessage::MediaPause { url });
-            } else if rate != 0.0 && old == 0.0 {
-                r.outbox.push(SMessage::MediaResume { url });
-            }
+            r.outbox.push(SMessage::MediaRate { url, rate });
         }
         fire(&mut r.elements[i], "ratechange");
         true

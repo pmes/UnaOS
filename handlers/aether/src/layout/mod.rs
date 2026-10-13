@@ -124,9 +124,7 @@ impl layout_core::Host for AetherHost {
         crate::media::intrinsic_size(node)
     }
     fn img_intrinsic(node: &NodeRef) -> Option<(f32, f32)> {
-        let el = node.as_element()?;
-        let attrs = el.attributes.borrow();
-        crate::images::effective_img_src(&attrs)
+        crate::images::img_source(node, crate::images::SELECTION_VIEWPORT) // AETHERMEDIA SR107: <picture>
             .and_then(|s| crate::images::get(&s))
             .map(|i| (i.width() as f32, i.height() as f32))
     }

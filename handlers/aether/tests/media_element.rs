@@ -54,6 +54,8 @@ fn names(reqs: &[SMessage]) -> Vec<String> {
             SMessage::MediaPause { url } => format!("pause {}", url.rsplit('/').next().unwrap()),
             SMessage::MediaResume { url } => format!("resume {}", url.rsplit('/').next().unwrap()),
             SMessage::MediaMute { url, muted } => format!("mute={muted} {}", url.rsplit('/').next().unwrap()),
+            SMessage::MediaVolume { url, volume } => format!("volume={volume} {}", url.rsplit('/').next().unwrap()),
+            SMessage::MediaRate { url, rate } => format!("rate={rate} {}", url.rsplit('/').next().unwrap()),
             other => format!("{other:?}"),
         })
         .collect()
@@ -136,9 +138,9 @@ fn video_end_seek_and_error() {
 }
 
 /// Rule: an audio-only stream is HAVE_ENOUGH_DATA at `MediaOpened` (no picture to wait for);
-/// volume 0 goes to Stria as `MediaMute`, other levels stay page-side; out-of-range volume is
-/// refused; playbackRate 0 pauses the stream on the wire and a non-zero rate resumes it;
-/// `preload=none` suspends after `loadstart`.
+/// volume goes to Stria as `MediaVolume` (mute stays its own verb); out-of-range volume is
+/// refused; playbackRate goes as `MediaRate` and 0 leaves the element playing; `preload=none`
+/// suspends after `loadstart`, and a volume set before it opens rides its opening request.
 #[test]
 fn audio_volume_rate_and_preload() {
     let mut e = engine_with(r#"<html><body><audio src="s.wav" controls></audio><audio src="n.wav" preload="none"></audio></body></html>"#);
@@ -156,9 +158,9 @@ fn audio_volume_rate_and_preload() {
     );
 
     assert_eq!(media::set_volume(&s, 0.0), Ok(true));
-    assert_eq!(names(&e.take_media_requests()), vec!["mute=true s.wav"]);
+    assert_eq!(names(&e.take_media_requests()), vec!["volume=0 s.wav"]);
     assert_eq!(media::set_volume(&s, 0.5), Ok(true));
-    assert_eq!(names(&e.take_media_requests()), vec!["mute=false s.wav"]);
+    assert_eq!(names(&e.take_media_requests()), vec!["volume=0.5 s.wav"]);
     assert_eq!(media::volume(&s), 0.5);
     assert_eq!(media::set_volume(&s, 1.5), Err(()));
 
@@ -166,13 +168,19 @@ fn audio_volume_rate_and_preload() {
     assert_eq!(names(&e.take_media_requests()), vec!["play s.wav"]);
     e.on_media_message(&meter(url, 0));
     assert!(media::set_playback_rate(&s, 0.0));
-    assert_eq!(names(&e.take_media_requests()), vec!["pause s.wav"]);
+    assert_eq!(names(&e.take_media_requests()), vec!["rate=0 s.wav"]);
     assert_eq!(e.media_elements()[0].state, State::Playing, "rate 0 is not paused");
     assert!(media::set_playback_rate(&s, 1.0));
-    assert_eq!(names(&e.take_media_requests()), vec!["resume s.wav"]);
+    assert_eq!(names(&e.take_media_requests()), vec!["rate=1 s.wav"]);
     assert_eq!(media::playback_rate(&s), 1.0);
     let ev = media::events(&s);
     assert_eq!(&ev[6..], &["volumechange", "volumechange", "play", "playing", "ratechange", "ratechange"], "{ev:?}");
+
+    // preload=none: the volume waits in the element and goes out after the opening request
+    assert_eq!(media::set_volume(&n, 0.25), Ok(true));
+    assert!(e.take_media_requests().is_empty(), "no session yet");
+    assert!(media::toggle(&n));
+    assert_eq!(names(&e.take_media_requests()), vec!["play n.wav", "volume=0.25 n.wav"]);
 }
 
 /// Rule: resource selection takes the first `<source>` whose `type` this engine can play; when
@@ -195,7 +203,7 @@ fn source_selection_by_type() {
 
 /// Rule (images): `srcset` parses per HTML (a comma inside a url is part of it), `sizes` turns
 /// width descriptors into densities, `<picture>` takes its first `<source>` whose media matches
-/// and whose type decodes (AVIF falls through until Aether links av1_core), else the img;
+/// and whose type decodes (AVIF does, through av1_core; JPEG XL does not), else the img;
 /// `loading=lazy` loads within 1250 px of the viewport.
 #[test]
 fn img_srcset_sizes_picture_and_lazy() {
@@ -209,18 +217,25 @@ fn img_srcset_sizes_picture_and_lazy() {
     let doc = aether::dom::parse_html(
         r#"<html><body>
             <picture id=p>
-              <source srcset="a.avif" type="image/avif">
+              <source srcset="a.jxl" type="image/jxl">
               <source srcset="n.png" media="(max-width: 100px)">
               <source srcset="w-400.png 400w, w-1000.png 1000w" sizes="50vw">
               <img src="f.png">
             </picture>
-            <picture id=q><source srcset="x.avif" type="image/avif"><img src="fallback.png" srcset="hi.png 2x"></picture>
+            <picture id=q><source srcset="x.avif" type="image/avif"><img src="fallback.png"></picture>
+            <picture id=r><source srcset="y.jxl" type="image/jxl"><img src="fallback.png" srcset="hi.png 2x"></picture>
             <img id=l src="lazy.png" loading="lazy">
         </body></html>"#,
     );
     let img = |sel: &str| doc.select(sel).unwrap().next().unwrap().as_node().clone();
     assert_eq!(aether::images::img_source(&img("#p img"), (800.0, 600.0)).as_deref(), Some("w-400.png"));
-    assert_eq!(aether::images::img_source(&img("#q img"), (800.0, 600.0)).as_deref(), Some("fallback.png"));
+    assert_eq!(aether::images::img_source(&img("#q img"), (800.0, 600.0)).as_deref(), Some("x.avif"));
+    assert_eq!(aether::images::img_source(&img("#r img"), (800.0, 600.0)).as_deref(), Some("fallback.png"));
+    // an AVIF file is recognised by its ftyp brand (and decoded by av1_core, not the image crate)
+    let mut ftyp = vec![0, 0, 0, 0x1c];
+    ftyp.extend_from_slice(b"ftypmif1\0\0\0\0mif1avifmiaf");
+    assert!(aether::images::is_avif(&ftyp));
+    assert!(!aether::images::is_avif(b"\x89PNG\r\n\x1a\n0000000000"));
     let lazy = img("#l");
     assert!(aether::images::is_lazy(&lazy.as_element().unwrap().attributes.borrow()));
     assert!(aether::images::lazy_should_load(1800.0, 100.0, 0.0, 600.0));
