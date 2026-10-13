@@ -20700,7 +20700,7 @@ fn paint_window(
         );
     }
 
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if !r.compat && super::look::is_softy() { super::softy::chrome::paint(dst, r, ox, oy, focused, controls(r).is_some(), &r.title[..r.title_len]); } if r.x >= pw || r.y >= ph { // SOFTY (B629): the Softy head and frame over the stock chrome, before the content; LINE-NEUTRAL fold, code first
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if !r.compat && super::look::is_softy() { super::softy::chrome::paint(dst, r, ox, oy, focused, controls(r).is_some(), &r.title[..r.title_len]); } else if !r.compat { self::desktop::chrome_paint(dst, r, ox, oy, focused, controls(r).is_some()); } if r.x >= pw || r.y >= ph { // DESKTOPCRAFT (B631): the Una head, frame band and shadow (`wm::desktop`) over the stock chrome, the same seat as Softy's; same fold. SOFTY (B629): the Softy head and frame over the stock chrome, before the content; LINE-NEUTRAL fold, code first
         comp_mark(r.id, mk + PW_EXIT);
         return;
     }
@@ -30456,3 +30456,10 @@ pub fn app_name_arm_launch(owner: u64, path: &str) -> bool {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 #[path = "fbdirect.rs"]
 pub mod fbdirect;
+// DESKTOPCRAFT (B631): the Una look's paint — the window chrome and its shadow in the frame band, the menu bar's and
+// the dock's VEIL fields, the generated wallpaper and `tests desktopcraft`. Declared at this file's tail with
+// `#[path]` (fbdirect's precedent) so `video/mod.rs` does not move and it reads the window row's fields; the same
+// gate as `draw`, so it is cfg-erased knob-off.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+#[path = "desktop.rs"]
+pub mod desktop;

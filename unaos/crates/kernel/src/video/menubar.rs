@@ -1828,7 +1828,7 @@ fn crystal_facet(u: usize, v: usize) -> Option<u32> {
 /// the fill ink over empty ones — one rule, both cases, no third colour. The build-time asserts on
 /// [`BOLT_W`]/[`BOLT_H`] keep it strictly inside the outline, which is what makes "whatever is under
 /// it" mean fill-or-face and never the cell's own edge.
-fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, it: super::status::BarItem) {
+fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, it: super::status::BarItem) { if wm::desktop::battery_row(out, w, h, j, x0, (BATT_BODY_W(), BATT_BODY_H()), (BATT_CAP_W(), BATT_CAP_H()), it.percent.min(100) as u8, it.charging) { return; } // DESKTOPCRAFT (B631): the kit's battery — a rounded outline, the fill level, the nub, an anti-aliased bolt; same slot, same rows; LINE-NEUTRAL fold, code first
     let by0 = (h - BATT_BODY_H()) / 2;
     if j < by0 || j >= by0 + BATT_BODY_H() {
         return;
@@ -1908,7 +1908,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     };
     for i in 0..w {
         out[i] = fill;
-    }
+    } wm::desktop::bar_field_row(out, r.0, r.1, w, h, j); // DESKTOPCRAFT (B631): the field is the face at 92 % over the wallpaper's VEIL (blurred once per picture) with one hairline at the foot, replacing the bevel and the keyline; every overlay below is unchanged; LINE-NEUTRAL fold, code first
 
     // The brand CRYSTAL, overlaid at its one-PAD left inset ([`crystal_offset`]). Drawn BEFORE the
     // text early-return because the gem spans more rows than the glyph cell does — it is centred in
