@@ -378,6 +378,9 @@ const BOLT: [u8; 8] = [
     ck.t(FLOOR_H() <= 480);
     // The title must be representable in what `wm` actually stores.
     const _: () = assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
+    // SNTP6: the caption starts past the crystal and the clock's slot is reserved in the width floor
+    // whether or not a clock is drawn — so no clock state can move or shorten the title.
+    #[cfg(feature = "sntp6")] { ck.t(TITLE_X0() > 0); ck.t(FLOOR_W() >= (CLOCK_GLYPHS + 1) * CELL_W()); }
 
     // The crystal must fit inside the bar with a bevel of clearance each side — the disc's own floor.
     ck.t(CRYSTAL_H() + 2 * theme::BEVEL() <= BAR_H());
@@ -2717,17 +2720,8 @@ pub fn firstpaint_selftest(pw: usize, ph: usize) {
 static BARCLOCK_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// The title's geometry does not mention the clock, so the clock's state cannot move the caption.
-/// Compile-time, because that is what the claim actually is.
-#[cfg(feature = "sntp6")]
-const _: () = {
-    // The caption starts at a constant that does not mention the clock, and it is allowed the whole
-    // stored title either way — so no clock state can move or shorten it.
-    assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
-    assert!(TITLE_X0() > 0);
-    // And the clock's slot is RESERVED in the width floor whether or not a clock is drawn, which is
-    // the mechanism that keeps the above true: an unsynced bar does not hand the title that space.
-    assert!(FLOOR_W() >= (CLOCK_GLYPHS + 1) * CELL_W());
-};
+/// Checked at runtime in [`uimetrics_sanity`] since FONT (GR27) made the cell metrics face-derived
+/// (`TITLE_X0`/`FLOOR_W`/`CELL_W` are no longer `const`; the one const claim, `TITLE_GLYPHS <= MAX_TITLE`, stays there).
 
 /// Report the bar's clock state ONCE per state per boot. `Some((x, y, w, h))` is the rect the clock
 /// was just drawn into (panel-relative, the bar sits at `y = 0`); `None` is the unsynced state, in
