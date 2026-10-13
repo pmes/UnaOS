@@ -60,6 +60,7 @@ dependencies = [
  "html_core",
  "image",
  "js_core",
+ "kvstore_core",
  "layout_core",
  "pixel_core",
  "resvg",
@@ -2862,6 +2863,10 @@ dependencies = [
  "polycool",
  "smallvec",
 ]
+
+[[package]]
+name = "kvstore_core"
+version = "0.1.0"
 
 [[package]]
 name = "layout_core"
