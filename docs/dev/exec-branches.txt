@@ -493,3 +493,4 @@ refs/heads/exec-rmbp-keplergr4                  bd3d399d IN-FLIGHT cloud 2026-10
 refs/heads/exec-pi-piemptybin                 bd3d399d IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-glasskit                   bd3d399d IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-softy                      bd3d399d IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-host-designlang                 bd3d399d IN-FLIGHT cloud 2026-10-14
