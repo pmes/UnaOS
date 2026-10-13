@@ -141,7 +141,8 @@ fn ledger_rules(rules: &[css_core::stylesheet::CssRule]) {
                         Some(PE::FirstLetter) => "first-letter",
                         Some(PE::Placeholder) => "placeholder",
                         Some(PE::Selection) => "selection",
-                        Some(PE::Backdrop) => "backdrop",
+                        // AETHERTOP (SR146): `::backdrop` is painted (`top_layer_backdrops`).
+                        Some(PE::Backdrop) => continue,
                         Some(PE::FileSelectorButton) => "file-selector-button",
                         Some(PE::Slotted(_)) => "slotted",
                         Some(PE::Part(_)) => "part",
@@ -524,7 +525,78 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
 /// dialog without an `open` attribute is `display: none`). Owed beside it, once css_core parses the pseudo-classes
 /// (docs/dev/evidence/aetherwpt/WPT.md §AETHERAPIS): `[popover]:not(:popover-open) { display: none }`,
 /// `dialog:modal` and `::backdrop`.
-const UA_SHEET: &str = "dialog:not([open]) { display: none; }";
+/// AETHERTOP (SR146): HTML §15.5.x "the top layer" / §15.3.x rendering rules for the dialog element and popovers,
+/// Fullscreen §7's UA rules, and the `::backdrop` boxes (CSS Position 4 §top-layer): a hidden popover has no box; a
+/// showing one and a modal dialog are fixed boxes of the viewport (laid out from its top-left corner — the engine's
+/// box builder has no `fit-content`, so the spec's `inset: 0; margin: auto` centering, which needs it, is not written:
+/// with both insets an auto width would stretch to the viewport); the fullscreen element fills the viewport; a modal
+/// dialog's backdrop is the spec's translucent black, a popover's transparent. `render` paints each top-layer element
+/// after its backdrop (`top_layer_paint`).
+const UA_SHEET: &str = "\
+dialog:not([open]) { display: none; }\
+[popover]:not(:popover-open):not(dialog[open]) { display: none; }\
+dialog:popover-open { display: block; }\
+[popover] { position: fixed; top: 0; left: 0; margin: 0; border: solid; padding: 0.25em; overflow: auto; color: canvastext; background-color: canvas; }\
+dialog:modal { position: fixed; top: 0; left: 0; margin: 0; overflow: auto; }\
+:not(:root):fullscreen { position: fixed; inset: 0; margin: 0; box-sizing: border-box; min-width: 0; max-width: none; min-height: 0; max-height: none; width: 100%; height: 100%; transform: none; }\
+::backdrop { position: fixed; inset: 0; }\
+dialog:modal::backdrop { background-color: rgba(0, 0, 0, 0.1); }\
+";
+
+thread_local! {
+    /// AETHERTOP (SR146): the top layer as the last cascade of the page's document saw it — each element (DOM node)
+    /// with its `::backdrop`'s background colour and alpha (None: no backdrop paints — `transparent`, or no rule).
+    static TOP_LAYER_PAINT: std::cell::RefCell<Vec<(html_core::NodeId, Option<((u8, u8, u8), f32)>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The top layer to paint above the document, in order, each with its `::backdrop` colour (see `TOP_LAYER_PAINT`).
+pub(crate) fn top_layer_paint() -> Vec<(html_core::NodeId, Option<((u8, u8, u8), f32)>)> {
+    TOP_LAYER_PAINT.with(|t| t.borrow().clone())
+}
+
+/// The `::backdrop` of each top-layer element: its `background-color` (or a `background` that is one colour) from
+/// the winning `::backdrop` rule (Cascade 5 order: importance, origin, specificity, appearance — `@media` and
+/// `@container` conditions of the rule's ancestors are not evaluated here, the dated gap), the UA sheet's included.
+fn top_layer_backdrops(doc: &html_core::Document, rules: &css_core::cascade::RuleSet<'_>) -> Vec<(html_core::NodeId, Option<((u8, u8, u8), f32)>)> {
+    use css_core::matching::{matches_for_pseudo, MatchContext};
+    use css_core::selectors::PseudoElement as PE;
+    let top = crate::js::toplayer::top_layer();
+    let mut out = Vec::with_capacity(top.len());
+    for (id, _) in top {
+        let id = html_core::NodeId(id);
+        if doc.element(id).is_none() {
+            continue;
+        }
+        let me = crate::dom::El::new(doc, id);
+        let cx = MatchContext { scope: None };
+        let mut best: Option<((bool, u8, css_core::selectors::Specificity, u32, usize), String)> = None;
+        for e in &rules.entries {
+            if e.selector.pseudo_element != Some(PE::Backdrop) || !matches_for_pseudo(e.selector, &me, Some(&PE::Backdrop), &cx) {
+                continue;
+            }
+            let origin = match e.origin {
+                css_core::cascade::Origin::UserAgent => 0,
+                css_core::cascade::Origin::User => 1,
+                css_core::cascade::Origin::Author => 2,
+            };
+            for (k, d) in e.declarations.iter().enumerate() {
+                let name = d.name.to_ascii_lowercase();
+                if name != "background-color" && name != "background" {
+                    continue;
+                }
+                // an important declaration beats every normal one; among importants the UA's win (Cascade 5 §6.1)
+                let origin_rank = if d.important { 2 - origin } else { origin };
+                let key = (d.important, origin_rank, e.selector.specificity, e.order, k);
+                if best.as_ref().is_none_or(|(b, _)| key > *b) {
+                    best = Some((key, value_text(&d.value)));
+                }
+            }
+        }
+        let color = best.and_then(|(_, v)| <crate::layout::AetherHost as layout_core::Host>::parse_color_alpha(&v)).filter(|c| c.1 > 0.0);
+        out.push((id, color));
+    }
+    out
+}
 
 // AETHERWPT3 (SR138): constructable stylesheets adopted by the page's document (CSSOM §6.1.2
 // `adoptedStyleSheets`, js/stylesheets.rs). The document's CSS style sheets are its own sheets in tree order
@@ -747,6 +819,13 @@ fn apply_stylesheets_with(
     let (styles, root_customs, pseudo_styles, recorded) =
         any.with_doc(|doc, _| cascade_document(doc, &rules, &pseudo_rules, &boxed, containers, scope.as_ref(), cacheable));
     drop(scope);
+    // AETHERTOP (SR146): the top layer's `::backdrop` colours, read off this cascade's rules when the tree is the
+    // page's own document (the top layer is the page's); the painter reads them each frame.
+    if hover.is_some() {
+        let own = crate::js::page(|p| p.doc.clone()).is_some_and(|d| any.same_document(&d));
+        let list = if own { any.with_doc(|doc, _| top_layer_backdrops(doc, &rules)) } else { Vec::new() };
+        TOP_LAYER_PAINT.with(|t| *t.borrow_mut() = list);
+    }
     if let (Some(els), Some(hover)) = (recorded, hover) {
         STYLE_CACHE.with(|c| {
             *c.borrow_mut() = Some(StyleCache {
@@ -757,6 +836,7 @@ fn apply_stylesheets_with(
                 hover: hover.to_vec(),
                 focused,
                 pointer_focus: pf,
+                toplayer_gen: crate::js::toplayer::generation(),
                 els,
             })
         });
@@ -926,6 +1006,9 @@ struct StyleCache {
     hover: Vec<html_core::NodeId>,
     focused: Option<html_core::NodeId>,
     pointer_focus: bool,
+    /// AETHERTOP (SR146): the top-layer generation (js/toplayer.rs) the cascade read `:popover-open` / `:modal` /
+    /// `:fullscreen` at.
+    toplayer_gen: u64,
     els: std::collections::HashMap<html_core::NodeId, CachedEl>,
 }
 
@@ -1111,6 +1194,9 @@ fn restyle_plan(
             }
             // Custom element definitions change without a recorded DOM change.
             S::Defined => return None,
+            // AETHERTOP (SR146): the top layer changes without a recorded DOM change (a popover shown, a modal
+            // dialog opened, the fullscreen element set): its generation says whether anything could have flipped.
+            S::PopoverOpen | S::Modal | S::Fullscreen if prev.toplayer_gen != crate::js::toplayer::generation() => return None,
             // Every other host-driven state is `dom::El::state`'s `html_state` fallback, which answers false for
             // it whatever the document does: nothing can flip it.
             _ => Vec::new(),
