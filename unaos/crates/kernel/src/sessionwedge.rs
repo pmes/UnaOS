@@ -26,6 +26,10 @@
 //!    5 s of the ignition, the pump stamped through the whole 5 s window with no gap of [`WEDGE_MS`], and the watch's
 //!    print path fired on a fixture-fed stale stamp (`-> SEEN :: fixture=1`, the same formatter, painted too), and
 //!    the fixture's band was handed back to the compositor, not filled (`cleared=damage rects=<n>`, FBDIRECT B536).
+//! 5. SETTERWEDGE (rmbp-ledger B553, flight 33 boot 1) — the file tail: the watch is ARMED AT THE IGNITION
+//!    ([`arm`], from `boot::ignite`), not at the render task's first lag roll after it; a wedge prints a per-core
+//!    census of what every core runs and spins on; and the cable is drained from the watch core while the pump is
+//!    stopped (`xhci::ftdi_flush_sync`), so the wedge's own lines reach the bench. `tests setterwedge`.
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
@@ -139,6 +143,7 @@ pub fn look(now: u64) {
             if t != 0 {
                 crate::sync::name_task(t, "PUMPWEDGE: the usb-pump, stopped"); // LOCKREG: its holds and the lock it spins on
             }
+            census("wedge"); // SETTERWEDGE (B553): every core's running task and the lock it spins on, once per wedge
         } else if now >= NEXT_PAINT.load(Relaxed) {
             NEXT_PAINT.store(now + PAINT_EVERY_MS, Relaxed);
             let mut ln = Line::new();
@@ -154,6 +159,7 @@ pub fn look(now: u64) {
     if f != 0 && now.saturating_sub(f) >= WEDGE_MS && FIX_LAST_MS.compare_exchange(f, 0, AcqRel, Relaxed).is_ok() {
         FIX_AGE.store(now.saturating_sub(f), Relaxed);
         say(now.saturating_sub(f), true);
+        FIX_CENSUS.store(census("fixture") as u32, Release); // SETTERWEDGE (B553): the census path, proved on the same fixture feed
         FIX_FIRES.fetch_add(1, Release);
     }
 }
@@ -230,6 +236,7 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, AcqRel) {
         crate::tests::register("sessionwedge", selftest);
+        setter_tests(); // SETTERWEDGE (B553)
     }
 }
 
@@ -290,5 +297,231 @@ fn selftest() {
         gap, passes, through as u8, a.as_str(), if seen { "seen" } else { "silent" }, FIX_AGE.load(Relaxed),
         if cleared { "damage" } else { "owed" }, crate::video::wm::fbdirect::handed(),
         if ok { "PASS" } else { "FAIL" }, IGNITION_MS, WEDGE_MS, WEDGES.load(Relaxed), WATCHED.load(Relaxed) as u8
+    );
+}
+
+// ── SETTERWEDGE (rmbp-ledger B553) — the watch armed AT the ignition, the core census, the cable rescue ──────────────
+//
+// Flight 33 boot 1 (image 25, a fresh card: the first-user path): the cable's last bytes are `[boot] phase=desktop
+// from=setter why=session at=35088ms pre_wi`, cut mid-word at 05:57:25, then nothing for 37 s; Peter: "machine not
+// responding". Boot 2 (the login-screen path, same image) ignites. What the wire and the code settle, and what they do not:
+//
+// * The print is not the hang. `serial_println!` formats the WHOLE line into a stack buffer first
+//   (`serial_line::emit_src`, serial_line.rs:110-121) and only then hands it to the taps; the FTDI tap copies the whole
+//   line under a `try_lock` (arch/x86_64/serial.rs:235, `ftdi::mirror`). `pre_windows`/`pre_starts`/`pre_valve` are
+//   three relaxed atomic loads (boot.rs:161-164). So the line was whole in the mirror ring; `pre_wi` is where the
+//   usb-pump's last 4 ms drain slice ended (xhci/mod.rs `drain_ftdi`, `FTDI_DRAIN_SLICE_MS`) — the pump never came
+//   round again (SESSIONWEDGE's reading of flight 29, the same shape).
+// * Nothing could say so: RENDERWEDGE's `render-watch`, the only caller of [`look`], is spawned LAZILY from the render
+//   task's lag roll on the first roll that reads the Desktop phase (video/renderwedge.rs:336-337 `watch_start`).
+//   Boot 2 and flight 32 boot 1 print `[render] watch armed` in the ignition second; flight 33 boot 1 never does —
+//   the wedge came before that roll, so PUMPWEDGE did not exist on the one boot it was built for.
+// * The setter path differs from the login-screen path at that instant in exactly these ways (video/login.rs
+//   `apply_create` vs `apply_user`): (1) the session opens while the PUBLISHED stage is still Installer
+//   (users.rs `STAGE`), so `users::furniture_held()` is true and the pump's `desktopbuild::service` holds the build
+//   until (2) `users::installer_desktop_ignite` runs `stage_resolve("user-created")` → `stage_publish` on the RENDER
+//   task after `close_into_session` (the stage swap, `stage_witness`, `desktopbuild::build("stage")`,
+//   `splash::hold_release`, `firstuser_witness`); (3) the home, the Holocron ring and the users row were written in
+//   the preceding 4 s (`[login] submit kdf_ms=2479 adduser_ms=1549`, `[holocron] ring=created`) and HOLOCRON.ELF was
+//   first placed on the render core (`SCHEDPLACE-X86: 'bg-user' -> c1`, boot 2: `-> c0`); (4) the ignition is at
+//   35 s, not 24 s. Flight 32 (image 24) took the same setter path and ignited, so the cause rides image 25's delta
+//   (POINTERSCALE, PUMPHOLE, TWOCURSORS, AETHERPTR, SPLASHWORD2, USBNETRX, DOCKPINS) crossed with one of (1)-(4).
+//   The read did not single one out: every image-25 site this arc could reach either is lock-free (fbdirect's table,
+//   `strips_paint`, the flight recorder's hand, POINTERSCALE's atomics) or ran on boot 2 too without wedging
+//   (TWOCURSORS `ghost_restore` declined 36 times at 06:02:52). The cause is therefore NOT named here; this block makes
+//   the next fresh-card boot name it on the cable.
+//
+// The witness:
+// * [`arm`] — `boot::ignite` spawns `pump-watch` (a sibling core: never the igniting render core, never the service
+//   core while another is online) at the ignition itself; it calls [`look`] every 250 ms, alongside render-watch.
+// * [`census`] — at a wedge (and on the fixture feed): `[pump] census why=<w> cores=<n> c0=<tid>[:waits=<site>:<tid>@cpu<n>]
+//   … pump=<tid>@cpu<n>` — what each core is running (`sched::current_task_id`, the published word, no deref) and the
+//   lock each spins on (LOCKREG `sync::waits_on`). No heap: a wedged core may hold the allocator.
+// * [`rescue`] — while the wedge lasts, once a second, `xhci::ftdi_flush_sync` from the watch core: the WEDGE-8 loan
+//   claimed (never locked), bounded at 50 ms, so the lines the pump never sent — and the PUMPWEDGE/census lines —
+//   reach the bench. A pump wedged INSIDE the loan reads `outcome=busy` (that is a finding too: the wedge is in an
+//   xHCI step).
+// * `tests setterwedge` — `:: SETTERWEDGE: from=<setter|login-screen> watch=<armed|late|none> armed_ms=<n>
+//   watch_cpu=<n> running=<0|1> replay=<ok|wedged|skip> replay_ms=<n> census=<cores> cable=<drained|empty|busy|no-cable>
+//   -> PASS|FAIL|SKIP ::`. The replay drives the setter-only tail (`users::stage_resolve("user-created")`, idempotent
+//   on a Desktop stage) on a sibling core under a 3 s bound. PASS iff the watch was armed at the ignition and is
+//   running, the replay returned (or the build has no `login`), and the census named at least one core.
+
+/// When [`arm`] spawned `pump-watch` (`arch::ms`, 0 = never), its core, and the igniting core.
+static ARMED_AT: AtomicU64 = AtomicU64::new(0);
+static ARMED_CPU: AtomicU64 = AtomicU64::new(u64::MAX);
+static ARMED_FROM: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `pump-watch` ran its first look.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Cores the fixture-fed census named.
+static FIX_CENSUS: AtomicU32 = AtomicU32::new(0);
+/// Cable rescues attempted, bytes they moved.
+static RESCUES: AtomicU32 = AtomicU32::new(0);
+static RESCUE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The setter-tail replay (`tests setterwedge`).
+static REPLAY_DONE: AtomicBool = AtomicBool::new(false);
+static REPLAY_TID: AtomicU64 = AtomicU64::new(0);
+static REPLAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `pump-watch`'s cadence (render-watch's).
+const LOOK_MS: u64 = 250;
+/// While a wedge lasts, the cable is rescued this often.
+const RESCUE_EVERY_MS: u64 = 1_000;
+/// The replay's bound.
+const REPLAY_BOUND_MS: u64 = 3_000;
+
+/// `boot::ignite` (every ignition; the first one spawns): the pump watch exists from the ignition on.
+pub fn arm() {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if ONCE.swap(true, AcqRel) {
+        return;
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    ARMED_CPU.store(cpu as u64, Relaxed);
+    ARMED_FROM.store(me as u64, Relaxed);
+    ARMED_AT.store(crate::arch::ms().max(1), Release);
+    setter_tests();
+    crate::arch::sched::spawn("pump-watch", watch_task, 0, cpu, crate::arch::sched::PRIO_HIGH);
+}
+
+fn watch_task(_arg: usize) {
+    RUNNING.store(true, Release);
+    serial_println!(
+        "[pump] watch running cpu={} from_cpu={} armed_ms={} wedge_ms={} (SETTERWEDGE B553: armed at the ignition, not at the first lag roll)",
+        ARMED_CPU.load(Relaxed), ARMED_FROM.load(Relaxed), ARMED_AT.load(Relaxed), WEDGE_MS
+    );
+    let mut next_rescue = 0u64;
+    loop {
+        crate::arch::sched::sleep_ms(LOOK_MS);
+        let now = crate::arch::ms();
+        look(now);
+        if FIRED.load(Acquire) && now >= next_rescue {
+            next_rescue = now + RESCUE_EVERY_MS;
+            let (w, b) = rescue();
+            let n = RESCUES.load(Relaxed);
+            if n == 1 || n % 10 == 0 {
+                serial_println!("[pump] cable rescue n={} bytes={} total_bytes={} outcome={} (SETTERWEDGE B553: the watch drains the FTDI while the pump is stopped)", n, b, RESCUE_BYTES.load(Relaxed), w);
+            }
+        }
+    }
+}
+
+/// One bounded drain of the FTDI mirror from THIS core (`xhci::ftdi_flush_sync`: claimed, never locked; 50 ms).
+fn rescue() -> (&'static str, u64) {
+    if !crate::drivers::xhci::ftdi::is_live() {
+        return ("no-cable", 0);
+    }
+    let hz = crate::arch::apic::tsc_hz().max(1_000);
+    let (bytes, _transfers, exhausted) = crate::drivers::xhci::ftdi_flush_sync(hz / 20);
+    RESCUES.fetch_add(1, Relaxed);
+    RESCUE_BYTES.fetch_add(bytes, Relaxed);
+    (if bytes > 0 { "drained" } else if exhausted { "busy" } else { "empty" }, bytes)
+}
+
+/// A wider bounded line for the census (eight cores and their waits).
+struct Wide {
+    b: [u8; 480],
+    n: usize,
+}
+impl Wide {
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.b[..self.n]).unwrap_or("-")
+    }
+}
+impl core::fmt::Write for Wide {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let take = core::cmp::min(self.b.len() - self.n, s.len());
+        self.b[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.n += take;
+        Ok(())
+    }
+}
+
+/// `[pump] census` — every core's running task and the lock it spins on. Returns the cores with a task.
+fn census(why: &str) -> usize {
+    use core::fmt::Write;
+    let mut w = Wide { b: [0; 480], n: 0 };
+    let mut n = 0usize;
+    for c in 0..crate::arch::gdt::MAX_CPUS {
+        match crate::arch::sched::current_task_id(c) {
+            Some(t) => {
+                n += 1;
+                let _ = write!(w, " c{}={}", c, t);
+                if let Some((site, ht, hc)) = crate::sync::waits_on(t as u32) {
+                    let _ = write!(w, ":waits={}:{}@cpu{}", site, ht, hc);
+                }
+            }
+            None => {
+                let _ = write!(w, " c{}=-", c);
+            }
+        }
+    }
+    serial_println!(
+        "[pump] census why={} cores={}{} pump={}@cpu{} (SETTERWEDGE B553: what each core runs, and the lock it spins on)",
+        why, n, w.as_str(), PUMP_TID.load(Relaxed), PUMP_CPU.load(Relaxed) as i64
+    );
+    n
+}
+
+/// Register `tests setterwedge` once (from [`arm`] and [`ensure_tests`]; never run at boot, R80).
+fn setter_tests() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, AcqRel) {
+        crate::tests::register("setterwedge", setter_selftest);
+    }
+}
+
+/// The setter-only tail, on a sibling core: `users::stage_resolve("user-created")` — what `installer_desktop_ignite`
+/// runs after the create-user form's `close_into_session` (idempotent on a Desktop stage: the publish finds the stage
+/// unchanged and returns; the ignition is latched).
+fn replay_task(_arg: usize) {
+    REPLAY_TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed);
+    let t0 = crate::arch::ms();
+    #[cfg(feature = "login")]
+    crate::fs::users::stage_resolve("user-created");
+    REPLAY_MS.store(crate::arch::ms().saturating_sub(t0), Relaxed);
+    REPLAY_DONE.store(true, Release);
+}
+
+/// `:: SETTERWEDGE: … -> PASS|FAIL|SKIP ::` — see this block's header.
+fn setter_selftest() {
+    let ig = crate::boot::ignite_ms();
+    let from = crate::boot::ignite_from();
+    let armed = ARMED_AT.load(Acquire);
+    if ig == 0 {
+        serial_println!(":: SETTERWEDGE: from={} watch={} armed_ms={} -> SKIP :: reason=no-session-ignition", from, if armed != 0 { "armed" } else { "none" }, armed);
+        return;
+    }
+    // `arm` runs inside `boot::ignite` one statement before the ignition is stamped: armed at the ignition = at or
+    // before it (a 50 ms allowance for a preempted ignite); later than that = the old lazy arming came back.
+    let watch = if armed == 0 { "none" } else if armed <= ig.saturating_add(50) { "armed" } else { "late" };
+    let running = RUNNING.load(Acquire);
+    #[cfg(feature = "login")]
+    let can = crate::boot::desktop() && crate::fs::users::boot_stage() == crate::fs::users::BootStage::Desktop;
+    #[cfg(not(feature = "login"))]
+    let can = false;
+    let replay = if !can {
+        "skip"
+    } else {
+        REPLAY_DONE.store(false, Release);
+        REPLAY_TID.store(0, Relaxed);
+        let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+        crate::arch::sched::spawn("setterwedge-replay", replay_task, 0, crate::arch::sched::sibling_online_cpu(me), crate::arch::sched::PRIO_NORMAL);
+        if wait_for(REPLAY_BOUND_MS, || REPLAY_DONE.load(Acquire)) {
+            "ok"
+        } else {
+            crate::sync::name_task(REPLAY_TID.load(Relaxed), "SETTERWEDGE: the setter tail did not return"); // LOCKREG: its holds and its wait
+            "wedged"
+        }
+    };
+    let cores = census("tests");
+    let (cable, _) = rescue();
+    let replay_ok = replay == "ok" || (replay == "skip" && !cfg!(feature = "login"));
+    let ok = watch == "armed" && running && replay_ok && cores > 0;
+    serial_println!(
+        ":: SETTERWEDGE: from={} watch={} armed_ms={} watch_cpu={} running={} replay={} replay_ms={} census={} cable={} -> {} :: ignite_ms={} fixture_census={} rescues={} rescue_bytes={} wedges={}",
+        from, watch, armed, ARMED_CPU.load(Relaxed) as i64, running as u8, replay, REPLAY_MS.load(Relaxed), cores, cable,
+        if ok { "PASS" } else { "FAIL" }, ig, FIX_CENSUS.load(Relaxed), RESCUES.load(Relaxed), RESCUE_BYTES.load(Relaxed), WEDGES.load(Relaxed)
     );
 }

@@ -482,7 +482,7 @@ mod imp {
         placed + 1
     }
 
-    /// `main.rs`'s DOCKPIN arm (render task): a pinned app's verb line (or Quarry's `run <path>`) goes through the
+    /// `main.rs`'s DOCKPIN arm (render task): a pinned app's WORD verb line (activity, settings — DOCKSHELL B555: a path pin spawns directly, `dock::dp_direct_launch`, never here) or Quarry's `run <path>` goes through the
     /// shell task's queue, origin Glass. A program runs on the task; a kernel-window verb is posted back to the
     /// render pass by the task. `false`: not taken (no shell window, queue full) — the caller dispatches inline.
     pub fn submit_glass(line: &str, console: &mut Console) -> bool {

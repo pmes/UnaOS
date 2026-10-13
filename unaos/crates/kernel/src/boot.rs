@@ -151,7 +151,7 @@ pub fn ignite(why: &'static str) {
     if LATCH.swap(true, Ordering::AcqRel) {
         return;
     }
-    crate::video::wincap::witness(); // WINDOWCAP (B378, R90): the limit's arming line + the witness, once, at the first desktop
+    crate::video::wincap::witness(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::sessionwedge::arm(); // SETTERWEDGE (rmbp-ledger B553): the pump watch is spawned HERE, at the ignition, not at the render task's first lag roll after it (flight 33 boot 1 wedged before that roll: no `[render] watch armed`, so no PUMPWEDGE could exist). LINE-NEUTRAL append, code first. WINDOWCAP (B378, R90): the limit's arming line + the witness, once, at the first desktop
     if before == Phase::Desktop {
         return; // the boot was already a Desktop (no pre-Desktop phase to end): nothing to order
     }
@@ -394,4 +394,15 @@ pub fn shot_bare(on: bool) {
 }
 pub fn shot_bare_held() -> bool {
     SHOT_BARE.load(Ordering::Acquire)
+}
+
+/// SETTERWEDGE (rmbp-ledger B553): the phase the ignition ended, as `[boot] phase=desktop from=` spells it (`tests setterwedge`).
+/// FILE-TAIL append (nothing above moves); x86 `wc` only, the watch's own gate.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn ignite_from() -> &'static str {
+    match FROM.load(Ordering::Relaxed) {
+        1 => "setter",
+        2 => "login-screen",
+        _ => "none",
+    }
 }

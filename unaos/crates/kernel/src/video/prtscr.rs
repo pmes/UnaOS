@@ -431,7 +431,7 @@ pub fn set_rect(kind: u32, x: u32, y: u32, w: u32, h: u32) {
 pub fn request_rect(kind: u32, x: u32, y: u32, w: u32, h: u32) {
     set_rect(kind, x, y, w, h);
     REQUESTS.fetch_add(1, Ordering::Relaxed);
-    PENDING.store(true, Ordering::Relaxed);
+    PENDING.store(true, Ordering::Relaxed); owe(); // QUEUESLEEP2 (B557): the pump's one-load door opens AFTER the request is visible (same-line fold)
 }
 
 /// SHOTREGION — drop an armed rectangle and its request (a refusal that came before `Job::begin` took it).
@@ -510,7 +510,7 @@ pub fn census() -> (u32, u32, u32) {
 pub fn request() {
     RECT_KIND.store(0, Ordering::Relaxed); // SHOTREGION: a plain Print Screen is the whole panel
     REQUESTS.fetch_add(1, Ordering::Relaxed);
-    PENDING.store(true, Ordering::Relaxed);
+    PENDING.store(true, Ordering::Relaxed); owe(); // QUEUESLEEP2 (B557): the pump's one-load door opens AFTER the request is visible (same-line fold)
 }
 
 /// PRTSCR — advance the capture by one bounded slice, opening one first if a request is armed.
@@ -520,17 +520,17 @@ pub fn request() {
 /// returns so its caller can poll the keyboard again. It used to run the whole encode-and-write —
 /// 6–9 s on the Orin, 70 s on the rMBP — from inside the pass that services input, which is SR2.
 ///
-/// Costs THREE relaxed loads per call when idle (two until PRTSCR-HOME added [`dir_fixture`]'s
-/// one-shot latch below), which is why it can still sit unconditionally beside `fat::probe_once()`
+/// Costs ONE relaxed load per call when idle (QUEUESLEEP2 B557: [`OWED`], file tail; it was three after PRTSCR-HOME's
+/// [`dir_fixture`] latch plus an AcqRel swap in `defer_fast`), which is why it can still sit unconditionally beside `fat::probe_once()`
 /// at every storage-ready pass this kernel carries.
-pub fn service() {
+pub fn service() { if !OWED.load(Ordering::Relaxed) { return; } service_owed() } fn service_owed() { // QUEUESLEEP2 (B557): the idle pump pays ONE relaxed load; the old body is `service_owed` (same-line fold, no line below moves)
     // PRTSCR-HOME: the destination fixture, once per boot. It is here rather than behind a knob
     // because the no-session refusal it measures is what EVERY board does today — a gate that only
     // runs when someone remembers a knob would never have measured the ordinary case even once.
     // One relaxed load per pass after the first; see `dir_fixture` for both arms and their go-reds.
     dir_fixture();
     if !PENDING.load(Ordering::Relaxed) && !SLICING.load(Ordering::Relaxed) {
-        return;
+        settle(); return; // QUEUESLEEP2 (B557): nothing pending, nothing slicing, the fixture registered -> close the door (re-checked inside)
     }
 
     // (a) A capture is already open. Advance it by one slice and hand the machine back.
@@ -1096,7 +1096,7 @@ fn slice_budget() -> u64 {
 /// between passes introduces no new sharing claim: the panel is read exactly as the one-shot capture
 /// read it — without the panel lock, through the handle, tearing accepted (see the module note).
 struct Job {
-    fs: FatFs,
+    fs: Option<FatFs>, vol: VolId, owner: Option<String>, // SCREENSHOTFAT (B556): `fs` is `None` when the capture writes the native home (rung 0, no FAT mounted); `vol` is the target's identity either way; `owner` the HOMEPRIV row stamped on the file
     panel: FrameBuffer,
     /// `SCREEN<n>.PNG`. Moved out into the [`Shot`] at the verdict.
     name: String,
@@ -1200,26 +1200,26 @@ impl Job {
         }
         let named = named(); let (kind, rx, ry, width, height) = if named.is_some() { (0, 0, 0, info.width as u32, info.height as u32) } else { take_rect(info.width as u32, info.height as u32) }; // GLASSEYES (B343): a named state shot is always the whole panel and leaves an armed rectangle armed. SHOTREGION: the whole panel unless a rectangle is armed
 
-        // 2. The volume, by the PRTSCR-VOL ladder (module note), before anything is built. This is
-        //    `mount_capture_target`, NOT `mount_program_source`: rung 2 is the whole reason a
-        //    read-only-boot-medium bench can capture at all, and a sliced capture must inherit it.
-        let fs = mount_capture_target()?;
+        // 2. The volume. SCREENSHOTFAT (B556): rung 0 is the session's own home on the native root, asked FIRST; only
+        //    when the root is not native does the PRTSCR-VOL ladder (module note) run — `mount_capture_target`, NOT
+        //    `mount_program_source`: rung 2 is the whole reason a read-only-boot-medium FAT-only bench can capture at all.
+        let native = native_capture_dir(&plan); let fs = if native.is_some() { None } else { Some(mount_capture_target()?) }; // SCREENSHOTFAT (B556): flight 33 — the ladder ran first, rung 1 met the R99-sacred boot FAT and refused before the native home was ever asked
         // PRTSCR-ASYNC/UNPLUG: the two facts the liveness probe compares against, taken now, while
         // the volume is known good. `usb_publish_gen` is read AFTER the mount so a publish that
         // raced the mount is already reflected — a stale-low generation would refuse a live disk.
-        let usb_backed = usb_backed(&fs);
+        let usb_backed = fs.as_ref().map(usb_backed).unwrap_or(false); // SCREENSHOTFAT: the native home is not the hot-unpluggable stick
         let vol_gen = crate::drivers::block::usb_publish_gen();
 
         // 3. PRTSCR-HOME — the user's own folder, created if absent, on THIS volume. One witness
         //    line per capture (`ensure_capture_dir` prints it), never one per slice.
-        let native = native_capture_dir(&plan); // VOLUMES (B366) M1: on a native root the folder is made through the mount table, never on the FAT
-        let (dir_cluster, dir) = match native { Some(r) => (NATIVE_DIR, r?), None => ensure_capture_dir(&fs, &plan)? };
+        let vol = fs.as_ref().map(vol_id).unwrap_or(NATIVE_VOL); let owner = if native.is_some() { home_owner(&plan) } else { None }; // SCREENSHOTFAT (B556): the target's identity (`source=unafs` for rung 0) and the home's HOMEPRIV owner row the file is stamped with. VOLUMES (B366) M1: on a native root the folder is made through the mount table, never on the FAT
+        let (dir_cluster, dir) = match native { Some(r) => (NATIVE_DIR, r?), None => ensure_capture_dir(fat(&fs)?, &plan)? };
 
         // 4. A name nothing else owns, IN THAT DIRECTORY.
         // SCRSHOT-DESKTOP (R60): `choose_name`, not `next_free_name` — the clock stamp when there is
         // a clock, the ladder when there is not, and a token saying which. Same never-overwrite
         // contract in both arms; see the naming block above `clock_name`.
-        let (name, name_from) = if dir_cluster == NATIVE_DIR { native_pick(&fs, &dir, &named, kind)? } else if let Some((_, n)) = &named { (named_replace(&fs, dir_cluster, &plan, n)?, "named") } else if kind != 0 { (shot_name(&fs, dir_cluster)?, if shot_clock_name().is_some() { "clock" } else { "clock-unset" }) } else { choose_name(&fs, dir_cluster)? };
+        let (name, name_from) = if dir_cluster == NATIVE_DIR { native_pick(vol, &dir, &named, kind)? } else if let Some((_, n)) = &named { (named_replace(fat(&fs)?, dir_cluster, &plan, n)?, "named") } else if kind != 0 { (shot_name(fat(&fs)?, dir_cluster)?, if shot_clock_name().is_some() { "clock" } else { "clock-unset" }) } else { choose_name(fat(&fs)?, dir_cluster)? };
 
         // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is
         // one of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture.
@@ -1242,7 +1242,7 @@ impl Job {
 
         let vpath = alloc::format!("{}/{}/{}", plan.home_str(), cur_leaf().0, name);
         Ok(Job {
-            fs,
+            fs, vol, owner,
             panel,
             name,
             dir_cluster,
@@ -1336,7 +1336,7 @@ impl Job {
                     // PRTSCR-ASYNC/UNPLUG: probe BEFORE the write, never after.
                     if !self.volume_alive() {
                         return Err(Refusal::Vanished(
-                            vol_id(&self.fs),
+                            self.vol,
                             core::mem::take(&mut self.name),
                             st.done,
                             self.need,
@@ -1350,17 +1350,17 @@ impl Job {
                         // SHOTMOUNT: the slice through the table (`mt.write` at the running offset).
                         match r.0.write(&self.vpath, at as u64, chunk, crate::fs::vfs::KERNEL_PRINCIPAL) {
                             Ok(n) => (n, (at + n) as u32, first),
-                            Err(_) => return Err(Refusal::Fat(vol_id(&self.fs), "write", FatError::Io)),
+                            Err(_) => return Err(Refusal::Fat(self.vol, "write", FatError::Io)),
                         }
                     } else {
-                        match busy_retry(|| self.fs.write_grow(first, size, dir_lba, dir_off, at as u32, chunk)) {
+                        match busy_retry(|| fat_op(&self.fs)?.write_grow(first, size, dir_lba, dir_off, at as u32, chunk)) {
                             Ok(t) => t,
-                            Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "write", e)),
+                            Err(e) => return Err(Refusal::Fat(self.vol, "write", e)),
                         }
                     };
                     if wrote != take {
                         return Err(Refusal::Short(
-                            vol_id(&self.fs),
+                            self.vol,
                             core::mem::take(&mut self.name),
                             at + wrote,
                             at + st.buf.len() - st.buf_at,
@@ -1380,7 +1380,7 @@ impl Job {
                     if !st.created {
                         if !self.volume_alive() {
                             return Err(Refusal::Vanished(
-                                vol_id(&self.fs),
+                                self.vol,
                                 core::mem::take(&mut self.name),
                                 0,
                                 self.need,
@@ -1394,19 +1394,19 @@ impl Job {
                         let vfs_ok = mt
                             .create(&self.vpath, crate::fs::vfs::NodeKind::File, crate::fs::vfs::KERNEL_PRINCIPAL)
                             .is_ok();
-                        if vfs_ok {
+                        if vfs_ok { if stamp_owner(&mt, &self.vpath, &self.owner) == "failed" { serial_println!("[prtscr] owner stamp path={} -> FAILED (the file stays ownerless)", self.vpath); } // SCREENSHOTFAT (B556): HOMEPRIV — the file is its user's, like the home it lands in
                             self.routed = Some(RoutedMt(mt));
                         } else if self.dir_cluster == NATIVE_DIR {
                             // VOLUMES (B366) M1: the folder is on the native root; there is no FAT twin to fall back to.
-                            return Err(Refusal::Fat(vol_id(&self.fs), "create (native home)", FatError::Io));
+                            return Err(Refusal::Fat(self.vol, "create (native home)", FatError::Io));
                         } else {
                             let dc = self.dir_cluster;
-                            match busy_retry(|| self.fs.create_in_dir(dc, &self.name, 0x20)) {
+                            match busy_retry(|| fat_op(&self.fs)?.create_in_dir(dc, &self.name, 0x20)) {
                                 Ok((_, lba, off)) => {
                                     st.dir_lba = lba;
                                     st.dir_off = off;
                                 }
-                                Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "create", e)),
+                                Err(e) => return Err(Refusal::Fat(self.vol, "create", e)),
                             }
                         }
                         st.created = true;
@@ -1484,7 +1484,7 @@ impl Job {
                     width: self.width,
                     height: self.height,
                     bytes: st.done,
-                    vol: vol_id(&self.fs),
+                    vol: self.vol,
                     dir: core::mem::take(&mut self.dir),
                     dir_cluster: self.dir_cluster,
                     chunks: st.enc.chunks(),
@@ -1496,7 +1496,7 @@ impl Job {
             }
             // Unreachable: `slice` is the only caller and it always hands back a live phase.
             // Answered rather than panicked, per this module's guard-with-a-return discipline.
-            Phase::Spent => Err(Refusal::Fat(vol_id(&self.fs), "slice", FatError::Io)),
+            Phase::Spent => Err(Refusal::Fat(self.vol, "slice", FatError::Io)),
         }
     }
 }
@@ -1568,7 +1568,7 @@ pub fn selftest_once() {
         }
         return;
     }
-    let fs = match mount_capture_target() {
+    let fs = if native_root() { None } else { Some(match mount_capture_target() { // SCREENSHOTFAT (B556): rung 0 — a native root needs no FAT; the shot reads back through the mount table
         Ok(fs) => fs,
         Err(Refusal::NoVolume(e)) => {
             if !SAID_NO_VOLUME.swap(true, Ordering::Relaxed) {
@@ -1601,9 +1601,9 @@ pub fn selftest_once() {
             }
             return;
         }
-    };
+    }) };
     DONE.store(true, Ordering::Relaxed);
-    if SAID_NO_VOLUME.load(Ordering::Relaxed) || SAID_READ_ONLY.load(Ordering::Relaxed) {
+    if let (true, Some(fs)) = (SAID_NO_VOLUME.load(Ordering::Relaxed) || SAID_READ_ONLY.load(Ordering::Relaxed), fs.as_ref()) {
         let label = fs.label();
         serial_println!(
             ":: PRTSCR-ST: writable volume arrived (source={} serial=0x{:08X} label={}) — running the deferred capture selftest ::{}",
@@ -1629,7 +1629,7 @@ pub fn selftest_once() {
     // cannot pass all three, because the size is the directory's own and the IEND is at the end.
     // PRTSCR-HOME: read back from the CAPTURE DIRECTORY the shot names, not the root — which is
     // itself part of what this selftest now proves. A file that landed anywhere else fails here.
-    if shot.dir_cluster == NATIVE_DIR { native_readback(&shot); return; } // VOLUMES (B366) M1: a native-root shot reads back through the mount table
+    if shot.dir_cluster == NATIVE_DIR { native_readback(&shot); return; } let Some(fs) = fs.as_ref() else { serial_println!(":: PRTSCR-ST: FAIL — {} is a FAT shot and no FAT is mounted (the root turned native mid-run) ::{}", shot.name, st_on()); return; }; // SCREENSHOTFAT (B556): rung 0 mounts no FAT. VOLUMES (B366) M1: a native-root shot reads back through the mount table
     let (de, _, _) = match fs.locate_in_dir(shot.dir_cluster, &shot.name) {
         Ok(hit) => hit,
         Err(e) => {
@@ -2272,7 +2272,7 @@ pub fn dir_fixture() { static QB2: AtomicBool = AtomicBool::new(false); if crate
         let was_said = DEFERRED_SAID.swap(false, Ordering::AcqRel);
         let was_slicing = SLICING.load(Ordering::Relaxed);
         if !was_slicing {
-            service();
+            service_owed(); // QUEUESLEEP2 (B557): the fixture drives the body past the one-load door
         }
         let (_, _, r1) = census();
         IN_FLIGHT.store(was_in_flight, Ordering::Release);
@@ -2445,8 +2445,8 @@ pub const NATIVE_DIR: u32 = u32::MAX;
 fn native_capture_dir(plan: &DirPlan) -> Option<Result<String, Refusal>> {
     use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
     let mt = crate::shell::vfs_mount_table();
-    if mt.volume_name("/").ok()? != "native" {
-        return None;
+    if !native_root() {
+        return None; // SCREENSHOTFAT (B556): the one native-root question, shared with PRTSCR-ST
     }
     let dir = alloc::format!("{}/{}", plan.home_str(), cur_leaf().0);
     let mut created = 0u32;
@@ -2469,26 +2469,26 @@ fn native_capture_dir(plan: &DirPlan) -> Option<Result<String, Refusal>> {
             }
         }
     }
-    serial_println!(
-        ":: PRTSCR-DIR: theme={} user={} home={} dir={} path={} created={} volume=unafs reason=session -> RESOLVED ::",
+    let owner = home_owner(plan); let stamped = stamp_owner(&mt, &dir, &owner); serial_println!(
+        ":: PRTSCR-DIR: theme={} user={} home={} dir={} path={} created={} owner={} dir_owner={} rung=0 volume=unafs reason=session -> RESOLVED ::",
         crate::video::theme::NAME,
         plan.user_str(),
         plan.home_str(),
         dir,
         dir,
-        created
+        created, owner.as_deref().map(owner_uid).unwrap_or("none"), stamped // SCREENSHOTFAT (B556): HOMEPRIV (B528) — the capture folder carries its home's owner row (written only where absent)
     );
     Some(Ok(dir))
 }
 
 /// The file name for a native-root capture, by the same rules as [`choose_name`] / [`shot_name`] /
 /// [`named_replace`] — asked of the mount table's directory, never of a FAT cluster.
-fn native_pick(fs: &FatFs, dir: &str, named: &Option<(&'static str, String)>, kind: u32) -> Result<(String, &'static str), Refusal> {
+fn native_pick(vol: VolId, dir: &str, named: &Option<(&'static str, String)>, kind: u32) -> Result<(String, &'static str), Refusal> {
     let mt = crate::shell::vfs_mount_table();
     let free = |n: &str| mt.stat(&alloc::format!("{}/{}", dir, n)).is_err();
     if let Some((_, n)) = named {
         let _ = mt.unlink(&alloc::format!("{}/{}", dir, n), crate::fs::vfs::KERNEL_PRINCIPAL);
-        return if free(n) { Ok((n.clone(), "named")) } else { Err(Refusal::AllTaken(vol_id(fs))) };
+        return if free(n) { Ok((n.clone(), "named")) } else { Err(Refusal::AllTaken(vol)) };
     }
     let ladder = |stem: &str| -> Option<String> { (0..MAX_CAPTURES).map(|i| alloc::format!("{}{}.PNG", stem, i)).find(|n| free(n)) };
     if kind != 0 {
@@ -2498,14 +2498,14 @@ fn native_pick(fs: &FatFs, dir: &str, named: &Option<(&'static str, String)>, ki
             }
         }
         let from = if shot_clock_name().is_some() { "clock" } else { "clock-unset" };
-        return ladder("SHOT").map(|n| (n, from)).ok_or(Refusal::AllTaken(vol_id(fs)));
+        return ladder("SHOT").map(|n| (n, from)).ok_or(Refusal::AllTaken(vol));
     }
     let from = match clock_name() {
         Some(n) if free(&n) => return Ok((n, "clock")),
         Some(_) => "clock-taken",
         None => "clock-unset",
     };
-    ladder("SCREEN").map(|n| (n, from)).ok_or(Refusal::AllTaken(vol_id(fs)))
+    ladder("SCREEN").map(|n| (n, from)).ok_or(Refusal::AllTaken(vol))
 }
 
 /// VOLUMES M1 — PRTSCR-ST's read-back for a native-root shot: the size the mount table holds.
@@ -2585,7 +2585,7 @@ pub fn prtscr_selftest() {
     let (_, _, r0) = census();
     let was_pending = PENDING.swap(true, Ordering::AcqRel);
     let was_said = DEFERRED_SAID.swap(false, Ordering::AcqRel);
-    service();
+    service_owed(); // QUEUESLEEP2 (B557): the fixture drives the body past the one-load door
     let (_, _, r1) = census();
     PENDING.store(was_pending, Ordering::Release);
     DEFERRED_SAID.store(was_said, Ordering::Release);
@@ -2642,4 +2642,92 @@ fn selftest_worker(_: usize) {
         crate::arch::sched::sleep_ms(20);
     }
     ST_ON_WORKER.store(false, Ordering::Relaxed);
+}
+
+// SCREENSHOTFAT (rmbp-ledger B556) — RUNG 0, THE SESSION'S OWN HOME. FILE TAIL, so no line above moves.
+// Flight 33 (Peter: "where's the screenshot"): the shell verb and Cmd-Shift-3 both printed `REFUSED READ-ONLY
+// (source=sdhc … the boot FAT is sacred (R99) …)` — `Job::begin` ran `mount_capture_target` BEFORE it asked
+// `native_capture_dir`, so on the UnaFS card the ladder's rung 1 met the read-only boot FAT, rung 2 found no stick,
+// and the refusal returned before the native home was ever consulted. The order is now: rung 0 the home on the
+// native root (`native_capture_dir`, `volume=unafs`), and the FAT rungs only when the root is not native. A capture
+// with no session still refuses first (PRTSCR-HOME), so the ladder never runs for a capture nobody owns.
+
+/// SCREENSHOTFAT — the identity a rung-0 capture reports: the native root has no FAT serial, so `serial=0x00000000`.
+const NATIVE_VOL: VolId = VolId { source: "unafs", serial: 0 };
+
+/// SCREENSHOTFAT — is `/` the native (UnaFS) volume? The one question rung 0 and PRTSCR-ST both ask.
+fn native_root() -> bool {
+    crate::shell::vfs_mount_table().volume_name("/").map(|v| v == "native").unwrap_or(false)
+}
+
+/// SCREENSHOTFAT — the FAT a FAT-rung capture mounted. `None` only on rung 0, whose arms never ask; answered with a
+/// refusal rather than a panic, per this module's guard-with-a-return discipline.
+fn fat(fs: &Option<FatFs>) -> Result<&FatFs, Refusal> {
+    fs.as_ref().ok_or(Refusal::NoVolume(FatError::NoDisk))
+}
+
+/// SCREENSHOTFAT — [`fat`] for a closure under [`busy_retry`], which speaks `FatError`.
+fn fat_op(fs: &Option<FatFs>) -> Result<&FatFs, FatError> {
+    fs.as_ref().ok_or(FatError::NoDisk)
+}
+
+/// SCREENSHOTFAT / HOMEPRIV (B528) — the `owner` row of the session's home (`user:<name>#<uid>`), read at kernel
+/// authority; `None` when the home carries none (a FAT root, or a home that predates HOMEPRIV and has not re-ensured).
+fn home_owner(plan: &DirPlan) -> Option<String> {
+    use crate::fs::vfs::{AttrValue, KERNEL_PRINCIPAL};
+    match crate::shell::vfs_mount_table().get_attr(plan.home_str(), "owner", KERNEL_PRINCIPAL) {
+        Ok(AttrValue::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// SCREENSHOTFAT — the uid an owner value names (`user:<name>#<uid>` -> `<uid>`), for the PRTSCR-DIR line.
+fn owner_uid(row: &str) -> &str {
+    match row.strip_prefix("user:").and_then(|r| r.rsplit_once('#')) {
+        Some((_, uid)) if !uid.is_empty() => uid,
+        _ => "none",
+    }
+}
+
+/// SCREENSHOTFAT / HOMEPRIV — give `path` the home's owner row when it has none, HOMEPRIV's migration shape
+/// (`MountTable::set_attr` at kernel authority, never over an existing row). The kernel made the folder and the file
+/// at `KERNEL_PRINCIPAL`, and `NativeBackend::create` writes no row for a kernel creator, so without this a capture
+/// in a private home would be readable by every principal that knows its path. Returns the verdict token:
+/// `set`, `kept` (a row is there), `none` (the home has no owner to copy), `unread`, `failed`.
+fn stamp_owner(mt: &crate::fs::vfs::MountTable, path: &str, owner: &Option<String>) -> &'static str {
+    use crate::fs::vfs::{AttrValue, VfsError, KERNEL_PRINCIPAL};
+    let Some(want) = owner else { return "none" };
+    match mt.get_attr(path, "owner", KERNEL_PRINCIPAL) {
+        Err(VfsError::Backend("no-attr")) => {}
+        Ok(_) => return "kept",
+        Err(_) => return "unread",
+    }
+    match mt.set_attr(path, "owner", AttrValue::Str(want.clone()), KERNEL_PRINCIPAL) {
+        Ok(()) => "set",
+        Err(_) => "failed",
+    }
+}
+
+// QUEUESLEEP2 (rmbp-ledger B557) — the pump's idle cost of `service`, ONE relaxed load. FILE TAIL, so no line above moves.
+// Flight 33's `pump_what_worst=prtscr` was a real Cmd-Shift-3 inside the window (the PRTSCR-VOL ladder and its refusal lines,
+// 23 ms, under the bound), but the idle path the promise named was not one load either: `dir_fixture` ran `defer_fast`
+// (an Acquire load of `tests::RUNNING`, a `CUR.try_lock` spin while any `tests` verb runs, and an AcqRel SWAP of its latch
+// on EVERY pass), then `DONE`, `PENDING` and `SLICING`. `OWED` folds all of it into one word: set at boot (the first pass
+// registers the fixture), set by `request`/`request_rect` AFTER `PENDING`, and cleared only by `settle` on the idle return,
+// which clears first and re-checks `PENDING`/`SLICING` second (SeqCst both sides of the race), so a press that lands between
+// the idle check and the clear re-opens the door instead of being stranded.
+static OWED: AtomicBool = AtomicBool::new(true);
+
+/// QUEUESLEEP2 — a request is armed: the next `service` pass takes the body. `Release` orders the `PENDING` store before it.
+#[inline]
+fn owe() {
+    OWED.store(true, Ordering::Release);
+}
+
+/// QUEUESLEEP2 — the idle return: close the one-load door, then re-open it if a request or a slice raced the close.
+fn settle() {
+    OWED.store(false, Ordering::SeqCst);
+    if PENDING.load(Ordering::SeqCst) || SLICING.load(Ordering::SeqCst) {
+        OWED.store(true, Ordering::SeqCst);
+    }
 }

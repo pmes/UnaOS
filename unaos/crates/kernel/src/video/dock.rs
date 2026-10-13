@@ -3086,7 +3086,7 @@ fn lp_arm(t: usize, owner: u64) {
 /// The button came up: the hold ends.
 pub fn lp_release() { LP_OWNER.store(0, Ordering::Release); }
 /// Poll from the input-drain task: after [`LONGPRESS_MS`] of hold the menu opens. Returns true when it did.
-pub fn lp_service(now_ms: u64) -> bool { dockgone_register(); // DOCKGONE (B498): `tests dockgone`, registered once from the service pass
+pub fn lp_service(now_ms: u64) -> bool { dockgone_register(); dockpins_register(); // DOCKGONE (B498): `tests dockgone`, registered once from the service pass
     dock2_service(now_ms); pin_timeout_service(now_ms); // HIDSTALL (B485): DOCKRELEASE. DOCK2 (B394): the launch pulse and its bound, auto-hide's reveal
     let o = LP_OWNER.load(Ordering::Acquire);
     if o == 0 || now_ms.wrapping_sub(LP_T0.load(Ordering::Relaxed)) < LONGPRESS_MS { return false; }
@@ -3334,7 +3334,7 @@ fn dp_launch(i: usize) -> &'static str {
             Some(p) => { crate::video::textedit::request_open(&p); "editor-requested" }
             None => "editor-no-home",
         },
-        _ => {
+        _ if dp_is_direct(i) => dp_direct_post(i), _ => { // DOCKSHELL (rmbp-ledger B555): a ring-3 pin whose verb is a PROGRAM PATH spawns it directly (the service pass, `dp_direct_service`), never a shell window; only a word verb (activity, settings) still rides the shell seam below
             DP_VERB_OWED.fetch_or(1 << i, Ordering::AcqRel);
             post_launch(PinnedApp::Shell); // the verb needs a shell window to run in; a live one just raises
             "verb-posted"
@@ -3418,7 +3418,7 @@ fn dp_witness(why: &str) {
 /// The service pass (called from `desktop_app_service`, never from a click path): drain an owed load
 /// and an owed save, each followed by the witness line.
 pub fn dockpin_service() {
-    empty_trash_service(); dock2_store_service(); // DOCK2 (B394): the Trash's state, the Quarry opens, the edge/auto-hide save
+    empty_trash_service(); dock2_store_service(); dp_direct_service(); // DOCK2 (B394): the Trash's state, the Quarry opens, the edge/auto-hide save. DOCKSHELL (B555): an owed direct pin launch, off the pump's core
     if DP_LOAD_OWED.swap(false, Ordering::AcqRel) {
         dock2_load(); // DOCK2: `system.dock.position` / `system.dock.autohide`, with the pins
         let c = dp_load();
@@ -4067,7 +4067,7 @@ fn dock2_service(now: u64) {
         if launch_landed(i) {
             LAUNCH_APP.store(0, Ordering::Release);
             LAUNCH_LAST.store(dt, Ordering::Relaxed);
-            serial_println!("[dock] launch app={} first_window_ms={}", DP_PINS[i].name, dt);
+            serial_println!("[dock] launch app={}{} first_window_ms={}", DP_PINS[i].name, if dp_direct_take_done(i) { " by=dock direct=1" } else { "" }, dt); // DOCKSHELL (B555): a direct pin launch says so
             PASS_OWED.store(true, Ordering::Release);
         } else if dt >= LAUNCH_BOUND_MS {
             LAUNCH_APP.store(0, Ordering::Release);
@@ -4681,3 +4681,209 @@ fn dockgone_selftest() {
 
 /// HIDSTALL2 (B509): the in-lane line is said once per press (re-armed by the press).
 static PIN_LANE_SAID: AtomicBool = AtomicBool::new(false);
+
+// =================================================================================================
+// DOCKSHELL (rmbp-ledger B555; parent B546 DOCKPINS) — TAIL-APPENDED: no line above moves. Flight 33, Peter: "aether
+// launches from taskbar by launching shell and then launching aether from there. why?" The wire (f33-boot2.log
+// 06:08:36): `tile=5/11 app=aether -> launch verb-posted`, `[dock] launch app=shell … -> LAUNCHED`, `[shelltask]
+// dockpin verb=/apps/AETHER.ELF`, `BAREXEC: … DETACHED`. [`dp_launch`]'s ring-3 arm latched the VERB and posted the
+// SHELL's launch, because the verb seam's only drain is the render body that owns the shell `Console`
+// (`take_verb_launch`, main.rs's DOCKPIN fold) — so a shell window opened on the glass before every path pin's
+// program (lumen, aether, midden, una: one arm, four pins).
+//
+// Now a Ring3Program pin whose verb is a PROGRAM PATH ([`dp_is_direct`]) is spawned DIRECTLY, Quarry's model
+// (`quarry::live::launch`: read, check, spawn detached, name the window): the press POSTS a bit ([`dp_direct_post`],
+// inside the click router — never perform); the service pass ([`dp_direct_service`], from `dockpin_service`) runs the
+// launch as a one-shot `dock-launch` task on a worker core (HIDSTALL2's Trash rule: the image read is UnaFS, never on
+// the hid pump's core; inline `on=pump` only with no such core). The launch ([`dp_direct_launch`]) is the shell's
+// path-launch checks, in the shell's order: stat, the image cap (`user_image_cap`), APPTRUST's door
+// (`fs::apptrust::launch_gate`, SHELLTRUST B527 — a foreign program posts the ask and nothing runs), the read, the
+// x86-64 ELF64 pre-checks, the program's note through EXECNAME's rule (`arch::elf::app_flags` -> `midden_core::
+// launch_mode`, B322 — the program decides), APPRES's sight FIRST (LUMENFAST B507), the spawn
+// (`spawn_user_image_bg_argv`, `bg`'s seam, argv[0] = the path, inside `origin::with(Glass, …)` — DIALOG2's
+// provenance), then the launch name (`wm::app_name_arm_launch`), so `app_name_of` == the pin's name and
+// [`dp_refresh`]'s running-window join is untouched. A CONSOLE program (no windowed/resident note) cannot run without
+// a console: it alone falls back to the verb seam, said `-> foreground (verb seam)`.
+// Wire: `[dock] direct app=<a> path=<p> bytes=<n> note=<f> pid=<p> slot=<s> sight_ms=<n> spawn_ms=<n> on=<worker|pump>
+// -> started` (or `-> refused=<why>`), then DOCK2's `[dock] launch app=<a> by=dock direct=1 first_window_ms=<n>`.
+// Fixture: `tests dockpins` -> `:: DOCKPINS: pins=<n> direct=<n> landed=<n> shell_windows=<a>-><b> shell_posted=<n>
+// verb_posted=<n> -> PASS|FAIL|SKIP ::`.
+// =================================================================================================
+
+/// Path pins owed a direct launch (bit = table index); set by the press, taken by the service pass.
+static DP_DIRECT_OWED: AtomicU32 = AtomicU32::new(0);
+/// Path pins whose last launch was direct (read once by DOCK2's first-window line).
+static DP_DIRECT_DONE: AtomicU32 = AtomicU32::new(0);
+/// One `dock-launch` task in flight.
+static DP_DIRECT_RUNNER: AtomicBool = AtomicBool::new(false);
+/// The last direct launch's (pid, slot) per pin — the fixture's kill handle.
+static DP_DIRECT_PID: [AtomicU64; DP_PINS.len()] = [const { AtomicU64::new(0) }; DP_PINS.len()];
+static DP_DIRECT_SLOT: [AtomicU64; DP_PINS.len()] = [const { AtomicU64::new(0) }; DP_PINS.len()];
+
+/// Is table app `i` a ring-3 pin whose launch line is a program path (spawned directly, no shell)? x86 only: the
+/// aarch64 desktop has no direct ring-3 spawn here and keeps the verb seam.
+fn dp_is_direct(i: usize) -> bool {
+    cfg!(target_arch = "x86_64") && i < DP_PINS.len() && DP_PINS[i].kind == DpKind::Ring3Program && DP_PINS[i].verb.starts_with('/')
+}
+
+/// POST a direct launch of path pin `i` (click router: never perform). No shell launch is posted.
+fn dp_direct_post(i: usize) -> &'static str {
+    DP_DIRECT_OWED.fetch_or(1 << i, Ordering::AcqRel);
+    "direct-posted"
+}
+
+/// Was pin `i`'s last launch direct? Clears the mark.
+fn dp_direct_take_done(i: usize) -> bool {
+    DP_DIRECT_DONE.fetch_and(!(1u32 << i), Ordering::AcqRel) & (1 << i) != 0
+}
+
+/// Take the lowest owed direct pin.
+fn dp_direct_take() -> Option<usize> {
+    loop {
+        let m = DP_DIRECT_OWED.load(Ordering::Acquire);
+        if m == 0 { return None; }
+        let i = m.trailing_zeros() as usize;
+        if DP_DIRECT_OWED.compare_exchange(m, m & !(1 << i), Ordering::AcqRel, Ordering::Acquire).is_ok() { return Some(i); }
+    }
+}
+
+/// Every owed direct launch, in table order.
+fn dp_direct_drain(on: &str) {
+    while let Some(i) = dp_direct_take() {
+        let _ = dp_direct_launch(i, on);
+    }
+}
+
+/// The service pass's half (from [`dockpin_service`]): an owed direct launch runs on a worker core; inline only
+/// when the machine has no worker apart from the pump's.
+fn dp_direct_service() {
+    if DP_DIRECT_OWED.load(Ordering::Acquire) == 0 { return; }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != crate::hidstall::pump_cpu()) {
+            if !DP_DIRECT_RUNNER.swap(true, Ordering::AcqRel) {
+                crate::arch::sched::spawn("dock-launch", dp_direct_runner, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+            }
+            return;
+        }
+    }
+    dp_direct_drain("pump");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dp_direct_runner(_arg: usize) {
+    dp_direct_drain("worker");
+    DP_DIRECT_RUNNER.store(false, Ordering::Release); // a bit posted after the drain is taken by the next service pass
+}
+
+/// The direct launch of path pin `i` — the shell's path-launch checks and `bg`'s spawn, no console, no shell window.
+/// `Ok((pid, slot))` once the program is running and named.
+#[cfg(target_arch = "x86_64")]
+fn dp_direct_launch(i: usize, on: &str) -> Result<(u64, u64), &'static str> {
+    use crate::fs::vfs::NodeKind;
+    let (name, path) = (DP_PINS[i].name, DP_PINS[i].verb);
+    let refuse = |why: &'static str| -> Result<(u64, u64), &'static str> {
+        serial_println!("[dock] direct app={} path={} on={} -> refused={}", name, path, on, why);
+        Err(why)
+    };
+    let mt = crate::shell::vfs_mount_table();
+    let st = match mt.stat(path) { Ok(s) => s, Err(_) => return refuse("stat") };
+    if matches!(st.kind, NodeKind::Dir) { return refuse("is-a-directory"); }
+    if st.size == 0 { return refuse("empty"); }
+    if st.size > crate::arch::syscall::user_image_cap() as u64 { return refuse("over-image-cap"); }
+    if !crate::fs::apptrust::launch_gate(&mt, path) { return refuse("apptrust"); } // SHELLTRUST (B527): a foreign program posts the ask; nothing runs
+    let bytes = match mt.read(path, 0, st.size as usize) { Ok(b) => b, Err(_) => return refuse("read") };
+    if bytes.len() as u64 != st.size { return refuse("short-read"); }
+    if !(bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] && bytes[4] == 2 && bytes[5] == 1 && u16::from_le_bytes([bytes[18], bytes[19]]) == 62) {
+        return refuse("not-x86-64-elf64");
+    }
+    let flags = crate::arch::elf::app_flags(&bytes); // EXECNAME (B322): the program decides
+    if midden_core::launch_mode(flags) != midden_core::LaunchMode::Detach {
+        // A console program needs a console: the verb seam (the shell window runs it, as typed). None of the four pins.
+        DP_VERB_OWED.fetch_or(1 << i, Ordering::AcqRel);
+        post_launch(PinnedApp::Shell);
+        serial_println!("[dock] direct app={} path={} note={} on={} -> foreground (verb seam)", name, path, flags, on);
+        return Err("foreground");
+    }
+    let t_sight = crate::arch::ms();
+    crate::fs::appres::sight(path); // LUMENFAST (B507): the sight first, so the name arm below finds its stamp cached
+    let sight_ms = crate::arch::ms().saturating_sub(t_sight);
+    crate::prof::launching(path);
+    DP_DIRECT_DONE.fetch_or(1 << i, Ordering::AcqRel); // before the spawn: the child may land its window before we return
+    let t_spawn = crate::arch::ms();
+    match crate::origin::with(crate::origin::Origin::Glass, || crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[path])) {
+        Ok((pid, slot, _entry)) => {
+            let spawn_ms = crate::arch::ms().saturating_sub(t_spawn);
+            wm::app_name_arm_launch(wm::owner_of_launch(slot), path);
+            DP_DIRECT_PID[i].store(pid, Ordering::Release);
+            DP_DIRECT_SLOT[i].store(slot, Ordering::Release);
+            serial_println!("[dock] direct app={} path={} bytes={} note={} pid={} slot={} sight_ms={} spawn_ms={} on={} -> started", name, path, bytes.len(), flags, pid, slot, sight_ms, spawn_ms, on);
+            Ok((pid, slot))
+        }
+        Err(e) => {
+            DP_DIRECT_DONE.fetch_and(!(1u32 << i), Ordering::AcqRel);
+            serial_println!("[dock] direct app={} path={} on={} -> refused=spawn ({})", name, path, on, e);
+            Err("spawn")
+        }
+    }
+}
+
+/// aarch64: never reached ([`dp_is_direct`] is false there); the verb seam is that desktop's launch.
+#[cfg(not(target_arch = "x86_64"))]
+fn dp_direct_launch(_i: usize, _on: &str) -> Result<(u64, u64), &'static str> { Err("no-direct-spawn") }
+
+/// Register `tests dockpins` once (from the service pass, DOCKGONE's shape).
+fn dockpins_register() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.load(Ordering::Relaxed) && !DONE.swap(true, Ordering::AcqRel) {
+            crate::tests::register("dockpins", dockpins_selftest);
+        }
+    }
+}
+
+/// `tests dockpins` — every built path pin (lumen/aether/midden/una, each on its own knob) launched exactly as its
+/// tile does (`dp_launch`, the press arm's call), drained, its window awaited, then the job killed. Per pin: the
+/// press answered `direct-posted`, posted NO shell launch and NO verb, the window landed (`app_name_of` == name), and
+/// the shell's window count did not move. A pin already running is skipped (its tile would only raise).
+#[cfg(target_arch = "x86_64")]
+fn dockpins_selftest() {
+    const WAIT_MS: u64 = 10_000;
+    let shell_windows = || -> usize {
+        let mut rows = ModelBuf::take();
+        let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+        rows[..n].iter().filter(|r| row_running(r) && dp_owner_is(1, r.owner_asid)).count()
+    };
+    let (mut pins, mut direct, mut landed, mut shell_posted, mut verb_posted) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let s0 = shell_windows();
+    for i in DP_FIRST_EXTRA..DP_PINS.len() {
+        if !dp_is_direct(i) || DP_ALL & (1 << i) == 0 || launch_landed(i) { continue; }
+        pins += 1;
+        let shell_was = launch_posted(PinnedApp::Shell);
+        let how = dp_launch(i);
+        let posted = !shell_was && launch_posted(PinnedApp::Shell);
+        let verb = DP_VERB_OWED.load(Ordering::Acquire) & (1 << i) != 0;
+        if how == "direct-posted" { direct += 1; }
+        if posted { shell_posted += 1; let _ = take_launch(PinnedApp::Shell); }
+        if verb { verb_posted += 1; DP_VERB_OWED.fetch_and(!(1 << i), Ordering::AcqRel); }
+        DP_DIRECT_PID[i].store(0, Ordering::Release);
+        dp_direct_drain("fixture"); // the service pass may have taken it first; either way one launch
+        let t0 = crate::arch::ms();
+        let mut up = false;
+        while crate::arch::ms().saturating_sub(t0) < WAIT_MS {
+            if launch_landed(i) { up = true; break; }
+            crate::arch::sched::sleep_ms(20);
+        }
+        if up { landed += 1; }
+        let shell_now = shell_windows();
+        let pid = DP_DIRECT_PID[i].load(Ordering::Acquire);
+        let kill = if pid != 0 { crate::arch::syscall::bg_kill(pid, DP_DIRECT_SLOT[i].load(Ordering::Acquire)) } else { "no-pid" };
+        let _ = dp_direct_take_done(i);
+        serial_println!("[dockpins] app={} how={} shell_posted={} verb_posted={} landed={} ms={} shell_windows={} pid={} kill={}",
+            DP_PINS[i].name, how, posted as u8, verb as u8, up as u8, crate::arch::ms().saturating_sub(t0), shell_now, pid, kill);
+    }
+    let s1 = shell_windows();
+    let v = if pins == 0 { "SKIP" } else if direct == pins && landed == pins && shell_posted == 0 && verb_posted == 0 && s1 <= s0 { "PASS" } else { "FAIL" };
+    serial_println!(":: DOCKPINS: pins={} direct={} landed={} shell_windows={}->{} shell_posted={} verb_posted={} -> {} ::", pins, direct, landed, s0, s1, shell_posted, verb_posted, v);
+}
