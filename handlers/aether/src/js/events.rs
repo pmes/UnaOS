@@ -591,6 +591,11 @@ fn event_path(t: TargetKey, ty: &str, composed: bool, related: Option<usize>) ->
         }
         if dom::kind(cur) == dom::NK::Document && cur == dom::main_doc() && ty != "load" {
             path.push(TargetKey::Window);
+        } else if dom::kind(cur) == dom::NK::Document && ty != "load" {
+            // AETHERDEBT SR93: a nested document's parent is its own window (AETHERFRAMES gap).
+            if let Some(w) = super::window::frames::window_target_of_document(cur) {
+                path.push(w);
+            }
         }
     }
     path

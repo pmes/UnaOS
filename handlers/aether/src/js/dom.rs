@@ -101,9 +101,17 @@ pub fn root_of(id: usize) -> usize {
     })
 }
 
-/// Connected: the shadow-including root is the main document (the only one with a browsing context).
-pub fn is_connected(id: usize) -> bool {
+/// The shadow-including root is the main document (the top context's: where the page's own script
+/// elements run — a nested document's scripts run in its context's realm, `js/frames.rs`).
+pub fn in_main_document(id: usize) -> bool {
     with_doc(|d| crate::dom::shadow::shadow_including_root(d, NodeId(id)).0) == main_doc()
+}
+
+/// Connected: the shadow-including root is a document with a browsing context — the main document,
+/// or the active document of a live nested context (AETHERDEBT SR93; AETHERFRAMES left it main-only).
+pub fn is_connected(id: usize) -> bool {
+    let root = with_doc(|d| crate::dom::shadow::shadow_including_root(d, NodeId(id)).0);
+    root == main_doc() || (kind(root) == NK::Document && super::window::frames::is_active_document(root))
 }
 
 pub fn main_doc() -> usize {

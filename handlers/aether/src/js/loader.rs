@@ -635,7 +635,9 @@ fn the_end(engine: &mut Engine, was_frozen: bool) {
 /// Post-insertion steps for a node that was inserted (DOM "insert" → HTML script element steps): every
 /// connected, not-yet-started script among its inclusive descendants is prepared.
 pub fn node_inserted(vm: &mut Vm, n: usize) {
-    if !dom::is_connected(n) {
+    // The top realm runs the main document's scripts only (a nested document is connected too, but
+    // its scripts are its context's, js/frames.rs).
+    if !dom::in_main_document(n) {
         return;
     }
     let scripts: Vec<usize> = with_doc(|d| {
@@ -654,7 +656,7 @@ pub fn node_inserted(vm: &mut Vm, n: usize) {
 /// text arrives now is prepared.
 pub fn children_changed(vm: &mut Vm, parent: usize) {
     let is_script = with_doc(|d| d.element(NodeId(parent)).is_some_and(|e| e.is_html("script")));
-    if is_script && dom::is_connected(parent) && !page(|p| p.parser_inserted.contains(&parent)) {
+    if is_script && dom::in_main_document(parent) && !page(|p| p.parser_inserted.contains(&parent)) {
         prepare_dynamic_script(vm, parent);
     }
 }

@@ -46,8 +46,8 @@
 //! module scripts in a nested document are skipped; `document.write` from a nested document's script
 //! re-opens that document (it has no parser); XML documents are parsed as HTML; `loading=lazy` loads
 //! eagerly (headless has no viewport intersection); removal is noticed at the next service, not inside
-//! `removeChild`; an event path inside a nested document ends at its Document (the Window step is
-//! `js/events.rs`'s, which only knows the top window).
+//! `removeChild`. (AETHERDEBT SR93: an event path inside a nested document now continues to its
+//! window — [`window_target_of_document`] — and `isConnected` is true in any live context's document.)
 
 use html_core::url;
 use crate::frames::{self as tree, ContextId, Readiness, Sandbox, TOP};
@@ -262,6 +262,20 @@ pub fn window_of_document(_vm: &mut Vm, doc: usize) -> Value {
         Some(g) => Value::Object(g),
         None => Value::Null,
     }
+}
+
+/// Is `doc` the active document of a live browsing context (the top's, or a child context whose
+/// container has not been discarded)? AETHERDEBT SR93: `isConnected` and the event path read it.
+pub fn is_active_document(doc: usize) -> bool {
+    doc == dom::main_doc() || tree::by_document(doc).is_some()
+}
+
+/// The event target of the window whose active document is `doc` when that is a NESTED context's
+/// (DOM §2.9 "get the parent" of a Document: its relevant global — AETHERDEBT SR93; the top's Window
+/// is `js/events.rs`'s own step).
+pub fn window_target_of_document(doc: usize) -> Option<TargetKey> {
+    let id = tree::by_document(doc).filter(|&id| id != TOP)?;
+    target_key(id)
 }
 
 /// `document.location` of a nested document.
