@@ -520,6 +520,38 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     apply_stylesheets_inner(layout_tree, sheets, None);
 }
 
+// AETHERWPT3 (SR138): constructable stylesheets adopted by the page's document (CSSOM §6.1.2
+// `adoptedStyleSheets`, js/stylesheets.rs). The document's CSS style sheets are its own sheets in tree order
+// followed by its adopted sheets (CSSOM §6.1.2 "document or shadow root CSS style sheets"), so the cascade of a
+// tree of that document's arena takes them after the sheets its caller collected; a nested document painted
+// from a snapshot (its own arena) does not.
+thread_local! {
+    static ADOPTED: std::cell::RefCell<Option<(crate::dom::NodeRef, Vec<String>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The adopted sheets' texts of the document `doc` (None, or an empty list: none), in order.
+pub fn set_adopted(doc: Option<crate::dom::NodeRef>, sheets: Vec<String>) {
+    ADOPTED.with(|a| *a.borrow_mut() = doc.filter(|_| !sheets.is_empty()).map(|d| (d, sheets)));
+}
+
+/// `sheets`, with the adopted sheets after them when `tree` lays out the adopting document.
+fn with_adopted<'a>(tree: &LayoutTree, sheets: &'a [String]) -> std::borrow::Cow<'a, [String]> {
+    let extra = ADOPTED.with(|a| {
+        let a = a.borrow();
+        let (doc, list) = a.as_ref()?;
+        let root = tree.node_map.get(&tree.root_node)?;
+        root.same_document(doc).then(|| list.clone())
+    });
+    match extra {
+        Some(list) => {
+            let mut v = sheets.to_vec();
+            v.extend(list);
+            std::borrow::Cow::Owned(v)
+        }
+        None => std::borrow::Cow::Borrowed(sheets),
+    }
+}
+
 /// AETHERPAINTPERF (SR130): the engine's restyle — [`apply_stylesheets`] for the page's own document, which
 /// re-cascades only the elements the DOM changes since its last call can re-match (`restyle_plan`) and reuses
 /// that call's cascade for every other element. `hover` is the hover chain the engine set
@@ -530,6 +562,8 @@ pub fn apply_stylesheets_scoped(layout_tree: &mut LayoutTree, sheets: &[String],
 }
 
 fn apply_stylesheets_inner(layout_tree: &mut LayoutTree, sheets: &[String], hover: Option<&[html_core::NodeId]>) {
+    let effective = with_adopted(layout_tree, sheets);
+    let sheets: &[String] = &effective;
     let mut round = apply_stylesheets_with(layout_tree, sheets, None, hover);
     if let Some(sizes) = round.containers.take() {
         if let Some(root) = layout_tree.node_map.get(&layout_tree.root_node).cloned() {

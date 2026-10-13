@@ -47,6 +47,8 @@
 pub mod animations;
 pub mod broadcast;
 pub mod cache_api;
+/// AETHERWPT3 (SR138): Selection.modify()'s caret over the rendered text.
+pub mod caret;
 pub mod canvas;
 pub mod controls;
 pub mod cssom;
@@ -74,6 +76,8 @@ pub mod range;
 pub mod reflect;
 mod reflect_table;
 pub mod shadow;
+/// AETHERWPT3 (SR138): constructable stylesheets and adoptedStyleSheets (CSSOM §6.1).
+pub mod stylesheets;
 pub mod sw;
 /// AETHERMEDIA2 (SR134): text tracks, requestVideoFrameCallback, PiP / captureStream refusals.
 pub mod tracks;
@@ -827,6 +831,8 @@ impl Engine {
         animations::install(&mut vm);
         // AETHERWPT3 (SR138): the Navigation API — after fetch (AbortController) and ports (structuredClone).
         navigation::install(&mut vm);
+        // AETHERWPT3 (SR138): CSSStyleSheet / adoptedStyleSheets — after dom (Document, ShadowRoot) and window (matchMedia).
+        stylesheets::install(&mut vm);
         // AETHERMEDIA2 (SR134): after window (URL, the element interfaces) — MSE, then text tracks.
         mse::install(&mut vm);
         tracks::install(&mut vm);

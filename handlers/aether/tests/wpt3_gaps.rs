@@ -500,3 +500,82 @@ R.push(navigation.activation.navigationType);
     eval(&mut e, "N = []; navigation.navigate('#no').committed.catch(function (x) { N.push('rej:' + x.name); }); 0");
     assert_eq!(eval(&mut e, "N.join() + '|' + location.hash"), "nav:push:wpt3.html#no:true:true:true:true,err:AbortError,rej:AbortError|#i");
 }
+
+/// O9 — CSSOM §6.1 constructable stylesheets (`new CSSStyleSheet()`, its MediaList, `replaceSync` dropping
+/// `@import`, `insertRule` / its SyntaxError and IndexSizeError, `replace()` resolving with the sheet in a task and
+/// holding off `replaceSync` meanwhile — NotAllowedError, §6.4.4 rule serialization) and §6.1.2 `adoptedStyleSheets`
+/// (an ObservableArray: assignment, `pop` / `push`; a sheet of another document refused; the adopted sheets
+/// cascading after the document's own); Selection API §3 `modify()` (a word back with collapsed whitespace, a
+/// character across `<br>` both ways, a word forward, `lineboundary`, an unknown alter ignored) and
+/// `getComposedRanges()` (a selection inside a shadow tree rescoped to its host unless its root is passed, in the
+/// options dictionary or the variadic form; a non-ShadowRoot TypeError; none without a selection).
+#[test]
+fn o9_adopted_stylesheets_composed_ranges_and_modify() {
+    let mut e = load_with(
+        &page(
+            r#"
+var st = document.createElement('style'); st.textContent = '#t { color: rgb(1, 2, 3) }'; document.head.appendChild(st);
+var t = document.createElement('div'); t.id = 't'; t.textContent = 'x'; document.body.appendChild(t);
+var sh = new CSSStyleSheet();
+sh.replaceSync('@import url(x.css); #t { color: rgb(0, 128, 0) } .x { margin-top: 1px }');
+R.push(sh.cssRules.length, sh.cssRules[0].cssText, sh.cssRules[0].selectorText, new CSSStyleSheet({ media: 'print, screen' }).media.mediaText);
+document.adoptedStyleSheets = [sh];
+R.push(document.adoptedStyleSheets.length, getComputedStyle(t).color);
+sh.insertRule('#t { color: rgb(0, 0, 255) }', 2);
+R.push(getComputedStyle(t).color);
+document.adoptedStyleSheets.pop();
+R.push(getComputedStyle(t).color, document.adoptedStyleSheets.length);
+var tryName = function (f) { try { f(); return 'no-throw'; } catch (x) { return x.name; } };
+R.push(tryName(function () { document.adoptedStyleSheets = [{}]; }), tryName(function () { sh.insertRule('@import url(y.css);'); }),
+       tryName(function () { sh.insertRule('#t { }', 9); }), tryName(function () { new StyleSheet(); }),
+       tryName(function () { document.implementation.createHTMLDocument('').adoptedStyleSheets = [sh]; }));
+var R2 = '';
+sh.replace('#t { color: rgb(255, 0, 0) }').then(function (r) { R2 = (r === sh) + ':' + sh.cssRules.length; });
+R.push(tryName(function () { sh.replaceSync(''); }));
+document.adoptedStyleSheets.push(sh);
+
+var d = document.createElement('div');
+d.innerHTML = 'Test, these are <strong id="s1"> strong </strong> <em id="e1"> italic </em> normal.';
+document.body.appendChild(d);
+var pre = document.createElement('pre'); pre.innerHTML = 'foo<br>bar'; document.body.appendChild(pre);
+var sel = getSelection(), st1 = document.getElementById('s1').firstChild, f = pre.firstChild, b2 = pre.lastChild;
+sel.collapse(st1, 4); sel.modify('extend', 'backward', 'word');
+R.push(sel.focusNode === st1, sel.focusOffset, sel.anchorOffset);
+sel.collapse(f, 3); sel.modify('move', 'forward', 'character');
+R.push(sel.focusNode === b2, sel.focusOffset);
+sel.modify('move', 'backward', 'character');
+R.push(sel.focusNode === f, sel.focusOffset);
+sel.collapse(st1, 4); sel.modify('move', 'forward', 'word');
+R.push(sel.focusNode === st1, sel.focusOffset);
+sel.modify('move', 'forward', 'lineboundary');
+R.push(sel.focusNode.data === ' normal.', sel.focusOffset);
+sel.modify('bogus', 'forward', 'word');
+R.push(sel.focusOffset);
+
+var host = document.createElement('div'); document.body.appendChild(host);
+var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<span>abc</span>';
+var inner = root.firstChild.firstChild;
+sel.setBaseAndExtent(inner, 1, inner, 2);
+R.push(sel.anchorNode === inner);
+var cr = sel.getComposedRanges();
+R.push(cr.length, cr[0] instanceof StaticRange, cr[0].startContainer === document.body,
+       cr[0].startOffset === Array.prototype.indexOf.call(document.body.childNodes, host), cr[0].endOffset - cr[0].startOffset);
+var cr2 = sel.getComposedRanges({ shadowRoots: [root] });
+R.push(cr2[0].startContainer === inner, cr2[0].startOffset, cr2[0].endOffset);
+R.push(sel.getComposedRanges(root)[0].endContainer === inner);
+R.push(tryName(function () { sel.getComposedRanges({ shadowRoots: [host] }); }));
+sel.removeAllRanges();
+R.push(sel.getComposedRanges().length);
+"#,
+        ),
+        5_000,
+    );
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        "2|#t { color: rgb(0, 128, 0); }|#t|print, screen|1|rgb(0, 128, 0)|rgb(0, 0, 255)|rgb(1, 2, 3)|0\
+         |TypeError|SyntaxError|IndexSizeError|TypeError|NotAllowedError|NotAllowedError\
+         |true|1|4|true|0|true|3|true|7|true|8|8\
+         |true|1|true|true|true|1|true|1|2|true|TypeError|0"
+    );
+    assert_eq!(run_until(&mut e, "R2 !== ''", "R2 + '|' + getComputedStyle(t).color", 10), "true:1|rgb(255, 0, 0)");
+}
