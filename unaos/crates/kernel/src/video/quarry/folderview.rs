@@ -323,16 +323,19 @@ fn attr_sort_key() -> Option<String> {
 }
 
 /// `columns::after_show`, before the listing's facts: a NEW folder flushes the old folder's latch, resolves its
-/// own view and applies it to the column state. Inside `MODEL` → `COLS`.
-pub(super) fn enter(cwd: &str, st: &mut ColState) {
+/// own view and applies it to the column state. Inside `MODEL`; QUARRYIO (B660): `COLS` is taken twice, briefly and
+/// with no read inside — once for the flush's snapshot, once to apply — and the resolve (the folder's and its
+/// parents' `una:view` attributes) reads between them with no `COLS` held.
+pub(super) fn enter(cwd: &str) {
     let attr_now = attr_sort_key();
     let searching = super::toolbar::search_active();
     let flush = {
+        let st = COLS.lock();
         let mut f = FV.lock();
         if f.dir == cwd && !searching {
             return;
         }
-        let out = (f.dirty && f.writable && !f.dir.is_empty()).then(|| (f.dir.clone(), snapshot(st, &f, attr_now)));
+        let out = (f.dirty && f.writable && !f.dir.is_empty()).then(|| (f.dir.clone(), snapshot(&st, &f, attr_now)));
         f.dirty = false;
         if let Some(o) = out.clone() {
             f.pending.push(o);
@@ -345,10 +348,14 @@ pub(super) fn enter(cwd: &str, st: &mut ColState) {
         out.is_some()
     };
     let mt = crate::shell::vfs_mount_table();
+    super::columns::io_note(); // QUARRYIO (B660): the resolve reads the folder's attributes
     let (v, src, writable) = resolve(&mt, cwd);
-    st.widths = v.widths;
-    st.key = v.sort;
-    st.desc = v.desc;
+    {
+        let mut st = COLS.lock();
+        st.widths = v.widths;
+        st.key = v.sort;
+        st.desc = v.desc;
+    }
     serial_println!(
         "[folderview] enter dir={} src={} writable={} mode={} sort={} cols={}{}",
         cwd, src, writable as u8, v.mode, enc_sort(&v), enc_columns(&v.widths),

@@ -25,7 +25,7 @@
 //! Lock order: `MODEL` → `COLS` → [`EXP`] (a leaf). Fixture: `tests quarrylive` ([`selftest`]).
 //! Design: `docs/dev/evidence/rmbp-1005/quarrylive.md`.
 
-use super::columns::{compute_meta, layout_with, sort_rows, ColState, COLS};
+use super::columns::{layout_with, pending_row, sort_rows, ColState, RowMeta, COLS};
 use super::toolbar::{self, View};
 use super::*;
 use core::sync::atomic::AtomicU64;
@@ -73,62 +73,103 @@ pub(super) fn mark(px: &mut [u32], g: &Geom, x0: usize, y: usize, row_h: usize, 
     name_x(g, x0, e)
 }
 
-/// Strip every inline row, then splice the expanded folders' children back under their parents. Called at the tail
-/// of `columns::resort` (MODEL and COLS held) — after the fresh listing's sort and after every header re-sort.
-pub(super) fn resplice(m: &mut Model, st: &mut ColState) {
-    if m.list.iter().any(|e| e.name.contains('/')) {
-        let aligned = st.meta.len() == m.list.len();
-        let keep: Vec<bool> = m.list.iter().map(|e| !e.name.contains('/')).collect();
-        let mut k = keep.iter();
-        m.list.retain(|_| *k.next().unwrap_or(&true));
-        if aligned {
-            let mut k = keep.iter();
-            st.meta.retain(|_| *k.next().unwrap_or(&true));
+/// The expanded folders of the open window (relative to `cwd`; the set resets when the folder changes).
+fn open_set(cwd: &str) -> Vec<String> {
+    let mut x = EXP.lock();
+    if x.cwd != cwd {
+        x.cwd = String::from(cwd);
+        x.open.clear();
+    }
+    x.open.clone()
+}
+
+/// QUARRYIO (B660): read the expanded folders' children — under `MODEL` only, BEFORE `COLS` is taken — for
+/// [`resplice`]. A folder whose children are already listed inline is not re-read (the splice re-uses them).
+/// `(folder relative to cwd, its rows)`.
+pub(super) fn read_open(m: &mut Model) -> Vec<(String, Vec<DirEnt>)> {
+    let open = open_set(&m.cwd);
+    if open.is_empty() || toolbar::view() != View::List {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for rel in open {
+        let pre = alloc::format!("{}/", rel);
+        if m.list.iter().any(|e| e.name.starts_with(&pre)) {
+            continue;
+        }
+        let p = join(&m.cwd, &rel);
+        if let Ok((true, rows)) = m.collect_cached(&p) {
+            out.push((rel, rows));
         }
     }
-    let open = {
-        let mut x = EXP.lock();
-        if x.cwd != m.cwd {
-            x.cwd = m.cwd.clone();
-            x.open.clear();
+    out
+}
+
+/// Strip every inline row (with its facts), then splice the expanded folders' children back under their parents.
+/// Called at the tail of `columns::resort` (MODEL and COLS held) — after the fresh listing's sort and after every
+/// header re-sort. QUARRYIO (B660): NO READ — a folder's children are the inline rows just stripped, else the rows
+/// `kids` carries ([`read_open`], read before `COLS`), else nothing; new rows get pending facts (the facts pass reads
+/// them).
+pub(super) fn resplice(m: &mut Model, st: &mut ColState, kids: &[(String, Vec<DirEnt>)]) {
+    if st.meta.len() != m.list.len() || st.meta.iter().zip(m.list.iter()).any(|(mm, e)| mm.name != e.name) {
+        let old = core::mem::take(&mut st.meta);
+        st.meta = m.list.iter().map(|e| old.iter().find(|o| o.name == e.name).cloned().unwrap_or_else(|| pending_row(e))).collect();
+    }
+    let mut inline: Vec<(DirEnt, RowMeta)> = Vec::new();
+    if m.list.iter().any(|e| e.name.contains('/')) {
+        let list = core::mem::take(&mut m.list);
+        let meta = core::mem::take(&mut st.meta);
+        for (e, mm) in list.into_iter().zip(meta.into_iter()) {
+            if e.name.contains('/') {
+                inline.push((e, mm));
+            } else {
+                m.list.push(e);
+                st.meta.push(mm);
+            }
         }
-        x.open.clone()
-    };
+    }
+    let open = open_set(&m.cwd);
     if open.is_empty() || toolbar::view() != View::List {
         return;
     }
-    let aligned = st.meta.len() == m.list.len();
-    let mt = crate::shell::vfs_mount_table();
+    let mut added = false;
     let mut i = 0usize;
     while i < m.list.len() {
         let e = &m.list[i];
         if is_dir(e) && open.iter().any(|o| *o == e.name) && m.list.len() < MAX_LIST {
             let rel = e.name.clone();
-            let p = join(&m.cwd, &rel);
-            if let Ok((true, rows)) = m.collect_cached(&p) {
-                let mut kids: Vec<DirEnt> = rows
-                    .into_iter()
-                    .map(|mut k| {
-                        k.name = join(&rel, &k.name);
-                        k
-                    })
-                    .collect();
-                dedupe_by_name(&mut kids);
-                kids.truncate(MAX_LIST - m.list.len());
-                let mut km = compute_meta(&mt, &m.cwd, &kids, &[]);
-                sort_rows(&mut kids, &mut km, st.key, st.desc);
-                let n = kids.len();
-                let tail = m.list.split_off(i + 1);
-                m.list.extend(kids);
-                m.list.extend(tail);
-                if aligned && km.len() == n {
-                    let tail = st.meta.split_off(i + 1);
-                    st.meta.extend(km);
-                    st.meta.extend(tail);
+            let pre = alloc::format!("{}/", rel);
+            let mut rows: Vec<(DirEnt, RowMeta)> =
+                inline.iter().filter(|(k, _)| k.name.strip_prefix(&pre).map_or(false, |r| !r.contains('/'))).cloned().collect();
+            if rows.is_empty() {
+                if let Some((_, ks)) = kids.iter().find(|(p, _)| *p == rel) {
+                    let mut v: Vec<DirEnt> = ks
+                        .iter()
+                        .cloned()
+                        .map(|mut k| {
+                            k.name = join(&rel, &k.name);
+                            k
+                        })
+                        .collect();
+                    dedupe_by_name(&mut v);
+                    added |= !v.is_empty();
+                    rows = v.into_iter().map(|k| { let mm = pending_row(&k); (k, mm) }).collect();
                 }
             }
+            rows.truncate(MAX_LIST - m.list.len());
+            let (mut kl, mut km): (Vec<DirEnt>, Vec<RowMeta>) = rows.into_iter().unzip();
+            sort_rows(&mut kl, &mut km, st.key, st.desc);
+            let tail = m.list.split_off(i + 1);
+            m.list.extend(kl);
+            m.list.extend(tail);
+            let tail = st.meta.split_off(i + 1);
+            st.meta.extend(km);
+            st.meta.extend(tail);
         }
         i += 1; // the spliced children are walked next, so a nested expanded folder splices too
+    }
+    if added {
+        super::columns::FACTS_POSTED.store(true, Ordering::Release); // QUARRYIO (B660): the new rows' facts, on the service pass
     }
 }
 
@@ -145,16 +186,21 @@ pub(super) fn press(m: &mut Model, sx: usize, i: usize) -> bool {
     let g = m.geom;
     let li = g.list_pane().inner();
     let lsb = if m.list.len() > m.list_visible() { SBW() } else { 0 };
-    let mut st = COLS.lock();
-    let c = layout_with(&g, li, lsb, &st.widths, st.trash, &attrcols::widths());
-    let x0 = c.name_x + depth_of(&e.name) * g.mark_w();
+    let x0 = {
+        let st = COLS.lock();
+        let c = layout_with(&g, li, lsb, &st.widths, st.trash, &attrcols::widths());
+        c.name_x + depth_of(&e.name) * g.mark_w()
+    };
     if sx < x0 || sx >= x0 + g.mark_w() {
         return false;
     }
     let name = e.name.clone();
     let open = toggle(&m.cwd, &name);
-    resplice(m, &mut st);
-    drop(st);
+    let kids = read_open(m); // QUARRYIO (B660): the read, before COLS
+    {
+        let mut st = COLS.lock();
+        resplice(m, &mut st, &kids);
+    }
     if let Some(k) = m.list.iter().position(|r| r.name == name) {
         m.list_sel = k;
     }
@@ -318,12 +364,13 @@ pub fn selftest() {
         match g.as_mut() {
             Some(m) if toolbar::view() == View::List => {
                 toggle(&m.cwd.clone(), "SUB");
+                let kids = read_open(m); // QUARRYIO (B660): read first, COLS second
                 let mut st = COLS.lock();
-                resplice(m, &mut st);
+                resplice(m, &mut st, &kids);
                 let at = m.list.iter().position(|e| e.name == "SUB");
                 let ok = at.map(|i| m.list.get(i + 1).map(|e| e.name == "SUB/IN.TXT").unwrap_or(false)).unwrap_or(false);
                 toggle(&m.cwd.clone(), "SUB");
-                resplice(m, &mut st);
+                resplice(m, &mut st, &[]);
                 ok && !m.list.iter().any(|e| e.name.contains('/'))
             }
             _ => false,
