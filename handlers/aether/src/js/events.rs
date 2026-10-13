@@ -497,11 +497,12 @@ pub fn install_handlers(vm: &mut Vm, o: Obj, names: &[&str]) {
 
 /// The "get the parent" chain of a target: node ancestors, then the Window above the main Document
 /// (except for `load`, which does not propagate from the document to the window).
-fn event_path(t: TargetKey, ty: &str) -> Vec<TargetKey> {
+fn event_path(t: TargetKey, ty: &str, composed: bool) -> Vec<TargetKey> {
     let mut path = vec![t];
     if let TargetKey::Node(n) = t {
         let mut cur = n;
-        while let Some(p) = parent_of(cur) {
+        // AETHERSHADOW: DOM §2.9 "get the parent" (assigned slot, shadow root → host unless contained).
+        while let Some(p) = dom::with_doc(|d| crate::dom::shadow::event_parent(d, html_core::NodeId(cur), composed, html_core::NodeId(n))).map(|p| p.0) {
             path.push(TargetKey::Node(p));
             cur = p;
         }
@@ -521,7 +522,7 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
     set_flag(vm, e, F_DISPATCH, true);
     let tv = target_value(vm, t);
     set_slot(vm, e, E_TARGET, tv);
-    let path = event_path(t, &ty);
+    let path = event_path(t, &ty, flags(vm, e) & F_COMPOSED != 0);
     let path_vals: Vec<Value> = path.iter().map(|k| target_value(vm, *k)).collect();
     let arr = vm.new_array(path_vals);
     set_slot(vm, e, E_PATH, Value::Object(arr));
@@ -554,9 +555,11 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
     for (i, k) in path.iter().enumerate().rev() {
         let phase = if i == 0 { 2.0 } else { 1.0 };
         set_slot(vm, e, E_PHASE, num(phase));
+        shadow_adjusted_target(vm, e, t, *k);
         ran |= invoke_listeners(vm, e, *k, &ty, true);
     }
     for (i, k) in path.iter().enumerate() {
+        shadow_adjusted_target(vm, e, t, *k);
         if i == 0 {
             set_slot(vm, e, E_PHASE, num(2.0));
         } else {
@@ -570,6 +573,19 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
     set_slot(vm, e, E_PHASE, num(0.0));
     set_slot(vm, e, E_CURRENT, Value::Null);
     set_slot(vm, e, E_PATH, Value::Undefined);
+    // AETHERSHADOW: clearTargets — a target left inside a shadow tree is not exposed after dispatch.
+    if let (TargetKey::Node(o), Some(last)) = (t, path.last()) {
+        let against = if let TargetKey::Node(l) = last { Some(html_core::NodeId(*l)) } else { None };
+        let fin = dom::with_doc(|d| {
+            let r = crate::dom::shadow::retarget(d, html_core::NodeId(o), against);
+            (!crate::dom::shadow::is_shadow_root(d, crate::dom::shadow::root(d, r))).then_some(r.0)
+        });
+        let v = match fin {
+            Some(r) => wrap(vm, r),
+            None => Value::Null,
+        };
+        set_slot(vm, e, E_TARGET, v);
+    }
     set_flag(vm, e, F_DISPATCH, false);
     set_flag(vm, e, F_STOP, false);
     set_flag(vm, e, F_STOP_IMMEDIATE, false);
@@ -584,6 +600,17 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
         }
     }
     (ok, ran)
+}
+
+/// AETHERSHADOW: the event's target while `k`'s listeners run — the original target retargeted
+/// against `k` (DOM §2.5 via `dom::shadow::retarget`, the one retargeting function).
+fn shadow_adjusted_target(vm: &mut Vm, e: Obj, t: TargetKey, k: TargetKey) {
+    if let TargetKey::Node(o) = t {
+        let against = if let TargetKey::Node(n) = k { Some(html_core::NodeId(n)) } else { None };
+        let r = dom::with_doc(|d| crate::dom::shadow::retarget(d, html_core::NodeId(o), against)).0;
+        let v = wrap(vm, r);
+        set_slot(vm, e, E_TARGET, v);
+    }
 }
 
 fn is_mouse_event(vm: &Vm, e: Obj) -> bool {
@@ -1293,7 +1320,13 @@ fn ev_composed_path(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     match slot(vm, e, E_PATH) {
         Value::Object(a) => {
             let list = vm.array_to_list(&Value::Object(a));
-            Ok(Value::Object(vm.new_array(list)))
+            // AETHERSHADOW: entries inside closed shadow trees the current target cannot see are hidden.
+            let cur = slot(vm, e, E_CURRENT);
+            let ids: Vec<Option<html_core::NodeId>> = list.iter().map(|v| node_of(vm, v).map(html_core::NodeId)).collect();
+            let at = list.iter().position(|v| v.same_value(&cur)).unwrap_or(0);
+            let keep = dom::with_doc(|d| crate::dom::shadow::composed_path(d, &ids, at));
+            let out: Vec<Value> = keep.into_iter().filter_map(|i| list.get(i).cloned()).collect();
+            Ok(Value::Object(vm.new_array(out)))
         }
         _ => Ok(Value::Object(vm.new_array(Vec::new()))),
     }

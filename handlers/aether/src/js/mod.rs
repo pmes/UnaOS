@@ -441,6 +441,9 @@ pub(crate) fn checkpoint(vm: &mut Vm) {
     if engine_poisoned() || page(|p| std::mem::replace(&mut p.in_checkpoint, true)) {
         return;
     }
+    // AETHERSHADOW: an observer microtask or custom element reactions a mutation owed without a
+    // settle of its own (a removal outside the binding's algorithms) are taken up here.
+    mutation::settle(vm);
     let mut ran = 0usize;
     loop {
         let Some(job) = vm.jobs.pop_front() else { break };
