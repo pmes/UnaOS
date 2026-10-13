@@ -1252,3 +1252,6 @@ pub mod dnd;
 pub mod vplay;
 // SVCLATCH (B462, PERFREVIEW F8): the service passes' latches, a posted flag checked before the lock; `tests svclatch`. See video/svclatch.rs.
 pub mod svclatch;
+// SOFTY (B629): the desktop's second LOOK (`video::softy`: the taskbar, Start, the chrome at the right) and its switch (`video::look`, Principia's `system.look`). Same gate as the dock; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy;

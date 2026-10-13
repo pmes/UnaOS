@@ -250,6 +250,11 @@ pub static SCHEMA: &[Key] = &[
         doc: "Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login.",
     },
     Key {
+        ns: "system", key: "look", kind: Kind::Enum(&crate::appearance::LOOKS), default: Default::Str("una"),
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel `video::look` (SOFTY)",
+        doc: "The desktop's look: `una` (menu bar, dock, UnaOS chrome) or `softy` (a bottom taskbar with a Start menu, window controls at the right), applied live on PrefChanged (SOFTY B629).",
+    },
+    Key {
         ns: "system", key: "notify.dnd", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel NOTIFY (`video/notify.rs`)",
         doc: "Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows, no sound) (NOTIFY, MACPARITY row 24). Edited in Settings > Notifications; stored in settings/notify (NOTIFYPANE B435).",

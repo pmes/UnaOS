@@ -14,6 +14,16 @@
 pub const MODE_KEY: &str = "appearance.mode";
 pub const ACCENT_KEY: &str = "appearance.accent";
 pub const HIGHLIGHT_KEY: &str = "appearance.highlight";
+/// SOFTY (rmbp-ledger B629): the desktop's LOOK — `system.look`, namespace-relative. `una` (the menu bar, the dock,
+/// the UnaOS chrome; the default) or `softy` (the bottom taskbar, the Start menu, controls at the right).
+pub const LOOK_KEY: &str = "look";
+/// The look spellings, index = the kernel's `video::look::Look` discriminant.
+pub const LOOKS: [&str; 2] = ["una", "softy"];
+
+/// A stored look; unset or unknown = `una` (index 0).
+pub fn look_index(v: Option<&str>) -> usize {
+    v.map(str::trim).and_then(|s| LOOKS.iter().position(|l| l.eq_ignore_ascii_case(s))).unwrap_or(0)
+}
 
 /// The mode spellings, in the Settings segment order.
 pub const MODES: [&str; 3] = ["light", "dark", "auto"];
@@ -107,6 +117,13 @@ mod tests {
         assert!(is_dark(Mode::Auto, Some(19)) && is_dark(Mode::Auto, Some(23)) && is_dark(Mode::Auto, Some(0)) && is_dark(Mode::Auto, Some(6)));
         assert!(!is_dark(Mode::Auto, Some(7)) && !is_dark(Mode::Auto, Some(12)) && !is_dark(Mode::Auto, Some(18)));
         assert!(is_dark(Mode::Dark, None) && !is_dark(Mode::Light, Some(22)));
+    }
+
+    #[test]
+    fn look_parse_defaults_una() {
+        assert_eq!(look_index(None), 0);
+        assert_eq!(look_index(Some(" Softy ")), 1);
+        assert_eq!(look_index(Some("windows")), 0);
     }
 
     #[test]
