@@ -159,3 +159,82 @@ Wire:
 
 The cost line is a measurement and not a verdict. Under QEMU TCG the numbers say nothing about metal. The
 1 ms budget is scored on the rMBP bench.
+
+## The Settings page (SETTINGSCRAFT, rmbp-ledger B630)
+
+`video/settings.rs` is the kit's first whole window. It follows DESIGN-LANGUAGE §3.4 (Settings) on the language's
+4 pt grid. It changes no dpi, font or core palette value: every colour is a theme role or derived from one, and the
+language's five open decisions are left to Peter.
+
+**Geometry** (logical px; the surface is `metrics::size` of them):
+
+| part | value |
+|---|---|
+| window | 920 x 560 (`WIN_W` x `WIN_H`); the floor rule for small panels stays (`open` refuses a window larger than the panel) |
+| column | 220 wide; ground = the window face 12/255 toward the ink (`SIDEBAR_TINT`: darker on Light, lighter on Dark, as `surface.sidebar` sits against `surface.window`); a hairline at its right edge |
+| user card | at the top: a 32 avatar disc (accent, the initial in `ink_on_accent`), the name bold, the role secondary; a press opens Users |
+| search | the kit's `text_field` under the card, 24 tall, a `Search` placeholder in `ink_secondary`; it filters the tab names (ASCII case-insensitive substring), Enter opens the first match, Esc clears |
+| tab rows | `sidebar_row` pills 28 tall at a 32 pitch, inset 8; a 16 icon tile at 8 from the pill's edge, the label 8 after it; selected = the accent pill with the bold light label |
+| pane | title = the tab's name in the Chrome face, bold, in a 60 band; content padding 20; rows 48 tall |
+| grouped list | `group_box` per band of rows, inset 4 from its band; a hairline between its rows from 12 in; the label at 12, the control right-aligned to 12 from the box's edge (`CTRL_R`) |
+
+**The tab icons** are drawn as code (no bitmap), each a rounded tile (`icon_radius`) with a glyph in the ink drawn on a
+fill: General a gear (slate), Users a head and shoulders and Display a screen on a stand (the first accent), About an
+"i" (slate), Login Items a list (slate), Appearance a half-lit disc (the ink's own tile), Trackpad a pad with its click
+strip (slate), File Types a page with a turned corner (slate), Notifications a bell (rose). The tiles come from the
+accents table. There is no literal.
+
+**Controls, one by one** (all from this kit; none is a bare `fill_rect` box):
+
+| pane | control | before | now |
+|---|---|---|---|
+| column | tab rows | flat rects, a 3 px focus bar | `sidebar_row` pills with icon tiles; the focus ring after a key |
+| General | Volume | flat rail, a square 8 px knob | `slider` (rail grown by half a knob each end, so the knob's centre is the press map's point) |
+| General | Mute · Auto-hide dock | 24 px square box | `toggle`, right-aligned |
+| General | Trackpad · Apply · Off · Password | flat rect buttons | `push_button` |
+| General | Wallpaper | flat rect, a `_` caret | `text_field` (caret, ring) |
+| General | Dock position | three flat rects | `segmented_w` |
+| Display | Brightness · Blank screen | flat rail, square knob | `slider` |
+| Display | Resolution | flat rect and a `v` | a popup: `push_button` with a two-stroke chevron. Open: a raised overlay (`shadow_rrect`, `fill_rrect`, `stroke_rrect`) with the current entry an accent pill |
+| Display | Font · Font size | flat segments, `  -` / `  +` | `segmented_w`, `push_button` |
+| Users | list | text rows, an accent bar | avatar discs, a row wash for the selection, `push_button`s (Yes is the default) |
+| Users | Add form | flat fields, an `Admin: yes` button | `text_field`s, Create the default `push_button`, Admin a `checkbox` |
+| About | facts | label / value rows | one centred card: an accent mark tile, the name, the version, the facts around the centre |
+| Login Items | Up · Down · Remove · < · > · Add | flat rect buttons | `push_button` (Add the default) |
+| Appearance | Light / Dark / Auto | flat segments | `segmented_w` |
+| Appearance | swatches | squares, a square ring | discs with a hairline edge, a ring on the chosen one and on hover |
+| Trackpad | four switches | 24 px boxes and `on` / `off` | `toggle`, right-aligned |
+| File Types | rows | `[icon] description - mime` text | a page icon tile, the description, the mime in the secondary ink; the row lights under the pointer |
+| Notifications | Do Not Disturb · Allow · Sound · steps · Style | boxes and flat rects | `toggle`, `checkbox`, `push_button` |
+
+**States.** Hover: polled on the desktop service pass (`settings::hover_poll`, one line in `quarry/live.rs` beside
+`settings::service`), which reads the cursor as the dock's hover does. Each paint records the rect of every control it
+drew. A repaint happens only when the pointer crosses into another control or tab row, not on every motion sample.
+Pressed: a press shows its control's pressed face for `PRESS_MS` (100 ms, `motion.fast`). Focus: the ring shows only after a key
+(DESIGN-LANGUAGE §2.7). A text field shows its caret whenever it holds the keys. The wheel reaches `settings::key_route`
+first in `quarry::live::key_route`'s chain and goes by the pointer, not the focus (QSCROLL's rule). Over the column it
+scrolls the rows; over File Types it pages (`[settings] wheel area=<column|pane> d=<n> moved=<0|1>`). The selected
+pill's ease is not done: the window repaints on demand, with no frame clock to step a 120 ms curve on.
+
+**What the kit lacked**, and what this page did about it:
+
+- a fixed-width segmented control: `draw::segmented_w` was ADDED (`segmented` now calls it), so the painted segments are the press router's `x / (w / n)` segments;
+- a popup button and a menu overlay: composed here from `push_button`, `line_aa`, `shadow_rrect`, `fill_rrect` and `stroke_rrect`;
+- an icon slot in `sidebar_row`: the pill is drawn with an empty label, then the tile and the label go on top;
+- a placeholder in `text_field`: drawn after it in `ink_secondary`;
+- a grouped list: `group_box` plus `hairline_h` separators (`settings::groups`);
+- a title-size face: the Chrome face in bold stands in until DESIGN-LANGUAGE §2.2's type ramp lands;
+- a motion primitive (an eased value stepped by a frame clock): none, so there is no pill ease.
+
+**`tests settings`** keeps its line and gains `craft=`. The fixture paints the General pane offscreen in the Light
+set and then in the Dark set (it restores the live set, accent and highlight afterwards) and reads pixels back:
+
+- **icons**: every tab's tile has a corner that is not the tile's colour, and the tile and a glyph both show inside it;
+- **hairline**: the first box's top edge is the hairline blended over the box's fill, with the window face above it
+  and the fill below it, and the separator runs from the row inset with the fill left of it;
+- **round**: the box's corner and the selected pill's corner are the ground underneath them. No bare 1-px-bordered
+  rectangle is left;
+- **sets**: the column differs from the pane, and the pane's face differs between the two sets.
+
+Wire: `[settings] fixture … col_ok=1 craft=ok win=920x560`. On a failure, `craft=` names the first failed check, with
+`-dark` added when it failed in the Dark set.
