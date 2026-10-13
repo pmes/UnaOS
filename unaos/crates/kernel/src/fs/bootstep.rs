@@ -515,20 +515,20 @@ pub fn poll() -> bool {
         }
         g.iter().any(|l| !l.name.is_empty())
     };
-    for d in &due[..n] {
-        serial_println!("[boot] step={} OVER budget_ms={} elapsed_ms={} last={} cmds={}", d.0, d.2, d.3, d.4, d.5);
-    }
     if n > 0 {
-        // The panel's line: the innermost over step, in words under the splash's own word.
+        // RESOLVEHANG (B524): the PANEL first, the wire second — a stepping task that wedged holding the serial sink would otherwise stop this look at its `serial_println!` before the glass ever shows the step. The panel's line: the innermost over step, in words under the splash's own word.
         let d = due[n - 1];
         let mut ln = PanelLine { b: [0; 160], n: 0 };
         use core::fmt::Write;
         let _ = write!(
             ln,
-            "{} ({}) is taking {}.{} s, budget {}.{} s, last {}, {} commands",
-            if d.1.is_empty() { d.0 } else { d.1 }, d.0, d.3 / 1000, (d.3 % 1000) / 100, d.2 / 1000, (d.2 % 1000) / 100, d.4, d.5
+            "step={} OVER - {} is taking {}.{} s, budget {}.{} s, last {}, {} commands", // RESOLVEHANG (B524): the bench reads the step's own name and `OVER` with no wire
+            d.0, if d.1.is_empty() { d.0 } else { d.1 }, d.3 / 1000, (d.3 % 1000) / 100, d.2 / 1000, (d.2 % 1000) / 100, d.4, d.5
         );
         crate::splash::over_label(ln.as_str());
+    }
+    for d in &due[..n] {
+        serial_println!("[boot] step={} OVER budget_ms={} elapsed_ms={} last={} cmds={}", d.0, d.2, d.3, d.4, d.5);
     }
     any || crate::splash::holding()
 }
