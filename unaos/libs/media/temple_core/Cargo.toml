@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# TEMPLE (LEDGER SR147, R128): the renderer core of the TEMPLE game — the FULL tier of R128's scene (a faceted zircon
+# in the foreground, the beam striking it, the dark-matter flow, the gravitationally lensed stars), rendered by
+# software ray tracing on one core. CHARTER: Vug (CODEX §2, 3D) owns the domain; seam `shared-core` — `#![no_std]` +
+# `alloc`, linked by the ring-3 vessel (crates/user-temple) and measured on the host by its own tests.
+#
+# The empty [workspace] table makes this crate its OWN workspace root (the user-* crates' shape): the root host
+# workspace's member list is not this arc's file (the fold may add `unaos/libs/media/temple_core` there).
+[workspace]
+
+[package]
+name = "temple_core"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+description = "TEMPLE (SR147): the no_std software ray tracer of R128's full scene — zircon, beam, dark-matter flow, lensed stars — over a generic scalar (Q16.16 integer for the soft-float ring-3 profile, f32 where the FPU is the program's)."
+
+[dependencies]
+# PALETTECORE (B559): the one table of UnaOS colours; the beam and the ultra-black ground are its SPLASH_* rows.
+palette_core = { path = "../../sys/palette_core" }
+
+# The tests ARE the bar's measurement (R106's front gate): a plain `cargo test` must time optimised code.
+[profile.test]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false

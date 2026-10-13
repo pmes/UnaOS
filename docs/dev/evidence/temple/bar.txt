@@ -1,0 +1,9 @@
+TEMPLE bar host: 4 logical cpus, one thread; cpu: Intel(R) Xeon(R) Processor @ 2.80GHz
+TEMPLE bar [fx16] build (tables + flow bake) 103 ms
+TEMPLE bar [fx16] still 960x600: 1 spp 723 ms, 4 spp 2930 ms, 8 spp 5594 ms, 16 spp 10884 ms (1181 ns per sample incl. resolve)
+TEMPLE bar [fx16] still convergence: mean |img4-img8| 0.955 LSB (2.26% ch > 8), mean |img8-img16| 0.297 LSB (0.09% ch > 8); converged (mean <= 0.5 LSB, < 0.5% > 8) at 8 spp = 5594 ms -> MISSES (bar <= 3000 ms)
+TEMPLE bar [fx16] orbit 480x300 (reset every frame, 2x upscale to 960x600 timed): 5.87 fps, worst frame 225 ms -> MISSES (bar >= 10 fps)
+TEMPLE bar [f32] build (tables + flow bake) 84 ms
+TEMPLE bar [f32] still 960x600: 1 spp 314 ms, 4 spp 1066 ms, 8 spp 2127 ms, 16 spp 4283 ms (465 ns per sample incl. resolve)
+TEMPLE bar [f32] still convergence: mean |img4-img8| 0.961 LSB (2.26% ch > 8), mean |img8-img16| 0.296 LSB (0.09% ch > 8); converged (mean <= 0.5 LSB, < 0.5% > 8) at 8 spp = 2127 ms -> MEETS (bar <= 3000 ms)
+TEMPLE bar [f32] orbit 480x300 (reset every frame, 2x upscale to 960x600 timed): 14.51 fps, worst frame 88 ms -> MEETS (bar >= 10 fps)
