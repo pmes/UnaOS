@@ -3,10 +3,11 @@
 //! RelativeTimeFormat (§17), Segmenter (§18), Locale (§14), DisplayNames (§12) and DurationFormat (2025), plus the locale-sensitive methods of
 //! Number, BigInt, Date, String and Array (§19) that route through them.
 //!
-//! ICU-free: the locale data is in this tree (`data.rs`), written from CLDR 46's `en`, `en-US` and
-//! `en-GB` values (the formats a page reads back from Chromium for those locales). A requested locale
-//! outside that set resolves to the default locale `en-US` (ECMA-402 §9.2.7 LookupMatchingLocale); the
-//! services report the locale they actually used in `resolvedOptions().locale`, as the spec requires.
+//! ICU-free (R83): the locale data is CLDR 46 generated into `crate::cldr` (INTLCLDR, SR137) — 32 CLDR locales
+//! and their alias tags. ResolveLocale (§9.2.7) runs the lookup matcher with a best-fit step (§9.2.8, an
+//! implementation choice): a request whose likely script differs from the lookup result's (zh-MO → Hant) takes
+//! the available locale of its own language and script. The services report the locale they used in
+//! `resolvedOptions().locale`; a request matching nothing resolves to the default locale `en-US`.
 
 use super::*;
 use alloc::format;
@@ -14,7 +15,6 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 
 pub mod collator;
-pub mod data;
 pub mod datetime;
 pub mod displaynames;
 pub mod duration;
@@ -54,8 +54,6 @@ pub fn alloc_intl(vm: &mut Vm, proto: Obj, data: IntlData) -> Obj {
     vm.alloc(ObjectData::new(Some(proto), Kind::Intl(Box::new(IntlObj { data, bound: None }))))
 }
 
-/// The locales this implementation has data for (ECMA-402 §9.1 [[AvailableLocales]]).
-pub const AVAILABLE: &[&str] = &["en", "en-GB", "en-US"];
 /// DefaultLocale (§6.2.4).
 pub const DEFAULT_LOCALE: &str = "en-US";
 
@@ -281,7 +279,7 @@ pub fn canonicalize_locale_list(vm: &mut Vm, locales: &Value) -> JsResult<Vec<St
 pub fn best_available(tag: &str) -> Option<&'static str> {
     let mut cand: String = locale::strip_extensions(tag);
     loop {
-        if let Some(a) = AVAILABLE.iter().find(|a| a.eq_ignore_ascii_case(&cand)) {
+        if let Some((a, _)) = crate::cldr::available(&cand) {
             return Some(a);
         }
         let pos = cand.rfind('-')?;
@@ -292,17 +290,50 @@ pub fn best_available(tag: &str) -> Option<&'static str> {
     }
 }
 
+/// The likely script of a tag (its own, or the one Add Likely Subtags gives it).
+fn likely_script(tag: &str) -> Option<String> {
+    let t = locale::LangTag::parse(tag)?;
+    if let Some(s) = &t.script {
+        return Some(s.clone());
+    }
+    let (_, s, _) = locale::add_likely(&t);
+    s
+}
+
+/// The best-fit step: when the lookup result writes another script than the request is likely written in
+/// (zh-TW-like requests against `zh`), the available locale of the same language and script.
+fn best_fit(request: &str, lookup: &'static str) -> &'static str {
+    let (Some(want), Some(have)) = (likely_script(request), likely_script(lookup)) else { return lookup };
+    if want == have {
+        return lookup;
+    }
+    let lang = request.split('-').next().unwrap_or("").to_ascii_lowercase();
+    if let Some((t, _)) = crate::cldr::available(&format!("{lang}-{want}")) {
+        return t;
+    }
+    for t in crate::cldr::available_tags() {
+        if t.split('-').next() == Some(lang.as_str()) && likely_script(t).as_deref() == Some(want.as_str()) {
+            return t;
+        }
+    }
+    lookup
+}
+
 /// The outcome of ResolveLocale (§9.2.7): the data locale and the Unicode extension keywords of the
 /// request that the service honours (key, value).
 pub struct Resolved {
+    /// The available tag that matched (what `resolvedOptions().locale` starts with).
     pub data_locale: &'static str,
+    /// Its CLDR data.
+    pub loc: crate::cldr::L,
     pub keywords: Vec<(String, String)>,
 }
 
-/// ResolveLocale with the lookup matcher (best fit is implementation-defined; lookup is a valid best fit).
+/// ResolveLocale with the lookup matcher plus the best-fit script step.
 pub fn resolve_locale(requested: &[String], relevant_keys: &[&str]) -> Resolved {
     for r in requested {
         if let Some(a) = best_available(r) {
+            let a = best_fit(&locale::strip_extensions(r), a);
             let mut keywords = Vec::new();
             if let Some(t) = locale::LangTag::parse(r) {
                 for (k, v) in &t.keywords {
@@ -311,10 +342,16 @@ pub fn resolve_locale(requested: &[String], relevant_keys: &[&str]) -> Resolved 
                     }
                 }
             }
-            return Resolved { data_locale: a, keywords };
+            return Resolved { data_locale: a, loc: loc_of(a), keywords };
         }
     }
-    Resolved { data_locale: DEFAULT_LOCALE, keywords: Vec::new() }
+    Resolved { data_locale: DEFAULT_LOCALE, loc: loc_of(DEFAULT_LOCALE), keywords: Vec::new() }
+}
+
+/// The CLDR data of a resolved locale string (its extensions ignored); `en` when unknown.
+pub fn loc_of(tag: &str) -> crate::cldr::L {
+    let base = locale::strip_extensions(tag);
+    crate::cldr::available(&base).map(|(_, l)| l).unwrap_or(crate::cldr::L::EN)
 }
 
 impl Resolved {
@@ -341,9 +378,18 @@ impl Resolved {
     }
 }
 
-/// The en-GB data set or the en-US one (`en` resolves to en-US data).
-pub fn is_gb(locale: &str) -> bool {
-    locale.starts_with("en-GB")
+/// The numbering system a service uses (§15.1.2 / §11.1.2): the option when it is a numeric system CLDR knows,
+/// else the -u-nu- keyword when it is, else the locale's default. Returns (system, keyword honoured).
+pub fn numbering_system(r: &Resolved, option: Option<&str>) -> (&'static str, bool) {
+    let known = |s: &str| crate::cldr::numbering_systems().find(|n| *n == s);
+    let kw = r.keyword("nu").and_then(known);
+    if let Some(o) = option.and_then(known) {
+        return (o, kw == Some(o));
+    }
+    if let Some(k) = kw {
+        return (k, true);
+    }
+    (r.loc.default_ns(), false)
 }
 
 fn get_canonical_locales(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -369,13 +415,13 @@ fn supported_values_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let kv = vm.arg(ctx, 0);
     let key = vm.to_string(&kv)?.to_rust();
     let mut list: Vec<String> = match key.as_str() {
-        "calendar" => strs(&["gregory"]),
-        // The collator implements the root order only (no tailorings such as "emoji" or "phonebk").
-        "collation" => Vec::new(),
-        "currency" => data::CURRENCIES.iter().map(|c| c.code.to_string()).collect(),
-        "numberingSystem" => strs(&["latn"]),
-        "timeZone" => data::ZONES.iter().map(|z| z.id.to_string()).chain(core::iter::once(String::from("UTC"))).collect(),
-        "unit" => data::UNITS.iter().map(|u| u.id.to_string()).collect(),
+        "calendar" => strs(datetime::CALENDARS),
+        // The CLDR collation types beside the locales' defaults (cldr::collation tailorings).
+        "collation" => strs(&["phonebk", "pinyin", "trad"]),
+        "currency" => crate::cldr::currency_codes().map(String::from).collect(),
+        "numberingSystem" => crate::cldr::numbering_systems().map(String::from).collect(),
+        "timeZone" => crate::tzdata::primary_ids().into_iter().map(String::from).chain(core::iter::once(String::from("UTC"))).collect(),
+        "unit" => crate::cldr::unit_ids().filter(|u| !u.contains("-per-")).map(String::from).collect(),
         _ => return vm.throw_range(&format!("Invalid key : {key}")),
     };
     list.sort();

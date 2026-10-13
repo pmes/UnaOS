@@ -1,5 +1,9 @@
 //! Time zones as data: a POSIX TZ rule (`std offset [dst [offset] [,start[/time],end[/time]]]`, IEEE 1003.1
 //! §8.3) gives LocalTZA without any OS time-zone database. The embedding sets the rule string; the default is UTC.
+//!
+//! INTLCLDR (SR137): `PosixTz::named("Europe/Berlin")` binds a rule to an IANA zone of `crate::tzdata` (tzdata
+//! 2025b): every historical transition of the zone answers up to its last one (2037 for zones that still
+//! change), its POSIX rule after it — Date's LocalTZA, DateTimeFormat and Temporal read the same table.
 
 use alloc::string::String;
 
@@ -22,6 +26,8 @@ pub struct PosixTz {
     /// Offset east of UTC in ms (the POSIX string writes hours west of UTC).
     pub std_offset: f64,
     pub dst: Option<Dst>,
+    /// The tzdata zone (index into `tzdata::ZONES`) whose transitions precede the rule; None for a bare rule.
+    pub zone: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -139,7 +145,7 @@ impl P<'_> {
 
 impl PosixTz {
     pub fn utc() -> PosixTz {
-        PosixTz { std_name: String::from("UTC"), std_offset: 0.0, dst: None }
+        PosixTz { std_name: String::from("UTC"), std_offset: 0.0, dst: None, zone: None }
     }
 
     /// Parse a POSIX TZ rule string, e.g. `CET-1CEST,M3.5.0,M10.5.0/3` or `EST5EDT,M3.2.0,M11.1.0`.
@@ -148,7 +154,7 @@ impl PosixTz {
         let std_name = p.name()?;
         let std_offset = -p.time()?;
         if p.peek().is_none() {
-            return Some(PosixTz { std_name, std_offset, dst: None });
+            return Some(PosixTz { std_name, std_offset, dst: None, zone: None });
         }
         let dst_name = p.name()?;
         let dst_offset = if matches!(p.peek(), Some(c) if c == b'+' || c == b'-' || c.is_ascii_digit()) { -p.time()? } else { std_offset + MS_HOUR };
@@ -168,11 +174,57 @@ impl PosixTz {
         if p.peek().is_some() {
             return None;
         }
-        Some(PosixTz { std_name, std_offset, dst: Some(Dst { name: dst_name, offset: dst_offset, start, end }) })
+        Some(PosixTz { std_name, std_offset, dst: Some(Dst { name: dst_name, offset: dst_offset, start, end }), zone: None })
     }
 
-    /// Offset (ms east of UTC) in effect at UTC time `t`.
+    /// The rule of an IANA zone with its history (any Zone or Link name of tzdata, ASCII case-insensitive).
+    pub fn named(id: &str) -> Option<PosixTz> {
+        let f = crate::tzdata::find(id)?;
+        Some(PosixTz::of_zone(f.data))
+    }
+
+    /// The rule of a tzdata zone (index into `tzdata::ZONES`) with its history.
+    pub fn of_zone(data: u16) -> PosixTz {
+        let z = &crate::tzdata::ZONES[data as usize];
+        let mut p = PosixTz::parse(z.posix).unwrap_or_else(|| {
+            // No rule: the type after the last transition holds for ever.
+            let k = crate::tzdata::transitions(data).last().map(|x| x.1).unwrap_or_else(|| crate::tzdata::initial(data));
+            PosixTz { std_name: String::new(), std_offset: k.offset as f64 * 1000.0, dst: None, zone: None }
+        });
+        p.zone = Some(data);
+        p
+    }
+
+    /// The historical local time type at UTC time `t` (ms), None when the rule answers (or no zone is bound).
+    fn hist_at(&self, t: f64) -> Option<crate::tzdata::Kind> {
+        let z = self.zone?;
+        if !t.is_finite() {
+            return None;
+        }
+        crate::tzdata::kind_at(z, floor(t / 1000.0) as i64)
+    }
+
+    /// Whether daylight-saving time is in effect at UTC time `t`.
+    pub fn is_dst_at_utc(&self, t: f64) -> bool {
+        if let Some(k) = self.hist_at(t) {
+            return k.dst;
+        }
+        match &self.dst {
+            Some(d) => self.rule_offset_at_utc(t) == d.offset && d.offset != self.std_offset,
+            None => false,
+        }
+    }
+
+    /// Offset (ms east of UTC) in effect at UTC time `t`: the zone's history, then its rule.
     pub fn offset_at_utc(&self, t: f64) -> f64 {
+        if let Some(k) = self.hist_at(t) {
+            return k.offset as f64 * 1000.0;
+        }
+        self.rule_offset_at_utc(t)
+    }
+
+    /// Offset (ms east of UTC) the POSIX rule gives at UTC time `t`.
+    pub fn rule_offset_at_utc(&self, t: f64) -> f64 {
         let d = match &self.dst {
             None => return self.std_offset,
             Some(d) => d,
@@ -200,6 +252,19 @@ impl PosixTz {
     /// Offset to subtract from local time `t` to get UTC: repeated local times take the offset before the
     /// transition (daylight time), skipped ones are read with the offset before the transition (standard time).
     pub fn offset_for_local(&self, t: f64) -> f64 {
+        if self.zone.is_some() {
+            // The offsets around `t`: those that read `t` back are its instants; of two (a repeated time) the
+            // earlier instant (the larger offset), of none (a skipped time) the offset before the transition.
+            let before = self.offset_at_utc(t - MS_DAY);
+            let after = self.offset_at_utc(t + MS_DAY);
+            let mut best: Option<f64> = None;
+            for o in [before, after] {
+                if self.offset_at_utc(t - o) == o && best.map(|b| o > b).unwrap_or(true) {
+                    best = Some(o);
+                }
+            }
+            return best.unwrap_or(before);
+        }
         let d = match &self.dst {
             None => return self.std_offset,
             Some(d) => d,
@@ -210,8 +275,15 @@ impl PosixTz {
         self.std_offset
     }
 
-    /// The abbreviation in effect at UTC time `t`.
+    /// The name in effect at UTC time `t`: for a tzdata zone the CLDR English long name of its metazone (what
+    /// Date.prototype.toString shows in parentheses), else the rule's abbreviation.
     pub fn name_at_utc(&self, t: f64) -> &str {
+        if let Some(z) = self.zone {
+            let dst = self.is_dst_at_utc(t);
+            if let Some(n) = zone_long_name(z, dst) {
+                return n;
+            }
+        }
         match &self.dst {
             Some(d) if self.offset_at_utc(t) == d.offset && d.offset != self.std_offset => &d.name,
             _ => &self.std_name,
@@ -221,6 +293,19 @@ impl PosixTz {
 
 fn floor(x: f64) -> f64 {
     crate::numconv::libm_floor(x)
+}
+
+/// The CLDR metazone of a tzdata zone: its own id first, then the ids of its Links (CLDR files zones under
+/// their older names: Asia/Calcutta, Europe/Kiev).
+pub fn zone_metazone(data: u16) -> Option<usize> {
+    let id = crate::tzdata::ZONES[data as usize].id;
+    crate::cldr::zone_meta(id).or_else(|| crate::tzdata::aliases_of(data).find_map(crate::cldr::zone_meta))
+}
+
+/// The English long standard / daylight name of a tzdata zone.
+fn zone_long_name(data: u16, dst: bool) -> Option<&'static str> {
+    let m = zone_metazone(data)?;
+    crate::cldr::L::EN.metazone_name(m, false, if dst { 2 } else { 1 })
 }
 
 pub fn day_from_year(y: f64) -> f64 {

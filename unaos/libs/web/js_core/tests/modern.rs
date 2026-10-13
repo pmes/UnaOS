@@ -67,7 +67,7 @@ fn intl_number_format() {
         ("new Intl.NumberFormat().formatToParts(-1234.5).map(p => p.type).join()", "minusSign,integer,group,integer,decimal,fraction"),
         ("new Intl.NumberFormat('en').formatRange(3, 5)", "3–5"),
         ("new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD'}).resolvedOptions().maximumFractionDigits", "2"),
-        ("new Intl.NumberFormat('de-DE').resolvedOptions().locale", "en-US"),
+        ("new Intl.NumberFormat('de-DE').resolvedOptions().locale", "de-DE"), // INTLCLDR (SR137): de-DE is a carried locale now
         ("try { new Intl.NumberFormat('en', {style: 'currency'}) } catch (e) { e.name }", "TypeError"),
     ]);
 }
@@ -155,7 +155,7 @@ fn intl_list_relative_segmenter_locale() {
         ("new Intl.Locale('en-Latn-US-u-hc-h23').hourCycle", "h23"),
         ("new Intl.Locale('en').maximize().toString()", "en-Latn-US"),
         ("Intl.getCanonicalLocales('EN-us').join()", "en-US"),
-        ("Intl.NumberFormat.supportedLocalesOf(['fr', 'en-GB']).join()", "en-GB"),
+        ("Intl.NumberFormat.supportedLocalesOf(['fr', 'en-GB']).join()", "fr,en-GB"), // INTLCLDR (SR137)
         ("Object.prototype.toString.call(Intl)", "[object Intl]"),
     ]);
 }

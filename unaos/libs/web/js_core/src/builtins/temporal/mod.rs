@@ -2,7 +2,7 @@
 //! `ZonedDateTime`, `PlainDate`, `PlainTime`, `PlainDateTime`, `PlainYearMonth`, `PlainMonthDay`, `Duration`
 //! and `Temporal.Now`, on the ISO 8601 calendar only (`iso8601`; every other calendar identifier is refused
 //! by name with a RangeError). Time zones are UTC, offset zones and the 84 IANA zones of the Intl data with
-//! their historical transitions (`tzdata.rs`, generated from tzdata 2025b). `Intl.DateTimeFormat` formats
+//! their historical transitions (`crate::tzdata`, generated from tzdata 2025b by INTLCLDR SR137). `Intl.DateTimeFormat` formats
 //! Temporal objects through `format_hook` (ECMA-402 Temporal integration, §11.5.x HandleDateTimeValue).
 //!
 //! Internal slots ride the engine's Intl object kind (`IntlData::Temporal`), and each realm's Temporal
@@ -12,7 +12,6 @@
 pub mod diff;
 pub mod iso;
 pub mod parse;
-pub mod tzdata;
 pub mod zone;
 
 mod duration;

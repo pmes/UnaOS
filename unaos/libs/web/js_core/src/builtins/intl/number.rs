@@ -5,9 +5,14 @@
 //! Every value is rounded as an exact decimal digit string (big-integer arithmetic, never a double's): a
 //! Number contributes its shortest round-tripping digits (the ICU behaviour every browser shows), a BigInt
 //! or a numeric string its exact digits.
+//!
+//! INTLCLDR (SR137): the patterns (affixes, the negative subpattern, primary / secondary grouping), symbols,
+//! numbering-system digits, minimum grouping digits, compact patterns (by magnitude and plural category),
+//! currency symbols / names / digits and unit patterns come from the CLDR 46 tables of `crate::cldr`.
 
 use super::*;
 use crate::bignum::BigUint;
+use crate::cldr::L;
 use core::cmp::Ordering;
 
 // ============================================================================================ decimals
@@ -458,7 +463,10 @@ pub enum Notation {
 #[derive(Clone, Debug)]
 pub struct NumFmt {
     pub locale: String,
-    pub gb: bool,
+    /// The CLDR data the formatter reads (INTLCLDR SR137).
+    pub loc: L,
+    /// The numbering system (a numeric system of `cldr::NUMSYS`).
+    pub ns: &'static str,
     pub style: Style,
     pub currency: String,
     pub currency_display: String,
@@ -473,8 +481,30 @@ pub struct NumFmt {
     pub sign: String,
 }
 
+impl NumFmt {
+    /// A plain decimal formatter of locale `loc` (RelativeTimeFormat's and DurationFormat's numbers).
+    pub fn plain(loc: L, locale: &str, ns: &'static str, dg: Digits) -> NumFmt {
+        NumFmt {
+            locale: String::from(locale),
+            loc,
+            ns,
+            style: Style::Decimal,
+            currency: String::new(),
+            currency_display: String::from("symbol"),
+            currency_sign: String::from("standard"),
+            unit: String::new(),
+            unit_display: String::from("short"),
+            dg,
+            notation: Notation::Standard,
+            compact_long: false,
+            grouping: Some("auto"),
+            sign: String::from("auto"),
+        }
+    }
+}
+
 fn is_sanctioned(u: &str) -> bool {
-    data::unit(u).is_some()
+    !u.contains("-per-") && crate::cldr::unit_ids().any(|x| x == u)
 }
 
 /// IsWellFormedUnitIdentifier (§6.6.1).
@@ -493,16 +523,15 @@ pub fn create(vm: &mut Vm, locales: &Value, options: &Value) -> JsResult<NumFmt>
     let requested = canonicalize_locale_list(vm, locales)?;
     let o = coerce_options(vm, options)?;
     get_string_option(vm, o, "localeMatcher", &["lookup", "best fit"], "Intl.NumberFormat")?;
-    if let Some(ns) = get_string_option(vm, o, "numberingSystem", &[], "Intl.NumberFormat")? {
+    let nu = get_string_option(vm, o, "numberingSystem", &[], "Intl.NumberFormat")?;
+    if let Some(ns) = &nu {
         if !ns.split('-').all(|p| (3..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric())) {
             return vm.throw_range(&format!("Invalid numberingSystem : {ns}"));
         }
     }
     let r = resolve_locale(&requested, &["nu"]);
-    let kept: Vec<(&str, &str)> = match r.keyword("nu") {
-        Some("latn") => vec![("nu", "latn")],
-        _ => Vec::new(),
-    };
+    let (ns, kw_kept) = numbering_system(&r, nu.as_deref());
+    let kept: Vec<(&str, &str)> = if kw_kept { vec![("nu", ns)] } else { Vec::new() };
     let locale = r.locale_with(&kept);
     // SetNumberFormatUnitOptions (§15.1.4)
     let style = get_string_option(vm, o, "style", &["decimal", "percent", "currency", "unit"], "Intl.NumberFormat")?;
@@ -545,7 +574,7 @@ pub fn create(vm: &mut Vm, locales: &Value, options: &Value) -> JsResult<NumFmt>
         _ => Notation::Standard,
     };
     let (mnfd_d, mxfd_d) = if style == Style::Currency && notation == Notation::Standard {
-        let cd = data::currency(&currency).map(|c| c.digits).unwrap_or(2);
+        let cd = crate::cldr::currency_digits(&currency);
         (cd, cd)
     } else {
         (0, if style == Style::Percent { 0 } else { 3 })
@@ -574,7 +603,8 @@ pub fn create(vm: &mut Vm, locales: &Value, options: &Value) -> JsResult<NumFmt>
     let sign = get_string_option(vm, o, "signDisplay", &["auto", "never", "always", "exceptZero", "negative"], "Intl.NumberFormat")?
         .unwrap_or_else(|| String::from("auto"));
     Ok(NumFmt {
-        gb: is_gb(&locale),
+        loc: r.loc,
+        ns,
         locale,
         style,
         currency,
@@ -709,16 +739,173 @@ pub fn parse_decimal_string(s: &str) -> Option<Mv> {
     Some(Mv::Fin(d))
 }
 
+// ---- CLDR number patterns (UTS #35 Part 3 §3): affixes, grouping sizes, the negative subpattern
+
+/// One affix element of a number pattern.
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Lit(String),
+    Minus,
+    Plus,
+    Percent,
+    PerMille,
+    Currency,
+}
+
+#[derive(Clone, Debug)]
+struct Sub {
+    pre: Vec<Tok>,
+    post: Vec<Tok>,
+    /// Grouping sizes (0: no grouping).
+    primary: usize,
+    secondary: usize,
+}
+
+fn push_lit(v: &mut Vec<Tok>, c: char) {
+    if let Some(Tok::Lit(s)) = v.last_mut() {
+        s.push(c);
+    } else {
+        v.push(Tok::Lit(String::from(c)));
+    }
+}
+
+fn parse_sub(p: &str) -> Sub {
+    let mut pre = Vec::new();
+    let mut post = Vec::new();
+    let mut num = String::new();
+    let mut state = 0; // 0 prefix, 1 number, 2 suffix
+    let mut quoted = false;
+    let cs: Vec<char> = p.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        i += 1;
+        if c == '\'' {
+            if i < cs.len() && cs[i] == '\'' {
+                i += 1;
+                push_lit(if state == 0 { &mut pre } else { &mut post }, '\'');
+            } else {
+                quoted = !quoted;
+            }
+            continue;
+        }
+        let numeric = !quoted && (c == '#' || c == ',' || c == '.' || c == '@' || c.is_ascii_digit() || (state == 1 && (c == 'E' || (c == '+' && num.ends_with('E')))));
+        if state < 2 && numeric {
+            state = 1;
+            num.push(c);
+            continue;
+        }
+        if state == 1 {
+            state = 2;
+        }
+        let v = if state == 0 { &mut pre } else { &mut post };
+        if quoted {
+            push_lit(v, c);
+            continue;
+        }
+        match c {
+            '-' => v.push(Tok::Minus),
+            '+' => v.push(Tok::Plus),
+            '%' => v.push(Tok::Percent),
+            '‰' => v.push(Tok::PerMille),
+            '¤' => {
+                if v.last() != Some(&Tok::Currency) {
+                    v.push(Tok::Currency);
+                }
+            }
+            _ => push_lit(v, c),
+        }
+    }
+    let int_part = num.split(['.', 'E']).next().unwrap_or("");
+    let groups: Vec<&str> = int_part.split(',').collect();
+    let (primary, secondary) = if groups.len() >= 2 {
+        let p = groups[groups.len() - 1].len();
+        let s = if groups.len() >= 3 { groups[groups.len() - 2].len() } else { p };
+        (p, s)
+    } else {
+        (0, 0)
+    };
+    Sub { pre, post, primary, secondary }
+}
+
+/// The positive subpattern and the explicit negative one, if any.
+fn parse_pattern(p: &str) -> (Sub, Option<Sub>) {
+    // A ';' inside quotes is literal; CLDR's patterns never quote one, so split on the first bare ';'.
+    match p.split_once(';') {
+        Some((a, b)) => (parse_sub(a), Some(parse_sub(b))),
+        None => (parse_sub(p), None),
+    }
+}
+
+/// The affixes for a sign: "-" the negative subpattern (explicit, or minus + positive), "+" the negative one with
+/// its minus replaced by plus (or plus + positive when the negative subpattern has no minus), "" the positive one.
+fn affixes(pat: &str, sign: &str) -> Sub {
+    let (pos, neg) = parse_pattern(pat);
+    match sign {
+        "-" => match neg {
+            Some(n) => Sub { primary: pos.primary, secondary: pos.secondary, ..n },
+            None => {
+                let mut pre = vec![Tok::Minus];
+                pre.extend(pos.pre.iter().cloned());
+                Sub { pre, ..pos }
+            }
+        },
+        "+" => match neg {
+            Some(n) if n.pre.contains(&Tok::Minus) || n.post.contains(&Tok::Minus) => {
+                let swap = |v: Vec<Tok>| v.into_iter().map(|t| if t == Tok::Minus { Tok::Plus } else { t }).collect::<Vec<_>>();
+                Sub { pre: swap(n.pre), post: swap(n.post), primary: pos.primary, secondary: pos.secondary }
+            }
+            _ => {
+                let mut pre = vec![Tok::Plus];
+                pre.extend(pos.pre.iter().cloned());
+                Sub { pre, ..pos }
+            }
+        },
+        _ => pos,
+    }
+}
+
+/// Symbol indexes of `cldr::L::symbol`.
+const SYM_DECIMAL: usize = 0;
+const SYM_GROUP: usize = 1;
+const SYM_PERCENT: usize = 2;
+const SYM_PLUS: usize = 3;
+const SYM_MINUS: usize = 4;
+const SYM_APPROX: usize = 5;
+const SYM_EXP: usize = 6;
+const SYM_PERMILLE: usize = 7;
+const SYM_INFINITY: usize = 8;
+const SYM_NAN: usize = 9;
+
+/// ASCII digits written in numbering system `ns`.
+pub fn localize_digits(s: &str, ns: &str) -> String {
+    if ns == "latn" {
+        return String::from(s);
+    }
+    let Some(d) = crate::cldr::digits(ns) else { return String::from(s) };
+    let ds: Vec<char> = d.chars().collect();
+    s.chars().map(|c| if c.is_ascii_digit() && ds.len() == 10 { ds[(c as u8 - b'0') as usize] } else { c }).collect()
+}
+
 fn exp_for_mag(nf: &NumFmt, mag: i32) -> i32 {
     match nf.notation {
         Notation::Standard => 0,
         Notation::Scientific => mag,
         Notation::Engineering => mag.div_euclid(3) * 3,
         Notation::Compact => {
+            // ComputeExponentForMagnitude from the locale's compact patterns: a pattern of z zeros for 10^m
+            // shows the number scaled by 10^(m - z + 1); "0" means no compaction.
             if mag < 3 {
-                0
-            } else {
-                (mag.div_euclid(3) * 3).min(12)
+                return 0;
+            }
+            let m = mag.min(14) as u32;
+            let style = if nf.compact_long { 1 } else { 0 };
+            match nf.loc.compact(style, m, 5) {
+                Some(p) => {
+                    let z = p.chars().filter(|c| *c == '0').count() as i32;
+                    if z == 0 || p.trim() == "0" { 0 } else { m as i32 - z + 1 }
+                }
+                None => 0,
             }
         }
     }
@@ -744,117 +931,184 @@ fn push(parts: &mut Vec<(String, String)>, t: &str, v: &str) {
     parts.push((String::from(t), String::from(v)));
 }
 
-fn push_integer(parts: &mut Vec<(String, String)>, int: &str, grouping: Option<&str>) {
-    let group = match grouping {
-        None => false,
-        Some("min2") => int.len() >= 5,
-        Some(_) => int.len() > 3,
+/// The integer digits with the locale's group separator: `primary` digits in the last group, `secondary` in the
+/// others, and no grouping below `primary + minimum grouping digits` digits.
+fn push_integer(parts: &mut Vec<(String, String)>, nf: &NumFmt, int: &str, primary: usize, secondary: usize) {
+    let min = match nf.grouping {
+        None => usize::MAX,
+        Some("always") => 1,
+        Some("min2") => (nf.loc.min_grouping() as usize).max(2),
+        Some(_) => nf.loc.min_grouping() as usize,
     };
-    if !group {
-        push(parts, "integer", int);
+    let int_l = localize_digits(int, nf.ns);
+    if primary == 0 || min == usize::MAX || int.len() < primary + min {
+        push(parts, "integer", &int_l);
         return;
     }
-    let first = int.len() % 3;
+    let chars: Vec<char> = int_l.chars().collect();
+    let n = chars.len();
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut at = n - primary;
+    cuts.push(at);
+    let sec = if secondary == 0 { primary } else { secondary };
+    while at > sec {
+        at -= sec;
+        cuts.push(at);
+    }
+    cuts.reverse();
+    let group = nf.loc.symbol(nf.ns, SYM_GROUP);
+    let mut start = 0;
+    for c in cuts {
+        let s: String = chars[start..c].iter().collect();
+        push(parts, "integer", &s);
+        push(parts, "group", group);
+        start = c;
+    }
+    let s: String = chars[start..].iter().collect();
+    push(parts, "integer", &s);
+}
+
+/// The CLDR plural category of a formatted number (UTS #35 operands from its digits and compact exponent).
+pub fn plural_of(nf: &NumFmt, int: &str, frac: &str, exp: u32) -> &'static str {
+    crate::cldr::plural(nf.loc.lang(), false, &crate::cldr::Operands::new(int, frac, exp))
+}
+
+fn is_space(c: char) -> bool {
+    c == ' ' || c == '\u{a0}' || c == '\u{202f}' || c == '\u{2009}'
+}
+
+/// Text around a number in a unit / compact / currency-name pattern: spaces as "literal", the rest as `kind`.
+fn push_text(parts: &mut Vec<(String, String)>, text: &str, kind: &str) {
+    let mut cur = String::new();
+    let mut cur_space = false;
+    for c in text.chars() {
+        let sp = is_space(c);
+        if !cur.is_empty() && sp != cur_space {
+            push(parts, if cur_space { "literal" } else { kind }, &cur);
+            cur.clear();
+        }
+        cur_space = sp;
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        push(parts, if cur_space { "literal" } else { kind }, &cur);
+    }
+}
+
+/// A CLDR pattern with quotes resolved (`Mio'.'` → `Mio.`).
+fn unquote(p: &str) -> String {
+    let mut out = String::new();
+    let cs: Vec<char> = p.chars().collect();
     let mut i = 0;
-    if first > 0 {
-        push(parts, "integer", &int[..first]);
-        i = first;
-    }
-    while i < int.len() {
-        if i > 0 {
-            push(parts, "group", ",");
-        }
-        push(parts, "integer", &int[i..i + 3]);
-        i += 3;
-    }
-}
-
-fn compact_name(exp: i32, long: bool) -> &'static str {
-    match (exp, long) {
-        (3, false) => "K",
-        (6, false) => "M",
-        (9, false) => "B",
-        (12, false) => "T",
-        (3, true) => "thousand",
-        (6, true) => "million",
-        (9, true) => "billion",
-        (12, true) => "trillion",
-        _ => "",
-    }
-}
-
-/// The CLDR `en` cardinal plural category of a formatted number (i = integer digits, v = fraction digits).
-pub fn en_cardinal(int: &str, frac: &str) -> &'static str {
-    if int == "1" && frac.is_empty() { "one" } else { "other" }
-}
-
-fn unit_pattern(nf: &NumFmt, one: bool) -> String {
-    let u = nf.unit.as_str();
-    let pick = |x: &data::Unit| -> &'static str {
-        match nf.unit_display.as_str() {
-            "long" => {
-                if one {
-                    x.long_one
-                } else {
-                    x.long_other
-                }
+    while i < cs.len() {
+        if cs[i] == '\'' {
+            if i + 1 < cs.len() && cs[i + 1] == '\'' {
+                out.push('\'');
+                i += 2;
+                continue;
             }
-            "narrow" => x.narrow,
-            _ => {
-                if one {
-                    x.short_one
-                } else {
-                    x.short_other
-                }
-            }
+            i += 1;
+            continue;
         }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The display pattern of a unit at plural category `cat` ("{0}" is the number).
+fn unit_pattern(nf: &NumFmt, cat: &str) -> String {
+    let w = match nf.unit_display.as_str() {
+        "long" => 0,
+        "narrow" => 2,
+        _ => 1,
     };
-    if let Some(x) = data::unit(u) {
-        return String::from(pick(x));
-    }
-    if let Some((s, n, lo, lp)) = data::compound_unit(u) {
-        return String::from(match nf.unit_display.as_str() {
-            "long" => {
-                if one {
-                    lo
-                } else {
-                    lp
-                }
-            }
-            "narrow" => n,
-            _ => s,
-        });
+    let ci = crate::cldr::cat_index(cat);
+    let pick = |u: &str| -> Option<&'static str> { nf.loc.unit(u, w, ci).or_else(|| nf.loc.unit(u, w, 5)) };
+    let u = nf.unit.as_str();
+    if let Some(p) = pick(u) {
+        return String::from(p);
     }
     let (a, b) = u.split_once("-per-").unwrap_or((u, ""));
-    let (ua, ub) = match (data::unit(a), data::unit(b)) {
-        (Some(x), Some(y)) => (x, y),
-        _ => return String::from("{0}"),
-    };
-    match nf.unit_display.as_str() {
-        "long" => {
-            let per = ub.long_one.replace("{0} ", "");
-            format!("{} per {}", if one { ua.long_one } else { ua.long_other }, per)
-        }
-        "narrow" => format!("{}/{}", ua.narrow, ub.narrow.replace("{0}", "")),
-        _ => format!("{}/{}", if one { ua.short_one } else { ua.short_other }, ub.short_one.replace("{0} ", "").replace("{0}", "")),
+    let Some(pa) = pick(a) else { return String::from("{0}") };
+    if let Some(per) = nf.loc.unit(b, w, 6) {
+        return per.replace("{0}", pa);
+    }
+    // The compound pattern "{0}/{1}" with the denominator's singular name ({0} removed from its "one" pattern).
+    let one = nf.loc.unit(b, w, 1).or_else(|| pick(b)).unwrap_or("");
+    let name = one.replace("{0}", "");
+    let name = name.trim_matches(is_space);
+    let comp = nf.loc.s(crate::cldr::slot::UNITPER_LONG + w);
+    let comp = if comp.is_empty() { "{0}/{1}" } else { comp };
+    comp.replace("{0}", pa).replace("{1}", name)
+}
+
+/// The symbol a currency shows.
+fn currency_symbol(nf: &NumFmt) -> String {
+    match nf.currency_display.as_str() {
+        "code" => nf.currency.clone(),
+        "narrowSymbol" => String::from(nf.loc.currency(&nf.currency, 2).unwrap_or(&nf.currency)),
+        _ => String::from(nf.loc.currency(&nf.currency, 1).unwrap_or(&nf.currency)),
     }
 }
 
-/// PartitionNumberPattern (§15.5.4).
+/// Expand affix elements into parts.
+fn push_affix(out: &mut Vec<(String, String)>, nf: &NumFmt, toks: &[Tok], sym: &str) {
+    for t in toks {
+        match t {
+            Tok::Lit(s) => push(out, "literal", s),
+            Tok::Minus => push(out, "minusSign", nf.loc.symbol(nf.ns, SYM_MINUS)),
+            Tok::Plus => push(out, "plusSign", nf.loc.symbol(nf.ns, SYM_PLUS)),
+            Tok::Percent => push(out, "percentSign", nf.loc.symbol(nf.ns, SYM_PERCENT)),
+            Tok::PerMille => push(out, "perMille", nf.loc.symbol(nf.ns, SYM_PERMILLE)),
+            Tok::Currency => push(out, "currency", sym),
+        }
+    }
+}
+
+/// PartitionNumberPattern (§15.5.4) over the CLDR patterns, symbols and digits of the formatter's locale.
 pub fn format_parts(nf: &NumFmt, mv: &Mv) -> Vec<(String, String)> {
+    let loc = nf.loc;
     let mut num: Vec<(String, String)> = Vec::new();
     let (neg, zero, nan);
     let mut int_s = String::new();
     let mut frac_s = String::new();
+    let mut exp_used: i32 = 0;
+    let mut compact_pat: Option<String> = None;
+    let currency_compact = nf.style == Style::Currency && nf.notation == Notation::Compact && nf.currency_display != "name" && !nf.compact_long;
+    let pat_index = match nf.style {
+        Style::Percent => 1,
+        Style::Currency if nf.currency_display != "name" => {
+            if nf.currency_sign == "accounting" {
+                5
+            } else {
+                3
+            }
+        }
+        _ => 0,
+    };
+    let mut pattern: &str = loc.number_pattern(nf.ns, pat_index);
+    let sym = if nf.style == Style::Currency { currency_symbol(nf) } else { String::new() };
+    if nf.style == Style::Currency && nf.currency_display != "name" {
+        // The alphaNextToNumber variant when the symbol's letter would touch the digits.
+        let (p, _) = parse_pattern(pattern);
+        let before = p.pre.contains(&Tok::Currency);
+        let touching = if before { sym.chars().last() } else { sym.chars().next() };
+        if touching.map(|c| c.is_alphabetic()).unwrap_or(false) {
+            pattern = loc.number_pattern(nf.ns, pat_index + 1);
+        }
+    }
+    let (pos, _) = parse_pattern(pattern);
+    let (primary, secondary) = (pos.primary, pos.secondary);
     match mv {
         Mv::NaN => {
-            push(&mut num, "nan", "NaN");
+            push(&mut num, "nan", loc.symbol(nf.ns, SYM_NAN));
             neg = false;
             zero = false;
             nan = true;
         }
         Mv::Inf(n) => {
-            push(&mut num, "infinity", "∞");
+            push(&mut num, "infinity", loc.symbol(nf.ns, SYM_INFINITY));
             neg = *n;
             zero = false;
             nan = false;
@@ -872,34 +1126,63 @@ pub fn format_parts(nf: &NumFmt, mv: &Mv) -> Vec<(String, String)> {
             neg = x.neg;
             zero = r.is_zero();
             nan = false;
-            push_integer(&mut num, &int, nf.grouping);
+            push_integer(&mut num, nf, &int, primary, secondary);
             if !frac.is_empty() {
-                push(&mut num, "decimal", ".");
-                push(&mut num, "fraction", &frac);
+                push(&mut num, "decimal", loc.symbol(nf.ns, SYM_DECIMAL));
+                push(&mut num, "fraction", &localize_digits(&frac, nf.ns));
             }
             match nf.notation {
                 Notation::Scientific | Notation::Engineering => {
-                    push(&mut num, "exponentSeparator", "E");
+                    push(&mut num, "exponentSeparator", loc.symbol(nf.ns, SYM_EXP));
                     if exp < 0 {
-                        push(&mut num, "exponentMinusSign", "-");
+                        push(&mut num, "exponentMinusSign", loc.symbol(nf.ns, SYM_MINUS));
                     }
-                    push(&mut num, "exponentInteger", &format!("{}", exp.unsigned_abs()));
+                    push(&mut num, "exponentInteger", &localize_digits(&format!("{}", exp.unsigned_abs()), nf.ns));
                 }
                 Notation::Compact if exp > 0 => {
-                    if nf.compact_long {
-                        push(&mut num, "literal", " ");
-                    }
-                    push(&mut num, "compact", compact_name(exp, nf.compact_long));
+                    let cat = crate::cldr::cat_index(plural_of(nf, &int, &frac, exp as u32));
+                    let key = (exp + int.len() as i32 - 1).clamp(3, 14) as u32;
+                    let style = if currency_compact {
+                        2
+                    } else if nf.compact_long {
+                        1
+                    } else {
+                        0
+                    };
+                    let p = loc.compact(style, key, cat).or_else(|| loc.compact(if nf.compact_long { 1 } else { 0 }, key, cat));
+                    compact_pat = p.map(unquote);
                 }
                 _ => {}
             }
             int_s = int;
             frac_s = frac;
-            if exp != 0 {
-                // A scaled value ("1K", "1E3") is never CLDR `one` (its operand n is not 1).
-                frac_s.push('c');
+            exp_used = exp;
+        }
+    }
+    // Compact affixes around the number ("0K", "0 Mio.", "¤0K").
+    let mut compact_has_currency = false;
+    if let Some(cp) = &compact_pat {
+        let first = cp.find('0').unwrap_or(0);
+        let last = cp.rfind('0').map(|i| i + 1).unwrap_or(cp.len());
+        let (pre, post) = (&cp[..first], &cp[last..]);
+        let mut wrapped: Vec<(String, String)> = Vec::new();
+        for (text, before) in [(pre, true), (post, false)] {
+            let mut ps: Vec<(String, String)> = Vec::new();
+            for (k, seg) in text.split('¤').enumerate() {
+                if k > 0 {
+                    push(&mut ps, "currency", &sym);
+                    compact_has_currency = true;
+                }
+                push_text(&mut ps, seg, "compact");
+            }
+            if before {
+                wrapped.extend(ps);
+                wrapped.append(&mut num);
+            } else {
+                wrapped.extend(ps);
             }
         }
+        num = wrapped;
     }
     let sign: &str = match nf.sign.as_str() {
         "always" => {
@@ -935,77 +1218,65 @@ pub fn format_parts(nf: &NumFmt, mv: &Mv) -> Vec<(String, String)> {
         }
     };
     let mut out: Vec<(String, String)> = Vec::new();
-    let push_sign = |out: &mut Vec<(String, String)>| match sign {
-        "-" => push(out, "minusSign", "-"),
-        "+" => push(out, "plusSign", "+"),
-        _ => {}
-    };
-    let one = en_cardinal(&int_s, &frac_s) == "one";
+    let outer = if compact_has_currency { loc.number_pattern(nf.ns, 0) } else { pattern };
+    let a = affixes(outer, sign);
+    push_affix(&mut out, nf, &a.pre, &sym);
+    out.extend(num);
+    push_affix(&mut out, nf, &a.post, &sym);
+    let cat = if nan || matches!(mv, Mv::Inf(_)) { "other" } else { plural_of(nf, &int_s, &frac_s, exp_used.max(0) as u32) };
     match nf.style {
-        Style::Decimal => {
-            push_sign(&mut out);
-            out.extend(num);
-        }
-        Style::Percent => {
-            push_sign(&mut out);
-            out.extend(num);
-            push(&mut out, "percentSign", "%");
-        }
-        Style::Currency => {
-            let c = data::currency(&nf.currency);
-            if nf.currency_display == "name" {
-                push_sign(&mut out);
-                out.extend(num);
-                push(&mut out, "literal", " ");
-                let name = match c {
-                    Some(c) => String::from(if one { c.one } else { c.other }),
-                    None => nf.currency.clone(),
-                };
-                push(&mut out, "currency", &name);
-            } else {
-                let sym: String = match (nf.currency_display.as_str(), c) {
-                    ("code", _) | (_, None) => nf.currency.clone(),
-                    ("narrowSymbol", Some(c)) => String::from(c.narrow),
-                    (_, Some(c)) => String::from(if nf.gb { data::gb_symbol(c.code).unwrap_or(c.symbol) } else { c.symbol }),
-                };
-                let spaced = sym.chars().last().map(|ch| ch.is_alphabetic()).unwrap_or(false);
-                let accounting = nf.currency_sign == "accounting" && sign == "-";
-                if accounting {
-                    push(&mut out, "literal", "(");
-                } else {
-                    push_sign(&mut out);
+        Style::Currency if nf.currency_display == "name" => {
+            let ci = crate::cldr::cat_index(cat);
+            let name = loc
+                .currency(&nf.currency, 3 + ci)
+                .or_else(|| loc.currency(&nf.currency, 8))
+                .or_else(|| loc.currency(&nf.currency, 0))
+                .map(String::from)
+                .unwrap_or_else(|| nf.currency.clone());
+            let up = loc.get(crate::cldr::slot::CURUNIT_ZERO + ci).or_else(|| loc.get(crate::cldr::slot::CURUNIT_ZERO + 5)).unwrap_or("{0} {1}");
+            wrap(up, out, |ps: &mut Vec<(String, String)>, k: &str| {
+                if k == "1" {
+                    push(ps, "currency", &name);
                 }
-                push(&mut out, "currency", &sym);
-                if spaced {
-                    push(&mut out, "literal", "\u{a0}");
-                }
-                out.extend(num);
-                if accounting {
-                    push(&mut out, "literal", ")");
-                }
-            }
+            })
         }
         Style::Unit => {
-            let pat = unit_pattern(nf, one);
-            let (pre, post) = pat.split_once("{0}").unwrap_or(("", ""));
-            if !pre.is_empty() {
-                push(&mut out, "unit", pre);
-            }
-            push_sign(&mut out);
-            out.extend(num);
-            if !post.is_empty() {
-                let trimmed = post.trim_start_matches(' ');
-                let spaces = post.len() - trimmed.len();
-                if spaces > 0 {
-                    push(&mut out, "literal", &post[..spaces]);
-                }
-                if !trimmed.is_empty() {
-                    push(&mut out, "unit", trimmed);
-                }
-            }
+            let up = unit_pattern(nf, cat);
+            let (pre, post) = up.split_once("{0}").unwrap_or(("", ""));
+            let mut res = Vec::new();
+            push_text(&mut res, pre, "unit");
+            res.extend(out);
+            push_text(&mut res, post, "unit");
+            res
         }
+        _ => out,
     }
-    out
+}
+
+/// Substitute the number parts for {0} in `pattern`, `other` for the remaining {n}, the text as literals.
+fn wrap(pattern: &str, number: Vec<(String, String)>, mut other: impl FnMut(&mut Vec<(String, String)>, &str)) -> Vec<(String, String)> {
+    let mut res = Vec::new();
+    let mut rest = pattern;
+    let mut number = Some(number);
+    while let Some(open) = rest.find('{') {
+        if open > 0 {
+            push(&mut res, "literal", &rest[..open]);
+        }
+        let close = rest[open..].find('}').map(|c| open + c).unwrap_or(rest.len() - 1);
+        let k = &rest[open + 1..close];
+        if k == "0" {
+            if let Some(n) = number.take() {
+                res.extend(n);
+            }
+        } else {
+            other(&mut res, k);
+        }
+        rest = &rest[close + 1..];
+    }
+    if !rest.is_empty() {
+        push(&mut res, "literal", rest);
+    }
+    res
 }
 
 pub fn format_to_string(nf: &NumFmt, mv: &Mv) -> String {
@@ -1022,7 +1293,7 @@ fn range_parts(nf: &NumFmt, x: &Mv, y: &Mv) -> (Vec<(String, String)>, Vec<Strin
         let mut inserted = false;
         for p in a {
             if !inserted && matches!(p.0.as_str(), "integer" | "nan" | "infinity" | "minusSign" | "plusSign" | "currency" | "literal") {
-                parts.push((String::from("approximatelySign"), String::from("~")));
+                parts.push((String::from("approximatelySign"), String::from(nf.loc.symbol(nf.ns, SYM_APPROX))));
                 src.push(String::from("shared"));
                 inserted = true;
             }
@@ -1130,7 +1401,7 @@ fn nf_format_range_to_parts(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn nf_resolved_options(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let o = this_intl(vm, &ctx.this, is_nf, "Intl.NumberFormat.prototype.resolvedOptions")?;
     let nf = nf_of(vm, o);
-    let mut props: Vec<(&str, Value)> = vec![("locale", Value::str(&nf.locale)), ("numberingSystem", Value::str("latn"))];
+    let mut props: Vec<(&str, Value)> = vec![("locale", Value::str(&nf.locale)), ("numberingSystem", Value::str(nf.ns))];
     props.push((
         "style",
         Value::str(match nf.style {

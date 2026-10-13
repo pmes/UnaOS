@@ -113,10 +113,23 @@ fn make_full_year(y: f64) -> f64 {
     if (0.0..=99.0).contains(&t) { 1900.0 + t } else { t }
 }
 
+/// The host's IANA zone as a tzdata rule with its history (INTLCLDR SR137), when `Vm::tz` is unset and the host
+/// names a zone the database knows.
+fn host_zone(vm: &mut Vm) -> Option<crate::tz::PosixTz> {
+    if vm.tz.is_some() {
+        return None;
+    }
+    let id = vm.host.time_zone_id()?;
+    crate::tz::PosixTz::named(&id)
+}
+
 /// Offset of local time from UTC at UTC time `t` (LocalTZA(t, true)).
 fn tz_utc(vm: &mut Vm, t: f64) -> f64 {
     if !t.is_finite() {
         return 0.0;
+    }
+    if let Some(z) = host_zone(vm) {
+        return z.offset_at_utc(t);
     }
     match &vm.tz {
         Some(z) => z.offset_at_utc(t),
@@ -131,6 +144,9 @@ pub fn local_time(vm: &mut Vm, t: f64) -> f64 {
 pub fn utc(vm: &mut Vm, t: f64) -> f64 {
     if !t.is_finite() {
         return f64::NAN;
+    }
+    if let Some(z) = host_zone(vm) {
+        return t - z.offset_for_local(t);
     }
     let off = match &vm.tz {
         Some(z) => z.offset_for_local(t),
@@ -521,10 +537,11 @@ fn tz_part(vm: &mut Vm, tv: f64) -> String {
     let a = off.abs();
     let h = floor(a / MS_HOUR) as u32;
     let m = (floor(a / MS_MIN) as u32) % 60;
-    let name = match &vm.tz {
-        Some(z) => alloc::string::String::from(z.name_at_utc(tv)),
-        None if off == 0.0 => alloc::string::String::from("Coordinated Universal Time"),
-        None => alloc::string::String::new(),
+    let host = host_zone(vm);
+    let name = match (&vm.tz, &host) {
+        (Some(z), _) | (None, Some(z)) => alloc::string::String::from(z.name_at_utc(tv)),
+        (None, None) if off == 0.0 => alloc::string::String::from("Coordinated Universal Time"),
+        (None, None) => alloc::string::String::new(),
     };
     if name.is_empty() { alloc::format!("{}{:02}{:02}", sign, h, m) } else { alloc::format!("{}{:02}{:02} ({})", sign, h, m, name) }
 }

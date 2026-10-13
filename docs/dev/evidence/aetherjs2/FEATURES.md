@@ -62,8 +62,8 @@ The **Test** column names the `#[test]` that asserts the feature's observable, i
 |---|---|---|
 | `using` / `await using` declarations | ES2026 explicit resource management (UsingDeclaration, AwaitUsingDeclaration) | parser (contextual `using`), scope analysis and compiler disposal at every block exit; the library it calls is in. A compiler change cannot be run here (R107), so it was not started. |
 | `Temporal` | TC39 Temporal | a new library the size of Intl. |
-| Locale data beyond en / en-GB / en-US; numbering systems other than `latn`; non-Gregorian calendars; collation tailorings | ECMA-402 §9.1, §11, §15, §10 | CLDR data in tree (R83: no ICU). |
-| Historical time zone transitions (each zone formats with its current rule) | ECMA-262 §21.4.1 (LocalTZA); ECMA-402 §11 | the tz database as data (SR55 / SR63 owed). |
+| Locale data beyond en / en-GB / en-US; numbering systems other than `latn`; non-Gregorian calendars; collation tailorings | ECMA-402 §9.1, §11, §15, §10 | CLDR data in tree (R83: no ICU). — DONE by INTLCLDR (SR137): 32 CLDR locales, 96 numbering systems, tzdata 2025b transitions. |
+| Historical time zone transitions (each zone formats with its current rule) | ECMA-262 §21.4.1 (LocalTZA); ECMA-402 §11 | the tz database as data (SR55 / SR63 owed). — DONE by INTLCLDR (SR137): 32 CLDR locales, 96 numbering systems, tzdata 2025b transitions. |
 | `formatRange` sharing fields ("Jan 15 – 16, 2024") | ECMA-402 §11.5.9 PartitionDateTimeRangePattern | both ends are written in full with the U+2009 dash. |
 | Inline caches / shapes | SR63 owed (performance) | no performance arc. |
 | Exact `innerText` | HTML §3.2.7 (SR63 owed) | layout territory (AETHERSTYLE3 is live there). |

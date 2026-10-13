@@ -1,12 +1,11 @@
 //! Time zones for Temporal (proposal-temporal 2025 §11): UTC and its aliases, offset zones (±HH:MM, minute
-//! precision), Etc/GMT±N, and the 84 IANA zones of `intl::data::ZONES` with their HISTORICAL offsets —
-//! `tzdata::HIST` holds every transition up to the instant from which the zone's current POSIX rule takes
-//! over (tzdata 2025b), and `tz::PosixTz` answers from there on. GetPossibleEpochNanoseconds,
+//! precision), Etc/GMT±N, and every Zone and Link of the IANA database (INTLCLDR SR137: `crate::tzdata`, tzdata
+//! 2025b) with its HISTORICAL offsets — every transition through 2037, and `tz::PosixTz` (the zone's TZif
+//! footer rule) after the last one. A Link keeps its own identifier and compares equal to its primary
+//! identifier. GetPossibleEpochNanoseconds,
 //! DisambiguatePossibleEpochNanoseconds, GetStartOfDay and GetNamedTimeZoneNext/PreviousTransition live here.
 
 use super::iso::*;
-use super::tzdata;
-use crate::builtins::intl::data;
 use crate::tz::PosixTz;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -20,7 +19,7 @@ pub enum TzKind {
     Utc,
     /// A fixed offset in nanoseconds east of UTC (offset zones and Etc/GMT±N).
     Fixed(i64),
-    /// Index into `data::ZONES`.
+    /// The primary identifier (`tzdata::Found::primary`): a Zone index, or `ZONES.len()` + a primary Link's index.
     Named(usize),
 }
 
@@ -107,8 +106,8 @@ pub fn parse_identifier(s: &str) -> Option<TimeZone> {
             is_offset: false,
         });
     }
-    let i = data::ZONES.iter().position(|z| z.id.eq_ignore_ascii_case(s))?;
-    Some(TimeZone { id: String::from(data::ZONES[i].id), kind: TzKind::Named(i), is_offset: false })
+    let f = crate::tzdata::find(s)?;
+    Some(TimeZone { id: String::from(f.id), kind: TzKind::Named(f.primary as usize), is_offset: false })
 }
 
 impl TimeZone {
@@ -136,32 +135,17 @@ struct Named {
 
 /// Decode a zone's history: (transition instant in ns, offset in ns after it).
 fn named(idx: usize) -> Named {
-    let z = &data::ZONES[idx];
-    let rule = PosixTz::parse(z.posix);
-    let h = tzdata::HIST.iter().find(|h| h.id == z.id);
-    let mut trans = Vec::new();
-    let mut initial = rule.as_ref().map(|r| (r.std_offset as i64) * 1_000_000).unwrap_or(0);
-    if let Some(h) = h {
-        initial = h.offs[0] as i64 * 1_000_000_000;
-        let mut t: i64 = 0;
-        let mut i = 0;
-        while i < h.data.len() {
-            let mut z: u64 = 0;
-            let mut shift = 0;
-            loop {
-                let b = h.data[i];
-                i += 1;
-                z |= ((b & 0x7f) as u64) << shift;
-                shift += 7;
-                if b & 0x80 == 0 {
-                    break;
-                }
-            }
-            let delta = ((z >> 1) as i64) ^ -((z & 1) as i64);
-            t += delta;
-            let off = h.offs[h.data[i] as usize] as i64 * 1_000_000_000;
-            i += 1;
+    let data = crate::tzdata::by_primary(idx as u16).data;
+    let rule = PosixTz::parse(crate::tzdata::ZONES[data as usize].posix);
+    let initial = crate::tzdata::initial(data).offset as i64 * 1_000_000_000;
+    // Offset changes only: a transition that flips the daylight-saving flag alone is no Temporal transition.
+    let mut trans: Vec<(i128, i64)> = Vec::new();
+    let mut cur = initial;
+    for (t, k) in crate::tzdata::transitions(data) {
+        let off = k.offset as i64 * 1_000_000_000;
+        if off != cur {
             trans.push((t as i128 * NS_PER_S, off));
+            cur = off;
         }
     }
     Named { initial, trans, rule }

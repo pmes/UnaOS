@@ -11,12 +11,14 @@ extern crate alloc;
 
 pub mod ast;
 pub mod bignum;
+pub mod cldr;
 pub mod lexer;
 pub mod numconv;
 pub mod parser;
 pub mod regexp;
 pub mod string;
 pub mod tz;
+pub mod tzdata;
 pub mod unicode;
 pub mod builtins;
 pub mod bytecode;
