@@ -24,7 +24,7 @@
 //! The layout reserves [`SCRATCH_SECTORS`] at the tail of p2, outside the volume, for the write proof.
 
 use crate::drivers::block::{self, BlockError, BlockHandle, GrantKind};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 /// The last 64 sectors of the installer's UnaFS partition: outside the volume, the only extent
 /// `tests ahciw` may write.
@@ -36,6 +36,11 @@ pub const FRESH_UNAFS_MIB: u64 = 4096;
 
 /// The root grant's port + 1 once minted (0 = none yet). Positive answers only are cached.
 static ROOT_PORT: AtomicU16 = AtomicU16::new(0);
+/// DONGLEBOOT (B658, flight 35 boot 2): the NEGATIVE answer, cached. `ensure_root_grant` cached only a found root, so
+/// every mount-table build (the prefs delete-watch's, every 2 s; the render task's) re-read a macOS SSD through AHCI.
+/// Set when the disk loop SAW at least one AHCI disk and none was ours (an SSD not yet enumerated is never remembered
+/// as absent); cleared when an install writes a fresh root (`format_fresh`).
+static ROOT_NONE: AtomicBool = AtomicBool::new(false);
 
 /// The UnaFS partition `(first, last)` of the disk on `port` when the disk is judged OURS.
 pub fn ours_unafs_part(port: u8) -> Option<(u64, u64)> {
@@ -70,6 +75,9 @@ pub fn ensure_root_grant() -> Option<u8> {
     if let Some(p) = root_port() {
         return Some(p);
     }
+    if ROOT_NONE.load(Ordering::Acquire) {
+        return None; // DONGLEBOOT (B658): the disks were walked once and none is ours; no AHCI read per mount-table build
+    }
     // `UNAOS_ROOT_PREFER=sdhc` is the operator's way to boot the card's root over an installed SSD —
     // and so the way to reinstall it (a live root grant makes `install ssd --write` refuse).
     if cfg!(feature = "root-prefer-sdhc") {
@@ -78,14 +86,19 @@ pub fn ensure_root_grant() -> Option<u8> {
     if block::ahci_live_grant().is_some() {
         return None; // an installer or a test holds the slot; the root is not taken from under it
     }
+    let mut seen = 0usize;
     for ix in 0..block::MAX_AHCI_DISKS {
         let Some(d) = block::ahci_disk(ix) else { continue };
+        seen += 1;
         let Some((first, last)) = ours_unafs_part(d.port) else { continue };
         let Some(g) = super::partition::mint_root_grant(d.port, first, last) else { continue };
         if block::hold_ahci_grant_for_boot(g) {
             ROOT_PORT.store(d.port as u16 + 1, Ordering::Release);
             return Some(d.port);
         }
+    }
+    if seen > 0 {
+        ROOT_NONE.store(true, Ordering::Release); // DONGLEBOOT (B658): walked, none ours — remembered until an install writes one
     }
     None
 }
@@ -106,6 +119,7 @@ pub fn bind_ssd_root(port: u8) -> bool {
 /// port write path — so the install grant in the slot (held by the caller) is what admits each sector.
 /// Returns the volume's 4 KiB block count.
 pub fn format_fresh(port: u8, first: u64, mib: u64) -> Result<u64, &'static str> {
+    ROOT_NONE.store(false, Ordering::Release); // DONGLEBOOT (B658): a fresh root is being written — walk again next time
     let dev = crate::fs::unafs::SdSectorDevice::open_on(BlockHandle::Ahci { port }).map_err(|_| "the SSD has no sector device")?;
     let blocks = mib * 256;
     let span = ::unafs::adapter::PartitionSpan { base_lba: first, block_count: blocks };
