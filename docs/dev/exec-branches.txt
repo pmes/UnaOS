@@ -482,15 +482,19 @@ refs/heads/exec-pi-pispec                     37adc602 FOLDED-BY-HAND da10c8ac
 refs/heads/exec-rmbp-striametal               0d88e0c9 FOLDED-BY-HAND e6eab096
 refs/heads/exec-rmbp-install4                 513ca5f8 FOLDED-BY-HAND 6b35b738
 refs/heads/exec-rmbp-dragnomove                 d616bf98 FOLDED-BY-HAND 9de8376d
-refs/heads/exec-rmbp-dockshell2                 d616bf98 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-dockshell2                 d616bf98 FOLDED-BY-HAND 817f7945
 refs/heads/exec-rmbp-notifycenter               d616bf98 FOLDED-BY-HAND 9de8376d
 refs/heads/exec-rmbp-settingstabs               d616bf98 FOLDED-BY-HAND 9de8376d
-refs/heads/exec-host-aethersidetabs             d616bf98 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-host-aethersidetabs             d616bf98 FOLDED-BY-HAND 817f7945
 refs/heads/exec-rmbp-tpstream                   d616bf98 FOLDED-BY-HAND 9de8376d
 refs/heads/exec-rmbp-wifi9                      bd3d399d FOLDED-BY-HAND 1623d1c3
 refs/heads/exec-rmbp-gen7r9b                    bd3d399d FOLDED-BY-HAND c5e4b486
 refs/heads/exec-rmbp-keplergr4                  bd3d399d FOLDED-BY-HAND c5e4b486
 refs/heads/exec-pi-piemptybin                 bd3d399d IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-rmbp-glasskit                   bd3d399d IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-rmbp-softy                      bd3d399d IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-host-designlang                 bd3d399d IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-glasskit                   bd3d399d FOLDED-BY-HAND 817f7945
+refs/heads/exec-rmbp-softy                      bd3d399d FOLDED-BY-HAND 817f7945
+refs/heads/exec-host-designlang                 bd3d399d FOLDED-BY-HAND 817f7945
+refs/heads/exec-rmbp-settingscraft              817f7945 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-desktopcraft               817f7945 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-dhcpreplug                 817f7945 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-ptrpress2                  817f7945 IN-FLIGHT cloud 2026-10-14
