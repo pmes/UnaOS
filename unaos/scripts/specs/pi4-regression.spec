@@ -2288,7 +2288,7 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---    `fired=` and `rl=` are PER-SLOT emission deltas, not a global total: this boot's earlier
 # ---    fixtures mint 32x8 rows that decline legitimately, and a global counter would have let one
 # ---    of them inflate the delta and red a kernel that was behaving perfectly.
-# ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
+# ---    Every leg value is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
 # ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
 # ---    presence check.
 # --- MERGE 6fddbccd (2026-08-18): the trunk's wm work moved the row floor 158 -> 149; the pin
@@ -2297,9 +2297,9 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # --- floor is `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W` and only the last term moved: the
 # --- CHROME face's raster is now derived from `theme::TITLE_HEIGHT` (34 -> Size20) instead of being
 # --- fixed at the body face's Size16, so the mono advance went 7 -> 9. Nothing about the control
-# --- cluster, the frame or the gap changed. See `wm::controls`' doc for the three moves this floor
-# --- has made and why none of them was ever a code change.
-REQUIRE :: WMCTRL: controls-declined — floor=151 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
+# --- cluster, the frame or the gap changed. UIMETRICS M1 (c6ec712b) then scaled every term: at QEMU 640x480 (scale 1)
+# --- 10+12+(36+48)+9 = 115; 151 was the 24-px box. The floor is pinned as a number (PISPEC, pi-ledger PI17).
+REQUIRE :: WMCTRL: controls-declined — floor=[1-9][0-9]* .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
 
 # --- DRAG-PI M4 — the drag COST witness (`[dragperf]`, wm::dragperf_selftest).
