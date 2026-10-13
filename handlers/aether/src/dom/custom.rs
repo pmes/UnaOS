@@ -33,6 +33,11 @@ pub enum Callback {
     Disconnected = 1,
     Adopted = 2,
     AttributeChanged = 3,
+    /// AETHERWPT3 (SR138): the form-associated callbacks (HTML §4.13.3 "form-associated custom elements").
+    FormAssociated = 4,
+    FormReset = 5,
+    FormDisabled = 6,
+    FormStateRestore = 7,
 }
 
 impl Callback {
@@ -42,6 +47,10 @@ impl Callback {
             Callback::Disconnected => "disconnectedCallback",
             Callback::Adopted => "adoptedCallback",
             Callback::AttributeChanged => "attributeChangedCallback",
+            Callback::FormAssociated => "formAssociatedCallback",
+            Callback::FormReset => "formResetCallback",
+            Callback::FormDisabled => "formDisabledCallback",
+            Callback::FormStateRestore => "formStateRestoreCallback",
         }
     }
 }
@@ -52,6 +61,8 @@ pub enum Arg {
     Null,
     Str(String),
     Node(NodeId),
+    /// AETHERWPT3 (SR138): formDisabledCallback's argument.
+    Bool(bool),
 }
 
 /// A custom element reaction (HTML §4.13.6).
@@ -70,8 +81,9 @@ pub struct Definition {
     /// Host root of the constructor.
     pub constructor: usize,
     pub observed: Vec<String>,
-    /// Host roots of connected/disconnected/adopted/attributeChanged callbacks.
-    pub callbacks: [Option<usize>; 4],
+    /// Host roots of connected/disconnected/adopted/attributeChanged callbacks, then (AETHERWPT3) the
+    /// form-associated four (formAssociated/formReset/formDisabled/formStateRestore), indexed by [`Callback`].
+    pub callbacks: [Option<usize>; 8],
     /// The construction stack: an element being upgraded, or `None` = the already-constructed marker.
     pub construction_stack: Vec<Option<NodeId>>,
     pub disable_shadow: bool,

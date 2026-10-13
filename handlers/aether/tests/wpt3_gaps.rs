@@ -273,3 +273,73 @@ Promise.all(P).then(function (r) { R = R.concat(r); }, function (e) { R.push('re
     );
     assert_eq!(run_until(&mut e, "W !== null", "W", 20), "ab,data:application/octet-stream;base64,,5,2");
 }
+
+/// O4 — HTML §4.13.7 ElementInternals and form-associated custom elements: attachInternals (once; never on a
+/// non-custom element), the form owner and `form.elements`, `labels`, formAssociatedCallback /
+/// formDisabledCallback / formResetCallback as reactions, setFormValue (a string under `name`, a FormData cloned
+/// when set) in the form's entry list, setValidity (flags need a message; CRLF normalized) driving `validity`,
+/// `validationMessage`, `checkValidity` and the form's, `states` (CustomStateSet), the ARIA mixin, and the
+/// NotSupportedError of a definition that is not form-associated.
+#[test]
+fn o4_element_internals_form_associated() {
+    let mut e = load_with(
+        &page(
+            r#"
+var log = [];
+class MyControl extends HTMLElement {
+    static get formAssociated() { return true; }
+    constructor() { super(); this.i = this.attachInternals(); }
+    formAssociatedCallback(f) { log.push('assoc:' + (f ? f.id : null)); }
+    formDisabledCallback(d) { log.push('disabled:' + d); }
+    formResetCallback() { log.push('reset'); }
+}
+customElements.define('my-control', MyControl);
+var form = document.createElement('form');
+form.id = 'f';
+document.body.appendChild(form);
+var c = document.createElement('my-control');
+c.setAttribute('name', 'n');
+c.id = 'mc';
+var lab = document.createElement('label');
+lab.htmlFor = 'mc';
+form.appendChild(lab);
+form.appendChild(c);
+var entries = function () { return Array.from(new FormData(form)).map(function (e) { return e.join('='); }).join('&'); };
+R.push(log.join(','), c.i.form === form, form.elements.length, form.elements[0] === c, c.i.labels.length, c.i.willValidate);
+c.i.setFormValue('v1');
+R.push(entries());
+var fd = new FormData();
+fd.append('a', '1');
+fd.append('b', '2');
+c.i.setFormValue(fd);
+fd.append('c', '3');
+R.push(entries());
+try { c.i.setValidity({ valueMissing: true }); R.push('no throw'); } catch (e) { R.push(e.name); }
+c.i.setValidity({ valueMissing: true, tooShort: true }, 'need\r\nmore');
+R.push(c.i.validity.valueMissing, c.i.validity.tooShort, c.i.validity.valid, JSON.stringify(c.i.validationMessage), c.i.checkValidity(), form.checkValidity());
+c.setAttribute('disabled', '');
+R.push(log.join(','), c.i.willValidate);
+c.removeAttribute('disabled');
+form.reset();
+R.push(log.join(','));
+c.i.states.add('checked');
+R.push(c.i.states.has('checked'), c.i.states.size, c.i.states instanceof CustomStateSet);
+c.i.ariaLabel = 'Lab';
+R.push(c.i.ariaLabel, c.i.role);
+try { c.attachInternals(); R.push('no throw'); } catch (e) { R.push(e.name); }
+try { document.createElement('div').attachInternals(); R.push('no throw'); } catch (e) { R.push(e.name); }
+customElements.define('plain-el', class extends HTMLElement { constructor() { super(); this.i = this.attachInternals(); } });
+var p = document.createElement('plain-el');
+try { p.i.form; R.push('no throw'); } catch (e) { R.push(e.name); }
+R.push(p.i.shadowRoot);
+form.removeChild(c);
+R.push(log.join(','));
+"#,
+        ),
+        5_000,
+    );
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        r#"assoc:f|true|1|true|1|true|n=v1|a=1&b=2|TypeError|true|true|false|"need\nmore"|false|false|assoc:f,disabled:true|false|assoc:f,disabled:true,disabled:false,reset|true|1|true|Lab||NotSupportedError|NotSupportedError|NotSupportedError||assoc:f,disabled:true,disabled:false,reset,assoc:null"#
+    );
+}

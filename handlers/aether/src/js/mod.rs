@@ -59,6 +59,8 @@ pub mod html;
 pub mod idb;
 pub mod idl;
 pub mod importmap;
+/// AETHERWPT3 (SR138): ElementInternals and form-associated custom elements.
+pub mod internals;
 pub mod loader;
 pub mod locks;
 pub mod mutation;
@@ -780,6 +782,7 @@ impl Engine {
         importmap::reset();
         crate::dom::mutation::reset();
         crate::dom::custom::reset(document.arena());
+        internals::reset();
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
         vm.track_rejections = true;
@@ -804,6 +807,7 @@ impl Engine {
         shadow::install(&mut vm);
         mutation::install(&mut vm);
         custom::install(&mut vm);
+        internals::install(&mut vm);
         canvas::install(&mut vm);
         // AETHERSTORAGE (SR94): the inbox and serializer first, then the APIs that use them.
         broadcast::install(&mut vm);
