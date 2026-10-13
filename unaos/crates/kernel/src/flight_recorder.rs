@@ -412,7 +412,7 @@ fn write_log(data: &[u8]) -> Result<usize, crate::fs::fat::FatError> {
 /// block device is present, flush the captured log to `/UNAOS.LOG`: the first time storage comes up,
 /// and thereafter whenever the ring has grown since the last successful flush (throttled). Honest-and-
 /// silent: one witness on the first success, one on failure; never panics, never blocks boot.
-pub fn service() { #[cfg(feature = "unafs")] if worker::off_this_task() { return; } // POINTERFEEL (B535): once handed, the `flightrec` worker is the only caller that runs the body (LINE-NEUTRAL fold, code first)
+pub fn service() { #[cfg(feature = "unafs")] let Some(_inline) = worker::gate() else { return }; // PUMPHOLE2 (B563): the gate decides BEFORE any body work — the worker runs the body; any other caller defers (one count) while the worker is coming, and runs it inline only where no worker can exist (`_inline` names that caller for HIDSTALL until the body returns). POINTERFEEL (B535): once handed, the `flightrec` worker is the only caller that runs the body (LINE-NEUTRAL fold, code first)
     static LAST_FLUSHED: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = never flushed
     static ITERS: AtomicUsize = AtomicUsize::new(0);
     static ANNOUNCED: AtomicBool = AtomicBool::new(false);
@@ -646,9 +646,20 @@ pub fn worker_state() -> (usize, u64) {
     (usize::MAX, 0)
 }
 
+/// PUMPHOLE2 (rmbp-ledger B563): is the flight recorder's work running on the CURRENT task as an inline caller (not
+/// the `flightrec` worker)? HIDSTALL's attribution reads it from the pump core's tick ISR (atomics only): a hold in the
+/// pump's `flight-recorder` step is the recorder's only when this is `true`; otherwise the step ran the gate's one load
+/// and `bootwit::service` (main.rs usb_pump). Without UnaFS there is no worker, so the body is always the caller's.
+pub fn on_caller_now() -> bool {
+    #[cfg(feature = "unafs")]
+    return worker::inline_now();
+    #[allow(unreachable_code)]
+    true
+}
+
 #[cfg(feature = "unafs")]
 mod worker {
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
     /// The worker's pace between body passes (the pump's ~1 ms nap; the body is cheap when idle).
     pub const PACE_MS: u64 = 1;
@@ -666,27 +677,129 @@ mod worker {
     /// The worker's task id (0 = not running): the body's owner once handed.
     static OWNER: AtomicU64 = AtomicU64::new(0);
 
-    /// `service()`'s first statement: `true` = the body belongs to the worker and this caller is not it (by task id,
-    /// so a migrated worker still owns it).
-    #[inline]
-    pub fn off_this_task() -> bool {
-        let o = OWNER.load(Ordering::Acquire);
-        o != 0 && crate::arch::sched::current_id() != Some(o)
+    // ── PUMPHOLE2 (rmbp-ledger B563) — the hand's state, and the passes the recorder DEFERRED instead of running inline.
+    /// Not tried: no split published yet, or no caller has reached the gate since.
+    const ST_UNTRIED: u8 = 0;
+    /// One caller is choosing the core / spawning (any other caller defers meanwhile).
+    const ST_TRYING: u8 = 1;
+    /// `flightrec` spawned; every non-worker caller defers until it stores [`OWNER`] (its first pass).
+    const ST_SPAWNED: u8 = 2;
+    /// No worker can exist (no eligible core, or the task had no id): the body runs inline, as before B541.
+    const ST_INLINE: u8 = 3;
+    static STATE: AtomicU8 = AtomicU8::new(ST_UNTRIED);
+    /// Passes a non-worker caller skipped the body (the pump's `flight-recorder` step was one gate, no service call).
+    static DEFERRED: AtomicU64 = AtomicU64::new(0);
+    /// The first deferred pass's uptime (0 = none yet).
+    static DEFER_FROM_MS: AtomicU64 = AtomicU64::new(0);
+    /// The task id running recorder work INLINE right now (0 = none): HIDSTALL's attribution ([`inline_now`]).
+    static INLINE_TID: AtomicU64 = AtomicU64::new(0);
+
+    /// The inline caller's mark: names it in [`INLINE_TID`] for the body's whole length, cleared on every return path.
+    pub struct InlineMark(bool);
+    impl InlineMark {
+        fn on() -> Self {
+            match crate::arch::sched::current_id() {
+                Some(t) => {
+                    INLINE_TID.store(t, Ordering::Relaxed);
+                    InlineMark(true)
+                }
+                None => InlineMark(false), // the BSP's own loop: no task, never the hid pump's core
+            }
+        }
+    }
+    impl Drop for InlineMark {
+        fn drop(&mut self) {
+            if self.0 {
+                INLINE_TID.store(0, Ordering::Relaxed);
+            }
+        }
     }
 
-    /// Start the worker once (from the body: the first pass with no global slot, or the first storage pass); no eligible core = stay inline.
-    pub fn hand() {
-        static TRIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        if TRIED.load(Ordering::Acquire) || crate::arch::smp::service_cpu().is_none() || TRIED.swap(true, Ordering::AcqRel) {
-            return; // PUMPHOLE (B541): now reached from the FIRST pass, so not before SCHED-X86 publishes its split (unpublished, `xhci_worker_cpu` indexes every AP, the render core included) — one load per pass until it does; decided once after
+    /// `true` = the current task is running recorder work inline (ISR-safe: two relaxed loads).
+    pub fn inline_now() -> bool {
+        let t = INLINE_TID.load(Ordering::Relaxed);
+        t != 0 && crate::arch::sched::current_id() == Some(t)
+    }
+
+    /// One deferred pass: counted, the first one stamped. No body work, no service call, no print.
+    #[inline]
+    fn defer() {
+        if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
+            DEFER_FROM_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// The deferral's one line, printed where it ENDS: on the worker's first pass (off the pump), or by the caller that
+    /// learns no worker can exist. The bytes the deferred passes did not drain stayed in the boot ring
+    /// (`boot_ring::capture` stages them; `ring_kib=` is its rolling capacity) and the serial TX ring, and the worker's
+    /// first pass drains them.
+    fn print_deferred(why: &str) {
+        serial_println!(
+            "[flight] service deferred passes={} until_ms={} from_ms={} ring_kib={} why={} (PUMPHOLE2: no recorder work on the hid pump's core while its worker is coming) ::",
+            DEFERRED.load(Ordering::Relaxed),
+            crate::arch::ms(),
+            DEFER_FROM_MS.load(Ordering::Relaxed),
+            crate::boot_ring::rolling_kib(),
+            why
+        );
+    }
+
+    /// `service()`'s first statement. `None` = this caller skips the body this pass; `Some(mark)` = it runs the body
+    /// (the worker, or an inline caller where no worker can exist — `mark` names that caller until the body returns).
+    /// Decided BEFORE any body work: the old order ran `mirror_service` + USBSTOR's `removable::service` on the pump
+    /// ahead of the hand (flight 33: `usb-pump:flight-recorder n=42 worst_ms=141`, all before the `on=worker` line).
+    pub fn gate() -> Option<InlineMark> {
+        let o = OWNER.load(Ordering::Acquire);
+        if o != 0 {
+            // Handed: the worker (by task id, so a migrated worker still owns it) is the only caller that runs the body.
+            return (crate::arch::sched::current_id() == Some(o)).then_some(InlineMark(false));
+        }
+        match STATE.load(Ordering::Acquire) {
+            ST_INLINE => return Some(InlineMark::on()),
+            ST_TRYING | ST_SPAWNED => {
+                defer();
+                return None;
+            }
+            _ => {}
+        }
+        if crate::arch::smp::service_cpu().is_none() {
+            // No split yet. A SCHEDULED caller defers (it may be a pump on a core the split has not named); the BSP's own
+            // loop (no task) runs inline, exactly as before — it is never the hid pump's core, and on every path that
+            // reaches it pre-split (usbdebug terminal loop, the inline GUI loop a declined handoff falls into) no split
+            // is ever published, so deferring there would starve SERWIT-2 and USBSTOR for the whole boot.
+            if crate::arch::sched::current_id().is_some() {
+                defer();
+                return None;
+            }
+            return Some(InlineMark::on());
+        }
+        let mark = InlineMark::on(); // the spawn below is recorder work on this caller — named honestly
+        if hand() || STATE.load(Ordering::Acquire) != ST_INLINE {
+            defer(); // spawned (or another caller is mid-hand): the body waits for the worker's first pass
+            return None;
+        }
+        Some(mark)
+    }
+
+    /// Start the worker once, the first pass the split is published (`true` = spawned, the caller defers). No eligible
+    /// core = inline, as before. Also reached from the body's two old hand sites, where it is now a no-op.
+    pub fn hand() -> bool {
+        if crate::arch::smp::service_cpu().is_none() {
+            return false; // PUMPHOLE (B541): not before SCHED-X86 publishes its split (unpublished, `xhci_worker_cpu` indexes every AP, the render core included)
+        }
+        if STATE.compare_exchange(ST_UNTRIED, ST_TRYING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return STATE.load(Ordering::Acquire) == ST_SPAWNED;
         }
         let pump = crate::hidstall::pump_cpu();
         let Some(c) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != pump) else {
+            STATE.store(ST_INLINE, Ordering::Release);
             serial_println!("[flight] service on=inline why=no-worker-core (POINTERFEEL: the step stays on the usb-pump) ::");
-            return;
+            print_deferred("no-worker-core");
+            return false;
         };
+        STATE.store(ST_SPAWNED, Ordering::Release);
         crate::arch::sched::spawn("flightrec", run, 0, c, crate::arch::sched::PRIO_NORMAL);
-        serial_println!("[flight] service on=worker cpu={} pace_ms={} hid_pump_cpu={} (POINTERFEEL: the flight-recorder step leaves the hid pump's core) ::", c, PACE_MS, pump);
+        true
     }
 
     /// BOOTLOGCARD (rmbp-ledger B549): the boot-log flush for a boot with no global slot (the card-only boot, where the
@@ -702,11 +815,17 @@ mod worker {
 
     fn run(_: usize) {
         let Some(id) = crate::arch::sched::current_id() else {
+            STATE.store(ST_INLINE, Ordering::Release); // PUMPHOLE2: the callers stop deferring and run the body inline
             serial_println!("[flight] service on=inline why=worker-has-no-task-id (POINTERFEEL) ::");
+            print_deferred("worker-has-no-task-id");
             crate::arch::sched::exit();
         };
-        CPU.store(crate::arch::sched::meter_current_cpu(), Ordering::Release);
+        let c = crate::arch::sched::meter_current_cpu();
+        CPU.store(c, Ordering::Release);
         OWNER.store(id, Ordering::Release);
+        // PUMPHOLE2: both lines print HERE, on the worker's core — the pump's last recorder act was the spawn.
+        serial_println!("[flight] service on=worker cpu={} pace_ms={} hid_pump_cpu={} (POINTERFEEL: the flight-recorder step leaves the hid pump's core) ::", c, PACE_MS, crate::hidstall::pump_cpu());
+        print_deferred("worker-up");
         loop {
             let t0 = crate::arch::ms();
             super::service();
