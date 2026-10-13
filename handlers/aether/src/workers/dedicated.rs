@@ -414,6 +414,21 @@ fn now_native(vm: &mut Vm, _c: &CallCtx) -> JsResult<Value> {
     Ok(Value::Number(elapsed_ms()))
 }
 
+/// `__w_forward_error(message, filename, lineno, colno)`: a nested worker's error that neither its Worker
+/// object nor this worker's global canceled goes on to this worker's owner (HTML §10.2.5, one level up).
+fn forward_error_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
+    checkpoint_kill(vm)?;
+    let message = str_arg(vm, c, 0)?;
+    let filename = str_arg(vm, c, 1)?;
+    let lineno = vm.arg(c, 2);
+    let lineno = vm.to_number(&lineno)?;
+    let colno = vm.arg(c, 3);
+    let colno = vm.to_number(&colno)?;
+    let (id, owner) = with_w(|w| (w.id, w.owner)).unwrap_or((0, 0));
+    crate::js::broadcast::post(owner, "worker-error", json!({ "id": id, "message": message, "filename": filename, "lineno": lineno, "colno": colno }).to_string());
+    Ok(Value::Undefined)
+}
+
 /// `__w_uncaught(error)`: an exception a listener threw (EventTarget dispatch reports it, HTML §8.1.4.6).
 fn uncaught_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     checkpoint_kill(vm)?;
@@ -580,6 +595,7 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
         ("__w_import", 1, import_native),
         ("__w_now", 0, now_native),
         ("__w_uncaught", 1, uncaught_native),
+        ("__w_forward_error", 4, forward_error_native),
     ] {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));

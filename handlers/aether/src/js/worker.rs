@@ -24,7 +24,9 @@
 //! `js::broadcast` serializer with ArrayBuffer and MessagePort transfer) and sends one `message` task to the
 //! worker; the worker's `postMessage` arrives as a `worker-message` inbox task here, which fires a trusted
 //! MessageEvent (`data`, `origin` "", `ports`) — or `messageerror` when deserialization fails. An uncaught
-//! worker error arrives as `worker-error` and fires an ErrorEvent (`message`, `filename`, `lineno`, `colno`).
+//! worker error arrives as `worker-error` and fires a cancelable ErrorEvent (`message`, `filename`, `lineno`,
+//! `colno`); not canceled, it is reported again one level up (the Window's `error` event, then the console; a
+//! parent worker's global, then that worker's owner).
 //! `terminate()` stops the worker (`dedicated::terminate`) and drops any of its messages still queued here.
 
 use super::idl::{self, arg, num};
@@ -199,7 +201,6 @@ const PRELUDE: &str = r#"
             }
             var name = o.name === undefined ? '' : String(o.name);
             super();
-            EventTarget.prototype.addEventListener.call(this, 'message', __msg_stash);
             var id = __worker('spawn', String(url), type, name, navSnapshot());
             ST.set(this, { id: id, terminated: false });
             BY_ID.set(id, this);
@@ -235,8 +236,18 @@ const PRELUDE: &str = r#"
             __net_fire(w, 'Event', 'error', undefined);
             return;
         }
-        __net_fire(w, 'ErrorEvent', 'error', { message: m.message, filename: m.filename, lineno: m.lineno, colno: m.colno });
-        console.error(m.message + ' (worker ' + m.filename + ':' + m.lineno + ')');
+        // HTML §10.2.5 (AETHERWORKERS2, SR125): a cancelable ErrorEvent at the Worker; not canceled, the error is
+        // reported again in the global the Worker object lives in — one level up: the Window (then the console),
+        // or, for a nested worker, the parent worker's global and on to its own owner.
+        var init = { message: m.message, filename: m.filename, lineno: m.lineno, colno: m.colno };
+        if (!__net_fire(w, 'ErrorEvent', 'error', init, true)) { return; }
+        if (typeof __w_forward_error === 'function') {
+            if (__w_error(m.message, m.filename, m.lineno, m.colno, null)) { __w_forward_error(m.message, m.filename, m.lineno, m.colno); }
+            return;
+        }
+        if (__net_fire(globalThis, 'ErrorEvent', 'error', init, true)) {
+            console.error(m.message + ' (worker ' + m.filename + ':' + m.lineno + ')');
+        }
     });
 })();
 "#;

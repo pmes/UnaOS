@@ -444,3 +444,36 @@ fn a_worker_creates_nested_workers_under_its_captured_context() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 3
+
+/// The ErrorEvent a worker error fires at the Worker is cancelable (HTML §10.2.5): canceled there, the
+/// Window never hears it; not canceled, it is reported again at the Window as a cancelable ErrorEvent. And
+/// `new MessageEvent(type, { ports })` from script carries its ports (a frozen array; a non-port throws).
+#[test]
+fn the_worker_error_event_is_cancelable_and_message_event_init_has_ports() {
+    let up = data_url("throw new Error('up');");
+    let kept = data_url("throw new Error('kept');");
+    let mut p = page(
+        PAGE,
+        &format!(
+            "var a = null, b = null, winA = 0, winB = null;
+             window.addEventListener('error', function (e) {{
+                 if (String(e.message).indexOf('up') >= 0) {{ winA++; }}
+                 if (String(e.message).indexOf('kept') >= 0) {{ winB = e.constructor.name + '|' + e.cancelable; e.preventDefault(); }}
+             }});
+             var w1 = new Worker('{up}'); w1.onerror = function (e) {{ a = e.cancelable + '|' + e.message; e.preventDefault(); }};
+             var w2 = new Worker('{kept}'); w2.onerror = function (e) {{ b = String(e.cancelable); }};
+             var ch = new MessageChannel();
+             var me = new MessageEvent('message', {{ data: 1, ports: [ch.port1] }});
+             var mp = [me.ports.length, me.ports[0] === ch.port1, Object.isFrozen(me.ports), new MessageEvent('x').ports.length, me.ports === me.ports].join('|');
+             var bad = 'none'; try {{ new MessageEvent('x', {{ ports: [{{}}] }}); }} catch (x) {{ bad = x.name; }}"
+        ),
+    );
+    assert_eq!(eval(&mut p, "mp"), "1|true|true|0|true", "MessageEventInit.ports");
+    assert_eq!(eval(&mut p, "bad"), "TypeError", "a non-MessagePort in ports");
+    assert_eq!(run_until(&mut p, "a !== null", "a", 20), "true|Uncaught Error: up");
+    assert_eq!(run_until(&mut p, "winB !== null", "winB + '|' + b", 20), "ErrorEvent|true|true", "not canceled at the Worker, the error reaches the Window");
+    spin(&mut p, 100);
+    assert_eq!(eval(&mut p, "winA"), "0", "canceled at the Worker, the Window never hears it");
+}

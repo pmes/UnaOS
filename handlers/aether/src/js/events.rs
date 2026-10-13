@@ -1537,6 +1537,17 @@ fn convert_member(vm: &mut Vm, v: Value, kind: char) -> JsResult<Value> {
                 v
             }
         }
+        // sequence<MessagePort> (MessageEventInit.ports, AETHERWORKERS2 SR125): a frozen array of MessagePorts,
+        // the empty one by default; anything else in the list is a TypeError.
+        'P' => {
+            let list = if v.is_undefined() { Vec::new() } else { vm.array_to_list(&v) };
+            for p in &list {
+                if !is_message_port(vm, p)? {
+                    return vm.throw_type("Failed to construct 'MessageEvent': Failed to read the 'ports' property from 'MessageEventInit': Failed to convert value to 'MessagePort'.");
+                }
+            }
+            frozen_array(vm, list)?
+        }
         // A required FormData (FormDataEventInit.formData; AETHERFORMS).
         'F' => {
             if !super::forms::is_form_data(vm, &v)? {
@@ -1619,7 +1630,7 @@ fn members(iface: &str) -> &'static [(&'static str, char)] {
         "PopStateEvent" => &[("state", 'a')],
         "HashChangeEvent" => &[("oldURL", 's'), ("newURL", 's')],
         "ProgressEvent" => &[("lengthComputable", 'b'), ("loaded", 'n'), ("total", 'n')],
-        "MessageEvent" => &[("data", 'a'), ("origin", 's'), ("lastEventId", 's'), ("source", 'o')],
+        "MessageEvent" => &[("data", 'a'), ("origin", 's'), ("lastEventId", 's'), ("source", 'o'), ("ports", 'P')],
         "PageTransitionEvent" => &[("persisted", 'b')],
         "SubmitEvent" => &[("submitter", 'o')],
         "FormDataEvent" => &[("formData", 'F')],
@@ -1894,10 +1905,47 @@ fn ev_member(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             if vm.heap.get(o).props.get(&key).is_some() {
                 return vm.get(o, &key);
             }
+            if name == "ports" {
+                // MessageEvent.ports with no init member: one frozen empty array, kept so `e.ports === e.ports`.
+                let a = frozen_array(vm, Vec::new())?;
+                vm.create_data_property(o, key, a.clone())?;
+                return Ok(a);
+            }
             Ok(default_member(&name))
         }
+        _ if name == "ports" => frozen_array(vm, Vec::new()),
         _ => Ok(default_member(&name)),
     }
+}
+
+/// A frozen JS array of `items` (a FrozenArray<T> attribute's value).
+fn frozen_array(vm: &mut Vm, items: Vec<Value>) -> JsResult<Value> {
+    let a = vm.new_array(items);
+    vm.set_integrity_level(a, true)?;
+    Ok(Value::Object(a))
+}
+
+/// Whether `v` is a MessagePort of the current realm (its prototype chain reaches `MessagePort.prototype`;
+/// a realm without `MessagePort` accepts any object).
+fn is_message_port(vm: &mut Vm, v: &Value) -> JsResult<bool> {
+    let Some(o) = v.as_object() else { return Ok(false) };
+    let g = vm.realm().global;
+    let ctor = vm.get(g, &PropertyKey::from_str("MessagePort"))?;
+    let Some(c) = ctor.as_object() else { return Ok(true) };
+    let Some(proto) = vm.get(c, &PropertyKey::from_str("prototype"))?.as_object() else { return Ok(true) };
+    let mut p = vm.heap.get(o).proto;
+    let mut hops = 0;
+    while let Some(x) = p {
+        if x == proto {
+            return Ok(true);
+        }
+        hops += 1;
+        if hops > 10_000 {
+            break;
+        }
+        p = vm.heap.get(x).proto;
+    }
+    Ok(false)
 }
 
 fn default_member(name: &str) -> Value {

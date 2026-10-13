@@ -389,15 +389,18 @@ fn list_arg(vm: &mut Vm, v: &Value) -> JsResult<Vec<String>> {
     Ok(out)
 }
 
-/// `__net_fire(target, iface, type, init)`: fires a trusted event of interface `iface` (its members read
-/// from `init`) at an EventTarget; answers whether it was not canceled.
+/// `__net_fire(target, iface, type, init, cancelable)`: fires a trusted event of interface `iface` (its members
+/// read from `init`) at an EventTarget; answers whether it was not canceled. `cancelable` (AETHERWORKERS2,
+/// SR125; absent = false) makes the event cancelable — the Worker's ErrorEvent (HTML §10.2.5).
 fn net_fire(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let t = arg(vm, ctx, 0);
     let Some(target) = super::events::target_of(vm, &t) else { return vm.throw_type("__net_fire: not an EventTarget") };
     let iface = str_arg(vm, ctx, 1)?;
     let ty = str_arg(vm, ctx, 2)?;
     let init = arg(vm, ctx, 3).as_object();
-    let e = super::events::new_event(vm, &iface, &ty, false, false, init);
+    let cancelable = arg(vm, ctx, 4);
+    let cancelable = vm.to_boolean(&cancelable);
+    let e = super::events::new_event(vm, &iface, &ty, false, cancelable, init);
     let r = idl::root(vm, Value::Object(e));
     let (not_canceled, _) = super::events::dispatch(vm, e, target);
     idl::unroot(vm, r);
@@ -644,7 +647,7 @@ fn storage_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 pub fn install(vm: &mut Vm) {
     let g = vm.realm().global;
     for (name, len, f) in [
-        ("__net_fire", 4, net_fire as NativeFn),
+        ("__net_fire", 5, net_fire as NativeFn),
         ("__net_http", 6, net_http),
         ("__net_http_sync", 6, net_http_sync),
         ("__net_cancel", 1, net_cancel),
