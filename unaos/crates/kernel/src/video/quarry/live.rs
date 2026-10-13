@@ -3795,20 +3795,20 @@ pub fn stamp_selftest() {
 ///
 /// and the verdict is three claims: the two PREFIX LISTS are equal element-for-element (not merely
 /// the same length — a table with three volumes and a shim that invented three others would pass a
-/// count test), `mounts` is non-empty, and `rows >= mounts`. The last one is the FILE MANAGER half:
-/// prefixes in a `Vec` prove nothing if `collect` still refuses, because [`Model::expand`] turns a
-/// collector error into an empty child list and leaves the tree at its single root row. On this
-/// machine the root expands to at least `boot` and `apps` — the synthesized mount rows
-/// `vfs_ls_collect` adds for every prefix bound below `/` — so three mounts cannot yield one row.
+/// count test), `mounts` is non-empty, and EVERY MOUNT IS REACHABLE in the tree (`reach=<k>/<mounts>`,
+/// QUARRYVOL2). That is the FILE MANAGER half: prefixes in a `Vec` prove nothing if `collect` still refuses,
+/// because [`Model::expand`] turns a collector error into an empty child list and leaves the tree at its
+/// single root row. A mount is reached when it is a root row itself, or its first path component is a child
+/// of the root (`/apps`, `/lib`, and `/volumes/UnaOS` + `/volumes/boot` through `volumes`).
 ///
-/// # Why `>=` and not `==`
+/// # Why reachability and not `rows >= mounts` (QUARRYVOL2, PISPEC pi-ledger PI21)
 ///
-/// Because [`root_prefixes`] is deliberately NOT a 1:1 map: `/` claims `/boot` and `/apps`, so the
-/// three mounts reduce to ONE root and then re-appear one level down as children, which is the
-/// duplicate-`/boot` rule and the honest shape of one namespace. The row count is therefore
-/// `1 + (directories under /)`, which is bounded below by the mount count and above by nothing this
-/// fixture should pin. `==` would encode this machine's volume list into a fixture that must also
-/// run on a Pi with a stick in it.
+/// The count rule held while every mount sat one level below `/`. ROOTDISK (B390) nests `/volumes/UnaOS` and
+/// VOLUMES (B366 M2, `fs::volumes::view`) withdraws `boot` from `/` once the partition is shown under Volumes,
+/// so the Pi's six mounts render 1 + {apps, lib, volumes} = 4 rows with every one of them reachable (`rows=4`,
+/// PIKERNEL8TEST2 serial-pi.log:851). The withdrawn `boot` counts as reached through `volumes`; any other
+/// unshown component is a real miss. `==` on rows would still encode one machine's volume list into a
+/// fixture that must also run on a Pi with a stick in it; reachability does not.
 ///
 /// # SKIP, and when it is honest
 ///
@@ -3856,15 +3856,15 @@ pub fn vol_selftest() {
         );
         return;
     }
-    let ok = same_list && mounts > 0 && rows >= mounts;
+    let boot_withdrawn = crate::fs::volumes::boot_alias_bound(); let child = |c: &str| m.tree.iter().any(|r| r.depth == 1 && r.name == c); let reach = m.mounts.iter().filter(|p| m.tree.iter().any(|r| r.depth == 0 && r.path == **p) || { let c = p.trim_start_matches('/').split('/').next().unwrap_or(""); child(c) || (boot_withdrawn && c == "boot" && child("volumes")) }).count(); let ok = same_list && mounts > 0 && reach == mounts; // QUARRYVOL2 (PISPEC, PI21): every mount REACHABLE (a root row, or its first component a child of the root; `boot` withdrawn by VOLUMES is reached through `volumes`), not `rows >= mounts` — line-NEUTRAL
     serial_println!(
         ":: QUARRYVOL: mounts={} table={} rows={} seam=fs::vfs::MountTable::prefixes \
-         model={:?} live={:?} roots={} same_list={} nonempty={} rows_ge_mounts={} cwd={} err={:?} \
+         model={:?} live={:?} roots={} same_list={} nonempty={} reach={}/{} cwd={} err={:?} \
          match={} -> {} ::",
         mounts, table.len(), rows,
         m.mounts, table,
         m.tree.iter().filter(|r| r.depth == 0).count(),
-        same_list, mounts > 0, rows >= mounts, m.cwd, m.err,
+        same_list, mounts > 0, reach, mounts, m.cwd, m.err,
         ok,
         if ok { "PASS" } else { "FAIL" }
     );
