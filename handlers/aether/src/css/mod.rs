@@ -189,10 +189,13 @@ fn cascade_document(
     pseudo_rules: &[css_core::cascade::RuleSet<'_>; 3],
     boxed: &std::collections::HashSet<html_core::NodeId>,
     containers: Option<&ContainerSizes>,
+    scope: Option<&Scope<'_>>,
+    record: bool,
 ) -> (
     std::collections::HashMap<html_core::NodeId, std::rc::Rc<SpecifiedStyle>>,
     std::collections::BTreeMap<String, Vec<css_core::CV>>,
     std::collections::HashMap<html_core::NodeId, PseudoStyles>,
+    Option<std::collections::HashMap<html_core::NodeId, CachedEl>>,
 ) {
     use css_core::values::{compute_custom_properties, contains_var, substitute_vars};
     use std::collections::{BTreeMap, HashMap};
@@ -216,11 +219,50 @@ fn cascade_document(
     // container rule's `style()` names a standard property.
     let want_decls = rules.entries.iter().any(|e| e.container.iter().any(|c| c.queries_standard_style()));
     let mut resolved: HashMap<html_core::NodeId, Vec<(String, String)>> = HashMap::new();
+    // AETHERPAINTPERF (SR130): each element's cascade as the next scoped restyle reuses it; the elements under a
+    // dirty root (preorder: a parent is decided before its children); the re-cascaded elements whose custom
+    // properties moved (their children re-cascade too: `var()` reads them); how many elements were cascaded.
+    let mut new_cache: Option<HashMap<html_core::NodeId, CachedEl>> = record.then(HashMap::new);
+    let mut dirty_sub: std::collections::HashSet<html_core::NodeId> = std::collections::HashSet::new();
+    let mut moved_customs: std::collections::HashSet<html_core::NodeId> = std::collections::HashSet::new();
+    let mut n_cascaded: u64 = 0;
     for id in doc.descendants(html_core::Document::ROOT) {
         let Some(el) = doc.element(id) else { continue };
-        let inline = el.attr("style").filter(|t| crate::security::csp::allow_style_attr(t)).map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
         let me_el = crate::dom::El::new(doc, id);
         let filter = doc.parent_element(id).and_then(|p| child_filter.get(&p)).copied().unwrap_or_default();
+        if let Some(sc) = scope {
+            let parent_el = doc.parent_element(id);
+            let under = sc.subtree.contains(&id) || parent_el.is_some_and(|p| dirty_sub.contains(&p));
+            if under {
+                dirty_sub.insert(id);
+            }
+            let forced = parent_el.is_some_and(|p| moved_customs.contains(&p));
+            let hit = (!under && !forced && !sc.self_only.contains(&id))
+                .then(|| sc.cache.get(&id))
+                .flatten()
+                .filter(|c| c.boxed == boxed.contains(&id));
+            if let Some(c) = hit {
+                // No dirty root reaches it: its matches, its own declarations and its parent's custom properties
+                // are what they were, so its last cascade is its cascade now.
+                child_filter.insert(id, filter.with_element(&me_el));
+                if doc.parent(id) == Some(html_core::Document::ROOT) {
+                    root_customs = (*c.customs).clone();
+                }
+                if let Some(st) = &c.style {
+                    out.insert(id, st.clone());
+                }
+                if let Some(ps) = &c.pseudo {
+                    pseudo_out.insert(id, ps.clone());
+                }
+                customs.insert(id, c.customs.clone());
+                if let Some(nc) = new_cache.as_mut() {
+                    nc.insert(id, c.clone());
+                }
+                continue;
+            }
+        }
+        n_cascaded += 1;
+        let inline = el.attr("style").filter(|t| crate::security::csp::allow_style_attr(t)).map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
         // AETHERSTYLE3 (SR103): `@container` rules ask the element's query container (the nearest ancestor
         // container whose name matches, css-contain-3 §3.1) as the first layout sized it.
         // AETHERSTYLE3B (SR115): every element is a style container — a rule with only `style()` queries asks the
@@ -288,9 +330,18 @@ fn cascade_document(
         if doc.parent(id) == Some(html_core::Document::ROOT) {
             root_customs = (*mine).clone();
         }
+        if let Some(sc) = scope {
+            let same = sc.cache.get(&id).is_some_and(|c| Rc::ptr_eq(&c.customs, &mine) || *c.customs == *mine);
+            if !same {
+                moved_customs.insert(id);
+            }
+        }
         if !boxed.contains(&id) {
             if let Some(r) = own_resolved.take() {
                 resolved.insert(id, r);
+            }
+            if let Some(nc) = new_cache.as_mut() {
+                nc.insert(id, CachedEl { boxed: false, style: None, pseudo: None, customs: mine.clone() });
             }
             customs.insert(id, mine);
             continue;
@@ -351,6 +402,9 @@ fn cascade_document(
             if let Some(r) = own_resolved.take() {
                 resolved.insert(id, r);
             }
+            if let Some(nc) = new_cache.as_mut() {
+                nc.insert(id, CachedEl { boxed: true, style: None, pseudo: pseudo_out.get(&id).cloned(), customs: mine.clone() });
+            }
             customs.insert(id, mine);
             continue;
         }
@@ -383,13 +437,17 @@ fn cascade_document(
                 s
             }
         };
+        if let Some(nc) = new_cache.as_mut() {
+            nc.insert(id, CachedEl { boxed: true, style: Some(style.clone()), pseudo: pseudo_out.get(&id).cloned(), customs: mine.clone() });
+        }
         out.insert(id, style);
         if let Some(r) = own_resolved.take() {
             resolved.insert(id, r);
         }
         customs.insert(id, mine);
     }
-    (out, root_customs, pseudo_out)
+    crate::perf::add_cascaded(n_cascaded);
+    (out, root_customs, pseudo_out, new_cache)
 }
 
 /// The cascaded styles of an element's ::marker, ::before and ::after (in that order; `None` = no
@@ -459,12 +517,25 @@ fn container_sizes(tree: &LayoutTree) -> ContainerSizes {
 /// cascaded again with those sizes (css-contain-3 §4: container rules apply against the containers' laid-out
 /// size; one round, so a rule that resizes its own container does not loop).
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
-    let mut round = apply_stylesheets_with(layout_tree, sheets, None);
+    apply_stylesheets_inner(layout_tree, sheets, None);
+}
+
+/// AETHERPAINTPERF (SR130): the engine's restyle — [`apply_stylesheets`] for the page's own document, which
+/// re-cascades only the elements the DOM changes since its last call can re-match (`restyle_plan`) and reuses
+/// that call's cascade for every other element. `hover` is the hover chain the engine set
+/// (`dom::El::set_hover_chain`): a `:hover` rule re-matches the elements that entered or left it. Falls back
+/// to the whole document whenever the plan cannot be bounded (see `restyle_plan`).
+pub fn apply_stylesheets_scoped(layout_tree: &mut LayoutTree, sheets: &[String], hover: &[html_core::NodeId]) {
+    apply_stylesheets_inner(layout_tree, sheets, Some(hover));
+}
+
+fn apply_stylesheets_inner(layout_tree: &mut LayoutTree, sheets: &[String], hover: Option<&[html_core::NodeId]>) {
+    let mut round = apply_stylesheets_with(layout_tree, sheets, None, hover);
     if let Some(sizes) = round.containers.take() {
         if let Some(root) = layout_tree.node_map.get(&layout_tree.root_node).cloned() {
             let (vw, vh) = layout_tree.viewport;
             *layout_tree = crate::layout::build_tree(&root, vw, vh);
-            round = apply_stylesheets_with(layout_tree, sheets, Some(&sizes));
+            round = apply_stylesheets_with(layout_tree, sheets, Some(&sizes), None);
         }
     }
     // AETHERSTYLE3 (SR103): transitions start from the style change, animations follow the names, and the
@@ -483,7 +554,12 @@ struct Round {
 
 /// One cascade + layout. With `containers` None, returns the query-container sizes when the sheets carry
 /// `@container` rules and the page has query containers (the caller's cue for the second round).
-fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], containers: Option<&ContainerSizes>) -> Round {
+fn apply_stylesheets_with(
+    layout_tree: &mut LayoutTree,
+    sheets: &[String],
+    containers: Option<&ContainerSizes>,
+    hover: Option<&[html_core::NodeId]>,
+) -> Round {
     let t0 = std::time::Instant::now();
     let (vw, vh) = layout_tree.viewport;
     set_viewport(vw, vh);
@@ -520,6 +596,10 @@ fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], conta
             any.get_or_insert_with(|| n.clone());
         }
     }
+    // AETHERPAINTPERF (SR130): the engine's restyle consumes the DOM changes recorded since its last cascade,
+    // whatever it decides; a document without elements leaves nothing to reuse.
+    let changes = if hover.is_some() { CHANGES.with(|c| std::mem::take(&mut *c.borrow_mut())) } else { (Vec::new(), false) };
+    let prev = if hover.is_some() { STYLE_CACHE.with(|c| c.borrow_mut().take()) } else { None };
     let Some(any) = any else {
         STYLE_TIMING.with(|t| t.set((t0.elapsed(), std::time::Duration::ZERO)));
         return Round::default();
@@ -551,8 +631,51 @@ fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], conta
         set
     });
     let t_c = std::time::Instant::now();
-    let (styles, root_customs, pseudo_styles) =
-        any.with_doc(|doc, _| cascade_document(doc, &rules, &pseudo_rules, &boxed, containers));
+    // AETHERPAINTPERF (SR130): the engine's restyle of its own document re-cascades the plan's elements only, and
+    // records this cascade for the next one (never under `@container` rules: their matches follow layout sizes).
+    // (Only the engine's restyle reads the page state; the script-side layout flushes have no use for it.)
+    let (version, focused) = match hover {
+        Some(_) => crate::js::page(|p| (p.version, p.focused.map(html_core::NodeId))),
+        None => (0, None),
+    };
+    let pf = pointer_focus();
+    let cacheable = hover.is_some() && containers.is_none() && !rules.has_container_rules();
+    let plan = match (&prev, hover) {
+        (Some(prev), Some(hover)) if cacheable && crate::perf::scoped() && !changes.1 => {
+            let same_inputs = prev.sheets.as_slice() == sheets && prev.viewport == (vw, vh) && prev.env == env;
+            if same_inputs {
+                let set = rules.invalidation();
+                any.with_doc(|doc, _| restyle_plan(doc, &set, prev, &changes.0, version, hover, focused, pf))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if hover.is_some() {
+        crate::perf::add_restyle(plan.is_some());
+    }
+    let scope = match (&prev, plan) {
+        (Some(prev), Some((self_only, subtree))) => Some(Scope { cache: &prev.els, self_only, subtree }),
+        _ => None,
+    };
+    let (styles, root_customs, pseudo_styles, recorded) =
+        any.with_doc(|doc, _| cascade_document(doc, &rules, &pseudo_rules, &boxed, containers, scope.as_ref(), cacheable));
+    drop(scope);
+    if let (Some(els), Some(hover)) = (recorded, hover) {
+        STYLE_CACHE.with(|c| {
+            *c.borrow_mut() = Some(StyleCache {
+                sheets: sheets.to_vec(),
+                viewport: (vw, vh),
+                env: env.clone(),
+                version,
+                hover: hover.to_vec(),
+                focused,
+                pointer_focus: pf,
+                els,
+            })
+        });
+    }
     if std::env::var_os("AETHER_STYLE_PROFILE").is_some() {
         eprintln!(
             "[style] parse + rule set {:?}, cascade {:?}, {} selector entries, rule hash {}",
@@ -624,6 +747,303 @@ pub(crate) fn animation_frame(tree: &mut LayoutTree) -> anim::Frame {
         anim::Frame::Idle if scrolled => anim::Frame::Repaint,
         f => f,
     }
+}
+
+/// AETHERPAINTPERF (SR130): [`animation_frame`] with the scope of its damage — the elements whose animated values
+/// moved, when every value the timeline runs on them is one whose ink stays inside the boxes the last frame
+/// painted for the element and its descendants (`render::subtree_ink`): colours, `opacity`,
+/// `background-position`. None when the frame scrolled, or something else animates (a transform, a filter, a
+/// clip-path, `visibility`, `z-index`, an outline colour — their ink or their stacking moves — or a layout
+/// property, which re-lays the tree out); the engine then damages the viewport.
+pub(crate) fn animation_frame_scoped(tree: &mut LayoutTree) -> (anim::Frame, Option<Vec<html_core::NodeId>>) {
+    let scrolled = crate::layout::scroll_frame(tree);
+    match anim::frame(tree) {
+        anim::Frame::Idle if scrolled => (anim::Frame::Repaint, None),
+        anim::Frame::Repaint if !scrolled => (anim::Frame::Repaint, ink_bounded_animations()),
+        anim::Frame::Repaint => (anim::Frame::Repaint, None),
+        f => (f, None),
+    }
+}
+
+/// The elements the timeline runs anything on, when every property it runs is ink-bounded (see
+/// [`animation_frame_scoped`]); None otherwise.
+fn ink_bounded_animations() -> Option<Vec<html_core::NodeId>> {
+    fn bounded(prop: &str) -> bool {
+        matches!(
+            prop,
+            "color" | "background-color" | "border-color" | "border-top-color" | "border-right-color" | "border-bottom-color"
+                | "border-left-color" | "opacity" | "background-position"
+        )
+    }
+    let now = anim::now_ms();
+    anim::with_timeline(|t| {
+        let keys = t.keys();
+        for k in &keys {
+            for id in t.animation_ids(Some(k)) {
+                let props: Vec<String> = match t.keyframes(id) {
+                    Some(frames) => frames.properties(),
+                    // a transition: its name is the property it runs
+                    None => match t.info(id, now) {
+                        Some(info) => vec![info.name],
+                        None => continue,
+                    },
+                };
+                if props.is_empty() || !props.iter().all(|p| bounded(p)) {
+                    return None;
+                }
+            }
+        }
+        Some(keys)
+    })
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// AETHERPAINTPERF (SR130): the restyle scope
+//
+// The script lane records every DOM change it makes (js/dom.rs `restyle_root`, right after the `touch()` that
+// counts it in the page's DOM version) as a [`Change`]. The engine's restyle (`apply_stylesheets_scoped`) turns
+// the changes since its last cascade into dirty roots through the rule set's invalidation set
+// (css_core::cascade::invalidation) — an attribute change reaches the element, its subtree or its parent's subtree
+// as the selectors that read the attribute (the changed class tokens, the old and new id) say; a change of an
+// element's children re-matches the added subtrees, every child when a selector reads sibling structure, and the
+// element itself (or its parent's subtree) when a selector reads `:empty`; a text change reaches its element only
+// through `:empty` — and re-cascades the elements under those roots, reusing the last cascade for the rest. It
+// cascades the whole document instead when a DOM change was not recorded (a `touch()` outside js/dom.rs leaves a
+// gap in the version count), when the sheets, the viewport or the media environment differ, when the rules carry
+// `@container` (matches follow layout sizes) or a selector the reach cannot bound (`:has()`, `:lang()`, `:dir()`,
+// `::slotted()`, `::part()`, `:defined`), or when the document has shadow trees.
+// ---------------------------------------------------------------------------------------------------------
+
+/// One DOM change the script lane made.
+#[derive(Clone, Debug)]
+pub(crate) enum Change {
+    /// `parent`'s children changed; `added` went in (new or moved nodes).
+    Children { parent: usize, added: Vec<usize> },
+    /// Attribute `name` of `el` changed from `old` to `new` (None: absent).
+    Attribute { el: usize, name: String, old: Option<String>, new: Option<String> },
+    /// A character-data node's data changed.
+    Text { node: usize },
+}
+
+/// Changes kept between two restyles; past it the next restyle cascades the whole document.
+const MAX_CHANGES: usize = 65_536;
+
+/// One element's last cascade.
+#[derive(Clone)]
+pub(crate) struct CachedEl {
+    /// It had a box (the cascade styles boxed elements only).
+    boxed: bool,
+    style: Option<std::rc::Rc<SpecifiedStyle>>,
+    pseudo: Option<PseudoStyles>,
+    customs: std::rc::Rc<std::collections::BTreeMap<String, Vec<css_core::CV>>>,
+}
+
+/// The last engine cascade of the page's document, with every input it ran against besides the DOM.
+struct StyleCache {
+    sheets: Vec<String>,
+    viewport: (f32, f32),
+    env: css_core::media::Environment,
+    /// The page's DOM version (`js::touch` count) the cascade saw.
+    version: u64,
+    hover: Vec<html_core::NodeId>,
+    focused: Option<html_core::NodeId>,
+    pointer_focus: bool,
+    els: std::collections::HashMap<html_core::NodeId, CachedEl>,
+}
+
+/// What a scoped cascade re-cascades: these elements, and every element under these.
+struct Scope<'c> {
+    cache: &'c std::collections::HashMap<html_core::NodeId, CachedEl>,
+    self_only: std::collections::HashSet<html_core::NodeId>,
+    subtree: std::collections::HashSet<html_core::NodeId>,
+}
+
+thread_local! {
+    /// The changes since the last engine restyle (with the DOM version each one bumped to), and whether more
+    /// than [`MAX_CHANGES`] came (the next restyle is whole).
+    static CHANGES: std::cell::RefCell<(Vec<(u64, Change)>, bool)> = const { std::cell::RefCell::new((Vec::new(), false)) };
+    static STYLE_CACHE: std::cell::RefCell<Option<StyleCache>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records a DOM change the script lane just counted as DOM version `version`.
+pub(crate) fn note_change(version: u64, change: Change) {
+    CHANGES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.1 {
+            return;
+        }
+        if c.0.len() >= MAX_CHANGES {
+            c.0.clear();
+            c.1 = true;
+            return;
+        }
+        c.0.push((version, change));
+    });
+}
+
+/// A new document (or a DOM change the engine made itself): the next restyle cascades the whole document.
+pub(crate) fn forget_restyle() {
+    CHANGES.with(|c| *c.borrow_mut() = (Vec::new(), false));
+    STYLE_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
+/// Adds the elements a change of reach `r` at element `id` can re-match; false when that is beyond the document's
+/// elements (a sibling reach at the document element).
+fn reach_into(
+    doc: &html_core::Document,
+    id: html_core::NodeId,
+    r: css_core::cascade::invalidation::Reach,
+    self_only: &mut std::collections::HashSet<html_core::NodeId>,
+    subtree: &mut std::collections::HashSet<html_core::NodeId>,
+) -> bool {
+    use css_core::cascade::invalidation::Reach;
+    match r {
+        Reach::None => true,
+        Reach::SelfOnly => {
+            self_only.insert(id);
+            true
+        }
+        Reach::Subtree => {
+            subtree.insert(id);
+            true
+        }
+        Reach::Siblings => match doc.parent_element(id) {
+            Some(p) => {
+                subtree.insert(p);
+                true
+            }
+            None => false,
+        },
+    }
+}
+
+/// The dirty roots of a scoped restyle — (elements re-cascaded alone, elements re-cascaded with their subtree) —
+/// from the changes since `prev` (the last cascade) under invalidation set `set`, and the engine state `:hover` /
+/// `:focus*` read; None when the restyle must cascade the whole document.
+#[allow(clippy::too_many_arguments)]
+fn restyle_plan(
+    doc: &html_core::Document,
+    set: &css_core::cascade::invalidation::InvalidationSet,
+    prev: &StyleCache,
+    changes: &[(u64, Change)],
+    version: u64,
+    hover: &[html_core::NodeId],
+    focused: Option<html_core::NodeId>,
+    pointer_focus: bool,
+) -> Option<(std::collections::HashSet<html_core::NodeId>, std::collections::HashSet<html_core::NodeId>)> {
+    use css_core::selectors::ElementState as S;
+    use html_core::{Document, NodeId};
+    if set.whole || crate::dom::shadow::any(doc) {
+        return None;
+    }
+    // Every DOM version since the last cascade must carry its recorded change: a `touch()` the script lane made
+    // outside js/dom.rs (innerHTML, form state, …) is a gap, and a gap is a change nobody can bound.
+    let span = version.wrapping_sub(prev.version);
+    if span > MAX_CHANGES as u64 {
+        return None;
+    }
+    let in_span = |v: u64| v.wrapping_sub(prev.version).wrapping_sub(1) < span;
+    let seen: std::collections::HashSet<u64> = changes.iter().map(|(v, _)| *v).filter(|v| in_span(*v)).collect();
+    if seen.len() as u64 != span {
+        return None;
+    }
+    let connected = |n: NodeId| -> bool {
+        let mut cur = Some(n);
+        while let Some(x) = cur {
+            if x == Document::ROOT {
+                return true;
+            }
+            cur = doc.parent(x);
+        }
+        false
+    };
+    let mut self_only = std::collections::HashSet::new();
+    let mut subtree = std::collections::HashSet::new();
+    for (v, ch) in changes {
+        if !in_span(*v) {
+            continue;
+        }
+        match ch {
+            Change::Children { parent, added } => {
+                let p = NodeId(*parent);
+                if !connected(p) {
+                    continue; // a detached tree: it is cascaded when it is inserted (an `added` root then)
+                }
+                if doc.element(p).is_none() {
+                    return None; // the document's own children
+                }
+                for a in added {
+                    let a = NodeId(*a);
+                    if doc.element(a).is_some() && connected(a) {
+                        subtree.insert(a);
+                    }
+                }
+                if set.siblings {
+                    subtree.insert(p);
+                }
+                if !reach_into(doc, p, set.empty, &mut self_only, &mut subtree) {
+                    return None;
+                }
+            }
+            Change::Attribute { el, name, old, new } => {
+                let e = NodeId(*el);
+                if doc.element(e).is_none() || !connected(e) {
+                    continue;
+                }
+                let r = set.attribute(name, old.as_deref(), new.as_deref());
+                if !reach_into(doc, e, r, &mut self_only, &mut subtree) {
+                    return None;
+                }
+            }
+            Change::Text { node } => {
+                let t = NodeId(*node);
+                if !connected(t) {
+                    continue;
+                }
+                if let Some(p) = doc.parent_element(t) {
+                    if !reach_into(doc, p, set.empty, &mut self_only, &mut subtree) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    // The states the engine drives: the elements whose state flipped since the last cascade.
+    let chain = |f: Option<NodeId>| -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut cur = f.filter(|f| doc.element(*f).is_some());
+        while let Some(x) = cur {
+            out.push(x);
+            cur = doc.parent_element(x);
+        }
+        out
+    };
+    for (s, r) in &set.states {
+        let flipped: Vec<NodeId> = match s {
+            S::Hover if prev.hover.as_slice() != hover => {
+                prev.hover.iter().filter(|x| !hover.contains(*x)).chain(hover.iter().filter(|x| !prev.hover.contains(*x))).copied().collect()
+            }
+            S::Focus if prev.focused != focused => [prev.focused, focused].into_iter().flatten().collect(),
+            S::FocusVisible if prev.focused != focused || prev.pointer_focus != pointer_focus => {
+                [prev.focused, focused].into_iter().flatten().collect()
+            }
+            S::FocusWithin if prev.focused != focused => {
+                let (a, b) = (chain(prev.focused), chain(focused));
+                a.iter().filter(|x| !b.contains(*x)).chain(b.iter().filter(|x| !a.contains(*x))).copied().collect()
+            }
+            // Custom element definitions change without a recorded DOM change.
+            S::Defined => return None,
+            // Every other host-driven state is `dom::El::state`'s `html_state` fallback, which answers false for
+            // it whatever the document does: nothing can flip it.
+            _ => Vec::new(),
+        };
+        for x in flipped {
+            if doc.element(x).is_some() && connected(x) && !reach_into(doc, x, *r, &mut self_only, &mut subtree) {
+                return None;
+            }
+        }
+    }
+    Some((self_only, subtree))
 }
 
 thread_local! {

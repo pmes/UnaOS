@@ -761,6 +761,13 @@ pub fn ensure_pre_insert_validity(vm: &mut Vm, node: usize, parent: usize, child
     ensure_validity(vm, node, parent, child, false)
 }
 
+/// AETHERPAINTPERF (SR130): records the DOM change the `touch()` just before it counted, under the DOM version
+/// that `touch()` bumped to (the engine's scoped restyle turns the changes into dirty roots and cascades the whole
+/// document when a version carries none: css/mod.rs `restyle_plan`).
+fn restyle_root(change: crate::css::Change) {
+    crate::css::note_change(page(|p| p.version), change);
+}
+
 /// DOM "insert" (§4.2.3): `node` (or a fragment's children) into `parent` before `child`.
 pub fn insert(vm: &mut Vm, node: usize, parent: usize, child: Option<usize>) {
     let nodes: Vec<usize> = if kind(node) == NK::Fragment { children_of(node) } else { vec![node] };
@@ -784,6 +791,7 @@ pub fn insert(vm: &mut Vm, node: usize, parent: usize, child: Option<usize>) {
     let ids: Vec<NodeId> = nodes.iter().map(|&n| NodeId(n)).collect();
     with_doc(|d| crate::dom::inserted_steps(d, NodeId(parent), &ids, prev, child.map(NodeId)));
     touch();
+    restyle_root(crate::css::Change::Children { parent, added: nodes.clone() });
     // Post-insertion steps: scripts that became connected are prepared (HTML §4.12.1).
     for &n in &nodes {
         super::loader::node_inserted(vm, n);
@@ -814,6 +822,7 @@ pub fn remove(vm: &mut Vm, node: usize) {
     }
     detach_node(node);
     touch();
+    restyle_root(crate::css::Change::Children { parent, added: Vec::new() });
     super::loader::children_changed(vm, parent);
     super::mutation::settle(vm);
 }
@@ -848,6 +857,7 @@ pub fn replace_child(vm: &mut Vm, child: usize, node: usize, parent: usize) -> J
     drop(guard);
     with_doc(|d| crate::dom::mutation::tree_record(d, NodeId(parent), added, vec![NodeId(child)], prev, reference.map(NodeId)));
     touch();
+    restyle_root(crate::css::Change::Children { parent, added: Vec::new() });
     super::mutation::settle(vm);
     Ok(child)
 }
@@ -872,6 +882,7 @@ pub fn replace_all(vm: &mut Vm, node: Option<usize>, parent: usize) {
         detach_node(*k);
     }
     touch();
+    restyle_root(crate::css::Change::Children { parent, added: Vec::new() });
     if let Some(n) = node {
         insert(vm, n, parent, None);
     } else if !kids.is_empty() {
@@ -1144,6 +1155,7 @@ fn normalize(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     if changed {
         touch();
+        restyle_root(crate::css::Change::Children { parent: n, added: Vec::new() });
     }
     Ok(Value::Undefined)
 }
@@ -1599,6 +1611,7 @@ pub fn replace_data(vm: &mut Vm, n: usize, offset: u32, count: u32, data: &str) 
     with_doc_mut(|d| set_char_data(d, n, from_utf16(&out)));
     super::range::replaced_data(n, offset, count, added_len);
     touch();
+    restyle_root(crate::css::Change::Text { node: n });
     if let Some(p) = parent_of(n) {
         super::loader::children_changed(vm, p);
     }
@@ -1728,6 +1741,7 @@ pub fn split_text_at(vm: &mut Vm, n: usize, o: u32) -> JsResult<usize> {
     replace_data(vm, n, o, len - o, "")?;
     if let Some(p) = parent {
         touch();
+        restyle_root(crate::css::Change::Children { parent: p, added: vec![new_node] });
         super::loader::children_changed(vm, p);
     }
     Ok(new_node)
@@ -1852,6 +1866,7 @@ pub fn attr_at(el: usize, i: usize) -> Option<Attribute> {
 /// HTML "attribute change steps" hook: event handler attributes, form-control default values.
 fn attribute_changed(vm: &mut Vm, el: usize, local: &str, ns: Namespace, old: Option<String>, new: Option<String>) {
     touch();
+    restyle_root(crate::css::Change::Attribute { el, name: local.to_string(), old: old.clone(), new: new.clone() });
     with_doc(|d| crate::dom::attribute_steps(d, NodeId(el), local, ns, old.clone(), new.clone()));
     if ns == Namespace::None {
         super::controls::attribute_changed(el, local, &old, &new);
@@ -2729,6 +2744,7 @@ fn adopt_node(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if let Some(p) = parent_of(n) {
         detach_node(n);
         touch();
+        restyle_root(crate::css::Change::Children { parent: p, added: Vec::new() });
         super::loader::children_changed(vm, p);
     }
     adopt(n, d);
@@ -3055,6 +3071,7 @@ fn set_attribute_node_impl(vm: &mut Vm, el: usize, a: Obj) -> JsResult<Value> {
         unroot(vm, oldr);
     }
     touch();
+    restyle_root(crate::css::Change::Attribute { el, name: local.clone(), old: old.clone(), new: Some(value.clone()) });
     if nse == Namespace::None && local.starts_with("on") {
         super::events::handler_attribute_changed(vm, el, &local[2..], true);
     }

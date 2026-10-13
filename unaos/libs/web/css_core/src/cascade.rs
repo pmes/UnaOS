@@ -25,6 +25,11 @@ use crate::parser::Declaration;
 use crate::selectors::{Combinator, Namespaces, PseudoElement, Selector, Simple, Specificity};
 use crate::stylesheet::{CssRule, FontFace, Keyframes, StyleRule, Stylesheet};
 
+/// AETHERPAINTPERF (SR130): invalidation sets over a rule set's selectors (declared here, beside the rule hash
+/// it complements, so the crate root's module list stays as it is).
+#[path = "invalidation.rs"]
+pub mod invalidation;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Origin {
     UserAgent,
@@ -399,6 +404,11 @@ impl<'a> RuleSet<'a> {
 
     pub fn index(&self) -> Option<&RuleIndex> {
         self.index.as_ref()
+    }
+
+    /// AETHERPAINTPERF (SR130): what a DOM change can re-match under these rules ([`invalidation::InvalidationSet`]).
+    pub fn invalidation(&self) -> invalidation::InvalidationSet {
+        invalidation::InvalidationSet::of(self.entries.iter().map(|e| e.selector))
     }
 
     /// Some entry is conditioned on `@container` (the caller lays out once and cascades again with sizes).

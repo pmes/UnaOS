@@ -26,6 +26,8 @@ pub mod frames;
 pub mod chrome;
 // AETHERDEVTOOLS (SR112): the developer-tools pane — a std reader of the engine, beside the std-free chrome model.
 pub mod devtools;
+// AETHERPAINTPERF (SR130): the work counters (`perf::counters()`) and the scoping switch.
+pub mod perf;
 
 #[cfg(test)]
 mod engine_tests;
@@ -259,7 +261,9 @@ impl AetherEngine {
         let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
         media::scan(&document, &base);
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
-        css::apply_stylesheets(&mut layout_tree, &self.stylesheets);
+        // AETHERPAINTPERF (SR130): the restyle re-cascades only what the DOM changes since the last one can re-match.
+        let hover: Vec<html_core::NodeId> = self.hover_path.iter().map(|n| n.id()).collect();
+        css::apply_stylesheets_scoped(&mut layout_tree, &self.stylesheets, &hover);
         self.layout_tree = Some(layout_tree);
         self.layout_epoch += 1;
         self.needs_repaint = true;
@@ -1868,7 +1872,9 @@ impl AetherEngine {
         media::scan(&document, url);
 
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
-        css::apply_stylesheets(&mut layout_tree, &sheets);
+        // AETHERPAINTPERF (SR130): a new document's first cascade is whole and records itself for the restyles after it.
+        css::forget_restyle();
+        css::apply_stylesheets_scoped(&mut layout_tree, &sheets, &[]);
         self.stylesheets = sheets;
         
         self.document = Some(document);
@@ -1937,6 +1943,7 @@ impl AetherEngine {
             }
         }
         
+        crate::perf::end_frame(); // AETHERPAINTPERF (SR130): this frame's counts (the wire line under AETHER_PERF=1)
         if damages.is_empty() {
             vec![(0, 0, self.width, self.height)]
         } else {
