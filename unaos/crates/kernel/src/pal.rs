@@ -343,7 +343,7 @@ pub mod cursor {
     // exact release position, unthrottled); this level is the BELT under it, consulted by the
     // routing tail on every motion report, and it cannot be missed because every report writes it.
     /// Whether the pointer's PRIMARY button is currently held, as of the most recent HID report.
-    /// Written by every pointer parse path; false before the first report.
+    /// Written by `push_locked` for every queued `Event::Button` (DRAGNOMOVE), and per report by EHCI.
     static BUTTON_DOWN: AtomicBool = AtomicBool::new(false);
 
     /// DRAGREL — publish the primary button's CURRENT level. Called from every pointer report,
@@ -1221,7 +1221,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
         event,
         Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_) | Event::Wheel(_)
     );
-    let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
+    let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_)); if let Event::Button(mask) = event { cursor::set_button_level(mask & 0x01 != 0); } // DRAGNOMOVE (rmbp-ledger B620) — THE ONE SEAM FOR THE PRIMARY LEVEL. Every `Event::Button` any producer queues (xHCI boot mouse/tablet, BT HID, the trackpad gesture taps, the EHCI paths, the synthesised releases) publishes `mask & 1` HERE, BEFORE `q.push` below — the ARC D M1 order (level first, then the edge; a synthesised release lowers it first because its own `Button(0)` passes this line first). Flight 34 boot 2 (USB mouse on xHCI): only `ehci::note_buttons` ever wrote the level, so it read UP from the first motion after a mouse press and the x86 drag belt cancelled every grab `release-level` before one steer (two grabs then read as a title double-click: Lumen zoomed). In `push_locked` and not `EventQueue::push`, so the re-circulation seam (`requeue_event`) never re-publishes a stale level. ⚠ LINE-NEUTRAL fold, code before the comment.
     // APPCLIP — **THE THIRD KIND.** `Event::Action` is neither `is_ptr` nor `is_key`, and it is
     // counted in NEITHER of the UVUG-10 class counters — nor, symmetrically, in `EVQ_POP` when it is
     // drained (see [`pop_event`]). That symmetry is the whole of the decision and it is the

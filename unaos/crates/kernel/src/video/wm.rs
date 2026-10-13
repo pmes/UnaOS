@@ -29639,9 +29639,9 @@ pub fn frame_at(x: i32, y: i32, skip: WinId) -> Option<(WinId, usize, usize, usi
 // `drag_cancel` call `resize_finish`, which prints `[wm-act] resize win= from=WxH to=WxH zone=`.
 // =================================================================================================
 
-/// WINRESIZE — edge band depth, panel px (clipped to the chrome: the content is never taken).
+/// WINRESIZE — edge band depth, BASE (96-ppi) px, scaled by `ui::px` in `rs_zone_of` (clipped to the chrome: the content is never taken).
 pub const RS_EDGE: usize = 6;
-/// WINRESIZE — corner square, panel px.
+/// WINRESIZE — corner square, BASE (96-ppi) px, scaled by `ui::px` in `rs_zone_of`.
 pub const RS_CORNER: usize = 12;
 /// WINRESIZE — minimum content size in SOURCE px. Width clears the control cluster (148 px floor).
 pub const RS_MIN_W: usize = 160;
@@ -29672,19 +29672,19 @@ fn rs_zone_of(ob: (usize, usize, usize, usize), cb: (usize, usize, usize, usize)
     if !in_box(px, py, ob) || in_box(px, py, cb) {
         return 0;
     }
-    let (bx, by, bw, bh) = ob;
+    let (bx, by, bw, bh) = ob; let (corner, edge) = (crate::ui::px(RS_CORNER), crate::ui::px(RS_EDGE)); // DRAGNOMOVE (B620, R117 read): the bands are BASE (96-ppi) px scaled like the frame they sit in — at the rMBP's 2x the frame is 10 device px and the old raw 6 px edge / 12 px corner were 3 / 6 logical px. ⚠ LINE-NEUTRAL fold.
     let (dl, dr, dt, db) = (px - bx, bx + bw - 1 - px, py - by, by + bh - 1 - py);
-    let (nl, nr, nt, nb) = (dl < RS_CORNER, dr < RS_CORNER, dt < RS_CORNER, db < RS_CORNER);
+    let (nl, nr, nt, nb) = (dl < corner, dr < corner, dt < corner, db < corner);
     if (nl || nr) && (nt || nb) {
         return (if nl { RS_L } else { RS_R }) | (if nt { RS_T } else { RS_B });
     }
-    if dt < RS_EDGE { return RS_T; }
-    if db < RS_EDGE { return RS_B; }
+    if dt < edge { return RS_T; }
+    if db < edge { return RS_B; }
     // The side bands stop at the title strip: the strip is the drag handle (`title_bar_hit`), and only
     // its corners (above) are resize.
     if py >= cb.1 {
-        if dl < RS_EDGE { return RS_L; }
-        if dr < RS_EDGE { return RS_R; }
+        if dl < edge { return RS_L; }
+        if dr < edge { return RS_R; }
     }
     0
 }

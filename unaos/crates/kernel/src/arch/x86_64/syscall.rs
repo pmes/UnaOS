@@ -6652,7 +6652,7 @@ pub fn wc_drag_motion() {
     // of that motion, so every motion drained while `pend != 0` is from an earlier report. The two
     // halves are one fix; neither is correct alone, and `swap=` on the `[dragrel]` line is how a
     // capture says the producer half fired.
-    if !crate::pal::cursor::button_down() {
+    if !crate::pal::cursor::button_down() { // DRAGNOMOVE (B620): this level is published by `pal::push_locked` for EVERY queued `Button` (xHCI mouse, BT, taps), not by `ehci::note_buttons` alone — flight 34's USB mouse read UP here on its first steer and every grab ended `release-level`.
         let now = crate::arch::ticks();
         let held = DRAG_LEVEL_UP_MS.load(Ordering::Relaxed);
         if held == 0 {
@@ -17543,7 +17543,7 @@ fn winx_launcher(demo_cpu: usize) {
     #[cfg(feature = "witness")]
     crate::tests::register("ptrdead", || { ptrdead_selftest(); lockfix_b1_selftest(); });// LOCKFIX-B1 — the input band's panel read driven across a HELD `WRITER` (rmbp-ledger B1). A BLOCK under the line above's `cfg`, so no line is added and no panic `Location` below moves — `apppin_selftest`'s fold at this ladder's tail is the pattern. Shares `ptrdead`'s cfg exactly and wants no more: it needs neither `wc` nor a window, only `WRITER` and `click_pointer_pos`, both compiled in every x86 build. PLACED HERE for the same reason `ptrdead` is the least disruptive fixture in the ladder — this one mints no row, touches no window table, moves no pointer and posts no event; it takes one lock, releases it, and reads a counter. The only ordering it needs is "after the pointer position is set", which every fixture above it has already done, and which is why its `(x,y)` is an OBSERVATION rather than an assertion (see the function's own note).
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("wmdirect", wmdirect_selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winsnap", crate::video::wm::winsnap::selftest); // WINSNAP fixture (video/winsnap.rs) crate::tests::register("winresize", winresize_selftest); // WINRESIZE (R75)
+    crate::tests::register("wmdirect", wmdirect_selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winsnap", crate::video::wm::winsnap::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winresize", winresize_selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("dragmouse", dragmouse_selftest); // WINSNAP fixture (video/winsnap.rs). WINRESIZE (R75) — DRAGNOMOVE (B620): its registration sat AFTER this line's `//` (a comment, compiled nothing — LEDGER P7), so `tests winresize` never existed and x86-wc.spec's `:: WINRESIZE: zones=8` REQUIRE had no producer; moved before it. DRAGMOUSE (B620) — the xHCI-mouse drag, press/steer/release through `pal::push_pointer_report` with NO `set_button_level`, file tail.
     // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in
     // two overlapping groups, banded seeds driven with the REAL sprite parked on the three-way
     // stack: the boot-8 wedge class (banded drags + cursor-repaint storm under overlap) is only
@@ -31543,4 +31543,157 @@ fn sys_audio_pos(handle: u64, what: u64) -> i64 {
         let _ = (handle, what);
         una_abi::EBADF
     }
+}
+
+// =================================================================================================
+// DRAGMOUSE (rmbp-ledger B620, DRAGNOMOVE) — TAIL-APPENDED so no `Location` above moves. `tests dragmouse`.
+// =================================================================================================
+
+/// DRAGMOUSE — the drag that failed on the glass, in the shape the xHCI boot-mouse path produces it.
+///
+/// Flight 34 boot 2 (`docs/dev/evidence/dragnomove/DRAGNOMOVE.md`): every title-bar grab with the USB
+/// mouse read `drag-begin … -> grabbed` then `drag-cancel … -> release-level` at a settle point that
+/// never changed — the drag belt in [`wc_route_tail`] asked `pal::cursor::button_down()`, and the only
+/// writer of that level was `ehci::note_buttons`. `drivers/xhci/mod.rs` queues `Event::Button(buttons)`
+/// through `pal::push_pointer_report` and nothing else, so the level read UP and the belt cancelled the
+/// grab on its first steering motion.
+///
+/// Every `wmdirect` leg that drags calls `set_button_level` itself, which is exactly why none of them
+/// could see this. This fixture calls it ONCE, to lower the level to a known baseline before the
+/// gesture (otherwise a level some earlier fixture left raised would pass the pre-fix tree); the
+/// press, the steer and the release then go through `pal::push_pointer_report` and nothing else, the
+/// way the xHCI decode pushes them, and the drain is the router's own (`wc_route_event` +
+/// `wc_route_tail`). The ring is HELD (PTRLEAK) so `x86_input_service` cannot take the events.
+///
+/// Conjuncts, and which are red on the pre-fix tree:
+///  * `press_level` — the queued press published the level. **Red pre-fix** (nothing wrote it).
+///  * `grabbed` — the routed press started a drag on the probe row.
+///  * `live` — after one routed steering motion the drag is STILL live, i.e. the belt did not cancel
+///    it. **Red pre-fix**: the `release-level` cancel Peter saw as "it won't drag".
+///  * `release_level` — the queued release lowered the level.
+///  * `ended` / `rest` — the release edge ended the gesture with the row at the +24 the hand steered to
+///    (a `drag-end … -> placed`); pre-fix it was cancelled at the grab point and `rest` is red too.
+///
+/// One verdict line: `[wm-act] dragmouse press_level=<b> grabbed=<b> live=<b> release_level=<b>
+/// ended=<b> rest=<b> at=(x,y) want=(x,y) discarded=<n> -> PASS|FAIL`.
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn dragmouse_selftest() {
+    use crate::pal::Event;
+    use crate::video::wm;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[wm-act] dragmouse -> SKIP (framebuffer not ready)");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 256 || ph < 256 {
+        serial_println!("[wm-act] dragmouse -> SKIP (panel {}x{} too small)", pw, ph);
+        return;
+    }
+    // `wmdirect`'s ring-3-band key (slot 2): the press focuses the dragged row's owner, and a
+    // ring-3 owner is the case whose steering motions are packed into its ring — the real Lumen shape.
+    const OWNER: u64 = 3;
+    let s = &raw const WMD_SURF as usize;
+    let len = core::mem::size_of_val(&WMD_SURF);
+    let w = wm::create(OWNER, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wdm");
+    if w == wm::WIN_NONE {
+        serial_println!("[wm-act] dragmouse -> SKIP (window table full)");
+        return;
+    }
+    let saved_focus = user_input_active();
+    user_input_set_active(OWNER);
+    wm::focus_changed(OWNER);
+    wm::move_to(w, pw / 3, ph / 3 + wm::TITLE_H() + wm::BORDER());
+    let Some(i) = wm::info(w) else {
+        serial_println!("[wm-act] dragmouse -> SKIP (row vanished)");
+        wm::close(w);
+        user_input_set_active(saved_focus);
+        return;
+    };
+    // `wmdirect`'s title-strip point: one pixel inside the left border, mid-strip — drag, not a
+    // control and not a resize zone.
+    let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H() / 2 - wm::BORDER()) as i32);
+    let hid = |v: i32, span: usize| -> i32 { ((v as i64 * 32767) / (span.max(1) as i64 - 1).max(1)) as i32 };
+    let dbl_was = wm::DBL_OFF.swap(true, Ordering::Relaxed);
+    crate::pal::fixture_ring_hold(true);
+    for _ in 0..8 {
+        if crate::pal::release_edge_pending() == 0 {
+            break;
+        }
+        crate::pal::note_release_edge_drained();
+    }
+    let mut discarded = 0u32;
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+        discarded += 1;
+    }
+    // The BASELINE, not the press: see the doc comment.
+    crate::pal::cursor::set_button_level(false);
+    crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
+    // PRESS — one xHCI report: no motion, the edge alone.
+    crate::pal::push_pointer_report(None, Some(Event::Button(1)));
+    let press_level = crate::pal::cursor::button_down();
+    // The press is routed with the EXACT strip pixel (`wmdirect`'s rule: the HID round trip can round
+    // a pixel off the one-pixel-inside point).
+    let press_ev = crate::pal::next_event();
+    if matches!(press_ev, Some(Event::Button(1))) {
+        let _ = wc_click_route_at(Event::Button(1), px, py);
+    }
+    let grabbed = wm::drag_active() == w;
+    // STEER — one motion-only report, popped and routed by the drain exactly as a real report is.
+    crate::pal::push_pointer_report(Some(Event::MouseAbsolute { x: hid(px + 24, pw), y: hid(py + 24, ph) }), None);
+    let _ = drain_and_route(8);
+    let live = wm::drag_active() == w;
+    // RELEASE — one report: its own lift (+27) and the edge, paired as the xHCI decode pairs them.
+    crate::pal::push_pointer_report(Some(Event::MouseAbsolute { x: hid(px + 27, pw), y: hid(py + 27, ph) }), Some(Event::Button(0)));
+    let release_level = !crate::pal::cursor::button_down();
+    let _ = drain_until_drag_ends();
+    let ended = wm::drag_active() == wm::WIN_NONE;
+    let at = wm::info(w).map(|r| (r.x, r.y));
+    let rest = at == Some((i.x + 24, i.y + 24));
+    // Clean up: no drag, no event and no counted edge outlives the fixture.
+    if wm::drag_active() != wm::WIN_NONE {
+        wm::drag_cancel("fixture");
+    }
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+    }
+    for _ in 0..8 {
+        if crate::pal::release_edge_pending() == 0 {
+            break;
+        }
+        crate::pal::note_release_edge_drained();
+    }
+    crate::pal::fixture_ring_hold(false);
+    wm::DBL_OFF.store(dbl_was, Ordering::Relaxed);
+    let ok = press_level && grabbed && live && release_level && ended && rest;
+    serial_println!(
+        "[wm-act] dragmouse press_level={} grabbed={} live={} release_level={} ended={} rest={} at={:?} want=({},{}) discarded={} -> {}",
+        press_level,
+        grabbed,
+        live,
+        release_level,
+        ended,
+        rest,
+        at,
+        i.x + 24,
+        i.y + 24,
+        discarded,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    wm::close(w);
+    user_input_set_active(saved_focus);
+    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+    wm::focus_reset();
 }
