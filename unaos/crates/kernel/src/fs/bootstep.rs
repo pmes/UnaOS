@@ -566,7 +566,7 @@ pub fn splash_selftest() {
         serial_println!(":: SPLASH: steps=0 slowest=none over={} live={} watch={} -> SKIP reason=no-steps ::", over, live, watch);
         return;
     }
-    let ok = over == 0 && live == 0;
+    let ok = over == 0 && live == 0; #[cfg(all(target_arch = "x86_64", feature = "wc"))] let owed = crate::video::wm::fbdirect::owed_splash(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let ok = ok && owed == 0; #[cfg(all(target_arch = "x86_64", feature = "wc"))] let watch_fb = alloc::format!("{} cleared={} rects={} owed={}", watch, if owed == 0 { "damage" } else { "owed" }, crate::video::wm::fbdirect::handed(), owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let watch = watch_fb.as_str(); // FBDIRECT (B536): the splash's direct paints (the stage word, the OVER line) handed back to the compositor — `cleared=damage rects=<n> owed=0`; a band still owed is FAIL. Folded here, LINE-NEUTRAL: the knob-off line keeps its bytes
     serial_println!(
         ":: SPLASH: steps={} slowest={}:{} over={} live={} watch={} -> {} ::",
         n, name, ms, over, live, watch, if ok { "PASS" } else { "FAIL" }

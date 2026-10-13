@@ -30447,3 +30447,12 @@ pub fn app_name_arm_launch(owner: u64, path: &str) -> bool {
     serial_println!("[wm] launch-name owner={} path={} name={} via={} armed={}", owner, path, name, via, armed as u8);
     armed
 }
+
+/// FBDIRECT (rmbp-ledger B536) — the registry of direct-framebuffer paints (the PUMPWEDGE / TESTWATCH bands, the
+/// splash's stage word and OVER line) and their hand-back to this compositor: `note` on paint, `clear` (a
+/// `damage_intersecting` + `screen::request_present_rect`, never a fill) at the paint's end, `expose_all` at a screen
+/// open. Declared at this file's tail under the watch bands' gate, `#[path]` resolving beside this file
+/// (`video/fbdirect.rs`, crystal.rs's `login` precedent), so `video/mod.rs` does not move; cfg-erased knob-off.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[path = "fbdirect.rs"]
+pub mod fbdirect;
