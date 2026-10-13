@@ -1338,6 +1338,52 @@ pub fn synthetic_click(vm: &mut Vm, n: usize) {
     click_with_activation(vm, n, false);
 }
 
+/// AETHERWPT3 (SR138): a trusted PointerEvent of the engine's mouse pointer (Pointer Events §4.1: pointerId 1,
+/// `pointerType` "mouse", primary, 1×1, pressure 0.5 while a button is down) at `n`. `pointerenter` /
+/// `pointerleave` neither bubble nor cancel; `gotpointercapture` / `lostpointercapture` bubble and do not
+/// cancel; the rest bubble and cancel; all but the boundary pair are composed. Returns (not canceled, ran).
+pub fn pointer_event(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64), button: i32, buttons: u16, related: Option<usize>) -> (bool, bool) {
+    if super::engine_poisoned() {
+        return (true, false);
+    }
+    let boundary = matches!(ty, "pointerenter" | "pointerleave");
+    let capture = matches!(ty, "gotpointercapture" | "lostpointercapture");
+    let init = vm.new_plain_object();
+    let ri = root(vm, Value::Object(init));
+    let g = Value::Object(vm.realm().global);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("view"), g);
+    for (k, v) in [
+        ("clientX", client.0),
+        ("clientY", client.1),
+        ("screenX", client.0),
+        ("screenY", client.1),
+        ("button", button as f64),
+        ("buttons", buttons as f64),
+        ("pointerId", super::pointer::MOUSE_ID as f64),
+        ("width", 1.0),
+        ("height", 1.0),
+        ("pressure", if buttons != 0 { 0.5 } else { 0.0 }),
+    ] {
+        let _ = vm.create_data_property(init, PropertyKey::from_str(k), num(v));
+    }
+    let _ = vm.create_data_property(init, PropertyKey::from_str("pointerType"), s("mouse"));
+    let _ = vm.create_data_property(init, PropertyKey::from_str("isPrimary"), Value::Bool(true));
+    let rel = match related {
+        Some(r) => target_value(vm, TargetKey::Node(r)),
+        None => Value::Null,
+    };
+    let _ = vm.create_data_property(init, PropertyKey::from_str("relatedTarget"), rel);
+    let e = new_event(vm, "PointerEvent", ty, !boundary, !boundary && !capture, Some(init));
+    if !boundary {
+        set_flag(vm, e, F_COMPOSED, true);
+    }
+    let r = root(vm, Value::Object(e));
+    let out = dispatch(vm, e, TargetKey::Node(n));
+    unroot(vm, r);
+    unroot(vm, ri);
+    out
+}
+
 /// A trusted pointer-motion event at element `n` (UI Events §5.3, AETHERHOVER SR67): `mousemove`,
 /// `mouseover` and `mouseout` bubble, are cancelable and composed; `mouseenter` and `mouseleave` do
 /// neither (§5.3.4: the engine fires one per element entered / left, so an ancestor's listener hears its
@@ -1348,6 +1394,30 @@ pub fn user_mouse(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64), related: 
     if super::engine_poisoned() {
         return false;
     }
+    // AETHERWPT3 (SR138): Pointer Events §11 — the pointer event first, at the pointer capture target when
+    // there is one (boundary events are not fired while captured); a canceled pointerdown suppresses the
+    // compatibility mousemove until the release.
+    let pid = super::pointer::MOUSE_ID;
+    let n = if ty == "mousemove" {
+        super::pointer::process_pending(vm, pid, client);
+        let t = super::pointer::capture_target(pid).unwrap_or(n);
+        pointer_event(vm, t, "pointermove", client, -1, super::pointer::buttons(), None);
+        if super::pointer::prevent_mouse() {
+            return false;
+        }
+        t
+    } else {
+        if super::pointer::capture_target(pid).is_none() {
+            let pty = match ty {
+                "mouseover" => "pointerover",
+                "mouseout" => "pointerout",
+                "mouseenter" => "pointerenter",
+                _ => "pointerleave",
+            };
+            pointer_event(vm, n, pty, client, -1, super::pointer::buttons(), related);
+        }
+        n
+    };
     let boundary_pair = matches!(ty, "mouseenter" | "mouseleave");
     let init = vm.new_plain_object();
     let ri = root(vm, Value::Object(init));
@@ -1378,6 +1448,36 @@ pub fn user_button(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64)) -> bool 
         return true;
     }
     let n = if dom::kind(n) == dom::NK::Element { n } else { parent_of(n).unwrap_or(n) };
+    // AETHERWPT3 (SR138): Pointer Events §11.1 — pointerdown / pointerup first, at the capture target when
+    // captured (the compatibility mouse event follows it there); a canceled pointerdown suppresses the
+    // compatibility mousedown / mouseup; after pointerup the capture is implicitly released (§10.3).
+    let pid = super::pointer::MOUSE_ID;
+    let n = if ty == "mousedown" {
+        super::pointer::process_pending(vm, pid, client);
+        let t = super::pointer::capture_target(pid).unwrap_or(n);
+        super::pointer::down(pid, super::pointer::Kind::Mouse, t);
+        let (ok, _) = pointer_event(vm, t, "pointerdown", client, 0, super::pointer::buttons(), None);
+        if !ok {
+            super::pointer::set_prevent_mouse(true);
+            return true;
+        }
+        t
+    } else {
+        super::pointer::up(pid);
+        super::pointer::process_pending(vm, pid, client);
+        let t = super::pointer::capture_target(pid).unwrap_or(n);
+        pointer_event(vm, t, "pointerup", client, 0, 0, None);
+        let prevented = super::pointer::prevent_mouse();
+        super::pointer::set_prevent_mouse(false);
+        let ok = if prevented { true } else { mouse_button(vm, t, ty, client) };
+        super::pointer::implicit_release(vm, pid, client);
+        return ok;
+    };
+    mouse_button(vm, n, ty, client)
+}
+
+/// The compatibility `mousedown` / `mouseup` of [`user_button`].
+fn mouse_button(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64)) -> bool {
     let init = vm.new_plain_object();
     let ri = root(vm, Value::Object(init));
     let buttons = if ty == "mousedown" { 1.0 } else { 0.0 };

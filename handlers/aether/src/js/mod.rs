@@ -64,6 +64,8 @@ pub mod internals;
 pub mod loader;
 pub mod locks;
 pub mod mutation;
+/// AETHERWPT3 (SR138): pointer capture (Pointer Events §10).
+pub mod pointer;
 /// AETHERMEDIA2 (SR134): Media Source Extensions.
 pub mod mse;
 pub mod ports;
@@ -783,6 +785,7 @@ impl Engine {
         crate::dom::mutation::reset();
         crate::dom::custom::reset(document.arena());
         internals::reset();
+        pointer::reset();
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
         vm.track_rejections = true;
@@ -808,6 +811,7 @@ impl Engine {
         mutation::install(&mut vm);
         custom::install(&mut vm);
         internals::install(&mut vm);
+        pointer::install(&mut vm);
         canvas::install(&mut vm);
         // AETHERSTORAGE (SR94): the inbox and serializer first, then the APIs that use them.
         broadcast::install(&mut vm);

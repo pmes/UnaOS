@@ -343,3 +343,45 @@ R.push(log.join(','));
         r#"assoc:f|true|1|true|1|true|n=v1|a=1&b=2|TypeError|true|true|false|"need\nmore"|false|false|assoc:f,disabled:true|false|assoc:f,disabled:true,disabled:false,reset|true|1|true|Lab||NotSupportedError|NotSupportedError|NotSupportedError||assoc:f,disabled:true,disabled:false,reset,assoc:null"#
     );
 }
+
+/// O5 — Pointer Events §10 / §11: setPointerCapture's NotFoundError (no such pointer) and InvalidStateError
+/// (disconnected), no capture outside the active buttons state, then a real press (the engine's mouse, pointerId 1):
+/// pointerdown before the compatibility mousedown, capture taken in the pointerdown listener, `gotpointercapture`
+/// before the next pointer event, the move over another element retargeted to the capturing one (pointermove and
+/// mousemove), and the implicit release after pointerup (`lostpointercapture`).
+#[test]
+fn o5_pointer_capture() {
+    let mut e = aether::AetherEngine::new();
+    e.load_html(
+        "http://127.0.0.1:8000/wpt3.html",
+        &page(
+            r#"
+var log = [];
+var a = document.getElementById('a'), b = document.getElementById('b');
+['pointerdown', 'pointermove', 'pointerup', 'gotpointercapture', 'lostpointercapture', 'mousedown', 'mouseup', 'mousemove'].forEach(function (t) {
+    a.addEventListener(t, function (e) { log.push('a:' + e.type + (e.pointerId !== undefined ? ':' + e.pointerId + ':' + e.pointerType : '')); });
+    b.addEventListener(t, function (e) { log.push('b:' + e.type); });
+});
+a.addEventListener('pointerdown', function (e) { a.setPointerCapture(e.pointerId); log.push('has:' + a.hasPointerCapture(1)); });
+try { a.setPointerCapture(7); R.push('no throw'); } catch (e) { R.push(e.name); }
+try { document.createElement('div').setPointerCapture(1); R.push('no throw'); } catch (e) { R.push(e.name); }
+a.setPointerCapture(1);
+R.push(a.hasPointerCapture(1));
+"#,
+        )
+        .replace(
+            "<body>",
+            "<body style=\"margin:0\"><div id=\"a\" style=\"position:absolute;left:0;top:0;width:100px;height:100px\"></div><div id=\"b\" style=\"position:absolute;left:0;top:200px;width:100px;height:100px\"></div>",
+        ),
+        true,
+    );
+    use aether::api::events::Event;
+    e.handle_event(Event::Resize(400, 400));
+    e.handle_event(Event::MouseDown(10.0, 10.0));
+    e.handle_event(Event::MouseMove(10.0, 210.0));
+    e.handle_event(Event::MouseUp(10.0, 210.0));
+    assert_eq!(
+        eval(&mut e, "R.join('|') + ' / ' + log.join(',')"),
+        "NotFoundError|InvalidStateError|false / a:pointerdown:1:mouse,has:true,a:mousedown,a:gotpointercapture:1:mouse,a:pointermove:1:mouse,a:mousemove,a:pointerup:1:mouse,a:mouseup,a:lostpointercapture:1:mouse"
+    );
+}
