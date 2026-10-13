@@ -19,7 +19,7 @@
 //! R95 §2 / R110 precedent, each cited file:line (torvalds/linux master 24a19b95, fetched 2026-10-13). No code is
 //! copied. `h` = drivers/gpu/drm/i915/gt/intel_gpu_commands.h, `rc` = gt/gen7_renderclear.c, `rs` =
 //! gt/gen7_renderstate.c, `cs` = gt/gen6_engine_cs.c. R83 / R95 §2: a row whose `src` is `None` DECLINES the rung by
-//! name and nothing is written; every R9 row is filled. R10 (the first draw) is a table that declines by name.
+//! name and nothing is written; every R9 row is filled. R10 (the first draw, GEN7R10/B638) is `gen7_r10.rs`.
 
 use super::*;
 
@@ -455,57 +455,14 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
 }
 
 // =====================================================================================================================
-// R10 — the smallest DRAW. Designed (GEN7R9B.md §3); it DECLINES by name at the first uncited row and writes nothing.
-// gen7_renderclear.c's own clear is a MEDIA walker (rc:413 `PIPELINE_SELECT_MEDIA`, rc:426-427 MEDIA_OBJECT), not a
-// 3DPRIMITIVE; i915 names the render-target SURFACE_STATE fields and the binding table (rc:151-168, rc:183) but no
-// 3DSTATE_* field of the draw path, and the pixel shader is EU ISA no i915 file names. The executing path is written
-// row by row as each `src` fills, after R9's verified prefix (PIPELINE_SELECT(3D), SBA) on the same envelope.
+// R10 — the first DRAW (GEN7R10, B638). Its row table, stream and read-back live in `gen7_r10.rs`, a child of this
+// file so it reuses R9's encodings and helpers; GEN7R10.md carries every row page-cited against the IVB PRM.
 // =====================================================================================================================
 
-/// R10's rows in command-stream order after R9's prefix.
-const R10_PAGES: [Page; 22] = [
-    Page { name: "SURFACE_STATE", field: "rt", owed: "IVB-PRM-Vol4-Pt1", src: Some("rc:151-168") },
-    Page { name: "BINDING_TABLE", field: "bt", owed: "IVB-PRM-Vol4-Pt1", src: Some("rc:183") },
-    Page { name: "3DSTATE_PUSH_CONSTANT_ALLOC_VS", field: "pcalloc", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_URB_VS", field: "urb", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_VS", field: "vs", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_HS", field: "hs", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_TE", field: "te", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_DS", field: "ds", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_GS", field: "gs", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_STREAMOUT", field: "so", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_CLIP", field: "clip", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_SF", field: "sf", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_SBE", field: "sbe", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_WM", field: "wm", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_PS", field: "ps", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "EU-pixel-shader", field: "kernel", owed: "IVB-PRM-Vol4-Pt3", src: None },
-    Page { name: "3DSTATE_DEPTH_BUFFER", field: "depth", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_BINDING_TABLE_POINTERS_PS", field: "btp", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_DRAWING_RECTANGLE", field: "rect", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_VERTEX_BUFFERS", field: "vb", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DSTATE_VERTEX_ELEMENTS", field: "ve", owed: "IVB-PRM-Vol2-Pt1", src: None },
-    Page { name: "3DPRIMITIVE", field: "prim", owed: "IVB-PRM-Vol2-Pt1", src: None },
-];
+#[path = "gen7_r10.rs"]
+mod draw;
 
-/// R10 under `tests gen7`, after R9: gated on R9's verified run, then the table; one `[gen7] r10` line. Writes nothing.
+/// R10 under `tests gen7`, after R9's witness line: gated on R9's word, one `[gen7] r10` line.
 fn r10(r9: &str) {
-    let cited = R10_PAGES.iter().filter(|p| p.src.is_some()).count();
-    if r9 != "verified" {
-        serial_println!(
-            "[gen7] r10 draw=3dprimitive r9={} rows_cited={}/{} writes=0 -> GATED reason=r9-not-verified",
-            r9, cited, R10_PAGES.len()
-        );
-        return;
-    }
-    match R10_PAGES.iter().find(|p| p.src.is_none()) {
-        Some(p) => serial_println!(
-            "[gen7] r10 draw=3dprimitive r9={} rows_cited={}/{} writes=0 -> DECLINED reason=page-{}-uncited field={} owed={}",
-            r9, cited, R10_PAGES.len(), p.name, p.field, p.owed
-        ),
-        None => serial_println!(
-            "[gen7] r10 draw=3dprimitive r9={} rows_cited={}/{} writes=0 -> DECLINED reason=exec-path-unwritten",
-            r9, cited, R10_PAGES.len()
-        ),
-    }
+    draw::run(r9)
 }
