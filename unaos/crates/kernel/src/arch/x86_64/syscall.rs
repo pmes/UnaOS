@@ -5617,7 +5617,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Key(b) => (INPUT_EV_KEY_DOWN, b as u64),
         Event::KeyUp(b) => (INPUT_EV_KEY_UP, b as u64),
         Event::Mouse { x, y } => (INPUT_EV_MOUSE_REL, pack_xy(x, y)),
-        Event::MouseAbsolute { x, y } => (INPUT_EV_MOUSE_ABS, pack_xy(x, y)),
+        Event::MouseAbsolute { x, y } => (INPUT_EV_MOUSE_ABS, ptr_abs_payload_hid(x, y)), // AETHERPTR (B543) — the tablet's 0..=32767 coordinate leaves as the focused program's WINDOW px (una_abi::INPUT_EV_MOUSE_ABS's contract), never raw; fn at this file's tail. ⚠ LINE-NEUTRAL: edited in place.
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
         // WHEEL: the delta rides the low byte as a raw two's-complement i8 — ring 3 sign-extends
         // (`payload as u8 as i8`). Cast through `u8` first: `i8 as u64` would sign-extend to
@@ -5670,7 +5670,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     let Some(packed) = pack_input(ev) else {
         return false;
     };
-    let lag_seq = USER_INPUT_TAIL[slot].load(Ordering::Relaxed).wrapping_add(1); let ok = user_input_push(slot, packed); if ok { crate::video::lag::routed_ring(&ev, slot, lag_seq); } ok // GLASSLAG M1 (B370): the [lag] wm stage ends at the ring-3 delivery (same-line fold).
+    let lag_seq = USER_INPUT_TAIL[slot].load(Ordering::Relaxed).wrapping_add(1); let ok = user_input_push(slot, packed); if ok { crate::video::lag::routed_ring(&ev, slot, lag_seq); ptr_abs_follow(slot, &ev); } ok // GLASSLAG M1 (B370): the [lag] wm stage ends at the ring-3 delivery (same-line fold). AETHERPTR (B543): a delivered RELATIVE report is followed by one INPUT_EV_MOUSE_ABS in the program's window px (fn at this file's tail). ⚠ LINE-NEUTRAL append.
 }
 
 /// WINX-7 ROUTER FOLD POINT (public, in-lane) — the ONE line the shell's event drain needs.
@@ -30996,4 +30996,68 @@ fn sys_pathwrite(a0: u64, a1: u64) -> i64 {
         serial_println!("[pathwrite] path={} principal={} flags={:#x} off={} bytes={} -> errno={}", path, who, flags, off, data.len(), r);
     }
     r
+}
+
+// ---- AETHERPTR (rmbp-ledger B543) — INPUT_EV_MOUSE_ABS in WINDOW px: the x86 producer (file tail, line-neutral) ----
+//
+// Flight 32 (image 24, boot 2): "there's 2 mouse cursors". AETHER.ELF drew its own pointer from an estimate it moved
+// by MOUSE_REL deltas, because this producer handed ring 3 no position it could map into its window: a relative
+// report left as the delta alone, and a tablet's report as the device's raw 0..=32767 coordinate. The compositor's
+// sprite (`pal::cursor`, the one pointer on the glass) and the program's estimate drifted apart, and both showed.
+// The contract is written once, in `una_abi::INPUT_EV_MOUSE_ABS`: x/y are the system pointer's position in the
+// receiving program's surface pixels — panel position minus the content origin of the owner's frontmost window,
+// divided by its integer upscale, unclamped. These three fns are the producer half; `user_input_enqueue` and
+// `pack_input` reach them by same-line folds.
+
+/// The content origin and upscale of `owner`'s frontmost window, `(x, y, scale)` in panel px, or `None` for an owner
+/// with no live window row. `wm::front_of_owner` is the compositor's own z answer (the window a press raised is the
+/// frontmost); `wm::info` is one masked TABLE snapshot each — the router already takes that lock for `hit_test`.
+fn ptr_win_origin(owner: u64) -> Option<(i32, i32, i32)> {
+    #[cfg(feature = "wc")]
+    {
+        let id = crate::video::wm::front_of_owner(owner)?;
+        let i = crate::video::wm::info(id)?;
+        Some((i.x as i32, i.y as i32, i.scale.max(1) as i32))
+    }
+    #[cfg(not(feature = "wc"))]
+    {
+        let _ = owner;
+        None
+    }
+}
+
+/// Panel point `(px, py)` in `owner`'s window pixels (floor division, so a point left of / above the origin stays
+/// negative), or `None` when the owner has no window.
+fn ptr_win_px(owner: u64, px: i32, py: i32) -> Option<(i32, i32)> {
+    let (ox, oy, s) = ptr_win_origin(owner)?;
+    Some(((px - ox).div_euclid(s), (py - oy).div_euclid(s)))
+}
+
+/// `pack_input`'s `Event::MouseAbsolute` payload: the report scaled to the panel exactly as `pal::cursor::set_abs`
+/// scales it (that install runs after this, in `user_input_route`'s `track_routed`), then into the FOCUSED owner's
+/// window px; an owner with no window is handed the panel point. The panel is read through LOCKFIX's non-blocking
+/// door (this is the input band); refused, the point is the origin, the clamp an unset framebuffer gives.
+fn ptr_abs_payload_hid(ax: i32, ay: i32) -> u64 {
+    let (w, h) = crate::video::panel_info_nonblocking().map_or((0, 0), |i| (i.width as i32, i.height as i32));
+    let px = ((ax as i64 * w as i64) / 32767).clamp(0, (w - 1).max(0) as i64) as i32;
+    let py = ((ay as i64 * h as i64) / 32767).clamp(0, (h - 1).max(0) as i64) as i32;
+    let owner = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    let (x, y) = ptr_win_px(owner, px, py).unwrap_or((px, py));
+    una_abi::input_ev_xy_payload(x, y)
+}
+
+/// After a RELATIVE report reached `slot`'s ring: push one `INPUT_EV_MOUSE_ABS` with the system pointer in that
+/// program's window px. The pointer was already moved by this report — its producer installs it before either
+/// router sees it (`main.rs::x86_ptr_install`, PTRINSTALL2/3) — so `click_pointer_pos` (the point a click is
+/// addressed to) is the position the sprite shows. Only for an owner with a window: a windowless program's ring
+/// carries exactly what it carried before. Absolute values are self-correcting, so a push the full ring drops
+/// (drop-newest) costs nothing the next report does not restore.
+fn ptr_abs_follow(slot: usize, ev: &crate::pal::Event) {
+    if !matches!(ev, crate::pal::Event::Mouse { .. }) {
+        return;
+    }
+    let (px, py) = click_pointer_pos();
+    if let Some((x, y)) = ptr_win_px(slot as u64 + 1, px, py) {
+        let _ = user_input_push(slot, una_abi::input_ev_pack(INPUT_EV_MOUSE_ABS, una_abi::input_ev_xy_payload(x, y)));
+    }
 }

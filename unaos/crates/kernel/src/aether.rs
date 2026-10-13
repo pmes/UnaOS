@@ -27,8 +27,8 @@
 //! 4. DRIVE (AETHERMETAL M3, LEDGER SR96). Before the kill, the fixture plays the operator into the program's
 //!    ring by owner (`user_input_push_owner`, unaapp.rs's channel), one step per wire line, each watched at the
 //!    seam (`line_watch_arm`) and read from the verdict tail: Tab (`:: AETHER: focus -> PASS href=… at=x0,y,x1`
-//!    — the first link's first text box, window px), the pointer pinned to the window's corner by a large
-//!    MOUSE_REL and moved onto that box (`:: AETHER: hover -> PASS href=…` → `hover=1`), a left-button drag
+//!    — the first link's first text box, window px), the pointer placed on that box by one MOUSE_ABS in window px
+//!    (AETHERPTR B543: the ring's pointer contract; `:: AETHER: hover -> PASS href=…` → `hover=1`), a left-button drag
 //!    across it (`:: AETHER: select -> PASS chars=<n>` → `select=<n>`), Ctrl+C (`:: AETHER: clip … set=<rc>`,
 //!    reported, not judged: the clipboard answers only the FOCUSED program), and a click on the link
 //!    (`:: AETHER: nav -> PASS how=click path=…` → `nav=1`: welcome.html's first link is keys.html beside it).
@@ -200,8 +200,8 @@ fn key(b: u8) -> u64 {
     una_abi::input_ev_pack(una_abi::INPUT_EV_KEY_DOWN, b as u64)
 }
 #[cfg(target_arch = "x86_64")]
-fn rel(dx: i64, dy: i64) -> u64 {
-    una_abi::input_ev_pack(una_abi::INPUT_EV_MOUSE_REL, (((dx as i16 as u16) as u64) << 16) | (dy as i16 as u16) as u64)
+fn abs(x: i64, y: i64) -> u64 {
+    una_abi::input_ev_pack(una_abi::INPUT_EV_MOUSE_ABS, una_abi::input_ev_xy_payload(x as i32, y as i32)) // AETHERPTR (B543): window px, what x86's producer hands a windowed program
 }
 #[cfg(target_arch = "x86_64")]
 fn button(mask: u8) -> u64 {
@@ -225,10 +225,10 @@ fn drive(slot: u64) -> Drive {
     d.tails[0] = step(slot, ":: AETHER: focus", &[key(b'\t')]);
     let at = d.tails[0].as_deref().filter(|t| t.starts_with("PASS")).map(|t| ints(t, "at=")).unwrap_or_default();
     let [x0, y, x1] = at[..] else { return d };
-    d.tails[1] = step(slot, ":: AETHER: hover", &[rel(-2000, -2000), rel(x0 + 2, y)]);
+    d.tails[1] = step(slot, ":: AETHER: hover", &[abs(x0 + 2, y)]);
     d.hover = d.tails[1].as_deref().is_some_and(|t| t.starts_with("PASS"));
     let span = (x1 - x0 - 4).max(4);
-    d.tails[2] = step(slot, ":: AETHER: select", &[button(1), rel(span, 0), button(0)]);
+    d.tails[2] = step(slot, ":: AETHER: select", &[button(1), abs(x0 + 2 + span, y), button(0)]);
     d.select = d.tails[2].as_deref().filter(|t| t.starts_with("PASS")).and_then(|t| ints(t, "chars=").first().copied()).unwrap_or(0).max(0) as u64;
     d.tails[3] = step(slot, ":: AETHER: clip", &[key(0x03)]);
     d.tails[4] = step(slot, ":: AETHER: nav", &[button(1), button(0)]);
