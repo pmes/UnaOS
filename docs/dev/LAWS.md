@@ -317,6 +317,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   in this harness. Until `.claude/settings.json` carries deny or ask rules for `Agent` and for writes
   outside the repo, the seat asks Peter before launching any executor or creating any file.
   Enforcer: settings.json once written; until then warning only.
+- **An agent-written file with a `\uXXXX` escape is re-read after the write** (HOSTSUITES, 2026-10-13: the harness's Write tool decoded the typed `\u00e9` into a literal `é` in the syntax_core KAT fixtures and in a ledger row; three tests went red). Enforcer: `grep -c '\\u[0-9a-fA-F]\{4\}' <file>` after the write, in the brief's DONE gate; the seat writes such files with sed or a heredoc.
 - **Briefs are lean:** intent, invariants, anchors, DONE gate, lane. Every brief states: never `git
   checkout/restore/stash/clean` any file; foreign red files are report-not-touch; no title
   instruction; no unscoped `pkill` (a pattern naming `cargo` kills the issuing shell; stop your own
