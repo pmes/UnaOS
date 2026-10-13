@@ -14,12 +14,13 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 55.
+Rows: 56.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
 | `aether.devtools.dock` | enum `right \| bottom` | `"right"` | operator | — | quartzite GTK devtools pane (`devtools_view::stored_dock`, stored by its dock button), sent to aether `chrome::DevtoolsChrome` as `BrowserDevtoolsDock` | The side the developer-tools pane docks on: beside the page (`right`) or under it (`bottom`) (AETHERDEVTOOLS, SR112). |
 | `aether.search` | string ≤512 printable | `"https://html.duckduckgo.com/html/?q=%s"` | operator | — | quartzite GTK url bar (`url_bar::search_template`), aether chrome omnibox | The address bar's search engine: a URL template whose `%s` (or `{searchTerms}`) becomes the urlencoded query when the typed text is not an address (AETHERCHROME). |
+| `aether.tabs.layout` | enum `top \| side` | `"top"` | operator | — | quartzite GTK tab strip (`tab_strip::stored_layout`, at build and on change), aether `chrome::sidetabs::TabLayout` | Where the browser's tabs are drawn: the horizontal strip across the top (`top`) or the vertical side strip on the left (`side`, collapsible to an icon rail; for many tabs) (AETHERSIDETABS, SR140, R118). |
 | `system.accessibility.contrast` | enum `no-preference \| more \| less` | `"no-preference"` | operator | — | aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-contrast`) | More or less contrast than the default: the `prefers-contrast` media feature pages read (`custom` when forced colors are on and this is unset), and a 3px focus ring at `more` (AETHERA11Y, SR119). |
 | `system.accessibility.forced_colors` | bool | `false` | operator | — | aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`forced-colors`) | A user palette replaces page colours: the `forced-colors: active` media feature, and a 3px focus ring (AETHERA11Y, SR119). |
 | `system.accessibility.reduce_motion` | bool | `false` | operator | — | aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-reduced-motion`) | Minimise non-essential motion: the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119). |

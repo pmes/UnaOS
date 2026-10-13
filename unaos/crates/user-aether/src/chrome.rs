@@ -16,6 +16,11 @@
 // field (the OMNIBOX), the bookmark star, zoom out, zoom in. The page sits below at `CHROME_H`, laid out at the
 // LOGICAL size `(pw, ph - CHROME_H) * 100 / zoom` and scaled onto the window at the blit, so zoom REFLOWS (the
 // host's reflowing zoom) and every page coordinate main.rs computes stays in the page's own CSS px.
+// HEADER CRAFT (SR140): every dimension is one named constant (THE HEADER'S METRICS) and every colour one `Skin`
+// field derived from the theme tokens. The toolbar is the active tab's ground (they join with no seam); the strip is
+// a half-step darker with hairlines between quiet tabs; a tab shows its letter tile and title centred and its × on
+// hover; the toolbar's controls are stroked glyphs with a rounded wash on hover and press, never a boxed rectangle;
+// the address field is one pill with a quiet border and, focused, the accent inside a soft halo.
 //
 // INPUT (`input`, called on every ring event before main.rs's dispatch: `None` = the chrome took it, `Some(ev)` =
 // main.rs handles `ev`, a pointer event rewritten into page px).
@@ -97,14 +102,47 @@ pub mod zoom;
 use crate::store;
 use history::{SessionHistory, Traversal};
 
-/// The tab strip's height, the toolbar's, and the chrome's (the page starts below it), window px.
-pub const TAB_H: i32 = 18;
-pub const BAR_H: i32 = 20;
+// ---- THE HEADER'S METRICS (AETHERSIDETABS / header craft, SR140): every dimension the strip and the toolbar are
+// drawn with, named once here; the colours are `Skin` (below), derived once from the theme tokens. ----------------
+/// The tab strip's band, the toolbar's band, and the chrome's height (the page starts below it), window px.
+pub const TAB_H: i32 = 26;
+pub const BAR_H: i32 = 30;
 pub const CHROME_H: i32 = TAB_H + BAR_H;
+/// The type: the BODY size (tab titles, the address field) and one step down (the zoom badge, the letter tile).
+const FONT: f32 = 11.0;
+const FONT_SMALL: f32 = 9.5;
+/// The header's inset from the window's left and right edges, and the gap between neighbouring controls.
+const EDGE: i32 = 8;
+const GAP: i32 = 4;
+/// A tab: the air above it in the strip, its width range, its top corners' radius, its inner padding (both sides).
+const TAB_TOP: i32 = 4;
+const TAB_MIN_W: i32 = 40;
+const TAB_MAX_W: i32 = 128;
+const TAB_R: i32 = 6;
+const TAB_PAD: i32 = 8;
+/// The hairline between two inactive tabs: its inset from the tab body's top and bottom.
+const SEP_INSET: i32 = 7;
+/// The favicon slot (the letter tile until the engine hands a favicon over), its radius, and the gap to the title.
+const TILE: i32 = 14;
+const TILE_R: i32 = 4;
+const TILE_GAP: i32 = 6;
+/// The close affordance (a circle, shown while the tab is hovered) and the × inside it (half its arm).
+const CLOSE: i32 = 16;
+const CLOSE_ARM: f32 = 3.0;
+/// A toolbar control's square (the field's height too), its hover / pressed wash radius.
+const CTL: i32 = 22;
+const CTL_R: i32 = 6;
+/// The address field: its radius (a full pill), its text inset, the focus ring's width.
+const FIELD_R: i32 = CTL / 2;
+const FIELD_PAD: i32 = 10;
+const RING: i32 = 2;
+/// The drawn glyphs (chevrons, plus, minus, ×): half their extent and their stroke width.
+const GLYPH: f32 = 4.0;
+const STROKE: f32 = 1.5;
+/// Where the toolbar's controls stand (their top edge).
+const BAR_Y: i32 = TAB_H + (BAR_H - CTL) / 2;
 /// The new-tab page's path (generated, never read off the volume).
 pub const NEWTAB: &str = "/aether:newtab";
-/// The chrome's text size, px.
-const FONT: f32 = 11.0;
 /// What an empty address field says.
 const PLACEHOLDER: &str = "Search or type a path";
 
@@ -752,28 +790,35 @@ struct Geo {
     zin: (i32, i32),
 }
 
-const BTN: i32 = 18;
-const CLOSE_W: i32 = 12;
-
 fn geo(ch: &Chrome) -> Geo {
     let w = ch.pw;
-    let area = (w - BTN - 4).max(24);
+    let area = (w - 2 * EDGE - GAP - CTL).max(TAB_MIN_W);
     let n = ch.strip.len().max(1) as i32;
-    let tw = (area / n).clamp(24, 112);
+    let tw = (area / n).clamp(TAB_MIN_W, TAB_MAX_W);
     // Tabs past the strip's room are not drawn (Ctrl+1..9 still reach them).
     let tabs: Vec<(u64, i32, i32)> =
-        ch.strip.tabs().iter().enumerate().map(|(i, t)| (t.id, 2 + i as i32 * tw, tw - 2)).filter(|&(_, x, tw)| x + tw <= area + 2).collect();
-    let plus_x = (2 + tabs.len() as i32 * tw).min(w - BTN - 2);
+        ch.strip.tabs().iter().enumerate().map(|(i, t)| (t.id, EDGE + i as i32 * tw, tw)).filter(|&(_, x, tw)| x + tw <= EDGE + area).collect();
+    let plus_x = (EDGE + tabs.len() as i32 * tw + GAP).min(w - EDGE - CTL);
+    let zin = w - EDGE - CTL;
+    let zout = zin - GAP - CTL;
+    let star = zout - GAP - CTL;
+    let fwd = EDGE + CTL + GAP;
+    let omni = fwd + CTL + EDGE;
     Geo {
         tabs,
-        plus: (plus_x, BTN),
-        back: (2, BTN),
-        fwd: (2 + BTN + 2, BTN),
-        omni: (2 * BTN + 8, (w - 2 * BTN - 8 - 3 * (BTN + 2) - 4).max(24)),
-        star: (w - 3 * (BTN + 2), BTN),
-        zout: (w - 2 * (BTN + 2), BTN),
-        zin: (w - (BTN + 2), BTN),
+        plus: (plus_x, CTL),
+        back: (EDGE, CTL),
+        fwd: (fwd, CTL),
+        omni: (omni, (star - EDGE - omni).max(24)),
+        star: (star, CTL),
+        zout: (zout, CTL),
+        zin: (zin, CTL),
     }
+}
+
+/// Where a tab's close affordance stands (its left edge), for a tab at `tx` that is `tw` wide.
+fn close_x(tx: i32, tw: i32) -> i32 {
+    tx + tw - TAB_PAD / 2 - CLOSE
 }
 
 fn within(x: i32, r: (i32, i32)) -> bool {
@@ -786,15 +831,21 @@ fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
     }
     let g = geo(ch);
     if y < TAB_H {
+        if y < TAB_TOP {
+            return Hot::None;
+        }
         for &(id, tx, tw) in &g.tabs {
             if within(x, (tx, tw)) {
-                if id == ch.strip.active() && x >= tx + tw - CLOSE_W - 2 {
+                if x >= close_x(tx, tw) && x < close_x(tx, tw) + CLOSE {
                     return Hot::Close(id);
                 }
                 return Hot::Tab(id);
             }
         }
         return if within(x, g.plus) { Hot::NewTab } else { Hot::None };
+    }
+    if y < BAR_Y || y >= BAR_Y + CTL {
+        return Hot::None;
     }
     for (r, h) in [(g.back, Hot::Back), (g.fwd, Hot::Fwd), (g.omni, Hot::Omni), (g.star, Hot::Star), (g.zout, Hot::ZoomOut), (g.zin, Hot::ZoomIn)] {
         if within(x, r) {
@@ -821,7 +872,15 @@ fn caret_at(fonts: &Fonts, text: &str, x: f32) -> usize {
 fn click(app: &mut App, page: &mut Page, fonts: &mut Fonts, h: Hot) {
     match h {
         Hot::Tab(id) => select_tab(app, page, id),
-        Hot::Close(_) => close_tab(app, page, fonts),
+        Hot::Close(id) => {
+            // The × shows on whichever tab the pointer is over: that tab is the one closed.
+            if id != app.ch.strip.active() {
+                select_tab(app, page, id);
+            }
+            if id == app.ch.strip.active() {
+                close_tab(app, page, fonts);
+            }
+        }
         Hot::NewTab => new_tab(app, page, fonts),
         Hot::Back => crate::back(app, page, fonts),
         Hot::Fwd => crate::forward(app, page, fonts),
@@ -922,7 +981,7 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
                     let g = geo(&app.ch);
                     if let Some(o) = app.ch.omni.as_mut() {
                         let text = o.buf.text().to_string();
-                        let x = (app.ch.ptr.0 - g.omni.0 - 3) as f32 + o.scroll.get();
+                        let x = (app.ch.ptr.0 - g.omni.0 - FIELD_PAD) as f32 + o.scroll.get();
                         let at = caret_at(fonts, &text, x);
                         o.buf.set_cursor(at);
                     } else {
@@ -941,6 +1000,7 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
                 if start == now {
                     click(app, page, fonts, now);
                 }
+                app.dirty = true; // the pressed wash goes
                 return None;
             }
             if m & 1 != 0 && was & 1 == 0 && app.ch.omni.is_some() {
@@ -955,22 +1015,180 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
 
 // ---- paint and blit ---------------------------------------------------------------------------------------------
 
-/// Draw `s` at x on the band [top, top + h), clipped to [x0, x1); returns the pen's end.
+/// The header's colours, derived once per frame from the theme tokens (`theme::Theme`, both looks): the toolbar is
+/// the active tab's ground (the content fill), so the two join with no seam; the strip is a half-step darker; every
+/// wash, hairline and ring is a mix of those with the ink or the accent — one accent, nothing else.
+struct Skin {
+    strip: u32,
+    bar: u32,
+    rule: u32,
+    sep: u32,
+    tab_hover: u32,
+    ctl_hover: u32,
+    ctl_press: u32,
+    ink: u32,
+    dim: u32,
+    accent: u32,
+    tile: u32,
+    tile_dim: u32,
+    field_bg: u32,
+    field_line: u32,
+    field_ink: u32,
+    field_sel: u32,
+    halo: u32,
+}
+
+fn skin() -> Skin {
+    use palette_core::mix;
+    let th = crate::theme::cur();
+    let bar = th.tab_active;
+    let strip = mix(bar, 0x000000, 1, 12);
+    Skin {
+        strip,
+        bar,
+        rule: mix(bar, th.chrome_rule, 1, 2),
+        sep: mix(strip, th.chrome_ink, 1, 6),
+        tab_hover: mix(strip, th.chrome_ink, 1, 14),
+        ctl_hover: mix(bar, th.chrome_ink, 1, 12),
+        ctl_press: mix(bar, th.chrome_ink, 1, 6),
+        ink: th.chrome_ink,
+        dim: th.chrome_dim,
+        accent: th.focus,
+        tile: mix(bar, th.focus, 3, 4),
+        tile_dim: mix(strip, th.chrome_dim, 2, 3),
+        field_bg: th.field_bg,
+        field_line: mix(bar, th.chrome_ink, 1, 6),
+        field_ink: th.field_ink,
+        field_sel: th.field_sel,
+        halo: mix(bar, th.focus, 2, 5),
+    }
+}
+
+/// A filled rectangle with anti-aliased round corners (radius `r`; `top_only`: the bottom corners square — a tab).
+/// Corner pixels are covered 4 x 4 sub-samples deep (no square root: a sample is in when its squared distance to the
+/// corner's centre is within the radius's square).
 #[allow(clippy::too_many_arguments)]
-fn label(cv: &mut Canvas, fonts: &Fonts, s: &str, x: f32, top: i32, h: i32, ink: u32, x0: i32, x1: i32) -> f32 {
+fn rrect(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, r: i32, c: u32, top_only: bool) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let r = r.min(w / 2).min(h / 2).max(0);
+    let (x1, y1) = (x + w, y + h);
+    for py in y.max(0)..y1.min(cv.h) {
+        for px in x.max(0)..x1.min(cv.w) {
+            // The corner this pixel falls in, if any: its centre in 1/8 px.
+            let cx = if px < x + r { Some(x + r) } else if px >= x1 - r { Some(x1 - r) } else { None };
+            let cy = if py < y + r { Some(y + r) } else if py >= y1 - r && !top_only { Some(y1 - r) } else { None };
+            let i = (py * cv.w + px) as usize;
+            match (cx, cy) {
+                (Some(cx), Some(cy)) => {
+                    let (cx8, cy8, r8) = (cx * 8, cy * 8, r * 8);
+                    let mut n = 0u32;
+                    for sy in 0..4 {
+                        for sx in 0..4 {
+                            let dx = px * 8 + 1 + sx * 2 - cx8;
+                            let dy = py * 8 + 1 + sy * 2 - cy8;
+                            if dx * dx + dy * dy <= r8 * r8 {
+                                n += 1;
+                            }
+                        }
+                    }
+                    if n > 0 {
+                        cv.px[i] = font_core::ui::blend(cv.px[i], c, (n * 255 / 16) as u8);
+                    }
+                }
+                _ => cv.px[i] = c,
+            }
+        }
+    }
+}
+
+/// An anti-aliased stroke from (x0, y0) to (x1, y1), `wd` px wide with round ends (4 x 4 sub-samples a pixel).
+fn seg(cv: &mut Canvas, x0: f32, y0: f32, x1: f32, y1: f32, wd: f32, c: u32) {
+    let rr = wd * wd / 4.0;
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len2 = (dx * dx + dy * dy).max(1e-6);
+    let m = wd / 2.0 + 1.0;
+    let (bx0, bx1) = (font_core::fmath::floor(x0.min(x1) - m) as i32, font_core::fmath::ceil(x0.max(x1) + m) as i32);
+    let (by0, by1) = (font_core::fmath::floor(y0.min(y1) - m) as i32, font_core::fmath::ceil(y0.max(y1) + m) as i32);
+    for py in by0.max(0)..by1.min(cv.h) {
+        for px in bx0.max(0)..bx1.min(cv.w) {
+            let mut n = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let (qx, qy) = (px as f32 + (sx as f32 + 0.5) / 4.0, py as f32 + (sy as f32 + 0.5) / 4.0);
+                    let t = (((qx - x0) * dx + (qy - y0) * dy) / len2).clamp(0.0, 1.0);
+                    let (ex, ey) = (x0 + t * dx - qx, y0 + t * dy - qy);
+                    if ex * ex + ey * ey <= rr {
+                        n += 1;
+                    }
+                }
+            }
+            if n > 0 {
+                let i = (py * cv.w + px) as usize;
+                cv.px[i] = font_core::ui::blend(cv.px[i], c, (n * 255 / 16) as u8);
+            }
+        }
+    }
+}
+
+/// The glyphs the toolbar and the strip draw as strokes (the font's `<` / `+` read as text, not as controls).
+#[derive(Clone, Copy)]
+enum Glyph {
+    Back,
+    Fwd,
+    Plus,
+    Minus,
+    Cross,
+}
+
+/// Draw `g` centred on (cx, cy).
+fn glyph(cv: &mut Canvas, g: Glyph, cx: f32, cy: f32, c: u32) {
+    let a = GLYPH;
+    match g {
+        Glyph::Back => {
+            seg(cv, cx + a / 2.0, cy - a, cx - a / 2.0, cy, STROKE, c);
+            seg(cv, cx - a / 2.0, cy, cx + a / 2.0, cy + a, STROKE, c);
+        }
+        Glyph::Fwd => {
+            seg(cv, cx - a / 2.0, cy - a, cx + a / 2.0, cy, STROKE, c);
+            seg(cv, cx + a / 2.0, cy, cx - a / 2.0, cy + a, STROKE, c);
+        }
+        Glyph::Plus => {
+            seg(cv, cx - a, cy, cx + a, cy, STROKE, c);
+            seg(cv, cx, cy - a, cx, cy + a, STROKE, c);
+        }
+        Glyph::Minus => seg(cv, cx - a, cy, cx + a, cy, STROKE, c),
+        Glyph::Cross => {
+            let k = CLOSE_ARM;
+            seg(cv, cx - k, cy - k, cx + k, cy + k, STROKE, c);
+            seg(cv, cx - k, cy + k, cx + k, cy - k, STROKE, c);
+        }
+    }
+}
+
+/// Draw `s` at x, vertically centred on the band [top, top + h), clipped to [x0, x1), at `size`; returns the pen's end.
+#[allow(clippy::too_many_arguments)]
+fn label_at(cv: &mut Canvas, fonts: &Fonts, s: &str, x: f32, top: i32, h: i32, ink: u32, x0: i32, x1: i32, size: f32) -> f32 {
     let sel = FontSel::default();
     let mut t = fonts.0.borrow_mut();
-    let (a, d, _) = t.line_metrics(sel, FONT);
+    let (a, d, _) = t.line_metrics(sel, size);
     let base = top as f32 + ((h as f32 + a - d) / 2.0);
     let base = font_core::fmath::floor(base);
     let (cw, chh) = (cv.w, cv.h);
-    t.draw(x, base, s, sel, FONT, ink, &mut |gx, gy, cov| {
+    t.draw(x, base, s, sel, size, ink, &mut |gx, gy, cov| {
         if gx >= x0 && gx < x1 && gx >= 0 && gy >= 0 && gx < cw && gy < chh {
             let i = (gy * cw + gx) as usize;
             cv.px[i] = font_core::ui::blend(cv.px[i], ink, cov);
         }
     });
-    x + t.measure(s, sel, FONT)
+    x + t.measure(s, sel, size)
+}
+
+/// [`label_at`] at the body size.
+#[allow(clippy::too_many_arguments)]
+fn label(cv: &mut Canvas, fonts: &Fonts, s: &str, x: f32, top: i32, h: i32, ink: u32, x0: i32, x1: i32) -> f32 {
+    label_at(cv, fonts, s, x, top, h, ink, x0, x1, FONT)
 }
 
 /// `s` cut (with an ellipsis) to fit `w` px.
@@ -991,78 +1209,125 @@ fn fit(fonts: &Fonts, s: &str, w: f32) -> String {
     out
 }
 
-/// A button: its hover wash and its glyph centred, dimmed when it can do nothing.
-fn button(cv: &mut Canvas, fonts: &Fonts, r: (i32, i32), glyph: &str, hot: bool, enabled: bool, ink: u32) {
-    let th = crate::theme::cur();
-    let (top, h) = (TAB_H + 1, BAR_H - 2);
-    if hot && enabled {
-        cv.fill(r.0, top, r.1, h, th.hot_bg);
+/// A control's state for its wash: pressed (the press started on it and the pointer is still on it), hovered, or
+/// at rest.
+fn wash(ch: &Chrome, h: Hot, sk: &Skin) -> Option<u32> {
+    if ch.hot != h {
+        None
+    } else if ch.pressed == Some(h) {
+        Some(sk.ctl_press)
+    } else {
+        Some(sk.ctl_hover)
     }
-    let gw = fonts.0.borrow_mut().measure(glyph, FontSel::default(), FONT);
-    let x = r.0 as f32 + (r.1 as f32 - gw) / 2.0;
-    label(cv, fonts, glyph, x, top, h, if enabled { ink } else { th.chrome_dim }, r.0, r.0 + r.1);
+}
+
+/// A toolbar control at `r` (x, w) on the bar: no box at rest, a rounded wash on hover / press, its glyph centred and
+/// dimmed when it can do nothing.
+fn control(cv: &mut Canvas, ch: &Chrome, sk: &Skin, r: (i32, i32), h: Hot, enabled: bool, g: Glyph) {
+    if enabled {
+        if let Some(c) = wash(ch, h, sk) {
+            rrect(cv, r.0, BAR_Y, r.1, CTL, CTL_R, c, false);
+        }
+    }
+    let (cx, cy) = (r.0 as f32 + r.1 as f32 / 2.0, BAR_Y as f32 + CTL as f32 / 2.0);
+    glyph(cv, g, cx, cy, if enabled { sk.ink } else { sk.dim });
 }
 
 /// Paint the strip and the toolbar into `cv` (the window's width, CHROME_H tall).
 fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
     let ch = &app.ch;
-    let th = crate::theme::cur();
+    let sk = skin();
     let g = geo(ch);
-    cv.fill(0, 0, cv.w, cv.h, th.chrome_bg);
-    // The strip.
+    cv.fill(0, 0, cv.w, TAB_H, sk.strip);
+    cv.fill(0, TAB_H, cv.w, BAR_H, sk.bar);
+    // The hairline under the strip; the active tab is painted over it below, so it joins the toolbar seamlessly.
+    cv.fill(0, TAB_H - 1, cv.w, 1, sk.rule);
+    let active = ch.strip.active();
+    let lit = |id: u64| id == active || ch.hot == Hot::Tab(id) || ch.hot == Hot::Close(id);
+    let body_h = TAB_H - TAB_TOP;
     for (i, &(id, tx, tw)) in g.tabs.iter().enumerate() {
-        let active = id == ch.strip.active();
-        let bg = if active {
-            th.tab_active
-        } else if ch.hot == Hot::Tab(id) {
-            th.hot_bg
-        } else {
-            th.tab_bg
-        };
-        cv.fill(tx, 2, tw, TAB_H - 2, bg);
-        if active {
-            cv.fill(tx, 2, tw, 2, th.focus);
+        let on = id == active;
+        if on {
+            rrect(cv, tx, TAB_TOP, tw, body_h, TAB_R, sk.bar, true);
+        } else if lit(id) {
+            rrect(cv, tx + 2, TAB_TOP + 2, tw - 4, body_h - 5, CTL_R, sk.tab_hover, false);
         }
-        let lab = ch.strip.tabs()[i].label().to_string();
-        let room = (tw - 8 - if active { CLOSE_W + 2 } else { 0 }) as f32;
-        let s = fit(fonts, &lab, room.max(8.0));
-        label(cv, fonts, &s, (tx + 4) as f32, 3, TAB_H - 3, if active { th.chrome_ink } else { th.chrome_dim }, tx, tx + tw - if active { CLOSE_W + 2 } else { 2 });
-        if active {
-            let cx = tx + tw - CLOSE_W - 2;
-            if ch.hot == Hot::Close(id) {
-                cv.fill(cx, 4, CLOSE_W, TAB_H - 6, th.hot_bg);
+        // The hairline between two quiet neighbours.
+        if let Some(&(next, _, _)) = g.tabs.get(i + 1) {
+            if !lit(id) && !lit(next) {
+                cv.fill(tx + tw, TAB_TOP + SEP_INSET, 1, body_h - 2 * SEP_INSET, sk.sep);
             }
-            label(cv, fonts, "\u{00D7}", (cx + 3) as f32, 3, TAB_H - 3, th.chrome_ink, cx, cx + CLOSE_W);
+        }
+        let tab = &ch.strip.tabs()[i];
+        // The favicon slot: the letter tile, vertically centred with the title.
+        let ty = TAB_TOP + (body_h - TILE) / 2;
+        let tile_x = tx + TAB_PAD;
+        rrect(cv, tile_x, ty, TILE, TILE, TILE_R, if on { sk.tile } else { sk.tile_dim }, false);
+        let mut letter = [0u8; 4];
+        let letter: &str = tab.initial().encode_utf8(&mut letter);
+        let lw = fonts.0.borrow_mut().measure(letter, FontSel::default(), FONT_SMALL);
+        label_at(cv, fonts, letter, tile_x as f32 + (TILE as f32 - lw) / 2.0, ty, TILE, sk.bar, tile_x, tile_x + TILE, FONT_SMALL);
+        // The title, then the close affordance while the tab is hovered.
+        let show_close = ch.hot == Hot::Tab(id) || ch.hot == Hot::Close(id);
+        let t0 = tile_x + TILE + TILE_GAP;
+        let t1 = if show_close { close_x(tx, tw) - GAP } else { tx + tw - TAB_PAD };
+        if t1 > t0 + 4 {
+            let s = fit(fonts, tab.label(), (t1 - t0) as f32);
+            label(cv, fonts, &s, t0 as f32, TAB_TOP, body_h, if on { sk.ink } else { sk.dim }, t0, t1);
+        }
+        if show_close {
+            let cx = close_x(tx, tw);
+            let cy = TAB_TOP + (body_h - CLOSE) / 2;
+            if ch.hot == Hot::Close(id) {
+                let c = if ch.pressed == Some(Hot::Close(id)) { sk.ctl_press } else { sk.ctl_hover };
+                rrect(cv, cx, cy, CLOSE, CLOSE, CLOSE / 2, c, false);
+            }
+            glyph(cv, Glyph::Cross, cx as f32 + CLOSE as f32 / 2.0, cy as f32 + CLOSE as f32 / 2.0, if on { sk.ink } else { sk.dim });
         }
     }
-    if ch.hot == Hot::NewTab {
-        cv.fill(g.plus.0, 3, g.plus.1, TAB_H - 4, th.hot_bg);
+    // `+`: a new tab, a quiet glyph with a wash on hover.
+    if let Some(c) = wash(ch, Hot::NewTab, &sk) {
+        rrect(cv, g.plus.0, TAB_TOP, g.plus.1, body_h - 1, CTL_R, c, false);
     }
-    let pw = fonts.0.borrow_mut().measure("+", FontSel::default(), FONT);
-    label(cv, fonts, "+", g.plus.0 as f32 + (g.plus.1 as f32 - pw) / 2.0, 3, TAB_H - 3, th.chrome_ink, g.plus.0, g.plus.0 + g.plus.1);
-    cv.fill(0, TAB_H, cv.w, 1, th.chrome_rule);
+    glyph(cv, Glyph::Plus, g.plus.0 as f32 + g.plus.1 as f32 / 2.0, TAB_TOP as f32 + body_h as f32 / 2.0, sk.dim);
     // The toolbar.
-    let ink = th.chrome_ink;
-    button(cv, fonts, g.back, "<", ch.hot == Hot::Back, app.hist.can_go(-1), ink);
-    button(cv, fonts, g.fwd, ">", ch.hot == Hot::Fwd, app.hist.can_go(1), ink);
-    let on = !ch.url.is_empty() && ch.bookmarks.contains(&ch.url);
-    button(cv, fonts, g.star, if on { "\u{2605}" } else { "\u{2606}" }, ch.hot == Hot::Star, !ch.url.is_empty(), if on { th.focus } else { ink });
-    button(cv, fonts, g.zout, "-", ch.hot == Hot::ZoomOut, ch.zoom > zoom::LEVELS[0], ink);
-    button(cv, fonts, g.zin, "+", ch.hot == Hot::ZoomIn, ch.zoom < zoom::LEVELS[zoom::LEVELS.len() - 1], ink);
-    // The address field.
+    control(cv, ch, &sk, g.back, Hot::Back, app.hist.can_go(-1), Glyph::Back);
+    control(cv, ch, &sk, g.fwd, Hot::Fwd, app.hist.can_go(1), Glyph::Fwd);
+    control(cv, ch, &sk, g.zout, Hot::ZoomOut, ch.zoom > zoom::LEVELS[0], Glyph::Minus);
+    control(cv, ch, &sk, g.zin, Hot::ZoomIn, ch.zoom < zoom::LEVELS[zoom::LEVELS.len() - 1], Glyph::Plus);
+    // The bookmark star: the font's own star (a filled one in the accent when the page is bookmarked).
+    {
+        let on = !ch.url.is_empty() && ch.bookmarks.contains(&ch.url);
+        let enabled = !ch.url.is_empty();
+        if enabled {
+            if let Some(c) = wash(ch, Hot::Star, &sk) {
+                rrect(cv, g.star.0, BAR_Y, g.star.1, CTL, CTL_R, c, false);
+            }
+        }
+        let s = if on { "\u{2605}" } else { "\u{2606}" };
+        let gw = fonts.0.borrow_mut().measure(s, FontSel::default(), FONT);
+        let ink = if on { sk.accent } else if enabled { sk.ink } else { sk.dim };
+        label(cv, fonts, s, g.star.0 as f32 + (g.star.1 as f32 - gw) / 2.0, BAR_Y, CTL, ink, g.star.0, g.star.0 + g.star.1);
+    }
+    // The address field: one rounded field with a quiet border; focused, the border turns the accent inside a soft
+    // halo.
     let (fx, fw) = g.omni;
-    let (ft, fh) = (TAB_H + 2, BAR_H - 4);
-    cv.fill(fx, ft, fw, fh, th.field_bg);
-    crate::paint::outline(cv, fx, ft, fw, fh, if ch.omni.is_some() { th.focus } else { th.chrome_rule });
-    let mut x1 = fx + fw - 3;
+    let (ft, fh) = (BAR_Y, CTL);
+    let focused = ch.omni.is_some();
+    if focused {
+        rrect(cv, fx - RING, ft - RING, fw + 2 * RING, fh + 2 * RING, FIELD_R + RING, sk.halo, false);
+    }
+    rrect(cv, fx, ft, fw, fh, FIELD_R, if focused { sk.accent } else { sk.field_line }, false);
+    rrect(cv, fx + 1, ft + 1, fw - 2, fh - 2, FIELD_R - 1, sk.field_bg, false);
+    let mut x1 = fx + fw - FIELD_PAD;
     if ch.zoom != 100 {
         let z = alloc::format!("{}%", ch.zoom);
-        let zw = fonts.0.borrow_mut().measure(&z, FontSel::default(), FONT);
-        let zx = (fx + fw - 4) as f32 - zw;
-        label(cv, fonts, &z, zx, ft, fh, th.chrome_dim, fx, fx + fw - 2);
-        x1 = zx as i32 - 3;
+        let zw = fonts.0.borrow_mut().measure(&z, FontSel::default(), FONT_SMALL);
+        let zx = (fx + fw - FIELD_PAD) as f32 - zw;
+        label_at(cv, fonts, &z, zx, ft, fh, sk.dim, fx, fx + fw - FIELD_PAD / 2, FONT_SMALL);
+        x1 = zx as i32 - GAP;
     }
-    let tx0 = fx + 3;
+    let tx0 = fx + FIELD_PAD;
     match &ch.omni {
         Some(o) => {
             let text = o.buf.text().to_string();
@@ -1086,24 +1351,25 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
                 let (a, b) = ((ox + s0) as i32, (ox + s1) as i32);
                 let (a, b) = (a.max(tx0), b.min(x1));
                 if b > a {
-                    cv.fill(a, ft + 2, b - a, fh - 4, th.field_sel);
+                    cv.fill(a, ft + 4, b - a, fh - 8, sk.field_sel);
                 }
             }
-            label(cv, fonts, &text, ox, ft, fh, th.field_ink, tx0, x1);
+            label(cv, fonts, &text, ox, ft, fh, sk.field_ink, tx0, x1);
             let cx = (ox + caret) as i32;
             if cx >= tx0 && cx <= x1 {
-                cv.fill(cx, ft + 2, 1, fh - 4, th.focus);
+                cv.fill(cx, ft + 5, 1, fh - 10, sk.accent);
             }
         }
         None if ch.url.is_empty() => {
-            label(cv, fonts, PLACEHOLDER, tx0 as f32, ft, fh, th.chrome_dim, tx0, x1);
+            label(cv, fonts, PLACEHOLDER, tx0 as f32, ft, fh, sk.dim, tx0, x1);
         }
         None => {
             let s = fit(fonts, &ch.url, (x1 - tx0) as f32);
-            label(cv, fonts, &s, tx0 as f32, ft, fh, th.field_ink, tx0, x1);
+            label(cv, fonts, &s, tx0 as f32, ft, fh, sk.field_ink, tx0, x1);
         }
     }
-    cv.fill(0, CHROME_H - 1, cv.w, 1, th.chrome_rule);
+    // The hairline between the header and the page.
+    cv.fill(0, CHROME_H - 1, cv.w, 1, sk.rule);
 }
 
 /// One frame onto the surface: the chrome on top, the page canvas (logical px) scaled onto the rest — a straight

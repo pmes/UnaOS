@@ -143,6 +143,11 @@ pub static SCHEMA: &[Key] = &[
         writers: OP, reader: "quartzite GTK url bar (`url_bar::search_template`), aether chrome omnibox",
         doc: "The address bar's search engine: a URL template whose `%s` (or `{searchTerms}`) becomes the urlencoded query when the typed text is not an address (AETHERCHROME).",
     },
+    Key {
+        ns: "aether", key: "tabs.layout", kind: Kind::Enum(&["top", "side"]), default: Default::Str("top"),
+        writers: OP, reader: "quartzite GTK tab strip (`tab_strip::stored_layout`, at build and on change), aether `chrome::sidetabs::TabLayout`",
+        doc: "Where the browser's tabs are drawn: the horizontal strip across the top (`top`) or the vertical side strip on the left (`side`, collapsible to an icon rail; for many tabs) (AETHERSIDETABS, SR140, R118).",
+    },
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     // ── AETHERA11Y (SR119): the user's accessibility preferences — the web's `prefers-*` / `forced-colors` media
     //    features (css_core `media::set_user_preferences`), recorded by aether `a11y::prefs::A11yPrefs::from_prefs` ──
