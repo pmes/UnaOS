@@ -268,7 +268,11 @@ fn console_method(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         "info" => 4,
         _ => 0,
     };
-    let msg = console_format(vm, ctx, 0);
+    let mut msg = console_format(vm, ctx, 0);
+    if level == "trace" {
+        // JSPOS (SR127): console.trace() prints the frames under its message (console §1.3.8).
+        msg = format!("{}\n{}", if msg.is_empty() { "console.trace".to_string() } else { msg }, vm.stack_trace_at().to_rust());
+    }
     super::host::console_out(lv, &msg);
     Ok(Value::Undefined)
 }

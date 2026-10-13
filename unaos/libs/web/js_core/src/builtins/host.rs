@@ -19,7 +19,7 @@ pub struct Timer {
 pub fn install_host_globals(vm: &mut Vm) {
     let op = vm.intr().object_proto;
     let console = vm.new_object(Some(op));
-    for (n, level) in [("log", 0u8), ("warn", 1), ("error", 2), ("debug", 3), ("info", 4), ("trace", 3)] {
+    for (n, level) in [("log", 0u8), ("warn", 1), ("error", 2), ("debug", 3), ("info", 4), ("trace", 5)] {
         let fp = vm.intr().function_proto;
         let f = vm.make_native_with(n, 0, console_method, false, Some(fp), alloc::vec![Value::Number(level as f64)]);
         vm.heap.get_mut(console).props.insert(PropertyKey::from_str(n), Prop::data(Value::Object(f), WEC));
@@ -137,6 +137,16 @@ fn console_method(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
         let a = vm.arg(ctx, i);
         inspect(vm, &a, 0, &mut out);
+    }
+    // JSPOS (SR127): slot 5 is console.trace — printed at the debug level with the frames under it.
+    if level == 5 {
+        if out.is_empty() {
+            out.push_str("console.trace");
+        }
+        out.push('\n');
+        out.push_str(&vm.stack_trace_at().to_rust());
+        vm.host.console(3, &out);
+        return Ok(Value::Undefined);
     }
     vm.host.console(level, &out);
     Ok(Value::Undefined)

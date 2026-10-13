@@ -1591,7 +1591,7 @@ impl Gen {
             derived,
             has_fields,
             source: Some(SourceRef { src: self.src.clone(), start: span.start, end: span.end }),
-            positions: Vec::new(),
+            positions: LineTable::empty(self.file.clone()),
             is_module: false,
             is_script: false,
             is_eval: false,

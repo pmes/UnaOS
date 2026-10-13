@@ -127,7 +127,7 @@ impl Vm {
             Ok(p) => p,
             Err(e) => return self.throw_syntax(&e.msg),
         };
-        let code = crate::compiler::compile_module(&prog);
+        let code = crate::compiler::compile_module_at(&prog, Some(&name.to_rust())); // JSPOS (SR127): frames name the module
         let info = code.module.clone().unwrap_or_default();
         let n = info.requests.len();
         let rec = ModuleRecord {

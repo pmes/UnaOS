@@ -403,21 +403,10 @@ impl Vm {
         Value::Object(o)
     }
 
-    /// The active call stack (innermost first, at most 16 frames) as "    at name" lines.
+    /// The active call stack (innermost first, at most 16 frames) as "    at name (file:line:col)" lines —
+    /// JSPOS (SR127): the positioned form from `stack_trace_at`, so engine-made errors carry positions too.
     pub fn stack_trace(&self) -> JsStr {
-        let mut out = String::new();
-        for f in self.frames.iter().rev().take(16) {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str("    at ");
-            if f.code.name.is_empty() {
-                out.push_str("<anonymous>");
-            } else {
-                out.push_str(&f.code.name.to_rust());
-            }
-        }
-        JsStr::from_str(&out)
+        self.stack_trace_at()
     }
 
     pub fn type_error(&mut self, msg: &str) -> Value {
