@@ -150,6 +150,8 @@ pub const PRELUDE: &str = r#"
             }
             terminate(s);
             s.method = method; s.reqURL = u.href; s.async = isAsync; s.reqHeaders = []; s.send = false;
+            // AETHERWPT3 (SR138): parsing a blob: URL attaches its entry (File API §8.3.4).
+            s.blobEntry = /^blob:/i.test(u.href) && typeof __blob_url_resolve === 'function' ? __blob_url_resolve(u.href, __here_origin()) : null;
             fresh(s);
             if (s.readyState !== 1) {
                 s.readyState = 1;
@@ -234,6 +236,12 @@ pub const PRELUDE: &str = r#"
                 // A data: URL is fetched without a network (Fetch §4.2 "scheme fetch").
                 try { data = __data_url(s.reqURL); } catch (e) { data = null; }
                 data = data ? [200, 'OK', s.reqURL, ['content-type', data[0]], data[1]] : 'error';
+            } else if (/^blob:/i.test(s.reqURL)) {
+                // AETHERWPT3 (SR138): Fetch §4.3, the blob scheme (a Range request header selects a 206).
+                var range = null;
+                s.reqHeaders.forEach(function (h) { if (h[0].toLowerCase() === 'range') { range = h[1]; } });
+                var br = typeof __blob_response === 'function' ? __blob_response(s.reqURL, s.method, s.blobEntry, range) : null;
+                data = br ? [br[0], br[1], s.reqURL, br[2], br[3]] : 'error';
             }
             if (!s.async) { return sendSync(this, s, flat, bytes, data); }
             s.send = true;
@@ -324,8 +332,11 @@ pub const PRELUDE: &str = r#"
     var textOf = function (s) {
         if (s.text !== null && s.textLen === s.received) { return s.text; }
         var m = mimeOf(s), cs = m && /charset\s*=\s*"?([^;"\s]+)/i.exec(m);
-        if (cs && !/^(utf-?8|unicode-1-1-utf-8)$/i.test(cs[1])) { __ledger('xhr-charset-decoded-as-utf8:' + cs[1]); }
-        s.text = new TextDecoder().decode(all(s));
+        // AETHERWPT3 (SR138): XHR §3.6.9 "text response" — the response charset's decoder (Encoding §9–§13 since O2),
+        // UTF-8 when it names none or one TextDecoder refuses.
+        var dec;
+        try { dec = new TextDecoder(cs ? cs[1] : 'utf-8'); } catch (e) { dec = new TextDecoder(); }
+        s.text = dec.decode(all(s));
         s.textLen = s.received;
         return s.text;
     };
@@ -371,7 +382,7 @@ pub const PRELUDE: &str = r#"
     var sendSync = function (xhr, s, flat, bytes, data) {
         var r;
         if (data === 'error') { r = { error: 'bad data: URL' }; }
-        else if (data) { r = { status: 200, statusText: 'OK', url: s.reqURL, headers: data[3], body: data[4].buffer }; }
+        else if (data) { r = { status: data[0], statusText: data[1], url: s.reqURL, headers: data[3], body: data[4].buffer }; }
         else if (!/^https?:/i.test(s.reqURL)) { r = { error: 'unsupported scheme' }; }
         else { r = __net_http_sync(s.method, s.reqURL.replace(/#.*$/, ''), flat, bytes, 'follow', s.timeout); }
         if (r.error !== undefined) {

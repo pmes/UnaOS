@@ -787,6 +787,7 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
     if let Err(e) = vm.run_script_str(SCOPE) {
         eprintln!("[aether-worker] scope prelude failed: {}", vm.error_string(&e));
     }
+    crate::api::platform::install_file_reader_sync(&mut vm); // AETHERWPT3 (SR138): FileReaderSync (File API §7), over SCOPE's Blob
     // AETHERWORKERS2 (SR125): the inbox dispatcher and BroadcastChannel over this thread's serial, and `Worker`
     // itself — a nested worker's spawn path reads this worker's captured facts (`creator`).
     crate::js::broadcast::install_worker(&mut vm);

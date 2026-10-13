@@ -105,6 +105,14 @@ pub fn fetch_script(url: &str, module: bool, crossorigin: Option<&str>, integrit
 /// A `file:` or `data:` script: Some((text, content type)) — the `data:` URL's MIME type, "" for a file —
 /// or None for any other scheme.
 fn local_script(url: &str) -> Option<Result<(String, String), String>> {
+    // AETHERWPT3 (SR138): a blob: URL's Blob (File API §8.3, api/blobstore.rs) — its bytes as UTF-8, its type.
+    if url.starts_with("blob:") {
+        return Some(
+            crate::api::blobstore::resolve(url, None)
+                .map(|e| (String::from_utf8_lossy(&e.bytes).into_owned(), e.mime))
+                .ok_or_else(|| format!("{url}: revoked or unknown blob URL")),
+        );
+    }
     if let Some(path) = url.strip_prefix("file://") {
         let path = percent_decode(path.split(['?', '#']).next().unwrap_or(path));
         return Some(std::fs::read_to_string(&path).map(|t| (t, String::new())).map_err(|e| format!("{url}: {e}")));

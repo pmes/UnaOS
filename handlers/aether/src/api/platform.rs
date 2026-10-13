@@ -136,6 +136,35 @@ fn codec_decode(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Object(vm.new_array(vals)))
 }
 
+/// AETHERWPT3 (SR138): `__blob_url_register(origin, bytes, type)` → a new blob URL (File API §8.3.1, api/blobstore.rs).
+fn blob_url_register(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let origin = str_arg(vm, ctx, 0)?;
+    let b = vm.arg(ctx, 1);
+    let bytes = crate::js::net::buffer_bytes(vm, &b).unwrap_or_default();
+    let mime = str_arg(vm, ctx, 2)?;
+    Ok(idl::s(&crate::api::blobstore::register(&origin, bytes, &mime)))
+}
+
+/// `__blob_url_revoke(url, origin)` (File API §8.3.3).
+fn blob_url_revoke(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let url = str_arg(vm, ctx, 0)?;
+    let origin = str_arg(vm, ctx, 1)?;
+    crate::api::blobstore::revoke(&url, &origin);
+    Ok(Value::Undefined)
+}
+
+/// `__blob_url_resolve(url, origin)` → `[ArrayBuffer, type]` or null (File API §8.3.4, partitioned by origin).
+fn blob_url_resolve(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let url = str_arg(vm, ctx, 0)?;
+    let origin = str_arg(vm, ctx, 1)?;
+    let Some(e) = crate::api::blobstore::resolve(&url, Some(&origin)) else { return Ok(Value::Null) };
+    let ab = js_core::builtins::typedarray::new_array_buffer(vm, 0)?;
+    if let Kind::ArrayBuffer(d) = &mut vm.heap.get_mut(ab).kind {
+        d.data = e.bytes.to_vec();
+    }
+    Ok(Value::Object(vm.new_array(vec![Value::Object(ab), idl::s(&e.mime)])))
+}
+
 /// `__random_bytes(n)` → array of n bytes from the OS entropy pool.
 fn random_bytes(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let v = vm.arg(ctx, 0);
@@ -174,6 +203,9 @@ pub fn init(vm: &mut Vm) {
         ("__random_bytes", 1, random_bytes),
         ("__parse_document", 1, parse_document),
         ("__codec_decode", 7, codec_decode),
+        ("__blob_url_register", 3, blob_url_register),
+        ("__blob_url_revoke", 2, blob_url_revoke),
+        ("__blob_url_resolve", 2, blob_url_resolve),
     ] {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
@@ -201,6 +233,9 @@ pub(crate) fn init_worker(vm: &mut Vm) {
         ("__form_byte", 1, form_byte),
         ("__random_bytes", 1, random_bytes),
         ("__codec_decode", 7, codec_decode),
+        ("__blob_url_register", 3, blob_url_register),
+        ("__blob_url_revoke", 2, blob_url_revoke),
+        ("__blob_url_resolve", 2, blob_url_resolve),
     ] {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
@@ -211,6 +246,64 @@ pub(crate) fn init_worker(vm: &mut Vm) {
     }
     crate::api::subtle::init(vm);
 }
+
+/// AETHERWPT3 (SR138): `FileReaderSync` (File API §7) for a dedicated worker's realm, over its Blob's bytes
+/// (`__blob_bytes`, the worker scope prelude's); installed by `workers::dedicated` after that prelude.
+pub(crate) fn install_file_reader_sync(vm: &mut Vm) {
+    if let Err(e) = vm.run_script_str(FILE_READER_SYNC) {
+        let m = vm.error_string(&e);
+        eprintln!("[aether-worker] FileReaderSync prelude failed: {m}");
+    }
+}
+
+/// File API §7 FileReaderSync and the read operations' "package data": an ArrayBuffer, a binary string, text (the label's encoding,
+/// else the Blob type's charset, else UTF-8 — a BOM overriding either, Encoding §6 "decode"), a data: URL.
+const FILE_READER_SYNC: &str = r#"
+(function () {
+    if (typeof Blob !== 'function' || typeof __blob_bytes !== 'function') { return; }
+    var bytesOf = function (blob, what) {
+        if (!(blob instanceof Blob)) { throw new TypeError("Failed to execute '" + what + "' on 'FileReaderSync': parameter 1 is not of type 'Blob'."); }
+        return new Uint8Array(__blob_bytes(blob));
+    };
+    var binary = function (b) {
+        var out = '';
+        for (var i = 0; i < b.length; i += 8192) { out += String.fromCharCode.apply(null, b.subarray(i, i + 8192)); }
+        return out;
+    };
+    var usable = function (label) {
+        try { new TextDecoder(label); return true; } catch (e) { return false; }
+    };
+    class FileReaderSync {
+        constructor() {}
+        readAsArrayBuffer(blob) { return bytesOf(blob, 'readAsArrayBuffer').slice().buffer; }
+        readAsBinaryString(blob) { return binary(bytesOf(blob, 'readAsBinaryString')); }
+        readAsText(blob) {
+            var b = bytesOf(blob, 'readAsText');
+            var enc = null, label = arguments[1];
+            if (label !== undefined && usable(String(label))) { enc = String(label); }
+            if (enc === null) {
+                var m = /;\s*charset\s*=\s*"?([^;"\s]+)/i.exec(blob.type);
+                if (m && usable(m[1])) { enc = m[1]; }
+            }
+            if (b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF) { enc = 'utf-8'; }
+            else if (b[0] === 0xFE && b[1] === 0xFF) { enc = 'utf-16be'; }
+            else if (b[0] === 0xFF && b[1] === 0xFE) { enc = 'utf-16le'; }
+            return new TextDecoder(enc || 'utf-8').decode(b);
+        }
+        readAsDataURL(blob) {
+            var b = bytesOf(blob, 'readAsDataURL');
+            return 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + btoa(binary(b));
+        }
+    }
+    Object.keys({ readAsArrayBuffer: 0, readAsBinaryString: 0, readAsText: 0, readAsDataURL: 0 }).forEach(function (k) {
+        var d = Object.getOwnPropertyDescriptor(FileReaderSync.prototype, k);
+        d.enumerable = true;
+        Object.defineProperty(FileReaderSync.prototype, k, d);
+    });
+    Object.defineProperty(FileReaderSync.prototype, Symbol.toStringTag, { value: 'FileReaderSync', configurable: true });
+    Object.defineProperty(globalThis, 'FileReaderSync', { value: FileReaderSync, writable: true, configurable: true, enumerable: false });
+})();
+"#;
 
 /// The WHATWG object shapes over the natives above.
 const PRELUDE: &str = r#"
@@ -465,16 +558,26 @@ const PRELUDE: &str = r#"
     op(URL.prototype, 'toString', { toString() { return us(this).c.href; } }.toString);
     op(URL.prototype, 'toJSON', { toJSON() { return us(this).c.href; } }.toJSON);
     Object.defineProperty(URL.prototype, Symbol.toStringTag, { value: 'URL', configurable: true });
-    // Object URLs need a blob store this engine does not have (AETHERWPT2 gap O3); the handle is unique and
-    // revocable but dereferences to nothing.
-    var blobSeq = 0;
+    // AETHERWPT3 (SR138): File API §8.3 — the blob URL store (api/blobstore.rs). createObjectURL takes a Blob (a
+    // MediaSource is js/mse.rs's, which wraps these); revokeObjectURL removes exactly the URL given, when this
+    // environment's origin created it.
+    var hereOrigin = function () { try { return String(globalThis.location.origin); } catch (e) { return 'null'; } };
     op(URL, 'createObjectURL', {
         createObjectURL(obj) {
-            if (typeof __ledger === 'function') { __ledger('URL.createObjectURL-no-blob-store'); }
-            return 'blob:' + (globalThis.location ? location.origin : 'null') + '/' + (++blobSeq);
+            if (arguments.length < 1) { throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present."); }
+            if (typeof Blob !== 'function' || !(obj instanceof Blob)) { throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed."); }
+            var bytes = typeof __blob_bytes === 'function' ? __blob_bytes(obj) : new Uint8Array(0);
+            return __blob_url_register(hereOrigin(), bytes, obj.type);
         },
     }.createObjectURL);
-    op(URL, 'revokeObjectURL', { revokeObjectURL(url) {} }.revokeObjectURL);
+    op(URL, 'revokeObjectURL', {
+        revokeObjectURL(url) {
+            if (arguments.length < 1) { throw new TypeError("Failed to execute 'revokeObjectURL' on 'URL': 1 argument required, but only 0 present."); }
+            var s = String(url);
+            if (!/^blob:/i.test(s)) { return; }
+            __blob_url_revoke(s, hereOrigin());
+        },
+    }.revokeObjectURL);
     globalThis.URL = URL;
     Object.defineProperty(globalThis, 'URL', { enumerable: false });
 })();

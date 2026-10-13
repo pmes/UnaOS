@@ -3,6 +3,8 @@
 // streaming fetch, WebSocket, EventSource, XMLHttpRequest — their worker threads and JS preludes; the
 // task source and natives are `crate::js::net`).
 pub mod a11y;
+/// AETHERWPT3 (SR138): the blob URL store (File API §8.3).
+pub mod blobstore;
 /// AETHERWPT3 (SR138): ASN.1 DER for `crypto.subtle`'s spki / pkcs8 key formats.
 pub mod der;
 /// AETHERWPT3 (SR138): the Encoding Standard's legacy decoders and generated indexes.

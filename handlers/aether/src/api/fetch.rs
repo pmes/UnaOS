@@ -660,6 +660,18 @@ pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
         let body = crate::js::host::fetch_script_text(url)?;
         return Ok(SubDocument { url: url.to_string(), content_type: mime_for_path(url), status: 200, body, charset: "UTF-8" });
     }
+    // AETHERWPT3 (SR138): a navigation to a blob: URL (Fetch §4.3 blob; navigations resolve across the origin
+    // partition) — the Blob's bytes under its type, decoded as a response of that type.
+    if url.starts_with("blob:") {
+        let e = crate::api::blobstore::resolve(url, None).ok_or_else(|| format!("revoked or unknown blob URL {url}"))?;
+        let ct = essence(&e.mime);
+        let (body, charset) = if ct.is_empty() || ct.contains("html") {
+            crate::dom::charset::decode_html(&e.bytes, &e.mime)
+        } else {
+            crate::dom::charset::decode_text(&e.bytes, &e.mime)
+        };
+        return Ok(SubDocument { url: url.to_string(), content_type: if ct.is_empty() { "text/plain".into() } else { ct }, status: 200, body, charset });
+    }
     if url.starts_with("http://") || url.starts_with("https://") {
         let r = http_sync(HttpReq {
             method: "GET".into(),
@@ -1135,13 +1147,16 @@ pub const PRELUDE: &str = r#"
                 }
             }
             var integrity = init.integrity !== undefined ? String(init.integrity) : (src ? src.integrity : '');
+            // AETHERWPT3 (SR138): URL parsing attaches a blob: URL's entry (File API §8.3.4), so a Request keeps
+            // its Blob even after the URL is revoked.
+            var blobEntry = src ? src.blobEntry : (/^blob:/i.test(url) && typeof __blob_url_resolve === 'function' ? __blob_url_resolve(url, hereOrigin()) : undefined);
             if (mode === 'no-cors' && ['GET', 'HEAD', 'POST'].indexOf(m) < 0) { throw new TypeError("Failed to construct 'Request': '" + m + "' is unsupported in no-cors mode."); }
             ST.set(this, {
                 url: url, method: m, headers: headers, body: body, bytes: bytes, signal: own, redirect: redirect,
                 credentials: credentials, mode: mode,
                 cache: cache,
                 keepalive: !!init.keepalive,
-                referrer: referrer, referrerPolicy: referrerPolicy, integrity: integrity,
+                referrer: referrer, referrerPolicy: referrerPolicy, integrity: integrity, blobEntry: blobEntry,
             });
         }
         get url() { return st(this).url; }
@@ -1255,6 +1270,32 @@ pub const PRELUDE: &str = r#"
         return [type, bytes];
     };
     hide(globalThis, '__data_url', dataURL);
+    // AETHERWPT3 (SR138): Fetch §4.3 "scheme fetch", blob — the entry's bytes as a 200, or the one range of a
+    // `Range` header (Fetch §2.2.? "parse a single range header value", whitespace allowed) as a 206; a null
+    // entry or a method other than GET is a network error (null here).
+    var hereOrigin = function () { try { return String(globalThis.location.origin); } catch (e) { return 'null'; } };
+    var blobResponse = function (url, method, entry, range) {
+        if (!entry || method !== 'GET') { return null; }
+        var all = new Uint8Array(entry[0]), full = all.length, type = entry[1];
+        if (range === null) {
+            return [200, 'OK', ['content-length', String(full), 'content-type', type], all];
+        }
+        var m = /^bytes[\t ]*=[\t ]*(\d*)[\t ]*-[\t ]*(\d*)[\t ]*$/.exec(range);
+        if (!m || (m[1] === '' && m[2] === '')) { return null; }
+        var start = m[1] === '' ? null : Number(m[1]), end = m[2] === '' ? null : Number(m[2]);
+        if (start !== null && end !== null && start > end) { return null; }
+        if (start === null) {
+            start = Math.max(full - end, 0);
+            end = full - 1;
+        } else {
+            if (start >= full) { return null; }
+            if (end === null || end >= full) { end = full - 1; }
+        }
+        var part = all.slice(start, end + 1);
+        return [206, 'Partial Content', ['content-length', String(part.length), 'content-type', type, 'content-range', 'bytes ' + start + '-' + end + '/' + full], part];
+    };
+    hide(globalThis, '__blob_response', blobResponse);
+    hide(globalThis, '__here_origin', hereOrigin);
     var fetch = function fetch(input, init) {
         return new Promise(function (resolve, reject) {
             var req;
@@ -1268,6 +1309,14 @@ pub const PRELUDE: &str = r#"
                 if (!d) { reject(new TypeError('Failed to fetch')); return; }
                 var hh = headersFrom(['content-type', d[0]], 'immutable');
                 creatingResponse = { type: 'basic', url: url, redirected: false, status: 200, statusText: 'OK', headers: hh, body: streamOf(d[1]) };
+                resolve(new Response());
+                return;
+            }
+            if (/^blob:/i.test(url)) {
+                var entry = rs.blobEntry !== undefined ? rs.blobEntry : (typeof __blob_url_resolve === 'function' ? __blob_url_resolve(url, hereOrigin()) : null);
+                var br = blobResponse(url, rs.method, entry, rs.headers.get('range'));
+                if (!br) { reject(new TypeError('Failed to fetch')); return; }
+                creatingResponse = { type: 'basic', url: url.replace(/#.*$/, ''), redirected: false, status: br[0], statusText: br[1], headers: headersFrom(br[2], 'immutable'), body: streamOf(br[3]) };
                 resolve(new Response());
                 return;
             }

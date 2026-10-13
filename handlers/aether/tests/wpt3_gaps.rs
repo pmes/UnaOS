@@ -215,3 +215,61 @@ R.push(hex(s), new TextDecoder('x-sjis').encoding);
     );
     assert_eq!(got, "430 41|410|fffd|3042 41 ff71|3042 ff71 4e02|3042 41|ac00|4e00 ca 304|4f60 20ac|80 ffff|TypeError|41 ac00|shift_jis");
 }
+
+/// Drives the event loop until `cond` holds (real time, for a worker's thread), then answers `out`.
+fn run_until(engine: &mut aether::AetherEngine, cond: &str, out: &str, secs: u64) -> String {
+    let js = engine.js_engine.as_mut().expect("engine");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        js.tick();
+        if js.eval_string(&format!("!!({cond})")).unwrap_or_default() == "true" {
+            return js.eval_string(out).unwrap_or_else(|e| format!("<error {e}>"));
+        }
+        if std::time::Instant::now() > end {
+            return format!("timed out: {}", js.eval_string(out).unwrap_or_default());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// O3 — File API §8.3 (the blob URL store: `blob:<origin>/<UUID v4>`, only an exact match revokes, a Request keeps
+/// the entry it parsed, a non-Blob is a TypeError) and Fetch §4.3 (the blob scheme: Content-Type / Content-Length,
+/// a fragment ignored, a `Range` → 206 with Content-Range, a method other than GET and a revoked URL network
+/// errors) through fetch and XMLHttpRequest; File API §7 FileReaderSync in a worker whose script is itself a blob
+/// URL.
+#[test]
+fn o3_blob_url_store_fetch_and_file_reader_sync() {
+    let mut e = load_with(
+        &page(
+            r#"
+var b = new Blob(['hello blob'], { type: 'text/plain' }), u = URL.createObjectURL(b);
+R.push(/^blob:http:\/\/127\.0\.0\.1:8000\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(u), new URL(u).origin);
+try { URL.createObjectURL({}); R.push('no throw'); } catch (e) { R.push(e.name); }
+var req = new Request(u);
+URL.revokeObjectURL(u + '#x');
+var fail = function (p) { return p.then(function () { return 'resolved'; }, function (e) { return e.name; }); };
+var x = new XMLHttpRequest();
+x.open('GET', u, false);
+x.send();
+R.push(x.status + ':' + x.responseText);
+var P = [
+    fetch(u + '#frag').then(function (r) { return r.text().then(function (t) { return r.status + ':' + r.headers.get('content-type') + ':' + r.headers.get('content-length') + ':' + t + ':' + (r.url === u); }); }),
+    fetch(u, { headers: { Range: 'bytes=6-' } }).then(function (r) { return r.text().then(function (t) { return r.status + ':' + r.headers.get('content-range') + ':' + t; }); }),
+    fail(fetch(u, { method: 'POST' })),
+];
+URL.revokeObjectURL(u);
+P.push(fail(fetch(u)), fetch(req).then(function (r) { return r.text(); }));
+var W = null;
+var wsrc = URL.createObjectURL(new Blob(["var s = new FileReaderSync(), bl = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF, 0x61, 0x62])]); postMessage([s.readAsText(bl), s.readAsDataURL(new Blob()), s.readAsArrayBuffer(bl).byteLength, s.readAsBinaryString(new Blob(['\\u03c3'])).length].join(','));"], { type: 'text/javascript' }));
+new Worker(wsrc).onmessage = function (e) { W = e.data; };
+Promise.all(P).then(function (r) { R = R.concat(r); }, function (e) { R.push('rejected ' + e); });
+"#,
+        ),
+        5_000,
+    );
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        "true|http://127.0.0.1:8000|TypeError|200:hello blob|200:text/plain:10:hello blob:true|206:bytes 6-9/10:blob|TypeError|TypeError|hello blob"
+    );
+    assert_eq!(run_until(&mut e, "W !== null", "W", 20), "ab,data:application/octet-stream;base64,,5,2");
+}
