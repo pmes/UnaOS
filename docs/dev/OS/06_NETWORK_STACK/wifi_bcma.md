@@ -1078,3 +1078,75 @@ wire. A `SENT` + `SILENT reason=no-probe-resp` with beacons present names that h
 
 **Residual:** `MACFILTER_SELF` now carries the station MAC, so the microcode ACKs unicast frames addressed to
 it; every write class is counted on the end line. QEMU models no BCM4331: WIFI1 SKIPs first.
+
+## S7 (WIFI11, B653) — TX power control from the SPROM, 2026-10-14
+
+**Knob:** none new; under `wifi10`. Lines are `[wifi11]` / `:: wifi11:`. Design, citations and wire shapes:
+`docs/dev/evidence/wifi11/WIFI11.md`.
+
+**The half WIFI10 designed and did not build.** `ident.rs` decodes the three HT-PHY cores' 2.4 GHz power blocks from the
+SPROM shadow S2r already reads (bases 0xC0/0xE0/0x100: `maxpwr_2g`, `itssi_2g`, `pa_2g[0..2]`; `drivers/bcma/sprom.c:287-294`,
+`ssb_regs.h:537-548`; one layout for every revision bcma accepts, 8..11, `sprom.c:167-173`, `:643`) and prints them by name
+with the revision. `htphyinit::tx_pwr_ctl` then runs b43's `op_init` tail (`phy_ht.c:998-1004`) after `tx_prep`: the idle
+TSSI under a TX tone (`:573-607` — the first signal this tree puts through the PA, with the MAC suspended), the control set
+up from the coefficients with the per-core 64-entry estimate tables (`:621-729`), the TSSI mux (`:609-619`), control ON
+(`:533-571`), and reads back `TX_PCTL_STATUS_C1..C3` as the index the hardware now holds. `wifi10()` runs it before the
+channel cookie, so S7's probe request leaves under control.
+
+**Witness lines:** `[wifi11] sprom rev=… core0@0x0c0 maxpwr_2g=… pa_2g=[…] …`, `[wifi11] idle-tssi …`,
+`[wifi11] txpctl-setup … -> ON`, `:: wifi11: txpctl on=1 target_idx=0x… … sprom=ok(rev=…) -> SET ::`, then WIFI10's lines
+with `tx_pwr_ctl=on` on the end line. Refusals (`-> NOT-SET reason=sprom-…` for an unread/implausible shadow,
+`reason=unprogrammed-pa-block` for a blank block — this tree's own gate, b43 has none) leave the control OFF and WIFI10
+running at the fixed index, as before.
+
+## S8 — authentication + association on an OPEN network: the design, 2026-10-14 (WIFI11, B653; not built)
+
+bcm4331.md's ladder labels S7 "MAC / station layer" (probe, auth, assoc all inside it) and S8 "WPA2-PSK"; this
+section is the arc's S8 as briefed — the open-network auth + assoc exchange, i.e. the remainder of bcm4331.md's S7
+observables — and WPA2 stays bcm4331.md's S8 after it. Sized: one arc (WIFI12), metal-only, needs an OPEN AP on the bench
+whose client list Peter can read (bcm4331.md §S7's external predicate).
+
+**State machine** (IEEE Std 802.11-2020 §11.3.1, `[PUBLIC]`): State 1 (unauthenticated, unassociated) -> open-system
+authentication -> State 2 (authenticated, unassociated) -> association -> State 3 (authenticated, associated); an RSNA
+would add State 4, an open network does not. Each transition has its own observable and its own refusal line.
+
+**Inputs from S6/S7:** the target BSS from a beacon or probe response the receiver decoded on channel 11 whose RSN IE is
+absent (`wifi_core::ieee80211::Beacon::protected() == false`), its BSSID and SSID; our station MAC (`ident::mac()`).
+The target is chosen by the operator (`tests wifi <ssid>`), never by the kernel picking the strongest open network.
+
+**The frames** (`unaos/libs/sys/wifi_core/src/ieee80211.rs`, host-tested, already in the tree since WIFI1 M3/M4), bytes
+as the builders emit them, FCS appended by the MAC:
+
+* Authentication request (`build_auth_open`): FC `b0 00` (mgmt, subtype 0xB), duration `00 00`, addr1 BSSID, addr2 STA,
+  addr3 BSSID, seq ctl `(n<<4)` LE; body `00 00` (algorithm 0, open) `01 00` (transaction 1) `00 00` (status 0). 30 bytes.
+* Authentication response (expected, `parse_auth`): the same body with transaction 2 and status at body+4; status 0 =
+  success (§9.4.1.9). Any other status is `-> REFUSED status=N`.
+* Association request (`build_assoc_req`): FC `00 00` (subtype 0x0), addr1/addr3 BSSID, addr2 STA; body capability
+  `01 00` (ESS), listen interval `03 00`, SSID IE `00 len …`, Supported Rates IE `01 04 82 84 8b 96` (1/2/5.5/11 basic).
+  The DS Parameter IE is not required of a station; the AP may require an HT Capabilities IE for an HT association but
+  an open 802.11g association needs none.
+* Association response (expected, `parse_assoc_resp`): capability, status (body+2), AID (body+4, low 14 bits; the two
+  top bits are set on the wire, §9.4.1.8). Status 0 + AID = State 3.
+
+**Hardware, all through WIFI10's ring and S6's receiver — nothing new in the DMA path:**
+
+1. `MACFILTER_BSSID` (slot 3, `b43.h:400`) <- the BSSID through the same control/data port `MACFILTER_SELF` used
+   (`main.c:657-677`, `:679-690`), so the ucode filters and ACKs on the BSS; `MACCTL.INFRA` (`b43.h:460`, `main.c:3117-3123`)
+   set for station mode (WIFI10's MACCTL writes are counted the same way).
+2. The retry limits into SHM scratch (`main.c:3972-3985`: short 7, long 4, `b43.h:608-609`) — the first unicast frames
+   this tree sends, so the ucode's retry counter needs a limit.
+3. `tx::txhdr` gains `mac_ctl |= ACK` for a unicast DA (`xmit.c:399-400`, `xmit.h:128`); `tx_receiver` = the BSSID; the
+   TX status's `acked` (WIFI10 already decodes it, `main.c:1341-1356`) is the per-frame verdict: `acked=1` means the AP's
+   MAC heard the frame, before any response is parsed — the observable that separates "not on the air" from "ignored".
+4. `rx::take` decodes subtypes 0xB and 0x1 addressed to our MAC through `parse_auth` / `parse_assoc_resp` (beside the
+   subtype 5 arm WIFI10 added), each with its BSSID checked against the target.
+5. Timing: auth response window 200 ms, assoc window 200 ms, one retry each at the station level (the ucode retries at
+   the frame level up to the limit); sequence numbers from `HWSEQ` (the ucode's, WIFI10's header).
+
+**Wire shapes:** `:: wifi12: auth bssid=… acked=1 resp=1 status=0 -> AUTHENTICATED ::` |
+`-> NOT-AUTHENTICATED reason=not-acked|no-response|status=N`; `:: wifi12: assoc … status=0 aid=N -> ASSOCIATED ::` |
+`-> NOT-ASSOCIATED reason=…`; `:: wifi12: state=3 bssid=… aid=N ::`. bcm4331.md's S7 row goes Confirmed only when the AP's
+own client list shows the station MAC (Peter reads it at the bench; the kernel cannot).
+
+**After State 3** the data path is `ethernet_to_data` / `data_to_ethernet` (the same file) over the same ring and
+receiver, which is where `smolnet` plugs in (bcm4331.md §S8's DHCP lease is the proof) — a later arc.

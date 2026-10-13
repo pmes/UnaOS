@@ -2649,6 +2649,41 @@ pub fn wifi10() {
     let suspended = rx::suspend(bar0, &mut w, "wifi10");
     let mut h = htphyinit::Ht::new(bar0);
     let tp = htphyinit::tx_prep(&mut h);
+    // WIFI11 (B653): HT-PHY TX power control from the SPROM's per-core PA coefficients — the half WIFI10
+    // designed and did not build (phy_ht.c:1001-1004, after tx_prep's :999-1000). Refused, witnessed, on an
+    // unread / implausible / blank SPROM block: the frame then leaves at WIFI10's fixed index.
+    let pctl = match ident::pwr_2g() {
+        Ok((rev, p)) => {
+            ident::pwr_line(rev, &p);
+            match p.iter().position(ident::pwr_blank) {
+                Some(c) => {
+                    serial_println!(
+                        ":: wifi11: txpctl on=0 target_idx=- sprom=blank(core{} rev={}) -> NOT-SET reason=unprogrammed-pa-block — b43 would drive control from it; the frame leaves at txpctl_cmd=[{:#06x},{:#06x},{:#06x}] ::",
+                        c, rev, tp.txpctl[0], tp.txpctl[1], tp.txpctl[2]
+                    );
+                    None
+                }
+                None => {
+                    let pin = [0usize, 1, 2].map(|c| htphyinit::PwrIn {
+                        target: p[c].maxpwr_2g, a1: p[c].pa_2g[0] as i16, b0: p[c].pa_2g[1] as i16, b1: p[c].pa_2g[2] as i16,
+                    });
+                    let r = htphyinit::tx_pwr_ctl(&mut h, &pin);
+                    serial_println!(
+                        ":: wifi11: txpctl on={} target_idx={:#06x} status=[{:#06x},{:#06x},{:#06x}] targ_pwr=[{},{},{}]dBm/4 idle_tssi=[{},{},{}] tone={} sprom=ok(rev={}) -> {} ::",
+                        r.on as u8, r.status[0], r.status[0], r.status[1], r.status[2], pin[0].target, pin[1].target, pin[2].target,
+                        r.idle[0], r.idle[1], r.idle[2], if r.tone_ok { "ran" } else { "TIMEOUT" }, rev,
+                        if r.on { "SET" } else { "NOT-SET reason=cmd-en-bits-unset" }
+                    );
+                    Some(r)
+                }
+            }
+        }
+        Err(why) => {
+            serial_println!(":: wifi11: txpctl on=0 target_idx=- sprom={} -> NOT-SET reason=sprom-{} — the frame leaves at txpctl_cmd=[{:#06x},{:#06x},{:#06x}] ::", why, why, tp.txpctl[0], tp.txpctl[1], tp.txpctl[2]);
+            None
+        }
+    };
+    let pctl_on = pctl.as_ref().map_or(false, |r| r.on);
     let cookie_pre = rx::chan_cookie(bar0, CH, &mut w);
     // 2. The TX ring, the rate memory, the PHY-TX-control words, the station MAC into the filter.
     let prep = match tx::prep(bar0, mac, &mut w) {
@@ -2707,11 +2742,11 @@ pub fn wifi10() {
         CH, WINDOW_US / 1000, if heard { "HEARD" } else { "SILENT" }, reason
     );
     serial_println!(
-        ":: wifi10: end mac-suspended-first={} cookie_pre={:#06x} wifi9_beacons={} rx2tx={} rst2rx={} tx_pwr_ctl=off tx-reset={} rx-reset={} mac-suspended={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-tx-desc={} wrote-macfilter={} wrote-irq-ack={} wrote-pci-cmd={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit=one(probe-req; MACFILTER_SELF set, so the ucode ACKs unicast to it) ::",
+        ":: wifi10: end mac-suspended-first={} cookie_pre={:#06x} wifi9_beacons={} rx2tx={} rst2rx={} tx_pwr_ctl={} tx-reset={} rx-reset={} mac-suspended={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-tx-desc={} wrote-macfilter={} wrote-irq-ack={} wrote-pci-cmd={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit=one(probe-req; MACFILTER_SELF set, so the ucode ACKs unicast to it) ::",
         suspended as u8, cookie_pre, beacons.map(|n| alloc::format!("{}", n)).unwrap_or_else(|| alloc::string::String::from("none")),
-        tp.rx2tx as u8, tp.rst2rx as u8, tx_off as u8, rx_off as u8, mac_off as u8,
-        w.macctl, w.shm, w.dma, w.tx_desc, w.macfilter, w.irq_ack, w.pci_cmd, tp.c.core_regs, tp.c.wrapper,
+        tp.rx2tx as u8, tp.rst2rx as u8, if pctl_on { "on" } else { "off" }, tx_off as u8, rx_off as u8, mac_off as u8,
+        w.macctl, w.shm, w.dma, w.tx_desc, w.macfilter, w.irq_ack, w.pci_cmd, h.c.core_regs, h.c.wrapper,
         if shm_ok { "MATCH" } else { "FAILED" }
     );
-    let _ = (prep.rate_mem, prep.reset_ok, prep.txstatus0, tp.pctl_en);
+    let _ = (prep.rate_mem, prep.reset_ok, prep.txstatus0, tp.pctl_en, pctl.as_ref().map(|r| (r.cmd, r.targ, r.idle_regs, r.samp_stat, r.c.timeouts)));
 }

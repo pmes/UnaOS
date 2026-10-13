@@ -49,7 +49,7 @@ pub(super) fn sprom_read(bar0: u64, ssid_dev: u16) {
         Verdict::Blocked => 3,
         Verdict::Short => 4,
     });
-    *ID.lock() = Some(id);
+    *ID.lock() = Some(id); #[cfg(feature = "wifi10")] { *PWR.lock() = Some(pwr_decode(&words)); } // WIFI11 (B653): the per-core power blocks, same read
 }
 
 pub(super) fn note_phy(raw: u16) {
@@ -96,4 +96,83 @@ pub(super) fn identity_line() {
 pub(super) fn mac() -> Option<[u8; 6]> {
     let id = (*ID.lock())?;
     if id.mac_ok { Some(id.mac) } else { None }
+}
+
+// ── WIFI11 (B653): the SPROM's per-core 2.4 GHz power info, for HT-PHY TX power control ───────────
+/// One core's 2.4 GHz power block as `drivers/bcma/sprom.c` reads it for SPROM revisions 8..11
+/// (`bcma_sprom_valid` accepts 8..=11, `sprom.c:167-173`; every one is extracted by
+/// `bcma_sprom_extract_r8`, `sprom.c:643`): byte +0x00 = maxpwr_2g (bits 7:0) and itssi_2g (bits
+/// 15:8) (`ssb_regs.h:542-545`, `sprom.c:287-290`), +0x02/+0x04/+0x06 = pa_2g[0..2] (`ssb_regs.h:546-548`,
+/// `sprom.c:292-294`). A fourth coefficient exists in Linux's struct and is never read for this layout.
+#[cfg(feature = "wifi10")]
+#[derive(Clone, Copy)]
+pub(super) struct CorePwr {
+    pub itssi_2g: u8,
+    pub maxpwr_2g: u8,
+    pub pa_2g: [u16; 3],
+}
+
+/// The three HT-PHY cores' power-info block base offsets (bytes): `ssb_regs.h:537-539`
+/// (`SSB_SROM8_PWR_INFO_CORE0..2`); the fourth block (0x0120) belongs to no HT-PHY core
+/// (`phy_ht.c:632-637` reads cores 0..2). The last byte read, 0x100 + 0x07, is inside the 440-byte shadow.
+#[cfg(feature = "wifi10")]
+pub(super) const PWR_INFO_CORE: [usize; 3] = [0x00C0, 0x00E0, 0x0100];
+
+#[cfg(feature = "wifi10")]
+static PWR: Mutex<Option<[CorePwr; 3]>> = Mutex::new(None);
+
+/// Decode the three blocks from the shadow words (word index = byte offset / 2, `sprom.c:183`).
+#[cfg(feature = "wifi10")]
+fn pwr_decode(words: &[u16]) -> [CorePwr; 3] {
+    let w = |b: usize| words.get(b / 2).copied().unwrap_or(0xFFFF);
+    let mut out = [CorePwr { itssi_2g: 0, maxpwr_2g: 0, pa_2g: [0; 3] }; 3];
+    for (c, base) in PWR_INFO_CORE.iter().enumerate() {
+        let mi = w(*base);
+        out[c] = CorePwr {
+            maxpwr_2g: (mi & 0x00FF) as u8,
+            itssi_2g: (mi >> 8) as u8,
+            pa_2g: [w(*base + 0x02), w(*base + 0x04), w(*base + 0x06)],
+        };
+    }
+    out
+}
+
+/// A block an unprogrammed SPROM would carry: the three PA words uniform 0xFFFF or 0x0000, or a max
+/// power of 0 or 0xFF. b43 would drive power control from such a block; this tree refuses (the wire
+/// says `sprom=blank`) and the frame leaves at WIFI10's fixed index instead.
+#[cfg(feature = "wifi10")]
+pub(super) fn pwr_blank(p: &CorePwr) -> bool {
+    let pa = p.pa_2g;
+    pa == [0xFFFF; 3] || pa == [0; 3] || p.maxpwr_2g == 0 || p.maxpwr_2g == 0xFF
+}
+
+/// The power info this boot read, with the SPROM revision, only when S2r judged the shadow PLAUSIBLE
+/// (`status::sprom_token() == "ok"`, the gate `mac()` shares). `Err` names the verdict otherwise.
+#[cfg(feature = "wifi10")]
+pub(super) fn pwr_2g() -> Result<(u8, [CorePwr; 3]), &'static str> {
+    let Some(id) = *ID.lock() else { return Err("unread") };
+    if id.verdict != Verdict::Plausible {
+        return Err(id.verdict.token());
+    }
+    match *PWR.lock() {
+        Some(p) => Ok((id.rev, p)),
+        None => Err("unread"),
+    }
+}
+
+/// Print the decoded blocks by name, one line: `[wifi11] sprom rev=… core0@0xc0 maxpwr_2g=… …`.
+#[cfg(feature = "wifi10")]
+pub(super) fn pwr_line(rev: u8, p: &[CorePwr; 3]) {
+    let mut s = String::new();
+    for (c, cp) in p.iter().enumerate() {
+        let _ = write!(
+            s, " core{}@{:#05x} maxpwr_2g={}({}dBm/4) itssi_2g={} pa_2g=[{:#06x},{:#06x},{:#06x}]{}",
+            c, PWR_INFO_CORE[c], cp.maxpwr_2g, cp.maxpwr_2g, cp.itssi_2g, cp.pa_2g[0], cp.pa_2g[1], cp.pa_2g[2],
+            if pwr_blank(cp) { "(blank)" } else { "" }
+        );
+    }
+    serial_println!(
+        "[wifi11] sprom rev={} layout=rev8..11(bcma extract_r8 for every accepted revision){} — sprom.c:167-173, :221-232, :285-294; ssb_regs.h:537-548",
+        rev, s
+    );
 }
