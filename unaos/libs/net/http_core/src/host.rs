@@ -693,6 +693,84 @@ struct Inner {
     connecting: Mutex<HashMap<PoolKey, Vec<Job>>>,
     /// Origins that answered ALPN with HTTP/1.1: a burst to them no longer waits on a handshake.
     h1_origins: Mutex<std::collections::HashSet<PoolKey>>,
+    /// NETDEBT (SR97): HTTP/1.1 connection threads per origin and the jobs waiting for one
+    /// ([`MAX_H1_PER_ORIGIN`]). Lock order: `connecting`, then `h1_slots`, then `pool`.
+    h1_slots: Mutex<HashMap<PoolKey, H1Slots>>,
+}
+
+/// NETDEBT (SR97): at most this many HTTP/1.1 connections per origin at once (the browsers' long-standing
+/// six; RFC 9112 §9.4 asks a client to limit them). A request beyond it waits for one of them to finish an
+/// exchange (it is served next on that connection) or to close (a new connection is opened for it).
+pub const MAX_H1_PER_ORIGIN: usize = 6;
+
+#[derive(Default)]
+struct H1Slots {
+    /// Connection threads that hold a slot (dialling, handshaking, serving or parked).
+    live: usize,
+    waiting: alloc::collections::VecDeque<Job>,
+}
+
+/// What [`Agent::admit`] decided for a job that needs a new connection.
+enum Admit {
+    /// A slot is taken: spawn the connection.
+    Spawn(Job),
+    /// At the cap, but a parked connection is free: hand it the job.
+    Idle(Sender<Job>, Job),
+    /// At the cap: the job waits for a slot.
+    Queued,
+}
+
+/// The slot a connection thread holds; released when the thread ends or its connection turns out to be h2.
+/// A waiting job inherits a released slot on a connection of its own.
+struct H1Slot {
+    inner: Arc<Inner>,
+    key: PoolKey,
+    held: bool,
+}
+
+impl H1Slot {
+    fn release(&mut self) {
+        if !self.held {
+            return;
+        }
+        self.held = false;
+        let next = self.inner.h1_slots.lock().ok().and_then(|mut m| {
+            let e = m.get_mut(&self.key)?;
+            match e.waiting.pop_front() {
+                Some(j) => Some(j), // the slot passes to it: `live` unchanged
+                None => {
+                    e.live = e.live.saturating_sub(1);
+                    if e.live == 0 {
+                        m.remove(&self.key);
+                    }
+                    None
+                }
+            }
+        });
+        if let Some(j) = next {
+            spawn_connection(self.inner.clone(), self.key.clone(), j, false);
+        }
+    }
+}
+
+impl Drop for H1Slot {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A connection thread for `job` that already owns a slot for `key`.
+fn spawn_connection(inner: Arc<Inner>, key: PoolKey, job: Job, owns_coalesce: bool) {
+    let id = {
+        let mut n = inner.next_id.lock().unwrap();
+        *n += 1;
+        *n
+    };
+    let slot = H1Slot { inner: inner.clone(), key: key.clone(), held: true };
+    std::thread::Builder::new()
+        .name(format!("http-conn-{id}"))
+        .spawn(move || connection_thread(inner, key, id, job, owns_coalesce, slot))
+        .expect("spawn connection thread");
 }
 
 /// A client: configuration, a cookie jar (optional), and a pool of keep-alive connection threads.
@@ -730,7 +808,16 @@ fn now_secs() -> i64 {
 
 impl Agent {
     pub fn new(cfg: AgentConfig) -> Self {
-        Agent { inner: Arc::new(Inner { cfg, pool: Mutex::new(HashMap::new()), next_id: Mutex::new(1), connecting: Mutex::new(HashMap::new()), h1_origins: Mutex::new(std::collections::HashSet::new()) }) }
+        Agent {
+            inner: Arc::new(Inner {
+                cfg,
+                pool: Mutex::new(HashMap::new()),
+                next_id: Mutex::new(1),
+                connecting: Mutex::new(HashMap::new()),
+                h1_origins: Mutex::new(std::collections::HashSet::new()),
+                h1_slots: Mutex::new(HashMap::new()),
+            }),
+        }
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -793,25 +880,56 @@ impl Agent {
         let coalesce = key.scheme == "https"
             && offers_h2(&self.inner.cfg)
             && !self.inner.h1_origins.lock().map(|h| h.contains(&key)).unwrap_or(false);
-        if coalesce && parked {
-            let Ok(mut c) = self.inner.connecting.lock() else { return };
-            if let Some(waiting) = c.get_mut(&key) {
-                waiting.push(job);
-                return;
-            }
-            c.insert(key.clone(), Vec::new());
-        }
-        let id = {
-            let mut n = self.inner.next_id.lock().unwrap();
-            *n += 1;
-            *n
-        };
-        let inner = self.inner.clone();
         let owns_coalesce = coalesce && parked;
-        std::thread::Builder::new()
-            .name(format!("http-conn-{id}"))
-            .spawn(move || connection_thread(inner, key, id, job, owns_coalesce))
-            .expect("spawn connection thread");
+        loop {
+            // NETDEBT (SR97): a new connection only under the per-origin cap.
+            let admitted = if owns_coalesce {
+                let Ok(mut c) = self.inner.connecting.lock() else { return };
+                if let Some(waiting) = c.get_mut(&key) {
+                    waiting.push(job);
+                    return;
+                }
+                let a = self.admit(&key, job);
+                if matches!(a, Admit::Spawn(_)) {
+                    c.insert(key.clone(), Vec::new());
+                }
+                a
+            } else {
+                self.admit(&key, job)
+            };
+            match admitted {
+                Admit::Spawn(j) => return spawn_connection(self.inner.clone(), key, j, owns_coalesce),
+                Admit::Queued => return,
+                Admit::Idle(tx, j) => match tx.send(j) {
+                    Ok(()) => return,
+                    Err(mpsc::SendError(j)) => job = j, // that thread is gone (its slot goes with it): again
+                },
+            }
+        }
+    }
+
+    /// NETDEBT (SR97): take a connection slot for `key`, or — at [`MAX_H1_PER_ORIGIN`] — a parked HTTP/1.1
+    /// connection that is free after all, or queue the job until a slot frees. Checked under the slots lock,
+    /// which `serve` also holds while it parks, so a job is never queued past a connection that just parked.
+    fn admit(&self, key: &PoolKey, job: Job) -> Admit {
+        let Ok(mut m) = self.inner.h1_slots.lock() else { return Admit::Spawn(job) };
+        let e = m.entry(key.clone()).or_default();
+        if e.live < MAX_H1_PER_ORIGIN {
+            e.live += 1;
+            return Admit::Spawn(job);
+        }
+        let idle = self.inner.pool.lock().ok().and_then(|mut p| {
+            let v = p.get_mut(key)?;
+            let i = v.iter().rposition(|i| !i.mux)?;
+            Some(v.remove(i).tx)
+        });
+        match idle {
+            Some(tx) => Admit::Idle(tx, job),
+            None => {
+                e.waiting.push_back(job);
+                Admit::Queued
+            }
+        }
     }
 
     /// The fields every request carries from this Agent: the jar's cookies, the User-Agent, and (when the
@@ -1079,7 +1197,8 @@ impl Drop for Coalesce {
     }
 }
 
-fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coalescing: bool) {
+fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coalescing: bool, slot: H1Slot) {
+    let mut slot = slot;
     let mut coalesce = coalescing.then(|| Coalesce { inner: inner.clone(), key: key.clone(), armed: true });
     let cfg = inner.cfg.clone();
     let fail = |job: Job, e: Error| {
@@ -1130,6 +1249,8 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coale
         let peer = PeerChain::of(&client);
         let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
         if alpn_h2 {
+            // An h2 connection multiplexes: it is not one of the origin's HTTP/1.1 connections.
+            slot.release();
             let mut h2c = match crate::h2::H2Conn::handshake(tls) {
                 Ok(c) => c,
                 Err(e) => return fail(first, e),
@@ -1164,12 +1285,28 @@ fn serve(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, mut run: impl F
         let outcome = run(job, reused);
         let job_back = match outcome {
             Outcome::Reusable(finish) => {
-                // Park BEFORE telling the caller the exchange ended, so its next request finds this connection.
-                if let Ok(mut p) = inner.pool.lock() {
-                    p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone(), mux: false });
-                }
+                // NETDEBT (SR97): a job waiting on the origin's connection cap is served here next; otherwise
+                // park BEFORE telling the caller the exchange ended, so its next request finds this connection.
+                // Both under the slots lock (see `Agent::admit`).
+                let queued = match inner.h1_slots.lock() {
+                    Ok(mut m) => match m.get_mut(key).and_then(|e| e.waiting.pop_front()) {
+                        Some(j) => Some(j),
+                        None => {
+                            if let Ok(mut p) = inner.pool.lock() {
+                                p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone(), mux: false });
+                            }
+                            None
+                        }
+                    },
+                    Err(_) => None,
+                };
                 if let Some((mut sink, r)) = finish {
                     sink.send(Event::End(r));
+                }
+                if let Some(j) = queued {
+                    job = j;
+                    reused = true;
+                    continue;
                 }
                 None
             }
