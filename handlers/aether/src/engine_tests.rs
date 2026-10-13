@@ -3367,7 +3367,10 @@ mod tests {
         let nav = engine.take_pending_nav().expect("post");
         assert_eq!(nav.method, forms::HttpMethod::Post);
         assert_eq!(nav.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(nav.body.as_deref(), Some("r=2\r\ns=bee\r\nact=post\r\n"));
+        // A `method=get` form posted by `formmethod=post formenctype=text/plain` sends its body URLENCODED
+        // under a text/plain header in Chromium (tests/data/forms_oracle/getform-postplain.expect, the
+        // sha-pinned measured vector for this exact shape; forms/mod.rs plan_navigation reproduces it).
+        assert_eq!(nav.body.as_deref(), Some("r=2&s=bee&act=post"));
     }
 
     /// A `submit` listener that cancels keeps the page (a scripted form submits itself).

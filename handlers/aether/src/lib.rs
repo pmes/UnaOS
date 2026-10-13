@@ -950,7 +950,19 @@ impl AetherEngine {
                                         self.set_focus(Some(control.clone()));
                                     } else if !forms::is_disabled(&control) {
                                         self.set_focus(Some(control.clone()));
-                                        self.activate(&control, (0, 0));
+                                        if self.js_engine.is_some() {
+                                            // The label's activation behavior already ran inside the click's
+                                            // dispatch above (js/events.rs activation_behavior "label": a
+                                            // synthetic click on the control, its checkbox/radio toggle and a
+                                            // submit button's submission included); a second click here undid
+                                            // the toggle. The submission it queued navigates now.
+                                            self.repaint_checkable(&control);
+                                            if let Some(nav) = js::take_form_submission() {
+                                                self.pending_nav = Some(nav);
+                                            }
+                                        } else {
+                                            self.activate(&control, (0, 0));
+                                        }
                                     }
                                     return;
                                 }
@@ -1281,8 +1293,13 @@ impl AetherEngine {
             self.submit_form(node, Some(node), coords);
             return;
         }
+        self.repaint_checkable(node);
+    }
+
+    /// A checkbox or radio whose checkedness changed repaints: its form (a radio's group mates may sit
+    /// anywhere in it), or the viewport when it has no form.
+    fn repaint_checkable(&mut self, node: &crate::dom::NodeRef) {
         if matches!(layout::control_kind(node), Some(layout::Control::Checkbox | layout::Control::Radio)) {
-            // A radio's group mates may sit anywhere in the form: repaint the form.
             match forms::form_owner(node) {
                 Some(f) => self.damage_node(&f),
                 None => {
