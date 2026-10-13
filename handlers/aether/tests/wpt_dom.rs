@@ -266,10 +266,9 @@ fn helper_sources(root: &Path, name: &str, src: &str) -> String {
 
 fn excluded(name: &str, src: &str) -> Option<&'static str> {
     let base = name.rsplit('/').next().unwrap_or(name);
-    if src.contains("window.open(")
-        || src.contains("<frameset")
-        || src.contains("<object")
-    {
+    // AETHERWPT4 (SR142): `window.open(` is no longer a reason — auxiliary browsing contexts landed with AETHERWPT3 O8
+    // (js/frames.rs, HTML §7.2.2.1); frameset and object documents still are.
+    if src.contains("<frameset") || src.contains("<object") {
         return Some("frames / browsing contexts");
     }
     // Documents that stop being fully active (an iframe navigated away or removed while its realm's
@@ -280,8 +279,10 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
     if base.contains("moveBefore") {
         return Some("moveBefore (2025 proposal)");
     }
-    if src.contains(".xhtml") || src.contains(".xml\"") || src.contains("XMLHttpRequest") || src.contains("fetch(") {
-        return Some("XML documents / network (SR70)");
+    // AETHERWPT4 (SR142): `XMLHttpRequest` / `fetch(` are no longer reasons — the network APIs run since AETHERNET (SR70)
+    // and the run serves the checkout; XML documents loaded as documents (.xhtml / .xml) still are.
+    if src.contains(".xhtml") || src.contains(".xml\"") {
+        return Some("XML documents");
     }
     if src.contains("testdriver.js") || src.contains("test_driver") {
         return Some("testdriver (WebDriver input automation)");
@@ -296,7 +297,6 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
         || name.starts_with("html/webappapis/update-rendering/")
         || name.starts_with("html/semantics/forms/customizable-combobox/")
         || src.contains("getBoundingClientRect")
-        || src.contains("getComputedStyle")
         || src.contains("offsetWidth")
         || src.contains("offsetHeight")
         || src.contains("offsetTop")
@@ -305,10 +305,10 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
         || src.contains("clientHeight")
         || src.contains("scrollTop")
         || src.contains("scrollLeft")
-        || src.contains("elementFromPoint")
-        || src.contains("scrollIntoView")
-        || src.contains("requestAnimationFrame")
     {
+        // AETHERWPT4 (SR142): `getComputedStyle` (the full author cascade, js/cssom.rs `cascaded_value`),
+        // `elementFromPoint` / `elementsFromPoint` (CSSOM View §6.1 hit testing), `scrollIntoView` (CSSOM View §7) and
+        // `requestAnimationFrame` (HTML §8.10, js/window.rs since AETHERJS) are no longer reasons on their own.
         return Some("layout / rendering (EYES is the oracle)");
     }
     if src.contains("alert(") && name.contains("user-prompts") || src.contains("print(") && name.contains("user-prompts") {
@@ -699,8 +699,9 @@ fn net_excluded(rel: &str, src: &str) -> Option<String> {
     if src.contains("RemoteContextHelper") || name.contains("back-forward-cache") {
         return Some("bfcache / remote browsing contexts".into());
     }
-    if src.contains("window.open(") || src.contains("document.domain") {
-        return Some("frames / browsing contexts / document.domain".into());
+    // AETHERWPT4 (SR142): `window.open(` runs (AETHERWPT3 O8's auxiliary browsing contexts); `document.domain` does not.
+    if src.contains("document.domain") {
+        return Some("document.domain".into());
     }
     if src.contains("://天気") || src.contains("\\u5929") {
         return Some("an IDN subdomain of the test host (needs web-platform.test DNS)".into());
@@ -732,21 +733,9 @@ fn net_excluded(rel: &str, src: &str) -> Option<String> {
         }
     }
     if dir.starts_with("xhr") {
-        if src.contains("responseXML") || src.contains("\"document\"") || src.contains("'document'") || src.contains(".xml") || src.contains("XMLDocument") || src.contains("xhtml") {
-            return Some("XML / document responses (Aether's XHR answers null)".into());
-        }
-        if src.contains("FormData") || dir.contains("formdata") {
-            return Some("FormData".into());
-        }
-        if src.contains("createObjectURL") || src.contains("blob:") {
-            return Some("blob: URLs".into());
-        }
-        if src.contains(".upload") {
-            return Some("upload progress events (not produced)".into());
-        }
-        if src.contains("shift_jis") || src.contains("windows-1252") || src.contains("iso-8859") || src.contains("charset=windows") || src.contains("big5") || src.contains("gbk") || src.contains("utf-16") || src.contains("UTF-16") {
-            return Some("legacy charsets (responseText decodes UTF-8 only)".into());
-        }
+        // AETHERWPT4 (SR142): XML / document responses (XHR §3.6.10 over api/xml.rs), FormData, blob: URLs (AETHERWPT3
+        // O3), upload progress events (XHR §3.5.6) and legacy charsets (XHR §3.6 final MIME type / encoding over
+        // AETHERWPT3 O2's decoders) are no longer reasons.
         if src.contains("setRequestHeader(\"Authorization\"") || name.contains("send-authentication") || name.contains("user-password") {
             return Some("HTTP authentication".into());
         }
@@ -1000,9 +989,7 @@ fn wpt2_excluded(root: &Path, rel: &str, src: &str) -> Option<String> {
     if scan.contains("RemoteContextHelper") || scan.contains("/common/dispatcher/") || name.contains("back-forward-cache") || rel.contains("/bfcache/") {
         return Some("bfcache / remote browsing contexts".into());
     }
-    if scan.contains("window.open(") {
-        return Some("auxiliary browsing contexts (window.open)".into());
-    }
+    // AETHERWPT4 (SR142): `window.open(` is no longer a reason (AETHERWPT3 O8: auxiliary browsing contexts, js/frames.rs).
     if src.contains("REMOTE_ORIGIN") || src.contains("REMOTE_HOST") || src.contains("HTTP_REMOTE") || src.contains("OTHER_ORIGIN") || src.contains("{{domains[") || src.contains("{{hosts[") || src.contains("CROSSDOMAIN") || src.contains("get_host_info().HTTPS") || name.contains("cross-origin") || name.contains("access-control") || name.contains("cors") || dir.contains("/cors") || dir.contains("/credentials") {
         return Some("cross-origin (no second origin with CORS in the stand-in)".into());
     }
@@ -1015,7 +1002,9 @@ fn wpt2_excluded(root: &Path, rel: &str, src: &str) -> Option<String> {
         return Some("media fixtures (/media/ is not in the sparse checkout)".into());
     }
     if [
-        "getBoundingClientRect", "getComputedStyle", "offsetWidth", "offsetHeight", "offsetTop", "offsetLeft", "clientWidth", "clientHeight", "scrollTop", "scrollLeft", "elementFromPoint", "scrollIntoView", "requestAnimationFrame", "caretPositionFromPoint",
+        // AETHERWPT4 (SR142): getComputedStyle, elementFromPoint, scrollIntoView and requestAnimationFrame lifted (as in
+        // `excluded`).
+        "getBoundingClientRect", "offsetWidth", "offsetHeight", "offsetTop", "offsetLeft", "clientWidth", "clientHeight", "scrollTop", "scrollLeft", "caretPositionFromPoint",
     ]
     .iter()
     .any(|t| src.contains(t))

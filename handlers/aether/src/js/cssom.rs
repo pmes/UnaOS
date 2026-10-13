@@ -1080,6 +1080,7 @@ thread_local! {
 
 pub fn reset() {
     FLUSHED.with(|f| *f.borrow_mut() = None);
+    CASCADED.with(|c| *c.borrow_mut() = None);
 }
 
 /// Runs `f` over an up-to-date layout of the main document (rebuilt when the DOM changed).
@@ -1230,6 +1231,12 @@ pub fn computed_value(el: usize, prop: &str) -> String {
             return format!("{}px", trim_num(v as f64));
         }
     }
+    // AETHERWPT4 (SR142): the cascaded value (every author sheet and the style attribute), inherited from the parent
+    // for an inherited property the element does not declare — CSSOM §9's resolved value for the properties the
+    // layout report does not compute.
+    if let Some(v) = cascaded_value(el, prop) {
+        return v;
+    }
     let inline = inline_block(el).get(prop);
     if !inline.is_empty() {
         crate::ledger::record_css(&format!("getComputedStyle-inline-not-cascaded:{prop}"));
@@ -1237,6 +1244,68 @@ pub fn computed_value(el: usize, prop: &str) -> String {
     }
     crate::ledger::record_css(&format!("getComputedStyle-initial-not-cascaded:{prop}"));
     initial_value(prop).to_string()
+}
+
+thread_local! {
+    /// AETHERWPT4 (SR142): each element's cascaded declarations as a declaration block, for the DOM version they
+    /// were computed at.
+    static CASCADED: std::cell::RefCell<Option<(u64, HashMap<NodeId, Block>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The cascaded value of `prop` on `el` (shorthands expanded to longhands, the cascade's last declaration of a longhand
+/// winning), serialized as `element.style` serializes it; None when no author declaration sets it.
+fn cascaded_declared(el: usize, prop: &str) -> Option<String> {
+    let version = page(|p| p.version);
+    let stale = CASCADED.with(|c| c.borrow().as_ref().map(|x| x.0) != Some(version));
+    if stale {
+        let (w, h) = page(|p| p.viewport);
+        let sheets = current_sheets();
+        let root = dom::main_doc();
+        let decls = with_doc(|d| crate::css::author_declarations(d, NodeId(root), &sheets, w, h));
+        let blocks: HashMap<NodeId, Block> = decls
+            .into_iter()
+            .map(|(id, list)| {
+                let mut b = Block::default();
+                for d in list {
+                    let name = if d.name.starts_with("--") { d.name.clone() } else { d.name.to_ascii_lowercase() };
+                    b.set(&name, &d.value, d.important);
+                }
+                (id, b)
+            })
+            .collect();
+        CASCADED.with(|c| *c.borrow_mut() = Some((version, blocks)));
+    }
+    CASCADED.with(|c| {
+        let c = c.borrow();
+        let v = c.as_ref()?.1.get(&NodeId(el))?.get(prop);
+        (!v.is_empty()).then_some(v)
+    })
+}
+
+/// CSS Cascade 5 §7.3 (the CSS-wide keywords) and §7.2 (inheritance) over [`cascaded_declared`]: `inherit` and an
+/// undeclared inherited property take the parent's computed value, `initial` the initial value, `unset` / `revert`
+/// either by whether the property inherits. A value that still holds `var()` is left to the fallback path.
+fn cascaded_value(el: usize, prop: &str) -> Option<String> {
+    let declared = cascaded_declared(el, prop);
+    let parent = || with_doc(|d| d.parent_element(NodeId(el)).map(|p| p.0)).filter(|p| with_doc(|d| d.element(NodeId(*p)).is_some()));
+    let inherits = css_core::container::inherited_property(prop);
+    let from_parent = || parent().map(|p| computed_value(p, prop)).filter(|v| !v.is_empty());
+    let initial = || Some(initial_value(prop).to_string()).filter(|v| !v.is_empty());
+    match declared.as_deref() {
+        Some("inherit") => from_parent(),
+        Some("initial") => initial(),
+        Some("unset" | "revert" | "revert-layer") => {
+            if inherits {
+                from_parent()
+            } else {
+                initial()
+            }
+        }
+        Some(v) if v.contains("var(") => None,
+        Some(v) => Some(v.to_string()),
+        None if inherits => from_parent(),
+        None => None,
+    }
 }
 
 fn trim_num(v: f64) -> String {
@@ -1487,10 +1556,219 @@ fn scroll_to(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
-fn noop_el(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_element(vm, ctx)?;
+// =================================================================================================
+// AETHERWPT4 (SR142): CSSOM View §6.1 hit testing and §7 scrollIntoView
+// =================================================================================================
+
+/// The document's extent (the union of every box) — the scrollable overflow of the viewport.
+fn document_extent() -> (f64, f64) {
+    with_layout(|f| {
+        let mut w = 0f32;
+        let mut h = 0f32;
+        for rs in f.boxes.values() {
+            for (x, y, bw, bh) in rs {
+                w = w.max(x + bw);
+                h = h.max(y + bh);
+            }
+        }
+        (w as f64, h as f64)
+    })
+}
+
+/// The paint layer an element is hit in: positioned boxes (and their descendants) above in-flow ones, ordered by the
+/// nearest positioned ancestor-or-self's `z-index` (CSS 2 Appendix E's stacking order, without nested contexts).
+fn paint_layer(el: usize) -> (i32, i64) {
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        let pos = computed_value(c, "position");
+        if !pos.is_empty() && pos != "static" {
+            let z = computed_value(c, "z-index").parse::<i64>().unwrap_or(0);
+            return (1, z);
+        }
+        cur = with_doc(|d| d.parent_element(NodeId(c)).map(|p| p.0));
+    }
+    (0, 0)
+}
+
+/// CSSOM View §6.1 `elementsFromPoint`: every element whose border box contains the viewport point, topmost first
+/// (positioned layers above the flow, then later in tree order — descendants and later siblings — above earlier), the
+/// root element last; `pointer-events: none` and `visibility: hidden` boxes are not hit-test targets. Empty when the
+/// point is outside the viewport.
+fn hit_test(x: f64, y: f64) -> Vec<usize> {
+    let (vw, vh) = page(|p| p.viewport);
+    if x < 0.0 || y < 0.0 || x > vw as f64 || y > vh as f64 || !x.is_finite() || !y.is_finite() {
+        return Vec::new();
+    }
+    let (sx, sy) = page(|p| p.scroll);
+    let (dx, dy) = ((x + sx) as f32, (y + sy) as f32);
+    let doc = dom::main_doc();
+    let order: Vec<usize> = with_doc(|d| d.descendants(NodeId(doc)).filter(|i| d.element(*i).is_some()).map(|i| i.0).collect());
+    let raw: Vec<(usize, usize)> = with_layout(|f| {
+        order
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| f.boxes.get(&NodeId(**id)).is_some_and(|rs| rs.iter().any(|(bx, by, bw, bh)| dx >= *bx && dx < bx + bw && dy >= *by && dy < by + bh)))
+            .map(|(i, id)| (i, *id))
+            .collect()
+    });
+    let mut hits: Vec<((i32, i64), usize, usize)> = raw
+        .into_iter()
+        .filter(|(_, id)| computed_value(*id, "pointer-events") != "none" && computed_value(*id, "visibility") != "hidden")
+        .map(|(i, id)| (paint_layer(id), i, id))
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    let mut out: Vec<usize> = hits.into_iter().map(|h| h.2).collect();
+    let root = with_doc(|d| d.element_children(NodeId(doc)).next().map(|r| r.0));
+    if let Some(r) = root {
+        out.retain(|e| *e != r);
+        out.push(r);
+    }
+    out
+}
+
+fn point_args(vm: &mut Vm, ctx: &CallCtx, what: &str) -> JsResult<(f64, f64)> {
+    if ctx.argc < 2 {
+        return vm.throw_type(&format!("Failed to execute '{what}' on 'Document': 2 arguments required, but only {} present.", ctx.argc));
+    }
+    let x = vm.to_number(&arg(vm, ctx, 0))?;
+    let y = vm.to_number(&arg(vm, ctx, 1))?;
+    if !x.is_finite() || !y.is_finite() {
+        return vm.throw_type(&format!("Failed to execute '{what}' on 'Document': The provided double value is non-finite."));
+    }
+    Ok((x, y))
+}
+
+/// The document a hit test runs against: the page's own (other documents have no viewport, CSSOM View §6.1 "If
+/// the document has no viewport, return null / the empty sequence").
+fn this_main_doc(vm: &mut Vm, ctx: &CallCtx) -> bool {
+    dom::node_of(vm, &ctx.this) == Some(dom::main_doc())
+}
+
+fn element_from_point(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (x, y) = point_args(vm, ctx, "elementFromPoint")?;
+    if !this_main_doc(vm, ctx) {
+        return Ok(Value::Null);
+    }
+    let first = hit_test(x, y).first().copied();
+    Ok(dom::wrap_opt(vm, first))
+}
+
+fn elements_from_point(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (x, y) = point_args(vm, ctx, "elementsFromPoint")?;
+    let hits = if this_main_doc(vm, ctx) { hit_test(x, y) } else { Vec::new() };
+    let vals: Vec<Value> = hits.into_iter().map(|e| dom::wrap(vm, e)).collect();
+    Ok(Value::Object(vm.new_array(vals)))
+}
+
+/// One axis of CSSOM View "determine the scroll-into-view position": the new scroll offset of a scrolling box whose
+/// visible range is `[view0, view0 + view_len)` (in the same coordinates as the element's `[el0, el0 + el_len)`),
+/// for `start` / `center` / `end` / `nearest`.
+fn align_axis(how: &str, el0: f64, el_len: f64, view0: f64, view_len: f64) -> f64 {
+    let el1 = el0 + el_len;
+    let view1 = view0 + view_len;
+    match how {
+        "start" => el0,
+        "end" => el1 - view_len,
+        "center" => el0 + el_len / 2.0 - view_len / 2.0,
+        _ => {
+            // "nearest": both edges outside — nothing; else align the edge that brings the most of it in view.
+            if (el0 < view0 && el1 > view1) || (el0 >= view0 && el1 <= view1) {
+                view0
+            } else if (el0 < view0 && el_len <= view_len) || (el1 > view1 && el_len > view_len) {
+                el0
+            } else {
+                el1 - view_len
+            }
+        }
+    }
+}
+
+fn enum_member(vm: &mut Vm, o: Obj, key: &str, allowed: &[&str], default: &'static str) -> JsResult<String> {
+    let v = vm.get(o, &PropertyKey::from_str(key))?;
+    if v.is_undefined() {
+        return Ok(default.to_string());
+    }
+    let s = vm.to_string(&v)?.to_rust();
+    if !allowed.contains(&s.as_str()) {
+        return vm.throw_type(&format!("Failed to execute 'scrollIntoView' on 'Element': The provided value '{s}' is not a valid enum value of type {}.", if key == "behavior" { "ScrollBehavior" } else { "ScrollLogicalPosition" }));
+    }
+    Ok(s)
+}
+
+/// CSSOM View `Element.scrollIntoView(arg)`: `true` / absent → block start, inline nearest; `false` → block end; a
+/// ScrollIntoViewOptions dictionary otherwise. "Scroll an element into view": every scroll-container ancestor (an
+/// `overflow` other than `visible` / `clip`) is asked to bring the element into its scrollport (applied with the next
+/// frame, as `scrollTo` is), then the viewport (its offset moves at once). An element without a box does nothing.
+fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let a = arg(vm, ctx, 0);
+    let (mut block, mut inline, mut behavior) = ("start".to_string(), "nearest".to_string(), "auto".to_string());
+    match &a {
+        Value::Object(o) => {
+            let o = *o;
+            let pos = ["start", "center", "end", "nearest"];
+            behavior = enum_member(vm, o, "behavior", &["auto", "instant", "smooth"], "auto")?;
+            block = enum_member(vm, o, "block", &pos, "start")?;
+            inline = enum_member(vm, o, "inline", &pos, "nearest")?;
+        }
+        Value::Undefined | Value::Null => {}
+        other => {
+            if !vm.to_boolean(other) {
+                block = "end".into();
+            }
+        }
+    }
+    if !dom::is_connected(el) {
+        return Ok(Value::Undefined);
+    }
+    let rects = client_rects(el);
+    if rects.is_empty() {
+        return Ok(Value::Undefined);
+    }
+    let (x, y, w, h) = bounding(el);
+    let sb = match behavior.as_str() {
+        "smooth" => crate::layout::ScrollBehavior::Smooth,
+        "instant" => crate::layout::ScrollBehavior::Instant,
+        _ => crate::layout::ScrollBehavior::Auto,
+    };
+    // Scroll-container ancestors, innermost first.
+    let mut cur = with_doc(|d| d.parent_element(NodeId(el)).map(|p| p.0));
+    while let Some(c) = cur {
+        let is_root = with_doc(|d| d.parent(NodeId(c)).is_some_and(|p| p.0 == dom::main_doc()));
+        let is_body = with_doc(|d| dom::is_html_tag(d, c, "body"));
+        if !is_root && !is_body {
+            let ox = computed_value(c, "overflow-x");
+            let oy = computed_value(c, "overflow-y");
+            let scrolls = |v: &str| matches!(v, "auto" | "scroll" | "hidden");
+            if scrolls(&ox) || scrolls(&oy) {
+                let (cx, cy, _, _) = bounding(c);
+                let (bt, bl) = border_of(c);
+                let first = with_layout(|f| f.boxes.get(&NodeId(c)).and_then(|v| v.first().copied()));
+                if let Some((_, _, cw, ch)) = first {
+                    let (sx, sy) = crate::layout::element_scroll_offset(NodeId(c));
+                    // The element's position in the container's scrolled content.
+                    let ex = x - cx - bl as f64 + sx as f64;
+                    let ey = y - cy - bt as f64 + sy as f64;
+                    let tx = align_axis(&inline, ex, w, sx as f64, (cw - 2.0 * bl) as f64);
+                    let ty = align_axis(&block, ey, h, sy as f64, (ch - 2.0 * bt) as f64);
+                    let nx = scrolls(&ox).then_some(tx.max(0.0) as f32);
+                    let ny = scrolls(&oy).then_some(ty.max(0.0) as f32);
+                    crate::layout::request_element_scroll(NodeId(c), nx, ny, sb);
+                }
+            }
+        }
+        cur = with_doc(|d| d.parent_element(NodeId(c)).map(|p| p.0));
+    }
+    // The viewport.
+    let (sx, sy) = page(|p| p.scroll);
+    let (vw, vh) = page(|p| p.viewport);
+    let (dw, dh) = document_extent();
+    let tx = align_axis(&inline, x + sx, w, sx, vw as f64).clamp(0.0, (dw - vw as f64).max(0.0));
+    let ty = align_axis(&block, y + sy, h, sy, vh as f64).clamp(0.0, (dh - vh as f64).max(0.0));
+    page(|p| p.scroll = (tx, ty));
     Ok(Value::Undefined)
 }
+
 
 pub fn install(vm: &mut Vm) {
     let csd = interface(vm, "CSSStyleDeclaration", None, None);
@@ -1531,7 +1809,10 @@ pub fn install(vm: &mut Vm) {
     for m in ["scroll", "scrollTo", "scrollBy"] {
         op_with(vm, element, m, 0, scroll_to, s(m));
     }
-    op(vm, element, "scrollIntoView", 0, noop_el);
+    op(vm, element, "scrollIntoView", 0, scroll_into_view);
+    let dp = iface("Document").unwrap().proto;
+    op(vm, dp, "elementFromPoint", 2, element_from_point);
+    op(vm, dp, "elementsFromPoint", 2, elements_from_point);
     let he = iface("HTMLElement").unwrap().proto;
     for m in ["offsetTop", "offsetLeft", "offsetWidth", "offsetHeight"] {
         attr_with(vm, he, m, box_metric, None, s(m));

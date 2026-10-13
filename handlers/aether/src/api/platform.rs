@@ -165,6 +165,94 @@ fn blob_url_resolve(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Object(vm.new_array(vec![Value::Object(ab), idl::s(&e.mime)])))
 }
 
+/// AETHERWPT4 (SR142): `__decode_bytes(bytes, label)` → `[text, encoding]` — Encoding §6 "decode": a UTF-8 / UTF-16 BOM
+/// wins and is dropped, else `label`'s encoding (Encoding §4.2), else UTF-8 (XHR §3.6.9 "text response").
+fn decode_bytes(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let b = vm.arg(ctx, 0);
+    let bytes = crate::js::net::buffer_bytes(vm, &b).unwrap_or_default();
+    let l = vm.arg(ctx, 1);
+    let enc = if l.is_null() || l.is_undefined() { None } else { crate::api::encoding::get_encoding(&vm.to_string(&l)?.to_rust()) };
+    let (text, used) = crate::api::encoding::decode(&bytes, enc.unwrap_or("UTF-8"));
+    Ok(Value::Object(vm.new_array(vec![idl::s(&text), idl::s(used)])))
+}
+
+/// AETHERWPT4 (SR142): `__get_encoding(label)` → the canonical encoding name, or null (Encoding §4.2 "get an encoding").
+fn get_encoding_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let l = str_arg(vm, ctx, 0)?;
+    Ok(crate::api::encoding::get_encoding(&l).map(idl::s).unwrap_or(Value::Null))
+}
+
+/// AETHERWPT4 (SR142): `__html_prescan(bytes)` → the encoding HTML §13.2.3.2's prescan of the first 1024 bytes finds, or
+/// null (XHR §3.6.10 "document response" for an HTML document without a final encoding).
+fn html_prescan(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let b = vm.arg(ctx, 0);
+    let bytes = crate::js::net::buffer_bytes(vm, &b).unwrap_or_default();
+    Ok(crate::dom::charset::prescan(&bytes).map(idl::s).unwrap_or(Value::Null))
+}
+
+/// AETHERWPT4 (SR142): `__xml_sniff(bytes)` → the encoding a leading XML declaration names (canonical), or null.
+fn xml_sniff(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let b = vm.arg(ctx, 0);
+    let bytes = crate::js::net::buffer_bytes(vm, &b).unwrap_or_default();
+    let e = crate::api::xml::sniff_declared_encoding(&bytes).and_then(|l| crate::api::encoding::get_encoding(&l));
+    Ok(e.map(idl::s).unwrap_or(Value::Null))
+}
+
+/// AETHERWPT4 (SR142): `__parse_xml(text)` → `[encoding|null, items…]` (api/xml.rs), or `[null]` plus the error as a
+/// string when the text is not namespace-well-formed: `typeof r[1] === 'string'`. Items are arrays: `['d', name,
+/// publicId, systemId]`, `['s', ns, qname, [ns, qname, value, …]]`, `['e']`, `['t', text]`, `['c', text]` (CDATA),
+/// `['m', data]` (comment), `['p', target, data]`.
+fn parse_xml(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    use crate::api::xml::Tok;
+    let text = str_arg(vm, ctx, 0)?;
+    let parsed = match crate::api::xml::parse(&text) {
+        Ok(p) => p,
+        Err(e) => return Ok(Value::Object(vm.new_array(vec![Value::Null, idl::s(&e)]))),
+    };
+    let opt = |v: &Option<String>| v.as_deref().map(idl::s).unwrap_or(Value::Null);
+    let mut out = vec![opt(&parsed.encoding)];
+    for t in &parsed.toks {
+        let row = match t {
+            Tok::Doctype { name, public_id, system_id } => vec![idl::s("d"), idl::s(name), idl::s(public_id), idl::s(system_id)],
+            Tok::Start { ns, qname, attrs } => {
+                let mut a = Vec::with_capacity(attrs.len() * 3);
+                for (ans, q, v) in attrs {
+                    a.push(opt(ans));
+                    a.push(idl::s(q));
+                    a.push(idl::s(v));
+                }
+                let arr = Value::Object(vm.new_array(a));
+                vec![idl::s("s"), opt(ns), idl::s(qname), arr]
+            }
+            Tok::End => vec![idl::s("e")],
+            Tok::Text(x) => vec![idl::s("t"), idl::s(x)],
+            Tok::CData(x) => vec![idl::s("c"), idl::s(x)],
+            Tok::Comment(x) => vec![idl::s("m"), idl::s(x)],
+            Tok::Pi { target, data } => vec![idl::s("p"), idl::s(target), idl::s(data)],
+        };
+        out.push(Value::Object(vm.new_array(row)));
+    }
+    Ok(Value::Object(vm.new_array(out)))
+}
+
+/// AETHERWPT4 (SR142): `__doc_meta(doc, contentType, url, charset)` — a created document's content type, URL and
+/// encoding (XHR §3.6.10 step 9; DOMParser's document takes the type it was asked for).
+fn doc_meta(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let d = vm.arg(ctx, 0);
+    let Some(id) = crate::js::dom::node_of(vm, &d) else { return vm.throw_type("__doc_meta: not a node") };
+    let ct = str_arg(vm, ctx, 1)?;
+    let url = str_arg(vm, ctx, 2)?;
+    let cs = str_arg(vm, ctx, 3)?;
+    crate::js::page(|p| {
+        if let Some(m) = p.docs.get_mut(&id) {
+            m.content_type = ct;
+            m.url = url;
+            m.charset = cs;
+        }
+    });
+    Ok(Value::Undefined)
+}
+
 /// `__random_bytes(n)` → array of n bytes from the OS entropy pool.
 fn random_bytes(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let v = vm.arg(ctx, 0);
@@ -203,6 +291,12 @@ pub fn init(vm: &mut Vm) {
         ("__random_bytes", 1, random_bytes),
         ("__parse_document", 1, parse_document),
         ("__codec_decode", 7, codec_decode),
+        ("__decode_bytes", 2, decode_bytes),
+        ("__get_encoding", 1, get_encoding_native),
+        ("__html_prescan", 1, html_prescan),
+        ("__xml_sniff", 1, xml_sniff),
+        ("__parse_xml", 1, parse_xml),
+        ("__doc_meta", 4, doc_meta),
         ("__blob_url_register", 3, blob_url_register),
         ("__blob_url_revoke", 2, blob_url_revoke),
         ("__blob_url_resolve", 2, blob_url_resolve),
@@ -233,6 +327,9 @@ pub(crate) fn init_worker(vm: &mut Vm) {
         ("__form_byte", 1, form_byte),
         ("__random_bytes", 1, random_bytes),
         ("__codec_decode", 7, codec_decode),
+        ("__decode_bytes", 2, decode_bytes),
+        ("__get_encoding", 1, get_encoding_native),
+        ("__xml_sniff", 1, xml_sniff),
         ("__blob_url_register", 3, blob_url_register),
         ("__blob_url_revoke", 2, blob_url_revoke),
         ("__blob_url_resolve", 2, blob_url_resolve),
@@ -907,16 +1004,60 @@ const PRELUDE: &str = r#"
 
 // ---- DOMParser / XMLSerializer ---------------------------------------
 (function () {
-    function DOMParser() {}
-    DOMParser.prototype.parseFromString = function (str, type) {
-        var t = type ? String(type).toLowerCase() : 'text/html';
-        if (t !== 'text/html') {
-            // The HTML parser is error-recovering and namespace-flat; an XML
-            // document parsed through it differs in casing and well-formed
-            // error reporting.
-            __ledger('DOMParser-unsupported-parsed-as-html:' + t);
+    // AETHERWPT4 (SR142): the XML document builder shared by DOMParser and XMLHttpRequest's document response — the
+    // tokens of api/xml.rs (`__parse_xml`) appended with the DOM's own methods, so namespaces, prefixes and
+    // attribute namespaces live where the DOM keeps them. Answers the document, or null when the text is not
+    // namespace-well-formed (the caller decides what failure means).
+    var xmlDocument = function (text, contentType, url, charset) {
+        if (typeof __parse_xml !== 'function') { return null; }
+        var r = __parse_xml(String(text));
+        if (typeof r[1] === 'string') { return null; }
+        var doc = document.implementation.createDocument(null, null, null);
+        var cur = doc;
+        for (var i = 1; i < r.length; i++) {
+            var t = r[i];
+            switch (t[0]) {
+                case 'd': cur.appendChild(doc.implementation.createDocumentType(t[1], t[2], t[3])); break;
+                case 's':
+                    var el = doc.createElementNS(t[1], t[2]);
+                    for (var k = 0; k + 2 < t[3].length; k += 3) { el.setAttributeNS(t[3][k], t[3][k + 1], t[3][k + 2]); }
+                    cur.appendChild(el);
+                    cur = el;
+                    break;
+                case 'e': cur = cur.parentNode; break;
+                case 't': cur.appendChild(doc.createTextNode(t[1])); break;
+                case 'c': cur.appendChild(doc.createCDATASection(t[1])); break;
+                case 'm': cur.appendChild(doc.createComment(t[1])); break;
+                case 'p': cur.appendChild(doc.createProcessingInstruction(t[1], t[2])); break;
+            }
         }
-        return __parse_document(String(str === undefined ? '' : str));
+        if (typeof __doc_meta === 'function') { __doc_meta(doc, contentType, url, charset || 'UTF-8'); }
+        return doc;
+    };
+    Object.defineProperty(globalThis, '__xml_document', { value: xmlDocument, writable: true, configurable: true, enumerable: false });
+    var pageURL = function () { try { return document.URL; } catch (e) { return 'about:blank'; } };
+    // HTML §8.5.1 DOMParser: `parseFromString(string, type)` with type a DOMParserSupportedType.
+    function DOMParser() {
+        if (!(this instanceof DOMParser)) { throw new TypeError("Failed to construct 'DOMParser': Please use the 'new' operator, this DOM object constructor cannot be called as a function."); }
+    }
+    DOMParser.prototype.parseFromString = function (str, type) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': 2 arguments required, but only " + arguments.length + ' present.'); }
+        var t = String(type);
+        if (['text/html', 'text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'].indexOf(t) < 0) {
+            throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': The provided value '" + t + "' is not a valid enum value of type DOMParserSupportedType.");
+        }
+        if (t === 'text/html') {
+            var hd = __parse_document(String(str));
+            if (typeof __doc_meta === 'function') { __doc_meta(hd, 'text/html', pageURL(), 'UTF-8'); }
+            return hd;
+        }
+        var d = xmlDocument(String(str), t, pageURL(), 'UTF-8');
+        if (d === null) {
+            // "If that fails": a document whose element is a parsererror in Gecko's namespace.
+            d = document.implementation.createDocument('http://www.mozilla.org/newlayout/xml/parsererror.xml', 'parsererror', null);
+            if (typeof __doc_meta === 'function') { __doc_meta(d, t, pageURL(), 'UTF-8'); }
+        }
+        return d;
     };
     globalThis.DOMParser = DOMParser;
 

@@ -4,12 +4,27 @@
 //! advances as the head and each body chunk arrive (OPENED → HEADERS_RECEIVED → LOADING → DONE, a
 //! `readystatechange` at each step and a `progress` per chunk at most every 50 ms), with `load` / `error` /
 //! `abort` / `timeout` and `loadend` at the end. Synchronous requests (`open(…, false)`) join the
-//! exchange on `api::fetch::http_sync`. Upload progress events are not produced (`upload` is an inert
-//! `XMLHttpRequestUpload`).
+//! exchange on `api::fetch::http_sync`.
 //!
-//! Not provided: `responseType = "document"` / `responseXML` (Aether parses HTML documents only through
-//! the page loader; both answer null and ledger it), and charsets other than UTF-8 for `responseText`
-//! (decoded as UTF-8, ledgered).
+//! AETHERWPT4 (SR142): the rest of the XHR Standard's send / response steps —
+//! - §3.5.6 upload progress: the upload listener flag (listeners on `upload` when `send()` runs), the upload
+//!   complete flag (set at once for a null body), `loadstart` on the upload object after the request's, and the
+//!   "process request end-of-body" events (`progress`, `load`, `loadend`) before the response head is handled
+//!   (the transport sends the body whole, so its end is known when the head arrives); the request error steps fire
+//!   the error event and `loadend` at the upload object first while the upload is incomplete.
+//! - §3.6 the MIME type and encoding of the response: MIME Sniffing §4.4 "parse a MIME type" and its
+//!   serialization, Fetch's "extract a MIME type" over the `Content-Type` values, "get a response MIME type"
+//!   (`text/xml` when none parses), `overrideMimeType()` (a MIME type that does not parse becomes
+//!   `application/octet-stream`), "get a final MIME type" and "get a final encoding" (the override's `charset`
+//!   over the response's, a label that names no encoding giving none).
+//! - §3.6.9 text response: Encoding §6 "decode" (a BOM wins) with the final encoding, the XML declaration's
+//!   encoding for an XML response when `responseType` is "", else UTF-8.
+//! - §3.6.10 document response: `responseType = "document"` (ignored outside a Window) and `responseXML` — an HTML
+//!   document (only for "document"; the final encoding, else the §13.2.3.2 prescan, else UTF-8) through html_core,
+//!   or an XML document through api/xml.rs (null when not namespace-well-formed), its content type, URL and
+//!   encoding set; the result kept as the response object.
+//! - §3.5.6 step 4: a Document body is serialized (`text/html` or `application/xml`, UTF-8), and an author
+//!   `Content-Type` whose `charset` is not UTF-8 is rewritten to UTF-8 for a Document or string body.
 
 /// The `XMLHttpRequest`, `XMLHttpRequestEventTarget` and `XMLHttpRequestUpload` interfaces.
 pub const PRELUDE: &str = r#"
@@ -46,7 +61,151 @@ pub const PRELUDE: &str = r#"
 
     var fresh = function (s) {
         s.status = 0; s.statusText = ''; s.url = ''; s.headers = []; s.chunks = []; s.received = 0; s.total = 0;
-        s.error = true; s.cache = undefined; s.cacheKind = undefined; s.text = null;
+        s.error = true; s.cache = undefined; s.cacheKind = undefined; s.text = null; s.doc = null; s.docDone = false;
+    };
+    // ---- AETHERWPT4 (SR142): MIME Sniffing §4.4 "parse a MIME type" / serialize, Fetch "extract a MIME type" ----
+    var HWS_EDGE = /^[\t\n\r ]+|[\t\n\r ]+$/g;
+    var QTOKEN = /^[\t\u0020-\u007E\u0080-\u00FF]*$/;
+    var parseMime = function (input) {
+        var str = String(input).replace(HWS_EDGE, ''), n = str.length;
+        var slash = str.indexOf('/');
+        if (slash < 0) { return null; }
+        var type = str.slice(0, slash);
+        if (!type || !TOKEN.test(type)) { return null; }
+        var pos = slash + 1;
+        var semi = str.indexOf(';', pos);
+        var subtype = str.slice(pos, semi < 0 ? n : semi).replace(/[\t\n\r ]+$/, '');
+        if (!subtype || !TOKEN.test(subtype)) { return null; }
+        pos = semi < 0 ? n : semi;
+        var m = { type: type.toLowerCase(), subtype: subtype.toLowerCase(), params: [] };
+        while (pos < n) {
+            pos++;
+            while (pos < n && /[\t\n\r ]/.test(str[pos])) { pos++; }
+            var start = pos;
+            while (pos < n && str[pos] !== ';' && str[pos] !== '=') { pos++; }
+            var name = str.slice(start, pos).toLowerCase();
+            if (pos < n) {
+                if (str[pos] === ';') { continue; }
+                pos++;
+            }
+            if (pos >= n) { break; }
+            var value = '';
+            if (str[pos] === '"') {
+                pos++;
+                for (;;) {
+                    while (pos < n && str[pos] !== '"' && str[pos] !== '\\') { value += str[pos++]; }
+                    if (pos >= n) { break; }
+                    var qb = str[pos++];
+                    if (qb === '\\') {
+                        if (pos >= n) { value += '\\'; break; }
+                        value += str[pos++];
+                    } else { break; }
+                }
+                while (pos < n && str[pos] !== ';') { pos++; }
+            } else {
+                start = pos;
+                while (pos < n && str[pos] !== ';') { pos++; }
+                value = str.slice(start, pos).replace(/[\t\n\r ]+$/, '');
+                if (value === '') { continue; }
+            }
+            if (name && TOKEN.test(name) && QTOKEN.test(value) && !m.params.some(function (p) { return p[0] === name; })) {
+                m.params.push([name, value]);
+            }
+        }
+        return m;
+    };
+    var essence = function (m) { return m.type + '/' + m.subtype; };
+    Object.defineProperty(globalThis, '__mime_parse', { value: parseMime, writable: true, configurable: true, enumerable: false });
+    var param = function (m, k) {
+        for (var i = 0; i < m.params.length; i++) { if (m.params[i][0] === k) { return m.params[i][1]; } }
+        return null;
+    };
+    var serializeMime = function (m) {
+        var out = essence(m);
+        m.params.forEach(function (p) {
+            var v = p[1];
+            if (!TOKEN.test(v)) { v = '"' + v.replace(/(["\\])/g, '\\$1') + '"'; }
+            out += ';' + p[0] + '=' + v;
+        });
+        return out;
+    };
+    // Fetch "get, decode, and split" a header value: commas outside quoted strings.
+    var splitValues = function (v) {
+        var out = [], cur = '', q = false;
+        for (var i = 0; i < v.length; i++) {
+            var c = v[i];
+            if (q && c === '\\' && i + 1 < v.length) { cur += c + v[++i]; continue; }
+            if (c === '"') { q = !q; }
+            if (c === ',' && !q) { out.push(cur.replace(HWS_EDGE, '')); cur = ''; continue; }
+            cur += c;
+        }
+        out.push(cur.replace(HWS_EDGE, ''));
+        return out;
+    };
+    var extractMime = function (list) {
+        var vals = [];
+        for (var i = 0; i + 1 < list.length; i += 2) { if (String(list[i]).toLowerCase() === 'content-type') { vals.push(String(list[i + 1])); } }
+        if (!vals.length) { return null; }
+        var charset = null, ess = null, mime = null;
+        splitValues(vals.join(', ')).forEach(function (v) {
+            var t = parseMime(v);
+            if (t === null || essence(t) === '*/*') { return; }
+            mime = t;
+            if (ess !== essence(mime)) {
+                charset = param(t, 'charset');
+                ess = essence(mime);
+            } else if (param(mime, 'charset') === null && charset !== null) {
+                mime.params.push(['charset', charset]);
+            }
+        });
+        return mime;
+    };
+    var isXMLMime = function (m) { var e = essence(m); return e === 'text/xml' || e === 'application/xml' || /\+xml$/.test(m.subtype); };
+    var isHTMLMime = function (m) { return essence(m) === 'text/html'; };
+    var responseMime = function (s) { return extractMime(s.headers) || parseMime('text/xml'); };
+    var finalMime = function (s) { return s.override !== null ? s.override : responseMime(s); };
+    var getEncoding = function (label) {
+        if (typeof __get_encoding === 'function') { return __get_encoding(label); }
+        try { return new TextDecoder(label).encoding; } catch (e) { return null; }
+    };
+    var finalEncoding = function (s) {
+        var label = param(responseMime(s), 'charset');
+        if (s.override !== null && param(s.override, 'charset') !== null) { label = param(s.override, 'charset'); }
+        return label === null ? null : getEncoding(label);
+    };
+    // Encoding §6 "decode": the BOM, else `label`, else UTF-8.
+    var decodeBytes = function (bytes, label) {
+        if (typeof __decode_bytes === 'function') { return __decode_bytes(bytes, label); }
+        var d;
+        try { d = new TextDecoder(label || 'utf-8'); } catch (e) { d = new TextDecoder(); }
+        return [d.decode(bytes), d.encoding];
+    };
+    var hasListeners = function (t) { return typeof __net_has_listeners === 'function' ? __net_has_listeners(t) : true; };
+    var isWindow = function () { return typeof document !== 'undefined' && typeof WorkerGlobalScope === 'undefined'; };
+    // §3.6.10 document response.
+    var documentResponse = function (s) {
+        if (s.docDone) { return s.doc; }
+        s.docDone = true;
+        s.doc = null;
+        var m = finalMime(s), html = isHTMLMime(m);
+        if (!html && !isXMLMime(m)) { return null; }
+        if (s.responseType === '' && html) { return null; }
+        var bytes = all(s), cs = finalEncoding(s), doc = null, r;
+        if (html) {
+            if (cs === null && typeof __html_prescan === 'function') { cs = __html_prescan(bytes); }
+            r = decodeBytes(bytes, cs === null ? 'UTF-8' : cs);
+            if (typeof __parse_document !== 'function') { return null; }
+            doc = __parse_document(r[0]);
+        } else {
+            if (cs === null && typeof __xml_sniff === 'function') { cs = __xml_sniff(bytes); }
+            r = decodeBytes(bytes, cs === null ? 'UTF-8' : cs);
+            if (typeof __xml_document !== 'function') { return null; }
+            doc = __xml_document(r[0], essence(m), s.url, r[1]);
+            if (doc === null) { return null; }
+        }
+        if (typeof __doc_meta === 'function') { __doc_meta(doc, essence(m), s.url, r[1]); }
+        s.doc = doc;
+        return doc;
     };
     class XMLHttpRequest extends XMLHttpRequestEventTarget {
         constructor() {
@@ -55,7 +214,8 @@ pub const PRELUDE: &str = r#"
             try { super(); up = new XMLHttpRequestUpload(); } finally { creating = false; }
             var s = { readyState: 0, method: 'GET', reqURL: '', url: '', async: true, user: null, password: null, reqHeaders: [],
                       send: false, timeout: 0, withCredentials: false, responseType: '', mime: null, id: 0, timer: 0,
-                      started: 0, lastProgress: 0, upload: up, gen: 0 };
+                      started: 0, lastProgress: 0, upload: up, gen: 0, override: null, upListener: false,
+                      upComplete: true, upTotal: 0 };
             fresh(s);
             ST.set(this, s);
         }
@@ -92,7 +252,8 @@ pub const PRELUDE: &str = r#"
             if (!s.async && s.readyState === 1 && typeof document !== 'undefined') {
                 throw dom("Failed to set the 'responseType' property on 'XMLHttpRequest': The response type cannot be changed for synchronous requests made from a document.", 'InvalidAccessError');
             }
-            if (v === 'document') { __ledger('xhr-responseType-document-null'); }
+            // §3.6.7 step 1: "document" is ignored outside a Window.
+            if (v === 'document' && !isWindow()) { return; }
             s.responseType = v;
         }
         get responseText() {
@@ -108,8 +269,8 @@ pub const PRELUDE: &str = r#"
             if (s.responseType !== '' && s.responseType !== 'document') {
                 throw dom("Failed to read the 'responseXML' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'document' (was '" + s.responseType + "').", 'InvalidStateError');
             }
-            if (s.readyState === 4 && !s.error) { __ledger('xhr-responseXML-null'); }
-            return null;
+            if (s.readyState !== 4 || s.error) { return null; }
+            return documentResponse(s);
         }
         get response() {
             var s = st(this);
@@ -118,10 +279,11 @@ pub const PRELUDE: &str = r#"
                 return textOf(s);
             }
             if (s.readyState !== 4 || s.error) { return null; }
+            if (s.responseType === 'document') { return documentResponse(s); }
             if (s.cacheKind === s.responseType) { return s.cache; }
             var bytes = all(s), v = null;
             if (s.responseType === 'arraybuffer') { v = bytes.buffer; }
-            else if (s.responseType === 'blob') { v = new Blob([bytes], { type: mimeOf(s) || '' }); }
+            else if (s.responseType === 'blob') { v = new Blob([bytes], { type: serializeMime(finalMime(s)) }); }
             else if (s.responseType === 'json') {
                 try {
                     var t = new TextDecoder().decode(bytes);
@@ -198,18 +360,23 @@ pub const PRELUDE: &str = r#"
         overrideMimeType(mime) {
             var s = st(this);
             if (s.readyState === 3 || s.readyState === 4) { throw dom("Failed to execute 'overrideMimeType' on 'XMLHttpRequest': MimeType cannot be overridden when the state is LOADING or DONE.", 'InvalidStateError'); }
-            mime = String(mime);
-            s.mime = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\/[!#$%&'*+\-.^_`|~0-9A-Za-z]+/.test(mime.trim()) ? mime.trim() : 'application/octet-stream';
+            s.override = parseMime(String(mime)) || parseMime('application/octet-stream');
         }
         send(body) {
             var s = st(this), self = this;
             if (s.readyState !== 1) { throw dom("Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError'); }
             if (s.send) { throw dom("Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError'); }
-            var bytes = null, ctype = null;
+            var bytes = null, ctype = null, isDoc = false;
             if (s.method !== 'GET' && s.method !== 'HEAD' && body !== undefined && body !== null) {
                 if (typeof Document !== 'undefined' && body instanceof Document) {
-                    bytes = new TextEncoder().encode(body.documentElement ? body.documentElement.outerHTML : '');
-                    ctype = 'text/html;charset=UTF-8';
+                    // §3.5.6 step 4.1: the document serialized (fragment serializing algorithm, require well-formed false).
+                    isDoc = true;
+                    var htmlDoc = body.contentType === 'text/html';
+                    var ser = '';
+                    if (htmlDoc) { ser = body.documentElement ? body.documentElement.outerHTML : ''; }
+                    else { try { ser = new XMLSerializer().serializeToString(body); } catch (e) { ser = ''; } }
+                    bytes = new TextEncoder().encode(ser);
+                    ctype = htmlDoc ? 'text/html;charset=UTF-8' : 'application/xml;charset=UTF-8';
                 } else {
                     var ex = __extract_body(body);
                     if (ex[0]) { __ledger('xhr-stream-body'); bytes = new Uint8Array(0); }
@@ -220,9 +387,14 @@ pub const PRELUDE: &str = r#"
             s.reqHeaders.forEach(function (h) {
                 if (h[0].toLowerCase() === 'content-type') {
                     hasType = true;
-                    // A UTF-8 body declares its charset as UTF-8 (XHR §3.5.6 step 4.4).
-                    if (ctype && /charset=/i.test(h[1]) && typeof body === 'string') {
-                        h = [h[0], h[1].replace(/charset=[^;]*/i, 'charset=UTF-8')];
+                    // §3.5.6 step 4.4: for a Document or string body, a parsed author Content-Type whose charset is
+                    // not UTF-8 gets charset=UTF-8 (re-serialized); anything else is sent as the author wrote it.
+                    if (bytes !== null && (isDoc || typeof body === 'string')) {
+                        var rec = parseMime(h[1]), cs = rec === null ? null : param(rec, 'charset');
+                        if (cs !== null && cs.toLowerCase() !== 'utf-8') {
+                            rec.params.forEach(function (p) { if (p[0] === 'charset') { p[1] = 'UTF-8'; } });
+                            h = [h[0], serializeMime(rec)];
+                        }
                     }
                 }
                 flat.push(h[0], h[1]);
@@ -243,12 +415,19 @@ pub const PRELUDE: &str = r#"
                 var br = typeof __blob_response === 'function' ? __blob_response(s.reqURL, s.method, s.blobEntry, range) : null;
                 data = br ? [br[0], br[1], s.reqURL, br[2], br[3]] : 'error';
             }
+            // §3.5.6 steps 5, 7, 8: the upload listener flag, and the upload complete flag for a null body.
+            s.upListener = hasListeners(s.upload);
+            s.upComplete = bytes === null;
+            s.upTotal = bytes === null ? 0 : bytes.byteLength;
             if (!s.async) { return sendSync(this, s, flat, bytes, data); }
             s.send = true;
             s.gen++;
             s.started = now();
             s.lastProgress = 0;
             fire(this, 'loadstart', 0, 0, false);
+            if (!s.upComplete && s.upListener && s.readyState === 1 && s.send) {
+                fire(this, 'loadstart', 0, s.upTotal, true);
+            }
             if (s.readyState !== 1 || !s.send) { return; }
             var gen = s.gen;
             if (data !== null) {
@@ -312,6 +491,14 @@ pub const PRELUDE: &str = r#"
         fresh(s);
         if (s.timer) { clearTimeout(s.timer); s.timer = 0; }
         __net_fire(xhr, 'Event', 'readystatechange', undefined);
+        // §3.5.6 "request error steps" step 6: an incomplete upload ends with the event at the upload object.
+        if (!s.upComplete) {
+            s.upComplete = true;
+            if (s.upListener) {
+                fire(xhr, event, 0, 0, true);
+                fire(xhr, 'loadend', 0, 0, true);
+            }
+        }
         fire(xhr, event, 0, 0, false);
         fire(xhr, 'loadend', 0, 0, false);
     };
@@ -319,7 +506,6 @@ pub const PRELUDE: &str = r#"
         for (var i = 0; i + 1 < list.length; i += 2) { if (String(list[i]).toLowerCase() === name) { return list[i + 1]; } }
         return null;
     };
-    var mimeOf = function (s) { return s.mime !== null ? s.mime : headerOf(s.headers, 'content-type'); };
     var all = function (s) {
         if (s.chunks.length !== 1) {
             var n = 0, i;
@@ -332,17 +518,29 @@ pub const PRELUDE: &str = r#"
     };
     var textOf = function (s) {
         if (s.text !== null && s.textLen === s.received) { return s.text; }
-        var m = mimeOf(s), cs = m && /charset\s*=\s*"?([^;"\s]+)/i.exec(m);
-        // AETHERWPT3 (SR138): XHR §3.6.9 "text response" — the response charset's decoder (Encoding §9–§13 since O2),
-        // UTF-8 when it names none or one TextDecoder refuses.
-        var dec;
-        try { dec = new TextDecoder(cs ? cs[1] : 'utf-8'); } catch (e) { dec = new TextDecoder(); }
-        s.text = dec.decode(all(s));
+        // AETHERWPT4 (SR142): §3.6.9 "text response" — the final encoding; for responseType "" and an XML final MIME
+        // type without one, the XML declaration's; else UTF-8; a BOM overriding any of them (Encoding §6 "decode").
+        var bytes = all(s), cs = finalEncoding(s);
+        if (cs === null && s.responseType === '' && isXMLMime(finalMime(s)) && typeof __xml_sniff === 'function') { cs = __xml_sniff(bytes); }
+        s.text = decodeBytes(bytes, cs === null ? 'UTF-8' : cs)[0];
         s.textLen = s.received;
         return s.text;
     };
     var onNet = function (xhr, s, kind, a) {
         if (kind === 'head') {
+            // §3.5.6 "process request end-of-body": the body was sent before the response began.
+            if (!s.upComplete) {
+                var g0 = s.gen;
+                s.upComplete = true;
+                if (s.upListener) {
+                    fire(xhr, 'progress', s.upTotal, s.upTotal, true);
+                    if (s.gen !== g0) { return; }
+                    fire(xhr, 'load', s.upTotal, s.upTotal, true);
+                    if (s.gen !== g0) { return; }
+                    fire(xhr, 'loadend', s.upTotal, s.upTotal, true);
+                    if (s.gen !== g0) { return; }
+                }
+            }
             s.error = false;
             s.rtHead = performance.now();
             s.status = a[0]; s.statusText = a[1]; s.url = a[2]; s.headers = a[3];
