@@ -10,13 +10,19 @@
 //!   with `remeasure`, a paint-only one only repaints). When a value stops being animated the engine relayouts
 //!   from the cascade, which is how the element returns to its un-animated value.
 //! * [`take_events`] hands the queued `transition*` / `animation*` events to the engine to dispatch.
+//!
+//! AETHERSTYLE3B (SR115): the events carry their `elapsedTime` (`layout_core::anim::TimedEvent`) and are
+//! dispatched by the script lane as TransitionEvent / AnimationEvent with their fields
+//! (`js::animations::poll` takes them with [`take_timed_events`]); [`take_events`] now hands the engine none,
+//! so the plain-`Event` loop in lib.rs no longer double-fires them. The Web Animations binding drives the same
+//! timeline ([`with_timeline`], [`poke`]).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use html_core::NodeId;
-use layout_core::anim::{initial_value, is_paint_only, AnimEvent, KeyframeSet, Timeline, TransitionLists};
+use layout_core::anim::{initial_value, is_paint_only, AnimEvent, KeyframeSet, TimedEvent, Timeline, TransitionLists};
 
 use super::{parse_cx, SpecifiedStyle};
 use crate::layout::{AetherHost, LayoutTree};
@@ -29,6 +35,50 @@ thread_local! {
     /// What the last frame animated: (element, property).
     static APPLIED: RefCell<HashSet<(NodeId, String)>> = RefCell::new(HashSet::new());
     static EPOCH: std::time::Instant = std::time::Instant::now();
+    /// AETHERSTYLE3B (SR115): the timed events not yet dispatched (bounded: a page without script drops the
+    /// oldest), and a script change to the timeline that the next frame must sample.
+    static PENDING: RefCell<Vec<TimedEvent<NodeId>>> = const { RefCell::new(Vec::new()) };
+    static POKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How many undispatched events are kept.
+const MAX_PENDING: usize = 1024;
+
+/// Moves the timeline's new events to the pending queue.
+fn drain_events() {
+    let new = TIMELINE.with(|t| t.borrow_mut().take_timed_events());
+    if new.is_empty() {
+        return;
+    }
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        p.extend(new);
+        let over = p.len().saturating_sub(MAX_PENDING);
+        if over > 0 {
+            p.drain(..over);
+        }
+    });
+}
+
+/// AETHERSTYLE3B (SR115): the Web Animations binding's access to the page's timeline.
+pub(crate) fn with_timeline<R>(f: impl FnOnce(&mut Timeline<NodeId>) -> R) -> R {
+    TIMELINE.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// A script changed the timeline (paused, seeked, cancelled …): the next frame samples it even when nothing runs.
+pub(crate) fn poke() {
+    POKED.with(|p| p.set(true));
+}
+
+/// The cascaded (base) value of `prop` on `el`: what an animation's implicit keyframe holds.
+pub(crate) fn base_value(el: NodeId, prop: &str) -> Option<String> {
+    PREV.with(|p| value_of(p.borrow().get(&el).map(|s| &**s), prop))
+}
+
+/// AETHERSTYLE3B (SR115): the events since the last call, with their `elapsedTime`, for the script lane.
+pub(crate) fn take_timed_events() -> Vec<TimedEvent<NodeId>> {
+    drain_events();
+    PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
 /// The frame clock in milliseconds.
@@ -39,6 +89,8 @@ pub(crate) fn now_ms() -> f64 {
 /// A new document: nothing runs, no before-change styles.
 pub(crate) fn reset() {
     TIMELINE.with(|t| *t.borrow_mut() = Timeline::new());
+    PENDING.with(|p| p.borrow_mut().clear());
+    POKED.with(|p| p.set(false));
     PREV.with(|p| p.borrow_mut().clear());
     KEYFRAMES.with(|k| k.borrow_mut().clear());
     APPLIED.with(|a| a.borrow_mut().clear());
@@ -91,15 +143,23 @@ pub(crate) fn sync(tree: &mut LayoutTree, styles: &HashMap<NodeId, Rc<SpecifiedS
                     t.set_animations(id, &anims, &|n| k.get(n).cloned(), now);
                 });
             }
+            // AETHERSTYLE3B (SR115): an element without a computed style keeps its script animations (it is
+            // still in the document); its CSS animations end. Only an element with no box is forgotten.
+            let boxed: HashSet<NodeId> = tree.node_map.values().map(|n| n.id()).collect();
             for key in t.keys() {
                 if !styles.contains_key(&key) {
-                    t.forget(&key);
+                    if boxed.contains(&key) {
+                        t.set_animations(&key, &[], &|_| None, now);
+                    } else {
+                        t.forget(&key);
+                    }
                 }
             }
         });
     }
     PREV.with(|p| *p.borrow_mut() = styles.clone());
     let values = sample(now);
+    drain_events();
     APPLIED.with(|a| *a.borrow_mut() = values.iter().flat_map(|(k, v)| v.iter().map(move |(p, _)| (*k, p.clone()))).collect());
     if !values.is_empty() {
         apply(tree, &values);
@@ -157,10 +217,12 @@ pub enum Frame {
 pub(crate) fn frame(tree: &mut LayoutTree) -> Frame {
     let active = TIMELINE.with(|t| t.borrow().active());
     let had = APPLIED.with(|a| !a.borrow().is_empty());
-    if !active && !had {
+    let poked = POKED.with(|p| p.replace(false));
+    if !active && !had && !poked {
         return Frame::Idle;
     }
     let values = sample(now_ms());
+    drain_events();
     let now: HashSet<(NodeId, String)> = values.iter().flat_map(|(k, v)| v.iter().map(move |(p, _)| (*k, p.clone()))).collect();
     let stopped = APPLIED.with(|a| a.borrow().iter().any(|e| !now.contains(e)));
     APPLIED.with(|a| *a.borrow_mut() = now);
@@ -174,7 +236,8 @@ pub(crate) fn frame(tree: &mut LayoutTree) -> Frame {
     Frame::Repaint
 }
 
-/// The events since the last call, for the engine to dispatch at their elements.
+/// The events for the engine to dispatch as plain Events — none since AETHERSTYLE3B (SR115): the script lane
+/// dispatches them as TransitionEvent / AnimationEvent ([`take_timed_events`]).
 pub(crate) fn take_events() -> Vec<AnimEvent<NodeId>> {
-    TIMELINE.with(|t| t.borrow_mut().take_events())
+    Vec::new()
 }

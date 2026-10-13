@@ -219,14 +219,22 @@ fn cascade_document(
         let filter = doc.parent_element(id).and_then(|p| child_filter.get(&p)).copied().unwrap_or_default();
         // AETHERSTYLE3 (SR103): `@container` rules ask the element's query container (the nearest ancestor
         // container whose name matches, css-contain-3 §3.1) as the first layout sized it.
+        // AETHERSTYLE3B (SR115): every element is a style container — a rule with only `style()` queries asks the
+        // nearest (named) ancestor's computed custom properties, in the first round already; a rule with size
+        // features needs a size container.
         let query = |c: &css_core::container::ContainerRule| -> bool {
-            let Some(sizes) = containers else { return false };
+            let needs_size = c.needs_size();
             let mut cur = doc.parent_element(id);
             while let Some(a) = cur {
-                if let Some(q) = sizes.get(&a) {
-                    if c.names(&q.names) {
-                        return c.evaluate(&q.size) == css_core::media::Tri::True;
-                    }
+                let sized = containers.and_then(|s| s.get(&a));
+                let names = match sized {
+                    Some(q) => q.names.clone(),
+                    None => out.get(&a).and_then(|s: &std::rc::Rc<SpecifiedStyle>| s.paint.container_name.clone()).unwrap_or_default(),
+                };
+                if (!needs_size || sized.is_some()) && c.names(&names) {
+                    let props = customs.get(&a);
+                    let lookup = |n: &str| props.and_then(|m| m.get(n)).map(|v| css_core::serialize::to_css(css_core::parser::trim_ws(v)));
+                    return c.evaluate_with(sized.map(|q| &q.size), &lookup) == css_core::media::Tri::True;
                 }
                 cur = doc.parent_element(a);
             }
@@ -545,13 +553,15 @@ fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], conta
 }
 
 /// AETHERSTYLE3 (SR103): one animation frame (`anim::frame`) — the engine repaints or relayouts on its answer.
+///
+/// AETHERSTYLE3B (SR115): the frame also advances programmatic scrolling (`layout::scroll_frame`: script
+/// scrolls start, smooth scrolls step) — a moved offset repaints.
 pub(crate) fn animation_frame(tree: &mut LayoutTree) -> anim::Frame {
-    anim::frame(tree)
-}
-
-/// AETHERSTYLE3 (SR103): the transition / animation events queued since the last call.
-pub(crate) fn take_animation_events() -> Vec<layout_core::anim::AnimEvent<html_core::NodeId>> {
-    anim::take_events()
+    let scrolled = crate::layout::scroll_frame(tree);
+    match anim::frame(tree) {
+        anim::Frame::Idle if scrolled => anim::Frame::Repaint,
+        f => f,
+    }
 }
 
 thread_local! {

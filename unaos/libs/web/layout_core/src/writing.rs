@@ -15,6 +15,15 @@
 //! * A vertical box in a horizontal parent (an orthogonal flow) is as wide as its content, not its parent.
 //!
 //! Logical properties map through the element's own `writing-mode` and `direction` (`css::apply_logical`).
+//!
+//! AETHERSTYLE3B (SR115): in `vertical-rl` / `vertical-lr`, a glyph whose Vertical_Orientation (UAX #50) is
+//! upright — CJK ideographs, kana, Hangul, Bopomofo, Yi, the CJK symbols and full-width forms — under
+//! `text-orientation: mixed`, and every glyph under `upright`, is not turned with its line: the inline formatter
+//! records its staging cell ([`UprightCell`], `InlineLayout::upright`) and the painters map that cell's pixels
+//! by translation into its place in the column ([`to_physical_upright`]) instead of the line's rotation. The
+//! inline advance stays the horizontal one (a full-width glyph's advance is its 1em vertical advance; a
+//! proportional glyph forced upright keeps its own width as its cell). Pointer hit testing maps a physical
+//! point back into the staging space ([`to_logical`]), which is what makes selection work in vertical text.
 
 use crate::prelude::*;
 use crate::tree::TextRun;
@@ -94,6 +103,73 @@ pub fn to_physical(mode: u8, x: i32, y: i32, block: i32, inline: i32, line_of: &
         },
         _ => (block - 1 - y, x),
     }
+}
+
+/// A physical point (x, y) in a vertical IFC's content box → the staging-space point it shows (the inverse of
+/// [`to_physical`], continuous): `block` / `inline` as there, `lines` the IFC's line boxes (top, height).
+pub fn to_logical(mode: u8, x: f32, y: f32, block: f32, inline: f32, lines: &[(f32, f32)]) -> (f32, f32) {
+    match mode {
+        SIDEWAYS_LR => (inline - y, x),
+        VERTICAL_LR => match lines.iter().find(|(t, h)| x >= *t && x < t + h) {
+            Some(&(t, h)) => (y, 2.0 * t + h - x),
+            None => (y, x),
+        },
+        _ => (y, block - x),
+    }
+}
+
+/// UAX #50 Vertical_Orientation U / Tu (upright in vertical text) for the ranges a page sets upright: CJK and
+/// its punctuation, kana, Hangul, Bopomofo, Yi, the compatibility and full-width forms, the supplementary
+/// ideographic planes.
+pub fn is_upright_char(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x11FF | 0x2E80..=0x2FFF | 0x3000..=0x303F | 0x3040..=0x30FF | 0x3100..=0x31FF | 0x3200..=0x33FF
+        | 0x3400..=0x4DBF | 0x4DC0..=0x4DFF | 0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xA960..=0xA97F | 0xAC00..=0xD7FF
+        | 0xF900..=0xFAFF | 0xFE10..=0xFE1F | 0xFE30..=0xFE6F | 0xFF01..=0xFF60 | 0xFF61..=0xFFDC | 0xFFE0..=0xFFE6
+        | 0x1F200..=0x1F2FF | 0x20000..=0x3FFFD)
+}
+
+/// Whether `c` stands upright in a vertical line under `text-orientation` `orientation` (0 mixed, 1 upright,
+/// 2 sideways; css-writing-modes-4 §5.1). Spaces never get a cell.
+pub fn upright(c: char, orientation: u8) -> bool {
+    if c.is_whitespace() {
+        return false;
+    }
+    match orientation {
+        1 => true,
+        2 => false,
+        _ => is_upright_char(c),
+    }
+}
+
+/// One upright glyph's cell in a vertical IFC's staging space: its inline start and advance, and its line box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UprightCell {
+    pub x: f32,
+    pub w: f32,
+    pub top: f32,
+    pub h: f32,
+}
+
+/// Where staging pixel (x, y) lands when it lies in an upright cell (None otherwise, or in a sideways mode,
+/// where text-orientation does not apply): the cell is translated, not turned — its glyph's horizontal axis
+/// becomes the column's, centred in the column (`h` wide) and in the cell's `w` of inline length.
+pub fn to_physical_upright(mode: u8, x: i32, y: i32, block: i32, cells: &[UprightCell]) -> Option<(i32, i32)> {
+    if !matches!(mode, VERTICAL_RL | VERTICAL_LR) {
+        return None;
+    }
+    for c in cells {
+        let (cx0, cx1) = (c.x.floor() as i32, (c.x + c.w).floor() as i32);
+        let (ct, cb) = (c.top.floor() as i32, (c.top + c.h).floor() as i32);
+        if x < cx0 || x >= cx1 || y < ct || y >= cb {
+            continue;
+        }
+        let (cw, ch) = (cx1 - cx0, cb - ct);
+        let col_left = if mode == VERTICAL_RL { block - cb } else { ct };
+        let pad = (ch - cw) / 2;
+        return Some((col_left + pad + (x - cx0), cx0 + (y - ct) - pad));
+    }
+    None
 }
 
 /// The available inline size of a vertical IFC root and whether the box fills it (a block-level box in a

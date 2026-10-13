@@ -21,11 +21,15 @@ use taffy::style::{Dimension, Display, FlexDirection, LengthPercentage, LengthPe
 pub struct ParseCx {
     pub viewport: (f32, f32),
     pub font: (f32, f32, f32, f32),
+    /// AETHERSTYLE3B (SR115): the query container's content-box (width, height) for the container-relative
+    /// units (css-contain-3 §6.1: cqw / cqi on the nearest container with a width, cqh / cqb on the nearest
+    /// with a height; None = the small viewport's axis). `remeasure` fills it per element after a first layout.
+    pub container: (Option<f32>, Option<f32>),
 }
 
 impl Default for ParseCx {
     fn default() -> Self {
-        ParseCx { viewport: (800.0, 600.0), font: (16.0, 16.0, 8.0, 8.0) }
+        ParseCx { viewport: (800.0, 600.0), font: (16.0, 16.0, 8.0, 8.0), container: (None, None) }
     }
 }
 
@@ -394,6 +398,26 @@ impl<H: Host> SpecifiedStyle<H> {
             };
             node_style.overflow = taffy::geometry::Point { x: map(o[0]), y: map(o[1]) };
             node_style.scrollbar_width = 0.0;
+            // AETHERSTYLE3B (SR115): `scrollbar-gutter: stable` (css-overflow-3 §6.1) reserves the vertical
+            // bar's space on a scroll container whether or not it overflows — taffy reserves `scrollbar_width`
+            // on the inline-end edge for a `Scroll` y axis; `both-edges` mirrors it on the start edge.
+            let scroller = o.iter().any(|v| matches!(*v, crate::scroll::HIDDEN | crate::scroll::SCROLL | crate::scroll::AUTO));
+            if scroller && matches!(self.paint.scrollbar_gutter, Some(1 | 2)) {
+                node_style.overflow.y = O::Scroll;
+                node_style.scrollbar_width = crate::scroll::SCROLLBAR;
+                if self.paint.scrollbar_gutter == Some(2) {
+                    let raw = node_style.padding.left.into_raw();
+                    if raw.tag() == taffy::style::CompactLength::LENGTH_TAG {
+                        node_style.padding.left = LengthPercentage::length(raw.value() + crate::scroll::SCROLLBAR);
+                        // The start-edge gutter is padding to taffy: under content-box sizing it would grow
+                        // the box, so a fixed width gives it up (the gutter lives inside the specified width).
+                        let w = node_style.size.width.into_raw();
+                        if node_style.box_sizing == taffy::style::BoxSizing::ContentBox && w.tag() == taffy::style::CompactLength::LENGTH_TAG {
+                            node_style.size.width = Dimension::length((w.value() - crate::scroll::SCROLLBAR).max(0.0));
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -631,6 +655,91 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 H::record_css(&format!("{}-value:{}", prop, clip(value)));
             }
         }
+        // AETHERSTYLE3B (SR115): css-overflow-3 §6.1, CSSOM View §5.1, css-scroll-snap-1 §5-§6.
+        "scrollbar-gutter" => match value {
+            "auto" => style.paint.scrollbar_gutter = Some(0),
+            "stable" => style.paint.scrollbar_gutter = Some(1),
+            "stable both-edges" | "both-edges stable" => style.paint.scrollbar_gutter = Some(2),
+            v if is_neutral_keyword(v) => {}
+            v => H::record_css(&format!("scrollbar-gutter-value:{}", clip(v))),
+        },
+        "scroll-behavior" => match value {
+            "smooth" => style.paint.scroll_smooth = Some(true),
+            "auto" => style.paint.scroll_smooth = Some(false),
+            _ => {}
+        },
+        "scroll-snap-type" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let axis = |a: &str| -> Option<u8> {
+                Some(match a {
+                    "none" => 0,
+                    "x" | "inline" => 1,
+                    "y" | "block" => 2,
+                    "both" => 3,
+                    _ => return None,
+                })
+            };
+            let parsed = match parts.as_slice() {
+                [a] => axis(a).map(|a| (a, 0)),
+                [a, "mandatory"] => axis(a).filter(|a| *a != 0).map(|a| (a, 1)),
+                [a, "proximity"] => axis(a).filter(|a| *a != 0).map(|a| (a, 0)),
+                _ => None,
+            };
+            match parsed {
+                Some(t) => style.paint.snap_type = Some(t),
+                None if is_neutral_keyword(value) => {}
+                None => H::record_css(&format!("scroll-snap-type-value:{}", clip(value))),
+            }
+        }
+        "scroll-snap-align" => {
+            let code = |a: &str| -> Option<u8> {
+                Some(match a {
+                    "none" => 0,
+                    "start" => 1,
+                    "end" => 2,
+                    "center" => 3,
+                    _ => return None,
+                })
+            };
+            // `<block> <inline>?` — one value sets both axes
+            let parts: Vec<Option<u8>> = value.split_whitespace().map(code).collect();
+            match parts.as_slice() {
+                [Some(b)] => style.paint.snap_align = Some([*b, *b]),
+                [Some(b), Some(i)] => style.paint.snap_align = Some([*i, *b]),
+                _ if is_neutral_keyword(value) => {}
+                _ => H::record_css(&format!("scroll-snap-align-value:{}", clip(value))),
+            }
+        }
+        "scroll-snap-stop" => match value {
+            "always" => style.paint.snap_stop = Some(true),
+            "normal" => style.paint.snap_stop = Some(false),
+            _ => {}
+        },
+        "scroll-padding" | "scroll-padding-top" | "scroll-padding-right" | "scroll-padding-bottom" | "scroll-padding-left" => {
+            let px = |v: &str| if v == "auto" { Some(0.0) } else { parse_px(v, cx).filter(|_| !v.ends_with('%')) };
+            let mut sp = style.paint.scroll_padding.unwrap_or([0.0; 4]);
+            let parts: Vec<Option<f32>> = value.split_whitespace().map(px).collect();
+            let ok = if prop == "scroll-padding" {
+                match parts.as_slice() {
+                    [Some(a)] => { sp = [*a; 4]; true }
+                    [Some(a), Some(b)] => { sp = [*a, *b, *a, *b]; true }
+                    [Some(a), Some(b), Some(c)] => { sp = [*a, *b, *c, *b]; true }
+                    [Some(a), Some(b), Some(c), Some(d)] => { sp = [*a, *b, *c, *d]; true }
+                    _ => false,
+                }
+            } else if let [Some(v)] = parts.as_slice() {
+                let i = match prop { "scroll-padding-top" => 0, "scroll-padding-right" => 1, "scroll-padding-bottom" => 2, _ => 3 };
+                sp[i] = *v;
+                true
+            } else {
+                false
+            };
+            if ok {
+                style.paint.scroll_padding = Some(sp);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("{}-value:{}", prop, clip(value)));
+            }
+        }
         "padding" => {
             if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v, cx)) {
                 style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
@@ -813,10 +922,8 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         "text-orientation" => match value {
             "mixed" => style.paint.text_orientation = Some(0),
-            "upright" => {
-                style.paint.text_orientation = Some(1);
-                H::record_css("text-orientation-value:upright");
-            }
+            // AETHERSTYLE3B (SR115): painted upright (`writing::upright`).
+            "upright" => style.paint.text_orientation = Some(1),
             "sideways" | "sideways-right" => style.paint.text_orientation = Some(2),
             _ => {}
         },
@@ -889,8 +996,13 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
         }
-        // css-multicol-1 §6: a spanning element splits the column flow; Aether does not split it.
-        "column-span" if value == "none" => {}
+        // AETHERSTYLE3B (SR115): css-multicol-1 §6.1 — a spanning element splits the column flow (`multicol`).
+        "column-span" => match value {
+            "none" => style.paint.col_span = Some(false),
+            "all" => style.paint.col_span = Some(true),
+            v if is_neutral_keyword(v) => {}
+            v => H::record_css(&format!("column-span-value:{}", clip(v))),
+        },
         // AETHERSTYLE3 (SR103): Filter Effects 1 §5 / Filter Effects 2 §3 — the list svg_core parses.
         "filter" | "backdrop-filter" => {
             let v = value.trim();
@@ -2327,6 +2439,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
+        scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {
@@ -2608,6 +2721,29 @@ pub fn is_font_relative(value: &str) -> bool {
     false
 }
 
+/// AETHERSTYLE3B (SR115): a value holding a container-relative length (cqw, cqh, cqi, cqb, cqmin, cqmax).
+pub fn is_container_relative(value: &str) -> bool {
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() || (b[i] == b'.' && b.get(i + 1).is_some_and(|c| c.is_ascii_digit())) {
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if matches!(value[start..i].to_ascii_lowercase().as_str(), "cqw" | "cqh" | "cqi" | "cqb" | "cqmin" | "cqmax") {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Properties whose value can be a length: their declarations are kept in
 /// cascade order (`PaintStyle::font_rel`) so the font-relative ones can be
 /// re-resolved against the element's own font.
@@ -2717,8 +2853,13 @@ pub fn parse_px(value: &str, cx: &ParseCx) -> Option<f32> {
 pub fn parse_viewport_length(v: &str, cx: &ParseCx) -> Option<f32> {
     let v = v.trim();
     let (vw, vh) = cx.viewport;
+    // AETHERSTYLE3B (SR115): the container-relative units (css-contain-3 §6.1), the small viewport's axis
+    // when no container answers (horizontal writing: cqi = cqw, cqb = cqh).
+    let (qw, qh) = (cx.container.0.unwrap_or(vw), cx.container.1.unwrap_or(vh));
     // Longest suffixes first: `dvh` must not be read as `vh` with a stray d.
     for (unit, basis) in [
+        ("cqmin", qw.min(qh)), ("cqmax", qw.max(qh)),
+        ("cqw", qw), ("cqi", qw), ("cqh", qh), ("cqb", qh),
         ("dvmin", vw.min(vh)), ("svmin", vw.min(vh)), ("lvmin", vw.min(vh)),
         ("dvmax", vw.max(vh)), ("svmax", vw.max(vh)), ("lvmax", vw.max(vh)),
         ("vmin", vw.min(vh)), ("vmax", vw.max(vh)),

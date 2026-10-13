@@ -611,17 +611,6 @@ impl AetherEngine {
             }
             css::anim::Frame::Idle => {}
         }
-        let events = css::take_animation_events();
-        if !events.is_empty() {
-            if let (Some(tree), Some(js_engine)) = (self.layout_tree.as_ref(), self.js_engine.as_mut()) {
-                for e in events {
-                    let node = tree.node_map.values().find(|n| n.id() == *e.key()).cloned();
-                    if let Some(node) = node {
-                        js_engine.fire(&node, e.kind(), true);
-                    }
-                }
-            }
-        }
         if images::take_lazy_loaded() > 0 {
             self.relayout(); // AETHERMEDIA (SR107): a lazy image arrived — its box takes its size
             self.lazy_images_pass();

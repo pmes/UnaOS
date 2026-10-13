@@ -411,6 +411,18 @@ pub fn hit<H: Host>(
     if boxes.is_empty() {
         return None;
     }
+    // AETHERSTYLE3B (SR115): a box of a vertical IFC is in its staging space anchored at the content box's
+    // physical origin (the painters' convention: x = origin + fragment x, top = origin + line top), so the
+    // physical pointer maps back through `writing::to_logical` into that space.
+    let raw = pointer;
+    let pointer = |i: usize| -> (f32, f32) {
+        let p = raw(i);
+        let b = &boxes[i];
+        match tree.inline.get(&b.ifc) {
+            Some(il) if il.vertical != 0 => vertical_pointer(il, b, p),
+            _ => p,
+        }
+    };
     let (i, inside) = pick(boxes, &pointer)?;
     let b = &boxes[i];
     let il = tree.inline.get(&b.ifc)?;
@@ -455,4 +467,15 @@ pub fn hit<H: Host>(
         }
     }
     Some(Hit { point, word, block, index: i, inside, near, under })
+}
+
+/// AETHERSTYLE3B (SR115): a physical pointer `p` → the staging-anchored space of box `b` of the vertical IFC
+/// `il` (see [`hit`]).
+pub fn vertical_pointer(il: &InlineLayout, b: &TextBox, p: (f32, f32)) -> (f32, f32) {
+    let Some(Frag::Text { x: fx, baseline, .. }) = il.frags.get(b.frag) else { return p };
+    let Some((_, lt, _)) = line_of(il, *baseline) else { return p };
+    let (ox, oy) = (b.x - fx, b.top - lt);
+    let lines: Vec<(f32, f32)> = il.lines.iter().map(|&(t, h, _)| (t, h)).collect();
+    let (sx, sy) = crate::writing::to_logical(il.vertical, p.0 - ox, p.1 - oy, il.height.ceil(), il.inline_extent.ceil(), &lines);
+    (ox + sx, oy + sy)
 }

@@ -10,6 +10,12 @@
 //! visible fraction. A wheel delta goes to the innermost user-scrollable box under the pointer and what it
 //! cannot take chains outward (css-overscroll-1 §2 scroll chaining), finally to the viewport; [`scroll_by`]
 //! returns what is left. Painters and hit tests shift a scroll container's content by [`content_shift`].
+//!
+//! AETHERSTYLE3B (SR115): `scrollbar-gutter: stable` reserves the bar's space in layout (`css::SpecifiedStyle`'s
+//! taffy fold), so the bar paints in its own gutter; a `scroll-snap-type` container lands every wheel step and
+//! every programmatic scroll on a snap position of its `scroll-snap-align` descendants ([`snap_offset`]); a
+//! programmatic scroll ([`scroll_target`]) animates as a [`SmoothScroll`] under `scroll-behavior: smooth`, driven
+//! per frame by the host.
 
 use crate::inline::Frag;
 use crate::prelude::*;
@@ -184,6 +190,11 @@ pub fn scroll_chain<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Vec<NodeId> {
 
 /// Scrolls along `chain` (innermost first): each box takes what its range and user-scrollable axes allow and
 /// passes the rest outward (scroll chaining). Returns the delta no box took (the viewport's).
+///
+/// AETHERSTYLE3B (SR115): a scroll snap container ([`snap_axes`]) lands on a snap position instead
+/// ([`snap_offset`] in the direction of the delta, css-scroll-snap-1 §7); when it moves, it takes that axis's
+/// whole delta (the wheel step chose the snap position), and when no snap position lies that way the delta
+/// passes outward.
 pub fn scroll_by<H: Host>(tree: &mut LayoutTree<H>, chain: &[NodeId], dx: f32, dy: f32) -> (f32, f32) {
     let (mut rx, mut ry) = (dx, dy);
     for &id in chain {
@@ -192,16 +203,199 @@ pub fn scroll_by<H: Host>(tree: &mut LayoutTree<H>, chain: &[NodeId], dx: f32, d
         }
         let (ux, uy) = user_scrollable(tree, id);
         let (ox, oy) = offset(tree, id);
-        let want = (if ux { ox + rx } else { ox }, if uy { oy + ry } else { oy });
+        let mut want = (if ux { ox + rx } else { ox }, if uy { oy + ry } else { oy });
+        let snap = snap_axes(tree, id);
+        if snap != (false, false) {
+            want = snap_offset(tree, id, (ox, oy), want, (rx, ry));
+        }
         let (nx, ny) = set_offset(tree, id, want.0, want.1);
         if ux {
-            rx -= nx - ox;
+            if snap.0 && (nx - ox).abs() > 0.01 {
+                rx = 0.0;
+            } else {
+                rx -= nx - ox;
+            }
         }
         if uy {
-            ry -= ny - oy;
+            if snap.1 && (ny - oy).abs() > 0.01 {
+                ry = 0.0;
+            } else {
+                ry -= ny - oy;
+            }
         }
     }
     (rx, ry)
+}
+
+// ---- AETHERSTYLE3B (SR115): scroll snapping (css-scroll-snap-1) --------------------------------------------------
+
+/// The axes (x, y) box `id` snaps on: `scroll-snap-type` on a scroll container.
+pub fn snap_axes<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (bool, bool) {
+    if !is_scroll_container(tree, id) {
+        return (false, false);
+    }
+    match tree.paint_map.get(&id).and_then(|p| p.snap_type) {
+        Some((a, _)) => (a & 1 != 0, a & 2 != 0),
+        None => (false, false),
+    }
+}
+
+/// The scroll offsets per axis at which a snap area of `id` aligns with its snapport (§6.1): every descendant
+/// whose nearest scroll container is `id` and whose `scroll-snap-align` is not `none` on that axis, at its
+/// start / end / center against the padding box less `scroll-padding`. Sorted, clamped to the scroll range,
+/// deduplicated; each with its `scroll-snap-stop: always`.
+pub fn snap_positions<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (Vec<(f32, bool)>, Vec<(f32, bool)>) {
+    let (_, _, cw, ch) = client_rect(tree, id);
+    let (mx, my) = max_scroll(tree, id);
+    let sp = tree.paint_map.get(&id).and_then(|p| p.scroll_padding).unwrap_or([0.0; 4]);
+    let Ok(l) = tree.taffy.layout(id) else { return (Vec::new(), Vec::new()) };
+    let mut xs: Vec<(f32, bool)> = Vec::new();
+    let mut ys: Vec<(f32, bool)> = Vec::new();
+    // areas in the padding-box space of `id` (unscrolled)
+    fn walk<H: Host>(tree: &LayoutTree<H>, id: NodeId, ox: f32, oy: f32, out: &mut Vec<(NodeId, f32, f32, f32, f32)>) {
+        for k in tree.taffy.children(id).unwrap_or_default() {
+            if tree.taffy.style(k).is_ok_and(|s| s.display == taffy::style::Display::None) {
+                continue;
+            }
+            let Ok(kl) = tree.taffy.layout(k) else { continue };
+            let cs = crate::col_shift(tree, k);
+            let (kx, ky) = (ox + kl.location.x + cs.0, oy + kl.location.y + cs.1);
+            out.push((k, kx, ky, kl.size.width, kl.size.height));
+            if !is_scroll_container(tree, k) {
+                walk(tree, k, kx, ky, out);
+            }
+        }
+    }
+    let mut areas = Vec::new();
+    walk(tree, id, -l.border.left, -l.border.top, &mut areas);
+    for (k, x, y, w, h) in areas {
+        let Some(p) = tree.paint_map.get(&k) else { continue };
+        let Some(align) = p.snap_align else { continue };
+        let stop = p.snap_stop == Some(true);
+        let pos = |a: u8, start: f32, size: f32, port: f32, ps: f32, pe: f32| -> Option<f32> {
+            let port_size = (port - ps - pe).max(0.0);
+            Some(match a {
+                1 => start - ps,
+                2 => start + size - ps - port_size,
+                3 => start + size / 2.0 - ps - port_size / 2.0,
+                _ => return None,
+            })
+        };
+        if let Some(v) = pos(align[0], x, w, cw, sp[3], sp[1]) {
+            xs.push((v.clamp(0.0, mx), stop));
+        }
+        if let Some(v) = pos(align[1], y, h, ch, sp[0], sp[2]) {
+            ys.push((v.clamp(0.0, my), stop));
+        }
+    }
+    let tidy = |v: &mut Vec<(f32, bool)>| {
+        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+        v.dedup_by(|a, b| {
+            if (a.0 - b.0).abs() < 0.5 {
+                b.1 |= a.1;
+                true
+            } else {
+                false
+            }
+        });
+    };
+    tidy(&mut xs);
+    tidy(&mut ys);
+    (xs, ys)
+}
+
+/// One axis's snapped offset (§7): `dir` > 0 / < 0 picks among the positions past `cur` that way — the nearest
+/// to `want`, but never past a `scroll-snap-stop: always` position — and `dir` == 0 the nearest overall.
+/// `mandatory` always snaps (no position that way: stay at `cur`); `proximity` only within `near` px of `want`.
+fn snap_axis(positions: &[(f32, bool)], cur: f32, want: f32, dir: f32, mandatory: bool, near: f32) -> f32 {
+    if positions.is_empty() {
+        return want;
+    }
+    fn nearest<'a>(cands: impl Iterator<Item = &'a (f32, bool)>, want: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for &(p, _) in cands {
+            if best.is_none_or(|b| (p - want).abs() < (b - want).abs()) {
+                best = Some(p);
+            }
+        }
+        best
+    }
+    let found = if dir > 0.0 {
+        let ahead: Vec<&(f32, bool)> = positions.iter().filter(|(p, _)| *p > cur + 0.5).collect();
+        let stop = ahead.iter().position(|(_, s)| *s).map(|i| i + 1).unwrap_or(ahead.len());
+        nearest(ahead[..stop].iter().copied(), want)
+    } else if dir < 0.0 {
+        let behind: Vec<&(f32, bool)> = positions.iter().filter(|(p, _)| *p < cur - 0.5).rev().collect();
+        let stop = behind.iter().position(|(_, s)| *s).map(|i| i + 1).unwrap_or(behind.len());
+        nearest(behind[..stop].iter().copied(), want)
+    } else {
+        nearest(positions.iter(), want)
+    };
+    match found {
+        Some(p) if mandatory || (p - want).abs() <= near => p,
+        None if mandatory && dir != 0.0 => cur,
+        _ => want,
+    }
+}
+
+/// The offset a scroll of snap container `id` from `cur` toward `want` lands on, per snapping axis (`dir` is
+/// the scroll's direction per axis; 0 = a programmatic or post-layout snap to the nearest position).
+pub fn snap_offset<H: Host>(tree: &LayoutTree<H>, id: NodeId, cur: (f32, f32), want: (f32, f32), dir: (f32, f32)) -> (f32, f32) {
+    let (sx, sy) = snap_axes(tree, id);
+    if !sx && !sy {
+        return want;
+    }
+    let mandatory = tree.paint_map.get(&id).and_then(|p| p.snap_type).is_some_and(|(_, m)| m == 1);
+    let (_, _, cw, ch) = client_rect(tree, id);
+    let (xs, ys) = snap_positions(tree, id);
+    (
+        if sx { snap_axis(&xs, cur.0, want.0, dir.0, mandatory, cw * 0.3) } else { want.0 },
+        if sy { snap_axis(&ys, cur.1, want.1, dir.1, mandatory, ch * 0.3) } else { want.1 },
+    )
+}
+
+// ---- AETHERSTYLE3B (SR115): smooth scrolling (CSSOM View §5.1 `scroll-behavior`) -------------------------------
+
+/// Whether a programmatic scroll of `id` with behavior `auto` animates (`scroll-behavior: smooth`).
+pub fn smooth_behavior<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
+    tree.paint_map.get(&id).and_then(|p| p.scroll_smooth) == Some(true)
+}
+
+/// A smooth scroll in progress: from `from` to `to` over `duration` ms from `start` (the frame clock).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SmoothScroll {
+    pub from: (f32, f32),
+    pub to: (f32, f32),
+    pub start: f64,
+    pub duration: f64,
+}
+
+impl SmoothScroll {
+    /// A smooth scroll whose duration grows with the distance (150 ms .. 450 ms, the range UAs use).
+    pub fn new(from: (f32, f32), to: (f32, f32), start: f64) -> Self {
+        let d = ((to.0 - from.0).abs()).max((to.1 - from.1).abs()) as f64;
+        SmoothScroll { from, to, start, duration: (150.0 + d * 0.3).min(450.0) }
+    }
+
+    /// The offset at `now` (an ease-in-out curve) and whether the scroll has arrived.
+    pub fn at(&self, now: f64) -> ((f32, f32), bool) {
+        let t = if self.duration <= 0.0 { 1.0 } else { ((now - self.start) / self.duration).clamp(0.0, 1.0) };
+        if t >= 1.0 {
+            return (self.to, true);
+        }
+        let e = (if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0) * (-2.0 * t + 2.0) * (-2.0 * t + 2.0) / 2.0 }) as f32;
+        ((self.from.0 + (self.to.0 - self.from.0) * e, self.from.1 + (self.to.1 - self.from.1) * e), false)
+    }
+}
+
+/// A programmatic scroll of `id` to (x, y) (CSSOM View `scrollTo` / `scrollTop =`): clamped, snapped to the
+/// nearest snap position on a snap container (§7). Returns the target; the caller sets it at once or animates
+/// to it with a [`SmoothScroll`].
+pub fn scroll_target<H: Host>(tree: &LayoutTree<H>, id: NodeId, x: f32, y: f32) -> (f32, f32) {
+    let (mx, my) = max_scroll(tree, id);
+    let cur = offset(tree, id);
+    let want = (x.clamp(0.0, mx), y.clamp(0.0, my));
+    snap_offset(tree, id, cur, want, (0.0, 0.0))
 }
 
 /// One scrollbar in the box's border-box space: its track and thumb rectangles (x, y, w, h).

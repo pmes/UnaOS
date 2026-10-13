@@ -115,6 +115,9 @@ impl DomNode for N {
     fn attr(&self, name: &str) -> Option<String> {
         self.node().attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
     }
+    fn attrs(&self) -> Vec<(String, String)> {
+        self.node().attrs.clone()
+    }
     fn text(&self) -> String {
         if self.node().kind == NodeKind::Text {
             return self.node().text.clone();

@@ -1433,14 +1433,57 @@ fn offset_parent_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(dom::wrap_opt(vm, p))
 }
 
+/// AETHERSTYLE3B (SR115): `scrollTop` / `scrollLeft` read the element's scroll offset of the last frame.
 fn scroll_pos_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_element(vm, ctx)?;
-    Ok(num(0.0))
+    let el = this_element(vm, ctx)?;
+    let (x, y) = crate::layout::element_scroll_offset(NodeId(el));
+    Ok(num(if callee_str(vm, ctx) == "scrollTop" { y } else { x } as f64))
 }
 
+/// A write queues a scroll request; the new offset shows after the next frame.
 fn scroll_pos_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_element(vm, ctx)?;
-    crate::ledger::record_dom("element-scroll-offsets-not-modelled");
+    let el = this_element(vm, ctx)?;
+    let v = vm.to_number(&arg(vm, ctx, 0))? as f32;
+    let (x, y) = if callee_str(vm, ctx) == "scrollTop" { (None, Some(v)) } else { (Some(v), None) };
+    crate::layout::request_element_scroll(NodeId(el), x, y, crate::layout::ScrollBehavior::Auto);
+    Ok(Value::Undefined)
+}
+
+/// `scroll()` / `scrollTo()` take `(x, y)` or `{left, top, behavior}`; `scrollBy()` adds to the offset.
+fn scroll_to(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let by = callee_str(vm, ctx) == "scrollBy";
+    let a0 = arg(vm, ctx, 0);
+    let mut behavior = crate::layout::ScrollBehavior::Auto;
+    let (mut x, mut y) = (None, None);
+    if let Value::Object(o) = a0 {
+        for (k, slot) in [("left", &mut x), ("top", &mut y)] {
+            let v = vm.get(o, &PropertyKey::from_str(k))?;
+            if !matches!(v, Value::Undefined) {
+                *slot = Some(vm.to_number(&v)? as f32);
+            }
+        }
+        let b = vm.get(o, &PropertyKey::from_str("behavior"))?;
+        if !matches!(b, Value::Undefined) {
+            let bs = vm.to_string(&b)?;
+            behavior = if bs.eq_str("smooth") {
+                crate::layout::ScrollBehavior::Smooth
+            } else if bs.eq_str("instant") {
+                crate::layout::ScrollBehavior::Instant
+            } else {
+                crate::layout::ScrollBehavior::Auto
+            };
+        }
+    } else {
+        x = Some(vm.to_number(&a0)? as f32);
+        y = Some(vm.to_number(&arg(vm, ctx, 1))? as f32);
+    }
+    if by {
+        let (cx, cy) = crate::layout::element_scroll_offset(NodeId(el));
+        x = x.map(|d| cx + d);
+        y = y.map(|d| cy + d);
+    }
+    crate::layout::request_element_scroll(NodeId(el), x, y, behavior);
     Ok(Value::Undefined)
 }
 
@@ -1482,11 +1525,13 @@ pub fn install(vm: &mut Vm) {
     for m in ["clientTop", "clientLeft", "clientWidth", "clientHeight", "scrollWidth", "scrollHeight"] {
         attr_with(vm, element, m, box_metric, None, s(m));
     }
-    attr(vm, element, "scrollTop", scroll_pos_get, Some(scroll_pos_set));
-    attr(vm, element, "scrollLeft", scroll_pos_get, Some(scroll_pos_set));
-    for m in ["scrollIntoView", "scroll", "scrollTo", "scrollBy"] {
-        op(vm, element, m, 0, noop_el);
+    for m in ["scrollTop", "scrollLeft"] {
+        attr_with(vm, element, m, scroll_pos_get, Some(scroll_pos_set), s(m));
     }
+    for m in ["scroll", "scrollTo", "scrollBy"] {
+        op_with(vm, element, m, 0, scroll_to, s(m));
+    }
+    op(vm, element, "scrollIntoView", 0, noop_el);
     let he = iface("HTMLElement").unwrap().proto;
     for m in ["offsetTop", "offsetLeft", "offsetWidth", "offsetHeight"] {
         attr_with(vm, he, m, box_metric, None, s(m));

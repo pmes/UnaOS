@@ -206,6 +206,22 @@ pub struct PaintStyle<H: Host> {
     pub container_type: Option<u8>,
     pub container_name: Option<Vec<String>>,
     pub contain_size: Option<u8>,
+    /// AETHERSTYLE3B (SR115): `scrollbar-gutter` (css-overflow-3 §6.1): 0 auto (overlay bars), 1 stable, 2
+    /// stable both-edges — a scroll container reserves [`crate::scroll::SCROLLBAR`] px of layout space.
+    pub scrollbar_gutter: Option<u8>,
+    /// `scroll-behavior` (CSSOM View §5.1): true = smooth (programmatic scrolls animate).
+    pub scroll_smooth: Option<bool>,
+    /// `scroll-snap-type` (css-scroll-snap-1 §5.1): (axes: 0 none, 1 x, 2 y, 3 both; 1 = mandatory, 0 =
+    /// proximity).
+    pub snap_type: Option<(u8, u8)>,
+    /// `scroll-snap-align` (§6.1) as [x, y]: 0 none, 1 start, 2 end, 3 center.
+    pub snap_align: Option<[u8; 2]>,
+    /// `scroll-snap-stop: always` (§6.2).
+    pub snap_stop: Option<bool>,
+    /// `scroll-padding` (§5.2) in px: [top, right, bottom, left] (the snapport's insets).
+    pub scroll_padding: Option<[f32; 4]>,
+    /// AETHERSTYLE3B (SR115): `column-span` (css-multicol-1 §6.1): true = `all`.
+    pub col_span: Option<bool>,
 }
 
 
@@ -299,6 +315,13 @@ impl<H: Host> Default for PaintStyle<H> {
             container_type: None,
             container_name: None,
             contain_size: None,
+            scrollbar_gutter: None,
+            scroll_smooth: None,
+            snap_type: None,
+            snap_align: None,
+            snap_stop: None,
+            scroll_padding: None,
+            col_span: None,
         }
     }
 }
