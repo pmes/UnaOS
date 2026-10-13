@@ -696,7 +696,7 @@ fn pin_quarry(_rows: &mut Model, n: usize) -> usize {
 /// used to inline. The dock is unconditionally PRESENT (there is no disable for it: it is the
 /// console's only way back), so `None` here means only that the panel cannot host it.
 pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
-    let mut tiles = ModelBuf::take();
+    if super::look::is_softy() { return super::softy::taskbar::rect(pw, ph); } let mut tiles = ModelBuf::take(); // SOFTY (B629): under the Softy look this tenancy hosts the taskbar band; LINE-NEUTRAL fold, code first
     // A zero rect asks the damage question nothing; only the tile count is wanted here.
     let (n, _) = wm::dock_scan(&mut tiles, (0, 0, 0, 0));
     // PINCOUNT — the registry must report the strip the painter will paint, pinned tiles included,
@@ -824,7 +824,7 @@ fn signature(e: &[wm::DockEntry], l: &Layout, pressed: u32) -> u64 {
 ///
 /// The quiet path is one `wm::dock_scan`, one hash and a compare. See the module header.
 pub fn compose() -> bool {
-    let t0 = crate::arch::now_cycles();
+    if super::look::is_softy() { return vacate_off() | super::softy::taskbar::compose(); } let t0 = crate::arch::now_cycles(); // SOFTY (B629): the taskbar paints in the dock's place (the dock's own pixels vacated once); LINE-NEUTRAL fold, code first
     let mut rows = ModelBuf::take();
     // Ask `wm` for the tile model AND the damage question in ONE table scan: "were any of the
     // windows that intersect the strip I last painted damaged in the pass that just ran?"
@@ -1084,7 +1084,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
 /// A kernel-owned row (the panel console) hands the KEYBOARD to the shell instead of to a program
 /// with no input ring — the rule the router's furniture arm already states.
 pub fn press_at(x: i32, y: i32) -> bool {
-    if x < 0 || y < 0 {
+    if super::look::is_softy() { return super::softy::taskbar::press_at(x, y); } if x < 0 || y < 0 { // SOFTY (B629): the taskbar's press arm in the dock's place; LINE-NEUTRAL fold, code first
         return false;
     }
     let (px, py) = (x as usize, y as usize);
@@ -3785,7 +3785,7 @@ pub fn position_word() -> &'static str { POSITIONS[position() as usize] }
 pub fn autohide() -> bool { AUTOHIDE.load(Ordering::Relaxed) }
 
 /// Is the strip on the glass now? Always, unless auto-hide is on and the pointer has not called it.
-fn shown() -> bool { !autohide() || REVEALED.load(Ordering::Relaxed) || MENU_OPEN.load(Ordering::Relaxed) }
+fn shown() -> bool { !super::look::is_softy() && (!autohide() || REVEALED.load(Ordering::Relaxed) || MENU_OPEN.load(Ordering::Relaxed)) } // SOFTY (B629): no dock layout under the Softy look, so every dock router (the tile menu, a right press) declines
 
 /// Settings (and the fixture): put the dock on edge `p` (bottom/left/right) now; `save` latches the store write.
 pub fn set_position(p: &str, save: bool) -> bool {

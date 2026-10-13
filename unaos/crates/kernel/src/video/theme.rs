@@ -1061,3 +1061,6 @@ fn lift(c: u32, n: u32) -> u32 {
 #[inline] pub fn ink_on_accent() -> u32 { if is_dark() { content_text() } else { field_bg() } }
 /// The secondary ink (a group's title, a caption): the content ink two fifths of the way to the face.
 #[inline] pub fn ink_secondary() -> u32 { mix(content_text(), chrome_face(), 2, 5) }
+/// SOFTY (B629): the Softy look's colours, re-exported by name from `palette_core::softy` (PALETTECORE B559: the
+/// values live there); `video::softy::palette` re-exports them beside its dimensions.
+pub use palette_core::softy;

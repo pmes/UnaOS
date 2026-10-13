@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 56.
+Rows: 57.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -40,6 +40,7 @@ Rows: 56.
 | `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen, aether, midden, una, stria each only on its own build) | dock | — | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen, aether, midden, una, stria); TOML arrays are outside the subset. |
 | `system.dock.position` | enum `bottom \| left \| right` | `"bottom"` | settings, dock, program | yes | kernel dock | The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock. |
 | `system.login.items` | string ≤256 printable | `""` | settings, dock | — | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
+| `system.look` | enum `una \| softy` | `"una"` | settings, program | yes | kernel `video::look` (SOFTY) | The desktop's look: `una` (menu bar, dock, UnaOS chrome) or `softy` (a bottom taskbar with a Start menu, window controls at the right), applied live on PrefChanged (SOFTY B629). |
 | `system.notify.dnd` | bool | `false` | settings, program | yes | kernel NOTIFY (`video/notify.rs`) | Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows, no sound) (NOTIFY, MACPARITY row 24). Edited in Settings > Notifications; stored in settings/notify (NOTIFYPANE B435). |
 | `system.notify.dnd_from` | int `0..=23` | `0` | settings | — | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it starts (0..23); equal to `notify.dnd_until` = no schedule (NOTIFYPANE B435). |
 | `system.notify.dnd_until` | int `0..=23` | `0` | settings | — | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it ends (0..23, wrapping midnight); equal to `notify.dnd_from` = no schedule (NOTIFYPANE B435). |

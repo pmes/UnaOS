@@ -796,7 +796,7 @@ pub fn owns_pixels() -> bool {
 ///  * **disabled** — the default state;
 ///  * **the panel cannot host it** — shorter than [`FLOOR_H`] or narrower than [`FLOOR_W`].
 pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
-    if !ENABLED.load(Ordering::Relaxed) {
+    if !ENABLED.load(Ordering::Relaxed) || super::look::is_softy() { // SOFTY (B629): no top strip under the Softy look (the taskbar takes the bottom band)
         return None;
     }
     geometry(pw, ph)
@@ -1034,7 +1034,7 @@ fn clock_hhmm() -> Option<[u8; CLOCK_GLYPHS]> {
 /// not hash, and cannot repaint. (The owed-pixels load is `SLOT.packed()`, which is `0` on every
 /// pass of a bar that was never on, so the erase branch is not taken; a bar that was turned OFF pays
 /// one erase, once, and then reads `0` too.)
-pub fn compose() -> bool {
+pub fn compose() -> bool { if super::look::is_softy() { if SLOT.packed() != 0 { let r = SLOT.rect(); SLOT.clear(); return strip::vacate("menubar", r, None, false); } return false; } // SOFTY (B629): the top strip is not drawn under the Softy look — what it owned is vacated once; LINE-NEUTRAL fold, code first
     if !ENABLED.load(Ordering::Relaxed) {
         let off = OFF_PASSES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         // MENUBAR-OCC-PAR — the NEVER-ENABLED outcome. See [`occpar_once`]: a bar that is off all

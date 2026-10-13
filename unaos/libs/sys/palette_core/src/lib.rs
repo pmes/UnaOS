@@ -402,3 +402,57 @@ const _: () = {
     assert!(t.accent == ACCENTS[3] && t.highlight == ACCENTS[5]);
     assert!(t.selection == mix(ACCENTS[5], DARK[Tok::ContentFill as usize], 3, 8));
 };
+
+/// SOFTY (B629): the Softy look's colours — every one Softy draws with, named once here (PALETTECORE B559: a colour
+/// literal lives in this table and nowhere else); `video::theme::softy` and `video::softy::palette` re-export them.
+pub mod softy {
+    /// The taskbar's and the focused window head's surface (a soft, slightly cool light grey).
+    pub const SURFACE: u32 = 0xF3F3F3;
+    /// An unfocused window head: one step lighter, so focus reads at a glance.
+    pub const SURFACE_IDLE: u32 = 0xFAFAFA;
+    /// The Start menu's and the calendar's body.
+    pub const FLYOUT: u32 = 0xF9F9F9;
+    /// The Start menu's footer band (the user and the power button).
+    pub const FLYOUT_FOOT: u32 = 0xEFEFEF;
+    /// Primary ink.
+    pub const TEXT: u32 = 0x202020;
+    /// Secondary ink (placeholders, the date line, section labels' detail).
+    pub const TEXT_2: u32 = 0x5C5C5C;
+    /// An unfocused window's caption.
+    pub const TEXT_IDLE: u32 = 0x8C8C8C;
+    /// THE accent (the brief's value; SOFTY.md notes it is the seat's to align with DESIGN-LANGUAGE).
+    pub const ACCENT: u32 = 0x0067C0;
+    /// Ink on the accent.
+    pub const ON_ACCENT: u32 = 0xFFFFFF;
+    /// The hairline every surface edge carries (the flyouts' outline, the taskbar's top edge, dividers).
+    pub const STROKE: u32 = 0x000000;
+    /// An unfocused window's 1 px border.
+    pub const EDGE_IDLE: u32 = 0xC8C8C8;
+    /// A hovered control: white over the surface …
+    pub const HOVER: u32 = 0xFFFFFF;
+    /// … and pressed: a touch of ink.
+    pub const PRESS: u32 = 0x000000;
+    /// The close button under the pointer, and its glyph.
+    pub const CLOSE_HOT: u32 = 0xC42B1C;
+    pub const CLOSE_INK: u32 = 0xFFFFFF;
+    /// A text field's face, its outline, and the darker underline that marks it as editable.
+    pub const FIELD: u32 = 0xFFFFFF;
+    pub const FIELD_LINE: u32 = 0x8A8A8A;
+    /// The running-app pip under a taskbar tile (idle; the focused app's pip is the accent).
+    pub const PIP: u32 = 0x8C8C8C;
+    /// An app's monogram tile colour when the registrar draws no icon for it: one calm hue per table app
+    /// (`dock::DP_PINS` order), then a hash pick for a window no pin names.
+    pub const APP_HUES: [u32; 11] = [
+    0x2E2E33, // console
+    0x3B3F46, // shell
+    0xD99A1E, // quarry
+    0x2F9461, // activity
+    0x6E6E78, // settings
+    0x2B78C9, // editor
+    0xC9822B, // lumen
+    0x4C64D6, // aether
+    0x7F58C7, // midden
+    0x138C88, // una
+    0xC9465C, // stria
+    ];
+}

@@ -14849,7 +14849,7 @@ fn outside_top_corner(r: &Window, px: usize, py: usize) -> bool {
         return false; // no chrome, no corners
     }
     let (bx, by, bw, bh) = outer_box(r);
-    let rad = super::theme::CORNER_RADIUS().min(bw / 2).min(bh / 2);
+    let rad = super::theme::CORNER_RADIUS().min(bw / 2).min(bh / 2); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let rad = if super::look::is_softy() { super::softy::chrome::RADIUS().min(rad) } else { rad }; // SOFTY (B629): the Softy head cuts an 8 px arc, so the desktop owns exactly the pixels it shows; LINE-NEUTRAL fold
     if rad == 0 || py < by || py >= by.saturating_add(rad) {
         return false;
     }
@@ -15600,7 +15600,7 @@ pub fn control_hit(id: WinId, x: i32, y: i32) -> Option<Ctrl> {
     }
     let (px, py) = (x as usize, y as usize);
     let t = table();
-    let r = row(&t, id)?;
+    let r = row(&t, id)?; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if super::look::is_softy() { return if controls(r).is_some() { super::softy::chrome::ctrl_at(r, px, py) } else { None }; } // SOFTY (B629): the three caption buttons at the RIGHT, the one geometry the Softy painter draws; LINE-NEUTRAL fold
     // CONSOLEWIN — the row's OWN list ([`ctrls_for`]), which is the list the painter walks. Walking
     // the global `CTRLS` here would still be correct-by-accident (`control_disc` returns `None` for
     // a control the row lacks, so the `matches!` would decline it), but it would be a second place
@@ -15966,7 +15966,7 @@ pub fn title_bar_hit(id: WinId, x: i32, y: i32) -> bool {
     if outside_top_corner(r, px, py) {
         return false;
     }
-    match close_box(r) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if super::look::is_softy() { return controls(r).is_none() || super::softy::chrome::ctrl_at(r, px, py).is_none(); } match close_box(r) { // SOFTY (B629): the drag handle excludes the Softy buttons; LINE-NEUTRAL fold, code first
         Some((cx, cy, d)) => !in_circle(px, py, cx, cy, d),
         None => true,
     }
@@ -20700,7 +20700,7 @@ fn paint_window(
         );
     }
 
-    if r.x >= pw || r.y >= ph {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if !r.compat && super::look::is_softy() { super::softy::chrome::paint(dst, r, ox, oy, focused, controls(r).is_some(), &r.title[..r.title_len]); } if r.x >= pw || r.y >= ph { // SOFTY (B629): the Softy head and frame over the stock chrome, before the content; LINE-NEUTRAL fold, code first
         comp_mark(r.id, mk + PW_EXIT);
         return;
     }

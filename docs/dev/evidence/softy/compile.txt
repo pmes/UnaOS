@@ -1,0 +1,18 @@
+SOFTY (rmbp-ledger B629) — the arc's one compile, exec-rmbp-softy, parent bd3d399d.
+
+cd unaos/crates/kernel && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/root/unaos-bench/scratch/cloud/wave32/target cargo +nightly check -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec --target ../../x86_64-unknown-none.json --features "$(cat /root/unaos-bench/scratch/cloud/wave32/kfeats24.txt)"
+
+features: witness,selfhost,logts,wcg-paygo,wcdvalve,quarry,facet,ehcihid,kbdwit,smc,sdwrite,sdw,sdhcblk,ahci,unafs,hda,hda-tone,usbnet,wifi,wifi2,wifi3,wifi4,bt,btc,login,nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-ce,beam,wc,noaspm,nvidia-kepler-vblank,deadman,linuxabi,busreg,lumen,netring3,selfdiag,lidsleep,videoplayer,intel-ivb,unaos_ivb,gen7,gen7,gen7r8,gen7,gen7blit,gmux_igd,smolnet,ftdirx,uvc,ioapic,midden,aether,una,sonde
+
+rc=0
+    Checking prefs_core v0.1.0 (/home/user/exec/softy/unaos/libs/sys/prefs_core)
+    Checking unaos-kernel v0.1.0 (/home/user/exec/softy/unaos/crates/kernel)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 17s
+
+Warnings in this arc's files (both private_interfaces, harmless: the two wm-only entries take wm's pub(super) Window):
+warning: type `video::wm::Window` is more private than the item `ctrl_at`
+   --> crates/kernel/src/video/softy/chrome.rs:59:1
+warning: type `video::wm::Window` is more private than the item `chrome::paint`
+   --> crates/kernel/src/video/softy/chrome.rs:174:1
+
+Not run (R107, the seat's at the fold): the aarch64 desktop_firmware leg of ./arroyo check, tests softy on QEMU, knoboff, prefs_core schema_gate (PREFS-SCHEMA.md regeneration owed).

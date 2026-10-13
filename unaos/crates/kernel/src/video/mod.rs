@@ -1255,3 +1255,6 @@ pub mod svclatch;
 // GLASSKIT (B628): the glass's drawing kit — anti-aliased rounded rects, strokes, shadows, dithered gradients, circles, lines and the control set; `tests glasskit`. Same gate as dock; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod draw;
+// SOFTY (B629): the desktop's second LOOK (`video::softy`: the taskbar, Start, the chrome at the right) and its switch (`video::look`, Principia's `system.look`). Same gate as the dock; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy;

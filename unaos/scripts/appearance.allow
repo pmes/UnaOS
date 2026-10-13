@@ -26,3 +26,5 @@ loginrender.rs  0xff_ffff    the 24-bit duration field of a stamp ring word (LOG
 ../../../user-una/src/theme.rs  0x5448_0000  the PREFS bus correlation-id base ("TH" tag) of the theme client, not a pixel (PALETTECORE B559 brought ring 3 into scope)
 ../../../user-midden/src/theme.rs  0x5448_0000  the PREFS bus correlation-id base ("TH" tag) of the theme client, not a pixel (PALETTECORE B559 brought ring 3 into scope)
 ../../../user-lumen/src/theme.rs  0x5448_0000  the PREFS bus correlation-id base ("TH" tag) of the theme client, not a pixel (PALETTECORE B559 brought ring 3 into scope)
+softy/chrome.rs  0x811C_9DC5  FNV-1a offset basis: the app-hue hash seed (SOFTY B629), not a pixel
+softy/chrome.rs  0x0100_0193  FNV-1a prime: the app-hue hash multiplier (SOFTY B629), not a pixel
