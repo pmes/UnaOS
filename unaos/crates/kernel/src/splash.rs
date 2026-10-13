@@ -932,7 +932,7 @@ pub fn step_label(text: &str) {
 
 /// Whether the OVER band is painted (the next step's word clears it).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-static OVER_UP: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL_LIVE: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL_SET: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] struct PanelSlot(core::cell::UnsafeCell<crate::video::FrameBuffer>); #[cfg(all(target_arch = "x86_64", feature = "wc"))] unsafe impl Sync for PanelSlot {} #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL: PanelSlot = PanelSlot(core::cell::UnsafeCell::new(crate::video::FrameBuffer::new())); // RESOLVEHANG2 (B531): the takeover's panel handle (`takeover_blit`, written once) and whether the watchdog may paint through it (from the takeover until `hold_release` has closed the row)
+static OVER_UP: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL_SKIP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0); #[cfg(all(target_arch = "x86_64", feature = "wc"))] fn panel_skip(bit: u8, why: &str) { if PANEL_SKIP.fetch_or(bit, Ordering::Relaxed) & bit == 0 { serial_println!("[splash] panel-write skipped why={}", why); } } #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL_LIVE: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL_SET: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] struct PanelSlot(core::cell::UnsafeCell<crate::video::FrameBuffer>); #[cfg(all(target_arch = "x86_64", feature = "wc"))] unsafe impl Sync for PanelSlot {} #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL: PanelSlot = PanelSlot(core::cell::UnsafeCell::new(crate::video::FrameBuffer::new())); // SMALLFIX9 (B533, RESOLVEHANG2's note): `panel_skip` — every gate that drops the OVER line names itself on the wire ONCE per boot (`[splash] panel-write skipped why=<which>`, one bit per why). RESOLVEHANG2 (B531): the takeover's panel handle (`takeover_blit`, written once) and whether the watchdog may paint through it (from the takeover until `hold_release` has closed the row)
 
 /// Whether the splash holds the glass (a held row is open) — the steps that are the splash's own waits
 /// (`store-wait`, `first-screen`) exist only while this is true.
@@ -962,12 +962,12 @@ pub fn over_label(text: &str) {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] over_panel(text);
     if HOLD_WIN.load(Ordering::Acquire) == 0 { return; }
     let ch = crate::video::font::Face::Chrome.cell_h();
-    let Some(mut g) = HOLD_SURF.try_lock() else { return };
-    let Some((surf, w, h)) = g.as_mut() else { return };
+    let Some(mut g) = HOLD_SURF.try_lock() else { #[cfg(all(target_arch = "x86_64", feature = "wc"))] panel_skip(8, "surf-busy"); return };
+    let Some((surf, w, h)) = g.as_mut() else { #[cfg(all(target_arch = "x86_64", feature = "wc"))] panel_skip(32, "surf-none"); return };
     let (w, h) = (*w, *h);
     let band_h = ch * 2;
     if w == 0 || h < band_h * 4 || surf.len() < w * h * 4 {
-        return;
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] panel_skip(16, "surf-geometry"); return;
     }
     let y0 = h - band_h * 2;
     over_band_clear(surf, w, y0, band_h);
@@ -994,10 +994,10 @@ pub fn over_label(text: &str) {
 /// TrueType engine, no heap), a computed background (write-only VRAM is never read). Same band as the surface's.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn over_panel(text: &str) {
-    if !PANEL_LIVE.load(Ordering::Acquire) { return; }
+    if !PANEL_LIVE.load(Ordering::Acquire) { panel_skip(1, "not-live"); return; }
     let fb = unsafe { *PANEL.0.get() }; // SAFETY: written once in `takeover_blit` before the Release store acquired above, never again
     let face = crate::video::font::Face::Chrome; let (cw, ch, w, h) = (face.cell_w(), face.cell_h(), fb.width(), fb.height()); let band_h = ch * 2;
-    if !fb.is_ready() || cw == 0 || w < cw || h < band_h * 4 { return; }
+    if !fb.is_ready() || cw == 0 || w < cw || h < band_h * 4 { if fb.is_ready() { panel_skip(4, "geometry"); } else { panel_skip(2, "not-ready"); } return; }
     let y0 = h - band_h * 2; fb.fill_rect(0, y0, w, band_h, SPLASH_BG);
     let n = text.len().min(w / cw); let (x0, ty) = ((w - n * cw) / 2, y0 + (band_h - ch) / 2);
     for (i, &b) in text.as_bytes()[..n].iter().enumerate() { crate::video::font::draw_glyph_fb(&fb, b, x0 + i * cw, ty, crate::video::theme::painter::SPLASH_CAPTION_INK, SPLASH_BG, false, face); }

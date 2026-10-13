@@ -200,7 +200,7 @@ pub(crate) const HID_MOD_GUI: u8 = 0x88; // bit 3 LGUI   | bit 7 RGUI (Cmd on Ap
 ///   = 0x1A (Ctrl-Z). Two collision classes are then carved back out, because `Event::Key` is one
 ///   `u8` with no modifier field, so a consumer literally cannot tell a folded Ctrl-combo from the
 ///   dedicated key that produces the same byte:
-///     - Ctrl with a NON-letter is suppressed: the classic codes (Ctrl-\ = 0x1C, Ctrl-] = 0x1D,
+///     - Ctrl with a NON-letter is suppressed (SMALLFIX9 B533: except a main-row digit, which presses `HID_KEY_CTRL_DIGIT | d`): the classic codes (Ctrl-\ = 0x1C, Ctrl-] = 0x1D,
 ///       Ctrl-^ = 0x1E, Ctrl-_ = 0x1F) land dead-on this table's arrow encoding at 0x1C..0x1F, and
 ///       `user-vug` binds 0x1C as yaw-right.
 ///     - Ctrl+letter folds landing on **0x08 / 0x09 / 0x0A / 0x0D** are suppressed too — these are
@@ -229,7 +229,7 @@ pub(crate) fn hid_key_ascii(keycode: u8, modifiers: u8, caps: bool) -> u8 {
     }
     if modifiers & HID_MOD_CTRL != 0 {
         if !is_letter {
-            return 0;
+            return if (0x1E..=0x27).contains(&keycode) { HID_KEY_CTRL_DIGIT | ((keycode - 0x1D) % 10) } else { 0 }; // SMALLFIX9 (B533, UNAMETAL's workaround) — ⚠ SAME-LINE fold, line-NEUTRAL: Ctrl + a main-row DIGIT is a PRESS of its own byte, `HID_KEY_CTRL_DIGIT | d` (Ctrl+1 = 0x81 .. Ctrl+9 = 0x89, Ctrl+0 = 0x80) — a range no key of this table and no other fold produces (`pwwire::key_class` already files 0x80..=0xFF as `nav`; every ASCII consumer takes 0x20..=0x7E only), so the arrow carve-out above is untouched and ring 3 sees Ctrl+1/2/3 as presses. The RELEASE stays the bare digit (`hid_key_release_ascii`, ALLKEYS: spurious release safe, missing release not); every other Ctrl+non-letter stays suppressed
         }
         let c0 = keycode - 0x03;
         // Carve out the folds that collide with dedicated-key bytes a consumer binds bare:
@@ -297,7 +297,7 @@ pub(crate) const HID_LOCK_KEYS: [(u8, u8); 3] = [
 /// It sits at `(0, 0)` in [`HID_SCANCODE_TO_ASCII`] and stays there: PrintScreen types nothing, and
 /// the table's contract is "the character this key types". It is a COMMAND, like Application and
 /// Power beside it.
-pub(crate) const HID_USAGE_PRINT_SCREEN: u8 = 0x46;
+pub(crate) const HID_USAGE_PRINT_SCREEN: u8 = 0x46; pub(crate) const HID_KEY_CTRL_DIGIT: u8 = 0x80; // SMALLFIX9 (B533): the base of the Ctrl+digit press bytes (`hid_key_ascii`), 0x80..=0x89
 
 /// PRTSCR — **did PrintScreen go DOWN in this report?** The shared press-edge predicate both
 /// decoders ask, so a key is a key whichever controller carried it.

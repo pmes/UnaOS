@@ -6941,7 +6941,7 @@ fn bg_program(console: &mut Console, path: &str, rest: &[&str]) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
     };
-    let mut argv = alloc::vec![path];
+    let canon = vfs_path(path); if !crate::fs::apptrust::launch_gate(&vfs_mount_table(), &canon) { serial_println!("[bg] refused=apptrust path={}", canon); console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("[bg] refused=apptrust path={}", canon)); return false; } let mut argv = alloc::vec![path];
     argv.extend_from_slice(rest);
     bg_image(console, path, &bytes, &argv).is_some()
 }
@@ -7374,7 +7374,7 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str, args: &[String]) ->
     // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
     // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
     // loader re-validates from scratch regardless.
-    if !exec_detaches(&bytes, &canon, typed) { serial_println!("[bg] spawn path={} bytes={} pid=foreground", load_path, bytes.len()); run_image(console, &canon, bytes, &argv); return true; } let n = bytes.len(); // EXECNAME (B322, R82): the program decides — a window or a resident server detaches below, anything else runs in the foreground through `run`'s own body. RING3ABI2 M2 (B333): the detached launch is `bg`'s own body (`bg_image`), so `bg`, `run` and a bare name share one path and carry the same argv.
+    let gate = vfs_path(&load_path); if !crate::fs::apptrust::launch_gate(&vfs_mount_table(), &gate) { serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: apptrust path={} ::", canon, typed, gate); console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: refused=apptrust path={}", typed, gate)); return true; } if !exec_detaches(&bytes, &canon, typed) { serial_println!("[bg] spawn path={} bytes={} pid=foreground", load_path, bytes.len()); run_image(console, &canon, bytes, &argv); return true; } let n = bytes.len(); // EXECNAME (B322, R82): the program decides — a window or a resident server detaches below, anything else runs in the foreground through `run`'s own body. RING3ABI2 M2 (B333): the detached launch is `bg`'s own body (`bg_image`), so `bg`, `run` and a bare name share one path and carry the same argv.
     crate::prof::launching(&canon); match bg_image(console, &canon, &bytes, &argv) {
         Some((pid, slot, entry)) => {
             serial_println!(
