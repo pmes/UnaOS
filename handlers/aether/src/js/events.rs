@@ -902,12 +902,13 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
         "summary" => {
             let Some(d) = parent_of(a) else { return };
             let was_open = dom::attr_value(d, "open").is_some();
+            // The toggle task is queued by the `open` attribute change steps (js/dom.rs), for script
+            // and user alike.
             if was_open {
                 dom::remove_attr(vm, d, "open");
             } else {
                 dom::set_attr(vm, d, "open", "");
             }
-            queue_details_toggle(vm, d, was_open);
         }
         "label" => {
             let control = dom::with_doc(|d| super::controls::label_control_in(d, a));
@@ -995,7 +996,7 @@ thread_local! {
 
 /// HTML §4.11.1 "queue a details toggle event task": a pending task for `d` keeps its oldState (the
 /// new state is read when it runs); otherwise a task is queued that fires a ToggleEvent at `d`.
-fn queue_details_toggle(vm: &mut Vm, d: usize, was_open: bool) {
+pub(crate) fn queue_details_toggle(vm: &mut Vm, d: usize, was_open: bool) {
     let pending = TOGGLE_PENDING.with(|t| t.borrow().contains_key(&d));
     if pending {
         return;
@@ -1233,6 +1234,31 @@ pub fn fire_simple(vm: &mut Vm, t: TargetKey, ty: &str, bubbles: bool, cancelabl
     let e = new_event(vm, "Event", ty, bubbles, cancelable, None);
     let r = root(vm, Value::Object(e));
     let (_, ran) = dispatch(vm, e, t);
+    unroot(vm, r);
+    ran
+}
+
+/// HTML "fire a focus event" (§6.6.4, AETHERDEBT SR93): a trusted, composed FocusEvent `ty` at `n`
+/// whose `relatedTarget` is `related` (the element focus moves from or to; null when none), `view`
+/// the Window. `focus`/`blur` do not bubble, `focusin`/`focusout` do (UI Events §5.2.2).
+pub fn fire_focus(vm: &mut Vm, n: usize, ty: &str, related: Option<usize>) -> bool {
+    if super::engine_poisoned() {
+        return false;
+    }
+    let init = vm.new_plain_object();
+    let rel = match related {
+        Some(r) => wrap(vm, r),
+        None => Value::Null,
+    };
+    let _ = vm.create_data_property(init, PropertyKey::from_str("relatedTarget"), rel);
+    let view = target_value(vm, TargetKey::Window);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("view"), view);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("detail"), num(0.0));
+    let bubbles = matches!(ty, "focusin" | "focusout");
+    let e = new_event(vm, "FocusEvent", ty, bubbles, false, Some(init));
+    set_flag(vm, e, F_COMPOSED, true);
+    let r = root(vm, Value::Object(e));
+    let (_, ran) = dispatch(vm, e, TargetKey::Node(n));
     unroot(vm, r);
     ran
 }

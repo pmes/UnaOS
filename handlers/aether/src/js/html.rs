@@ -635,14 +635,17 @@ fn focus_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if old == Some(el) {
         return Ok(Value::Undefined);
     }
+    // HTML §6.6.4 "focus update steps" (AETHERDEBT SR93): FocusEvents whose relatedTarget is the
+    // other side of the move — blur/focusout at the old element name the new one, focus/focusin at the
+    // new element name the old one.
     if let Some(o) = old {
         page(|p| p.focused = None);
-        super::events::fire_simple(vm, super::TargetKey::Node(o), "blur", false, false);
-        super::events::fire_simple(vm, super::TargetKey::Node(o), "focusout", true, false);
+        super::events::fire_focus(vm, o, "blur", Some(el));
+        super::events::fire_focus(vm, o, "focusout", Some(el));
     }
     page(|p| p.focused = Some(el));
-    super::events::fire_simple(vm, super::TargetKey::Node(el), "focus", false, false);
-    super::events::fire_simple(vm, super::TargetKey::Node(el), "focusin", true, false);
+    super::events::fire_focus(vm, el, "focus", old);
+    super::events::fire_focus(vm, el, "focusin", old);
     Ok(Value::Undefined)
 }
 
@@ -650,8 +653,8 @@ fn blur_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_html(vm, ctx)?;
     if page(|p| p.focused) == Some(el) {
         page(|p| p.focused = None);
-        super::events::fire_simple(vm, super::TargetKey::Node(el), "blur", false, false);
-        super::events::fire_simple(vm, super::TargetKey::Node(el), "focusout", true, false);
+        super::events::fire_focus(vm, el, "blur", None);
+        super::events::fire_focus(vm, el, "focusout", None);
     }
     Ok(Value::Undefined)
 }

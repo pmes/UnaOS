@@ -771,6 +771,13 @@ impl AetherEngine {
                             "a" => {
                                 self.set_focus(None);
                                 if let Some(href) = el.attributes.borrow().get("href") {
+                                    // AETHERDEBT SR93: a `javascript:` URL is the page's — the click's
+                                    // activation behavior (js/events.rs follow_hyperlink) already
+                                    // queued its script; it is never a navigation for the shell.
+                                    let t = href.trim_start_matches(|c: char| c.is_ascii_whitespace() || c.is_ascii_control());
+                                    if t.len() >= 11 && t.is_char_boundary(11) && t[..11].eq_ignore_ascii_case("javascript:") {
+                                        return;
+                                    }
                                     let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
                                     let url = images::resolve(&base, href);
                                     self.pending_nav = Some(forms::OpenDocument::get(url));
