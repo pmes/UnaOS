@@ -11,7 +11,8 @@
 //                                  the ownership ACL lets this program read (RING3EXEC B521), else -EACCES
 //   SYS_PATH_WRITE                 the first chunk with PATH_W_TRUNC at offset 0 (create-or-truncate), then each
 //                                  chunk at its offset; UNAMETAL2 (LEDGER SR98): on the default x86 kernel as this
-//                                  program's principal under the volume's write ACL (-EACCES by the ACL's word)
+//                                  program's principal under the volume's write ACL (-EACCES by the ACL's word);
+//                                  UNAIDE2 (LEDGER SR111): PATH_W_UNLINK (`unlink`) and PATH_W_MKDIRS (`mkdir`) too
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -181,6 +182,30 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<usize, i64> {
             return Ok(done);
         }
     }
+}
+
+/// UNAIDE2 (LEDGER SR111): remove the file at `path` — one SYS_PATH_WRITE with PATH_W_UNLINK (empty data, offset 0).
+pub fn unlink(path: &str) -> Result<(), i64> {
+    let req = path_req(path, una_abi::PATH_W_UNLINK, 0, &[]).ok_or(una_abi::EINVAL)?;
+    let r = sys(una_abi::SYS_PATH_WRITE, req.as_ptr() as u64, req.len() as u64, 0, 0);
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(())
+    }
+}
+
+/// UNAIDE2: make the directory `dir` (absolute). SYS_PATH_WRITE has no mkdir verb, but PATH_W_MKDIRS creates every
+/// missing PARENT of the path it is handed: `dir/.keep` is written empty with TRUNC|MKDIRS (which makes `dir`), then
+/// unlinked again, leaving the folder empty.
+pub fn mkdir(dir: &str) -> Result<(), i64> {
+    let keep = alloc::format!("{}/.keep", dir.trim_end_matches('/'));
+    let req = path_req(&keep, una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS, 0, &[]).ok_or(una_abi::EINVAL)?;
+    let r = sys(una_abi::SYS_PATH_WRITE, req.as_ptr() as u64, req.len() as u64, 0, 0);
+    if r < 0 {
+        return Err(r);
+    }
+    unlink(&keep)
 }
 
 /// RING3EXEC (B521): `SYS_SPAWN_PATH(path, len, argv, argc)` — the argv descriptors point at the words in place.

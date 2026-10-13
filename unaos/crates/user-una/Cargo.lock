@@ -21,6 +21,14 @@ name = "font_core"
 version = "0.1.0"
 
 [[package]]
+name = "git_core"
+version = "0.1.0"
+dependencies = [
+ "crypto_core",
+ "pixel_core",
+]
+
+[[package]]
 name = "holocron_core"
 version = "0.1.0"
 dependencies = [
@@ -43,6 +51,18 @@ name = "palette_core"
 version = "0.1.0"
 
 [[package]]
+name = "pixel_core"
+version = "0.1.0"
+dependencies = [
+ "raw_core",
+ "vp8_core",
+]
+
+[[package]]
+name = "raw_core"
+version = "0.1.0"
+
+[[package]]
 name = "syntax_core"
 version = "0.1.0"
 
@@ -61,6 +81,7 @@ dependencies = [
  "edit_core",
  "font8x8",
  "font_core",
+ "git_core",
  "matrix_core",
  "midden_core",
  "palette_core",
@@ -82,3 +103,7 @@ dependencies = [
  "una-abi",
  "vein_core",
 ]
+
+[[package]]
+name = "vp8_core"
+version = "0.1.0"

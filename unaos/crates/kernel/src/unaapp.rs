@@ -34,8 +34,23 @@
 //! on the volume are the edited text, and highlight > 0. The single-producer note is middenapp.rs's: do not type
 //! into the new window during `tests una` on the bench.
 //!
+//! UNAIDE2 (LEDGER SR111) — THE IDE DRIVES, on a UnaFS root, after the save leg and before legs 1–3; each is a group
+//! of events into the ring and ONE watched wire line whose PREFIX carries the expected values (`serial_line`'s
+//! watch matches a prefix, so a wrong value is a timeout, never a false hit):
+//!   a. OPEN TWO FILES — Ctrl+1 (the KEY_CTRL_DIGIT press and its bare release), Down, Enter in the tree rooted at
+//!      [`FIX_DIR`] (`fix.rs` then `fix2.txt`, matrix_core's byte order) -> `:: UNA: tab active=2 tabs=2 path=<fix2> `;
+//!   b. SWITCH — Ctrl+T -> `:: UNA: tab active=1 tabs=2 path=<fix.rs> `;
+//!   c. FIND — Ctrl+F, `main`, Enter -> `:: UNA: find needle=main word=0 hits=1 at=2:4 ` (the saved text's line 2);
+//!   d. GO TO LINE — Ctrl+G, `1`, Enter -> `:: UNA: goto line=1 `;
+//!   e. REPLACE — Ctrl+T back to `fix2.txt`, Ctrl+L (the replace prompt; Ctrl+H never reaches ring 3), Tab, `alpha`,
+//!      Tab, `omega`, Ctrl+W (whole-word), Ctrl+A (all) -> `:: UNA: replace needle=alpha with=omega word=1 n=2 `
+//!      (whole-word leaves `alphabet`: 2 of the 3 substring hits);
+//!   f. SAVE the second tab — Esc, Ctrl+S -> `:: UNA: save path=<fix2> `, and after the exit [`FIX2_PATH`] must read
+//!      [`FIX2_SAVED`] byte-exact.
+//! PASS on a UnaFS root also needs every drive (`ide=ok`); the first one that times out is named (`ide=<step>`).
+//!
 //! WITNESS. `:: UNAAPP: image=/apps/UNA.ELF window=<elf|fixed|bad> panes=<n> lines=<n> saved=<1|0|skip>
-//! highlight=<n> -> PASS|FAIL|SKIP ::` preceded by `[unaapp] …` (pid, slot, timings, the decoded status, the bytes
+//! highlight=<n> ide=<ok|skip|step> -> PASS|FAIL|SKIP ::` preceded by `[unaapp] …` (pid, slot, timings, the decoded status, the bytes
 //! check, the ACL leg) and, on FAIL/SKIP, `:: UNAAPP: reason=… ::`. No `UNA.ELF` on the volume is a SKIP (the
 //! builder stages it; a bare kernel has none).
 
@@ -53,6 +68,17 @@ const FIX_PATH: &str = "/var/tmp/una/fix.rs";
 const FIX_SRC: &[u8] = b"fn main() {}\n";
 const FIX_EDIT: &[u8] = b"// una\n";
 const FIX_SAVED: &[u8] = b"// una\nfn main() {}\n";
+/// UNAIDE2: the second file of the IDE drives, its text, the bytes expected back after the whole-word replace-all.
+const FIX2_PATH: &str = "/var/tmp/una/fix2.txt";
+const FIX2_SRC: &[u8] = b"alpha alphabet alpha\n";
+const FIX2_SAVED: &[u8] = b"omega alphabet omega\n";
+/// UNAIDE2: the watched prefixes, each carrying the values the drive expects.
+const W_TAB2: &str = ":: UNA: tab active=2 tabs=2 path=/var/tmp/una/fix2.txt ";
+const W_TAB1: &str = ":: UNA: tab active=1 tabs=2 path=/var/tmp/una/fix.rs ";
+const W_FIND: &str = ":: UNA: find needle=main word=0 hits=1 at=2:4 ";
+const W_GOTO: &str = ":: UNA: goto line=1 ";
+const W_REPL: &str = ":: UNA: replace needle=alpha with=omega word=1 n=2 ";
+const W_SAVE2: &str = ":: UNA: save path=/var/tmp/una/fix2.txt ";
 /// UNAMETAL2: the ACL leg's probe — a name under ROOTACL's `system` tree `/apps`, which `anon` may not create.
 const ACL_PROBE: &str = "/apps/UNAPROBE.TXT";
 /// The window, one mono face off the volume and the workspace's first listing come before the start line.
@@ -90,7 +116,12 @@ const fn status_parse(s: i32) -> (u32, u32, u32, u8, u32, bool, bool, bool, u32)
 }
 
 fn verdict(window: &str, panes: u32, lines: u32, saved: &str, spans: u32, v: &str) {
-    serial_println!(":: UNAAPP: image={} window={} panes={} lines={} saved={} highlight={} -> {} ::", IMAGE, window, panes, lines, saved, spans, v);
+    verdict_ide(window, panes, lines, saved, spans, "skip", v)
+}
+
+/// UNAIDE2: the witness with the IDE drives' word (`ok`, `skip`, or the step that failed).
+fn verdict_ide(window: &str, panes: u32, lines: u32, saved: &str, spans: u32, ide: &str, v: &str) {
+    serial_println!(":: UNAAPP: image={} window={} panes={} lines={} saved={} highlight={} ide={} -> {} ::", IMAGE, window, panes, lines, saved, spans, ide, v);
 }
 
 /// UNAMETAL2: lay [`FIX_PATH`] = [`FIX_SRC`] with KERNEL authority (missing directories made, an old file replaced).
@@ -111,8 +142,17 @@ fn lay_fixture(mt: &crate::fs::vfs::MountTable) -> Result<(), &'static str> {
     }
     mt.create(FIX_PATH, NodeKind::File, K).map_err(|_| "fixture-create")?;
     match mt.write(FIX_PATH, 0, FIX_SRC, K) {
-        Ok(n) if n == FIX_SRC.len() => Ok(()),
-        _ => Err("fixture-write"),
+        Ok(n) if n == FIX_SRC.len() => {}
+        _ => return Err("fixture-write"),
+    }
+    // UNAIDE2: the second file the drives open from the tree.
+    if mt.stat(FIX2_PATH).is_ok() {
+        mt.unlink(FIX2_PATH, K).map_err(|_| "fixture-unlink2")?;
+    }
+    mt.create(FIX2_PATH, NodeKind::File, K).map_err(|_| "fixture-create2")?;
+    match mt.write(FIX2_PATH, 0, FIX2_SRC, K) {
+        Ok(n) if n == FIX2_SRC.len() => Ok(()),
+        _ => Err("fixture-write2"),
     }
 }
 
@@ -164,6 +204,46 @@ fn type_line(slot: u64, s: &[u8]) -> bool {
         ok &= push(slot, una_abi::INPUT_EV_KEY_DOWN, b);
     }
     ok
+}
+
+/// UNAIDE2: one IDE drive — arm `watch`, push `evs` (type, byte) into the ring, wait for the line.
+fn drive(pid: u64, slot: u64, watch: &'static str, evs: &[(u64, u8)]) -> Result<u64, &'static str> {
+    crate::serial_line::line_watch_arm(watch);
+    for &(ty, b) in evs {
+        if !push(slot, ty, b) {
+            return Err("input-ring-full");
+        }
+    }
+    wait_line(pid, LINE_MS)
+}
+
+/// UNAIDE2: the drives a–f (module doc), in order. `Ok(ms of each)`, or the name of the step that failed.
+fn ide_drives(pid: u64, slot: u64) -> Result<[u64; 7], &'static str> {
+    use una_abi::{INPUT_EV_KEY_DOWN as D, INPUT_EV_KEY_UP as U, KEY_CTRL_DIGIT, KEY_DOWN, KEY_ESC};
+    let typed = |s: &[u8], out: &mut alloc::vec::Vec<(u64, u8)>| out.extend(s.iter().map(|&b| (D, b)));
+    let mut ms = [0u64; 7];
+    // a. open two files: Ctrl+1 (press + bare release), Down, Enter.
+    ms[0] = drive(pid, slot, W_TAB2, &[(D, KEY_CTRL_DIGIT | 1), (U, b'1'), (D, KEY_DOWN), (D, b'\n')]).map_err(|_| "open2")?;
+    // b. switch: Ctrl+T.
+    ms[1] = drive(pid, slot, W_TAB1, &[(D, 0x14)]).map_err(|_| "switch")?;
+    // c. find: Ctrl+F, `main`, Enter.
+    let mut ev = alloc::vec![(D, 0x06)];
+    typed(b"main\n", &mut ev);
+    ms[2] = drive(pid, slot, W_FIND, &ev).map_err(|_| "find")?;
+    // d. go to line: Ctrl+G, `1`, Enter.
+    ms[3] = drive(pid, slot, W_GOTO, &[(D, 0x07), (D, b'1'), (D, b'\n')]).map_err(|_| "goto")?;
+    // e. back to fix2.txt, then the whole-word replace-all.
+    ms[4] = drive(pid, slot, W_TAB2, &[(D, 0x14)]).map_err(|_| "switch2")?;
+    let mut ev = alloc::vec![(D, 0x0C), (D, 0x09)];
+    typed(b"alpha", &mut ev);
+    ev.push((D, 0x09));
+    typed(b"omega", &mut ev);
+    ev.push((D, 0x17));
+    ev.push((D, 0x01));
+    ms[5] = drive(pid, slot, W_REPL, &ev).map_err(|_| "replace")?;
+    // f. Esc closes the prompt, Ctrl+S saves the second tab.
+    ms[6] = drive(pid, slot, W_SAVE2, &[(D, KEY_ESC), (D, 0x13)]).map_err(|_| "save2")?;
+    Ok(ms)
 }
 
 pub fn selftest() {
@@ -249,6 +329,18 @@ pub fn selftest() {
             }
         }
     }
+    // UNAIDE2: the IDE drives a–f, on a UnaFS root after the save leg.
+    let mut ide: &'static str = if laid.is_ok() { "unrun" } else { "skip" };
+    let mut ide_ms: Option<[u64; 7]> = None;
+    if fail.is_none() && laid.is_ok() {
+        match ide_drives(pid, slot) {
+            Ok(ms) => {
+                ide = "ok";
+                ide_ms = Some(ms);
+            }
+            Err(step) => ide = step,
+        }
+    }
     if fail.is_none() {
         // Ctrl+3 as the decoder delivers it (a bare release of `3`), then the line into the console.
         crate::serial_line::line_watch_arm(PLANNED);
@@ -292,6 +384,14 @@ pub fn selftest() {
     let verb = midden_core::ring3::verb_of(code).unwrap_or("none");
     // UNAMETAL2: what the save left on the volume.
     let bytes_ok = laid.is_ok() && matches!(mt.read(FIX_PATH, 0, FIX_SAVED.len() + 64), Ok(b) if b.as_slice() == FIX_SAVED);
+    // UNAIDE2: what the replace-all and the second save left on the volume.
+    let bytes2_ok = laid.is_ok() && matches!(mt.read(FIX2_PATH, 0, FIX2_SAVED.len() + 64), Ok(b) if b.as_slice() == FIX2_SAVED);
+    serial_println!(
+        "[unaapp] ide={} ms(open2,switch,find,goto,switch2,replace,save2)={:?} bytes2={}",
+        ide,
+        ide_ms,
+        if laid.is_err() { "n/a" } else if bytes2_ok { "ok" } else { "bad" }
+    );
     serial_println!(
         "[unaapp] pid={} slot={} entry={:#x} start_ms={:?} save_ms={:?} help_ms={:?} status={:?} panes={} rows={} cmds={} kind={} verb={} window_ok={} face={} saved={} spans={} bytes={} acl={} kill={}",
         pid, slot, entry, started.ok(), save_ms, help_ms, status, panes, rows, cmds, midden_core::ring3::kind_name(kind), verb, win_ok, face, saved, spans,
@@ -300,14 +400,17 @@ pub fn selftest() {
     let help_rows = midden_core::help(&midden_core::Facts::ring3(true)).lines().count() as u32;
     let base = fail.is_none() && status.is_some() && win_ok && panes == PANES && cmds == 1 && kind == 1 && verb == "help" && rows > help_rows;
     let save_ok = laid.is_err() || (saved && bytes_ok && spans > 0);
-    let ok = base && save_ok;
+    let ide_ok = laid.is_err() || (ide == "ok" && bytes2_ok);
+    let ok = base && save_ok && ide_ok;
     if let Some(r) = fail {
         why(r);
     } else if !base {
         serial_println!(":: UNAAPP: reason=status-mismatch (want panes=3 cmds=1 kind=Say verb=help rows>{}) ::", help_rows);
     } else if !save_ok {
         serial_println!(":: UNAAPP: reason=save-mismatch (want saved=1 bytes=ok highlight>0 at {}) ::", FIX_PATH);
+    } else if !ide_ok {
+        serial_println!(":: UNAAPP: reason=ide-mismatch (step={} bytes2={} at {}) ::", ide, if bytes2_ok { "ok" } else { "bad" }, FIX2_PATH);
     }
     let saved_word = if laid.is_err() { "skip" } else if saved { "1" } else { "0" };
-    verdict(window, panes, rows, saved_word, spans, if ok { "PASS" } else { "FAIL" });
+    verdict_ide(window, panes, rows, saved_word, spans, ide, if ok { "PASS" } else { "FAIL" });
 }

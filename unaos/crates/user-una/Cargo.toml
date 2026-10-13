@@ -48,3 +48,7 @@ font_core = { path = "../../libs/text/font_core" }
 syntax_core = { path = "../../libs/text/syntax_core" }
 font8x8 = { version = "0.3.1", default-features = false }
 matrix_core = { path = "../../libs/fs/matrix_core" }
+# UNAIDE2 (LEDGER SR111): git_core — Vairë's repository core (GITCORE SR59), the no_std default (its `std` Repository
+# off): the index, blob ids, loose and packed objects, gitignore and git's line diff for the tree's marks and the
+# console's read-only `git status` / `git diff`; the I/O is the program's own (src/git.rs over SYS_PATH_*).
+git_core = { path = "../../libs/vcs/git_core" }

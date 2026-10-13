@@ -11,6 +11,12 @@
 // SYS_SPAWN_PATH. What differs from MIDDEN.ELF is only what a pane inside an IDE must differ in: the scrollback
 // wraps at the pane's columns (set by the painter), the cwd starts at the workspace root, `exit`/`quit` ask the
 // IDE to quit (returned as `Act::Quit`, the window is the IDE's), and the wire tag is `:: UNA: plan=`.
+//
+// UNAIDE2 (LEDGER SR111): `run` is the door the IDE's Run verb (Ctrl+R, main.rs) uses — a `.run` line or the typed
+// line goes through the same plan; a launched program is DETACHED (SYS_SPAWN_PATH is the `bg` body) and ring 3 has no
+// pipe door, so its output is not this pane's — the launch row says so rather than leave the pane silent.
+// `git` (`git status`, `git diff [path]`) is served here, read-only, through git.rs over git_core (SR59) at the
+// workspace root; any other git word is refused by name. Wire `:: UNA: git verb=<status|diff> … ::`.
 
 use crate::fs::{errno_text, list, read_file, resolve, spawn_path, stat, CAT_MAX};
 use crate::Line;
@@ -55,6 +61,8 @@ pub struct Console {
     hist: VecDeque<String>,
     hist_at: Option<usize>,
     pub cwd: String,
+    /// UNAIDE2: the workspace root (where `git` looks for `.git`).
+    root: String,
     facts: Facts,
     pub cmds: u32,
     pub last_kind: u32,
@@ -73,6 +81,7 @@ impl Console {
             caret: 0,
             hist: VecDeque::new(),
             hist_at: None,
+            root: cwd.clone(),
             cwd,
             facts: Facts { exec: cfg!(target_arch = "x86_64"), ..Facts::ring3(cfg!(target_arch = "x86_64")) }, // RING3EXEC (B521): SYS_SPAWN_PATH is x86's
             cmds: 0,
@@ -118,6 +127,24 @@ impl Console {
         }
     }
 
+    /// UNAIDE2: run `line` as if typed (the IDE's Run verb).
+    pub fn run(&mut self, line: &str) -> Act {
+        self.dirty = true;
+        self.run_line(line)
+    }
+
+    /// UNAIDE2: the typed line, taken out of the input (Ctrl+R runs it); `None` when nothing is typed.
+    pub fn take_input(&mut self) -> Option<String> {
+        if self.inp.iter().all(|b| *b == b' ') {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&self.inp).into_owned();
+        self.inp.clear();
+        self.caret = 0;
+        self.hist_at = None;
+        Some(line)
+    }
+
     // ---- the plan, executed through the syscalls it names ----
     fn run_line(&mut self, line: &str) -> Act {
         let prompt = alloc::format!("{}> {}", self.cwd, line);
@@ -130,6 +157,12 @@ impl Console {
         }
         let facts = self.facts;
         let word = midden_core::canon_verb(line.split_whitespace().next().unwrap_or(""));
+        if word == "git" {
+            // UNAIDE2: read-only git through git_core, served here.
+            let rest: Vec<String> = line.split_whitespace().skip(1).map(String::from).collect();
+            self.git(&rest);
+            return Act::None;
+        }
         if word == "run" && facts.exec {
             // RING3EXEC (B521): `run <path> [args]` — not a verb on `Facts::ring3` (no job table), served here.
             let words: Vec<&str> = line.split_whitespace().skip(1).collect();
@@ -165,6 +198,9 @@ impl Console {
                         self.say(Tone::Out, "UNA.ELF console launches: run <path> [args], and bare names (detached)");
                     }
                     self.say(Tone::Out, "keys: Ctrl+1 tree, Ctrl+2 editor, Ctrl+3 console (Esc cycles), Ctrl+O open, Ctrl+S save, Ctrl+Q quit");
+                    self.say(Tone::Out, "tabs: Ctrl+T next, Ctrl+4..9 tab 1..6, Ctrl+W close; Ctrl+F find, Ctrl+L replace (Tab swaps, Ctrl+W whole-word, Ctrl+A all), Ctrl+G line");
+                    self.say(Tone::Out, "tree: n new file (Ctrl+N anywhere), f new folder, r rename, Delete trash, g git diff; Ctrl+R runs the .run line or the typed line");
+                    self.say(Tone::Out, "UNA.ELF console serves git (read-only): git status, git diff [path]");
                 }
                 (1, word.clone(), true)
             }
@@ -208,6 +244,7 @@ impl Console {
         let r = spawn_path(&path, argv);
         if r > 0 {
             self.say(Tone::Out, &alloc::format!("{}: {} started - pid {}", verb, path, r));
+            self.say(Tone::Out, "(detached: its output is not this pane's - ring 3 has no pipe door)");
             Ok(r)
         } else {
             self.say(Tone::Err, &alloc::format!("{}: {}: {} {}", verb, path, r, errno_text(r)));
@@ -227,6 +264,110 @@ impl Console {
             Err(e) => l.put(b" served=0 err=").dec(e),
         };
         l.put(b" pane=console ::");
+        l.wire();
+    }
+
+    /// UNAIDE2: `git [status]` / `git diff [path]` — read-only.
+    fn git(&mut self, args: &[String]) {
+        match args.first().map(String::as_str) {
+            None | Some("status") => self.git_status(),
+            Some("diff") => match args.get(1) {
+                Some(p) => {
+                    let p = resolve(&self.cwd, p);
+                    self.git_diff(&p);
+                }
+                None => {
+                    let Some(repo) = self.repo() else { return };
+                    let st = repo.status();
+                    if st.modified.is_empty() {
+                        self.say(Tone::Out, "git diff: no modified files");
+                    }
+                    for rel in st.modified.iter().take(20) {
+                        let p = if repo.root == "/" { alloc::format!("/{}", rel) } else { alloc::format!("{}/{}", repo.root, rel) };
+                        self.diff_rows(&repo, &p);
+                    }
+                }
+            },
+            Some(other) => {
+                let m = alloc::format!("git {}: refused - UNA.ELF's git is read-only (status, diff)", other);
+                self.say(Tone::Err, &m);
+            }
+        }
+    }
+
+    fn repo(&mut self) -> Option<crate::git::Repo> {
+        match crate::git::open(&self.root) {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => {
+                let m = alloc::format!("git: no .git under {}", self.root);
+                self.say(Tone::Err, &m);
+                None
+            }
+            Err(e) => {
+                let m = alloc::format!("git: {}", e);
+                self.say(Tone::Err, &m);
+                None
+            }
+        }
+    }
+
+    fn git_status(&mut self) {
+        let Some(repo) = self.repo() else { return };
+        let st = repo.status();
+        let head = alloc::format!("git {} at {} ({} index entries){}", repo.hk_name(), repo.gitdir, repo.entries(), if st.truncated { " - walk truncated" } else { "" });
+        self.say(Tone::Out, &head);
+        for (tag, tone, v) in [("modified:  ", Tone::Echo, &st.modified), ("deleted:   ", Tone::Err, &st.deleted), ("untracked: ", Tone::Out, &st.untracked)] {
+            for p in v.iter() {
+                let row = alloc::format!("  {}{}", tag, p);
+                self.say(tone, &row);
+            }
+        }
+        if st.modified.is_empty() && st.deleted.is_empty() && st.untracked.is_empty() {
+            self.say(Tone::Out, "nothing to commit, working tree clean");
+        }
+        let mut l = Line::new(b":: UNA: git verb=status modified=");
+        l.dec(st.modified.len() as i64).put(b" untracked=").dec(st.untracked.len() as i64).put(b" deleted=").dec(st.deleted.len() as i64);
+        l.put(b" truncated=").dec(st.truncated as i64).put(b" rc=0 ::");
+        l.wire();
+    }
+
+    /// UNAIDE2: `path`'s diff against the index, into the scrollback (the tree's `g`).
+    pub fn git_diff(&mut self, path: &str) {
+        let Some(repo) = self.repo() else { return };
+        self.diff_rows(&repo, path);
+    }
+
+    fn diff_rows(&mut self, repo: &crate::git::Repo, path: &str) {
+        let (rc, lines) = match repo.diff(path) {
+            Ok(d) if d.is_empty() => {
+                let m = alloc::format!("git diff {}: no changes", path);
+                self.say(Tone::Out, &m);
+                (0, 0)
+            }
+            Ok(d) => {
+                let text = String::from_utf8_lossy(&d).into_owned();
+                let mut n = 0;
+                for l in text.lines() {
+                    let tone = if l.starts_with('+') && !l.starts_with("+++") {
+                        Tone::Echo
+                    } else if l.starts_with('-') && !l.starts_with("---") {
+                        Tone::Err
+                    } else {
+                        Tone::Out
+                    };
+                    self.say(tone, l);
+                    n += 1;
+                }
+                (0, n)
+            }
+            Err(e) => {
+                let m = alloc::format!("git diff {}: {}", path, e);
+                self.say(Tone::Err, &m);
+                (-1, 0)
+            }
+        };
+        let mut l = Line::new(b":: UNA: git verb=diff path=");
+        l.put(path.as_bytes()).put(b" lines=").dec(lines as i64).put(b" rc=").dec(rc).put(b" ::");
         l.wire();
     }
 
