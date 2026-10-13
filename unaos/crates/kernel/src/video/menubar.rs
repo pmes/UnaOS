@@ -191,7 +191,7 @@ pub const BAR_BOLD: bool = BOLD;
 /// SO2 — the bar's type, named for the wire. See [`BAR_FACE`].
 pub const BAR_FONT_NAME: &str = "chrome20-bold";
 
-/// The clock's rendered width in glyphs: `HH:MM`.
+/// The clock's rendered width in glyphs: `HH:MM`. FONTS2 (B650): the clock draws with TABULAR figures (`text::tabular` — the run opens with a digit), so its advance no longer moves from minute to minute and the right-aligned clock stops jittering.
 const CLOCK_GLYPHS: usize = 5;
 
 /// The longest title the bar will show, in glyphs — the whole stored caption. Unlike the dock (which

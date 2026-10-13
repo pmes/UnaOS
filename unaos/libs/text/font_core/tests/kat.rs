@@ -13,6 +13,7 @@ use kat_data::KATS;
 #[test]
 fn tables_match_fonttools() {
     let mut checked = 0;
+    let mut vendored = 0; // FONTS2 (B650): the rows of the tree's own faces (repo-relative paths)
     let mut n_cmap = 0;
     let mut n_outline = 0;
     let mut n_comp = 0;
@@ -96,9 +97,13 @@ fn tables_match_fonttools() {
             assert!(f.outline(gid, &mut p), "{} glyph {gid} failed to load", k.path);
         }
         checked += 1;
+        vendored += !k.path.starts_with('/') as usize;
     }
-    eprintln!("KAT: {checked} fonts, {n_cmap} cmap lookups, {n_outline} outlines, {n_comp} composites, {n_kern} kern pairs");
+    eprintln!("KAT: {checked} fonts ({vendored} vendored), {n_cmap} cmap lookups, {n_outline} outlines, {n_comp} composites, {n_kern} kern pairs");
     assert!(checked > 0, "no KAT font available on this host");
+    // FONTS2 (B650): the vendored faces are part of the tree, so these three rows check on EVERY host — a host
+    // whose system fonts differ from the KAT source skips those rows and still checks these.
+    assert_eq!(vendored, 3, "the three vendored faces (fonts/inter, fonts/jetbrains-mono, fonts/noto-sans) must check");
 }
 
 #[test]

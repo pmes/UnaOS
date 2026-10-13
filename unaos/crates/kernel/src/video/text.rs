@@ -496,9 +496,9 @@ mod tt {
         }
     }
 
-    fn style(t: &Tt, face: usize, bold: bool) -> (Style, f32) {
+    fn style(t: &Tt, face: usize, bold: bool, s: &[u8]) -> (Style, f32) {
         let (mut st, bl) = t.styles[face];
-        st.bold = bold;
+        st.bold = bold; if super::tabular(s) { st.features |= font_core::ui::FEAT_TNUM; } // FONTS2 (B650): a run that OPENS with a figure is a readout (the clock, a meter, a percentage) and draws with tabular figures, so its width holds while its digits change (DESIGN-LANGUAGE §2.2: "Figures that change in place … use `tnum`"); LINE-NEUTRAL fold, code first
         (st, bl)
     }
 
@@ -509,7 +509,7 @@ mod tt {
             if y + cell_h > clip_h {
                 return x;
             }
-            let (st, bl) = style(t, face, bold);
+            let (st, bl) = style(t, face, bold, s);
             let pen = t.eng.draw_0rgb(px, stride, clip_w, clip_h, x as f32, y as f32 + bl, s, st, ink);
             x + font_core::fmath::ceil(pen) as usize
         })
@@ -522,7 +522,7 @@ mod tt {
             if sy >= cell_h {
                 return;
             }
-            let (st, bl) = style(t, face, bold);
+            let (st, bl) = style(t, face, bold, s);
             let row = sy as i32;
             t.eng.draw_with(s, st, x0 as f32, bl, None, Some(row), ink, &mut |gx, gy, a| {
                 if gy == row && gx >= 0 && (gx as usize) < w && (gx as usize) < out.len() {
@@ -536,7 +536,7 @@ mod tt {
     pub fn draw_cell(ch: u8, cx: usize, cy: usize, ink: u32, bold: bool, face: usize, put: &mut dyn FnMut(usize, usize, u8)) -> bool {
         with(|t| {
             let (cw, chh) = cell(face);
-            let (st, bl) = style(t, face, bold);
+            let (st, bl) = style(t, face, bold, &[]);
             let c = if (0x20..0x7f).contains(&ch) { ch as char } else { ' ' };
             let (x0, y0) = (cx as i32, cy as i32);
             let (x1, y1) = (x0 + cw as i32, y0 + chh as i32);
@@ -552,7 +552,7 @@ mod tt {
     #[allow(clippy::too_many_arguments)]
     pub fn draw_with(s: &[u8], bold: bool, face: usize, x: usize, y: isize, max_w: usize, ink: u32, put: &mut dyn FnMut(isize, isize, u8)) -> Option<usize> {
         with(|t| {
-            let (st, bl) = style(t, face, bold);
+            let (st, bl) = style(t, face, bold, s);
             let pen = t.eng.draw_with(s, st, x as f32, y as f32 + bl, Some((x + max_w) as f32), None, ink, &mut |gx, gy, a| put(gx as isize, gy as isize, a));
             x + font_core::fmath::ceil(pen) as usize
         })
@@ -560,7 +560,7 @@ mod tt {
 
     pub fn advance(s: &[u8], bold: bool, face: usize) -> Option<usize> {
         with(|t| {
-            let (st, _) = style(t, face, bold);
+            let (st, _) = style(t, face, bold, s);
             font_core::fmath::ceil(t.eng.measure(s, st)) as usize
         })
     }
@@ -913,7 +913,7 @@ pub fn ensure_tests() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("font", fixture);
+        crate::tests::register("font", fixture); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::tests::register("fonts", fonts2_fixture); // FONTS2 (B650): `tests fonts` — tnum, MVAR, FeatureVariations, the vendored KAT; desktop builds only, body at the FILE TAIL (LINE-NEUTRAL append, before this comment)
     }
 }
 
@@ -1005,4 +1005,125 @@ pub fn resident_read(path: &str, off: u64, cap: usize) -> Option<alloc::vec::Vec
 #[cfg(feature = "selfdiag")]
 pub fn resident_served() -> u64 {
     RESIDENT_SERVED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ------------------------------------------------------------------------------------------------ FONTS2 (B650)
+// The file tail holds FONTS2's statements so that no line above moves (the knob-off image's panic locations are
+// line numbers): the figures rule and `tests fonts`. Both exist only on a desktop build, like the engine they read.
+
+/// FONTS2 (rmbp-ledger B650): the FIGURES RULE of the text seam — `true` when the run OPENS with a figure (after
+/// leading spaces, an ASCII digit, or a `+` / `-` / `.` followed by one). Such a run is a readout whose digits change
+/// in place — `HH:MM`, `97%`, `13/16`, `11 min`, `13 px`, `1h 2m 3s` — and draws with `tnum` (tabular figures), so
+/// its width is the same for every value. `Untitled 2` or `Log In 3 times` open with a letter and keep the face's
+/// proportional figures. Applied in `tt::style` for every string call (`draw_text`, `draw_row`, `draw_with`,
+/// `advance`, so `fit`); `draw_cell` draws one glyph on a grid and has no run to classify.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn tabular(s: &[u8]) -> bool {
+    let i = s.iter().position(|&c| c != b' ').unwrap_or(s.len());
+    match s.get(i) {
+        Some(c) if c.is_ascii_digit() => true,
+        Some(b'+' | b'-' | b'.') => s.get(i + 1).is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// FONTS2 (B650): the vendored faces' header facts the kernel checks its loaded slots against — (wire name,
+/// numGlyphs, unitsPerEm, hhea ascender / descender / lineGap), fontTools 4.66.1's reading of the pinned files
+/// (`unaos/firmware/fonts.pins`; the host KAT rows in `font_core/tests/data/kat_data.rs` carry the rest).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+const VENDORED_KAT: [(&str, u16, u16, [i16; 3]); 3] = [
+    ("inter", 2937, 2048, [1984, -494, 0]),
+    ("jetbrains-mono", 1743, 1000, [1020, -300, 0]),
+    ("noto-sans", 3877, 1000, [1069, -293, 0]),
+];
+
+/// `tests fonts` (FONTS2, rmbp-ledger B650): the four things FONTSCRAFT left owed, measured through the seam —
+/// * tnum: the clock (`Face::Chrome`, as the menu bar draws it) and five meter shapes (`Face::Ui`) have the same
+///   advance for `1`s as for `0`s; CONTROL: `x 11111` vs `x 00000` (no leading figure, proportional) DIFFER when Inter
+///   is the UI face (its proportional `1` is narrower; DejaVu's default figures are already tabular).
+/// * mvar: the UI sans face instanced at `wght` 100 / 400 / 700 / 900 at the UI size keeps ONE line box, and when
+///   the face carries `MVAR` its underline or x-height moves with the weight (Inter: `undo`/`unds`).
+/// * gsub_fv: the FeatureVariations reader on `layout::FEATURE_VARIATIONS_PROBE` (`ss01` = lookup 0 at the default
+///   instance, lookup 1 at axis-0 coordinate 0.5 and above, nothing selected below); the loaded faces' own record
+///   count is printed (0: no vendored face carries FeatureVariations).
+/// * kat: each vendored face loaded with the pinned header facts ([`VENDORED_KAT`]).
+///
+/// `:: FONTS2: tnum=ok(clock,meters=5) mvar=ok(instances=4) gsub_fv=ok(rules=1) kat=ok(vendored=3) -> PASS ::`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn fonts2_fixture() {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use font_core::ui::{Role, Style};
+    tt::service();
+    if !tt::ready() {
+        serial_println!(":: FONTS2: tnum=fail(no-face) mvar=fail(no-face) gsub_fv=fail(no-face) kat=fail(vendored=0) -> FAIL :: (no face loaded from {}: see the [kfont] load line)", DIR);
+        return;
+    }
+    // (a) tnum.
+    let same = |a: &[u8], b: &[u8], f: Face| advance(a, false, f) == advance(b, false, f);
+    let clock = tabular(b"11:11") && same(b"11:11", b"00:00", Face::Chrome);
+    let meters: [(&[u8], &[u8]); 5] = [(b"11%", b"00%"), (b"11/16", b"00/16"), (b"11 min", b"00 min"), (b"11 px", b"00 px"), (b"1h 11m 11s", b"0h 00m 00s")];
+    let meters_ok = meters.iter().filter(|&&(a, b)| tabular(a) && same(a, b, Face::Ui)).count();
+    let ui_name = Face::Ui.name();
+    let control_differs = !same(b"x 11111", b"x 00000", Face::Ui);
+    let control_ok = !tabular(b"x 11111") && (control_differs || ui_name != "inter");
+    serial_println!(
+        "[fonts2] tnum clock={} ({}px) meters={}/5 control={} ui_face={}",
+        clock as u8, advance(b"00:00", false, Face::Chrome), meters_ok, if control_differs { "differs" } else { "same" }, ui_name
+    );
+    let tnum_ok = clock && meters_ok == 5 && control_ok;
+    // (b) MVAR.
+    let mv = tt::with(|t| {
+        let base = Style::new(Role::Sans, false, t.styles[2].0.size);
+        let insts: Vec<font_core::Font> = [100u16, 400, 700, 900].iter().filter_map(|&w| t.eng.primary_instance(&base.with_weight(w))).collect();
+        let Some(reg) = insts.get(1).copied() else { return (0usize, false, String::from("no sans face")) };
+        let one_line = insts.iter().all(|f| f.line_metrics() == reg.line_metrics());
+        let moved = insts.iter().any(|f| f.underline() != reg.underline() || f.x_height() != reg.x_height());
+        let tags: Vec<String> = reg.mvar.map(|m| m.tags()).unwrap_or_default().iter().map(|g| String::from(core::str::from_utf8(g).unwrap_or("?"))).collect();
+        let per: Vec<String> = insts.iter().map(|f| alloc::format!("{:?}/{:?}", f.underline().unwrap_or((0, 0)), f.x_height().unwrap_or(0))).collect();
+        let detail = alloc::format!(
+            "tags={} line={:?} one_line={} underline/xh@100,400,700,900={}",
+            if tags.is_empty() { String::from("none") } else { tags.join(",") }, reg.line_metrics(), one_line as u8, per.join(",")
+        );
+        (insts.len(), one_line && (reg.mvar.is_none() || moved), detail)
+    });
+    let (n_inst, mvar_ok, mv_detail) = mv.unwrap_or((0, false, String::from("engine busy")));
+    serial_println!("[fonts2] mvar {}", mv_detail);
+    let mvar_ok = mvar_ok && n_inst == 4;
+    // (c) GSUB FeatureVariations — on the probe; the faces' own count for the record.
+    let probe = font_core::layout::Gsub::parse(font_core::layout::FEATURE_VARIATIONS_PROBE);
+    let (rules, fv_ok, fv_detail) = match probe {
+        Some(g) => {
+            let at = |c: f32| g.0.feature_lookups_at(&[*b"DFLT"], *b"ss01", &[c]);
+            let (d, h, f) = (at(0.0), at(0.5), at(1.0));
+            let below = g.0.selected_variation(&[0.25]);
+            let ok = d.as_deref() == Some(&[0][..]) && h.as_deref() == Some(&[1][..]) && f.as_deref() == Some(&[1][..]) && below.is_none() && g.0.feature_variation_count() == 1;
+            (g.0.feature_variation_count(), ok, alloc::format!("probe ss01@0={:?} @0.5={:?} @1.0={:?} selected@0.25={:?}", d, h, f, below))
+        }
+        None => (0, false, String::from("probe did not parse")),
+    };
+    let face_fv = tt::with(|t| t.eng.slots().iter().map(|s| s.font.gsub.map_or(0, |g| g.0.feature_variation_count()) + s.font.gpos.map_or(0, |g| g.0.feature_variation_count())).sum::<usize>()).unwrap_or(0);
+    serial_println!("[fonts2] gsub_fv {} faces_records={} (the vendored faces' GSUB/GPOS are version 1.0: the reader is proven on the probe)", fv_detail, face_fv);
+    // (d) the vendored faces against their pinned header facts.
+    let kat = tt::with(|t| {
+        VENDORED_KAT
+            .iter()
+            .map(|&(name, ng, upem, hhea)| {
+                let hit = t.eng.slots().iter().find(|s| s.name == name);
+                let ok = hit.is_some_and(|s| s.font.num_glyphs == ng && s.font.units_per_em == upem && [s.font.ascender, s.font.descender, s.font.line_gap] == hhea);
+                (name, hit.is_some(), ok)
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    let vendored = kat.iter().filter(|k| k.2).count();
+    let kd: Vec<String> = kat.iter().map(|(n, present, ok)| alloc::format!("{}={}", n, if *ok { "ok" } else if *present { "differs" } else { "absent" })).collect();
+    serial_println!("[fonts2] kat {}", kd.join(" "));
+    let kat_ok = vendored == VENDORED_KAT.len();
+    let word = |b: bool| if b { "ok" } else { "fail" };
+    serial_println!(
+        ":: FONTS2: tnum={}(clock,meters={}) mvar={}(instances={}) gsub_fv={}(rules={}) kat={}(vendored={}) -> {} ::",
+        word(tnum_ok), meters_ok, word(mvar_ok), n_inst, word(fv_ok), rules, word(kat_ok), vendored,
+        if tnum_ok && mvar_ok && fv_ok && kat_ok { "PASS" } else { "FAIL" }
+    );
 }

@@ -51,9 +51,12 @@ pub fn sha256_hex(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
-/// Read a font file if present and (when `sha` is given) identical to the KAT's source.
+/// Read a font file if present and (when `sha` is given) identical to the KAT's source. FONTS2 (B650): a path
+/// without a leading `/` is the TREE's (the vendored faces under `fonts/`), resolved against the repository root, so
+/// those rows check on every host whatever its system fonts are.
 pub fn load(path: &str, sha: Option<&str>) -> Option<Vec<u8>> {
-    let d = std::fs::read(path).ok()?;
+    let full = if path.starts_with('/') { path.to_string() } else { format!("{}/../../../../{path}", env!("CARGO_MANIFEST_DIR")) };
+    let d = std::fs::read(&full).ok()?;
     if let Some(s) = sha {
         if sha256_hex(&d) != s {
             eprintln!("SKIP {path}: sha256 differs from the KAT source");

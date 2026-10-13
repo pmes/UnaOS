@@ -1088,3 +1088,18 @@
 /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc	2	79c18ebe7b811951e8311bad7103ebeae8c337ed9988ea69e8a78a66cfe029b9	3	1	5124	1	文泉驛點陣正黑
 /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc	2	79c18ebe7b811951e8311bad7103ebeae8c337ed9988ea69e8a78a66cfe029b9	3	1	5124	2	Regular
 /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc	2	79c18ebe7b811951e8311bad7103ebeae8c337ed9988ea69e8a78a66cfe029b9	3	1	5124	4	文泉驛點陣正黑
+# FONTS2 (B650): the three VENDORED faces, repo-relative paths (docs/dev/evidence/fonts2/gen_name_vendored.py, fontTools 4.66.1)
+fonts/inter/InterVariable.ttf	0	4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf	1	0	0	4	Inter Variable
+fonts/inter/InterVariable.ttf	0	4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf	1	0	0	6	InterVariable
+fonts/inter/InterVariable.ttf	0	4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf	3	1	1033	1	Inter Variable
+fonts/inter/InterVariable.ttf	0	4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf	3	1	1033	2	Regular
+fonts/inter/InterVariable.ttf	0	4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf	3	1	1033	4	Inter Variable
+fonts/inter/InterVariable.ttf	0	4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf	3	1	1033	6	InterVariable
+fonts/jetbrains-mono/JetBrainsMono-Variable.ttf	0	662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016	3	1	1033	1	JetBrains Mono
+fonts/jetbrains-mono/JetBrainsMono-Variable.ttf	0	662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016	3	1	1033	2	Regular
+fonts/jetbrains-mono/JetBrainsMono-Variable.ttf	0	662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016	3	1	1033	4	JetBrains Mono Regular
+fonts/jetbrains-mono/JetBrainsMono-Variable.ttf	0	662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016	3	1	1033	6	JetBrainsMono-Regular
+fonts/noto-sans/NotoSans-Variable.ttf	0	fb53504de62e767a54695416123d68d67f71c9b69722175184ad56e7dd13547b	3	1	1033	1	Noto Sans
+fonts/noto-sans/NotoSans-Variable.ttf	0	fb53504de62e767a54695416123d68d67f71c9b69722175184ad56e7dd13547b	3	1	1033	2	Regular
+fonts/noto-sans/NotoSans-Variable.ttf	0	fb53504de62e767a54695416123d68d67f71c9b69722175184ad56e7dd13547b	3	1	1033	4	Noto Sans Regular
+fonts/noto-sans/NotoSans-Variable.ttf	0	fb53504de62e767a54695416123d68d67f71c9b69722175184ad56e7dd13547b	3	1	1033	6	NotoSans-Regular

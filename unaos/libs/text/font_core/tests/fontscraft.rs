@@ -414,3 +414,59 @@ fn ramp_png() {
         eprintln!("FONTSCRAFT ramp written: {p}");
     }
 }
+
+// ------------------------------------------------------------------------------------------------ FONTS2 (B650)
+
+/// FONTS2 (rmbp-ledger B650): `MVAR` moves the metrics of an instance — the numbers are fontTools 4.66.1's
+/// instancer on the pinned files (docs/dev/evidence/fonts2/RESUME.md): Inter's underline (`undo`, `unds`) at `wght`
+/// 400 / 700 / 900, Noto Sans' x-height (`xhgt`) 536 → 546. No vendored face carries `hasc`/`hdsc`/`hlgp`, so the
+/// line box is the same at every weight, and the engine's line metrics are those of the REGULAR instance.
+#[test]
+fn mvar_metrics_move_with_the_instance() {
+    let f = inter();
+    let m = f.mvar.expect("Inter 4.1 carries MVAR");
+    let tags: Vec<String> = m.tags().iter().map(|t| String::from_utf8_lossy(t).into_owned()).collect();
+    assert_eq!(tags, ["stro", "strs", "undo", "unds", "xhgt"]);
+    assert!(!m.has(*b"hasc") && !m.has(*b"hdsc") && !m.has(*b"hlgp"));
+    assert_eq!(f.metric_delta(*b"undo"), 0.0, "the default instance has no delta");
+    let at = |w: f32| f.with_variations(&[(*b"wght", w)]);
+    assert_eq!(at(400.0).underline(), Some((-348, 140)));
+    assert_eq!(at(700.0).underline(), Some((-323, 190)));
+    assert_eq!(at(900.0).underline(), Some((-302, 232)));
+    for w in [100.0, 400.0, 700.0, 900.0] {
+        let g = at(w);
+        assert_eq!(g.x_height(), Some(1118), "Inter xh at {w}");
+        assert_eq!(g.line_metrics(), f.line_metrics(), "Inter line box at {w}");
+    }
+    let n = noto();
+    assert_eq!(n.mvar.map(|m| m.record_count()), Some(2));
+    assert_eq!(n.with_variations(&[(*b"wght", 400.0)]).x_height(), Some(536));
+    assert_eq!(n.with_variations(&[(*b"wght", 700.0)]).x_height(), Some(546));
+    assert_eq!(n.with_variations(&[(*b"wght", 900.0)]).x_height(), Some(546));
+    assert!(jbmono().mvar.is_none(), "JetBrains Mono carries no MVAR");
+    let (e, _, _) = engine();
+    let lm = e.line_metrics(Role::Sans, 26.0).unwrap();
+    let (a, d, g) = f.line_metrics();
+    let s = 26.0 / f.units_per_em as f32;
+    assert_eq!(lm, (a as f32 * s, -(d as f32) * s, (a as f32 - d as f32 + g as f32) * s));
+}
+
+/// FONTS2 (B650): the GSUB/GPOS FeatureVariations reader (OpenType 1.9, "OpenType Layout Common Table Formats":
+/// FeatureVariations, ConditionSet, Condition Table Format 1, FeatureTableSubstitution) on the synthetic probe — the
+/// vendored faces carry none (their GSUB/GPOS are version 1.0), which this also pins.
+#[test]
+fn gsub_feature_variations_probe() {
+    use font_core::layout::{Gsub, FEATURE_VARIATIONS_PROBE};
+    let g = Gsub::parse(FEATURE_VARIATIONS_PROBE).expect("the probe parses").0;
+    assert_eq!(g.feature_variation_count(), 1);
+    for (c, sel, want) in [(0.0, None, 0u16), (0.25, None, 0), (-0.5, None, 0), (0.5, Some(0), 1), (1.0, Some(0), 1)] {
+        assert_eq!(g.selected_variation(&[c]), sel, "selected at {c}");
+        assert_eq!(g.feature_lookups_at(&[*b"DFLT"], *b"ss01", &[c]), Some(vec![want]), "ss01 at {c}");
+    }
+    assert_eq!(g.selected_variation(&[]), None, "a missing axis reads 0");
+    assert_eq!(g.feature_lookups(&[*b"DFLT"], *b"ss01"), Some(vec![0]), "the default instance's view");
+    for f in [inter(), jbmono(), noto()] {
+        assert_eq!(f.gsub.map_or(0, |t| t.0.feature_variation_count()), 0);
+        assert_eq!(f.gpos.map_or(0, |t| t.0.feature_variation_count()), 0);
+    }
+}
