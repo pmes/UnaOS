@@ -1,0 +1,244 @@
+   Compiling quote v1.0.47
+    Checking elf_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/sys/elf_core)
+    Checking vp8_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/media/vp8_core)
+    Checking raw_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/media/raw_core)
+    Checking type_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/sys/type_core)
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+    Checking pixel_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/media/pixel_core)
+    Checking crypto_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/sys/crypto_core)
+    Checking demux_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/media/demux_core)
+    Checking html_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/web/html_core)
+    Checking tls_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/sys/tls_core)
+    Checking psl_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/net/psl_core)
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+    Checking audio_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/media/audio_core)
+warning: `tls_core` (lib) generated 1 warning
+    Checking http_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/net/http_core)
+    Checking av1_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/media/av1_core)
+    Checking font_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/text/font_core)
+   Compiling simd_helpers v0.1.0
+    Checking css_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/web/css_core)
+    Checking text_host v0.1.0 (/home/user/exec/aetherdevtools2/libs/text_host)
+    Checking svg_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/media/svg_core)
+    Checking kvstore_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/fs/kvstore_core)
+    Checking js_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/web/js_core)
+    Checking layout_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/web/layout_core)
+warning: unreachable pattern
+    --> unaos/libs/web/layout_core/src/css.rs:1633:9
+     |
+1584 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1633 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `layout_core` (lib) generated 1 warning
+    Checking futures-channel v0.3.34
+    Checking gdk4-sys v0.11.5
+    Checking graphene-sys v0.22.9
+   Compiling gtk4-sys v0.11.5
+   Compiling gsk4-sys v0.11.5
+warning: field `is_arrow` is never read
+  --> unaos/libs/web/js_core/src/parser/mod.rs:65:9
+   |
+50 | pub(crate) struct Ctx {
+   |                   --- field in this struct
+...
+65 |     pub is_arrow: bool,
+   |         ^^^^^^^^
+   |
+   = note: `Ctx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Params` is never constructed
+  --> unaos/libs/web/js_core/src/parser/mod.rs:86:5
+   |
+77 | pub(crate) enum ScopeKind {
+   |                 --------- variant in this enum
+...
+86 |     Params,
+   |     ^^^^^^
+   |
+   = note: `ScopeKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `ui` is never read
+   --> unaos/libs/web/js_core/src/regexp/parser.rs:215:5
+    |
+202 | struct P<'a> {
+    |        - field in this struct
+...
+215 |     ui: bool,
+    |     ^^
+
+warning: field `is_switch` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:44:48
+   |
+44 |     Target { labels: Vec<Atom>, is_loop: bool, is_switch: bool, breaks: Vec<usize>, continues: Vec<usize>, scope: u32, labelled_only...
+   |     ------ field in this variant               ^^^^^^^^^
+
+warning: field `kind` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:65:9
+   |
+55 | pub(crate) struct FnState {
+   |                   ------- field in this struct
+...
+65 |     pub kind: FnKind,
+   |         ^^^^
+
+warning: enum `Flow` is never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:13:6
+   |
+13 | enum Flow {
+   |      ^^^^
+
+warning: methods `fr` and `frm` are never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:29:8
+   |
+19 | impl Vm {
+   | ------- methods in this implementation
+...
+29 |     fn fr(&self) -> &Frame {
+   |        ^^
+...
+33 |     fn frm(&mut self) -> &mut Frame {
+   |        ^^^
+
+   Compiling system-deps v7.0.8
+warning: `js_core` (lib) generated 7 warnings
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.17.1
+   Compiling indexmap v2.14.2
+   Compiling memoffset v0.9.1
+   Compiling toml_edit v0.25.15+spec-1.1.0
+   Compiling sourceview5-sys v0.11.2
+   Compiling field-offset v0.3.6
+   Compiling proc-macro-crate v3.5.0
+   Compiling libspelling-sys v0.5.0
+   Compiling glib-build-tools v0.22.8
+    Checking prefs_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/sys/prefs_core)
+   Compiling quartzite v0.1.0 (/home/user/exec/aetherdevtools2/libs/quartzite)
+    Checking edit_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/text/edit_core)
+    Checking syntax_core v0.1.0 (/home/user/exec/aetherdevtools2/unaos/libs/text/syntax_core)
+   Compiling aether-shell v0.1.0 (/home/user/exec/aetherdevtools2/vessels/aether-shell)
+   Compiling futures-macro v0.3.34
+   Compiling bytemuck_derive v1.12.1
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+    Checking futures-util v0.3.34
+    Checking tokio v1.53.2
+   Compiling equator-macro v0.4.2
+    Checking bytemuck v1.25.2
+    Checking font-types v0.12.6
+   Compiling zerocopy-derive v0.8.59
+   Compiling thiserror-impl v2.0.21
+    Checking equator v0.4.2
+    Checking aligned-vec v0.6.4
+    Checking v_frame v0.3.9
+    Checking read-fonts v0.41.0
+    Checking serde v1.0.229
+    Checking bandy v0.1.0 (/home/user/exec/aetherdevtools2/libs/bandy)
+   Compiling profiling-procmacros v1.0.18
+    Checking gneiss_pal v0.1.0 (/home/user/exec/aetherdevtools2/libs/gneiss_pal)
+   Compiling arg_enum_proc_macro v0.3.4
+    Checking profiling v1.0.18
+    Checking av1-grain v0.2.5
+    Checking tiny-skia-path v0.12.0
+    Checking rgb v0.8.53
+    Checking num-complex v0.4.6
+   Compiling num-derive v0.4.2
+    Checking thiserror v2.0.21
+    Checking pulp v0.22.3
+    Checking av-scenechange v0.14.1
+    Checking zerocopy v0.8.59
+    Checking skrifa v0.44.0
+    Checking harfrust v0.12.0
+    Checking tiny-skia v0.12.0
+    Checking rav1e v0.8.1
+    Checking qoi v0.4.1
+   Compiling clap_derive v4.6.7
+    Checking half v2.7.1
+    Checking tiff v0.11.3
+    Checking usvg v0.48.1
+    Checking exr v1.74.2
+    Checking resvg v0.48.1
+    Checking ravif v0.13.0
+    Checking futures-executor v0.3.34
+   Compiling glib-macros v0.22.9
+   Compiling gtk4-macros v0.11.5
+    Checking image v0.25.10
+    Checking elessar v0.1.0 (/home/user/exec/aetherdevtools2/libs/elessar)
+    Checking principia v0.1.0 (/home/user/exec/aetherdevtools2/handlers/principia)
+    Checking tabula v0.1.0 (/home/user/exec/aetherdevtools2/handlers/tabula)
+    Checking resonance v0.1.0 (/home/user/exec/aetherdevtools2/libs/resonance)
+    Checking stria v0.1.0 (/home/user/exec/aetherdevtools2/handlers/stria)
+    Checking facet v0.1.0 (/home/user/exec/aetherdevtools2/handlers/facet)
+    Checking clap v4.6.7
+    Checking aether v0.1.0 (/home/user/exec/aetherdevtools2/handlers/aether)
+    Checking glib v0.22.10
+warning: field `timer_count` is never read
+   --> handlers/aether/src/js/mod.rs:258:9
+    |
+189 | pub(crate) struct PageState {
+    |                   --------- field in this struct
+...
+258 |     pub timer_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aether` (lib) generated 1 warning
+warning: use of deprecated method `aether::AetherEngine::load_url`: use aether::net::fetch_document and engine.load_html instead to prevent borrow panics
+  --> handlers/aether/src/main.rs:73:48
+   |
+73 |                         if let Err(e) = engine.load_url(&url).await {
+   |                                                ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: `aether` (bin "aether" test) generated 1 warning
+    Checking gio v0.22.10
+    Checking cairo-rs v0.22.9
+    Checking graphene-rs v0.22.8
+warning: `aether` (lib test) generated 1 warning (1 duplicate)
+    Checking pango v0.22.9
+    Checking gdk-pixbuf v0.22.0
+    Checking gdk4 v0.11.5
+    Checking gsk4 v0.11.5
+    Checking gtk4 v0.11.5
+    Checking sourceview5 v0.11.2
+    Checking libspelling v0.5.0
+warning: unused import: `RefCell`
+  --> libs/quartzite/src/platforms/gtk/devtools_view.rs:24:23
+   |
+24 | use std::cell::{Cell, RefCell};
+   |                       ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `width`
+  --> libs/quartzite/src/platforms/gtk/image_view.rs:19:49
+   |
+19 |     drawing_area.set_draw_func(move |_area, cr, width, height| {
+   |                                                 ^^^^^ help: if this is intentional, prefix it with an underscore: `_width`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `height`
+  --> libs/quartzite/src/platforms/gtk/image_view.rs:19:56
+   |
+19 |     drawing_area.set_draw_func(move |_area, cr, width, height| {
+   |                                                        ^^^^^^ help: if this is intentional, prefix it with an underscore: `_height`
+
+warning: `quartzite` (lib) generated 3 warnings (1 duplicate) (run `cargo fix --lib -p quartzite` to apply 2 suggestions)
+warning: `quartzite` (lib test) generated 3 warnings (2 duplicates) (run `cargo fix --lib -p quartzite --tests` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 00s

@@ -95,6 +95,8 @@ enum TabCmd {
     Activate,
     /// The tab was closed.
     Shutdown,
+    /// AETHERDEVTOOLS2 (SR112): the window's developer-tools chrome changed (opened, closed, docked, resized).
+    Devtools(chrome::DevtoolsChrome),
 }
 
 /// A tab → the coordinator.
@@ -154,13 +156,22 @@ struct Tab {
     loading: bool,
     last_nav: Option<(bool, bool, bool, u32)>,
     last_status: String,
+    /// AETHERDEVTOOLS2 (SR112): the window's developer-tools chrome (the coordinator's copy), the pane's
+    /// own state beside this tab's engine, the content area the pane and the page split (the last
+    /// `BrowserResize`, else the engine's first device size), and the pane text last sent.
+    devtools_chrome: chrome::DevtoolsChrome,
+    devtools: chrome::devtools::DevTools,
+    window: (u32, u32),
+    last_lines: Option<Vec<String>>,
 }
 
 impl Tab {
     fn new(id: u64, bus: Synapse, active: Arc<AtomicU64>, reports: UnboundedSender<TabReport>, rx: UnboundedReceiver<TabCmd>) -> Self {
+        let engine = AetherEngine::new();
+        let window = engine.device_size();
         Self {
             id,
-            engine: AetherEngine::new(),
+            engine,
             bus,
             active,
             reports,
@@ -176,6 +187,45 @@ impl Tab {
             loading: false,
             last_nav: None,
             last_status: String::new(),
+            devtools_chrome: chrome::DevtoolsChrome::default(),
+            devtools: chrome::devtools::DevTools::new(),
+            window,
+            last_lines: None,
+        }
+    }
+
+    /// AETHERDEVTOOLS2 (SR112): the engine's device size follows the PAGE rect of the split of the content
+    /// area (the whole area while the pane is closed).
+    fn fit_page(&mut self) {
+        let ((_, _, pw, ph), _) = self.devtools_chrome.split(self.window.0, self.window.1);
+        let size = (pw.max(1), ph.max(1));
+        if self.engine.device_size() != size {
+            self.engine.set_device_size(size.0, size.1);
+        }
+    }
+
+    /// One frame. While the pane is open it is `chrome::host::devtools_frame` (the tick and the paint
+    /// through the Performance recorder, then the pane's text, sent to the face when it changed);
+    /// otherwise the engine's own `tick` + `render_frame`.
+    fn frame(&mut self) {
+        if !self.devtools_chrome.open {
+            if self.engine.tick() {
+                let damages = self.engine.render_frame();
+                if !damages.is_empty() {
+                    self.blit();
+                }
+            }
+            return;
+        }
+        let (damage, lines) = chrome::host::devtools_frame(&mut self.engine, &self.devtools_chrome, &mut self.devtools, self.window);
+        if damage.is_some_and(|d| !d.is_empty()) {
+            self.blit();
+        }
+        if let Some(lines) = lines {
+            if self.is_active() && self.last_lines.as_ref() != Some(&lines) {
+                self.bus.fire(SMessage::BrowserDevtoolsLines(lines.clone()));
+                self.last_lines = Some(lines);
+            }
         }
     }
 
@@ -219,6 +269,8 @@ impl Tab {
         self.last_nav = None;
         self.last_status = String::new();
         self.bus.fire(SMessage::BrowserStatus(String::new()));
+        // The pane's text is re-sent on the next frame (this tab's, not the last active one's).
+        self.last_lines = None;
         self.mirror_chrome();
     }
 
@@ -249,11 +301,8 @@ impl Tab {
             while let Ok(c) = self.rx.try_recv() {
                 self.deferred.push_back(c);
             }
-            if ticked && self.engine.tick() {
-                let damages = self.engine.render_frame();
-                if !damages.is_empty() {
-                    self.blit();
-                }
+            if ticked {
+                self.frame();
             }
             let mut batch = Vec::new();
             while let Some(c) = self.deferred.pop_front() {
@@ -268,6 +317,11 @@ impl Tab {
                         return;
                     }
                     TabCmd::Activate => self.present_all(),
+                    TabCmd::Devtools(c) => {
+                        self.devtools_chrome = c;
+                        self.last_lines = None;
+                        self.fit_page();
+                    }
                     TabCmd::Msg(m) => batch.push(m),
                 }
             }
@@ -401,7 +455,20 @@ impl Tab {
             ref m @ (SMessage::MediaOpened { .. } | SMessage::MediaFrame { .. } | SMessage::MediaEnded { .. } | SMessage::MediaError { .. }) => {
                 self.engine.on_media_message(m);
             }
-            SMessage::BrowserResize(w, h) => self.engine.set_device_size(w, h),
+            SMessage::BrowserResize(w, h) => {
+                self.window = (w, h);
+                self.fit_page();
+            }
+            // AETHERDEVTOOLS2 (SR112): the pane's panel tabs and its Console input.
+            SMessage::BrowserDevtoolsPanel(label) => {
+                if let Some(p) = chrome::devtools::Panel::ALL.iter().find(|p| p.label().eq_ignore_ascii_case(&label)) {
+                    self.devtools.panel = *p;
+                }
+            }
+            SMessage::BrowserDevtoolsEval(line) => {
+                self.devtools.panel = chrome::devtools::Panel::Console;
+                let _ = self.devtools.evaluate(&mut self.engine, &line);
+            }
             SMessage::BrowserKey(key) => self.engine.handle_event(aether::api::events::Event::KeyDown(key)),
             SMessage::BrowserText(text) => self.engine.handle_event(aether::api::events::Event::Text(text)),
             // SR67: hover, `:hover` re-style, the page's mouse events.
@@ -533,9 +600,46 @@ struct Coordinator {
     downloads: chrome::downloads::DownloadList,
     next_download: u64,
     last_resize: Option<(u32, u32)>,
+    /// AETHERDEVTOOLS2 (SR112): the window's developer-tools chrome (open, dock, share).
+    devtools: chrome::DevtoolsChrome,
+}
+
+/// AETHERDEVTOOLS2 (SR112): the face's layout for the pane — `DevtoolsChrome::split` of the content area
+/// (`(0, 0)` until the face reported one).
+fn devtools_layout(c: &chrome::DevtoolsChrome, area: Option<(u32, u32)>) -> SMessage {
+    let (w, h) = area.unwrap_or((0, 0));
+    let (page, pane) = c.split(w, h);
+    SMessage::BrowserDevtoolsLayout { bottom: c.dock == chrome::DevtoolsDock::Bottom, page, pane }
 }
 
 impl Coordinator {
+    /// The devtools chrome changed: every tab's engine follows the new split, the face lays out the pane.
+    fn publish_devtools(&self) {
+        for tx in self.tabs.values() {
+            let _ = tx.send(TabCmd::Devtools(self.devtools));
+        }
+        self.bus.fire(devtools_layout(&self.devtools, self.last_resize));
+    }
+
+    /// A devtools verb from the face; answers whether the chrome changed.
+    fn on_devtools(&mut self, m: &SMessage) -> bool {
+        let before = self.devtools;
+        match m {
+            SMessage::BrowserDevtoolsKey { key, ctrl, shift, alt } => {
+                self.devtools.on_key(key, *ctrl, *shift, *alt);
+            }
+            SMessage::BrowserDevtoolsDock { bottom } => {
+                let want = if *bottom { chrome::DevtoolsDock::Bottom } else { chrome::DevtoolsDock::Right };
+                if self.devtools.dock != want {
+                    self.devtools.flip_dock();
+                }
+            }
+            SMessage::BrowserDevtoolsShare(pct) => self.devtools.set_share(*pct),
+            _ => {}
+        }
+        self.devtools != before
+    }
+
     fn send(&self, id: u64, cmd: TabCmd) {
         if let Some(tx) = self.tabs.get(&id) {
             let _ = tx.send(cmd);
@@ -555,6 +659,7 @@ impl Coordinator {
 
     fn activate(&mut self, id: u64) {
         self.active.store(id, Ordering::Relaxed);
+        self.send(id, TabCmd::Devtools(self.devtools));
         if let Some((w, h)) = self.last_resize {
             self.send(id, TabCmd::Msg(SMessage::BrowserResize(w, h)));
         }
@@ -626,6 +731,14 @@ impl Coordinator {
             SMessage::BrowserResize(w, h) => {
                 self.last_resize = Some((w, h));
                 self.to_active(SMessage::BrowserResize(w, h));
+                if self.devtools.open {
+                    self.bus.fire(devtools_layout(&self.devtools, self.last_resize));
+                }
+            }
+            SMessage::BrowserDevtoolsKey { .. } | SMessage::BrowserDevtoolsDock { .. } | SMessage::BrowserDevtoolsShare(_) => {
+                if self.on_devtools(&m) {
+                    self.publish_devtools();
+                }
             }
             // Facet's answers go back to the tab whose receipt they carry.
             SMessage::Facet(c)
@@ -657,7 +770,9 @@ impl Coordinator {
             | SMessage::BrowserZoom(_)
             | SMessage::BrowserFind { .. }
             | SMessage::BrowserFindClose
-            | SMessage::BrowserPageInfoAsk => self.to_active(m),
+            | SMessage::BrowserPageInfoAsk
+            | SMessage::BrowserDevtoolsPanel(_)
+            | SMessage::BrowserDevtoolsEval(_) => self.to_active(m),
             _ => {}
         }
     }
@@ -766,6 +881,7 @@ fn main() {
                     downloads: chrome::downloads::DownloadList::default(),
                     next_download: 0,
                     last_resize: None,
+                    devtools: chrome::DevtoolsChrome::default(),
                 };
                 local.block_on(&rt, coordinator.run(bus_rx, reports_rx));
             })
@@ -846,5 +962,26 @@ mod tests {
         ]);
         let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
         assert_eq!(shape, ["BrowserScroll(0.0, 3.0)", "BrowserMouseMove(4.0, 4.0)", "BrowserResize(20, 20)"]);
+    }
+
+    /// AETHERDEVTOOLS2 (SR112): the face's split/key path through the shell — F12 from the face's hook
+    /// opens the pane (`DevtoolsChrome::on_key`), the layout the face receives is `split` of the content
+    /// area (right dock, 40 %), the dock verb moves it under the page, the splitter's share is clamped, a
+    /// key that is not the toggle changes nothing, and Ctrl+Shift+I closes it (the page keeps the area).
+    #[test]
+    fn devtools_key_and_split_reach_the_face_layout() {
+        let mut c = chrome::DevtoolsChrome::default();
+        let shape = |c: &chrome::DevtoolsChrome| format!("{:?}", devtools_layout(c, Some((1000, 800))));
+        assert_eq!(shape(&c), "BrowserDevtoolsLayout { bottom: false, page: (0, 0, 1000, 800), pane: None }");
+        assert!(c.on_key("F12", false, false, false));
+        assert_eq!(shape(&c), "BrowserDevtoolsLayout { bottom: false, page: (0, 0, 600, 800), pane: Some((600, 0, 400, 800)) }");
+        c.flip_dock();
+        c.set_share(5);
+        assert_eq!(shape(&c), "BrowserDevtoolsLayout { bottom: true, page: (0, 0, 1000, 680), pane: Some((0, 680, 1000, 120)) }");
+        assert!(!c.on_key("F11", false, false, false));
+        assert!(c.open);
+        assert!(c.on_key("I", true, true, false));
+        assert_eq!(shape(&c), "BrowserDevtoolsLayout { bottom: true, page: (0, 0, 1000, 800), pane: None }");
+        assert_eq!(format!("{:?}", devtools_layout(&c, None)), "BrowserDevtoolsLayout { bottom: true, page: (0, 0, 0, 0), pane: None }");
     }
 }

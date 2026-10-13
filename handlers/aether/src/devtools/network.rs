@@ -12,8 +12,12 @@
 //!
 //! What the cache does not hold is reported as not recorded, never guessed: a `no-store` answer, a
 //! non-GET, a `file:` / `data:` load. The cache's times are Unix seconds, so `time_ms` has one-second
-//! resolution. Requests script makes (`fetch`, XHR) reach this list only through the cache entry their
-//! URL left; a per-request log in `api/fetch.rs` is owed for the rest (outside this arc's files).
+//! resolution for those rows.
+//!
+//! Requests script makes (`fetch`, XHR, a synchronous exchange) come from `api::fetch::request_log`
+//! (AETHERDEVTOOLS2): the per-request log the fetch worker keeps as each exchange runs — method, status,
+//! Content-Type, bytes and wall time in ms — so a `no-store` answer, a POST or a failed request appears
+//! too. They follow the document's rows, oldest first.
 
 use crate::AetherEngine;
 
@@ -26,6 +30,10 @@ pub enum Initiator {
     Image,
     Media,
     Frame,
+    /// A script request: `fetch()` or an asynchronous XHR.
+    Fetch,
+    /// A synchronous exchange: a synchronous XHR, an iframe's document, a worker's `importScripts`.
+    Sync,
     Other,
 }
 
@@ -38,6 +46,8 @@ impl Initiator {
             Initiator::Image => "img",
             Initiator::Media => "media",
             Initiator::Frame => "iframe",
+            Initiator::Fetch => "fetch/xhr",
+            Initiator::Sync => "sync",
             Initiator::Other => "other",
         }
     }
@@ -59,16 +69,19 @@ pub struct Request {
     pub time_ms: Option<i64>,
     /// The security refusal that blocked it (`security-<rule>`), when one names its URL.
     pub blocked: Option<String>,
+    /// Why a script request failed (a refusal, a network error, `cancelled`).
+    pub error: Option<String>,
 }
 
 impl Request {
     /// The row as the text face's columns.
     pub fn row(&self) -> String {
         let dash = || "-".to_string();
-        let status = match (&self.blocked, self.status) {
-            (Some(_), _) => "blocked".to_string(),
-            (None, Some(s)) => s.to_string(),
-            (None, None) => dash(),
+        let status = match (&self.blocked, &self.error, self.status) {
+            (Some(_), _, _) => "blocked".to_string(),
+            (None, Some(_), _) => "failed".to_string(),
+            (None, None, Some(s)) => s.to_string(),
+            (None, None, None) => dash(),
         };
         let mime = self.mime.clone().unwrap_or_else(dash);
         let size = self.size.map(|s| s.to_string()).unwrap_or_else(dash);
@@ -76,6 +89,8 @@ impl Request {
         let mut s = format!("{:<7} {:<6} {:<10} {:<24} {:>9} {:>7}  {}", self.method, status, self.initiator.label(), mime, size, ms, self.url);
         if let Some(b) = &self.blocked {
             s.push_str(&format!("  ({b})"));
+        } else if let Some(e) = &self.error {
+            s.push_str(&format!("  ({e})"));
         }
         s
     }
@@ -175,7 +190,7 @@ pub fn requests(engine: &AetherEngine) -> Vec<Request> {
     let mut out: Vec<Request> = references(engine)
         .into_iter()
         .map(|(initiator, url)| {
-            let mut r = Request { url: url.clone(), method: "GET", initiator, status: None, mime: None, size: None, time_ms: None, blocked: blocked_for(&url) };
+            let mut r = Request { url: url.clone(), method: "GET", initiator, status: None, mime: None, size: None, time_ms: None, blocked: blocked_for(&url), error: None };
             if let Ok(u) = html_core::url::Url::parse(&url) {
                 if matches!(u.scheme(), "http" | "https") {
                     let part = partition.clone().or_else(|| gneiss_pal::api::http::site_of(&url)).unwrap_or_default();
@@ -202,10 +217,41 @@ pub fn requests(engine: &AetherEngine) -> Vec<Request> {
                 size: None,
                 time_ms: None,
                 blocked: Some(rule),
+                error: None,
             });
         }
     }
+    // The script requests this page made (AETHERDEVTOOLS2), from the fetch worker's log.
+    for q in crate::api::fetch::request_log(&top) {
+        out.push(Request {
+            method: static_method(&q.method),
+            initiator: if q.sync { Initiator::Sync } else { Initiator::Fetch },
+            status: q.status,
+            mime: q.mime,
+            size: (q.done || q.size > 0).then_some(q.size),
+            time_ms: q.time_ms.map(|t| t.min(i64::MAX as u64) as i64),
+            blocked: None,
+            error: q.error,
+            url: q.url,
+        });
+    }
     out
+}
+
+/// The row's method as the column's static spelling (an extension method reads `*`).
+fn static_method(m: &str) -> &'static str {
+    match m {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "PATCH" => "PATCH",
+        "OPTIONS" => "OPTIONS",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "*",
+    }
 }
 
 /// The URL a refusal's detail names: from the scheme before its first `://` to the end (a CSP detail is

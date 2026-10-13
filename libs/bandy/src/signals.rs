@@ -230,6 +230,28 @@ pub enum SMessage {
     /// Shell → chrome: one download's progress row. `total` is `None` when the length is unknown;
     /// `done` with `error: None` is a saved file.
     BrowserDownload { id: u64, name: String, received: u64, total: Option<u64>, done: bool, error: Option<String> },
+    // AETHERDEVTOOLS2 (SR112): the developer-tools pane on the glass. The model is `aether::chrome::DevtoolsChrome`
+    // (open, dock side, share; `split` decides the page and pane rects) owned by the shell; the pane's content
+    // is `aether::devtools::DevTools` beside each tab's engine. These verbs are the seam to the face.
+    /// Chrome → shell: a key the face's capture-phase hook took before the page saw it (F12, Ctrl+Shift+I);
+    /// `key` is the key's name (`F12`, `I`). The shell's `DevtoolsChrome::on_key` decides.
+    BrowserDevtoolsKey { key: String, ctrl: bool, shift: bool, alt: bool },
+    /// Chrome → shell: dock the pane under the page (`bottom`) or beside it (Principia
+    /// `aether.devtools.dock`, read by the face at start and written by its dock button).
+    BrowserDevtoolsDock { bottom: bool },
+    /// Chrome → shell: the splitter moved; the pane's share of the dock axis in percent (clamped by
+    /// `DevtoolsChrome::set_share`).
+    BrowserDevtoolsShare(u32),
+    /// Chrome → engine: show the panel labelled so (`Elements`, `Console`, `Network`, `Storage`,
+    /// `Performance`).
+    BrowserDevtoolsPanel(String),
+    /// Chrome → engine: one Console line, evaluated in the page's realm.
+    BrowserDevtoolsEval(String),
+    /// Shell → chrome: `DevtoolsChrome::split` of the content area — the page rect and the pane rect
+    /// `(x, y, w, h)` (`pane` None: closed, the page has the whole area); `bottom` is the dock side.
+    BrowserDevtoolsLayout { bottom: bool, page: (u32, u32, u32, u32), pane: Option<(u32, u32, u32, u32)> },
+    /// Engine → chrome: the pane's text, one line per row (`DevTools::render`), sent when it changes.
+    BrowserDevtoolsLines(Vec<String>),
 
     // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
     // A session is keyed by the media `url` the request named (the same string `PlayMedia`

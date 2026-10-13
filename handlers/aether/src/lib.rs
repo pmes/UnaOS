@@ -24,6 +24,8 @@ pub mod media;
 pub mod selection;
 pub mod frames;
 pub mod chrome;
+// AETHERDEVTOOLS (SR112): the developer-tools pane — a std reader of the engine, beside the std-free chrome model.
+pub mod devtools;
 
 #[cfg(test)]
 mod engine_tests;

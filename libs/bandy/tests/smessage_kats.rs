@@ -407,6 +407,31 @@ kat!(
     SMessage::BrowserDownload { id: 7, name: "una.iso".to_string(), received: 512, total: Some(1024), done: false, error: None },
     r#"{"BrowserDownload":{"id":7,"name":"una.iso","received":512,"total":1024,"done":false,"error":null}}"#
 );
+// AETHERDEVTOOLS2 (SR112): the developer-tools pane's seven verbs.
+kat!(
+    kat_browser_devtools_key,
+    SMessage::BrowserDevtoolsKey { key: "F12".to_string(), ctrl: false, shift: false, alt: false },
+    r#"{"BrowserDevtoolsKey":{"key":"F12","ctrl":false,"shift":false,"alt":false}}"#
+);
+kat!(kat_browser_devtools_dock, SMessage::BrowserDevtoolsDock { bottom: true }, r#"{"BrowserDevtoolsDock":{"bottom":true}}"#);
+kat!(kat_browser_devtools_share, SMessage::BrowserDevtoolsShare(40), r#"{"BrowserDevtoolsShare":40}"#);
+kat!(kat_browser_devtools_panel, SMessage::BrowserDevtoolsPanel("Network".to_string()), r#"{"BrowserDevtoolsPanel":"Network"}"#);
+kat!(kat_browser_devtools_eval, SMessage::BrowserDevtoolsEval("1+1".to_string()), r#"{"BrowserDevtoolsEval":"1+1"}"#);
+kat!(
+    kat_browser_devtools_layout,
+    SMessage::BrowserDevtoolsLayout { bottom: false, page: (0, 0, 600, 800), pane: Some((600, 0, 400, 800)) },
+    r#"{"BrowserDevtoolsLayout":{"bottom":false,"page":[0,0,600,800],"pane":[600,0,400,800]}}"#
+);
+kat!(
+    kat_browser_devtools_layout_closed,
+    SMessage::BrowserDevtoolsLayout { bottom: true, page: (0, 0, 1000, 800), pane: None },
+    r#"{"BrowserDevtoolsLayout":{"bottom":true,"page":[0,0,1000,800],"pane":null}}"#
+);
+kat!(
+    kat_browser_devtools_lines,
+    SMessage::BrowserDevtoolsLines(vec!["[Elements]  Console".to_string(), " <html>".to_string()]),
+    r#"{"BrowserDevtoolsLines":["[Elements]  Console"," <html>"]}"#
+);
 
 // --- STRIA (A/V playback) ---
 
@@ -1352,6 +1377,13 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserBookmarks { .. } => "BrowserBookmarks",
         SMessage::BrowserPageInfo { .. } => "BrowserPageInfo",
         SMessage::BrowserDownload { .. } => "BrowserDownload",
+        SMessage::BrowserDevtoolsKey { .. } => "BrowserDevtoolsKey", // AETHERDEVTOOLS2 (SR112): the pane's seven verbs
+        SMessage::BrowserDevtoolsDock { .. } => "BrowserDevtoolsDock",
+        SMessage::BrowserDevtoolsShare(_) => "BrowserDevtoolsShare",
+        SMessage::BrowserDevtoolsPanel(_) => "BrowserDevtoolsPanel",
+        SMessage::BrowserDevtoolsEval(_) => "BrowserDevtoolsEval",
+        SMessage::BrowserDevtoolsLayout { .. } => "BrowserDevtoolsLayout",
+        SMessage::BrowserDevtoolsLines(_) => "BrowserDevtoolsLines",
     }
 }
 
