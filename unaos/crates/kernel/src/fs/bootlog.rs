@@ -91,7 +91,7 @@ fn off_pump(snapshot: fn() -> Option<(Vec<u8>, usize)>) -> bool {
     if FLUSHER.load(Ordering::Acquire) {
         return true;
     }
-    let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != crate::hidstall::pump_cpu()) else { return false };
+    let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != crate::hidstall::pump_cpu() && !CADENCE.load(Ordering::Acquire)) else { return false }; // BOOTLOGCARD (B549): the flightrec cadence owns the flush once claimed — divert flushes inline on the worker (LINE-NEUTRAL fold, code first)
     if FLUSHER.swap(true, Ordering::AcqRel) {
         return true;
     }
@@ -149,7 +149,7 @@ fn flush(snapshot: fn() -> Option<(Vec<u8>, usize)>) {
     match mt.write(&path, 0, &body, k) {
         Ok(_) => {
             let _ = mt.truncate(&path, body.len() as u64, k);
-            LAST_LEN.store(len, Ordering::Relaxed);
+            LAST_LEN.store(len, Ordering::Relaxed); #[cfg(feature = "unafs")] written_once(&path, body.len()); // BOOTLOGCARD (B549): the one written witness (LINE-NEUTRAL fold, code first)
         }
         Err(e) => {
             FAILED.store(true, Ordering::Relaxed);
@@ -164,4 +164,46 @@ fn flush(snapshot: fn() -> Option<(Vec<u8>, usize)>) {
 #[cfg(all(feature = "unafs", target_arch = "x86_64"))]
 pub fn flusher_armed() -> bool {
     FLUSHER.load(Ordering::Relaxed)
+}
+
+// ── BOOTLOGCARD (rmbp-ledger B549) — the boot log on a card-only boot. FILE-TAIL append. ───────────────────────────────
+//
+// THE HOLE (B541 PUMPHOLE's "needs your call"): `divert` is reached only from `flight_recorder::service` BELOW its
+// `block::info().is_none()` early return; on an internal-card-only boot the global slot stays empty all session, so the
+// boot log was never written to `/var/log/boot-<n>.log` though `/` is the native UnaFS root. THE MOVE: that early return
+// now calls `worker::card_bootlog`, which runs only on the `flightrec` worker (B541's `worker::hand`) and lands here —
+// the same [`flush`] (native-root check, `choose`, rotation to [`KEEP`]) at the worker's cadence, every [`EVERY`] body
+// passes, never on the pump's core and never through the FAT path. When the `bootlog-flush` task (SMALLFIX8) already
+// owns the flush (a storage boot), this does nothing; once this cadence is claimed, `off_pump` declines to spawn a
+// second flusher, so one writer owns `/var/log/boot-<n>.log`. Wire: `[boot] log flush on=flightrec every_passes=<n>`
+// once, then `[boot] log path=/var/log/boot-<n>.log volume=unafs bytes=<n> -> written` on the first successful write.
+
+/// BOOTLOGCARD: the `flightrec` worker's cadence owns the flush (the card-only boot).
+#[cfg(feature = "unafs")]
+static CADENCE: AtomicBool = AtomicBool::new(false);
+
+/// BOOTLOGCARD: `flight_recorder::worker::card_bootlog` (on the `flightrec` worker only): one cadence step of the flush.
+#[cfg(feature = "unafs")]
+pub fn divert_on_worker(snapshot: fn() -> Option<(Vec<u8>, usize)>) {
+    #[cfg(target_arch = "x86_64")]
+    if FLUSHER.load(Ordering::Acquire) {
+        return; // the `bootlog-flush` task (SMALLFIX8) already owns the flush
+    }
+    if !CADENCE.swap(true, Ordering::AcqRel) {
+        serial_println!("[boot] log flush on=flightrec every_passes={} (BOOTLOGCARD: no global slot — the flightrec worker writes the boot log to UnaFS, never the FAT) ::", EVERY);
+    }
+    if FAILED.load(Ordering::Relaxed) || ITERS.fetch_add(1, Ordering::Relaxed) % EVERY != 0 {
+        return;
+    }
+    flush(snapshot);
+}
+
+/// BOOTLOGCARD: the first successful write of `/var/log/boot-<n>.log`, said once (any path: worker cadence, the
+/// `bootlog-flush` task, or inline).
+#[cfg(feature = "unafs")]
+fn written_once(path: &str, bytes: usize) {
+    static WROTE: AtomicBool = AtomicBool::new(false);
+    if !WROTE.swap(true, Ordering::Relaxed) {
+        serial_println!("[boot] log path={} volume=unafs bytes={} -> written ::", path, bytes);
+    }
 }
