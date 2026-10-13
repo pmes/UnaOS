@@ -4453,6 +4453,62 @@ PY
     echo -e "${COLOR_GREEN}✅ aarch64 ring-3 secrets handler: HOLOCRON.ELF${COLOR_RESET}"
 }
 
+# ARMAPPS (LEDGER SR100): the image-24 programs on aarch64 media — LUMEN.ELF, MIDDEN.ELF, UNA.ELF and AETHER.ELF built
+# from the SAME crates as their x86 builds, linked at the aarch64 ELF window (crates/<crate>/<crate>.ld, VA
+# una_abi::USER_XWIN_VA_ARM, RING3ABI2 M5) the way build_user_holocron_aarch64 links HOLOCRON.ELF. The build IS the
+# staged name (no -ARM suffix): kernel8 and stage_jetson_el0_images copy it to APPS/ under its FEATURE (lumen,
+# midden, una, aether). One recipe, four callers: the build_user_<app>_x86 steps (syms before the strip, into
+# target/APPS-ARM/; the strip; e_machine, b700 here; the APPRES stamp) with HOLOCRONARM's aarch64 window-fit assert
+# in place of user_elf_window_check (the x86 one keys on USER_XWIN_VA_X86). The programs already carry their aarch64 arms:
+# `landmark_base` reads the args page's `window_base` (lumen main.rs:1454, midden :678, una :532, aether :163),
+# the syscall stub is `svc #0` (vein_ring3 sys.rs; aether sys.rs:14), RING3EXEC's `exec` fact is x86's.
+# $1 crate dir name, $2 staged NAME (target/<NAME>.ELF, APPS-ARM/<NAME>.syms), $3 what it is (for the log), $4.. extra
+# cargo args (an explicit --target for a crate whose .cargo/config.toml defaults to x86, --features).
+build_user_xwin_aarch64() {
+    local crate="$1" name="$2" what="$3"; shift 3
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building aarch64 ring-3 ${what} (crates/${crate} → target/${name}.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/${crate}"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/${crate}/${crate}.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec "$@"
+    cd "$WORKSPACE_DIR"
+    local bin="${WORKSPACE_DIR}/crates/${crate}/target/aarch64-base/release/${crate}" f="${WORKSPACE_DIR}/target/${name}.ELF" out
+    # PROFILE2 M3's symbol table, BEFORE the strip — emit_user_syms' llvm-nm line, written to target/APPS-ARM/ and not
+    # target/APPS/: the x86 builds own target/APPS/<NAME>.syms under the SAME names, and one tree builds both arches
+    # (`tools/flame <log> --apps target/APPS-ARM` for an aarch64 capture). Warns, never fails the build.
+    mkdir -p "${WORKSPACE_DIR}/target/APPS-ARM"
+    "$TOOLBIN/llvm-nm" -n -C --defined-only "$bin" > "${WORKSPACE_DIR}/target/APPS-ARM/${name}.syms" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: target/APPS-ARM/${name}.syms ($(wc -l < "${WORKSPACE_DIR}/target/APPS-ARM/${name}.syms") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on ${bin} — no APPS-ARM/${name}.syms${COLOR_RESET}"
+    "$TOOLBIN/llvm-objcopy" --strip-all "$bin" "$f"
+    [ -s "$f" ] || { echo -e "${COLOR_RED}ERROR: ${name}.ELF missing/empty — aarch64 ${name} build failed${COLOR_RESET}"; exit 1; }
+    [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: ${name}.ELF does not start with the ELF magic${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "$f" | tr -d ' \n')"
+    [ "$pmach" = "b700" ] || { echo -e "${COLOR_RED}ERROR: ${name}.ELF e_machine is ${pmach}, want b700 (EM_AARCH64=183 LE)${COLOR_RESET}"; exit 1; }
+    out="$(python3 - "$f" "$USER_WINDOW_BYTES" "$USER_XWIN_VA_ARM" 12582912 <<'PY'
+import struct, sys
+b = open(sys.argv[1], 'rb').read(); win = int(sys.argv[2]); xva = int(sys.argv[3]); fcap = int(sys.argv[4])
+entry, = struct.unpack_from('<Q', b, 24); phoff, = struct.unpack_from('<Q', b, 32); phent, phnum = struct.unpack_from('<HH', b, 54)
+loads, stack = [], 0
+for i in range(phnum):
+    t, fl, off, va, pa, fs, ms, al = struct.unpack_from('<IIQQQQQQ', b, phoff + i * phent)
+    if t == 1: loads.append((va, ms))
+    if t == 0x6474E551: stack = ms
+lo = min(v for v, _ in loads); hi = max(v + m for v, m in loads)
+st = ((stack + 0xFFF) & ~0xFFF) if stack else 65536
+need = (hi - xva) + st + 4096
+print("model=elf entry=%#x lo=%#x span=%d stack=%d need=%d file=%d file_cap=%d" % (entry, lo, hi - lo, st, need, len(b), fcap))
+sys.exit(0 if lo == xva and entry == xva and need <= win and st <= (1 << 20) and len(b) <= fcap else 1)
+PY
+)" || { echo -e "${COLOR_RED}ERROR: ${name}.ELF does not fit the aarch64 ELF window: ${out}${COLOR_RESET}"; exit 1; }
+    echo -e "   ${name}.ELF: ${out}"
+    una_res_stamp "${WORKSPACE_DIR}/crates/${crate}" "$f"  # APPRES (B398): icon, name, signature, version — after the fit check, as the x86 fns order it
+    echo -e "${COLOR_GREEN}✅ aarch64 ring-3 ${what}: ${name}.ELF${COLOR_RESET}"
+}
+build_user_lumen_aarch64()  { build_user_xwin_aarch64 user-lumen  LUMEN  "Lumen app" --features cryptocore; }   # VEINTLS (SR36): the product crypto provider, as build_user_lumen_x86
+build_user_midden_aarch64() { build_user_xwin_aarch64 user-midden MIDDEN "Midden app"; }
+build_user_una_aarch64()    { build_user_xwin_aarch64 user-una    UNA    "Una IDE"; }
+build_user_aether_aarch64() { build_user_xwin_aarch64 user-aether AETHER "Aether app" --target "${WORKSPACE_DIR}/aarch64-base.json"; }   # its .cargo/config.toml defaults to x86_64-unknown-none.json
+
 # VEINTLS (SR36): NET.ELF runs on vein_ring3 (the transport LUMEN uses: verified TLS 1.3 with tls_core), linked at
 # the ELF window (RING3ABI2's user-net-x86.ld, taken verbatim) and built `--features cryptocore`.
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
@@ -6021,6 +6077,9 @@ USER_CHECK_MATRIX=(
   "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-holocron aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-holocron/user-holocron.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-midden   aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-una      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-una/user-una.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-aether   aarch64 ${WORKSPACE_DIR}/aarch64-base.json        -C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
 )
 
 # Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
@@ -10071,6 +10130,22 @@ stage_jetson_el0_images() {
             build_user_holocron_aarch64
             cp "${WORKSPACE_DIR}/target/HOLOCRON.ELF" "${APPS_DIR_ARM}/HOLOCRON.ELF"
             staged=$((staged + 1))
+            build_user_lumen_aarch64   # ARMAPPS (SR100): LUMEN.ELF itself, the program the lumen dock pin launches
+            cp "${WORKSPACE_DIR}/target/LUMEN.ELF" "${APPS_DIR_ARM}/LUMEN.ELF"
+            staged=$((staged + 1))
+            ;;
+    esac
+    # ARMAPPS (SR100): the image-24 programs, each under its own FEATURE (the knob that puts it in `_feats` is
+    # ARMLINE's). AETHER.ELF's page (crates/user-aether/doc/*.html) rides the volume as system/doc/, the builder's
+    # stage_welcome shape, read by the program at /boot/system/doc/welcome.html (user-aether main.rs PAGES).
+    case ",${_feats}" in *",midden,"*) build_user_midden_aarch64; cp "${WORKSPACE_DIR}/target/MIDDEN.ELF" "${APPS_DIR_ARM}/MIDDEN.ELF"; staged=$((staged + 1)) ;; esac
+    case ",${_feats}" in *",una,"*) build_user_una_aarch64; cp "${WORKSPACE_DIR}/target/UNA.ELF" "${APPS_DIR_ARM}/UNA.ELF"; staged=$((staged + 1)) ;; esac
+    case ",${_feats}" in
+        *",aether,"*)
+            build_user_aether_aarch64
+            cp "${WORKSPACE_DIR}/target/AETHER.ELF" "${APPS_DIR_ARM}/AETHER.ELF"
+            staged=$((staged + 1))
+            mkdir -p "${ESP_DIR_ARM}/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${ESP_DIR_ARM}/system/doc/"
             ;;
     esac
     # HELLO.BIN: only when `tegra_el0` armed `build_user_blob` above (see the block header).
@@ -11907,7 +11982,7 @@ kernel8() {
     fi
     if [ -n "${UNAOS_LUMEN:-}" ]; then
         K8_FEATS="${K8_FEATS},lumen"
-        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.ELF yet; tests lumen is x86) + HOLOCRONARM: APPS/HOLOCRON.ELF and the RINGLOGIN door${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image stages LUMEN.ELF since ARMAPPS SR100; tests lumen is x86) + HOLOCRONARM: APPS/HOLOCRON.ELF and the RINGLOGIN door${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"
@@ -12106,6 +12181,21 @@ kernel8() {
             build_user_holocron_aarch64
             cp "${WORKSPACE_DIR}/target/HOLOCRON.ELF" "$KERNEL8_DIR/APPS/HOLOCRON.ELF"
             case ",${K8_FEATS}," in *",selfdiag,"*) ;; *) echo -e "${COLOR_YELLOW}  ⚠ HOLOCRON.ELF staged without UNAOS_SELFDIAG=1: its store (SYS_PATH_READ/WRITE) answers -ENOSYS on this image${COLOR_RESET}" ;; esac
+            build_user_lumen_aarch64   # ARMAPPS (SR100): LUMEN.ELF itself, the program the lumen dock pin launches
+            cp "${WORKSPACE_DIR}/target/LUMEN.ELF" "$KERNEL8_DIR/APPS/LUMEN.ELF"
+            ;;
+    esac
+    # ARMAPPS (SR100): the image-24 programs on the Pi card, each under its own FEATURE (the knob that puts it in
+    # K8_FEATS is ARMLINE's), as stage_jetson_el0_images stages them on the Orin. MIDDEN.ELF and UNA.ELF read the
+    # volume through SYS_PATH_READ (`selfdiag` on aarch64, as for HOLOCRON.ELF); AETHER.ELF's page rides as
+    # system/doc/ (the builder's stage_welcome shape), read at /boot/system/doc/welcome.html.
+    case ",${K8_FEATS}," in *",midden,"*) build_user_midden_aarch64; cp "${WORKSPACE_DIR}/target/MIDDEN.ELF" "$KERNEL8_DIR/APPS/MIDDEN.ELF" ;; esac
+    case ",${K8_FEATS}," in *",una,"*) build_user_una_aarch64; cp "${WORKSPACE_DIR}/target/UNA.ELF" "$KERNEL8_DIR/APPS/UNA.ELF" ;; esac
+    case ",${K8_FEATS}," in
+        *",aether,"*)
+            build_user_aether_aarch64
+            cp "${WORKSPACE_DIR}/target/AETHER.ELF" "$KERNEL8_DIR/APPS/AETHER.ELF"
+            mkdir -p "$KERNEL8_DIR/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "$KERNEL8_DIR/system/doc/"
             ;;
     esac
 
