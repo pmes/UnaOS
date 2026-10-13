@@ -3,9 +3,18 @@
 //! header (§5.4), plus `SameSite` from RFC 6265bis §5.6.7 parsed and kept. The jar is plain data — the caller
 //! owns time (`now`, Unix seconds) and persistence (every field of [`Cookie`] is public).
 //!
+//! RFC 6265bis storage rules, in every `set_cookie` (AETHERORIGIN, LEDGER SR86): a `Secure` cookie only from a
+//! secure origin (https/wss, or a loopback host); a non-secure origin never shadows an existing `Secure`
+//! cookie (§5.7 "leave secure cookies alone"); the `__Secure-` and `__Host-` name prefixes (§4.1.3; `__Host-`
+//! also needs no `Domain` and `Path=/`); `SameSite=None` requires `Secure`. With a [`CookieContext`] (the
+//! caller knows the site-for-cookies): a cross-site response that is not a top-level navigation may not set
+//! a `Lax`/`Strict`/unspecified cookie; on retrieval `Strict` needs a same-site request, and `Lax` — which
+//! an unspecified SameSite defaults to (Lax-by-default) — also passes a top-level navigation with a safe
+//! method; `Partitioned` (CHIPS; requires `Secure`) keys a cookie to the context's partition (the top-level
+//! site), and it is sent only under that partition.
+//!
 //! OWED: the public suffix list (§5.3 step 5) — only single-label suffixes (`Domain=org`) are refused today,
-//! so `Domain=co.uk` from `a.co.uk` is accepted; and SameSite enforcement (the caller knows
-//! the site-for-cookies, this module only records the attribute).
+//! so `Domain=co.uk` from `a.co.uk` is accepted.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -39,6 +48,23 @@ pub struct Cookie {
     pub secure_only: bool,
     pub http_only: bool,
     pub same_site: Option<SameSite>,
+    /// CHIPS: the partition (top-level site) a `Partitioned` cookie is keyed to; `None` = unpartitioned.
+    pub partition: Option<String>,
+}
+
+/// The request a cookie is stored from or sent with (RFC 6265bis §5.2 "same-site" and "cross-site"
+/// requests). `Default` is a same-site, unpartitioned context — the behaviour of [`CookieJar::set_cookie`]
+/// and [`CookieJar::cookie_header`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CookieContext {
+    /// The request's site differs from its site-for-cookies (the top-level site).
+    pub cross_site: bool,
+    /// The request navigates a top-level browsing context.
+    pub top_level_navigation: bool,
+    /// The method is safe (GET, HEAD, OPTIONS, TRACE).
+    pub safe_method: bool,
+    /// The partition key (top-level site) for `Partitioned` cookies.
+    pub partition: Option<String>,
 }
 
 /// What §5.2 extracted from one Set-Cookie value.
@@ -54,6 +80,8 @@ pub struct ParsedSetCookie {
     pub secure: bool,
     pub http_only: bool,
     pub same_site: Option<SameSite>,
+    /// CHIPS `Partitioned`.
+    pub partitioned: bool,
 }
 
 fn trim_wsp(s: &str) -> &str {
@@ -110,6 +138,8 @@ pub fn parse_set_cookie(s: &str) -> Option<ParsedSetCookie> {
             c.secure = true;
         } else if an.eq_ignore_ascii_case("httponly") {
             c.http_only = true;
+        } else if an.eq_ignore_ascii_case("partitioned") {
+            c.partitioned = true;
         } else if an.eq_ignore_ascii_case("samesite") {
             c.same_site = if aval.eq_ignore_ascii_case("strict") {
                 Some(SameSite::Strict)
@@ -276,6 +306,30 @@ fn is_secure_scheme(url: &Url) -> bool {
     matches!(url.scheme(), "https" | "wss")
 }
 
+/// RFC 6265bis §5.1 "secure" request: a secure scheme, or a loopback host the user agent trusts as one.
+fn is_secure_origin(url: &Url) -> bool {
+    if is_secure_scheme(url) {
+        return true;
+    }
+    match request_host(url) {
+        Some(h) => h == "localhost" || h.ends_with(".localhost") || h == "[::1]" || h.starts_with("127."),
+        None => false,
+    }
+}
+
+/// RFC 6265bis §4.1.3 cookie name prefixes (matched ASCII case-insensitively, as §5.7 step 19 does).
+fn prefix_ok(p: &ParsedSetCookie, secure_origin: bool) -> bool {
+    let n = p.name.as_bytes();
+    let has = |pre: &str| n.len() >= pre.len() && n[..pre.len()].eq_ignore_ascii_case(pre.as_bytes());
+    if has("__Secure-") && !(p.secure && secure_origin) {
+        return false;
+    }
+    if has("__Host-") && !(p.secure && secure_origin && p.domain.is_none() && p.path.as_deref() == Some("/")) {
+        return false;
+    }
+    true
+}
+
 // ---------------------------------------------------------------- §5.3 / §5.4 the jar
 
 /// A cookie store. `http` on each call says whether the caller is an HTTP API (Set-Cookie / Cookie) or a
@@ -308,8 +362,30 @@ impl CookieJar {
 
     /// §5.3 for one Set-Cookie value received from `url` at `now`. Returns whether a cookie was stored.
     pub fn set_cookie(&mut self, url: &Url, header: &str, now: i64, http: bool) -> bool {
+        self.set_cookie_in(url, header, now, http, &CookieContext::default())
+    }
+
+    /// [`set_cookie`](Self::set_cookie) for a request in `ctx` (RFC 6265bis §5.7 with SameSite and CHIPS).
+    pub fn set_cookie_in(&mut self, url: &Url, header: &str, now: i64, http: bool, ctx: &CookieContext) -> bool {
         let Some(p) = parse_set_cookie(header) else { return false };
         let Some(host) = request_host(url) else { return false };
+        let secure_origin = is_secure_origin(url);
+        if p.secure && !secure_origin {
+            return false;
+        }
+        if !prefix_ok(&p, secure_origin) {
+            return false;
+        }
+        if p.same_site == Some(SameSite::None) && !p.secure {
+            return false;
+        }
+        if ctx.cross_site && p.same_site != Some(SameSite::None) && !ctx.top_level_navigation {
+            return false;
+        }
+        if p.partitioned && !p.secure {
+            return false;
+        }
+        let partition = if p.partitioned { ctx.partition.clone() } else { None };
         let (persistent, expiry) = match (p.max_age, p.expires) {
             (Some(ma), _) => (true, if ma <= 0 { EARLIEST } else { now.saturating_add(ma) }),
             (None, Some(e)) => (true, e),
@@ -336,9 +412,17 @@ impl CookieJar {
         if !http && p.http_only {
             return false;
         }
+        // §5.7 step 16: a non-secure origin may not shadow a Secure cookie of the same name.
+        if !p.secure && !secure_origin
+            && self.cookies.iter().any(|o| {
+                o.secure_only && o.name == p.name && (domain_match(&domain, &o.domain) || domain_match(&o.domain, &domain)) && path_match(&path, &o.path)
+            })
+        {
+            return false;
+        }
         let mut creation = self.seq;
         self.seq += 1;
-        if let Some(i) = self.cookies.iter().position(|o| o.name == p.name && o.domain == domain && o.path == path) {
+        if let Some(i) = self.cookies.iter().position(|o| o.name == p.name && o.domain == domain && o.path == path && o.partition == partition) {
             if self.cookies[i].http_only && !http {
                 return false;
             }
@@ -358,6 +442,7 @@ impl CookieJar {
             secure_only: p.secure,
             http_only: p.http_only,
             same_site: p.same_site,
+            partition,
         };
         let live = c.expiry > now;
         if live {
@@ -369,16 +454,29 @@ impl CookieJar {
 
     /// §5.4: the Cookie header value for a request to `url` at `now`, or `None` when no cookie applies.
     pub fn cookie_header(&mut self, url: &Url, now: i64, http: bool) -> Option<String> {
+        self.cookie_header_in(url, now, http, &CookieContext::default())
+    }
+
+    /// [`cookie_header`](Self::cookie_header) for a request in `ctx` (RFC 6265bis §5.8.3 SameSite, with an
+    /// unspecified SameSite enforced as `Lax`; partitioned cookies only under their partition).
+    pub fn cookie_header_in(&mut self, url: &Url, now: i64, http: bool, ctx: &CookieContext) -> Option<String> {
         self.cookies.retain(|o| o.expiry > now);
         let host = request_host(url)?;
         let path = url.pathname();
         let path = if path.is_empty() { "/".to_string() } else { path };
-        let secure = is_secure_scheme(url);
+        let secure = is_secure_origin(url);
         let mut hits: Vec<usize> = (0..self.cookies.len())
             .filter(|&i| {
                 let c = &self.cookies[i];
                 let dom = if c.host_only { host == c.domain } else { domain_match(&host, &c.domain) };
-                dom && path_match(&path, &c.path) && (!c.secure_only || secure) && (!c.http_only || http)
+                let site_ok = !ctx.cross_site
+                    || match c.same_site {
+                        Some(SameSite::None) => true,
+                        Some(SameSite::Strict) => false,
+                        Some(SameSite::Lax) | None => ctx.top_level_navigation && ctx.safe_method,
+                    };
+                let part_ok = c.partition.is_none() || c.partition == ctx.partition;
+                dom && path_match(&path, &c.path) && (!c.secure_only || secure) && (!c.http_only || http) && site_ok && part_ok
             })
             .collect();
         if hits.is_empty() {
@@ -415,6 +513,40 @@ mod tests {
         assert_eq!(parse_cookie_date("Fri, 07 Aug 2007 08:04:19 GMT"), Some(1186473859));
         assert_eq!(parse_cookie_date("Feb 30 2021 00:00:00"), None);
         assert_eq!(parse_cookie_date("Jan 1 1600 00:00:00"), None);
+    }
+
+    #[test]
+    fn rfc6265bis_rules() {
+        let http = Url::parse("http://a.example/").unwrap();
+        let https = Url::parse("https://a.example/").unwrap();
+        let mut j = CookieJar::new();
+        let same = CookieContext::default();
+        assert!(!j.set_cookie(&http, "s=1; Secure", 0, true), "Secure from an insecure origin");
+        assert!(j.set_cookie(&https, "s=1; Secure", 0, true));
+        assert!(!j.set_cookie(&http, "s=2", 0, true), "leave secure cookies alone");
+        assert!(!j.set_cookie(&https, "__Secure-a=1", 0, true));
+        assert!(j.set_cookie(&https, "__Secure-a=1; Secure", 0, true));
+        assert!(!j.set_cookie(&https, "__Host-b=1; Secure; Path=/; Domain=a.example", 0, true));
+        assert!(j.set_cookie(&https, "__Host-b=1; Secure; Path=/", 0, true));
+        assert!(!j.set_cookie(&https, "n=1; SameSite=None", 0, true));
+        let cross = CookieContext { cross_site: true, safe_method: true, ..Default::default() };
+        assert!(!j.set_cookie_in(&https, "lax=1", 0, true, &cross), "Lax-by-default refuses a cross-site set");
+        assert!(j.set_cookie_in(&https, "none=1; SameSite=None; Secure", 0, true, &cross));
+        assert!(j.set_cookie(&https, "strict=1; SameSite=Strict", 0, true));
+        assert!(j.set_cookie(&https, "dflt=1", 0, true));
+        let got = j.cookie_header_in(&https, 0, true, &cross).unwrap();
+        assert!(got.contains("none=1") && !got.contains("strict=1") && !got.contains("dflt=1"));
+        let nav = CookieContext { cross_site: true, top_level_navigation: true, safe_method: true, partition: None };
+        let got = j.cookie_header_in(&https, 0, true, &nav).unwrap();
+        assert!(got.contains("dflt=1") && !got.contains("strict=1"));
+        assert!(j.cookie_header_in(&https, 0, true, &same).unwrap().contains("strict=1"));
+        let top_a = CookieContext { partition: Some("https://top-a.example".into()), ..Default::default() };
+        let top_b = CookieContext { partition: Some("https://top-b.example".into()), ..Default::default() };
+        let mut p = CookieJar::new();
+        assert!(!p.set_cookie_in(&https, "chip=1; Partitioned", 0, true, &top_a), "Partitioned requires Secure");
+        assert!(p.set_cookie_in(&https, "chip=1; Secure; Partitioned; SameSite=None", 0, true, &top_a));
+        assert!(p.cookie_header_in(&https, 0, true, &top_a).is_some());
+        assert!(p.cookie_header_in(&https, 0, true, &top_b).is_none());
     }
 
     #[test]

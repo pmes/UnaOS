@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_core::host::{self, Agent, AgentConfig, Event, EventSink, Next};
-pub use http_core::cookie::CookieJar;
+pub use http_core::cookie::{CookieContext, CookieJar};
 pub use http_core::headers::Headers;
 pub use http_core::url::Url;
 

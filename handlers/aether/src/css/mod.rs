@@ -1634,7 +1634,7 @@ fn cascade_document(
     let mut root_customs = BTreeMap::new();
     for id in doc.descendants(html_core::Document::ROOT) {
         let Some(el) = doc.element(id) else { continue };
-        let inline = el.attr("style").map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
+        let inline = el.attr("style").filter(|t| crate::security::csp::allow_style_attr(t)).map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
         let me_el = crate::dom::El::new(doc, id);
         let filter = doc.parent_element(id).and_then(|p| child_filter.get(&p)).copied().unwrap_or_default();
         let applied = css_core::cascade::cascade_filtered(rules, &me_el, &inline, None, Some(&filter));

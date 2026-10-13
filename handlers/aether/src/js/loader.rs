@@ -233,12 +233,16 @@ fn inline_text(el: usize) -> String {
     })
 }
 
-/// Fetches an external script's source: the page's pre-fetched set first, then the network/disk.
-fn fetch_source(url: &str) -> Result<String, String> {
+/// Fetches an external script's source: the page's pre-fetched set first, then the network/disk (with the
+/// element's `crossorigin` and `integrity`, AETHERORIGIN SR86; a pre-fetched source has its integrity
+/// checked by the caller).
+fn fetch_source(url: &str, el: usize, kind: ScriptKind) -> Result<String, String> {
     if let Some(s) = page(|p| p.script_sources.get(url).cloned()) {
         return Ok(s);
     }
-    let r = super::host::fetch_script_text(url);
+    let crossorigin = attr_value(el, "crossorigin");
+    let integrity = attr_value(el, "integrity").unwrap_or_default();
+    let r = super::host::fetch_script(url, kind == ScriptKind::Module, crossorigin.as_deref(), &integrity);
     if let Err(e) = &r {
         crate::ledger::record_js(&format!("script-fetch-failed:{}", super::clip(url, 48)));
         if std::env::var("UNAOS_JSDEBUG").is_ok() {
@@ -340,9 +344,28 @@ fn spin_event_loop(vm: &mut Vm) {
 /// Fetches (when needed) and executes a prepared script, firing `load`/`error` for external ones.
 fn run_script_now(vm: &mut Vm, el: usize) {
     let Some(mut rec) = SCRIPTS.with(|s| s.borrow().get(&el).cloned()) else { return };
+    // AETHERORIGIN (SR86): the document's policies are (re)read and the page half armed before any script
+    // runs; then CSP (inline: nonce/hash/'unsafe-inline'; external: the pre-request check) and mixed content
+    // gate the element — a refused external script fires `error`, a refused inline one simply never runs.
+    crate::security::csp::arm(vm);
+    let gate_parser_inserted = page(|p| p.parser_inserted.contains(&el));
+    let inline_src = if rec.external { None } else { rec.source.as_ref().and_then(|r| r.as_ref().ok()).cloned() };
+    if !crate::security::script_allowed(el, rec.url.as_deref().filter(|_| rec.external), inline_src.as_deref(), gate_parser_inserted) {
+        crate::security::csp::arm(vm);
+        if rec.external {
+            super::events::fire_simple(vm, TargetKey::Node(el), "error", false, false);
+        }
+        return;
+    }
     if rec.source.is_none() {
         rec.source = Some(match &rec.url {
-            Some(u) => fetch_source(u),
+            Some(u) => fetch_source(u, el, rec.kind).and_then(|text| {
+                // SRI on the text (a pre-fetched source included); eligible when same-origin or CORS-mode.
+                let eligible = attr_value(el, "crossorigin").is_some()
+                    || rec.kind == ScriptKind::Module
+                    || crate::security::origin::Origin::of(u).same_origin(&crate::security::origin::Origin::of(&super::page_url()));
+                if crate::security::script_integrity_ok(el, u, &text, eligible) { Ok(text) } else { Err("integrity".into()) }
+            }),
             None => Err("unresolvable script URL".into()),
         });
         SCRIPTS.with(|s| s.borrow_mut().insert(el, rec.clone()));
