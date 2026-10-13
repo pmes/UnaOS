@@ -36,7 +36,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering as CmpOrd;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::{fill, join, mtime_field, size_field, text, theme, DirEnt, Geom, Model, NodeKind, Rect, VfsTime, MODEL, PAD};
 use crate::fs::vfs::{AttrValue, MountTable, VfsError, KERNEL_PRINCIPAL};
@@ -175,6 +175,9 @@ pub struct RowMeta {
     pub origin: Option<String>,
     /// ATTRCOLUMNS (B402): this row's value for each of the folder's attribute columns, in view order.
     pub cells: Vec<super::attrcols::Cell>,
+    /// QUARRYIO (B660): not yet read for the current listing — the facts pass fills it; the painter draws what is
+    /// here (the previous listing's facts for the same name, else `...`).
+    pub pending: bool,
 }
 
 /// The column state beside the model.
@@ -185,6 +188,8 @@ pub struct ColState {
     pub widths: Widths,
     pub trash: bool,
     loaded: bool,
+    /// QUARRYIO (B660): the folder `meta` was built for (a relist of the same folder keeps its facts on the glass).
+    dir: String,
 }
 
 pub static COLS: crate::sync::Mutex<ColState> = crate::sync::Mutex::new(ColState {
@@ -194,6 +199,7 @@ pub static COLS: crate::sync::Mutex<ColState> = crate::sync::Mutex::new(ColState
     widths: DEFAULT_WIDTHS,
     trash: false,
     loaded: false,
+    dir: String::new(),
 });
 
 /// A change to persist on the next service pass.
@@ -221,6 +227,7 @@ fn load(st: &mut ColState) {
 /// Write the widths and the sort (only changed keys are re-saved by `prefs::set`). Quarry's service
 /// pass — chained from `live::service`, never from a router.
 pub fn service() {
+    facts_pass(); // QUARRYIO (B660): the listing's facts, a few rows a pass, read with no Quarry lock held
     super::attrcols::service(); // ATTRCOLUMNS (B402): the listed folder's facts, a few files a pass
     super::folderview::service(); // FOLDERVIEW (B424): the View menu's latch, the window frame, the folder's latched view write
     if !PERSIST.swap(false, Ordering::AcqRel) {
@@ -359,6 +366,7 @@ fn listing_mime(mt: &MountTable, path: &str, e: &DirEnt, attrs: bool, sniffs: &m
 
 /// Is `cwd` the session user's Trash? SMALLFIX4 (TRASHCORE fold): the ONE rule, `trash_core::is_trash_folder`.
 pub fn is_trash(cwd: &str) -> bool {
+    io_note(); // QUARRYIO (B660): the mount table is a probe
     trash_core::is_trash_folder(&crate::fs::trash::Mt(crate::shell::vfs_mount_table()), cwd, &crate::fs::trash::home_base())
 }
 
@@ -368,23 +376,33 @@ pub fn compute_meta(mt: &MountTable, cwd: &str, list: &[DirEnt], origins: &[(Str
     let attrs = !matches!(mt.list_attrs(cwd, KERNEL_PRINCIPAL), Err(VfsError::Unsupported));
     let mut sniffs = 0usize;
     let mut names: Vec<(String, String)> = Vec::new();
-    let mut out = Vec::with_capacity(list.len());
-    for e in list {
-        let path = join(cwd, &e.name);
-        let mime = listing_mime(mt, &path, e, attrs, &mut sniffs);
-        if mime == crate::fs::filetype::UNAOS_ELF { let _ = crate::fs::appres::sight_in(mt, &path); } // APPRES (B398): first sight of a program in a listing
-        let type_name = match names.iter().find(|(m, _)| *m == mime) {
-            Some((_, n)) => n.clone(),
-            None => {
-                let n = crate::fs::assoc::name_of_in(mt, &mime);
-                names.push((mime.clone(), n.clone()));
-                n
-            }
-        };
-        let origin = origins.iter().find(|(n, _)| n.eq_ignore_ascii_case(&e.name)).map(|(_, o)| o.clone());
-        out.push(RowMeta { name: e.name.clone(), mime, type_name, origin, cells: Vec::new() });
-    }
-    out
+    list.iter().map(|e| row_meta(mt, cwd, e, attrs, &mut sniffs, &mut names, origins)).collect()
+}
+
+/// One row's facts — I/O: the `una:type` attribute, the sniff, APPRES's first sight of a program, the registry's type
+/// name (`names` caches those per listing; `sniffs` counts toward [`SNIFF_CAP`]). QUARRYIO (B660): called only with
+/// no Quarry lock held ([`facts_pass`]) or off the window (the fixtures).
+fn row_meta(mt: &MountTable, cwd: &str, e: &DirEnt, attrs: bool, sniffs: &mut usize, names: &mut Vec<(String, String)>, origins: &[(String, String)]) -> RowMeta {
+    let path = join(cwd, &e.name);
+    let mime = listing_mime(mt, &path, e, attrs, sniffs);
+    if mime == crate::fs::filetype::UNAOS_ELF { let _ = crate::fs::appres::sight_in(mt, &path); } // APPRES (B398): first sight of a program in a listing
+    let type_name = match names.iter().find(|(m, _)| *m == mime) {
+        Some((_, n)) => n.clone(),
+        None => {
+            let n = crate::fs::assoc::name_of_in(mt, &mime);
+            names.push((mime.clone(), n.clone()));
+            n
+        }
+    };
+    let origin = origins.iter().find(|(n, _)| n.eq_ignore_ascii_case(&e.name)).map(|(_, o)| o.clone());
+    RowMeta { name: e.name.clone(), mime, type_name, origin, cells: Vec::new(), pending: false }
+}
+
+/// A row whose facts are not read yet (pure): a folder is a folder, a known extension names its type; the rest waits.
+pub(super) fn pending_row(e: &DirEnt) -> RowMeta {
+    use crate::fs::filetype as ft;
+    let mime = if matches!(e.kind, NodeKind::Dir) { ft::DIRECTORY } else { ft::by_extension(&e.name).unwrap_or("") };
+    RowMeta { name: e.name.clone(), mime: String::from(mime), type_name: String::new(), origin: None, cells: Vec::new(), pending: true }
 }
 
 fn time_key(t: Option<&VfsTime>) -> (u16, u8, u8, u8, u8, u8) {
@@ -437,46 +455,364 @@ pub fn sort_rows(list: &mut Vec<DirEnt>, meta: &mut Vec<RowMeta>, key: SortKey, 
     }
 }
 
-/// Re-sort the model's list by the current key, keeping the selected ROW selected.
+/// Re-sort the model's list by the current key, keeping the selected ROW selected. No read: the expanded folders'
+/// children are the inline rows already listed (QUARRYIO B660).
 fn resort(m: &mut Model, st: &mut ColState) {
+    resort_with(m, st, &[]);
+}
+
+/// [`resort`] with the expanded folders' children read beforehand (`livedir::read_open`, before `COLS`).
+fn resort_with(m: &mut Model, st: &mut ColState, kids: &[(String, Vec<DirEnt>)]) {
     let sel = m.list.get(m.list_sel).map(|e| e.name.clone());
     match super::attrcols::sort_index() {
         Some(i) => super::attrcols::sort_rows_by(&mut m.list, &mut st.meta, i, st.desc), // ATTRCOLUMNS (B402)
         None => sort_rows(&mut m.list, &mut st.meta, st.key, st.desc),
     }
-    super::livedir::resplice(m, st); if let Some(n) = sel { // QUARRYLIVE (B494): the expanded folders' children, back under their parents after every sort
+    super::livedir::resplice(m, st, kids); if let Some(n) = sel { // QUARRYLIVE (B494): the expanded folders' children, back under their parents after every sort
         if let Some(i) = m.list.iter().position(|e| e.name == n) {
             m.list_sel = i;
         }
     }
 }
 
-/// `Model::show`'s tail: derive the facts for the new listing and apply the sort. Inside the model
-/// lock (the listing itself was read there too).
+/// `Model::show`'s tail: install the new listing's facts as PENDING and apply the sort. Inside the model lock (the
+/// listing itself was read there). QUARRYIO (B660): the folder-level reads (the Trash test, FOLDERVIEW's resolve,
+/// the expanded folders' children) happen BEFORE `COLS` is taken; the per-row facts are read by [`facts_pass`] on the
+/// service pass with no Quarry lock held. `COLS` is never held across a read.
 pub(super) fn after_show(m: &mut Model) {
+    let trash = is_trash(&m.cwd);
+    super::folderview::enter(&m.cwd); // FOLDERVIEW (B424): a new folder resolves its own view (own, inherited, default) — reads first, COLS only to apply
+    let kids = super::livedir::read_open(m); // QUARRYLIVE (B494): the expanded folders' children, read before COLS
+    let epoch = EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
     let mut st = COLS.lock();
     load(&mut st);
-    st.trash = is_trash(&m.cwd);
-    super::folderview::enter(&m.cwd, &mut st); // FOLDERVIEW (B424): a new folder resolves its own view (own, inherited, default)
+    st.trash = trash;
+    let old = if st.dir == m.cwd { core::mem::take(&mut st.meta) } else { Vec::new() };
+    st.dir = m.cwd.clone();
+    st.meta = seed(&m.list, &old);
     if m.list.is_empty() {
-        st.meta.clear();
+        FACTS_POSTED.store(false, Ordering::Release);
         return;
     }
-    let mt = crate::shell::vfs_mount_table();
-    let origins: Vec<(String, String)> = if st.trash {
-        crate::fs::trash::entries().into_iter().map(|e| (e.name, e.orig)).collect()
-    } else {
-        Vec::new()
-    };
-    st.meta = compute_meta(&mt, &m.cwd, &m.list, &origins);
-    super::attrcols::after_meta(&mt, &m.cwd, &m.list, &mut st.meta); // ATTRCOLUMNS (B402): the folder's attribute columns and their cells
-    super::folderview::after_attrs(); // FOLDERVIEW (B424): the folder's attribute-column sort, once its keys are read
     let st = &mut *st;
-    resort(m, st);
-    let typed = st.meta.iter().filter(|r| r.mime != crate::fs::filetype::OCTET).count();
+    resort_with(m, st, &kids);
+    *FACTS.lock() = Facts { epoch, t0: crate::arch::ms(), passes: 0, ..Facts::EMPTY };
+    FACTS_POSTED.store(true, Ordering::Release);
+}
+
+/// The new listing's facts: the previous listing's for the same name (marked pending — a relist keeps its types on
+/// the glass while they are re-read), else a pending row. Pure.
+fn seed(list: &[DirEnt], old: &[RowMeta]) -> Vec<RowMeta> {
+    list.iter()
+        .map(|e| match old.iter().find(|o| o.name == e.name) {
+            Some(o) => RowMeta { pending: true, ..o.clone() },
+            None => pending_row(e),
+        })
+        .collect()
+}
+
+// ── QUARRYIO (B660): the facts pass ─────────────────────────────────────────────────────────────
+
+/// Rows whose facts one service pass reads (ATTRCOLUMNS' refresh takes the same bite, `attrcols::PER_PASS`).
+const FACTS_PER_PASS: usize = 4;
+/// Service passes the fixture runs at most to drain a listing's facts.
+const FACTS_PASS_CAP: usize = 64;
+
+/// The listing epoch: bumped by every [`after_show`]; a pass's reads install only into the epoch they were taken in.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Up while a listed row's facts may be pending (raised by [`after_show`] and `livedir::resplice`; lowered by the
+/// pass that finds none).
+pub(super) static FACTS_POSTED: AtomicBool = AtomicBool::new(false);
+
+/// One listing's folder-level context, read once per epoch by the pass (never across a read: a leaf lock).
+struct Facts {
+    epoch: u64,
+    /// The context is read for `epoch` (the next fields are valid).
+    ready: bool,
+    cwd: String,
+    attrs: bool,
+    origins: Vec<(String, String)>,
+    names: Vec<(String, String)>,
+    keys: Vec<String>,
+    sniffs: usize,
+    scanned: usize,
+    t0: u64,
+    passes: usize,
+}
+
+impl Facts {
+    const EMPTY: Facts = Facts {
+        epoch: 0,
+        ready: false,
+        cwd: String::new(),
+        attrs: false,
+        origins: Vec::new(),
+        names: Vec::new(),
+        keys: Vec::new(),
+        sniffs: 0,
+        scanned: 0,
+        t0: 0,
+        passes: 0,
+    };
+}
+
+static FACTS: crate::sync::Mutex<Facts> = crate::sync::Mutex::new(Facts::EMPTY);
+
+/// Quarry's facts pass. Snapshot (MODEL → COLS, no I/O) up to [`FACTS_PER_PASS`] pending rows, release every Quarry
+/// lock, read, then re-take MODEL → COLS → ATTRS and install by name into the same epoch. The pass that leaves
+/// nothing pending applies FOLDERVIEW's attribute sort, re-sorts and prints the listing line. `true` = it read.
+pub(super) fn facts_pass() -> bool {
+    if !FACTS_POSTED.load(Ordering::Acquire) {
+        return false;
+    }
+    // 1. Snapshot: what is pending, in which folder and epoch. No read.
+    let (epoch, cwd, trash, rows, files) = {
+        let g = MODEL.lock();
+        let Some(m) = g.as_ref() else {
+            FACTS_POSTED.store(false, Ordering::Release);
+            return false;
+        };
+        let st = COLS.lock();
+        let epoch = EPOCH.load(Ordering::Acquire);
+        let rows: Vec<DirEnt> = m
+            .list
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| st.meta.get(*i).map_or(true, |mm| mm.name != e.name || mm.pending))
+            .map(|(_, e)| e.clone())
+            .take(FACTS_PER_PASS)
+            .collect();
+        let need_ctx = { let f = FACTS.lock(); f.epoch != epoch || !f.ready };
+        let files: Option<Vec<DirEnt>> = need_ctx.then(|| m.list.iter().filter(|e| !e.name.contains('/')).cloned().collect());
+        (epoch, m.cwd.clone(), st.trash, rows, files)
+    };
+    // 2. The reads, with NO Quarry lock held.
+    let _svc = ServiceMark::new();
+    let mt = crate::shell::vfs_mount_table();
+    io_note();
+    if let Some(files) = files {
+        let attrs = !matches!(mt.list_attrs(&cwd, KERNEL_PRINCIPAL), Err(VfsError::Unsupported));
+        let origins: Vec<(String, String)> = if trash {
+            crate::fs::trash::entries().into_iter().map(|e| (e.name, e.orig)).collect()
+        } else {
+            Vec::new()
+        };
+        let keys = super::attrcols::begin(&mt, &cwd, attrs, &files); // ATTRCOLUMNS (B402): the folder's `una:view` and its refresh queue
+        let mut f = FACTS.lock();
+        let (t0, passes) = if f.epoch == epoch { (f.t0, f.passes) } else { (crate::arch::ms(), 0) };
+        *f = Facts { epoch, ready: true, cwd: cwd.clone(), attrs, origins, names: Vec::new(), keys, sniffs: 0, scanned: 0, t0, passes };
+    }
+    let (attrs, origins, mut names, keys, mut sniffs, scanned) = {
+        let f = FACTS.lock();
+        if f.epoch != epoch || f.cwd != cwd {
+            return false; // a newer listing took the context; its own pass reads
+        }
+        (f.attrs, f.origins.clone(), f.names.clone(), f.keys.clone(), f.sniffs, f.scanned)
+    };
+    let mut got: Vec<RowMeta> = Vec::with_capacity(rows.len());
+    for e in rows.iter() {
+        io_note();
+        got.push(row_meta(&mt, &cwd, e, attrs, &mut sniffs, &mut names, &origins));
+    }
+    let take = rows.len().min(super::attrcols::SCAN_CAP.saturating_sub(scanned));
+    let avail = if attrs && take > 0 { super::attrcols::scan(&mt, &cwd, &rows[..take], &keys, &mut got[..take]) } else { Vec::new() };
+    {
+        let mut f = FACTS.lock();
+        if f.epoch == epoch {
+            f.names = names;
+            f.sniffs = sniffs;
+            f.scanned = scanned + take;
+            f.passes += 1;
+        }
+    }
+    drop(_svc);
+    // 3. Install, by name, into the same epoch. No read.
+    let mut g = MODEL.lock();
+    let Some(m) = g.as_mut() else { return true };
+    let mut st = COLS.lock();
+    if EPOCH.load(Ordering::Acquire) != epoch || m.cwd != cwd {
+        return true; // the folder moved under the read: the new listing's pending rows are read by the next pass
+    }
+    if st.meta.len() != m.list.len() {
+        let old = core::mem::take(&mut st.meta);
+        st.meta = seed(&m.list, &old);
+    }
+    for r in got.into_iter() {
+        if let Some(i) = m.list.iter().position(|e| e.name == r.name) {
+            if let Some(slot) = st.meta.get_mut(i) {
+                *slot = r;
+            }
+        }
+    }
+    super::attrcols::merge_avail(&cwd, avail);
+    let left = st.meta.iter().zip(m.list.iter()).filter(|(mm, e)| mm.pending || mm.name != e.name).count();
+    if left == 0 {
+        FACTS_POSTED.store(false, Ordering::Release);
+        super::folderview::after_attrs(); // FOLDERVIEW (B424): the folder's attribute-column sort, once its keys are read
+        let st = &mut *st;
+        resort(m, st);
+        let typed = st.meta.iter().filter(|r| r.mime != crate::fs::filetype::OCTET).count();
+        let (n_or, passes, ms) = { let f = FACTS.lock(); (f.origins.len(), f.passes, crate::arch::ms().saturating_sub(f.t0)) };
+        serial_println!(
+            "[quarry2] list cwd={} rows={} typed={} trash={} origins={} sort={} desc={}",
+            m.cwd, m.list.len(), typed, st.trash as u8, n_or, st.key.name(), st.desc as u8
+        );
+        serial_println!("[quarryio] facts dir={} rows={} passes={} ms={} (read on the service pass, no Quarry lock held)", m.cwd, m.list.len(), passes, ms);
+    }
+    drop(st);
+    drop(g);
+    super::repaint();
+    true
+}
+
+/// Rows still pending in the open window (the fixture's count).
+fn pending_now() -> usize {
+    let g = MODEL.lock();
+    let Some(m) = g.as_ref() else { return 0 };
+    let st = COLS.lock();
+    m.list.iter().enumerate().filter(|(i, e)| st.meta.get(*i).map_or(true, |mm| mm.pending || mm.name != e.name)).count()
+}
+
+// ── QUARRYIO (B660): the read witness ───────────────────────────────────────────────────────────
+
+/// The task inside `repaint` (`current_id + 1`; 0 = none) and the task inside [`facts_pass`]'s reads.
+static PAINTER: AtomicU64 = AtomicU64::new(0);
+static SERVICER: AtomicU64 = AtomicU64::new(0);
+/// Reads at Quarry's seams: inside a paint, inside the facts pass, elsewhere (the listing's own read).
+static IO_PAINT: AtomicUsize = AtomicUsize::new(0);
+static IO_SERVICE: AtomicUsize = AtomicUsize::new(0);
+static IO_OTHER: AtomicUsize = AtomicUsize::new(0);
+/// The most Quarry locks held at a read, and the reads that found `COLS` held.
+static HOLDS_MAX: AtomicUsize = AtomicUsize::new(0);
+static COLS_IN_IO: AtomicUsize = AtomicUsize::new(0);
+
+fn here() -> u64 {
+    crate::arch::sched::current_id().map_or(u64::MAX, |t| t + 1)
+}
+
+/// `repaint`'s bracket: this task is painting while the guard lives.
+pub(super) struct PaintMark;
+impl PaintMark {
+    pub(super) fn new() -> PaintMark {
+        PAINTER.store(here(), Ordering::Release);
+        PaintMark
+    }
+}
+impl Drop for PaintMark {
+    fn drop(&mut self) {
+        PAINTER.store(0, Ordering::Release);
+    }
+}
+
+struct ServiceMark;
+impl ServiceMark {
+    fn new() -> ServiceMark {
+        SERVICER.store(here(), Ordering::Release);
+        ServiceMark
+    }
+}
+impl Drop for ServiceMark {
+    fn drop(&mut self) {
+        SERVICER.store(0, Ordering::Release);
+    }
+}
+
+/// Is the calling task inside Quarry's paint?
+pub(super) fn painting() -> bool {
+    PAINTER.load(Ordering::Acquire) == here()
+}
+
+/// One read at a Quarry seam (a directory read, a facts row, a folder-level read): counted by where it ran and by
+/// the Quarry locks held at it (`is_locked` is global — see the fixture's honest limit).
+pub(super) fn io_note() {
+    let me = here();
+    if PAINTER.load(Ordering::Acquire) == me {
+        IO_PAINT.fetch_add(1, Ordering::Relaxed);
+    } else if SERVICER.load(Ordering::Acquire) == me {
+        IO_SERVICE.fetch_add(1, Ordering::Relaxed);
+    } else {
+        IO_OTHER.fetch_add(1, Ordering::Relaxed);
+    }
+    let cols = COLS.is_locked();
+    let holds = MODEL.is_locked() as usize + cols as usize + super::attrcols::ATTRS.is_locked() as usize;
+    HOLDS_MAX.fetch_max(holds, Ordering::Relaxed);
+    if cols {
+        COLS_IN_IO.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `tests quarryio` — open Quarry on a scratch folder under the home (five files: three typed by name, two by their
+/// bytes), drain the facts on the service pass, then paint [`QIO_PAINTS`] times, counting the reads at Quarry's seams.
+/// `:: QUARRYIO: paints=<n> io_in_paint=0 io_in_service=<n> holds_max=<n> cols_in_io=0 pending=0 -> PASS ::`.
+const QIO_PAINTS: usize = 8;
+pub fn quarryio_selftest() {
+    use crate::fs::vfs::KERNEL_PRINCIPAL as P;
+    let t = crate::shell::vfs_mount_table();
+    let base = super::ops::home_dir();
+    let dir = join(&base, "QIOTMP");
+    let _ = super::ops::op_delete(&dir);
+    if super::ops::op_mkdir(&dir).is_err() {
+        serial_println!(":: QUARRYIO: base={} reason=mkdir -> SKIP ::", base);
+        return;
+    }
+    let files: [(&str, &[u8]); 5] = [
+        ("A.MD", b"# QUARRYIO\n"),
+        ("B.TXT", b"plain\n"),
+        ("C.JSON", b"{\"k\":1}\n"),
+        ("DNOTE", b"# sniffed markdown\n- row\n"),
+        ("EJSON", b"{\"sniffed\":true}\n"),
+    ];
+    for (n, body) in files.iter() {
+        let p = join(&dir, n);
+        let _ = t.create(&p, NodeKind::File, P).and_then(|_| t.write(&p, 0, body, P));
+    }
+    let was_open = super::is_open();
+    if !super::open_at(&dir) {
+        let _ = super::ops::op_delete(&dir);
+        serial_println!(":: QUARRYIO: reason=no-window -> SKIP ::");
+        return;
+    }
+    for c in [&IO_PAINT, &IO_SERVICE, &IO_OTHER, &HOLDS_MAX, &COLS_IN_IO] {
+        c.store(0, Ordering::Relaxed);
+    }
+    // A fresh listing of the folder AFTER the counters reset, so its facts are read inside the count (by this task's
+    // passes below, or by the render task's own service pass — both are the service pass).
+    if let Some(m) = MODEL.lock().as_mut() {
+        let c = m.cwd.clone();
+        m.invalidate();
+        m.show(&c);
+    }
+    let pend0 = pending_now();
+    let mut passes = 0usize;
+    while pending_now() > 0 && passes < FACTS_PASS_CAP {
+        if !facts_pass() && !FACTS_POSTED.load(Ordering::Acquire) {
+            break;
+        }
+        passes += 1;
+    }
+    let pending = pending_now();
+    let p0 = super::PAINTS.load(Ordering::Relaxed);
+    for _ in 0..QIO_PAINTS {
+        super::repaint();
+    }
+    let paints = super::PAINTS.load(Ordering::Relaxed).saturating_sub(p0);
+    let (in_paint, in_svc, other) = (IO_PAINT.load(Ordering::Relaxed), IO_SERVICE.load(Ordering::Relaxed), IO_OTHER.load(Ordering::Relaxed));
+    let (holds, cols) = (HOLDS_MAX.load(Ordering::Relaxed), COLS_IN_IO.load(Ordering::Relaxed));
+    let typed = {
+        let g = MODEL.lock();
+        let st = COLS.lock();
+        g.as_ref().map_or(0, |m| m.list.iter().zip(st.meta.iter()).filter(|(e, mm)| mm.name == e.name && !mm.pending && !mm.type_name.is_empty()).count())
+    };
+    if was_open {
+        let _ = super::open_at(&base);
+    } else {
+        super::close();
+    }
+    let _ = super::ops::op_delete(&dir);
+    let ok = in_paint == 0 && in_svc > 0 && cols == 0 && pending == 0 && paints >= QIO_PAINTS;
     serial_println!(
-        "[quarry2] list cwd={} rows={} typed={} trash={} origins={} sort={} desc={}",
-        m.cwd, m.list.len(), typed, st.trash as u8, origins.len(), st.key.name(), st.desc as u8
+        ":: QUARRYIO: paints={} io_in_paint={} io_in_service={} holds_max={} cols_in_io={} pending={} -> {} :: dir={} passes={} pending_at_open={} typed={} io_other={}",
+        paints, in_paint, in_svc, holds, cols, pending, if ok { "PASS" } else { "FAIL" }, dir, passes, pend0, typed, other
     );
 }
 
@@ -635,7 +971,7 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
                     }
                 }
                 Col::Modified => mtime_field(ent.mtime.as_ref()).into_bytes(),
-                Col::Type => clipped(meta.map(|mm| mm.type_name.as_str()).unwrap_or("-"), w),
+                Col::Type => clipped(meta.map(|mm| if mm.pending && mm.type_name.is_empty() { "..." } else { mm.type_name.as_str() }).unwrap_or("-"), w), // QUARRYIO (B660): a row not yet read paints as pending
                 Col::Origin => clipped(meta.and_then(|mm| mm.origin.as_deref()).unwrap_or("-"), w),
                 Col::Name => Vec::new(),
             };
@@ -671,7 +1007,7 @@ fn ent(name: &str, dir: bool, size: u64, min: u8) -> DirEnt {
 fn meta_of(list: &[DirEnt], ty: &[&str]) -> Vec<RowMeta> {
     list.iter()
         .zip(ty.iter())
-        .map(|(e, t)| RowMeta { name: e.name.clone(), mime: String::new(), type_name: String::from(*t), origin: None, cells: Vec::new() })
+        .map(|(e, t)| RowMeta { name: e.name.clone(), mime: String::new(), type_name: String::from(*t), origin: None, cells: Vec::new(), pending: false })
         .collect()
 }
 

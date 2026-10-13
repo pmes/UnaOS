@@ -24,13 +24,13 @@
 use super::columns::{Cols, RowMeta};
 use super::*;
 use crate::fs::attrfacts as af;
-use crate::fs::vfs::{AttrValue, MountTable, VfsError, KERNEL_PRINCIPAL};
+use crate::fs::vfs::{AttrValue, MountTable, KERNEL_PRINCIPAL};
 use alloc::collections::VecDeque;
 use core::cmp::Ordering as CmpOrd;
 use core::sync::atomic::AtomicBool;
 
 /// Rows whose attributes a listing reads (the folder's key set and the cells).
-const SCAN_CAP: usize = 256;
+pub(super) const SCAN_CAP: usize = 256;
 /// Files whose facts one service pass refreshes.
 const PER_PASS: usize = 4;
 
@@ -174,7 +174,7 @@ pub fn sort_rows_by(list: &mut Vec<DirEnt>, meta: &mut Vec<RowMeta>, i: usize, d
 }
 
 /// Read the rows' attributes (bounded): the folder's key set, and each row's cells for `keys`.
-fn scan(mt: &MountTable, dir: &str, list: &[DirEnt], keys: &[String], meta: &mut [RowMeta]) -> Vec<(String, &'static str)> {
+pub(super) fn scan(mt: &MountTable, dir: &str, list: &[DirEnt], keys: &[String], meta: &mut [RowMeta]) -> Vec<(String, &'static str)> {
     let mut avail: Vec<(String, &'static str)> = Vec::new();
     for (n, e) in list.iter().enumerate().take(SCAN_CAP) {
         let attrs = mt.list_attrs(&join(dir, &e.name), KERNEL_PRINCIPAL).unwrap_or_default();
@@ -191,23 +191,25 @@ fn scan(mt: &MountTable, dir: &str, list: &[DirEnt], keys: &[String], meta: &mut
     avail
 }
 
-/// `columns::after_show`'s tail: a new folder loads its `una:view` and queues its files' facts; every listing
-/// reads the key set and the cells. Nothing on a volume without attributes.
-pub fn after_meta(mt: &MountTable, cwd: &str, list: &[DirEnt], meta: &mut Vec<RowMeta>) {
+/// The facts pass's folder context (`columns::facts_pass`, once per listing, NO Quarry lock held — QUARRYIO B660):
+/// a new folder loads its `una:view` (read before `ATTRS` is taken) and queues its files' facts; every listing starts
+/// its key set afresh (the pass merges each bite's keys, [`merge_avail`]). Nothing on a volume without attributes
+/// (`attrs` = false). Returns the folder's chosen columns, for the cells.
+pub fn begin(mt: &MountTable, cwd: &str, attrs: bool, list: &[DirEnt]) -> Vec<String> {
+    let fresh = ATTRS.lock().dir != cwd;
+    let view = if fresh && attrs { Some(af::view_of(mt, cwd)) } else { None };
     let mut st = ATTRS.lock();
-    if st.dir != cwd {
+    if fresh {
         st.dir = String::from(cwd);
-        st.keys = af::view_of(mt, cwd);
+        st.keys = view.unwrap_or_default();
         st.sort = None;
-        st.avail.clear();
     }
-    if matches!(mt.list_attrs(cwd, KERNEL_PRINCIPAL), Err(VfsError::Unsupported)) {
+    st.avail.clear();
+    if !attrs {
         st.keys.clear();
-        st.avail.clear();
-        return;
+        return Vec::new();
     }
     let keys = st.keys.clone();
-    st.avail = scan(mt, cwd, list, &keys, meta);
     if st.queued_dir != cwd {
         st.queued_dir = String::from(cwd);
         st.pending.clear();
@@ -217,8 +219,26 @@ pub fn after_meta(mt: &MountTable, cwd: &str, list: &[DirEnt], meta: &mut Vec<Ro
         POSTED.settle(!st.pending.is_empty()); // SVCLATCH (B462)
     }
     if !keys.is_empty() {
-        serial_println!("[attrcols] view dir={} cols={} avail={}", cwd, keys.join(","), st.avail.len());
+        serial_println!("[attrcols] view dir={} cols={}", cwd, keys.join(","));
     }
+    keys
+}
+
+/// One facts bite's keys into the folder's key set (sorted), when the view is still `cwd`'s. No read.
+pub fn merge_avail(cwd: &str, part: Vec<(String, &'static str)>) {
+    if part.is_empty() {
+        return;
+    }
+    let mut st = ATTRS.lock();
+    if st.dir != cwd {
+        return;
+    }
+    for (k, t) in part {
+        if !st.avail.iter().any(|(a, _)| *a == k) {
+            st.avail.push((k, t));
+        }
+    }
+    st.avail.sort_by(|a, b| a.0.cmp(&b.0));
 }
 
 /// A file Quarry just opened: its facts first on the next service pass.

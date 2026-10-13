@@ -66,7 +66,11 @@ static WANT: spin::Mutex<Option<(String, usize, usize)>> = spin::Mutex::new(None
 /// The last `(panes, path)` the glass witness printed.
 static SAID: spin::Mutex<(usize, String)> = spin::Mutex::new((0, String::new()));
 
-/// A directory's rows, sorted and de-duplicated as the list pane sorts them by default.
+/// QUARRYIO (B660): listings the painter missed in [`LCACHE`], read on the next service pass.
+static WANT_LS: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// A directory's rows, sorted and de-duplicated as the list pane sorts them by default. QUARRYIO (B660): inside
+/// Quarry's paint it answers from the cache only — a miss paints the pane empty and is read on the service pass.
 fn listing(path: &str) -> Vec<(String, bool)> {
     let vgen = super::volume_gen();
     {
@@ -78,6 +82,13 @@ fn listing(path: &str) -> Vec<(String, bool)> {
         if let Some((_, r)) = c.1.iter().find(|(p, _)| p == path) {
             return r.clone();
         }
+    }
+    if super::columns::painting() {
+        let mut w = WANT_LS.lock();
+        if !w.iter().any(|p| p == path) {
+            w.push(String::from(path));
+        }
+        return Vec::new();
     }
     let rows: Vec<(String, bool)> = match super::collect(path) {
         Ok((true, mut rows)) => {
@@ -274,6 +285,13 @@ fn paint_preview(g: &Geom, px: &mut [u32], r: Rect, path: &str) {
 /// Quarry's service pass: render the latched preview card (Quick Look's renderer; I/O, never in the router), then
 /// repaint so the card shows.
 pub(super) fn service() {
+    let missed: Vec<String> = WANT_LS.try_lock().map(|mut g| core::mem::take(&mut *g)).unwrap_or_default();
+    if !missed.is_empty() {
+        for p in missed.iter() {
+            let _ = listing(p); // QUARRYIO (B660): the painter's misses, read here and cached
+        }
+        super::repaint();
+    }
     let Some((path, w, h)) = WANT.try_lock().and_then(|mut g| g.take()) else { return };
     if w == 0 || h == 0 {
         return;

@@ -568,6 +568,7 @@ static PAINTS: AtomicUsize = AtomicUsize::new(0);
 /// empty child list, so the root row could never grow one, and [`Model::new`]'s landing rule saw no
 /// candidates and stayed on `/`.
 fn collect(path: &str) -> Result<(bool, Vec<DirEnt>), String> {
+    columns::io_note(); // QUARRYIO (B660): every directory read Quarry makes passes here — the witness counts where it ran
     // VOLUMES (B366) M2: Peter's layout — the boot partition under Volumes only, and only its EFI tree.
     crate::shell::vfs_ls_collect(path).map(|(d, rows)| (d, if d { crate::fs::volumes::view(path, rows, crate::fs::volumes::boot_alias_bound()) } else { rows }))
 }
@@ -1856,6 +1857,7 @@ fn repaint() {
     if surf.is_empty() {
         return;
     }
+    let _paint = columns::PaintMark::new(); // QUARRYIO (B660): this task is painting until the surface is drawn (a read in here is `io_in_paint`)
     {
         // SMALLFIX4 (SECREVIEW F6): `surf` IS `w * h` ARGB8888 words (allocated by `open`, never resized), so
         // the view is a plain reborrow — the old `Vec<u8>`-as-`[u32]` cast leaned on an alignment Rust does not promise.
@@ -4696,6 +4698,7 @@ fn jobs_status_service() {
 pub fn quarry3_tests() {
     crate::tests::register("quarry3", quarry3_selftest); dragdrop::tests(); livedir::tests(); // DRAGDROP (B440): `tests dragdrop`
     millercols::register(); // COLUMNSVIEW (B436): `tests columnsview` rides this registration
+    crate::tests::register("quarryio", columns::quarryio_selftest); // QUARRYIO (B660): `tests quarryio` rides it too (no tests.rs line)
 }
 
 /// M6 — `tests quarry3`, over the live table and the test-f set:
