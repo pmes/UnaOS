@@ -476,3 +476,6 @@ refs/heads/exec-rmbp-qemuskip                 cb833ebb FOLDED-BY-HAND a487c4dc
 refs/heads/exec-rmbp-kvmlat                   cb833ebb FOLDED-BY-HAND d664a62b
 refs/heads/exec-rmbp-uireds26                 cb833ebb FOLDED-BY-HAND d3cc9c38
 refs/heads/exec-pi-piwm                       cb833ebb FOLDED-BY-HAND 23e68944
+refs/heads/exec-rmbp-bootverdicts2            37adc602 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-kvmlat2                  37adc602 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-pi-pispec                     37adc602 IN-FLIGHT cloud 2026-10-13
