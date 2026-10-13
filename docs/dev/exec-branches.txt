@@ -402,6 +402,6 @@ refs/heads/exec-rmbp-fbdirect                 e619ee8b FOLDED-BY-HAND 3fa13ea4 2
 refs/heads/exec-rmbp-pumpretry                b4fe61c6 FOLDED-BY-HAND c191e4dd 2026-10-13
 refs/heads/exec-rmbp-usbnetdhcp               4407688e FOLDED-BY-HAND 7dee4227 2026-10-13
 refs/heads/exec-rmbp-smallfix10               4a63aeff FOLDED-BY-HAND f55eaaab 2026-10-13
-refs/heads/exec-arm-apps                      fb31ed67 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-arm-apps                      d338dca4 FOLDED-BY-HAND 1440d4ad 2026-10-13
 refs/heads/exec-arm-sonde                     fb31ed67 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-arm-line                      b36b2193 FOLDED-BY-HAND 1f782366 2026-10-13
