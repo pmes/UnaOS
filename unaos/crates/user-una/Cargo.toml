@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# UNAMETAL (LEDGER SR90, R104): `APPS/UNA.ELF` — the Una IDE's UnaOS-native face, the Code layout (CODEX §4) as a
+# ring-3 program: one compositor window split three ways — a sidebar file tree (SYS_PATH_READ + PATH_R_LIST,
+# SYS_STAT), a centre editor over edit_core (Tabula's core, the one the host Tabula links, SR73), a bottom
+# console that is MIDDEN.ELF's loop over midden_core (copied into src/console.rs, the crate not linked). The
+# MIDDENTWIN shape (crates/user-midden, SR75): own workspace root, no_std/no_main, linked in the ELF window
+# (user-una-x86.ld), text through font_core::ui from the DejaVu faces on the volume with font8x8 as fallback.
+# The host Una (vessels/una, GTK) stays (R104).
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent workspace never builds
+# this no_std/no_main program for the host during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-una"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-una"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+
+# una-abi: the syscall numbers, the INPUT_EV_* layout, the window landmarks, UserStat, WHOAMI, the args page.
+# edit_core: the editor pane's buffer of record — piece table, cursors/selections, grouped undo, search (SR73).
+# midden_core: the console pane's shell core — Facts, plan, help, the ring-3 served set (default-features off).
+# vein_ring3: only its ring-3 plumbing — the syscall stub, the SYS_SBRK heap, `files::path_read` (MIDDEN.ELF's set).
+# font_core: the panes' text; font8x8: the grid when no face is on the volume.
+[dependencies]
+una-abi = { path = "../una-abi" }
+edit_core = { path = "../../libs/text/edit_core" }
+midden_core = { path = "../../libs/sys/midden_core", default-features = false }
+vein_ring3 = { path = "../../libs/sys/vein_ring3" }
+font_core = { path = "../../libs/text/font_core" }
+font8x8 = { version = "0.3.1", default-features = false }
