@@ -16,11 +16,16 @@ use crate::dom::NodeRef;
 use crate::AetherEngine;
 use html_core::NodeId;
 
-/// How the page was rendered, as the a11y rules need it: per element, its computed `display` and
-/// `visibility` (`css::computed_report`, the values layout and paint consumed). Without a layout tree the
-/// DOM alone decides (the `hidden` attribute and the never-rendered metadata elements).
+/// How the page was rendered, as the a11y rules need it: per element, whether layout gave it a box and
+/// whether that box is `display: none` (the taffy tree of `AetherEngine::layout_tree`), and its computed
+/// `display` and `visibility` (`css::computed_report`, the values layout and paint consumed). Without a
+/// layout tree the DOM alone decides (the `hidden` attribute and the never-rendered metadata elements).
 pub struct Rendering {
     report: Option<HashMap<NodeId, [String; 20]>>,
+    /// Every element that generated a layout box, and whether that box is `display: none` (its subtree
+    /// keeps boxes in the taffy tree but is not rendered). An element with no box is either inside a
+    /// subtree layout skipped (`hidden`, the metadata elements) or `display: contents`.
+    boxed: Option<HashMap<NodeId, bool>>,
 }
 
 /// `css::REPORT_PROPS` indexes.
@@ -33,12 +38,19 @@ const NEVER_RENDERED: [&str; 12] = ["head", "script", "style", "template", "titl
 impl Rendering {
     /// The engine's current rendering.
     pub fn of(engine: &AetherEngine) -> Self {
-        Rendering { report: engine.layout_tree.as_ref().map(crate::css::computed_report) }
+        let boxed = engine.layout_tree.as_ref().map(|t| {
+            t.node_map
+                .iter()
+                .filter(|(_, n)| n.is_element())
+                .map(|(tid, n)| (n.id(), t.taffy.style(*tid).is_ok_and(|s| s.display == taffy::style::Display::None)))
+                .collect()
+        });
+        Rendering { report: engine.layout_tree.as_ref().map(crate::css::computed_report), boxed }
     }
 
     /// No layout: the DOM-only rules.
     pub fn dom_only() -> Self {
-        Rendering { report: None }
+        Rendering { report: None, boxed: None }
     }
 
     fn computed(&self, n: &NodeRef) -> Option<&[String; 20]> {
@@ -50,8 +62,9 @@ impl Rendering {
         self.computed(n).map(|c| c[DISPLAY].as_str())
     }
 
-    /// HTML §15.1 "being rendered": false for an element with no box. An element without a box whose
-    /// descendants have boxes is `display: contents` and counts as rendered.
+    /// HTML §15.1 "being rendered": false for an element in a `display: none` box's subtree, and for one
+    /// with no box at all; an element without a box whose descendants have boxes is `display: contents`
+    /// and counts as rendered.
     pub fn not_rendered(&self, n: &NodeRef) -> bool {
         if !n.is_element() {
             return false;
@@ -59,12 +72,15 @@ impl Rendering {
         if n.inclusive_ancestors_any(|a| NEVER_RENDERED.contains(&tag(a).as_str())) {
             return true;
         }
-        match &self.report {
-            Some(r) => {
-                if r.contains_key(&n.id()) {
+        match &self.boxed {
+            Some(b) => {
+                if n.inclusive_ancestors_any(|a| b.get(&a.id()) == Some(&true)) {
+                    return true;
+                }
+                if b.contains_key(&n.id()) {
                     return false;
                 }
-                !n.descendants().any(|d| d.is_element() && r.contains_key(&d.id()))
+                !n.descendants().any(|d| d.is_element() && b.contains_key(&d.id()))
             }
             None => n.inclusive_ancestors_any(|a| has_attr(a, "hidden")),
         }

@@ -4,7 +4,7 @@
 //! | key                         | on                                                     | does |
 //! |-----------------------------|--------------------------------------------------------|------|
 //! | Tab / Shift+Tab (`ISO_Left_Tab`) | anywhere (a text field too: Tab is never an edit) | focus moves to the next / previous sequential stop ([`super::focus::tab`]) |
-//! | Enter                       | a link (`a`/`area` with `href`)                        | the link's activation: a trusted `click`, whose activation behavior follows the hyperlink |
+//! | Enter                       | a link (`a`/`area` with `href`)                        | the link's activation: a trusted `click`, then (not canceled) the hyperlink is followed |
 //! | Enter / Space               | a details' `summary`                                   | the summary's activation: the details toggles |
 //! | Up/Left, Down/Right         | a radio button in a group                              | the previous / next enabled radio of the group is focused AND checked (its click: `input` / `change` fire) |
 //! | Up/Down, Home/End           | an ARIA `listbox` option (or the listbox itself)       | the previous / next / first / last option is focused (roving focus) or made `aria-activedescendant`, and selected (`aria-selected`) when the listbox is single-select |
@@ -40,7 +40,7 @@ pub fn handle_key(engine: &mut AetherEngine, key: &str) -> bool {
     }
     let t = tag(&node);
     match k {
-        Key::Return if matches!(t.as_str(), "a" | "area") && has_attr(&node, "href") => click(engine, &node),
+        Key::Return if matches!(t.as_str(), "a" | "area") && has_attr(&node, "href") => follow_link(engine, &node),
         Key::Return | Key::Space if t == "summary" => click(engine, &node),
         Key::Up | Key::Left | Key::Down | Key::Right if radio_group(&node).is_some() => {
             radio_arrow(engine, &node, matches!(k, Key::Down | Key::Right))
@@ -62,6 +62,33 @@ pub fn click(engine: &mut AetherEngine, node: &NodeRef) -> bool {
     }
     engine.damage_rects.push((0, 0, engine.width, engine.height));
     engine.needs_repaint = true;
+    true
+}
+
+/// Enter on a link: the trusted click, then — unless a listener canceled it — the hyperlink is followed
+/// (HTML §4.6.4 "follow the hyperlink"). The binding's trusted-click activation leaves an ordinary link to
+/// the shell's pointer path (js/events.rs `"a" | "area"`), so the keyboard path follows it here through the
+/// same navigation a script-dispatched click takes (`js::window::navigate_from_link`: a same-document
+/// fragment scrolls, anything else is staged for the shell and picked up by `AetherEngine::tick`). A
+/// `javascript:` URL was already queued by the click itself.
+fn follow_link(engine: &mut AetherEngine, node: &NodeRef) -> bool {
+    if !click(engine, node) {
+        return false;
+    }
+    if crate::js::last_click_canceled() {
+        return true;
+    }
+    let Some(href) = attr(node, "href") else { return true };
+    let t = href.trim_start_matches(|c: char| c.is_ascii_whitespace() || c.is_ascii_control());
+    if t.len() >= 11 && t.is_char_boundary(11) && t[..11].eq_ignore_ascii_case("javascript:") {
+        return true;
+    }
+    if let Some(js) = engine.js_engine.as_mut() {
+        let _ = crate::js::window::navigate_from_link(&mut js.vm, &href);
+        if crate::js::take_mutated() {
+            engine.relayout();
+        }
+    }
     true
 }
 
