@@ -48,7 +48,17 @@
 //!   `=4` `ga10bprobe5m` — the MAPPING (§4.1.2): `fmccode <- …data…`, `fmcdata <- …text…`, same payload.
 //! Both print `triple=` and `map=` on the ARMED banner, on every placement line and on the verdict.
 //!
+//! RUNG 5g (`=6`, `ga10bprobe5g`, ledger A111; GA10BNEXT 2026-10-14) is NOT an ignition: it is the GSP-ACR
+//! door's first rung, the IMEM/DMEM PORT CENSUS (`ga10b_port.rs`, a child module declared below), and on
+//! that build it REPLACES the loader and the ignition — nothing is spent, the boot continues into the desktop.
+//!
 //! WITNESS FAMILY `[ga10bprobe5a]` — 15 bytes bracketed; `LC_ALL=C grep -a -o -F` certifies the artifact.
+
+/// GA10B-PROBE5G — rung 5g, the GSP-ACR door's port census, declared from HERE (not `arch/aarch64/mod.rs`)
+/// so the knob-off tree lexes neither this line's file nor a moved `Location`; `pub(super)` entry only.
+#[cfg(feature = "ga10bprobe5g")]
+#[path = "ga10b_port.rs"]
+mod ga10b_port;
 
 use super::ga10b_probe::{
     bcr_write_verify, clk, finish4, pg_state, r32, resolve_gpu_node, settle_ms, unreadable_reason, w32_4,
@@ -110,7 +120,9 @@ const fn inv(file: usize) -> usize {
 /// The knob value this build answers to, for the wire — `3` and `4` take precedence because they are
 /// their own one-delta arms and never combine with the others.
 fn knob_digit() -> &'static str {
-    if cfg!(feature = "ga10bprobe5s") {
+    if cfg!(feature = "ga10bprobe5g") {
+        "6"
+    } else if cfg!(feature = "ga10bprobe5s") {
         "3"
     } else if cfg!(feature = "ga10bprobe5m") {
         "4"
@@ -415,6 +427,13 @@ const KNOB_SUFFIX: &str = "d";
 /// RETURNS on every zero-MMIO refusal; an ignition path ends in SYSTEM_OFF.
 #[allow(unreachable_code)]
 pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
+    #[cfg(feature = "ga10bprobe5g")]
+    {
+        // RUNG 5g (=6): the port census in place of the loader and the ignition — zero vendor bytes, zero
+        // BCR writes, nothing spent; it RETURNS and the boot continues (ga10b_port.rs, ledger A111).
+        ga10b_port::rung5g_run(dtb_addr, dtb_size, ram_gib_mask);
+        return;
+    }
     serial_println!("[ga10bprobe5a] rung 5a ARMED (UNAOS_GA10B_PROBE5={}{}) triple={} map={} — the VENDOR IGNITION: rung 4b's seven writes with ONLY THE PAYLOAD changed. ONE DELTA FROM render15-5a: triple=acr-gsp map=canonical is the flown configuration; triple=safety-scheduler is the SECOND TRIPLE arm (A80) and map=swapped is the MAPPING arm (A81, fmccode<-…data…, fmcdata<-…text…). The BCR lock makes a boot ONE ignition, so the two arms never share a power cycle. Order: zero-MMIO phase (window, pattern, the three vendor files read from /boot/GA10B/ through the VFS, sized, placed 256-aligned, digested in the window — any refusal RETURNS with zero MMIO) -> rung 4a's bracket and BCR census re-proven -> rung 4c's pre-ignition census -> addresses at the three placements (form={} shift={}) -> bcr_dmacfg noncoherent|lock (SPENDS THE POWER CYCLE) -> bcr_ctrl 0x111 -> priscv_cpuctl startcpu -> bounded br_retcode poll -> the oracles -> verdict -> SYSTEM_OFF. Verdict vocabulary: ACR-ACCEPTED | BROM-VERDICT-FAIL code=<retcode> | BROM-VERDICT-PASS-UNWITNESSED code=<retcode> | BROM-NOVERDICT | IGNITION-SKIPPED reason=<bcr-not-allheld|bcr-addr-refused> | BCR-CTRL-REFUSED | REFUSED reason=<image-absent|image-size|image-digest|image-window|image-unaligned|no-dma-window|no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable>. F21 warning: a fabric RAS from a real image whose DMA reach we do not bound may need a manual power cut", knob_digit(), KNOB_SUFFIX, TRIPLE_NAME, MAP_NAME, ADDR_FORM, ADDR_SHIFT);
     serial_println!("[ga10bprobe5a] addr_encoding={} shift={} from={} (P5x: rung 4e, UNAOS_GA10B_PROBE4=5, is the flight that settles the encoding; until its verdict is in docs/dev/evidence/ this build carries the form its knob value named and says so here)", ADDR_FORM, ADDR_SHIFT, if ADDR_SHIFT == 8 { "unflown(4e; rung-5 brief §1.2 Hopper MIT source)" } else { "flown(4b raw; A51/A55)" });
     let Some(ld) = phase0_load() else { return; };

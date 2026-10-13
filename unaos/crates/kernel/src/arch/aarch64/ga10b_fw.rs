@@ -362,4 +362,9 @@ pub fn fixture_service() {
     } else {
         serial_println!("[ga10bfw] fixture: pass1(GA10B)={} pass2(GA10BBAD)={} pass3(GA10BSS)={} pass4(GA10BSSBAD)={} -> FAIL — see the loader lines above", if p1 { "LOADED" } else { "NOT-LOADED" }, if p2 { "REFUSED-digest" } else { "NOT-REFUSED-digest" }, if p3 { "LOADED" } else { "NOT-LOADED" }, if p4 { "REFUSED-digest" } else { "NOT-REFUSED-digest" });
     }
+    // GA10BNEXT (ledger A111): QEMU virt has no GA10B, so a `UNAOS_GA10B_PROBE5=<n>` virt build arms the LOADER
+    // alone (arroyo's `_p5_metal` gate) and the port-census rung 5g cannot run here. Said by name, from the only
+    // GA10B verdict a virt boot has, so a scorer keyed on `:: ga10b: 5g` reads SKIP and never an absence.
+    #[cfg(not(feature = "ga10bprobe5a"))]
+    serial_println!(":: ga10b: 5g SKIP reason=no-ga10b ::");
 }
