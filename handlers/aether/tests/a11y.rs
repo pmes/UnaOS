@@ -604,3 +604,40 @@ fn devtools_accessibility_panel() {
     assert_eq!((ins.role, ins.tab_stop), ("textbox", Some(1)));
     assert!(ins.states.contains(&"required".to_string()));
 }
+
+/// The surface pixel at (`x`, `y`) as RGB.
+fn pixel(e: &AetherEngine, x: u32, y: u32) -> (u8, u8, u8) {
+    let i = ((y * e.width + x) * 4) as usize;
+    (e.surface[i + 2], e.surface[i + 1], e.surface[i])
+}
+
+/// A11YFACE (SR124): the ring and the author's outline. A bare `:focus { outline: none }` keeps the ring (the
+/// WCAG 2.4.7 UA convention); with the author's own `:focus-visible` styling the `outline: none` is honoured; an
+/// author outline replaces the ring and paints outside the border box grown by `outline-offset`.
+#[test]
+fn outline_none_and_author_outlines_replace_the_ring() {
+    const BODY: &str = r#"<body style="margin:0"><button id="b" style="margin:20px">Go</button></body>"#;
+    let ring_at = |css: &str| {
+        let mut e = page(&format!("<head><style>{css}</style></head>{BODY}"));
+        assert!(keyboard::handle_key(&mut e, "Tab"));
+        assert_eq!(focused_id(&e).as_deref(), Some("b"));
+        e.damage_rects.push((0, 0, e.width, e.height));
+        e.render_frame();
+        let (x, y, _w, h) = e.box_of(&dom(&e, "b")).unwrap();
+        let mid = (y + h / 2.0) as u32;
+        (1..=6).map(|d| pixel(&e, x as u32 - d, mid)).collect::<Vec<_>>()
+    };
+    let ring = (16, 16, 16);
+    assert_eq!(ring_at("button:focus { outline: none }")[0], ring, "outline: none without :focus-visible styling keeps the ring");
+    assert_ne!(
+        ring_at("button:focus { outline: none } button:focus-visible { background-color: rgb(200, 200, 0) }")[0],
+        ring,
+        "the author styles :focus-visible: outline: none removes the ring"
+    );
+    let red = (255, 0, 0);
+    let band = ring_at("button:focus-visible { outline: 2px solid rgb(255, 0, 0); outline-offset: 2px }");
+    assert!(band[0] != ring && band[0] != red && band[1] != red, "the 2px offset gap: {band:?}");
+    assert_eq!((band[2], band[3]), (red, red), "the author's 2px outline, outside the gap: {band:?}");
+    assert_ne!(band[4], red, "{band:?}");
+    assert!(!band.contains(&ring), "the author's outline replaces the ring: {band:?}");
+}

@@ -263,6 +263,10 @@ pub fn focus(engine: &mut AetherEngine, node: Option<NodeRef>, keyboard: bool) {
             let _ = crate::js::take_mutated();
         }
     }
+    // A11YFACE (SR124): whether the author styles `:focus-visible` for the target (read now, while it holds
+    // keyboard focus) decides whether its `outline: none` may remove the ring (render::focusring's table).
+    let styled = keyboard && node.as_ref().is_some_and(|n| crate::render::focusring::author_styles_focus_visible(&engine.stylesheets, n));
+    crate::render::focusring::set_author_focus_visible(styled);
     crate::render::focusring::set_target(node.clone().filter(|_| keyboard));
     // `:focus` / `:focus-visible` rules (and whatever the focus listeners changed) restyle the page.
     engine.relayout();

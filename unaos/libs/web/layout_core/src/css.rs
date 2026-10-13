@@ -1665,7 +1665,53 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.radius = Some(r);
             }
         }
-        "border" | "outline" => {
+        // A11YFACE (SR124): css-ui-4 §4 — the outline is its own paint (outside the border box, no space), never
+        // the border: `button:focus { outline: none }` no longer removes the button's border, and `outline: 2px
+        // solid` no longer draws one. The shorthand resets the longhands it omits (§4.1: style none, width
+        // medium, colour currentColor).
+        "outline" => {
+            let (mut st, mut width, mut color) = (crate::paint::OUTLINE_NONE, crate::paint::OUTLINE_MEDIUM, None);
+            let mut ok = !value.is_empty();
+            for part in split_top_level(value) {
+                if let Some(k) = crate::paint::outline_style_code(part) {
+                    st = k;
+                } else if let Some(px) = outline_width_value(part, cx) {
+                    width = px;
+                } else if let Some(c) = outline_color_value::<H>(part) {
+                    color = c;
+                } else {
+                    ok = false;
+                }
+            }
+            if ok {
+                style.paint.outline_style = Some(st);
+                style.paint.outline_width = Some(width);
+                style.paint.outline_color = Some(color);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("outline-value:{}", clip(value)));
+            }
+        }
+        "outline-style" => match crate::paint::outline_style_code(value) {
+            Some(k) => style.paint.outline_style = Some(k),
+            None if is_neutral_keyword(value) => {}
+            None => H::record_css(&format!("outline-style-value:{}", clip(value))),
+        },
+        "outline-width" => {
+            if let Some(px) = outline_width_value(value, cx) {
+                style.paint.outline_width = Some(px);
+            }
+        }
+        "outline-color" => {
+            if let Some(c) = outline_color_value::<H>(value) {
+                style.paint.outline_color = Some(c);
+            }
+        }
+        "outline-offset" => {
+            if let Some(px) = parse_px(value, cx) {
+                style.paint.outline_offset = Some(px);
+            }
+        }
+        "border" => {
             let v = value.trim();
             if v == "none" || v == "0" {
                 style.paint.border = Some([None; 4]);
@@ -2440,6 +2486,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
+        outline_style, outline_width, outline_color, outline_offset,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {
@@ -2756,7 +2803,7 @@ pub fn is_length_property(prop: &str) -> bool {
             | "column-gap" | "flex-basis" | "flex" | "border" | "border-top" | "border-right" | "border-bottom"
             | "border-left" | "border-width" | "border-top-width" | "border-right-width" | "border-bottom-width"
             | "border-left-width" | "border-radius" | "letter-spacing" | "line-height" | "vertical-align"
-            | "border-spacing" | "outline" | "text-indent"
+            | "border-spacing" | "outline" | "outline-width" | "outline-offset" | "text-indent"
     )
 }
 
@@ -3074,6 +3121,38 @@ fn border_style_code(v: &str) -> Option<u8> {
         "double" => Some(3),
         _ => None,
     }
+}
+
+/// A11YFACE (SR124): an `outline-width` (`<line-width>`): `thin` / `medium` / `thick`, or a non-negative length
+/// (a bare number only when it is 0, as for borders).
+fn outline_width_value(v: &str, cx: &ParseCx) -> Option<f32> {
+    let v = v.trim();
+    if let Some(px) = crate::paint::outline_width_keyword(v) {
+        return Some(px);
+    }
+    if !v.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let bare = v.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if bare && v.parse::<f32>().ok() != Some(0.0) {
+        return None;
+    }
+    parse_px(v, cx).filter(|px| *px >= 0.0)
+}
+
+/// A11YFACE (SR124): an `outline-color` as the RGBA [`PaintStyle::outline_color`] holds: `currentColor` and
+/// `invert` (a UA that cannot invert paints currentColor, css-ui-4 §4.4) are `Some(None)`.
+fn outline_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8, u8)>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("currentcolor") || v.eq_ignore_ascii_case("invert") {
+        return Some(None);
+    }
+    if v.eq_ignore_ascii_case("transparent") {
+        return Some(Some((0, 0, 0, 0)));
+    }
+    let (r, g, b) = parse_color_str::<H>(v)?;
+    let a = (color_alpha::<H>(v).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    Some(Some((r, g, b, a)))
 }
 
 /// One radius: px (>= 0) or a percentage as a negative width fraction.
