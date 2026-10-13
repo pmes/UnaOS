@@ -3787,6 +3787,17 @@ una = [] # UNAMETAL (LEDGER SR90, R104): `tests una` (crate::unaapp, x86) — AP
 # Kept in sync with `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
 aether = ["selfdiag"]
 
+# STRIAMETAL (LEDGER SR139): UNAOS_STRIA=1 arms `tests stria` (crate::striaapp) — APPS/STRIA.ELF, Stria (CODEX §2 A/V)
+# as ONE ring-3 program (crates/user-stria: demux_core + vp8/vp9/av1/h264_core + audio_core), validated by the
+# production loader in the ELF-window model, spawned with the staged /system/test-f/TEST.WEBM, its lines read at the
+# console seam (`:: STRIAAPP: image=/apps/STRIA.ELF window=elf frames=<n> audio=<ok|none> drift_ms=<n> -> PASS ::`),
+# and STRIA.ELF first in line for the media types it declares (fs/assoc.rs `registrants_in`). Implies `selfdiag`:
+# SYS_PATH_READ is the file surface the program reads the file through. The program and its staging exist on every
+# build; the sound it plays is una-abi STRIAMETAL's (rmbp-ledger B618: x86 over `hda-tone`, aarch64 refused by name).
+# Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm), `unaos/builder/src/main.rs`,
+# `unaos/scripts/banner-cert.sh` and the three image-line env files.
+stria = ["selfdiag"]
+
 # SELFDIAG (rmbp-ledger B324, R82): UNAOS_SELFDIAG=1 arms the smart installer's diagnosis loop's kernel half —
 # the BOOT LOG ON DISK (crate::bootwit: every `:: TAG: ... -> PASS|FAIL|SKIP ::` line and the `:: BOOT:`
 # line of a boot written to /var/log/boot.<n>.witness on a UnaFS root at desktop-ready and at reboot /

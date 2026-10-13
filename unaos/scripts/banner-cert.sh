@@ -372,6 +372,7 @@ midden|:: MIDDENAPP: image=|@arch:x86_64|unmeasured-here
 una|:: UNAAPP: image=|@arch:x86_64|unmeasured-here
 sonde|:: SONDE:|@arch:x86_64|unmeasured-here
 aether|:: AETHERAPP:|-|measured
+stria|:: STRIAAPP: image=|-|unmeasured-here
 netring3|:: ENTROPY:|-|measured
 selfdiag|:: SELFDIAG:|-|measured
 installdemo|:: INSTALLVERB: census disk=|-|measured(4)

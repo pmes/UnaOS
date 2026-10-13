@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Stria (UnaOS's own design): a play wedge over three striae on a slate tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#20313f"/>
+<rect x="10" y="44" width="44" height="3" rx="1.5" fill="#4f9dff"/>
+<rect x="10" y="50" width="32" height="3" rx="1.5" fill="#7fb8ff"/>
+<rect x="10" y="38" width="38" height="3" rx="1.5" fill="#2f6fbf"/>
+<polygon points="24,10 24,34 44,22" fill="#ffffff"/>
+</svg>
