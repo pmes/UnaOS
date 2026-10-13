@@ -408,7 +408,7 @@ refs/heads/exec-arm-line                      b36b2193 FOLDED-BY-HAND 1f782366 2
 refs/heads/exec-rmbp-pointerscale             79d6ab5c FOLDED-BY-HAND e279515b 2026-10-13
 refs/heads/exec-rmbp-pumphole 3d81bfb6 FOLDED-BY-HAND f537b73e 2026-10-13
 refs/heads/exec-rmbp-twocursors 9ef4f764 FOLDED-BY-HAND f537b73e 2026-10-13
-refs/heads/exec-rmbp-aetherptr                bf81f7ef IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-aetherptr                80b6ae77 FOLDED-BY-HAND 16bc73af 2026-10-13
 refs/heads/exec-rmbp-splashword2              f416f182 FOLDED-BY-HAND 2996a71c 2026-10-13
 refs/heads/exec-rmbp-dockpins                 8fae9ef3 FOLDED-BY-HAND 023b318d 2026-10-13
 refs/heads/exec-rmbp-usbnetrx2                36f2e5b7 FOLDED-BY-HAND d72be074 2026-10-13
