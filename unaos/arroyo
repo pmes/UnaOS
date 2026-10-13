@@ -9672,6 +9672,37 @@ esp_x86_unafs_card() {
         done
         echo -e "${COLOR_YELLOW}⚡ WIFI-FW: firmware/b43.pins vs the staged set -> ${pin_state} (the kernel stages only a pinned match; UNPINNED/MISMATCH boots read reason=unpinned/pin-mismatch)${COLOR_RESET}"
     fi
+    # KEPLER-FW (KEPLERUCODE rmbp-ledger B637, R119 "the bunker is the standing answer for every proprietary bit"): the
+    # GK107's FECS/GPCCS context-switch firmware (fuc409c fuc409d fuc41ac fuc41ad — the names nouveau requests behind
+    # NvGrUseFW, gr/gf100.c:2603-2606) is BENCH-ONLY and never in-tree (CLEAN_ROOM_POLICY §4), the WIFI-FW shape exactly:
+    # UNAOS_KEPLER_FW_PATH=<absolute dir in the bunker> stages the four into target/kepler-fw and onto the ESP tree at
+    # FW/KEPLER/ (p1 — R99 keeps firmware blobs there), where `tests kgr` reads them (drivers/gpu/kepler_ucode.rs; never at
+    # boot, R80). Unset => nothing staged, the image byte-identical; set but not absolute, unreadable, or a file missing =>
+    # the build FAILS LOUDLY naming it. Each digest is printed with a ready-to-paste row and compared against
+    # firmware/kepler.pins (-> MATCH / UNPINNED / MISMATCH); the kernel uploads only a set whose four rows match.
+    if [ -n "${UNAOS_KEPLER_FW_PATH:-}" ]; then
+        case "$UNAOS_KEPLER_FW_PATH" in /*) ;; *) echo -e "${COLOR_RED}❌ KEPLER-FW: UNAOS_KEPLER_FW_PATH must be absolute: ${UNAOS_KEPLER_FW_PATH}${COLOR_RESET}"; return 1;; esac
+        local kfw kfwdir="${WORKSPACE_DIR}/target/kepler-fw"
+        for kfw in fuc409c fuc409d fuc41ac fuc41ad; do
+            [ -r "${UNAOS_KEPLER_FW_PATH}/${kfw}" ] || { echo -e "${COLOR_RED}❌ KEPLER-FW: ${UNAOS_KEPLER_FW_PATH}/${kfw} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
+        done
+        rm -rf "$kfwdir"; mkdir -p "$kfwdir"
+        for kfw in fuc409c fuc409d fuc41ac fuc41ad; do cp "${UNAOS_KEPLER_FW_PATH}/${kfw}" "$kfwdir/"; done
+        mkdir -p "$esp_t/FW/KEPLER" && cp "$kfwdir"/fuc4* "$esp_t/FW/KEPLER/" || {
+            echo -e "${COLOR_RED}❌ KEPLER-FW: copying the set onto the ESP tree at FW/KEPLER/ failed — no card image${COLOR_RESET}"; return 1; }
+        echo -e "${COLOR_YELLOW}⚡ KEPLER-FW: GK107 ctxsw set (4 files) from ${UNAOS_KEPLER_FW_PATH} onto the ESP at FW/KEPLER/ (bench-only, never in-tree)${COLOR_RESET}"
+        local krole ksum kbytes kpinned kpin_state="MATCH"
+        for kfw in fuc409c:fecs_code fuc409d:fecs_data fuc41ac:gpccs_code fuc41ad:gpccs_data; do
+            krole="${kfw##*:}"; kfw="${kfw%%:*}"
+            ksum=$(sha256sum "$kfwdir/${kfw}" | cut -d' ' -f1)
+            kbytes=$(stat -c %s "$kfwdir/${kfw}")
+            echo -e "${COLOR_YELLOW}⚡ KEPLER-FW: ${kfw} sha256=${ksum} bytes=${kbytes} pin-row: ${krole} ${ksum}${COLOR_RESET}"
+            kpinned=$(awk -v r="$krole" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/kepler.pins" 2>/dev/null | head -1)
+            if [ -z "$kpinned" ]; then [ "$kpin_state" = "MATCH" ] && kpin_state="UNPINNED"
+            elif [ "$kpinned" != "$ksum" ]; then kpin_state="MISMATCH"; fi
+        done
+        echo -e "${COLOR_YELLOW}⚡ KEPLER-FW: firmware/kepler.pins vs the staged set -> ${kpin_state} (the kernel uploads only a pinned match; UNPINNED/MISMATCH reads reason=unpinned/pin-mismatch at tests kgr)${COLOR_RESET}"
+    fi
     # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
     # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \

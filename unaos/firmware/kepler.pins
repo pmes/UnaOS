@@ -1,0 +1,14 @@
+# KEPLERUCODE (rmbp-ledger B637, R119) — SHA-256 pins for the GK107's FECS/GPCCS context-switch firmware
+# (drivers/gpu/kepler_ucode.rs). NO FIRMWARE BYTES live in this tree (CLEAN_ROOM_POLICY §4). Each row is a fact
+# ABOUT a file in Peter's bunker (drivers/nvidia-gk107/): `<role> <64 lowercase hex>`, roles
+#   fecs_code  (fuc409c — FECS IMEM)     fecs_data  (fuc409d — FECS DMEM)
+#   gpccs_code (fuc41ac — GPCCS IMEM)    gpccs_data (fuc41ad — GPCCS DMEM)
+# (the names nouveau requests behind NvGrUseFW, gr/gf100.c:2603-2606, as `nouveau/nv<chipset>_<name>` or
+# `nouveau/<name>`, gf100.c:2578-2582). The kernel uploads ONLY a set whose four SHA-256s equal these rows; with a
+# row missing it refuses with reason=unpinned and prints the digest. The rows come from arroyo's KEPLER-FW build line
+# (`⚡ KEPLER-FW: <file> sha256=… pin-row: <role> <hex>`) — never typed from memory.
+# Lines starting with `#` and blank lines are ignored.
+
+# NO ROWS YET (2026-10-13, KEPLERUCODE): linux-firmware does NOT ship nvidia/gk107/ — the four files have no
+# linux-firmware source (docs/dev/evidence/keplerucode/keplerucode.md §1). Until the bunker holds a set, every
+# `tests kgr` reads `[kgr] ucode … -> absent` and KGR4 stays `(ucode-gated)`.
