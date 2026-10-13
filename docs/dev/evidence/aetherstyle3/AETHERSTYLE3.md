@@ -35,3 +35,48 @@ ascent 0.8 em, descent 0.2 em). The aethergen ledger lines this arc retires: `pr
 - `Cargo.lock` (root): layout_core gains the `svg_core` dependency edge (one line, written by cargo).
 - `unaos/crates/user-aether/Cargo.lock`: not touched; its next build adds the same edge (layout_core's manifest
   names svg_core by path; the ring-3 program is not built by this arc).
+
+## AETHERSTYLE3B (LEDGER SR115) — the refused list taken
+
+Charter and seam as above (Aether, `shared-core`: css_core and layout_core, both rings; the host face follows in
+handlers/aether/src/{css,layout,render} and the new js/animations.rs). Branch `exec-host-aetherstyle3b`, base
+7af171f2. Status words: nothing here has run. Each row is compiled code (`cargo check -p css_core -p layout_core
+-p aether --tests` rc=0 at every commit) with one fixture test over the same `tests/common` harness; the tests,
+WPT and EYES are the seat's at the fold (R107).
+
+| feature | commit | parse / cascade | layout / paint | test (`unaos/libs/web/<core>/tests/`) | still refused |
+|---|---|---|---|---|---|
+| `filter: url(#id)` | ebe007dc | the list svg_core parses (url entries were already stored); `DomNode::attrs` added to the seam (default none; the host and the harness enumerate) | layout_core `effects::filter_rgba_refs`: entries in order, functions through the CSS hook, each reference serialized (`filter_markup`) into a one-filter SVG document and run by `svg_core::filter::render_filtered_bbox` with the border box as bbox (region, units, the whole primitive graph are svg_core's); `filter_margin_box`; host `filter_group` / `backdrop_group` resolve against the element's document | layout_core `filter_url.rs`: feColorMatrix saturate(0) greys the red box, `url() blur()` runs both in order, a missing or non-filter reference runs nothing | references into another document; the image ring resolves none until crates/user-aether implements `DomNode::attrs` |
+| `scrollbar-gutter` | 6473bd0e | `scrollbar-gutter: auto / stable / stable both-edges` | taffy reserves `scrollbar_width` for a Scroll y axis (block and flex), so a stable scroll container lays its content out 10px narrower and the overlay bar sits in the gutter; both-edges adds the start padding | layout_core `scroll_snap.rs`: 90px child (stable), 10px + 80px (both-edges) | classic (layout-taking) scrollbars for `auto`, `scrollbar-width`, `scrollbar-color` |
+| scroll snapping | 6473bd0e | `scroll-snap-type`, `scroll-snap-align`, `scroll-snap-stop`, `scroll-padding` | layout_core `scroll::snap_positions` / `snap_offset`: wheel steps land on the next position in their direction (mandatory always, proximity within 30% of the snapport, never past an `always` stop), the delta chains out when none is ahead; programmatic scrolls snap to the nearest | same file: 0 → 100 → 200, back, chains out at 300; proximity; snap-stop; scroll-padding 0 / 90 / 190 / 290 | `scroll-margin`, re-snapping after a relayout, keyboard / scrollbar-drag snapping |
+| smooth scrolling, `scrollTop` / `scrollTo` from script | 6473bd0e | `scroll-behavior` | layout_core `scroll::scroll_target` (clamp + snap), `SmoothScroll` (150-450 ms by distance, ease-in-out); host layout `element_scroll_offset` / `request_element_scroll` / `scroll_frame`, run by `css::animation_frame` each tick | same file: the curve's duration, midpoint and arrival; `scroll_target` | the DOM binding: `Element.scrollTop/scrollLeft` setters and `scroll()/scrollTo()/scrollBy()/scrollIntoView()` live in handlers/aether/src/js/cssom.rs (outside this brief), which must call the two host functions (see "Owed outside the brief") |
+| `column-span: all` | f2ab1808 | `column-span: none / all` | layout_core `multicol::balance_blocks`: the flow splits into column sets at each spanner, each set balances on its own, the spanner moves up under the set at full width, `LayoutTree::col_sets` records the sets; host rules paint per set | layout_core `multicol_span.rs`: b (210, -50), spanner (0, -50) at 410px, d (210, -100), container 130px, sets (0, 50) and (80, 50) | spanners nested inside wrappers |
+| a tall block split across columns | f2ab1808 | — | layout_core `multicol::collect_child`: a block child that paints nothing of its own contributes its in-flow children (and plain IFC lines) as units, recursively; nested shifts compose through every painter's per-child `col_shift` | same file: an unstyled wrapper's four 50px blocks split two per column | a decorated (background / border / padding) box taller than a column moves whole: no per-fragment painting (`box-decoration-break`) |
+| upright glyphs in vertical text | 8eb2bb97 | `text-orientation: upright` no longer ledgered | layout_core `writing::upright` (UAX #50 U/Tu ranges under `mixed`, all under `upright`), `InlineLayout::upright` cells, `to_physical_upright` (the cell translated, not turned); host `vmap` tries it first | layout_core `vertical_text.rs`: two cells for "漢字abc", two under upright, none sideways; (2,5) → (7,0) | `text-combine-upright`; a proportional glyph forced upright keeps its horizontal width as its vertical advance |
+| selection in vertical text | 8eb2bb97 | — | layout_core `writing::to_logical`; `hit::hit` maps a vertical IFC box's pointer into staging space (`vertical_pointer`); host TextBoxes of vertical IFCs recorded at the physical origin plus staging offsets (the core walker's convention) | same file: `to_logical` inverts rl and lr; a pointer 33px down the column hits UTF-16 offset 3 | the caret of an editable vertical field |
+| `@container style()` | 8f36481a | css_core `ContainerCondition` / `StyleQuery` (not / and / or, `name: value`, bare `name`), `evaluate_with(size, custom properties)`, `needs_size` | host cascade: every element is a style container — a style-only rule asks the nearest name-matching ancestor's computed custom properties in the first round, no layout | layout_core `container_style.rs`: dark applies, light does not, presence, `not`, a missing property, a named query past an unnamed ancestor | standard properties inside `style()`, `scroll-state()` |
+| container-relative units | 8f36481a | `ParseCx::container`; cqw / cqi / cqh / cqb / cqmin / cqmax (viewport axis when no container) | layout_core `remeasure` → `reresolve_container_units`: elements with cq lengths re-apply their length declarations against the nearest width / height query containers as laid out, then lay out again (both rings) | same file: 50cqw of 300px = 150px, 10cqh without a height container = 60px, 10cqmin of 200 x 100 = 10px | vertical containers (cqi / cqb stay width / height) |
+| TransitionEvent / AnimationEvent fields | e8665deb | — | layout_core `TimedEvent` (elapsedTime per css-transitions-1 §6.1 / css-animations-1 §4.1), `animationcancel`; host `js::animations::poll` dispatches trusted TransitionEvent / AnimationEvent with propertyName / animationName, elapsedTime, pseudoElement | layout_core `web_animations.rs`: 0.2 / 1.0 s for a -200ms-delayed transition, 0 / 1 / 2 s and cancel at 0.6 s for an animation | events of pseudo-elements (`pseudoElement` is always "") |
+| Web Animations API | e8665deb | — | layout_core `Timeline::animate` / `info` / `animation_ids` / play / pause / finish / cancel / reverse / rate / seek / start / keyframes / timing / `take_finished`; host js/animations.rs: KeyframeEffect, Animation, CSSAnimation, CSSTransition, DocumentTimeline, AnimationPlaybackEvent, `element.animate`, `getAnimations` | same file: sample, pause, resume, rate 2, finish once, reverse, finish backwards, cancel, composite order | `composite` add / accumulate, `iterationStart`, `commitStyles()`, scroll / view timelines, the play-pending state, pausing a CSS transition |
+
+### Owed outside the brief's files
+
+- handlers/aether/src/js/cssom.rs (`scroll_pos_get` / `scroll_pos_set` / `noop_el`, cssom.rs:1436-1450, installed at
+  :1485-1489): register `scrollTop` / `scrollLeft` with `attr_with(..., s(name))`; the getter returns
+  `crate::layout::element_scroll_offset(html_core::NodeId(el))` (.1 for scrollTop, .0 for scrollLeft); the setter
+  calls `crate::layout::request_element_scroll(NodeId(el), x, y, crate::layout::ScrollBehavior::Auto)` with the
+  other axis `None`; `scroll()` / `scrollTo()` take `(x, y)` or `{left, top, behavior}` (behavior `smooth` /
+  `instant` / `auto`), `scrollBy()` adds the delta to `element_scroll_offset`, `scrollIntoView()` asks each
+  scroll-container ancestor for the element's offset. A read right after a write sees the new offset after the
+  next frame (the request applies against the engine's tree in `scroll_frame`).
+- handlers/aether/src/lib.rs:614-624: the plain-`Event` loop over `css::take_animation_events()` is now dead
+  (that function returns none; the typed events go through `js::animations::poll`).
+- handlers/aether/src/js/mod.rs: three lines were added for the brief's new file — `pub mod animations;`,
+  `animations::install(&mut vm)` in `Engine::new`, `animations::poll(&mut self.vm)` in `Engine::tick`.
+- unaos/crates/user-aether: `DomNode::attrs` has a default (no attributes), so the ring-3 program compiles
+  unchanged and resolves no `url()` filter until its arena implements it.
+
+### What the fold should see
+
+`cargo test -p layout_core --tests` runs six new files — `filter_url`, `scroll_snap`, `multicol_span`,
+`vertical_text`, `container_style`, `web_animations` — one test each, beside SR103's six.
