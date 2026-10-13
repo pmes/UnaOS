@@ -741,15 +741,8 @@ fn apply_stylesheets_with(
 ///
 /// AETHERSTYLE3B (SR115): the frame also advances programmatic scrolling (`layout::scroll_frame`: script
 /// scrolls start, smooth scrolls step) — a moved offset repaints.
-pub(crate) fn animation_frame(tree: &mut LayoutTree) -> anim::Frame {
-    let scrolled = crate::layout::scroll_frame(tree);
-    match anim::frame(tree) {
-        anim::Frame::Idle if scrolled => anim::Frame::Repaint,
-        f => f,
-    }
-}
-
-/// AETHERPAINTPERF (SR130): [`animation_frame`] with the scope of its damage — the elements whose animated values
+///
+/// AETHERPAINTPERF (SR130): with the scope of its damage — the elements whose animated values
 /// moved, when every value the timeline runs on them is one whose ink stays inside the boxes the last frame
 /// painted for the element and its descendants (`render::subtree_ink`): colours, `opacity`,
 /// `background-position`. None when the frame scrolled, or something else animates (a transform, a filter, a
