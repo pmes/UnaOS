@@ -72,6 +72,13 @@ impl Rendering {
         if n.inclusive_ancestors_any(|a| NEVER_RENDERED.contains(&tag(a).as_str())) {
             return true;
         }
+        // A <select>'s options live in its popup, never in flow (layout_core gives them no box): they are
+        // rendered when their select is.
+        if matches!(tag(n).as_str(), "option" | "optgroup") {
+            if let Some(sel) = n.ancestors().find(|a| tag(a) == "select") {
+                return self.not_rendered(&sel);
+            }
+        }
         match &self.boxed {
             Some(b) => {
                 if n.inclusive_ancestors_any(|a| b.get(&a.id()) == Some(&true)) {

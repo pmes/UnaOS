@@ -193,7 +193,8 @@ pub fn next(doc: &NodeRef, r: &Rendering, current: Option<&NodeRef>, backward: b
             return Some(cand.clone());
         }
     }
-    None
+    // The only stop is the focused element: focus stays (the move wraps onto itself).
+    current.filter(|c| seq.contains(c)).cloned()
 }
 
 thread_local! {

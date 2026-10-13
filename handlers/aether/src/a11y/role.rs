@@ -229,6 +229,15 @@ pub fn implicit_role(n: &NodeRef, named: &dyn Fn() -> bool) -> &'static str {
         }
         "strong" => "strong",
         "sub" => "subscript",
+        // HTML-AAM: a details' summary has "no corresponding role"; Chromium exposes it as a disclosure
+        // button (it is activated like one, and expanded follows its details' `open`).
+        "summary" => {
+            if n.parent().is_some_and(|p| tag(&p) == "details") {
+                "button"
+            } else {
+                GENERIC
+            }
+        }
         "sup" => "superscript",
         "svg" => {
             if named() {
