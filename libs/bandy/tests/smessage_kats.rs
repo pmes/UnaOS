@@ -354,6 +354,60 @@ kat!(
     r#"{"BrowserClipboardSet":"line one\nline two"}"#
 );
 
+// --- AETHERCHROME (SR84): the browser chrome ---
+
+kat!(
+    kat_browser_go,
+    SMessage::BrowserGo { input: "una os".to_string(), search: "https://html.duckduckgo.com/html/?q=%s".to_string() },
+    r#"{"BrowserGo":{"input":"una os","search":"https://html.duckduckgo.com/html/?q=%s"}}"#
+);
+kat!(kat_browser_nav_stop, SMessage::BrowserNavStop, r#""BrowserNavStop""#);
+kat!(kat_browser_tab_new, SMessage::BrowserTabNew, r#""BrowserTabNew""#);
+kat!(kat_browser_tab_close_id, SMessage::BrowserTabClose(Some(3)), r#"{"BrowserTabClose":3}"#);
+kat!(kat_browser_tab_close_active, SMessage::BrowserTabClose(None), r#"{"BrowserTabClose":null}"#);
+kat!(kat_browser_tab_select, SMessage::BrowserTabSelect(2), r#"{"BrowserTabSelect":2}"#);
+kat!(kat_browser_tab_step, SMessage::BrowserTabStep(-1), r#"{"BrowserTabStep":-1}"#);
+kat!(kat_browser_zoom, SMessage::BrowserZoom(1), r#"{"BrowserZoom":1}"#);
+kat!(
+    kat_browser_find,
+    SMessage::BrowserFind { query: "una".to_string(), forward: false },
+    r#"{"BrowserFind":{"query":"una","forward":false}}"#
+);
+kat!(kat_browser_find_close, SMessage::BrowserFindClose, r#""BrowserFindClose""#);
+kat!(kat_browser_bookmark_toggle, SMessage::BrowserBookmarkToggle, r#""BrowserBookmarkToggle""#);
+kat!(kat_browser_page_info_ask, SMessage::BrowserPageInfoAsk, r#""BrowserPageInfoAsk""#);
+kat!(
+    kat_browser_tabs,
+    SMessage::BrowserTabs { active: 2, tabs: vec![(1, "UnaOS".to_string(), false), (2, "New Tab".to_string(), true)] },
+    r#"{"BrowserTabs":{"active":2,"tabs":[[1,"UnaOS",false],[2,"New Tab",true]]}}"#
+);
+kat!(
+    kat_browser_nav_state,
+    SMessage::BrowserNavState { can_back: true, can_forward: false, loading: true, zoom_pct: 110 },
+    r#"{"BrowserNavState":{"can_back":true,"can_forward":false,"loading":true,"zoom_pct":110}}"#
+);
+kat!(
+    kat_browser_find_result,
+    SMessage::BrowserFindResult { query: "una".to_string(), matches: 4, current: 1 },
+    r#"{"BrowserFindResult":{"query":"una","matches":4,"current":1}}"#
+);
+kat!(kat_browser_status, SMessage::BrowserStatus("https://una.os/a".to_string()), r#"{"BrowserStatus":"https://una.os/a"}"#);
+kat!(
+    kat_browser_bookmarks,
+    SMessage::BrowserBookmarks { items: vec![("UnaOS".to_string(), "https://una.os/".to_string())], current: true },
+    r#"{"BrowserBookmarks":{"items":[["UnaOS","https://una.os/"]],"current":true}}"#
+);
+kat!(
+    kat_browser_page_info,
+    SMessage::BrowserPageInfo { url: "https://una.os/".to_string(), secure: true, summary: "TLS 1.3".to_string() },
+    r#"{"BrowserPageInfo":{"url":"https://una.os/","secure":true,"summary":"TLS 1.3"}}"#
+);
+kat!(
+    kat_browser_download,
+    SMessage::BrowserDownload { id: 7, name: "una.iso".to_string(), received: 512, total: Some(1024), done: false, error: None },
+    r#"{"BrowserDownload":{"id":7,"name":"una.iso","received":512,"total":1024,"done":false,"error":null}}"#
+);
+
 // --- STRIA (A/V playback) ---
 
 kat!(kat_media_poster, SMessage::MediaPoster { url: "file:///v.webm".to_string() }, r#"{"MediaPoster":{"url":"file:///v.webm"}}"#);
@@ -1205,6 +1259,24 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::Tabula(_) => "Tabula",
         SMessage::BrowserMouseMove(_, _) => "BrowserMouseMove",
         SMessage::BrowserCursorChanged(_) => "BrowserCursorChanged", // AETHERHOVER (SR67) fold: the exhaustive match gains the two motion variants
+        SMessage::BrowserGo { .. } => "BrowserGo", // AETHERCHROME (SR84): the chrome's eighteen verbs
+        SMessage::BrowserNavStop => "BrowserNavStop",
+        SMessage::BrowserTabNew => "BrowserTabNew",
+        SMessage::BrowserTabClose(_) => "BrowserTabClose",
+        SMessage::BrowserTabSelect(_) => "BrowserTabSelect",
+        SMessage::BrowserTabStep(_) => "BrowserTabStep",
+        SMessage::BrowserZoom(_) => "BrowserZoom",
+        SMessage::BrowserFind { .. } => "BrowserFind",
+        SMessage::BrowserFindClose => "BrowserFindClose",
+        SMessage::BrowserBookmarkToggle => "BrowserBookmarkToggle",
+        SMessage::BrowserPageInfoAsk => "BrowserPageInfoAsk",
+        SMessage::BrowserTabs { .. } => "BrowserTabs",
+        SMessage::BrowserNavState { .. } => "BrowserNavState",
+        SMessage::BrowserFindResult { .. } => "BrowserFindResult",
+        SMessage::BrowserStatus(_) => "BrowserStatus",
+        SMessage::BrowserBookmarks { .. } => "BrowserBookmarks",
+        SMessage::BrowserPageInfo { .. } => "BrowserPageInfo",
+        SMessage::BrowserDownload { .. } => "BrowserDownload",
     }
 }
 

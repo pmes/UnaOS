@@ -208,6 +208,111 @@ pub mod text_field;
 pub mod glyph;
 pub mod image_view;
 pub mod console_view;
+// AETHERCHROME (SR84): the browser chrome's GTK face.
+pub mod tab_strip;
+pub mod url_bar;
+
+/// AETHERCHROME (SR84): the Aether browser window — the tab strip, the address row with the bookmark
+/// bar, and the page with its find bar / status line / downloads overlays — and the browser's keyboard
+/// shortcuts, installed on the window in the CAPTURE phase so they work whether the page, the address
+/// field or nothing has focus (the page still receives Esc, Ctrl+C/A/V and every unclaimed key).
+pub fn bootstrap_browser_chrome(window: &gtk4::ApplicationWindow, synapse: bandy::Synapse) -> NativeView {
+    use bandy::SMessage;
+    use gtk4::{CallbackAction, Orientation, PropagationPhase, Shortcut, ShortcutController, ShortcutTrigger};
+
+    let root = gtk4::Box::new(Orientation::Vertical, 0);
+    let strip = tab_strip::bootstrap_tab_strip(synapse.clone());
+    let bar = url_bar::bootstrap_url_bar(synapse.clone());
+    let page = image_view::bootstrap_page_view("viewport", synapse.clone());
+    root.append(&strip);
+    root.append(&bar.root);
+    root.append(&page.root);
+
+    let shortcuts = ShortcutController::new();
+    shortcuts.set_propagation_phase(PropagationPhase::Capture);
+    let add = |trigger: &str, action: CallbackAction| {
+        if let Some(t) = ShortcutTrigger::parse_string(trigger) {
+            shortcuts.add_shortcut(Shortcut::new(Some(t), Some(action)));
+        }
+    };
+    let send = |msg: SMessage| {
+        let syn = synapse.clone();
+        CallbackAction::new(move |_, _| {
+            syn.fire(msg.clone());
+            gtk4::glib::Propagation::Stop
+        })
+    };
+    for (trigger, msg) in [
+        ("<Control>t", SMessage::BrowserTabNew),
+        ("<Control>w", SMessage::BrowserTabClose(None)),
+        ("<Control>Tab", SMessage::BrowserTabStep(1)),
+        ("<Control>Page_Down", SMessage::BrowserTabStep(1)),
+        ("<Control><Shift>Tab", SMessage::BrowserTabStep(-1)),
+        ("<Control><Shift>ISO_Left_Tab", SMessage::BrowserTabStep(-1)),
+        ("<Control>Page_Up", SMessage::BrowserTabStep(-1)),
+        ("<Control>r", SMessage::BrowserNavReload),
+        ("F5", SMessage::BrowserNavReload),
+        ("<Alt>Left", SMessage::BrowserNavBack),
+        ("<Alt>Right", SMessage::BrowserNavForward),
+        ("<Control>d", SMessage::BrowserBookmarkToggle),
+        ("<Control>plus", SMessage::BrowserZoom(1)),
+        ("<Control>equal", SMessage::BrowserZoom(1)),
+        ("<Control>KP_Add", SMessage::BrowserZoom(1)),
+        ("<Control>minus", SMessage::BrowserZoom(-1)),
+        ("<Control>KP_Subtract", SMessage::BrowserZoom(-1)),
+        ("<Control>0", SMessage::BrowserZoom(0)),
+        ("<Control>KP_0", SMessage::BrowserZoom(0)),
+    ] {
+        add(trigger, send(msg));
+    }
+    // Ctrl+L: the address field.
+    {
+        let entry = bar.entry.clone();
+        add("<Control>l", CallbackAction::new(move |_, _| {
+            entry.grab_focus();
+            gtk4::glib::Propagation::Stop
+        }));
+    }
+    // Ctrl+F: the find bar.
+    {
+        let (find_bar, find_entry) = (page.find_bar.clone(), page.find_entry.clone());
+        add("<Control>f", CallbackAction::new(move |_, _| {
+            find_bar.set_visible(true);
+            find_entry.grab_focus();
+            gtk4::glib::Propagation::Stop
+        }));
+    }
+    // Ctrl+Shift+B: the bookmark bar.
+    {
+        let bookmark_bar = bar.bookmark_bar.clone();
+        add("<Control><Shift>b", CallbackAction::new(move |_, _| {
+            bookmark_bar.set_visible(!bookmark_bar.is_visible());
+            gtk4::glib::Propagation::Stop
+        }));
+    }
+    window.add_controller(shortcuts);
+
+    // The window title mirrors the active tab's document title.
+    {
+        let mut rx = synapse.subscribe();
+        let window = window.clone();
+        gtk4::glib::spawn_future_local(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(SMessage::BrowserTitleChanged(title)) => {
+                        let t = if title.trim().is_empty() { "Aether Browser".to_string() } else { format!("{title} — Aether") };
+                        window.set_title(Some(&t));
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    page.surface.grab_focus();
+    root.upcast()
+}
 // pub mod spline;
 // pub mod mega_bar;
 // pub mod types;

@@ -14,10 +14,11 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 47.
+Rows: 48.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| `aether.search` | string ≤512 printable | `"https://html.duckduckgo.com/html/?q=%s"` | operator | — | quartzite GTK url bar (`url_bar::search_template`), aether chrome omnibox | The address bar's search engine: a URL template whose `%s` (or `{searchTerms}`) becomes the urlencoded query when the typed text is not an address (AETHERCHROME). |
 | `system.appearance.accent` | enum `crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"crispy"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours). |
 | `system.appearance.highlight` | enum `accent \| crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"accent"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | The text-selection colour: `accent` follows the accent, or one of the eight accent names (APPEARANCE B408). |
 | `system.appearance.mode` | enum `light \| dark \| auto` | `"light"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408). |

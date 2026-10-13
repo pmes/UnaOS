@@ -22,6 +22,21 @@ use html_core::url;
 use js_core::builtins::host::Timer;
 use js_core::vm::*;
 
+/// History (§7.7.2) wired to the tab's session history (AETHERCHROME, SR84) — see `js/history.rs`.
+#[path = "history.rs"]
+pub mod history;
+
+thread_local! {
+    /// `devicePixelRatio`: the tab's page zoom (AETHERCHROME, SR84) — Chromium reports zoom × the
+    /// screen's scale; the shell's surface is 1:1, so it is the zoom alone.
+    static DPR: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+}
+
+/// The engine sets the zoom it lays the page out at (`AetherEngine::set_zoom_pct`).
+pub fn set_device_pixel_ratio(r: f64) {
+    DPR.with(|d| d.set(if r.is_finite() && r > 0.0 { r } else { 1.0 }));
+}
+
 // =================================================================================================
 // Timers (HTML §8.6) — the callbacks live in `vm.timers` (GC-traced); the schedule is the page clock
 // =================================================================================================
@@ -281,7 +296,7 @@ fn global_number(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         "innerHeight" | "outerHeight" => h as f64,
         "scrollX" | "pageXOffset" => sx,
         "scrollY" | "pageYOffset" => sy,
-        "devicePixelRatio" => 1.0,
+        "devicePixelRatio" => DPR.with(|d| d.get()),
         _ => 0.0,
     }))
 }
@@ -527,7 +542,7 @@ fn current_url() -> Option<url::Url> {
 
 /// Location-object navigate: a fragment-only change stays in the document (hashchange); anything else
 /// is staged for the shell, which performs navigations.
-fn navigate(vm: &mut Vm, target: &str, _replace: bool) -> JsResult<()> {
+fn navigate(vm: &mut Vm, target: &str, replace: bool) -> JsResult<()> {
     let base = super::page_url();
     let resolved = match url::Url::parse(&base).and_then(|b| b.join(target)) {
         Ok(u) => u,
@@ -547,6 +562,13 @@ fn navigate(vm: &mut Vm, target: &str, _replace: bool) -> JsResult<()> {
             if old != new {
                 page(|p| p.url = new.clone());
                 super::Engine::set_doc_url(&new);
+                // A fragment navigation is a same-document session history entry (HTML §7.4.2.3.3
+                // "navigate to a fragment": historyHandling push, or replace for location.replace).
+                history::queue(if replace {
+                    history::Op::Replace { url: new.clone(), state: None }
+                } else {
+                    history::Op::Push { url: new.clone(), state: None }
+                });
                 let init = vm.new_plain_object();
                 vm.create_data_property(init, PropertyKey::from_str("oldURL"), s(&old))?;
                 vm.create_data_property(init, PropertyKey::from_str("newURL"), s(&new))?;
@@ -627,15 +649,22 @@ fn loc_reload(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
 }
 
 // =================================================================================================
-// History (HTML §7.7.2) — same-document state only
+// History (HTML §7.7.2) — over the tab's session history (`history.rs`)
 // =================================================================================================
 
-fn history_get(vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
+/// The document's History object; a fresh one starts from the current entry's state.
+fn history_obj(vm: &mut Vm) -> Value {
     let doc = dom::main_doc();
-    Ok(dom::cached(vm, doc, SO_HISTORY, |vm| {
+    dom::cached(vm, doc, SO_HISTORY, |vm| {
+        let state = history::current_state();
+        let state = history::parse_state(vm, state.as_deref());
         let p = iface("History").unwrap().proto;
-        host_obj(vm, p, T_HISTORY, vec![Value::Null, num(1.0)])
-    }))
+        host_obj(vm, p, T_HISTORY, vec![state, num(1.0)])
+    })
+}
+
+fn history_get(vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
+    Ok(history_obj(vm))
 }
 
 fn this_history(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Obj> {
@@ -646,8 +675,8 @@ fn this_history(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Obj> {
 }
 
 fn history_length(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_history(vm, ctx)?;
-    Ok(slot(vm, o, 1))
+    this_history(vm, ctx)?;
+    Ok(num(history::length() as f64))
 }
 
 fn history_state(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -664,8 +693,10 @@ fn history_push(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let stringify = vm.get(json, &PropertyKey::from_str("stringify"))?;
     let parse = vm.get(json, &PropertyKey::from_str("parse"))?;
     let text = vm.call(&stringify, &Value::Object(json), &[state])?;
+    let serialized = if text.is_undefined() { None } else { Some(string(vm, &text)?) };
     let cloned = if text.is_undefined() { Value::Null } else { vm.call(&parse, &Value::Object(json), &[text])? };
     set_slot(vm, o, 0, cloned);
+    let mut entry_url = super::page_url();
     let u = arg(vm, ctx, 2);
     if !u.is_nullish() {
         let u = string(vm, &u)?;
@@ -677,18 +708,38 @@ fn history_push(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             }
             page(|p| p.url = nu.to_string());
             super::Engine::set_doc_url(&nu.href());
+            entry_url = nu.href();
         }
     }
-    if which == "pushState" {
-        let n = slot_num(vm, o, 1);
-        set_slot(vm, o, 1, num(n + 1.0));
-    }
+    // The session history entry (AETHERCHROME): pushState adds one, replaceState rewrites the current.
+    history::queue(if which == "pushState" {
+        history::Op::Push { url: entry_url, state: serialized }
+    } else {
+        history::Op::Replace { url: entry_url, state: serialized }
+    });
     Ok(Value::Undefined)
 }
 
+/// `back()`, `forward()`, `go(delta)`: traverse the session history (queued — §7.7.2 "traverse the
+/// history by a delta" runs as a task; the engine applies it at its next drain). `go(0)` / `go()` is
+/// a reload.
 fn history_nav(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     this_history(vm, ctx)?;
-    crate::ledger::record_js("history-traversal-not-supported");
+    let which = callee_str(vm, ctx);
+    let delta = match which.as_str() {
+        "back" => -1,
+        "forward" => 1,
+        _ => {
+            let d = arg(vm, ctx, 0);
+            if d.is_undefined() { 0 } else { vm.to_int32(&d)? }
+        }
+    };
+    if delta == 0 {
+        let u = super::page_url();
+        page(|p| p.pending_nav = Some(u));
+    } else {
+        history::queue(history::Op::Go(delta));
+    }
     Ok(Value::Undefined)
 }
 
@@ -1251,7 +1302,7 @@ pub fn install(vm: &mut Vm) {
     idl::op_with(vm, hist.proto, "pushState", 2, history_push, s("pushState"));
     idl::op_with(vm, hist.proto, "replaceState", 2, history_push, s("replaceState"));
     for name in ["back", "forward", "go"] {
-        op(vm, hist.proto, name, 0, history_nav);
+        idl::op_with(vm, hist.proto, name, 0, history_nav, s(name));
     }
 
     // Navigator, Screen
