@@ -417,7 +417,7 @@ refs/heads/exec-rmbp-cursorarm                ed9d3384 FOLDED-BY-HAND 0cbfe003 2
 refs/heads/exec-rmbp-bootlogcard              6372ae0d FOLDED-BY-HAND da5885ed 2026-10-13
 refs/heads/exec-rmbp-cursorshape              de18d363 FOLDED-BY-HAND 4635423c 2026-10-13
 refs/heads/exec-rmbp-jobscan2                 1a9eaeb7 FOLDED-BY-HAND ceaecdc7 2026-10-13
-refs/heads/exec-host-aetherstyle3             abcb8d33 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aetherstyle3             21deebae FOLDED-BY-HAND 5c841ceb 2026-10-13
 refs/heads/exec-host-aethersw                 ba928bd0 FOLDED-BY-HAND 13e01cbc 2026-10-13
 refs/heads/exec-rmbp-sonde2                   0069ca00 FOLDED-BY-HAND 25a2e59d 2026-10-13
 refs/heads/exec-rmbp-unakeys                  9f64d857 FOLDED-BY-HAND cf2256a5 2026-10-13
