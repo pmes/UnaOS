@@ -37,33 +37,9 @@ use html_core::{Document, NodeId};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// A list item's `::marker` as author-styled (css-lists-3 §3.1, css-pseudo-4 §3.2). `None` fields
-/// fall back to the item's own (inherited) values.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MarkerPaint {
-    /// The marker's text from a `content` list; `None` = `content: normal` (the list-style marker).
-    pub text: Option<String>,
-    /// `content: none`: no marker.
-    pub none: bool,
-    pub color: Option<(u8, u8, u8)>,
-    pub font_size: Option<f32>,
-    /// As `PaintStyle::font_size_rel`: (0, f) = f x the item's font-size, (1, f) = f x the root's.
-    pub font_size_rel: Option<(u8, f32)>,
-    pub weight: Option<super::FontWeight>,
-    pub italic: Option<bool>,
-    pub family: Option<u16>,
-}
-
-impl MarkerPaint {
-    /// The marker's font-size against the list item's.
-    pub fn size(&self, item: f32) -> f32 {
-        match self.font_size_rel {
-            Some((0, f)) => f * item,
-            Some((1, f)) => f * 16.0,
-            _ => self.font_size.unwrap_or(item),
-        }
-    }
-}
+/// A list item's `::marker` as author-styled: LAYOUTCORE (SR76) moved the type into `layout_core` beside
+/// `PaintStyle`, which carries it.
+pub use layout_core::MarkerPaint;
 
 /// One piece of a generated box's content.
 #[derive(Clone, Debug, PartialEq)]
@@ -440,7 +416,14 @@ pub(crate) fn generate(
     for (origin, kind, parts, mut style) in gen_boxes {
         let Some(&host) = boxes.get(&origin).and_then(|v| v.first()) else { continue };
         let node = box_node(&doc, origin, kind, &parts);
-        let Some(gid) = super::build_taffy_tree(&node, &mut tree.taffy, &mut tree.node_map, &mut tree.paint_map, quirks) else {
+        let Some(gid) = layout_core::build_taffy_tree::<super::AetherHost>(
+            &node,
+            &mut tree.taffy,
+            &mut tree.node_map,
+            &mut tree.paint_map,
+            quirks,
+            &crate::css::parse_cx(),
+        ) else {
             continue;
         };
         // The clearfix (`::after { content: ""; display: table; clear: both }`) after content that is
@@ -482,11 +465,6 @@ pub(crate) fn generate(
     out
 }
 
-/// True for a box this module generated (a detached element standing in the box tree).
-pub(crate) fn is_generated_box(tree: &LayoutTree, id: taffy::NodeId) -> bool {
-    tree.node_map.get(&id).is_some_and(|n| n.as_element().is_some() && n.parent().is_none())
-}
-
 /// Inline-level (or floated) by the cascade about to be folded: text, an element whose cascaded
 /// `display` is inline-level or that floats, else the tag default. Anonymous boxes are block boxes.
 fn inline_or_float(tree: &LayoutTree, styles: &HashMap<NodeId, Rc<SpecifiedStyle>>, k: taffy::NodeId) -> bool {
@@ -500,7 +478,7 @@ fn inline_or_float(tree: &LayoutTree, styles: &HashMap<NodeId, Rc<SpecifiedStyle
     }
     match st.and_then(|s| s.paint.display_kind) {
         Some(d) => d != 1,
-        None => super::is_inline_node(n),
+        None => layout_core::is_inline_node(n),
     }
 }
 
@@ -536,8 +514,7 @@ fn share_line(tree: &mut LayoutTree, styles: &HashMap<NodeId, Rc<SpecifiedStyle>
         flex_wrap: taffy::style::FlexWrap::Wrap,
         align_items: taffy::style::AlignItems::BASELINE,
         size: taffy::geometry::Size { width: taffy::style::Dimension::percent(1.0), height: taffy::style::Dimension::auto() },
-        position: taffy::style::Position::Relative,
-        ..Default::default()
+        ..layout_core::base_style()
     };
     let Ok(id) = tree.taffy.new_with_children(anon, &run) else { return };
     tree.paint_map.insert(id, super::PaintStyle::default());

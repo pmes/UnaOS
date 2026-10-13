@@ -7,17 +7,19 @@
 // ring-3 program on the image, in LUMEN.ELF's shape (LUMENAPP B323, R82). Peter (2026-10-05): "all the more reason
 // to get aether working".
 //
-// WHAT IT IS. A window over one HTML page read off the volume. The parser, the cascade and the text are the shared
-// no_std cores (seam `shared-core`): html_core (WHATWG tokenizer + tree construction into an arena DOM), css_core
-// (Syntax 3, Selectors 4, the cascade sort — matched over html_core's arena through `style::El`), font_core::ui (the
-// engine the kernel's video::text and Lumen draw with, the DejaVu faces off the volume). The CSS2 block + inline
-// formatter is this crate's own (src/layout.rs): the host engine (handlers/aether) lays out with taffy, which is
-// std, and porting it is M2's question.
+// WHAT IT IS. A window over one HTML page read off the volume. The parser, the cascade, the LAYOUT and the text are
+// the shared no_std cores (seam `shared-core`): html_core (WHATWG tokenizer + tree construction into an arena DOM),
+// css_core (Syntax 3, Selectors 4, the cascade sort — matched over html_core's arena through `style::El`),
+// layout_core (LAYOUTCORE SR76, AETHERMETAL M2: the host engine's box generation, taffy style mapping, inline
+// formatter, tables and margin collapsing — the SAME engine handlers/aether lays out with; M1's in-crate
+// formatter is gone), font_core::ui (the engine the kernel's video::text and Lumen draw with, the DejaVu faces off
+// the volume).
 //
 // PIPELINE. read (/system/doc/welcome.html, SYS_PATH_READ, else SYS_OPEN) → html_core::parse_document →
-// style::compute (UA sheet + <style> + style="") → layout::build (box tree) → layout::layout_root (block + inline
-// formatting at the window's width) → paint::paint (back buffer) → the surface → SYS_WIN_PRESENT. A resize lays
-// out again at the new width; a scroll repaints.
+// style::compute (<style> + style="", every winning declaration through layout_core::css::apply_declaration) →
+// layout_core::layout (box tree from the tag defaults, the cascade folded on, taffy + the inline formatter at the
+// window's width, text measured by txt::Fonts) → paint::paint (the LayoutTree into a back buffer) → the surface →
+// SYS_WIN_PRESENT. A resize lays out again at the new width; a scroll repaints.
 //
 // KEYS. Up/Down scroll a line (20 px), the wheel three, PageUp/PageDown (and Space) a window less one line,
 // Home/End (and Cmd/Ctrl+Home/End) the top and the bottom. Esc, or the window's close, exits.
@@ -31,13 +33,13 @@
 extern crate alloc;
 
 mod heap;
-mod layout;
 mod paint;
 mod style;
 mod sys;
 mod txt;
 
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use una_abi::{
     input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_UP,
     SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
@@ -132,10 +134,9 @@ fn landmark_base() -> u64 {
 }
 
 struct Page {
-    doc: html_core::Document,
+    doc: &'static html_core::Document,
     sty: style::Styled,
-    boxes: Option<layout::BoxNode>,
-    laid: Option<layout::Laid>,
+    tree: Option<style::Tree>,
     doc_h: f32,
     lines: usize,
     blocks: usize,
@@ -180,34 +181,24 @@ impl App {
     }
 }
 
-/// The canvas colour: the root's background, else the body's, else white (CSS2 §14.2).
-fn canvas_bg(doc: &html_core::Document, sty: &style::Styled) -> u32 {
-    let Some(root) = doc.document_element() else { return 0x00FF_FFFF };
-    if let Some(c) = sty.styles[sty.of[root.0]].bg {
-        return c;
-    }
-    for k in doc.element_children(root) {
-        if doc.element(k).is_some_and(|e| e.is_html("body")) {
-            if let Some(c) = sty.styles[sty.of[k.0]].bg {
-                return c;
-            }
-        }
-    }
-    0x00FF_FFFF
-}
-
-fn lay(p: &mut Page, txt: &mut txt::Txt, w: i32) {
-    let Some(b) = p.boxes.as_ref() else {
-        p.laid = None;
+/// Lay the page out at the window's size with layout_core (the host's engine): the line boxes of every inline
+/// formatting context are `lines`, the block-level boxes `blocks`, the root box's height `doc_h`.
+fn lay(p: &mut Page, fonts: &mut txt::Fonts, w: i32, h: i32) {
+    if p.doc.document_element().is_none() {
+        p.tree = None;
         p.doc_h = 0.0;
         return;
-    };
-    let mut cx = layout::Cx { sty: &p.sty, txt, stats: layout::Stats::default() };
-    let (l, h) = layout::layout_root(b, w as f32, &mut cx);
-    p.lines = cx.stats.lines;
-    p.blocks = cx.stats.blocks;
-    p.laid = Some(l);
-    p.doc_h = h;
+    }
+    let tree = layout_core::layout(&style::Doc(p.doc), &p.sty, fonts, (w as f32, h as f32));
+    p.lines = tree.inline.values().map(|il| il.lines.len()).sum();
+    p.blocks = tree
+        .node_map
+        .iter()
+        .filter(|(id, n)| layout_core::DomNode::is_element(*n) && layout_core::is_block_level(&tree, **id))
+        .count();
+    p.doc_h = tree.taffy.layout(tree.root_node).map(|l| l.size.height).unwrap_or(0.0);
+    p.bg = paint::canvas_bg(&tree);
+    p.tree = Some(tree);
 }
 
 #[no_mangle]
@@ -263,7 +254,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
     // The faces.
-    let (mut txt, why) = txt::load();
+    let (txt, why) = txt::load();
 
     let mut l = Line::new(b":: AETHER: start src=");
     match src {
@@ -289,13 +280,13 @@ pub extern "C" fn _start() -> ! {
         None => alloc::string::String::from(MISSING),
     };
     drop(bytes);
-    let doc = html_core::parse_document(&html, html_core::ParseOpts::default());
+    // One page per run: the arena lives as long as the program, so the layout tree's node handles are `'static`.
+    let doc: &'static html_core::Document = alloc::boxed::Box::leak(alloc::boxed::Box::new(html_core::parse_document(&html, html_core::ParseOpts::default())));
     drop(html);
-    let sty = style::compute(&doc, MAX_W as f32, MAX_H as f32);
-    let boxes = layout::build(&doc, &sty);
-    let bg = canvas_bg(&doc, &sty);
-    let mut page = Page { doc, sty, boxes, laid: None, doc_h: 0.0, lines: 0, blocks: 0, bg };
-    lay(&mut page, &mut txt, app.w);
+    let sty = style::compute(doc, app.w as f32, app.h as f32);
+    let mut fonts = txt::Fonts(RefCell::new(txt));
+    let mut page = Page { doc, sty, tree: None, doc_h: 0.0, lines: 0, blocks: 0, bg: 0x00FF_FFFF };
+    lay(&mut page, &mut fonts, app.w, app.h);
     let mut cv = paint::Canvas::new(app.w, app.h);
     let mut reported = false;
 
@@ -344,7 +335,7 @@ pub extern "C" fn _start() -> ! {
             k += 1;
         }
         if app.relayout {
-            lay(&mut page, &mut txt, app.w);
+            lay(&mut page, &mut fonts, app.w, app.h);
             app.relayout = false;
             app.scroll = app.scroll.clamp(0.0, app.max_scroll(&page));
         }
@@ -352,8 +343,8 @@ pub extern "C" fn _start() -> ! {
             if cv.w != app.w || cv.h != app.h {
                 cv = paint::Canvas::new(app.w, app.h);
             }
-            match page.laid.as_ref() {
-                Some(l) => paint::paint(&mut cv, l, app.scroll, page.bg, &page.sty, &mut txt),
+            match page.tree.as_ref() {
+                Some(t) => paint::paint(&mut cv, t, app.scroll, page.bg, &fonts),
                 None => cv.fill(0, 0, cv.w, cv.h, page.bg),
             }
             app.blit(&cv);
@@ -387,7 +378,7 @@ fn report(path: &[u8], read: bool, p: &Page, cv: &paint::Canvas, ms: u64, total_
     l.put(b" heap_kib=").dec((HEAP.usage().1 / 1024) as i64);
     l.put(b" ::");
     l.wire();
-    let _ = &p.doc;
+    let _ = p.doc;
 }
 
 #[panic_handler]

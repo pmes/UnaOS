@@ -21,7 +21,9 @@
 //! - the root element's margins do not collapse; nor do those of
 //!   absolutely positioned boxes, flex items, inline-level boxes, or boxes
 //!   with `overflow` other than visible (each is its own formatting root).
-use super::LayoutTree;
+use crate::prelude::*;
+use crate::tree::LayoutTree;
+use crate::{DomNode, Host, NodeKind};
 use taffy::prelude::*;
 use taffy::style::{FlexDirection, LengthPercentageAuto, Position};
 
@@ -68,13 +70,13 @@ fn zero_lp(v: taffy::style::LengthPercentage) -> bool {
     raw.tag() == taffy::style::CompactLength::LENGTH_TAG && raw.value() == 0.0
 }
 
-fn tag_of(tree: &LayoutTree, id: NodeId) -> Option<String> {
-    tree.node_map.get(&id).and_then(|n| n.as_element().map(|e| e.name.local.as_ref().to_string()))
+fn tag_of<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Option<String> {
+    tree.node_map.get(&id).and_then(|n| n.tag())
 }
 
 /// Boxes that are block containers in Aether's approximation: a column
 /// box that is not a real flex container, not a table part, not clipped.
-fn is_block_container(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
+fn is_block_container<H: Host>(tree: &LayoutTree<H>, id: NodeId, st: &Style) -> bool {
     if st.display == Display::None || st.flex_direction != FlexDirection::Column {
         return false;
     }
@@ -84,35 +86,34 @@ fn is_block_container(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
     }
     match tree.node_map.get(&id) {
         Some(n) => {
-            let Some(el) = n.as_element() else { return n.as_document().is_some() };
-            let tag = el.name.local.as_ref();
-            !super::is_table_part(tag) && super::is_block_level(tree, id)
+            let Some(tag) = n.tag() else { return n.kind() == NodeKind::Document };
+            !crate::tree::is_table_part(&tag) && crate::tree::is_block_level(tree, id)
         }
         // Anonymous boxes are rows; a column without a DOM node is not ours.
         None => false,
     }
 }
 
-pub(crate) fn is_block_container_pub(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
+pub(crate) fn is_block_container_pub<H: Host>(tree: &LayoutTree<H>, id: NodeId, st: &Style) -> bool {
     is_block_container(tree, id, st)
 }
 
-pub(crate) fn in_flow_block_pub(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
+pub(crate) fn in_flow_block_pub<H: Host>(tree: &LayoutTree<H>, id: NodeId, st: &Style) -> bool {
     in_flow_block(tree, id, st)
 }
 
 /// True when this box is an in-flow block-level participant of its
 /// parent's block formatting context.
-fn in_flow_block(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
+fn in_flow_block<H: Host>(tree: &LayoutTree<H>, id: NodeId, st: &Style) -> bool {
     if st.display == Display::None || st.position == Position::Absolute {
         return false;
     }
     match tree.node_map.get(&id) {
         Some(n) => {
-            if n.as_text().is_some() {
+            if n.is_text() {
                 return false;
             }
-            super::is_block_level(tree, id)
+            crate::tree::is_block_level(tree, id)
         }
         None => true, // anonymous block box around an inline run
     }
@@ -123,8 +124,8 @@ fn in_flow_block(tree: &LayoutTree, id: NodeId, st: &Style) -> bool {
 /// its children's). Returns `id`'s effective (top, bottom) margins: its
 /// own, collapsed with whatever escaped from its first/last children, or
 /// None for a side that is not collapsible.
-fn walk(
-    tree: &mut LayoutTree,
+fn walk<H: Host>(
+    tree: &mut LayoutTree<H>,
     id: NodeId,
     bfc_child: bool,
     saved: &mut Saved,
@@ -237,7 +238,7 @@ fn walk(
         }
     } else if kids.is_empty() {
         // A leaf element with no content: empty if nothing gives it height.
-        let leaf_el = tree.node_map.get(&id).and_then(|n| n.as_element().map(|e| e.name.local.as_ref().to_string()));
+        let leaf_el = tree.node_map.get(&id).and_then(|n| n.tag());
         is_empty_box = bfc_child
             && leaf_el.is_some_and(|t| !matches!(t.as_str(), "img" | "input" | "select" | "textarea" | "button" | "hr" | "svg" | "canvas" | "video" | "iframe" | "br"))
             && st.size.height.is_auto()
@@ -254,7 +255,7 @@ fn walk(
     (top_out, bot_out, is_empty_box)
 }
 
-fn write_margins(tree: &mut LayoutTree, id: NodeId, top: f32, bottom: f32, saved: &mut Saved) {
+fn write_margins<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, top: f32, bottom: f32, saved: &mut Saved) {
     let Ok(st) = tree.taffy.style(id) else { return };
     let (t0, b0) = (st.margin.top, st.margin.bottom);
     if px(t0) == Some(top) && px(b0) == Some(bottom) {
@@ -269,7 +270,7 @@ fn write_margins(tree: &mut LayoutTree, id: NodeId, top: f32, bottom: f32, saved
 
 /// Rewrites the box tree's vertical margins to their collapsed values.
 /// Returns what [`restore`] needs to put the specified margins back.
-pub(crate) fn apply(tree: &mut LayoutTree) -> Saved {
+pub(crate) fn apply<H: Host>(tree: &mut LayoutTree<H>) -> Saved {
     let mut saved = Saved::new();
     let root = tree.root_node;
     walk(tree, root, false, &mut saved);
@@ -278,7 +279,7 @@ pub(crate) fn apply(tree: &mut LayoutTree) -> Saved {
 
 /// Puts back the specified margins [`apply`] replaced. The computed layout
 /// stays; only the styles return to author values.
-pub(crate) fn restore(tree: &mut LayoutTree, saved: Saved) {
+pub(crate) fn restore<H: Host>(tree: &mut LayoutTree<H>, saved: Saved) {
     for (id, t, b) in saved.into_iter().rev() {
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();
