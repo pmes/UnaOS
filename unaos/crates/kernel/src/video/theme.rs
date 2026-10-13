@@ -1018,3 +1018,46 @@ pub const POINTER_SHAPE_INK: [(u32, u32); 8] = [
     (POINTER_FILL, POINTER_SHADOW),           // resize-ew
     (POINTER_FILL, POINTER_SHADOW),           // busy
 ];
+
+// ── GLASSKIT (rmbp-ledger B628) — the drawing kit's roles (`video/draw.rs`), every one DERIVED from the set above ──
+// No new colour: each role is a live token mixed, lifted or given an alpha, so Light/Dark and the accent move them
+// with everything else. Alpha-bearing roles are straight `0xAARRGGBB` words (`draw::Ink::argb`). Appended at the file
+// tail: no line above moves.
+/// The hairline's opacity (of 255): an edge the eye reads as a line, not a border.
+pub const HAIRLINE_ALPHA: u32 = 31;
+/// A control's edge (a check box, a field, an unpressed button): one step firmer than a hairline.
+pub const CONTROL_EDGE_ALPHA: u32 = 56;
+/// The focus ring's opacity over the accent.
+pub const FOCUS_RING_ALPHA: u32 = 120;
+/// A soft (control-sized) shadow's peak opacity, Light / Dark.
+pub const SHADOW_SOFT_ALPHA: (u32, u32) = (46, 110);
+/// A window's shadow's peak opacity, Light / Dark.
+pub const SHADOW_WINDOW_ALPHA: (u32, u32) = (72, 150);
+/// How far a group box's fill is lifted above the window's face, per channel.
+pub const GROUP_LIFT: u32 = 8;
+
+/// `c` lifted `n` per channel toward white, saturating.
+fn lift(c: u32, n: u32) -> u32 {
+    let ch = |s: u32| (((c >> s) & 0xFF) + n).min(255) << s;
+    ch(16) | ch(8) | ch(0)
+}
+/// The hairline: the content ink at [`HAIRLINE_ALPHA`].
+#[inline] pub fn hairline() -> u32 { content_text() | (HAIRLINE_ALPHA << 24) }
+/// A control's edge: the content ink at [`CONTROL_EDGE_ALPHA`].
+#[inline] pub fn control_edge() -> u32 { content_text() | (CONTROL_EDGE_ALPHA << 24) }
+/// The focus ring: the accent at [`FOCUS_RING_ALPHA`].
+#[inline] pub fn focus_ring() -> u32 { accent() | (FOCUS_RING_ALPHA << 24) }
+/// A knob's or a button's shadow (black, the set's soft peak).
+#[inline] pub fn shadow_soft() -> u32 { (if is_dark() { SHADOW_SOFT_ALPHA.1 } else { SHADOW_SOFT_ALPHA.0 }) << 24 }
+/// A window's drop shadow (black, the set's window peak).
+#[inline] pub fn shadow_window() -> u32 { (if is_dark() { SHADOW_WINDOW_ALPHA.1 } else { SHADOW_WINDOW_ALPHA.0 }) << 24 }
+/// An inset group box's fill: the window's face one step lighter.
+#[inline] pub fn group_fill() -> u32 { lift(chrome_face(), GROUP_LIFT) }
+/// An off switch's track, a slider's rail, a segmented control's well: the face a sixth of the way to the ink.
+#[inline] pub fn control_track() -> u32 { mix(chrome_face(), content_text(), 1, 6) }
+/// A knob, an unchecked box, a plain button's face: the field's white on Light, the light ink on Dark.
+#[inline] pub fn knob_face() -> u32 { if is_dark() { content_text() } else { field_bg() } }
+/// Ink drawn ON the accent (a check mark, a selected row's label, the default button's label).
+#[inline] pub fn ink_on_accent() -> u32 { if is_dark() { content_text() } else { field_bg() } }
+/// The secondary ink (a group's title, a caption): the content ink two fifths of the way to the face.
+#[inline] pub fn ink_secondary() -> u32 { mix(content_text(), chrome_face(), 2, 5) }
