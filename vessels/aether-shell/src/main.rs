@@ -97,6 +97,69 @@ enum TabCmd {
     Shutdown,
     /// AETHERDEVTOOLS2 (SR112): the window's developer-tools chrome changed (opened, closed, docked, resized).
     Devtools(chrome::DevtoolsChrome),
+    /// A11YFACE (SR124): one AT-SPI cache request from the socket (`aether::dom::a11y::atspi::answer`).
+    Atspi(AtspiQuery),
+}
+
+/// A11YFACE (SR124): a request line read off the accessibility socket and where its answer goes.
+struct AtspiQuery {
+    request: String,
+    reply: tokio::sync::oneshot::Sender<String>,
+}
+
+/// The application name the socket's objects carry (`:unaos.aether-<pid>`; there is no bus name to give).
+fn atspi_app() -> String {
+    format!(":unaos.aether-{}", std::process::id())
+}
+
+/// A11YFACE (SR124): the AT-SPI cache socket. AT-SPI over D-Bus is refused (the workspace carries no D-Bus
+/// crate, R83 — `aether::dom::a11y::atspi`'s doc); the same objects are served on
+/// `$XDG_RUNTIME_DIR/unaos-aether-a11y-<pid>.sock` (mode 0600, the runtime dir is the user's own): one request
+/// line per connection, answered by the active tab's engine. No runtime dir: no socket, and the refusal says
+/// so (never a fallback under /tmp).
+fn spawn_atspi_socket(tx: UnboundedSender<AtspiQuery>) -> Option<std::path::PathBuf> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).filter(|d| d.is_dir()) else {
+        eprintln!(":: a11y: atspi-cache socket REFUSED reason=no XDG_RUNTIME_DIR ::");
+        return None;
+    };
+    let path = dir.join(format!("unaos-aether-a11y-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(":: a11y: atspi-cache socket REFUSED reason={e} ::");
+            return None;
+        }
+    };
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    eprintln!(":: a11y: atspi-cache socket {} (AT-SPI D-Bus refused: no D-Bus crate, R83) ::", path.display());
+    thread::Builder::new()
+        .name("aether-a11y-socket".into())
+        .spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { continue };
+                let tx = tx.clone();
+                // One request per connection, each on its own thread: a slow client never holds the next.
+                let _ = thread::Builder::new().name("aether-a11y-conn".into()).spawn(move || {
+                    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut line = String::new();
+                    if BufReader::new((&conn).take(4096)).read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    if tx.send(AtspiQuery { request: line.trim().to_string(), reply }).is_err() {
+                        return;
+                    }
+                    let answer = rx.blocking_recv().unwrap_or_else(|_| "ERR no page\n".to_string());
+                    let _ = (&conn).write_all(answer.as_bytes());
+                });
+            }
+        })
+        .ok()?;
+    Some(path)
 }
 
 /// A tab → the coordinator.
@@ -317,6 +380,9 @@ impl Tab {
                         return;
                     }
                     TabCmd::Activate => self.present_all(),
+                    TabCmd::Atspi(q) => {
+                        let _ = q.reply.send(aether::dom::a11y::atspi::answer(&self.engine, &q.request, &atspi_app()));
+                    }
                     TabCmd::Devtools(c) => {
                         self.devtools_chrome = c;
                         self.last_lines = None;
@@ -499,6 +565,24 @@ impl Tab {
                 let (secure, summary) = chrome::host::page_info(&url);
                 self.show(SMessage::BrowserPageInfo { url, secure, summary });
             }
+            // A11YFACE (SR124): an accessibility verb (`a11y tree`, `a11y skip`, heading / landmark moves) on this
+            // tab's page; the answer goes back to the face.
+            SMessage::BrowserA11y(verb) => {
+                let lines = aether::dom::a11y::nav::run(&mut self.engine, &verb);
+                self.show(SMessage::BrowserA11yLines(lines));
+            }
+            // A11YFACE (SR124): Principia's accessibility rows (the face read them): the media features and the
+            // focus ring follow, and the page restyles (`A11yPrefs::apply`).
+            SMessage::BrowserA11yPrefs { reduce_motion, contrast, forced_colors } => {
+                let p = aether::dom::a11y::prefs::A11yPrefs::from_rows(reduce_motion, &contrast, forced_colors);
+                p.apply(Some(&mut self.engine));
+                let (w, h) = (self.engine.width, self.engine.height);
+                self.engine.damage_rects.push((0, 0, w, h));
+                self.engine.needs_repaint = true;
+                if self.is_active() {
+                    eprintln!("{}", p.witness());
+                }
+            }
             _ => {}
         }
         // A link click or form submit staged a navigation; a page's `history.back()` may have staged a
@@ -602,6 +686,8 @@ struct Coordinator {
     last_resize: Option<(u32, u32)>,
     /// AETHERDEVTOOLS2 (SR112): the window's developer-tools chrome (open, dock, share).
     devtools: chrome::DevtoolsChrome,
+    /// A11YFACE (SR124): the last accessibility rows the face sent (every new tab gets them).
+    a11y_prefs: Option<SMessage>,
 }
 
 /// AETHERDEVTOOLS2 (SR112): the face's layout for the pane — `DevtoolsChrome::split` of the content area
@@ -653,6 +739,9 @@ impl Coordinator {
     fn open_tab(&mut self) {
         let id = self.strip.open();
         let tx = spawn_tab(id, self.bus.clone(), self.active.clone(), self.reports.clone());
+        if let Some(p) = &self.a11y_prefs {
+            let _ = tx.send(TabCmd::Msg(p.clone()));
+        }
         self.tabs.insert(id, tx);
         self.activate(id);
     }
@@ -748,6 +837,14 @@ impl Coordinator {
                 let tab = c.receipt_id().map(receipt_tab).unwrap_or(0);
                 self.send(tab, TabCmd::Msg(SMessage::Facet(c)));
             }
+            // A11YFACE (SR124): the accessibility rows are every tab's (each engine thread keeps its own focus-ring
+            // theme and restyles its own page); kept for the tabs opened later.
+            SMessage::BrowserA11yPrefs { .. } => {
+                for tx in self.tabs.values() {
+                    let _ = tx.send(TabCmd::Msg(m.clone()));
+                }
+                self.a11y_prefs = Some(m);
+            }
             // Stria's answers are keyed by media url; every tab's engine takes the ones it asked for.
             SMessage::MediaOpened { .. } | SMessage::MediaFrame { .. } | SMessage::MediaEnded { .. } | SMessage::MediaError { .. } => {
                 for tx in self.tabs.values() {
@@ -772,7 +869,8 @@ impl Coordinator {
             | SMessage::BrowserFindClose
             | SMessage::BrowserPageInfoAsk
             | SMessage::BrowserDevtoolsPanel(_)
-            | SMessage::BrowserDevtoolsEval(_) => self.to_active(m),
+            | SMessage::BrowserDevtoolsEval(_)
+            | SMessage::BrowserA11y(_) => self.to_active(m),
             _ => {}
         }
     }
@@ -822,7 +920,12 @@ impl Coordinator {
         }
     }
 
-    async fn run(mut self, mut bus_rx: tokio::sync::broadcast::Receiver<SMessage>, mut reports_rx: UnboundedReceiver<TabReport>) {
+    async fn run(
+        mut self,
+        mut bus_rx: tokio::sync::broadcast::Receiver<SMessage>,
+        mut reports_rx: UnboundedReceiver<TabReport>,
+        mut atspi_rx: UnboundedReceiver<AtspiQuery>,
+    ) {
         self.open_tab();
         loop {
             tokio::select! {
@@ -832,6 +935,8 @@ impl Coordinator {
                     Err(_) => return,
                 },
                 Some(r) = reports_rx.recv() => self.on_report(r),
+                // A11YFACE (SR124): an AT-SPI cache request goes to the active tab's engine.
+                Some(q) = atspi_rx.recv() => self.send(self.strip.active(), TabCmd::Atspi(q)),
             }
         }
     }
@@ -862,6 +967,8 @@ fn main() {
     // AETHERCHROME (SR84): the coordinator (tab strip, bookmarks, downloads; the router) and, through
     // it, one engine thread per tab. Subscribed before the window exists, so nothing the chrome
     // fires is missed.
+    let (atspi_tx, atspi_rx) = unbounded_channel();
+    let atspi_socket = spawn_atspi_socket(atspi_tx);
     {
         let bus = synapse.clone();
         let bus_rx = synapse.subscribe();
@@ -882,8 +989,9 @@ fn main() {
                     next_download: 0,
                     last_resize: None,
                     devtools: chrome::DevtoolsChrome::default(),
+                    a11y_prefs: None,
                 };
-                local.block_on(&rt, coordinator.run(bus_rx, reports_rx));
+                local.block_on(&rt, coordinator.run(bus_rx, reports_rx, atspi_rx));
             })
             .expect("spawn chrome coordinator thread");
     }
@@ -928,6 +1036,11 @@ fn main() {
         ]);
 
         quartzite::Backend::new_tetra_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), aether_ui, synapse.clone()).run();
+    }
+
+    // A11YFACE (SR124): the window closed — the socket goes with the process.
+    if let Some(p) = atspi_socket {
+        let _ = std::fs::remove_file(p);
     }
 }
 

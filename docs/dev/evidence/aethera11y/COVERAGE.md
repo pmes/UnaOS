@@ -113,19 +113,27 @@ What `handlers/aether/src/dom/a11y/` (source: `handlers/aether/src/a11y/`) compu
 | Principia `system.accessibility.*` → prefers-reduced-motion, prefers-contrast, forced-colors | accessibility_media_features_follow_principia |
 | devtools Accessibility panel: tree rows, selected node's role / name (from) / states / tab order | devtools_accessibility_panel |
 
-## Owed outside this arc's files (not made; the exact change)
+## The face (A11YFACE, SR124) — what was "not done" and what now works
 
-1. `handlers/aether/src/lib.rs` `key_default` (lib.rs:996), first statement:
-   `if crate::dom::a11y::keyboard::handle_key(self, &key) { return; }` — the shell's `KeyDown` then
-   reaches Tab / Enter-on-link / arrows (today only a caller of `handle_key` does). Optionally move the
-   module declaration from `dom/mod.rs` (`#[path = "../a11y/mod.rs"]`) to lib.rs as `pub mod a11y;`.
-2. `handlers/aether/src/lib.rs` MouseUp (lib.rs:869): `crate::dom::a11y::focus::set_starting_point(Some(node.clone()))`
-   (HTML §6.6.3: a click moves the sequential navigation starting point) and keep `js` PageState.focused in step
-   with `set_focus` (today a click focuses the engine's control but not `document.activeElement`).
-3. `libs/quartzite/src/platforms/gtk/devtools_view.rs` `PANELS`: append `"Accessibility"` (6 entries).
-4. The GTK face: read Principia `system.accessibility.*` and call
-   `aether::dom::a11y::prefs::A11yPrefs::from_prefs(|k| …).apply(Some(&mut engine))` at start and on change;
-   bind the shell verbs (`nav::skip_to_content`, `nav::next_heading`, `nav::next_landmark`) to keys / bandy verbs
-   (`vessels/aether-shell/src/main.rs`, `libs/bandy/src/signals.rs`).
-5. AT-SPI: a bridge over `a11y::tree` (the read API is in place; nothing exports it yet).
-6. `outline: none` is not honored by the ring: layout_core carries no `outline` value to paint or read.
+Every row is fixed-unflown: written and compiled (`cargo check --workspace --tests --features aether-shell/gtk`
+rc=0), tests written not run (R107) until the seat's fold.
+
+| SR119 "not done" | now | where | test |
+| :-- | :-- | :-- | :-- |
+| 1. `key_default` → `keyboard::handle_key` | already folded at c4c99344 (lib.rs:990) | — | tab_order_follows_tabindex |
+| 2. a click moves the starting point | already folded at c4c99344 (lib.rs:866) | — | — |
+| 3. devtools `PANELS` gains Accessibility | already folded at c4c99344 (devtools_view.rs, 6 entries) | — | devtools_accessibility_panel |
+| 4a. the GTK face reads `system.accessibility.*` | at start and on change: Principia's store (`PrefStore::load` + `effective`), re-read on a `PrefChanged` for `system`/`accessibility.*` on the bus and on a `gio::FileMonitor` of the store folder; sent as `BrowserA11yPrefs`; the shell's coordinator hands it to every tab (and each new one), whose engine runs `A11yPrefs::apply` (media queries flip, page restyles, ring width) and prints `:: a11y: prefs contrast=… forced=… motion=… -> applied ::` | `libs/quartzite/src/platforms/gtk/a11y_prefs.rs`, `vessels/aether-shell/src/main.rs`, `a11y/prefs.rs` (`from_rows`, `witness`) | accessibility_media_features_follow_principia, reading_keys_drive_the_shell_verbs (witness) |
+| 4b. reading verbs bound to keys and bandy verbs | Alt+1 skip to content, H / Shift+H heading, D / Shift+D landmark — in the keydown default (a page that cancels its key keeps it), refused while a text field, editing host, `<select>` or typeahead widget is focused; F6 / Shift+F6 cycle address field ↔ page (the face's capture-phase shortcut); bandy `A11yVerb` (`a11y tree`, `a11y skip`, `a11y next/previous heading [N]`, `a11y next/previous landmark`) as `BrowserA11y`, answered by `BrowserA11yLines` | `a11y/keyboard.rs` `reading_key`, `a11y/nav.rs` `run`, `libs/bandy/src/signals.rs`, `gtk/mod.rs` | reading_keys_drive_the_shell_verbs, a11y_verb_table_round_trips, kat_browser_a11y_* |
+| 5. AT-SPI | the tree in AT-SPI2's `GetItems` shape (path, app, parent, index, child count, interfaces, name, AtspiRole, description, state words) with Component extents and Text, for every object (root and focus at least), password text masked; served on `$XDG_RUNTIME_DIR/unaos-aether-a11y-<pid>.sock` (0600; `GetItems` / `GetRoot` / `GetFocus`, twelve tab-separated fields per line, `.` ends) | `a11y/atspi.rs`, `vessels/aether-shell/src/main.rs` | atspi_cache_shape_for_root_and_focus |
+| 6. `outline: none` and the ring | `outline` / `outline-width` / `-style` / `-color` / `-offset` are their own paint in layout_core (no longer the border); author outlines paint outside the border box grown by the offset, last in the frame; the ring yields to a visible author outline, and to `outline: none` only when an author `:focus-visible` rule matches the element | `layout_core/src/{css,paint}.rs`, `css_core/src/selectors.rs` (`mentions_state`), `render/focusring.rs`, `a11y/focus.rs` | outline_paints_outside_the_border_box_and_is_never_a_border, selectors_report_the_focus_visible_state, outline_none_and_author_outlines_replace_the_ring |
+
+## Refused, and why
+
+| what | why |
+| :-- | :-- |
+| AT-SPI on the D-Bus accessibility bus (registration, `org.a11y.atspi.*` objects, events) | root Cargo.lock at c4c99344 carries no D-Bus crate (no zbus, dbus, atspi, accesskit); R83 admits no new heavy dependency without a ruling. The cache shape is served on the socket above until a ruling names the transport. |
+| AT-SPI events (focus, text-changed, children-changed) | no bus to emit on; a client polls `GetFocus`. |
+| Outlines under transforms and in multicol fragments | the untransformed border box is outlined. |
+| `outline-*` longhands in Aether's `@supports` set | `handlers/aether/src/css/mod.rs` `property_supported` lists only `outline`; outside this arc's files. Exact change: add `"outline-width" \| "outline-style" \| "outline-color" \| "outline-offset"` beside `"outline"` (css/mod.rs:808). |
+| Role / state numbers checked against a live AT-SPI registry | none on this host; the values are at-spi2-core's `atspi-constants.h`, marked unverified in `atspi.rs`. |

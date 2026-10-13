@@ -135,3 +135,18 @@ pub fn skip_to_content(engine: &mut AetherEngine) -> Option<usize> {
     let n = dom_node(engine, id)?;
     Some(go_to(engine, &n))
 }
+
+/// A11YFACE (SR124): runs a bandy accessibility verb ([`bandy::A11yVerb`], the shell's `BrowserA11y`) on the
+/// engine's page and answers its lines — `a11y tree`: the tree's; a move: the one line of the node the reading
+/// position moved to ([`AxTree::line`]), empty when there was nothing to move to.
+pub fn run(engine: &mut AetherEngine, verb: &bandy::A11yVerb) -> Vec<String> {
+    use bandy::A11yVerb as V;
+    let moved = match *verb {
+        V::Tree => return super::tree(engine).lines(),
+        V::Skip => skip_to_content(engine),
+        V::NextHeading { backward, level } => next_heading(engine, level, backward),
+        V::NextLandmark { backward } => next_landmark(engine, backward),
+    };
+    let Some(id) = moved else { return Vec::new() };
+    super::tree(engine).find_dom(id).map(|n| vec![AxTree::line(n)]).unwrap_or_default()
+}

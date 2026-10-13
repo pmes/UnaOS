@@ -215,6 +215,8 @@ pub mod url_bar;
 pub mod probe_view;
 // AETHERDEVTOOLS2 (SR112): the developer-tools pane's face — the split beside the page, the splitter, the dock pref.
 pub mod devtools_view;
+// A11YFACE (SR124): Principia's `system.accessibility.*` rows, read at start and on change, sent to the shell.
+pub mod a11y_prefs;
 
 /// AETHERCHROME (SR84): the Aether browser window — the tab strip, the address row with the bookmark
 /// bar, and the page with its find bar / status line / downloads overlays — and the browser's keyboard
@@ -301,7 +303,22 @@ pub fn bootstrap_browser_chrome(window: &gtk4::ApplicationWindow, synapse: bandy
             gtk4::glib::Propagation::Stop
         }));
     }
+    // A11YFACE (SR124): F6 / Shift+F6 move focus between the chrome (the address field) and the page, as browsers
+    // do; on the page surface the page's own keys work (Tab, Alt+1, H, D — `aether::dom::a11y::keyboard`).
+    for trigger in ["F6", "<Shift>F6"] {
+        let (entry, surface) = (bar.entry.clone(), page.surface.clone());
+        add(trigger, CallbackAction::new(move |_, _| {
+            if surface.has_focus() {
+                entry.grab_focus();
+            } else {
+                surface.grab_focus();
+            }
+            gtk4::glib::Propagation::Stop
+        }));
+    }
     window.add_controller(shortcuts);
+    // A11YFACE (SR124): the accessibility rows, now and on every change.
+    a11y_prefs::bootstrap_a11y_prefs(synapse.clone());
 
     // The window title mirrors the active tab's document title.
     {

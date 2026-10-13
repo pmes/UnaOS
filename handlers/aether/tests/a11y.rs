@@ -604,3 +604,121 @@ fn devtools_accessibility_panel() {
     assert_eq!((ins.role, ins.tab_stop), ("textbox", Some(1)));
     assert!(ins.states.contains(&"required".to_string()));
 }
+
+/// The surface pixel at (`x`, `y`) as RGB.
+fn pixel(e: &AetherEngine, x: u32, y: u32) -> (u8, u8, u8) {
+    let i = ((y * e.width + x) * 4) as usize;
+    (e.surface[i + 2], e.surface[i + 1], e.surface[i])
+}
+
+/// A11YFACE (SR124): the ring and the author's outline. A bare `:focus { outline: none }` keeps the ring (the
+/// WCAG 2.4.7 UA convention); with the author's own `:focus-visible` styling the `outline: none` is honoured; an
+/// author outline replaces the ring and paints outside the border box grown by `outline-offset`.
+#[test]
+fn outline_none_and_author_outlines_replace_the_ring() {
+    const BODY: &str = r#"<body style="margin:0"><button id="b" style="margin:20px">Go</button></body>"#;
+    let ring_at = |css: &str| {
+        let mut e = page(&format!("<head><style>{css}</style></head>{BODY}"));
+        assert!(keyboard::handle_key(&mut e, "Tab"));
+        assert_eq!(focused_id(&e).as_deref(), Some("b"));
+        e.damage_rects.push((0, 0, e.width, e.height));
+        e.render_frame();
+        let (x, y, _w, h) = e.box_of(&dom(&e, "b")).unwrap();
+        let mid = (y + h / 2.0) as u32;
+        (1..=6).map(|d| pixel(&e, x as u32 - d, mid)).collect::<Vec<_>>()
+    };
+    let ring = (16, 16, 16);
+    assert_eq!(ring_at("button:focus { outline: none }")[0], ring, "outline: none without :focus-visible styling keeps the ring");
+    assert_ne!(
+        ring_at("button:focus { outline: none } button:focus-visible { background-color: rgb(200, 200, 0) }")[0],
+        ring,
+        "the author styles :focus-visible: outline: none removes the ring"
+    );
+    let red = (255, 0, 0);
+    let band = ring_at("button:focus-visible { outline: 2px solid rgb(255, 0, 0); outline-offset: 2px }");
+    assert!(band[0] != ring && band[0] != red && band[1] != red, "the 2px offset gap: {band:?}");
+    assert_eq!((band[2], band[3]), (red, red), "the author's 2px outline, outside the gap: {band:?}");
+    assert_ne!(band[4], red, "{band:?}");
+    assert!(!band.contains(&ring), "the author's outline replaces the ring: {band:?}");
+}
+
+/// A11YFACE (SR124): the reading keys reach the shell's verbs through the keydown default — Alt+1 skips to content,
+/// H / Shift+H walk headings, D / Shift+D landmarks — and a focused text field or `<select>` keeps its letters.
+#[test]
+fn reading_keys_drive_the_shell_verbs() {
+    let mut e = page(
+        r#"<body><nav id="n"><a href="/a">A</a></nav><main id="main"><h1 id="t">Title</h1><h2 id="s">Sub</h2>
+<input id="q"><select id="sel"><option>h</option></select></main><footer id="f">f</footer></body>"#,
+    );
+    let main = dom(&e, "main").id().0;
+    assert_eq!(keyboard::reading_key(&e, "Alt+1"), Some(bandy::A11yVerb::Skip));
+    assert!(keyboard::handle_key(&mut e, "Alt+1"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(main), "Alt+1: skip to content");
+    assert!(keyboard::handle_key(&mut e, "h"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "t").id().0), "H: the next heading");
+    assert!(keyboard::handle_key(&mut e, "h"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "s").id().0));
+    assert!(keyboard::handle_key(&mut e, "Shift+H"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "t").id().0), "Shift+H: back");
+    assert!(keyboard::handle_key(&mut e, "d"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(dom(&e, "f").id().0), "D: the next landmark");
+    assert!(keyboard::handle_key(&mut e, "Shift+D"));
+    assert_eq!(focus::position(&e).map(|n| n.id().0), Some(main), "Shift+D: back");
+    // The verbs answer the face with the node's line.
+    assert_eq!(nav::run(&mut e, &bandy::A11yVerb::NextHeading { backward: false, level: Some(2) }), vec!["heading \"Sub\" level=2".to_string()]);
+    assert!(nav::run(&mut e, &bandy::A11yVerb::Tree).iter().any(|l| l.trim_start() == "heading \"Title\" level=1"));
+    // A text field or a select keeps its letters.
+    let n = dom(&e, "q");
+    focus::focus(&mut e, Some(n), true);
+    assert_eq!(keyboard::reading_key(&e, "h"), None);
+    assert!(!keyboard::handle_key(&mut e, "h"));
+    let n = dom(&e, "sel");
+    focus::focus(&mut e, Some(n), true);
+    assert_eq!(keyboard::reading_key(&e, "d"), None);
+    assert_eq!(keyboard::reading_key(&e, "Ctrl+h"), None);
+    // The face's rows: the witness the shell prints.
+    let p = A11yPrefs::from_rows(true, "more", false);
+    assert_eq!(p.witness(), ":: a11y: prefs contrast=more forced=none motion=reduce -> applied ::");
+}
+
+/// A11YFACE (SR124): the AT-SPI cache shape the shell's socket serves — the root and the focused object carry
+/// Accessible, Component and Text; roles and states map to AT-SPI's numbers; a password field's text is masked;
+/// the wire is twelve tab-separated fields per object and a final `.`.
+#[test]
+fn atspi_cache_shape_for_root_and_focus() {
+    use aether::dom::a11y::atspi;
+    let mut e = page(
+        r#"<head><title>Cache</title></head><body><main><h1 id="h">Hi</h1><label for="q">Query</label>
+<input id="q" value="abc" required><input id="p" type="password" value="secret"></main></body>"#,
+    );
+    assert!(keyboard::handle_key(&mut e, "Tab"));
+    let all = atspi::items(&e);
+    let root = &all[0];
+    assert_eq!((root.path.as_str(), root.parent.as_str(), root.role), (atspi::ROOT_PATH, atspi::NULL_PATH, atspi::ROLE_DOCUMENT_WEB));
+    assert_eq!(root.name, "Cache");
+    assert_eq!(root.interfaces, vec![atspi::ACCESSIBLE, atspi::COMPONENT, atspi::TEXT]);
+    assert!(root.text.as_deref().is_some_and(|t| t.contains("Hi")), "{:?}", root.text);
+    assert_eq!(root.extents, Some((0, 0, e.width as i32, e.height as i32)));
+
+    let f = atspi::focus(&e).unwrap();
+    assert_eq!(f.path, format!("{}{}", atspi::PATH_PREFIX, dom(&e, "q").id().0));
+    assert_eq!((f.role, f.name.as_str(), f.text.as_deref()), (atspi::ROLE_ENTRY, "Query", Some("abc")));
+    assert_eq!(f.interfaces, vec![atspi::ACCESSIBLE, atspi::COMPONENT, atspi::TEXT]);
+    let has = |s: [u32; 2], bit: u32| if bit < 32 { s[0] & (1 << bit) != 0 } else { s[1] & (1 << (bit - 32)) != 0 };
+    for bit in [atspi::STATE_FOCUSED, atspi::STATE_FOCUSABLE, atspi::STATE_ENABLED, atspi::STATE_EDITABLE, atspi::STATE_SINGLE_LINE, atspi::STATE_REQUIRED] {
+        assert!(has(f.states, bit), "state bit {bit} in {:?}", f.states);
+    }
+    let (x, y, w, h) = e.box_of(&dom(&e, "q")).unwrap();
+    assert_eq!(f.extents, Some((x.round() as i32, (y as f64 - e.scroll_y).round() as i32, w.round() as i32, h.round() as i32)));
+
+    let pw = all.iter().find(|i| i.path.ends_with(&format!("/{}", dom(&e, "p").id().0))).unwrap();
+    assert_eq!((pw.role, pw.text.as_deref()), (atspi::ROLE_PASSWORD_TEXT, Some("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}")));
+    assert!(all.iter().any(|i| i.role == atspi::ROLE_HEADING && i.name == "Hi"));
+    assert!(all.iter().any(|i| i.role == atspi::ROLE_LANDMARK));
+
+    let wire = atspi::answer(&e, "GetFocus", ":app");
+    assert!(wire.ends_with("\n.\n"), "{wire}");
+    assert_eq!(wire.lines().next().unwrap().split('\t').count(), 12, "{wire}");
+    assert_eq!(atspi::answer(&e, "GetItems", ":app").lines().count(), all.len() + 1);
+    assert!(atspi::answer(&e, "Bogus", ":app").starts_with("ERR"));
+}

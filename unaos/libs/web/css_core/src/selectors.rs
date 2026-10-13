@@ -204,6 +204,27 @@ impl SelectorList {
     pub fn max_specificity(&self) -> Specificity {
         self.0.iter().map(|s| s.specificity).max().unwrap_or(Specificity::ZERO)
     }
+
+    /// A11YFACE (SR124): whether any selector of the list names element state `s` — in any compound, and
+    /// inside `:is()` / `:where()` / `:not()` / `:has()` / `:nth-*(… of S)`. The host's test for author
+    /// `:focus-visible` styling: `outline: none` removes the UA focus ring only when the author styles
+    /// focus themselves (css-ui-4 §4.3 `outline-style: auto`; the WCAG 2.4.7 UA convention).
+    pub fn mentions_state(&self, s: ElementState) -> bool {
+        self.0.iter().any(|sel| sel.mentions_state(s))
+    }
+}
+
+impl Selector {
+    /// A11YFACE (SR124): [`SelectorList::mentions_state`] for one complex selector.
+    pub fn mentions_state(&self, s: ElementState) -> bool {
+        self.compounds.iter().flatten().any(|simple| match simple {
+            Simple::Pseudo(PseudoClass::State(x)) => *x == s,
+            Simple::Pseudo(PseudoClass::Not(l) | PseudoClass::Is(l) | PseudoClass::Where(l)) => l.mentions_state(s),
+            Simple::Pseudo(PseudoClass::Has(rel)) => rel.iter().any(|r| r.selector.mentions_state(s)),
+            Simple::Pseudo(PseudoClass::Nth { of: Some(l), .. }) => l.mentions_state(s),
+            _ => false,
+        })
+    }
 }
 
 /// A relative selector (`:has()` arguments, nested style rules): the leading combinator binds the

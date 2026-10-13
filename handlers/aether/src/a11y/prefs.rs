@@ -41,6 +41,27 @@ impl A11yPrefs {
         }
     }
 
+    /// A11YFACE (SR124): the preferences from the face's `BrowserA11yPrefs` (the rows already typed; `contrast` in
+    /// its stored spelling).
+    pub fn from_rows(reduce_motion: bool, contrast: &str, forced_colors: bool) -> Self {
+        A11yPrefs { reduce_motion, contrast: Contrast::parse(contrast), forced_colors }
+    }
+
+    /// A11YFACE (SR124): the witness the shell prints when it applies them:
+    /// `:: a11y: prefs contrast=<no-preference|more|less> forced=<active|none> motion=<reduce|no-preference> -> applied ::`.
+    pub fn witness(&self) -> String {
+        let contrast = match self.contrast {
+            Contrast::More => "more",
+            Contrast::Less => "less",
+            Contrast::NoPreference => "no-preference",
+        };
+        format!(
+            ":: a11y: prefs contrast={contrast} forced={} motion={} -> applied ::",
+            if self.forced_colors { "active" } else { "none" },
+            if self.reduce_motion { "reduce" } else { "no-preference" }
+        )
+    }
+
     /// The media-query side of the preferences.
     pub fn media(&self) -> UserPreferences {
         UserPreferences { reduced_motion: self.reduce_motion, contrast: self.contrast, forced_colors: self.forced_colors }

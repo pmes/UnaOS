@@ -867,7 +867,7 @@ fn property_supported(prop: &str) -> bool {
             | "font-size" | "font-weight" | "line-height" | "visibility"
             | "max-width" | "max-height" | "min-width" | "min-height"
             | "overflow" | "overflow-x" | "overflow-y"
-            | "border" | "outline" | "border-color" | "border-width" | "border-style"
+            | "border" | "outline" | "outline-width" | "outline-style" | "outline-color" | "outline-offset" | "border-color" | "border-width" | "border-style"
             | "border-top" | "border-right" | "border-bottom" | "border-left"
             | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
             | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"

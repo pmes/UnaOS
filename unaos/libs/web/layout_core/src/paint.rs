@@ -232,6 +232,16 @@ pub struct PaintStyle<H: Host> {
     /// AETHERSTYLE3C (SR122): `container-type` names `scroll-state` (css-conditional-5 §2.1): the box answers
     /// `@container scroll-state()` queries ([`crate::scroll::scroll_state`]).
     pub container_scroll: Option<bool>,
+    /// A11YFACE (SR124): `outline-style` (css-ui-4 §4.3) as an [`OUTLINE_NONE`] … [`OUTLINE_DOUBLE`] code;
+    /// `auto` ([`OUTLINE_AUTO`]) is the host's focus-ring appearance.
+    pub outline_style: Option<u8>,
+    /// `outline-width` in px (§4.2: `thin` 1, `medium` 3, `thick` 5).
+    pub outline_width: Option<f32>,
+    /// `outline-color` (§4.4) as RGBA; `Some(None)` = `currentColor` (and `invert`, which a UA without
+    /// colour inversion paints as currentColor).
+    pub outline_color: Option<Option<(u8, u8, u8, u8)>>,
+    /// `outline-offset` in px (§4.5; a negative offset draws the outline inside the border box).
+    pub outline_offset: Option<f32>,
 }
 
 
@@ -336,6 +346,10 @@ impl<H: Host> Default for PaintStyle<H> {
             text_combine: None,
             scroll_margin: None,
             container_scroll: None,
+            outline_style: None,
+            outline_width: None,
+            outline_color: None,
+            outline_offset: None,
         }
     }
 }
@@ -397,6 +411,98 @@ impl MarkerPaint {
     }
 }
 
+
+// ---- A11YFACE (SR124): outlines (css-ui-4 §4) ---------------------------------------------------------------
+//
+// An outline is paint only: it takes no space (§4: "outlines do not take up space"), is drawn just outside the
+// border edge grown by `outline-offset` (§4.5), and the UA may draw every outline of a stacking context as its
+// final step (CSS 2.2 Appendix E step 10, "implementations that do not draw outlines in steps above must draw
+// outlines from this stacking context at this stage") — which is where the host's painter draws them.
+
+/// `outline-style: none` (the initial value) — no outline.
+pub const OUTLINE_NONE: u8 = 0;
+/// `outline-style: auto` — the UA's focus-ring appearance (the host's `render::focusring`).
+pub const OUTLINE_AUTO: u8 = 1;
+/// `solid` (and `groove` / `ridge` / `inset` / `outset`, drawn solid).
+pub const OUTLINE_SOLID: u8 = 2;
+pub const OUTLINE_DASHED: u8 = 3;
+pub const OUTLINE_DOTTED: u8 = 4;
+pub const OUTLINE_DOUBLE: u8 = 5;
+/// `medium`, the initial `outline-width` (§4.2), in px.
+pub const OUTLINE_MEDIUM: f32 = 3.0;
+
+/// An `outline-style` keyword (css-ui-4 §4.3: `auto | <outline-line-style>`; `hidden` is not valid for outlines
+/// and reads as none).
+pub fn outline_style_code(v: &str) -> Option<u8> {
+    let v = v.trim();
+    let is = |k: &str| v.eq_ignore_ascii_case(k);
+    if is("none") || is("hidden") {
+        Some(OUTLINE_NONE)
+    } else if is("auto") {
+        Some(OUTLINE_AUTO)
+    } else if is("solid") || is("groove") || is("ridge") || is("inset") || is("outset") {
+        Some(OUTLINE_SOLID)
+    } else if is("dashed") {
+        Some(OUTLINE_DASHED)
+    } else if is("dotted") {
+        Some(OUTLINE_DOTTED)
+    } else if is("double") {
+        Some(OUTLINE_DOUBLE)
+    } else {
+        None
+    }
+}
+
+/// An `outline-width` keyword in px (`thin` 1, `medium` 3, `thick` 5 — the `<line-width>` values UAs use).
+pub fn outline_width_keyword(v: &str) -> Option<f32> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("thin") {
+        Some(1.0)
+    } else if v.eq_ignore_ascii_case("medium") {
+        Some(OUTLINE_MEDIUM)
+    } else if v.eq_ignore_ascii_case("thick") {
+        Some(5.0)
+    } else {
+        None
+    }
+}
+
+/// The outline a box paints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Outline {
+    pub style: u8,
+    pub width: f32,
+    pub offset: f32,
+    /// RGBA; None = currentColor.
+    pub color: Option<(u8, u8, u8, u8)>,
+}
+
+/// The outline `p` specifies: None for `outline-style: none` (the initial value, so a box nobody styled has
+/// none) and for a zero width; an `auto` outline is returned (style [`OUTLINE_AUTO`]) for the host to draw as
+/// its focus ring.
+pub fn outline_of<H: Host>(p: &PaintStyle<H>) -> Option<Outline> {
+    let style = p.outline_style?;
+    if style == OUTLINE_NONE {
+        return None;
+    }
+    let width = p.outline_width.unwrap_or(OUTLINE_MEDIUM).max(0.0);
+    if width == 0.0 && style != OUTLINE_AUTO {
+        return None;
+    }
+    Some(Outline { style, width, offset: p.outline_offset.unwrap_or(0.0), color: p.outline_color.flatten() })
+}
+
+/// The band an outline covers around the border box `bb` = (x, y, w, h): `(inner, outer)` rects. The inner edge
+/// is the border box grown by `offset` (§4.5; a negative offset shrinks it, never past the box's centre), the
+/// outer edge the inner grown by `width`.
+pub fn outline_band(bb: (f32, f32, f32, f32), width: f32, offset: f32) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+    let (x, y, w, h) = bb;
+    let o = offset.max(-(w.min(h) / 2.0));
+    let inner = (x - o, y - o, (w + 2.0 * o).max(0.0), (h + 2.0 * o).max(0.0));
+    let width = width.max(0.0);
+    let outer = (inner.0 - width, inner.1 - width, inner.2 + 2.0 * width, inner.3 + 2.0 * width);
+    (inner, outer)
+}
 
 // ---- AETHERSTYLE2 (SR95): transforms and basic shapes ------------------------------------------------------
 
