@@ -529,3 +529,7 @@ refs/heads/exec-rmbp-wifi11                       8da376cb FOLDED-BY-HAND 8997db
 refs/heads/exec-rmbp-gen7r11                      8da376cb FOLDED-BY-HAND 3cb97b78
 refs/heads/exec-rmbp-a11ypane                     8da376cb FOLDED-BY-HAND 7fda687d
 refs/heads/exec-rmbp-keplergold                   8da376cb FOLDED-BY-HAND 269cc521
+refs/heads/exec-rmbp-gatesteal                    45e03964 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-dongleboot                   45e03964 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-winedge                      45e03964 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-quarryio                     45e03964 IN-FLIGHT cloud 2026-10-14

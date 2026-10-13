@@ -90,23 +90,26 @@ impl Sem {
 /// accent table (`theme::accent()`, the chosen accent's fill; hover / pressed / ink derived the way §2.3 derives them,
 /// toward black or white). When DESIGNAPPLY (B639) lands §2.3's tokens in `palette_core`, each arm becomes the token
 /// of the same name and nothing else in Softy moves.
-/// Seat, at the LOCAL WAVE 3 fold: DESIGNAPPLY (B639) retired the material tokens this map read (BevelShadow,
-/// TitleInactiveTop, ButtonText, ButtonFacePressed); each is read as the semantic token it became.
 pub fn dark(t: Sem) -> u32 {
     use crate::video::theme::{Tok, DARK};
     let d = |k: Tok| DARK[k as usize];
     let acc = crate::video::theme::accent();
     match t {
-        Sem::SurfaceWindow => d(Tok::ContentFill),
-        Sem::SurfaceSidebar => d(Tok::WindowBg),
-        Sem::SurfaceContent | Sem::SurfaceSunken => d(Tok::SurfaceSunken),
-        Sem::SurfaceRaised => d(Tok::FieldBg),
+        // Flight 35 (SOFTY dark=0/19): the seat's LOCAL WAVE 3 fold mapped the retired material tokens onto the
+        // nearest semantic ones and made SurfaceWindow and SurfaceRaised the SAME token, so the dark elevations
+        // no longer rose. DESIGNAPPLY's palette IS the §2.3 vocabulary Softy's Sem names: each reads its own.
+        Sem::SurfaceWindow => d(Tok::SurfaceWindow),
+        Sem::SurfaceSidebar => d(Tok::SurfaceSidebar),
+        Sem::SurfaceContent => d(Tok::SurfaceContent),
+        Sem::SurfaceSunken => d(Tok::SurfaceSunken),
+        Sem::SurfaceRaised => d(Tok::SurfaceRaised),
         Sem::SurfaceOverlay => d(Tok::SurfaceOverlay),
-        Sem::LineSubtle => d(Tok::TitleActiveBottom),
-        Sem::LineStrong => d(Tok::FrameLine),
-        Sem::LineControl | Sem::TextTertiary => d(Tok::TitleTextInactive),
+        Sem::LineSubtle => d(Tok::LineSubtle),
+        Sem::LineStrong => d(Tok::LineStrong),
+        Sem::LineControl => d(Tok::LineControl),
+        Sem::TextTertiary => d(Tok::TextTertiary),
         Sem::TextPrimary => d(Tok::TextPrimary),
-        Sem::TextSecondary => palette_core::mix(d(Tok::TextPrimary), d(Tok::TextSecondary), 1, 2),
+        Sem::TextSecondary => d(Tok::TextSecondary),
         Sem::TextDisabled => d(Tok::TextDisabled),
         Sem::AccentFill => acc,
         Sem::AccentHover => palette_core::mix(acc, light::PRESS, 1, 12),
