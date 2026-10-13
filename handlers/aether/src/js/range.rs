@@ -7,6 +7,11 @@
 //! A live Range is a platform object whose one slot is its serial; its boundary points live in a
 //! thread-local registry the mutation hooks walk. (No finalizer tells the host a Range died, so the
 //! registry lives as long as the page — a page's ranges are few next to its nodes.)
+//!
+//! The Selection's range is one of these (AETHERRANGES, SR78): `js/selection.rs` holds the id of its
+//! associated live range, every mutation hook first lets it track the engine's selection
+//! (`selection::track`), and every boundary-point write lets the engine's selection follow the range
+//! (`selection::range_changed`). One Range type, not two.
 
 use super::dom::{self, kind, node_of, parent_of, wrap, NK};
 use super::idl::*;
@@ -50,15 +55,24 @@ fn get(id: usize) -> (Bp, Bp) {
     })
 }
 
+/// The boundary points of live range `id` (None for an id the registry no longer holds).
+pub fn points(id: usize) -> Option<(Bp, Bp)> {
+    RANGES.with(|r| r.borrow().get(id).filter(|l| l.alive).map(|l| (l.start, l.end)))
+}
+
+/// Every boundary-point write tells the Selection (AETHERRANGES, SR78): when `id` is the selection's
+/// associated range, the engine's selection follows it (Selection API §2: the selection IS its range).
 fn set_start_raw(id: usize, b: Bp) {
     RANGES.with(|r| r.borrow_mut()[id].start = b);
+    dom::selection::range_changed();
 }
 
 fn set_end_raw(id: usize, b: Bp) {
     RANGES.with(|r| r.borrow_mut()[id].end = b);
+    dom::selection::range_changed();
 }
 
-fn new_live(start: Bp, end: Bp) -> usize {
+pub fn new_live(start: Bp, end: Bp) -> usize {
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
         r.push(Live { start, end, alive: true });
@@ -66,8 +80,12 @@ fn new_live(start: Bp, end: Bp) -> usize {
     })
 }
 
-fn retire(id: usize) {
-    RANGES.with(|r| r.borrow_mut()[id].alive = false);
+pub fn retire(id: usize) {
+    RANGES.with(|r| {
+        if let Some(l) = r.borrow_mut().get_mut(id) {
+            l.alive = false;
+        }
+    });
 }
 
 /// Applies `f` to every live boundary point.
@@ -78,6 +96,7 @@ fn each_bp(mut f: impl FnMut(&mut Bp)) {
             f(&mut l.end);
         }
     });
+    dom::selection::range_changed();
 }
 
 fn any_ranges() -> bool {
@@ -168,6 +187,7 @@ fn substring(n: usize, off: u32, count: u32) -> String {
 
 /// §4.2.3 "remove" steps 4–7, run before `node` leaves `parent` (where it sits at `index`).
 pub fn removing(node: usize, parent: usize, index: u32) {
+    dom::selection::track();
     if !any_ranges() {
         return;
     }
@@ -182,6 +202,7 @@ pub fn removing(node: usize, parent: usize, index: u32) {
 
 /// §4.2.3 "insert" step 4: `count` nodes went in at `index` of `parent`.
 pub fn inserted(parent: usize, index: u32, count: u32) {
+    dom::selection::track();
     if !any_ranges() {
         return;
     }
@@ -194,6 +215,7 @@ pub fn inserted(parent: usize, index: u32, count: u32) {
 
 /// §4.10 "replace data" steps 8–11.
 pub fn replaced_data(node: usize, offset: u32, count: u32, added: u32) {
+    dom::selection::track();
     if !any_ranges() {
         return;
     }
@@ -211,6 +233,7 @@ pub fn replaced_data(node: usize, offset: u32, count: u32, added: u32) {
 
 /// §4.11 "split a Text node" step 7.2–7.5 (after `new_node` went in after `node` under `parent`).
 pub fn split(node: usize, new_node: usize, offset: u32, parent: Option<usize>) {
+    dom::selection::track();
     if !any_ranges() {
         return;
     }
@@ -226,6 +249,7 @@ pub fn split(node: usize, new_node: usize, offset: u32, parent: Option<usize>) {
 
 /// §4.4 normalize, per merged sibling: `current` (at `index` under `parent`) folds into `into` at `len`.
 pub fn merged(into: usize, current: usize, parent: usize, index: u32, len: u32) {
+    dom::selection::track();
     if !any_ranges() {
         return;
     }
@@ -246,8 +270,20 @@ fn proto_of(name: &str) -> Obj {
 
 pub fn make_range(vm: &mut Vm, start: Bp, end: Bp) -> Value {
     let id = new_live(start, end);
+    wrap_live(vm, id)
+}
+
+/// A Range object for an existing live range `id` (the Selection's associated range, created before
+/// script asked for its object).
+pub fn wrap_live(vm: &mut Vm, id: usize) -> Value {
     let p = proto_of("Range");
     Value::Object(host_obj(vm, p, T_RANGE, vec![num(id as f64)]))
+}
+
+/// The live-range id of `v` when it is a `Range` object.
+pub fn live_id(vm: &Vm, v: &Value) -> Option<usize> {
+    let o = unproxy(vm, v.as_object()?);
+    (tag_of(vm, o) == Some(T_RANGE)).then(|| slot_num(vm, o, 0) as usize)
 }
 
 fn this_range(vm: &mut Vm, ctx: &CallCtx) -> JsResult<usize> {
@@ -665,7 +701,7 @@ fn collapse_point(s: Bp, e: Bp) -> Bp {
     }
 }
 
-fn delete_contents_impl(vm: &mut Vm, id: usize) -> JsResult<()> {
+pub fn delete_contents_impl(vm: &mut Vm, id: usize) -> JsResult<()> {
     let (s, e) = get(id);
     if s == e {
         return Ok(());

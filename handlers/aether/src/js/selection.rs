@@ -1,6 +1,5 @@
-//! AETHERSELECT (LEDGER SR69): the Selection API (W3C Selection API §2–§4) and the DOM Standard's
-//! `Range` (§5.5) over the engine's one selection (`crate::selection`), which the user's pointer and
-//! script share.
+//! AETHERSELECT (LEDGER SR69): the Selection API (W3C Selection API §2–§4) over the engine's one
+//! selection (`crate::selection`), which the user's pointer and script share.
 //!
 //! - `document.getSelection()` / `window.getSelection()`: the document's one `Selection` object (the
 //!   same object every call). `anchorNode`/`anchorOffset`/`focusNode`/`focusOffset`, `isCollapsed`,
@@ -10,30 +9,46 @@
 //!   serialization of the selected range, as Chromium's).
 //! - `selectionchange` fires at the document as a task after every change, coalesced while one is
 //!   queued (Selection API §3).
-//! - `Range` (`new Range()`, `document.createRange()`): boundary points, `setStart`/`setEnd` (+ Before /
-//!   After), `collapse`, `selectNode`, `selectNodeContents`, `cloneRange`, `commonAncestorContainer`,
-//!   `toString` (the Text data in the range, §5.5). A Range here is a static snapshot: it does not track
-//!   later DOM mutations (live-range update steps are owed), and `getRangeAt(0)` returns a new Range
-//!   describing the selection, not the object `addRange` was given.
+//! - The selection's range is a real live DOM `Range` (AETHERRANGES, SR78; `js/range.rs` owns `Range`,
+//!   `StaticRange` and `document.createRange` — one Range type, not two). The association is the live-
+//!   range id plus the engine selection's generation it was made at and the direction ([`Assoc`]):
+//!   `getRangeAt(0)` returns the same object until the selection changes (`===` holds; `addRange(r)`
+//!   makes `r` that object); a DOM mutation moves the range by the §5.5 live-range steps and the engine's
+//!   selection follows it ([`range_changed`]); script moving the associated Range moves the selection; a
+//!   change from the pointer or a Selection method (a new generation) ends the association, and the next
+//!   `getRangeAt` makes a new Range (Selection API: collapse/extend/setBaseAndExtent/selectAllChildren
+//!   each "set this's range to a new range").
 //!
 //! CHARTER: Aether owns the browser (CODEX §2); this is inside the live handler (js_core binding, SR63).
 
 use super::super::idl::*;
 use super::super::{page, Task, TargetKey};
-use super::{kind, main_doc, node_arg, node_of, node_ref, root_of, with_doc, wrap, wrap_opt, NK};
+use super::super::range::{self, Bp};
+use super::{kind, main_doc, node_arg, node_ref, root_of, with_doc, wrap_opt, NK};
 use crate::selection::{self as model, Point, Selection};
 use js_core::vm::*;
 use std::cell::{Cell, RefCell};
 
-/// Platform-object tags for the two interfaces (idl.rs's list ends at 19).
-pub const T_SELECTION: u8 = 40;
-pub const T_RANGE: u8 = 41;
+/// Platform-object tag for `Selection` (idl.rs's list ends at 19; range.rs takes 40–41, traversal.rs
+/// 42–43, controls.rs 44–45). Its one slot holds the associated Range object once script has seen it.
+pub const T_SELECTION: u8 = 46;
+
+/// The selection's associated live range (`range` registry id), valid while the engine selection's
+/// generation is `epoch`; `backward` is the direction (anchor = end); `has_obj` = a Range object for `id`
+/// is in the Selection object's slot 0 (script may hold it, so the id is never retired then).
+#[derive(Clone, Copy)]
+struct Assoc {
+    id: usize,
+    epoch: u64,
+    backward: bool,
+    has_obj: bool,
+}
 
 thread_local! {
     /// This page's Selection object (rooted; one per realm).
     static SEL_OBJ: Cell<Option<Obj>> = const { Cell::new(None) };
     static SEL_PROTO: Cell<Option<Obj>> = const { Cell::new(None) };
-    static RANGE_PROTO: Cell<Option<Obj>> = const { Cell::new(None) };
+    static ASSOC: Cell<Option<Assoc>> = const { Cell::new(None) };
     /// A layout of the document for `toString`, by DOM version.
     static LAYOUT: RefCell<Option<(u64, crate::layout::LayoutTree)>> = const { RefCell::new(None) };
 }
@@ -54,7 +69,7 @@ pub fn queue_selectionchange() {
 // Install
 // =================================================================================================
 
-/// Installs `Selection`, `Range` and `document.createRange` (called from `dom::install`).
+/// Installs `Selection` (called from `dom::install`; `Range` and `document.createRange` are range.rs's).
 pub fn install(vm: &mut Vm) {
     let sel = interface(vm, "Selection", None, None);
     let sp = sel.proto;
@@ -83,35 +98,8 @@ pub fn install(vm: &mut Vm) {
     op(vm, sp, "deleteFromDocument", 0, delete_from_document);
     op(vm, sp, "toString", 0, sel_to_string);
 
-    let range = interface(vm, "Range", None, Some((range_ctor, 0)));
-    let rp = range.proto;
-    RANGE_PROTO.with(|c| c.set(Some(rp)));
-    for (n, v) in [("START_TO_START", 0.0), ("START_TO_END", 1.0), ("END_TO_END", 2.0), ("END_TO_START", 3.0)] {
-        konst(vm, range, n, v);
-    }
-    attr(vm, rp, "startContainer", range_start_container, None);
-    attr(vm, rp, "startOffset", range_start_offset, None);
-    attr(vm, rp, "endContainer", range_end_container, None);
-    attr(vm, rp, "endOffset", range_end_offset, None);
-    attr(vm, rp, "collapsed", range_collapsed, None);
-    attr(vm, rp, "commonAncestorContainer", range_common_ancestor, None);
-    op(vm, rp, "setStart", 2, range_set_start);
-    op(vm, rp, "setEnd", 2, range_set_end);
-    op(vm, rp, "setStartBefore", 1, range_set_start_before);
-    op(vm, rp, "setStartAfter", 1, range_set_start_after);
-    op(vm, rp, "setEndBefore", 1, range_set_end_before);
-    op(vm, rp, "setEndAfter", 1, range_set_end_after);
-    op(vm, rp, "collapse", 0, range_collapse);
-    op(vm, rp, "selectNode", 1, range_select_node);
-    op(vm, rp, "selectNodeContents", 1, range_select_node_contents);
-    op(vm, rp, "cloneRange", 0, range_clone);
-    op(vm, rp, "detach", 0, range_detach);
-    op(vm, rp, "toString", 0, range_to_string);
-
-    if let Some(doc) = page(|p| p.ifaces.get("Document").copied()) {
-        op(vm, doc.proto, "createRange", 0, create_range);
-    }
     SEL_OBJ.with(|c| c.set(None));
+    ASSOC.with(|c| c.set(None));
     LAYOUT.with(|c| *c.borrow_mut() = None);
 }
 
@@ -132,19 +120,106 @@ pub fn get_selection(vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
         return Ok(Value::Object(o));
     }
     let Some(proto) = SEL_PROTO.with(Cell::get) else { return Ok(Value::Null) };
-    let o = host_obj(vm, proto, T_SELECTION, Vec::new());
+    let o = host_obj(vm, proto, T_SELECTION, vec![Value::Undefined]);
     root(vm, Value::Object(o));
     SEL_OBJ.with(|c| c.set(Some(o)));
     Ok(Value::Object(o))
 }
 
 // =================================================================================================
+// The associated range (AETHERRANGES, SR78)
+// =================================================================================================
+
+fn bp(p: Point) -> Bp {
+    Bp { node: p.node, off: p.offset }
+}
+
+fn point(b: Bp) -> Point {
+    Point { node: b.node, offset: b.off }
+}
+
+/// (start, end, backward) of an engine selection, by the DOM's boundary-point order (§5.2).
+fn start_end(x: Selection) -> (Bp, Bp, bool) {
+    let (a, f) = (bp(x.anchor), bp(x.focus));
+    let backward = root_of(a.node) == root_of(f.node) && range::cmp_bp(a, f) == std::cmp::Ordering::Greater;
+    if backward {
+        (f, a, true)
+    } else {
+        (a, f, false)
+    }
+}
+
+/// The association if it is still the selection's (its generation is the current one). A stale one is
+/// dropped, its live range retired unless script holds its object.
+fn current() -> Option<Assoc> {
+    let a = ASSOC.with(Cell::get)?;
+    if a.epoch == model::generation() && model::get().is_some() && range::points(a.id).is_some() {
+        return Some(a);
+    }
+    if !a.has_obj {
+        range::retire(a.id);
+    }
+    ASSOC.with(|c| c.set(None));
+    None
+}
+
+/// Makes the engine's selection (if any) a live range, so the coming DOM mutation moves it by the §5.5
+/// steps. range.rs calls this first in every mutation hook; it is idempotent.
+pub fn track() {
+    if current().is_some() {
+        return;
+    }
+    let Some(x) = model::get() else { return };
+    let (s, e, backward) = start_end(x);
+    let id = range::new_live(s, e);
+    ASSOC.with(|c| c.set(Some(Assoc { id, epoch: model::generation(), backward, has_obj: false })));
+}
+
+/// range.rs calls this after every boundary-point write: when the associated range moved, the engine's
+/// selection follows it (anchor/focus by the association's direction); a range moved out of the
+/// document leaves no selection (Chromium; Selection API: the range's root must be the document).
+pub fn range_changed() {
+    let Some(a) = current() else { return };
+    let Some((s, e)) = range::points(a.id) else { return };
+    let sel = if a.backward {
+        Selection { anchor: point(e), focus: point(s) }
+    } else {
+        Selection { anchor: point(s), focus: point(e) }
+    };
+    if model::get() == Some(sel) {
+        return;
+    }
+    if !(in_document(s.node) && in_document(e.node)) {
+        model::set(None);
+        current();
+        return;
+    }
+    if model::set(Some(sel)) {
+        ASSOC.with(|c| c.set(Some(Assoc { epoch: model::generation(), ..a })));
+    }
+}
+
+/// The selection's Range object (made, and associated, on first sight): `getRangeAt(0)`.
+fn range_object(vm: &mut Vm, sel: Obj) -> Option<Value> {
+    model::get()?;
+    track();
+    let a = current()?;
+    if a.has_obj {
+        return Some(slot(vm, sel, 0));
+    }
+    let r = range::wrap_live(vm, a.id);
+    set_slot(vm, sel, 0, r.clone());
+    ASSOC.with(|c| c.set(Some(Assoc { has_obj: true, ..a })));
+    Some(r)
+}
+
+// =================================================================================================
 // Helpers
 // =================================================================================================
 
-fn this_sel(vm: &mut Vm, ctx: &CallCtx) -> JsResult<()> {
+fn this_sel(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Obj> {
     match this_tagged(vm, &ctx.this, T_SELECTION) {
-        Some(_) => Ok(()),
+        Some(o) => Ok(o),
         None => vm.throw_type("Illegal invocation"),
     }
 }
@@ -222,39 +297,6 @@ fn with_page_layout<R>(f: impl FnOnce(&crate::layout::LayoutTree) -> R) -> R {
     r
 }
 
-fn new_range(vm: &mut Vm, start: Point, end: Point) -> Value {
-    let proto = RANGE_PROTO.with(Cell::get).unwrap_or_else(|| vm.intr().object_proto);
-    let o = host_obj(
-        vm,
-        proto,
-        T_RANGE,
-        vec![num(start.node as f64), num(start.offset as f64), num(end.node as f64), num(end.offset as f64)],
-    );
-    Value::Object(o)
-}
-
-fn range_points(vm: &Vm, o: Obj) -> (Point, Point) {
-    let n = |i| slot_num(vm, o, i);
-    (
-        Point { node: n(0) as usize, offset: n(1) as u32 },
-        Point { node: n(2) as usize, offset: n(3) as u32 },
-    )
-}
-
-fn this_range(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Obj> {
-    match this_tagged(vm, &ctx.this, T_RANGE) {
-        Some(o) => Ok(o),
-        None => vm.throw_type("Illegal invocation"),
-    }
-}
-
-fn set_range(vm: &mut Vm, o: Obj, start: Point, end: Point) {
-    set_slot(vm, o, 0, num(start.node as f64));
-    set_slot(vm, o, 1, num(start.offset as f64));
-    set_slot(vm, o, 2, num(end.node as f64));
-    set_slot(vm, o, 3, num(end.offset as f64));
-}
-
 // =================================================================================================
 // Selection
 // =================================================================================================
@@ -310,44 +352,49 @@ fn direction(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 
 fn get_range_at(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_sel(vm, ctx)?;
+    let o = this_sel(vm, ctx)?;
     let i = offset_arg(vm, ctx, 0)?;
-    match model::get() {
-        Some(x) if i == 0 => {
-            let (a, b) = ordered_points(x.anchor, x.focus);
-            Ok(new_range(vm, a, b))
-        }
+    match range_object(vm, o) {
+        Some(r) if i == 0 => Ok(r),
         _ => throw_dom(vm, "IndexSizeError", &format!("The index provided ({i}) is greater than or equal to the maximum bound.")),
     }
 }
 
+/// `addRange(range)`: with no range yet and `range` in the document, `range` (that object, by
+/// reference) becomes the selection's range, forwards. Chromium keeps an existing range (one at most).
 fn add_range(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_sel(vm, ctx)?;
+    let o = this_sel(vm, ctx)?;
     need(vm, ctx, 1, "Selection", "addRange")?;
     let v = arg(vm, ctx, 0);
-    let Some(o) = v.as_object().filter(|o| tag_of(vm, *o) == Some(T_RANGE)) else {
+    let Some(id) = range::live_id(vm, &v) else {
         return vm.throw_type("Failed to execute 'addRange' on 'Selection': parameter 1 is not of type 'Range'.");
     };
-    // Chromium keeps an existing range (one range at most); a range outside the document is ignored.
-    if model::get().is_none() {
-        let (a, b) = range_points(vm, o);
-        if in_document(a.node) && in_document(b.node) {
-            model::set(Some(Selection { anchor: a, focus: b }));
-        }
+    if model::get().is_some() {
+        return Ok(Value::Undefined);
     }
+    let Some((s, e)) = range::points(id) else { return Ok(Value::Undefined) };
+    if !(in_document(s.node) && in_document(e.node)) {
+        return Ok(Value::Undefined);
+    }
+    current();
+    model::set(Some(Selection { anchor: point(s), focus: point(e) }));
+    set_slot(vm, o, 0, v);
+    ASSOC.with(|c| c.set(Some(Assoc { id, epoch: model::generation(), backward: false, has_obj: true })));
     Ok(Value::Undefined)
 }
 
+/// `removeRange(range)`: only the selection's own range object (by identity) can be removed.
 fn remove_range(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_sel(vm, ctx)?;
+    let o = this_sel(vm, ctx)?;
     let v = arg(vm, ctx, 0);
-    let Some(o) = v.as_object().filter(|o| tag_of(vm, *o) == Some(T_RANGE)) else {
+    let Some(id) = range::live_id(vm, &v) else {
         return vm.throw_type("Failed to execute 'removeRange' on 'Selection': parameter 1 is not of type 'Range'.");
     };
-    let (a, b) = range_points(vm, o);
-    match model::get() {
-        Some(x) if ordered_points(x.anchor, x.focus) == (a, b) => {
+    match current() {
+        Some(a) if a.id == id && a.has_obj => {
             model::set(None);
+            current();
+            set_slot(vm, o, 0, Value::Undefined);
             Ok(Value::Undefined)
         }
         _ => throw_dom(vm, "NotFoundError", "The given range isn't in document."),
@@ -462,9 +509,17 @@ fn contains_node(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Bool(r))
 }
 
+/// `deleteFromDocument()`: `deleteContents()` on the selection's range (Selection API §2); the live
+/// range collapses and the selection follows it.
 fn delete_from_document(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     this_sel(vm, ctx)?;
-    crate::ledger::record_dom("Selection.deleteFromDocument");
+    if model::get().is_none() {
+        return Ok(Value::Undefined);
+    }
+    track();
+    if let Some(a) = current() {
+        range::delete_contents_impl(vm, a.id)?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -477,203 +532,4 @@ fn sel_to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let doc = node_ref(main_doc());
     let text = with_page_layout(|l| model::range_text(l, &doc, x.anchor, x.focus));
     Ok(s(&text))
-}
-
-// =================================================================================================
-// Range
-// =================================================================================================
-
-fn range_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    if ctx.new_target.is_undefined() {
-        return vm.throw_type("Failed to construct 'Range': Please use the 'new' operator");
-    }
-    let d = main_doc();
-    let p = Point { node: d, offset: 0 };
-    Ok(new_range(vm, p, p))
-}
-
-fn create_range(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let d = node_of(vm, &ctx.this).unwrap_or_else(main_doc);
-    let p = Point { node: d, offset: 0 };
-    Ok(new_range(vm, p, p))
-}
-
-fn range_start_container(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let (a, _) = range_points(vm, o);
-    Ok(wrap(vm, a.node))
-}
-fn range_start_offset(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    Ok(num(range_points(vm, o).0.offset as f64))
-}
-fn range_end_container(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let (_, b) = range_points(vm, o);
-    Ok(wrap(vm, b.node))
-}
-fn range_end_offset(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    Ok(num(range_points(vm, o).1.offset as f64))
-}
-fn range_collapsed(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let (a, b) = range_points(vm, o);
-    Ok(Value::Bool(a == b))
-}
-
-fn range_common_ancestor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let (a, b) = range_points(vm, o);
-    let anc = with_doc(|d| {
-        let mut chain = vec![a.node];
-        let mut n = d.parent(html_core::NodeId(a.node));
-        while let Some(p) = n {
-            chain.push(p.0);
-            n = d.parent(p);
-        }
-        let mut m = Some(html_core::NodeId(b.node));
-        while let Some(x) = m {
-            if chain.contains(&x.0) {
-                return x.0;
-            }
-            m = d.parent(x);
-        }
-        a.node
-    });
-    Ok(wrap(vm, anc))
-}
-
-/// DOM §5.5 "set the start or end": a start after the end (or in another tree) collapses the range there.
-fn set_boundary(vm: &mut Vm, o: Obj, p: Point, start: bool) {
-    let (a, b) = range_points(vm, o);
-    let other_tree = root_of(p.node) != root_of(if start { b.node } else { a.node });
-    let (ka, kb, kp) = (key_of(a), key_of(b), key_of(p));
-    if start {
-        let collapse = other_tree || matches!((kp, kb), (Some(kp), Some(kb)) if kp > kb);
-        set_range(vm, o, p, if collapse { p } else { b });
-    } else {
-        let collapse = other_tree || matches!((kp, ka), (Some(kp), Some(ka)) if kp < ka);
-        set_range(vm, o, if collapse { p } else { a }, p);
-    }
-}
-
-fn range_set_start(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    need(vm, ctx, 2, "Range", "setStart")?;
-    let n = node_arg(vm, ctx, 0, "Range", "setStart")?;
-    let off = offset_arg(vm, ctx, 1)?;
-    check_point(vm, n, off)?;
-    set_boundary(vm, o, Point { node: n, offset: off }, true);
-    Ok(Value::Undefined)
-}
-
-fn range_set_end(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    need(vm, ctx, 2, "Range", "setEnd")?;
-    let n = node_arg(vm, ctx, 0, "Range", "setEnd")?;
-    let off = offset_arg(vm, ctx, 1)?;
-    check_point(vm, n, off)?;
-    set_boundary(vm, o, Point { node: n, offset: off }, false);
-    Ok(Value::Undefined)
-}
-
-fn parent_point(vm: &mut Vm, ctx: &CallCtx, method: &str, after: bool) -> JsResult<Point> {
-    let n = node_arg(vm, ctx, 0, "Range", method)?;
-    match index_in_parent(n) {
-        Some((p, i)) => Ok(Point { node: p, offset: i + u32::from(after) }),
-        None => throw_dom(vm, "InvalidNodeTypeError", "the given Node has no parent."),
-    }
-}
-
-fn range_set_start_before(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let p = parent_point(vm, ctx, "setStartBefore", false)?;
-    set_boundary(vm, o, p, true);
-    Ok(Value::Undefined)
-}
-fn range_set_start_after(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let p = parent_point(vm, ctx, "setStartAfter", true)?;
-    set_boundary(vm, o, p, true);
-    Ok(Value::Undefined)
-}
-fn range_set_end_before(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let p = parent_point(vm, ctx, "setEndBefore", false)?;
-    set_boundary(vm, o, p, false);
-    Ok(Value::Undefined)
-}
-fn range_set_end_after(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let p = parent_point(vm, ctx, "setEndAfter", true)?;
-    set_boundary(vm, o, p, false);
-    Ok(Value::Undefined)
-}
-
-fn range_collapse(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let to_start = boolean(vm, &arg(vm, ctx, 0));
-    let (a, b) = range_points(vm, o);
-    let p = if to_start { a } else { b };
-    set_range(vm, o, p, p);
-    Ok(Value::Undefined)
-}
-
-fn range_select_node(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let n = node_arg(vm, ctx, 0, "Range", "selectNode")?;
-    match index_in_parent(n) {
-        Some((p, i)) => {
-            set_range(vm, o, Point { node: p, offset: i }, Point { node: p, offset: i + 1 });
-            Ok(Value::Undefined)
-        }
-        None => throw_dom(vm, "InvalidNodeTypeError", "the given Node has no parent."),
-    }
-}
-
-fn range_select_node_contents(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let n = node_arg(vm, ctx, 0, "Range", "selectNodeContents")?;
-    if kind(n) == NK::Doctype {
-        return throw_dom(vm, "InvalidNodeTypeError", "The node provided is of type 'DocumentType'.");
-    }
-    let len = node_len(n);
-    set_range(vm, o, Point { node: n, offset: 0 }, Point { node: n, offset: len });
-    Ok(Value::Undefined)
-}
-
-fn range_clone(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let (a, b) = range_points(vm, o);
-    Ok(new_range(vm, a, b))
-}
-
-fn range_detach(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_range(vm, ctx)?;
-    Ok(Value::Undefined)
-}
-
-/// DOM §5.5 stringifier: the data of the Text nodes in the range (partial at either end).
-fn range_to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    let o = this_range(vm, ctx)?;
-    let (a, b) = range_points(vm, o);
-    let doc = node_ref(main_doc());
-    let ord = model::order(&doc);
-    let out = with_doc(|d| {
-        let (Some(ka), Some(kb)) = (ord.key(d, a), ord.key(d, b)) else { return String::new() };
-        let mut out = String::new();
-        for id in std::iter::once(html_core::Document::ROOT).chain(d.descendants(html_core::Document::ROOT)) {
-            let html_core::NodeData::Text(t) = d.data(id) else { continue };
-            let Some(pre) = ord.pre(id.0) else { continue };
-            let len = t.encode_utf16().count() as u32;
-            let s = if ka.0 < pre { 0 } else if ka.0 == pre { ka.1.max(0) as u32 } else { continue };
-            let e = if kb.0 > pre { len } else if kb.0 == pre { (kb.1.max(0) as u32).min(len) } else { continue };
-            if e > s {
-                out.push_str(&t[model::utf16_to_byte(t, s)..model::utf16_to_byte(t, e)]);
-            }
-        }
-        out
-    });
-    Ok(s(&out))
 }
