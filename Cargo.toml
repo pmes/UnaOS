@@ -53,6 +53,7 @@ members = [
     "unaos/libs/web/html_core",
     # CSSCORE (SR47): CSS Syntax 3 + Selectors 4 + the cascade helpers, no_std, zero deps.
     "unaos/libs/web/css_core",
+    "unaos/libs/web/gl_core", # WEBGL1 (SR136): the no_std software WebGL 1.0 / OpenGL ES 2.0 pipeline (state machine, GLSL ES 1.00 bytecode, rasterizer), zero deps
     # LAYOUTCORE (SR76, AETHERMETAL M2): Aether's layout engine (boxes, taffy mapping, inline formatter, tables),
     # no_std + alloc over the Dom/Fonts traits — the ONE engine the host browser and APPS/AETHER.ELF lay out with.
     "unaos/libs/web/layout_core",

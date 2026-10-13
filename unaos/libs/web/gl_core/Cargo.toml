@@ -1,0 +1,12 @@
+[package]
+name = "gl_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "WEBGL1 (SR136): a software OpenGL ES 2.0 / WebGL 1.0 pipeline — the state machine, a GLSL ES 1.00 compiler to a register bytecode and its interpreter, the rasterizer, textures and framebuffers — no_std + alloc, zero dependencies."
+
+# WEBGL1 (LEDGER SR136, R83, R104): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies. No system GL,
+# no ANGLE: UnaOS owns the pipeline the way the 2D canvas (handlers/aether/src/canvas, SR85) and the kernel's `rast`
+# are software. Aether's `WebGLRenderingContext` (handlers/aether/src/js/webgl.rs) is the WebIDL face; AETHER.ELF
+# links this crate by path later. Design: the first commit body of the series and docs/dev/evidence/webgl1/WEBGL1.md.
+[dependencies]

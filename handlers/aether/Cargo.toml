@@ -27,6 +27,8 @@ html_core = { path = "../../unaos/libs/web/html_core" }
 # AETHERSTYLE (SR54): CSS parsing, selector matching, @media/@supports/@layer, the cascade sort, var() and
 # calc() are UnaOS's own CSSCORE (SR47) — cssparser + selectors are gone.
 css_core = { path = "../../unaos/libs/web/css_core" }
+# WEBGL1 (SR136): `canvas.getContext('webgl')` runs on UnaOS's own software OpenGL ES 2.0 (no system GL, no ANGLE).
+gl_core = { path = "../../unaos/libs/web/gl_core" }
 # LAYOUTCORE (SR76, AETHERMETAL M2): the layout engine is layout_core, the no_std core APPS/AETHER.ELF links too;
 # taffy is the same 0.15 line it pins (no std, the features it names), kept as a direct dependency only for the
 # `taffy::` paths render/, selection, hit testing and the tests read the box tree through.

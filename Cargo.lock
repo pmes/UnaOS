@@ -57,6 +57,7 @@ dependencies = [
  "directories",
  "font_core",
  "futures-util",
+ "gl_core",
  "gneiss_pal",
  "html_core",
  "image",
@@ -1883,6 +1884,10 @@ dependencies = [
  "http_core",
  "pixel_core",
 ]
+
+[[package]]
+name = "gl_core"
+version = "0.1.0"
 
 [[package]]
 name = "gl_generator"
