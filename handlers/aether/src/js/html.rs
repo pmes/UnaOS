@@ -1780,7 +1780,8 @@ fn media_ended(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn media_current_time_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
-    Ok(num(media_entry(el).map(|e| e.pts_ns.max(0) as f64 / 1e9).unwrap_or(0.0)))
+    let _ = media_entry(el);
+    Ok(num(crate::media::current_time(&dom::node_ref(el)))) // AETHERMEDIA SR107: the seek target while seeking
 }
 
 fn media_current_time_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1800,21 +1801,14 @@ fn media_duration(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn media_ready_state(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
-    Ok(num(match media_entry(el) {
-        Some(e) if e.duration_ns > 0 || e.frame.is_some() => 4.0,
-        Some(e) if matches!(e.state, crate::media::State::Playing | crate::media::State::Paused) => 1.0,
-        _ => 0.0,
-    }))
+    let _ = media_entry(el);
+    Ok(num(crate::media::ready_state(&dom::node_ref(el)) as f64)) // AETHERMEDIA SR107: media/'s machine
 }
 
 fn media_network_state(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
-    Ok(num(match media_entry(el) {
-        Some(e) if e.fetching => 2.0,
-        Some(e) if !e.url.is_empty() => 1.0,
-        Some(_) => 3.0,
-        None => 0.0,
-    }))
+    let _ = media_entry(el);
+    Ok(num(crate::media::network_state(&dom::node_ref(el)) as f64)) // AETHERMEDIA SR107
 }
 
 fn media_current_src(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1825,7 +1819,10 @@ fn media_current_src(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn media_volume_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
-    Ok(num(page(|p| p.media_volume.get(&el).copied()).unwrap_or(1.0)))
+    match media_entry(el) {
+        Some(_) => Ok(num(crate::media::volume(&dom::node_ref(el)))),
+        None => Ok(num(page(|p| p.media_volume.get(&el).copied()).unwrap_or(1.0))),
+    }
 }
 
 fn media_volume_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1835,8 +1832,11 @@ fn media_volume_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         return throw_dom(vm, "IndexSizeError", &format!("The volume provided ({v}) is outside the range [0, 1]."));
     }
     page(|p| p.media_volume.insert(el, v));
-    crate::ledger::record_dom("HTMLMediaElement.volume-not-forwarded-to-stria");
-    page(|p| p.tasks.push_back(super::Task::Event(super::TargetKey::Node(el), "volumechange".into(), false)));
+    // AETHERMEDIA SR107: a registered element's volume goes to Stria (MediaVolume) and media/ fires volumechange
+    let forwarded = media_entry(el).is_some() && crate::media::set_volume(&dom::node_ref(el), v) == Ok(true);
+    if !forwarded {
+        page(|p| p.tasks.push_back(super::Task::Event(super::TargetKey::Node(el), "volumechange".into(), false)));
+    }
     Ok(Value::Undefined)
 }
 
@@ -1854,19 +1854,53 @@ fn media_muted_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
-fn media_const_false(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_element(vm, ctx)?;
-    Ok(Value::Bool(false))
-}
-
-fn media_null(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_element(vm, ctx)?;
-    Ok(Value::Null)
-}
-
 fn media_rate(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     this_element(vm, ctx)?;
     Ok(num(1.0))
+}
+
+// AETHERMEDIA (SR107): playbackRate, seeking and error over media/'s element model.
+fn media_rate_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let _ = media_entry(el);
+    Ok(num(crate::media::playback_rate(&dom::node_ref(el))))
+}
+
+fn media_rate_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let r = vm.to_number(&arg(vm, ctx, 0))?;
+    if !r.is_finite() {
+        return vm.throw_type("The provided double value is non-finite.");
+    }
+    let forwarded = media_entry(el).is_some() && crate::media::set_playback_rate(&dom::node_ref(el), r);
+    if !forwarded {
+        page(|p| p.tasks.push_back(super::Task::Event(super::TargetKey::Node(el), "ratechange".into(), false)));
+    }
+    Ok(Value::Undefined)
+}
+
+fn media_seeking(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    Ok(Value::Bool(crate::media::seeking(&dom::node_ref(el))))
+}
+
+fn media_error(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let code = crate::media::error_code(&dom::node_ref(el));
+    if code == 0 {
+        return Ok(Value::Null);
+    }
+    let message = match &media_entry(el).map(|e| e.state) {
+        Some(crate::media::State::Error(t)) => t.clone(),
+        _ => String::new(),
+    };
+    let o = vm.new_plain_object();
+    vm.create_data_property(o, PropertyKey::from_str("code"), num(code as f64))?;
+    vm.create_data_property(o, PropertyKey::from_str("message"), s(&message))?;
+    for (k, v) in [("MEDIA_ERR_ABORTED", 1.0), ("MEDIA_ERR_NETWORK", 2.0), ("MEDIA_ERR_DECODE", 3.0), ("MEDIA_ERR_SRC_NOT_SUPPORTED", 4.0)] {
+        vm.create_data_property(o, PropertyKey::from_str(k), num(v))?;
+    }
+    Ok(Value::Object(o))
 }
 
 fn video_size(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -2042,9 +2076,9 @@ pub fn install(vm: &mut Vm) {
     attr(vm, mp, "currentSrc", media_current_src, None);
     attr(vm, mp, "volume", media_volume_get, Some(media_volume_set));
     attr(vm, mp, "muted", media_muted_get, Some(media_muted_set));
-    attr(vm, mp, "seeking", media_const_false, None);
-    attr(vm, mp, "error", media_null, None);
-    attr(vm, mp, "playbackRate", media_rate, None);
+    attr(vm, mp, "seeking", media_seeking, None);
+    attr(vm, mp, "error", media_error, None);
+    attr(vm, mp, "playbackRate", media_rate_get, Some(media_rate_set));
     attr(vm, mp, "defaultPlaybackRate", media_rate, None);
     let vp = iface("HTMLVideoElement").unwrap().proto;
     attr_with(vm, vp, "videoWidth", video_size, None, s("w"));

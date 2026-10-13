@@ -35,6 +35,32 @@
 //!   whole GET; the element's opening request waits for it ([`take_outbox`] releases it), a
 //!   failure becomes a `MediaError` for that key, painted in the box.
 //!
+//! AETHERMEDIA (LEDGER SR107) added the HTMLMediaElement model (HTML §4.8.11) on top of that wire:
+//!
+//! * `readyState` (HAVE_NOTHING → HAVE_METADATA on `MediaOpened` → HAVE_CURRENT/FUTURE/ENOUGH_DATA on
+//!   the first picture, or at once for an audio-only stream: Stria opened a local file, every byte
+//!   is there) and `networkState` (EMPTY / IDLE / LOADING / NO_SOURCE) per element.
+//! * The events, in HTML's order, queued as tasks on the page's event loop (`js::Task::Event` —
+//!   the same queue the HTMLMediaElement binding in `js/html.rs` uses): `loadstart` (+ `suspend`
+//!   under `preload=none`), `durationchange`, `loadedmetadata`, `resize`, `loadeddata`, `canplay`,
+//!   `canplaythrough`, `play` (autoplay, the user's click), `playing` (the first picture after a
+//!   play), `timeupdate` (every 250 ms of media time, and on pause / seek / end), `seeking` /
+//!   `seeked`, `pause`, `ended`, `error` (`MediaError` code 4 before metadata, 3 after),
+//!   `volumechange`, `ratechange`. `play`/`pause` from script are fired by the binding itself, so
+//!   [`play`] / [`pause`] never fire them twice.
+//! * `loop` (read live from the attribute, so `el.loop = true` works through reflection): at
+//!   `MediaEnded` the element seeks to 0 and plays on — no `ended`, no `pause`.
+//! * `currentTime` during a seek reads the target (the frame follows); `seeking` until it lands.
+//! * `volume` → `MediaVolume` (Stria scales the samples; `muted` stays its own `MediaMute`).
+//! * `playbackRate` → `MediaRate` (Stria: 0 holds the clock while the element stays "potentially
+//!   playing", as HTML says; other rates scale the clock where Stria can, see `Player::set_rate`).
+//!   Both reach a session that opens later with its opening request.
+//!
+//! Decoding is never Aether's: every picture and sample comes from Stria, which decodes through
+//! the owned cores (`gneiss_pal::dsp` = `demux_core`, `vp8_core`, `av1_core` behind its `av1`
+//! feature, `audio_core`). The current picture paints from ONE call site,
+//! `render/mod.rs` → `crate::media::paint_for` (the `video`/`audio` arm of the box painter).
+//!
 //! State lives in a thread-local registry — the same pattern as `images::STORE` — because the
 //! engine, layout (intrinsic size) and renderer (frame, poster, controls) all run on the engine
 //! thread and each needs the element's media state by DOM node. The shell drains requests with
@@ -104,6 +130,98 @@ pub struct Element {
     pub fetching: bool,
     /// The opening request held back until the fetch completes.
     pub deferred: Option<Deferred>,
+    /// HTMLMediaElement `readyState` (HTML §4.8.11.7): one of the `HAVE_*` constants.
+    pub ready_state: u8,
+    /// HTMLMediaElement `networkState` (HTML §4.8.11.5): one of the `NETWORK_*` constants.
+    pub network_state: u8,
+    /// `seeking`, and the position asked for.
+    pub seeking: bool,
+    /// `playbackRate` (page-side; see the module doc).
+    pub rate: f64,
+    /// `volume` (0..=1; page-side, 0 forwarded as mute).
+    pub volume: f64,
+    /// `MediaError.code` (1 aborted, 2 network, 3 decode, 4 src not supported); 0 = `error` is null.
+    pub error_code: u16,
+    /// pts at the last `timeupdate`.
+    pub last_timeupdate_ns: i64,
+    /// A play happened and `playing` has not been fired for it yet.
+    pub playing_owed: bool,
+    /// Every media event fired at this element, in order (tests, the headless report).
+    pub events: Vec<&'static str>,
+}
+
+/// `readyState` values (HTML §4.8.11.7).
+pub const HAVE_NOTHING: u8 = 0;
+pub const HAVE_METADATA: u8 = 1;
+pub const HAVE_CURRENT_DATA: u8 = 2;
+pub const HAVE_FUTURE_DATA: u8 = 3;
+pub const HAVE_ENOUGH_DATA: u8 = 4;
+/// `networkState` values (HTML §4.8.11.5).
+pub const NETWORK_EMPTY: u8 = 0;
+pub const NETWORK_IDLE: u8 = 1;
+pub const NETWORK_LOADING: u8 = 2;
+pub const NETWORK_NO_SOURCE: u8 = 3;
+/// HTML: `timeupdate` fires every 15 to 250 ms during playback; Aether counts media time.
+pub const TIMEUPDATE_NS: i64 = 250_000_000;
+/// The event log's cap per element.
+const EVENT_LOG_MAX: usize = 512;
+
+/// Fire the simple event `ty` at `node` (not bubbling, not cancelable): logged on the element and
+/// queued as a task on the page's event loop when `node` belongs to the page's document (the
+/// HTML "queue a media element task"). A page with no script engine simply never runs the task.
+fn queue_event(node: &NodeRef, ty: &'static str) {
+    let id = node.id().0;
+    let doc = node.document_node();
+    let _ = crate::js::PAGE.try_with(|p| {
+        if let Ok(mut p) = p.try_borrow_mut() {
+            if p.doc.as_ref() == Some(&doc) {
+                p.tasks.push_back(crate::js::Task::Event(crate::js::TargetKey::Node(id), ty.to_string(), false));
+            }
+        }
+    });
+}
+
+fn fire(e: &mut Element, ty: &'static str) {
+    if e.events.len() < EVENT_LOG_MAX {
+        e.events.push(ty);
+    }
+    queue_event(&e.node, ty);
+}
+
+/// The element's `loop` attribute, read live (IDL `loop` reflects it).
+fn looping(node: &NodeRef) -> bool {
+    node.as_element().is_some_and(|el| el.attributes.borrow().get("loop").is_some())
+}
+
+/// Advance `readyState` to `to`, firing every event HTML fires on the way (§4.8.11.7), then
+/// `playing` when a play is owed and data is there.
+fn advance_ready(e: &mut Element, to: u8) {
+    if to >= HAVE_METADATA && e.ready_state < HAVE_METADATA {
+        e.ready_state = HAVE_METADATA;
+        fire(e, "durationchange");
+        if e.kind == Kind::Video && e.natural.is_some() {
+            fire(e, "resize");
+        }
+        fire(e, "loadedmetadata");
+    }
+    if to >= HAVE_CURRENT_DATA && e.ready_state < HAVE_CURRENT_DATA {
+        e.ready_state = HAVE_CURRENT_DATA;
+        fire(e, "loadeddata");
+    }
+    if to >= HAVE_FUTURE_DATA && e.ready_state < HAVE_FUTURE_DATA {
+        e.ready_state = HAVE_FUTURE_DATA;
+        fire(e, "canplay");
+    }
+    if to >= HAVE_ENOUGH_DATA && e.ready_state < HAVE_ENOUGH_DATA {
+        e.ready_state = HAVE_ENOUGH_DATA;
+        fire(e, "canplaythrough");
+        // a local file (Stria's, or the finished cache file) is whole: the fetch is idle
+        e.network_state = NETWORK_IDLE;
+    }
+    if e.playing_owed && e.state == State::Playing && e.ready_state >= HAVE_FUTURE_DATA {
+        e.playing_owed = false;
+        fire(e, "playing");
+    }
 }
 
 /// The request an element sends once its source is local.
@@ -116,6 +234,8 @@ pub enum Deferred {
 #[derive(Default)]
 struct Registry {
     elements: Vec<Element>,
+    /// Elements whose every `<source>` was refused (the `error` at the last one already fired).
+    refused: Vec<NodeRef>,
     outbox: Vec<SMessage>,
     title: String,
 }
@@ -297,8 +417,20 @@ fn open_requests(out: &mut Vec<SMessage>, e: &Element, what: Deferred, title: &s
         Deferred::Poster => out.push(SMessage::MediaPoster { url: e.url.clone() }),
         Deferred::Play => out.push(SMessage::PlayMedia { url: e.url.clone(), title: title.to_string(), mime: e.mime.clone() }),
     }
+    settings_requests(out, e);
+}
+
+/// What a session needs to match the element's script-set state when it opens: `MediaMute` when
+/// muted, `MediaVolume` / `MediaRate` (AETHERMEDIA SR107) when not the defaults.
+fn settings_requests(out: &mut Vec<SMessage>, e: &Element) {
     if e.muted {
         out.push(SMessage::MediaMute { url: e.url.clone(), muted: true });
+    }
+    if e.volume != 1.0 {
+        out.push(SMessage::MediaVolume { url: e.url.clone(), volume: e.volume as f32 });
+    }
+    if e.rate != 1.0 {
+        out.push(SMessage::MediaRate { url: e.url.clone(), rate: e.rate });
     }
 }
 
@@ -407,6 +539,7 @@ pub fn reset(title: &str) {
             }
         }
         r.elements.clear();
+        r.refused.clear();
         r.title = title.to_string();
         for url in stops {
             r.outbox.push(SMessage::MediaStop { url });
@@ -426,7 +559,19 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
             if find(&r, &node).is_some() {
                 continue;
             }
-            let Some((src, mime)) = source_for(&node, base) else { continue };
+            let Some((src, mime)) = source_for(&node, base) else {
+                // HTML §4.8.11.5: every `<source>` failed — `error` at the last one, networkState
+                // NO_SOURCE (the element's own `networkState` getter answers it, see [`network_state`]).
+                if !r.refused.contains(&node) {
+                    let last = node.children().filter(|c| c.as_element().is_some_and(|e| e.name.local.as_ref() == "source")).last();
+                    if let Some(last) = last {
+                        crate::ledger::record_dom("media-no-playable-source");
+                        queue_event(&last, "error");
+                        r.refused.push(node.clone());
+                    }
+                }
+                continue;
+            };
             // AETHERDEBT SR93: media-src and mixed content (passive media autoupgrades) decide the fetch.
             let dest = if node.as_element().is_some_and(|e| e.name.local.as_ref() == "video") { "video" } else { "audio" };
             let Some(src) = crate::security::subresource_url(&src, dest) else { continue };
@@ -484,7 +629,28 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
                 levels: [0.0; 2],
                 fetching,
                 deferred: None,
+                ready_state: HAVE_NOTHING,
+                network_state: NETWORK_EMPTY,
+                seeking: false,
+                rate: 1.0,
+                volume: 1.0,
+                error_code: 0,
+                last_timeupdate_ns: 0,
+                playing_owed: autoplays,
+                events: Vec::new(),
             };
+            // HTML §4.8.11.5 resource selection: networkState LOADING and `loadstart`; under
+            // `preload=none` the fetch suspends at once (`suspend`, networkState IDLE).
+            e.network_state = NETWORK_LOADING;
+            fire(&mut e, "loadstart");
+            if opening.is_none() && !shared {
+                e.network_state = NETWORK_IDLE;
+                fire(&mut e, "suspend");
+            }
+            if autoplays {
+                // autoplay clears `paused` (`play`); `playing` waits for the first picture
+                fire(&mut e, "play");
+            }
             if let Some(what) = opening {
                 if fetching {
                     e.deferred = Some(what);
@@ -533,6 +699,8 @@ pub fn on_message(msg: &SMessage) -> Effect {
     MEDIA.with(|m| {
         let mut r = m.borrow_mut();
         let mut fx = Effect::default();
+        // streams a looping element restarts (once per url, after the loop below)
+        let mut loops: Vec<String> = Vec::new();
         for e in r.elements.iter_mut().filter(|e| &e.url == url) {
             fx.handled = true;
             match msg {
@@ -541,12 +709,19 @@ pub fn on_message(msg: &SMessage) -> Effect {
                     if e.kind == Kind::Video && nat != e.natural {
                         fx.relayout = true;
                     }
+                    let duration_changed = e.ready_state >= HAVE_METADATA && e.duration_ns != *duration_ns;
                     e.natural = nat;
                     e.duration_ns = *duration_ns;
                     e.real_video = *real_video;
                     if e.state == State::Loading {
                         e.state = State::Paused;
                     }
+                    if duration_changed {
+                        fire(e, "durationchange");
+                    }
+                    // an audio-only stream has no picture to wait for: the local file is whole
+                    let to = if nat.is_none() { HAVE_ENOUGH_DATA } else { HAVE_METADATA };
+                    advance_ready(e, to);
                 }
                 SMessage::MediaFrame { pts_ns, width: 0, levels, .. } => {
                     // an audio-only session's meter frame: the newest window's peaks, and the
@@ -558,6 +733,8 @@ pub fn on_message(msg: &SMessage) -> Effect {
                     if e.state == State::Loading {
                         e.state = State::Paused;
                     }
+                    advance_ready(e, HAVE_ENOUGH_DATA);
+                    time_moved(e);
                 }
                 SMessage::MediaFrame { pts_ns, levels, .. } => {
                     if let Some(p) = levels.last() {
@@ -573,19 +750,72 @@ pub fn on_message(msg: &SMessage) -> Effect {
                     if e.state == State::Loading {
                         e.state = State::Paused;
                     }
+                    advance_ready(e, HAVE_ENOUGH_DATA);
+                    time_moved(e);
                 }
                 SMessage::MediaEnded { .. } => {
-                    e.state = State::Ended;
+                    if looping(&e.node) && e.state == State::Playing {
+                        // HTML §4.8.11.8 "reaches the end" with `loop`: seek to the start, play on
+                        loops.push(e.url.clone());
+                        e.seeking = true;
+                        e.pts_ns = 0;
+                        fire(e, "seeking");
+                    } else {
+                        let was_playing = e.state == State::Playing;
+                        e.state = State::Ended;
+                        e.playing_owed = false;
+                        e.last_timeupdate_ns = e.pts_ns;
+                        fire(e, "timeupdate");
+                        if was_playing {
+                            fire(e, "pause");
+                        }
+                        fire(e, "ended");
+                    }
                 }
                 SMessage::MediaError { error, .. } => {
                     e.state = State::Error(error.clone());
+                    // HTML §4.8.11.5: before metadata the source is "not supported" (code 4,
+                    // networkState NO_SOURCE); after it, a decode error (code 3, IDLE)
+                    if e.ready_state == HAVE_NOTHING {
+                        e.error_code = 4;
+                        e.network_state = NETWORK_NO_SOURCE;
+                    } else {
+                        e.error_code = 3;
+                        e.network_state = NETWORK_IDLE;
+                    }
+                    e.playing_owed = false;
+                    e.seeking = false;
+                    fire(e, "error");
                 }
                 _ => {}
             }
             fx.repaint.push(e.node.clone());
         }
+        loops.dedup();
+        let title = r.title.clone();
+        for url in loops {
+            let mime = r.elements.iter().find(|e| e.url == url).map(|e| e.mime.clone()).unwrap_or_default();
+            r.outbox.push(SMessage::MediaSeek { url: url.clone(), position_ns: 0 });
+            r.outbox.push(SMessage::PlayMedia { url, title: title.clone(), mime });
+        }
         fx
     })
+}
+
+/// The picture or meter moved the clock: a pending seek lands (`timeupdate`, `seeked`), and
+/// during playback `timeupdate` fires every [`TIMEUPDATE_NS`] of media time.
+fn time_moved(e: &mut Element) {
+    if e.seeking {
+        e.seeking = false;
+        e.last_timeupdate_ns = e.pts_ns;
+        fire(e, "timeupdate");
+        fire(e, "seeked");
+        return;
+    }
+    if e.state == State::Playing && (e.pts_ns - e.last_timeupdate_ns).abs() >= TIMEUPDATE_NS {
+        e.last_timeupdate_ns = e.pts_ns;
+        fire(e, "timeupdate");
+    }
 }
 
 /// The media element `node` is, or is inside.
@@ -617,6 +847,7 @@ pub fn play(node: &NodeRef) -> bool {
             e.deferred = Some(Deferred::Play);
             e.state = State::Playing;
             e.show_poster = false;
+            e.playing_owed = true;
             return true;
         }
         if state == State::Ended {
@@ -624,12 +855,27 @@ pub fn play(node: &NodeRef) -> bool {
         }
         let title = r.title.clone();
         r.outbox.push(SMessage::PlayMedia { url: url.clone(), title, mime });
-        if r.elements[i].muted && state == State::Idle {
-            r.outbox.push(SMessage::MediaMute { url, muted: true });
+        if state == State::Idle {
+            let mut out = Vec::new();
+            settings_requests(&mut out, &r.elements[i]);
+            r.outbox.extend(out);
         }
         let e = &mut r.elements[i];
+        if state == State::Ended {
+            // HTML play(): an ended element seeks to the start first
+            e.pts_ns = 0;
+            e.seeking = true;
+            fire(e, "seeking");
+        }
+        if state == State::Idle && e.network_state == NETWORK_IDLE && e.ready_state == HAVE_NOTHING {
+            // preload=none resumes its suspended fetch
+            e.network_state = NETWORK_LOADING;
+        }
         e.state = State::Playing;
         e.show_poster = false;
+        // `play` is the caller's (the binding fires it, [`toggle`] for a click); `playing` follows
+        // the first picture after this
+        e.playing_owed = true;
         true
     })
 }
@@ -644,7 +890,12 @@ pub fn pause(node: &NodeRef) -> bool {
         }
         let url = r.elements[i].url.clone();
         r.outbox.push(SMessage::MediaPause { url });
-        r.elements[i].state = State::Paused;
+        let e = &mut r.elements[i];
+        e.state = State::Paused;
+        e.playing_owed = false;
+        // HTML pause(): `timeupdate` then `pause` — the binding (or [`toggle`]) fires `pause` after
+        e.last_timeupdate_ns = e.pts_ns;
+        fire(e, "timeupdate");
         true
     })
 }
@@ -656,11 +907,22 @@ pub fn toggle(node: &NodeRef) -> bool {
         let r = m.borrow();
         find(&r, &el).map(|i| r.elements[i].state == State::Playing)
     });
-    match playing {
+    let done = match playing {
         Some(true) => pause(&el),
         Some(false) => play(&el),
         None => false,
+    };
+    if done {
+        // a user click is not script: this path fires `play` / `pause` itself
+        let ty = if playing == Some(true) { "pause" } else { "play" };
+        MEDIA.with(|m| {
+            let mut r = m.borrow_mut();
+            if let Some(i) = find(&r, &el) {
+                fire(&mut r.elements[i], ty);
+            }
+        });
     }
+    done
 }
 
 /// Set `node`'s element muted or not (HTMLMediaElement.muted from script): the registry's flag, and
@@ -679,6 +941,104 @@ pub fn set_muted(node: &NodeRef, muted: bool) -> bool {
     })
 }
 
+/// Set `node`'s element `volume` (HTMLMediaElement.volume). `Err` when outside 0..=1 (the binding
+/// throws IndexSizeError). Fires `volumechange`; an open session gets `MediaVolume` (Stria scales
+/// the samples; mute stays separate and wins), an unopened one gets it with its opening request.
+pub fn set_volume(node: &NodeRef, volume: f64) -> Result<bool, ()> {
+    if !(0.0..=1.0).contains(&volume) {
+        return Err(());
+    }
+    Ok(MEDIA.with(|m| {
+        let mut r = m.borrow_mut();
+        let Some(i) = find(&r, node) else { return false };
+        if r.elements[i].volume == volume {
+            return true;
+        }
+        r.elements[i].volume = volume;
+        if !matches!(r.elements[i].state, State::Idle) {
+            let url = r.elements[i].url.clone();
+            r.outbox.push(SMessage::MediaVolume { url, volume: volume as f32 });
+        }
+        fire(&mut r.elements[i], "volumechange");
+        true
+    }))
+}
+
+/// Set `node`'s element `playbackRate`. Fires `ratechange`; an open session gets `MediaRate`
+/// (Stria: 0 holds the clock with the element still playing, as HTML says; another rate scales the
+/// clock — see Stria's `Player::set_rate` for what it refuses).
+pub fn set_playback_rate(node: &NodeRef, rate: f64) -> bool {
+    if !rate.is_finite() {
+        return false;
+    }
+    MEDIA.with(|m| {
+        let mut r = m.borrow_mut();
+        let Some(i) = find(&r, node) else { return false };
+        let old = r.elements[i].rate;
+        if old == rate {
+            return true;
+        }
+        r.elements[i].rate = rate;
+        if !matches!(r.elements[i].state, State::Idle) {
+            let url = r.elements[i].url.clone();
+            r.outbox.push(SMessage::MediaRate { url, rate });
+        }
+        fire(&mut r.elements[i], "ratechange");
+        true
+    })
+}
+
+fn with_element<T>(node: &NodeRef, f: impl FnOnce(&Element) -> T) -> Option<T> {
+    MEDIA.with(|m| {
+        let r = m.borrow();
+        find(&r, node).map(|i| f(&r.elements[i]))
+    })
+}
+
+/// HTMLMediaElement `readyState` of `node` (HAVE_NOTHING for an element Aether has not registered).
+pub fn ready_state(node: &NodeRef) -> u8 {
+    with_element(node, |e| e.ready_state).unwrap_or(HAVE_NOTHING)
+}
+
+/// HTMLMediaElement `networkState` of `node`: the registered element's, NO_SOURCE when every
+/// `<source>` was refused, else EMPTY.
+pub fn network_state(node: &NodeRef) -> u8 {
+    if let Some(n) = with_element(node, |e| e.network_state) {
+        return n;
+    }
+    if MEDIA.with(|m| m.borrow().refused.contains(node)) { NETWORK_NO_SOURCE } else { NETWORK_EMPTY }
+}
+
+/// HTMLMediaElement `currentTime` in seconds (the seek target while seeking).
+pub fn current_time(node: &NodeRef) -> f64 {
+    with_element(node, |e| e.pts_ns.max(0) as f64 / 1e9).unwrap_or(0.0)
+}
+
+/// HTMLMediaElement `seeking`.
+pub fn seeking(node: &NodeRef) -> bool {
+    with_element(node, |e| e.seeking).unwrap_or(false)
+}
+
+/// `MediaError.code` of `node` (0: `error` is null).
+pub fn error_code(node: &NodeRef) -> u16 {
+    with_element(node, |e| e.error_code).unwrap_or(0)
+}
+
+/// HTMLMediaElement `playbackRate` (1 for an unregistered element).
+pub fn playback_rate(node: &NodeRef) -> f64 {
+    with_element(node, |e| e.rate).unwrap_or(1.0)
+}
+
+/// HTMLMediaElement `volume` (1 for an unregistered element).
+pub fn volume(node: &NodeRef) -> f64 {
+    with_element(node, |e| e.volume).unwrap_or(1.0)
+}
+
+/// The media events fired at `node`'s element so far, in order.
+pub fn events(node: &NodeRef) -> Vec<&'static str> {
+    with_element(node, |e| e.events.clone()).unwrap_or_default()
+}
+
 /// Seek `node`'s element to `position_ns` (clears the show-poster flag, as HTML's seek does).
 pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
     MEDIA.with(|m| {
@@ -691,6 +1051,12 @@ pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
         if e.state == State::Ended {
             e.state = State::Paused;
         }
+        // HTML §4.8.11.9: `seeking` is true and `currentTime` reads the new position at once;
+        // `timeupdate` + `seeked` when the frame at the target arrives ([`time_moved`])
+        let dur = e.duration_ns;
+        e.pts_ns = (if dur > 0 { position_ns.min(dur) } else { position_ns }) as i64;
+        e.seeking = true;
+        fire(e, "seeking");
         true
     })
 }

@@ -509,6 +509,34 @@ impl AetherEngine {
         media::snapshot().get(i).is_some_and(|e| media::seek(&e.node, position_ns))
     }
 
+    /// AETHERMEDIA (SR107): ask for every `loading=lazy` `<img>` whose box is within Chromium's
+    /// 1250 px margin of the viewport and not yet decoded (`images::request_lazy` fetches off-thread;
+    /// `tick` installs the result and relayouts).
+    fn lazy_images_pass(&self) {
+        let Some(doc) = self.document.as_ref() else { return };
+        let Ok(imgs) = doc.select("img[loading]") else { return };
+        let base = images::page_base();
+        for img in imgs {
+            let node = img.as_node();
+            if !images::is_lazy(&img.attributes.borrow()) {
+                continue;
+            }
+            let Some(src) = images::img_source(node, images::SELECTION_VIEWPORT) else { continue };
+            if src.starts_with("data:") {
+                continue;
+            }
+            let abs = images::resolve(&base, &src);
+            if !(abs.starts_with("http://") || abs.starts_with("https://")) || images::has(&abs) {
+                continue;
+            }
+            if let Some((_, y, _, h)) = self.box_of(node) {
+                if images::lazy_should_load(y, h, self.scroll_y as f32, self.height as f32) {
+                    images::request_lazy(&abs);
+                }
+            }
+        }
+    }
+
     /// Absolute (document) border box of `node`'s layout box: (x, y, w, h).
     pub fn box_of(&self, node: &crate::dom::NodeRef) -> Option<(f32, f32, f32, f32)> {
         let layout = self.layout_tree.as_ref()?;
@@ -591,6 +619,10 @@ impl AetherEngine {
                     }
                 }
             }
+        }
+        if images::take_lazy_loaded() > 0 {
+            self.relayout(); // AETHERMEDIA (SR107): a lazy image arrived — its box takes its size
+            self.lazy_images_pass();
         }
         self.sel_changed();
         // The focused field's caret blinks: repaint its box when the phase flips.
@@ -774,6 +806,7 @@ impl AetherEngine {
                     .map(|h| (h as f64 - self.height as f64).max(0.0))
                     .unwrap_or(f64::MAX);
                 self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll);
+                self.lazy_images_pass(); // AETHERMEDIA (SR107): loading=lazy images nearing the viewport
                 // Integer shift must equal the difference of the TRUNCATED
                 // positions the renderer will actually paint at — deriving it
                 // from the fractional delta lets retained pixels drift against
@@ -1847,6 +1880,7 @@ impl AetherEngine {
         self.scroll_y = 0.0;
         layout::forget_scroll(); // AETHERSTYLE3 (SR103): a new document's boxes start unscrolled
         css::anim::reset(); // AETHERSTYLE3 (SR103): and nothing of the old one keeps animating
+        self.lazy_images_pass(); // AETHERMEDIA (SR107): lazy images already near the first viewport
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
         // Focus never survives a navigation; the new document's first `autofocus` control that can

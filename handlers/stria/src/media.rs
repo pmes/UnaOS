@@ -209,6 +209,12 @@ pub struct Player {
     audio_eof: bool,
     /// Muted: zeros go to the device in place of the samples (the clock keeps running).
     muted: bool,
+    /// AETHERMEDIA (SR107): linear output gain 0..=1 (`MediaVolume`); mute wins over it.
+    volume: f32,
+    /// The requester asked to run (play) / to hold (pause).
+    running: bool,
+    /// `MediaRate` 0: the clock and the device are held while the session stays running.
+    rate_held: bool,
     consumed_seen: u64,
     /// Device consumption at the last open/seek, and frames pushed to the device since: the
     /// audio-only end is when the device has played every pushed frame.
@@ -382,6 +388,9 @@ impl Player {
             levels: VecDeque::new(),
             audio_eof: false,
             muted: false,
+            volume: 1.0,
+            running: false,
+            rate_held: false,
             consumed_seen: 0,
             consumed_base: 0,
             pushed_frames: 0,
@@ -417,16 +426,48 @@ impl Player {
         self.vtrack.as_ref()
     }
     pub fn play(&mut self) {
+        self.running = true;
+        if self.rate_held {
+            return;
+        }
         if let Some(o) = self.aout.as_mut() {
             o.set_paused(false);
         }
         self.clock.play();
     }
     pub fn pause(&mut self) {
+        self.running = false;
+        self.hold();
+    }
+    fn hold(&mut self) {
         self.clock.pause();
         if let Some(o) = self.aout.as_mut() {
             o.set_paused(true);
         }
+    }
+
+    /// AETHERMEDIA (SR107): the output gain, linear 0..=1, applied to the samples on their way to
+    /// the device (the meters keep measuring the stream). Mute wins.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = if volume.is_finite() { volume.clamp(0.0, 1.0) } else { 1.0 };
+    }
+
+    /// AETHERMEDIA (SR107): the playback rate. 0 holds the clock and the device while the session
+    /// stays running (HTML: playing, not advancing); a non-zero rate releases the hold. Returns
+    /// false for a rate other than 0 or 1: the master clock (audio device or wall) has no rate
+    /// and no time-stretch exists in the audio path, so such a session plays at 1x.
+    pub fn set_rate(&mut self, rate: f64) -> bool {
+        let held = rate == 0.0;
+        if held && !self.rate_held {
+            self.rate_held = true;
+            self.hold();
+        } else if !held && self.rate_held {
+            self.rate_held = false;
+            if self.running {
+                self.play();
+            }
+        }
+        rate == 0.0 || rate == 1.0
     }
 
     /// Mute / unmute: the device plays zeros in place of the stream (already-queued samples
@@ -652,7 +693,14 @@ impl Player {
                 self.pending.make_contiguous();
                 continue;
             }
-            let took = if self.muted { out.push(&vec![0.0; chunk.len()]) } else { out.push(chunk) };
+            let took = if self.muted {
+                out.push(&vec![0.0; chunk.len()])
+            } else if self.volume != 1.0 {
+                let g = self.volume;
+                out.push(&chunk.iter().map(|x| x * g).collect::<Vec<f32>>())
+            } else {
+                out.push(chunk)
+            };
             if took == 0 {
                 break;
             }

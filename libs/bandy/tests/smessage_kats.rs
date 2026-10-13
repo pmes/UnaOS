@@ -420,6 +420,8 @@ kat!(
 );
 kat!(kat_media_stop, SMessage::MediaStop { url: "u".to_string() }, r#"{"MediaStop":{"url":"u"}}"#);
 kat!(kat_media_mute, SMessage::MediaMute { url: "u".to_string(), muted: true }, r#"{"MediaMute":{"url":"u","muted":true}}"#);
+kat!(kat_media_volume, SMessage::MediaVolume { url: "u".to_string(), volume: 0.5 }, r#"{"MediaVolume":{"url":"u","volume":0.5}}"#);
+kat!(kat_media_rate, SMessage::MediaRate { url: "u".to_string(), rate: 1.5 }, r#"{"MediaRate":{"url":"u","rate":1.5}}"#);
 kat!(
     kat_media_opened,
     SMessage::MediaOpened {
@@ -1286,6 +1288,8 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::MediaSeek { .. } => "MediaSeek",
         SMessage::MediaStop { .. } => "MediaStop",
         SMessage::MediaMute { .. } => "MediaMute",
+        SMessage::MediaVolume { .. } => "MediaVolume",
+        SMessage::MediaRate { .. } => "MediaRate",
         SMessage::MediaOpened { .. } => "MediaOpened",
         SMessage::MediaFrame { .. } => "MediaFrame",
         SMessage::MediaEnded { .. } => "MediaEnded",

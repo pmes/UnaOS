@@ -14,6 +14,8 @@
 //! | `MediaPause` / `MediaResume` | freeze / run the session's clock | frames stop / resume |
 //! | `MediaSeek { url, position_ns }` | keyframe at or before, decode forward | the frame at the target |
 //! | `MediaMute { url, muted }` | zero / restore the samples sent to the device (clock runs on) | |
+//! | `MediaVolume { url, volume }` | scale the samples sent to the device (0..=1; mute wins) | |
+//! | `MediaRate { url, rate }` | 0 holds the clock (session stays playing), non-zero releases; other than 0/1 plays at 1x (logged) | |
 //! | `MediaStop { url }` | close the session | `MediaEnded` |
 //!
 //! A stream with no video track is an AUDIO-ONLY session (AUDIOTRACK, SR45): `MediaOpened`
@@ -225,6 +227,19 @@ fn handle(synapse: &Synapse, sessions: &mut HashMap<String, Session>, msg: SMess
         SMessage::MediaMute { url, muted } => {
             if let Some(s) = sessions.get_mut(&url) {
                 s.player.set_muted(muted);
+            }
+        }
+        // AETHERMEDIA (SR107): HTMLMediaElement.volume / playbackRate
+        SMessage::MediaVolume { url, volume } => {
+            if let Some(s) = sessions.get_mut(&url) {
+                s.player.set_volume(volume);
+            }
+        }
+        SMessage::MediaRate { url, rate } => {
+            if let Some(s) = sessions.get_mut(&url) {
+                if !s.player.set_rate(rate) {
+                    log::warn!("[STRIA] :: {url}: playbackRate {rate} refused (no clock rate / time-stretch); playing at 1x");
+                }
             }
         }
         SMessage::MediaStop { url } => {
