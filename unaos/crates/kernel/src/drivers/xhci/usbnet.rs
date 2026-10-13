@@ -461,6 +461,7 @@ pub fn disconnect(slot: u8) {
     SLOT.store(0, Ordering::Relaxed);
     retry_reset(); // PUMPRETRY (B537): a pull during a back-off forgets the pending retry
     reset_arm(); U9_CARRY.store(0, Ordering::Relaxed); // USBNET9 M2: a carried burst dies with the slot
+    ud_reset(); // USBNETDHCP (B538): the client, its lease and the ping die with the slot
     tx_reset(); // NETCLOCK: an in-flight OUT TD dies with the slot
     for m in MAC.iter() {
         m.store(0, Ordering::Relaxed);
@@ -685,6 +686,7 @@ pub fn claim(slot_id: u8, endpoint_id: u8, param: u64, code: u8, transfer_len: u
 }
 pub fn take_done() -> Option<(u8, u32)> {
     u8_pass_tick(); // USBNET8 M8: every data pass asks here; the interval between asks is the pass time
+    ud_tick(); // USBNETDHCP (B538): the link's DHCP client and gateway ping, paced off the data pass (under the controller loan)
     if !DONE.load(Ordering::Relaxed) {
         return None;
     }
@@ -707,7 +709,9 @@ pub fn deliver(frame: &[u8]) {
     if frame.is_empty() {
         return; // the ZLP that terminates an MPS-multiple frame completes a whole TRB with 0 bytes
     }
-    if RXQ.lock().push(frame) {
+    let queued = RXQ.lock().push(frame);
+    ud_tap(frame, queued); // USBNETDHCP (B538): every frame classified on the wire, the DHCP reply / post-lease ARP + ICMP taken here, whether or not the 7-frame ring had room
+    if queued {
         RX_FRAMES.fetch_add(1, Ordering::Relaxed);
         note_ethertype(frame);
         let _ = FIRST_FRAME_AT.compare_exchange(0, crate::arch::ms().max(1), Ordering::Relaxed, Ordering::Relaxed); // USBNET7
@@ -1200,6 +1204,7 @@ pub fn selftest() {
         RX_ARP.load(Ordering::Relaxed), RX_V4.load(Ordering::Relaxed), RX_V6.load(Ordering::Relaxed), RX_DHCP.load(Ordering::Relaxed),
         RX_PAD_HDR.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), leased() as u8
     );
+    ud_report(); // USBNETDHCP (B538): the frame classes and the client's state
     serial_println!(":: USBNET6: chip={} rx_ctl={:#06x} mfb=qctrl-buf{} frames={} dropped={} first_ethertype={}{} -> {} ::", chip, rxctl, mfb, frames, dropped, et, why, v);
     usbnet7_verdict(t0, first_at, first);
 }
@@ -2085,3 +2090,388 @@ pub fn usbnetrx_selftest() {
     serial_println!(":: USBNETRX: armed={} doorbell={} ep_state={} frames={} window={} td={} usb={} -> {} ::",
         armed, rung, ep_state_name(st), frames, frames - f0, rxr_td_name(RXR_TD.load(Ordering::Relaxed)), rxr_usb(), if ok { "PASS" } else { "FAIL" });
 }
+
+// ── USBNETDHCP (rmbp-ledger B538) — TAIL-APPENDED ───────────────────────────────────────────────────
+// Flight 31: smoltcp's DISCOVER went out three times (262-octet BOOTP, broadcast flag clear), 54 frames came
+// back, no reply from port 67 ever reached the ring (no `[usbnet] rx dhcp` line) and nothing said what the 54
+// were. The tap below (called from `deliver` for every frame, before the ring's verdict matters) classifies
+// each frame on the wire and runs the link's own RFC 2131 client (`net::dhcp`, 300-octet BOOTP, broadcast
+// flag set — so the OFFER/ACK come back broadcast, the class the RX filter is already proven to pass), then
+// answers ARP for the lease and pings the gateway once. Everything here runs under the controller loan
+// (`take_done` and `deliver` are both inside `usbnet_data_pass`), so the client mutex never contends; frames
+// go straight onto TXQ (never `raw_tx`: its `drive` would re-take the loan we hold) and the same pass issues them.
+
+use net::dhcp::{DhcpClient, Handled};
+
+/// Frames printed one line each before the counts take over.
+const UD_SHOW: u64 = 32;
+/// Link seen -> the first DISCOVER (the PHY's first frames settle).
+const UD_SETTLE_MS: u64 = 1_000;
+/// DISCOVER retransmit back-off (RFC 2131 §4.1: 4, 8, 16, 32 s …), capped.
+const UD_RETX_MIN_MS: u64 = 4_000;
+const UD_RETX_MAX_MS: u64 = 32_000;
+/// A REQUEST unanswered this long restarts discovery.
+const UD_REQ_MS: u64 = 4_000;
+/// Gateway ARP / echo: per-try wait and tries per stage.
+const UD_PING_MS: u64 = 2_000;
+const UD_PING_TRIES: u32 = 3;
+/// ICMP identifier of the gateway echo ("UD"), distinct from smolnet's 0x554E.
+const UD_PING_IDENT: u16 = 0x5544;
+const UD_PING_DATA: &[u8] = b"unaos-usbnet";
+
+const UD_IDLE: u8 = 0;
+const UD_DISCOVERING: u8 = 1;
+const UD_REQUESTING: u8 = 2;
+const UD_BOUND: u8 = 3;
+/// Ping stages: none, ARP sent, echo sent, done (answered or given up).
+const UP_NONE: u8 = 0;
+const UP_ARP: u8 = 1;
+const UP_ECHO: u8 = 2;
+const UP_DONE: u8 = 3;
+
+static UD_CLIENT: Mutex<Option<DhcpClient>> = Mutex::new(None);
+static UD_STATE: AtomicU8 = AtomicU8::new(UD_IDLE);
+/// When the client next acts (0 = the link not yet seen up).
+static UD_NEXT: AtomicU64 = AtomicU64::new(0);
+static UD_RETX: AtomicU64 = AtomicU64::new(0);
+static UD_DISCOVERS: AtomicU64 = AtomicU64::new(0);
+static UD_OFFERS: AtomicU64 = AtomicU64::new(0);
+static UD_ACKS: AtomicU64 = AtomicU64::new(0);
+static UD_NAKS: AtomicU64 = AtomicU64::new(0);
+static UD_IGNORED: AtomicU64 = AtomicU64::new(0);
+/// The lease, big-endian octets packed (0 = none).
+static UD_IP: AtomicU32 = AtomicU32::new(0);
+static UD_MASK: AtomicU32 = AtomicU32::new(0);
+static UD_GW: AtomicU32 = AtomicU32::new(0);
+static UD_DNS: AtomicU32 = AtomicU32::new(0);
+static UD_LEASE_S: AtomicU32 = AtomicU32::new(0);
+/// A bound lease the stack (smolnet) has not applied yet.
+static UD_PENDING: AtomicBool = AtomicBool::new(false);
+static UD_PSTATE: AtomicU8 = AtomicU8::new(UP_NONE);
+static UD_PAT: AtomicU64 = AtomicU64::new(0);
+static UD_PTRIES: AtomicU32 = AtomicU32::new(0);
+static UD_GWMAC: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static UD_ARPS: AtomicU64 = AtomicU64::new(0);
+// Frame classes (every frame the data pass delivered, ring room or not).
+static UD_RX_N: AtomicU64 = AtomicU64::new(0);
+static UD_C_ARP: AtomicU64 = AtomicU64::new(0);
+static UD_C_V4: AtomicU64 = AtomicU64::new(0);
+static UD_C_V6: AtomicU64 = AtomicU64::new(0);
+static UD_C_OTHER: AtomicU64 = AtomicU64::new(0);
+static UD_C_BCAST: AtomicU64 = AtomicU64::new(0);
+static UD_C_MCAST: AtomicU64 = AtomicU64::new(0);
+static UD_C_OURS: AtomicU64 = AtomicU64::new(0);
+static UD_C_FOREIGN: AtomicU64 = AtomicU64::new(0);
+static UD_C_UDP67: AtomicU64 = AtomicU64::new(0);
+static UD_C_QFULL: AtomicU64 = AtomicU64::new(0);
+
+/// Dotted-quad display.
+struct UdIp([u8; 4]);
+impl core::fmt::Display for UdIp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{}.{}.{}", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+fn ud_ip(a: &AtomicU32) -> [u8; 4] { a.load(Ordering::Relaxed).to_be_bytes() }
+fn ud_be16(b: &[u8], i: usize) -> u16 { u16::from_be_bytes([b[i], b[i + 1]]) }
+fn ud_state_name(s: u8) -> &'static str {
+    match s { UD_DISCOVERING => "discovering", UD_REQUESTING => "requesting", UD_BOUND => "bound", _ => "idle" }
+}
+/// One frame onto TXQ (a masked micro-hold, like every other hold of the ring).
+fn ud_push(frame: &[u8]) -> bool {
+    let ok = TXQ.lock().push(frame);
+    if !ok { TX_DROP.fetch_add(1, Ordering::Relaxed); }
+    ok
+}
+
+/// The slot went away: the client, the lease and the ping with it (the counts stay, per boot).
+fn ud_reset() {
+    { let _m = crate::arch::IrqMask::new(); *UD_CLIENT.lock() = None; }
+    UD_STATE.store(UD_IDLE, Ordering::Relaxed);
+    UD_NEXT.store(0, Ordering::Relaxed);
+    UD_RETX.store(0, Ordering::Relaxed);
+    for a in [&UD_IP, &UD_MASK, &UD_GW, &UD_DNS, &UD_LEASE_S] { a.store(0, Ordering::Relaxed); }
+    UD_PENDING.store(false, Ordering::Relaxed);
+    UD_PSTATE.store(UP_NONE, Ordering::Relaxed);
+    UD_PTRIES.store(0, Ordering::Relaxed);
+}
+
+/// Every data pass: with the PHY up, the client's next step when it is due; once bound, the ping's.
+fn ud_tick() {
+    if !is_up() || (kind() == KIND_AX88179 && !link_up()) { return; }
+    let now = crate::arch::ms().max(1);
+    let state = UD_STATE.load(Ordering::Relaxed);
+    if state == UD_BOUND { ud_ping_tick(now); return; }
+    let next = UD_NEXT.load(Ordering::Relaxed);
+    if next == 0 { UD_NEXT.store(now + UD_SETTLE_MS, Ordering::Relaxed); return; }
+    if now < next { return; }
+    if state == UD_REQUESTING {
+        serial_println!("[dhcp] request unanswered ms={} -> discover", UD_REQ_MS);
+    }
+    let retx = UD_RETX.load(Ordering::Relaxed).max(UD_RETX_MIN_MS).min(UD_RETX_MAX_MS);
+    UD_RETX.store((retx * 2).min(UD_RETX_MAX_MS), Ordering::Relaxed);
+    UD_NEXT.store(now + retx, Ordering::Relaxed);
+    ud_discover();
+}
+
+/// A padded broadcast DISCOVER under a fresh xid onto TXQ. `[dhcp] discover n= xid= len= retx_ms=` the first
+/// two and every power of two (the u9 dump prints its bytes when the pass issues it: `flags=8000 len=342`).
+fn ud_discover() {
+    let m = mac();
+    let xid = (crate::arch::now_cycles() as u32) ^ u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+    let mut out = [0u8; 400];
+    let n = {
+        let _m = crate::arch::IrqMask::new();
+        let mut g = UD_CLIENT.lock();
+        let c = g.get_or_insert_with(|| DhcpClient::new(m, xid));
+        c.discover_min(xid, &mut out)
+    };
+    let Some(n) = n else { return };
+    UD_STATE.store(UD_DISCOVERING, Ordering::Relaxed);
+    let k = UD_DISCOVERS.fetch_add(1, Ordering::Relaxed) + 1;
+    let pushed = ud_push(&out[..n]);
+    if k <= 2 || k.is_power_of_two() || !pushed {
+        serial_println!("[dhcp] discover n={} xid={:08x} len={} client=net retx_ms={} q={}", k, xid, n,
+            UD_RETX.load(Ordering::Relaxed) / 2, if pushed { "ok" } else { "full" });
+    }
+}
+
+/// The counts line: every frame class since boot.
+fn ud_counts_line(n: u64) {
+    serial_println!(
+        "[usbnet] rx counts n={} arp={} v4={} v6={} other={} bcast={} mcast={} ours={} foreign={} udp67={} qfull={}",
+        n, UD_C_ARP.load(Ordering::Relaxed), UD_C_V4.load(Ordering::Relaxed), UD_C_V6.load(Ordering::Relaxed),
+        UD_C_OTHER.load(Ordering::Relaxed), UD_C_BCAST.load(Ordering::Relaxed), UD_C_MCAST.load(Ordering::Relaxed),
+        UD_C_OURS.load(Ordering::Relaxed), UD_C_FOREIGN.load(Ordering::Relaxed), UD_C_UDP67.load(Ordering::Relaxed),
+        UD_C_QFULL.load(Ordering::Relaxed)
+    );
+}
+
+/// `tests usbnet`: the classes and the client.
+fn ud_report() {
+    ud_counts_line(UD_RX_N.load(Ordering::Relaxed));
+    let ping = match UD_PSTATE.load(Ordering::Relaxed) { UP_ARP => "arp", UP_ECHO => "echo", UP_DONE => "done", _ => "none" };
+    serial_println!(
+        "[usbnet] dhcp state={} discovers={} offers={} acks={} naks={} ignored={} ip={} gw={} ping={} arp_replies={}",
+        ud_state_name(UD_STATE.load(Ordering::Relaxed)), UD_DISCOVERS.load(Ordering::Relaxed), UD_OFFERS.load(Ordering::Relaxed),
+        UD_ACKS.load(Ordering::Relaxed), UD_NAKS.load(Ordering::Relaxed), UD_IGNORED.load(Ordering::Relaxed),
+        UdIp(ud_ip(&UD_IP)), UdIp(ud_ip(&UD_GW)), ping, UD_ARPS.load(Ordering::Relaxed)
+    );
+}
+
+/// Every delivered frame: classified (one line each for the first `UD_SHOW`, then the counts at each power of
+/// two), then a DHCP reply goes to the client and, once bound, ARP and ICMP to the responders.
+fn ud_tap(f: &[u8], queued: bool) {
+    if f.len() < 14 { return; }
+    let et = ud_be16(f, 12);
+    let m = mac();
+    let d = &f[0..6];
+    let dst = if d.iter().all(|&b| b == 0xff) {
+        UD_C_BCAST.fetch_add(1, Ordering::Relaxed); "bcast"
+    } else if d[0] & 1 != 0 {
+        UD_C_MCAST.fetch_add(1, Ordering::Relaxed); "mcast"
+    } else if d == &m[..] {
+        UD_C_OURS.fetch_add(1, Ordering::Relaxed); "ours"
+    } else {
+        UD_C_FOREIGN.fetch_add(1, Ordering::Relaxed); "other"
+    };
+    if !queued { UD_C_QFULL.fetch_add(1, Ordering::Relaxed); }
+    let mut proto: Option<u8> = None;
+    let mut arp_op: Option<u16> = None;
+    let mut ports: Option<(u16, u16)> = None;
+    let mut l4 = 0usize;
+    match et {
+        0x0806 => {
+            UD_C_ARP.fetch_add(1, Ordering::Relaxed);
+            if f.len() >= 22 { arp_op = Some(ud_be16(f, 20)); }
+        }
+        0x0800 => {
+            UD_C_V4.fetch_add(1, Ordering::Relaxed);
+            if f.len() >= 34 {
+                l4 = 14 + ((f[14] & 0x0f) as usize) * 4;
+                proto = Some(f[23]);
+                if (f[23] == 17 || f[23] == 6) && f.len() >= l4 + 4 { ports = Some((ud_be16(f, l4), ud_be16(f, l4 + 2))); }
+            }
+        }
+        0x86dd => {
+            UD_C_V6.fetch_add(1, Ordering::Relaxed);
+            if f.len() >= 54 {
+                proto = Some(f[20]);
+                if (f[20] == 17 || f[20] == 6) && f.len() >= 58 { ports = Some((ud_be16(f, 54), ud_be16(f, 56))); }
+            }
+        }
+        _ => { UD_C_OTHER.fetch_add(1, Ordering::Relaxed); }
+    }
+    let n = UD_RX_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= UD_SHOW {
+        let p = match (arp_op, proto) {
+            (Some(op), _) => alloc::format!("arp{}", op),
+            (None, Some(p)) => alloc::format!("{}", p),
+            _ => alloc::string::String::from("-"),
+        };
+        let ps = match ports { Some((s, t)) => alloc::format!("{}->{}", s, t), None => alloc::string::String::from("-") };
+        serial_println!("[usbnet] rx ethertype={:#06x} proto={} ports={} len={} dst={} q={}", et, p, ps, f.len(), dst, if queued { "ok" } else { "full" });
+    } else if n.is_power_of_two() {
+        ud_counts_line(n);
+    }
+    if et == 0x0800 {
+        if let Some((sp, dp)) = ports {
+            if proto == Some(17) && sp == 67 {
+                UD_C_UDP67.fetch_add(1, Ordering::Relaxed);
+                if dp == 68 { ud_dhcp_rx(f); }
+            }
+        } else if proto == Some(1) && f.len() >= l4 + 8 {
+            ud_icmp_rx(f, l4);
+        }
+    } else if et == 0x0806 && f.len() >= 42 {
+        ud_arp_rx(f, arp_op.unwrap_or(0));
+    }
+}
+
+/// A DHCP server reply (UDP 67 -> 68) into the client.
+fn ud_dhcp_rx(f: &[u8]) {
+    let Some(l) = net::dhcp::parse_lease(f) else { return };
+    let mut out = [0u8; 400];
+    let (h, ours) = {
+        let _m = crate::arch::IrqMask::new();
+        let mut g = UD_CLIENT.lock();
+        match g.as_mut() { Some(c) => (c.handle(&l, &mut out), c.xid()), None => (Handled::Ignored, 0) }
+    };
+    let now = crate::arch::ms().max(1);
+    let r = &l.reply;
+    match h {
+        Handled::Request(n) => {
+            UD_OFFERS.fetch_add(1, Ordering::Relaxed);
+            UD_STATE.store(UD_REQUESTING, Ordering::Relaxed);
+            UD_NEXT.store(now + UD_REQ_MS, Ordering::Relaxed);
+            let pushed = ud_push(&out[..n]);
+            serial_println!("[dhcp] offer ip={} server={} -> request{}", UdIp(r.your_ip), UdIp(r.server_ip), if pushed { "" } else { " q=full" });
+        }
+        Handled::Bound => {
+            UD_ACKS.fetch_add(1, Ordering::Relaxed);
+            UD_IP.store(u32::from_be_bytes(r.your_ip), Ordering::Relaxed);
+            UD_MASK.store(u32::from_be_bytes(l.mask), Ordering::Relaxed);
+            UD_GW.store(u32::from_be_bytes(l.router), Ordering::Relaxed);
+            UD_DNS.store(u32::from_be_bytes(l.dns), Ordering::Relaxed);
+            UD_LEASE_S.store(l.lease_s, Ordering::Relaxed);
+            UD_STATE.store(UD_BOUND, Ordering::Relaxed);
+            UD_PENDING.store(true, Ordering::Relaxed);
+            serial_println!(":: USBNET: dhcp=bound ip={} mask={} gw={} dns={} lease={} ::",
+                UdIp(r.your_ip), UdIp(l.mask), UdIp(l.router), UdIp(l.dns), l.lease_s);
+            ud_ping_start(now);
+        }
+        Handled::Nak => {
+            UD_NAKS.fetch_add(1, Ordering::Relaxed);
+            UD_STATE.store(UD_IDLE, Ordering::Relaxed);
+            UD_RETX.store(0, Ordering::Relaxed);
+            UD_NEXT.store(now, Ordering::Relaxed);
+            serial_println!("[dhcp] nak server={} -> discover", UdIp(r.server_ip));
+        }
+        Handled::Ignored => {
+            let k = UD_IGNORED.fetch_add(1, Ordering::Relaxed);
+            if k < 4 {
+                serial_println!("[dhcp] reply ignored type={} xid={:08x} ours={:08x} state={}", r.msg_type, r.xid, ours, ud_state_name(UD_STATE.load(Ordering::Relaxed)));
+            }
+        }
+    }
+}
+
+/// After the ACK: ARP the gateway (the echo follows its reply), or say there is no router to ping.
+fn ud_ping_start(now: u64) {
+    UD_PTRIES.store(0, Ordering::Relaxed);
+    if UD_GW.load(Ordering::Relaxed) == 0 {
+        UD_PSTATE.store(UP_DONE, Ordering::Relaxed);
+        serial_println!("[net] ping gw=0.0.0.0 rtt_ms=none reason=no-router");
+        return;
+    }
+    ud_arp_gw(now);
+}
+/// Who-has the gateway, from the lease, broadcast, padded to 60.
+fn ud_arp_gw(now: u64) {
+    let mut buf = [0u8; 60];
+    let m = mac();
+    if net::arp::build_request(&mut buf[14..42], m, ud_ip(&UD_IP), ud_ip(&UD_GW)).is_none()
+        || net::ethernet::write_header(&mut buf[0..14], [0xff; 6], m, 0x0806).is_none()
+    {
+        return;
+    }
+    UD_PSTATE.store(UP_ARP, Ordering::Relaxed);
+    UD_PAT.store(now, Ordering::Relaxed);
+    UD_PTRIES.fetch_add(1, Ordering::Relaxed);
+    let _ = ud_push(&buf);
+}
+/// One echo request to the gateway's MAC (seq 1), padded to 60.
+fn ud_echo(now: u64) {
+    let mut buf = [0u8; 80];
+    let m = mac();
+    let mut gm = [0u8; 6];
+    for i in 0..6 { gm[i] = UD_GWMAC[i].load(Ordering::Relaxed); }
+    let Some(n) = net::icmp::write_echo_request(&mut buf[34..], UD_PING_IDENT, 1, UD_PING_DATA) else { return };
+    if net::ipv4::write_header(&mut buf[14..34], ud_ip(&UD_IP), ud_ip(&UD_GW), net::ipv4::PROTO_ICMP, n).is_none()
+        || net::ethernet::write_header(&mut buf[0..14], gm, m, 0x0800).is_none()
+    {
+        return;
+    }
+    UD_PSTATE.store(UP_ECHO, Ordering::Relaxed);
+    UD_PAT.store(now, Ordering::Relaxed);
+    UD_PTRIES.fetch_add(1, Ordering::Relaxed);
+    let _ = ud_push(&buf[..(34 + n).max(60)]);
+}
+/// Bound, every pass: retry the stage that has waited `UD_PING_MS`, or give up after `UD_PING_TRIES`.
+fn ud_ping_tick(now: u64) {
+    let st = UD_PSTATE.load(Ordering::Relaxed);
+    if st != UP_ARP && st != UP_ECHO { return; }
+    if now.saturating_sub(UD_PAT.load(Ordering::Relaxed)) < UD_PING_MS { return; }
+    let tries = UD_PTRIES.load(Ordering::Relaxed);
+    if tries >= UD_PING_TRIES {
+        UD_PSTATE.store(UP_DONE, Ordering::Relaxed);
+        serial_println!("[net] ping gw={} rtt_ms=none reason={} tries={}", UdIp(ud_ip(&UD_GW)), if st == UP_ARP { "no-arp" } else { "no-reply" }, tries);
+        return;
+    }
+    if st == UP_ARP { ud_arp_gw(now) } else { ud_echo(now) }
+}
+/// ARP while bound: answer a request for our address; take the gateway's reply and send the echo.
+fn ud_arp_rx(f: &[u8], op: u16) {
+    if UD_STATE.load(Ordering::Relaxed) != UD_BOUND { return; }
+    let a = &f[14..];
+    let ours = ud_ip(&UD_IP);
+    let m = mac();
+    if op == 1 {
+        let sm = net::arp::ArpStateMachine::new(ours, m);
+        if let Some((reply, dmac)) = sm.process_packet(a) {
+            let mut buf = [0u8; 60];
+            if net::ethernet::write_frame(&mut buf, dmac, m, 0x0806, &reply).is_some() {
+                let pushed = ud_push(&buf);
+                let k = UD_ARPS.fetch_add(1, Ordering::Relaxed) + 1;
+                if k <= 4 || k.is_power_of_two() {
+                    serial_println!("[net] arp reply to={} for={} n={}{}", UdIp([a[14], a[15], a[16], a[17]]), UdIp(ours), k, if pushed { "" } else { " q=full" });
+                }
+            }
+        }
+    } else if op == 2 && UD_PSTATE.load(Ordering::Relaxed) == UP_ARP && a[14..18] == ud_ip(&UD_GW) {
+        for i in 0..6 { UD_GWMAC[i].store(a[8 + i], Ordering::Relaxed); }
+        serial_println!("[net] arp gw={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", UdIp(ud_ip(&UD_GW)), a[8], a[9], a[10], a[11], a[12], a[13]);
+        UD_PTRIES.store(0, Ordering::Relaxed);
+        ud_echo(crate::arch::ms().max(1));
+    }
+}
+/// ICMP while the echo is out: the gateway's reply to our ident/seq times the ping.
+fn ud_icmp_rx(f: &[u8], l4: usize) {
+    if UD_PSTATE.load(Ordering::Relaxed) != UP_ECHO { return; }
+    if f[26..30] != ud_ip(&UD_GW) || f[30..34] != ud_ip(&UD_IP) { return; }
+    if let Some((id, seq)) = net::icmp::parse_echo_reply(&f[l4..]) {
+        if id == UD_PING_IDENT && seq == 1 {
+            let rtt = crate::arch::ms().saturating_sub(UD_PAT.load(Ordering::Relaxed));
+            UD_PSTATE.store(UP_DONE, Ordering::Relaxed);
+            serial_println!("[net] ping gw={} rtt_ms={}", UdIp(ud_ip(&UD_GW)), rtt);
+        }
+    }
+}
+
+/// The bound lease the stack has not applied yet: (address, mask, router, DNS). smolnet's `usb_lease_tick`.
+pub fn lease_pending() -> Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> {
+    if !UD_PENDING.load(Ordering::Relaxed) || UD_STATE.load(Ordering::Relaxed) != UD_BOUND { return None; }
+    Some((ud_ip(&UD_IP), ud_ip(&UD_MASK), ud_ip(&UD_GW), ud_ip(&UD_DNS)))
+}
+/// The stack took (or declined) the lease.
+pub fn lease_applied() { UD_PENDING.store(false, Ordering::Relaxed); }
