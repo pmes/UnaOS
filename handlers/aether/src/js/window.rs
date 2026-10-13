@@ -856,7 +856,7 @@ fn doc_str(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn doc_domain_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let d = this_doc(vm, ctx)?;
     let v = string(vm, &arg(vm, ctx, 0))?.to_ascii_lowercase();
-    let host = doc_url_of(d).and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
+    let host = doc_url_of(d).and_then(|u| Some(u.host_str().to_ascii_lowercase())).unwrap_or_default();
     let sandboxed = crate::frames::by_document(d).and_then(crate::frames::get).is_some_and(|c| c.origin.starts_with("null"));
     if host.is_empty() || sandboxed {
         return throw_dom(vm, "SecurityError", "Failed to set the 'domain' property on 'Document': Assignment is forbidden for sandboxed iframes.");

@@ -20,6 +20,7 @@
 //!   (`AetherEngine::render_frame`), registered here by its container, and composed into the
 //!   container's content box by `render::render_frame` through [`child_surface`].
 
+use html_core::url;
 use crate::dom::NodeRef;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -276,7 +277,7 @@ pub fn post_order() -> Vec<ContextId> {
 pub fn url_origin(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(u) if u.scheme() == "file" => "file://".to_string(),
-        Ok(u) => u.origin().ascii_serialization(),
+        Ok(u) => u.origin(),
         Err(_) => "null".to_string(),
     }
 }

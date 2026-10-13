@@ -49,6 +49,7 @@
 //! `removeChild`; an event path inside a nested document ends at its Document (the Window step is
 //! `js/events.rs`'s, which only knows the top window).
 
+use html_core::url;
 use crate::frames::{self as tree, ContextId, Readiness, Sandbox, TOP};
 use crate::js::dom::{self, with_doc, with_doc_mut, wrap};
 use crate::js::events;
@@ -629,7 +630,7 @@ fn loc_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     let Ok(mut u) = url::Url::parse(&url_of(id)) else { return Ok(Value::Undefined) };
     crate::js::html::set_url_part(&mut u, &part, &v);
-    navigate_ctx(vm, id, u.as_str())?;
+    navigate_ctx(vm, id, &u.href())?;
     Ok(Value::Undefined)
 }
 
@@ -1081,7 +1082,7 @@ pub fn post_message(vm: &mut Vm, ctx: &CallCtx, target: ContextId) -> JsResult<V
         "*" => None,
         "/" => Some(origin_of(inc)),
         t => match url::Url::parse(t) {
-            Ok(u) => Some(tree::url_origin(u.as_str())),
+            Ok(u) => Some(tree::url_origin(&u.href())),
             Err(_) => {
                 return throw_dom(vm, "SyntaxError", &format!("Failed to execute 'postMessage' on 'Window': Invalid target origin '{t}' in a call to 'postMessage'."));
             }
