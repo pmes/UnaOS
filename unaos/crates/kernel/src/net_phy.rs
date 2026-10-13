@@ -1004,6 +1004,14 @@ pub mod net6 {
         dev: SmoltcpPhy<Net6Nic, Learn>,
         /// socket-id → (smoltcp handle, owning address-space id, transport). `None` = free.
         reg: [Option<(SocketHandle, u64, Kind)>; NSOCK],
+        /// ARMRESOLVE (B560): socket-id → the index of the static buffer set its socket borrows. A
+        /// PERMUTATION of `0..NSOCK` (identity at build); `accept`'s peel swaps two LIVE rows' entries, so
+        /// the invariant `open` relies on — a free `reg` slot's buffer set is borrowed by no socket —
+        /// survives a listener being re-armed on the free slot's buffers.
+        buf_of: [usize; NSOCK],
+        /// ARMRESOLVE (B560): the port a TCP row is LISTENING on (0 = not a listener), so `accept` can
+        /// re-arm the listener in place after peeling an established connection off it.
+        listen_port: [u16; NSOCK],
     }
 
     static STACK: crate::sync::Mutex<Option<Stack>> = crate::sync::Mutex::new(None);
@@ -1048,7 +1056,14 @@ pub mod net6 {
         // ⇒ its buffer set is unborrowed).
         let storage: &'static mut [SocketStorage<'static>] =
             unsafe { &mut *core::ptr::addr_of_mut!(SOCK_STORAGE) };
-        *guard = Some(Stack { iface, sockets: SocketSet::new(storage), dev, reg: [None; NSOCK] });
+        *guard = Some(Stack {
+            iface,
+            sockets: SocketSet::new(storage),
+            dev,
+            reg: [None; NSOCK],
+            buf_of: core::array::from_fn(|i| i),
+            listen_port: [0; NSOCK],
+        });
         true
     }
 
@@ -1735,26 +1750,14 @@ pub mod net6 {
         }
         let stack = g.as_mut().unwrap();
         let sid = stack.reg.iter().position(|s| s.is_none())?;
-        // SAFETY: `sid` is a FREE `reg` slot, so buffer set `sid` is borrowed by no live socket.
+        let b = stack.buf_of[sid];
+        // SAFETY: `sid` is a FREE `reg` slot, so buffer set `buf_of[sid]` is borrowed by no live socket.
         // `addr_of_mut!(STATIC[sid])` names the element as a PLACE (no intermediate reference), then
         // `from_raw_parts_mut` re-forms the slice — no autoref through a raw deref. The socket OWNS
         // the borrows until it is removed in `close`, which frees the slot in the same breath.
         let handle = if tcp_sock {
-            let (rx, tx): (&'static mut [u8], &'static mut [u8]) = unsafe {
-                (
-                    core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(TCP_RX_DATA[sid]) as *mut u8,
-                        TCP_BUF,
-                    ),
-                    core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(TCP_TX_DATA[sid]) as *mut u8,
-                        TCP_BUF,
-                    ),
-                )
-            };
-            stack
-                .sockets
-                .add(tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx)))
+            // SAFETY: as above — buffer set `b` belongs to the free slot `sid` alone.
+            stack.sockets.add(unsafe { tcp_socket_on(b) })
         } else {
             let (rm, rd, tm, td): (
                 &'static mut [udp::PacketMetadata],
@@ -1764,19 +1767,19 @@ pub mod net6 {
             ) = unsafe {
                 (
                     core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(UDP_RX_META[sid]) as *mut udp::PacketMetadata,
+                        core::ptr::addr_of_mut!(UDP_RX_META[b]) as *mut udp::PacketMetadata,
                         UDP_PKTS,
                     ),
                     core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(UDP_RX_DATA[sid]) as *mut u8,
+                        core::ptr::addr_of_mut!(UDP_RX_DATA[b]) as *mut u8,
                         UDP_BUF,
                     ),
                     core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(UDP_TX_META[sid]) as *mut udp::PacketMetadata,
+                        core::ptr::addr_of_mut!(UDP_TX_META[b]) as *mut udp::PacketMetadata,
                         UDP_PKTS,
                     ),
                     core::slice::from_raw_parts_mut(
-                        core::ptr::addr_of_mut!(UDP_TX_DATA[sid]) as *mut u8,
+                        core::ptr::addr_of_mut!(UDP_TX_DATA[b]) as *mut u8,
                         UDP_BUF,
                     ),
                 )
@@ -1816,6 +1819,7 @@ pub mod net6 {
         if let Some(Some((handle, _, _))) = stack.reg.get(sid).copied() {
             stack.sockets.remove(handle);
             stack.reg[sid] = None;
+            stack.listen_port[sid] = 0;
             SOCK_GEN[sid].fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -2117,7 +2121,7 @@ pub mod net6 {
 
         // The `dns` VERB itself, on the same wire — the shell verb an operator types, exercised here
         // so the boot log carries its witness shape even on a headless run.
-        let _ = dns("una.os");
+        let _ = dns("una.os"); #[cfg(feature = "netring3")] crate::netring3::selftest(); // ARMRESOLVE (B560): with `netring3` armed beside the NIC knob (UNAOS_VNET=1 UNAOS_NETRING3=1), the virt boot also runs `tests net` — `:: ENTROPY:` and `:: RESOLVE:` through the SYS_RESOLVE body, now bound to this lane's resolver — so QEMU `virt` proves the aarch64 verb with nobody typing. Same-line fold, code before the `//`.
         serial_println!(
             "{} fixture: {}/{} legs passed -> {} ::",
             P6, pass, legs,
@@ -2299,5 +2303,129 @@ pub mod net6 {
             ":: NETCLOCK: polls_per_s={} tx_per_s={} nic={} rx_ok={} -> {} ::",
             polls_ps, tx_ps, nic_name(), RX_FRAMES.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL" }
         );
+    }
+
+    // ── ARMRESOLVE (rmbp-ledger B560): the resolver SYS_RESOLVE binds, and the passive TCP half ──────
+
+    /// Build a TCP socket over static buffer set `b`.
+    ///
+    /// SAFETY: the caller holds the `STACK` lock and has proven that buffer set `b` is borrowed by no
+    /// live socket (it is `buf_of[s]` for a FREE `reg` slot `s`). The socket then OWNS the borrows until
+    /// it is removed in `close`.
+    unsafe fn tcp_socket_on(b: usize) -> tcp::Socket<'static> {
+        // SAFETY: the function's contract (buffer set `b` unborrowed, `STACK` held).
+        let (rx, tx): (&'static mut [u8], &'static mut [u8]) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(TCP_RX_DATA[b]) as *mut u8, TCP_BUF),
+                core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(TCP_TX_DATA[b]) as *mut u8, TCP_BUF),
+            )
+        };
+        tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx))
+    }
+
+    /// What `SYS_RESOLVE` gets back from this lane: the NIC is dark (no adapter, PHY link down, or no
+    /// lease and no gateway to ask), the resolver gave no A record, or the address.
+    pub enum Lookup {
+        Dark,
+        NoAnswer,
+        A([u8; 4]),
+    }
+
+    /// The QUIET lookup behind `SYS_RESOLVE` on aarch64 (netring3.rs): the same `dns_lookup` the `dns`
+    /// verb drives, without the verb's witness line (ring 3 resolving a name is not a boot event; x86's
+    /// `smolnet::resolve` is quiet too). Every socket failure and every non-answer is `NoAnswer`, the
+    /// x86 shape (`-ENOENT`).
+    pub fn lookup(host: &str) -> Lookup {
+        match nic() {
+            Some(n) if (n.link_up)() => {}
+            _ => return Lookup::Dark,
+        }
+        match dns_lookup(host, resolver()) {
+            DnsVerdict::NoResolver => Lookup::Dark,
+            DnsVerdict::Resolved(a) => Lookup::A(a),
+            _ => Lookup::NoAnswer,
+        }
+    }
+
+    /// The ring-3 poll model for a passive accept (x86 `smolnet::AcceptOutcome`'s shape).
+    pub enum AcceptOutcome {
+        /// A peer connected: the connection now lives in this fresh socket-id; the listener is re-armed.
+        Connected(usize),
+        /// Nothing yet, or no free slot to peel into (the connection stays buffered on the listener).
+        Pending,
+        /// Not a listening TCP socket (never listened, closed, or UDP).
+        NotListening,
+    }
+
+    /// One accept pass's wall budget. Short, like x86's `ACCEPT_E1000_MS`: ring 3 re-drives on `-EAGAIN`.
+    const ACCEPT_MS: i64 = 20;
+
+    /// Arm TCP socket `sid` as a passive LISTENER on `port`. No I/O.
+    pub fn listen(sid: usize, port: u16) -> Result<(), ()> {
+        if port == 0 {
+            return Err(());
+        }
+        let mut g = STACK.lock();
+        let stack = g.as_mut().ok_or(())?;
+        let handle = row(stack, sid, Kind::Tcp).ok_or(())?;
+        stack.sockets.get_mut::<tcp::Socket>(handle).listen(port).map_err(|_| ())?;
+        stack.listen_port[sid] = port;
+        Ok(())
+    }
+
+    /// Non-blocking ACCEPT on listening socket `sid`: a bounded pump (`STACK` released between polls)
+    /// chasing an inbound handshake; on ESTABLISHED the connection is PEELED into a fresh socket-id and
+    /// the listener re-armed in place, so the listener's id and generation — and the caller's handle —
+    /// survive any number of accepts (x86 SOCK-7's persistent listener).
+    pub fn accept(sid: usize) -> AcceptOutcome {
+        if listen_port_of(sid) == 0 {
+            return AcceptOutcome::NotListening;
+        }
+        kick();
+        pump_until(ACCEPT_MS, |stack| {
+            let Some(handle) = row(stack, sid, Kind::Tcp) else { return Some(AcceptOutcome::NotListening) };
+            match stack.sockets.get_mut::<tcp::Socket>(handle).state() {
+                tcp::State::Listen | tcp::State::SynReceived => None,
+                tcp::State::Closed => Some(AcceptOutcome::NotListening),
+                _ => Some(peel_and_rearm(stack, sid)),
+            }
+        })
+        .unwrap_or(AcceptOutcome::Pending)
+    }
+
+    fn listen_port_of(sid: usize) -> u16 {
+        let g = STACK.lock();
+        match g.as_ref() {
+            Some(stack) if sid < NSOCK => stack.listen_port[sid],
+            _ => 0,
+        }
+    }
+
+    /// Under the `STACK` lock: listener row `lsid` reached ESTABLISHED. Move that established socket to a
+    /// FREE row `csid`, arm a fresh listener on the SAME port over `csid`'s (unborrowed) buffer set into
+    /// row `lsid`, and swap the two rows' `buf_of` entries so each row names the buffers its socket
+    /// borrows. `csid`'s generation was bumped at its last close, so no stale handle names the new row.
+    fn peel_and_rearm(stack: &mut Stack, lsid: usize) -> AcceptOutcome {
+        let Some((estab, owner, Kind::Tcp)) = stack.reg[lsid] else { return AcceptOutcome::NotListening };
+        let port = stack.listen_port[lsid];
+        if port == 0 {
+            return AcceptOutcome::NotListening;
+        }
+        let Some(csid) = stack.reg.iter().position(|s| s.is_none()) else {
+            return AcceptOutcome::Pending; // back-pressure: the connection stays on the listener row
+        };
+        // SAFETY: `csid` is a FREE row, so buffer set `buf_of[csid]` is borrowed by no live socket; the
+        // `STACK` lock is held by our caller (`pump_until`'s check runs under it).
+        let mut fresh = unsafe { tcp_socket_on(stack.buf_of[csid]) };
+        if fresh.listen(port).is_err() {
+            return AcceptOutcome::Pending; // dropped unadded: its buffer borrows end here
+        }
+        // One live socket per `reg` row and `csid` free, so the set holds at most NSOCK-1: `add` fits.
+        let nh = stack.sockets.add(fresh);
+        stack.reg[csid] = Some((estab, owner, Kind::Tcp));
+        stack.reg[lsid] = Some((nh, owner, Kind::Tcp));
+        stack.buf_of.swap(lsid, csid);
+        stack.listen_port[csid] = 0;
+        AcceptOutcome::Connected(csid)
     }
 }

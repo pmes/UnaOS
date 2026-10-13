@@ -6873,7 +6873,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), una_abi::SYS_SBRK => super::xwin::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), // CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
         SYS_XFER => sys_xfer(a0, a1, a2),
-        SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
+        SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_LISTEN => net6_sys_listen(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_ACCEPT => net6_sys_accept(a0), // ARMRESOLVE (B560): SYS_LISTEN 47 / SYS_ACCEPT 48, the passive half x86 has answered since SOCK-6/SOCK-7, same fold, bodies at the FILE TAIL. NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
         SYS_MSEND => sys_msend(a0, a1),
         SYS_MRECV => sys_mrecv(a0, a1, a2), // PREFCHANGED (B558): a2 = una_abi::MRECV_NOWAIT
@@ -25835,8 +25835,8 @@ fn sys_getrandom(buf_ptr: u64, len: u64) -> i64 {
     if r.is_err() { EFAULT } else { got as i64 }
 }
 
-/// NETRING3 M2 (B306): `SYS_RESOLVE` on aarch64 — validated, then `-ENODEV` from the shared body until
-/// the NET6 resolver is bound to it (owed).
+/// NETRING3 M2 (B306): `SYS_RESOLVE` on aarch64 — validated, then the shared body, which ARMRESOLVE (B560)
+/// binds to the NET6 lane's resolver: dark NIC -ENODEV, no answer -ENOENT, a bound lease resolves.
 #[cfg(feature = "netring3")]
 fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
     let n = name_len as usize;
@@ -26324,4 +26324,58 @@ pub fn prefchanged_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
         return None;
     }
     bus_mbox_pop(row as u64).map(|m| m.frame)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// ARMRESOLVE (rmbp-ledger B560) — SYS_LISTEN(47) / SYS_ACCEPT(48) on aarch64, over `net_phy::net6`.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// The last two verbs of the socket family that refused on this arch (they fell to the dispatch's
+// default arm). The x86 contract exactly: listen is a configuring authority (`CAP_WRITE`), accept a
+// receiving one (`CAP_READ`); accept is non-blocking (`-EAGAIN` = none yet, ring 3 re-drives) and the
+// LISTENER PERSISTS (the connection is peeled into a fresh gen-fenced socket-id, the listener re-armed
+// in place); the connection handle's rights are DERIVED — the intersection of READ|WRITE|GRANT with the
+// listener handle's current rights — so an attenuated listener cannot amplify itself. FILE TAIL; the
+// dispatch arms are a LINE-NEUTRAL fold onto the existing NET6 arm.
+
+/// SYS_LISTEN(handle, port) -> `0` / `-EINVAL` (port 0 or out of range, not TCP, or smoltcp refused).
+#[cfg(feature = "net6")]
+fn net6_sys_listen(handle: u64, port: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, una_abi::CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if port == 0 || port > u16::MAX as u64 {
+        return EINVAL;
+    }
+    match crate::net_phy::net6::listen(sid, port as u16) {
+        Ok(()) => 0,
+        Err(()) => EINVAL,
+    }
+}
+
+/// SYS_ACCEPT(handle) -> a FRESH socket HANDLE for the accepted connection / `-EAGAIN` / `-EINVAL`
+/// (not a listener). With no handle slot free the peeled connection is CLOSED and `-EAGAIN` returned:
+/// a four-slot set cannot afford x86's "reaped at teardown" leak.
+#[cfg(feature = "net6")]
+fn net6_sys_accept(handle: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, CAP_READ) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    match crate::net_phy::net6::accept(sid) {
+        crate::net_phy::net6::AcceptOutcome::Connected(conn) => {
+            let Some(h) = handle_install(asid, HANDLE_RESERVING) else {
+                crate::net_phy::net6::close(conn); // no handle slot — release the connection, never leak it
+                return NET6_EAGAIN;
+            };
+            // Kind + rights FIRST, the live value LAST (Release) — the install discipline `net6_sys_socket` keeps.
+            handle_set_kind(asid, h, KIND_SOCKET);
+            let listener_rights = HANDLE_RIGHTS[asid as usize][handle as usize].load(Ordering::Acquire);
+            handle_set_rights(asid, h, (CAP_READ | una_abi::CAP_WRITE | una_abi::CAP_GRANT) & listener_rights);
+            handle_set(asid, h, net6_pack(conn));
+            h as i64
+        }
+        crate::net_phy::net6::AcceptOutcome::Pending => NET6_EAGAIN,
+        crate::net_phy::net6::AcceptOutcome::NotListening => EINVAL,
+    }
 }

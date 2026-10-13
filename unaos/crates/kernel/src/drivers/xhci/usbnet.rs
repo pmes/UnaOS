@@ -979,11 +979,14 @@ fn net6_mac() -> Option<[u8; 6]> {
     if is_up() { Some(mac()) } else { None }
 }
 #[cfg(all(target_arch = "aarch64", feature = "net6"))]
+fn net6_rx_ready() -> bool { rx_ready(false) } // ARMRESOLVE (B560) at the fold: the ARMNET (B346) poll-gate half NET6_OPS lacked — no aarch64 image with usbnet+net6 compiled without it
+#[cfg(all(target_arch = "aarch64", feature = "net6"))]
 static NET6_OPS: crate::net_phy::net6::NicOps = crate::net_phy::net6::NicOps {
     rx: raw_rx,
     tx: raw_tx,
     mac: net6_mac,
     link_up: is_up,
+    rx_ready: net6_rx_ready,
     name: "usbnet-ecm",
 };
 

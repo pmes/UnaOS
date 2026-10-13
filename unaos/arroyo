@@ -7633,6 +7633,7 @@ KERNEL_CFG_MATRIX=(
   # PRECONDITION, inherited from the `virt_el0` leg above: compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
   "arm-virt-net6 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,vnet,net6"
+  "arm-virt-net6-ring3 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,vnet,net6,netring3"
   # SNTP-NET6 (orin-0912b) — the ARMED polarity of `sntp6`, and the ONE leg that compiles the time
   # client and the menu bar's clock witness TOGETHER. It is the row above plus `sntp6` plus the desk
   # terms `arm-desk-noel0` already proves are board-free (`desktop_firmware,livecon,quarry`), and every

@@ -5,7 +5,7 @@
 //! NETRING3 (rmbp-ledger B306): the arch-neutral bodies behind `SYS_GETRANDOM` (56) and `SYS_RESOLVE`
 //! (57), and the `tests net` fixture. The rungs under a metal HTTPS client: ring 3 gets entropy (the
 //! one kernel generator, `crate::rand`, now with a DRBG on top) and a name lookup (the one kernel
-//! resolver, `smolnet::resolve` — the path `fetch` and the SNTP witness already use). Each arch's
+//! resolver, `smolnet::resolve` on x86, `net_phy::net6::lookup` on aarch64 (ARMRESOLVE B560)). Each arch's
 //! `syscall.rs` owns only the user-copy; everything else is here. Design and witness lines:
 //! `docs/dev/evidence/rmbp-1004/NETRING3.md`.
 
@@ -53,7 +53,7 @@ pub fn resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
     #[allow(unreachable_code)]
     {
         let _ = ENOENT;
-        Err(ENODEV) // aarch64: the NET6 resolver is not bound to this syscall yet (owed)
+        #[cfg(all(feature = "net6", target_arch = "aarch64"))] return net6_resolve(name); Err(ENODEV) // ARMRESOLVE (rmbp-ledger B560): on aarch64 the NET6 lane's resolver answers (body at the FILE TAIL; the statement is folded onto this line, code before the `//`, so no line of this file moves and the x86 image's panic::Location rows stay put). Without `net6` there is no NIC surface on this arch: -ENODEV, a dark NIC.
     }
 }
 
@@ -199,4 +199,25 @@ pub fn nethang_selftest() {
     }
     #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
     serial_println!(":: NETHANG: path=resolve held_locks=0 bounded=1 -> SKIP reason=no-smolnet-on-this-arch ::");
+}
+
+// ---- ARMRESOLVE (rmbp-ledger B560): SYS_RESOLVE on aarch64 from the NET6 lane ----------------------
+
+/// The aarch64 body behind `resolve`: the NET6 lane's quiet lookup (`net_phy::net6::lookup`, the same
+/// `dns_lookup` the `dns` shell verb drives, minus the verb's witness line), mapped onto x86's three
+/// answers: a dark NIC (no adapter registered, PHY link down, or no lease and no gateway to ask) is
+/// `-ENODEV`; a name the resolver does not answer with an A record is `-ENOENT`; a bound lease resolves
+/// into the `[v4 4][v6 16]` block (v6 zero, as on x86).
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+fn net6_resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
+    let s = core::str::from_utf8(name).map_err(|_| EINVAL)?;
+    match crate::net_phy::net6::lookup(s) {
+        crate::net_phy::net6::Lookup::Dark => Err(ENODEV),
+        crate::net_phy::net6::Lookup::NoAnswer => Err(ENOENT),
+        crate::net_phy::net6::Lookup::A(ip) => {
+            let mut out = [0u8; RESOLVE_OUT_LEN];
+            out[..4].copy_from_slice(&ip);
+            Ok(out)
+        }
+    }
 }
