@@ -726,7 +726,7 @@ fn open_as(state: State) {
     // Modal over the glass: the console keeps taking glyphs, serial keeps every line, but it stops
     // presenting until the session opens (instgui's rule and reason).
     fbcon::console_present_suspend(true);
-    serial_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true power_row={}", id, ow, oh, ox, oy, (state == State::Open) as u8); // SMALLFIX10 (B539 item 2): was `bootlog_println!`, which compiles to nothing without `bootlog`/`tests-at-boot` (bootlog.rs:119) — the image line carries neither, so RESOLVEHANG2's promised row never printed on flight 31. Once per screen open: not chatty
+    serial_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true power_row={}", id, ow, oh, ox, oy, (state == State::Open) as u8); if state == State::Open { super::loginwindow::LOGIN_FORM_OPENED.store(true, Ordering::Release); } // UIREDS26 (B571): FIRSTUSER owes the power row once this form opened. SMALLFIX10 (B539 item 2): was `bootlog_println!`, which compiles to nothing without `bootlog`/`tests-at-boot` (bootlog.rs:119) — the image line carries neither, so RESOLVEHANG2's promised row never printed on flight 31. Once per screen open: not chatty
     repaint();
     crate::splash::hold_release("first-screen"); #[cfg(target_arch = "x86_64")] { let _ = crate::video::wm::fbdirect::expose_all("screen-open"); } // FBDIRECT (B536): the screen is up and the splash released — every direct-paint rect still on the glass (the stage word, an OVER line, a PUMPWEDGE/TESTWATCH band) is handed back to the compositor once. SPLASH2 M3: the first real screen (setter / create-user / login) is PAINTED — the splash gives the glass up now
 }
