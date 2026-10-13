@@ -39,7 +39,7 @@ fn components(u: &url::Url, vm: &mut Vm) -> JsResult<Value> {
 /// `RandomState` — which is itself seeded from the OS — with the monotonic
 /// clock, and the substitution is ledgered so a page that needed
 /// cryptographic quality can see it did not get it. No fixed fill, ever.
-fn entropy(n: usize) -> Vec<u8> {
+pub(crate) fn entropy(n: usize) -> Vec<u8> {
     use std::io::Read;
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let mut buf = vec![0u8; n];

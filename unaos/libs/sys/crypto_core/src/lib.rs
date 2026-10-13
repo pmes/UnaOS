@@ -22,12 +22,13 @@
 //! | [`sha1`] | SHA-1 — OCSP CertID matching only, never a signature | FIPS 180-4 §6.1 |
 //! | [`pbkdf2`] | PBKDF2-HMAC | RFC 8018 §5.2 |
 //! | [`chacha20`], [`poly1305`], [`chacha20poly1305`] | ChaCha20, Poly1305, the AEAD | RFC 8439 |
-//! | [`aes`], [`gcm`] | AES-128/256 (bitsliced), GCM/GMAC | FIPS 197, SP 800-38D |
+//! | [`aes`], [`gcm`] | AES-128/192/256 (bitsliced; forward and inverse cipher), GCM/GMAC | FIPS 197, SP 800-38D |
 //! | [`x25519`] | X25519 | RFC 7748 |
 //! | [`ed25519`] | Ed25519 | RFC 8032 |
 //! | [`p256`] | P-256 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
 //! | [`p384`] | P-384 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
 //! | [`rsa`] | RSASSA-PSS + RSASSA-PKCS1-v1_5 VERIFY | RFC 8017 (PKCS #1 v2.2) |
+//! | [`rsa_private`] | RSA key generation, CRT private operations, PKCS #1 v1.5 / PSS signing, OAEP | RFC 8017, FIPS 186-5 A.1.3 / B.3 |
 //! | [`blake2b`], [`argon2`] | BLAKE2b, Argon2id/i/d | RFC 7693, RFC 9106 |
 //! | [`sha3`] | SHA3-224/256/384/512, SHAKE128/256 | FIPS 202 |
 //! | [`mlkem`] | ML-KEM-512/768/1024 (KeyGen, Encaps, Decaps; K-PKE, NTT) | FIPS 203 |
@@ -73,6 +74,7 @@ pub mod p256;
 mod bignum;
 pub mod p384;
 pub mod rsa;
+pub mod rsa_private;
 pub mod blake2b;
 pub mod argon2;
 pub mod drbg;

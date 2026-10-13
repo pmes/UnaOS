@@ -3,6 +3,8 @@
 // streaming fetch, WebSocket, EventSource, XMLHttpRequest — their worker threads and JS preludes; the
 // task source and natives are `crate::js::net`).
 pub mod a11y;
+/// AETHERWPT3 (SR138): ASN.1 DER for `crypto.subtle`'s spki / pkcs8 key formats.
+pub mod der;
 pub mod events;
 pub mod eventsource;
 pub mod fetch;

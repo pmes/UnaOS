@@ -169,3 +169,22 @@ in this series (spec section, the `wpt2_gaps.rs` test that pins it); **owed** = 
 - lib: `api::subtle::tests::subtle_primitives_known_answers`.
 - The existing net directories (`wpt_websockets`, `wpt_eventsource`, `wpt_xhr`) run through the same,
   generalised `run_served_dir` with their unchanged `net_excluded`; their scores should not move.
+
+## AETHERWPT3 (SR138) — the AETHERWPT2 gap list O1–O9
+
+The gaps AETHERWPT2 named (the table above, rows O1–O9), each implemented to its specification or refused by name
+with the reason. **done** = implemented in this series (spec section, the `wpt3_gaps.rs` test that pins it);
+**refused** = not built, with why. R107: no executor ran WPT or the tests; the bench's `wpt2_*` run on the fold is
+the measurement (the directories each row names should rise from their AETHERWPT2 floors).
+
+| # | directories | what landed | status |
+|---|---|---|---|
+| O1 | streams, encoding, compression, fetch/api | owed in this series | open |
+| O2 | encoding, html/infrastructure/urls | owed in this series | open |
+| O3 | FileAPI, url | owed in this series | open |
+| O4 | custom-elements | owed in this series | open |
+| O5 | pointerevents | owed in this series | open |
+| O6 | resource-timing | owed in this series | open |
+| O7 | WebCryptoAPI | RSASSA-PKCS1-v1_5 / RSA-PSS / RSA-OAEP (generate, sign / verify, encrypt / decrypt) over the new `crypto_core::rsa_private` (RFC 8017: CRT private operations with a fault check, PKCS #1 v1.5 / PSS signing, OAEP, generic-hash verification, FIPS 186-5 A.1.3-shaped key generation); ECDSA / ECDH on P-256 and P-384; Ed25519; X25519; AES-CBC (SP 800-38A §6.2 + PKCS #7) and AES-KW (RFC 3394) over the new FIPS 197 §5.3 inverse cipher in `crypto_core::aes` (bitsliced, table-free); `spki` / `pkcs8` (RFC 5280, RFC 5208, RFC 5915, RFC 8410 through the strict DER of `api/der.rs`) and `jwk` (RFC 7517/7518/8037 with WebCrypto's use / key_ops / ext / alg checks) for every family; `wrapKey` / `unwrapKey` (§14.3.11/12: the op-then-encrypt normalization, jwk as UTF-8 JSON); the encapsulation KeyUsages | done — `wpt3_gaps::o7_subtle_crypto_asymmetric_and_formats`, `api::subtle::tests::subtle_cbc_and_kw_known_answers`, `api::der::tests::der_round_trips`, crypto_core `aes::tests::fips197_appendix_c_inverse`, `rsa_private::tests::generate_sign_verify_encrypt_decrypt`. Refused by name: P-521 (crypto_core has no P-521 field; NotSupportedError), Ed448 / X448 and the tentative Modern Algorithms (ML-KEM / ML-DSA / ChaCha20-Poly1305 / AES-OCB / KMAC / Argon2 / the `raw-*` formats — not registered, NotSupportedError / TypeError), multi-prime RSA JWKs (`oth`, NotSupportedError), RSA exponents above 2^64 in generateKey (OperationError) |
+| O8 | html/browsers/* | owed in this series | open |
+| O9 | shadow-dom, selection | owed in this series | open |
