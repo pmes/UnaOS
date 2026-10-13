@@ -462,4 +462,4 @@ refs/heads/exec-orin-armpipe                  12393dd6 FOLDED-BY-HAND 0a8cd3fa
 refs/heads/exec-orin-armtests                 4f3a436e FOLDED-BY-HAND fba51881
 refs/heads/exec-host-aetherdevtools3          4f3a436e FOLDED-BY-HAND a920b5d5
 refs/heads/exec-host-aetherworkers3           4f3a436e FOLDED-BY-HAND 7c1b0881
-refs/heads/exec-host-aetherpaintperf          4f3a436e IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aetherpaintperf          4f3a436e FOLDED-BY-HAND 8e4a8cac
