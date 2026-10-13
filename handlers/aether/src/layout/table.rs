@@ -321,7 +321,7 @@ fn layout_table(tree: &mut LayoutTree, table: NodeId, min_content: &dyn Fn(&Layo
             let mut st = st.clone();
             st.flex_direction = taffy::style::FlexDirection::Row;
             st.flex_wrap = FlexWrap::NoWrap;
-            st.align_items = Some(AlignItems::STRETCH);
+            st.align_items = AlignItems::STRETCH;
             st.gap.width = LengthPercentage::length(spacing);
             st.margin.top = LengthPercentageAuto::length(if !collapse { if ri == 0 { spacing } else { 0.0 } } else if ri == 0 { 0.0 } else { -shared });
             let _ = tree.taffy.set_style(r, st);

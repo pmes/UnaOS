@@ -528,8 +528,9 @@ pub(crate) fn build_taffy_tree(
                 display: Display::Flex,
                 flex_direction: FlexDirection::Row,
                 flex_wrap: taffy::style::FlexWrap::Wrap,
-                align_items: Some(taffy::style::AlignItems::BASELINE),
+                align_items: taffy::style::AlignItems::BASELINE,
                 size: Size { width: Dimension::percent(1.0), height: Dimension::auto() },
+                position: taffy::style::Position::Relative,
                 ..Default::default()
             };
             if let Ok(id) = taffy.new_with_children(anon, run) {
@@ -604,10 +605,13 @@ pub(crate) fn build_taffy_tree(
             taffy::style::FlexWrap::NoWrap
         },
         align_items: if children_inline && !child_ids.is_empty() {
-            Some(taffy::style::AlignItems::BASELINE)
+            taffy::style::AlignItems::BASELINE
         } else {
-            None
+            taffy::style::AlignItems::NORMAL
         },
+        // taffy 0.15 defaults to Static, which hands absolute children to the nearest
+        // positioned ancestor; Aether's boxes each claim their own, as under 0.14.
+        position: taffy::style::Position::Relative,
         // Inline boxes keep their measured width; the row wraps instead
         // of shrinking them (shrunk text would draw more lines than the
         // measured height and overlap the next block).
@@ -1035,19 +1039,19 @@ fn propagate_text_align(tree: &mut LayoutTree) {
                     FlexDirection::Row | FlexDirection::RowReverse
                 );
                 let mut changed = false;
-                if row && st.justify_content.is_none() {
-                    st.justify_content = Some(if align == 1 {
+                if row && st.justify_content == taffy::style::JustifyContent::NORMAL {
+                    st.justify_content = if align == 1 {
                         taffy::style::JustifyContent::CENTER
                     } else {
                         taffy::style::JustifyContent::END
-                    });
+                    };
                     changed = true;
-                } else if !row && st.align_items.is_none() {
-                    st.align_items = Some(if align == 1 {
+                } else if !row && st.align_items == taffy::style::AlignItems::NORMAL {
+                    st.align_items = if align == 1 {
                         taffy::style::AlignItems::CENTER
                     } else {
                         taffy::style::AlignItems::END
-                    });
+                    };
                     changed = true;
                 }
                 if changed {
@@ -1262,16 +1266,16 @@ fn fix_display_contexts(tree: &mut LayoutTree) {
         if inline.iter().all(|&i| i) {
             st.flex_direction = FlexDirection::Row;
             st.flex_wrap = taffy::style::FlexWrap::Wrap;
-            if st.align_items.is_none() {
-                st.align_items = Some(taffy::style::AlignItems::BASELINE);
+            if st.align_items == taffy::style::AlignItems::NORMAL {
+                st.align_items = taffy::style::AlignItems::BASELINE;
             }
             let _ = tree.taffy.set_style(id, st);
             continue;
         }
         st.flex_direction = FlexDirection::Column;
         st.flex_wrap = taffy::style::FlexWrap::NoWrap;
-        if st.align_items == Some(taffy::style::AlignItems::BASELINE) {
-            st.align_items = None;
+        if st.align_items == taffy::style::AlignItems::BASELINE {
+            st.align_items = taffy::style::AlignItems::NORMAL;
         }
         let _ = tree.taffy.set_style(id, st);
         // Wrap each run of inline children (two or more, or any text) in
@@ -1301,9 +1305,10 @@ fn fix_display_contexts(tree: &mut LayoutTree) {
                 display: Display::Flex,
                 flex_direction: FlexDirection::Row,
                 flex_wrap: taffy::style::FlexWrap::Wrap,
-                align_items: Some(taffy::style::AlignItems::BASELINE),
+                align_items: taffy::style::AlignItems::BASELINE,
                 size: Size { width: Dimension::percent(1.0), height: Dimension::auto() },
                 box_sizing: taffy::style::BoxSizing::ContentBox,
+                position: taffy::style::Position::Relative,
                 ..Default::default()
             };
             // Detach first: a taffy node has one parent.
