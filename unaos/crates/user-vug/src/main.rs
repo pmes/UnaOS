@@ -3021,7 +3021,12 @@ fn fps_refresh(ticks: &mut u64, mark: &mut u32, fps: u32, frame: u32, win: u32) 
             let v = ((frame.wrapping_sub(*mark) as u64 * TICK_HZ as u64 + (dt / 2) as u64) / dt as u64) as u32;
             *ticks = now;
             *mark = frame;
-            if v != fps && wirediet_fps_due(v, now) {
+            // WIREDIET M1 is x86-only, as M2 is (PIKERNEL8TEST: on aarch64 its bytes pushed VUGK.ELF past the page cliff).
+            #[cfg(target_arch = "x86_64")]
+            let due = wirediet_fps_due(v, now);
+            #[cfg(not(target_arch = "x86_64"))]
+            let due = true;
+            if v != fps && due {
                 sayn(b"[vugfps] wf=", win * 1000 + v.min(999));
             }
             return v;
@@ -4060,13 +4065,16 @@ static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WIND
 // ---------------------------------------------------------------------------------------------
 
 /// WIREDIET: the heartbeat, in this arch's ticks — a periodic line that has not moved says so at most this often.
+#[cfg(target_arch = "x86_64")]
 const WIREDIET_HEARTBEAT_TICKS: u64 = 5 * TICK_HZ as u64;
 
 /// WIREDIET M1: what `[vugfps]` last printed — (tick of the print << 32) | the rate. One atomic.
+#[cfg(target_arch = "x86_64")]
 static VUG_SAID: AtomicU64 = AtomicU64::new(0);
 
 /// WIREDIET M1: `[vugfps]` speaks when the rate moved by more than a tenth of what it last said (at least 2/s),
 /// or when 5 s have passed and the rate differs at all. A 30 fps window jittering 29..34 is quiet; 30 -> 18 is not.
+#[cfg(target_arch = "x86_64")]
 fn wirediet_fps_due(v: u32, now: u64) -> bool {
     let said = VUG_SAID.load(Ordering::Relaxed);
     let (last_t, last_v) = ((said >> 32) as u32, said as u32);
