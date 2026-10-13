@@ -14,10 +14,13 @@
 //! | shell verbs               | [`nav`]       | skip to content, next/previous heading (any level or one), next/previous landmark; A11YFACE (SR124): bandy's `A11yVerb` ([`nav::run`]) and the keys Alt+1 / H / D ([`keyboard::reading_key`]) |
 //! | preferences               | [`prefs`]     | Principia's `system.accessibility.*` rows → css_core's `prefers-reduced-motion` / `prefers-contrast` / `forced-colors` and the focus-ring theme |
 //!
+//! | AT-SPI cache              | [`atspi`]     | A11YFACE (SR124): the tree as AT-SPI2's `GetItems` objects with Component extents and Text; the D-Bus side is refused (no D-Bus crate, R83) — the shell serves the shape on its own socket |
+//!
 //! THE ONE READ API is [`tree`] (`a11y::tree(&engine) -> AxTree`): the GTK face (AT-SPI later) and the
 //! devtools Accessibility panel ([`crate::devtools::accessibility`]) both read it; nothing caches it, so a
 //! script's mutation shows on the next read.
 
+pub mod atspi;
 pub mod focus;
 pub mod keyboard;
 pub mod name;

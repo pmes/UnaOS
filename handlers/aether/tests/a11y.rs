@@ -680,3 +680,45 @@ fn reading_keys_drive_the_shell_verbs() {
     let p = A11yPrefs::from_rows(true, "more", false);
     assert_eq!(p.witness(), ":: a11y: prefs contrast=more forced=none motion=reduce -> applied ::");
 }
+
+/// A11YFACE (SR124): the AT-SPI cache shape the shell's socket serves — the root and the focused object carry
+/// Accessible, Component and Text; roles and states map to AT-SPI's numbers; a password field's text is masked;
+/// the wire is twelve tab-separated fields per object and a final `.`.
+#[test]
+fn atspi_cache_shape_for_root_and_focus() {
+    use aether::dom::a11y::atspi;
+    let mut e = page(
+        r#"<head><title>Cache</title></head><body><main><h1 id="h">Hi</h1><label for="q">Query</label>
+<input id="q" value="abc" required><input id="p" type="password" value="secret"></main></body>"#,
+    );
+    assert!(keyboard::handle_key(&mut e, "Tab"));
+    let all = atspi::items(&e);
+    let root = &all[0];
+    assert_eq!((root.path.as_str(), root.parent.as_str(), root.role), (atspi::ROOT_PATH, atspi::NULL_PATH, atspi::ROLE_DOCUMENT_WEB));
+    assert_eq!(root.name, "Cache");
+    assert_eq!(root.interfaces, vec![atspi::ACCESSIBLE, atspi::COMPONENT, atspi::TEXT]);
+    assert!(root.text.as_deref().is_some_and(|t| t.contains("Hi")), "{:?}", root.text);
+    assert_eq!(root.extents, Some((0, 0, e.width as i32, e.height as i32)));
+
+    let f = atspi::focus(&e).unwrap();
+    assert_eq!(f.path, format!("{}{}", atspi::PATH_PREFIX, dom(&e, "q").id().0));
+    assert_eq!((f.role, f.name.as_str(), f.text.as_deref()), (atspi::ROLE_ENTRY, "Query", Some("abc")));
+    assert_eq!(f.interfaces, vec![atspi::ACCESSIBLE, atspi::COMPONENT, atspi::TEXT]);
+    let has = |s: [u32; 2], bit: u32| if bit < 32 { s[0] & (1 << bit) != 0 } else { s[1] & (1 << (bit - 32)) != 0 };
+    for bit in [atspi::STATE_FOCUSED, atspi::STATE_FOCUSABLE, atspi::STATE_ENABLED, atspi::STATE_EDITABLE, atspi::STATE_SINGLE_LINE, atspi::STATE_REQUIRED] {
+        assert!(has(f.states, bit), "state bit {bit} in {:?}", f.states);
+    }
+    let (x, y, w, h) = e.box_of(&dom(&e, "q")).unwrap();
+    assert_eq!(f.extents, Some((x.round() as i32, (y as f64 - e.scroll_y).round() as i32, w.round() as i32, h.round() as i32)));
+
+    let pw = all.iter().find(|i| i.path.ends_with(&format!("/{}", dom(&e, "p").id().0))).unwrap();
+    assert_eq!((pw.role, pw.text.as_deref()), (atspi::ROLE_PASSWORD_TEXT, Some("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}")));
+    assert!(all.iter().any(|i| i.role == atspi::ROLE_HEADING && i.name == "Hi"));
+    assert!(all.iter().any(|i| i.role == atspi::ROLE_LANDMARK));
+
+    let wire = atspi::answer(&e, "GetFocus", ":app");
+    assert!(wire.ends_with("\n.\n"), "{wire}");
+    assert_eq!(wire.lines().next().unwrap().split('\t').count(), 12, "{wire}");
+    assert_eq!(atspi::answer(&e, "GetItems", ":app").lines().count(), all.len() + 1);
+    assert!(atspi::answer(&e, "Bogus", ":app").starts_with("ERR"));
+}

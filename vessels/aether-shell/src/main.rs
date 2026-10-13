@@ -97,6 +97,69 @@ enum TabCmd {
     Shutdown,
     /// AETHERDEVTOOLS2 (SR112): the window's developer-tools chrome changed (opened, closed, docked, resized).
     Devtools(chrome::DevtoolsChrome),
+    /// A11YFACE (SR124): one AT-SPI cache request from the socket (`aether::dom::a11y::atspi::answer`).
+    Atspi(AtspiQuery),
+}
+
+/// A11YFACE (SR124): a request line read off the accessibility socket and where its answer goes.
+struct AtspiQuery {
+    request: String,
+    reply: tokio::sync::oneshot::Sender<String>,
+}
+
+/// The application name the socket's objects carry (`:unaos.aether-<pid>`; there is no bus name to give).
+fn atspi_app() -> String {
+    format!(":unaos.aether-{}", std::process::id())
+}
+
+/// A11YFACE (SR124): the AT-SPI cache socket. AT-SPI over D-Bus is refused (the workspace carries no D-Bus
+/// crate, R83 — `aether::dom::a11y::atspi`'s doc); the same objects are served on
+/// `$XDG_RUNTIME_DIR/unaos-aether-a11y-<pid>.sock` (mode 0600, the runtime dir is the user's own): one request
+/// line per connection, answered by the active tab's engine. No runtime dir: no socket, and the refusal says
+/// so (never a fallback under /tmp).
+fn spawn_atspi_socket(tx: UnboundedSender<AtspiQuery>) -> Option<std::path::PathBuf> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).filter(|d| d.is_dir()) else {
+        eprintln!(":: a11y: atspi-cache socket REFUSED reason=no XDG_RUNTIME_DIR ::");
+        return None;
+    };
+    let path = dir.join(format!("unaos-aether-a11y-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(":: a11y: atspi-cache socket REFUSED reason={e} ::");
+            return None;
+        }
+    };
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    eprintln!(":: a11y: atspi-cache socket {} (AT-SPI D-Bus refused: no D-Bus crate, R83) ::", path.display());
+    thread::Builder::new()
+        .name("aether-a11y-socket".into())
+        .spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { continue };
+                let tx = tx.clone();
+                // One request per connection, each on its own thread: a slow client never holds the next.
+                let _ = thread::Builder::new().name("aether-a11y-conn".into()).spawn(move || {
+                    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut line = String::new();
+                    if BufReader::new((&conn).take(4096)).read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    if tx.send(AtspiQuery { request: line.trim().to_string(), reply }).is_err() {
+                        return;
+                    }
+                    let answer = rx.blocking_recv().unwrap_or_else(|_| "ERR no page\n".to_string());
+                    let _ = (&conn).write_all(answer.as_bytes());
+                });
+            }
+        })
+        .ok()?;
+    Some(path)
 }
 
 /// A tab → the coordinator.
@@ -317,6 +380,9 @@ impl Tab {
                         return;
                     }
                     TabCmd::Activate => self.present_all(),
+                    TabCmd::Atspi(q) => {
+                        let _ = q.reply.send(aether::dom::a11y::atspi::answer(&self.engine, &q.request, &atspi_app()));
+                    }
                     TabCmd::Devtools(c) => {
                         self.devtools_chrome = c;
                         self.last_lines = None;
@@ -854,7 +920,12 @@ impl Coordinator {
         }
     }
 
-    async fn run(mut self, mut bus_rx: tokio::sync::broadcast::Receiver<SMessage>, mut reports_rx: UnboundedReceiver<TabReport>) {
+    async fn run(
+        mut self,
+        mut bus_rx: tokio::sync::broadcast::Receiver<SMessage>,
+        mut reports_rx: UnboundedReceiver<TabReport>,
+        mut atspi_rx: UnboundedReceiver<AtspiQuery>,
+    ) {
         self.open_tab();
         loop {
             tokio::select! {
@@ -864,6 +935,8 @@ impl Coordinator {
                     Err(_) => return,
                 },
                 Some(r) = reports_rx.recv() => self.on_report(r),
+                // A11YFACE (SR124): an AT-SPI cache request goes to the active tab's engine.
+                Some(q) = atspi_rx.recv() => self.send(self.strip.active(), TabCmd::Atspi(q)),
             }
         }
     }
@@ -894,6 +967,8 @@ fn main() {
     // AETHERCHROME (SR84): the coordinator (tab strip, bookmarks, downloads; the router) and, through
     // it, one engine thread per tab. Subscribed before the window exists, so nothing the chrome
     // fires is missed.
+    let (atspi_tx, atspi_rx) = unbounded_channel();
+    let atspi_socket = spawn_atspi_socket(atspi_tx);
     {
         let bus = synapse.clone();
         let bus_rx = synapse.subscribe();
@@ -916,7 +991,7 @@ fn main() {
                     devtools: chrome::DevtoolsChrome::default(),
                     a11y_prefs: None,
                 };
-                local.block_on(&rt, coordinator.run(bus_rx, reports_rx));
+                local.block_on(&rt, coordinator.run(bus_rx, reports_rx, atspi_rx));
             })
             .expect("spawn chrome coordinator thread");
     }
@@ -961,6 +1036,11 @@ fn main() {
         ]);
 
         quartzite::Backend::new_tetra_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), aether_ui, synapse.clone()).run();
+    }
+
+    // A11YFACE (SR124): the window closed — the socket goes with the process.
+    if let Some(p) = atspi_socket {
+        let _ = std::fs::remove_file(p);
     }
 }
 
