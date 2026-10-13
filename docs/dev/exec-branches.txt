@@ -470,7 +470,7 @@ refs/heads/exec-host-h264core                 ef3fe22d FOLDED-BY-HAND 31b3e542
 refs/heads/exec-host-aethermedia2             ef3fe22d FOLDED-BY-HAND b261435d
 refs/heads/exec-host-aetherwpt2               fe30fa59 FOLDED-BY-HAND 897a565d
 refs/heads/exec-host-webgl1                   558dbdd0 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-host-intlcldr                 2a436e4a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-intlcldr                 2a436e4a FOLDED-BY-HAND 2ca12b08
 refs/heads/exec-host-aetherwpt3               e3925d80 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-qemuskip                 cb833ebb IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-kvmlat                   cb833ebb IN-FLIGHT cloud 2026-10-13
