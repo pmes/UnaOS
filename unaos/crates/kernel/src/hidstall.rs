@@ -285,7 +285,7 @@ static SEC_HOLD: AtomicU64 = AtomicU64::new(0);
 /// The pump core's tick ISR (LOCKREG `sync::isr_tick`): the tick before this one was `hold_ms` late — interrupts were
 /// masked on this core by `name` (the current task), inside pump step `step` (0 = not the pump), holding `site`
 /// (LOCKREG's outermost acquire site, 0 = none). ISR context: atomics only.
-pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8) {
+pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8) { let step = fr_step(step); // PUMPHOLE2 (B563): the `flight-recorder` step is charged to the recorder only while its work runs on this task (LINE-NEUTRAL fold, code first)
     if hold_ms <= HOLD_OVER_MS {
         return;
     }
@@ -375,7 +375,7 @@ impl core::fmt::Display for HolderName {
         }
         let step = h.step.load(Relaxed);
         if step != 0 {
-            write!(f, ":{}", crate::video::lag::PUMP_NAMES.get(step as usize).copied().unwrap_or("-"))?;
+            write!(f, ":{}", crate::video::lag::PUMP_NAMES.get(step as usize).copied().unwrap_or(if step == P_FLIGHT_REST { "flight-step:bootwit" } else { "-" }))?; // PUMPHOLE2 (B563): the step's remainder named apart
         }
         let site = h.site.load(Relaxed);
         if site != 0 {
@@ -551,4 +551,27 @@ impl core::fmt::Display for FrPlace {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("-")
     }
+}
+
+// ── PUMPHOLE2 (rmbp-ledger B563) — a hold in the pump's `flight-recorder` step is the recorder's only while the recorder's
+// work runs on the pump. FILE-TAIL append. ────────
+// Flight 33: `[hid] stall census holder=usb-pump:flight-recorder n=42 worst_ms=141` (all before login) beside
+// `fr=worker:c2 fr_worst_ms=1`. The step id is "the step after the pump's last mark" (video/lag.rs `pump_next`), and the
+// segment between `pump_seg(P_CONSOLE)` and `pump_seg(P_FLIGHT)` runs `flight_recorder::service()` AND
+// `bootwit::service()` (main.rs usb_pump, SELFDIAG). Since PUMPHOLE2 the recorder's gate is one load on the pump once its
+// worker is coming or running, so a masked hold in that segment is charged to `flight-recorder` only when
+// `flight_recorder::on_caller_now()` says the recorder's work (an inline body, or the hand's spawn) is running on this
+// very task; otherwise it is `usb-pump:flight-step:bootwit`. Off x86 there is no recorder: the step id is kept.
+
+/// The step id a hold is charged under (`P_FLIGHT_REST` = the `flight-recorder` segment with the recorder not running).
+const P_FLIGHT_REST: u8 = 0xFE;
+
+/// Remap `step` for the attribution. ISR context: atomics only (`on_caller_now` is two relaxed loads).
+#[inline]
+fn fr_step(step: u8) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    if step == crate::video::lag::P_FLIGHT && !crate::flight_recorder::on_caller_now() {
+        return P_FLIGHT_REST;
+    }
+    step
 }
