@@ -382,3 +382,6 @@ refs/heads/exec-host-urlcore                  3cf96e79 IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-host-aethercache              3cf96e79 IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-host-syntaxcore               3cf96e79 IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-host-deps2                    3cf96e79 IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-rmbp-shelltrust               0b12eb42 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-homepriv                 0b12eb42 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-wifi8                    0b12eb42 IN-FLIGHT rmbp 2026-10-13
