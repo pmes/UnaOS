@@ -384,7 +384,7 @@ refs/heads/exec-host-syntaxcore               a1f88c22 FOLDED-BY-HAND c5be368f 2
 refs/heads/exec-host-deps2                    0559c9f5 FOLDED-BY-HAND 8707a3a8 2026-10-13
 refs/heads/exec-rmbp-shelltrust               aa7cbcd6 FOLDED-BY-HAND 2708f7f1 2026-10-13
 refs/heads/exec-rmbp-homepriv                 628e47d4 FOLDED-BY-HAND 3e91c72f 2026-10-13
-refs/heads/exec-rmbp-wifi8                    5ee074e9 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-wifi8                    a2c664bf FOLDED-BY-HAND 5341fd78 2026-10-13
 refs/heads/exec-rmbp-resolvehang2             b331474b FOLDED-BY-HAND 2df96a85 2026-10-13
 refs/heads/exec-rmbp-queuewedge               5a14da5b FOLDED-BY-HAND 7485c830 2026-10-13
 refs/heads/exec-rmbp-realsense                3cfe9814 FOLDED-BY-HAND 4870c438 2026-10-13
@@ -416,7 +416,7 @@ refs/heads/exec-rmbp-aetherptr2               abcb8d33 IN-FLIGHT cloud 2026-10-1
 refs/heads/exec-rmbp-cursorarm                abcb8d33 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-bootlogcard              6372ae0d FOLDED-BY-HAND da5885ed 2026-10-13
 refs/heads/exec-rmbp-cursorshape              abcb8d33 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-rmbp-jobscan2                 abcb8d33 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-jobscan2                 1a9eaeb7 FOLDED-BY-HAND ceaecdc7 2026-10-13
 refs/heads/exec-host-aetherstyle3             abcb8d33 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-aethersw                 abcb8d33 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-sonde2                   abcb8d33 IN-FLIGHT cloud 2026-10-13
