@@ -12,7 +12,7 @@
 //!    `drivers::realsense_xu`'s builders (the HW-monitor `GET_ADV(etDepthTableControl)` command, the XU
 //!    reply reader, the request words) against hand-laid bytes. Field by field; the first failure is
 //!    named. Runs on every machine: `-> PASS` or `-> FAIL`.
-//! 2. THE DEVICE — what this boot's EHCI walk recorded for a D400 (`uvc::multi::record`):
+//! 2. THE DEVICE — what this boot's EHCI walk, or its xHCI `probe_iso` (ARMSONDE, SR101), recorded for a D400 (`uvc::multi::record`):
 //!    `:: SONDE: dev=8086:0b3a streams=<depth,ir,color> fmt=Z16 w=<n> h=<n> depth_scale=<f> frames_2s=<n>
 //!    -> … ::`. With no D400 on the bus (every QEMU run, every bench without the camera) it is
 //!    `-> SKIP(no-device)`. With one, the census, the XU reads and the depth scale are printed and the

@@ -1730,7 +1730,7 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
         addr, h.name(), config_value, wtotal, want, cap,
         if wtotal as usize > cap { " (the tail of this descriptor is UNREAD)" } else { "" }
     );
-    let buf = h.buf();
+    let buf = h.buf(); #[cfg(feature = "sonde")] multi::ident(addr, buf, &mut |bm, br, wv, wi, wl, di| h.control(bm, br, wv, wi, wl, di)); // ARMSONDE (LEDGER SR101): WHOSE camera, on the xHCI path too — `probe`'s FOLD 1, here before the configuration re-read (`cfg` is the caller's copy, so the 18-byte device read into `buf` destroys nothing). Without it a D435i on any USB-A port (xHCI on every board, the Orin's and the Pi's only bus) was never recorded and `tests sonde` read `SKIP(no-device)` with the camera plugged in.
     let n = match h.control(0x80, 6, 0x0200, 0, want, true) {
         Ok(n) if n >= 9 => (n as usize).min(cap),
         Ok(n) => {
@@ -1790,7 +1790,7 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
         serial_println!("[uvc] abort addr={} host={} stage=set-configuration req=SET_CONFIGURATION({}) reason=stalled-or-timeout", addr, h.name(), config_value);
         return;
     }
-    crate::bootlog_println!("[uvc] configured addr={} host={} cfg_value={} vs_intf={}", addr, h.name(), config_value, c.vs_intf);
+    crate::bootlog_println!("[uvc] configured addr={} host={} cfg_value={} vs_intf={}", addr, h.name(), config_value, c.vs_intf); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, &mut |bm, br, wv, wi, wl, di| h.control(bm, br, wv, wi, wl, di)); // ARMSONDE (LEDGER SR101): `probe`'s FOLD 2 on the xHCI path — the multi-function census of the full descriptor and, for a D400, the record plus the three XU GET_CURs. Placed AFTER SET_CONFIGURATION so the XU reads address a configured device, and `full` is still the descriptor here: the only transfer since its read is SET_CONFIGURATION, wLength 0, which has no data stage (`sync_control` touches the buffer only when `w_length > 0`). Every later read in this function is of owned copies (`c`, `eps`, the pick) or of a fresh transfer.
     let mut blk_len = 0usize;
     for (stage, req) in [("min", RQ_GET_MIN), ("max", RQ_GET_MAX), ("def", RQ_GET_DEF)] {
         match h.control(BMREQ_GET_INTF, req, wvalue, windex, PROBE_LEN_ASK, true) {
@@ -2031,7 +2031,7 @@ fn stream_fixture(parsed: bool) {
     let ok = |b: bool| if b { "PASS" } else { "FAIL" };
     if !STREAM_ARMED.load(Ordering::Acquire) {
         // CPUID.01H:ECX bit 31 — set by a hypervisor for its guest (QEMU sets it on its x86 models).
-        let vm = core::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+        #[cfg(target_arch = "x86_64")] let vm = core::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0; #[cfg(not(target_arch = "x86_64"))] let vm = false; // ARMSONDE (SR101): CPUID is x86's; an aarch64 boot names the plain reason (QEMU raspi4b/virt carry no UVC device either way).
         let reason = if vm { "qemu-no-uvc-stream" } else { "no-xhci-uvc-stream" };
         if parsed && streamed {
             serial_println!(":: UVC: selftest=PASS stream_selftest=PASS host=- frames_2s=- fps=- -> SKIP reason={} ::", reason);
@@ -2046,14 +2046,14 @@ fn stream_fixture(parsed: bool) {
     let t0 = crate::arch::now_cycles();
     let span = crate::arch::hw_wait_budget(); // 2 s of wall clock once the TSC is calibrated
     while crate::arch::now_cycles().wrapping_sub(t0) < span {
-        crate::arch::sched::sleep_ticks(10);
+        #[cfg(target_arch = "x86_64")] crate::arch::sched::sleep_ticks(10); #[cfg(not(target_arch = "x86_64"))] { if let Ok(mut x) = crate::drivers::xhci::claim() { x.poll_events(); } crate::arch::sched::yield_now(); } // ARMSONDE (SR101): on aarch64 the window DRIVES the event ring itself — x86 has the 1 ms `xhci-poll` task to keep the iso ring harvested while this sleeps; the Orin's drive loop drains no sleepers (xusb_tegra `kbd_pump_body`'s JC3 note) and the `tests` verb runs on the very console pump that polls, so a sleep there would park forever and count nothing.
         core::hint::spin_loop();
     }
     let dt = crate::arch::now_cycles().wrapping_sub(t0).max(1);
     let s1 = snap();
     let i1 = crate::drivers::xhci::isoch::stats();
     let frames = s1.0.wrapping_sub(s0.0);
-    let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "x86_64")] let hz = crate::arch::apic::tsc_hz(); #[cfg(target_arch = "aarch64")] let hz = crate::arch::timer::cntfrq(); // ARMSONDE (SR101): `now_cycles` is CNTVCT on aarch64, which counts at CNTFRQ_EL0 (31.25 MHz Orin, 54 MHz Pi 4).
     let fps10 = if hz != 0 { (frames as u64).saturating_mul(10).saturating_mul(hz) / dt } else { frames as u64 * 5 };
     let wh = STREAM_WH.load(Ordering::Relaxed);
     let cc = cc_str(STREAM_CC.load(Ordering::Relaxed));
@@ -2489,4 +2489,14 @@ pub mod multi {
             rs::HWMON_BUF, rs::DEPTH_UNITS_DEFAULT_UM
         );
     }
+}
+
+/// ARMSONDE (LEDGER SR101) — `tests uvc` registered whether or not a camera was offered. On x86 the EHCI walk
+/// calls `probe` for every non-hub device, so the fixture is always deferred there; an aarch64 board has no EHCI,
+/// and `probe_iso` runs only for a video-IAD candidate, so with no camera plugged in `tests uvc` was "no such
+/// fixture" instead of the parser PASS and the stream half's `-> SKIP reason=no-xhci-uvc-stream`. `defer`
+/// de-duplicates by name, so the later `probe_iso` deferral is a no-op. Called from `tests::ensure_shellux`
+/// (aarch64 only, so the x86 fixture table is unchanged). Appended at the file tail: no line above moves.
+pub fn ensure_tests() {
+    let _ = crate::tests::defer("uvc", uvc_fixture);
 }

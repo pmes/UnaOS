@@ -73,5 +73,5 @@ pub mod hda;
 // OS). Knob off => the module is never lexed (the `#[cfg]`-erased `pub mod` is the one case
 // LAWS §5 names as byte-safe) and media are byte-identical. DECLARED LAST, after `hda` and for the
 // reason `ahci` and `hda` were: the knob-off line numbering of every module above is untouched.
-#[cfg(all(target_arch = "x86_64", feature = "uvc"))]
-pub mod uvc; #[cfg(all(target_arch = "x86_64", feature = "sonde"))] pub mod realsense_xu; // REALSENSE (LEDGER SR92): the D400 vendor extension unit as data (librealsense facts, cited). LINE-NEUTRAL append, before this comment; knob off => never lexed.
+#[cfg(feature = "uvc")]
+pub mod uvc; #[cfg(feature = "sonde")] pub mod realsense_xu; // REALSENSE (LEDGER SR92): the D400 vendor extension unit as data (librealsense facts, cited). LINE-NEUTRAL append, before this comment; knob off => never lexed.
