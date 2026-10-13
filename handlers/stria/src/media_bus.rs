@@ -15,7 +15,7 @@
 //! | `MediaSeek { url, position_ns }` | keyframe at or before, decode forward | the frame at the target |
 //! | `MediaMute { url, muted }` | zero / restore the samples sent to the device (clock runs on) | |
 //! | `MediaVolume { url, volume }` | scale the samples sent to the device (0..=1; mute wins) | |
-//! | `MediaRate { url, rate }` | 0 holds the clock (session stays playing), non-zero releases; other than 0/1 plays at 1x (logged) | |
+//! | `MediaRate { url, rate }` | 0 holds the clock (session stays playing); 0.25..=4 runs the master clock at that rate, audio time-stretched (WSOLA, pitch kept); outside that, clamped (logged) | |
 //! | `MediaStop { url }` | close the session | `MediaEnded` |
 //!
 //! A stream with no video track is an AUDIO-ONLY session (AUDIOTRACK, SR45): `MediaOpened`
@@ -238,7 +238,7 @@ fn handle(synapse: &Synapse, sessions: &mut HashMap<String, Session>, msg: SMess
         SMessage::MediaRate { url, rate } => {
             if let Some(s) = sessions.get_mut(&url) {
                 if !s.player.set_rate(rate) {
-                    log::warn!("[STRIA] :: {url}: playbackRate {rate} refused (no clock rate / time-stretch); playing at 1x");
+                    log::warn!("[STRIA] :: {url}: playbackRate {rate} outside 0.25..=4; clamped to {}", s.player.rate());
                 }
             }
         }

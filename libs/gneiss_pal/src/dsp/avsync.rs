@@ -140,6 +140,9 @@ pub struct AudioClock {
     playing: bool,
     /// Last value returned: the clock never runs backwards across a report.
     last: std::sync::atomic::AtomicI64,
+    /// AETHERMEDIA2 (SR134): media ns per output ns, in parts per million — the device plays
+    /// time-stretched audio, so one second of output frames is `rate` seconds of media.
+    rate_ppm: i64,
 }
 
 impl AudioClock {
@@ -155,6 +158,7 @@ impl AudioClock {
             max_interp_ns,
             playing: false,
             last: std::sync::atomic::AtomicI64::new(i64::MIN),
+            rate_ppm: 1_000_000,
         }
     }
     fn frames_ns(&self, frames: u64) -> i64 {
@@ -167,10 +171,11 @@ impl AudioClock {
     }
     pub fn media_ns(&self) -> i64 {
         let audible = self.played.saturating_sub(self.latency_frames);
-        let mut t = self.start_media + self.frames_ns(audible);
+        let scale = |ns: i64| if self.rate_ppm == 1_000_000 { ns } else { (ns as i128 * self.rate_ppm as i128 / 1_000_000) as i64 };
+        let mut t = self.start_media + scale(self.frames_ns(audible));
         if self.playing && audible > 0 {
             let dt = self.src.now_ns().saturating_sub(self.report_src).min(self.max_interp_ns);
-            t += dt as i64;
+            t += scale(dt as i64);
         }
         let prev = self.last.load(Ordering::Relaxed);
         let t = t.max(if prev == i64::MIN { t } else { prev });
@@ -183,6 +188,14 @@ impl AudioClock {
     }
     pub fn pause(&mut self) {
         self.playing = false;
+    }
+    /// AETHERMEDIA2 (SR134): the playback rate (ppm of 1.0). The clock restarts at the media time it
+    /// has reached, with nothing played: the caller flushes the device, whose queued frames were
+    /// stretched at the old rate.
+    pub fn set_rate_ppm(&mut self, ppm: i64) {
+        let now = self.media_ns();
+        self.rate_ppm = ppm.max(1);
+        self.seek(now);
     }
     /// Restart at `media_ns` with nothing played (after a seek the output is flushed).
     pub fn seek(&mut self, media_ns: i64) {
@@ -239,6 +252,15 @@ impl MasterClock {
     }
     pub fn is_audio(&self) -> bool {
         matches!(self, MasterClock::Audio(_))
+    }
+    /// AETHERMEDIA2 (SR134): HTMLMediaElement.playbackRate on the master clock, in ppm of 1.0. The
+    /// wall clock rebases (continuous); the audio clock restarts where it is (the device is flushed
+    /// by the caller, see [`AudioClock::set_rate_ppm`]).
+    pub fn set_rate_ppm(&mut self, ppm: i64) {
+        match self {
+            MasterClock::Audio(a) => a.set_rate_ppm(ppm),
+            MasterClock::Wall(w) => w.set_rate_ppm(ppm),
+        }
     }
 }
 
