@@ -35,20 +35,24 @@ its line count up to the file tail (`git diff -U0` shows four `-N +N` single-lin
 `cursor.rs` edits are `#[cfg]` lines rewritten in place. With the knob off, every new statement is removed by its
 `#[cfg(feature = "desktop_firmware")]`.
 
-## 2. Owed outside this arc's files: the other two hover call sites
+## 2. The other two hover call sites (second commit, scope widened by the seat)
 
-`user_input_enqueue` covers the hover only while a ring-3 app has focus. Two pointer paths never call it, and each
-needs one folded statement in a file this brief excluded:
+`user_input_enqueue` covers the hover only while a ring-3 app has focus. The two pointer paths that never call it
+now each carry one folded statement, placed before the line's first `//` so `main.rs` keeps its line count:
 
-- **Pi, shell focus.** In `main.rs` `render_service`, the `Mouse`/`MouseAbsolute` arms (the two
-  `wm::drag_route_tail(ev)` folds, `main.rs:5482` and `:5492`) need
-  `#[cfg(feature = "desktop_firmware")] unaos_kernel::arch::aarch64::syscall::arm_resize_hover(ev);` appended after
-  `drag_route_tail(ev);`.
-- **Orin.** In `main.rs:3021` (`jd2_console_pump`'s per-frame pointer block), after `orin_drag_steer(..)`, the line
-  needs `#[cfg(feature = "orinclick")] unaos_kernel::arch::aarch64::syscall::arm_resize_hover_at(x, y);`, where
-  `(x, y)` = `pal::cursor::pos(pal.width() as i32, pal.height() as i32)`.
+- **Pi, shell focus.** In `main.rs:5482` and `:5492` (`render_service`'s `Mouse`/`MouseAbsolute` arms), after
+  `drag_route_tail(ev);`: `#[cfg(feature = "desktop_firmware")] unaos_kernel::arch::aarch64::syscall::arm_resize_hover(ev);`.
+- **Orin.** In `main.rs:3021` (`jd2_console_pump`'s per-frame pointer block), after `orin_drag_steer(..)` and before
+  `cursor::draw_over`, so the draw latches the new shape: `#[cfg(all(feature = "orinclick", feature =
+  "desktop_firmware"))] { let (hx, hy) = cursor::pos(..); …::arm_resize_hover_at(hx, hy); }`. `orinclick` does not
+  imply `desktop_firmware` in `Cargo.toml`, so both are named.
 
-Press, motion, release and keys do not depend on either fold.
+The same commit adds `DRAG_LAST_MOVE_MS.store(0, Relaxed)` to `resize_begin` (`video/wm.rs:29832`, under
+`target_arch = "aarch64"`). `drag_begin` already makes that reset (`:17169`). Without it a resize inherited the
+previous gesture's admission floor (DRAG-ADMIT, capped at 250 ms).
+
+The tegra-image feature set the compile used has no `orinclick`, so the Orin statement was not type-checked. The
+fold's orinclick leg owes that check.
 
 ## 3. The fixture: `tests winresize` on aarch64
 
