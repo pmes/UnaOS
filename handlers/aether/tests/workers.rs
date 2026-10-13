@@ -14,6 +14,17 @@
 //! 7. a same-origin http(s) worker fetched through the page's loader, its `importScripts`, and a module
 //!    worker's static import.
 //!
+//! AETHERWORKERS2 (LEDGER SR125), one test per item:
+//!
+//! 8. `terminate()` interrupts a loop that calls nothing (js_core `Vm::interrupt`);
+//! 9. the worker script goes out as `Sec-Fetch-Dest: worker` (importScripts as `script`) and a non-JavaScript
+//!    MIME type is refused, the console naming it;
+//! 10. the Worker's ErrorEvent is cancelable (uncanceled, it reaches the Window) and `new MessageEvent(type,
+//!     { ports })` carries its ports;
+//! 11. IndexedDB, Web Locks and BroadcastChannel in a worker share the owner document's storage;
+//! 12. `unhandledrejection` / `rejectionhandled` at the worker global;
+//! 13. nested workers under the parent's captured URL, origin and CSP, terminated with it.
+//!
 //! No WPT: the seat runs the suites. Storage lives under CARGO_TARGET_TMPDIR.
 
 use std::io::{Read, Write};

@@ -264,8 +264,10 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
     if src.contains("testdriver.js") || src.contains("test_driver") {
         return Some("testdriver (WebDriver input automation)");
     }
-    if src.contains("new Worker") || src.contains("SharedWorker") || src.contains("serviceWorker") || src.contains("MessageChannel") || src.contains("postMessage(") {
-        return Some("workers / messaging");
+    // AETHERWORKERS2 (SR125): dedicated workers (`new Worker`), MessageChannel and postMessage run now; what
+    // stays out is SharedWorker (not implemented) and service workers (their WPT needs a TLS origin).
+    if src.contains("SharedWorker") || src.contains("serviceWorker") {
+        return Some("shared / service workers");
     }
     if name.contains("/scrolling/")
         || name.starts_with("html/webappapis/update-rendering/")
@@ -668,8 +670,11 @@ fn net_excluded(rel: &str, src: &str) -> Option<String> {
     if name.contains(".https.") || name.contains(".h2.") || name.contains(".serviceworker.") {
         return Some("needs a TLS server (https / h2)".into());
     }
-    if name.ends_with(".worker.js") || name.contains(".sharedworker.") || src.contains("new Worker(") || src.contains("SharedWorker(") || src.contains("fetch_tests_from_worker") {
-        return Some("workers".into());
+    // AETHERWORKERS2 (SR125): a page that starts a dedicated worker (`new Worker(`) runs now. Still out: SharedWorker,
+    // and the worker-context variants (`.worker.js`, `fetch_tests_from_worker`), which need the stand-in to
+    // serve wptserve's `.worker.html` wrapper (tests/wpt_net.rs).
+    if name.ends_with(".worker.js") || name.contains(".sharedworker.") || src.contains("SharedWorker(") || src.contains("fetch_tests_from_worker") {
+        return Some("shared workers / worker-context tests".into());
     }
     if src.contains("RemoteContextHelper") || name.contains("back-forward-cache") {
         return Some("bfcache / remote browsing contexts".into());
