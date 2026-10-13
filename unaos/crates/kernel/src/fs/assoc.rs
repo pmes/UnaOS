@@ -185,12 +185,12 @@ pub fn known_types_in(mt: &MountTable) -> Vec<String> {
             v.push(m);
         }
     }
-    if let Ok(ents) = mt.read_dir(TYPES_DIR) {
-        for e in ents {
-            if e.name.starts_with("application-x-vnd.") || e.name.starts_with('.') {
+    if let Ok(ents) = mt.read_dir_kinds(TYPES_DIR) { // JOBSCAN2 (B551): names only — `read_dir` read every row's inode inside ONE masked transaction
+        for (name, _) in ents {
+            if name.starts_with("application-x-vnd.") || name.starts_with('.') {
                 continue;
             }
-            let m = mime_of_leaf(&e.name);
+            let m = mime_of_leaf(&name);
             if !v.contains(&m) {
                 v.push(m);
             }
@@ -241,16 +241,16 @@ pub struct SigDecl {
 /// full builds only).
 fn sig_decls(mt: &MountTable) -> Vec<SigDecl> {
     let mut out = Vec::new();
-    if let Ok(ents) = mt.read_dir(TYPES_DIR) {
-        for e in ents.iter().filter(|e| e.name.starts_with("application-x-vnd.")) {
-            let obj = alloc::format!("{}/{}", TYPES_DIR, e.name);
+    if let Ok(ents) = mt.read_dir_kinds(TYPES_DIR) { // JOBSCAN2 (B551): names only — `read_dir` read every row's inode inside ONE masked transaction
+        for (name, _) in ents.iter().filter(|(n, _)| n.starts_with("application-x-vnd.")) {
+            let obj = alloc::format!("{}/{}", TYPES_DIR, name);
             let decl: Vec<String> = str_attr(mt, &obj, midden_core::RES_KEY_DOCTYPES).unwrap_or_default().lines().map(String::from).collect();
             let types = uncovered_types(&decl);
             if types.is_empty() {
                 continue;
             }
             let path = str_attr(mt, &obj, appres::KEY_APP_PATH).filter(|p| !crate::fs::apptrust::is_foreign(mt, p)).unwrap_or_default();
-            out.push(SigDecl { sig: String::from(&e.name["application-x-vnd.".len()..]), path, types });
+            out.push(SigDecl { sig: String::from(&name["application-x-vnd.".len()..]), path, types });
         }
     }
     out
@@ -270,7 +270,10 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
     // missing type is its own one-object batch (one bounded transaction, one root flip), each present type its own
     // `set_attrs` — no 30-object masked hold. On x86 the caller's task yields between objects (interrupts and the
     // HID pump run between them). One line per object: `[filetypes] type=<mime> made= filled= blocks= cmds= ms= masked_ms=`.
-    let present: Vec<String> = mt.read_dir(TYPES_DIR).map(|v| v.into_iter().map(|e| e.name).collect()).unwrap_or_default();
+    // JOBSCAN2 (B551): presence from the names alone (`read_dir_kinds`: the directory blob, no inode read per row —
+    // `read_dir` read ~35 inodes inside one masked transaction before the first object).
+    let present: Vec<String> = mt.read_dir_kinds(TYPES_DIR).map(|v| v.into_iter().map(|(n, _)| n).collect()).unwrap_or_default();
+    let mut group = 1usize; // keys per stamping transaction, sized by the last one's masked span (`stamp_grouped`)
     let scoped = crate::fs::bootstep::scope_word() != "global";
     let sio = || if scoped { crate::fs::bootstep::scope_io() } else { crate::fs::bootstep::io() };
     let (mut made, mut filled) = (0usize, 0usize);
@@ -281,10 +284,22 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
         let leaf = String::from(&obj[TYPES_DIR.len() + 1..]);
         let exists = present.iter().any(|n| *n == leaf);
         let want = keys_for_obj(mt, &mime, exists, &sigs);
-        let (mut m1, mut f1) = (0usize, 0usize);
+        let (mut m1, mut f1, mut txs, mut mm) = (0usize, 0usize, 0u32, 0u64);
         if !exists {
-            match mt.create_files_batch(TYPES_DIR, alloc::vec![(leaf, want.clone())], k) {
-                Ok(n) => m1 = n,
+            // FILETYPES (JOBSCAN2, B551): the object is created BARE (one small transaction: the inode, the directory
+            // rewrite, its name facts), then its keys are stamped in groups (`stamp_grouped`). Flight 32's 275 ms
+            // masked hold was the one-object create carrying every key (each key two index B-tree inserts, cmds=62 in
+            // one IRQ-masked transaction). The stamp is written only after every object, so a build cut between the
+            // create and its keys is finished by the next build's fill arm below.
+            match mt.create_files_batch(TYPES_DIR, alloc::vec![(leaf, Vec::new())], k) {
+                Ok(n) => {
+                    m1 = n;
+                    txs += 1;
+                    mm = mm.max(crate::hidstall::scope_masked_take());
+                    breathe_between();
+                    let keys: Vec<(String, Option<AttrValue>)> = want.into_iter().map(|(key, v)| (key, Some(v))).collect();
+                    txs += stamp_grouped(mt, &obj, &keys, k, &mut group, &mut mm)?;
+                }
                 Err(VfsError::Unsupported) => { // no batch on this volume: the plain create, then its keys
                     mt.create(&obj, NodeKind::File, k)?;
                     for (key, v) in want {
@@ -303,24 +318,58 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
                 .collect();
             if !fill.is_empty() {
                 f1 = fill.len();
-                mt.set_attrs(&obj, &fill, k)?;
+                txs += stamp_grouped(mt, &obj, &fill, k, &mut group, &mut mm)?; // JOBSCAN2 (B551): grouped like a new object's keys
             }
         }
         made += m1;
         filled += f1;
-        let mm = crate::hidstall::scope_masked_take(); // every object's span, said or not
+        let mm = mm.max(crate::hidstall::scope_masked_take()); // every object's span, said or not
         PER_TYPE_MASKED.fetch_max(mm, Ordering::Relaxed);
         if m1 + f1 > 0 {
             let d = sio().since(io0);
-            serial_println!("[filetypes] type={} made={} filled={} blocks={} cmds={} ms={} masked_ms={}", mime, m1, f1, d.blocks_read(), d.cmds(),
-                crate::arch::ms().saturating_sub(t0), mm);
+            serial_println!("[filetypes] type={} made={} filled={} blocks={} cmds={} ms={} masked_ms={} txs={} group={}", mime, m1, f1, d.blocks_read(), d.cmds(),
+                crate::arch::ms().saturating_sub(t0), mm, txs, group);
         }
-        #[cfg(target_arch = "x86_64")]
-        if !crate::arch::irqs_masked() {
-            crate::arch::sched::yield_now(); // between objects, never inside a hold: the HID pump and the render lane run (JOBSCAN's worker runs this build)
-        }
+        breathe_between(); // between objects, never inside a hold: the HID pump and the render lane run (JOBSCAN's worker runs this build)
     }
     Ok((made, filled))
+}
+
+/// JOBSCAN2 (B551): the most keys one stamping transaction carries.
+const STAMP_GROUP_MAX: usize = 4;
+
+/// Between two registry transactions: on x86, with interrupts on, the task yields (the HID pump and the render lane
+/// run); never inside a hold.
+fn breathe_between() {
+    #[cfg(target_arch = "x86_64")]
+    if !crate::arch::irqs_masked() {
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// JOBSCAN2 (B551): stamp `keys` on `obj` in GROUPS — each group one `set_attrs` (one masked transaction, one
+/// commit), a yield between groups. The group is sized by the last transaction's masked span: back to one key past
+/// two thirds of [`MASKED_MS_BOUND`], one more key (to [`STAMP_GROUP_MAX`]) under a third of it. `mm` takes every
+/// group's span; returns the transactions taken.
+fn stamp_grouped(mt: &MountTable, obj: &str, keys: &[(String, Option<AttrValue>)], k: &str, group: &mut usize, mm: &mut u64) -> Result<u32, VfsError> {
+    let mut rest = keys;
+    let mut txs = 0u32;
+    while !rest.is_empty() {
+        let n = (*group).clamp(1, STAMP_GROUP_MAX).min(rest.len());
+        *mm = (*mm).max(crate::hidstall::scope_masked_take()); // what came before this group stays the object's
+        mt.set_attrs(obj, &rest[..n], k)?;
+        let m = crate::hidstall::scope_masked_take();
+        *mm = (*mm).max(m);
+        txs += 1;
+        if m * 3 > MASKED_MS_BOUND * 2 {
+            *group = 1;
+        } else if m * 3 <= MASKED_MS_BOUND && n == *group {
+            *group = (*group + 1).min(STAMP_GROUP_MAX);
+        }
+        rest = &rest[n..];
+        breathe_between();
+    }
+    Ok(txs)
 }
 
 /// `/system` and [`TYPES_DIR`], created when absent.
@@ -1092,9 +1141,9 @@ pub fn uncovered_types(doctypes: &[String]) -> Vec<String> {
 /// (`seed_in`'s set: a full build creates their objects). One attribute read per signature object, full builds only.
 pub fn seed_types_in(mt: &MountTable) -> Vec<String> {
     let mut v = known_types_in(mt);
-    if let Ok(ents) = mt.read_dir(TYPES_DIR) {
-        for e in ents.iter().filter(|e| e.name.starts_with("application-x-vnd.")) {
-            let obj = alloc::format!("{}/{}", TYPES_DIR, e.name);
+    if let Ok(ents) = mt.read_dir_kinds(TYPES_DIR) { // JOBSCAN2 (B551): names only — `read_dir` read every row's inode inside ONE masked transaction
+        for (name, _) in ents.iter().filter(|(n, _)| n.starts_with("application-x-vnd.")) {
+            let obj = alloc::format!("{}/{}", TYPES_DIR, name);
             let decl: Vec<String> = str_attr(mt, &obj, midden_core::RES_KEY_DOCTYPES).unwrap_or_default().lines().map(String::from).collect();
             for m in uncovered_types(&decl) {
                 if !v.contains(&m) {
