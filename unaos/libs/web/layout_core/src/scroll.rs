@@ -416,6 +416,104 @@ pub fn snap_offset<H: Host>(tree: &LayoutTree<H>, id: NodeId, cur: (f32, f32), w
     )
 }
 
+// ---- AETHERSTYLE3C (SR122): scroll-state container queries (css-conditional-5 §2.3) ---------------------------
+
+/// Which inset edges a `position: sticky` box is stuck to, as the painter places it (css-position-3 §3.4:
+/// against the viewport — Aether's one sticky scrollport — scrolled to `vs` and `viewport` big, never leaving
+/// its containing block, the parent's content box): `css_core::container` edge bits, 0 when it sits at its
+/// normal-flow place or is not sticky.
+pub fn sticky_stuck<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> u8 {
+    use css_core::container::{BOTTOM, LEFT, RIGHT, TOP};
+    let Some(p) = tree.paint_map.get(&id) else { return 0 };
+    if p.position_kind != Some(4) {
+        return 0;
+    }
+    let Some(ins) = p.inset_px else { return 0 };
+    let (Some((nx, ny)), Ok(l)) = (box_origin(tree, id, vs), tree.taffy.layout(id)) else { return 0 };
+    let (w, h) = (l.size.width, l.size.height);
+    let (cb_l, cb_t, cb_r, cb_b) = match tree.taffy.parent(id).and_then(|q| Some((box_origin(tree, q, vs)?, tree.taffy.layout(q).ok()?))) {
+        Some(((px, py), pl)) => (
+            px + pl.border.left + pl.padding.left,
+            py + pl.border.top + pl.padding.top,
+            px + pl.size.width - pl.border.right - pl.padding.right,
+            py + pl.size.height - pl.border.bottom - pl.padding.bottom,
+        ),
+        None => (f32::MIN, f32::MIN, f32::MAX, f32::MAX),
+    };
+    let mut out = 0u8;
+    if let Some(t) = ins[0] {
+        let target = vs.1 + t;
+        if ny < target && target.min(cb_b - h).max(ny) > ny {
+            out |= TOP;
+        }
+    } else if let Some(b) = ins[2] {
+        let target = vs.1 + viewport.1 - b - h;
+        if ny > target && target.max(cb_t).min(ny) < ny {
+            out |= BOTTOM;
+        }
+    }
+    if let Some(lf) = ins[3] {
+        let target = vs.0 + lf;
+        if nx < target && target.min(cb_r - w).max(nx) > nx {
+            out |= LEFT;
+        }
+    } else if let Some(r) = ins[1] {
+        let target = vs.0 + viewport.0 - r - w;
+        if nx > target && target.max(cb_l).min(nx) < nx {
+            out |= RIGHT;
+        }
+    }
+    out
+}
+
+/// The scroll state a `container-type: scroll-state` box offers its `@container scroll-state()` queries:
+/// `stuck` from [`sticky_stuck`] (the caller's viewport scroll), `snapped` — the axes on which the box is the
+/// snap target its nearest snap container sits on ([`snapped_targets`]), `scrollable` — the directions the box,
+/// as a scroll container, can still scroll (offset above 0: toward top / left; below its maximum: toward bottom
+/// / right).
+pub fn scroll_state<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> css_core::container::ScrollState {
+    use css_core::container::{AXIS_X, AXIS_Y, BOTTOM, LEFT, RIGHT, TOP};
+    let mut st = css_core::container::ScrollState::default();
+    if let Some(p) = tree.paint_map.get(&id) {
+        st.vertical = crate::writing::is_vertical(p.writing_mode.unwrap_or(0));
+        st.rtl = p.rtl == Some(true);
+    }
+    st.stuck = sticky_stuck(tree, id, vs, viewport);
+    let mut cur = tree.taffy.parent(id);
+    while let Some(c) = cur {
+        if is_scroll_container(tree, c) {
+            if snap_axes(tree, c) != (false, false) {
+                let (tx, ty) = snapped_targets(tree, c);
+                if tx == Some(id) {
+                    st.snapped |= AXIS_X;
+                }
+                if ty == Some(id) {
+                    st.snapped |= AXIS_Y;
+                }
+            }
+            break;
+        }
+        cur = tree.taffy.parent(c);
+    }
+    if is_scroll_container(tree, id) {
+        let (ox, oy) = offset(tree, id);
+        let (mx, my) = max_scroll(tree, id);
+        if oy > 0.5 {
+            st.scrollable |= TOP;
+        }
+        if oy < my - 0.5 {
+            st.scrollable |= BOTTOM;
+        }
+        if ox > 0.5 {
+            st.scrollable |= LEFT;
+        }
+        if ox < mx - 0.5 {
+            st.scrollable |= RIGHT;
+        }
+    }
+    st
+}
+
 // ---- AETHERSTYLE3B (SR115): smooth scrolling (CSSOM View §5.1 `scroll-behavior`) -------------------------------
 
 /// Whether a programmatic scroll of `id` with behavior `auto` animates (`scroll-behavior: smooth`).

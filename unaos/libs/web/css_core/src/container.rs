@@ -14,8 +14,16 @@
 //! `not` / `and` / `or` over `(<declaration>)` style features, a bare `--name` testing that the custom property
 //! has a value — and evaluated against the query container's computed custom properties, which the caller
 //! hands in ([`ContainerRule::evaluate_with`]). Every element is a style container, so a style-only rule
-//! needs no size container ([`ContainerRule::needs_size`]) and no layout. A standard property inside
-//! `style()` and `scroll-state()` queries stay unknown (false).
+//! needs no size container ([`ContainerRule::needs_size`]) and no layout.
+//!
+//! AETHERSTYLE3C (SR122): a standard property inside `style()` is answered by the same caller closure — the
+//! query container's computed value as the text of its resolved declaration (inherited properties from the
+//! nearest ancestor that declares them, [`inherited_property`]), compared with whitespace squashed and ASCII
+//! case folded (custom properties compare case-sensitively, as tokens). `scroll-state()` queries
+//! (css-conditional-5 §2.3) parse into [`ScrollStateQuery`] — `stuck`, `snapped` and `scrollable` with their
+//! physical, logical and axis keywords, a bare feature meaning "not none" — and evaluate against the
+//! [`ScrollState`] of the nearest `container-type: scroll-state` ancestor, which the caller computes from its
+//! layout ([`ContainerRule::evaluate_full`], [`ContainerRule::needs_scroll_state`]).
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -45,9 +53,44 @@ pub enum ContainerCondition {
     Size(MediaCondition),
     /// `style( <style-query> )`.
     Style(StyleQuery),
-    /// `<general-enclosed>` (`scroll-state()`, anything else): unknown.
+    /// AETHERSTYLE3C (SR122): `scroll-state( <scroll-state-query> )`.
+    ScrollState(ScrollStateQuery),
+    /// `<general-enclosed>` (anything else): unknown.
     Unknown,
 }
+
+/// AETHERSTYLE3C (SR122): a `<scroll-state-query>` (css-conditional-5 §2.3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScrollStateQuery {
+    Not(Box<ScrollStateQuery>),
+    And(Vec<ScrollStateQuery>),
+    Or(Vec<ScrollStateQuery>),
+    /// `stuck` / `snapped` / `scrollable`, lower-cased, with its keyword (None: the boolean form).
+    Feature(String, Option<String>),
+    Unknown,
+}
+
+/// AETHERSTYLE3C (SR122): what a scroll-state container offers its queries. Edge bits: [`TOP`], [`RIGHT`],
+/// [`BOTTOM`], [`LEFT`]; axis bits: [`AXIS_X`], [`AXIS_Y`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollState {
+    /// The edges a sticky box is stuck to (css-position-3 §3.4: held at that inset edge of its scrollport).
+    pub stuck: u8,
+    /// The axes on which the box is the snap target of its snap container.
+    pub snapped: u8,
+    /// The directions the scroll container can still scroll toward.
+    pub scrollable: u8,
+    /// The container's writing mode is vertical (block axis horizontal; `vertical-rl` assumed) / its direction is rtl.
+    pub vertical: bool,
+    pub rtl: bool,
+}
+
+pub const TOP: u8 = 1;
+pub const RIGHT: u8 = 2;
+pub const BOTTOM: u8 = 4;
+pub const LEFT: u8 = 8;
+pub const AXIS_X: u8 = 1;
+pub const AXIS_Y: u8 = 2;
 
 /// A `<style-query>`.
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +163,7 @@ fn condition(w: &[&CV]) -> Option<ContainerCondition> {
 fn in_parens(c: &CV) -> ContainerCondition {
     match c {
         CV::Function(name, args) if name.eq_ignore_ascii_case("style") => ContainerCondition::Style(style_query(args)),
+        CV::Function(name, args) if name.eq_ignore_ascii_case("scroll-state") => ContainerCondition::ScrollState(scroll_query(args)),
         CV::Block(BlockKind::Paren, inner) => {
             let w: Vec<&CV> = inner.iter().filter(|c| !c.is_whitespace()).collect();
             let nested = w.first().is_some_and(|f| matches!(f, CV::Block(BlockKind::Paren, _) | CV::Function(..)) || is_ident(f, "not"));
@@ -192,6 +236,153 @@ fn style_feature(v: &[CV]) -> StyleQuery {
     StyleQuery::Feature(String::from(name), Some(value))
 }
 
+/// AETHERSTYLE3C (SR122): `<scroll-state-query>`: `not` / `and` / `or` over parenthesized queries, or one
+/// `<scroll-state-feature>` (`name: keyword` or a bare name).
+fn scroll_query(args: &[CV]) -> ScrollStateQuery {
+    let w: Vec<&CV> = args.iter().filter(|c| !c.is_whitespace()).collect();
+    if w.is_empty() {
+        return ScrollStateQuery::Unknown;
+    }
+    if is_ident(w[0], "not") {
+        return if w.len() == 2 { ScrollStateQuery::Not(Box::new(scroll_in_parens(w[1]))) } else { ScrollStateQuery::Unknown };
+    }
+    if !matches!(w[0], CV::Block(BlockKind::Paren, _)) {
+        return scroll_feature(args);
+    }
+    let first = scroll_in_parens(w[0]);
+    if w.len() == 1 {
+        return first;
+    }
+    let op = if is_ident(w[1], "and") { "and" } else if is_ident(w[1], "or") { "or" } else { return ScrollStateQuery::Unknown };
+    let mut items = alloc::vec![first];
+    let mut i = 1;
+    while i < w.len() {
+        match (is_ident(w[i], op), w.get(i + 1)) {
+            (true, Some(n)) => items.push(scroll_in_parens(n)),
+            _ => return ScrollStateQuery::Unknown,
+        }
+        i += 2;
+    }
+    if op == "and" { ScrollStateQuery::And(items) } else { ScrollStateQuery::Or(items) }
+}
+
+fn scroll_in_parens(c: &CV) -> ScrollStateQuery {
+    match c {
+        CV::Block(BlockKind::Paren, inner) => {
+            let w: Vec<&CV> = inner.iter().filter(|c| !c.is_whitespace()).collect();
+            if w.first().is_some_and(|f| matches!(f, CV::Block(BlockKind::Paren, _)) || is_ident(f, "not")) {
+                scroll_query(inner)
+            } else {
+                scroll_feature(inner)
+            }
+        }
+        _ => ScrollStateQuery::Unknown,
+    }
+}
+
+fn scroll_feature(v: &[CV]) -> ScrollStateQuery {
+    let v = crate::parser::trim_ws(v);
+    let Some(name) = v.first().and_then(|c| c.ident()) else { return ScrollStateQuery::Unknown };
+    let name = name.to_ascii_lowercase();
+    if !matches!(name.as_str(), "stuck" | "snapped" | "scrollable") {
+        return ScrollStateQuery::Unknown;
+    }
+    let rest = crate::parser::trim_ws(&v[1..]);
+    if rest.is_empty() {
+        return ScrollStateQuery::Feature(name, None);
+    }
+    if !matches!(rest[0], CV::Token(Token::Colon)) {
+        return ScrollStateQuery::Unknown;
+    }
+    let value = crate::parser::trim_ws(&rest[1..]);
+    match (value.len(), value.first().and_then(|c| c.ident())) {
+        (1, Some(k)) => ScrollStateQuery::Feature(name, Some(k.to_ascii_lowercase())),
+        _ => ScrollStateQuery::Unknown,
+    }
+}
+
+/// The physical edge bits a `stuck` / `scrollable` keyword names in a container of this writing mode and
+/// direction (the axis keywords name both edges of their axis); None: not a keyword of that feature.
+fn edge_bits(k: &str, st: &ScrollState, axes: bool) -> Option<u8> {
+    let (bs, be, is, ie) = match (st.vertical, st.rtl) {
+        (false, false) => (TOP, BOTTOM, LEFT, RIGHT),
+        (false, true) => (TOP, BOTTOM, RIGHT, LEFT),
+        (true, false) => (RIGHT, LEFT, TOP, BOTTOM),
+        (true, true) => (RIGHT, LEFT, BOTTOM, TOP),
+    };
+    Some(match k {
+        "none" => 0,
+        "top" => TOP,
+        "right" => RIGHT,
+        "bottom" => BOTTOM,
+        "left" => LEFT,
+        "block-start" => bs,
+        "block-end" => be,
+        "inline-start" => is,
+        "inline-end" => ie,
+        "x" if axes => LEFT | RIGHT,
+        "y" if axes => TOP | BOTTOM,
+        "block" if axes => bs | be,
+        "inline" if axes => is | ie,
+        _ => return None,
+    })
+}
+
+fn eval_scroll(q: &ScrollStateQuery, st: &ScrollState) -> Tri {
+    match q {
+        ScrollStateQuery::Not(q) => not(eval_scroll(q, st)),
+        ScrollStateQuery::And(v) => all(v.iter().map(|q| eval_scroll(q, st))),
+        ScrollStateQuery::Or(v) => any(v.iter().map(|q| eval_scroll(q, st))),
+        ScrollStateQuery::Feature(name, value) => {
+            let cur = match name.as_str() {
+                "stuck" => st.stuck,
+                "scrollable" => st.scrollable,
+                _ => st.snapped,
+            };
+            let Some(k) = value else { return if cur != 0 { Tri::True } else { Tri::False } };
+            let want = if name == "snapped" {
+                let (b, i) = if st.vertical { (AXIS_X, AXIS_Y) } else { (AXIS_Y, AXIS_X) };
+                match k.as_str() {
+                    "none" => 0,
+                    "x" => AXIS_X,
+                    "y" => AXIS_Y,
+                    "block" => b,
+                    "inline" => i,
+                    "both" => return if cur & (AXIS_X | AXIS_Y) == AXIS_X | AXIS_Y { Tri::True } else { Tri::False },
+                    _ => return Tri::Unknown,
+                }
+            } else {
+                match edge_bits(k, st, name == "scrollable") {
+                    Some(b) => b,
+                    None => return Tri::Unknown,
+                }
+            };
+            let hit = if want == 0 { cur == 0 } else { cur & want != 0 };
+            if hit { Tri::True } else { Tri::False }
+        }
+        ScrollStateQuery::Unknown => Tri::Unknown,
+    }
+}
+
+/// AETHERSTYLE3C (SR122): whether a standard property inherits (its computed value comes from the parent when
+/// the element declares none) — the properties CSS defines as inherited, which a `style()` query of a
+/// standard property reads from the nearest ancestor that declares them.
+pub fn inherited_property(name: &str) -> bool {
+    matches!(
+        name,
+        "color" | "font" | "font-family" | "font-size" | "font-style" | "font-weight" | "font-variant" | "font-stretch"
+            | "font-feature-settings" | "font-variation-settings" | "font-kerning" | "font-size-adjust" | "line-height"
+            | "letter-spacing" | "word-spacing" | "text-align" | "text-align-last" | "text-indent" | "text-transform"
+            | "text-shadow" | "text-rendering" | "text-orientation" | "text-combine-upright" | "white-space"
+            | "white-space-collapse" | "text-wrap" | "word-break" | "overflow-wrap" | "word-wrap" | "hyphens"
+            | "tab-size" | "direction" | "writing-mode" | "visibility" | "cursor" | "list-style" | "list-style-type"
+            | "list-style-position" | "list-style-image" | "quotes" | "caption-side" | "border-collapse"
+            | "border-spacing" | "empty-cells" | "orphans" | "widows" | "color-scheme" | "accent-color"
+            | "caret-color" | "pointer-events" | "image-rendering" | "paint-order" | "fill" | "stroke"
+            | "stroke-width" | "-webkit-text-fill-color" | "-webkit-text-stroke"
+    )
+}
+
 /// Whitespace runs collapsed, ends trimmed: the comparison form of a computed value text.
 fn squash(v: &str) -> String {
     let mut out = String::new();
@@ -210,13 +401,14 @@ fn eval_style(q: &StyleQuery, style: &dyn Fn(&str) -> Option<String>) -> Tri {
         StyleQuery::And(v) => all(v.iter().map(|q| eval_style(q, style))),
         StyleQuery::Or(v) => any(v.iter().map(|q| eval_style(q, style))),
         StyleQuery::Feature(name, value) => {
-            if !name.starts_with("--") {
-                return Tri::Unknown;
-            }
-            let cur = style(name).map(|c| squash(&c)).filter(|c| !c.is_empty());
+            // AETHERSTYLE3C (SR122): a standard property compares its resolved declaration's text, keywords
+            // case-insensitively; a custom property compares its tokens as written.
+            let custom = name.starts_with("--");
+            let fold = |v: &str| if custom { squash(v) } else { squash(v).to_ascii_lowercase() };
+            let cur = style(name).map(|c| fold(&c)).filter(|c| !c.is_empty());
             let hit = match value {
                 None => cur.is_some(),
-                Some(v) => cur.as_deref() == Some(squash(v).as_str()),
+                Some(v) => cur.as_deref() == Some(fold(v).as_str()),
             };
             if hit { Tri::True } else { Tri::False }
         }
@@ -248,14 +440,42 @@ fn any(it: impl Iterator<Item = Tri>) -> Tri {
     r
 }
 
-fn eval_cond(c: &ContainerCondition, size: Option<&ContainerSize>, style: &dyn Fn(&str) -> Option<String>) -> Tri {
+fn eval_cond(c: &ContainerCondition, size: Option<&ContainerSize>, style: &dyn Fn(&str) -> Option<String>, scroll: Option<&ScrollState>) -> Tri {
     match c {
-        ContainerCondition::Not(c) => not(eval_cond(c, size, style)),
-        ContainerCondition::And(v) => all(v.iter().map(|c| eval_cond(c, size, style))),
-        ContainerCondition::Or(v) => any(v.iter().map(|c| eval_cond(c, size, style))),
+        ContainerCondition::Not(c) => not(eval_cond(c, size, style, scroll)),
+        ContainerCondition::And(v) => all(v.iter().map(|c| eval_cond(c, size, style, scroll))),
+        ContainerCondition::Or(v) => any(v.iter().map(|c| eval_cond(c, size, style, scroll))),
         ContainerCondition::Size(m) => size.map(|s| eval(m, s)).unwrap_or(Tri::Unknown),
         ContainerCondition::Style(q) => eval_style(q, style),
+        ContainerCondition::ScrollState(q) => scroll.map(|s| eval_scroll(q, s)).unwrap_or(Tri::Unknown),
         ContainerCondition::Unknown => Tri::Unknown,
+    }
+}
+
+fn has_scroll(c: &ContainerCondition) -> bool {
+    match c {
+        ContainerCondition::Not(c) => has_scroll(c),
+        ContainerCondition::And(v) | ContainerCondition::Or(v) => v.iter().any(has_scroll),
+        ContainerCondition::ScrollState(_) => true,
+        _ => false,
+    }
+}
+
+fn style_standard(q: &StyleQuery) -> bool {
+    match q {
+        StyleQuery::Not(q) => style_standard(q),
+        StyleQuery::And(v) | StyleQuery::Or(v) => v.iter().any(style_standard),
+        StyleQuery::Feature(n, _) => !n.starts_with("--"),
+        StyleQuery::Unknown => false,
+    }
+}
+
+fn has_standard_style(c: &ContainerCondition) -> bool {
+    match c {
+        ContainerCondition::Not(c) => has_standard_style(c),
+        ContainerCondition::And(v) | ContainerCondition::Or(v) => v.iter().any(has_standard_style),
+        ContainerCondition::Style(q) => style_standard(q),
+        _ => false,
     }
 }
 
@@ -277,10 +497,27 @@ impl ContainerRule {
     /// The condition against one query container: its size (None: not a size container) and its computed
     /// custom properties (`style(name)` → the value text, None when the property has no value).
     pub fn evaluate_with(&self, size: Option<&ContainerSize>, style: &dyn Fn(&str) -> Option<String>) -> Tri {
+        self.evaluate_full(size, style, None)
+    }
+
+    /// AETHERSTYLE3C (SR122): as [`ContainerRule::evaluate_with`], with the query container's scroll state
+    /// (None: not a scroll-state container — `scroll-state()` is unknown).
+    pub fn evaluate_full(&self, size: Option<&ContainerSize>, style: &dyn Fn(&str) -> Option<String>, scroll: Option<&ScrollState>) -> Tri {
         match &self.condition {
-            Some(c) => eval_cond(c, size, style),
+            Some(c) => eval_cond(c, size, style, scroll),
             None => Tri::False,
         }
+    }
+
+    /// AETHERSTYLE3C (SR122): the condition queries `scroll-state()`: its query container must be a
+    /// scroll-state container.
+    pub fn needs_scroll_state(&self) -> bool {
+        self.condition.as_ref().is_some_and(has_scroll)
+    }
+
+    /// AETHERSTYLE3C (SR122): a `style()` query names a standard property (the caller must answer those).
+    pub fn queries_standard_style(&self) -> bool {
+        self.condition.as_ref().is_some_and(has_standard_style)
     }
 
     /// The condition queries size features: its query container must be a size container (§3.1).

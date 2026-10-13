@@ -922,13 +922,25 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "will-change" => {}
         // AETHERSTYLE3 (SR103): css-contain-3 §3 — query containers (the host's second cascade evaluates
         // `@container` against their sizes) and size containment (`fold_into`).
-        "container-type" => match value {
-            "normal" => style.paint.container_type = Some(0),
-            "size" => style.paint.container_type = Some(1),
-            "inline-size" => style.paint.container_type = Some(2),
-            v if is_neutral_keyword(v) => {}
-            v => H::record_css(&format!("container-type-value:{}", clip(v))),
-        },
+        // AETHERSTYLE3C (SR122): `normal | [ [ size | inline-size ] || scroll-state ]` (css-conditional-5 §2.1).
+        "container-type" => {
+            let (mut ty, mut scroll, mut ok) = (None, false, true);
+            for k in value.split_whitespace() {
+                match k {
+                    "normal" if ty.is_none() && !scroll => ty = Some(0),
+                    "size" if ty.is_none() => ty = Some(1),
+                    "inline-size" if ty.is_none() => ty = Some(2),
+                    "scroll-state" if !scroll && ty != Some(0) => scroll = true,
+                    _ => ok = false,
+                }
+            }
+            if ok && (ty.is_some() || scroll) {
+                style.paint.container_type = Some(ty.unwrap_or(0));
+                style.paint.container_scroll = Some(scroll);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("container-type-value:{}", clip(value)));
+            }
+        }
         "container-name" => {
             let names: Vec<String> = value.split_whitespace().filter(|n| *n != "none").map(|n| n.to_string()).collect();
             style.paint.container_name = Some(names);
@@ -2502,7 +2514,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
-        deco_clone, text_combine, scroll_margin,
+        deco_clone, text_combine, scroll_margin, container_scroll,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {

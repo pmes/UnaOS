@@ -229,6 +229,9 @@ pub struct PaintStyle<H: Host> {
     /// AETHERSTYLE3C (SR122): `scroll-margin` (css-scroll-snap-1 §6.3) in px: [top, right, bottom, left] — the
     /// snap area's outsets from the border box.
     pub scroll_margin: Option<[f32; 4]>,
+    /// AETHERSTYLE3C (SR122): `container-type` names `scroll-state` (css-conditional-5 §2.1): the box answers
+    /// `@container scroll-state()` queries ([`crate::scroll::scroll_state`]).
+    pub container_scroll: Option<bool>,
 }
 
 
@@ -332,6 +335,7 @@ impl<H: Host> Default for PaintStyle<H> {
             deco_clone: None,
             text_combine: None,
             scroll_margin: None,
+            container_scroll: None,
         }
     }
 }
