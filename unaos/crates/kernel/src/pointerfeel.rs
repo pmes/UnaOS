@@ -273,7 +273,7 @@ fn run() {
     }
     GAP_MAX_MS.store(0, Relaxed);
     GAP_MAX_WHO.store(usize::MAX, Relaxed);
-    GAP_MAX_STEP.store(0, Relaxed); reset_class(); // PUMPHOLE (B541)
+    GAP_MAX_STEP.store(0, Relaxed); reset_class(); reset_xfer(); // PUMPHOLE (B541). TPSTREAM (B624): the window's transfer census starts at zero
     ARMED.store(true, core::sync::atomic::Ordering::Release);
     serial_println!("[ptrfeel] move one finger on the trackpad for {} s (waiting up to {} s for the first touch)", WINDOW_MS / 1000, TOUCH_WAIT_MS / 1000);
     let _ = crate::video::notify(b"pointerfeel", b"Trackpad test", b"Move one finger on the trackpad for 5 seconds", b"", 0, b"");
@@ -311,10 +311,10 @@ fn report() {
     let gmax = GAP_MAX_MS.load(Relaxed);
     let worst = if gaps == 0 { None } else { Some(Holder(GAP_MAX_WHO.load(Relaxed), 0, GAP_MAX_STEP.load(Relaxed) as u8)) };
     serial_println!(
-        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} starved={} starved_max_ms={} silent={} silent_max_ms={} pass_max_ms={} pass_bound_ms={} via=tests",
+        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} starved={} starved_max_ms={} silent={} silent_max_ms={} pass_max_ms={} pass_bound_ms={} {} via=tests",
         n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, Classed(silent_worst(gaps), WorstWord(worst)), if mt > leg { "mt" } else { "legacy" }, FineWord, RateWord(rate_x10), // POINTERSCALE2 (B554): `expected_hz=` from the endpoint's bInterval beside `rate_hz=` (LINE-NEUTRAL, code first)
         if verdict(n, STARVED.load(Relaxed), mt, leg) && rate_ok(rate_x10, expected_hz()) { "PASS" } else { "FAIL" }, BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
-        REASSERT_LATCHED.load(Relaxed), fr, fr_worst, LOGIN_GAP_MS.load(Relaxed), LoginGapHolder, STARVED.load(Relaxed), STARVED_MAX_MS.load(Relaxed), SILENT.load(Relaxed), SILENT_MAX_MS.load(Relaxed), PASS_MAX_MS.load(Relaxed), BOUND_MS
+        REASSERT_LATCHED.load(Relaxed), fr, fr_worst, LOGIN_GAP_MS.load(Relaxed), LoginGapHolder, STARVED.load(Relaxed), STARVED_MAX_MS.load(Relaxed), SILENT.load(Relaxed), SILENT_MAX_MS.load(Relaxed), PASS_MAX_MS.load(Relaxed), BOUND_MS, XferWord
     );
     let start = START_MS.load(Relaxed);
     for k in 0..(gaps as usize).min(GAP_LOG) {
@@ -512,6 +512,56 @@ impl core::fmt::Display for RateWord {
             f, "expected_hz={} poll_hz={} binterval={} speed={} rate_pct={} rate={}",
             e, poll_hz(), EP_BINTERVAL.load(Relaxed), if EP_HS.load(Relaxed) { "hs" } else { "fs" }, self.0 * 10 / e,
             if rate_ok(self.0, e) { "ok" } else { "LOW" }
+        )
+    }
+}
+
+// ── TPSTREAM (rmbp-ledger B624) — the window's TRANSFER census beside its report count. FILE-TAIL append. ─────────────────
+//
+// Flight 34's `rate_pct=21 … worst_holder=silent` could not say WHERE a silent frame went: the pad may not have sent it,
+// or the host may have retired it and dropped it. `drivers/ehci/mod.rs`' TPSTREAM block found the second — the hid pass
+// read every pad frame it retired as zero bytes (`mps - residue` against a 256 B armed total) — and fixed it. These
+// counters put the path on the verdict line so the bench sees it working: ` nak=<passes that found the transfer in
+// flight> err=<transaction errors> csplit_miss=<missed complete-splits> via_isr=<completions the interrupt lifted>
+// via_poll=<completions the pass retired> rescued=<pass completions the old length read as 0> inflight=1` (the endpoint's
+// hardware depth: one transfer in the QH overlay — overlay-direct silicon, no qTD ring). Counted only inside the open
+// window, from the decode's pass and from the EHCI interrupt (relaxed atomics, no lock, no print — safe in the ISR).
+// After the fix the bench expects a moving finger to read `rate_pct>=80 gaps=0 … rescued=<n>` with `via_poll` frames no
+// longer missing from `reports=`.
+
+pub const XFER_NAK: usize = 0;
+pub const XFER_ERR: usize = 1;
+pub const XFER_MISS: usize = 2;
+pub const XFER_ISR: usize = 3;
+pub const XFER_POLL: usize = 4;
+pub const XFER_RESCUED: usize = 5;
+static XFER: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+
+/// One transfer event on the vendor pad's endpoint (`XFER_*`), counted while the window is open after the first touch.
+#[inline]
+pub fn note_xfer(kind: usize) {
+    if !ARMED.load(Relaxed) || START_MS.load(Relaxed) == 0 {
+        return;
+    }
+    if let Some(c) = XFER.get(kind) {
+        c.fetch_add(1, Relaxed);
+    }
+}
+
+fn reset_xfer() {
+    for c in XFER.iter() {
+        c.store(0, Relaxed);
+    }
+}
+
+/// `nak=<n> err=<n> csplit_miss=<n> via_isr=<n> via_poll=<n> rescued=<n> inflight=1` on the verdict line.
+struct XferWord;
+impl core::fmt::Display for XferWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let g = |k: usize| XFER[k].load(Relaxed);
+        write!(
+            f, "nak={} err={} csplit_miss={} via_isr={} via_poll={} rescued={} inflight=1",
+            g(XFER_NAK), g(XFER_ERR), g(XFER_MISS), g(XFER_ISR), g(XFER_POLL), g(XFER_RESCUED)
         )
     }
 }
