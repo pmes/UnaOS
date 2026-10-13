@@ -29688,17 +29688,17 @@ pub fn winresize_selftest() {
     let sc = i0.scale.max(1) as i64;
     let (cw, ch) = ((i0.w * i0.scale) as i32, (i0.h * i0.scale) as i32);
     let (ox, oy) = (i0.x as i32 - wm::BORDER() as i32, i0.y as i32 - (wm::TITLE_H() + wm::BORDER()) as i32);
-    let (ow, oh) = (cw + 2 * wm::BORDER() as i32, ch + (wm::TITLE_H() + 2 * wm::BORDER()) as i32);
-    // Leg 1 — the eight zones, each probe distinct and nonzero.
+    let (ow, oh) = (cw + 2 * wm::BORDER() as i32, ch + (wm::TITLE_H() + 2 * wm::BORDER()) as i32); let e = crate::ui::px(wm::RS_EDGE) as i32; let (bl, bt, br, bb) = (ox - 1 - e / 2, oy - 1 - e / 2, ox + ow + e / 2, oy + oh + e / 2); // DESIGNFIX (B649): with no frame the band lies OUTSIDE the box (DESIGNAPPLY B639, §2.9: `wm::rs_band_box`, `resize_band_hit`) — every probe and press point sits mid-band, `e / 2` past the box's edge (`bl`/`bt` one px further so an `e` of 1 still lands outside). ⚠ LINE-NEUTRAL fold, code before this comment.
+    // Leg 1 — the eight zones, each probe distinct and nonzero (DESIGNFIX: in the outside band, never the content).
     let probes = [
-        (ox + 1, i0.y as i32 + ch / 2, wm::RS_L),
-        (ox + ow - 2, i0.y as i32 + ch / 2, wm::RS_R),
-        (ox + ow / 2, oy + 1, wm::RS_T),
-        (ox + ow / 2, oy + oh - 2, wm::RS_B),
-        (ox + 1, oy + 1, wm::RS_L | wm::RS_T),
-        (ox + ow - 2, oy + 1, wm::RS_R | wm::RS_T),
-        (ox + 1, oy + oh - 2, wm::RS_L | wm::RS_B),
-        (ox + ow - 2, oy + oh - 2, wm::RS_R | wm::RS_B),
+        (bl, i0.y as i32 + ch / 2, wm::RS_L),
+        (br, i0.y as i32 + ch / 2, wm::RS_R),
+        (ox + ow / 2, bt, wm::RS_T),
+        (ox + ow / 2, bb, wm::RS_B),
+        (bl, bt, wm::RS_L | wm::RS_T),
+        (br, bt, wm::RS_R | wm::RS_T),
+        (bl, bb, wm::RS_L | wm::RS_B),
+        (br, bb, wm::RS_R | wm::RS_B),
     ];
     let mut zones = 0u32; let (cursor_ok, cursor_shapes) = winresize_cursor_leg(w, &probes, (i0.x as i32 + cw / 2, i0.y as i32 + ch / 2)); // WINRESIZE2 (B635): the hover leg, run BEFORE the drag legs move the frame — the eight probes are the eight zones (file tail). ⚠ LINE-NEUTRAL fold, code before this comment.
     for (px, py, want) in probes.iter() {
@@ -29708,7 +29708,7 @@ pub fn winresize_selftest() {
     }
     // The title strip's drag handle must NOT be a zone (the `wm-act` fixture's grab point).
     let strip_clear = wm::resize_zone_at(w, i0.x as i32 + 1, i0.y as i32 - (wm::TITLE_H() / 2 + wm::BORDER()) as i32) == 0;
-    let (brx, bry) = (ox + ow - 2, oy + oh - 2);
+    let (brx, bry) = (br, bb);
     // One routed drag: press at the zone, move, release through the router. Returns (w, h) after.
     let drag = |fx: i32, fy: i32, tx: i32, ty: i32| -> Option<(usize, usize)> {
         crate::pal::cursor::set_button_level(true);
@@ -29731,7 +29731,7 @@ pub fn winresize_selftest() {
     // Leg 3 — past the panel edge: clamps inside the panel and inside the 400x300 slot.
     let c0 = wm::RS_CLAMPED.load(Relaxed);
     let i1 = wm::info(w);
-    let (bx1, by1) = i1.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx1, by1) = i1.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 + e / 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 + e / 2)).unwrap_or((brx, bry));
     let r3 = drag(bx1, by1, pw as i32 + 400, ph as i32 + 400);
     let clamp_ok = match (r3, wm::info(w)) {
         (Some((w3, h3)), Some(i)) => w3 <= WRZ_CW && h3 <= WRZ_CH && i.x + w3 * i.scale + wm::BORDER() <= pw && i.y + h3 * i.scale + wm::BORDER() <= ph && wm::RS_CLAMPED.load(Relaxed) > c0,
@@ -29739,12 +29739,12 @@ pub fn winresize_selftest() {
     };
     // Leg 4 — toward the origin: stops at the minimum.
     let i2 = wm::info(w);
-    let (bx2, by2) = i2.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx2, by2) = i2.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 + e / 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 + e / 2)).unwrap_or((brx, bry));
     let min_ok = drag(bx2, by2, 0, 0) == Some((wm::RS_MIN_W, wm::RS_MIN_H));
     // Leg 5 — Shift keeps the aspect (from the minimum, grow width only).
     crate::video::keymap::note_mods(crate::drivers::xhci::HID_MOD_SHIFT);
     let a0 = wm::info(w);
-    let (bx3, by3) = a0.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2)).unwrap_or((brx, bry));
+    let (bx3, by3) = a0.map(|i| ((i.x + i.w * i.scale + wm::BORDER()) as i32 + e / 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 + e / 2)).unwrap_or((brx, bry));
     let ar = drag(bx3, by3, bx3 + 60 * sc as i32, by3);
     crate::video::keymap::note_mods(0);
     let aspect_ok = match (a0, ar) {

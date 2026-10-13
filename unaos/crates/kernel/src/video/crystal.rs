@@ -1547,7 +1547,7 @@ pub mod sheet {
     /// `text.primary` — an item's label (the bar's own ink: the dropdown is the bar's text hanging below it).
     #[inline]
     pub fn text_primary() -> u32 {
-        unfill(theme::title_text_active())
+        unfill(theme::text_primary())
     }
     /// `text.secondary` — the shortcut keycaps.
     #[inline]
@@ -1557,7 +1557,7 @@ pub mod sheet {
     /// `text.disabled` — a disabled item.
     #[inline]
     pub fn text_disabled() -> u32 {
-        unfill(theme::title_text_inactive())
+        unfill(theme::text_disabled())
     }
     /// `accent.fill` — the hovered item's pill.
     #[inline]
@@ -1745,7 +1745,7 @@ pub mod sheet {
                         return theme::surface_content();
                     }
                     if y + self.title_h >= cy0 && y < cy0 {
-                        return theme::chrome_face();
+                        return theme::surface_window();
                     }
                 }
                 break; // the frame band: the wallpaper under the window's own shadow
