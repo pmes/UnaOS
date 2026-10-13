@@ -39,6 +39,9 @@ pub struct DtFmt {
     pub tzn: Option<&'static str>,
     pub date_style: Option<&'static str>,
     pub time_style: Option<&'static str>,
+    /// The options named a component or a style (TEMPORAL SR117: a Temporal type with no explicit fields
+    /// formats with its own defaults, ECMA-402 Temporal §11.1.x).
+    pub explicit: bool,
 }
 
 fn pick(values: &[&'static str], s: Option<String>) -> Option<&'static str> {
@@ -206,6 +209,7 @@ pub fn create(vm: &mut Vm, locales: &Value, options: &Value, required: &str, def
         tzn,
         date_style,
         time_style,
+        explicit: false,
     };
     let explicit = weekday.is_some()
         || era.is_some()
@@ -218,6 +222,7 @@ pub fn create(vm: &mut Vm, locales: &Value, options: &Value, required: &str, def
         || second.is_some()
         || fsd.is_some()
         || tzn.is_some();
+    f.explicit = explicit || date_style.is_some() || time_style.is_some();
     if date_style.is_some() || time_style.is_some() {
         if explicit {
             return vm.throw_type("Can't set option dateStyle or timeStyle together with other date/time fields");
@@ -684,8 +689,31 @@ fn time_arg(vm: &mut Vm, v: &Value) -> JsResult<f64> {
 }
 
 pub fn format_value(vm: &mut Vm, f: &DtFmt, t: f64) -> Vec<(String, String)> {
-    let off = zone_offset(vm, &f.zone, t);
+    let off = zone_offset_of(vm, f, t);
     format_parts(f, t, off)
+}
+
+/// The formatter's offset at `t`: an IANA zone reads its historical transitions (TEMPORAL SR117,
+/// `temporal::zone`), everything else its rule.
+pub fn zone_offset_of(vm: &mut Vm, f: &DtFmt, t: f64) -> f64 {
+    if let ZoneRule::Posix(..) = &f.zone {
+        if let Some(z) = crate::builtins::temporal::zone::parse_identifier(&f.zone_id) {
+            if t.is_finite() {
+                let ns = (t as i128) * 1_000_000;
+                return crate::builtins::temporal::zone::offset_ns(&z, ns) as f64 / 1_000_000.0;
+            }
+        }
+    }
+    zone_offset(vm, &f.zone, t)
+}
+
+/// format / formatToParts over a Temporal object or a time value.
+fn format_any(vm: &mut Vm, f: &DtFmt, v: &Value) -> JsResult<Vec<(String, String)>> {
+    if let Some(parts) = crate::builtins::temporal::format_hook(vm, f, v)? {
+        return Ok(parts);
+    }
+    let t = time_arg(vm, v)?;
+    Ok(format_value(vm, f, t))
 }
 
 fn dtf_format_getter(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -696,18 +724,16 @@ fn dtf_format_getter(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn dtf_bound_format(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let o = bound_target(vm, ctx);
     let v = vm.arg(ctx, 0);
-    let t = time_arg(vm, &v)?;
     let f = dtf_of(vm, o);
-    let parts = format_value(vm, &f, t);
+    let parts = format_any(vm, &f, &v)?;
     Ok(Value::str(&concat_parts(&parts)))
 }
 
 fn dtf_format_to_parts(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let o = this_intl(vm, &ctx.this, is_dtf, "Intl.DateTimeFormat.prototype.formatToParts")?;
     let v = vm.arg(ctx, 0);
-    let t = time_arg(vm, &v)?;
     let f = dtf_of(vm, o);
-    let parts = format_value(vm, &f, t);
+    let parts = format_any(vm, &f, &v)?;
     Ok(parts_array(vm, &parts, None))
 }
 
@@ -718,11 +744,14 @@ fn range_args(vm: &mut Vm, ctx: &CallCtx, what: &str) -> JsResult<(DtFmt, Vec<(S
     if a.is_undefined() || b.is_undefined() {
         return vm.throw_type("startDate or endDate is undefined");
     }
-    let x = time_arg(vm, &a)?;
-    let y = time_arg(vm, &b)?;
     let f = dtf_of(vm, o);
-    let pa = format_value(vm, &f, x);
-    let pb = format_value(vm, &f, y);
+    let ta = crate::builtins::temporal::tdata(vm, &a).map(|d| d.index());
+    let tb = crate::builtins::temporal::tdata(vm, &b).map(|d| d.index());
+    if ta != tb {
+        return vm.throw_type("formatRange needs two values of the same kind");
+    }
+    let pa = format_any(vm, &f, &a)?;
+    let pb = format_any(vm, &f, &b)?;
     Ok((f, pa, pb))
 }
 

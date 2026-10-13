@@ -188,6 +188,15 @@ impl PosixTz {
         if in_dst { d.offset } else { self.std_offset }
     }
 
+    /// The two rule transitions of `year` as UTC instants in ms: (into daylight time, back to standard time).
+    /// `None` for a rule without daylight time. Temporal's `getTimeZoneTransition` walks these (SR117).
+    pub fn transitions_utc(&self, year: f64) -> Option<(f64, f64)> {
+        let d = self.dst.as_ref()?;
+        let s = rule_day_start(year, d.start.0) + d.start.1 - self.std_offset;
+        let e = rule_day_start(year, d.end.0) + d.end.1 - d.offset;
+        Some((s, e))
+    }
+
     /// Offset to subtract from local time `t` to get UTC: repeated local times take the offset before the
     /// transition (daylight time), skipped ones are read with the offset before the transition (standard time).
     pub fn offset_for_local(&self, t: f64) -> f64 {
