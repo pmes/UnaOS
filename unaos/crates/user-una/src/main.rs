@@ -27,8 +27,8 @@
 // would collide with the arrow bytes), but it still delivers the RELEASE as the bare digit (ALLKEYS: a release is
 // never suppressed). So a KEY_UP of `1`/`2`/`3` with no KEY_DOWN of it before is exactly a modified digit — Ctrl
 // (or Alt/Cmd) + 1/2/3 — and that is the chord this program reads. Esc cycles the focus too (one key, no chord).
-// A click focuses the pane under the pointer; the pointer is this program's own estimate, moved by MOUSE_REL deltas
-// and clamped to the window (x86 gives ring 3 no window origin to map MOUSE_ABS through — owed, named here).
+// A click focuses the pane under the pointer; the pointer is the one the kernel delivers (AETHERPTR, rmbp-ledger
+// B543): every INPUT_EV_MOUSE_ABS carries the system pointer in this window's pixels, so nothing here estimates it.
 //
 // GLOBAL KEYS. Ctrl+S save the editor's file; Ctrl+O open the tree's selected file; Ctrl+Q quit (and a window
 // close request). Everything else goes to the focused pane (tree.rs, editor.rs, console.rs say their keys).
@@ -46,7 +46,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use una_abi::{
     input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP,
-    INPUT_EV_MOUSE_REL, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
+    INPUT_EV_MOUSE_ABS, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
 use vein_ring3::sys::{sleep_ms, sys, write};
 
@@ -174,7 +174,8 @@ struct App {
     con: console::Console,
     /// Bytes whose KEY_DOWN this program saw and whose KEY_UP it has not (the modified-digit chord test).
     down: [bool; 128],
-    ptr: (i32, i32),
+    /// The delivered pointer (INPUT_EV_MOUSE_ABS, window px, unclamped); `None` until the first one.
+    ptr: Option<(i32, i32)>,
     buttons: u8,
     dirty: bool,
 }
@@ -294,7 +295,7 @@ impl App {
         if !pressed {
             return;
         }
-        let (x, y) = self.ptr;
+        let Some((x, y)) = self.ptr else { return };
         if R_TREE.has(x, y) {
             self.set_focus(Pane::Tree);
             let r = (y - R_TREE.y - 2) / self.lh() - 1;
@@ -586,7 +587,7 @@ pub extern "C" fn _start() -> ! {
         ed: editor::Editor::new(),
         con: console::Console::new(root.clone(), con_cols),
         down: [false; 128],
-        ptr: (W / 2, H / 2),
+        ptr: None,
         buttons: 0,
         dirty: true,
     };
@@ -633,10 +634,7 @@ pub extern "C" fn _start() -> ! {
                         app.ed.action(p as u8);
                     }
                 }
-                INPUT_EV_MOUSE_REL => {
-                    let (dx, dy) = ((p >> 16) as u16 as i16 as i32, p as u16 as i16 as i32);
-                    app.ptr = ((app.ptr.0 + dx).clamp(0, W - 1), (app.ptr.1 + dy).clamp(0, H - 1));
-                }
+                INPUT_EV_MOUSE_ABS => app.ptr = Some(una_abi::input_ev_xy(p)),
                 INPUT_EV_BUTTON => app.button(p as u8),
                 INPUT_EV_CLOSE_REQ => app.quit(),
                 _ => {}

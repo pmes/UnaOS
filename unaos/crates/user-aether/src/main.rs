@@ -33,12 +33,14 @@
 // AETHERMETAL M3 (LEDGER SR96): INTERACTION — the window answers the INPUT_EV ring's pointer and keys (R108's pane
 // contract: a surface in, an input stream out, a resize). Model and wire in `ui.rs`; here, the dispatch:
 //
-// * POINTER. x86 hands ring 3 no window origin to map MOUSE_ABS through (UNAMETAL's note, user-una), so the pointer
-//   is this program's own estimate, moved by MOUSE_REL deltas and clamped to the window, and DRAWN here (an arrow;
-//   over a link a hand — the cursor change; a compositor cursor-shape verb does not exist, so the system cursor is
-//   owed, not faked). Every move hit-tests with `layout_core::hit::hit` (the host's selection.rs hit test, one
-//   function both rings call): over an `a[href]` the status line names the href and `:: AETHER: hover -> PASS
-//   href=<h> ::` is written once per link entered.
+// * POINTER (AETHERPTR, rmbp-ledger B543). The position is the one the kernel delivers: every INPUT_EV_MOUSE_ABS
+//   carries the SYSTEM pointer in this window's pixels (una_abi's contract — x86 sends one after every relative
+//   report and for every tablet report), so this program neither estimates a pointer nor draws one: the
+//   compositor's sprite is the one pointer on the glass (flight 32: "there's 2 mouse cursors" was this program's
+//   arrow beside it). A hand over a link needs a compositor cursor-SHAPE verb, which does not exist; it is absent,
+//   not faked. Every move hit-tests with `layout_core::hit::hit` (the host's selection.rs hit test, one function
+//   both rings call) at the delivered point: over an `a[href]` the status line names the href and `:: AETHER:
+//   hover -> PASS href=<h> ::` is written once per link entered; a pointer outside the window hovers nothing.
 // * CLICK (press + release, < 3 px between): over a link, NAVIGATE — the href resolved against the page's own
 //   `file://` URL by `html_core::url` (WHATWG URL), a `file:` path read off the volume (its `/boot` twin too),
 //   parsed, cascaded and laid out as the first page was; the old page's arena is freed. Session history is a list
@@ -72,7 +74,7 @@ use html_core::NodeId;
 use layout_core::hit::TextBox;
 use layout_core::{FontSel, NodeMap};
 use una_abi::{
-    input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_REL, INPUT_EV_WHEEL,
+    input_ev_payload, input_ev_type, input_ev_xy, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, INPUT_EV_WHEEL,
     INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
 
@@ -237,9 +239,10 @@ struct App {
     dirty: bool,
     relayout: bool,
     // ---- AETHERMETAL M3 (SR96) ----
-    /// This program's pointer estimate (window px) and whether it has moved yet (drawn only then).
+    /// The delivered pointer (INPUT_EV_MOUSE_ABS, window px): `ptr` clamped into the window for the hit test,
+    /// `raw` as delivered (outside the window it is negative or past w/h; `None` until the first one).
     ptr: (i32, i32),
-    ptr_seen: bool,
+    raw: Option<(i32, i32)>,
     buttons: u8,
     /// A left press is down: the travel since it, and whether it became a drag.
     pressed: bool,
@@ -361,7 +364,8 @@ fn flat_at(p: &Page, fonts: &txt::Fonts, ptr: (i32, i32), scroll: f32) -> Option
 
 /// Re-hit the pointer for hover: the link under it (the hit must be INSIDE a box, not merely nearest).
 fn hover_at(app: &mut App, p: &Page, fonts: &txt::Fonts) {
-    let link = hit_at(p, fonts, app.ptr, app.scroll).filter(|h| h.inside).and_then(|h| p.box_link.get(h.index).copied().flatten());
+    let inside = app.raw.is_some_and(|(x, y)| x >= 0 && y >= 0 && x < app.w && y < app.h);
+    let link = if inside { hit_at(p, fonts, app.ptr, app.scroll).filter(|h| h.inside).and_then(|h| p.box_link.get(h.index).copied().flatten()) } else { None };
     if link != app.hover {
         app.hover = link;
         app.dirty = true;
@@ -602,7 +606,7 @@ fn marks(app: &App, page: &Page) -> NodeMap<Vec<paint::Mark>> {
     m
 }
 
-/// Over the page: the focused link's outline, the status line, the pointer.
+/// Over the page: the focused link's outline and the status line (the pointer is the compositor's sprite).
 fn overlay(app: &App, page: &Page, cv: &mut paint::Canvas, fonts: &txt::Fonts) {
     if let Some(link) = app.focus.and_then(|k| page.links.get(k).copied()) {
         for (i, b) in page.boxes.iter().enumerate() {
@@ -623,9 +627,6 @@ fn overlay(app: &App, page: &Page, cv: &mut paint::Canvas, fonts: &txt::Fonts) {
         paint::status(cv, fonts, &ui::href(page.doc, l), false);
     } else if let Some((s, _)) = &app.flash {
         paint::status(cv, fonts, s, false);
-    }
-    if app.ptr_seen {
-        paint::pointer(cv, app.ptr.0, app.ptr.1, app.hover.is_some());
     }
 }
 
@@ -659,7 +660,7 @@ pub extern "C" fn _start() -> ! {
         dirty: true,
         relayout: false,
         ptr: (MAX_W / 2, MAX_H / 2),
-        ptr_seen: false,
+        raw: None,
         buttons: 0,
         pressed: false,
         travel: 0,
@@ -803,21 +804,22 @@ pub extern "C" fn _start() -> ! {
                         app.dirty = true;
                     }
                 },
-                INPUT_EV_MOUSE_REL => {
-                    let (dx, dy) = ((p >> 16) as u16 as i16 as i32, p as u16 as i16 as i32);
-                    let (nx, ny) = (app.ptr.0 + dx, app.ptr.1 + dy);
+                INPUT_EV_MOUSE_ABS => {
+                    // AETHERPTR (B543): the system pointer in window px; the motion is the step from the last one.
+                    let (nx, ny) = input_ev_xy(p);
+                    let (dx, dy) = app.raw.map_or((0, 0), |(x, y)| (nx - x, ny - y));
+                    app.raw = Some((nx, ny));
                     if app.buttons & 4 != 0 {
                         app.scroll_to(app.scroll - dy as f32, &page); // the middle button drags the page
                     } else if app.pressed {
-                        // A selection dragged past the window's edge scrolls the page under it.
-                        if ny < 0 {
-                            app.scroll_to(app.scroll + ny as f32, &page);
-                        } else if ny > app.h - 1 {
-                            app.scroll_to(app.scroll + (ny - app.h + 1) as f32, &page);
+                        // A selection dragged past the window's edge scrolls the page under it, by the travel out there.
+                        if ny < 0 && dy < 0 {
+                            app.scroll_to(app.scroll + dy as f32, &page);
+                        } else if ny > app.h - 1 && dy > 0 {
+                            app.scroll_to(app.scroll + dy as f32, &page);
                         }
                     }
                     app.ptr = (nx.clamp(0, app.w - 1), ny.clamp(0, app.h - 1));
-                    app.ptr_seen = true;
                     app.dirty = true;
                     if app.pressed {
                         app.travel += dx.abs() + dy.abs();

@@ -15,8 +15,8 @@
 // match, the current find match — keyed by its IFC root and fragment index, built by `ui`) gets its marked bytes'
 // line-box band filled first (the caret x of each end measured exactly as the hit test measures it), the glyphs
 // on top, and a selection's glyphs again in white (Chromium's highlight, the host's `selection::HIGHLIGHT`
-// over white). Over the page: the focused link's outline, the status line (the hovered href, the find bar, a
-// flash) and this window's own pointer, an arrow or — over a link — a hand.
+// over white). Over the page: the focused link's outline and the status line (the hovered href, the find bar, a
+// flash). No pointer: the compositor's sprite is the one pointer (AETHERPTR, rmbp-ledger B543).
 
 use alloc::vec::Vec;
 
@@ -361,27 +361,4 @@ pub fn status(cv: &mut Canvas, fonts: &Fonts, s: &str, accent: bool) {
     let mut t = fonts.0.borrow_mut();
     let (a, _, _) = t.line_metrics(sel, 11.0);
     t.draw(4.0, (y + 2) as f32 + a, s, sel, 11.0, ink, &mut |gx, gy, cov| cv.blend(gx, gy, ink, cov));
-}
-
-/// This window's pointer at (`x`, `y`): the arrow, or over a link the hand (`hand`). 1 = outline, 2 = fill.
-pub fn pointer(cv: &mut Canvas, x: i32, y: i32, hand: bool) {
-    const ARROW: [&[u8]; 12] = [
-        b"1", b"11", b"121", b"1221", b"12221", b"122221", b"1222221", b"12222221", b"1222111", b"12121", b"11 121", b"   11",
-    ];
-    const HAND: [&[u8]; 14] = [
-        b"   11", b"  1221", b"  1221", b"  1221", b"  122111", b"  12212211", b"111221221211", b"122122222221",
-        b"122222222221", b" 12222222221", b"  1222222221", b"  122222221", b"   12222221", b"   11111111",
-    ];
-    let rows: &[&[u8]] = if hand { &HAND } else { &ARROW };
-    let (ox, oy) = if hand { (x - 4, y) } else { (x, y) };
-    for (ry, row) in rows.iter().enumerate() {
-        for (rx, &c) in row.iter().enumerate() {
-            let col = match c {
-                b'1' => 0x0000_0000,
-                b'2' => 0x00FF_FFFF,
-                _ => continue,
-            };
-            cv.fill(ox + rx as i32, oy + ry as i32, 1, 1, col);
-        }
-    }
 }

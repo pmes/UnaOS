@@ -401,7 +401,21 @@ pub const INPUT_EV_KEY_DOWN: u64 = 1;
 pub const INPUT_EV_KEY_UP: u64 = 2;
 /// Relative pointer motion. Payload `[31:16]` = dx, `[15:0]` = dy, both `i16`.
 pub const INPUT_EV_MOUSE_REL: u64 = 3;
-/// Absolute pointer position. Payload `[31:16]` = x, `[15:0]` = y, both `i16`.
+/// Absolute pointer position. Payload `[31:16]` = x, `[15:0]` = y, both `i16` ([`input_ev_xy`] decodes,
+/// [`input_ev_xy_payload`] encodes).
+///
+/// AETHERPTR (rmbp-ledger B543) — THE CONTRACT: x and y are the SYSTEM pointer's position in the receiving
+/// program's WINDOW pixels — the panel position minus the content origin of that program's frontmost window,
+/// divided by the window's integer upscale (`wm::WindowInfo::{x, y, scale}`), so `(0, 0)` is the surface's
+/// top-left pixel and the unit is the surface pixel the program draws. The value is NOT clamped: a pointer
+/// outside the window reads negative or past `w`/`h`, which is how a drag held past an edge is seen. A
+/// program that owns no window is handed panel pixels (origin 0, scale 1). The system sprite is the ONE
+/// pointer on the glass: a program hit-tests from this position and never draws or estimates its own.
+/// x86 delivers one after every RELATIVE report it hands the focused program (the `INPUT_EV_MOUSE_REL`
+/// first, then this) and for every absolute (tablet) report in place of the device's raw 0..=32767
+/// coordinate. Owed on aarch64: its `pack_input` still forwards the device coordinate unchanged
+/// (`arch/aarch64/syscall.rs`, the `Event::MouseAbsolute` arm) and pushes nothing after a relative report;
+/// no aarch64 program reads this type today.
 pub const INPUT_EV_MOUSE_ABS: u64 = 4;
 /// A pointer button state. Payload `[7:0]` = button bitmask.
 pub const INPUT_EV_BUTTON: u64 = 5;
@@ -446,6 +460,18 @@ pub const fn input_ev_type(ev: u64) -> u64 {
 #[inline]
 pub const fn input_ev_payload(ev: u64) -> u64 {
     ev & 0xFFFF_FFFF
+}
+/// AETHERPTR (B543): the signed `(x, y)` pair of an [`INPUT_EV_MOUSE_ABS`] or [`INPUT_EV_MOUSE_REL`]
+/// payload — `[31:16]` and `[15:0]`, each sign-extended from `i16`.
+#[inline]
+pub const fn input_ev_xy(payload: u64) -> (i32, i32) {
+    ((payload >> 16) as u16 as i16 as i32, payload as u16 as i16 as i32)
+}
+/// AETHERPTR (B543): the payload for the pair `(x, y)`, each narrowed to `i16` — the encode
+/// [`input_ev_xy`] inverts. The x86 producer and the kernel's `tests aether` drive pack through this.
+#[inline]
+pub const fn input_ev_xy_payload(x: i32, y: i32) -> u64 {
+    ((x as i16 as u16 as u64) << 16) | (y as i16 as u16 as u64)
 }
 
 /// Arrow keys ride the otherwise-unused C0 range `0x1C..=0x1F` (the four ASCII "information
@@ -655,6 +681,8 @@ const _: () = assert!(SYS_RENAME > SYS_CPUPULSE && SYS_CPUPULSE > SYS_ACCEPT);
 /// The packed event must never collide with a negative return: type 5 shifted left 48 leaves bit 63
 /// clear with room to spare.
 const _: () = assert!(input_ev_pack(INPUT_EV_BUTTON, 0xFFFF_FFFF) < (1u64 << 63));
+// AETHERPTR (B543): the window-px pair round-trips, negatives included (a pointer left of / above the window).
+const _: () = assert!(input_ev_xy(input_ev_xy_payload(-7, 1439)).0 == -7 && input_ev_xy(input_ev_xy_payload(-7, 1439)).1 == 1439);
 /// The pulse payload's word count and its struct must describe the same bytes.
 const _: () = assert!(PULSE_WORDS * 8 == core::mem::size_of::<UserPulse>());
 /// `UserInfo` is the two-word POD its copy-out seam assumes.
