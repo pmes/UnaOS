@@ -192,6 +192,12 @@ impl<T: Transport + ?Sized> Session<'_, T> {
         }
         f.errno
     }
+
+    /// AETHERNET (LEDGER SR110): the protocol version the handshake negotiated — 0x0304 (TLS 1.3) or 0x0303
+    /// (TLS 1.2, TLSCORE2's relay path) — so a caller's wire can say which (`tls=1.3`). Read-only; additive.
+    pub fn version(&self) -> u16 {
+        self.c.negotiated().version
+    }
 }
 
 impl<T: Transport + ?Sized> Transport for Session<'_, T> {
