@@ -385,3 +385,5 @@ refs/heads/exec-host-deps2                    3cf96e79 IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-rmbp-shelltrust               0b12eb42 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-homepriv                 0b12eb42 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-wifi8                    0b12eb42 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-resolvehang2             cd59927b IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-queuewedge               cd59927b IN-FLIGHT rmbp 2026-10-13
