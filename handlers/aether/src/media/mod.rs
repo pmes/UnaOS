@@ -56,6 +56,25 @@
 //!   playing", as HTML says; other rates scale the clock where Stria can, see `Player::set_rate`).
 //!   Both reach a session that opens later with its opening request.
 //!
+//! AETHERMEDIA2 (LEDGER SR134) added, on the same element model:
+//!
+//! * **Media Source Extensions** ([`mse`], `js/mse.rs`): a `src` that is a MediaSource's object URL
+//!   attaches it; the element's bus key becomes the MediaSource's journal (`mediasource:<path>`),
+//!   Stria plays the appended segments through its `MediaSourceFeed`, and readyState follows the
+//!   model's `buffered` around the current position ([`mse_changed`]) — `waiting` when it drops
+//!   while playing, `ended` from Stria after endOfStream.
+//! * **Text tracks** ([`tracks`], `js/tracks.rs`): `<track>` WebVTT, TextTrack / VTTCue, `cuechange`;
+//!   the showing cues ride [`Paint::captions`] to render/media_overlay.rs.
+//! * **Autoplay**: bare `autoplay` plays once the document has sticky user activation
+//!   ([`note_user_activation`]); without it the element shows the play affordance
+//!   ([`Paint::blocked`]) and script `play()` rejects with NotAllowedError ([`play_allowed`]).
+//! * **preload**: `none` fetches nothing (an http(s) source waits for play), `auto` fetches the whole
+//!   resource and fires `progress` then `suspend` when it is in the cache.
+//! * `requestVideoFrameCallback` reads [`frame_info`] (frames presented, media time, size).
+//! * `canPlayType` answers from [`play_support`]: "probably" for codecs Stria decodes (VP9 since
+//!   VP9CORE SR116, with VP8, AV1, the audio codecs), "maybe" for a codec it would show as the labelled
+//!   stand-in (H.264, HEVC).
+//!
 //! Decoding is never Aether's: every picture and sample comes from Stria, which decodes through
 //! the owned cores (`gneiss_pal::dsp` = `demux_core`, `vp8_core`, `av1_core` behind its `av1`
 //! feature, `audio_core`). The current picture paints from ONE call site,
@@ -148,6 +167,14 @@ pub struct Element {
     pub playing_owed: bool,
     /// Every media event fired at this element, in order (tests, the headless report).
     pub events: Vec<&'static str>,
+    /// AETHERMEDIA2 (SR134): the MediaSource attached through `src` (its [`mse`] id).
+    pub mse: Option<u32>,
+    /// AETHERMEDIA2: autoplay or `play()` refused for want of user activation — the play affordance shows.
+    pub blocked: bool,
+    /// AETHERMEDIA2: pictures presented since load (`requestVideoFrameCallback`'s presentedFrames).
+    pub presented: u64,
+    /// AETHERMEDIA2: `preload=auto` — `progress` + `suspend` when the whole resource is local.
+    pub preload_auto: bool,
 }
 
 /// `readyState` values (HTML §4.8.11.7).
@@ -176,6 +203,18 @@ fn queue_event(node: &NodeRef, ty: &'static str) {
         if let Ok(mut p) = p.try_borrow_mut() {
             if p.doc.as_ref() == Some(&doc) {
                 p.tasks.push_back(crate::js::Task::Event(crate::js::TargetKey::Node(id), ty.to_string(), false));
+            }
+        }
+    });
+}
+
+/// AETHERMEDIA2 (SR134): queue the simple event `ty` at any event target of the page (a node, or a
+/// script-made EventTarget by its serial — MediaSource, SourceBuffer, TextTrack, VTTCue).
+pub(crate) fn queue_target_event(key: crate::js::TargetKey, ty: &str) {
+    let _ = crate::js::PAGE.try_with(|p| {
+        if let Ok(mut p) = p.try_borrow_mut() {
+            if p.doc.is_some() {
+                p.tasks.push_back(crate::js::Task::Event(key, ty.to_string(), false));
             }
         }
     });
@@ -436,11 +475,11 @@ fn settings_requests(out: &mut Vec<SMessage>, e: &Element) {
 
 /// Media types this engine hands to Stria. Containers: what `demux_core` parses (MP4, WebM,
 /// Matroska) and the bare audio files `dsp::audio` decodes (MP3, Ogg, WAV, FLAC, ADTS, AIFF).
-/// Codecs: anything Stria opens — real decoders (`utp1` test pattern, PCM, and since
-/// AUDIOTRACK Opus, Vorbis, AAC-LC, MP3 (`mp3`, `mp4a.6B`, WAV's `1`), FLAC) and the video codecs
-/// it plays with the labelled stand-in until AVCODEC lands (AV1, VP8, VP9, H.264, HEVC). An
-/// unknown codec makes the `<source>` unplayable, so the next one is tried — HTML's
-/// `canPlayType` == "" rule.
+/// Codecs: anything Stria opens — real decoders (`utp1` test pattern, VP8 (vp8_core), VP9
+/// (vp9_core, VP9CORE SR116), AV1 (av1_core), PCM, Opus, Vorbis, AAC-LC, MP3 (`mp3`, `mp4a.6B`,
+/// WAV's `1`), FLAC) and the codecs it plays as the labelled stand-in (H.264, HEVC: no owned
+/// decoder). An unknown codec makes the `<source>` unplayable, so the next one is tried — HTML's
+/// `canPlayType` == "" rule. [`play_support`] tells the two playable kinds apart.
 pub fn can_play_type(mime: &str) -> bool {
     let mut parts = mime.split(';');
     let base = parts.next().unwrap_or("").trim().to_ascii_lowercase();
@@ -466,6 +505,28 @@ pub fn can_play_type(mime: &str) -> bool {
         }
     }
     true
+}
+
+/// AETHERMEDIA2 (SR134): `canPlayType`'s three answers — 0 "" (not playable), 1 "maybe" (no `codecs`
+/// parameter, or a codec Stria would show as the labelled stand-in: `avc1`/`avc3`/`hvc1`/`hev1`),
+/// 2 "probably" (every named codec has a real decoder in Stria).
+pub fn play_support(mime: &str) -> u8 {
+    if !can_play_type(mime) {
+        return 0;
+    }
+    let mut named = false;
+    for p in mime.split(';').skip(1) {
+        let p = p.trim();
+        let Some(v) = p.strip_prefix("codecs=").or_else(|| p.strip_prefix("codecs =")) else { continue };
+        for c in v.trim_matches(|c| c == '"' || c == '\'').split(',') {
+            let c = c.trim().to_ascii_lowercase();
+            named = true;
+            if ["avc1", "avc3", "hvc1", "hev1"].iter().any(|k| c == *k || c.starts_with(&format!("{k}."))) {
+                return 1;
+            }
+        }
+    }
+    if named { 2 } else { 1 }
 }
 
 /// The url a media element plays (HTML resource selection): its own `src`, else the first
@@ -530,6 +591,10 @@ pub fn set_title(title: &str) {
 /// Forget the previous document's media. Every url that had a Stria session gets a
 /// `MediaStop` in the (new) outbox, so navigating away stops playback.
 pub fn reset(title: &str) {
+    // AETHERMEDIA2 (SR134): MediaSources detach (sourceclose), text tracks and activation go with the page
+    mse::reset();
+    tracks::reset();
+    STICKY.with(|s| s.set(false));
     MEDIA.with(|m| {
         let mut r = m.borrow_mut();
         let mut stops: Vec<String> = Vec::new();
@@ -552,11 +617,24 @@ pub fn reset(title: &str) {
 pub fn scan(doc: &NodeRef, base: &str) -> bool {
     let Ok(found) = doc.select("video, audio") else { return false };
     let nodes: Vec<NodeRef> = found.map(|m| m.as_node().clone()).collect();
-    MEDIA.with(|m| {
+    let any = MEDIA.with(|m| {
         let mut r = m.borrow_mut();
         let mut any = false;
         for node in nodes {
             if find(&r, &node).is_some() {
+                continue;
+            }
+            // AETHERMEDIA2 (SR134): a MediaSource object URL attaches the MediaSource (MSE §2.4.1)
+            let raw_src = node.as_element().and_then(|e| e.attributes.borrow().get("src").map(|s| s.trim().to_string()));
+            if let Some(id) = raw_src.as_deref().and_then(mse::by_url) {
+                let Some(url) = mse::attach(id, &node) else { continue };
+                let e = mse_element(node.clone(), url, raw_src.unwrap_or_default(), id);
+                let title = r.title.clone();
+                let mut out = Vec::new();
+                open_requests(&mut out, &e, if e.state == State::Playing { Deferred::Play } else { Deferred::Poster }, &title);
+                r.outbox.extend(out);
+                r.elements.push(e);
+                any = true;
                 continue;
             }
             let Some((src, mime)) = source_for(&node, base) else {
@@ -575,8 +653,15 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
             // AETHERDEBT SR93: media-src and mixed content (passive media autoupgrades) decide the fetch.
             let dest = if node.as_element().is_some_and(|e| e.name.local.as_ref() == "video") { "video" } else { "audio" };
             let Some(src) = crate::security::subresource_url(&src, dest) else { continue };
-            // http(s): Stria plays the cache file; the fetch may still be running
-            let (url, fetching) = if is_remote(&src) { (format!("file://{}", cache_path(&src).display()), ensure_cached(&src)) } else { (src.clone(), false) };
+            // http(s): Stria plays the cache file; the fetch may still be running. AETHERMEDIA2: under
+            // `preload=none` nothing is fetched until play.
+            let preload_none_early = node.as_element().is_some_and(|e| e.attributes.borrow().get("preload").is_some_and(|p| p.trim().eq_ignore_ascii_case("none")));
+            let wants_fetch = !preload_none_early || node.as_element().is_some_and(|e| e.attributes.borrow().get("autoplay").is_some());
+            let (url, fetching) = if is_remote(&src) {
+                (format!("file://{}", cache_path(&src).display()), if wants_fetch { ensure_cached(&src) } else { !cache_path(&src).exists() })
+            } else {
+                (src.clone(), false)
+            };
             let el = node.as_element().unwrap();
             let kind = if el.name.local.as_ref() == "video" { Kind::Video } else { Kind::Audio };
             let attrs = el.attributes.borrow();
@@ -592,11 +677,13 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
             let muted = attrs.get("muted").is_some();
             let controls = attrs.get("controls").is_some();
             let preload_none = attrs.get("preload").is_some_and(|p| p.trim().eq_ignore_ascii_case("none"));
+            let preload_auto = attrs.get("preload").is_some_and(|p| p.trim().eq_ignore_ascii_case("auto"));
             drop(attrs);
-            // Chromium's autoplay policy: muted autoplay always runs; unmuted autoplay waits
-            // for a user gesture (this engine has no media-engagement index, so it never runs).
-            let autoplays = autoplay && muted;
-            if autoplay && !muted {
+            // Chromium's autoplay policy: muted autoplay always runs; unmuted autoplay runs once the
+            // document has sticky user activation (HTML §6.4.1) — AETHERMEDIA2 (SR134); before it, the
+            // element shows the play affordance (no media-engagement index here).
+            let autoplays = autoplay && (muted || has_sticky_activation());
+            if autoplay && !autoplays {
                 crate::ledger::record_dom("media-autoplay-blocked-unmuted");
             }
             // A session per url: a second element on the same stream shares the first's.
@@ -638,6 +725,10 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
                 last_timeupdate_ns: 0,
                 playing_owed: autoplays,
                 events: Vec::new(),
+                mse: None,
+                blocked: autoplay && !autoplays,
+                presented: 0,
+                preload_auto,
             };
             // HTML §4.8.11.5 resource selection: networkState LOADING and `loadstart`; under
             // `preload=none` the fetch suspends at once (`suspend`, networkState IDLE).
@@ -665,6 +756,203 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
             any = true;
         }
         any
+    });
+    // AETHERMEDIA2 (SR134): every media element's `<track>` children
+    if let Ok(found) = doc.select("video, audio") {
+        for m in found {
+            tracks::scan(m.as_node(), base);
+        }
+    }
+    any
+}
+
+/// AETHERMEDIA2 (SR134): the element model of a media element whose `src` attached MediaSource `id`.
+/// Autoplay follows the same policy; `loadstart` fires now, readyState follows the MediaSource.
+fn mse_element(node: NodeRef, url: String, src: String, id: u32) -> Element {
+    let el = node.as_element().unwrap();
+    let kind = if el.name.local.as_ref() == "video" { Kind::Video } else { Kind::Audio };
+    let a = el.attributes.borrow();
+    let autoplay = a.get("autoplay").is_some();
+    let muted = a.get("muted").is_some();
+    let controls = a.get("controls").is_some();
+    drop(a);
+    let autoplays = autoplay && (muted || has_sticky_activation());
+    let mut e = Element {
+        node,
+        kind,
+        url,
+        src,
+        mime: String::new(),
+        poster: None,
+        autoplay,
+        muted,
+        controls,
+        state: if autoplays { State::Playing } else { State::Loading },
+        show_poster: !autoplays,
+        natural: None,
+        duration_ns: 0,
+        pts_ns: 0,
+        frame: None,
+        real_video: false,
+        levels: [0.0; 2],
+        fetching: false,
+        deferred: None,
+        ready_state: HAVE_NOTHING,
+        network_state: NETWORK_LOADING,
+        seeking: false,
+        rate: 1.0,
+        volume: 1.0,
+        error_code: 0,
+        last_timeupdate_ns: 0,
+        playing_owed: autoplays,
+        events: Vec::new(),
+        mse: Some(id),
+        blocked: autoplay && !autoplays,
+        presented: 0,
+        preload_auto: false,
+    };
+    fire(&mut e, "loadstart");
+    if autoplays {
+        fire(&mut e, "play");
+    }
+    e
+}
+
+/// The readyState the attached MediaSource supports at the element's position (MSE §2.4.4): nothing
+/// before every SourceBuffer has an init segment; HAVE_METADATA when the position is not buffered;
+/// HAVE_ENOUGH_DATA when at least a second (or the rest, once ended) is buffered past it;
+/// HAVE_FUTURE_DATA with more than a frame; else HAVE_CURRENT_DATA.
+fn mse_ready(e: &Element) -> u8 {
+    let Some(id) = e.mse else { return e.ready_state };
+    let Some((init, ended, _, ranges)) = mse::element_view(id) else { return HAVE_NOTHING };
+    if !init {
+        return HAVE_NOTHING;
+    }
+    let t = e.pts_ns;
+    let Some(&(_, end)) = ranges.iter().find(|&&(a, b)| a <= t && t < b) else {
+        return if ended && ranges.last().is_some_and(|r| t >= r.1) { HAVE_ENOUGH_DATA } else { HAVE_METADATA };
+    };
+    if ended && ranges.last().is_some_and(|r| r.1 == end) {
+        return HAVE_ENOUGH_DATA;
+    }
+    match end - t {
+        d if d >= 1_000_000_000 => HAVE_ENOUGH_DATA,
+        d if d > 40_000_000 => HAVE_FUTURE_DATA,
+        _ => HAVE_CURRENT_DATA,
+    }
+}
+
+/// Set an MSE element's readyState to what its MediaSource supports: rising fires HTML's events
+/// ([`advance_ready`]); falling below HAVE_FUTURE_DATA while playing fires `waiting` (HTML §4.8.11.7).
+fn apply_mse_ready(e: &mut Element) {
+    let to = mse_ready(e);
+    if to >= e.ready_state {
+        advance_ready(e, to);
+    } else {
+        let was = e.ready_state;
+        e.ready_state = to;
+        if was >= HAVE_FUTURE_DATA && to < HAVE_FUTURE_DATA && e.state == State::Playing {
+            e.playing_owed = true;
+            fire(e, "waiting");
+        }
+    }
+}
+
+/// AETHERMEDIA2 (SR134): the MediaSource attached to `node` changed (an append, a remove, duration,
+/// endOfStream): duration and readyState follow; `durationchange` when `duration_event` and the
+/// duration moved after metadata.
+pub(crate) fn mse_changed(node: &NodeRef, duration_event: bool) {
+    MEDIA.with(|m| {
+        let mut r = m.borrow_mut();
+        let Some(i) = find(&r, node) else { return };
+        let e = &mut r.elements[i];
+        let Some(id) = e.mse else { return };
+        let Some((_, ended, dur, _)) = mse::element_view(id) else { return };
+        let d = match dur {
+            Some(d) if d != i64::MAX && d > 0 => d as u64,
+            _ => 0,
+        };
+        if d != e.duration_ns {
+            e.duration_ns = d;
+            if duration_event && e.ready_state >= HAVE_METADATA {
+                fire(e, "durationchange");
+            }
+        }
+        if ended {
+            e.network_state = NETWORK_IDLE;
+        }
+        apply_mse_ready(e);
+    });
+}
+
+/// AETHERMEDIA2 (SR134): endOfStream("decode"/"network") or an append error: before metadata the
+/// element's source is not supported (4), after it a decode error (3) — MSE §2.4.7 step 3.
+pub(crate) fn mse_decode_error(node: &NodeRef) {
+    MEDIA.with(|m| {
+        let mut r = m.borrow_mut();
+        let Some(i) = find(&r, node) else { return };
+        let e = &mut r.elements[i];
+        e.error_code = if e.ready_state == HAVE_NOTHING { 4 } else { 3 };
+        e.state = State::Error("MediaSource: decode error".into());
+        e.playing_owed = false;
+        fire(e, "error");
+    });
+}
+
+/// `duration` of an MSE element in seconds (NaN / +Infinity), None for any other element.
+pub fn mse_duration(node: &NodeRef) -> Option<f64> {
+    let id = with_element(node, |e| e.mse).flatten()?;
+    Some(mse::duration(id))
+}
+
+/// HTMLMediaElement `buffered` as (start, end) ns: the MediaSource's for an MSE element; for a
+/// file Stria opened (the whole local file), [0, duration) once metadata is known.
+pub fn buffered(node: &NodeRef) -> Vec<(i64, i64)> {
+    match with_element(node, |e| (e.mse, e.ready_state, e.duration_ns)) {
+        Some((Some(id), _, _)) => mse::buffered(id),
+        Some((None, rs, d)) if rs >= HAVE_METADATA && d > 0 => vec![(0, d as i64)],
+        _ => Vec::new(),
+    }
+}
+
+thread_local! {
+    /// HTML §6.4.1 sticky activation of the page's document.
+    static STICKY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// AETHERMEDIA2 (SR134): a user activation happened on the page (HTML §6.4.1 "activation triggering
+/// input event": a trusted click, key or touch). The document keeps sticky activation; blocked
+/// `autoplay` elements may play from now on.
+pub fn note_user_activation() {
+    STICKY.with(|s| s.set(true));
+}
+
+/// The document has sticky activation.
+pub fn has_sticky_activation() -> bool {
+    STICKY.with(|s| s.get())
+}
+
+/// Chromium's autoplay policy for `play()` (and `autoplay`): muted media always, audible media once
+/// the document has sticky activation. False marks the element blocked (the play affordance).
+pub fn play_allowed(node: &NodeRef, muted: bool) -> bool {
+    if muted || has_sticky_activation() {
+        return true;
+    }
+    MEDIA.with(|m| {
+        let mut r = m.borrow_mut();
+        if let Some(i) = find(&r, node) {
+            r.elements[i].blocked = true;
+        }
+    });
+    crate::ledger::record_dom("media-play-not-allowed");
+    false
+}
+
+/// What `requestVideoFrameCallback` reports: (presentedFrames, mediaTime s, width, height).
+pub fn frame_info(node: &NodeRef) -> Option<(u64, f64, u32, u32)> {
+    with_element(node, |e| {
+        let (w, h) = e.natural.unwrap_or((0, 0));
+        (e.presented, e.pts_ns.max(0) as f64 / 1e9, w, h)
     })
 }
 
@@ -721,7 +1009,13 @@ pub fn on_message(msg: &SMessage) -> Effect {
                     }
                     // an audio-only stream has no picture to wait for: the local file is whole
                     let to = if nat.is_none() { HAVE_ENOUGH_DATA } else { HAVE_METADATA };
-                    advance_ready(e, to);
+                    if e.mse.is_some() {
+                        // AETHERMEDIA2: the MediaSource decides readiness and duration
+                        apply_mse_ready(e);
+                    } else {
+                        advance_ready(e, to);
+                        preload_whole(e);
+                    }
                 }
                 SMessage::MediaFrame { pts_ns, width: 0, levels, .. } => {
                     // an audio-only session's meter frame: the newest window's peaks, and the
@@ -733,7 +1027,12 @@ pub fn on_message(msg: &SMessage) -> Effect {
                     if e.state == State::Loading {
                         e.state = State::Paused;
                     }
-                    advance_ready(e, HAVE_ENOUGH_DATA);
+                    if e.mse.is_some() {
+                        apply_mse_ready(e);
+                    } else {
+                        advance_ready(e, HAVE_ENOUGH_DATA);
+                        preload_whole(e);
+                    }
                     time_moved(e);
                 }
                 SMessage::MediaFrame { pts_ns, levels, .. } => {
@@ -747,10 +1046,16 @@ pub fn on_message(msg: &SMessage) -> Effect {
                     }
                     e.frame = Some(f);
                     e.pts_ns = *pts_ns;
+                    e.presented += 1;
                     if e.state == State::Loading {
                         e.state = State::Paused;
                     }
-                    advance_ready(e, HAVE_ENOUGH_DATA);
+                    if e.mse.is_some() {
+                        apply_mse_ready(e);
+                    } else {
+                        advance_ready(e, HAVE_ENOUGH_DATA);
+                        preload_whole(e);
+                    }
                     time_moved(e);
                 }
                 SMessage::MediaEnded { .. } => {
@@ -802,9 +1107,21 @@ pub fn on_message(msg: &SMessage) -> Effect {
     })
 }
 
+/// AETHERMEDIA2 (SR134): `preload=auto` — the whole resource is local (Stria opened the file, or the
+/// cache fetch finished): `progress`, then the fetch suspends (`suspend`, networkState IDLE), once.
+fn preload_whole(e: &mut Element) {
+    if e.preload_auto && e.ready_state >= HAVE_ENOUGH_DATA && !e.events.contains(&"progress") {
+        fire(e, "progress");
+        e.network_state = NETWORK_IDLE;
+        fire(e, "suspend");
+    }
+}
+
 /// The picture or meter moved the clock: a pending seek lands (`timeupdate`, `seeked`), and
 /// during playback `timeupdate` fires every [`TIMEUPDATE_NS`] of media time.
 fn time_moved(e: &mut Element) {
+    // AETHERMEDIA2 (SR134): text tracks' "time marches on" (cuechange / enter / exit)
+    tracks::time_marches_on(&e.node, e.pts_ns);
     if e.seeking {
         e.seeking = false;
         e.last_timeupdate_ns = e.pts_ns;
@@ -842,8 +1159,14 @@ pub fn play(node: &NodeRef) -> bool {
             return false;
         }
         if r.elements[i].fetching {
-            // released (as PlayMedia) when the cache file is whole
+            // released (as PlayMedia) when the cache file is whole; AETHERMEDIA2: a `preload=none`
+            // http(s) source starts its fetch now
+            let src = r.elements[i].src.clone();
+            if is_remote(&src) {
+                ensure_cached(&src);
+            }
             let e = &mut r.elements[i];
+            e.blocked = false;
             e.deferred = Some(Deferred::Play);
             e.state = State::Playing;
             e.show_poster = false;
@@ -861,6 +1184,7 @@ pub fn play(node: &NodeRef) -> bool {
             r.outbox.extend(out);
         }
         let e = &mut r.elements[i];
+        e.blocked = false;
         if state == State::Ended {
             // HTML play(): an ended element seeks to the start first
             e.pts_ns = 0;
@@ -903,6 +1227,8 @@ pub fn pause(node: &NodeRef) -> bool {
 /// A click on (or inside) a media element: play when not playing, else pause.
 pub fn toggle(node: &NodeRef) -> bool {
     let Some(el) = element_at(node) else { return false };
+    // AETHERMEDIA2 (SR134): the user's click on the element is an activation
+    note_user_activation();
     let playing = MEDIA.with(|m| {
         let r = m.borrow();
         find(&r, &el).map(|i| r.elements[i].state == State::Playing)
@@ -1057,6 +1383,11 @@ pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
         e.pts_ns = (if dur > 0 { position_ns.min(dur) } else { position_ns }) as i64;
         e.seeking = true;
         fire(e, "seeking");
+        if e.mse.is_some() {
+            // AETHERMEDIA2: an unbuffered target drops readyState (`waiting` while playing)
+            apply_mse_ready(e);
+        }
+        tracks::time_marches_on(&e.node, e.pts_ns);
         true
     })
 }
@@ -1065,6 +1396,7 @@ pub fn seek(node: &NodeRef, position_ns: u64) -> bool {
 /// has finished fetching (their held-back opening request, or a `MediaError` for the key when
 /// the fetch failed: it comes back over the bus and paints in the box).
 pub fn take_outbox() -> Vec<SMessage> {
+    tracks::poll(); // AETHERMEDIA2 (SR134): http(s) WebVTT that finished fetching
     // FETCHED is process-wide while the elements are this thread's page: take only the results this
     // page is waiting for, so another engine (another test thread) draining its own outbox cannot
     // swallow them (the AETHERFONT join found that race in the parallel test run).
@@ -1163,6 +1495,10 @@ pub struct Paint {
     pub duration_ns: u64,
     /// The latest audio meter (peak L/R).
     pub levels: [f32; 2],
+    /// AETHERMEDIA2 (SR134): the showing text tracks' active cues (the UA caption box's lines).
+    pub captions: Vec<String>,
+    /// AETHERMEDIA2: autoplay / `play()` was refused for want of activation — paint the play affordance.
+    pub blocked: bool,
 }
 
 /// The renderer's question for a `<video>`/`<audio>` node.
@@ -1187,6 +1523,8 @@ pub fn paint_for(node: &NodeRef) -> Option<Paint> {
             pts_ns: 0,
             duration_ns: 0,
             levels: [0.0; 2],
+            captions: Vec::new(),
+            blocked: false,
         });
     };
     let poster = if e.show_poster { e.poster.as_deref().and_then(crate::images::get) } else { None };
@@ -1202,6 +1540,8 @@ pub fn paint_for(node: &NodeRef) -> Option<Paint> {
         pts_ns: e.pts_ns,
         duration_ns: e.duration_ns,
         levels: e.levels,
+        captions: if e.kind == Kind::Video { tracks::captions(&e.node) } else { Vec::new() },
+        blocked: e.blocked && e.state != State::Playing,
     })
 }
 
@@ -1277,6 +1617,9 @@ pub fn clock_text(ns: i64) -> String {
     let s = (ns.max(0) / 1_000_000_000) as u64;
     format!("{}:{:02}", s / 60, s % 60)
 }
+
+pub mod mse;
+pub mod tracks;
 
 #[cfg(test)]
 mod tests;

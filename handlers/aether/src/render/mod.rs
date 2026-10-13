@@ -214,6 +214,8 @@ mod glyphcache;
 // AETHERA11Y (SR119): the keyboard focus ring, painted last from the accessibility theme.
 pub mod focusring;
 pub(crate) mod effects;
+// AETHERMEDIA2 (SR134): the caption box and the blocked-autoplay play affordance over a <video>.
+mod media_overlay;
 
 fn in_clip(x: u32, y: u32, clip: Clip) -> bool {
     let (x0, y0, x1, y1) = clip;
@@ -1392,6 +1394,7 @@ fn paint_media(
         }
     }
 
+    media_overlay::paint(media, content, font, surface, width, height, damage_rects, clip); // AETHERMEDIA2 (SR134)
     if media.controls && media.kind == crate::media::Kind::Audio {
         paint_audio_controls(media, content, font, surface, width, height, damage_rects, clip);
     } else if media.controls {

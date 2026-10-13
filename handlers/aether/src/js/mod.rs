@@ -62,12 +62,16 @@ pub mod importmap;
 pub mod loader;
 pub mod locks;
 pub mod mutation;
+/// AETHERMEDIA2 (SR134): Media Source Extensions.
+pub mod mse;
 pub mod ports;
 pub mod range;
 pub mod reflect;
 mod reflect_table;
 pub mod shadow;
 pub mod sw;
+/// AETHERMEDIA2 (SR134): text tracks, requestVideoFrameCallback, PiP / captureStream refusals.
+pub mod tracks;
 pub mod traversal;
 pub mod net;
 pub mod window;
@@ -808,6 +812,9 @@ impl Engine {
         locks::install(&mut vm);
         sw::install(&mut vm);
         animations::install(&mut vm);
+        // AETHERMEDIA2 (SR134): after window (URL, the element interfaces) — MSE, then text tracks.
+        mse::install(&mut vm);
+        tracks::install(&mut vm);
         Engine { vm }
     }
 
