@@ -32,6 +32,103 @@ struct Wall {
     w: usize,
     h: usize,
     px: Vec<u32>,
+    /// DESKTOPCRAFT (B631): the VEIL — the picture box-averaged over 8 x 8 cells and blurred once
+    /// (`wm::desktop::veil_gen`); every translucent strip samples it instead of re-blurring per frame.
+    veil: Vec<u32>,
+    vw: usize,
+    vh: usize,
+}
+
+/// DESKTOPCRAFT (B631): the READ-ONLY snapshot the furniture painters sample (the window frame band, the menu bar,
+/// the dock's plate). They paint masked and possibly on several staging cores at once, so they never take `WALL`'s
+/// lock (a contended `try_lock` would flash the flat colour for a pass): they load this pointer. It names the
+/// buffers of the `Wall` installed in `WALL`; when a new picture is installed the old `Wall` moves to `RETIRED` and
+/// is freed only by the install AFTER that one, so a painter that loaded the old pointer finishes on live memory
+/// (a paint pass is milliseconds; two installs are a decode or a generation apart). The `Snap` itself is a small
+/// leaked box per install.
+struct Snap {
+    px: *const u32,
+    len: usize,
+    w: usize,
+    h: usize,
+    veil: *const u32,
+    vlen: usize,
+    vw: usize,
+    vh: usize,
+}
+static SNAP: core::sync::atomic::AtomicPtr<Snap> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static RETIRED: crate::sync::Mutex<Option<Wall>> = crate::sync::Mutex::new(None);
+/// The installed picture is the generated default (not a file): a found `WALL.PNG` replaces it.
+static PROCEDURAL: AtomicBool = AtomicBool::new(false);
+
+/// Make `new` the backdrop (or none): publish its snapshot, then retire the old picture (see [`Snap`]).
+fn install(new: Option<Wall>) {
+    let snap = match new.as_ref() {
+        Some(w) => alloc::boxed::Box::into_raw(alloc::boxed::Box::new(Snap {
+            px: w.px.as_ptr(),
+            len: w.px.len(),
+            w: w.w,
+            h: w.h,
+            veil: w.veil.as_ptr(),
+            vlen: w.veil.len(),
+            vw: w.vw,
+            vh: w.vh,
+        })),
+        None => core::ptr::null_mut(),
+    };
+    let old = {
+        let mut g = WALL.lock();
+        SNAP.store(snap, Ordering::Release);
+        core::mem::replace(&mut *g, new)
+    };
+    *RETIRED.lock() = old;
+}
+
+/// DESKTOPCRAFT (B631): the installed picture and its VEIL for the furniture painters (`None` = the flat colour).
+pub fn back() -> Option<crate::video::wm::desktop::Back<'static>> {
+    let p = SNAP.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: a published `Snap` is never freed, and the buffers it names stay allocated until the second install
+    // after it (see [`Snap`]); every painter's use of them ends inside its pass.
+    let s = unsafe { &*p };
+    if s.len < s.w * s.h || s.vlen < s.vw * s.vh {
+        return None;
+    }
+    let (px, veil) = unsafe { (core::slice::from_raw_parts(s.px, s.len), core::slice::from_raw_parts(s.veil, s.vlen)) };
+    Some(crate::video::wm::desktop::Back { px, w: s.w, h: s.h, veil, vw: s.vw, vh: s.vh })
+}
+
+/// DESKTOPCRAFT (B631): **the default wallpaper**, generated at the panel's size (`wm::desktop::wall_gen`: the
+/// two-tone diagonal and the accent's soft disc, dithered) when no picture file was found. Off the paint path (the
+/// default probe's worker on x86). Witness: `:: WALLPAPER: src=procedural WxH=<w>x<h> scaled=<w>x<h> letterbox=0 ms=<n> -> PASS ::`.
+fn generate() -> bool {
+    let t0 = crate::arch::ms();
+    let Some(pi) = crate::video::panel_info_nonblocking() else { return false };
+    let (pw, ph) = (pi.width, pi.height);
+    if pw == 0 || ph == 0 {
+        return false;
+    }
+    let mut buf: Vec<u32> = Vec::new();
+    if buf.try_reserve_exact(pw * ph).is_err() {
+        return false;
+    }
+    buf.resize(pw * ph, DESKTOP_BG);
+    crate::video::wm::desktop::wall_gen(&mut buf, pw, ph);
+    let Some((veil, vw, vh)) = crate::video::wm::desktop::veil_gen(&buf, pw, ph) else { return false };
+    if OFF.load(Ordering::Relaxed) || (active() && !PROCEDURAL.load(Ordering::Relaxed)) {
+        return false; // `wallpaper off`, or a picture file, arrived while this ran
+    }
+    install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh }));
+    PROCEDURAL.store(true, Ordering::Relaxed);
+    STALE.store(true, Ordering::Release);
+    crate::video::wm::desktop_repaint();
+    crate::census_println!(
+        ":: WALLPAPER: src=procedural WxH={}x{} scaled={}x{} letterbox=0 ms={} -> PASS ::",
+        pw, ph, pw, ph, crate::arch::ms().saturating_sub(t0)
+    );
+    true
 }
 
 static WALL: crate::sync::Mutex<Option<Wall>> = crate::sync::Mutex::new(None);
@@ -145,7 +242,7 @@ fn probe(cpu: Option<usize>) {
     // An empty namespace COUNTS as a try (a QEMU boot with no disk must still reach the `src=none`
     // witness after MAX_TRIES * RETRY_MS); painting is what `desktop_scene_owns_backdrop` gates, not probing.
     let n = TRIES.fetch_add(1, Ordering::Relaxed) + 1;
-    let found = !crate::shell::vfs_mount_table().prefixes().is_empty() && load_default();
+    let found = !crate::shell::vfs_mount_table().prefixes().is_empty() && load_default(); let found_or_made = found || (!active() && !OFF.load(Ordering::Relaxed) && generate()); let _ = found_or_made; // DESKTOPCRAFT (B631): no picture file -> the generated default, on this same try (the worker on x86); a file found on a later try replaces it
     match cpu {
         Some(c) => serial_println!("[wallpaper] probe try={} found={} on=worker cpu={} ms={}", n, found as u8, c, crate::arch::ms().saturating_sub(t0)),
         None => serial_println!("[wallpaper] probe try={} found={} on=inline ms={}", n, found as u8, crate::arch::ms().saturating_sub(t0)),
@@ -212,7 +309,9 @@ pub fn load(path: &str) -> Result<(), String> {
         buf[d..d + sw].copy_from_slice(&px[y * sw..(y + 1) * sw]);
     }
     let letterbox = (sw != pw || sh != ph) as u32;
-    *WALL.lock() = Some(Wall { w: pw, h: ph, px: buf });
+    let (veil, vw, vh) = crate::video::wm::desktop::veil_gen(&buf, pw, ph).unwrap_or((Vec::new(), 0, 0)); // DESKTOPCRAFT (B631): the VEIL, once per picture
+    install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh }));
+    PROCEDURAL.store(false, Ordering::Relaxed);
     OFF.store(false, Ordering::Relaxed);
     repaint();
     crate::census_println!(
@@ -225,7 +324,8 @@ pub fn load(path: &str) -> Result<(), String> {
 /// Restore the flat colour.
 pub fn off() {
     OFF.store(true, Ordering::Relaxed);
-    *WALL.lock() = None;
+    install(None);
+    PROCEDURAL.store(false, Ordering::Relaxed);
     repaint();
     witness_none();
 }

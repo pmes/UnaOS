@@ -824,7 +824,7 @@ fn signature(e: &[wm::DockEntry], l: &Layout, pressed: u32) -> u64 {
 ///
 /// The quiet path is one `wm::dock_scan`, one hash and a compare. See the module header.
 pub fn compose() -> bool {
-    if super::look::is_softy() { return vacate_off() | super::softy::taskbar::compose(); } let t0 = crate::arch::now_cycles(); // SOFTY (B629): the taskbar paints in the dock's place (the dock's own pixels vacated once); LINE-NEUTRAL fold, code first
+    if super::look::is_softy() { return vacate_off() | super::softy::taskbar::compose(); } let t0 = crate::arch::now_cycles(); wm::desktop::hover_track(); // DESKTOPCRAFT (B631): the Una disc group's hover, once per pass (Softy's twin is the taskbar's). SOFTY (B629): the taskbar paints in the dock's place (the dock's own pixels vacated once); LINE-NEUTRAL fold, code first
     let mut rows = ModelBuf::take();
     // Ask `wm` for the tile model AND the damage question in ONE table scan: "were any of the
     // windows that intersect the strip I last painted damaged in the pass that just ran?"
@@ -856,7 +856,7 @@ pub fn compose() -> bool {
         None => 0,
     };
     let sig = match mnu { Some(g) => strip::fnv1a_u64(strip::fnv1a_u64(sig, g.mx as u64 + 1), (g.hover as u64) << 8 | g.keep as u64), None => sig };
-    let sig = if sig == 0 { 0 } else { strip::seal(strip::fnv1a_u64(sig, dock2_sig())) }; // DOCK2: Trash state, launch pulse phase
+    let sig = if sig == 0 { 0 } else { strip::seal(strip::fnv1a_u64(sig, dock2_sig() ^ craft_hover(layout.as_ref(), pw, ph))) }; // DESKTOPCRAFT (B631): the hovered tile is part of what was painted. DOCK2: Trash state, launch pulse phase
     let painted_sig = SLOT.sig();
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
 
@@ -949,7 +949,7 @@ fn paint(l: &Layout, rows: &[wm::DockEntry], pressed: u32, mnu: Option<MenuGeo>)
 /// flat spans first and the two `STRIP_R`-wide end bands are patched per-pixel, and only on the
 /// `2*STRIP_R` rows that have a corner in them at all. Same pixels, same shape; the shape test runs
 /// `4 * (2*STRIP_R)^2` times per repaint instead of `5 * w * h`.
-fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32, j: usize) {
+fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32, j: usize) { if craft_row(out, l, rows, pressed, j) { return; } // DESKTOPCRAFT (B631): the Una plate and tiles (`craft_row`, this file's tail); LINE-NEUTRAL fold, code first
     // The strip's material is anchored to the STRIP, not to the panel: index ceramic by the row's
     // offset inside the box, exactly as the window chrome indexes it by the row's offset inside the
     // window. The grain then belongs to the object.
@@ -4999,4 +4999,64 @@ fn line_direct(line: &str) -> Option<bool> {
     };
     serial_println!("[dock] line launch line={} -> {}", l, how);
     Some(true)
+}
+
+// ── DESKTOPCRAFT (rmbp-ledger B631) — the dock's Una paint ────────────────────────────────────────────────────────
+// Paint only: the layout, the tile boxes, the menu band and every router are untouched. The row composer above
+// hands each row here first; the plate (the face at 72 % over the VEIL, rounded, a hairline round it), the tiles
+// (rounded squares at the kit's icon radius, a 4 % ink tint under the pointer, the pressed face) and the 2 px
+// running dot are `wm::desktop`'s, the app icon and the caption are this file's as before, and `dock2_overlay`
+// (the separator, thumbnails, Peter's Trash stick figure) runs last exactly as it did. No magnification.
+
+/// The tile under the pointer + 1 (`0` = none), latched by [`craft_hover`] for [`craft_row`].
+static CRAFT_HOVER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The pointer's tile, latched; returned folded into the strip's signature so a hover change repaints it.
+fn craft_hover(l: Option<&Layout>, pw: usize, ph: usize) -> u64 {
+    let Some(l) = l else {
+        CRAFT_HOVER.store(0, Ordering::Relaxed);
+        return 0;
+    };
+    let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
+    let (cx, cy) = (cx.max(0) as usize, cy.max(0) as usize);
+    let hot = (0..l.n).find(|&t| matches!(l.tile(t), Some((tx, ty, tw, th)) if cx >= tx && cx < tx + tw && cy >= ty && cy < ty + th)).map_or(0, |t| t + 1);
+    CRAFT_HOVER.store(hot, Ordering::Relaxed);
+    (hot as u64) << 48
+}
+
+/// A live window's row (the pins carry sentinel ids at the top of the id space): it gets the running dot.
+fn craft_running(id: wm::WinId) -> bool {
+    id != wm::WIN_NONE && id < wm::WinId::MAX - 15
+}
+
+/// **Row `j` of the strip in the Una look.** `false` = not taken (the stock row paints).
+fn craft_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32, j: usize) -> bool {
+    if l.w == 0 || out.len() < l.w {
+        return false;
+    }
+    wm::desktop::dock_field_row(out, l.x, l.y, l.w, l.h, j);
+    let hot = CRAFT_HOVER.load(Ordering::Relaxed);
+    for (t, r) in rows.iter().enumerate().take(l.n) {
+        let Some((tx, ty, tw, th)) = l.tile(t) else { continue };
+        let (bx, by) = (tx - l.x, ty - l.y);
+        let lit = r.id == pressed || dnd_app_lit(r.id);
+        wm::desktop::dock_tile_row(out, l.w, j, bx, by, tw, th, PAD(), hot == t + 1, lit, craft_running(r.id));
+        if j < by || j >= by + th {
+            continue;
+        }
+        if crate::fs::appres::dock_icon_row(out, l.w, r.id, &r.title[..r.title_len.min(r.title.len())], bx, by, tw, th, j) {
+            continue;
+        }
+        let ty0 = by + (th - CELL_H()) / 2;
+        if j < ty0 || j >= ty0 + CELL_H() {
+            continue;
+        }
+        let ink = if r.focused { theme::title_text_active() } else { theme::title_text_inactive() };
+        let mut ob = [0u8; 8];
+        let (cap, cap_len) = if l.is_overflow(t) { let k = overflow_label(l.overflow, &mut ob); (&ob[..], k) } else { (&r.title[..], r.title_len) };
+        let cols = super::text::fit(&cap[..l.glyphs.min(cap_len)], false, FACE, l.glyphs * FACE.cell_w());
+        super::text::draw_row(out, l.w, &cap[..cols], bx + PAD(), j - ty0, ink, false, FACE);
+    }
+    dock2_overlay(out, l, rows, j);
+    true
 }

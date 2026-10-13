@@ -354,14 +354,14 @@ fn button(px: &mut [u32], pw: usize, ph: usize, clip: usize, r: (usize, usize, u
 fn paint_card(i: usize, n: &Note) {
     let px = surf(i);
     let (pw, ph) = (metrics::size(W), metrics::size(H));
-    frame(px, pw, W, H);
-    icon(px, pw, ph, 12, (H - ICON) / 2, ICON, n.app());
+    craft_card(px, pw, ph); // DESKTOPCRAFT (B631): a rounded, shadowed card over the wallpaper's VEIL (was `frame`: a flat face in a 1 px box)
+    craft_icon(px, pw, ph, n.app()); // DESKTOPCRAFT (B631): the app's icon, or a rounded accent tile where the registrar has none
     let face = super::text::Face::Ui;
     let clip = if n.has_button() { btn_rect().0 - 6 } else { W - 8 };
     let _ = metrics::text(px, pw, ph, clip, 62, 10, n.title(), theme::content_text(), true, face);
     let _ = metrics::text(px, pw, ph, clip, 62, 34, n.line(), theme::title_text_active(), false, face);
     if n.has_button() {
-        button(px, pw, ph, W - 4, btn_rect(), n.label());
+        craft_button(px, pw, ph, btn_rect(), n.label()); // DESKTOPCRAFT (B631): the kit's push button (rounded, hairline edge)
     }
 }
 
@@ -1160,4 +1160,74 @@ pub fn expire_now() {
     if let Some(t) = due {
         pass(t.max(crate::arch::ms()));
     }
+}
+
+// ── DESKTOPCRAFT (rmbp-ledger B631) — the toast card's paint ─────────────────────────────────────────────────────
+// The card is a chromeless overlay row (`wm::overlay_open`) of `W` x `H`, so its rounded corners and its shadow are
+// drawn INSIDE that surface: a `CARD_MARGIN` band of the wallpaper's VEIL (sampled where slot 0 sits, the slot every
+// card is painted for) under the card's soft shadow, then the card body — `group_fill`, `CARD_RADIUS` corners, a
+// hairline edge. Geometry, the press router and the stack are unchanged; the Center keeps its own `frame`.
+
+/// The band around the card body that holds its shadow (logical px).
+const CARD_MARGIN: usize = 4;
+/// The card body's corner radius (logical px; DESIGN-LANGUAGE `radius.card` + 2, held to the body's half height).
+const CARD_RADIUS: usize = 12;
+
+fn craft_card(px: &mut [u32], pw: usize, ph: usize) {
+    use super::draw::{self, Ink, Rect, Surf};
+    let ph = ph.min(px.len() / pw.max(1));
+    let (cx, cy) = match crate::video::panel_info_nonblocking() {
+        Some(i) => {
+            let r = card_rect(i.width, 0);
+            (r.0, r.1)
+        }
+        None => (0, 0),
+    };
+    let back = super::wm::desktop::live_back();
+    for y in 0..ph {
+        let row = &mut px[y * pw..(y + 1) * pw];
+        match back.as_ref() {
+            Some(b) => b.soft(row, cx, cy + y),
+            None => row.fill(theme::DESKTOP_BG),
+        }
+    }
+    let m = metrics::size(CARD_MARGIN) as i32;
+    let body = Rect::new(m, m, pw as i32 - 2 * m, ph as i32 - 2 * m);
+    let rad = (metrics::size(CARD_RADIUS) as i32).min(body.h / 2);
+    let mut s = Surf::new(&mut px[..pw * ph], pw);
+    let drop = metrics::size(1) as i32;
+    draw::shadow_rrect(&mut s, body.offset(0, drop), rad, (m - drop).max(1), theme::shadow_soft());
+    draw::fill_rrect(&mut s, body, rad, theme::group_fill());
+    draw::stroke_rrect(&mut s, body, rad, 1, Ink::argb(theme::hairline()));
+}
+
+fn craft_icon(px: &mut [u32], pw: usize, ph: usize, app: &[u8]) {
+    use super::draw::{self, Rect, Surf};
+    let key = if app.is_empty() { "generic" } else { s(app) };
+    let (x, y, size) = (metrics::size(12), metrics::size((H - ICON) / 2), metrics::size(ICON));
+    if crate::fs::appres::blit_key_icon(px, pw, ph, x, y, size, key) {
+        return;
+    }
+    let ph = ph.min(px.len() / pw.max(1));
+    let mut sf = Surf::new(&mut px[..pw * ph], pw);
+    draw::fill_rrect(&mut sf, Rect::new(x as i32, y as i32, size as i32, size as i32), draw::icon_radius(size) as i32, theme::accent());
+}
+
+fn craft_button(px: &mut [u32], pw: usize, ph: usize, r: (usize, usize, usize, usize), t: &[u8]) {
+    use super::draw::{self, Ink, Rect, Surf};
+    let face = super::text::Face::Ui;
+    {
+        let ph = ph.min(px.len() / pw.max(1));
+        let mut sf = Surf::new(&mut px[..pw * ph], pw);
+        let (x0, y0) = (metrics::edge(r.0) as i32, metrics::edge(r.1) as i32);
+        let b = Rect::new(x0, y0, metrics::edge(r.0 + r.2) as i32 - x0, metrics::edge(r.1 + r.3) as i32 - y0);
+        let rad = (metrics::size(draw::DIMS.button_radius) as i32).min(b.h / 2);
+        draw::shadow_rrect(&mut sf, b.offset(0, metrics::size(draw::DIMS.button_drop) as i32), rad, metrics::size(draw::DIMS.button_blur) as i32, theme::shadow_soft());
+        draw::fill_rrect(&mut sf, b, rad, theme::knob_face());
+        draw::stroke_rrect(&mut sf, b, rad, 1, Ink::argb(theme::control_edge()));
+    }
+    let tw = metrics::ladvance(t, false, face);
+    let tx = r.0 + r.2.saturating_sub(tw) / 2;
+    let ty = r.1 + r.3.saturating_sub(metrics::lcell_h(face)) / 2;
+    let _ = metrics::text(px, pw, ph, r.0 + r.2, tx, ty, t, theme::content_text(), false, face);
 }

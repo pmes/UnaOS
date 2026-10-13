@@ -429,7 +429,7 @@ fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
     super::super::metrics::fill(px, super::super::metrics::size(W), x, y, w, h, c);
 }
 
-fn rect(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
+#[allow(dead_code)] fn rect(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
     fill(px, x, y, w, 1, c);
     fill(px, x, y + h - 1, w, 1, c);
     fill(px, x, y, 1, h, c);
@@ -442,8 +442,7 @@ fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
 }
 
 fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: bool, secret: bool) {
-    fill(px, x, y, w, CELL + 8, theme::content_fill());
-    rect(px, x, y, w, CELL + 8, if focused { theme::accent() } else { theme::frame_line() });
+    craft_box(px, x, y, w, CELL + 8, Craft::Field, focused); // DESKTOPCRAFT (B631): the kit's text field — rounded, a control-edge hairline, the accent ring outside when focused (was a flat box in a 1 px frame)
     let n = content.len().min(FIELD_MAX);
     if secret {
         let dots = [b'*'; FIELD_MAX];
@@ -463,8 +462,7 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
 /// password has no reason to know it is the only way in.
 fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
     let (x, y, w, h) = ctl_rect(c, setpw);
-    fill(px, x, y, w, h, if primary { theme::accent() } else { theme::button_face() });
-    rect(px, x, y, w, h, theme::frame_line());
+    craft_box(px, x, y, w, h, if primary { Craft::Primary } else { Craft::Button }, false); // DESKTOPCRAFT (B631): the kit's push button (rounded, soft shadow, hairline)
     let tw = super::super::metrics::ladvance(label, false, FACE); // KERNELFONT: the shaped width. LOGINFONT
     let tx = x + w.saturating_sub(tw) / 2;
     let ty = y + h.saturating_sub(CELL) / 2;
@@ -478,8 +476,7 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
 /// wire line for a press on one says `user-row` and an INDEX, never the name.
 fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     let (x, y, w, h) = ctl_rect(Ctl::User(i), false);
-    fill(px, x, y, w, h, if picked { theme::accent() } else { theme::content_fill() });
-    rect(px, x, y, w, h, if picked { theme::accent() } else { theme::frame_line() });
+    craft_box(px, x, y, w, h, if picked { Craft::Picked } else { Craft::Tile }, false); // DESKTOPCRAFT (B631): the user card — an accent pill when picked, a raised rounded tile otherwise
     let max = crate::video::text::fit(name, false, FACE, super::super::metrics::size(w - 12)); // UIMETRICS: the physical width // KERNELFONT: whole glyphs that fit. LOGINFONT
     let ax = super::loginwindow::tile_avatar(&mut |d| tile_draw(px, d), name, x + 3, y + 3, h.saturating_sub(6), picked); // LOGINWINDOW (B430): the user's own avatar (`una:icon` or initials). FIRSTUSER (R100): the generic avatar on every user tile (`loginwindow.rs`)
     let max = max.min(crate::video::text::fit(name, false, FACE, super::super::metrics::size(w.saturating_sub(12 + ax)))); // FIRSTUSER: the name fits beside the avatar
@@ -495,11 +492,11 @@ fn repaint() {
     // SAFETY: see `SURF`.
     let px: &mut [u32] = surf();
     fill(px, 0, 0, W, H, theme::chrome_face());
-    rect(px, 2, 2, W - 4, H - 4, theme::frame_line());
+    // DESKTOPCRAFT (B631): no inner 1 px frame — the window's own chrome (rounded head, shadowed band) is the card's edge.
     if f.state == State::CreateUser {
         // FIRSTBOOT (R77): "Create your account" — name, password, retype, Create.
         text(px, LX, 14, b"Create your administrator account", theme::content_text()); // FIRSTUSER (R100): the first user is the administrator
-        fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
+        craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
         let (nx, ny, nw, _) = cu_rect(Ctl::NameField);
         text(px, LX, ny + 4, b"Name", theme::title_text_inactive());
         field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
@@ -539,7 +536,7 @@ fn repaint() {
         let n = f.name_len.min(users::NAME_MAX);
         title[19..19 + n].copy_from_slice(&f.name[..n]);
         text(px, LX, 14, &title[..19 + n], theme::content_text());
-        fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
+        craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
         let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, true);
         text(px, LX, py + 4, b"Password", theme::title_text_inactive());
         field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
@@ -564,7 +561,7 @@ fn repaint() {
     let locked = LOCKED.load(Ordering::Relaxed);
     let title: &[u8] = if locked { b"Locked" } else { b"Log in to UnaOS" };
     text(px, LX, 14, title, theme::content_text());
-    fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
+    craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
     // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
     // picks and the row the painter draws are the same row by construction — the `ctl_rect` argument
     // one layer up, applied to the CONTENT as well as to the geometry.
@@ -2469,11 +2466,7 @@ fn power_row(px: &mut [u32], on: bool) { // RESOLVEHANG2 (B531): `on` from the c
     let k = PFOCUS.load(Ordering::Relaxed);
     for i in 0..3u8 {
         let (x, y, w, h) = ctl_rect(Ctl::Power(i), false);
-        fill(px, x, y, w, h, theme::button_face());
-        rect(px, x, y, w, h, if k == i + 1 { theme::accent() } else { theme::frame_line() });
-        if k == i + 1 {
-            rect(px, x + 1, y + 1, w - 2, h - 2, theme::accent()); // the keyboard ring
-        }
+        craft_box(px, x, y, w, h, Craft::Button, k == i + 1); // DESKTOPCRAFT (B631): the kit's button; the keyboard ring is the accent focus ring outside it
         let l = PWR_LABEL[i as usize];
         let tw = super::super::metrics::ladvance(l, false, FACE);
         let ink = if i == 0 && !crate::power::sleep_armed() { theme::title_text_inactive() } else { theme::button_text() }; // LOGINWINDOW (B430): Sleep greys until LIDSLEEP (B431) arms the lane
@@ -2740,7 +2733,7 @@ fn paint_change(px: &mut [u32], f: &Form) {
     let n = f.name_len.min(users::NAME_MAX);
     title[23..23 + n].copy_from_slice(&f.name[..n]);
     text(px, LX, 14, &title[..23 + n], theme::content_text());
-    fill(px, LX, 36, W - 2 * LX, 2, theme::frame_line());
+    craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
     for (c, label, buf, len, focus) in [
         (Ctl::OldField, &b"Old password"[..], &f.old, f.old_len, Focus::Old),
         (Ctl::PwField, &b"New"[..], &f.pw, f.pw_len, Focus::Password),
@@ -3022,4 +3015,69 @@ pub fn echo_selftest() {
         ":: LOGINECHO: keys={} echoed={} full={} comp_max_ms={} comp_max_us={} rect={} -> {} :: bound_ms={} mode=driven",
         ECHO_KEYS_DRIVEN, echoed, full, mx / 1000, mx, rect(ECHO_RECT.load(Ordering::Relaxed)), if pass { "PASS" } else { "FAIL" }, ECHO_BOUND_MS
     );
+}
+
+// ── DESKTOPCRAFT (rmbp-ledger B631) — the login card's paint ─────────────────────────────────────────────────────
+// Paint only: every `ctl_rect` (the press router's geometry) is drawn exactly where it was; the boxes are now the
+// kit's (`video::draw`): rounded, anti-aliased, a hairline edge, a soft shadow under a button, and the accent focus
+// ring OUTSIDE a focused field or a keyboard-focused button. The text and the caret are drawn as before.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Craft {
+    /// A text field (`field_bg`, a control edge).
+    Field,
+    /// A plain push button (`knob_face`, a soft shadow, a control edge).
+    Button,
+    /// The default button (the accent).
+    Primary,
+    /// A user's card, not picked (the raised group fill, a hairline).
+    Tile,
+    /// The picked user's card (the accent).
+    Picked,
+}
+
+/// The logical rect `(x, y, w, h)` as a device rect on the screen's surface.
+fn craft_rect(x: usize, y: usize, w: usize, h: usize) -> super::super::draw::Rect {
+    let e = super::super::metrics::edge;
+    let (x0, y0) = (e(x) as i32, e(y) as i32);
+    super::super::draw::Rect::new(x0, y0, e(x + w) as i32 - x0, e(y + h) as i32 - y0)
+}
+
+fn craft_box(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, kind: Craft, ring: bool) {
+    use super::super::draw::{self, Ink, Surf, DIMS};
+    let sw = super::super::metrics::size(W);
+    let n = (sw * super::super::metrics::size(H)).min(px.len());
+    let mut s = Surf::new(&mut px[..n], sw);
+    let r = craft_rect(x, y, w, h);
+    let rad = (crate::ui::px(if kind == Craft::Field { DIMS.field_radius } else { DIMS.button_radius }) as i32).min(r.h / 2);
+    if matches!(kind, Craft::Button | Craft::Primary) {
+        draw::shadow_rrect(&mut s, r.offset(0, crate::ui::px(DIMS.button_drop) as i32), rad, crate::ui::px(DIMS.button_blur) as i32, theme::shadow_soft());
+    }
+    let face = match kind {
+        Craft::Field => theme::field_bg(),
+        Craft::Button => theme::knob_face(),
+        Craft::Primary | Craft::Picked => theme::accent(),
+        Craft::Tile => theme::group_fill(),
+    };
+    draw::fill_rrect(&mut s, r, rad, face);
+    let edge = match kind {
+        Craft::Tile => Ink::argb(theme::hairline()),
+        Craft::Primary | Craft::Picked => Ink::new(theme::accent(), 0),
+        _ => Ink::argb(theme::control_edge()),
+    };
+    draw::stroke_rrect(&mut s, r, rad, 1, edge);
+    if ring {
+        let fw = crate::ui::px(DIMS.focus_ring) as i32;
+        draw::stroke_rrect(&mut s, r.inset(-fw), rad + fw, fw, Ink::argb(theme::focus_ring()));
+    }
+}
+
+/// A one-device-px hairline across the logical span `(x, y, w)`.
+fn craft_rule(px: &mut [u32], x: usize, y: usize, w: usize) {
+    use super::super::draw::{self, Ink, Surf};
+    let sw = super::super::metrics::size(W);
+    let n = (sw * super::super::metrics::size(H)).min(px.len());
+    let mut s = Surf::new(&mut px[..n], sw);
+    let r = craft_rect(x, y, w, 1);
+    draw::hairline_h(&mut s, r.x, r.y, r.w, Ink::argb(theme::hairline()));
 }
