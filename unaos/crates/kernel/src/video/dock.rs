@@ -871,7 +871,7 @@ pub fn compose() -> bool {
     // The two damage conditions, and nothing else. Note the ordering: a signature that MATCHES and a
     // pass that did not touch the strip is the common case and returns here having read no pixel.
     if sig == painted_sig && !clobbered {
-        return side_menu_pass(layout.as_ref(), mnu); // DOCK2: a side dock's menu is its own rect, kept on top every pass
+        return side_menu_pass(layout.as_ref(), mnu, &rows[..n]); // DOCK2: a side dock's menu is its own rect, kept on top every pass
     }
     // THE STRIP OWES ITS OWN VACATED PIXELS. `wm::erase` cleans the boxes of WINDOWS; the dock is not
     // a window and no other painter knows its rect, so a strip that shrinks (a window closed, so the
@@ -917,7 +917,7 @@ pub fn compose() -> bool {
         (l.w * l.h) as u64,
     );
     SLOT.store(sig, Some(ext_rect(&l, mb)));
-    side_menu_pass(Some(&l), mnu);
+    side_menu_pass(Some(&l), mnu, &rows[..n]);
     true
 }
 
@@ -932,7 +932,8 @@ fn paint(l: &Layout, rows: &[wm::DockEntry], pressed: u32, mnu: Option<MenuGeo>)
     // `blit` and the single `flush_rect`. This function is now the dock's row composer and nothing
     // else, which is exactly the split that lets a second tenant exist.
     let mb = mnu.map_or(0, |g| g.band);
-    strip::paint("dock", ext_rect(l, mb), |out, j| if j < mb { menu_row(out, l, mnu, j) } else { compose_row(out, l, rows, pressed, j - mb) })
+    let under = if mb > 0 { super::crystal::sheet::Under::scan(rows) } else { super::crystal::sheet::Under::none() }; // MENUS2 (B652): the scene under the menu's band, scanned once per paint and only while a menu is open
+    strip::paint("dock", ext_rect(l, mb), |out, j| if j < mb { menu_row(out, l, mnu, j, &under) } else { compose_row(out, l, rows, pressed, j - mb) })
 }
 
 /// Compose panel row `j` of the strip into `out[0..l.w]` as logical `0x00RRGGBB` colours.
@@ -3009,9 +3010,10 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     let (t, owner) = (MENU_TILE.load(Ordering::Relaxed) as usize, MENU_OWNER.load(Ordering::Relaxed));
     if t >= rows.len() || rows[t].owner_asid != owner { MENU_OPEN.store(false, Ordering::Release); return None; }
     let (tx, ty, _, _) = l.tile(t)?;
-    let mw = (18 * CELL_W() + 2 * PAD()).min(if l.vert { MAX_STRIP_W } else { l.w }); // PREFSUI: `[x] Open at Login` is the widest row
+    let band_px = super::crystal::sheet::BAND(); // MENUS2 (B652): the published rect is the OUTER one — the sheet's shadow band on the body's right and at its foot (MENUSCRAFT §2); every hit test below reads `sheet::body`
+    let mw = (18 * CELL_W() + 2 * PAD() + band_px).min(if l.vert { MAX_STRIP_W } else { l.w }); // PREFSUI: `[x] Open at Login` is the widest row
     let nrows = if owner == TRASH_OWNER { 1 } else { MENU_ITEMS + menu_win_rows(owner) }; // WINDOWLIST M3; DOCK2 M6 the Trash's one item — one extra row per window when the app has more than one
-    let mh = nrows * TILE_H();
+    let mh = nrows * TILE_H() + band_px;
     let band = if l.vert { 0 } else { mh + PAD() }; // DOCK2: a side dock's menu stands BESIDE the tile, as its own rect
     if l.y < band { return None; }
     let (mx, my) = if l.vert { (if position() == 1 { l.x + l.w + PAD() } else { l.x.saturating_sub(PAD() + mw) }, ty.min((l.y + l.h).saturating_sub(mh))) } else { (tx.min(l.x + l.w - mw), l.y - band) };
@@ -3019,34 +3021,69 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     if let Some((pw, ph)) = dims {
         let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
         let (cx, cy) = (cx.max(0) as usize, cy.max(0) as usize);
-        if cx >= mx && cx < mx + mw && cy >= my && cy < my + mh { hover = (cy - my) / TILE_H(); }
+        let (bx0, by0, bw, bh) = super::crystal::sheet::body((mx, my, mw, mh)); // MENUS2: the hover lives in the body, never on the band
+        if cx >= bx0 && cx < bx0 + bw && cy >= by0 && cy < by0 + bh { hover = (cy - my) / TILE_H(); }
     }
     Some(MenuGeo { mx, my, mw, mh, band, hover, keep: is_kept(owner), rows: nrows, owner })
 }
 
 /// Menu band row `j` (0 = top of the band) as logical colours into `out[0..l.w]`: the desktop where the
-/// menu is not (the tenant's convention for pixels it does not own), a face panel with a keyline and two
-/// rows where it is; the hovered row in the accent.
-fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize) {
+/// menu is not (the tenant's convention for pixels it does not own), the SHEET where it is (MENUS2, B652:
+/// `crystal::sheet`, MENUSCRAFT's one painter for every menu); the hovered row on the accent pill.
+fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize, under: &super::crystal::sheet::Under) {
     for i in 0..l.w { out[i] = wm::DESKTOP_BG; }
     let Some(g) = g else { return };
-    menu_box(out, l.w, g.mx - l.x, g, j);
+    menu_box(out, l.w, g.mx - l.x, g, j, under);
 }
 
 /// The menu box's row `j` drawn at `bx` in a row `ow` wide (the band above a bottom dock, or a side dock's own rect).
-fn menu_box(out: &mut [u32], ow: usize, bx: usize, g: MenuGeo, j: usize) {
-    if j >= g.mh { return; }
-    let (row, sy0) = (j / TILE_H(), (j % TILE_H()) as isize - ((TILE_H() - CELL_H()) / 2) as isize);
-    let hot = row == g.hover;
-    let face = if hot { theme::accent() } else { theme::surface_raised() };
-    let ink = if hot { theme::surface_raised() } else { theme::text_primary() };
-    let edge_row = j == 0 || j + 1 == g.mh;
-    for i in 0..g.mw {
-        out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::line_subtle() } else { face };
+///
+/// MENUS2 (B652) — MENUSCRAFT §9's change, exactly: the row is `sheet::row` first (all four corners round, because a
+/// context menu floats; the `under` is the scene estimate the SHARD and window menus blend their band over), then the
+/// hovered item's `sheet::pill`, the label in the sheet's inks (`on_accent` on the pill), and `seal_row` over the menu's
+/// span so no pixel is pure white (MENU-UNDER's cursor-FILL guard). The face panel, its keyline and the full-width
+/// accent row are gone.
+fn menu_box(out: &mut [u32], ow: usize, bx: usize, g: MenuGeo, j: usize, under: &super::crystal::sheet::Under) {
+    use super::crystal::sheet;
+    if j >= g.mh || bx + g.mw > out.len() { return; }
+    let r: strip::Rect = (g.mx, g.my, g.mw, g.mh);
+    let (_, _, bw, bh) = sheet::body(r);
+    sheet::row(&mut out[bx..bx + g.mw], r, j, under, false);
+    if j < bh {
+        let (row, sy0) = (j / TILE_H(), (j % TILE_H()) as isize - ((TILE_H() - CELL_H()) / 2) as isize);
+        let hot = row == g.hover;
+        if hot { sheet::pill(&mut out[bx..bx + g.mw], bw, j, row * TILE_H(), TILE_H()); }
+        let ink = if hot { sheet::on_accent() } else { sheet::text_primary() };
+        let mut wbuf = [0u8; wm::MAX_TITLE];
+        let label: &[u8] = if g.owner == TRASH_OWNER { b"Empty Trash..." } else if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3; DOCK2 the six items
+        if sy0 >= 0 { super::text::draw_row(out, (bx + bw).min(ow), label, bx + sheet::INSET() + PAD(), sy0 as usize, ink, false, FACE); }
     }
-    let mut wbuf = [0u8; wm::MAX_TITLE];
-    let label: &[u8] = if g.owner == TRASH_OWNER { b"Empty Trash..." } else if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3; DOCK2 the six items
-    if sy0 >= 0 { super::text::draw_row(out, ow, label, bx + PAD(), sy0 as usize, ink, false, FACE); }
+    sheet::seal_row(&mut out[bx..bx + g.mw]);
+}
+
+/// MENUS2 (B652) — `tests menuscraft`'s `dock_menu=` leg: the tile menu's painter over a synthetic one-row (Trash)
+/// geometry and the flat scene, read off the SAME `menu_box` the live band paints through. True when the body's
+/// top-left corner pixel is not the face (rounded: a floating sheet), the hovered row carries the accent pill inside
+/// the inset and not outside it, the band row under the body is darker than the scene (the `elev.2` lift), and no
+/// painted pixel is pure white.
+pub fn sheet_probe() -> bool {
+    use super::crystal::sheet;
+    let band = sheet::BAND();
+    let g = MenuGeo { mx: 0, my: 0, mw: 18 * CELL_W() + 2 * PAD() + band, mh: TILE_H() + band, band: 0, hover: 0, keep: false, rows: 1, owner: TRASH_OWNER };
+    let (_, _, bw, bh) = sheet::body((g.mx, g.my, g.mw, g.mh));
+    let under = sheet::Under::none();
+    let mut out = alloc::vec![0u32; g.mw];
+    let mut white = 0usize;
+    let mut paint = |j: usize, out: &mut alloc::vec::Vec<u32>| { out.fill(0); menu_box(out, g.mw, 0, g, j, &under); white += out.iter().filter(|&&c| c & 0x00FF_FFFF == theme::pure_white()).count(); };
+    paint(0, &mut out);
+    let corner = out[0] != sheet::surface_overlay();
+    paint(bh / 2, &mut out);
+    let probe_x = bw - sheet::INSET() - 2; // past the label, inside the pill
+    let pill = out[probe_x] == sheet::accent_fill() && out[sheet::INSET() / 2] != sheet::accent_fill();
+    paint(bh + 1, &mut out);
+    let luma = |c: u32| (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8;
+    let shadow = luma(out[bw / 2]) < luma(theme::DESKTOP_BG);
+    corner && pill && shadow && white == 0
 }
 
 /// The open menu's box (x, y, w, h), or `None` when closed. Same geometry the painter draws from.
@@ -3102,6 +3139,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     menu_close();
     if x < 0 || y < 0 { return false; }
     let (px, py) = (x as usize, y as usize);
+    let (mx, my, mw, mh) = super::crystal::sheet::body((mx, my, mw, mh)); // MENUS2 (B652): a press on the shadow band is a press outside the menu (MENUSCRAFT §2)
     if px < mx || px >= mx + mw || py < my || py >= my + mh { return false; }
     let owner = MENU_OWNER.load(Ordering::Relaxed);
     let prow = (py - my) / TILE_H();
@@ -3968,11 +4006,12 @@ fn trash_glyph_row(out: &mut [u32], bx: usize, tw: usize, th: usize, y: usize, f
 
 /// A side dock's menu, painted as its own rect over everything each pass while it is open; its last rect is
 /// vacated (and the windows under it re-damaged) the pass after it closes. Returns whether it painted.
-fn side_menu_pass(l: Option<&Layout>, mnu: Option<MenuGeo>) -> bool {
+fn side_menu_pass(l: Option<&Layout>, mnu: Option<MenuGeo>, rows: &[wm::DockEntry]) -> bool {
     if let (Some(l), Some(g)) = (l, mnu) {
         if l.vert {
             let r = (g.mx, g.my, g.mw, g.mh);
-            let ok = strip::paint("dock", r, |out, j| { for i in 0..g.mw { out[i] = wm::DESKTOP_BG; } menu_box(out, g.mw, 0, g, j); });
+            let under = super::crystal::sheet::Under::scan(rows); // MENUS2 (B652): the scene the sheet's band blends over
+            let ok = strip::paint("dock", r, |out, j| { for i in 0..g.mw { out[i] = wm::DESKTOP_BG; } menu_box(out, g.mw, 0, g, j, &under); });
             if ok { SIDE_RECT.store(strip::pack_rect(Some(r)), Ordering::Relaxed); }
             return ok;
         }

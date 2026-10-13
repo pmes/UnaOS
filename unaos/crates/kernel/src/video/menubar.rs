@@ -3641,6 +3641,10 @@ fn luma(c: u32) -> u32 {
 /// * `glyphs` — the bell, network and volume glyphs painted for a fake tray at the live bar width and at the floor
 ///   width + 6 x 64: every icon item with a slot draws (`drawn=3/3` at the live width), every changed pixel lies in
 ///   an icon slot (`inside`), and adjacent seated items are exactly `ITEM_GAP` apart (`gap`).
+/// * MENUS2 (B652) — `dock_menu` (`dock::sheet_probe`: the tile menu's `menu_box` on the sheet), `quarry_menu` and
+///   `band_exact` (`quarry::live::ops::sheet_probe`: Quarry's menu painted in its own surface over two fills, the band
+///   darker than each and different between them; `n/a` without `quarry`), `wallpaper_gen` (`strip::seal` folds
+///   `strip::wall_gen` through `seal_with`, and another generation changes it).
 pub fn menuscraft_selftest() {
     use super::crystal::sheet;
     // ── leg 1: the sheet ──
@@ -3727,12 +3731,23 @@ pub fn menuscraft_selftest() {
         }
     }
     let glyphs_ok = seated_live > 0 && drawn_live == seated_live && inside && gap_ok;
-    let ok = sheet_ok && glyphs_ok;
+
+    // ── leg 3 (MENUS2, B652): the context menus on the sheet, the wallpaper generation in the seal, the exact band ──
+    let dock_ok = super::dock::sheet_probe();
+    #[cfg(feature = "quarry")]
+    let (quarry_ok, band_exact) = super::quarry::live::ops::sheet_probe();
+    #[cfg(not(feature = "quarry"))]
+    let (quarry_ok, band_exact) = (true, true); // no file manager in this image: the two legs print `n/a`
+    let (e, g) = (theme::epoch(), strip::wall_gen());
+    let wall_ok = strip::seal(1) == strip::seal_with(1, e, g) && strip::seal_with(1, e, g) != strip::seal_with(1, e, g ^ 1);
+    let q = |b: bool| if !cfg!(feature = "quarry") { "n/a" } else if b { "ok" } else { "BAD" };
+    let ok = sheet_ok && glyphs_ok && dock_ok && quarry_ok && band_exact && wall_ok;
     serial_println!(
-        ":: MENUSCRAFT: sheet={}x{} band={} corners={} face={} hairline={} shadow={}({}<{},{}) pill={} white={} glyphs={}/{} inside={} gap={}({}) -> {} ::",
+        ":: MENUSCRAFT: sheet={}x{} band={} corners={} face={} hairline={} shadow={}({}<{},{}) pill={} white={} glyphs={}/{} inside={} gap={}({}) dock_menu={} quarry_menu={} wallpaper_gen={} band_exact={} -> {} ::",
         w, h, band, if corners { "ok" } else { "BAD" }, if face_ok { "ok" } else { "BAD" }, if hairline { "ok" } else { "BAD" },
         if shadow { "ok" } else { "BAD" }, near, scene, far, if pill { "ok" } else { "BAD" }, white,
         drawn_live, seated_live, if inside { "ok" } else { "BAD" }, if gap_ok { "ok" } else { "BAD" }, ITEM_GAP(),
+        if dock_ok { "ok" } else { "BAD" }, q(quarry_ok), if wall_ok { "ok" } else { "BAD" }, q(band_exact),
         if ok { "PASS" } else { "FAIL" }
     );
 }
