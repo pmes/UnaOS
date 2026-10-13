@@ -2951,7 +2951,7 @@ pub struct DeviceSlot {
     /// is not a dup: it means the completion the endpoint just retired is one we cannot account
     /// for, and the old `return` left the interrupt-IN endpoint permanently un-armed — the P54b
     /// metal fact (mouse dead after a user focus drop, keyboard alive). Those re-arm.
-    pub mouse_prev_phys: u64,
+    pub mouse_prev_phys: u64, pub mouse_armed_trb: [u64; MOUSE_INFLIGHT], pub mouse_armed_buf: [u64; MOUSE_INFLIGHT], pub mouse_armed_n: u8, // PTRPRESS2 (B633) — the POINTER's ARMED SET, `keyboard_armed_*`'s twin (XHCINTD): the Normal TRBs outstanding on the pointer interrupt-IN, NEWEST LAST, and the 64-byte pool buffer each was armed with. `mouse_retire` pops through a match and hands back the buffer the retired TD was DMA-written into; `mouse_prev_phys` to the left is now written THERE, at the retirement, because under N TRBs the expectation before the newest names a TD still armed. ⚠ FOLDED onto the existing field (kernel8.img panic-`Location` identity).
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
@@ -3126,7 +3126,7 @@ impl DeviceSlot {
             mouse_state: 0,
             mouse_ring: None,
             mouse_expect_phys: 0,
-            mouse_prev_phys: 0,
+            mouse_prev_phys: 0, mouse_armed_trb: [0; MOUSE_INFLIGHT], mouse_armed_buf: [0; MOUSE_INFLIGHT], mouse_armed_n: 0, // PTRPRESS2 — seeded empty beside its sibling. ⚠ FOLDED.
             mouse_report_count: 0,
             mouse_prev_buttons: 0, mouse_prev_rep: [0; 6], mouse_prev_len: 0, // PTRPRESS — seeded empty beside its sibling; `mouse_prev_len` 0 means "no predecessor", which is what makes the FIRST report of a slot unable to score as restated. ⚠ FOLDED.
             is_keyboard: false,
@@ -3212,7 +3212,7 @@ impl DeviceSlot {
         self.mouse_intf = 0;
         self.mouse_state = 0;
         self.mouse_expect_phys = 0;
-        self.mouse_prev_phys = 0;
+        self.mouse_prev_phys = 0; self.mouse_armed_trb = [0; MOUSE_INFLIGHT]; self.mouse_armed_buf = [0; MOUSE_INFLIGHT]; self.mouse_armed_n = 0; // PTRPRESS2 — cleared on slot reuse beside its sibling, or a recycled slot's top-up would believe a dead device's TDs were still outstanding and arm nothing. ⚠ FOLDED.
         self.mouse_report_count = 0;
         self.mouse_prev_buttons = 0; self.mouse_prev_rep = [0; 6]; self.mouse_prev_len = 0; // PTRPRESS — cleared on slot reuse beside its sibling, or a recycled slot would compare a new device's first report against a dead one's last and score a false restated. ⚠ FOLDED.
         // UVUG-5: a keyboard slot is being torn down (detach / disconnect / enum-recovery). Signal the
@@ -4554,7 +4554,7 @@ impl XhciController {
                                     }
                                 } else {
                                     MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed); if self.slots[slot_id as usize].mouse_prev_buttons != 0 { MOUSE_PRESS_LOST.fetch_add(1, Ordering::Relaxed); MOUSE_PRESS_RECOVERED.fetch_add(1, Ordering::Relaxed); self.slots[slot_id as usize].mouse_prev_buttons = 0; self.slots[slot_id as usize].mouse_prev_len = 0; crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); } // PTRPRESS (S30) — THE OTHER HALF OF THE RECOVERY, and the half that is metal-only: an error re-arm retires a TD this driver cannot account for, so any button edge the device made across it is GONE and, under SET_IDLE 0, will never be resent. If the level says a button is DOWN at that instant the release is the edge that can be missing, and nothing downstream will ever lift it — the stuck click. Synthesise it here, ungated (driver correctness, every board), and clear `mouse_prev_len` with it so the first report AFTER the hole has no predecessor to be compared against: it was never decoded, and scoring it as restated would convict the hole twice. ⚠ FOLDED onto the existing count.
-                                    self.queue_mouse_read(slot_id as u8);
+                                    let _ = self.mouse_retire(slot_id as u8, param); self.mouse_top_up(slot_id as u8); // PTRPRESS2 — RETIRE THE ERRORING TD FIRST, then top up to N: the keyboard's XHCINTD rule, because this is the one place a pointer TD leaves the ring without reaching the decode that pops the set, and a leaked entry per error would fill the set until `mouse_top_up` armed nothing. ⚠ FOLDED.
                                 }
                                 return;
                             }
@@ -4626,7 +4626,7 @@ impl XhciController {
                                             );
                                         }
                                         self.slots[slot_id as usize].mouse_report_count = 0;
-                                        self.queue_mouse_read(slot_id as u8);
+                                        self.mouse_top_up(slot_id as u8); // PTRPRESS2 — THE ENUMERATION ARM fills the EMPTY set to `MOUSE_INFLIGHT`; every later top-up restores what a completion consumed. ⚠ FOLDED.
                                     }
                                     // Boot-capable HID interfaces power up in REPORT protocol (report
                                     // IDs + device-defined layout the decoders don't parse). Queue a
@@ -4902,7 +4902,7 @@ impl XhciController {
                                         //   * any other mismatch — the endpoint retired a TD we cannot
                                         //     account for; nothing is guaranteed armed. Discard the
                                         //     report, then RE-ARM so the pointer survives.
-                                        if slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys {
+                                        let mexpect = slot.mouse_expect_phys; let mouse_hit = self.mouse_retire(slot_id as u8, param); let slot = &self.slots[slot_id as usize]; if mexpect != 0 && mouse_hit.is_none() { // PTRPRESS2 — the dup guard tests SET MEMBERSHIP, the keyboard's XHCINTD shape: `mouse_retire` searches the armed TRBs for `param`, POPS it (and everything older) on a hit and hands back its buffer, and on a miss changes nothing and returns None — exactly the old `param != mouse_expect_phys`. `slot` is re-borrowed after the `&mut self` call; on a miss every field it reads below is unchanged. ⚠ FOLDED.
                                             let prev = slot.mouse_prev_phys;
                                             let expect = slot.mouse_expect_phys;
                                             let have_buf = slot.mouse_data_buffer.is_some()
@@ -4912,16 +4912,16 @@ impl XhciController {
                                             if param != prev && have_buf {
                                                 // Not the known dup — re-arm rather than lose the pointer.
                                                 MOUSE_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
-                                                self.queue_mouse_read(slot_id as u8);
+                                                self.mouse_top_up(slot_id as u8); // PTRPRESS2 — TOP UP to N: the guard cannot account for this completion, so the outstanding count is unknown and the set decides. ⚠ FOLDED.
                                                 Self::piusb39_witness("guard");
                                             }
                                             if !have_buf { MOUSE_NOBUF_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } else if param == prev { MOUSE_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } return; // CLICKDEAD v2 — count the exit that neither re-arms nor prints, SPLIT by cause. Reaching here means `!(param != prev && have_buf)`, so the two arms are exhaustive: no buffer/ring (teardown or allocation defect — re-arming would be wrong) vs. the known duplicate with the buffer intact (the guard's by-design skip). `!have_buf` wins the tie. ⚠ FOLDED onto the existing `return;`, never a line of its own (kernel8.img panic-`Location` byte-identity).
                                         }
-                                        if let Some(data_buf_ptr) = slot.mouse_data_buffer {
+                                        if let Some(data_buf_ptr) = mouse_hit.map(|b| b as *mut u8).or(slot.mouse_data_buffer) { // PTRPRESS2 — decode the buffer of the TD THAT JUST RETIRED: with N outstanding the controller may be writing any of the others. `.or(..)` is the pre-arm path (`mexpect == 0`), verbatim. ⚠ FOLDED.
                                             // XHCI-COHERENCE: consumer boundary — the interrupt-IN
                                             // report was DMA-written; invalidate before decoding. No-op x86.
-                                            dma_coherency::inval(data_buf_ptr as usize, 512);
-                                            let data_data = core::slice::from_raw_parts(data_buf_ptr, 512);
+                                            dma_coherency::inval(data_buf_ptr as usize, MOUSE_BUF_STRIDE); // PTRPRESS2 — one pool buffer, not the whole 512-byte window: a sibling buffer may be armed. ⚠ FOLDED.
+                                            let mrep: [u8; MOUSE_BUF_STRIDE] = core::ptr::read(data_buf_ptr as *const [u8; MOUSE_BUF_STRIDE]); self.mouse_top_up(slot_id as u8); let slot = &self.slots[slot_id as usize]; let data_data = &mrep[..]; // PTRPRESS2 — THE DEPTH REPAIR, IN ORDER: (1) copy the report off the retired buffer onto the stack, after the `inval`; (2) TOP UP to N and ring the doorbell HERE, before the decode, instead of as the branch's last statement — the retired buffer is free the instant `mouse_retire` popped it; (3) decode the stack copy. Everything below reads `mrep`. `queue_mouse_read` used to be this branch's LAST statement with ONE TD outstanding, so the endpoint had no TD for the whole decode (and for PTRPRESS's 900 ms stall); now it always has N-1 at least. ⚠ FOLDED.
                                             let _buttons = data_data[0];
                                             // Metal diagnostic (parallels the keyboard dump): show the raw
                                             // pointer report AND the values our boot-layout decode extracts,
@@ -5045,7 +5045,7 @@ impl XhciController {
                                             // does not re-fire. Shared xHCI code: x86 xHCI mice gain
                                             // the same correct release edge (a fix, not a risk —
                                             // EHCI keeps its own emit).
-                                            let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons; #[cfg(feature = "witness")] if ptrpress_hole(buttons, prev_btn) { self.queue_mouse_read(slot_id as u8); return; } { let g = KBD_DRAIN_GAP.load(Ordering::Relaxed); if g > MOUSE_ARMGAP_MAX.load(Ordering::Relaxed) { MOUSE_ARMGAP_MAX.store(g, Ordering::Relaxed); } } let rlen = report_len.min(6); let restated = { let s = &self.slots[slot_id as usize]; rlen != 0 && s.mouse_prev_len as usize == rlen && s.mouse_prev_rep[..rlen] == data_data[..rlen] }; { let s = &mut self.slots[slot_id as usize]; s.mouse_prev_len = rlen as u8; s.mouse_prev_rep[..rlen].copy_from_slice(&data_data[..rlen]); } let prev_btn = if restated { MOUSE_RESTATED_COUNT.fetch_add(1, Ordering::Relaxed); if buttons != 0 { MOUSE_PRESS_LOST.fetch_add(1, Ordering::Relaxed); MOUSE_PRESS_RECOVERED.fetch_add(1, Ordering::Relaxed); crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); self.slots[slot_id as usize].mouse_prev_buttons = 0; 0 } else { MOUSE_RELEASE_ORPHAN.fetch_add(1, Ordering::Relaxed); prev_btn } } else { prev_btn }; // PTRPRESS (S30) — THE PRESS-RECOVERY SEAM, three things folded onto the line that reads the level. (1) ARMGAP: `KBD_DRAIN_GAP` is stamped by `drain_event_ring_once` for BOTH endpoints (it is the one place that knows when software looked at the ring), so latching it here gives the POINTER the upper bound on its own unarmed window that PRTSCLOST gave the keyboard — the pointer had no such latch, and `queue_mouse_read` is still the LAST statement of this branch with ONE TD outstanding, so the window is real on every board. (2) RESTATED: a report whose delivered bytes are identical to its predecessor's. A pointer under SET_IDLE 0 reports only on a change, so this is impossible from the device and proves an intermediate report was lost — `KBD_RESTATED_COUNT`'s argument, and the only signal a LEVEL-diffed decoder can have that an EDGE went missing. Split into the two faults it is: buttons DOWN = the release fell in the hole and the level is stuck down (`press_lost`, Peter at the glass: a click that never lifts); buttons UP = a whole press+release pair fell in the hole and the click was swallowed (`release_orphan` — the release the decoder saw arrive with no press behind it). (3) RECOVERY, ungated because it is driver correctness on every board: on the stuck-down case synthesise the release the device can never resend — push `Button(0)` and drop the level to 0 — so the consumer's held-state tracker lifts and THIS report's still-down mask then reads as a fresh press edge instead of no edge at all. The swallowed-pair case is NOT synthesised: recovering it would mean inventing a click nobody made, and the counter is the honest answer. ⚠ FOLDED onto the existing `let` — no line added.
+                                            let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons; #[cfg(feature = "witness")] if ptrpress_hole(buttons, prev_btn) { return; } { let g = KBD_DRAIN_GAP.load(Ordering::Relaxed); if g > MOUSE_ARMGAP_MAX.load(Ordering::Relaxed) { MOUSE_ARMGAP_MAX.store(g, Ordering::Relaxed); } } let rlen = report_len.min(6); let same = { let s = &self.slots[slot_id as usize]; rlen != 0 && s.mouse_prev_len as usize == rlen && s.mouse_prev_rep[..rlen] == data_data[..rlen] }; let moving = rel && (last_a != 0 || last_b != 0 || wheel != 0); let restated = if rel { rlen != 0 && self.slots[slot_id as usize].mouse_prev_len != 0 && !moving && buttons == prev_btn } else { same }; if same && moving { MOUSE_RESTATED_MOVING.fetch_add(1, Ordering::Relaxed); } let explained = ptrpress_explained(); { let s = &mut self.slots[slot_id as usize]; s.mouse_prev_len = rlen as u8; s.mouse_prev_rep[..rlen].copy_from_slice(&data_data[..rlen]); } let prev_btn = if restated { if !explained { MOUSE_RESTATED_COUNT.fetch_add(1, Ordering::Relaxed); } if buttons != 0 { MOUSE_PRESS_LOST.fetch_add(1, Ordering::Relaxed); MOUSE_PRESS_RECOVERED.fetch_add(1, Ordering::Relaxed); crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); self.slots[slot_id as usize].mouse_prev_buttons = 0; 0 } else { MOUSE_CLICK_SYNTH.fetch_add(1, Ordering::Relaxed); crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0x01))); crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); prev_btn } } else { prev_btn }; // PTRPRESS2 (B633) — THE LOSS TEST IS PER KIND, and the old one convicted ordinary motion. (1) ARMGAP: `KBD_DRAIN_GAP` latched as before (an upper bound on the drain cadence; with N TDs outstanding it no longer bounds a dark endpoint). (2) RESTATED = a report a change-only device cannot send, i.e. proof an intermediate report was lost. ABSOLUTE (tablet): byte identity with the predecessor, because an absolute report is a STATE. RELATIVE: NO motion, NO wheel, and the mask equal to the decoded level — byte identity is NOT the test, because a relative report is a DELTA and a steady slow move repeats `[00 ff ff 00]` legitimately (`moving_dup`, `MOUSE_RESTATED_MOVING`, counts those and nothing else happens to them). Flight 34 boot 2 is the proof: 13 `restated`/`release_orphan` at 15:22:35Z from a change-only mouse (86 s idle = 32 reports) moving in small repeated deltas, and at 15:25:00Z ten `[clickroute] press … was=0` in one second along one leftward drag while MOUSE-1 read `buttons=0x01` throughout — the old test read a steady DRAG as a lost release and chopped it into re-grabs, two of which inside DBL_MS zoomed Lumen. The discriminator is EHCI's ARC D M1 (`repress … && !moved`). `explained` = the fixture's injected hole (witness only; `false` on every other build) owns this report, so `restated` stays the wire's own count. (3) RECOVERY, ungated: mask DOWN = release then press lost, synthesise `Button(0)` and drop the level so this report reads as a fresh press (unchanged); mask UP = a CLICK the wire swallowed (press then release, the device's one report buffer overwritten), synthesise the press THEN the release, in order, each through `push_pointer_report` so `pal::push_locked` publishes each level (DRAGNOMOVE's seam). The mask is 0x01: the report proves a button went down and up, not which. `MOUSE_RELEASE_ORPHAN` is no longer reachable from here and stays on the score line as the falsifier. ⚠ FOLDED onto the existing `let` — no line added.
                                             let edge = buttons != prev_btn;
                                             #[cfg(feature = "usbdebug")]
                                             if edge {
@@ -16042,7 +16042,7 @@ impl XhciController {
             //    completion after recovery is accepted, then arm the read.
             {
                 let s = &mut self.slots[slot as usize];
-                if is_mouse { s.mouse_expect_phys = 0; s.mouse_prev_phys = 0; }
+                if is_mouse { s.mouse_expect_phys = 0; s.mouse_prev_phys = 0; s.mouse_armed_trb = [0; MOUSE_INFLIGHT]; s.mouse_armed_buf = [0; MOUSE_INFLIGHT]; s.mouse_armed_n = 0; } // PTRPRESS2 — the pointer's armed SET is stale for the keyboard's reason: CLEAR_FEATURE(HALT) plus the moved TR Dequeue Pointer abandon every recorded TD. ⚠ FOLDED.
                 else { s.keyboard_expect_phys = 0; s.keyboard_prev_phys = 0; s.keyboard_armed_trb = [0; KBD_INFLIGHT]; s.keyboard_armed_buf = [0; KBD_INFLIGHT]; s.keyboard_armed_n = 0; } // XHCINTD — the armed SET is stale for exactly the reason the two expectations beside it are: CLEAR_FEATURE(HALT) plus the moved TR Dequeue Pointer make every recorded address name a TD that will never retire, and leaving them would make `kbd_top_up` believe N were outstanding and arm nothing. ⚠ FOLDED.
             }
             let armable = {
@@ -16053,7 +16053,7 @@ impl XhciController {
             if armable {
                 if is_mouse {
                     MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed); if self.slots[slot as usize].mouse_prev_buttons != 0 { MOUSE_PRESS_LOST.fetch_add(1, Ordering::Relaxed); MOUSE_PRESS_RECOVERED.fetch_add(1, Ordering::Relaxed); self.slots[slot as usize].mouse_prev_buttons = 0; self.slots[slot as usize].mouse_prev_len = 0; crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); } // PTRPRESS — the HALT-recovery twin of the error-arm synthesis above, and the stronger case: CLEAR_FEATURE(HALT) plus a moved TR Dequeue Pointer means every TD on that endpoint is abandoned. ⚠ FOLDED.
-                    self.queue_mouse_read(slot);
+                    self.mouse_top_up(slot); // PTRPRESS2 — the halt-recovery arm: N, safe unconditionally because the set was just cleared. ⚠ FOLDED.
                     Self::piusb39_witness("halt");
                 } else {
                     self.kbd_top_up(slot); // XHCINTD — the halt-recovery arm: N, and safe unconditionally because the set was just cleared above. ⚠ FOLDED.
@@ -16068,7 +16068,7 @@ impl XhciController {
             let dir_in = (self.slots[slot_id as usize].mouse_ep & 0x80) != 0;
             let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
 
-            let data_phys = self.slots[slot_id as usize].mouse_data_buffer.unwrap() as u64;
+            let data_phys = match self.mouse_free_buf(slot_id) { Some(b) => b, None => return }; // PTRPRESS2 — arm into a pool buffer NOT currently armed (`kbd_free_buf`'s twin); `None` = set full or no buffer, and returning here is what terminates `mouse_top_up`. Subsumes the old `.unwrap()`. ⚠ FOLDED.
             // XHCI-COHERENCE: evict any stale/dirty lines of the report buffer before arming the
             // interrupt-IN read (the controller DMA-writes it; the completion path invalidates before
             // decoding). No-op x86.
@@ -16087,10 +16087,10 @@ impl XhciController {
             // PIUSB-39: remember the TD we are retiring before overwriting the expectation — a
             // genuine Panther-Point dup-Success names THAT address, and only that address may be
             // discarded without a re-arm.
-            self.slots[slot_id as usize].mouse_prev_phys =
-                self.slots[slot_id as usize].mouse_expect_phys;
-            self.slots[slot_id as usize].mouse_expect_phys =
-                ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
+            let trb_phys = ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64); { let s = &mut self.slots[slot_id as usize]; let n = s.mouse_armed_n as usize; if n < MOUSE_INFLIGHT { s.mouse_armed_trb[n] = trb_phys; s.mouse_armed_buf[n] = data_phys; s.mouse_armed_n = (n + 1) as u8; } MOUSE_OUTSTANDING.store(s.mouse_armed_n as u64, Ordering::Relaxed); } // PTRPRESS2 — register the TRB just produced in the armed set, NEWEST LAST. `mouse_prev_phys` is NO LONGER written here (`mouse_retire` records it at the retirement, XHCINTD's hazard 2). ⚠ FOLDED.
+            self.slots[slot_id as usize].mouse_expect_phys = trb_phys;
+            // PTRPRESS2: the expectation is the NEWEST armed TRB (the line above); the dup guard's
+            // `mouse_prev_phys` is written by `mouse_retire`. Two lines kept so nothing below moves.
             let rearms = MOUSE_REARM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             // PIUSB-39 witness — knob-gated (usbdebug) and BOUNDED (first arm + every 256th), so a
             // metal capture can read the pointer pipeline's liveness without flooding the FTDI.
@@ -16901,12 +16901,12 @@ pub fn enumeration_in_flight() -> bool {
 // after the FIRST button edge this boot (a deadline and not a condition, so a boot whose pointer is
 // never clicked prints nothing and an armed fixture that printed nothing is arroyo's red, never a
 // quiet pass):
-//   :: PTRPRESS: reports=<n> press_lost=<p> release_orphan=<o> recovered=<r> armgap_us=<g> restated=<t> edges=<e> held=<h> holed=<i> rearm=<a> discard=<d> dup=<u> nobuf=<b> errrearm=<x> -> PASS|FAIL ::
+//   :: PTRPRESS: reports=<n> press_lost=<p> release_orphan=<o> recovered=<r> armgap_us=<g> restated=<t> edges=<e> held=<h> holed=<i> rearm=<a> discard=<d> dup=<u> nobuf=<b> errrearm=<x> inflight=<n> depth=<n> click_synth=<c> moving_dup=<m> press_us=<u> skipped=<s> -> PASS|FAIL ::   (PTRPRESS2 B633: the six fields before the verdict)
 // `edges` is the CONTROL — button edges actually delivered downstream; `edges=0` means the burst
 // never reached the decoder and the verdict is about nothing, so it FAILS. `held` is the level at
 // score time: non-zero is a button this driver still believes is down after the burst ended, which
-// is the stuck click itself. PASS iff `press_lost == recovered && release_orphan == 0 && held == 0
-// && edges > 0 && holed == 1 && press_lost >= 1`. `holed` is the second control — the fixture's own
+// is the stuck click itself. PTRPRESS2: PASS iff `holed == 1 && click_synth >= 1 && release_orphan == 0 && restated == 0
+// && press_lost == recovered && held == 0 && edges > 0 && inflight == depth && depth >= 2` (the old `press_lost >= 1` could never pass on a relative mouse: the report after a lost release carries motion and the level diff delivers the release itself). `holed` is the second control — the fixture's own
 // injected hole (see `ptrpress_hole`), without which the repair would be scored against a fault that
 // never happened. `-> FAIL` is in arroyo's FAULT_PATTERNS, so the leg's exit status carries it.
 //
@@ -16951,8 +16951,8 @@ pub fn enumeration_in_flight() -> bool {
 #[cfg(feature = "witness")]
 fn ptrpress_hole(buttons: u8, prev_btn: u8) -> bool {
     if PTRPRESS_STALLED.load(Ordering::Relaxed) == 0 { return false; }
-    if buttons != 0 || prev_btn == 0 { return false; }
-    PTRPRESS_HOLED.swap(1, Ordering::Relaxed) == 0
+    if buttons == 0 || prev_btn != 0 { return false; } // PTRPRESS2 — the first PRESS after the stall, not the first release: a press swallowed and its release delivered is the coalesced-click shape (the device's one report buffer overwritten before the host polled), and it is the fault the click synthesis repairs. ⚠ in place.
+    if PTRPRESS_HOLED.swap(1, Ordering::Relaxed) != 0 { return false; } PTRPRESS_HOLE_NEXT.store(1, Ordering::Relaxed); true // PTRPRESS2 — and the NEXT decoded report is owned by this hole (`ptrpress_explained`), so the restatement it produces is not counted as the wire's.
 }
 
 /// PTRPRESS — cycles to microseconds, over `xhcihub_hz()` (the same fold, already `witness`-gated;
@@ -16970,7 +16970,7 @@ fn ptrpress_note(slot_id: u8, buttons: u8, prev_btn: u8) {
     if buttons == prev_btn { return; }
     PTRPRESS_EDGES.fetch_add(1, Ordering::Relaxed);
     let now = crate::arch::now_cycles();
-    let _ = PTRPRESS_FIRST_EDGE.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+    let _ = PTRPRESS_FIRST_EDGE.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed); if buttons != 0 && prev_btn == 0 { PTRPRESS_PRESS_AT.store(now, Ordering::Relaxed); } else if buttons == 0 { let t = PTRPRESS_PRESS_AT.swap(0, Ordering::Relaxed); if t != 0 { PTRPRESS_PRESS_MAX.fetch_max(now.wrapping_sub(t), Ordering::Relaxed); } } // PTRPRESS2 — the press->release interval of every pair the DECODER saw both halves of (a release with no decoded press behind it leaves `PTRPRESS_PRESS_AT` at 0 and is not timed); `press_us` on the line is the longest. Read against `armgap_us`: a click shorter than the dark window is the only way a whole pair could hide in it.
     if buttons != 0 && PTRPRESS_STALLED.swap(1, Ordering::Relaxed) == 0 {
         let budget = PTRPRESS_STALL_MS.saturating_mul(xhcihub_hz()) / 1000;
         while crate::arch::now_cycles().wrapping_sub(now) < budget { core::hint::spin_loop(); }
@@ -16994,17 +16994,17 @@ impl XhciController {
         let recovered = MOUSE_PRESS_RECOVERED.load(Ordering::Relaxed);
         let edges = PTRPRESS_EDGES.load(Ordering::Relaxed);
         let holed = PTRPRESS_HOLED.load(Ordering::Relaxed);
-        let pass = holed == 1 && lost >= 1 && lost == recovered && orphan == 0 && held == 0 && edges > 0;
+        let (inflight, depth, synth, restated) = (MOUSE_OUTSTANDING.load(Ordering::Relaxed), MOUSE_DEPTH_WANT.load(Ordering::Relaxed), MOUSE_CLICK_SYNTH.load(Ordering::Relaxed), MOUSE_RESTATED_COUNT.load(Ordering::Relaxed)); let pass = holed == 1 && synth >= 1 && orphan == 0 && restated == 0 && lost == recovered && held == 0 && edges > 0 && inflight == depth && depth >= 2; // PTRPRESS2 — the verdict the header states.
         serial_println!(
-            ":: PTRPRESS: reports={} press_lost={} release_orphan={} recovered={} armgap_us={} restated={} edges={} held={:#04x} holed={} rearm={} discard={} dup={} nobuf={} errrearm={} -> {} ::",
+            ":: PTRPRESS: reports={} press_lost={} release_orphan={} recovered={} armgap_us={} restated={} edges={} held={:#04x} holed={} rearm={} discard={} dup={} nobuf={} errrearm={} inflight={} depth={} click_synth={} moving_dup={} press_us={} skipped={} -> {} ::",
             PTRPRESS_REPORTS.load(Ordering::Relaxed), lost, orphan, recovered,
             ptrpress_us(MOUSE_ARMGAP_MAX.load(Ordering::Relaxed)),
-            MOUSE_RESTATED_COUNT.load(Ordering::Relaxed), edges, held, holed,
+            restated, edges, held, holed,
             MOUSE_REARM_COUNT.load(Ordering::Relaxed),
             MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed),
             MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed),
             MOUSE_NOBUF_DROP_COUNT.load(Ordering::Relaxed),
-            MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed),
+            MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed), inflight, depth, synth, MOUSE_RESTATED_MOVING.load(Ordering::Relaxed), ptrpress_us(PTRPRESS_PRESS_MAX.load(Ordering::Relaxed)), MOUSE_SKIPPED_COUNT.load(Ordering::Relaxed),
             if pass { "PASS" } else { "FAIL" }
         );
     }
@@ -17866,4 +17866,117 @@ pub fn poll_task_armed() -> bool {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn poll_task_armed() -> bool {
     false
+}
+
+// ── PTRPRESS2 (rmbp-ledger B633) — the pointer interrupt-IN at depth N, and the click the wire swallowed ──
+//
+// TAIL APPEND, so nothing above moves (kernel8.img panic-`Location` identity); every call site above is
+// folded onto an existing line. XHCINTD (B44) gave the KEYBOARD `KBD_INFLIGHT` Normal TRBs outstanding
+// and left the pointer on ONE: `queue_mouse_read` was the pointer branch's last statement, so the
+// endpoint had no TD from the controller's retirement until the decode finished. This is the same
+// repair re-cut for the pointer, over its own armed set (`mouse_armed_trb/_buf/_n`, folded onto
+// `mouse_prev_phys`) and its own pool (`mouse_data_buffer + i * MOUSE_BUF_STRIDE`, inside the existing
+// 512-byte 64-aligned allocation: 4 x 64 = 256). The xHCI transfer ring holds the TDs (16 entries,
+// `TransferRing::new(16)`), which EHCI's overlay could not (TPSTREAM B624 §4.3).
+
+/// PTRPRESS2 — Normal TRBs the pointer interrupt-IN keeps outstanding at once.
+pub const MOUSE_INFLIGHT: usize = 4;
+/// PTRPRESS2 — each outstanding TRB's own report buffer, carved from `mouse_data_buffer` at this
+/// stride. 64 is the aarch64 D-cache line, so the `inval` of a retired buffer never touches an armed one.
+pub const MOUSE_BUF_STRIDE: usize = 64;
+/// PTRPRESS2 — GAUGE: pointer TRBs armed right now (`MOUSE_INFLIGHT` in steady state). `inflight=`.
+pub static MOUSE_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
+/// PTRPRESS2 — the depth `mouse_top_up` last aimed at (`MOUSE_INFLIGHT`, or 1 for an MPS over the stride). `depth=`.
+pub static MOUSE_DEPTH_WANT: AtomicU64 = AtomicU64::new(0);
+/// PTRPRESS2 — armed TRBs a completion stepped OVER (out-of-order retirement or a missed event). `skipped=`.
+pub static MOUSE_SKIPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+/// PTRPRESS2 — clicks synthesised (press then release) for a motionless report whose mask equals an UP
+/// level: a press and its release both happened between two reports the decoder saw. `click_synth=`.
+pub static MOUSE_CLICK_SYNTH: AtomicU64 = AtomicU64::new(0);
+/// PTRPRESS2 — relative reports byte-identical to their predecessor that CARRY MOTION: legitimate
+/// repeated deltas, which the old byte-identity test convicted as lost edges. Counted, nothing else. `moving_dup=`.
+pub static MOUSE_RESTATED_MOVING: AtomicU64 = AtomicU64::new(0);
+/// PTRPRESS2 — set by the injected hole, consumed by the next decoded report (witness only).
+#[cfg(feature = "witness")] pub static PTRPRESS_HOLE_NEXT: AtomicU64 = AtomicU64::new(0);
+/// PTRPRESS2 — `now_cycles` of the last decoded press edge, 0 = none pending (witness only).
+#[cfg(feature = "witness")] pub static PTRPRESS_PRESS_AT: AtomicU64 = AtomicU64::new(0);
+/// PTRPRESS2 — the longest decoded press->release, in cycles (witness only). `press_us=`.
+#[cfg(feature = "witness")] pub static PTRPRESS_PRESS_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// PTRPRESS2 — `true` once, for the first report decoded after the fixture's injected hole: its
+/// restatement is the hole's, not the wire's. Always `false` without `witness`.
+#[cfg(feature = "witness")]
+fn ptrpress_explained() -> bool { PTRPRESS_HOLE_NEXT.swap(0, Ordering::Relaxed) != 0 }
+#[cfg(not(feature = "witness"))]
+#[inline(always)]
+fn ptrpress_explained() -> bool { false }
+
+/// PTRPRESS2 — [`kbd_retire_set`]'s twin over the pointer's armed set: on a miss nothing changes and
+/// `None` comes back (the dup guard's old `param != mouse_expect_phys`); on a hit at `p` the set is popped
+/// through `p` (older entries name TDs that will never report; `p > 0` is counted into
+/// `MOUSE_SKIPPED_COUNT`), `prev_phys` becomes the retired TRB, and the buffer it was armed with comes back.
+fn mouse_retire_set(
+    armed_trb: &mut [u64; MOUSE_INFLIGHT],
+    armed_buf: &mut [u64; MOUSE_INFLIGHT],
+    armed_n: &mut u8,
+    prev_phys: &mut u64,
+    param: u64,
+) -> Option<u64> {
+    let n = (*armed_n as usize).min(MOUSE_INFLIGHT);
+    let p = (0..n).find(|&i| armed_trb[i] == param)?;
+    let buf = armed_buf[p];
+    *prev_phys = param;
+    if p > 0 { MOUSE_SKIPPED_COUNT.fetch_add(p as u64, Ordering::Relaxed); }
+    let keep = n - p - 1;
+    for i in 0..keep {
+        armed_trb[i] = armed_trb[p + 1 + i];
+        armed_buf[i] = armed_buf[p + 1 + i];
+    }
+    for i in keep..n {
+        armed_trb[i] = 0;
+        armed_buf[i] = 0;
+    }
+    *armed_n = keep as u8;
+    MOUSE_OUTSTANDING.store(keep as u64, Ordering::Relaxed);
+    Some(buf)
+}
+
+impl XhciController {
+    /// PTRPRESS2 — how many TRBs this slot's pointer may keep outstanding: `MOUSE_INFLIGHT`, **1** when
+    /// the endpoint's MPS exceeds `MOUSE_BUF_STRIDE` (pool buffers would overlap, so such a device keeps
+    /// exactly the old single-TRB behaviour), **0** with no buffer or no ring.
+    fn mouse_inflight(&self, slot_id: u8) -> usize {
+        let s = &self.slots[slot_id as usize];
+        if s.mouse_data_buffer.is_none() || s.mouse_ring.is_none() { return 0; }
+        if (s.mouse_mps as usize) > MOUSE_BUF_STRIDE { 1 } else { MOUSE_INFLIGHT }
+    }
+
+    /// PTRPRESS2 — the lowest pool buffer not currently armed; `None` when the set is at depth.
+    fn mouse_free_buf(&self, slot_id: u8) -> Option<u64> {
+        let want = self.mouse_inflight(slot_id);
+        let s = &self.slots[slot_id as usize];
+        let base = s.mouse_data_buffer? as u64;
+        let n = (s.mouse_armed_n as usize).min(MOUSE_INFLIGHT);
+        (0..want).map(|i| base + (i * MOUSE_BUF_STRIDE) as u64).find(|c| !s.mouse_armed_buf[..n].contains(c))
+    }
+
+    /// PTRPRESS2 — [`mouse_retire_set`] over this slot's armed set. The caller holds no borrow of `self.slots`.
+    fn mouse_retire(&mut self, slot_id: u8, param: u64) -> Option<u64> {
+        let s = &mut self.slots[slot_id as usize];
+        mouse_retire_set(&mut s.mouse_armed_trb, &mut s.mouse_armed_buf, &mut s.mouse_armed_n, &mut s.mouse_prev_phys, param)
+    }
+
+    /// PTRPRESS2 — arm Normal TRBs on this slot's pointer interrupt-IN until `mouse_inflight()` are
+    /// outstanding. A no-op when full, so every arm site calls it unconditionally; bounded by
+    /// `MOUSE_INFLIGHT` iterations whatever the slot state, so a corrupted count can stall the endpoint
+    /// but never spin the pump.
+    fn mouse_top_up(&mut self, slot_id: u8) {
+        let want = self.mouse_inflight(slot_id);
+        if want != 0 { MOUSE_DEPTH_WANT.store(want as u64, Ordering::Relaxed); }
+        for _ in 0..MOUSE_INFLIGHT {
+            if (self.slots[slot_id as usize].mouse_armed_n as usize) >= want { break; }
+            if self.mouse_free_buf(slot_id).is_none() { break; }
+            self.queue_mouse_read(slot_id);
+        }
+    }
 }
