@@ -418,6 +418,6 @@ refs/heads/exec-rmbp-bootlogcard              6372ae0d FOLDED-BY-HAND da5885ed 2
 refs/heads/exec-rmbp-cursorshape              abcb8d33 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-jobscan2                 1a9eaeb7 FOLDED-BY-HAND ceaecdc7 2026-10-13
 refs/heads/exec-host-aetherstyle3             abcb8d33 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-host-aethersw                 abcb8d33 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aethersw                 ba928bd0 FOLDED-BY-HAND 13e01cbc 2026-10-13
 refs/heads/exec-rmbp-sonde2                   abcb8d33 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-unakeys                  abcb8d33 IN-FLIGHT cloud 2026-10-13
