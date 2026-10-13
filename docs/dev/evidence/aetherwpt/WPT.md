@@ -147,3 +147,25 @@ in this series (spec section, the `wpt2_gaps.rs` test that pins it); **owed** = 
 | O7 | WebCryptoAPI | ECDSA / ECDH / Ed25519 / X25519 / RSA in `crypto.subtle` (crypto_core has the primitives), `jwk` / `pkcs8` / `spki` formats, `wrapKey` / `unwrapKey` (NotSupportedError today), AES-KW; AES-CBC needs the AES inverse cipher, which crypto_core's `aes` lacks (encrypt-only) — a change in `unaos/libs/sys/crypto_core/src/aes.rs`, outside this arc's files | owed |
 | O8 | html/browsers/* | auxiliary browsing contexts (`window.open` is a stub), the Navigation API (`navigation`, `NavigateEvent`), bfcache | owed |
 | O9 | shadow-dom, selection | `adoptedStyleSheets` / constructable stylesheets, `Selection.getComposedRanges`, `Selection.modify` (needs layout) | owed |
+
+### Tests and what the bench should expect
+
+- `tests/wpt_dom.rs`: `wpt2_url`, `wpt2_encoding`, `wpt2_fetch_api`, `wpt2_streams`, `wpt2_fileapi`,
+  `wpt2_webstorage`, `wpt2_indexeddb`, `wpt2_html_browsers_history`, `wpt2_html_browsers_the_window_object`,
+  `wpt2_html_browsers_browsing_the_web`, `wpt2_html_semantics_scripting_1`,
+  `wpt2_html_semantics_embedded_content`, `wpt2_html_semantics_tabular_data`,
+  `wpt2_html_semantics_interactive_elements`, `wpt2_html_semantics_text_level_semantics`,
+  `wpt2_html_semantics_grouping_content`, `wpt2_custom_elements`, `wpt2_shadow_dom`, `wpt2_selection`,
+  `wpt2_uievents`, `wpt2_pointerevents`, `wpt2_webcryptoapi`, `wpt2_compression`, `wpt2_resource_timing`,
+  `wpt2_performance_timeline`, `wpt2_console`, `wpt2_html_infrastructure_urls` (floor 0 each; a debug build
+  skips them unless `AETHER_WPT=1`), and `wpt2_directory_table_is_complete` (runs in every build: table =
+  tests = sparse lines). Each prints `wpt <dir> (served N test pages): pass/total`, the skipped pages by
+  reason, and the count of pages without testharness.js; per-file results go to `target/wpt-<dir>.tsv`
+  (`/` → `-`).
+- `tests/wpt2_gaps.rs` (headless, no network): `g1_urlsearchparams_per_url_standard`,
+  `g2_textdecoder_per_encoding_standard`, `g3_queuing_strategies_and_size`, `g4_blob_and_file_constructors`,
+  `g5_table_caption_thead_tfoot_tbody`, `g6_get_random_values_checks`, `g7_subtle_crypto_symmetric`,
+  `g8_performance_timeline_delivers`, `g9_console_namespace_and_labels`.
+- lib: `api::subtle::tests::subtle_primitives_known_answers`.
+- The existing net directories (`wpt_websockets`, `wpt_eventsource`, `wpt_xhr`) run through the same,
+  generalised `run_served_dir` with their unchanged `net_excluded`; their scores should not move.
