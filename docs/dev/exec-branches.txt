@@ -426,3 +426,8 @@ refs/heads/exec-rmbp-pointerscale2            cc2b7a8a IN-FLIGHT cloud 2026-10-1
 refs/heads/exec-rmbp-dockshell                4936bc2c FOLDED-BY-HAND 21901b42 2026-10-13
 refs/heads/exec-rmbp-screenshotfat            d20412c5 FOLDED-BY-HAND e5a8bd8c 2026-10-13
 refs/heads/exec-rmbp-queuesleep2              cc2b7a8a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aetherjs2                98d9f842 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aethermedia              98d9f842 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-sonde3                   98d9f842 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-prefchanged              98d9f842 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-palettecore              98d9f842 IN-FLIGHT cloud 2026-10-13
