@@ -144,7 +144,7 @@ pub fn selftest() {
     use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
     use raw_core::synth::{self, Coding};
     let mt = crate::shell::vfs_mount_table();
-    let home = crate::fs::trash::home_base();
+    let home = crate::fs::trash::home_base(); if let Some(k) = crate::fs::vfs::home_unwritable(&mt, &home) { serial_println!(":: RAWCORE: home={} -> SKIP reason=home-not-writable({}) ::", home, k); return; } // QEMUSKIP (B613): the home first
     let (pa, pc) = (alloc::format!("{}/RAWTEST.ARW", home), alloc::format!("{}/RAWTESTC.ARW", home));
     let (w, h) = (64u32, 32u32);
     let file = synth::arw(w, h, &synth::ramp(w, h), Coding::Plain14);

@@ -279,6 +279,7 @@ pub fn selftest() {
         serial_println!(":: FILETYPE: typed=0 sniffed=0 ext=0 assoc=- override=- quarry=- reason=no-volume -> SKIP ::");
         return;
     };
+    if let Some(k) = crate::fs::vfs::home_unwritable(&mt, dir) { serial_println!(":: FILETYPE: typed=0 sniffed=0 ext=0 assoc=- override=- quarry=- dir={} -> SKIP reason=home-not-writable({}) ::", dir, k); return; } // QEMUSKIP (B613): a store that refuses writes cannot stage FTPIC.DAT
     let p = |leaf: &str| if dir == "/" { alloc::format!("/{}", leaf) } else { alloc::format!("{}/{}", dir, leaf) };
     let (png, wav, lnx, una) = (&type_core::fixture::PNG[..], &type_core::fixture::WAV[..], type_core::fixture::elf(0x40_0000), type_core::fixture::elf(0));
     // (leaf, content, the type it must come out as, the leg that must decide it before any stamp)

@@ -1437,6 +1437,9 @@ fn main() {
     let trust_ok = stage_trust(&trust_src, &esp_dir);
     // KERNELFONT (B359): the UI faces, on the ESP (single-stick boots) and on the DATA volume below.
     let _ = stage_fonts(&kfont_dirs_env(), &esp_dir);
+    // QEMUSKIP (B613, B600): the test-f fixtures on the QEMU root too (the ESP directory IS the root under
+    // `fat:rw:`), the way metal gets them on the card's UnaFS /system.
+    let _ = stage_testf(&workspace_dir.join("builder/testf.list"), &target_dir.join("testf-cache"), &esp_dir);
 
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.

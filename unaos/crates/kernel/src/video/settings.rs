@@ -1078,7 +1078,7 @@ fn press_users(row: usize, cx: usize) {
 /// through the VFS, parse it with prefs_core, compare, restore.
 #[cfg(feature = "witness")]
 pub fn selftest() {
-    let before = CUR.lock().clone();
+    if let Some(k) = crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()) { serial_println!(":: SETTINGS: controls={} tabs={} store={} -> SKIP reason=home-not-writable({}) ::", CONTROLS, TABS, crate::prefs::path(), k); return; } let before = CUR.lock().clone(); // QEMUSKIP (B613): the save + re-read legs need the store's volume to take a write
     let opened = open().is_ok();
     set(3, idle_index(5));
     let want = CUR.lock().clone();

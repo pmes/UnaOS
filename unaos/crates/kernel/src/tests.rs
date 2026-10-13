@@ -153,8 +153,8 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] /* ARMNOEL0: the prefs_client cfg (lib.rs) */ crate::prefs_client::ensure_tests(); #[cfg(feature = "selfdiag")] crate::selfdiag::ensure(); // EXECNAME (B322): `tests exec`. SETTINGSBUS (B337): `tests settingsbus`. SELFDIAG (B324): `tests selfdiag`. (merge12 fold: one line)
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
-        for e in t.iter().flatten() { console.println(&format!("{:<14} {}", e.0, crate::smallfix3::arc_of(e.0))); } // SMALLFIX3 (B416): each fixture with its arc
-        console.println(&format!("{} deferred, {} ran at boot", deferred_count(), AT_BOOT.load(Ordering::Relaxed)));
+        for e in t.iter().flatten() { console.println(&format!("{:<14} {}", e.0, crate::smallfix3::arc_of(e.0))); serial_println!("[tests] list {:<14} {}", e.0, crate::smallfix3::arc_of(e.0)); } // SMALLFIX3 (B416): each fixture with its arc. QEMUSKIP (B558/B613): and on the wire — the serial door never sees a routed verb's console (LINE-NEUTRAL append, before this comment)
+        console.println(&format!("{} deferred, {} ran at boot", deferred_count(), AT_BOOT.load(Ordering::Relaxed))); serial_println!(":: TESTS: list n={} deferred={} at_boot={} ::", t.iter().flatten().count(), deferred_count(), AT_BOOT.load(Ordering::Relaxed)); // QEMUSKIP (B558/B613): the list's tail on the wire (LINE-NEUTRAL append, before this comment)
         return;
     }
     let name = args.first().copied(); *ARG.lock() = args.get(1).map(|a| alloc::string::String::from(*a)); // AUDIOCODEC (SR30): `tests play <fmt>` reads its <fmt> via `arg()`

@@ -450,7 +450,7 @@ pub fn ensure_tests() {
 pub fn selftest() {
     use crate::prefs::key;
     use crate::video::settings;
-    subscribe();
+    if let Some(k) = crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()) { serial_println!(":: SETTINGSBUS: via=- store={} -> SKIP reason=home-not-writable({}) ::", crate::prefs::path(), k); return; } subscribe(); // QEMUSKIP (B613): `set=` is a save to <home>/settings
     let _ = settings::bus_changes(); // earlier changes are not this fixture's
     let live0 = crate::video::dimidle::idle_min() as i64;
     let before = sys_int(key::IDLE_MIN, 0, 1440);

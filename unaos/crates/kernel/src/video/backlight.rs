@@ -202,7 +202,7 @@ pub fn selftest() {
     serial_println!(
         ":: BRIGHTFLOOR: floor={} set0_on={} load_clamped={} reset_ok={} full={} mono={} driver={} -> {} ::",
         FLOOR, set0_on as u8, load_clamped as u8, reset_ok as u8, full as u8, mono as u8,
-        if a0.hw { "gmux" } else { "sim" }, if ok { "PASS" } else { "FAIL" }
+        if a0.hw { "gmux" } else { "sim" }, if ok { "PASS" } else if mono && load_clamped && reset_ok && gmux_absent() { "SKIP reason=no-gmux" } else { "FAIL" } // QEMUSKIP (B613): the pure legs held; only the register legs met no gmux
     );
 }
 
@@ -474,7 +474,7 @@ pub fn brightstep() {
     serial_println!(
         ":: BRIGHTSTEP: steps={} readback_ok={} slider_sync={} keys={} driver={} -> {} ::",
         n, rb_ok, if sync_ok == n { "ok" } else { "bad" }, if keys { "ok" } else { "bad" },
-        if hw { "gmux" } else { "sim" }, if ok { "PASS" } else { "FAIL" }
+        if hw { "gmux" } else { "sim" }, if ok { "PASS" } else if keys && gmux_absent() { "SKIP reason=no-gmux" } else { "FAIL" } // QEMUSKIP (B613): the key-scale KAT held; the readbacks met no gmux
     );
 }
 
@@ -499,4 +499,22 @@ pub fn off_via(via: &str) -> (bool, Option<u32>, bool) {
     let mut rb = [0u8; 12];
     serial_println!("[backlight] off reg=0 readback={} driver={} via={}", fmt_opt(r.1, &mut rb), if r.2 { "gmux" } else { "sim" }, via);
     r
+}
+
+// ── QEMUSKIP (rmbp-ledger B613) — TAIL-APPENDED. IS THE GMUX THERE? THE DRIVER'S OWN ANSWER ───────────────────────────
+// `panel_max` reports `hw=true` on every gmux build, gmux or not, so a machine without one (QEMUIMAGE26: `[backlight] seed
+// readback=- max=1023 … (gmux did not answer …)`, every `readback=-`) failed `tests brightfloor`/`brightstep`/`lidsleep` on
+// hardware it does not have. The probe is the driver's own: `igpu::gmux_max_brightness` filters the timeout and the
+// all-ones float of an absent gmux (drivers/gpu/igpu.rs `gmux_max_brightness`). A build that drives no gmux ("sim") answers
+// `false` here — its fixtures run on the simulated register as before.
+
+/// QEMUSKIP (B613): `true` when this build drives the gmux and the gmux does not answer its range read.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd", feature = "intel-ivb"))]
+pub fn gmux_absent() -> bool {
+    crate::drivers::gpu::igpu::gmux_max_brightness().is_none()
+}
+/// QEMUSKIP (B613): no gmux on this build — the simulated register is the driver; nothing is absent.
+#[cfg(not(all(target_arch = "x86_64", feature = "gmux_igd", feature = "intel-ivb")))]
+pub fn gmux_absent() -> bool {
+    false
 }

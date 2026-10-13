@@ -866,7 +866,7 @@ pub fn tests_gpublit() {
     if !BUILT.load(Acquire) {
         let why = if VERDICT.load(Acquire) == 0 { "no-takeover" } else { *REFUSED.lock() };
         serial_println!(":: GPUBLIT: selftest=refused({}) ce_us=0 cpu_us=0 -> blitter=cpu ::", why);
-        serial_println!(":: GPUBLIT-TEST: rerun=refused boot={} -> FAIL ::", boot);
+        serial_println!(":: GPUBLIT-TEST: rerun=refused boot={} -> {} ::", boot, if VERDICT.load(Acquire) == 0 { "SKIP reason=no-kepler" } else { "FAIL" }); // QEMUSKIP (B613): VERDICT 0 = this driver never took a Kepler over (`reason()` no-takeover); a refused takeover stays FAIL
         return;
     }
     let t0 = crate::arch::now_cycles();

@@ -224,7 +224,7 @@ pub fn selftest() {
     let mt = crate::shell::vfs_mount_table();
     serial_println!("[selfdiag] bootlog state={} boot={} kept={} lost={} tree={}", bootlog, n, kept, lost, tree_root(&mt).as_deref().unwrap_or("none"));
     let unafs = crate::bootwit::root_is_unafs(&mt);
-    let dir: &str = if unafs { "/var/tmp/selfdiag" } else { "/boot/SDFIX" };
+    let dir: &str = if unafs { "/var/tmp/selfdiag" } else { "/boot/SDFIX" }; if let Some(k) = crate::fs::vfs::home_unwritable(&mt, dir) { serial_println!(":: SELFDIAG: provider=echo dir={} bootlog={} -> SKIP reason=home-not-writable({}) ::", dir, bootlog, k); return; } // QEMUSKIP (B613): the fixture tree is written there first (`stage=mkdirs`)
     match run_fixture(&mt, dir) {
         Ok(f) => {
             serial_println!("[selfdiag] fx root={} dir={} prompt={} answer={} hunks={} next={}", if unafs { "unafs" } else { "fat" }, dir, f.prompt, f.answer, f.hunks, f.next);

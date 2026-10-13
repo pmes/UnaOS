@@ -180,7 +180,7 @@ pub fn selftest() {
     let verdict = match (m, b.word()) {
         (Msld::Ok(..), "ok") if restored => "PASS",
         (Msld::Ok(..) | Msld::Unbuilt, "unarmed") => "SKIP",
-        _ => "FAIL",
+        _ if super::backlight::gmux_absent() => "SKIP reason=no-gmux", _ => "FAIL", // QEMUSKIP (B613): the blank is a gmux write; no gmux answered
     };
     serial_println!(
         ":: LIDSLEEP: msld={} raw={} flips={} backlight_off={} prior={} off_rb={} restore_rb={} armed={} -> {} ::",
