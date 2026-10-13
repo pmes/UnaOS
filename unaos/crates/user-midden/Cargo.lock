@@ -31,6 +31,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "palette_core"
+version = "0.1.0"
+
+[[package]]
 name = "tls_core"
 version = "0.1.0"
 
@@ -45,6 +49,7 @@ dependencies = [
  "font8x8",
  "font_core",
  "midden_core",
+ "palette_core",
  "una-abi",
  "vein_ring3",
 ]

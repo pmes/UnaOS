@@ -22,3 +22,7 @@ wm.rs           0x165667B1      the xxhash32 PRIME32_5 in the window-identity ha
 ../selftest.rs  0x1234_5678  the RwLock round-trip marker word
 ../selftest.rs  0xC0FFEE     the channel round-trip token
 loginrender.rs  0xff_ffff    the 24-bit duration field of a stamp ring word (LOGINRENDER B514), a mask, not a pixel
+../../../user-aether/src/theme.rs  0x5448_0000  the PREFS bus correlation-id base ("TH" tag) of the theme client, not a pixel (PALETTECORE B559 brought ring 3 into scope)
+../../../user-una/src/theme.rs  0x5448_0000  the PREFS bus correlation-id base ("TH" tag) of the theme client, not a pixel (PALETTECORE B559 brought ring 3 into scope)
+../../../user-midden/src/theme.rs  0x5448_0000  the PREFS bus correlation-id base ("TH" tag) of the theme client, not a pixel (PALETTECORE B559 brought ring 3 into scope)
+../../../user-lumen/src/theme.rs  0x5448_0000  the PREFS bus correlation-id base ("TH" tag) of the theme client, not a pixel (PALETTECORE B559 brought ring 3 into scope)

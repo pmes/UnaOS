@@ -30,6 +30,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "palette_core"
+version = "0.1.0"
+
+[[package]]
 name = "slotmap"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -67,6 +71,7 @@ dependencies = [
  "font_core",
  "html_core",
  "layout_core",
+ "palette_core",
  "una-abi",
 ]
 

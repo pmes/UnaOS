@@ -31,8 +31,9 @@
 //!
 //! **Taste gate is CLOSED — APPROVED** (iteration 3, Peter, 2026-07-26). These are
 //! no longer provisional: the visual verdict has been taken on the kit these
-//! numbers come from. A later verdict change edits THIS FILE ONLY — every consumer
-//! reads the names, never the literals.
+//! numbers come from. A later verdict change edits the VALUE in `unaos/libs/sys/palette_core` (PALETTECORE,
+//! rmbp-ledger B559: the one no_std table both rings link) and its provenance HERE — every consumer, kernel or
+//! ring 3, reads the names, never the literals. This file re-exports every colour; it spells none.
 //!
 //! # Wiring status
 //!
@@ -68,7 +69,8 @@
 //!
 //! See `docs/dev/OS/08_VIDEO/engine.md` §CRISPYWIRE and §CURSOR-VANISH.
 //!
-//! A verdict change still edits THIS FILE ONLY: every consumer reads the names.
+//! A verdict change still edits ONE table (`palette_core`, the values) and this header (the provenance): every
+//! consumer reads the names.
 //!
 //! # Representation
 //!
@@ -127,65 +129,65 @@
 
 // ---------------------------------------------------------------------------
 // Palette — 21 roles, packed 0x00RRGGBB. Every provenance comment below quotes
-// the json triple at `us-crispy-modern` `0787ba9f`.
+// the json triple at `us-crispy-modern` `0787ba9f`; the value is `palette_core`'s (B559), re-exported by name.
 // ---------------------------------------------------------------------------
 
 /// `palette.chrome_face` = `[0.925, 0.925, 0.933]` @ `0787ba9f` — the window body fill.
-pub const CHROME_FACE: u32 = 0x00EC_ECEE;
+pub use palette_core::CHROME_FACE;
 
 /// `palette.bevel_light` = `[1.0, 1.0, 1.0]` @ `0787ba9f` — top/left bevel edge.
-pub const BEVEL_LIGHT: u32 = 0x00FF_FFFF;
+pub use palette_core::BEVEL_LIGHT;
 
 /// `palette.bevel_shadow` = `[0.667, 0.667, 0.686]` @ `0787ba9f` — bottom/right bevel edge.
-pub const BEVEL_SHADOW: u32 = 0x00AA_AAAF;
+pub use palette_core::BEVEL_SHADOW;
 
 /// `palette.frame_line` = `[0.706, 0.706, 0.725]` @ `0787ba9f` — the outer keyline of the frame.
-pub const FRAME_LINE: u32 = 0x00B4_B4B9;
+pub use palette_core::FRAME_LINE;
 
 /// `palette.title_active_top` = `[0.933, 0.933, 0.945]` @ `0787ba9f` — focused title gradient, top stop.
-pub const TITLE_ACTIVE_TOP: u32 = 0x00EE_EEF1;
+pub use palette_core::TITLE_ACTIVE_TOP;
 
 /// `palette.title_active_bottom` = `[0.89, 0.89, 0.91]` @ `0787ba9f` — focused title gradient, bottom stop.
-pub const TITLE_ACTIVE_BOTTOM: u32 = 0x00E3_E3E8;
+pub use palette_core::TITLE_ACTIVE_BOTTOM;
 
 /// `palette.title_inactive_top` = `[0.957, 0.957, 0.961]` @ `0787ba9f` — unfocused title gradient, top stop.
-pub const TITLE_INACTIVE_TOP: u32 = 0x00F4_F4F5;
+pub use palette_core::TITLE_INACTIVE_TOP;
 
 /// `palette.title_inactive_bottom` = `[0.937, 0.937, 0.945]` @ `0787ba9f` — unfocused title gradient, bottom stop.
-pub const TITLE_INACTIVE_BOTTOM: u32 = 0x00EF_EFF1;
+pub use palette_core::TITLE_INACTIVE_BOTTOM;
 
 /// `palette.title_text_active` = `[0.145, 0.149, 0.161]` @ `0787ba9f` — focused title caption ink.
-pub const TITLE_TEXT_ACTIVE: u32 = 0x0025_2629;
+pub use palette_core::TITLE_TEXT_ACTIVE;
 
 /// `palette.title_text_inactive` = `[0.478, 0.478, 0.494]` @ `0787ba9f` — unfocused title caption ink.
-pub const TITLE_TEXT_INACTIVE: u32 = 0x007A_7A7E;
+pub use palette_core::TITLE_TEXT_INACTIVE;
 
 /// `palette.button_face` = `[0.973, 0.973, 0.98]` @ `0787ba9f` — resting button face.
-pub const BUTTON_FACE: u32 = 0x00F8_F8FA;
+pub use palette_core::BUTTON_FACE;
 
 /// `palette.button_face_pressed` = `[0.878, 0.878, 0.89]` @ `0787ba9f` — pressed button face.
-pub const BUTTON_FACE_PRESSED: u32 = 0x00E0_E0E3;
+pub use palette_core::BUTTON_FACE_PRESSED;
 
 /// `palette.button_text` = `[0.125, 0.129, 0.141]` @ `0787ba9f` — button label ink.
-pub const BUTTON_TEXT: u32 = 0x0020_2124;
+pub use palette_core::BUTTON_TEXT;
 
 /// `palette.content_fill` = `[0.96, 0.949, 0.918]` @ `0787ba9f` — content-region base fill.
 ///
 /// Unchanged across the CRISPY-PI-2 re-lift: iteration 3 kept the paper tone, and
 /// `content_surface.Paper.base_rgb` still agrees with it by construction.
-pub const CONTENT_FILL: u32 = 0x00F5_F2EA;
+pub use palette_core::CONTENT_FILL;
 
 /// `palette.content_text` = `[0.129, 0.125, 0.118]` @ `0787ba9f` — content-region ink.
-pub const CONTENT_TEXT: u32 = 0x0021_201E;
+pub use palette_core::CONTENT_TEXT;
 
 /// `palette.scroll_track` = `[0.949, 0.949, 0.957]` @ `0787ba9f` — scrollbar trough.
-pub const SCROLL_TRACK: u32 = 0x00F2_F2F4;
+pub use palette_core::SCROLL_TRACK;
 
 /// `palette.scroll_thumb` = `[0.796, 0.796, 0.812]` @ `0787ba9f` — scrollbar thumb.
-pub const SCROLL_THUMB: u32 = 0x00CB_CBCF;
+pub use palette_core::SCROLL_THUMB;
 
 /// `palette.accent` = `[0.29, 0.451, 0.667]` @ `0787ba9f` — selection / focus accent.
-pub const ACCENT: u32 = 0x004A_73AA;
+pub use palette_core::ACCENT;
 
 // ---------------------------------------------------------------------------
 // Title-bar controls. Iteration 3 replaces the single square `CONTROL_BOX` role
@@ -195,13 +197,13 @@ pub const ACCENT: u32 = 0x004A_73AA;
 // ---------------------------------------------------------------------------
 
 /// `palette.control_close` = `[0.239, 0.373, 0.573]` @ `0787ba9f` — close control fill.
-pub const CONTROL_CLOSE: u32 = 0x003D_5F92;
+pub use palette_core::CONTROL_CLOSE;
 
 /// `palette.control_mid` = `[0.404, 0.549, 0.729]` @ `0787ba9f` — middle (minimise) control fill.
-pub const CONTROL_MID: u32 = 0x0067_8CBA;
+pub use palette_core::CONTROL_MID;
 
 /// `palette.control_zoom` = `[0.573, 0.667, 0.788]` @ `0787ba9f` — zoom control fill.
-pub const CONTROL_ZOOM: u32 = 0x0092_AAC9;
+pub use palette_core::CONTROL_ZOOM;
 
 // ---------------------------------------------------------------------------
 // SEMANTIC control fills — Peter's ruling, 2026-08-09 (white board Q9, answer
@@ -247,17 +249,17 @@ pub const CONTROL_ZOOM: u32 = 0x0092_AAC9;
 /// Its red channel is already `0xFF`, so `knurl`'s crest CLIPS on this role and the
 /// crosshatch reads there as its trough alone — disclosed in `knurl.rs` and pinned by
 /// that module's leg 4 rather than left as an unchecked note.
-pub const CTRL_CLOSE: u32 = 0x00FF_5F57;
+pub use palette_core::CTRL_CLOSE;
 
 /// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — MINIMISE control
 /// fill: the macOS standard minimise hue, `#FEBC2E`, hue 43°. Supersedes this table's
 /// earlier muted derivation `#C89C52`. Pending re-lift as `palette.ctrl_min`.
-pub const CTRL_MIN: u32 = 0x00FE_BC2E;
+pub use palette_core::CTRL_MIN;
 
 /// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — ZOOM control fill:
 /// the macOS standard zoom hue, `#28C840`, hue 128°. Supersedes this table's earlier
 /// muted derivation `#5E9468`. Pending re-lift as `palette.ctrl_zoom`.
-pub const CTRL_ZOOM: u32 = 0x0028_C840;
+pub use palette_core::CTRL_ZOOM;
 
 // ---------------------------------------------------------------------------
 // Gloss — `palette.gloss`. A white highlight applied with a two-stop alpha
@@ -277,7 +279,7 @@ pub const Q16_ONE: u32 = 65536;
 /// Unchanged across the CRISPY-PI-2 re-lift; note that iteration 3 also takes
 /// `BEVEL_LIGHT` to pure white, so the two roles now coincide numerically. They stay
 /// separate names because they are separate roles in the json and may diverge again.
-pub const GLOSS_HIGHLIGHT: u32 = 0x00FF_FFFF;
+pub use palette_core::GLOSS_HIGHLIGHT;
 
 /// `palette.gloss.top_alpha` = `0.14` @ `0787ba9f` — gloss opacity at the top edge, Q16.
 pub const GLOSS_TOP_ALPHA_Q16: u32 = 9175;
@@ -464,7 +466,7 @@ const _: () = {
     ];
     let mut i = 0;
     while i < ROLES.len() {
-        assert!(ROLES[i] <= 0x00FF_FFFF);
+        assert!(ROLES[i] >> 24 == 0);
         i += 1;
     }
 };
@@ -779,14 +781,11 @@ pub const NAME: &str = "crispy";
 
 // --- TERMCOLOR (R75) — the terminal's 16-colour palette --------------------------------------------
 /// The console's default text colour (what an attribute-less cell paints).
-pub const TERM_FG: u32 = 0x00AA_AAAA;
+pub use palette_core::TERM_FG;
 /// The prompt's colour on the Moonstone console ground — the accent, lifted so it reads on dark.
-pub const TERM_ACCENT: u32 = 0x007F_B2F0;
+pub use palette_core::TERM_ACCENT;
 /// ANSI 0..7 (normal) then 8..15 (bright), tuned for the dark `0x2D2B55` ground.
-pub const ANSI16: [u32; 16] = [
-    0x0000_0000, 0x00CD_3131, 0x000D_BC79, 0x00E5_E510, 0x0024_72C8, 0x00BC_3FBC, 0x0011_A8CD, 0x00E5_E5E5,
-    0x0066_6666, 0x00F1_4C4C, 0x0023_D18B, 0x00F5_F543, 0x003B_8EEA, 0x00D6_70D6, 0x0029_B8DB, 0x00FF_FFFF,
-];
+pub use palette_core::ANSI16;
 /// Named picks the shell's own output uses (`Console::style`).
 pub const TERM_RED: u8 = 31;
 pub const TERM_GREEN: u8 = 32;
@@ -795,7 +794,9 @@ pub const TERM_DIM: u8 = 90;
 
 // ── APPEARANCE (rmbp-ledger B408, MACPARITY rows 21/22) — the system palette as TOKENS ─────────────────────────────
 // The Mac's rule: every colour on the glass comes from the system's palette, never a literal, so Light / Dark, the
-// accent and the highlight reach every control at once. The kit roles above stay as the LIGHT set's provenance (and
+// accent and the highlight reach every control at once. The sets, the accents and the fixed-look rows below are
+// `palette_core`'s (PALETTECORE B559 — the table the four ring-3 programs map their roles over too), re-exported
+// by name. The kit roles above stay as the LIGHT set's provenance (and
 // for the const contexts — selftest goldens, const asserts); every PAINTER reads the live value through the role
 // functions below (`chrome_face()` … `accent()`), which index the active set. `unaos/scripts/appearance-check.py`
 // certifies [`AUDIT_LITERALS_OUTSIDE`]: the colour literals under `video/` outside this file (before: 103).
@@ -806,89 +807,47 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering as AOrd};
 /// The colour literals under `video/` outside this file and in the listed painters (`scripts/appearance.painters`) — certified by `unaos/scripts/appearance-check.py`.
 pub const AUDIT_LITERALS_OUTSIDE: usize = 0;
 
-/// One palette token. Light = the kit (crispy) values above, unchanged; Dark = ours (neutral greys, the same accent).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum Tok {
-    WindowBg, BevelLight, BevelShadow, FrameLine, TitleActiveTop, TitleActiveBottom, TitleInactiveTop, TitleInactiveBottom,
-    TitleTextActive, TitleTextInactive, ButtonFace, ButtonFacePressed, ButtonText, ContentFill, ContentText, ScrollTrack,
-    ScrollThumb, ControlClose, ControlMid, ControlZoom, CtrlClose, CtrlMin, CtrlZoom, GlossHighlight, FieldBg, ErrorText,
-    MeterHigh, MeterMid, MeterLow, SyntaxCode, SyntaxNum, SyntaxLit,
-}
-
-/// Tokens in a set (the `tokens=` of the witness, plus the accent and the selection, which are chosen, not set rows).
-pub const TOKENS: usize = 32;
-pub const TOKEN_NAMES: [&str; TOKENS] = [
-    "WindowBg", "BevelLight", "BevelShadow", "FrameLine", "TitleActiveTop", "TitleActiveBottom", "TitleInactiveTop", "TitleInactiveBottom",
-    "TitleTextActive", "TitleTextInactive", "ButtonFace", "ButtonFacePressed", "ButtonText", "ContentFill", "ContentText", "ScrollTrack",
-    "ScrollThumb", "ControlClose", "ControlMid", "ControlZoom", "CtrlClose", "CtrlMin", "CtrlZoom", "GlossHighlight", "FieldBg", "ErrorText",
-    "MeterHigh", "MeterMid", "MeterLow", "SyntaxCode", "SyntaxNum", "SyntaxLit",
-];
-
-/// The LIGHT set: the kit's crispy roles as they are, plus the roles the audit lifted out of the painters.
-pub const LIGHT: [u32; TOKENS] = [
-    CHROME_FACE, BEVEL_LIGHT, BEVEL_SHADOW, FRAME_LINE, TITLE_ACTIVE_TOP, TITLE_ACTIVE_BOTTOM, TITLE_INACTIVE_TOP, TITLE_INACTIVE_BOTTOM,
-    TITLE_TEXT_ACTIVE, TITLE_TEXT_INACTIVE, BUTTON_FACE, BUTTON_FACE_PRESSED, BUTTON_TEXT, CONTENT_FILL, CONTENT_TEXT, SCROLL_TRACK,
-    SCROLL_THUMB, CONTROL_CLOSE, CONTROL_MID, CONTROL_ZOOM, CTRL_CLOSE, CTRL_MIN, CTRL_ZOOM, GLOSS_HIGHLIGHT,
-    0x00FF_FFFF, // FieldBg — Quarry's rename / new-folder field (was a literal in quarry/ops.rs)
-    0x00A0_2020, // ErrorText — Facet's failure line (was a literal in facet.rs)
-    0x00C8_4B3C, 0x00D9_A22E, 0x0043_A05A, // MeterHigh / Mid / Low — Activity's load ink (activity.rs)
-    0x0020_8040, 0x00B0_5000, 0x0080_30A0, // SyntaxCode / Num / Lit — FileView's tints (fileview.rs)
-];
-
-/// The DARK set: ours — neutral greys, the window controls' semantic hues kept, inks lifted for a dark ground.
-pub const DARK: [u32; TOKENS] = [
-    0x002A_2A2D, 0x003A_3A3E, 0x0016_1618, 0x004A_4A50, 0x003C_3C41, 0x0034_3438, 0x0030_3033, 0x002B_2B2E,
-    0x00E8_E8EC, 0x008E_8E94, 0x0048_484D, 0x005C_5C62, 0x00EE_EEF1, 0x001E_1E20, 0x00E6_E4DF, 0x0032_3236,
-    0x0060_6066, CONTROL_CLOSE, CONTROL_MID, CONTROL_ZOOM, CTRL_CLOSE, CTRL_MIN, CTRL_ZOOM, GLOSS_HIGHLIGHT,
-    0x002C_2C2F, 0x00E5_7373,
-    0x00D9_604F, 0x00E0_AE45, 0x0052_B86A,
-    0x006C_C88A, 0x00E3_9A55, 0x00C3_8BE0,
-];
-
-/// The eight accents (`prefs_core::appearance::ACCENTS` order), ours. Index 0 is the kit's own [`ACCENT`].
-pub const ACCENTS: [u32; 8] = [ACCENT, 0x002E_8C8C, 0x005B_8C3A, 0x00C0_8A1E, 0x00C0_603A, 0x00B0_4A6A, 0x007A_5AB0, 0x006E_6E73];
+/// The tokens, their names, the LIGHT and DARK sets and the eight accents (`prefs_core::appearance::ACCENTS` order)
+/// — PALETTECORE (rmbp-ledger B559): the one table both rings link, re-exported so every consumer keeps its `theme::` path.
+pub use palette_core::{Tok, ACCENTS, DARK, LIGHT, TOKENS, TOKEN_NAMES};
 
 /// Colours that are the same in both sets (the console is dark in both; the pointer is un-themed, PA38; Pulse and
 /// Facet's media ground are dark instruments) — consts, so the const contexts that read them keep compiling.
-pub const DESKTOP_BG: u32 = 0x002D_2B55;
-pub const PANEL_BG: u32 = 0x001E_1E1E;
-pub const CONSOLE_BG: u32 = 0x0000_0000;
-pub const CONSOLE_TEXT: u32 = 0x00C0_C0C0;
-pub const CONSOLE_BRIGHT: u32 = 0x00FF_FFFF;
-pub const PANIC_BG: u32 = 0x0030_0000;
+pub use palette_core::DESKTOP_BG;
+pub use palette_core::PANEL_BG;
+pub use palette_core::CONSOLE_BG;
+pub use palette_core::CONSOLE_TEXT;
+pub use palette_core::CONSOLE_BRIGHT;
+pub use palette_core::PANIC_BG;
 // BEZEL (B405) and PANICSCREEN (B406) are fixed-look overlays, the same in Light and Dark (APPEARANCE B408 moved
 // their literals here at merge17 so `appearance-check.py` holds at literals_outside_theme=0).
-pub const BEZEL_FACE: u32 = 0x0026_2629;
-pub const BEZEL_EDGE: u32 = 0x003C_3C40;
-pub const BEZEL_INK: u32 = 0x00EE_EEF0;
-pub const BEZEL_DIM: u32 = 0x004A_4A50;
-pub const PANIC_INK: u32 = 0x00EC_ECEE;
-pub const PANIC_INK_SMALL: u32 = 0x00A0_A0A6;
+pub use palette_core::BEZEL_FACE;
+pub use palette_core::BEZEL_EDGE;
+pub use palette_core::BEZEL_INK;
+pub use palette_core::BEZEL_DIM;
+pub use palette_core::PANIC_INK;
+pub use palette_core::PANIC_INK_SMALL;
 // SESSIONWEDGE (B525): the PUMPWEDGE band painted over the panel while the usb-pump is wedged (fixed-look, like PANIC).
-pub const WEDGE_BAND: u32 = 0x0060_1010;
-pub const WEDGE_INK: u32 = 0x00FF_F0E0;
+pub use palette_core::WEDGE_BAND;
+pub use palette_core::WEDGE_INK;
 // PLAYER (B419): the player's dim caption and the scrubber knob's edge (moved here at merge17).
-pub const PLAYER_DIM_TEXT: u32 = 0x0070_6E6A;
-pub const PLAYER_KNOB_EDGE: u32 = 0x00FF_FFFF;
-pub const POINTER_FILL: u32 = 0x00FF_FFFF;
-pub const POINTER_SHADOW: u32 = 0x0010_1014;
-pub const PULSE_BG: u32 = 0x0010_0E16;
-pub const PULSE_METER: u32 = 0x009B_59B6;
-pub const PULSE_LABEL: u32 = 0x008A_8296;
-pub const MEDIA_BG: u32 = 0x0020_2020;
-pub const MEDIA_MATTE: u32 = 0x0010_1010;
-pub const MEDIA_CAPTION: u32 = 0x00F0_F0F0;
-pub const SNAP_INK: u32 = 0x004A_90D9;
-pub const SHOT_BORDER: u32 = 0x00FF_FFFF;
+pub use palette_core::PLAYER_DIM_TEXT;
+pub use palette_core::PLAYER_KNOB_EDGE;
+pub use palette_core::POINTER_FILL;
+pub use palette_core::POINTER_SHADOW;
+pub use palette_core::PULSE_BG;
+pub use palette_core::PULSE_METER;
+pub use palette_core::PULSE_LABEL;
+pub use palette_core::MEDIA_BG;
+pub use palette_core::MEDIA_MATTE;
+pub use palette_core::MEDIA_CAPTION;
+pub use palette_core::SNAP_INK;
+pub use palette_core::SHOT_BORDER;
 /// An opaque black pixel (a decoded image's empty canvas).
-pub const OPAQUE_BLACK: u32 = 0xFF00_0000;
+pub use palette_core::OPAQUE_BLACK;
 
 /// The packed-ARGB form of an `0x00RRGGBB` role (Facet's surfaces carry alpha).
-#[inline]
-pub const fn opaque(c: u32) -> u32 {
-    0xFF00_0000 | c
-}
+pub use palette_core::opaque;
 
 static DARK_ON: AtomicBool = AtomicBool::new(false);
 static ACCENT_IX: AtomicU8 = AtomicU8::new(0);
@@ -988,58 +947,12 @@ fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
 
 /// SELFTEST VECTORS — pixel values the painters' selftests feed in or expect back (golden rows of the materials,
 /// synthetic window surfaces). Not chrome; here so the glass's sources name no literal (the audit's rule).
-pub mod fixture {
-    pub const PROBE_RGB: u32 = 0x0012_3456;
-    pub const BLACK: u32 = 0x0000_0000;
-    pub const WHITE: u32 = 0x00FF_FFFF;
-    pub const INK: u32 = 0x0020_2020;
-    pub const MAGENTA: u32 = 0x00FF_00FF;
-    pub const OPAQUE_GREEN: u32 = 0xFF00_FF00;
-    pub const RGB_RED: u32 = 0x00FF_0000;
-    pub const RGB_GREEN: u32 = 0x0000_FF00;
-    pub const RGB_BLUE: u32 = 0x0000_00FF;
-    pub const RAMP_BASE: u32 = 0x0000_FF80;
-    pub const BLUE: u32 = 0x0020_40FF;
-    pub const GREEN: u32 = 0x0040_FF20;
-    pub const RED: u32 = 0x00FF_4020;
-    pub const YELLOW: u32 = 0x00FF_FF20;
-    pub const CYAN: u32 = 0x0020_FFFF;
-    pub const PINK: u32 = 0x00FF_20FF;
-    pub const SKY: u32 = 0x0030_90F0;
-    pub const LEAF: u32 = 0x0040_A060;
-    pub const DUSK: u32 = 0x0033_3355;
-    pub const STEEL: u32 = 0x0030_70A0;
-    pub const ROSE: u32 = 0x00FF_2020;
-    pub const LIME: u32 = 0x0020_FF20;
-    pub const JADE: u32 = 0x0020_C080;
-    pub const TEST_COLOR: u32 = 0x0011_2233;
-    pub const SENTINEL: u32 = 0x00AB_CDEF;
-    /// The kit's paper `base_rgb` under the pinned rounding — `paper.rs`'s tripwire against `CONTENT_FILL`.
-    pub const PAPER_BASE: u32 = 0x00F5_F2EA;
-    /// `ceramic.rs` leg 4: `CHROME_FACE` under the material, rows 0..8.
-    pub const CERAMIC_REF8: [u32; 8] = [
-        0x00EC_ECEE, 0x00EB_EBED, 0x00EC_ECEE, 0x00EB_EBED, //
-        0x00EC_ECEE, 0x00EA_EAEC, 0x00EA_EAEC, 0x00EA_EAEC,
-    ];
-    /// `knurl.rs` leg 4: the three control roles at node / apex / groove / cancel.
-    pub const KNURL_REF: [[u32; 4]; 3] = [
-        [0x00FF_5F57, 0x00FF_6058, 0x00F9_5D55, 0x00FF_5F57],
-        [0x00FE_BC2E, 0x00FF_BF2E, 0x00F8_B82D, 0x00FE_BC2E],
-        [0x0028_C840, 0x0028_CC41, 0x0027_C33E, 0x0028_C840],
-    ];
-    /// `paper.rs` leg 2: the reference corner.
-    pub const PAPER_REF4: [u32; 16] = [
-        0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, //
-        0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, 0x00F7_F4EC, //
-        0x00F3_F0E9, 0x00F4_F1E9, 0x00F4_F1E9, 0x00F4_F1E9, //
-        0x00F3_F0E9, 0x00F4_F1E9, 0x00F4_F1E9, 0x00F4_F1E9,
-    ];
-}
+pub use palette_core::fixture;
 
 const _: () = {
     let mut i = 0;
     while i < TOKENS {
-        assert!(LIGHT[i] <= 0x00FF_FFFF && DARK[i] <= 0x00FF_FFFF);
+        assert!(LIGHT[i] >> 24 == 0 && DARK[i] >> 24 == 0);
         i += 1;
     }
     assert!(LIGHT[Tok::ContentText as usize] != LIGHT[Tok::ContentFill as usize]);
@@ -1047,6 +960,30 @@ const _: () = {
     assert!(DARK[Tok::WindowBg as usize] != LIGHT[Tok::WindowBg as usize]);
     assert!(Tok::SyntaxLit as usize + 1 == TOKENS);
     assert!(ACCENTS.len() == 8);
+    // PALETTECORE (B559): the core spells the accent names (it has no deps); the kernel links both, so the two lists
+    // are held equal here — a renamed accent in either fails the build, never the glass.
+    const fn names_eq(a: &[&str], b: &[&str]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            let (x, y) = (a[i].as_bytes(), b[i].as_bytes());
+            if x.len() != y.len() {
+                return false;
+            }
+            let mut j = 0;
+            while j < x.len() {
+                if x[j] != y[j] {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+    assert!(names_eq(&palette_core::ACCENT_NAMES, &prefs_core::appearance::ACCENTS));
 };
 
 // ── PAINTERSCOPE (rmbp-ledger B482) — the painters OUTSIDE video/ read their colours here ──────────────────────────
@@ -1054,52 +991,11 @@ const _: () = {
 // `appearance-check.py` scans them with `video/` and counts toward [`AUDIT_LITERALS_OUTSIDE`]. Their roles live in
 // `painter` (one look each: the console, the status bands, the boot splash, the Orin probes); the format-check
 // primaries a panel bring-up paints live in `testcard`. Values are the literals they replaced, unchanged.
-pub mod painter {
-    /// `console.rs` — the scrollback page band and its thumb.
-    pub const CONSOLE_BAND: u32 = 0x003A_3868;
-    /// `ui_status.rs` — a core meter's unfilled segment, its idle breath, its parked dash.
-    pub const METER_DIM: u32 = 0x002A_2432;
-    pub const METER_BREATH: u32 = 0x005F_4E86;
-    pub const METER_PARKED: u32 = 0x003A_3550;
-    /// `ui_status.rs` — the status strip (ground, aqua text) and the pulse instrument panel under it.
-    pub const STATUS_STRIP_BG: u32 = 0x001B_1A3A;
-    pub const STATUS_STRIP_FG: u32 = 0x007B_D0E0;
-    pub const PULSE_PANEL_BG: u32 = 0x000E_0D22;
-    pub const PULSE_PANEL_FG: u32 = 0x009F_B4C8;
-    /// `ui_status.rs` — the instrument LED ramp, green through amber to red.
-    pub const LED_GREEN: u32 = 0x002E_CC71;
-    pub const LED_AMBER: u32 = 0x00F1_C40F;
-    pub const LED_RED: u32 = 0x00E7_4C3C;
-    /// `splash.rs` — the boot splash: backdrop, facet edge, inner facet, the white beam, the edge glint.
-    pub const SPLASH_BG: u32 = 0x0006_0608;
-    pub const SPLASH_EDGE: u32 = 0x004A_4658;
-    pub const SPLASH_FACET: u32 = 0x002C_2936;
-    pub const SPLASH_BEAM: u32 = 0x00F2_F2EE;
-    pub const SPLASH_GLINT: u32 = 0x00FF_FFFF;
-    /// `splash.rs` — the refracted spectrum, red to violet (one per ray sample).
-    pub const SPLASH_SPECTRUM: [u32; 9] = [
-        0x00E8_1414, 0x00F0_5810, 0x00F8_9008, 0x00F0_D010, 0x0060_D818, //
-        0x0018_C860, 0x0018_B8C8, 0x002E_58E8, 0x0090_28D8,
-    ];
-    /// `splash.rs` — the takeover caption band and its ink.
-    pub const SPLASH_CAPTION_BG: u32 = 0x0010_1418;
-    pub const SPLASH_CAPTION_INK: u32 = 0x00E8_E8F0;
-    /// `display_tegra.rs` ORIN-RASTGLASS — `rast_demo`'s `RW_CLEAR` (0x10, 0x10, 0x18) as the packed word.
-    pub const RAST_PAPER: u32 = 0x0010_1018;
-}
+pub use palette_core::painter;
 
 /// The pure primaries a panel bring-up paints to prove the pixel format (`display_tegra.rs`'s bars and quadrant
 /// card): in the named order the format is right, red/blue swapped names it wrong. Not a theme — a test card.
-pub mod testcard {
-    pub const BLACK: u32 = 0x0000_0000;
-    pub const BLUE: u32 = 0x0000_00FF;
-    pub const GREEN: u32 = 0x0000_FF00;
-    pub const CYAN: u32 = 0x0000_FFFF;
-    pub const RED: u32 = 0x00FF_0000;
-    pub const MAGENTA: u32 = 0x00FF_00FF;
-    pub const YELLOW: u32 = 0x00FF_FF00;
-    pub const WHITE: u32 = 0x00FF_FFFF;
-}
+pub use palette_core::testcard;
 
 // ── CURSORSHAPE (rmbp-ledger B550) — the sprite table's inks, one (fill, shadow) pair per shape ────────────────────
 // `video/cursor.rs`'s `SHAPES` table reads its colours HERE, indexed by `una_abi::CURSOR_*` (arrow, hand, text,
