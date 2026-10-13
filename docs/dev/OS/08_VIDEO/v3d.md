@@ -9688,7 +9688,7 @@ counted (`PTB_PRIMS_BINNED d=1`), not clipped (`PTB_PRIM_CLIP d=0`), not viewpor
 zero tile-list bytes. No decode of the 1/2/1 triple is claimed here (§49.24.3's law: the bytes
 honestly, no invented layout); decoding it from authority is the next rung's task 0.
 
-##### 49.25.11f The next rung, designed and not built: `emptybin` (PI-V3D-105)
+##### 49.25.11f The next rung, designed: `emptybin` (PI-V3D-105) — BUILT 2026-10-13, see §49.25.11g
 
 **The campaign question:** one primitive binned, zero new list bytes, three nonzero tile-state
 words — where between the VCM's vertex fetch and tile-list emission does the primitive's *content*
@@ -9740,7 +9740,7 @@ the silence of the ERR block.
 ##### 49.25.11g Measured, this arc
 
 Worktree `exec-v3dverdict`, baseline `d6ed3024`. **Doc-only**: no `.rs` file, no knob, no packed
-byte, no serial line changed — the `emptybin` rung is *designed* here, not built, gated on its
+byte, no serial line changed — the `emptybin` rung was *designed* here (it is BUILT — PIEMPTYBIN, 2026-10-13, closing this section), gated on its
 task 0.
 
 | gate | result |
@@ -9752,3 +9752,80 @@ task 0.
 by a successor session from the capture, per the standing no-folds-at-close order — the capture, not
 the baton prose, is the evidence of record, and the one place the baton's summary was too strong
 ("binned to nothing") is corrected by §49.25.11e's byte diff.
+
+**Built — PIEMPTYBIN (PI-V3D-105), branch `exec-pi-piemptybin`, parent `bd3d399d`, 2026-10-13.** Desk
+arc: no boot flew; the rung's first wire is the bench Pi's next render-class boot (`pi-queue.md`, METAL).
+Where it departs from §49.25.11f the departure is the brief's, named here so a reader does not hunt for
+a knob: there is **no `UNAOS_V3D_EMPTYBIN` and no `v3d_emptybin` feature**. The rung lives under `v3d`
+itself and runs from the test verb — `tests v3d` on a `UNAOS_V3D=1` image (R80: nothing at boot) — so it
+cannot ride the boot-time ladder's virgin CT0. It buys a clean CT0 the boot's own way instead: the
+`[v3d50]` reset cycle, `v3d_init_hw_state`, `program_mmu`, `v3d_irq_enable`, then a `[v3d105] CT0 HYGIENE`
+read that refuses the kick (`-> FAIL reason=ct0-not-virgin`) unless CTRUN, BMACTIVE and BMBUSY all read 0.
+It is not a cold power-cycle and says so on its first line.
+
+Task 0, as §49.25.11f requires it:
+
+1. **The 1/2/1 tile-state delta is NOT decoded.** The kernel driver only points the array —
+   `v3d_regs.h:326-327` (`V3D_CLE_CT0QTS`, `V3D_CLE_CT0QTS_ENABLE BIT(1)`), written from the userspace
+   `job->qts` at `v3d_sched.c:233-236` (raspberrypi/linux `rpi-6.6.y`) — and never describes its contents.
+   The layout authority is Mesa's, on `gitlab.freedesktop.org`, which is unreachable from this seat.
+   Decoding stopped, per the design; the rung prints leg H's words raw beside boot 15's `1/2/1`.
+2. **The two sources are pinned from the uapi enum**, `include/uapi/drm/v3d_drm.h` (`rpi-6.6.y`): the
+   anonymous `V3D_PERFCNT_*` enum opens at `:364` with value 0 and runs contiguous to `V3D_PERFCNT_NUM` at
+   `:451`, so value = line − 364. `rpi-6.6.y`'s `v3d_perfmon.c` carries no `v3d_performance_counters[]`
+   (that table is later mainline), so the enum it mirrors is the source of record.
+   **`src58 V3D_PERFCNT_L2T_VCD_READS` (`:422`)** — the campaign's own number, confirmed. **`src78
+   V3D_PERFCNT_PSE_MEM_READS` (`:442`)** — the only source in the table named for primitive setup (the
+   `FEP_*` family at `:364-367` is the render-side front end, and slot 0 already carries
+   `FEP_VALID_PRIMS`). Whether the PSE takes part in a bin job is stated by no reachable source, so row B2
+   carries that caveat on the wire and leg E's slot-6 delta is printed as the empty control.
+
+The slots and code, all in `unaos/crates/kernel/src/arch/aarch64/v3d.rs`:
+
+| piece | where | source |
+|---|---|---|
+| bank table `V3D105_SRC` (slots 0/1/2/3/4/7 = boot 15's `src1/14/32/16/33/35`) | `v3d.rs:17921` | `v3d_drm.h:365/378/396/380/397/399` |
+| slot 5 = `src58 L2T_VCD_READS` (was `src11 PTB_PRIM_CLIP`) | `v3d.rs:17927` | `v3d_drm.h:422` |
+| slot 6 = `src78 PSE_MEM_READS` (was `src10 PTB_PRIM_VIEWPOINT_DISCARD`) | `v3d.rs:17928` | `v3d_drm.h:442` |
+| arm: EN=0, SRC_0_3/SRC_4_7, read-back, CLR, OVERFLOW, EN last (`v3d105_pctr_arm`) | `v3d.rs:17996` | `v3d_regs.h:357/360/361/368-371/372-383/388-391`; `v3d_perfmon.c:26-58` |
+| boot 15 baseline constants (`V3D105_B15_*`) | `v3d.rs:17954` | §49.25.11a/b/e |
+| bit 225 at run time (`V3D105_SINGLESEG`, read in `build_shader_record`) | `v3d.rs:17917`, `:4105` | §49.25.10a |
+| one leg, production bases + armed prologue (`v3d105_leg`); the bank and ERR sampled after the V2a pair | `v3d.rs:18053`, ERR at `:18121` | `v3d_sched.c` bin order, `v3d_regs.h:326-335` |
+| the new slots' line (`v3d105_emit_bank`) | `v3d.rs:18162` | — |
+| `ERR_STAT` bit-by-name (`V3D103_ERR_BITS`, `v3d103_emit_err`, ungated from `v3d_vpmprobe`) | `v3d.rs:16839`, `:16950` | `v3d_regs.h:528-544` |
+| the rung, rows and verdict (`v3d105_emptybin`) | `v3d.rs:18197`; rows from `:18326`; verdict `:18369` | §49.25.11c/f |
+| registration (`ensure_tests` → `tests::register("v3d", …)`) | `v3d.rs:18382`; `tests.rs:175` (line-neutral append) | R80 |
+
+Ungated, unchanged: `build_bin_cl_emptyunarm_padded`, `v3d97_violation_once`, `v3d99_dump_head`,
+`v3d101_emit_intsts`, `v3d104_emit_shadrec_readback` and the `[v3d103]` ERR block lost their per-knob
+`#[cfg]` (each replaced by a one-line comment, so no line moved). A build that already compiled them
+compiles the same items; every one sits inside the `v3d` module, so the knob-off image is untouched
+(Cargo.toml:1704-1710).
+
+**The wire, in §49.25.7h's order.** `[v3d105] EMPTYBIN` (desk line, read first) → `[v3d50]` reset lines
+→ `[v3d105] CT0 HYGIENE` → `[v3d104] SHADREC READBACK` + `[v3d105] SHADREC DIFF` (the default record against
+the armed one, all 36 bytes: the guard needs exactly one differing bit and it must be 225) →
+`[v3d105] PCTRARM` → `[v3d103] ERRSTAT (PRE-ARM)` → leg E (`[v3d105] LEG E`, `[v3d101] INT_STS DECODE`,
+`[v3d105] EMPTYBIN BANK LEG E`, `[v3d103] ERRSTAT (E)`) → leg H (the same four, admitted only if leg E
+left CT0 clean) → the four rows → the verdict:
+
+```
+:: V3D: [v3d105] EMPTYBIN ROW B1 — L2T_VCD_READS FLAT on leg H (slot5 d=<n>; leg E d=<n>) — fired=<0|1> — … ::
+:: V3D: [v3d105] EMPTYBIN ROW B2 — L2T_VCD_READS MOVED, PSE_MEM_READS FLAT on leg H (slot5 d=<n>, slot6 d=<n>; leg E slot6 d=<n>) — fired=<0|1> — … ::
+:: V3D: [v3d105] EMPTYBIN ROW B3 — BOTH MOVED on leg H (slot5 d=<n>, slot6 d=<n>) — fired=<0|1> — … ::
+:: V3D: [v3d105] EMPTYBIN ROW B4 — NEWLY-LATCHED ERR_STAT on leg H = <hex> (H <hex> & !PRE-ARM <hex>) — fired=<0|1> — … ::
+::   [v3d105] B4 newly-latched bit<n> <v3d_regs.h name> (<reading>) — v3d_regs.h:528-544 V3D_ERR_STAT ::   (one per newly-latched bit)
+:: V3D: [v3d105] EMPTYBIN VERDICT — guards: bank=<0|1> legE-E1=<0|1> errE=PRE-ARM=<0|1> readback=<0|1> legH-boot15-shape=<0|1> | leg H: … | rows fired B1=… B2=… B3=… B4=… — <OUTCOME Bn … | INCONCLUSIVE …> -> <PASS outcome=Bn | FAIL reason=inconclusive-…> ::
+```
+
+Precedence, computed on the Pi against the constants: leg H never ran ⇒ `inconclusive-legE-unclean`;
+bank mask lost or `src32` flat on H ⇒ `inconclusive-bank`; leg E not E1 (closed, no fault, real-pool =
+20, real-ts = 48) or `ERRSTAT (E)` ≠ PRE-ARM ⇒ `inconclusive-legE`; the record diff is not exactly bit 225
+⇒ `inconclusive-readback`; then **B4** (any newly-latched bit on H, ahead of the shape guard, because
+"name the bit and chase it before reasoning"); then leg H's boot 15 shape (BFC Δ1 and retired,
+`PTB_PRIMS_BINNED d=1`, FEP flat, QPU active and valid within ×½..×2 of boot 15's 27/52 and above twice
+the null shader's 5, pool words = 20) ⇒ `inconclusive-legH-shape`; then **B1** / **B2** / **B3** off slots 5
+and 6. `INT_STS` against boot 15's `0x00000002`, the stall slot against 25 and the tile-state words
+against `1/2/1` are printed on the verdict line as observations, not guards. On QEMU raspi4b (no V3D
+block) the rung prints `:: v3d: emptybin SKIP reason=no-v3d-block (hub IDENT0 = 0x00000000: …) -> SKIP
+reason=no-v3d-block ::` and touches nothing else. Evidence: `docs/dev/evidence/piemptybin/PIEMPTYBIN.md`.
