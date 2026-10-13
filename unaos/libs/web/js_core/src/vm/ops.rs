@@ -687,10 +687,20 @@ impl Vm {
     }
 
     /// Where an error was made: the first frame of its recorded trace that has a line (for a SyntaxError
-    /// from [`Vm::run_script_at`], the offending token). None for a non-error value or a trace with no
-    /// positions — a host reports line 0 then (`ErrorEvent.lineno`).
+    /// from [`Vm::run_script_at`], the offending token). A thrown non-error value (`throw "x"`) records no
+    /// trace, so it falls back to the last `throw` statement executed ([`Vm::last_throw`], AETHERDEVTOOLS3
+    /// SR128). None for a trace with no positions, or a non-error no `throw` statement threw — a host
+    /// reports line 0 then (`ErrorEvent.lineno`).
     pub fn error_position(&self, v: &Value) -> Option<SourcePosition> {
-        self.error_frames(v)?.lines().find_map(parse_frame)
+        match self.error_frames(v) {
+            Some(t) => t.lines().find_map(parse_frame),
+            None => {
+                let (code, pc) = self.last_throw.as_ref()?;
+                let t = &code.positions;
+                let (line, col) = t.lookup(*pc)?;
+                Some(SourcePosition { file: t.file_name(), line, col })
+            }
+        }
     }
 
     /// The text an uncaught error prints with: `Name: message` (as [`Vm::error_string`]) followed by its

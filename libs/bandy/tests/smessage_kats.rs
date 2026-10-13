@@ -417,6 +417,7 @@ kat!(kat_browser_devtools_dock, SMessage::BrowserDevtoolsDock { bottom: true }, 
 kat!(kat_browser_devtools_share, SMessage::BrowserDevtoolsShare(40), r#"{"BrowserDevtoolsShare":40}"#);
 kat!(kat_browser_devtools_panel, SMessage::BrowserDevtoolsPanel("Network".to_string()), r#"{"BrowserDevtoolsPanel":"Network"}"#);
 kat!(kat_browser_devtools_eval, SMessage::BrowserDevtoolsEval("1+1".to_string()), r#"{"BrowserDevtoolsEval":"1+1"}"#);
+kat!(kat_browser_devtools_goto, SMessage::BrowserDevtoolsGoto { url: "http://a/x.js".to_string(), line: 7 }, r#"{"BrowserDevtoolsGoto":{"url":"http://a/x.js","line":7}}"#);
 kat!(
     kat_browser_devtools_layout,
     SMessage::BrowserDevtoolsLayout { bottom: false, page: (0, 0, 600, 800), pane: Some((600, 0, 400, 800)) },
@@ -1422,6 +1423,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserDevtoolsShare(_) => "BrowserDevtoolsShare",
         SMessage::BrowserDevtoolsPanel(_) => "BrowserDevtoolsPanel",
         SMessage::BrowserDevtoolsEval(_) => "BrowserDevtoolsEval",
+        SMessage::BrowserDevtoolsGoto { .. } => "BrowserDevtoolsGoto",
         SMessage::BrowserDevtoolsLayout { .. } => "BrowserDevtoolsLayout",
         SMessage::BrowserDevtoolsLines(_) => "BrowserDevtoolsLines",
         SMessage::BrowserA11y(_) => "BrowserA11y", // A11YFACE (SR124): the accessibility verbs and rows

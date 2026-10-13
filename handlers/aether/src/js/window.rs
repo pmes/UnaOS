@@ -260,20 +260,217 @@ fn console_format(vm: &mut Vm, ctx: &CallCtx, from: usize) -> String {
 }
 
 fn console_method(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    // AETHERDEVTOOLS3 (SR128): console §1.2 (count, countReset), §1.3 (group, groupCollapsed, groupEnd),
+    // §1.4 (time, timeLog, timeEnd) and §1.1.7 `table` as a text table. The group depth, the counters and
+    // the timers are the console's own state, kept per document: a new page URL, or a page console shorter
+    // than it was at the last call (a new document of the same URL), starts them over.
+    struct ConsoleState {
+        page: String,
+        lines: usize,
+        depth: usize,
+        counts: Vec<(String, u64)>,
+        timers: Vec<(String, std::time::Instant)>,
+    }
+    thread_local! {
+        static STATE: std::cell::RefCell<ConsoleState> = const {
+            std::cell::RefCell::new(ConsoleState { page: String::new(), lines: 0, depth: 0, counts: Vec::new(), timers: Vec::new() })
+        };
+    }
+    fn label_of(vm: &mut Vm, ctx: &CallCtx) -> String {
+        match arg(vm, ctx, 0) {
+            Value::Undefined => "default".to_string(),
+            v => vm.to_string(&v).map(|s| s.to_rust()).unwrap_or_else(|_| "default".to_string()),
+        }
+    }
+    fn key_text(k: &PropertyKey) -> Option<String> {
+        match k {
+            PropertyKey::Index(i) => Some(i.to_string()),
+            PropertyKey::Str(s) => Some(s.to_rust()),
+            PropertyKey::Sym(_) => None,
+        }
+    }
+    fn cell(vm: &Vm, v: &Value) -> String {
+        let mut out = String::new();
+        js_core::builtins::host::inspect(vm, v, 1, &mut out);
+        out
+    }
+    /// console §1.1.7: rows are the data's own enumerable keys; a row that is an object contributes its own
+    /// enumerable keys as columns (first seen first, or the `properties` list), any other row a `Values` cell.
+    fn table(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Option<String>> {
+        let Value::Object(data) = arg(vm, ctx, 0) else { return Ok(None) };
+        let only: Option<Vec<String>> = match arg(vm, ctx, 1) {
+            Value::Object(p) if vm.is_array(&Value::Object(p))? => {
+                let mut cols = Vec::new();
+                for k in vm.enumerable_own_keys(p)? {
+                    let v = vm.get(p, &k)?;
+                    cols.push(vm.to_string(&v)?.to_rust());
+                }
+                Some(cols)
+            }
+            _ => None,
+        };
+        let mut cols: Vec<String> = only.clone().unwrap_or_default();
+        let mut values_col = false;
+        let mut rows: Vec<(String, Vec<(String, String)>, Option<String>)> = Vec::new();
+        for k in vm.enumerable_own_keys(data)? {
+            let Some(name) = key_text(&k) else { continue };
+            let v = vm.get(data, &k)?;
+            match &v {
+                Value::Object(o) if !vm.is_callable(&v) => {
+                    let mut cells = Vec::new();
+                    for ck in vm.enumerable_own_keys(*o)? {
+                        let Some(cn) = key_text(&ck) else { continue };
+                        if only.as_ref().is_some_and(|c| !c.contains(&cn)) {
+                            continue;
+                        }
+                        let cv = vm.get(*o, &ck)?;
+                        if !cols.contains(&cn) {
+                            cols.push(cn.clone());
+                        }
+                        cells.push((cn, cell(vm, &cv)));
+                    }
+                    rows.push((name, cells, None));
+                }
+                _ => {
+                    values_col = true;
+                    rows.push((name, Vec::new(), Some(cell(vm, &v))));
+                }
+            }
+        }
+        let mut header = vec!["(index)".to_string()];
+        header.extend(cols.iter().cloned());
+        if values_col {
+            header.push("Values".to_string());
+        }
+        let body: Vec<Vec<String>> = rows
+            .into_iter()
+            .map(|(name, cells, value)| {
+                let mut r = vec![name];
+                for c in &cols {
+                    r.push(cells.iter().find(|(n, _)| n == c).map(|(_, v)| v.clone()).unwrap_or_default());
+                }
+                if values_col {
+                    r.push(value.unwrap_or_default());
+                }
+                r
+            })
+            .collect();
+        let widths: Vec<usize> = (0..header.len())
+            .map(|i| std::iter::once(&header[i]).chain(body.iter().map(|r| &r[i])).map(|c| c.chars().count()).max().unwrap_or(0))
+            .collect();
+        let rule = |l: &str, m: &str, r: &str| format!("{l}{}{r}", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join(m));
+        let row = |cells: &[String]| {
+            let inner: Vec<String> = cells.iter().zip(&widths).map(|(c, w)| format!(" {c}{} ", " ".repeat(w - c.chars().count()))).collect();
+            format!("│{}│", inner.join("│"))
+        };
+        let mut out = vec![rule("┌", "┬", "┐"), row(header.as_slice()), rule("├", "┼", "┤")];
+        out.extend(body.iter().map(|r| row(r.as_slice())));
+        out.push(rule("└", "┴", "┘"));
+        Ok(Some(out.join("\n")))
+    }
+
     let level = callee_str(vm, ctx);
-    let lv = match level.as_str() {
+    let (url, lines) = (super::page_url(), page(|p| p.console.len()));
+    STATE.with(|st| {
+        let mut st = st.borrow_mut();
+        if st.page != url || lines < st.lines {
+            *st = ConsoleState { page: url, lines, depth: 0, counts: Vec::new(), timers: Vec::new() };
+        }
+    });
+    let mut lv = match level.as_str() {
         "warn" => 1,
         "error" => 2,
         "debug" | "trace" => 3,
-        "info" => 4,
+        "info" | "count" => 4,
         _ => 0,
     };
-    let mut msg = console_format(vm, ctx, 0);
-    if level == "trace" {
-        // JSPOS (SR127): console.trace() prints the frames under its message (console §1.3.8).
-        msg = format!("{}\n{}", if msg.is_empty() { "console.trace".to_string() } else { msg }, vm.stack_trace_at().to_rust());
+    let now = std::time::Instant::now();
+    let msg = match level.as_str() {
+        "trace" => {
+            // JSPOS (SR127): console.trace() prints the frames under its message (console §1.3.8).
+            let m = console_format(vm, ctx, 0);
+            Some(format!("{}\n{}", if m.is_empty() { "console.trace".to_string() } else { m }, vm.stack_trace_at().to_rust()))
+        }
+        "table" => match table(vm, ctx)? {
+            Some(t) => Some(t),
+            None => Some(console_format(vm, ctx, 0)),
+        },
+        "group" | "groupCollapsed" => {
+            let m = console_format(vm, ctx, 0);
+            Some(if m.is_empty() { format!("console.{level}") } else { m })
+        }
+        "groupEnd" => None,
+        "count" | "countReset" => {
+            let label = label_of(vm, ctx);
+            STATE.with(|st| {
+                let mut st = st.borrow_mut();
+                let at = st.counts.iter().position(|(l, _)| *l == label);
+                match (level.as_str(), at) {
+                    ("count", Some(i)) => {
+                        st.counts[i].1 += 1;
+                        Some(format!("{label}: {}", st.counts[i].1))
+                    }
+                    ("count", None) => {
+                        st.counts.push((label.clone(), 1));
+                        Some(format!("{label}: 1"))
+                    }
+                    (_, Some(i)) => {
+                        st.counts[i].1 = 0;
+                        None
+                    }
+                    (_, None) => {
+                        lv = 1;
+                        Some(format!("Count for '{label}' does not exist"))
+                    }
+                }
+            })
+        }
+        "time" | "timeLog" | "timeEnd" => {
+            let label = label_of(vm, ctx);
+            let extra = if level == "timeLog" { console_format(vm, ctx, 1) } else { String::new() };
+            STATE.with(|st| {
+                let mut st = st.borrow_mut();
+                let at = st.timers.iter().position(|(l, _)| *l == label);
+                match (level.as_str(), at) {
+                    ("time", Some(_)) => {
+                        lv = 1;
+                        Some(format!("Timer '{label}' already exists"))
+                    }
+                    ("time", None) => {
+                        st.timers.push((label, now));
+                        None
+                    }
+                    (_, None) => {
+                        lv = 1;
+                        Some(format!("Timer '{label}' does not exist"))
+                    }
+                    (which, Some(i)) => {
+                        let ms = now.duration_since(st.timers[i].1).as_secs_f64() * 1000.0;
+                        if which == "timeEnd" {
+                            st.timers.remove(i);
+                        }
+                        Some(if extra.is_empty() { format!("{label}: {ms:.3} ms") } else { format!("{label}: {ms:.3} ms {extra}") })
+                    }
+                }
+            })
+        }
+        _ => Some(console_format(vm, ctx, 0)),
+    };
+    let depth = STATE.with(|st| st.borrow().depth);
+    if let Some(m) = msg {
+        let pad = "  ".repeat(depth);
+        let text = if pad.is_empty() { m } else { m.split('\n').map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n") };
+        super::host::console_out(lv, &text);
     }
-    super::host::console_out(lv, &msg);
+    STATE.with(|st| {
+        let mut st = st.borrow_mut();
+        match level.as_str() {
+            "group" | "groupCollapsed" => st.depth += 1,
+            "groupEnd" => st.depth = st.depth.saturating_sub(1),
+            _ => {}
+        }
+        st.lines = page(|p| p.console.len());
+    });
     Ok(Value::Undefined)
 }
 
@@ -1259,13 +1456,13 @@ pub fn install(vm: &mut Vm) {
     let op_ = vm.intr().object_proto;
     let console = vm.new_object(Some(op_));
     let fp = vm.intr().function_proto;
-    for name in ["log", "info", "warn", "error", "debug", "trace", "dir", "dirxml", "table"] {
+    for name in ["log", "info", "warn", "error", "debug", "trace", "dir", "dirxml", "table", "group", "groupCollapsed", "groupEnd", "time", "timeEnd", "timeLog", "count", "countReset"] {
         let f = vm.make_native_with(name, 0, console_method, false, Some(fp), vec![s(name)]);
         vm.heap.get_mut(console).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(f), WEC));
     }
     let f = vm.make_native("assert", 0, console_assert, false);
     vm.heap.get_mut(console).props.insert(PropertyKey::from_str("assert"), Prop::data(Value::Object(f), WEC));
-    for name in ["group", "groupCollapsed", "groupEnd", "time", "timeEnd", "timeLog", "count", "countReset", "clear", "profile", "profileEnd", "timeStamp"] {
+    for name in ["clear", "profile", "profileEnd", "timeStamp"] {
         let f = vm.make_native(name, 0, console_noop, false);
         vm.heap.get_mut(console).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(f), WEC));
     }

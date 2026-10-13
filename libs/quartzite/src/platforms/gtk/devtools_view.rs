@@ -27,8 +27,27 @@ use std::rc::Rc;
 use super::glyph::{GlyphEntry, GlyphLabel};
 use bandy::{PrefValue, SMessage, Synapse};
 
-/// The pane's panels, as the engine labels them (`aether::devtools::Panel::label`).
-pub const PANELS: [&str; 6] = ["Elements", "Console", "Network", "Storage", "Performance", "Accessibility"];
+/// The pane's panels, as the engine labels them (`aether::devtools::Panel::label`); AETHERDEVTOOLS3
+/// (SR128) adds Sources, in the engine's tab order.
+pub const PANELS: [&str; 7] = ["Elements", "Console", "Sources", "Network", "Storage", "Performance", "Accessibility"];
+
+/// AETHERDEVTOOLS3 (SR128): the (url, line) a pane text line names when it is a V8-shaped frame
+/// (`    at fn (url:line:col)`, `    at url:line:col`) — the face's half of a frame click; the engine's own
+/// reading is `aether::devtools::sources::frame_target`, the same grammar. The click itself waits on a bus
+/// verb carrying it to `DevTools::goto` (bandy has none yet: named in the SR128 row).
+pub fn goto_target(line: &str) -> Option<(String, u32)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("at ")?.trim_end();
+    let loc = match (rest.strip_suffix(')'), rest.rfind(" (")) {
+        (Some(r), Some(k)) => &r[k + 2..],
+        _ => rest,
+    };
+    let mut it = loc.rsplitn(3, ':');
+    let _col: u32 = it.next()?.parse().ok()?;
+    let n: u32 = it.next()?.parse().ok()?;
+    let file = it.next().filter(|f| !f.is_empty() && !f.contains(char::is_whitespace))?;
+    Some((file.to_string(), n))
+}
 
 /// Principia's spelling of a dock side (`aether.devtools.dock`): true = under the page.
 pub fn dock_from_pref(v: &str) -> bool {
@@ -126,6 +145,29 @@ pub fn bootstrap_devtools(synapse: Synapse, page: &gtk4::Widget) -> DevtoolsView
     text.set_cursor_visible(false);
     text.set_monospace(true);
     text.set_wrap_mode(WrapMode::None);
+    {
+        // AETHERDEVTOOLS3 (SR128): a click on a Console frame line (`    at fn (url:line:col)`) opens the
+        // Sources panel at that line — the engine's `DevTools::goto` through `BrowserDevtoolsGoto`.
+        let syn = synapse.clone();
+        let tv = text.clone();
+        let click = gtk4::GestureClick::new();
+        click.connect_released(move |_, _, x, y| {
+            let (bx, by) = tv.window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
+            if let Some(iter) = tv.iter_at_location(bx, by) {
+                let buf = tv.buffer();
+                let start = buf.iter_at_line(iter.line()).unwrap_or(iter);
+                let mut end = start;
+                if !end.ends_line() {
+                    end.forward_to_line_end();
+                }
+                let line = buf.text(&start, &end, false).to_string();
+                if let Some((url, line)) = goto_target(&line) {
+                    syn.fire(SMessage::BrowserDevtoolsGoto { url, line });
+                }
+            }
+        });
+        text.add_controller(click);
+    }
     let scroll = ScrolledWindow::new();
     scroll.set_child(Some(&text));
     scroll.set_vexpand(true);
@@ -278,5 +320,17 @@ mod tests {
         assert!(!splitter_settled(620, 600, 1000));
         assert!(dock_from_pref(dock_pref(true)) && !dock_from_pref(dock_pref(false)));
         assert!(!dock_from_pref("left"));
+    }
+
+    /// AETHERDEVTOOLS3 (SR128): the Sources tab is the third, and a frame line reads back its url and line.
+    #[test]
+    fn sources_tab_and_frame_targets() {
+        assert_eq!(PANELS.len(), 7);
+        assert_eq!(PANELS[2], "Sources");
+        assert_eq!(goto_target("    at boom (https://a.test/index.html:3:9)"), Some(("https://a.test/index.html".to_string(), 3)));
+        assert_eq!(goto_target("    at https://a.test/app.js:12:1"), Some(("https://a.test/app.js".to_string(), 12)));
+        assert_eq!(goto_target("    at new C (https://a.test/c.js:4:20)"), Some(("https://a.test/c.js".to_string(), 4)));
+        assert_eq!(goto_target("    at inner (t.js)"), None);
+        assert_eq!(goto_target("x Uncaught Error: boom"), None);
     }
 }

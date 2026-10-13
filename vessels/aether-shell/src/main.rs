@@ -535,6 +535,9 @@ impl Tab {
                 self.devtools.panel = chrome::devtools::Panel::Console;
                 let _ = self.devtools.evaluate(&mut self.engine, &line);
             }
+            SMessage::BrowserDevtoolsGoto { url, line } => {
+                let _ = self.devtools.goto(&self.engine, &url, line); // AETHERDEVTOOLS3 (SR128): a frame click
+            }
             SMessage::BrowserKey(key) => self.engine.handle_event(aether::api::events::Event::KeyDown(key)),
             SMessage::BrowserText(text) => self.engine.handle_event(aether::api::events::Event::Text(text)),
             // SR67: hover, `:hover` re-style, the page's mouse events.
@@ -870,6 +873,7 @@ impl Coordinator {
             | SMessage::BrowserPageInfoAsk
             | SMessage::BrowserDevtoolsPanel(_)
             | SMessage::BrowserDevtoolsEval(_)
+            | SMessage::BrowserDevtoolsGoto { .. }
             | SMessage::BrowserA11y(_) => self.to_active(m),
             _ => {}
         }

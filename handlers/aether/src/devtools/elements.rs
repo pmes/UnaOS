@@ -6,6 +6,11 @@
 //! consume, serialized as `getComputedStyle` does, the 20 properties of `css::REPORT_PROPS`), the box
 //! from `AetherEngine::box_of`, and the picker from `AetherEngine::hit_test_at`. Nothing is cached: each
 //! call reads the tree as it stands, so a script's mutation shows on the next read.
+//!
+//! AETHERDEVTOOLS3 (SR128): the selected element's box model ([`box_model`]) — margin, border, padding and
+//! content as layout resolved them (taffy's `Layout.margin` / `border` / `padding` and the border-box
+//! `size` of the element's box in `AetherEngine::layout_tree`, the box `box_of` measures) — drawn as four
+//! nested rectangles with the numbers on their edges ([`box_model_lines`]), the way every devtools draws it.
 
 use crate::dom::{NodeData, NodeRef};
 use crate::AetherEngine;
@@ -158,4 +163,129 @@ pub fn breadcrumb(engine: &AetherEngine, id: usize) -> String {
         .collect();
     parts.reverse();
     parts.join(" > ")
+}
+
+/// Four edge widths in CSS px.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Edges {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+impl Edges {
+    fn of(r: taffy::geometry::Rect<f32>) -> Edges {
+        Edges { top: r.top, right: r.right, bottom: r.bottom, left: r.left }
+    }
+}
+
+/// An element's box model as layout resolved it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxModel {
+    pub margin: Edges,
+    pub border: Edges,
+    pub padding: Edges,
+    /// The content box's (width, height): the border box less border and padding.
+    pub content: (f32, f32),
+}
+
+/// The box model of the element with arena id `id`: its first box in tree order (the one `box_of`
+/// measures). None for a non-element, an element without a box of its own (`display: none`, or a run
+/// inside an inline formatting context), or before the first layout.
+pub fn box_model(engine: &AetherEngine, id: usize) -> Option<BoxModel> {
+    let n = node(engine, id)?;
+    n.as_element()?;
+    let layout = engine.layout_tree.as_ref()?;
+    fn find(id: taffy::prelude::NodeId, layout: &crate::layout::LayoutTree, want: &NodeRef) -> Option<taffy::prelude::NodeId> {
+        if layout.node_map.get(&id) == Some(want) {
+            return Some(id);
+        }
+        layout.taffy.children(id).ok()?.into_iter().find_map(|c| find(c, layout, want))
+    }
+    let tid = find(layout.root_node, layout, &n)?;
+    let l = layout.taffy.layout(tid).ok()?;
+    let (border, padding) = (Edges::of(l.border), Edges::of(l.padding));
+    let content = (
+        (l.size.width - border.left - border.right - padding.left - padding.right).max(0.0),
+        (l.size.height - border.top - border.bottom - padding.top - padding.bottom).max(0.0),
+    );
+    // Vertical margins are collapsed by rewriting the taffy style before the pass (layout_core's
+    // `collapse::apply`) and restored after it, so `Layout.margin` reads 0 there: the drawing takes the
+    // restored style's fixed lengths and falls back to the layout's value for anything else.
+    let mut margin = Edges::of(l.margin);
+    if let Ok(st) = layout.taffy.style(tid) {
+        for (slot, raw) in [(&mut margin.top, st.margin.top.into_raw()), (&mut margin.right, st.margin.right.into_raw()), (&mut margin.bottom, st.margin.bottom.into_raw()), (&mut margin.left, st.margin.left.into_raw())] {
+            if raw.tag() == taffy::style::CompactLength::LENGTH_TAG {
+                *slot = raw.value();
+            }
+        }
+    }
+    Some(BoxModel { margin, border, padding, content })
+}
+
+/// A box-model number: up to two decimals, trailing zeros dropped; an edge of zero reads `-` (as the
+/// Chromium and Firefox drawings print it).
+fn edge(v: f32) -> String {
+    if v.abs() < 0.005 {
+        return "-".to_string();
+    }
+    let s = format!("{:.2}", v);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The box model drawn as text, four nested rectangles: margin outermost, then border, padding and the
+/// content box holding its `w x h`; each outer rectangle is labelled at its top-left with its top edge's
+/// number centred beside the label, its bottom edge's centred below, and its left and right edges' numbers
+/// on the content's row. A zero edge reads `-`.
+///
+/// ```text
+/// +----------------------------------------+
+/// | margin            10                   |
+/// |    +------------------------------+    |
+/// |    | border       2               |    |
+/// |    |   +----------------------+   |    |
+/// |    |   | padding  5           |   |    |
+/// |    |   |     +----------+     |   |    |
+/// | 10 | 2 |   6 | 100 x 40 | 6   | 2 | 10 |
+/// ...
+/// ```
+pub fn box_model_lines(bm: &BoxModel) -> Vec<String> {
+    let size = format!(" {} x {} ", edge(bm.content.0).replace('-', "0"), edge(bm.content.1).replace('-', "0"));
+    let content_rule = format!("+{}+", "-".repeat(size.chars().count()));
+    let mut inner = vec![content_rule.clone(), format!("|{size}|"), content_rule];
+    for (label, e) in [("padding", bm.padding), ("border", bm.border), ("margin", bm.margin)] {
+        let iw = inner[0].chars().count();
+        let (t, r, b, l) = (edge(e.top), edge(e.right), edge(e.bottom), edge(e.left));
+        let vmax = t.len().max(b.len());
+        let mut sw = l.len().max(r.len());
+        while iw + 2 * (sw + 2) < 2 * (label.len() + 3) + vmax {
+            sw += 1;
+        }
+        let w = iw + 2 * (sw + 2);
+        let centred = |v: &str, label: Option<&str>| {
+            let mut row: Vec<char> = vec![' '; w];
+            let at = (w - v.len()) / 2;
+            for (i, c) in v.chars().enumerate() {
+                row[at + i] = c;
+            }
+            if let Some(lb) = label {
+                for (i, c) in lb.chars().enumerate() {
+                    row[1 + i] = c;
+                }
+            }
+            format!("|{}|", row.into_iter().collect::<String>())
+        };
+        let rule = format!("+{}+", "-".repeat(w));
+        let mid = inner.len() / 2;
+        let mut next = vec![rule.clone(), centred(&t, Some(label))];
+        for (k, line) in inner.iter().enumerate() {
+            let (sl, sr) = if k == mid { (format!(" {l:>sw$} "), format!(" {r:<sw$} ")) } else { (" ".repeat(sw + 2), " ".repeat(sw + 2)) };
+            next.push(format!("|{sl}{line}{sr}|"));
+        }
+        next.push(centred(&b, None));
+        next.push(rule);
+        inner = next;
+    }
+    inner
 }

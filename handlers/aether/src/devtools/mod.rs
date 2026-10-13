@@ -13,6 +13,7 @@
 //! | Network      | [`network`]    | the document's resource references resolved against `AetherEngine::current_url`, each looked up in `net::http_cache()` under the page's partition (`cache_key(site_of(top), url)`, the key gneiss_pal stores under — SR88), and `security::refusals()` (SR86) for the blocked ones |
 //! | Storage      | [`storage`]    | `net::cookie_jar()`, `storage::with_area` (localStorage + sessionStorage under `storage::page_storage_key`), `storage::idb::databases` + `usage`, `storage::cache::cache_names` + `request_keys` + `usage` (SR94) |
 //! | Accessibility | [`accessibility`] | `a11y::tree` (THE accessibility read API: roles, accname 1.2 names, states, hidden subtrees pruned) and `a11y::focus::order` for the Tab sequence; the selected node is the Elements panel's (AETHERA11Y, SR119) |
+//! | Sources      | [`sources`]    | the document's `<script>` elements (`AetherEngine::document`), each external script's source through `js::ran_source` (what the engine ran or pre-fetched under its URL), each inline script's text; a Console frame `url:line:col` is a target ([`DevTools::goto`], AETHERDEVTOOLS3 SR128) |
 //! | Performance  | [`timeline`]   | `css::last_style_timing` (the cascade and re-layout wall times `apply_stylesheets` already measures) plus the pane's own clock around `AetherEngine::tick` (script: timers, microtasks, rAF) and `AetherEngine::render_frame` (paint) |
 //!
 //! The pane is toggled by F12 / Ctrl+Shift+I and docked right or bottom by the chrome model
@@ -24,6 +25,7 @@ pub mod accessibility;
 pub mod console;
 pub mod elements;
 pub mod network;
+pub mod sources;
 pub mod storage;
 pub mod timeline;
 
@@ -35,6 +37,8 @@ pub enum Panel {
     #[default]
     Elements,
     Console,
+    /// AETHERDEVTOOLS3 (SR128): the page's scripts and the source of the selected one.
+    Sources,
     Network,
     Storage,
     Performance,
@@ -43,12 +47,13 @@ pub enum Panel {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 6] = [Panel::Elements, Panel::Console, Panel::Network, Panel::Storage, Panel::Performance, Panel::Accessibility];
+    pub const ALL: [Panel; 7] = [Panel::Elements, Panel::Console, Panel::Sources, Panel::Network, Panel::Storage, Panel::Performance, Panel::Accessibility];
 
     pub fn label(self) -> &'static str {
         match self {
             Panel::Elements => "Elements",
             Panel::Console => "Console",
+            Panel::Sources => "Sources",
             Panel::Network => "Network",
             Panel::Storage => "Storage",
             Panel::Performance => "Performance",
@@ -68,6 +73,8 @@ pub struct DevTools {
     pub console: console::Console,
     /// The Performance panel's frame samples.
     pub timeline: timeline::Timeline,
+    /// The Sources panel's selected script and current line.
+    pub sources: sources::Sources,
 }
 
 impl DevTools {
@@ -81,6 +88,25 @@ impl DevTools {
         self.selected = Some(id);
         self.panel = Panel::Elements;
         Some(id)
+    }
+
+    /// Follows a frame: shows Sources with the script a frame naming `url` is in and `line` current (the
+    /// Console's `    at fn (url:line:col)` lines are targets). False, and nothing changes, when the document
+    /// has no script of that name.
+    pub fn goto(&mut self, engine: &AetherEngine, url: &str, line: u32) -> bool {
+        if !self.sources.goto(engine, url, line) {
+            return false;
+        }
+        self.panel = Panel::Sources;
+        true
+    }
+
+    /// Follows the frame a pane text line names ([`sources::frame_target`]); false for any other line.
+    pub fn goto_line(&mut self, engine: &AetherEngine, text: &str) -> bool {
+        match sources::frame_target(text) {
+            Some((url, line, _)) => self.goto(engine, &url, line),
+            None => false,
+        }
     }
 
     /// One evaluator line in the page's realm (the Console's input field).
@@ -107,6 +133,9 @@ impl DevTools {
                     if let Some((x, y, w, h)) = ins.border_box {
                         out.push(format!("box {x:.1},{y:.1}  {w:.1} x {h:.1}"));
                     }
+                    if let Some(bm) = self.selected.and_then(|id| elements::box_model(engine, id)) {
+                        out.extend(elements::box_model_lines(&bm));
+                    }
                     for (k, v) in &ins.attributes {
                         out.push(format!("@{k} = \"{v}\""));
                     }
@@ -132,8 +161,12 @@ impl DevTools {
                 out.push(format!("{:<7} {:<6} {:<10} {:<24} {:>9} {:>7}  {}", "method", "status", "type", "mime", "size", "ms", "url"));
                 for r in network::requests(engine) {
                     out.push(r.row());
+                    if r.has_detail() {
+                        out.extend(r.detail_lines());
+                    }
                 }
             }
+            Panel::Sources => out.extend(self.sources.lines(engine)),
             Panel::Storage => {
                 let v = storage::view(engine);
                 out.extend(v.lines());

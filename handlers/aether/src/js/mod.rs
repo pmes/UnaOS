@@ -362,7 +362,7 @@ pub fn console_lines_detailed() -> Vec<(u8, String)> {
 
 /// JSPOS: the (filename, lineno, colno) an ErrorEvent for `err` carries — the position the error recorded
 /// when it was made (vm/ops.rs `error_position`: the innermost frame with a line, or a SyntaxError's
-/// offending token); else the page URL and 0, 0 (a thrown non-error value: no position is recorded).
+/// offending token, or AETHERDEVTOOLS3's last throw site for a thrown non-error); else the page URL and 0, 0.
 pub fn error_site(vm: &Vm, err: &Value) -> (String, u32, u32) {
     match vm.error_position(err) {
         Some(p) => (p.file, p.line, p.col),
@@ -381,6 +381,13 @@ fn script_file() -> String {
         }
     }
     page_url()
+}
+
+/// AETHERDEVTOOLS3 (SR128): the devtools Sources panel's goto hook — the source the engine ran under the
+/// frame file name `file` (the latest per name, as the console excerpt reads it), else the external script
+/// the loader pre-fetched under that absolute URL. None when it holds neither.
+pub fn ran_source(file: &str) -> Option<std::rc::Rc<str>> {
+    page(|p| p.ran_sources.get(file).cloned().or_else(|| p.script_sources.get(file).map(|s| std::rc::Rc::from(s.as_str()))))
 }
 
 /// Keeps `src` as the source of `file` for console excerpts (bounded by [`RAN_SOURCES_CAP`]).

@@ -247,6 +247,9 @@ pub enum SMessage {
     BrowserDevtoolsPanel(String),
     /// Chrome → engine: one Console line, evaluated in the page's realm.
     BrowserDevtoolsEval(String),
+    /// AETHERDEVTOOLS3 (SR128): chrome → engine: a Console frame line was clicked — show `url` at `line`
+    /// in the Sources panel.
+    BrowserDevtoolsGoto { url: String, line: u32 },
     /// Shell → chrome: `DevtoolsChrome::split` of the content area — the page rect and the pane rect
     /// `(x, y, w, h)` (`pane` None: closed, the page has the whole area); `bottom` is the dock side.
     BrowserDevtoolsLayout { bottom: bool, page: (u32, u32, u32, u32), pane: Option<(u32, u32, u32, u32)> },
