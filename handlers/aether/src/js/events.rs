@@ -1486,6 +1486,42 @@ pub fn user_button(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64)) -> bool 
     mouse_button(vm, n, ty, client)
 }
 
+/// AETHERWPT5 (SR144): a trusted `wheel` at the element under the pointer (UI Events §5.4: a WheelEvent that
+/// bubbles, is cancelable and composed; `deltaMode` DOM_DELTA_PIXEL), as WebDriver's wheel-source `scroll`
+/// action dispatches before the scroll. A text-node hit is retargeted to its parent element. Returns false when
+/// a listener canceled it (the default — scrolling — is then skipped).
+pub fn user_wheel(vm: &mut Vm, n: usize, client: (f64, f64), delta: (f64, f64)) -> bool {
+    if super::engine_poisoned() {
+        return true;
+    }
+    let n = if dom::kind(n) == dom::NK::Element { n } else { parent_of(n).unwrap_or(n) };
+    let init = vm.new_plain_object();
+    let ri = root(vm, Value::Object(init));
+    let g = Value::Object(vm.realm().global);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("view"), g);
+    for (k, v) in [
+        ("clientX", client.0),
+        ("clientY", client.1),
+        ("screenX", client.0),
+        ("screenY", client.1),
+        ("button", 0.0),
+        ("buttons", super::pointer::buttons() as f64),
+        ("deltaX", delta.0),
+        ("deltaY", delta.1),
+        ("deltaZ", 0.0),
+        ("deltaMode", 0.0),
+    ] {
+        let _ = vm.create_data_property(init, PropertyKey::from_str(k), num(v));
+    }
+    let e = new_event(vm, "WheelEvent", "wheel", true, true, Some(init));
+    set_flag(vm, e, F_COMPOSED, true);
+    let r = root(vm, Value::Object(e));
+    let (ok, _) = dispatch(vm, e, TargetKey::Node(n));
+    unroot(vm, r);
+    unroot(vm, ri);
+    ok
+}
+
 /// The compatibility `mousedown` / `mouseup` of [`user_button`].
 fn mouse_button(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64)) -> bool {
     let init = vm.new_plain_object();

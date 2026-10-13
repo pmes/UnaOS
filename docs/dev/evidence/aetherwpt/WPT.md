@@ -336,3 +336,116 @@ for the viewport offset `scrollIntoView` moves (the viewport offset is the scrip
 Beyond the predicates, the API directories outside the run set (the counts above) are the next arcs' run set:
 popovers and dialog, IntersectionObserver / ResizeObserver, Web Animations, CSS Typed OM, the Clipboard API,
 Fullscreen, close-watcher.
+
+## AETHERWPT5 (SR144) — testdriver, a second origin, the handlers
+
+### Measurement (step 1: the predicates read over the pinned checkout, no suite run — R107)
+
+The same port of the three predicates as AETHERWPT4's (`excluded`, `net_excluded`, `wpt2_excluded` with
+`run_wpt2_dir`'s pre-filter, the helper-script scan, the variants, `py_refs` / `wpt2_py_refs`, `PY_HANDLERS`) applied to
+da1f6d20 reproduces SR142's after count exactly — **2197 excluded pages, testdriver 736, cross-origin 361** — and is
+the yardstick for this arc's lifts: **2197 before, 1082 after** (the script is a 300-line Python port kept in the
+seat's scratch; its per-directory output is the table below). The testdriver group by the WebDriver command the
+excluded pages used: `test_driver.Actions` 410, `send_keys` 137, `click` 83, `bless` 38, `set_test_context` 10,
+`get_computed_label` 6, `bidi` 5, `get_computed_role` 2, and one each of `set_window_rect`, `get_window_rect`,
+`create_window`, `navigate`, `minimize_window`. The handler group, by the pages naming each `.py`: two were not
+handlers at all — `html/canvas/tools/gentest.py` (56) and `moving-between-documents/tools/generate.py` (52) are
+generators a generated page names in its comment — then `delayed-broken-video.py` 14, `serve-with-content-type.py` 12,
+`log.py` 8, `download_stash.py` 6, `echo-headers.py` / `infinite-redirects.py` / `fake_responses.py` 4, nine at 3 and
+2, and a tail of singles; lifting cross-origin exposed the CORS handlers behind it (`fetch/api/resources/preflight.py`
+15, `reset-token.py` / `access-control-preflight-denied.py` 6, `access-control-*.py` 3 and 2 each, `multi_redirect.py`
+3).
+
+| directory | run → after | excluded → after | what stays (count) |
+|---|---|---|---|
+| dom/events | 175 | 88 → 42 | layout 38, documents not fully active 4 |
+| dom/ranges | 67 | 10 → 7 | layout 7 |
+| html/semantics/forms | 477 | 121 → 29 | layout 23, frames 5, XML documents 1 |
+| html/webappapis | 312 | 14 → 13 | user prompts 4, layout 3, frames 3, XML 2, testdriver beyond 1 |
+| websockets | 185 → 191 | 341 → 335 | wss variants 315, bfcache 6, WebSocketStream 5, TLS 2, idlharness 1, IDN 1, four pywebsocket handlers, `check.py`'s sibling `redirect_response` served |
+| eventsource | 54 → 58 | 9 → 5 | `eventsource/message.py` (a path that does not exist) 2, worker `message.py` 2, document.domain 1 |
+| xhr | 219 → 294 | 113 → 38 | HTTP authentication (`auth*/`, `access-control-auth-basic.py`) 17, preflight-cache handlers 5, `gzip.py` / `zlib.py` 2, `xhr/content.py` and other paths that do not exist 7, idlharness 1, TLS 1, document.domain 1 |
+| url, encoding | 42 → 43, 1255 → 1260 | 2 → 1, 7 → 2 | idlharness; TLS |
+| fetch/api | 116 → 165 | 72 → 23 | TLS 15, h2 / service worker 3, `network-partition-key.py` (not in the checkout) 2, three handler singles |
+| FileAPI, webstorage, IndexedDB | 62 → 65, 50 → 53, 221 → 227 | 22 → 19, 4 → 1, 12 → 6 | manual, TLS, idlharness, bfcache |
+| html/browsers/history | 125 → 136 | 23 → 12 | manual 9, bfcache 2, `delay.py` (not in the checkout) 1 |
+| html/browsers/the-window-object | 94 → 96 | 7 → 5 | manual 2, TLS 2, testdriver beyond 1 |
+| html/browsers/browsing-the-web | 186 → 254 | 149 → 81 | bfcache 54, TLS 11, get-host-info's HTTPS origins 6, layout 6, media 1, three handler singles |
+| html/semantics/scripting-1 | 393 → 492 | 134 → 35 | worker-only globals 12, `cookies/resources/set-cookie.py` (not in the checkout) 4, TLS 4, `echo-referrer.py` (a path that does not exist) 3, manual 2, handler singles |
+| html/semantics/embedded-content | 418 → 644 | 403 → 177 | media fixtures 130, layout 19, bfcache 16, TLS 7, manual 4, `timeout_on_seek.py` 1 |
+| html/semantics/interactive-elements | 47 → 86 | 65 → 26 | layout 17, manual 8, media 1 |
+| custom-elements | 177 → 179 | 9 → 7 | testdriver beyond (`get_computed_label`) 3, media 3, `form-echo.py` 1 |
+| shadow-dom | 164 → 257 | 113 → 20 | layout 17, testdriver beyond (`get_computed_label`) 3 |
+| selection | 92 → 121 | 42 → 13 | layout 11, manual 1, idlharness 1 |
+| uievents | 15 → 63 | 62 → 14 | layout 9, manual 4, idlharness 1 |
+| pointerevents | 12 → 178 | 255 → 89 | layout 58, TLS 24, manual 7 |
+| resource-timing | 88 → 122 | 62 → 28 | TLS 12, worker-only 6, `content-type.py` (not in the checkout) and `multi_redirect` siblings, idlharness 1 |
+| console | 6 → 11 | 6 → 1 | idlharness 1 |
+| html/infrastructure/urls | 54 → 58 | 15 → 11 | TLS 10, `stash.py` 1 |
+
+The groups after this arc, largest first: wss variants 315; **layout / rendering 212** (69 before — the testdriver
+pages that also read `getBoundingClientRect` / `offset*` / `client*` / `scroll*` now reach that predicate, which
+`testdriver` had hidden; EYES stays its oracle); media fixtures 139; bfcache 98; TLS 96; manual 49; worker-only
+globals 18; idlharness 17; testdriver commands beyond the vendor 15; frames 9 + 4; TLS for get-host-info's HTTPS
+origins 7; XML documents 6; WebSocketStream 5; user prompts 4; handlers 31 pages over 24 files (17 of them HTTP
+authentication, 7 naming a path that does not exist in the checkout, `gzip.py` / `zlib.py` needing a deflate
+compressor the tree does not have); document.domain 2; IDN 1; HTTP authentication 1.
+
+### The three (step 2)
+
+| # | group (pages lifted) | specification | what landed |
+|---|---|---|---|
+| 1 | testdriver (736 → 15) | WebDriver §12.4.1 Element Click, §12.5.1 Element Send Keys, §15.5 Perform Actions (§15.4.3 origins, §17.2 normalised key values), Permissions §3.2 Set Permission, §16 cookie commands; testdriver.js's `test_driver_internal` contract (`in_automation`) | `tests/wpt_net/mod.rs` `TESTDRIVER_VENDOR_JS`, served at `/resources/testdriver-vendor.js` by both servers (`wpt_dom.rs` `serve`, `wpt_net` `http_conn`): `click` (the in-view centre testdriver.js computed, moved into the top-level viewport through the frame chain), `send_keys` (the focusing steps, then the keys by node id), `action_sequence` (element origins by node id), `set_permission`, `get_all_cookies` / `get_named_cookie` / `delete_all_cookies`, `set_test_context`; `in_automation` true so the rest rejects at once. `src/js/testdriver.rs` (new): `__td_queue` / `__td_node`, the thread-local queue, the WebDriver key table, the permission store. `src/lib.rs` `AetherEngine::pump_automation`: each command through the shell's input path — click = `MouseMove` + `MouseDown` + `MouseUp` (`pointerdown` / `mousedown`, `pointerup` / `mouseup`, `click` with activation); send keys = focus (caret at the end of a text control), per code point `keydown`, the default action, `Text` for an unmodified printable key, `keyup`, modifiers held for the sequence; actions tick by tick (`pointerMove` by viewport / pointer / element-centre origin through `pointer_moved`, `pointerDown` / `pointerUp`, `keyDown` / `keyUp`, `scroll` = a `wheel` (`js/events.rs` `user_wheel`, new) then `Scroll`); then `__td_settle(ticket, error, result)`. The runners (`run_file`, `run_net_file`) settle in 200 ms virtual slices and pump between them. Predicates: `testdriver_beyond` names the commands the vendor does not implement. |
+| 2 | cross-origin (361 → 0; 7 moved to TLS) | HTML §7.5 origins (a tuple origin differs by host and by port), Fetch §3.2 CORS protocol (the engine's `security/cors.rs`, since AETHERNET), wptserve's localhost configuration (`get-host-info.sub.js`: REMOTE_HOST and NOTSAMESITE_HOST are `127.0.0.1` when the host is `localhost`) | `wpt_net::HOST` = `localhost`, `run_net_file` loads `http://localhost:<port>/…`; `start` binds `{{ports[http][0]}}` and `{{ports[http][1]}}` on `127.0.0.1`, `127.0.0.2`–`127.0.0.6` and `[::1]`; `subst` maps `{{host}}` → `localhost`, `www` / `www1` → `127.0.0.1`, `www2` → `127.0.0.2`, `alt` → `127.0.0.3`, `alt.www*` → `127.0.0.4`–`6`, `nonexistent` → `nonexistent.invalid`, `location[host]` / `[port]` from the Host header, `header_or_default(...)`; `requri.py` answers `request.url` from the Host header. |
+| 3 | un-emulated handlers (270 → 31) | each handler's `.py` at da1f6d20, cited by path in `PY_HANDLERS`; wptserve's `request.POST` (urlencoded and multipart/form-data), `response.set_cookie` (http.cookies' Morsel), the stash | 94 handlers in `wpt_net` `py()`: the scripting-1 set (`serve-with-content-type`, `log`, `serve-custom-response` with its stashed context, the four `load-error-events`, `delayed-modulescript`, `referrer-checker`, `cross-origin`, `script-not-found-not-executed`, `serve-text-then-js`, the two `http-accept-header-checker`, `record-fetch`), embedded-content (`delayed-broken-video`, `download_stash`, the four img handlers with their PNGs read from the checkout), html/browsers (`redirect`, `refresh` with its raw 0x80 0xFF header bytes, `slow`, `no-cache-single-redirect`, `unset_context_name_stash`), html/infrastructure/urls (`blank`, `echo-referrer-text`), xhr (`echo-headers`, `infinite-redirects`, `parse-headers`, `json-with-bom`, `win-1252-xml`, `invalid-utf8`, `echo-content-type`, `get-set-cookie`, `bad-chunk-encoding`, `upload`, `chunked` with its trailer, `last-modified`, `accept`, `conditional`, `form`, and 22 `access-control-*` / CORS handlers), resource-timing (`fake_responses`, `empty`, `TAOResponse`, `status-code`, `redirect-without-location`, `resource-timing-content-length`, `redirect-cors`, `cacheable-and-validated`, `multi_redirect`), encoding (`single-byte-raw`, `json-charset`, `text-plain-charset`, `text-html-meta-charset`), url (`percent-encoding`), fetch/api (`preflight` with its stashed dictionary, `bad-chunk-encoding`, `script-with-header`, `cache`, `redirect-empty-location`, `stashed-chunk`), eventsource (`cors` delegating to the handlers it runs, `cors-cookie`), FileAPI (`echo-content-escaped`), websockets (`set-cookie`, `redirect_response`, `check`), common (`slow-redirect`). `py_refs` ignores a `.py` under `tools/` (108 pages). |
+
+### What the fold should expect (R107: no executor ran the suites)
+
+- Predicates: `excluded()` and `wpt2_excluded()` lose `testdriver (WebDriver input automation)` and gain
+  `testdriver (WebDriver commands beyond input automation)` (15 pages); `net_excluded()` and `wpt2_excluded()` lose
+  `cross-origin (no second origin with CORS in the stand-in)`; `wpt2_excluded()` gains `needs a TLS server (the HTTPS
+  origins of get-host-info)` (7). Excluded pages 2197 → 1082 by the count above; the `layout / rendering` count rises
+  69 → 212 as explained.
+- Served pages grow by ~900 (pointerevents 12 → 178, embedded-content 418 → 644, shadow-dom 164 → 257, scripting-1
+  393 → 492, xhr 219 → 294 …); each is bounded at 30 s real time by `run_net_file`, so wall time grows with them —
+  the pointerevents directory alone is 166 more pages, most of which drive the one mouse pointer the engine has.
+- The DIRS runner (`run_file`) now settles in slices: a page that completes early returns at the same virtual time
+  as before; a page that never completes still ends at 15 s virtual.
+- `wpt_xhr` keeps its 85% floor over 75 more served pages: the CORS pages now run against the engine's own
+  `security/cors.rs` (the preflight, the CORS check, the response-header filter) — a floor movement there is a CORS
+  finding, not a stand-in one. Every `wpt2_*` floor is 0.
+- The first page of a run that reaches `localhost` resolves it through the system resolver; the stand-in listens on
+  `[::1]` as well as `127.0.0.1`, so either address order connects at once. A bench whose loopback refuses
+  `127.0.0.2`–`127.0.0.6` prints `wpt_net: cannot listen on …` and the pages naming those hosts fail; it never panics.
+- Wire shape of a testdriver page: `click` → `pointerdown` / `mousedown` / `pointerup` / `mouseup` / `click` at the
+  element's centre; `send_keys("ab")` on an input → `keydown a`, `input`, `keyup a`, `keydown b`, `input`, `keyup b`
+  with the value `ab`; a `bless` resolves through its injected button's click.
+
+Refused by name in this arc: a second pointer (the engine has one, the mouse — js/pointer.rs — so a `pointerType`
+of `touch` or `pen` drives it as the mouse, `pointerId` 1; the pointerevents pages that assert on the type fail and
+count), buttons other than the primary (a `pointerDown` with `button` 2 presses the primary; no `contextmenu`),
+`get_computed_label` / `get_computed_role` (the a11y name computation wants the rendering; 9 pages stay excluded),
+the BiDi modules and the window-placement, navigation, virtual-authenticator, sensor, FedCM and reporting commands
+(the `testdriver_beyond` list), HTTP authentication handlers (`auth*/auth.py`, `authentication.py`,
+`access-control-auth-basic.py`: the engine has no credential prompt — the standing `HTTP authentication` reason),
+`gzip.py` / `zlib.py` (a compressor), `timeout_on_seek.py` and the preflight-cache handlers (`access-control-basic-
+preflight-cache*.py`, `no-custom-header-on-preflight.py`: a stash-counted preflight cache; next), and the pages naming
+a `.py` path that is not in the checkout (`xhr/content.py`, `eventsource/message.py`, `module/echo-referrer.py`,
+`cookies/resources/set-cookie.py`, `fetch/connection-pool/…`, `fetch/content-type/…`: the predicate names them
+truthfully).
+
+### Next for AETHERWPT6 (by the AFTER count)
+
+1. websockets TLS variants — 315: a wss endpoint (a TLS server in the stand-in; with it the 96 `.https.` pages and
+   get-host-info's HTTPS origins, 7).
+2. layout geometry — 212 (`getBoundingClientRect` / `offset*` / `client*` / `scroll*`), against EYES; the largest
+   share is now pointerevents (58) and dom/events (38), pages that read a rect to aim the pointer.
+3. media fixtures — 139: `/media/` in `SPARSE`.
+4. bfcache / remote contexts — 98: the dispatcher and a back/forward cache.
+5. manual — 49 (a person).
+6. worker-only globals — 18: the `.any.worker.html` variant.
+7. idlharness — 17: `/interfaces/` in `SPARSE`.
+8. testdriver beyond the vendor — 15: `get_computed_label` / `get_computed_role` over the a11y tree (9), window
+   placement, BiDi.
+9. the handler tail — 31: HTTP authentication (17), the preflight cache (5), a compressor (2).
+10. a second pointer type for the pointerevents pages that run but assert `pointerType` (not an exclusion; a score).

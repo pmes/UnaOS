@@ -23,8 +23,17 @@
 //! `common/` (`slow.py`, `echo.py`), with wptserve's stash (one process-wide map keyed by key and URL directory,
 //! `take` removes, a second `put` of a live key is an error) behind the stash-using ones.
 //!
-//! Cross-origin hosts (`www`, `alt`) map to `localhost` — a different origin from `127.0.0.1` on the same
-//! loopback — and wss/h2/https variants are not served (no TLS server).
+//! AETHERWPT5 (SR144): the stand-in serves `/resources/testdriver-vendor.js` ([`TESTDRIVER_VENDOR_JS`]), the
+//! WebDriver commands of `testdriver.js` over the engine's automation queue (`js/testdriver.rs`,
+//! `AetherEngine::pump_automation`); a second origin: the page origin is `http://localhost:{{ports[http][0]}}`
+//! (wptserve's own localhost configuration, so `get-host-info.sub.js` names `127.0.0.1` as the remote and
+//! not-same-site host), `{{domains[www]}}` / `{{domains[www1]}}` are `127.0.0.1`, `{{domains[www2]}}` `127.0.0.2`,
+//! the `alt` hosts `127.0.0.3`–`127.0.0.6` (every 127/8 address is the loopback on Linux; a listener is bound per
+//! address and per port), `{{ports[http][1]}}` a second port, `{{hosts[][nonexistent]}}` a `.invalid` name; and
+//! the handlers of `html/semantics/{scripting-1,embedded-content}`, `xhr`, `resource-timing`, `encoding`, `url`,
+//! `fetch/api`, `eventsource`, `websockets`, `FileAPI`, `html/browsers` and `html/infrastructure/urls` that the
+//! measurement ranked (docs/dev/evidence/aetherwpt/WPT.md, the AETHERWPT5 section), each from its `.py` source at
+//! the pinned commit. wss/h2/https variants are still not served (no TLS server).
 
 use gneiss_pal::api::http::ws::{accept_key, close_payload, encode_frame, FrameDecoder, OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -67,6 +76,102 @@ pub const PY_HANDLERS: &[&str] = &[
     "fetch/api/resources/infinite-slow-response.py",
     "common/slow.py",
     "common/echo.py",
+    // AETHERWPT5 (SR144)
+    "html/semantics/embedded-content/media-elements/loading-the-media-resource/resources/delayed-broken-video.py",
+    "html/semantics/scripting-1/the-script-element/serve-with-content-type.py",
+    "html/semantics/scripting-1/the-script-element/log.py",
+    "html/semantics/scripting-1/the-script-element/serve-custom-response.py",
+    "html/semantics/scripting-1/the-script-element/resources/load-error-events.py",
+    "html/semantics/scripting-1/the-script-element/css-module/resources/load-error-events.py",
+    "html/semantics/scripting-1/the-script-element/json-module/load-error-events.py",
+    "html/semantics/scripting-1/the-script-element/text-module/load-error-events.py",
+    "html/semantics/scripting-1/the-script-element/module/resources/delayed-modulescript.py",
+    "html/semantics/scripting-1/the-script-element/module/resources/referrer-checker.py",
+    "html/semantics/scripting-1/the-script-element/resources/cross-origin.py",
+    "html/semantics/scripting-1/the-script-element/script-not-found-not-executed.py",
+    "html/semantics/scripting-1/the-script-element/text-module/serve-text-then-js.py",
+    "html/semantics/scripting-1/the-script-element/json-module/http-accept-header-checker.py",
+    "html/semantics/scripting-1/the-script-element/text-module/http-accept-header-checker.py",
+    "html/semantics/scripting-1/the-script-element/css-module/resources/record-fetch.py",
+    "html/semantics/embedded-content/the-iframe-element/support/download_stash.py",
+    "html/semantics/embedded-content/the-img-element/404-response-with-actual-image-data.py",
+    "html/semantics/embedded-content/the-img-element/resources/image-alternate-no-store.py",
+    "html/semantics/embedded-content/the-img-element/resources/referrer-checker-img.py",
+    "html/semantics/embedded-content/the-img-element/resources/image-and-stash.py",
+    "html/browsers/browsing-the-web/navigating-across-documents/resources/redirect.py",
+    "html/browsers/browsing-the-web/navigating-across-documents/refresh/resources/refresh.py",
+    "html/browsers/browsing-the-web/overlapping-navigations-and-traversals/resources/slow.py",
+    "html/browsers/browsing-the-web/navigating-across-documents/resources/no-cache-single-redirect.py",
+    "html/browsers/browsing-the-web/history-traversal/resources/unset_context_name_stash.py",
+    "html/infrastructure/urls/resolving-urls/query-encoding/resources/blank.py",
+    "html/infrastructure/urls/terminology-0/resources/echo-referrer-text.py",
+    "xhr/resources/echo-headers.py",
+    "xhr/resources/infinite-redirects.py",
+    "xhr/resources/parse-headers.py",
+    "xhr/resources/json-with-bom.py",
+    "xhr/resources/win-1252-xml.py",
+    "xhr/resources/invalid-utf8.py",
+    "xhr/resources/echo-content-type.py",
+    "xhr/resources/get-set-cookie.py",
+    "xhr/resources/bad-chunk-encoding.py",
+    "xhr/resources/upload.py",
+    "xhr/resources/chunked.py",
+    "xhr/resources/last-modified.py",
+    "xhr/resources/accept.py",
+    "xhr/resources/conditional.py",
+    "xhr/resources/form.py",
+    "resource-timing/resources/fake_responses.py",
+    "resource-timing/resources/empty.py",
+    "resource-timing/resources/TAOResponse.py",
+    "resource-timing/resources/status-code.py",
+    "resource-timing/resources/redirect-without-location.py",
+    "resource-timing/resources/resource-timing-content-length.py",
+    "resource-timing/resources/redirect-cors.py",
+    "resource-timing/resources/cacheable-and-validated.py",
+    "encoding/resources/single-byte-raw.py",
+    "encoding/resources/json-charset.py",
+    "encoding/resources/text-plain-charset.py",
+    "encoding/resources/text-html-meta-charset.py",
+    "url/resources/percent-encoding.py",
+    "fetch/api/resources/bad-chunk-encoding.py",
+    "fetch/api/resources/script-with-header.py",
+    "fetch/api/resources/cache.py",
+    "fetch/api/resources/redirect-empty-location.py",
+    "fetch/api/resources/stashed-chunk.py",
+    "eventsource/resources/cors.py",
+    "eventsource/resources/cors-cookie.py",
+    "FileAPI/file/resources/echo-content-escaped.py",
+    "websockets/cookies/support/set-cookie.py",
+    "websockets/opening-handshake/resources/redirect_response.py",
+    "websockets/security/check.py",
+    // AETHERWPT5 (SR144): the CORS handlers the cross-origin lift reaches.
+    "fetch/api/resources/preflight.py",
+    "xhr/resources/reset-token.py",
+    "xhr/resources/access-control-preflight-denied.py",
+    "xhr/resources/access-control-basic-put-allow.py",
+    "xhr/resources/access-control-basic-denied.py",
+    "xhr/resources/access-control-basic-options-not-supported.py",
+    "xhr/resources/access-control-preflight-request-invalid-status.py",
+    "xhr/resources/access-control-basic-allow-star.py",
+    "xhr/resources/access-control-basic-allow.py",
+    "xhr/resources/access-control-origin-header.py",
+    "xhr/resources/access-control-allow-with-body.py",
+    "xhr/resources/access-control-basic-cors-safelisted-request-headers.py",
+    "xhr/resources/access-control-basic-cors-safelisted-response-headers.py",
+    "xhr/resources/access-control-preflight-request-allow-headers-returns-star.py",
+    "xhr/resources/access-control-preflight-request-header-lowercase.py",
+    "xhr/resources/access-control-preflight-request-header-returns-origin.py",
+    "xhr/resources/access-control-preflight-request-header-sorted.py",
+    "xhr/resources/access-control-preflight-request-headers-origin.py",
+    "xhr/resources/access-control-cookie.py",
+    "xhr/resources/echo-content-cors.py",
+    "xhr/resources/redirect-cors.py",
+    "xhr/resources/header-user-agent.py",
+    "xhr/resources/win-1252-html.py",
+    "xhr/resources/invalid-utf8-html.py",
+    "resource-timing/resources/multi_redirect.py",
+    "common/slow-redirect.py",
+    "html/semantics/scripting-1/the-script-element/module/dynamic-import/beta/redirect.py",
 ];
 
 /// The pywebsocket handlers the WebSocket server re-implements (`/name` = `websockets/handlers/name_wsh.py`).
@@ -96,10 +201,106 @@ pub const WS_HANDLERS: &[&str] = &[
     "delayed-passive-close",
 ];
 
+/// AETHERWPT5 (SR144): Aether's `testdriver-vendor.js` — `window.test_driver_internal`'s WebDriver commands over
+/// the engine's automation queue (`js/testdriver.rs`: `__td_queue(kind, json)` returns a ticket the engine settles
+/// through `__td_settle(ticket, error, result)` after dispatching the command — `AetherEngine::pump_automation`).
+/// `in_automation` is true, so a command the vendor does not implement rejects at once instead of waiting for a
+/// person. Element Click's point and Perform Actions' element origins are the engine's own layout
+/// (`getClientRects`, CSSOM View); a point in a frame's viewport is moved to the top-level one through the
+/// frame element's border box.
+pub const TESTDRIVER_VENDOR_JS: &str = r#"(function () {
+  if (typeof __td_queue !== 'function' || typeof __td_node !== 'function' || !window.test_driver_internal) { return; }
+  var pending = {};
+  function call(kind, payload) {
+    return new Promise(function (resolve, reject) {
+      var ticket = __td_queue(kind, JSON.stringify(payload));
+      pending[ticket] = { resolve: resolve, reject: reject };
+    });
+  }
+  window.__td_settle = function (ticket, error, result) {
+    var p = pending[ticket];
+    if (!p) { return; }
+    delete pending[ticket];
+    if (error !== null && error !== undefined) { p.reject(new Error(error)); } else { p.resolve(result === undefined ? null : result); }
+  };
+  function toTop(win, x, y) {
+    try {
+      while (win && win !== window) {
+        var fe = win.frameElement;
+        if (!fe) { break; }
+        var r = fe.getBoundingClientRect();
+        x += r.left + (fe.clientLeft || 0);
+        y += r.top + (fe.clientTop || 0);
+        win = win.parent;
+      }
+    } catch (e) {}
+    return { x: x, y: y };
+  }
+  function winOf(el) { return el && el.ownerDocument ? el.ownerDocument.defaultView : window; }
+  var td = window.test_driver_internal;
+  td.in_automation = true;
+  td.click = function (element, coords) {
+    var p = toTop(winOf(element), coords.x, coords.y);
+    return call('click', { x: p.x, y: p.y });
+  };
+  td.send_keys = function (element, keys) {
+    try { element.focus(); } catch (e) {}
+    return call('keys', { target: __td_node(element), keys: String(keys) });
+  };
+  td.action_sequence = function (actions, context) {
+    var sources = [];
+    for (var i = 0; i < actions.length; i++) {
+      var src = actions[i];
+      var list = [];
+      var acts = src.actions || [];
+      for (var j = 0; j < acts.length; j++) {
+        var a = acts[j];
+        var o = {};
+        for (var k in a) { if (k !== 'origin') { o[k] = a[k]; } }
+        if (a.origin !== undefined && a.origin !== null) {
+          if (typeof a.origin === 'string') { o.origin = a.origin; }
+          else {
+            var id = __td_node(a.origin);
+            if (id === null) { return Promise.reject(new Error('invalid argument: origin')); }
+            o.origin = { node: id };
+          }
+        }
+        list.push(o);
+      }
+      sources.push({ type: src.type, id: src.id, pointerType: (src.parameters && src.parameters.pointerType) || 'mouse', actions: list });
+    }
+    return call('actions', { sources: sources });
+  };
+  td.set_permission = function (params, context) {
+    var d = (params && params.descriptor) || {};
+    return call('permission', { name: String(d.name), state: String(params && params.state) });
+  };
+  td.get_all_cookies = function (context) { return call('cookies_get', {}); };
+  td.get_named_cookie = function (name, context) { return call('cookie_named', { name: String(name) }); };
+  td.delete_all_cookies = function (context) { return call('cookies_clear', {}); };
+  td.set_test_context = function (context) {};
+})();
+"#;
+
 #[derive(Clone, Copy)]
 pub struct Ports {
+    /// `{{ports[http][0]}}`: the page origin's port (`http://localhost:<http>`).
     pub http: u16,
+    /// AETHERWPT5 (SR144): `{{ports[http][1]}}`, the same server on a second port (a different origin).
+    pub http2: u16,
     pub ws: u16,
+}
+
+/// AETHERWPT5 (SR144): the host name the runner loads test pages from (`{{host}}`); its origin is
+/// `http://localhost:{{ports[http][0]}}`.
+pub const HOST: &str = "localhost";
+
+/// The loopback addresses the stand-in listens on, for the `sub` pipe's other hosts: `www` / `www1` (and
+/// get-host-info's REMOTE_HOST and NOTSAMESITE_HOST under a `localhost` page host), `www2`, and the `alt` hosts.
+const HOSTS: &[(&str, &str)] = &[("www", "127.0.0.1"), ("www1", "127.0.0.1"), ("www2", "127.0.0.2"), ("alt", "127.0.0.3"), ("alt.www", "127.0.0.4"), ("alt.www1", "127.0.0.5"), ("alt.www2", "127.0.0.6")];
+
+fn host_of(key: &str) -> &'static str {
+    HOSTS.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or("127.0.0.1")
 }
 
 struct Req {
@@ -135,6 +336,132 @@ impl Req {
             (k == name).then(|| v.to_string())
         })
     }
+    /// AETHERWPT5 (SR144): wptserve's `request.POST` — the body's fields as (name, value, filename, content type)
+    /// in order: `application/x-www-form-urlencoded` (urllib's parse_qsl) or `multipart/form-data` (cgi's
+    /// FieldStorage; a part with a `filename` is a file, `Content-Type` text/plain when absent).
+    fn post(&self) -> Vec<(Vec<u8>, Vec<u8>, Option<String>, Option<String>)> {
+        let ct = self.header("content-type").unwrap_or("").to_string();
+        let mut out = Vec::new();
+        if let Some(b) = ct.split(';').map(str::trim).find_map(|p| p.strip_prefix("boundary=")) {
+            let b = b.trim_matches('"');
+            let delim = format!("--{b}").into_bytes();
+            let body = &self.body;
+            let mut parts: Vec<&[u8]> = Vec::new();
+            let mut i = 0;
+            let mut starts = Vec::new();
+            while let Some(p) = find(&body[i..], &delim) {
+                starts.push(i + p);
+                i += p + delim.len();
+            }
+            for w in starts.windows(2) {
+                parts.push(&body[w[0] + delim.len()..w[1]]);
+            }
+            for part in parts {
+                let part = part.strip_prefix(b"\r\n").unwrap_or(part);
+                let Some(h) = find(part, b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&part[..h]).into_owned();
+                let mut value = &part[h + 4..];
+                if value.ends_with(b"\r\n") {
+                    value = &value[..value.len() - 2];
+                }
+                let mut name = Vec::new();
+                let mut filename = None;
+                let mut ptype = None;
+                for line in head.lines() {
+                    let Some((k, v)) = line.split_once(':') else { continue };
+                    if k.trim().eq_ignore_ascii_case("content-disposition") {
+                        for param in v.split(';').map(str::trim) {
+                            if let Some(n) = param.strip_prefix("name=") {
+                                name = n.trim_matches('"').as_bytes().to_vec();
+                            } else if let Some(f) = param.strip_prefix("filename=") {
+                                filename = Some(f.trim_matches('"').to_string());
+                            }
+                        }
+                    } else if k.trim().eq_ignore_ascii_case("content-type") {
+                        ptype = Some(v.trim().to_string());
+                    }
+                }
+                if filename.is_some() && ptype.is_none() {
+                    ptype = Some("text/plain".into());
+                }
+                out.push((name, value.to_vec(), filename, ptype));
+            }
+        } else {
+            for kv in String::from_utf8_lossy(&self.body).split('&').filter(|x| !x.is_empty()) {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                out.push((pct(k), pct(v), None, None));
+            }
+        }
+        out
+    }
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// A base64 decoder (RFC 4648 §4, padding optional) for the handlers that carry base64 (`decodebytes`,
+/// `b64decode`).
+fn b64decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+/// `Set-Cookie` as wptserve's `response.set_cookie(name, value, expires=…, secure=…)` writes it (http.cookies'
+/// Morsel: `name=value; expires=<date>; Path=/; Secure`).
+fn set_cookie_header(name: &str, value: &str, expires: Option<&str>, secure: bool) -> String {
+    let mut h = format!("{name}={value}");
+    if let Some(e) = expires {
+        h.push_str(&format!("; expires={e}"));
+    }
+    h.push_str("; Path=/");
+    if secure {
+        h.push_str("; Secure");
+    }
+    h
+}
+
+/// An HTTP-date (RFC 7231 §7.1.1.1 IMF-fixdate) for a Unix time.
+fn http_date(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (h, m, sec) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    let wd = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][days.rem_euclid(7) as usize];
+    let mn = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(mo - 1) as usize];
+    format!("{wd}, {d:02} {mn} {y} {h:02}:{m:02}:{sec:02} GMT")
 }
 
 fn pct(s: &str) -> Vec<u8> {
@@ -257,16 +584,31 @@ fn subst(text: &str, req: &Req, ports: Ports) -> String {
         };
         let key = rest[i + 2..i + j].trim();
         let v = match key {
-            "host" | "domains[]" | "hosts[][]" | "location[hostname]" => Some("127.0.0.1".to_string()),
-            k if k.starts_with("domains[") || k.starts_with("hosts[") => Some("localhost".to_string()),
-            "ports[http][0]" | "ports[http][1]" => Some(ports.http.to_string()),
+            // AETHERWPT5 (SR144): the page host is `localhost` (wptserve's localhost configuration); the other
+            // hosts are the loopback addresses the stand-in listens on (HOSTS); a `nonexistent` host does not resolve.
+            "host" | "domains[]" | "hosts[][]" | "location[hostname]" => Some(HOST.to_string()),
+            "hosts[][nonexistent]" | "hosts[alt][nonexistent]" => Some("nonexistent.invalid".to_string()),
+            k if k.starts_with("domains[") => Some(host_of(k.trim_start_matches("domains[").trim_end_matches(']')).to_string()),
+            k if k.starts_with("hosts[") => {
+                let inner = k.trim_start_matches("hosts[").trim_end_matches(']');
+                let (ns, sub) = inner.split_once("][").unwrap_or((inner, ""));
+                Some(match (ns, sub) {
+                    ("", "") => HOST.to_string(),
+                    ("", sub) => host_of(sub).to_string(),
+                    ("alt", "") => host_of("alt").to_string(),
+                    ("alt", sub) => host_of(&format!("alt.{sub}")).to_string(),
+                    _ => host_of("alt").to_string(),
+                })
+            }
+            "ports[http][0]" => Some(ports.http.to_string()),
+            "ports[http][1]" => Some(ports.http2.to_string()),
             "ports[ws][0]" => Some(ports.ws.to_string()),
             // No TLS server: an unused port, so wss/https variants fail fast (and are skipped by name).
             "ports[https][0]" | "ports[wss][0]" | "ports[h2][0]" | "ports[https][1]" => Some("1".into()),
             "location[scheme]" => Some("http".into()),
-            "location[host]" | "location[server]" => Some(format!("127.0.0.1:{}", ports.http)),
-            "location[port]" => Some(ports.http.to_string()),
-            "location[path]" => Some(req.path.clone()),
+            "location[host]" | "location[server]" => Some(req.header("host").map(str::to_string).unwrap_or_else(|| format!("{HOST}:{}", ports.http))),
+            "location[port]" => Some(req.header("host").and_then(|h| h.rsplit_once(':').map(|(_, p)| p.to_string())).unwrap_or_else(|| ports.http.to_string())),
+            "location[path]" | "location[pathname]" => Some(req.path.clone()),
             "location[query]" => Some(if req.query.is_empty() { String::new() } else { format!("?{}", req.query) }),
             "uuid()" => Some(format!("{:016x}-0000-4000-8000-000000000000", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)),
             k => {
@@ -274,6 +616,10 @@ fn subst(text: &str, req: &Req, ports: Ports) -> String {
                     Some(req.header(h.trim_matches('"')).unwrap_or("").to_string())
                 } else if let Some(g) = k.strip_prefix("GET[").and_then(|x| x.strip_suffix(']')) {
                     Some(req.get_str(g.trim_matches('"')).unwrap_or_default())
+                } else if let Some(a) = k.strip_prefix("header_or_default(").and_then(|x| x.strip_suffix(')')) {
+                    // AETHERWPT5 (SR144): wptserve's `header_or_default(name, default)`.
+                    let (h, d) = a.split_once(',').unwrap_or((a, ""));
+                    Some(req.header(h.trim()).unwrap_or(d.trim()).to_string())
                 } else {
                     None
                 }
@@ -363,6 +709,23 @@ fn any_worker_script(root: &Path, stem: &str) -> Option<Vec<u8>> {
 enum Stashed {
     Str(String),
     Redirect { count: u32, preflight: bool },
+    /// AETHERWPT5 (SR144): `serve-custom-response.py`'s context.
+    Custom { network_error: bool, run_count: u32, status_code: u16, content_type: String },
+    /// AETHERWPT5 (SR144): `fetch/api/resources/preflight.py`'s stashed dictionary.
+    Dict(Vec<(String, String)>),
+}
+
+/// `stash.take(key)` as a string, or None.
+fn stash_take_str(key: &str, dir: &str) -> Option<String> {
+    match stash_take(key, dir) {
+        Some(Stashed::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// `stash.take(key)` as a counter (0 when absent), as the handlers that count requests read it.
+fn stash_count(key: &str, dir: &str) -> u32 {
+    stash_take_str(key, dir).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// wptserve's stash: (key, URL directory) → value. Process-wide, as wptserve's is server-wide.
@@ -433,8 +796,16 @@ fn sleep_ms(ms: u64) {
 }
 
 /// The emulated Python handlers. `None` = not emulated.
-fn py(rel: &str, req: &Req, s: &mut TcpStream) -> Option<Option<Resp>> {
+fn py(rel: &str, req: &Req, s: &mut TcpStream, root: &Path, ports: Ports) -> Option<Option<Resp>> {
     let es = "text/event-stream";
+    let dir = url_dir(req);
+    // The handler's own directory in the checkout (`os.path.dirname(__file__)`).
+    let here = root.join(rel).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+    let read = |p: &Path| std::fs::read(p).unwrap_or_default();
+    let referer = req.header("referer").unwrap_or("").to_string();
+    let origin = req.header("origin").map(str::to_string);
+    // wptserve's `response.set_error(code, message)`: a text/plain body "<code> <reason>\n\n<message>"-shaped error.
+    let set_error = |code: u16, msg: &str| Resp::new(code, "Error", "text/plain", msg.as_bytes().to_vec());
     Some(Some(match rel {
         "eventsource/resources/message.py" => {
             let mime = req.get_str("mime").unwrap_or_else(|| es.into());
@@ -600,7 +971,8 @@ fn py(rel: &str, req: &Req, s: &mut TcpStream) -> Option<Option<Resp>> {
         }
         "xhr/resources/echo-method.py" => Resp::new(200, "OK", "text/plain", req.method.clone().into_bytes()),
         "xhr/resources/requri.py" => {
-            let body = if req.get("full").is_some() { format!("http://127.0.0.1{}", req.target) } else { req.path.clone() };
+            // `request.url`: the scheme, the Host header and the request target.
+            let body = if req.get("full").is_some() { format!("http://{}{}", req.header("host").unwrap_or(HOST), req.target) } else { req.path.clone() };
             Resp::new(200, "OK", "text/html", body.into_bytes())
         }
         "xhr/resources/corsenabled.py" => {
@@ -740,7 +1112,9 @@ fn py(rel: &str, req: &Req, s: &mut TcpStream) -> Option<Option<Resp>> {
             let body = match stash_take(&key, &url_dir(req)) {
                 Some(Stashed::Str(v)) => serde_json::to_string(&v).unwrap_or_else(|_| "null".into()),
                 Some(Stashed::Redirect { count, preflight }) => format!("{{\"count\": {count}, \"preflight\": \"{}\"}}", if preflight { 1 } else { 0 }),
-                None => "null".into(),
+                // AETHERWPT5 (SR144): preflight.py's dictionary as JSON; serve-custom-response's context is never taken here.
+                Some(Stashed::Dict(d)) => serde_json::Value::Object(d.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect()).to_string(),
+                Some(Stashed::Custom { .. }) | None => "null".into(),
             };
             Resp::new(200, "OK", "application/json", body.into_bytes()).header("Access-Control-Allow-Origin", "*")
         }
@@ -822,6 +1196,1013 @@ fn py(rel: &str, req: &Req, s: &mut TcpStream) -> Option<Option<Resp>> {
             Resp::new(200, "OK", "", Vec::new())
         }
         "common/echo.py" => Resp::new(200, "OK", "text/html", req.get("content").unwrap_or_default()).header("X-XSS-Protection", "0"),
+        // ---- AETHERWPT5 (SR144): the handlers the measurement ranked, each from its source at da1f6d20.
+        "html/semantics/embedded-content/media-elements/loading-the-media-resource/resources/delayed-broken-video.py" => {
+            sleep_ms(100);
+            Resp::new(200, "OK", "text/plain", b"FAIL".to_vec())
+        }
+        "html/semantics/scripting-1/the-script-element/serve-with-content-type.py" => {
+            match (req.get_str("fn"), req.get_str("ct")) {
+                (Some(f), Some(ct)) if !f.contains("..") && here.join(&f).is_file() => Resp::new(200, "OK", &ct, read(&here.join(&f))),
+                _ => set_error(400, "Not enough parameters or file not found"),
+            }
+        }
+        "html/semantics/scripting-1/the-script-element/log.py" => {
+            let (Some(id), Some(sec)) = (req.get_str("id").and_then(|v| v.parse::<i64>().ok()), req.get_str("sec").and_then(|v| v.parse::<u64>().ok())) else {
+                return Some(Some(set_error(400, "Invalid parameter")));
+            };
+            sleep_ms(sec * 1000);
+            Resp::new(200, "OK", "text/javascript", format!("log('{id}')").into_bytes())
+        }
+        "html/semantics/scripting-1/the-script-element/serve-custom-response.py" => {
+            let key = req.get_str("key").unwrap_or_default();
+            let (mut network_error, run_count, mut status_code, mut content_type) = match stash_take(&key, &dir) {
+                Some(Stashed::Custom { network_error, run_count, status_code, content_type }) => (network_error, run_count, status_code, content_type),
+                _ => (false, 0, 200, "application/javascript".to_string()),
+            };
+            let put = |ne: bool, rc: u32, sc: u16, ct: &str| {
+                stash_put(&key, &dir, Stashed::Custom { network_error: ne, run_count: rc, status_code: sc, content_type: ct.to_string() });
+            };
+            match req.get_str("action").as_deref() {
+                Some("stat") => {
+                    put(network_error, run_count, status_code, &content_type);
+                    return Some(Some(Resp::new(200, "OK", "text/plain", run_count.to_string().into_bytes())));
+                }
+                Some("reset-stat") => {
+                    put(network_error, 0, status_code, &content_type);
+                    return Some(Some(Resp::new(200, "OK", "text/plain", b"OK".to_vec())));
+                }
+                Some("set") => {
+                    if let Some(c) = req.get_str("code").and_then(|v| v.parse().ok()) {
+                        status_code = c;
+                    }
+                    if let Some(ct) = req.get_str("content-type") {
+                        content_type = ct;
+                    }
+                    if let Some(ne) = req.get_str("network-error") {
+                        network_error = ne.eq_ignore_ascii_case("true");
+                    }
+                    put(network_error, run_count, status_code, &content_type);
+                    return Some(Some(Resp::new(200, "OK", "text/plain", b"OK".to_vec())));
+                }
+                _ => {}
+            }
+            if network_error {
+                put(true, run_count + 1, status_code, &content_type);
+                // The connection closes without a response.
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                return Some(None);
+            }
+            let body: &[u8] = match content_type.as_str() {
+                "application/javascript" => b"export default 'hello';",
+                "application/json" => b"{\"hello\": \"world\"}",
+                "text/css" => b"#test { background-color: rgb(0, 255, 0); }",
+                _ => b"42",
+            };
+            put(network_error, run_count + 1, status_code, &content_type);
+            Resp::new(status_code, "OK", &content_type, body.to_vec())
+        }
+        "html/semantics/scripting-1/the-script-element/resources/load-error-events.py"
+        | "html/semantics/scripting-1/the-script-element/css-module/resources/load-error-events.py"
+        | "html/semantics/scripting-1/the-script-element/json-module/load-error-events.py"
+        | "html/semantics/scripting-1/the-script-element/text-module/load-error-events.py" => {
+            let test = req.get_str("test").unwrap_or_default();
+            if test.is_empty() || !test.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                return Some(Some(set_error(500, "AssertionError")));
+            }
+            let load = test.contains("_load");
+            let (import_ok, import_404) = if rel.contains("/css-module/") {
+                ("import \"./basic.css\" with { type: \"css\"}; ", "import \"./not_found.css\" with { type: \"css\"}; ")
+            } else if rel.contains("/json-module/") {
+                ("import \"./module.json\" with { type: \"json\"}; ", "import \"./not_found.json\" with { type: \"json\"}; ")
+            } else if rel.contains("/text-module/") {
+                ("import \"./file.txt\" with { type: \"text\" }; ", "import \"./not_found.txt\" with { type: \"text\" }; ")
+            } else {
+                ("\"use strict\"; ", "\"use strict\"; ")
+            };
+            let classic = !rel.contains("-module/");
+            let (status, body) = if load {
+                (200, format!("{import_ok}{test}.executed = true;"))
+            } else {
+                (if classic { 404 } else { 200 }, format!("{import_404}{test}.test.step(function() {{ assert_unreached(\"404 script should not be executed\"); }});"))
+            };
+            Resp::new(status, if status == 200 { "OK" } else { "Not Found" }, "text/javascript", body.into_bytes())
+        }
+        "html/semantics/scripting-1/the-script-element/module/resources/delayed-modulescript.py" => {
+            let ms: f64 = req.get_str("ms").and_then(|v| v.parse().ok()).unwrap_or(500.0);
+            sleep_ms(ms as u64);
+            Resp::new(200, "OK", "text/javascript", b"export let delayedLoaded = true;".to_vec())
+        }
+        "html/semantics/scripting-1/the-script-element/module/resources/referrer-checker.py" => {
+            Resp::new(200, "OK", "text/javascript", format!("export const referrer = '{referer}';").into_bytes()).header("Access-Control-Allow-Origin", "*")
+        }
+        "html/semantics/scripting-1/the-script-element/resources/cross-origin.py" => {
+            let mut r = if req.method == "OPTIONS" {
+                Resp::new(200, "OK", "", Vec::new())
+            } else {
+                let included = req.cookie("milk").as_deref() == Some("1");
+                Resp::new(200, "OK", "text/javascript", format!("var included = {included};").into_bytes())
+            };
+            if let Some(o) = &origin {
+                r = r.header("Access-Control-Allow-Origin", o).header("Access-Control-Allow-Methods", "GET").header("Access-Control-Allow-Credentials", "true");
+            }
+            r
+        }
+        "html/semantics/scripting-1/the-script-element/script-not-found-not-executed.py" => Resp::new(404, "Not Found", "text/javascript", b"test1_token = \"script executed\";".to_vec()),
+        "html/semantics/scripting-1/the-script-element/text-module/serve-text-then-js.py" => {
+            let Some(key) = req.get_str("key") else { return Some(Some(set_error(400, "Not enough parameters"))) };
+            let n = stash_count(&key, &dir);
+            stash_put(&key, &dir, Stashed::Str((n + 1).to_string()));
+            if n == 0 {
+                Resp::new(200, "OK", "text/plain", b"hello".to_vec())
+            } else {
+                Resp::new(200, "OK", "application/javascript", b"export default 'world';".to_vec())
+            }
+        }
+        "html/semantics/scripting-1/the-script-element/json-module/http-accept-header-checker.py" => {
+            let accept = req.header("accept").unwrap_or("");
+            Resp::new(200, "OK", "application/json", format!("{{\"accept\": \"{accept}\"}}").into_bytes()).header("Access-Control-Allow-Origin", "*")
+        }
+        "html/semantics/scripting-1/the-script-element/text-module/http-accept-header-checker.py" => {
+            Resp::new(200, "OK", "text/plain", req.header("accept").unwrap_or("").as_bytes().to_vec()).header("Access-Control-Allow-Origin", "*")
+        }
+        "html/semantics/scripting-1/the-script-element/css-module/resources/record-fetch.py" => {
+            let (Some(key), Some(action)) = (req.get_str("key"), req.get_str("action")) else { return Some(Some(set_error(400, "Not enough parameters"))) };
+            let n = stash_count(&key, &dir);
+            match action.as_str() {
+                "incCount" => {
+                    stash_put(&key, &dir, Stashed::Str((n + 1).to_string()));
+                    Resp::new(200, "OK", "text/css", b"#test { background-color: #FF0000; }".to_vec())
+                }
+                "getCount" => Resp::new(200, "OK", "text/json", format!("{{\"count\": {n} }}").into_bytes()),
+                _ => set_error(400, "Invalid action"),
+            }
+        }
+        "html/semantics/embedded-content/the-iframe-element/support/download_stash.py" => {
+            let token = req.get_str("token").unwrap_or_default();
+            if req.get("verify-token").is_some() {
+                let hit = stash_take(&token, &dir).is_some();
+                return Some(Some(Resp::new(200, "OK", "text/html", if hit { b"TOKEN_SET".to_vec() } else { b"TOKEN_NOT_SET".to_vec() }).header("X-Content-Type-Options", "nosniff")));
+            }
+            let Some(delay) = req.get_str("finish-delay").and_then(|v| v.parse::<f64>().ok()) else {
+                // `<a download>`
+                stash_put(&token, &dir, Stashed::Str("True".into()));
+                return Some(Some(Resp::new(200, "OK", "text/html", Vec::new()).header("X-Content-Type-Options", "nosniff")));
+            };
+            // Navigation to a download: the body trickles in while the page cancels it.
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Content-Type-Options: nosniff\r\nContent-Disposition: attachment\r\nConnection: close\r\n\r\n");
+            let single = (delay / 10.0) as u64;
+            for _ in 0..10 {
+                sleep_ms(single);
+                if s.write_all(b"\n").is_err() || s.flush().is_err() {
+                    return Some(None);
+                }
+            }
+            stash_put(&token, &dir, Stashed::Str("True".into()));
+            return Some(None);
+        }
+        "html/semantics/embedded-content/the-img-element/404-response-with-actual-image-data.py" => Resp::new(
+            404,
+            "Not Found",
+            "image/png",
+            b64decode("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsQAAA7EAZUrDhsAAAAhSURBVDhPY3wro/KfgQLABKXJBqMGjBoAAqMGDLwBDAwAEsoCTFWunmQAAAAASUVORK5CYII="),
+        ),
+        "html/semantics/embedded-content/the-img-element/resources/image-alternate-no-store.py" => {
+            const STASH_ID: &str = "882e0112-2a43-4ff1-9503-658b1a2a8e67";
+            let switch = stash_take_str(STASH_ID, &dir).as_deref() == Some("True");
+            stash_put(STASH_ID, &dir, Stashed::Str(if switch { "False".into() } else { "True".into() }));
+            let image = if switch { "blue-10.png" } else { "green.png" };
+            Resp::new(200, "OK", "image/png", read(&here.join(image))).header("Cache-Control", "no-store")
+        }
+        "html/semantics/embedded-content/the-img-element/resources/referrer-checker-img.py" => {
+            let expected = req.get_str("expected_referrer").unwrap_or_default();
+            if referer == expected {
+                Resp::new(200, "OK", "image/png", read(&here.join("image.png")))
+            } else {
+                Resp::new(404, "Not Found", "image/png", b"Not found".to_vec())
+            }
+        }
+        "html/semantics/embedded-content/the-img-element/resources/image-and-stash.py" => {
+            if let Some(uuid) = req.get_str("increment") {
+                let n = stash_count(&uuid, &dir);
+                stash_put(&uuid, &dir, Stashed::Str((n + 1).to_string()));
+                Resp::new(200, "OK", "image/png", read(&here.join("image.png")))
+            } else if let Some(uuid) = req.get_str("read") {
+                let n = stash_count(&uuid, &dir);
+                stash_put(&uuid, &dir, Stashed::Str(n.to_string()));
+                Resp::new(200, "OK", "", n.to_string().into_bytes())
+            } else {
+                Resp::new(404, "Not Found", "", b"Not found".to_vec())
+            }
+        }
+        "html/browsers/browsing-the-web/navigating-across-documents/resources/redirect.py" => {
+            Resp::new(302, "Found", "", Vec::new()).header("Location", &req.get_str("location").unwrap_or_default())
+        }
+        "html/browsers/browsing-the-web/navigating-across-documents/refresh/resources/refresh.py" => {
+            // The Refresh header carries the bytes 0x80 0xFF (a byte-to-Unicode test): written raw.
+            let mut head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nRefresh: 0;./refreshed.txt?".to_vec();
+            head.extend_from_slice(&[0x80, 0xFF]);
+            head.extend_from_slice(b"\r\nContent-Length: 15\r\nConnection: close\r\n\r\nNot refreshed.\n");
+            let _ = s.write_all(&head);
+            return Some(None);
+        }
+        "html/browsers/browsing-the-web/overlapping-navigations-and-traversals/resources/slow.py" => {
+            sleep_ms(2000);
+            Resp::new(200, "OK", "text/html", Vec::new())
+        }
+        "html/browsers/browsing-the-web/navigating-across-documents/resources/no-cache-single-redirect.py" => {
+            let uuid = req.get_str("uuid").unwrap_or_default();
+            if stash_take(&uuid, &dir).is_none() {
+                stash_put(&uuid, &dir, Stashed::Str("sentinel value".into()));
+                Resp::new(302, "Found", "", Vec::new()).header("Cache-Control", "no-store").header("Location", &req.get_str("location").unwrap_or_default())
+            } else {
+                Resp::new(200, "OK", "text/html", b"No redirect".to_vec()).header("Cache-Control", "no-store")
+            }
+        }
+        "html/browsers/browsing-the-web/history-traversal/resources/unset_context_name_stash.py" => {
+            let key = req.get_str("id").unwrap_or_default();
+            if req.method == "POST" {
+                let value = req.get_str("value").unwrap_or_default();
+                stash_take(&key, &dir);
+                stash_put(&key, &dir, Stashed::Str(value));
+                Resp::new(200, "OK", "", b"OK".to_vec())
+            } else {
+                Resp::new(200, "OK", "", stash_take_str(&key, &dir).unwrap_or_else(|| "NONE".into()).into_bytes())
+            }
+        }
+        "html/infrastructure/urls/resolving-urls/query-encoding/resources/blank.py" => {
+            Resp::new(200, "OK", &format!("text/html; charset={}", req.get_str("encoding").unwrap_or_default()), Vec::new())
+        }
+        "html/infrastructure/urls/terminology-0/resources/echo-referrer-text.py" => Resp::new(200, "OK", "text/plain", referer.into_bytes()),
+        "xhr/resources/echo-headers.py" => {
+            // `str(request.raw_headers)`: the request's header lines as they came.
+            let text: String = req.headers.iter().map(|(k, v)| format!("{k}: {v}\n")).collect();
+            Resp::new(200, "OK", "text/plain", text.into_bytes())
+        }
+        "xhr/resources/infinite-redirects.py" => {
+            let host = req.header("host").unwrap_or(HOST);
+            let location = format!("http://{host}{}", req.path);
+            let mut page = "alternate";
+            let mut ty = 302;
+            let mut mix = 0;
+            if req.get_str("page").as_deref() == Some("alternate") {
+                page = "default";
+            }
+            if req.get_str("type").as_deref() == Some("301") {
+                ty = 301;
+            }
+            if req.get_str("mix").as_deref() == Some("1") {
+                mix = 1;
+                ty = if ty == 301 { 302 } else { 301 };
+            }
+            let new_location = format!("{location}?page={page}&type={ty}&mix={mix}");
+            Resp::new(301, "Moved Permanently", "", format!("Hello guest. You have been redirected to {new_location}").into_bytes())
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache")
+                .header("Location", &new_location)
+        }
+        "xhr/resources/parse-headers.py" => {
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            if let Some(v) = req.get_str("my-custom-header") {
+                r = r.header("My-Custom-Header", &v);
+            }
+            r
+        }
+        "xhr/resources/json-with-bom.py" => Resp::new(200, "OK", "application/json", b"\xef\xbb\xbf{\"key\":\"value\"}".to_vec()),
+        "xhr/resources/win-1252-xml.py" => Resp::new(200, "OK", "application/xml;charset=windows-1252", b"<\xff/>".to_vec()),
+        "xhr/resources/invalid-utf8.py" => Resp::new(200, "OK", "application/json", b"{\"key\":\"\xff\"}".to_vec()),
+        "xhr/resources/echo-content-type.py" => Resp::new(200, "OK", "text/plain", req.header("content-type").unwrap_or("").as_bytes().to_vec()).header("Connection", "close"),
+        "xhr/resources/get-set-cookie.py" => {
+            let expires = req.get("clear").filter(|v| !v.is_empty()).map(|_| http_date(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) - 86400));
+            let mut content = String::new();
+            if let Some(c) = req.header("cookie") {
+                for p in c.split(';') {
+                    let p = p.trim();
+                    if !p.is_empty() {
+                        content.push(' ');
+                        content.push_str(p);
+                    }
+                }
+            }
+            Resp::new(200, "OK", "text/plain", content.into_bytes())
+                .header("Set-Cookie", &set_cookie_header("WK-test", "1", expires.as_deref(), false))
+                .header("Set-Cookie", &set_cookie_header("WK-test-secure", "1", expires.as_deref(), true))
+        }
+        "xhr/resources/bad-chunk-encoding.py" | "fetch/api/resources/bad-chunk-encoding.py" => {
+            let xhr = rel.starts_with("xhr/");
+            let delay: u64 = if xhr { 100 } else { req.get_str("ms").and_then(|v| v.parse::<f64>().ok()).unwrap_or(1000.0) as u64 };
+            let count: usize = if xhr { 5 } else { req.get_str("count").and_then(|v| v.parse().ok()).unwrap_or(50) };
+            sleep_ms(delay);
+            let head: &[u8] = if xhr {
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+            } else {
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            };
+            let _ = s.write_all(head);
+            sleep_ms(delay);
+            for _ in 0..count {
+                if s.write_all(b"a\r\nTEST_CHUNK\r\n").is_err() {
+                    return Some(None);
+                }
+                sleep_ms(delay);
+            }
+            let _ = s.write_all(b"garbage");
+            return Some(None);
+        }
+        "xhr/resources/upload.py" => {
+            let post = req.post();
+            let mut fields: Vec<(Vec<u8>, Vec<u8>)> = post.iter().filter(|(_, _, f, _)| f.is_none()).map(|(k, v, _, _)| (k.clone(), v.clone())).collect();
+            fields.sort();
+            let mut files: Vec<(Vec<u8>, String, String, usize)> = post.iter().filter_map(|(k, v, f, t)| f.as_ref().map(|f| (k.clone(), f.clone(), t.clone().unwrap_or_else(|| "None".into()), v.len()))).collect();
+            files.sort();
+            let mut content = Vec::new();
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            for (k, v) in fields {
+                if seen.contains(&k) {
+                    continue; // `values[0]`: the first value per name
+                }
+                seen.push(k.clone());
+                content.extend_from_slice(&k);
+                content.push(b'=');
+                content.extend_from_slice(&v);
+                content.push(b',');
+            }
+            content.push(b'\n');
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            for (k, f, t, len) in files {
+                if seen.contains(&k) {
+                    continue;
+                }
+                seen.push(k.clone());
+                content.extend_from_slice(&k);
+                content.extend_from_slice(format!("={f}:{t}:{len},").as_bytes());
+            }
+            Resp::new(200, "OK", "", content)
+        }
+        "xhr/resources/chunked.py" => {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Test-Me\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+            for chunk in [&b"First chunk\r\n"[..], b"Second chunk\r\n", b"Yet another (third) chunk\r\n", b"Yet another (fourth) chunk\r\n"] {
+                let _ = s.write_all(format!("{:x}\r\n", chunk.len()).as_bytes());
+                let _ = s.write_all(chunk);
+                let _ = s.write_all(b"\r\n");
+            }
+            let _ = s.write_all(b"0\r\nX-Test-Me: Trailer header value\r\n\r\n");
+            return Some(None);
+        }
+        "xhr/resources/last-modified.py" => {
+            let src = here.join("well-formed.xml");
+            let mtime = std::fs::metadata(&src).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
+            Resp::new(200, "OK", "application/xml", read(&src)).header("Last-Modified", &http_date(mtime))
+        }
+        "xhr/resources/accept.py" => Resp::new(200, "OK", "text/plain", req.header("accept").unwrap_or("NO").as_bytes().to_vec()),
+        "xhr/resources/conditional.py" => {
+            let tag = req.get_str("tag");
+            let date = req.get_str("date").unwrap_or_default();
+            let cors = req.get("cors").is_some();
+            if req.method == "OPTIONS" {
+                return Some(Some(Resp::new(200, "OK", "", Vec::new()).header("Access-Control-Allow-Origin", "*").header("Access-Control-Allow-Headers", "IF-NONE-MATCH")));
+            }
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            if let Some(t) = &tag {
+                r = r.header("ETag", &format!("\"{t}\""));
+            } else if !date.is_empty() {
+                r = r.header("Last-Modified", &date);
+            }
+            if cors {
+                r = r.header("Access-Control-Allow-Origin", "*");
+            }
+            let matched = req.header("if-none-match").is_some_and(|m| tag.as_deref() == Some(m)) || req.header("if-modified-since").is_some_and(|m| m == date);
+            if matched {
+                r.status = 304;
+                r.reason = "SUPERCOOL".into();
+                r
+            } else {
+                if !cors {
+                    r = r.header("Access-Control-Allow-Origin", "*");
+                }
+                r.headers.push(("Content-Type".into(), "text/plain".into()));
+                r.body = b"MAYBE NOT".to_vec();
+                r
+            }
+        }
+        "xhr/resources/form.py" => {
+            let post = req.post();
+            let first = |name: &[u8]| post.iter().find(|(k, _, _, _)| k == name).map(|(_, v, _, _)| v.clone()).unwrap_or_default();
+            let mut body = b"id:".to_vec();
+            body.extend(first(b"id"));
+            body.extend_from_slice(b";value:");
+            body.extend(first(b"value"));
+            body.push(b';');
+            Resp::new(200, "OK", "", body)
+        }
+        "resource-timing/resources/fake_responses.py" => {
+            if req.method == "OPTIONS" {
+                return Some(Some(Resp::new(204, "No Content", "", Vec::new()).header("Access-Control-Allow-Headers", "*").header("Access-Control-Allow-Origin", "*")));
+            }
+            let tag = req.get_str("tag");
+            let date = req.get_str("date").unwrap_or_default();
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Access-Control-Allow-Origin", "*").header("Timing-Allow-Origin", "*");
+            if let Some(t) = &tag {
+                r = r.header("ETag", &format!("\"{t}\""));
+            } else if !date.is_empty() {
+                r = r.header("Last-Modified", &date);
+            }
+            if let Some(loc) = req.get_str("redirect") {
+                r.status = 302;
+                r.reason = "Moved".into();
+                return Some(Some(r.header("Location", &loc)));
+            }
+            if let Some(url) = req.get_str("url") {
+                let name = url.split('?').next().unwrap_or("").to_string();
+                if !name.contains("..") {
+                    r.headers.push(("Content-Type".into(), "text/javascript".into()));
+                    r.body = read(&root.join("resource-timing/resources").join(name));
+                    return Some(Some(r));
+                }
+            }
+            let matched = req.header("if-none-match").is_some_and(|m| tag.as_deref() == Some(m)) || req.header("if-modified-since").is_some_and(|m| m == date);
+            if matched {
+                r.status = 304;
+                r.reason = "SUPERCOOL".into();
+                r
+            } else {
+                r.headers.push(("Content-Type".into(), "text/plain".into()));
+                r.body = b"MAYBE NOT".to_vec();
+                r
+            }
+        }
+        "resource-timing/resources/empty.py" => Resp::new(200, "OK", "text/plain", Vec::new()),
+        "resource-timing/resources/TAOResponse.py" => {
+            let o = origin.clone().unwrap_or_default();
+            let tao = req.get_str("tao").unwrap_or_default();
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            if origin.is_some() {
+                r = r.header("Access-Control-Allow-Origin", &o);
+            }
+            match tao.as_str() {
+                "wildcard" => r = r.header("Timing-Allow-Origin", "*"),
+                "null" => r = r.header("Timing-Allow-Origin", "null"),
+                "Null" => r = r.header("Timing-Allow-Origin", "Null"),
+                "origin" => r = r.header("Timing-Allow-Origin", &o),
+                t if t.starts_with("origin_port") => {
+                    let mut parts = o.splitn(3, ':');
+                    let host = format!("{}:{}", parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    let port = t.strip_prefix("origin_port_").unwrap_or("");
+                    r = r.header("Timing-Allow-Origin", &format!("{host}:{port}"));
+                }
+                "space" => r = r.header("Timing-Allow-Origin", &format!("{o} *")),
+                "multi" => r = r.header("Timing-Allow-Origin", &o).header("Timing-Allow-Origin", "*"),
+                "multi_wildcard" => r = r.header("Timing-Allow-Origin", "*").header("Timing-Allow-Origin", "*"),
+                "match_origin" => r = r.header("Timing-Allow-Origin", &o).header("Timing-Allow-Origin", "fake"),
+                "match_wildcard" => r = r.header("Timing-Allow-Origin", "fake").header("Timing-Allow-Origin", "*"),
+                "uppercase" => r = r.header("Timing-Allow-Origin", &o.to_uppercase()),
+                _ => {}
+            }
+            if req.get("img").is_some() {
+                r.headers.push(("Content-Type".into(), "image/png".into()));
+                r.body = read(&root.join("resource-timing/resources/blue.png"));
+            } else {
+                r.headers.push(("Content-Type".into(), "text/plain".into()));
+                r.body = b"TEST".to_vec();
+            }
+            r
+        }
+        "resource-timing/resources/status-code.py" => {
+            let status: u16 = req.get_str("status").and_then(|v| v.parse().ok()).unwrap_or(200);
+            let mut r = Resp::new(status, "", "", Vec::new());
+            if let Some(t) = req.get_str("tao_value") {
+                r = r.header("timing-allow-origin", &t);
+            }
+            if let Some(a) = req.get_str("allow_origin") {
+                r = r.header("access-control-allow-origin", &a);
+            }
+            r
+        }
+        "resource-timing/resources/redirect-without-location.py" => Resp::new(302, "Found", "", Vec::new()),
+        "resource-timing/resources/resource-timing-content-length.py" => {
+            let content = req.get("content").unwrap_or_default();
+            let length = req.get_str("length").unwrap_or_default();
+            let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain;charset=UTF-8\r\nConnection: close\r\n".to_vec();
+            if length == "auto" {
+                out.extend_from_slice(format!("Content-Length:{}\r\n", content.len()).as_bytes());
+            } else if length != "none" {
+                out.extend_from_slice(format!("Content-Length:{length}\r\n").as_bytes());
+            }
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(&content);
+            let _ = s.write_all(&out);
+            return Some(None);
+        }
+        "resource-timing/resources/redirect-cors.py" | "resource-timing/resources/cacheable-and-validated.py" => {
+            let cacheable = rel.ends_with("cacheable-and-validated.py");
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            if cacheable {
+                if let Some(t) = req.get_str("timing_allow_origin").filter(|t| !t.is_empty()) {
+                    r = r.header("Timing-Allow-Origin", &t);
+                }
+                if let Some(o) = &origin {
+                    r = r.header("Access-Control-Allow-Origin", o);
+                }
+                r = r.header("Cache-Control", "max-age=60").header("ETag", "assdfsdfe");
+            } else {
+                if let Some(a) = req.get_str("allow_origin") {
+                    r = r.header("Access-Control-Allow-Origin", &a);
+                }
+                if let Some(t) = req.get_str("timing_allow_origin") {
+                    r = r.header("Timing-Allow-Origin", &t);
+                }
+            }
+            if req.method == "OPTIONS" {
+                r.status = 204;
+                r.reason = "No Content".into();
+                if let Some(m) = req.header("access-control-request-method") {
+                    r = r.header("Access-Control-Allow-Methods", m);
+                }
+                if let Some(h) = req.header("access-control-request-headers") {
+                    r = r.header("Access-Control-Allow-Headers", h);
+                }
+                r
+            } else if cacheable {
+                if req.header("cache-control").is_some() {
+                    r.status = 304;
+                    r.reason = "NotModified".into();
+                } else {
+                    r.body = req.get("content").unwrap_or_default();
+                }
+                r
+            } else {
+                r.status = 302;
+                r.reason = "Found".into();
+                r.header("Location", &req.get_str("location").unwrap_or_default())
+            }
+        }
+        "encoding/resources/single-byte-raw.py" => Resp::new(200, "OK", &format!("text/plain;charset={}", req.get_str("label").unwrap_or_default()), (0u8..255).collect::<Vec<u8>>()),
+        "encoding/resources/json-charset.py" => {
+            let mut ct = req.get_str("type").unwrap_or_else(|| "application/json".into());
+            if let Some(cs) = req.get_str("charset") {
+                ct.push_str(&format!(";charset={cs}"));
+            }
+            Resp::new(200, "OK", &ct, "{\"text\":\"☃é\"}".as_bytes().to_vec()).header("X-Content-Type-Options", "nosniff")
+        }
+        "encoding/resources/text-plain-charset.py" => Resp::new(200, "OK", &format!("text/plain;charset={}", req.get_str("label").unwrap_or_default()), b"hello encoding".to_vec()),
+        "encoding/resources/text-html-meta-charset.py" => Resp::new(200, "OK", "text/html", format!("<meta charset=\"{}\">hello encoding", req.get_str("label").unwrap_or_default()).into_bytes()),
+        "url/resources/percent-encoding.py" => {
+            let value = req.get_str("value").unwrap_or_default().replace(' ', "+");
+            let encoding = req.get_str("encoding").unwrap_or_default();
+            let decoded = String::from_utf8_lossy(&b64decode(&value)).into_owned();
+            let refs: String = decoded.chars().map(|c| format!("&#x{:X};", c as u32)).collect();
+            Resp::new(200, "OK", &format!("text/html;charset={encoding}"), format!("<!doctype html>\n<a href=\"https://doesnotmatter.invalid/?{refs}#{refs}\">test</a>\n").into_bytes())
+        }
+        "fetch/api/resources/script-with-header.py" => {
+            let content: &[u8] = if req.get_str("content").as_deref() == Some("empty") { b"" } else { b"console.log('Script loaded')" };
+            Resp::new(200, "OK", &req.get_str("mime").unwrap_or_default(), content.to_vec())
+        }
+        "fetch/api/resources/cache.py" => {
+            if req.header("if-none-match") == Some("\"123abc\"") {
+                Resp::new(304, "Not Modified", "", Vec::new()).header("X-HTTP-STATUS", "304")
+            } else {
+                Resp::new(200, "OK", "text/plain", b"lorem ipsum dolor sit amet".to_vec()).header("ETag", "\"123abc\"")
+            }
+        }
+        "fetch/api/resources/redirect-empty-location.py" => Resp::new(302, "Found", "", Vec::new()).header("Location", ""),
+        "fetch/api/resources/stashed-chunk.py" => {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+            for (c, wait) in [(b'A', 100), (b'B', 100), (b'C', 5000)] {
+                if s.write_all(&[c; 4096]).is_err() || s.flush().is_err() {
+                    return Some(None);
+                }
+                sleep_ms(wait);
+            }
+            return Some(None);
+        }
+        "eventsource/resources/cors.py" => {
+            let o = req.get_str("origin").or_else(|| origin.clone()).unwrap_or_default();
+            let credentials = req.get_str("credentials").unwrap_or_else(|| "true".into());
+            let cors = |r: Resp| r.header("Access-Control-Allow-Origin", &o).header("Access-Control-Allow-Credentials", &credentials);
+            match req.get_str("run").as_deref() {
+                Some("cache-control") => {
+                    let text = String::from_utf8_lossy(&read(&root.join("eventsource/resources/cache-control.event_stream"))).into_owned();
+                    cors(Resp::new(200, "OK", es, subst(&text, req, ports).into_bytes()))
+                }
+                Some("redirect") => match py("common/redirect.py", req, s, root, ports) {
+                    Some(Some(r)) => cors(r),
+                    other => return other,
+                },
+                Some(h @ ("status-reconnect" | "message")) => match py(&format!("eventsource/resources/{h}.py"), req, s, root, ports) {
+                    Some(Some(r)) => cors(r),
+                    other => return other,
+                },
+                _ => cors(Resp::new(200, "OK", "", Vec::new())),
+            }
+        }
+        "eventsource/resources/cors-cookie.py" => {
+            let last = req.header("last-event-id").unwrap_or("").to_string();
+            let ident = req.get_str("ident").unwrap_or_else(|| "test".into());
+            let cookie = if req.cookie(&ident).is_some() { "COOKIE" } else { "NO_COOKIE" };
+            let o = req.get_str("origin").or_else(|| origin.clone()).unwrap_or_default();
+            let credentials = req.get_str("credentials").unwrap_or_else(|| "true".into());
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            if o != "none" {
+                r = r.header("Access-Control-Allow-Origin", &o);
+            }
+            if credentials != "none" {
+                r = r.header("Access-Control-Allow-Credentials", &credentials);
+            }
+            match last.as_str() {
+                "" => {
+                    r.headers.push(("Content-Type".into(), es.into()));
+                    r = r.header("Set-Cookie", &set_cookie_header(&ident, "COOKIE", None, false));
+                    r.body = format!("id: 1\nretry: 200\ndata: first {cookie}\n\n").into_bytes();
+                }
+                "1" => {
+                    r.headers.push(("Content-Type".into(), es.into()));
+                    r = r.header("Set-Cookie", &set_cookie_header(&ident, "COOKIE", Some(&http_date(996_192_000)), false));
+                    r.body = format!("id: 2\ndata: second {cookie}\n\n").into_bytes();
+                }
+                _ => {
+                    r.headers.push(("Content-Type".into(), "stop".into()));
+                    r.body = format!("data: {last}{cookie}\n\n").into_bytes();
+                }
+            }
+            r
+        }
+        "FileAPI/file/resources/echo-content-escaped.py" => {
+            let mut content = Vec::new();
+            for &b in &req.body {
+                if b <= 0x1F || b >= 0x7F {
+                    content.extend_from_slice(format!("\\x{b:02x}").as_bytes());
+                } else if b == b'\\' {
+                    content.extend_from_slice(b"\\\\");
+                } else {
+                    content.push(b);
+                }
+            }
+            let text = String::from_utf8_lossy(&content).replace("\\x0d\\x0a", "\r\n");
+            Resp::new(200, "OK", "text/plain; charset=UTF-8", text.into_bytes())
+                .header("X-Request-Method", &req.method)
+                .header("X-Request-Content-Length", req.header("content-length").unwrap_or("NO"))
+                .header("X-Request-Content-Type", req.header("content-type").unwrap_or("NO"))
+        }
+        "websockets/cookies/support/set-cookie.py" => {
+            let unquoted: String = pct(&req.query.replace('+', "%2B")).iter().map(|&c| c as char).collect();
+            Resp::new(200, "OK", "text/plain", Vec::new()).header("Set-Cookie", &unquoted)
+        }
+        "websockets/opening-handshake/resources/redirect_response.py" => Resp::new(301, "moved", "", Vec::new()).header("Location", "/echo"),
+        "websockets/security/check.py" => Resp::new(200, "OK", "", if req.header("sec-websocket-key").is_some() { b"FAIL".to_vec() } else { b"PASS".to_vec() }),
+        // ---- AETHERWPT5 (SR144): the CORS handlers the cross-origin lift reaches (each from its source).
+        "fetch/api/resources/preflight.py" => {
+            let mut r = Resp::new(200, "OK", "text/plain", Vec::new());
+            let token = req.get_str("token");
+            match req.get_str("origin") {
+                Some(o) => {
+                    for part in o.split(", ") {
+                        r = r.header("Access-Control-Allow-Origin", part);
+                    }
+                }
+                None => r = r.header("Access-Control-Allow-Origin", "*"),
+            }
+            let mut data: Vec<(String, String)> = vec![("control_request_headers".into(), String::new()), ("preflight".into(), "0".into()), ("preflight_referrer".into(), String::new())];
+            let set = |d: &mut Vec<(String, String)>, k: &str, v: String| {
+                d.retain(|(x, _)| x != k);
+                d.push((k.to_string(), v));
+            };
+            let get = |d: &[(String, String)], k: &str| d.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+            if req.get("clear-stash").is_some() {
+                let hit = token.as_deref().is_some_and(|t| stash_take(t, &dir).is_some());
+                r.body = if hit { b"1".to_vec() } else { b"0".to_vec() };
+                return Some(Some(r));
+            }
+            if req.get("credentials").is_some() {
+                r = r.header("Access-Control-Allow-Credentials", "true");
+            }
+            if req.method == "OPTIONS" {
+                if req.header("access-control-request-method").is_none() {
+                    return Some(Some(set_error(400, "No Access-Control-Request-Method header")));
+                }
+                if req.header("accept").unwrap_or("") != "*/*" {
+                    return Some(Some(set_error(400, "Request does not have 'Accept: */*' header")));
+                }
+                if req.get("control_request_headers").is_some() {
+                    set(&mut data, "control_request_headers", req.header("access-control-request-headers").unwrap_or("").to_string());
+                }
+                if let Some(m) = req.get_str("max_age") {
+                    r = r.header("Access-Control-Max-Age", &m);
+                }
+                if let Some(h) = req.get_str("allow_headers") {
+                    r = r.header("Access-Control-Allow-Headers", &h);
+                }
+                if let Some(m) = req.get_str("allow_methods") {
+                    r = r.header("Access-Control-Allow-Methods", &m);
+                }
+                let status: u16 = req.get_str("preflight_status").and_then(|v| v.parse().ok()).unwrap_or(200);
+                set(&mut data, "preflight", "1".into());
+                set(&mut data, "preflight_referrer", referer.clone());
+                set(&mut data, "preflight_user_agent", req.header("user-agent").unwrap_or("").to_string());
+                if let Some(t) = &token {
+                    stash_put(t, &dir, Stashed::Dict(data));
+                }
+                r.status = status;
+                return Some(Some(r));
+            }
+            if let Some(t) = &token {
+                if let Some(Stashed::Dict(d)) = stash_take(t, &dir) {
+                    data = d;
+                }
+            }
+            if req.get("checkUserAgentHeaderInPreflight").is_some() && req.header("user-agent").map(str::to_string) != get(&data, "preflight_user_agent") {
+                r.status = 400;
+                r.body = b"ERROR: No user-agent header in preflight".to_vec();
+                return Some(Some(r));
+            }
+            r = r.header("Access-Control-Expose-Headers", "x-did-preflight, x-control-request-headers, x-referrer, x-preflight-referrer, x-origin");
+            r = r.header("x-did-preflight", &get(&data, "preflight").unwrap_or_else(|| "0".into()));
+            r = r.header("x-control-request-headers", &get(&data, "control_request_headers").unwrap_or_default());
+            r = r.header("x-preflight-referrer", &get(&data, "preflight_referrer").unwrap_or_default());
+            r = r.header("x-referrer", &referer);
+            r = r.header("x-origin", origin.as_deref().unwrap_or(""));
+            if let Some(t) = &token {
+                stash_put(t, &dir, Stashed::Dict(data));
+            }
+            r
+        }
+        "xhr/resources/reset-token.py" => {
+            let token = req.get_str("token").unwrap_or_default();
+            stash_put(&token, &dir, Stashed::Str(String::new()));
+            Resp::new(200, "OK", "", b"PASS".to_vec()).header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or(""))
+        }
+        "xhr/resources/access-control-preflight-denied.py" => {
+            let token = req.get_str("token").unwrap_or_default();
+            let state = stash_take_str(&token, &dir).filter(|s| !s.is_empty()).unwrap_or_else(|| "Uninitialized".into());
+            let command = req.get_str("command");
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Cache-Control", "no-store").header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or("")).header("Access-Control-Max-Age", "1");
+            let fail = |r: &mut Resp, m: &str| {
+                r.body = format!("FAIL: {m}").into_bytes();
+                r.status = 400;
+            };
+            let set_state = |v: &str| {
+                stash_put(&token, &dir, Stashed::Str(v.into()));
+            };
+            if command.as_deref() == Some("reset") {
+                if req.method == "GET" {
+                    set_state("");
+                    r.body = b"Server state reset".to_vec();
+                } else {
+                    fail(&mut r, "Invalid Method.");
+                }
+            } else if state == "Uninitialized" {
+                if req.method == "OPTIONS" {
+                    r.body = b"This request should not be displayed.".to_vec();
+                    set_state("Denied");
+                } else {
+                    fail(&mut r, &state);
+                }
+            } else if state == "Denied" {
+                if req.method == "GET" && command.as_deref() == Some("complete") {
+                    set_state("");
+                    r.body = b"Request successfully blocked.".to_vec();
+                } else {
+                    set_state("Deny Ignored");
+                    fail(&mut r, "The request was not denied.");
+                }
+            } else if state == "Deny Ignored" {
+                set_state("");
+                fail(&mut r, &state);
+            } else {
+                set_state("");
+                fail(&mut r, "Unknown Error.");
+            }
+            r
+        }
+        "xhr/resources/access-control-basic-put-allow.py" => {
+            let o = origin.as_deref().unwrap_or("");
+            match req.method.as_str() {
+                "OPTIONS" => Resp::new(200, "OK", "text/plain", Vec::new()).header("Access-Control-Allow-Credentials", "true").header("Access-Control-Allow-Methods", "PUT").header("Access-Control-Allow-Origin", o),
+                "PUT" => {
+                    let mut body = b"PASS: Cross-domain access allowed.\n".to_vec();
+                    body.extend_from_slice(&req.body);
+                    Resp::new(200, "OK", "text/plain", body).header("Access-Control-Allow-Credentials", "true").header("Access-Control-Allow-Origin", o)
+                }
+                m => Resp::new(200, "OK", "text/plain", format!("Wrong method: {m}").into_bytes()),
+            }
+        }
+        // `response.text = …` sets nothing wptserve writes: an empty 200 without CORS headers.
+        "xhr/resources/access-control-basic-denied.py" => Resp::new(200, "OK", "text/plain", Vec::new()).header("Cache-Control", "no-store"),
+        "xhr/resources/access-control-basic-options-not-supported.py" => {
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Cache-Control", "no-store");
+            if req.method != "OPTIONS" {
+                match &origin {
+                    Some(o) => r = r.header("Access-Control-Allow-Credentials", "true").header("Access-Control-Allow-Origin", o),
+                    None => r.status = 500,
+                }
+            } else {
+                r.status = 400;
+            }
+            r
+        }
+        "xhr/resources/access-control-preflight-request-invalid-status.py" => {
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            if req.method == "OPTIONS" {
+                if let Some(c) = req.get_str("code").and_then(|v| v.parse::<u16>().ok()).filter(|c| *c != 0) {
+                    r.status = c;
+                }
+                r = r.header("Access-Control-Max-Age", "1").header("Access-Control-Allow-Headers", "x-pass");
+            }
+            r.header("Cache-Control", "no-store").header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or(""))
+        }
+        "xhr/resources/access-control-basic-allow-star.py" => Resp::new(200, "OK", "text/plain", b"PASS: Cross-domain access allowed.".to_vec()).header("Access-Control-Allow-Origin", "*"),
+        "xhr/resources/access-control-basic-allow.py" => Resp::new(200, "OK", "text/plain", b"PASS: Cross-domain access allowed.".to_vec())
+            .header("Access-Control-Allow-Credentials", "true")
+            .header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or("")),
+        "xhr/resources/access-control-origin-header.py" => Resp::new(200, "OK", "text/plain", format!("PASS: Cross-domain access allowed.\nHTTP_ORIGIN: {}", origin.as_deref().unwrap_or("")).into_bytes())
+            .header("Cache-Control", "no-cache, no-store")
+            .header("Access-Control-Allow-External", "true")
+            .header("Access-Control-Allow-Origin", "*"),
+        "xhr/resources/access-control-allow-with-body.py" => Resp::new(200, "OK", "text/plain", b"PASS".to_vec())
+            .header("Cache-Control", "no-store")
+            .header("Access-Control-Allow-Headers", "X-Requested-With")
+            .header("Access-Control-Max-Age", "0")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Methods", "*")
+            .header("Vary", "Accept-Encoding"),
+        "xhr/resources/access-control-basic-cors-safelisted-request-headers.py" => {
+            if req.method != "POST" {
+                return Some(Some(Resp::new(400, "Bad Request", "", Vec::new()).header("Cache-Control", "no-store")));
+            }
+            let mut body = String::new();
+            for h in ["Accept", "Accept-Language", "Content-Language", "Content-Type"] {
+                body.push_str(&format!("{h}: {}\n", req.header(h).unwrap_or("<None>")));
+            }
+            Resp::new(200, "OK", "", body.into_bytes()).header("Cache-Control", "no-store").header("Access-Control-Allow-Credentials", "true").header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or(""))
+        }
+        "xhr/resources/access-control-basic-cors-safelisted-response-headers.py" => Resp::new(200, "OK", "text/plain", b"PASS: Cross-domain access allowed.".to_vec())
+            .header("cache-control", "no cache")
+            .header("content-language", "en")
+            .header("expires", "Fri, 30 Oct 1998 14:19:41 GMT")
+            .header("last-modified", "Tue, 15 Nov 1994 12:45:26 GMT")
+            .header("pragma", "no-cache")
+            .header("x-test", "foobar")
+            .header("Access-Control-Allow-Origin", "*"),
+        "xhr/resources/access-control-preflight-request-allow-headers-returns-star.py" | "xhr/resources/access-control-preflight-request-header-returns-origin.py" => {
+            let star = rel.ends_with("returns-star.py");
+            if req.method == "OPTIONS" {
+                let allow_origin = if star { "*".to_string() } else { origin.clone().unwrap_or_default() };
+                let allow_headers = if star { "*" } else { "X-Test" };
+                Resp::new(200, "OK", "", Vec::new()).header("Access-Control-Allow-Origin", &allow_origin).header("Access-Control-Allow-Headers", allow_headers)
+            } else if req.header("x-test").is_some() {
+                Resp::new(200, "OK", "text/plain", b"PASS".to_vec()).header("Access-Control-Allow-Origin", "*")
+            } else {
+                Resp::new(400, "Bad Request", "", Vec::new()).header("Access-Control-Allow-Origin", "*")
+            }
+        }
+        "xhr/resources/access-control-preflight-request-header-lowercase.py" => {
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Cache-Control", "no-store").header("Access-Control-Allow-Origin", "*").header("Access-Control-Max-Age", "0");
+            if req.method == "OPTIONS" {
+                let asks = req.header("access-control-request-headers").unwrap_or("").split(',').any(|h| h.trim() == "x-test");
+                if asks {
+                    r = r.header("Access-Control-Allow-Headers", "X-Test");
+                } else {
+                    r.status = 400;
+                }
+            } else if req.header("x-test").is_some() {
+                r.body = b"PASS".to_vec();
+            } else {
+                r.status = 400;
+            }
+            r
+        }
+        "xhr/resources/access-control-preflight-request-header-sorted.py" => {
+            let headers = "x-custom-s,x-custom-test,x-custom-u,x-custom-ua,x-custom-v";
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Cache-Control", "no-store").header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or(""));
+            if req.method == "OPTIONS" {
+                r = r.header("Access-Control-Max-Age", "0").header("Access-Control-Allow-Headers", headers);
+                if req.header("access-control-request-headers") != Some(headers) {
+                    r.status = 400;
+                }
+            } else if req.header("x-custom-s").is_some() {
+                r.body = b"PASS".to_vec();
+            } else {
+                r.status = 400;
+                r.body = b"FAIL".to_vec();
+            }
+            r
+        }
+        "xhr/resources/access-control-preflight-request-headers-origin.py" => {
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Cache-Control", "no-store").header("Access-Control-Allow-Origin", "*");
+            if req.method == "OPTIONS" {
+                if req.header("access-control-request-headers").unwrap_or("").to_ascii_lowercase().contains("origin") {
+                    r.status = 400;
+                    r.body = b"Error: 'origin' included in Access-Control-Request-Headers".to_vec();
+                } else {
+                    r = r.header("Access-Control-Allow-Headers", "x-pass");
+                }
+            } else {
+                r.body = req.header("x-pass").unwrap_or("").as_bytes().to_vec();
+            }
+            r
+        }
+        "xhr/resources/access-control-cookie.py" => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Cache-Control", "no-store").header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or("")).header("Access-Control-Allow-Credentials", "true");
+            if let Some(c) = req.header("cookie") {
+                let names: Vec<String> = c.split(';').filter_map(|p| p.trim().split_once('=').map(|(k, _)| k.to_string())).collect();
+                for name in names {
+                    r = r.header("Set-Cookie", &set_cookie_header(&name, "deleted", Some(&http_date(now - 86400)), false));
+                }
+            }
+            if let Some(name) = req.get_str("cookie_name").filter(|n| !n.is_empty()) {
+                r = r.header("Set-Cookie", &set_cookie_header(&name, "COOKIE", Some(&http_date(now + 86400)), false));
+            }
+            r
+        }
+        "xhr/resources/echo-content-cors.py" => {
+            let mut r = Resp::new(200, "OK", "text/plain", req.body.clone())
+                .header("X-Request-Method", &req.method)
+                .header("X-Request-Content-Length", req.header("content-length").unwrap_or("NO"))
+                .header("X-Request-Content-Type", req.header("content-type").unwrap_or("NO"))
+                .header("Access-Control-Allow-Credentials", "true");
+            // The handler reads `origin` from the query for all three (its source's quirk).
+            let o = req.get_str("origin");
+            if let Some(v) = o.clone().or_else(|| origin.clone()) {
+                r = r.header("Access-Control-Allow-Origin", &v);
+            }
+            if let Some(v) = o.clone().or_else(|| req.header("access-control-request-headers").map(str::to_string)) {
+                r = r.header("Access-Control-Allow-Headers", &v);
+            }
+            if let Some(v) = o.or_else(|| req.header("access-control-request-method").map(str::to_string)) {
+                r = r.header("Access-Control-Allow-Methods", &format!("OPTIONS, {v}"));
+            }
+            r
+        }
+        "xhr/resources/redirect-cors.py" => {
+            let location = req.get_str("location").unwrap_or_default();
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            if req.method == "OPTIONS" {
+                if req.get("redirect_preflight").is_some() {
+                    r.status = 302;
+                    r.reason = "Found".into();
+                    r = r.header("Location", &location);
+                }
+                r = r.header("Access-Control-Allow-Methods", "GET").header("Access-Control-Max-Age", "1");
+            } else if req.method == "GET" {
+                r.status = 302;
+                r.reason = "Found".into();
+                r = r.header("Location", &location);
+            }
+            if req.get("allow_origin").is_some() {
+                r = r.header("Access-Control-Allow-Origin", origin.as_deref().unwrap_or(""));
+            }
+            if let Some(h) = req.get_str("allow_header") {
+                r = r.header("Access-Control-Allow-Headers", &h);
+            }
+            r
+        }
+        "xhr/resources/header-user-agent.py" => {
+            let mut r = Resp::new(200, "OK", "", Vec::new()).header("Access-Control-Allow-Origin", "*").header("Access-Control-Max-Age", "0").header("Access-Control-Allow-Headers", "x-test");
+            let ua = req.header("user-agent").is_some_and(|u| !u.is_empty());
+            if req.method == "OPTIONS" {
+                if !ua {
+                    r.status = 400;
+                    r.body = b"FAIL: User-Agent header missing in preflight request.".to_vec();
+                }
+            } else if ua {
+                r.body = b"PASS".to_vec();
+            } else {
+                r.status = 400;
+                r.body = b"FAIL: User-Agent header missing in request".to_vec();
+            }
+            r
+        }
+        // `chr(0xff)` as a str: wptserve encodes it UTF-8 (two bytes).
+        "xhr/resources/win-1252-html.py" => Resp::new(200, "OK", "text/html;charset=windows-1252", "\u{ff}".as_bytes().to_vec()),
+        "xhr/resources/invalid-utf8-html.py" => Resp::new(200, "OK", "text/html;charset=utf-8", vec![0xff]),
+        "resource-timing/resources/multi_redirect.py" => {
+            let step: u32 = req.get_str("step").and_then(|v| v.parse().ok()).unwrap_or(1);
+            let page_origin = req.get_str("page_origin").unwrap_or_default();
+            let cross_origin = req.get_str("cross_origin").unwrap_or_default();
+            let final_resource = req.get_str("final_resource").unwrap_or_default();
+            let tao_value = req.get_str("tao_value").unwrap_or_else(|| "*".into());
+            let tao_steps: i64 = req.get_str("tao_steps").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let quoted: String = final_resource.bytes().map(|b| if b.is_ascii_alphanumeric() || b"_.-~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+            let path = format!("/resource-timing/resources/multi_redirect.py?page_origin={page_origin}&cross_origin={cross_origin}&final_resource={quoted}&tao_value={tao_value}&tao_steps={}&step=", tao_steps - 1);
+            let mut r = Resp::new(302, "Found", "", Vec::new());
+            if tao_steps > 0 {
+                r = r.header("timing-allow-origin", &tao_value);
+            }
+            let url = match step {
+                1 => format!("{cross_origin}{path}2"),
+                2 => format!("{page_origin}{path}3"),
+                _ => format!("{page_origin}{final_resource}"),
+            };
+            r.header("Location", &url)
+        }
+        "common/slow-redirect.py" | "html/semantics/scripting-1/the-script-element/module/dynamic-import/beta/redirect.py" => {
+            let status: u16 = req.get_str("status").and_then(|v| v.parse().ok()).unwrap_or(302);
+            if rel.starts_with("common/") {
+                let delay: u64 = req.get_str("delay").and_then(|v| v.parse().ok()).unwrap_or(2);
+                sleep_ms(delay * 1000);
+            }
+            Resp::new(status, "Redirect", "", Vec::new()).header("Location", &req.get_str("location").unwrap_or_default())
+        }
         _ => return None,
     }))
 }
@@ -831,6 +2212,9 @@ fn http_conn(mut s: TcpStream, root: PathBuf, ports: Ports, report_js: &'static 
     let rel = req.path.trim_start_matches('/').to_string();
     let resp = if rel == "resources/testharnessreport.js" {
         Resp::new(200, "OK", "text/javascript", report_js.as_bytes().to_vec())
+    } else if rel == "resources/testdriver-vendor.js" {
+        // AETHERWPT5 (SR144): the checkout's vendor file is empty; Aether's drives the engine.
+        Resp::new(200, "OK", "text/javascript", TESTDRIVER_VENDOR_JS.as_bytes().to_vec())
     } else if let Some(stem) = rel.strip_suffix(".any.html") {
         match wrapper(&root, stem, "any", report_js) {
             Some(b) => Resp::new(200, "OK", "text/html; charset=utf-8", b),
@@ -859,7 +2243,7 @@ fn http_conn(mut s: TcpStream, root: PathBuf, ports: Ports, report_js: &'static 
             None => Resp::new(404, "Not Found", "text/plain", b"not found".to_vec()),
         }
     } else if rel.ends_with(".py") {
-        match py(&rel, &req, &mut s) {
+        match py(&rel, &req, &mut s, &root, ports) {
             Some(Some(r)) => r,
             Some(None) => return,
             None => Resp::new(500, "Handler Not Emulated", "text/plain", format!("{rel} is not emulated").into_bytes()),
@@ -1157,18 +2541,34 @@ fn ws_conn(mut s: TcpStream) {
     }
 }
 
-/// Starts the HTTP and WebSocket servers over the checkout at `root`.
+/// Starts the HTTP and WebSocket servers over the checkout at `root`. AETHERWPT5 (SR144): the HTTP server
+/// listens on two ports (`{{ports[http][0]}}`, `{{ports[http][1]}}`) and, for each, on every loopback address the
+/// `sub` pipe names (`127.0.0.1` for `localhost` and the `www` hosts, `127.0.0.2`–`127.0.0.6`, and `[::1]` so a
+/// resolver that lists it first connects at once) — one origin per (host, port).
 pub fn start(root: PathBuf, report_js: &'static str) -> Ports {
     let http = TcpListener::bind("127.0.0.1:0").expect("bind http");
+    let http2 = TcpListener::bind("127.0.0.1:0").expect("bind http2");
     let ws = TcpListener::bind("127.0.0.1:0").expect("bind ws");
-    let ports = Ports { http: http.local_addr().unwrap().port(), ws: ws.local_addr().unwrap().port() };
-    std::thread::spawn(move || {
-        for s in http.incoming() {
-            let Ok(s) = s else { continue };
-            let root = root.clone();
-            std::thread::spawn(move || http_conn(s, root, ports, report_js));
+    let ports = Ports { http: http.local_addr().unwrap().port(), http2: http2.local_addr().unwrap().port(), ws: ws.local_addr().unwrap().port() };
+    let mut listeners = vec![http, http2];
+    for addr in ["127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5", "127.0.0.6", "[::1]"] {
+        for port in [ports.http, ports.http2] {
+            match TcpListener::bind(format!("{addr}:{port}")) {
+                Ok(l) => listeners.push(l),
+                Err(e) => eprintln!("wpt_net: cannot listen on {addr}:{port} ({e}); the pages that need that host will fail"),
+            }
         }
-    });
+    }
+    for l in listeners {
+        let root = root.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(s) = s else { continue };
+                let root = root.clone();
+                std::thread::spawn(move || http_conn(s, root, ports, report_js));
+            }
+        });
+    }
     std::thread::spawn(move || {
         for s in ws.incoming() {
             let Ok(s) = s else { continue };

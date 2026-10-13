@@ -45,6 +45,14 @@
 //! browsing contexts, bfcache, idlharness, an un-emulated handler, the `/media/` fixtures, layout); reftests and
 //! manual pages (no testharness.js) are counted, not run. An API Aether lacks is never an exclusion: those tests
 //! run and fail, and the per-directory floors (0 at landing) rise from the bench's first run.
+//!
+//! AETHERWPT5 (SR144): testdriver pages run — both servers substitute `/resources/testdriver-vendor.js`
+//! (`wpt_net::TESTDRIVER_VENDOR_JS`: Element Click, Element Send Keys, Perform Actions, Set Permission and the cookie
+//! commands over the engine's automation queue), and the runners pump that queue between event-loop slices
+//! (`AetherEngine::pump_automation`); what stays excluded is a page using a WebDriver command the vendor does not
+//! implement ([`testdriver_beyond`]). Cross-origin pages run: the stand-in serves `localhost` as the page host and
+//! the 127/8 loopback addresses as the other hosts, on two ports (`wpt_net::start`). A `.py` under `tools/` is a
+//! generator a page names in a comment, never a handler it fetches ([`py_refs`]).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -155,6 +163,9 @@ fn serve(root: PathBuf) -> u16 {
                 let rel = path.trim_start_matches('/').to_string();
                 let (status, body, ty): (&str, Vec<u8>, &str) = if rel == "resources/testharnessreport.js" {
                     ("200 OK", REPORT_JS.as_bytes().to_vec(), "text/javascript")
+                } else if rel == "resources/testdriver-vendor.js" {
+                    // AETHERWPT5 (SR144): Aether's vendor script (the checkout's is empty).
+                    ("200 OK", wpt_net::TESTDRIVER_VENDOR_JS.as_bytes().to_vec(), "text/javascript")
                 } else if let Some((stem, kind)) = rel.strip_suffix(".window.html").map(|s| (s, "window")).or_else(|| rel.strip_suffix(".any.html").map(|s| (s, "any"))) {
                     let js = format!("/{stem}.{kind}.js");
                     let src = std::fs::read_to_string(root.join(format!("{stem}.{kind}.js"))).unwrap_or_default();
@@ -284,8 +295,10 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
     if src.contains(".xhtml") || src.contains(".xml\"") {
         return Some("XML documents");
     }
-    if src.contains("testdriver.js") || src.contains("test_driver") {
-        return Some("testdriver (WebDriver input automation)");
+    // AETHERWPT5 (SR144): testdriver pages run (the stand-in's vendor script over the engine's automation queue);
+    // a WebDriver command the vendor does not implement still is a reason.
+    if (src.contains("testdriver.js") || src.contains("test_driver")) && testdriver_beyond(src) {
+        return Some("testdriver (WebDriver commands beyond input automation)");
     }
     // AETHERWORKERS2 (SR125): dedicated workers (`new Worker`), MessageChannel and postMessage run now.
     // AETHERWORKERS3 (SR129): SharedWorker runs too; what stays out is service workers (their WPT needs a TLS
@@ -317,6 +330,22 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
     None
 }
 
+/// AETHERWPT5 (SR144): the WebDriver commands `testdriver-vendor.js` does not implement — a page naming one of
+/// them stays excluded (the BiDi modules, window placement, navigation and freeze, the virtual authenticator /
+/// sensors / pressure sources, FedCM, storage access, the reporting command, the accessibility queries, device
+/// posture, display features, bounce tracking, Protected Audience, Global Privacy Control, web extensions).
+/// Click, send_keys, bless, action sequences, set_permission and the cookie commands run.
+fn testdriver_beyond(scan: &str) -> bool {
+    [
+        "test_driver.bidi", "set_rph_registration_mode", "set_spc_transaction_mode", "virtual_sensor", "virtual_pressure", "web_extension", "set_window_rect", "get_window_rect",
+        "minimize_window", "create_window", "test_driver.navigate(", "test_driver.freeze", "virtual_authenticator", "fedcm", "set_storage_access", "generate_test_report",
+        "get_computed_label", "get_computed_role", "get_accessibility_properties", "set_device_posture", "set_display_features", "run_bounce_tracking", "set_protected_audience",
+        "global_privacy_control", "virtual_wallet",
+    ]
+    .iter()
+    .any(|t| scan.contains(t))
+}
+
 #[derive(Default)]
 struct FileResult {
     pass: usize,
@@ -338,13 +367,24 @@ fn run_file(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResult {
     };
     let mut engine = aether::AetherEngine::new();
     engine.load_page(page, true);
-    let Some(js) = engine.js_engine.as_mut() else {
+    if engine.js_engine.is_none() {
         out.harness = "no engine".into();
         out.total = 1;
         return out;
-    };
-    aether::event_loop::settle(js, 15_000);
-    let json = js.eval_string("typeof window.__wpt === 'string' ? window.__wpt : ''").unwrap_or_default();
+    }
+    // AETHERWPT5 (SR144): the 15 s virtual budget in slices, the testdriver queue pumped between them (a queued
+    // WebDriver command is dispatched through the engine's input path, then its promise settles).
+    let v0 = aether::event_loop::now_ms();
+    let mut json = String::new();
+    while aether::event_loop::now_ms().saturating_sub(v0) < 15_000 {
+        let js = engine.js_engine.as_mut().unwrap();
+        aether::event_loop::settle(js, 200);
+        json = js.eval_string("typeof window.__wpt === 'string' ? window.__wpt : ''").unwrap_or_default();
+        if !json.is_empty() {
+            break;
+        }
+        engine.pump_automation();
+    }
     if json.is_empty() {
         out.harness = "harness did not complete".into();
         out.total = 1;
@@ -565,7 +605,8 @@ fn wpt_html_webappapis() {
 /// Runs one test page until its harness completes: the event loop settles in slices (virtual time while
 /// idle, real time while the page has network operations in flight), checking for the results between.
 fn run_net_file(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResult {
-    let url = format!("http://127.0.0.1:{port}/{rel}");
+    // AETHERWPT5 (SR144): the page origin is `http://localhost:<port>` (`{{host}}`); 127.0.0.1 is the remote host.
+    let url = format!("http://{}:{port}/{rel}", wpt_net::HOST);
     let mut out = FileResult::default();
     let page = match rt.block_on(aether::net::fetch_page(&url)) {
         Ok(p) => p,
@@ -577,20 +618,22 @@ fn run_net_file(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResul
     };
     let mut engine = aether::AetherEngine::new();
     engine.load_page(page, true);
-    let Some(js) = engine.js_engine.as_mut() else {
+    if engine.js_engine.is_none() {
         out.harness = "no engine".into();
         out.total = 1;
         return out;
-    };
+    }
     let real = std::time::Instant::now();
     let v0 = aether::event_loop::now_ms();
     let mut json = String::new();
     while real.elapsed().as_secs() < 30 && aether::event_loop::now_ms().saturating_sub(v0) < 16_000 {
+        let js = engine.js_engine.as_mut().unwrap();
         aether::event_loop::settle(js, 200);
         json = js.eval_string("typeof window.__wpt === 'string' ? window.__wpt : ''").unwrap_or_default();
         if !json.is_empty() {
             break;
         }
+        engine.pump_automation(); // AETHERWPT5 (SR144): the queued testdriver commands
     }
     if json.is_empty() {
         out.harness = "harness did not complete".into();
@@ -642,8 +685,10 @@ fn py_refs(rel_dir: &str, src: &str) -> Vec<String> {
         }
         let name = &src[start..end];
         i = end;
-        // `*_wsh.py` are pywebsocket handlers (the WebSocket server's), not wptserve's.
-        if name.len() <= 3 || name.starts_with("http") || name.ends_with("_wsh.py") {
+        // `*_wsh.py` are pywebsocket handlers (the WebSocket server's), not wptserve's. AETHERWPT5 (SR144): a `.py`
+        // under `tools/` is the generator a generated page names in its comment (html/canvas/tools/gentest.py,
+        // moving-between-documents/tools/generate.py), never a handler it fetches.
+        if name.len() <= 3 || name.starts_with("http") || name.ends_with("_wsh.py") || name.contains("tools/") {
             continue;
         }
         let full = if let Some(abs) = name.strip_prefix('/') {
@@ -709,9 +754,8 @@ fn net_excluded(rel: &str, src: &str) -> Option<String> {
     if src.contains("idlharness") {
         return Some("idlharness (interfaces/*.idl are not in the checkout)".into());
     }
-    if src.contains("REMOTE_ORIGIN") || src.contains("REMOTE_HOST") || src.contains("HTTP_REMOTE") || src.contains("OTHER_ORIGIN") || src.contains("{{domains[") || src.contains("{{hosts[") || src.contains("CROSSDOMAIN") || src.contains("cross-origin") && !dir.starts_with("websockets") || name.contains("cross-origin") || name.contains("access-control") || name.contains("cors") {
-        return Some("cross-origin (no second origin with CORS in the stand-in)".into());
-    }
+    // AETHERWPT5 (SR144): cross-origin pages run — the stand-in serves a second origin (host name and port) and the
+    // engine's CORS (security/cors.rs) answers them; what it cannot serve is an HTTPS origin.
     for h in py_refs(dir, src) {
         if !wpt_net::PY_HANDLERS.contains(&h.as_str()) {
             return Some(format!("needs wptserve handler {h}"));
@@ -894,9 +938,11 @@ fn wpt_xhr() {
 // AETHERWPT2 (SR135): the rest of the platform a browser is measured on, through the same stand-in
 // =================================================================================================
 
-/// The directories AETHERWPT2 runs (recursively, through `wpt_net`), each with what its tests need that this
-/// run cannot give them — the reasons [`wpt2_excluded`] names per file. An API Aether lacks is not listed
-/// here: those tests run and fail (docs/dev/evidence/aetherwpt/WPT.md, the AETHERWPT2 gap list).
+/// The directories AETHERWPT2 runs (recursively, through `wpt_net`), each with what its tests needed at landing
+/// that the run could not give them — the reasons [`wpt2_excluded`] named per file then. An API Aether lacks is not
+/// listed here: those tests run and fail (docs/dev/evidence/aetherwpt/WPT.md, the AETHERWPT2 gap list). Since then
+/// AETHERWPT4 lifted window.open and the four layout tokens, AETHERWPT5 testdriver and cross-origin hosts and the
+/// handlers it emulates: the needs below are the history, the predicate is the law.
 pub const WPT2_DIRS: &[(&str, &str)] = &[
     ("url", "an un-emulated handler (percent-encoding.py); XML documents (.xhtml, not collected)"),
     ("encoding", "TLS (sharedarraybuffer.https); un-emulated handlers (single-byte-raw.py, text-plain-charset.py, json-charset.py, text-html-meta-charset.py); idlharness"),
@@ -980,8 +1026,9 @@ fn wpt2_excluded(root: &Path, rel: &str, src: &str) -> Option<String> {
         return Some("manual test (a person reads the result)".into());
     }
     let scan = format!("{src}{}", helper_sources(root, rel, src));
-    if scan.contains("testdriver.js") || scan.contains("test_driver") {
-        return Some("testdriver (WebDriver input automation)".into());
+    // AETHERWPT5 (SR144): testdriver pages run; a WebDriver command the vendor does not implement is the reason left.
+    if (scan.contains("testdriver.js") || scan.contains("test_driver")) && testdriver_beyond(&scan) {
+        return Some("testdriver (WebDriver commands beyond input automation)".into());
     }
     if src.contains("idlharness") {
         return Some("idlharness (interfaces/*.idl are not in the checkout)".into());
@@ -990,8 +1037,10 @@ fn wpt2_excluded(root: &Path, rel: &str, src: &str) -> Option<String> {
         return Some("bfcache / remote browsing contexts".into());
     }
     // AETHERWPT4 (SR142): `window.open(` is no longer a reason (AETHERWPT3 O8: auxiliary browsing contexts, js/frames.rs).
-    if src.contains("REMOTE_ORIGIN") || src.contains("REMOTE_HOST") || src.contains("HTTP_REMOTE") || src.contains("OTHER_ORIGIN") || src.contains("{{domains[") || src.contains("{{hosts[") || src.contains("CROSSDOMAIN") || src.contains("get_host_info().HTTPS") || name.contains("cross-origin") || name.contains("access-control") || name.contains("cors") || dir.contains("/cors") || dir.contains("/credentials") {
-        return Some("cross-origin (no second origin with CORS in the stand-in)".into());
+    // AETHERWPT5 (SR144): neither is cross-origin (the stand-in's second origin, `wpt_net::start`); a page reaching
+    // for get-host-info's HTTPS origins needs the TLS server.
+    if src.contains("get_host_info().HTTPS") {
+        return Some("needs a TLS server (the HTTPS origins of get-host-info)".into());
     }
     for h in wpt2_py_refs(root, dir, src) {
         if !wpt_net::PY_HANDLERS.contains(&h.as_str()) {
