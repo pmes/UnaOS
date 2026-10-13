@@ -1,4 +1,4 @@
-//! CHARTER: Sonde — driver
+//! CHARTER: Kernel — driver (the probe is Sonde's, R112; its CODEX row is Amendment IV, pending Peter's signature)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 

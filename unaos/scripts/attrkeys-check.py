@@ -57,6 +57,8 @@ def scan(root):
                 p = os.path.join(d, f)
                 rel = os.path.relpath(p, root)
                 n += 1
+                if rel == 'unaos/libs/net/psl_core/src/table.rs':
+                    continue  # the generated Public Suffix List (NETDEBT SR97): domain labels such as `bt.it`, never attribute keys
                 if rel == REGISTRY:
                     continue
                 try:
