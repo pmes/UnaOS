@@ -396,3 +396,4 @@ refs/heads/exec-rmbp-aethermetal3             5ee074e9 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-unametal2                5ee074e9 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-matrixcore               5ee074e9 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-smallfix9                5ee074e9 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-xhciiso                  df9abf52 IN-FLIGHT rmbp 2026-10-13
