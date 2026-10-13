@@ -22,16 +22,24 @@
 // The workspace root is argv[1] (the args page; `una /home/peter/proj`), or the session home (SYS_WHOAMI), or `/`.
 // An argv[1] that names a FILE opens it in the editor and roots the tree at its directory.
 //
-// FOCUS. Ctrl+1 / Ctrl+2 / Ctrl+3 = tree / editor / console, and a click on a pane. The ring carries one byte and
-// no modifier bits, and the HID decoder SUPPRESSES the press of Ctrl+<non-letter> (xhci `hid_key_ascii`: its fold
-// would collide with the arrow bytes), but it still delivers the RELEASE as the bare digit (ALLKEYS: a release is
-// never suppressed). So a KEY_UP of `1`/`2`/`3` with no KEY_DOWN of it before is exactly a modified digit — Ctrl
-// (or Alt/Cmd) + 1/2/3 — and that is the chord this program reads. Esc cycles the focus too (one key, no chord).
+// FOCUS. Ctrl+1 / Ctrl+2 / Ctrl+3 = tree / editor / console, and a click on a pane. UNAKEYS (rmbp-ledger B552): the
+// ring carries one byte and no modifier field, so the modifier state rides the KEY_DOWN payload itself — since
+// SMALLFIX9 (B533) the shared HID fold (xhci `hid_key_ascii`) presses Ctrl + a main-row digit as its own byte,
+// `una_abi::KEY_CTRL_DIGIT | d` (Ctrl+1 = 0x81), a range no other key produces; that PRESS is the chord. Its RELEASE
+// still arrives as the bare digit (ALLKEYS: a release cannot know the press's modifiers), so the press marks that
+// digit's release as owed and `key_up` swallows it. The older reading stays as the fallback for a press the decoder
+// still suppresses (Alt/Cmd + digit, a pre-SMALLFIX9 kernel): a KEY_UP of `1`/`2`/`3` with no KEY_DOWN of it before
+// is a modified digit. Esc cycles the focus too (one key, no chord).
 // A click focuses the pane under the pointer; the pointer is the one the kernel delivers (AETHERPTR, rmbp-ledger
 // B543): every INPUT_EV_MOUSE_ABS carries the system pointer in this window's pixels, so nothing here estimates it.
 //
 // GLOBAL KEYS. Ctrl+S save the editor's file; Ctrl+O open the tree's selected file; Ctrl+Q quit (and a window
 // close request). Everything else goes to the focused pane (tree.rs, editor.rs, console.rs say their keys).
+//
+// THEME. Every colour is a field of `theme::Theme` (theme.rs: Principia's `system.appearance.*` and Tabula's
+// `tabula.theme.<kind>` over the PREFS bus, the kernel palette's Light/Dark rows) — read once at start and again when
+// the store moves (`theme::due`, PrefChanged's ring-3 stand-in); `:: UNA: theme mode=<light|dark> accent=<name>
+// bus=<0|-errno> ::` at start and on every change.
 //
 // WIRE. `:: UNA: start window=<id> font=<face|font8x8 font_why=<w>> panes=3 root=<p> entries=<n> cwd=<p> ::` once;
 // the console's `:: UNA: plan=<Nothing|Say|Host|Exec> verb=<v> served=<0|1> rows=<n> pane=console ::` per line; the
@@ -46,13 +54,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use una_abi::{
     input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP,
-    INPUT_EV_MOUSE_ABS, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
+    INPUT_EV_MOUSE_ABS, KEY_CTRL_DIGIT, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
-use vein_ring3::sys::{sleep_ms, sys, write};
+use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
 
 mod console;
 mod editor;
 mod fs;
+mod theme;
 mod tree;
 mod txt;
 
@@ -67,20 +76,6 @@ const STRIDE: usize = W as usize * 4;
 const SIDE_W: i32 = 86;
 const CON_Y: i32 = 190;
 const PANES: u32 = 3;
-
-const BG: u32 = 0xFF12_141A;
-const SIDE_BG: u32 = 0xFF16_1922;
-const ED_BG: u32 = 0xFF1A_1E28;
-const STATUS_BG: u32 = 0xFF24_2A38;
-const INK: u32 = 0xFFE6_E3EC;
-const DIM_INK: u32 = 0xFF8C_8A99;
-const DIR_INK: u32 = 0xFF9F_E6B0;
-const ERR_INK: u32 = 0xFFFF_8A80;
-const ECHO_INK: u32 = 0xFF8F_B8FF;
-const CARET: u32 = 0xFFB0_8CFF;
-const RULE: u32 = 0xFF3A_3550;
-const SEL_BG: u32 = 0xFF3A_3F66;
-const ROW_SEL: u32 = 0xFF2E_3348;
 
 static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY;
 
@@ -242,6 +237,18 @@ impl App {
 
     // ---- input ----
     fn key_down(&mut self, k: u8) {
+        // UNAKEYS (B552): Ctrl + main-row digit, read from the press's own byte (see FOCUS above).
+        if (KEY_CTRL_DIGIT..=KEY_CTRL_DIGIT + 9).contains(&k) {
+            let d = k - KEY_CTRL_DIGIT;
+            self.down[(b'0' + d) as usize] = true; // its release arrives as the bare digit: owed, swallowed by key_up
+            match d {
+                1 => self.set_focus(Pane::Tree),
+                2 => self.set_focus(Pane::Editor),
+                3 => self.set_focus(Pane::Console),
+                _ => {}
+            }
+            return;
+        }
         if (k as usize) < self.down.len() {
             self.down[k as usize] = true;
         }
@@ -281,7 +288,7 @@ impl App {
             self.down[i] = false;
             return;
         }
-        // A release whose press was suppressed: Ctrl/Alt/Cmd + digit (see FOCUS above).
+        // A release whose press was suppressed: Alt/Cmd + digit, or Ctrl + digit on a pre-SMALLFIX9 kernel (FOCUS).
         match k {
             b'1' => self.set_focus(Pane::Tree),
             b'2' => self.set_focus(Pane::Editor),
@@ -352,13 +359,14 @@ impl App {
     }
 
     fn paint_tree(&mut self) {
+        let th = theme::cur();
         let lh = self.lh();
         let r = R_TREE;
-        self.fill(r, SIDE_BG);
+        self.fill(r, th.side_bg);
         let cols = self.cols_in(r.w);
         let title = self.tree.root.rsplit('/').find(|s| !s.is_empty()).unwrap_or("/");
         let title: Vec<u8> = alloc::format!("{}/", title).bytes().map(|b| if (0x20..=0x7e).contains(&b) { b } else { b'?' }).take(cols).collect();
-        self.text(4, r.y + 2, &title, DIM_INK, r);
+        self.text(4, r.y + 2, &title, th.dim_ink, r);
         let rows = self.tree_rows();
         self.tree.scroll_to_sel(rows);
         let focused = self.focus == Pane::Tree;
@@ -370,16 +378,16 @@ impl App {
             }
             let y = r.y + 2 + (row as i32 + 1) * lh;
             if i == self.tree.sel {
-                self.fill(Rect { x: r.x, y, w: r.w, h: lh }, if focused { SEL_BG } else { ROW_SEL });
+                self.fill(Rect { x: r.x, y, w: r.w, h: lh }, if focused { th.sel_bg } else { th.row_sel });
             }
             let (mark, ink) = {
                 let nd = &self.tree.nodes[i];
                 if nd.err {
-                    (b' ', ERR_INK)
+                    (b' ', th.err_ink)
                 } else if nd.dir {
-                    (if nd.open { b'-' } else { b'+' }, DIR_INK)
+                    (if nd.open { b'-' } else { b'+' }, th.dir_ink)
                 } else {
-                    (b' ', INK)
+                    (b' ', th.ink)
                 }
             };
             let ind = self.tree.indent(i);
@@ -391,14 +399,15 @@ impl App {
             self.text(2, y, &s, ink, r);
         }
         if n == 0 {
-            self.text(4, r.y + 2 + lh, b"(empty)", DIM_INK, r);
+            self.text(4, r.y + 2 + lh, b"(empty)", th.dim_ink, r);
         }
     }
 
     fn paint_editor(&mut self) {
+        let th = theme::cur();
         let lh = self.lh();
         let r = R_ED;
-        self.fill(r, ED_BG);
+        self.fill(r, th.ed_bg);
         let (sy, rows) = self.ed_geom();
         let cols = self.cols_in(r.w);
         self.ed.view(rows, cols);
@@ -423,13 +432,15 @@ impl App {
                     if off >= a && off + ch.len_utf8() <= b {
                         let xa = self.cx(x0, c);
                         let xb = self.cx(x0, c + 1);
-                        self.fill(Rect { x: xa, y, w: xb - xa, h: lh }, SEL_BG);
+                        self.fill(Rect { x: xa, y, w: xb - xa, h: lh }, th.sel_bg);
                     }
                 }
             }
             let glyphs: Vec<u8> = idx.iter().map(|&(_, ch)| if (' '..='~').contains(&ch) { ch as u8 } else if ch == '\t' { b' ' } else { b'?' }).collect();
             // UNAMETAL2 (SR98): each char's ink is its syntax_core token's appearance token; runs of one ink draw once.
-            let inks: Option<Vec<u32>> = self.ed.highlight.as_ref().map(|h| idx.iter().map(|&(bi, _)| h.ink_at(l, bi)).collect());
+            // UNAKEYS (B552): kind -> token through Principia's map, token -> ink through the live look.
+            let map = &self.ed.map;
+            let inks: Option<Vec<u32>> = self.ed.highlight.as_ref().map(|h| idx.iter().map(|&(bi, _)| th.token_ink(map.token(h.kind_at(l, bi)))).collect());
             match inks {
                 Some(inks) => {
                     let mut a = 0;
@@ -443,7 +454,7 @@ impl App {
                         a = b;
                     }
                 }
-                None => self.text(x0, y, &glyphs, INK, text_clip),
+                None => self.text(x0, y, &glyphs, th.ink, text_clip),
             }
         }
         // The caret (full on focus, dim otherwise).
@@ -451,11 +462,11 @@ impl App {
         if cl >= top && cl < top + rows && cc >= left {
             let x = self.cx(x0, cc - left);
             let y = r.y + 2 + (cl - top) as i32 * lh;
-            self.fill(Rect { x, y, w: 2, h: lh - 1 }, if self.focus == Pane::Editor { CARET } else { RULE });
+            self.fill(Rect { x, y, w: 2, h: lh - 1 }, if self.focus == Pane::Editor { th.caret } else { th.rule });
         }
         // The status line: the find prompt, or path / dirty / line:col / message.
         let sr = Rect { x: r.x, y: sy, w: r.w, h: r.y + r.h - sy };
-        self.fill(sr, STATUS_BG);
+        self.fill(sr, th.status_bg);
         let s = match &self.ed.search {
             Some(q) => alloc::format!("find: {}_", q),
             None => {
@@ -464,13 +475,14 @@ impl App {
             }
         };
         let s: Vec<u8> = s.bytes().map(|b| if (0x20..=0x7e).contains(&b) { b } else { b'?' }).take(cols).collect();
-        self.text(x0, sy + 1, &s, if self.ed.search.is_some() { ECHO_INK } else { DIM_INK }, sr);
+        self.text(x0, sy + 1, &s, if self.ed.search.is_some() { th.echo_ink } else { th.dim_ink }, sr);
     }
 
     fn paint_console(&mut self) {
+        let th = theme::cur();
         let lh = self.lh();
         let r = R_CON;
-        self.fill(r, BG);
+        self.fill(r, th.con_bg);
         let cols = self.cols_in(r.w);
         self.con.cols = cols;
         // The prompt line at the bottom; the scrollback fills upward from it (MIDDEN.ELF's paint).
@@ -482,9 +494,9 @@ impl App {
         let caret_at = start + self.con.caret;
         let skip = (caret_at + 1).saturating_sub(cols);
         let vis: Vec<u8> = shown[skip..].iter().copied().take(cols).collect();
-        self.text(4, py, &vis, INK, r);
+        self.text(4, py, &vis, th.ink, r);
         let cx = self.cx(4, caret_at - skip);
-        self.fill(Rect { x: cx, y: py, w: 2, h: lh - 1 }, if self.focus == Pane::Console { CARET } else { RULE });
+        self.fill(Rect { x: cx, y: py, w: 2, h: lh - 1 }, if self.focus == Pane::Console { th.caret } else { th.rule });
         let fit = ((py - r.y - 2) / lh).max(0) as usize;
         let n = self.con.rows.len();
         let first = n.saturating_sub(fit);
@@ -492,9 +504,9 @@ impl App {
         let mut y = py - (rows.len() as i32) * lh;
         for (tone, s) in rows {
             let ink = match tone {
-                console::Tone::Out => INK,
-                console::Tone::Err => ERR_INK,
-                console::Tone::Echo => ECHO_INK,
+                console::Tone::Out => th.ink,
+                console::Tone::Err => th.err_ink,
+                console::Tone::Echo => th.echo_ink,
             };
             self.text(4, y, s.as_bytes(), ink, r);
             y += lh;
@@ -510,14 +522,15 @@ impl App {
         self.paint_editor();
         self.paint_console();
         // The rules between the panes, and the focused pane's accent bar along its top edge.
-        self.fill(Rect { x: SIDE_W, y: 0, w: 1, h: CON_Y }, RULE);
-        self.fill(Rect { x: 0, y: CON_Y, w: W, h: 1 }, RULE);
+        let th = theme::cur();
+        self.fill(Rect { x: SIDE_W, y: 0, w: 1, h: CON_Y }, th.rule);
+        self.fill(Rect { x: 0, y: CON_Y, w: W, h: 1 }, th.rule);
         let f = match self.focus {
             Pane::Tree => R_TREE,
             Pane::Editor => R_ED,
             Pane::Console => R_CON,
         };
-        self.fill(Rect { x: f.x, y: f.y, w: f.w, h: 2 }, CARET);
+        self.fill(Rect { x: f.x, y: f.y, w: f.w, h: 2 }, th.caret);
         self.dirty = false;
         self.tree.dirty = false;
         self.ed.repaint = false;
@@ -571,6 +584,10 @@ pub extern "C" fn _start() -> ! {
         l.wire();
         exit(1);
     }
+    // UNAKEYS (B552): the look and Tabula's theme map from Principia, before the first paint.
+    theme::load();
+    let map = theme::syntax_map();
+    theme_wire();
     let (face, why) = match txt::load() {
         Ok(t) => (Some(t), None),
         Err(w) => (None, Some(w)),
@@ -591,6 +608,7 @@ pub extern "C" fn _start() -> ! {
         buttons: 0,
         dirty: true,
     };
+    app.ed.map = map;
     let mut l = Line::new(b":: UNA: start window=");
     l.dec(win).put(b" font=");
     match (&app.face, &why) {
@@ -641,9 +659,27 @@ pub extern "C" fn _start() -> ! {
             }
             k += 1;
         }
+        // UNAKEYS (B552): the store moved (PrefChanged's ring-3 stand-in, theme.rs) -> every pane repaints.
+        if theme::due(now_ms()) {
+            let moved = theme::load();
+            let map = theme::syntax_map();
+            if moved || map != app.ed.map {
+                app.ed.map = map;
+                app.dirty = true;
+                theme_wire();
+            }
+        }
         app.paint();
         sleep_ms(16);
     }
+}
+
+/// `:: UNA: theme mode=<light|dark> accent=<name> bus=<0|-errno> ::` — the look in force.
+fn theme_wire() {
+    let l = theme::cur().look;
+    let mut w = Line::new(b":: UNA: theme mode=");
+    w.put(l.mode_name().as_bytes()).put(b" accent=").put(l.accent_name().as_bytes()).put(b" bus=").dec(theme::bus_err()).put(b" ::");
+    w.wire();
 }
 
 #[panic_handler]

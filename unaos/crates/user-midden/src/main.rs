@@ -27,6 +27,11 @@
 // history; Enter runs the line; Ctrl+C clears the line (`^C`); `exit`/`quit` (the core's CLOSES) close the
 // window and exit; a window close request does the same.
 //
+// THEME. UNAKEYS (rmbp-ledger B552): every colour is a field of `theme::Theme` (theme.rs: Principia's
+// `system.appearance.*` over the PREFS bus, the kernel palette's Light/Dark rows), read once at start and again when
+// the store moves (`theme::due`, PrefChanged's ring-3 stand-in); `:: MIDDEN: theme mode=<light|dark> accent=<name>
+// bus=<0|-errno> ::` at start and on every change.
+//
 // WIRE. `:: MIDDEN: start window=<id> font=<face|font8x8 font_why=<w>> facts=ring3 cwd=<p> ::` once, then per
 // line `:: MIDDEN: plan=<Nothing|Say|Host> verb=<v> served=<1|0> rows=<n> ::` — a launch (`run <path>` or a bare
 // name) is `:: MIDDEN: plan=Exec verb=<run|typed> served=1 pid=<n> ::`, or `served=0 err=<errno>` — and on exit
@@ -44,8 +49,9 @@ use una_abi::{
     SYS_INPUT_POLL, SYS_STAT, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
 use vein_ring3::files;
-use vein_ring3::sys::{sleep_ms, sys, write};
+use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
 
+mod theme;
 mod txt;
 
 /// LUMEN.ELF's size-class heap over SYS_SBRK: plans, scrollback lines and the face bytes are heap objects.
@@ -61,13 +67,6 @@ const INP_CAP: usize = 240;
 const HIST_CAP: usize = 32;
 /// The most a `cat` reads (the window shows the tail; the ring keeps 8 KB of it).
 const CAT_MAX: usize = 64 * 1024;
-
-const BG: u32 = 0xFF12_141A;
-const INK: u32 = 0xFFE6_E3EC;
-const ERR_INK: u32 = 0xFFFF_8A80;
-const ECHO_INK: u32 = 0xFF8F_B8FF;
-const CARET: u32 = 0xFFB0_8CFF;
-const RULE: u32 = 0xFF3A_3550;
 
 static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY;
 
@@ -559,11 +558,12 @@ impl App {
             return;
         }
         self.dirty = false;
+        let th = theme::cur();
         let lh = self.lh();
-        self.fill(0, 0, W, H, BG);
+        self.fill(0, 0, W, H, th.bg);
         // The prompt line at the bottom, under a rule; the scrollback fills upward from it.
         let py = H - lh - 4;
-        self.fill(0, py - 3, W, 1, RULE);
+        self.fill(0, py - 3, W, 1, th.rule);
         let prompt = alloc::format!("{}> ", self.cwd);
         let cols = self.cols();
         let mut shown: Vec<u8> = prompt.as_bytes().to_vec();
@@ -573,9 +573,9 @@ impl App {
         let caret_at = start + self.caret;
         let skip = (caret_at + 1).saturating_sub(cols);
         let vis: Vec<u8> = shown[skip..].iter().copied().take(cols).collect();
-        self.text(4, py, &vis, INK);
+        self.text(4, py, &vis, th.ink);
         let cx = 4 + ((caret_at - skip) as f32 * self.cell()) as i32;
-        self.fill(cx, py, 2, lh - 1, CARET);
+        self.fill(cx, py, 2, lh - 1, th.caret);
         let fit = ((py - 6) / lh).max(0) as usize;
         let n = self.rows.len();
         let first = n.saturating_sub(fit);
@@ -583,9 +583,9 @@ impl App {
         let mut y = py - 6 - (rows.len() as i32) * lh;
         for (tone, s) in rows {
             let ink = match tone {
-                Tone::Out => INK,
-                Tone::Err => ERR_INK,
-                Tone::Echo => ECHO_INK,
+                Tone::Out => th.ink,
+                Tone::Err => th.err_ink,
+                Tone::Echo => th.echo_ink,
             };
             self.text(4, y, s.as_bytes(), ink);
             y += lh;
@@ -698,6 +698,8 @@ pub extern "C" fn _start() -> ! {
         l.wire();
         exit(1);
     }
+    theme::load(); // UNAKEYS (B552): the look from Principia, before the first paint
+    theme_wire();
     let face = txt::load();
     let (face, why) = match face {
         Ok(t) => (Some(t), None),
@@ -757,9 +759,21 @@ pub extern "C" fn _start() -> ! {
             }
             k += 1;
         }
+        if theme::due(now_ms()) && theme::load() {
+            app.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
+            theme_wire();
+        }
         app.paint();
         sleep_ms(16);
     }
+}
+
+/// `:: MIDDEN: theme mode=<light|dark> accent=<name> bus=<0|-errno> ::` — the look in force.
+fn theme_wire() {
+    let l = theme::cur().look;
+    let mut w = Line::new(b":: MIDDEN: theme mode=");
+    w.put(l.mode_name().as_bytes()).put(b" accent=").put(l.accent_name().as_bytes()).put(b" bus=").dec(theme::bus_err()).put(b" ::");
+    w.wire();
 }
 
 #[panic_handler]

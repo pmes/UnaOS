@@ -395,7 +395,9 @@ pub const INPUT_EV_TYPE_SHIFT: u32 = 48;
 /// Mask for the type field once shifted down.
 pub const INPUT_EV_TYPE_MASK: u64 = 0xFF;
 
-/// A key PRESS. Payload `[7:0]` = ASCII, or one of the `KEY_*` C0 arrow codes.
+/// A key PRESS. Payload `[7:0]` = ASCII, or one of the `KEY_*` C0 arrow codes, or a [`KEY_CTRL_DIGIT`] chord
+/// byte (`0x80..=0x89`: the payload carries no modifier field, so a modified key the ring must tell apart presses as
+/// a byte of its own).
 pub const INPUT_EV_KEY_DOWN: u64 = 1;
 /// A key RELEASE. Same payload as the press.
 pub const INPUT_EV_KEY_UP: u64 = 2;
@@ -490,6 +492,13 @@ pub const KEY_UP: u8 = 0x1F;
 /// ESC — plain ASCII, listed here because it sits one below the arrow block and every consumer of
 /// the arrows wants it too.
 pub const KEY_ESC: u8 = 0x1B;
+/// Ctrl + a main-row digit PRESSES as `KEY_CTRL_DIGIT | d` — Ctrl+1 = `0x81` … Ctrl+9 = `0x89`, Ctrl+0 = `0x80`
+/// (SMALLFIX9, rmbp-ledger B533: the shared HID fold `hid_key_ascii`, whose `HID_KEY_CTRL_DIGIT` is this value). The
+/// range is one no key and no other fold produces, and every ASCII consumer takes `0x20..=0x7E` only, so a program
+/// that does not read it ignores it. The RELEASE is the bare digit (`KEY_UP '1'`): a release cannot know the press's
+/// modifiers, so a reader marks the digit's release owed at the press (UNAKEYS B552: UNA.ELF's pane switch). The
+/// keypad digits and Alt/Cmd + digit stay suppressed.
+pub const KEY_CTRL_DIGIT: u8 = 0x80;
 
 /// [`SYS_GETINFO`]'s payload: `#[repr(C)]`, no padding, so the byte view is exactly the two fields
 /// in declaration order — `pid` at 0, `ticks` at 8.

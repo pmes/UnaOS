@@ -36,6 +36,11 @@
 // Cmd-V pastes. Ctrl-K or Cmd-K starts a new conversation; Esc cancels an answer in flight and NEVER
 // closes the window (R24). Commands: /new /list /open N /copy /help.
 //
+// THEME. UNAKEYS (rmbp-ledger B552): every colour is a field of `theme::Theme` (theme.rs: Principia's
+// `system.appearance.*` over the PREFS bus, the kernel palette's Light/Dark rows), read once at start and again when
+// the store moves (`theme::due`, PrefChanged's ring-3 stand-in); `:: LUMEN: theme mode=<light|dark> accent=<name>
+// bus=<0|-errno> ::` at start and on every change.
+//
 // WIRE. `:: LUMEN: start provider=<claude|echo> model=<m> key=<holocron|unafs|none|fat-refused> [holocron=<no-fulfiller|not-found|refused>] transport=<tls|http|none>
 // trust=<roots|none> clock=<set|unset> history=<N|off> files=<path|open|off> font=<dejavu-sans font_kib=<n>|font8x8 font_why=<w>> ::` once (KERNELFONT2), then per answer `:: LUMEN: reply provider=<p>
 // first_token_ms=<n> bytes=<n> stop=<s> [transport=tls verified=<issuer CN>] in=<n> out=<n> ::` or `:: LUMEN: fail stage=<s>
@@ -57,6 +62,7 @@ use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
 
 extern crate alloc;
 
+mod theme;
 mod txt;
 use txt::Kind;
 
@@ -182,7 +188,7 @@ fn style_at(spans: &[Span], i: usize, fence: bool) -> (Kind, u32, bool, bool) {
             return (k, tint_ink(sp.tint), sp.italic, code);
         }
     }
-    (if fence { Kind::Mono } else { Kind::Sans }, INK, false, false)
+    (if fence { Kind::Mono } else { Kind::Sans }, theme::cur().ink, false, false)
 }
 /// The transcript: every turn of the conversation as shown and saved (oldest turns drop first).
 const LOG_CAP: usize = 1 << 20;
@@ -201,20 +207,6 @@ const INP_CAP: usize = 1024;
 const ROLE_USER: u8 = 1;
 const ROLE_AI: u8 = 2;
 const ROLE_NOTE: u8 = 3;
-
-const BG: u32 = 0xFF14_1218;
-const RULE: u32 = 0xFF3A_3550;
-const INK: u32 = 0xFFE6_E3EC;
-const USER_INK: u32 = 0xFF8F_B8FF;
-const NOTE_INK: u32 = 0xFF9A_92A8;
-const CARET: u32 = 0xFFB0_8CFF;
-const OK_INK: u32 = 0xFF7C_D992;
-const HEAD_INK: u32 = 0xFFFF_D27A;
-const CODE_INK: u32 = 0xFF9F_E6B0;
-const CODE_BG: u32 = 0xFF20_1C2A;
-const QUOTE_INK: u32 = 0xFFB8_B0C8;
-const LINK_INK: u32 = 0xFF7F_C8FF;
-const SEL_BAR: u32 = 0xFFB0_8CFF;
 
 static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY; // the grid when no face is on the volume (KERNELFONT2)
 
@@ -1281,13 +1273,14 @@ impl Surf {
 }
 
 fn tint_ink(t: Tint) -> u32 {
+    let th = theme::cur();
     match t {
-        Tint::Plain => INK,
-        Tint::Heading => HEAD_INK,
-        Tint::Dim => NOTE_INK,
-        Tint::Code => CODE_INK,
-        Tint::Quote => QUOTE_INK,
-        Tint::Link => LINK_INK,
+        Tint::Plain => th.ink,
+        Tint::Heading => th.head_ink,
+        Tint::Dim => th.note_ink,
+        Tint::Code => th.code_ink,
+        Tint::Quote => th.quote_ink,
+        Tint::Link => th.link_ink,
     }
 }
 
@@ -1303,7 +1296,7 @@ fn draw_spans(s: &Surf, x: f32, y: i32, text: &[u8], spans: &[Span], a: usize, b
             e += 1;
         }
         if code {
-            s.fill(pen as i32, y, width(&text[i..e], k).ceil_px(), lh(), CODE_BG);
+            s.fill(pen as i32, y, width(&text[i..e], k).ceil_px(), lh(), theme::cur().code_bg);
         }
         pen = s.styled_k(pen, y, &text[i..e], ink, k, italic);
         i = e;
@@ -1322,22 +1315,23 @@ impl CeilPx for f32 {
 
 /// Draw the window; returns (visible transcript rows, the largest scroll) for the next event.
 fn render(a: &App, s: &Surf) -> (i32, i32) {
+    let th = theme::cur();
     let (w, h) = (a.w, a.h);
     let lh = lh();
-    s.fill(0, 0, w, h, BG);
+    s.fill(0, 0, w, h, th.bg);
     let tw = (w - 8) as f32; // the text width, px
     // the footer: two status rows
     let fy2 = h - lh - 2;
     let fy1 = fy2 - lh;
-    s.fill(0, fy1 - 3, w, 1, RULE);
+    s.fill(0, fy1 - 3, w, 1, th.rule);
     let st1 = &a.st1[..a.st1_n];
-    s.text(4, fy1, &st1[..fit(st1, Kind::Sans, tw)], OK_INK);
+    s.text(4, fy1, &st1[..fit(st1, Kind::Sans, tw)], th.ok_ink);
     let (sc, st): (u32, &[u8]) = if a.busy {
-        (CARET, b"... answering (Esc cancels)")
+        (th.caret, b"... answering (Esc cancels)")
     } else if a.flash_n > 0 && now_ms() < a.flash_until {
-        (CARET, &a.flash[..a.flash_n])
+        (th.caret, &a.flash[..a.flash_n])
     } else {
-        (NOTE_INK, &a.st2[..a.st2_n])
+        (th.note_ink, &a.st2[..a.st2_n])
     };
     s.text(4, fy2, &st[..fit(st, Kind::Sans, tw)], sc);
     // the input: broken into rows of at most `iw` px (by character, not word: it is being typed)
@@ -1360,20 +1354,20 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
     let crow = if crow + 1 < total && starts[crow + 1] == a.caret { crow + 1 } else { crow };
     let top = (crow + 1).saturating_sub(shown);
     let iy = fy1 - 6 - shown as i32 * lh;
-    s.fill(0, iy - 3, w, 1, RULE);
+    s.fill(0, iy - 3, w, 1, th.rule);
     let mut r = 0;
     while r < shown {
         let row = top + r;
         let y = iy + r as i32 * lh;
         if row == 0 {
-            s.text(4, y, b">", USER_INK);
+            s.text(4, y, b">", th.user_ink);
         }
         let lo = starts[row].min(a.inp_n);
         let hi = starts.get(row + 1).copied().unwrap_or(a.inp_n).min(a.inp_n);
-        s.text(4 + 16, y, &a.inp[lo..hi], INK);
+        s.text(4 + 16, y, &a.inp[lo..hi], th.ink);
         if row == crow {
             let cx = 4 + 16 + width(&a.inp[lo..a.caret.clamp(lo, hi)], Kind::Sans) as i32;
-            s.fill(cx, y, 2, lh, CARET);
+            s.fill(cx, y, 2, lh, th.caret);
         }
         r += 1;
     }
@@ -1402,10 +1396,10 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
                 let block = Block::from_u8(rec.block);
                 let fence = matches!(block, Block::Code | Block::Fence);
                 if fence {
-                    s.fill(2, y, w - 8, lh, CODE_BG);
+                    s.fill(2, y, w - 8, lh, th.code_bg);
                 }
                 if block == Block::Rule {
-                    s.fill(4, y + lh / 2, w - 12, 1, RULE);
+                    s.fill(4, y + lh / 2, w - 12, 1, th.rule);
                 } else {
                     let text = &rt()[..cache_len];
                     let spans = &rs()[..cache_spans];
@@ -1420,7 +1414,7 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
                 let e = a.line_end(p);
                 let a0 = (p + rec.dofs as usize).min(e);
                 let b0 = (a0 + rec.len as usize).min(e);
-                let (ink, mark): (u32, &[u8]) = if role == ROLE_USER { (USER_INK, b">") } else { (NOTE_INK, b"*") };
+                let (ink, mark): (u32, &[u8]) = if role == ROLE_USER { (th.user_ink, b">") } else { (th.note_ink, b"*") };
                 if rec.flags & F_TURN != 0 && rec.flags & F_LEAD != 0 {
                     s.text(4, y, mark, ink);
                 }
@@ -1428,7 +1422,7 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
             }
         }
         if selected {
-            s.fill(0, y, 2, lh, SEL_BAR);
+            s.fill(0, y, 2, lh, th.sel_bar);
         }
         i += 1;
     }
@@ -1437,8 +1431,8 @@ fn render(a: &App, s: &Surf) -> (i32, i32) {
         let track = rows as i32 * lh;
         let thumb = (track * rows as i32 / n as i32).max(6);
         let ty = 3 + ((track - thumb) as i64 * first as i64 / maxs.max(1) as i64) as i32;
-        s.fill(w - 3, 3, 2, track, RULE);
-        s.fill(w - 3, ty, 2, thumb, CARET);
+        s.fill(w - 3, 3, 2, track, th.rule);
+        s.fill(w - 3, ty, 2, thumb, th.caret);
     }
     (rows as i32, maxs as i32)
 }
@@ -1473,6 +1467,8 @@ pub extern "C" fn _start() -> ! {
         Line::new(b":: LUMEN: SYS_WIN_CREATE refused ::").wire();
         exit(1);
     }
+    theme::load(); // UNAKEYS (B552): the look from Principia, before the first paint
+    theme_wire();
     {
         let a = app();
         a.ring = Ring::new(unsafe { &mut *core::ptr::addr_of_mut!(RECS) });
@@ -1643,9 +1639,21 @@ pub extern "C" fn _start() -> ! {
             a.flash_n = 0;
             a.dirty = true;
         }
+        if theme::due(now_ms()) && theme::load() {
+            a.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
+            theme_wire();
+        }
         a.paint();
         sleep_ms(16);
     }
+}
+
+/// `:: LUMEN: theme mode=<light|dark> accent=<name> bus=<0|-errno> ::` — the look in force.
+fn theme_wire() {
+    let l = theme::cur().look;
+    let mut w = Line::new(b":: LUMEN: theme mode=");
+    w.put(l.mode_name().as_bytes()).put(b" accent=").put(l.accent_name().as_bytes()).put(b" bus=").dec(theme::bus_err()).put(b" ::");
+    w.wire();
 }
 
 #[panic_handler]

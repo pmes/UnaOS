@@ -17,6 +17,9 @@
 // on top, and a selection's glyphs again in white (Chromium's highlight, the host's `selection::HIGHLIGHT`
 // over white). Over the page: the focused link's outline and the status line (the hovered href, the find bar, a
 // flash). No pointer: the compositor's sprite is the one pointer (AETHERPTR, rmbp-ledger B543).
+//
+// UNAKEYS (rmbp-ledger B552): no colour is spelled here — the page's initial colours are `theme::PAGE_*` and every
+// colour over the page (the marks, the status line) is a field of the live `theme::cur()` (Principia's appearance).
 
 use alloc::vec::Vec;
 
@@ -90,7 +93,7 @@ pub fn inks(tree: &Tree) -> NodeMap<Ink> {
                 me.color = p
                     .and_then(|p| p.color)
                     .map(rgb)
-                    .unwrap_or(if tag == "a" && n.has_attr("href") { 0x0000_00EE } else { inh.color });
+                    .unwrap_or(if tag == "a" && n.has_attr("href") { crate::theme::PAGE_LINK } else { inh.color });
                 if let Some(fs) = p.and_then(|p| p.used_font_size) {
                     me.size = fs;
                 }
@@ -117,7 +120,7 @@ pub fn inks(tree: &Tree) -> NodeMap<Ink> {
         }
     }
     let mut out = NodeMap::new();
-    let root = Ink { color: 0x0000_0000, size: 16.0, sel: FontSel::default(), underline: false, list: 1 };
+    let root = Ink { color: crate::theme::PAGE_INK, size: 16.0, sel: FontSel::default(), underline: false, list: 1 };
     walk(tree, tree.root_node, root, &mut out);
     out
 }
@@ -133,7 +136,7 @@ pub fn canvas_bg(tree: &Tree) -> u32 {
             p.background.filter(|_| p.bg_alpha.unwrap_or(1.0) >= 0.5).map(rgb)
         })
     };
-    bg_of("html").or_else(|| bg_of("body")).unwrap_or(0x00FF_FFFF)
+    bg_of("html").or_else(|| bg_of("body")).unwrap_or(crate::theme::PAGE_BG)
 }
 
 struct Cx<'a> {
@@ -159,12 +162,6 @@ pub struct Mark {
     pub e: usize,
     pub kind: MarkKind,
 }
-
-/// Chromium's selection colour over white (the host's `selection::HIGHLIGHT` at its alpha), and its glyphs.
-const SEL_BG: u32 = 0x0033_67D1;
-const SEL_INK: u32 = 0x00FF_FFFF;
-const FIND_BG: u32 = 0x00FF_E45C;
-const FIND_CUR_BG: u32 = 0x00FF_9632;
 
 /// Paint the page with its top at `-scroll`; `bg` is the canvas colour, `inks` the tree's inherited paint,
 /// `marks` the selection and find highlights by IFC root.
@@ -226,7 +223,7 @@ fn paint_box(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
     }
     let p = tree.paint_map.get(&id);
     let hidden = p.and_then(|p| p.hidden).unwrap_or(false);
-    let ink = cx.inks.get(&id).copied().unwrap_or(Ink { color: 0, size: 16.0, sel: FontSel::default(), underline: false, list: 1 });
+    let ink = cx.inks.get(&id).copied().unwrap_or(Ink { color: crate::theme::PAGE_INK, size: 16.0, sel: FontSel::default(), underline: false, list: 1 });
     let node = tree.node_map.get(&id);
     let (w, h) = (l.size.width, l.size.height);
     if !hidden && y + h >= 0.0 {
@@ -298,10 +295,11 @@ fn paint_box(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
                         let caret = |b: usize| if b == 0 { 0.0 } else { cx.fonts.0.borrow_mut().measure(&s[..b], tink.sel, tink.size) };
                         let (x0, x1) = (ox + fx + caret(m.s), ox + fx + caret(m.e));
                         let (top, lh) = layout_core::hit::line_of(il, *baseline).map(|(_, t, h)| (t, h)).unwrap_or((baseline - tink.size, tink.size * 1.25));
+                        let th = crate::theme::cur();
                         let c = match m.kind {
-                            MarkKind::Select => SEL_BG,
-                            MarkKind::Find => FIND_BG,
-                            MarkKind::FindCur => FIND_CUR_BG,
+                            MarkKind::Select => th.sel_bg,
+                            MarkKind::Find => th.find_bg,
+                            MarkKind::FindCur => th.find_cur_bg,
                         };
                         cv.fill(fl(x0), fl(oy + top), (fl(x1) - fl(x0)).max(1), fl(oy + top + lh) - fl(oy + top), c);
                         if m.kind == MarkKind::Select {
@@ -310,7 +308,7 @@ fn paint_box(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
                     }
                     text(cv, cx, &tink, ox + fx, base, s, *width);
                     if let Some((x0, part)) = white {
-                        let wink = Ink { color: SEL_INK, underline: false, ..tink };
+                        let wink = Ink { color: crate::theme::cur().sel_ink, underline: false, ..tink };
                         text(cv, cx, &wink, x0, base, part, 0.0);
                     }
                 }
@@ -350,14 +348,15 @@ pub fn outline(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, c: u32) {
     cv.fill(x + w - 1, y, 1, h, c);
 }
 
-/// The status line: `s` in the small face on a dark band at the window's foot (the hovered href, the find bar,
-/// a flash); `accent` tints the band (the find bar with no match).
+/// The status line: `s` in the small face on the theme's status band at the window's foot (the hovered href, the
+/// find bar, a flash); `accent` turns it to the alert band (the find bar with no match).
 pub fn status(cv: &mut Canvas, fonts: &Fonts, s: &str, accent: bool) {
+    let th = crate::theme::cur();
     let y = cv.h - STATUS_H;
-    cv.fill(0, y, cv.w, STATUS_H, if accent { 0x005A_1E1E } else { 0x0020_2632 });
-    cv.fill(0, y, cv.w, 1, 0x003A_3550);
+    cv.fill(0, y, cv.w, STATUS_H, if accent { th.status_alert } else { th.status_bg });
+    cv.fill(0, y, cv.w, 1, th.status_rule);
     let sel = FontSel::default();
-    let ink = 0x00E6_E3EC;
+    let ink = th.status_ink;
     let mut t = fonts.0.borrow_mut();
     let (a, _, _) = t.line_metrics(sel, 11.0);
     t.draw(4.0, (y + 2) as f32 + a, s, sel, 11.0, ink, &mut |gx, gy, cov| cv.blend(gx, gy, ink, cov));
