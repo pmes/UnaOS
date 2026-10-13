@@ -62,9 +62,7 @@ mod tests {
         let mut form_data = std::collections::HashMap::new();
         form_data.insert("q".to_string(), "hello world & rust".to_string());
         
-        let encoded = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(form_data.iter())
-            .finish();
+        let encoded = html_core::url::form::serialize(form_data.iter());
             
         assert_eq!(encoded, "q=hello+world+%26+rust");
     }

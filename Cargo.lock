@@ -68,7 +68,6 @@ dependencies = [
  "text_host",
  "thiserror 2.0.21",
  "tokio",
- "url",
 ]
 
 [[package]]
@@ -2378,6 +2377,7 @@ dependencies = [
 name = "http_core"
 version = "0.1.0"
 dependencies = [
+ "html_core",
  "pixel_core",
  "tls_core",
 ]

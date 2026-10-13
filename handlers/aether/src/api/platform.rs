@@ -1,6 +1,6 @@
 //! Platform APIs that are *real*, not shaped-like-real: `URL` /
-//! `URLSearchParams` over the same `url` crate the network stack parses
-//! with, UTF-8 `TextEncoder`/`TextDecoder`, the `AbortController` object
+//! `URLSearchParams` over UnaOS's own WHATWG URL parser (`html_core::url`,
+//! URLCORE SR87 — the one the network stack parses with, via http_core), UTF-8 `TextEncoder`/`TextDecoder`, the `AbortController` object
 //! graph, `DOMParser` over the same `html_core` parser (`dom::parse_html`) the
 //! `innerHTML` setter uses, and `crypto` seeded from the OS entropy pool.
 //!
@@ -12,6 +12,7 @@
 //! shows up as a gap rather than as silence.
 
 use crate::js::idl;
+use html_core::url;
 use js_core::vm::*;
 
 fn str_arg(vm: &mut Vm, ctx: &CallCtx, i: usize) -> JsResult<String> {
@@ -19,8 +20,8 @@ fn str_arg(vm: &mut Vm, ctx: &CallCtx, i: usize) -> JsResult<String> {
     Ok(vm.to_string(&v)?.to_rust())
 }
 
-/// Serialises a parsed `Url` into the component bag the JS `URL` class reads. Every field is what the
-/// `url` crate actually computed — none of them are reconstructed by string surgery in JS.
+/// Serialises a parsed `Url` into the component bag the JS `URL` class reads. Every field is what
+/// `html_core::url` actually computed — none of them are reconstructed by string surgery in JS.
 fn components(u: &url::Url, vm: &mut Vm) -> JsResult<Value> {
     let o = vm.new_plain_object();
     for part in ["href", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash", "origin"] {
@@ -64,7 +65,7 @@ fn entropy(n: usize) -> Vec<u8> {
     out
 }
 
-/// `__url_parse(input, base)` → components | null. Relative resolution is the `url` crate's, so
+/// `__url_parse(input, base)` → components | null. Relative resolution is html_core::url's, so
 /// `new URL('../a', 'https://h/x/y/z')` lands exactly where the network stack would fetch it from.
 fn url_parse(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let input = str_arg(vm, ctx, 0)?;
@@ -81,8 +82,8 @@ fn url_parse(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
 }
 
-/// `__url_set(href, part, value)` → components | null. Component writes go through the crate's own
-/// setters, which re-normalise the whole URL.
+/// `__url_set(href, part, value)` → components | null. Component writes go through the URL Standard's
+/// setters (a basic URL parse with that component's state override).
 fn url_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let href = str_arg(vm, ctx, 0)?;
     let part = str_arg(vm, ctx, 1)?;
@@ -90,10 +91,26 @@ fn url_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let Ok(mut u) = url::Url::parse(&href) else { return Ok(Value::Null) };
     let before = u.to_string();
     crate::js::html::set_url_part(&mut u, &part, &value);
-    if u.as_str() == before && !value.is_empty() && part != "search" && part != "hash" {
+    if u.href() == before && !value.is_empty() && part != "search" && part != "hash" {
         crate::ledger::record_js(&format!("URL-set-refused:{part}"));
     }
     components(&u, vm)
+}
+
+/// `__form_parse(s)` → `[[name, value], ...]`: the application/x-www-form-urlencoded parser (URL §5.1).
+fn form_parse(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let input = str_arg(vm, ctx, 0)?;
+    let mut rows = Vec::new();
+    for (n, v) in url::form::parse_str(&input) {
+        rows.push(Value::Object(vm.new_array(vec![idl::s(&n), idl::s(&v)])));
+    }
+    Ok(Value::Object(vm.new_array(rows)))
+}
+
+/// `__form_byte(s)` → the urlencoded byte serializer of `s` (URL §5.2: form set, space as `+`).
+fn form_byte(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let input = str_arg(vm, ctx, 0)?;
+    Ok(idl::s(&url::form::byte_serialize(input.as_bytes())))
 }
 
 /// `__random_bytes(n)` → array of n bytes from the OS entropy pool.
@@ -129,6 +146,8 @@ pub fn init(vm: &mut Vm) {
     for (name, len, f) in [
         ("__url_parse", 2, url_parse as NativeFn),
         ("__url_set", 3, url_set),
+        ("__form_parse", 1, form_parse),
+        ("__form_byte", 1, form_byte),
         ("__random_bytes", 1, random_bytes),
         ("__parse_document", 1, parse_document),
     ] {
@@ -148,20 +167,11 @@ pub fn init(vm: &mut Vm) {
 const PRELUDE: &str = r#"
 
 // ---- URLSearchParams -------------------------------------------------
-// Real application/x-www-form-urlencoded semantics: '+' decodes to space,
+// Real application/x-www-form-urlencoded semantics (URL §5): the parser and
+// the byte serializer are html_core::url's (__form_parse / __form_byte);
 // insertion order is preserved, and repeated names are kept (getAll).
 (function () {
-    var enc = function (s) {
-        return encodeURIComponent(String(s))
-            .replace(/%20/g, '+')
-            .replace(/[!'()~]/g, function (c) {
-                return '%' + c.charCodeAt(0).toString(16).toUpperCase();
-            });
-    };
-    var dec = function (s) {
-        try { return decodeURIComponent(String(s).replace(/\+/g, ' ')); }
-        catch (e) { return String(s).replace(/\+/g, ' '); }
-    };
+    var enc = function (s) { return __form_byte(String(s)); };
 
     function URLSearchParams(init) {
         this._p = [];
@@ -169,15 +179,8 @@ const PRELUDE: &str = r#"
         if (init === undefined || init === null) { return; }
         if (typeof init === 'string') {
             var q = init.charAt(0) === '?' ? init.slice(1) : init;
-            if (q.length) {
-                var parts = q.split('&');
-                for (var i = 0; i < parts.length; i++) {
-                    if (!parts[i].length) { continue; }
-                    var j = parts[i].indexOf('=');
-                    if (j < 0) { this._p.push([dec(parts[i]), '']); }
-                    else { this._p.push([dec(parts[i].slice(0, j)), dec(parts[i].slice(j + 1))]); }
-                }
-            }
+            var rows = __form_parse(q);
+            for (var i = 0; i < rows.length; i++) { this._p.push([rows[i][0], rows[i][1]]); }
         } else if (Array.isArray(init)) {
             for (var k = 0; k < init.length; k++) {
                 this._p.push([String(init[k][0]), String(init[k][1])]);
@@ -269,7 +272,7 @@ const PRELUDE: &str = r#"
     globalThis.URLSearchParams = URLSearchParams;
 
     // ---- URL ---------------------------------------------------------
-    // Every component comes from the `url` crate; component writes go back
+    // Every component comes from html_core::url; component writes go back
     // through it and re-normalise. searchParams is live-linked both ways,
     // as in the platform.
     function URL(input, base) {
