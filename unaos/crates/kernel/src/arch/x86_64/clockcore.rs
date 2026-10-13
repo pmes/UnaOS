@@ -304,7 +304,7 @@ pub fn ensure_tests() {
 /// tree — `ref=pm`); (2) a deliberate 20 ms masked spin on THIS core must still see `ms()` advance
 /// 20 ms, and the watch must have named it; (3) every online core's LAPIC tick advanced in the window.
 pub fn selftest() {
-    const WIN_MS: u64 = 250;
+    const WIN_MS: u64 = 250; if !tsc_clock() && !crate::arch::apic::tsc_invariant() { serial_println!(":: CLOCKCORE: source=apic invariant=0 ref=pm -> SKIP reason=no-invariant-tsc ::"); return; } // QEMUSKIP (B613): `start` keeps the tick clock on a non-invariant TSC (line 79), so the TSC clock this fixture certifies is not the clock
     let hz = crate::arch::apic::tsc_hz();
     let cores = online();
     let snap: alloc::vec::Vec<u64> = cores
