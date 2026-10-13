@@ -161,6 +161,8 @@ pub struct Vm {
     /// GC roots) until a handler is attached or the host drains the list at its microtask checkpoint.
     pub track_rejections: bool,
     pub rejected_unhandled: Vec<Obj>,
+    /// AETHERPERF (SR118): the root hidden class every object allocated through `alloc` starts from.
+    pub root_shape: Rc<propmap::Shape>,
 }
 
 pub(crate) fn wk_sym(desc: &str) -> Sym {
@@ -221,6 +223,7 @@ impl Vm {
             async_counter: 0,
             track_rejections: false,
             rejected_unhandled: Vec::new(),
+            root_shape: propmap::Shape::root(),
         };
         let r = vm.create_realm();
         vm.cur_realm = r;
@@ -250,6 +253,12 @@ impl Vm {
     // ------------------------------------------------------------------------------------- allocation
 
     pub fn alloc(&mut self, d: ObjectData) -> Obj {
+        let mut d = d;
+        // Shapes (vm/propmap.rs): a fresh object's empty property map starts at the root hidden class.
+        // Environment records never hold properties.
+        if !matches!(d.kind, Kind::Env(_)) {
+            d.props.seed(&self.root_shape);
+        }
         let o = self.heap.alloc(d);
         if self.in_native {
             self.temp_roots.push(Value::Object(o));
