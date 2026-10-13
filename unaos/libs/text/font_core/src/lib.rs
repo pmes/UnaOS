@@ -19,6 +19,8 @@
 //! - [`bidi`] (UAX #9), [`grapheme`] (UAX #29), [`script`] (Scripts + Script_Extensions itemizer),
 //!   [`normalize`] (UAX #15 NFC/NFD), [`linebreak`] (UAX #14, every class) — tables generated from UCD 17.0.0
 //!   ([`ucd`]) and proven on Unicode's conformance files in full (FONTBIDI, SR56).
+//! - [`var`] (FONTSCRAFT, B640): variable fonts — `fvar` axes, `avar` maps, `gvar` outlines, `HVAR` advances,
+//!   GPOS/GDEF device deltas — instanced per [`Font`] with [`Font::set_variation`] / [`Font::with_variations`].
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -49,10 +51,14 @@ pub mod script;
 pub mod shape;
 pub mod ui;
 pub mod ucd;
+pub mod var;
 
 pub use cache::GlyphCache;
 pub use font::{Error, Font, Os2, Outlines, Post};
 pub use path::{OutlineSink, Path, PathCmd};
 pub use raster::{rasterize_glyph, rasterize_glyph_mode, GlyphBitmap, RenderMode};
 pub use bidi::Direction;
-pub use shape::{draw_text, layout_lines, measure, shape, shape_dir, shape_fallback, shape_run, Canvas, GlyphPos, Line, ShapeOptions};
+pub use shape::{
+    draw_text, layout_lines, measure, shape, shape_dir, shape_fallback, shape_fallback_with, shape_run, shape_run_with, Canvas, GlyphPos, Line,
+    ShapeOptions,
+};

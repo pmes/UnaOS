@@ -6,6 +6,7 @@ Responsiveness is the #1 feature.
 * **Implementation:** The Window Server runs on a dedicated high-priority thread (Real-Time Class). It never waits for an application to finish thinking.
 
 ## 2. Information Density (The "Data" Aesthetic)
+> **SUPERSEDED on visual design** (R124, FONTSCRAFT B640): type and density follow [DESIGN-LANGUAGE.md](DESIGN-LANGUAGE.md) §2.1–§2.2 — Inter (variable, `wght` + `opsz`) for the UI, JetBrains Mono for code and data, Noto Sans as the script fallback, the §2.2 ramp (`theme::type_role`), and Compact density for data views.
 We reject modern "white space" trends. We prefer **High Signal-to-Noise Ratio**.
 * **Tabs:** Like BeOS, windows use distinctive tabs that are easy to grab.
 * **Metadata First:** In the file browser, we don't just show icons. We show resolution, frame rate (for videos), and EXIF data (for photos) directly in the list view.
@@ -17,6 +18,7 @@ unaOS is a workbench, not a consumption device.
 * **Virtual Desktops:** Deeply integrated. One workspace for "Kernel Dev," one for "Music," one for "Communication."
 
 ## 4. Dark Mode by Default (Ecology)
+> **SUPERSEDED on visual design** (R124, FONTSCRAFT B640): colour, Light/Dark and accents follow [DESIGN-LANGUAGE.md](DESIGN-LANGUAGE.md) §2.3; OLED black stays for the console and media grounds only.
 * **OLED Black:** The default theme uses true black (`#000000`) to turn off pixels on OLED screens (Pixel 10, modern laptops). This saves energy.
 * **Accent Colors:** Used strictly to indicate status (Green = Good, Yellow = Busy, Red = Error). No decorative colors.
 

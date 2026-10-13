@@ -21,24 +21,38 @@
 //!   every dropped entry is counted in [`Stats::evictions`]. A shaped-run cache (64 runs) so a strip
 //!   painter calling once per scanline shapes a string once.
 //! * The panel's pixel density from its EDID ([`edid_ppi`]) and the CSS-px → device-px rule ([`device_px`]).
+//!
+//! FONTSCRAFT (rmbp-ledger B640, R124, DESIGN-LANGUAGE §2.2) adds what the language's raster needs:
+//! * Variable faces instanced per draw ([`Font::set_variation`]): `wght` from [`Style::weight`] (or
+//!   [`Engine::bold_weight`], 600, when `bold` asks a variable slot for a weight it was not loaded at) and `opsz`
+//!   set automatically to the size in pt ([`Engine::set_px_per_pt`]).
+//! * OpenType features on request ([`Style::features`]: `tnum`, `zero`, `ss01`, `ss02`, `cv01`, `cv05`, `cv08`,
+//!   `case`), `kern`/`liga`/`calt` always on; tracking ([`Style::tracking`], em).
+//! * Per-role cached ATLASES: the glyph cache is split by (role, bold, weight, size) — one atlas per type role at
+//!   the panel's scale — under the one byte bound; an overflow drops whole atlases least-recently-used first, so
+//!   drawing a 40-pt clock never flushes the 13-pt body.
+//! * The fallback chain primary → [`Role::Fallback`] (Noto Sans, then DejaVu Sans) → [`Role::Script`] faces.
 
 use crate::bidi::Direction;
 use crate::cache::{split_position, CacheKey, SUBPIXEL_STEPS};
 use crate::fmath::{floor, round};
 use crate::raster::{rasterize_glyph_mode, GlyphBitmap, RenderMode};
-use crate::shape::{shape_fallback, ShapeOptions};
+use crate::shape::{shape_fallback_with, ShapeOptions};
 use crate::Font;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-/// What a face is FOR. The primary of a [`Style`] is the slot with its role (and weight); [`Role::Script`]
-/// slots are fallbacks tried after it.
+/// What a face is FOR. The primary of a [`Style`] is the slot with its role (and weight); [`Role::Fallback`]
+/// slots (FONTSCRAFT: Noto Sans, then DejaVu Sans) are tried after it, then the [`Role::Script`] slots.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Sans,
     Serif,
     Mono,
     Script,
+    /// FONTSCRAFT (B640): the general fallback faces, in load order, after the primary and before the scripts —
+    /// DESIGN-LANGUAGE §2.2's chain Inter → Noto Sans → DejaVu Sans (→ the kernel's bitmap atlas).
+    Fallback,
 }
 
 /// One loaded face.
@@ -49,12 +63,64 @@ pub struct Slot<'a> {
     pub font: Font<'a>,
 }
 
-/// How a run is drawn: role, weight and size in device px.
+/// FONTSCRAFT (B640): OpenType features a [`Style`] turns on (bits of [`Style::features`]); `kern`, `liga` and
+/// `calt` are always on.
+pub const FEAT_TNUM: u8 = 1;
+pub const FEAT_ZERO: u8 = 2;
+pub const FEAT_SS01: u8 = 4;
+pub const FEAT_SS02: u8 = 8;
+pub const FEAT_CV01: u8 = 16;
+pub const FEAT_CV05: u8 = 32;
+pub const FEAT_CV08: u8 = 64;
+pub const FEAT_CASE: u8 = 128;
+
+/// The OpenType tags of a [`Style::features`] mask.
+pub fn feature_tags(bits: u8) -> Vec<crate::layout::Tag> {
+    let all: [(u8, &[u8; 4]); 8] = [
+        (FEAT_TNUM, b"tnum"),
+        (FEAT_ZERO, b"zero"),
+        (FEAT_SS01, b"ss01"),
+        (FEAT_SS02, b"ss02"),
+        (FEAT_CV01, b"cv01"),
+        (FEAT_CV05, b"cv05"),
+        (FEAT_CV08, b"cv08"),
+        (FEAT_CASE, b"case"),
+    ];
+    all.iter().filter(|(b, _)| bits & b != 0).map(|(_, t)| **t).collect()
+}
+
+/// How a run is drawn: role, weight and size in device px; FONTSCRAFT adds an explicit `wght` (0 = by `bold`),
+/// OpenType features ([`FEAT_TNUM`] …) and tracking (em fraction, + looser).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Style {
     pub role: Role,
     pub bold: bool,
     pub size: f32,
+    /// `wght` for a variable face (100–900); 0 = the slot's own weight, or [`Engine::bold_weight`] when `bold`
+    /// asks for a weight the slot does not have.
+    pub weight: u16,
+    pub features: u8,
+    /// Letter spacing in em (DESIGN-LANGUAGE §2.2's tracking column: +0.5 % = 0.005).
+    pub tracking: f32,
+}
+
+impl Style {
+    /// A style with no weight override, no extra features and no tracking (KERNELFONT's three fields).
+    pub const fn new(role: Role, bold: bool, size: f32) -> Self {
+        Style { role, bold, size, weight: 0, features: 0, tracking: 0.0 }
+    }
+    pub const fn with_weight(mut self, w: u16) -> Self {
+        self.weight = w;
+        self
+    }
+    pub const fn with_features(mut self, f: u8) -> Self {
+        self.features = f;
+        self
+    }
+    pub const fn with_tracking(mut self, t: f32) -> Self {
+        self.tracking = t;
+        self
+    }
 }
 
 /// A shaped glyph in px, relative to the run's pen origin on the baseline (y down).
@@ -68,8 +134,7 @@ pub struct Placed {
 }
 
 struct Run {
-    role: Role,
-    bold: bool,
+    style: Style,
     size_64: u32,
     text: Vec<u8>,
     glyphs: Vec<Placed>,
@@ -89,16 +154,37 @@ pub struct Stats {
     pub runs_shaped: u64,
     pub cache_bytes: usize,
     pub cap_bytes: usize,
+    /// FONTSCRAFT (B640): live per-role atlases (one per role, weight and size drawn).
+    pub atlases: usize,
 }
 
 /// Bookkeeping charged per cache entry on top of its coverage bytes (key, map node, bitmap header).
 pub const ENTRY_OVERHEAD: usize = 64;
 const RUN_CAP: usize = 64;
+/// FONTSCRAFT (B640): the most per-role atlases kept at once (the §2.2 ramp has ten roles; a frame draws a few).
+pub const ATLAS_MAX: usize = 12;
 
-/// The engine: faces, the bounded glyph cache, the run cache, the counters.
+/// What one atlas holds: every glyph of one (role, bold, weight, size) — one type role at the panel's scale.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AtlasKey {
+    role: Role,
+    bold: bool,
+    weight: u16,
+    size_64: u32,
+}
+
+struct Atlas {
+    key: AtlasKey,
+    map: BTreeMap<CacheKey, Option<GlyphBitmap>>,
+    bytes: usize,
+    used: u64,
+}
+
+/// The engine: faces, the per-role atlases (one byte bound over all of them), the run cache, the counters.
 pub struct Engine<'a> {
     slots: Vec<Slot<'a>>,
-    cache: BTreeMap<CacheKey, Option<GlyphBitmap>>,
+    atlases: Vec<Atlas>,
+    tick: u64,
     runs: Vec<Run>,
     run_next: usize,
     pub mode: RenderMode,
@@ -106,20 +192,31 @@ pub struct Engine<'a> {
     /// Linux desktop's fontconfig `hintslight` gives installed faces — the light auto-hinter on TrueType faces.
     pub hinting: crate::hint::Hinting,
     hinters: BTreeMap<u8, crate::hint::autofit::AutoHinter>,
+    /// FONTSCRAFT (B640): device px per pt (the panel's UI scale); a variable face's `opsz` is the size in pt.
+    px_per_pt: f32,
+    /// FONTSCRAFT: the `wght` a `bold` style instances a variable face at when no bold slot is loaded — 600,
+    /// DESIGN-LANGUAGE §2.2's "semibold, not bold, for emphasis below 20 pt".
+    pub bold_weight: u16,
     pub stats: Stats,
 }
+
+const WGHT: [u8; 4] = *b"wght";
+const OPSZ: [u8; 4] = *b"opsz";
 
 impl<'a> Engine<'a> {
     /// An empty engine whose glyph cache holds at most `cap_bytes`.
     pub fn new(cap_bytes: usize) -> Self {
         Engine {
             slots: Vec::new(),
-            cache: BTreeMap::new(),
+            atlases: Vec::new(),
+            tick: 0,
             runs: Vec::new(),
             run_next: 0,
             mode: RenderMode::SkiaAaa,
             hinting: crate::hint::Hinting::None,
             hinters: BTreeMap::new(),
+            px_per_pt: 1.0,
+            bold_weight: 600,
             stats: Stats { cap_bytes: cap_bytes.max(4096), ..Stats::default() },
         }
     }
@@ -145,6 +242,32 @@ impl<'a> Engine<'a> {
         self.slots.iter().any(|s| s.role == role)
     }
 
+    /// FONTSCRAFT (B640): the panel's device px per pt. A variable face with an `opsz` axis is drawn at
+    /// `opsz = size_px / px_per_pt` (Inter: 14–32), the way Segoe UI Variable sets it by default. Changing it
+    /// drops every atlas and run.
+    pub fn set_px_per_pt(&mut self, k: f32) {
+        let k = if k.is_finite() && k > 0.0 { k } else { 1.0 };
+        if k != self.px_per_pt {
+            self.px_per_pt = k;
+            self.flush_all();
+            self.runs.clear();
+            self.run_next = 0;
+        }
+    }
+
+    pub fn px_per_pt(&self) -> f32 {
+        self.px_per_pt
+    }
+
+    fn flush_all(&mut self) {
+        for a in self.atlases.drain(..) {
+            self.stats.evictions += a.map.len() as u64;
+        }
+        self.stats.flushes += 1;
+        self.stats.cache_bytes = 0;
+        self.stats.atlases = 0;
+    }
+
     fn primary(&self, role: Role, bold: bool) -> Option<usize> {
         self.slots
             .iter()
@@ -153,8 +276,9 @@ impl<'a> Engine<'a> {
             .or_else(|| self.slots.iter().position(|s| s.role == role))
     }
 
-    /// The fallback stack for a style: its primary, then (for serif/mono) the sans face of the same weight,
-    /// then every script face.
+    /// The fallback stack for a style: its primary, then (for serif/mono) the sans face of the same weight, then
+    /// the [`Role::Fallback`] faces of that weight (a variable fallback serves both weights), then every script
+    /// face.
     fn stack(&self, role: Role, bold: bool) -> Vec<usize> {
         let mut v = Vec::new();
         if let Some(p) = self.primary(role, bold) {
@@ -168,11 +292,55 @@ impl<'a> Engine<'a> {
             }
         }
         for (i, s) in self.slots.iter().enumerate() {
+            if s.role == Role::Fallback && !v.contains(&i) && (s.bold == bold || (!s.bold && s.font.has_axis(WGHT))) {
+                v.push(i);
+            }
+        }
+        for (i, s) in self.slots.iter().enumerate() {
             if s.role == Role::Script {
                 v.push(i);
             }
         }
         v
+    }
+
+    /// The `wght` slot `face` is instanced at for `style` (0 = the face as loaded).
+    fn weight_for(&self, face: usize, style: &Style) -> u16 {
+        let Some(s) = self.slots.get(face) else { return 0 };
+        if !s.font.has_axis(WGHT) {
+            return 0;
+        }
+        if style.weight != 0 {
+            style.weight
+        } else if style.bold && !s.bold {
+            self.bold_weight
+        } else {
+            0
+        }
+    }
+
+    /// Slot `face` instanced for `style`: `wght` per [`Engine::weight_for`], `opsz` from the size in pt.
+    fn instance(&self, face: usize, style: &Style) -> Font<'a> {
+        let s = &self.slots[face];
+        let mut f = s.font;
+        let w = self.weight_for(face, style);
+        if w != 0 {
+            f.set_variation(WGHT, w as f32);
+        }
+        if f.has_axis(OPSZ) {
+            f.set_variation(OPSZ, style.size / self.px_per_pt);
+        }
+        f
+    }
+
+    /// The instance a role's primary face draws `style` with — what a witness names (`wght`, `opsz`).
+    pub fn primary_instance(&self, style: &Style) -> Option<Font<'a>> {
+        Some(self.instance(self.primary(style.role, style.bold)?, style))
+    }
+
+    /// The name of the primary face of `role`/`bold` (the slot's wire name).
+    pub fn primary_name(&self, role: Role, bold: bool) -> Option<&'static str> {
+        Some(self.slots[self.primary(role, bold)?].name)
     }
 
     /// (ascent, descent, line height) in px at `size` for the primary regular face of `role` — browser line
@@ -209,7 +377,8 @@ impl<'a> Engine<'a> {
     /// whose budgets are `len * cell_w` keeps holding on average.
     pub fn fit_size_mean(&self, role: Role, bold: bool, cell_w: f32, cell_h: f32) -> Option<f32> {
         let size = self.fit_size(role, None, cell_h)?;
-        let f = &self.slots[self.primary(role, bold)?].font;
+        let p = self.primary(role, bold)?;
+        let f = self.instance(p, &Style::new(role, bold, size));
         let upem = f.units_per_em.max(1) as f32;
         let sum: u32 = ('a'..='z').map(|c| f.advance(f.glyph_index(c)) as u32).sum();
         let mean = sum as f32 / 26.0 / upem;
@@ -227,15 +396,28 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Shape `text` in `style` (bidi, script runs, per-cluster fallback), cached. `None` when no face of the
-    /// role (or sans) is loaded.
+    /// The baseline inside a line box of `line_h` px (DESIGN-LANGUAGE §2.2's line heights): the face's ascent plus
+    /// half the leading, the CSS rule.
+    pub fn baseline_in_line(&self, role: Role, size: f32, line_h: f32) -> f32 {
+        match self.line_metrics(role, size) {
+            Some((a, d, _)) => round((line_h - (a + d)) / 2.0 + a),
+            None => round(line_h * 0.8),
+        }
+    }
+
+    /// Shape `text` in `style` (bidi, script runs, per-cluster fallback, variable instances, features, tracking),
+    /// cached. `None` when no face of the role (or sans) is loaded.
     fn shape_run(&mut self, text: &[u8], style: Style) -> Option<usize> {
         let size_64 = floor(style.size * 64.0 + 0.5) as u32;
-        if let Some(i) = self
-            .runs
-            .iter()
-            .position(|r| r.size_64 == size_64 && r.role == style.role && r.bold == style.bold && r.text == text)
-        {
+        if let Some(i) = self.runs.iter().position(|r| {
+            r.size_64 == size_64
+                && r.style.role == style.role
+                && r.style.bold == style.bold
+                && r.style.weight == style.weight
+                && r.style.features == style.features
+                && r.style.tracking == style.tracking
+                && r.text == text
+        }) {
             return Some(i);
         }
         let stack = self.stack(style.role, style.bold);
@@ -246,19 +428,26 @@ impl<'a> Engine<'a> {
             Ok(s) => alloc::borrow::Cow::Borrowed(s),
             Err(_) => alloc::borrow::Cow::Owned(text.iter().map(|&b| if b < 0x80 { b as char } else { '?' }).collect()),
         };
-        let fonts: Vec<&Font> = stack.iter().map(|&i| &self.slots[i].font).collect();
         let size = size_64 as f32 / 64.0;
+        let qs = Style { size, ..style };
+        let inst: Vec<Font<'a>> = stack.iter().map(|&i| self.instance(i, &qs)).collect();
+        let fonts: Vec<&Font> = inst.iter().collect();
+        let extra = feature_tags(style.features);
+        let track = style.tracking * size;
         let mut pen = 0f32;
         let mut glyphs = Vec::new();
-        for (fi, g) in shape_fallback(&fonts, &s, &ShapeOptions::default(), Direction::Auto) {
+        for (fi, g) in shape_fallback_with(&fonts, &s, &ShapeOptions::default(), Direction::Auto, &extra) {
             let f = fonts[fi];
             let sc = size / f.units_per_em.max(1) as f32;
-            let adv = g.x_advance as f32 * sc;
+            let mut adv = g.x_advance as f32 * sc;
+            if track != 0.0 && g.x_advance != 0 {
+                adv += track;
+            }
             glyphs.push(Placed { face: stack[fi] as u8, glyph: g.glyph, x: pen + g.x_offset as f32 * sc, y: -(g.y_offset as f32) * sc, adv });
             pen += adv;
         }
         self.stats.runs_shaped += 1;
-        let run = Run { role: style.role, bold: style.bold, size_64, text: text.to_vec(), glyphs, width: pen };
+        let run = Run { style, size_64, text: text.to_vec(), glyphs, width: pen };
         let i = if self.runs.len() < RUN_CAP {
             self.runs.push(run);
             self.runs.len() - 1
@@ -287,34 +476,81 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The coverage bitmap of one glyph, through the byte-bounded cache.
-    fn glyph(&mut self, face: u8, glyph: u16, size: f32, sub_x: u8) -> Option<&GlyphBitmap> {
-        let key = CacheKey { font: face as u32, glyph, size_64: floor(size * 64.0 + 0.5) as u32, sub_x: sub_x % SUBPIXEL_STEPS as u8, sub_y: 0, hinting: self.hinting };
-        if self.cache.contains_key(&key) {
+    /// The atlas index for `style` (created, or the least recently used one recycled, on a miss).
+    fn atlas_for(&mut self, style: &Style) -> usize {
+        let key = AtlasKey { role: style.role, bold: style.bold, weight: style.weight, size_64: floor(style.size * 64.0 + 0.5) as u32 };
+        self.tick += 1;
+        if let Some(i) = self.atlases.iter().position(|a| a.key == key) {
+            self.atlases[i].used = self.tick;
+            return i;
+        }
+        let fresh = Atlas { key, map: BTreeMap::new(), bytes: 0, used: self.tick };
+        if self.atlases.len() < ATLAS_MAX {
+            self.atlases.push(fresh);
+            self.stats.atlases = self.atlases.len();
+            return self.atlases.len() - 1;
+        }
+        let lru = (0..self.atlases.len()).min_by_key(|&i| self.atlases[i].used).unwrap_or(0);
+        let old = core::mem::replace(&mut self.atlases[lru], fresh);
+        self.stats.evictions += old.map.len() as u64;
+        self.stats.flushes += 1;
+        self.stats.cache_bytes -= old.bytes;
+        lru
+    }
+
+    /// Make room for `cost` bytes for atlas `keep`: whole atlases go least-recently-used first, `keep` last.
+    fn make_room(&mut self, keep: usize, cost: usize) {
+        while self.stats.cache_bytes + cost > self.stats.cap_bytes {
+            let victim = (0..self.atlases.len())
+                .filter(|&i| i != keep && !self.atlases[i].map.is_empty())
+                .min_by_key(|&i| self.atlases[i].used)
+                .or_else(|| (!self.atlases[keep].map.is_empty()).then_some(keep));
+            let Some(v) = victim else { break };
+            let a = &mut self.atlases[v];
+            self.stats.evictions += a.map.len() as u64;
+            self.stats.flushes += 1;
+            self.stats.cache_bytes -= a.bytes;
+            a.map.clear();
+            a.bytes = 0;
+        }
+    }
+
+    /// The coverage bitmap of one glyph of slot `face` in `style`, through atlas `ai` (byte-bounded overall).
+    fn glyph(&mut self, ai: usize, face: u8, glyph: u16, style: &Style, sub_x: u8) -> Option<&GlyphBitmap> {
+        let w = self.weight_for(face as usize, style);
+        let key = CacheKey {
+            font: face as u32 | (w as u32) << 8,
+            glyph,
+            size_64: floor(style.size * 64.0 + 0.5) as u32,
+            sub_x: sub_x % SUBPIXEL_STEPS as u8,
+            sub_y: 0,
+            hinting: self.hinting,
+        };
+        if self.atlases[ai].map.contains_key(&key) {
             self.stats.hits += 1;
         } else {
             self.stats.misses += 1;
-            let slot = self.slots.get(face as usize)?;
+            if face as usize >= self.slots.len() {
+                return None;
+            }
             let step = 1.0 / SUBPIXEL_STEPS as f32;
             let (size_q, sx) = (key.size_64 as f32 / 64.0, key.sub_x as f32 * step);
+            let font = self.instance(face as usize, &Style { size: size_q, ..*style });
             let bm = match self.hinting {
-                crate::hint::Hinting::None => rasterize_glyph_mode(&slot.font, glyph, size_q, sx, 0.0, self.mode),
+                crate::hint::Hinting::None => rasterize_glyph_mode(&font, glyph, size_q, sx, 0.0, self.mode),
                 h => {
-                    let hinter = self.hinters.entry(face).or_insert_with(|| crate::hint::autofit::AutoHinter::new(&slot.font));
-                    crate::raster::rasterize_glyph_hinted(&slot.font, hinter, glyph, size_q, sx, 0.0, self.mode, h)
+                    let hinter = self.hinters.entry(face).or_insert_with(|| crate::hint::autofit::AutoHinter::new(&font));
+                    crate::raster::rasterize_glyph_hinted(&font, hinter, glyph, size_q, sx, 0.0, self.mode, h)
                 }
             };
             let cost = ENTRY_OVERHEAD + bm.as_ref().map_or(0, |b| b.data.len());
-            if self.stats.cache_bytes + cost > self.stats.cap_bytes && !self.cache.is_empty() {
-                self.stats.evictions += self.cache.len() as u64;
-                self.stats.flushes += 1;
-                self.cache.clear();
-                self.stats.cache_bytes = 0;
-            }
+            self.make_room(ai, cost);
             self.stats.cache_bytes += cost;
-            self.cache.insert(key, bm);
+            let a = &mut self.atlases[ai];
+            a.bytes += cost;
+            a.map.insert(key, bm);
         }
-        self.cache.get(&key).and_then(|b| b.as_ref())
+        self.atlases[ai].map.get(&key).and_then(|b| b.as_ref())
     }
 
     /// Composite `text` with its pen origin at (`x`, `baseline`) px: `put(px, py, coverage)` for every
@@ -336,8 +572,8 @@ impl<'a> Engine<'a> {
         let Some(ri) = self.shape_run(text, style) else { return 0.0 };
         let lut = if luma(ink) < 128 { &PREBLEND_DARK } else { &PREBLEND_LIGHT };
         let glyphs = core::mem::take(&mut self.runs[ri].glyphs);
+        let ai = self.atlas_for(&style);
         let iy = round(baseline) as i32;
-        let size = style.size;
         let mut pen = 0f32;
         for p in &glyphs {
             if let Some(m) = max_x {
@@ -350,7 +586,7 @@ impl<'a> Engine<'a> {
             if row.map_or(true, |r| r == iy) {
                 self.stats.glyphs_drawn += 1;
             }
-            if let Some(bm) = self.glyph(p.face, p.glyph, size, sx) {
+            if let Some(bm) = self.glyph(ai, p.face, p.glyph, &style, sx) {
                 let (w, h) = (bm.width as i32, bm.height as i32);
                 let (r0, r1) = match row {
                     Some(r) => {
@@ -392,13 +628,14 @@ impl<'a> Engine<'a> {
                 (g != 0).then_some((i, g))
             })
             .unwrap_or((first, 0));
-        let f = &self.slots[face].font;
+        let f = self.instance(face, &style);
         let adv = f.advance(gid) as f32 * style.size / f.units_per_em.max(1) as f32;
         let lut = if luma(ink) < 128 { &PREBLEND_DARK } else { &PREBLEND_LIGHT };
         let (ix, sx) = split_position(x);
         let iy = round(baseline) as i32;
         self.stats.glyphs_drawn += 1;
-        if let Some(bm) = self.glyph(face as u8, gid, style.size, sx) {
+        let ai = self.atlas_for(&style);
+        if let Some(bm) = self.glyph(ai, face as u8, gid, &style, sx) {
             let w = bm.width as i32;
             for ry in 0..bm.height as i32 {
                 for cx in 0..w {

@@ -7,6 +7,7 @@ use crate::glyf::Glyf;
 use crate::layout::{Gdef, Gpos, Gsub, Kern};
 use crate::path::{OutlineSink, Path};
 use crate::reader::{i16_at, slice, u16_at, u32_at};
+use crate::var::{Avar, Axis, Fvar, Gvar, Hvar, ItemVariationStore, MAX_AXES};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -85,6 +86,15 @@ pub struct Font<'a> {
     pub gpos: Option<Gpos<'a>>,
     pub gdef: Option<Gdef<'a>>,
     pub kern: Option<Kern<'a>>,
+    /// FONTSCRAFT (B640): the variation tables (all `None` for a static face) …
+    pub fvar: Option<Fvar<'a>>,
+    pub avar: Option<Avar<'a>>,
+    pub gvar: Option<Gvar<'a>>,
+    pub hvar: Option<Hvar<'a>>,
+    /// … `GDEF`'s ItemVariationStore (GPOS ValueRecord / Anchor device deltas) …
+    pub layout_store: Option<ItemVariationStore<'a>>,
+    /// … and this instance's normalized coordinates, one per `fvar` axis (all 0 = the default instance).
+    coords: [f32; MAX_AXES],
 }
 
 const TTCF: u32 = 0x7474_6366;
@@ -145,6 +155,12 @@ impl<'a> Font<'a> {
             gpos: None,
             gdef: None,
             kern: None,
+            fvar: None,
+            avar: None,
+            gvar: None,
+            hvar: None,
+            layout_store: None,
+            coords: [0.0; MAX_AXES],
         };
         // head
         let head = f.table_req(b"head")?;
@@ -198,7 +214,95 @@ impl<'a> Font<'a> {
         f.gsub = f.table(b"GSUB").and_then(Gsub::parse);
         f.gpos = f.table(b"GPOS").and_then(Gpos::parse);
         f.kern = f.table(b"kern").and_then(Kern::parse);
+        // FONTSCRAFT (B640): variations. A face whose `fvar` does not parse is read as static.
+        f.fvar = f.table(b"fvar").and_then(Fvar::parse);
+        if f.fvar.is_some() {
+            f.avar = f.table(b"avar").and_then(Avar::parse);
+            if matches!(f.outlines, Outlines::Glyf(_)) {
+                f.gvar = f.table(b"gvar").and_then(Gvar::parse);
+            }
+            f.hvar = f.table(b"HVAR").and_then(Hvar::parse);
+            f.layout_store = f.table(b"GDEF").and_then(gdef_var_store);
+        }
         Ok(f)
+    }
+
+    // ------------------------------------------------------------------------------------- variations (B640)
+
+    /// The face has an `fvar` table.
+    pub fn is_variable(&self) -> bool {
+        self.fvar.is_some()
+    }
+
+    /// The variation axes (empty for a static face).
+    pub fn axes(&self) -> Vec<Axis> {
+        self.fvar.map_or_else(Vec::new, |f| f.axes())
+    }
+
+    /// The face has axis `tag` (`wght`, `opsz`, `wdth`, …).
+    pub fn has_axis(&self, tag: [u8; 4]) -> bool {
+        self.fvar.and_then(|f| f.index_of(tag)).is_some()
+    }
+
+    /// This instance's normalized coordinates (one per axis, up to [`MAX_AXES`]).
+    pub fn coords(&self) -> &[f32] {
+        let n = self.fvar.map_or(0, |f| (f.axis_count as usize).min(MAX_AXES));
+        &self.coords[..n]
+    }
+
+    /// Any coordinate is off the default.
+    pub fn is_instanced(&self) -> bool {
+        self.coords.iter().any(|&c| c != 0.0)
+    }
+
+    /// Set axis `tag` to user value `value` (clamped to the axis, normalized through `avar`). Unknown axes and
+    /// static faces are ignored. Other axes keep their value.
+    pub fn set_variation(&mut self, tag: [u8; 4], value: f32) {
+        let Some(fv) = self.fvar else { return };
+        let Some(i) = fv.index_of(tag) else { return };
+        if i < MAX_AXES {
+            self.coords[i] = fv.normalize(i, value, self.avar.as_ref());
+        }
+    }
+
+    /// A copy of this face at the instance `settings` (each `(axis tag, user value)`), other axes as they are.
+    pub fn with_variations(&self, settings: &[([u8; 4], f32)]) -> Font<'a> {
+        let mut f = *self;
+        for &(t, v) in settings {
+            f.set_variation(t, v);
+        }
+        f
+    }
+
+    /// Back to the default instance.
+    pub fn reset_variations(&mut self) {
+        self.coords = [0.0; MAX_AXES];
+    }
+
+    /// The user value of axis `tag` at this instance (the inverse of the default normalization; `avar` is not
+    /// inverted, so this is exact only where its map is the identity) — for witnesses.
+    pub fn variation_value(&self, tag: [u8; 4]) -> Option<f32> {
+        let fv = self.fvar?;
+        let i = fv.index_of(tag)?;
+        let a = fv.axis(i)?;
+        let c = *self.coords.get(i)?;
+        Some(if c < 0.0 { a.default + c * (a.default - a.min) } else { a.default + c * (a.max - a.default) })
+    }
+
+    /// The device delta of a VariationIndex table at `d` (Device table with deltaFormat 0x8000) for this instance,
+    /// in font units; 0 for a hinting Device table, a static face or the default instance.
+    pub fn device_delta(&self, d: &[u8]) -> f32 {
+        if !self.is_instanced() {
+            return 0.0;
+        }
+        let Some(store) = self.layout_store else { return 0.0 };
+        if u16_at(d, 4) != Some(0x8000) {
+            return 0.0;
+        }
+        match (u16_at(d, 0), u16_at(d, 2)) {
+            (Some(outer), Some(inner)) => store.delta(outer, inner, self.coords()),
+            _ => 0.0,
+        }
     }
 
     /// A table's bytes by tag, bounds-checked against the file.
@@ -262,10 +366,34 @@ impl<'a> Font<'a> {
         v
     }
 
-    /// Advance width in font units.
+    /// Advance width in font units (at this instance: `HVAR`'s delta, else `gvar`'s phantom points, rounded).
     pub fn advance(&self, gid: u16) -> u16 {
         let i = (gid as usize).min(self.num_hmetrics as usize - 1);
-        u16_at(self.hmtx, 4 * i).unwrap_or(0)
+        let base = u16_at(self.hmtx, 4 * i).unwrap_or(0);
+        if !self.is_instanced() {
+            return base;
+        }
+        let d = self.advance_delta(gid);
+        crate::fmath::round(base as f32 + d).clamp(0.0, 65535.0) as u16
+    }
+
+    /// The advance's variation delta at this instance, fractional font units.
+    pub fn advance_delta(&self, gid: u16) -> f32 {
+        if !self.is_instanced() {
+            return 0.0;
+        }
+        if let Some(h) = &self.hvar {
+            return h.advance_delta(gid, self.coords());
+        }
+        if let (Some(gv), Outlines::Glyf(g)) = (&self.gvar, &self.outlines) {
+            if let Some(n) = g.var_point_count(gid) {
+                if let Some(d) = gv.deltas(gid, n + 4, None, self.coords()) {
+                    // Phantom points 1 and 2 (no inference: an unreferenced phantom point does not move).
+                    return d[n + 1].0 - d[n].0;
+                }
+            }
+        }
+        0.0
     }
 
     /// Left side bearing in font units.
@@ -285,7 +413,10 @@ impl<'a> Font<'a> {
             return false;
         }
         match &self.outlines {
-            Outlines::Glyf(g) => g.outline(gid, sink),
+            Outlines::Glyf(g) => match (&self.gvar, self.is_instanced()) {
+                (Some(gv), true) => g.outline_var(gid, sink, Some((gv, self.coords()))),
+                _ => g.outline(gid, sink),
+            },
             Outlines::Cff(c) => c.outline(gid, sink).is_some(),
             Outlines::None => false,
         }
@@ -347,6 +478,18 @@ impl<'a> Font<'a> {
         }
         (self.ascender, self.descender, self.line_gap)
     }
+}
+
+/// `GDEF` 1.3's ItemVariationStore (offset at byte 14 when minor >= 3).
+fn gdef_var_store(d: &[u8]) -> Option<ItemVariationStore<'_>> {
+    if u16_at(d, 0)? != 1 || u16_at(d, 2)? < 3 {
+        return None;
+    }
+    let off = u32_at(d, 14)? as usize;
+    if off == 0 {
+        return None;
+    }
+    ItemVariationStore::parse(d.get(off..)?)
 }
 
 fn parse_os2(d: &[u8]) -> Option<Os2> {

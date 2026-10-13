@@ -48,6 +48,17 @@
 //!   (7x16 -> 18x40 at 2.5 on the 220/227-ppi rMBP panels), DejaVu Sans Mono at `system.display.font_size` CSS px
 //!   x ppi / 96 capped by that cell — the face `font_size` takes effect on. Before the faces load the bitmap atlas
 //!   is drawn at the scale's integer part, centred in the same cell, so the grid never changes under the console.
+//! * `Title` (FONTSCRAFT, B640) — DESIGN-LANGUAGE §2.2's `type.title2` (Una 20/26 pt, Softy 20/28, `wght` 600,
+//!   tracking -0.75 %) from `theme::type_role`, the title-size face SETTINGSCRAFT's kit lacked; its cell is the line
+//!   height in px at the dpi scale.
+//!
+//! FONTSCRAFT (rmbp-ledger B640, R124): the faces are DESIGN-LANGUAGE §2.2's — **Inter** (variable: `wght` + `opsz`)
+//! for every proportional role (`system.display.font = "sans"`, the schema default, IS Inter), **JetBrains Mono**
+//! (variable `wght`) for the grid, and the fallback chain Inter → Noto Sans (variable) → DejaVu Sans → the bitmap
+//! atlas. `font_core::ui` instances the variable faces per draw: `wght` 400, 600 where a caller asks bold (semibold,
+//! not bold, below 20 pt), the type role's weight for `Title`; `opsz` = the size in pt (the engine's px per pt is
+//! the dpi scale). A tree without the vendored faces (an older image) loads exactly KERNELFONT's DejaVu set in the
+//! same roles. Witness: one `[font] face=… ` line after `[kfont] load`.
 
 use super::font;
 use super::framebuffer::FrameBuffer;
@@ -66,6 +77,8 @@ pub enum Face {
     Ui,
     /// KERNELFONT2: the console's dpi-scaled cell (see the module doc).
     Grid,
+    /// FONTSCRAFT (B640): `type.title2` — the title-size face (see the module doc).
+    Title,
 }
 
 impl Face {
@@ -73,7 +86,7 @@ impl Face {
     #[inline(always)]
     pub const fn bitmap(self) -> font::Face {
         match self {
-            Face::Chrome => font::Face::Chrome,
+            Face::Chrome | Face::Title => font::Face::Chrome,
             _ => font::Face::Body,
         }
     }
@@ -84,6 +97,7 @@ impl Face {
             Face::Grid => grid_cell().0,
             Face::Chrome => chrome_cell().0, // UIMETRICS (B372): the chrome cell x the dpi scale
             Face::Ui => grid_cell().0, // UIMETRICS (B372): the native windows' text cell — the body cell x the dpi scale
+            Face::Title => title_cell().0,
             _ => self.bitmap().cell_w(),
         }
     }
@@ -94,6 +108,7 @@ impl Face {
             Face::Grid => grid_cell().1,
             Face::Chrome => chrome_cell().1,
             Face::Ui => grid_cell().1,
+            Face::Title => title_cell().1,
             _ => self.bitmap().cell_h(),
         }
     }
@@ -111,6 +126,7 @@ impl Face {
             Face::Chrome => 1,
             Face::Ui => 2,
             Face::Grid => 3,
+            Face::Title => 4,
         }
     }
 }
@@ -287,6 +303,14 @@ pub fn chrome_cell() -> (usize, usize) {
     (crate::video::dpi::px_at(font::CHROME_CELL_W, s2), crate::video::dpi::px_at(font::CHROME_CELL_H, s2))
 }
 
+/// FONTSCRAFT (B640): the title face's cell — the chrome cell's width (a proportional face measures with
+/// [`advance`]) by `type.title2`'s line height in px at the dpi scale (26 pt -> 52 px at 2.0 in the Una look).
+pub fn title_cell() -> (usize, usize) {
+    let st = crate::video::theme::type_role(crate::video::theme::TypeRole::Title2, crate::video::look::is_softy());
+    let s2 = crate::video::dpi::s2();
+    (chrome_cell().0, crate::video::dpi::px_at(st.line_pt as usize, s2))
+}
+
 /// UIMETRICS: how the BITMAP fallback draws `face` inside its scaled cell — `(k, ox, oy)`: the atlas glyph
 /// magnified by the scale's integer part `k`, offset to the cell's centre. `None` when the face's cell IS the
 /// atlas cell (scale 1.0, or a face that does not scale): draw the atlas as it is.
@@ -372,12 +396,20 @@ mod tt {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use font_core::ui::{device_px, edid_ppi, Engine, Role, Style, DEFAULT_CSS_PX};
+    use crate::video::theme::{type_role, TypeRole};
     use font_core::Font;
 
-    /// (file, wire name, role, bold). The first is REQUIRED: without it the desktop stays on the bitmap face.
+    /// (file, wire name, role, bold). FONTSCRAFT (B640): Inter and JetBrains Mono are the Sans and Mono primaries;
+    /// Noto Sans and DejaVu Sans are the fallback chain after them. The DejaVu Sans / Sans Mono rows are the
+    /// STAND-INS: when Inter (JetBrains Mono) did not load they take its role, as KERNELFONT had them, and a DejaVu
+    /// mono face is read only then. A sans face (Inter or DejaVu Sans) is REQUIRED: without one the desktop stays on
+    /// the bitmap face.
     pub const FACES: &[(&str, &str, Role, bool)] = &[
-        ("DejaVuSans.ttf", "dejavu-sans", Role::Sans, false),
-        ("DejaVuSans-Bold.ttf", "dejavu-sans-bold", Role::Sans, true),
+        ("InterVariable.ttf", "inter", Role::Sans, false),
+        ("JetBrainsMono-Variable.ttf", "jetbrains-mono", Role::Mono, false),
+        ("NotoSans-Variable.ttf", "noto-sans", Role::Fallback, false),
+        ("DejaVuSans.ttf", "dejavu-sans", Role::Fallback, false),
+        ("DejaVuSans-Bold.ttf", "dejavu-sans-bold", Role::Fallback, true),
         ("DejaVuSansMono.ttf", "dejavu-mono", Role::Mono, false),
         ("DejaVuSansMono-Bold.ttf", "dejavu-mono-bold", Role::Mono, true),
         ("DejaVuSerif.ttf", "dejavu-serif", Role::Serif, false),
@@ -394,7 +426,7 @@ mod tt {
     const RETRY_MS: u64 = 2000;
     const MAX_TRIES: u32 = 15;
     const PREFS_MS: u64 = 1000;
-    /// A face file larger than this is refused (DejaVu Sans is 760 KB; the Noto script faces are smaller).
+    /// A face file larger than this is refused (Inter's variable face is 880 KB, DejaVu Sans 760 KB).
     const FACE_MAX: usize = 4 * 1024 * 1024;
     /// Bounded wait for the engine lock before a call draws with the bitmap face instead.
     const SPIN: u32 = 1 << 14;
@@ -402,8 +434,8 @@ mod tt {
     pub struct Tt {
         pub eng: Engine<'static>,
         /// Per [`super::Face`] index: style and the baseline row inside the face's cell.
-        pub styles: [(Style, f32); 4],
-        pub names: [&'static str; 4],
+        pub styles: [(Style, f32); 5],
+        pub names: [&'static str; 5],
         pub family: Role,
         pub css_px: i64,
         pub ppi: u32,
@@ -459,6 +491,7 @@ mod tt {
         match face {
             1 => super::chrome_cell(), // UIMETRICS (B372)
             2 | 3 => super::grid_cell(), // UIMETRICS: Ui lays out on the dpi-scaled cell (the native windows)
+            4 => super::title_cell(), // FONTSCRAFT (B640)
             _ => (font::CELL_W, font::CELL_H),
         }
     }
@@ -556,6 +589,9 @@ mod tt {
     /// Size the three faces: Body fits the console cell (mono); Chrome fits the bar's cell; Ui is the
     /// preference (CSS px x ppi / 96), capped by the body cell.
     pub fn restyle(t: &mut Tt) {
+        // FONTSCRAFT (B640): a variable face's `opsz` is the size in pt — device px over the dpi scale.
+        let s2 = crate::video::dpi::s2().max(1);
+        t.eng.set_px_per_pt(s2 as f32 / 2.0);
         let eng = &t.eng;
         let fam = if eng.has(t.family) { t.family } else { Role::Sans };
         let mono = if eng.has(Role::Mono) { Role::Mono } else { Role::Sans };
@@ -572,14 +608,17 @@ mod tt {
         let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
         let grid_fit = eng.fit_size(mono, Some(gw as f32), gh as f32).unwrap_or(body);
         let grid = device_px(t.css_px as f32, t.ppi).min(grid_fit).max(6.0);
-        let mk = |role: Role, size: f32, cell: usize| (Style { role, bold: false, size }, eng.baseline_in_cell(role, size, cell as f32));
-        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, gh), mk(mono, grid, gh)];
-        let nm = |r: Role| match r {
-            Role::Mono => "dejavu-mono",
-            Role::Serif => "dejavu-serif",
-            _ => "dejavu-sans",
-        };
-        t.names = [nm(mono), nm(fam), nm(fam), nm(mono)];
+        let mk = |role: Role, size: f32, cell: usize| (Style::new(role, false, size), eng.baseline_in_cell(role, size, cell as f32));
+        // FONTSCRAFT (B640): the title face — `type.title2` of the look on the glass, in px at the dpi scale.
+        let t2 = type_role(TypeRole::Title2, crate::video::look::is_softy());
+        let (title_px, title_line) = (t2.size_pt as f32 * s2 as f32 / 2.0, super::title_cell().1);
+        let title = (
+            Style::new(fam, true, title_px).with_weight(t2.weight).with_tracking(t2.tracking_em()),
+            eng.baseline_in_line(fam, title_px, title_line as f32),
+        );
+        t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, gh), mk(mono, grid, gh), title];
+        let nm = |r: Role| eng.primary_name(r, false).unwrap_or("none");
+        t.names = [nm(mono), nm(fam), nm(fam), nm(mono), nm(fam)];
     }
 
     pub fn read_face(mt: &crate::fs::vfs::MountTable, p: &str) -> Result<Vec<u8>, &'static str> {
@@ -616,10 +655,13 @@ mod tt {
         NEXT_TRY.store(now + RETRY_MS, Ordering::Relaxed);
         let n = TRIES.fetch_add(1, Ordering::Relaxed) + 1;
         let mt = crate::shell::vfs_mount_table();
-        let Some(dir) = [super::DIR, super::DIR_CARD].into_iter().find(|d| mt.stat(&alloc::format!("{}/{}", d, FACES[0].0)).is_ok()) else {
+        // FONTSCRAFT (B640): the volume holds Inter, or (an older image) DejaVu Sans.
+        let has = |d: &str, f: &str| mt.stat(&alloc::format!("{}/{}", d, f)).is_ok();
+        let Some(dir) = [super::DIR, super::DIR_CARD].into_iter().find(|d| has(d, "InterVariable.ttf") || has(d, "DejaVuSans.ttf")) else {
             if n >= MAX_TRIES {
                 GAVE_UP.store(true, Ordering::Relaxed);
-                serial_println!("[kfont] load faces=0/{} fallback=bitmap reason=absent path={}/{} tries={} (KERNELFONT: the desktop stays on the noto bitmap atlases)", FACES.len(), super::DIR, FACES[0].0, n);
+                serial_println!("[kfont] load faces=0/{} fallback=bitmap reason=absent path={}/InterVariable.ttf tries={} (KERNELFONT: the desktop stays on the noto bitmap atlases)", FACES.len(), super::DIR, n);
+                serial_println!("[font] face=font8x8 reason=absent chain=font8x8 (FONTSCRAFT: no Inter, Noto Sans or DejaVu on the volume)");
             }
             return;
         };
@@ -632,7 +674,16 @@ mod tt {
         let mut missing = String::new();
         let mut scripts_missing = String::new();
         let mut bytes = 0usize;
-        for &(file, name, role, bold) in FACES {
+        // FONTSCRAFT (B640): which primaries loaded decides the stand-ins' roles.
+        let (mut have_inter, mut have_jb) = (false, false);
+        for &(file, name, role0, bold) in FACES {
+            let mut role = role0;
+            if name.starts_with("dejavu-sans") && !have_inter {
+                role = Role::Sans; // the KERNELFONT sans stands in for Inter
+            }
+            if name.starts_with("dejavu-mono") && have_jb {
+                continue; // JetBrains Mono holds the grid: the DejaVu mono faces are not read
+            }
             let p = alloc::format!("{}/{}", dir, file);
             let why = match read_face(mt, &p) {
                 Ok(v) => {
@@ -640,6 +691,8 @@ mod tt {
                     let data: &'static [u8] = alloc::boxed::Box::leak(v.into_boxed_slice());
                     match Font::parse(data) {
                         Ok(f) => { #[cfg(feature = "selfdiag")] super::resident_note(&p, data); // LUMENFAST (B507): the parsed face's bytes, served to ring 3's SYS_PATH_READ of the same path; folded onto this line, code before comment, so no line below moves
+                            have_inter |= name == "inter";
+                            have_jb |= name == "jetbrains-mono";
                             eng.add_face(name, role, bold, f);
                             bytes += len;
                             None
@@ -670,7 +723,7 @@ mod tt {
         let family = family_of(crate::prefs::text(FONT_KEY));
         let css_px = crate::prefs::int(FONT_SIZE_KEY, 9, 32).unwrap_or(DEFAULT_CSS_PX);
         let n = eng.face_count();
-        let mut t = Tt { eng, styles: [(Style { role: Role::Sans, bold: false, size: 12.0 }, 12.0); 4], names: ["", "", "", ""], family, css_px, ppi, font_bytes: bytes, missing, scripts_missing };
+        let mut t = Tt { eng, styles: [(Style::new(Role::Sans, false, 12.0), 12.0); 5], names: ["", "", "", "", ""], family, css_px, ppi, font_bytes: bytes, missing, scripts_missing };
         restyle(&mut t);
         let fallback = if t.missing.is_empty() { String::from("none") } else { t.missing.clone() };
         let s2 = crate::video::dpi::scale_x2();
@@ -683,12 +736,53 @@ mod tt {
             family_name(family), css_px, t.names[0], t.styles[0].0.size, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size,
             crate::arch::ms().saturating_sub(t0)
         );
+        font_witness(&t, have_inter, have_jb); // FONTSCRAFT (B640): `[font] face=Inter …`
         crate::video::edidsrc::witness(ppi); // KFONTPPI (B382): edid_src, ppi, scale, cell, grid — one line
         *TT.lock() = Some(t);
         READY.store(true, Ordering::Release);
         regrid_console(); // UIMETRICS (B372): a non-default font_size at load regrids the console too
         super::EPOCH.fetch_add(1, Ordering::AcqRel); // KERNELFONT2 M4: the windows painted before this repaint once
         let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+    }
+
+    /// FONTSCRAFT (B640): the face the desktop draws with, its variable instance at the UI size, the mono face, the
+    /// fallback chain as loaded and the title role — one line:
+    /// `[font] face=Inter file=InterVariable.ttf axes=opsz:14-32,wght:100-900 ui=<px> wght=400 opsz=<pt> bold_wght=600
+    /// mono=jetbrains-mono chain=inter>noto-sans>dejavu-sans>font8x8 title=<px>/<line>@600 look=una base_pt=13
+    /// features=kern,liga,calt+tnum,zero,ss01,cv01-on-request atlases=per-role`.
+    fn font_witness(t: &Tt, have_inter: bool, have_jb: bool) {
+        let eng = &t.eng;
+        let ui = t.styles[2].0;
+        let face = if have_inter { "Inter" } else { "DejaVu" };
+        let file = if have_inter { "InterVariable.ttf" } else { "DejaVuSans.ttf" };
+        let inst = eng.primary_instance(&ui);
+        let axes: String = inst
+            .map(|f| {
+                f.axes()
+                    .iter()
+                    .map(|a| alloc::format!("{}:{}-{}", core::str::from_utf8(&a.tag).unwrap_or("?"), a.min as i32, a.max as i32))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let val = |tag: &[u8; 4]| inst.and_then(|f| f.variation_value(*tag)).map_or(String::from("-"), |v| alloc::format!("{:.1}", v));
+        let mut chain: Vec<&str> = Vec::new();
+        for s in eng.slots() {
+            if (s.role == Role::Sans || s.role == Role::Fallback) && !s.bold && !chain.contains(&s.name) {
+                chain.push(s.name);
+            }
+        }
+        chain.push("font8x8");
+        let softy = crate::video::look::is_softy();
+        let base = if softy { crate::video::theme::TYPE_BASE_PT.1 } else { crate::video::theme::TYPE_BASE_PT.0 };
+        let (ts, tl) = (t.styles[4].0, super::title_cell().1);
+        serial_println!(
+            "[font] face={} file={} axes={} ui={:.2} wght={} opsz={} bold_wght={} mono={} chain={} title={:.1}/{}@{} look={} base_pt={} features=kern,liga,calt+tnum,zero,ss01,ss02,cv01,cv05,cv08,case-on-request atlases=per-role reason={}",
+            face, file, if axes.is_empty() { "none" } else { axes.as_str() }, ui.size, val(b"wght"), val(b"opsz"), eng.bold_weight,
+            eng.primary_name(Role::Mono, false).unwrap_or("none"), chain.join(">"), ts.size, tl, ts.weight,
+            if softy { "softy" } else { "una" }, base,
+            match (have_inter, have_jb) { (true, true) => "ok", (true, false) => "jetbrains-absent", (false, true) => "inter-absent", _ => "inter-absent+jetbrains-absent" }
+        );
     }
 
     /// Re-size when `system.display.font` / `font_size` change (checked once a second off the paint paths).

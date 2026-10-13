@@ -8,7 +8,7 @@
 //! back/lookahead ignores masks, nested lookups re-index the match positions when they change the buffer length.
 
 use crate::layout::{
-    class_of, coverage_index, read_value, sub, value_size, Gdef, LayoutTable, Lookup, Value,
+    class_of, coverage_index, sub, value_size, Gdef, LayoutTable, Lookup, Value,
     LOOKUP_IGNORE_MARKS, LOOKUP_MARK_ATTACHMENT_TYPE, LOOKUP_RIGHT_TO_LEFT, LOOKUP_USE_MARK_FILTERING_SET,
 };
 use crate::reader::{i16_at, u16_at};
@@ -857,13 +857,14 @@ impl<'b, 'f> Apply<'b, 'f> {
             1 => {
                 let ci = coverage_index(sub(st, 0, 2)?, g)?;
                 let vf = u16_at(st, 4)?;
+                let font = self.font;
                 let v = match u16_at(st, 0)? {
-                    1 => read_value(st, 6, vf)?,
+                    1 => crate::layout::read_value_var(font, st, 6, vf)?,
                     2 => {
                         if ci >= u16_at(st, 6)? {
                             return None;
                         }
-                        read_value(st, 8 + ci as usize * value_size(vf), vf)?
+                        crate::layout::read_value_var(font, st, 8 + ci as usize * value_size(vf), vf)?
                     }
                     _ => return None,
                 };
@@ -874,7 +875,7 @@ impl<'b, 'f> Apply<'b, 'f> {
                 coverage_index(sub(st, 0, 2)?, g)?;
                 let flag = self.flag;
                 let j = self.seek(i, true, flag, false, 0, &mut |_| None)?;
-                let (v1, v2, has2) = crate::layout::pair_adjust(st, g, self.info[j].glyph)?;
+                let (v1, v2, has2) = crate::layout::pair_adjust_var(self.font, st, g, self.info[j].glyph)?;
                 self.apply_value(i, &v1);
                 self.apply_value(j, &v2);
                 Some(if has2 { j + 1 } else { j })
@@ -888,8 +889,21 @@ impl<'b, 'f> Apply<'b, 'f> {
         }
     }
 
-    fn anchor(d: &[u8]) -> Option<(i32, i32)> {
-        Some((i16_at(d, 2)? as i32, i16_at(d, 4)? as i32))
+    /// An Anchor table: formats 1-3; format 3's x/y Device offsets carry VariationIndex deltas at an instance
+    /// (FONTSCRAFT, B640).
+    fn anchor_var(font: &Font, d: &[u8]) -> Option<(i32, i32)> {
+        let (mut x, mut y) = (i16_at(d, 2)? as i32, i16_at(d, 4)? as i32);
+        if u16_at(d, 0)? == 3 && font.is_instanced() {
+            for (k, v) in [(6usize, &mut x), (8, &mut y)] {
+                let o = u16_at(d, k).unwrap_or(0) as usize;
+                if o != 0 {
+                    if let Some(dev) = d.get(o..) {
+                        *v += crate::fmath::round(font.device_delta(dev)) as i32;
+                    }
+                }
+            }
+        }
+        Some((x, y))
     }
 
     fn cursive(&mut self, st: &[u8], j: usize) -> Option<usize> {
@@ -902,14 +916,14 @@ impl<'b, 'f> Apply<'b, 'f> {
         if cj >= n {
             return None;
         }
-        let entry = Self::anchor(sub(st, 0, 6 + 4 * cj as usize)?)?;
+        let entry = Self::anchor_var(self.font, sub(st, 0, 6 + 4 * cj as usize)?)?;
         let flag = self.flag;
         let i = self.seek(j, false, flag, false, 0, &mut |_| None)?;
         let ci = coverage_index(cov, self.info[i].glyph)?;
         if ci >= n {
             return None;
         }
-        let exit = Self::anchor(sub(st, 0, 6 + 4 * ci as usize + 2)?)?;
+        let exit = Self::anchor_var(self.font, sub(st, 0, 6 + 4 * ci as usize + 2)?)?;
         let (exit_x, exit_y) = exit;
         let (entry_x, entry_y) = entry;
         if !self.rtl {
@@ -1029,9 +1043,9 @@ impl<'b, 'f> Apply<'b, 'f> {
         if mark_class >= class_count {
             return None;
         }
-        let mark_anchor = Self::anchor(sub(mark_array, 0, rec + 2)?)?;
+        let mark_anchor = Self::anchor_var(self.font, sub(mark_array, 0, rec + 2)?)?;
         let at = 2 + 2 * (row as usize * class_count as usize + mark_class as usize);
-        let base_anchor = Self::anchor(sub(anchors, 0, at)?)?;
+        let base_anchor = Self::anchor_var(self.font, sub(anchors, 0, at)?)?;
         let p = &mut self.pos[i];
         p.x_offset = base_anchor.0 - mark_anchor.0;
         p.y_offset = base_anchor.1 - mark_anchor.1;

@@ -2,6 +2,10 @@
 //! Simple glyphs (flags with repeats, short/same coordinate encodings) and composite glyphs (word/byte args,
 //! x/y offsets or point matching, scale / x-y scale / 2x2 transforms, SCALED/UNSCALED_COMPONENT_OFFSET),
 //! recursion bounded at depth 8. Instructions are skipped: FONTCORE does not hint.
+//!
+//! FONTSCRAFT (B640): [`Glyf::outline_var`] applies `gvar` deltas (a [`crate::var::Gvar`] and the instance's
+//! normalized coordinates) to each simple glyph's points (untouched points inferred per contour) and to each
+//! composite's component offsets, and translates by the first phantom point's delta as FreeType does.
 
 use crate::path::OutlineSink;
 use crate::reader::{u16_at, u32_at, Reader};
@@ -137,7 +141,7 @@ impl<'a> Glyf<'a> {
         Some(out)
     }
 
-    fn load(&self, gid: u16, depth: u8, pts: &mut Vec<Pt>, ends: &mut Vec<usize>) -> Option<()> {
+    fn load(&self, gid: u16, depth: u8, pts: &mut Vec<Pt>, ends: &mut Vec<usize>, var: Option<(&crate::var::Gvar, &[f32])>) -> Option<()> {
         if depth > MAX_DEPTH {
             return None;
         }
@@ -207,19 +211,34 @@ impl<'a> Glyf<'a> {
                 }
                 pts.push(Pt { x: xs[i] as f32, y: v as f32, on: f & ON_CURVE != 0 });
             }
+            if let Some((gv, coords)) = var {
+                // FONTSCRAFT: the glyph's points plus the four phantom points; untouched points inferred per contour.
+                let orig: Vec<(f32, f32)> = pts[base..].iter().map(|p| (p.x, p.y)).collect();
+                if let Some(d) = gv.deltas(gid, np + 4, Some((&orig, &my_ends)), coords) {
+                    let shift = d[np].0; // phantom point 1: the origin's horizontal delta
+                    for (k, p) in pts[base..].iter_mut().enumerate() {
+                        p.x += d[k].0 - shift;
+                        p.y += d[k].1;
+                    }
+                }
+            }
             for e in my_ends {
                 ends.push(base + e);
             }
             Some(())
         } else {
-            for c in self.components(gid)? {
+            let comps = self.components(gid)?;
+            // FONTSCRAFT: a composite's gvar points are its components' offsets, then the four phantom points.
+            let cd = var.and_then(|(gv, coords)| gv.deltas(gid, comps.len() + 4, None, coords));
+            let shift = cd.as_ref().map_or(0.0, |d| d[comps.len()].0);
+            for (ci, c) in comps.into_iter().enumerate() {
                 if c.glyph == gid {
                     return None;
                 }
                 let start = pts.len();
                 let mut sub_pts = Vec::new();
                 let mut sub_ends = Vec::new();
-                self.load(c.glyph, depth + 1, &mut sub_pts, &mut sub_ends)?;
+                self.load(c.glyph, depth + 1, &mut sub_pts, &mut sub_ends, var)?;
                 let [a, b, cc, dd] = c.transform;
                 for p in sub_pts.iter_mut() {
                     let (x, y) = (p.x, p.y);
@@ -234,7 +253,10 @@ impl<'a> Glyf<'a> {
                         dx = a * x + cc * y;
                         dy = b * x + dd * y;
                     }
-                    (dx, dy)
+                    match &cd {
+                        Some(d) => (dx + d[ci].0 - shift, dy + d[ci].1),
+                        None => (dx, dy),
+                    }
                 } else {
                     // Point matching: parent point arg1 (already loaded) meets child point arg2.
                     let pp = *pts.get(c.arg1 as usize)?;
@@ -392,9 +414,32 @@ impl<'a> Glyf<'a> {
 
     /// Emit the outline of `gid` (font units). Returns false if the glyph is malformed.
     pub fn outline(&self, gid: u16, sink: &mut impl OutlineSink) -> bool {
+        self.outline_var(gid, sink, None)
+    }
+
+    /// FONTSCRAFT (B640): the number of `gvar` points of `gid` before the phantom points — the outline's points for
+    /// a simple glyph, the component count for a composite; `None` for an empty or malformed glyph.
+    pub fn var_point_count(&self, gid: u16) -> Option<usize> {
+        let d = self.glyph_data(gid)?;
+        if d.is_empty() {
+            return Some(0);
+        }
+        let n = Reader::new(d).i16()?;
+        if n >= 0 {
+            if n == 0 {
+                return Some(0);
+            }
+            Some(u16_at(d, 10 + 2 * (n as usize - 1))? as usize + 1)
+        } else {
+            Some(self.components(gid)?.len())
+        }
+    }
+
+    /// [`Glyf::outline`] at a variation instance: `var` = the face's `gvar` and normalized coordinates.
+    pub fn outline_var(&self, gid: u16, sink: &mut impl OutlineSink, var: Option<(&crate::var::Gvar, &[f32])>) -> bool {
         let mut pts = Vec::new();
         let mut ends = Vec::new();
-        if self.load(gid, 0, &mut pts, &mut ends).is_none() {
+        if self.load(gid, 0, &mut pts, &mut ends, var).is_none() {
             return false;
         }
         let mut start = 0usize;
