@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# STRIAMETAL (SR139): the bare x86_64 build, self-contained — build-std (core + alloc: the media cores are no_std + alloc)
+# and the workspace-root bare x86_64 spec as the default target (user-aether's config). arroyo's build_user_stria_x86
+# passes the same --target explicitly and the linker script via RUSTFLAGS; build_user_stria_aarch64 passes
+# --target aarch64-base.json.
+[build]
+target = "../../x86_64-unknown-none.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

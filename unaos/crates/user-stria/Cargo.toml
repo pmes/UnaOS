@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# STRIAMETAL (LEDGER SR139): `APPS/STRIA.ELF` — Stria, UnaOS's A/V handler (CODEX §2; Amendment II: Aether renders,
+# Stria plays), as ONE ring-3 program on the image, in the LUMENAPP shape (B323, R82) and user-aether's build shape
+# (SR66): one compositor window (SYS_WIN_CREATE .. SYS_WIN_PRESENT, the INPUT_EV_* ring), linked in the ELF window
+# (user-stria-x86.ld / user-stria.ld). It reads a media file off the volume, demuxes it with demux_core, decodes the
+# pictures with the shared video cores and the sound with audio_core — the SAME no_std crates the host Stria plays
+# through (gneiss_pal's dsp arm) and the kernel's Player links (video/vplay.rs) — and presents the pictures against
+# the sound's clock (una-abi STRIAMETAL, SYS_AUDIO_*: rmbp-ledger B618) or the kernel's time when there is no sound.
+#
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent workspace never builds this
+# no_std/no_main program for the host during `./arroyo check`.
+[workspace]
+
+[package]
+name = "user-stria"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-stria"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+
+# una-abi: the syscall numbers, the INPUT_EV_* layout, the window landmarks, the STRIAMETAL audio verbs (zero bytes).
+# demux_core: MP4 / Matroska / WebM. vp8_core, vp9_core: always linked (VP8 and VP9 first, the brief's order).
+# av1_core, h264_core: linked by the default features `av1` and `h264` (the ELF fits the window with them: the sizes
+# per arch are in docs/dev/evidence/striametal/). audio_core: WAV, AIFF, FLAC, Ogg (Opus, Vorbis), MP3, AAC — the
+# container's sound through `container::open_demuxed`. font8x8: the transport bar's glyphs (the SAME grid Aether's
+# fallback and the kernel link). All of the media cores are the shared no_std seam (CODEX §2 `shared-core`).
+[dependencies]
+una-abi = { path = "../una-abi" }
+demux_core = { path = "../../libs/media/demux_core" }
+vp8_core = { path = "../../libs/media/vp8_core" }
+vp9_core = { path = "../../libs/media/vp9_core" }
+av1_core = { path = "../../libs/media/av1_core", optional = true }
+h264_core = { path = "../../libs/media/h264_core", optional = true }
+audio_core = { path = "../../libs/media/audio_core" }
+font8x8 = { version = "0.3.1", default-features = false }
+
+[features]
+default = ["av1", "h264"]
+av1 = ["dep:av1_core"]
+h264 = ["dep:h264_core"]
