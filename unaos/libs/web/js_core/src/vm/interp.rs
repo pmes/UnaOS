@@ -512,6 +512,10 @@ impl Vm {
                 }
                 Op::GetProp(k) => {
                     let o = self.pop();
+                    if let Some(v) = self.ic_get_prop(fi, pc, k, &o)? {
+                        self.stack.push(v);
+                        continue;
+                    }
                     let key = PropertyKey::from_js(self.frames[fi].code.str(k).clone());
                     let v = self.get_v(&o, &key)?;
                     self.stack.push(v);
@@ -519,6 +523,10 @@ impl Vm {
                 Op::SetProp(k) => {
                     let v = self.pop();
                     let o = self.pop();
+                    if self.ic_set_prop(fi, pc, k, &o, &v) {
+                        self.stack.push(v);
+                        continue;
+                    }
                     let key = PropertyKey::from_js(self.frames[fi].code.str(k).clone());
                     let strict = self.frames[fi].code.strict;
                     self.put_value(&o, key, v.clone(), strict)?;
@@ -527,6 +535,34 @@ impl Vm {
                 Op::GetElem => {
                     let k = self.pop();
                     let o = self.pop();
+                    // AETHERPERF array / string element fast path: a packed (non-hole) dense element or a string's
+                    // code unit at an in-range integer index; holes, sparse arrays and everything else fall back.
+                    if let Value::Number(n) = k {
+                        let i = n as u32;
+                        if i as f64 == n && i != u32::MAX {
+                            match &o {
+                                Value::Object(ob) => {
+                                    if let Kind::Array(a) = &self.heap.get(*ob).kind {
+                                        if a.dense {
+                                            if let Some(v) = a.elems.get(i as usize) {
+                                                if !v.is_empty() {
+                                                    let v = v.clone();
+                                                    self.stack.push(v);
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Value::String(s) if (i as usize) < s.len() => {
+                                    let v = Value::String(s.slice(i as usize, i as usize + 1));
+                                    self.stack.push(v);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     let v = self.get_elem(&o, &k)?;
                     self.stack.push(v);
                 }
@@ -534,6 +570,12 @@ impl Vm {
                     let v = self.pop();
                     let k = self.pop();
                     let o = self.pop();
+                    if let (Value::Object(ob), Value::Number(n)) = (&o, &k) {
+                        if self.array_store_fast(*ob, *n, &v) {
+                            self.stack.push(v);
+                            continue;
+                        }
+                    }
                     if o.is_nullish() {
                         return self.throw_type(&alloc::format!("Cannot set properties of {}", if o.is_null() { "null" } else { "undefined" }));
                     }
@@ -684,16 +726,20 @@ impl Vm {
                 Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Exp | Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
                     let b = self.pop();
                     let a = self.pop();
-                    let r = match (&a, &b, op) {
-                        (Value::Number(x), Value::Number(y), Op::Sub) => Value::Number(x - y),
-                        (Value::Number(x), Value::Number(y), Op::Mul) => Value::Number(x * y),
-                        (Value::Number(x), Value::Number(y), Op::Div) => Value::Number(x / y),
+                    // AETHERPERF: every number x number case inline (no rooting, no ToNumeric clones), with the
+                    // small-integer path inside `num_binop`; anything else is the old `arith`.
+                    let r = match (&a, &b) {
+                        (Value::Number(x), Value::Number(y)) => Value::Number(num_binop(op, *x, *y)),
                         _ => self.arith(op, &a, &b)?,
                     };
                     self.stack.push(r);
                 }
                 Op::Neg => {
                     let a = self.pop();
+                    if let Value::Number(n) = a {
+                        self.stack.push(Value::Number(-n));
+                        continue;
+                    }
                     let r = match self.to_numeric(&a)? {
                         Value::Number(n) => Value::Number(-n),
                         Value::BigInt(b) => Value::BigInt(Rc::new(BigInt::from_mag(!b.neg, b.mag.clone()))),
@@ -746,7 +792,12 @@ impl Vm {
                 Op::Eq | Op::Ne => {
                     let b = self.pop();
                     let a = self.pop();
-                    let r = self.loose_eq(&a, &b)?;
+                    // AETHERPERF: same-type number / string operands compare as IsStrictlyEqual (§7.2.14 step 1).
+                    let r = match (&a, &b) {
+                        (Value::Number(x), Value::Number(y)) => x == y,
+                        (Value::String(x), Value::String(y)) => x == y,
+                        _ => self.loose_eq(&a, &b)?,
+                    };
                     self.stack.push(Value::Bool(if op == Op::Eq { r } else { !r }));
                 }
                 Op::StrictEq => {
@@ -1293,6 +1344,58 @@ impl Vm {
         }
     }
 
+    /// AETHERPERF array store fast path: `a[i] = v` on a dense array at an in-range non-hole index (overwrite) or at
+    /// `i == length` (append). The append is OrdinarySet's outcome when no object on the prototype chain has an own
+    /// property `i` and none is exotic for indices (Proxy, TypedArray, module namespace): the walk reaches null, the
+    /// receiver gets CreateDataProperty, and an extensible array with a writable length grows by one. false = take
+    /// the old path (key conversion, `put_value`), which also covers every other case.
+    fn array_store_fast(&mut self, ob: Obj, n: f64, v: &Value) -> bool {
+        let i = n as u32;
+        if i as f64 != n || i == u32::MAX {
+            return false;
+        }
+        let d = self.heap.get_mut(ob);
+        let ext = d.extensible;
+        let len = match &mut d.kind {
+            Kind::Array(a) if a.dense => {
+                let len = a.elems.len();
+                if (i as usize) < len {
+                    if a.elems[i as usize].is_empty() {
+                        return false;
+                    }
+                    a.elems[i as usize] = v.clone();
+                    return true;
+                }
+                if (i as usize) != len || !a.len_writable {
+                    return false;
+                }
+                len
+            }
+            _ => return false,
+        };
+        if !ext {
+            return false;
+        }
+        let key = PropertyKey::Index(i);
+        let mut cur = self.heap.get(ob).proto;
+        let mut depth = 0;
+        while let Some(p) = cur {
+            depth += 1;
+            if depth > 8 || matches!(self.heap.get(p).kind, Kind::Proxy(_) | Kind::TypedArray(_) | Kind::ModuleNamespace(_)) {
+                return false;
+            }
+            if self.ordinary_get_own(p, &key).is_some() {
+                return false;
+            }
+            cur = self.heap.get(p).proto;
+        }
+        if let Kind::Array(a) = &mut self.heap.get_mut(ob).kind {
+            debug_assert!(a.elems.len() == len);
+            a.elems.push(v.clone());
+        }
+        true
+    }
+
     // ------------------------------------------------------------------------------------- call helpers
 
     fn do_call(&mut self, base: usize, argc: usize, _fi: usize) -> JsResult<()> {
@@ -1455,5 +1558,35 @@ impl Vm {
             Kind::Env(d) => d.info.names[i as usize].to_rust(),
             _ => alloc::string::String::new(),
         }
+    }
+}
+
+/// AETHERPERF small-integer path: `Value` is an enum whose only number representation is `Number(f64)` (16 bytes
+/// since the thin JsStr), so a "smi" is an integral f64 — add/sub/mul/compare are one FP instruction already, the
+/// int32 conversions of the bitwise ops take `to_int32`'s in-range cast, and `%` on two positive int32-valued
+/// operands is an integer remainder. Results are bit-identical to `arith` (vm/ops.rs) for every input.
+#[inline]
+fn num_binop(op: Op, x: f64, y: f64) -> f64 {
+    match op {
+        Op::Sub => x - y,
+        Op::Mul => x * y,
+        Op::Div => x / y,
+        Op::Mod => {
+            if (1.0..=2147483647.0).contains(&x) && (1.0..=2147483647.0).contains(&y) {
+                let (xi, yi) = (x as i32, y as i32);
+                if xi as f64 == x && yi as f64 == y {
+                    return (xi % yi) as f64;
+                }
+            }
+            ops::js_mod(x, y)
+        }
+        Op::Exp => crate::builtins::math::pow(x, y),
+        Op::BitAnd => (ops::to_int32(x) & ops::to_int32(y)) as f64,
+        Op::BitOr => (ops::to_int32(x) | ops::to_int32(y)) as f64,
+        Op::BitXor => (ops::to_int32(x) ^ ops::to_int32(y)) as f64,
+        Op::Shl => ops::to_int32(x).wrapping_shl(ops::to_uint32(y) & 31) as f64,
+        Op::Shr => (ops::to_int32(x) >> (ops::to_uint32(y) & 31)) as f64,
+        Op::UShr => (ops::to_uint32(x) >> (ops::to_uint32(y) & 31)) as f64,
+        _ => f64::NAN,
     }
 }
