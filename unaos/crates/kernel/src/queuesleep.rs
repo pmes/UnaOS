@@ -7,8 +7,14 @@
 //! the wire read `stage=pump stage_ms=28440`, `stage=queue stage_ms=3090` and `35413`. `video::lag`'s QUEUESLEEP section
 //! stamps every wait on the input path; this fixture reads those stamps over an idle window and then times one key.
 //!
-//! `tests queuesleep` (R80: only when asked; under `tests-at-boot` the window runs on its own task once the desktop is
-//! up, so the registering context is never held):
+//! `tests queuesleep` (R80: only when asked). QUEUEWEDGE (B532): the window ALWAYS runs on its own `queuesleep` task
+//! — typed, it opens at once; under `tests-at-boot`, once the desktop is up — so the verb returns in microseconds.
+//! Flight 30 ran the 30 s window ON the `shell-job` task inside `tests::run`: for 33 s it held the shell (the job's
+//! queue `busy`, so `tests loginrender` queued behind it) and the `tests` table (`tests::RUNNING`, every other `tests`
+//! refused). It held no lock and nothing the compositor takes — the `stage=comp` seconds were the headless door's own
+//! keys, routed to a console that never draws, charged `comp` until the 3 s timeout on a desktop with no pass. The typed
+//! verb prints `:: QUEUESLEEP: armed idle_s=30 on=task cpu=<n> via=tests -> SKIP reason=verdict-follows ::` and the
+//! verdict line below follows from the window task; TESTWATCH (`tests_watch.rs`) watches that task, stamped every pass.
 //!
 //! `:: QUEUESLEEP: idle_s=30 wake_ms=<n> pump_max_ms=<n> queue_max_ms=<n> pump_wait_worst=<word> -> PASS|FAIL ::
 //!  bound_ms=50 pump_what_worst=<step> xhci_poll_gap_max_ms=<n> claim_busy=<n> nap_max_ms=<n> queue_what=<..>
@@ -17,9 +23,11 @@
 //! * the window: [`IDLE_S`] seconds with NO synthetic traffic — `pump_max_ms` is the longest `usb-pump` interval (a step,
 //!   or the loop's nap past its tick), `queue_max_ms` the longest a key or press sat in the queue (finished events and
 //!   any still in flight, read directly so a router that never runs cannot hide one);
-//! * then ONE key through the synthetic door every fixture uses (`pal::push_event`): a `KeyUp(lag::PROBE_KEY)` — a key
-//!   edge no keyboard sends and every consumer ignores — and `wake_ms` is its push → the router taking it (`lag::route`),
-//!   the whole input path: the ring, the `input` task, the GUI channel, the render task;
+//! * then ONE key through the door a real key takes (`pal::push_event`, the funnel the xHCI decoder pushes its own
+//!   `KeyUp` through, drivers/xhci/mod.rs): a `KeyUp(lag::PROBE_KEY)` — a key edge no keyboard sends and every consumer
+//!   ignores — and `wake_ms` is its push → the router taking it (`lag::route`), the whole input path: the ring, the
+//!   `input` task, the GUI channel, the render task. The push is one masked ring-lock section; the wait for the route
+//!   is a bounded poll on the window task ([`WAKE_WAIT_MS`]) — nothing else ever waits on it;
 //! * PASS iff `wake_ms`, `pump_max_ms` and `queue_max_ms` are all ≤ [`BOUND_MS`]. `pump_wait_worst` names what the input
 //!   was waiting on during the worst interval (`run` = nothing: the step held only the loop).
 
@@ -46,32 +54,63 @@ pub fn selftest() {
         serial_println!(":: QUEUESLEEP: -> SKIP :: reason=no-wc (the stamps live on the x86 wc input path) bound_ms={}", BOUND_MS);
         return;
     }
-    if cfg!(feature = "tests-at-boot") {
-        spawn_window();
+    if RUNNING.load(Ordering::Acquire) {
+        serial_println!(":: QUEUESLEEP: -> SKIP :: reason=already-running bound_ms={}", BOUND_MS);
         return;
     }
-    run("tests");
+    spawn_window(cfg!(feature = "tests-at-boot"));
 }
 
+/// QUEUEWEDGE (B532): the window's own task, typed or at boot — the caller (the `shell-job` task inside `tests::run`)
+/// returns at once and holds nothing for the window's 30 s.
 #[cfg(target_arch = "x86_64")]
-fn spawn_window() {
+fn spawn_window(boot: bool) {
     let cpu = crate::arch::smp::worker_cpu(0).unwrap_or_else(crate::arch::sched::meter_current_cpu);
-    crate::arch::sched::spawn("queuesleep", boot_window, 0, cpu, crate::arch::sched::PRIO_NORMAL);
-    serial_println!(":: QUEUESLEEP: armed idle_s={} on=task cpu={} (tests-at-boot: the window opens {} ms after phase=desktop) ::", IDLE_S, cpu, SETTLE_MS);
+    crate::arch::sched::spawn("queuesleep", window_task, boot as usize, cpu, crate::arch::sched::PRIO_NORMAL);
+    if boot {
+        serial_println!(":: QUEUESLEEP: armed idle_s={} on=task cpu={} (tests-at-boot: the window opens {} ms after phase=desktop) ::", IDLE_S, cpu, SETTLE_MS);
+    } else {
+        serial_println!(
+            ":: QUEUESLEEP: armed idle_s={} on=task cpu={} via=tests -> SKIP reason=verdict-follows :: (the window runs on its own task; the shell and the tests table are free; the verdict line follows in ~{} s)",
+            IDLE_S, cpu, IDLE_S + WAKE_WAIT_MS / 1000
+        );
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn spawn_window() {}
+fn spawn_window(_boot: bool) {
+    run("tests"); // unreachable in practice (`qs_on` is x86 + `wc`); keeps one caller on every arch
+}
 
 #[cfg(target_arch = "x86_64")]
-fn boot_window(_: usize) {
-    let t0 = crate::arch::ms();
-    while crate::boot::phase() != crate::boot::Phase::Desktop && crate::arch::ms().saturating_sub(t0) < DESK_WAIT_MS {
-        crate::arch::sched::sleep_ms(100);
+fn window_task(boot: usize) {
+    if boot != 0 {
+        let t0 = crate::arch::ms();
+        while crate::boot::phase() != crate::boot::Phase::Desktop && crate::arch::ms().saturating_sub(t0) < DESK_WAIT_MS {
+            crate::arch::sched::sleep_ms(100);
+        }
+        crate::arch::sched::sleep_ms(SETTLE_MS);
     }
-    crate::arch::sched::sleep_ms(SETTLE_MS);
-    run("boot");
+    watch_arm();
+    run(if boot != 0 { "boot" } else { "tests" });
+    watch_disarm();
     crate::arch::sched::exit();
+}
+
+/// TESTWATCH (B532): the window task is watched from a sibling core while it runs, and stamps every pass.
+fn watch_arm() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    crate::tests_watch::arm("tests queuesleep");
+}
+
+fn watch_disarm() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    crate::tests_watch::disarm();
+}
+
+fn watch_stamp() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    crate::tests_watch::stamp();
 }
 
 fn sleep_ms(ms: u64) {
@@ -103,6 +142,7 @@ fn run(via: &str) {
     while crate::arch::ms().saturating_sub(t0) < IDLE_S * 1000 {
         sleep_ms(100);
         q_seen = q_seen.max(lag::qs_queue_now_us());
+        watch_stamp();
     }
     let (pump, q_us, xgap_us, busy, nap_us) = lag::qs_window();
     let q_us = q_us.max(q_seen).max(lag::qs_queue_now_us());
@@ -116,6 +156,7 @@ fn run(via: &str) {
     while done == 0 && crate::arch::ms().saturating_sub(w0) < WAKE_WAIT_MS {
         sleep_tick();
         done = lag::qs_probe_done();
+        watch_stamp();
     }
     let wake_ms = if done == 0 { None } else { Some(done.saturating_sub(t) / 1000) };
     let (pump_ms, queue_ms) = (p_us / 1000, q_us / 1000);

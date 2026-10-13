@@ -213,7 +213,7 @@ mod imp {
                         DROPPED.fetch_add(1, Relaxed);
                     }
                     o.push_back(String::from(text));
-                    JOB_LINES.fetch_add(1, Relaxed);
+                    JOB_LINES.fetch_add(1, Relaxed); crate::tests_watch::stamp(); // TESTWATCH (B532): a transcript line is the watched job's progress (LINE-NEUTRAL fold)
                     PENDING.store(true, Release);
                     return;
                 }
@@ -274,7 +274,7 @@ mod imp {
             }
             let (t0, l0, d0) = (crate::arch::ms(), JOB_LINES.load(Relaxed), DROPPED.load(Relaxed));
             let origin = if glass { crate::origin::Origin::Glass } else { crate::origin::Origin::Door };
-            let _ = crate::origin::with(origin, || crate::shell::dispatch_command(&line, &mut con, &mut pal));
+            let watched = verb(&line) == "tests"; if watched { crate::tests_watch::arm(&line); } let _ = crate::origin::with(origin, || crate::shell::dispatch_command(&line, &mut con, &mut pal)); if watched { crate::tests_watch::disarm(); } // TESTWATCH (B532 QUEUEWEDGE): a `tests` line is watched from a sibling core while it runs (LINE-NEUTRAL fold)
             serial_println!("[shelltask] done verb={} tid={} ms={} lines={} dropped={}", verb(&line), tid,
                 crate::arch::ms().saturating_sub(t0), JOB_LINES.load(Relaxed).wrapping_sub(l0), DROPPED.load(Relaxed).wrapping_sub(d0));
         }
@@ -475,7 +475,7 @@ mod imp {
             }
         }
         let v = ABORT_VERB.try_lock().map(|v| v.clone()).unwrap_or_default();
-        ABORT_TID.store(0, Release);
+        ABORT_TID.store(0, Release); if reaped { crate::tests_watch::disarm_task(tid); } // TESTWATCH (B532): a reaped job's watch ends with it; an abandoned one stays watched (LINE-NEUTRAL fold)
         ABORTS.fetch_add(1, Relaxed);
         serial_println!("[shelltask] abort verb={} tid={} after_ms={} locks_released={} queued_kept={} how={}", v, tid, after, released, kept, how);
         PENDING.store(true, Release);

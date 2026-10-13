@@ -12,3 +12,4 @@ selftest.rs                     the offscreen pal / glyph vectors
 main.rs                         the desktop clears of the boot pumps
 arch/aarch64/display_tegra.rs   the Orin format bars, the composite quadrant card, the ladder and rastglass papers
 sessionwedge.rs                 the PUMPWEDGE band: the usb-pump wedge notice painted on the panel while the wedge lasts (SESSIONWEDGE B525)
+tests_watch.rs                  the TESTWATCH band: a running test's wedge notice painted on the panel while the wedge lasts (QUEUEWEDGE B532)

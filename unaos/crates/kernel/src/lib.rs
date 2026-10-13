@@ -335,7 +335,7 @@ pub mod soundopeners;
 // SMALLFIX7 (rmbp-ledger B501): `tests smallfix7`, `tests prtscr` — flight 27's small reds. Tail statement.
 pub mod smallfix7;
 // QUEUESLEEP (rmbp-ledger B512, R103 §2): `tests queuesleep` — the input path on an idle desktop, then one key, timed. Tail statement.
-pub mod queuesleep; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod sessionwedge; // SESSIONWEDGE (rmbp-ledger B525): the usb-pump's liveness stamp, the PUMPWEDGE watch that prints without the pump, `tests sessionwedge` (LINE-NEUTRAL fold, code first)
+pub mod queuesleep; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod sessionwedge; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod tests_watch; // TESTWATCH (rmbp-ledger B532 QUEUEWEDGE): a running `tests` verb watched from a sibling core. SESSIONWEDGE (rmbp-ledger B525): the usb-pump's liveness stamp, the PUMPWEDGE watch that prints without the pump, `tests sessionwedge` (LINE-NEUTRAL fold, code first)
 #[cfg(all(feature = "midden", target_arch = "x86_64"))] pub mod middenapp; // MIDDENTWIN (LEDGER SR75): `tests midden` — APPS/MIDDEN.ELF, the ring-3 shell over midden_core, driven and read back. Tail statement, so no existing line moves.
 // AETHERMETAL (LEDGER SR66): `tests aether` — APPS/AETHER.ELF (the browser as a ring-3 program) validated, spawned, its page report read. Tail statement, so no existing line moves.
 #[cfg(feature = "aether")]
