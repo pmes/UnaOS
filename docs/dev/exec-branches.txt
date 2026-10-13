@@ -392,7 +392,7 @@ refs/heads/exec-host-aetherdebt               c83f2d13 FOLDED-BY-HAND bbb13b5e 2
 refs/heads/exec-host-aetherstorage            bb7043c7 FOLDED-BY-HAND 6780baca 2026-10-13
 refs/heads/exec-host-aetherstyle2             83551784 FOLDED-BY-HAND a16d392b 2026-10-13
 refs/heads/exec-host-netdebt                  c2ceddd8 FOLDED-BY-HAND 702f2b2c 2026-10-13
-refs/heads/exec-rmbp-aethermetal3             629bab58 FOLDED-BY-HAND ? 2026-10-13
+refs/heads/exec-rmbp-aethermetal3             629bab58 FOLDED-BY-HAND 7685c107 2026-10-13
 refs/heads/exec-rmbp-unametal2                2f3706c4 FOLDED-BY-HAND e09a3139 2026-10-13
 refs/heads/exec-rmbp-matrixcore               310bf934 FOLDED-BY-HAND c79e7088 2026-10-13
 refs/heads/exec-rmbp-smallfix9                e87a5620 FOLDED-BY-HAND 9da1718a 2026-10-13
