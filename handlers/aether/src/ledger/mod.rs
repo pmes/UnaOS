@@ -159,6 +159,12 @@ impl ApiCoverageLedger {
             .contains_key(&(category, sanitize_name(api_name)))
     }
 
+    /// AETHERDEVTOOLS (SR112) read API: every record as (category, name, call count), sorted by
+    /// category then name (the Console panel's Issues).
+    pub fn entries(&self) -> impl Iterator<Item = (ApiCategory, &str, usize)> + '_ {
+        self.missing_apis.iter().map(|((c, n), k)| (*c, n.as_str(), *k))
+    }
+
     /// Dumps the current ledger state to a file in a human-readable format.
     pub fn dump_to_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut file = File::create(path)?;
