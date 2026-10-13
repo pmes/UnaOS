@@ -2,7 +2,7 @@
 //! per-unit styles and displays, fractionalDigits; format / formatToParts / resolvedOptions. Unit text
 //! comes from the NumberFormat unit patterns (`data::UNITS`), the list from ListFormat's `unit` type.
 
-use super::number::{format_parts as num_parts, Dec, Digits, Mv, NumFmt, Notation, Style};
+use super::number::{format_parts as num_parts, Dec, Digits, Mv, NumFmt};
 use super::*;
 
 pub const UNITS: [&str; 10] =
@@ -143,21 +143,8 @@ fn to_record(vm: &mut Vm, v: &Value) -> JsResult<[f64; 10]> {
 }
 
 fn plain_nf(locale: &str, min_int: u32, max_frac: u32, min_frac: u32) -> NumFmt {
-    NumFmt {
-        locale: String::from(locale),
-        gb: false,
-        style: Style::Decimal,
-        currency: String::new(),
-        currency_display: String::from("symbol"),
-        currency_sign: String::from("standard"),
-        unit: String::new(),
-        unit_display: String::from("short"),
-        dg: Digits { min_int, ..Digits::fixed(min_frac, max_frac) },
-        notation: Notation::Standard,
-        compact_long: false,
-        grouping: Some("auto"),
-        sign: String::from("auto"),
-    }
+    let loc = loc_of(locale);
+    NumFmt::plain(loc, locale, loc.default_ns(), Digits { min_int, ..Digits::fixed(min_frac, max_frac) })
 }
 
 /// PartitionDurationFormatPattern: (parts, per part the unit it formats — "" for separators).

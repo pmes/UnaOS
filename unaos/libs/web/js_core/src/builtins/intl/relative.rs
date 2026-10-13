@@ -1,6 +1,6 @@
 //! Intl.RelativeTimeFormat (ECMA-402 §17) with the CLDR `en` relative-time patterns.
 
-use super::number::{format_parts as num_parts, Digits, Dec, Mv, NumFmt, Notation, Style};
+use super::number::{format_parts as num_parts, Digits, Dec, Mv, NumFmt};
 use super::*;
 
 #[derive(Clone, Debug)]
@@ -107,21 +107,8 @@ pub fn parts(f: &RelFmt, v: f64, unit: &'static str) -> (Vec<(String, String)>, 
         }
     }
     let past = v < 0.0 || (v == 0.0 && v.is_sign_negative());
-    let nf = NumFmt {
-        locale: f.locale.clone(),
-        gb: false,
-        style: Style::Decimal,
-        currency: String::new(),
-        currency_display: String::from("symbol"),
-        currency_sign: String::from("standard"),
-        unit: String::new(),
-        unit_display: String::from("short"),
-        dg: Digits::fixed(0, 3),
-        notation: Notation::Standard,
-        compact_long: false,
-        grouping: Some("auto"),
-        sign: String::from("never"),
-    };
+    let loc = loc_of(&f.locale);
+    let nf = NumFmt { sign: String::from("never"), ..NumFmt::plain(loc, &f.locale, loc.default_ns(), Digits::fixed(0, 3)) };
     let x = Mv::Fin(Dec::from_f64(v.abs()));
     let np = num_parts(&nf, &x);
     let (int, frac): (String, String) = np.iter().fold((String::new(), String::new()), |(mut i, mut fr), (t, s)| {

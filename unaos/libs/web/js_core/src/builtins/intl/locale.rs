@@ -232,33 +232,70 @@ pub fn strip_extensions(tag: &str) -> String {
     out.join("-")
 }
 
-/// Add Likely Subtags (UTS #35 §4.3) for the languages the data names; others keep their tag.
-fn likely(t: &LangTag) -> (String, Option<String>, Option<String>) {
-    let (sc, rg) = match t.language.as_str() {
-        "en" => ("Latn", "US"),
-        "de" => ("Latn", "DE"),
-        "fr" => ("Latn", "FR"),
-        "es" => ("Latn", "ES"),
-        "it" => ("Latn", "IT"),
-        "pt" => ("Latn", "BR"),
-        "nl" => ("Latn", "NL"),
-        "sv" => ("Latn", "SE"),
-        "pl" => ("Latn", "PL"),
-        "ru" => ("Cyrl", "RU"),
-        "uk" => ("Cyrl", "UA"),
-        "el" => ("Grek", "GR"),
-        "he" => ("Hebr", "IL"),
-        "ar" => ("Arab", "EG"),
-        "hi" => ("Deva", "IN"),
-        "ja" => ("Jpan", "JP"),
-        "ko" => ("Kore", "KR"),
-        "zh" => ("Hans", "CN"),
-        "tr" => ("Latn", "TR"),
-        "und" => ("Latn", "US"),
-        _ => return (t.language.clone(), t.script.clone(), t.region.clone()),
+/// Add Likely Subtags (UTS #35 §4.3) over CLDR's likelySubtags (`cldr::LIKELY`): the first of lang-script-region,
+/// lang-region, lang-script, lang, und-region, und-script found fills the missing language, script and region.
+pub fn add_likely(t: &LangTag) -> (String, Option<String>, Option<String>) {
+    let lang = t.language.as_str();
+    let mut keys: Vec<String> = Vec::new();
+    if let (Some(sc), Some(r)) = (&t.script, &t.region) {
+        keys.push(format!("{lang}-{sc}-{r}"));
+    }
+    if let Some(r) = &t.region {
+        keys.push(format!("{lang}-{r}"));
+    }
+    if let Some(sc) = &t.script {
+        keys.push(format!("{lang}-{sc}"));
+    }
+    keys.push(String::from(lang));
+    if lang == "und" {
+        if let Some(r) = &t.region {
+            keys.push(format!("und-{r}"));
+        }
+        if let Some(sc) = &t.script {
+            keys.push(format!("und-{sc}"));
+        }
+    }
+    for k in keys {
+        if let Some(v) = crate::cldr::likely(&k) {
+            let mut p = v.split('-');
+            let l2 = p.next().unwrap_or("und");
+            let s2 = p.next().map(String::from);
+            let r2 = p.next().map(String::from);
+            let language = if lang == "und" { String::from(l2) } else { String::from(lang) };
+            return (language, t.script.clone().or(s2), t.region.clone().or(r2));
+        }
+    }
+    (String::from(lang), t.script.clone(), t.region.clone())
+}
+
+/// Remove Likely Subtags (UTS #35 §4.4, favouring the region): the shortest of lang, lang-region, lang-script
+/// that maximizes to the same tag.
+pub fn remove_likely(t: &LangTag) -> (String, Option<String>, Option<String>) {
+    let max = add_likely(t);
+    let lang = max.0.clone();
+    let trials: [(Option<String>, Option<String>); 3] = [(None, None), (None, max.2.clone()), (max.1.clone(), None)];
+    for (sc, r) in trials {
+        let probe = LangTag { language: lang.clone(), script: sc.clone(), region: r.clone(), ..t.clone() };
+        if add_likely(&probe) == max {
+            return (lang, sc, r);
+        }
+    }
+    max
+}
+
+/// The hour cycle a locale prefers (timeData of its region, else of its likely region): h11 / h12 / h23 / h24.
+pub fn preferred_hour_cycle(t: &LangTag) -> &'static str {
+    let region = match &t.region {
+        Some(r) => r.clone(),
+        None => add_likely(t).2.unwrap_or_else(|| String::from("001")),
     };
-    let lang = if t.language == "und" { String::from("en") } else { t.language.clone() };
-    (lang, Some(t.script.clone().unwrap_or_else(|| sc.to_string())), Some(t.region.clone().unwrap_or_else(|| rg.to_string())))
+    let pref = crate::cldr::hour_pref(&region).or_else(|| crate::cldr::hour_pref("001")).map(|p| p.0).unwrap_or("H");
+    match pref {
+        "h" => "h12",
+        "K" => "h11",
+        "k" => "h24",
+        _ => "h23",
+    }
 }
 
 // ============================================================================================ Intl.Locale
@@ -376,7 +413,7 @@ fn new_loc(vm: &mut Vm, t: LangTag) -> Value {
 
 fn loc_maximize(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let mut t = this_loc(vm, ctx, "Intl.Locale.prototype.maximize")?;
-    let (l, s, r) = likely(&t);
+    let (l, s, r) = add_likely(&t);
     t.language = l;
     t.script = s;
     t.region = r;
@@ -384,16 +421,10 @@ fn loc_maximize(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 fn loc_minimize(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let mut t = this_loc(vm, ctx, "Intl.Locale.prototype.minimize")?;
-    let (_, s, r) = likely(&LangTag { script: None, region: None, ..t.clone() });
-    if t.script == s {
-        t.script = None;
-    }
-    if t.region == r {
-        t.region = None;
-    }
-    if t.language == "und" {
-        t.language = String::from("en");
-    }
+    let (l, s, r) = remove_likely(&t);
+    t.language = l;
+    t.script = s;
+    t.region = r;
     Ok(new_loc(vm, t))
 }
 fn loc_to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -457,7 +488,7 @@ fn loc_hour_cycles(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let t = this_loc(vm, ctx, "Intl.Locale.prototype.getHourCycles")?;
     let hc = match t.keyword("hc") {
         Some(h) => String::from(h),
-        None => String::from(if t.region.as_deref() == Some("GB") { "h23" } else { "h12" }),
+        None => String::from(preferred_hour_cycle(&t)),
     };
     Ok(Value::Object(vm.new_array(vec![Value::str(&hc)])))
 }
@@ -468,7 +499,8 @@ fn loc_calendars(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 fn loc_text_info(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let t = this_loc(vm, ctx, "Intl.Locale.prototype.getTextInfo")?;
-    let rtl = matches!(t.language.as_str(), "ar" | "he" | "fa" | "ur" | "yi" | "ps" | "sd" | "ug" | "dv");
+    let script = add_likely(&t).1.unwrap_or_default();
+    let rtl = matches!(script.as_str(), "Arab" | "Hebr" | "Thaa" | "Syrc" | "Nkoo" | "Adlm" | "Rohg" | "Mand" | "Samr" | "Yezi" | "Mend");
     let o = object_from(vm, vec![("direction", Value::str(if rtl { "rtl" } else { "ltr" }))]);
     Ok(Value::Object(o))
 }
