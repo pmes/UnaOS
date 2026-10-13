@@ -24,6 +24,7 @@ pub mod reflect;
 pub mod regexp;
 pub mod string;
 pub mod symbol;
+pub mod temporal;
 pub mod typedarray;
 pub mod weak;
 
