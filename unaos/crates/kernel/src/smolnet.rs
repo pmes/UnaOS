@@ -2115,18 +2115,19 @@ pub fn leased() -> bool {
     LEASED.load(Ordering::Relaxed)
 }
 
-/// USBNET6 M3: tries so far of the link-driven DHCP acquisition (bounded: a silent network is not retried forever).
+/// USBNETRX (B545): smoltcp's DHCP client has been taken off the USB link (set once, per boot).
 #[cfg(feature = "usbnet")]
 static DHCP_LINK_TRIES: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "usbnet")]
-const DHCP_LINK_MAX: u32 = 6;
 
-/// USBNET6 M3: DHCP on the USB Ethernet link. Flight 19 printed NO `SOCK-5` line on any boot: `dhcp_acquire`
-/// runs only from `init()`, and `init()` only from the ring-3 socket syscalls, while the stack on the metal is
-/// built lazily by the SOCK-2 witness with the static slirp config — so the dongle received frames for minutes
-/// and the lease was never asked for. Driven from the 5 s `net_tick::service_tick` (main loop, large stack):
-/// once the dongle's PHY reports link and no lease has landed, build the stack if needed and run the same
-/// chunked one-shot acquisition (re-armed per try), at most `DHCP_LINK_MAX` tries, one `SOCK-5` line each.
+/// USBNET6 M3 -> USBNETRX (rmbp-ledger B545): ONE DHCP client on the USB Ethernet link. Flight 32 put two on the
+/// wire at once — usbnet's tap client (`net::dhcp`, `[dhcp] discover … client=net`, 342 B, broadcast flag) and
+/// smoltcp's dhcpv4 socket pumped from here by `dhcp_acquire` every tick (304 B, flag clear, a `SOCK-5 … no offer`
+/// line each 7 s), under different xids. The tap keeps the job: it sees EVERY frame the data pass delivers before
+/// the 7-frame ring's verdict (flight 32: `qfull=18` of 64 — smoltcp never saw those), it asks for a broadcast
+/// reply, and its bound lease already reaches the stack and the status tray through `usb_lease_tick` ->
+/// `dhcp_apply` (LEASED + LEASE_IP, read by `video/status.rs`'s `tray_publish` via `lease_ip()`). So once the
+/// dongle has link this builds the stack if needed and REMOVES smoltcp's dhcpv4 socket — its DISCOVER never leaves
+/// again — and marks the one-shot `dhcp_acquire` attempted so `init()` never pumps it on this link either.
 /// The e1000 path is untouched (its DHCP stays where it was).
 #[cfg(feature = "usbnet")]
 pub fn dhcp_link_tick() {
@@ -2137,20 +2138,18 @@ pub fn dhcp_link_tick() {
     if !usbnet::is_up() || (usbnet::kind() == usbnet::KIND_AX88179 && !usbnet::link_up()) {
         return;
     }
-    if usbnet::take_rx_resumed() && DHCP_LINK_TRIES.swap(0, Ordering::Relaxed) >= DHCP_LINK_MAX {
-        serial_println!("[usbnet] dhcp link tries re-armed (rx resumed after a stall)"); // NETFRAME (B368)
-    }
-    if DHCP_LINK_TRIES.fetch_add(1, Ordering::Relaxed) >= DHCP_LINK_MAX {
+    if DHCP_LINK_TRIES.load(Ordering::Relaxed) != 0 {
         return;
     }
-    {
-        let mut g = STACK.lock();
-        if !ensure_stack(&mut g) {
-            return;
-        }
+    let mut g = STACK.lock();
+    if !ensure_stack(&mut g) {
+        return;
     }
-    DHCP_ATTEMPTED.store(false, Ordering::Release);
-    dhcp_acquire();
+    let Some(stack) = g.as_mut() else { return };
+    DHCP_ATTEMPTED.store(true, Ordering::Release);
+    let removed = stack.dhcp.take().map(|h| { let _ = stack.sockets.remove(h); }).is_some();
+    DHCP_LINK_TRIES.store(1, Ordering::Relaxed);
+    serial_println!("[dhcp] link client=net (usbnet tap) smoltcp-dhcp={} -> one client", if removed { "removed" } else { "absent" });
 }
 
 // =============================================================================

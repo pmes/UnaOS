@@ -843,6 +843,12 @@ pub mod ax {
     /// USBNET8 M7: what Linux writes once the interface is open and on every `ax88179_link_reset` (`rxctl` from
     /// `ax88179_set_multicast`): START 0x0080 | AB 0x0008 | IPE 0x0200, plus AMALL 0x0002 (Linux sets AM + the hash filter
     /// for its IPv6/mDNS groups; this driver programs no hash, so all-multicast).
+    /// USBNETRX (B545): no RX_CTL bit gates DIRECTED frames (DA == NODE_ID). Linux `ax88179_set_multicast` starts from
+    /// `AX_RX_CTL_START | AX_RX_CTL_AB | AX_RX_CTL_IPE` and, with an empty multicast list, adds nothing — commented "just
+    /// broadcast and directed"; `AX_RX_CTL_AP` 0x0020 (in `ax88179_reset`'s value, dropped here exactly as Linux drops it on
+    /// open), `AX_RX_CTL_AM` 0x0010 (hash) and `AX_RX_CTL_AMALL` 0x0002 are multicast selectors, `AX_RX_CTL_PRO` 0x0001
+    /// promiscuous; asix.h names the START bit `AX_RX_CTL_SO`. Unicast to us rides START + the NODE_ID match — the link-up
+    /// ARP probe (`ud_probe_tick`) is what proves it on the wire.
     pub const RX_CTL_OPEN: u16 = 0x028a;
     pub const RX_CTL_STOP: u16 = 0x0000;
     /// USBNET8 M7: Linux `ax88179_reset`'s provisional medium, before any link: RECEIVE_EN 0x0100 | TXFLOW_CTRLEN 0x0020 |
@@ -1708,7 +1714,14 @@ fn u8_txprobe_send(now: u64) -> u32 {
     U8_PROBE_REPLY_AT.store(0, Ordering::Relaxed);
     U8_PROBE_IP.store(ip, Ordering::Relaxed);
     if ip == 0 { return 0; }
-    let m = mac();
+    let fr = u8_probe_frame(mac(), ip);
+    U8_PROBE_AT.store(now.max(1), Ordering::Relaxed);
+    raw_tx(&fr);
+    ip
+}
+/// The RFC 5227 ARP probe for `ip` from MAC `m` (sender IP 0.0.0.0): the owner's reply is addressed to `m` —
+/// a frame UNICAST to our station address. Shared by the USBNET7 fixture and USBNETRX's link-up probe.
+fn u8_probe_frame(m: [u8; 6], ip: u32) -> [u8; 60] {
     let mut fr = [0u8; 60]; // 42 bytes of ARP, zero-padded to the Ethernet minimum
     fr[0..6].copy_from_slice(&[0xff; 6]);
     fr[6..12].copy_from_slice(&m);
@@ -1716,9 +1729,7 @@ fn u8_txprobe_send(now: u64) -> u32 {
     fr[14..22].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]); // Ethernet, IPv4, request
     fr[22..28].copy_from_slice(&m); // sender MAC; sender IP 28..32 stays 0.0.0.0 (a probe)
     fr[38..42].copy_from_slice(&ip.to_be_bytes()); // target IP; target MAC 32..38 stays zero
-    U8_PROBE_AT.store(now.max(1), Ordering::Relaxed);
-    raw_tx(&fr);
-    ip
+    fr
 }
 /// `[usbnet] txprobe arp who_has=<ip> sent=<0|1> reply_ms=<n|none> tx=<completions>`.
 fn u8_txprobe_report(ip: u32) {
@@ -2194,12 +2205,14 @@ fn ud_reset() {
     UD_PENDING.store(false, Ordering::Relaxed);
     UD_PSTATE.store(UP_NONE, Ordering::Relaxed);
     UD_PTRIES.store(0, Ordering::Relaxed);
+    ud_probe_reset(); // USBNETRX (B545)
 }
 
 /// Every data pass: with the PHY up, the client's next step when it is due; once bound, the ping's.
 fn ud_tick() {
     if !is_up() || (kind() == KIND_AX88179 && !link_up()) { return; }
     let now = crate::arch::ms().max(1);
+    ud_probe_tick(now); // USBNETRX (B545): the link-up ARP probe whose reply is unicast to our MAC
     let state = UD_STATE.load(Ordering::Relaxed);
     if state == UD_BOUND { ud_ping_tick(now); return; }
     let next = UD_NEXT.load(Ordering::Relaxed);
@@ -2303,7 +2316,7 @@ fn ud_tap(f: &[u8], queued: bool) {
         _ => { UD_C_OTHER.fetch_add(1, Ordering::Relaxed); }
     }
     let n = UD_RX_N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= UD_SHOW {
+    if n <= UD_SHOW || (dst == "ours" && UD_C_OURS.load(Ordering::Relaxed) <= UD_OURS_SHOW) { // USBNETRX: the first unicast frames to our MAC print past the 32
         let p = match (arp_op, proto) {
             (Some(op), _) => alloc::format!("arp{}", op),
             (None, Some(p)) => alloc::format!("{}", p),
@@ -2324,6 +2337,7 @@ fn ud_tap(f: &[u8], queued: bool) {
             ud_icmp_rx(f, l4);
         }
     } else if et == 0x0806 && f.len() >= 42 {
+        ud_probe_rx(f, arp_op.unwrap_or(0), dst); // USBNETRX (B545): the probe's answer, with the class it arrived as
         ud_arp_rx(f, arp_op.unwrap_or(0));
     }
 }
@@ -2475,3 +2489,65 @@ pub fn lease_pending() -> Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> {
 }
 /// The stack took (or declined) the lease.
 pub fn lease_applied() { UD_PENDING.store(false, Ordering::Relaxed); }
+
+// ── USBNETRX (rmbp-ledger B545) — TAIL-APPENDED ─────────────────────────────────────────────────────
+// Flight 32: 64 frames classified, `ours=0 udp67=0` — every frame mcast/bcast. Nothing in that session SOLICITED a
+// unicast to our MAC: smoltcp's flag-clear DISCOVERs drew no reply of any class (no udp67 even broadcast), and the
+// USBNET7 ARP probe (whose reply is unicast to us) runs only inside `tests usbnet7`, which was not typed. So "zero
+// unicast" did not separate "the RX filter drops directed frames" from "our TX never reached the LAN". This probe runs
+// on every link-up by itself: who-has a peer we have HEARD (`U8_PEER_V4`, an IPv4 source off the ring), sender IP
+// 0.0.0.0, sender MAC ours (RFC 5227) — the owner replies to our MAC. Three tries, 2 s apart, onto TXQ (we are inside
+// the data pass under the loan: never `raw_tx`).
+//   `[usbnet] txprobe link who_has=<ip> try=<k> reply_ms=<n> dst=ours -> unicast-rx ok`   TX reached the LAN AND a
+//                                                                                      directed frame passed RX_CTL
+//   `[usbnet] txprobe link who_has=<ip> tries=3 reply_ms=none -> no-reply`                 TX or directed RX is dead
+//   (`dst=bcast` on the ok line = the peer broadcast its reply: TX proven, unicast RX still unproven.)
+/// Unicast frames to our MAC printed one line each, past `UD_SHOW`.
+const UD_OURS_SHOW: u64 = 8;
+const UD_PROBE_WAIT_MS: u64 = 2_000;
+const UD_PROBE_TRIES: u32 = 3;
+static UD_PROBE_IP: AtomicU32 = AtomicU32::new(0);
+static UD_PROBE_AT: AtomicU64 = AtomicU64::new(0);
+static UD_PROBE_N: AtomicU32 = AtomicU32::new(0);
+/// The probe has a verdict this boot (answered, or out of tries).
+static UD_PROBE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Every data pass with the PHY up: the next probe try when due, the no-reply verdict after the last.
+fn ud_probe_tick(now: u64) {
+    if UD_PROBE_DONE.load(Ordering::Relaxed) { return; }
+    let at = UD_PROBE_AT.load(Ordering::Relaxed);
+    if at != 0 && now.saturating_sub(at) < UD_PROBE_WAIT_MS { return; }
+    let k = UD_PROBE_N.load(Ordering::Relaxed);
+    if k >= UD_PROBE_TRIES {
+        UD_PROBE_DONE.store(true, Ordering::Relaxed);
+        let o = UD_PROBE_IP.load(Ordering::Relaxed).to_be_bytes();
+        serial_println!("[usbnet] txprobe link who_has={}.{}.{}.{} tries={} reply_ms=none ours={} -> no-reply", o[0], o[1], o[2], o[3], k, UD_C_OURS.load(Ordering::Relaxed));
+        return;
+    }
+    let ip = U8_PEER_V4.load(Ordering::Relaxed);
+    if ip == 0 { return; } // no IPv4 peer heard yet: nobody to ask
+    if !ud_push(&u8_probe_frame(mac(), ip)) { return; } // TXQ full: next pass
+    UD_PROBE_IP.store(ip, Ordering::Relaxed);
+    UD_PROBE_AT.store(now, Ordering::Relaxed);
+    UD_PROBE_N.store(k + 1, Ordering::Relaxed);
+}
+
+/// An ARP reply (op 2) from the probed address to our MAC: the verdict, naming the class the reply came as.
+fn ud_probe_rx(f: &[u8], op: u16, dst: &str) {
+    let want = UD_PROBE_IP.load(Ordering::Relaxed);
+    if op != 2 || want == 0 || UD_PROBE_DONE.load(Ordering::Relaxed) { return; }
+    if u32::from_be_bytes([f[28], f[29], f[30], f[31]]) != want || f[32..38] != mac() { return; }
+    UD_PROBE_DONE.store(true, Ordering::Relaxed);
+    let o = want.to_be_bytes();
+    let rms = crate::arch::ms().saturating_sub(UD_PROBE_AT.load(Ordering::Relaxed));
+    serial_println!("[usbnet] txprobe link who_has={}.{}.{}.{} try={} reply_ms={} dst={} -> {}", o[0], o[1], o[2], o[3],
+        UD_PROBE_N.load(Ordering::Relaxed), rms, dst, if dst == "ours" { "unicast-rx ok" } else { "tx ok, reply not unicast" });
+}
+
+/// The slot went away: the next link-up probes again.
+fn ud_probe_reset() {
+    UD_PROBE_IP.store(0, Ordering::Relaxed);
+    UD_PROBE_AT.store(0, Ordering::Relaxed);
+    UD_PROBE_N.store(0, Ordering::Relaxed);
+    UD_PROBE_DONE.store(false, Ordering::Relaxed);
+}
