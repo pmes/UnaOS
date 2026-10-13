@@ -1771,7 +1771,7 @@ pub fn mirror_service() {
             );
         }
     }
-    serwit2_arm(); crate::serial_line::census_poll(); crate::boot_ring::arm_once();
+    serwit2_arm(); crate::serial_line::census_poll(); crate::boot_ring::arm_once(); #[cfg(feature = "logts")] crate::logts::probe_poll(); // BOOTVERDICTS2 (rmbp-ledger B616): the `[logts] source=… advancing=` probe, once per civil anchor. LINE-NEUTRAL append, before this comment.
     // SO29/DRAINCAP — the drain-cap fixture, one-shot, riding this poll for the same reason the
     // SERWIT-2 verdict does: `mirror_service`'s stated contract is IRQs unmasked, no locks held, not
     // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first

@@ -69,3 +69,39 @@ Specs. The only row on this witness is x86-witness.spec:1490, `PENDING \[seriald
 (PENDING, not REQUIRE; its `key=0x…` already does not match the current `key=printable` class word). The new word
 keeps the `-> shell` prefix, so the row's reading is unchanged. x86-wc.spec:229/230/234 pin `:: SERIALDOOR:` (the
 fixture's verdict), not this witness.
+
+## 3. LOGTS: why the stamp froze, and the probe (B564's observation; B618 for the clock)
+
+What the wire said. qemu-image26/serial.log: every stamped line before :965 reads `[07:13:52Z]` (the RTC anchor),
+every stamped line from :965 (the `[sntp]` reply; `:: SNTP: … offset_ms=29000 -> PASS ::` at :966) to the end of the
+capture reads `[07:14:21Z]` (the SNTP anchor). `LC_ALL=C grep -a -o -E '\[[0-9]{2}:[0-9]{2}:[0-9]{2}Z\]' | uniq -c`:
+623 then 3679 — two values, no other.
+
+Cause. The stamp is `logts::render_prefix` → `clock::logts_now()` (clock.rs:280): the anchor's second plus
+`monotonic()` elapsed. x86 `monotonic()` (clock.rs:58-68) is the invariant TSC only: `None` unless
+`apic::tsc_invariant()` (CPUID 0x8000_0007 EDX[8]) and `tsc_hz() != 0`. KVM's default vCPU advertises no invariant TSC
+(`[clock] source=apic hz=1996137621 invariant=0`, serial.log:3), so elapsed is 0 and every line stamps the anchor's own
+second: frozen at the RTC anchor, then at the SNTP anchor. Not a source switch at the sync: the stamp was frozen from
+the first line, and the sync only moved the anchor. The same `None` freezes `unix_now`/`try_unix_now` (the menu bar
+clock), `now` (FAT mtimes) and `uptime_secs` on such a machine — the clock fix is clock.rs's (B618, outside this arc's
+list). CLOCKCORE's `arch::ms()` (arch/x86_64/clockcore.rs:100: the TSC when invariant, else the calibrated 1 kHz tick)
+does advance on that machine.
+
+The change (logts.rs). `advance(unix)`: when `clock::mono_ticks()` is `None` (the civil clock has no counter), latch
+the anchor second with `arch::ms()` at the first line that shows it — a frozen clock repeats its anchor's second
+exactly, so a different second is a new anchor — and stamp `anchor + (arch::ms() - latch_ms) / 1000`. Lock-free
+(three atomics, one `arch::ms()`), so it holds the prefix's every-context rule. Bound: the latch lands at the first
+print after the anchor, so a stamp can lag by the gap between the anchor and that print. Where the counter exists
+(aarch64 CNTPCT, an invariant TSC) the stamp is `logts_now`'s, unchanged.
+
+The probe. `logts::probe_poll`, called from `serial_ring::mirror_service` (serial_ring.rs:1774, LINE-NEUTRAL, under
+`logts`): once per civil anchor (`clock::raw_anchor`'s second changes: RTC at boot, then each SNTP sync or `date -s`)
+it samples the stamp, waits 3 s of `arch::ms()`, samples again and prints
+`[logts] source=<counter|arch-ms> anchor=<rtc|sntp|manual> advancing=<0|1> span_ms=<n> moved_s=<n>`. No verdict word
+(a boot line, R80). Expected on the KVM boot: `[logts] source=arch-ms anchor=rtc advancing=1 span_ms=3… moved_s=3`
+and, after the sync, `[logts] source=arch-ms anchor=sntp advancing=1 …`; on the rMBP (invariant TSC):
+`source=counter`. `advancing=0` is the defect this section names.
+
+Specs. The rows that read the prefix (x86-witness.spec:140 REQUIRE and :422 FORBID on the monotonic `[  NNNms]` form,
+:434 REQUIRE / :442 FORBID on LOGWIT-1, which accepts either form's 12-column shape) are untouched: the change is in
+the civil branch only and keeps its `[HH:MM:SSZ] ` shape. No row names `[logts]`.
