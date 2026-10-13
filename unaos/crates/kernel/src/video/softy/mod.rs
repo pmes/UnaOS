@@ -75,17 +75,59 @@ pub fn selftest() {
     // 4. The caption buttons: on the topmost window with controls, minimise / maximise / close sit at the RIGHT edge.
     let btn = buttons_probe();
     let btn_ok = btn != "fail";
+    // SOFTY2 (B641) — the finish, each leg on the live desktop with Softy on the glass:
+    // 6. The Boot Camp keys (R126): the mirrored tables and the Windows-key tap, driven as a decoder drives them.
+    let (k_mac, k_pc, k_tap, k_spoil) = crate::video::keymap::softy2_selftest();
+    let keys_ok = k_mac && k_pc && k_tap && k_spoil;
+    // 7. Quick settings (the tray) and the notification calendar (the clock): a press opens each above the bar with
+    //    its shadow band, a second press closes it.
+    let fly = |which: u8| -> (bool, bool, usize) {
+        let Some((x, y)) = taskbar::probe_hot(pw, ph, which) else { return (false, false, 0) };
+        let opened = taskbar::press_at(x as i32, y as i32) && startmenu::open_kind() == which && startmenu::rect().map(|r| r.1 + r.3 < want.1).unwrap_or(false);
+        let band = startmenu::shadow_band();
+        let closed = taskbar::press_at(x as i32, y as i32) && startmenu::open_kind() == 0;
+        (opened, closed, band)
+    };
+    let (q_open, q_close, _) = if taskbar::probe_hot(pw, ph, 3).is_some() { fly(3) } else { (true, true, 0) };
+    let q_word = if taskbar::probe_hot(pw, ph, 3).is_none() { "notray" } else if q_open && q_close { "open,close" } else { "no" };
+    let (c_open, c_close, band) = fly(2);
+    // 8. The dark palette: every §2.3 token Softy names resolves, the dark elevations rise (window < raised <
+    //    overlay), ink reads over the window, and the accent is the ACCENT TABLE's fill in both modes.
+    let lum = |c: u32| ((c >> 16) & 0xFF) * 3 + ((c >> 8) & 0xFF) * 6 + (c & 0xFF);
+    let d = palette::dark;
+    use palette::Sem as S;
+    let named = palette::SEMS.iter().filter(|&&t| d(t) >> 24 == 0 && !t.name().is_empty()).count();
+    let dark_ok = named == palette::SEMS.len()
+        && lum(d(S::SurfaceWindow)) < lum(d(S::SurfaceRaised)) && lum(d(S::SurfaceRaised)) < lum(d(S::SurfaceOverlay))
+        && lum(d(S::TextPrimary)) > 4 * lum(d(S::SurfaceWindow))
+        && d(S::AccentFill) == crate::video::theme::accent();
+    let accent_ok = palette::ACCENT() == crate::video::theme::accent();
+    // 9. The caption buttons' pressed state: a latched press on the focused window's close button reads back pressed.
+    let pressed = match wm::wl_focused() {
+        Some((id, _)) => {
+            chrome::latch_for_test(Some((id, 2, true)));
+            let r = chrome::latched() == Some((id, 2, true));
+            chrome::latch_for_test(None);
+            if r { "ok" } else { "no" }
+        }
+        None => "nowindow",
+    };
+    let s2_ok = keys_ok && q_open && q_close && c_open && c_close && band > 0 && dark_ok && accent_ok && pressed != "no";
     // 5. Back to the UnaOS look: the taskbar leaves, the dock and (when it was on) the menu bar return.
     let back = look::set(was, "tests");
     wm::composite();
     let gone = taskbar::painted_rect().is_none() || was == look::Look::Softy;
     let dock_back = dock::strip_rect(pw, ph) != Some(want) || was == look::Look::Softy;
     let bar_back = menubar::strip_rect(pw, ph).is_some() == bar_was;
-    let ok = (switched || was == look::Look::Softy) && geo_ok && painted == Some(want) && open_ok && close_ok && tile_ok && btn_ok && (back || was == look::Look::Softy) && gone && dock_back && bar_back;
+    let ok = (switched || was == look::Look::Softy) && geo_ok && painted == Some(want) && open_ok && close_ok && tile_ok && btn_ok && s2_ok && (back || was == look::Look::Softy) && gone && dock_back && bar_back;
+    let yn = |b: bool| if b { "ok" } else { "no" };
     serial_println!(
-        ":: SOFTY: switch={} bar={},{},{}x{} tiles={} start={},{} tile={} buttons={} back={},{} -> {} ::",
+        ":: SOFTY: switch={} bar={},{},{}x{} tiles={} start={},{} tile={} buttons={} keys=softy-mac:{},una-pc:{},tap:{},spoil:{} quick={} calendar={},{} shadow={} dark={}/{} accent={} pressed={} back={},{} -> {} ::",
         if switched { "ok" } else { "no" }, want.0, want.1, want.2, want.3, tiles,
         if open_ok { "open" } else { "no" }, if close_ok { "close" } else { "no" }, tile_word, btn,
+        yn(k_mac), yn(k_pc), yn(k_tap), yn(k_spoil), q_word,
+        if c_open { "open" } else { "no" }, if c_close { "close" } else { "no" }, band,
+        if dark_ok { named } else { 0 }, palette::SEMS.len(), if accent_ok { "table" } else { "no" }, pressed,
         if bar_back { "menubar" } else { "no-menubar" }, if dock_back { "dock" } else { "no-dock" },
         if ok { "PASS" } else { "FAIL" }
     );

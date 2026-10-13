@@ -2492,6 +2492,7 @@ fn paint_appearance(st: &mut State) {
     txt(st, TRACK_X + 8, 4, "Selected text looks like this");
     txt2(st, LABEL_X, 5, "The accent marks the default button, the selection, the focus ring,");
     txt2(st, LABEL_X, 6, "the slider knob and the menu highlight; the highlight is text selection.");
+    txt(st, LABEL_X, 7, "Look"); seg(st, 7, &[b"UnaOS", b"Softy"], super::look::current() as usize, false); // SOFTY2 (B641): the LOOK row — Principia's `system.look`, live (`look::choose` on the press row below)
 }
 
 fn press_appearance(row: usize, cx: usize) {
@@ -2502,6 +2503,7 @@ fn press_appearance(row: usize, cx: usize) {
         0 if k < TRACK_W => { let i = (k / (TRACK_W / 3)).min(2); (0, i, "appearance_mode", ap::MODES[i]) }
         2 if k < ap::ACCENTS.len() * SW_PITCH => { let i = k / SW_PITCH; (1, i, "appearance_accent", ap::ACCENTS[i]) }
         3 if k < ap::HIGHLIGHTS.len() * SW_PITCH => { let i = k / SW_PITCH; (2, i, "appearance_highlight", ap::HIGHLIGHTS[i]) }
+        7 if k < TRACK_W => { let i = (k / (TRACK_W / 2)).min(1); super::look::choose(i); say("system_look", ap::LOOKS[i], true); repaint(); return; } // SOFTY2 (B641): Look — UnaOS | Softy (stored and applied by `look::service`, off the click router)
         _ => return,
     };
     super::appearance::choose(kind, i);

@@ -15,8 +15,9 @@
 //!
 //! PRESSES — the Start button toggles the Start menu; a tile RAISES its running window (or minimises it when it
 //! is already the focused one), else LAUNCHES the app DIRECTLY through `dock::launch_named` — the dock's own pin
-//! launch, so R115 holds here exactly as it holds on the dock; the clock toggles the calendar; the tray's icons
-//! open Settings.
+//! launch, so R115 holds here exactly as it holds on the dock; the clock toggles the NOTIFICATION CALENDAR (the
+//! notification summary over the month); the tray toggles QUICK SETTINGS (Wi-Fi, sound, battery; its gear opens
+//! Settings) — SOFTY2 (B641). Every target draws hover and, while the pointer's button is held, pressed.
 //!
 //! Paint: row-composed through `strip::paint` (`softy::paint` facade on one scanline), damage-driven by one
 //! signature exactly as the dock is. No heap on the pass: the window scan reuses a warm pool.
@@ -132,6 +133,8 @@ struct Model {
     pressed: u8,
     start_open: bool,
     cal_open: bool,
+    /// SOFTY2: the quick-settings flyout is open (the tray draws lit).
+    qs_open: bool,
 }
 
 /// The band's geometry for a model on a `pw`-wide panel (strip-local px).
@@ -154,7 +157,7 @@ impl Model {
         let mut m = Model {
             n: 0, t: [Tile::empty(); k::TILES_MAX], net: 0, vol: 0, bat: 0, clock: [b' '; 5], date: [b' '; 10],
             clock_set: false, hot: HOT_NONE, pressed: HOT_NONE, start_open: super::startmenu::open_kind() == 1,
-            cal_open: super::startmenu::open_kind() == 2,
+            cal_open: super::startmenu::open_kind() == 2, qs_open: super::startmenu::open_kind() == 3,
         };
         // Pins first, in the table's order.
         for i in 0..dock::DP_PINS.len() {
@@ -266,7 +269,8 @@ impl Model {
             }
         }
         h = strip::fnv1a_u64(h, self.net as u64 | (self.vol as u64) << 8 | (self.bat as u64) << 16 | (self.hot as u64) << 32 | (self.pressed as u64) << 40);
-        h = strip::fnv1a_u64(h, (self.start_open as u64) | (self.cal_open as u64) << 1 | (self.clock_set as u64) << 2);
+        // SOFTY2: the quick-settings state, and the appearance epoch (dark / accent) — a theme change repaints the band.
+        h = strip::fnv1a_u64(h, (self.start_open as u64) | (self.cal_open as u64) << 1 | (self.clock_set as u64) << 2 | (self.qs_open as u64) << 3 | (crate::video::theme::epoch() as u64) << 32);
         for &b in self.clock.iter().chain(self.date.iter()) {
             h = strip::fnv1a(h, b);
         }
@@ -279,14 +283,14 @@ impl Model {
 pub(super) fn start_mark(s: &mut Surf, x: usize, y: usize, d: usize) {
     let half = d / 2;
     let (cx, cy) = (x + half, y + half);
-    let light = p::blend(k::ACCENT, k::ON_ACCENT, 90);
+    let light = p::blend(k::ACCENT(), k::ON_ACCENT, 90);
     for yy in y..y + d {
         let dy = if yy >= cy { yy - cy } else { cy - yy };
         let hw = half.saturating_sub(dy); // the diamond's half-width at this row
         if hw == 0 {
             continue;
         }
-        p::fill(s, (cx - hw, yy, hw, 1), k::ACCENT, 255);
+        p::fill(s, (cx - hw, yy, hw, 1), k::ACCENT(), 255);
         p::fill(s, (cx, yy, hw, 1), light, 255);
     }
     p::hairline_h(s, cx - half / 2, cy - half / 3, half, k::ON_ACCENT, 120);
@@ -305,7 +309,7 @@ pub(super) fn tile_icon(s: &mut Surf, pin: u8, title: &[u8], x: usize, y: usize,
 }
 
 /// Our tray glyphs, `d` square at `(x, y)` in `ink`.
-fn glyph_net(s: &mut Surf, x: usize, y: usize, d: usize, up: bool, ink: u32) {
+pub(super) fn glyph_net(s: &mut Surf, x: usize, y: usize, d: usize, up: bool, ink: u32) {
     // Four rising bars; a down link draws them faint with a slash.
     let a = if up { 255 } else { 90 };
     let bw = (d / 6).max(1);
@@ -318,7 +322,7 @@ fn glyph_net(s: &mut Surf, x: usize, y: usize, d: usize, up: bool, ink: u32) {
     }
 }
 
-fn glyph_vol(s: &mut Surf, x: usize, y: usize, d: usize, level: u8, muted: bool, ink: u32) {
+pub(super) fn glyph_vol(s: &mut Surf, x: usize, y: usize, d: usize, level: u8, muted: bool, ink: u32) {
     let t = k::px(1);
     let (bx, by, bh) = (x + d / 8, y + d * 3 / 8, d / 4);
     p::fill(s, (bx, by, d / 6, bh + 1), ink, 255);
@@ -345,37 +349,37 @@ fn glyph_vol(s: &mut Surf, x: usize, y: usize, d: usize, level: u8, muted: bool,
     }
 }
 
-fn glyph_bat(s: &mut Surf, x: usize, y: usize, d: usize, pct: u16, charging: bool, ink: u32) {
+pub(super) fn glyph_bat(s: &mut Surf, x: usize, y: usize, d: usize, pct: u16, charging: bool, ink: u32) {
     let (w, h) = (d - d / 8, d / 2);
     let (bx, by) = (x, y + (d - h) / 2);
     p::stroke_rrect(s, (bx, by, w, h), k::px(2), ink, 255);
     p::fill(s, (bx + w, by + h / 3, (d / 8).max(1), h / 3), ink, 255);
     let inner = w.saturating_sub(4 * k::px(1));
     let fw = inner * pct.min(100) as usize / 100;
-    let col = if pct < 15 && !charging { k::CLOSE_HOT } else { ink };
+    let col = if pct < 15 && !charging { k::CLOSE_HOT() } else { ink };
     p::fill(s, (bx + 2 * k::px(1), by + 2 * k::px(1), fw, h.saturating_sub(4 * k::px(1))), col, 255);
     if charging {
         let mx = bx + w / 2;
-        p::line(s, mx + d / 10, by - 1, mx - d / 10, by + h / 2, k::px(1), k::ACCENT, 255);
-        p::line(s, mx - d / 10, by + h / 2, mx + d / 10, by + h + 1, k::px(1), k::ACCENT, 255);
+        p::line(s, mx + d / 10, by - 1, mx - d / 10, by + h / 2, k::px(1), k::ACCENT(), 255);
+        p::line(s, mx - d / 10, by + h / 2, mx + d / 10, by + h + 1, k::px(1), k::ACCENT(), 255);
     }
 }
 
 /// Compose strip row `j` of the band.
 fn paint_row(out: &mut [u32], m: &Model, l: &Layout, w: usize, j: usize) {
     let mut s = Surf::row(out, w, j);
-    p::fill(&mut s, (0, j, w, 1), k::SURFACE, 255);
-    p::hairline_h(&mut s, 0, 0, w, k::STROKE, k::STROKE_A);
+    p::fill(&mut s, (0, j, w, 1), k::SURFACE(), 255);
+    p::hairline_h(&mut s, 0, 0, w, k::STROKE(), k::STROKE_A());
     // The tiles: Start, then the apps.
     for i in 0..=m.n {
         let x = l.x0 + i * l.pitch;
         let hot = if i == 0 { HOT_START } else { i as u8 };
         let lit = if i == 0 { m.start_open } else { m.t[i - 1].focused };
-        let back = if m.pressed == hot { Some((k::PRESS, k::PRESS_A)) } else if m.hot == hot { Some((k::HOVER, k::HOVER_A)) } else if lit { Some((k::HOVER, k::HOVER_A / 2)) } else { None };
+        let back = if m.pressed == hot { Some((k::PRESS(), k::PRESS_A())) } else if m.hot == hot { Some((k::HOVER(), k::HOVER_A())) } else if lit { Some((k::HOVER(), k::HOVER_A() / 2)) } else { None };
         if let Some((c, a)) = back {
             p::rrect(&mut s, (x, l.ty, l.tw, l.th), k::px(k::TILE_R), c, a);
             if m.hot == hot || lit {
-                p::stroke_rrect(&mut s, (x, l.ty, l.tw, l.th), k::px(k::TILE_R), k::STROKE, k::STROKE_A / 2);
+                p::stroke_rrect(&mut s, (x, l.ty, l.tw, l.th), k::px(k::TILE_R), k::STROKE(), k::STROKE_A() / 2);
             }
         }
         let ic = k::px(k::TILE_ICON);
@@ -390,32 +394,36 @@ fn paint_row(out: &mut [u32], m: &Model, l: &Layout, w: usize, j: usize) {
             let pw = k::px(if t.focused { k::PIP_W_ON } else { k::PIP_W });
             let ph = k::px(k::PIP_H);
             let py = l.ty + l.th - ph - k::px(1);
-            p::rrect(&mut s, (x + (l.tw - pw) / 2, py, pw, ph), ph / 2, if t.focused { k::ACCENT } else { k::PIP }, 255);
+            p::rrect(&mut s, (x + (l.tw - pw) / 2, py, pw, ph), ph / 2, if t.focused { k::ACCENT_INK() } else { k::PIP() }, 255);
         }
     }
     // The tray group.
     if l.tray_n > 0 {
-        if m.hot == HOT_TRAY {
-            p::rrect(&mut s, (l.tray_x, l.ty, l.tray_w, l.th), k::px(k::TILE_R), k::HOVER, k::HOVER_A);
+        if m.pressed == HOT_TRAY {
+            p::rrect(&mut s, (l.tray_x, l.ty, l.tray_w, l.th), k::px(k::TILE_R), k::PRESS(), k::PRESS_A());
+        } else if m.hot == HOT_TRAY || m.qs_open {
+            p::rrect(&mut s, (l.tray_x, l.ty, l.tray_w, l.th), k::px(k::TILE_R), k::HOVER(), if m.qs_open && m.hot != HOT_TRAY { k::HOVER_A() / 2 } else { k::HOVER_A() });
         }
         let (ic, ig) = (k::px(k::TRAY_ICON), k::px(k::TRAY_GAP));
         let mut x = l.tray_x + k::px(k::TRAY_PAD);
         let y = l.ty + (l.th - ic) / 2;
         if m.net != 0 {
-            glyph_net(&mut s, x, y, ic, m.net == 2, k::TEXT);
+            glyph_net(&mut s, x, y, ic, m.net == 2, k::TEXT());
             x += ic + ig;
         }
         if m.vol != 0 {
-            glyph_vol(&mut s, x, y, ic, (m.vol & 0x7F) - 1, m.vol & 0x80 != 0, k::TEXT);
+            glyph_vol(&mut s, x, y, ic, (m.vol & 0x7F) - 1, m.vol & 0x80 != 0, k::TEXT());
             x += ic + ig;
         }
         if m.bat != 0 {
-            glyph_bat(&mut s, x, y, ic, (m.bat & 0x7FFF) - 1, m.bat & 0x8000 != 0, k::TEXT);
+            glyph_bat(&mut s, x, y, ic, (m.bat & 0x7FFF) - 1, m.bat & 0x8000 != 0, k::TEXT());
         }
     }
     // The clock: time over date, right-aligned in its box.
-    if m.hot == HOT_CLOCK || m.cal_open {
-        p::rrect(&mut s, (l.clock_x, l.ty, l.clock_w, l.th), k::px(k::TILE_R), k::HOVER, if m.cal_open { k::HOVER_A / 2 } else { k::HOVER_A });
+    if m.pressed == HOT_CLOCK {
+        p::rrect(&mut s, (l.clock_x, l.ty, l.clock_w, l.th), k::px(k::TILE_R), k::PRESS(), k::PRESS_A());
+    } else if m.hot == HOT_CLOCK || m.cal_open {
+        p::rrect(&mut s, (l.clock_x, l.ty, l.clock_w, l.th), k::px(k::TILE_R), k::HOVER(), if m.cal_open { k::HOVER_A() / 2 } else { k::HOVER_A() });
     }
     let face = Face::Ui;
     let ch = face.cell_h();
@@ -423,12 +431,12 @@ fn paint_row(out: &mut [u32], m: &Model, l: &Layout, w: usize, j: usize) {
     if m.clock_set {
         let mid = l.ty + l.th / 2;
         let tw = p::text_w(&m.clock, false, face);
-        p::text(&mut s, right - tw, mid.saturating_sub(ch), tw + 1, &m.clock, k::TEXT, false, face);
+        p::text(&mut s, right - tw, mid.saturating_sub(ch), tw + 1, &m.clock, k::TEXT(), false, face);
         let dw = p::text_w(&m.date, false, face);
-        p::text(&mut s, right - dw, mid, dw + 1, &m.date, k::TEXT, false, face);
+        p::text(&mut s, right - dw, mid, dw + 1, &m.date, k::TEXT(), false, face);
     } else {
         let tw = p::text_w(b"--:--", false, face);
-        p::text(&mut s, right - tw, l.ty + (l.th - ch) / 2, tw + 1, b"--:--", k::TEXT_2, false, face);
+        p::text(&mut s, right - tw, l.ty + (l.th - ch) / 2, tw + 1, b"--:--", k::TEXT_2(), false, face);
     }
 }
 
@@ -474,6 +482,8 @@ pub fn compose() -> bool {
     let mut m = m;
     let l = m.layout(pw);
     m.hot = hover(&m, &l, r, cx, cy);
+    // SOFTY2: the pressed state, latched from the pointer's level (it was drawn but never set).
+    m.pressed = if crate::pal::cursor::button_down() { m.hot } else { HOT_NONE };
     announce(&m, r.3);
     let sig = m.signature(r);
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {
@@ -536,7 +546,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     let l = m.layout(pw);
     let hot = if on_bar { m.hit(&l, px - r.0, py - r.1) } else { HOT_NONE };
     // An open flyout closes on any press outside it — unless that press is its own toggle, which toggles it.
-    if open != 0 && !((open == 1 && hot == HOT_START) || (open == 2 && hot == HOT_CLOCK)) {
+    if open != 0 && !((open == 1 && hot == HOT_START) || (open == 2 && hot == HOT_CLOCK) || (open == 3 && hot == HOT_TRAY)) {
         super::startmenu::close("outside");
     }
     if !on_bar {
@@ -546,12 +556,13 @@ pub fn press_at(x: i32, y: i32) -> bool {
         HOT_START => {
             super::startmenu::toggle(1, "button");
         }
+        // SOFTY2: the clock opens the notification calendar — the month with the notification summary over it.
         HOT_CLOCK => {
             super::startmenu::toggle(2, "button");
         }
+        // SOFTY2: the tray opens QUICK SETTINGS (sound, Wi-Fi, battery); its gear launches Settings.
         HOT_TRAY => {
-            let how = dock::launch_named("settings").unwrap_or("absent");
-            serial_println!("[softy] tray press -> settings launch {}", how);
+            super::startmenu::toggle(3, "button");
         }
         HOT_NONE => {}
         i => tile_press(&m.t[i as usize - 1]),
@@ -603,4 +614,23 @@ pub fn probe_pin(i: usize) -> Option<usize> {
         Model::read(&rows[..n])
     };
     if i == 0 || i > m.n || m.t[i - 1].pin == NO_PIN { None } else { Some(m.t[i - 1].pin as usize) }
+}
+
+/// SOFTY2 fixture: the panel centre of the clock (`which` = 2, it opens the calendar) or the tray group (3, quick
+/// settings) on a `pw` x `ph` panel, from the painter's own model and layout; `None` when the band has no such
+/// target (no tray item is known yet).
+pub fn probe_hot(pw: usize, ph: usize, which: u8) -> Option<(usize, usize)> {
+    let r = rect(pw, ph)?;
+    let m = {
+        let mut rows = ROWS.lock();
+        let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+        Model::read(&rows[..n])
+    };
+    let l = m.layout(pw);
+    let y = r.1 + l.ty + l.th / 2;
+    match which {
+        2 => Some((r.0 + l.clock_x + l.clock_w / 2, y)),
+        3 if l.tray_w > 0 => Some((r.0 + l.tray_x + l.tray_w / 2, y)),
+        _ => None,
+    }
 }
