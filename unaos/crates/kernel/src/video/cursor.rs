@@ -3789,7 +3789,7 @@ pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> Co
     for w in 0..MASK_WORDS {
         ov.covered.0[w] |= mine.0[w];
     }
-    out.taken = taken;
+    out.taken = taken; #[cfg(all(target_arch = "x86_64", feature = "wc"))] ghost_note_composed(&plan); // TWOCURSORS (B542) — publish the box this layer just carried an arrow for, lock-free, so a tail that cannot claim the overlay still knows where an orphan can stand. ⚠ SAME-LINE fold, line-NEUTRAL; block at the file tail.
     out.missed = missed;
     out
 }
@@ -3840,7 +3840,7 @@ pub fn adopt_overlay() {
     // CURSOR-6 — swap, not load: the flag is per-pass state and the tail is the one place that can
     // retire it. Reading it without clearing would make one dropped clear poison every later pass;
     // clearing it without reading would lose the only evidence the pass produced.
-    let uncover_lost = UNCOVER_LOST.swap(false, Ordering::Relaxed);
+    let uncover_lost = UNCOVER_LOST.swap(false, Ordering::Relaxed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let ghost = GHOST_COMPOSED.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut ghost_box: Option<(usize, usize, usize, usize)> = None; // TWOCURSORS (B542) — take this pass's composed-box mirror; `ghost_box` is the orphan rect owed a repair at the tail. ⚠ SAME-LINE fold, line-NEUTRAL.
     let mut sp = match claim() {
         Ok(l) => l,
         Err(_) => {
@@ -3869,7 +3869,7 @@ pub fn adopt_overlay() {
                 }
                 Err(_) => owe_overlay_close(),
             }
-            return;
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))] ghost_on_refuse(ghost); return; // TWOCURSORS (B542) — the sprite claim was refused and the coverage install discarded, so an arrow the layer delivered has no owner: damage its box so the window re-presents over it. ⚠ SAME-LINE fold, line-NEUTRAL.
         }
     };
     let restored = {
@@ -3924,7 +3924,7 @@ pub fn adopt_overlay() {
                 // cut suppressed `adopt_incoh` whenever a lost clear coincided, which would have hidden
                 // a real CURSOR-5 incoherence behind a CURSOR-6 one — a silent counter, which is exactly
                 // the failure mode that made P65v2 unreadable.
-                let coherent = c5_coherent && !uncover_lost;
+                let coherent = c5_coherent && !uncover_lost; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { ghost_box = ghost_restore(&ov, c5_coherent); } // TWOCURSORS (B542) — an install about to be DECLINED for a session that no longer describes the live sprite: take back the arrow the layer delivered, colour-guarded, from the layer save, before the refresh below draws the live one. ⚠ SAME-LINE fold, line-NEUTRAL.
                 if coherent {
                     // Install the layer-derived save-under for every pixel a present delivered. Those
                     // pixels are on the panel already — this is bookkeeping, not painting, which is what
@@ -3974,7 +3974,7 @@ pub fn adopt_overlay() {
             // coverage install is discarded — CURSOR-9's documented residual, the same one WEDGE-9's
             // refusal at the sprite claim above accepts.
             Err(_) => {
-                owe_overlay_close();
+                owe_overlay_close(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { ghost_box = ghost_refused_box(ghost); } // TWOCURSORS (B542) — overlay refused: no `ov.saved` to restore from, so the composed box is handed to `repair`. ⚠ SAME-LINE fold, line-NEUTRAL.
                 false
             }
         };
@@ -4025,7 +4025,7 @@ pub fn adopt_overlay() {
     if let Some((px, py)) = armed_at {
         serial_println!("[cursor] armed x={} y={}", px, py);
     }
-    repair(restored);
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] repair(ghost_box); repair(restored); // TWOCURSORS (B542) — the orphan rect (if any) handed back like a restored one: windows damaged, desktop rect queued. ⚠ SAME-LINE fold, line-NEUTRAL.
 }
 
 /// CURSOR-4 — put back the sprite pixels that are still off the panel, saving each from the FRONT.
@@ -4833,7 +4833,7 @@ pub(super) fn ptrpaint_rollup(scope: &str) {
     serial_println!(
         "[ptrpaint] sprite-nowait scope={} nowait_ok={} nowait_owed={} owed_cashed={} owed_cashed_us_max={} bounded_entries={} owing={} -> {}",
         scope, ok, owed, cashed, max_us, entries, u8::from(standing), verdict
-    );
+    ); ghost_rollup(scope); // TWOCURSORS (B542) — `[cursorghost]` chained off `[ptrpaint]`, the same pass's contention story one decision further on. ⚠ SAME-LINE fold, line-NEUTRAL; this fn is already x86-wc-witness gated.
 }
 
 /// PTRPAINT — the fixture's one-shot latch, and the two guards that make its verdict mean something.
@@ -4954,4 +4954,198 @@ pub fn set_crosshair(on: bool) {
 /// SHOTREGION M1 — is the crosshair the current shape (the fixture's witness).
 pub fn crosshair() -> bool {
     CROSSHAIR.load(Ordering::Relaxed)
+}
+
+// =================================================================================================
+// TWOCURSORS — AN ARROW THE OVERLAY DELIVERED IS TAKEN BACK WHEN ITS INSTALL IS DECLINED (x86 `wc`,
+// rmbp-ledger B542)
+// =================================================================================================
+//
+// Appended at the TAIL of this file for the reason the PANELREFUSE, CURSORBG and PTRPAINT blocks above
+// give: `cursor.rs` is compiled into the knob-off image on both arches and panic `Location` records
+// embed line numbers. Everything above this block changed by SAME-LINE folds only (`compose_into`'s
+// `out.taken` line, five lines of `adopt_overlay`, and `ptrpaint_rollup`'s closing `);`), each one
+// BEFORE its line's first `//` (LEDGER P7) and gated `all(target_arch = "x86_64", feature = "wc")`, so
+// the knob-off image cannot move.
+//
+// # The defect — flight 32, boot 2, Aether open: "there's 2 mouse cursors"
+//
+// Every painter in this module that draws the arrow on the PANEL holds the sprite loan, and a refused
+// loan never draws: `repaint_nowait`/`repaint_deferred`/`ensure_drawn` take `owe_repaint()` and the
+// arrow STAYS PUT at its last position until a claim lands (`cash_owed_sprite`, a composite tail). One
+// image, late. That is the policy for the module's own sprite and this block keeps it.
+//
+// There is exactly ONE painter that puts an arrow on the glass WITHOUT the sprite loan: CURSOR-3's
+// `compose_into`, which paints the PLAN's arrow into a window's staged layer under the OVERLAY loan
+// alone, and the window's row copies deliver it. Its guard is `live_epoch() != plan.epoch`, which
+// EPOCH's own doc says NARROWS the window and does not close it: a compose that read the epoch just
+// before another core's full undraw/redraw (the input band's `repaint_nowait`, the claim that made
+// `[wedge9] refused=` climb) paints the arrow at the OLD origin, and the present lands it AFTER that
+// core's undraw has restored the old box. The panel now holds two arrows: the live sprite at the new
+// origin, and the plan's at the old one.
+//
+// EPOCH's doc promised the tail closes the residual — "a compose that slipped through on a stale read
+// is caught at the tail and settled by a whole-sprite `refresh_locked` instead of by an install". It is
+// caught, and it is not settled: `adopt_overlay` DECLINES the install (`[cursor5] adopt_incoh=`), closes
+// the session with `covered.reset()`, and runs `refresh_locked` — which restores the LIVE sprite's box,
+// not the PLAN's. Nobody owns the plan's arrow any more: no `saved`, no damage, no handback. Over a
+// window that does not re-present (a static Aether page) it stands on the glass indefinitely. The same
+// orphan is left by the two refused tails: a refused SPRITE claim (`ov.covered.reset(); owe_repaint()`,
+// and the owed refresh again restores only the live box) and a refused OVERLAY claim
+// (`owe_overlay_close`, the session's coverage discarded unread).
+//
+// # The fix — the tail takes back what the layer delivered
+//
+// * **Declined with both loans held** ([`ghost_restore`], `adopt_overlay`'s coherence line): for every
+//   COVERED pixel at the SESSION's geometry, if the panel still holds the arrow's colour, put back
+//   `ov.saved[i]` — the window's own freshly composed pixel, captured by `compose_into` before it
+//   painted the arrow, i.e. exactly what the present meant the panel to hold. Colour-guarded on the
+//   module's standing rule, and run BEFORE the `refresh_locked` that every declined tail takes, so a
+//   pixel the live sprite shares is handled by that refresh's own guard (skipped on undraw, re-saved
+//   from the now-correct front on draw) — which also defuses the self-capture `[cursor5] selfsave=`
+//   counts when the live draw read the plan's arrow as its under-content.
+// * **Declined on a refused claim** ([`ghost_on_refuse`], [`ghost_refused_box`]): no pixel is written
+//   without the sprite loan — writing beside a holder that is mid restore -> save -> draw is the race
+//   the loan exists to prevent. The composed box (published lock-free by [`ghost_note_composed`], the
+//   only source a tail with no overlay loan has) is handed to [`repair`] instead: every window under
+//   it is damaged, so its next present overwrites the orphan from its source surface.
+// * Every orphan's box goes to [`repair`] in both arms — the colour guard's residual (a pixel another
+//   painter took) is closed the way every other restore in this module closes it.
+//
+// # Why the CURSORBG rect read 188x236+691+1360 and not 18x18
+//
+// `[cursor] restore rect=` prints the rect `restore_note` QUEUED, and that is the bounding union of the
+// current sprite box and `CB_PENDING` — every handback the `REPAIR_MIN_MS` floor deferred since the last
+// queued one (`deferred=610` of `n=1278`). Each member is one 18x18 sprite box; the union of a pointer
+// sweep's boxes is the sweep's bounding box — x 691..879, y 1360..1596, the path down toward the dock
+// strip (`[dock] press at (618,1699)`, Peter launching Aether). A window-sized rect from a sprite-sized
+// producer, by design ("a deferral is not a drop"), over `src=flat` desktop where the queued present
+// only re-publishes the desktop under a withheld sprite box. It is a symptom of the contention, not the
+// second image.
+//
+// # The witness
+//
+// `[cursorghost] orphan scope=… declined=<n> restored_px=<n> restored_on_refuse=<n> damaged=<n> -> …`,
+// chained off `[ptrpaint]` on `[wedge9]`'s cadence. `declined` — tails that declined an install with
+// arrow pixels delivered; `restored_px` — pixels taken back from the layer save; `restored_on_refuse` —
+// refused tails whose composed box was handed to `repair`; `damaged` — orphan boxes handed back, which
+// must equal `declined + restored_on_refuse`. `QUIET` when no orphan was ever made; `RESTORED` when
+// every one was handed back; `LOST` otherwise.
+
+/// TWOCURSORS — the box the open session's layer last carried an arrow for, packed by [`cb_pack`],
+/// or 0. Written by [`ghost_note_composed`] from `compose_into` (overlay loan held, session open) and
+/// swapped to 0 by `adopt_overlay`, the session's only closer, before it closes — so it describes
+/// exactly the pass being closed.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static GHOST_COMPOSED: AtomicU64 = AtomicU64::new(0);
+
+/// TWOCURSORS — declined installs whose session had arrow pixels delivered (loans held).
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static GH_DECLINED: AtomicU64 = AtomicU64::new(0);
+/// TWOCURSORS — orphan arrow pixels put back from the layer save.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static GH_PX: AtomicU64 = AtomicU64::new(0);
+/// TWOCURSORS — refused tails whose composed box was handed to [`repair`].
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static GH_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// TWOCURSORS — orphan boxes handed back (both arms).
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static GH_DAMAGED: AtomicU64 = AtomicU64::new(0);
+
+/// TWOCURSORS — `compose_into` delivered `taken > 0` arrow pixels into a layer at `plan`'s geometry.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn ghost_note_composed(plan: &Plan) {
+    if let Some(p) = cb_pack(plan.bx, plan.by, plan.bw, plan.bh) {
+        GHOST_COMPOSED.store(p, Ordering::Release);
+    }
+}
+
+/// TWOCURSORS — count one orphan box handed to [`repair`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn ghost_count_damaged() {
+    #[cfg(feature = "witness")]
+    GH_DAMAGED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// TWOCURSORS — the tail is about to decline the install. If the session does NOT describe the live
+/// sprite (`!c5_coherent`) and its layer delivered arrow pixels, put each one back from `ov.saved`
+/// where the panel still holds the arrow's colour, and return the session box for [`repair`].
+///
+/// Called with BOTH loans held (sprite, then overlay — the documented order), exactly the footing
+/// `undraw_locked`'s FLICKER-2 restore writes the panel from. `c5_coherent` alone and not `coherent`:
+/// a decline caused only by `uncover_lost` has the session at the live sprite's own geometry and
+/// epoch, so the arrow the layer delivered IS the live sprite's and `refresh_locked` restores it.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn ghost_restore(ov: &Overlay, c5_coherent: bool) -> Option<(usize, usize, usize, usize)> {
+    if c5_coherent || !ov.session || ov.covered.0.iter().all(|&w| w == 0) {
+        return None;
+    }
+    #[cfg(feature = "witness")]
+    GH_DECLINED.fetch_add(1, Ordering::Relaxed);
+    let (bx, by, bw, bh, s) = (ov.bx, ov.by, ov.bw, ov.bh, ov.s);
+    // Masked-safe, as every panel take here: a refusal writes nothing and the box still goes to
+    // `repair`, whose window damage re-presents over the orphan.
+    if let Some(fb) = sprite_panel() {
+        if fb.is_ready() {
+            let covered = ov.covered;
+            let saved = &ov.saved;
+            let mut n = 0u64;
+            for_each_sprite_pixel(bx, by, bw, bh, s, |x, y, color, i| {
+                if covered.get(i) && i < saved.len() && fb.read_pixel(x, y) == Some(color) {
+                    fb.put_pixel(x, y, saved[i]);
+                    n += 1;
+                }
+            });
+            if n > 0 {
+                flush_box(&fb, by, bh);
+            }
+            #[cfg(feature = "witness")]
+            GH_PX.fetch_add(n, Ordering::Relaxed);
+            #[cfg(not(feature = "witness"))]
+            let _ = n;
+        }
+    }
+    ghost_count_damaged();
+    Some((bx, by, bw, bh))
+}
+
+/// TWOCURSORS — a refused tail (overlay claim refused under a held sprite): the composed box, if this
+/// pass composed one, for [`repair`]. No pixel is written — there is no `ov.saved` in hand.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn ghost_refused_box(ghost: u64) -> Option<(usize, usize, usize, usize)> {
+    if ghost == 0 {
+        return None;
+    }
+    #[cfg(feature = "witness")]
+    GH_REFUSED.fetch_add(1, Ordering::Relaxed);
+    ghost_count_damaged();
+    Some(cb_unpack(ghost))
+}
+
+/// TWOCURSORS — the SPRITE claim was refused at the tail: hand the composed box to [`repair`] now,
+/// with no loan held (the early return skips the function's own `repair`). `repair` takes `TABLE`
+/// through WEDGE-7's bounded micro-guard, the same call `adopt_overlay` already makes at its end.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn ghost_on_refuse(ghost: u64) {
+    repair(ghost_refused_box(ghost));
+}
+
+/// TWOCURSORS — the `[cursorghost]` rollup. See the block header for each field.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+fn ghost_rollup(scope: &str) {
+    let declined = GH_DECLINED.load(Ordering::Relaxed);
+    let px = GH_PX.load(Ordering::Relaxed);
+    let refused = GH_REFUSED.load(Ordering::Relaxed);
+    let damaged = GH_DAMAGED.load(Ordering::Relaxed);
+    let verdict = if declined == 0 && refused == 0 {
+        "QUIET"
+    } else if damaged >= declined + refused {
+        "RESTORED"
+    } else {
+        "LOST"
+    };
+    serial_println!(
+        "[cursorghost] orphan scope={} declined={} restored_px={} restored_on_refuse={} damaged={} -> {}",
+        scope, declined, px, refused, damaged, verdict
+    );
 }
