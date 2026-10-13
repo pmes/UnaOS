@@ -27,7 +27,7 @@
 // which builds the frame of record (kind REPLY, corr 0, status 0, the kernel reply principal, body
 // `<ns>.<key>` NUL `<literal>`) into the SUBSCRIPTION queue while a kernel subscriber is registered
 // ([`subscribe`]). The Settings window drains it ([`changes_drain`]) and repaints from a fresh get.
-// Ring-3 delivery of verb 19 (an interest-registration verb) is OWED.
+// Ring-3 delivery (PREFCHANGED B558, the file tail): a verb-19 REQUEST registers a prefix, each match is pushed.
 //
 // Design of record: docs/dev/evidence/rmbp-1005/SETTINGSBUS.md.
 
@@ -162,7 +162,7 @@ pub fn subscribe() {
 /// PrefChanged: called by the store on every accepted write. Builds the verb-19 frame of record into the
 /// subscription queue (oldest dropped and counted when full). No subscriber = nothing queued.
 pub fn on_changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
-    if !SUBSCRIBED.load(Ordering::Acquire) {
+    let kq = SUBSCRIBED.load(Ordering::Acquire); if !kq && R3_SUBS.load(Ordering::Acquire) == 0 { // PREFCHANGED (B558): a kernel OR a ring-3 subscriber
         return;
     }
     // PREFSKERNEL (B345): the shared body — `<ns>.<key>` NUL `<literal>` [NUL `clamped=true`].
@@ -173,7 +173,7 @@ pub fn on_changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
     let mut f = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
     let n = crate::bus::build_reply(una_abi::BUS_VERB_PREF_CHANGED, 0, 0, kernel_reply_principal(), &body, &mut f);
     f.truncate(n);
-    let frame = f.into_boxed_slice();
+    let frame = f.into_boxed_slice(); r3_deliver(ns, k, &frame); if !kq { return; } // PREFCHANGED (B558): the same frame of record into every subscribed ring-3 owner's mailbox (file tail). LINE-NEUTRAL append.
     locked(|| {
         let mut q = CHANGES.lock();
         if q.len() >= Q_CAP {
@@ -438,7 +438,7 @@ pub fn ensure_tests() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) {
-            crate::tests::register("settingsbus", selftest);
+            crate::tests::register("settingsbus", selftest); #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] crate::tests::register("prefchanged", fx::selftest); // PREFCHANGED (B558): beside its parent's fixture (fixture file prefchanged_fx.rs). LINE-NEUTRAL append.
         }
     }
 }
@@ -629,3 +629,127 @@ pub fn relay_tag(tag: u8, prin: [u8; 32], body: &[u8], wait_ms: u64) -> Result<(
         core::hint::spin_loop();
     }
 }
+
+// ── PREFCHANGED (rmbp-ledger B558): PrefChanged (verb 19) DELIVERED to ring 3 ──────────────────────────
+//
+// The wire is una-abi's PREFCHANGED block. A ring-3 program's verb-19 REQUEST (`SYS_MSEND`, body = a `<ns>.<key>`
+// prefix) reaches [`subscribe_owner`] from each arch's MSEND arm with the caller's mailbox row (x86: the slot;
+// aarch64: the ASID) and its generation; the prefixes live on that row of [`SUBS`] (a `procslot::SlotVec`, B399 — no
+// pool width). `on_changed` (above, called by `prefs::changed` on every accepted write, whoever wrote it) builds the
+// frame of record once and hands it to [`r3_deliver`], which pushes ONE copy per matching owner per write into its
+// mailbox through the arch's `prefs_changed_push` (generation-stamped with the SUBSCRIBER's generation, so a frame
+// raced past a teardown is discarded by MRECV; one slot kept for the owner's own replies; full = dropped, counted in
+// [`R3_DROPPED`], said once). Teardown (`clear_handle_row` on both arches) calls [`unsubscribe_row`].
+
+/// One owner's subscription: the generation it subscribed under and its prefixes.
+struct Sub {
+    rgen: u64,
+    prefixes: Vec<String>,
+}
+
+/// Per-row subscriptions. x86 keys rows by slot, aarch64 by ASID (the arch's mailbox key).
+#[cfg(target_arch = "x86_64")]
+static SUBS: crate::procslot::SlotVec<crate::sync::Mutex<Option<Sub>>> = crate::procslot::SlotVec::new(|| crate::sync::Mutex::new(None), crate::sync::Mutex::new(None));
+#[cfg(target_arch = "aarch64")]
+static SUBS: crate::procslot::SlotVec<crate::sync::Mutex<Option<Sub>>> = crate::procslot::SlotVec::new_asid(|| crate::sync::Mutex::new(None), crate::sync::Mutex::new(None));
+
+/// Rows holding a subscription (the write path's no-subscriber fast exit).
+static R3_SUBS: AtomicU32 = AtomicU32::new(0);
+/// Frames pushed into ring-3 mailboxes / dropped on a full mailbox (monotonic since boot).
+pub static R3_DELIVERED: AtomicU32 = AtomicU32::new(0);
+pub static R3_DROPPED: AtomicU32 = AtomicU32::new(0);
+static R3_FULL_SAID: AtomicBool = AtomicBool::new(false);
+
+/// The shared row (kernel tasks, no private address space) never subscribes: it is never torn down.
+fn shared_row(row: usize) -> bool {
+    row == crate::procslot::SHARED_ROW || (cfg!(target_arch = "aarch64") && row == 0)
+}
+
+/// The verb-19 REQUEST: register `body` (a `<ns>.<key>` prefix) for the owner on `row` at generation `rgen`.
+/// 0, -EINVAL (bad body, shared row) or -ENOSPC (past `PREF_SUB_MAX`). Process context (the row may allocate).
+pub fn subscribe_owner(row: usize, rgen: u64, body: &[u8]) -> i64 {
+    if shared_row(row) || row > crate::procslot::ROW_ID_MAX || body.len() > una_abi::PREF_SUB_PREFIX_MAX || body.contains(&0) {
+        return EINVAL;
+    }
+    let Ok(prefix) = core::str::from_utf8(body) else { return EINVAL };
+    let cell = &SUBS[row];
+    let (st, n, fresh) = locked(|| {
+        let mut g = cell.lock();
+        let fresh = g.is_none();
+        let sub = g.get_or_insert_with(|| Sub { rgen, prefixes: Vec::new() });
+        if sub.rgen != rgen {
+            sub.rgen = rgen; // a predecessor's row the teardown never reached: the new tenant starts clean
+            sub.prefixes.clear();
+        }
+        if sub.prefixes.iter().any(|p| p == prefix) {
+            return (0, sub.prefixes.len(), fresh);
+        }
+        if sub.prefixes.len() >= una_abi::PREF_SUB_MAX {
+            return (una_abi::ENOSPC, sub.prefixes.len(), fresh);
+        }
+        sub.prefixes.push(String::from(prefix));
+        (0, sub.prefixes.len(), fresh)
+    });
+    if fresh {
+        R3_SUBS.fetch_add(1, Ordering::AcqRel);
+    }
+    serial_println!("[prefsbus] subscribe row={} gen={} prefix=\"{}\" n={} status={} (PREFCHANGED B558)", row, rgen, prefix, n, st);
+    st
+}
+
+/// Take `row`'s subscription out (never allocates a row). The teardown's half and the fixture's save.
+fn take_row(row: usize) -> Option<Sub> {
+    let cell = SUBS.peek(row)?;
+    let old = locked(|| cell.lock().take());
+    if old.is_some() {
+        R3_SUBS.fetch_sub(1, Ordering::AcqRel);
+    }
+    old
+}
+
+/// Teardown: the subscription dies with the address space (both arches' `clear_handle_row`).
+pub fn unsubscribe_row(row: usize) {
+    let _ = take_row(row);
+}
+
+/// Push `frame` (the verb-19 frame of record for `<ns>.<k>`) into every owner whose prefix matches: one frame per
+/// owner per write, however many of its prefixes match.
+fn r3_deliver(ns: &str, k: &str, frame: &[u8]) {
+    if R3_SUBS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let addr = alloc::format!("{}.{}", ns, k);
+    let mut to: Vec<(usize, u64)> = Vec::new();
+    for row in 0..SUBS.hwm() {
+        if shared_row(row) {
+            continue;
+        }
+        let Some(cell) = SUBS.peek(row) else { continue };
+        let hit = locked(|| cell.lock().as_ref().and_then(|s| s.prefixes.iter().any(|p| addr.starts_with(p.as_str())).then_some(s.rgen)));
+        if let Some(rgen) = hit {
+            to.push((row, rgen));
+        }
+    }
+    for (row, rgen) in to {
+        let st = crate::arch::syscall::prefs_changed_push(row, rgen, Box::from(frame));
+        if st == 0 {
+            R3_DELIVERED.fetch_add(1, Ordering::Relaxed);
+        } else if st == una_abi::EAGAIN {
+            R3_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if !R3_FULL_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!("[prefsbus] changed {} -> row={} mailbox full: frame dropped (said once; r3_dropped counts each)", addr, row);
+            }
+        }
+        // any other status: the owner is gone (generation moved) — its teardown unsubscribes it
+    }
+}
+
+/// How many prefixes `row` holds (the fixture's read).
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware", feature = "aarch64_el0"))))]
+fn row_prefixes(row: usize) -> usize {
+    SUBS.peek(row).map(|c| locked(|| c.lock().as_ref().map_or(0, |s| s.prefixes.len()))).unwrap_or(0)
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware", feature = "aarch64_el0"))))]
+#[path = "prefchanged_fx.rs"]
+mod fx;

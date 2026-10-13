@@ -2623,7 +2623,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_SEEK => sys_seek(a0, a1),
         SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), // CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
-        SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
+        SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1, a2), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
         // so the dispatch match is byte-identical there and an unknown number falls to the default.
         #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
@@ -15061,7 +15061,7 @@ pub fn clear_handle_row(slot: usize) {
     // keeps the bounded table self-cleaning and enforces the owner-exit-reverts-to-public rule. Before
     // `clear_files_row` (the open-descriptor decrefs) — order-independent (a separate lock), placed here for
     // adjacency with the file teardown (the aarch64 `owned_clear_owner_asid` twin).
-    owned_clear_owner_slot(slot); busx_mbox_clear(slot); #[cfg(feature = "busreg")] crate::bus_route::on_exit(&BUSREG_OPS, slot); // BUSX86: drain this row's bus mailbox alongside its handles, owner rows and inbox. It lands AFTER the `SLOT_GEN` bump at the top of this function, which is what makes it sufficient rather than merely tidy: every queued reply carries the recipient's generation and `busx_mbox_pop` discards a stale-gen frame, so a reply enqueued in the window between the bump and this drain is already dead-on-arrival for the row's next tenant. The aarch64 twin drains at the same point in `clear_handle_row` for the same reason. ⚠ SAME-LINE fold.
+    owned_clear_owner_slot(slot); busx_mbox_clear(slot); #[cfg(feature = "busreg")] crate::bus_route::on_exit(&BUSREG_OPS, slot); crate::prefs_client::unsubscribe_row(slot); // PREFCHANGED (B558): the PrefChanged subscription dies with the tenant (LINE-NEUTRAL append). BUSX86: drain this row's bus mailbox alongside its handles, owner rows and inbox. It lands AFTER the `SLOT_GEN` bump at the top of this function, which is what makes it sufficient rather than merely tidy: every queued reply carries the recipient's generation and `busx_mbox_pop` discards a stale-gen frame, so a reply enqueued in the window between the bump and this drain is already dead-on-arrival for the row's next tenant. The aarch64 twin drains at the same point in `clear_handle_row` for the same reason. ⚠ SAME-LINE fold.
     // U6bx: the slot's open-FILE row rides the same teardown (handles first, so no File handle can name a
     // descriptor this wipe has already freed) — covers both the exit and the fault-kill path, exactly like
     // the handles (the aarch64 `clear_handle_row` -> `clear_files_row` twin).
@@ -25032,7 +25032,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // by-name delete and `SYS_RENAME` call — so these legs cannot drift from the syscall's, there
         // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "wc")] { crate::video::dialog::bus_fulfil(hdr.verb, row as u64 + 1, body) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(row), row as u64 + 1, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "wc", feature = "quarry"))] { crate::video::dnd::bus_drop_get(row as u64 + 1, body, &mut text) } #[cfg(not(all(feature = "wc", feature = "quarry")))] { EINVAL } } // ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "wc")] { crate::video::dialog::bus_fulfil(hdr.verb, row as u64 + 1, body) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(row), row as u64 + 1, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "wc", feature = "quarry"))] { crate::video::dnd::bus_drop_get(row as u64 + 1, body, &mut text) } #[cfg(not(all(feature = "wc", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(row, cgen, body), // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this row (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
@@ -25063,7 +25063,7 @@ fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
 /// exact length is the return value. The destination is validated ONCE up front over the whole-frame
 /// window, so a bad buffer is -EFAULT BEFORE any dequeue — a popped frame is never lost to a failed
 /// copy. Blocking rides the Semaphore; off a scheduled task it degrades to a poll returning -EAGAIN.
-fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
+fn sys_mrecv(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 { // PREFCHANGED (B558): `flags` = una_abi::MRECV_NOWAIT answers -EAGAIN on an empty mailbox instead of parking
     busx_sem_init_once();
     if (buf_len as usize) < crate::bus::BUS_FRAME_MAX {
         return EMSGSIZE_X;
@@ -25082,8 +25082,8 @@ fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
             }
             return msg.frame.len() as i64;
         }
-        if !BUSX_SEM[row].wait() {
-            return EAGAIN; // off a scheduled task — the kernel-fixture poll path
+        if flags == una_abi::MRECV_NOWAIT || !BUSX_SEM[row].wait() {
+            return EAGAIN; // off a scheduled task — the kernel-fixture poll path; or MRECV_NOWAIT (PREFCHANGED B558)
         }
     }
 }
@@ -31156,4 +31156,56 @@ fn cursor_shape_drop(slot: usize) {
     if let Some(row) = SLOT_CURSOR_SHAPE.peek(slot) {
         row.store(una_abi::CURSOR_ARROW as u8, Ordering::Release);
     }
+}
+
+// =================================================================================================
+// PREFCHANGED (rmbp-ledger B558): this arch's half of PrefChanged's ring-3 delivery (`prefs_client.rs` tail) — the
+// push into a subscriber's mailbox, and the `tests prefchanged` hooks over the PRODUCTION `busx_msend_for`.
+// Appended at the file tail so no existing line moves.
+// =================================================================================================
+
+/// Push a verb-19 frame of record into `row`'s mailbox for the tenant of generation `rgen` (the subscriber's): the
+/// frame is stamped with `rgen`, so if the tenant died meanwhile `busx_mbox_pop` discards it. One slot stays free
+/// for the owner's own replies (`busx_msend_for`'s capacity-before-fulfilment rule must keep holding). 0 = queued
+/// and the row's MRECV woken; -EAGAIN = full (dropped); -ESRCH = the subscriber's generation is gone.
+pub fn prefs_changed_push(row: usize, rgen: u64, frame: alloc::boxed::Box<[u8]>) -> i64 {
+    if row >= BUSX_MBOX.len() || row >= SLOT_GEN.len() || row == SHARED_ROW {
+        return EINVAL;
+    }
+    if SLOT_GEN[row].load(Ordering::Acquire) != rgen {
+        return -3; // ESRCH: the subscriber's tenancy ended (its teardown unsubscribes it)
+    }
+    busx_sem_init_once();
+    {
+        let _irq = IrqGuard::mask_save();
+        let mut mb = BUSX_MBOX[row].lock();
+        if mb.count + 1 >= BUSX_MBOX_DEPTH {
+            return EAGAIN;
+        }
+        let tail = (mb.head + mb.count) % BUSX_MBOX_DEPTH;
+        mb.slots[tail] = Some(BusxMsg { rgen, frame });
+        mb.count += 1;
+    }
+    BUSX_SEM[row].post();
+    0
+}
+
+/// `tests prefchanged`: send `frame` as scratch row `row` through the production MSEND body.
+#[cfg(feature = "witness")]
+pub fn prefchanged_fx_send(row: usize, frame: &[u8]) -> i64 {
+    if row >= BUSX_MBOX.len() {
+        return EINVAL;
+    }
+    busx_sem_init_once();
+    let cgen = SLOT_GEN[row].load(Ordering::Acquire);
+    busx_msend_for(row, cgen, frame)
+}
+
+/// `tests prefchanged`: the non-blocking dequeue `SYS_MRECV` runs, for scratch row `row`.
+#[cfg(feature = "witness")]
+pub fn prefchanged_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
+    if row >= BUSX_MBOX.len() {
+        return None;
+    }
+    busx_mbox_pop(row).map(|m| m.frame)
 }

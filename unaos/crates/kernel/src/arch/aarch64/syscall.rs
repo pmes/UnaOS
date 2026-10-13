@@ -4474,7 +4474,7 @@ pub fn clear_handle_row(asid: u64) {
     // BANDY-1 M2: drain this ASID's bus mailbox alongside its handles/inbox — undelivered replies
     // die with their tenant (the boxes free here), and the gen bump above already makes any reply
     // enqueued in a race dead-on-arrival for the next tenant (bus_mrecv verifies the stamp).
-    bus_mbox_clear(asid); #[cfg(feature = "busreg")] crate::bus_route::on_exit(&BUSREG_OPS, asid as usize);
+    bus_mbox_clear(asid); #[cfg(feature = "busreg")] crate::bus_route::on_exit(&BUSREG_OPS, asid as usize); crate::prefs_client::unsubscribe_row(asid as usize); // PREFCHANGED (B558): the PrefChanged subscription dies with the tenant (LINE-NEUTRAL append)
     // U7: DISOWN any still-live transfer this dying ASID sent (SENDER -> u64::MAX, never a real ASID):
     // revoke authority dies with the sender, so the ASID's next tenant can neither revoke nor be blamed
     // for the old tenant's transfers (txids are monotonic and were returned to EL0 — without this, a
@@ -6876,7 +6876,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
         SYS_MSEND => sys_msend(a0, a1),
-        SYS_MRECV => sys_mrecv(a0, a1),
+        SYS_MRECV => sys_mrecv(a0, a1, a2), // PREFCHANGED (B558): a2 = una_abi::MRECV_NOWAIT
         SYS_THREAD_SPAWN => sys_thread_spawn(a0, a1, a2, a3),
         SYS_THREAD_JOIN => sys_thread_join(a0),
         SYS_THREAD_EXIT => sys_thread_exit(), // never returns
@@ -23109,7 +23109,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "desktop_firmware")] { crate::video::dialog::bus_fulfil(hdr.verb, asid as u64, body) } #[cfg(not(feature = "desktop_firmware"))] { EINVAL } } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(ppid), asid as u64, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "desktop_firmware", feature = "quarry"))] { crate::video::dnd::bus_drop_get(asid as u64, body, &mut text) } #[cfg(not(all(feature = "desktop_firmware", feature = "quarry")))] { EINVAL } } // ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "desktop_firmware")] { crate::video::dialog::bus_fulfil(hdr.verb, asid as u64, body) } #[cfg(not(feature = "desktop_firmware"))] { EINVAL } } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(ppid), asid as u64, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "desktop_firmware", feature = "quarry"))] { crate::video::dnd::bus_drop_get(asid as u64, body, &mut text) } #[cfg(not(all(feature = "desktop_firmware", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(asid as usize, agen, body), // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this ASID (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -23140,7 +23140,7 @@ fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
 /// the frame's exact length is the return value. Blocking rides the sys_wait Semaphore idiom
 /// (park + cross-core wake); off a scheduled task (kernel fixture context) it degrades to a
 /// non-blocking poll returning -EAGAIN.
-fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
+fn sys_mrecv(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 { // PREFCHANGED (B558): `flags` = una_abi::MRECV_NOWAIT answers -EAGAIN on an empty mailbox instead of parking
     bus_sem_init_once();
     if (buf_len as usize) < crate::bus::BUS_FRAME_MAX {
         return EMSGSIZE;
@@ -23164,8 +23164,8 @@ fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
         }
         // Empty: park on the semaphore (posted by every enqueue). A spurious permit (teardown
         // drain raced an enqueue) just loops back around to wait.
-        if !BUS_SEM[asid as usize].wait() {
-            return EAGAIN; // off a scheduled task — the kernel-fixture poll path
+        if flags == una_abi::MRECV_NOWAIT || !BUS_SEM[asid as usize].wait() {
+            return EAGAIN; // off a scheduled task — the kernel-fixture poll path; or MRECV_NOWAIT (PREFCHANGED B558)
         }
         remask_irq(); // the sys_wait discipline: epilogue must run IRQ-masked
     }
@@ -26273,4 +26273,55 @@ fn cursor_shape_drop(asid: u64) {
             row.store(una_abi::CURSOR_ARROW as u8, Ordering::Release);
         }
     }
+}
+
+// =================================================================================================
+// PREFCHANGED (rmbp-ledger B558): this arch's half of PrefChanged's ring-3 delivery (`prefs_client.rs` tail) — the
+// push into a subscriber's mailbox (ASID + ASID_GEN keyed), and the `tests prefchanged` hooks over the PRODUCTION
+// `sys_msend_for`. Appended at the file tail so no existing line moves.
+// =================================================================================================
+
+/// Push a verb-19 frame of record into `asid`'s mailbox for the tenant of generation `agen` (the subscriber's): the
+/// frame is stamped with `agen`, so if the tenant died meanwhile `bus_mbox_pop` discards it. One slot stays free
+/// for the owner's own replies. 0 = queued and MRECV woken; -EAGAIN = full (dropped); -ESRCH = generation gone.
+pub fn prefs_changed_push(asid: usize, agen: u64, frame: alloc::boxed::Box<[u8]>) -> i64 {
+    if asid == 0 || asid >= BUS_MBOX.len() || asid >= ASID_GEN.len() {
+        return EINVAL;
+    }
+    if ASID_GEN[asid].load(Ordering::Acquire) != agen {
+        return -3; // ESRCH: the subscriber's tenancy ended (its teardown unsubscribes it)
+    }
+    bus_sem_init_once();
+    {
+        let _irq = IrqGuard::mask_save();
+        let mut mb = BUS_MBOX[asid].lock();
+        if mb.count + 1 >= BUS_MBOX_DEPTH {
+            return EAGAIN;
+        }
+        let tail = (mb.head + mb.count) % BUS_MBOX_DEPTH;
+        mb.slots[tail] = Some(BusMsg { agen, frame });
+        mb.count += 1;
+    }
+    BUS_SEM[asid].post();
+    0
+}
+
+/// `tests prefchanged`: send `frame` as scratch ASID `row` through the production MSEND body.
+#[cfg(feature = "witness")]
+pub fn prefchanged_fx_send(row: usize, frame: &[u8]) -> i64 {
+    if row == 0 || row >= BUS_MBOX.len() {
+        return EINVAL;
+    }
+    bus_sem_init_once();
+    let agen = ASID_GEN[row].load(Ordering::Acquire);
+    sys_msend_for(row as u64, agen, PrincipalRecord::program(b"prog:PREFCHANGED"), frame)
+}
+
+/// `tests prefchanged`: the non-blocking dequeue `SYS_MRECV` runs, for scratch ASID `row`.
+#[cfg(feature = "witness")]
+pub fn prefchanged_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
+    if row == 0 || row >= BUS_MBOX.len() {
+        return None;
+    }
+    bus_mbox_pop(row as u64).map(|m| m.frame)
 }
