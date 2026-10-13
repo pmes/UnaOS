@@ -42,9 +42,14 @@ thread_local! {
     static INDETERMINATE: RefCell<std::collections::HashSet<usize>> = RefCell::new(std::collections::HashSet::new());
     static RESETTING: RefCell<std::collections::HashSet<usize>> = RefCell::new(std::collections::HashSet::new());
     static SUBMITTING: RefCell<std::collections::HashSet<usize>> = RefCell::new(std::collections::HashSet::new());
+    /// AETHERDEBT SR93: the File objects (host roots) a file input's selection holds — set from script
+    /// through `input.files = dataTransfer.files` (there is no picker here).
+    static FILES: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
 pub fn reset() {
+    // The roots belonged to the previous page's VM (gone with it).
+    FILES.with(|s| s.borrow_mut().clear());
     INDETERMINATE.with(|s| s.borrow_mut().clear());
     SUBMITTING.with(|s| s.borrow_mut().clear());
     SELECTION.with(|s| s.borrow_mut().clear());
@@ -742,24 +747,258 @@ fn files_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }))
 }
 
+/// `input.files = list` (HTML §4.10.5.1.18, AETHERDEBT SR93): a FileList (from a DataTransfer, or
+/// another input) replaces the selection; null and anything else are ignored. The input's own
+/// FileList then lists the new files.
 fn files_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_element(vm, ctx)?;
-    // Setting null is ignored; a FileList from a DataTransfer would replace the selection (no picker here).
+    let el = this_element(vm, ctx)?;
+    if input_type(el) != "file" {
+        return Ok(Value::Undefined);
+    }
+    let v = arg(vm, ctx, 0);
+    let Some(list) = this_tagged(vm, &v, T_FILELIST) else { return Ok(Value::Undefined) };
+    let files = filelist_files(vm, list);
+    let roots: Vec<usize> = files.into_iter().map(|f| root(vm, f)).collect();
+    if let Some(old) = FILES.with(|f| f.borrow_mut().insert(el, roots)) {
+        for r in old {
+            unroot(vm, r);
+        }
+    }
+    let own = files_get(vm, ctx)?;
+    if let Value::Object(o) = own {
+        filelist_sync(vm, o);
+    }
     Ok(Value::Undefined)
 }
 
-fn filelist_length(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    if this_tagged(vm, &ctx.this, T_FILELIST).is_none() {
-        return vm.throw_type("Illegal invocation");
+/// The File objects a FileList lists: a DataTransfer's live array (slot 1), else the selection of the
+/// input in slot 0.
+fn filelist_files(vm: &mut Vm, o: Obj) -> Vec<Value> {
+    if let v @ Value::Object(_) = slot(vm, o, 1) {
+        return vm.array_to_list(&v);
     }
-    Ok(num(0.0))
+    let el = slot_num(vm, o, 0);
+    if !(el >= 0.0) {
+        return Vec::new();
+    }
+    let roots = FILES.with(|f| f.borrow().get(&(el as usize)).cloned()).unwrap_or_default();
+    roots.into_iter().map(|r| rooted(vm, r)).collect()
+}
+
+/// Does file input `el` hold a script-set selection?
+pub fn has_selected_files(el: usize) -> bool {
+    FILES.with(|f| f.borrow().get(&el).is_some_and(|v| !v.is_empty()))
+}
+
+/// A file input's selected File objects, in order (the entry list's `file` entries).
+pub fn selected_files(vm: &mut Vm, el: usize) -> Vec<Value> {
+    let roots = FILES.with(|f| f.borrow().get(&el).cloned()).unwrap_or_default();
+    roots.into_iter().map(|r| rooted(vm, r)).collect()
+}
+
+/// The FileList's supported property indices as own read-only data properties (FileList has an
+/// indexed getter; the list changes only through `files_set` and a DataTransfer's item list, which
+/// call this).
+fn filelist_sync(vm: &mut Vm, o: Obj) {
+    let files = filelist_files(vm, o);
+    let stale: Vec<PropertyKey> = vm.heap.get(o).props.keys().filter(|k| matches!(k, PropertyKey::Index(_))).cloned().collect();
+    for k in stale {
+        vm.heap.get_mut(o).props.remove(&k);
+    }
+    for (i, f) in files.into_iter().enumerate() {
+        vm.heap.get_mut(o).props.insert(PropertyKey::Index(i as u32), Prop::data(f, E | C));
+    }
+}
+
+fn filelist_length(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let Some(o) = this_tagged(vm, &ctx.this, T_FILELIST) else {
+        return vm.throw_type("Illegal invocation");
+    };
+    Ok(num(filelist_files(vm, o).len() as f64))
 }
 
 fn filelist_item(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    if this_tagged(vm, &ctx.this, T_FILELIST).is_none() {
+    let Some(o) = this_tagged(vm, &ctx.this, T_FILELIST) else {
         return vm.throw_type("Illegal invocation");
+    };
+    let a0 = arg(vm, ctx, 0);
+    let i = vm.to_number(&a0)?;
+    let files = filelist_files(vm, o);
+    if !(i >= 0.0) || i.fract() != 0.0 || (i as usize) >= files.len() {
+        return Ok(Value::Null);
     }
-    Ok(Value::Null)
+    Ok(files[i as usize].clone())
+}
+
+/// `__filelist_new(array)`: a FileList over a DataTransfer's live File array (the prelude's).
+fn n_filelist_new(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let a = arg(vm, ctx, 0);
+    if !a.is_object() {
+        return vm.throw_type("__filelist_new: an array is required");
+    }
+    let p = dom::proto("FileList");
+    let o = host_obj(vm, p, T_FILELIST, vec![num(-1.0), a]);
+    filelist_sync(vm, o);
+    Ok(Value::Object(o))
+}
+
+/// `__filelist_sync(list)`: re-reads a DataTransfer FileList's indices after its items changed.
+fn n_filelist_sync(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let v = arg(vm, ctx, 0);
+    if let Some(o) = this_tagged(vm, &v, T_FILELIST) {
+        filelist_sync(vm, o);
+    }
+    Ok(Value::Undefined)
+}
+
+/// DataTransfer, DataTransferItemList and DataTransferItem (HTML §6.11.3–6.11.5, AETHERDEBT SR93) for
+/// the forms cases: a script-made DataTransfer (`new DataTransfer()`, data store mode read/write)
+/// whose `items.add(file)` files show in `files` — a FileList `input.files` accepts — and whose
+/// string items back `setData`/`getData`/`types`. No drag source exists here, so the protected and
+/// read-only modes never arise.
+const DATA_TRANSFER_PRELUDE: &str = r#"(function () {
+  "use strict";
+  var newList = globalThis.__filelist_new, syncList = globalThis.__filelist_sync;
+  var KEY = {};
+  var state = new WeakMap();
+  function st(o) { var s = state.get(o); if (!s) throw new TypeError("Illegal invocation"); return s; }
+  function isFile(v) { return typeof File === "function" && v instanceof File; }
+  function normType(t) {
+    t = String(t).toLowerCase();
+    if (t === "text") return "text/plain";
+    if (t === "url") return "text/uri-list";
+    return t;
+  }
+  class DataTransferItem {
+    constructor(key, entry) { if (key !== KEY) throw new TypeError("Illegal constructor"); state.set(this, entry); }
+    get kind() { return st(this).kind; }
+    get type() { return st(this).type; }
+    getAsString(cb) {
+      var e = st(this);
+      if (cb == null || e.kind !== "string" || e.removed) return;
+      if (typeof cb !== "function") throw new TypeError("Failed to execute 'getAsString' on 'DataTransferItem': parameter 1 is not a function.");
+      var d = e.data;
+      setTimeout(function () { cb(d); }, 0);
+    }
+    getAsFile() { var e = st(this); return e.kind === "file" && !e.removed ? e.data : null; }
+  }
+  class DataTransferItemList {
+    constructor(key, dt) { if (key !== KEY) throw new TypeError("Illegal constructor"); state.set(this, dt); }
+    get length() { return st(this).entries.length; }
+    add(data, type) {
+      var dt = st(this);
+      if (arguments.length === 0) throw new TypeError("Failed to execute 'add' on 'DataTransferItemList': 1 argument required, but only 0 present.");
+      var entry;
+      if (isFile(data)) {
+        entry = { kind: "file", type: String(data.type).toLowerCase(), data: data };
+      } else {
+        if (arguments.length < 2) throw new TypeError("Failed to execute 'add' on 'DataTransferItemList': parameter 1 is not of type 'File'.");
+        var t = String(type).toLowerCase();
+        if (dt.entries.some(function (e) { return e.kind === "string" && e.type === t; })) {
+          throw new DOMException("An item already exists for type '" + t + "'.", "NotSupportedError");
+        }
+        entry = { kind: "string", type: t, data: String(data) };
+      }
+      dt.entries.push(entry);
+      var item = new DataTransferItem(KEY, entry);
+      entry.item = item;
+      dt.changed();
+      return item;
+    }
+    remove(i) {
+      var dt = st(this);
+      i = Number(i) >>> 0;
+      if (i < dt.entries.length) { dt.entries[i].removed = true; dt.entries.splice(i, 1); dt.changed(); }
+    }
+    clear() {
+      var dt = st(this);
+      dt.entries.forEach(function (e) { e.removed = true; });
+      dt.entries.length = 0;
+      dt.changed();
+    }
+  }
+  class DataTransfer {
+    constructor() {
+      var self = this;
+      var dt = { entries: [], files: [], dropEffect: "none", effectAllowed: "none", list: null, fileList: null };
+      dt.changed = function () {
+        var old = dt.list, i;
+        for (i = 0; old && i < old.__n; i++) delete old[i];
+        dt.entries.forEach(function (e, k) {
+          Object.defineProperty(dt.list, k, { value: e.item, enumerable: true, configurable: true });
+        });
+        dt.list.__n = dt.entries.length;
+        dt.files.length = 0;
+        dt.entries.forEach(function (e) { if (e.kind === "file") dt.files.push(e.data); });
+        syncList(dt.fileList);
+      };
+      dt.list = new DataTransferItemList(KEY, dt);
+      Object.defineProperty(dt.list, "__n", { value: 0, writable: true, enumerable: false });
+      dt.fileList = newList(dt.files);
+      state.set(self, dt);
+    }
+    get dropEffect() { return st(this).dropEffect; }
+    set dropEffect(v) { v = String(v); if (["none", "copy", "link", "move"].indexOf(v) >= 0) st(this).dropEffect = v; }
+    get effectAllowed() { return st(this).effectAllowed; }
+    set effectAllowed(v) {
+      v = String(v);
+      if (["none", "copy", "copyLink", "copyMove", "link", "linkMove", "move", "all", "uninitialized"].indexOf(v) >= 0) st(this).effectAllowed = v;
+    }
+    get items() { return st(this).list; }
+    get files() { return st(this).fileList; }
+    get types() {
+      var dt = st(this), out = [];
+      dt.entries.forEach(function (e) { if (e.kind === "string") out.push(e.type); });
+      if (dt.entries.some(function (e) { return e.kind === "file"; })) out.push("Files");
+      return Object.freeze(out);
+    }
+    getData(format) {
+      var t = normType(format), dt = st(this);
+      for (var i = 0; i < dt.entries.length; i++) {
+        var e = dt.entries[i];
+        if (e.kind === "string" && e.type === t) return e.data;
+      }
+      return "";
+    }
+    setData(format, data) {
+      var t = normType(format), dt = st(this);
+      dt.entries = dt.entries.filter(function (e) { if (e.kind === "string" && e.type === t) { e.removed = true; return false; } return true; });
+      var entry = { kind: "string", type: t, data: String(data) };
+      entry.item = new DataTransferItem(KEY, entry);
+      dt.entries.push(entry);
+      dt.changed();
+    }
+    clearData(format) {
+      var dt = st(this), t = format === undefined ? null : normType(format);
+      dt.entries = dt.entries.filter(function (e) {
+        if (e.kind === "string" && (t === null || e.type === t)) { e.removed = true; return false; }
+        return true;
+      });
+      dt.changed();
+    }
+    setDragImage(image, x, y) {}
+  }
+  Object.defineProperty(DataTransfer.prototype, Symbol.toStringTag, { value: "DataTransfer", configurable: true });
+  Object.defineProperty(DataTransferItemList.prototype, Symbol.toStringTag, { value: "DataTransferItemList", configurable: true });
+  Object.defineProperty(DataTransferItem.prototype, Symbol.toStringTag, { value: "DataTransferItem", configurable: true });
+  [["DataTransfer", DataTransfer], ["DataTransferItemList", DataTransferItemList], ["DataTransferItem", DataTransferItem]].forEach(function (p) {
+    Object.defineProperty(globalThis, p[0], { value: p[1], writable: true, configurable: true, enumerable: false });
+  });
+})();"#;
+
+/// Installs DataTransfer after the forms prelude (File exists): the two natives it calls, then the
+/// prelude.
+pub fn install_data_transfer(vm: &mut Vm) {
+    let g = vm.realm().global;
+    for (name, len, f) in [("__filelist_new", 1, n_filelist_new as NativeFn), ("__filelist_sync", 1, n_filelist_sync)] {
+        let fo = vm.make_native(name, len, f, false);
+        vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
+    }
+    if let Err(e) = vm.run_script_str(DATA_TRANSFER_PRELUDE) {
+        let m = vm.error_string(&e);
+        crate::ledger::record_js(&format!("datatransfer-prelude-failed:{}", super::clip(&m, 64)));
+        eprintln!("[aether] DataTransfer prelude failed: {m}");
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ valueAsNumber / valueAsDate / stepUp

@@ -1142,7 +1142,21 @@ impl AetherEngine {
             return;
         }
         let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
-        if let Some(nav) = forms::build_form_submission(&base, control, submitter, coords) {
+        // AETHERDEBT SR93: with script running, the entry list is built through the script DOM so the
+        // trusted `formdata` event fires (listeners may edit the list) and script-set files submit;
+        // without script, the engine's own entry list (no listener can exist).
+        let nav = match &mut self.js_engine {
+            Some(js_engine) => {
+                let sub = submitter.map(|s| s.id().0);
+                let nav = js::forms::user_submission(&mut js_engine.vm, form.id().0, sub, coords, &base);
+                if js::take_mutated() {
+                    self.relayout();
+                }
+                nav
+            }
+            None => forms::build_form_submission(&base, control, submitter, coords),
+        };
+        if let Some(nav) = nav {
             self.pending_nav = Some(nav);
         }
     }

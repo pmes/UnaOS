@@ -38,6 +38,8 @@ thread_local! {
     static HELPERS: Cell<Helpers> = Cell::new(Helpers { from: None, pairs: None, is: None, bytes: None });
     /// Forms whose "constructing entry list" flag is set (§4.10.21.4).
     static CONSTRUCTING: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    /// The user click's coordinates in an image submit button while [`user_submission`] builds its list.
+    static CLICK_COORDS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// Each form's past names map (§4.10.3): name → element, in insertion order.
     static PAST_NAMES: RefCell<HashMap<usize, Vec<(String, usize)>>> = RefCell::new(HashMap::new());
     static FORM_HANDLER: Cell<Option<Obj>> = const { Cell::new(None) };
@@ -82,6 +84,9 @@ fn ws(c: char) -> bool {
 enum Raw {
     Text(String),
     EmptyFile,
+    /// A file input with a selection (AETHERDEBT SR93, `input.files = dataTransfer.files`): one entry
+    /// per selected File, read with the VM.
+    Files(usize),
 }
 
 /// A submit button (§4.10.18.6): `<button>` in the Submit Button state, `<input type=submit|image>`.
@@ -174,8 +179,10 @@ fn raw_entries(form: usize, submitter: Option<usize>) -> Vec<(String, Raw)> {
                 Some(n) => (format!("{n}.x"), format!("{n}.y")),
                 None => ("x".to_string(), "y".to_string()),
             };
-            out.push((nx, Raw::Text("0".into())));
-            out.push((ny, Raw::Text("0".into())));
+            // A user click's coordinates in the image (AETHERDEBT SR93), else 0,0.
+            let (cx, cy) = CLICK_COORDS.with(Cell::get).unwrap_or((0, 0));
+            out.push((nx, Raw::Text(cx.to_string())));
+            out.push((ny, Raw::Text(cy.to_string())));
             continue;
         }
         let Some(name) = attr_value(field, "name").filter(|n| !n.is_empty()) else { continue };
@@ -188,6 +195,7 @@ fn raw_entries(form: usize, submitter: Option<usize>) -> Vec<(String, Raw)> {
                 }
             }
             (_, "checkbox" | "radio") => out.push((name.clone(), Raw::Text(attr_value(field, "value").unwrap_or_else(|| "on".into())))),
+            (_, "file") if controls::has_selected_files(field) => out.push((name.clone(), Raw::Files(field))),
             (_, "file") => out.push((name.clone(), Raw::EmptyFile)),
             (_, "hidden") if name.eq_ignore_ascii_case("_charset_") => out.push((name.clone(), Raw::Text("UTF-8".into()))),
             ("textarea", _) => out.push((name.clone(), Raw::Text(hard_wrap(field, controls::value_of(field))))),
@@ -228,6 +236,12 @@ fn entry_list_inner(vm: &mut Vm, form: usize, submitter: Option<usize>) -> JsRes
         let pv = match v {
             Raw::Text(t) => s(&t),
             Raw::EmptyFile => Value::Null,
+            Raw::Files(el) => {
+                for f in controls::selected_files(vm, el) {
+                    pairs.push(Value::Object(vm.new_array(vec![s(&n), f])));
+                }
+                continue;
+            }
         };
         pairs.push(Value::Object(vm.new_array(vec![s(&n), pv])));
     }
@@ -324,6 +338,33 @@ pub fn navigate(vm: &mut Vm, form: usize, submitter: Option<usize>) {
     let url = super::page_url();
     let Some(nav) = core::plan_navigation(&url, &form_ref, sub_ref.as_ref(), entries) else { return };
     stage(nav);
+}
+
+/// The submission a USER starts (a click on a submit button, implicit submission — AETHERDEBT SR93,
+/// the AETHERFORMS owed user-click path): after the shell's `submit` event, the entry list through the
+/// script DOM so the trusted `formdata` event fires at the form and its listeners' edits count (and a
+/// file input's script-set files submit), image button coordinates from the click, then the
+/// navigation `crate::forms::plan_navigation` builds against `base` — returned for the shell to stage
+/// (not staged here). None when the form is disconnected or already constructing its entry list.
+pub fn user_submission(vm: &mut Vm, form: usize, submitter: Option<usize>, coords: (i32, i32), base: &str) -> Option<OpenDocument> {
+    if !dom::is_connected(form) || CONSTRUCTING.with(|c| c.borrow().contains(&form)) {
+        return None;
+    }
+    CLICK_COORDS.with(|c| c.set(Some(coords)));
+    let list = entry_list(vm, form, submitter);
+    CLICK_COORDS.with(|c| c.set(None));
+    let Ok(Some(pairs)) = list else { return None };
+    if !dom::is_connected(form) {
+        return None;
+    }
+    let r = root(vm, pairs.clone());
+    let entries = entries_of(vm, &pairs);
+    unroot(vm, r);
+    let entries = entries.ok()?;
+    let doc = page(|p| p.doc.clone())?;
+    let form_ref = doc.node_at(NodeId(form));
+    let sub_ref = submitter.map(|s| doc.node_at(NodeId(s)));
+    core::plan_navigation(base, &form_ref, sub_ref.as_ref(), entries)
 }
 
 fn stage(nav: OpenDocument) {

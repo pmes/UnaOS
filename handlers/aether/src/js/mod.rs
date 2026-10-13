@@ -547,6 +547,8 @@ impl Engine {
         window::install(&mut vm);
         net::install(&mut vm);
         forms::install(&mut vm);
+        // AETHERDEBT SR93: DataTransfer (its FileList feeds `input.files`) — after forms: File exists.
+        controls::install_data_transfer(&mut vm);
         // After window::install: these replace the platform.rs MutationObserver/customElements stubs.
         shadow::install(&mut vm);
         mutation::install(&mut vm);
