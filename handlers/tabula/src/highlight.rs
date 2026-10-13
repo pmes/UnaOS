@@ -71,7 +71,7 @@ pub struct HighlightPrefs {
 }
 
 impl HighlightPrefs {
-    /// Build from lookups in namespace `tabula` (`get("highlight")`, `get("theme.keyword")`, ...).
+    /// Build from lookups in namespace `tabula` (`get("highlight")`, `get("theme.<kind>")`, ...).
     /// Defaults live here, with the consumer: an unset or unknown `highlight` is `core`.
     pub fn from_prefs(get: impl Fn(&str) -> Option<PrefValue>, dark: bool) -> Self {
         let engine = match get("highlight") {

@@ -561,7 +561,7 @@ fn try_load() -> Result<(), FatError> {
         return Ok(());
     }
     let fs = store_mount()?;
-    let veto = if fs.write_veto().is_some() { "ro" } else { "rw" }; let via = store_via().name(); // LOGIN16 (B217): the load line names the ladder rung the volume mounted through
+    store_pin(&fs); let veto = if fs.write_veto().is_some() { "ro" } else { "rw" }; let via = store_via().name(); // STOREMOVE (B530): the first load pins the store's volume for the boot. LOGIN16 (B217): the load line names the ladder rung the volume mounted through
     let (src, img) = match read_root_file(&fs, USERS_FILE) {
         Some(b) => ("dat", Some(b)),
         None => match read_root_file(&fs, USERS_TMP_FILE) {
@@ -1236,7 +1236,7 @@ pub fn loginst_settled() -> bool {
 pub fn service() {
     use core::sync::atomic::Ordering;
     if SERVICED.load(Ordering::Relaxed) {
-        return;
+        #[cfg(all(target_arch = "x86_64", feature = "login", not(feature = "loginst")))] { if RESOLVE_WAIT_T0.load(Ordering::Acquire) != 0 && resolve_wait_over() { resolve_tail(); crate::tests::source_done(crate::tests::SRC_LOGIN); } } return; // RESOLVEHANG2 (B531): a stage-resolve held for the console runs on the pass the console comes up (or the bound expires); `source_done` is the skipped `not(loginst)` tail line of the load arm below
     }
     // STORAGE FIRST: the same predicate `holocron::load_once` waits on; until it answers, this pass costs
     // one load and prints nothing. (The VFS mount table is deliberately NOT consulted here at all —
@@ -1264,7 +1264,7 @@ pub fn service() {
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
         #[cfg(all(feature = "loginst", feature = "tests-at-boot"))] LOGINST_LIVE.store(true, Ordering::Release); // LOGINFLOW2 — boot 2's screen is up from the resolution to the fixtures below; the press battery waits (the chain's tail drops it)
-        { let st = crate::fs::bootstep::begin("stage-resolve", "Resolving the session"); stage_resolve("store-loaded"); st.end(stage_name()); crate::fs::bootstep::open("first-screen", "Preparing the screen"); } // SPLASHSTALL (B510): "Starting" is the step's own words now, and the stretch from the stage to the first painted screen is its own step (`splash::hold_release` ends it). BOOT80 (B350). FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
+        #[cfg(all(target_arch = "x86_64", feature = "login", not(feature = "loginst")))] { if !resolve_wait_over() { return; } } resolve_tail(); // RESOLVEHANG2 (B531): stage-resolve WAITS for the FTDI console or RESOLVE_WAIT_MS — across PASSES (this pass is the one that brings the FTDI up: `service_ftdi` runs ahead of this call in the same loop, main.rs BOOTPACE CONSOLE-FIRST), so a hang in the step is on the live wire. SPLASHSTALL (B510): "Starting" is the step's own words now, and the stretch from the stage to the first painted screen is its own step (`splash::hold_release` ends it). BOOT80 (B350). FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::tests::register("boot2-login", boot2_login_entry); crate::tests::register("logout", logout_entry); } // LOGINFLOW2 M1/M2 — boot 2's login through the screen (BEFORE the chain's second pass: it needs the screen up), then LOGOUTUI M4
             #[cfg(feature = "loginst")] { crate::tests::register("login-chain", loginst_chain); #[cfg(feature = "unafs")] crate::tests::register("users", homepriv_fixture); crate::tests::source_done(crate::tests::SRC_LOGIN); } // R77 M3 — the loginst fixture chain is a registered test (`tests login-chain`); `tests-at-boot` runs it here, as before. Body: `loginst_chain`, this file's tail. HOMEPRIV (B528): `tests users` (unafs), body at this file's tail.
             #[cfg(not(feature = "loginst"))] crate::tests::source_done(crate::tests::SRC_LOGIN); // no loginst on the flight image: the login source has nothing to register and must not be waited on (boot 17 compile fix)
@@ -1295,7 +1295,7 @@ pub fn service() {
 }
 
 /// Mount refusals seen by [`service`] since storage registered; the bound is the verdict.
-static MOUNT_REFUSALS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static MOUNT_REFUSALS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); static RESOLVE_WAIT_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(all(target_arch = "x86_64", feature = "login", not(feature = "loginst")))] const RESOLVE_WAIT_MS: u64 = 8000; pub fn resolve_waiting() -> bool { RESOLVE_WAIT_T0.load(core::sync::atomic::Ordering::Acquire) != 0 } #[cfg(all(target_arch = "x86_64", feature = "login", not(feature = "loginst")))] fn resolve_wait_over() -> bool { use core::sync::atomic::Ordering::{Acquire, Release}; let now = crate::arch::ms().max(1); let t0 = match RESOLVE_WAIT_T0.load(Acquire) { 0 => { RESOLVE_WAIT_T0.store(now, Release); now } t => t }; let up = crate::drivers::xhci::ftdi::is_live(); if !up && now.saturating_sub(t0) < RESOLVE_WAIT_MS { return false; } RESOLVE_WAIT_T0.store(0, Release); serial_println!("[boot] step=stage-resolve waited_ms={} for=console console={} bound_ms={}", now.saturating_sub(t0), if up { "up" } else { "absent" }, RESOLVE_WAIT_MS); true } fn resolve_tail() { let st = crate::fs::bootstep::begin("stage-resolve", "Resolving the session"); stage_resolve("store-loaded"); st.end(stage_name()); crate::fs::bootstep::open("first-screen", "Preparing the screen"); } // RESOLVEHANG2 (B531): `RESOLVE_WAIT_T0` = when the wait began (0 = none); `resolve_waiting` holds the splash's 5 s bound (splash.rs `hold_service`); `resolve_tail` is the load arm's stage-resolve block, moved verbatim
 /// Passes of refusal before [`service`] gives up for the boot. Each pass is one main-loop iteration; on
 /// QEMU virt the loan clears within a handful of passes, so 4096 is a wall, not a wait.
 const MOUNT_REFUSAL_BOUND: u32 = 4096;
@@ -2713,7 +2713,7 @@ fn usersready_fixture() { if crate::tests::defer("usersready", usersready_fixtur
 
 /// The ladder rung the users store mounts from. `None` is "nowhere to ask" — `store_ready` false.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StoreVia { Global, Sdhc, Ahci, None }
+pub enum StoreVia { Global, Sdhc, Ahci, None } static STORE_PIN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0); static STORE_PIN_FP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); static STORE_MOVE_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); fn store_fp(fs: &FatFs) -> u64 { let (id, n) = fs.volume_fingerprint(); ((id as u64) << 32) | n as u64 } fn store_pin_via() -> Option<StoreVia> { match STORE_PIN.load(core::sync::atomic::Ordering::Acquire) { 1 => Some(StoreVia::Global), 2 => Some(StoreVia::Sdhc), 3 => Some(StoreVia::Ahci), _ => None } } fn store_pin(fs: &FatFs) { use core::sync::atomic::Ordering::{Acquire, Release}; if STORE_PIN.load(Acquire) != 0 { return; } let v = store_via_ladder(); let code = match v { StoreVia::Global => 1, StoreVia::Sdhc => 2, StoreVia::Ahci => 3, StoreVia::None => return }; STORE_PIN_FP.store(store_fp(fs), Release); STORE_PIN.store(code, Release); serial_println!("[users] store pinned via={} vol={:#x} (STOREMOVE B530: every later mount of the store asks this rung and this volume, for the boot)", v.name(), store_fp(fs)); } fn store_pin_holds(fs: &FatFs) -> bool { let want = STORE_PIN_FP.load(core::sync::atomic::Ordering::Acquire); let got = store_fp(fs); if want == 0 || got == want { return true; } let pin = store_pin_via().map_or("none", |v| v.name()); serial_println!("[users] store={}:{:#x} write-to={}:{:#x} -> refused (STOREMOVE B530: the store's volume is pinned at its first load; ladder={})", pin, want, pin, got, store_via_ladder().name()); false } // STOREMOVE (rmbp-ledger B530): the store's rung AND volume (FAT serial + cluster count) pinned at the first load (`try_load`), read by every later `store_via`; a mount on the pinned rung that finds ANOTHER volume is refused by name
 
 impl StoreVia {
     pub fn name(self) -> &'static str {
@@ -2728,7 +2728,7 @@ pub fn store_via_from(global: bool, sdhc: bool, ahci: usize) -> StoreVia {
     if global { StoreVia::Global } else if sdhc { StoreVia::Sdhc } else if ahci > 0 { StoreVia::Ahci } else { StoreVia::None }
 }
 
-fn store_via() -> StoreVia {
+fn store_via() -> StoreVia { let ladder = store_via_ladder(); match store_pin_via() { Some(p) => { if p != ladder && !STORE_MOVE_SAID.swap(true, core::sync::atomic::Ordering::AcqRel) { serial_println!("[users] store pinned via={} ladder={} -> stays (STOREMOVE B530: the ladder moved after the first load; the store does not)", p.name(), ladder.name()); } p } None => ladder } } fn store_via_ladder() -> StoreVia { // STOREMOVE (B530): the pin first; the ladder (below) only before the first load
     store_via_from(crate::drivers::block::info().is_some(), sdhc_registered(), ahci_registered())
 }
 
@@ -2743,7 +2743,7 @@ fn store_mount() -> Result<FatFs, FatError> {
         StoreVia::Ahci => crate::fs::fat::BlockSource::Ahci(crate::drivers::block::ahci_port_at(0).ok_or(FatError::NoDisk)?),
         _ => return Err(FatError::NoDisk),
     };
-    crate::fs::fat::mount_source(source)
+    let fs = crate::fs::fat::mount_source(source)?; if !store_pin_holds(&fs) { return Err(FatError::NoDisk); } Ok(fs) // STOREMOVE (B530): another volume on the pinned rung is refused by name
 }
 
 // =========================================================================================

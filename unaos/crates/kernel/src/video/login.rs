@@ -582,7 +582,7 @@ fn repaint() {
     text(px, LX, py + 4, b"Password", theme::title_text_inactive());
     field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password && PFOCUS.load(Ordering::Relaxed) == 0, true);
     button(px, Ctl::Button, if locked { b"Unlock" } else { b"Log In" }, true, false);
-    power_row(px);
+    power_row(px, f.state == State::Open); // RESOLVEHANG2 (B531): the caller holds FORM — pass the state in, never re-lock
     let hint: &[u8] = b"Enter or Log In   Tab switches";
     text(px, LX, 186, hint, theme::title_text_inactive());
     if !f.message.is_empty() {
@@ -2458,8 +2458,8 @@ fn power_row_on() -> bool {
     FORM.lock().state == State::Open
 }
 
-fn power_row(px: &mut [u32]) {
-    if !power_row_on() {
+fn power_row(px: &mut [u32], on: bool) { // RESOLVEHANG2 (B531): `on` from the caller (FORM is held there)
+    if !on {
         return;
     }
     super::loginwindow::POWER_ROW.store(true, Ordering::Release); // SMALLFIX3 (B416): FIRSTUSER's `login_window=users+power` reads DIALOG2's row
