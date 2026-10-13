@@ -397,3 +397,8 @@ refs/heads/exec-rmbp-unametal2                5ee074e9 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-matrixcore               5ee074e9 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-smallfix9                5ee074e9 IN-FLIGHT rmbp 2026-10-13
 refs/heads/exec-rmbp-xhciiso                  df9abf52 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-pointerfeel              2e5e3696 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-fbdirect                 2e5e3696 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-pumpretry                2e5e3696 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-usbnetdhcp               2e5e3696 IN-FLIGHT rmbp 2026-10-13
+refs/heads/exec-rmbp-smallfix10               2e5e3696 IN-FLIGHT rmbp 2026-10-13
