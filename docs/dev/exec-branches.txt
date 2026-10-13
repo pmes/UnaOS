@@ -452,6 +452,6 @@ refs/heads/exec-host-aethera11y               7af171f2 FOLDED-BY-HAND b706066a
 refs/heads/exec-rmbp-midden2                  ee65d11d FOLDED-BY-HAND 20df2c6b
 refs/heads/exec-rmbp-lumen2                   99af732f FOLDED-BY-HAND 20df2c6b
 refs/heads/exec-host-aetherstyle3c            9e203b86 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-host-aetherworkers             6427870e IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aetherworkers             6427870e FOLDED-BY-HAND 567fc9a7
 refs/heads/exec-rmbp-shellabi                 c4c99344 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-a11yface                 c4c99344 IN-FLIGHT cloud 2026-10-13
