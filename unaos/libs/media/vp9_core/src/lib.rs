@@ -22,6 +22,7 @@ pub mod consts;
 pub mod header;
 pub mod probs;
 pub mod tables;
+pub mod transform;
 
 /// Every way a decode can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
