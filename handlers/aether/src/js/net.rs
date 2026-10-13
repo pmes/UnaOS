@@ -411,6 +411,14 @@ fn net_fire(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Bool(not_canceled))
 }
 
+/// AETHERWPT4 (SR142): `__net_has_listeners(target)` — whether any event listener (or handler) is registered on the
+/// target (XHR §3.5.6 step 5, "the upload listener flag").
+fn net_has_listeners(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let t = arg(vm, ctx, 0);
+    let Some(target) = super::events::target_of(vm, &t) else { return Ok(Value::Bool(false)) };
+    Ok(Value::Bool(super::page(|p| p.listeners.get(&target).is_some_and(|ls| ls.iter().any(|l| !l.removed)))))
+}
+
 /// The body argument of a request: a string (UTF-8), a BufferSource, or nothing.
 fn body_arg(vm: &mut Vm, v: &Value) -> JsResult<Vec<u8>> {
     if v.is_undefined() || v.is_null() {
@@ -652,6 +660,7 @@ pub fn install(vm: &mut Vm) {
     let g = vm.realm().global;
     for (name, len, f) in [
         ("__net_fire", 5, net_fire as NativeFn),
+        ("__net_has_listeners", 1, net_has_listeners),
         ("__net_http", 6, net_http),
         ("__net_http_sync", 6, net_http_sync),
         ("__net_cancel", 1, net_cancel),

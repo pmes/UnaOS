@@ -20,3 +20,5 @@ pub mod subtle;
 pub mod uievents;
 pub mod websockets;
 pub mod xhr;
+/// AETHERWPT4 (SR142): the XML 1.0 + Namespaces parser behind XHR's document response and DOMParser's XML types.
+pub mod xml;

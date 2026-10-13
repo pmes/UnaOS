@@ -552,6 +552,47 @@ fn with_adopted<'a>(tree: &LayoutTree, sheets: &'a [String]) -> std::borrow::Cow
     }
 }
 
+/// AETHERWPT4 (SR142): each element's author declarations in cascade order (Cascade 5 §6: origin and importance,
+/// layers, specificity, order of appearance — css_core's sort), the inline `style` attribute included, over `sheets`
+/// and the document's adopted sheets: what CSSOM §9's resolved value reads for a property the layout report does not
+/// compute (js/cssom.rs `computed_value`: the last declaration of a property wins). `root` is the document node of
+/// `doc`; `@media` is evaluated against the `vw` × `vh` viewport.
+pub fn author_declarations(
+    doc: &html_core::Document,
+    root: html_core::NodeId,
+    sheets: &[String],
+    vw: f32,
+    vh: f32,
+) -> std::collections::HashMap<html_core::NodeId, Vec<css_core::parser::Declaration>> {
+    let mut all: Vec<String> = sheets.to_vec();
+    ADOPTED.with(|a| {
+        if let Some((d, list)) = a.borrow().as_ref() {
+            if d.id() == root {
+                all.extend(list.iter().cloned());
+            }
+        }
+    });
+    let parsed: Vec<css_core::stylesheet::Stylesheet> = all.iter().map(|s| css_core::stylesheet::parse_stylesheet(s)).collect();
+    let env = media_environment(vw, vh);
+    let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
+    let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
+    let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
+    let mut rules = css_core::cascade::RuleSet::new();
+    for s in &parsed {
+        rules.add_sheet(s, css_core::cascade::Origin::Author, &cond);
+    }
+    rules.build_index();
+    let mut out = std::collections::HashMap::new();
+    for id in doc.descendants(root) {
+        let Some(el) = doc.element(id) else { continue };
+        let inline = el.attr("style").filter(|t| crate::security::csp::allow_style_attr(t)).map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
+        let me = crate::dom::El::new(doc, id);
+        let applied = css_core::cascade::cascade(&rules, &me, &inline, None);
+        out.insert(id, applied.into_iter().map(|a| a.declaration.clone()).collect());
+    }
+    out
+}
+
 /// AETHERPAINTPERF (SR130): the engine's restyle — [`apply_stylesheets`] for the page's own document, which
 /// re-cascades only the elements the DOM changes since its last call can re-match (`restyle_plan`) and reuses
 /// that call's cascade for every other element. `hover` is the hover chain the engine set

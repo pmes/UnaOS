@@ -1062,6 +1062,85 @@ pub const PRELUDE: &str = r#"
         };
         return step();
     };
+    // AETHERWPT4 (SR142): Fetch's "multipart/form-data parser" over bytes and a boundary → [[name, value, filename|null]]
+    // (a File value when the part has a filename), or null on failure.
+    var parseMultipart = function (input, boundary) {
+        var n = input.length, pos = 0, out = [];
+        var bnd = utf8('--' + boundary), dec = new TextDecoder('utf-8', { ignoreBOM: true });
+        var at = function (p, seq) {
+            if (p + seq.length > n) { return false; }
+            for (var k = 0; k < seq.length; k++) { if (input[p + k] !== seq[k]) { return false; } }
+            return true;
+        };
+        var CRLF = [13, 10], DASHES = [45, 45];
+        var iso = function (a, b) { var t = ''; for (var k = a; k < b; k++) { t += String.fromCharCode(input[k]); } return t; };
+        // "parse a multipart/form-data name": to the next quote, %0A / %0D / %22 decoded.
+        var parseName = function () {
+            var start = pos;
+            while (pos < n && input[pos] !== 0x22) { pos++; }
+            if (pos >= n) { return null; }
+            var raw = iso(start, pos).replace(/%0A/g, '\n').replace(/%0D/g, '\r').replace(/%22/g, '"');
+            pos++;
+            var b = new Uint8Array(raw.length);
+            for (var k = 0; k < raw.length; k++) { b[k] = raw.charCodeAt(k); }
+            return dec.decode(b);
+        };
+        if (!at(pos, bnd)) { return null; }
+        pos += bnd.length;
+        for (;;) {
+            if (at(pos, DASHES)) { return out; }
+            if (!at(pos, CRLF)) { return null; }
+            pos += 2;
+            var name = null, filename = null, ctype = null;
+            for (;;) {
+                if (at(pos, CRLF)) { pos += 2; break; }
+                var hs = pos;
+                while (pos < n && input[pos] !== 0x3A && input[pos] !== 13 && input[pos] !== 10) { pos++; }
+                var hname = iso(hs, pos);
+                if (pos >= n || input[pos] !== 0x3A || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(hname)) { return null; }
+                pos++;
+                while (pos < n && (input[pos] === 0x20 || input[pos] === 0x09)) { pos++; }
+                var lname = hname.toLowerCase();
+                if (lname === 'content-disposition') {
+                    name = null; filename = null;
+                    var pre = utf8('form-data; name="');
+                    if (!at(pos, pre)) { return null; }
+                    pos += pre.length;
+                    name = parseName();
+                    if (name === null) { return null; }
+                    var fpre = utf8('; filename="');
+                    if (at(pos, fpre)) {
+                        pos += fpre.length;
+                        filename = parseName();
+                        if (filename === null) { return null; }
+                    }
+                } else if (lname === 'content-type') {
+                    var vs = pos;
+                    while (pos < n && input[pos] !== 13 && input[pos] !== 10) { pos++; }
+                    ctype = iso(vs, pos).replace(/[\t ]+$/, '');
+                } else {
+                    while (pos < n && input[pos] !== 13 && input[pos] !== 10) { pos++; }
+                }
+                if (!at(pos, CRLF)) { return null; }
+                pos += 2;
+            }
+            if (name === null) { return null; }
+            // The body: up to CR LF and the delimiter.
+            var delim = [13, 10].concat(Array.prototype.slice.call(bnd));
+            var end = -1;
+            for (var q = pos; q + delim.length <= n; q++) { if (at(q, delim)) { end = q; break; } }
+            if (end < 0) { return null; }
+            var body = input.slice(pos, end);
+            pos = end + delim.length;
+            if (filename !== null) {
+                if (ctype === null) { ctype = 'text/plain'; }
+                if (!/^[\x00-\x7F]*$/.test(ctype)) { ctype = ''; }
+                out.push([name, new File([body], filename, { type: ctype }), filename]);
+            } else {
+                out.push([name, dec.decode(body), null]);
+            }
+        }
+    };
     var mixBody = function (C) {
         getter(C.prototype, 'body', function () { return st(this).body; });
         getter(C.prototype, 'bodyUsed', function () { var b = st(this).body; return b !== null && disturbed(b); });
@@ -1073,9 +1152,32 @@ pub const PRELUDE: &str = r#"
             var ty = this.headers.get('content-type') || '';
             return consume(this, 'blob').then(function (b) { return new Blob([b], { type: ty }); });
         });
+        // AETHERWPT4 (SR142): Fetch §5 "consume body" with "package data" for FormData — the multipart/form-data
+        // parser (HTML §4.10.21.8 / RFC 7578, as Fetch's "multipart/form-data parser" states it) or the
+        // application/x-www-form-urlencoded parser (URL §5.1); any other MIME type is a TypeError.
         method(C.prototype, 'formData', function () {
-            __ledger('fetch-formData-unimplemented');
-            return Promise.reject(new TypeError('formData() is not supported'));
+            var self = this, who = this instanceof Response ? 'Response' : 'Request';
+            var ct = this.headers.get('content-type');
+            return consume(this, 'formData').then(function (bytes) {
+                var m = ct === null ? null : (typeof __mime_parse === 'function' ? __mime_parse(ct) : null);
+                var ess = m ? m.type + '/' + m.subtype : '';
+                var fail = function () { throw new TypeError("Failed to execute 'formData' on '" + who + "': Failed to parse body as FormData."); };
+                var fd = new FormData();
+                if (ess === 'multipart/form-data') {
+                    var boundary = null;
+                    m.params.forEach(function (p) { if (p[0] === 'boundary') { boundary = p[1]; } });
+                    var entries = boundary === null ? null : parseMultipart(bytes, boundary);
+                    if (entries === null) { fail(); }
+                    entries.forEach(function (e) { if (e[2] !== null) { fd.append(e[0], e[1], e[2]); } else { fd.append(e[0], e[1]); } });
+                    return fd;
+                }
+                if (ess === 'application/x-www-form-urlencoded') {
+                    __form_parse(new TextDecoder().decode(bytes)).forEach(function (r) { fd.append(r[0], r[1]); });
+                    return fd;
+                }
+                void self;
+                fail();
+            });
         });
     };
 
@@ -1256,17 +1358,39 @@ pub const PRELUDE: &str = r#"
     hide(globalThis, 'Response', Response);
 
     // ---- fetch (Fetch §5.6) ---------------------------------------------------------------------------
-    var dataURL = function (url) {
-        var m = /^data:([^,]*?)(;base64)?,([\s\S]*)$/i.exec(url);
-        if (!m) { return null; }
-        var type = m[1] || 'text/plain;charset=US-ASCII', bytes;
-        if (m[2]) {
-            var bin = atob(decodeURIComponent(m[3]).replace(/[\t\n\f\r ]/g, ''));
-            bytes = new Uint8Array(bin.length);
-            for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
-        } else {
-            bytes = utf8(decodeURIComponent(m[3]));
+    // AETHERWPT4 (SR142): Fetch "data: URL processor" (§ data: URLs) — the body percent-decoded to BYTES (not through UTF-8
+    // text), `;base64` recognized at the end of the MIME type with spaces before it, the forgiving-base64 decode of the
+    // isomorphic decoding, a MIME type that does not parse becoming text/plain;charset=US-ASCII.
+    var pctDecode = function (str) {
+        var b = utf8(str), out = new Uint8Array(b.length), n = 0;
+        var hx = function (c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102); };
+        for (var i = 0; i < b.length; i++) {
+            var c = b[i];
+            if (c === 0x25 && i + 2 < b.length && hx(b[i + 1]) && hx(b[i + 2])) {
+                out[n++] = parseInt(String.fromCharCode(b[i + 1], b[i + 2]), 16);
+                i += 2;
+            } else {
+                out[n++] = c;
+            }
         }
+        return out.slice(0, n);
+    };
+    var dataURL = function (url) {
+        var m = /^data:([^,]*),([\s\S]*)$/i.exec(String(url).replace(/#[\s\S]*$/, ''));
+        if (!m) { return null; }
+        var type = m[1].replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ''), bytes = pctDecode(m[2]);
+        var b64 = /;[ ]*base64$/i.exec(type);
+        if (b64) {
+            var bin = '';
+            for (var i = 0; i < bytes.length; i++) { bin += String.fromCharCode(bytes[i]); }
+            try { bin = atob(bin.replace(/[\t\n\f\r ]/g, '')); } catch (e) { return null; }
+            bytes = new Uint8Array(bin.length);
+            for (var k = 0; k < bin.length; k++) { bytes[k] = bin.charCodeAt(k); }
+            type = type.slice(0, b64.index);
+        }
+        if (type.charAt(0) === ';') { type = 'text/plain' + type; }
+        var rec = typeof __mime_parse === 'function' ? __mime_parse(type) : (/^[^\/;]+\/[^\/;]+/.test(type) ? type : null);
+        if (rec === null) { type = 'text/plain;charset=US-ASCII'; }
         return [type, bytes];
     };
     hide(globalThis, '__data_url', dataURL);
