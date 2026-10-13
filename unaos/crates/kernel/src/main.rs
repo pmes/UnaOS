@@ -6818,8 +6818,8 @@ fn x86_render_service(cpu: usize) {
                                 // On the crispy desktop the key never falls to the backdrop console
                                 // (the shell is off the glass); it goes to the shell WINDOW, or is
                                 // dropped if the window failed to open (logged at bring-up).
-                                if shell_id != unaos_kernel::video::wm::WIN_NONE {
-                                    let took = handle_key(c, &mut shell_console, &mut shell_pal);
+                                if unaos_kernel::serialdoor::to_window(c, shell_id, shell_gen, &mut shell_console.current_input) { // DOORSPLIT (rmbp-ledger B634) — LINE-NEUTRAL fold: a keyboard key goes to the window if one exists (as before); a DOOR key goes where its line was latched on its first byte — a line held for a window that is gone is adopted into the headless console (`serialdoor::adopt`), and a line begun headless stays headless when a window opens; `false` falls to the door arm below.
+                                    let took = handle_key(c, &mut shell_console, &mut shell_pal); unaos_kernel::serialdoor::window_saw(&shell_console.current_input); // DOORSPLIT — LINE-NEUTRAL append: the held window line as it now stands, what an adoption moves.
                                     shell_dirty = true;
                                     if took {
                                         break;
