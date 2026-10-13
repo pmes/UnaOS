@@ -1971,17 +1971,17 @@ fn block_scale(fb: &FrameBuffer) -> usize {
 /// a restore must match against. That single-answer property is why save and restore can walk the
 /// same scan order and pair up entry for entry with no per-pixel bookkeeping.
 fn sprite_color(s: usize, col: usize, row: usize) -> Option<u32> {
-    // SHOTREGION: while a selection is up the arrow is a crosshair — one `s`-thick vertical and horizontal bar through the cell's centre block.
-    let cross = CROSSHAIR.load(Ordering::Relaxed);
+    // CURSORSHAPE (B550): the glyph is the LATCHED row of the one sprite table (`SHAPES`, file tail) — latched only inside `draw_locked` while the sprite is DOWN, so every save, restore and plan of one drawn sprite walks the same pixel set and the same colours (the colour guard's premise). SHOTREGION's crosshair is that table's row 3. ⚠ LINE-NEUTRAL: edited in place.
+    let g = &SHAPES[(LIVE_SHAPE.load(Ordering::Relaxed) as usize).min(SHAPES.len() - 1)];
     let hit = |c: usize, r: usize| -> bool {
         c < crate::ui::BASE_CELL * s
             && r < crate::ui::BASE_CELL * s
-            && if cross { c / s == 3 || r / s == 3 } else { ARROW[r / s] & (0x80 >> (c / s)) != 0 }
+            && g.mask[r / s] & (0x80 >> (c / s)) != 0
     };
     if hit(col, row) {
-        Some(FILL)
+        Some(g.fill)
     } else if col >= s && row >= s && hit(col - s, row - s) {
-        Some(SHADOW)
+        Some(g.shadow)
     } else {
         None
     }
@@ -3810,7 +3810,7 @@ fn current_origin() -> Option<(usize, usize)> {
     if info.width == 0 || info.height == 0 {
         return None;
     }
-    let (px, py) = crate::pal::cursor::pos(info.width as i32, info.height as i32);
+    let (px, py) = shape_hot(crate::pal::cursor::pos(info.width as i32, info.height as i32), crate::ui::Metrics::panel().scale); // CURSORSHAPE (B550): the LIVE glyph's hotspot sits on the pointer, exactly as `draw_locked` places it, so a plan is judged against the origin a draw would use. ⚠ LINE-NEUTRAL: edited in place.
     Some((
         (px.max(0) as usize).min(info.width - 1),
         (py.max(0) as usize).min(info.height - 1),
@@ -4120,7 +4120,7 @@ fn draw_locked(
         return Ok(None);
     }
     let info = fb.info();
-    let s = block_scale(&fb);
+    let s = block_scale(&fb); shape_latch(); // CURSORSHAPE (B550): THE ONE LATCH — the requested shape becomes the drawn one here, with the sprite provably DOWN (every caller tests `!sp.drawn`), before the save-under walks its pixels. ⚠ LINE-NEUTRAL append.
     let side = (crate::ui::BASE_CELL + 1) * s;
     if s == 0 || side > MAX_SIDE || info.width == 0 || info.height == 0 {
         return Ok(None);
@@ -4133,7 +4133,7 @@ fn draw_locked(
     // keeps the tip exactly on the hot spot and simply draws less of the tail. (`pal::cursor` clamps
     // the position to the panel, so the origin is always on-screen and the clipped box is never
     // empty.)
-    let (px, py) = crate::pal::cursor::pos(info.width as i32, info.height as i32);
+    let (px, py) = shape_hot(crate::pal::cursor::pos(info.width as i32, info.height as i32), s); // CURSORSHAPE (B550): the box origin is the pointer minus the latched glyph's hotspot (the arrow's is (0,0), so the arrow is placed exactly as before); the hit-test point is still `pal::cursor::pos`. ⚠ LINE-NEUTRAL: edited in place.
     let bx = (px.max(0) as usize).min(info.width.saturating_sub(1));
     let by = (py.max(0) as usize).min(info.height.saturating_sub(1));
     let bw = side.min(info.width - bx);
@@ -4943,12 +4943,12 @@ fn ptrpaint_selftest(held: SpriteLoan) {
     );
 }
 
-/// SHOTREGION M1 — the selection crosshair. Read by [`sprite_color`] on every sprite paint, so flipping it takes effect on the very next draw (the next pointer report or composite); the sprite's box is the same either way.
+/// SHOTREGION M1 — the selection crosshair. CURSORSHAPE (B550): an OVERRIDE of the requested shape (`shape_effective`), latched by the next draw like any shape and owed a repaint when it flips, so it still takes effect on the very next sprite paint; the sprite's box is the same either way.
 static CROSSHAIR: AtomicBool = AtomicBool::new(false);
 
 /// SHOTREGION M1 — turn the crosshair shape on or off.
 pub fn set_crosshair(on: bool) {
-    CROSSHAIR.store(on, Ordering::Relaxed);
+    CROSSHAIR.store(on, Ordering::Relaxed); shape_owe(); // CURSORSHAPE (B550): a flip owes the sprite one repaint so the latch takes it (file tail). ⚠ LINE-NEUTRAL append.
 }
 
 /// SHOTREGION M1 — is the crosshair the current shape (the fixture's witness).
@@ -5150,3 +5150,201 @@ fn ghost_rollup(scope: &str) {
         scope, declined, px, refused, damaged, verdict
     );
 }
+
+// =================================================================================================
+// CURSORSHAPE — ONE SPRITE TABLE, THE SHAPE A FOCUSED PROGRAM ASKS FOR (rmbp-ledger B550; R108's pane contract,
+// its input half)
+// =================================================================================================
+//
+// Appended at the TAIL for the reason every block above gives: `cursor.rs` is compiled into the knob-off image on
+// both arches and panic `Location` records embed line numbers. Above this block the arc is five SAME-LINE edits,
+// each code-first (LEDGER P7): `sprite_color`'s glyph lookup (one comment line, the `cross` line and three arms
+// edited in place), `current_origin`'s and `draw_locked`'s pointer line (`shape_hot`), `draw_locked`'s scale line
+// (`shape_latch`), and `set_crosshair`'s store (`shape_owe`).
+//
+// # What changed
+//
+// The sprite was ONE glyph (`ARROW`) plus SHOTREGION's crosshair, which `sprite_color` computed from a flag. It is
+// now a TABLE, [`SHAPES`], one row per `una_abi::CURSOR_*` value — the 8x8 block mask, the hotspot, and the
+// (fill, shadow) pair read from `video/theme.rs` (`POINTER_SHAPE_INK`). Row 0 is `ARROW` with `FILL`/`SHADOW` and
+// hotspot (0,0), so the default sprite is the same pixels at the same origin as before the arc; row 3 is the
+// crosshair SHOTREGION drew (the col-3 / row-3 bars), now with its hotspot on its centre.
+//
+// # The latch — why a shape change can never mis-restore
+//
+// Every walk of a drawn sprite (`undraw_locked`'s restore, `settle`, `compose_into`, `absorb_desktop`, the ghost
+// restore) re-derives the painted set from `sprite_color` and pairs it with `saved[i]` by scan index, and the
+// colour guard compares the panel against `sprite_color`'s colour. Both are only sound if the glyph a sprite was
+// DRAWN with is the glyph it is RESTORED with. So the shape is two words: [`REQ_SHAPE`] (what the focused program
+// asked for, written lock-free from syscall context by [`set_shape`]) and [`LIVE_SHAPE`] (what `sprite_color`
+// reads), and the only writer of `LIVE_SHAPE` is [`shape_latch`], called inside `draw_locked` — under the sprite
+// loan, with the sprite provably down, before the save-under. A stale overlay plan composed against the previous
+// glyph carries the previous epoch (`draw_locked` bumps it), so `adopt_overlay` declines it exactly as it declines a
+// plan whose geometry moved (TWOCURSORS' ghost restore covers the rest).
+//
+// # Getting the change on the glass
+//
+// [`set_shape`] arms `REPAINT_OWED` when the requested glyph differs from the drawn one — the same flag a refused
+// claim arms, cashed by `take_present_dirty` at the next composite tail (and on x86 `wc` by `cash_owed_sprite`),
+// and by the next pointer report's own `repaint` in any case. It deliberately does NOT call `owe_repaint`: that also
+// charges `[wedge9] refused=`, and a shape change is not contention. No lock, no print, no allocation — safe from a
+// masked teardown and from either arch's syscall path.
+//
+// The arch halves (`arch/*/syscall.rs`, file tails): `SYS_CURSOR_SHAPE` stores the shape on the caller's slot
+// sidecar and calls [`set_shape`] when the caller holds focus; every focus change calls it with the INCOMING
+// program's stored shape (the outgoing one is reset to the arrow), and a focus revoked by a teardown with the arrow.
+
+/// One row of the sprite table: an 8x8 block mask (MSB = leftmost column, the `ARROW` layout), the hotspot in blocks
+/// (the pixel that sits ON the pointer), and the (fill, shadow) inks.
+pub struct Glyph {
+    pub mask: [u8; 8],
+    pub hot: (u8, u8),
+    pub fill: u32,
+    pub shadow: u32,
+}
+
+const fn ink(i: usize) -> (u32, u32) {
+    crate::video::theme::POINTER_SHAPE_INK[i]
+}
+
+/// THE SPRITE TABLE — indexed by `una_abi::CURSOR_*`. Shapes other than the arrow and crosshair are new with this
+/// arc and INVENTED (theme.rs PA38: the kit defines no pointer, so a kit revision may redraw any row; every reader
+/// goes through this table, so it is one edit).
+pub const SHAPES: [Glyph; una_abi::CURSOR_SHAPES as usize] = [
+    // CURSOR_ARROW — the arrow the sprite has always drawn, tip on the pointer.
+    Glyph { mask: ARROW, hot: (0, 0), fill: FILL, shadow: SHADOW },
+    // CURSOR_HAND — a raised index finger, its tip on the pointer.
+    Glyph {
+        mask: [0b0011_0000, 0b0011_0000, 0b0011_1110, 0b1011_1111, 0b1111_1111, 0b0111_1111, 0b0011_1110, 0b0011_1110],
+        hot: (2, 0),
+        fill: ink(1).0,
+        shadow: ink(1).1,
+    },
+    // CURSOR_TEXT — the I-beam: serifs top and bottom, stem in column 3, its middle on the pointer.
+    Glyph {
+        mask: [0b0110_1100, 0b0001_0000, 0b0001_0000, 0b0001_0000, 0b0001_0000, 0b0001_0000, 0b0001_0000, 0b0110_1100],
+        hot: (3, 4),
+        fill: ink(2).0,
+        shadow: ink(2).1,
+    },
+    // CURSOR_CROSSHAIR — SHOTREGION's bars (column 3 and row 3), now centred on the pointer.
+    Glyph {
+        mask: [0b0001_0000, 0b0001_0000, 0b0001_0000, 0b1111_1111, 0b0001_0000, 0b0001_0000, 0b0001_0000, 0b0001_0000],
+        hot: (3, 3),
+        fill: ink(3).0,
+        shadow: ink(3).1,
+    },
+    // CURSOR_MOVE — four arrowheads on a cross.
+    Glyph {
+        mask: [0b0001_0000, 0b0011_1000, 0b0101_0100, 0b1111_1110, 0b0101_0100, 0b0011_1000, 0b0001_0000, 0b0000_0000],
+        hot: (3, 3),
+        fill: ink(4).0,
+        shadow: ink(4).1,
+    },
+    // CURSOR_RESIZE_NS — a vertical double arrow.
+    Glyph {
+        mask: [0b0001_0000, 0b0011_1000, 0b0111_1100, 0b0001_0000, 0b0001_0000, 0b0111_1100, 0b0011_1000, 0b0001_0000],
+        hot: (3, 4),
+        fill: ink(5).0,
+        shadow: ink(5).1,
+    },
+    // CURSOR_RESIZE_EW — a horizontal double arrow.
+    Glyph {
+        mask: [0b0000_0000, 0b0010_0100, 0b0110_0110, 0b1111_1111, 0b0110_0110, 0b0010_0100, 0b0000_0000, 0b0000_0000],
+        hot: (4, 3),
+        fill: ink(6).0,
+        shadow: ink(6).1,
+    },
+    // CURSOR_BUSY — an hourglass.
+    Glyph {
+        mask: [0b1111_1110, 0b0100_0100, 0b0010_1000, 0b0001_0000, 0b0010_1000, 0b0100_0100, 0b1111_1110, 0b0000_0000],
+        hot: (3, 3),
+        fill: ink(7).0,
+        shadow: ink(7).1,
+    },
+];
+
+const _: () = assert!(
+    crate::video::theme::POINTER_SHAPE_INK.len() == SHAPES.len()
+        && una_abi::CURSOR_CROSSHAIR == 3
+        && una_abi::CURSOR_ARROW == 0
+);
+
+/// CURSORSHAPE — the shape the focused program (or the shell) asked for. Written by [`set_shape`]; read only by
+/// [`shape_effective`].
+static REQ_SHAPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(una_abi::CURSOR_ARROW as u8);
+/// CURSORSHAPE — the table row the sprite is DRAWN with. Written only by [`shape_latch`] (inside `draw_locked`).
+static LIVE_SHAPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(una_abi::CURSOR_ARROW as u8);
+
+/// The row the next draw will latch: SHOTREGION's crosshair while a region selection is up, else the request.
+#[inline]
+fn shape_effective() -> u8 {
+    if CROSSHAIR.load(Ordering::Relaxed) {
+        una_abi::CURSOR_CROSSHAIR as u8
+    } else {
+        REQ_SHAPE.load(Ordering::Acquire)
+    }
+}
+
+/// THE LATCH — `draw_locked` only, sprite loan held and sprite down. See the block header.
+#[inline]
+fn shape_latch() {
+    LIVE_SHAPE.store(shape_effective(), Ordering::Relaxed);
+}
+
+/// The box origin for a pointer at `p` drawn at block scale `s`: the pointer minus the LIVE glyph's hotspot.
+#[inline]
+fn shape_hot(p: (i32, i32), s: usize) -> (i32, i32) {
+    let g = &SHAPES[(LIVE_SHAPE.load(Ordering::Relaxed) as usize).min(SHAPES.len() - 1)];
+    (p.0 - g.hot.0 as i32 * s as i32, p.1 - g.hot.1 as i32 * s as i32)
+}
+
+/// Owe the sprite one repaint if the glyph the next draw would latch is not the one on the glass. The flag is the
+/// one `owe_repaint` arms, WITHOUT its `[wedge9] refused=` charge — a shape change is not a refused claim.
+#[inline]
+fn shape_owe() {
+    if shape_effective() != LIVE_SHAPE.load(Ordering::Relaxed) {
+        REPAINT_OWED.store(true, Ordering::Release);
+    }
+}
+
+/// CURSORSHAPE — publish `shape` (a `una_abi::CURSOR_*` value; out of range reads as the arrow — the arch verb
+/// refuses those before it gets here) as the sprite's shape. Called by both arches' `SYS_CURSOR_SHAPE` for a caller
+/// holding focus, and by every focus change and focus revocation. Atomics only: no lock, no print, no allocation.
+pub fn set_shape(shape: u64) {
+    let s = if shape < una_abi::CURSOR_SHAPES { shape as u8 } else { una_abi::CURSOR_ARROW as u8 };
+    REQ_SHAPE.store(s, Ordering::Release);
+    shape_owe();
+}
+
+/// CURSORSHAPE — the sprite-table index the next draw latches (the fixture's witness: "set hand → the index
+/// changes, focus away → arrow").
+pub fn shape_index() -> u8 {
+    shape_effective()
+}
+
+/// CURSORSHAPE — the sprite-table index the sprite on the glass was drawn with.
+pub fn live_shape_index() -> u8 {
+    LIVE_SHAPE.load(Ordering::Relaxed)
+}
+
+/// CURSORSHAPE — a shape's wire name (`tests cursorshape`, and any witness that names one).
+pub fn shape_name(i: u8) -> &'static str {
+    match i as u64 {
+        una_abi::CURSOR_ARROW => "arrow",
+        una_abi::CURSOR_HAND => "hand",
+        una_abi::CURSOR_TEXT => "text",
+        una_abi::CURSOR_CROSSHAIR => "crosshair",
+        una_abi::CURSOR_MOVE => "move",
+        una_abi::CURSOR_RESIZE_NS => "resize-ns",
+        una_abi::CURSOR_RESIZE_EW => "resize-ew",
+        una_abi::CURSOR_BUSY => "busy",
+        _ => "?",
+    }
+}
+
+/// CURSORSHAPE — `tests cursorshape`, the fixture (CHARTER line in its own file). Declared here, at the tail, so the
+/// module root (`video/mod.rs`, lexed into every image) gains no line.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+#[path = "cursorshape.rs"]
+pub mod cursorshape;

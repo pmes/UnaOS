@@ -37,8 +37,9 @@
 //   carries the SYSTEM pointer in this window's pixels (una_abi's contract — x86 sends one after every relative
 //   report and for every tablet report), so this program neither estimates a pointer nor draws one: the
 //   compositor's sprite is the one pointer on the glass (flight 32: "there's 2 mouse cursors" was this program's
-//   arrow beside it). A hand over a link needs a compositor cursor-SHAPE verb, which does not exist; it is absent,
-//   not faked. Every move hit-tests with `layout_core::hit::hit` (the host's selection.rs hit test, one function
+//   arrow beside it). CURSORSHAPE (rmbp-ledger B550): the SHAPE is asked of the compositor, never drawn here —
+//   every hover hit asks `SYS_CURSOR_SHAPE` for the hand over a link, the text beam over selectable text (inside a
+//   text box), the arrow anywhere else (and while a selection drag is held, the beam). Every move hit-tests with `layout_core::hit::hit` (the host's selection.rs hit test, one function
 //   both rings call) at the delivered point: over an `a[href]` the status line names the href and `:: AETHER:
 //   hover -> PASS href=<h> ::` is written once per link entered; a pointer outside the window hovers nothing.
 // * CLICK (press + release, < 3 px between): over a link, NAVIGATE — the href resolved against the page's own
@@ -82,6 +83,7 @@ use layout_core::{FontSel, NodeMap};
 use una_abi::{
     input_ev_payload, input_ev_type, input_ev_xy, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, INPUT_EV_WHEEL,
     INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
+    CURSOR_ARROW, CURSOR_HAND, CURSOR_TEXT, SYS_CURSOR_SHAPE,
 };
 
 use sys::{exit, now_ms, sleep_ms, sys, write};
@@ -368,10 +370,20 @@ fn flat_at(p: &Page, fonts: &txt::Fonts, ptr: (i32, i32), scroll: f32) -> Option
     hit_at(p, fonts, ptr, scroll).map(|h| p.flat.at(h.index, h.near))
 }
 
-/// Re-hit the pointer for hover: the link under it (the hit must be INSIDE a box, not merely nearest).
+/// Re-hit the pointer for hover: the link under it (the hit must be INSIDE a box, not merely nearest), and the
+/// pointer shape that answers it (CURSORSHAPE, B550): the hand over a link, the text beam over any other text box
+/// (selectable text), the arrow off the text and outside the window.
 fn hover_at(app: &mut App, p: &Page, fonts: &txt::Fonts) {
     let inside = app.raw.is_some_and(|(x, y)| x >= 0 && y >= 0 && x < app.w && y < app.h);
-    let link = if inside { hit_at(p, fonts, app.ptr, app.scroll).filter(|h| h.inside).and_then(|h| p.box_link.get(h.index).copied().flatten()) } else { None };
+    let hit = if inside { hit_at(p, fonts, app.ptr, app.scroll).filter(|h| h.inside) } else { None };
+    let link = hit.as_ref().and_then(|h| p.box_link.get(h.index).copied().flatten());
+    cursor_shape(if link.is_some() {
+        CURSOR_HAND
+    } else if hit.is_some() {
+        CURSOR_TEXT
+    } else {
+        CURSOR_ARROW
+    });
     if link != app.hover {
         app.hover = link;
         app.dirty = true;
@@ -380,6 +392,14 @@ fn hover_at(app: &mut App, p: &Page, fonts: &txt::Fonts) {
             Line::new(b":: AETHER: hover -> PASS href=").put(cut(h.as_bytes(), 64)).put(b" ::").wire();
         }
     }
+}
+
+/// CURSORSHAPE (B550): ask the compositor for the pointer's shape. Called on every pointer event, uncached: the
+/// kernel compares against the shape it shows, and a focus change resets it to the arrow behind this program's
+/// back, so a ring-3 cache would go stale. The answer is ignored — on a kernel without the verb (-ENOSYS) the
+/// pointer simply stays the arrow.
+fn cursor_shape(shape: u64) {
+    let _ = sys(SYS_CURSOR_SHAPE, shape, 0, 0, 0);
 }
 
 fn cut(b: &[u8], n: usize) -> &[u8] {
@@ -836,6 +856,7 @@ pub extern "C" fn _start() -> ! {
                         }
                     }
                     if app.pressed && app.dragged {
+                        cursor_shape(CURSOR_TEXT); // CURSORSHAPE (B550): a selection drag is text under the pointer
                         if let (Some(a), Some(f)) = (app.anchor, flat_at(&page, &fonts, app.ptr, app.scroll)) {
                             app.sel = Some((a, f));
                         }

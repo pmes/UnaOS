@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), // CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -3697,7 +3697,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         // The operator named this launch and this is its first window: TAKE the focus, wherever it
         // currently is. A plain store rather than a CAS — there is no losing race to lose here, the
         // whole point being that an incumbent holder does not veto the grant.
-        USER_INPUT_ACTIVE.store(owner, Ordering::Release);
+        let cs_old = USER_INPUT_ACTIVE.swap(owner, Ordering::AcqRel); cursor_shape_focus(cs_old, owner); // CURSORSHAPE (B550): a focus TAKE is a focus change — `swap` names the loser so its shape resets (file tail). ⚠ LINE-NEUTRAL: edited in place.
         clear_input_row(slot);
         serial_println!(
             ":: wc-x86: input focus -> slot {} (SPAWN-FOCUS: operator-launched, first window) ::",
@@ -3708,7 +3708,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        clear_input_row(slot); // a fresh focus starts clean, exactly as `user_input_set_active` does
+        clear_input_row(slot); cursor_shape_focus(0, owner); // CURSORSHAPE (B550): the shell (0) was idle and loses focus to `owner` (file tail). ⚠ LINE-NEUTRAL append. — a fresh focus starts clean, exactly as `user_input_set_active` does
         serial_println!(":: wc-x86: input focus -> slot {} (first window, shell was idle) ::", slot);
         true
     } else {
@@ -5976,7 +5976,7 @@ pub fn user_input_set_active(slot_plus1: u64) {
         // generation at worst early, never late.
         pace_focus_arrival(slot);
     }
-    USER_INPUT_ACTIVE.store(slot_plus1, Ordering::Release);
+    let cs_old = USER_INPUT_ACTIVE.swap(slot_plus1, Ordering::AcqRel); cursor_shape_focus(cs_old, slot_plus1); // CURSORSHAPE (B550): the shape follows focus — the program LEAVING is reset to the arrow, the one ARRIVING shows its stored shape (the shell: the arrow); `swap` (AcqRel, a superset of the Release store it replaces) names the leaver. Body at the FILE TAIL. ⚠ LINE-NEUTRAL: edited in place.
     // VUGPAUSE-2/x86: a focus ARRIVAL is a wake edge, and it is the one the RING cannot supply — focus
     // enqueues nothing, it RESETS the ring, so an app parked on an empty ring sees no TAIL movement
     // when it is handed the keyboard. LAST, after the focus word is published, so the woken task
@@ -6010,7 +6010,7 @@ fn user_input_revoke_slot(slot: usize) {
         .compare_exchange(biased, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        EL0_FOCUS_REVOKES.fetch_add(1, Ordering::AcqRel);
+        EL0_FOCUS_REVOKES.fetch_add(1, Ordering::AcqRel); cursor_shape_focus(biased, 0); // CURSORSHAPE (B550): a revoked focus goes to the shell, so the dying program's shape leaves the sprite. ⚠ LINE-NEUTRAL append.
         serial_println!(":: wc-x86: input focus revoked — slot {} torn down ::", slot);
     }
     clear_input_row(slot);
@@ -14999,7 +14999,7 @@ pub fn clear_handle_row(slot: usize) {
     // this, because `clear_input_row` is shared with the focus-ARRIVAL path; see `USER_INPUT_PARKED`.
     // Teardown is the one event that PROVES the parker is gone: it is the path a task killed inside
     // `sched::futex_wait` exits through without ever reaching its own clear.
-    clear_input_parked(slot);
+    clear_input_parked(slot); cursor_shape_drop(slot); // CURSORSHAPE (B550): the slot's stored shape dies with the tenant (file tail). ⚠ LINE-NEUTRAL append.
     // WINX-7: the detached mark is per-TENANT, not per-slot, so it must die with the tenant — a
     // foreground `run` landing in a slot a `bg` job just vacated must not inherit "I was detached"
     // and skip its own frame cap.
@@ -30414,7 +30414,7 @@ pub fn slot_tables_warm(s: usize) {
     SLOT_EPOCH.warm(s);
     BUSX_MBOX.warm(s);
     BUSX_SEM.warm(s);
-    SLOT_REPACE.warm(s);
+    SLOT_REPACE.warm(s); SLOT_CURSOR_SHAPE.warm(s); // CURSORSHAPE (B550): the shape sidecar's row, claimed with the slot. ⚠ LINE-NEUTRAL append.
 }
 
 /// WINDOWCAP3 (B399): the DMG-REFUSE fixture's ground-truth masks are `u64`, so it reads the table's first
@@ -31085,4 +31085,73 @@ fn ptr_abs_arrival(slot: usize) {
     let packed = una_abi::input_ev_pack(INPUT_EV_MOUSE_ABS, una_abi::input_ev_xy_payload(x, y));
     USER_INPUT_BUF[slot][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
     USER_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
+// =================================================================================================
+// CURSORSHAPE (rmbp-ledger B550; R108 — the pane contract's INPUT half) — `SYS_CURSOR_SHAPE` (69, una-abi) on this
+// arch. TAIL-APPENDED; above this block the arc is same-line folds only: the dispatch arm (beside SYS_SPAWN_PATH),
+// the three focus writes (`user_input_set_active`'s store and the SPAWN-FOCUS take, each now a `swap` that names
+// the loser, and the idle-shell CAS arm), the teardown revoke, `clear_handle_row`'s drop and `slot_tables_warm`.
+//
+// * The shape lives on the OWNER'S SLOT, `SLOT_CURSOR_SHAPE` — a `procslot::SlotVec` row (B399), warmed with the
+//   slot so no path here allocates; every read and write below is `peek` (never allocates), so the focus hook is
+//   safe on the masked teardown chain and inside the router.
+// * A caller that holds focus (`USER_INPUT_ACTIVE == slot + 1`) also publishes to the sprite
+//   (`video::cursor::set_shape`, atomics only). One that does not is stored and never shown: it receives no
+//   pointer events, so it cannot know what is under the pointer.
+// * Every focus change runs `cursor_shape_focus(old, new)`: the program losing focus is reset to the arrow, the
+//   one gaining it shows its stored shape (0 = the shell = the arrow). A teardown resets the slot's row
+//   (`cursor_shape_drop`), so a reused slot inherits no shape.
+// =================================================================================================
+
+/// CURSORSHAPE (B550): the shape each slot asked for (`una_abi::CURSOR_*`), 0 = the arrow.
+static SLOT_CURSOR_SHAPE: crate::procslot::SlotVec<AtomicU8> = crate::procslot::SlotVec::new(|| AtomicU8::new(0), AtomicU8::new(0));
+
+/// `SYS_CURSOR_SHAPE(shape) -> 0 / -EINVAL` — see the block above. `-EINVAL` off a private slot too (the shared
+/// kernel row asks nothing of the sprite through this door).
+fn sys_cursor_shape(shape: u64) -> i64 {
+    match crate::arch::x86_64::memory::current_slot() {
+        Some(slot) => cursor_shape_apply(slot as u64 + 1, shape),
+        None => una_abi::EINVAL,
+    }
+}
+
+/// CURSORSHAPE: the verb's body for the owner whose focus key is `key` (`slot + 1`; 0 = the shell, which stores
+/// nothing and publishes when it holds focus). `pub` for `tests cursorshape` (`video/cursorshape.rs`), which acts
+/// for whoever holds focus.
+pub fn cursor_shape_apply(key: u64, shape: u64) -> i64 {
+    if shape >= una_abi::CURSOR_SHAPES {
+        return una_abi::EINVAL;
+    }
+    if key != 0 {
+        match SLOT_CURSOR_SHAPE.peek((key - 1) as usize).filter(|_| slot_in_range((key - 1) as usize)) {
+            Some(row) => row.store(shape as u8, Ordering::Release),
+            None => return una_abi::EINVAL,
+        }
+    }
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == key {
+        crate::video::cursor::set_shape(shape);
+    }
+    0
+}
+
+/// CURSORSHAPE: focus moved from `old` to `new` (both `slot + 1`, 0 = the shell). The leaver's shape resets to the
+/// arrow; the sprite shows the arriver's stored shape.
+fn cursor_shape_focus(old: u64, new: u64) {
+    if old != 0 && old != new {
+        if let Some(row) = SLOT_CURSOR_SHAPE.peek((old - 1) as usize) {
+            row.store(una_abi::CURSOR_ARROW as u8, Ordering::Release);
+        }
+    }
+    let shown = if new == 0 {
+        una_abi::CURSOR_ARROW
+    } else {
+        SLOT_CURSOR_SHAPE.peek((new - 1) as usize).map_or(una_abi::CURSOR_ARROW, |row| row.load(Ordering::Acquire) as u64)
+    };
+    crate::video::cursor::set_shape(shown);
+}
+
+/// CURSORSHAPE: slot teardown — the departed tenant's shape does not outlive it.
+fn cursor_shape_drop(slot: usize) {
+    if let Some(row) = SLOT_CURSOR_SHAPE.peek(slot) {
+        row.store(una_abi::CURSOR_ARROW as u8, Ordering::Release);
+    }
 }

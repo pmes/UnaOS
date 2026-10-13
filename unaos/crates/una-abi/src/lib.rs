@@ -2473,3 +2473,53 @@ pub const E2BIG: i64 = -7;
 /// Not an executable image for this arch.
 pub const ENOEXEC: i64 = -8;
 const _: () = assert!(SYS_SPAWN_PATH == SYS_RINGKEY + 1 && core::mem::size_of::<SpawnArg>() == 16);
+
+// =================================================================================================
+// CURSORSHAPE (rmbp-ledger B550; R108 — the pane contract's INPUT half: a surface in, an input stream out, a
+// resize, and now the POINTER SHAPE the pane asks for over its own content). AETHERPTR (B543) made the system
+// sprite the ONE pointer on the glass and left the hand over a link ABSENT, because no verb let a program ask the
+// compositor for a shape. This is that verb.
+//
+//   SYS_CURSOR_SHAPE(shape) -> 0 / -EINVAL
+//     shape   one of the CURSOR_* values below (a u64 enum; anything >= CURSOR_SHAPES is -EINVAL).
+//     effect  the shape is stored on the CALLER's slot (x86: the process slot; aarch64: the ASID) and, when the
+//             caller holds input focus, published to the compositor's sprite, which draws it at the next sprite
+//             paint (a pointer report or a composite tail — the change arms the sprite's owed repaint). The
+//             request of a program WITHOUT focus is stored and never shown: only the focused program receives
+//             the pointer (INPUT_EV_MOUSE_ABS), so only it can know what is under it.
+//     focus   a focus change resets the program LOSING focus to CURSOR_ARROW and shows the shape the program
+//             GAINING it has stored (CURSOR_ARROW for the shell); a slot torn down is reset to CURSOR_ARROW,
+//             so a reused slot inherits nothing. The kernel side is `user_input_set_active` on both arches.
+//     hotspot each shape's click point is its own (the beam's centre, the hand's fingertip): the sprite is drawn
+//             offset so its hotspot sits on the pointer, and the pointer position INPUT_EV_MOUSE_ABS carries is
+//             unchanged by the shape — a program hit-tests exactly as before.
+//     cost    the kernel compares against the shown shape, so calling it on EVERY pointer event is the intended
+//             use (no ring-3 cache to go stale across a focus change).
+//
+// Numbered 69: the next free number after RING3EXEC's SYS_SPAWN_PATH (68), continuing the tail-append order the
+// verbs since 63 follow (each `= n; // after <prev>`). 34..=39 are unassigned too and are left alone: nothing here
+// needs to sit beside the window verbs, and a gap is cheaper to keep than to explain. Free on both arches at the
+// arc's base abcb8d33: no `SYS_*: u64 = 69` anywhere in the tree, and neither dispatcher matches a literal 69.
+// =================================================================================================
+
+/// `SYS_CURSOR_SHAPE(shape)` — see the block above.
+pub const SYS_CURSOR_SHAPE: u64 = 69; // after RING3EXEC's SYS_SPAWN_PATH (68)
+/// The system arrow — the default, and what every focus change and teardown resets to.
+pub const CURSOR_ARROW: u64 = 0;
+/// A pointing hand — over a link or anything that navigates on a click.
+pub const CURSOR_HAND: u64 = 1;
+/// The text beam — over selectable or editable text.
+pub const CURSOR_TEXT: u64 = 2;
+/// A crosshair — a precise point or a region selection.
+pub const CURSOR_CROSSHAIR: u64 = 3;
+/// Four-way move — something under the pointer can be dragged anywhere.
+pub const CURSOR_MOVE: u64 = 4;
+/// Vertical resize — a horizontal edge or splitter that drags up/down.
+pub const CURSOR_RESIZE_NS: u64 = 5;
+/// Horizontal resize — a vertical edge or splitter that drags left/right.
+pub const CURSOR_RESIZE_EW: u64 = 6;
+/// Busy — the program is working and will not answer the pointer yet.
+pub const CURSOR_BUSY: u64 = 7;
+/// One past the last shape: the table width, and the first value `SYS_CURSOR_SHAPE` refuses.
+pub const CURSOR_SHAPES: u64 = 8;
+const _: () = assert!(SYS_CURSOR_SHAPE == SYS_SPAWN_PATH + 1 && CURSOR_BUSY + 1 == CURSOR_SHAPES);
