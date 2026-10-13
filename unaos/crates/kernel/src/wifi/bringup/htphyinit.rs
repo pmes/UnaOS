@@ -729,3 +729,316 @@ pub(super) fn tx_prep(h: &mut Ht) -> TxPrep {
     );
     TxPrep { rx2tx, rst2rx, txpctl, pctl_en, c: h.c }
 }
+
+// ── WIFI11 (B653): HT-PHY TX power control from the SPROM's per-core PA coefficients ──────────────
+// `b43_phy_ht_op_init`'s tail (`phy_ht.c:998-1004`) after `tx_prep`'s tx-power-fix + control OFF: the
+// idle TSSI measured under a TX tone (`:573-607`), the control set up from SPROM maxpwr_2g / pa_2g
+// (`:621-729`), the TSSI mux (`:609-619`), control ON (`:533-571`). Registers from `phy_ht.h`, cited.
+#[cfg(feature = "wifi10")]
+const HT_IQLOCAL_CMDGCTL: u16 = 0x0C2; // phy_ht.h:20
+#[cfg(feature = "wifi10")]
+const HT_SAMP_CMD: u16 = 0x0C3; // phy_ht.h:21
+#[cfg(feature = "wifi10")]
+const HT_SAMP_CMD_STOP: u16 = 0x0002; // phy_ht.h:22
+#[cfg(feature = "wifi10")]
+const HT_SAMP_LOOP_CNT: u16 = 0x0C4; // phy_ht.h:23
+#[cfg(feature = "wifi10")]
+const HT_SAMP_WAIT_CNT: u16 = 0x0C5; // phy_ht.h:24
+#[cfg(feature = "wifi10")]
+const HT_SAMP_DEP_CNT: u16 = 0x0C6; // phy_ht.h:25
+#[cfg(feature = "wifi10")]
+const HT_SAMP_STAT: u16 = 0x0C7; // phy_ht.h:26
+#[cfg(feature = "wifi10")]
+const HT_TSSIMODE: u16 = 0x122; // phy_ht.h:30
+#[cfg(feature = "wifi10")]
+const HT_TSSIMODE_EN: u16 = 0x0001; // phy_ht.h:31
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_CMD_INIT: u16 = 0x007F; // phy_ht.h:40, :63, :101 (the same field in C1..C3)
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_CMD_PCTLEN: u16 = 0x8000; // phy_ht.h:43
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_N: u16 = 0x1E8; // phy_ht.h:44
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_N_TSSID: u16 = 0x00FF; // phy_ht.h:45
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_N_NPTIL2: u16 = 0x0700; // phy_ht.h:47-48 (shift 8)
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_IDLE_TSSI: u16 = 0x1E9; // phy_ht.h:49
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_IDLE_TSSI_C1: u16 = 0x003F; // phy_ht.h:50
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_IDLE_TSSI_C2: u16 = 0x3F00; // phy_ht.h:52-53 (shift 8)
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_IDLE_TSSI_BINF: u16 = 0x8000; // phy_ht.h:54
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_TARG_PWR: u16 = 0x1EA; // phy_ht.h:55 (C1 bits 7:0, C2 bits 15:8, :56-59)
+#[cfg(feature = "wifi10")]
+const HT_TX_PCTL_STATUS: [u16; 3] = [0x1ED, 0x1EE, extg(0x169)]; // phy_ht.h:60-61, :108
+#[cfg(feature = "wifi10")]
+const HT_RSSI: [u16; 3] = [0x219, 0x21A, 0x21B]; // phy_ht.h:64-66
+#[cfg(feature = "wifi10")]
+const HT_RF_SEQ_MODE_CA_OVER: u16 = 0x0001; // phy_ht.h:73
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_IDLE_TSSI2: u16 = extg(0x165); // phy_ht.h:102 (C3 bits 5:0, :103-104)
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_TARG_PWR2: u16 = extg(0x166); // phy_ht.h:105 (C3 bits 7:0, :106-107)
+/// `phy_ht.c:575` — the per-core register bases the idle-TSSI step saves and drives (0x840 = EXTG 0x40).
+#[cfg(feature = "wifi10")]
+const HT_IDLE_TSSI_BASE: [u16; 3] = [0x840, 0x860, 0x880];
+/// `phy_ht.c:470-477` — the twelve registers `poll_rssi` saves around the RSSI selection.
+#[cfg(feature = "wifi10")]
+const HT_POLL_RSSI_SAVE: [u16; 12] = [
+    HT_AFE[0].1, HT_AFE[0].0, 0x848, 0x841, HT_AFE[1].1, HT_AFE[1].0, 0x868, 0x861, HT_AFE[2].1, HT_AFE[2].0, 0x888, 0x881,
+];
+/// `phy_ht.c:361` — the sample-play buffer, table 0x11 (0x4400 = 17 << 10 in the cursor form), 20 << 3 entries.
+#[cfg(feature = "wifi10")]
+const HT_SAMP_TABLE: u16 = 0x11;
+#[cfg(feature = "wifi10")]
+const HT_SAMP_LEN: u16 = 20 << 3;
+
+/// The per-core inputs (SPROM, `ident::CorePwr`): the target power (dBm/4) and the three PA
+/// coefficients a1, b0, b1 as `phy_ht.c:633-636` names them.
+#[cfg(feature = "wifi10")]
+#[derive(Clone, Copy)]
+pub(super) struct PwrIn {
+    pub target: u8,
+    pub a1: i16,
+    pub b0: i16,
+    pub b1: i16,
+}
+
+/// What `tx_pwr_ctl` measured, wrote and read back.
+#[cfg(feature = "wifi10")]
+pub(super) struct TxPctl {
+    /// `TXPCTL_CMD_C1 & EN_BITS == EN_BITS` after the enable.
+    pub on: bool,
+    /// The idle TSSI per core (`phy_ht.c:600-602`).
+    pub idle: [u8; 3],
+    /// `TX_PCTL_STATUS_C1..C3` read after the enable: the hardware's current power index per core.
+    pub status: [u16; 3],
+    /// `TXPCTL_CMD_C1..C3` read after the enable.
+    pub cmd: [u16; 3],
+    /// `TXPCTL_TARG_PWR` and `TXPCTL_TARG_PWR2` read back.
+    pub targ: [u16; 2],
+    /// `TXPCTL_IDLE_TSSI` and `TXPCTL_IDLE_TSSI2` read back.
+    pub idle_regs: [u16; 2],
+    /// The TX tone ran to its status bit (`phy_ht.c:404-411`).
+    pub tone_ok: bool,
+    /// The sample-play engine's status before `stop_playback` (`phy_ht.c:341`).
+    pub samp_stat: u16,
+    pub c: Counts,
+}
+
+/// `phy_ht.c:359-372` — the sample buffer: `HT_SAMP_LEN` 32-bit zero elements of table 0x11 from
+/// offset 0 (b43 sets the cursor once and lets it advance; this tree sets it per element).
+#[cfg(feature = "wifi10")]
+fn load_samples(h: &mut Ht) -> u16 {
+    for i in 0..HT_SAMP_LEN {
+        h.tab_w(HT_SAMP_TABLE, i, Tw::B32, 0);
+    }
+    HT_SAMP_LEN
+}
+
+/// `phy_ht.c:374-413` — run the loaded samples: depth = samps-1, loops 0xFFFF (endless; not
+/// decremented), wait 0; RF_SEQ_MODE.CA_OVER set around SAMP_CMD bit 0; the status bit polled 100 x
+/// 10 us. `bb_mult` receives HTTAB16(13, 0x63 + i*4) on the first run (`:382-385`). Returns the poll verdict.
+#[cfg(feature = "wifi10")]
+fn run_samples(h: &mut Ht, samps: u16, loops: u16, wait: u16, bb_mult: &mut [Option<u16>; 3]) -> bool {
+    for (i, m) in bb_mult.iter_mut().enumerate() {
+        if m.is_none() {
+            *m = Some(h.tab_r(13, 0x63 + (i as u16) * 4, Tw::B16) as u16);
+        }
+    }
+    h.phy_w(HT_SAMP_DEP_CNT, samps - 1);
+    let loops = if loops != 0xFFFF { loops - 1 } else { loops };
+    h.phy_w(HT_SAMP_LOOP_CNT, loops);
+    h.phy_w(HT_SAMP_WAIT_CNT, wait);
+    let save_seq_mode = h.phy_r(HT_RF_SEQ_MODE);
+    h.phy_set(HT_RF_SEQ_MODE, HT_RF_SEQ_MODE_CA_OVER);
+    // :397-399 — b43 masks with ~0 (no bit cleared; its own TODO); the read-modify-writes are kept in order.
+    h.phy_mask(HT_SAMP_CMD, 0xFFFF);
+    h.phy_mask(HT_SAMP_CMD, 0xFFFF);
+    h.phy_mask(HT_IQLOCAL_CMDGCTL, 0xFFFF);
+    h.phy_set(HT_SAMP_CMD, 0x1);
+    let mut ok = false;
+    for _ in 0..100 {
+        if h.phy_r(HT_RF_SEQ_STATUS) & 1 == 0 {
+            ok = true;
+            break;
+        }
+        let _ = settle(10);
+    }
+    if !ok {
+        h.c.timeouts += 1;
+    }
+    h.phy_w(HT_RF_SEQ_MODE, save_seq_mode);
+    ok
+}
+
+/// `phy_ht.c:335-357` — stop playback: SAMP_STAT bit 0 -> SAMP_CMD.STOP, else bit 1 ->
+/// IQLOCAL_CMDGCTL &= 0x7FFF; SAMP_CMD &= ~4; the saved bb_mult restored to HTTAB16(13, 0x63/0x67 + i*4).
+#[cfg(feature = "wifi10")]
+fn stop_playback(h: &mut Ht, bb_mult: &[Option<u16>; 3]) -> u16 {
+    let stat = h.phy_r(HT_SAMP_STAT);
+    if stat & 0x1 != 0 {
+        h.phy_set(HT_SAMP_CMD, HT_SAMP_CMD_STOP);
+    } else if stat & 0x2 != 0 {
+        h.phy_mask(HT_IQLOCAL_CMDGCTL, 0x7FFF);
+    }
+    h.phy_mask(HT_SAMP_CMD, !0x0004);
+    for (i, m) in bb_mult.iter().enumerate() {
+        if let Some(v) = m {
+            h.tab_w(13, 0x63 + (i as u16) * 4, Tw::B16, *v as u32);
+            h.tab_w(13, 0x67 + (i as u16) * 4, Tw::B16, *v as u32);
+        }
+    }
+    stat
+}
+
+/// `phy_ht.c:427-465` — RSSI selection, all three cores (`core_sel` 5), type TSSI 2G: AFE_Cx |= 0x300
+/// then |= 0xC00, AFE_Cx_OVER |= 0x200 then |= 0x400, radio C3|0xBF |= 1, radio Cx|0x159 <- 0x11.
+#[cfg(feature = "wifi10")]
+fn rssi_select_tssi_2g(h: &mut Ht) {
+    for (core, (over, afe)) in HT_AFE.iter().enumerate() {
+        h.phy_set(*afe, 0x3 << 8);
+        h.phy_set(*afe, 0x3 << 10);
+        h.phy_set(*over, 0x1 << 9);
+        h.phy_set(*over, 0x1 << 10);
+        h.radio_set(R2059_C3 | 0xbf, 0x1);
+        h.radio_w([R2059_C1, R2059_C2, R2059_C3][core] | 0x159, 0x11);
+    }
+}
+
+/// `phy_ht.c:467-509` — one sample of the three RSSI words under the TSSI-2G selection, the twelve
+/// registers saved and restored; each core's two 6-bit fields sign-extended (`:496-501`). Returns
+/// `[C1 low, C1 high, C2 low, C2 high, C3 low, C3 high]`.
+#[cfg(feature = "wifi10")]
+fn poll_rssi_tssi_2g(h: &mut Ht) -> [i32; 6] {
+    let mut save = [0u16; 12];
+    for (i, r) in HT_POLL_RSSI_SAVE.iter().enumerate() {
+        save[i] = h.phy_r(*r);
+    }
+    rssi_select_tssi_2g(h);
+    let sx = |v: u16| -> i32 { (((v & 0x3F) << 2) as u8 as i8 >> 2) as i32 };
+    let mut buf = [0i32; 6];
+    for (c, r) in HT_RSSI.iter().enumerate() {
+        let t = h.phy_r(*r);
+        buf[2 * c] = sx(t);
+        buf[2 * c + 1] = sx(t >> 8);
+    }
+    for (i, r) in HT_POLL_RSSI_SAVE.iter().enumerate() {
+        h.phy_w(*r, save[i]);
+    }
+    buf
+}
+
+/// `phy_ht.c:573-607` — the idle TSSI: per core save base+6, +7, +0 and write +6 <- 0, +7 &= ~0xF,
+/// +0 |= 0x400, +0 |= 0x1000; the TX tone (`:415-421`: samples loaded, run endless); 20 us; one RSSI
+/// poll; playback stopped; CCA reset; the saved registers restored. idle[c] = the core's low field & 0xFF.
+#[cfg(feature = "wifi10")]
+fn idle_tssi(h: &mut Ht) -> ([u8; 3], bool, u16) {
+    let mut save = [[0u16; 3]; 3];
+    for (core, base) in HT_IDLE_TSSI_BASE.iter().enumerate() {
+        save[core][1] = h.phy_r(base + 6);
+        save[core][2] = h.phy_r(base + 7);
+        save[core][0] = h.phy_r(base + 0);
+        h.phy_w(base + 6, 0);
+        h.phy_mask(base + 7, !0xF);
+        h.phy_set(base + 0, 0x0400);
+        h.phy_set(base + 0, 0x1000);
+    }
+    let mut bb_mult = [None::<u16>; 3];
+    let samp = load_samples(h);
+    let tone_ok = run_samples(h, samp, 0xFFFF, 0, &mut bb_mult);
+    let _ = settle(20);
+    let buf = poll_rssi_tssi_2g(h);
+    let stat = stop_playback(h, &bb_mult);
+    let _ = reset_cca(h);
+    let idle = [(buf[0] & 0xff) as u8, (buf[2] & 0xff) as u8, (buf[4] & 0xff) as u8];
+    for (core, base) in HT_IDLE_TSSI_BASE.iter().enumerate() {
+        h.phy_w(base + 0, save[core][0]);
+        h.phy_w(base + 6, save[core][1]);
+        h.phy_w(base + 7, save[core][2]);
+    }
+    (idle, tone_ok, stat)
+}
+
+/// `phy_ht.c:621-729`, the 2.4 GHz arm (`:632-637`): TSSIMODE.EN; CMD_C1 &= ~PCTLEN; IDLE_TSSI |= 0x4000;
+/// CMD_C1..C3 INIT field <- 0x19; IDLE_TSSI |= BINF; the idle values into IDLE_TSSI (C1, C2) and
+/// IDLE_TSSI2 (C3); TXPCTL_N TSSID 0xF0, NPTIL2 3; the targets into TARG_PWR (C1, C2) and TARG_PWR2 (C3);
+/// per core the 64-entry estimate table HTTAB16(26 + c, 0..64): num = 8*(16*b0 + b1*i),
+/// den = 32768 + a1*i, pwr = max((4*num + den/2) / den, -8) (`:719-729`; C's truncating division = Rust's).
+#[cfg(feature = "wifi10")]
+fn tx_power_ctl_setup(h: &mut Ht, p: &[PwrIn; 3], idle: &[u8; 3]) {
+    h.phy_set(HT_TSSIMODE, HT_TSSIMODE_EN);
+    h.phy_mask(HT_TXPCTL_CMD_C1, !HT_TXPCTL_CMD_PCTLEN & 0xFFFF);
+    h.phy_set(HT_TXPCTL_IDLE_TSSI, 0x4000);
+    h.phy_maskset(HT_TXPCTL_CMD_C1, !HT_TXPCTL_CMD_INIT, 0x19);
+    h.phy_maskset(HT_TXPCTL_CMD_C2, !HT_TXPCTL_CMD_INIT, 0x19);
+    h.phy_maskset(HT_TXPCTL_CMD_C3, !HT_TXPCTL_CMD_INIT, 0x19);
+    h.phy_set(HT_TXPCTL_IDLE_TSSI, HT_TXPCTL_IDLE_TSSI_BINF);
+    h.phy_maskset(HT_TXPCTL_IDLE_TSSI, !HT_TXPCTL_IDLE_TSSI_C1, idle[0] as u16);
+    h.phy_maskset(HT_TXPCTL_IDLE_TSSI, !HT_TXPCTL_IDLE_TSSI_C2, (idle[1] as u16) << 8);
+    h.phy_maskset(HT_TXPCTL_IDLE_TSSI2, !0x003F, idle[2] as u16);
+    h.phy_maskset(HT_TXPCTL_N, !HT_TXPCTL_N_TSSID, 0xf0);
+    h.phy_maskset(HT_TXPCTL_N, !HT_TXPCTL_N_NPTIL2, 0x3 << 8);
+    h.phy_maskset(HT_TXPCTL_TARG_PWR, !0x00FF, p[0].target as u16);
+    h.phy_maskset(HT_TXPCTL_TARG_PWR, !0xFF00, (p[1].target as u16) << 8);
+    h.phy_maskset(HT_TXPCTL_TARG_PWR2, !0x00FF, p[2].target as u16);
+    for (c, pc) in p.iter().enumerate() {
+        let (a1, b0, b1) = (pc.a1 as i32, pc.b0 as i32, pc.b1 as i32);
+        for i in 0..64i32 {
+            let num = 8 * (16 * b0 + b1 * i);
+            let den = 32768 + a1 * i;
+            let pwr = core::cmp::max((4 * num + den / 2) / den, -8);
+            h.tab_w(26 + c as u16, i as u16, Tw::B16, pwr as u32);
+        }
+    }
+}
+
+/// `phy_ht.c:609-619` — the TSSI mux: per core radio 0x8BF |= 1 (C3 | 0xBF), radio Cx|0x159 <- 0x11.
+#[cfg(feature = "wifi10")]
+fn tssi_setup(h: &mut Ht) {
+    for r in [R2059_C1, R2059_C2, R2059_C3] {
+        h.radio_set(0x8bf, 0x1);
+        h.radio_w(r | 0x0159, 0x0011);
+    }
+}
+
+/// `phy_ht.c:533-571`, the enable arm (`:556-568`): CMD_C1 |= EN_BITS; the 5 GHz 0x32 writes do not
+/// apply; b43's saved indices start at INIT + 1 = 0x80 (`:862-864`), above INIT, so no CMD index is
+/// written and the hardware starts from the INIT field the setup wrote (0x19).
+#[cfg(feature = "wifi10")]
+fn tx_power_ctl_on(h: &mut Ht) {
+    h.phy_set(HT_TXPCTL_CMD_C1, HT_TXPCTL_EN_BITS);
+}
+
+/// The whole tail (`phy_ht.c:1001-1004`) after `tx_prep`: idle TSSI, setup from `p`, TSSI mux, control
+/// ON, then the readback. The MAC is suspended by the caller throughout, as b43's `op_init` runs
+/// (`phy_common.c:455`). The tone is the first signal this tree has ever put through the PA.
+#[cfg(feature = "wifi10")]
+pub(super) fn tx_pwr_ctl(h: &mut Ht, p: &[PwrIn; 3]) -> TxPctl {
+    let before = h.c;
+    let (idle, tone_ok, samp_stat) = idle_tssi(h);
+    serial_println!(
+        "[wifi11] idle-tssi tone={} samp_stat={:#06x} idle=[{},{},{}] wrote-phy-data={} wrote-radio-data={} timeouts={} — phy_ht.c:573-607 (tone :415-421, run :374-413, rssi :467-509, stop :335-357)",
+        if tone_ok { "ran" } else { "TIMEOUT" }, samp_stat, idle[0], idle[1], idle[2],
+        h.c.phy_data - before.phy_data, h.c.radio_data - before.radio_data, h.c.timeouts - before.timeouts
+    );
+    tx_power_ctl_setup(h, p, &idle);
+    tssi_setup(h);
+    tx_power_ctl_on(h);
+    let cmd = [h.phy_r(HT_TXPCTL_CMD_C1), h.phy_r(HT_TXPCTL_CMD_C2), h.phy_r(HT_TXPCTL_CMD_C3)];
+    let status = [h.phy_r(HT_TX_PCTL_STATUS[0]), h.phy_r(HT_TX_PCTL_STATUS[1]), h.phy_r(HT_TX_PCTL_STATUS[2])];
+    let targ = [h.phy_r(HT_TXPCTL_TARG_PWR), h.phy_r(HT_TXPCTL_TARG_PWR2)];
+    let idle_regs = [h.phy_r(HT_TXPCTL_IDLE_TSSI), h.phy_r(HT_TXPCTL_IDLE_TSSI2)];
+    let on = cmd[0] & HT_TXPCTL_EN_BITS == HT_TXPCTL_EN_BITS;
+    serial_println!(
+        "[wifi11] txpctl-setup target=[{},{},{}]dBm/4 a1=[{},{},{}] b0=[{},{},{}] b1=[{},{},{}] init_idx=0x19 cmd=[{:#06x},{:#06x},{:#06x}] en_bits={:#06x} targ_pwr={:#06x}/{:#06x} idle_tssi={:#06x}/{:#06x} status=[{:#06x},{:#06x},{:#06x}] est_tables=3x64(HTTAB16 26..28) tssi_mux=set wrote-phy-data={} wrote-radio-data={} -> {} — phy_ht.c:621-729, :609-619, :533-571",
+        p[0].target, p[1].target, p[2].target, p[0].a1, p[1].a1, p[2].a1, p[0].b0, p[1].b0, p[2].b0, p[0].b1, p[1].b1, p[2].b1,
+        cmd[0], cmd[1], cmd[2], cmd[0] & HT_TXPCTL_EN_BITS, targ[0], targ[1], idle_regs[0], idle_regs[1],
+        status[0], status[1], status[2], h.c.phy_data - before.phy_data, h.c.radio_data - before.radio_data,
+        if on { "ON" } else { "NOT-ON" }
+    );
+    TxPctl { on, idle, status, cmd, targ, idle_regs, tone_ok, samp_stat, c: h.c }
+}
