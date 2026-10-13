@@ -163,6 +163,8 @@ pub fn init(vm: &mut Vm) {
             eprintln!("[aether] {label} prelude failed: {m}");
         }
     }
+    // AETHERWPT2 (SR135): `crypto.subtle` over crypto_core, on the `crypto` the prelude made.
+    crate::api::subtle::init(vm);
 }
 
 /// AETHERWORKERS (SR123): the DOM-less half of [`init`] for a dedicated worker's realm (`workers::dedicated`):
@@ -184,6 +186,7 @@ pub(crate) fn init_worker(vm: &mut Vm) {
         let m = vm.error_string(&e);
         eprintln!("[aether-worker] platform prelude failed: {m}");
     }
+    crate::api::subtle::init(vm);
 }
 
 /// The WHATWG object shapes over the natives above.
@@ -784,32 +787,70 @@ const PRELUDE: &str = r#"
     globalThis.XMLSerializer = XMLSerializer;
 })();
 
+// ---- QuotaExceededError (WebIDL §3.14.2) ------------------------------
+// AETHERWPT2 (SR135): the DOMException subclass with `quota` and `requested`
+// (null when not given); negative or non-finite options are refused, and a
+// `requested` below `quota` is a RangeError.
+(function () {
+    if (typeof DOMException !== 'function') { return; }
+    var QE = new WeakMap();
+    var opt = function (v, what) {
+        if (v === undefined) { return null; }
+        var n = +v;
+        if (!isFinite(n)) { throw new TypeError("Failed to construct 'QuotaExceededError': Failed to read the '" + what + "' property from 'QuotaExceededErrorOptions': The provided double value is non-finite."); }
+        if (n < 0) { throw new RangeError("Failed to construct 'QuotaExceededError': '" + what + "' must not be negative."); }
+        return n;
+    };
+    class QuotaExceededError extends DOMException {
+        constructor() {
+            var message = arguments[0] === undefined ? '' : String(arguments[0]);
+            var o = arguments[1];
+            if (o !== undefined && o !== null && typeof o !== 'object' && typeof o !== 'function') { throw new TypeError("Failed to construct 'QuotaExceededError': The provided value is not of type 'QuotaExceededErrorOptions'."); }
+            var quota = opt(o ? o.quota : undefined, 'quota');
+            var requested = opt(o ? o.requested : undefined, 'requested');
+            if (quota !== null && requested !== null && requested < quota) { throw new RangeError("Failed to construct 'QuotaExceededError': 'requested' must not be less than 'quota'."); }
+            super(message, 'QuotaExceededError');
+            QE.set(this, { quota: quota, requested: requested });
+        }
+    }
+    var slot = function (o) {
+        var s = (o !== null && typeof o === 'object') ? QE.get(o) : undefined;
+        if (s === undefined) { throw new TypeError('Illegal invocation'); }
+        return s;
+    };
+    Object.defineProperty(QuotaExceededError.prototype, 'quota', { get: function () { return slot(this).quota; }, enumerable: true, configurable: true });
+    Object.defineProperty(QuotaExceededError.prototype, 'requested', { get: function () { return slot(this).requested; }, enumerable: true, configurable: true });
+    Object.defineProperty(globalThis, 'QuotaExceededError', { value: QuotaExceededError, writable: true, enumerable: false, configurable: true });
+})();
+
 // ---- crypto ----------------------------------------------------------
 // getRandomValues fills from the OS entropy pool; randomUUID is a real
 // v4 UUID built on the same bytes.
 (function () {
     var crypto = globalThis.crypto || {};
-    crypto.getRandomValues = function (arr) {
-        if (!arr || typeof arr.length !== 'number') {
-            throw new TypeError('getRandomValues expects an integer-typed array');
+    // AETHERWPT2 (SR135): WebCrypto §10.1.1 — an integer-typed ArrayBufferView only (TypeMismatchError for the
+    // float arrays and DataView), at most 65,536 bytes (QuotaExceededError), filled through a byte view so the
+    // BigInt64 arrays and subclasses fill too; the same object comes back.
+    var taDesc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag);
+    var taName = taDesc && typeof taDesc.get === 'function'
+        ? function (a) { return taDesc.get.call(a); }
+        : function (a) { return ArrayBuffer.isView(a) && !(a instanceof DataView) ? a.constructor.name : undefined; };
+    var INTEGER = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array', 'BigUint64Array'];
+    crypto.getRandomValues = function getRandomValues(array) {
+        if (arguments.length < 1) { throw new TypeError("Failed to execute 'getRandomValues' on 'Crypto': 1 argument required, but only 0 present."); }
+        if (!ArrayBuffer.isView(array)) { throw new TypeError("Failed to execute 'getRandomValues' on 'Crypto': parameter 1 is not of type 'ArrayBufferView'."); }
+        var kind = array instanceof DataView ? 'DataView' : taName(array);
+        if (INTEGER.indexOf(kind) < 0) {
+            throw new DOMException("Failed to execute 'getRandomValues' on 'Crypto': The provided ArrayBufferView is of type '" + kind + "', which is not an integer array type.", 'TypeMismatchError');
         }
-        if (typeof arr.BYTES_PER_ELEMENT === 'number' && arr.BYTES_PER_ELEMENT === 8) {
-            // BigInt64/BigUint64 need BigInt writes; not filled rather than
-            // filled wrongly.
-            __ledger('crypto.getRandomValues-64bit-array-unfilled');
-            return arr;
+        if (array.byteLength > 65536) {
+            var msg = "Failed to execute 'getRandomValues' on 'Crypto': The ArrayBufferView's byte length (" + array.byteLength + ") exceeds the number of bytes of entropy available via this API (65536).";
+            throw typeof QuotaExceededError === 'function' ? new QuotaExceededError(msg) : new DOMException(msg, 'QuotaExceededError');
         }
-        var width = arr.BYTES_PER_ELEMENT || 1;
-        var bytes = __random_bytes(arr.length * width);
-        for (var i = 0; i < arr.length; i++) {
-            var v = 0;
-            for (var b = 0; b < width; b++) { v = v * 256 + bytes[i * width + b]; }
-            // Typed-array assignment truncates to the element width; a
-            // plain Array keeps the full unsigned value, which is what a
-            // caller of a non-typed array can expect at best.
-            arr[i] = v;
+        if (array.byteLength) {
+            new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(__random_bytes(array.byteLength));
         }
-        return arr;
+        return array;
     };
     crypto.randomUUID = function () {
         var b = __random_bytes(16);

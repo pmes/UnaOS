@@ -196,3 +196,86 @@ R.push(PerformanceObserver.supportedEntryTypes === PerformanceObserver.supported
         "InvalidModificationError|3|9.5|measure|true|1|SyntaxError|SyntaxError|a,m,b|{\"name\":\"m\",\"entryType\":\"measure\",\"startTime\":3,\"duration\":9.5}|true|mark,measure|mark:a,mark:b|0|true"
     );
 }
+
+/// G6 — WebCrypto §10.1.1 `getRandomValues` and the WebIDL `QuotaExceededError`: float arrays and DataView are a
+/// TypeMismatchError, over 65,536 bytes a QuotaExceededError (code 22, `quota` / `requested` null, from this
+/// global's constructor), BigInt64 arrays and subclasses fill, the same object comes back.
+#[test]
+fn g6_get_random_values_checks() {
+    let got = answers(
+        r#"
+var name = function (f) { try { f(); return 'no throw'; } catch (e) { return e.name; } };
+R.push(name(function () { crypto.getRandomValues(new Float32Array(4)); }), name(function () { crypto.getRandomValues(new DataView(new ArrayBuffer(4))); }));
+try { crypto.getRandomValues(new Uint8Array(65537)); R.push('no throw'); }
+catch (e) { R.push(e.name, e.code, e.quota, e.requested, e.constructor === QuotaExceededError, e instanceof DOMException); }
+var big = new BigUint64Array(4);
+R.push(crypto.getRandomValues(big) === big, big.some(function (x) { return x !== 0n; }));
+class Sub extends Uint16Array {}
+var sub = new Sub(8);
+R.push(crypto.getRandomValues(sub) === sub, crypto.getRandomValues(new Uint8Array(0)).length);
+var q = new QuotaExceededError('m', { quota: 5, requested: 10 });
+R.push(q.quota, q.requested, q.name, q.message, name(function () { new QuotaExceededError('m', { quota: 10, requested: 5 }); }));
+"#,
+    );
+    assert_eq!(got, "TypeMismatchError|TypeMismatchError|QuotaExceededError|22|||true|true|true|true|true|0|5|10|QuotaExceededError|m|RangeError");
+}
+
+/// G7 — WebCrypto §14 over crypto_core: digest, HMAC sign / verify over an imported raw key, AES-GCM round
+/// trip (and an OperationError on a corrupted tag), AES-CTR against SP 800-38A F.5.1, HKDF deriveBits against
+/// RFC 5869 case 1, PBKDF2 deriveKey to an AES-GCM key, and the general steps' errors (unknown algorithm
+/// NotSupportedError, wrong usage InvalidAccessError, empty usages SyntaxError, non-extractable export).
+#[test]
+fn g7_subtle_crypto_symmetric() {
+    let mut e = load(&page(
+        r#"
+var hex = function (b) { return Array.prototype.map.call(new Uint8Array(b), function (x) { return (x + 256).toString(16).slice(1); }).join(''); };
+var un = function (h) { var o = new Uint8Array(h.length / 2); for (var i = 0; i < o.length; i++) { o[i] = parseInt(h.substr(i * 2, 2), 16); } return o; };
+var te = new TextEncoder();
+var S = crypto.subtle, out = {};
+var fail = function (p) { return p.then(function () { return 'resolved'; }, function (e) { return e.name; }); };
+Promise.all([
+    S.digest('sha-256', te.encode('abc')).then(hex),
+    S.importKey('raw', te.encode('Jefe'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']).then(function (k) {
+        return S.sign('HMAC', k, te.encode('what do ya want for nothing?')).then(function (sig) {
+            return S.verify('HMAC', k, sig, te.encode('what do ya want for nothing?')).then(function (ok) { return hex(sig) + ':' + ok + ':' + k.algorithm.length + ':' + k.usages.join(',') + ':' + (k instanceof CryptoKey); });
+        });
+    }),
+    S.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']).then(function (k) {
+        var iv = new Uint8Array(12);
+        return S.encrypt({ name: 'AES-GCM', iv: iv }, k, te.encode('hello')).then(function (ct) {
+            var bad = new Uint8Array(ct); bad[bad.length - 1] ^= 1;
+            return Promise.all([S.decrypt({ name: 'AES-GCM', iv: iv }, k, ct).then(function (p) { return new TextDecoder().decode(p); }), fail(S.decrypt({ name: 'AES-GCM', iv: iv }, k, bad)), S.exportKey('raw', k).then(function (r) { return r.byteLength; })]);
+        }).then(function (r) { return r.join(':'); });
+    }),
+    S.importKey('raw', un('2b7e151628aed2a6abf7158809cf4f3c'), 'AES-CTR', false, ['encrypt']).then(function (k) {
+        return S.encrypt({ name: 'AES-CTR', counter: un('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff'), length: 64 }, k, un('6bc1bee22e409f96e93d7e117393172a')).then(hex);
+    }),
+    S.importKey('raw', new Uint8Array(22).fill(11), 'HKDF', false, ['deriveBits']).then(function (k) {
+        return S.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: un('000102030405060708090a0b0c'), info: un('f0f1f2f3f4f5f6f7f8f9') }, k, 336).then(hex);
+    }),
+    S.importKey('raw', te.encode('password'), 'PBKDF2', false, ['deriveKey']).then(function (k) {
+        return S.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('salt'), iterations: 1 }, k, { name: 'AES-GCM', length: 256 }, true, ['encrypt']).then(function (d) {
+            return S.exportKey('raw', d).then(function (r) { return hex(r) + ':' + d.algorithm.name + ':' + d.algorithm.length; });
+        });
+    }),
+    fail(S.digest('SHA-3', new Uint8Array(1))),
+    S.importKey('raw', new Uint8Array(16), 'AES-GCM', false, ['decrypt']).then(function (k) { return Promise.all([fail(S.encrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, k, new Uint8Array(1))), fail(S.exportKey('raw', k))]); }).then(function (r) { return r.join(':'); }),
+    fail(S.generateKey({ name: 'HMAC', hash: 'SHA-256' }, false, [])),
+    fail(S.generateKey({ name: 'HMAC', hash: 'SHA-256' }, false, ['encrypt'])),
+]).then(function (r) { R = r; }, function (e) { R = ['rejected ' + e]; });
+"#,
+    ));
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\
+         |5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843:true:32:sign,verify:true\
+         |hello:OperationError:32\
+         |874d6191b620e3261bef6864990db6ce\
+         |3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865\
+         |120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b:AES-GCM:256\
+         |NotSupportedError\
+         |InvalidAccessError:InvalidAccessError\
+         |SyntaxError\
+         |SyntaxError"
+    );
+}

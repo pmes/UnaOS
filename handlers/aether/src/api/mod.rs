@@ -7,6 +7,8 @@ pub mod events;
 pub mod eventsource;
 pub mod fetch;
 pub mod platform;
+/// AETHERWPT2 (SR135): `crypto.subtle` (digest, HMAC, AES-GCM / AES-CTR, HKDF, PBKDF2) over crypto_core.
+pub mod subtle;
 pub mod uievents;
 pub mod websockets;
 pub mod xhr;
