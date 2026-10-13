@@ -488,8 +488,8 @@ refs/heads/exec-rmbp-settingstabs               d616bf98 FOLDED-BY-HAND 9de8376d
 refs/heads/exec-host-aethersidetabs             d616bf98 IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-tpstream                   d616bf98 FOLDED-BY-HAND 9de8376d
 refs/heads/exec-rmbp-wifi9                      bd3d399d IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-rmbp-gen7r9b                    bd3d399d IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-rmbp-keplergr4                  bd3d399d IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-gen7r9b                    bd3d399d FOLDED-BY-HAND c5e4b486
+refs/heads/exec-rmbp-keplergr4                  bd3d399d FOLDED-BY-HAND c5e4b486
 refs/heads/exec-pi-piemptybin                 bd3d399d IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-glasskit                   bd3d399d IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-softy                      bd3d399d IN-FLIGHT cloud 2026-10-14
