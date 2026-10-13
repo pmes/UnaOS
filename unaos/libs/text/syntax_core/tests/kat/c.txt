@@ -7,6 +7,6 @@ static const char *s = u8"x\n\101" "??=";
 int main(void) {
     size_t n = sizeof(int) + 0x1Fu + 1.5e-3f; // tail \
     continued
-    wchar_t c = L'é';
+    wchar_t c = L'\u00e9';
     return MAX(n, 2);
 }

@@ -39,7 +39,7 @@
 9 identifier |c|
 9 operator |=|
 9 char |L'|
-9 escape |é|
+9 escape |\u00e9|
 9 char |'|
 9 punctuation |;|
 10 keyword |return|

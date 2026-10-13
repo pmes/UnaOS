@@ -1,5 +1,5 @@
 # comment
-title = "TOML\"x\"é"
+title = "TOML\"x\"\u00e9"
 [owner]
 name.first = 'Tom'
 dob = 1979-05-27 07:32:00-08:00
