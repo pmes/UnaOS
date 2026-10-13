@@ -234,7 +234,7 @@ fn content_codings() {
     let n = bad.len();
     bad[n - 6] ^= 1; // the CRC-32
     assert!(matches!(encoding::decode(&[Coding::Gzip], &bad), Err(DecodeError::Inflate(_))));
-    assert_eq!(encoding::decode(&[Coding::Brotli], b"x"), Err(DecodeError::Unsupported("br".into())));
+    assert!(matches!(encoding::decode(&[Coding::Brotli], b"x"), Err(DecodeError::Brotli(_)))); // NETDEBT2 (SR113): br decodes now; one byte is a refused stream, not an unsupported coding
     let h = head("HTTP/1.1 200 OK\r\nContent-Encoding: identity, x-gzip\r\n\r\n");
     assert_eq!(encoding::content_codings(&h.headers), [Coding::Gzip]);
 }

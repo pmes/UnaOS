@@ -81,6 +81,11 @@ impl From<DecodeError> for Error {
     }
 }
 
+/// NETDEBT (SR97), shared by NETDEBT2 (SR113): at most this many HTTP/1.1 connections per origin at once (the
+/// browsers' long-standing six; RFC 9112 §9.4 asks a client to limit them). ONE limit for both rings: the host pool
+/// (`host::Agent`'s `h1_slots`) and AETHER.ELF's socket pool (user-aether net.rs) both read this constant.
+pub const MAX_H1_PER_ORIGIN: usize = 6;
+
 const READ_CHUNK: usize = 16 * 1024;
 
 /// A connection: the transport plus whatever was read past the last message.

@@ -12,15 +12,19 @@
 // 3. SOCKET — `vein_ring3::net::Tcp` over SYS_SOCKET 40 / SYS_CONNECT 44 / SYS_SEND 45 / SYS_SOCK_RECV 46 / SYS_CLOSE
 //    17 (non-blocking verbs polled, connect bounded at 15 s, I/O idle at 120 s), plus this file's per-navigation
 //    deadline (`FETCH_MS`) through `vein_ring3::net::set_tick`: past it every wait answers ECANCELED → `timeout`.
-// 4. TLS — `vein_ring3::tls::with_session` over `vein_ring3::TlsSetup::load()` (VEINTLS SR36: tls_core on
-//    CRYPTOCORE, the chain built to /system/trust/roots.pem, checked at SYS_TIME, RFC 6125 name match; the CT list
-//    and CCADB intermediates when staged). Exactly NET.ELF's and LUMEN.ELF's root pinning — loaded once, on the first
-//    https navigation. No provider / no trust store / no clock = a named refusal; there is no insecure mode.
-// 5. HTTP/1.1 — `http_core::h1::encode_request_head` + `http_core::Conn` (interim 1xx skipped, §6.3 framing,
-//    chunked), `h1::keep_alive` for reuse. HTTP/2: http_core's `h2` is no_std-clean (feature `h2` alone, no `host`),
-//    but vein_ring3's handshake offers ALPN `http/1.1` only, so h2 is never negotiated here (owed with an ALPN knob).
-// 6. CODINGS — `http_core::encoding` (gzip/deflate through pixel_core's inflater; Accept-Encoding advertises only
-//    those). `br` is not decoded by the core: a server that sends it anyway is a named refusal (`coding-unsupported`).
+// 4. TLS — `vein_ring3::tls::with_session_alpn` (ALPN `h2, http/1.1`, NETDEBT2 SR113) over
+//    `vein_ring3::TlsSetup::load()` (VEINTLS SR36: tls_core on CRYPTOCORE, the chain built to /system/trust/roots.pem,
+//    checked at SYS_TIME, RFC 6125 name match; the CT list and CCADB intermediates when staged). Exactly NET.ELF's and
+//    LUMEN.ELF's root pinning — loaded once, on the first https navigation. No provider / no trust store / no clock = a named refusal; there is no insecure mode.
+// 5. HTTP — over TLS the handshake offers ALPN `h2, http/1.1` and `Session::alpn` says what the server chose
+//    (NETDEBT2 SR113). `h2`: `http_core::h2::H2Conn` (no_std, the SAME client the host transport multiplexes with) —
+//    preface + SETTINGS, one stream per navigation (HEADERS with :method/:scheme/:authority/:path, the fields below
+//    minus the connection-specific ones), the head, DATA under both receive windows, the stream closed; the TLS
+//    session ends with the navigation as before. Otherwise (and always for plain http) HTTP/1.1:
+//    `http_core::h1::encode_request_head` + `http_core::Conn` (interim 1xx skipped, §6.3 framing, chunked),
+//    `h1::keep_alive` for reuse. The wire's `proto=h2|h1` says which carried the page.
+// 6. CODINGS — `http_core::encoding` (gzip/deflate through pixel_core's inflater, br through the core's RFC 7932
+//    decoder; `Accept-Encoding` is the core's `ACCEPT_ENCODING` = `gzip, deflate, br`, what the host sends too).
 // 7. COOKIES — `http_core::cookie::CookieJar` (RFC 6265bis: Secure, __Host-/__Secure- prefixes, SameSite with Lax
 //    default, Partitioned, the public-suffix Domain refusal through psl_core) in a `CookieContext` this file fills
 //    from psl_core's registrable domain: `cross_site` = the target's site differs from the last network page's,
@@ -28,8 +32,8 @@
 // 8. REDIRECTS — `http_core::redirect::next_hop` (Fetch §4.4: 301/302/303/307/308, Location joined, fragment
 //    inherited, only http/https followed) up to `redirect::MAX_REDIRECTS` (20); the request is rebuilt per hop, so the
 //    core's credential rule holds (cookies recomputed by the jar for the new URL; no Authorization is ever sent).
-// 9. CONNECTIONS — plain-HTTP keep-alive sockets are parked per origin and reused; at most `MAX_PER_ORIGIN` (6, the
-//    host transport's `MAX_H1_PER_ORIGIN`, http_core host.rs — host-only behind feature `host`, so mirrored here) are
+// 9. CONNECTIONS — plain-HTTP keep-alive sockets are parked per origin and reused; at most `MAX_PER_ORIGIN` (=
+//    `http_core::MAX_H1_PER_ORIGIN`, the no_std const the host pool reads too — ONE limit, NETDEBT2 SR113) are
 //    open to one origin, idle ones dropped after `IDLE_MS`. A TLS session lives inside `with_session`'s closure, so an
 //    https request is one connection with `Connection: close`.
 //
@@ -39,9 +43,10 @@
 // redirect credential rule (redirect.rs). Nothing is re-implemented here, so there is no second switch.
 //
 // WIRE, one line per navigation:
-// `:: AETHER: net url=<final url> status=<n> bytes=<decoded body> ms=<n> tls=<1.3|1.2|off> hops=<n> conn=<new|reused>
-//  coding=<identity|gzip|deflate> [issuer=<CN>] -> PASS|FAIL [reason=<why> code=<n>] ::` — PASS when a final answer
-// arrived (any status: a 404 page is a page); FAIL names the stage (`resolve`, `connect`, `tls-<why>`, `timeout`, ...).
+// `:: AETHER: net url=<final url> status=<n> bytes=<decoded body> ms=<n> tls=<1.3|1.2|off> proto=<h2|h1>
+//  hops=<n> conn=<new|reused> coding=<identity|gzip|deflate|br> [issuer=<CN>] -> PASS|FAIL [reason=<why> code=<n>] ::`
+// — PASS when a final answer arrived (any status: a 404 page is a page); FAIL names the stage (`resolve`, `connect`,
+// `tls-<why>`, `h2-protocol`, `timeout`, ...).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -50,6 +55,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use http_core::cookie::{CookieContext, CookieJar};
 use http_core::encoding::{self, Coding};
 use http_core::h1::{self, BodyDecoder};
+use http_core::h2::H2Conn;
 use http_core::url::{Host, Url};
 use http_core::{redirect, Conn, Headers};
 use vein_core::client::Transport as VeinTransport;
@@ -59,8 +65,9 @@ use vein_ring3::net::{Tcp, ECANCELED};
 use crate::sys::now_ms;
 use crate::Line;
 
-/// The host transport's per-origin HTTP/1.1 connection cap (http_core host.rs `MAX_H1_PER_ORIGIN`, NETDEBT SR97).
-pub const MAX_PER_ORIGIN: usize = 6;
+/// The per-origin HTTP/1.1 connection cap: http_core's shared `MAX_H1_PER_ORIGIN` (NETDEBT SR97), the SAME constant
+/// the host transport's pool reads (NETDEBT2 SR113) — never a copy.
+pub const MAX_PER_ORIGIN: usize = http_core::MAX_H1_PER_ORIGIN;
 /// Every navigation (all hops, DNS, connect, TLS, body) finishes inside this or ends `timeout`.
 pub const FETCH_MS: u64 = 30_000;
 /// A parked keep-alive socket older than this is closed rather than reused (servers time idle ones out).
@@ -203,6 +210,29 @@ fn exchange<T: VeinTransport + ?Sized>(t: &mut T, head: &[u8], said_close: bool)
     Ok(Resp { status: rh.status, headers: rh.headers, body, keep })
 }
 
+/// One GET over HTTP/2 (the server chose `h2` by ALPN): the preface and SETTINGS exchange, one stream, the whole
+/// answer. A protocol failure (GOAWAY, RST_STREAM, a malformed frame) is `h2-protocol`; the transport's own errors
+/// keep their names (`timeout`, `io`).
+fn exchange_h2<T: VeinTransport + ?Sized>(t: &mut T, authority: &str, target: &str, h: &Headers) -> Result<Resp, Fail> {
+    let h2_fail = |e: http_core::Error| match &e {
+        http_core::Error::Io(s) if !s.starts_with("errno") => fail("h2-protocol", vein_ring3::tls::EPROTO),
+        _ => http_fail(&e),
+    };
+    let mut c = H2Conn::handshake(Wire(t)).map_err(h2_fail)?;
+    let id = c.send_request("GET", "https", authority, target, h, &[]).map_err(h2_fail)?;
+    let (status, headers) = c.read_head(id).map_err(h2_fail)?;
+    let mut body = Vec::new();
+    while let Some(chunk) = c.read_data(id).map_err(h2_fail)? {
+        if body.len() + chunk.len() > BODY_MAX {
+            let _ = c.cancel(id);
+            return Err(fail("body-too-large", BODY_MAX as i64));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    c.close_stream(id);
+    Ok(Resp { status, headers, body, keep: false })
+}
+
 // ---- name, socket ---------------------------------------------------------------------------------------------
 
 /// The IPv4 address of `url`'s host: a literal as written, else the kernel resolver (cached).
@@ -257,6 +287,8 @@ fn park(n: &mut Net, origin: String, tcp: Tcp) {
 /// What one hop learned beyond the response.
 struct Hop {
     tls: u16,
+    /// The page came over HTTP/2 (ALPN `h2`); otherwise HTTP/1.1.
+    h2: bool,
     reused: bool,
     issuer: Option<vein_ring3::Verified>,
 }
@@ -290,7 +322,7 @@ fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail>
                 if r.keep {
                     park(n, origin, t);
                 }
-                return Ok((r, Hop { tls: 0, reused: true, issuer: None }));
+                return Ok((r, Hop { tls: 0, h2: false, reused: true, issuer: None }));
             }
         }
         let mut t = Tcp::connect(ip, port).map_err(|e| fail(if e == ECANCELED { "timeout" } else { "connect" }, e))?;
@@ -298,7 +330,7 @@ fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail>
         if r.keep {
             park(n, origin, t);
         }
-        return Ok((r, Hop { tls: 0, reused: false, issuer: None }));
+        return Ok((r, Hop { tls: 0, h2: false, reused: false, issuer: None }));
     }
 
     if n.tls.is_none() {
@@ -314,12 +346,18 @@ fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail>
     let ctx_tls = setup.context().ok_or(fail("tls-no-context", 0))?;
     let mut t = Tcp::connect(ip, port).map_err(|e| fail(if e == ECANCELED { "timeout" } else { "connect" }, e))?;
     let host = url.hostname();
-    let done = vein_ring3::tls::with_session(&mut t, &host, &ctx_tls, |s, v| (exchange(s, &head, true), s.version(), v));
+    let authority = url.host_str();
+    // NETDEBT2 (SR113): offer h2 first; the server's choice picks the exchange.
+    let done = vein_ring3::tls::with_session_alpn(&mut t, &host, &ctx_tls, vein_ring3::tls::ALPN_H2_HTTP1, |s, v| {
+        let h2 = s.is_h2();
+        let r = if h2 { exchange_h2(s, &authority, &target, &h) } else { exchange(s, &head, true) };
+        (r, s.version(), v, h2)
+    });
     match done {
         Err(f) => Err(fail(tls_why(f.why), f.errno)),
-        Ok(((Ok(r), ver, v), _)) => Ok((r, Hop { tls: ver, reused: false, issuer: Some(v) })),
-        Ok(((Err(e), _, _), Some(tf))) if e.why != "timeout" => Err(fail(tls_why(tf.why), tf.errno)),
-        Ok(((Err(e), _, _), _)) => Err(e),
+        Ok(((Ok(r), ver, v, h2), _)) => Ok((r, Hop { tls: ver, h2, reused: false, issuer: Some(v) })),
+        Ok(((Err(e), _, _, _), Some(tf))) if e.why != "timeout" => Err(fail(tls_why(tf.why), tf.errno)),
+        Ok(((Err(e), _, _, _), _)) => Err(e),
     }
 }
 
@@ -400,7 +438,7 @@ pub fn fetch(url: &str) -> Result<(Vec<u8>, String), i64> {
             }
         }
     };
-    // Undo the content codings (gzip/deflate; br is a named refusal).
+    // Undo the content codings (gzip/deflate/br; any other is a named refusal).
     let mut coding: &[u8] = b"identity";
     let out = out.and_then(|r| {
         let codings = encoding::content_codings(&r.headers);
@@ -433,6 +471,8 @@ pub fn fetch(url: &str) -> Result<(Vec<u8>, String), i64> {
         Some(0x0303) => b"1.2",
         _ => b"off",
     });
+    // `h2`/`h1`, short: the line buffer is 240 bytes.
+    l.put(b" proto=").put(if last.as_ref().is_some_and(|h| h.h2) { b"h2" as &[u8] } else { b"h1" });
     l.put(b" hops=").dec(hops as i64);
     l.put(b" conn=").put(if last.as_ref().is_some_and(|h| h.reused) { b"reused" as &[u8] } else { b"new" });
     l.put(b" coding=").put(coding);
