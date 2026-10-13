@@ -3,14 +3,15 @@
 //
 // UNAKEYS (rmbp-ledger B552): RING-3 THEME READS. CHARTER: Principia owns the choice (`system.appearance.mode` /
 // `.accent` / `.highlight`, prefs_core::schema); the
-// painter's palette is the kernel's (`video/theme.rs` LIGHT / DARK / ACCENTS). Seam: a bus CLIENT — the PREFS verbs
+// painter's palette is `palette_core` (PALETTECORE B559: the LIGHT / DARK rows, the ACCENTS, `Look`, the role struct
+// `palette_core::Theme` — the one no_std table the kernel's `video/theme.rs` re-exports too). Seam: a bus CLIENT — the PREFS verbs
 // (una-abi BUS_VERB_PREF_GET 16, fulfilled in-kernel by `prefs::bus_fulfil`, the same store the
 // kernel's own `prefs_client` reads, SETTINGSBUS B337). Nothing here decides a preference.
 //
 // THE RULE (the appearance gate's, `scripts/appearance-check.py`, applied to ring 3): every colour this program
-// paints is a field of [`Theme`]; this file is the only one in the crate that spells a colour. The palette rows are
-// the kernel set's values for the tokens this program reads — copied, because ring 3 links no kernel file (owed: a
-// shared no_std palette core both rings link, so the copy cannot drift).
+// paints is a field of [`Theme`], mapped over `palette_core` — no file of this crate spells a colour, this one
+// included: the rows are the core's, linked by both rings (shared-core seam), so ring 3 cannot drift from the kernel.
+// The gate scans this file for zero beside the kernel's `video/theme.rs`.
 //
 // WHEN. [`load`] once at start; [`due`] from the frame loop, then [`load`] again. Ring-3 delivery of PrefChanged (verb 19) is OWED
 // (kernel `prefs_client.rs` header: "Ring-3 delivery of verb 19 … is OWED"), and SYS_MRECV blocks on an empty
@@ -27,88 +28,11 @@ use vein_ring3::sys::sys;
 /// How often [`due`] asks for a re-read of the store (ms) while PrefChanged has no ring-3 delivery.
 pub const POLL_MS: u64 = 2000;
 
-// ---- the palette (kernel `video/theme.rs`) ------------------------------------------------------------------
+// ---- the palette (`palette_core`, PALETTECORE B559 — the table the kernel re-exports) --------------------------
 
-/// The kernel tokens the four ring-3 programs read (the same rows in each program's theme.rs; a program uses those
-/// its roles name).
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-#[repr(usize)]
-enum Tok {
-    WindowBg,
-    FrameLine,
-    TitleActiveBottom,
-    TitleTextInactive,
-    ContentFill,
-    ContentText,
-    FieldBg,
-    ErrorText,
-    SyntaxCode,
-    SyntaxNum,
-    SyntaxLit,
-    MeterLow,
-}
-const N: usize = 12;
-/// LIGHT rows: CHROME_FACE, FRAME_LINE, TITLE_ACTIVE_BOTTOM, TITLE_TEXT_INACTIVE, CONTENT_FILL, CONTENT_TEXT, FieldBg,
-/// ErrorText, SyntaxCode / Num / Lit, MeterLow.
-const LIGHT: [u32; N] = [
-    0x00EC_ECEE, 0x00B4_B4B9, 0x00E3_E3E8, 0x007A_7A7E, 0x00F5_F2EA, 0x0021_201E, 0x00FF_FFFF, 0x00A0_2020, 0x0020_8040, 0x00B0_5000, 0x0080_30A0,
-    0x0043_A05A,
-];
-/// DARK rows, the same tokens.
-const DARK: [u32; N] = [
-    0x002A_2A2D, 0x004A_4A50, 0x0034_3438, 0x008E_8E94, 0x001E_1E20, 0x00E6_E4DF, 0x002C_2C2F, 0x00E5_7373, 0x006C_C88A, 0x00E3_9A55, 0x00C3_8BE0,
-    0x0052_B86A,
-];
-/// The eight accents, `prefs_core::appearance::ACCENTS` order (index 0 the kit's own).
-const ACCENTS: [u32; 8] = [0x004A_73AA, 0x002E_8C8C, 0x005B_8C3A, 0x00C0_8A1E, 0x00C0_603A, 0x00B0_4A6A, 0x007A_5AB0, 0x006E_6E73];
-/// Their names (`prefs_core::appearance::ACCENTS`, spelled here: this crate links no prefs_core).
-const ACCENT_NAMES: [&str; 8] = ["crispy", "teal", "moss", "amber", "clay", "rose", "violet", "slate"];
-
-/// The appearance as Principia stores it, resolved: the set, the accent, the highlight.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Look {
-    pub dark: bool,
-    pub accent: u8,
-    pub hl: u8,
-}
-#[allow(dead_code)]
-impl Look {
-    /// The store's defaults (`appearance.mode = light`, `accent = crispy`, `highlight = accent`).
-    pub const DEFAULT: Look = Look { dark: false, accent: 0, hl: 0 };
-    const fn tok(self, t: Tok) -> u32 {
-        if self.dark { DARK[t as usize] } else { LIGHT[t as usize] }
-    }
-    const fn accent(self) -> u32 {
-        ACCENTS[self.accent as usize % 8]
-    }
-    /// The kernel's `selection()`: the highlight mixed toward the content ground (5/8 Light, 3/8 Dark).
-    const fn selection(self) -> u32 {
-        let (num, den) = if self.dark { (3, 8) } else { (5, 8) };
-        mix(ACCENTS[self.hl as usize % 8], self.tok(Tok::ContentFill), num, den)
-    }
-    pub fn mode_name(self) -> &'static str {
-        if self.dark { "dark" } else { "light" }
-    }
-    pub fn accent_name(self) -> &'static str {
-        ACCENT_NAMES[self.accent as usize % 8]
-    }
-}
-
-/// `a` and `b` mixed `num/den` of the way to `b`, per channel (the kernel's `theme::mix`).
-const fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
-    let mut out = 0;
-    let mut s = 0;
-    while s < 24 {
-        let (x, y) = ((a >> s) & 0xFF, (b >> s) & 0xFF);
-        out |= ((x * (den - num) + y * num) / den) << s;
-        s += 8;
-    }
-    out
-}
-const fn opaque(c: u32) -> u32 {
-    0xFF00_0000 | c
-}
+/// The appearance as Principia stores it, resolved (the set, the accent, the highlight) — the core's.
+pub use palette_core::Look;
+use palette_core::{opaque, Tok};
 
 // ---- this program's roles ----------------------------------------------------------------------------------
 
@@ -127,14 +51,15 @@ pub struct Theme {
 }
 impl Theme {
     pub const fn of(l: Look) -> Theme {
+        let p = palette_core::Theme::of(l);
         Theme {
             look: l,
-            bg: opaque(l.tok(Tok::ContentFill)),
-            ink: opaque(l.tok(Tok::ContentText)),
-            err_ink: opaque(l.tok(Tok::ErrorText)),
-            echo_ink: opaque(l.accent()),
-            caret: opaque(l.accent()),
-            rule: opaque(l.tok(Tok::FrameLine)),
+            bg: opaque(p.tok(Tok::ContentFill)),
+            ink: opaque(p.tok(Tok::ContentText)),
+            err_ink: opaque(p.tok(Tok::ErrorText)),
+            echo_ink: opaque(p.accent),
+            caret: opaque(p.accent),
+            rule: opaque(p.tok(Tok::FrameLine)),
         }
     }
 }
@@ -233,8 +158,7 @@ fn word<'a>(key: &str, buf: &'a mut [u8; 16], err: &mut i64) -> Option<&'a [u8]>
 }
 
 fn accent_ix(w: Option<&[u8]>) -> Option<u8> {
-    let w = w?;
-    ACCENT_NAMES.iter().position(|n| n.as_bytes().eq_ignore_ascii_case(w)).map(|i| i as u8)
+    palette_core::accent_by_name(w?)
 }
 
 /// Read the look from the store: `(look, the first bus refusal or 0)`. `auto` is dark 19:00-07:00 by the kernel's

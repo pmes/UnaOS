@@ -34,6 +34,9 @@ codegen-units = 1
 # font_core: the window's text (KERNELFONT2's engine); font8x8: the grid when no face is on the volume.
 [dependencies]
 una-abi = { path = "../una-abi" }
+# PALETTECORE (rmbp-ledger B559): the one no_std palette (LIGHT / DARK / ACCENTS, Look, the role struct) the kernel's
+# video/theme.rs re-exports — theme.rs maps this program's roles over it; zero deps, no alloc.
+palette_core = { path = "../../libs/sys/palette_core" }
 midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }
 font_core = { path = "../../libs/text/font_core" }

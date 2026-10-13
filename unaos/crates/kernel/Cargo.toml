@@ -3874,6 +3874,10 @@ exfat_core = { path = "../../libs/fs/exfat_core", default-features = false }
 # PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
 # same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
 prefs_core = { path = "../../libs/sys/prefs_core" }
+# PALETTECORE (rmbp-ledger B559): the one no_std palette table both rings link — `video/theme.rs` re-exports every
+# colour from it (the kit roles, LIGHT / DARK / ACCENTS, the fixed-look rows, fixture / painter / testcard) and spells
+# none; the four ring-3 programs map their roles over the same crate. Unconditional, zero deps, no alloc.
+palette_core = { path = "../../libs/sys/palette_core" }
 # TRASHCORE (B449, R79): the one Trash core — fs/trash.rs is only its I/O over the mount table; Matrix's VaultTrash links the same crate.
 trash_core = { path = "../../libs/fs/trash_core" }
 # LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3

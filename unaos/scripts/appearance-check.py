@@ -9,7 +9,13 @@
 # not listed is a finding (`unlisted painter`), as is a listed file that is gone. A literal suffixed u64/usize/i64/
 # isize, or held by a const/static/let typed so, is an address or offset — the glass's pixel is a u32.
 #
-# HOW IT DECIDES. Scope = crates/kernel/src/video/**/*.rs except theme.rs, plus the listed painters. Comments and string/char
+# PALETTECORE (B559): the ONE place a colour literal lives is `libs/sys/palette_core/src/lib.rs` (the no_std table both
+# rings link), outside the scope. `video/theme.rs` re-exports it and is SCANNED like any video/ file (no exemption), and
+# so are the four ring-3 programs' `crates/user-{aether,una,midden,lumen}/src/theme.rs` (RING3 below), which map their
+# roles over the core; an allow row for one of them is keyed `../../../user-<name>/src/theme.rs`. The core itself is a
+# CONTROL: fewer than CORE_MIN colour literals read there is no verdict (exit 2) — the core moved or the scanner broke.
+#
+# HOW IT DECIDES. Scope = crates/kernel/src/video/**/*.rs, plus the listed painters, plus RING3. Comments and string/char
 # literals are stripped first. A COLOUR LITERAL is any of:
 #   (a) a hex literal, underscores dropped and any integer suffix (`u32`, `u64`, …) ignored, whose digits
 #       are six (0xRRGGBB) or eight (0xAARRGGBB, ANY alpha byte) — `0x12_34_56`, `0x0012_3456u32`,
@@ -32,6 +38,11 @@
 import os, re, sys
 
 SUFFIX = r'(?:[ui](?:8|16|32|64|128|size))?'
+# PALETTECORE (B559): the ring-3 theme files the gate scans (paths under the unaos dir), and the core it reads as a control.
+RING3 = ('crates/user-aether/src/theme.rs', 'crates/user-una/src/theme.rs', 'crates/user-midden/src/theme.rs',
+         'crates/user-lumen/src/theme.rs')
+CORE = 'libs/sys/palette_core/src/lib.rs'
+CORE_MIN = 100
 HEX = re.compile(r'\b0[xX]([0-9A-Fa-f_]+?)([ui](?:8|16|32|64|128|size))?\b')
 WIDE = ('u64', 'i64', 'usize', 'isize', 'u128', 'i128')
 WIDE_ITEM = re.compile(r'\b(?:const|static(?:\s+mut)?|let(?:\s+mut)?)\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*(?:u64|i64|usize|isize|u128|i128)\s*=([^;]*);', re.S)
@@ -189,8 +200,6 @@ def judge(tree, painters):
     hits, unlisted = {}, []
     for path in sorted(tree):
         vid = path.startswith('video/')
-        if vid and path == 'video/theme.rs':
-            continue
         if vid or path in painters:
             h = scan_text(tree[path])
             if h:
@@ -210,6 +219,8 @@ PAINTER_PLANTS = [
      'a sink definition, a comment, a string'),
     ({'regs.rs': 'const R: u32 = 0x0012_3456;'}, [], 0, 0, 0, 'a non-painter outside video/ is not scanned'),
     ({}, ['gone.rs'], 0, 0, 1, 'a listed painter that is gone'),
+    ({'video/theme.rs': 'pub const X: u32 = 0x0012_3456;\npub use palette_core::LIGHT;'}, [], 1, 0, 0,
+     'PALETTECORE: video/theme.rs is scanned (no exemption)'),
 ]
 
 def probes(verbose=False):
@@ -274,6 +285,22 @@ def main():
                 p = os.path.join(root, nm)
                 tree[os.path.relpath(p, src).replace(os.sep, '/')] = open(p, encoding='utf-8', errors='replace').read()
     raw, unlisted, missing = judge(tree, painters)
+    # PALETTECORE (B559): the ring-3 theme files join the scope (keyed under crates/kernel/src's parent's parent so the
+    # allow-row path below resolves to `../../../user-<name>/src/theme.rs`); a missing one is a missing painter.
+    for r3 in RING3:
+        p3 = os.path.join(u, r3)
+        key = os.path.relpath(p3, src).replace(os.sep, '/')
+        if not os.path.exists(p3):
+            missing.append(key)
+            continue
+        h = scan_text(open(p3, encoding='utf-8', errors='replace').read())
+        if h:
+            raw[key] = h
+    core_p = os.path.join(u, CORE)
+    core_n = len(scan_text(open(core_p, encoding='utf-8', errors='replace').read())) if os.path.exists(core_p) else 0
+    if core_n < CORE_MIN:
+        print(f'appearance-check: CONTROL: {CORE} reads {core_n} colour literals (< {CORE_MIN}) — no verdict')
+        return 2
     used = set()
     total, files, allowed = 0, {}, 0
     for path in sorted(raw):
@@ -303,7 +330,8 @@ def main():
         print(f'  listed painter missing: {p}')
     print(f'appearance-check: literals_outside_theme={total} files={len(files)} certified={want} '
           f'allow_rows={len(allow)} allowed_hits={allowed} stale={len(stale) + bad_rows} '
-          f'plants={len(PLANTS) + len(PAINTER_PLANTS)} painters={len(painters)} unlisted={len(unlisted) + len(missing)}')
+          f'plants={len(PLANTS) + len(PAINTER_PLANTS)} painters={len(painters)} unlisted={len(unlisted) + len(missing)} '
+          f'ring3={len(RING3)} core_literals={core_n}')
     return 0 if (total == 0 and want == 0 and not stale and not bad_rows and not unlisted and not missing) else 1
 
 if __name__ == '__main__':

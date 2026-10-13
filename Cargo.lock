@@ -3366,6 +3366,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "palette_core"
+version = "0.1.0"
+
+[[package]]
 name = "pango"
 version = "0.22.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

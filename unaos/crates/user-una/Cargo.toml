@@ -38,6 +38,9 @@ codegen-units = 1
 # links (SYNTAXCORE SR89, R105), painted through the appearance tokens its theme map names.
 [dependencies]
 una-abi = { path = "../una-abi" }
+# PALETTECORE (rmbp-ledger B559): the one no_std palette (LIGHT / DARK / ACCENTS, Look, the role struct) the kernel's
+# video/theme.rs re-exports — theme.rs maps this program's roles over it; zero deps, no alloc.
+palette_core = { path = "../../libs/sys/palette_core" }
 edit_core = { path = "../../libs/text/edit_core" }
 midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }

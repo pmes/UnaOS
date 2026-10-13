@@ -1,0 +1,14 @@
+[package]
+name = "palette_core"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+description = "Palette core: the one table of UnaOS colours (the kit roles, the LIGHT and DARK token rows, the eight accents, the fixed-look rows) both rings link."
+
+# PALETTECORE (rmbp-ledger B559, B552's owed). CHARTER: Principia owns the appearance CHOICE
+# (`system.appearance.mode` / `.accent` / `.highlight`, prefs_core::appearance); this crate owns only the VALUES the
+# choice indexes. Seam: `shared-core` — `#![no_std]`, no alloc, `#![forbid(unsafe_code)]`, NO dependencies, a member
+# of the ROOT host workspace, pulled by the kernel (`video/theme.rs` re-exports it) and by the four ring-3 programs
+# (`crates/user-{aether,una,midden,lumen}/src/theme.rs` map their roles over it) as a path dep. No features: the
+# core compiles identically everywhere, so there is nothing to forward.
+[dependencies]

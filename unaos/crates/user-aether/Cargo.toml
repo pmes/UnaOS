@@ -34,6 +34,9 @@ codegen-units = 1
 # font8x8: the glyph grid when no face is on the volume (the SAME crate Lumen and the kernel link).
 [dependencies]
 una-abi = { path = "../una-abi" }
+# PALETTECORE (rmbp-ledger B559): the one no_std palette (LIGHT / DARK / ACCENTS, Look, the role struct) the kernel's
+# video/theme.rs re-exports — theme.rs maps this program's roles over it; zero deps, no alloc.
+palette_core = { path = "../../libs/sys/palette_core" }
 html_core = { path = "../../libs/web/html_core" }
 css_core = { path = "../../libs/web/css_core" }
 font_core = { path = "../../libs/text/font_core" }
