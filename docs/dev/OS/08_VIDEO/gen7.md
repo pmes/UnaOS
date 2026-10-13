@@ -58,9 +58,12 @@ Every offset and encoding in the module carries its provenance on the wire:
 | `[BDW-ONLY]` / `[CHV-ONLY]` | Pinned on **later** silicon (Broadwell, Cherryview/Braswell) and carried here as a hypothesis to be tested on our own part — never implemented as though it were Gen7 spec. |
 | `[EXT-UNPINNED]` | Recollection, unverified. May be tested under capture/restore; may never be load-bearing. |
 | `[METAL]` | Observed on this MacBookPro10,1 in a named boot capture. |
+| `[I915-MIT]` | (GEN7R9B, B626) A hardware fact — opcode, dword count, bit field — read from the Linux `i915` driver's MIT-licensed `gt/` files, cited `file:line` at a named revision (`docs/dev/evidence/gen7r9b/GEN7R9B.md` §1). Facts only; no function transcribed. |
 
-Clean-room line: Intel PRMs are the only pinning target. Linux `i915` and Mesa `i965` source
-are off-limits and are not a source for anything in this ladder.
+Clean-room line: Intel PRMs are the first pinning target. Until GEN7R9B, Linux `i915` and Mesa `i965` source
+were off-limits for this ladder. From GEN7R9B (B626), because the PRM hosts answer 403 through the proxy, the
+`i915` `gt/` files (all SPDX MIT) are read for HARDWARE FACTS under the R95 §2 / R110 precedent: names and
+values only, each cited file:line, and no code copied. R9's 3D half is the first use. Mesa stays unused.
 
 ---
 
@@ -1105,7 +1108,32 @@ still armed and under the same hold, a full-panel-width 32-row copy between two 
 (ring dwords 16..31, TAIL 0x40→0x80, R8's encodings unchanged) and the same bytes copied by the CPU:
 `[gen7] band …` and `:: GEN7BLIT: … gpu_us= cpu_us= proj_gpu_us= proj_cpu_us= at=<w>x<h> -> candidate=bcs|cpu ::`
 — rung 0 of KCOMP's second blitter candidate; `candidate=cpu` closes the blit route and the gen7 route is 3D.
-**R9 (3D, RCS)**: parked — no PRM page for PIPELINE_SELECT / STATE_BASE_ADDRESS / 3DPRIMITIVE / the EU pixel
-shader was in reach (the PRM hosts answered 403 to this session); its walls are listed in the design doc §4.
+**R9 (3D, RCS)**: B504 parked it, then B504 wrote it as a rung that declined by name. GEN7R9B (B626) makes it
+execute. The rows come from i915 `[I915-MIT]` (`docs/dev/evidence/gen7r9b/GEN7R9B.md` §2: 6 of 6 filled).
+`drivers/gpu/gen7_r9.rs` sits behind `UNAOS_IVB3D_R9=1` and is now on the image line.
+
+- **Gate.** It runs under `tests gen7` after R7, gated on R6's `r6-sentinel-hit` this run.
+- **Envelope.** It arms the RCS in its own proven-unowned two-slot GGTT window (0x13400: the ring, then the
+  pinned page) under R6's `mt` hold.
+- **Stream.** The ring is 52 dwords:
+  - renderclear's invalidate / `PIPELINE_SELECT(3D)` = `0x69040000` / invalidate / flush;
+  - `STATE_BASE_ADDRESS` (10 dwords, every base = the pinned page, modify bits set);
+  - invalidate;
+  - i915's gen7 RCS breadcrumb `PIPE_CONTROL` (post-sync write-immediate `0x3D09C0DE` to pinned+0x40,
+    GLOBAL_GTT_IVB, CS_STALL).
+- **Teardown.** The ring is disabled, its registers are restored, the hold is released, and the PTEs are
+  restored behind a drained ring.
+- **Wire:** `[gen7] r9 ring=rcs r6=… cand=mt pipeline=3d sba=ok pipe_control=posted immediate=0x3D09C0DE
+  read=0x… landed=1 head= tail=0xd0 passed= idle= restored=regs:,fw:,ptes: gpu_us= us= ->
+  r9-3d-postsync-verified`. The other outcomes are `r9-head-stuck passed=<last command retired>`,
+  `r9-postsync-miss`, `-> REFUSED reason=… writes=0` and `-> GATED`. `GEN7LADDER … r9=<verified|failed|…>`.
+- **Risk stated before the boot.** The RCS runs with no context image (no MI_SET_CONTEXT).
+
+**R10 (the first draw)**: designed in GEN7R9B.md §3 and run as a table. renderclear's clear is a media walker,
+not a 3DPRIMITIVE. i915 names the render-target SURFACE_STATE and the binding table (2 of 22 rows) but no
+3DSTATE_* field of the draw path and no EU shader. `[gen7] r10 draw=3dprimitive r9=verified rows_cited=2/22
+writes=0 -> DECLINED reason=page-3DSTATE_PUSH_CONSTANT_ALLOC_VS-uncited`, and `-> GATED reason=r9-not-verified`
+when R9 did not verify. gen7_renderstate.c's null state (rs:18-158) is a complete gen7 3D batch with values but
+no names. Pairing its headers needs the PRM, and that pairing is owed.
 **PPS**: rungs 03/07 of the `igpu-dpy` ladder now print `why=panel-not-handed-to-igd bits=cited` — the bits were
 cited at rung 07b all along; the write still waits on a gmux hand-off and a T-value source.

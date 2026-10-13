@@ -325,6 +325,7 @@ ftdirx|:: FTDIRX: first byte rx=|-|measured
 usbnet|:: USBNET: bus=xhci slot=|-|measured
 gen7r8|:: gen7: r8 begin rung=R8 wake=|-|measured
 gen7blit|:: GEN7BLIT2: impl=bcs|-|measured
+gen7r9|[gen7] r9 ring=rcs r6=|-|unmeasured-here
 nvidia-kepler-kfbind|:: KFBIND: pbdma[|-|measured
 nvidia-kepler-kdhead|:: KDHEAD: end rung=KD14|-|measured
 nvidia-kepler-ctrladdr|:: kepler: ctrladdr |-|measured
