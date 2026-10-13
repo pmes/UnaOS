@@ -138,6 +138,7 @@ pub fn init_realm(vm: &mut Vm, idx: u32) {
     typedarray::init(vm);
     date::init(vm);
     intl::init(vm);
+    temporal::init(vm);
     es2026::init(vm);
     global(vm, "globalThis", Value::Object(global_obj));
     let g = vm.realm().global;

@@ -45,6 +45,9 @@ pub enum IntlData {
     Locale(Box<locale::LangTag>),
     DurationFormat(Box<duration::DurFmt>),
     DisplayNames(Box<displaynames::DnFmt>),
+    /// The internal slots of a Temporal object (TEMPORAL SR117) — the Intl heap kind carries them so the
+    /// engine's object model needs no new variant.
+    Temporal(Box<crate::builtins::temporal::TData>),
 }
 
 pub fn alloc_intl(vm: &mut Vm, proto: Obj, data: IntlData) -> Obj {

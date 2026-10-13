@@ -25,7 +25,7 @@ const VALUES_DATE: &[&str] = &["long", "short", "narrow"];
 const VALUES_TIME: &[&str] = &["long", "short", "narrow", "numeric", "2-digit"];
 const VALUES_SUB: &[&str] = &["long", "short", "narrow", "numeric"];
 
-fn create(vm: &mut Vm, locales: &Value, options: &Value) -> JsResult<DurFmt> {
+pub fn create(vm: &mut Vm, locales: &Value, options: &Value) -> JsResult<DurFmt> {
     let requested = canonicalize_locale_list(vm, locales)?;
     let o = options_object(vm, options)?;
     let svc = "Intl.DurationFormat";
