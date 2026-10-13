@@ -1583,7 +1583,7 @@ static CONSOLE_LAUNCH_TRIED: AtomicU32 = AtomicU32::new(0);
 /// Arch-neutral: this module's own gate (x86 + `wc` OR aarch64 + `desktop_firmware`) is exactly the
 /// gate on every `fbcon` entry point it calls, so there is no `target_arch` test here and none is
 /// needed — x86 has the same dock, the same pin and the same console window.
-pub fn console_launch_service(who: &'static str) -> bool {
+pub fn console_launch_service(who: &'static str) -> bool { dp_window_service(who); // DOCKSHELL2 (B621): an owed settings/activity open, on the render pass (SHELLTASK2's rule: a kernel window is the render pass's)
     if !take_launch(PinnedApp::Console) {
         return false;
     }
@@ -3207,10 +3207,10 @@ pub fn launch_posted(app: PinnedApp) -> bool {
 // LAUNCH goes through the SAME seams the shell verbs use: quarry -> `quarry::request_open` (the existing
 // tile arm); editor -> `textedit::request_open` (an untitled buffer, `<home>/untitled.txt`, a missing path
 // being a new buffer; drained by `quarry::live::service`, so the editor tile needs the `quarry` feature to
-// launch); activity / settings -> the VERB string is latched ([`dp_launch`]) and [`take_verb_launch`] hands
-// it to the render body that owns the shell `Console`, which runs `shell::dispatch_command(verb, ..)` —
-// the very line an operator would type. With no shell window open the shell launch is posted too and the
-// verb stays latched until the shell exists.
+// launch); activity / settings -> RETIRED shape (verb latched, shell window posted, `take_verb_launch`): since
+// DOCKSHELL2 (B621) they open their kernel window directly on the render pass (`dp_window_service`, file tail);
+// the verb seam survives only for a console program, which needs a console. Same line count as the text it
+// replaces (this module is lexed on every desktop build).
 //
 // RUNNING / RAISE: a table app's live window is an ordinary dock row (every window is a tile). Kernel-
 // window apps are matched by owner (console, shell, quarry, editor); ring-3 apps (activity, settings) by
@@ -3262,7 +3262,7 @@ fn dp_owner_is(i: usize, o: u64) -> bool {
         1 => o == wm::KERNEL_OWNER_DESKTOP,
         2 => quarry_owner() == Some(o),
         5 => o == crate::video::textedit::OWNER,
-        _ => o == DP_PIN_OWNER + i as u64 || o == DP_PROG_OWNER[i].load(Ordering::Relaxed),
+        _ => o == DP_PIN_OWNER + i as u64 || o == DP_PROG_OWNER[i].load(Ordering::Relaxed) || o == dp_window_owner(i), // DOCKSHELL2 (rmbp-ledger B621): activity/settings are KERNEL windows (owner `KERNEL_OWNER_BASE + 7`), which `dp_refresh` skips, so the pin never saw its own window
     }
 }
 fn dp_spec_of_owner(o: u64) -> Option<usize> { (0..DP_PINS.len()).find(|&i| dp_owner_is(i, o)) }
@@ -3271,7 +3271,7 @@ fn dp_extra_of_owner(o: u64) -> Option<usize> {
     (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| dp_is_pinned(i) && dp_owner_is(i, o)).map(|i| i - DP_FIRST_EXTRA)
 }
 fn dp_extra_wanted(i: usize, n: usize, present: &dyn Fn(u64) -> bool) -> bool {
-    let o = match i { 5 => crate::video::textedit::OWNER, _ => DP_PROG_OWNER[i].load(Ordering::Relaxed) };
+    let o = match i { 5 => crate::video::textedit::OWNER, _ if dp_window_owner(i) != 0 => dp_window_owner(i), _ => DP_PROG_OWNER[i].load(Ordering::Relaxed) }; // DOCKSHELL2 (B621): a live settings/activity window replaces its pin tile
     true /* WINDOWCAP-2: no strip cap — the layout overflows */ && dp_is_pinned(i) && !(o != 0 && present(o))
 }
 
@@ -3334,7 +3334,7 @@ fn dp_launch(i: usize) -> &'static str {
             Some(p) => { crate::video::textedit::request_open(&p); "editor-requested" }
             None => "editor-no-home",
         },
-        _ if dp_is_direct(i) => dp_direct_post(i), _ => { // DOCKSHELL (rmbp-ledger B555): a ring-3 pin whose verb is a PROGRAM PATH spawns it directly (the service pass, `dp_direct_service`), never a shell window; only a word verb (activity, settings) still rides the shell seam below
+        _ if dp_is_direct(i) => dp_direct_post(i), _ if dp_is_window(i) => dp_window_post(i), _ => { // DOCKSHELL2 (rmbp-ledger B621): a word-verb pin whose verb opens a KERNEL window (activity, settings) posts that window's open, drained on the render pass (`dp_window_service`), never a shell window; the verb arm below is left for a console program only. DOCKSHELL (rmbp-ledger B555): a ring-3 pin whose verb is a PROGRAM PATH spawns it directly (the service pass, `dp_direct_service`), never a shell window; only a word verb (activity, settings) still rides the shell seam below
             DP_VERB_OWED.fetch_or(1 << i, Ordering::AcqRel);
             post_launch(PinnedApp::Shell); // the verb needs a shell window to run in; a live one just raises
             "verb-posted"
@@ -3531,7 +3531,7 @@ const LINE_INTERN_MAX: usize = 64;
 
 /// POST (never perform) `line` for the shell window, and the shell launch it needs (a live shell raises).
 /// `false` when the intern table is full (the line is refused with a wire line, nothing is leaked).
-pub fn post_line_launch(line: &str) -> bool {
+pub fn post_line_launch(line: &str) -> bool { if let Some(r) = line_direct(line) { return r; } line_seam_post(line) } fn line_seam_post(line: &str) -> bool { // DOCKSHELL2 (B621): a line naming a GUI launch (a kernel-window verb, a program path) launches directly; only a console line (`run <path>`) still takes the shell seam
     let interned = {
         let mut t = LINE_INTERN.lock();
         match t.iter().find(|l| **l == line) {
@@ -4750,14 +4750,18 @@ fn dp_direct_take() -> Option<usize> {
 /// Every owed direct launch, in table order.
 fn dp_direct_drain(on: &str) {
     while let Some(i) = dp_direct_take() {
-        let _ = dp_direct_launch(i, on);
+        let _ = dp_path_launch(Some(i), DP_PINS[i].verb, on);
+    }
+    while DP_PATH_FLAG.swap(false, Ordering::AcqRel) {
+        let p = DP_PATH_OWED.lock().take();
+        if let Some(p) = p { let _ = dp_path_launch(None, &p, on); } // DOCKSHELL2 (B621): a launcher/menu program path, no pin
     }
 }
 
 /// The service pass's half (from [`dockpin_service`]): an owed direct launch runs on a worker core; inline only
 /// when the machine has no worker apart from the pump's.
 fn dp_direct_service() {
-    if DP_DIRECT_OWED.load(Ordering::Acquire) == 0 { return; }
+    if DP_DIRECT_OWED.load(Ordering::Acquire) == 0 && !DP_PATH_FLAG.load(Ordering::Acquire) { return; }
     #[cfg(target_arch = "x86_64")]
     {
         if let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != crate::hidstall::pump_cpu()) {
@@ -4779,9 +4783,9 @@ fn dp_direct_runner(_arg: usize) {
 /// The direct launch of path pin `i` — the shell's path-launch checks and `bg`'s spawn, no console, no shell window.
 /// `Ok((pid, slot))` once the program is running and named.
 #[cfg(target_arch = "x86_64")]
-fn dp_direct_launch(i: usize, on: &str) -> Result<(u64, u64), &'static str> {
+fn dp_path_launch(pin: Option<usize>, path: &str, on: &str) -> Result<(u64, u64), &'static str> { // DOCKSHELL2 (B621): `pin` None = a launcher/menu program path (no pin bookkeeping)
     use crate::fs::vfs::NodeKind;
-    let (name, path) = (DP_PINS[i].name, DP_PINS[i].verb);
+    let name = match pin { Some(i) => DP_PINS[i].name, None => path.rsplit('/').next().unwrap_or(path) };
     let refuse = |why: &'static str| -> Result<(u64, u64), &'static str> {
         serial_println!("[dock] direct app={} path={} on={} -> refused={}", name, path, on, why);
         Err(why)
@@ -4800,8 +4804,7 @@ fn dp_direct_launch(i: usize, on: &str) -> Result<(u64, u64), &'static str> {
     let flags = crate::arch::elf::app_flags(&bytes); // EXECNAME (B322): the program decides
     if midden_core::launch_mode(flags) != midden_core::LaunchMode::Detach {
         // A console program needs a console: the verb seam (the shell window runs it, as typed). None of the four pins.
-        DP_VERB_OWED.fetch_or(1 << i, Ordering::AcqRel);
-        post_launch(PinnedApp::Shell);
+        match pin { Some(i) => { DP_VERB_OWED.fetch_or(1 << i, Ordering::AcqRel); post_launch(PinnedApp::Shell); } None => { let _ = line_seam_post(path); } }
         serial_println!("[dock] direct app={} path={} note={} on={} -> foreground (verb seam)", name, path, flags, on);
         return Err("foreground");
     }
@@ -4809,19 +4812,18 @@ fn dp_direct_launch(i: usize, on: &str) -> Result<(u64, u64), &'static str> {
     crate::fs::appres::sight(path); // LUMENFAST (B507): the sight first, so the name arm below finds its stamp cached
     let sight_ms = crate::arch::ms().saturating_sub(t_sight);
     crate::prof::launching(path);
-    DP_DIRECT_DONE.fetch_or(1 << i, Ordering::AcqRel); // before the spawn: the child may land its window before we return
+    if let Some(i) = pin { DP_DIRECT_DONE.fetch_or(1 << i, Ordering::AcqRel); } // before the spawn: the child may land its window before we return
     let t_spawn = crate::arch::ms();
     match crate::origin::with(crate::origin::Origin::Glass, || crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[path])) {
         Ok((pid, slot, _entry)) => {
             let spawn_ms = crate::arch::ms().saturating_sub(t_spawn);
             wm::app_name_arm_launch(wm::owner_of_launch(slot), path);
-            DP_DIRECT_PID[i].store(pid, Ordering::Release);
-            DP_DIRECT_SLOT[i].store(slot, Ordering::Release);
+            if let Some(i) = pin { DP_DIRECT_PID[i].store(pid, Ordering::Release); DP_DIRECT_SLOT[i].store(slot, Ordering::Release); }
             serial_println!("[dock] direct app={} path={} bytes={} note={} pid={} slot={} sight_ms={} spawn_ms={} on={} -> started", name, path, bytes.len(), flags, pid, slot, sight_ms, spawn_ms, on);
             Ok((pid, slot))
         }
         Err(e) => {
-            DP_DIRECT_DONE.fetch_and(!(1u32 << i), Ordering::AcqRel);
+            if let Some(i) = pin { DP_DIRECT_DONE.fetch_and(!(1u32 << i), Ordering::AcqRel); }
             serial_println!("[dock] direct app={} path={} on={} -> refused=spawn ({})", name, path, on, e);
             Err("spawn")
         }
@@ -4830,7 +4832,7 @@ fn dp_direct_launch(i: usize, on: &str) -> Result<(u64, u64), &'static str> {
 
 /// aarch64: never reached ([`dp_is_direct`] is false there); the verb seam is that desktop's launch.
 #[cfg(not(target_arch = "x86_64"))]
-fn dp_direct_launch(_i: usize, _on: &str) -> Result<(u64, u64), &'static str> { Err("no-direct-spawn") }
+fn dp_path_launch(_pin: Option<usize>, _path: &str, _on: &str) -> Result<(u64, u64), &'static str> { Err("no-direct-spawn") }
 
 /// Register `tests dockpins` once (from the service pass, DOCKGONE's shape).
 fn dockpins_register() {
@@ -4843,10 +4845,13 @@ fn dockpins_register() {
     }
 }
 
-/// `tests dockpins` — every built path pin (lumen/aether/midden/una, each on its own knob) launched exactly as its
-/// tile does (`dp_launch`, the press arm's call), drained, its window awaited, then the job killed. Per pin: the
-/// press answered `direct-posted`, posted NO shell launch and NO verb, the window landed (`app_name_of` == name), and
-/// the shell's window count did not move. A pin already running is skipped (its tile would only raise).
+/// `tests dockpins` — DOCKSHELL2 (rmbp-ledger B621, R115): EVERY built table pin but the shell's own (console, quarry,
+/// activity, settings, editor, and the path pins lumen/aether/midden/una/stria, each on its own knob) launched exactly
+/// as its tile does (`launch_named`, the seam the press arm, login items and the launcher share), drained, its window
+/// awaited (`launch_landed`, the dock's own first-window join), and a ring-3 job killed. Per pin: the launch answered a
+/// DIRECT word (never `verb-posted`), posted NO shell launch and NO verb, the window landed, and the shell's window count
+/// did not move (`shell_windows=<a>-><b>` on the per-pin line). A pin already running is skipped (its tile would only
+/// raise). A kernel window the fixture opened is left open (`kill=kept`).
 #[cfg(target_arch = "x86_64")]
 fn dockpins_selftest() {
     const WAIT_MS: u64 = 10_000;
@@ -4855,20 +4860,21 @@ fn dockpins_selftest() {
         let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
         rows[..n].iter().filter(|r| row_running(r) && dp_owner_is(1, r.owner_asid)).count()
     };
-    let (mut pins, mut direct, mut landed, mut shell_posted, mut verb_posted) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut pins, mut direct, mut landed, mut shell_posted, mut verb_posted, mut moved) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
     let s0 = shell_windows();
-    for i in DP_FIRST_EXTRA..DP_PINS.len() {
-        if !dp_is_direct(i) || DP_ALL & (1 << i) == 0 || launch_landed(i) { continue; }
+    for i in 0..DP_PINS.len() {
+        if i == 1 || !dp_available(i) || DP_ALL & (1 << i) == 0 || (i == 5 && !cfg!(feature = "quarry")) || launch_landed(i) { continue; }
         pins += 1;
         let shell_was = launch_posted(PinnedApp::Shell);
-        let how = dp_launch(i);
+        let how = launch_named(DP_PINS[i].name).unwrap_or("refused");
         let posted = !shell_was && launch_posted(PinnedApp::Shell);
         let verb = DP_VERB_OWED.load(Ordering::Acquire) & (1 << i) != 0;
-        if how == "direct-posted" { direct += 1; }
+        let word = matches!(how, "direct-posted" | "console-posted" | "quarry-requested" | "editor-requested");
+        if word && !posted && !verb { direct += 1; }
         if posted { shell_posted += 1; let _ = take_launch(PinnedApp::Shell); }
         if verb { verb_posted += 1; DP_VERB_OWED.fetch_and(!(1 << i), Ordering::AcqRel); }
         DP_DIRECT_PID[i].store(0, Ordering::Release);
-        dp_direct_drain("fixture"); // the service pass may have taken it first; either way one launch
+        if dp_is_direct(i) { dp_direct_drain("fixture"); } // the service pass may have taken it first; either way one launch
         let t0 = crate::arch::ms();
         let mut up = false;
         while crate::arch::ms().saturating_sub(t0) < WAIT_MS {
@@ -4877,13 +4883,120 @@ fn dockpins_selftest() {
         }
         if up { landed += 1; }
         let shell_now = shell_windows();
+        if shell_now != s0 { moved += 1; }
         let pid = DP_DIRECT_PID[i].load(Ordering::Acquire);
-        let kill = if pid != 0 { crate::arch::syscall::bg_kill(pid, DP_DIRECT_SLOT[i].load(Ordering::Acquire)) } else { "no-pid" };
+        let kill = if pid != 0 { crate::arch::syscall::bg_kill(pid, DP_DIRECT_SLOT[i].load(Ordering::Acquire)) } else if dp_is_direct(i) { "no-pid" } else { "kept" };
         let _ = dp_direct_take_done(i);
-        serial_println!("[dockpins] app={} how={} shell_posted={} verb_posted={} landed={} ms={} shell_windows={} pid={} kill={}",
-            DP_PINS[i].name, how, posted as u8, verb as u8, up as u8, crate::arch::ms().saturating_sub(t0), shell_now, pid, kill);
+        serial_println!("[dockpins] app={} how={} shell_posted={} verb_posted={} landed={} ms={} shell_windows={}->{} pid={} kill={}",
+            DP_PINS[i].name, how, posted as u8, verb as u8, up as u8, crate::arch::ms().saturating_sub(t0), s0, shell_now, pid, kill);
     }
     let s1 = shell_windows();
-    let v = if pins == 0 { "SKIP" } else if direct == pins && landed == pins && shell_posted == 0 && verb_posted == 0 && s1 <= s0 { "PASS" } else { "FAIL" };
+    let v = if pins == 0 { "SKIP" } else if direct == pins && landed == pins && shell_posted == 0 && verb_posted == 0 && moved == 0 && s1 == s0 { "PASS" } else { "FAIL" };
     serial_println!(":: DOCKPINS: pins={} direct={} landed={} shell_windows={}->{} shell_posted={} verb_posted={} -> {} ::", pins, direct, landed, s0, s1, shell_posted, verb_posted, v);
+}
+
+// =================================================================================================
+// DOCKSHELL2 (rmbp-ledger B621, R115) — TAIL-APPENDED. Flight 34, Peter: "opening settings from taskbar opens shell to
+// open settings … shell should not be opening to open gui apps from the gui actions". The wire (f34-boot1.log
+// 15:05:31Z): `tile=2/11 app=settings -> launch verb-posted`, `[dock] launch app=shell … -> LAUNCHED`, `[shelltask]
+// dockpin verb=settings`, `[settings] open win=3` (owner 0xffffff07), then 15:05:41Z `[dock] launch app=settings
+// first_window_ms=timeout`. The verb RAN and the window OPENED; the timeout was the dock's join: settings and activity
+// are KERNEL windows (`settings::OWNER` = `activity::OWNER` = `KERNEL_OWNER_BASE + 7`), [`dp_refresh`] skips kernel
+// owners, so [`dp_owner_is`] never matched the window, the pin tile stayed beside it (`settings:pin` in the census) and
+// the bound fired a false "did not open a window" notice.
+//
+// Now: [`dp_launch`]'s arm for a word-verb pin whose verb opens a kernel window ([`dp_is_window`]) POSTS a bit
+// ([`dp_window_post`], click router: never perform) and the render pass ([`dp_window_service`], from
+// [`console_launch_service`], every render body on both arches) calls the ONE function the shell verb lands in —
+// `settings::open` (shell.rs `settings_verb`), `activity::open` (shell.rs's `activity` arm) — so no shell window is
+// posted. [`dp_window_owner`] joins the live window to its pin (first window, running dot, pin tile hidden). A line
+// posted by another GUI launcher ([`post_line_launch`]: the system menu's Force Quit -> `activity`, the launcher's
+// program paths) is launched directly by [`line_direct`]; only a console line (`run <path>`, Quarry's console
+// program) and a console program's fallback still take the shell seam ([`line_seam_post`]).
+// Wire: `[dock] press … app=settings -> launch direct-posted`, `[dock] direct app=settings window=settings by=<who>
+// open_ms=<n> -> opened` (or `-> refused=<why>`), then DOCK2's `[dock] launch app=settings by=dock direct=1
+// first_window_ms=<n>`; a menu line `[dock] line launch line=activity app=activity -> direct-posted`.
+// =================================================================================================
+
+/// Word-verb pins owed a kernel-window open (bit = table index); set by the press, taken by the render pass.
+static DP_WINDOW_OWED: AtomicU32 = AtomicU32::new(0);
+/// Consecutive `panel busy` declines of the owed open (re-posted until the bound).
+static DP_WINDOW_TRIED: AtomicU32 = AtomicU32::new(0);
+const DP_WINDOW_TRIES: u32 = 32;
+/// A program path posted by a launcher with no pin (one owed at a time: a second post replaces the first).
+static DP_PATH_OWED: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mutex::new(None);
+static DP_PATH_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Is table app `i` a word-verb pin whose verb opens a KERNEL window (activity, settings)?
+fn dp_is_window(i: usize) -> bool {
+    i < DP_PINS.len() && matches!(DP_PINS[i].verb, "activity" | "settings")
+}
+
+/// The owner of kernel-window pin `i`'s LIVE window, or 0 (atomic reads only: called under the window-table lock).
+/// Settings and Activity share `KERNEL_OWNER_BASE + 7`; each module's own `is_open` disambiguates which is up.
+fn dp_window_owner(i: usize) -> u64 {
+    match DP_PINS.get(i).map(|s| s.verb) {
+        Some("activity") if crate::video::activity::is_open() => crate::video::activity::OWNER,
+        Some("settings") if crate::video::settings::is_open() => crate::video::settings::OWNER,
+        _ => 0,
+    }
+}
+
+/// POST the kernel-window open of pin `i` (click router: never perform). No shell launch is posted.
+fn dp_window_post(i: usize) -> &'static str {
+    DP_WINDOW_OWED.fetch_or(1 << i, Ordering::AcqRel);
+    "direct-posted"
+}
+
+/// The render pass's half (from [`console_launch_service`]): each owed kernel window opened by the function its shell
+/// verb calls. A `panel busy` decline re-posts, bounded by [`DP_WINDOW_TRIES`].
+fn dp_window_service(who: &str) {
+    if DP_WINDOW_OWED.load(Ordering::Acquire) == 0 { return; }
+    let m = DP_WINDOW_OWED.swap(0, Ordering::AcqRel);
+    for i in 0..DP_PINS.len() {
+        if m & (1 << i) == 0 || !dp_is_window(i) { continue; }
+        DP_DIRECT_DONE.fetch_or(1 << i, Ordering::AcqRel); // before the open: DOCK2's first-window line may read it the same pass
+        let t0 = crate::arch::ms();
+        let r: Result<(), alloc::string::String> = match DP_PINS[i].verb {
+            "activity" => crate::video::activity::open().map_err(alloc::string::String::from),
+            _ => crate::video::settings::open(),
+        };
+        let open_ms = crate::arch::ms().saturating_sub(t0);
+        match r {
+            Ok(()) => {
+                DP_WINDOW_TRIED.store(0, Ordering::Relaxed);
+                serial_println!("[dock] direct app={} window={} by={} open_ms={} -> opened", DP_PINS[i].name, DP_PINS[i].verb, who, open_ms);
+            }
+            Err(e) => {
+                DP_DIRECT_DONE.fetch_and(!(1u32 << i), Ordering::AcqRel);
+                let tries = DP_WINDOW_TRIED.fetch_add(1, Ordering::Relaxed) + 1;
+                if e == "panel busy" && tries < DP_WINDOW_TRIES { DP_WINDOW_OWED.fetch_or(1 << i, Ordering::AcqRel); continue; }
+                DP_WINDOW_TRIED.store(0, Ordering::Relaxed);
+                serial_println!("[dock] direct app={} window={} by={} tries={} -> refused={}", DP_PINS[i].name, DP_PINS[i].verb, who, tries, e);
+            }
+        }
+    }
+}
+
+/// [`post_line_launch`]'s direct arm: `Some(posted)` when `line` names a GUI launch — a kernel-window verb (the system
+/// menu's Force Quit posts `activity`) or, on x86, a bare program path (the launcher's `/apps/*.ELF`; a pin's own path
+/// takes that pin's direct arm) — and `None` for every other line (a console line such as Quarry's `run <path>`).
+fn line_direct(line: &str) -> Option<bool> {
+    let l = line.trim();
+    if let Some(i) = (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| dp_is_window(i) && DP_PINS[i].verb == l) {
+        let how = dp_window_post(i);
+        serial_println!("[dock] line launch line={} app={} -> {}", l, DP_PINS[i].name, how);
+        return Some(true);
+    }
+    if !cfg!(target_arch = "x86_64") || !l.starts_with('/') || l.contains(char::is_whitespace) { return None; }
+    let how = match (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| dp_is_direct(i) && DP_PINS[i].verb.eq_ignore_ascii_case(l)) {
+        Some(i) => dp_direct_post(i),
+        None => {
+            *DP_PATH_OWED.lock() = Some(alloc::string::String::from(l));
+            DP_PATH_FLAG.store(true, Ordering::Release);
+            "direct-posted"
+        }
+    };
+    serial_println!("[dock] line launch line={} -> {}", l, how);
+    Some(true)
 }
