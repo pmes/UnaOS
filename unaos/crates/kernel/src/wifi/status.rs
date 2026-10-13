@@ -134,3 +134,21 @@ pub fn wifi9() -> (u8, u8, Option<u32>) {
     let b = W9_BEACONS.load(Ordering::Relaxed);
     (W9_REINIT.load(Ordering::Relaxed), W9_TUNE.load(Ordering::Relaxed), if b == u32::MAX { None } else { Some(b) })
 }
+
+// ── WIFI10 (B646): S7's probe-request half this boot — for `tests wifi`. ────────────────────────
+/// `tx`: 0 not run, 1 SENT (the ucode's TX status carried our cookie, frame_count > 0, no suppression),
+/// 2 NOT-SENT, 3 not attempted. `heard`: 0 not run, 1 HEARD (a probe response addressed to our MAC),
+/// 2 SILENT.
+#[cfg(feature = "wifi10")]
+static W10_TX: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "wifi10")]
+static W10_HEARD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "wifi10")]
+pub fn set_wifi10(tx: u8, heard: u8) {
+    W10_TX.store(tx, Ordering::Relaxed);
+    W10_HEARD.store(heard, Ordering::Relaxed);
+}
+#[cfg(feature = "wifi10")]
+pub fn wifi10() -> (u8, u8) {
+    (W10_TX.load(Ordering::Relaxed), W10_HEARD.load(Ordering::Relaxed))
+}

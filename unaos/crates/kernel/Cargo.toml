@@ -742,6 +742,13 @@ wifi5 = ["wifi3"]
 # and a 5 s beacon count with the SSIDs decoded (`src/wifi/bringup/rx.rs`). NO transmit of any frame.
 # IMPLIES `wifi4` (S5r's reset verdict gates it; it reads WIFI7's latched d11 handle). x86_64-only.
 wifi9 = ["wifi4"]
+# WIFI-10 knob (WIFI10 arc, rmbp-ledger B646, R110): UNAOS_WIFI10=1 arms rung S7's probe-request half, run by
+# `tests wifi` after wifi9's receive window — ONE frame out of the chip (a broadcast probe request at 1 Mbit/s CCK
+# through one 64-bit TX DMA ring on controller 1, the FW598 TX header, the ucode's TX-status FIFO read for the
+# verdict; `src/wifi/bringup/tx.rs`), the station MAC into MACFILTER_SELF, then a 2 s receive window counting the
+# probe RESPONSES addressed to it. THIS IS THE FIRST KNOB THAT LETS THE d11 TRANSMIT. IMPLIES `wifi9` (its tune and
+# receiver are the gate and the listener). x86_64-only, stripped by arm_features.
+wifi10 = ["wifi9"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

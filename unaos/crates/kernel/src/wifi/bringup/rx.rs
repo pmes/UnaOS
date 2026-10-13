@@ -116,11 +116,15 @@ pub(super) struct Writes {
     pub dma: u32,
     pub irq_ack: u32,
     pub pci_cmd: u32,
+    /// WIFI10 (B646): MACFILTER_CONTROL/DATA halfwords (`main.c:657-677`).
+    pub macfilter: u32,
+    /// WIFI10 (B646): TX descriptor words written into host ring memory (`dma.c:177-211`).
+    pub tx_desc: u32,
 }
 
 /// # Safety
 /// As `super::w32`: the window is mapped and on the d11 core (checked live by `live::handle`).
-unsafe fn w16(base: u64, off: u64, val: u16) {
+pub(super) unsafe fn w16(base: u64, off: u64, val: u16) {
     core::ptr::write_volatile((base + off) as *mut u16, val);
 }
 
@@ -134,7 +138,7 @@ pub(super) fn shm_w16(bar0: u64, off: u16, val: u16, w: &mut Writes) {
     w.shm += 2;
 }
 
-fn shm_r16(bar0: u64, off: u16, w: &mut Writes) -> u16 {
+pub(super) fn shm_r16(bar0: u64, off: u16, w: &mut Writes) -> u16 {
     unsafe {
         w32(bar0, D11_SHM_CONTROL, (SHM_ROUTE_SHARED << 16) | ((off as u32) >> 2));
         w.shm += 1;
@@ -166,7 +170,7 @@ fn awake(bar0: u64, w: &mut Writes) -> u16 {
 
 /// `main.c:2987-3017` — suspend the MAC: awake, MACCTL.ENABLED off, then poll GEN_IRQ_REASON for
 /// MAC_SUSPENDED (35 x 10 us, then 40 x 1 ms). Printed; `true` = the bit was seen.
-pub(super) fn suspend(bar0: u64, w: &mut Writes) -> bool {
+pub(super) fn suspend(bar0: u64, w: &mut Writes, tag: &str) -> bool {
     let pre = unsafe { r32(bar0, D11_MACCTL) };
     let st = awake(bar0, w);
     let v = unsafe { r32(bar0, D11_MACCTL) };
@@ -184,8 +188,8 @@ pub(super) fn suspend(bar0: u64, w: &mut Writes) -> bool {
     }
     let post = unsafe { r32(bar0, D11_MACCTL) };
     serial_println!(
-        "[wifi9] mac-suspend macctl pre={:#010x} post={:#010x} ucodestat={} suspended={} polls={} — main.c:2987-3017",
-        pre, post, st, seen as u8, polls
+        "[{}] mac-suspend macctl pre={:#010x} post={:#010x} ucodestat={} suspended={} polls={} — main.c:2987-3017",
+        tag, pre, post, st, seen as u8, polls
     );
     seen
 }
@@ -209,6 +213,12 @@ pub(super) struct Seen {
     pub empty: u32,
     pub other_chan: u32,
     pub ssids: Vec<String>,
+    /// WIFI10 (B646): probe responses decoded (subtype 5), of which addressed to `me`, and their BSSIDs.
+    pub probe_resp: u32,
+    pub resp_to_us: u32,
+    pub bssids: Vec<String>,
+    /// The station MAC a probe response must name in addr1 to count as `resp_to_us` (zeros = none).
+    pub me: [u8; 6],
 }
 
 /// An SSID as printable text: bytes outside 0x20..0x7e and the list's own `,[]` become `?`; empty =
@@ -271,7 +281,7 @@ fn rx_reset(bar0: u64, w: &mut Writes) -> bool {
 }
 
 /// One delivered slot (`dma.c:1579-1663` + `xmit.c:635-690`): count it, decode a beacon's SSID.
-fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32) -> usize {
+fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32, tag: &str) -> usize {
     let mut len = unsafe { core::ptr::read_volatile(buf as *const u16) } as usize;
     if len == 0 {
         for _ in 0..5 {
@@ -308,7 +318,7 @@ fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32) -> usize {
         *raw_rows += 1;
         let mut hx = String::new();
         for b in hdr.iter() { hx.push_str(&alloc::format!("{:02x}", b)); }
-        serial_println!("[wifi9] rx-raw n={} len={} macstat={:#010x} chanstat={:#06x} ch={} hdr={}", raw_rows, len, macstat, chanstat, chan, hx);
+        serial_println!("[{}] rx-raw n={} len={} macstat={:#010x} chanstat={:#06x} ch={} hdr={}", tag, raw_rows, len, macstat, chanstat, chan, hx);
     }
     if macstat & RX_MAC_FCSERR != 0 {
         s.fcs_err += 1;
@@ -329,18 +339,47 @@ fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32) -> usize {
                 s.ssids.push(t);
             }
         }
+    } else if (frame[0] >> 2) & 0x3 == 0 && (frame[0] >> 4) == 0x5 {
+        // WIFI10 (B646): subtype 5, a probe response — the same fixed fields + IEs as a beacon
+        // (IEEE 802.11 §9.3.3.11); `parse_beacon` accepts both. addr1 (bytes 4..10) names the station it answers.
+        if let Some(b) = wifi_core::ieee80211::parse_beacon(&frame) {
+            s.probe_resp += 1;
+            if frame[4..10] == s.me {
+                s.resp_to_us += 1;
+            }
+            let t = ssid_text(&b.ssid);
+            if s.ssids.len() < MAX_SSIDS && !s.ssids.iter().any(|x| *x == t) {
+                s.ssids.push(t);
+            }
+            let bs = alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", b.bssid[0], b.bssid[1], b.bssid[2], b.bssid[3], b.bssid[4], b.bssid[5]);
+            if s.bssids.len() < MAX_SSIDS && !s.bssids.iter().any(|x| *x == bs) {
+                s.bssids.push(bs);
+            }
+        }
     }
     1
 }
 
-/// S6. Precondition: the MAC is suspended (`suspend`), the PHY re-initialised and tuned to `ch`.
-pub(super) fn run(bar0: u64, bus: u8, dev: u8, func: u8, ch: u16, w: &mut Writes) -> Seen {
-    let mut s = Seen::default();
+/// The armed RX engine and its poll state. S6 (`run`) and S7's response window (WIFI10, `bringup/tx.rs`
+/// via `bringup::wifi10`) share the three halves below.
+pub(super) struct Rx {
+    ring: u64,
+    bufs: u64,
+    slot: usize,
+    moves: u32,
+    raw_rows: u32,
+    tsf_delta: u64,
+    tag: &'static str,
+}
+
+/// S6's setup half. Precondition: the MAC is suspended (`suspend`), the PHY re-initialised and tuned.
+/// The engine check, PCI bus mastering, the ring and its buffers, station opmode, the SHM words, the
+/// controller, the MAC enabled. `Err` carries the refusal text the caller prints (nothing programmed).
+pub(super) fn arm(bar0: u64, bus: u8, dev: u8, func: u8, w: &mut Writes, tag: &'static str) -> Result<Rx, String> {
     // ── The engine type (dma.c:800-811): the wrapper's IOST.DMA64. ──
     let iost = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_IOST) };
     if iost & IOST_DMA64 == 0 {
-        serial_println!(":: wifi9: rx REFUSED reason=engine-not-dma64 iost={:#010x} — dma.c:800-811; nothing programmed ::", iost);
-        return s;
+        return Err(alloc::format!("engine-not-dma64 iost={:#010x} — dma.c:800-811; nothing programmed", iost));
     }
     // ── Bus mastering: the d11 DMAs into host memory (PCI Command bit 2). ──
     let cmd = unsafe { read_config_16(bus, dev, func, 0x04) };
@@ -353,16 +392,14 @@ pub(super) fn run(bar0: u64, bus: u8, dev: u8, func: u8, ch: u16, w: &mut Writes
     let ring_l = core::alloc::Layout::from_size_align(RINGMEM, RINGMEM).ok();
     let bufs_l = core::alloc::Layout::from_size_align(SLOTS * BUFSIZE, 4096).ok();
     let (Some(rl), Some(bl)) = (ring_l, bufs_l) else {
-        serial_println!(":: wifi9: rx REFUSED reason=layout — nothing programmed ::");
-        return s;
+        return Err(String::from("layout — nothing programmed"));
     };
     // Deliberately never freed: the engine owns this memory until RXCTL reads DISABLED, and a failed
     // reset below would leave it owning it for the rest of the boot.
     let ring = unsafe { alloc::alloc::alloc_zeroed(rl) } as u64;
     let bufs = unsafe { alloc::alloc::alloc_zeroed(bl) } as u64;
     if ring == 0 || bufs == 0 {
-        serial_println!(":: wifi9: rx REFUSED reason=no-memory — nothing programmed ::");
-        return s;
+        return Err(String::from("no-memory — nothing programmed"));
     }
     let reset_ok = rx_reset(bar0, w);
     for i in 0..SLOTS {
@@ -403,28 +440,29 @@ pub(super) fn run(bar0: u64, bus: u8, dev: u8, func: u8, ch: u16, w: &mut Writes
     let _ = awake(bar0, w);
     let mac_on = unsafe { r32(bar0, D11_MACCTL) };
     serial_println!(
-        "[wifi9] rx-setup ring={:#x} bufs={:#x} slots={} buf={} fo={} rxctl={:#010x} ringhi={:#010x} rxstatus={:#010x} reset={} pci_cmd={:#06x}->{:#06x} macctl={:#010x}->{:#010x} — dma.c:672-750, main.c:3103-3160, :2958-2983",
-        ring, bufs, SLOTS, BUFSIZE, FRAMEOFFSET, rxctl, hi, st0, reset_ok as u8, cmd, cmd_post, ctl0, mac_on
+        "[{}] rx-setup ring={:#x} bufs={:#x} slots={} buf={} fo={} rxctl={:#010x} ringhi={:#010x} rxstatus={:#010x} reset={} pci_cmd={:#06x}->{:#06x} macctl={:#010x}->{:#010x} — dma.c:672-750, main.c:3103-3160, :2958-2983",
+        tag, ring, bufs, SLOTS, BUFSIZE, FRAMEOFFSET, rxctl, hi, st0, reset_ok as u8, cmd, cmd_post, ctl0, mac_on
     );
+    Ok(Rx { ring, bufs, slot: 0, moves: 0, raw_rows: 0, tsf_delta: 0, tag })
+}
 
-    // ── The window: 5 s by TSF (6 s TSC cap), polled every 5 ms (a sleep inside the shell task). ──
+/// The window: `window_us` by TSF (TSC cap one second longer), polled every 5 ms (a sleep inside the
+/// shell task). Every delivered slot is counted into `s` and re-armed.
+pub(super) fn poll(bar0: u64, rx: &mut Rx, s: &mut Seen, ch: u16, window_us: u64, w: &mut Writes) {
     let hz = crate::bootpace::origin_hz();
-    let cap = if hz >= 1000 { hz * 6 } else { 0 };
+    let cap = if hz >= 1000 { hz * (window_us / 1_000_000 + 1) } else { 0 };
     let c0 = crate::arch::now_cycles();
     let t0 = unsafe { tsf(bar0) };
     let mut t1 = t0;
-    let mut slot = 0usize;
-    let mut moves = 0u32;
-    let mut raw_rows = 0u32;
-    while t1.wrapping_sub(t0) < WATCH_US && crate::arch::now_cycles().wrapping_sub(c0) < cap {
+    while t1.wrapping_sub(t0) < window_us && crate::arch::now_cycles().wrapping_sub(c0) < cap {
         let cur = ((unsafe { r32(bar0, RXSTATUS) } & RXSTATDPTR) as usize / DESC_BYTES) % SLOTS; // dma.c:231-239
-        while slot != cur {
-            moves += 1;
-            let n = take(bufs + (slot * BUFSIZE) as u64, &mut s, ch, &mut raw_rows);
+        while rx.slot != cur {
+            rx.moves += 1;
+            let n = take(rx.bufs + (rx.slot * BUFSIZE) as u64, s, ch, &mut rx.raw_rows, rx.tag);
             for _ in 0..n {
-                unsafe { fill(ring, slot, bufs + (slot * BUFSIZE) as u64, w) };
-                slot = (slot + 1) % SLOTS;
-                if slot == cur { break; }
+                unsafe { fill(rx.ring, rx.slot, rx.bufs + (rx.slot * BUFSIZE) as u64, w) };
+                rx.slot = (rx.slot + 1) % SLOTS;
+                if rx.slot == cur { break; }
             }
         }
         // dma.c:1699-1700 with the dma.c:1679-1681 back-off: RXINDEX = the slot before the hardware's.
@@ -433,14 +471,34 @@ pub(super) fn run(bar0: u64, bus: u8, dev: u8, func: u8, ch: u16, w: &mut Writes
         crate::arch::sched::sleep_ms(5);
         t1 = unsafe { tsf(bar0) };
     }
+    rx.tsf_delta += t1.wrapping_sub(t0);
+}
+
+/// S6's stop half: the MAC suspended, the engine reset (dma.c:439-475); the memory is leaked on
+/// purpose (see `arm`). `(mac_suspended, engine_disabled)`.
+pub(super) fn finish(bar0: u64, rx: &Rx, w: &mut Writes) -> (bool, bool) {
     let st1 = unsafe { r32(bar0, RXSTATUS) };
     let err1 = unsafe { r32(bar0, RXERROR) };
-    // ── Stop: MAC suspended, engine reset (dma.c:439-475). The memory is leaked on purpose (above). ──
-    let mac_off = suspend(bar0, w);
+    let mac_off = suspend(bar0, w, rx.tag);
     let stopped = rx_reset(bar0, w);
     serial_println!(
-        "[wifi9] rx-window tsf-delta={}us slots-consumed={} rxstatus={:#010x} rxerror={:#010x} stop: mac-suspended={} engine-disabled={} — b43 dma.c:1684-1702 polled",
-        t1.wrapping_sub(t0), moves, st1, err1, mac_off as u8, stopped as u8
+        "[{}] rx-window tsf-delta={}us slots-consumed={} rxstatus={:#010x} rxerror={:#010x} stop: mac-suspended={} engine-disabled={} — b43 dma.c:1684-1702 polled",
+        rx.tag, rx.tsf_delta, rx.moves, st1, err1, mac_off as u8, stopped as u8
     );
+    (mac_off, stopped)
+}
+
+/// S6. Precondition: the MAC is suspended (`suspend`), the PHY re-initialised and tuned to `ch`.
+pub(super) fn run(bar0: u64, bus: u8, dev: u8, func: u8, ch: u16, w: &mut Writes) -> Seen {
+    let mut s = Seen::default();
+    let mut rx = match arm(bar0, bus, dev, func, w, "wifi9") {
+        Ok(r) => r,
+        Err(why) => {
+            serial_println!(":: wifi9: rx REFUSED reason={} ::", why);
+            return s;
+        }
+    };
+    poll(bar0, &mut rx, &mut s, ch, WATCH_US, w);
+    let _ = finish(bar0, &rx, w);
     s
 }

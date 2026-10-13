@@ -1050,3 +1050,31 @@ is untouched by the arc, so the `B43_SHM_UCODE` upload refusal is unchanged by c
 above: on a repeat of Boot D's no-storage shape the capture must carry six `still deferred n=k/6`
 heartbeats where Boot D carried nothing, and on a boot whose volume arrives the `volume APPEARED` line must
 be followed by a staging verdict and the arc-2 chain.
+
+## S7 (WIFI10, B646) — the probe-request half: one frame out, 2026-10-14
+
+**Knob:** `UNAOS_WIFI10=1` → `wifi10` (implies `wifi9`), default OFF, x86_64-only, stripped by `arm_features`.
+**The first knob that lets the d11 transmit.** `tests wifi` runs `bringup::wifi10()` once per boot after
+`wifi9()` (R80: nothing at boot). Design, citations and wire shapes: `docs/dev/evidence/wifi10/WIFI10.md`.
+
+**The rung** (`src/wifi/bringup/tx.rs`, `htphyinit::tx_prep`, `rx::{arm,poll,finish}`): gated on WIFI9's
+channel-11 tune reading MATCH this boot and on S2r's plausible station MAC; the MAC suspended; the HT-PHY's
+RF sequencer forced RX2TX then RST2RX under the PA override (`phy_ht.c:983-986`), power control OFF; the SHM
+channel cookie; the rate memory, the PHY-TX-control words and `MACFILTER_SELF` (`main.c:3162-3216`,
+`:657-677`); ONE 64-bit TX DMA ring on controller 1 (`dma.c:681-694`); S6's receiver armed (the MAC enabled);
+a 35-byte broadcast probe request behind the 118-byte FW598 TX header (`xmit.h:25-65`, `xmit.c:235-567`) on two
+descriptors, `TXINDEX` poked (`dma.c:1186-1286`); the ucode's TX-status FIFO decoded (`main.c:1334-1360`) for
+the verdict; a 2 s receive window counting probe responses addressed to our MAC; both engines reset.
+
+**Witness lines:** `:: wifi10: tx frames=1 kind=probe-req … -> SENT | NOT-SENT reason=…`,
+`:: wifi10: rx probe-resp=N to_us=N from=[bssid…] … -> HEARD | SILENT reason=…`, `:: wifi10: end …`; the
+`[wifi10]` detail lines (`htphy-tx-prep`, `tx-setup`, `tx-poke`, `tx-status`, S6's `rx-setup`/`rx-window`).
+WIFI5's row S7 reads Confirmed only on HEARD.
+
+**Designed, not built:** HT-PHY TX power control (`phy_ht.c:589-640`) — its setup takes the SPROM's per-core PA
+coefficients (`maxpwr_2g`, `pa_2g[0..3]`), whose rev-8 SPROM offsets are in `drivers/bcma/sprom.c`, outside the
+arc's b43 source list. The frame leaves at the index the init tables left in `TXPCTL_CMD_C1..C3`, printed on the
+wire. A `SENT` + `SILENT reason=no-probe-resp` with beacons present names that half as the next rung.
+
+**Residual:** `MACFILTER_SELF` now carries the station MAC, so the microcode ACKs unicast frames addressed to
+it; every write class is counted on the end line. QEMU models no BCM4331: WIFI1 SKIPs first.

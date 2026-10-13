@@ -307,6 +307,7 @@ wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
 wifi3|:: wifi2: ucode upload words=|-|measured
 wifi4|:: wifi4: REFUSED reason=wifi3-upload-not-proven|-|measured(1)
 wifi9|:: wifi9: rx NOT ATTEMPTED reason=no-tune|-|unmeasured-here
+wifi10|:: wifi10: tx NOT ATTEMPTED reason=no-station-mac|-|unmeasured-here
 nvidia-kepler|:: kepler: probe-abort bar0-unmapped|-|measured
 nvidia-kepler-takeover|:: kdisp: takeover-abort no-gop-info ::|nvidia-kepler|measured
 nvidia-kepler-fifo|:: kepler: |nvidia-kepler|measured

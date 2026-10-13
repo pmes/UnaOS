@@ -667,3 +667,65 @@ pub(super) fn run(bar0: u64, phy_rev: u16, ch: u16, chan_cookie: &mut dyn FnMut(
     );
     Verdict { ok, match_: m, elems: n, tune: Some(t), c: h.c }
 }
+
+// ── WIFI10 (B646): the TX-side steps of `b43_phy_ht_op_init` the receive subset skipped ────────────
+/// `phy_ht.h:62`, `:100` — the per-core TX power control command registers beside `HT_TXPCTL_CMD_C1`.
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_CMD_C2: u16 = 0x222;
+#[cfg(feature = "wifi10")]
+const HT_TXPCTL_CMD_C3: u16 = extg(0x164);
+/// `phy_ht.h:76` — the RX2TX trigger.
+#[cfg(feature = "wifi10")]
+const HT_RF_SEQ_TRIG_RX2TX: u16 = 0x0001;
+
+/// What `tx_prep` did and read.
+#[cfg(feature = "wifi10")]
+pub(super) struct TxPrep {
+    pub rx2tx: bool,
+    pub rst2rx: bool,
+    /// `TXPCTL_CMD_C1..C3` as left by the init tables (the fixed power index the frame leaves at).
+    pub txpctl: [u16; 3],
+    /// `TXPCTL_CMD_C1 & EN_BITS` after: 0 = power control OFF, as this rung holds it.
+    pub pctl_en: u16,
+    pub c: Counts,
+}
+
+/// `phy_ht.c:196-213` — the PA override: save `RF_CTL_INT_C1..C3` and write 0x0400 (off), or restore (on).
+#[cfg(feature = "wifi10")]
+fn pa_override(h: &mut Ht, save: &mut [u16; 3], enable: bool) {
+    for (i, reg) in HT_RF_CTL_INT.iter().enumerate() {
+        if enable {
+            h.phy_w(*reg, save[i]);
+        } else {
+            save[i] = h.phy_r(*reg);
+        }
+    }
+    if !enable {
+        for reg in HT_RF_CTL_INT.iter() {
+            h.phy_w(*reg, 0x0400);
+        }
+    }
+}
+
+/// `phy_ht.c:983-986` — under the PA override, force the RF sequencer RX2TX then RST2RX (the TX path
+/// sequenced once, the radio left in RX), then `:999-1000` tx power fix + power control OFF, and the
+/// three `TXPCTL_CMD` words read for the wire. The idle-TSSI tone, the power-control setup (SPROM PA
+/// coefficients: `drivers/bcma/sprom.c`, outside the arc's sources) and the TSSI setup are NOT run.
+#[cfg(feature = "wifi10")]
+pub(super) fn tx_prep(h: &mut Ht) -> TxPrep {
+    let mut save = [0u16; 3];
+    pa_override(h, &mut save, false);
+    let rx2tx = force_rf_sequence(h, HT_RF_SEQ_TRIG_RX2TX);
+    let rst2rx = force_rf_sequence(h, HT_RF_SEQ_TRIG_RST2RX);
+    pa_override(h, &mut save, true);
+    tx_power_fix(h);
+    h.phy_mask(HT_TXPCTL_CMD_C1, 0xFFFF & !HT_TXPCTL_EN_BITS);
+    let txpctl = [h.phy_r(HT_TXPCTL_CMD_C1), h.phy_r(HT_TXPCTL_CMD_C2), h.phy_r(HT_TXPCTL_CMD_C3)];
+    let pctl_en = txpctl[0] & HT_TXPCTL_EN_BITS;
+    serial_println!(
+        "[wifi10] htphy-tx-prep rx2tx={} rst2rx={} txpctl_cmd=[{:#06x},{:#06x},{:#06x}] tx_pwr_ctl={} idle_tssi=not-run txpctl_setup=not-run(sprom-pa-coefficients: drivers/bcma/sprom.c) tssi_setup=not-run wrote-core-regs={} timeouts={} — phy_ht.c:196-213, :983-986, :999-1000",
+        if rx2tx { "done" } else { "TIMEOUT" }, if rst2rx { "done" } else { "TIMEOUT" }, txpctl[0], txpctl[1], txpctl[2],
+        if pctl_en == 0 { "off" } else { "ON?" }, h.c.core_regs, h.c.timeouts
+    );
+    TxPrep { rx2tx, rst2rx, txpctl, pctl_en, c: h.c }
+}

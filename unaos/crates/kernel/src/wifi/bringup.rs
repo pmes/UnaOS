@@ -2555,7 +2555,7 @@ pub fn wifi9() {
     }
     let shm_pre = unsafe { r32(bar0, D11_SHM_CONTROL) };
     let mut w = rx::Writes::default();
-    let suspended = rx::suspend(bar0, &mut w);
+    let suspended = rx::suspend(bar0, &mut w, "wifi9");
     let mut cookie_pre: Option<u16> = None;
     let hv = {
         let mut cookie = |ch: u16| {
@@ -2601,4 +2601,117 @@ pub fn wifi9() {
         w.macctl, w.shm, w.dma, w.irq_ack, w.pci_cmd, hv.c.radio_addr, hv.c.radio_data, hv.c.core_regs, hv.c.wrapper,
         if shm_ok { "MATCH" } else { "FAILED" }
     );
+}
+
+// WIFI10 (B646, R110): S7's probe-request half — one frame out through the TX DMA ring, the responses
+// heard by S6's receiver. Runs once per boot from `tests wifi`, after `wifi9()`. See bringup/tx.rs.
+#[cfg(feature = "wifi10")]
+mod tx;
+
+/// `tests wifi` (verb.rs), after `wifi9()`: S7's probe-request half. Gates: `wifi9` tuned channel 11
+/// this boot (its receiver proved the PHY decodes) and S2r read a plausible station MAC. Order: the
+/// MAC re-suspended, the HT-PHY's TX-side sequencing (`htphyinit::tx_prep`), the channel cookie, the
+/// TX ring and the SHM/filter words (`tx::prep`), S6's receiver armed (the MAC enabled), the frame
+/// (`tx::fire`), a 2 s response window, both engines stopped. Once per boot; a second `tests wifi`
+/// prints the recorded verdict.
+#[cfg(feature = "wifi10")]
+pub fn wifi10() {
+    static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let (t, h) = super::status::wifi10();
+        serial_println!(":: wifi10: already ran this boot tx={} heard={} — one pass per boot ::", t, h);
+        return;
+    }
+    const CH: u16 = 11;
+    const WINDOW_US: u64 = 2_000_000;
+    let (_reinit, tune, beacons) = super::status::wifi9();
+    if tune != 1 {
+        super::status::set_wifi10(3, 0);
+        serial_println!(":: wifi10: tx NOT ATTEMPTED reason=no-tune(wifi9 tune={}) — no frame is built on an untuned PHY; nothing written ::", tune);
+        return;
+    }
+    let Some(mac) = ident::mac() else {
+        super::status::set_wifi10(3, 0);
+        serial_println!(":: wifi10: tx NOT ATTEMPTED reason=no-station-mac — S2r read no plausible il0macaddr this boot; nothing written ::");
+        return;
+    };
+    let (bar0, bus, dev, func) = match live::handle() {
+        Ok(h) => h,
+        Err(why) => {
+            super::status::set_wifi10(3, 0);
+            serial_println!(":: wifi10: tx NOT ATTEMPTED reason={} — nothing written ::", why);
+            return;
+        }
+    };
+    let shm_pre = unsafe { r32(bar0, D11_SHM_CONTROL) };
+    let mut w = rx::Writes::default();
+    // 1. The MAC suspended (wifi9's end left it so; re-asserted, main.c:2987-3017), then the PHY's TX side.
+    let suspended = rx::suspend(bar0, &mut w, "wifi10");
+    let mut h = htphyinit::Ht::new(bar0);
+    let tp = htphyinit::tx_prep(&mut h);
+    let cookie_pre = rx::chan_cookie(bar0, CH, &mut w);
+    // 2. The TX ring, the rate memory, the PHY-TX-control words, the station MAC into the filter.
+    let prep = match tx::prep(bar0, mac, &mut w) {
+        Ok(p) => p,
+        Err(why) => {
+            super::status::set_wifi10(3, 0);
+            unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
+            serial_println!(":: wifi10: tx NOT ATTEMPTED reason={} ::", why);
+            return;
+        }
+    };
+    // 3. S6's receiver armed — the MAC enabled, the ucode awake.
+    let mut seen = rx::Seen::default();
+    seen.me = mac;
+    let mut rxr = match rx::arm(bar0, bus, dev, func, &mut w, "wifi10") {
+        Ok(r) => r,
+        Err(why) => {
+            super::status::set_wifi10(3, 0);
+            let _ = tx::stop(bar0, &mut w);
+            unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
+            serial_println!(":: wifi10: tx NOT ATTEMPTED reason=rx-{} ::", why);
+            return;
+        }
+    };
+    // 4. The frame.
+    let r = tx::fire(bar0, &prep, mac, CH, &mut w);
+    let sent = r.sent();
+    serial_println!(
+        ":: wifi10: tx frames=1 kind=probe-req ch={} rate=1M(cck) len={} from={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} cookie={:#06x} status={} frame_count={} supp={} acked={} seq={} txpctl_cmd=[{:#06x},{:#06x},{:#06x}] -> {}{} ::",
+        CH, r.frame_len, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], r.cookie,
+        if r.status_seen { "seen" } else { "none" }, r.frame_count, r.supp, r.acked as u8, r.seq, tp.txpctl[0], tp.txpctl[1], tp.txpctl[2],
+        if sent { "SENT" } else { "NOT-SENT" }, if sent { alloc::string::String::new() } else { alloc::format!(" reason={}", r.reason()) }
+    );
+    // 5. The response window, then both engines stopped and the MAC suspended.
+    rx::poll(bar0, &mut rxr, &mut seen, CH, WINDOW_US, &mut w);
+    let (mac_off, rx_off) = rx::finish(bar0, &rxr, &mut w);
+    let tx_off = tx::stop(bar0, &mut w);
+    unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
+    let shm_ok = unsafe { r32(bar0, D11_SHM_CONTROL) } == shm_pre;
+    let heard = seen.resp_to_us > 0;
+    let reason = if heard {
+        alloc::string::String::new()
+    } else if !sent {
+        alloc::format!(" reason=tx:{}", r.reason())
+    } else if seen.probe_resp > 0 {
+        alloc::format!(" reason=responses-not-to-us({})", seen.probe_resp)
+    } else if seen.frames > 0 {
+        alloc::format!(" reason=no-probe-resp(frames={} beacons={})", seen.frames, seen.beacons)
+    } else {
+        alloc::string::String::from(" reason=nothing-received")
+    };
+    super::status::set_wifi10(if sent { 1 } else { 2 }, if heard { 1 } else { 2 });
+    serial_println!(
+        ":: wifi10: rx probe-resp={} to_us={} from=[{}] ssids=[{}] beacons={} frames={} fcs_err={} other_chan={} ch={} window={}ms -> {}{} ::",
+        seen.probe_resp, seen.resp_to_us, seen.bssids.join(","), seen.ssids.join(","), seen.beacons, seen.frames, seen.fcs_err, seen.other_chan,
+        CH, WINDOW_US / 1000, if heard { "HEARD" } else { "SILENT" }, reason
+    );
+    serial_println!(
+        ":: wifi10: end mac-suspended-first={} cookie_pre={:#06x} wifi9_beacons={} rx2tx={} rst2rx={} tx_pwr_ctl=off tx-reset={} rx-reset={} mac-suspended={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-tx-desc={} wrote-macfilter={} wrote-irq-ack={} wrote-pci-cmd={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit=one(probe-req; MACFILTER_SELF set, so the ucode ACKs unicast to it) ::",
+        suspended as u8, cookie_pre, beacons.map(|n| alloc::format!("{}", n)).unwrap_or_else(|| alloc::string::String::from("none")),
+        tp.rx2tx as u8, tp.rst2rx as u8, tx_off as u8, rx_off as u8, mac_off as u8,
+        w.macctl, w.shm, w.dma, w.tx_desc, w.macfilter, w.irq_ack, w.pci_cmd, tp.c.core_regs, tp.c.wrapper,
+        if shm_ok { "MATCH" } else { "FAILED" }
+    );
+    let _ = (prep.rate_mem, prep.reset_ok, prep.txstatus0, tp.pctl_en);
 }
