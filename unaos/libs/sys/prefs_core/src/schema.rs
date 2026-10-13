@@ -156,15 +156,33 @@ pub static SCHEMA: &[Key] = &[
         writers: OP, reader: "aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-contrast`)",
         doc: "More or less contrast than the default: the `prefers-contrast` media feature pages read (`custom` when forced colors are on and this is unset), and a 3px focus ring at `more` (AETHERA11Y, SR119).",
     },
+    // ── A11YPANE (rmbp-ledger B655): the glass's Accessibility pane (Settings > Accessibility; DESIGN-LANGUAGE §2.3
+    //    High contrast, §2.6 Reduce motion, [S1] text enlarged to 200 %). The kernel applies them at the login's load
+    //    and on PrefChanged (`video/settings.rs` `a11y_load`); the pane and any program may write them ──
+    Key {
+        ns: "system", key: "accessibility.cursor_size", kind: Kind::Float { min: 1.0, max: 4.0 }, default: Default::Float(1.0),
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel cursor (`video/cursor.rs` `block_scale` through `settings::cursor_blocks`), Settings > Accessibility",
+        doc: "The pointer's size as a multiple of its 1:1 size: the sprite's block scale is multiplied by it (halves on the slider), capped at the sprite's box (`ui::SCALE_MAX`, x4 at 1:1, x2 at 2:1) (A11YPANE, B655).",
+    },
     Key {
         ns: "system", key: "accessibility.forced_colors", kind: Kind::Bool, default: Default::Bool(false),
         writers: OP, reader: "aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`forced-colors`)",
         doc: "A user palette replaces page colours: the `forced-colors: active` media feature, and a 3px focus ring (AETHERA11Y, SR119).",
     },
     Key {
+        ns: "system", key: "accessibility.increase_contrast", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs`, owed: `text.secondary` -> `text.primary`, `line.*` -> `line.control`), Settings > Accessibility (`settings::increase_contrast`)",
+        doc: "High contrast on the glass (DESIGN-LANGUAGE §2.3): the secondary ink reads as the primary and every hairline as the control line (A11YPANE, B655). The web's own switch is `accessibility.contrast`.",
+    },
+    Key {
         ns: "system", key: "accessibility.reduce_motion", kind: Kind::Bool, default: Default::Bool(false),
-        writers: OP, reader: "aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-reduced-motion`)",
-        doc: "Minimise non-essential motion: the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119).",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel glass (`video/motion.rs` `reduced()` through `settings::reduce_motion`: every glide a one-frame cut), Settings > Accessibility; aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-reduced-motion`)",
+        doc: "Minimise non-essential motion: the glass's slides (the Settings pill, toggle knobs, segmented thumbs) become one-frame cuts (DESIGN-LANGUAGE §2.6, A11YPANE B655), and the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119).",
+    },
+    Key {
+        ns: "system", key: "accessibility.text_size", kind: Kind::Enum(&["default", "large", "larger", "largest"]), default: Default::Str("default"),
+        writers: &[Writer::Settings, Writer::Program], reader: "Settings > Accessibility (`settings::a11y_load`), applied by writing `system.display.font_size` (13 / 16 / 20 / 26 CSS px), which `video::text` sizes its faces from (CSS px x the panel's ppi / 96)",
+        doc: "Larger UI text in four steps: `default` (13 px, the body size), `large` (x1.25), `larger` (x1.5), `largest` (x2, the HIG's 200 %). A step is applied on change by writing `display.font_size`; the store carries both (A11YPANE, B655).",
     },
     Key {
         ns: "system", key: "appearance.accent", kind: Kind::Enum(&crate::appearance::ACCENTS), default: Default::Str("crispy"),

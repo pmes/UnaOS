@@ -20,10 +20,10 @@
 //!   paint-path contract).
 //! * [`Frame`] — the repaint gate: `due(now, running)` is true at most once per [`FRAME_MS`] and only while
 //!   something runs; it counts what it granted.
-//! * [`reduced`] — Reduce motion. The design language names the pane (Settings → Accessibility → Reduce motion)
-//!   but no store key, and `prefs::key` (prefs.rs) has no accessibility namespace, so this is the documented
-//!   constant [`REDUCE_MOTION`] until the Accessibility pane's arc adds `accessibility.reduce_motion` to the schema
-//!   and swaps this one body for a `prefs_client::sys_flag` read.
+//! * [`reduced`] — Reduce motion: `system.accessibility.reduce_motion` (PREFS-SCHEMA.md), as the Settings window
+//!   latched it at the login's load and on every PrefChanged naming it (A11YPANE B655: `settings::reduce_motion`,
+//!   one atomic, no bus call on a paint path). [`REDUCE_MOTION`] is the default the latch starts from; MOTIONKIT
+//!   shipped it as the one body while the schema had no key.
 //!
 //! `tests motion` (registered in tests.rs's settings block) samples every curve at 0/¼/½/¾/1 against the reference
 //! values (the Bézier solved in double precision offline, ±[`SAMPLE_TOL`] Q16), drives a tween through a simulated
@@ -47,13 +47,14 @@ pub const EXIT: u32 = 160;
 /// The frame (ui_guidelines.md §1): one repaint per 16 ms while a tween runs.
 pub const FRAME_MS: u64 = 16;
 
-/// Reduce motion (DESIGN-LANGUAGE §2.6's no-motion fallback). A documented constant: see the module head.
+/// Reduce motion (DESIGN-LANGUAGE §2.6's no-motion fallback): the default of the Settings latch (the schema's).
 pub const REDUCE_MOTION: bool = false;
 
 /// Is motion reduced? Every tween the glides start reads this once; `true` makes every slide a one-frame cut.
+/// A11YPANE (B655): the Accessibility pane's key, as Settings applied it (`settings::reduce_motion`, an atomic load).
 #[inline]
 pub fn reduced() -> bool {
-    REDUCE_MOTION
+    crate::video::settings::reduce_motion()
 }
 
 // ── the curves ──────────────────────────────────────────────────────────────────────────────────────────────────

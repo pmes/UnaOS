@@ -1961,7 +1961,7 @@ pub fn armed() -> bool {
 /// Block magnification, derived from the panel — THE METRICS RULE. The arrow is 8 blocks square (one
 /// glyph cell, `cell_w` × `cell_h`); the shadow adds one more block in each direction.
 fn block_scale(fb: &FrameBuffer) -> usize {
-    crate::ui::Metrics::panel().scale
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::ui::Metrics::panel().scale } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { crate::video::settings::cursor_blocks(crate::ui::Metrics::panel().scale) } // A11YPANE (B655): x the operator's cursor size (Settings > Accessibility, `system.accessibility.cursor_size`), capped at `ui::SCALE_MAX` — the save-under's box (`MAX_SIDE`); the knob-off arm is the line as it was. ⚠ LINE-NEUTRAL: edited in place.
 }
 
 /// The colour the sprite paints at box-relative `(col, row)`, or `None` where it paints nothing.
@@ -3810,7 +3810,7 @@ fn current_origin() -> Option<(usize, usize)> {
     if info.width == 0 || info.height == 0 {
         return None;
     }
-    let (px, py) = shape_hot(crate::pal::cursor::pos(info.width as i32, info.height as i32), crate::ui::Metrics::panel().scale); // CURSORSHAPE (B550): the LIVE glyph's hotspot sits on the pointer, exactly as `draw_locked` places it, so a plan is judged against the origin a draw would use. ⚠ LINE-NEUTRAL: edited in place.
+    let (px, py) = shape_hot(crate::pal::cursor::pos(info.width as i32, info.height as i32), { #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::ui::Metrics::panel().scale } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { block_scale(&fb) } }); // A11YPANE (B655): the plan's origin at the scale `draw_locked` draws at (`block_scale`, the cursor size folded in); the knob-off arm is the expression as it was. CURSORSHAPE (B550): the LIVE glyph's hotspot sits on the pointer, exactly as `draw_locked` places it, so a plan is judged against the origin a draw would use. ⚠ LINE-NEUTRAL: edited in place.
     Some((
         (px.max(0) as usize).min(info.width - 1),
         (py.max(0) as usize).min(info.height - 1),

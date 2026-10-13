@@ -101,7 +101,7 @@ pub mod key {
     pub const TP_SECONDARY: &str = "trackpad.secondary_click";
     pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
     /// DRAGDROP (B440): the folders the user dropped on Quarry's sidebar Favorites (R79: a preference is Principia's).
-    pub const QUARRY_FAVORITES: &str = "quarry.favorites";
+    pub const QUARRY_FAVORITES: &str = "quarry.favorites"; pub const A11Y_REDUCE_MOTION: &str = "accessibility.reduce_motion"; pub const A11Y_INCREASE_CONTRAST: &str = "accessibility.increase_contrast"; pub const A11Y_CURSOR_SIZE: &str = "accessibility.cursor_size"; pub const A11Y_TEXT_SIZE: &str = "accessibility.text_size"; // A11YPANE (B655): the Accessibility pane's four keys (LINE-NEUTRAL fold, code first: this file is lexed into every image)
 }
 
 static TREE: crate::sync::Mutex<PrefTree> = crate::sync::Mutex::new(PrefTree::new());
