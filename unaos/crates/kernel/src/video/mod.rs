@@ -1252,3 +1252,6 @@ pub mod dnd;
 pub mod vplay;
 // SVCLATCH (B462, PERFREVIEW F8): the service passes' latches, a posted flag checked before the lock; `tests svclatch`. See video/svclatch.rs.
 pub mod svclatch;
+// GLASSKIT (B628): the glass's drawing kit — anti-aliased rounded rects, strokes, shadows, dithered gradients, circles, lines and the control set; `tests glasskit`. Same gate as dock; at the tail so no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod draw;

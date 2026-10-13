@@ -3934,7 +3934,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
         if j < by + 2 || j + 2 >= by + th { continue; }
         let v = j - by - 2;
         if r.id == TRASH_PIN_ID {
-            trash_glyph_row(out, bx, tw, th, j - by, TRASH_FULL.load(Ordering::Relaxed), ceramic::shade_gain(dnd_face(), j, ceramic::CONTROL_GAIN_Q16)); // DRAGDROP (B440): the selection face while a drag hovers it
+            let (kx, kw, kh, kr) = (bx + 2, tw.saturating_sub(4), th.saturating_sub(4), super::draw::icon_radius(th.saturating_sub(4))); let keep = super::draw::row_keep(out, kx, kw, kr); trash_glyph_row(out, bx, tw, th, j - by, TRASH_FULL.load(Ordering::Relaxed), ceramic::shade_gain(dnd_face(), j, ceramic::CONTROL_GAIN_Q16)); super::draw::row_round(out, &keep, kx, kw, kh, j - by - 2, kr); // GLASSKIT (B628): the Trash tile's plate rounded and anti-aliased by the kit — the glyph itself untouched (LINE-NEUTRAL, code before comment). DRAGDROP (B440): the selection face while a drag hovers it
         } else if dock2_group(r) == 1 {
             if let Some(g) = thumbs.as_ref() {
                 if let Some((_, w, h, px)) = g.iter().find(|e| e.0 == r.id) {
