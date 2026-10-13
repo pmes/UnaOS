@@ -34,7 +34,7 @@ const BATT_WAIT_MS: u64 = 500;
 const PAINT_WAIT_MS: u64 = 500;
 
 /// Is there a desktop? `strip::compose_all`'s gate.
-pub fn built() -> bool {
+pub fn built() -> bool { #[cfg(all(target_arch = "x86_64", feature = "wc"))] steps::render_seen(); // DONGLEBOOT (B658): `strip::compose_all` asks this on every composite — the render task's liveness stamp. LINE-NEUTRAL append, code first
     BUILT.load(Acquire)
 }
 
@@ -263,14 +263,67 @@ mod steps {
         let t0 = match HOLD_T0.compare_exchange(0, now, AcqRel, Acquire) { Ok(_) => now, Err(v) => v };
         let waited = now.saturating_sub(t0);
         let settled = super::settled();
-        if !settled && waited < STARTER_WAIT_MS {
+        // DONGLEBOOT (B658): the render task's quiet since the build got past its stage wait (HELD_AT) — or since
+        // the hold began, whichever is later — counted only while the build is in flight (owed past its stage, or
+        // its first paint pending): that is when the build is waiting on a composite.
+        let held_at = super::HELD_AT.load(Relaxed);
+        let in_flight = held_at != 0 && (super::OWED_AT.load(Acquire) != 0 || super::PAINT_AT.load(Acquire) != 0);
+        let quiet = if in_flight { now.saturating_sub(RENDER_SEEN_MS.load(Relaxed).max(held_at).max(t0)) } else { 0 };
+        let Some(why) = release_why(settled, waited, in_flight, quiet) else {
             HELD.fetch_or(bit(who), Relaxed);
             return true;
-        }
+        };
         if SAID.fetch_or(bit(who), AcqRel) & bit(who) == 0 {
-            serial_println!("[desktop] starter after-bar who={} waited_ms={} why={}", who, waited, if settled { "settled" } else { "timeout" });
+            if why == "render-wedged" {
+                serial_println!("[desktop] starter after-bar who={} waited_ms={} why={} render_quiet_ms={} (DONGLEBOOT: the bar cannot paint while the render task is stuck; the starter does not wait out the bound)", who, waited, why, quiet);
+            } else {
+                serial_println!("[desktop] starter after-bar who={} waited_ms={} why={}", who, waited, why);
+            }
         }
         false
+    }
+
+    /// DONGLEBOOT (B658): the render task composed this long ago (`ms().max(1)`, 0 = never seen).
+    static RENDER_SEEN_MS: AtomicU64 = AtomicU64::new(0);
+    /// DONGLEBOOT (B658): the build in flight and the render task silent this long = the render task is wedged; a
+    /// held starter goes now. Three times the first paint's read-back bound: a healthy build composites within it.
+    pub(super) const RENDER_WEDGE_MS: u64 = 3 * super::PAINT_WAIT_MS;
+
+    /// The render task's stamp, from [`super::built`] (`strip::compose_all`'s gate). Off the render task: nothing.
+    pub(super) fn render_seen() {
+        if matches!(crate::arch::sched::current_name(), Some(n) if n.starts_with("render")) {
+            RENDER_SEEN_MS.store(crate::arch::ms().max(1), Relaxed);
+        }
+    }
+
+    /// DONGLEBOOT (B658): the starter's release rule, pure (the fixture drives it). `None` = hold.
+    /// `settled` → `settled`; the build in flight with the render task quiet for [`RENDER_WEDGE_MS`] →
+    /// `render-wedged`; past [`STARTER_WAIT_MS`] → `timeout`.
+    pub(super) fn release_why(settled: bool, waited: u64, in_flight: bool, render_quiet_ms: u64) -> Option<&'static str> {
+        if settled {
+            Some("settled")
+        } else if in_flight && render_quiet_ms >= RENDER_WEDGE_MS {
+            Some("render-wedged")
+        } else if waited >= STARTER_WAIT_MS {
+            Some("timeout")
+        } else {
+            None
+        }
+    }
+
+    /// `tests dongleboot` leg 4: the rule's table. `(cases, ok)`.
+    pub(super) fn release_table() -> (u32, u32) {
+        let w = RENDER_WEDGE_MS;
+        let cases: [((bool, u64, bool, u64), Option<&str>); 6] = [
+            ((true, 40, true, 0), Some("settled")),
+            ((false, w + 10, true, w + 10), Some("render-wedged")),
+            ((false, w + 10, true, 10), None),
+            ((false, w + 10, false, 0), None),
+            ((false, STARTER_WAIT_MS, false, 0), Some("timeout")),
+            ((false, 100, true, w - 1), None),
+        ];
+        let ok = cases.iter().filter(|(a, want)| release_why(a.0, a.1, a.2, a.3) == *want).count() as u32;
+        (cases.len() as u32, ok)
     }
 
     pub(super) fn say(bar_ms: u64) {
@@ -308,4 +361,73 @@ mod steps {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn starter_holds(who: &'static str) -> bool {
     steps::holds(who)
+}
+
+/// DONGLEBOOT (rmbp-ledger B658) — `tests dongleboot`: flight 35 boot 2's wedge, leg by leg, on whatever disks this
+/// machine has (QEMU: `-device usb-net` + an AHCI disk; the bench: the NIC at power-on, the macOS SSD).
+///
+/// 1. `prefs_stat` — the prefs delete watch's stats, run its way, after one warm call (the store's table is decided
+///    once): `mounts_walked=1` and ZERO AHCI reads across the pass = `home-only`. A FAT root = `skip(fat-root)`.
+/// 2. `ahci_bound` — one READ on the first AHCI disk made to miss the REAL `T_CMD_MS` (the poll ignores completion):
+///    the `[ahci] cmd timeout port=N ms=<n> -> port marked` line, the port lock's whole hold within
+///    `T_CMD_MS + T_PORT_MS`, the next read refused at once, then the port restarted and reading = `ok(<hold ms>)`.
+/// 3. `render_spin` — the fixture holds the port lock and reads AS the render task: refused, with `<ms>` of spin
+///    (0 = it never waited).
+/// 4. `starter` — the usbnet starter's release rule over its six cases (settled, render-wedged, render live, no
+///    build in flight, the 10 s bound, just under the wedge bound) = `released`.
+///
+/// `:: DONGLEBOOT: prefs_stat=<home-only|…> ahci_bound=<ok(<ms>)|…> render_spin=<ms> starter=<released|…> -> PASS|FAIL ::`
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn dongleboot_selftest() {
+    use alloc::string::String;
+    // ── 1. the prefs stat ──────────────────────────────────────────────────────────────────────────────────────
+    let _ = crate::prefs::dongleboot_stat_probe(); // warm: the store's table decided (one full table, once)
+    #[cfg(feature = "ahci")]
+    let r0 = crate::drivers::ahci::dongle::reads();
+    let (walked, dev, _dom, _n, native) = crate::prefs::dongleboot_stat_probe();
+    #[cfg(feature = "ahci")]
+    let reads = crate::drivers::ahci::dongle::reads().saturating_sub(r0);
+    #[cfg(not(feature = "ahci"))]
+    let reads = 0u64;
+    let (prefs_word, prefs_ok): (String, bool) = if !native {
+        (alloc::format!("skip(fat-root walked={})", walked), true)
+    } else if walked == 1 && reads == 0 {
+        (String::from("home-only"), true)
+    } else {
+        (alloc::format!("leaked(walked={} ahci_reads={})", walked, reads), false)
+    };
+    // ── 2. the AHCI bound, 3. the render task ──────────────────────────────────────────────────────────────────
+    #[cfg(feature = "ahci")]
+    let (bound_word, bound_ok, spin_word, spin_ok) = {
+        use crate::drivers::ahci::dongle;
+        let (bw, bo) = match dongle::bound_probe() {
+            None => (String::from("skip(no-disk)"), true),
+            Some(b) => {
+                let ok = b.timed_out && b.cmd_ms <= 1000 + 2 && b.hold_ms <= dongle::HOLD_CEIL_MS && b.marked && b.refused_after && b.refused_us < 1000 && b.revived;
+                if ok {
+                    (alloc::format!("ok({})", b.hold_ms), true)
+                } else {
+                    (alloc::format!("fail(port={} timed_out={} cmd_ms={} hold_ms={} marked={} refused_after={} refused_us={} revived={})", b.port, b.timed_out as u8, b.cmd_ms, b.hold_ms, b.marked as u8, b.refused_after as u8, b.refused_us, b.revived as u8), false)
+                }
+            }
+        };
+        let (refused, spin_us) = dongle::render_probe();
+        let (sw, so) = if refused { (alloc::format!("{}", spin_us / 1000), spin_us < 1000) } else { (String::from("not-refused"), false) };
+        (bw, bo, sw, so)
+    };
+    #[cfg(not(feature = "ahci"))]
+    let (bound_word, bound_ok, spin_word, spin_ok) = (String::from("skip(unbuilt)"), true, String::from("0"), true);
+    // ── 4. the starter ─────────────────────────────────────────────────────────────────────────────────────────
+    let (cases, ok) = steps::release_table();
+    let starter_ok = cases == ok;
+    let starter_word = if starter_ok { String::from("released") } else { alloc::format!("rule({}/{})", ok, cases) };
+    #[cfg(feature = "ahci")]
+    let census = { let (t, rr, br, mh) = crate::drivers::ahci::dongle::census(); alloc::format!("timeouts={} render_refused={} busy_refused={} max_hold_ms={}", t, rr, br, mh) };
+    #[cfg(not(feature = "ahci"))]
+    let census = String::from("ahci=unbuilt");
+    let pass = prefs_ok && bound_ok && spin_ok && starter_ok;
+    serial_println!(
+        ":: DONGLEBOOT: prefs_stat={} ahci_bound={} render_spin={} starter={} -> {} :: device={} wedge_ms={} {}",
+        prefs_word, bound_word, spin_word, starter_word, if pass { "PASS" } else { "FAIL" }, dev, steps::RENDER_WEDGE_MS, census
+    );
 }

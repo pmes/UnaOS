@@ -174,7 +174,7 @@ pub fn legacy_path() -> String {
 // ── VFS helpers (mount table, kernel principal) ─────────────────────────────────────────────────
 
 fn read_all(p: &str) -> Option<Vec<u8>> {
-    let mt = crate::shell::vfs_mount_table();
+    let mt = store_mt();
     let st = mt.stat(p).ok()?;
     if st.size as usize > READ_MAX {
         return None;
@@ -187,7 +187,7 @@ fn read_all(p: &str) -> Option<Vec<u8>> {
 
 fn write_all(p: &str, b: &[u8]) -> Result<(), String> {
     use crate::fs::vfs::NodeKind;
-    let mt = crate::shell::vfs_mount_table();
+    let mt = store_mt();
     let k = crate::fs::vfs::KERNEL_PRINCIPAL;
     let _ = mt.unlink(p, k);
     mt.create(p, NodeKind::File, k).map_err(|e| alloc::format!("create {}: {:?}", p, e))?;
@@ -205,7 +205,7 @@ fn write_all(p: &str, b: &[u8]) -> Result<(), String> {
 /// `<home>/settings` — a plain folder in the home (R98: no link, no dot).
 fn ensure_dirs() {
     use crate::fs::vfs::NodeKind;
-    let mt = crate::shell::vfs_mount_table();
+    let mt = store_mt();
     let d = path();
     if mt.stat(&d).is_err() {
         let _ = mt.create(&d, NodeKind::Dir, crate::fs::vfs::KERNEL_PRINCIPAL);
@@ -292,7 +292,7 @@ fn parse_said(p: &str, text: &[u8]) -> Result<PrefTree, prefs_core::ParseError> 
 /// The domains in `<home>/settings` (a `<d>.new` alone counts: its swap was interrupted).
 fn domains_on_volume() -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
-    if let Ok(ents) = crate::shell::vfs_mount_table().read_dir(&path()) {
+    if let Ok(ents) = store_mt().read_dir(&path()) {
         for e in ents {
             if !matches!(e.kind, crate::fs::vfs::NodeKind::File) {
                 continue;
@@ -370,7 +370,7 @@ fn load() {
         let saved = save();
         let n = ON_DISK.lock().len();
         if saved.is_ok() {
-            let mt = crate::shell::vfs_mount_table();
+            let mt = store_mt();
             let lp = legacy_path();
             let _ = mt.unlink(&lp, crate::fs::vfs::KERNEL_PRINCIPAL);
             let _ = mt.unlink(&alloc::format!("{}.new", lp), crate::fs::vfs::KERNEL_PRINCIPAL);
@@ -441,7 +441,7 @@ fn watch_task(_cpu: usize) {
 /// default, so the keys simply leave the tree and every reader answers its default). Returns the domains reset.
 fn watch_deleted() -> Vec<String> {
     let Some(_g) = SAVE_LOCK.try_lock() else { return Vec::new() };
-    let mt = crate::shell::vfs_mount_table();
+    let mt = store_mt(); say_stat_once(&mt); // DONGLEBOOT (B658): the store's own volume, never a mount-table build per pass (LINE-NEUTRAL fold, code first)
     let gone: Vec<String> = ON_DISK.lock().iter().filter(|d| mt.stat(&domain_path(d)).is_err() && mt.stat(&alloc::format!("{}.new", domain_path(d))).is_err()).cloned().collect();
     for d in &gone {
         let keys = prefs_core::files::clear(&mut TREE.lock(), d);
@@ -502,7 +502,7 @@ pub fn save_domain(d: &str) -> Result<usize, String> {
         Some(Ok(t)) if t == want || t.to_toml() == want.to_toml() => {} // re-emit equality covers a NaN value
         _ => return Err(String::from("read-back does not parse to the tree")),
     }
-    let mt = crate::shell::vfs_mount_table();
+    let mt = store_mt();
     let k = crate::fs::vfs::KERNEL_PRINCIPAL;
     let _ = mt.unlink(&p, k);
     match mt.rename(&tmp, &p, k) {
@@ -1274,4 +1274,106 @@ impl SessionSeen {
     pub(crate) fn forget(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
+}
+
+// ── DONGLEBOOT (rmbp-ledger B658) — the store's table is the store's volume ───────────────────────────────────
+//
+// Flight 35 boot 2: `[lock] held-too-long name=prefs.rs:224 at=prefs.rs:443` (this file's `watch_deleted` holding
+// SAVE_LOCK) for 37522 ms over `name=ahci.rs:249 at=ahci.rs:680` (the SATA port lock) — a stat of a domain file in
+// the home on the CARD reached the internal SSD. Not through the stat: `MountTable::resolve` is longest-prefix and
+// `<home>/settings/<d>` resolves to `/` (the native UnaFS on the card) whatever else is mounted, the EFI volume of
+// `ahci0` included (it is withdrawn from `/volumes` anyway, volumes.rs `withdraw_foreign_esp`). Through the TABLE:
+// every `shell::vfs_mount_table()` runs `bootdisk::bind` → `bind_root(…, unafs_state(src), …)` → under `ahciroot`
+// (on the image line since INSTALL4) `install::ahciroot::ensure_root_grant()`, which caches only a POSITIVE answer
+// and re-probes the SSD's GPT and partitions (`selfinstall::probe`, `partition::census`) on every call when the
+// SSD is not OURS — the bench's SSD carries macOS, so every table build read it (every prefs watch pass on boots 1
+// and 3 shows the same pair at 53–99 ms). The watch built a table every 2 s.
+//
+// The fix in this file: the store's reads, writes and stats resolve against ONE mount — `/` as the native UnaFS
+// backend, the same `NativeBackend` `bootdisk::bind_root` mounts there — once the root is bound and the store's
+// path is claimed by `/` alone (decided once per boot from one full table). A FAT root keeps the full table (the
+// homes live on the FAT there; nothing changes). `[prefs] stat domain=<d> mounts_walked=<n> device=<handle>` once
+// per boot at the first watch pass, and from `tests dongleboot`. The SSD probe that every OTHER table build still
+// runs is ahciroot.rs's (outside this arc's files; the one-line change is in the commit body).
+
+/// 0 = undecided, 1 = the store is on the native root alone, 2 = the full table (a FAT root, or a prefix over it).
+static STORE_KIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static STAT_SAID: AtomicBool = AtomicBool::new(false);
+
+/// The table every store read, write and stat resolves against.
+fn store_mt() -> crate::fs::vfs::MountTable {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        match STORE_KIND.load(Ordering::Acquire) {
+            1 => {
+                let mut t = crate::fs::vfs::MountTable::new();
+                t.mount("/", alloc::boxed::Box::new(crate::fs::vfs::NativeBackend::new("native")));
+                return t;
+            }
+            2 => return crate::shell::vfs_mount_table(),
+            _ => {}
+        }
+        let mt = crate::shell::vfs_mount_table();
+        if matches!(crate::fs::bootdisk::locate(), crate::fs::bootdisk::Verdict::Bound(_)) {
+            let p = path();
+            let native = mt.volume_name(&p).map(|n| n == "native").unwrap_or(false);
+            let alone = mt.prefixes().iter().filter(|q| **q != "/").all(|q| !(p == *q || (p.starts_with(*q) && p.as_bytes().get(q.len()) == Some(&b'/'))));
+            STORE_KIND.store(if native && alone { 1 } else { 2 }, Ordering::Release);
+        }
+        mt
+    }
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+    {
+        crate::shell::vfs_mount_table()
+    }
+}
+
+/// The device the store's table reads: the shared UnaFS mount's handle on a native store, else the found root's
+/// source (`-` before either is known).
+fn store_device(mt: &crate::fs::vfs::MountTable) -> String {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    if mt.volume_name("/").map(|n| n == "native").unwrap_or(false) {
+        if let Some(h) = crate::fs::unafs::mount_bound_handle() {
+            return alloc::format!("{:?}", h).to_ascii_lowercase().replace(' ', "");
+        }
+    }
+    let _ = mt;
+    match crate::fs::bootdisk::locate() {
+        crate::fs::bootdisk::Verdict::Bound(f) => String::from(f.source.name()),
+        crate::fs::bootdisk::Verdict::None_(_) => String::from("-"),
+    }
+}
+
+/// `[prefs] stat …`, once per boot, at the watch's first pass.
+fn say_stat_once(mt: &crate::fs::vfs::MountTable) {
+    if STAT_SAID.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let d = ON_DISK.lock().first().cloned().unwrap_or_else(|| String::from("-"));
+    serial_println!(
+        "[prefs] stat domain={} mounts_walked={} device={} store={} (DONGLEBOOT: the delete watch stats the store's volume only)",
+        d, mt.prefixes().len(), store_device(mt), match STORE_KIND.load(Ordering::Acquire) { 1 => "native-root", 2 => "full-table", _ => "undecided" }
+    );
+}
+
+/// `tests dongleboot` leg 1: the watch's stats, run the watch's way (one table, every domain on the watch list and
+/// its `.new`). Returns `(mounts_walked, device, first domain, stats, native_store)`; prints the `[prefs] stat` line.
+pub fn dongleboot_stat_probe() -> (usize, String, String, u32, bool) {
+    ensure_loaded();
+    let mt = store_mt();
+    let mut ds: Vec<String> = ON_DISK.lock().clone();
+    if ds.is_empty() {
+        ds.push(String::from("display"));
+    }
+    let mut n = 0u32;
+    for d in &ds {
+        let _ = mt.stat(&domain_path(d));
+        let _ = mt.stat(&alloc::format!("{}.new", domain_path(d)));
+        n += 2;
+    }
+    let walked = mt.prefixes().len();
+    let dev = store_device(&mt);
+    let native = STORE_KIND.load(Ordering::Acquire) == 1;
+    serial_println!("[prefs] stat domain={} mounts_walked={} device={} stats={} store={}", ds[0], walked, dev, n, if native { "native-root" } else { "full-table" });
+    (walked, dev, ds[0].clone(), n, native)
 }

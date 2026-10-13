@@ -478,7 +478,7 @@ fn port_start(abar: u64, port: u8) -> bool {
 /// `IDENTIFY DEVICE` ignores both and passes zero.
 fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool) -> Result<(), ()> {
     let abar = p.abar;
-    let port = p.port;
+    let port = p.port; if dongle::marked(port) { dongle::refused_marked(port, cmd); return Err(()); } // DONGLEBOOT (B658): a port that missed its bound is never issued another command this boot
 
     // Only one command slot is ever used, so a busy PxCI bit 0 means the previous command never
     // finished — refuse rather than overwrite a table the controller may still be reading.
@@ -545,20 +545,27 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
 
     pw32(abar, port, P_CI, 1);
 
-    let done = wait_ms(if cmd == ATA_FLUSH_CACHE_EXT { T_FLUSH_MS } else { T_CMD_MS }, || { // AHCIROOT (B332): a flush drains the cache, so it gets its own bound
-        pr32(abar, port, P_CI) & 1 == 0 || pr32(abar, port, P_IS) & PIS_TFES != 0
+    let bound_ms = if cmd == ATA_FLUSH_CACHE_EXT { T_FLUSH_MS } else { T_CMD_MS }; // AHCIROOT (B332): a flush drains the cache, so it gets its own bound
+    let forced = dongle::forced(); // DONGLEBOOT (B658): `tests dongleboot` makes ONE command miss the real bound (the poll ignores completion)
+    let t_wait = crate::arch::now_cycles();
+    let done = wait_ms(bound_ms, || {
+        !forced && (pr32(abar, port, P_CI) & 1 == 0 || pr32(abar, port, P_IS) & PIS_TFES != 0)
     });
 
     let is = pr32(abar, port, P_IS);
     let tfd = pr32(abar, port, P_TFD);
     if !done {
+        // DONGLEBOOT (B658): the bound is the bound. The port is MARKED (every later command on it is refused at
+        // the top of this fn, at once) and stopped — never restarted and re-polled, so one dead port costs this
+        // caller at most `bound_ms + T_PORT_MS` and every other caller nothing.
+        let waited_ms = dongle::cycles_to_us(crate::arch::now_cycles().wrapping_sub(t_wait)) / 1000;
+        dongle::mark(port, waited_ms);
         serial_println!(
-            "[ahci] port {} command {:#04x} TIMED OUT after {} ms (PxCI={:#010x} PxIS={:#010x} PxTFD={:#010x} PxSERR={:#010x})",
-            port, cmd, T_CMD_MS, pr32(abar, port, P_CI), is, tfd, pr32(abar, port, P_SERR)
+            "[ahci] cmd timeout port={} cmd={:#04x} ms={} bound_ms={} forced={} PxCI={:#010x} PxIS={:#010x} PxTFD={:#010x} PxSERR={:#010x} -> port marked (DONGLEBOOT: no further command is issued to this port this boot)",
+            port, cmd, waited_ms, bound_ms, forced as u8, pr32(abar, port, P_CI), is, tfd, pr32(abar, port, P_SERR)
         );
-        // Leave the port in a known state rather than with a command outstanding.
+        // Leave the port with no command outstanding (ST cleared, CR drained, bounded by T_PORT_MS).
         port_stop(abar, port);
-        port_start(abar, port);
         return Err(());
     }
     if is & PIS_TFES != 0 || tfd & TFD_ERR != 0 {
@@ -673,29 +680,32 @@ fn sector0_kind(buf: &[u8; SECTOR_BYTES]) -> &'static str {
 /// Bounded and synchronous: one READ DMA EXT, polled against [`T_CMD_MS`]. The port lock is held
 /// across the command, so two callers serialise rather than interleaving command tables — with one
 /// command slot in play that is a correctness requirement, not an optimisation.
+///
+/// DONGLEBOOT (rmbp-ledger B658): the hold is [`dongle::with_port`]'s — taken and released with interrupts
+/// MASKED, so the holder cannot be preempted off its core mid-command (flight 35 boot 2: a preempted holder kept
+/// this lock 37.5 s against a 1 s command bound), acquired with a bounded try (never an unbounded spin), and
+/// never waited for at all by the render task.
 pub fn read_block_at(port_ix: usize, lba: u64, buf: &mut [u8]) -> Result<(), ()> {
     if buf.len() < SECTOR_BYTES || port_ix >= MAX_AHCI_DISKS {
         return Err(());
     }
-    let guard = PORTS.lock();
-    let p = match guard[port_ix] {
-        Some(p) => p,
-        None => return Err(()),
-    };
-    if lba >= p.num_sectors {
-        return Err(());
-    }
-    // READ DMA EXT is a 48-bit command; a device without 48-bit addressing cannot serve it. This
-    // arc issues no 28-bit read command, so such a device is enumerated and reported and simply has
-    // no read path — an honest gap, named here, rather than a command the device would abort.
-    if !p.lba48 {
-        return Err(());
-    }
-    issue(&p, ATA_READ_DMA_EXT, lba, 1, SECTOR_BYTES, false)?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(p.dma as *const u8, buf.as_mut_ptr(), SECTOR_BYTES);
-    }
-    Ok(())
+    dongle::note_read();
+    dongle::with_port(port_ix, lba, |p| {
+        if lba >= p.num_sectors {
+            return Err(());
+        }
+        // READ DMA EXT is a 48-bit command; a device without 48-bit addressing cannot serve it. This
+        // arc issues no 28-bit read command, so such a device is enumerated and reported and simply has
+        // no read path — an honest gap, named here, rather than a command the device would abort.
+        if !p.lba48 {
+            return Err(());
+        }
+        issue(p, ATA_READ_DMA_EXT, lba, 1, SECTOR_BYTES, false)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(p.dma as *const u8, buf.as_mut_ptr(), SECTOR_BYTES);
+        }
+        Ok(())
+    })
 }
 
 /// How many ports this driver brought up and published.
@@ -959,11 +969,7 @@ pub(crate) fn write_block_at(port_ix: usize, lba: u64, buf: &[u8]) -> Result<(),
     if buf.len() < SECTOR_BYTES || port_ix >= MAX_AHCI_DISKS {
         return Err(());
     }
-    let guard = PORTS.lock();
-    let p = match guard[port_ix] {
-        Some(p) => p,
-        None => return Err(()),
-    };
+    dongle::with_port(port_ix, lba, |p| { let p = *p; // DONGLEBOOT (B658): the write's hold is the read's — masked, bounded, never a render wait
     if lba >= p.num_sectors {
         serial_println!(
             "[ahci] port {} WRITE refused lba={} beyond device capacity {} sectors",
@@ -990,6 +996,7 @@ pub(crate) fn write_block_at(port_ix: usize, lba: u64, buf: &[u8]) -> Result<(),
         core::ptr::copy_nonoverlapping(buf.as_ptr(), p.dma as *mut u8, SECTOR_BYTES);
     }
     issue(&p, ATA_WRITE_DMA_EXT, lba, 1, SECTOR_BYTES, true)
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1035,4 +1042,215 @@ pub(crate) fn flush_at(port_ix: usize) -> Result<(), ()> {
         None => return Err(()),
     };
     issue(&p, ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// DONGLEBOOT (rmbp-ledger B658) — the port lock's hold, bounded for real.
+//
+// Flight 35 boot 2 (`f35-boot2.log` 21:58:42Z, the USB NIC plugged at power-on): `[lock] held-too-long
+// name=ahci.rs:249 at=ahci.rs:680 by=36@cpu2 ms=37519 waiters=2` and the render task (12@cpu1) spinning on it
+// 37410 ms. One `read_block_at` is ONE command polled against T_CMD_MS on the TSC, and no `TIMED OUT` line
+// printed — the command completed. The 37.5 s was the HOLDER OFF ITS CORE: task 36 (`prefs-watch`, a
+// preemptible kernel task) held `PORTS` across the command with interrupts ON, the timer rotated it out, and the
+// same second `:: [smpbal] steal 'bg-user' c1->c2 ::` put the login's ring-3 HOLOCRON (cooperative: IF clear,
+// runs to completion) on cpu2; the holder came back only when that finished. (Boot 3's steal went to c0 and its
+// desktop built in 340 ms.) The steal is GATESTEAL's; the hold is this file's:
+//
+// * [`with_port`] takes and releases `PORTS` with interrupts MASKED, so a holder cannot be preempted: the hold is
+//   the command's own time (microseconds on a healthy disk), at most `T_CMD_MS + T_PORT_MS` once per dead port.
+// * It ACQUIRES with a bounded try (`T_CMD_MS + T_PORT_MS`), never an unbounded spin: a holder that is not ours
+//   to bound (a flush, 10 s) costs a waiter a refusal, not a wedge.
+// * The render task never waits on a disk: busy is an immediate refusal for it (`[ahci] render refused`), and the
+//   caller answers what it answers for an unreadable sector.
+// * A command that misses its bound marks the port (`[ahci] cmd timeout port=N ms=<n> -> port marked`); every
+//   later command on it is refused at once ([`issue`]'s head).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+pub mod dongle {
+    use super::{cycles_ms, AhciPort, MAX_AHCI_DISKS, PORTS, SECTOR_BYTES, T_CMD_MS, T_PORT_MS};
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+    /// HBA ports (bit = port number, 0..32) whose command missed its bound this boot.
+    static DEAD: AtomicU32 = AtomicU32::new(0);
+    /// Ports whose refusal line was said (once each).
+    static DEAD_SAID: AtomicU32 = AtomicU32::new(0);
+    /// `read_block_at` calls this boot — the prefs leg's "did the stat reach this disk" counter.
+    static READS: AtomicU64 = AtomicU64::new(0);
+    /// Commands that missed their bound, and the last one's wait (ms).
+    static TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+    static LAST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+    /// The last and the longest `PORTS` hold through [`with_port`] (µs).
+    static LAST_HOLD_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_HOLD_US: AtomicU64 = AtomicU64::new(0);
+    /// Render-task acquires refused because the lock was held, and the last refusal's spin (µs, before the refusal).
+    static RENDER_REFUSED: AtomicU32 = AtomicU32::new(0);
+    static RENDER_SPIN_US: AtomicU64 = AtomicU64::new(0);
+    /// Non-render acquires that gave up at the bound.
+    static BUSY_REFUSED: AtomicU32 = AtomicU32::new(0);
+    /// `tests dongleboot`: this task's next command poll ignores completion (a forced miss of the REAL bound; 0 = none).
+    static FORCE_TIMEOUT_TID: AtomicU64 = AtomicU64::new(0);
+    /// `tests dongleboot`: this task id is treated as the render task (0 = none).
+    static FORCE_RENDER_TID: AtomicU64 = AtomicU64::new(0);
+    /// How many refusal lines a class prints before it only counts.
+    const SAY_CAP: u32 = 4;
+
+    pub fn note_read() {
+        READS.fetch_add(1, Relaxed);
+    }
+
+    /// `read_block_at` calls so far this boot.
+    pub fn reads() -> u64 {
+        READS.load(Relaxed)
+    }
+
+    pub(super) fn forced() -> bool {
+        let f = FORCE_TIMEOUT_TID.load(Acquire);
+        f != 0 && crate::arch::sched::current_id() == Some(f)
+    }
+
+    pub(super) fn marked(port: u8) -> bool {
+        DEAD.load(Acquire) & (1u32 << (port & 31)) != 0
+    }
+
+    pub(super) fn mark(port: u8, waited_ms: u64) {
+        DEAD.fetch_or(1u32 << (port & 31), AcqRel);
+        TIMEOUTS.fetch_add(1, Relaxed);
+        LAST_TIMEOUT_MS.store(waited_ms, Relaxed);
+    }
+
+    pub(super) fn refused_marked(port: u8, cmd: u8) {
+        if DEAD_SAID.fetch_or(1u32 << (port & 31), AcqRel) & (1u32 << (port & 31)) == 0 {
+            serial_println!("[ahci] port {} marked — command {:#04x} refused at once (DONGLEBOOT: it missed its bound earlier this boot)", port, cmd);
+        }
+    }
+
+    /// TSC cycles to µs (the uncalibrated fallback is `cycles_ms`'s).
+    pub(super) fn cycles_to_us(c: u64) -> u64 {
+        let per_ms = cycles_ms(1).max(1);
+        c.saturating_mul(1000) / per_ms
+    }
+
+    fn on_render() -> bool {
+        let f = FORCE_RENDER_TID.load(Relaxed);
+        if f != 0 && crate::arch::sched::current_id() == Some(f) {
+            return true;
+        }
+        matches!(crate::arch::sched::current_name(), Some(n) if n.starts_with("render"))
+    }
+
+    /// The ONE way `PORTS` is held across a command: masked (no preemption inside the hold), acquired with a
+    /// bounded try, never waited for by the render task. `f` runs under the hold with the port's copy.
+    pub(super) fn with_port<R>(port_ix: usize, lba: u64, f: impl FnOnce(&AhciPort) -> Result<R, ()>) -> Result<R, ()> {
+        let render = on_render();
+        crate::arch::without_interrupts(move || {
+            let t0 = crate::arch::now_cycles();
+            let bound = cycles_ms(T_CMD_MS + T_PORT_MS);
+            let guard = loop {
+                if let Some(g) = PORTS.try_lock() {
+                    break g;
+                }
+                let spun = crate::arch::now_cycles().wrapping_sub(t0);
+                if render {
+                    RENDER_SPIN_US.store(cycles_to_us(spun), Relaxed);
+                    let n = RENDER_REFUSED.fetch_add(1, Relaxed) + 1;
+                    if n <= SAY_CAP {
+                        serial_println!("[ahci] render refused ix={} lba={} n={} (DONGLEBOOT: the render task never waits on a disk; the port lock is held — the caller reads it as an unreadable sector)", port_ix, lba, n);
+                    }
+                    return Err(());
+                }
+                if spun >= bound {
+                    let n = BUSY_REFUSED.fetch_add(1, Relaxed) + 1;
+                    if n <= SAY_CAP {
+                        serial_println!("[ahci] busy refused ix={} lba={} waited_ms={} bound_ms={} n={} (DONGLEBOOT: the port lock was not free inside the bound)", port_ix, lba, cycles_to_us(spun) / 1000, T_CMD_MS + T_PORT_MS, n);
+                    }
+                    return Err(());
+                }
+                core::hint::spin_loop();
+            };
+            let p = match guard[port_ix] {
+                Some(p) => p,
+                None => return Err(()),
+            };
+            let th = crate::arch::now_cycles();
+            let r = f(&p);
+            let held = cycles_to_us(crate::arch::now_cycles().wrapping_sub(th));
+            drop(guard);
+            LAST_HOLD_US.store(held, Relaxed);
+            MAX_HOLD_US.fetch_max(held, Relaxed);
+            r
+        })
+    }
+
+    /// `tests dongleboot` leg 2: what one forced miss of the real bound did.
+    pub struct BoundProbe {
+        pub port: u8,
+        /// The command's wait when it was given up (ms) — the bound, give or take a poll.
+        pub cmd_ms: u64,
+        /// The whole `PORTS` hold around it (ms): the wait plus the port stop.
+        pub hold_ms: u64,
+        pub timed_out: bool,
+        pub marked: bool,
+        /// The next read on the marked port was refused, and how long that took (µs).
+        pub refused_after: bool,
+        pub refused_us: u64,
+        /// The port restarted and read again.
+        pub revived: bool,
+    }
+
+    /// The hold's ceiling the leg holds a forced miss to.
+    pub const HOLD_CEIL_MS: u64 = T_CMD_MS + T_PORT_MS;
+
+    /// `tests dongleboot` leg 2 — one READ on the first published disk whose poll ignores completion, so the
+    /// REAL `T_CMD_MS` fires; then a second read (refused at once: the port is marked); then the port is restarted
+    /// and unmarked so the rest of the boot keeps its disk. `None` = no AHCI disk on this machine.
+    pub fn bound_probe() -> Option<BoundProbe> {
+        let (ix, port) = {
+            let g = PORTS.lock();
+            let ix = (0..MAX_AHCI_DISKS).find(|&i| g[i].is_some())?;
+            (ix, g[ix]?.port)
+        };
+        let mut buf = [0u8; SECTOR_BYTES];
+        let t0 = TIMEOUTS.load(Relaxed);
+        FORCE_TIMEOUT_TID.store(crate::arch::sched::current_id().unwrap_or(0), Release);
+        let r = super::read_block_at(ix, 0, &mut buf);
+        FORCE_TIMEOUT_TID.store(0, Release);
+        let timed_out = r.is_err() && TIMEOUTS.load(Relaxed) > t0;
+        let cmd_ms = LAST_TIMEOUT_MS.load(Relaxed);
+        let hold_ms = LAST_HOLD_US.load(Relaxed) / 1000;
+        let marked = marked(port);
+        let tr = crate::arch::now_cycles();
+        let refused_after = super::read_block_at(ix, 0, &mut buf).is_err();
+        let refused_us = cycles_to_us(crate::arch::now_cycles().wrapping_sub(tr));
+        let started = crate::arch::without_interrupts(|| {
+            let g = PORTS.lock();
+            match g[ix] {
+                Some(p) => super::port_start(p.abar, p.port),
+                None => false,
+            }
+        });
+        DEAD.fetch_and(!(1u32 << (port & 31)), AcqRel);
+        DEAD_SAID.fetch_and(!(1u32 << (port & 31)), AcqRel);
+        let revived = started && super::read_block_at(ix, 0, &mut buf).is_ok();
+        Some(BoundProbe { port, cmd_ms, hold_ms, timed_out, marked, refused_after, refused_us, revived })
+    }
+
+    /// `tests dongleboot` leg 3 — the render task and a held port lock: the fixture holds `PORTS` (the stand-in for
+    /// flight 35's off-core holder) and reads AS the render task. `(refused, spin_us)`: refused at once, and the
+    /// spin before the refusal in µs (0 = it never waited).
+    pub fn render_probe() -> (bool, u64) {
+        let me = crate::arch::sched::current_id().unwrap_or(0);
+        let mut buf = [0u8; SECTOR_BYTES];
+        let before = RENDER_REFUSED.load(Relaxed);
+        let g = PORTS.lock();
+        FORCE_RENDER_TID.store(me, Release);
+        let r = super::read_block_at(0, 0, &mut buf);
+        FORCE_RENDER_TID.store(0, Release);
+        drop(g);
+        let refused = r.is_err() && RENDER_REFUSED.load(Relaxed) > before;
+        (refused, if refused { RENDER_SPIN_US.load(Relaxed) } else { u64::MAX })
+    }
+
+    /// The census the fixture line carries: `(timeouts, render_refused, busy_refused, max_hold_ms)`.
+    pub fn census() -> (u32, u32, u32, u64) {
+        (TIMEOUTS.load(Relaxed), RENDER_REFUSED.load(Relaxed), BUSY_REFUSED.load(Relaxed), MAX_HOLD_US.load(Relaxed) / 1000)
+    }
 }
