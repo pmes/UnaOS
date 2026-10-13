@@ -3207,10 +3207,16 @@ pub fn render_frame(
                 let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
                 let cx0 = current_x - sx as f32 + shx + layout_box.border.left + layout_box.padding.left;
                 let cy0 = current_y - sy as f32 + shy + layout_box.border.top + layout_box.padding.top;
-                for k in 1..cols.filled {
-                    let mid = cx0 + k as f32 * (cols.width + cols.gap) - cols.gap / 2.0;
-                    let x0 = (mid - rw / 2.0).round();
-                    fill_rect(x0, cy0, x0 + rw.max(1.0).round(), cy0 + cols.height, rc, 255, surface, width, height, damage_rects, child_clip);
+                // AETHERSTYLE3B (SR115): a container split by `column-span: all` rules each column set.
+                let one = [layout_core::multicol::ColumnSet { top: 0.0, height: cols.height, filled: cols.filled }];
+                let sets = layout.col_sets.get(&node_id).map(|v| v.as_slice()).unwrap_or(&one);
+                for set in sets {
+                    for k in 1..set.filled {
+                        let mid = cx0 + k as f32 * (cols.width + cols.gap) - cols.gap / 2.0;
+                        let x0 = (mid - rw / 2.0).round();
+                        let y0 = cy0 + set.top;
+                        fill_rect(x0, y0, x0 + rw.max(1.0).round(), y0 + set.height, rc, 255, surface, width, height, damage_rects, child_clip);
+                    }
                 }
             }
         }

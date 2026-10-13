@@ -988,8 +988,13 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
         }
-        // css-multicol-1 §6: a spanning element splits the column flow; Aether does not split it.
-        "column-span" if value == "none" => {}
+        // AETHERSTYLE3B (SR115): css-multicol-1 §6.1 — a spanning element splits the column flow (`multicol`).
+        "column-span" => match value {
+            "none" => style.paint.col_span = Some(false),
+            "all" => style.paint.col_span = Some(true),
+            v if is_neutral_keyword(v) => {}
+            v => H::record_css(&format!("column-span-value:{}", clip(v))),
+        },
         // AETHERSTYLE3 (SR103): Filter Effects 1 §5 / Filter Effects 2 §3 — the list svg_core parses.
         "filter" | "backdrop-filter" => {
             let v = value.trim();
@@ -2426,7 +2431,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
-        scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding,
+        scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {

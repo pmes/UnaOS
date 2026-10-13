@@ -10,6 +10,15 @@
 //! `column-fill: auto` and a definite height the columns fill sequentially at that height. A block child moves
 //! by [`crate::LayoutTree::col_shift`]; a line's fragments are rewritten in place in its IFC. The container's
 //! height becomes the tallest column. `column-rule` paints between columns that hold content ([`Columns`]).
+//!
+//! AETHERSTYLE3B (SR115): a `column-span: all` child of the container splits the flow (§6.1): the content
+//! before it balances into one column set, the spanner sits below that set at the container's full width,
+//! and the content after it balances into the next set ([`ColumnSet`], [`crate::LayoutTree::col_sets`]). A
+//! block child with no painted box of its own (no background, border, padding, shadow, clip, filter or
+//! transform; not a scroll, flex, grid or multicol container) is not a unit itself: its in-flow children (and
+//! the lines of its plain IFC children) are, recursively — so a tall wrapper's content splits across columns
+//! (§8 fragmentation, `break-inside: auto`). A decorated box taller than a column still moves whole (its
+//! border and background are not painted per fragment: `box-decoration-break` is not modelled).
 
 use crate::inline::{Frag, InlineLayout};
 use crate::prelude::*;
@@ -244,6 +253,75 @@ pub(crate) fn rule_of<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Option<(f32,
 /// `column-rule-style: none | hidden`.
 pub const RULE_NONE: u8 = 255;
 
+/// AETHERSTYLE3B (SR115): one column set of a container split by spanners: its top and height in the
+/// container's content space and how many columns hold content.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ColumnSet {
+    pub top: f32,
+    pub height: f32,
+    pub filled: u32,
+}
+
+/// A `column-span: all` box.
+pub fn is_spanner<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
+    tree.paint_map.get(&id).and_then(|p| p.col_span) == Some(true)
+}
+
+/// A block box whose in-flow content fragments in its place: it paints nothing of its own (see the module
+/// notes) and is a plain block container with in-flow children.
+fn transparent<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
+    if tree.inline.contains_key(&id) || is_multicol(tree, id) || crate::scroll::is_scroll_container(tree, id) {
+        return false;
+    }
+    let Ok(st) = tree.taffy.style(id) else { return false };
+    if st.display != taffy::style::Display::Flex {
+        return false;
+    }
+    let Ok(l) = tree.taffy.layout(id) else { return false };
+    if let Some(p) = tree.paint_map.get(&id) {
+        if p.flex_container == Some(true)
+            || p.background.is_some()
+            || p.bg_image.is_some()
+            || p.bg_gradient.as_ref().is_some_and(|g| g.is_some())
+            || p.shadows.as_ref().is_some_and(|s| !s.is_empty())
+            || p.clip == Some(true)
+            || p.filter.as_ref().is_some_and(|f| f.is_some())
+            || p.transform.as_ref().is_some_and(|t| !t.is_empty())
+            || matches!(p.position_kind, Some(1..))
+        {
+            return false;
+        }
+    }
+    l.border.top + l.border.bottom + l.border.left + l.border.right == 0.0
+        && l.padding.top + l.padding.bottom + l.padding.left + l.padding.right == 0.0
+        && !flow_children(tree, id).is_empty()
+}
+
+/// The fragmentation units of one in-flow child `k` of `parent`, whose border box's top is `base_y` in the
+/// container's content space: a whole box, the lines of a splittable IFC, or (recursively) a transparent
+/// block's own units.
+fn collect_child<H: Host>(tree: &LayoutTree<H>, k: NodeId, base_y: f32, depth: u32, units: &mut Vec<(f32, f32, Unit)>) {
+    let Ok(kl) = tree.taffy.layout(k).cloned() else { return };
+    let top = base_y + kl.location.y - kl.margin.top.max(0.0);
+    let bottom = base_y + kl.location.y + kl.size.height + kl.margin.bottom.max(0.0);
+    if splittable(tree, k) {
+        let il = &tree.inline[&k];
+        let dy = base_y + kl.location.y + kl.border.top + kl.padding.top;
+        if il.lines.is_empty() {
+            units.push((top, bottom, Unit::Box(k)));
+        }
+        for (i, &(t, h, _)) in il.lines.iter().enumerate() {
+            units.push((dy + t, dy + t + h, Unit::Line { ifc: k, line: i }));
+        }
+    } else if depth < 8 && transparent(tree, k) {
+        for g in flow_children(tree, k) {
+            collect_child(tree, g, base_y + kl.location.y, depth + 1, units);
+        }
+    } else {
+        units.push((top, bottom, Unit::Box(k)));
+    }
+}
+
 /// A child whose lines may fragment one by one: an IFC root with no paint of its own around the lines.
 fn splittable<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
     if !tree.inline.contains_key(&id) {
@@ -280,26 +358,63 @@ pub(crate) fn flow_children<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Vec<No
 pub(crate) fn balance_blocks<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, n: u32, w: f32, gap: f32) -> Columns {
     let Ok(cl) = tree.taffy.layout(id).cloned() else { return Columns::default() };
     let content_top = cl.border.top + cl.padding.top;
-    let mut units: Vec<(f32, f32, Unit)> = Vec::new();
+    // AETHERSTYLE3B (SR115): the flow splits at each `column-span: all` child into column sets.
+    enum Item {
+        Set(Vec<(f32, f32, Unit)>),
+        Spanner(NodeId),
+    }
+    let mut items: Vec<Item> = vec![Item::Set(Vec::new())];
+    let mut content_end = 0.0f32;
     for k in flow_children(tree, id) {
-        let Ok(kl) = tree.taffy.layout(k).cloned() else { continue };
-        let top = kl.location.y - kl.margin.top.max(0.0) - content_top;
-        let bottom = kl.location.y + kl.size.height + kl.margin.bottom.max(0.0) - content_top;
-        if splittable(tree, k) {
-            let il = &tree.inline[&k];
-            let dy = kl.location.y - content_top + kl.border.top + kl.padding.top;
-            if il.lines.is_empty() {
-                units.push((top, bottom, Unit::Box(k)));
+        if is_spanner(tree, k) {
+            if let Ok(kl) = tree.taffy.layout(k) {
+                content_end = content_end.max(kl.location.y + kl.size.height + kl.margin.bottom.max(0.0) - content_top);
             }
-            for (i, &(t, h, _)) in il.lines.iter().enumerate() {
-                units.push((dy + t, dy + t + h, Unit::Line { ifc: k, line: i }));
+            items.push(Item::Spanner(k));
+            items.push(Item::Set(Vec::new()));
+            continue;
+        }
+        if let Some(Item::Set(units)) = items.last_mut() {
+            collect_child(tree, k, -content_top, 0, units);
+            if let Some(u) = units.last() {
+                content_end = content_end.max(u.1);
             }
-        } else {
-            units.push((top, bottom, Unit::Box(k)));
         }
     }
-    let fixed = fixed_height(tree, id);
-    let (shifts, h, filled) = balance(&units, n, w, gap, fixed);
+    let split = items.len() > 1;
+    let fixed = if split { None } else { fixed_height(tree, id) };
+    let mut units: Vec<(f32, f32, Unit)> = Vec::new();
+    let mut shifts: Vec<(f32, f32)> = Vec::new();
+    let mut sets: Vec<ColumnSet> = Vec::new();
+    let (mut h, mut filled) = (0.0f32, 0u32);
+    let mut acc = 0.0f32; // how far everything after the sets so far has moved up
+    for item in items {
+        match item {
+            Item::Set(seg) => {
+                if seg.is_empty() {
+                    continue;
+                }
+                let (s, used, f) = balance(&seg, n, w, gap, fixed);
+                let first = seg[0].0;
+                let end = seg.iter().map(|u| u.1).fold(first, f32::max);
+                sets.push(ColumnSet { top: first + acc, height: used, filled: f });
+                h = h.max(used);
+                filled = filled.max(f);
+                shifts.extend(s.into_iter().map(|(dx, dy)| (dx, dy + acc)));
+                units.extend(seg);
+                acc += first + used - end;
+            }
+            Item::Spanner(k) => {
+                if acc != 0.0 {
+                    tree.col_shift.insert(k, (0.0, acc));
+                }
+            }
+        }
+    }
+    if split {
+        h = (content_end + acc).max(0.0);
+        tree.col_sets.insert(id, sets);
+    }
     // per IFC child: the shift of each of its lines
     let mut per_ifc: Vec<(NodeId, Vec<(f32, f32)>)> = Vec::new();
     for (u, s) in units.iter().zip(shifts.iter()) {

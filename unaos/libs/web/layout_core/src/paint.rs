@@ -220,6 +220,8 @@ pub struct PaintStyle<H: Host> {
     pub snap_stop: Option<bool>,
     /// `scroll-padding` (§5.2) in px: [top, right, bottom, left] (the snapport's insets).
     pub scroll_padding: Option<[f32; 4]>,
+    /// AETHERSTYLE3B (SR115): `column-span` (css-multicol-1 §6.1): true = `all`.
+    pub col_span: Option<bool>,
 }
 
 
@@ -319,6 +321,7 @@ impl<H: Host> Default for PaintStyle<H> {
             snap_align: None,
             snap_stop: None,
             scroll_padding: None,
+            col_span: None,
         }
     }
 }

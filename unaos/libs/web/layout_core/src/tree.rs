@@ -33,6 +33,9 @@ pub struct LayoutTree<H: Host> {
     pub col_shift: NodeMap<(f32, f32)>,
     /// AETHERSTYLE3 (SR103): each multicol container's used column geometry (the painter's column rules).
     pub multicol: NodeMap<crate::multicol::Columns>,
+    /// AETHERSTYLE3B (SR115): a multicol container a `column-span: all` element splits — its column sets in
+    /// order (css-multicol-1 §6.1); absent when the container is one set ([`LayoutTree::multicol`] alone).
+    pub col_sets: NodeMap<Vec<crate::multicol::ColumnSet>>,
 }
 
 /// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
@@ -263,6 +266,7 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         scroll: NodeMap::new(),
         col_shift: NodeMap::new(),
         multicol: NodeMap::new(),
+        col_sets: NodeMap::new(),
     }
 }
 
@@ -1361,6 +1365,7 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
     crate::scroll::prepare(tree);
     tree.col_shift.clear();
     tree.multicol.clear();
+    tree.col_sets.clear();
     propagate_text_align(tree);
     collapse_inline_whitespace(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
@@ -1649,6 +1654,10 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
             let Some((n, w, gap)) = crate::multicol::used_columns(tree, id, cw, fs) else { continue };
             mc_geom.push((id, n, w, gap));
             for k in crate::multicol::flow_children(tree, id) {
+                // AETHERSTYLE3B (SR115): a `column-span: all` child keeps the container's full width.
+                if crate::multicol::is_spanner(tree, k) {
+                    continue;
+                }
                 let Ok(st) = tree.taffy.style(k) else { continue };
                 mc_saved.push((k, st.max_size.width, st.flex_shrink));
                 let mut st = st.clone();
