@@ -500,3 +500,7 @@ refs/heads/exec-rmbp-dhcpreplug                 817f7945 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-ptrpress2                  817f7945 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-doorsplit                  aa3c9c70 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-winresize2                 aa3c9c70 FOLDED-BY-HAND e524f792
+refs/heads/exec-orin-armresize                  360dbad9 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-firstlogin                 360dbad9 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-host-aethersidetabs2            360dbad9 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-host-aetherwpt4                 360dbad9 IN-FLIGHT cloud 2026-10-14
