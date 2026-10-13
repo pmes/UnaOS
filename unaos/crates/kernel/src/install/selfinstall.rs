@@ -72,13 +72,32 @@ pub struct Probe {
     pub unafs_present: bool,
 }
 
+/// INSTALL4 (B619): the SATA disk `install ssd` names — the first one that is NOT the boot disk, else the
+/// first one (so the refusal still names it). Index 0 alone named the q35 boot ESP (`ide.0` = AHCI port 0)
+/// on every QEMU lane and never the virtual SSD beside it; on the rMBP (SSD = port 0, boot = the SD card)
+/// the answer is the one it always was.
 fn first_ahci() -> Option<(u8, BlockDeviceId)> {
+    let mut first = None;
     for ix in 0..block::MAX_AHCI_DISKS {
         if let Some(d) = block::ahci_disk(ix) {
-            return Some((d.port, d.info.id(BlockHandle::Ahci { port: d.port })));
+            let id = d.info.id(BlockHandle::Ahci { port: d.port });
+            if !is_boot_disk(id) {
+                return Some((d.port, id));
+            }
+            first = first.or(Some((d.port, id)));
         }
     }
-    None
+    first
+}
+
+/// INSTALL4 (B619): is this SATA disk the one the system booted from? `selfguard` answers for the handles
+/// it enumerates; for a SATA handle the installer's own serial check (`partition::sata_is_boot_device`).
+fn is_boot_disk(id: BlockDeviceId) -> bool {
+    #[cfg(feature = "ahci-write")]
+    if partition::sata_is_boot_device(id.handle) {
+        return true;
+    }
+    super::selfguard::refuses(id)
 }
 
 fn has(entries: &[crate::fs::fat::DirEntry], name: &str, dir: bool) -> bool {
@@ -197,8 +216,10 @@ fn running_source() -> Option<BlockSource> {
     }
 }
 
-fn source_is_ahci(s: BlockSource) -> bool {
-    matches!(s, BlockSource::Ahci(_))
+/// INSTALL4 (B619): is the running volume on the TARGET disk? Only that is refused: a system booted from
+/// one SATA disk (every QEMU lane, an rMBP booted off an installed SSD) may clone onto ANOTHER one.
+fn source_on_port(s: BlockSource, port: u8) -> bool {
+    matches!(s, BlockSource::Ahci(p) if p == port)
 }
 
 fn plan_text(p: &Probe) -> String {
@@ -206,7 +227,7 @@ fn plan_text(p: &Probe) -> String {
         return String::from("REFUSE(stranger: R20, no destructive work on a disk that is not ours)");
     }
     let Some(src) = running_source() else { return String::from("NO-SOURCE(running volume not found)") };
-    if source_is_ahci(src) {
+    if source_on_port(src, p.port) {
         return String::from("NO-SOURCE(already running from the SSD)");
     }
     let (mut files, mut bytes) = (0usize, 0u64);
@@ -415,7 +436,7 @@ fn write_ssd_inner(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str
     let t0 = crate::arch::ticks();
     // Source: the running card's volume, buffered whole BEFORE any destructive write.
     let Some(src_id) = running_source() else { fail(out, "running volume not found"); stage("snapshot", "fail (running volume not found)"); return oc(false, false, "running volume not found") };
-    if source_is_ahci(src_id) {
+    if source_on_port(src_id, port) {
         fail(out, "already running from the SSD; boot the card to clone");
         stage("snapshot", "fail (already running from the SSD)");
         return oc(false, false, "already running from the SSD");
