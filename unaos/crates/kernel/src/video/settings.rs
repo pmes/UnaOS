@@ -352,15 +352,15 @@ pub fn request_open() {
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    super::launcher::service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appswitch::service(); /* APPSWITCH (B428): the switcher's pass */ // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
-    if crate::fs::assoc::view_service() && is_open() && cur_tab() == FT_TAB { repaint(); } // FILETYPES (B423): the registry's rows / a preferred-app change, applied off the click path
-    #[cfg(any(target_arch = "aarch64", feature = "unafs"))] crate::fs::nameindex::service(); // NAMEINDEX (B432): the login task's chunked name-index build (idle: one load)
-    crate::prefs::service(); super::loginitems::service(); super::settingsfiles::service(); super::appearance::service(); // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_LAUNCHER); super::launcher::service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appswitch::service(); } /* APPSWITCH (B428): the switcher's pass. KVMLAT2 (B579): each part of this fn is a nested `loginrender` stamp */ // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
+    let av = { let _s = super::loginrender::stamp(super::loginrender::W_S_ASSOC); crate::fs::assoc::view_service() }; if av && is_open() && cur_tab() == FT_TAB { repaint(); } // FILETYPES (B423): the registry's rows / a preferred-app change, applied off the click path
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))] { let _s = super::loginrender::stamp(super::loginrender::W_S_NAMEINDEX); crate::fs::nameindex::service(); } // NAMEINDEX (B432): the login task's chunked name-index build (idle: one load)
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_PREFS); crate::prefs::service(); } { let _s = super::loginrender::stamp(super::loginrender::W_S_LOGINITEMS); super::loginitems::service(); } { let _s = super::loginrender::stamp(super::loginrender::W_S_FILES); super::settingsfiles::service(); } { let _s = super::loginrender::stamp(super::loginrender::W_S_APPEARANCE); super::appearance::service(); } // PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
     if super::notifypane::take_stale() && is_open() && cur_tab() == NP_TAB { repaint(); } // NOTIFYPANE (B435): a newly seen app joins the open pane
     let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
-    let mut wb = [0u8; crate::prefs::WHO_BUF]; let (sk, sq) = SESSION_SEEN.check(); let who = if sq.is_none() { crate::prefs::user_name_in(&mut wb) } else { None }; let has = sq.unwrap_or(who.is_some()); if sq.is_none() { SESSION_SEEN.mark(sk, has); } // SESSIONGEN (B462): the session is compared only when the login generation moved; PERFREVIEW F3 (B443): the per-pass session reads go on the stack
+    let mut wb = [0u8; crate::prefs::WHO_BUF]; let (sk, sq) = SESSION_SEEN.check(); let who = if sq.is_none() { let _s = super::loginrender::stamp(super::loginrender::W_S_SESSION); crate::prefs::user_name_in(&mut wb) } else { None }; let has = sq.unwrap_or(who.is_some()); if sq.is_none() { SESSION_SEEN.mark(sk, has); } // SESSIONGEN (B462): the session is compared only when the login generation moved; PERFREVIEW F3 (B443): the per-pass session reads go on the stack
     if has {
         let fresh = match who { Some(u) => { let mut g = LOADED_FOR.lock(); if *g != u { *g = String::from(u); true } else { false } } None => false }; // SESSIONGEN: quiet => this generation was compared (and recorded) already
         // BRIGHTFLOOR M5: the session opened — the load (and the safe-mode Shift check) waits for the
@@ -370,7 +370,7 @@ pub fn service() {
         let at = LOGIN_AT.load(Ordering::Acquire);
         if at != 0 && crate::arch::ms().saturating_sub(at) >= SAFE_SETTLE_MS {
             LOGIN_AT.store(0, Ordering::Release);
-            load_for_login();
+            { let _s = super::loginrender::stamp(super::loginrender::W_S_LOAD); load_for_login(); } // KVMLAT2 (B579)
             LOAD_DONE.store(true, Ordering::Release);
         }
     }
@@ -388,12 +388,12 @@ pub fn service() {
             if db { c.bright = bl; }
             (dv, db)
         };
-        if db { persist(0); }
-        if dv { persist(1); }
+        if db { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
+        if dv { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(1); }
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
-        if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { persist(0); }
+        if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    mode_service(); tp_service(); bus_changes(); if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
