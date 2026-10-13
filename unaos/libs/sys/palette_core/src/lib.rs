@@ -64,6 +64,11 @@ pub const TEXT_DISABLED: (u32, u32) = (0x00A3_A5A8, 0x005C_5E61);
 pub const CTRL_CLOSE: u32 = 0x00F0_584B;
 pub const CTRL_MIN: u32 = 0x00F4_BF3F;
 pub const CTRL_ZOOM: u32 = 0x0047_C86E;
+/// DESIGN-LANGUAGE §3.7 (MENUSCRAFT B642): a kit sheet never paints PURE WHITE; the seal reads for it and steps
+/// to [`OFF_WHITE`]. The core holds both so no painter or fixture carries the literal (the appearance gate).
+pub const PURE_WHITE: u32 = 0x00FF_FFFF;
+/// The one-step-off white the seal substitutes for [`PURE_WHITE`].
+pub const OFF_WHITE: u32 = 0x00FE_FEFE;
 
 /// `status.*` — FIXED, not accent-derived: they say the same thing in every theme. Each fill takes a white label
 /// (>= 4.5:1); the ink (status as text or icon on a surface) is the fill in Light and §2.3's lifted ink in Dark.

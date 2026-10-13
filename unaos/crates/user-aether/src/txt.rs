@@ -121,7 +121,7 @@ pub fn load() -> (Txt, Option<Why>) {
 impl Txt {
     fn fstyle(&self, sel: FontSel, size: f32) -> FStyle {
         let role = if sel.family == layout_core::MONO && self.mono { Role::Mono } else { Role::Sans };
-        FStyle { role, bold: sel.weight >= 600, size }
+        FStyle::new(role, sel.weight >= 600, size)
     }
 
     /// Advance width of `s` in `sel` at `size`, px.

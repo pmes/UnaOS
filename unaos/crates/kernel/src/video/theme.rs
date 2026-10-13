@@ -871,6 +871,11 @@ pub const GROUP_LIFT: u32 = 8;
 /// Ink drawn ON the accent (a check mark, a selected row's label, the default button's label): white in both sets —
 /// every `accent.fill` is solved for >= 4.6:1 white text (§2.3).
 #[inline] pub fn ink_on_accent() -> u32 { ON_FILL }
+/// MENUSCRAFT (B642), DESIGN-LANGUAGE §3.7: a kit sheet never paints PURE WHITE; the sheet's seal reads for it and
+/// steps to [`off_white`]. Named here so the painters and the fixture carry no colour literal (the appearance gate).
+#[inline] pub const fn pure_white() -> u32 { palette_core::PURE_WHITE }
+/// The one-step-off white the seal substitutes for [`pure_white`].
+#[inline] pub const fn off_white() -> u32 { palette_core::OFF_WHITE }
 /// The secondary ink (a group's title, a caption): `text.secondary`.
 #[inline] pub fn ink_secondary() -> u32 { text_secondary() }
 /// SOFTY (B629): the Softy look's colours, re-exported by name from `palette_core::softy` (PALETTECORE B559: the

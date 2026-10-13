@@ -145,8 +145,8 @@ pub fn load() -> Result<Txt, Why> {
     let size = eng.fit_size(Role::Sans, None, LH_TT as f32).unwrap_or(12.0);
     let mrole = if eng.has(Role::Mono) { Role::Mono } else { Role::Sans };
     let msize = eng.fit_size(mrole, None, LH_TT as f32).unwrap_or(12.0);
-    let sans = Style { role: Role::Sans, bold: false, size };
-    let mono = Style { role: mrole, bold: false, size: msize };
+    let sans = Style::new(Role::Sans, false, size);
+    let mono = Style::new(mrole, false, msize);
     let base = eng.baseline_in_cell(Role::Sans, size, LH_TT as f32);
     let mut t = Txt { eng, sans, mono, base, adv: [[0.0; 95]; 3], bytes };
     for (k, st) in [sans, Style { bold: true, ..sans }, mono].into_iter().enumerate() {

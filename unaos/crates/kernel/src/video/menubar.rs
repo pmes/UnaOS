@@ -3660,16 +3660,16 @@ pub fn menuscraft_selftest() {
     paint(bh - 1, &mut row);
     let corners = row[0] != face;
     let hairline = row[bw / 2] != face;
-    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == theme::pure_white()).count();
     paint(bh / 2, &mut row);
     let face_ok = row[bw / 2] == face;
-    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == theme::pure_white()).count();
     paint(bh + 1, &mut row);
     let near = luma(row[bw / 2]);
-    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == theme::pure_white()).count();
     paint(h - 1, &mut row);
     let far = luma(row[bw / 2]);
-    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == theme::pure_white()).count();
     let scene = luma(theme::DESKTOP_BG);
     let shadow = near < scene && near < far;
     let (top, ih) = (crate::ui::px(10), crate::ui::px(20));
@@ -3677,7 +3677,7 @@ pub fn menuscraft_selftest() {
     sheet::pill(&mut row, bw, top + ih / 2, top, ih);
     sheet::seal_row(&mut row);
     let pill = row[bw / 2] == sheet::accent_fill() && row[sheet::INSET() / 2] != sheet::accent_fill();
-    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == theme::pure_white()).count();
     let sheet_ok = corners && face_ok && hairline && shadow && pill && white == 0;
 
     // ── leg 2: the glyphs against their slots ──

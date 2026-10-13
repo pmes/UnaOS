@@ -504,10 +504,19 @@ refs/heads/exec-orin-armresize                  360dbad9 FOLDED-BY-HAND 4f687b59
 refs/heads/exec-rmbp-firstlogin                 360dbad9 FOLDED-BY-HAND a76e79c2
 refs/heads/exec-host-aethersidetabs2            360dbad9 FOLDED-BY-HAND e57d1b0e
 refs/heads/exec-host-aetherwpt4                 360dbad9 FOLDED-BY-HAND 621dda89
-refs/heads/exec-host-aetherwpt5                   e57d1b0e IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-host-aetherapis                   e57d1b0e IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-host-aetherwpt5                   e57d1b0e FOLDED-BY-HAND 56a89822
+refs/heads/exec-host-aetherapis                   e57d1b0e FOLDED-BY-HAND c369c236
 refs/heads/exec-rmbp-wifi10                       e57d1b0e FOLDED-BY-HAND 0a01b320
 refs/heads/exec-orin-ga10bnext                    e57d1b0e FOLDED-BY-HAND c29d976c
 refs/heads/exec-orin-appmenuarm                   e57d1b0e FOLDED-BY-HAND 782e7f67
 refs/heads/exec-rmbp-quarryhover                  e57d1b0e FOLDED-BY-HAND 96794a6d
 refs/heads/exec-rmbp-motionkit                    e57d1b0e FOLDED-BY-HAND e4528914
+refs/heads/exec-rmbp-local-designapply           62306ce0 FOLDED-BY-HAND 4156edff
+refs/heads/exec-rmbp-local-fontscraft            29e3982f FOLDED-BY-HAND 255d7b32
+refs/heads/exec-rmbp-local-softy2                73375027 FOLDED-BY-HAND 2038a7ff
+refs/heads/exec-rmbp-local-menuscraft            4354a868 FOLDED-BY-HAND 5eca3ba4
+refs/heads/exec-rmbp-local-keplerucode           d0f90797 FOLDED-BY-HAND ce5933a0
+refs/heads/exec-rmbp-local-gen7r10               96317f96 FOLDED-BY-HAND 8ba9b95f
+refs/heads/exec-rmbp-local-knoboff27             6f84ce5c FOLDED-BY-HAND 766bb8ea
+refs/heads/exec-rmbp-local-dhcpbench             0c9107b1 FOLDED-BY-HAND ca589d56
+refs/heads/exec-rmbp-local-shotstage             6f13e5e9 IN-FLIGHT bench 2026-10-14

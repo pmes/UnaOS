@@ -107,7 +107,7 @@ pub fn load() -> Result<Txt, Why> {
             let mut eng = Engine::new(CACHE);
             eng.add_face(NAMES[k], role, false, f);
             let size = eng.fit_size(role, None, LH_TT as f32).unwrap_or(12.0);
-            let st = Style { role, bold: false, size };
+            let st = Style::new(role, false, size);
             let base = eng.baseline_in_cell(role, size, LH_TT as f32);
             let cell = eng.measure(b"M", st).max(1.0);
             return Ok(Txt { eng, st, base, cell, name: NAMES[k], bytes: len });

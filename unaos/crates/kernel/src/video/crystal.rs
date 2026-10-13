@@ -1576,14 +1576,14 @@ pub mod sheet {
     #[inline]
     fn unfill(c: u32) -> u32 {
         let c = c & 0x00FF_FFFF;
-        if c == 0x00FF_FFFF { 0x00FE_FEFE } else { c }
+        if c == theme::pure_white() { theme::off_white() } else { c }
     }
 
     /// The same rule over a finished row (a blend of two near-whites can round to white).
     pub fn seal_row(out: &mut [u32]) {
         for p in out.iter_mut() {
-            if *p & 0x00FF_FFFF == 0x00FF_FFFF {
-                *p = (*p & 0xFF00_0000) | 0x00FE_FEFE;
+            if *p & 0x00FF_FFFF == theme::pure_white() {
+                *p = (*p & 0xFF00_0000) | theme::off_white();
             }
         }
     }
@@ -1789,7 +1789,7 @@ pub mod sheet {
         draw::fill_rrect(&mut s, b, radii, surface_overlay());
         draw::stroke_rrect(&mut s, b, radii, 1, Ink::argb(line_subtle()));
         if theme::is_dark() {
-            draw::stroke_rrect(&mut s, b.inset(1), radii.shrink(1), 1, Ink::new(0x00FF_FFFF, RIM_DARK));
+            draw::stroke_rrect(&mut s, b.inset(1), radii.shrink(1), 1, Ink::new(theme::pure_white(), RIM_DARK));
         }
     }
 
