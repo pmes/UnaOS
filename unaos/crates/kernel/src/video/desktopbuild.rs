@@ -42,6 +42,7 @@ pub fn built() -> bool {
 pub fn build(why: &'static str) {
     if !BUILT.load(Acquire) && OWED_AT.compare_exchange(0, crate::arch::ms().max(1), AcqRel, Relaxed).is_ok() {
         AT_LOGIN.store(why == "login ok", Relaxed);
+        probe_reset();
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
     service(); // no device-service pass carries it off x86 (and no SMC battery to wait for): build inline; a later `build` retries
@@ -58,6 +59,7 @@ fn batt_key() -> u32 {
 pub fn service() {
     let paint_at = PAINT_AT.load(Acquire);
     if paint_at != 0 {
+        probe_pass();
         let ms = crate::arch::ms().saturating_sub(paint_at);
         if super::menubar::owns_pixels() || ms >= PAINT_WAIT_MS {
             if PAINT_AT.compare_exchange(paint_at, 0, AcqRel, Relaxed).is_ok() {
@@ -78,10 +80,12 @@ pub fn service() {
         }
         return;
     }
+    probe_pass();
     #[cfg(feature = "login")]
     if crate::fs::users::furniture_held() {
         return; // the session's stage has not published yet (flight 24 card 1's race): stay owed
     }
+    let _ = HELD_AT.compare_exchange(0, crate::arch::ms().max(1), AcqRel, Relaxed); // KVMLAT2: the first pass that found the stage published
     let waited = crate::arch::ms().saturating_sub(at);
     if super::status::source() == super::status::Source::Unresolved && waited < BATT_WAIT_MS && cfg!(all(target_arch = "x86_64", feature = "wc")) {
         return; // the first SMC sweep lands ~1 ms after the services open: the bar's first paint carries the battery
@@ -89,6 +93,7 @@ pub fn service() {
     if OWED_AT.compare_exchange(at, 0, AcqRel, Relaxed).is_err() {
         return;
     }
+    probe_built(at);
     PREBUILT.store(super::menubar::owns_pixels() || super::dock::owns_pixels(), Relaxed);
     LAST_BATT.store(batt_key(), Relaxed);
     BUILT.store(true, Release);
@@ -110,8 +115,9 @@ fn say(bar_ms: u64) {
     let dock = super::dock::owns_pixels();
     let at_login = AT_LOGIN.load(Relaxed);
     serial_println!(
-        "[desktop] built at={} bar_ms={} battery={} dock={} pins={}",
-        if at_login { "login ok" } else { "stage" }, bar_ms, battery, if dock { "painted" } else { "unpainted" }, super::dock::pins_pinned()
+        "[desktop] built at={} bar_ms={} battery={} dock={} pins={} held_ms={} batt_ms={} gap_max_ms={}",
+        if at_login { "login ok" } else { "stage" }, bar_ms, battery, if dock { "painted" } else { "unpainted" }, super::dock::pins_pinned(),
+        HELD_MS.load(Relaxed), BATT_MS.load(Relaxed), GAP_MAX_MS.load(Relaxed) // KVMLAT2 (B576): where the bar's span went
     );
     if !FIRST_SAID.swap(true, AcqRel) {
         let prebuilt = PREBUILT.load(Relaxed);
@@ -130,6 +136,7 @@ fn say(bar_ms: u64) {
 /// Log Out: the desktop object goes — the bar off, unbuilt, one composite vacates the bar's and the dock's pixels.
 pub fn teardown(why: &'static str) {
     OWED_AT.store(0, Release);
+    probe_reset();
     PAINT_AT.store(0, Release);
     LAST_BATT.store(u32::MAX, Relaxed);
     if !BUILT.swap(false, AcqRel) {
@@ -155,4 +162,39 @@ pub fn last_bar_ms() -> Option<u64> {
         0 => None,
         n => Some(n - 1),
     }
+}
+
+// KVMLAT2 (B576): THE BAR'S SPAN, SPLIT. Image 26's `[desktop] built at=login ok bar_ms=425` held a 12801 -> 12960 ms
+// span the wire did not explain. The `[desktop] built` line now ends `held_ms=<ask -> the first pass that found the
+// session's stage published (furniture_held)> batt_ms=<that pass -> the build (the battery source's bounded wait)>
+// gap_max_ms=<the longest gap between two service passes from the ask to the line>` — bar_ms minus those two is the
+// first paint's read-back; a large gap_max_ms names the pass that ran something else (the HDA walk, B576) between.
+static HELD_AT: AtomicU64 = AtomicU64::new(0);
+static LAST_PASS: AtomicU64 = AtomicU64::new(0);
+static HELD_MS: AtomicU64 = AtomicU64::new(0);
+static BATT_MS: AtomicU64 = AtomicU64::new(0);
+static GAP_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A new ask (or a teardown): the span's readings start over.
+fn probe_reset() {
+    for a in [&HELD_AT, &LAST_PASS, &HELD_MS, &BATT_MS, &GAP_MAX_MS] {
+        a.store(0, Relaxed);
+    }
+}
+
+/// A service pass while the build is owed or its paint pending: the gap since the previous one.
+fn probe_pass() {
+    let now = crate::arch::ms().max(1);
+    let last = LAST_PASS.swap(now, Relaxed);
+    if last != 0 {
+        GAP_MAX_MS.fetch_max(now.saturating_sub(last), Relaxed);
+    }
+}
+
+/// The build ran (ask stamp `at`): the stage wait and the battery wait, fixed.
+fn probe_built(at: u64) {
+    let (now, held_at) = (crate::arch::ms(), HELD_AT.load(Relaxed));
+    let held_at = if held_at == 0 { now } else { held_at };
+    HELD_MS.store(held_at.saturating_sub(at), Relaxed);
+    BATT_MS.store(now.saturating_sub(held_at), Relaxed);
 }

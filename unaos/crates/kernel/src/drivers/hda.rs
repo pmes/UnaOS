@@ -2274,7 +2274,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
     #[cfg(feature = "hda-tone")] play::service(); static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // PLAYWAV (R75): the stream's refill tick (idle = one atomic load), LINE-NEUTRAL fold
-    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || !crate::boot::services_gate("hda") { // FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
+    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || !crate::boot::services_gate("hda") || bar_holds() { // KVMLAT2 (B576): and not before the bar's first paint (`bar_holds`, file tail). FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
     }
     crate::boot::note_start("hda"); if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -2668,4 +2668,41 @@ pub fn vol_readback() -> Option<(u8, bool, u8, u8)> {
     let (muted, gain) = (r & 0x80 != 0, (r & 0x7F) as u8);
     let level = if steps == 0 { 16 } else { ((gain as u32 * 16).div_ceil(steps as u32)).min(16) as u8 };
     Some((level, muted, gain, steps))
+}
+
+// ===================== KVMLAT2 (rmbp-ledger B576) — THE BRING-UP WAITS FOR THE BAR =====================
+//
+// Image 26's KVM boot (docs/dev/evidence/qemu-image26/serial.log): `[boot] phase=desktop … at=12737ms`, then
+// `[hda] probe deferred-start at=12960ms` and the whole codec walk, then `[desktop] built at=login ok bar_ms=425`
+// (12737 + 425 = 13162 ms) and `:: JOBSCAN: … bar_ms=425 … -> FAIL` (bound 200, `fs/jobs.rs`). `probe_after_root`
+// runs in the usb-pump's `net-hda` step and `desktopbuild::service` in its `desktop-app` step of the SAME loop
+// (main.rs, the device-service pass), so the walk's ~200 ms sat inside the bar's first paint. The bring-up now
+// waits until `desktopbuild::settled()` (the desktop built and its first paint read back), bounded by JOBSCAN's
+// own fallback, `fs::jobs::BAR_WAIT_MS` after this gate first opened (the services' open): a desktop that never
+// settles costs the tone that bound, never the tone. Without a desktop object (`wc` off) or without `/jobs`'s
+// module (`unafs` off) nothing waits. Said once: `[hda] probe after-bar waited_ms=<n> why=<settled|timeout>`.
+
+/// KVMLAT2 (B576): `true` while the HDA bring-up must still wait for the bar's first paint.
+fn bar_holds() -> bool {
+    #[cfg(all(feature = "wc", feature = "unafs"))]
+    {
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire}};
+        static T0: AtomicU64 = AtomicU64::new(0);
+        static SAID: AtomicBool = AtomicBool::new(false);
+        let now = crate::arch::ms().max(1);
+        let t0 = match T0.compare_exchange(0, now, AcqRel, Acquire) { Ok(_) => now, Err(v) => v };
+        let waited = now.saturating_sub(t0);
+        let settled = crate::video::desktopbuild::settled();
+        if !settled && waited < crate::fs::jobs::BAR_WAIT_MS {
+            return true;
+        }
+        if !SAID.swap(true, AcqRel) {
+            serial_println!("[hda] probe after-bar waited_ms={} why={}", waited, if settled { "settled" } else { "timeout" });
+        }
+        false
+    }
+    #[cfg(not(all(feature = "wc", feature = "unafs")))]
+    {
+        false
+    }
 }
