@@ -42,6 +42,8 @@ use std::rc::Rc;
 pub enum ScriptKind {
     Classic,
     Module,
+    /// `<script type="importmap">` (HTML §4.12.1.1 step 11; registered at once when prepared — AETHERJS2).
+    ImportMap,
 }
 
 /// A prepared script element's record.
@@ -318,6 +320,9 @@ fn script_kind(el: usize) -> Option<ScriptKind> {
     if essence == "module" {
         return Some(ScriptKind::Module);
     }
+    if essence == "importmap" {
+        return Some(ScriptKind::ImportMap);
+    }
     None
 }
 
@@ -416,6 +421,9 @@ fn prepare_parser_script(vm: &mut Vm, el: usize) {
         (ScriptKind::Module, _) => {
             with_ctx(|c| c.deferred.push(el));
         }
+        // §4.12.1.1 step 32: an import map "immediately executes" — it must be in place before the
+        // modules after it resolve their specifiers.
+        (ScriptKind::ImportMap, _) => run_script_now(vm, el),
     }
 }
 
@@ -433,6 +441,8 @@ fn spin_event_loop(vm: &mut Vm) {
                 super::idl::unroot(vm, r);
                 super::invoke(vm, "task", &f, &Value::Undefined, &[]);
             }
+            super::Task::Rejection(r) => super::fire_rejection(vm, r, false),
+            super::Task::RejectionHandled(r) => super::fire_rejection(vm, r, true),
         }
         super::checkpoint(vm);
     }
@@ -453,6 +463,16 @@ fn run_script_now(vm: &mut Vm, el: usize) {
         crate::security::csp::arm(vm);
         if rec.external {
             super::events::fire_simple(vm, TargetKey::Node(el), "error", false, false);
+        }
+        return;
+    }
+    if rec.kind == ScriptKind::ImportMap {
+        // External import maps are not supported (§4.12.1.1 step 27: "fire an event named error").
+        if rec.external {
+            super::events::fire_simple(vm, TargetKey::Node(el), "error", false, false);
+        } else {
+            let text = rec.source.clone().and_then(|r| r.ok()).unwrap_or_default();
+            register_import_map(vm, el, &text);
         }
         return;
     }
@@ -504,6 +524,7 @@ fn run_script_now(vm: &mut Vm, el: usize) {
             r.map(|_| ())
         }
         ScriptKind::Module => run_module(vm, el, &rec, &src),
+        ScriptKind::ImportMap => Ok(()),
     };
     if rec.external && !parser_inserted {
         EXTERNAL_ASYNC_RUNNING.with(|c| c.set(c.get().saturating_sub(1)));
@@ -517,6 +538,24 @@ fn run_script_now(vm: &mut Vm, el: usize) {
     }
     if rec.external {
         super::events::fire_simple(vm, TargetKey::Node(el), "load", false, false);
+    }
+}
+
+/// HTML "register an import map" (§8.1.5.6) for an inline `<script type="importmap">`: the document's base
+/// URL is the map's; a structurally invalid map is a TypeError reported like a script's, dropped entries
+/// are console warnings.
+fn register_import_map(vm: &mut Vm, el: usize, text: &str) {
+    let base = dom::base_url(dom::node_document(el));
+    match super::importmap::register(text, &base) {
+        Ok(warnings) => {
+            for w in warnings {
+                super::host::console_out(1, &w);
+            }
+        }
+        Err(msg) => {
+            let e = vm.type_error(&msg);
+            super::events::report_exception(vm, &e);
+        }
     }
 }
 
@@ -677,7 +716,7 @@ fn prepare_dynamic_script(vm: &mut Vm, el: usize) {
     let kind = rec.kind;
     let external = rec.external;
     SCRIPTS.with(|s| s.borrow_mut().insert(el, rec));
-    if kind == ScriptKind::Classic && !external {
+    if (kind == ScriptKind::Classic && !external) || kind == ScriptKind::ImportMap {
         run_script_now(vm, el);
     } else {
         page(|p| p.tasks.push_back(super::Task::Script(el)));

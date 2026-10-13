@@ -228,7 +228,7 @@ pub const SERIALIZE: &str = r#"
     };
     var tagOf = function (x) { return Object.prototype.toString.call(x).slice(8, -1); };
     var VIEWS = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
-        'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'DataView'];
+        'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'DataView'];
     var num = function (n) {
         if (n !== n) { return { t: 'N', v: 'NaN' }; }
         if (n === Infinity) { return { t: 'N', v: 'Infinity' }; }
@@ -348,9 +348,27 @@ pub const SERIALIZE: &str = r#"
     hide('__sc_ser', ser);
     hide('__sc_de', de);
     Object.defineProperty(globalThis, 'structuredClone', {
-        value: function structuredClone(value) {
+        // HTML §2.7.11 structuredClone(value, { transfer }): ArrayBuffers in `transfer` move — the clone owns
+        // their bytes and the originals are detached (AETHERJS2).
+        value: function structuredClone(value, options) {
             if (arguments.length < 1) { throw new TypeError("Failed to execute 'structuredClone': 1 argument required, but only 0 present."); }
-            return de(ser(value));
+            var transfer = [];
+            if (options !== undefined && options !== null) {
+                if (typeof options !== 'object' && typeof options !== 'function') {
+                    throw new TypeError("Failed to execute 'structuredClone': The provided value is not of type 'StructuredSerializeOptions'.");
+                }
+                if (options.transfer !== undefined) { transfer = Array.from(options.transfer); }
+            }
+            var seen = new Set();
+            transfer.forEach(function (b, i) {
+                if (tagOf(b) !== 'ArrayBuffer') { throw err('Value at index ' + i + ' does not have a transferable type and'); }
+                if (seen.has(b)) { throw err('ArrayBuffer at index ' + i + ' is a duplicate of an earlier ArrayBuffer and'); }
+                if (typeof b.detached === 'boolean' && b.detached) { throw err('ArrayBuffer at index ' + i + ' is already detached and'); }
+                seen.add(b);
+            });
+            var out = de(ser(value));
+            transfer.forEach(function (b) { ArrayBuffer.prototype.transfer.call(b, 0); });
+            return out;
         },
         writable: true, configurable: true, enumerable: false,
     });

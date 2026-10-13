@@ -109,6 +109,8 @@ fn request_animation_frame(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn cancel_animation_frame(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let id = vm.to_number(&arg(vm, ctx, 0))? as u32;
     let r = page(|p| {
+        // A callback of the frame now running that has not run yet is canceled too.
+        p.raf_cancelled.insert(id);
         let i = p.raf.iter().position(|(h, _)| *h == id)?;
         Some(p.raf.remove(i).1)
     });
@@ -139,18 +141,28 @@ pub fn drain_raf(vm: &mut Vm, passes: u32) {
 
 /// One animation frame: advances the page clock a frame and runs the callbacks registered before it.
 pub fn run_raf_pass(vm: &mut Vm) -> usize {
-    let batch: Vec<(u32, usize)> = page(|p| std::mem::take(&mut p.raf));
+    let batch: Vec<(u32, usize)> = page(|p| {
+        p.raf_cancelled.clear();
+        std::mem::take(&mut p.raf)
+    });
     if batch.is_empty() {
         return 0;
     }
     crate::event_loop::advance_clock(16);
+    // One timestamp for every callback of the frame (HTML §8.1.7.3 step "run the animation frame
+    // callbacks" passes the frame's `now`); each callback is its own "invoke a callback", so the
+    // microtasks it queues run before the next one.
     let ts = super::events::now_hr();
     let n = batch.len();
-    for (_, r) in batch {
+    for (h, r) in batch {
         let cb = idl::rooted(vm, r);
         unroot(vm, r);
+        if page(|p| p.raf_cancelled.contains(&h)) {
+            continue;
+        }
         super::invoke(vm, "raf-callback", &cb, &Value::Undefined, &[num(ts)]);
     }
+    page(|p| p.raf_cancelled.clear());
     n
 }
 
