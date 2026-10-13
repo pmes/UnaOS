@@ -90,6 +90,8 @@ impl Sem {
 /// accent table (`theme::accent()`, the chosen accent's fill; hover / pressed / ink derived the way §2.3 derives them,
 /// toward black or white). When DESIGNAPPLY (B639) lands §2.3's tokens in `palette_core`, each arm becomes the token
 /// of the same name and nothing else in Softy moves.
+/// Seat, at the LOCAL WAVE 3 fold: DESIGNAPPLY (B639) retired the material tokens this map read (BevelShadow,
+/// TitleInactiveTop, ButtonText, ButtonFacePressed); each is read as the semantic token it became.
 pub fn dark(t: Sem) -> u32 {
     use crate::video::theme::{Tok, DARK};
     let d = |k: Tok| DARK[k as usize];
@@ -97,15 +99,15 @@ pub fn dark(t: Sem) -> u32 {
     match t {
         Sem::SurfaceWindow => d(Tok::ContentFill),
         Sem::SurfaceSidebar => d(Tok::WindowBg),
-        Sem::SurfaceContent | Sem::SurfaceSunken => d(Tok::BevelShadow),
+        Sem::SurfaceContent | Sem::SurfaceSunken => d(Tok::SurfaceSunken),
         Sem::SurfaceRaised => d(Tok::FieldBg),
-        Sem::SurfaceOverlay => d(Tok::TitleInactiveTop),
+        Sem::SurfaceOverlay => d(Tok::SurfaceOverlay),
         Sem::LineSubtle => d(Tok::TitleActiveBottom),
         Sem::LineStrong => d(Tok::FrameLine),
         Sem::LineControl | Sem::TextTertiary => d(Tok::TitleTextInactive),
-        Sem::TextPrimary => d(Tok::ButtonText),
-        Sem::TextSecondary => palette_core::mix(d(Tok::ButtonText), d(Tok::TitleTextInactive), 1, 2),
-        Sem::TextDisabled => d(Tok::ButtonFacePressed),
+        Sem::TextPrimary => d(Tok::TextPrimary),
+        Sem::TextSecondary => palette_core::mix(d(Tok::TextPrimary), d(Tok::TextSecondary), 1, 2),
+        Sem::TextDisabled => d(Tok::TextDisabled),
         Sem::AccentFill => acc,
         Sem::AccentHover => palette_core::mix(acc, light::PRESS, 1, 12),
         Sem::AccentPressed => palette_core::mix(acc, light::PRESS, 1, 6),

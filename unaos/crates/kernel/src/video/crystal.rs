@@ -1742,7 +1742,7 @@ pub mod sheet {
                 let (cx0, cy0, cx1, cy1) = w.c;
                 if x >= cx0 && x < cx1 {
                     if y >= cy0 && y < cy1 {
-                        return theme::content_fill();
+                        return theme::surface_content();
                     }
                     if y + self.title_h >= cy0 && y < cy0 {
                         return theme::chrome_face();
