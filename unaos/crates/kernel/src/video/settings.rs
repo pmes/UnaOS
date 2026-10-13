@@ -42,6 +42,10 @@
 //! pane. Every colour is a theme role or derived from one; `tests settings` paints both sets offscreen and checks the
 //! pixels (`craft=ok`).
 //!
+//! A11YPANE (rmbp-ledger B655): the Accessibility tab (the last) — Reduce motion, Increase contrast, Cursor size, Text
+//! size — the four `system.accessibility.*` keys, applied as atomics the glass reads (`motion::reduced`,
+//! `cursor::block_scale`), loaded at login and followed on PrefChanged; `tests a11y`.
+//!
 //! Witness: `:: SETTINGS: controls=<n> tabs=<n> loaded=<n> saved=<n> -> PASS ::` on open and on save, and the
 //! `tests` fixture `settings` ([`selftest`]: set idle to 5, save, re-read the file, compare).
 
@@ -106,8 +110,8 @@ const TOP: usize = PANE_Y;
 const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
-pub const TABS: usize = 9;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8
+pub const TABS: usize = 10;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -353,7 +357,7 @@ fn load_for_login() {
     if mask & 8 != 0 { apply_idle(v.idle_min); }
     tp_load(if mask & 16 != 0 { Some(v.ptr) } else { None }); // TRACKPADPANE (B412): the five trackpad keys; a legacy pointer.speed stands in for an unset speed
     if mask & 32 != 0 && !v.wall.is_empty() { apply_wall(&v.wall); }
-    mode_at_login(); super::appearance::load_at_login(); // PREFSUI (R93): a stored `system.display.mode` is this session's scale
+    mode_at_login(); super::appearance::load_at_login(); a11y_load("login"); // A11YPANE (B655): the four accessibility keys, latched for the glass. PREFSUI (R93): a stored `system.display.mode` is this session's scale
 }
 
 /// Set control `i` to `val` (slider position, toggle 0/1, chooser index), apply, print, save, repaint.
@@ -480,7 +484,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -699,7 +703,8 @@ fn avatar(st: &mut State, x: usize, y: usize, d: usize, name: &str) {
 // ── The tab icons: our own glyphs, drawn as code on a rounded tile (DESIGN-LANGUAGE §2.8, §7.3 item 1) ────────────
 
 /// A tab's tile colour: the accents table and the ink — no literal (General, About, Login Items, Trackpad and File
-/// Types the slate; Users and Display the first accent; Appearance the ink itself; Notifications the rose).
+/// Types the slate; Users and Display the first accent; Appearance the ink itself; Notifications the rose;
+/// Accessibility the slate).
 fn icon_tile(tab: usize) -> u32 {
     match tab {
         1 | 2 => theme::ACCENTS[0],
@@ -776,6 +781,14 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
             fill_rrect(s, Rect::new(x + f(26), y + f(16), f(48), f(68)), Radii::new(f(6), f(22), f(6), f(6)), ink);
             fill_rrect(s, Rect::new(x + f(34), y + f(46), f(32), sw), 0, bg);
             fill_rrect(s, Rect::new(x + f(34), y + f(60), f(22), sw), 0, bg);
+        }
+        9 => {
+            // Accessibility: the universal-access figure — a ring, the head, the arms across, the two legs (A11YPANE B655).
+            stroke_circle(s, cx, cy, f(44).max(2), sw, ink);
+            fill_circle(s, cx, y + f(30), f(8).max(1), ink);
+            fill_rrect(s, Rect::new(x + f(28), y + f(42), f(44), sw), f(2), ink);
+            line_aa(s, cx * SUB, (y + f(46)) * SUB, (x + f(36)) * SUB, (y + f(76)) * SUB, sw * SUB, ink);
+            line_aa(s, cx * SUB, (y + f(46)) * SUB, (x + f(64)) * SUB, (y + f(76)) * SUB, sw * SUB, ink);
         }
         _ => {
             // Notifications: a bell — the dome, the rim, the clapper, the crown.
@@ -886,7 +899,7 @@ fn paint(st: &mut State, v: &Values) {
     let tab = (v.tab as usize).min(TABS - 1);
     paint_column(st, tab);
     // The pane's title band: the tab's name in the title face, bold (DESIGN-LANGUAGE §3.4: the pane title).
-    let tf = super::text::Face::Chrome;
+    let tf = super::text::Face::Title; // FONTSCRAFT (B640): the pane title in the title face (owed from the fold, A11YPANE)
     let tc = super::metrics::lcell_h(tf);
     text_at(st, BOX_X, (PANE_Y - tc) / 2, w, TAB_NAMES[tab], theme::text_primary(), true, tf);
     match v.tab {
@@ -897,6 +910,7 @@ fn paint(st: &mut State, v: &Values) {
         6 => paint_trackpad(st), // TRACKPADPANE (B412): TP_TAB = 6 (v.tab is u8)
         t if t as usize == FT_TAB => paint_filetypes(st), // FILETYPES (B423)
         t if t as usize == NP_TAB => paint_notifypane(st), // NOTIFYPANE (B435)
+        t if t as usize == A11Y_TAB => paint_a11y(st), // A11YPANE (B655)
         _ => paint_about(st),
     }
     // SETTINGSFILES (B407, R98): the pane's file, as a link (the accent ink) that reveals `<home>/settings` in Quarry.
@@ -984,7 +998,7 @@ fn paint_about(st: &mut State) {
         draw::group_box(&mut s, Rect::new(e(BOX_X), e(y0), ew(BOX_X, BOX_W), e(y1) - e(y0)), b"");
         tab_icon(&mut s, 3, e(cx - mark / 2), e(y0 + 24), ew(cx - mark / 2, mark), Some(theme::accent()));
     }
-    let (tf, uf) = (super::text::Face::Chrome, super::text::Face::Ui);
+    let (tf, uf) = (super::text::Face::Title, super::text::Face::Ui); // FONTSCRAFT (B640): the About card's name in the title face
     let (tc, uc) = (super::metrics::lcell_h(tf), super::metrics::lcell_h(uf));
     let mut y = y0 + 24 + mark + 12;
     let tw = super::metrics::ladvance(b"UnaOS", true, tf);
@@ -1648,6 +1662,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         TP_TAB => press_trackpad(row, cx), // TRACKPADPANE (B412)
         t if t == FT_TAB => press_filetypes(row, cx), // FILETYPES (B423)
         t if t == NP_TAB => press_notifypane(row, cx), // NOTIFYPANE (B435)
+        t if t == A11Y_TAB => press_a11y(row, cx), // A11YPANE (B655)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -1961,7 +1976,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } // APPEARANCE (B408): another client chose
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } // A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }
@@ -2143,6 +2158,7 @@ fn drag_value(ctrl: usize) -> i64 {
     match ctrl {
         0 => { let (r, m) = (crate::video::backlight::cur_raw(), crate::video::backlight::panel_range()); crate::video::backlight::pct_of(r.min(m), m) as i64 }
         1 => CUR.lock().vol as i64,
+        A11Y_CURSOR_CTRL => A11Y_CURSOR_Q.load(Ordering::Relaxed) as i64, // A11YPANE (B655): quarters
         _ => CUR.lock().idle_min as i64,
     }
 }
@@ -2157,6 +2173,7 @@ fn drag_apply(ctrl: usize, cx: usize) {
             CUR.lock().bright = a.level;
         }
         1 => { let v = slider_at(cx, 16) as u8; let mut c = CUR.lock(); if c.vol == v && !c.mute { return; } c.vol = v; c.mute = false; drop(c); apply_volume(v, false); }
+        A11Y_CURSOR_CTRL => { let q = a11y_cursor_at(cx); if A11Y_CURSOR_Q.load(Ordering::Relaxed) == q { return; } a11y_set(2, q as usize, false); return; } // A11YPANE (B655): live, `a11y_set` repaints
         _ => { let m = IDLE_STEPS[slider_at(cx, IDLE_STEPS.len() - 1)]; let mut c = CUR.lock(); if c.idle_min == m { return; } c.idle_min = m; drop(c); apply_idle(m); }
     }
     repaint();
@@ -2209,10 +2226,11 @@ fn drag_finish() {
     match d.ctrl {
         0 => { let l = CUR.lock().bright; say("brightness", &alloc::format!("{}", l), true); bright_persist_later(); }
         1 => { let v = CUR.lock().vol; say("volume", &alloc::format!("{}", v), true); persist(1); }
+        A11Y_CURSOR_CTRL => { let q = A11Y_CURSOR_Q.load(Ordering::Relaxed); a11y_set(2, q as usize, true); } // A11YPANE (B655): the commit prints and latches the store write
         _ => { let m = CUR.lock().idle_min; say("idle_min", &alloc::format!("{}", m), true); persist(3); }
     }
     DRAGS.fetch_add(1, Ordering::Relaxed);
-    serial_println!("[settings] slider drag key={} samples={} ms={} from={} to={}", NAMES[d.ctrl], d.samples, crate::arch::ms().saturating_sub(d.t0), d.from, to);
+    serial_println!("[settings] slider drag key={} samples={} ms={} from={} to={}", NAMES.get(d.ctrl).copied().unwrap_or(crate::prefs::key::A11Y_CURSOR_SIZE), d.samples, crate::arch::ms().saturating_sub(d.t0), d.from, to);
 }
 
 /// `tests settings` leg: drive a drag on the Blank-screen slider THROUGH the capture seam (press, two motion
@@ -2796,6 +2814,7 @@ pub fn row_of_key(key: &str) -> (usize, usize) {
         "display.wallpaper" => (0, 5),
         k if k.starts_with("display.") => (2, AT_FIRST),
         k if k.starts_with("login.") => (4, AT_FIRST),
+        k if k.starts_with("accessibility.") => (A11Y_TAB, AT_FIRST), // A11YPANE (B655)
         _ => (0, AT_FIRST),
     }
 }
@@ -2833,8 +2852,8 @@ fn take_at(tab: usize) -> (usize, bool) {
 // posts) and the stored stanzas: Allow, Banner/Center, Sound; row 9 the `settings/notify` link. Every change applies
 // LIVE in `notifypane`'s cell and latches ONE store write drained on NOTIFY's service pass (never a bus call here).
 
-/// The Notifications tab's index on the strip (the last tab; FILETYPES precedes it at the fold).
-pub const NP_TAB: usize = TABS - 1;
+/// The Notifications tab's index on the strip (FILETYPES precedes it; A11YPANE (B655) follows it as the last tab).
+pub const NP_TAB: usize = TABS - 2;
 const NP_ROW0: usize = 3;
 const NP_APP_ROWS: usize = 6;
 const NP_ALLOW_X: usize = PANE_X + 300;
@@ -2959,4 +2978,221 @@ fn press_filetypes(row: usize, cx: usize) {
         else { return; }
     } else { return; }
     repaint();
+}
+
+// ── A11YPANE (rmbp-ledger B655) — the Accessibility tab ──────────────────────────────────────────────────────────────
+// DESIGN-LANGUAGE §2.6 (Reduce motion: every slide a one-frame cut), §2.3 (High contrast: `text.secondary` ->
+// `text.primary`, `line.*` -> `line.control`), [S1] (text enlarged to 200 %). The four `system.accessibility.*` keys
+// (PREFS-SCHEMA.md; `prefs::key::A11Y_*`): `reduce_motion` (bool), `increase_contrast` (bool), `cursor_size` (float
+// 1.0..=4.0, halves on the slider), `text_size` (enum default / large / larger / largest). Rows 0-1 toggles, row 2 a
+// slider that DRAGS through PREFSUI's capture seam (`Drag.ctrl` = [`A11Y_CURSOR_CTRL`]), row 3 a segmented control.
+// The APPLIED state is four atomics the glass reads on its hot paths with no lock and no bus call: `motion::reduced()`
+// asks [`reduce_motion`] for every glide; `cursor::block_scale` asks [`cursor_blocks`] for every sprite draw (the
+// panel's block scale x the size, capped at `ui::SCALE_MAX`, the save-under's box); [`increase_contrast`] is the
+// theme's to read (owed: theme.rs is not this arc's file). The text size goes through the face seam the faces already
+// follow: a step writes `system.display.font_size` (its px, [`A11Y_TEXT_PX`]) and `video::text` restyles on its next
+// poll at CSS px x the panel's ppi / 96; at login nothing is written (the store carries the px). Loaded with the
+// login's load ([`a11y_load`]), followed on PrefChanged (`bus_changes_inner` marks [`A11Y_DIRTY`], the service pass
+// re-reads), stored as ONE latched PrefSet per changed key drained by [`a11y_service`] (never a bus write in the click
+// router). Wire: `[settings] accessibility.<key>=<v> applied=<0|1>`, `[settings] accessibility loaded …`.
+
+/// The Accessibility tab's index on the strip: the last tab.
+pub const A11Y_TAB: usize = TABS - 1;
+/// The schema's `accessibility.text_size` spellings, in step order.
+const A11Y_TEXT_NAMES: [&str; 4] = ["default", "large", "larger", "largest"];
+/// The CSS px each text step writes to `system.display.font_size`: the body size (DESIGN-LANGUAGE §2.2, 13), x1.25,
+/// x1.5, x2.0 ([S1]: text enlarged by at least 200 %). Every step is inside the schema's `9..=32`.
+pub const A11Y_TEXT_PX: [i64; 4] = [13, 16, 20, 26];
+/// The cursor size in QUARTERS (4 = x1.0 .. 16 = x4.0): the atomic's unit, so the float never lives on a paint path.
+const A11Y_CURSOR_MIN_Q: u8 = 4;
+const A11Y_CURSOR_MAX_Q: u8 = 16;
+/// The slider's last position (0..=6 -> x1.0..=x4.0 by halves).
+const A11Y_CURSOR_STEPS: usize = 6;
+/// The `Drag.ctrl` of the cursor-size slider (past [`CONTROLS`]: not a [`NAMES`] control).
+const A11Y_CURSOR_CTRL: usize = CONTROLS;
+
+static A11Y_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(draw::motion::REDUCE_MOTION);
+static A11Y_CONTRAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static A11Y_CURSOR_Q: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(A11Y_CURSOR_MIN_Q);
+static A11Y_TEXT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size).
+static A11Y_PERSIST: AtomicU32 = AtomicU32::new(0);
+/// A PrefChanged named an `accessibility.*` key: the service pass re-reads the four.
+static A11Y_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Reduce motion, as applied (`motion::reduced()` reads this for every glide).
+#[inline]
+pub fn reduce_motion() -> bool {
+    A11Y_REDUCE.load(Ordering::Relaxed)
+}
+
+/// Increase contrast, as applied (the theme's read: `text.secondary` -> `text.primary`, `line.*` -> `line.control`).
+#[inline]
+pub fn increase_contrast() -> bool {
+    A11Y_CONTRAST.load(Ordering::Relaxed)
+}
+
+/// The cursor sprite's block scale for the panel's `base` scale: `base x size` rounded, held to `1..=ui::SCALE_MAX`
+/// (the save-under buffer is sized for `SCALE_MAX`: a larger block would be refused by `draw_locked`). Pure.
+#[inline]
+pub fn cursor_blocks(base: usize) -> usize {
+    ((base * A11Y_CURSOR_Q.load(Ordering::Relaxed) as usize + 2) / 4).clamp(1, crate::ui::SCALE_MAX)
+}
+
+/// A stored `cursor_size` as quarters: finite, held to 1.0..=4.0, rounded to the nearest quarter. Pure.
+fn a11y_cursor_q_of(f: f64) -> u8 {
+    let f = if f.is_finite() { f.clamp(1.0, 4.0) } else { 1.0 };
+    ((f * 4.0 + 0.5) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q)
+}
+
+/// Quarters as the pane prints them: `1.50`.
+fn a11y_cursor_str(q: u8) -> String {
+    alloc::format!("{}.{:02}", q / 4, (q % 4) as u32 * 25)
+}
+
+/// The slider position `cx` as quarters (halves: 4, 6, .. 16).
+fn a11y_cursor_at(cx: usize) -> u8 {
+    A11Y_CURSOR_MIN_Q + 2 * slider_at(cx, A11Y_CURSOR_STEPS) as u8
+}
+
+/// The text step whose px `font_size` is (`None` = a size no step writes: the Display tab's - / + set it).
+fn a11y_text_step_of(px: i64) -> Option<usize> {
+    A11Y_TEXT_PX.iter().position(|p| *p == px)
+}
+
+/// Read the four keys over the bus (the schema's default where unset), latch them for the glass. `via` = `login`
+/// (the login's load) or `prefchanged` (another client wrote one); on `prefchanged` a moved text step is re-applied
+/// (its px written) through the same latched write a press makes.
+fn a11y_load(via: &str) {
+    use crate::prefs::key; use crate::prefs_client::{sys_flag as flag, sys_get, sys_text as text};
+    let rm = flag(key::A11Y_REDUCE_MOTION).unwrap_or(draw::motion::REDUCE_MOTION);
+    let ic = flag(key::A11Y_INCREASE_CONTRAST).unwrap_or(false);
+    let cq = sys_get(key::A11Y_CURSOR_SIZE).and_then(|v| v.as_float()).map_or(A11Y_CURSOR_MIN_Q, a11y_cursor_q_of);
+    let ts = text(key::A11Y_TEXT_SIZE).and_then(|s| A11Y_TEXT_NAMES.iter().position(|n| *n == s)).unwrap_or(0) as u8;
+    let (rm0, ic0, cq0, ts0) = (A11Y_REDUCE.swap(rm, Ordering::Relaxed), A11Y_CONTRAST.swap(ic, Ordering::Relaxed), A11Y_CURSOR_Q.swap(cq, Ordering::Relaxed), A11Y_TEXT.swap(ts, Ordering::Relaxed));
+    let moved = (rm0 != rm) as u8 + (ic0 != ic) as u8 + (cq0 != cq) as u8 + (ts0 != ts) as u8;
+    if via != "login" && ts0 != ts { A11Y_PERSIST.fetch_or(1 << 3, Ordering::AcqRel); }
+    if via == "login" || moved > 0 {
+        serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} moved={} via={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], moved, via);
+    }
+}
+
+/// Set row `row` (0 / 1 toggles = `val != 0`; 2 the cursor size in quarters; 3 the text step), apply it to the latch
+/// the glass reads, and when `store`: print the change and latch the store write. Repaints.
+fn a11y_set(row: usize, val: usize, store: bool) {
+    let (name, vtxt, applied) = match row {
+        0 => { A11Y_REDUCE.store(val != 0, Ordering::Relaxed); ("reduce_motion", alloc::format!("{}", (val != 0) as u8), true) }
+        1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
+        2 => { let q = (val.min(255) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q); A11Y_CURSOR_Q.store(q, Ordering::Relaxed); ("cursor_size", alloc::format!("x{}", a11y_cursor_str(q)), super::cursor::armed()) }
+        3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
+        _ => return,
+    };
+    if store {
+        say(&alloc::format!("accessibility.{}", name), &vtxt, applied);
+        A11Y_PERSIST.fetch_or(1 << row, Ordering::AcqRel);
+    }
+    repaint();
+}
+
+/// The service pass: a PrefChanged's re-read, then the owed store writes (one PrefSet per changed key; the text
+/// step also writes its px to `system.display.font_size`, the seam `video::text` follows within a second).
+fn a11y_service() {
+    if A11Y_DIRTY.swap(false, Ordering::AcqRel) && LOAD_DONE.load(Ordering::Acquire) {
+        a11y_load("prefchanged");
+        if is_open() && cur_tab() == A11Y_TAB { repaint(); }
+    }
+    let owed = A11Y_PERSIST.swap(0, Ordering::AcqRel);
+    if owed == 0 { return; }
+    use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys;
+    if owed & 1 != 0 { set_sys(key::A11Y_REDUCE_MOTION, P::Bool(A11Y_REDUCE.load(Ordering::Relaxed))); }
+    if owed & 2 != 0 { set_sys(key::A11Y_INCREASE_CONTRAST, P::Bool(A11Y_CONTRAST.load(Ordering::Relaxed))); }
+    if owed & 4 != 0 { set_sys(key::A11Y_CURSOR_SIZE, P::Float(A11Y_CURSOR_Q.load(Ordering::Relaxed) as f64 / 4.0)); }
+    if owed & 8 != 0 {
+        let s = (A11Y_TEXT.load(Ordering::Relaxed) as usize).min(A11Y_TEXT_NAMES.len() - 1);
+        set_sys(key::A11Y_TEXT_SIZE, P::Str(String::from(A11Y_TEXT_NAMES[s])));
+        set_sys(key::FONT_SIZE, P::Int(A11Y_TEXT_PX[s]));
+    }
+}
+
+fn paint_a11y(st: &mut State) {
+    groups(st, &[(0, 1), (2, 3)]);
+    let (rm, ic, q) = (reduce_motion(), increase_contrast(), A11Y_CURSOR_Q.load(Ordering::Relaxed));
+    txt(st, LABEL_X, 0, "Reduce motion");
+    tog(st, 0, TOG_X, rm, false); // SETTINGSCRAFT: the kit's switch, right-aligned (a press anywhere on the row flips it)
+    txt2(st, TRACK_X, 0, if rm { "Slides are cuts" } else { "Slides ease over 160 ms" });
+    txt(st, LABEL_X, 1, "Increase contrast");
+    tog(st, 1, TOG_X, ic, false);
+    txt2(st, TRACK_X, 1, if ic { "Secondary ink and lines at full strength" } else { "Standard contrast" });
+    txt(st, LABEL_X, 2, "Cursor size");
+    slider(st, 2, ((q - A11Y_CURSOR_MIN_Q) / 2) as usize, A11Y_CURSOR_STEPS, false);
+    txt2(st, VAL_X, 2, &alloc::format!("x{} ({} blocks)", a11y_cursor_str(q), cursor_blocks(crate::ui::Metrics::panel().scale)));
+    txt(st, LABEL_X, 3, "Text size");
+    let px = font_size();
+    let step = a11y_text_step_of(px).unwrap_or(A11Y_TEXT.load(Ordering::Relaxed) as usize).min(A11Y_TEXT_NAMES.len() - 1);
+    seg(st, 3, &[b"Default", b"Large", b"Larger", b"Largest"], step, false);
+    txt2(st, VAL_X, 3, &alloc::format!("{} px", px));
+    txt2(st, LABEL_X, 4, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
+    txt2(st, LABEL_X, 5, "Text size sets the UI font size the faces follow; contrast raises the secondary ink and the lines.");
+}
+
+/// A press on the Accessibility tab: a toggle row flips, the cursor slider captures (a drag), a text segment sets.
+fn press_a11y(row: usize, cx: usize) {
+    match row {
+        0 => a11y_set(0, (!reduce_motion()) as usize, true),
+        1 => a11y_set(1, (!increase_contrast()) as usize, true),
+        2 => { if cx + 6 >= TRACK_X && cx <= TRACK_X + TRACK_W + 6 { drag_begin(A11Y_CURSOR_CTRL, cx); } }
+        3 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(3, ((cx - TRACK_X) / (TRACK_W / A11Y_TEXT_NAMES.len())).min(A11Y_TEXT_NAMES.len() - 1), true); } }
+        _ => {}
+    }
+}
+
+/// `tests a11y`: the four keys are in the schema; the pane paints offscreen with its four controls; a glide under
+/// Reduce motion is a one-frame cut (and eases without it); the contrast latch reads back; the cursor seam doubles
+/// the blocks at x2 and holds `SCALE_MAX`; the text steps are the body size, rising, to 200 %, inside the font-size
+/// range. Every latch is restored; nothing is written to the store.
+/// `:: A11Y: keys=4 declared=ok pane=ok reduce_motion=snap(ok) contrast=ok cursor=ok(x2) text=ok -> PASS ::`
+pub fn selftest_a11y() {
+    use crate::prefs::key;
+    let keys = [key::A11Y_REDUCE_MOTION, key::A11Y_INCREASE_CONTRAST, key::A11Y_CURSOR_SIZE, key::A11Y_TEXT_SIZE];
+    let declared = keys.iter().filter(|k| prefs_core::schema::lookup(crate::prefs::NS, k).is_some()).count();
+    // The pane, painted offscreen at the panel's scale: the card, the search field and the four controls record hits.
+    let pane = {
+        let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+        let mut surf: Vec<u32> = Vec::new();
+        if surf.try_reserve_exact(pw * ph).is_err() { false } else {
+            surf.resize(pw * ph, 0);
+            let mut st = State::new(WIN_W, WIN_H, surf, 0, true, 0);
+            let mut v = CUR.lock().clone();
+            v.tab = A11Y_TAB as u8;
+            paint(&mut st, &v);
+            st.hits.len() >= 6 && TAB_NAMES[A11Y_TAB] == "Accessibility" && col_list("access").1 == 1 && NP_TAB + 1 == A11Y_TAB
+        }
+    };
+    // Reduce motion: a moved target under the latch is drawn AT the target with nothing running; without it, from where it was.
+    use draw::motion::{Curve, Glides, BASE};
+    let rm0 = A11Y_REDUCE.swap(true, Ordering::Relaxed);
+    let snap = { let mut g = Glides::new(); let _ = g.to(1, 0, 1000, BASE, Curve::Standard); let v = g.to(1, 100, 1001, BASE, Curve::Standard); v == 100 && !g.running() };
+    A11Y_REDUCE.store(false, Ordering::Relaxed);
+    let eases = { let mut g = Glides::new(); let _ = g.to(1, 0, 1000, BASE, Curve::Standard); let v = g.to(1, 100, 1001, BASE, Curve::Standard); v < 100 && g.running() };
+    A11Y_REDUCE.store(rm0, Ordering::Relaxed);
+    let ic0 = A11Y_CONTRAST.swap(true, Ordering::Relaxed);
+    let contrast = increase_contrast() && { A11Y_CONTRAST.store(false, Ordering::Relaxed); !increase_contrast() };
+    A11Y_CONTRAST.store(ic0, Ordering::Relaxed);
+    let q0 = A11Y_CURSOR_Q.swap(8, Ordering::Relaxed);
+    let max = crate::ui::SCALE_MAX;
+    let mut cursor = cursor_blocks(1) == 2 && cursor_blocks(2) == 4usize.min(max) && cursor_blocks(max) == max;
+    A11Y_CURSOR_Q.store(A11Y_CURSOR_MAX_Q, Ordering::Relaxed);
+    cursor &= cursor_blocks(1) == 4usize.min(max) && cursor_blocks(2) == max;
+    A11Y_CURSOR_Q.store(A11Y_CURSOR_MIN_Q, Ordering::Relaxed);
+    cursor &= cursor_blocks(1) == 1 && cursor_blocks(2) == 2 && a11y_cursor_q_of(2.0) == 8 && a11y_cursor_q_of(9.0) == 16 && a11y_cursor_q_of(0.1) == 4 && a11y_cursor_q_of(f64::NAN) == 4 && a11y_cursor_at(TRACK_X) == 4 && a11y_cursor_at(TRACK_X + TRACK_W) == 16;
+    A11Y_CURSOR_Q.store(q0, Ordering::Relaxed);
+    let text = A11Y_TEXT_PX[0] == font_core::ui::DEFAULT_CSS_PX && A11Y_TEXT_PX.windows(2).all(|w| w[0] < w[1]) && A11Y_TEXT_PX[3] >= 2 * A11Y_TEXT_PX[0]
+        && A11Y_TEXT_PX.iter().all(|p| (FONT_MIN..=FONT_MAX).contains(p)) && a11y_text_step_of(16) == Some(1) && a11y_text_step_of(14).is_none()
+        && A11Y_TEXT_NAMES.iter().all(|n| matches!(prefs_core::schema::lookup(crate::prefs::NS, key::A11Y_TEXT_SIZE).map(|k| k.kind), Some(prefs_core::schema::Kind::Enum(e)) if e.contains(n)));
+    let ok = declared == keys.len() && pane && snap && eases && contrast && cursor && text;
+    serial_println!(
+        ":: A11Y: keys={} declared={} pane={} reduce_motion=snap({}) contrast={} cursor={}(x2) text={} -> {} ::",
+        keys.len(), if declared == keys.len() { "ok" } else { "FAIL" }, if pane { "ok" } else { "FAIL" }, if snap && eases { "ok" } else if snap { "no-ease" } else { "FAIL" },
+        if contrast { "ok" } else { "FAIL" }, if cursor { "ok" } else { "FAIL" }, if text { "ok" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
+    );
 }
