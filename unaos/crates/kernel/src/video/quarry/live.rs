@@ -4486,7 +4486,10 @@ pub fn quarry3_selftest() {
     let found = hits.iter().filter(|(p, _)| p.contains("test-f/TEST.")).count();
     let search_ok = found > 0;
     serial_println!("[quarry3] search q=TEST. hits={} test_f={} src={} dirs={} ms={}", hits.len(), found, src, dirs, crate::arch::ms().saturating_sub(t0));
-    if !search_ok {
+    // UIREDS26 (B587): the search leg's targets ARE the test-f samples (it counts hits under `test-f/`); with no test-f
+    // directory it has nothing to find, exactly as `views` above has nothing to paint — said, not failed.
+    let search_word = if search_ok { "ok" } else if dir.is_none() { "skip(no-test-f)" } else { "FAIL" };
+    if search_word == "FAIL" {
         fails.push("search");
     }
     let (viewer, routed, owed) = ql;
@@ -4500,7 +4503,7 @@ pub fn quarry3_selftest() {
         ok(sidebar_ok),
         ok(toolbar_ok),
         views,
-        ok(search_ok),
+        search_word,
         viewer,
         total,
         if fails.is_empty() { "PASS" } else { "FAIL" },
