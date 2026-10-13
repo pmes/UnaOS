@@ -28,7 +28,7 @@ use super::glyph::{GlyphEntry, GlyphLabel};
 use bandy::{PrefValue, SMessage, Synapse};
 
 /// The pane's panels, as the engine labels them (`aether::devtools::Panel::label`).
-pub const PANELS: [&str; 5] = ["Elements", "Console", "Network", "Storage", "Performance"];
+pub const PANELS: [&str; 6] = ["Elements", "Console", "Network", "Storage", "Performance", "Accessibility"];
 
 /// Principia's spelling of a dock side (`aether.devtools.dock`): true = under the page.
 pub fn dock_from_pref(v: &str) -> bool {

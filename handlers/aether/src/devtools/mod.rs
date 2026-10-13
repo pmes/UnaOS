@@ -12,6 +12,7 @@
 //! | Console      | [`console`]    | `js::console_lines` (PageState.console, fed by `js::host::console_out`, which every `console.*` and every uncaught error reaches), `js::reported_errors`, the evaluator through `js::Engine::eval_string` in the PAGE's realm, `ledger::snapshot().entries()` for the engine's honest-failure lines |
 //! | Network      | [`network`]    | the document's resource references resolved against `AetherEngine::current_url`, each looked up in `net::http_cache()` under the page's partition (`cache_key(site_of(top), url)`, the key gneiss_pal stores under — SR88), and `security::refusals()` (SR86) for the blocked ones |
 //! | Storage      | [`storage`]    | `net::cookie_jar()`, `storage::with_area` (localStorage + sessionStorage under `storage::page_storage_key`), `storage::idb::databases` + `usage`, `storage::cache::cache_names` + `request_keys` + `usage` (SR94) |
+//! | Accessibility | [`accessibility`] | `a11y::tree` (THE accessibility read API: roles, accname 1.2 names, states, hidden subtrees pruned) and `a11y::focus::order` for the Tab sequence; the selected node is the Elements panel's (AETHERA11Y, SR119) |
 //! | Performance  | [`timeline`]   | `css::last_style_timing` (the cascade and re-layout wall times `apply_stylesheets` already measures) plus the pane's own clock around `AetherEngine::tick` (script: timers, microtasks, rAF) and `AetherEngine::render_frame` (paint) |
 //!
 //! The pane is toggled by F12 / Ctrl+Shift+I and docked right or bottom by the chrome model
@@ -19,6 +20,7 @@
 //! directly) in its pane. Everything here runs on the engine's thread: the page state it reads is
 //! thread-local there.
 
+pub mod accessibility;
 pub mod console;
 pub mod elements;
 pub mod network;
@@ -36,10 +38,12 @@ pub enum Panel {
     Network,
     Storage,
     Performance,
+    /// AETHERA11Y (SR119): the accessibility tree and the selected node's role, name and states.
+    Accessibility,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 5] = [Panel::Elements, Panel::Console, Panel::Network, Panel::Storage, Panel::Performance];
+    pub const ALL: [Panel; 6] = [Panel::Elements, Panel::Console, Panel::Network, Panel::Storage, Panel::Performance, Panel::Accessibility];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -48,6 +52,7 @@ impl Panel {
             Panel::Network => "Network",
             Panel::Storage => "Storage",
             Panel::Performance => "Performance",
+            Panel::Accessibility => "Accessibility",
         }
     }
 }
@@ -144,6 +149,7 @@ impl DevTools {
                 let t = self.timeline.totals();
                 out.push(format!("{:>6} {:>9.2} {:>9.2} {:>9.2} {:>9.2}", "total", t.script_ms, t.style_ms, t.layout_ms, t.paint_ms));
             }
+            Panel::Accessibility => out.extend(accessibility::lines(engine, self.selected)),
         }
         out
     }

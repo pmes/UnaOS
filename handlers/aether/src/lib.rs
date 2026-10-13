@@ -860,8 +860,10 @@ impl AetherEngine {
                 css::note_focus_modality(true); // AETHERGEN (SR71): click focus is pointer-modal
                 let Some(node) = self.hit_test(x, y) else {
                     self.set_focus(None);
+                    crate::dom::a11y::focus::set_starting_point(None);
                     return;
                 };
+                crate::dom::a11y::focus::set_starting_point(Some(node.clone())); // AETHERA11Y (SR119): HTML §6.6.3
                 // Script click handlers run first (bubbling); a handled
                 // click still follows links, matching default behavior.
                 // The click's activation behavior runs here too: a checkbox
@@ -983,6 +985,11 @@ impl AetherEngine {
     /// The default action of a key press (the shell's `KeyDown`), when the page's `keydown` did not
     /// cancel it.
     fn key_default(&mut self, key: String) {
+        // AETHERA11Y (SR119): sequential focus navigation (Tab, Enter on links, the arrow keys in
+        // composite widgets) before the page's own default; a key it handles is consumed.
+        if crate::dom::a11y::keyboard::handle_key(self, &key) {
+            return;
+        }
         // A focused text control takes its editing keys first (forms::edit); the page only
         // scrolls by keyboard when no field holds the keys.
         if let Some(node) = self.editing_node() {
