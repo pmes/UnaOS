@@ -1,3 +1,7 @@
+//! SUPERSEDED by INTLCLDR (SR137): nothing in the engine reads this file any more — the locale data is the
+//! generated CLDR 46 table of `crate::cldr`, the zones the generated tzdata 2025b table of `crate::tzdata`. Kept
+//! (R20) until the seat retires it; `builtins/temporal/gen_tzdata.py` still parses its ZONES list.
+//!
 //! The locale data of `en`, `en-US` and `en-GB` (values from CLDR 46 as Chromium 13x reports them), and
 //! the time zones as POSIX rules (the CURRENT rule of each IANA zone, tzdata 2025b; historical transitions
 //! are not modelled — a date before a zone's last rule change formats with today's rule).

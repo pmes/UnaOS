@@ -418,7 +418,7 @@ fn supported_values_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         "collation" => strs(&["phonebk", "pinyin", "trad"]),
         "currency" => crate::cldr::currency_codes().map(String::from).collect(),
         "numberingSystem" => crate::cldr::numbering_systems().map(String::from).collect(),
-        "timeZone" => data::ZONES.iter().map(|z| z.id.to_string()).chain(core::iter::once(String::from("UTC"))).collect(),
+        "timeZone" => crate::tzdata::primary_ids().into_iter().map(String::from).chain(core::iter::once(String::from("UTC"))).collect(),
         "unit" => crate::cldr::unit_ids().filter(|u| !u.contains("-per-")).map(String::from).collect(),
         _ => return vm.throw_range(&format!("Invalid key : {key}")),
     };

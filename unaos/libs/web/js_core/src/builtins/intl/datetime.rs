@@ -24,7 +24,8 @@ pub enum ZoneRule {
     /// The embedding's local time (`Vm::tz` or `Host::tz_offset_ms`).
     Local,
     Fixed(f64),
-    Posix(PosixTz, u8),
+    /// An IANA zone of `crate::tzdata` with its history (`PosixTz::zone` set).
+    Named(PosixTz),
 }
 
 #[derive(Clone, Debug)]
@@ -126,9 +127,10 @@ pub fn parse_zone(s: &str) -> Option<(ZoneRule, String)> {
         // Etc/GMT+5 is five hours WEST of Greenwich.
         return Some((ZoneRule::Fixed(-(sign * n) as f64 * 3_600_000.0), format!("Etc/GMT{}{}", if sign == 1 { '+' } else { '-' }, n)));
     }
-    let z = data::zone(s)?;
-    let rule = PosixTz::parse(z.posix)?;
-    Some((ZoneRule::Posix(rule, z.meta), String::from(z.id)))
+    // An IANA Zone or Link (tzdata 2025b): DateTimeFormat reports the primary identifier (ECMA-402 §11.1.2:
+    // [[TimeZone]] is the record's [[PrimaryIdentifier]]).
+    let f = crate::tzdata::find(s)?;
+    Some((ZoneRule::Named(PosixTz::of_zone(f.data)), String::from(f.primary_id)))
 }
 
 /// DefaultTimeZone (§21.4.1.24 SystemTimeZoneIdentifier): the host's IANA id when it names one of the
@@ -138,6 +140,11 @@ pub fn default_zone(vm: &mut Vm) -> (ZoneRule, String) {
         if let Some(z) = parse_zone(&id) {
             return z;
         }
+    }
+    if let Some(z) = vm.tz.as_ref().filter(|z| z.zone.is_some()) {
+        let z = z.clone();
+        let id = crate::tzdata::ZONES[z.zone.unwrap_or(0) as usize].id;
+        return (ZoneRule::Named(z), String::from(id));
     }
     let now = vm.host.now_ms();
     let off = crate::builtins::date::local_time(vm, now) - now;
@@ -152,7 +159,7 @@ pub fn zone_offset(vm: &mut Vm, z: &ZoneRule, t: f64) -> f64 {
     match z {
         ZoneRule::Local => crate::builtins::date::local_time(vm, t) - t,
         ZoneRule::Fixed(o) => *o,
-        ZoneRule::Posix(p, _) => p.offset_at_utc(t),
+        ZoneRule::Named(p) => p.offset_at_utc(t),
     }
 }
 
@@ -893,38 +900,82 @@ fn gmt(f: &DtFmt, off: f64, long: bool) -> String {
     g.replace("{0}", &body)
 }
 
-/// Whether daylight-saving time is in effect for the formatter's zone at `t` with offset `off`.
-fn in_dst(f: &DtFmt, off: f64) -> bool {
+/// Whether daylight-saving time is in effect for the formatter's zone at `t` (the tzdata isdst flag).
+fn in_dst(f: &DtFmt, t: f64) -> bool {
     match &f.zone {
-        ZoneRule::Posix(p, _) => p.dst.is_some() && off != p.std_offset,
+        ZoneRule::Named(p) => p.is_dst_at_utc(t),
         _ => false,
     }
 }
 
-/// The CLDR zone id the names of `zone_id` are filed under.
-fn cldr_zone_id(zone_id: &str) -> &str {
-    if zone_id == "UTC" { "Etc/UTC" } else { zone_id }
+/// The ids CLDR may file a zone's names under: the formatter's id, the data Zone's, its Links'.
+fn cldr_ids(f: &DtFmt) -> Vec<&str> {
+    let mut v: Vec<&str> = Vec::new();
+    v.push(if f.zone_id == "UTC" { "Etc/UTC" } else { f.zone_id.as_str() });
+    if let ZoneRule::Named(p) = &f.zone {
+        if let Some(d) = p.zone {
+            v.push(crate::tzdata::ZONES[d as usize].id);
+            for a in crate::tzdata::aliases_of(d) {
+                v.push(a);
+            }
+        }
+    }
+    v
 }
 
-fn zone_name(f: &DtFmt, style: &str, off: f64, _t: f64) -> String {
-    let id = cldr_zone_id(&f.zone_id);
-    let dst = in_dst(f, off);
+/// The generic location format (UTS #35 Part 4 §7.3): regionFormat with the country's name, for a zone whose
+/// country has no other zone.
+fn location_name(f: &DtFmt) -> Option<String> {
+    let ZoneRule::Named(p) = &f.zone else { return None };
+    let d = p.zone?;
+    let cc = crate::tzdata::ZONES[d as usize].cc;
+    if cc.is_empty() {
+        return None;
+    }
+    let zones = crate::tzdata::ZONES.iter().filter(|z| z.cc == cc).count()
+        + crate::tzdata::LINKS.iter().filter(|l| l.primary && crate::tzdata::ZONES[l.target as usize].cc == cc).count();
+    if zones != 1 {
+        return None;
+    }
+    let country = f.loc.region_name(cc)?;
+    let rf = f.loc.get(slot::TZ_REGIONFORMAT)?;
+    Some(rf.replace("{0}", country))
+}
+
+fn zone_name(f: &DtFmt, style: &str, off: f64, t: f64) -> String {
+    let ids = cldr_ids(f);
+    let dst = in_dst(f, t);
     let kind = if dst { 2 } else { 1 };
-    let meta = cldr::zone_meta(id);
     let utc = f.zone_id == "UTC";
-    let named = |short: bool, k: usize| -> Option<&'static str> {
-        f.loc.zone_name(id, short, k).or_else(|| if utc && k == 0 { f.loc.zone_name(id, short, 1) } else { None }).or_else(|| meta.and_then(|m| f.loc.metazone_name(m, short, k)))
+    let meta = ids.iter().find_map(|id| cldr::zone_meta(id));
+    let observes_dst = match &f.zone {
+        ZoneRule::Named(p) => p.dst.is_some(),
+        _ => false,
     };
-    let fixed = matches!(f.zone, ZoneRule::Fixed(_)) && !utc;
+    let named = |short: bool, k: usize| -> Option<&'static str> {
+        for id in &ids {
+            if let Some(n) = f.loc.zone_name(id, short, k) {
+                return Some(n);
+            }
+            if (utc || !observes_dst) && k == 0 {
+                if let Some(n) = f.loc.zone_name(id, short, 1) {
+                    return Some(n);
+                }
+            }
+        }
+        let m = meta?;
+        f.loc.metazone_name(m, short, k).or_else(|| if k == 0 && !observes_dst { f.loc.metazone_name(m, short, 1) } else { None })
+    };
+    let fixed = matches!(f.zone, ZoneRule::Fixed(_) | ZoneRule::Local) && !utc;
     let name = match style {
-        "short" if !fixed => named(true, kind),
-        "long" if !fixed => named(false, kind),
-        "shortGeneric" if !fixed => named(true, 0),
-        "longGeneric" if !fixed => named(false, 0),
+        "short" if !fixed => named(true, kind).map(String::from),
+        "long" if !fixed => named(false, kind).map(String::from),
+        "shortGeneric" if !fixed => named(true, 0).map(String::from).or_else(|| location_name(f)),
+        "longGeneric" if !fixed => named(false, 0).map(String::from).or_else(|| location_name(f)),
         _ => None,
     };
     match name {
-        Some(n) => String::from(n),
+        Some(n) => n,
         None => gmt(f, off, matches!(style, "long" | "longOffset" | "longGeneric")),
     }
 }
@@ -1333,14 +1384,6 @@ pub fn format_value(vm: &mut Vm, f: &DtFmt, t: f64) -> Vec<(String, String)> {
 /// The formatter's offset at `t`: an IANA zone reads its historical transitions (TEMPORAL SR117,
 /// `temporal::zone`), everything else its rule.
 pub fn zone_offset_of(vm: &mut Vm, f: &DtFmt, t: f64) -> f64 {
-    if let ZoneRule::Posix(..) = &f.zone {
-        if let Some(z) = crate::builtins::temporal::zone::parse_identifier(&f.zone_id) {
-            if t.is_finite() {
-                let ns = (t as i128) * 1_000_000;
-                return crate::builtins::temporal::zone::offset_ns(&z, ns) as f64 / 1_000_000.0;
-            }
-        }
-    }
     zone_offset(vm, &f.zone, t)
 }
 
