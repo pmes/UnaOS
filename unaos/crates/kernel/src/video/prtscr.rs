@@ -2705,6 +2705,9 @@ fn stamp_owner(mt: &crate::fs::vfs::MountTable, path: &str, owner: &Option<Strin
     match mt.set_attr(path, "owner", AttrValue::Str(want.clone()), KERNEL_PRINCIPAL) {
         Ok(()) => "set",
         Err(_) => "failed",
+    }
+}
+
 // QUEUESLEEP2 (rmbp-ledger B557) — the pump's idle cost of `service`, ONE relaxed load. FILE TAIL, so no line above moves.
 // Flight 33's `pump_what_worst=prtscr` was a real Cmd-Shift-3 inside the window (the PRTSCR-VOL ladder and its refusal lines,
 // 23 ms, under the bound), but the idle path the promise named was not one load either: `dir_fixture` ran `defer_fast`
