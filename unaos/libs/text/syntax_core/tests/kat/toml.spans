@@ -5,7 +5,7 @@
 1 string |"TOML|
 1 escape |\"|
 1 string |x|
-1 escape |\"é|
+1 escape |\"\u00e9|
 1 string |"|
 2 heading |[owner]|
 3 variable |name|
