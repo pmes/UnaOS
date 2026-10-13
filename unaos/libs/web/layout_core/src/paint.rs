@@ -201,6 +201,11 @@ pub struct PaintStyle<H: Host> {
     /// `text-orientation` (§5.1): 0 mixed, 1 upright, 2 sideways. Glyphs paint sideways in every vertical
     /// mode (the `mixed` rendering of Latin); upright CJK is not rotated back.
     pub text_orientation: Option<u8>,
+    /// AETHERSTYLE3 (SR103): `container-type` (css-contain-3 §3.1): 0 normal, 1 size, 2 inline-size;
+    /// `container-name` (Some(empty) = none); `contain`'s size containment (0 none, 1 size, 2 inline-size).
+    pub container_type: Option<u8>,
+    pub container_name: Option<Vec<String>>,
+    pub contain_size: Option<u8>,
 }
 
 
@@ -291,6 +296,9 @@ impl<H: Host> Default for PaintStyle<H> {
             col_rule_color: None,
             writing_mode: None,
             text_orientation: None,
+            container_type: None,
+            container_name: None,
+            contain_size: None,
         }
     }
 }

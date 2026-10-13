@@ -77,7 +77,9 @@ pub enum CssRule {
     Import(ImportRule),
     FontFace(FontFace),
     Keyframes(Keyframes),
-    /// Any other at-rule (`@page`, `@property`, `@counter-style`, `@container`…), kept as syntax.
+    /// AETHERSTYLE3 (SR103): `@container [name] <condition> { … }` (CSS Containment 3 §4).
+    Container(crate::container::ContainerRule, Vec<CssRule>),
+    /// Any other at-rule (`@page`, `@property`, `@counter-style`…), kept as syntax.
     Other(AtRule),
 }
 
@@ -220,6 +222,7 @@ fn at_rule(a: AtRule, ns: &Namespaces, parent: Option<&SelectorList>) -> Option<
         }
         "font-face" if parent.is_none() => Some(CssRule::FontFace(FontFace { descriptors: declarations_of(a.block.as_deref()?) })),
         "keyframes" | "-webkit-keyframes" if parent.is_none() => keyframes(&a),
+        "container" => Some(CssRule::Container(crate::container::parse_container_prelude(&a.prelude), group_contents(a.block.as_deref()?, ns, parent))),
         _ => Some(CssRule::Other(a)),
     }
 }

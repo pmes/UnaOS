@@ -8,7 +8,7 @@
 use std::rc::Rc;
 
 use css_core::matching::Element;
-use layout_core::css::SpecifiedStyle;
+use layout_core::css::{apply_declaration, ParseCx, SpecifiedStyle};
 use layout_core::{Adv, ComputedStyles, Dom, DomNode, FontSel, Fonts, Host, LayoutTree, NodeKind};
 
 /// One node of the fixture document.
@@ -236,6 +236,38 @@ pub fn lay(doc: &N, vw: f32, vh: f32) -> Tree {
 /// Lays the fixture out with a computed-style table.
 pub fn lay_styled(doc: &N, sheet: &Sheet, vw: f32, vh: f32) -> Tree {
     layout_core::layout(&D(doc.clone()), sheet, &mut F, (vw, vh))
+}
+
+/// Folds every element's cascaded declarations (css_core's cascade over `rules`, the element's `style=""`
+/// included) — `container` answers each `@container` rule for an element (None: container rules never apply).
+pub fn cascade_sheet(
+    doc: &N,
+    rules: &css_core::cascade::RuleSet<'_>,
+    container: Option<&dyn Fn(&N, &css_core::container::ContainerRule) -> bool>,
+    vw: f32,
+    vh: f32,
+) -> Sheet {
+    let cx = ParseCx::new(vw, vh);
+    let mut out = Vec::new();
+    for (i, n) in doc.doc.nodes.iter().enumerate() {
+        if n.kind != NodeKind::Element {
+            continue;
+        }
+        let e = doc.at(i);
+        let inline = DomNode::attr(&e, "style").map(|s| css_core::stylesheet::parse_style_attribute(&s)).unwrap_or_default();
+        let eval = |c: &css_core::container::ContainerRule| container.is_some_and(|f| f(&e, c));
+        let applied = css_core::cascade::cascade_contained(rules, &e, &inline, None, None, Some(&eval));
+        if applied.is_empty() {
+            continue;
+        }
+        let mut s = SpecifiedStyle::<TH>::default();
+        for a in &applied {
+            let v = css_core::serialize::to_css(css_core::parser::trim_ws(&a.declaration.value));
+            apply_declaration(&a.declaration.name.to_ascii_lowercase(), &v, &mut s, &cx);
+        }
+        out.push((i, Rc::new(s)));
+    }
+    Sheet(out)
 }
 
 /// The laid-out border box of `node` in page coordinates: (x, y, w, h).

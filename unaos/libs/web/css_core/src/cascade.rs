@@ -42,6 +42,9 @@ pub struct RuleEntry<'a> {
     pub layer: Vec<u32>,
     /// Order of appearance (rule index across all sheets).
     pub order: u32,
+    /// AETHERSTYLE3 (SR103): the `@container` rules this entry is nested in, outermost first — every one
+    /// must hold for the element ([`cascade_contained`]); empty for an unconditional entry.
+    pub container: Vec<&'a crate::container::ContainerRule>,
 }
 
 /// The rules in force for one environment.
@@ -53,6 +56,8 @@ pub struct RuleSet<'a> {
     layers: Vec<(String, u32)>,
     next_order: u32,
     index: Option<RuleIndex>,
+    /// The `@container` rules around the rules being added.
+    container_stack: Vec<&'a crate::container::ContainerRule>,
 }
 
 /// Rule hashing: indices into [`RuleSet::entries`], bucketed by the subject compound's key.
@@ -356,6 +361,11 @@ impl<'a> RuleSet<'a> {
                 }
                 CssRule::FontFace(f) => self.font_faces.push(f),
                 CssRule::Keyframes(k) => self.keyframes.push(k),
+                CssRule::Container(c, inner) => {
+                    self.container_stack.push(c);
+                    self.add_rules(inner, origin, layer, prefix, ns, cond);
+                    self.container_stack.pop();
+                }
                 CssRule::Other(_) => {}
             }
         }
@@ -367,7 +377,14 @@ impl<'a> RuleSet<'a> {
         let own = if layer.is_empty() { alloc::vec![u32::MAX] } else { layer.to_vec() };
         if !s.declarations.is_empty() {
             for sel in &s.selectors.0 {
-                self.entries.push(RuleEntry { selector: sel, declarations: &s.declarations, origin, layer: own.clone(), order });
+                self.entries.push(RuleEntry {
+                    selector: sel,
+                    declarations: &s.declarations,
+                    origin,
+                    layer: own.clone(),
+                    order,
+                    container: self.container_stack.clone(),
+                });
             }
         }
         // nested style rules and nested conditional / layer rules, in order
@@ -382,6 +399,11 @@ impl<'a> RuleSet<'a> {
 
     pub fn index(&self) -> Option<&RuleIndex> {
         self.index.as_ref()
+    }
+
+    /// Some entry is conditioned on `@container` (the caller lays out once and cascades again with sizes).
+    pub fn has_container_rules(&self) -> bool {
+        self.entries.iter().any(|e| !e.container.is_empty())
     }
 
     /// The `@keyframes` rule in force for `name` (the last one wins).
@@ -463,6 +485,20 @@ pub fn cascade_filtered<'a, E: Element>(
     pseudo: Option<&PseudoElement>,
     ancestors: Option<&AncestorFilter>,
 ) -> Vec<Applied<'a>> {
+    cascade_contained(rules, el, inline, pseudo, ancestors, None)
+}
+
+/// [`cascade_filtered`] with container queries (AETHERSTYLE3 SR103): an entry nested in `@container` rules
+/// applies when `container` answers true for every one of them (the caller finds the element's query
+/// container and its size); with `None` such entries never apply (no container is sized yet).
+pub fn cascade_contained<'a, E: Element>(
+    rules: &RuleSet<'a>,
+    el: &E,
+    inline: &'a [Declaration],
+    pseudo: Option<&PseudoElement>,
+    ancestors: Option<&AncestorFilter>,
+    container: Option<&dyn Fn(&crate::container::ContainerRule) -> bool>,
+) -> Vec<Applied<'a>> {
     let cx = MatchContext::new();
     let mut out: Vec<Applied<'a>> = Vec::new();
     // One rule may match through several of its selectors: keep the highest specificity per rule. A
@@ -486,6 +522,9 @@ pub fn cascade_filtered<'a, E: Element>(
             continue;
         }
         let e = &rules.entries[i];
+        if !e.container.is_empty() && !container.is_some_and(|f| e.container.iter().all(|c| f(c))) {
+            continue;
+        }
         if !matches_for_pseudo(e.selector, el, pseudo, &cx) {
             continue;
         }

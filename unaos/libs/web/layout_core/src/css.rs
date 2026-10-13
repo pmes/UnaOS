@@ -369,6 +369,13 @@ impl<H: Host> SpecifiedStyle<H> {
         if let Some(bs) = self.box_sizing {
             node_style.box_sizing = bs;
         }
+        // AETHERSTYLE3 (SR103): size containment (css-contain-2 §3.2) — an auto height is laid out as if the
+        // box were empty (0 plus its padding and border); inline-size containment leaves a block's width to its
+        // containing block, which already does not depend on its content.
+        if (self.paint.container_type == Some(1) || self.paint.contain_size == Some(1)) && self.height.is_none() {
+            node_style.size.height = Dimension::length(0.0);
+            node_style.min_size.height = LengthPercentageAuto::auto();
+        }
         // AETHERSTYLE3 (SR103): a scroll container's automatic minimum size is 0 (css-flexbox-1 §4.5), which
         // taffy reads from its own `overflow`; scrollbars are overlays, so no gutter is reserved.
         if let Some(o) = self.paint.overflow {
@@ -734,6 +741,48 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         // css-will-change-1 §2: a hint a UA may ignore.
         "will-change" => {}
+        // AETHERSTYLE3 (SR103): css-contain-3 §3 — query containers (the host's second cascade evaluates
+        // `@container` against their sizes) and size containment (`fold_into`).
+        "container-type" => match value {
+            "normal" => style.paint.container_type = Some(0),
+            "size" => style.paint.container_type = Some(1),
+            "inline-size" => style.paint.container_type = Some(2),
+            v if is_neutral_keyword(v) => {}
+            v => H::record_css(&format!("container-type-value:{}", clip(v))),
+        },
+        "container-name" => {
+            let names: Vec<String> = value.split_whitespace().filter(|n| *n != "none").map(|n| n.to_string()).collect();
+            style.paint.container_name = Some(names);
+        }
+        "container" => {
+            let (names, ty) = match value.split_once('/') {
+                Some((n, t)) => (n.trim(), Some(t.trim())),
+                None => (value, None),
+            };
+            apply_declaration("container-name", names, style, cx);
+            apply_declaration("container-type", ty.unwrap_or("normal"), style, cx);
+        }
+        "contain" => {
+            let mut size = 0u8;
+            let mut paint = false;
+            for k in value.split_whitespace() {
+                match k {
+                    "size" => size = 1,
+                    "inline-size" if size != 1 => size = 2,
+                    "strict" => {
+                        size = 1;
+                        paint = true;
+                    }
+                    "content" | "paint" => paint = true,
+                    "none" | "layout" | "style" => {}
+                    _ => {}
+                }
+            }
+            style.paint.contain_size = Some(size);
+            if paint {
+                style.paint.clip = Some(true);
+            }
+        }
         // AETHERSTYLE3 (SR103): css-writing-modes-4 §3.1 / §5.1 (laid out by `writing`).
         "writing-mode" => match crate::writing::parse_writing_mode(value) {
             Some(m) => style.paint.writing_mode = Some(m),
@@ -2255,9 +2304,9 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
-        writing_mode, text_orientation,
+        writing_mode, text_orientation, container_type, contain_size,
     );
-    clone!(text_shadows, transform, clip_path, filter, backdrop_filter);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
