@@ -30731,7 +30731,7 @@ fn sys_pathread(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     }
     let cap = (a3 as usize).min(una_abi::PATH_IO_MAX);
     let who = attrsurf_principal(caller_row());
-    let mt = crate::shell::vfs_mount_table();
+    #[cfg(feature = "sonde")] if !list && path == crate::sonde::DEPTH0_PATH { return match crate::sonde::depth0_read(off, cap) { Ok((b, k)) => match copy_to_user(a2, &b) { Ok(()) => k, Err(e) => e }, Err(e) => e }; } let mt = crate::shell::vfs_mount_table(); // SONDE3 (SR108): selfdiag::path_fulfil's SONDE2 hook, here for a kernel without `selfdiag` — the published depth frame, read by name before any volume walk. LINE-NEUTRAL append, before this comment.
     let errno = |e: crate::fs::vfs::VfsError| crate::fs::attrsys::errno_of(&e);
     let out = if list {
         match mt.list_as(path, &who) {

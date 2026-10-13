@@ -26,14 +26,22 @@
 //!    otherwise (no stream armed — the `[uvc] commit=` line says why —, a stream that is not this camera's
 //!    depth, or no frames). The old `SKIP(no-iso-pipe)` is gone: the pipe exists.
 //!
-//! The depth scale is the D400 default (1000 µm per unit = 0.001 m, librealsense
-//! `src/ds/d400/d400-device.cpp:912`) marked `(default)`: its true read is the HW-monitor channel, a 1 KiB XU
-//! transfer (see `realsense_xu`), which the xHCI host's 4 KiB EP0 buffer can now carry and `after_census`
-//! still withholds (owed). Every millimetre on the line is `raw * 1000 µm / 1000`.
+//! The depth scale — SONDE3 (LEDGER SR108) — is the camera's own: `uvc::multi::after_census` reads
+//! `GET_ADV(etDepthTableControl)` over the HW-monitor channel (a 1 KiB XU `SET_CUR`/`GET_CUR` pair, see
+//! `realsense_xu`) when the EP0 buffer carries it (the xHCI host's 4 KiB page), and the line says
+//! `depth_scale=<m>(device)`. On EHCI (256-byte EP0), or when the exchange fails (its `[sonde] hwmon=` line
+//! names the stage), it is the D400 default (1000 µm per unit = 0.001 m, librealsense
+//! `src/ds/d400/d400-device.cpp:912`) marked `(default)`. Every millimetre on the line is `raw * um / 1000`.
 //!
-//! RING 3: `depth0_read` is the reader `SYS_PATH_READ` of `/dev/probe/depth0` calls; the one-line hook in
-//! `selfdiag::path_fulfil` (and `sys_pathread` on a kernel without `selfdiag`) is outside this arc's files
-//! and is named in the SR105 row as owed.
+//! CONTINUOUS (SONDE3): [`tap_service`] runs on the xHCI service pass (`xhci/isoch.rs` `service_uvc`, which
+//! rides the FTDI ladder slot of the same main-loop passes as the storage-ready work) and republishes
+//! `/dev/probe/depth0` from every Nth completed frame, ONE decode per pass at most, N grown when a decode's
+//! measured cost passes [`TAP_BUDGET_US`] (2 ms) and shrunk back under half of it; every 5 s:
+//! `[sonde] depth0 seq=<n> fps=<f> published=<k> pub_fps=<f> every=<N> cost_us_max=<n> over_budget=<n>
+//! bytes=<n> depth_scale=<m>(device|default)`.
+//!
+//! RING 3: `depth0_read` is the reader `SYS_PATH_READ` of `/dev/probe/depth0` calls — from
+//! `selfdiag::path_fulfil` and, SONDE3, from x86 `sys_pathread` on a kernel without `selfdiag` (one line each).
 
 use crate::drivers::realsense_xu as rs;
 use crate::drivers::uvc::depth_tap;
@@ -142,6 +150,17 @@ fn um_parts(um: u32) -> (u32, u32) {
     (um / 1_000_000, um % 1_000_000)
 }
 
+/// SONDE3 (SR108): the depth scale this boot uses and where it came from — the camera's HW-monitor answer
+/// (`(device)`) when `after_census` read one, else the D400 default (`(default)`).
+fn depth_scale() -> (u32, &'static str) {
+    let um = crate::drivers::uvc::hwmon::depth_um();
+    if um != 0 {
+        (um, "device")
+    } else {
+        (rs::DEPTH_UNITS_DEFAULT_UM, "default")
+    }
+}
+
 fn selftest() {
     let mut fails = 0u32;
     let mut first: (&'static str, u64, u64) = ("", 0, 0);
@@ -201,6 +220,12 @@ fn selftest() {
     check("xu.wvalue.laser", rs::xu_wvalue(rs::CTRL_LASER_POWER) as u64, 0x0400);
     check("xu.windex", rs::xu_windex(rs::DEPTH_XU_UNIT, 0) as u64, 0x0300);
     check("d400.d435i", rs::is_d400(0x8086, 0x0B3A) as u64, 1);
+    // SONDE3 (SR108): the HW-monitor pair's request words and the EP0 gate (EHCI 256 withholds, xHCI 4 KiB sends).
+    check("hwmon.wvalue", rs::xu_wvalue(rs::CTRL_HWMONITOR) as u64, 0x0100);
+    check("hwmon.set_cur", ((rs::BM_CLASS_INTF_OUT as u64) << 8) | rs::RQ_SET_CUR as u64, 0x2101);
+    check("hwmon.get_cur", ((rs::BM_CLASS_INTF_IN as u64) << 8) | rs::RQ_GET_CUR as u64, 0xA181);
+    check("hwmon.fits.ehci", rs::hwmon_fits(256) as u64, 0);
+    check("hwmon.fits.xhci", rs::hwmon_fits(crate::drivers::uvc::XHCI_EP0_CAP) as u64, 1);
     check("d400.facetime", rs::is_d400(0x05AC, 0x8510) as u64, 0);
     let mut cmd = [0xEEu8; 32];
     let n = rs::hwmon_build_depth_units(&mut cmd);
@@ -305,7 +330,7 @@ fn selftest() {
         }
     };
     let streams = core::str::from_utf8(&names[..k]).unwrap_or("?");
-    let um = rs::DEPTH_UNITS_DEFAULT_UM;
+    let (um, um_src) = depth_scale();
     let (ip, fp) = um_parts(um);
 
     // The stream `probe_iso` armed must be THIS camera's depth (`Z16 `) — anything else is named, not counted.
@@ -318,8 +343,8 @@ fn selftest() {
                 Some((a, _, _, cc)) => ("armed-stream-is-not-z16", a, cc),
             };
             serial_println!(
-                ":: SONDE: dev={:04x}:{:04x} addr={} streams={} fmt=Z16 w={} h={} depth_scale={}.{:06}(default) laser_mw={} emitter={} preset={} xu_unit={} window_short={} stream_addr={} stream_fourcc={} frames_2s=0 -> FAIL reason={} ::",
-                r.vid, r.pid, r.addr, streams, r.depth_w, r.depth_h, ip, fp, v(r.xu[0]), v(r.xu[1]), v(r.xu[2]), r.xu_unit,
+                ":: SONDE: dev={:04x}:{:04x} addr={} streams={} fmt=Z16 w={} h={} depth_scale={}.{:06}({}) laser_mw={} emitter={} preset={} xu_unit={} window_short={} stream_addr={} stream_fourcc={} frames_2s=0 -> FAIL reason={} ::",
+                r.vid, r.pid, r.addr, streams, r.depth_w, r.depth_h, ip, fp, um_src, v(r.xu[0]), v(r.xu[1]), v(r.xu[2]), r.xu_unit,
                 r.ran_short, a, core::str::from_utf8(&cc).unwrap_or("?").trim_end(), why
             );
             return;
@@ -389,8 +414,8 @@ fn selftest() {
     let pm = stats.map(|s| s.valid_permille()).unwrap_or(0);
     let pass = frames > 0;
     serial_println!(
-        ":: SONDE: dev={:04x}:{:04x} addr={} streams={} fmt=Z16 w={} h={} depth_scale={}.{:06}(default) laser_mw={} emitter={} preset={} xu_unit={} window_short={} frames_2s={} fps={}.{} good={} short={} err={} over={} bad_hdr={} seq={} min_mm={} max_mm={} median_mm={} valid_pct={}.{} depth0={} -> {}{} ::",
-        r.vid, r.pid, r.addr, streams, w, h, ip, fp, v(r.xu[0]), v(r.xu[1]), v(r.xu[2]), r.xu_unit, r.ran_short,
+        ":: SONDE: dev={:04x}:{:04x} addr={} streams={} fmt=Z16 w={} h={} depth_scale={}.{:06}({}) laser_mw={} emitter={} preset={} xu_unit={} window_short={} frames_2s={} fps={}.{} good={} short={} err={} over={} bad_hdr={} seq={} min_mm={} max_mm={} median_mm={} valid_pct={}.{} depth0={} -> {}{} ::",
+        r.vid, r.pid, r.addr, streams, w, h, ip, fp, um_src, v(r.xu[0]), v(r.xu[1]), v(r.xu[2]), r.xu_unit, r.ran_short,
         frames, fps10 / 10, fps10 % 10, c1.1.wrapping_sub(c0.1), c1.2.wrapping_sub(c0.2), c1.3.wrapping_sub(c0.3),
         c1.4.wrapping_sub(c0.4), c1.6.wrapping_sub(c0.6), seq,
         mm(stats.map(|s| s.min_raw)), mm(stats.map(|s| s.max_raw)), mm(stats.map(|s| s.median_raw)), pm / 10, pm % 10,
@@ -402,5 +427,166 @@ fn selftest() {
         serial_println!("[sonde] depth0=withheld path={} reason={}", DEPTH0_PATH, why);
     } else {
         crate::census_println!("[sonde] depth0=published path={} bytes={} header={} seq={}", DEPTH0_PATH, depth0_len(), wire::HEADER_LEN, seq);
+    }
+}
+
+// ── SONDE3 (LEDGER SR108): the continuous depth tap ─────────────────────────────────────────────────────────────
+//
+// SONDE2 published `/dev/probe/depth0` once, inside `tests sonde`. The tap republishes it from the live stream on
+// every service pass that has a new frame N or more frames past the last one published: one copy of the front
+// buffer (`depth_tap::copy_latest`, under the stream lock), `probe_core::Frame::new` (the geometry check) and
+// `wire::encode` (the PRB1 header, `seq` = the assembler's frame number, so it rises), the record built in a
+// reused buffer and SWAPPED into `DEPTH0` (the reader's lock is held for the swap only). Both buffers are kept
+// across passes, so a steady stream allocates nothing after its first publish.
+
+/// The per-pass bound: a decode measured past it doubles N (up to [`TAP_EVERY_MAX`]); under half of it, N steps
+/// back toward 1. ONE decode per pass at most, so a pass's tap work is one decode or a few atomic loads.
+pub const TAP_BUDGET_US: u64 = 2_000;
+/// The ceiling on N (every 64th frame ≈ one publish per 2 s at 30 fps).
+const TAP_EVERY_MAX: u32 = 64;
+/// The status line's period.
+const TAP_LINE_S: u64 = 5;
+
+struct Tap {
+    every: u32,
+    last_seq: u32,
+    frame: Vec<u8>,
+    spare: Vec<u8>,
+    published: u32,
+    over: u32,
+    cost_max: u64,
+    win_t0: u64,
+    win_seq0: u32,
+    win_pub0: u32,
+    withheld: &'static str,
+}
+
+static TAP: crate::sync::Mutex<Tap> = crate::sync::Mutex::new(Tap {
+    every: 1,
+    last_seq: 0,
+    frame: Vec::new(),
+    spare: Vec::new(),
+    published: 0,
+    over: 0,
+    cost_max: 0,
+    win_t0: 0,
+    win_seq0: 0,
+    win_pub0: 0,
+    withheld: "",
+});
+
+fn tick_hz() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "aarch64")]
+    let hz = crate::arch::timer::cntfrq();
+    hz
+}
+
+/// SONDE3 (SR108): the service-pass hook (`xhci/isoch.rs` `service_uvc`'s first line). No camera, no armed depth
+/// stream, or a pass already in the tap (`try_lock`): return after a few loads. No USB traffic, so it is legal
+/// mid-enumeration.
+pub fn tap_service() {
+    let Some(r) = multi::record() else { return };
+    let Some((addr, w, h, cc)) = depth_tap::armed() else { return };
+    if addr != r.addr || cc != *b"Z16 " || w == 0 || h == 0 {
+        return;
+    }
+    let hz = tick_hz();
+    if hz == 0 {
+        return;
+    }
+    let Some(mut t) = TAP.try_lock() else { return };
+    let seq = depth_tap::latest_seq();
+    let now = crate::arch::now_cycles();
+    let (um, um_src) = depth_scale();
+    if t.win_t0 == 0 {
+        t.win_t0 = now;
+        t.win_seq0 = seq;
+        t.win_pub0 = t.published;
+    } else if now.wrapping_sub(t.win_t0) >= TAP_LINE_S * hz {
+        let dt = now.wrapping_sub(t.win_t0).max(1);
+        let fps10 = (seq.wrapping_sub(t.win_seq0) as u64).saturating_mul(10).saturating_mul(hz) / dt;
+        let pub10 = (t.published.wrapping_sub(t.win_pub0) as u64).saturating_mul(10).saturating_mul(hz) / dt;
+        let (ip, fp) = um_parts(um);
+        serial_println!(
+            "[sonde] depth0 seq={} fps={}.{} published={} pub_fps={}.{} every={} cost_us_max={} over_budget={} bytes={} depth_scale={}.{:06}({}){}{}",
+            t.last_seq, fps10 / 10, fps10 % 10, t.published, pub10 / 10, pub10 % 10, t.every,
+            t.cost_max.saturating_mul(1_000_000) / hz, t.over, depth0_len(), ip, fp, um_src,
+            if t.withheld.is_empty() { "" } else { " withheld=" }, t.withheld
+        );
+        t.win_t0 = now;
+        t.win_seq0 = seq;
+        t.win_pub0 = t.published;
+        t.cost_max = 0;
+        t.withheld = "";
+    }
+    if seq == 0 || (t.last_seq != 0 && seq.wrapping_sub(t.last_seq) < t.every) {
+        return;
+    }
+
+    // ONE decode: copy, check, header, swap.
+    let t0 = crate::arch::now_cycles();
+    let row = w as usize * 2;
+    let need = row * h as usize;
+    let mut frame = core::mem::take(&mut t.frame);
+    frame.clear();
+    if frame.capacity() < need && frame.try_reserve_exact(need).is_err() {
+        t.withheld = "heap";
+        t.last_seq = seq;
+        return;
+    }
+    let got = depth_tap::copy_latest(&mut frame);
+    let outcome: Result<u32, &'static str> = match got {
+        None => Err("no-complete-frame"),
+        Some((_, len)) if frame.len() != len || len != need => Err(if len > need { "frame-larger-than-geometry" } else { "frame-short-of-geometry" }),
+        Some((fseq, _)) => {
+            let ts_us = (t0 as u128 * 1_000_000 / hz as u128) as u64;
+            match Frame::new(StreamKind::Depth, PixelFormat::Z16, w as u32, h as u32, row, ts_us, fseq as u64, core::mem::take(&mut frame)) {
+                Err(_) => Err("frame-geometry"),
+                Ok(f) => {
+                    let id = alloc::format!("uvc:{:04x}:{:04x}", r.vid, r.pid);
+                    let res = match wire::encode(&f, &id, um, None) {
+                        Err(_) => Err("wire-encode"),
+                        Ok(hd) => {
+                            let mut rec = core::mem::take(&mut t.spare);
+                            rec.clear();
+                            let total = hd.len() + f.data.len();
+                            if rec.capacity() < total && rec.try_reserve_exact(total).is_err() {
+                                Err("heap")
+                            } else {
+                                rec.extend_from_slice(&hd);
+                                rec.extend_from_slice(&f.data);
+                                let old = DEPTH0.lock().replace(rec);
+                                t.spare = old.unwrap_or_default();
+                                Ok(fseq)
+                            }
+                        }
+                    };
+                    frame = f.data; // the staging buffer comes back for the next pass
+                    res
+                }
+            }
+        }
+    };
+    t.frame = frame;
+    match outcome {
+        Ok(fseq) => {
+            t.last_seq = fseq;
+            t.published = t.published.wrapping_add(1);
+        }
+        Err(why) => {
+            t.last_seq = seq;
+            t.withheld = why;
+        }
+    }
+    let cost = crate::arch::now_cycles().wrapping_sub(t0);
+    t.cost_max = t.cost_max.max(cost);
+    let budget = hz.saturating_mul(TAP_BUDGET_US) / 1_000_000;
+    if cost > budget {
+        t.over = t.over.wrapping_add(1);
+        t.every = (t.every.saturating_mul(2)).min(TAP_EVERY_MAX);
+    } else if cost.saturating_mul(2) < budget && t.every > 1 {
+        t.every -= 1;
     }
 }

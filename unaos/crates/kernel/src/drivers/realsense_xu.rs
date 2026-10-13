@@ -12,11 +12,12 @@
 //! from the layouts those lines state.
 //!
 //! What this file is NOT: a transport. It owns no hardware and issues nothing; `uvc::multi` issues the
-//! three short `GET_CUR` reads this rung makes, through the EHCI EP0 seam, and `tests sonde` scores the
-//! builders against fixtures. The HW-monitor command channel (`hwmon_*`) is a 1024-byte `SET_CUR` +
-//! `GET_CUR` pair on the XU (`src/platform/uvc-option.cpp:132-151`), and the EHCI EP0 data buffer is
-//! 256 bytes (`qh::Buf256`) — so the channel is built and scored here and WITHHELD on the wire, by name,
-//! until a transport with a 1 KiB control buffer carries it (the xHCI path, owed).
+//! three short `GET_CUR` reads this rung makes, through the EP0 seam its caller hands it, and `tests sonde`
+//! scores the builders against fixtures. The HW-monitor command channel (`hwmon_*`) is a 1024-byte
+//! `SET_CUR` + `GET_CUR` pair on the XU (`src/platform/uvc-option.cpp:132-151`). SONDE3 (LEDGER SR108):
+//! `uvc::multi::after_census` sends it when the EP0 buffer it was handed holds [`HWMON_BUF`] bytes
+//! ([`hwmon_fits`]) — the xHCI host's 4 KiB page (`uvc::XHCI_EP0_CAP`, XHCIISO B534) does; the EHCI EP0
+//! data buffer is 256 bytes (`qh::Buf256`), so on EHCI the channel stays WITHHELD on the wire, by name.
 
 // ── Identity ────────────────────────────────────────────────────────────────────────────────────
 /// Intel's USB-IF vendor id.
@@ -80,6 +81,15 @@ pub const fn xu_wvalue(ctrl: u8) -> u16 {
     (ctrl as u16) << 8
 }
 
+/// UVC 1.1 §4.2.1 / Table 4-1: a class-specific request to an interface's entity, host-to-device (`SET_CUR`).
+pub const BM_CLASS_INTF_OUT: u8 = 0x21;
+/// The same, device-to-host (`GET_CUR` — the three XU reads above use it).
+pub const BM_CLASS_INTF_IN: u8 = 0xA1;
+/// UVC 1.1 Appendix A.8 (Video Class-Specific Request Codes): `SET_CUR = 0x01`.
+pub const RQ_SET_CUR: u8 = 0x01;
+/// UVC 1.1 Appendix A.8: `GET_CUR = 0x81`.
+pub const RQ_GET_CUR: u8 = 0x81;
+
 /// UVC 1.1 §4.2.1: `wIndex` = entity id << 8 | VideoControl interface number.
 pub const fn xu_windex(unit: u8, vc_intf: u8) -> u16 {
     ((unit as u16) << 8) | vc_intf as u16
@@ -120,6 +130,12 @@ pub const HWMON_CMD_LEN: usize = 24;
 pub const HWMON_BUF: usize = 1024;
 /// `hw-monitor.h:46` — `HW_MONITOR_DATA_SIZE_OFFSET = 1020`: where the XU reply states its data size.
 pub const HWMON_DATA_SIZE_OFFSET: usize = 1020;
+
+/// SONDE3 (SR108): can an EP0 data buffer of `cap` bytes carry the HW-monitor exchange? Both halves of the
+/// pair are [`HWMON_BUF`] long (`uvc-option.cpp:132,142`), so the buffer must hold the whole transfer.
+pub const fn hwmon_fits(cap: usize) -> bool {
+    cap >= HWMON_BUF
+}
 
 /// Lay out a data-less HW-monitor command at the front of `out` (`src/hw-monitor.cpp:28-59`): u16 length
 /// (of everything after the 4-byte header), u16 magic, u32 opcode, u32 × 4 params, little-endian. The
