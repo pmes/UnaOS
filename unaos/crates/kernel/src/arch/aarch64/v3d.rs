@@ -4099,6 +4099,12 @@ fn build_shader_record() -> u32 {
     // shader, and `build_bisect_null_shader_record`'s leg-G record is untouched.
     #[cfg(feature = "v3d_singleseg")]
     sf(&mut rec, 225, 1, 1); // CS start in final thread section (Mesa single_seg = 1 for this program)
+    // PI-V3D-105 (`tests v3d`, [v3d105] emptybin): the same bit, armed at RUN time and only while the
+    // emptybin rung holds `V3D105_SINGLESEG` (§49.25.11f: "bit 225 stays declared"). The flag is false
+    // at boot and is cleared again before the rung returns, so every boot-time record is unchanged.
+    if V3D105_SINGLESEG.load(Ordering::Relaxed) {
+        sf(&mut rec, 225, 1, 1);
+    }
     sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
     sf(&mut rec, 227, 29, cs >> 3); // CS code address
     sf(&mut rec, 256, 32, cs_unif); // CS uniforms address (PI-V3D-9: VPM read-offset stream)
@@ -15802,7 +15808,7 @@ struct V3d96Bases {
 /// PI-V3D-97 §49.20.2 V2a — read the violation pair ONCE and FIRST. Returns the two RAW words and
 /// nothing derived: the caller decodes afterwards (`vio_decode` itself reads `MMU_DEBUG_INFO`, which
 /// is exactly the "other MMU read" the law puts behind this one).
-#[cfg(feature = "v3d_basedaim")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_basedaim")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 #[inline]
 fn v3d97_violation_once() -> (u32, u32) {
     let vio_addr = mmio_read(V3D_HUB_BASE, V3D_MMU_VIO_ADDR);
@@ -15814,7 +15820,7 @@ fn v3d97_violation_once() -> (u32, u32) {
 /// prologue, immediately after the one the shape already carries. Packet SET, ORDER, geometry and
 /// encoding are otherwise `BinContent::Empty`'s exactly; `pad == 0` reproduces it byte for byte, and
 /// `v3d97_pad_selfcheck` PROVES that on the wire rather than asserting it in this comment.
-#[cfg(feature = "v3d_basedaim")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_basedaim")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn build_bin_cl_emptyunarm_padded(cl_off: usize, pad: usize) -> usize {
     let mut w = RclWriter::new(cl_off);
     w.pkt(Pkt::new(P_NUMBER_OF_LAYERS, 2).f(0, 8, 0).done());
@@ -15997,7 +16003,7 @@ const _: () = assert!(TILE_STATE_BYTES == 8 * 32);
 /// the scan's L2T write-back and invalidate have already made coherent — no register is touched, no
 /// verdict is drawn here. Rides every leg, so a leg that wrote nothing supplies its own negative
 /// control: a window that took no write must still read pure `0xA5A5A5A5 ^ index` poison.
-#[cfg(feature = "v3d_armedclose")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_armedclose")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn v3d99_dump_head(tag: &str, what: &str, base: u32, rows: usize) {
     for row in 0..rows {
         let mut w = [0u32; 8];
@@ -16632,7 +16638,7 @@ fn v3d101_sample() -> V3d101Sample {
 /// from `v3d_regs.h` at PI-V3D-44/45 — it is a line that SAYS them, so a reader never has to hold the
 /// bit table in their head. The word is the one `wait_fldone` already returned; this is arithmetic on a
 /// value the leg has, not a new register read.
-#[cfg(feature = "v3d_dispatchdisc")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_dispatchdisc")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn v3d101_emit_intsts(leg: &str, tag: &str, sts: u32) {
     let qpu_vec = (sts & V3D_INT_QPU_MASK) >> V3D_INT_QPU_SHIFT;
     let named = V3D_INT_FRDONE
@@ -16817,19 +16823,19 @@ fn v3d102_emit_h_verdict(
 // vocabulary: six VPM errors, four VPA (vertex-pipe-assembly) errors, and the VDW/VCD/VCM groups on
 // either side of the VPM. A latched VPMEWNA or VPMEWR convicts the ACCESS half outright; a clean word
 // on a leg whose shader provably ran convicts the SILENT half.
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_FDBGO: usize = 0x0f04; // front-end debug O (v3d_regs.h) — printed RAW, no decode claimed
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_FDBGB: usize = 0x0f08; // front-end debug B (v3d_regs.h) — printed RAW, no decode claimed
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_FDBGS: usize = 0x0f10; // front-end debug S (v3d_regs.h) — printed RAW, no decode claimed
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_STAT: usize = 0x0f20; // latched error status (v3d_regs.h) — decoded bit by bit below
 /// V3D_ERR_STAT's bit table: (mask, `v3d_regs.h` name, this file's reading of it). The NAMES are the
 /// header's and are load-bearing; the readings are ours and are printed as readings. THE RAW WORD IS
 /// THE EVIDENCE — every emitter prints it before any name, so a wrong expansion here can narrow or
 /// mislabel a conclusion but can never destroy the measurement.
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D103_ERR_BITS: [(u32, &str, &str); 16] = [
     (1 << 15, "L2CARE", "L2C AXI receive-FIFO overrun"),
     (1 << 14, "VCMBE", "VCM error, binner"),
@@ -16849,17 +16855,17 @@ const V3D103_ERR_BITS: [(u32, &str, &str); 16] = [
     (1 << 0, "VPAEABB", "VPA allocating a busy block"),
 ];
 /// The bit CLASSES §49.25.7's rows split on. Every bit in the table above lands in exactly one.
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_CLASS_VPM: u32 = 0x03F0; // bits 9..4 — the six VPM errors
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_CLASS_VPA: u32 = 0x000F; // bits 3..0 — the four VPA errors
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_CLASS_PIPE: u32 = 0xFC00; // bits 15..10 — L2C/VCM/VCD/VDW
 /// The two VPM-WRITE bits specifically — the pair that speaks to §49.25.6's "or the coord thread's
 /// ACCESS to it" directly, where a read/free/pipe error would name a different station instead.
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const V3D_ERR_VPM_WRITE_PAIR: u32 = (1 << 7) | (1 << 4); // VPMEWNA | VPMEWR
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 const _: () = assert!(
     V3D_ERR_CLASS_VPM | V3D_ERR_CLASS_VPA | V3D_ERR_CLASS_PIPE == 0xFFFF
         && V3D_ERR_CLASS_VPM & V3D_ERR_CLASS_VPA == 0
@@ -16886,7 +16892,7 @@ const V3D103_IDENT1_FIELDS: [(u32, u32, &str); 5] = [
 /// same window as the `[v3d101]` counter sample: strictly AFTER the §49.20.2 V2a violation pair (which
 /// keeps its read-once-and-first law untouched) and BEFORE the leg's own L2T flush, so the words
 /// describe the kick and not this code's cache maintenance.
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 #[derive(Clone, Copy, Default)]
 struct V3d103Err {
     stat: u32,
@@ -16899,7 +16905,7 @@ struct V3d103Err {
 /// every leg's line can print NEWLY-LATCHED bits rather than cumulative ones. `V3D_ERR_STAT` is a
 /// LATCHING status register and this file never clears it, so a bit set at the arm was set by something
 /// earlier in the boot and is not this ladder's finding. The rows split on `leg & !pre` for that reason.
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 static V3D103_PRE: [core::sync::atomic::AtomicU32; 4] = [
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
@@ -16907,7 +16913,7 @@ static V3D103_PRE: [core::sync::atomic::AtomicU32; 4] = [
     core::sync::atomic::AtomicU32::new(0),
 ];
 
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn v3d103_pre_store(e: &V3d103Err) {
     V3D103_PRE[0].store(e.stat, Ordering::Relaxed);
     V3D103_PRE[1].store(e.fdbgo, Ordering::Relaxed);
@@ -16915,7 +16921,7 @@ fn v3d103_pre_store(e: &V3d103Err) {
     V3D103_PRE[3].store(e.fdbgs, Ordering::Relaxed);
 }
 
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn v3d103_pre_load() -> V3d103Err {
     V3d103Err {
         stat: V3D103_PRE[0].load(Ordering::Relaxed),
@@ -16925,7 +16931,7 @@ fn v3d103_pre_load() -> V3d103Err {
     }
 }
 
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn v3d103_err_sample() -> V3d103Err {
     dsb();
     let e = V3d103Err {
@@ -16940,7 +16946,7 @@ fn v3d103_err_sample() -> V3d103Err {
 
 /// PI-V3D-103 — `V3D_ERR_STAT` bit by bit, with the raw word FIRST and the three class masks after it.
 /// `label` names the window (`PRE-ARM` for the pristine reference read, or the leg letter).
-#[cfg(feature = "v3d_vpmprobe")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_vpmprobe")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn v3d103_emit_err(label: &str, tag: &str, e: &V3d103Err) {
     let vpm = e.stat & V3D_ERR_CLASS_VPM;
     let vpa = e.stat & V3D_ERR_CLASS_VPA;
@@ -16978,7 +16984,7 @@ fn v3d104_emit_singleseg() {
 /// read back OUT OF THE ARENA after `build_shader_record` published it. A knob-gated line that cannot
 /// prove its own bit landed is decoration; this one prints the word and decodes the three flags, so a
 /// capture in which bit 225 reads 0 kills every S row before it is read.
-#[cfg(feature = "v3d_singleseg")]
+// PI-V3D-105: was `#[cfg(feature = "v3d_singleseg")]` — ungated inside the `v3d` module because `tests v3d` ([v3d105] emptybin) reads it on a plain `UNAOS_V3D=1` image; a build that already compiled it compiles the identical item.
 fn v3d104_emit_shadrec_readback() {
     let w28 = arena_u32(OFF_SHADREC + 28);
     serial_println!(
@@ -17865,4 +17871,517 @@ fn v3d97_basedaim_legs() {
     serial_println!(
         ":: V3D: [v3d97] BASEDAIM COMPLETE — three closes taken (A zero-base/14B, B zero-base/46B, C mapped-bases/14B) and nothing else. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg C's values on purpose: nothing runs after this rung, and a restore would be one more write between the verdict and the wire. Read leg B's verdict BEFORE leg C's — if R3 fired, leg C is void ::"
     );
+}
+
+// ═══ PI-V3D-105 — `emptybin`: v3d.md §49.25.11f, BUILT. `tests v3d`, never at boot (R80). ══════════
+//
+// THE QUESTION (§49.25.11f). Boot 15 (`UNAOS_V3D_SINGLESEG=1`) closed leg H's frame: one primitive was
+// counted binned (`PTB_PRIMS_BINNED d=1`), none was clipped or viewport-discarded, three tile-state words
+// read 1/2/1 where the empty close reads 0, and the tile-alloc pool took NOTHING the empty close did not
+// write (20 words, byte-identical). Where between the vertex fetch and tile-list emission does the
+// primitive's content evaporate?
+//
+// TASK 0, at the desk, before this was typed (§49.25.11f's gate):
+//  (1) The tile-state delta (words 1..3 = 1, 2, 1) is NOT decoded. The kernel driver only POINTS the
+//      array — v3d_regs.h:326-327 `V3D_CLE_CT0QTS` / `V3D_CLE_CT0QTS_ENABLE BIT(1)`, written from the
+//      userspace-supplied `job->qts` at v3d_sched.c:233-236 — and never describes its contents; the
+//      layout authority is Mesa's (src/broadcom), on gitlab.freedesktop.org, which is NOT REACHABLE from
+//      this seat. Per the design: "if no authority reaches those bytes, record that and stop decoding".
+//      The rung prints the words raw against boot 15's 1/2/1, and decodes nothing.
+//  (2) The two re-sourced slots are pinned from the uapi enum the kernel exports, NOT from memory:
+//      raspberrypi/linux rpi-6.6.y include/uapi/drm/v3d_drm.h opens the anonymous `V3D_PERFCNT_*` enum at
+//      line 364 with `V3D_PERFCNT_FEP_VALID_PRIMTS_NO_PIXELS` (value 0) and runs contiguous to
+//      `V3D_PERFCNT_NUM` at :451, so value == line - 364. `v3d_performance_counters[]` (the table the design
+//      names) is a later mainline v3d_perfmon.c structure; rpi-6.6.y's v3d_perfmon.c has no table, so the
+//      enum it would mirror is the source of record. L2T_VCD_READS = :422 - 364 = 58 (the campaign's own
+//      record agrees). The front-end / primitive-setup source is PSE_MEM_READS = :442 - 364 = 78 — the
+//      only unit in the table NAMED for primitive setup (the FEP_* family at :364-367 is the render-side
+//      front end and slot 0 already carries FEP_VALID_PRIMS). Whether the PSE participates in a BIN job
+//      is a fact no reachable source states (Mesa is unreachable), so B2/B3 carry that caveat on the wire
+//      and leg E's slot-6 delta is printed as the empty control.
+//
+// PCTR programming (v3d_regs.h, rpi-6.6.y): V3D_V4_PCTR_0_EN 0x650 (:357), V3D_V4_PCTR_0_CLR 0x654 (:360),
+// V3D_PCTR_0_OVERFLOW 0x658 (:361), V3D_V4_PCTR_0_SRC_0_3 0x660 and SRC_X(x) = 0x660 + 4x (:368-371), the
+// four 7-bit select fields S0..S3 at bits 6:0 / 14:8 / 22:16 / 30:24 (:372-383), V3D_PCTR_CYCLE_COUNT 32
+// (:384), counter outputs V3D_PCTR_0_PCTR0 0x680 + 4x (:388-391). The arm order is this file's
+// `v3d101_pctr_arm` idiom (boot 15's own arming) — EN=0, SRC, read-back, CLR, OVERFLOW, EN last — which
+// performs every write of v3d_perfmon.c:26-58 `v3d_perfmon_start` with the enable moved last.
+//
+// WHY A RESET FIRST. §49.3's founding lesson: a CT0 measurement taken behind an unclosed bin frame is
+// contaminated. `tests v3d` runs long after the boot's `probe_job` and M4 bins, so the rung re-runs the
+// boot's own reset cycle (`v3d_reset_cycle`, PM GRAFX_V3D OFF->ON) and the boot's own re-init
+// (`v3d_init_hw_state`, `program_mmu`, `v3d_irq_enable`) and REFUSES to kick unless CT0 then reads idle.
+// That is the closest a shell verb comes to §49.25.7h's cold boot, and the wire says it is not one.
+
+/// PI-V3D-105 — bit 225 for the duration of the rung only (read by `build_shader_record`).
+static V3D105_SINGLESEG: AtomicBool = AtomicBool::new(false);
+
+/// The bank (§49.25.11f task 1): boot 15's slots 0/1/2/3/4/7 UNTOUCHED, slots 5/6 re-sourced.
+/// Values are v3d_drm.h (rpi-6.6.y) line - 364; see task 0 (2) above.
+const V3D105_SRC: [u32; 8] = [
+    1,  // v3d_drm.h:365 V3D_PERFCNT_FEP_VALID_PRIMS                   — UNCHANGED (boot 15 d=0)
+    14, // v3d_drm.h:378 V3D_PERFCNT_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER — UNCHANGED (boot 15 d=27)
+    32, // v3d_drm.h:396 V3D_PERFCNT_CYCLE_COUNT (v3d_regs.h:384)     — RESERVED control (V3D63_CTRL_SLOT)
+    16, // v3d_drm.h:380 V3D_PERFCNT_QPU_CYCLES_VALID_INSTR           — UNCHANGED (boot 15 d=52)
+    33, // v3d_drm.h:397 V3D_PERFCNT_QPU_CYCLES_STALLED_VERTEX_COORD_USER — UNCHANGED (boot 15 d=25)
+    58, // v3d_drm.h:422 V3D_PERFCNT_L2T_VCD_READS                    — NEW (was src11 PTB_PRIM_CLIP, d=0)
+    78, // v3d_drm.h:442 V3D_PERFCNT_PSE_MEM_READS                    — NEW (was src10 PTB_PRIM_VIEWPOINT_DISCARD, d=0)
+    35, // v3d_drm.h:399 V3D_PERFCNT_PTB_PRIMS_BINNED                 — UNCHANGED (boot 15 d=1)
+];
+const V3D105_SRC_NAME: [&str; 8] = [
+    "FEP_VALID_PRIMS",
+    "QPU_ACTIVE_CYCLES_VERTEX_COORD_USER",
+    "CYCLE_COUNT (control)",
+    "QPU_CYCLES_VALID_INSTR",
+    "QPU_CYCLES_STALLED_VERTEX_COORD_USER",
+    "L2T_VCD_READS [NEW]",
+    "PSE_MEM_READS [NEW]",
+    "PTB_PRIMS_BINNED",
+];
+const V3D105_VCD_SLOT: usize = 5;
+const V3D105_FE_SLOT: usize = 6;
+const V3D105_PCTR_MASK: u32 = 0xFF;
+const _: () = assert!(
+    V3D105_SRC[V3D63_CTRL_SLOT] == PCTR_SRC_CYCLE_COUNT
+        && V3D105_SRC[V3D105_VCD_SLOT] == 422 - 364
+        && V3D105_SRC[V3D105_FE_SLOT] == 442 - 364
+        && V3D105_SRC[0] == 365 - 364
+        && V3D105_SRC[7] == 399 - 364
+);
+
+// Boot 15's baseline, carried IN the rung so the verdict is computed on the Pi (v3d.md §49.25.11a/b/e,
+// capture `~/unaos-bench/capture/line-acm0/pi.log` lines 28747-32089).
+const V3D105_B15_E_POOL_WORDS: u32 = 20; // leg E `real-pool=20/8192` (OUTCOME E1)
+const V3D105_B15_E_TS_WORDS: u32 = 48; // leg E `real-ts=48/64`
+const V3D105_B15_ERRSTAT_PRE: u32 = 0x0000_1000; // `ERRSTAT (PRE-ARM) raw=0x00001000` (VCDI alone)
+const V3D105_B15_H_QPU_ACTIVE: u32 = 27; // leg H slot1 d=27
+const V3D105_B15_H_QPU_VALID: u32 = 52; // leg H slot3 d=52
+const V3D105_B15_H_STALL: u32 = 25; // leg H slot4 d=25
+const V3D105_B15_H_PRIMS_BINNED: u32 = 1; // leg H slot7 d=1
+const V3D105_B15_H_POOL_WORDS: u32 = 20; // leg H pool words = 20 (= the empty close's)
+const V3D105_B15_H_INT_STS: u32 = 0x0000_0002; // leg H INT_STS — FLDONE alone
+const V3D105_B15_H_TS_W123: [u32; 3] = [1, 2, 1]; // leg H tile-state +0x004..+0x00f
+const V3D105_NULL_SHADER_ACTIVE: u32 = 5; // boot 15 leg G's NULL shader, the magnitude H must exceed
+
+/// One leg's measurements. Everything the verdict reads, nothing it does not.
+#[derive(Clone, Copy, Default)]
+struct V3d105Leg {
+    ran: bool,
+    submit_sound: bool,
+    idled: bool,
+    retired: bool,
+    frdone: bool,
+    bfc_delta: u32,
+    sts: u32,
+    fault: u32,
+    pool_words: u32,
+    ts_words: u32,
+    ts_w: [u32; 8],
+    raw: [u32; 8],
+    ovf: u32,
+    en: u32,
+    err: V3d103Err,
+}
+
+impl V3d105Leg {
+    fn closed(&self) -> bool {
+        self.frdone || self.retired || self.bfc_delta != 0
+    }
+    fn ct0_clean(&self) -> bool {
+        self.ran && self.submit_sound && self.closed() && self.idled
+    }
+}
+
+/// Arm the bank once, before leg E (boot 15's placement). Counter-file config registers only.
+fn v3d105_pctr_arm() {
+    let pack = |s: &[u32]| (s[0] & 0x7f) | ((s[1] & 0x7f) << 8) | ((s[2] & 0x7f) << 16) | ((s[3] & 0x7f) << 24);
+    let src_0_3 = pack(&V3D105_SRC[0..4]);
+    let src_4_7 = pack(&V3D105_SRC[4..8]);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3, src_0_3);
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7, src_4_7);
+    dsb();
+    let lat_0_3 = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_0_3);
+    let lat_4_7 = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_SRC_4_7);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_CLR, V3D105_PCTR_MASK);
+    mmio_write(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW, V3D105_PCTR_MASK);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, V3D105_PCTR_MASK);
+    dsb();
+    serial_println!(
+        ":: V3D: [v3d105] PCTRARM — the emptybin bank armed ONCE, before LEG E, left running across E and H (boot 15's placement). EN={:#010x} SRC_0_3={:#010x} (read back {:#010x}) SRC_4_7={:#010x} (read back {:#010x}) | slot0=src{} {} · slot1=src{} {} · slot2=src{} {} · slot3=src{} {} · slot4=src{} {} · slot5=src{} {} · slot6=src{} {} · slot7=src{} {} | slots 0/1/2/3/4/7 are boot 15's, UNTOUCHED (the guard reads leg identity off them); slots 5/6 are re-sourced from boot 15's PTB_PRIM_CLIP/PTB_PRIM_VIEWPOINT_DISCARD (both flight-proven 0). Ids are include/uapi/drm/v3d_drm.h rpi-6.6.y line-364 ::",
+        V3D105_PCTR_MASK, src_0_3, lat_0_3, src_4_7, lat_4_7,
+        V3D105_SRC[0], V3D105_SRC_NAME[0], V3D105_SRC[1], V3D105_SRC_NAME[1],
+        V3D105_SRC[2], V3D105_SRC_NAME[2], V3D105_SRC[3], V3D105_SRC_NAME[3],
+        V3D105_SRC[4], V3D105_SRC_NAME[4], V3D105_SRC[5], V3D105_SRC_NAME[5],
+        V3D105_SRC[6], V3D105_SRC_NAME[6], V3D105_SRC[7], V3D105_SRC_NAME[7],
+    );
+}
+
+/// Everything leg H's list reads: `v3d100_publish`'s M4-class half (code, uniforms, vertices, default
+/// attributes, record), without leg G's null shader, which this rung never kicks.
+fn v3d105_publish() {
+    let cs_len = write_shader_words(OFF_CS_CODE, &CS_VS_WORDS);
+    let vs_len = write_shader_words(OFF_VS_CODE, &CS_VS_WORDS);
+    let fs_len = write_shader_words(OFF_FS_CODE, &FS_WORDS);
+    let fs_unif_len = write_fs_uniforms(OFF_FS_UNIF);
+    let cs_unif_len = write_geo_uniforms(OFF_CS_UNIF);
+    let vs_unif_len = write_geo_uniforms(OFF_VS_UNIF);
+    for (i, v) in TRI_VERTS.iter().enumerate() {
+        for (j, comp) in v.iter().enumerate() {
+            arena_write_u32(OFF_VTXDATA + i * 16 + j * 4, comp.to_bits());
+        }
+    }
+    fill_region(OFF_DEFAULT_ATTRS, 16, 0);
+    let _ = build_shader_record();
+    cache::clean_range(arena_phys() + OFF_CS_CODE, cs_len);
+    cache::clean_range(arena_phys() + OFF_VS_CODE, vs_len);
+    cache::clean_range(arena_phys() + OFF_FS_CODE, fs_len);
+    cache::clean_range(arena_phys() + OFF_FS_UNIF, fs_unif_len);
+    cache::clean_range(arena_phys() + OFF_CS_UNIF, cs_unif_len);
+    cache::clean_range(arena_phys() + OFF_VS_UNIF, vs_unif_len);
+    cache::clean_range(arena_phys() + OFF_VTXDATA, TRI_VERTS.len() * 16);
+    cache::clean_range(arena_phys() + OFF_DEFAULT_ATTRS, 16);
+    cache::clean_range(arena_phys() + OFF_SHADREC, 36 + 16);
+}
+
+/// One leg, on PRODUCTION bases with leg E's armed prologue (`v3d97_leg(.., armed=true, ..)`'s path,
+/// without the decoy windows legs C/D aimed at). `content == false` is leg E (the 14-byte empty list);
+/// `true` is leg H (`BinContent::Full`, the m4-class minimum over the real coordinate shader).
+fn v3d105_leg(leg: &str, content: bool) -> V3d105Leg {
+    let mut out = V3d105Leg::default();
+    let tag = if content {
+        "v3d105 emptybin leg H (PRODUCTION bases + armed prologue, one flat triangle, bit225=1)"
+    } else {
+        "v3d105 emptybin leg E (PRODUCTION bases + armed prologue, the 14-byte EMPTY list)"
+    };
+    let cl_len = if content {
+        build_bin_cl_content_geom(OFF_PROBE_BIN_CL, OFF_SHADREC, 1, BinContent::Full, TARGET_W, TARGET_H)
+    } else {
+        build_bin_cl_emptyunarm_padded(OFF_PROBE_BIN_CL, 0)
+    };
+    cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, cl_len);
+    let ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
+    let ea = ba + cl_len as u32;
+    let tile_alloc = (arena_phys() + OFF_BIN_TILEALLOC) as u32;
+    let ts = (arena_phys() + OFF_TILESTATE) as u32;
+    if !arena_contains(ba as usize, cl_len)
+        || !arena_contains(tile_alloc as usize, BIN_TILEALLOC_BYTES)
+        || !arena_contains(ts as usize, TILE_STATE_BYTES)
+    {
+        serial_println!(
+            ":: V3D: [v3d105] LEG {} — a range escapes the arena; refusing the kick (fail-closed). NOTHING was kicked ::",
+            leg
+        );
+        return out;
+    }
+    decode_cl_packets(tag, OFF_PROBE_BIN_CL, cl_len);
+    v3d56_poison_region(OFF_TILESTATE, TILE_STATE_BYTES);
+    v3d56_poison_region(OFF_BIN_TILEALLOC, BIN_TILEALLOC_BYTES);
+
+    // v3d_bin_job_run's order (v3d_sched.c), as leg E took it on boot 15: BPOS=0, the per-job cache
+    // invalidate, then CT0QMA/QMS/QTS|ENABLE (v3d_regs.h:334/335/326-327), then QBA/QEA (:328/:331).
+    bin_prejob_bpos_clear(tag);
+    invalidate_gpu_caches("L2T flush (v3d105 emptybin pre-kick)");
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, tile_alloc);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, BIN_TILEALLOC_BYTES as u32);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, ts | V3D_CLE_CT0QTS_ENABLE);
+    dsb();
+    v3d62_arm(tag);
+    clear_mmu_fault_latch(tag);
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    let bfc_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QBA, ba);
+    dsb();
+    mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QEA, ea); // GO
+    dsb();
+    out.ran = true;
+    out.submit_sound = v3d54_submit_audit(tag, ba, ea, cl_len);
+    out.idled = wait_bit_clear(V3D_CORE0_BASE, V3D_CLE_CT0CS, V3D_CLE_CTNCS_CTRUN, tag);
+    let (sts, _us, retired) = wait_fldone(tag, ba, ea);
+    out.sts = sts;
+    out.retired = retired;
+    out.frdone = sts & V3D_INT_FRDONE != 0;
+
+    // §49.20.2 V2a: the violation pair FIRST, then the bank and the ERR block in the same window,
+    // before this leg's own cache maintenance (boot 15's sampling point, `v3d97_leg`).
+    let (vio_addr, vio_id) = v3d97_violation_once();
+    let mmu_ctl = mmio_read(V3D_HUB_BASE, V3D_MMU_CTL);
+    out.fault = mmu_ctl & (V3D_MMU_CTL_PT_INVALID | V3D_MMU_CTL_WRITE_VIOLATION | V3D_MMU_CTL_CAP_EXCEEDED);
+    let (client, va) = vio_decode(vio_id, vio_addr);
+    dsb();
+    for i in 0..8 {
+        out.raw[i] = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_PCTR0 + 4 * i);
+    }
+    out.ovf = mmio_read(V3D_CORE0_BASE, V3D_PCTR_0_OVERFLOW);
+    out.en = mmio_read(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN);
+    out.err = v3d103_err_sample();
+    v3d62_frame_witness(tag);
+
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH);
+    let flush_done = wait_bit_clear(
+        V3D_CORE0_BASE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, "L2T write-back (v3d105 scan)",
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_SLCACTL, V3D_SLCACTL_INVALIDATE_ALL);
+    dsb();
+    cache::invalidate_range(arena_phys(), ARENA_BYTES);
+    dsb();
+    let ts_scan = v3d56_scan(ts, TILE_STATE_BYTES);
+    let pool_scan = v3d56_scan(tile_alloc, BIN_TILEALLOC_BYTES);
+    v3d56_emit_scan(tag, "tile-state (real, CT0QTS target)", ts, &ts_scan, flush_done);
+    v3d56_emit_scan(tag, "tile-alloc pool (real, CT0QMA target)", tile_alloc, &pool_scan, flush_done);
+    v3d99_dump_head(tag, "REAL tile-alloc pool (CT0QMA)", tile_alloc, 4);
+    v3d99_dump_head(tag, "REAL tile-state array (CT0QTS)", ts, 8);
+    for i in 0..8 {
+        out.ts_w[i] = arena_u32(OFF_TILESTATE + 4 * i);
+    }
+    out.pool_words = pool_scan.zeroed + pool_scan.overwritten;
+    out.ts_words = ts_scan.zeroed + ts_scan.overwritten;
+    let bfc_after = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    out.bfc_delta = bfc_after.wrapping_sub(bfc_pre);
+    serial_println!(
+        ":: V3D: [v3d105] LEG {} ({}) — list len={} ({:#x}) | frame-closed={} (retired={} FRDONE={} BFC {:#010x}->{:#010x} Δ{}) submit_sound={} idled={} INT_STS={:#010x} | VIO_ADDR={:#010x} VIO_ID={:#010x} RAW -> client {} @ VA {:#010x} MMU_CTL={:#010x} fault={} | real-ts={}/{} real-pool={}/{} (drain completed={}) | tile-state +0x000: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} ::",
+        leg, tag, cl_len, cl_len,
+        out.closed() as u32, retired as u32, out.frdone as u32, bfc_pre, bfc_after, out.bfc_delta,
+        out.submit_sound as u32, out.idled as u32, sts,
+        vio_addr, vio_id, client, va, mmu_ctl, (out.fault != 0) as u32,
+        out.ts_words, ts_scan.words, out.pool_words, pool_scan.words, flush_done as u32,
+        out.ts_w[0], out.ts_w[1], out.ts_w[2], out.ts_w[3], out.ts_w[4], out.ts_w[5], out.ts_w[6], out.ts_w[7]
+    );
+    mmio_write(V3D_CORE0_BASE, V3D_CTL_INT_CLR, mmio_read(V3D_CORE0_BASE, V3D_CTL_INT_STS));
+    dsb();
+    clear_mmu_fault_latch("v3d105 post-leg (VOID for the violation pair — see this leg's line)");
+    out
+}
+
+/// One leg's bank line — the NEW SLOTS' LINE. `prev` is the previous sample's raw words (zero for leg E,
+/// which reads against the clear at the arm), so each Δ is exactly what this leg's kick added.
+fn v3d105_emit_bank(leg: &str, s: &V3d105Leg, prev: &[u32; 8]) -> [u32; 8] {
+    let mut d = [0u32; 8];
+    for i in 0..8 {
+        d[i] = s.raw[i].wrapping_sub(prev[i]);
+    }
+    serial_println!(
+        ":: V3D: [v3d105] EMPTYBIN BANK LEG {} — PCTR_EN(at read)={:#010x} OVERFLOW={:#010x} | slot0 src{} {} raw={} d={} · slot1 src{} {} raw={} d={} · slot2 src{} {} raw={} d={} · slot3 src{} {} raw={} d={} · slot4 src{} {} raw={} d={} · slot5 src{} {} raw={} d={} · slot6 src{} {} raw={} d={} · slot7 src{} {} raw={} d={} | pool words={} tile-state words={} — this line CARRIES NO VERDICT ::",
+        leg, s.en, s.ovf,
+        V3D105_SRC[0], V3D105_SRC_NAME[0], s.raw[0], d[0],
+        V3D105_SRC[1], V3D105_SRC_NAME[1], s.raw[1], d[1],
+        V3D105_SRC[2], V3D105_SRC_NAME[2], s.raw[2], d[2],
+        V3D105_SRC[3], V3D105_SRC_NAME[3], s.raw[3], d[3],
+        V3D105_SRC[4], V3D105_SRC_NAME[4], s.raw[4], d[4],
+        V3D105_SRC[5], V3D105_SRC_NAME[5], s.raw[5], d[5],
+        V3D105_SRC[6], V3D105_SRC_NAME[6], s.raw[6], d[6],
+        V3D105_SRC[7], V3D105_SRC_NAME[7], s.raw[7], d[7],
+        s.pool_words, s.ts_words,
+    );
+    d
+}
+
+/// Stop the bank (EN=0), as `v3d101_pctr_stop` does: the counter file left as every other rung sees it.
+fn v3d105_pctr_stop() {
+    mmio_write(V3D_CORE0_BASE, V3D_V4_PCTR_0_EN, 0);
+    dsb();
+}
+
+/// Restore the default record (bit 225 = 0) so nothing after the rung reads the armed one.
+fn v3d105_restore_record() {
+    V3D105_SINGLESEG.store(false, Ordering::Relaxed);
+    let _ = build_shader_record();
+    cache::clean_range(arena_phys() + OFF_SHADREC, 36 + 16);
+}
+
+/// `tests v3d` — the emptybin rung. Registered by `ensure_tests`; never called at boot (R80).
+fn v3d105_emptybin() {
+    // ── 0. Presence: the boot probe's own verdict, read the boot probe's own way (hub IDENT0 first). ──
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        V3dPresence::Down => {
+            serial_println!(":: v3d: emptybin SKIP reason=no-v3d-block (hub IDENT0 = 0x00000000: no V3D block — QEMU raspi4b models none) -> SKIP reason=no-v3d-block ::");
+            return;
+        }
+        V3dPresence::Poison(v) => {
+            serial_println!(":: v3d: emptybin SKIP reason=no-v3d-block (hub IDENT0 = {:#010x}: bus poison, not a live register) -> SKIP reason=no-v3d-block ::", v);
+            super::exceptions::serror_drain_request("v3d: [v3d105] emptybin probe poison");
+            return;
+        }
+    }
+    serial_println!(
+        ":: V3D: [v3d105] EMPTYBIN — READ THIS FIRST (desk work, not a measurement). v3d.md §49.25.11f's rung, built: `tests v3d` on a plain UNAOS_V3D=1 image, never at boot (R80). TASK 0 (1): the tile-state delta (leg H words 1..3 = 1,2,1 on boot 15) is NOT decoded — the kernel only points the array (v3d_regs.h:326-327 CT0QTS/ENABLE, v3d_sched.c:233-236), its layout is Mesa's and gitlab.freedesktop.org is unreachable, so decoding STOPPED; the words are printed raw. TASK 0 (2): slot5 = src58 V3D_PERFCNT_L2T_VCD_READS (v3d_drm.h rpi-6.6.y :422, enum base :364), slot6 = src78 V3D_PERFCNT_PSE_MEM_READS (:442) — the only primitive-setup-NAMED source; whether the PSE runs in a BIN job is stated by no reachable source, so leg E's slot6 is the empty control. Slots 0/1/2/3/4/7 are boot 15's, untouched. ONE VARIABLE beyond boot 15: the two re-sourced slots; bit 225 stays declared (§49.25.10). NOT A COLD BOOT: this rung re-runs the boot's reset cycle and re-init and refuses to kick unless CT0 then reads idle; the bench's capture is still the next render-class boot. Order on the wire (§49.25.7h): this line, [v3d104] SHADREC READBACK + [v3d105] SHADREC DIFF, [v3d105] PCTRARM, [v3d103] ERRSTAT (PRE-ARM), LEG E ([v3d105] LEG E, [v3d101] INT_STS DECODE, [v3d105] EMPTYBIN BANK LEG E, [v3d103] ERRSTAT (E)), LEG H (the same four), then ROW B1..B4 and the VERDICT ::"
+    );
+
+    // ── 1. A virgin CT0: the boot's reset cycle and re-init, then a hygiene read. ──
+    v3d_reset_cycle();
+    settle_ms(2);
+    match probe_hub_ident0() {
+        V3dPresence::Up(_) => {}
+        _ => {
+            serial_println!(":: v3d: emptybin FAIL — the block did not come back UP after the reset cycle; NOTHING was kicked -> FAIL reason=block-lost-after-reset ::");
+            super::exceptions::serror_drain_request("v3d: [v3d105] emptybin block lost");
+            return;
+        }
+    }
+    v3d_init_hw_state();
+    if !program_mmu() {
+        serial_println!(":: v3d: emptybin FAIL — program_mmu refused after the reset cycle; NOTHING was kicked -> FAIL reason=mmu-program ::");
+        super::exceptions::serror_drain_request("v3d: [v3d105] emptybin mmu");
+        return;
+    }
+    v3d_irq_enable();
+    let cs0 = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0CS);
+    let pcs0 = mmio_read(V3D_CORE0_BASE, V3D_CLE_PCS);
+    let bfc0 = mmio_read(V3D_CORE0_BASE, V3D_CLE_BFC);
+    serial_println!(
+        ":: V3D: [v3d105] CT0 HYGIENE (after reset + re-init) — CT0CS={:#010x} (CTRUN={}) PCS={:#010x} (BMACTIVE={} BMBUSY={}) BFC={:#010x} ::",
+        cs0, (cs0 & V3D_CLE_CTNCS_CTRUN != 0) as u32, pcs0,
+        (pcs0 & V3D_PCS_BMACTIVE != 0) as u32, (pcs0 & V3D_PCS_BMBUSY != 0) as u32, bfc0
+    );
+    if cs0 & V3D_CLE_CTNCS_CTRUN != 0 || pcs0 & (V3D_PCS_BMACTIVE | V3D_PCS_BMBUSY) != 0 {
+        serial_println!(":: v3d: emptybin FAIL — CT0 is not idle after the reset cycle (§49.3: a leg behind an open frame measures nothing); NOTHING was kicked -> FAIL reason=ct0-not-virgin ::");
+        return;
+    }
+
+    // ── 2. The record: default vs armed, diffed bit for bit, then the armed one published. ──
+    V3D105_SINGLESEG.store(false, Ordering::Relaxed);
+    let _ = build_shader_record();
+    let mut rec_default = [0u8; 36];
+    for (i, b) in rec_default.iter_mut().enumerate() {
+        *b = arena_byte(OFF_SHADREC + i);
+    }
+    V3D105_SINGLESEG.store(true, Ordering::Relaxed);
+    v3d105_publish();
+    v3d104_emit_shadrec_readback();
+    let mut diff_bits = 0u32;
+    let mut diff_first: i32 = -1;
+    for i in 0..36 {
+        let x = rec_default[i] ^ arena_byte(OFF_SHADREC + i);
+        if x != 0 && diff_first < 0 {
+            diff_first = (i * 8) as i32 + x.trailing_zeros() as i32;
+        }
+        diff_bits += x.count_ones();
+    }
+    let w28 = arena_u32(OFF_SHADREC + 28);
+    let readback_ok = diff_bits == 1 && diff_first == 225 && (w28 >> 1) & 1 == 1;
+    serial_println!(
+        ":: V3D: [v3d105] SHADREC DIFF — default record vs the record this rung publishes, all 36 bytes: differing bits={} first={} | word@byte28={:#010x} bit225={} — readback-guard={} (exactly ONE bit, bit 225, set) ::",
+        diff_bits, diff_first, w28, (w28 >> 1) & 1, readback_ok as u32
+    );
+
+    // ── 3. The bank, then the pristine ERR read (boot 15's emission order). ──
+    v3d105_pctr_arm();
+    let pre = v3d103_err_sample();
+    v3d103_pre_store(&pre);
+    v3d103_emit_err("PRE-ARM", "pristine, before LEG E's kick (v3d105 emptybin)", &pre);
+    let pre = v3d103_pre_load();
+    serial_println!(
+        "::   [v3d105] ERRSTAT (PRE-ARM) reference — this run {:#010x}, boot 15 {:#010x}; newly-latched bits on every leg are computed against THIS run's word ::",
+        pre.stat, V3D105_B15_ERRSTAT_PRE
+    );
+
+    // ── 4. LEG E — the empty control. ──
+    let e = v3d105_leg("E", false);
+    v3d101_emit_intsts("E", "v3d105 emptybin leg E", e.sts);
+    let de = v3d105_emit_bank("E", &e, &[0u32; 8]);
+    v3d103_emit_err("E", "v3d105 emptybin leg E", &e.err);
+
+    // ── 5. LEG H — admitted only behind a clean CT0 (§49.3), bit 225 declared. ──
+    let h = if e.ct0_clean() {
+        let h = v3d105_leg("H", true);
+        v3d101_emit_intsts("H", "v3d105 emptybin leg H", h.sts);
+        v3d103_emit_err("H", "v3d105 emptybin leg H", &h.err);
+        h
+    } else {
+        serial_println!(":: V3D: [v3d105] LEG H STOOD DOWN — leg E did not leave CT0 clean (submit_sound, frame-closed and CTRUN-clear must all hold). NO content kick was issued ::");
+        V3d105Leg::default()
+    };
+    let dh = if h.ran { v3d105_emit_bank("H", &h, &e.raw) } else { [0u32; 8] };
+    v3d105_pctr_stop();
+    v3d105_restore_record();
+
+    // ── 6. The verdict, computed HERE against boot 15's constants. ──
+    let moved = |d: &[u32; 8], s: &V3d105Leg, i: usize| d[i] != 0 || s.ovf & (1 << i) != 0;
+    let bank_ok = h.ran && h.en & V3D105_PCTR_MASK == V3D105_PCTR_MASK && moved(&dh, &h, V3D63_CTRL_SLOT);
+    let e1 = e.ran
+        && e.closed()
+        && e.fault == 0
+        && e.pool_words == V3D105_B15_E_POOL_WORDS
+        && e.ts_words == V3D105_B15_E_TS_WORDS;
+    let err_e_pre = e.err.stat == pre.stat;
+    let qpu_band = |d: u32, b15: u32| d >= b15 / 2 && d <= b15 * 2 && d > 2 * V3D105_NULL_SHADER_ACTIVE;
+    let h_shape = h.ran
+        && h.retired
+        && h.bfc_delta == 1
+        && dh[7] == V3D105_B15_H_PRIMS_BINNED
+        && dh[0] == 0
+        && qpu_band(dh[1], V3D105_B15_H_QPU_ACTIVE)
+        && qpu_band(dh[3], V3D105_B15_H_QPU_VALID)
+        && h.pool_words == V3D105_B15_H_POOL_WORDS;
+    let newly = if h.ran { h.err.stat & !pre.stat } else { 0 };
+    let vcd = h.ran && moved(&dh, &h, V3D105_VCD_SLOT);
+    let fe = h.ran && moved(&dh, &h, V3D105_FE_SLOT);
+    let b = [h.ran && !vcd, vcd && !fe, vcd && fe, newly != 0];
+    serial_println!(
+        ":: V3D: [v3d105] EMPTYBIN ROW B1 — L2T_VCD_READS FLAT on leg H (slot5 d={}; leg E d={}) — fired={} — the attribute DMA never fetched the vertices: the primitive was assembled without its data, and the wall moves to the attribute record (address, stride, max-index) ::",
+        dh[5], de[5], b[0] as u32
+    );
+    serial_println!(
+        ":: V3D: [v3d105] EMPTYBIN ROW B2 — L2T_VCD_READS MOVED, PSE_MEM_READS FLAT on leg H (slot5 d={}, slot6 d={}; leg E slot6 d={}) — fired={} — vertices were fetched and the primitive never entered setup; caveat on the wire: no reachable source says the PSE runs in a BIN job, so a flat slot6 on BOTH legs is the source, not the primitive ::",
+        dh[5], dh[6], de[6], b[1] as u32
+    );
+    serial_println!(
+        ":: V3D: [v3d105] EMPTYBIN ROW B3 — BOTH MOVED on leg H (slot5 d={}, slot6 d={}) — fired={} — the primitive traversed the front end and what is missing is the list EMISSION: a tile-coverage question (PI-V3D-17's clipper/viewport room from the other side); the next variable is the vertex DATA (one desk-derived full-tile triangle) ::",
+        dh[5], dh[6], b[2] as u32
+    );
+    serial_println!(
+        ":: V3D: [v3d105] EMPTYBIN ROW B4 — NEWLY-LATCHED ERR_STAT on leg H = {:#010x} (H {:#010x} & !PRE-ARM {:#010x}) — fired={} — name the bit and chase it before reasoning (S4's law) ::",
+        newly, h.err.stat, pre.stat, b[3] as u32
+    );
+    for (mask, name, reading) in V3D103_ERR_BITS.iter() {
+        if newly & mask != 0 {
+            serial_println!(
+                "::   [v3d105] B4 newly-latched bit{} {} ({}) — v3d_regs.h:528-544 V3D_ERR_STAT ::",
+                mask.trailing_zeros(), name, reading
+            );
+        }
+    }
+    let (outcome, tail): (&str, &str) = if !h.ran {
+        ("INCONCLUSIVE — leg H never ran (leg E left CT0 unclean); no B row is read", "FAIL reason=inconclusive-legE-unclean")
+    } else if !bank_ok {
+        ("INCONCLUSIVE — the bank lost its enable mask or slot2 src32 CYCLE_COUNT never moved on leg H", "FAIL reason=inconclusive-bank")
+    } else if !e1 || !err_e_pre {
+        ("INCONCLUSIVE — leg E is not OUTCOME E1 (closed, no fault, real-pool=20, real-ts=48) or ERRSTAT (E) != PRE-ARM: the arm leaked wider than declared", "FAIL reason=inconclusive-legE")
+    } else if !readback_ok {
+        ("INCONCLUSIVE — the published record is not the default with exactly bit 225 set", "FAIL reason=inconclusive-readback")
+    } else if b[3] {
+        ("OUTCOME B4 — a newly-latched ERR_STAT bit on leg H; the bit names the station (lines above)", "PASS outcome=B4")
+    } else if !h_shape {
+        ("INCONCLUSIVE — leg H does not reproduce boot 15's shape (BFC Δ1 + retired, PTB_PRIMS_BINNED d=1, FEP flat, QPU at the real-shader magnitude, pool words=20): a re-sourcing that changed leg behaviour convicts the arm", "FAIL reason=inconclusive-legH-shape")
+    } else if b[0] {
+        ("OUTCOME B1 — the attribute DMA never fetched the vertices", "PASS outcome=B1")
+    } else if b[1] {
+        ("OUTCOME B2 — vertices fetched, the primitive never entered setup (PSE caveat above)", "PASS outcome=B2")
+    } else {
+        ("OUTCOME B3 — the full front end traversed; list emission is what is missing", "PASS outcome=B3")
+    };
+    serial_println!(
+        ":: V3D: [v3d105] EMPTYBIN VERDICT — guards: bank={} legE-E1={} errE=PRE-ARM={} readback={} legH-boot15-shape={} | leg H: BFC Δ{} retired={} INT_STS={:#010x} (boot 15 {:#010x}) FEP d={} QPU active d={} (boot 15 {}) valid d={} (boot 15 {}) stall d={} (boot 15 {}) PTB_PRIMS_BINNED d={} pool={} ts={} tile-state w1..3={}/{}/{} (boot 15 {}/{}/{}) | rows fired B1={} B2={} B3={} B4={} — {} -> {} ::",
+        bank_ok as u32, e1 as u32, err_e_pre as u32, readback_ok as u32, h_shape as u32,
+        h.bfc_delta, h.retired as u32, h.sts, V3D105_B15_H_INT_STS,
+        dh[0], dh[1], V3D105_B15_H_QPU_ACTIVE, dh[3], V3D105_B15_H_QPU_VALID, dh[4], V3D105_B15_H_STALL,
+        dh[7], h.pool_words, h.ts_words, h.ts_w[1], h.ts_w[2], h.ts_w[3],
+        V3D105_B15_H_TS_W123[0], V3D105_B15_H_TS_W123[1], V3D105_B15_H_TS_W123[2],
+        b[0] as u32, b[1] as u32, b[2] as u32, b[3] as u32,
+        outcome, tail
+    );
+}
+
+/// PI-V3D-105 — register `tests v3d` (the emptybin rung). Called from `tests.rs`'s registration line;
+/// deferred by default, run on the spot under `tests-at-boot` (where QEMU raspi4b prints the SKIP).
+pub fn ensure_tests() {
+    static REG: AtomicBool = AtomicBool::new(false);
+    if !REG.swap(true, Ordering::AcqRel) {
+        crate::tests::register("v3d", v3d105_emptybin);
+    }
 }
