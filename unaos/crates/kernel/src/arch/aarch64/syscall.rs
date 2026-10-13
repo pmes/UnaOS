@@ -4506,7 +4506,7 @@ pub fn clear_handle_row(asid: u64) {
     // would inherit a permanent "someone is parked here" and the backstop would wake an empty key for the
     // rest of the boot. It is deliberately NOT inside `clear_input_row`, whose other caller is a focus
     // arrival: see `clear_input_parked`.
-    clear_input_parked(asid);
+    clear_input_parked(asid); cursor_shape_drop(asid); // CURSORSHAPE (B550): the ASID's stored shape dies with the tenant (file tail). ⚠ LINE-NEUTRAL append.
     // VUGMIN-C: and the resume-print pacing counter, for the ordinary recycle reason — the next tenant of
     // this slot must get its own first/second `[vugpause2] resume` lines printed rather than inheriting a
     // departed program's cadence and going quiet until the count next hits a power of two. Pacing state
@@ -4523,7 +4523,7 @@ pub fn clear_handle_row(asid: u64) {
         .compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        EL0_FOCUS_REVOKES.fetch_add(1, Ordering::Relaxed);
+        EL0_FOCUS_REVOKES.fetch_add(1, Ordering::Relaxed); cursor_shape_focus(asid, 0); // CURSORSHAPE (B550): a revoked focus goes to the shell; the dying program's shape leaves the sprite. ⚠ LINE-NEUTRAL append.
     }
     // UVUG-8r2: companion clear for the takeover latch. Without it a torn-down ASID could leave its takeover
     // engaged, and a REUSED ASID would inherit it — the next `run` into the same slot would start with its
@@ -6871,7 +6871,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), una_abi::SYS_SBRK => super::xwin::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), // HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), // CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
@@ -13493,7 +13493,7 @@ pub fn user_input_set_active(asid: u64) {
     // suspends when the latch matches the asid the wait loop is watching, and the next `user_input_set_active`
     // clears it again. Closing it properly would need focus+latch under one atomic or a seqlock, which is not
     // worth it for a window this narrow and this benign.
-    USER_INPUT_ACTIVE.store(asid, Ordering::Release);
+    let cs_old = USER_INPUT_ACTIVE.swap(asid, Ordering::AcqRel); cursor_shape_focus(cs_old, asid); // CURSORSHAPE (B550): the shape follows focus — the leaver resets to the arrow, the arriver shows its stored shape; `swap` (AcqRel ⊇ the Release store it replaces) names the leaver. Body at the FILE TAIL. ⚠ LINE-NEUTRAL: edited in place.
     EL0_TAKEOVER_ASID.store(0, Ordering::Release);
     // Heartbeat reset to 0 as an "unset" sentinel. NOTE it is a value, not a tombstone: `takeover_suspends`
     // treats it as a real timestamp, so within the first `TAKEOVER_STALE_SECS` after CNTPCT origin a 0 reads as
@@ -25996,7 +25996,7 @@ pub fn slot_tables_warm(asid: u64) {
     BUS_SEM.warm(a);
     #[cfg(feature = "login")]
     SLOT_EPOCH.warm(a);
-    SLOT_PPID.warm(a);
+    SLOT_PPID.warm(a); SLOT_CURSOR_SHAPE.warm(a); // CURSORSHAPE (B550): the shape sidecar's row, claimed with the slot. ⚠ LINE-NEUTRAL append.
 }
 
 // =================================================================================================
@@ -26130,5 +26130,70 @@ fn sys_kdf(a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             if w.is_err() { EFAULT } else { 0 }
         }
         Err(e) => e,
+    }
+}
+
+// =================================================================================================
+// CURSORSHAPE (rmbp-ledger B550; R108 — the pane contract's INPUT half) — `SYS_CURSOR_SHAPE` (69, una-abi) on
+// aarch64, the x86 tail block's twin with the ASID as the owner key (this arch's focus word holds the ASID, 0 = the
+// shell). TAIL-APPENDED; above it the arc is same-line folds only: the dispatch arm, `user_input_set_active`'s
+// store (now a `swap` naming the leaver), `clear_handle_row`'s revoke and drop, and `slot_tables_warm`.
+// The shape is stored on the owner's ASID row (`procslot::SlotVec`, B399, warmed with the slot; read and written
+// by `peek` only, so the focus hook allocates nothing on the masked teardown chain), published to the sprite
+// (`video::cursor::set_shape`, atomics only) when the caller holds focus, reset to the arrow when its owner loses
+// focus or is torn down. The sprite reads it on both arches: `video/cursor.rs` is compiled on every image.
+// =================================================================================================
+
+/// CURSORSHAPE (B550): the shape each ASID asked for (`una_abi::CURSOR_*`), 0 = the arrow.
+static SLOT_CURSOR_SHAPE: crate::procslot::SlotVec<AtomicU8> = crate::procslot::SlotVec::new_asid(|| AtomicU8::new(0), AtomicU8::new(0));
+
+/// `SYS_CURSOR_SHAPE(shape) -> 0 / -EINVAL` — the caller's ASID from `TTBR0_EL1`, read synchronously in the SVC.
+fn sys_cursor_shape(shape: u64) -> i64 {
+    match current_asid() {
+        0 => una_abi::EINVAL,
+        asid => cursor_shape_apply(asid, shape),
+    }
+}
+
+/// CURSORSHAPE: the verb's body for the owner whose focus key is `key` (the ASID; 0 = the shell, which stores
+/// nothing and publishes when it holds focus). `pub` for `tests cursorshape` (`video/cursorshape.rs`).
+pub fn cursor_shape_apply(key: u64, shape: u64) -> i64 {
+    if shape >= una_abi::CURSOR_SHAPES {
+        return una_abi::EINVAL;
+    }
+    if key != 0 {
+        match SLOT_CURSOR_SHAPE.peek(key as usize).filter(|_| key as usize <= crate::procslot::SLOT_ID_MAX) {
+            Some(row) => row.store(shape as u8, Ordering::Release),
+            None => return una_abi::EINVAL,
+        }
+    }
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == key {
+        crate::video::cursor::set_shape(shape);
+    }
+    0
+}
+
+/// CURSORSHAPE: focus moved from ASID `old` to ASID `new` (0 = the shell). The leaver resets to the arrow; the
+/// sprite shows the arriver's stored shape.
+fn cursor_shape_focus(old: u64, new: u64) {
+    if old != 0 && old != new {
+        if let Some(row) = SLOT_CURSOR_SHAPE.peek(old as usize) {
+            row.store(una_abi::CURSOR_ARROW as u8, Ordering::Release);
+        }
+    }
+    let shown = if new == 0 {
+        una_abi::CURSOR_ARROW
+    } else {
+        SLOT_CURSOR_SHAPE.peek(new as usize).map_or(una_abi::CURSOR_ARROW, |row| row.load(Ordering::Acquire) as u64)
+    };
+    crate::video::cursor::set_shape(shown);
+}
+
+/// CURSORSHAPE: ASID teardown — the departed tenant's shape does not outlive it.
+fn cursor_shape_drop(asid: u64) {
+    if asid != 0 {
+        if let Some(row) = SLOT_CURSOR_SHAPE.peek(asid as usize) {
+            row.store(una_abi::CURSOR_ARROW as u8, Ordering::Release);
+        }
     }
 }

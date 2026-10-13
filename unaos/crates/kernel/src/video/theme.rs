@@ -1100,3 +1100,25 @@ pub mod testcard {
     pub const YELLOW: u32 = 0x00FF_FF00;
     pub const WHITE: u32 = 0x00FF_FFFF;
 }
+
+// ── CURSORSHAPE (rmbp-ledger B550) — the sprite table's inks, one (fill, shadow) pair per shape ────────────────────
+// `video/cursor.rs`'s `SHAPES` table reads its colours HERE, indexed by `una_abi::CURSOR_*` (arrow, hand, text,
+// crosshair, move, resize-ns, resize-ew, busy). No new literal: every pair is the two pointer colours above, so the
+// pointer stays one look in Light and Dark (PA38's "un-themed" verdict is about the colours; this file is where a
+// kit revision would change them, for every shape at once). The TEXT BEAM is the one inverted pair — dark ink with a
+// light offset — because it stands over text: a white beam on a white page (Aether) is invisible and the offset
+// keeps it readable on a dark editor (Una). Appended at the file tail: no line above moves.
+/// The text beam's ink and its offset halo.
+pub const POINTER_BEAM_FILL: u32 = POINTER_SHADOW;
+pub const POINTER_BEAM_SHADOW: u32 = POINTER_FILL;
+/// `(fill, shadow)` per `una_abi::CURSOR_*` index; the width is asserted against `CURSOR_SHAPES` in `video/cursor.rs`.
+pub const POINTER_SHAPE_INK: [(u32, u32); 8] = [
+    (POINTER_FILL, POINTER_SHADOW),           // arrow
+    (POINTER_FILL, POINTER_SHADOW),           // hand
+    (POINTER_BEAM_FILL, POINTER_BEAM_SHADOW), // text beam
+    (POINTER_FILL, POINTER_SHADOW),           // crosshair
+    (POINTER_FILL, POINTER_SHADOW),           // move
+    (POINTER_FILL, POINTER_SHADOW),           // resize-ns
+    (POINTER_FILL, POINTER_SHADOW),           // resize-ew
+    (POINTER_FILL, POINTER_SHADOW),           // busy
+];

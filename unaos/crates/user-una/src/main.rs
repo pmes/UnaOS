@@ -29,6 +29,8 @@
 // (or Alt/Cmd) + 1/2/3 — and that is the chord this program reads. Esc cycles the focus too (one key, no chord).
 // A click focuses the pane under the pointer; the pointer is the one the kernel delivers (AETHERPTR, rmbp-ledger
 // B543): every INPUT_EV_MOUSE_ABS carries the system pointer in this window's pixels, so nothing here estimates it.
+// CURSORSHAPE (rmbp-ledger B550): each one also asks the compositor for the pointer's shape (`SYS_CURSOR_SHAPE`) —
+// the text beam over the editor pane, the arrow over the tree, the console and outside the window.
 //
 // GLOBAL KEYS. Ctrl+S save the editor's file; Ctrl+O open the tree's selected file; Ctrl+Q quit (and a window
 // close request). Everything else goes to the focused pane (tree.rs, editor.rs, console.rs say their keys).
@@ -46,7 +48,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use una_abi::{
     input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP,
-    INPUT_EV_MOUSE_ABS, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
+    INPUT_EV_MOUSE_ABS, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT, CURSOR_ARROW, CURSOR_TEXT,
+    SYS_CURSOR_SHAPE,
 };
 use vein_ring3::sys::{sleep_ms, sys, write};
 
@@ -634,7 +637,15 @@ pub extern "C" fn _start() -> ! {
                         app.ed.action(p as u8);
                     }
                 }
-                INPUT_EV_MOUSE_ABS => app.ptr = Some(una_abi::input_ev_xy(p)),
+                INPUT_EV_MOUSE_ABS => {
+                    let (x, y) = una_abi::input_ev_xy(p);
+                    app.ptr = Some((x, y));
+                    // CURSORSHAPE (B550): the beam over the editor, the arrow elsewhere. Asked on every pointer
+                    // event, uncached (a focus change resets the shape behind this program's back); the answer
+                    // is ignored — a kernel without the verb leaves the arrow.
+                    let shape = if R_ED.has(x, y) { CURSOR_TEXT } else { CURSOR_ARROW };
+                    let _ = sys(SYS_CURSOR_SHAPE, shape, 0, 0, 0);
+                }
                 INPUT_EV_BUTTON => app.button(p as u8),
                 INPUT_EV_CLOSE_REQ => app.quit(),
                 _ => {}
