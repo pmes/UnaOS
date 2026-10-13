@@ -502,6 +502,12 @@ pub enum Event {
 /// Where a connection thread sends events. `false` = the receiver is gone (the exchange is abandoned).
 pub trait EventSink: Send {
     fn send(&mut self, ev: Event) -> bool;
+    /// NETDEBT (SR97): send without waiting — an h2 connection serves many streams on one thread and must not
+    /// block on one slow reader. `Full` hands the event back to be offered again. Default: the blocking `send`
+    /// (a sink that cannot tell is never full).
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        if self.send(ev) { TrySend::Sent } else { TrySend::Gone }
+    }
     /// NETDEBT (SR97): the TLS peer of the connection that is about to answer this exchange, told before its
     /// `Head` (again if the job moves to another connection). Default: ignored. [`WithPeer`] keeps it.
     fn peer(&mut self, _chain: &Arc<PeerChain>) {}
@@ -545,6 +551,9 @@ impl<S: EventSink> EventSink for WithPeer<S> {
     fn send(&mut self, ev: Event) -> bool {
         self.inner.send(ev)
     }
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        self.inner.try_send(ev)
+    }
     fn peer(&mut self, chain: &Arc<PeerChain>) {
         if let Ok(mut s) = self.slot.lock() {
             *s = Some(chain.clone());
@@ -553,9 +562,26 @@ impl<S: EventSink> EventSink for WithPeer<S> {
     }
 }
 
+/// What [`EventSink::try_send`] did.
+#[derive(Debug)]
+pub enum TrySend {
+    Sent,
+    /// The receiver has no room now: the event, to offer again later.
+    Full(Event),
+    /// The receiver is gone (the exchange is abandoned).
+    Gone,
+}
+
 impl EventSink for SyncSender<Event> {
     fn send(&mut self, ev: Event) -> bool {
         SyncSender::send(self, ev).is_ok()
+    }
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        match SyncSender::try_send(self, ev) {
+            Ok(()) => TrySend::Sent,
+            Err(mpsc::TrySendError::Full(ev)) => TrySend::Full(ev),
+            Err(mpsc::TrySendError::Disconnected(_)) => TrySend::Gone,
+        }
     }
 }
 
@@ -1442,6 +1468,10 @@ struct MuxStream {
     head: bool,
     /// A followed redirect: its body is read and dropped.
     drain: bool,
+    /// NETDEBT (SR97): a chunk the reader had no room for. While it is held the stream's DATA stays in
+    /// `H2Conn`'s buffer, untaken, so its flow-control window is not re-opened: the server stops on THIS stream
+    /// at RECV_WINDOW, and the connection thread goes on serving the others.
+    held: Option<Event>,
 }
 
 /// NETDEBT (SR97): a content-coded body on a multiplexed stream is decoded AS IT ARRIVES, on a thread of its
@@ -1471,6 +1501,19 @@ impl EventSink for DecodeSink {
             Event::Head(_) => true, // the head went to the real sink before the swap
         }
     }
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        let feed = match ev {
+            Event::Data(d) => Feed::Chunk(d),
+            Event::End(r) => Feed::End(r),
+            Event::Head(_) => return TrySend::Sent,
+        };
+        match self.feed.try_send(feed) {
+            Ok(()) => TrySend::Sent,
+            Err(mpsc::TrySendError::Full(Feed::Chunk(d))) => TrySend::Full(Event::Data(d)),
+            Err(mpsc::TrySendError::Full(Feed::End(r))) => TrySend::Full(Event::End(r)),
+            Err(mpsc::TrySendError::Disconnected(_)) => TrySend::Gone,
+        }
+    }
 }
 
 /// Start a decoder for `coding` that delivers to `sink` (dropped with the closure if the thread cannot start).
@@ -1497,6 +1540,8 @@ fn spawn_decoder(sink: Box<dyn EventSink>, coding: Coding) -> Result<DecodeSink,
 
 enum Pump {
     Pending,
+    /// The reader has no room: the stream waits for it (not for the server).
+    Stalled,
     Done(Result<(), Error>),
     /// The receiver went away: cancel the stream.
     Gone,
@@ -1560,6 +1605,17 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
             }
         }
     }
+    // Never block on the reader: offer, and hold what it has no room for.
+    if let Some(ev) = m.held.take() {
+        match m.job.sink.try_send(ev) {
+            TrySend::Sent => {}
+            TrySend::Full(ev) => {
+                m.held = Some(ev);
+                return Pump::Stalled;
+            }
+            TrySend::Gone => return Pump::Gone,
+        }
+    }
     loop {
         match h2c.try_data(sid) {
             Err(e) => return Pump::Done(Err(e)),
@@ -1569,8 +1625,13 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
                 if m.drain {
                     continue;
                 }
-                if !m.job.sink.send(Event::Data(d)) {
-                    return Pump::Gone;
+                match m.job.sink.try_send(Event::Data(d)) {
+                    TrySend::Sent => {}
+                    TrySend::Full(ev) => {
+                        m.held = Some(ev);
+                        return Pump::Stalled;
+                    }
+                    TrySend::Gone => return Pump::Gone,
                 }
             }
         }
@@ -1593,6 +1654,8 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
         queue.extend(c.take());
     }
     let mut active: alloc::collections::BTreeMap<u32, MuxStream> = alloc::collections::BTreeMap::new();
+    // NETDEBT (SR97): finished streams whose End the reader had no room for yet (offered again each turn).
+    let mut ending: Vec<(Box<dyn EventSink>, Event)> = Vec::new();
     let mut proven = false;
     let mut last_progress = Instant::now();
     let timeout = inner.cfg.timeout;
@@ -1621,7 +1684,7 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
             let authority = job.url.host_str();
             match h2c.send_request(&job.method, &key.scheme, &authority, &job.url.request_target(), &job.headers, &body) {
                 Ok(sid) => {
-                    active.insert(sid, MuxStream { job, head: false, drain: false });
+                    active.insert(sid, MuxStream { job, head: false, drain: false, held: None });
                 }
                 Err(e) => {
                     // The connection cannot carry it (write failed, GOAWAY): a job on a connection that
@@ -1635,7 +1698,13 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
                 }
             }
         }
+        for (mut sink, ev) in core::mem::take(&mut ending) {
+            if let TrySend::Full(ev) = sink.try_send(ev) {
+                ending.push((sink, ev));
+            }
+        }
         // Progress every stream from what is buffered (send_request may have read frames for others).
+        let mut waiting_on_readers = !ending.is_empty();
         let ids: Vec<u32> = active.keys().copied().collect();
         for sid in ids {
             let m = active.get_mut(&sid).expect("listed");
@@ -1645,10 +1714,15 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
             }
             match r {
                 Pump::Pending => {}
+                Pump::Stalled => waiting_on_readers = true,
                 Pump::Done(res) => {
                     h2c.close_stream(sid);
-                    let mut m = active.remove(&sid).expect("listed");
-                    m.job.sink.send(Event::End(res));
+                    let m = active.remove(&sid).expect("listed");
+                    let mut sink = m.job.sink;
+                    if let TrySend::Full(ev) = sink.try_send(Event::End(res)) {
+                        ending.push((sink, ev));
+                        waiting_on_readers = true;
+                    }
                 }
                 Pump::Gone => {
                     active.remove(&sid);
@@ -1661,7 +1735,11 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
                 }
             }
         }
-        if active.is_empty() {
+        if waiting_on_readers {
+            // The connection is waiting on our readers, not on the server: that is not an idle socket.
+            last_progress = Instant::now();
+        }
+        if active.is_empty() && ending.is_empty() {
             if !queue.is_empty() {
                 if h2c.can_open() {
                     continue;
@@ -1710,6 +1788,9 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
     }
     for j in queue {
         retry(j, Error::Io("h2: connection closed before the request was sent".into()));
+    }
+    for (mut sink, ev) in ending {
+        sink.send(ev); // the connection is ending: wait for these readers
     }
     let why = conn_err.unwrap_or_else(|| Error::Io("h2: connection closed".into()));
     for (sid, mut m) in active {

@@ -547,6 +547,15 @@ impl EventSink for TokioSink {
     fn send(&mut self, ev: Event) -> bool {
         self.0.blocking_send(ev).is_ok()
     }
+    /// NETDEBT (SR97): an h2 connection offers each stream's chunks without waiting, so a slow reader slows
+    /// only its own stream.
+    fn try_send(&mut self, ev: Event) -> host::TrySend {
+        match self.0.try_send(ev) {
+            Ok(()) => host::TrySend::Sent,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => host::TrySend::Full(ev),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => host::TrySend::Gone,
+        }
+    }
 }
 
 /// Builder for [`Client`].

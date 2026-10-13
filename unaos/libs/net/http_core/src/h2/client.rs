@@ -11,6 +11,13 @@
 //! ([`H2Conn::step_frame`], when [`H2Conn::has_buffered_frame`] or its socket says bytes wait) and polls every open
 //! stream without blocking ([`H2Conn::try_head`], [`H2Conn::try_data`]). GOAWAY marks every stream above its
 //! last-stream-id REFUSED (§6.8: never processed, safe to retry on a new connection — [`H2Conn::refused`]).
+//!
+//! Receive flow control (NETDEBT, SR97; §5.2, §6.9): each stream's window ([`RECV_WINDOW`]) is credited back
+//! only for bytes its CONSUMER has taken ([`H2Conn::try_data`] popping them), so a stream whose reader stalls
+//! stops its server at that window while every other stream keeps flowing. The connection window
+//! ([`CONN_RECV_WINDOW`]) is credited as DATA is received: what is buffered is already bounded per stream, and
+//! one stalled stream must not starve the connection. Frames that arrive for a stream this side already closed
+//! or reset (§5.1 "closed") are discarded — their header blocks still decoded, so HPACK state stays in step.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -21,17 +28,24 @@ use super::hpack::{Decoder, Encoder};
 use crate::conn::{Error, Transport};
 use crate::headers::Headers;
 
-/// Our receive window per stream and for the connection (we read eagerly; 4 MiB keeps a fast link busy).
+/// Our receive window per stream (4 MiB keeps a fast link busy): the most a stream buffers for its reader.
 pub const RECV_WINDOW: u32 = 4 << 20;
+/// Our connection receive window (credited on receipt; see the module text).
+pub const CONN_RECV_WINDOW: u32 = 16 << 20;
 const OUR_MAX_FRAME: u32 = frame::DEFAULT_MAX_FRAME_SIZE;
 
 #[derive(Debug, Default)]
 struct Stream {
     send_window: i64,
-    recv_consumed: u32,
+    /// Flow-controlled bytes received and not yet credited back (buffered + taken-but-uncredited): never more
+    /// than RECV_WINDOW, or the peer overran the window.
+    recv_outstanding: u32,
+    /// Bytes the consumer has taken (or padding) not yet credited back with WINDOW_UPDATE.
+    recv_taken: u32,
     head: Option<(u16, Headers)>,
     trailers: Option<Headers>,
-    data: alloc::collections::VecDeque<Vec<u8>>,
+    /// DATA payloads with the flow-controlled length each counted (padding included).
+    data: alloc::collections::VecDeque<(Vec<u8>, u32)>,
     end: bool,
     reset: Option<ErrorCode>,
 }
@@ -84,7 +98,7 @@ impl<T: Transport> H2Conn<T> {
             (frame::SETTINGS_HEADER_TABLE_SIZE, 4096),
         ]);
         out.extend(frame::encode(frame::SETTINGS, 0, 0, &settings));
-        out.extend(frame::encode(frame::WINDOW_UPDATE, 0, 0, &(RECV_WINDOW - 65_535).to_be_bytes()));
+        out.extend(frame::encode(frame::WINDOW_UPDATE, 0, 0, &(CONN_RECV_WINDOW - 65_535).to_be_bytes()));
         t.write_all(&out)?;
         let mut c = H2Conn {
             t,
@@ -243,7 +257,8 @@ impl<T: Transport> H2Conn<T> {
             Frame::PushPromise { .. } => return Err(self.fail(ErrorCode::Protocol)), // push was disabled
             Frame::Priority { .. } | Frame::Unknown { .. } => {}
             Frame::Headers { stream, block, end_stream, end_headers, .. } => {
-                if !self.streams.contains_key(&stream) {
+                // An idle (never opened) stream is a protocol error; a closed one is discarded after decoding.
+                if !self.streams.contains_key(&stream) && !self.was_opened(stream) {
                     return Err(self.fail(ErrorCode::Protocol));
                 }
                 if end_headers {
@@ -267,20 +282,30 @@ impl<T: Transport> H2Conn<T> {
                 }
             }
             Frame::Data { stream, data, end_stream, flow_len } => {
-                // Flow control counts the whole payload, padding included (§6.9.1).
+                // Flow control counts the whole payload, padding included (§6.9.1). The connection window is
+                // credited on receipt (the per-stream windows bound what is buffered).
                 self.conn_recv_consumed += flow_len;
+                if self.conn_recv_consumed >= CONN_RECV_WINDOW / 2 {
+                    let n = core::mem::take(&mut self.conn_recv_consumed);
+                    self.t.write_all(&frame::encode(frame::WINDOW_UPDATE, 0, 0, &n.to_be_bytes()))?;
+                }
                 let Some(st) = self.streams.get_mut(&stream) else {
+                    if self.was_opened(stream) {
+                        return Ok(()); // a stream we closed or cancelled: frames in flight are discarded (§5.1)
+                    }
                     return Err(self.fail(ErrorCode::Protocol));
                 };
                 if st.end {
                     return self.rst(stream, ErrorCode::StreamClosed);
                 }
-                st.recv_consumed += flow_len;
-                if st.recv_consumed > RECV_WINDOW {
+                st.recv_outstanding += flow_len;
+                if st.recv_outstanding > RECV_WINDOW {
                     return self.rst(stream, ErrorCode::FlowControl);
                 }
-                if !data.is_empty() {
-                    st.data.push_back(data);
+                if data.is_empty() {
+                    st.recv_taken += flow_len; // padding only: nothing for the consumer to take
+                } else {
+                    st.data.push_back((data, flow_len));
                 }
                 st.end |= end_stream;
             }
@@ -288,11 +313,19 @@ impl<T: Transport> H2Conn<T> {
         Ok(())
     }
 
+    /// Was `id` a stream this side opened (client-initiated, below the next id)?
+    fn was_opened(&self, id: u32) -> bool {
+        id % 2 == 1 && id < self.next_stream
+    }
+
     fn on_header_block(&mut self, stream: u32, block: &[u8], end_stream: bool) -> Result<(), Error> {
         let fields = match self.dec.decode(block) {
             Ok(f) => f,
             Err(_) => return Err(self.fail(ErrorCode::Compression)),
         };
+        if !self.streams.contains_key(&stream) {
+            return Ok(()); // a closed stream's block: decoded for the HPACK state, then dropped
+        }
         let mut status: Option<u16> = None;
         let mut headers = Headers::new();
         let mut malformed = false;
@@ -458,19 +491,15 @@ impl<T: Transport> H2Conn<T> {
         {
             self.check_reset(id)?;
             let st = self.streams.get_mut(&id).ok_or(Error::Io("h2: unknown stream".into()))?;
-            if let Some(d) = st.data.pop_front() {
-                // Re-open the windows once half is used.
-                let mut out = Vec::new();
-                if st.recv_consumed >= RECV_WINDOW / 2 {
-                    out.extend(frame::encode(frame::WINDOW_UPDATE, 0, id, &st.recv_consumed.to_be_bytes()));
-                    st.recv_consumed = 0;
-                }
-                if self.conn_recv_consumed >= RECV_WINDOW / 2 {
-                    out.extend(frame::encode(frame::WINDOW_UPDATE, 0, 0, &self.conn_recv_consumed.to_be_bytes()));
-                    self.conn_recv_consumed = 0;
-                }
-                if !out.is_empty() && !st.end {
-                    self.t.write_all(&out)?;
+            if let Some((d, flow_len)) = st.data.pop_front() {
+                // The consumer took these bytes: re-open the stream's window once half of it is taken.
+                st.recv_taken += flow_len;
+                if st.recv_taken >= RECV_WINDOW / 2 {
+                    let n = core::mem::take(&mut st.recv_taken);
+                    st.recv_outstanding = st.recv_outstanding.saturating_sub(n);
+                    if !st.end {
+                        self.t.write_all(&frame::encode(frame::WINDOW_UPDATE, 0, id, &n.to_be_bytes()))?;
+                    }
                 }
                 return Ok(DataPoll::Chunk(d));
             }
