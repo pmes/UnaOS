@@ -141,3 +141,9 @@ impl Texture {
         true
     }
 }
+
+/// Sample a complete texture (ES 2.0 §3.7.7–§3.7.9). The filtering arrives with the texture stage of the
+/// series; until then every lookup answers the incomplete-texture value.
+pub fn sample(_t: &Texture, _cube: bool, _coord: [f32; 3], _lod: crate::vm::Lod) -> [f32; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}

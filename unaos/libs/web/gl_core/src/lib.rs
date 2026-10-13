@@ -11,6 +11,7 @@
 //!   [`object`] / [`texture`] / [`framebuffer`] — the objects, completeness.
 //! * [`glsl`] — GLSL ES 1.00: preprocessor, parser, semantics, code generation; [`vm`] — the register
 //!   bytecode and its interpreter; [`link`] — program link; [`program`] — shader and program objects.
+//! * [`raster`] — draws, clipping, rasterization, per-fragment operations, clear, readPixels, presentation.
 //!
 //! `no_std` + `alloc`, no dependencies, no `unsafe`.
 #![no_std]
@@ -26,6 +27,7 @@ pub mod glsl;
 pub mod link;
 pub mod object;
 pub mod program;
+pub mod raster;
 pub mod texture;
 pub mod vm;
 
