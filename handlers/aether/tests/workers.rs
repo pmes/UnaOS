@@ -311,3 +311,24 @@ fn a_same_origin_worker_loads_through_the_page_loader() {
     assert_eq!(run_until(&mut p, "a !== null", "a", 20), "hi!|/w.js");
     assert_eq!(run_until(&mut p, "b !== null", "b", 20), "mod:x|TypeError", "a module worker imports statically and refuses importScripts");
 }
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 1
+
+/// `terminate()` of a worker spinning in a loop that calls nothing: the kill flag is the realm's
+/// `Vm::interrupt`, which js_core checks beside the instruction budget, so the thread stops at its next
+/// instruction. Without it the loop runs out its whole task budget (`js::TASK_BUDGET`, 400M instructions,
+/// seconds of interpretation); the bound below is far inside one budget.
+#[test]
+fn terminate_interrupts_a_loop_that_calls_nothing() {
+    let spinner = data_url("postMessage('spinning'); while (true) {}");
+    let mut p = page(PAGE, &format!("var s = null; var w = new Worker('{spinner}'); w.onmessage = function (e) {{ s = e.data; }};"));
+    let doc = aether::js::broadcast::doc();
+    assert_eq!(run_until(&mut p, "s !== null", "s", 20), "spinning");
+    assert_eq!(aether::workers::dedicated::threads(doc), 1, "the worker thread is spinning");
+    eval(&mut p, "w.terminate();");
+    let t0 = Instant::now();
+    while aether::workers::dedicated::threads(doc) > 0 {
+        assert!(t0.elapsed() < Duration::from_millis(1000), "the spinning worker was not interrupted within one TASK_BUDGET");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

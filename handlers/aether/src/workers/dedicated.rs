@@ -37,11 +37,11 @@
 //! js_core's error traces carry no source positions.
 //!
 //! `worker.terminate()` (and the document going away) sets the worker's kill flag, drops it from the registry
-//! so nothing more is delivered, and wakes the thread with `Stop`. js_core has no cross-thread interrupt — the
-//! instruction budget is its only preemption point (`vm/interp.rs` run_inner) — so the thread stops at its next
-//! CHECKPOINT: between tasks, or inside a task at the next call into any worker native (each checks the flag
-//! and, if set, zeroes `vm.budget`, which terminates the script at its next instruction with `vm.terminated`).
-//! A pure compute loop that calls nothing stops when its task budget runs out.
+//! so nothing more is delivered, and wakes the thread with `Stop`. The kill flag is also the realm's
+//! `Vm::interrupt` (AETHERWORKERS2, SR125): js_core checks it beside the instruction budget in `run_inner` and
+//! `Vm::tick`, so a running script — a pure compute loop that calls nothing included — stops at its next
+//! instruction, `vm.terminated` set, exactly as an exhausted budget stops it. Between tasks the loop checks
+//! the flag; the natives' `checkpoint_kill` stays as the belt to that brace.
 
 use js_core::vm::*;
 use serde_json::json;
@@ -95,7 +95,8 @@ pub struct Spawn {
 }
 
 struct Shared {
-    kill: AtomicBool,
+    /// Set by `terminate` (and at thread exit); the realm's `Vm::interrupt`.
+    kill: Arc<AtomicBool>,
     /// Commands sent and not yet run (plus the script evaluation, until it ends).
     pending: AtomicUsize,
     /// A timer is due within [`SOON_MS`].
@@ -123,7 +124,7 @@ pub fn next_id() -> u64 {
 /// Starts the worker thread. The script is evaluated on it; its errors arrive at the page as `worker-error`.
 pub fn spawn(sp: Spawn) -> Result<(), String> {
     let (tx, rx) = channel::<Cmd>();
-    let shared = Arc::new(Shared { kill: AtomicBool::new(false), pending: AtomicUsize::new(1), timer_soon: AtomicBool::new(false) });
+    let shared = Arc::new(Shared { kill: Arc::new(AtomicBool::new(false)), pending: AtomicUsize::new(1), timer_soon: AtomicBool::new(false) });
     let id = sp.id;
     workers().insert(id, Handle { doc: sp.doc, tx, shared: shared.clone() });
     let r = std::thread::Builder::new().name("aether-dedicated-worker".into()).stack_size(8 << 20).spawn(move || worker_main(sp, rx, shared));
@@ -470,8 +471,10 @@ fn next_due(vm: &Vm) -> Option<f64> {
 }
 
 /// Builds the DedicatedWorkerGlobalScope realm.
-fn build(sp: &Spawn) -> Vm {
+fn build(sp: &Spawn, shared: &Shared) -> Vm {
     let mut vm = Vm::new(Box::new(WorkerHost { url: sp.url.clone(), modules: 0 }));
+    // terminate() interrupts the running script at its next instruction (js_core vm/interp.rs run_inner).
+    vm.interrupt = Some(shared.kill.clone());
     js_core::builtins::host::install_host_globals(&mut vm);
     super::realm::install_shared(&mut vm);
     let g = vm.realm().global;
@@ -520,7 +523,7 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
     crate::js::ports::set_worker_owner(Some(sp.id));
     super::realm::enter(super::realm::RealmCtx { key: sp.storage_key.clone(), scope: String::new(), script_url: sp.url.clone() });
     W.with(|w| *w.borrow_mut() = Some(WState { id: sp.id, doc: sp.doc, url: sp.url.clone(), kind: sp.kind, shared: shared.clone(), closing: false, start: Instant::now() }));
-    let mut vm = build(&sp);
+    let mut vm = build(&sp, &shared);
     let (kind, url, source) = (sp.kind, sp.url.clone(), sp.source.clone());
     task(&mut vm, Some(&source), |vm| match kind {
         Kind::Classic => vm.run_script_str(&source).map(|_| ()),
