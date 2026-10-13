@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), una_abi::SYS_PIPE_WRITE => sys_pipe_write(a0, a1, a2), una_abi::SYS_KILL => sys_kill(a0), // SHELLABI (B612): the launcher's write into its child's input ring and its kill of that child, bodies at the FILE TAIL (same-line fold). RING3PIPE (B609): the launcher's read of its child's console, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), una_abi::SYS_PIPE_WRITE => sys_pipe_write(a0, a1, a2), una_abi::SYS_KILL => sys_kill(a0), una_abi::SYS_AUDIO_OPEN => sys_audio_open(a0, a1, a2), una_abi::SYS_AUDIO_WRITE => sys_audio_write(a0, a1, a2), una_abi::SYS_AUDIO_CLOSE => sys_audio_close(a0), una_abi::SYS_AUDIO_POS => sys_audio_pos(a0, a1), // STRIAMETAL (B618): the ring-3 audio stream 73..=76, bodies at the FILE TAIL (same-line fold). SHELLABI (B612): the launcher's write into its child's input ring and its kill of that child, bodies at the FILE TAIL (same-line fold). RING3PIPE (B609): the launcher's read of its child's console, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1, a2), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -31452,4 +31452,95 @@ pub fn launch_push(handle: u64, packed: u64) -> bool {
 /// ARMTESTS: events sitting unread in the ring of the program the launch `handle` names.
 pub fn launch_depth(handle: u64) -> u32 {
     user_input_depth(owner_of_launch(handle))
+}
+
+// =================================================================================================
+// STRIAMETAL (rmbp-ledger B618; LEDGER SR139) — this arch's half of una-abi's STRIAMETAL block: `SYS_AUDIO_OPEN` (73),
+// `SYS_AUDIO_WRITE` (74), `SYS_AUDIO_CLOSE` (75), `SYS_AUDIO_POS` (76) over `drivers::hda::play`'s ring-3 stream
+// (hda_play.rs tail). TAIL-APPENDED; above this block the arc is ONE same-line fold, the dispatch arm beside SYS_KILL.
+//
+// * THE KEY is RING3PIPE's: the caller's process slot (`caller_row()`) and its tenant generation (`pipe_gen`, i.e.
+//   SLOT_GEN), with `pipe_alive` as the liveness compare the device-service tick runs to reap a stream whose owner
+//   exited — the same (row, generation) pair B609's pipes are reclaimed by, never a hook in the teardown.
+// * The PCM is copied in through `copy_from_user` (the whole range validated first), at most AUDIO_WRITE_MAX per call.
+// * Without UNAOS_HDATONE (`hda-tone`) this kernel has no output stream: the open is refused BY NAME,
+//   `refused=no-hda-stream`, -ENODEV, and the other three verbs answer -EBADF (no handle can exist).
+// =================================================================================================
+
+/// STRIAMETAL: the caller's pid for the wire (0 for the shared kernel row).
+fn audio_pid(row: usize) -> u64 {
+    appquit_pid(row as u64 + 1).unwrap_or(0)
+}
+
+/// STRIAMETAL: `SYS_AUDIO_OPEN(rate, channels, bits)` — see una-abi's block.
+fn sys_audio_open(rate: u64, ch: u64, bits: u64) -> i64 {
+    let row = caller_row();
+    let pid = audio_pid(row);
+    #[cfg(feature = "hda-tone")]
+    {
+        match crate::drivers::hda::play::r3_open(row, pipe_gen(row), pipe_alive, pid, rate, ch, bits) {
+            Ok(h) => {
+                serial_println!("[audio] open pid={} rate={} ch={} bits={} -> ok handle={}", pid, rate, ch, bits, h);
+                h as i64
+            }
+            Err((e, why)) => {
+                serial_println!("[audio] open pid={} rate={} ch={} bits={} -> refused={} errno={}", pid, rate, ch, bits, why, e);
+                e
+            }
+        }
+    }
+    #[cfg(not(feature = "hda-tone"))]
+    {
+        serial_println!("[audio] open pid={} rate={} ch={} bits={} -> refused=no-hda-stream (this kernel was built without UNAOS_HDATONE)", pid, rate, ch, bits);
+        una_abi::ENODEV
+    }
+}
+
+/// STRIAMETAL: `SYS_AUDIO_WRITE(handle, buf, len)` — PCM in (`len == 0` = end of stream).
+fn sys_audio_write(handle: u64, buf: u64, len: u64) -> i64 {
+    #[cfg(feature = "hda-tone")]
+    {
+        let row = caller_row();
+        let n = (len as usize).min(una_abi::AUDIO_WRITE_MAX);
+        let mut k = alloc::vec![0u8; n];
+        if n > 0 {
+            if let Err(e) = copy_from_user(&mut k, buf) {
+                return e;
+            }
+        }
+        crate::drivers::hda::play::r3_write(handle, row, pipe_gen(row), &k)
+    }
+    #[cfg(not(feature = "hda-tone"))]
+    {
+        let _ = (handle, buf, len);
+        una_abi::EBADF
+    }
+}
+
+/// STRIAMETAL: `SYS_AUDIO_CLOSE(handle)` — stop now, free the output.
+fn sys_audio_close(handle: u64) -> i64 {
+    #[cfg(feature = "hda-tone")]
+    {
+        let row = caller_row();
+        crate::drivers::hda::play::r3_close(handle, row, pipe_gen(row))
+    }
+    #[cfg(not(feature = "hda-tone"))]
+    {
+        let _ = handle;
+        una_abi::EBADF
+    }
+}
+
+/// STRIAMETAL: `SYS_AUDIO_POS(handle, what)` — frames played (the A/V clock) or the underrun count.
+fn sys_audio_pos(handle: u64, what: u64) -> i64 {
+    #[cfg(feature = "hda-tone")]
+    {
+        let row = caller_row();
+        crate::drivers::hda::play::r3_pos(handle, row, pipe_gen(row), what)
+    }
+    #[cfg(not(feature = "hda-tone"))]
+    {
+        let _ = (handle, what);
+        una_abi::EBADF
+    }
 }

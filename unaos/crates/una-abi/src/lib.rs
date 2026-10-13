@@ -2668,3 +2668,66 @@ pub const KEY_EOT: u8 = 0x04;
 /// SHELLABI: broken pipe — `SYS_PIPE_WRITE` to a child that has exited.
 pub const EPIPE: i64 = -32;
 const _: () = assert!(SYS_PIPE_READ == SYS_CURSOR_SHAPE + 1 && SYS_PIPE_WRITE == SYS_PIPE_READ + 1 && SYS_KILL == SYS_PIPE_WRITE + 1 && SPAWN_FLAGS & SPAWN_ARGC_MASK == 0 && ARGS_MAX as u64 <= SPAWN_ARGC_MASK);
+
+// =================================================================================================
+// STRIAMETAL (rmbp-ledger B618; LEDGER SR139 — Stria, CODEX §2 A/V, playing natively as APPS/STRIA.ELF) — ring 3's
+// AUDIO OUT. Until this block a ring-3 program could draw (SYS_WIN_PRESENT) but not sound: the kernel played PCM only
+// for itself (`drivers/hda_play.rs`, `play <file>`, the Player window). FOUR verbs, one stream:
+//
+//   open   `SYS_AUDIO_OPEN(rate, channels, bits)` -> handle > 0. rate AUDIO_RATE_MIN..=AUDIO_RATE_MAX Hz, channels 1|2,
+//          bits 8|16 (unsigned 8-bit / signed 16-bit LE, interleaved) — anything else -EINVAL. ONE stream per program
+//          (a second open while the caller holds one: -EEXIST) and one system-wide (the machine has one output
+//          stream): another program's live stream, or the kernel's own player sounding, is -EBUSY. A machine with no
+//          sink this arch drives is -ENODEV, refused BY NAME on the wire. The answer comes at once; the output path is
+//          brought up on the kernel's device-service tick, never on the caller's 16 KiB syscall stack, so until it is
+//          armed every write answers -EAGAIN (a program simply keeps offering its buffer).
+//   write  `SYS_AUDIO_WRITE(handle, buf, len)` -> bytes taken (> 0, whole frames, at most AUDIO_WRITE_MAX per call) or
+//          -EAGAIN (the ring is full or still arming — keep the bytes, offer them again). The stream starts once about
+//          a ring's worth is queued; between writes it plays what it holds and counts an UNDERRUN for every period it
+//          had to pad. `len == 0` is END OF STREAM: what is queued plays out, then the stream stops itself. -EBADF a
+//          handle the caller does not hold; -EIO the stream died (its bring-up was refused, or the kernel's player took
+//          the output) — close it, the clock is the caller's own from then on.
+//   close  `SYS_AUDIO_CLOSE(handle)` -> 0: the stream stops NOW (nothing queued plays) and the output is free. -EBADF.
+//   pos    `SYS_AUDIO_POS(handle, what)`: `what` = AUDIO_POS_PLAYED -> source frames PLAYED since the stream ran — the
+//          clock a player syncs its pictures to; capped at the frames written, so an underrun HOLDS the clock instead
+//          of running it over silence; 0 until the stream runs. AUDIO_POS_UNDERRUNS -> the stream's underrun count.
+//          -EBADF, -EINVAL an unknown `what`.
+//
+// TEARDOWN is RING3PIPE's reap shape (B609): the stream is keyed by its opener's (row, generation) — x86's process
+// slot and SLOT_GEN — so the owner's exit is seen as a generation that moved, and the next device-service tick stops
+// the stream and frees the output (`[audio] close … reason=owner-exited`). A program that dies mid-song is silent
+// within a tick, never a ring looping its last period.
+//
+// ARCHES. x86: over `drivers::hda::play` (the PLAYWAV ring: `start` / `feed` / `finish` / `stop`), built with
+// UNAOS_HDATONE; an x86 kernel without it refuses `refused=no-hda-stream`. aarch64: refused by name,
+// `[audio] open … -> refused=no-aarch64-sink (…)` — the Pi 4's audio is HDMI and PWM with no driver in this tree, the
+// Orin's is its HDA behind the APE with no driver, QEMU virt carries no audio device; the program plays on the
+// kernel's clock instead. WIRE: `[audio] open pid=<p> rate=<r> ch=<c> bits=<b> -> ok handle=<h>|refused=<why>`,
+// `[audio] arm handle=<h> eff_rate=<e> resampled=<0|1> -> ok|refused=<why>`, `[audio] close handle=<h> pid=<p>
+// reason=<close|owner-exited|superseded> frames=<f> underruns=<u>`.
+// Numbered 73..=76: the next free numbers after SHELLABI's SYS_KILL (72), the tail-append order.
+// =================================================================================================
+
+/// STRIAMETAL (B618): `SYS_AUDIO_OPEN(rate, channels, bits)` — see the block above.
+pub const SYS_AUDIO_OPEN: u64 = 73; // after SHELLABI's SYS_KILL (72)
+/// STRIAMETAL (B618): `SYS_AUDIO_WRITE(handle, buf, len)` — PCM in; `len == 0` = end of stream.
+pub const SYS_AUDIO_WRITE: u64 = 74; // after SYS_AUDIO_OPEN (73)
+/// STRIAMETAL (B618): `SYS_AUDIO_CLOSE(handle)` — stop now, free the output.
+pub const SYS_AUDIO_CLOSE: u64 = 75; // after SYS_AUDIO_WRITE (74)
+/// STRIAMETAL (B618): `SYS_AUDIO_POS(handle, what)` — the stream's clock (frames played) or its underrun count.
+pub const SYS_AUDIO_POS: u64 = 76; // after SYS_AUDIO_CLOSE (75)
+/// `SYS_AUDIO_POS`'s `what`: source frames played (the A/V clock).
+pub const AUDIO_POS_PLAYED: u64 = 0;
+/// `SYS_AUDIO_POS`'s `what`: periods the stream padded because nothing was queued.
+pub const AUDIO_POS_UNDERRUNS: u64 = 1;
+/// The lowest and highest source rate `SYS_AUDIO_OPEN` takes (the output resamples what its codec refuses).
+pub const AUDIO_RATE_MIN: u32 = 8_000;
+pub const AUDIO_RATE_MAX: u32 = 48_000;
+/// The most bytes one `SYS_AUDIO_WRITE` takes (a larger `len` is taken up to this, whole frames).
+pub const AUDIO_WRITE_MAX: usize = 16 * 1024;
+/// Device or resource busy — `SYS_AUDIO_OPEN` while another program's stream (or the kernel's player) holds the output.
+pub const EBUSY: i64 = -16;
+const _: () = assert!(
+    SYS_AUDIO_OPEN == SYS_KILL + 1 && SYS_AUDIO_WRITE == SYS_AUDIO_OPEN + 1 && SYS_AUDIO_CLOSE == SYS_AUDIO_WRITE + 1 && SYS_AUDIO_POS == SYS_AUDIO_CLOSE + 1
+        && AUDIO_POS_PLAYED != AUDIO_POS_UNDERRUNS && AUDIO_RATE_MIN < AUDIO_RATE_MAX && AUDIO_WRITE_MAX % 4 == 0
+);

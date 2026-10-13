@@ -139,7 +139,7 @@ pub fn start(rate: u32, channels: u8, bits: u8) -> Result<u32, &'static str> {
     if !(8_000..=48_000).contains(&rate) { return Err("rate outside 8000..48000"); }
     if channels != 1 && channels != 2 { return Err("channels must be 1 or 2"); }
     if bits != 8 && bits != 16 { return Err("bits must be 8 or 16"); }
-    stop();
+    stop(); EPOCH.fetch_add(1, Ordering::AcqRel); // STRIAMETAL (B618): every stream `start` arms is a new epoch, so a ring-3 stream sees the kernel player take the output (file tail). LINE-NEUTRAL fold.
     *ST.lock() = { let mut s = St::new(); s.src_rate = rate; s.src_ch = channels as usize; s.src_bits = bits as usize; s };
     REQ_RATE.store(rate, Ordering::Release);
     TONE_NOW.store(true, Ordering::Relaxed);
@@ -355,7 +355,7 @@ fn report() {
 pub fn service() {
     super::amp::tick(); // AUDIO8 (B329) M1: the amp's idle hold-off (idle cost: one atomic load)
     if ALERT.load(Ordering::Acquire) { alert_play(); } // NOTIFYPANE (B435): a latched alert sound (idle cost: one atomic load)
-    if TQ_LIVE.load(Ordering::Acquire) { tq_tick(); } // DECJOBHANG M3: `tests play`'s queue (idle cost: one atomic load)
+    if TQ_LIVE.load(Ordering::Acquire) { tq_tick(); } if R3_LIVE.load(Ordering::Acquire) { r3_tick(); } // STRIAMETAL (B618): the ring-3 stream's arm and its owner's reap (idle cost: one atomic load; file tail; LINE-NEUTRAL append, code before this comment). DECJOBHANG M3: `tests play`'s queue (idle cost: one atomic load)
     if !ACTIVE.load(Ordering::Acquire) { return; }
     if let Some(p) = PENDING.try_lock().and_then(|mut g| g.take()) { let _ = open_wav(&p); }
     wav_pump(); coded_pump();
@@ -1412,3 +1412,211 @@ pub fn open_facts(path: &str) -> Result<audio_core::Info, String> {
 
 /// M3: the stack `open_facts` needs (the decoder's own, measured — `DEC_STACK`).
 pub const OPEN_STACK: usize = DEC_STACK;
+
+// ── STRIAMETAL (rmbp-ledger B618) — THE RING-3 STREAM: una-abi's SYS_AUDIO_* over this file's ring ────────────────────
+// A ring-3 program (APPS/STRIA.ELF, LEDGER SR139) plays its own PCM through the SAME stream `play` and the Player use —
+// `start` / `feed` / `finish` / `stop`, nothing new under them. The x86 syscall layer (arch/x86_64/syscall.rs tail,
+// STRIAMETAL) calls the five `r3_*` doors below with the caller's (row, SLOT_GEN) and its own liveness test, the key
+// RING3PIPE's table uses (B609). Two folds above, both LINE-NEUTRAL: `start` bumps [`EPOCH`] (so a stream the kernel
+// player re-armed is seen as gone, never fed), and `service` runs [`r3_tick`] when a ring-3 stream exists.
+//
+// * OPEN never brings the output up: `start` re-runs the controller probe (`super::probe()`), deeper than a ring-3
+//   syscall's 16 KiB kernel stack should carry, so the open is LATCHED (state PENDING) and the device-service tick —
+//   the task `probe_after_root` runs on, the stack the tone's own bring-up uses — calls `start`. Until then a write
+//   answers -EAGAIN, which a program already handles as "ring full".
+// * The CLOCK is the ring's own: `position_ms`'s arithmetic (entries completed + LPIB within the current one) in the
+//   codec's frames, scaled back to the SOURCE rate (`start` may resample to 48 kHz), and CAPPED at the source frames
+//   `feed` took — an underrun pads silence, and a clock that counted the padding would run the pictures ahead of the
+//   sound.
+// * REAP: the tick asks the owner's liveness each pass (one generation compare); a dead owner's stream is stopped and
+//   the output freed (`[audio] close … reason=owner-exited`).
+
+/// Bumped by every `start` (the fold there): the epoch a ring-3 stream was armed in.
+static EPOCH: AtomicU32 = AtomicU32::new(0);
+/// A ring-3 stream exists (`service`'s one-load idle test).
+static R3_LIVE: AtomicBool = AtomicBool::new(false);
+/// The last handle minted (handles are never reused within a boot).
+static R3_HANDLE: AtomicU32 = AtomicU32::new(0);
+
+const R3_PENDING: u8 = 1;
+const R3_ARMED: u8 = 2;
+const R3_DEAD: u8 = 3;
+
+struct R3 {
+    handle: u32,
+    row: usize,
+    tgen: u64,
+    alive: fn(usize, u64) -> bool,
+    pid: u64,
+    rate: u32,
+    ch: u8,
+    bits: u8,
+    state: u8,
+    epoch: u32,
+}
+static R3S: crate::sync::Mutex<Option<R3>> = crate::sync::Mutex::new(None);
+
+/// The stream's clock and underruns off the ring: (source frames played, capped at the frames fed; underruns).
+fn r3_counts() -> (u64, u32) {
+    let s = ST.lock();
+    if s.run_ms == 0 {
+        return (0, s.underruns);
+    }
+    let bytes = s.completed * ENTRY_BYTES as u64 + (s.lpib_last as u64 % ENTRY_BYTES as u64);
+    let src = (bytes / 4) * s.src_rate as u64 / s.eff_rate.max(1) as u64;
+    (src.min(s.in_frames), s.underruns)
+}
+
+/// End a stream taken out of [`R3S`]: stop the output when it is still this stream's (never the kernel player's),
+/// and say so.
+fn r3_end(s: R3, reason: &str) {
+    let ours = s.state == R3_ARMED && EPOCH.load(Ordering::Acquire) == s.epoch;
+    let (frames, under) = if ours { r3_counts() } else { (0, 0) };
+    if ours {
+        stop();
+    }
+    serial_println!("[audio] close handle={} pid={} reason={} frames={} underruns={}", s.handle, s.pid, reason, frames, under);
+}
+
+/// `SYS_AUDIO_OPEN`'s body for the caller `(row, tgen)` (`alive` = the arch's liveness compare, `pid` for the wire):
+/// the handle, or the errno and the refusal word. The output comes up on the next [`r3_tick`].
+pub fn r3_open(row: usize, tgen: u64, alive: fn(usize, u64) -> bool, pid: u64, rate: u64, ch: u64, bits: u64) -> Result<u32, (i64, &'static str)> {
+    if !(una_abi::AUDIO_RATE_MIN as u64..=una_abi::AUDIO_RATE_MAX as u64).contains(&rate) || !(ch == 1 || ch == 2) || !(bits == 8 || bits == 16) {
+        return Err((una_abi::EINVAL, "format"));
+    }
+    let stale = {
+        let mut g = R3S.lock();
+        match g.as_ref() {
+            Some(s) if s.row == row && s.tgen == tgen => return Err((una_abi::EEXIST, "already-open")),
+            Some(s) if (s.alive)(s.row, s.tgen) => return Err((una_abi::EBUSY, "stream-held")),
+            _ => {}
+        }
+        g.take()
+    };
+    if let Some(s) = stale {
+        r3_end(s, "owner-exited");
+    }
+    if busy() || DEC_LIVE.load(Ordering::Acquire) {
+        return Err((una_abi::EBUSY, "output-sounding"));
+    }
+    let handle = R3_HANDLE.fetch_add(1, Ordering::AcqRel).wrapping_add(1).max(1);
+    *R3S.lock() = Some(R3 { handle, row, tgen, alive, pid, rate: rate as u32, ch: ch as u8, bits: bits as u8, state: R3_PENDING, epoch: 0 });
+    R3_LIVE.store(true, Ordering::Release);
+    Ok(handle)
+}
+
+/// The device-service tick's half (folded into `service`): bring a PENDING stream's output up, notice an output the
+/// kernel player took, and reap a stream whose owner exited.
+fn r3_tick() {
+    let (handle, pending, dead, taken, rate, ch, bits) = {
+        let g = R3S.lock();
+        let Some(s) = g.as_ref() else {
+            R3_LIVE.store(false, Ordering::Release);
+            return;
+        };
+        (s.handle, s.state == R3_PENDING, !(s.alive)(s.row, s.tgen), s.state == R3_ARMED && EPOCH.load(Ordering::Acquire) != s.epoch, s.rate, s.ch, s.bits)
+    };
+    if dead || taken {
+        let s = R3S.lock().take();
+        if let Some(s) = s {
+            r3_end(s, if dead { "owner-exited" } else { "superseded" });
+        }
+        return;
+    }
+    if !pending {
+        return;
+    }
+    let r = if busy() || DEC_LIVE.load(Ordering::Acquire) { Err("output-sounding") } else { start(rate, ch, bits) };
+    let epoch = EPOCH.load(Ordering::Acquire);
+    let mut g = R3S.lock();
+    match g.as_mut().filter(|s| s.handle == handle) {
+        Some(s) => match r {
+            Ok(eff) => {
+                s.state = R3_ARMED;
+                s.epoch = epoch;
+                serial_println!("[audio] arm handle={} eff_rate={} resampled={} -> ok", handle, eff, (eff != rate) as u8);
+            }
+            Err(why) => {
+                s.state = R3_DEAD;
+                serial_println!("[audio] arm handle={} eff_rate=0 resampled=0 -> refused=start-failed ({})", handle, why);
+            }
+        },
+        None => {
+            drop(g);
+            if r.is_ok() {
+                stop(); // closed while it came up
+            }
+        }
+    }
+}
+
+/// The caller's stream by handle: `(state, epoch, bytes per frame)`, or -EBADF.
+fn r3_mine(handle: u64, row: usize, tgen: u64) -> Result<(u8, u32, usize), i64> {
+    let g = R3S.lock();
+    match g.as_ref() {
+        Some(s) if s.handle as u64 == handle && s.row == row && s.tgen == tgen => Ok((s.state, s.epoch, s.ch as usize * s.bits as usize / 8)),
+        _ => Err(una_abi::EBADF),
+    }
+}
+
+/// `SYS_AUDIO_WRITE`'s body: whole frames of `data` into the ring (bytes taken), -EAGAIN while full or arming, -EIO a
+/// dead stream; empty `data` = end of stream.
+pub fn r3_write(handle: u64, row: usize, tgen: u64, data: &[u8]) -> i64 {
+    let (state, epoch, frame) = match r3_mine(handle, row, tgen) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match state {
+        R3_PENDING => return una_abi::EAGAIN,
+        R3_DEAD => return una_abi::EIO,
+        _ => {}
+    }
+    if EPOCH.load(Ordering::Acquire) != epoch {
+        return una_abi::EIO; // the kernel player took the output; the tick says so and frees the row
+    }
+    if data.is_empty() {
+        finish();
+        return 0;
+    }
+    let n = data.len() / frame.max(1) * frame.max(1);
+    if n == 0 {
+        return una_abi::EINVAL;
+    }
+    if feed(&data[..n]) == 0 { una_abi::EAGAIN } else { n as i64 }
+}
+
+/// `SYS_AUDIO_CLOSE`'s body: stop now and free the output. 0, or -EBADF.
+pub fn r3_close(handle: u64, row: usize, tgen: u64) -> i64 {
+    let s = {
+        let mut g = R3S.lock();
+        match g.as_ref() {
+            Some(s) if s.handle as u64 == handle && s.row == row && s.tgen == tgen => g.take(),
+            _ => return una_abi::EBADF,
+        }
+    };
+    if let Some(s) = s {
+        r3_end(s, "close");
+    }
+    0
+}
+
+/// `SYS_AUDIO_POS`'s body: `what` = AUDIO_POS_PLAYED (source frames played, 0 until the stream runs) or
+/// AUDIO_POS_UNDERRUNS. -EBADF, -EINVAL, -EIO a dead stream.
+pub fn r3_pos(handle: u64, row: usize, tgen: u64, what: u64) -> i64 {
+    let (state, epoch, _) = match r3_mine(handle, row, tgen) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if what != una_abi::AUDIO_POS_PLAYED && what != una_abi::AUDIO_POS_UNDERRUNS {
+        return una_abi::EINVAL;
+    }
+    match state {
+        R3_PENDING => 0,
+        R3_DEAD => una_abi::EIO,
+        _ if EPOCH.load(Ordering::Acquire) != epoch => una_abi::EIO,
+        _ => {
+            let (played, under) = r3_counts();
+            if what == una_abi::AUDIO_POS_PLAYED { played as i64 } else { under as i64 }
+        }
+    }
+}
