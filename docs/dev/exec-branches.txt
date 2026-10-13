@@ -471,7 +471,7 @@ refs/heads/exec-host-aethermedia2             ef3fe22d FOLDED-BY-HAND b261435d
 refs/heads/exec-host-aetherwpt2               fe30fa59 FOLDED-BY-HAND 897a565d
 refs/heads/exec-host-webgl1                   558dbdd0 FOLDED-BY-HAND 0f1da5d6
 refs/heads/exec-host-intlcldr                 2a436e4a FOLDED-BY-HAND 2ca12b08
-refs/heads/exec-host-aetherwpt3               e3925d80 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aetherwpt3               e3925d80 FOLDED-BY-HAND eb94594c
 refs/heads/exec-rmbp-qemuskip                 cb833ebb FOLDED-BY-HAND a487c4dc
 refs/heads/exec-rmbp-kvmlat                   cb833ebb FOLDED-BY-HAND d664a62b
 refs/heads/exec-rmbp-uireds26                 cb833ebb FOLDED-BY-HAND d3cc9c38
