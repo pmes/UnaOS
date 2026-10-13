@@ -160,6 +160,10 @@ fn docs() -> &'static Mutex<Vec<DocEntry>> {
 
 /// The page's origin (`scheme://host[:port]`), or an opaque `null:<doc>` that matches no other document.
 pub fn page_origin() -> String {
+    // AETHERWORKERS2 (SR125): on a dedicated worker thread, the worker's origin (`storage::WorkerClient`).
+    if let Some(o) = crate::storage::worker_client_origin() {
+        return o;
+    }
     let url = super::page_url();
     origin_of(&url).unwrap_or_else(|| format!("null:{}", NET.with(|n| n.borrow().doc)))
 }

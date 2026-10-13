@@ -296,6 +296,13 @@ thread_local! {
     static W: RefCell<Option<WState>> = const { RefCell::new(None) };
     /// An error report is being dispatched (an `error` listener that throws is logged, not re-reported).
     static REPORTING: Cell<bool> = const { Cell::new(false) };
+    /// HTML's outstanding rejected promises weak set (their `unhandledrejection` fired, still unhandled);
+    /// rooted through `vm.host_roots` while listed.
+    static OUTSTANDING: RefCell<Vec<Obj>> = const { RefCell::new(Vec::new()) };
+    /// Outstanding promises that got a handler since: each queues `rejectionhandled`.
+    static HANDLED: RefCell<Vec<Obj>> = const { RefCell::new(Vec::new()) };
+    /// [`notify_rejections`] is running (its own tasks do not re-enter it).
+    static NOTIFYING: Cell<bool> = const { Cell::new(false) };
 }
 
 fn with_w<R>(f: impl FnOnce(&mut WState) -> R) -> Option<R> {
@@ -346,6 +353,20 @@ impl Host for WorkerHost {
     }
     fn now_ms(&mut self) -> f64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| (d.as_secs_f64() * 1000.0).floor()).unwrap_or(0.0)
+    }
+    /// HostPromiseRejectionTracker "handle" (HTML §8.1.5.7): an outstanding rejected promise got a handler —
+    /// queue its `rejectionhandled` (fired by [`notify_rejections`] after the task).
+    fn promise_rejection(&mut self, promise: Obj, operation: u8) {
+        if operation != 1 {
+            return;
+        }
+        let was = OUTSTANDING.with(|o| {
+            let mut o = o.borrow_mut();
+            o.iter().position(|q| *q == promise).map(|i| o.remove(i)).is_some()
+        });
+        if was {
+            HANDLED.with(|h| h.borrow_mut().push(promise));
+        }
     }
     /// A module worker's static and dynamic imports: resolved against the importing module (bare specifiers
     /// refuse — a worker has no import map), fetched under the worker's request context (destination
@@ -537,6 +558,9 @@ fn task(vm: &mut Vm, src: Option<&str>, f: impl FnOnce(&mut Vm) -> JsResult<()>)
             }
         }
     }));
+    if r.is_ok() {
+        notify_rejections(vm);
+    }
     if r.is_err() {
         // A binding bug must cost the worker, not the browser: the worker closes, the page hears an error.
         let (id, owner, url) = with_w(|w| {
@@ -547,6 +571,75 @@ fn task(vm: &mut Vm, src: Option<&str>, f: impl FnOnce(&mut Vm) -> JsResult<()>)
         crate::ledger::record_js("worker-engine-panicked");
         crate::js::broadcast::post(owner, "worker-error", json!({ "id": id, "message": "Uncaught Error: the worker's engine failed", "filename": url, "lineno": 0, "colno": 0 }).to_string());
     }
+}
+
+fn is_unhandled(vm: &Vm, p: Obj) -> bool {
+    matches!(&vm.heap.get(p).kind, js_core::vm::Kind::Promise(d) if !d.handled)
+}
+
+fn unroot_host(vm: &mut Vm, p: Obj) {
+    if let Some(i) = vm.host_roots.iter().position(|v| matches!(v, Value::Object(o) if *o == p)) {
+        vm.host_roots.remove(i);
+    }
+}
+
+/// `__w_rejection(type, promise, reason)` for `p`: answers whether the event was not canceled.
+fn fire_rejection(vm: &mut Vm, p: Obj, handled_event: bool) -> JsResult<bool> {
+    let reason = match &vm.heap.get(p).kind {
+        js_core::vm::Kind::Promise(d) => d.result.clone(),
+        _ => Value::Undefined,
+    };
+    let ty = if handled_event { "rejectionhandled" } else { "unhandledrejection" };
+    let v = call_global(vm, "__w_rejection", &[s(ty), Value::Object(p), reason])?;
+    Ok(!matches!(v, Value::Bool(false)))
+}
+
+/// HTML §8.1.5.7 "notify about rejected promises" for the worker's global (AETHERWORKERS2, SR125), after each
+/// task's microtask checkpoint: every promise still unhandled gets an `unhandledrejection` task (a cancelable
+/// PromiseRejectionEvent at the global; not canceled, "Uncaught (in promise)" on the console) and joins the
+/// outstanding set if still unhandled after it; every outstanding promise that got a handler since gets a
+/// `rejectionhandled` task. Rounds repeat while those tasks reject more (at most 64).
+fn notify_rejections(vm: &mut Vm) {
+    if NOTIFYING.with(|n| n.replace(true)) {
+        return;
+    }
+    for _ in 0..64 {
+        if killed() {
+            break;
+        }
+        let pending: Vec<Obj> = std::mem::take(&mut vm.rejected_unhandled).into_iter().filter(|p| is_unhandled(vm, *p)).collect();
+        let handled: Vec<Obj> = HANDLED.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        if pending.is_empty() && handled.is_empty() {
+            break;
+        }
+        // Rooted while their tasks run (a handled promise keeps its outstanding-set root until it fired).
+        vm.host_roots.extend(pending.iter().map(|p| Value::Object(*p)));
+        for p in pending {
+            let mut not_canceled = true;
+            task(vm, None, |vm| {
+                not_canceled = fire_rejection(vm, p, false)?;
+                Ok(())
+            });
+            if not_canceled && !killed() {
+                let reason = match &vm.heap.get(p).kind {
+                    js_core::vm::Kind::Promise(d) => d.result.clone(),
+                    _ => Value::Undefined,
+                };
+                let msg = vm.error_string(&reason);
+                eprintln!("[aether-worker] Uncaught (in promise) {msg}");
+            }
+            if is_unhandled(vm, p) {
+                OUTSTANDING.with(|o| o.borrow_mut().push(p));
+                vm.host_roots.push(Value::Object(p));
+            }
+            unroot_host(vm, p);
+        }
+        for p in handled {
+            task(vm, None, |vm| fire_rejection(vm, p, true).map(|_| ()));
+            unroot_host(vm, p);
+        }
+    }
+    NOTIFYING.with(|n| n.set(false));
 }
 
 /// Fires the realm's timers due at the worker's clock, one generation, each its own task.
@@ -619,7 +712,15 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
     // AETHERWORKERS2 (SR125): the inbox dispatcher and BroadcastChannel over this thread's serial, and `Worker`
     // itself — a nested worker's spawn path reads this worker's captured facts (`creator`).
     crate::js::broadcast::install_worker(&mut vm);
+    // IndexedDB (and navigator.storage) and Web Locks over the owner document's storage key: the bindings the
+    // page runs, whose natives read `storage::page_storage_key` / `js::broadcast::doc` — this thread's worker
+    // client and inbox serial. `Navigator` names WorkerNavigator only while their preludes look it up.
+    crate::js::idb::install(&mut vm);
+    crate::js::locks::install(&mut vm);
     crate::js::worker::install(&mut vm);
+    if let Err(e) = vm.run_script_str("delete globalThis.Navigator;") {
+        eprintln!("[aether-worker] navigator cleanup failed: {}", vm.error_string(&e));
+    }
     let info = json!({
         "url": sp.url,
         "name": sp.name,
@@ -631,6 +732,9 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
         eprintln!("[aether-worker] init failed: {}", vm.error_string(&e));
     }
     let _ = vm.run_jobs();
+    // HTML §8.1.5.7 in the worker: HostPromiseRejectionTracker on; [`notify_rejections`] fires the events.
+    vm.rejected_unhandled.clear();
+    vm.track_rejections = true;
     vm
 }
 
@@ -639,6 +743,11 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
     crate::js::ports::set_worker_owner(Some(sp.id));
     super::realm::enter(super::realm::RealmCtx { key: sp.storage_key.clone(), scope: String::new(), script_url: sp.url.clone() });
     // The worker's own inbox serial: what `js::broadcast::post` sends to it becomes a `Cmd::Inbox` task here.
+    crate::storage::enter_worker_client(Some(crate::storage::WorkerClient {
+        key: (!sp.storage_key.is_empty()).then(|| sp.storage_key.clone()),
+        secure: sp.secure,
+        origin: crate::security::origin::Origin::of(&sp.url).serialize(),
+    }));
     let my_id = sp.id;
     let serial = crate::js::broadcast::enter_worker(Box::new(move |kind: &str, payload: String| send(my_id, Cmd::Inbox { kind: kind.to_string(), payload })));
     W.with(|w| {
@@ -706,6 +815,9 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
     // Its nested workers lose their owner; its serial retires (connections, locks, channels).
     terminate_children(sp.id);
     crate::js::broadcast::leave_worker();
+    crate::storage::enter_worker_client(None);
+    OUTSTANDING.with(|o| o.borrow_mut().clear());
+    HANDLED.with(|h| h.borrow_mut().clear());
     W.with(|w| *w.borrow_mut() = None);
     let mut t = threads_map();
     if let Some(n) = t.get_mut(&sp.doc) {
@@ -801,6 +913,20 @@ const EVENTS: &str = r#"
         get error() { return ERR.get(this).error; }
     }
 
+    var PRE = new WeakMap();
+    class PromiseRejectionEvent extends Event {
+        constructor(type, init) {
+            if (arguments.length < 2) { throw new TypeError("Failed to construct 'PromiseRejectionEvent': 2 arguments required, but only " + arguments.length + " present."); }
+            super(type, init);
+            if (init === null || typeof init !== 'object' || !('promise' in init)) {
+                throw new TypeError("Failed to construct 'PromiseRejectionEvent': Failed to read the 'promise' property from 'PromiseRejectionEventInit': Required member is undefined.");
+            }
+            PRE.set(this, { promise: init.promise, reason: init.reason });
+        }
+        get promise() { return PRE.get(this).promise; }
+        get reason() { return PRE.get(this).reason; }
+    }
+
     var LS = new WeakMap();
     var listeners = function (t) { var m = LS.get(t); if (!m) { m = Object.create(null); LS.set(t, m); } return m; };
     var capOf = function (o) { return typeof o === 'boolean' ? o : !!(o && typeof o === 'object' && o.capture); };
@@ -851,7 +977,7 @@ const EVENTS: &str = r#"
             return !s.canceled;
         }
     }
-    [Event, MessageEvent, ErrorEvent, EventTarget].forEach(function (C) {
+    [Event, MessageEvent, ErrorEvent, PromiseRejectionEvent, EventTarget].forEach(function (C) {
         Object.defineProperty(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
         hide(C.name, C);
     });
@@ -915,6 +1041,15 @@ const SCOPE: &str = r#"
     var GP = (G instanceof DedicatedWorkerGlobalScope) ? DedicatedWorkerGlobalScope.prototype : G;
     var WP = (G instanceof WorkerGlobalScope) ? WorkerGlobalScope.prototype : G;
     __net_handlers(GP, ['message', 'messageerror']);
+    __net_handlers(WP, ['unhandledrejection', 'rejectionhandled']);
+    // WorkerNavigator (HTML §8.10.1.1): `navigator.storage` and `navigator.locks` are getters the IndexedDB and
+    // Web Locks preludes put on its prototype (they find it as `Navigator`, deleted after they ran).
+    class WorkerNavigator {
+        constructor() { throw new TypeError('Illegal constructor'); }
+    }
+    Object.defineProperty(WorkerNavigator.prototype, Symbol.toStringTag, { value: 'WorkerNavigator', configurable: true });
+    hide('WorkerNavigator', WorkerNavigator);
+    hide('Navigator', WorkerNavigator);
     (function () {
         // WorkerGlobalScope.onerror is an OnErrorEventHandler: (message, source, lineno, colno, error); true cancels.
         var h = null, wired = false;
@@ -1128,12 +1263,13 @@ const SCOPE: &str = r#"
         Object.defineProperty(loc, Symbol.toStringTag, { value: 'WorkerLocation' });
         hide('location', Object.freeze(loc));
         var n = INFO.navigator || {};
-        var nav = {
+        var fields = {
             userAgent: n.userAgent || '', appName: n.appName || 'Netscape', appVersion: n.appVersion || '', appCodeName: 'Mozilla',
             product: 'Gecko', platform: n.platform || '', language: n.language || 'en-US', languages: Object.freeze((n.languages || [n.language || 'en-US']).slice()),
             onLine: true, hardwareConcurrency: n.hardwareConcurrency || 1,
         };
-        Object.defineProperty(nav, Symbol.toStringTag, { value: 'WorkerNavigator' });
+        var nav = Object.create(WorkerNavigator.prototype);
+        Object.keys(fields).forEach(function (k) { Object.defineProperty(nav, k, { value: fields[k], enumerable: true }); });
         hide('navigator', Object.freeze(nav));
         hide('name', String(INFO.name));
         var cs = __cache_shapes();
@@ -1146,5 +1282,8 @@ const SCOPE: &str = r#"
         return G.dispatchEvent(trusted(new ErrorEvent('error', { message: message, filename: filename, lineno: lineno, colno: colno, error: error, cancelable: true })));
     });
     hide('__w_deliver', function (text, csv) { __msg_dispatch(G, text, csv); });
+    hide('__w_rejection', function (type, promise, reason) {
+        return G.dispatchEvent(trusted(new PromiseRejectionEvent(type, { promise: promise, reason: reason, cancelable: type === 'unhandledrejection' })));
+    });
 })();
 "#;

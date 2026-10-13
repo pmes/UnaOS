@@ -286,6 +286,9 @@ pub fn bucket_dir(area: &str, storage_key: &str) -> PathBuf {
 /// top document's key for now (the incumbent realm's origin does not reach the natives — the same rule
 /// `localStorage` follows in `js::net`).
 pub fn page_storage_key() -> Option<String> {
+    if let Some(key) = WORKER_CLIENT.with(|w| w.borrow().as_ref().map(|c| c.key.clone())) {
+        return key;
+    }
     let origin = crate::js::net::page_origin();
     if origin.starts_with("null") {
         return None;
@@ -295,7 +298,40 @@ pub fn page_storage_key() -> Option<String> {
 
 /// Secure Contexts §3.1 for the running page (the Cache API, service workers and Web Locks need one).
 pub fn page_is_secure() -> bool {
+    if let Some(secure) = WORKER_CLIENT.with(|w| w.borrow().as_ref().map(|c| c.secure)) {
+        return secure;
+    }
     crate::security::origin::is_potentially_trustworthy_url(&crate::js::page_url())
+}
+
+/// AETHERWORKERS2 (SR125): a dedicated worker thread's storage client. A worker's storage key is its owner
+/// document's (HTML §10.2.4: the worker's environment settings share the owner's storage key), so IndexedDB,
+/// Web Locks and BroadcastChannel inside the worker (`js::idb`, `js::locks`, `js::broadcast`, installed in the
+/// worker realm) reach the same process-wide stores the document does, taking each store's lock directly
+/// (`storage::idb`'s registry and `storage::locks`' manager are `Mutex`es callable from any thread); their
+/// notices come back to the worker's own inbox serial.
+pub struct WorkerClient {
+    /// The owner document's storage key (None: an opaque origin, storage refused).
+    pub key: Option<String>,
+    /// The owner document is a secure context.
+    pub secure: bool,
+    /// The worker's origin, serialized (what `js::net::page_origin` answers on the worker thread).
+    pub origin: String,
+}
+
+thread_local! {
+    static WORKER_CLIENT: RefCell<Option<WorkerClient>> = const { RefCell::new(None) };
+}
+
+/// Sets (Some, at a worker thread's start) or clears (None, at its end) this thread's [`WorkerClient`]:
+/// [`page_storage_key`] and [`page_is_secure`] answer it first.
+pub fn enter_worker_client(client: Option<WorkerClient>) {
+    WORKER_CLIENT.with(|w| *w.borrow_mut() = client);
+}
+
+/// The worker's origin on a dedicated worker thread ([`enter_worker_client`]); None elsewhere.
+pub fn worker_client_origin() -> Option<String> {
+    WORKER_CLIENT.with(|w| w.borrow().as_ref().map(|c| c.origin.clone()))
 }
 
 /// AETHERCACHE (SR88): the HTTP cache's disk tier — `http-cache/` under the same platform data directory the

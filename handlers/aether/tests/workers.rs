@@ -477,3 +477,75 @@ fn the_worker_error_event_is_cancelable_and_message_event_init_has_ports() {
     spin(&mut p, 100);
     assert_eq!(eval(&mut p, "winA"), "0", "canceled at the Worker, the Window never hears it");
 }
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 4
+
+/// IndexedDB, Web Locks and BroadcastChannel inside a worker run over the owner document's storage key: a
+/// record the worker writes is the document's to read, a lock the document holds queues the worker's request
+/// until it is released (the grant arrives at the worker's own inbox), and a BroadcastChannel of the same
+/// name carries messages both ways between the document and the worker.
+#[test]
+fn a_worker_shares_its_documents_storage() {
+    let port = server(|path| match path {
+        "/s/w.js" => Some((
+            "text/javascript",
+            "var bc = new BroadcastChannel('wk');
+             bc.onmessage = function (e) { postMessage('bc:' + e.data); };
+             onmessage = function (e) {
+                 if (e.data !== 'go') { return; }
+                 navigator.locks.request('L', function (lock) { postMessage('lock:' + lock.name + ':' + lock.mode); });
+                 navigator.locks.request('L2', function () { postMessage('lock2'); });
+                 var r = indexedDB.open('wdb', 1);
+                 r.onupgradeneeded = function () { r.result.createObjectStore('s'); };
+                 r.onsuccess = function () {
+                     var db = r.result;
+                     var tx = db.transaction('s', 'readwrite');
+                     tx.objectStore('s').put('from-worker', 'k');
+                     tx.oncomplete = function () { db.close(); bc.postMessage('from-worker'); postMessage('idb:done'); };
+                 };
+             };"
+                .into(),
+        )),
+        _ => None,
+    });
+    let mut p = page(
+        &format!("http://127.0.0.1:{port}/s/page"),
+        "var got = []; var release = null;
+         navigator.locks.request('L2', function () { return new Promise(function (res) { release = res; }); });
+         var pbc = new BroadcastChannel('wk');
+         pbc.onmessage = function (e) { got.push('page-bc:' + e.data); };
+         var w = new Worker('/s/w.js'); w.onmessage = function (e) { got.push(e.data); };
+         w.postMessage('go');",
+    );
+    run_until(&mut p, "got.indexOf('idb:done') >= 0 && got.indexOf('lock:L:exclusive') >= 0 && got.indexOf('page-bc:from-worker') >= 0", "got.join(',')", 20);
+    spin(&mut p, 100);
+    assert_eq!(eval(&mut p, "got.indexOf('lock2')"), "-1", "the document holds L2: the worker's request waits");
+    eval(&mut p, "release(); pbc.postMessage('hello');");
+    run_until(&mut p, "got.indexOf('lock2') >= 0 && got.indexOf('bc:hello') >= 0", "got.join(',')", 20);
+    eval(
+        &mut p,
+        "var v = null; var r2 = indexedDB.open('wdb', 1);
+         r2.onsuccess = function () { var q = r2.result.transaction('s').objectStore('s').get('k'); q.onsuccess = function () { v = q.result; }; };",
+    );
+    assert_eq!(run_until(&mut p, "v !== null", "v", 20), "from-worker", "the worker's record is in the document's database");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 5
+
+/// Rejection tracking in the worker realm: an unhandled rejection fires a cancelable PromiseRejectionEvent
+/// `unhandledrejection` at the worker global, and a handler attached later fires `rejectionhandled`.
+#[test]
+fn a_worker_fires_unhandledrejection_and_rejectionhandled() {
+    let w = data_url(
+        "self.addEventListener('unhandledrejection', function (e) {
+             postMessage('un:' + e.reason + ':' + (e.promise instanceof Promise) + ':' + e.cancelable + ':' + (e instanceof PromiseRejectionEvent));
+             e.preventDefault();
+             var p = e.promise;
+             setTimeout(function () { p.catch(function () {}); }, 0);
+         });
+         self.onrejectionhandled = function (e) { postMessage('handled:' + e.reason); };
+         Promise.reject('r1');",
+    );
+    let mut p = page(PAGE, &format!("var got = []; var w = new Worker('{w}'); w.onmessage = function (e) {{ got.push(e.data); }};"));
+    assert_eq!(run_until(&mut p, "got.length >= 2", "got.join(',')", 20), "un:r1:true:true:true,handled:r1");
+}
