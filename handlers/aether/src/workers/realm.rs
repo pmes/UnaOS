@@ -234,7 +234,11 @@ fn import_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
 /// `__cache(op, json, body)` in the worker: the page binding's operations over the worker's storage key.
 fn cache_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     let x = ctx();
-    crate::js::cache_api::run(vm, c, Some(x.key), true)
+    // AETHERWORKERS (SR123): a dedicated worker of an opaque origin has no storage key (SecurityError), and
+    // `caches` is a secure-context member of a worker realm as of a page (a service worker always is one).
+    let secure = crate::security::origin::is_potentially_trustworthy_url(&x.script_url);
+    let key = (!x.key.is_empty()).then_some(x.key);
+    crate::js::cache_api::run(vm, c, key, secure)
 }
 
 fn ledger_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
@@ -259,23 +263,41 @@ fn call_global(vm: &mut Vm, name: &str, args: &[Value]) -> Option<Value> {
     }
 }
 
-/// Builds the realm and evaluates the worker script. Answers the realm, or the evaluation error.
-fn build(rc: &RealmCtx, script: &str) -> Result<Vm, String> {
-    let mut vm = Vm::new(Box::new(SwHost));
-    js_core::builtins::host::install_host_globals(&mut vm);
+/// AETHERWORKERS (SR123): the natives a dedicated worker's realm shares with this one — URL resolution,
+/// `fetch` as a client of the realm's script origin, UTF-8, the Cache API over the realm's storage key, the
+/// ledger. They read the thread's [`RealmCtx`], set by [`enter`].
+pub(crate) fn install_shared(vm: &mut Vm) {
     let g = vm.realm().global;
     for (name, len, f) in [
         ("__sw_url", 2, url_native as NativeFn),
         ("__sw_fetch", 5, fetch_native),
         ("__sw_utf8_decode", 1, utf8_decode),
         ("__sw_utf8_encode", 1, utf8_encode),
-        ("__sw_skip_waiting", 0, skip_waiting),
+        ("__cache", 3, cache_native),
+        ("__ledger", 1, ledger_native),
+    ] {
+        let fo = vm.make_native(name, len, f, false);
+        vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
+    }
+}
+
+/// Binds this thread's realm context (the natives of [`install_shared`] read it).
+pub(crate) fn enter(rc: RealmCtx) {
+    STATE.with(|s| *s.borrow_mut() = Some(State { ctx: rc, skip_waiting: false }));
+}
+
+/// Builds the realm and evaluates the worker script. Answers the realm, or the evaluation error.
+fn build(rc: &RealmCtx, script: &str) -> Result<Vm, String> {
+    let mut vm = Vm::new(Box::new(SwHost));
+    js_core::builtins::host::install_host_globals(&mut vm);
+    install_shared(&mut vm);
+    let g = vm.realm().global;
+    for (name, len, f) in [
+        ("__sw_skip_waiting", 0, skip_waiting as NativeFn),
         ("__sw_clients", 1, clients_native),
         ("__sw_claim", 0, claim_native),
         ("__sw_client_post", 2, client_post),
         ("__sw_import", 1, import_native),
-        ("__cache", 3, cache_native),
-        ("__ledger", 1, ledger_native),
     ] {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
@@ -284,8 +306,10 @@ fn build(rc: &RealmCtx, script: &str) -> Result<Vm, String> {
     let scope_json = json!({ "scope": rc.scope, "scriptURL": rc.script_url }).to_string();
     for (label, src) in [
         ("serialize", crate::js::broadcast::SERIALIZE),
+        ("sw-fetch", FETCH),
         ("sw-scope", SCOPE),
         ("cache-shapes", crate::js::cache_api::CACHE_SHAPES),
+        ("caches", CACHES),
     ] {
         if let Err(e) = vm.run_script_str(src) {
             return Err(format!("{label} prelude: {}", vm.error_string(&e)));
@@ -387,55 +411,25 @@ fn skip_waiting_called() -> bool {
     STATE.with(|s| s.borrow().as_ref().is_some_and(|s| s.skip_waiting))
 }
 
-/// The ServiceWorkerGlobalScope members over the natives above.
-const SCOPE: &str = r#"
+/// AETHERWORKERS (SR123): `Headers` / `Request` / `Response` / `fetch` over `__sw_url` / `__sw_fetch` /
+/// `__sw_utf8_*` — shared by the service-worker realm (run before [`SCOPE`]) and a dedicated worker's realm
+/// (`workers::dedicated`), both of which register those natives through [`install_shared`].
+/// `caches` on the service-worker global: the page prelude's getter over this realm's `__cache` (a secure
+/// context answers the CacheStorage; an insecure one reads `undefined`, the `[SecureContext]` rule).
+const CACHES: &str = r#"
+(function () {
+    var cs = __cache_shapes();
+    Object.defineProperty(globalThis, 'caches', {
+        get: function () { return __cache('secure', '{}') === true ? cs : undefined; },
+        configurable: true, enumerable: true,
+    });
+})();
+"#;
+
+pub(crate) const FETCH: &str = r#"
 (function () {
     var G = globalThis;
-    var hide = function (name, v) { Object.defineProperty(G, name, { value: v, writable: true, configurable: true, enumerable: false }); };
     var expose = function (name, v) { Object.defineProperty(G, name, { value: v, writable: true, configurable: true, enumerable: false }); };
-    expose('self', G);
-    if (typeof DOMException !== 'function') {
-        class DOMException extends Error {
-            constructor(message, name) { super(message === undefined ? '' : String(message)); this.name = name === undefined ? 'Error' : String(name); }
-        }
-        expose('DOMException', DOMException);
-    }
-    if (typeof __ledger !== 'function') { hide('__ledger', function () {}); }
-
-    // ---- events (the global is the only target; listeners in registration order, then the handler)
-    var L = Object.create(null);
-    expose('addEventListener', function (type, f) {
-        if (f === null || f === undefined) { return; }
-        type = String(type);
-        var list = L[type] || (L[type] = []);
-        if (list.indexOf(f) < 0) { list.push(f); }
-    });
-    expose('removeEventListener', function (type, f) {
-        var list = L[String(type)];
-        if (!list) { return; }
-        var i = list.indexOf(f);
-        if (i >= 0) { list.splice(i, 1); }
-    });
-    ['install', 'activate', 'fetch', 'message', 'messageerror'].forEach(function (n) {
-        var v = null;
-        Object.defineProperty(G, 'on' + n, { get: function () { return v; }, set: function (f) { v = typeof f === 'function' ? f : null; }, configurable: true, enumerable: true });
-    });
-    var fire = function (ev) {
-        var list = (L[ev.type] || []).slice();
-        var h = G['on' + ev.type];
-        if (typeof h === 'function') { list.push(h); }
-        for (var i = 0; i < list.length; i++) {
-            var f = list[i];
-            try {
-                if (typeof f === 'function') { f.call(G, ev); }
-                else if (f && typeof f.handleEvent === 'function') { f.handleEvent(ev); }
-            } catch (e) {
-                console.error('Uncaught ' + (e && e.stack ? e.stack : e));
-            }
-            if (ev.__stopImmediate) { break; }
-        }
-    };
-
     // ---- Headers / Request / Response / fetch (a synchronous exchange per call)
     var norm = function (k) { return String(k).toLowerCase(); };
     class Headers {
@@ -558,6 +552,60 @@ const SCOPE: &str = r#"
             } catch (e) { reject(e instanceof TypeError ? e : new TypeError(String(e && e.message || e))); }
         });
     });
+})();
+"#;
+
+/// The ServiceWorkerGlobalScope members over the natives above (after [`FETCH`]).
+const SCOPE: &str = r#"
+(function () {
+    var G = globalThis;
+    var hide = function (name, v) { Object.defineProperty(G, name, { value: v, writable: true, configurable: true, enumerable: false }); };
+    var expose = function (name, v) { Object.defineProperty(G, name, { value: v, writable: true, configurable: true, enumerable: false }); };
+    expose('self', G);
+    if (typeof DOMException !== 'function') {
+        class DOMException extends Error {
+            constructor(message, name) { super(message === undefined ? '' : String(message)); this.name = name === undefined ? 'Error' : String(name); }
+        }
+        expose('DOMException', DOMException);
+    }
+    if (typeof __ledger !== 'function') { hide('__ledger', function () {}); }
+
+    // ---- events (the global is the only target; listeners in registration order, then the handler)
+    var L = Object.create(null);
+    expose('addEventListener', function (type, f) {
+        if (f === null || f === undefined) { return; }
+        type = String(type);
+        var list = L[type] || (L[type] = []);
+        if (list.indexOf(f) < 0) { list.push(f); }
+    });
+    expose('removeEventListener', function (type, f) {
+        var list = L[String(type)];
+        if (!list) { return; }
+        var i = list.indexOf(f);
+        if (i >= 0) { list.splice(i, 1); }
+    });
+    ['install', 'activate', 'fetch', 'message', 'messageerror'].forEach(function (n) {
+        var v = null;
+        Object.defineProperty(G, 'on' + n, { get: function () { return v; }, set: function (f) { v = typeof f === 'function' ? f : null; }, configurable: true, enumerable: true });
+    });
+    var fire = function (ev) {
+        var list = (L[ev.type] || []).slice();
+        var h = G['on' + ev.type];
+        if (typeof h === 'function') { list.push(h); }
+        for (var i = 0; i < list.length; i++) {
+            var f = list[i];
+            try {
+                if (typeof f === 'function') { f.call(G, ev); }
+                else if (f && typeof f.handleEvent === 'function') { f.handleEvent(ev); }
+            } catch (e) {
+                console.error('Uncaught ' + (e && e.name ? e.name + ': ' + e.message + '\n' : '') + (e && e.stack ? e.stack : e));
+            }
+            if (ev.__stopImmediate) { break; }
+        }
+    };
+
+    var hidden = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false }); };
+
     expose('importScripts', function () {
         for (var i = 0; i < arguments.length; i++) {
             var u = __sw_url(String(arguments[i]), null);

@@ -62,6 +62,7 @@ pub mod importmap;
 pub mod loader;
 pub mod locks;
 pub mod mutation;
+pub mod ports;
 pub mod range;
 pub mod reflect;
 mod reflect_table;
@@ -70,6 +71,7 @@ pub mod sw;
 pub mod traversal;
 pub mod net;
 pub mod window;
+pub mod worker;
 
 use crate::dom::NodeRef;
 use js_core::string::JsStr;
@@ -646,6 +648,10 @@ impl Engine {
         canvas::install(&mut vm);
         // AETHERSTORAGE (SR94): the inbox and serializer first, then the APIs that use them.
         broadcast::install(&mut vm);
+        // AETHERWORKERS (SR123): MessagePort/MessageChannel, then Worker; the idle-callback task source.
+        ports::install(&mut vm);
+        worker::install(&mut vm);
+        crate::event_loop::install(&mut vm);
         idb::install(&mut vm);
         cache_api::install(&mut vm);
         locks::install(&mut vm);

@@ -101,6 +101,9 @@ pub fn retire(doc: u64) {
     crate::storage::idb::doc_gone(doc);
     crate::storage::locks::doc_gone(doc);
     crate::workers::sw::doc_gone(doc);
+    // AETHERWORKERS (SR123): the document's dedicated workers terminate and its message ports disentangle.
+    crate::workers::dedicated::doc_gone(doc);
+    super::ports::doc_gone(doc);
 }
 
 /// Runs the queued inbox messages (at most [`MAX_PER_TURN`]); answers how many ran.
@@ -205,7 +208,9 @@ pub fn install(vm: &mut Vm) {
 }
 
 /// HTML §2.7 StructuredSerialize / StructuredDeserialize over a JSON text (see the module docs). Shared by
-/// every realm that runs it: the service-worker realm runs the same text (`workers::sw`).
+/// every realm that runs it: the service-worker realm runs the same text (`workers::sw`), and so does a
+/// dedicated worker's realm (`workers::dedicated`, AETHERWORKERS SR123), whose `postMessage` and MessagePort
+/// transfer lists ride `__sc_ser(value, portIndexMap)` / `__sc_de(text, ports)` (`js::ports`).
 pub const SERIALIZE: &str = r#"
 (function () {
     var hide = function (name, v) {
@@ -236,7 +241,10 @@ pub const SERIALIZE: &str = r#"
         if (n === 0 && 1 / n < 0) { return { t: 'N', v: '-0' }; }
         return n;
     };
-    var ser = function (value) {
+    // AETHERWORKERS (SR123): `xp` (optional) maps each transferred MessagePort to its index in the message's
+    // port list; such a port serializes as `{t:'P', x}` and `de(text, ports)` answers `ports[x]`. Without `xp`
+    // a port is a platform object and throws DataCloneError as before.
+    var ser = function (value, xp) {
         var mem = new Map(), next = 0;
         var walk = function (v) {
             var ty = typeof v;
@@ -246,6 +254,7 @@ pub const SERIALIZE: &str = r#"
             if (ty === 'bigint') { return { t: 'I', v: String(v) }; }
             if (ty === 'symbol') { throw err(String(v)); }
             if (ty === 'function') { throw err(v.name ? 'function ' + v.name : 'A function'); }
+            if (xp && xp.has(v)) { return { t: 'P', x: xp.get(v) }; }
             if (mem.has(v)) { return { t: 'r', i: mem.get(v) }; }
             var id = next++;
             mem.set(v, id);
@@ -300,7 +309,7 @@ pub const SERIALIZE: &str = r#"
         };
         return JSON.stringify(walk(value));
     };
-    var de = function (text) {
+    var de = function (text, ports) {
         var mem = [];
         var unnum = function (n) {
             if (n !== null && typeof n === 'object') { return n.v === 'NaN' ? NaN : n.v === 'Infinity' ? Infinity : n.v === '-Infinity' ? -Infinity : -0; }
@@ -314,6 +323,9 @@ pub const SERIALIZE: &str = r#"
                 case 'N': return unnum(n);
                 case 'I': return BigInt(n.v);
                 case 'r': return mem[n.i];
+                case 'P':
+                    if (!ports || !(n.x in ports)) { throw err('A MessagePort'); }
+                    return ports[n.x];
                 case 'Bo': o = Object(n.v); break;
                 case 'Nu': o = Object(unnum(n.v)); break;
                 case 'St': o = Object(n.v); break;

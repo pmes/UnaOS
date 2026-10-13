@@ -1,10 +1,14 @@
 //! A script worker thread: its own js_core realm (no DOM), fed source text over a channel, answering
-//! with each completion value as a string ("Error: …" for a throw). The groundwork for dedicated
-//! workers; not yet exposed to pages as `Worker`.
+//! with each completion value as a string ("Error: …" for a throw). The original groundwork; pages reach
+//! workers through [`dedicated`] (AETHERWORKERS, SR123), not through this.
 //!
 //! AETHERSTORAGE (SR94): [`sw`] — service-worker registrations, lifecycle, control and the fetch interception
 //! hook — and [`realm`], the ServiceWorkerGlobalScope realm each running worker gets on its own thread.
+//!
+//! AETHERWORKERS (SR123): [`dedicated`] — `new Worker()`'s thread and DedicatedWorkerGlobalScope realm (the page
+//! half is `js::worker`; MessagePorts are `js::ports`).
 
+pub mod dedicated;
 pub mod realm;
 pub mod sw;
 

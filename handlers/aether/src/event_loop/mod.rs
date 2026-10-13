@@ -19,10 +19,24 @@
 //! [`settle`]. While network operations are in flight and nothing else is runnable, [`settle`] waits on
 //! real time (the virtual clock advancing with it), so a page's socket or stream can deliver before the
 //! budget runs out; with no operation in flight it behaves exactly as before.
+//!
+//! AETHERWORKERS (SR123): two more sources. A dedicated worker's messages ride the `js::broadcast` inbox (so
+//! they run where every inbox message runs), and while one of the document's workers has work outstanding
+//! (`workers::dedicated::busy`) [`settle`] waits on real time for it exactly as it does for network
+//! operations. And the idle-callback task source (Cooperative Scheduling of Background Tasks §4):
+//! `requestIdleCallback(cb, { timeout })` queues `cb`; [`fire_due_timers`] starts an IDLE PERIOD when its pass
+//! fired nothing (no timer due, no browsing-context task) and the page's task queue is empty, with deadline =
+//! min(now + [`FRAME_BUDGET_MS`], the next timer's due time), and runs the callbacks queued before the period
+//! (a callback queued during it waits for the next) while the deadline holds; a callback whose `timeout`
+//! passed runs at the next pass whether or not the loop is idle, with `didTimeout` true and no time
+//! remaining. Each callback is its own task (`js::invoke_callback`: report, microtask checkpoint) and gets an
+//! IdleDeadline whose `timeRemaining()` is `max(0, deadline − now)` on the page clock. Idle callbacks are NOT
+//! counted in [`fire_due_timers`]'s return value: an idle period is idleness, so a callback that re-queues
+//! itself every period cannot hold a virtual-time driver past its idle rounds.
 
 use crate::js::Engine;
-use js_core::vm::{Value, Vm};
-use std::cell::Cell;
+use js_core::vm::{CallCtx, JsResult, NativeFn, Prop, PropertyKey, Value, Vm, WC};
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 /// Most timers a single tick will fire; the overflow stays queued and the shortfall is ledgered.
@@ -31,7 +45,10 @@ pub const MAX_FIRES_PER_TICK: usize = 256;
 /// Bounded boot drain: passes of "advance a frame, run tasks, fire due timers" a page load gets before
 /// first layout, and the clock advance per pass.
 pub const BOOT_PASSES: u32 = 8;
-pub const BOOT_PASS_MS: u64 = 16;
+pub const BOOT_PASS_MS: u64 = FRAME_BUDGET_MS;
+
+/// One frame of the page clock (≈60 Hz): the longest idle period between frames, and the boot drain's pass.
+pub const FRAME_BUDGET_MS: u64 = 16;
 
 /// Real milliseconds [`settle`] sleeps per round while it waits on network operations in flight.
 pub const NET_WAIT_MS: u64 = 2;
@@ -46,6 +63,9 @@ thread_local! {
     static CLOCK_FROZEN: Cell<bool> = const { Cell::new(false) };
     /// Mirror of the armed timer count (for diagnostics without the VM at hand).
     static ARMED: Cell<usize> = const { Cell::new(0) };
+    /// The idle request callback list: (handle, timeout deadline on the page clock), in request order. The
+    /// callbacks themselves live in the realm (the prelude's map), traced by its collector.
+    static IDLE: RefCell<(u32, Vec<(u32, Option<u64>)>)> = const { RefCell::new((0, Vec::new())) };
 }
 
 /// Milliseconds on the page clock.
@@ -92,6 +112,7 @@ pub fn reset() {
     CLOCK_OFFSET.with(|o| o.set(0));
     CLOCK_FROZEN.with(|f| f.set(false));
     ARMED.with(|a| a.set(0));
+    IDLE.with(|q| *q.borrow_mut() = (0, Vec::new()));
     crate::js::window::frames::reset();
 }
 
@@ -131,6 +152,7 @@ pub fn fire_due_timers(vm: &mut Vm) -> usize {
         due.truncate(MAX_FIRES_PER_TICK);
     }
     let mut ran = framed;
+    let idle = due.is_empty() && framed == 0 && crate::js::page(|p| p.tasks.is_empty());
     for (_, _, id) in due {
         // A callback earlier in this generation may have cleared this one.
         let Some(i) = vm.timers.iter().position(|t| t.id == id) else { continue };
@@ -164,8 +186,148 @@ pub fn fire_due_timers(vm: &mut Vm) -> usize {
             break;
         }
     }
+    run_idle_callbacks(vm, idle);
     ran
 }
+
+/// The idle-callback pass (see the module docs): an idle period when `idle`, else only the timed-out
+/// callbacks. Answers how many ran.
+fn run_idle_callbacks(vm: &mut Vm, idle: bool) -> usize {
+    let queued: Vec<(u32, Option<u64>)> = IDLE.with(|q| q.borrow().1.clone());
+    if queued.is_empty() || crate::js::engine_poisoned() {
+        return 0;
+    }
+    let now = now_ms();
+    let mut deadline = now + FRAME_BUDGET_MS;
+    if let Some(d) = next_due(vm) {
+        deadline = deadline.min((d.max(now as f64)).ceil() as u64);
+    }
+    let g = vm.realm().global;
+    let run = vm.get(g, &PropertyKey::from_str("__idle_run")).unwrap_or(Value::Undefined);
+    if !vm.is_callable(&run) {
+        return 0;
+    }
+    let mut ran = 0;
+    for (id, timeout) in queued {
+        let t = now_ms();
+        let timed_out = timeout.is_some_and(|at| t >= at);
+        if !timed_out && (!idle || t >= deadline) {
+            continue;
+        }
+        // An earlier callback of this pass may have cancelled it.
+        let still = IDLE.with(|q| {
+            let mut q = q.borrow_mut();
+            match q.1.iter().position(|(h, _)| *h == id) {
+                Some(i) => {
+                    q.1.remove(i);
+                    true
+                }
+                None => false,
+            }
+        });
+        if !still {
+            continue;
+        }
+        let dl = if timed_out { t } else { deadline };
+        crate::js::invoke_callback(vm, "idle-callback", &run, &[Value::Number(id as f64), Value::Number(dl as f64), Value::Bool(timed_out)]);
+        ran += 1;
+        if crate::js::engine_poisoned() {
+            break;
+        }
+    }
+    ran
+}
+
+/// `__ric(op, n)`: `add(timeout)` → handle; `cancel(handle)`; `now()` → the page clock (ms).
+fn ric_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let op = vm.arg(ctx, 0);
+    let op = vm.to_string(&op)?.to_rust();
+    let n = vm.arg(ctx, 1);
+    let n = if n.is_nullish() { 0.0 } else { vm.to_number(&n)? };
+    match op.as_str() {
+        "add" => {
+            let timeout = (n.is_finite() && n > 0.0).then(|| now_ms() + n as u64);
+            let id = IDLE.with(|q| {
+                let mut q = q.borrow_mut();
+                q.0 = q.0.wrapping_add(1).max(1);
+                let id = q.0;
+                q.1.push((id, timeout));
+                id
+            });
+            Ok(Value::Number(id as f64))
+        }
+        "cancel" => {
+            let id = if n.is_finite() && n >= 0.0 { n as u32 } else { 0 };
+            IDLE.with(|q| q.borrow_mut().1.retain(|(h, _)| *h != id));
+            Ok(Value::Undefined)
+        }
+        "now" => Ok(Value::Number(now_ms() as f64)),
+        _ => vm.throw_type("__ric: unknown operation"),
+    }
+}
+
+/// Number of idle callbacks queued.
+pub fn idle_queued() -> usize {
+    IDLE.with(|q| q.borrow().1.len())
+}
+
+/// Installs `requestIdleCallback` / `cancelIdleCallback` / `IdleDeadline` in the page realm (replacing the
+/// timer-queue shim `api::platform` used to install).
+pub fn install(vm: &mut Vm) {
+    let g = vm.realm().global;
+    let fo = vm.make_native("__ric", 2, ric_native as NativeFn, false);
+    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("__ric"), Prop::data(Value::Object(fo), WC));
+    if let Err(e) = vm.run_script_str(IDLE_PRELUDE) {
+        let m = vm.error_string(&e);
+        crate::ledger::record_js(&format!("idle-prelude-failed:{}", crate::js::clip(&m, 64)));
+        eprintln!("[aether] idle prelude failed: {m}");
+    }
+}
+
+const IDLE_PRELUDE: &str = r#"
+(function () {
+    var hide = function (name, v) {
+        Object.defineProperty(globalThis, name, { value: v, writable: true, configurable: true, enumerable: false });
+    };
+    var CB = new Map(), D = new WeakMap(), TOKEN = {};
+    class IdleDeadline {
+        constructor(token, deadline, didTimeout) {
+            if (token !== TOKEN) { throw new TypeError('Illegal constructor'); }
+            D.set(this, { deadline: deadline, didTimeout: didTimeout });
+        }
+        timeRemaining() {
+            var d = D.get(this);
+            if (!d) { throw new TypeError('Illegal invocation'); }
+            return Math.max(0, d.deadline - __ric('now'));
+        }
+        get didTimeout() {
+            var d = D.get(this);
+            if (!d) { throw new TypeError('Illegal invocation'); }
+            return d.didTimeout;
+        }
+    }
+    Object.defineProperty(IdleDeadline.prototype, Symbol.toStringTag, { value: 'IdleDeadline', configurable: true });
+    hide('IdleDeadline', IdleDeadline);
+    hide('requestIdleCallback', function requestIdleCallback(callback, options) {
+        if (typeof callback !== 'function') {
+            throw new TypeError("Failed to execute 'requestIdleCallback' on 'Window': parameter 1 is not of type 'IdleRequestCallback'.");
+        }
+        var t = options !== undefined && options !== null && options.timeout !== undefined ? Number(options.timeout) : 0;
+        var id = __ric('add', t > 0 ? t : 0);
+        CB.set(id, callback);
+        return id;
+    });
+    hide('cancelIdleCallback', function cancelIdleCallback(handle) {
+        var id = Number(handle);
+        if (CB.delete(id)) { __ric('cancel', id); }
+    });
+    hide('__idle_run', function (id, deadline, didTimeout) {
+        var cb = CB.get(id);
+        CB.delete(id);
+        if (typeof cb === 'function') { cb.call(globalThis, new IdleDeadline(TOKEN, deadline, didTimeout)); }
+    });
+})();
+"#;
 
 /// The bounded boot drain: [`BOOT_PASSES`] passes of "advance a frame, run the queued tasks, fire the
 /// timers now due". A page's zero/short-delay boot timers still run before first layout; a boot timer
@@ -208,9 +370,10 @@ pub fn settle(engine: &mut Engine, budget_ms: u64) {
         if engine.has_tasks() {
             continue;
         }
-        if crate::js::net::active() {
-            // Network operations in flight: wait a little real time for them, the page clock keeping pace,
-            // so a timer due meanwhile still fires in order.
+        if crate::js::net::active() || crate::workers::dedicated::busy(crate::js::broadcast::doc()) {
+            // Network operations in flight, or a dedicated worker with work outstanding (AETHERWORKERS):
+            // wait a little real time for them, the page clock keeping pace, so a timer due meanwhile still
+            // fires in order.
             let t0 = Instant::now();
             std::thread::sleep(std::time::Duration::from_millis(NET_WAIT_MS));
             advance_clock((t0.elapsed().as_millis() as u64).max(1));
