@@ -468,8 +468,17 @@ const PRELUDE: &str = r#"
                     throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + ' present.');
                 }
                 super(bits, opts);
-                var lm = opts !== undefined && opts !== null && opts.lastModified !== undefined ? Number(opts.lastModified) : Date.now();
-                FST.set(this, { name: usv(name), lastModified: Math.trunc(lm) || 0 });
+                // AETHERWPT2 (SR135): `lastModified` is a WebIDL `long long` (NaN / ±Infinity → 0, truncated, wrapped
+                // modulo 2^64 into the signed range).
+                var lm = opts !== undefined && opts !== null && opts.lastModified !== undefined ? +opts.lastModified : Date.now();
+                if (!isFinite(lm)) { lm = 0; }
+                lm = Math.trunc(lm);
+                if (lm >= 9223372036854775808 || lm < -9223372036854775808) {
+                    lm = lm % 18446744073709551616;
+                    if (lm >= 9223372036854775808) { lm -= 18446744073709551616; }
+                    else if (lm < -9223372036854775808) { lm += 18446744073709551616; }
+                }
+                FST.set(this, { name: usv(name), lastModified: lm === 0 ? 0 : lm });
             }
             get name() { return fst(this).name; }
             get lastModified() { return fst(this).lastModified; }

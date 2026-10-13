@@ -34,6 +34,17 @@
 //! skipped by name with the reason ([`net_excluded`]). AETHERWORKERS3 (SR129): `.worker.js` tests run in the
 //! stand-in's generated `.worker.html` page (`fetch_tests_from_worker`), as wptserve serves them. Per-file results go to
 //! `target/wpt-<dir>.tsv`; `.any.js` tests run their window variant (`?default` for websockets).
+//!
+//! AETHERWPT2 (SR135) adds the rest of what a browser is measured on ([`WPT2_DIRS`]: url, encoding, fetch/api,
+//! streams, FileAPI, webstorage, IndexedDB, html/browsers/{history,the-window-object,browsing-the-web},
+//! html/semantics/{scripting-1,embedded-content,tabular-data,interactive-elements,text-level-semantics,
+//! grouping-content}, custom-elements, shadow-dom, selection, uievents (keyboard events are
+//! `uievents/keyboard`), pointerevents, WebCryptoAPI, compression, resource-timing, performance-timeline, console,
+//! html/infrastructure/urls), one `wpt2_*` test each, served by the same stand-in. What a test needs that the
+//! run cannot give it is named per file by [`wpt2_excluded`] (TLS, testdriver, cross-origin hosts, auxiliary
+//! browsing contexts, bfcache, idlharness, an un-emulated handler, the `/media/` fixtures, layout); reftests and
+//! manual pages (no testharness.js) are counted, not run. An API Aether lacks is never an exclusion: those tests
+//! run and fail, and the per-directory floors (0 at landing) rise from the bench's first run.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -46,7 +57,7 @@ const WPT_REPO: &str = "https://github.com/web-platform-tests/wpt.git";
 const WPT_COMMIT: &str = "da1f6d20caf40b4003ae288dda8c97f252dd9264";
 
 /// The sparse checkout: the directories run, plus the shared harness and support trees they load.
-const SPARSE: &str = "/dom/\n/resources/\n/common/\n/html/resources/\n/html/dom/\n/html/semantics/forms/\n/html/webappapis/\n/html/semantics/interfaces.js\n/dom/nodes/\n/dom/*.js\n/websockets/\n/eventsource/\n/xhr/\n";
+const SPARSE: &str = "/dom/\n/resources/\n/common/\n/html/resources/\n/html/dom/\n/html/semantics/forms/\n/html/webappapis/\n/html/semantics/interfaces.js\n/dom/nodes/\n/dom/*.js\n/websockets/\n/eventsource/\n/xhr/\n/url/\n/encoding/\n/fetch/api/\n/streams/\n/FileAPI/\n/webstorage/\n/IndexedDB/\n/html/browsers/history/\n/html/browsers/the-window-object/\n/html/browsers/browsing-the-web/\n/html/semantics/scripting-1/\n/html/semantics/embedded-content/\n/html/semantics/tabular-data/\n/html/semantics/interactive-elements/\n/html/semantics/text-level-semantics/\n/html/semantics/grouping-content/\n/custom-elements/\n/shadow-dom/\n/selection/\n/uievents/\n/pointerevents/\n/WebCryptoAPI/\n/compression/\n/resource-timing/\n/performance-timeline/\n/console/\n/html/infrastructure/urls/\n/images/\n";
 
 /// The directories run: (path, recurse into subdirectories). `html/dom` is its top-level reflection suite.
 const DIRS: &[(&str, bool)] = &[
@@ -90,13 +101,15 @@ fn locate() -> Option<PathBuf> {
     }
     let t = target_dir().join("wpt");
     let git = |args: &[&str]| Command::new("git").arg("-C").arg(&t).args(args).status().map(|s| s.success()).unwrap_or(false);
-    // A checkout made by an earlier runner lacks the SR72 directories or the AETHERNET ones: widen it in place.
-    if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() && (!t.join("html/webappapis").is_dir() || !NET_DIRS.iter().all(|d| t.join(d).is_dir())) {
+    // A checkout made by an earlier runner lacks the SR72 directories, the AETHERNET ones or the AETHERWPT2 ones:
+    // widen it in place.
+    let complete = |t: &Path| t.join("html/webappapis").is_dir() && NET_DIRS.iter().all(|d| t.join(d).is_dir()) && WPT2_DIRS.iter().all(|(d, _)| t.join(d).is_dir());
+    if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() && !complete(&t) {
         let _ = std::fs::write(t.join(".git/info/sparse-checkout"), SPARSE);
         let _ = Command::new("git").arg("-C").arg(&t).args(["checkout", "-q", "FETCH_HEAD"]).status();
         let _ = Command::new("git").arg("-C").arg(&t).args(["read-tree", "-mu", "HEAD"]).status();
     }
-    if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() && t.join("html/webappapis").is_dir() && NET_DIRS.iter().all(|d| t.join(d).is_dir()) {
+    if t.join("dom/nodes").is_dir() && t.join("resources/testharness.js").is_file() && complete(&t) {
         return Some(t);
     }
     let _ = std::fs::create_dir_all(&t);
@@ -785,6 +798,11 @@ fn net_files(root: &Path, dir: &str) -> Vec<(String, Vec<String>, Vec<String>)> 
 }
 
 fn run_net_dir(dir: &str, floor_pct: usize) {
+    run_served_dir(dir, floor_pct, &|_, rel, src| net_excluded(rel, src));
+}
+
+/// Runs every test page of `dir` through the stand-in, skipping (with the reason) those `skip` names.
+fn run_served_dir(dir: &str, floor_pct: usize, skip: &dyn Fn(&Path, &str, &str) -> Option<String>) {
     if cfg!(debug_assertions) && std::env::var("AETHER_WPT").is_err() && std::env::var("AETHER_WPT_ONLY").is_err() {
         println!("wpt {dir}: skipped in a debug build (run with --release, or set AETHER_WPT=1)");
         return;
@@ -813,7 +831,7 @@ fn run_net_dir(dir: &str, floor_pct: usize) {
             skipped.push((format!("{rel}{v}"), "needs a TLS server (wss / h2 variant)".into()));
             tsv.push_str(&format!("{rel}\t{v}\t0\t0\t-\tneeds a TLS server (wss / h2 variant)\n"));
         }
-        if let Some(why) = net_excluded(&rel, &src) {
+        if let Some(why) = skip(&root, &rel, &src) {
             for v in &run {
                 skipped.push((format!("{rel}{v}"), why.clone()));
                 tsv.push_str(&format!("{rel}\t{v}\t0\t0\t-\t{why}\n"));
@@ -844,7 +862,7 @@ fn run_net_dir(dir: &str, floor_pct: usize) {
             tsv.push_str(&format!("{rel}\t{v}\t{}\t{}\t{}\t\n", r.pass, r.total, r.harness));
         }
     }
-    let _ = std::fs::write(target_dir().join(format!("wpt-{dir}.tsv")), tsv);
+    let _ = std::fs::write(target_dir().join(format!("wpt-{}.tsv", dir.replace('/', "-"))), tsv);
     let pct = if total == 0 { 0.0 } else { 100.0 * pass as f64 / total as f64 };
     println!("wpt {dir} (served {files_run} test pages): {pass}/{total} subtests ({pct:.1}%)");
     let mut reasons: Vec<&str> = skipped.iter().map(|(_, r)| r.as_str()).collect();
@@ -873,4 +891,219 @@ fn wpt_eventsource() {
 #[test]
 fn wpt_xhr() {
     run_net_dir("xhr", 85);
+}
+
+// =================================================================================================
+// AETHERWPT2 (SR135): the rest of the platform a browser is measured on, through the same stand-in
+// =================================================================================================
+
+/// The directories AETHERWPT2 runs (recursively, through `wpt_net`), each with what its tests need that this
+/// run cannot give them — the reasons [`wpt2_excluded`] names per file. An API Aether lacks is not listed
+/// here: those tests run and fail (docs/dev/evidence/aetherwpt/WPT.md, the AETHERWPT2 gap list).
+pub const WPT2_DIRS: &[(&str, &str)] = &[
+    ("url", "an un-emulated handler (percent-encoding.py); XML documents (.xhtml, not collected)"),
+    ("encoding", "TLS (sharedarraybuffer.https); un-emulated handlers (single-byte-raw.py, text-plain-charset.py, json-charset.py, text-html-meta-charset.py); idlharness"),
+    ("fetch/api", "cross-origin hosts (cors/, credentials/, get-host-info REMOTE origins); TLS and h2 (.https., .h2.); service workers; un-emulated handlers (preflight.py, cache.py, authentication.py, …); auxiliary browsing contexts (keepalive window.open); idlharness"),
+    ("streams", "idlharness; TLS (.https. transferable variants); auxiliary browsing contexts"),
+    ("FileAPI", "auxiliary browsing contexts (url/ window.open); cross-origin hosts; TLS; manual pages (-manual); idlharness"),
+    ("webstorage", "auxiliary browsing contexts (event tests that window.open); TLS"),
+    ("IndexedDB", "TLS (storage buckets, .https.); testdriver; auxiliary browsing contexts; bfcache; idlharness"),
+    ("html/browsers/history", "auxiliary browsing contexts (window.open); un-emulated handlers; testdriver; bfcache / remote contexts"),
+    ("html/browsers/the-window-object", "auxiliary browsing contexts (window.open, named access to opened windows); cross-origin hosts; testdriver; TLS"),
+    ("html/browsers/browsing-the-web", "remote contexts (/common/dispatcher/, RemoteContextHelper); bfcache; auxiliary browsing contexts; un-emulated handlers (slow.py, refresh.py, redirect.py, …); testdriver; TLS"),
+    ("html/semantics/scripting-1", "un-emulated handlers (serve-custom-response.py, serve-with-content-type.py, load-error-events.py, referrer-checker.py, log.py, …); cross-origin hosts; TLS"),
+    ("html/semantics/embedded-content", "the /media/ fixtures (not in the sparse checkout); layout; testdriver; un-emulated handlers; cross-origin hosts; TLS; reftests"),
+    ("html/semantics/tabular-data", "layout (a few); reftests"),
+    ("html/semantics/interactive-elements", "testdriver (dialog, popover, details input); layout; reftests"),
+    ("html/semantics/text-level-semantics", "reftests; layout"),
+    ("html/semantics/grouping-content", "reftests; layout"),
+    ("custom-elements", "auxiliary browsing contexts; testdriver; layout; un-emulated handlers (form-echo.py, echo-content-escaped.py)"),
+    ("shadow-dom", "testdriver (focus, input, selection by input); layout; reftests"),
+    ("selection", "testdriver; layout (caret and extent by coordinates); reftests"),
+    ("uievents", "testdriver (keyboard, mouse, wheel, click order — the keyboard-event tests are uievents/keyboard); layout; manual pages"),
+    ("pointerevents", "testdriver (nearly every test drives a real pointer); TLS; layout"),
+    ("WebCryptoAPI", "idlharness; cross-origin hosts (secure_context/ non-secure origin); h2. `.https.` alone runs: it asks for a secure context, and 127.0.0.1 is potentially trustworthy (Secure Contexts §3.2)"),
+    ("compression", "nothing infrastructural: its one `.https.` file asks only for a secure context and runs (as WebCryptoAPI's do); worker-only globals are not run"),
+    ("resource-timing", "un-emulated handlers (status-code.py, compressed-js.py, redirect-cors.py, fake_responses.py, …); cross-origin hosts (TAO tests); TLS; auxiliary browsing contexts; layout"),
+    ("performance-timeline", "bfcache / remote contexts (back-forward-cache, not-restored-reasons); auxiliary browsing contexts; idlharness"),
+    ("console", "testdriver and manual pages (the -logging and -manual pages are read by a person); idlharness"),
+    ("html/infrastructure/urls", "TLS (.https.); legacy-charset documents served through un-emulated handlers (resource.py, stash.py, blank.py); cross-origin hosts"),
+];
+
+/// Directories whose `.https.` files ask only for a secure context (no second origin, no TLS-only feature): the
+/// stand-in's 127.0.0.1 origin is potentially trustworthy, so they run over http.
+const SECURE_CONTEXT_ONLY: &[&str] = &["WebCryptoAPI", "compression"];
+
+/// The `.py` handlers a test references, resolved like [`py_refs`], with `fetch/api`'s `RESOURCES_DIR + "x.py"`
+/// form (a bare name next to `resources/utils.js`) resolved to the sibling `resources/` directory when the bare
+/// resolution names no file in the checkout.
+fn wpt2_py_refs(root: &Path, rel_dir: &str, src: &str) -> Vec<String> {
+    py_refs(rel_dir, src)
+        .into_iter()
+        .map(|h| {
+            if root.join(&h).is_file() || h.contains("/resources/") {
+                return h;
+            }
+            let name = h.rsplit('/').next().unwrap_or(&h).to_string();
+            let mut d = rel_dir.to_string();
+            loop {
+                let cand = format!("{d}/resources/{name}");
+                if root.join(&cand).is_file() {
+                    return cand;
+                }
+                match d.rsplit_once('/') {
+                    Some((up, _)) => d = up.to_string(),
+                    None => return h,
+                }
+            }
+        })
+        .collect()
+}
+
+/// Why a test of an AETHERWPT2 directory is not run (None = run). Infrastructure only: what the stand-in, the
+/// headless page or the harness cannot provide. A missing API is never a reason.
+fn wpt2_excluded(root: &Path, rel: &str, src: &str) -> Option<String> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let dir = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let top = WPT2_DIRS.iter().map(|(d, _)| *d).filter(|d| rel.starts_with(&format!("{d}/"))).max_by_key(|d| d.len()).unwrap_or("");
+    if name.ends_with(".any.js") {
+        if let Some(g) = src.lines().find_map(|l| l.trim().strip_prefix("// META: global=")) {
+            if !g.split(',').any(|x| x.trim() == "window") {
+                return Some("not a window-global test (worker / shadowrealm globals only)".into());
+            }
+        }
+    }
+    if name.contains(".h2.") || name.contains(".serviceworker.") || name.contains(".sharedworker.") {
+        return Some("needs a TLS server (h2) or a service / shared worker variant".into());
+    }
+    if name.contains(".https.") && !SECURE_CONTEXT_ONLY.contains(&top) {
+        return Some("needs a TLS server (https)".into());
+    }
+    if name.contains("-manual.") {
+        return Some("manual test (a person reads the result)".into());
+    }
+    let scan = format!("{src}{}", helper_sources(root, rel, src));
+    if scan.contains("testdriver.js") || scan.contains("test_driver") {
+        return Some("testdriver (WebDriver input automation)".into());
+    }
+    if src.contains("idlharness") {
+        return Some("idlharness (interfaces/*.idl are not in the checkout)".into());
+    }
+    if scan.contains("RemoteContextHelper") || scan.contains("/common/dispatcher/") || name.contains("back-forward-cache") || rel.contains("/bfcache/") {
+        return Some("bfcache / remote browsing contexts".into());
+    }
+    if scan.contains("window.open(") {
+        return Some("auxiliary browsing contexts (window.open)".into());
+    }
+    if src.contains("REMOTE_ORIGIN") || src.contains("REMOTE_HOST") || src.contains("HTTP_REMOTE") || src.contains("OTHER_ORIGIN") || src.contains("{{domains[") || src.contains("{{hosts[") || src.contains("CROSSDOMAIN") || src.contains("get_host_info().HTTPS") || name.contains("cross-origin") || name.contains("access-control") || name.contains("cors") || dir.contains("/cors") || dir.contains("/credentials") {
+        return Some("cross-origin (no second origin with CORS in the stand-in)".into());
+    }
+    for h in wpt2_py_refs(root, dir, src) {
+        if !wpt_net::PY_HANDLERS.contains(&h.as_str()) {
+            return Some(format!("needs wptserve handler {h}"));
+        }
+    }
+    if scan.contains("/media/") {
+        return Some("media fixtures (/media/ is not in the sparse checkout)".into());
+    }
+    if [
+        "getBoundingClientRect", "getComputedStyle", "offsetWidth", "offsetHeight", "offsetTop", "offsetLeft", "clientWidth", "clientHeight", "scrollTop", "scrollLeft", "elementFromPoint", "scrollIntoView", "requestAnimationFrame", "caretPositionFromPoint",
+    ]
+    .iter()
+    .any(|t| src.contains(t))
+    {
+        return Some("layout / rendering (EYES is the oracle)".into());
+    }
+    None
+}
+
+/// Testharness-free HTML pages under `dir` (reftests, crash tests, manual pages): counted, not run.
+fn non_testharness_pages(root: &Path, dir: &str) -> usize {
+    let mut n = 0;
+    let mut stack = vec![root.join(dir)];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let f = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if !matches!(f.as_str(), "resources" | "support" | "handlers" | "tools") {
+                    stack.push(p);
+                }
+            } else if (f.ends_with(".html") || f.ends_with(".htm")) && !f.contains("-ref.") && !f.contains("-ref-") && !std::fs::read_to_string(&p).unwrap_or_default().contains("testharness.js") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+fn run_wpt2_dir(dir: &str, floor_pct: usize) {
+    let listed = WPT2_DIRS.iter().any(|(d, _)| *d == dir);
+    assert!(listed, "{dir} is not an AETHERWPT2 directory");
+    if !(cfg!(debug_assertions) && std::env::var("AETHER_WPT").is_err() && std::env::var("AETHER_WPT_ONLY").is_err()) {
+        if let Some(root) = locate() {
+            println!("wpt {dir}: {} reftest / crash / manual pages (no testharness.js) not run", non_testharness_pages(&root, dir));
+        }
+    }
+    // Crash tests and tool trees are not testharness tests (`net_files` already leaves resources/support/handlers).
+    run_served_dir(dir, floor_pct, &|root, rel, src| {
+        if ["/crashtests/", "/tools/", "/reference/", "/references/"].iter().any(|x| rel.contains(x)) {
+            return Some("not a testharness test (crash test / tool / reference)".into());
+        }
+        wpt2_excluded(root, rel, src)
+    });
+}
+
+macro_rules! wpt2_tests {
+    ($($name:ident => $dir:literal),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                // Floor 0 at landing (AETHERWPT2, SR135): the bench's first run sets each directory's floor.
+                run_wpt2_dir($dir, 0);
+            }
+        )*
+    };
+}
+
+wpt2_tests! {
+    wpt2_url => "url",
+    wpt2_encoding => "encoding",
+    wpt2_fetch_api => "fetch/api",
+    wpt2_streams => "streams",
+    wpt2_fileapi => "FileAPI",
+    wpt2_webstorage => "webstorage",
+    wpt2_indexeddb => "IndexedDB",
+    wpt2_html_browsers_history => "html/browsers/history",
+    wpt2_html_browsers_the_window_object => "html/browsers/the-window-object",
+    wpt2_html_browsers_browsing_the_web => "html/browsers/browsing-the-web",
+    wpt2_html_semantics_scripting_1 => "html/semantics/scripting-1",
+    wpt2_html_semantics_embedded_content => "html/semantics/embedded-content",
+    wpt2_html_semantics_tabular_data => "html/semantics/tabular-data",
+    wpt2_html_semantics_interactive_elements => "html/semantics/interactive-elements",
+    wpt2_html_semantics_text_level_semantics => "html/semantics/text-level-semantics",
+    wpt2_html_semantics_grouping_content => "html/semantics/grouping-content",
+    wpt2_custom_elements => "custom-elements",
+    wpt2_shadow_dom => "shadow-dom",
+    wpt2_selection => "selection",
+    wpt2_uievents => "uievents",
+    wpt2_pointerevents => "pointerevents",
+    wpt2_webcryptoapi => "WebCryptoAPI",
+    wpt2_compression => "compression",
+    wpt2_resource_timing => "resource-timing",
+    wpt2_performance_timeline => "performance-timeline",
+    wpt2_console => "console",
+    wpt2_html_infrastructure_urls => "html/infrastructure/urls",
+}
+
+/// Every AETHERWPT2 directory has its `wpt2_*` test (the macro list above and [`WPT2_DIRS`] agree), and the
+/// sparse checkout carries each one.
+#[test]
+fn wpt2_directory_table_is_complete() {
+    for (d, needs) in WPT2_DIRS {
+        assert!(SPARSE.lines().any(|l| l == format!("/{d}/")), "{d} is not in the sparse checkout");
+        assert!(!needs.is_empty(), "{d} names what it needs");
+    }
+    assert_eq!(WPT2_DIRS.len(), 27);
 }
