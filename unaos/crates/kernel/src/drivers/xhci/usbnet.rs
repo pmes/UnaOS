@@ -383,13 +383,13 @@ pub fn configured(slot: u8) {
 
 /// Bring-up state for the controller's service pass.
 pub fn bringup_pending() -> Option<u8> {
-    if STATE.load(Ordering::Relaxed) != ST_CONFIGURED || crate::arch::ms() < RETRY_AT_MS.load(Ordering::Relaxed) || !crate::boot::services_gate("usbnet") {
-        return None; // PUMPRETRY (B537): a refused try waits out its back-off on later passes (the pump runs on). INSTALLBARE (R86): the class bring-up (the register walk, rx arm, link poll) waits for the Desktop's services; enumeration already ran
+    if STATE.load(Ordering::Relaxed) != ST_CONFIGURED || crate::arch::ms() < RETRY_AT_MS.load(Ordering::Relaxed) || !crate::boot::services_gate("usbnet") || usbnet_bar_holds() {
+        return None; // FIRSTLOGIN (B636): and while the desktop's bar is unbuilt (flight 34 boot 1: this bring-up's 333 ms sat inside the first login's bar_ms=341). PUMPRETRY (B537): a refused try waits out its back-off on later passes (the pump runs on). INSTALLBARE (R86): the class bring-up (the register walk, rx arm, link poll) waits for the Desktop's services; enumeration already ran
     }
     crate::boot::note_start("usbnet");
     Some(SLOT.load(Ordering::Relaxed))
 }
-pub fn cfg_value() -> u8 { CFG_VALUE.load(Ordering::Relaxed) }
+pub fn cfg_value() -> u8 { CFG_VALUE.load(Ordering::Relaxed) } #[cfg(all(target_arch = "x86_64", feature = "wc"))] fn usbnet_bar_holds() -> bool { crate::video::desktopbuild::starter_holds("usbnet") } #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] fn usbnet_bar_holds() -> bool { false } // FIRSTLOGIN (B636): the class bring-up waits (bounded) for the bar's first paint, KVMLAT2's HDA hold made one call. LINE-NEUTRAL append, code first
 pub fn ctrl_iface() -> u8 { CTRL_IFACE.load(Ordering::Relaxed) }
 pub fn data_iface() -> u8 { DATA_IFACE.load(Ordering::Relaxed) }
 pub fn data_alt() -> u8 { DATA_ALT.load(Ordering::Relaxed) }
