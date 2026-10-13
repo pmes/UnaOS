@@ -24744,13 +24744,13 @@ fn clickplain_leg(owner: u64, other: u64, surf: usize, len: usize) -> Option<(bo
     let edges1 = sc::user_input_wake_edges();
     let _ = sc::user_input_enqueue(Button(0));
     let depth_release = sc::user_input_depth(owner);
-    let hit = queued && refocused && depth_press == 1 && depth_release == 2;
+    let hit = queued && refocused && depth_press == 1 + cfg!(feature = "desktop_firmware") as u32 && depth_release == 2 + cfg!(feature = "desktop_firmware") as u32; // AETHERPTR2 (B547): with the window system the focus arrival writes one INPUT_EV_MOUSE_ABS ahead of the press (`user_input_set_active` -> `ptr_abs_arrival`), so each depth is one deeper.
     let woke = edges1.wrapping_sub(edges0) >= 2;
 
     // --- deliver: the SAME window, now focused (the press above left focus here). Ordinary app input,
     // and it must stack on the pair already in the ring rather than replace it.
     let queued2 = sc::user_input_enqueue(Button(1));
-    let delivered = queued2 && sc::user_input_depth(owner) == 3;
+    let delivered = queued2 && sc::user_input_depth(owner) == 3 + cfg!(feature = "desktop_firmware") as u32; // AETHERPTR2 (B547): + the arrival's INPUT_EV_MOUSE_ABS.
     let _ = sc::user_input_enqueue(Button(0));
 
     close(w);

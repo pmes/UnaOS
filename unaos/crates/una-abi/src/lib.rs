@@ -413,9 +413,12 @@ pub const INPUT_EV_MOUSE_REL: u64 = 3;
 /// pointer on the glass: a program hit-tests from this position and never draws or estimates its own.
 /// x86 delivers one after every RELATIVE report it hands the focused program (the `INPUT_EV_MOUSE_REL`
 /// first, then this) and for every absolute (tablet) report in place of the device's raw 0..=32767
-/// coordinate. Owed on aarch64: its `pack_input` still forwards the device coordinate unchanged
-/// (`arch/aarch64/syscall.rs`, the `Event::MouseAbsolute` arm) and pushes nothing after a relative report;
-/// no aarch64 program reads this type today.
+/// coordinate. aarch64 does the same on an image with the window system (`desktop_firmware`, AETHERPTR2
+/// rmbp-ledger B547); an aarch64 image without it has no window to map into and forwards the device coordinate
+/// unchanged (`arch/aarch64/syscall.rs`, the `Event::MouseAbsolute` arm's knob-off half). On both arches one is
+/// also written at focus ARRIVAL (`user_input_set_active`, right after the ring reset, for an owner with a
+/// window), so a press that moves focus is hit-tested at the pointer's position, not at the last point the
+/// program was handed while it last had focus.
 pub const INPUT_EV_MOUSE_ABS: u64 = 4;
 /// A pointer button state. Payload `[7:0]` = button bitmask.
 pub const INPUT_EV_BUTTON: u64 = 5;

@@ -5968,7 +5968,7 @@ pub fn user_input_set_active(slot_plus1: u64) {
         if !slot_in_range(slot) {
             return; // not a real slot — refuse rather than publish a focus nobody can drain
         }
-        clear_input_row(slot); // a fresh focus starts clean
+        clear_input_row(slot); #[cfg(feature = "wc")] ptr_abs_arrival(slot); // a fresh focus starts clean. AETHERPTR2 (rmbp-ledger B547): then ONE INPUT_EV_MOUSE_ABS in the arriving program's window px, so a press that moved focus is hit-tested where the sprite is (fn at this file's tail). ⚠ LINE-NEUTRAL append.
         // VSYNC-PACE: the input-latency exemption. The first present from any of this slot's windows
         // after this point skips the pacer entirely — the frame that answers the operator's focus change
         // is the one frame where a frame of added latency reads as sluggishness rather than smoothness.
@@ -7931,7 +7931,7 @@ pub fn clickroute_selftest() {
     let rel_consumed = wc_click_route_at(Event::Button(0), bpx, bpy);
     let rel_ok = !rel_consumed && user_input_enqueue(Event::Button(0));
     let depth_rel = user_input_depth(OWNER_B);
-    let depth_ok = depth_press == 1 && depth_rel == 2 && rel_ok;
+    let depth_ok = depth_press == 1 + cfg!(feature = "wc") as u32 && depth_rel == 2 + cfg!(feature = "wc") as u32 && rel_ok; // AETHERPTR2 (B547): with wc the focus arrival on B writes one INPUT_EV_MOUSE_ABS ahead of the press (`ptr_abs_arrival`), so each depth is one deeper: depth=2/3.
 
     // Leg 4 — a press over KERNEL furniture, from a live app focus. Consumed; keyboard to the shell;
     // the raise is the row's own z-bump and `SHELL_Z` must not move.
@@ -7972,7 +7972,7 @@ pub fn clickroute_selftest() {
     let d_kept = user_input_active() == OWNER_A;
     // The keystream still reaches the previous owner: one event routed into the ACTIVE ring lands
     // in A's ring (the arrival reset it, so the depth read is exact).
-    let d_drains = user_input_enqueue(Event::Button(1)) && user_input_depth(OWNER_A) == 1;
+    let d_drains = user_input_enqueue(Event::Button(1)) && user_input_depth(OWNER_A) == 1 + cfg!(feature = "wc") as u32; // AETHERPTR2 (B547): + the arrival's INPUT_EV_MOUSE_ABS (A owns window `wa`).
     let d_nofab = wc_click_route_at(Event::Button(0), kpx, kpy);
     let deflect_ok = d_consumed && d_kept && d_drains && d_nofab;
     shell_key_sink_set_raw(sink_saved);
@@ -31060,4 +31060,29 @@ fn ptr_abs_follow(slot: usize, ev: &crate::pal::Event) {
     if let Some((x, y)) = ptr_win_px(slot as u64 + 1, px, py) {
         let _ = user_input_push(slot, una_abi::input_ev_pack(INPUT_EV_MOUSE_ABS, una_abi::input_ev_xy_payload(x, y)));
     }
+}
+
+/// AETHERPTR2 (rmbp-ledger B547) — focus ARRIVAL: after `user_input_set_active` reset `slot`'s ring, write ONE
+/// `INPUT_EV_MOUSE_ABS` with the system pointer in that program's window px. Without it a press that MOVES focus
+/// lands in the just-cleared ring before any position for the new window, and the program hit-tests at the last
+/// point it was handed — wherever the pointer was when it last had focus — until the next motion report. Only for
+/// an owner with a window (`ptr_win_px` is `None` otherwise): a windowless ring starts as empty as before.
+/// Written straight into the ring, NOT through `user_input_push`: no unnamed wake (the NAMED `"focus"` edge that
+/// `user_input_set_active` fires after publishing the focus word is this arrival's wake, so the D-3 resume witness
+/// and every wake counter read exactly as before) and no delivered count (the router delivered nothing). The ring
+/// was reset on the line before the call, so the full test cannot fire; it stays as the producer's invariant.
+#[cfg(feature = "wc")]
+fn ptr_abs_arrival(slot: usize) {
+    let (px, py) = click_pointer_pos();
+    let Some((x, y)) = ptr_win_px(slot as u64 + 1, px, py) else {
+        return;
+    };
+    let head = USER_INPUT_HEAD[slot].load(Ordering::Acquire);
+    let tail = USER_INPUT_TAIL[slot].load(Ordering::Relaxed);
+    if tail.wrapping_sub(head) >= INPUT_RING_CAP as u32 {
+        return;
+    }
+    let packed = una_abi::input_ev_pack(INPUT_EV_MOUSE_ABS, una_abi::input_ev_xy_payload(x, y));
+    USER_INPUT_BUF[slot][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
+    USER_INPUT_TAIL[slot].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
 }
