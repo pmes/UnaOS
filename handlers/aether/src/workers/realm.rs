@@ -661,19 +661,32 @@ const SCOPE: &str = r#"
     expose('ExtendableMessageEvent', ExtendableMessageEvent);
 
     // ---- clients, registration, skipWaiting
+    // AETHERWORKERS3 (SR129): every client this engine tracks is a top-level document, so each is a WindowClient
+    // (Service Workers §4.3): `visibilityState` 'visible' (a headless page is never hidden), `focused` false, and
+    // `focus()` rejects with InvalidAccessError — the spec's answer when the worker has no transient user
+    // activation to spend ("If this algorithm is not triggered by user activation, reject").
     var clientObj = function (c) {
         return {
             id: c.id, url: c.url, type: c.type || 'window', frameType: 'top-level',
+            visibilityState: 'visible', focused: false,
             postMessage: function (msg) { __sw_client_post(c.id, __sc_ser(msg)); },
+            focus: function () { return Promise.reject(new DOMException("Failed to execute 'focus' on 'WindowClient': Not allowed to focus a window.", 'InvalidAccessError')); },
         };
     };
+    // ClientQueryOptions.type (Service Workers §4.4.2): 'window' by default; 'worker' / 'sharedworker' match no
+    // tracked client (dedicated and shared workers are not service-worker clients here); 'all' matches every one.
+    var CLIENT_TYPES = ['window', 'worker', 'sharedworker', 'all'];
     expose('clients', {
         get: function (id) {
             return Promise.resolve(JSON.parse(__sw_clients(true)).filter(function (c) { return c.id === String(id); }).map(clientObj)[0]);
         },
         matchAll: function (o) {
             var all = !!(o && o.includeUncontrolled);
-            return Promise.resolve(JSON.parse(__sw_clients(all)).map(clientObj));
+            var type = (o && o.type !== undefined) ? String(o.type) : 'window';
+            if (CLIENT_TYPES.indexOf(type) < 0) {
+                return Promise.reject(new TypeError("Failed to execute 'matchAll' on 'Clients': The provided value '" + type + "' is not a valid enum value of type ClientType."));
+            }
+            return Promise.resolve(JSON.parse(__sw_clients(all)).filter(function (c) { return type === 'all' || (c.type || 'window') === type; }).map(clientObj));
         },
         claim: function () { __sw_claim(); return Promise.resolve(undefined); },
         openWindow: function () { __ledger('clients.openWindow-unsupported'); return Promise.reject(new TypeError('clients.openWindow is not supported.')); },

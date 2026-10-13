@@ -37,6 +37,9 @@
 //!     and a MessagePort, the detach rules, a ReadableStream refused by name, `messageerror` in a worker realm;
 //! 18. port garbage collection in a worker realm: an unreachable local pair is closed by the realm's collector,
 //!     a port whose peer is in the page is kept until that peer closes;
+//! 19. the AETHERSW (SR104) client gaps: `navigator.serviceWorker.ready` is one promise, `clients.matchAll`
+//!     filters by `type` (an invalid one rejects), a WindowClient's `visibilityState` / `focused` and its
+//!     `focus()` rejecting InvalidAccessError without user activation.
 //! No WPT: the seat runs the suites. Storage lives under CARGO_TARGET_TMPDIR.
 
 use std::io::{Read, Write};
@@ -858,4 +861,47 @@ fn an_unreachable_port_pair_in_a_worker_is_closed_by_its_collector() {
     assert_eq!(run_until(&mut p, "got.length >= 2", "got.join(',')", 60), "before:83,after:3", "the 80 unreachable ports are collected; keep and the cross-realm port stay");
     eval(&mut p, "c.port1.close(); w.postMessage('again');");
     assert_eq!(run_until(&mut p, "got.length >= 3", "got[2]", 60), "unentangled:2", "an unentangled port is collectable");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS3 (SR129) item 6
+
+/// Service Workers §3.4.4: `navigator.serviceWorker.ready` answers the same promise each time and resolves with
+/// the registration once it is active. §4.4.2 / §4.3 in the worker: `clients.matchAll({ type })` filters by
+/// client type ('worker' matches none of the window clients, 'all' with `includeUncontrolled` matches the
+/// page, an invalid type rejects TypeError); the page as a WindowClient is 'visible', not focused, and its
+/// `focus()` rejects InvalidAccessError (no user activation).
+#[test]
+fn service_worker_ready_is_one_promise_and_match_all_filters_by_type() {
+    let port = server_ex(|path| match path {
+        "/swc/sw.js" => Some(Fixture::js(
+            "self.addEventListener('message', function (e) {
+                 var c = e.source, out = [];
+                 clients.matchAll({ type: 'worker' }).then(function (l) {
+                     out.push('worker:' + l.length);
+                     return clients.matchAll({ type: 'all', includeUncontrolled: true });
+                 }).then(function (l) {
+                     out.push('all:' + (l.length >= 1));
+                     return clients.matchAll({ type: 'bogus' }).then(function () { out.push('bogus:ok'); }, function (x) { out.push('bogus:' + x.name); });
+                 }).then(function () {
+                     return clients.get(c.id);
+                 }).then(function (wc) {
+                     out.push('client:' + wc.type + ':' + wc.visibilityState + ':' + wc.focused);
+                     return wc.focus().then(function () { out.push('focus:ok'); }, function (x) { out.push('focus:' + x.name); });
+                 }).then(function () { c.postMessage(out.join(',')); });
+             });",
+        )),
+        _ => None,
+    });
+    let mut p = page(
+        &format!("http://127.0.0.1:{port}/swc/page"),
+        "var c0 = navigator.serviceWorker.controller;
+         var same = navigator.serviceWorker.ready === navigator.serviceWorker.ready;
+         var got = null, readyScope = null;
+         navigator.serviceWorker.onmessage = function (e) { got = e.data; };
+         navigator.serviceWorker.register('/swc/sw.js').then(function () { return navigator.serviceWorker.ready; })
+             .then(function (r) { readyScope = r.scope; r.active.postMessage('go'); });",
+    );
+    assert_eq!(eval(&mut p, "same"), "true", "ready is one promise");
+    assert_eq!(run_until(&mut p, "readyScope !== null", "readyScope", 20), format!("http://127.0.0.1:{port}/swc/"));
+    assert_eq!(run_until(&mut p, "got !== null", "got", 20), "worker:0,all:true,bogus:TypeError,client:window:visible:false,focus:InvalidAccessError");
 }
