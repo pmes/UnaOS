@@ -459,7 +459,7 @@ refs/heads/exec-host-aetherworkers2           12393dd6 FOLDED-BY-HAND 4264ea86
 refs/heads/exec-host-aetherrender3            12393dd6 FOLDED-BY-HAND b88b0486
 refs/heads/exec-host-jspos                    12393dd6 FOLDED-BY-HAND e65920c4
 refs/heads/exec-orin-armpipe                  12393dd6 FOLDED-BY-HAND 0a8cd3fa
-refs/heads/exec-orin-armtests                 4f3a436e IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-orin-armtests                 4f3a436e FOLDED-BY-HAND fba51881
 refs/heads/exec-host-aetherdevtools3          4f3a436e FOLDED-BY-HAND a920b5d5
 refs/heads/exec-host-aetherworkers3           4f3a436e IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-aetherpaintperf          4f3a436e IN-FLIGHT cloud 2026-10-13
