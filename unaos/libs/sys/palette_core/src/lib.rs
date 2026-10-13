@@ -560,3 +560,33 @@ pub mod softy {
     0xC9465C, // stria
     ];
 }
+
+/// STARFIELD (rmbp-ledger B661, R128) — the generated default wallpaper's palette: dark matter on ULTRA BLACK, the
+/// lensed stars, the zircon and the beam (`docs/dev/OS/05_USER_EXPERIENCE/STARFIELD.md` §3). `(Light, Dark)` pairs;
+/// the Dark set is the one the scene is for, the Light set is the same generator, quieter. Appended at the crate's
+/// tail so no line above moves.
+pub mod starfield {
+    /// The ground. Dark: ultra black, never `#000000` (DESIGN-LANGUAGE §2.3 keeps pure black for the console and the
+    /// media grounds; the blue survives two overlapping window shadows, so DESKTOPCRAFT's `black=` holds).
+    pub const VOID: (u32, u32) = (0x00E8_EAF4, 0x0004_0612);
+    /// The dark-matter haze and the faintest strokes (deep blue-violet).
+    pub const MATTER_DEEP: (u32, u32) = (0x00D3_D6EE, 0x0016_0F44);
+    /// The strokes at middle density (violet-blue).
+    pub const MATTER_MID: (u32, u32) = (0x00A3_AEE2, 0x0030_47C4);
+    /// The densest strokes and the streams' travelling glints (faint cyan; darker ink on Light).
+    pub const MATTER_HI: (u32, u32) = (0x0071_83CC, 0x0086_E2F2);
+    /// A star (blue-white; a muted dot on Light).
+    pub const STAR: (u32, u32) = (0x0088_93C8, 0x00DC_E6FF);
+    /// A warm bright star (the Starry Night yellow).
+    pub const STAR_WARM: (u32, u32) = (0x00C2_9A68, 0x00FF_E2B0);
+    /// The zircon's shadowed facets, its lit facets, its highlight and rim.
+    pub const ZIRCON_DEEP: (u32, u32) = (0x0025_5682, 0x0004_2440);
+    pub const ZIRCON_MID: (u32, u32) = (0x0056_9ED4, 0x0018_86C4);
+    pub const ZIRCON_LIGHT: (u32, u32) = (0x00F2_FAFF, 0x00BE_F6FF);
+    /// The zircon's fire (dispersion): a warm and a cool flash.
+    pub const FIRE_WARM: (u32, u32) = (0x00EE_AE6A, 0x00FF_B45A);
+    pub const FIRE_COOL: (u32, u32) = (0x00A2_86E6, 0x00B0_7CFF);
+    /// The beam's core and its glow.
+    pub const BEAM_CORE: (u32, u32) = (0x00FA_FCFF, 0x00F2_FAFF);
+    pub const BEAM_GLOW: (u32, u32) = (0x00B4_D2FA, 0x0060_B0FF);
+}

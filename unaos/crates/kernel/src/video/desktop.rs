@@ -28,7 +28,9 @@
 //! * [`track`] / [`shade_bytes`] / [`shade_words`] — THE SHADOW, both looks (below).
 //! * [`bar_row`] / [`dock_plate_row`] / [`dock_tile_row`] — the menu bar's field and the dock's plate and tiles.
 //! * [`wall_gen`] / [`veil_gen`] — the default wallpaper and its VEIL (the blurred copy every translucent strip
-//!   samples), built once per wallpaper by `video::wallpaper`.
+//!   samples), built once per wallpaper by `video::wallpaper`. STARFIELD (B661, R128): the default is the scene —
+//!   dark matter on ultra black, lensed stars, the zircon and the beam — and its sparse SHIMMER, re-tinted per tick by
+//!   [`shimmer_tick`] from [`track`]'s tail; `tests starfield` ([`starfield_selftest`]).
 //! * [`selftest`] — `tests desktopcraft` (R80: a verb, never at boot).
 //!
 //! THE SHADOW AND THE COMPOSITOR (DESIGNAPPLY B639, R122, DESIGN-LANGUAGE §2.4). The 5 pt frame and the bevel are
@@ -63,7 +65,7 @@
 //! GLASSKIT smoothstep over `[-blur, +blur]` (half the peak on the edge). A shaded pixel is then one table read per
 //! cast that reaches it and one multiply per channel.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::video::draw::{self, Ink, Radii, Rect, Surf};
 use crate::video::text::{self, Face};
@@ -113,14 +115,6 @@ pub struct Craft {
     /// The running indicator: its diameter and its opacity (153 = 60 %).
     pub dot: usize,
     pub dot_alpha: u32,
-    /// The wallpaper: the dark tone's darkening of `DESKTOP_BG`, the light tone's pull toward the accent, the glow's
-    /// peak, its radius in permille of the panel's height and its centre in permille of the panel.
-    pub wall_dark: u32,
-    pub wall_tint: u32,
-    pub glow_alpha: u32,
-    pub glow_radius_pm: usize,
-    pub glow_x_pm: usize,
-    pub glow_y_pm: usize,
 }
 
 pub const CRAFT: Craft = Craft {
@@ -142,12 +136,6 @@ pub const CRAFT: Craft = Craft {
     dock_hover: 10,
     dot: 4,
     dot_alpha: 153,
-    wall_dark: 90,
-    wall_tint: 96,
-    glow_alpha: 150,
-    glow_radius_pm: 620,
-    glow_x_pm: 300,
-    glow_y_pm: 760,
 };
 
 /// A pt length at the panel's scale, in device px.
@@ -607,11 +595,24 @@ pub(super) fn track() {
     // 1. The casting rows, topmost first (z, id, box, focused, zoomed) — under the table, nothing else held.
     let mut rows: [(u32, super::WinId, (usize, usize, usize, usize), bool); MAX_CASTS] = [(0, 0, (0, 0, 0, 0), false); MAX_CASTS];
     let mut nr = 0usize;
+    let (mut occ, mut no, mut occ_full) = ([(0usize, 0usize, 0usize, 0usize); SHIM_OCC], 0usize, false);
     {
         let shell = super::shell_z();
         let focus = super::focus_asid();
         let t = super::table();
         for r in t.rows.iter() {
+            if r.used && super::above_shell(r, shell) {
+                // STARFIELD (B661): every visible window's occluder box (its shadow extent) — the shimmer skips them.
+                let b = occluder_box(r, shell, focus);
+                if b.2 != 0 && b.3 != 0 {
+                    if no < SHIM_OCC {
+                        occ[no] = b;
+                        no += 1;
+                    } else {
+                        occ_full = true;
+                    }
+                }
+            }
             if !casts(r, shell) {
                 continue;
             }
@@ -668,6 +669,9 @@ pub(super) fn track() {
         *g = now;
     }
     if nf == 0 {
+        if !occ_full {
+            shimmer_live(&occ[..no], pw as usize, ph as usize); // STARFIELD (B661): the shimmer rides an idle pass only
+        }
         return;
     }
     TRACK_FILLS.fetch_add(1, Ordering::Relaxed);
@@ -1139,61 +1143,1292 @@ pub fn dock_tile_row(out: &mut [u32], w: usize, j: usize, x: usize, y: usize, tw
 /// The 4x4 ordered-dither matrix in 1/256 of a step (`draw`'s own values).
 const BAYER: [u32; 16] = [8, 136, 40, 168, 200, 72, 232, 104, 56, 184, 24, 152, 248, 120, 216, 88];
 
-/// **The default wallpaper** into `px` (`w` x `h`): a soft two-tone diagonal from `DESKTOP_BG` darkened (top left)
-/// to `DESKTOP_BG` pulled toward the accent (bottom right), and a large soft disc of the accent low and left of
-/// centre — every colour derived from the live tokens, ordered-dithered so an 8-bit panel shows no banding.
-/// Integer only; one table of `w` words.
-pub fn wall_gen(px: &mut [u32], w: usize, h: usize) {
-    if w == 0 || h == 0 || px.len() < w * h {
+// ── STARFIELD (rmbp-ledger B661, R128) — the generated default: dark matter, lensed stars, the zircon, the beam ──────
+//
+// Peter (R128): the start screen SHIMMERS; the crystal less Picasso; the Starry Night flow read as DARK MATTER on ULTRA
+// BLACK; a beam striking a temple-sized ZIRCON in the FOREGROUND; the background stars GRAVITATIONALLY LENSED through
+// the flow's mass. The design record (written before this code, R106) is `docs/dev/OS/05_USER_EXPERIENCE/STARFIELD.md`:
+// §3 the composition, §4 the field, §5 the lens math, §6 the zircon, §7 the beam, §8 the shimmer. Integer only. The
+// picture is painted ONCE per install on the worker core (`wallpaper::generate`); per frame only the sparse SHIMMER runs
+// ([`shimmer_tick`], seated at [`track`]'s tail). Every colour is a `theme::starfield` pair (`palette_core`).
+
+/// The scene's palette, resolved once per generation from the live set (Dark is the scene, Light the quieter one).
+#[derive(Clone, Copy)]
+struct SfPal {
+    void: u32,
+    deep: u32,
+    mid: u32,
+    hi: u32,
+    star: u32,
+    warm: u32,
+    zd: u32,
+    zm: u32,
+    zl: u32,
+    fw: u32,
+    fc: u32,
+    core: u32,
+    glow: u32,
+}
+
+impl SfPal {
+    fn live() -> SfPal {
+        use crate::video::theme::starfield as sf;
+        let dark = theme::is_dark();
+        let p = |t: (u32, u32)| if dark { t.1 } else { t.0 };
+        SfPal {
+            void: p(sf::VOID),
+            deep: p(sf::MATTER_DEEP),
+            mid: p(sf::MATTER_MID),
+            hi: p(sf::MATTER_HI),
+            star: p(sf::STAR),
+            warm: p(sf::STAR_WARM),
+            zd: p(sf::ZIRCON_DEEP),
+            zm: p(sf::ZIRCON_MID),
+            zl: p(sf::ZIRCON_LIGHT),
+            fw: p(sf::FIRE_WARM),
+            fc: p(sf::FIRE_COOL),
+            core: p(sf::BEAM_CORE),
+            glow: p(sf::BEAM_GLOW),
+        }
+    }
+}
+
+/// `dst` toward `src` by `a` of 256 (exact at both ends; no lane carries into the next).
+#[inline]
+fn sf_mix(dst: u32, src: u32, a: u32) -> u32 {
+    let a = a.min(256);
+    let na = 256 - a;
+    let rb = (((src & 0x00FF_00FF) * a + (dst & 0x00FF_00FF) * na) >> 8) & 0x00FF_00FF;
+    let g = (((src & 0x0000_FF00) * a + (dst & 0x0000_FF00) * na) >> 8) & 0x0000_FF00;
+    rb | g
+}
+
+/// The sum of the three channels' absolute differences.
+#[inline]
+fn sf_dist(a: u32, b: u32) -> u32 {
+    [16u32, 8, 0].iter().map(|&s| (((a >> s) & 255) as i32 - ((b >> s) & 255) as i32).unsigned_abs()).sum()
+}
+
+/// A 64-bit mix of a lattice point and a seed (splitmix's finaliser).
+#[inline]
+fn sf_hash(a: i64, b: i64, seed: u64) -> u64 {
+    let mut z = (a as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (b as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ seed.wrapping_mul(0x1656_67B1_9E37_79F9);
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Value noise at pixel `(x, y)` over a lattice `l` px wide: Q12 (0..=4095), smoothstep-bilinear.
+fn sf_vn(x: i64, y: i64, l: i64, seed: u64) -> i64 {
+    let l = l.max(1);
+    let (fx, fy) = ((x * 4096).div_euclid(l), (y * 4096).div_euclid(l));
+    let (ix, iy) = (fx >> 12, fy >> 12);
+    let (tx, ty) = (fx & 4095, fy & 4095);
+    let sm = |t: i64| (t * t * (3 * 4096 - 2 * t)) >> 24;
+    let (sx, sy) = (sm(tx), sm(ty));
+    let hv = |a: i64, b: i64| (sf_hash(a, b, seed) >> 52) as i64;
+    let (a, b, c, d) = (hv(ix, iy), hv(ix + 1, iy), hv(ix, iy + 1), hv(ix + 1, iy + 1));
+    let top = a + (((b - a) * sx) >> 12);
+    let bot = c + (((d - c) * sx) >> 12);
+    top + (((bot - top) * sy) >> 12)
+}
+
+/// `sin(deg)` in Q12 (Bhaskara I's approximation; under 0.2 % off).
+fn sf_sin(deg: i64) -> i64 {
+    let d = deg.rem_euclid(360);
+    let (x, s) = if d >= 180 { (d - 180, -1) } else { (d, 1) };
+    let p = x * (180 - x);
+    s * (4 * p * 4096) / (40500 - p)
+}
+
+fn sf_cos(deg: i64) -> i64 {
+    sf_sin(deg + 90)
+}
+
+#[inline]
+fn sf_isqrt(v: i64) -> i64 {
+    draw::isqrt(v.max(0) as u64) as i64
+}
+
+/// A zeroed `i32` table, or `None` without memory.
+fn sf_vec(n: usize) -> Option<alloc::vec::Vec<i32>> {
+    let mut v = alloc::vec::Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v)
+}
+
+/// Blend `col` into pixel `(x, y)` at `a` of 256 (bounds-checked).
+#[inline]
+fn sf_plot(px: &mut [u32], w: usize, h: usize, x: i64, y: i64, col: u32, a: u32) {
+    if a == 0 || x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
         return;
     }
-    let base = theme::DESKTOP_BG;
-    let acc = theme::accent();
-    let t0 = draw::blend(base, 0, CRAFT.wall_dark);
-    let t1 = draw::blend(base, acc, CRAFT.wall_tint);
-    let glow = draw::blend(acc, theme::knob_face(), 48);
-    let ch = |c: u32, s: u32| ((c >> s) & 255) as i64;
-    let (a0, a1) = ([ch(t0, 16), ch(t0, 8), ch(t0, 0)], [ch(t1, 16), ch(t1, 8), ch(t1, 0)]);
-    let gl = [ch(glow, 16), ch(glow, 8), ch(glow, 0)];
-    // The diagonal parameter, Q15 per axis (so x + y spans 0 ..= 65536).
-    let mut tx = alloc::vec::Vec::new();
-    if tx.try_reserve_exact(w).is_err() {
+    let o = y as usize * w + x as usize;
+    px[o] = sf_mix(px[o], col, a);
+}
+
+/// Blend `col` at the Q8 sub-pixel point `(x, y)`, spread bilinearly over its four pixels.
+#[inline]
+fn sf_splat(px: &mut [u32], w: usize, h: usize, x: i64, y: i64, col: u32, a: u32) {
+    if a == 0 || x < 0 || y < 0 {
         return;
     }
-    tx.extend((0..w).map(|x| ((x as u64 * 32768) / w.max(2) as u64) as i64));
-    let rad = (h * CRAFT.glow_radius_pm / 1000).max(1) as i64;
-    let (gx, gy) = ((w * CRAFT.glow_x_pm / 1000) as i64, (h * CRAFT.glow_y_pm / 1000) as i64);
-    let r2 = rad * rad;
-    let inv = (1i64 << 40) / r2.max(1);
-    for y in 0..h {
-        let ty = (y as i64 * 32768) / h.max(2) as i64;
-        let dy = y as i64 - gy;
-        let dy2 = dy * dy;
-        let in_rows = dy2 < r2;
-        let row = &mut px[y * w..(y + 1) * w];
-        for (x, p) in row.iter_mut().enumerate() {
-            let t = tx[x] + ty; // 0 ..= 65536
-            let mut c = [0i64; 3];
-            for k in 0..3 {
-                c[k] = (a0[k] << 8) + ((a1[k] - a0[k]) * t >> 8);
+    let (ix, iy) = (x >> 8, y >> 8);
+    let (fx, fy) = ((x & 255) as u32, (y & 255) as u32);
+    let ws = [(256 - fx) * (256 - fy), fx * (256 - fy), (256 - fx) * fy, fx * fy];
+    for (k, &wt) in ws.iter().enumerate() {
+        sf_plot(px, w, h, ix + (k & 1) as i64, iy + (k >> 1) as i64, col, (a.min(256) * wt) >> 16);
+    }
+}
+
+/// THE FIELD (STARFIELD.md §4): the dark-matter density, its smoothed potential, the flow (the curl of the stream
+/// function) and the lens gradient, on a node grid of `c` px (node `i` at pixel `(i - 1) c`).
+struct SfField {
+    c: i64,
+    gw: usize,
+    gh: usize,
+    dens: alloc::vec::Vec<i32>,
+    phi: alloc::vec::Vec<i32>,
+    ux: alloc::vec::Vec<i32>,
+    uy: alloc::vec::Vec<i32>,
+    gx: alloc::vec::Vec<i32>,
+    gy: alloc::vec::Vec<i32>,
+    gmax: i64,
+}
+
+/// The three Starry Night vortices: centre (permille of W, H), radius (permille of H), strength per px of radius.
+const SF_VORTEX: [(i64, i64, i64, i64); 3] = [(340, 300, 200, 60), (620, 160, 110, -50), (140, 620, 130, 55)];
+
+impl SfField {
+    fn build(w: usize, h: usize) -> Option<SfField> {
+        let c = (h as i64 / 72).max(8);
+        let (gw, gh) = (w / c as usize + 4, h / c as usize + 4);
+        let n = gw * gh;
+        let (mut dens, mut phi, mut tmp) = (sf_vec(n)?, sf_vec(n)?, sf_vec(n)?);
+        let (mut ux, mut uy, mut gx, mut gy) = (sf_vec(n)?, sf_vec(n)?, sf_vec(n)?, sf_vec(n)?);
+        let (ww, hh) = (w as i64, h as i64);
+        let l1 = (hh * 10 / 25).max(16);
+        let (l2, l3, l0) = ((l1 * 10 / 21).max(8), (l1 * 10 / 44).max(4), (hh * 10 / 16).max(16));
+        let ridge = |v: i64| {
+            let r = 4095 - (2 * v - 4095).abs();
+            let r = (r * r) >> 12;
+            (r * r) >> 12
+        };
+        let node = |i: usize, j: usize| ((i as i64 - 1) * c, (j as i64 - 1) * c);
+        for j in 0..gh {
+            for i in 0..gw {
+                let (x, y) = node(i, j);
+                let (r1, r2, r3) = (ridge(sf_vn(x, y, l1, 1)), ridge(sf_vn(x, y, l2, 2)), ridge(sf_vn(x, y, l3, 3)));
+                let d = (5 * r1 + 3 * ((r2 * (r1 + 1024)) >> 12) + 2 * ((r3 * (r2 + 1024)) >> 12)) / 10;
+                dens[j * gw + i] = d.clamp(0, 4095) as i32;
             }
-            if in_rows {
-                let dx = x as i64 - gx;
-                let d2 = dx * dx + dy2;
-                if d2 < r2 {
-                    let q = 256 - ((d2 * inv) >> 32).min(256); // 256 at the centre, 0 at the rim
-                    let f = q * q * q >> 16; // a smooth falloff, 0 ..= 256
-                    let a = f * CRAFT.glow_alpha as i64 >> 8; // 0 ..= alpha (of 256)
-                    for k in 0..3 {
-                        c[k] += ((gl[k] << 8) - c[k]) * a >> 8;
+        }
+        // The potential: the density blurred four times by [1 2 1] each way (the lens sees a smoother mass).
+        phi.copy_from_slice(&dens);
+        for _ in 0..4 {
+            for j in 0..gh {
+                for i in 0..gw {
+                    let (l, r) = (i.saturating_sub(1), (i + 1).min(gw - 1));
+                    tmp[j * gw + i] = (phi[j * gw + l] + 2 * phi[j * gw + i] + phi[j * gw + r]) / 4;
+                }
+            }
+            for j in 0..gh {
+                let (u, d) = (j.saturating_sub(1), (j + 1).min(gh - 1));
+                for i in 0..gw {
+                    phi[j * gw + i] = (tmp[u * gw + i] + 2 * tmp[j * gw + i] + tmp[d * gw + i]) / 4;
+                }
+            }
+        }
+        // The stream function: the potential, a coarse drift and the vortices.
+        for j in 0..gh {
+            for i in 0..gw {
+                let (x, y) = node(i, j);
+                let mut p = phi[j * gw + i] as i64 + (sf_vn(x, y, l0, 4) - 2048) / 2;
+                for &(vx, vy, vr, va) in SF_VORTEX.iter() {
+                    let (cx, cy, rr) = (ww * vx / 1000, hh * vy / 1000, (hh * vr / 1000).max(1));
+                    let (dx, dy) = (x - cx, y - cy);
+                    let r2 = dx * dx + dy * dy;
+                    if r2 < rr * rr {
+                        let q = 4096 - r2 * 4096 / (rr * rr);
+                        p += va * rr * q / 4096 * q / 4096;
+                    }
+                }
+                tmp[j * gw + i] = p as i32;
+            }
+        }
+        // The flow (the curl, normalised to Q12) and the lens gradient (per cell).
+        let mut gm = 0i64;
+        for j in 0..gh {
+            let (u, d) = (j.saturating_sub(1), (j + 1).min(gh - 1));
+            for i in 0..gw {
+                let (l, r) = (i.saturating_sub(1), (i + 1).min(gw - 1));
+                let k = j * gw + i;
+                let (dpx, dpy) = ((tmp[j * gw + r] - tmp[j * gw + l]) as i64, (tmp[d * gw + i] - tmp[u * gw + i]) as i64);
+                let (vx, vy) = (dpy, -dpx);
+                let m = sf_isqrt(vx * vx + vy * vy);
+                if m > 0 {
+                    ux[k] = (vx * 4096 / m) as i32;
+                    uy[k] = (vy * 4096 / m) as i32;
+                } else {
+                    ux[k] = 4096;
+                    uy[k] = 0;
+                }
+                let (a, b) = (((phi[j * gw + r] - phi[j * gw + l]) / 2) as i64, ((phi[d * gw + i] - phi[u * gw + i]) / 2) as i64);
+                gx[k] = a as i32;
+                gy[k] = b as i32;
+                if i > 0 && j > 0 && i + 1 < gw && j + 1 < gh {
+                    gm = gm.max(sf_isqrt(a * a + b * b));
+                }
+            }
+        }
+        Some(SfField { c, gw, gh, dens, phi, ux, uy, gx, gy, gmax: gm.max(1) })
+    }
+
+    /// Table `v` bilinearly at the Q8 pixel point `(xq, yq)`.
+    #[inline]
+    fn at(&self, v: &[i32], xq: i64, yq: i64) -> i64 {
+        let cq = self.c << 8;
+        let (u, s) = (xq + cq, yq + cq);
+        let i = (u.max(0) / cq).min(self.gw as i64 - 2);
+        let j = (s.max(0) / cq).min(self.gh as i64 - 2);
+        let fx = ((u - i * cq) * 256 / cq).clamp(0, 256);
+        let fy = ((s - j * cq) * 256 / cq).clamp(0, 256);
+        let (i, j, g) = (i as usize, j as usize, self.gw);
+        let (a, b, c, d) = (v[j * g + i] as i64, v[j * g + i + 1] as i64, v[(j + 1) * g + i] as i64, v[(j + 1) * g + i + 1] as i64);
+        let t = a * 256 + (b - a) * fx;
+        let bo = c * 256 + (d - c) * fx;
+        (t * 256 + (bo - t) * fy) >> 16
+    }
+}
+
+/// 1. THE GROUND AND THE HAZE: ultra black, the dark-matter web as a faint glow (`v^2`, `v = (3 D + Phi) / 4`), a
+/// vignette on the added light, ordered-dithered. Per pixel: two bilinear reads off per-column and per-row tables.
+fn sf_haze(px: &mut [u32], w: usize, h: usize, f: &SfField, p: &SfPal) -> Option<()> {
+    let cq = f.c;
+    let mut cols: alloc::vec::Vec<(u32, i32)> = alloc::vec::Vec::new();
+    cols.try_reserve_exact(w).ok()?;
+    for x in 0..w {
+        let u = x as i64 + cq;
+        let i = (u / cq).min(f.gw as i64 - 2);
+        cols.push((i as u32, ((u - i * cq) * 256 / cq) as i32));
+    }
+    let ch = |c: u32| [((c >> 16) & 255) as i32, ((c >> 8) & 255) as i32, (c & 255) as i32];
+    let (v0, v1, v2) = (ch(p.void), ch(p.deep), ch(p.mid));
+    let (cx, cy) = (w as i64 / 2, h as i64 / 2);
+    let inv = (110i64 << 32) / (cx * cx + cy * cy).max(1);
+    let gw = f.gw;
+    for y in 0..h {
+        let s = y as i64 + cq;
+        let j = (s / cq).min(f.gh as i64 - 2) as usize;
+        let fy = ((s - j as i64 * cq) * 256 / cq) as i32;
+        let dy2 = (y as i64 - cy) * (y as i64 - cy);
+        let (r0, r1) = (j * gw, (j + 1) * gw);
+        let row = &mut px[y * w..(y + 1) * w];
+        for (x, o) in row.iter_mut().enumerate() {
+            let (i, fx) = cols[x];
+            let i = i as usize;
+            let bil = |v: &[i32]| {
+                let t = v[r0 + i] * 256 + (v[r0 + i + 1] - v[r0 + i]) * fx;
+                let b = v[r1 + i] * 256 + (v[r1 + i + 1] - v[r1 + i]) * fx;
+                (t * 256 + (b - t) * fy) >> 16
+            };
+            let vv = ((3 * bil(&f.dens) + bil(&f.phi)) >> 2).clamp(0, 4095);
+            let dx = x as i64 - cx;
+            let vig = 256 - (((dx * dx + dy2) * inv) >> 32) as i32;
+            let a = ((((vv * vv) >> 16) * vig) >> 8) * 150 >> 8;
+            let hi = if vv > 3000 { ((vv - 3000) * a) >> 11 } else { 0 };
+            let dth = BAYER[((y & 3) << 2) | (x & 3)] as i32;
+            let q = |k: usize| ((((v0[k] << 8) + (v1[k] - v0[k]) * a + (v2[k] - v1[k]) * hi) + dth) >> 8).clamp(0, 255) as u32;
+            *o = (q(0) << 16) | (q(1) << 8) | q(2);
+        }
+    }
+    Some(())
+}
+
+/// 2. THE FLOW (Van Gogh strokes): streamlines of the curl from a jittered seed grid, integrated both ways by the
+/// midpoint rule one px a step, tapered at the tips; luminance = the density at the seed. Every 7th step of a bright
+/// stroke is a shimmer candidate `(x, y, phase along the stroke)`. Returns the strokes drawn.
+fn sf_strokes(px: &mut [u32], w: usize, h: usize, f: &SfField, p: &SfPal, cand: &mut alloc::vec::Vec<(u16, u16, u16)>) -> u32 {
+    let (ww, hh) = (w as i64, h as i64);
+    let sp = (hh / 60).max(6);
+    let (lmin, lvar) = ((hh * 18 / 1800).max(6), (hh * 90 / 1800).max(8));
+    let mut n = 0u32;
+    for gy in 0..hh / sp + 1 {
+        for gx in 0..ww / sp + 1 {
+            let r = sf_hash(gx, gy, 11);
+            let (x0, y0) = (gx * sp + (r % sp as u64) as i64, gy * sp + ((r >> 16) % sp as u64) as i64);
+            if x0 >= ww || y0 >= hh {
+                continue;
+            }
+            let (xq, yq) = ((x0 << 8) + 128, (y0 << 8) + 128);
+            let d0 = f.at(&f.dens, xq, yq).clamp(0, 4095);
+            if d0 < 400 && (r >> 40) & 3 != 0 {
+                continue; // the voids keep one faint stroke in four
+            }
+            let half = (lmin + ((r >> 24) % lvar as u64) as i64) / 2;
+            let tone = (d0 + ((r >> 44) & 511) as i64 - 256).clamp(0, 4095) as u32;
+            let col = if tone < 2048 { sf_mix(p.deep, p.mid, tone >> 3) } else { sf_mix(p.mid, p.hi, (tone - 2048) >> 3) };
+            let ab = 24 + d0 * 200 / 4096;
+            let wid = 1 + (d0 > 1800) as i64 + (d0 > 3200) as i64;
+            let bright = ab > 120;
+            n += 1;
+            for dir in [1i64, -1] {
+                let (mut x, mut y) = (xq, yq);
+                for st in 0..half {
+                    let (ux, uy) = (f.at(&f.ux, x, y), f.at(&f.uy, x, y));
+                    let (mx, my) = (x + dir * ux / 32, y + dir * uy / 32);
+                    let (vx, vy) = (f.at(&f.ux, mx, my), f.at(&f.uy, mx, my));
+                    x += dir * vx / 16;
+                    y += dir * vy / 16;
+                    if x < 0 || y < 0 || x >= ww << 8 || y >= hh << 8 {
+                        break;
+                    }
+                    let tip = st * 256 / half.max(1);
+                    let a = (ab * (256 - ((tip * tip) >> 8)) >> 8) as u32;
+                    sf_splat(px, w, h, x, y, col, a);
+                    for k in 1..wid {
+                        sf_splat(px, w, h, x - vy * k / 16, y + vx * k / 16, col, a * 3 / 4);
+                    }
+                    if bright && st % 7 == 3 && cand.len() < 60_000 && cand.try_reserve(1).is_ok() {
+                        cand.push(((x >> 8) as u16, (y >> 8) as u16, ((st * dir * 1200) as u64).wrapping_add(r) as u16));
                     }
                 }
             }
-            let dth = BAYER[((y & 3) << 2) | (x & 3)] as i64;
-            let q = |v: i64| (((v + dth) >> 8).clamp(0, 255)) as u32;
-            *p = (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2]);
         }
     }
+    n
+}
+
+/// A drawn star: its source `b` and image `t` (Q8), the lens gradient there, brightness, class, stretch.
+#[derive(Clone, Copy)]
+struct SfStar {
+    bq: (i64, i64),
+    tq: (i64, i64),
+    g: (i64, i64),
+    b: u32,
+    class: u8,
+    stretched: bool,
+}
+
+/// One lens probe the fixture checks: the source, the image (Q8 px) and the gradient there.
+#[derive(Clone, Copy, Default)]
+pub struct SfProbe {
+    pub bq: (i64, i64),
+    pub tq: (i64, i64),
+    pub g: (i64, i64),
+}
+
+/// 3. THE STARS, LENSED (STARFIELD.md §5): source `b` by hash; `delta = -G Dmax / Gmax` (away from the mass); image
+/// `t = b + delta`; stretched into an arc `1 + |G| Smax / Gmax` px along the tangent `(-Gy, Gx)`; magnified by
+/// `1 + 0.75 |G| / Gmax`. Returns `(drawn, displaced by >= 1 px)`.
+fn sf_stars(px: &mut [u32], w: usize, h: usize, f: &SfField, p: &SfPal, out: &mut alloc::vec::Vec<SfStar>) -> Option<(u32, u32)> {
+    let (ww, hh) = (w as i64, h as i64);
+    let n = ((3000 * ww * hh) / (2880 * 1800)).max(300) as usize;
+    out.try_reserve_exact(n).ok()?;
+    let (dmax, smax) = ((hh / 100).max(2), (hh / 225).max(1));
+    let (rh, sk) = ((hh * 4 / 1800).max(2), (hh * 10 / 1800).max(3));
+    let (mut drawn, mut lensed) = (0u32, 0u32);
+    for k in 0..n as i64 {
+        let r = sf_hash(k, 7, 21);
+        let bq = (((r % ww as u64) as i64) << 8 | 128, (((r >> 24) % hh as u64) as i64) << 8 | 128);
+        let (gx, gy) = (f.at(&f.gx, bq.0, bq.1), f.at(&f.gy, bq.0, bq.1));
+        let gm = sf_isqrt(gx * gx + gy * gy);
+        let (dx, dy) = (-gx * dmax * 256 / f.gmax, -gy * dmax * 256 / f.gmax);
+        let tq = (bq.0 + dx, bq.1 + dy);
+        if tq.0 < 0 || tq.1 < 0 || tq.0 >= ww << 8 || tq.1 >= hh << 8 {
+            continue;
+        }
+        if dx * dx + dy * dy >= 256 * 256 {
+            lensed += 1;
+        }
+        let u = ((r >> 48) & 4095) as i64;
+        let class: u8 = if u > 3972 { 2 } else if u > 3480 { 1 } else { 0 };
+        let mag = (((u * u) >> 12) * u) >> 12;
+        let mu = 256 + gm * 192 / f.gmax;
+        let b = (((24 + mag * 200 / 4095) * mu) >> 8).min(256) as u32;
+        let col = if class == 2 && (r >> 8) % 3 == 0 { p.warm } else { p.star };
+        let l = 1 + gm * smax / f.gmax;
+        let stretched = l >= 2;
+        if stretched {
+            let (tx, ty) = (-gy * 256 / gm.max(1), gx * 256 / gm.max(1));
+            let steps = l * 2;
+            for i in -steps..=steps {
+                let e = 256 - i.abs() * 256 / (steps + 1);
+                sf_splat(px, w, h, tq.0 + tx * i / 2, tq.1 + ty * i / 2, col, ((b as i64 * e) >> 8) as u32 * 3 / 4);
+            }
+        } else {
+            sf_splat(px, w, h, tq.0, tq.1, col, b);
+            if class >= 1 {
+                for (ox, oy) in [(256i64, 0i64), (-256, 0), (0, 256), (0, -256)] {
+                    sf_splat(px, w, h, tq.0 + ox, tq.1 + oy, col, b / 3);
+                }
+            }
+        }
+        if class == 2 {
+            let (cx, cy) = (tq.0 >> 8, tq.1 >> 8);
+            for oy in -rh..=rh {
+                for ox in -rh..=rh {
+                    let d2 = ox * ox + oy * oy;
+                    if d2 <= rh * rh {
+                        let q = 256 - d2 * 256 / (rh * rh + 1);
+                        sf_plot(px, w, h, cx + ox, cy + oy, col, ((b as i64 * q * q) >> 16) as u32 / 3);
+                    }
+                }
+            }
+            for i in 1..=sk {
+                let a = (b as i64 * (sk + 1 - i) / (sk + 1)) as u32 / 2;
+                for (sx, sy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
+                    sf_plot(px, w, h, cx + sx * i, cy + sy * i, col, a);
+                }
+            }
+        }
+        drawn += 1;
+        out.push(SfStar { bq, tq, g: (gx, gy), b, class, stretched });
+    }
+    Some((drawn, lensed))
+}
+
+/// The zircon as drawn: its silhouette's per-column top and bottom (`i32::MAX` / -1 where it is absent), its box,
+/// the apex, and how many of its facets face the camera.
+struct SfGem {
+    top: alloc::vec::Vec<i32>,
+    bot: alloc::vec::Vec<i32>,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+    apex: (i64, i64),
+    front: u32,
+}
+
+/// The zircon's facet count: 8 prism quads, 8 crown triangles, the base.
+pub const ZIRCON_FACETS: u32 = 17;
+
+/// 4. THE ZIRCON (STARFIELD.md §6): an octagonal prism under an octagonal pyramid and a base, tilted -15 degrees,
+/// projected in perspective to 45 % of the panel's height at (0.78 W, base 0.965 H); front facets only (convex: they
+/// tile the silhouette), each flat-shaded from the beam's light with a specular, a Fresnel rim and the crown's fire,
+/// silhouette edges anti-aliased, interior edges a faint highlight line.
+fn sf_zircon(px: &mut [u32], w: usize, h: usize, p: &SfPal) -> Option<SfGem> {
+    const N: usize = 8;
+    let (ww, hh) = (w as i64, h as i64);
+    let (yb, yt, ya) = (-7168i64, 1229i64, 6349i64);
+    let mut v = [[0i64; 3]; 17];
+    for k in 0..N {
+        let a = 20 + 45 * k as i64;
+        let (c, s) = (sf_cos(a), sf_sin(a));
+        v[k] = [c, yt, s];
+        v[N + k] = [c, yb, s];
+    }
+    v[16] = [0, ya, 0];
+    // Faces: vertex ring, vertex count, the neighbour face across each edge (edge e runs vertex e -> e + 1).
+    let mut faces = [([0usize; 8], 0usize, [0usize; 8]); 17];
+    for k in 0..N {
+        let (k1, km) = ((k + 1) % N, (k + N - 1) % N);
+        faces[k] = ([N + k, N + k1, k1, k, 0, 0, 0, 0], 4, [16, k1, 8 + k, km, 0, 0, 0, 0]);
+        faces[8 + k] = ([k, k1, 16, 0, 0, 0, 0, 0], 3, [k, 8 + k1, 8 + km, 0, 0, 0, 0, 0]);
+    }
+    let (mut bv, mut bn) = ([0usize; 8], [0usize; 8]);
+    for e in 0..N {
+        let j = N - 1 - e; // edge B_j -> B_(j-1), shared with prism j-1
+        bv[e] = N + j;
+        bn[e] = (j + N - 1) % N;
+    }
+    faces[16] = (bv, 8, bn);
+    // The tilt (top toward the camera), then the camera's depth.
+    let (ct, st) = (sf_cos(-15), sf_sin(-15));
+    let tilt = |q: [i64; 3]| [q[0], (q[1] * ct - q[2] * st) >> 12, (q[1] * st + q[2] * ct) >> 12];
+    let zc = 7 * 4096;
+    let mut cv = [[0i64; 3]; 17];
+    for k in 0..17 {
+        let t = tilt(v[k]);
+        cv[k] = [t[0], t[1], t[2] + zc];
+    }
+    let centre = [0i64, (yb + ya) / 2, 0];
+    let norm = |q: [i64; 3]| {
+        let m = sf_isqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).max(1);
+        [q[0] * 4096 / m, q[1] * 4096 / m, q[2] * 4096 / m]
+    };
+    let dot = |a: [i64; 3], b: [i64; 3]| (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) >> 12;
+    let mut nrm = [[0i64; 3]; 17];
+    let mut cen = [[0i64; 3]; 17];
+    let mut front = [false; 17];
+    for (fi, f) in faces.iter().enumerate() {
+        let (a, b, c) = (v[f.0[0]], v[f.0[1]], v[f.0[2]]);
+        let (e1, e2) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+        let mut n = norm([(e1[1] * e2[2] - e1[2] * e2[1]) >> 12, (e1[2] * e2[0] - e1[0] * e2[2]) >> 12, (e1[0] * e2[1] - e1[1] * e2[0]) >> 12]);
+        let mut m = [0i64; 3];
+        let mut mc = [0i64; 3];
+        for &vi in f.0[..f.1].iter() {
+            for d in 0..3 {
+                m[d] += v[vi][d];
+                mc[d] += cv[vi][d];
+            }
+        }
+        let k = f.1 as i64;
+        let (m, mc) = ([m[0] / k, m[1] / k, m[2] / k], [mc[0] / k, mc[1] / k, mc[2] / k]);
+        if dot(n, [m[0] - centre[0], m[1] - centre[1], m[2] - centre[2]]) < 0 {
+            n = [-n[0], -n[1], -n[2]];
+        }
+        let n = tilt(n);
+        nrm[fi] = n;
+        cen[fi] = mc;
+        front[fi] = dot(n, mc) < 0;
+    }
+    // Projection, then one scale and shift: 45 % of the panel's height, base at 0.965 H, centre at 0.78 W.
+    let mut sn = [(0i64, 0i64); 17];
+    let (mut nx0, mut nx1, mut ny0, mut ny1) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+    for k in 0..17 {
+        let z = cv[k][2].max(1);
+        sn[k] = (cv[k][0] * 65536 / z, -cv[k][1] * 65536 / z);
+        nx0 = nx0.min(sn[k].0);
+        nx1 = nx1.max(sn[k].0);
+        ny0 = ny0.min(sn[k].1);
+        ny1 = ny1.max(sn[k].1);
+    }
+    let span = (ny1 - ny0).max(1);
+    let hg = hh * 45 / 100;
+    let (ax, by) = ((ww * 78 / 100) << 8, (hh * 965 / 1000) << 8);
+    let midx = (nx0 + nx1) / 2;
+    let mut sp = [(0i64, 0i64); 17];
+    for k in 0..17 {
+        sp[k] = ((sn[k].0 - midx) * hg * 256 / span + ax, (sn[k].1 - ny1) * hg * 256 / span + by);
+    }
+    let (gx0, gx1) = (sp.iter().map(|q| q.0).min().unwrap_or(0) >> 8, sp.iter().map(|q| q.0).max().unwrap_or(0) >> 8);
+    let (gy0, gy1) = (sp.iter().map(|q| q.1).min().unwrap_or(0) >> 8, sp.iter().map(|q| q.1).max().unwrap_or(0) >> 8);
+    let gh_px = (gy1 - gy0).max(1);
+    let (mut top, mut bot) = (sf_vec(w)?, sf_vec(w)?);
+    top.fill(i32::MAX);
+    bot.fill(-1);
+    // The light: the beam's, from above, a little left and toward the camera.
+    let lgt = norm([-901, 3809, -1229]);
+    let mut nfront = 0u32;
+    for (fi, f) in faces.iter().enumerate() {
+        if !front[fi] {
+            continue;
+        }
+        nfront += 1;
+        let n = nrm[fi];
+        let vv = norm([-cen[fi][0], -cen[fi][1], -cen[fi][2]]);
+        let ndl = dot(n, lgt).max(0);
+        let ndv = dot(n, vv).max(0);
+        let fr = ((4096 - ndv) * (4096 - ndv) >> 12) * (4096 - ndv) >> 12;
+        let hv = norm([lgt[0] + vv[0], lgt[1] + vv[1], lgt[2] + vv[2]]);
+        let mut spc = dot(n, hv).max(0);
+        for _ in 0..5 {
+            spc = (spc * spc) >> 12;
+        }
+        let mut c = sf_mix(p.zd, p.zm, (ndl * 256 >> 12) as u32);
+        c = sf_mix(c, p.zl, ((spc * 220) >> 12) as u32);
+        c = sf_mix(c, p.zl, ((fr * 150) >> 12) as u32);
+        if (8..16).contains(&fi) && ndl > 2400 {
+            c = sf_mix(c, if fi % 2 == 0 { p.fw } else { p.fc }, 40);
+        }
+        let alpha = 210 + ((fr * 46) >> 12);
+        // The face's edges: Q8 endpoints, the inside sign, length, silhouette-ness.
+        let nv = f.1;
+        let mut area = 0i64;
+        for e in 0..nv {
+            let (a, b) = (sp[f.0[e]], sp[f.0[(e + 1) % nv]]);
+            area += a.0 * b.1 - b.0 * a.1;
+        }
+        let sg = if area >= 0 { 1i64 } else { -1 };
+        let mut ed = [(0i64, 0i64, 0i64, 0i64, 0i64, false); 8];
+        let (mut fx0, mut fx1, mut fy0, mut fy1) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+        for e in 0..nv {
+            let (a, b) = (sp[f.0[e]], sp[f.0[(e + 1) % nv]]);
+            let len = sf_isqrt((b.0 - a.0) * (b.0 - a.0) + (b.1 - a.1) * (b.1 - a.1)).max(1);
+            ed[e] = (a.0, a.1, b.0 - a.0, b.1 - a.1, len, !front[f.2[e]]);
+            fx0 = fx0.min(a.0);
+            fx1 = fx1.max(a.0);
+            fy0 = fy0.min(a.1);
+            fy1 = fy1.max(a.1);
+        }
+        let (bx0, bx1) = (((fx0 >> 8) - 1).clamp(0, ww), ((fx1 >> 8) + 2).clamp(0, ww));
+        let (by0, by1) = (((fy0 >> 8) - 1).clamp(0, hh), ((fy1 >> 8) + 2).clamp(0, hh));
+        let mut d = [0i64; 8];
+        let mut stp = [0i64; 8];
+        for e in 0..nv {
+            stp[e] = -sg * ed[e].3 * 65536 / ed[e].4;
+        }
+        for y in by0..by1 {
+            let pyc = (y << 8) + 128;
+            let pxc = (bx0 << 8) + 128;
+            for e in 0..nv {
+                let (x0, y0, ex, ey, len, _) = ed[e];
+                d[e] = sg * (ex * (pyc - y0) - ey * (pxc - x0)) * 256 / len;
+            }
+            let shade = ((y - gy0) * 72 / gh_px).clamp(0, 72) as u32;
+            let cy = sf_mix(c, p.zd, shade);
+            for x in bx0..bx1 {
+                let (mut cov, mut inside, mut ein, mut esil) = (256i64, true, i64::MAX, i64::MAX);
+                for e in 0..nv {
+                    let dq = d[e] >> 8;
+                    if ed[e].5 {
+                        cov = cov.min((dq + 128).clamp(0, 256));
+                        esil = esil.min(dq);
+                    } else {
+                        if dq < 0 {
+                            inside = false;
+                        }
+                        ein = ein.min(dq);
+                    }
+                    d[e] += stp[e];
+                }
+                if !inside || cov <= 0 {
+                    continue;
+                }
+                let mut cc = cy;
+                if ein < 154 {
+                    cc = sf_mix(cc, p.zl, ((154 - ein) * 50 / 154) as u32);
+                }
+                if esil < 384 {
+                    cc = sf_mix(cc, p.zl, ((384 - esil.max(0)) * 70 / 384) as u32);
+                }
+                let o = y as usize * w + x as usize;
+                px[o] = sf_mix(px[o], cc, ((cov * alpha) >> 8) as u32);
+                let xi = x as usize;
+                top[xi] = top[xi].min(y as i32);
+                bot[xi] = bot[xi].max(y as i32);
+            }
+        }
+    }
+    Some(SfGem { top, bot, x0: gx0, y0: gy0, x1: gx1, y1: gy1, apex: (sp[16].0 >> 8, sp[16].1 >> 8), front: nfront })
+}
+
+/// The beam as drawn: its column, the landing row, its glow half-width and the landing glow's radius.
+#[derive(Clone, Copy)]
+struct SfBeam {
+    x: i64,
+    land: i64,
+    gw: i64,
+    rg: i64,
+}
+
+/// 5. THE BEAM (STARFIELD.md §7): a column from the panel's top onto the crown's upper-left facet, brightening toward
+/// the landing; dust along it; the landing glow, its hot core and a horizontal flare; the three-ray fan inside.
+fn sf_beam(px: &mut [u32], w: usize, h: usize, p: &SfPal, g: &SfGem) -> SfBeam {
+    let (ww, hh) = (w as i64, h as i64);
+    let bx = (g.apex.0 - (g.x1 - g.x0) * 16 / 100).clamp(1, ww - 2);
+    let t = g.top[bx as usize];
+    let land = (if t == i32::MAX { g.apex.1 } else { t as i64 }).clamp(1, hh - 1);
+    let (cw, gwd, rg, rc) = ((hh / 600).max(1), (hh / 45).max(3), (hh / 13).max(6), (hh / 200).max(2));
+    for y in 0..land {
+        let fade = 96 + 160 * y / land;
+        for dx in -gwd..=gwd {
+            let x = bx + dx;
+            if x < 0 || x >= ww {
+                continue;
+            }
+            let o = y as usize * w + x as usize;
+            let ad = dx.abs();
+            let ag = (((gwd - ad) * (gwd - ad) * 90 / (gwd * gwd)) * fade) >> 8;
+            let mut c = sf_mix(px[o], p.glow, ag as u32);
+            if ad <= cw {
+                let ac = ((256 - ad * ad * 256 / ((cw + 1) * (cw + 1))) * fade) >> 8;
+                c = sf_mix(c, p.core, ac as u32);
+            }
+            px[o] = c;
+        }
+        let r = sf_hash(y, bx, 31);
+        if r % 23 == 0 {
+            let x = bx + ((r >> 8) % (2 * gwd as u64 + 1)) as i64 - gwd;
+            sf_plot(px, w, h, x, y, p.glow, 60 + ((r >> 20) % 80) as u32);
+        }
+    }
+    for oy in -rg..=rg {
+        for ox in -rg..=rg {
+            let d2 = ox * ox + oy * oy;
+            if d2 > rg * rg {
+                continue;
+            }
+            let d = sf_isqrt(d2);
+            let q = rg - d;
+            sf_plot(px, w, h, bx + ox, land + oy, p.glow, (q * q * q * 200 / (rg * rg * rg)) as u32);
+            if d <= rc {
+                sf_plot(px, w, h, bx + ox, land + oy, p.core, ((rc - d + 1) * 230 / (rc + 1)) as u32);
+            }
+        }
+    }
+    let fl = rg * 26 / 10;
+    for oy in -1i64..=1 {
+        for ox in -fl..=fl {
+            let q = fl - ox.abs();
+            let a = (q * q * 120 / (fl * fl) * if oy == 0 { 256 } else { 110 }) >> 8;
+            sf_plot(px, w, h, bx + ox, land + oy, p.core, a as u32);
+        }
+    }
+    let len = ((g.y1 - land) * 6 / 10).max(1);
+    for (deg, col) in [(64i64, p.fw), (68, p.zl), (72, p.fc)] {
+        let (dxq, dyq) = (sf_cos(deg), sf_sin(deg));
+        for t in 0..len {
+            let (x, y) = (bx + dxq * t / 4096, land + dyq * t / 4096);
+            if x < 0 || x >= ww {
+                continue;
+            }
+            let (tp, bt) = (g.top[x as usize], g.bot[x as usize]);
+            if tp == i32::MAX || y < tp as i64 || y > bt as i64 {
+                continue;
+            }
+            let a = (90 * (len - t) / len) as u32;
+            sf_plot(px, w, h, x, y, col, a);
+            sf_plot(px, w, h, x + 1, y, col, a / 2);
+        }
+    }
+    SfBeam { x: bx, land, gw: gwd, rg }
+}
+
+/// One shimmering pixel: `out = mix(rest, tint, amp * smooth(triangle(t * rate * 8 + phase)) / 256)` — at the wave's
+/// zero it is exactly the generated picture (STARFIELD.md §8).
+#[derive(Clone, Copy)]
+pub struct Glint {
+    pub x: u16,
+    pub y: u16,
+    pub rest: u32,
+    pub tint: u32,
+    pub phase: u16,
+    pub rate: u8,
+    pub amp: u8,
+    grp: u32,
+}
+
+/// A run of glints re-tinted together, and the box it repaints (`x1`, `y1` exclusive).
+#[derive(Clone, Copy)]
+pub struct Group {
+    pub start: u32,
+    pub len: u32,
+    pub x0: u16,
+    pub y0: u16,
+    pub x1: u16,
+    pub y1: u16,
+}
+
+/// The picture's shimmer: its glints sorted by group, the groups (the beam's first), the coprime stride the star
+/// cells are visited in, and the picture's size.
+pub struct Shimmer {
+    pub glints: alloc::vec::Vec<Glint>,
+    pub groups: alloc::vec::Vec<Group>,
+    pub beam_groups: usize,
+    pub stride: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// What one generation drew, for the witness lines and `tests starfield`.
+pub struct Scene {
+    pub shimmer: Shimmer,
+    pub stars: u32,
+    pub lensed: u32,
+    pub streams: u32,
+    pub front: u32,
+    /// The zircon's box `(x, y, w, h)` and the beam's `(column, landing row, glow half-width)`.
+    pub gem: (usize, usize, usize, usize),
+    pub beam: (usize, usize, usize),
+    pub probes: [SfProbe; 3],
+    pub nprobes: usize,
+    /// The lens's largest displacement, px (`H/100`).
+    pub dmax: i64,
+}
+
+/// The shimmer's caps (STARFIELD.md §8): all glints, the beam's, the twinkles', the lensed-drift entries (pairs).
+pub const SHIMMER_MAX: usize = 6000;
+const SF_CAP_BEAM: usize = 1600;
+const SF_CAP_TWINKLE: usize = 2000;
+const SF_CAP_DRIFT: usize = 800;
+/// The beam's groups: six column segments and the landing.
+const SF_BEAM_SEGS: u32 = 6;
+const SF_BEAM_GROUPS: u32 = SF_BEAM_SEGS + 1;
+
+/// Up to `cap` items of `v`, evenly spaced (so a cap never favours the top of the panel).
+fn sf_thin<T: Copy>(v: &[T], cap: usize, mut each: impl FnMut(T)) {
+    let n = v.len();
+    if n == 0 || cap == 0 {
+        return;
+    }
+    let take = n.min(cap);
+    for i in 0..take {
+        each(v[i * n / take]);
+    }
+}
+
+/// 6. THE SHIMMER LIST, from the FINAL picture: the beam's centre line and landing; the stars (a lensed compact star
+/// with `|G| > Gmax/4` is a drift PAIR, every other star a twinkle toward the ground 3 px away); the streams'
+/// travelling glints. No star or stream entry on or beside the foreground. Sorted into groups: the beam's, then cells.
+#[allow(clippy::too_many_arguments)]
+fn sf_shimmer(px: &[u32], w: usize, h: usize, p: &SfPal, g: &SfGem, b: &SfBeam, stars: &[SfStar], cand: &[(u16, u16, u16)], gmax: i64) -> Option<Shimmer> {
+    let (ww, hh) = (w as i64, h as i64);
+    let fg = |x: i64, y: i64| -> bool {
+        if x < 0 || y < 0 || x >= ww || y >= hh {
+            return true;
+        }
+        if x >= g.x0 - 6 && x <= g.x1 + 6 {
+            for xx in [x - 3, x, x + 3] {
+                if xx >= 0 && xx < ww {
+                    let (t, bt) = (g.top[xx as usize], g.bot[xx as usize]);
+                    if t != i32::MAX && y >= t as i64 - 3 && y <= bt as i64 + 3 {
+                        return true;
+                    }
+                }
+            }
+        }
+        let (dx, dy) = (x - b.x, y - b.land);
+        (dx.abs() <= b.gw + 3 && y <= b.land) || dx * dx + dy * dy <= (b.rg + 3) * (b.rg + 3) || (dy.abs() <= 3 && dx.abs() <= b.rg * 26 / 10 + 3)
+    };
+    let cs = (hh / 19).max(32);
+    let ncx = (ww + cs - 1) / cs;
+    let cell = |x: i64, y: i64| SF_BEAM_GROUPS + ((y / cs) * ncx + x / cs) as u32;
+    let at = |x: i64, y: i64| px[y as usize * w + x as usize];
+    let mut gl: alloc::vec::Vec<Glint> = alloc::vec::Vec::new();
+    gl.try_reserve_exact(SHIMMER_MAX + 2).ok()?;
+    let push = |gl: &mut alloc::vec::Vec<Glint>, x: i64, y: i64, tint: u32, phase: u16, rate: u8, amp: u8, grp: u32| {
+        if gl.len() < SHIMMER_MAX && x >= 0 && y >= 0 && x < ww && y < hh {
+            gl.push(Glint { x: x as u16, y: y as u16, rest: at(x, y), tint, phase, rate, amp, grp });
+        }
+    };
+    // The beam: its centre line (a pulse runs down it into the stone) and its landing.
+    let step = if b.land as usize > SF_CAP_BEAM - 300 { 2 } else { 1 };
+    let kq = 65536 * 9 / (2 * hh).max(1);
+    let mut y = 0i64;
+    while y < b.land {
+        let seg = ((y * SF_BEAM_SEGS as i64) / b.land.max(1)).min(SF_BEAM_SEGS as i64 - 1) as u32;
+        push(&mut gl, b.x, y, p.core, (65536 - (y * kq) % 65536) as u16, 2, 100, seg);
+        y += step;
+    }
+    let rh = hh / 200 + 4;
+    for oy in -rh..=rh {
+        for ox in -rh..=rh {
+            if ox * ox + oy * oy <= rh * rh && (ox + oy) & 1 == 0 {
+                push(&mut gl, b.x + ox, b.land + oy, p.core, 0, 2, 120, SF_BEAM_SEGS);
+            }
+        }
+    }
+    // The stars: drift pairs (lensed, compact), then twinkles.
+    let mut drift = 0usize;
+    let mut tw: alloc::vec::Vec<(i64, i64, i64, i64, u64)> = alloc::vec::Vec::new();
+    tw.try_reserve_exact(stars.len()).ok()?;
+    for (k, s) in stars.iter().enumerate() {
+        let (x, y) = (s.tq.0 >> 8, s.tq.1 >> 8);
+        let r = sf_hash(k as i64, 3, 41);
+        let gm = sf_isqrt(s.g.0 * s.g.0 + s.g.1 * s.g.1);
+        if !s.stretched && s.class < 2 && gm * 4 > gmax && drift + 2 <= SF_CAP_DRIFT {
+            let (qx, qy) = if s.g.0.abs() >= s.g.1.abs() { (x - s.g.0.signum(), y) } else { (x, y - s.g.1.signum()) };
+            if !fg(x, y) && !fg(qx, qy) && qx >= 0 && qy >= 0 && qx < ww && qy < hh {
+                let (rp, rq) = (at(x, y), at(qx, qy));
+                let grp = cell(x, y);
+                let ph = r as u16;
+                push(&mut gl, x, y, rq, ph, 1, 128, grp);
+                push(&mut gl, qx, qy, rp, ph, 1, 128, grp);
+                drift += 2;
+                continue;
+            }
+        }
+        let (bx, by) = if x + 3 < ww { (x + 3, y) } else { (x - 3, y) };
+        if !fg(x, y) && !fg(bx, by) {
+            tw.push((x, y, bx, by, r));
+        }
+    }
+    sf_thin(&tw, SF_CAP_TWINKLE, |(x, y, bx, by, r)| {
+        let tint = at(bx, by);
+        push(&mut gl, x, y, tint, r as u16, 2 + ((r >> 16) % 5) as u8, 140 + ((r >> 24) % 61) as u8, cell(x, y));
+    });
+    // The streams: the rest of the budget, evenly over the candidates clear of the foreground.
+    let room = SHIMMER_MAX.saturating_sub(gl.len());
+    let mut sc: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
+    sc.try_reserve_exact(cand.len()).ok()?;
+    sc.extend(cand.iter().copied().filter(|&(x, y, _)| !fg(x as i64, y as i64)));
+    sf_thin(&sc, room, |(x, y, ph)| {
+        let (x, y) = (x as i64, y as i64);
+        push(&mut gl, x, y, p.hi, ph, 3, 140, cell(x, y));
+    });
+    // Sort by group, then position; one entry per pixel within a group.
+    gl.sort_unstable_by_key(|e| ((e.grp as u64) << 32) | ((e.y as u64) << 16) | e.x as u64);
+    gl.dedup_by_key(|e| (e.grp, e.x, e.y));
+    let mut groups: alloc::vec::Vec<Group> = alloc::vec::Vec::new();
+    let mut beam_groups = 0usize;
+    let mut i = 0usize;
+    while i < gl.len() {
+        let gid = gl[i].grp;
+        let start = i;
+        let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0u16, 0u16);
+        while i < gl.len() && gl[i].grp == gid {
+            x0 = x0.min(gl[i].x);
+            y0 = y0.min(gl[i].y);
+            x1 = x1.max(gl[i].x + 1);
+            y1 = y1.max(gl[i].y + 1);
+            i += 1;
+        }
+        if groups.try_reserve(1).is_err() {
+            return None;
+        }
+        groups.push(Group { start: start as u32, len: (i - start) as u32, x0, y0, x1, y1 });
+        if gid < SF_BEAM_GROUPS {
+            beam_groups += 1;
+        }
+    }
+    let ncells = groups.len() - beam_groups;
+    let mut stride = (ncells * 618 / 1000).max(1);
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        a
+    };
+    while ncells > 1 && gcd(stride, ncells) != 1 {
+        stride += 1;
+    }
+    Some(Shimmer { glints: gl, groups, beam_groups, stride, w, h })
+}
+
+/// **The default wallpaper** into `px` (`w` x `h`): STARFIELD (B661, R128) — the ultra-black ground and the
+/// dark-matter haze, the flow's Van Gogh strokes, the lensed stars, the zircon in the foreground and the beam striking
+/// it, every colour a `theme::starfield` pair; and the shimmer list built from the finished picture. Integer only.
+/// `None` when `w`/`h` are out of range or memory refused a table (the picture may then be partly drawn; the caller
+/// installs it without a shimmer).
+pub fn wall_gen(px: &mut [u32], w: usize, h: usize) -> Option<Scene> {
+    if w < 64 || h < 64 || w > 16_384 || h > 16_384 || px.len() < w * h {
+        return None;
+    }
+    let p = SfPal::live();
+    let f = SfField::build(w, h)?;
+    sf_haze(px, w, h, &f, &p)?;
+    let mut cand: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
+    let streams = sf_strokes(px, w, h, &f, &p, &mut cand);
+    let mut stars: alloc::vec::Vec<SfStar> = alloc::vec::Vec::new();
+    let (nstars, lensed) = sf_stars(px, w, h, &f, &p, &mut stars)?;
+    let g = sf_zircon(px, w, h, &p)?;
+    let b = sf_beam(px, w, h, &p, &g);
+    let shimmer = sf_shimmer(px, w, h, &p, &g, &b, &stars, &cand, f.gmax)?;
+    // The lens probes: the three largest displacements among the bright compact stars clear of the foreground.
+    let (ww, hh) = (w as i64, h as i64);
+    let mut probes = [SfProbe::default(); 3];
+    let mut best = [-1i64; 3];
+    for s in stars.iter() {
+        let (x, y) = (s.tq.0 >> 8, s.tq.1 >> 8);
+        if s.stretched || s.b < 100 || x < 8 || y < 8 || x >= ww - 8 || y >= hh - 8 {
+            continue;
+        }
+        if (x - b.x).abs() <= b.gw + 8 || (x >= g.x0 - 8 && x <= g.x1 + 8 && y >= g.y0 - 8) || ((x - b.x).pow(2) + (y - b.land).pow(2)) <= (b.rg + 8).pow(2) {
+            continue;
+        }
+        let (dx, dy) = (s.tq.0 - s.bq.0, s.tq.1 - s.bq.1);
+        let m = dx * dx + dy * dy;
+        let mut k = 3usize;
+        while k > 0 && m > best[k - 1] {
+            k -= 1;
+        }
+        if k < 3 {
+            for j in (k + 1..3).rev() {
+                best[j] = best[j - 1];
+                probes[j] = probes[j - 1];
+            }
+            best[k] = m;
+            probes[k] = SfProbe { bq: s.bq, tq: s.tq, g: s.g };
+        }
+    }
+    let nprobes = best.iter().filter(|&&m| m >= 0).count();
+    Some(Scene {
+        shimmer,
+        stars: nstars,
+        lensed,
+        streams,
+        front: g.front,
+        gem: (g.x0.max(0) as usize, g.y0.max(0) as usize, (g.x1 - g.x0).max(0) as usize, (g.y1 - g.y0).max(0) as usize),
+        beam: (b.x as usize, b.land as usize, b.gw as usize),
+        probes,
+        nprobes,
+        dmax: (hh / 100).max(2),
+    })
+}
+
+// ── THE SHIMMER, per frame ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Star cells re-tinted per tick (the beam's seven groups are re-tinted every tick).
+pub const SHIMMER_CELLS: usize = 4;
+/// The shimmer's floor between ticks (30 Hz at most).
+pub const SHIMMER_MS: u64 = 33;
+
+/// `smooth(triangle(th))`: 0 at 0, 255 at half a turn, 0 again at a full turn.
+#[inline]
+fn sf_wave(th: u16) -> u32 {
+    let p = th as u32;
+    let tri = if p < 32768 { p } else { 65535 - p };
+    let x = tri >> 7;
+    (x * x * (768 - 2 * x)) >> 16
+}
+
+/// Re-tint group `g` at time `t` through `put(x, y, colour)`; returns the glints written.
+fn sf_retint(s: &Shimmer, g: &Group, t: u32, put: &mut impl FnMut(usize, usize, u32)) -> u32 {
+    let (a, b) = (g.start as usize, (g.start + g.len) as usize);
+    for e in s.glints[a.min(s.glints.len())..b.min(s.glints.len())].iter() {
+        let th = t.wrapping_mul(e.rate as u32 * 8).wrapping_add(e.phase as u32) as u16;
+        let k = (e.amp as u32 * sf_wave(th)) >> 8;
+        put(e.x as usize, e.y as usize, sf_mix(e.rest, e.tint, k));
+    }
+    g.len
+}
+
+/// **One shimmer tick** (STARFIELD.md §8): every beam group, then the next [`SHIMMER_CELLS`] star cells in the
+/// coprime-stride order from `cursor`; a group whose box meets an occluder box `(x, y, w, h)` (a visible window and
+/// its shadow extent) is skipped — the shimmer stops where a window covers it — and every other is re-tinted through
+/// `put` and its box handed to `queue` (the live seat queues it on the compositor's erase route). Returns
+/// `(next cursor, glints written, boxes queued, px in the boxes)`. Pure: the fixture runs it on an offscreen picture.
+pub fn shimmer_tick(s: &Shimmer, now_ms: u64, occ: &[(usize, usize, usize, usize)], cursor: u32, mut put: impl FnMut(usize, usize, u32), mut queue: impl FnMut(usize, usize, usize, usize)) -> (u32, u32, u32, u64) {
+    let t = now_ms as u32;
+    let hit = |g: &Group| occ.iter().any(|&(x, y, w, h)| (g.x0 as usize) < x + w && x < g.x1 as usize && (g.y0 as usize) < y + h && y < g.y1 as usize);
+    let (mut n, mut nb, mut area) = (0u32, 0u32, 0u64);
+    let mut run = |g: &Group, n: &mut u32, nb: &mut u32, area: &mut u64| {
+        if g.len == 0 || g.x1 <= g.x0 || g.y1 <= g.y0 || hit(g) {
+            return;
+        }
+        *n += sf_retint(s, g, t, &mut put);
+        let (bw, bh) = ((g.x1 - g.x0) as usize, (g.y1 - g.y0) as usize);
+        queue(g.x0 as usize, g.y0 as usize, bw, bh);
+        *nb += 1;
+        *area += (bw * bh) as u64;
+    };
+    for g in s.groups[..s.beam_groups.min(s.groups.len())].iter() {
+        run(g, &mut n, &mut nb, &mut area);
+    }
+    let ncells = s.groups.len().saturating_sub(s.beam_groups);
+    let mut cur = cursor;
+    if ncells > 0 {
+        for _ in 0..SHIMMER_CELLS.min(ncells) {
+            let i = s.beam_groups + ((cur as usize % ncells) * s.stride) % ncells;
+            cur = cur.wrapping_add(1);
+            run(&s.groups[i], &mut n, &mut nb, &mut area);
+        }
+    }
+    (cur, n, nb, area)
+}
+
+/// The visible windows' occluder boxes [`track`] gathers for the shimmer (more than this and the shimmer skips the pass).
+const SHIM_OCC: usize = 32;
+/// The last tick (ms), the star-cell cursor, ticks run, and a tick in flight (passes may run on several cores).
+static SHIM_LAST: AtomicU64 = AtomicU64::new(0);
+static SHIM_CURSOR: AtomicU32 = AtomicU32::new(0);
+static SHIM_TICKS: AtomicU32 = AtomicU32::new(0);
+static SHIM_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// The live seat (from [`track`], at the head of the composite pass, before the erase drain): at most once per
+/// [`SHIMMER_MS`], only when the erase queue is empty and the pass queued no shadow fill, only while the desktop scene
+/// owns the backdrop and the installed picture is the generated one at the panel's size. The re-tinted pixels are
+/// written into the installed picture (`wallpaper::shimmer_with`) and each box goes on `defer_erase`, so the SAME
+/// pass's drain paints it through `stage_fill` (the wallpaper, every window shadow, the window and furniture clip, the
+/// cursor bracket).
+#[cfg(feature = "facet")]
+fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
+    if super::DEFER_N.load(Ordering::Relaxed) != 0 || !crate::video::desktop_scene_owns_backdrop() {
+        return;
+    }
+    let now = crate::arch::ms();
+    if now.wrapping_sub(SHIM_LAST.load(Ordering::Relaxed)) < SHIMMER_MS || SHIM_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    SHIM_LAST.store(now, Ordering::Relaxed);
+    let cur = SHIM_CURSOR.load(Ordering::Relaxed);
+    let next = crate::video::wallpaper::shimmer_with(|s, buf, w, h| {
+        if w != pw || h != ph || s.w != w || s.h != h {
+            return cur;
+        }
+        let (c, _, _, _) = shimmer_tick(
+            s,
+            now,
+            occ,
+            cur,
+            // SAFETY: `buf` is the installed picture's `w * h` buffer (published with its shimmer, freed only by the
+            // install after next — see `wallpaper::Snap`); `(x, y)` lies inside it (a glint is a pixel of that
+            // picture). Painters read it concurrently; an aligned word store is never torn, and the pixel's box is
+            // repainted by this pass's drain.
+            |x, y, c| unsafe { core::ptr::write_volatile(buf.add(y * w + x), c) },
+            |x, y, bw, bh| super::defer_erase(x, y, bw, bh, super::DEFER_ROUTE, false),
+        );
+        c
+    });
+    if let Some(c) = next {
+        SHIM_CURSOR.store(c, Ordering::Relaxed);
+        SHIM_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    SHIM_BUSY.store(false, Ordering::Release);
+}
+#[cfg(not(feature = "facet"))]
+fn shimmer_live(_occ: &[(usize, usize, usize, usize)], _pw: usize, _ph: usize) {}
+
+/// Shimmer ticks run live since boot.
+pub fn shimmer_ticks() -> u32 {
+    SHIM_TICKS.load(Ordering::Relaxed)
+}
+
+/// The shimmer's cost on an offscreen picture: `ticks` ticks 7 x [`SHIMMER_MS`] apart, each re-tint plus the drain's
+/// fill modelled as the wallpaper rows of every queued box copied into `frame`. Returns `(worst tick us, mean us,
+/// boxes, px changed in wall)` — `wall` is changed in place.
+fn shimmer_cost(s: &Shimmer, wall: &mut [u32], frame: &mut [u32], pw: usize, occ: &[(usize, usize, usize, usize)], ticks: u32) -> (u64, u64, u32) {
+    let (mut cur, mut worst, mut total, mut nbox) = (0u32, 0u64, 0u64, 0u32);
+    for k in 0..ticks {
+        let now = 1000 + k as u64 * SHIMMER_MS * 7;
+        let mut boxes = [(0usize, 0usize, 0usize, 0usize); 16];
+        let mut nb = 0usize;
+        let (t0, _) = now_ns();
+        let (c, _, _, _) = shimmer_tick(s, now, occ, cur, |x, y, c| wall[y * pw + x] = c, |x, y, w, h| {
+            if nb < boxes.len() {
+                boxes[nb] = (x, y, w, h);
+                nb += 1;
+            }
+        });
+        for &(x, y, w, h) in boxes[..nb].iter() {
+            for yy in y..y + h {
+                let o = yy * pw + x;
+                if o + w <= frame.len() && o + w <= wall.len() {
+                    frame[o..o + w].copy_from_slice(&wall[o..o + w]);
+                }
+            }
+        }
+        let dt = now_ns().0.saturating_sub(t0);
+        worst = worst.max(dt);
+        total += dt;
+        nbox += nb as u32;
+        cur = c;
+    }
+    (worst / 1000, total / ticks.max(1) as u64 / 1000, nbox)
+}
+
+/// The DESKTOPCRAFT fixture's three window boxes, grown by their shadow margins — the occluders the shimmer sees.
+fn fixture_occluders(pw: usize, ph: usize) -> [(usize, usize, usize, usize); 3] {
+    let k = |v: usize| v * pw / 1440;
+    let dark = theme::is_dark();
+    let s2 = crate::video::dpi::s2();
+    let wins = [(k(1010), k(250), k(380), k(520), false), (k(640), k(170), k(760), k(520), false), (k(120), k(110), k(900), k(600), true)];
+    let mut out = [(0usize, 0usize, 0usize, 0usize); 3];
+    for (i, &(x, y, w, h, focused)) in wins.iter().enumerate() {
+        let (t, s, b) = margins(if focused { ELEV_WINDOW } else { ELEV_IDLE }, dark, s2);
+        let (w, h) = (w.min(pw.saturating_sub(x)), h.min(ph.saturating_sub(y)));
+        let (x0, y0) = (x.saturating_sub(s as usize), y.saturating_sub(t as usize));
+        out[i] = (x0, y0, x + w + s as usize - x0, y + h + b as usize - y0);
+    }
+    out
+}
+
+/// **`tests starfield`** (R80: a verb, never at boot) — generates the scene offscreen at the rMBP panel's size
+/// (2880x1800; 1440x900 where memory refuses), times it against 400 ms, checks the lens on three known stars, the
+/// zircon, the beam, the shimmer list's cap and that no pure-black run exists, then runs 30 shimmer ticks with the
+/// DESKTOPCRAFT windows as occluders: the worst tick against 800 us, and no pixel under a window changed.
+///
+/// `:: STARFIELD: detail surface=<w>x<h> glints=<n> groups=<n> zircon_box=<x>,<y>,<w>,<h> front=<n> beam_land=<x>,<y> lens=ok(<dx>,<dy>) x3 covered_changed=0 changed=<n> boxes=<n> shimmer_max_us=<n> literals=0 ::`
+/// `:: STARFIELD: gen_ms=<n> stars=<n> lensed=ok streams=<n> zircon=ok(facets=17) beam=ok shimmer_us=<n> -> PASS ::`
+pub fn starfield_selftest() {
+    let mut dims = [(2880usize, 1800usize), (1440, 900)].into_iter();
+    let (pw, ph, mut wall, mut frame) = loop {
+        let Some((w, h)) = dims.next() else {
+            serial_println!(":: STARFIELD: no-surface -> FAIL ::");
+            return;
+        };
+        let (mut a, mut b) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+        if a.try_reserve_exact(w * h).is_ok() && b.try_reserve_exact(w * h).is_ok() {
+            a.resize(w * h, 0u32);
+            b.resize(w * h, 0u32);
+            break (w, h, a, b);
+        }
+    };
+    let (t0, _) = now_ns();
+    let scene = wall_gen(&mut wall, pw, ph);
+    let gen_ms = now_ns().0.saturating_sub(t0) / 1_000_000;
+    let Some(sc) = scene else {
+        serial_println!(":: STARFIELD: gen_ms={} no-scene -> FAIL ::", gen_ms);
+        return;
+    };
+    let at = |x: usize, y: usize| wall[y.min(ph - 1) * pw + x.min(pw - 1)];
+    // The lens, on three known stars: displaced >= 1 px, at most Dmax (+1), AWAY from the mass (delta . G < 0), and a
+    // star is drawn at the image (it differs from the mean of the ring 5 px round it).
+    let mut lens_ok = sc.nprobes == 3;
+    let mut lens_txt: [(bool, i64, i64); 3] = [(false, 0, 0); 3];
+    for (i, pr) in sc.probes[..sc.nprobes.min(3)].iter().enumerate() {
+        let (dx, dy) = (pr.tq.0 - pr.bq.0, pr.tq.1 - pr.bq.1);
+        let m2 = dx * dx + dy * dy;
+        let away = dx * pr.g.0 + dy * pr.g.1 < 0;
+        let within = m2 >= 256 * 256 && m2 <= ((sc.dmax + 1) * 256).pow(2);
+        let (x, y) = ((pr.tq.0 >> 8) as usize, (pr.tq.1 >> 8) as usize);
+        let mut acc = [0u32; 3];
+        for (ox, oy) in [(5i64, 0i64), (-5, 0), (0, 5), (0, -5), (4, 4), (-4, 4), (4, -4), (-4, -4)] {
+            let c = at((x as i64 + ox).max(0) as usize, (y as i64 + oy).max(0) as usize);
+            for (k, s) in [16u32, 8, 0].iter().enumerate() {
+                acc[k] += (c >> s) & 255;
+            }
+        }
+        let ring = ((acc[0] / 8) << 16) | ((acc[1] / 8) << 8) | (acc[2] / 8);
+        let drawn = sf_dist(at(x, y), ring) > 6;
+        let ok = away && within && drawn;
+        lens_ok &= ok;
+        lens_txt[i] = (ok, (dx + 128) >> 8, (dy + 128) >> 8);
+    }
+    // The zircon: 17 facets, 5..=11 facing the camera, 40..=50 % of the panel tall, on the panel.
+    let (gx, gy, gw, gh) = sc.gem;
+    let gem_ok = sc.front >= 5 && sc.front <= 11 && gh * 1000 >= ph * 400 && gh * 1000 <= ph * 500 && gx + gw <= pw && gy + gh <= ph;
+    // The beam: its column mid-way down differs from the field three glow-widths aside; it lands on the stone.
+    let (bx, land, bgw) = sc.beam;
+    let side = if bx + 3 * bgw < pw { bx + 3 * bgw } else { bx.saturating_sub(3 * bgw) };
+    let beam_ok = land > 0 && land >= gy && land <= gy + gh && sf_dist(at(bx, land / 2), at(side, land / 2)) > 12;
+    // No pure-black run (the ground is ultra black, never #000000).
+    let mut runs = 0usize;
+    for y in 0..ph {
+        let mut run = 0usize;
+        for x in 0..pw {
+            if wall[y * pw + x] & 0x00FF_FFFF == 0 {
+                run += 1;
+                if run == 3 {
+                    runs += 1;
+                }
+            } else {
+                run = 0;
+            }
+        }
+    }
+    // The shimmer: 30 ticks, the DESKTOPCRAFT windows as occluders.
+    let occ = fixture_occluders(pw, ph);
+    let mut before: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if before.try_reserve_exact(pw * ph).is_err() {
+        serial_println!(":: STARFIELD: gen_ms={} no-snapshot -> FAIL ::", gen_ms);
+        return;
+    }
+    before.extend_from_slice(&wall);
+    frame.copy_from_slice(&wall);
+    let (worst, _mean, boxes) = shimmer_cost(&sc.shimmer, &mut wall, &mut frame, pw, &occ, 30);
+    let (mut changed, mut covered) = (0u64, 0u64);
+    for y in 0..ph {
+        for x in 0..pw {
+            if wall[y * pw + x] != before[y * pw + x] {
+                changed += 1;
+                if occ.iter().any(|&(ox, oy, ow, oh)| x >= ox && x < ox + ow && y >= oy && y < oy + oh) {
+                    covered += 1;
+                }
+            }
+        }
+    }
+    let nglint = sc.shimmer.glints.len();
+    let lit = theme::AUDIT_LITERALS_OUTSIDE;
+    let shim_ok = worst <= 800 && nglint <= SHIMMER_MAX && covered == 0 && changed > 0;
+    let ok = gen_ms <= 400 && sc.stars > 0 && lens_ok && sc.streams > 0 && gem_ok && beam_ok && runs == 0 && shim_ok && lit == 0;
+    let lf = |i: usize| if lens_txt[i].0 { "ok" } else { "FAIL" };
+    serial_println!(
+        ":: STARFIELD: detail surface={}x{} glints={} groups={} zircon_box={},{},{},{} front={} beam_land={},{} lens={}({},{}) lens={}({},{}) lens={}({},{}) covered_changed={} changed={} boxes={} shimmer_max_us={} black_runs={} literals={} ::",
+        pw, ph, nglint, sc.shimmer.groups.len(), gx, gy, gw, gh, sc.front, bx, land,
+        lf(0), lens_txt[0].1, lens_txt[0].2, lf(1), lens_txt[1].1, lens_txt[1].2, lf(2), lens_txt[2].1, lens_txt[2].2,
+        covered, changed, boxes, worst, runs, lit
+    );
+    serial_println!(
+        ":: STARFIELD: gen_ms={} stars={} lensed={} streams={} zircon={}(facets={}) beam={} shimmer_us={} -> {} ::",
+        gen_ms,
+        sc.stars,
+        if lens_ok { "ok" } else { "FAIL" },
+        sc.streams,
+        if gem_ok { "ok" } else { "FAIL" },
+        ZIRCON_FACETS,
+        if beam_ok { "ok" } else { "FAIL" },
+        worst,
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
 
 /// **The VEIL** of `px` (`w` x `h`): each `VEIL_CELL`-square cell's mean, then one [1 2 1] pass each way over the
@@ -1287,7 +2522,7 @@ struct FixWin {
 /// against the 60 Hz frame (16 667 us):
 ///
 /// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
-/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> -> UNDER|OVER ::`
+/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> shimmer_us=<n> -> UNDER|OVER ::`
 ///
 /// * **corners** — the focused window's top-left box pixel (outside the rounded head) is the desktop under the
 ///   shadows (exactly the fill's value there), and the head's face one radius in is not;
@@ -1324,7 +2559,7 @@ pub fn selftest() {
         }
     };
     let (t0, clock) = now_ns();
-    wall_gen(&mut wall, pw, ph);
+    let scene = wall_gen(&mut wall, pw, ph); // STARFIELD (B661): the scene; its shimmer is costed after every check
     let (t1, _) = now_ns();
     let Some((veil, vw, vh)) = veil_gen(&wall, pw, ph) else {
         serial_println!(":: DESKTOPCRAFT: no-veil -> FAIL ::");
@@ -1574,12 +2809,14 @@ pub fn selftest() {
         fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
     );
     let frame_us = f4.saturating_sub(f0) / 1000;
+    // STARFIELD (B661): the shimmer's worst tick over these windows (after every check: it re-tints `wall`).
+    let shim_us = scene.as_ref().map_or(0, |sc| shimmer_cost(&sc.shimmer, &mut wall, &mut frame, pw, &fixture_occluders(pw, ph), 30).0);
     const BUDGET_US: u64 = 16_667;
     let s2 = crate::video::dpi::s2();
     let (mt, ms, mb) = margins(ELEV_WINDOW, dark, s2);
     let (it, is, ib) = margins(ELEV_IDLE, dark, s2);
     serial_println!(
-        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} ramp_a={}/{} ramp_dark={}/{} frame={} track_fills={} black_runs={} -> {} ::",
+        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} ramp_a={}/{} ramp_dark={}/{} frame={} track_fills={} black_runs={} shimmer_us={} -> {} ::",
         clock,
         frame_us,
         BUDGET_US,
@@ -1605,6 +2842,7 @@ pub fn selftest() {
         super::BORDER(),
         TRACK_FILLS.load(Ordering::Relaxed),
         runs,
+        shim_us,
         if frame_us <= BUDGET_US { "UNDER" } else { "OVER" }
     );
 }

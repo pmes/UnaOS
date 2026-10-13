@@ -640,7 +640,7 @@ pub use palette_core::MEDIA_BG;
 pub use palette_core::MEDIA_MATTE;
 pub use palette_core::MEDIA_CAPTION;
 pub use palette_core::SNAP_INK;
-pub use palette_core::SHOT_BORDER;
+pub use palette_core::SHOT_BORDER; pub use palette_core::starfield; // STARFIELD (B661, R128): the generated default wallpaper's (Light, Dark) pairs — dark matter, stars, the zircon, the beam. ⚠ LINE-NEUTRAL fold, code first: this file is in every image.
 /// An opaque black pixel (a decoded image's empty canvas).
 pub use palette_core::OPAQUE_BLACK;
 

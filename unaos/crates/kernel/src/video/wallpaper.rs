@@ -37,6 +37,9 @@ struct Wall {
     veil: Vec<u32>,
     vw: usize,
     vh: usize,
+    /// STARFIELD (B661): the generated picture's SHIMMER (`wm::desktop::Shimmer`; boxed so its address survives the move
+    /// into `WALL`; retired with the picture). `None` for a picture file.
+    shim: Option<alloc::boxed::Box<crate::video::wm::desktop::Shimmer>>,
 }
 
 /// DESKTOPCRAFT (B631): the READ-ONLY snapshot the furniture painters sample (the window frame band, the menu bar,
@@ -47,7 +50,7 @@ struct Wall {
 /// (a paint pass is milliseconds; two installs are a decode or a generation apart). The `Snap` itself is a small
 /// leaked box per install.
 struct Snap {
-    px: *const u32,
+    px: *mut u32,
     len: usize,
     w: usize,
     h: usize,
@@ -55,6 +58,8 @@ struct Snap {
     vlen: usize,
     vw: usize,
     vh: usize,
+    /// STARFIELD (B661): the picture's shimmer (null for a file); lives exactly as long as `px`.
+    shim: *const crate::video::wm::desktop::Shimmer,
 }
 static SNAP: core::sync::atomic::AtomicPtr<Snap> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 static RETIRED: crate::sync::Mutex<Option<Wall>> = crate::sync::Mutex::new(None);
@@ -62,10 +67,10 @@ static RETIRED: crate::sync::Mutex<Option<Wall>> = crate::sync::Mutex::new(None)
 static PROCEDURAL: AtomicBool = AtomicBool::new(false);
 
 /// Make `new` the backdrop (or none): publish its snapshot, then retire the old picture (see [`Snap`]).
-fn install(new: Option<Wall>) {
-    let snap = match new.as_ref() {
+fn install(mut new: Option<Wall>) {
+    let snap = match new.as_mut() {
         Some(w) => alloc::boxed::Box::into_raw(alloc::boxed::Box::new(Snap {
-            px: w.px.as_ptr(),
+            px: w.px.as_mut_ptr(),
             len: w.px.len(),
             w: w.w,
             h: w.h,
@@ -73,6 +78,7 @@ fn install(new: Option<Wall>) {
             vlen: w.veil.len(),
             vw: w.vw,
             vh: w.vh,
+            shim: w.shim.as_deref().map_or(core::ptr::null(), |s| s as *const _),
         })),
         None => core::ptr::null_mut(),
     };
@@ -96,12 +102,13 @@ pub fn back() -> Option<crate::video::wm::desktop::Back<'static>> {
     if s.len < s.w * s.h || s.vlen < s.vw * s.vh {
         return None;
     }
-    let (px, veil) = unsafe { (core::slice::from_raw_parts(s.px, s.len), core::slice::from_raw_parts(s.veil, s.vlen)) };
+    let (px, veil) = unsafe { (core::slice::from_raw_parts(s.px as *const u32, s.len), core::slice::from_raw_parts(s.veil, s.vlen)) };
     Some(crate::video::wm::desktop::Back { px, w: s.w, h: s.h, veil, vw: s.vw, vh: s.vh })
 }
 
-/// DESKTOPCRAFT (B631): **the default wallpaper**, generated at the panel's size (`wm::desktop::wall_gen`: the
-/// two-tone diagonal and the accent's soft disc, dithered) when no picture file was found. Off the paint path (the
+/// DESKTOPCRAFT (B631): **the default wallpaper**, generated at the panel's size (`wm::desktop::wall_gen` — STARFIELD
+/// B661: dark matter on ultra black, the lensed stars, the zircon and the beam, with its shimmer list) when no picture
+/// file was found. Off the paint path (the
 /// default probe's worker on x86). Witness: `:: WALLPAPER: src=procedural WxH=<w>x<h> scaled=<w>x<h> letterbox=0 ms=<n> -> PASS ::`.
 fn generate() -> bool {
     let t0 = crate::arch::ms();
@@ -116,12 +123,22 @@ fn generate() -> bool {
         return false;
     }
     buf.resize(pw * ph, DESKTOP_BG);
-    crate::video::wm::desktop::wall_gen(&mut buf, pw, ph);
+    let scene = crate::video::wm::desktop::wall_gen(&mut buf, pw, ph);
+    let wall_ms = crate::arch::ms().saturating_sub(t0);
     let Some((veil, vw, vh)) = crate::video::wm::desktop::veil_gen(&buf, pw, ph) else { return false };
     if OFF.load(Ordering::Relaxed) || (active() && !PROCEDURAL.load(Ordering::Relaxed)) {
         return false; // `wallpaper off`, or a picture file, arrived while this ran
     }
-    install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh }));
+    match scene.as_ref() {
+        Some(sc) => serial_println!(
+            "[starfield] gen wall_ms={} stars={} lensed={} streams={} facets={} front={} glints={} groups={} surface={}x{}",
+            wall_ms, sc.stars, sc.lensed, sc.streams, crate::video::wm::desktop::ZIRCON_FACETS, sc.front,
+            sc.shimmer.glints.len(), sc.shimmer.groups.len(), pw, ph
+        ),
+        None => serial_println!("[starfield] gen wall_ms={} scene=none surface={}x{}", wall_ms, pw, ph),
+    }
+    let shim = scene.map(|sc| alloc::boxed::Box::new(sc.shimmer));
+    install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh, shim }));
     PROCEDURAL.store(true, Ordering::Relaxed);
     GEN_EPOCH.store(epoch, Ordering::Release); // MENUSCRAFT
     STALE.store(true, Ordering::Release);
@@ -313,7 +330,7 @@ pub fn load(path: &str) -> Result<(), String> {
     }
     let letterbox = (sw != pw || sh != ph) as u32;
     let (veil, vw, vh) = crate::video::wm::desktop::veil_gen(&buf, pw, ph).unwrap_or((Vec::new(), 0, 0)); // DESKTOPCRAFT (B631): the VEIL, once per picture
-    install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh }));
+    install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh, shim: None }));
     PROCEDURAL.store(false, Ordering::Relaxed);
     OFF.store(false, Ordering::Relaxed);
     repaint();
@@ -322,6 +339,21 @@ pub fn load(path: &str) -> Result<(), String> {
         path, iw, ih, sw, sh, letterbox, crate::arch::ms().saturating_sub(t0)
     );
     Ok(())
+}
+
+/// STARFIELD (B661): run `f` on the installed picture's shimmer, its buffer and size (`None` when no picture is
+/// installed or it is a file). The pointers are a published `Snap`'s, so they stay valid for one paint pass (see [`Snap`]).
+pub fn shimmer_with<R>(f: impl FnOnce(&crate::video::wm::desktop::Shimmer, *mut u32, usize, usize) -> R) -> Option<R> {
+    let p = SNAP.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: a published `Snap` is never freed; its buffer and shimmer live until the second install after it.
+    let s = unsafe { &*p };
+    if s.shim.is_null() || s.len < s.w * s.h {
+        return None;
+    }
+    Some(f(unsafe { &*s.shim }, s.px, s.w, s.h))
 }
 
 /// Restore the flat colour.
