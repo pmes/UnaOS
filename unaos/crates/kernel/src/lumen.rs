@@ -21,6 +21,10 @@
 //! fixture reads the program's first wire line or its fault — `:: LUMENCRASH: spawned=1 first_line=<ok|fault
 //! vec=N rip=+0x..|timeout> -> PASS|FAIL ::` (see `spawn_step` at the file tail). The "runs nothing" above is
 //! LUMENAPP's static half only.
+//!
+//! LUMEN2 (LEDGER SR121) adds the chat's drives (`lumen2` at the file tail): a streamed reply from the FIXTURE
+//! provider in both dialects, a new conversation, a switch, and a code block render — `:: LUMEN2: … -> PASS ::`.
+//! They need no network and say so by name (`net=absent` keeps PASS).
 
 use vein_core::prefs::{self as rules, KeyState, Plan};
 
@@ -90,6 +94,7 @@ pub fn selftest() {
         None => serial_println!(":: LUMENCRASH: spawned=0 first_line=none -> SKIP reason=not-spawned ::"),
     }
     lumenux();
+    lumen2();
 }
 
 /// The LUMENAPP verdict; `Some(image)` only on PASS (the image the spawn step then runs).
@@ -163,6 +168,7 @@ pub fn selftest() {
     serial_println!(":: LUMENAPP: reason=aarch64-image-owed ::");
     serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP reason=window-bad ::", IMAGE, provider, key.as_str());
     lumenux();
+    lumen2();
 }
 
 // ── LUMENCRASH M3 (rmbp-ledger B326) — the SPAWN step: run the real image as `bg` does and read its first line ──
@@ -455,4 +461,152 @@ fn resident_served() -> u64 {
     return crate::video::text::resident_served();
     #[cfg(not(feature = "selfdiag"))]
     0
+}
+
+// ── LUMEN2 (LEDGER SR121) — the chat's drives, over the SAME shared core LUMEN.ELF runs ─────────────────────
+// No ring 3, no network, no file I/O: each drive runs vein_core on fixed inputs, so a PASS is a statement about
+// the code the program links.
+//   stream   the FIXTURE provider (`vein_core::fixture`): Claude's recorded event stream and Gemini's, each served
+//            as an HTTP response seven bytes a read through `client::exchange_dialect` — the decoder must yield the
+//            answer in pieces (one per delta: `claude_pieces=` / `gemini_pieces=`, at least 2 each), the whole text
+//            exact, stop=end_turn, no failure;
+//   new      a home with conversations 1 and 2 listed (`convo::parse_listing`), titled from their files
+//            (`history::title_of`, a `set title` block beating the first question): a new conversation is 3;
+//   switch   conversation 1's file parsed back to its turns, conversation 2's `set model` naming a Gemini model the
+//            model table routes to Gemini with a context window; a trashed path under `<home>/.Trash`; the find row's
+//            search;
+//   code     the fixture's answer rendered line by line — the fence names `rust`, the code line is Block::Code, the
+//            copy verb's `code_blocks` body is the code; a table row and its delimiter render as Table / TableRule.
+// WITNESS. `:: LUMEN2: stream=<ok|bad> claude_pieces=<n> gemini_pieces=<n> new=<ok|bad> new_seq=<n> switch=<ok|bad>
+// code=<ok|bad> provider=fixture net=<up|absent> -> PASS|FAIL ::` (the network is never used; `net=` names it).
+fn lumen2() {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use vein_core::claude::{Dialect, Event, Stop};
+    use vein_core::history::{self, Ev, Setting, Who};
+    use vein_core::md::{self, Block, Span, State};
+    use vein_core::{client, convo, fixture, models};
+
+    let stream = |d: Dialect, sse: &str, want: &str| -> (bool, usize) {
+        let mut t = fixture::Replay::new([fixture::HEAD_200.as_bytes(), sse.as_bytes(), b"", b""], 7);
+        let mut rx = alloc::vec![0u8; 512];
+        let mut line = alloc::vec![0u8; 2048];
+        let mut text = String::new();
+        let mut pieces = 0usize;
+        let o = client::exchange_dialect(&mut t, d, b"HEAD", b"BODY", &mut rx, &mut line, &mut |e| {
+            if let Event::Text(s) = e {
+                text.push_str(s);
+                pieces += 1;
+            }
+        });
+        (text == want && o.status == 200 && o.fail.is_none() && o.stop == Some(Stop::EndTurn) && pieces >= 2 && t.reads > 8, pieces)
+    };
+    let (c_ok, c_pieces) = stream(Dialect::Claude, fixture::CLAUDE_SSE, fixture::TEXT);
+    let (g_ok, g_pieces) = stream(Dialect::Gemini, fixture::GEMINI_SSE, fixture::GEMINI_TEXT);
+
+    // Two conversation files, as LUMEN.ELF writes them.
+    let file = |seq: u32, user: &[u8], ai: &[u8], set: Option<(Setting, &[u8])>| -> Vec<u8> {
+        let mut b = alloc::vec![0u8; 2048];
+        let n = {
+            let mut o = vein_core::Out::new(&mut b);
+            history::header(seq, 1, &mut o);
+            if let Some((s, v)) = set {
+                history::set(s, v, &mut o);
+            }
+            history::turn(Who::User, user, &mut o);
+            history::turn(Who::Assistant, ai, &mut o);
+            o.done().unwrap_or(0)
+        };
+        b.truncate(n);
+        b
+    };
+    let f1 = file(1, b"how do rust lifetimes work", fixture::TEXT.as_bytes(), None);
+    let f2 = file(2, b"plan a trip", b"Sure.", Some((Setting::Model, b"gemini-2.5-flash")));
+    // The index is ~11 KiB (convo::MAX entries): on the heap, not this test's stack. All-zero is `Index::new()`
+    // (no entries, cur 0), so the zeroed allocation is a valid value.
+    // SAFETY: every field of convo::Index is an integer or an integer array; zero is `Index::new()` field for field.
+    let mut ix: alloc::boxed::Box<convo::Index> = unsafe { alloc::boxed::Box::<convo::Index>::new_zeroed().assume_init() };
+    convo::parse_listing(b"0002.md\n0001.md\nnotes.txt\n", &mut |s| ix.insert(s));
+    for (seq, f) in [(1u16, &f1), (2, &f2)] {
+        ix.set_title(seq, history::title_of(f, convo::TITLE_MAX));
+    }
+    let new_seq = ix.next_seq();
+    let new_ok = ix.len() == 2 && new_seq == 3 && ix.title(1) == b"how do rust lifetimes work" && ix.newest(0).map(|e| e.seq) == Some(2);
+
+    let switch_ok = {
+        let mut turns: Vec<(Who, Vec<u8>)> = Vec::new();
+        history::parse(&f1, &mut |e| match e {
+            Ev::Begin(w) => turns.push((w, Vec::new())),
+            Ev::Line(l) => {
+                if let Some(t) = turns.last_mut() {
+                    if !t.1.is_empty() || l.is_empty() {
+                        t.1.push(b'\n');
+                    }
+                    t.1.extend_from_slice(l);
+                }
+            }
+        });
+        let want_ai = fixture::TEXT.trim_end_matches('\n').as_bytes();
+        let model2 = history::setting(&f2, Setting::Model).and_then(|m| core::str::from_utf8(m).ok()).unwrap_or("");
+        let info = models::lookup(model2);
+        let mut hits = [0u16; 4];
+        let hn = ix.search(b"RUST", &mut hits);
+        let mut tp = [0u8; 64];
+        let tn = convo::trash_path(b"/home/una", 1, 0, &mut tp).unwrap_or(0);
+        turns.len() == 2
+            && turns[0] == (Who::User, b"how do rust lifetimes work".to_vec())
+            && turns[1].0 == Who::Assistant
+            && turns[1].1 == want_ai
+            && info.dialect == Dialect::Gemini
+            && info.context > 0
+            && hn == 1
+            && hits[0] == 1
+            && &tp[..tn] == b"/home/una/.Trash/lumen-0001.md"
+    };
+
+    let code_ok = {
+        let mut st = State::default();
+        let mut t = [0u8; 128];
+        let mut sp = [Span::EMPTY; 16];
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut lang_ok = false;
+        for l in fixture::TEXT.split('\n') {
+            if md::fence_info(l.as_bytes()) == Some(b"rust".as_slice()) {
+                lang_ok = true;
+            }
+            blocks.push(md::line(&mut st, l.as_bytes(), &mut t, &mut sp).block);
+        }
+        let mut body: Option<(usize, usize)> = None;
+        md::code_blocks(fixture::TEXT.as_bytes(), &mut |b| body = Some(b.body));
+        let body_ok = body.is_some_and(|(a, b)| &fixture::TEXT.as_bytes()[a..b] == b"fn main() {}");
+        let mut st2 = State::default();
+        let row = md::line(&mut st2, b"| a | b |", &mut t, &mut sp);
+        let row_ok = row.block == Block::Table && &t[..row.len] == b"a | b";
+        let rule_ok = md::line(&mut st2, b"|---|:-:|", &mut t, &mut sp).block == Block::TableRule;
+        lang_ok && blocks.get(1) == Some(&Block::Fence) && blocks.get(2) == Some(&Block::Code) && blocks.get(3) == Some(&Block::Fence) && !st.fence && body_ok && row_ok && rule_ok
+    };
+
+    let ok = |b: bool| if b { "ok" } else { "bad" };
+    let stream_ok = c_ok && g_ok;
+    serial_println!(
+        ":: LUMEN2: stream={} claude_pieces={} gemini_pieces={} new={} new_seq={} switch={} code={} provider=fixture net={} -> {} ::",
+        ok(stream_ok),
+        c_pieces,
+        g_pieces,
+        ok(new_ok),
+        new_seq,
+        ok(switch_ok),
+        ok(code_ok),
+        lumen2_net(),
+        if stream_ok && new_ok && switch_ok && code_ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// Whether this boot's network came up (informational: the LUMEN2 drives never use it).
+fn lumen2_net() -> &'static str {
+    #[cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet", feature = "net6"))]
+    if crate::net_phy::settled_ipv4().is_some() {
+        return "up";
+    }
+    "absent"
 }
