@@ -32,6 +32,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use gneiss_pal::dsp::audio::stretch::Wsola;
 use gneiss_pal::dsp::audio::{self as ac, AudioDecoder};
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::avsync::{Decision, DriftMeter, DriftReport, MasterClock, SchedStats, Scheduler, TimeSource};
@@ -215,6 +216,14 @@ pub struct Player {
     running: bool,
     /// `MediaRate` 0: the clock and the device are held while the session stays running.
     rate_held: bool,
+    /// AETHERMEDIA2 (SR134): the playback rate (0.25..=4) the master clock runs at; audio reaches
+    /// the device through WSOLA (`audio_core::stretch`, pitch kept) when it is not 1.
+    rate: f64,
+    stretch: Option<Wsola>,
+    /// Stretched stereo waiting for the device (device-rate frames).
+    stretched: VecDeque<f32>,
+    /// AETHERMEDIA2 (SR134): a session fed by appended segments (`open_live`).
+    live: Option<Live>,
     consumed_seen: u64,
     /// Device consumption at the last open/seek, and frames pushed to the device since: the
     /// audio-only end is when the device has played every pushed frame.
@@ -240,6 +249,19 @@ pub struct Player {
     info: MediaInfo,
 }
 
+/// AETHERMEDIA2 (SR134): a live session's resume state.
+#[derive(Default)]
+struct Live {
+    /// endOfStream: running out of packets is the end.
+    ended: bool,
+    /// The last decode time handed to a decoder, per track id, since the last seek.
+    delivered: Vec<(u32, i64)>,
+    /// The last seek target (0 at open): where a rebuilt demuxer resumes when nothing was delivered.
+    target_ns: i64,
+    /// The clock is held at the buffered end (HTML `waiting`).
+    waiting: bool,
+}
+
 /// The bare-audio-file probe: a format `dsp::audio` decodes and a demuxer does not.
 fn open_audio_file(bytes: &[u8]) -> Result<(ac::Decoder, ac::Info), String> {
     let dec = ac::Decoder::open_bytes(bytes.to_vec()).map_err(|e| e.to_string())?;
@@ -261,9 +283,31 @@ impl Player {
     /// used only when the stream has decodable audio. `display_hz` sets the scheduler's early
     /// window (half a display period).
     pub fn open(bytes: Vec<u8>, time: Arc<dyn TimeSource>, aout: Option<Box<dyn AudioOut>>, display_hz: u32) -> Result<Player, OpenError> {
+        Self::open_from(bytes, None, time, aout, display_hz)
+    }
+
+    /// AETHERMEDIA2 (SR134): open a LIVE session over a demuxer of appended segments (an MSE
+    /// MediaSource through [`crate::media_source::MediaSourceFeed`]). The media timeline starts at 0
+    /// (MSE: the element's position starts at 0 and stalls until data covers it); running out of
+    /// packets is not the end — the clock holds ([`Player::waiting`]) until [`Player::refresh_live`]
+    /// brings more, and the end comes only after `ended` (endOfStream) and the last frame.
+    pub fn open_live(demux: Demuxer, time: Arc<dyn TimeSource>, aout: Option<Box<dyn AudioOut>>, display_hz: u32) -> Result<Player, OpenError> {
+        let mut p = Self::open_from(Vec::new(), Some(demux), time, aout, display_hz)?;
+        p.live = Some(Live::default());
+        p.start_ns = 0;
+        p.audio_base_ns = 0;
+        p.clock.seek(0);
+        Ok(p)
+    }
+
+    fn open_from(bytes: Vec<u8>, pre: Option<Demuxer>, time: Arc<dyn TimeSource>, aout: Option<Box<dyn AudioOut>>, display_hz: u32) -> Result<Player, OpenError> {
         let mut audio_note = String::new();
         let mut audio_start_ns = 0i64;
-        let (demux, vtrack, vdec, audio, duration_ns, start_ns) = match Demuxer::open(bytes.clone()) {
+        let opened = match pre {
+            Some(d) => Ok(d),
+            None => Demuxer::open(bytes.clone()),
+        };
+        let (demux, vtrack, vdec, audio, duration_ns, start_ns) = match opened {
             Ok(demux) => {
                 let vtrack = demux.tracks().iter().find(|t| t.kind == TrackKind::Video).cloned();
                 let vdec: Option<Box<dyn VideoDecoder>> = vtrack.as_ref().map(|vt| match decoder_for(vt) {
@@ -391,6 +435,10 @@ impl Player {
             volume: 1.0,
             running: false,
             rate_held: false,
+            rate: 1.0,
+            stretch: None,
+            stretched: VecDeque::new(),
+            live: None,
             consumed_seen: 0,
             consumed_base: 0,
             pushed_frames: 0,
@@ -452,22 +500,44 @@ impl Player {
         self.volume = if volume.is_finite() { volume.clamp(0.0, 1.0) } else { 1.0 };
     }
 
-    /// AETHERMEDIA (SR107): the playback rate. 0 holds the clock and the device while the session
-    /// stays running (HTML: playing, not advancing); a non-zero rate releases the hold. Returns
-    /// false for a rate other than 0 or 1: the master clock (audio device or wall) has no rate
-    /// and no time-stretch exists in the audio path, so such a session plays at 1x.
+    /// The playback rate. 0 holds the clock and the device while the session stays running (HTML:
+    /// playing, not advancing); a non-zero rate releases the hold. AETHERMEDIA2 (SR134): a rate in
+    /// 0.25..=4 runs the master clock at that rate (`MasterClock::set_rate_ppm`), so the video's
+    /// frame selection follows the rated clock, and the audio is time-stretched by WSOLA with its
+    /// pitch kept; on the audio clock the change re-seeks to the reached time (the device ring holds
+    /// audio stretched at the old rate). Returns false for a rate outside 0 and 0.25..=4, which plays
+    /// clamped into that range.
     pub fn set_rate(&mut self, rate: f64) -> bool {
         let held = rate == 0.0;
         if held && !self.rate_held {
             self.rate_held = true;
             self.hold();
-        } else if !held && self.rate_held {
-            self.rate_held = false;
-            if self.running {
-                self.play();
+        } else if !held {
+            let r = if rate.is_finite() { rate.clamp(gneiss_pal::dsp::audio::stretch::MIN_RATE, gneiss_pal::dsp::audio::stretch::MAX_RATE) } else { 1.0 };
+            if r != self.rate {
+                self.rate = r;
+                self.clock.set_rate_ppm((r * 1_000_000.0).round() as i64);
+                if let Some(w) = self.stretch.as_mut() {
+                    w.set_rate(r);
+                }
+                if self.aout.is_some() {
+                    let now = self.clock.media_ns();
+                    self.seek(now);
+                }
+            }
+            if self.rate_held {
+                self.rate_held = false;
+                if self.running {
+                    self.play();
+                }
             }
         }
-        rate == 0.0 || rate == 1.0
+        held || (gneiss_pal::dsp::audio::stretch::MIN_RATE..=gneiss_pal::dsp::audio::stretch::MAX_RATE).contains(&rate)
+    }
+
+    /// AETHERMEDIA2 (SR134): the rate the clock runs at (1 unless set; 0 is a hold, not a rate).
+    pub fn rate(&self) -> f64 {
+        self.rate
     }
 
     /// Mute / unmute: the device plays zeros in place of the stream (already-queued samples
@@ -479,6 +549,10 @@ impl Player {
     /// Seek: land on the keyframe at or before `ns`, decode forward silently to `ns`. The
     /// device ring is flushed, so no pre-seek audio plays after the jump.
     pub fn seek(&mut self, ns: i64) {
+        if let Some(l) = self.live.as_mut() {
+            l.delivered.clear();
+            l.target_ns = ns;
+        }
         if let Some(d) = self.demux.as_mut() {
             let target = if self.vtrack.is_none() { (ns - AUDIO_PREROLL_NS).max(self.start_ns) } else { ns };
             let _ = d.seek(target);
@@ -498,6 +572,10 @@ impl Player {
         }
         self.queue.clear();
         self.pending.clear();
+        self.stretched.clear();
+        if let Some(w) = self.stretch.as_mut() {
+            w.reset();
+        }
         if let Some(o) = self.aout.as_mut() {
             o.flush();
             self.consumed_seen = o.consumed();
@@ -602,6 +680,12 @@ impl Player {
     }
 
     fn route(&mut self, p: Packet) {
+        if let Some(l) = self.live.as_mut() {
+            match l.delivered.iter_mut().find(|(t, _)| *t == p.track) {
+                Some(d) => d.1 = d.1.max(p.dts),
+                None => l.delivered.push((p.track, p.dts)),
+            }
+        }
         if Some(p.track) == self.vtrack.as_ref().map(|t| t.id) {
             if let Some(v) = self.vdec.as_mut() {
                 match v.decode(&p) {
@@ -624,7 +708,8 @@ impl Player {
         if self.audio_rate == 0 {
             return i64::MAX;
         }
-        (self.pending.len() / 2) as i64 * 1_000_000_000 / self.audio_rate as i64
+        let stretched = (self.stretched.len() / 2) as f64 * self.rate;
+        ((self.pending.len() / 2) as f64 + stretched) as i64 * 1_000_000_000 / self.audio_rate as i64
     }
 
     /// Decode until the video queue holds enough frames (or audio enough samples), or EOF.
@@ -638,6 +723,8 @@ impl Player {
             if let Some(d) = self.demux.as_mut() {
                 match d.next_packet() {
                     Some(p) => self.route(p),
+                    // AETHERMEDIA2 (SR134): a live session out of packets waits for the next append
+                    None if self.live.as_ref().is_some_and(|l| !l.ended) => break,
                     None => {
                         self.eof = true;
                         self.audio_eof = true;
@@ -686,6 +773,41 @@ impl Player {
         let delta = c.saturating_sub(self.consumed_seen);
         self.consumed_seen = c;
         self.clock.on_audio_played(delta);
+        if self.rate != 1.0 {
+            // AETHERMEDIA2 (SR134): media-rate samples → WSOLA → device-rate samples
+            let rate = self.rate;
+            let ar = self.audio_rate;
+            let w = self.stretch.get_or_insert_with(|| {
+                let mut w = Wsola::new(ar, 2);
+                w.set_rate(rate);
+                w
+            });
+            let (a, b) = self.pending.as_slices();
+            w.push(a);
+            w.push(b);
+            self.pending.clear();
+            let mut o = Vec::new();
+            w.pull(&mut o);
+            self.stretched.extend(o);
+            while !self.stretched.is_empty() {
+                self.stretched.make_contiguous();
+                let (chunk, _) = self.stretched.as_slices();
+                let took = if self.muted {
+                    out.push(&vec![0.0; chunk.len()])
+                } else if self.volume != 1.0 {
+                    let g = self.volume;
+                    out.push(&chunk.iter().map(|x| x * g).collect::<Vec<f32>>())
+                } else {
+                    out.push(chunk)
+                };
+                if took == 0 {
+                    break;
+                }
+                self.pushed_frames += (took / 2) as u64;
+                self.stretched.drain(..took);
+            }
+            return;
+        }
         while !self.pending.is_empty() {
             let (a, b) = self.pending.as_slices();
             let chunk = if a.len() >= 2 { a } else { b };
@@ -739,11 +861,84 @@ impl Player {
         }
     }
 
+    /// AETHERMEDIA2 (SR134): the live session is out of data at the clock — hold the clock and the
+    /// device (`waiting`) until an append brings packets; release when the decoders have data again.
+    fn live_stall(&mut self) {
+        let Some(l) = self.live.as_ref() else { return };
+        if l.ended {
+            if l.waiting {
+                self.live.as_mut().unwrap().waiting = false;
+                if self.running && !self.rate_held {
+                    self.play();
+                }
+            }
+            return;
+        }
+        let exhausted = self.demux.as_ref().is_none_or(|d| d.position() >= d.samples().len());
+        let now = self.clock.media_ns();
+        let video_starved = self.vtrack.is_some() && self.queue.is_empty();
+        let audio_starved = self.audio.is_some() && self.pending.is_empty() && self.stretched.is_empty() && self.audio_drained(now);
+        let starved = exhausted && (video_starved || audio_starved);
+        let waiting = l.waiting;
+        if starved && !waiting {
+            self.live.as_mut().unwrap().waiting = true;
+            self.clock.pause();
+            if let Some(o) = self.aout.as_mut() {
+                o.set_paused(true);
+            }
+        } else if !starved && waiting {
+            self.live.as_mut().unwrap().waiting = false;
+            if self.running && !self.rate_held {
+                self.play();
+            }
+        }
+    }
+
+    /// AETHERMEDIA2 (SR134): a live session holds at the end of its buffered data.
+    pub fn waiting(&self) -> bool {
+        self.live.as_ref().is_some_and(|l| l.waiting)
+    }
+
+    /// AETHERMEDIA2 (SR134): the appended segments changed — continue in `demux` (every buffered
+    /// frame, rebuilt) after the last packet handed to a decoder, or, when none was since the last
+    /// seek, from the keyframe at or before that seek's target. `ended` is endOfStream.
+    pub fn refresh_live(&mut self, mut demux: Demuxer, duration_ns: u64, ended: bool) {
+        let Some(l) = self.live.as_mut() else { return };
+        l.ended = ended;
+        self.info.duration_ns = duration_ns;
+        if l.delivered.is_empty() {
+            let target = l.target_ns;
+            if demux.seek(target).is_none() {
+                demux.set_position(0);
+            }
+        } else {
+            let floor = l.delivered.iter().map(|d| d.1).min().unwrap_or(i64::MIN);
+            let pos = demux
+                .samples()
+                .iter()
+                .position(|s| {
+                    let id = demux.tracks()[s.track_index].id;
+                    match l.delivered.iter().find(|d| d.0 == id) {
+                        Some(d) => s.dts > d.1,
+                        None => s.dts >= floor,
+                    }
+                })
+                .unwrap_or(demux.samples().len());
+            demux.set_position(pos);
+        }
+        if demux.position() < demux.samples().len() || ended {
+            self.eof = false;
+            self.audio_eof = false;
+        }
+        self.demux = Some(demux);
+    }
+
     /// One display refresh.
     pub fn tick(&mut self, sink: &mut dyn FrameSink) -> Tick {
         self.feed_audio();
         self.pump();
         self.feed_audio();
+        self.live_stall();
         let now = self.clock.media_ns();
         self.meter.record(self.time.now_ns() as i64, now);
         let mut presented = false;
@@ -775,10 +970,10 @@ impl Player {
         self.sched.on_display_tick(self.on_glass.is_some());
         if presented {
             Tick::Presented
-        } else if self.vtrack.is_some() && self.eof && self.queue.is_empty() && (self.audio.is_none() || (self.pending.is_empty() && self.audio_drained(now))) {
+        } else if self.vtrack.is_some() && self.eof && self.queue.is_empty() && (self.audio.is_none() || (self.pending.is_empty() && self.stretched.is_empty() && self.audio_drained(now))) {
             // a video ends with its last frame AND its audio (a soundtrack may outlast the picture)
             Tick::Ended
-        } else if self.vtrack.is_none() && self.audio_eof && self.pending.is_empty() && self.levels.is_empty() && self.audio_drained(now) {
+        } else if self.vtrack.is_none() && self.audio_eof && self.pending.is_empty() && self.stretched.is_empty() && self.levels.is_empty() && self.audio_drained(now) {
             Tick::Ended
         } else {
             Tick::Idle

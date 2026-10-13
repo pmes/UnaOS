@@ -249,3 +249,211 @@ fn bus_verbs_poster_play_end() {
     let (pr, dr) = ended.unwrap();
     assert_eq!(pr + dr, 20, "every frame either presented or dropped");
 }
+
+// ------------------------------------------------------------------------------------------------
+// AETHERMEDIA2 (SR134): the MediaSourceFeed (MSE segments instead of a file), playbackRate.
+// ------------------------------------------------------------------------------------------------
+
+use gneiss_pal::dsp::demux::fragment::{MediaSourceModel, Op};
+use stria::media_source::MediaSourceFeed;
+
+/// A fragmented MP4 cut at its box boundaries: the initialization segment (`ftyp` + `moov`) and
+/// one media segment per `moof` + `mdat`.
+fn fmp4_segments(file: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut p = 0;
+    let mut init = Vec::new();
+    let mut media: Vec<Vec<u8>> = Vec::new();
+    while p + 8 <= file.len() {
+        let size = u32::from_be_bytes([file[p], file[p + 1], file[p + 2], file[p + 3]]) as usize;
+        let kind = &file[p + 4..p + 8];
+        let bx = &file[p..p + size];
+        match kind {
+            b"ftyp" | b"moov" => init.extend_from_slice(bx),
+            b"moof" => media.push(bx.to_vec()),
+            b"mdat" => media.last_mut().expect("moof before mdat").extend_from_slice(bx),
+            _ => {}
+        }
+        p += size;
+    }
+    (init, media)
+}
+
+fn record(op: Op) -> Vec<u8> {
+    let mut b = Vec::new();
+    op.encode(&mut b);
+    b
+}
+
+/// Ticks a live player for `n` display periods at 60 Hz; returns the frames shown.
+fn run(p: &mut Player, time: &ManualTime, rec: &mut Rec, n: usize) -> bool {
+    for _ in 0..n {
+        let clock = p.clock_ns();
+        if p.tick(&mut RecSink { rec: &mut *rec, clock }) == Tick::Ended {
+            return true;
+        }
+        time.advance(16_666_667);
+    }
+    false
+}
+
+/// Rule (MSE + HTML): appended fragmented-MP4 segments play through the feed; at the buffered end
+/// the clock holds (`waiting`) instead of ending; the next append resumes after the last frame
+/// decoded; endOfStream ends after the last frame. The records travel in their journal form.
+#[test]
+fn media_source_feed_plays_appended_fmp4_waits_at_the_buffered_end_and_ends_at_end_of_stream() {
+    // 2 s at 25 fps, a keyframe per second, one fragment per second
+    let file = build::mp4(&[build::test_pattern_track(1, 160, 120, 25, 50, 25)], &Mp4Options { fragment: 25, ..Default::default() });
+    let (init, media) = fmp4_segments(&file);
+    assert_eq!(media.len(), 2);
+    let mut feed = MediaSourceFeed::new();
+    let mut journal = record(Op::AddSourceBuffer { mime: "video/mp4; codecs=\"utp1\"".into() });
+    journal.extend(record(Op::Append { sb: 0, bytes: init.clone() }));
+    // a record cut in two still applies whole
+    let cut = journal.len() - 7;
+    assert_eq!(feed.push_records(&journal[..cut]), 1);
+    assert_eq!(feed.push_records(&journal[cut..]), 1);
+    assert!(feed.ready(), "init segment on every SourceBuffer");
+    feed.push_records(&record(Op::Append { sb: 0, bytes: media[0].clone() }));
+    assert_eq!(feed.model.buffered(), vec![(0, 1_000_000_000)]);
+
+    let time = ManualTime::new();
+    let mut p = Player::open_live(feed.demuxer().unwrap(), Arc::new(time.clone()), None, 60).unwrap();
+    p.refresh_live(feed.demuxer().unwrap(), feed.duration_ns(), feed.ended());
+    p.play();
+    let mut rec = Rec::default();
+    assert!(!run(&mut p, &time, &mut rec, 90), "no end before endOfStream");
+    assert!(p.waiting(), "held at the buffered end");
+    assert_eq!(rec.shown.len(), 25);
+    let held = p.clock_ns();
+    assert!(held <= 1_000_000_000 + 16_666_667, "clock held at {held}");
+    run(&mut p, &time, &mut rec, 10);
+    assert_eq!(p.clock_ns(), held, "the clock does not move while waiting");
+
+    feed.push_records(&record(Op::Append { sb: 0, bytes: media[1].clone() }));
+    assert!(feed.take_changed());
+    assert_eq!(feed.model.buffered(), vec![(0, 2_000_000_000)]);
+    p.refresh_live(feed.demuxer().unwrap(), feed.duration_ns(), feed.ended());
+    run(&mut p, &time, &mut rec, 5);
+    assert!(!p.waiting());
+    feed.push_records(&record(Op::EndOfStream { error: 0 }));
+    p.refresh_live(feed.demuxer().unwrap(), feed.duration_ns(), feed.ended());
+    assert!(run(&mut p, &time, &mut rec, 120), "ended after endOfStream");
+    let counters: Vec<u32> = rec.shown.iter().map(|s| s.2).collect();
+    assert_eq!(counters, (0..50).collect::<Vec<u32>>(), "every frame once, in order, across the stall");
+    assert_eq!(feed.duration_ns(), 2_000_000_000);
+}
+
+/// Rule (MSE WebM byte stream): a WebM appended in arbitrary chunks (init segment and clusters cut
+/// mid-element) yields the same coded frames as the file demuxer; an unknown-size Cluster completes
+/// at the next Cluster, the last one at endOfStream.
+#[test]
+fn webm_appended_in_chunks_parses_into_the_file_frames() {
+    for unknown in [false, true] {
+        let opts = MkvOptions { cluster_blocks: 10, unknown_size_cluster: unknown, unknown_size_segment: unknown, ..Default::default() };
+        let file = build::mkv(&[build::test_pattern_track(1, 160, 120, 25, 50, 10)], &opts);
+        let mut m = MediaSourceModel::new();
+        m.apply(&Op::AddSourceBuffer { mime: "video/webm".into() });
+        for c in file.chunks(333) {
+            let a = m.apply(&Op::Append { sb: 0, bytes: c.to_vec() });
+            assert_eq!(a.error, None, "unknown={unknown}");
+        }
+        let before = m.buffer(0).unwrap().tracks[0].frames.len();
+        m.apply(&Op::EndOfStream { error: 0 });
+        let frames = &m.buffer(0).unwrap().tracks[0].frames;
+        assert_eq!(frames.len(), 50, "unknown={unknown}");
+        if unknown {
+            assert_eq!(before, 40, "the last unknown-size Cluster completes at endOfStream");
+        }
+        assert!(frames.iter().enumerate().all(|(i, f)| f.pts_ns == i as i64 * 40_000_000));
+        assert_eq!(m.buffered(), vec![(0, 2_000_000_000)]);
+    }
+}
+
+/// Rule (MSE §3.5.8 / §3.5.9): `timestampOffset` moves a segment; "sequence" mode lays a re-appended
+/// segment after the last one; `remove()` runs to the next random access point; a media segment
+/// before any initialization segment is an append error.
+#[test]
+fn coded_frame_processing_offset_sequence_and_remove() {
+    let file = build::mp4(&[build::test_pattern_track(1, 160, 120, 25, 50, 25)], &Mp4Options { fragment: 25, ..Default::default() });
+    let (init, media) = fmp4_segments(&file);
+    let sec = 1_000_000_000i64;
+
+    let mut m = MediaSourceModel::new();
+    m.apply(&Op::AddSourceBuffer { mime: "video/mp4".into() });
+    assert!(m.apply(&Op::Append { sb: 0, bytes: media[0].clone() }).error.is_some());
+    m.apply(&Op::Abort { sb: 0 });
+    m.apply(&Op::Append { sb: 0, bytes: init.clone() });
+    m.apply(&Op::Append { sb: 0, bytes: media[0].clone() });
+    m.apply(&Op::TimestampOffset { sb: 0, ns: 5 * sec });
+    m.apply(&Op::Append { sb: 0, bytes: media[0].clone() });
+    assert_eq!(m.buffered(), vec![(0, sec), (5 * sec, 6 * sec)]);
+    // remove [0.5 s, 0.6 s): it runs to the next random access point (5 s), so every frame whose
+    // presentation time is >= 0.5 s goes (§3.5.9 step 3.3: PTS >= start) and the GOP's head stays; the
+    // 25 fps frame at 0.48 s keeps its 40 ms, so the range ends at 0.52 s
+    m.apply(&Op::Remove { sb: 0, start_ns: sec / 2, end_ns: sec / 2 + sec / 10 });
+    assert_eq!(m.buffered(), vec![(0, 13 * sec / 25), (5 * sec, 6 * sec)]);
+
+    let mut q = MediaSourceModel::new();
+    q.apply(&Op::AddSourceBuffer { mime: "video/mp4".into() });
+    q.apply(&Op::Mode { sb: 0, sequence: true });
+    q.apply(&Op::Append { sb: 0, bytes: init });
+    for _ in 0..3 {
+        q.apply(&Op::Append { sb: 0, bytes: media[1].clone() });
+    }
+    assert_eq!(q.buffered(), vec![(0, 3 * sec)], "sequence mode: back to back from 0");
+    assert_eq!(q.duration_ns, Some(3 * sec));
+}
+
+/// Rule (playbackRate 0.25..4): the master clock runs at the rate, so frame selection follows it —
+/// at 2x, one second of wall time presents two seconds of frames; at 0.5x, half a second.
+#[test]
+fn playback_rate_scales_the_clock_and_the_frames() {
+    for (rate, want_ns) in [(2.0, 2_000_000_000i64), (0.5, 500_000_000)] {
+        let file = build::mp4(&[build::test_pattern_track(1, 160, 120, 25, 100, 25)], &Mp4Options::default());
+        let time = ManualTime::new();
+        let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+        assert!(p.set_rate(rate));
+        p.play();
+        let mut rec = Rec::default();
+        run(&mut p, &time, &mut rec, 60);
+        let c = p.clock_ns();
+        assert!((c - want_ns).abs() <= 2 * 16_666_667 * 4, "rate {rate}: clock {c}");
+        let last = rec.shown.last().unwrap();
+        assert!((last.1 - c).abs() <= 80_000_000, "rate {rate}: the frame on glass follows the rated clock");
+    }
+    let file = build::mp4(&[build::test_pattern_track(1, 160, 120, 25, 10, 10)], &Mp4Options::default());
+    let mut p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert!(!p.set_rate(8.0), "outside 0.25..4 is clamped");
+    assert_eq!(p.rate(), 4.0);
+}
+
+/// Rule (WSOLA keeps the pitch): a 441 Hz tone stretched at 2x lasts half as long and still crosses
+/// zero 882 times a second; at 0.5x it lasts twice as long, same frequency.
+#[test]
+fn wsola_time_stretch_keeps_the_pitch() {
+    use gneiss_pal::dsp::audio::stretch::Wsola;
+    let sr = 48_000usize;
+    let tone: Vec<f32> = (0..sr * 2).flat_map(|i| {
+        let x = (2.0 * std::f64::consts::PI * 441.0 * i as f64 / sr as f64).sin() as f32 * 0.5;
+        [x, x]
+    }).collect();
+    for rate in [2.0, 0.5] {
+        let mut w = Wsola::new(sr as u32, 2);
+        w.set_rate(rate);
+        let mut out = Vec::new();
+        for c in tone.chunks(4096) {
+            w.push(c);
+            w.pull(&mut out);
+        }
+        let frames = out.len() / 2;
+        let want = (sr as f64 * 2.0 / rate) as usize;
+        // the tail still inside the analysis window (a frame plus the search) is not out yet
+        assert!((frames as f64 - want as f64).abs() < sr as f64 * 0.1, "rate {rate}: {frames} frames, want ~{want}");
+        // zero crossings of the left channel over the middle half of the output, per second
+        let m = frames / 2;
+        let mid: Vec<f32> = out.iter().step_by(2).skip(frames / 4).take(m).copied().collect();
+        let zc = mid.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+        let per_sec = zc as f64 * sr as f64 / m as f64;
+        assert!((per_sec - 882.0).abs() <= 15.0, "rate {rate}: {per_sec} zero crossings per second (pitch moved)");
+    }
+}

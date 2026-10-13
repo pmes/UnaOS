@@ -1437,6 +1437,9 @@ fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
         return (true, false);
     }
     CLICKING.with(|c| c.borrow_mut().insert(n));
+    if trusted {
+        crate::media::note_user_activation(); // AETHERMEDIA2 (SR134): HTML's sticky activation for autoplay
+    }
     let init = vm.new_plain_object();
     let _ = vm.create_data_property(init, PropertyKey::from_str("detail"), num(1.0));
     let e = new_event(vm, "MouseEvent", "click", true, true, Some(init));

@@ -880,6 +880,7 @@ impl AetherEngine {
                 self.insert_text(&text);
             }
             api::events::Event::KeyDown(key) => {
+                media::note_user_activation(); // AETHERMEDIA2 (SR134): a trusted key is a user activation
                 // AETHEREVENTS (SR80): UI Events §5.6 — a trusted `keydown` at the focused element runs
                 // first and a canceled one suppresses the default (editing, activation, scrolling); the
                 // `keyup` follows the default.

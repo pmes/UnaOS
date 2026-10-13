@@ -1740,6 +1740,14 @@ fn media_play(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     match media_entry(el) {
         Some(e) if !matches!(e.state, crate::media::State::Error(_)) => {
             let was_paused = !matches!(e.state, crate::media::State::Playing);
+            // AETHERMEDIA2 (SR134): Chromium's autoplay policy — audible play() needs the document's
+            // sticky activation; without it the promise rejects and the element shows the play affordance.
+            let muted = page(|p| p.media_muted.get(&el).copied()).unwrap_or(e.muted);
+            if was_paused && !crate::media::play_allowed(&dom::node_ref(el), muted) {
+                let ex = dom_exception(vm, "NotAllowedError", "play() failed because the user didn't interact with the document first.");
+                vm.call(&reject, &Value::Undefined, &[ex])?;
+                return Ok(Value::Object(p));
+            }
             crate::media::play(&dom::node_ref(el));
             if was_paused {
                 page(|p| p.tasks.push_back(super::Task::Event(super::TargetKey::Node(el), "play".into(), false)));
@@ -1772,7 +1780,12 @@ fn media_can_play_type(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     this_element(vm, ctx)?;
     need(vm, ctx, 1, "HTMLMediaElement", "canPlayType")?;
     let t = string(vm, &arg(vm, ctx, 0))?;
-    Ok(s(if crate::media::can_play_type(&t) { if t.contains("codecs") { "probably" } else { "maybe" } } else { "" }))
+    // AETHERMEDIA2 (SR134): "probably" only for codecs Stria really decodes; a stand-in codec is "maybe"
+    Ok(s(match crate::media::play_support(&t) {
+        2 => "probably",
+        1 => "maybe",
+        _ => "",
+    }))
 }
 
 fn media_paused(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1803,6 +1816,9 @@ fn media_current_time_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn media_duration(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
+    if let Some(d) = crate::media::mse_duration(&dom::node_ref(el)) {
+        return Ok(num(d)); // AETHERMEDIA2 (SR134): the MediaSource's duration (NaN, +Infinity)
+    }
     Ok(num(media_entry(el).filter(|e| e.duration_ns > 0).map(|e| e.duration_ns as f64 / 1e9).unwrap_or(f64::NAN)))
 }
 
@@ -1878,6 +1894,11 @@ fn media_rate_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let r = vm.to_number(&arg(vm, ctx, 0))?;
     if !r.is_finite() {
         return vm.throw_type("The provided double value is non-finite.");
+    }
+    // AETHERMEDIA2 (SR134): Chromium's supported range (0, or 1/16..16); Stria plays 0.25..4 with the
+    // pitch kept and clamps the rest
+    if r != 0.0 && !(0.0625..=16.0).contains(&r) {
+        return throw_dom(vm, "NotSupportedError", &format!("The provided playback rate ({r}) is not in the supported playback range."));
     }
     let forwarded = media_entry(el).is_some() && crate::media::set_playback_rate(&dom::node_ref(el), r);
     if !forwarded {

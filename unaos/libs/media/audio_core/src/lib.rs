@@ -52,6 +52,8 @@ pub mod md5;
 pub mod mp3;
 pub mod ogg;
 pub mod opus;
+/// AETHERMEDIA2 (SR134): WSOLA time-stretch (playbackRate with the pitch kept).
+pub mod stretch;
 pub mod vorbis;
 pub mod wav;
 
