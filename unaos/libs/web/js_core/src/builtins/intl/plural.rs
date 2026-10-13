@@ -1,5 +1,6 @@
-//! Intl.PluralRules (ECMA-402 §16) with the CLDR `en` rules: cardinal `one` (i = 1 and v = 0) / `other`;
-//! ordinal `one` (n % 10 = 1, n % 100 ≠ 11), `two` (2, ≠ 12), `few` (3, ≠ 13), `other`.
+//! Intl.PluralRules (ECMA-402 §16) over CLDR 46's plural rules (INTLCLDR, SR137): the cardinal and ordinal
+//! rules of the locale's language, compiled by tools/gen_cldr.py and evaluated by `cldr::plural` on the UTS #35
+//! operands of the number as formatted with the digit options; selectRange reads CLDR's plural ranges.
 
 use super::number::{digit_options, format_numeric, mv_of, Digits, Mv, RType};
 use super::*;
@@ -7,6 +8,8 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct Plural {
     pub locale: String,
+    /// The language whose rules apply.
+    pub lang: &'static str,
     pub ordinal: bool,
     pub dg: Digits,
 }
@@ -31,33 +34,23 @@ fn pr_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let t = get_string_option(vm, o, "type", &["cardinal", "ordinal"], "Intl.PluralRules")?;
     let dg = digit_options(vm, o, 0, 3, false)?;
     let r = resolve_locale(&requested, &[]);
-    let pr = Plural { locale: String::from(r.data_locale), ordinal: t.as_deref() == Some("ordinal"), dg };
+    let pr = Plural { locale: String::from(r.data_locale), lang: plural_lang(r.loc), ordinal: t.as_deref() == Some("ordinal"), dg };
     Ok(Value::Object(alloc_intl(vm, p, IntlData::PluralRules(Box::new(pr)))))
 }
 
-/// ResolvePlural (§16.5.3) for `en`.
+/// The language of the plural rules of a data locale (pt-PT has rules of its own; en-* and es-* share).
+pub fn plural_lang(loc: crate::cldr::L) -> &'static str {
+    loc.lang()
+}
+
+/// ResolvePlural (§16.5.3): the category of the number as formatted with the digit options.
 pub fn select(pr: &Plural, mv: &Mv) -> &'static str {
     let x = match mv {
         Mv::Fin(x) => x,
         _ => return "other",
     };
     let (_, int, frac) = format_numeric(&pr.dg, x);
-    let int = int.trim_start_matches('0');
-    if !pr.ordinal {
-        return if int == "1" && frac.is_empty() { "one" } else { "other" };
-    }
-    if frac.bytes().any(|b| b != b'0') {
-        return "other";
-    }
-    let b = int.as_bytes();
-    let last = b.last().map(|c| c - b'0').unwrap_or(0);
-    let tens = if b.len() >= 2 { b[b.len() - 2] - b'0' } else { 0 };
-    match (last, tens) {
-        (1, t) if t != 1 => "one",
-        (2, t) if t != 1 => "two",
-        (3, t) if t != 1 => "few",
-        _ => "other",
-    }
+    crate::cldr::plural(pr.lang, pr.ordinal, &crate::cldr::Operands::new(&int, &frac, 0))
 }
 
 fn is_pr(d: &IntlData) -> bool {
@@ -91,9 +84,14 @@ fn pr_select_range(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if x.is_nan() || y.is_nan() {
         return vm.throw_range("Invalid number range: NaN");
     }
-    let _ = pr_of(vm, o);
-    // CLDR `en` plural ranges: one+other, other+one and other+other all resolve to `other`.
-    Ok(Value::str("other"))
+    let pr = pr_of(vm, o);
+    // ResolvePluralRange (§16.5.5): the categories of both ends through CLDR's plural ranges.
+    if pr.ordinal {
+        return Ok(Value::str(select(&pr, &mv_of(y))));
+    }
+    let a = select(&pr, &mv_of(x));
+    let b = select(&pr, &mv_of(y));
+    Ok(Value::str(crate::cldr::plural_range(pr.lang, a, b)))
 }
 
 fn pr_resolved_options(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -113,7 +111,7 @@ fn pr_resolved_options(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         props.push(("minimumSignificantDigits", Value::Number(d.min_sig as f64)));
         props.push(("maximumSignificantDigits", Value::Number(d.max_sig as f64)));
     }
-    let cats: &[&str] = if pr.ordinal { &["one", "two", "few", "other"] } else { &["one", "other"] };
+    let cats = crate::cldr::plural_categories(pr.lang, pr.ordinal);
     let vals = cats.iter().map(|c| Value::str(c)).collect();
     let arr = vm.new_array(vals);
     props.push(("pluralCategories", Value::Object(arr)));

@@ -390,11 +390,6 @@ pub fn numbering_system(r: &Resolved, option: Option<&str>) -> (&'static str, bo
     (r.loc.default_ns(), false)
 }
 
-/// The en-GB data set or the en-US one (`en` resolves to en-US data).
-pub fn is_gb(locale: &str) -> bool {
-    locale.starts_with("en-GB")
-}
-
 fn get_canonical_locales(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let l = vm.arg(ctx, 0);
     let list = canonicalize_locale_list(vm, &l)?;
