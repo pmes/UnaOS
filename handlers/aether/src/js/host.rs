@@ -12,7 +12,6 @@
 //! - the clock is the wall clock (`Date.now`); local time is UTC (this host has no zone database);
 //! - `Math.random` is seeded from the OS entropy pool.
 
-use html_core::url;
 use js_core::vm::{Host, Obj};
 
 /// Most module fetches one page may make.
@@ -47,9 +46,8 @@ pub fn resolve_specifier(base: &str, specifier: &str) -> Result<String, String> 
         Some(i) => &base[..i],
         None => base,
     };
-    if url::Url::parse(base).is_err() {
-        return Err(format!("bad module base {base}"));
-    }
+    // An unparsable base (a page with no URL) still resolves absolute specifiers and mapped bare ones;
+    // only a relative specifier needs it, and importmap::resolve refuses that one with a TypeError.
     super::importmap::resolve(base, specifier)
 }
 
