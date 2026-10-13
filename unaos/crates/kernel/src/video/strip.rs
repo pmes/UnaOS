@@ -325,7 +325,7 @@ pub fn fnv1a_u64(mut h: u64, v: u64) -> u64 {
 /// colliding with it would leave the strip un-repainted forever.
 #[inline]
 pub fn seal(h: u64) -> u64 {
-    let h = h ^ ((super::theme::epoch() as u64) << 40); if h == 0 { 1 } else { h } // APPEARANCE (B408): a theme switch changes every strip's signature, so the bar, dock and menus repaint once
+    seal_with(h, super::theme::epoch(), wall_gen()) // APPEARANCE (B408): a theme switch changes every strip's signature, so the bar, dock and menus repaint once. MENUS2 (B652): so does a wallpaper install (`wall_gen`, MENUSCRAFT §6) — a sheet's band blends over the picture, so the picture is part of what it painted; the pure body is `seal_with` at the file's tail (appended there so no line above it moves). ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
 }
 
 // ---------------------------------------------------------------------------
@@ -2025,4 +2025,26 @@ pub fn bands_check(old: Rect, new: Rect) -> (usize, u64, bool) {
         clear &= !meets;
     }
     (n, px, clear && px == bar_uncovered(old, Some(new)))
+}
+
+/// MENUS2 (B652) — [`seal`]'s pure body, the fixture's read (`tests menuscraft` `wallpaper_gen=`): the theme epoch
+/// at bit 40 as before (B408), then the wallpaper's install generation folded through FNV, so a new picture under a
+/// sheet changes the signature exactly as a theme switch does. Never `0` (reserved for "nothing painted").
+pub fn seal_with(h: u64, epoch: u32, wall: u64) -> u64 {
+    let h = fnv1a_u64(h ^ ((epoch as u64) << 40), wall);
+    if h == 0 { 1 } else { h }
+}
+
+/// MENUS2 (B652) — the installed wallpaper's IDENTITY, MENUSCRAFT §6's install generation without a counter in
+/// `wallpaper.rs` (not in this lane): every `wallpaper::install` builds its picture in a fresh `Vec` while the one
+/// before it is still alive in `WALL` and the one before that in `RETIRED` (wallpaper.rs `install`), so two
+/// consecutive installs never share an address. `(px, w, h)` folded; `0` = the flat colour (none installed).
+#[cfg(feature = "facet")]
+pub fn wall_gen() -> u64 {
+    super::wallpaper::back().map_or(0, |b| (b.px.as_ptr() as u64) ^ ((b.w as u64) << 48) ^ ((b.h as u64) << 32))
+}
+/// MENUS2 (B652) — no `facet`, no wallpaper module: the generation is constant.
+#[cfg(not(feature = "facet"))]
+pub fn wall_gen() -> u64 {
+    0
 }

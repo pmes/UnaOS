@@ -1,5 +1,7 @@
 # MENUS2 (rmbp-ledger B652) — RESUME (stopped by the seat 2026-10-14: wrong model; resumes on Opus)
 
+> SUPERSEDED by [MENUS2.md](MENUS2.md) — the arc was finished from this note; kept as the stop record.
+
 Worktree /home/user/exec/menus2, branch exec-rmbp-menus2, cut from 8da376cb. WIP commit c4b63fbd (dock.rs only).
 NO compile was run. Last compile command: none (rc: n/a). No gates, no linters run.
 

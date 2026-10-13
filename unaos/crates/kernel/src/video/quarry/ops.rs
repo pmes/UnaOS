@@ -297,11 +297,115 @@ struct Edit {
 }
 static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 
+/// MENUS2 (B652): the OUTER sizes — the sheet's body (the widest label, `Empty Trash (NN items)`, at `INSET + PAD`
+/// from each side, inside the item pill's inset) plus `sheet::BAND()` on the right and at the foot for the `elev.2`
+/// shadow (MENUSCRAFT §2). The height carries the container's `DROP_PADY` above and below the items.
 fn menu_w(g: &Geom) -> usize {
-    22 * g.cell_w() + 2 * PAD()
+    use crate::video::crystal::sheet;
+    22 * g.cell_w() + 2 * PAD() + 2 * sheet::INSET() + sheet::BAND()
 }
 fn menu_h(g: &Geom) -> usize {
-    ITEMS.len() * g.row_h() + 2
+    ITEMS.len() * g.row_h() + 2 * crate::video::crystal::DROP_PADY() + crate::video::crystal::sheet::BAND()
+}
+
+/// MENUS2 (B652) — the body of the menu at `(x, y)` (source px): `(bw, bh, pady)`. The band is outside it.
+fn menu_body(g: &Geom) -> (usize, usize, usize) {
+    let band = crate::video::crystal::sheet::BAND();
+    (menu_w(g) - band, menu_h(g) - band, crate::video::crystal::DROP_PADY())
+}
+
+/// MENUS2 (B652) — the item under the pointer, or `None`: the system cursor read through the input path's one door
+/// (`panel_info_nonblocking`, LOCKFIX), mapped by [`to_source`] (wm's `hit_test`/`info`, no Quarry lock taken), and
+/// tested against the BODY less its padding — the band and the padding light nothing.
+fn menu_hover(g: &Geom, x: usize, y: usize) -> Option<usize> {
+    let i = crate::video::panel_info_nonblocking()?;
+    let (px, py) = crate::pal::cursor::pos(i.width as i32, i.height as i32);
+    let (sx, sy) = to_source(px, py)?;
+    let (bw, _, pady) = menu_body(g);
+    if sx < x || sx >= x + bw || sy < y + pady {
+        return None;
+    }
+    let k = (sy - y - pady) / g.row_h();
+    if k < ITEMS.len() { Some(k) } else { None }
+}
+
+/// MENUS2 (B652) — **Quarry's file-ops menu on the sheet** (MENUSCRAFT §9), painted IN Quarry's own surface `px`
+/// (source px, stride `g.w`) at `(x, y)` through the kit (`video::draw`): the `elev.2` lift as two `shadow_rrect`
+/// layers in `theme::shadow_soft()` (the mapped `elev.2` ink for an overlay outside crystal, MENUSCRAFT §7's toast ×
+/// row; the tight layer at two thirds of it, elev.2's own tight:wide ratio), the `surface.overlay` body at
+/// `radius.overlay` with all four corners round (a context menu floats), the `line.subtle` hairline, the hovered
+/// item's `sheet::pill`, the labels in `text.primary` (`on_accent` on the pill), and `sheet::seal_row` over every
+/// row of the outer rect (no pure white: MENU-UNDER). `sheet::row` is not used: its `Under` is a scene ESTIMATE in
+/// panel coordinates, and here the pixels beneath the band are Quarry's own, already in `px` — the shadow blends
+/// over the TRUE scene (MENUSCRAFT §4's exactness, where the owner holds the pixels).
+fn menu_paint(px: &mut [u32], g: &Geom, x: usize, y: usize, hover: Option<usize>) {
+    use crate::video::{crystal::sheet, draw};
+    let (w, h) = (menu_w(g), menu_h(g));
+    let (bw, bh, pady) = menu_body(g);
+    let rh = g.row_h();
+    if x + w > g.w || y + h > g.h || px.len() < g.w * g.h || bw <= 2 * sheet::INSET() {
+        return;
+    }
+    let rad = sheet::RADIUS().min(bw as i32 / 2).min(bh as i32 / 2).max(0);
+    {
+        let mut s = draw::Surf::new(&mut px[..g.w * g.h], g.w);
+        let b = draw::Rect::new(x as i32, y as i32, bw as i32, bh as i32);
+        let band = sheet::BAND() as i32;
+        let drop = (crate::ui::px(3) as i32).min(band - 1).max(0);
+        let wide = theme::shadow_soft();
+        let tight = ((wide >> 24) * 2 / 3) << 24;
+        draw::shadow_rrect(&mut s, b.offset(0, drop), rad, (band - drop).max(1), wide);
+        draw::shadow_rrect(&mut s, b, rad, (crate::ui::px(2) as i32).min(band).max(1), tight);
+        draw::fill_rrect(&mut s, b, rad, sheet::surface_overlay());
+        draw::stroke_rrect(&mut s, b, rad, 1, draw::Ink::argb(sheet::line_subtle()));
+    }
+    for (i, it) in ITEMS.iter().enumerate() {
+        let top = y + pady + i * rh;
+        let hot = hover == Some(i);
+        if hot {
+            for r in top..top + rh {
+                sheet::pill(&mut px[r * g.w + x..r * g.w + x + bw], bw, r - top, 0, rh);
+            }
+        }
+        let ink = if hot { sheet::on_accent() } else { sheet::text_primary() };
+        text(px, g, x + sheet::INSET() + PAD(), top + g.ts, it.label().as_bytes(), x + bw - sheet::INSET(), ink);
+    }
+    for r in y..y + h {
+        sheet::seal_row(&mut px[r * g.w + x..r * g.w + x + w]);
+    }
+}
+
+/// MENUS2 (B652) — `tests menuscraft`'s `quarry_menu=` and `band_exact=` legs: `(menu ok, band exact)`. The live
+/// painter ([`menu_paint`]) over a pure geometry (`geometry(1280, 800)`), item 0 hovered, into two surfaces of
+/// different fills (`surface.content`, then the accent). Menu ok: the body's centre is `surface.overlay`, the pill
+/// sits inside the inset (accent at the body's right inner edge, the face outside the inset), no pure white in the
+/// outer rect. Band exact: the band pixel beside the body is darker than its own fill in BOTH surfaces and differs
+/// between them — the shadow blended over the true pixels beneath, not over an estimate.
+pub fn sheet_probe() -> (bool, bool) {
+    use crate::video::crystal::sheet;
+    let Some(g) = geometry(1280, 800) else { return (false, false) };
+    let (w, h) = (menu_w(&g), menu_h(&g));
+    let (bw, bh, pady) = menu_body(&g);
+    if w > g.w || h > g.h {
+        return (false, false);
+    }
+    let fills = [theme::surface_content() & 0x00FF_FFFF, theme::accent() & 0x00FF_FFFF];
+    let luma = |c: u32| (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8;
+    let (mut menu_ok, mut darker) = (true, true);
+    let mut band_px = [0u32; 2];
+    for (k, &f) in fills.iter().enumerate() {
+        let mut px = alloc::vec![f; g.w * g.h];
+        menu_paint(&mut px, &g, 0, 0, Some(0));
+        let at = |x: usize, y: usize| px[y * g.w + x] & 0x00FF_FFFF;
+        menu_ok &= at(bw / 2, bh / 2) == sheet::surface_overlay();
+        menu_ok &= at(bw - sheet::INSET() - 2, pady + g.row_h() / 2) == sheet::accent_fill() && at(sheet::INSET() / 2, pady + g.row_h() / 2) != sheet::accent_fill();
+        for r in 0..h {
+            menu_ok &= !px[r * g.w..r * g.w + w].iter().any(|&c| c & 0x00FF_FFFF == theme::pure_white());
+        }
+        band_px[k] = at(bw + 1, bh / 2);
+        darker &= luma(band_px[k]) < luma(f);
+    }
+    (menu_ok, darker && band_px[0] != band_px[1])
 }
 
 /// Paint the menu and the edit field over the finished frame. Called at the end of `repaint_locked`.
@@ -336,13 +440,9 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
         s.push(b'_');
         text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::text_primary());
     }
-    if let Some(mn) = MENU.lock().as_ref() {
-        let (w, h) = (menu_w(g), menu_h(g));
-        fill(px, g, mn.x, mn.y, w, h, theme::surface_raised());
-        keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::line_subtle());
-        for (i, it) in ITEMS.iter().enumerate() {
-            text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::text_primary());
-        }
+    let at = MENU.lock().as_ref().map(|mn| (mn.x, mn.y)); // MENUS2 (B652): the origin copied out, so the hover read below holds no Quarry UI lock
+    if let Some((mx, my)) = at {
+        menu_paint(px, g, mx, my, menu_hover(g, mx, my)); // MENUS2 (B652): the sheet (was a raised face, a keyline and flat rows)
     }
     super::getinfo::paint(m, px); // ATTRCOLUMNS (B402): the inspector
     super::openwith::paint(m, px); // FILETYPES (B423): Open With…
@@ -481,11 +581,11 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     let origin = (mn.x, mn.y);
     if let Some((sx, sy)) = hit {
         let g = match MODEL.lock().as_ref() {
-            Some(m) => (menu_w(&m.geom), m.geom.row_h()),
+            Some(m) => { let (bw, _, pady) = menu_body(&m.geom); (bw, m.geom.row_h(), pady) } // MENUS2 (B652): the BODY less its padding — a press on the band dismisses (MENUSCRAFT §2)
             None => return true,
         };
-        if sx >= mn.x && sx < mn.x + g.0 && sy >= mn.y + 1 {
-            let i = (sy - mn.y - 1) / g.1;
+        if sx >= mn.x && sx < mn.x + g.0 && sy >= mn.y + g.2 {
+            let i = (sy - mn.y - g.2) / g.1;
             if i < ITEMS.len() {
                 picked = Some(ITEMS[i]);
             }
