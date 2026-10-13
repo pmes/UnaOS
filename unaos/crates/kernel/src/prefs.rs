@@ -708,7 +708,7 @@ pub fn set_sys(k: &str, v: PrefValue) {
 /// on the preferences file once the VFS can set one ([`mirror_attr`]).
 fn changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
     let v = &a.value;
-    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] crate::prefs_client::on_changed(ns, k, a); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers. PREFSKERNEL (B345): it carries `clamped`.
+    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::prefs_client::on_changed(ns, k, a); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers. PREFSKERNEL (B345): it carries `clamped`. ARMNOEL0: widened with the prefs_client cfg (lib.rs).
     mirror_attr(ns, k, v);
 }
 
@@ -829,7 +829,7 @@ impl prefs_core::wire::Store for KernelStore {
 }
 
 // The shared wire's numbers are the kernel bus's (prefs_core's dev-test pins them to una-abi too).
-#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))]
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // ARMNOEL0: widened with the `crate::bus` cfg (lib.rs)
 const _: () = assert!(
     prefs_core::wire::BODY_MAX == crate::bus::BUS_BODY_MAX
         && prefs_core::wire::VERB_GET == una_abi::BUS_VERB_PREF_GET
@@ -838,7 +838,7 @@ const _: () = assert!(
         && prefs_core::wire::VERB_CHANGED == una_abi::BUS_VERB_PREF_CHANGED
 );
 
-#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold); ARMNOEL0: widened with it so the aarch64 desktop without EL0 reads the store
 /// Fulfil one PREF verb — PREFSKERNEL (B345): a thin call into `prefs_core::wire::fulfil` over the kernel
 /// store, the function Principia answers with on the host. `in_session`: the caller runs in the open
 /// session (the transport decides, from the stamped principal). Reply body into `text`; returns the status.
@@ -855,7 +855,7 @@ pub fn bus_fulfil(verb: u8, body: &[u8], in_session: bool, text: &mut Vec<u8>) -
     prefs_core::wire::fulfil(&mut KernelStore, verb, body, in_session, text)
 }
 
-#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold); ARMNOEL0: widened with it
 /// PREFS-CODEC KATs (M3): the three request bodies through the frozen v1 frame — build, `frame_parse`
 /// (the verb gate admits them), body-parse — plus one frozen golden and the refusals. Pure, in RAM.
 /// Prints `:: PREFS-CODEC: kats=<n> -> PASS ::`.
@@ -906,8 +906,8 @@ pub fn codec_selftest() -> bool {
 #[cfg(feature = "witness")]
 pub fn selftest() {
     ensure_loaded();
-    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] let codec = codec_selftest();
-    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))] let codec = true; // no bus on this build: the codec leg is vacuous, not failed
+    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] let codec = codec_selftest(); // ARMNOEL0: widened (with its twin) to the `crate::bus` cfg
+    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware"))))] let codec = true; // no bus on this build: the codec leg is vacuous, not failed
     // SETTINGSFILES (R98): the legs below run on the `general` domain file (power.lowbat_shutdown_pct's)
     // and the fixture's own `settings/fixturens`; every other domain file is untouched.
     let p = domain_path("general");
@@ -953,8 +953,8 @@ pub fn selftest() {
     // same clamped SET with the same status and the same bytes (`100` NUL `clamped=true`).
     let wire_body: &[u8] = b"system.power.lowbat_shutdown_pct\x00250";
     let mut kt = Vec::new();
-    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] let ks = bus_fulfil(prefs_core::wire::VERB_SET, wire_body, true, &mut kt);
-    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))] let ks = prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_SET, wire_body, true, &mut kt);
+    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] let ks = bus_fulfil(prefs_core::wire::VERB_SET, wire_body, true, &mut kt); // ARMNOEL0: widened (with its twin) to the bus_fulfil cfg
+    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware"))))] let ks = prefs_core::wire::fulfil(&mut KernelStore, prefs_core::wire::VERB_SET, wire_body, true, &mut kt);
     let mut rt = Vec::new();
     let rs = prefs_core::wire::fulfil(&mut prefs_core::wire::TreeStore::default(), prefs_core::wire::VERB_SET, wire_body, true, &mut rt);
     let wire_ok = ks == 0 && ks == rs && kt == rt && kt == b"100\x00clamped=true";

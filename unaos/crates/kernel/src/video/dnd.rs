@@ -560,8 +560,9 @@ fn ring3_deliver(owner: u64, paths: &[String]) -> bool {
     let ev = una_abi::input_ev_pack(una_abi::INPUT_EV_DROP, una_abi::drop_ev_payload(token, n));
     #[cfg(target_arch = "x86_64")]
     let pushed = crate::arch::x86_64::syscall::user_input_push_owner(owner, ev);
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_el0"))] // ARMNOEL0: the Pi ring lives in syscall.rs, compiled only with an EL0 layer
     let pushed = crate::arch::aarch64::syscall::user_input_push_owner(owner, ev); // DROPTYPES (B477): the Pi's ring, by owner (= asid)
+    #[cfg(all(target_arch = "aarch64", not(feature = "aarch64_el0")))] let pushed = { let _ = ev; false }; // ARMNOEL0: no EL0 layer, no ring-3 window to push to
     serial_println!("[dnd] ring3 owner={} token={} n={} pushed={} types=declared", owner, token, n, pushed as u8);
     pushed
 }
@@ -603,8 +604,9 @@ static GHOST_REFUSED: AtomicBool = AtomicBool::new(false);
 fn ring3_live(owner: u64) -> bool {
     #[cfg(target_arch = "x86_64")]
     return crate::arch::x86_64::syscall::ring3_owner_live(owner);
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_el0"))] // ARMNOEL0: syscall.rs exists only with an EL0 layer
     return crate::arch::aarch64::syscall::ring3_owner_live(owner);
+    #[cfg(all(target_arch = "aarch64", not(feature = "aarch64_el0")))] return { let _ = owner; false }; // ARMNOEL0: no EL0 layer, no live ring-3 program
 }
 
 /// The drop types `owner`'s program declares: its armed name → the APPRES key → the registrant's `droptypes`.
