@@ -418,7 +418,7 @@ fn supported_values_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let kv = vm.arg(ctx, 0);
     let key = vm.to_string(&kv)?.to_rust();
     let mut list: Vec<String> = match key.as_str() {
-        "calendar" => strs(&["gregory"]),
+        "calendar" => strs(datetime::CALENDARS),
         // The collator implements the root order only (no tailorings such as "emoji" or "phonebk").
         "collation" => Vec::new(),
         "currency" => crate::cldr::currency_codes().map(String::from).collect(),
