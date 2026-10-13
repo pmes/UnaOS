@@ -7,10 +7,11 @@
 //
 //   SYS_STAT                       kind (0 file, 1 dir), size, id, flags
 //   SYS_PATH_READ                  a file from `offset`, PATH_IO_MAX per call (0 = end of file)
-//   SYS_PATH_READ + PATH_R_LIST    a directory's names, `\n`-joined, a directory with a trailing `/`; inside the
-//                                  caller's own home (holocron2), else -EACCES by the ownership ACL
+//   SYS_PATH_READ + PATH_R_LIST    a directory's names, `\n`-joined, a directory with a trailing `/`; any directory
+//                                  the ownership ACL lets this program read (RING3EXEC B521), else -EACCES
 //   SYS_PATH_WRITE                 the first chunk with PATH_W_TRUNC at offset 0 (create-or-truncate), then each
-//                                  chunk at its offset; present only on a kernel with `selfdiag` (-ENOSYS without)
+//                                  chunk at its offset; UNAMETAL2 (LEDGER SR98): on the default x86 kernel as this
+//                                  program's principal under the volume's write ACL (-EACCES by the ACL's word)
 
 use alloc::string::String;
 use alloc::vec::Vec;

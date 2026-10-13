@@ -8,8 +8,9 @@
 //
 // FILES. Open = SYS_PATH_READ of the whole file (EDIT_MAX bound, refused past it rather than truncated — a
 // truncated document saved back would destroy the tail), lossy UTF-8 (the status says so), `Buffer::new`. Save =
-// `Buffer` text -> SYS_PATH_WRITE (truncate, then chunks), present on a `selfdiag` kernel; -ENOSYS otherwise, named
-// in the status. Opening over unsaved edits is refused once ("Ctrl+O again discards").
+// `Buffer` text -> SYS_PATH_WRITE (truncate, then chunks) — UNAMETAL2 (LEDGER SR98): on the default x86 kernel too,
+// as this program's principal under the volume's write ACL (a refusal is EACCES in the status). Opening over unsaved
+// edits is refused once ("Ctrl+O again discards").
 //
 // KEYS (focused). Printable ASCII inserts; Enter = `newline` (the core's auto-indent); Backspace = delete one
 // grapheme back; Tab = four spaces; arrows = `move_cursors`; Ctrl+A / Ctrl+E line start / end; Ctrl+K delete the
@@ -18,19 +19,104 @@
 // resolved actions (INPUT_EV_ACTION, APPCLIP/TERMSEL): select-all, select-left/right, select-line-start/end,
 // deselect, and TERMSEL2's caret moves — the ring carries no modifier bits, so Shift+arrow arrives that way.
 //
-// SYNTAXCORE (LEDGER SR89) runs this wave: `highlight` is the seam it fills — a per-line span painter the pane
-// asks before drawing a line. Nothing is linked; `None` draws every line in the one ink.
+// HIGHLIGHT — UNAMETAL2 (LEDGER SR98) fills SYNTAXCORE's (SR89) seam with the core itself: `highlight` holds the
+// grammar (`syntax_core::language_for_id`, chosen from the file's extension by Tabula's table), the incremental
+// `Highlighter` and the `Theme`. Open lexes the document through a `Source` over edit_core's Buffer (one line at a
+// time, never the document as one String); every edit's `Change`s are spliced and re-lexed (Tabula's
+// `TabulaDocument::sync_syntax` shape), so a keystroke re-lexes one line in the common case. A character's ink is the
+// APPEARANCE TOKEN the theme map names for its kind (`Theme::token`), resolved by [`token_ink`] through the painter's
+// DARK set (kernel `video/theme.rs`; this program paints a dark ground) — no colour belongs to a kind. Owed: ring 3
+// reads neither the live theme (Light/Dark, the chosen accent) nor Principia's `tabula.theme.<kind>`; the default
+// theme and the default accent stand until a syscall carries them. A file with no grammar draws in the one ink.
 
 use crate::fs::{errno_word, read_file, write_file, EDIT_MAX};
 use crate::Line;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use edit_core::{Buffer, Direction, Motion, SearchOpts, Selection, Unit};
+use edit_core::{Buffer, Change, Direction, Motion, SearchOpts, Selection, Unit};
+use syntax_core::{HighlightKind, Highlighter, Language, Source, Theme};
 use una_abi::{KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_UP};
 
-/// SYNTAXCORE (SR89) seam: fill `spans` with `(byte_start, byte_end, argb)` runs over one line's text. The pane
-/// draws a byte covered by no span in the default ink.
-pub type Highlight = fn(line: &str, spans: &mut Vec<(usize, usize, u32)>);
+/// The language id for a path's extension — `TabulaDocument::language_for` (handlers/tabula/src/document.rs), the
+/// ids syntax_core has grammars for; anything else is plain text.
+fn language_for(path: &str) -> &'static str {
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    match leaf.rsplit_once('.').map(|(_, e)| e) {
+        Some("rs") => "rust",
+        Some("toml") => "toml",
+        Some("md") => "markdown",
+        Some("c") | Some("h") | Some("cpp") => "c",
+        Some("sh") | Some("bash") => "sh",
+        _ => "txt",
+    }
+}
+
+/// An appearance token's ink (`0xAARRGGBB`): the DARK rows of kernel `video/theme.rs` for the tokens
+/// `syntax_core::APPEARANCE_TOKENS` may name, `Accent` = the default accent (`ACCENTS[0]`). An unknown name is the
+/// content ink.
+pub fn token_ink(token: &str) -> u32 {
+    0xFF00_0000
+        | match token {
+            "SyntaxCode" => 0x006C_C88A,
+            "SyntaxNum" => 0x00E3_9A55,
+            "SyntaxLit" => 0x00C3_8BE0,
+            "ErrorText" => 0x00E5_7373,
+            "TitleTextInactive" => 0x008E_8E94,
+            "Accent" => 0x004A_73AA,
+            _ => 0x00E6_E4DF, // ContentText
+        }
+}
+
+/// edit_core's Buffer as syntax_core reads text: lines, never the whole document.
+struct BufSource<'a>(&'a Buffer);
+impl Source for BufSource<'_> {
+    fn line_count(&self) -> usize {
+        self.0.line_count()
+    }
+    fn line_start(&self, line: usize) -> usize {
+        self.0.text().line_start(line)
+    }
+    fn read_line(&self, line: usize, out: &mut String) {
+        out.push_str(&self.0.line(line));
+    }
+}
+
+/// The document's grammar, its per-line checkpoints and tokens, and the theme map.
+pub struct Syntax {
+    lang: Box<dyn Language>,
+    hl: Highlighter,
+    theme: Theme,
+}
+
+impl Syntax {
+    /// The grammar for `path`'s language, with `buf` lexed whole; `None` = no grammar (plain text).
+    fn for_path(path: &str, buf: &Buffer) -> Option<Syntax> {
+        let lang = syntax_core::language_for_id(language_for(path))?;
+        let mut hl = Highlighter::new();
+        hl.reset(lang.as_ref(), &BufSource(buf));
+        Some(Syntax { lang, hl, theme: Theme::default() })
+    }
+    /// Splice an edit's changed line ranges into the checkpoints and re-lex from the first touched line.
+    fn sync(&mut self, buf: &Buffer, changes: &[Change]) {
+        for c in changes {
+            self.hl.splice(c.first_line, c.old_last_line, c.new_last_line);
+        }
+        self.hl.relex(self.lang.as_ref(), &BufSource(buf));
+    }
+    pub fn id(&self) -> &'static str {
+        self.lang.id()
+    }
+    /// Every token of the document, as last lexed (the witness's `spans`).
+    pub fn spans(&self) -> usize {
+        (0..self.hl.line_count()).map(|l| self.hl.line_tokens(l).len()).sum()
+    }
+    /// The ink of byte `byte` of `line`: its token's kind through the theme map, else the content ink.
+    pub fn ink_at(&self, line: usize, byte: usize) -> u32 {
+        let k = self.hl.line_tokens(line).iter().find(|t| byte >= t.start as usize && byte < t.end as usize).map(|t| t.kind);
+        token_ink(self.theme.token(k.unwrap_or(HighlightKind::Identifier)))
+    }
+}
 
 pub struct Editor {
     pub buf: Buffer,
@@ -44,8 +130,10 @@ pub struct Editor {
     needle: String,
     pub msg: String,
     discard_armed: bool,
-    /// SYNTAXCORE (LEDGER SR89): the highlighter seam — `None` until that core lands; nothing is linked here.
-    pub highlight: Option<Highlight>,
+    /// UNAMETAL2: the open document's syntax core (`None` = a language with no grammar, or no document).
+    pub highlight: Option<Syntax>,
+    /// UNAMETAL2: the last Ctrl+S answered rc=0 (the exit status's SAVED bit).
+    pub saved: bool,
     pub repaint: bool,
 }
 
@@ -62,6 +150,7 @@ impl Editor {
             msg: String::from("Ctrl+1 tree, Enter opens a file"),
             discard_armed: false,
             highlight: None,
+            saved: false,
             repaint: true,
         }
     }
@@ -105,13 +194,16 @@ impl Editor {
                 let lossy = core::str::from_utf8(&bytes).is_err();
                 let text = String::from_utf8_lossy(&bytes);
                 self.buf = Buffer::new(&text);
+                self.highlight = Syntax::for_path(path, &self.buf);
                 self.path = Some(String::from(path));
                 self.dirty = false;
                 self.top = 0;
                 self.left = 0;
                 self.search = None;
                 self.msg = if lossy { String::from("opened (not UTF-8: shown lossy)") } else { String::from("opened") };
-                l.put(b" bytes=").dec(bytes.len() as i64).put(b" lines=").dec(self.buf.line_count() as i64).put(b" rc=0 ::");
+                l.put(b" bytes=").dec(bytes.len() as i64).put(b" lines=").dec(self.buf.line_count() as i64);
+                l.put(b" lang=").put(self.highlight.as_ref().map_or("none", |h| h.id()).as_bytes());
+                l.put(b" spans=").dec(self.highlight.as_ref().map_or(0, |h| h.spans()) as i64).put(b" rc=0 ::");
             }
             Err(e) => {
                 self.msg = alloc::format!("open: {} {}", errno_word(e), e);
@@ -135,10 +227,12 @@ impl Editor {
             Ok(_) => {
                 self.dirty = false;
                 self.discard_armed = false;
+                self.saved = true;
                 self.msg = String::from("saved");
                 l.put(b" rc=0 ::");
             }
             Err(e) => {
+                self.saved = false;
                 self.msg = alloc::format!("save: {} {}", errno_word(e), e);
                 l.put(b" rc=").dec(e).put(b" ::");
             }
@@ -147,10 +241,15 @@ impl Editor {
         self.repaint = true;
     }
 
-    fn edited(&mut self, changed: bool) {
-        if changed {
-            self.dirty = true;
-            self.discard_armed = false;
+    /// An edit's changes: dirty the document and re-lex what they touched.
+    fn edited(&mut self, changes: Vec<Change>) {
+        if changes.is_empty() {
+            return;
+        }
+        self.dirty = true;
+        self.discard_armed = false;
+        if let Some(h) = self.highlight.as_mut() {
+            h.sync(&self.buf, &changes);
         }
     }
 
@@ -223,15 +322,15 @@ impl Editor {
         }
         match k {
             b'\n' | b'\r' => {
-                let c = !self.buf.newline().is_empty();
+                let c = self.buf.newline();
                 self.edited(c);
             }
             0x08 | 0x7f => {
-                let c = !self.buf.delete(Unit::Grapheme, Direction::Backward).is_empty();
+                let c = self.buf.delete(Unit::Grapheme, Direction::Backward);
                 self.edited(c);
             }
             0x09 => {
-                let c = !self.buf.insert("    ").is_empty();
+                let c = self.buf.insert("    ");
                 self.edited(c);
             }
             KEY_LEFT => self.buf.move_cursors(Motion::Left, false),
@@ -241,19 +340,21 @@ impl Editor {
             0x01 => self.buf.move_cursors(Motion::LineStart, false),
             0x05 => self.buf.move_cursors(Motion::LineEnd, false),
             0x0B => {
-                let c = !self.buf.delete_lines().is_empty();
+                let c = self.buf.delete_lines();
                 self.edited(c);
             }
             0x1A => match self.buf.undo() {
-                Some(_) => {
-                    self.edited(true);
+                Some(c) => {
+                    self.edited(c);
+                    self.dirty = true;
                     self.msg = String::from("undo");
                 }
                 None => self.msg = String::from("nothing to undo"),
             },
             0x19 => match self.buf.redo() {
-                Some(_) => {
-                    self.edited(true);
+                Some(c) => {
+                    self.edited(c);
+                    self.dirty = true;
                     self.msg = String::from("redo");
                 }
                 None => self.msg = String::from("nothing to redo"),
@@ -265,7 +366,7 @@ impl Editor {
             0x07 => self.find_next(),
             0x20..=0x7e => {
                 let mut s = [0u8; 4];
-                let c = !self.buf.insert((k as char).encode_utf8(&mut s)).is_empty();
+                let c = self.buf.insert((k as char).encode_utf8(&mut s));
                 self.edited(c);
             }
             _ => self.repaint = false,

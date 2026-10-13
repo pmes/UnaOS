@@ -35,7 +35,8 @@
 //
 // WIRE. `:: UNA: start window=<id> font=<face|font8x8 font_why=<w>> panes=3 root=<p> entries=<n> cwd=<p> ::` once;
 // the console's `:: UNA: plan=<Nothing|Say|Host|Exec> verb=<v> served=<0|1> rows=<n> pane=console ::` per line; the
-// editor's `:: UNA: open path=<p> bytes=<n> lines=<n> rc=<r> ::` and `:: UNA: save path=<p> bytes=<n> rc=<r> ::`;
+// editor's `:: UNA: open path=<p> bytes=<n> lines=<n> lang=<id|none> spans=<n> rc=<r> ::` (UNAMETAL2: the syntax
+// core's grammar and token count) and `:: UNA: save path=<p> bytes=<n> rc=<r> ::`;
 // on exit `:: UNA: exit status=<s> panes=3 lines=<n> cmds=<n> focus=<tree|editor|console> ::`. The exit status packs
 // the facts `tests una` (kernel unaapp.rs) reads back — see `status`.
 
@@ -110,14 +111,25 @@ impl Line {
     }
 }
 
-/// The exit status `tests una` reads back (`bg_poll`'s `Exited(i32)`; bit 31 stays clear): the console's
-/// scrollback rows `[9:0]`, its lines planned `[15:10]`, the last plan's kind `[17:16]` (0 Nothing, 1 Say, 2 Host,
-/// 3 Exec), its verb code `[25:18]` (`midden_core::ring3::verb_code`), the pane count `[27:26]`, a window `[28]`,
-/// a loaded face `[29]`. The kernel decodes it in `unaapp.rs` `status_parse` — the two are kept in step by hand.
-const fn status(rows: u32, cmds: u32, kind: u32, verb: u8, panes: u32, window: bool, face: bool) -> i32 {
+/// The exit status `tests una` reads back (`bg_poll`'s `Exited(i32)`; bit 31 stays clear). UNAMETAL2 (LEDGER SR98)
+/// repacked it to carry the save and the highlight: the console's scrollback rows `[9:0]`, its lines planned
+/// `[11:10]` (cap 3), the last plan's kind `[13:12]` (0 Nothing, 1 Say, 2 Host, 3 Exec), its verb code `[21:14]`
+/// (`midden_core::ring3::verb_code`), the pane count `[23:22]`, a window `[24]`, a loaded face `[25]`, SAVED `[26]`
+/// (the last Ctrl+S answered rc=0), HIGHLIGHT `[30:27]` (the document's syntax_core token count, cap 15). The kernel
+/// decodes it in `unaapp.rs` `status_parse` — the two are kept in step by hand.
+#[allow(clippy::too_many_arguments)]
+const fn status(rows: u32, cmds: u32, kind: u32, verb: u8, panes: u32, window: bool, face: bool, saved: bool, spans: u32) -> i32 {
     let r = if rows > 0x3FF { 0x3FF } else { rows };
-    let c = if cmds > 0x3F { 0x3F } else { cmds };
-    (r | (c << 10) | ((kind & 3) << 16) | ((verb as u32) << 18) | ((panes & 3) << 26) | ((window as u32) << 28) | ((face as u32) << 29)) as i32
+    let c = if cmds > 3 { 3 } else { cmds };
+    let h = if spans > 0xF { 0xF } else { spans };
+    (r | (c << 10)
+        | ((kind & 3) << 12)
+        | ((verb as u32) << 14)
+        | ((panes & 3) << 22)
+        | ((window as u32) << 24)
+        | ((face as u32) << 25)
+        | ((saved as u32) << 26)
+        | (h << 27)) as i32
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -217,9 +229,11 @@ impl App {
 
     fn quit(&mut self) -> ! {
         let rows = self.con.rows.len() as u32;
-        let st = status(rows, self.con.cmds, self.con.last_kind, self.con.last_verb, PANES, self.win >= 0, self.face.is_some());
+        let spans = self.ed.highlight.as_ref().map_or(0, |h| h.spans()) as u32;
+        let st = status(rows, self.con.cmds, self.con.last_kind, self.con.last_verb, PANES, self.win >= 0, self.face.is_some(), self.ed.saved, spans);
         let mut l = Line::new(b":: UNA: exit status=");
         l.dec(st as i64).put(b" panes=").dec(PANES as i64).put(b" lines=").dec(rows as i64);
+        l.put(b" saved=").dec(self.ed.saved as i64).put(b" spans=").dec(spans as i64);
         l.put(b" cmds=").dec(self.con.cmds as i64).put(b" focus=").put(self.focus.name()).put(b" ::");
         l.wire();
         exit(st)
@@ -392,7 +406,6 @@ impl App {
         let sels: Vec<(usize, usize)> = self.ed.buf.selections().iter().filter(|s| !s.is_empty()).map(|s| (s.start(), s.end())).collect();
         let nlines = self.ed.buf.line_count();
         let (left, top) = (self.ed.left, self.ed.top);
-        let mut spans: Vec<(usize, usize, u32)> = Vec::new();
         for row in 0..rows {
             let l = top + row;
             if l >= nlines {
@@ -414,15 +427,19 @@ impl App {
                 }
             }
             let glyphs: Vec<u8> = idx.iter().map(|&(_, ch)| if (' '..='~').contains(&ch) { ch as u8 } else if ch == '\t' { b' ' } else { b'?' }).collect();
-            match self.ed.highlight {
-                // SYNTAXCORE (SR89): draw each run in its span's ink.
-                Some(h) => {
-                    spans.clear();
-                    h(&line, &mut spans);
-                    for (c, &(bi, _)) in idx.iter().enumerate() {
-                        let ink = spans.iter().find(|&&(a, b, _)| bi >= a && bi < b).map_or(INK, |&(_, _, k)| k);
-                        let x = self.cx(x0, c);
-                        self.text(x, y, &glyphs[c..c + 1], ink, text_clip);
+            // UNAMETAL2 (SR98): each char's ink is its syntax_core token's appearance token; runs of one ink draw once.
+            let inks: Option<Vec<u32>> = self.ed.highlight.as_ref().map(|h| idx.iter().map(|&(bi, _)| h.ink_at(l, bi)).collect());
+            match inks {
+                Some(inks) => {
+                    let mut a = 0;
+                    while a < inks.len() {
+                        let mut b = a + 1;
+                        while b < inks.len() && inks[b] == inks[a] {
+                            b += 1;
+                        }
+                        let x = self.cx(x0, a);
+                        self.text(x, y, &glyphs[a..b], inks[a], text_clip);
+                        a = b;
                     }
                 }
                 None => self.text(x0, y, &glyphs, INK, text_clip),

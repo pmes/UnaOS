@@ -39,6 +39,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "syntax_core"
+version = "0.1.0"
+
+[[package]]
 name = "tls_core"
 version = "0.1.0"
 
@@ -55,6 +59,7 @@ dependencies = [
  "font_core",
  "matrix_core",
  "midden_core",
+ "syntax_core",
  "una-abi",
  "vein_ring3",
 ]

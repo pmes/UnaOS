@@ -34,11 +34,14 @@ codegen-units = 1
 # vein_ring3: only its ring-3 plumbing — the syscall stub, the SYS_SBRK heap, `files::path_read` (MIDDEN.ELF's set).
 # font_core: the panes' text; font8x8: the grid when no face is on the volume.
 # matrix_core: the tree pane's listing — Matrix's core (SR99), the rule the host Finder lists with, over SYS_PATH_*.
+# syntax_core: UNAMETAL2 (LEDGER SR98) — the editor's highlighting, the grammars and incremental lexer the host Tabula
+# links (SYNTAXCORE SR89, R105), painted through the appearance tokens its theme map names.
 [dependencies]
 una-abi = { path = "../una-abi" }
 edit_core = { path = "../../libs/text/edit_core" }
 midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }
 font_core = { path = "../../libs/text/font_core" }
+syntax_core = { path = "../../libs/text/syntax_core" }
 font8x8 = { version = "0.3.1", default-features = false }
 matrix_core = { path = "../../libs/fs/matrix_core" }
