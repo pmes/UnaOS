@@ -13,6 +13,13 @@
 //!
 //! `El` borrows the arena (`&Document`) instead of holding the `Rc<RefCell<…>>`, so a whole cascade
 //! or query walks the tree under ONE shared borrow and the matcher allocates nothing per hop.
+//!
+//! AETHERSHADOW (SR82): an `El` may carry the shadow host of the tree it is matched in. Then a
+//! top-level element of the shadow tree has the host as its parent, the host's own ancestors and
+//! siblings are out of reach, and the host alone reports the reserved attribute [`HOST_MARK`] that
+//! `:host` / `:host(<compound>)` are rewritten to before css_core parses (css_core has no `:host`;
+//! `[attr]` has the pseudo-class's specificity). Outside a shadow tree nothing reports the mark, so
+//! `:host` matches nothing, as the spec says. [`Selectors::matches_slotted`] matches `::slotted()`.
 
 use super::NodeRef;
 use css_core::matching::{html_state, matches_list, Element, MatchContext};
@@ -24,14 +31,26 @@ use html_core::{Document, NodeData, NodeId};
 pub struct El<'a> {
     pub doc: &'a Document,
     pub id: NodeId,
+    /// The shadow host whose shadow tree this match runs in (None: a light-tree match).
+    pub host: Option<NodeId>,
 }
+
+/// The attribute only the in-scope shadow host reports (`:host` is rewritten to it).
+pub const HOST_MARK: &str = "__aether_host__";
 
 impl<'a> El<'a> {
     pub fn new(doc: &'a Document, id: NodeId) -> Self {
-        El { doc, id }
+        El { doc, id, host: None }
+    }
+    /// An element matched inside the shadow tree of `host` (None: as [`El::new`]).
+    pub fn in_tree(doc: &'a Document, id: NodeId, host: Option<NodeId>) -> Self {
+        El { doc, id, host }
     }
     fn hop(&self, id: Option<NodeId>) -> Option<Self> {
-        id.map(|id| El { doc: self.doc, id })
+        id.map(|id| El { doc: self.doc, id, host: self.host })
+    }
+    fn is_scoped_host(&self) -> bool {
+        self.host == Some(self.id)
     }
     fn element(&self) -> Option<&'a html_core::Element> {
         self.doc.element(self.id)
@@ -62,18 +81,37 @@ impl Element for El<'_> {
         self.element().map(|e| e.ns.url()).unwrap_or("")
     }
     fn each_attr(&self, f: &mut dyn FnMut(&str, &str, &str) -> bool) -> bool {
+        if self.is_scoped_host() && f("", HOST_MARK, "") {
+            return true;
+        }
         match self.element() {
             Some(e) => e.attrs.iter().any(|a| f(a.ns.url(), &a.local, &a.value)),
             None => false,
         }
     }
     fn parent_element(&self) -> Option<Self> {
+        if let Some(h) = self.host {
+            if self.id == h {
+                return None;
+            }
+            if let Some(p) = self.doc.parent(self.id) {
+                if super::shadow::host_of(self.doc, p) == Some(h) {
+                    return self.hop(Some(h));
+                }
+            }
+        }
         self.hop(self.doc.parent_element(self.id))
     }
     fn prev_sibling_element(&self) -> Option<Self> {
+        if self.is_scoped_host() {
+            return None;
+        }
         self.hop(self.doc.prev_sibling_element(self.id))
     }
     fn next_sibling_element(&self) -> Option<Self> {
+        if self.is_scoped_host() {
+            return None;
+        }
         self.hop(self.doc.next_sibling_element(self.id))
     }
     fn first_child_element(&self) -> Option<Self> {
@@ -93,9 +131,15 @@ impl Element for El<'_> {
     }
     // The hot simple selectors read the attribute list directly.
     fn attr(&self, name: &str) -> Option<String> {
+        if name == HOST_MARK {
+            return self.is_scoped_host().then(String::new);
+        }
         self.element()?.attrs.iter().find(|a| a.ns.url().is_empty() && a.local == name).map(|a| a.value.clone())
     }
     fn has_attr(&self, name: &str) -> bool {
+        if name == HOST_MARK {
+            return self.is_scoped_host();
+        }
         self.element().is_some_and(|e| e.attrs.iter().any(|a| a.ns.url().is_empty() && a.local == name))
     }
     fn id_is(&self, id: &str) -> bool {
@@ -120,6 +164,8 @@ impl Element for El<'_> {
                     _ => self.doc.is_inclusive_ancestor(self.id, f),
                 }
             }
+            // AETHERSHADOW: `:defined` is the element's custom element state (HTML §4.13.1).
+            ElementState::Defined => super::custom::is_defined(self.doc, self.id),
             _ => html_state(self, s),
         }
     }
@@ -189,20 +235,141 @@ pub struct Selectors(pub SelectorList);
 impl Selectors {
     /// Compiles a selector list; `Err` on a syntax error (the Selectors API's SyntaxError).
     pub fn compile(s: &str) -> Result<Selectors, ()> {
-        parse_selector_str(s, &Namespaces::default()).map(Selectors).map_err(|_| ())
+        let rewritten = rewrite_host(s);
+        let text = rewritten.as_deref().unwrap_or(s);
+        parse_selector_str(text, &Namespaces::default()).map(Selectors).map_err(|_| ())
     }
 
     /// Does any selector of the list match element `id`? `scope` is `:scope` (the queried element).
+    /// An element in a shadow tree is matched in its host's scope (`:host`, the host as the top-level
+    /// parent).
     pub fn matches_in(&self, doc: &Document, id: NodeId, scope: Option<NodeId>) -> bool {
         if doc.element(id).is_none() {
             return false;
         }
-        let scope_el = scope.filter(|s| doc.element(*s).is_some()).map(|s| El::new(doc, s));
+        let host = if super::shadow::any(doc) { super::shadow::containing_host(doc, id) } else { None };
+        let scope_el = scope.filter(|s| doc.element(*s).is_some()).map(|s| El::in_tree(doc, s, host));
         let cx = MatchContext { scope: scope_el.as_ref() };
-        matches_list(&self.0, &El::new(doc, id), &cx)
+        matches_list(&self.0, &El::in_tree(doc, id, host), &cx)
+    }
+
+    /// Does a `::slotted(<compound>)` selector of the list match slottable `id`? The compound must
+    /// match `id` and the rest of the selector its assigned slot (in the slot's shadow tree), as CSS
+    /// Scoping §3.2.2 says. For the cascade, which owns where shadow-tree rules apply.
+    pub fn matches_slotted(&self, doc: &Document, id: NodeId) -> bool {
+        use css_core::matching::{matches_for_pseudo, matches_selector};
+        use css_core::selectors::{PseudoElement, Selector, Specificity};
+        let Some(slot) = super::shadow::find_slot(doc, id, false) else { return false };
+        let host = super::shadow::containing_host(doc, slot);
+        let slot_el = El::in_tree(doc, slot, host);
+        let me = El::new(doc, id);
+        self.0.0.iter().any(|sel| {
+            let Some(pe) = &sel.pseudo_element else { return false };
+            let PseudoElement::Slotted(compound) = pe else { return false };
+            let inner = Selector {
+                compounds: vec![compound.clone()],
+                combinators: Vec::new(),
+                pseudo_element: None,
+                specificity: Specificity::ZERO,
+            };
+            matches_selector(&inner, &me, &MatchContext { scope: None })
+                && matches_for_pseudo(sel, &slot_el, Some(pe), &MatchContext { scope: None })
+        })
     }
 
     pub fn matches_node(&self, node: &NodeRef) -> bool {
         self.matches_in(&node.doc.borrow(), node.id, None)
     }
+}
+
+/// Rewrites `:host` and `:host(<compound>)` to the reserved attribute the in-scope host reports
+/// (`[__aether_host__]`, `[__aether_host__]:is(<compound>)`). Token-aware: strings and escapes are
+/// skipped; `::` pseudo-elements and `:host-context()` are left alone. None when there is no `:host`.
+fn rewrite_host(s: &str) -> Option<String> {
+    if !s.to_ascii_lowercase().contains(":host") {
+        return None;
+    }
+    let b: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    let mut changed = false;
+    let ident = |c: char| c.is_alphanumeric() || c == '-' || c == '_' || !c.is_ascii();
+    while i < b.len() {
+        let c = b[i];
+        if c == '\\' {
+            out.push(c);
+            if i + 1 < b.len() {
+                out.push(b[i + 1]);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let word: String = b.get(i + 1..i + 5).map(|w| w.iter().collect::<String>().to_ascii_lowercase()).unwrap_or_default();
+        let after = b.get(i + 5).copied();
+        if c == ':' && (i == 0 || b[i - 1] != ':') && word == "host" && !after.is_some_and(|a| ident(a) && a != '(') {
+            changed = true;
+            if after == Some('(') {
+                // the balanced argument
+                let mut depth = 0i32;
+                let mut j = i + 5;
+                let mut q2: Option<char> = None;
+                let mut end = None;
+                while j < b.len() {
+                    let ch = b[j];
+                    if ch == '\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if let Some(q) = q2 {
+                        if ch == q {
+                            q2 = None;
+                        }
+                    } else if ch == '"' || ch == '\'' {
+                        q2 = Some(ch);
+                    } else if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                let Some(end) = end else { return None };
+                let inner: String = b[i + 6..end].iter().collect();
+                out.push('[');
+                out.push_str(HOST_MARK);
+                out.push_str("]:is(");
+                out.push_str(&inner);
+                out.push(')');
+                i = end + 1;
+            } else {
+                out.push('[');
+                out.push_str(HOST_MARK);
+                out.push(']');
+                i += 5;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    changed.then_some(out)
 }

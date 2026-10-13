@@ -23,6 +23,9 @@
 //! - [`traversal`] — NodeFilter, NodeIterator, TreeWalker (SR72).
 //! - [`reflect`] — HTML §2.6.1 reflection of every reflected IDL attribute (SR72).
 //! - [`controls`] — form controls' DOM half: value modes, selection, constraint validation (SR72).
+//! - [`shadow`], [`mutation`], [`custom`] — shadow trees, MutationObserver and custom elements over
+//!   `dom::shadow` / `dom::mutation` / `dom::custom` (AETHERSHADOW, SR82); `mutation::settle` is the
+//!   [CEReactions] / observer-microtask boundary the mutation algorithms end with.
 //! - [`loader`] — HTML §4.12.1 script processing driven by the parser: parser-blocking, `defer`,
 //!   `async` and module scripts, `document.write` during parse, dynamically inserted scripts, and
 //!   §13.2.7 "the end" (DOMContentLoaded, load).
@@ -35,14 +38,17 @@
 
 pub mod controls;
 pub mod cssom;
+pub mod custom;
 pub mod dom;
 pub mod events;
 pub mod host;
 pub mod html;
 pub mod idl;
 pub mod loader;
+pub mod mutation;
 pub mod range;
 pub mod reflect;
+pub mod shadow;
 pub mod traversal;
 pub mod net;
 pub mod window;
@@ -501,6 +507,8 @@ impl Engine {
         crate::api::fetch::reset_budget();
         net::reset();
         crate::event_loop::reset();
+        crate::dom::mutation::reset();
+        crate::dom::custom::reset(document.arena());
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
         vm.track_rejections = true;
@@ -515,6 +523,10 @@ impl Engine {
         cssom::install(&mut vm);
         window::install(&mut vm);
         net::install(&mut vm);
+        // After window::install: these replace the platform.rs MutationObserver/customElements stubs.
+        shadow::install(&mut vm);
+        mutation::install(&mut vm);
+        custom::install(&mut vm);
         Engine { vm }
     }
 
