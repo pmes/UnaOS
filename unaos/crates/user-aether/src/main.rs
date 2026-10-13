@@ -466,8 +466,9 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
         Err(e) => (
             alloc::format!(
                 "<!doctype html><title>Aether</title><style>body{{color:#5a1010}}</style><h1>Not found</h1>\
-<p>The page <code>{}</code> could not be read from the volume (code {}).</p><p>Backspace goes back.</p>",
+<p>The page <code>{}</code> could not be read from the {} (code {}).</p><p>Backspace goes back.</p>",
                 esc(path),
+                if net::is_net(path) { "network" } else { "volume" }, // AETHERMETAL5: the omnibox's URLs and searches fetch
                 e
             ),
             None,

@@ -395,8 +395,8 @@ pub const INPUT_EV_TYPE_SHIFT: u32 = 48;
 /// Mask for the type field once shifted down.
 pub const INPUT_EV_TYPE_MASK: u64 = 0xFF;
 
-/// A key PRESS. Payload `[7:0]` = ASCII, or one of the `KEY_*` C0 arrow codes, or a [`KEY_CTRL_DIGIT`] chord
-/// byte (`0x80..=0x89`: the payload carries no modifier field, so a modified key the ring must tell apart presses as
+/// A key PRESS. Payload `[7:0]` = ASCII, or one of the `KEY_*` C0 arrow codes, or a [`KEY_CTRL_DIGIT`] / [`KEY_CTRL_TAB`] chord
+/// byte (`0x80..=0x8D`: the payload carries no modifier field, so a modified key the ring must tell apart presses as
 /// a byte of its own).
 pub const INPUT_EV_KEY_DOWN: u64 = 1;
 /// A key RELEASE. Same payload as the press.
@@ -499,6 +499,18 @@ pub const KEY_ESC: u8 = 0x1B;
 /// modifiers, so a reader marks the digit's release owed at the press (UNAKEYS B552: UNA.ELF's pane switch). The
 /// keypad digits and Alt/Cmd + digit stay suppressed.
 pub const KEY_CTRL_DIGIT: u8 = 0x80;
+/// Ctrl+Tab PRESSES as `0x8A`, Ctrl+Shift+Tab as `0x8B`, Ctrl+`=` (Shift or not: Ctrl+plus) as `0x8C`, Ctrl+`-` as
+/// `0x8D` (AETHERMETAL5, LEDGER SR109: the same shared HID fold, `HID_KEY_CTRL_TAB` .. `HID_KEY_CTRL_MINUS`), the bytes
+/// after the [`KEY_CTRL_DIGIT`] chords and on the same terms: no key and no other fold produces them, an ASCII
+/// consumer ignores them, and the RELEASE is the bare key (`KEY_UP` Tab / `=` / `-`). Aether's chrome binds them to
+/// the next / previous tab and zoom in / out. The keypad `+`/`-` and Alt/Cmd chords stay suppressed.
+pub const KEY_CTRL_TAB: u8 = 0x8A;
+/// See [`KEY_CTRL_TAB`].
+pub const KEY_CTRL_SHIFT_TAB: u8 = 0x8B;
+/// See [`KEY_CTRL_TAB`].
+pub const KEY_CTRL_PLUS: u8 = 0x8C;
+/// See [`KEY_CTRL_TAB`].
+pub const KEY_CTRL_MINUS: u8 = 0x8D;
 
 /// [`SYS_GETINFO`]'s payload: `#[repr(C)]`, no padding, so the byte view is exactly the two fields
 /// in declaration order — `pid` at 0, `ticks` at 8.
