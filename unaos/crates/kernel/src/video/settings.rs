@@ -181,6 +181,13 @@ struct State {
     press: Option<(usize, usize, u64)>,
     hits: Vec<[u16; 4]>,
     hot: Option<usize>,
+    /// MOTIONKIT (B648): the values in motion (the pill's y, each toggle's knob, a segmented thumb's x — keyed by
+    /// [`mkey`]), the frame gate [`hover_poll`] asks, and this paint's clock and tab (read once at the top of
+    /// [`paint`]: a control helper never locks `CUR`, which [`open`] holds across its first paint).
+    glides: draw::motion::Glides,
+    frame: draw::motion::Frame,
+    now: u64,
+    tab: usize,
 }
 
 impl State {
@@ -188,6 +195,7 @@ impl State {
         State {
             sel, strip, col_top, col_hover: None, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf,
             query: String::new(), search: false, kbd: false, ptr: None, press: None, hits: Vec::new(), hot: None,
+            glides: draw::motion::Glides::new(), frame: draw::motion::Frame::new(), now: 0, tab: 0,
         }
     }
 }
@@ -612,12 +620,28 @@ fn slider(st: &mut State, r: usize, pos: usize, max: usize, focus: bool) {
     draw::slider(&mut sf(st), e(TRACK_X) - k / 2, e(y), ew(TRACK_X, TRACK_W) + k, pos as u32, max as u32, c);
 }
 
-/// The kit's switch in row `r` at `x`.
+// ── MOTIONKIT (rmbp-ledger B648) — the three motions (DESIGN-LANGUAGE §2.6, `motion.base` 160 ms / `ease.standard`) ──
+// The sidebar pill eases between rows, a toggle's knob slides, a segmented thumb slides. Each is a keyed value in
+// `State::glides`: the control helper asks for the value to draw THIS frame given its target, the glides start a tween
+// when the target moved, and `hover_poll` (the desktop service pass) repaints once per 16 ms frame while one runs and
+// never while idle (`State::frame` counts the frames it granted). Reduce motion (`motion::reduced()`) makes each a cut.
+
+/// A motion key: `kind` (1 pill, 2 toggle, 3 segmented) over the tab, the row and a logical x (a toggle's).
+const fn mkey(kind: u32, tab: usize, r: usize, x: usize) -> u32 {
+    (kind << 28) | ((tab as u32 & 0xff) << 20) | ((r as u32 & 0xff) << 12) | (x as u32 & 0xfff)
+}
+const MK_PILL: u32 = 1;
+const MK_TOGGLE: u32 = 2;
+const MK_SEG: u32 = 3;
+
+/// The kit's switch in row `r` at `x`: its knob glides to `on`'s end.
 fn tog(st: &mut State, r: usize, x: usize, on: bool, focus: bool) {
     let (tw, th) = (draw::DIMS.toggle_w, draw::DIMS.toggle_h);
     let y = mid_y(r, th);
     let c = cs(st, x, y, tw, th, focus);
-    draw::toggle(&mut sf(st), e(x), e(y), on, c);
+    let (now, tab) = (st.now, st.tab);
+    let knob = st.glides.to(mkey(MK_TOGGLE, tab, r, x), if on { draw::motion::ONE as i32 } else { 0 }, now, draw::motion::BASE, draw::motion::Curve::Standard);
+    draw::toggle_at(&mut sf(st), e(x), e(y), knob as u32, c);
 }
 
 /// The kit's check box in row `r` at `x`.
@@ -628,12 +652,17 @@ fn check(st: &mut State, r: usize, x: usize, on: bool) {
     draw::checkbox(&mut sf(st), e(x), e(y), on, c);
 }
 
-/// The kit's segmented control over the track in row `r` (equal segments: the press map is `x / (TRACK_W / n)`).
+/// The kit's segmented control over the track in row `r` (equal segments: the press map is `x / (TRACK_W / n)`);
+/// its thumb glides to segment `sel`.
 fn seg(st: &mut State, r: usize, labels: &[&[u8]], sel: usize, focus: bool) {
     let h = draw::DIMS.seg_h;
     let y = mid_y(r, h);
     let c = cs(st, TRACK_X, y, TRACK_W, h, focus);
-    draw::segmented_w(&mut sf(st), e(TRACK_X), e(y), ew(TRACK_X, TRACK_W), labels, sel, c);
+    let (x0, w) = (e(TRACK_X), ew(TRACK_X, TRACK_W));
+    let target = x0 + (w / labels.len().max(1) as i32) * sel.min(labels.len().saturating_sub(1)) as i32;
+    let (now, tab) = (st.now, st.tab);
+    let tx = st.glides.to(mkey(MK_SEG, tab, r, 0), target, now, draw::motion::BASE, draw::motion::Curve::Standard);
+    draw::segmented_at(&mut sf(st), x0, e(y), w, labels, sel, tx, c);
 }
 
 /// The inset grouped boxes of a pane: one per `(first row, last row)`, a hairline between its rows inset from the
@@ -801,22 +830,37 @@ fn paint_column(st: &mut State, tab: usize) {
         text_at(st, SEARCH_X + draw::DIMS.field_pad_x, SEARCH_Y + (SEARCH_H - ch) / 2, SEARCH_X + SEARCH_W, "Search", theme::ink_secondary(), false, face);
     }
     // The tab rows: the selected one a full-width accent pill with the light ink, the hovered one washed.
+    // MOTIONKIT (B648): the pill is ONE shape that glides between rows — the washes first, then the pill at its
+    // glided y, then every icon and label; a label takes the light ink while the pill covers its row's centre.
     let (list, n) = col_list(&st.query);
     st.col_top = col_clamp(st.col_top, n);
     let top = st.col_top;
-    for i in top..(top + COL_VIS).min(n) {
+    let vis = top..(top + COL_VIS).min(n);
+    let pill = vis.clone().find(|&i| list[i] as usize == tab).map(|i| {
+        let (now, ph) = (st.now, dp(PILL_H));
+        let py = st.glides.to(mkey(MK_PILL, 0, 0, 0), e(pill_y(i, top)), now, draw::motion::BASE, draw::motion::Curve::Standard);
+        Rect::new(e(PILL_X), py, ew(PILL_X, cw), ph)
+    });
+    for i in vis.clone() {
+        let k = list[i] as usize;
+        let state = draw::ControlState { hover: st.col_hover == Some(k), pressed: false, disabled: false, focused: false };
+        draw::sidebar_row(&mut sf(st), e(PILL_X), e(pill_y(i, top)), ew(PILL_X, cw), b"", false, state);
+    }
+    if let Some(p) = pill {
+        let state = draw::ControlState { hover: st.col_hover == Some(tab), pressed: false, disabled: false, focused: st.strip && st.kbd };
+        draw::sidebar_row(&mut sf(st), p.x, p.y, p.w, b"", true, state);
+    }
+    for i in vis {
         let k = list[i] as usize;
         let y = pill_y(i, top);
-        let on = k == tab;
-        let state = draw::ControlState { hover: st.col_hover == Some(k), pressed: false, disabled: false, focused: on && st.strip && st.kbd };
+        let on = pill.is_some_and(|p| { let cy = e(y) + ew(y, PILL_H) / 2; cy >= p.y && cy < p.bottom() });
         {
             let mut s = sf(st);
-            draw::sidebar_row(&mut s, e(PILL_X), e(y), ew(PILL_X, cw), b"", on, state);
             let iy = y + (PILL_H - ICON) / 2;
             tab_icon(&mut s, k, e(ICON_X), e(iy), ew(ICON_X, ICON), None);
         }
         let ink = if on { theme::ink_on_accent() } else { theme::content_text() };
-        text_at(st, COL_LABEL_X, y + (PILL_H - ch) / 2, COL_W - PILL_X, TAB_NAMES[k], ink, on, face);
+        text_at(st, COL_LABEL_X, y + (PILL_H - ch) / 2, COL_W - PILL_X, TAB_NAMES[k], ink, k == tab, face);
     }
     if n == 0 {
         text_at(st, ICON_X, pill_y(0, 0) + (PILL_H - ch) / 2, COL_W - PILL_X, "No results", theme::ink_secondary(), false, face);
@@ -833,6 +877,7 @@ fn paint_column(st: &mut State, tab: usize) {
 fn paint(st: &mut State, v: &Values) {
     let w = st.w;
     st.hits.clear();
+    st.now = crate::arch::ms(); st.tab = (v.tab as usize).min(TABS - 1); // MOTIONKIT (B648): this frame's clock and tab, read once
     {
         let mut s = sf(st);
         let all = Rect::new(0, 0, s.w as i32, s.h as i32);
@@ -1339,9 +1384,13 @@ pub fn hover_route(x: i32, y: i32) -> bool {
 pub fn hover_poll() {
     if !is_open() { return; }
     let now = crate::arch::ms();
-    let done = STATE.lock().as_mut().is_some_and(|s| match s.press {
-        Some((_, _, t)) if now.saturating_sub(t) >= PRESS_MS => { s.press = None; true }
-        _ => false,
+    let done = STATE.lock().as_mut().is_some_and(|s| {
+        let pressed = match s.press {
+            Some((_, _, t)) if now.saturating_sub(t) >= PRESS_MS => { s.press = None; true }
+            _ => false,
+        };
+        let running = s.glides.running(); // MOTIONKIT (B648): a frame is owed while a value glides — one per 16 ms, none idle
+        s.frame.due(now, running) | pressed
     });
     if done { repaint(); }
     let Some(i) = crate::video::panel_info_nonblocking() else { return };
