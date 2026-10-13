@@ -46,8 +46,13 @@ version = "0.1.0"
 dependencies = [
  "css_core",
  "font_core",
+ "svg_core",
  "taffy",
 ]
+
+[[package]]
+name = "palette_core"
+version = "0.1.0"
 
 [[package]]
 name = "pixel_core"
@@ -81,6 +86,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
+name = "svg_core"
+version = "0.1.0"
+dependencies = [
+ "font_core",
+]
+
+[[package]]
 name = "taffy"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -111,6 +123,7 @@ dependencies = [
  "html_core",
  "http_core",
  "layout_core",
+ "palette_core",
  "psl_core",
  "una-abi",
  "vein_core",
