@@ -44,8 +44,22 @@
 //! engine (no more script on this page; the DOM still renders) instead of ending the process, and a
 //! per-task instruction budget turns a runaway script into a reported, uncatchable termination.
 
+/// AETHERAPIS (SR145): HTML §6.4 user activation (sticky, transient, history-action).
+pub mod activation;
 // AETHERSTYLE3B (SR115): the Web Animations API and the typed transition / animation events.
 pub mod animations;
+/// AETHERAPIS (SR145): the Clipboard API over the shell's clipboard seam.
+pub mod clipboard;
+/// AETHERAPIS (SR145): close watchers (HTML §6.6.5) and the CloseWatcher interface.
+pub mod closewatcher;
+/// AETHERAPIS (SR145): the Fullscreen API.
+pub mod fullscreen;
+/// AETHERAPIS (SR145): IntersectionObserver and ResizeObserver over the engine's layout.
+pub mod observers;
+/// AETHERAPIS (SR145): the top layer — the popover API (HTML §6.12) and the dialog element (HTML §4.11.4).
+pub mod toplayer;
+/// AETHERAPIS (SR145): CSS Typed OM Level 1.
+pub mod typed_om;
 pub mod broadcast;
 pub mod cache_api;
 /// AETHERWPT3 (SR138): Selection.modify()'s caret over the rendered text.
@@ -799,6 +813,11 @@ impl Engine {
         internals::reset();
         pointer::reset();
         testdriver::reset();
+        // AETHERAPIS (SR145): the activation, top-layer, fullscreen and clipboard state is the page's.
+        activation::reset();
+        toplayer::reset();
+        fullscreen::reset();
+        clipboard::reset();
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
         vm.track_rejections = true;
@@ -848,6 +867,17 @@ impl Engine {
         // AETHERMEDIA2 (SR134): after window (URL, the element interfaces) — MSE, then text tracks.
         mse::install(&mut vm);
         tracks::install(&mut vm);
+        // AETHERAPIS (SR145): user activation first (the gate the others read), then close watchers (the hidden
+        // `__cw_make` the top layer uses), the top layer (popover, dialog), fullscreen (reads `__tl`), the Clipboard
+        // API (reads `__activation`), the observers (over cssom's rects), and the Typed OM (over `element.style`,
+        // `getComputedStyle` and stylesheets' `CSSStyleRule`).
+        activation::install(&mut vm);
+        closewatcher::install(&mut vm);
+        toplayer::install(&mut vm);
+        fullscreen::install(&mut vm);
+        clipboard::install(&mut vm);
+        observers::install(&mut vm);
+        typed_om::install(&mut vm);
         Engine { vm }
     }
 
@@ -966,7 +996,9 @@ impl Engine {
         if n > 0 {
             window::run_raf_pass(&mut self.vm);
         }
-        n
+        // AETHERAPIS (SR145): HTML §8.1.7.3 "update the rendering" steps 14 and 16 — the intersection observations
+        // (entries queued as a task) and the resize observation loop (delivered now) follow the frame's callbacks.
+        n + observers::update(&mut self.vm)
     }
 
     /// Whether tasks are queued.

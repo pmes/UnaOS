@@ -520,6 +520,12 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     apply_stylesheets_inner(layout_tree, sheets, None);
 }
 
+/// AETHERAPIS (SR145): the user-agent style sheet rules the top layer needs (HTML §15.5.x "the dialog element": a
+/// dialog without an `open` attribute is `display: none`). Owed beside it, once css_core parses the pseudo-classes
+/// (docs/dev/evidence/aetherwpt/WPT.md §AETHERAPIS): `[popover]:not(:popover-open) { display: none }`,
+/// `dialog:modal` and `::backdrop`.
+const UA_SHEET: &str = "dialog:not([open]) { display: none; }";
+
 // AETHERWPT3 (SR138): constructable stylesheets adopted by the page's document (CSSOM §6.1.2
 // `adoptedStyleSheets`, js/stylesheets.rs). The document's CSS style sheets are its own sheets in tree order
 // followed by its adopted sheets (CSSOM §6.1.2 "document or shadow root CSS style sheets"), so the cascade of a
@@ -651,7 +657,11 @@ fn apply_stylesheets_with(
     let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
     let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
     let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
+    // AETHERAPIS (SR145): the user-agent rules of the top layer (HTML §15.5.x rendering: a dialog without `open`
+    // has no box), at the UA origin so an author rule still wins.
+    let ua = css_core::stylesheet::parse_stylesheet(UA_SHEET);
     let mut rules = css_core::cascade::RuleSet::new();
+    rules.add_sheet(&ua, css_core::cascade::Origin::UserAgent, &cond);
     for s in &parsed {
         rules.add_sheet(s, css_core::cascade::Origin::Author, &cond);
     }

@@ -828,6 +828,9 @@ pub fn remove(vm: &mut Vm, node: usize) {
     touch();
     restyle_root(crate::css::Change::Children { parent, added: Vec::new() });
     super::loader::children_changed(vm, parent);
+    // AETHERAPIS (SR145): the removing steps of a showing popover, an open dialog and the fullscreen element
+    // (HTML §6.12 / §4.11.4, Fullscreen §4) — a no-op while nothing is showing.
+    super::toplayer::node_removed(vm, node);
     super::mutation::settle(vm);
 }
 
@@ -1906,6 +1909,12 @@ fn attribute_changed(vm: &mut Vm, el: usize, local: &str, ns: Namespace, old: Op
     // script or by the summary's activation — queues the toggle task with the old state.
     if ns == Namespace::None && local == "open" && old.is_some() != new.is_some() && with_doc(|d| d.element(NodeId(el)).is_some_and(|e| e.is_html("details"))) {
         super::events::queue_details_toggle(vm, el, old.is_some());
+    }
+    // AETHERAPIS (SR145): the `popover` attribute change steps (HTML §6.12.1: a showing popover whose type changes
+    // is hidden) and the dialog `open` attribute change steps (§4.11.4: an open attribute removed by script closes
+    // the dialog and queues its `close` event) — a no-op while nothing is showing.
+    if ns == Namespace::None && matches!(local, "popover" | "open") {
+        super::toplayer::attribute_changed(vm, el, local, &old, &new);
     }
     // An Attr object for a removed attribute keeps its last value.
     if new.is_none() {

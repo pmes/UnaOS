@@ -50,6 +50,9 @@ pub const ROWS: &[Row] = &[
     Row { on: Iface("HTMLElement"), idl: "autofocus", attr: "autofocus", kind: Bool },
     Row { on: Iface("HTMLElement"), idl: "hidden", attr: "hidden", kind: Hidden },
     Row { on: Iface("HTMLElement"), idl: "inert", attr: "inert", kind: Bool },
+    // AETHERAPIS (SR145): HTML §6.12 the popover attribute (auto / manual / hint; the empty string is auto, an
+    // invalid value is manual, a missing attribute is null).
+    Row { on: Iface("HTMLElement"), idl: "popover", attr: "popover", kind: Enum(&En { keywords: &["auto", "manual", "hint"], missing: None, invalid: Some("manual"), nullable: true, aliases: &[("", Some("auto"))] }) },
     Row { on: Iface("HTMLElement"), idl: "accessKey", attr: "accesskey", kind: Str },
     Row { on: Iface("HTMLElement"), idl: "tabIndex", attr: "tabindex", kind: TabIndex },
     // elements-embedded.js
