@@ -143,3 +143,20 @@ and every arc adds verdicts). Expected: `SERWIT-2 tap tste: … dropped=0`, `:: 
 | default FORBIDs (QUARRYVOL) | `rows=4 … rows_ge_mounts=false … -> FAIL` | `:: QUARRYVOL: mounts=6 table=6 rows=4 … reach=6/6 … match=true -> PASS ::` |
 | `:399`, `:470`/`:477`, `:265` | K3 `w=0x1df`, BANDY `w=0x2f`, SERWIT-2 `evidence_lost=10` | unchanged until §7, §6, §8 land |
 | — | no `[users] stage-resolve` | unchanged until §3 lands |
+
+## 10. Commits and compile legs (R107: compiled once per code commit; every QEMU/gate leg is the fold's)
+
+| commit | row | compile |
+|---|---|---|
+| `ccb56889` | PI22 cause C — RASTWIN-ARMED (`main.rs`) | Pi kernel8-test line rc=0 |
+| `1bbb08af` | PI15 — spec `:789`, `:1983` | spec-only |
+| `688dbb03` | PI16 — spec `:2180` | spec-only |
+| `e7cf274e` | PI17 — spec `:2302` | spec-only |
+| `7033b823` | PI21 — QUARRYVOL2 (`video/quarry/live.rs`) | Pi kernel8-test line rc=0 |
+| this record's commit | PI12/PI13/PI14 + the stage: diagnoses, exact changes | x86 kfeats24 line rc=0 at `7033b823` |
+
+Pi line: `cd unaos/crates/kernel && cargo +nightly check --target ../../aarch64-unaos.json -Z build-std=core,compiler_builtins,alloc
+-Z build-std-features=compiler-builtins-mem -Z json-target-spec --features "$(cat k8feats.txt)"` with PIWM's
+`k8feats.txt` (`baremetal,skip_xhci,witness,tests-at-boot,census,usbnet,smp7,v3d,vugpar,wedge2,piusb,genet,nettest,genet,pirast,desktop_firmware,quarry,login,lumen,selfdiag,holocron,midden,una,sonde,aether,uvc`),
+`unaos/target/user_blob.bin` built once the way `build_user_blob` does. x86 line: the same with
+`--target ../../x86_64-unaos.json` and wave 32's `kfeats24.txt`.
