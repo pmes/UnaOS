@@ -23,6 +23,8 @@
 //! - [`traversal`] — NodeFilter, NodeIterator, TreeWalker (SR72).
 //! - [`reflect`] — HTML §2.6.1 reflection of every reflected IDL attribute (SR72).
 //! - [`controls`] — form controls' DOM half: value modes, selection, constraint validation (SR72).
+//! - [`forms`] — the entry list and `formdata`, FormData/File, script-started submission navigation,
+//!   the form and select legacy platform objects (AETHERFORMS, SR79).
 //! - [`loader`] — HTML §4.12.1 script processing driven by the parser: parser-blocking, `defer`,
 //!   `async` and module scripts, `document.write` during parse, dynamically inserted scripts, and
 //!   §13.2.7 "the end" (DOMContentLoaded, load).
@@ -37,6 +39,7 @@ pub mod controls;
 pub mod cssom;
 pub mod dom;
 pub mod events;
+pub mod forms;
 pub mod host;
 pub mod html;
 pub mod idl;
@@ -215,6 +218,8 @@ pub(crate) struct PageState {
     pub focused: Option<usize>,
     /// Navigation a script staged (`location.href = …`, `location.assign`).
     pub pending_nav: Option<String>,
+    /// A POST form submission a script started (`submit()`, `requestSubmit()`), for the shell.
+    pub pending_submit: Option<crate::forms::OpenDocument>,
     /// Re-entrancy guard for "report the exception".
     pub reporting: bool,
     /// HTML "performing a microtask checkpoint" flag.
@@ -298,6 +303,13 @@ pub fn console_lines() -> Vec<(u8, String)> {
 /// A navigation the page's script requested (`location.href = …`), consumed.
 pub fn take_script_navigation() -> Option<String> {
     page(|p| p.pending_nav.take())
+}
+
+/// A POST form submission the page's script started (method, body and enctype from
+/// `crate::forms::plan_navigation`), consumed. Script-started GET submissions arrive through
+/// [`take_script_navigation`].
+pub fn take_form_submission() -> Option<crate::forms::OpenDocument> {
+    page(|p| p.pending_submit.take())
 }
 
 /// Whether `node` belongs to the page whose script state this thread holds (layout and tests also
@@ -496,6 +508,7 @@ impl Engine {
         range::reset();
         traversal::reset();
         controls::reset();
+        forms::reset();
         events::reset_clock();
         clear_poison();
         crate::api::fetch::reset_budget();
@@ -515,6 +528,7 @@ impl Engine {
         cssom::install(&mut vm);
         window::install(&mut vm);
         net::install(&mut vm);
+        forms::install(&mut vm);
         Engine { vm }
     }
 

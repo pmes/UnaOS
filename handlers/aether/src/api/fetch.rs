@@ -695,6 +695,11 @@ pub const PRELUDE: &str = r#"
             return [null, utf8(body.toString()), 'application/x-www-form-urlencoded;charset=UTF-8'];
         }
         if (typeof FormData !== 'undefined' && body instanceof FormData) {
+            // multipart/form-data over js::forms' encoder (crate::forms::multipart).
+            if (typeof __formdata_encode === 'function') {
+                var enc = __formdata_encode(body);
+                return [null, new Uint8Array(enc[0]), enc[1]];
+            }
             __ledger('fetch-formdata-body-unencoded');
         }
         return [null, utf8(body), 'text/plain;charset=UTF-8'];
