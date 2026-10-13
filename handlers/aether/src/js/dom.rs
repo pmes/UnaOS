@@ -533,6 +533,10 @@ pub fn clone_node(id: usize, deep: bool, doc: Option<usize>) -> usize {
             if let Some(o) = p.ns_override.get(&src).cloned() {
                 p.ns_override.insert(dst, o);
             }
+            let moved: Vec<_> = p.attr_ns_override.iter().filter(|(k, _)| k.0 == src).map(|(k, v)| ((dst, k.1.clone(), k.2.clone()), v.clone())).collect();
+            for (k, v) in moved {
+                p.attr_ns_override.insert(k, v);
+            }
             if p.started.contains(&src) {
                 p.started.insert(dst);
             }
@@ -1856,7 +1860,26 @@ fn find_attr_qname(el: usize, qname: &str) -> Option<usize> {
 }
 
 fn find_attr_ns(el: usize, ns: &str, local: &str) -> Option<usize> {
-    with_doc(|d| d.element(NodeId(el)).and_then(|e| e.attrs.iter().position(|a| a.ns.url() == ns && a.local == local)))
+    with_doc(|d| d.element(NodeId(el)).and_then(|e| e.attrs.iter().position(|a| a.local == local && attr_ns_url(el, a) == ns)))
+}
+
+/// The attribute's namespace URL: the page's side table for a namespace the closed set cannot hold (an XML
+/// document's `p:a` under `xmlns:p="urn:p"`), else the closed set's own. AETHERWPT4's XML builder stores such
+/// attributes with `Namespace::None` plus a side-table row keyed (element, prefix, local), as elements use
+/// `ns_override`; before this, `getAttributeNS('urn:p', 'a')` answered null for every foreign namespace.
+fn attr_ns_url(el: usize, a: &Attribute) -> String {
+    if a.ns == Namespace::None {
+        if let Some(u) = page(|p| p.attr_ns_override.get(&(el, a.prefix.map(str::to_string), a.local.clone())).cloned()) {
+            return u;
+        }
+    }
+    a.ns.url().to_string()
+}
+
+fn attr_ns_forget(el: usize, a: &Attribute) {
+    if a.ns == Namespace::None {
+        page(|p| p.attr_ns_override.remove(&(el, a.prefix.map(str::to_string), a.local.clone())));
+    }
 }
 
 pub fn attr_at(el: usize, i: usize) -> Option<Attribute> {
@@ -2015,16 +2038,12 @@ fn set_attribute_ns(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let q = string(vm, &arg(vm, ctx, 1))?;
     let v = string(vm, &arg(vm, ctx, 2))?;
     let (ns, prefix, local) = validate_and_extract(vm, ns, &q)?;
-    let nse = match ns_from_url(&ns) {
-        Some(n) => n,
-        None => {
-            crate::ledger::record_dom("setAttributeNS-namespace-unrepresentable");
-            Namespace::None
-        }
-    };
+    let foreign = ns_from_url(&ns).is_none();
+    let nse = ns_from_url(&ns).unwrap_or(Namespace::None);
+    let at = find_attr_ns(el, &ns, &local);
     let old = with_doc_mut(|d| {
         let e = d.element_mut(NodeId(el))?;
-        match e.attrs.iter_mut().find(|a| a.ns == nse && a.local == local) {
+        match at.and_then(|i| e.attrs.get_mut(i)) {
             Some(a) => Some(std::mem::replace(&mut a.value, v.clone())),
             None => {
                 e.attrs.push(Attribute { prefix: prefix.as_deref().map(intern), ns: nse, local: local.clone(), value: v.clone() });
@@ -2032,6 +2051,9 @@ fn set_attribute_ns(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             }
         }
     });
+    if foreign {
+        page(|p| p.attr_ns_override.insert((el, prefix.clone(), local.clone()), ns.clone()));
+    }
     attribute_changed(vm, el, &local, nse, old, Some(v));
     Ok(Value::Undefined)
 }
@@ -2042,6 +2064,7 @@ fn remove_attribute(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let q = string(vm, &arg(vm, ctx, 0))?;
     if let Some(i) = find_attr_qname(el, &q) {
         let a = with_doc_mut(|d| d.element_mut(NodeId(el)).unwrap().attrs.remove(i));
+        attr_ns_forget(el, &a);
         attribute_changed(vm, el, &a.local, a.ns, Some(a.value), None);
     }
     Ok(Value::Undefined)
@@ -2054,6 +2077,7 @@ fn remove_attribute_ns(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let l = string(vm, &arg(vm, ctx, 1))?;
     if let Some(i) = find_attr_ns(el, &ns, &l) {
         let a = with_doc_mut(|d| d.element_mut(NodeId(el)).unwrap().attrs.remove(i));
+        attr_ns_forget(el, &a);
         attribute_changed(vm, el, &a.local, a.ns, Some(a.value), None);
     }
     Ok(Value::Undefined)
@@ -2920,11 +2944,12 @@ pub fn new_attr(vm: &mut Vm, owner: Option<usize>, ns: &str, prefix: Option<&str
 /// The Attr object for attribute index `i` of `el` (one object per attribute while it is attached).
 pub fn attr_object(vm: &mut Vm, el: usize, i: usize) -> Option<Value> {
     let a = attr_at(el, i)?;
-    let key = (el, format!("{}|{}", a.ns.url(), a.local));
+    let url = attr_ns_url(el, &a);
+    let key = (el, format!("{}|{}", url, a.local));
     if let Some((o, _)) = page(|p| p.attrs.get(&key).copied()) {
         return Some(Value::Object(o));
     }
-    let o = new_attr(vm, Some(el), a.ns.url(), a.prefix, &a.local, &a.value);
+    let o = new_attr(vm, Some(el), &url, a.prefix, &a.local, &a.value);
     let r = root(vm, Value::Object(o));
     page(|p| p.attrs.insert(key, (o, r)));
     Some(Value::Object(o))
@@ -3050,10 +3075,11 @@ fn set_attribute_node_impl(vm: &mut Vm, el: usize, a: Obj) -> JsResult<Value> {
     };
     let value = attr_str(vm, a, 4);
     let nse = ns_from_url(&ns).unwrap_or(Namespace::None);
-    let old_obj = find_attr_ns(el, &ns, &local).and_then(|i| attr_object(vm, el, i));
+    let at = find_attr_ns(el, &ns, &local);
+    let old_obj = at.and_then(|i| attr_object(vm, el, i));
     let old = with_doc_mut(|d| {
         let e = d.element_mut(NodeId(el)).unwrap();
-        match e.attrs.iter_mut().find(|x| x.ns == nse && x.local == local) {
+        match at.and_then(|i| e.attrs.get_mut(i)) {
             Some(x) => Some(std::mem::replace(&mut x.value, value.clone())),
             None => {
                 e.attrs.push(Attribute { prefix: prefix.as_deref().map(intern), ns: nse, local: local.clone(), value: value.clone() });
@@ -3061,8 +3087,11 @@ fn set_attribute_node_impl(vm: &mut Vm, el: usize, a: Obj) -> JsResult<Value> {
             }
         }
     });
+    if ns_from_url(&ns).is_none() {
+        page(|p| p.attr_ns_override.insert((el, prefix.clone(), local.clone()), ns.clone()));
+    }
     // The old Attr (if any) becomes detached with its old value; `a` becomes the attribute's object.
-    let key = (el, format!("{}|{}", nse.url(), local));
+    let key = (el, format!("{}|{}", ns, local));
     if let Some(Value::Object(oo)) = &old_obj {
         set_slot(vm, *oo, 0, num(-1.0));
         set_slot(vm, *oo, 4, s(old.as_deref().unwrap_or("")));

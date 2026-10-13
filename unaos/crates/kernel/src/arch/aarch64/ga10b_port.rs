@@ -1,3 +1,4 @@
+//! CHARTER: Kernel — driver
 //! GA10B-PROBE5G — RUNG 5g of the GA10B ladder: THE GSP-ACR DOOR, STEP ONE — the IMEM/DMEM PORT CENSUS
 //! (`ga10bprobe5g`, DEFAULT OFF; `UNAOS_GA10B_PROBE5=6`; implies `ga10bprobe5a` for the entry seam and
 //! rung 4a's helpers, and REPLACES the ignition on that build — nothing is spent, the boot continues

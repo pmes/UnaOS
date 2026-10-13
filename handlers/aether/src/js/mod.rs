@@ -295,6 +295,8 @@ pub(crate) struct PageState {
     pub same_object: HashMap<(usize, u8), (Obj, usize)>,
     /// Element namespace/prefix html_core's closed namespace set cannot hold (createElementNS).
     pub ns_override: HashMap<usize, (String, Option<String>)>,
+    /// Attribute namespaces the closed set cannot hold (setAttributeNS / the XML builder): (element, prefix, local) → URL.
+    pub attr_ns_override: HashMap<(usize, Option<String>, String), String>,
     /// `new EventTarget()` objects by serial (rooted: listeners are keyed by the serial).
     pub other_targets: HashMap<u32, (Obj, usize)>,
     /// The page clock reading at the time origin (`performance.now()` = 0).
