@@ -363,9 +363,9 @@ refs/heads/exec-rmbp-renderwedge            521d98de FOLDED-BY-HAND db66e678 202
 refs/heads/exec-rmbp-ring3exec              d079c4a7 FOLDED-BY-HAND db66e678 2026-10-12
 refs/heads/exec-rmbp-vfstxcost              3736f0d1 FOLDED-BY-HAND db66e678 2026-10-12
 refs/heads/exec-rmbp-trashlock              c416a2cc FOLDED-BY-HAND 78e78304 2026-10-12
-refs/heads/exec-rmbp-resolvehang            ed33b926 IN-FLIGHT rmbp 2026-10-12
-refs/heads/exec-rmbp-sessionwedge           ed33b926 IN-FLIGHT rmbp 2026-10-12
-refs/heads/exec-rmbp-twoboot                ed33b926 IN-FLIGHT rmbp 2026-10-12
+refs/heads/exec-rmbp-resolvehang            cf00acde FOLDED-BY-HAND a456af73 2026-10-13
+refs/heads/exec-rmbp-sessionwedge           2c04ab2f FOLDED-BY-HAND a456af73 2026-10-13
+refs/heads/exec-rmbp-twoboot                04687650 FOLDED-BY-HAND a456af73 2026-10-13
 refs/heads/exec-rmbp-layoutcore               3cf96e79 IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-rmbp-unametal                 3cf96e79 IN-FLIGHT rmbp 2026-10-12
 refs/heads/exec-host-aetherwss                3cf96e79 IN-FLIGHT rmbp 2026-10-12
