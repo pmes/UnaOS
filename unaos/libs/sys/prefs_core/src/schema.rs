@@ -144,6 +144,23 @@ pub static SCHEMA: &[Key] = &[
         doc: "The address bar's search engine: a URL template whose `%s` (or `{searchTerms}`) becomes the urlencoded query when the typed text is not an address (AETHERCHROME).",
     },
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
+    // ── AETHERA11Y (SR119): the user's accessibility preferences — the web's `prefers-*` / `forced-colors` media
+    //    features (css_core `media::set_user_preferences`), recorded by aether `a11y::prefs::A11yPrefs::from_prefs` ──
+    Key {
+        ns: "system", key: "accessibility.contrast", kind: Kind::Enum(&["no-preference", "more", "less"]), default: Default::Str("no-preference"),
+        writers: OP, reader: "aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-contrast`)",
+        doc: "More or less contrast than the default: the `prefers-contrast` media feature pages read (`custom` when forced colors are on and this is unset), and a 3px focus ring at `more` (AETHERA11Y, SR119).",
+    },
+    Key {
+        ns: "system", key: "accessibility.forced_colors", kind: Kind::Bool, default: Default::Bool(false),
+        writers: OP, reader: "aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`forced-colors`)",
+        doc: "A user palette replaces page colours: the `forced-colors: active` media feature, and a 3px focus ring (AETHERA11Y, SR119).",
+    },
+    Key {
+        ns: "system", key: "accessibility.reduce_motion", kind: Kind::Bool, default: Default::Bool(false),
+        writers: OP, reader: "aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-reduced-motion`)",
+        doc: "Minimise non-essential motion: the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119).",
+    },
     Key {
         ns: "system", key: "appearance.accent", kind: Kind::Enum(&crate::appearance::ACCENTS), default: Default::Str("crispy"),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",

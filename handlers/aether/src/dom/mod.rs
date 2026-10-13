@@ -20,6 +20,11 @@ pub mod custom;
 pub mod mutation;
 mod select;
 pub mod shadow;
+// AETHERA11Y (SR119): the accessibility tree, sequential focus navigation and the reading verbs — computed
+// from this document model and its computed style. Declared here because lib.rs is outside the arc's files;
+// the fold may move the declaration to lib.rs as `pub mod a11y;` (callers then say `crate::a11y`).
+#[path = "../a11y/mod.rs"]
+pub mod a11y;
 
 pub use select::{El, Selectors};
 

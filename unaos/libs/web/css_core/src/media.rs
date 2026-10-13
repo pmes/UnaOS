@@ -5,6 +5,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::parser::{trim_ws, BlockKind, CV};
 use crate::tokenizer::Token;
 use crate::values::absolute_length;
@@ -20,6 +22,10 @@ pub struct Environment {
     pub media_type: &'static str,
     pub dark: bool,
     pub reduced_motion: bool,
+    /// AETHERA11Y (SR119): `prefers-contrast` — `"no-preference"`, `"more"`, `"less"` or `"custom"`.
+    pub contrast: &'static str,
+    /// AETHERA11Y (SR119): `forced-colors: active`.
+    pub forced_colors: bool,
     /// primary pointer: `"none"`, `"coarse"`, `"fine"`
     pub pointer: &'static str,
     pub hover: bool,
@@ -32,15 +38,19 @@ pub struct Environment {
 }
 
 impl Default for Environment {
-    /// Chromium headless on a desktop: 800×600 screen, 1dppx, light, fine pointer with hover.
+    /// Chromium headless on a desktop: 800×600 screen, 1dppx, light, fine pointer with hover; the user's
+    /// accessibility preferences are the ones [`set_user_preferences`] last recorded (none until then).
     fn default() -> Self {
+        let prefs = user_preferences();
         Environment {
             width: 800.0,
             height: 600.0,
             dppx: 1.0,
             media_type: "screen",
             dark: false,
-            reduced_motion: false,
+            reduced_motion: prefs.reduced_motion,
+            contrast: prefs.contrast.keyword(prefs.forced_colors),
+            forced_colors: prefs.forced_colors,
             pointer: "fine",
             hover: true,
             color_bits: 8,
@@ -54,6 +64,75 @@ impl Default for Environment {
 impl Environment {
     pub fn viewport(width: f64, height: f64) -> Self {
         Environment { width, height, ..Default::default() }
+    }
+}
+
+/// AETHERA11Y (SR119): the user's `prefers-contrast` choice (Media Queries 5 §11.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Contrast {
+    #[default]
+    NoPreference,
+    More,
+    Less,
+}
+
+impl Contrast {
+    /// A stored spelling (`no-preference` / `more` / `less`); anything else is no preference.
+    pub fn parse(v: &str) -> Contrast {
+        match v.trim() {
+            s if s.eq_ignore_ascii_case("more") => Contrast::More,
+            s if s.eq_ignore_ascii_case("less") => Contrast::Less,
+            _ => Contrast::NoPreference,
+        }
+    }
+
+    /// The `prefers-contrast` keyword: with forced colors active and no explicit choice it is `custom`
+    /// (MQ5 §11.2: "forced-colors: active" with a palette that is neither more nor less contrast).
+    pub const fn keyword(self, forced_colors: bool) -> &'static str {
+        match self {
+            Contrast::More => "more",
+            Contrast::Less => "less",
+            Contrast::NoPreference if forced_colors => "custom",
+            Contrast::NoPreference => "no-preference",
+        }
+    }
+}
+
+/// AETHERA11Y (SR119): the accessibility preferences media queries are evaluated against — Principia's
+/// `system.accessibility.*` rows, recorded by the embedder (host Aether's `a11y::prefs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct UserPreferences {
+    pub reduced_motion: bool,
+    pub contrast: Contrast,
+    pub forced_colors: bool,
+}
+
+/// One byte: bit 0 reduced motion, bits 1..=2 contrast (0 none, 1 more, 2 less), bit 3 forced colors.
+/// Process-wide (no_std has no thread-locals): it is the user's preference, the same for every page.
+static USER_PREFS: AtomicU8 = AtomicU8::new(0);
+
+/// Records the user's accessibility preferences; every [`Environment`] made after it (`default`,
+/// `viewport`) carries them.
+pub fn set_user_preferences(p: UserPreferences) {
+    let c = match p.contrast {
+        Contrast::NoPreference => 0u8,
+        Contrast::More => 1,
+        Contrast::Less => 2,
+    };
+    USER_PREFS.store((p.reduced_motion as u8) | (c << 1) | ((p.forced_colors as u8) << 3), Ordering::Relaxed);
+}
+
+/// The preferences [`set_user_preferences`] last recorded.
+pub fn user_preferences() -> UserPreferences {
+    let b = USER_PREFS.load(Ordering::Relaxed);
+    UserPreferences {
+        reduced_motion: b & 1 != 0,
+        contrast: match (b >> 1) & 3 {
+            1 => Contrast::More,
+            2 => Contrast::Less,
+            _ => Contrast::NoPreference,
+        },
+        forced_colors: b & 8 != 0,
     }
 }
 
@@ -450,9 +529,9 @@ fn discrete(name: &str, env: &Environment) -> Option<(&'static str, bool)> {
         "pointer" | "any-pointer" => (env.pointer, env.pointer != "none"),
         "prefers-color-scheme" => (if env.dark { "dark" } else { "light" }, true),
         "prefers-reduced-motion" => (if env.reduced_motion { "reduce" } else { "no-preference" }, env.reduced_motion),
-        "prefers-contrast" => ("no-preference", false),
+        "prefers-contrast" => (env.contrast, env.contrast != "no-preference"),
         "prefers-reduced-transparency" | "prefers-reduced-data" => ("no-preference", false),
-        "forced-colors" => ("none", false),
+        "forced-colors" => (if env.forced_colors { "active" } else { "none" }, env.forced_colors),
         "inverted-colors" => ("none", false),
         "scripting" => (env.scripting, env.scripting != "none"),
         "update" => (if env.media_type == "print" { "none" } else { "fast" }, env.media_type != "print"),

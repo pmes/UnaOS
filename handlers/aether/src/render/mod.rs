@@ -96,6 +96,8 @@ pub fn text_boxes() -> Vec<TextBox> {
 }
 
 mod boxpaint;
+// AETHERA11Y (SR119): the keyboard focus ring, painted last from the accessibility theme.
+pub mod focusring;
 pub(crate) mod effects;
 
 fn in_clip(x: u32, y: u32, clip: Clip) -> bool {
@@ -3211,4 +3213,6 @@ pub fn render_frame(
         damage_rects,
         (0.0, 0.0, width as f32, height as f32),
     );
+    // AETHERA11Y (SR119): `:focus-visible` from the keyboard — the ring over everything.
+    focusring::paint(layout, surface, width, height, sx, sy, damage_rects);
 }
