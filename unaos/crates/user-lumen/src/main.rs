@@ -1858,7 +1858,7 @@ fn eff_system() -> &'static str {
 static mut DEFSYS: [u8; SYS_CAP] = [0; SYS_CAP];
 static mut DEFSYS_N: usize = 0;
 
-/// The Gemini key: Holocron `vein/gemini.api_key` first, else the key file `vein.gemini_key_file` names (UnaFS
+/// The Gemini key: Holocron `vein/gemini.api_key` first, else the key file `vein.gemini.key_file` names (UnaFS
 /// only, as Claude's). Read the first time a Gemini conversation needs it, then kept.
 static mut GKEY: [u8; 320] = [0; 320];
 static mut GKEY_STATE: Option<(KeyState, usize)> = None;
@@ -1873,7 +1873,7 @@ fn gemini_key() -> (KeyState, usize) {
         vein_ring3::holocron::KeyFrom::Refuse(_) => (KeyState::None, 0),
         vein_ring3::holocron::KeyFrom::Fallback(_) => {
             let mut v = [0u8; 128];
-            match vein_ring3::prefs::get("vein.gemini_key_file", &mut v) {
+            match vein_ring3::prefs::get("vein.gemini.key_file", &mut v) {
                 Ok(Some(n)) => match core::str::from_utf8(vein_core::prefs::unquote(&v[..n])) {
                     Ok(p) if !p.is_empty() => vein_ring3::key::read(Some(p), buf),
                     _ => (KeyState::None, 0),

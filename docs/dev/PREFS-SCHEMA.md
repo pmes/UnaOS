@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 53.
+Rows: 55.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -66,10 +66,12 @@ Rows: 53.
 | `vein.gemini.embed_region` | string ≤128 printable | `"us-central1"` | operator | — | gneiss_pal ProviderConfig, EmbedConfig | Vertex region for embeddings. |
 | `vein.gemini.project` | string ≤128 printable | consumer: none: gcloud auth refuses without one | operator | — | gneiss_pal ProviderConfig, EmbedConfig | Google Cloud project for Vertex. |
 | `vein.gemini.region` | string ≤128 printable | `"global"` | operator | — | gneiss_pal ProviderConfig | Vertex region for chat. |
+| `vein.gemini.key_file` | string ≤40 printable | consumer: unset: Gemini has no key on the image; the Echo provider answers | operator | — | vein_ring3 key (LUMEN.ELF, a Gemini conversation) | LUMEN2 (SR121): absolute path of the Gemini API key file on the UnaFS volume, the Gemini twin of `key_file` (same bound and FAT refusal). |
 | `vein.key_file` | string ≤40 printable | consumer: unset: no key, the Echo provider answers | operator | — | vein_ring3 key (LUMEN.ELF); kernel tests lumen | Absolute path of the API key file on the UnaFS volume (read only when it stats with an inode id; refused on FAT). At most 40 bytes: ring 3's SYS_OPEN name bound. |
 | `vein.max_tokens` | int `1..=4294967295` | `16000` | operator | — | gneiss_pal ProviderConfig | Output token cap per reply. |
 | `vein.model` | string ≤128 printable | rule `chat-model` | operator | — | gneiss_pal ProviderConfig | The chat model. |
 | `vein.provider` | enum `claude \| gemini \| claudecode \| echo \| relay` | `"claude"` | operator | — | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38). |
+| `vein.system_prompt` | string ≤2048 printable | consumer: unset: Lumen's built-in system prompt | operator | — | LUMEN.ELF (LUMEN2, SR121); a conversation's own `lumen:set system` block overrides it | The default system prompt for a new conversation. At most 2048 bytes (Lumen's SYS_CAP). |
 | `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | — | gneiss_pal ProviderConfig | Sampling temperature. |
 
 ## Rules (derived defaults)

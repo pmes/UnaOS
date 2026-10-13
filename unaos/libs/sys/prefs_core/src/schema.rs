@@ -397,6 +397,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Vertex region for chat.",
     },
     Key {
+        ns: "vein", key: "gemini.key_file", kind: Kind::Str { max_len: 40, printable: true },
+        default: Default::Consumer("unset: Gemini has no key on the image; the Echo provider answers"),
+        writers: OP, reader: "vein_ring3 key (LUMEN.ELF, a Gemini conversation)",
+        doc: "LUMEN2 (SR121): absolute path of the Gemini API key file on the UnaFS volume, the Gemini twin of `key_file` (same bound and FAT refusal).",
+    },
+    Key {
         ns: "vein", key: "key_file", kind: Kind::Str { max_len: 40, printable: true },
         default: Default::Consumer("unset: no key, the Echo provider answers"),
         writers: OP, reader: "vein_ring3 key (LUMEN.ELF); kernel tests lumen",
@@ -417,6 +423,12 @@ pub static SCHEMA: &[Key] = &[
         default: Default::Str("claude"),
         writers: OP, reader: "gneiss_pal ProviderConfig; user-vein (metal: echo | relay)",
         doc: "The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38).",
+    },
+    Key {
+        ns: "vein", key: "system_prompt", kind: Kind::Str { max_len: 2048, printable: true },
+        default: Default::Consumer("unset: Lumen's built-in system prompt"),
+        writers: OP, reader: "LUMEN.ELF (LUMEN2, SR121); a conversation's own `lumen:set system` block overrides it",
+        doc: "The default system prompt for a new conversation. At most 2048 bytes (Lumen's SYS_CAP).",
     },
     Key {
         ns: "vein", key: "temperature", kind: Kind::Float { min: 0.0, max: 2.0 },
