@@ -22,6 +22,22 @@
 // hover; the toolbar's controls are stroked glyphs with a rounded wash on hover and press, never a boxed rectangle;
 // the address field is one pill with a quiet border and, focused, the accent inside a soft halo.
 //
+// SIDE TABS AND THE HEADER'S ACTIONS (AETHERSIDETABS2, SR143). Principia's `aether.tabs.layout` (`top` | `side`, the
+// host face's key; read at start and whenever `theme::due` reports a PrefChanged — its subscription names `aether.tabs.`
+// beside `system.appearance.`; a kernel that refuses it falls back to due's own poll) chooses where the tabs stand. `side`: the model's
+// `sidetabs::SideStrip` (linked by path like the rest) is a COLUMN down the window's left — `width_for(pw)`: 240 px,
+// at most a third of this 288 px surface, or the 48 px rail — over its toggle row and `TabStrip::rows` 32 px each
+// (a group's header with its colour dot, name, count and chevron, a click collapsing it; its tabs with a stripe in
+// the group's colour; the favicon or the letter tile, the title, the × on hover; the `+` row), scrolled by the
+// wheel and revealed on every tab switch; the toolbar then spans only the page's width, and the PAGE'S ORIGIN is
+// (column width, BAR_H) instead of (0, CHROME_H): `page_x`/`page_y` below are the one place it is decided, and
+// `logical`, `to_window`, the pointer rewrite and `blit` all read them. The toolbar gains RELOAD (the page read
+// again, history untouched: main.rs `load` with push = false) and the MENU (⋮ at the right end): the chrome's
+// actions as a list — new tab, bookmark this page, bookmarks and history (the new-tab page lists both), downloads,
+// find in page, zoom in / out / actual size, settings. On a narrow bar the zoom buttons (under 360 px) and the star
+// (under 220 px) leave the bar for the menu. A tab's FAVICON tile (`sidetabs::favicon_tile`, 16 px) replaces its
+// letter tile when the face has one (`Chrome::set_icon`).
+//
 // INPUT (`input`, called on every ring event before main.rs's dispatch: `None` = the chrome took it, `Some(ev)` =
 // main.rs handles `ev`, a pointer event rewritten into page px).
 // * TABS (`tabs::TabStrip`): Ctrl+T (0x14) a new tab (the new-tab page: bookmarks, recent history, the volume's
@@ -67,7 +83,7 @@ use edit_core::{Buffer, Direction, Motion, Selection, Unit};
 use layout_core::FontSel;
 use una_abi::{
     input_ev_pack, input_ev_payload, input_ev_type, input_ev_xy, input_ev_xy_payload, CURSOR_ARROW, CURSOR_HAND, CURSOR_TEXT, INPUT_EV_ACTION,
-    INPUT_EV_BUTTON, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, INPUT_EV_WIN_RESIZE, KEY_CTRL_MINUS, KEY_CTRL_PLUS, KEY_CTRL_SHIFT_TAB, KEY_CTRL_TAB,
+    INPUT_EV_BUTTON, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, KEY_CTRL_MINUS, KEY_CTRL_PLUS, KEY_CTRL_SHIFT_TAB, KEY_CTRL_TAB,
     KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
 };
 
@@ -98,9 +114,15 @@ pub mod downloads;
 #[allow(dead_code, unused_imports)]
 #[path = "../../../../handlers/aether/src/chrome/zoom.rs"]
 pub mod zoom;
+// AETHERSIDETABS2 (SR143): the side column's geometry, the layout pref and the favicon tile (std-free; names only
+// `super::tabs`).
+#[allow(dead_code, unused_imports)]
+#[path = "../../../../handlers/aether/src/chrome/sidetabs.rs"]
+pub mod sidetabs;
 
 use crate::store;
 use history::{SessionHistory, Traversal};
+use sidetabs::{SideHit, SideStrip, TabLayout};
 
 // ---- THE HEADER'S METRICS (AETHERSIDETABS / header craft, SR140): every dimension the strip and the toolbar are
 // drawn with, named once here; the colours are `Skin` (below), derived once from the theme tokens. ----------------
@@ -139,8 +161,34 @@ const RING: i32 = 2;
 /// The drawn glyphs (chevrons, plus, minus, ×): half their extent and their stroke width.
 const GLYPH: f32 = 4.0;
 const STROKE: f32 = 1.5;
-/// Where the toolbar's controls stand (their top edge).
-const BAR_Y: i32 = TAB_H + (BAR_H - CTL) / 2;
+/// Where the toolbar's controls stand in the bar (their top edge below the bar's top; `Chrome::bar_y`).
+const BAR_INSET: i32 = (BAR_H - CTL) / 2;
+/// AETHERSIDETABS2 (SR143): the narrowest bar that still carries the zoom buttons, and the star (else they are only
+/// in the menu).
+const BAR_ZOOM_MIN: i32 = 360;
+const BAR_STAR_MIN: i32 = 220;
+/// The menu: its width, one row's height, its inner padding, its radius, and its rows.
+const MENU_W: i32 = 176;
+const MENU_ROW: i32 = 22;
+const MENU_PAD: i32 = 4;
+const MENU_R: i32 = 8;
+const MENU: [(&str, &str); 10] = [
+    ("New tab", "Ctrl+T"),
+    ("Bookmark this page", "Ctrl+D"),
+    ("Bookmarks and history", ""),
+    ("Downloads", ""),
+    ("Find in page", "Ctrl+F"),
+    ("Zoom in", "Ctrl++"),
+    ("Zoom out", "Ctrl+-"),
+    ("Actual size", "Ctrl+0"),
+    ("Close tab", "Ctrl+W"),
+    ("Settings", ""),
+];
+/// The side column's favicon / letter tile (the model's `FAVICON_PX`) and the group's colour dot.
+const SIDE_TILE: i32 = sidetabs::FAVICON_PX as i32;
+const DOT: i32 = 8;
+/// Principia's row for where the tabs stand (`sidetabs::PREF_NS` . `sidetabs::PREF_KEY`).
+const LAYOUT_PREF: &str = "aether.tabs.layout";
 /// The new-tab page's path (generated, never read off the volume).
 pub const NEWTAB: &str = "/aether:newtab";
 /// What an empty address field says.
@@ -179,6 +227,11 @@ enum Hot {
     Star,
     ZoomOut,
     ZoomIn,
+    /// AETHERSIDETABS2 (SR143): reload, the menu button, one of its rows, and a place in the side column.
+    Reload,
+    Menu,
+    MenuItem(usize),
+    Side(SideHit),
 }
 
 pub struct Chrome {
@@ -201,6 +254,12 @@ pub struct Chrome {
     ptr: (i32, i32),
     hot: Hot,
     pressed: Option<Hot>,
+    /// AETHERSIDETABS2 (SR143): where the tabs stand (Principia's row) and the side column's state, whether the menu
+    /// is open, and each tab's favicon tile (16 x 16 RGBA) when the face has one.
+    layout: TabLayout,
+    side: SideStrip,
+    menu: bool,
+    icons: Vec<(u64, Vec<u8>)>,
 }
 
 impl Chrome {
@@ -224,20 +283,85 @@ impl Chrome {
             ptr: (-1, -1),
             hot: Hot::None,
             pressed: None,
+            layout: TabLayout::Top,
+            side: SideStrip::default(),
+            menu: false,
+            icons: Vec::new(),
         }
+    }
+
+    fn is_side(&self) -> bool {
+        self.layout == TabLayout::Side
+    }
+
+    /// The side column's width (0 in the top layout).
+    fn col_w(&self) -> i32 {
+        if self.is_side() {
+            self.side.width_for(self.pw.max(0) as u32) as i32
+        } else {
+            0
+        }
+    }
+
+    /// THE PAGE'S ORIGIN in window px (AETHERSIDETABS2): right of the side column and under the toolbar in the side
+    /// layout, under the whole header (0, CHROME_H) in the top one.
+    pub fn page_x(&self) -> i32 {
+        self.col_w()
+    }
+
+    pub fn page_y(&self) -> i32 {
+        if self.is_side() {
+            BAR_H
+        } else {
+            CHROME_H
+        }
+    }
+
+    /// The toolbar's band top, and its controls' top edge.
+    fn bar_top(&self) -> i32 {
+        self.page_y() - BAR_H
+    }
+
+    fn bar_y(&self) -> i32 {
+        self.bar_top() + BAR_INSET
     }
 
     /// The page's logical size at this window and zoom (CSS px).
     fn logical(&self) -> (i32, i32) {
         let z = self.zoom.max(1) as i32;
-        let lw = (self.pw * 100 / z).max(16);
-        let lh = ((self.ph - CHROME_H).max(16) * 100 / z).max(16);
+        let lw = ((self.pw - self.page_x()).max(16) * 100 / z).max(16);
+        let lh = ((self.ph - self.page_y()).max(16) * 100 / z).max(16);
         (lw, lh)
+    }
+
+    /// The open menu's rectangle (x, y, w, h), under the menu button's right edge.
+    fn menu_rect(&self) -> (i32, i32, i32, i32) {
+        let w = MENU_W.min(self.pw - 2 * EDGE);
+        let h = MENU.len() as i32 * MENU_ROW + 2 * MENU_PAD;
+        (self.pw - EDGE - w, self.page_y() + 2, w, h)
+    }
+
+    fn in_menu(&self, x: i32, y: i32) -> bool {
+        let (mx, my, mw, mh) = self.menu_rect();
+        self.menu && x >= mx && x < mx + mw && y >= my && y < my + mh
     }
 
     fn over(&self) -> bool {
         let (x, y) = self.ptr;
-        x >= 0 && y >= 0 && x < self.pw && y < CHROME_H
+        x >= 0 && y >= 0 && x < self.pw && y < self.ph && (y < self.page_y() || x < self.page_x() || self.in_menu(x, y))
+    }
+
+    /// AETHERSIDETABS2 (SR143): tab `id`'s favicon tile (`sidetabs::FAVICON_PX` square RGBA, what
+    /// `sidetabs::favicon_tile` makes of a decoded `<link rel=icon>`), or `None` to show its letter tile again.
+    pub fn set_icon(&mut self, id: u64, tile: Option<Vec<u8>>) {
+        self.icons.retain(|(k, _)| *k != id);
+        if let Some(t) = tile.filter(|t| t.len() >= (SIDE_TILE * SIDE_TILE * 4) as usize) {
+            self.icons.push((id, t));
+        }
+    }
+
+    fn icon(&self, id: u64) -> Option<&[u8]> {
+        self.icons.iter().find(|(k, _)| *k == id).map(|(_, t)| t.as_slice())
     }
 
     fn file(&self, leaf: &str) -> Option<String> {
@@ -271,7 +395,7 @@ impl Chrome {
 /// under the zoom: what the focus line's `at=` reports, so `tests aether` aims the system pointer where it lands.
 pub fn to_window(app: &App, x: f32, y: f32) -> (i64, i64) {
     let z = app.ch.zoom as f32 / 100.0;
-    ((x * z) as i64, (y * z) as i64 + CHROME_H as i64)
+    ((x * z) as i64 + app.ch.page_x() as i64, (y * z) as i64 + app.ch.page_y() as i64)
 }
 
 /// The URL the chrome shows for a page path (`file://` + the path; a network page's path is its URL already; nothing
@@ -378,7 +502,31 @@ pub fn start(app: &mut App, page: &Page) {
     l.put(b" bookmarks=").dec(app.ch.bookmarks.items().len() as i64).put(b" history=").dec(app.ch.visits.len() as i64);
     l.put(b" code=").dec(code).put(b" ::");
     l.wire();
+    prefs(app, true); // AETHERSIDETABS2 (SR143): where the tabs stand, before the first paint
     loaded(app, page, true);
+}
+
+/// AETHERSIDETABS2 (SR143): re-read where the tabs stand — at start, whenever `theme::due` saw the store move
+/// (`moved`: a PrefChanged under `aether.tabs.` or `system.appearance.`, theme.rs's subscription). A
+/// change re-lays the window (the page's origin and logical size move; no tab or page is touched):
+/// `:: AETHER: tabs layout=<top|side> col=<px> ::`.
+pub fn prefs(app: &mut App, moved: bool) {
+    if !moved {
+        return;
+    }
+    let want = crate::theme::pref_text(LAYOUT_PREF).map(|t| TabLayout::parse(&t)).unwrap_or_default();
+    if want == app.ch.layout {
+        return;
+    }
+    app.ch.layout = want;
+    app.ch.hot = Hot::None;
+    app.ch.menu = false;
+    let (strip, ph, id) = (&app.ch.strip, app.ch.ph.max(0) as u32, app.ch.strip.active());
+    app.ch.side.reveal(strip, ph, id);
+    refit(app);
+    let mut l = Line::new(b":: AETHER: tabs layout=");
+    l.put(want.as_str().as_bytes()).put(b" col=").dec(app.ch.col_w() as i64).put(b" ::");
+    l.wire();
 }
 
 /// A page became the active tab's (main.rs `load`, and a same-document traversal): the tab's title and URL, the
@@ -438,7 +586,15 @@ fn split_frag(url: &str) -> (String, Option<String>) {
 
 // ---- tabs -----------------------------------------------------------------------------------------------------
 
-fn tab_wire(app: &App, how: &[u8]) {
+fn tab_wire(app: &mut App, how: &[u8]) {
+    // AETHERSIDETABS2 (SR143): the side column keeps the active tab on view; a closed tab's favicon goes.
+    {
+        let ch = &mut app.ch;
+        let (ph, id) = (ch.ph.max(0) as u32, ch.strip.active());
+        ch.side.reveal(&ch.strip, ph, id);
+        let strip = &ch.strip;
+        ch.icons.retain(|(k, _)| strip.get(*k).is_some());
+    }
     let ch = &app.ch;
     let k = ch.strip.tabs().iter().position(|t| t.id == ch.strip.active()).map_or(0, |i| i + 1);
     let mut l = Line::new(b":: AETHER: tab -> PASS how=");
@@ -446,9 +602,8 @@ fn tab_wire(app: &App, how: &[u8]) {
     l.wire();
 }
 
-/// Move the active tab's state into the parked list, leaving `placeholder` as the page.
-fn park(app: &mut App, page: &mut Page, placeholder: Page) {
-    let id = app.ch.strip.active();
+/// Move tab `id`'s state (the live one) into the parked list, leaving `placeholder` as the page.
+fn park(app: &mut App, page: &mut Page, placeholder: Page, id: u64) {
     let cur = core::mem::replace(page, placeholder);
     let hist = core::mem::take(&mut app.hist);
     app.ch.parked.push(Parked { id, page: cur, hist, scroll: app.scroll, w: app.w, h: app.h });
@@ -480,7 +635,8 @@ fn placeholder(app: &App) -> Page {
 /// Ctrl+T / `+`: a new tab on the new-tab page, the address field focused.
 fn new_tab(app: &mut App, page: &mut Page, fonts: &mut Fonts) {
     let ph = placeholder(app);
-    park(app, page, ph);
+    let id = app.ch.strip.active();
+    park(app, page, ph, id);
     app.ch.strip.open();
     app.ch.omni = None;
     crate::load(app, page, fonts, NEWTAB, b"newtab", true);
@@ -514,7 +670,8 @@ fn select_tab(app: &mut App, page: &mut Page, id: u64) {
     }
     app.ch.omni = None;
     let ph = placeholder(app);
-    park(app, page, ph);
+    let live = app.ch.strip.active();
+    park(app, page, ph, live);
     app.ch.strip.select(id);
     if !unpark(app, page, id) {
         // Not parked (cannot happen: every inactive tab is) — take the parked one back rather than show nothing.
@@ -534,6 +691,60 @@ fn cycle_tab(app: &mut App, page: &mut Page, dir: i32) {
     let j = (i as i64 + dir as i64).rem_euclid(tabs.len() as i64) as usize;
     let id = tabs[j].id;
     select_tab(app, page, id);
+}
+
+/// AETHERSIDETABS2 (SR143): a click on a group's header collapses or expands it. Collapsing the active tab's group
+/// moves the active tab out of it (the model's rule), so the pages swap as a switch does.
+fn toggle_group(app: &mut App, page: &mut Page, g: tabs::GroupId) {
+    let before = app.ch.strip.active();
+    if app.ch.strip.group_toggle(g).is_none() {
+        return;
+    }
+    let now = app.ch.strip.active();
+    if now != before {
+        app.ch.omni = None;
+        let ph = placeholder(app);
+        park(app, page, ph, before);
+        unpark(app, page, now);
+        tab_wire(app, b"select");
+    }
+    app.dirty = true;
+}
+
+/// AETHERSIDETABS2 (SR143): the toolbar's reload — the page read again in place (main.rs `load`, no new history
+/// entry): `:: AETHER: nav -> PASS how=reload ... ::`.
+fn reload(app: &mut App, page: &mut Page, fonts: &mut Fonts) {
+    app.ch.omni = None;
+    let path = page.path.clone();
+    crate::load(app, page, fonts, &path, b"reload", false);
+}
+
+/// AETHERSIDETABS2 (SR143): one of the menu's rows (`MENU`'s order).
+fn menu_item(app: &mut App, page: &mut Page, fonts: &mut Fonts, i: usize) {
+    app.ch.menu = false;
+    app.dirty = true;
+    match i {
+        0 => new_tab(app, page, fonts),
+        1 => bookmark(app, page),
+        2 => crate::load(app, page, fonts, NEWTAB, b"menu", true),
+        3 => {
+            let d = &app.ch.downloads;
+            let msg = match d.items().last() {
+                None => String::from("no downloads yet"),
+                Some(x) => alloc::format!("{} download(s); last {} ({})", d.items().len(), x.name, if x.error.is_some() { "failed" } else { "in Desktop" }),
+            };
+            app.flash(msg);
+        }
+        4 => app.find = Some(crate::ui::Find::default()),
+        5 => zoom_step(app, 1),
+        6 => zoom_step(app, -1),
+        7 => zoom_step(app, 0),
+        8 => close_tab(app, page, fonts),
+        _ => app.flash(alloc::format!("settings: Principia {} = {}, aether.search", LAYOUT_PREF, app.ch.layout.as_str())),
+    }
+    let mut l = Line::new(b":: AETHER: menu -> PASS item=");
+    l.put(MENU.get(i).map_or(b"none" as &[u8], |m| m.0.as_bytes())).put(b" ::");
+    l.wire();
 }
 
 fn select_nth(app: &mut App, page: &mut Page, n: Option<usize>) {
@@ -778,41 +989,71 @@ fn omni_action(app: &mut App, a: u64) {
 
 // ---- geometry, hit test, input ----------------------------------------------------------------------------------
 
-/// The chrome's rectangles at the current window width (x, w) — tabs in the strip, buttons and the field in the bar.
+/// The chrome's rectangles at the current window width (x, w) — tabs in the strip (the top layout only), buttons and
+/// the field in the bar (which spans the page's width: right of the side column in the side layout). A control the bar
+/// has no room for is `None` (it is in the menu).
 struct Geo {
     tabs: Vec<(u64, i32, i32)>,
     plus: (i32, i32),
     back: (i32, i32),
     fwd: (i32, i32),
+    reload: (i32, i32),
     omni: (i32, i32),
-    star: (i32, i32),
-    zout: (i32, i32),
-    zin: (i32, i32),
+    star: Option<(i32, i32)>,
+    zout: Option<(i32, i32)>,
+    zin: Option<(i32, i32)>,
+    menu: (i32, i32),
 }
 
 fn geo(ch: &Chrome) -> Geo {
     let w = ch.pw;
-    let area = (w - 2 * EDGE - GAP - CTL).max(TAB_MIN_W);
-    let n = ch.strip.len().max(1) as i32;
-    let tw = (area / n).clamp(TAB_MIN_W, TAB_MAX_W);
-    // Tabs past the strip's room are not drawn (Ctrl+1..9 still reach them).
-    let tabs: Vec<(u64, i32, i32)> =
-        ch.strip.tabs().iter().enumerate().map(|(i, t)| (t.id, EDGE + i as i32 * tw, tw)).filter(|&(_, x, tw)| x + tw <= EDGE + area).collect();
-    let plus_x = (EDGE + tabs.len() as i32 * tw + GAP).min(w - EDGE - CTL);
-    let zin = w - EDGE - CTL;
-    let zout = zin - GAP - CTL;
-    let star = zout - GAP - CTL;
-    let fwd = EDGE + CTL + GAP;
-    let omni = fwd + CTL + EDGE;
+    let (tabs, plus) = if ch.is_side() {
+        (Vec::new(), (0, 0))
+    } else {
+        let area = (w - 2 * EDGE - GAP - CTL).max(TAB_MIN_W);
+        let n = ch.strip.len().max(1) as i32;
+        let tw = (area / n).clamp(TAB_MIN_W, TAB_MAX_W);
+        // Tabs past the strip's room are not drawn (Ctrl+1..9 still reach them).
+        let tabs: Vec<(u64, i32, i32)> =
+            ch.strip.tabs().iter().enumerate().map(|(i, t)| (t.id, EDGE + i as i32 * tw, tw)).filter(|&(_, x, tw)| x + tw <= EDGE + area).collect();
+        let plus_x = (EDGE + tabs.len() as i32 * tw + GAP).min(w - EDGE - CTL);
+        (tabs, (plus_x, CTL))
+    };
+    let x0 = ch.page_x();
+    let bw = w - x0;
+    let menu = w - EDGE - CTL;
+    let mut r = menu - GAP;
+    let (zout, zin) = if bw >= BAR_ZOOM_MIN {
+        let zin = r - CTL;
+        let zout = zin - GAP - CTL;
+        r = zout - GAP;
+        (Some((zout, CTL)), Some((zin, CTL)))
+    } else {
+        (None, None)
+    };
+    let star = if bw >= BAR_STAR_MIN {
+        r -= CTL;
+        let s = r;
+        r -= GAP;
+        Some((s, CTL))
+    } else {
+        None
+    };
+    let back = x0 + EDGE;
+    let fwd = back + CTL + GAP;
+    let reload = fwd + CTL + GAP;
+    let omni = reload + CTL + EDGE;
     Geo {
         tabs,
-        plus: (plus_x, CTL),
-        back: (EDGE, CTL),
+        plus,
+        back: (back, CTL),
         fwd: (fwd, CTL),
-        omni: (omni, (star - EDGE - omni).max(24)),
-        star: (star, CTL),
-        zout: (zout, CTL),
-        zin: (zin, CTL),
+        reload: (reload, CTL),
+        omni: (omni, (r + GAP - EDGE - omni).max(24)),
+        star,
+        zout,
+        zin,
+        menu: (menu, CTL),
     }
 }
 
@@ -826,11 +1067,26 @@ fn within(x: i32, r: (i32, i32)) -> bool {
 }
 
 fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
-    if y < 0 || y >= CHROME_H || x < 0 || x >= ch.pw {
+    if ch.menu {
+        // The open menu sits over the page: its rows are the chrome's.
+        let (mx, my, mw, mh) = ch.menu_rect();
+        if x >= mx && x < mx + mw && y >= my && y < my + mh {
+            let k = (y - my - MENU_PAD).div_euclid(MENU_ROW);
+            return if k >= 0 && (k as usize) < MENU.len() { Hot::MenuItem(k as usize) } else { Hot::None };
+        }
+    }
+    if y < 0 || y >= ch.ph || x < 0 || x >= ch.pw {
+        return Hot::None;
+    }
+    let cw = ch.col_w();
+    if x < cw {
+        return ch.side.hit_w(&ch.strip, cw as u32, ch.ph.max(0) as u32, x, y).map_or(Hot::None, Hot::Side);
+    }
+    if y >= ch.page_y() {
         return Hot::None;
     }
     let g = geo(ch);
-    if y < TAB_H {
+    if !ch.is_side() && y < TAB_H {
         if y < TAB_TOP {
             return Hot::None;
         }
@@ -844,10 +1100,15 @@ fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
         }
         return if within(x, g.plus) { Hot::NewTab } else { Hot::None };
     }
-    if y < BAR_Y || y >= BAR_Y + CTL {
+    let by = ch.bar_y();
+    if y < by || y >= by + CTL {
         return Hot::None;
     }
-    for (r, h) in [(g.back, Hot::Back), (g.fwd, Hot::Fwd), (g.omni, Hot::Omni), (g.star, Hot::Star), (g.zout, Hot::ZoomOut), (g.zin, Hot::ZoomIn)] {
+    let opt = [(g.star, Hot::Star), (g.zout, Hot::ZoomOut), (g.zin, Hot::ZoomIn)];
+    for (r, h) in [(g.back, Hot::Back), (g.fwd, Hot::Fwd), (g.reload, Hot::Reload), (g.omni, Hot::Omni), (g.menu, Hot::Menu)]
+        .into_iter()
+        .chain(opt.into_iter().filter_map(|(r, h)| r.map(|r| (r, h))))
+    {
         if within(x, r) {
             return h;
         }
@@ -887,6 +1148,19 @@ fn click(app: &mut App, page: &mut Page, fonts: &mut Fonts, h: Hot) {
         Hot::Star => bookmark(app, page),
         Hot::ZoomOut => zoom_step(app, -1),
         Hot::ZoomIn => zoom_step(app, 1),
+        // AETHERSIDETABS2 (SR143): reload, the menu, and the side column.
+        Hot::Reload => reload(app, page, fonts),
+        Hot::Menu => app.ch.menu = !app.ch.menu,
+        Hot::MenuItem(i) => menu_item(app, page, fonts, i),
+        Hot::Side(SideHit::Toggle) => {
+            app.ch.side.toggle();
+            app.ch.hot = Hot::None;
+            refit(app);
+        }
+        Hot::Side(SideHit::Tab(id)) => select_tab(app, page, id),
+        Hot::Side(SideHit::Close(id)) => click(app, page, fonts, Hot::Close(id)),
+        Hot::Side(SideHit::Group(g)) => toggle_group(app, page, g),
+        Hot::Side(SideHit::NewTab) => new_tab(app, page, fonts),
         Hot::Omni | Hot::None => {}
     }
 }
@@ -895,6 +1169,11 @@ fn click(app: &mut App, page: &mut Page, fonts: &mut Fonts, h: Hot) {
 pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Option<u64> {
     let p = input_ev_payload(ev);
     match input_ev_type(ev) {
+        INPUT_EV_KEY_DOWN if app.ch.menu && p as u8 == KEY_ESC => {
+            app.ch.menu = false; // AETHERSIDETABS2 (SR143): Esc closes the menu first
+            app.dirty = true;
+            None
+        }
         INPUT_EV_KEY_DOWN => {
             let c = p as u8;
             // The tab chords and every chord byte (0x80..=0x8D) work from the field too; every other key is the field's while it has the keys.
@@ -938,14 +1217,25 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
         INPUT_EV_WIN_RESIZE => {
             app.ch.pw = (((p >> 16) & 0xffff) as i32).clamp(64, MAX_W);
             app.ch.ph = ((p & 0xffff) as i32).clamp(CHROME_H + 32, MAX_H);
+            app.ch.side.scroll = app.ch.side.scroll.clamp(0, SideStrip::max_scroll(&app.ch.strip, app.ch.ph as u32));
             refit(app);
+            None
+        }
+        // AETHERSIDETABS2 (SR143): the wheel over the side column scrolls the tab list (positive = toward the top).
+        INPUT_EV_WHEEL if app.ch.ptr.0 >= 0 && app.ch.ptr.0 < app.ch.col_w() => {
+            let n = p as u8 as i8 as i32;
+            let ch = &mut app.ch;
+            ch.side.scroll_by(&ch.strip, ch.ph.max(0) as u32, -n * sidetabs::ROW_H as i32);
+            ch.hot = hit(ch, ch.ptr.0, ch.ptr.1);
+            app.dirty = true;
             None
         }
         INPUT_EV_MOUSE_ABS => {
             let (nx, ny) = input_ev_xy(p);
             app.ch.ptr = (nx, ny);
             let z = app.ch.zoom.max(1) as i32;
-            let (lx, ly) = ((nx * 100).div_euclid(z), ((ny - CHROME_H) * 100).div_euclid(z));
+            let (ox, oy) = (app.ch.page_x(), app.ch.page_y()); // AETHERSIDETABS2: the page's origin
+            let (lx, ly) = (((nx - ox) * 100).div_euclid(z), ((ny - oy) * 100).div_euclid(z));
             let held = app.pressed || app.buttons & 4 != 0;
             if app.ch.over() && !held {
                 let h = hit(&app.ch, nx, ny);
@@ -972,6 +1262,13 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
         }
         INPUT_EV_BUTTON => {
             let (m, was) = (p as u8, app.buttons);
+            if m & 1 != 0 && was & 1 == 0 && app.ch.menu && !app.ch.in_menu(app.ch.ptr.0, app.ch.ptr.1) && hit(&app.ch, app.ch.ptr.0, app.ch.ptr.1) != Hot::Menu {
+                // AETHERSIDETABS2 (SR143): a press outside the open menu closes it and is spent.
+                app.buttons = m;
+                app.ch.menu = false;
+                app.dirty = true;
+                return None;
+            }
             if m & 1 != 0 && was & 1 == 0 && app.ch.over() {
                 app.buttons = m;
                 let h = hit(&app.ch, app.ch.ptr.0, app.ch.ptr.1);
@@ -1036,6 +1333,9 @@ struct Skin {
     field_ink: u32,
     field_sel: u32,
     halo: u32,
+    /// AETHERSIDETABS2 (SR143): the side column's selected row — the accent at a sixth over the column (§3.10: a
+    /// quieter selection than Settings', because many tabs are scanned).
+    side_sel: u32,
 }
 
 fn skin() -> Skin {
@@ -1061,6 +1361,7 @@ fn skin() -> Skin {
         field_ink: th.field_ink,
         field_sel: th.field_sel,
         halo: mix(bar, th.focus, 2, 5),
+        side_sel: mix(strip, th.focus, 1, 6),
     }
 }
 
@@ -1140,7 +1441,28 @@ enum Glyph {
     Plus,
     Minus,
     Cross,
+    /// AETHERSIDETABS2 (SR143): reload (an open circle with its arrowhead), the menu (three dots), a disclosure
+    /// chevron pointing down (an expanded group).
+    Reload,
+    Dots,
+    Down,
 }
+
+/// The unit circle every 30 degrees (x right, y down), for the reload glyph's arc — no trigonometry in a no_std face.
+const RING12: [(f32, f32); 12] = [
+    (1.0, 0.0),
+    (0.866, 0.5),
+    (0.5, 0.866),
+    (0.0, 1.0),
+    (-0.5, 0.866),
+    (-0.866, 0.5),
+    (-1.0, 0.0),
+    (-0.866, -0.5),
+    (-0.5, -0.866),
+    (0.0, -1.0),
+    (0.5, -0.866),
+    (0.866, -0.5),
+];
 
 /// Draw `g` centred on (cx, cy).
 fn glyph(cv: &mut Canvas, g: Glyph, cx: f32, cy: f32, c: u32) {
@@ -1163,6 +1485,30 @@ fn glyph(cv: &mut Canvas, g: Glyph, cx: f32, cy: f32, c: u32) {
             let k = CLOSE_ARM;
             seg(cv, cx - k, cy - k, cx + k, cy + k, STROKE, c);
             seg(cv, cx - k, cy + k, cx + k, cy - k, STROKE, c);
+        }
+        Glyph::Reload => {
+            // From the top (-90 deg) clockwise round to -30 deg: ten 30-degree chords, the gap at the upper right,
+            // the arrowhead at the arc's end pointing along it.
+            let r = a + 0.5;
+            let pt = |k: usize| (cx + RING12[k % 12].0 * r, cy + RING12[k % 12].1 * r);
+            for k in 9..19 {
+                let ((x0, y0), (x1, y1)) = (pt(k), pt(k + 1));
+                seg(cv, x0, y0, x1, y1, STROKE, c);
+            }
+            let (ex, ey) = pt(19);
+            // The arc travels up and to the right there; the two barbs lean back from the tip, 45 degrees each side.
+            seg(cv, ex, ey, ex - 2.9, ey + 0.8, STROKE, c);
+            seg(cv, ex, ey, ex + 0.8, ey + 2.9, STROKE, c);
+        }
+        Glyph::Dots => {
+            for k in -1..=1 {
+                let y = cy + k as f32 * (a - 0.5);
+                seg(cv, cx, y, cx, y, STROKE + 1.0, c);
+            }
+        }
+        Glyph::Down => {
+            seg(cv, cx - a / 1.5, cy - a / 3.0, cx, cy + a / 3.0, STROKE, c);
+            seg(cv, cx, cy + a / 3.0, cx + a / 1.5, cy - a / 3.0, STROKE, c);
         }
     }
 }
@@ -1224,24 +1570,193 @@ fn wash(ch: &Chrome, h: Hot, sk: &Skin) -> Option<u32> {
 /// A toolbar control at `r` (x, w) on the bar: no box at rest, a rounded wash on hover / press, its glyph centred and
 /// dimmed when it can do nothing.
 fn control(cv: &mut Canvas, ch: &Chrome, sk: &Skin, r: (i32, i32), h: Hot, enabled: bool, g: Glyph) {
+    let by = ch.bar_y();
     if enabled {
         if let Some(c) = wash(ch, h, sk) {
-            rrect(cv, r.0, BAR_Y, r.1, CTL, CTL_R, c, false);
+            rrect(cv, r.0, by, r.1, CTL, CTL_R, c, false);
         }
     }
-    let (cx, cy) = (r.0 as f32 + r.1 as f32 / 2.0, BAR_Y as f32 + CTL as f32 / 2.0);
+    let (cx, cy) = (r.0 as f32 + r.1 as f32 / 2.0, by as f32 + CTL as f32 / 2.0);
     glyph(cv, g, cx, cy, if enabled { sk.ink } else { sk.dim });
 }
 
-/// Paint the strip and the toolbar into `cv` (the window's width, CHROME_H tall).
+/// AETHERSIDETABS2 (SR143): a tab's favicon tile (`sidetabs::FAVICON_PX` square RGBA) drawn `s` px square at (x, y),
+/// alpha-blended (nearest sample when `s` differs from the tile).
+fn draw_icon(cv: &mut Canvas, x: i32, y: i32, s: i32, tile: &[u8]) {
+    let n = SIDE_TILE;
+    for dy in 0..s {
+        for dx in 0..s {
+            let (px, py) = (x + dx, y + dy);
+            if px < 0 || py < 0 || px >= cv.w || py >= cv.h {
+                continue;
+            }
+            let (sx, sy) = (dx * n / s, dy * n / s);
+            let k = ((sy * n + sx) * 4) as usize;
+            let Some(q) = tile.get(k..k + 4) else { continue };
+            if q[3] == 0 {
+                continue;
+            }
+            let c = (q[0] as u32) << 16 | (q[1] as u32) << 8 | q[2] as u32;
+            let i = (py * cv.w + px) as usize;
+            cv.px[i] = font_core::ui::blend(cv.px[i], c, q[3]);
+        }
+    }
+}
+
+/// The favicon slot for tab `t` at (x, y), `s` px square: its favicon when the face has one, else the letter tile.
+#[allow(clippy::too_many_arguments)]
+fn tab_tile(cv: &mut Canvas, ch: &Chrome, fonts: &Fonts, sk: &Skin, t: &tabs::Tab, on: bool, x: i32, y: i32, s: i32) {
+    if let Some(icon) = ch.icon(t.id) {
+        draw_icon(cv, x, y, s, icon);
+        return;
+    }
+    rrect(cv, x, y, s, s, TILE_R, if on { sk.tile } else { sk.tile_dim }, false);
+    let mut letter = [0u8; 4];
+    let letter: &str = t.initial().encode_utf8(&mut letter);
+    let lw = fonts.0.borrow_mut().measure(letter, FontSel::default(), FONT_SMALL);
+    label_at(cv, fonts, letter, x as f32 + (s as f32 - lw) / 2.0, y, s, sk.bar, x, x + s, FONT_SMALL);
+}
+
+/// AETHERSIDETABS2 (SR143): the side column — `SideStrip::layout`'s rows under the toggle row, the column's width
+/// `Chrome::col_w`, the whole window tall.
+fn paint_side(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
+    let (cw, h) = (ch.col_w(), ch.ph);
+    let rh = sidetabs::ROW_H as i32;
+    let rail = ch.side.collapsed;
+    let active = ch.strip.active();
+    cv.fill(0, 0, cw, h, sk.strip);
+    for r in ch.side.layout(&ch.strip, h.max(0) as u32) {
+        let y = r.y;
+        let (bx, bw) = (4, cw - 8);
+        match r.row {
+            tabs::Row::Tab(id) => {
+                let Some(t) = ch.strip.get(id) else { continue };
+                let on = id == active;
+                let hov = ch.hot == Hot::Side(SideHit::Tab(id)) || ch.hot == Hot::Side(SideHit::Close(id));
+                if on {
+                    rrect(cv, bx, y + 2, bw, rh - 4, CTL_R, sk.side_sel, false);
+                } else if hov {
+                    rrect(cv, bx, y + 2, bw, rh - 4, CTL_R, sk.tab_hover, false);
+                }
+                // A grouped tab's stripe in its group's colour.
+                if let Some(g) = t.group.and_then(|g| ch.strip.group(g)) {
+                    if !rail {
+                        rrect(cv, bx + 2, y + 9, 3, rh - 18, 1, g.color.rgb(), false);
+                    }
+                }
+                let tx = if rail { (cw - SIDE_TILE) / 2 } else { bx + 10 };
+                let ty = y + (rh - SIDE_TILE) / 2;
+                tab_tile(cv, ch, fonts, sk, t, on, tx, ty, SIDE_TILE);
+                if rail {
+                    continue;
+                }
+                let cbox = sidetabs::CLOSE_W as i32;
+                let t0 = tx + SIDE_TILE + TILE_GAP;
+                let t1 = if hov { cw - cbox } else { bx + bw - 6 };
+                if t1 > t0 + 4 {
+                    let s = fit(fonts, t.label(), (t1 - t0) as f32);
+                    label(cv, fonts, &s, t0 as f32, y, rh, if on { sk.ink } else { sk.dim }, t0, t1);
+                }
+                if hov {
+                    let (cx, cy) = (cw - cbox + (cbox - CLOSE) / 2 - 2, y + (rh - CLOSE) / 2);
+                    if ch.hot == Hot::Side(SideHit::Close(id)) {
+                        let c = if ch.pressed == Some(ch.hot) { sk.ctl_press } else { sk.ctl_hover };
+                        rrect(cv, cx, cy, CLOSE, CLOSE, CLOSE / 2, c, false);
+                    }
+                    glyph(cv, Glyph::Cross, cx as f32 + CLOSE as f32 / 2.0, cy as f32 + CLOSE as f32 / 2.0, sk.ink);
+                }
+            }
+            tabs::Row::Group(gid) => {
+                let Some(g) = ch.strip.group(gid) else { continue };
+                if ch.hot == Hot::Side(SideHit::Group(gid)) {
+                    rrect(cv, bx, y + 4, bw, rh - 8, CTL_R, sk.tab_hover, false);
+                }
+                let dx = if rail { (cw - DOT) / 2 } else { bx + 10 + (SIDE_TILE - DOT) / 2 };
+                rrect(cv, dx, y + (rh - DOT) / 2, DOT, DOT, DOT / 2, g.color.rgb(), false);
+                if rail {
+                    continue;
+                }
+                let name = if g.name.trim().is_empty() { g.color.name() } else { g.name.as_str() };
+                let count = alloc::format!("{}", ch.strip.group_tabs(gid).len());
+                let cx = (cw - 8 - CTL / 2) as f32;
+                glyph(cv, if g.collapsed { Glyph::Fwd } else { Glyph::Down }, cx, (y + rh / 2) as f32, sk.dim);
+                let nw = fonts.0.borrow_mut().measure(&count, FontSel::default(), FONT_SMALL);
+                let nx = cx - CTL as f32 / 2.0 - nw;
+                label_at(cv, fonts, &count, nx, y, rh, sk.dim, 0, cw, FONT_SMALL);
+                let t0 = bx + 10 + SIDE_TILE + TILE_GAP;
+                let t1 = nx as i32 - GAP;
+                if t1 > t0 + 4 {
+                    let s = fit(fonts, name, (t1 - t0) as f32);
+                    label(cv, fonts, &s, t0 as f32, y, rh, sk.ink, t0, t1);
+                }
+            }
+            tabs::Row::NewTab => {
+                if ch.hot == Hot::Side(SideHit::NewTab) {
+                    rrect(cv, bx, y + 2, bw, rh - 4, CTL_R, sk.tab_hover, false);
+                }
+                let tx = if rail { (cw - SIDE_TILE) / 2 } else { bx + 10 };
+                glyph(cv, Glyph::Plus, tx as f32 + SIDE_TILE as f32 / 2.0, (y + rh / 2) as f32, sk.dim);
+                if !rail {
+                    let t0 = tx + SIDE_TILE + TILE_GAP;
+                    label(cv, fonts, "New tab", t0 as f32, y, rh, sk.dim, t0, bx + bw);
+                }
+            }
+        }
+    }
+    // The toggle row, over whatever scrolled under it: collapse (open) or expand (rail).
+    cv.fill(0, 0, cw, rh, sk.strip);
+    let tw = CTL;
+    let tx = if rail { (cw - tw) / 2 } else { cw - EDGE - tw };
+    let ty = (rh - CTL) / 2;
+    if let Some(c) = wash(ch, Hot::Side(SideHit::Toggle), sk) {
+        rrect(cv, tx, ty, tw, CTL, CTL_R, c, false);
+    }
+    glyph(cv, if rail { Glyph::Fwd } else { Glyph::Back }, tx as f32 + tw as f32 / 2.0, ty as f32 + CTL as f32 / 2.0, sk.dim);
+    cv.fill(cw - 1, 0, 1, h, sk.rule);
+}
+
+/// AETHERSIDETABS2 (SR143): the open menu — a rounded card under the menu button, one row per `MENU` entry (its
+/// chord dimmed at the right), the hovered row washed.
+fn paint_menu(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
+    if !ch.menu {
+        return;
+    }
+    let (mx, my, mw, mh) = ch.menu_rect();
+    rrect(cv, mx - 1, my - 1, mw + 2, mh + 2, MENU_R + 1, sk.field_line, false);
+    rrect(cv, mx, my, mw, mh, MENU_R, sk.bar, false);
+    for (i, (name, key)) in MENU.iter().enumerate() {
+        let ry = my + MENU_PAD + i as i32 * MENU_ROW;
+        if ch.hot == Hot::MenuItem(i) {
+            rrect(cv, mx + MENU_PAD, ry, mw - 2 * MENU_PAD, MENU_ROW, CTL_R, sk.ctl_hover, false);
+        }
+        let x1 = mx + mw - 2 * MENU_PAD;
+        let mut t1 = x1;
+        if !key.is_empty() {
+            let kw = fonts.0.borrow_mut().measure(key, FontSel::default(), FONT_SMALL);
+            let kx = x1 as f32 - kw;
+            label_at(cv, fonts, key, kx, ry, MENU_ROW, sk.dim, mx, x1, FONT_SMALL);
+            t1 = kx as i32 - GAP;
+        }
+        let t0 = mx + 3 * MENU_PAD;
+        label(cv, fonts, name, t0 as f32, ry, MENU_ROW, sk.ink, t0, t1);
+    }
+}
+
+/// Paint the header into `cv` (the whole window): in the top layout the strip and the toolbar across the top, in the
+/// side layout the column down the left and the toolbar over the page; then the open menu over everything.
 fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
     let ch = &app.ch;
     let sk = skin();
     let g = geo(ch);
-    cv.fill(0, 0, cv.w, TAB_H, sk.strip);
-    cv.fill(0, TAB_H, cv.w, BAR_H, sk.bar);
-    // The hairline under the strip; the active tab is painted over it below, so it joins the toolbar seamlessly.
-    cv.fill(0, TAB_H - 1, cv.w, 1, sk.rule);
+    let (x0, bt, by) = (ch.page_x(), ch.bar_top(), ch.bar_y());
+    if ch.is_side() {
+        paint_side(ch, cv, fonts, &sk);
+    } else {
+        cv.fill(0, 0, cv.w, TAB_H, sk.strip);
+        // The hairline under the strip; the active tab is painted over it below, so it joins the toolbar seamlessly.
+        cv.fill(0, TAB_H - 1, cv.w, 1, sk.rule);
+    }
+    cv.fill(x0, bt, cv.w - x0, BAR_H, sk.bar);
     let active = ch.strip.active();
     let lit = |id: u64| id == active || ch.hot == Hot::Tab(id) || ch.hot == Hot::Close(id);
     let body_h = TAB_H - TAB_TOP;
@@ -1259,14 +1774,14 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
             }
         }
         let tab = &ch.strip.tabs()[i];
-        // The favicon slot: the letter tile, vertically centred with the title.
+        // AETHERSIDETABS2: a grouped tab's run carries its group's colour along the strip's foot.
+        if let Some(gr) = tab.group.and_then(|g| ch.strip.group(g)) {
+            cv.fill(tx + 2, TAB_H - 3, tw - 4, 2, gr.color.rgb());
+        }
+        // The favicon slot (the favicon, else the letter tile), vertically centred with the title.
         let ty = TAB_TOP + (body_h - TILE) / 2;
         let tile_x = tx + TAB_PAD;
-        rrect(cv, tile_x, ty, TILE, TILE, TILE_R, if on { sk.tile } else { sk.tile_dim }, false);
-        let mut letter = [0u8; 4];
-        let letter: &str = tab.initial().encode_utf8(&mut letter);
-        let lw = fonts.0.borrow_mut().measure(letter, FontSel::default(), FONT_SMALL);
-        label_at(cv, fonts, letter, tile_x as f32 + (TILE as f32 - lw) / 2.0, ty, TILE, sk.bar, tile_x, tile_x + TILE, FONT_SMALL);
+        tab_tile(cv, ch, fonts, &sk, tab, on, tile_x, ty, TILE);
         // The title, then the close affordance while the tab is hovered.
         let show_close = ch.hot == Hot::Tab(id) || ch.hot == Hot::Close(id);
         let t0 = tile_x + TILE + TILE_GAP;
@@ -1285,34 +1800,46 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
             glyph(cv, Glyph::Cross, cx as f32 + CLOSE as f32 / 2.0, cy as f32 + CLOSE as f32 / 2.0, if on { sk.ink } else { sk.dim });
         }
     }
-    // `+`: a new tab, a quiet glyph with a wash on hover.
-    if let Some(c) = wash(ch, Hot::NewTab, &sk) {
-        rrect(cv, g.plus.0, TAB_TOP, g.plus.1, body_h - 1, CTL_R, c, false);
+    if !ch.is_side() {
+        // `+`: a new tab, a quiet glyph with a wash on hover.
+        if let Some(c) = wash(ch, Hot::NewTab, &sk) {
+            rrect(cv, g.plus.0, TAB_TOP, g.plus.1, body_h - 1, CTL_R, c, false);
+        }
+        glyph(cv, Glyph::Plus, g.plus.0 as f32 + g.plus.1 as f32 / 2.0, TAB_TOP as f32 + body_h as f32 / 2.0, sk.dim);
     }
-    glyph(cv, Glyph::Plus, g.plus.0 as f32 + g.plus.1 as f32 / 2.0, TAB_TOP as f32 + body_h as f32 / 2.0, sk.dim);
     // The toolbar.
     control(cv, ch, &sk, g.back, Hot::Back, app.hist.can_go(-1), Glyph::Back);
     control(cv, ch, &sk, g.fwd, Hot::Fwd, app.hist.can_go(1), Glyph::Fwd);
-    control(cv, ch, &sk, g.zout, Hot::ZoomOut, ch.zoom > zoom::LEVELS[0], Glyph::Minus);
-    control(cv, ch, &sk, g.zin, Hot::ZoomIn, ch.zoom < zoom::LEVELS[zoom::LEVELS.len() - 1], Glyph::Plus);
+    control(cv, ch, &sk, g.reload, Hot::Reload, true, Glyph::Reload);
+    if let Some(r) = g.zout {
+        control(cv, ch, &sk, r, Hot::ZoomOut, ch.zoom > zoom::LEVELS[0], Glyph::Minus);
+    }
+    if let Some(r) = g.zin {
+        control(cv, ch, &sk, r, Hot::ZoomIn, ch.zoom < zoom::LEVELS[zoom::LEVELS.len() - 1], Glyph::Plus);
+    }
+    // The menu button: washed while its menu is open.
+    if ch.menu {
+        rrect(cv, g.menu.0, by, g.menu.1, CTL, CTL_R, sk.ctl_press, false);
+    }
+    control(cv, ch, &sk, g.menu, Hot::Menu, true, Glyph::Dots);
     // The bookmark star: the font's own star (a filled one in the accent when the page is bookmarked).
-    {
+    if let Some(star) = g.star {
         let on = !ch.url.is_empty() && ch.bookmarks.contains(&ch.url);
         let enabled = !ch.url.is_empty();
         if enabled {
             if let Some(c) = wash(ch, Hot::Star, &sk) {
-                rrect(cv, g.star.0, BAR_Y, g.star.1, CTL, CTL_R, c, false);
+                rrect(cv, star.0, by, star.1, CTL, CTL_R, c, false);
             }
         }
         let s = if on { "\u{2605}" } else { "\u{2606}" };
         let gw = fonts.0.borrow_mut().measure(s, FontSel::default(), FONT);
         let ink = if on { sk.accent } else if enabled { sk.ink } else { sk.dim };
-        label(cv, fonts, s, g.star.0 as f32 + (g.star.1 as f32 - gw) / 2.0, BAR_Y, CTL, ink, g.star.0, g.star.0 + g.star.1);
+        label(cv, fonts, s, star.0 as f32 + (star.1 as f32 - gw) / 2.0, by, CTL, ink, star.0, star.0 + star.1);
     }
     // The address field: one rounded field with a quiet border; focused, the border turns the accent inside a soft
     // halo.
     let (fx, fw) = g.omni;
-    let (ft, fh) = (BAR_Y, CTL);
+    let (ft, fh) = (by, CTL);
     let focused = ch.omni.is_some();
     if focused {
         rrect(cv, fx - RING, ft - RING, fw + 2 * RING, fh + 2 * RING, FIELD_R + RING, sk.halo, false);
@@ -1369,40 +1896,34 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
         }
     }
     // The hairline between the header and the page.
-    cv.fill(0, CHROME_H - 1, cv.w, 1, sk.rule);
+    cv.fill(x0, ch.page_y() - 1, cv.w - x0, 1, sk.rule);
+    paint_menu(ch, cv, fonts, &sk);
 }
 
-/// One frame onto the surface: the chrome on top, the page canvas (logical px) scaled onto the rest — a straight
-/// copy at 100 %, bilinear otherwise — then SYS_WIN_PRESENT.
+/// One frame onto the surface: the page canvas (logical px) scaled into the page's rectangle — right of the side
+/// column and under the toolbar, or under the whole header (`Chrome::page_x` / `page_y`) — a straight copy at 100 %,
+/// bilinear otherwise; the header painted over the rest (and the open menu over the page); then SYS_WIN_PRESENT.
 pub fn blit(app: &App, cv: &Canvas, fonts: &Fonts) {
     let (pw, ph) = (app.ch.pw.min(MAX_W), app.ch.ph.min(MAX_H));
-    let mut top = Canvas::new(pw, CHROME_H);
-    paint_chrome(app, &mut top, fonts);
-    let put = |x: i32, y: i32, c: u32| {
-        let row = unsafe { app.surf.add(y as usize * crate::STRIDE) as *mut u32 };
-        unsafe { row.add(x as usize).write_volatile(0xFF00_0000 | c) };
-    };
-    for y in 0..CHROME_H.min(ph) {
-        for x in 0..pw {
-            put(x, y, top.px[(y * pw + x) as usize]);
-        }
-    }
-    let dh = ph - CHROME_H;
-    if dh > 0 && cv.w > 0 && cv.h > 0 {
-        if cv.w == pw && cv.h == dh {
+    let mut ui = Canvas::new(pw, ph);
+    let (ox, oy) = (app.ch.page_x().clamp(0, pw), app.ch.page_y().clamp(0, ph));
+    let (dw, dh) = (pw - ox, ph - oy);
+    if dw > 0 && dh > 0 && cv.w > 0 && cv.h > 0 {
+        let mut put = |x: i32, y: i32, c: u32| ui.px[((oy + y) * pw + ox + x) as usize] = c;
+        if cv.w == dw && cv.h == dh {
             for y in 0..dh {
-                for x in 0..pw {
-                    put(x, CHROME_H + y, cv.px[(y * cv.w + x) as usize]);
+                for x in 0..dw {
+                    put(x, y, cv.px[(y * cv.w + x) as usize]);
                 }
             }
         } else {
             // 16.16 fixed point: the source sample centred under each window pixel.
             let sx = |x: i32| -> (i32, i32, u32) {
-                let f = (((2 * x + 1) as i64 * cv.w as i64 * 65536) / (2 * pw as i64) - 32768).max(0);
+                let f = (((2 * x + 1) as i64 * cv.w as i64 * 65536) / (2 * dw as i64) - 32768).max(0);
                 let x0 = ((f >> 16) as i32).min(cv.w - 1);
                 (x0, (x0 + 1).min(cv.w - 1), ((f >> 8) & 0xFF) as u32)
             };
-            let xs: Vec<(i32, i32, u32)> = (0..pw).map(sx).collect();
+            let xs: Vec<(i32, i32, u32)> = (0..dw).map(sx).collect();
             for y in 0..dh {
                 let f = (((2 * y + 1) as i64 * cv.h as i64 * 65536) / (2 * dh as i64) - 32768).max(0);
                 let y0 = ((f >> 16) as i32).min(cv.h - 1);
@@ -1421,9 +1942,16 @@ pub fn blit(app: &App, cv: &Canvas, fonts: &Fonts) {
                         out |= v.min(255) << s;
                         s += 8;
                     }
-                    put(x as i32, CHROME_H + y, out);
+                    put(x as i32, y, out);
                 }
             }
+        }
+    }
+    paint_chrome(app, &mut ui, fonts);
+    for y in 0..ph {
+        let row = unsafe { app.surf.add(y as usize * crate::STRIDE) as *mut u32 };
+        for x in 0..pw {
+            unsafe { row.add(x as usize).write_volatile(0xFF00_0000 | ui.px[(y * pw + x) as usize]) };
         }
     }
     sys(una_abi::SYS_WIN_PRESENT, app.win as u64, 0, 0, 0);

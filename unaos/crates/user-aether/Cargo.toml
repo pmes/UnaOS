@@ -54,6 +54,10 @@ psl_core = { path = "../../libs/net/psl_core" }
 # UNA.ELF link. The chrome's MODEL is not a dependency: handlers/aether/src/chrome/*.rs (std-free) are linked by
 # `#[path]` from src/chrome.rs, because the crate around them is std.
 edit_core = { path = "../../libs/text/edit_core" }
+# AETHERSIDETABS2 (SR143): the tab's FAVICON — pixel_core (PIXELCORE SR25: no_std + alloc, forbid(unsafe), no default
+# features; the SAME core the kernel's video/png.rs links and http_core already pulls in for its inflater, so no new
+# code family enters the ELF) decodes the page's `<link rel=icon>` (PNG/JPEG/GIF/BMP/QOI/WebP) for the strip's tile.
+pixel_core = { path = "../../libs/media/pixel_core" }
 
 # AETHERNET (SR110): `cryptocore` is the product crypto provider under tls_core (Lumen's line). It is ON BY DEFAULT here
 # because arroyo's build_user_aether_x86 / _aarch64 pass no --features (Lumen's builds pass `--features cryptocore`):

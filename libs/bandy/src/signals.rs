@@ -204,6 +204,30 @@ pub enum SMessage {
     BrowserTabSelect(u64),
     /// Chrome → shell: switch `n` tabs right (negative: left), wrapping (Ctrl+Tab / Ctrl+Shift+Tab).
     BrowserTabStep(i32),
+    // AETHERSIDETABS2 (SR143): the many-tabs verbs — the drag and the tab groups. The model is
+    // `aether::chrome::tabs::TabStrip` (move_to, group_*); `aether::chrome::apply_tab_verb` applies these.
+    /// Chrome → shell: the drag — move tab `id` to strip index `to` (counted after it is taken out; clamped).
+    /// Dropped between two tabs of a group it joins that group; dragged clear of its own it leaves it.
+    BrowserTabMove { id: u64, to: u32 },
+    /// Chrome → shell: a new group named `name` holding `tabs`, in `color` (a `GroupColor` name such as
+    /// `blue`; `None`: the first colour no group uses).
+    BrowserTabGroupNew { tabs: Vec<u64>, name: String, color: Option<String> },
+    /// Chrome → shell: put tab `id` at the end of group `group` (a drop on the group's header).
+    BrowserTabGroupAdd { id: u64, group: u64 },
+    /// Chrome → shell: take tab `id` out of its group (it lands just past the group's run).
+    BrowserTabUngroup(u64),
+    /// Chrome → shell: collapse or expand group `id` (a click on its header or its chip).
+    BrowserTabGroupToggle(u64),
+    /// Chrome → shell: rename group `group`.
+    BrowserTabGroupRename { group: u64, name: String },
+    /// Chrome → shell: recolour group `group` (`None`: the next colour after its current one).
+    BrowserTabGroupRecolor { group: u64, color: Option<String> },
+    /// Chrome → shell: dissolve group `id`; its tabs stay where they are, ungrouped.
+    BrowserTabGroupDissolve(u64),
+    /// Engine → chrome: tab `id`'s favicon as a `size` x `size` tightly packed 8-bit RGBA tile (top row first),
+    /// for the strip (every tab's, active or not); an empty `rgba` clears it (the letter tile shows again). At
+    /// most one fetch per page load; the full-size active icon stays [`SMessage::BrowserFaviconChanged`].
+    BrowserTabFavicon { id: u64, size: u32, rgba: Vec<u8> },
     /// Chrome → engine: zoom one step in (`1`), out (`-1`), or back to 100 % (`0`).
     BrowserZoom(i32),
     /// Chrome → engine: find `query` in the page; a repeat of the same query steps to the next
@@ -215,8 +239,9 @@ pub enum SMessage {
     BrowserBookmarkToggle,
     /// Chrome → engine: describe the active page (the page-info popover opened).
     BrowserPageInfoAsk,
-    /// Shell → chrome: the tab strip — `(id, title, loading)` in strip order, and the active id.
-    BrowserTabs { active: u64, tabs: Vec<(u64, String, bool)> },
+    /// Shell → chrome: the tab strip — its rows in strip order, its groups, and the active id
+    /// (AETHERSIDETABS2, SR143: the row carries the URL, the group and the letter tile's seed).
+    BrowserTabs { active: u64, tabs: Vec<BrowserTabRow>, groups: Vec<BrowserTabGroupRow> },
     /// Engine → chrome: what the toolbar shows for the active tab.
     BrowserNavState { can_back: bool, can_forward: bool, loading: bool, zoom_pct: u32 },
     /// Engine → chrome: `matches` hits for `query`; `current` is the 1-based active one (0 = none).
@@ -797,6 +822,32 @@ impl Default for FacetView {
     fn default() -> Self {
         FacetView { zoom: FacetZoom::Fit, pan_x: 0, pan_y: 0, quarter_turns: 0, flip_h: false, flip_v: false }
     }
+}
+
+/// AETHERSIDETABS2 (SR143): one tab of [`SMessage::BrowserTabs`], in strip order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabRow {
+    pub id: u64,
+    /// What the strip shows: the title, else the URL, else `New Tab`.
+    pub label: String,
+    pub url: String,
+    pub loading: bool,
+    /// The group the tab sits in (an id of [`BrowserTabGroupRow`]); `None` ungrouped.
+    pub group: Option<u64>,
+    /// The letter tile's letter when there is no favicon (`aether::chrome::tabs::Tab::initial`).
+    pub initial: String,
+}
+
+/// AETHERSIDETABS2 (SR143): one tab group of [`SMessage::BrowserTabs`]; its tabs are contiguous in the strip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabGroupRow {
+    pub id: u64,
+    pub name: String,
+    /// The colour's name (`grey`, `blue`, … `orange`) and its swatch as `0xRRGGBB`.
+    pub color: String,
+    pub rgb: u32,
+    /// Collapsed: the side strip shows only the header, the top strip only the chip.
+    pub collapsed: bool,
 }
 
 /// What Facet knows about an open image.

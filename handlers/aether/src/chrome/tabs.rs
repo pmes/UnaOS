@@ -90,6 +90,12 @@ impl GroupColor {
     pub fn parse(s: &str) -> Option<GroupColor> {
         GroupColor::ALL.into_iter().find(|c| c.name().eq_ignore_ascii_case(s.trim()))
     }
+
+    /// The colour after this one in the picker's order, wrapping (AETHERSIDETABS2: a face's "next colour").
+    pub fn next(self) -> GroupColor {
+        let i = GroupColor::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        GroupColor::ALL[(i + 1) % GroupColor::ALL.len()]
+    }
 }
 
 /// A named, coloured group of contiguous tabs.
@@ -380,6 +386,15 @@ impl TabStrip {
         self.tabs.insert(end, t);
         self.prune_groups();
         true
+    }
+
+    /// The colour a new group gets when the face names none: the first in the picker's order that no group uses,
+    /// else the one after the newest group's (AETHERSIDETABS2, SR143).
+    pub fn next_color(&self) -> GroupColor {
+        GroupColor::ALL
+            .into_iter()
+            .find(|c| !self.groups.iter().any(|g| g.color == *c))
+            .unwrap_or_else(|| self.groups.last().map(|g| g.color.next()).unwrap_or(GroupColor::Grey))
     }
 
     /// Take tab `id` out of its group (it moves just past the group's run, so the run stays whole).

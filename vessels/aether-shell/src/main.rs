@@ -657,12 +657,21 @@ impl Tab {
         }
         // The favicon is chrome decoration: the fetch is detached onto the LocalSet, never awaited;
         // a failure is simply no icon.
+        // AETHERSIDETABS2 (SR143): the strip's per-tab tile rides the same one fetch (staged once per page load,
+        // and only when the icon's URL changed): a new URL clears the tab's tile at once, so a failed fetch shows
+        // the letter tile rather than the last site's icon; the decoded icon is scaled to the 16 px tile by the
+        // model (`sidetabs::favicon_tile`) and fired for every tab, active or not.
         if let Some(fav) = self.pending_favicon.take() {
             if self.last_favicon.as_deref() != Some(fav.as_str()) {
                 self.last_favicon = Some(fav.clone());
+                *self.favicon.borrow_mut() = None;
+                self.bus.fire(SMessage::BrowserTabFavicon { id: self.id, size: 0, rgba: Vec::new() });
                 let (bus, active, id, slot) = (self.bus.clone(), self.active.clone(), self.id, self.favicon.clone());
                 tokio::task::spawn_local(async move {
                     if let Some((width, height, rgba)) = aether::net::fetch_favicon(&fav).await {
+                        if let Some(tile) = chrome::sidetabs::favicon_tile(width, height, &rgba) {
+                            bus.fire(SMessage::BrowserTabFavicon { id, size: chrome::sidetabs::FAVICON_PX, rgba: tile });
+                        }
                         *slot.borrow_mut() = Some((width, height, rgba.clone()));
                         if active.load(Ordering::Relaxed) == id {
                             bus.fire(SMessage::BrowserFaviconChanged { width, height, rgba });
@@ -774,7 +783,7 @@ impl Coordinator {
     }
 
     fn publish_tabs(&self) {
-        self.bus.fire(SMessage::BrowserTabs { active: self.strip.active(), tabs: self.strip.snapshot() });
+        self.bus.fire(chrome::tabs_message(&self.strip)); // AETHERSIDETABS2 (SR143): rows with URL, group, letter tile
     }
 
     fn publish_bookmarks(&self) {
@@ -801,6 +810,26 @@ impl Coordinator {
                 if let Some(id) = self.strip.step(n) {
                     if id != before {
                         self.activate(id);
+                    }
+                }
+            }
+            // AETHERSIDETABS2 (SR143): the drag and the group verbs, applied by the model; a collapse that moved
+            // the active tab out of its group activates the new one.
+            SMessage::BrowserTabMove { .. }
+            | SMessage::BrowserTabGroupNew { .. }
+            | SMessage::BrowserTabGroupAdd { .. }
+            | SMessage::BrowserTabUngroup(_)
+            | SMessage::BrowserTabGroupToggle(_)
+            | SMessage::BrowserTabGroupRename { .. }
+            | SMessage::BrowserTabGroupRecolor { .. }
+            | SMessage::BrowserTabGroupDissolve(_) => {
+                let before = self.strip.active();
+                if chrome::apply_tab_verb(&mut self.strip, &m) == Some(true) {
+                    let now = self.strip.active();
+                    if now != before {
+                        self.activate(now);
+                    } else {
+                        self.publish_tabs();
                     }
                 }
             }

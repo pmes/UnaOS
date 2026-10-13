@@ -129,6 +129,7 @@ dependencies = [
  "http_core",
  "layout_core",
  "palette_core",
+ "pixel_core",
  "psl_core",
  "una-abi",
  "vein_core",

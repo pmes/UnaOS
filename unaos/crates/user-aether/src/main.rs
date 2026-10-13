@@ -71,6 +71,11 @@
 // page's LOGICAL size; `App::hist` is the tab's `SessionHistory`; `load` asks the chrome for the new-tab page and
 // tells it what loaded; a link to a file Aether does not render is a download; the frame goes up through
 // `chrome::blit` (the chrome on top, the page scaled under it).
+//
+// AETHERSIDETABS2 (LEDGER SR143): the page's ORIGIN is the chrome's (`Chrome::page_x`/`page_y`: (0, CHROME_H) with the
+// tabs on top, (the side column's width, BAR_H) with them on the side); the frame loop hands `chrome::prefs` what
+// `theme::due` saw (a PrefChanged under `aether.tabs.` re-reads `aether.tabs.layout`), so the switch is live. `load`
+// fetches the page's icon once (`favicon`, pixel_core) for the tab's favicon tile.
 
 extern crate alloc;
 
@@ -498,6 +503,56 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
     l.wire();
     app.flash(if read { page.path.clone() } else { alloc::format!("not found: {}", path) });
     chrome::loaded(app, page, read);
+    if read && page.path != chrome::NEWTAB {
+        favicon(app, page); // AETHERSIDETABS2 (SR143): the tab's favicon tile, one fetch per page load
+    }
+}
+
+/// AETHERSIDETABS2 (SR143): the page's icon — the first `<link>` whose `rel` names an icon (`icon`, `shortcut icon`,
+/// `apple-touch-icon[-precomposed]`; `data:` skipped), else `/favicon.ico` on a network page's origin (the host
+/// engine's `net::favicon_url` rule) — fetched ONCE through `fetch` (the volume or AETHERNET), decoded by pixel_core
+/// (the still-image core http_core already links: PNG, JPEG, GIF, BMP, QOI, WebP; an ICO is refused, no icon), and
+/// handed to the chrome as `sidetabs::favicon_tile`'s 16 px tile for the active tab — or `None`, the letter tile.
+/// Wire: `:: AETHER: favicon -> PASS w=<w> h=<h> src=<url> ::` / `FAIL reason=<none|fetch|decode> ::`.
+fn favicon(app: &mut App, page: &Page) {
+    const RELS: [&str; 4] = ["icon", "shortcut", "apple-touch-icon", "apple-touch-icon-precomposed"];
+    let doc = page.doc;
+    let declared = doc.descendants(html_core::Document::ROOT).find_map(|n| {
+        let e = doc.element(n).filter(|e| e.is_html("link"))?;
+        let rel = e.attr("rel")?;
+        if !rel.split_ascii_whitespace().any(|w| RELS.iter().any(|k| w.eq_ignore_ascii_case(k))) {
+            return None;
+        }
+        let href = e.attr("href")?.trim();
+        (!href.is_empty() && !href.starts_with("data:")).then(|| String::from(href))
+    });
+    let href = declared.or_else(|| net::is_net(&page.path).then(|| String::from("/favicon.ico")));
+    let id = app.ch.strip.active();
+    let mut l = Line::new(b":: AETHER: favicon -> ");
+    let Some(src) = href.and_then(|h| resolve(&page.path, &h).ok()).map(|(p, _)| p) else {
+        app.ch.set_icon(id, None);
+        l.put(b"FAIL reason=none ::").wire();
+        return;
+    };
+    let tile = match fetch(&src) {
+        Err(_) => Err(b"fetch" as &[u8]),
+        Ok((bytes, _)) => pixel_core::decode(&bytes)
+            .ok()
+            .and_then(|i| chrome::sidetabs::favicon_tile(i.width, i.height, &i.rgba).map(|t| (i.width, i.height, t)))
+            .ok_or(b"decode" as &[u8]),
+    };
+    match tile {
+        Ok((w, h, t)) => {
+            app.ch.set_icon(id, Some(t));
+            l.put(b"PASS w=").dec(w as i64).put(b" h=").dec(h as i64).put(b" src=").put(cut(src.as_bytes(), 72)).put(b" ::");
+        }
+        Err(why) => {
+            app.ch.set_icon(id, None);
+            l.put(b"FAIL reason=").put(why).put(b" src=").put(cut(src.as_bytes(), 72)).put(b" ::");
+        }
+    }
+    l.wire();
+    app.dirty = true;
 }
 
 /// Follow `href` from the current page.
@@ -951,7 +1006,9 @@ pub extern "C" fn _start() -> ! {
             app.flash = None;
             app.dirty = true;
         }
-        if theme::due(now_ms()) && theme::load() {
+        let moved = theme::due(now_ms());
+        chrome::prefs(&mut app, moved); // AETHERSIDETABS2 (SR143): `aether.tabs.layout` — the tabs' side, live
+        if moved && theme::load() {
             app.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
             theme_wire();
         }
