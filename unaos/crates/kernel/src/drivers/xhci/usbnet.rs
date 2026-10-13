@@ -1062,7 +1062,7 @@ pub fn link_seen(now_ms: u64, physr: Option<u16>, plsr: u8) -> Option<u16> {
         if p & PHYSR_FULL != 0 { m |= MEDIUM_FULL; }
         SPEED_MBPS.store(mbps, Ordering::Relaxed);
         LINK.store(true, Ordering::Relaxed); if ARMED.load(Ordering::Relaxed) { NF_ARM_AT.store(now_ms.max(1), Ordering::Relaxed); } // USBNET8: a TD armed before the PHY had link has waited on nothing; its stall clock starts at link-up (flight 23's first kick was the bring-up TD at link-up)
-        serial_println!("[usbnet] link up speed={}M duplex={} physr={:#06x} usb_plsr={:#04x} medium={:#06x}", mbps, if p & PHYSR_FULL != 0 { "full" } else { "half" }, p, plsr, m);
+        serial_println!("[usbnet] link up speed={}M duplex={} physr={:#06x} usb_plsr={:#04x} medium={:#06x}", mbps, if p & PHYSR_FULL != 0 { "full" } else { "half" }, p, plsr, m); ud_link_up(now_ms); // DHCPREPLUG (B632): a link-up restarts the link's DHCP client (fresh xid, back-off 4 s, the DISCOVER inside 1 s)
         medium = Some(m);
     } else if !up && was {
         LINK.store(false, Ordering::Relaxed);
@@ -2209,6 +2209,7 @@ fn ud_reset() {
     UD_PSTATE.store(UP_NONE, Ordering::Relaxed);
     UD_PTRIES.store(0, Ordering::Relaxed);
     ud_probe_reset(); // USBNETRX (B545)
+    UD_ACQ_T0.store(0, Ordering::Relaxed); UD_XID_NEXT.store(0, Ordering::Relaxed); UD_BIG.store(UB_NONE, Ordering::Relaxed); // DHCPREPLUG (B632)
 }
 
 /// Every data pass: with the PHY up, the client's next step when it is due; once bound, the ping's.
@@ -2216,6 +2217,7 @@ fn ud_tick() {
     if !is_up() || (kind() == KIND_AX88179 && !link_up()) { return; }
     let now = crate::arch::ms().max(1);
     ud_probe_tick(now); // USBNETRX (B545): the link-up ARP probe whose reply is unicast to our MAC
+    ud_big_tick(now); // DHCPREPLUG (B632): after the probe's unicast answer, the same who-has padded to the DISCOVER's 342 bytes
     let state = UD_STATE.load(Ordering::Relaxed);
     if state == UD_BOUND { ud_ping_tick(now); return; }
     let next = UD_NEXT.load(Ordering::Relaxed);
@@ -2227,29 +2229,42 @@ fn ud_tick() {
     let retx = UD_RETX.load(Ordering::Relaxed).max(UD_RETX_MIN_MS).min(UD_RETX_MAX_MS);
     UD_RETX.store((retx * 2).min(UD_RETX_MAX_MS), Ordering::Relaxed);
     UD_NEXT.store(now + retx, Ordering::Relaxed);
-    ud_discover();
+    ud_discover(now, retx);
 }
 
 /// A padded broadcast DISCOVER under a fresh xid onto TXQ. `[dhcp] discover n= xid= len= retx_ms=` the first
-/// two and every power of two (the u9 dump prints its bytes when the pass issues it: `flags=8000 len=342`).
-fn ud_discover() {
+/// two, every power of two, and the first after a link-up restart (the u9 dump prints its bytes when the pass issues
+/// it: `flags=8000 len=342`). DHCPREPLUG (B632): `retx_ms` is the interval this DISCOVER waits before the next — the
+/// B538 line printed half the stored next value, so at the 32 s cap it read 16000 (flight 34); `secs` counts from
+/// this acquisition's first DISCOVER (RFC 2131 §4.4.1); the full option set (61, 12, 55) via `discover_rfc`; the
+/// first DISCOVER of the boot is decoded once as `[dhcp] tx-audit`.
+fn ud_discover(now: u64, retx: u64) {
     let m = mac();
-    let xid = (crate::arch::now_cycles() as u32) ^ u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+    let pre = UD_XID_NEXT.swap(0, Ordering::Relaxed);
+    let xid = if pre != 0 { pre } else { (crate::arch::now_cycles() as u32) ^ u32::from_be_bytes([m[2], m[3], m[4], m[5]]) };
+    let _ = UD_ACQ_T0.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+    let secs = (now.saturating_sub(UD_ACQ_T0.load(Ordering::Relaxed)) / 1000).min(0xffff) as u16;
     let mut out = [0u8; 400];
     let n = {
         let _m = crate::arch::IrqMask::new();
         let mut g = UD_CLIENT.lock();
         let c = g.get_or_insert_with(|| DhcpClient::new(m, xid));
-        c.discover_min(xid, &mut out)
+        c.discover_rfc(xid, secs, &mut out)
     };
     let Some(n) = n else { return };
     UD_STATE.store(UD_DISCOVERING, Ordering::Relaxed);
+    UD_T_DISC.store(now, Ordering::Relaxed);
+    UD_LAST_RETX.store(retx, Ordering::Relaxed);
     let k = UD_DISCOVERS.fetch_add(1, Ordering::Relaxed) + 1;
     let pushed = ud_push(&out[..n]);
-    if k <= 2 || k.is_power_of_two() || !pushed {
-        serial_println!("[dhcp] discover n={} xid={:08x} len={} client=net retx_ms={} q={}", k, xid, n,
-            UD_RETX.load(Ordering::Relaxed) / 2, if pushed { "ok" } else { "full" });
+    let restart = UD_RESTART_SHOW.swap(false, Ordering::Relaxed);
+    if k <= 2 || k.is_power_of_two() || !pushed || restart {
+        let ra = UD_RESTART_AT.load(Ordering::Relaxed);
+        serial_println!("[dhcp] discover n={} xid={:08x} len={} secs={} client=net retx_ms={} q={}{}", k, xid, n, secs,
+            retx, if pushed { "ok" } else { "full" }, if restart { alloc::format!(" after_link_up_ms={}", now.saturating_sub(ra)) } else { alloc::string::String::new() });
+        ud_filter_line("discover");
     }
+    if !UD_AUDITED.swap(true, Ordering::Relaxed) { ud_tx_audit(&out[..n]); }
 }
 
 /// The counts line: every frame class since boot.
@@ -2330,6 +2345,9 @@ fn ud_tap(f: &[u8], queued: bool) {
     } else if n.is_power_of_two() {
         ud_counts_line(n);
     }
+    if let (0x0800, Some(17), Some((sp, dp))) = (et, proto, ports) {
+        if sp == 67 || sp == 68 || dp == 67 || dp == 68 { ud_heard(f, dst); } // DHCPREPLUG (B632): every UDP 67/68 frame we hear, anyone's
+    }
     if et == 0x0800 {
         if let Some((sp, dp)) = ports {
             if proto == Some(17) && sp == 67 {
@@ -2342,6 +2360,7 @@ fn ud_tap(f: &[u8], queued: bool) {
     } else if et == 0x0806 && f.len() >= 42 {
         ud_probe_rx(f, arp_op.unwrap_or(0), dst); // USBNETRX (B545): the probe's answer, with the class it arrived as
         ud_arp_rx(f, arp_op.unwrap_or(0));
+        ud_big_rx(f, arp_op.unwrap_or(0), dst); // DHCPREPLUG (B632)
     }
 }
 
@@ -2352,7 +2371,10 @@ fn ud_dhcp_rx(f: &[u8]) {
     let (h, ours) = {
         let _m = crate::arch::IrqMask::new();
         let mut g = UD_CLIENT.lock();
-        match g.as_mut() { Some(c) => (c.handle(&l, &mut out), c.xid()), None => (Handled::Ignored, 0) }
+        let now = crate::arch::ms().max(1);
+        let t0 = UD_ACQ_T0.load(Ordering::Relaxed);
+        let secs = if t0 == 0 { 0 } else { (now.saturating_sub(t0) / 1000).min(0xffff) as u16 };
+        match g.as_mut() { Some(c) => (c.handle_rfc(&l, secs, &mut out), c.xid()), None => (Handled::Ignored, 0) } // DHCPREPLUG (B632): the REQUEST carries 61/12/55 and secs as the DISCOVER did
     };
     let now = crate::arch::ms().max(1);
     let r = &l.reply;
@@ -2361,6 +2383,7 @@ fn ud_dhcp_rx(f: &[u8]) {
             UD_OFFERS.fetch_add(1, Ordering::Relaxed);
             UD_STATE.store(UD_REQUESTING, Ordering::Relaxed);
             UD_NEXT.store(now + UD_REQ_MS, Ordering::Relaxed);
+            UD_T_OFFER.store(now, Ordering::Relaxed); // DHCPREPLUG (B632)
             let pushed = ud_push(&out[..n]);
             serial_println!("[dhcp] offer ip={} server={} -> request{}", UdIp(r.your_ip), UdIp(r.server_ip), if pushed { "" } else { " q=full" });
         }
@@ -2373,6 +2396,7 @@ fn ud_dhcp_rx(f: &[u8]) {
             UD_LEASE_S.store(l.lease_s, Ordering::Relaxed);
             UD_STATE.store(UD_BOUND, Ordering::Relaxed);
             UD_PENDING.store(true, Ordering::Relaxed);
+            UD_DORA_MS.store(now.saturating_sub(UD_T_DISC.load(Ordering::Relaxed)), Ordering::Relaxed); UD_ACQ_T0.store(0, Ordering::Relaxed); // DHCPREPLUG (B632): DISCOVER -> ACK of the transaction that bound
             serial_println!(":: USBNET: dhcp=bound ip={} mask={} gw={} dns={} lease={} ::",
                 UdIp(r.your_ip), UdIp(l.mask), UdIp(l.router), UdIp(l.dns), l.lease_s);
             ud_ping_start(now);
@@ -2553,4 +2577,238 @@ fn ud_probe_reset() {
     UD_PROBE_AT.store(0, Ordering::Relaxed);
     UD_PROBE_N.store(0, Ordering::Relaxed);
     UD_PROBE_DONE.store(false, Ordering::Relaxed);
+}
+
+// ── DHCPREPLUG (rmbp-ledger B632) — TAIL-APPENDED ───────────────────────────────────────────────────
+// Flight 34: the LAN answered our unicast-solicited ARP (`txprobe … dst=ours -> unicast-rx ok`) and never a DISCOVER
+// (16 of them, 20 minutes, `udp67=0`). This section reads that silence from our side: (1) a link-up restarts the
+// client — fresh xid, back-off back to 4 s, the DISCOVER `UD_RESTART_MS` after the PHY reports link
+// (`[dhcp] link-up -> restart xid= backoff=4000`), called from `link_seen`'s up edge and from `tests dhcp`;
+// (2a) every UDP 67/68 frame the tap sees, anyone's, one `[dhcp] rx` row each; (2b) the first DISCOVER of the boot
+// decoded field by field against RFC 2131 §4.4.1 / RFC 2132 (`[dhcp] tx-audit`, `net::dhcp::audit_request`);
+// (2c) the RX filter as the part read it back and the frame classes since the link came up (`[dhcp] rx-filter`);
+// (2e) the probe's who-has re-sent padded to the DISCOVER's 342 bytes — the 60-byte probe proves TX of a minimum
+// frame, this tests TX of a frame the DISCOVER's size (`[dhcp] tx-size probe`).
+// `tests dhcp` (QEMU user-net answers DHCP): the lease, then a simulated link-down/up restarts and re-leases.
+
+/// Link-up -> the restart's DISCOVER (inside the brief's 1 s; the AX medium word is written after `link_seen` returns).
+const UD_RESTART_MS: u64 = 250;
+/// A DISCOVER -> ACK slower than this fails `tests dhcp`.
+const UD_DORA_MAX_MS: u64 = 2_000;
+static UD_XID_NEXT: AtomicU32 = AtomicU32::new(0);
+/// This acquisition's first DISCOVER (ms; 0 = none in flight) — the `secs` field counts from it.
+static UD_ACQ_T0: AtomicU64 = AtomicU64::new(0);
+static UD_T_DISC: AtomicU64 = AtomicU64::new(0);
+static UD_T_OFFER: AtomicU64 = AtomicU64::new(0);
+static UD_DORA_MS: AtomicU64 = AtomicU64::new(0);
+static UD_LAST_RETX: AtomicU64 = AtomicU64::new(0);
+static UD_RESTART_AT: AtomicU64 = AtomicU64::new(0);
+static UD_RESTARTS: AtomicU64 = AtomicU64::new(0);
+static UD_RESTART_SHOW: AtomicBool = AtomicBool::new(false);
+static UD_AUDITED: AtomicBool = AtomicBool::new(false);
+static UD_HEARD: AtomicU64 = AtomicU64::new(0);
+/// Frame classes at the last link-up (the `rx-filter` line prints what arrived since).
+static UD_LU_BCAST: AtomicU64 = AtomicU64::new(0);
+static UD_LU_MCAST: AtomicU64 = AtomicU64::new(0);
+static UD_LU_OURS: AtomicU64 = AtomicU64::new(0);
+static UD_LU_FOREIGN: AtomicU64 = AtomicU64::new(0);
+static UD_LU_HEARD: AtomicU64 = AtomicU64::new(0);
+/// The 342-byte who-has: none, due (the 60-byte one was answered), sent, verdict printed.
+const UB_NONE: u8 = 0;
+const UB_DUE: u8 = 1;
+const UB_SENT: u8 = 2;
+const UB_DONE: u8 = 3;
+const UB_LEN: usize = 342;
+static UD_BIG: AtomicU8 = AtomicU8::new(UB_NONE);
+static UD_BIG_AT: AtomicU64 = AtomicU64::new(0);
+
+struct UdMac([u8; 6]);
+impl core::fmt::Display for UdMac {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let m = self.0;
+        write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5])
+    }
+}
+fn ud_list(v: &[u8]) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for (i, b) in v.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str(&alloc::format!("{}", b));
+    }
+    if s.is_empty() { s.push('-'); }
+    s
+}
+
+/// The PHY reported link (or `tests dhcp` simulated a down/up): restart the client. The lease atomics stay until
+/// the new ACK replaces them; the client object stays (its xid is replaced at the DISCOVER, so a late OFFER for the
+/// old transaction is ignored); the link probes run again.
+fn ud_link_up(now: u64) {
+    let now = now.max(1);
+    let m = mac();
+    let xid = ((crate::arch::now_cycles() as u32) ^ u32::from_be_bytes([m[2], m[3], m[4], m[5]])).max(1);
+    let old = { let _m = crate::arch::IrqMask::new(); UD_CLIENT.lock().as_ref().map(|c| c.xid()).unwrap_or(0) };
+    let was = UD_STATE.load(Ordering::Relaxed);
+    UD_XID_NEXT.store(xid, Ordering::Relaxed);
+    UD_STATE.store(UD_IDLE, Ordering::Relaxed);
+    UD_RETX.store(0, Ordering::Relaxed);
+    UD_ACQ_T0.store(0, Ordering::Relaxed);
+    UD_NEXT.store(now + UD_RESTART_MS, Ordering::Relaxed);
+    UD_PSTATE.store(UP_NONE, Ordering::Relaxed);
+    UD_PTRIES.store(0, Ordering::Relaxed);
+    ud_probe_reset();
+    UD_BIG.store(UB_NONE, Ordering::Relaxed);
+    UD_RESTART_AT.store(now, Ordering::Relaxed);
+    UD_RESTART_SHOW.store(true, Ordering::Relaxed);
+    let n = UD_RESTARTS.fetch_add(1, Ordering::Relaxed) + 1;
+    UD_LU_BCAST.store(UD_C_BCAST.load(Ordering::Relaxed), Ordering::Relaxed);
+    UD_LU_MCAST.store(UD_C_MCAST.load(Ordering::Relaxed), Ordering::Relaxed);
+    UD_LU_OURS.store(UD_C_OURS.load(Ordering::Relaxed), Ordering::Relaxed);
+    UD_LU_FOREIGN.store(UD_C_FOREIGN.load(Ordering::Relaxed), Ordering::Relaxed);
+    UD_LU_HEARD.store(UD_HEARD.load(Ordering::Relaxed), Ordering::Relaxed);
+    serial_println!("[dhcp] link-up -> restart xid={:08x} backoff={} discover_in_ms={} was={} old_xid={:08x} restarts={}",
+        xid, UD_RETX_MIN_MS, UD_RESTART_MS, ud_state_name(was), old, n);
+    ud_filter_line("link-up");
+}
+
+/// `[dhcp] rx-filter`: the RX filter as programmed and read back, and what arrived by class (boot and since link-up).
+fn ud_filter_line(at: &str) {
+    let rx = RX_CTL_RB.load(Ordering::Relaxed);
+    let (b, m, o, f) = (UD_C_BCAST.load(Ordering::Relaxed), UD_C_MCAST.load(Ordering::Relaxed), UD_C_OURS.load(Ordering::Relaxed), UD_C_FOREIGN.load(Ordering::Relaxed));
+    let h = UD_HEARD.load(Ordering::Relaxed);
+    serial_println!(
+        "[dhcp] rx-filter at={} kind={} rxctl={:#06x} start={} ab={} pro={} amall={} am={} ecm_filter={} boot: bcast={} mcast={} ucast={} foreign={} dhcp_rx={} link: bcast={} mcast={} ucast={} foreign={} dhcp_rx={}",
+        at, kind_name(), rx, (rx >> 7) & 1, (rx >> 3) & 1, rx & 1, (rx >> 1) & 1, (rx >> 4) & 1,
+        if kind() == KIND_ECM { if FILTER_OK.load(Ordering::Relaxed) { "ok" } else { "refused" } } else { "n/a" },
+        b, m, o, f, h,
+        b.saturating_sub(UD_LU_BCAST.load(Ordering::Relaxed)), m.saturating_sub(UD_LU_MCAST.load(Ordering::Relaxed)),
+        o.saturating_sub(UD_LU_OURS.load(Ordering::Relaxed)), f.saturating_sub(UD_LU_FOREIGN.load(Ordering::Relaxed)),
+        h.saturating_sub(UD_LU_HEARD.load(Ordering::Relaxed))
+    );
+}
+
+/// `[dhcp] tx-audit`: our DISCOVER, every field as it sits in the buffer handed to TXQ, and the first RFC check
+/// that fails (`fail=none` = every check passed).
+fn ud_tx_audit(f: &[u8]) {
+    let Some(a) = net::dhcp::audit_request(f) else {
+        serial_println!("[dhcp] tx-audit len={} -> short", f.len());
+        return;
+    };
+    serial_println!(
+        "[dhcp] tx-audit eth dst={} src={} type={:#06x} ; ip ver_ihl={:#04x} tos={:#04x} len={} id={} frag={:#06x} ttl={} proto={} csum={:#06x} csum_ok={} src={} dst={} ; udp {}->{} len={} csum={:#06x} udpsum={}",
+        UdMac(a.eth_dst), UdMac(a.eth_src), a.ethertype, a.ip_ver_ihl, a.ip_tos, a.ip_len, a.ip_id, a.ip_frag, a.ip_ttl,
+        a.ip_proto, a.ip_csum, a.ip_csum_ok as u8, UdIp(a.ip_src), UdIp(a.ip_dst), a.udp_sport, a.udp_dport, a.udp_len,
+        a.udp_csum, match a.udp_csum_verdict { 0 => "none", 1 => "ok", _ => "BAD" }
+    );
+    let host = core::str::from_utf8(&a.host[..a.host_len]).unwrap_or("?");
+    serial_println!(
+        "[dhcp] tx-audit bootp op={} htype={} hlen={} hops={} xid={:08x} secs={} flags={:#06x} ciaddr={} chaddr={} chaddr_is_src={} cookie={} bootp_len={} ; opts={} type={} client_id={} host={} params={} end={} -> rfc2131 fail={}",
+        a.op, a.htype, a.hlen, a.hops, a.xid, a.secs, a.flags, UdIp(a.ciaddr), UdMac(a.chaddr), (a.chaddr == a.eth_src) as u8,
+        if a.cookie_ok { "ok" } else { "BAD" }, a.bootp_len, ud_list(&a.opts[..a.n_opts.min(16)]), net::dhcp::msg_name(a.msg_type),
+        if a.client_id_ok { "ok" } else { "absent" }, if a.host_len == 0 { "-" } else { host }, ud_list(&a.params[..a.n_params]),
+        if a.end_ok { "ok" } else { "BAD" }, a.fail
+    );
+}
+
+/// `[dhcp] rx`: one row per UDP 67/68 frame the tap sees, whoever it is for.
+fn ud_heard(f: &[u8], dst: &str) {
+    let Some(h) = net::dhcp::hear(f) else { return };
+    let k = UD_HEARD.fetch_add(1, Ordering::Relaxed) + 1;
+    let ours = { let _m = crate::arch::IrqMask::new(); UD_CLIENT.lock().as_ref().map(|c| c.xid() == h.xid && h.xid != 0).unwrap_or(false) };
+    serial_println!(
+        "[dhcp] rx n={} {}:{} -> {}:{} from={} dst={} op={} type={} xid={:08x} ours={} flags={:#06x} yiaddr={} chaddr={} chaddr_is_us={} server={} lease_s={} bootp_len={} udpsum={}",
+        k, UdIp(h.ip_src), h.sport, UdIp(h.ip_dst), h.dport, UdMac(h.eth_src), dst, h.op, net::dhcp::msg_name(h.msg_type), h.xid,
+        ours as u8, h.flags, UdIp(h.yiaddr), UdMac(h.chaddr), (h.chaddr == mac()) as u8, UdIp(h.server_id), h.lease_s, h.bootp_len,
+        match h.udp_csum_verdict { 0 => "none", 1 => "ok", _ => "BAD" }
+    );
+}
+
+/// After the 60-byte probe's answer: the same who-has padded to `UB_LEN`; its verdict after `UD_PROBE_WAIT_MS`.
+fn ud_big_tick(now: u64) {
+    match UD_BIG.load(Ordering::Relaxed) {
+        UB_DUE => {
+            let ip = UD_PROBE_IP.load(Ordering::Relaxed);
+            let mut fr = [0u8; UB_LEN];
+            fr[..60].copy_from_slice(&u8_probe_frame(mac(), ip));
+            if !ud_push(&fr) { return; }
+            UD_BIG_AT.store(now, Ordering::Relaxed);
+            UD_BIG.store(UB_SENT, Ordering::Relaxed);
+        }
+        UB_SENT if now.saturating_sub(UD_BIG_AT.load(Ordering::Relaxed)) >= UD_PROBE_WAIT_MS => {
+            UD_BIG.store(UB_DONE, Ordering::Relaxed);
+            serial_println!("[dhcp] tx-size probe len={} who_has={} reply_ms=none -> large-tx lost (the 60-byte probe was answered)",
+                UB_LEN, UdIp(UD_PROBE_IP.load(Ordering::Relaxed).to_be_bytes()));
+        }
+        _ => {}
+    }
+}
+/// An ARP reply from the probed address to our MAC: the 60-byte probe's answer arms the large one; the large one's
+/// answer is its verdict.
+fn ud_big_rx(f: &[u8], op: u16, dst: &str) {
+    let want = UD_PROBE_IP.load(Ordering::Relaxed);
+    if op != 2 || want == 0 || u32::from_be_bytes([f[28], f[29], f[30], f[31]]) != want || f[32..38] != mac() { return; }
+    match UD_BIG.load(Ordering::Relaxed) {
+        UB_NONE => UD_BIG.store(UB_DUE, Ordering::Relaxed),
+        UB_SENT => {
+            UD_BIG.store(UB_DONE, Ordering::Relaxed);
+            serial_println!("[dhcp] tx-size probe len={} who_has={} reply_ms={} dst={} -> large-tx ok", UB_LEN, UdIp(want.to_be_bytes()),
+                crate::arch::ms().saturating_sub(UD_BIG_AT.load(Ordering::Relaxed)), dst);
+        }
+        _ => {}
+    }
+}
+
+/// Pump the data pass until `done` or `ms` elapse; true when `done` held.
+fn ud_pump(ms: u64, done: impl Fn() -> bool) -> bool {
+    let t0 = crate::arch::ms();
+    while crate::arch::ms().saturating_sub(t0) < ms && is_up() && !done() {
+        main_pass();
+        for _ in 0..256 { core::hint::spin_loop(); }
+    }
+    done()
+}
+
+/// `tests dhcprestart`: the verb — a simulated link-down/up (the client restarts exactly as at a PHY link-up).
+pub fn dhcp_restart_verb() {
+    if !is_up() {
+        serial_println!("[dhcp] sim link-down/up -> SKIP reason=no-dongle");
+        return;
+    }
+    serial_println!("[dhcp] sim link-down/up state={}", ud_state_name(UD_STATE.load(Ordering::Relaxed)));
+    ud_link_up(crate::arch::ms());
+}
+
+/// `tests dhcp` (QEMU user-net answers DHCP): (1) the lease — the boot's, or wait up to 10 s for it; (2) a
+/// simulated link-down/up: the restart's DISCOVER inside 1 s with back-off 4000 under a new xid, then DISCOVER ->
+/// ACK inside 2 s and the same lease again.
+/// `:: DHCP: lease ip= mask= gw= dns= lease_s= dora_ms= ; restart xid=<old>-><new> backoff= discover_ms= dora_ms= ip= -> PASS ::`
+pub fn dhcp_selftest() {
+    if !is_up() {
+        serial_println!(":: DHCP: lease ip=0.0.0.0 reason=no-dongle -> SKIP ::");
+        return;
+    }
+    let bound = || UD_STATE.load(Ordering::Relaxed) == UD_BOUND;
+    let b1 = ud_pump(10_000, bound);
+    let ip1 = ud_ip(&UD_IP);
+    let dora1 = UD_DORA_MS.load(Ordering::Relaxed);
+    serial_println!("[dhcp] fixture lease bound={} ip={} mask={} gw={} dns={} lease_s={} dora_ms={}", b1 as u8, UdIp(ip1),
+        UdIp(ud_ip(&UD_MASK)), UdIp(ud_ip(&UD_GW)), UdIp(ud_ip(&UD_DNS)), UD_LEASE_S.load(Ordering::Relaxed), dora1);
+    let old = { let _m = crate::arch::IrqMask::new(); UD_CLIENT.lock().as_ref().map(|c| c.xid()).unwrap_or(0) };
+    let d0 = UD_DISCOVERS.load(Ordering::Relaxed);
+    dhcp_restart_verb();
+    let at = UD_RESTART_AT.load(Ordering::Relaxed);
+    let sent = ud_pump(1_500, || UD_DISCOVERS.load(Ordering::Relaxed) > d0);
+    let disc_ms = if sent { UD_T_DISC.load(Ordering::Relaxed).saturating_sub(at) } else { u64::MAX };
+    let new = { let _m = crate::arch::IrqMask::new(); UD_CLIENT.lock().as_ref().map(|c| c.xid()).unwrap_or(0) };
+    let backoff = UD_LAST_RETX.load(Ordering::Relaxed);
+    let b2 = sent && ud_pump(UD_DORA_MAX_MS + 1_000, bound);
+    let dora2 = UD_DORA_MS.load(Ordering::Relaxed);
+    let ip2 = ud_ip(&UD_IP);
+    let ok = b1 && dora1 <= UD_DORA_MAX_MS && sent && disc_ms <= 1_000 && backoff == UD_RETX_MIN_MS && new != old
+        && b2 && dora2 <= UD_DORA_MAX_MS && ip2 != [0; 4];
+    serial_println!(
+        ":: DHCP: lease ip={} mask={} gw={} dns={} lease_s={} dora_ms={} ; restart xid={:08x}->{:08x} backoff={} discover_ms={} dora_ms={} ip={} -> {} ::",
+        UdIp(ip1), UdIp(ud_ip(&UD_MASK)), UdIp(ud_ip(&UD_GW)), UdIp(ud_ip(&UD_DNS)), UD_LEASE_S.load(Ordering::Relaxed), dora1,
+        old, new, backoff, if sent { alloc::format!("{}", disc_ms) } else { alloc::string::String::from("none") },
+        if b2 { alloc::format!("{}", dora2) } else { alloc::string::String::from("none") }, UdIp(ip2), if ok { "PASS" } else { "FAIL" }
+    );
 }
