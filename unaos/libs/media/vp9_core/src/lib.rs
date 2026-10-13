@@ -23,6 +23,7 @@ pub mod frame;
 pub mod header;
 pub mod inter;
 pub mod intra;
+pub mod loopfilter;
 pub mod probs;
 pub mod tables;
 pub mod transform;
