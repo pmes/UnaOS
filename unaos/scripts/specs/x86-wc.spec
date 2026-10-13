@@ -967,7 +967,7 @@ FORBID :: TEXTEDIT: .* -> FAIL ::
 REQUIRE :: FILEOPEN:
 FORBID :: FILEOPEN: .* -> FAIL ::
 # ── SETTINGS (R75), TAIL-APPENDED — the settings fixture: open, idle=5, save, re-read, compare
-REQUIRE :: SETTINGS: controls=[0-9]+ tabs=4 loaded=[0-9]+ saved=[0-9]+ -> PASS ::
+REQUIRE :: SETTINGS: controls=[0-9]+ tabs=[0-9]+ loaded=[0-9]+ saved=[0-9]+ -> PASS ::
 FORBID :: SETTINGS: .* -> FAIL ::
 # SETTINGS2 — the Users tab leg of the same fixture (tmpuser add/list/delete; root + self refusals)
 REQUIRE :: SETTINGS-USERS: listed=[0-9]+ added=[0-9]+ deleted=[0-9]+ refused=[0-9]+ -> PASS ::

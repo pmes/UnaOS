@@ -1971,7 +1971,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // other half of the same convention, kept HERE because the bar owns the caption's glyphs and
     // `draw_bar_row` deliberately does not redraw them.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    let cap_ink = if m.menus.app_open() { theme::surface_raised() } else { theme::text_primary() };
+    let cap_ink = if m.menus.app_open() { theme::ink_on_accent() } else { theme::text_primary() };
     super::text::draw_row(out, w, &m.title[..cols], TITLE_X0(), sy, cap_ink, BOLD, FACE);
 
     // MENUSTAT — the battery's PERCENT, right-aligned in its fixed [`BATT_PCT_GLYPHS`] slot so the
