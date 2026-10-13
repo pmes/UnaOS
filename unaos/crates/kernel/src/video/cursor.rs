@@ -5374,7 +5374,7 @@ pub mod cursorshape;
 // still one row.
 
 /// WINRESIZE2 — the sentinel "no zone": the program's ask (or the arrow) is the shape.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 const ZONE_NONE: u8 = 0xFF;
 /// WINRESIZE2 — the north-west/south-east double arrow (the `tl` and `br` corners). A SYSTEM row: past the ABI table.
 pub const SHAPE_RESIZE_NWSE: u8 = una_abi::CURSOR_SHAPES as u8;
@@ -5383,7 +5383,7 @@ pub const SHAPE_RESIZE_NESW: u8 = una_abi::CURSOR_SHAPES as u8 + 1;
 
 /// WINRESIZE2 — the system rows, in the `SHAPES` style: an 8x8 block mask, MSB leftmost, the hotspot on the stem
 /// (the NS/EW rule: the pixel of the shaft nearest the glyph's centre), the resize rows' ink (`POINTER_SHAPE_INK[5]`).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub const ZONE_SHAPES: [Glyph; 2] = [
     // SHAPE_RESIZE_NWSE — a diagonal double arrow, heads in the top-left and bottom-right corners.
     Glyph {
@@ -5402,7 +5402,7 @@ pub const ZONE_SHAPES: [Glyph; 2] = [
 ];
 
 /// WINRESIZE2 — the zone shape the frame selected, or [`ZONE_NONE`].
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static ZONE_SHAPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(ZONE_NONE);
 
 /// WINRESIZE2 — the table row for sprite index `i`: `SHAPES` for every ABI value (clamped as before), the system
@@ -5410,7 +5410,7 @@ static ZONE_SHAPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::
 #[inline(always)]
 fn glyph(i: u8) -> &'static Glyph {
     let t: &'static [Glyph; una_abi::CURSOR_SHAPES as usize] = &SHAPES;
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     if (i as usize) >= t.len() && ((i as usize) - t.len()) < ZONE_SHAPES.len() {
         let z: &'static [Glyph; 2] = &ZONE_SHAPES;
         return &z[(i as usize) - t.len()];
@@ -5421,7 +5421,7 @@ fn glyph(i: u8) -> &'static Glyph {
 /// WINRESIZE2 — the zone shape over the program's ask `req` (see the block header).
 #[inline(always)]
 fn zone_over(req: u8) -> u8 {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         let z = ZONE_SHAPE.load(Ordering::Acquire);
         if z != ZONE_NONE {
@@ -5434,7 +5434,7 @@ fn zone_over(req: u8) -> u8 {
 /// WINRESIZE2 — the system rows' wire names under x86 `wc`; anything else (and everything off it) is `"?"`, the arm
 /// it replaced.
 fn zone_shape_name(i: u8) -> &'static str {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     match i {
         SHAPE_RESIZE_NWSE => return "resize-nwse",
         SHAPE_RESIZE_NESW => return "resize-nesw",
@@ -5447,7 +5447,7 @@ fn zone_shape_name(i: u8) -> &'static str {
 /// WINRESIZE2 — the frame's zone shape: `Some(row)` on a zone entry (an ABI row or a system row; anything else is
 /// refused as `None`), `None` on the exit. Atomics only, like [`set_shape`]: owes the sprite a repaint when the row
 /// the next draw latches is not the drawn one.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn set_zone_shape(s: Option<u8>) {
     let v = match s {
         Some(r) if (r as usize) < shape_count() => r,
@@ -5458,7 +5458,7 @@ pub fn set_zone_shape(s: Option<u8>) {
 }
 
 /// WINRESIZE2 — the frame's zone shape now, `None` off the frame.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn zone_shape() -> Option<u8> {
     let z = ZONE_SHAPE.load(Ordering::Acquire);
     if z == ZONE_NONE { None } else { Some(z) }
@@ -5467,11 +5467,11 @@ pub fn zone_shape() -> Option<u8> {
 /// WINRESIZE2 — every row the sprite can be drawn with: the ABI table plus, under x86 `wc`, the system rows
 /// (`tests winresize`'s `cursor_shapes=`).
 pub const fn shape_count() -> usize {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         return SHAPES.len() + ZONE_SHAPES.len();
     }
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         SHAPES.len()
     }

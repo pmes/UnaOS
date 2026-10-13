@@ -29829,7 +29829,7 @@ pub fn resize_begin(id: WinId, zone: u8, x: i32, y: i32) -> bool {
     DRAG_LAST_X.store(g[2], Relaxed);
     DRAG_LAST_Y.store(g[3], Relaxed);
     DRAG_MOVES.store(0, Relaxed);
-    DRAG_PACE_LAST_MS.store(0, Relaxed);
+    DRAG_PACE_LAST_MS.store(0, Relaxed); #[cfg(target_arch = "aarch64")] DRAG_LAST_MOVE_MS.store(0, Relaxed); // ARMRESIZE (orin-ledger A96): DRAG-ADMIT's reset, as `drag_begin` makes it — a fresh resize must not sit out the previous gesture's measured compositor weather. ⚠ LINE-NEUTRAL append, code before this comment.
     DRAG_PACE_ADMITTED.store(0, Relaxed);
     DRAG_PACE_COALESCED.store(0, Relaxed);
     RS_ZONE.store(zone, Release);
