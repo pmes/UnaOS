@@ -31,6 +31,11 @@
 //!
 //! [`Tabula::dispatch`] is the whole behaviour, pure over the held documents and the filesystem;
 //! [`serve`] only wires it to the bus.
+//!
+//! UNAMETAL2 (LEDGER SR98, the EDITCORE follow-up): every read goes through the buffer of record,
+//! [`TabulaDocument::core`] (edit_core), never the `buffer` String snapshot — the loaded content is
+//! `doc.text()`, the line count and the goto offset are the core's, and an insert is ONE core edit
+//! (`replace_range`, a single undo group that SYNTAXCORE re-lexes) instead of a rebuilt String.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -40,8 +45,8 @@ use bandy::Synapse;
 
 use crate::document::TabulaDocument;
 
-/// One held document and its cursor (a byte offset into `doc.buffer`, always on a char boundary
-/// when used).
+/// One held document and its cursor (a byte offset into `doc.core`'s text, always on a char
+/// boundary when used).
 #[derive(Debug, Clone)]
 struct Held {
     doc: TabulaDocument,
@@ -91,7 +96,7 @@ impl Tabula {
             TabulaCommand::EditorSave { path, .. } => self.save(path),
             TabulaCommand::EditorGoto { path, line, col, .. } => match self.docs.get_mut(path) {
                 Some(h) => {
-                    h.cursor = offset_of(&h.doc.buffer, *line, *col);
+                    h.cursor = offset_in(&h.doc.core, *line, *col);
                     Vec::new()
                 }
                 None => vec![error(path, "not open")],
@@ -123,8 +128,8 @@ impl Tabula {
         vec![
             SMessage::Tabula(TabulaCommand::EditorLoaded {
                 path: path.to_string(),
-                content: doc.buffer.clone(),
-                lines: u32::try_from(doc.buffer.lines().count()).unwrap_or(u32::MAX),
+                content: doc.text(),
+                lines: u32::try_from(text_lines(&doc.core)).unwrap_or(u32::MAX),
                 language: doc.language.clone(),
                 read_only: doc.read_only,
             }),
@@ -156,13 +161,10 @@ impl Tabula {
         if h.doc.read_only {
             return vec![error(path, "document is read-only (console log view)")];
         }
-        let at = floor_boundary(&h.doc.buffer, h.cursor);
+        let at = h.doc.core.text().floor_boundary(h.cursor);
         let was_dirty = h.doc.dirty;
-        let mut next = String::with_capacity(h.doc.buffer.len() + text.len());
-        next.push_str(&h.doc.buffer[..at]);
-        next.push_str(text);
-        next.push_str(&h.doc.buffer[at..]);
-        h.doc.set_buffer(next);
+        h.doc.replace_range(at..at, text);
+        h.doc.dirty = true; // as `set_buffer` marked it: an insert dirties the document even when empty
         h.cursor = at + text.len();
         let mut out = Vec::new();
         if !was_dirty {
@@ -188,7 +190,7 @@ impl Tabula {
         }
         let was_dirty = h.doc.dirty;
         h.doc.set_buffer(content);
-        h.cursor = floor_boundary(&h.doc.buffer, h.cursor);
+        h.cursor = h.doc.core.text().floor_boundary(h.cursor);
         if was_dirty { Vec::new() } else { vec![dirty(&path, true)] }
     }
 }
@@ -204,18 +206,37 @@ fn dirty(path: &str, dirty: bool) -> SMessage {
 fn pane_load(path: &str, doc: &TabulaDocument) -> SMessage {
     SMessage::EditorLoad {
         path: Some(path.to_string()),
-        content: doc.buffer.clone(),
+        content: doc.text(),
         language: doc.language.clone(),
     }
 }
 
-/// The largest char boundary `<= at` (and `<= text.len()`).
-fn floor_boundary(text: &str, at: usize) -> usize {
-    let mut at = at.min(text.len());
-    while !text.is_char_boundary(at) {
-        at -= 1;
+/// The lines `str::lines` would count in `core`'s text: the core's line count, less the empty line
+/// after a final line feed (and 0 for an empty text).
+fn text_lines(core: &edit_core::Buffer) -> usize {
+    let n = core.line_count();
+    if core.is_empty() {
+        0
+    } else if n > 1 && core.text().line_start(n - 1) == core.len() {
+        n - 1
+    } else {
+        n
     }
-    at
+}
+
+/// [`offset_of`] over the buffer of record: the byte offset of 1-based `line`, `col` (col in chars)
+/// in `core`'s text, by the same clamping rule — line 0 and col 0 read as 1, a line past the end is
+/// the last line `str::split_inclusive` yields, a col past the end of its line is the line's end
+/// (before its `\n` / `\r\n`).
+pub fn offset_in(core: &edit_core::Buffer, line: u32, col: u32) -> usize {
+    let lines = text_lines(core);
+    if lines == 0 {
+        return 0;
+    }
+    let l = (line.max(1) as usize).min(lines) - 1;
+    let body = core.line(l);
+    let into = body.char_indices().nth(col.max(1) as usize - 1).map(|(b, _)| b).unwrap_or(body.len());
+    core.text().line_start(l) + into
 }
 
 /// The byte offset of 1-based `line`, `col` (col in chars), clamped to the text: line 0 and col 0
@@ -448,7 +469,7 @@ mod tests {
         assert_eq!(t.active(), Some(p.as_str()));
         let out = t.dispatch(&SMessage::EditorEdited { content: "b\n".into() });
         assert!(matches!(&out[..], [SMessage::Tabula(TabulaCommand::EditorDirty { dirty: true, .. })]));
-        assert_eq!(t.document(&p).unwrap().buffer, "b\n");
+        assert_eq!(t.document(&p).unwrap().text(), "b\n");
         assert!(t.dispatch(&SMessage::EditorEdited { content: "c\n".into() }).is_empty(), "already dirty");
 
         // Re-opening a held document re-presents it, edits included.
@@ -484,5 +505,9 @@ mod tests {
         assert_eq!(offset_of(t, 4, 3), 11);
         assert_eq!(offset_of(t, 99, 99), t.len(), "past the end is the end");
         assert_eq!(offset_of("", 3, 3), 0);
+        // The core twin answers the same offsets.
+        for (text, line, col) in [(t, 1, 1), (t, 0, 0), (t, 1, 99), (t, 2, 2), (t, 3, 5), (t, 4, 3), (t, 99, 99), ("", 3, 3), ("a\n", 2, 1)] {
+            assert_eq!(offset_in(&edit_core::Buffer::new(text), line, col), offset_of(text, line, col), "{text:?} {line}:{col}");
+        }
     }
 }

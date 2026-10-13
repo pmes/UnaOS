@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), // RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -30874,4 +30874,126 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ro
             Err((if why.contains("args page") { una_abi::E2BIG } else { EAGAIN }, "loader"))
         }
     }
+}
+
+// =================================================================================================
+// UNAMETAL2 (LEDGER SR98) — `SYS_PATH_WRITE` (60) on the default x86 kernel, AS THE CALLER, under the volume's write
+// ACL. TAIL-APPENDED: no line above moves. Why `selfdiag` gated it (RING3EXEC's note above `ring3_path_ok`): that
+// gate protected `selfdiag::principal_for`'s installer grant (the selfhost tree, the system table and the diagnosis
+// records written with KERNEL authority) and kept every ring-3 path write off kernels without the diagnosis loop.
+// The grant STAYS behind `selfdiag` — nothing here asks `principal_for`; every verb runs under the caller's ATTRSURF
+// principal, so the only judge is the volume: native UnaFS `native_write_authz` (owner row / `grants:<p>` with the
+// write right / ROOTACL's `system` trees writable by kernel and the administrator only; create asks the PARENT),
+// FAT/foreign `authorize_write` (the mounting principal or kernel). A refusal is `-EACCES` by the ACL's word. With
+// `selfdiag`, `sys_pathio` keeps both numbers exactly as before and this block is not dispatched.
+// TRUNC truncates an existing file IN PLACE (`MountTable::truncate`, native `truncate_data` keeps the inode) instead
+// of `selfdiag::put_file`'s unlink + create, which would drop the file's owner/grants rows and hand the file to any
+// holder of a write grant. Wire: `[pathwrite] path=<p> principal=<who> flags=<f> off=<o> bytes=<n> -> ok=<n>` or
+// `… -> errno=<e>`.
+// =================================================================================================
+
+/// UNAMETAL2: the write verbs of `SYS_PATH_WRITE` for `who` over the live namespace — `PATH_W_UNLINK` (empty data,
+/// offset 0), `PATH_W_MKDIRS` (each missing parent created as `who`), `PATH_W_TRUNC` (offset 0: truncate in place,
+/// or create when missing, then write), else a write at `off` into an existing file (`off <= size`). Bytes written,
+/// or a negative errno. Never the installer grant: `who` is whoever the caller is.
+pub fn path_write_as(path: &str, flags: u16, off: u64, data: &[u8], who: &str) -> i64 {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    if !ring3_path_ok(path) || data.len() > una_abi::PATH_IO_MAX {
+        return EINVAL;
+    }
+    if flags & !(una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS | una_abi::PATH_W_UNLINK) != 0 {
+        return EINVAL;
+    }
+    let mt = crate::shell::vfs_mount_table();
+    let errno = |e: VfsError| crate::fs::attrsys::errno_of(&e);
+    if flags & una_abi::PATH_W_UNLINK != 0 {
+        if !data.is_empty() || off != 0 || flags != una_abi::PATH_W_UNLINK {
+            return EINVAL;
+        }
+        return match mt.unlink(path, who) {
+            Ok(()) => 0,
+            Err(e) => errno(e),
+        };
+    }
+    if flags & una_abi::PATH_W_MKDIRS != 0 {
+        let mut i = 1;
+        while let Some(k) = path[i..].find('/') {
+            let d = &path[..i + k];
+            match mt.stat(d) {
+                Ok(st) if st.kind == NodeKind::Dir => {}
+                Ok(_) => return una_abi::ENOTDIR,
+                Err(_) => {
+                    if let Err(e) = mt.create(d, NodeKind::Dir, who) {
+                        return errno(e);
+                    }
+                }
+            }
+            i += k + 1;
+        }
+    }
+    if flags & una_abi::PATH_W_TRUNC != 0 {
+        if off != 0 {
+            return EINVAL;
+        }
+        let made = match mt.stat(path) {
+            Ok(st) if st.kind == NodeKind::Dir => return una_abi::EISDIR,
+            Ok(_) => mt.truncate(path, 0, who).map(|_| ()),
+            Err(_) => mt.create(path, NodeKind::File, who).map(|_| ()),
+        };
+        if let Err(e) = made {
+            return errno(e);
+        }
+    } else {
+        match mt.stat(path) {
+            Ok(st) if st.kind == NodeKind::Dir => return una_abi::EISDIR,
+            Ok(st) if off > st.size => return EINVAL,
+            Ok(_) => {}
+            Err(e) => return errno(e),
+        }
+    }
+    let mut done = 0usize;
+    while done < data.len() {
+        match mt.write(path, off + done as u64, &data[done..], who) {
+            Ok(0) => return una_abi::EIO,
+            Ok(w) => done += w,
+            Err(e) => return errno(e),
+        }
+    }
+    done as i64
+}
+
+/// UNAMETAL2: `SYS_PATH_WRITE(req_ptr, req_len)` on a kernel without `selfdiag` — una-abi's SELFDIAG request layout
+/// copied in whole (`sys_pathread`'s discipline), then [`path_write_as`] under the CALLER's principal.
+#[cfg(not(feature = "selfdiag"))]
+fn sys_pathwrite(a0: u64, a1: u64) -> i64 {
+    let h = una_abi::PATH_IO_HDR_LEN;
+    let n = a1 as usize;
+    if n <= h || n > h + una_abi::PATH_IO_PATH_MAX + una_abi::PATH_IO_MAX {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if let Err(e) = copy_from_user(&mut inb, a0) {
+        return e;
+    }
+    let plen = u16::from_le_bytes([inb[0], inb[1]]) as usize;
+    let flags = u16::from_le_bytes([inb[2], inb[3]]);
+    let rsv = u32::from_le_bytes([inb[4], inb[5], inb[6], inb[7]]);
+    let mut o8 = [0u8; 8];
+    o8.copy_from_slice(&inb[8..16]);
+    let off = u64::from_le_bytes(o8);
+    if rsv != 0 || plen == 0 || plen > una_abi::PATH_IO_PATH_MAX || n < h + plen {
+        return EINVAL;
+    }
+    let Ok(path) = core::str::from_utf8(&inb[h..h + plen]) else {
+        return EINVAL;
+    };
+    let data = &inb[h + plen..];
+    let who = attrsurf_principal(caller_row());
+    let r = path_write_as(path, flags, off, data, &who);
+    if r >= 0 {
+        serial_println!("[pathwrite] path={} principal={} flags={:#x} off={} bytes={} -> ok={}", path, who, flags, off, data.len(), r);
+    } else {
+        serial_println!("[pathwrite] path={} principal={} flags={:#x} off={} bytes={} -> errno={}", path, who, flags, off, data.len(), r);
+    }
+    r
 }

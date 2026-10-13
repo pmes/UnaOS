@@ -4030,7 +4030,7 @@ The ring-3 syscall table gains one number; the next free syscall number is **69*
 | nr | name | args | returns | x86 | aarch64 |
 |---|---|---|---|---|---|
 | 59 | `SYS_PATH_READ` | `req_ptr, req_len, out_ptr, out_cap` (una-abi SELFDIAG layout; flags 0 = file bytes, `PATH_R_LIST` = directory names) | bytes copied out (0 = end) / -errno | **default kernel:** read + list, caller's principal only; **`selfdiag`:** `sys_pathio` as before (installer grant, writes) | `selfdiag` only |
-| 60 | `SYS_PATH_WRITE` | `req_ptr, req_len` | bytes written / -errno | `selfdiag` only | `selfdiag` only |
+| 60 | `SYS_PATH_WRITE` | `req_ptr, req_len` (flags `PATH_W_TRUNC` / `PATH_W_MKDIRS` / `PATH_W_UNLINK`) | bytes written / -errno | **default kernel (UNAMETAL2, SR98):** caller's principal only, under the volume's write ACL; **`selfdiag`:** `sys_pathio` as before (installer grant) | `selfdiag` only |
 | 68 | `SYS_SPAWN_PATH` | `path_ptr, path_len, argv_ptr, argc` (`argc` × `SpawnArg {ptr u64, len u64}`, 0..=`ARGS_MAX`; argc 0 = argv `[path]`) | child pid (> 0) / -errno | always | unknown-syscall default |
 
 **`SYS_SPAWN_PATH`** (`arch/x86_64/syscall.rs` tail, `sys_spawn_path` → `spawn_path_checked`). The path
@@ -4054,3 +4054,26 @@ the ACL permits — HOLOCRON2's home-only rule is retired. `/` itself is a legal
 The ring-3 shell (`crates/user-midden`, MIDDENTWIN) uses both: `run <path> [args]` and bare names launch through
 `SYS_SPAWN_PATH` (`:: MIDDEN: plan=Exec verb=<run|typed> served=1 pid=<n> ::`), `ls <dir>` reads the ACL listing.
 The program change is `docs/dev/evidence/ring3exec/user-midden.patch`, applied at the fold after MIDDENTWIN.
+
+## UNAMETAL2 — `SYS_PATH_WRITE` on the default x86 kernel (LEDGER SR98, 2026-10-13, x86)
+
+No new number. `SYS_PATH_WRITE` (60) is dispatched on a kernel WITHOUT `selfdiag` (`arch/x86_64/syscall.rs`: the
+not-selfdiag arm folded onto the dispatch line beside `SYS_PATH_READ`'s, the body `sys_pathwrite` →
+`path_write_as` at the file's tail). Why `selfdiag` gated it, and what stays gated: `selfdiag::principal_for`'s
+installer grant — the selfhost tree, the system table and `/var/log/diag.*` written with KERNEL authority — is
+never asked on this path; every verb runs AS THE CALLER (`attrsurf_principal`: `anon` or `user:<name>#<uid>`), so
+the volume's write ACL is the only judge: native UnaFS `native_write_authz` (owner row, `grants:<principal>` with
+the write right, ROOTACL's `system` trees `/system` `/apps` `/lib` writable only by kernel and the administrator;
+create asks the PARENT), FAT/foreign `authorize_write` (the mounting principal or kernel — a ring-3 program does not
+write the ESP). A refusal is `-EACCES`. Verbs (una-abi's SELFDIAG layout unchanged): `PATH_W_UNLINK` (alone, empty
+data, offset 0); `PATH_W_MKDIRS` (each missing parent created as the caller); `PATH_W_TRUNC` (offset 0): an existing
+file is truncated IN PLACE (`MountTable::truncate`; native `truncate_data` keeps the inode and so its owner/grants
+rows — `selfdiag::put_file`'s unlink + create would drop them), a missing one created (owner row = the caller), then
+written; no flag: a write at `offset` into an existing file, `offset <= size`. Wire per call: `[pathwrite] path=<p>
+principal=<who> flags=<f> off=<o> bytes=<n> -> ok=<n>` or `… -> errno=<e>`. With `selfdiag` nothing changes.
+
+The consumer is UNA.ELF's Ctrl+S (`crates/user-una`, `fs::write_file`: the first chunk `PATH_W_TRUNC`, then each
+chunk at its offset). `tests una` (`kernel/src/unaapp.rs`) lays `/var/tmp/una/fix.rs` on a UnaFS root, opens it
+through argv[1], types `// una⏎`, saves, and reads the bytes back; its witness grows `saved=<1|0|skip>
+highlight=<n>` (the editor's syntax_core token count) and `[unaapp] … acl=<refused|open|n/a>` (the default
+kernel's write path asked to create `/apps/UNAPROBE.TXT` as `anon`).
