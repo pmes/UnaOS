@@ -425,9 +425,9 @@ refs/heads/exec-rmbp-setterwedge              e6f9b99c FOLDED-BY-HAND 1c48d5f6 2
 refs/heads/exec-rmbp-pointerscale2            cd3a8094 FOLDED-BY-HAND 35a8113d 2026-10-13
 refs/heads/exec-rmbp-dockshell                4936bc2c FOLDED-BY-HAND 21901b42 2026-10-13
 refs/heads/exec-rmbp-screenshotfat            d20412c5 FOLDED-BY-HAND e5a8bd8c 2026-10-13
-refs/heads/exec-rmbp-queuesleep2              cc2b7a8a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-queuesleep2              cc2b7a8a FOLDED-BY-HAND eb477a46
 refs/heads/exec-host-aetherjs2                8c312d05 FOLDED-BY-HAND df34ac53 2026-10-13
-refs/heads/exec-host-aethermedia              98d9f842 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aethermedia              98d9f842 FOLDED-BY-HAND 3410b842
 refs/heads/exec-rmbp-sonde3                   ac00fced FOLDED-BY-HAND 7435ff67 2026-10-13
 refs/heads/exec-rmbp-prefchanged              37ee4848 FOLDED-BY-HAND 7a619c96 2026-10-13
 refs/heads/exec-rmbp-palettecore              c6aa248e FOLDED-BY-HAND 36704ba2 2026-10-13
