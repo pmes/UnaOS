@@ -2941,8 +2941,11 @@ pub fn render_frame(
                     (t.floor() as i32, ((t + h).floor() - t.floor()) as i32)
                 })
             };
+            // AETHERSTYLE3B (SR115): an upright glyph's cell (CJK under `mixed`, every glyph under `upright`) is
+            // translated into its place in the column instead of turned with the line.
             let vmap = |x: i32, y: i32| {
-                let (px, py) = layout_core::writing::to_physical(vmode, x, y, vbh as i32, vbw as i32, &vline);
+                let (px, py) = layout_core::writing::to_physical_upright(vmode, x, y, vbh as i32, &ifc.upright)
+                    .unwrap_or_else(|| layout_core::writing::to_physical(vmode, x, y, vbh as i32, vbw as i32, &vline));
                 (vorigin.0 + px, vorigin.1 + py)
             };
             let mut vbuf: Vec<u8> = Vec::new();
@@ -3085,8 +3088,11 @@ pub fn render_frame(
                             crate::layout::inline::Frag::Text { width: w, .. } => *w,
                             _ => 0.0,
                         };
+                        // AETHERSTYLE3B (SR115): a vertical IFC's box is recorded in its staging space anchored at
+                        // the content box's physical origin — the space `layout_core::hit` maps a pointer into.
+                        let (rx, ry) = if vmode != 0 { (vorigin.0 as f32, vorigin.1 as f32) } else { (0.0, 0.0) };
                         TEXT_BOXES.with(|t| {
-                            t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox, w: fw, top: ltop, bottom: lbot, adv, scroll: (sx, sy) })
+                            t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox + rx, w: fw, top: ltop + ry, bottom: lbot + ry, adv, scroll: (sx, sy) })
                         });
                         let deco = Deco { underline: i.underline, line_through: i.line_through };
                         if let Some(marks) = mark_plan.get(&fi) {

@@ -64,6 +64,8 @@ pub struct InlineLayout {
     pub vertical: u8,
     /// A vertical root's used inline size: what it fills, or its longest line.
     pub inline_extent: f32,
+    /// AETHERSTYLE3B (SR115): a vertical root's upright glyph cells in staging space (`writing::upright`).
+    pub upright: Vec<crate::writing::UprightCell>,
 }
 
 enum Item {
@@ -730,8 +732,46 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
             })
             .fold(0.0f32, f32::max);
         out.inline_extent = if v_fill { v_avail } else { longest.ceil() };
+        out.upright = upright_cells(tree, ctx, &out, &default_run);
     }
     out
+}
+
+/// AETHERSTYLE3B (SR115): the upright glyphs of a vertical IFC (`writing::upright` under each text's inherited
+/// `text-orientation`): each one's staging cell, from the measured advance of the text before and through it.
+fn upright_cells<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx: &Ctx<F>, il: &InlineLayout, fallback: &TextRun) -> Vec<crate::writing::UprightCell> {
+    let mut cells = Vec::new();
+    if !matches!(il.vertical, crate::writing::VERTICAL_RL | crate::writing::VERTICAL_LR) {
+        return cells;
+    }
+    for f in &il.frags {
+        let Frag::Text { node, text, x, baseline, .. } = f else { continue };
+        // text-orientation is inherited: the nearest box that sets it
+        let mut orient = 0u8;
+        let mut cur = Some(*node);
+        while let Some(c) = cur {
+            if let Some(o) = tree.paint_map.get(&c).and_then(|p| p.text_orientation) {
+                orient = o;
+                break;
+            }
+            cur = tree.taffy.parent(c);
+        }
+        if !text.chars().any(|c| crate::writing::upright(c, orient)) {
+            continue;
+        }
+        let Some((_, top, h)) = crate::hit::line_of(il, *baseline) else { continue };
+        let run = run_of(ctx, *node, fallback);
+        let adv = run.advancer();
+        let mut pen = 0.0f32;
+        for (i, c) in text.char_indices() {
+            let end = ctx.fonts.measure(&text[..i + c.len_utf8()], &adv);
+            if crate::writing::upright(c, orient) {
+                cells.push(crate::writing::UprightCell { x: x + pen, w: (end - pen).max(0.0), top, h });
+            }
+            pen = end;
+        }
+    }
+    cells
 }
 
 fn trailing_space_width<F: Fonts + ?Sized>(ctx: &Ctx<F>, node: NodeId, fallback: &TextRun, n: usize) -> f32 {
