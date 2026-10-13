@@ -5,6 +5,7 @@ use crate::ast::FnKind;
 use crate::string::JsStr;
 use crate::vm::value::BigInt;
 use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -391,8 +392,9 @@ pub struct Code {
     /// A class constructor (base or derived) whose class has instance fields / private methods.
     pub has_fields: bool,
     pub source: Option<SourceRef>,
-    /// Source position per op (for error messages / stack traces): (pc, source offset).
-    pub positions: Vec<(u32, u32)>,
+    /// JSPOS (SR127): the line table — bytecode offset to (line, column) of the source the op came from, for
+    /// stack traces and error positions (delta-encoded, see [`LineTable`]).
+    pub positions: LineTable,
     /// Scripts and modules: is this top-level module code?
     pub is_module: bool,
     pub is_script: bool,
@@ -416,5 +418,146 @@ impl Code {
     }
     pub fn is_constructor(&self) -> bool {
         matches!(self.kind, FnKind::Normal | FnKind::ClassConstructor) && !self.is_async && !self.is_generator
+    }
+}
+
+// ------------------------------------------------------------------------------------------ JSPOS line table
+
+/// Line starts of one source text (UTF-16 offsets), for offset -> (line, column). Line terminators are the
+/// ECMAScript ones (§12.3): LF, CR (CR LF counts once), U+2028, U+2029.
+#[derive(Clone, Debug)]
+pub struct LineIndex {
+    starts: Vec<u32>,
+}
+
+impl LineIndex {
+    pub fn new(src: &[u16]) -> LineIndex {
+        let mut starts = alloc::vec![0u32];
+        let mut i = 0usize;
+        while i < src.len() {
+            let c = src[i];
+            if c == 0x0D && src.get(i + 1) == Some(&0x0A) {
+                i += 1;
+            }
+            if matches!(c, 0x0A | 0x0D | 0x2028 | 0x2029) {
+                starts.push(i as u32 + 1);
+            }
+            i += 1;
+        }
+        LineIndex { starts }
+    }
+
+    /// 1-based (line, column) of a UTF-16 offset; the column counts UTF-16 code units, as V8's does.
+    pub fn line_col(&self, offset: u32) -> (u32, u32) {
+        let i = self.starts.partition_point(|&s| s <= offset).max(1) - 1;
+        (i as u32 + 1, offset - self.starts[i] + 1)
+    }
+}
+
+/// 1-based (line, column) of `offset` in `src` (a one-off: builds the index).
+pub fn line_col(src: &[u16], offset: u32) -> (u32, u32) {
+    LineIndex::new(src).line_col(offset)
+}
+
+/// JSPOS (SR127): one function's line table, built once by the compiler from the parser's token positions.
+///
+/// Encoding (`bytes`), one row per op whose position differs from the previous row's, rows in pc order:
+/// `uvarint(pc - prev_pc)`, `zigzag-varint(line - prev_line)`, `uvarint(column)` (column absolute, 1-based;
+/// `prev_pc` starts at 0, `prev_line` at 1). A row covers every op from its pc up to the next row's — the
+/// SpiderMonkey/V8 source-note shape: one or two bytes for most rows, no per-op cost. `file` is the script's
+/// URL (one `Rc` shared by every function of the script); `None` prints as `<anonymous>` (eval code,
+/// `Function(...)` bodies, scripts run without a name).
+#[derive(Clone, Debug, Default)]
+pub struct LineTable {
+    pub bytes: Vec<u8>,
+    pub file: Option<Rc<str>>,
+}
+
+fn put_uvarint(out: &mut Vec<u8>, mut v: u32) {
+    while v >= 0x80 {
+        out.push((v as u8 & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn get_uvarint(b: &[u8], i: &mut usize) -> Option<u32> {
+    let mut v = 0u32;
+    let mut shift = 0;
+    loop {
+        let byte = *b.get(*i)?;
+        *i += 1;
+        v |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift > 28 {
+            return None;
+        }
+    }
+}
+
+impl LineTable {
+    /// An empty table naming `file` (a synthesized function: a default class constructor).
+    pub fn empty(file: Option<Rc<str>>) -> LineTable {
+        LineTable { bytes: Vec::new(), file }
+    }
+
+    /// Encode `rows` of (pc, source offset) — pc non-decreasing, as the compiler records them — through
+    /// `index` into a table.
+    pub fn build(rows: &[(u32, u32)], index: &LineIndex, file: Option<Rc<str>>) -> LineTable {
+        let mut bytes = Vec::with_capacity(rows.len() * 3);
+        let (mut ppc, mut pline, mut pcol) = (0u32, 1u32, 0u32);
+        for &(pc, off) in rows {
+            let (line, col) = index.line_col(off);
+            if !bytes.is_empty() && line == pline && col == pcol {
+                continue;
+            }
+            put_uvarint(&mut bytes, pc.saturating_sub(ppc));
+            let d = line as i64 - pline as i64;
+            put_uvarint(&mut bytes, ((d << 1) ^ (d >> 63)) as u32);
+            put_uvarint(&mut bytes, col);
+            (ppc, pline, pcol) = (pc, line, col);
+        }
+        bytes.shrink_to_fit();
+        LineTable { bytes, file }
+    }
+
+    /// Every row as (pc, line, column), in pc order.
+    pub fn rows(&self) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        let (mut i, mut pc, mut line) = (0usize, 0u32, 1i64);
+        while i < self.bytes.len() {
+            let (Some(dpc), Some(dl), Some(col)) = (get_uvarint(&self.bytes, &mut i), get_uvarint(&self.bytes, &mut i), get_uvarint(&self.bytes, &mut i)) else { break };
+            pc += dpc;
+            line += ((dl >> 1) as i64) ^ -((dl & 1) as i64);
+            out.push((pc, line as u32, col));
+        }
+        out
+    }
+
+    /// (line, column) of the op at `pc`: the last row at or before it.
+    pub fn lookup(&self, pc: u32) -> Option<(u32, u32)> {
+        let (mut i, mut rpc, mut line) = (0usize, 0u32, 1i64);
+        let mut found = None;
+        while i < self.bytes.len() {
+            let (Some(dpc), Some(dl), Some(col)) = (get_uvarint(&self.bytes, &mut i), get_uvarint(&self.bytes, &mut i), get_uvarint(&self.bytes, &mut i)) else { break };
+            rpc += dpc;
+            if rpc > pc {
+                break;
+            }
+            line += ((dl >> 1) as i64) ^ -((dl & 1) as i64);
+            found = Some((line as u32, col));
+        }
+        found
+    }
+
+    /// The file name a stack frame prints: the script URL, or `<anonymous>`.
+    pub fn file_name(&self) -> String {
+        match &self.file {
+            Some(f) => String::from(&**f),
+            None => String::from("<anonymous>"),
+        }
     }
 }

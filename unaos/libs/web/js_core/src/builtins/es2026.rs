@@ -67,7 +67,7 @@ fn error_capture_stack_trace(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
         head.push_str(&msg.to_rust());
     }
-    let trace = vm.stack_trace().to_rust();
+    let trace = vm.stack_trace_at().to_rust();
     if !trace.is_empty() {
         head.push('\n');
         head.push_str(&trace);
@@ -944,7 +944,7 @@ pub fn init_dispose(vm: &mut Vm) {
 fn suppressed_error_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let nt = if ctx.new_target.is_undefined() { Value::Object(ctx.callee) } else { ctx.new_target.clone() };
     let proto = vm.get_prototype_from_ctor(&nt, |i| i.suppressed_error_proto)?;
-    let trace = vm.stack_trace();
+    let trace = vm.stack_trace_at();
     let o = vm.alloc(ObjectData::new(Some(proto), Kind::Error(trace)));
     let msg = vm.arg(ctx, 2);
     if !msg.is_undefined() {
@@ -961,7 +961,7 @@ fn suppressed_error_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 /// A SuppressedError for a disposal that threw `error` while `suppressed` was already pending.
 fn suppressed(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
     let proto = vm.intr().suppressed_error_proto;
-    let trace = vm.stack_trace();
+    let trace = vm.stack_trace_at();
     let o = vm.alloc(ObjectData::new(Some(proto), Kind::Error(trace)));
     vm.heap.get_mut(o).props.insert(PropertyKey::from_str("error"), Prop::data(error, WC));
     vm.heap.get_mut(o).props.insert(PropertyKey::from_str("suppressed"), Prop::data(suppressed, WC));

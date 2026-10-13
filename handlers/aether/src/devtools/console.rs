@@ -120,9 +120,11 @@ impl Console {
         self.transcript.retain(|(at, u, _)| u == url && *at <= len);
     }
 
-    /// The page's console and the evaluator's transcript, merged in the order they happened.
+    /// The page's console and the evaluator's transcript, merged in the order they happened. An uncaught
+    /// error's entry carries, under its `Uncaught …` line, the frames (`    at fn (url:line:col)`) and the
+    /// source excerpt around its position (JSPOS, SR127: `js::console_lines_detailed`).
     pub fn entries(&self) -> Vec<Entry> {
-        let page = crate::js::console_lines();
+        let page = crate::js::console_lines_detailed();
         let url = crate::js::page_url();
         let mine: Vec<&(usize, String, Entry)> = self.transcript.iter().filter(|(at, u, _)| *u == url && *at <= page.len()).collect();
         let mut out = Vec::with_capacity(page.len() + mine.len());

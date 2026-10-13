@@ -84,16 +84,26 @@ pub(crate) struct Gen {
     pub field_name: Option<JsStr>,
     /// Module code: local names of import entries (GetImport operand = index).
     pub imports: Vec<JsStr>,
+    /// JSPOS (SR127): the source's line starts (token offset -> line, column) and the script's URL, shared by
+    /// every function compiled from it; `finish` turns each function's (pc, offset) rows into its line table.
+    pub lines: Rc<LineIndex>,
+    pub file: Option<Rc<str>>,
 }
 
 pub struct CompileError(pub String);
 
 /// Compile a parsed Script.
 pub fn compile_script(p: &Program) -> Rc<Code> {
+    compile_script_at(p, None)
+}
+
+/// Compile a parsed Script whose source came from `file` (its URL: what stack frames and error positions name).
+pub fn compile_script_at(p: &Program, file: Option<&str>) -> Rc<Code> {
     let mut a = Analyzer::new(p.scope_count);
     a.program(p, false);
     let tree = finalize(a.t);
     let mut g = Gen::new(tree, p.source.clone(), Mode::Script, p.strict);
+    g.file = file.map(Rc::from);
     g.program(p);
     Rc::new(g.finish(JsStr::empty(), 0, 0, FnKind::Normal, None, false, true, false))
 }
@@ -110,10 +120,16 @@ pub fn compile_eval(p: &Program) -> Rc<Code> {
 
 /// Compile module code.
 pub fn compile_module(p: &Program) -> Rc<Code> {
+    compile_module_at(p, None)
+}
+
+/// Compile module code fetched from `file` (the module's URL).
+pub fn compile_module_at(p: &Program, file: Option<&str>) -> Rc<Code> {
     let mut a = Analyzer::new(p.scope_count);
     a.program(p, false);
     let tree = finalize(a.t);
     let mut g = Gen::new(tree, p.source.clone(), Mode::Module, true);
+    g.file = file.map(Rc::from);
     g.f.is_async = p.has_top_await;
     let info = module_info(p);
     g.imports = info.imports.iter().map(|i| i.local.clone()).collect();
@@ -148,6 +164,7 @@ fn finalize(mut t: ScopeTree) -> ScopeTree {
 
 impl Gen {
     fn new(tree: ScopeTree, src: Rc<[u16]>, mode: Mode, strict: bool) -> Gen {
+        let lines = Rc::new(LineIndex::new(&src));
         Gen {
             tree,
             src,
@@ -173,11 +190,15 @@ impl Gen {
             class_has_fields: false,
             field_name: None,
             imports: Vec::new(),
+            lines,
+            file: None,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn finish(&mut self, name: JsStr, nparams: u32, length: u32, kind: FnKind, source: Option<SourceRef>, is_module: bool, is_script: bool, is_eval: bool) -> Code {
+        let positions = LineTable::build(&self.f.positions, &self.lines, self.file.clone());
+        self.f.positions.clear();
         let f = &mut self.f;
         Code {
             name,
@@ -194,7 +215,7 @@ impl Gen {
             derived: f.derived,
             has_fields: false,
             source,
-            positions: core::mem::take(&mut f.positions),
+            positions,
             is_module,
             is_script,
             is_eval,
@@ -208,10 +229,13 @@ impl Gen {
         self.f.ops.push(op);
         self.f.ops.len() - 1
     }
+    /// Record the source offset of the next op. A later record at the same pc replaces the earlier one: the
+    /// innermost expression is the one whose op is emitted there.
     pub(crate) fn pos(&mut self, at: u32) {
         let pc = self.f.ops.len() as u32;
-        if self.f.positions.last().map(|p| p.0 != pc).unwrap_or(true) {
-            self.f.positions.push((pc, at));
+        match self.f.positions.last_mut() {
+            Some(p) if p.0 == pc => p.1 = at,
+            _ => self.f.positions.push((pc, at)),
         }
     }
     pub(crate) fn here(&self) -> usize {

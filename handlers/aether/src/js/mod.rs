@@ -287,7 +287,16 @@ pub(crate) struct PageState {
     pub timer_nesting: Option<u32>,
     /// Each armed timer's nesting level, by id.
     pub timer_levels: HashMap<u32, u32>,
+    /// JSPOS (SR127): the source of each classic page script run, by the file name its frames carry (the
+    /// latest per name; [`RAN_SOURCES_CAP`] bytes at most), for the console's excerpt under an uncaught error.
+    pub ran_sources: HashMap<String, std::rc::Rc<str>>,
+    /// JSPOS: console index of an uncaught error's line -> its frames and source excerpt (the devtools
+    /// Console prints them under the line; `console_lines` stays the one-line form).
+    pub console_details: HashMap<usize, String>,
 }
+
+/// Bytes of page-script source kept for console excerpts.
+const RAN_SOURCES_CAP: usize = 8 << 20;
 
 thread_local! {
     pub(crate) static PAGE: RefCell<PageState> = RefCell::new(PageState::default());
@@ -334,6 +343,134 @@ pub fn reported_errors() -> Vec<String> {
 /// Console output of this page, in order.
 pub fn console_lines() -> Vec<(u8, String)> {
     page(|p| p.console.clone())
+}
+
+/// JSPOS (SR127): the console output with each uncaught error's frames (`    at fn (url:line:col)`) and the
+/// source excerpt around its position joined under its line — what the devtools Console shows.
+pub fn console_lines_detailed() -> Vec<(u8, String)> {
+    page(|p| {
+        p.console
+            .iter()
+            .enumerate()
+            .map(|(i, (l, t))| match p.console_details.get(&i) {
+                Some(d) => (*l, format!("{t}\n{d}")),
+                None => (*l, t.clone()),
+            })
+            .collect()
+    })
+}
+
+/// JSPOS: the (filename, lineno, colno) an ErrorEvent for `err` carries — the position the error recorded
+/// when it was made (vm/ops.rs `error_position`: the innermost frame with a line, or a SyntaxError's
+/// offending token); else the page URL and 0, 0 (a thrown non-error value: no position is recorded).
+pub fn error_site(vm: &Vm, err: &Value) -> (String, u32, u32) {
+    match vm.error_position(err) {
+        Some(p) => (p.file, p.line, p.col),
+        None => (page_url(), 0, 0),
+    }
+}
+
+/// The file name a classic script's frames carry: the running `<script src>`'s absolute URL, else the
+/// document's URL (inline scripts, timer strings, `javascript:` URLs, the console evaluator).
+fn script_file() -> String {
+    if let Some(el) = page(|p| p.current_script) {
+        if let Some(src) = dom::attr_value(el, "src") {
+            if let Some(u) = dom::resolve_url(dom::node_document(el), &src) {
+                return u;
+            }
+        }
+    }
+    page_url()
+}
+
+/// Keeps `src` as the source of `file` for console excerpts (bounded by [`RAN_SOURCES_CAP`]).
+fn remember_source(file: &str, src: &str) {
+    page(|p| {
+        let held: usize = p.ran_sources.iter().filter(|(k, _)| k.as_str() != file).map(|(_, v)| v.len()).sum();
+        if held + src.len() <= RAN_SOURCES_CAP {
+            p.ran_sources.insert(file.to_string(), std::rc::Rc::from(src));
+        }
+    });
+}
+
+/// "Report the exception" (js/events.rs `report_exception`) and then, when it reached the console (nobody
+/// canceled the `error` event), the error's frames and source excerpt recorded under that console line.
+/// `running` is the (file, source) of the script that was running, when the caller has it.
+pub(crate) fn report_uncaught(vm: &mut Vm, err: &Value, running: Option<(&str, &str)>) {
+    let before = page(|p| p.console.len());
+    events::report_exception(vm, err);
+    note_uncaught_detail(vm, err, before, running);
+}
+
+/// Records the frames and source excerpt of `err` under the first `Uncaught …` console line at or after
+/// index `before` (once per line).
+pub(crate) fn note_uncaught_detail(vm: &Vm, err: &Value, before: usize, running: Option<(&str, &str)>) {
+    let at = page(|p| (before..p.console.len()).find(|&i| p.console[i].0 == 2 && p.console[i].1.starts_with("Uncaught ") && !p.console_details.contains_key(&i)));
+    let Some(at) = at else { return };
+    let mut detail = vm.error_frames(err).unwrap_or_default();
+    if let Some(pos) = vm.error_position(err) {
+        let src: Option<std::rc::Rc<str>> = match running {
+            Some((f, s)) if f == pos.file => Some(std::rc::Rc::from(s)),
+            _ => page(|p| p.ran_sources.get(&pos.file).cloned()),
+        };
+        let ex = src.map(|s| source_excerpt(&s, pos.line, pos.col)).unwrap_or_default();
+        if !ex.is_empty() {
+            if !detail.is_empty() {
+                detail.push('\n');
+            }
+            detail.push_str(&ex);
+        }
+    }
+    if !detail.is_empty() {
+        page(|p| p.console_details.insert(at, detail));
+    }
+}
+
+/// The Sources-style excerpt around `line` (1-based) of `src`: two lines either side, numbered, the line
+/// marked `>`, and a caret under UTF-16 column `col`. Lines split where js_core's line table splits them
+/// (LF, CR, CR LF, U+2028, U+2029). Empty when the line is past the end.
+pub fn source_excerpt(src: &str, line: u32, col: u32) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let mut it = src.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            lines.push(&src[start..i]);
+            start = i + c.len_utf8();
+            if c == '\r' && it.peek().map(|&(_, n)| n) == Some('\n') {
+                it.next();
+                start += 1;
+            }
+        }
+    }
+    lines.push(&src[start..]);
+    let l = line as usize;
+    if l == 0 || l > lines.len() {
+        return String::new();
+    }
+    let (first, last) = (l.saturating_sub(2).max(1), (l + 2).min(lines.len()));
+    let w = last.to_string().len();
+    let mut out = String::new();
+    for n in first..=last {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let mark = if n == l { '>' } else { ' ' };
+        out.push_str(&format!("{mark} {n:>w$} | {}", lines[n - 1]));
+        if n == l {
+            let mut pad = String::new();
+            let mut units = 0u32;
+            for c in lines[n - 1].chars() {
+                if units + 1 >= col {
+                    break;
+                }
+                units += c.len_utf16() as u32;
+                pad.push(if c == '\t' { '\t' } else { ' ' });
+            }
+            out.push_str(&format!("\n  {:>w$} | {pad}^", ""));
+        }
+    }
+    out
 }
 
 /// A navigation the page's script requested (`location.href = …`), consumed.
@@ -417,7 +554,7 @@ pub(crate) fn invoke(vm: &mut Vm, label: &str, f: &Value, this: &Value, args: &[
     let out = match r {
         Some(Ok(v)) => Some(v),
         Some(Err(e)) => {
-            events::report_exception(vm, &e);
+            report_uncaught(vm, &e, None);
             None
         }
         None => None,
@@ -440,12 +577,19 @@ pub(crate) fn run_classic(vm: &mut Vm, src: &str, label: &str) -> Result<Value, 
 
 /// ScriptEvaluation + report, without the trailing checkpoint (the loader restores
 /// `document.currentScript` first, as Blink does, so microtasks see `null`).
+///
+/// JSPOS (SR127): the script runs under its file name (`script_file`), so its frames and a SyntaxError
+/// name `url:line:col`; a page script's source is kept for the console's excerpt.
 pub(crate) fn run_classic_no_checkpoint(vm: &mut Vm, src: &str, label: &str) -> Result<Value, Value> {
-    let r = enter(vm, label, |vm| vm.run_script_str(src));
+    let file = script_file();
+    if label == "script" {
+        remember_source(&file, src);
+    }
+    let r = enter(vm, label, |vm| vm.run_script_str_at(src, &file));
     match r {
         Some(Ok(v)) => Ok(v),
         Some(Err(e)) => {
-            events::report_exception(vm, &e);
+            report_uncaught(vm, &e, Some((&file, src)));
             Err(e)
         }
         None => Err(Value::str("js engine poisoned")),
@@ -464,7 +608,7 @@ pub(crate) fn run_timer_source(vm: &mut Vm, src: &str) -> Result<Value, Value> {
     if let Err(m) = crate::security::compile_strings_allowed(src) {
         let p = vm.intr().eval_error_proto;
         let e = vm.make_error(p, &m);
-        events::report_exception(vm, &e);
+        report_uncaught(vm, &e, None);
         return Err(e);
     }
     run_classic(vm, src, "timer-source")
@@ -500,7 +644,7 @@ pub(crate) fn checkpoint(vm: &mut Vm) {
         ran += 1;
         let r = enter(vm, "microtask", |vm| vm.run_job(job));
         match r {
-            Some(Err(e)) => events::report_exception(vm, &e),
+            Some(Err(e)) => report_uncaught(vm, &e, None),
             Some(Ok(())) => {}
             None => break,
         }

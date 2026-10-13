@@ -589,3 +589,185 @@ pub fn string_to_number(s: &JsStr) -> f64 {
         _ => f64::NAN,
     }
 }
+
+// ------------------------------------------------------------------------------------- JSPOS stack frames
+
+/// JSPOS (SR127): a source position an error or a frame names — the script URL (`<anonymous>` when the code
+/// has none) and the 1-based line and UTF-16 column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourcePosition {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Stack frames recorded per error (V8's `Error.stackTraceLimit` default is 10; js_core keeps 16).
+pub const STACK_FRAMES: usize = 16;
+
+/// One frame line in V8's shape: `    at name (file:line:col)`, `    at new Name (…)` for a construct call,
+/// `    at file:line:col` for unnamed code (top-level script, anonymous functions); a frame whose pc has no
+/// row prints `    at name (file)`.
+fn frame_line(f: &Frame, out: &mut String) {
+    let pc = f.pc.saturating_sub(1) as u32;
+    let t = &f.code.positions;
+    let loc = match t.lookup(pc) {
+        Some((l, c)) => alloc::format!("{}:{}:{}", t.file_name(), l, c),
+        None => t.file_name(),
+    };
+    out.push_str("    at ");
+    let name = f.code.name.to_rust();
+    let ctor = f.construct || !f.new_target.is_undefined();
+    if name.is_empty() && !ctor {
+        out.push_str(&loc);
+        return;
+    }
+    if ctor {
+        out.push_str("new ");
+    }
+    out.push_str(if name.is_empty() { "<anonymous>" } else { &name });
+    out.push_str(" (");
+    out.push_str(&loc);
+    out.push(')');
+}
+
+/// Parse a frame line this module wrote back into a position (`None` for a frame with no line).
+fn parse_frame(line: &str) -> Option<SourcePosition> {
+    let rest = line.trim_start().strip_prefix("at ")?;
+    let loc = match (rest.strip_suffix(')'), rest.rfind(" (")) {
+        (Some(r), Some(i)) => &r[i + 2..],
+        _ => rest,
+    };
+    let mut it = loc.rsplitn(3, ':');
+    let col = it.next()?.parse().ok()?;
+    let line = it.next()?.parse().ok()?;
+    let file = String::from(it.next()?);
+    Some(SourcePosition { file, line, col })
+}
+
+impl Vm {
+    /// JSPOS: the active call stack, innermost first, at most [`STACK_FRAMES`] frames, as V8-shaped
+    /// `    at name (file:line:col)` lines joined by '\n' — what an error's `stack` carries below its header.
+    /// Every frame's `pc` is one past the op it is executing (interp.rs stores `pc + 1` before dispatch), so
+    /// `pc - 1` is the throwing op in the innermost frame and the call op in each caller.
+    pub fn stack_trace_at(&self) -> JsStr {
+        let mut out = String::new();
+        for f in self.frames.iter().rev().take(STACK_FRAMES) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            frame_line(f, &mut out);
+        }
+        JsStr::from_str(&out)
+    }
+
+    /// The active call stack as positions, innermost first (`console.trace`, a host's own reporting).
+    pub fn stack_positions(&self) -> Vec<SourcePosition> {
+        self.frames
+            .iter()
+            .rev()
+            .take(STACK_FRAMES)
+            .filter_map(|f| {
+                let t = &f.code.positions;
+                let (line, col) = t.lookup(f.pc.saturating_sub(1) as u32)?;
+                Some(SourcePosition { file: t.file_name(), line, col })
+            })
+            .collect()
+    }
+
+    /// The recorded frames of an error object ([[ErrorData]]): its trace without the header line, or None
+    /// for any other value.
+    pub fn error_frames(&self, v: &Value) -> Option<String> {
+        match v {
+            Value::Object(o) => match &self.heap.get(*o).kind {
+                Kind::Error(t) => Some(t.to_rust()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Where an error was made: the first frame of its recorded trace that has a line (for a SyntaxError
+    /// from [`Vm::run_script_at`], the offending token). None for a non-error value or a trace with no
+    /// positions — a host reports line 0 then (`ErrorEvent.lineno`).
+    pub fn error_position(&self, v: &Value) -> Option<SourcePosition> {
+        self.error_frames(v)?.lines().find_map(parse_frame)
+    }
+
+    /// The text an uncaught error prints with: `Name: message` (as [`Vm::error_string`]) followed by its
+    /// recorded frames — V8's `error.stack` shape. A non-error value prints as `error_string` alone.
+    pub fn error_stack(&mut self, v: &Value) -> String {
+        let mut s = self.error_string(v);
+        if let Some(t) = self.error_frames(v) {
+            if !t.is_empty() {
+                s.push('\n');
+                s.push_str(&t);
+            }
+        }
+        s
+    }
+
+    /// An error object of prototype `proto` with `message` and an explicit recorded trace.
+    pub fn make_error_with_trace(&mut self, proto: Obj, msg: &str, trace: &str) -> Value {
+        let o = self.alloc(ObjectData::new(Some(proto), Kind::Error(JsStr::from_str(trace))));
+        if !msg.is_empty() {
+            let m = Value::String(JsStr::from_str(msg));
+            self.heap.get_mut(o).props.insert(PropertyKey::from_str("message"), Prop::data(m, WC));
+        }
+        Value::Object(o)
+    }
+
+    /// ScriptEvaluation of `src` named `file` (its URL): `Vm::run_script` with the name threaded into every
+    /// function's line table, and a SyntaxError carrying the offending token's position as its one frame
+    /// (`    at file:line:col`).
+    pub fn run_script_at(&mut self, src: &[u16], file: &str) -> JsResult<Value> {
+        let prog = match crate::parser::parse_script(src) {
+            Ok(p) => p,
+            Err(e) => {
+                let (line, col) = crate::bytecode::line_col(src, e.pos);
+                let p = self.intr().syntax_error_proto;
+                let trace = alloc::format!("    at {}:{}:{}", file, line, col);
+                return Err(self.make_error_with_trace(p, &e.msg, &trace));
+            }
+        };
+        let code = crate::compiler::compile_script_at(&prog, Some(file));
+        let r = self.cur_realm;
+        let genv = self.realms[r as usize].global_env;
+        let gt = self.realms[r as usize].global_this.clone();
+        let base = self.stack.len();
+        self.stack.push(Value::Undefined);
+        self.stack.push(gt.clone());
+        let nl = code.nlocals as usize;
+        self.stack.resize(base + 2 + nl, Value::Undefined);
+        let hb = self.handlers.len();
+        self.frames.push(Frame {
+            code,
+            pc: 0,
+            args_base: base + 2,
+            argc: 0,
+            base: base + 2,
+            func: None,
+            this: gt,
+            new_target: Value::Undefined,
+            env: Some(genv),
+            handler_base: hb,
+            realm: r,
+            construct: false,
+            entry: true,
+            coroutine: None,
+            resume_kind: 0,
+            script: None,
+        });
+        let res = self.run();
+        self.stack.truncate(base);
+        self.cur_realm = r;
+        match res? {
+            super::interp::Completion::Return(v) | super::interp::Completion::Suspend(v) => Ok(v),
+        }
+    }
+
+    /// [`Vm::run_script_at`] on a Rust string.
+    pub fn run_script_str_at(&mut self, src: &str, file: &str) -> JsResult<Value> {
+        let u: Vec<u16> = src.encode_utf16().collect();
+        self.run_script_at(&u, file)
+    }
+}

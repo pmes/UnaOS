@@ -99,7 +99,7 @@ fn make(vm: &mut Vm, ctx: &CallCtx, msg_idx: usize) -> JsResult<Obj> {
     let nt = if ctx.new_target.is_undefined() { Value::Object(ctx.callee) } else { ctx.new_target.clone() };
     let pf = proto_for(vm, ctx.callee);
     let proto = vm.get_prototype_from_ctor(&nt, pf)?;
-    let trace = vm.stack_trace();
+    let trace = vm.stack_trace_at();
     let o = vm.alloc(ObjectData::new(Some(proto), Kind::Error(trace)));
     let msg = vm.arg(ctx, msg_idx);
     if !msg.is_undefined() {
@@ -151,16 +151,26 @@ fn to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::String(name.concat(&JsStr::from_str(": ")).concat(&msg)))
 }
 
-/// get Error.prototype.stack: the trace of an object with [[ErrorData]], else undefined.
+/// get Error.prototype.stack: for an object with [[ErrorData]], V8's shape — the header `Name: message` (as
+/// Error.prototype.toString composes it) then the frames recorded when the error was made, one
+/// `    at fn (url:line:col)` line each (JSPOS, SR127; vm/ops.rs `stack_trace_at`); else undefined.
 fn stack_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let o = match &ctx.this {
         Value::Object(o) => *o,
         _ => return vm.throw_type("Error.prototype.stack getter called on non-object"),
     };
-    match &vm.heap.get(o).kind {
-        Kind::Error(t) => Ok(Value::String(t.clone())),
-        _ => Ok(Value::Undefined),
+    let trace = match &vm.heap.get(o).kind {
+        Kind::Error(t) => t.clone(),
+        _ => return Ok(Value::Undefined),
+    };
+    let head = match to_string(vm, ctx) {
+        Ok(Value::String(h)) => h,
+        _ => JsStr::from_str("Error"),
+    };
+    if trace.is_empty() {
+        return Ok(Value::String(head));
     }
+    Ok(Value::String(head.concat(&JsStr::from_str("\n")).concat(&trace)))
 }
 
 /// set Error.prototype.stack: a String value becomes an own data property (SetterThatIgnoresPrototypeProperties).
