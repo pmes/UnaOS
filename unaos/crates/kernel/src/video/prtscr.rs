@@ -2537,7 +2537,7 @@ pub fn announce(shot: &Shot) {
         // A toast is ONE line under a 24-char title (`toast::TL`/`LL`; `Screenshot saved to Desktop` is 27), so the title
         // says what and the line says WHERE — the file home-relative (`~/Desktop/Screenshot 2026-10-06 at 14.57.18.png`,
         // 46 of 52); the wire keeps the whole path.
-        if crate::video::dialog::notice(b"Screenshot saved", home_rel(&shot.path).as_bytes()) { "toast" } else { "toast-dropped" } // DIALOG2 (B404): THE router — information -> toast
+        if crate::video::notify::post_full(b"system", b"Screenshot saved", home_rel(&shot.path).as_bytes(), b"Open", crate::video::notify::ACT_OPEN_FILE, shot.path.as_bytes()) { "toast" } else { "toast-dropped" } /* NOTIFYCENTER (B622): the post carries an open-file action */ // DIALOG2 (B404): THE router — information -> toast
     };
     #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
     let to = "no-glass";
