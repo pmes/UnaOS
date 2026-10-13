@@ -350,6 +350,7 @@ bsprun|:: [orinbsprun] boot core |tegra|measured(1)
 sdmmc|:: UNAFS: native unafs volume MOUNTED read-only on SdMmc|tegra|measured(1)
 ga10bprobe5|[ga10bfw] window_need=|ga10bprobe5a+witness|measured(1)
 ga10bprobe5a|[ga10bprobe5a] -> REFUSED reason=|tegra|measured(13)
+ga10bprobe5g|[ga10bprobe5g] rung 5g ARMED|tegra|unmeasured-here
 baremetal|:: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console (no framebuffer) ::|-|measured(1)
 skip_xhci|:: xHCI bring-up SKIPPED (skip_xhci feature): video only, no USB ::|-|measured(1)
 lowbat_shutdown|:: LOWBAT-SHUTDOWN armed: pct=|-|measured(1)

@@ -502,5 +502,12 @@ refs/heads/exec-rmbp-doorsplit                  aa3c9c70 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-winresize2                 aa3c9c70 FOLDED-BY-HAND e524f792
 refs/heads/exec-orin-armresize                  360dbad9 FOLDED-BY-HAND 4f687b59
 refs/heads/exec-rmbp-firstlogin                 360dbad9 FOLDED-BY-HAND a76e79c2
-refs/heads/exec-host-aethersidetabs2            360dbad9 IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-host-aetherwpt4                 360dbad9 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-host-aethersidetabs2            360dbad9 FOLDED-BY-HAND e57d1b0e
+refs/heads/exec-host-aetherwpt4                 360dbad9 FOLDED-BY-HAND 621dda89
+refs/heads/exec-host-aetherwpt5                   e57d1b0e IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-host-aetherapis                   e57d1b0e IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-wifi10                       e57d1b0e FOLDED-BY-HAND 0a01b320
+refs/heads/exec-orin-ga10bnext                    e57d1b0e FOLDED-BY-HAND c29d976c
+refs/heads/exec-orin-appmenuarm                   e57d1b0e FOLDED-BY-HAND 782e7f67
+refs/heads/exec-rmbp-quarryhover                  e57d1b0e FOLDED-BY-HAND 96794a6d
+refs/heads/exec-rmbp-motionkit                    e57d1b0e FOLDED-BY-HAND e4528914

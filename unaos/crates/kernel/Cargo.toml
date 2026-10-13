@@ -2785,6 +2785,12 @@ ga10bprobe5s = ["ga10bprobe5a"]
 # line `map=swapped`. NEVER combined with `ga10bprobe5s` by the knob, for the same one-delta reason.
 # Default OFF. ARMED polarity type-checked by the `arm-tegra-ga10bprobe5m` leg. Witness: `[ga10bprobe5a]`.
 ga10bprobe5m = ["ga10bprobe5a"]
+# GA10BNEXT (orin-ledger A111): rung 5g = the GSP-ACR door's PORT CENSUS. `UNAOS_GA10B_PROBE5=6` arms it; it
+# runs FIRST in `ga10bprobe5_run` and RETURNS — no loader, no BCR write, no lock, nothing spent: ten falcon-port
+# registers read by name, imemc0/dmemc0 held and restored, one word round-tripped through each data port whose
+# control held. IMPLIES `ga10bprobe5a`; rides a render card, never with PROBE4. Default OFF. Witness:
+# `[ga10bprobe5g] rung 5g ARMED` (banner-cert row), verdict `:: ga10b: 5g port-census … ::`.
+ga10bprobe5g = ["ga10bprobe5a"]
 
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
