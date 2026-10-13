@@ -1003,6 +1003,13 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             v if is_neutral_keyword(v) => {}
             v => H::record_css(&format!("column-span-value:{}", clip(v))),
         },
+        // AETHERSTYLE3C (SR122): css-break-3 §5.4 — how a decorated box split across columns paints (`multicol`).
+        "box-decoration-break" => match value {
+            "slice" => style.paint.deco_clone = Some(false),
+            "clone" => style.paint.deco_clone = Some(true),
+            v if is_neutral_keyword(v) => {}
+            v => H::record_css(&format!("box-decoration-break-value:{}", clip(v))),
+        },
         // AETHERSTYLE3 (SR103): Filter Effects 1 §5 / Filter Effects 2 §3 — the list svg_core parses.
         "filter" | "backdrop-filter" => {
             let v = value.trim();
@@ -1777,7 +1784,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                             | "backface-visibility" | "perspective" | "perspective-origin"
                             | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
                             | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
-                            | "column-rule-style" | "column-rule-color" | "column-span"
+                            | "column-rule-style" | "column-rule-color" | "column-span" | "box-decoration-break"
                             | "writing-mode" | "text-orientation"
                     )
                 }) =>
@@ -2440,6 +2447,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
+        deco_clone,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {

@@ -834,6 +834,8 @@ fn property_supported(prop: &str) -> bool {
             | "transition-delay" | "transition-behavior" | "animation" | "animation-name" | "animation-duration"
             | "animation-timing-function" | "animation-delay" | "animation-iteration-count"
             | "animation-direction" | "animation-fill-mode" | "animation-play-state"
+            // AETHERSTYLE3C (SR122)
+            | "column-span" | "box-decoration-break" | "-webkit-box-decoration-break"
     )
 }
 

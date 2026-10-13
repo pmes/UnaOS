@@ -222,6 +222,8 @@ pub struct PaintStyle<H: Host> {
     pub scroll_padding: Option<[f32; 4]>,
     /// AETHERSTYLE3B (SR115): `column-span` (css-multicol-1 §6.1): true = `all`.
     pub col_span: Option<bool>,
+    /// AETHERSTYLE3C (SR122): `box-decoration-break` (css-break-3 §5.4): true = `clone`, false = `slice`.
+    pub deco_clone: Option<bool>,
 }
 
 
@@ -322,6 +324,7 @@ impl<H: Host> Default for PaintStyle<H> {
             snap_stop: None,
             scroll_padding: None,
             col_span: None,
+            deco_clone: None,
         }
     }
 }

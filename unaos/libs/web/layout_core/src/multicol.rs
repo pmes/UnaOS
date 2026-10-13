@@ -17,8 +17,18 @@
 //! block child with no painted box of its own (no background, border, padding, shadow, clip, filter or
 //! transform; not a scroll, flex, grid or multicol container) is not a unit itself: its in-flow children (and
 //! the lines of its plain IFC children) are, recursively — so a tall wrapper's content splits across columns
-//! (§8 fragmentation, `break-inside: auto`). A decorated box taller than a column still moves whole (its
-//! border and background are not painted per fragment: `box-decoration-break` is not modelled).
+//! (§8 fragmentation, `break-inside: auto`).
+//!
+//! AETHERSTYLE3C (SR122): a decorated block (background, border, padding or shadow; otherwise plain — see
+//! `fragmentable`) or decorated IFC root fragments too: its children (or lines) are units it owns, its own
+//! block-start edge travelling with the first and its block-end edge with the last. When they land in more than
+//! one column the box is painted per fragment ([`BoxFragment`], [`crate::LayoutTree::col_frags`], css-break-3
+//! §5.4): `box-decoration-break: slice` (initial) slices the one box, `clone` gives every fragment the box's
+//! full edges — the balancer then reserves the cloned block-start edges above a column's first unit and the
+//! block-end edges below its last (`fill`'s pads). When they all land in one column the box moves whole as
+//! before. A `column-span: all` box splits the flow at any depth of transparent wrappers (§6.1; the wrapper is
+//! not narrowed to the column width, its other children are — [`narrow_targets`]); inside a decorated box it
+//! stays a unit.
 
 use crate::inline::{Frag, InlineLayout};
 use crate::prelude::*;
@@ -89,24 +99,27 @@ pub(crate) enum Unit {
 }
 
 /// Greedy fill at column height `h`: the column of each unit and each column's top. `None` when it needs more
-/// than `n` columns (the last column then takes the rest when `force`).
-fn fill(units: &[(f32, f32, Unit)], h: f32, n: u32, force: bool) -> Option<(Vec<u32>, Vec<f32>)> {
+/// than `n` columns (the last column then takes the rest when `force`). AETHERSTYLE3C (SR122): `pads[i]` is what
+/// unit `i` adds when a column starts at it (`.0`, the cloned block-start edges of the decorated box it continues)
+/// and when a column ends after it (`.1`, the cloned block-end edges); empty = none.
+fn fill(units: &[(f32, f32, Unit)], pads: &[(f32, f32)], h: f32, n: u32, force: bool) -> Option<(Vec<u32>, Vec<f32>)> {
     let mut cols = Vec::with_capacity(units.len());
     let mut tops: Vec<f32> = Vec::new();
     let mut k = 0u32;
     let mut has = false;
-    for &(top, bottom, _) in units {
+    for (i, &(top, bottom, _)) in units.iter().enumerate() {
+        let (pre, post) = pads.get(i).copied().unwrap_or((0.0, 0.0));
         if tops.is_empty() {
             tops.push(top);
         }
-        if has && bottom - tops[k as usize] > h + 0.01 {
+        if has && bottom + post - tops[k as usize] > h + 0.01 {
             if k + 1 >= n {
                 if !force {
                     return None;
                 }
             } else {
                 k += 1;
-                tops.push(top);
+                tops.push(top - pre);
             }
         }
         has = true;
@@ -116,19 +129,20 @@ fn fill(units: &[(f32, f32, Unit)], h: f32, n: u32, force: bool) -> Option<(Vec<
 }
 
 /// Balances `units` into `n` columns (or fills at `fixed` height): per unit its (dx, dy), the used height and
-/// how many columns hold content.
-pub(crate) fn balance(units: &[(f32, f32, Unit)], n: u32, w: f32, gap: f32, fixed: Option<f32>) -> (Vec<(f32, f32)>, f32, u32) {
+/// how many columns hold content. `pads` as in [`fill`].
+pub(crate) fn balance(units: &[(f32, f32, Unit)], pads: &[(f32, f32)], n: u32, w: f32, gap: f32, fixed: Option<f32>) -> (Vec<(f32, f32)>, f32, u32) {
     if units.is_empty() {
         return (Vec::new(), 0.0, 0);
     }
     let first = units[0].0;
     let total = units.iter().map(|u| u.1).fold(first, f32::max) - first;
     let tallest = units.iter().map(|u| u.1 - u.0).fold(0.0f32, f32::max);
+    let pad_max = pads.iter().map(|p| p.0 + p.1).fold(0.0f32, f32::max);
     let h = match fixed {
         Some(h) => h.max(tallest),
         None => {
-            let (mut lo, mut hi) = (tallest, total.max(tallest));
-            if fill(units, lo, n, false).is_some() {
+            let (mut lo, mut hi) = (tallest, total.max(tallest) + pad_max);
+            if fill(units, pads, lo, n, false).is_some() {
                 hi = lo;
             }
             for _ in 0..24 {
@@ -136,7 +150,7 @@ pub(crate) fn balance(units: &[(f32, f32, Unit)], n: u32, w: f32, gap: f32, fixe
                     break;
                 }
                 let mid = (lo + hi) / 2.0;
-                if fill(units, mid, n, false).is_some() {
+                if fill(units, pads, mid, n, false).is_some() {
                     hi = mid;
                 } else {
                     lo = mid;
@@ -145,14 +159,17 @@ pub(crate) fn balance(units: &[(f32, f32, Unit)], n: u32, w: f32, gap: f32, fixe
             hi
         }
     };
-    let (cols, tops) = fill(units, h, n, true).unwrap_or_default();
+    let (cols, tops) = fill(units, pads, h, n, true).unwrap_or_default();
     let mut shifts = Vec::with_capacity(units.len());
     let mut used = 0.0f32;
     for (i, &(_, bottom, _)) in units.iter().enumerate() {
         let k = cols[i];
         let top = tops[k as usize];
         shifts.push((k as f32 * (w + gap), first - top));
-        used = used.max(bottom - top);
+        // the cloned block-end edges close a column that ends at this unit
+        let ends = cols.get(i + 1).is_none_or(|n| *n != k);
+        let post = if ends { pads.get(i).map(|p| p.1).unwrap_or(0.0) } else { 0.0 };
+        used = used.max(bottom + post - top);
     }
     let filled = cols.last().map(|k| k + 1).unwrap_or(0);
     (shifts, if fixed.is_some() { h } else { used }, filled)
@@ -215,7 +232,7 @@ pub(crate) fn balance_ifc<H: Host>(tree: &LayoutTree<H>, root: NodeId, il: &mut 
     let units: Vec<(f32, f32, Unit)> =
         il.lines.iter().enumerate().map(|(i, &(t, h, _))| (t, t + h, Unit::Line { ifc: root, line: i })).collect();
     let fixed = fixed_height(tree, root);
-    let (shifts, h, filled) = balance(&units, n, w, gap, fixed);
+    let (shifts, h, filled) = balance(&units, &[], n, w, gap, fixed);
     let heights = |id: NodeId| tree.taffy.layout(id).map(|l| l.size.height).unwrap_or(0.0);
     shift_lines(il, &shifts, &heights);
     il.height = h;
@@ -270,6 +287,12 @@ pub fn is_spanner<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
 /// A block box whose in-flow content fragments in its place: it paints nothing of its own (see the module
 /// notes) and is a plain block container with in-flow children.
 fn transparent<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
+    plain_block(tree, id) && !decorated(tree, id) && !flow_children(tree, id).is_empty()
+}
+
+/// A block container whose content may fragment: not an IFC root, multicol, scroll, flex or positioned box, and
+/// no clip, filter or transform (those paint the box as one layer).
+fn plain_block<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
     if tree.inline.contains_key(&id) || is_multicol(tree, id) || crate::scroll::is_scroll_container(tree, id) {
         return false;
     }
@@ -277,30 +300,146 @@ fn transparent<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
     if st.display != taffy::style::Display::Flex {
         return false;
     }
+    if tree.node_map.get(&id).and_then(|n| crate::DomNode::tag(n)).is_some_and(|t| crate::tree::is_table_part(&t)) {
+        return false;
+    }
+    match tree.paint_map.get(&id) {
+        Some(p) => {
+            p.flex_container != Some(true)
+                && p.clip != Some(true)
+                && !p.filter.as_ref().is_some_and(|f| f.is_some())
+                && !p.transform.as_ref().is_some_and(|t| !t.is_empty())
+                && !matches!(p.position_kind, Some(1..))
+        }
+        None => true,
+    }
+}
+
+/// The box paints something of its own: a background, a border, padding or a shadow.
+fn decorated<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
     let Ok(l) = tree.taffy.layout(id) else { return false };
-    if let Some(p) = tree.paint_map.get(&id) {
-        if p.flex_container == Some(true)
-            || p.background.is_some()
+    let painted = tree.paint_map.get(&id).is_some_and(|p| {
+        p.background.is_some()
             || p.bg_image.is_some()
             || p.bg_gradient.as_ref().is_some_and(|g| g.is_some())
             || p.shadows.as_ref().is_some_and(|s| !s.is_empty())
-            || p.clip == Some(true)
-            || p.filter.as_ref().is_some_and(|f| f.is_some())
-            || p.transform.as_ref().is_some_and(|t| !t.is_empty())
-            || matches!(p.position_kind, Some(1..))
-        {
-            return false;
-        }
-    }
-    l.border.top + l.border.bottom + l.border.left + l.border.right == 0.0
-        && l.padding.top + l.padding.bottom + l.padding.left + l.padding.right == 0.0
-        && !flow_children(tree, id).is_empty()
+    });
+    painted
+        || l.border.top + l.border.bottom + l.border.left + l.border.right != 0.0
+        || l.padding.top + l.padding.bottom + l.padding.left + l.padding.right != 0.0
 }
 
-/// The fragmentation units of one in-flow child `k` of `parent`, whose border box's top is `base_y` in the
-/// container's content space: a whole box, the lines of a splittable IFC, or (recursively) a transparent
-/// block's own units.
-fn collect_child<H: Host>(tree: &LayoutTree<H>, k: NodeId, base_y: f32, depth: u32, units: &mut Vec<(f32, f32, Unit)>) {
+/// AETHERSTYLE3C (SR122): a decorated box whose content fragments (css-break-3 §5.4 `box-decoration-break`):
+/// a plain block container with in-flow children, or an IFC root (its lines), that paints a box of its own.
+fn fragmentable<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
+    if !decorated(tree, id) {
+        return false;
+    }
+    if let Some(il) = tree.inline.get(&id) {
+        let Some(p) = tree.paint_map.get(&id) else { return !il.lines.is_empty() };
+        return !il.lines.is_empty()
+            && il.columns.is_none()
+            && il.vertical == 0
+            && !crate::scroll::is_scroll_container(tree, id)
+            && p.clip != Some(true)
+            && p.flex_container != Some(true)
+            && !p.filter.as_ref().is_some_and(|f| f.is_some())
+            && !p.transform.as_ref().is_some_and(|t| !t.is_empty())
+            && !matches!(p.position_kind, Some(1..))
+            && !matches!(p.display_kind, Some(0 | 2));
+    }
+    plain_block(tree, id) && !flow_children(tree, id).is_empty()
+}
+
+/// AETHERSTYLE3C (SR122): one column fragment of a decorated box split across columns (css-break-3 §5.4). In
+/// the box's own border-box space (unshifted): the piece's `top` and `height` (x and width are the box's);
+/// `shift` moves the piece to its column like [`crate::LayoutTree::col_shift`]; `edges` say whether the piece
+/// draws the box's block-start / block-end border and padding. Under `slice` (the initial value) the pieces are
+/// slices of the one box laid end to end — its background positioned against the whole box, the block-start
+/// edges on the first piece only, the block-end edges on the last; under `clone` (`cloned`) every piece is a box
+/// of its own with all four edges, its background positioned against the piece.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxFragment {
+    pub shift: (f32, f32),
+    pub top: f32,
+    pub height: f32,
+    pub edges: (bool, bool),
+    pub cloned: bool,
+}
+
+/// A decorated box whose units fragment: its border box's top and height in the container's content space,
+/// its block-start / block-end edges (border + padding) and its `box-decoration-break`.
+struct Deco {
+    id: NodeId,
+    top: f32,
+    height: f32,
+    start: f32,
+    end: f32,
+    cloned: bool,
+}
+
+/// One fragmentation unit while the flow is collected: (top, bottom, what moves), the clone pads ([`fill`])
+/// and the decorated box it belongs to.
+struct U {
+    top: f32,
+    bottom: f32,
+    unit: Unit,
+    pad: (f32, f32),
+    owner: Option<usize>,
+}
+
+/// The flow of a multicol container as column sets split by spanners.
+enum Item {
+    Set(Vec<U>),
+    Spanner(NodeId),
+}
+
+/// What the flow collection fills in.
+struct Flow {
+    items: Vec<Item>,
+    decos: Vec<Deco>,
+    /// The bottom of the last thing collected (the container's single-column content end).
+    end: f32,
+}
+
+impl Flow {
+    fn set(&mut self) -> &mut Vec<U> {
+        if !matches!(self.items.last(), Some(Item::Set(_))) {
+            self.items.push(Item::Set(Vec::new()));
+        }
+        match self.items.last_mut() {
+            Some(Item::Set(v)) => v,
+            _ => unreachable!(),
+        }
+    }
+    fn push(&mut self, top: f32, bottom: f32, unit: Unit) {
+        self.end = self.end.max(bottom);
+        self.set().push(U { top, bottom, unit, pad: (0.0, 0.0), owner: None });
+    }
+}
+
+/// The in-flow children of `parent` (whose border-box top is `base_y` in the container's content space) into
+/// the flow: AETHERSTYLE3C (SR122) a `column-span: all` box at any depth of transparent wrappers splits the flow
+/// (css-multicol-1 §6.1: the spanner is in the container's formatting context), unless it sits inside a
+/// decorated box (`in_deco`), where it stays a unit.
+fn collect_flow<H: Host>(tree: &LayoutTree<H>, parent: NodeId, base_y: f32, depth: u32, in_deco: bool, flow: &mut Flow) {
+    for k in flow_children(tree, parent) {
+        if !in_deco && is_spanner(tree, k) {
+            if let Ok(kl) = tree.taffy.layout(k) {
+                flow.end = flow.end.max(base_y + kl.location.y + kl.size.height + kl.margin.bottom.max(0.0));
+            }
+            flow.items.push(Item::Spanner(k));
+            flow.items.push(Item::Set(Vec::new()));
+            continue;
+        }
+        collect_child(tree, k, base_y, depth, in_deco, flow);
+    }
+}
+
+/// The fragmentation units of one in-flow child `k` whose parent's border box's top is `base_y` in the
+/// container's content space: a whole box, the lines of a splittable IFC, (recursively) a transparent block's
+/// own units, or (AETHERSTYLE3C) a decorated box's content as units it owns ([`Deco`]).
+fn collect_child<H: Host>(tree: &LayoutTree<H>, k: NodeId, base_y: f32, depth: u32, in_deco: bool, flow: &mut Flow) {
     let Ok(kl) = tree.taffy.layout(k).cloned() else { return };
     let top = base_y + kl.location.y - kl.margin.top.max(0.0);
     let bottom = base_y + kl.location.y + kl.size.height + kl.margin.bottom.max(0.0);
@@ -308,17 +447,47 @@ fn collect_child<H: Host>(tree: &LayoutTree<H>, k: NodeId, base_y: f32, depth: u
         let il = &tree.inline[&k];
         let dy = base_y + kl.location.y + kl.border.top + kl.padding.top;
         if il.lines.is_empty() {
-            units.push((top, bottom, Unit::Box(k)));
+            flow.push(top, bottom, Unit::Box(k));
         }
         for (i, &(t, h, _)) in il.lines.iter().enumerate() {
-            units.push((dy + t, dy + t + h, Unit::Line { ifc: k, line: i }));
+            flow.push(dy + t, dy + t + h, Unit::Line { ifc: k, line: i });
         }
     } else if depth < 8 && transparent(tree, k) {
-        for g in flow_children(tree, k) {
-            collect_child(tree, g, base_y + kl.location.y, depth + 1, units);
+        collect_flow(tree, k, base_y + kl.location.y, depth + 1, in_deco, flow);
+    } else if depth < 8 && !in_deco && fragmentable(tree, k) {
+        let first = flow.set().len();
+        if let Some(il) = tree.inline.get(&k) {
+            let dy = base_y + kl.location.y + kl.border.top + kl.padding.top;
+            for (i, &(t, h, _)) in il.lines.iter().enumerate() {
+                flow.push(dy + t, dy + t + h, Unit::Line { ifc: k, line: i });
+            }
+        } else {
+            collect_flow(tree, k, base_y + kl.location.y, depth + 1, true, flow);
         }
+        let cloned = tree.paint_map.get(&k).and_then(|p| p.deco_clone) == Some(true);
+        let start = kl.border.top + kl.padding.top;
+        let end = kl.border.bottom + kl.padding.bottom;
+        let di = flow.decos.len();
+        // the decorated box's content stays in one set (no spanner inside it), so its units are a run
+        let units = flow.set();
+        if units.len() <= first {
+            flow.push(top, bottom, Unit::Box(k));
+            return;
+        }
+        let last = units.len() - 1;
+        // the box's own block-start edge (and margin) travels with its first unit, its block-end with its last
+        units[first].top = top;
+        units[last].bottom = bottom;
+        for (i, u) in units.iter_mut().enumerate().skip(first) {
+            u.owner = Some(di);
+            if cloned {
+                u.pad = (if i > first { start } else { 0.0 }, if i < last { end } else { 0.0 });
+            }
+        }
+        flow.end = flow.end.max(bottom);
+        flow.decos.push(Deco { id: k, top: base_y + kl.location.y, height: kl.size.height, start, end, cloned });
     } else {
-        units.push((top, bottom, Unit::Box(k)));
+        flow.push(top, bottom, Unit::Box(k));
     }
 }
 
@@ -352,38 +521,49 @@ pub(crate) fn flow_children<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Vec<No
         .collect()
 }
 
+/// A transparent wrapper with a spanner somewhere inside it (through more transparent wrappers).
+fn holds_spanner<H: Host>(tree: &LayoutTree<H>, id: NodeId, depth: u32) -> bool {
+    depth < 8
+        && transparent(tree, id)
+        && flow_children(tree, id).into_iter().any(|k| is_spanner(tree, k) || holds_spanner(tree, k, depth + 1))
+}
+
+/// AETHERSTYLE3C (SR122): the boxes of multicol container `id` the single-column pass narrows to the column
+/// width: its in-flow children, except spanners (they keep the full width) and wrappers that hold one (their
+/// own children are narrowed instead, recursively, so the spanner inside stays full-width).
+pub(crate) fn narrow_targets<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Vec<NodeId> {
+    fn walk<H: Host>(tree: &LayoutTree<H>, id: NodeId, depth: u32, out: &mut Vec<NodeId>) {
+        for k in flow_children(tree, id) {
+            if is_spanner(tree, k) {
+                continue;
+            }
+            if holds_spanner(tree, k, depth) {
+                walk(tree, k, depth + 1, out);
+            } else {
+                out.push(k);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, id, 0, &mut out);
+    out
+}
+
 /// css-multicol-1 on a block multicol container whose children are already laid out at the column width:
-/// fragments them (whole boxes, or the lines of a splittable IFC child) into the columns, records the boxes'
-/// [`LayoutTree::col_shift`] and rewrites the split lines. Returns the column geometry.
+/// fragments them (whole boxes, the lines of a splittable IFC child, the content of a decorated box) into the
+/// columns, records the boxes' [`LayoutTree::col_shift`], the decorated boxes' [`LayoutTree::col_frags`] and
+/// rewrites the split lines. Returns the column geometry.
 pub(crate) fn balance_blocks<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, n: u32, w: f32, gap: f32) -> Columns {
     let Ok(cl) = tree.taffy.layout(id).cloned() else { return Columns::default() };
     let content_top = cl.border.top + cl.padding.top;
-    // AETHERSTYLE3B (SR115): the flow splits at each `column-span: all` child into column sets.
-    enum Item {
-        Set(Vec<(f32, f32, Unit)>),
-        Spanner(NodeId),
-    }
-    let mut items: Vec<Item> = vec![Item::Set(Vec::new())];
-    let mut content_end = 0.0f32;
-    for k in flow_children(tree, id) {
-        if is_spanner(tree, k) {
-            if let Ok(kl) = tree.taffy.layout(k) {
-                content_end = content_end.max(kl.location.y + kl.size.height + kl.margin.bottom.max(0.0) - content_top);
-            }
-            items.push(Item::Spanner(k));
-            items.push(Item::Set(Vec::new()));
-            continue;
-        }
-        if let Some(Item::Set(units)) = items.last_mut() {
-            collect_child(tree, k, -content_top, 0, units);
-            if let Some(u) = units.last() {
-                content_end = content_end.max(u.1);
-            }
-        }
-    }
-    let split = items.len() > 1;
+    // AETHERSTYLE3B (SR115): the flow splits at each `column-span: all` child into column sets;
+    // AETHERSTYLE3C (SR122): at any depth of transparent wrappers.
+    let mut flow = Flow { items: vec![Item::Set(Vec::new())], decos: Vec::new(), end: 0.0 };
+    collect_flow(tree, id, -content_top, 0, false, &mut flow);
+    let Flow { items, decos, end: content_end } = flow;
+    let split = items.iter().any(|i| matches!(i, Item::Spanner(_)));
     let fixed = if split { None } else { fixed_height(tree, id) };
-    let mut units: Vec<(f32, f32, Unit)> = Vec::new();
+    let mut units: Vec<U> = Vec::new();
     let mut shifts: Vec<(f32, f32)> = Vec::new();
     let mut sets: Vec<ColumnSet> = Vec::new();
     let (mut h, mut filled) = (0.0f32, 0u32);
@@ -394,9 +574,11 @@ pub(crate) fn balance_blocks<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, n: u
                 if seg.is_empty() {
                     continue;
                 }
-                let (s, used, f) = balance(&seg, n, w, gap, fixed);
-                let first = seg[0].0;
-                let end = seg.iter().map(|u| u.1).fold(first, f32::max);
+                let plain: Vec<(f32, f32, Unit)> = seg.iter().map(|u| (u.top, u.bottom, u.unit)).collect();
+                let pads: Vec<(f32, f32)> = seg.iter().map(|u| u.pad).collect();
+                let (s, used, f) = balance(&plain, &pads, n, w, gap, fixed);
+                let first = seg[0].top;
+                let end = seg.iter().map(|u| u.bottom).fold(first, f32::max);
                 sets.push(ColumnSet { top: first + acc, height: used, filled: f });
                 h = h.max(used);
                 filled = filled.max(f);
@@ -415,10 +597,53 @@ pub(crate) fn balance_blocks<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, n: u
         h = (content_end + acc).max(0.0);
         tree.col_sets.insert(id, sets);
     }
+    // AETHERSTYLE3C (SR122): a decorated box whose units all landed in one place moves whole (its shift is its
+    // own, its content's are dropped); one split across columns is painted per fragment.
+    for (di, d) in decos.iter().enumerate() {
+        let idx: Vec<usize> = (0..units.len()).filter(|&i| units[i].owner == Some(di)).collect();
+        let Some(&i0) = idx.first() else { continue };
+        if idx.iter().all(|&i| shifts[i] == shifts[i0]) {
+            if shifts[i0] != (0.0, 0.0) {
+                tree.col_shift.insert(d.id, shifts[i0]);
+            }
+            for &i in &idx {
+                shifts[i] = (0.0, 0.0);
+            }
+            continue;
+        }
+        let mut groups: Vec<(usize, usize)> = Vec::new(); // (first unit, last unit) per fragment
+        for &i in &idx {
+            match groups.last_mut() {
+                Some(g) if shifts[g.0] == shifts[i] => g.1 = i,
+                _ => groups.push((i, i)),
+            }
+        }
+        let count = groups.len();
+        let mut frags = Vec::with_capacity(count);
+        for (g, &(a, b)) in groups.iter().enumerate() {
+            let (first, last) = (g == 0, g + 1 == count);
+            let (top, bottom) = if d.cloned {
+                (
+                    if first { 0.0 } else { units[a].top - d.top - d.start },
+                    if last { d.height } else { units[b].bottom - d.top + d.end },
+                )
+            } else {
+                (if first { 0.0 } else { units[a].top - d.top }, if last { d.height } else { units[groups[g + 1].0].top - d.top })
+            };
+            frags.push(BoxFragment {
+                shift: shifts[a],
+                top,
+                height: (bottom - top).max(0.0),
+                edges: if d.cloned { (true, true) } else { (first, last) },
+                cloned: d.cloned,
+            });
+        }
+        tree.col_frags.insert(d.id, frags);
+    }
     // per IFC child: the shift of each of its lines
     let mut per_ifc: Vec<(NodeId, Vec<(f32, f32)>)> = Vec::new();
     for (u, s) in units.iter().zip(shifts.iter()) {
-        match u.2 {
+        match u.unit {
             Unit::Box(k) => {
                 if *s != (0.0, 0.0) {
                     tree.col_shift.insert(k, *s);
@@ -454,6 +679,9 @@ pub(crate) fn balance_blocks<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, n: u
     }).collect();
     let hf = |nid: NodeId| heights.iter().find(|(i, _)| *i == nid).map(|(_, h)| *h).unwrap_or(0.0);
     for (ifc, per_line) in per_ifc {
+        if per_line.iter().all(|s| *s == (0.0, 0.0)) {
+            continue;
+        }
         if let Some(il) = tree.inline.get_mut(&ifc) {
             shift_lines(il, &per_line, &hf);
         }
