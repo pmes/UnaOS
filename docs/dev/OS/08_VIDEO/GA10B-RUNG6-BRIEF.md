@@ -121,3 +121,55 @@ null hypothesis, measured against the firmware file list and nvgpu's GA10B path;
 what can refute it. Rung 5b is BUILT and compiles ARMED (`arm-tegra-ga10bprobe5b`); rungs 6a–6d are
 DESIGN only (A65 `open`), each blocked on the metal read the rung below it provides — R53's ladder,
 one rung and the one after, stopping where the next step is a metal boot.
+
+## 8. Rung 5g — the GSP-ACR door, step one: the IMEM/DMEM PORT CENSUS (GA10BNEXT, 2026-10-14; ledger A111)
+
+Added after A95 closed the BRFETCH-DMA door by measurement (RUNG5 brief §9). The ladder's record names TWO
+doors in nvgpu (orin-queue 2026-09-12; §9.2): the BRFETCH-DMA door every rung flew, and the GSP-ACR door —
+`MAILBOX0/1` descriptor + `bcr_ctrl 0x11` (BRFETCH FALSE) + IMEM/DMEM PORT LOADS before STARTCPU. §9.2 ruled
+the second door "not a candidate until its write list exists", and the write list is still unread. That bars
+its IGNITION. It does not bar its CENSUS, which is the ladder's older discipline (3 before 3b, 4a before 4b,
+this brief's §3 before §2 step 2): the door's write class is the falcon port (`IMEMC/IMEMD/IMEMT/DMEMC/DMEMD`),
+and no rung has ever read one of those registers on this die. The full design, register table and verdict
+vocabulary are `docs/dev/evidence/ga10bnext/GA10BNEXT.md` §3; this section is the brief's pointer and the
+bounding row.
+
+- **Knob** `UNAOS_GA10B_PROBE5=6` → `ga10bprobe5a` + `ga10bprobe5g`. Code `arch/aarch64/ga10b_port.rs`
+  (a child module of `ga10b_ignite`, gated on `ga10bprobe5g`). On this build `ga10bprobe5_run` runs the
+  census FIRST and RETURNS: no loader, no ignition, nothing spent, the desktop comes up.
+- **Sequence** (GSP legacy-falcon block, BAR0 + 0x110000): the bracket (rail + clocks, BPMP); READ census
+  `hwcfg 0x108`, `hwcfg2 0x0f4`, `mailbox0 0x040`, `cpuctl 0x100` (the known lockdown control — pri-error on
+  every flight), then first touch `mailbox1 0x044`, `imemc0 0x180`, `imemd0 0x184`, `imemt0 0x188`,
+  `dmemc0 0x1c0`, `dmemd0 0x1c4`; CONTROL census of `imemc0` and `dmemc0` (write BLK=1, readback, restore
+  as found); ONE-WORD round-trip through each data port whose control register held (re-point, read as-found,
+  write `0x4A10B5D0`, re-point, read, re-point, restore, re-point, read); the bracket restored.
+- **Provenance.** `hwcfg`/`hwcfg2`/`cpuctl` ACKED; `mailbox0` PUBLIC-RECALLED and metal-proven (rung 3b);
+  the ports, their fields (OFFS [7:2], BLK [23:8], AINCW 24, AINCR 25, SECURE 28), `imemt`, `mailbox1` and
+  HWCFG's size fields are PUBLIC-RECALLED (nouveau `nvkm/falcon/v1.c` + `base.c`, MIT; open-gpu-kernel-modules
+  `dev_falcon_v4.h`, MIT) and NOT in the ACKED facts file — announced before every touch, printed raw.
+- **A decode of a flown datum:** `hwcfg = 0x80420100` = IMEM 64 KiB, DMEM 64 KiB; the `acr-gsp` text (28,672 B)
+  and data (9,472 B) FIT a port-load.
+- **Why its answer is attributable where `br_retcode` was not:** lockdown is per-register in this block
+  (`hwcfg`/`hwcfg2`/`mailbox0` answer, `dmactl`/`idlestate`/`irq*`/`cpuctl` read `0xbadf5620`); the ports are
+  on neither list. `PORT-GATED` = lockdown reaches the door's write class, door 2 closed at this altitude by
+  direct measurement (R19 form). `PORT-OPEN` = the write class is open under lockdown, a GPU-side positive no
+  flight has shown, and the floor the door's ignition rung would stand on — still a candidate ONLY once the
+  nvgpu write list is read (§9.5 item 1).
+
+| rung | new witness | sibling it must exclude | the bound that HOLDS |
+|---|---|---|---|
+| 5g | `[ga10bprobe5g] port census: … -> PORT-OPEN` and `:: ga10b: 5g port-census … -> PASS ::` | rung 4c/5a's reads of `hwcfg`/`hwcfg2`/`mailbox0` in the same block (values there say nothing about the ports), and a control register that holds while its data port does not | key on `[ga10bprobe5g]` + `imemd=held dmemd=held`: the PATTERN read back through the re-pointed port AND the as-found word read back after the restore, on BOTH ports |
+
+**Fail shapes, named ahead (R19 form, knob and code KEPT):** F35 `PORT-GATED` — the five port registers
+pri-error, hwcfg a value: the door is closed at this altitude; the next question is the one §9.5 already
+names (NVIDIA's signed chain above EL2), not another EL2 write. F36 `PORT-CTRL-NOT-HELD` — a control register
+answers but ignores the write: a read-only mirror under lockdown; record, do not iterate. F37
+`PORT-DATA-NOT-HELD` — the control holds, the data port returns the as-found word: the port is pointed but
+the memory write is dropped (a SECURE-bit or lockdown rule on the data path); the IMEMC SECURE bit 28 is
+the one documented delta, for a LATER rung, not this one. F38 `PORT-PARTIAL` — DMEM open, IMEM gated (or the
+reverse): the door needs both; record which. F39 `PORT-UNREADABLE` — hwcfg itself pri-error: not the block the
+ladder has read; re-fly cold before reading anything into it.
+
+**What the rung does NOT attempt:** no vendor byte, no BCR write, no lock, no `bcr_ctrl`, no STARTCPU, no
+mailbox write (§9.3 closed it), no PMU/FECS/GPCCS. QEMU virt has no GA10B: the loader fixture prints
+`:: ga10b: 5g SKIP reason=no-ga10b ::` there, by name.

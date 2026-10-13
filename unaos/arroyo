@@ -1605,6 +1605,15 @@ fi
 #                             SWAPPED (fmccode<-…data…, fmcdata<-…text…, manifest unmoved): the other
 #                             ONE delta, the MAPPING (ledger A81). 3 and 4 NEVER combine — the BCR lock
 #                             makes a boot ONE ignition, so a two-delta arm could not attribute a FAIL
+#   UNAOS_GA10B_PROBE5=6   -> + `ga10bprobe5a` + `ga10bprobe5g` — RUNG 5g, THE GSP-ACR DOOR'S FIRST RUNG: the
+#                             IMEM/DMEM PORT CENSUS (`arch/aarch64/ga10b_port.rs`, ledger A111). NOT an
+#                             ignition: on this build `ga10bprobe5_run` runs the census in place of the loader
+#                             and the ignition — the port registers read under lockdown, the two control
+#                             registers write-readback-restored, ONE WORD round-tripped through each data port —
+#                             prints `:: ga10b: 5g port-census … -> PASS|FAIL reason=…|DEFERRED reason=… ::`
+#                             and RETURNS into the desktop. Nothing spent, no `d` form (there is no ignition
+#                             to defer). On a virt build the loader fixture prints `:: ga10b: 5g SKIP
+#                             reason=no-ga10b ::`.
 #   UNAOS_GA10B_PROBE5=<n>d (1d|5d|2d|7d|3d|4d) -> the same set + `ga10bprobe5d` — the ignition DEFERRED to the
 #                             shutdown path (rung 4d's shape): the loader still runs at boot, the desktop
 #                             comes up, Shut Down ignites (needs the power::psci_call hook, see Cargo.toml)
@@ -1616,13 +1625,13 @@ fi
 # 5a implies 4a, so rung 4a's own census also runs at post-heap-init and RETURNS; 5a re-proves it inside.
 # Default OFF => modules + call sites vanish, no panic Location moves, knob-off images byte-identical.
 # ARMED polarities type-checked by the `arm-ga10bprobe5` (virt, witness), `arm-tegra-ga10bprobe5a`,
-# `arm-tegra-ga10bprobe5e`, `arm-tegra-ga10bprobe5b`, `arm-tegra-ga10bprobe5d`, `arm-tegra-ga10bprobe5s`
-# and `arm-tegra-ga10bprobe5m` legs of KERNEL_CFG_MATRIX.
-# Witness families: `[ga10bfw]`, `[ga10bprobe5a]`, `[ga10bprobe5b]`, `[ga10bprobe5d]`. Fly WITHOUT
+# `arm-tegra-ga10bprobe5e`, `arm-tegra-ga10bprobe5b`, `arm-tegra-ga10bprobe5d`, `arm-tegra-ga10bprobe5s`,
+# `arm-tegra-ga10bprobe5m` and `arm-tegra-ga10bprobe5g` legs of KERNEL_CFG_MATRIX.
+# Witness families: `[ga10bfw]`, `[ga10bprobe5a]`, `[ga10bprobe5b]`, `[ga10bprobe5d]`, `[ga10bprobe5g]`. Fly WITHOUT
 # UNAOS_GA10B_PROBE1/2/3/4. The ORIN-SELFUP line of `tegra_early_stop` is the 5a call's seam (main.rs).
 [ -n "${UNAOS_GA10B_PROBE5:-}" ] && _feats="${_feats}ga10bprobe5,"
 _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_jetson_img|jetson-img) _p5_metal=1 ;; esac; [ -n "${UNAOS_TEGRA:-}" ] && _p5_metal=1   # GA10B-PROBE5 METAL GATE. ⚠ WAS `[ "${1:-}" = "esp-jetson" ]`, a single string equality against ONE of the SIX verb spellings the dispatcher accepts (`esp-jetson|esp_jetson|jetson` at :9026 and `esp-jetson-img|esp_jetson_img|jetson-img` at :9029, whose `esp_jetson_img()` is nothing but a call to `esp_jetson`). So five of six spellings silently DROPPED `ga10bprobe5a` — the ignition itself — while still setting `ga10bprobe5`, and the build printed a feature banner that named the rung it was not building. MEASURED 2026-09-13 staging rung 5a: `esp-jetson` built `ga10bprobe5,ga10bprobe5a`, the `esp-jetson-img` step that follows it in the same chain rebuilt `ga10bprobe5` alone and OVERWROTE kernel.elf, and `LC_ALL=C grep -a -o -F` on the artifact found `ga10b` 0 against the 4f card's 79. A card cut from that boots, prints no rung, and looks like a clean flight — one power cycle spent on nothing. Enumerate the aliases the way the UNAOS_WITNESS gate at :49 already does; a feature gate keys on the BUILD TARGET, never on one spelling of its name. PROBE4 carries no such guard, which is why the render15-4f card was sound.
-[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; 2|2d) _feats="${_feats}ga10bprobe5a,ga10bprobe5b," ;; 7|7d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e,ga10bprobe5b," ;; 3|3d) _feats="${_feats}ga10bprobe5a,ga10bprobe5s," ;; 4|4d) _feats="${_feats}ga10bprobe5a,ga10bprobe5m," ;; esac
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; 2|2d) _feats="${_feats}ga10bprobe5a,ga10bprobe5b," ;; 7|7d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e,ga10bprobe5b," ;; 3|3d) _feats="${_feats}ga10bprobe5a,ga10bprobe5s," ;; 4|4d) _feats="${_feats}ga10bprobe5a,ga10bprobe5m," ;; 6) _feats="${_feats}ga10bprobe5a,ga10bprobe5g," ;; esac
 [ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1d|5d|2d|7d|3d|4d) _feats="${_feats}ga10bprobe5d," ;; esac
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
@@ -7551,6 +7560,11 @@ KERNEL_CFG_MATRIX=(
   # `MAP` is evaluated at compile time in BOTH polarities, so a mapping that does not invert is a build
   # error here rather than a mislabelled line on the wire.
   "arm-tegra-ga10bprobe5m ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5m"
+  # GA10B-PROBE5G armed (GA10BNEXT, 2026-10-14; ledger A111) — the `=6` polarity: rung 5g, the GSP-ACR door's
+  # IMEM/DMEM PORT CENSUS (`arch/aarch64/ga10b_port.rs`, a child module of `ga10b_ignite` gated on this
+  # feature alone), run in place of the ignition. IMPLIES `ga10bprobe5a`. Without this leg the only file of
+  # the rung is lexed by NOTHING in `check`.
+  "arm-tegra-ga10bprobe5g ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5g"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of
