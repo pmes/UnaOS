@@ -494,8 +494,8 @@ refs/heads/exec-pi-piemptybin                 bd3d399d IN-FLIGHT cloud 2026-10-1
 refs/heads/exec-rmbp-glasskit                   bd3d399d FOLDED-BY-HAND 817f7945
 refs/heads/exec-rmbp-softy                      bd3d399d FOLDED-BY-HAND 817f7945
 refs/heads/exec-host-designlang                 bd3d399d FOLDED-BY-HAND 817f7945
-refs/heads/exec-rmbp-settingscraft              817f7945 IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-rmbp-desktopcraft               817f7945 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-settingscraft              817f7945 FOLDED-BY-HAND 0a9c3340
+refs/heads/exec-rmbp-desktopcraft               817f7945 FOLDED-BY-HAND 0a9c3340
 refs/heads/exec-rmbp-dhcpreplug                 817f7945 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-ptrpress2                  817f7945 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-doorsplit                  aa3c9c70 FOLDED-BY-HAND e524f792
