@@ -26324,6 +26324,8 @@ pub fn prefchanged_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
         return None;
     }
     bus_mbox_pop(row as u64).map(|m| m.frame)
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 // ARMRESOLVE (rmbp-ledger B560) — SYS_LISTEN(47) / SYS_ACCEPT(48) on aarch64, over `net_phy::net6`.
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
