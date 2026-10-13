@@ -11,6 +11,10 @@ name = "css_core"
 version = "0.1.0"
 
 [[package]]
+name = "edit_core"
+version = "0.1.0"
+
+[[package]]
 name = "font8x8"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -118,6 +122,7 @@ name = "user-aether"
 version = "0.1.0"
 dependencies = [
  "css_core",
+ "edit_core",
  "font8x8",
  "font_core",
  "html_core",

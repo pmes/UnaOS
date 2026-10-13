@@ -37,6 +37,18 @@
 //! select=<n> -> PASS|FAIL|SKIP ::` — PASS additionally needs hover=1, nav=1 and select > 0; `[aetherapp] drive
 //! …` carries each step's tail and the clip rc.
 //!
+//! 5. DRIVE (AETHERMETAL4, LEDGER SR109): THE CHROME, one step per feature after M3's, same channel: Ctrl+T (0x14)
+//!    opens a tab (`:: AETHER: tab -> PASS how=new tabs=2` → `tab=1`); the new tab's address field has the keys,
+//!    so Ctrl+L (0x0C) + `/system/doc/welcome.html` + Enter types a URL to a local page (`:: AETHER: nav -> PASS
+//!    how=omnibox` → `url=1`); Ctrl+F (0x06) + `aether` + Enter finds in it (`:: AETHER: find -> PASS hits=<n>` →
+//!    `find=<n>`), Esc closes the bar; Left goes back to the new-tab page (`:: AETHER: nav -> PASS how=back` →
+//!    `back=1`); `=` zooms (`:: AETHER: zoom -> PASS pct=110`, reported) and Ctrl+W closes the tab (`:: AETHER: tab
+//!    -> PASS how=close tabs=1`, reported). Every pointer position the drive pushes is WINDOW px (the focus line's
+//!    `at=` is reported in them, below the chrome).
+//!
+//! WITNESS (SR109). `… hover=<0|1> nav=<0|1> select=<n> tab=<0|1> url=<0|1> back=<0|1> find=<n> -> PASS|FAIL|SKIP ::`
+//! — PASS additionally needs tab=1, url=1, back=1 and find > 0; `[aetherapp] chrome …` carries each step's tail.
+//!
 //! The knob is `UNAOS_AETHER=1` → feature `aether` (it implies `selfdiag`: SYS_PATH_READ is the file surface the
 //! program reads the page and the faces through). Registered from `tests::ensure_shellux`, so the QEMU lanes
 //! (`tests-at-boot`) run it at boot and the desktop runs it as `tests aether`.
@@ -58,7 +70,7 @@ pub fn ensure() {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn selftest() {
     serial_println!(":: AETHERAPP: reason=aarch64-image-owed ::");
-    serial_println!(":: AETHERAPP: image={} window=bad painted=0 lines=0 hover=0 nav=0 select=0 -> SKIP reason=aarch64-image-owed ::", IMAGE);
+    serial_println!(":: AETHERAPP: image={} window=bad painted=0 lines=0 hover=0 nav=0 select=0 tab=0 url=0 back=0 find=0 -> SKIP reason=aarch64-image-owed ::", IMAGE);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -66,8 +78,8 @@ pub fn selftest() {
     let verdict_m3 = |window: &str, painted: u64, lines: u64, d: &Drive, v: &str| {
         crate::serial_line::tail_arm(); // the glass reads THIS line's tail, not the program's
         serial_println!(
-            ":: AETHERAPP: image={} window={} painted={} lines={} hover={} nav={} select={} -> {} ::",
-            IMAGE, window, painted, lines, d.hover as u8, d.nav as u8, d.select, v
+            ":: AETHERAPP: image={} window={} painted={} lines={} hover={} nav={} select={} tab={} url={} back={} find={} -> {} ::",
+            IMAGE, window, painted, lines, d.hover as u8, d.nav as u8, d.select, d.tab as u8, d.url as u8, d.back as u8, d.find, v
         );
     };
     let verdict = |window: &str, painted: u64, lines: u64, v: &str| verdict_m3(window, painted, lines, &Drive::default(), v);
@@ -144,12 +156,19 @@ pub fn selftest() {
         "[aetherapp] drive focus={:?} hover={:?} select={:?} clip={:?} nav={:?}",
         drive.tails[0].as_deref(), drive.tails[1].as_deref(), drive.tails[2].as_deref(), drive.tails[3].as_deref(), drive.tails[4].as_deref()
     );
+    serial_println!(
+        "[aetherapp] chrome tab={:?} url={:?} find={:?} back={:?} zoom={:?} close={:?}",
+        drive.tails[5].as_deref(), drive.tails[6].as_deref(), drive.tails[7].as_deref(), drive.tails[8].as_deref(), drive.tails[9].as_deref(), drive.tails[10].as_deref()
+    );
     let m3 = drive.hover && drive.nav && drive.select > 0;
+    let chrome = drive.tab && drive.url && drive.back && drive.find > 0; // SR109
     if ok && !m3 {
         why(if drive.tails[0].is_none() { "no-focus-line" } else if !drive.hover { "no-hover" } else if drive.select == 0 { "no-selection" } else { "no-nav" });
+    } else if ok && !chrome {
+        why(if !drive.tab { "no-tab" } else if !drive.url { "no-omnibox-nav" } else if drive.find == 0 { "no-find" } else { "no-back" });
     }
     net_drive();
-    verdict_m3(window, painted, lines, &drive, if ok && m3 { "PASS" } else { "FAIL" });
+    verdict_m3(window, painted, lines, &drive, if ok && m3 && chrome { "PASS" } else { "FAIL" });
 }
 
 /// AETHERNET (LEDGER SR110): the network leg of `tests aether`. AETHER.ELF fetches http:// and https:// pages over the
@@ -168,10 +187,15 @@ fn net_drive() {
 #[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct Drive {
-    tails: [Option<alloc::string::String>; 5],
+    /// M3: focus, hover, select, clip, nav; SR109: tab, url, find, back, zoom, close.
+    tails: [Option<alloc::string::String>; 11],
     hover: bool,
     nav: bool,
     select: u64,
+    tab: bool,
+    url: bool,
+    back: bool,
+    find: u64,
 }
 
 /// One drive step: arm the seam's watch on `prefix`, push `evs` into the program's ring (owner `slot + 1`), wait up
@@ -181,12 +205,10 @@ fn step(slot: u64, prefix: &'static str, evs: &[u64]) -> Option<alloc::string::S
     const STEP_MS: u64 = 3_000;
     crate::serial_line::line_watch_arm(prefix);
     crate::serial_line::tail_arm();
-    for &e in evs {
-        if !crate::arch::syscall::user_input_push_owner(slot + 1, e) {
-            crate::serial_line::line_watch_disarm();
-            let _ = crate::serial_line::tail_take();
-            return None;
-        }
+    if !push(slot, evs) {
+        crate::serial_line::line_watch_disarm();
+        let _ = crate::serial_line::tail_take();
+        return None;
     }
     let t0 = crate::arch::ticks();
     let mut hit = false;
@@ -204,6 +226,22 @@ fn step(slot: u64, prefix: &'static str, evs: &[u64]) -> Option<alloc::string::S
     }
     let tail = crate::serial_line::tail_take();
     if hit { tail } else { None }
+}
+
+/// Push `evs` into the program's ring (owner `slot + 1`) in order; a full ring (32 events) is waited on for up to
+/// 500 ms while the program drains it (SR109: a typed URL is ~26 events). False when it never drained.
+#[cfg(target_arch = "x86_64")]
+fn push(slot: u64, evs: &[u64]) -> bool {
+    for &e in evs {
+        let t0 = crate::arch::ticks();
+        while !crate::arch::syscall::user_input_push_owner(slot + 1, e) {
+            if crate::arch::ticks() >= t0 + 500 {
+                return false;
+            }
+            crate::arch::sched::yield_now();
+        }
+    }
+    true
 }
 
 /// The packed events the drive pushes (the router's encoding, `una_abi::input_ev_pack`).
@@ -245,7 +283,34 @@ fn drive(slot: u64) -> Drive {
     d.tails[3] = step(slot, ":: AETHER: clip", &[key(0x03)]);
     d.tails[4] = step(slot, ":: AETHER: nav", &[button(1), button(0)]);
     d.nav = d.tails[4].as_deref().is_some_and(|t| t.starts_with("PASS"));
+    chrome(slot, &mut d);
     d
+}
+
+/// AETHERMETAL4 (SR109): the chrome, one drive per feature — open a tab, type a URL to a local page, find in it,
+/// back; then zoom and close the tab (reported).
+#[cfg(target_arch = "x86_64")]
+fn chrome(slot: u64, d: &mut Drive) {
+    let pass = |t: &Option<alloc::string::String>, want: &str| t.as_deref().is_some_and(|t| t.starts_with("PASS") && t.contains(want));
+    d.tails[5] = step(slot, ":: AETHER: tab", &[key(0x14)]);
+    d.tab = pass(&d.tails[5], "how=new");
+    let mut evs: alloc::vec::Vec<u64> = alloc::vec![key(0x0C)];
+    evs.extend(b"/system/doc/welcome.html".iter().map(|&c| key(c)));
+    evs.push(key(b'\n'));
+    d.tails[6] = step(slot, ":: AETHER: nav", &evs);
+    d.url = pass(&d.tails[6], "how=omnibox");
+    let mut evs: alloc::vec::Vec<u64> = alloc::vec![key(0x06)];
+    evs.extend(b"aether".iter().map(|&c| key(c)));
+    evs.push(key(b'\n'));
+    d.tails[7] = step(slot, ":: AETHER: find", &evs);
+    d.find = d.tails[7].as_deref().filter(|t| t.starts_with("PASS")).and_then(|t| ints(t, "hits=").first().copied()).unwrap_or(0).max(0) as u64;
+    if d.tails[7].is_some() {
+        let _ = push(slot, &[key(una_abi::KEY_ESC)]); // the bar takes the Esc (with no bar open it would exit)
+    }
+    d.tails[8] = step(slot, ":: AETHER: nav", &[key(una_abi::KEY_LEFT)]);
+    d.back = pass(&d.tails[8], "how=back");
+    d.tails[9] = step(slot, ":: AETHER: zoom", &[key(b'=')]);
+    d.tails[10] = step(slot, ":: AETHER: tab", &[key(0x17)]);
 }
 
 /// The static half: the image off the program volume, the loader's plan, the app note. `Ok((image, window))`;

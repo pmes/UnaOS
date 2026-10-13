@@ -58,6 +58,21 @@ pub struct Theme {
     /// A find match and the current one: the `amber` and `clay` accents mixed toward the page ground.
     pub find_bg: u32,
     pub find_cur_bg: u32,
+    // ---- AETHERMETAL4 (SR109): the chrome above the page (chrome.rs) ----
+    /// The strip and the toolbar's ground, the rule under them, an inactive tab, the active tab (the page's own
+    /// band, the kit's content fill), the chrome's ink and its dimmed ink (a disabled button, the placeholder).
+    pub chrome_bg: u32,
+    pub chrome_rule: u32,
+    pub tab_bg: u32,
+    pub tab_active: u32,
+    pub chrome_ink: u32,
+    pub chrome_dim: u32,
+    /// The address field's ground and ink, a hovered control's wash, the field's selection; the caret, the
+    /// bookmarked star and the field's focus ring are `focus` (the accent).
+    pub field_bg: u32,
+    pub field_ink: u32,
+    pub hot_bg: u32,
+    pub field_sel: u32,
 }
 impl Theme {
     pub const fn of(l: Look) -> Theme {
@@ -74,6 +89,16 @@ impl Theme {
             sel_ink: PAGE_BG,
             find_bg: mix(ACCENTS[3], PAGE_BG, 3, 8),
             find_cur_bg: mix(ACCENTS[4], PAGE_BG, 1, 4),
+            chrome_bg: l.tok(Tok::WindowBg),
+            chrome_rule: l.tok(Tok::FrameLine),
+            tab_bg: status,
+            tab_active: l.tok(Tok::ContentFill),
+            chrome_ink: l.tok(Tok::ContentText),
+            chrome_dim: l.tok(Tok::TitleTextInactive),
+            field_bg: l.tok(Tok::FieldBg),
+            field_ink: l.tok(Tok::ContentText),
+            hot_bg: mix(l.tok(Tok::WindowBg), l.accent(), 1, 5),
+            field_sel: mix(ACCENTS[l.hl as usize % 8], l.tok(Tok::FieldBg), 1, 2),
         }
     }
 }
@@ -194,6 +219,18 @@ pub fn read_look() -> (Look, i64) {
     let accent = accent_ix(word("system.appearance.accent", &mut b, &mut err)).unwrap_or(0);
     let hl = accent_ix(word("system.appearance.highlight", &mut b, &mut err)).unwrap_or(accent);
     (Look { dark, accent, hl }, err)
+}
+
+/// AETHERMETAL4 (SR109): a preference's text (`<ns>.<key>`, unquoted, at most 255 bytes) — the omnibox's
+/// `aether.search` template (Principia's row, prefs_core::schema, the host chrome's own read). `None` unset or refused.
+pub fn pref_text(key: &str) -> Option<alloc::string::String> {
+    let mut raw = [0u8; 256];
+    let n = call(BUS_VERB_PREF_GET, key.as_bytes(), &mut raw).ok()?;
+    let w = unquote(&raw[..n]);
+    if w.is_empty() {
+        return None;
+    }
+    Some(alloc::string::String::from_utf8_lossy(w).into_owned())
 }
 
 // ---- the live theme ----------------------------------------------------------------------------------------

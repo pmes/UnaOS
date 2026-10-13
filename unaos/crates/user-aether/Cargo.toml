@@ -50,6 +50,10 @@ vein_core = { path = "../../libs/sys/vein_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }
 http_core = { path = "../../libs/net/http_core" }
 psl_core = { path = "../../libs/net/psl_core" }
+# AETHERMETAL4 (SR109): the omnibox's buffer of record — Tabula's editing core (SR73), the one the host Tabula and
+# UNA.ELF link. The chrome's MODEL is not a dependency: handlers/aether/src/chrome/*.rs (std-free) are linked by
+# `#[path]` from src/chrome.rs, because the crate around them is std.
+edit_core = { path = "../../libs/text/edit_core" }
 
 # AETHERNET (SR110): `cryptocore` is the product crypto provider under tls_core (Lumen's line). It is ON BY DEFAULT here
 # because arroyo's build_user_aether_x86 / _aarch64 pass no --features (Lumen's builds pass `--features cryptocore`):
