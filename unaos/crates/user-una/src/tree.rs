@@ -12,15 +12,15 @@
 // on a file asks the IDE to open it in the editor (the same as Ctrl+O); Left on a closed entry jumps to its parent.
 //
 // FILE OPERATIONS — UNAIDE2 (LEDGER SR111). `n` new file, `f` new folder, `r` rename (the IDE asks the name in the
-// editor's status line), Backspace/Delete trash. Only the doors ring 3 has are used: SYS_PATH_WRITE's three verbs
-// (fs.rs: create-or-truncate, make-parents, unlink). New file = an empty PATH_W_TRUNC write; new folder = fs::mkdir
-// (MKDIRS over `dir/.keep`, then its unlink); rename of a FILE = copy then unlink (`via=copy`: a new object — its id,
-// attributes and grants do not follow); rename of a FOLDER is refused by name (no ring-3 rename door: SYS_RENAME is
-// the FAT root-name verb, the mount table's rename has no syscall). TRASH is trash_core's rule (Matrix, B449), whose
-// `store` RENAMES the object into <home>/.Trash — with no ring-3 rename it cannot run here, so a delete is REFUSED BY
-// NAME, never replaced by a permanent unlink. After each op the tree is rebuilt with its open folders re-opened and
-// the selection on the touched path. Wire: `:: UNA: tree op=<newfile|newdir|rename|trash> path=<p> [to=<p>
-// via=copy] rc=<r> [why=<w>] ::`.
+// editor's status line), Backspace/Delete trash. New file = an empty PATH_W_TRUNC write; new folder = fs::mkdir
+// (MKDIRS over `dir/.keep`, then its unlink). RING3RENAME (rmbp-ledger B561) — rename of a file OR a folder is a REAL
+// rename (`via=rename`): one SYS_PATH_WRITE with PATH_W_RENAME (fs::rename), the object keeps its id, so its
+// attributes, owner and grants follow, and a folder takes its subtree; an end on FAT is refused by name (`-ENOTSUP`).
+// TRASH is trash_core's rule (Matrix, B449) run here over fs::PathTrash: `<home>/.Trash/<name>` (trash_core's
+// collision name when taken) BY RENAME, the `una:trash-origin/-time/-by` record stamped on the object first (the
+// sidecar trash_core's `store` picks for an attribute volume), never a permanent unlink. After each op the tree is
+// rebuilt with its open folders re-opened and the selection on the touched path. Wire: `:: UNA: tree
+// op=<newfile|newdir|rename|trash> path=<p> [to=<p> via=rename] rc=<r> [why=<w>] ::`.
 //
 // GIT MARKS — UNAIDE2 (SR111): with a `.git` under the workspace root (git.rs, read-only through git_core) each row
 // listed carries `M` (modified against the index) or `?` (untracked), computed when its folder is listed, on a
@@ -31,7 +31,7 @@
 // name in byte order), over `PathVolume`: the core's `Volume` seam on SYS_PATH_READ + PATH_R_LIST (list),
 // SYS_STAT (stat) and SYS_PATH_READ (read). The tree keeps its lazy shape: one listing per opened directory.
 
-use crate::fs::{errno_word, list, mkdir, read_file, resolve, stat, unlink, write_file, CAT_MAX};
+use crate::fs::{errno_word, list, mkdir, read_file, resolve, stat, write_file, CAT_MAX};
 use crate::Line;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -101,7 +101,7 @@ pub enum Act {
     Open(String),
     /// UNAIDE2: ask a name for this operation (the IDE's status-line prompt).
     Ask(Op),
-    /// UNAIDE2: trash the selection (refused by name: `Tree::trash`).
+    /// UNAIDE2: trash the selection (RING3RENAME: trash_core's rule, `Tree::trash`).
     Trash,
     /// UNAIDE2: show this file's git diff in the console.
     Diff(String),
@@ -114,9 +114,6 @@ pub enum Op {
     NewDir,
     Rename,
 }
-
-/// UNAIDE2: the largest file a rename copies.
-const COPY_MAX: usize = 16 * 1024 * 1024;
 
 /// UNAIDE2: a leaf name the ops accept — printable ASCII, no `/`, not `.`/`..`.
 fn name_ok(n: &str) -> bool {
@@ -139,12 +136,12 @@ fn parent(path: &str) -> String {
     }
 }
 
-/// `:: UNA: tree op=<op> path=<p> [to=<p> via=copy] rc=<r> [why=<w>] ::`
+/// `:: UNA: tree op=<op> path=<p> [to=<p> via=rename] rc=<r> [why=<w>] ::`
 fn op_wire(op: &str, path: &str, to: Option<&str>, rc: i64, why: Option<&str>) {
     let mut l = Line::new(b":: UNA: tree op=");
     l.put(op.as_bytes()).put(b" path=").put(path.as_bytes());
     if let Some(t) = to {
-        l.put(b" to=").put(t.as_bytes()).put(b" via=copy");
+        l.put(b" to=").put(t.as_bytes()).put(b" via=rename");
     }
     l.put(b" rc=").dec(rc);
     if let Some(w) = why {
@@ -265,32 +262,49 @@ impl Tree {
         Ok(p)
     }
 
-    /// UNAIDE2: rename the FILE `path` to `name` in its folder — copied whole, then the original unlinked (a new
-    /// object: id, attributes and grants do not follow). A folder is refused (`ENOSYS`: no ring-3 rename door).
-    /// `Ok(new path)`; `Err((errno, why))` — `why` names a refusal or a half-done copy.
-    pub fn rename(&mut self, path: &str, name: &str) -> Result<String, (i64, Option<&'static str>)> {
+    /// RING3RENAME (B561): rename the file or folder `path` to `name` in its folder — fs::rename (SYS_PATH_WRITE +
+    /// PATH_W_RENAME): the same object under a new name, a folder with its subtree. `Ok(new path)`, or the -errno.
+    pub fn rename(&mut self, path: &str, name: &str) -> Result<String, i64> {
         if !name_ok(name) {
-            return Err((una_abi::EINVAL, None));
+            return Err(una_abi::EINVAL);
         }
         let to = join(&parent(path), name);
-        let r = copy_rename(path, &to);
-        let (rc, why) = match r {
-            Ok(()) => (0, None),
-            Err((e, w)) => (e, w),
-        };
-        op_wire("rename", path, Some(&to), rc, why);
+        let r = crate::fs::rename(path, &to);
+        op_wire("rename", path, Some(&to), r.err().unwrap_or(0), None);
         r?;
         self.rebuild(Some(&to));
         Ok(to)
     }
 
-    /// UNAIDE2: trash the selection — REFUSED BY NAME. trash_core's `store` renames the object into <home>/.Trash and
-    /// ring 3 has no path rename (SYS_PATH_WRITE: truncate / make-parents / unlink; SYS_RENAME: FAT root names), so
-    /// the Trash rule cannot run here; a permanent unlink is not offered in its place. Returns the refusal errno.
-    pub fn trash(&mut self) -> i64 {
-        let p = self.selected().map_or_else(|| resolve("/", &self.root), |s| s.0);
-        op_wire("trash", &p, None, una_abi::ENOSYS, Some("no-ring3-rename-door-for-trash_core"));
-        una_abi::ENOSYS
+    /// RING3RENAME (B561): trash the selection — `trash_core::trash` over fs::PathTrash, the session home's Trash
+    /// (`/home` with no session, trash_core's `Ctx` rule). `Ok((path, its path in the Trash))`; `Err((path, why))` — trash_core's refusal
+    /// or the door's errno, in its words.
+    pub fn trash(&mut self) -> Result<(String, String), (String, String)> {
+        let Some((p, _)) = self.selected() else {
+            let root = resolve("/", &self.root);
+            op_wire("trash", &root, None, una_abi::EINVAL, Some("nothing-selected"));
+            return Err((root, String::from("nothing selected")));
+        };
+        // trash_core's `Ctx`: `/home/<user>`, or `/home` with no session (fs::home answers `/` then, the tree's root).
+        let home = match crate::fs::home() {
+            h if h == "/" => String::from("/home"),
+            h => h,
+        };
+        let user = crate::fs::user_name();
+        let cx = trash_core::Ctx { home: &home, user: &user, now: crate::fs::now() };
+        match trash_core::trash(&mut crate::fs::PathTrash, &cx, &p) {
+            Ok(name) => {
+                let to = trash_core::join(&trash_core::trash_dir(&home), &name);
+                op_wire("trash", &p, Some(&to), 0, None);
+                self.rebuild(Some(&parent(&p)));
+                Ok((p, to))
+            }
+            Err(why) => {
+                let w: String = why.chars().map(|c| if c == ' ' { '-' } else { c }).collect();
+                op_wire("trash", &p, None, -1, Some(&w)); // rc=-1: trash_core refused (its words in why=)
+                Err((p, why))
+            }
+        }
     }
 
     /// The selected FILE, if the selection is one.
@@ -389,23 +403,4 @@ impl Tree {
         self.dirty = true;
         act
     }
-}
-
-/// UNAIDE2: the rename body — a FILE copied whole to `to`, then `path` unlinked. `why` names a refusal (a folder) or a
-/// half-done copy (the original kept).
-fn copy_rename(path: &str, to: &str) -> Result<(), (i64, Option<&'static str>)> {
-    match stat(path) {
-        Ok(s) if s.kind == 1 => return Err((una_abi::ENOSYS, Some("folder-no-ring3-rename-door"))),
-        Ok(_) => {}
-        Err(e) => return Err((e, None)),
-    }
-    if stat(to).is_ok() {
-        return Err((una_abi::EEXIST, None));
-    }
-    let bytes = read_file(path, COPY_MAX, true).map_err(|e| (e, None))?;
-    if let Err(e) = write_file(to, &bytes) {
-        let _ = unlink(to);
-        return Err((e, None));
-    }
-    unlink(path).map_err(|e| (e, Some("copied-original-kept")))
 }

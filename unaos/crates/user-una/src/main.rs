@@ -49,8 +49,9 @@
 // `:: UNA: close path=<p> dirty=<0|1> tabs=<n> ::`. A press in the editor's text places the caret under the pointer.
 //
 // FILES AND RUN — UNAIDE2 (LEDGER SR111). The tree's operations (tree.rs FILE OPERATIONS: `n`/Ctrl+N new file, `f`
-// new folder, `r` rename, Delete trash — refused by name) ask their name in the editor's status line (`ask`; Enter
-// commits, Esc drops it); a new file opens in a tab, a renamed file's tab follows it. Ctrl+R (`run`) runs the first
+// new folder, `r` rename, Delete trash — RING3RENAME B561: a real rename and trash_core's Trash) ask their name in the
+// editor's status line (`ask`; Enter commits, Esc drops it); a new file opens in a tab, a renamed file's tab follows
+// it (a renamed folder's open files too). Ctrl+R (`run`) runs the first
 // line of `.run` in the active file's folder, else the workspace root's (`$FILE` = the active file), else the line
 // typed in the console, through the console's midden_core plan; `:: UNA: run src=<path|typed> line=<l> ::`.
 // POINTER (B543/B550) in every pane: the hand over the tab strip, the beam over the editor's text and the console,
@@ -351,7 +352,7 @@ impl App {
                     let leaf = String::from(p.rsplit('/').next().unwrap_or(&p));
                     (p, leaf)
                 }
-                None => return self.say(String::from("rename: select a file in the tree")),
+                None => return self.say(String::from("rename: select a file or folder in the tree")),
             },
             _ => (self.tree.target_dir(), String::new()),
         };
@@ -378,18 +379,24 @@ impl App {
             },
             tree::Op::Rename => match self.tree.rename(&a.base, &name) {
                 Ok(to) => {
-                    for e in self.tabs.iter_mut().filter(|e| e.path.as_deref() == Some(a.base.as_str())) {
-                        e.path = Some(to.clone());
-                        e.repaint = true;
+                    // RING3RENAME (B561): every tab on the renamed path, or under it when it was a folder, follows it.
+                    let under = alloc::format!("{}/", a.base);
+                    for e in self.tabs.iter_mut() {
+                        let moved = match e.path.as_deref() {
+                            Some(p) if p == a.base => Some(to.clone()),
+                            Some(p) if p.starts_with(&under) => Some(alloc::format!("{}/{}", to, &p[under.len()..])),
+                            _ => None,
+                        };
+                        if let Some(np) = moved {
+                            e.path = Some(np);
+                            e.repaint = true;
+                        }
                     }
-                    alloc::format!("renamed to {} (copied: id and attributes do not follow)", name)
+                    alloc::format!("renamed to {}", name)
                 }
-                Err((e, why)) => {
+                Err(e) => {
                     self.tree.rebuild(None);
-                    match why {
-                        Some(w) => alloc::format!("rename: {} {} ({})", fs::errno_word(e), e, w),
-                        None => alloc::format!("rename: {} {}", fs::errno_word(e), e),
-                    }
+                    alloc::format!("rename: {} {}", fs::errno_word(e), e)
                 }
             },
         };
@@ -545,8 +552,12 @@ impl App {
                 tree::Act::Open(p) => self.open_path(&p),
                 tree::Act::Ask(op) => self.begin_ask(op),
                 tree::Act::Trash => {
-                    let e = self.tree.trash();
-                    self.say(alloc::format!("trash: refused {} - trash_core moves by rename and ring 3 has no rename door", e));
+                    // RING3RENAME (B561): trash_core's rule over the ring-3 rename door.
+                    let m = match self.tree.trash() {
+                        Ok((p, to)) => alloc::format!("trashed {} -> {}", p.rsplit('/').next().unwrap_or(&p), to),
+                        Err((p, why)) => alloc::format!("trash {}: {}", p.rsplit('/').next().unwrap_or(&p), why),
+                    };
+                    self.say(m);
                 }
                 tree::Act::Diff(p) => {
                     self.set_focus(Pane::Console);

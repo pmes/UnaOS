@@ -3776,3 +3776,67 @@ fn tx_boot_quiet(us: u64) -> bool {
     }
     true
 }
+
+// =================================================================================================
+// RING3RENAME (rmbp-ledger B561) — TAIL-APPENDED (this file's panic Locations are line-pinned). The ring-3 face of
+// [`MountTable::rename`]: `SYS_PATH_WRITE` with `una_abi::PATH_W_RENAME` (layout in una-abi's RING3RENAME block),
+// called by x86's `path_write_as` (the default kernel) and `selfdiag::path_fulfil` (x86 and aarch64) — one body, so
+// the arches cannot drift. The mount table already owns the primitive (the cross-volume and cross-mount-root
+// refusals, the SOURCE OBJECT's write ACL, the RECEIVING directory's write ACL, the backend's one-transaction relink
+// and the NSGEN bump); this adds only what a non-kernel caller needs on top:
+//   * both paths the surface accepts (absolute, no empty / `.` / `..` component), `to` never inside `from`;
+//   * both ends on the native UnaFS volume (`volume_id` = the `vfs:unafs:` domain tag) — FAT is refused BY NAME:
+//     its cross-directory move refuses a directory and a long name, and SYS_RENAME is its root-name verb;
+//   * the LEAVING directory's write ACL as well (`MountTable::rename` asks the object and the receiving directory;
+//     a move takes a name out of a directory, so the caller must be able to write that directory too);
+//   * the spellings ring 3 tests for: `exists` -> -EEXIST.
+// The object id never changes (the native backend relinks the entry), so owner / grants / attribute rows travel.
+// =================================================================================================
+
+/// RING3RENAME: is `p` a path the ring-3 rename accepts — absolute, 2..=PATH_IO_PATH_MAX, no empty/`.`/`..` part?
+fn ring3_rename_path_ok(p: &str) -> bool {
+    p.len() >= 2 && p.len() <= una_abi::PATH_IO_PATH_MAX && p.starts_with('/') && p[1..].split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// RING3RENAME: the checks, in order; `Err((errno, why))` names the refusal.
+fn ring3_rename_inner(mt: &MountTable, from: &str, to: &str, who: &str) -> Result<(), (i64, &'static str)> {
+    if !ring3_rename_path_ok(from) || !ring3_rename_path_ok(to) {
+        return Err((una_abi::EINVAL, "bad-path"));
+    }
+    if to.len() > from.len() && to.starts_with(from) && to.as_bytes()[from.len()] == b'/' {
+        return Err((una_abi::EINVAL, "into-own-subtree"));
+    }
+    let native = Some(volid_mix(VOLID_SEED, b"vfs:unafs:"));
+    let vf = mt.volume_id(from).map_err(|e| (crate::fs::attrsys::errno_of(&e), "no-volume"))?;
+    let vt = mt.volume_id(to).map_err(|e| (crate::fs::attrsys::errno_of(&e), "no-volume"))?;
+    if vf != native || vt != native {
+        return Err((una_abi::ENOTSUP, "not-native-unafs (FAT/foreign: SYS_PATH_WRITE renames on the UnaFS root only)"));
+    }
+    mt.stat(from).map_err(|e| (crate::fs::attrsys::errno_of(&e), "source"))?;
+    let (b, rel) = mt.resolve(from).map_err(|e| (crate::fs::attrsys::errno_of(&e), "resolve"))?;
+    b.authorize_write(&receiving_dir(rel), who).map_err(|e| (crate::fs::attrsys::errno_of(&e), "leaving-dir-acl"))?;
+    match mt.rename(from, to, who) {
+        Ok(()) => Ok(()),
+        Err(VfsError::Backend("exists")) => Err((una_abi::EEXIST, "exists")),
+        Err(VfsError::Unsupported) => Err((una_abi::ENOTSUP, "cross-volume")),
+        Err(e @ VfsError::Denied) => Err((crate::fs::attrsys::errno_of(&e), "acl")),
+        Err(e) => Err((crate::fs::attrsys::errno_of(&e), "rename")),
+    }
+}
+
+/// RING3RENAME: `SYS_PATH_WRITE` + `PATH_W_RENAME` — `from` (the request's path) renamed to `to_raw` (its data, UTF-8)
+/// as `who`; `off` must be 0. 0 or -errno, said on the wire either way.
+pub fn ring3_rename(mt: &MountTable, from: &str, off: u64, to_raw: &[u8], who: &str) -> i64 {
+    let to = core::str::from_utf8(to_raw).unwrap_or("");
+    let r = if off != 0 || to.is_empty() { Err((una_abi::EINVAL, "bad-request")) } else { ring3_rename_inner(mt, from, to, who) };
+    match r {
+        Ok(()) => {
+            serial_println!("[pathrename] from={} to={} principal={} -> ok", from, to, who);
+            0
+        }
+        Err((e, why)) => {
+            serial_println!("[pathrename] from={} to={} principal={} -> refused={} errno={}", from, to, who, why, e);
+            e
+        }
+    }
+}

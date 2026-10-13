@@ -2563,3 +2563,29 @@ pub const PREF_SUB_PREFIX_MAX: usize = 64;
 pub const PREF_SUB_MAX: usize = 4;
 /// `SYS_MRECV`'s third argument: return -EAGAIN on an empty mailbox instead of blocking (ASCII "NOWAIT").
 pub const MRECV_NOWAIT: u64 = 0x4E4F_5741_4954;
+
+// =================================================================================================
+// RING3RENAME (rmbp-ledger B561; SR111 UNAIDE2's two refusals the spec, SR98 UNAMETAL2's write ACL the model) — a
+// path rename/move for ring 3, as a FLAG of `SYS_PATH_WRITE`, not a new number. The SELFDIAG request already carries
+// two variable fields after its header — `[path]` then `[data]` — and a rename needs exactly two strings, so the
+// layout admits it unchanged:
+//
+//   request  [path_len u16][flags u16 = PATH_W_RENAME][rsv u32 = 0][offset u64 = 0][from][to]
+//            from = the path, to = the data: both absolute, 2..=PATH_IO_PATH_MAX, no empty / `.` / `..` component
+//   return   0, or -errno
+//
+// PATH_W_RENAME is alone (no other flag beside it). The kernel renames `from` to `to` through the mount table AS THE
+// CALLER under the volume's write ACL: the object that leaves (owner / `grants:<p>` write right / ROOTACL), the
+// directory it leaves and the directory that receives it must all be writable by the caller. Same volume only, and
+// that volume must be the native UnaFS root: an end on FAT (or any other foreign volume) is refused BY NAME with
+// `-ENOTSUP` (SYS_RENAME stays the FAT root-name verb). A directory moves with its subtree; the object id does not
+// change, so its owner / grants / attribute rows travel with it. `-EEXIST` when `to` exists, `-EINVAL` when `to`
+// lies inside `from`, `-ENOENT` for a missing source or receiving directory, `-EACCES` by the ACL's word. Dispatched
+// on both arches wherever `SYS_PATH_WRITE` is: x86's default `sys_pathwrite` (`path_write_as`) and `selfdiag`'s
+// `path_fulfil` (x86 and aarch64). Wire: `[pathrename] from=<f> to=<t> principal=<p> -> ok` or `-> refused=<why>
+// errno=<e>`.
+// =================================================================================================
+
+/// RING3RENAME: `SYS_PATH_WRITE` flag — rename `path` to the path carried as `data` (see the block above).
+pub const PATH_W_RENAME: u16 = 1 << 4;
+const _: () = assert!(PATH_W_RENAME & (PATH_W_TRUNC | PATH_W_MKDIRS | PATH_W_UNLINK | PATH_R_LIST) == 0);
