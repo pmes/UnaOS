@@ -42,6 +42,8 @@
 REQUIRE \[wm-act\] direct .* -> PASS
 # WINRESIZE (R75) — `tests winresize`: eight frame zones, a routed corner drag, the panel/min clamps, Shift aspect and the Ctrl-arrow keys.
 REQUIRE :: WINRESIZE: zones=8 .* -> PASS ::
+# DRAGNOMOVE (B620) — `tests dragmouse`: a press/steer/release pushed as the xHCI mouse pushes them (no level call) still moves the window
+REQUIRE \[wm-act\] dragmouse .* -> PASS
 REQUIRE \[clickroute\] route .* -> PASS
 
 # --- PTRDEAD (SELFTEST-RACE, 2026-08-27) ------------------------------------------------------
