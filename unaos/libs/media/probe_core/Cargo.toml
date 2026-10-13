@@ -1,0 +1,12 @@
+[package]
+name = "probe_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "REALSENSE (SR92, R112): Sonde's probe core — the frame model (Z16/Y8/Y16/YUY2), the depth model (depth scale, pinhole intrinsics, deprojection, point clouds), the depth colour ramp and the IMU sample model; no_std + alloc, shared by Ring 0 and Ring 3."
+
+# PROBECORE (R112): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, and NO dependencies — the
+# pixel_core/midden_core shape: a member of the ROOT host workspace (handlers/sonde links it) and, when the
+# kernel's Sonde path grows a frame pipe, a path dep of the kernel (owed: the kernel's Cargo.lock is not in
+# the REALSENSE brief, so `tests sonde` carries its few constants itself today).
+[dependencies]

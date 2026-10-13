@@ -1113,7 +1113,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
     // and a camera's VideoStreaming interface (the half this rung needs) is never inside it.
     // `data_buf` is 256 bytes, so that is the ceiling; `ran_short` on the census line says when
     // the device's own wTotalLength exceeded it, and NOTHING here pretends otherwise.
-    let wtotal = if cfg.len() >= 4 { le16(cfg, 2) } else { 0 };
+    let wtotal = if cfg.len() >= 4 { le16(cfg, 2) } else { 0 }; #[cfg(feature = "sonde")] multi::ident(addr, buf, &mut *xfer); // REALSENSE (LEDGER SR92): WHOSE camera — one GET_DESCRIPTOR(DEVICE) for a video-IAD candidate, AFTER `cfg` (which aliases `buf`) is read for the last time. LINE-NEUTRAL append, before this comment; knob off erases it.
     let want = wtotal.min(256);
     crate::census_println!(
         "[uvc] candidate addr={} cfg_value={} wTotalLength={} reading={}{}",
@@ -1140,7 +1140,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
         }
     };
     let full = core::slice::from_raw_parts(buf as *const u8, n);
-    let c = parse(full);
+    let c = parse(full); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, &mut *xfer); // REALSENSE (LEDGER SR92): the per-interface census (depth/ir/color functions, XUs, HID) of the same window, and a D400's three XU GET_CURs; `full` is read before its first transfer and never after. LINE-NEUTRAL append, before this comment.
     print_census(idx, addr, &c);
 
     if !c.have_vs {
@@ -1302,4 +1302,420 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
 /// QUIETBOOT3 (rmbp-ledger B352, R80) — the parser self-test as a `tests uvc` fixture (the boot no longer runs it).
 fn uvc_fixture() {
     let _ = selftest();
+}
+
+// ── REALSENSE (LEDGER SR92, R112): the multi-interface census and the D400's XU reads ───────────────
+//
+// APPENDED, and `#[cfg(feature = "sonde")]`-erased whole, so no line above moves and a knob-off image
+// (sonde off, uvc on or off) carries this file's pre-REALSENSE text byte for byte. Reached from `probe`
+// by two LINE-NEUTRAL folds (the device-descriptor read on the `wtotal` line, the census after
+// `parse(full)`), each statement BEFORE its line's first `//`.
+//
+// WHY A SECOND WALK: `parse` above is the CAMERA1 census of ONE streaming function — `vs_intf` is
+// overwritten by every VideoStreaming interface it meets and every format of every interface lands in
+// one `fmts` list. A D435i is THREE video functions behind one IAD (depth Z16, infrared Y8, colour YUY2 —
+// librealsense `src/ds/d400/d400-factory.cpp:695-697` names the three streams of the D435i's profile) and
+// a HID interface for the IMU, and `parse` cannot tell them apart. `multi::census` walks the same bytes
+// keeping one record PER VideoStreaming interface number, plus every extension unit (UVC 1.1 §3.7.2.6,
+// Table 3-9) and the HID interface. `parse` and its self-test are untouched.
+#[cfg(feature = "sonde")]
+pub mod multi {
+    use super::{le16, le32, CC_VIDEO, CS_INTERFACE, DT_INTERFACE, SC_VIDEOCONTROL, SC_VIDEOSTREAMING};
+    use super::{VS_FORMAT_MJPEG, VS_FORMAT_UNCOMPRESSED, VS_FRAME_MJPEG, VS_FRAME_UNCOMPRESSED, VS_INPUT_HEADER, Xfer};
+    use crate::drivers::realsense_xu as rs;
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+
+    /// UVC 1.1 Appendix A.5: `VC_EXTENSION_UNIT` (librealsense's backend names the same code,
+    /// `src/uvc/uvc-types.h:103`).
+    const VC_EXTENSION_UNIT: u8 = 0x06;
+    /// USB HID class (HID 1.11 §4.1).
+    const CC_HID: u8 = 0x03;
+
+    pub const MAX_VS: usize = 4;
+    pub const MAX_XU: usize = 4;
+
+    /// The role a streaming function plays, from its first format's FourCC (librealsense
+    /// `src/ds/d400/d400-device.cpp:55-75`: `Z16 ` → Z16/DEPTH, `GREY`/`Y8  ` → Y8/INFRARED,
+    /// `YUY2` → YUYV/COLOR; `Y16 ` → Y16 is the infrared imagers' 16-bit form).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Role {
+        Depth,
+        Ir,
+        Color,
+        Unknown,
+    }
+
+    pub fn role_of(cc: [u8; 4]) -> Role {
+        match &cc {
+            b"Z16 " => Role::Depth,
+            b"GREY" | b"Y8  " | b"Y16 " | b"Y8I " => Role::Ir,
+            b"YUY2" | b"YUYV" | b"UYVY" => Role::Color,
+            _ => Role::Unknown,
+        }
+    }
+
+    pub fn role_name(r: Role) -> &'static str {
+        match r {
+            Role::Depth => "depth",
+            Role::Ir => "ir",
+            Role::Color => "color",
+            Role::Unknown => "other",
+        }
+    }
+
+    /// One VideoStreaming function (all alternates of one interface number).
+    #[derive(Clone, Copy, Default)]
+    pub struct VsFn {
+        pub intf: u8,
+        pub ep: u8,
+        pub terminal_link: u8,
+        /// Formats declared in the input header / seen walking.
+        pub declared_formats: u8,
+        pub nfmt: u8,
+        /// The FIRST format's FourCC (MJPEG: `MJPG`), bpp and first frame's size.
+        pub fourcc: [u8; 4],
+        pub bpp: u8,
+        pub width: u16,
+        pub height: u16,
+        pub default_interval: u32,
+    }
+
+    impl VsFn {
+        pub fn role(&self) -> Role {
+            role_of(self.fourcc)
+        }
+    }
+
+    /// One extension unit.
+    #[derive(Clone, Copy, Default)]
+    pub struct Xu {
+        pub id: u8,
+        pub guid: [u8; 16],
+        pub ncontrols: u8,
+    }
+
+    impl Xu {
+        pub fn is_d400_depth(&self) -> bool {
+            self.guid == rs::DEPTH_XU_GUID
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub struct Streams {
+        pub have_vc: bool,
+        pub vc_intf: u8,
+        pub nvs: usize,
+        pub vs: [VsFn; MAX_VS],
+        pub nxu: usize,
+        pub xus: [Xu; MAX_XU],
+        pub hid_intf: Option<u8>,
+        pub ran_short: bool,
+        pub overflowed: bool,
+    }
+
+    impl Streams {
+        /// The stream roles in interface order, as `depth,ir,color` (≤ 4 names, `-` when none).
+        pub fn label(&self, out: &mut [u8; 32]) -> usize {
+            let mut n = 0usize;
+            for f in self.vs[..self.nvs].iter() {
+                let name = role_name(f.role()).as_bytes();
+                if n != 0 && n < out.len() {
+                    out[n] = b',';
+                    n += 1;
+                }
+                for &b in name {
+                    if n < out.len() {
+                        out[n] = b;
+                        n += 1;
+                    }
+                }
+            }
+            if n == 0 {
+                out[0] = b'-';
+                n = 1;
+            }
+            n
+        }
+
+        /// The first function playing `role`.
+        pub fn find(&self, role: Role) -> Option<&VsFn> {
+            self.vs[..self.nvs].iter().find(|f| f.role() == role)
+        }
+
+        pub fn depth_xu(&self) -> Option<&Xu> {
+            self.xus[..self.nxu].iter().find(|x| x.is_d400_depth())
+        }
+    }
+
+    /// THE MULTI-INTERFACE WALK. Pure and total, the same descriptor walk as `parse` (USB 2.0 §9.5),
+    /// with the class-specific arms keyed by the interface descriptor most recently seen.
+    pub fn census(cfg: &[u8]) -> Streams {
+        let mut s = Streams::default();
+        let mut off = 0usize;
+        let (mut in_vc, mut cur): (bool, Option<usize>) = (false, None);
+        // Within the current VS function: the first format's index (frames after it are its frames).
+        let mut first_fmt_open = false;
+        while off + 2 <= cfg.len() {
+            let len = cfg[off] as usize;
+            if len < 2 {
+                break;
+            }
+            if off + len > cfg.len() {
+                s.ran_short = true;
+                break;
+            }
+            let d = &cfg[off..off + len];
+            match d[1] {
+                // USB 2.0 Table 9-12: bInterfaceNumber[2] bInterfaceClass[5] bInterfaceSubClass[6].
+                DT_INTERFACE if len >= 9 => {
+                    in_vc = d[5] == CC_VIDEO && d[6] == SC_VIDEOCONTROL;
+                    if in_vc && !s.have_vc {
+                        s.have_vc = true;
+                        s.vc_intf = d[2];
+                    }
+                    if d[5] == CC_HID && s.hid_intf.is_none() {
+                        s.hid_intf = Some(d[2]);
+                    }
+                    if d[5] == CC_VIDEO && d[6] == SC_VIDEOSTREAMING {
+                        // A new interface NUMBER is a new function; an alternate setting of the
+                        // current one (same number, alt > 0) is not.
+                        let same = cur.map(|i| s.vs[i].intf == d[2]).unwrap_or(false);
+                        if !same {
+                            if s.nvs < MAX_VS {
+                                s.vs[s.nvs] = VsFn { intf: d[2], ..VsFn::default() };
+                                cur = Some(s.nvs);
+                                s.nvs += 1;
+                                first_fmt_open = false;
+                            } else {
+                                s.overflowed = true;
+                                cur = None;
+                            }
+                        }
+                    } else {
+                        cur = None;
+                    }
+                }
+                // UVC 1.1 §3.7.2.6, Table 3-9: bUnitID[3] guidExtensionCode[4..20] bNumControls[20].
+                CS_INTERFACE if in_vc && len >= 21 && d[2] == VC_EXTENSION_UNIT => {
+                    if s.nxu < MAX_XU {
+                        let mut x = Xu { id: d[3], ncontrols: d[20], ..Xu::default() };
+                        x.guid.copy_from_slice(&d[4..20]);
+                        s.xus[s.nxu] = x;
+                        s.nxu += 1;
+                    } else {
+                        s.overflowed = true;
+                    }
+                }
+                CS_INTERFACE if len >= 3 && cur.is_some() => {
+                    let f = &mut s.vs[cur.unwrap_or(0)];
+                    match d[2] {
+                        // UVC 1.1 Table 3-13: bNumFormats[3] bEndpointAddress[6] bTerminalLink[8].
+                        VS_INPUT_HEADER if len >= 9 => {
+                            f.declared_formats = d[3];
+                            f.ep = d[6];
+                            f.terminal_link = d[8];
+                        }
+                        // Uncompressed payload Table 3-1: guidFormat[5..21] bBitsPerPixel[21].
+                        VS_FORMAT_UNCOMPRESSED if len >= 23 => {
+                            if f.nfmt == 0 {
+                                f.fourcc.copy_from_slice(&d[5..9]);
+                                f.bpp = d[21];
+                                first_fmt_open = true;
+                            } else {
+                                first_fmt_open = false;
+                            }
+                            f.nfmt = f.nfmt.saturating_add(1);
+                        }
+                        VS_FORMAT_MJPEG if len >= 7 => {
+                            if f.nfmt == 0 {
+                                f.fourcc = *b"MJPG";
+                                first_fmt_open = true;
+                            } else {
+                                first_fmt_open = false;
+                            }
+                            f.nfmt = f.nfmt.saturating_add(1);
+                        }
+                        // Uncompressed/MJPEG payload Table 3-2 (identical): wWidth[5..7] wHeight[7..9]
+                        // dwDefaultFrameInterval[21..25]. The FIRST frame of the FIRST format only.
+                        VS_FRAME_UNCOMPRESSED | VS_FRAME_MJPEG if len >= 25 => {
+                            if first_fmt_open && f.width == 0 {
+                                f.width = le16(d, 5);
+                                f.height = le16(d, 7);
+                                f.default_interval = le32(d, 21);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            off += len;
+        }
+        s
+    }
+
+    // ── The record `tests sonde` reads (atomics: written once per boot at enumeration) ────────────
+    static VIDPID: AtomicU32 = AtomicU32::new(0);
+    static ADDR: AtomicU8 = AtomicU8::new(0);
+    static ROLES: AtomicU32 = AtomicU32::new(0); // bit 0 depth, 1 ir, 2 color
+    static DEPTH_WH: AtomicU32 = AtomicU32::new(0);
+    static DEPTH_CC: AtomicU32 = AtomicU32::new(0);
+    static XU_UNIT: AtomicU8 = AtomicU8::new(0);
+    static RAN_SHORT: AtomicBool = AtomicBool::new(false);
+    /// Per `rs::XU_READS` entry: the value read, or `NOT_READ` / `STALLED`.
+    static XU_VAL: [AtomicU32; 3] = [AtomicU32::new(NOT_READ), AtomicU32::new(NOT_READ), AtomicU32::new(NOT_READ)];
+    pub const NOT_READ: u32 = u32::MAX;
+    pub const STALLED: u32 = u32::MAX - 1;
+    /// The device descriptor of the candidate being walked (set by `ident`, consumed by `after_census`).
+    static PENDING: AtomicU32 = AtomicU32::new(0);
+
+    /// What the boot saw, for `tests sonde`.
+    #[derive(Clone, Copy)]
+    pub struct Record {
+        pub vid: u16,
+        pub pid: u16,
+        pub addr: u8,
+        pub roles: u32,
+        pub depth_w: u16,
+        pub depth_h: u16,
+        pub depth_cc: [u8; 4],
+        pub xu_unit: u8,
+        pub ran_short: bool,
+        pub xu: [u32; 3],
+    }
+
+    pub fn record() -> Option<Record> {
+        let vp = VIDPID.load(Ordering::Acquire);
+        if vp == 0 {
+            return None;
+        }
+        let wh = DEPTH_WH.load(Ordering::Relaxed);
+        Some(Record {
+            vid: (vp >> 16) as u16,
+            pid: vp as u16,
+            addr: ADDR.load(Ordering::Relaxed),
+            roles: ROLES.load(Ordering::Relaxed),
+            depth_w: (wh >> 16) as u16,
+            depth_h: wh as u16,
+            depth_cc: DEPTH_CC.load(Ordering::Relaxed).to_le_bytes(),
+            xu_unit: XU_UNIT.load(Ordering::Relaxed),
+            ran_short: RAN_SHORT.load(Ordering::Relaxed),
+            xu: [XU_VAL[0].load(Ordering::Relaxed), XU_VAL[1].load(Ordering::Relaxed), XU_VAL[2].load(Ordering::Relaxed)],
+        })
+    }
+
+    /// FOLD 1 (the `wtotal` line of `probe`): one `GET_DESCRIPTOR(DEVICE)` for a video-IAD candidate, so
+    /// the census knows WHOSE camera it is walking. USB 2.0 §9.4.3 / Table 9-8: bmRequestType 0x80,
+    /// bRequest 6, wValue 0x0100, 18 bytes; idVendor @8, idProduct @10. ONE attempt; on failure the
+    /// device is walked as an unknown camera (the CAMERA1 path is unchanged either way).
+    pub fn ident(addr: u8, buf: *mut u8, xfer: Xfer) {
+        PENDING.store(0, Ordering::Relaxed);
+        match xfer(0x80, 6, 0x0100, 0, 18, true) {
+            Ok(n) if n >= 12 => {
+                // SAFETY: `buf` is the EP0 data buffer `probe`'s contract names (256 bytes, live for the
+                // controller `xfer` drives) and the transfer above just wrote `n` >= 12 bytes into it.
+                let b = unsafe { core::slice::from_raw_parts(buf as *const u8, 12) };
+                let (vid, pid) = (le16(b, 8), le16(b, 10));
+                PENDING.store(((vid as u32) << 16) | pid as u32, Ordering::Relaxed);
+                crate::census_println!("[sonde] ident addr={} dev={:04x}:{:04x} d400={}", addr, vid, pid, rs::is_d400(vid, pid));
+            }
+            Ok(n) => serial_println!("[sonde] ident addr={} req=GET_DESCRIPTOR(DEVICE) got={} reason=runt", addr, n),
+            Err(e) => serial_println!("[sonde] ident addr={} req=GET_DESCRIPTOR(DEVICE) reason={}", addr, e),
+        }
+    }
+
+    /// FOLD 2 (after `parse(full)` in `probe`): the multi-interface census of the same window, printed,
+    /// and for a D400 the record `tests sonde` reads plus the three XU `GET_CUR`s. `full` aliases `buf`:
+    /// it is read ONLY before the first transfer below.
+    pub fn after_census(addr: u8, config_value: u8, full: &[u8], buf: *mut u8, xfer: Xfer) {
+        let s = census(full);
+        let vp = PENDING.load(Ordering::Relaxed);
+        let (vid, pid) = ((vp >> 16) as u16, vp as u16);
+        let mut lbl = [0u8; 32];
+        let n = s.label(&mut lbl);
+        crate::census_println!(
+            "[sonde] census addr={} dev={:04x}:{:04x} vc_intf={} fns={} streams={} xus={} hid_intf={} ran_short={} overflowed={}",
+            addr, vid, pid, s.vc_intf, s.nvs, core::str::from_utf8(&lbl[..n]).unwrap_or("?"), s.nxu,
+            s.hid_intf.map(|i| i as i32).unwrap_or(-1), s.ran_short, s.overflowed
+        );
+        for f in s.vs[..s.nvs].iter() {
+            let cc = super::fourcc(&{
+                let mut g = [0u8; 16];
+                g[..4].copy_from_slice(&f.fourcc);
+                g
+            });
+            crate::census_println!(
+                "[sonde] fn intf={} ep={:#04x} role={} fourcc={}{}{}{} bpp={} {}x{} default_us={} formats={}/{}",
+                f.intf, f.ep, role_name(f.role()), cc[0], cc[1], cc[2], cc[3], f.bpp, f.width, f.height,
+                f.default_interval / 10, f.nfmt, f.declared_formats
+            );
+        }
+        for x in s.xus[..s.nxu].iter() {
+            crate::census_println!(
+                "[sonde] xu id={} controls={} guid0={:02x}{:02x}{:02x}{:02x} d400_depth={}",
+                x.id, x.ncontrols, x.guid[3], x.guid[2], x.guid[1], x.guid[0], x.is_d400_depth()
+            );
+        }
+        if !rs::is_d400(vid, pid) {
+            return;
+        }
+
+        // A D400: the record first (all from the census, no traffic), then the reads.
+        let mut roles = 0u32;
+        for f in s.vs[..s.nvs].iter() {
+            roles |= match f.role() {
+                Role::Depth => 1,
+                Role::Ir => 2,
+                Role::Color => 4,
+                Role::Unknown => 0,
+            };
+        }
+        if let Some(d) = s.find(Role::Depth) {
+            DEPTH_WH.store(((d.width as u32) << 16) | d.height as u32, Ordering::Relaxed);
+            DEPTH_CC.store(u32::from_le_bytes(d.fourcc), Ordering::Relaxed);
+        }
+        ROLES.store(roles, Ordering::Relaxed);
+        ADDR.store(addr, Ordering::Relaxed);
+        RAN_SHORT.store(s.ran_short, Ordering::Relaxed);
+        // The unit: the census's depth XU when the window reached it, else the firmware's fixed id
+        // (`ds-private.h:66-67` — unit 3 is the firmware's fact, not the host's).
+        let unit = s.depth_xu().map(|x| x.id).unwrap_or(rs::DEPTH_XU_UNIT);
+        XU_UNIT.store(unit, Ordering::Relaxed);
+        VIDPID.store(vp, Ordering::Release);
+
+        // SET_CONFIGURATION — the standard request that makes interface requests legal (USB 2.0
+        // §9.4.7); CAMERA1's probe sends the same one with the same value a few lines later, which is
+        // legal and idempotent (§9.4.7: the device stays configured).
+        if xfer(0x00, 9, config_value as u16, 0, 0, false).is_err() {
+            serial_println!("[sonde] xu abort addr={} stage=set-configuration reason=stalled-or-timeout", addr);
+            return;
+        }
+        let vc = if s.have_vc { s.vc_intf } else { 0 };
+        for (i, r) in rs::XU_READS.iter().enumerate() {
+            let (wv, wi) = (rs::xu_wvalue(r.ctrl), rs::xu_windex(unit, vc));
+            match xfer(0xA1, 0x81, wv, wi, r.len, true) {
+                Ok(got) if got as u16 >= r.len => {
+                    // SAFETY: as in `ident` — the live EP0 buffer, `got` >= r.len (<= 2) bytes written.
+                    let b = unsafe { core::slice::from_raw_parts(buf as *const u8, r.len as usize) };
+                    let v = if r.len == 2 { le16(b, 0) as u32 } else { b[0] as u32 };
+                    XU_VAL[i].store(v, Ordering::Relaxed);
+                    crate::census_println!("[sonde] xu read={} unit={} ctrl={} wValue={:#06x} wIndex={:#06x} value={}", r.name, unit, r.ctrl, wv, wi, v);
+                }
+                Ok(got) => {
+                    XU_VAL[i].store(STALLED, Ordering::Relaxed);
+                    serial_println!("[sonde] xu read={} unit={} ctrl={} got={} need={} reason=runt", r.name, unit, r.ctrl, got, r.len);
+                }
+                Err(e) => {
+                    XU_VAL[i].store(STALLED, Ordering::Relaxed);
+                    serial_println!("[sonde] xu read={} unit={} ctrl={} STALLED reason={} — NOT retried", r.name, unit, r.ctrl, e);
+                }
+            }
+        }
+        // The depth scale's own read is the HW-monitor GET_ADV(etDepthTableControl) — a 1024-byte XU
+        // SET_CUR/GET_CUR pair (realsense_xu::hwmon_*), which the 256-byte EP0 buffer cannot carry.
+        serial_println!(
+            "[sonde] hwmon=withheld reason=ep0-buf-256-lt-{} depth_scale=default({} um, d400-device.cpp:912)",
+            rs::HWMON_BUF, rs::DEPTH_UNITS_DEFAULT_UM
+        );
+    }
 }

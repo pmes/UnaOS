@@ -3706,6 +3706,17 @@ hda-sie = ["hda-tone"]
 # k8-reach.registry`, records why this knob has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
 uvc = ["ehcihid"]
+# REALSENSE (LEDGER SR92, R112): `UNAOS_SONDE=1` arms Sonde's first probe, the Intel RealSense D435i —
+# `drivers/uvc.rs`'s appended `multi` census (one record per VideoStreaming function: depth Z16, infrared
+# Y8, colour YUY2; every extension unit; the HID interface), a D400's three XU `GET_CUR`s (laser power,
+# emitter, preset) through the EHCI EP0 seam, `drivers/realsense_xu.rs` (the vendor XU and HW-monitor
+# facts from librealsense, cited), and `tests sonde` (crate::sonde: the D435i fixture, then
+# `:: SONDE: dev=… -> SKIP(no-device)` or the device's census `-> SKIP(no-iso-pipe)`). IMPLIES `uvc`: both
+# folds live in `uvc::probe`. Default OFF => `pub mod realsense_xu` and `pub mod sonde` are never lexed,
+# uvc.rs's appended block and its two same-line folds are `#[cfg]`-erased, and the image is byte-identical
+# (`./arroyo knoboff sonde`). x86_64 only. FIVE places (LAWS §4): this line, `unaos/arroyo`'s `_feats`,
+# `unaos/builder/src/main.rs`, `scripts/banner-cert.sh`, `scripts/k8-reach.registry`.
+sonde = ["uvc"]
 # IOAPIC (rmbp-ledger B147): `UNAOS_IOAPIC=1` arms `arch/x86_64/ioapic.rs` — the Intel 82093AA
 # I/O APIC redirection table, which this kernel has never had. Until this feature, `apic.rs` drove
 # the LOCAL APIC only and `drivers/pci.rs` could enable MSI/MSI-X, so a PCI function offering no

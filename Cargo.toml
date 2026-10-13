@@ -37,6 +37,7 @@ members = [
     "unaos/libs/media/audio_core",
     "unaos/libs/media/pixel_core",
     "unaos/libs/media/raw_core", # RAWCORE (B444): camera raw (TIFF/ARW) — container, preview, EXIF facts, demosaic; no_std, both rings
+    "unaos/libs/media/probe_core", # REALSENSE (SR92, R112): Sonde's probe core — frames (Z16/Y8/Y16/YUY2), depth model, IMU samples; no_std, both rings
     "unaos/libs/media/vp8_core",
     "unaos/libs/media/av1_core",
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.
@@ -71,6 +72,7 @@ members = [
     "handlers/midden",
     "handlers/amber_bytes",
     "handlers/stria",
+    "handlers/sonde", # REALSENSE (SR92, R112): Sonde, the handler of probes — ProbeList/Open/Frame/Close on the bus, the replay probe, the pane model
     "handlers/aether",
     "handlers/principia",
     "handlers/facet",

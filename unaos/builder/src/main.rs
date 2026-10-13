@@ -972,6 +972,7 @@ fn main() {
     if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
     if std::env::var("UNAOS_MIDDEN").is_ok() { feats.push("midden"); } // MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs). Kept in sync with arroyo.
     if std::env::var("UNAOS_UNA").is_ok() { feats.push("una"); } // UNAMETAL (LEDGER SR90): `tests una` (kernel unaapp.rs). Kept in sync with arroyo.
+    if std::env::var("UNAOS_SONDE").is_ok() { feats.push("sonde"); } // REALSENSE (LEDGER SR92): `tests sonde` (kernel sonde.rs; implies uvc in Cargo.toml). Kept in sync with arroyo.
     // AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (APPS/AETHER.ELF validated, spawned, its page report read). Kept in sync with arroyo.
     if std::env::var("UNAOS_AETHER").is_ok() { feats.push("aether"); }
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.

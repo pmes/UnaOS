@@ -279,6 +279,40 @@ pub enum SMessage {
     MediaEnded { url: String, presented: u64, dropped: u64 },
     MediaError { url: String, error: String },
 
+    // --- SONDE (Probes; REALSENSE, LEDGER SR92, R112) ---
+    // Sonde owns the probes — depth cameras, cameras, IMUs. A probe is keyed by its `id` (e.g.
+    // `replay:d435i`, `uvc:8086:0b3a`), a stream by its name (`depth`, `ir`, `color`, `accel`, `gyro`).
+    // The frame formats and the depth model are `probe_core`'s (unaos/libs/media/probe_core), the one
+    // no_std core both rings link. Requests: `ProbeList` (empty), `ProbeOpen`, `ProbeClose`. Sonde
+    // answers `ProbeList` with the probes, an open stream with `ProbeFrame`s, and a stream that stops
+    // (closed, or could not open) with `ProbeClose`.
+    /// Requester → Sonde with `probes` EMPTY: name the probes. Sonde → requester: the probes present,
+    /// `(id, name, streams)` with `streams` the stream names the probe can open.
+    ProbeList { probes: Vec<(String, String, Vec<String>)> },
+    /// Requester → Sonde: start `stream` of probe `id` at `width x height` and `fps` (each 0 = the
+    /// probe's default mode for that stream).
+    ProbeOpen { id: String, stream: String, width: u32, height: u32, fps: u32 },
+    /// Sonde → requester: one frame of an open stream, raw. `format` is a `probe_core::PixelFormat` name
+    /// (`Z16`, `Y8`, `Y16`, `YUY2`); `data` holds `stride * (height - 1) + width * bytes_per_pixel`
+    /// bytes or more, little-endian samples. `depth_scale` is metres per Z16 unit (0 for a non-depth
+    /// stream); `intrinsics` is the stream's pinhole `[fx, fy, ppx, ppy]` in pixels when known.
+    ProbeFrame {
+        id: String,
+        stream: String,
+        format: String,
+        seq: u64,
+        timestamp_us: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        depth_scale: f32,
+        intrinsics: Option<[f32; 4]>,
+        data: Vec<u8>,
+    },
+    /// Requester → Sonde: stop `stream` of `id` (every open stream of `id` when `stream` is empty).
+    /// Sonde → requester: that stream stopped (closed, or could not be opened).
+    ProbeClose { id: String, stream: String },
+
     // --- EDITOR (The Code Pane) ---
     /// Load a document into the active editor pane. Fired when a file is
     /// selected for editing; the macOS `MacOSSpline` router pushes `content`
