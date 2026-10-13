@@ -2130,7 +2130,7 @@ const DHCP_LINK_MAX: u32 = 6;
 /// The e1000 path is untouched (its DHCP stays where it was).
 #[cfg(feature = "usbnet")]
 pub fn dhcp_link_tick() {
-    use crate::drivers::xhci::usbnet;
+    use crate::drivers::xhci::usbnet; usb_lease_tick(); // USBNETDHCP (B538): the USB link client's bound lease reaches the stack first (LINE-NEUTRAL: folded onto this cfg(usbnet) fn's first line)
     if LEASED.load(Ordering::Relaxed) || e1000::nic_present() {
         return;
     }
@@ -2247,4 +2247,35 @@ static LEASE_IP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 pub fn lease_ip() -> Option<[u8; 4]> {
     if !LEASED.load(Ordering::Relaxed) { return None; }
     match LEASE_IP.load(Ordering::Relaxed) { 0 => None, v => Some(v.to_be_bytes()) }
+}
+
+/// USBNETDHCP (rmbp-ledger B538) — TAIL-APPENDED. The USB link's own DHCP client (`usbnet`'s tap, `net::dhcp`)
+/// bound a lease inside the controller pass, where STACK may already be held by a pump (`raw_rx -> drive ->
+/// deliver`), so it only records it; this applies it from the 5 s net tick (`dhcp_link_tick`, STACK free):
+/// through `dhcp_apply` (SOCK-5 lease line, LEASED, LEASE_IP, the DNS server), then smoltcp's dhcpv4 socket
+/// is removed — one DHCP client on the link once bound. A lease smoltcp landed first stands; the tap's is
+/// reported and not re-applied.
+#[cfg(feature = "usbnet")]
+fn usb_lease_tick() {
+    let Some((ip, mask, gw, dns)) = crate::drivers::xhci::usbnet::lease_pending() else { return };
+    if LEASED.load(Ordering::Relaxed) {
+        crate::drivers::xhci::usbnet::lease_applied();
+        serial_println!("[dhcp] lease ip={}.{}.{}.{} -> not applied (the stack already holds a lease)", ip[0], ip[1], ip[2], ip[3]);
+        return;
+    }
+    let mut g = STACK.lock();
+    if !ensure_stack(&mut g) {
+        return; // no NIC yet: the lease stays pending for the next tick
+    }
+    let Some(stack) = g.as_mut() else { return };
+    let plen = mask.iter().map(|b| b.count_ones()).sum::<u32>().min(32) as u8;
+    let cidr = Ipv4Cidr::new(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]), if plen == 0 { 24 } else { plen });
+    let router = if gw == [0; 4] { None } else { Some(Ipv4Address::new(gw[0], gw[1], gw[2], gw[3])) };
+    let dns_srv = if dns == [0; 4] { None } else { Some(Ipv4Address::new(dns[0], dns[1], dns[2], dns[3])) };
+    dhcp_apply(stack, cidr, router, dns_srv);
+    if let Some(h) = stack.dhcp.take() {
+        let _ = stack.sockets.remove(h);
+    }
+    crate::drivers::xhci::usbnet::lease_applied();
+    serial_println!("[dhcp] lease applied ip={}.{}.{}.{}/{} client=net smoltcp-dhcp=removed", ip[0], ip[1], ip[2], ip[3], cidr.prefix_len());
 }

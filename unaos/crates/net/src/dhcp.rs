@@ -225,3 +225,139 @@ impl DhcpClient {
         }
     }
 }
+
+// ── USBNETDHCP (rmbp-ledger B538) — APPENDED: the USB link's client. Nothing above this line changed,
+// so the e1000 path (`on_reply`, the unpadded builders) and every image that does not call these compiles
+// exactly as before.
+
+/// RFC 1542 §2.1: the minimum BOOTP message a client sends (some servers drop shorter ones; flight 31's
+/// smoltcp DISCOVER carried 262 octets).
+pub const BOOTP_MIN: usize = 300;
+/// DHCPNAK (RFC 2131 §3.1.4).
+pub const MSG_NAK: u8 = 6;
+
+/// A DHCP message in its full zero-padded `BOOTP_MIN` buffer (broadcast flag set by `build_message`),
+/// wrapped in the broadcast frame: 14 + 20 + 8 + 300 = 342 bytes.
+fn build_min(
+    frame: &mut [u8],
+    xid: u32,
+    mac: [u8; 6],
+    msg_type: u8,
+    requested_ip: Option<[u8; 4]>,
+    server_ip: Option<[u8; 4]>,
+) -> Option<usize> {
+    let mut dhcp = [0u8; BOOTP_MIN];
+    build_message(&mut dhcp, xid, mac, msg_type, requested_ip, server_ip)?;
+    wrap(frame, mac, &dhcp)
+}
+
+/// A server reply with the lease's options: 1 subnet mask, 3 first router, 6 first DNS server,
+/// 51 lease seconds (zeros when absent).
+#[derive(Clone, Copy)]
+pub struct DhcpLease {
+    pub reply: DhcpReply,
+    pub mask: [u8; 4],
+    pub router: [u8; 4],
+    pub dns: [u8; 4],
+    pub lease_s: u32,
+}
+
+/// `parse_reply` plus the lease options. `None` when the frame is not a DHCP reply (UDP 67 -> 68).
+pub fn parse_lease(frame: &[u8]) -> Option<DhcpLease> {
+    let reply = parse_reply(frame)?;
+    let eth = EthernetFrame::new(frame)?;
+    let ip = Ipv4Header::new(eth.payload())?;
+    let dg = udp::UdpDatagram::new(ip.payload())?;
+    let d = dg.payload();
+    let mut l = DhcpLease { reply, mask: [0; 4], router: [0; 4], dns: [0; 4], lease_s: 0 };
+    let mut i = 240;
+    while i < d.len() {
+        let code = d[i];
+        if code == 255 {
+            break;
+        }
+        if code == 0 {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= d.len() {
+            break;
+        }
+        let len = d[i + 1] as usize;
+        if i + 2 + len > d.len() {
+            break;
+        }
+        let v = &d[i + 2..i + 2 + len];
+        match code {
+            1 if len >= 4 => l.mask.copy_from_slice(&v[..4]),
+            3 if len >= 4 => l.router.copy_from_slice(&v[..4]),
+            6 if len >= 4 => l.dns.copy_from_slice(&v[..4]),
+            51 if len >= 4 => l.lease_s = u32::from_be_bytes([v[0], v[1], v[2], v[3]]),
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    Some(l)
+}
+
+/// What [`DhcpClient::handle`] did with a reply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Handled {
+    /// Another transaction, or a message this state does not take.
+    Ignored,
+    /// An OFFER was taken: a REQUEST of this many bytes is in `out`.
+    Request(usize),
+    /// The ACK landed: `leased_ip` is set, state `Bound`.
+    Bound,
+    /// The server refused (NAK): back to `Idle`, discover again.
+    Nak,
+}
+
+impl DhcpClient {
+    /// The current transaction id.
+    pub fn xid(&self) -> u32 {
+        self.xid
+    }
+
+    /// (Re)start discovery under a fresh `xid` (RFC 2131 §4.1: a new transaction per retransmitted
+    /// DISCOVER is allowed; it keeps a late OFFER for an old one from being mistaken for the new one):
+    /// a padded broadcast DISCOVER into `out`, its length returned.
+    pub fn discover_min(&mut self, xid: u32, out: &mut [u8]) -> Option<usize> {
+        self.xid = xid;
+        self.state = DhcpState::Discovering;
+        self.leased_ip = None;
+        build_min(out, xid, self.mac, MSG_DISCOVER, None, None)
+    }
+
+    /// `on_reply`'s state machine over a parsed lease, with padded output and NAK handling: OFFER while
+    /// Discovering -> a REQUEST for its address from its server; ACK while Requesting -> Bound;
+    /// NAK while Requesting -> Idle.
+    pub fn handle(&mut self, lease: &DhcpLease, out: &mut [u8]) -> Handled {
+        let r = &lease.reply;
+        if r.xid != self.xid {
+            return Handled::Ignored;
+        }
+        match (self.state, r.msg_type) {
+            (DhcpState::Discovering, MSG_OFFER) => {
+                match build_min(out, self.xid, self.mac, MSG_REQUEST, Some(r.your_ip), Some(r.server_ip)) {
+                    Some(n) => {
+                        self.state = DhcpState::Requesting;
+                        Handled::Request(n)
+                    }
+                    None => Handled::Ignored,
+                }
+            }
+            (DhcpState::Requesting, MSG_ACK) => {
+                self.leased_ip = Some(r.your_ip);
+                self.state = DhcpState::Bound;
+                Handled::Bound
+            }
+            (DhcpState::Requesting, MSG_NAK) => {
+                self.state = DhcpState::Idle;
+                self.leased_ip = None;
+                Handled::Nak
+            }
+            _ => Handled::Ignored,
+        }
+    }
+}
