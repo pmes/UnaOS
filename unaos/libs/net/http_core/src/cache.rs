@@ -271,11 +271,14 @@ pub fn parse_http_date(s: &str) -> Option<i64> {
 
 // ---------------------------------------------------------------- keys
 
-/// The site a request is partitioned by: `scheme://host` of the top-level document (the registrable domain
-/// is owed until a Public Suffix List lands; the host is the stricter partition meanwhile).
+/// The site a request is partitioned by (HTML §7.1.2 "obtain a site", Fetch's network partition key):
+/// `scheme://registrable-domain` of the top-level document — NETDEBT (SR97): the registrable domain from the
+/// Public Suffix List (`psl_core`), so `a.example.co.uk` and `b.example.co.uk` share a partition and
+/// `alice.github.io` and `bob.github.io` do not. A host without one (an IP address, `localhost`, a host that is
+/// itself a public suffix) is its own site.
 pub fn site_of(url: &Url) -> String {
     let host = match url.host() {
-        Some(Host::Domain(d)) => d.clone(),
+        Some(Host::Domain(d)) => psl_core::site_host(d).to_string(),
         Some(h) => h.to_string(),
         None => String::new(),
     };
@@ -939,6 +942,9 @@ mod tests {
         assert_eq!(back, e);
         assert!(Entry::decode(&e.encode()[..10]).is_none());
         assert_eq!(cache_key("https://a.example", &Url::parse("https://a.example/x#y").unwrap()), "https://a.example https://a.example/x");
-        assert_eq!(site_of(&Url::parse("https://sub.a.example:8443/p").unwrap()), "https://sub.a.example");
+        assert_eq!(site_of(&Url::parse("https://sub.a.example:8443/p").unwrap()), "https://a.example");
+        assert_eq!(site_of(&Url::parse("https://x.y.example.co.uk/").unwrap()), "https://example.co.uk");
+        assert_eq!(site_of(&Url::parse("https://alice.github.io/").unwrap()), "https://alice.github.io");
+        assert_eq!(site_of(&Url::parse("http://127.0.0.1:8080/").unwrap()), "http://127.0.0.1");
     }
 }

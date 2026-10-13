@@ -2380,6 +2380,7 @@ version = "0.1.0"
 dependencies = [
  "html_core",
  "pixel_core",
+ "psl_core",
  "tls_core",
 ]
 
@@ -3990,6 +3991,10 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "psl_core"
+version = "0.1.0"
 
 [[package]]
 name = "pulp"

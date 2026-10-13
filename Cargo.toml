@@ -52,6 +52,7 @@ members = [
     "unaos/libs/web/layout_core",
     # HTTPCORE (SR51): the no_std HTTP client core (URL, HTTP/1.1, cookies, codings, h2) + its host transport.
     "unaos/libs/net/http_core",
+    "unaos/libs/net/psl_core", # NETDEBT (SR97): the Public Suffix List as a generated table, registrable_domain() — no_std, zero deps
     # GITCORE (SR59): the no_std git core (objects, deflate encoder, packs, index, refs, diff, smart HTTP).
     "unaos/libs/vcs/git_core",
 
