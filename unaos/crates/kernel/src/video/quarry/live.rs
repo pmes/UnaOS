@@ -466,8 +466,25 @@ enum Act {
     NoOpener { path: String, mime: String, why: &'static str },
 }
 
+/// QUARRYHOVER (B647): what the pointer is over, resolved by [`hover_at`] through the same rects the press
+/// reads. The painters draw the kit's hover wash on it ([`hover_wash`]); a change repaints once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Hover {
+    None,
+    /// A tree-pane row (model index).
+    Tree(usize),
+    /// A list-pane row (model index; the List view only).
+    List(usize),
+    /// A sidebar row (`sidebar::rows` index; never a header).
+    Side(usize),
+    /// A toolbar control: 0 back, 1 forward, 2 List, 3 Icons, 4 Columns, 5 the search field.
+    Tool(u8),
+}
+
 struct Model {
     geom: Geom,
+    /// QUARRYHOVER (B647): the hovered row / control, from the desktop service pass ([`hover_poll`]).
+    hover: Hover,
     tree: Vec<TreeRow>,
     tree_sel: usize,
     tree_scroll: usize,
@@ -910,6 +927,7 @@ impl Model {
     fn new(geom: Geom) -> Self {
         let mut m = Model {
             geom,
+            hover: Hover::None,
             tree: Vec::new(),
             tree_sel: 0,
             tree_scroll: 0,
@@ -1622,6 +1640,16 @@ fn keyline(px: &mut [u32], g: &Geom, r: Rect, c: u32) {
     fill(px, g, r.x + r.w.saturating_sub(1), r.y, 1, r.h, c);
 }
 
+/// QUARRYHOVER (B647): the kit's hover face over a row — GLASSKIT's `sidebar_row` wash (`theme::hairline`, a
+/// rounded pill at `DIMS.row_radius`), drawn through `video::draw` so the file manager's rows light exactly as
+/// the Settings column's do. No colour literal: the ink is a theme role, the radius the kit's table.
+pub(super) fn hover_wash(px: &mut [u32], g: &Geom, x: usize, y: usize, w: usize, h: usize) {
+    use crate::video::draw;
+    let mut s = draw::Surf::new(px, g.w);
+    let r = draw::Rect::new(x as i32, y as i32, w as i32, h as i32);
+    draw::fill_rrect(&mut s, r, crate::ui::px(draw::DIMS.row_radius) as i32, draw::Ink::argb(theme::hairline()));
+}
+
 /// QUARRYFONT — draw ASCII text, clipped to `max_x`, through the SHARED anti-aliased face.
 ///
 /// The body was a `font8x8::legacy::BASIC_LEGACY` lookup whose every set bit was filled as a
@@ -1773,6 +1801,8 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         if sel {
             let c = if m.focus == Pane::Tree { theme::accent() } else { theme::scroll_thumb() };
             fill(px, g, ti.x, y, ti.w - tsb, row_h, c);
+        } else if m.hover == Hover::Tree(i) {
+            hover_wash(px, g, ti.x, y, ti.w - tsb, row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
         }
         let ink = if sel && m.focus == Pane::Tree {
             theme::chrome_face()
@@ -2022,7 +2052,7 @@ pub fn open() {
         SURF.lock().clear();
         return;
     }
-    WIN.store(id, Ordering::Relaxed); wm::winid_register_holder(&WIN, "quarry"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Same argument as pulsewin's: `close()` clears this cell and `press_route` is its only caller, so a close taken by the router's furniture arm would free the row and leave this cell naming a re-issuable slot. render7 is the boot where this window WAS re-issued the console's id (`[quarry] open win=1` after `close-furniture win=1`).
+    WIN.store(id, Ordering::Relaxed); wm::winid_register_holder(&WIN, "quarry"); LAST_PTR.store(u64::MAX, Ordering::Relaxed); // QUARRYHOVER (B647): the hover pass reads the pointer afresh over the new window. WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Same argument as pulsewin's: `close()` clears this cell and `press_route` is its only caller, so a close taken by the router's furniture arm would free the row and leave this cell naming a re-issuable slot. render7 is the boot where this window WAS re-issued the console's id (`[quarry] open win=1` after `close-furniture win=1`).
     wm::focus_changed(OWNER);
     let (roots_n, tn, ln) = {
         let gd = MODEL.lock();
@@ -2716,13 +2746,37 @@ struct WheelHit {
 /// the viewport — holds after a wheel exactly as it holds after a track page, and [`Model::settle`]
 /// stays a fixed point rather than yanking the viewport back to a selection left off-screen.
 fn wheel_scroll(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<WheelHit> {
+    wheel_scroll_view(m, sx, sy, detents, toolbar::view()) // QUARRYHOVER (B647): the view is a parameter so the fixture can wheel the Icons grid without latching a folder mode
+}
+
+/// QUARRYHOVER (B647): [`wheel_scroll`] with the list pane's view named — every scrolling pane under the pointer:
+/// the SIDEBAR (`sidebar::wheel`, one row a detent — it is short), the tree, the list (rows), the ICONS grid
+/// (whole grid rows, `list_scroll` kept on a row boundary as `iconview::follow` keeps it; `settle` is not called
+/// there because its row clamp is the List view's) and the Miller columns (`millercols::wheel`).
+fn wheel_scroll_view(m: &mut Model, sx: usize, sy: usize, detents: i32, view: toolbar::View) -> Option<WheelHit> {
     let g = m.geom;
+    if sidebar::rect(&g).contains(sx, sy) {
+        return Some(sidebar::wheel(m, detents));
+    }
     let tree = g.tree_pane().contains(sx, sy);
     if !tree && !g.list_pane().contains(sx, sy) {
         return None;
     }
-    if !tree && toolbar::view() == toolbar::View::Columns {
+    if !tree && view == toolbar::View::Columns {
         return millercols::wheel(m, sx, sy, detents); // SMALLFIX4 (COLUMNSVIEW owed): the wheel moves the pane under the pointer
+    }
+    if !tree && view == toolbar::View::Icons {
+        let (cols, vis) = iconview::grid(&g, g.list_pane().inner());
+        let cols = cols.max(1);
+        let len = m.list.len();
+        let max_row = len.div_ceil(cols).saturating_sub(vis);
+        let cur = (m.list_scroll / cols).min(max_row);
+        let step = detents.unsigned_abs() as usize;
+        let next = if detents > 0 { cur.saturating_sub(step) } else { cur.saturating_add(step).min(max_row) };
+        m.list_scroll = next * cols;
+        let hi = ((next + vis) * cols).saturating_sub(1).min(len.saturating_sub(1));
+        m.list_sel = m.list_sel.max(next * cols).min(hi);
+        return Some(WheelHit { pane: "icons", scroll: next, max: max_row, moved: next != cur });
     }
     let (len, vis, scroll) = if tree {
         (m.tree.len(), m.tree_visible(), m.tree_scroll)
@@ -2859,6 +2913,232 @@ fn wheel_route(delta: i8) -> bool {
     true
 }
 
+// ── QUARRYHOVER (rmbp-ledger B647) — the hover line, on the desktop service pass ────────────────────────────────
+// SETTINGSTABS (B623) left owed "the hover line in quarry/live.rs"; SETTINGSCRAFT (B630) built the shape for
+// Settings: the pointer is READ on the service pass (`pal::cursor::pos`, as the dock's hover reads it — the motion
+// itself is routed in the arch syscall files, which gain no line), de-duplicated against the last position, and
+// the window repaints ONLY when the hovered row or control changed. Quarry takes the same shape: [`hover_poll`]
+// rides `service()` beside `settings::hover_poll` (one folded line), [`hover_route`] resolves the panel pointer
+// to a surface pixel through `wm::hit_test` + `wm::info` exactly as `press_route` does, and [`hover_at`] maps the
+// pixel to a [`Hover`] through the SAME rects the press reads (`toolbar::layout`, `sidebar::rect`,
+// `Geom::tree_pane` / `list_pane`), so what lights is what a press would hit. The painters draw it with the kit's
+// face ([`hover_wash`] on a row; `toolbar::button`'s `draw::ControlState` tint). Census: [`HOVER_PAINTS`].
+
+/// The last panel pointer the hover pass read (`x << 32 | y`; `u64::MAX` = read it afresh).
+static LAST_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// Repaints the hover pass caused (one per crossing; the fixture's `repaints=`).
+static HOVER_PAINTS: AtomicUsize = AtomicUsize::new(0);
+
+/// What the pointer at surface pixel `(sx, sy)` is over. Pure over the model and the toolbar/sidebar statics.
+/// Lock order: the caller holds `MODEL`; `toolbar::view` takes `TB`, `sidebar::row_at` takes `SIDE` (both below).
+fn hover_at(m: &Model, sx: usize, sy: usize) -> Hover {
+    let g = m.geom;
+    let l = toolbar::layout(&g);
+    for (k, r) in [l.back, l.fwd, l.list, l.icons, l.columns, l.search].iter().enumerate() {
+        if r.contains(sx, sy) {
+            return Hover::Tool(k as u8);
+        }
+    }
+    if let Some(i) = sidebar::row_at(&g, sx, sy) {
+        return Hover::Side(i);
+    }
+    let row_h = g.row_h();
+    let tp = g.tree_pane();
+    if tp.contains(sx, sy) {
+        let ti = tp.inner();
+        if sy >= ti.y {
+            let r = (sy - ti.y) / row_h;
+            let i = m.tree_scroll + r;
+            if r < m.tree_visible() && i < m.tree.len() {
+                return Hover::Tree(i);
+            }
+        }
+        return Hover::None;
+    }
+    let lp = g.list_pane();
+    if lp.contains(sx, sy) && m.err.is_none() && toolbar::view() == toolbar::View::List {
+        let li = lp.inner();
+        let body_y = li.y + row_h;
+        let sb = if m.list.len() > m.list_visible() { SBW() } else { 0 };
+        if sy >= body_y && sx < li.x + li.w - sb {
+            let r = (sy - body_y) / row_h;
+            let i = m.list_scroll + r;
+            if r < m.list_visible() && i < m.list.len() {
+                return Hover::List(i);
+            }
+        }
+    }
+    Hover::None
+}
+
+/// The pointer at panel `(x, y)`: light what it is over and repaint ONLY when that changed. A pointer outside the
+/// window (or over a window above it) clears the light. Never consumes; returns whether a repaint happened.
+pub fn hover_route(x: i32, y: i32) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return false;
+    }
+    let Some(info) = wm::info(id) else { return false };
+    let inside = x >= info.x as i32 && y >= info.y as i32 && matches!(wm::hit_test(x, y), Some((w, _, _)) if w == id);
+    let changed = {
+        let mut guard = MODEL.lock();
+        let Some(m) = guard.as_mut() else { return false };
+        let h = if inside {
+            let sc = info.scale.max(1);
+            let (sx, sy) = ((x as usize - info.x) / sc, (y as usize - info.y) / sc);
+            if sx < info.w && sy < info.h { hover_at(m, sx, sy) } else { Hover::None }
+        } else {
+            Hover::None
+        };
+        let c = m.hover != h;
+        m.hover = h;
+        c
+    };
+    if changed {
+        repaint();
+        HOVER_PAINTS.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
+}
+
+/// The hover pass: rides `service()` beside `settings::hover_poll`. A closed window costs one load; an unmoved
+/// pointer one swap. Reads the cursor through the input path's one door (`panel_info_nonblocking`, LOCKFIX).
+pub fn hover_poll() {
+    if !is_open() {
+        return;
+    }
+    let Some(i) = crate::video::panel_info_nonblocking() else { return };
+    let (x, y) = crate::pal::cursor::pos(i.width as i32, i.height as i32);
+    let k = ((x as u32 as u64) << 32) | y as u32 as u64;
+    if LAST_PTR.swap(k, Ordering::Relaxed) == k {
+        return;
+    }
+    hover_route(x, y);
+}
+
+/// The hovered row / control now (the fixture's read).
+fn hover_now() -> Hover {
+    MODEL.lock().as_ref().map_or(Hover::None, |m| m.hover)
+}
+
+/// `tests quarryhover` — through the LIVE window and the live pass: put the pointer (`pal::cursor::set_abs`, the
+/// absolute report every HID tablet sends) over a tree row, a sidebar row and a toolbar button, run [`hover_poll`]
+/// after each, read the hovered state and the repaint count (exactly one per crossing; a second poll with the
+/// pointer still repaints nothing); then wheel every scrolling pane through [`wheel_scroll_view`] (tree, list,
+/// sidebar, the Icons grid) and count the panes that took the detent. The model's scroll and selection are put
+/// back, the pointer and the focus owner restored, a window this fixture opened closed.
+///
+/// `:: QUARRYHOVER: rows=ok sidebar=ok toolbar=ok repaints=<n> wheel_panes=<n> -> PASS ::`
+pub fn hover_selftest() {
+    let saved_focus = wm::focus_asid();
+    let was_open = is_open();
+    if !was_open {
+        open();
+    }
+    if !is_open() {
+        wm::focus_changed(saved_focus);
+        serial_println!(":: QUARRYHOVER: quarry declined to open — see the `[quarry] DECLINE reason=` line above (640x480 refuses by design) :: SKIP ::");
+        return;
+    }
+    let id = WIN.load(Ordering::Relaxed);
+    let (Some(info), Some(pi)) = (wm::info(id), crate::video::panel_info_nonblocking()) else {
+        serial_println!(":: QUARRYHOVER: rows=FAIL sidebar=FAIL toolbar=FAIL repaints=0 wheel_panes=0 -> FAIL :: reason=no-geometry ::");
+        return;
+    };
+    let (pw, ph) = (pi.width as i32, pi.height as i32);
+    let home = crate::pal::cursor::pos(pw, ph);
+    // The three targets, in surface px: the first tree row, the first sidebar row below its header (Home), the
+    // List button — each at its centre, so the absolute report's rounding (<= 1 px) cannot miss.
+    let (tree_pt, side_pt, tool_pt, geom) = {
+        let guard = MODEL.lock();
+        let Some(m) = guard.as_ref() else { return };
+        let g = m.geom;
+        let ti = g.tree_pane().inner();
+        let sr = sidebar::rect(&g);
+        let l = toolbar::layout(&g);
+        (
+            (ti.x + ti.w / 2, ti.y + g.row_h() / 2),
+            (sr.x + sr.w / 2, sr.y + g.ts + g.row_h() + g.row_h() / 2),
+            (l.list.x + l.list.w / 2, l.list.y + l.list.h / 2),
+            g,
+        )
+    };
+    let sc = info.scale.max(1);
+    let put = |(sx, sy): (usize, usize)| {
+        let (px, py) = ((info.x + sx * sc) as i64, (info.y + sy * sc) as i64);
+        // `set_abs` maps `ax * w / 32767` (floored): round the report UP so the pointer lands on or 1 px past the target.
+        let ax = ((px * 32767 + pw as i64 - 1) / pw as i64) as i32;
+        let ay = ((py * 32767 + ph as i64 - 1) / ph as i64) as i32;
+        crate::pal::cursor::set_abs(ax, ay, pw, ph);
+        hover_poll();
+    };
+    let p0 = HOVER_PAINTS.load(Ordering::Relaxed);
+    LAST_PTR.store(u64::MAX, Ordering::Relaxed);
+    put(tree_pt);
+    let h1 = hover_now();
+    let p1 = HOVER_PAINTS.load(Ordering::Relaxed);
+    hover_poll(); // the pointer did not move: no repaint
+    let p1b = HOVER_PAINTS.load(Ordering::Relaxed);
+    put(side_pt);
+    let h2 = hover_now();
+    let p2 = HOVER_PAINTS.load(Ordering::Relaxed);
+    put(tool_pt);
+    let h3 = hover_now();
+    let p3 = HOVER_PAINTS.load(Ordering::Relaxed);
+    let rows_ok = h1 == Hover::Tree(0) && p1 - p0 == 1 && p1b == p1;
+    let side_ok = h2 == Hover::Side(1) && p2 - p1 == 1;
+    let tool_ok = h3 == Hover::Tool(2) && p3 - p2 == 1;
+    // The wheel, over every scrolling pane, on the live model (its offsets put back afterwards).
+    let (wheel_panes, wheel_hits) = {
+        let mut guard = MODEL.lock();
+        let Some(m) = guard.as_mut() else { return };
+        let g = geom;
+        let ti = g.tree_pane().inner();
+        let li = g.list_pane().inner();
+        let sr = sidebar::rect(&g);
+        let saved = (m.tree_scroll, m.tree_sel, m.list_scroll, m.list_sel, sidebar::scroll());
+        let list_pt = (li.x + li.w / 2, li.y + g.row_h() + g.row_h() / 2);
+        let legs: [(&str, (usize, usize), toolbar::View); 4] = [
+            ("tree", (ti.x + ti.w / 2, ti.y + g.row_h() / 2), toolbar::View::List),
+            ("list", list_pt, toolbar::View::List),
+            ("sidebar", (sr.x + sr.w / 2, sr.y + sr.h / 2), toolbar::View::List),
+            ("icons", list_pt, toolbar::View::Icons),
+        ];
+        let mut n = 0usize;
+        let mut names: Vec<String> = Vec::new();
+        for (name, (sx, sy), v) in legs.iter() {
+            match wheel_scroll_view(m, *sx, *sy, -1, *v) {
+                Some(h) if h.pane == *name => { n += 1; names.push(alloc::format!("{}:{}/{}{}", h.pane, h.scroll, h.max, if h.moved { "" } else { "=" })); }
+                Some(h) => names.push(alloc::format!("{}->{}", name, h.pane)),
+                None => names.push(alloc::format!("{}:none", name)),
+            }
+        }
+        m.tree_scroll = saved.0;
+        m.tree_sel = saved.1;
+        m.list_scroll = saved.2;
+        m.list_sel = saved.3;
+        sidebar::set_scroll(saved.4);
+        (n, names.join(","))
+    };
+    // Put the pointer back where it was (the same report; <= 1 px), clear the light, restore the focus owner.
+    let (hx, hy) = home;
+    crate::pal::cursor::set_abs(((hx as i64 * 32767 + pw as i64 - 1) / pw as i64) as i32, ((hy as i64 * 32767 + ph as i64 - 1) / ph as i64) as i32, pw, ph);
+    hover_poll();
+    if !was_open {
+        close();
+    } else {
+        repaint();
+    }
+    wm::focus_changed(saved_focus);
+    let ok = rows_ok && side_ok && tool_ok && wheel_panes == 4;
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
+    serial_println!("[quarryhover] seen tree={:?} sidebar={:?} toolbar={:?} paints={},{},{},{} idle_repaint={} wheel={}", h1, h2, h3, p0, p1, p2, p3, p1b - p1, wheel_hits);
+    serial_println!(
+        ":: QUARRYHOVER: rows={} sidebar={} toolbar={} repaints={} wheel_panes={} -> {} ::",
+        w(rows_ok), w(side_ok), w(tool_ok), p3 - p0, wheel_panes, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
 // ── The dock's request seam ─────────────────────────────────────────────────────────────────────
 
 /// Latched by `video::dock`'s pinned tile; drained by whoever services the desktop.
@@ -2899,7 +3179,7 @@ pub fn service() {
     }
     {
         let _s = lr::stamp(lr::W_Q_SETTINGS);
-        crate::video::settings::service(); crate::video::settings::hover_poll(); // SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
+        crate::video::settings::service(); crate::video::settings::hover_poll(); hover_poll(); // QUARRYHOVER (B647): Quarry's hover pass beside Settings', same shape (line-neutral, code before the comment). SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
     }
     {
         let _s = lr::stamp(lr::W_Q_FONT);
@@ -3031,6 +3311,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // no disk (QEMU raspi4b has no USB stick and x86 has no mount table at all).
     let mut m = Model {
         geom: small,
+        hover: Hover::None,
         tree: Vec::new(),
         tree_sel: 0,
         tree_scroll: 0,
@@ -4062,6 +4343,7 @@ pub fn open_selftest() {
     // reaches the VFS, and this fixture owes no board a volume.
     let mut m = Model {
         geom: small,
+        hover: Hover::None,
         tree: Vec::new(),
         tree_sel: 0,
         tree_scroll: 0,

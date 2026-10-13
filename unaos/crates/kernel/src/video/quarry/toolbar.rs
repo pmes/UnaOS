@@ -406,8 +406,20 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
 
 // ── Paint ───────────────────────────────────────────────────────────────────────────────────────
 
-fn button(px: &mut [u32], g: &Geom, r: Rect, label: &[u8], on: bool, live: bool) {
-    fill(px, g, r.x, r.y, r.w, r.h, if on { theme::accent() } else { theme::button_face() });
+/// QUARRYHOVER (B647): the face a control draws in state `st` — GLASSKIT's own nudge (`ControlState::face`: the
+/// face toward the ink by `DIMS.hover_tint` / `press_tint`), spelled here because the kit keeps that method private.
+fn face_of(c: u32, st: crate::video::draw::ControlState) -> u32 {
+    use crate::video::draw::{blend, DIMS};
+    if st.pressed { blend(c, theme::content_text(), DIMS.press_tint) } else if st.hover { blend(c, theme::content_text(), DIMS.hover_tint) } else { c }
+}
+
+/// The kit state of toolbar control `k` (`Hover::Tool`'s index) under the model's hover.
+fn state(m: &Model, k: u8) -> crate::video::draw::ControlState {
+    if m.hover == super::Hover::Tool(k) { crate::video::draw::ControlState::HOVER } else { crate::video::draw::ControlState::NORMAL }
+}
+
+fn button(px: &mut [u32], g: &Geom, r: Rect, label: &[u8], on: bool, live: bool, st: crate::video::draw::ControlState) {
+    fill(px, g, r.x, r.y, r.w, r.h, face_of(if on { theme::accent() } else { theme::button_face() }, st)); // QUARRYHOVER (B647): the hover face
     super::keyline(px, g, r, theme::frame_line());
     let ink = if on {
         theme::chrome_face()
@@ -429,14 +441,14 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     fill(px, g, 0, 0, g.w, g.bar_h(), theme::chrome_face());
     fill(px, g, 0, l.path.y.saturating_sub(1), g.w, 1, theme::frame_line());
     fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::frame_line());
-    button(px, g, l.back, b"<", false, t.hist.can_back());
-    button(px, g, l.fwd, b">", false, t.hist.can_forward());
-    button(px, g, l.list, b"List", t.view == View::List, true);
-    button(px, g, l.icons, b"Icons", t.view == View::Icons, true);
-    button(px, g, l.columns, b"Columns", t.view == View::Columns, true);
+    button(px, g, l.back, b"<", false, t.hist.can_back(), state(m, 0));
+    button(px, g, l.fwd, b">", false, t.hist.can_forward(), state(m, 1));
+    button(px, g, l.list, b"List", t.view == View::List, true, state(m, 2));
+    button(px, g, l.icons, b"Icons", t.view == View::Icons, true, state(m, 3));
+    button(px, g, l.columns, b"Columns", t.view == View::Columns, true, state(m, 4));
     // The search field.
     let s = l.search;
-    fill(px, g, s.x, s.y, s.w, s.h, theme::content_fill());
+    fill(px, g, s.x, s.y, s.w, s.h, face_of(theme::content_fill(), state(m, 5))); // QUARRYHOVER (B647): the field's hover face
     super::keyline(px, g, s, if t.search.focused { theme::accent() } else { theme::frame_line() });
     let ty = s.y + s.h.saturating_sub(g.cell_h()) / 2;
     if t.search.q.is_empty() && !t.search.focused {
