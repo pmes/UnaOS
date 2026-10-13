@@ -46,6 +46,8 @@ demux_core = { path = "../../unaos/libs/media/demux_core" }
 vp8_core = { path = "../../unaos/libs/media/vp8_core" }
 # VP9CORE (SR116): the from-spec VP9 decoder (profiles 0 and 2) behind `dsp::video::vp9` (`no_std`, no dependencies).
 vp9_core = { path = "../../unaos/libs/media/vp9_core" }
+# H264CORE (SR133): the from-spec H.264 / AVC decoder (Baseline, Main, High; 8-bit 4:2:0) behind `dsp::video::h264` (`no_std`, no dependencies).
+h264_core = { path = "../../unaos/libs/media/h264_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }

@@ -168,8 +168,9 @@ fn poster_is_frame_zero_while_paused() {
 #[test]
 fn codec_without_decoder_plays_the_labelled_stand_in() {
     let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10);
-    t.spec.fourcc = *b"avc1";
-    t.spec.config_box = Some(*b"avcC");
+    // H.264 has a decoder since H264CORE (SR133); HEVC is the codec with none.
+    t.spec.fourcc = *b"hvc1";
+    t.spec.config_box = Some(*b"hvcC");
     t.spec.config = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let file = build::mp4(&[t], &Mp4Options::default());
     let time = ManualTime::new();
