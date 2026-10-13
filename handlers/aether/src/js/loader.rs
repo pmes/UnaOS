@@ -810,6 +810,7 @@ pub fn document_open(vm: &mut Vm, doc: usize) -> JsResult<()> {
         }
     });
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Children { parent: doc, added: Vec::new() }); // AETHERPAINTPERF2 (SR132): the opened document emptied
     crate::ledger::record_dom("document.open-replaces-document");
     Ok(())
 }
@@ -845,5 +846,6 @@ fn reparse_opened(vm: &mut Vm, doc: usize) {
         }
     }
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Children { parent: doc, added: dom::children_of(doc) }); // AETHERPAINTPERF2 (SR132): the re-parsed document
     let _ = vm;
 }

@@ -1052,6 +1052,7 @@ fn radio_value_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if let Some(n) = items.into_iter().find(|&n| is_radio(n) && radio_value_of(n) == v) {
         super::html::set_checkedness(vm, n, true);
         super::touch();
+        crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: n, name: "checked".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     }
     Ok(Value::Undefined)
 }

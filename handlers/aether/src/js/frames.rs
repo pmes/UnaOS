@@ -351,6 +351,7 @@ fn populate(doc: usize, markup: &str) -> bool {
         }
     }
     crate::js::touch();
+    crate::css::note_change(crate::js::page(|p| p.version), crate::css::Change::Children { parent: doc, added: dom::children_of(doc) }); // AETHERPAINTPERF2 (SR132): a nested document (detached from the page's: no restyle)
     quirks
 }
 

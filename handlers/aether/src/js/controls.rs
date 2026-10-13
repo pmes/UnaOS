@@ -580,6 +580,7 @@ pub fn value_of(el: usize) -> String {
 fn store_value(el: usize, v: String) {
     page(|p| p.values.insert(el, v));
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "value".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
 }
 
 /// The `value` setter for input (value mode) and textarea: dirty, and the cursor moves to the end when
@@ -2313,6 +2314,7 @@ fn reset_form_inner(vm: &mut Vm, el: usize) -> JsResult<Value> {
         reset_control(vm, e)?;
     }
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "value".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     Ok(Value::Undefined)
 }
 

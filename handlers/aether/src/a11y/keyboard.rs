@@ -213,9 +213,11 @@ fn listbox_key(engine: &mut AetherEngine, node: &NodeRef, k: Key) -> bool {
         // The listbox keeps focus; the active option moves.
         set_attr(&lb, "aria-activedescendant", &attr(&target, "id").unwrap_or_default());
         crate::js::touch();
+        crate::css::note_change(crate::js::page(|p| p.version), crate::css::Change::Children { parent: lb.parent().map_or(0, |p| p.id().0), added: opts.iter().chain(std::iter::once(&lb)).map(|o| o.id().0).collect() }); // AETHERPAINTPERF2 (SR132): aria-selected / aria-activedescendant on the options and the listbox
         engine.relayout();
     } else {
         crate::js::touch();
+        crate::css::note_change(crate::js::page(|p| p.version), crate::css::Change::Children { parent: lb.parent().map_or(0, |p| p.id().0), added: opts.iter().chain(std::iter::once(&lb)).map(|o| o.id().0).collect() }); // AETHERPAINTPERF2 (SR132): aria-selected / aria-activedescendant on the options and the listbox
         focus::focus(engine, Some(target), true);
     }
     true
