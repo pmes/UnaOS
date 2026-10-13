@@ -746,6 +746,7 @@ pub fn open(kind: u8, by: &str) -> bool {
     // SOFTY2: `shadow=` is the band's width (0 = no room for the elev.2 shadow); the calendar names notify's unread count.
     if kind == 2 {
         serial_println!("[softy] {} open by={} win={} {}x{} at={},{} shadow={} notify_unread={}", word(kind), by, id, w, h, x, y, m, crate::video::notify::unread());
+        crate::video::notify::request_center(true); // SOFTY3 (B651): the calendar opens notify's OWN Center beside it (its service pass acts)
     } else {
         serial_println!("[softy] {} open by={} win={} {}x{} at={},{} shadow={}", word(kind), by, id, w, h, x, y, m);
     }
@@ -764,6 +765,9 @@ pub fn close(by: &str) -> bool {
     }
     *ST.lock() = None; // after the row is gone
     serial_println!("[softy] {} close by={}", word(kind), by);
+    if kind == 2 {
+        crate::video::notify::request_center(false); // SOFTY3 (B651): the calendar's Center closes with it
+    }
     true
 }
 

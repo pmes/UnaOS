@@ -113,6 +113,21 @@ pub fn selftest() {
         None => "nowindow",
     };
     let s2_ok = keys_ok && q_open && q_close && c_open && c_close && band > 0 && dark_ok && accent_ok && pressed != "no";
+    // 10. SOFTY3 (B651): the clock's flyout opens notify's OWN Center beside it and closes it with itself — the request
+    //     is notify's seam (`request_center`), acted on by its service pass, which the leg drives once per press.
+    //     The Center the operator had open is asked back at the end.
+    let center_was = crate::video::notify::center_open();
+    let clock_center = |want_open: bool| -> bool {
+        let Some((x, y)) = taskbar::probe_hot(pw, ph, 2) else { return false };
+        let _ = taskbar::press_at(x as i32, y as i32);
+        crate::video::notify::service();
+        (startmenu::open_kind() == 2) == want_open && crate::video::notify::center_open() == want_open
+    };
+    let cc_open = clock_center(true);
+    let cc_close = clock_center(false);
+    if center_was {
+        crate::video::notify::request_center(true);
+    }
     // 5. Back to the UnaOS look: the taskbar leaves, the dock and (when it was on) the menu bar return.
     let back = look::set(was, "tests");
     wm::composite();
@@ -131,6 +146,7 @@ pub fn selftest() {
         if bar_back { "menubar" } else { "no-menubar" }, if dock_back { "dock" } else { "no-dock" },
         if ok { "PASS" } else { "FAIL" }
     );
+    serial_println!(":: SOFTY: clock->center open={} close={} -> {} ::", yn(cc_open), yn(cc_close), if cc_open && cc_close { "PASS" } else { "FAIL" });
 }
 
 /// The caption buttons' hit-test on the topmost window that draws them: `right(min,max,close)` when the three sit
