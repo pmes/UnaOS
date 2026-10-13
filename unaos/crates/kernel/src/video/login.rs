@@ -970,6 +970,7 @@ pub fn consume_key(c: u8) -> bool {
     if !KEY_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
+    let echo0 = echo_snapshot(c); // LOGINECHO (B564): taken before the key moves anything — a text edit that moves nothing else is echoed into its field's rect
     if (0x20..=0x7e).contains(&c) && PFOCUS.load(Ordering::Relaxed) == 0 && ARMED.swap(false, Ordering::Relaxed) { FORM.lock().focus = Focus::Password; } // LOGINWINDOW: typing on an arrow-picked tile opens its field
     match c {
         b'\t' if power_tab() => {} // DIALOG2: Tab walks Name -> Password -> Sleep -> Restart -> Shut Down -> Name
@@ -1041,7 +1042,9 @@ pub fn consume_key(c: u8) -> bool {
         }
         _ => {}
     }
-    repaint();
+    if !echo_after(echo0) {
+        repaint();
+    }
     true
 }
 
@@ -2823,4 +2826,200 @@ pub fn settings_rekey_fixture() -> &'static str {
     let refused = matches!(compute(&w).0, Outcome::SetPw { written: Err("bad-old-password"), .. });
     let unwritten = !users::verify(&me[..ml], NEW);
     if map && refused && unwritten { "ok" } else { "FAIL" }
+}
+
+// =================================================================================================
+// LOGINECHO (rmbp-ledger B564) — A KEYSTROKE COSTS ITS FIELD, NOT THE FORM.
+//
+// Flight 33 (B557's finding): INPUTSTALL `comp_max_ms=258` was the login screen echoing typed keys, 100-258 ms per
+// key — every key ended in `repaint()`, which redraws the whole dpi-scaled form (roster tiles and avatars, fields,
+// button, power row, footer, all shaped text) and presents it with `wm::present` (`damage_all`: the whole box
+// composited). Now a text edit that moves nothing else ([`echo_snapshot`] before the key, [`echo_after`] after it)
+// redraws ONLY the focused field, through the same `field()` primitive and the same rect accessor the painter uses
+// for that form ([`echo_rect`]: `ctl_rect` / `cu_rect` / `chg_rect` — LOGINFLOW's one-accessor rule), and presents
+// that field's surface-row band alone (`wm::present_rows`, FBCON-DMG's banded present). One line per echo:
+// `[login] key echo comp_ms=<n> rect=<w>x<h> us=<n> band=<y0>..<y1> field=<name>` (no typed byte, no length).
+// `tests loginecho` drives ten keys through the live `consume_key` and asserts the bound.
+// =================================================================================================
+
+/// An echoed key over this fails `tests loginecho` (one 60 Hz frame).
+pub const ECHO_BOUND_MS: u64 = 16;
+/// Keys the witness drives into the password field.
+const ECHO_KEYS_DRIVEN: u32 = 10;
+/// Keys echoed into their field's rect (this boot).
+static ECHO_KEYS: AtomicU32 = AtomicU32::new(0);
+/// Text edits that had to take the whole form (the roster pick moved with the name).
+static ECHO_FULL: AtomicU32 = AtomicU32::new(0);
+/// The longest echo this boot, and the longest since the witness last reset it (us).
+static ECHO_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ECHO_WIN_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last echo's physical field rect, packed `w << 32 | h`.
+static ECHO_RECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// What a key may be echoed against: the form's state, the focused field, and (log-in form, Name) the tile the name picks.
+type EchoSnap = Option<(State, Focus, Option<usize>)>;
+
+/// Before the key: is it a text edit on a windowed form, and what does the form look like? `None` = not an echo candidate.
+fn echo_snapshot(c: u8) -> EchoSnap {
+    if !((0x20..=0x7e).contains(&c) || c == 8 || c == 0x7f) || PFOCUS.load(Ordering::Relaxed) != 0 {
+        return None;
+    }
+    let (st, fo) = {
+        let f = FORM.lock();
+        if !f.windowed || !matches!(f.state, State::Open | State::SetPw | State::CreateUser) {
+            return None;
+        }
+        (f.state, f.focus)
+    };
+    let pick = if st == State::Open && fo == Focus::Name && !LOCKED.load(Ordering::Relaxed) { picked_ix() } else { None };
+    Some((st, fo, pick))
+}
+
+/// After the key: echo it into its field if nothing but that field moved. `false` = the caller repaints the whole form.
+fn echo_after(s: EchoSnap) -> bool {
+    let Some((st, fo, pick)) = s else { return false };
+    if PFOCUS.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let (st2, fo2) = {
+        let f = FORM.lock();
+        (f.state, f.focus)
+    };
+    if st2 != st || fo2 != fo {
+        return false;
+    }
+    if st == State::Open && fo == Focus::Name && !LOCKED.load(Ordering::Relaxed) && picked_ix() != pick {
+        ECHO_FULL.fetch_add(1, Ordering::Relaxed); // the name became (or stopped being) a tile's: the tile repaints too
+        return false;
+    }
+    echo_field()
+}
+
+/// The focused field's LOGICAL rect on the form being drawn — the painter's own accessor for that form.
+fn echo_rect(state: State, chg: u8, focus: Focus) -> Option<(usize, usize, usize, usize)> {
+    let r = match (state, focus) {
+        (State::CreateUser, Focus::Name) => cu_rect(Ctl::NameField),
+        (State::CreateUser, Focus::Password) => cu_rect(Ctl::PwField),
+        (State::CreateUser, Focus::Retype) => cu_rect(Ctl::Pw2Field),
+        (State::SetPw, Focus::Old) if chg == CHG_OWN => chg_rect(Ctl::OldField),
+        (State::SetPw, Focus::Password) if chg == CHG_OWN => chg_rect(Ctl::PwField),
+        (State::SetPw, Focus::Retype) if chg == CHG_OWN => chg_rect(Ctl::Pw2Field),
+        (State::SetPw, Focus::Password) => ctl_rect(Ctl::PwField, true),
+        (State::SetPw, Focus::Retype) => ctl_rect(Ctl::Pw2Field, true),
+        (State::Open, Focus::Name) => ctl_rect(Ctl::NameField, false),
+        (State::Open, Focus::Password) => ctl_rect(Ctl::PwField, false),
+        _ => return None,
+    };
+    if r.2 == 0 { None } else { Some(r) }
+}
+
+fn echo_field_word(f: Focus) -> &'static str {
+    match f {
+        Focus::Name => "name",
+        Focus::Password => "password",
+        Focus::Retype => "retype",
+        Focus::Old => "old",
+    }
+}
+
+/// Redraw ONLY the focused field and present its surface-row band. `false` = no rect for this form (repaint whole).
+fn echo_field() -> bool {
+    use super::super::metrics::{edge, size};
+    let t0 = crate::hidstall::now_us();
+    let (x, y, w, h, fo) = {
+        let f = FORM.lock();
+        if !f.windowed {
+            return false;
+        }
+        let Some((x, y, w, h)) = echo_rect(f.state, f.chg, f.focus) else { return false };
+        let (buf, len): (&[u8], usize) = match f.focus {
+            Focus::Name => (&f.name, f.name_len),
+            Focus::Password => (&f.pw, f.pw_len),
+            Focus::Retype => (&f.pw2, f.pw2_len),
+            Focus::Old => (&f.old, f.old_len),
+        };
+        // SAFETY: see `SURF` — the key-owning route, as `repaint`.
+        let px: &mut [u32] = surf();
+        field(px, x, y, w, &buf[..len.min(FIELD_MAX)], true, f.focus != Focus::Name); // the echo path runs only with PFOCUS == 0, so the focused frame is the painter's
+        (x, y, w, h, f.focus)
+    };
+    let id = WIN.load(Ordering::Relaxed);
+    let (y0, y1) = (edge(y), edge(y + h).min(size(H)));
+    if id != wm::WIN_NONE {
+        crate::video::lag::present_req(); // as `wm::present` does: INPUTSTALL's draw/pre split sees the request
+        let _ = wm::present_rows(id, y0, y1);
+    }
+    let us = crate::hidstall::now_us().saturating_sub(t0);
+    let (pw, ph) = (edge(x + w).min(size(W)).saturating_sub(edge(x)), y1.saturating_sub(y0));
+    ECHO_KEYS.fetch_add(1, Ordering::Relaxed);
+    ECHO_MAX_US.fetch_max(us, Ordering::Relaxed);
+    ECHO_WIN_MAX_US.fetch_max(us, Ordering::Relaxed);
+    ECHO_RECT.store(((pw as u64) << 32) | ph as u64, Ordering::Relaxed);
+    serial_println!("[login] key echo comp_ms={} rect={}x{} us={} band={}..{} field={}", us / 1000, pw, ph, us, y0, y1, echo_field_word(fo));
+    true
+}
+
+/// Register `tests loginecho` once (folded into `loginfurn::ensure_tests`).
+pub fn echo_ensure() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) {
+        crate::tests::register("loginecho", echo_selftest);
+    }
+}
+
+/// `tests loginecho` (R80: only when asked) — with the screen up: ten keys through the live `consume_key` into the
+/// password field, each one field-sized band and under [`ECHO_BOUND_MS`]; with no screen: what the boot's keys recorded.
+pub fn echo_selftest() {
+    let rect = |r: u64| alloc::format!("{}x{}", r >> 32, r & 0xffff_ffff);
+    let live = !cfg!(feature = "tests-at-boot")
+        && is_open()
+        && FORM.lock().windowed
+        && WIN.load(Ordering::Relaxed) != wm::WIN_NONE
+        && !submit_busy()
+        && PFOCUS.load(Ordering::Relaxed) == 0;
+    if !live {
+        let k = ECHO_KEYS.load(Ordering::Relaxed);
+        if k == 0 {
+            serial_println!(":: LOGINECHO: keys=0 -> SKIP :: reason=screen-down bound_ms={} full={}", ECHO_BOUND_MS, ECHO_FULL.load(Ordering::Relaxed));
+            return;
+        }
+        let mx = ECHO_MAX_US.load(Ordering::Relaxed);
+        serial_println!(
+            ":: LOGINECHO: keys={} echoed={} full={} comp_max_ms={} comp_max_us={} rect={} -> {} :: bound_ms={} mode=recorded",
+            k, k, ECHO_FULL.load(Ordering::Relaxed), mx / 1000, mx, rect(ECHO_RECT.load(Ordering::Relaxed)),
+            if mx < ECHO_BOUND_MS * 1000 { "PASS" } else { "FAIL" }, ECHO_BOUND_MS
+        );
+        return;
+    }
+    // Save what the drive moves: the focus, the password field, the arrow-pick latch.
+    let (focus0, mut pw0, pwl0) = {
+        let f = FORM.lock();
+        (f.focus, f.pw, f.pw_len)
+    };
+    let armed = ARMED.swap(false, Ordering::Relaxed);
+    FORM.lock().focus = Focus::Password;
+    repaint(); // the focus move is one whole-form compose, outside the ten
+    let (k0, f0) = (ECHO_KEYS.load(Ordering::Relaxed), ECHO_FULL.load(Ordering::Relaxed));
+    ECHO_WIN_MAX_US.store(0, Ordering::Relaxed);
+    for _ in 0..ECHO_KEYS_DRIVEN {
+        let _ = consume_key(b'x');
+    }
+    let echoed = ECHO_KEYS.load(Ordering::Relaxed).wrapping_sub(k0);
+    let full = ECHO_FULL.load(Ordering::Relaxed).wrapping_sub(f0);
+    let mx = ECHO_WIN_MAX_US.load(Ordering::Relaxed);
+    {
+        let mut f = FORM.lock();
+        f.pw = pw0;
+        f.pw_len = pwl0;
+        f.focus = focus0;
+    }
+    pw0 = [0; FIELD_MAX]; // the saved copy of a typed password does not outlive the drive
+    let _ = pw0;
+    ARMED.store(armed, Ordering::Relaxed);
+    repaint();
+    let pass = echoed == ECHO_KEYS_DRIVEN && full == 0 && mx < ECHO_BOUND_MS * 1000;
+    serial_println!(
+        ":: LOGINECHO: keys={} echoed={} full={} comp_max_ms={} comp_max_us={} rect={} -> {} :: bound_ms={} mode=driven",
+        ECHO_KEYS_DRIVEN, echoed, full, mx / 1000, mx, rect(ECHO_RECT.load(Ordering::Relaxed)), if pass { "PASS" } else { "FAIL" }, ECHO_BOUND_MS
+    );
 }
