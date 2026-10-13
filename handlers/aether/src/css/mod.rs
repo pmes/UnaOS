@@ -259,7 +259,7 @@ impl SpecifiedStyle {
                 node_style.flex_direction = FlexDirection::Row;
             }
             node_style.flex_wrap = self.flex_wrap.unwrap_or(taffy::style::FlexWrap::NoWrap);
-            node_style.align_items = self.align_items;
+            node_style.align_items = self.align_items.unwrap_or(taffy::style::AlignItems::NORMAL);
         } else if let Some(w) = self.flex_wrap {
             node_style.flex_wrap = w;
         }
@@ -304,7 +304,7 @@ impl SpecifiedStyle {
         if let Some(v) = self.inset_right { node_style.inset.right = v; }
         if let Some(v) = self.inset_bottom { node_style.inset.bottom = v; }
         if let Some(j) = self.justify {
-            node_style.justify_content = Some(j);
+            node_style.justify_content = j;
         }
         // align-items only reaches ROW boxes. A column box here is the
         // block-container approximation, not a real column flex container:
@@ -314,7 +314,7 @@ impl SpecifiedStyle {
             if self.flex_container == Some(true)
                 || matches!(node_style.flex_direction, FlexDirection::Row | FlexDirection::RowReverse)
             {
-                node_style.align_items = Some(a);
+                node_style.align_items = a;
             }
         }
         if let Some(a) = self.align_self {
@@ -1552,7 +1552,7 @@ fn apply_spec_to_node(
     }
     match style.position {
         Some(taffy::style::Position::Absolute) => { abs_nodes.insert(node_id); }
-        Some(taffy::style::Position::Relative) => { abs_nodes.remove(&node_id); }
+        Some(_) => { abs_nodes.remove(&node_id); }
         None => {}
     }
     if style.inset_top.is_some() || style.inset_left.is_some()

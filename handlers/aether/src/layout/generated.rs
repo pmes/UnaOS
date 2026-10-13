@@ -534,8 +534,9 @@ fn share_line(tree: &mut LayoutTree, styles: &HashMap<NodeId, Rc<SpecifiedStyle>
         display: taffy::style::Display::Flex,
         flex_direction: taffy::style::FlexDirection::Row,
         flex_wrap: taffy::style::FlexWrap::Wrap,
-        align_items: Some(taffy::style::AlignItems::BASELINE),
+        align_items: taffy::style::AlignItems::BASELINE,
         size: taffy::geometry::Size { width: taffy::style::Dimension::percent(1.0), height: taffy::style::Dimension::auto() },
+        position: taffy::style::Position::Relative,
         ..Default::default()
     };
     let Ok(id) = tree.taffy.new_with_children(anon, &run) else { return };
