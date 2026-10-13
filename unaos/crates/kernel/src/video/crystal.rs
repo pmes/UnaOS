@@ -98,7 +98,7 @@
 //! while the menu is open tears the menu down — [`super::menubar::set_enabled`] calls [`dismiss`] — so
 //! the surface never outlives the mark it hangs from.
 
-use super::{menubar, strip, theme, wm};
+use super::{menubar, strip, wm};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -183,8 +183,9 @@ const FACE: super::text::Face = super::text::Face::Chrome;
 /// which is the whole point of writing it as an expression. Bounded, not pinned, below.
 #[allow(non_snake_case)] #[inline] fn ITEM_H() -> usize { CELL_H() + crate::ui::px(8) }
 
-/// A separator row's height, px — a thin band carrying one keyline, centred.
-#[allow(non_snake_case)] #[inline] fn SEP_H() -> usize { crate::ui::px(7) }
+/// A separator row's height, px — a thin band carrying one keyline, centred. MENUSCRAFT (B642): 5 above, the
+/// hairline, 5 below (DESIGN-LANGUAGE §3.7; was 7).
+#[allow(non_snake_case)] #[inline] fn SEP_H() -> usize { crate::ui::px(11) }
 
 /// The menu's 1 px keyline border, all four sides — the same [`theme::FRAME_LINE`] the window frame
 /// and the bar keyline use.
@@ -192,6 +193,9 @@ const BORDER: usize = 1;
 
 /// The horizontal inset of item text from the menu's inner edge — one [`strip::PAD`], the kit's gap.
 #[allow(non_snake_case)] #[inline] fn PADX() -> usize { strip::PAD() }
+
+/// MENUSCRAFT (B642): the container's vertical padding above the first row and below the last (§3.7 "padding 5").
+#[allow(non_snake_case)] #[inline] fn PADY() -> usize { crate::ui::px(5) }
 
 /// The longest item label in glyphs, walked at compile time so the menu width is a function of the
 /// tree rather than a magic number that a relabelled item could silently overflow.
@@ -210,7 +214,7 @@ const fn max_label_glyphs() -> usize {
 
 /// The menu's total height, walked at compile time from the row heights plus the two borders.
 fn menu_height() -> usize {
-    let mut h = 2 * BORDER;
+    let mut h = 2 * BORDER + 2 * PADY(); // MENUSCRAFT: the container's padding
     let mut i = 0;
     while i < ROWS.len() {
         h += if ROWS[i].verb.is_some() { ITEM_H() } else { SEP_H() };
@@ -220,7 +224,7 @@ fn menu_height() -> usize {
 }
 
 /// The menu's width, px: both borders, both insets, and the widest label.
-#[allow(non_snake_case)] #[inline] fn MENU_W() -> usize { 2 * BORDER + 2 * PADX() + max_label_glyphs() * CELL_W() }
+#[allow(non_snake_case)] #[inline] fn MENU_W() -> usize { (2 * BORDER + 2 * PADX() + max_label_glyphs() * CELL_W()).max(sheet::MIN_W()) } // MENUSCRAFT: §3.7's min-width
 
 /// The menu's height, px.
 #[allow(non_snake_case)] #[inline] fn MENU_H() -> usize { menu_height() }
@@ -256,6 +260,8 @@ const ITEM_COUNT: usize = item_count();
 pub const DROP_BORDER: usize = BORDER;
 /// WINMENU — an item row's height, px.
 #[allow(non_snake_case)] #[inline] pub fn DROP_ITEM_H() -> usize { ITEM_H() }
+/// MENUSCRAFT (B642) — the container's vertical padding, px.
+#[allow(non_snake_case)] #[inline] pub fn DROP_PADY() -> usize { PADY() }
 /// WINMENU — a separator band's height, px.
 #[allow(non_snake_case)] #[inline] pub fn DROP_SEP_H() -> usize { SEP_H() }
 /// WINMENU — the horizontal inset of item text from the inner edge, px.
@@ -397,13 +403,13 @@ fn menu_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let (_cx, _cy, _cw, _ch) = menubar::crystal_box_abs(pw, ph)?;
     let (_bx, by, _bw, bh) = menubar::strip_rect(pw, ph)?;
     let my = by + bh; // flush under the bar
-    if MENU_W() > pw || my + MENU_H() > ph {
-        return None; // panel cannot host the menu below the bar
+    if MENU_W() + sheet::BAND() > pw || my + MENU_H() + sheet::BAND() > ph {
+        return None; // panel cannot host the menu (and its shadow band, MENUSCRAFT) below the bar
     }
     // PANEL-LEFT-FLUSH: the literal 0 is the whole ruling. It is written here rather than derived
     // from the glyph precisely so that moving the mark can never move the menu again.
     let mx = 0;
-    Some((mx, my, MENU_W(), MENU_H()))
+    Some((mx, my, MENU_W() + sheet::BAND(), MENU_H() + sheet::BAND())) // MENUSCRAFT: the published rect carries the shadow's band; `sheet::body` is what a press hits
 }
 
 /// MENUFIT — **the dropdown's LIVE extent: its rect while the menu is open, `None` while it is not.**
@@ -482,7 +488,7 @@ pub fn menu_wakeup_rescue() {}
 
 /// The top of row `idx` as an offset from the menu's top edge, in px — border plus every earlier row.
 fn row_top(idx: usize) -> usize {
-    let mut y = BORDER;
+    let mut y = BORDER + PADY(); // MENUSCRAFT: below the container's padding
     let mut i = 0;
     while i < idx {
         y += if ROWS[i].verb.is_some() { ITEM_H() } else { SEP_H() };
@@ -514,7 +520,7 @@ fn row_at(ly: usize) -> Option<usize> {
 /// inside the menu but on a separator, a border, or the inner padding answers `None`; a press outside
 /// the menu answers `None`.
 fn item_at(r: strip::Rect, px: usize, py: usize) -> Option<Verb> {
-    let (mx, my, mw, mh) = r;
+    let (mx, my, mw, mh) = sheet::body(r); // MENUSCRAFT: the shadow band is outside the menu
     if px < mx || px >= mx + mw || py < my || py >= my + mh {
         return None;
     }
@@ -524,7 +530,7 @@ fn item_at(r: strip::Rect, px: usize, py: usize) -> Option<Verb> {
 
 /// Does panel point `(px, py)` fall anywhere inside the menu rect (border included)?
 fn menu_contains(r: strip::Rect, px: usize, py: usize) -> bool {
-    let (mx, my, mw, mh) = r;
+    let (mx, my, mw, mh) = sheet::body(r); // MENUSCRAFT: the shadow band is outside the menu
     px >= mx && px < mx + mw && py >= my && py < my + mh
 }
 
@@ -737,7 +743,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     if OPEN.load(Ordering::Acquire) {
         if let Some(r) = menu_rect(pw, ph) {
             if menu_contains(r, px, py) {
-                if super::powerui::panel_open() { let (rx, ry, rw, _) = r; let row = py.saturating_sub(ry + BORDER) / ITEM_H(); let _ = super::statusmenu::panel_press(row, px.saturating_sub(rx + BORDER + PADX()), rw.saturating_sub(2 * (BORDER + PADX()))); PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed); return true; } // STATUSTRAY (B426): a press on a status menu's row acts through the owner's seam (slider, mute, the table toggle); the panel stays open // POWERMENU M2: a press inside the battery panel is swallowed
+                if super::powerui::panel_open() { let (rx, ry, rw, _) = sheet::body(r); let row = py.saturating_sub(ry + BORDER + PADY()) / ITEM_H(); let _ = super::statusmenu::panel_press(row, px.saturating_sub(rx + BORDER + PADX()), rw.saturating_sub(2 * (BORDER + PADX()))); PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed); return true; } // STATUSTRAY (B426): a press on a status menu's row acts through the owner's seam (slider, mute, the table toggle); the panel stays open // POWERMENU M2: a press inside the battery panel is swallowed
                 return match item_at(r, px, py) {
                     Some(verb) if verb.real() && power_ask(verb) => { // DIALOG (B395): Restart / Shut Down / Log Out ASK — the confirm dialog with its 60 s countdown (was POWERMENU M1's click-again arming)
                         PRESS_OUTCOME.store(OUT_PICK, Ordering::Relaxed); PICKS.fetch_add(1, Ordering::Relaxed);
@@ -925,7 +931,8 @@ pub fn compose() -> bool {
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
-    let sig = strip::seal(strip::fnv1a_u64(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))), super::powerui::armed_code() as u64 | ((super::powerui::panel_open() as u64) << 8) | (super::statusmenu::generation() << 16))); // POWERMENU: the armed label / panel mode repaint
+    let hov = sheet_hover(r, pw, ph); // MENUSCRAFT (B642): the hovered row lights its pill, so it is part of what was painted
+    let sig = strip::seal(strip::fnv1a_u64(strip::fnv1a_u64(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))), super::powerui::armed_code() as u64 | ((super::powerui::panel_open() as u64) << 8) | (super::statusmenu::generation() << 16)), hov as u64)); // POWERMENU: the armed label / panel mode repaint
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {
         return false;
     }
@@ -939,7 +946,12 @@ pub fn compose() -> bool {
     }
 
     let t1 = crate::arch::now_cycles();
-    if !strip::paint("crystal", r, |out, j| compose_row(out, r, j)) {
+    let under = sheet::Under::scan(&rows[..]); // MENUSCRAFT: the scene the shadow band blends over
+    if !strip::paint("crystal", r, |out, j| {
+        sheet::row(out, r, j, &under, true);
+        compose_row(out, r, j);
+        sheet::seal_row(out);
+    }) {
         return false;
     }
     LEDGER.paint(crate::arch::now_cycles().saturating_sub(t1), (r.2 * r.3) as u64);
@@ -953,42 +965,28 @@ pub fn compose() -> bool {
 /// overlaid by index. The dock's and bar's shape: an overlay keeps the inner loop a handful of
 /// integer compares rather than a scan over every label at every pixel.
 fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
-    let (_mx, _my, w, h) = r;
+    // MENUSCRAFT (B642) — the field pass (face, keylines) is [`sheet::row`]'s now, painted first into the same
+    // row; this overlays the content in BODY coordinates (the body's origin is the rect's, the band is right and
+    // below), so every row offset below is the one it always was, plus the container's padding.
+    let (_mx, _my, w, h) = sheet::body(r);
     // MENU-UNDER load-bearing palette fact (review, 2026-08-18): no colour this function emits may
     // be pure white 0x00FF_FFFF — that is the sprite's FILL, and `cursor::undraw_locked`'s colour
     // guard is what stops a stale save-under from stamping over a menu that opened mid-pass
-    // (the open-direction residual the MENU-UNDER decline cannot see). CHROME_FACE, FRAME_LINE and
-    // the blended label text all differ from FILL today; a future theme edit that puts 0xFFFFFF in
-    // the dropdown (BEVEL_LIGHT / GLOSS_HIGHLIGHT are both pure white) re-opens a one-pixel stamp.
-
-    // The whole-row base: keyline on the top and bottom border rows, menu face elsewhere.
-    let base = if j < BORDER || j + 1 > h - BORDER {
-        theme::frame_line()
-    } else {
-        theme::chrome_face()
-    };
-    for i in 0..w {
-        out[i] = base;
-    }
-    // The two side borders, on every row.
-    for i in 0..w {
-        if i < BORDER || i + BORDER >= w {
-            out[i] = theme::frame_line();
-        }
-    }
-    if j < BORDER || j + 1 > h - BORDER {
-        return; // a pure border row — nothing else on it
+    // (the open-direction residual the MENU-UNDER decline cannot see). MENUSCRAFT: every sheet
+    // colour goes through `sheet::unfill` and the finished row through `sheet::seal_row`.
+    if j < BORDER + PADY() || j + BORDER + PADY() >= h {
+        return; // the hairline, the padding, or the shadow band — nothing else on it
     }
 
     if super::powerui::panel_open() { // POWERMENU M2: one text line per ITEM_H band
-        let li = (j - BORDER) / ITEM_H();
-        let sy = (j - BORDER) % ITEM_H();
+        let li = (j - BORDER - PADY()) / ITEM_H();
+        let sy = (j - BORDER - PADY()) % ITEM_H();
         { let mut b = [0u8; 4]; let n = super::powerui::panel_line(li, &mut b); if n > 0 && b[0] == super::statusmenu::SLIDER_MARK { super::statusmenu::paint_slider(out, w, BORDER + PADX(), w.saturating_sub(2 * (BORDER + PADX())), sy, ITEM_H(), &b[..n]); return; } } // STATUSTRAY: the volume slider row
         if sy >= (ITEM_H() - CELL_H()) / 2 && sy < (ITEM_H() - CELL_H()) / 2 + CELL_H() {
             let mut buf = [0u8; 48];
             let n = super::powerui::panel_line(li, &mut buf);
             if n > 0 && buf[0] == super::statusmenu::GRID_MARK { super::statusmenu::paint_grid(out, w, BORDER + PADX(), w.saturating_sub(2 * (BORDER + PADX())), sy - (ITEM_H() - CELL_H()) / 2, &buf[1..n]); return; } // STATUSTRAY: the clock's month glance
-            super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, theme::title_text_active(), false, FACE);
+            super::text::draw_row(out, w, &buf[..n], BORDER + PADX(), sy - (ITEM_H() - CELL_H()) / 2, sheet::text_primary(), false, FACE);
         }
         return;
     }
@@ -998,27 +996,25 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     let top = row_top(row);
 
     match ROWS[row].verb {
-        // A separator: one keyline centred in the band, inset from the side borders by PADX.
-        None => {
-            if j == top + SEP_H() / 2 {
-                for i in (BORDER + PADX())..(w - BORDER - PADX()) {
-                    out[i] = theme::frame_line();
-                }
-            }
-        }
-        // An item: its label, vertically centred in the row, at PADX from the inner edge.
+        // A separator: one `line.subtle` hairline centred in the band, inset `sheet::SEP_INSET` (MENUSCRAFT).
+        None => sheet::separator(out, w, j, top + SEP_H() / 2),
+        // An item: the accent pill under the pointer (MENUSCRAFT), then its label, vertically centred in the row,
+        // at PADX from the inner edge.
         Some(_) => {
+            let lit = HOVER.load(Ordering::Relaxed) == row + 1;
+            if lit {
+                sheet::pill(out, w, j, top, ITEM_H());
+            }
             let vpad = (ITEM_H() - CELL_H()) / 2;
             let gtop = top + vpad;
             if j < gtop || j >= gtop + CELL_H() {
                 return;
             }
             let sy = j - gtop;
-            // FONT (GR27) — the shared anti-aliased face, blended over the row fill the loop above
-            // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
-            // body text, not a caption.
+            // FONT (GR27) — the shared anti-aliased face, blended over the row the sheet painted (RAM scratch —
+            // the blend's read is cached). Regular weight: menu items are body text, not a caption.
             let label = match ROWS[row].verb { Some(Verb::Restart) => super::powerui::armed_label(1), Some(Verb::ShutDown) => super::powerui::armed_label(2), _ => None }.unwrap_or(ROWS[row].label).as_bytes(); // POWERMENU M1: the armed row re-reads
-            super::text::draw_row(out, w, label, BORDER + PADX(), sy, theme::title_text_active(), false, FACE);
+            super::text::draw_row(out, w, label, BORDER + PADX(), sy, if lit { sheet::on_accent() } else { sheet::text_primary() }, false, FACE);
         }
     }
 }
@@ -1390,8 +1386,8 @@ pub fn logout_row_fire() -> bool {
 /// The panel's rect: right-flush under the bar (the battery item lives at the bar's right), one text line per ITEM_H.
 fn panel_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let (_bx, by, _bw, bh) = menubar::strip_rect(pw, ph)?;
-    let w = 2 * BORDER + 2 * PADX() + super::powerui::PANEL_GLYPHS * CELL_W();
-    let h = 2 * BORDER + super::powerui::panel_rows().max(1) * ITEM_H();
+    let w = 2 * BORDER + 2 * PADX() + super::powerui::PANEL_GLYPHS * CELL_W() + sheet::BAND(); // MENUSCRAFT: the shadow band
+    let h = 2 * BORDER + 2 * PADY() + super::powerui::panel_rows().max(1) * ITEM_H() + sheet::BAND();
     let my = by + bh;
     if w > pw || my + h > ph { return None; }
     let x = super::statusmenu::anchor_x().map(|ax| ax.min(pw - w)).unwrap_or(pw - w); // STATUSTRAY: hang under the pressed item (right-clamped)
@@ -1420,7 +1416,7 @@ pub fn power_panel_selftest() -> bool {
         open_battery_panel(pw, ph);
         let rect = menu_rect(pw, ph);
         let mut row = [0u32; 512];
-        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H() - CELL_H()) / 2 + CELL_H() / 2); any = row[BORDER + PADX()..r.2 - BORDER].iter().any(|&c| c != theme::chrome_face()); } any }).unwrap_or(false);
+        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { let jj = BORDER + PADY() + (ITEM_H() - CELL_H()) / 2 + CELL_H() / 2; sheet::row(&mut row, r, jj, &sheet::Under::none(), true); compose_row(&mut row, r, jj); any = row[BORDER + PADX()..sheet::body(r).2 - BORDER].iter().any(|&c| c != sheet::surface_overlay()); } any }).unwrap_or(false);
         ok = ok && OPEN.load(Ordering::Relaxed) && super::powerui::panel_open() && rect.is_some() && drew;
         dismiss("fixture");
         ok = ok && !OPEN.load(Ordering::Relaxed) && !super::powerui::panel_open();
@@ -1477,4 +1473,410 @@ pub fn open_status_panel(pw: usize, ph: usize, via: &'static str) {
     if OPEN.load(Ordering::Acquire) { dismiss("switch"); }
     super::powerui::panel_set();
     open_via(pw, ph, via);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// MENUSCRAFT (rmbp-ledger B642, DESIGN-LANGUAGE §3.7) — THE DROPDOWNS ON THE KIT
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Every dropdown this file and `winmenu` paint — the SHARD menu, its panel mode (the battery panel and every status
+// item's menu, STATUSTRAY) and a window's menus — is one SHEET: a rounded `surface.overlay` body under an `elev.2`
+// shadow, a `line.subtle` hairline, the accent item pill under the pointer, inset separators and keycap hints. The
+// geometry the routers read is unchanged in kind: the published rect (the strip rect, the MENU-OCC occluder, the
+// vacate rect) grows by [`sheet::BAND`] on the right and at the foot to hold the shadow, and every hit test reads
+// [`sheet::body`] — the rect minus that band — so a press on the shadow is a press outside the menu.
+//
+// THE BAND AND THE COMPOSITOR. A strip writes the front buffer and nothing reads it back (VRAM), so the band cannot
+// blend over what is really under it. It blends over a SCENE ESTIMATE ([`sheet::Under`]): the windows' boxes from
+// the compositor's own table (title band = `chrome_face`, content = `content_fill`, frame band = the wallpaper) and
+// the wallpaper elsewhere. The windows under the open menu withhold the whole published rect (MENU-OCC), so the
+// estimate is what the glass shows there until the menu goes. Exact pixels under a shadow need the compositor to
+// hand an overlay the composed scene beneath it — the window shadow's owed margin (DESKTOPCRAFT.md), the same change.
+
+/// MENUSCRAFT — the SHARD menu's hovered item row + 1 (`0` = none), latched by [`compose`] for [`compose_row`].
+static HOVER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// MENUSCRAFT — the item row under the pointer (+1), latched; folded into the damage signature by [`compose`] so a
+/// hover change repaints the sheet. The panel mode (information rows, a slider, a month grid) lights no row.
+fn sheet_hover(r: strip::Rect, pw: usize, ph: usize) -> usize {
+    let hot = if super::powerui::panel_open() {
+        0
+    } else {
+        let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
+        let (bx, by, bw, bh) = sheet::body(r);
+        let inset = sheet::INSET();
+        if cx < 0 || cy < 0 {
+            0
+        } else {
+            let (px, py) = (cx as usize, cy as usize);
+            if px >= bx + inset && px + inset < bx + bw && py >= by && py < by + bh {
+                row_at(py - by).filter(|&i| ROWS[i].verb.is_some()).map_or(0, |i| i + 1)
+            } else {
+                0
+            }
+        }
+    };
+    HOVER.store(hot, Ordering::Relaxed);
+    hot
+}
+
+/// MENUSCRAFT — **the sheet every dropdown is painted on** (this file's SHARD menu and panel mode, `winmenu`'s
+/// window menus). Paint only, plus the two geometry facts the routers share: [`BAND`] and [`body`].
+pub mod sheet {
+    use crate::video::draw::{self, Ink, Radii, Rect, Surf};
+    use crate::video::{strip, text, theme, wm};
+
+    // ── the palette seam: DESIGN-LANGUAGE §2.3's token names over today's palette API ─────────────────────────────
+    // DESIGNAPPLY (B639) re-points these at the OKLCH table; nothing below names a colour any other way.
+
+    /// `surface.overlay` — menus, popovers, toasts (the toast card's own face, so the two overlays agree).
+    #[inline]
+    pub fn surface_overlay() -> u32 {
+        unfill(theme::group_fill())
+    }
+    /// `line.subtle` — separators and the sheet's hairline (straight ARGB).
+    #[inline]
+    pub fn line_subtle() -> u32 {
+        theme::hairline()
+    }
+    /// `line.control` — a keycap's outline (straight ARGB).
+    #[inline]
+    pub fn line_control() -> u32 {
+        theme::control_edge()
+    }
+    /// `text.primary` — an item's label (the bar's own ink: the dropdown is the bar's text hanging below it).
+    #[inline]
+    pub fn text_primary() -> u32 {
+        unfill(theme::title_text_active())
+    }
+    /// `text.secondary` — the shortcut keycaps.
+    #[inline]
+    pub fn text_secondary() -> u32 {
+        unfill(theme::ink_secondary())
+    }
+    /// `text.disabled` — a disabled item.
+    #[inline]
+    pub fn text_disabled() -> u32 {
+        unfill(theme::title_text_inactive())
+    }
+    /// `accent.fill` — the hovered item's pill.
+    #[inline]
+    pub fn accent_fill() -> u32 {
+        unfill(theme::accent())
+    }
+    /// The label on `accent.fill` (white in the Una look: the Mac idiom §3.7 keeps).
+    #[inline]
+    pub fn on_accent() -> u32 {
+        unfill(theme::ink_on_accent())
+    }
+
+    /// MENU-UNDER load-bearing palette fact (crystal `compose_row`'s note, kept): no colour a dropdown emits may be
+    /// pure white — that is the cursor sprite's FILL, and `cursor::undraw_locked`'s colour guard is what keeps a
+    /// stale save-under off a menu that opened mid-pass. One step off white is invisible and keeps the guard true.
+    #[inline]
+    fn unfill(c: u32) -> u32 {
+        let c = c & 0x00FF_FFFF;
+        if c == 0x00FF_FFFF { 0x00FE_FEFE } else { c }
+    }
+
+    /// The same rule over a finished row (a blend of two near-whites can round to white).
+    pub fn seal_row(out: &mut [u32]) {
+        for p in out.iter_mut() {
+            if *p & 0x00FF_FFFF == 0x00FF_FFFF {
+                *p = (*p & 0xFF00_0000) | 0x00FE_FEFE;
+            }
+        }
+    }
+
+    // ── the lengths (DESIGN-LANGUAGE §3.7, Una column; logical px at the panel's scale) ───────────────────────────
+
+    #[inline]
+    fn px(n: usize) -> usize {
+        crate::ui::px(n)
+    }
+    /// `radius.overlay` (10).
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn RADIUS() -> i32 {
+        px(10) as i32
+    }
+    /// `radius.item` (5 = overlay − inset).
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn ITEM_RADIUS() -> i32 {
+        px(5) as i32
+    }
+    /// The item pill's inset from the body's sides (5).
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn INSET() -> usize {
+        px(5)
+    }
+    /// A separator's inset from the body's sides (10).
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn SEP_INSET() -> usize {
+        px(10)
+    }
+    /// The container's minimum width (180).
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn MIN_W() -> usize {
+        px(180)
+    }
+    /// `radius.small` (4) — a keycap.
+    #[allow(non_snake_case)]
+    #[inline]
+    fn KEY_RADIUS() -> i32 {
+        px(4) as i32
+    }
+    /// A keycap's horizontal padding and the gap between two keycaps.
+    #[allow(non_snake_case)]
+    #[inline]
+    fn KEY_PAD() -> usize {
+        px(4)
+    }
+    #[allow(non_snake_case)]
+    #[inline]
+    fn KEY_GAP() -> usize {
+        px(3)
+    }
+    /// **The shadow's band** on the body's right and at its foot (8): the `elev.2` shadow held inside the published
+    /// rect, the way DESKTOPCRAFT holds a window's shadow inside its frame band. No band on the left or the top: a
+    /// bar-dropped sheet's top meets the bar, the SHARD menu's left meets the panel edge, and the light reads from
+    /// the upper left.
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn BAND() -> usize {
+        px(8)
+    }
+    /// How far the wide shadow falls below the body.
+    #[allow(non_snake_case)]
+    #[inline]
+    fn DROP() -> i32 {
+        px(3) as i32
+    }
+
+    /// `elev.2` (DESIGN-LANGUAGE §2.4): `0 0 2pt @ 12 %` + `0 8 24pt @ 18 %` (light), `@ 30 %` + `@ 45 %` (dark),
+    /// as `(tight, wide)` peak opacities of 255. The wide layer's blur is held to the band.
+    fn elev2() -> (u32, u32) {
+        if theme::is_dark() { (77, 115) } else { (31, 46) }
+    }
+    /// `rim.dark` (`#FFFFFF @ 8 %`): the dark sheet's inner rim, so its edge survives a dark wallpaper.
+    const RIM_DARK: u32 = 20;
+
+    /// **The body of a published sheet rect** `r` (outer, band included): the rect the routers hit-test against.
+    #[inline]
+    pub fn body(r: strip::Rect) -> strip::Rect {
+        let (x, y, w, h) = r;
+        (x, y, w.saturating_sub(BAND()), h.saturating_sub(BAND()))
+    }
+
+    // ── the scene under the band ──────────────────────────────────────────────────────────────────────────────
+
+    const UNDER_MAX: usize = 16;
+
+    #[derive(Clone, Copy, Default)]
+    struct WinBox {
+        z: u32,
+        /// The window's outer box (frame band included).
+        o: (usize, usize, usize, usize),
+        /// Its content box (`x0, y0, x1, y1`); the title band is the `TITLE_H` rows above it.
+        c: (usize, usize, usize, usize),
+    }
+
+    /// **The scene estimate** under a sheet's band: the visible windows' boxes, lowest z first, and the wallpaper.
+    pub struct Under {
+        n: usize,
+        wins: [WinBox; UNDER_MAX],
+        back: Option<wm::desktop::Back<'static>>,
+        title_h: usize,
+    }
+
+    impl Under {
+        /// No windows, no wallpaper: the flat desktop colour (a fixture's row).
+        pub fn none() -> Under {
+            Under { n: 0, wins: [WinBox::default(); UNDER_MAX], back: None, title_h: 0 }
+        }
+
+        /// From the compositor's table snapshot (`wm::dock_scan`'s rows, the scan `compose` already ran for its
+        /// CLOBBER-REPAIR test): every row on the panel, by `wm::info`, z-sorted. The highest `UNDER_MAX` win.
+        pub fn scan(rows: &[wm::DockEntry]) -> Under {
+            let mut u = Under { n: 0, wins: [WinBox::default(); UNDER_MAX], back: wm::desktop::live_back(), title_h: wm::TITLE_H() };
+            let b = wm::BORDER();
+            for e in rows.iter().filter(|e| e.visible) {
+                let Some(i) = wm::info(e.id) else { continue };
+                let s = i.scale.max(1);
+                let (ws, hs) = (i.w * s, i.h * s);
+                let wb = WinBox {
+                    z: i.z,
+                    o: (i.x.saturating_sub(b), i.y.saturating_sub(u.title_h + b), i.x + ws + b, i.y + hs + b),
+                    c: (i.x, i.y, i.x + ws, i.y + hs),
+                };
+                // Insert by z (ascending); full: replace the lowest when this one is higher.
+                if u.n == UNDER_MAX {
+                    if wb.z <= u.wins[0].z {
+                        continue;
+                    }
+                    u.wins.copy_within(1..UNDER_MAX, 0);
+                    u.n -= 1;
+                }
+                let mut k = u.n;
+                while k > 0 && u.wins[k - 1].z > wb.z {
+                    u.wins[k] = u.wins[k - 1];
+                    k -= 1;
+                }
+                u.wins[k] = wb;
+                u.n += 1;
+            }
+            u
+        }
+
+        /// The estimated scene colour at panel `(x, y)`.
+        fn at(&self, x: usize, y: usize) -> u32 {
+            for w in self.wins[..self.n].iter().rev() {
+                let (ox0, oy0, ox1, oy1) = w.o;
+                if x < ox0 || x >= ox1 || y < oy0 || y >= oy1 {
+                    continue;
+                }
+                let (cx0, cy0, cx1, cy1) = w.c;
+                if x >= cx0 && x < cx1 {
+                    if y >= cy0 && y < cy1 {
+                        return theme::content_fill();
+                    }
+                    if y + self.title_h >= cy0 && y < cy0 {
+                        return theme::chrome_face();
+                    }
+                }
+                break; // the frame band: the wallpaper under the window's own shadow
+            }
+            self.back.as_ref().map_or(theme::DESKTOP_BG, |b| b.get(x, y))
+        }
+    }
+
+    // ── the painters ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// **Row `j` of the sheet** published at `r` (outer, panel px) into `out[..r.2]`: the scene under the band and
+    /// the body's rounded-off corners, the two-layer `elev.2` shadow, the `surface.overlay` body (`square_top`: the
+    /// top corners square, for a sheet hanging from the bar), its hairline, and in Dark the inner rim. The content
+    /// painters overlay their rows afterwards, in body coordinates (the body's origin IS the rect's).
+    pub fn row(out: &mut [u32], r: strip::Rect, j: usize, under: &Under, square_top: bool) {
+        let (ox, oy, w, _h) = r;
+        if w == 0 || out.len() < w {
+            return;
+        }
+        let (_, _, bw, bh) = body(r);
+        if bw == 0 || bh == 0 {
+            return;
+        }
+        let rad = RADIUS().min(bw as i32 / 2).min(bh as i32 / 2).max(0);
+        let ru = rad as usize;
+        let corner_row = j + ru >= bh || (!square_top && j < ru);
+        let out = &mut out[..w];
+        for (x, p) in out.iter_mut().enumerate() {
+            if j >= bh || x >= bw || corner_row {
+                *p = under.at(ox + x, oy + j);
+            }
+        }
+        let mut s = Surf::new(out, w);
+        let b = Rect::new(0, -(j as i32), bw as i32, bh as i32);
+        let (tight, wide) = elev2();
+        let band = BAND() as i32;
+        let drop = DROP().min(band - 1).max(0);
+        draw::shadow_rrect(&mut s, b.offset(0, drop), rad, (band - drop).max(1), wide << 24);
+        draw::shadow_rrect(&mut s, b, rad, (px(2) as i32).min(band).max(1), tight << 24);
+        let radii = if square_top { Radii::new(0, 0, rad, rad) } else { Radii::all(rad) };
+        draw::fill_rrect(&mut s, b, radii, surface_overlay());
+        draw::stroke_rrect(&mut s, b, radii, 1, Ink::argb(line_subtle()));
+        if theme::is_dark() {
+            draw::stroke_rrect(&mut s, b.inset(1), radii.shrink(1), 1, Ink::new(0x00FF_FFFF, RIM_DARK));
+        }
+    }
+
+    /// The accent item pill of the item whose band starts at body row `top` (`ih` tall), on body row `j`.
+    pub fn pill(out: &mut [u32], bw: usize, j: usize, top: usize, ih: usize) {
+        if bw == 0 || out.len() < bw || bw <= 2 * INSET() {
+            return;
+        }
+        let mut s = Surf::new(&mut out[..bw], bw);
+        let r = Rect::new(INSET() as i32, top as i32 - j as i32, (bw - 2 * INSET()) as i32, ih as i32);
+        draw::fill_rrect(&mut s, r, ITEM_RADIUS(), accent_fill());
+    }
+
+    /// A separator's hairline on body row `y` (drawn when `j == y`), inset [`SEP_INSET`] from both sides.
+    pub fn separator(out: &mut [u32], bw: usize, j: usize, y: usize) {
+        if j != y {
+            return;
+        }
+        let ink = Ink::argb(line_subtle());
+        let end = bw.saturating_sub(SEP_INSET()).min(out.len());
+        for p in out[SEP_INSET().min(end)..end].iter_mut() {
+            *p = draw::blend(*p, ink.rgb, ink.a);
+        }
+    }
+
+    /// Is `chord` a key chord (`cmd-x`, `cmd-alt-left`) drawn as keycaps, rather than a phrase (`F1 / F2`,
+    /// `title double-click`) drawn as text?
+    fn is_keys(chord: &str) -> bool {
+        !chord.is_empty() && !chord.contains(' ')
+    }
+
+    /// A chord token as its keycap reads (`cmd` -> `Cmd`, `x` -> `X`), into `buf`; returns its length.
+    fn cap_text(tok: &str, buf: &mut [u8; 8]) -> usize {
+        let t = tok.as_bytes();
+        let n = t.len().min(buf.len());
+        buf[..n].copy_from_slice(&t[..n]);
+        if n > 0 {
+            buf[0] = buf[0].to_ascii_uppercase();
+        }
+        n
+    }
+
+    /// The width a chord's hint reserves, in glyph cells of the dropdown's face (keycaps pad each token; a phrase
+    /// is its text). `winmenu::item_glyphs` reads this, so the reservation and the painter cannot drift.
+    pub fn chord_cells(chord: &str) -> usize {
+        if is_keys(chord) {
+            chord.len() + chord.split('-').count()
+        } else {
+            chord.len()
+        }
+    }
+
+    /// **The keycap hint** of `chord`, right-aligned to end at `x_end`, on body row `j` of an item whose glyph band
+    /// starts at `gtop` and is `ch` tall. Each key is a `radius.small` outline (`line.control`; on the accent pill the
+    /// label at half strength) around its token in `ink`; a phrase is plain `ink` text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn keycaps(out: &mut [u32], bw: usize, j: usize, gtop: usize, ch: usize, chord: &str, x_end: usize, ink: u32, lit: bool, bold: bool, face: text::Face) {
+        if bw == 0 || out.len() < bw {
+            return;
+        }
+        let in_band = j >= gtop && j < gtop + ch;
+        if !is_keys(chord) {
+            if in_band {
+                let x = x_end.saturating_sub(text::advance(chord.as_bytes(), bold, face));
+                text::draw_row(out, bw, chord.as_bytes(), x, j - gtop, ink, bold, face);
+            }
+            return;
+        }
+        let edge = if lit { Ink::new(on_accent(), 128) } else { Ink::argb(line_control()) };
+        let mut x = x_end;
+        let mut first = true;
+        for tok in chord.rsplit('-') {
+            let mut b = [0u8; 8];
+            let n = cap_text(tok, &mut b);
+            let tw = text::advance(&b[..n], bold, face);
+            let cw = tw + 2 * KEY_PAD();
+            if !first {
+                x = x.saturating_sub(KEY_GAP());
+            }
+            first = false;
+            x = x.saturating_sub(cw);
+            if j >= gtop && j < gtop + ch {
+                let mut s = Surf::new(&mut out[..bw], bw);
+                let r = Rect::new(x as i32, gtop as i32 - j as i32, cw as i32, ch as i32);
+                draw::stroke_rrect(&mut s, r, KEY_RADIUS().min(ch as i32 / 2), 1, edge);
+                text::draw_row(out, bw, &b[..n], x + KEY_PAD(), j - gtop, ink, bold, face);
+            }
+        }
+    }
 }

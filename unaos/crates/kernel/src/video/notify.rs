@@ -844,10 +844,12 @@ fn pass(now: u64) {
         }
     };
     let mut closed = false;
+    let mut hot = 0u32; // MENUSCRAFT (B642): the hovered card's seq — it shows its close button
     for i in 0..STACK_MAX {
         let Some(c) = st.cards[i].as_mut() else { continue };
         if ptr.map(|(x, y)| inside(x, y, card_rect(pw, i))).unwrap_or(false) {
             c.until = c.until.max(now.saturating_add(HOVER_KEEP_MS));
+            hot = c.n.seq;
             continue;
         }
         if now >= c.until {
@@ -860,6 +862,7 @@ fn pass(now: u64) {
     if closed {
         restack(&mut st, pw);
     }
+    craft_hover(&st, hot); // MENUSCRAFT (B642): the toast's hover x, repainted on the edge
     drop(st);
     if UNREAD.load(Ordering::Relaxed) != unread0 && !headless {
         wm::composite(); // the bell's badge is bar chrome: a collected notification still repaints the bar
@@ -1230,4 +1233,54 @@ fn craft_button(px: &mut [u32], pw: usize, ph: usize, r: (usize, usize, usize, u
     let tx = r.0 + r.2.saturating_sub(tw) / 2;
     let ty = r.1 + r.3.saturating_sub(metrics::lcell_h(face)) / 2;
     let _ = metrics::text(px, pw, ph, r.0 + r.2, tx, ty, t, theme::content_text(), false, face);
+}
+
+// ── MENUSCRAFT (rmbp-ledger B642) — the toast's hover x ───────────────────────────────────────────────────────────
+// A card under the pointer shows a close button on its top-left corner (a `surface.raised` disc with a `line.subtle`
+// edge, a soft `elev.2` lift and a `text.secondary` x), the notification idiom of both looks. The press router is
+// unchanged: a press anywhere on a card but its action button already dismisses it (`REQ_DISMISS`), so the x is
+// the affordance for the press that was always there. Repainted only on the hover EDGE (`pass` latches the hovered
+// seq): the card leaving the pointer repaints without it, the card arriving repaints with it, each presented once.
+
+/// The hovered card's seq (`0` = none), the edge latch.
+static HOVER_SEQ: AtomicU32 = AtomicU32::new(0);
+/// The close button's diameter (logical px).
+const CLOSE_D: usize = 18;
+
+fn craft_hover(st: &St, hot: u32) {
+    let was = HOVER_SEQ.swap(hot, Ordering::Relaxed);
+    if was == hot {
+        return;
+    }
+    for c in st.cards.iter().flatten() {
+        if c.n.seq != was && c.n.seq != hot {
+            continue;
+        }
+        paint_card(c.surf, &c.n);
+        if c.n.seq == hot {
+            craft_close(c.surf);
+        }
+        if c.win != wm::WIN_NONE {
+            let _ = wm::present(c.win);
+        }
+    }
+}
+
+fn craft_close(i: usize) {
+    use super::draw::{self, Ink, Rect, Surf};
+    let px = surf(i);
+    let pw = metrics::size(W);
+    let ph = metrics::size(H).min(px.len() / pw.max(1));
+    let mut s = Surf::new(&mut px[..pw * ph], pw);
+    let r = (metrics::size(CLOSE_D) as i32 / 2).max(3);
+    let c = r + 1; // the disc sits on the card's top-left corner, inside the surface
+    draw::shadow_rrect(&mut s, Rect::new(c - r, c - r + metrics::size(1) as i32, 2 * r, 2 * r), r, metrics::size(2) as i32, theme::shadow_soft());
+    draw::fill_circle(&mut s, c, c, r, theme::knob_face());
+    draw::stroke_circle(&mut s, c, c, r, 1, Ink::argb(theme::hairline()));
+    let sub = draw::SUB;
+    let arm = r * sub * 2 / 5;
+    let (cx, cy) = (c * sub, c * sub);
+    let wdt = (metrics::size(3) as i32 * sub / 2).max(sub);
+    draw::line_aa(&mut s, cx - arm, cy - arm, cx + arm, cy + arm, wdt, theme::ink_secondary());
+    draw::line_aa(&mut s, cx - arm, cy + arm, cx + arm, cy - arm, wdt, theme::ink_secondary());
 }
