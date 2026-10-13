@@ -464,7 +464,7 @@ pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
                     Err(SmcError::Absent)
                 }
                 Err(e) => {
-                    dump_first_failure(key, e); // wedged on the re-read: report what actually broke
+                    if e != SmcError::Stuck(STEP_TXN) { dump_first_failure(key, e); } /* SESSIONWEDGE: a busy conversation lock is not an SMC fault */ // wedged on the re-read: report what actually broke
                     Err(e)
                 }
             }
@@ -474,7 +474,7 @@ pub fn read_key(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
             r
         }
         Err(e @ SmcError::Stuck(_)) => {
-            dump_first_failure(key, e);
+            if e != SmcError::Stuck(STEP_TXN) { dump_first_failure(key, e); } // SESSIONWEDGE (B525): a busy conversation lock (STEP_TXN) is not an SMC fault — the boot's one DIAG stays unspent
             r
         }
     }
@@ -505,7 +505,7 @@ static TXN: Mutex<()> = Mutex::new(());
 
 /// One serialized SMC transaction. Every path that talks to the controller goes through here.
 fn read_txn(key: &[u8; 4], out: &mut [u8]) -> Result<usize, SmcError> {
-    let _guard = TXN.lock();
+    let Some(_guard) = txn_acquire() else { return Err(SmcError::Stuck(STEP_TXN)) }; // SESSIONWEDGE (B525): a bounded, yielding take — the usb-pump never spins on a holder another core's scheduler parked (file tail)
     read_key_inner(key, out)
 }
 
@@ -835,7 +835,7 @@ pub fn present() -> bool {
 /// Caveat 3 ("`#KEY` enumeration is a standing bounded wedge on this machine") is therefore **stale
 /// as a statement about the SMC**: the wedge was our drain, in un-fixed code, both times.
 fn read_key_by_index(index: u32, name: &mut [u8; 4]) -> Result<(), SmcError> {
-    let _guard = TXN.lock();
+    let Some(_guard) = txn_acquire() else { return Err(SmcError::Stuck(STEP_TXN)) }; // SESSIONWEDGE (B525): the same bounded take (file tail)
     // 0) settle any residue from a prior transaction (M2 idle-guard; no-op on an idle SMC). Outside
     //    the close-wrapper deliberately: if the settle fails, no command of OURS has been written,
     //    there is no transaction of ours to close, and the settle has already drained for its own
@@ -2159,8 +2159,119 @@ pub fn battery_post() {
 /// PUMPWITNESS: `smc-batt`, the accountant's cadence. Never returns.
 #[cfg(target_arch = "x86_64")]
 fn battery_task(_: usize) {
+    BATT_TASK.store(true, core::sync::atomic::Ordering::Relaxed); // SESSIONWEDGE (B525): `tests sessionwedge` reports it armed
     loop {
         battery::refresh_if_due();
         crate::arch::sched::sleep_ms(100);
     }
+}
+
+// SESSIONWEDGE (rmbp-ledger B525) — THE CONVERSATION LOCK IS NEVER AN UNBOUNDED WAIT. FILE TAIL, so no line above moves
+// (the `[lock] … name=smc.rs:<line>` classes and every `panic::Location` keep their lines).
+//
+// PUMPWITNESS (B518) moved the battery ACCOUNTANT onto `smc-batt` on `smp::worker_cpu(0)` but left three SMC readers on
+// the `usb-pump`'s desktop-app step (`status::poll`, BATTLIVE's `adapter::read`, LIDSLEEP's `MSLD` read — all through
+// `read_key` → `read_txn`). `TXN` was a raw spin (`sync::Mutex::lock`, no mask), so the pump spun on a holder ANOTHER
+// core's scheduler had parked: tasks are pinned and preemptive (arch/x86_64/sched.rs:14-18), and worker_cpu(0) is the
+// core every new off-pump task of this fold shares (smc-batt, wall-probe, the three witness tasks, the Dock's Trash
+// reader and — `xhci_worker_cpu(0)`, the same core in the Exclusive tier — `bootlog-flush`), with IRQ-masked UnaFS
+// transactions of up to 483/666 ms (B516, B514) and, on image 22 (no TRASHLOCK), B523's masked-MOUNT-on-CARD
+// inversion that freezes that core for good. A frozen smc-batt holding `TXN` = a pump spinning forever, unmasked: the
+// hid-pump and xhci-poll on the pump core keep the sprite moving, the render core keeps the Dock answering, and the
+// FTDI mirror — drained by the pump alone — stops on its last packet. That is flight 29's wire.
+//
+// The take is now bounded and yielding: a busy `TXN` is retried on the next tick (`sleep_ticks(1)` when the caller is a
+// scheduled task with interrupts on; a spin pause otherwise), for at most `TXN_WAIT_MS`; past it the read answers
+// `Stuck(STEP_TXN)` — a failed read every caller already holds through (BATMON-HOLD, `status`'s staleness ceiling,
+// LIDSLEEP's printed-once `lid=stuck`), and `read_key` does not spend the boot's one DIAG on it. The holder is recorded
+// so PUMPWEDGE can name it (`txn_wait_holder`). The SMC conversation itself is unchanged and still serialized.
+
+/// `SmcError::Stuck(STEP_TXN)`: the conversation lock stayed busy past [`TXN_WAIT_MS`]; no command of ours was written.
+const STEP_TXN: u8 = 5;
+/// The longest a reader waits for the conversation lock: one step's bound (`SMC_WAIT_CYCLES`, ~93 ms on the rMBP's
+/// 2.69 GHz TSC) times three — a wedging holder is a refusal here, never a stopped caller.
+const TXN_WAIT_MS: u64 = 300;
+/// The holder (`tid << 8 | cpu + 1`; 0 = free) and the waiter in a bounded wait (tid; 0 = none).
+static TXN_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TXN_WAITER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TXN_TIMEOUTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `smc-batt` is running.
+static BATT_TASK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The conversation lock, held: dropping it clears the recorded holder, then releases.
+struct TxnGuard {
+    _g: crate::sync::MutexGuard<'static, ()>,
+}
+impl Drop for TxnGuard {
+    fn drop(&mut self) {
+        TXN_OWNER.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn txn_tag() -> u64 {
+    let tid = crate::arch::sched::current_id().unwrap_or(0);
+    (tid << 8) | (crate::arch::percpu::this_cpu().cpu_index as u64 + 1)
+}
+
+/// Take `TXN` within [`TXN_WAIT_MS`] (see the block comment). `None` = refused; the caller answers `Stuck(STEP_TXN)`.
+#[track_caller]
+fn txn_acquire() -> Option<TxnGuard> {
+    use core::sync::atomic::Ordering::Relaxed;
+    if let Some(g) = TXN.try_lock() {
+        TXN_OWNER.store(txn_tag(), Relaxed);
+        return Some(TxnGuard { _g: g });
+    }
+    let me = crate::arch::sched::current_id();
+    let can_sleep = me.is_some() && x86_64::instructions::interrupts::are_enabled();
+    if let Some(t) = me {
+        TXN_WAITER.store(t, Relaxed);
+    }
+    let t0 = crate::arch::ms();
+    let got = loop {
+        if let Some(g) = TXN.try_lock() {
+            break Some(g);
+        }
+        if crate::arch::ms().saturating_sub(t0) >= TXN_WAIT_MS {
+            break None;
+        }
+        if can_sleep {
+            crate::arch::sched::sleep_ticks(1);
+        } else {
+            poll_pause();
+        }
+    };
+    if me.is_some() {
+        TXN_WAITER.store(0, Relaxed);
+    }
+    match got {
+        Some(g) => {
+            TXN_OWNER.store(txn_tag(), Relaxed);
+            Some(TxnGuard { _g: g })
+        }
+        None => {
+            let o = TXN_OWNER.load(Relaxed);
+            if TXN_TIMEOUTS.fetch_add(1, Relaxed) == 0 {
+                serial_println!(
+                    "[smc] txn busy waiter={} holder={}@cpu{} waited_ms={} -> refused (SESSIONWEDGE: the read answers stuck step={}; the caller holds its last reading)",
+                    crate::arch::sched::current_name().unwrap_or("-"), o >> 8, (o & 0xff) as i64 - 1, crate::arch::ms().saturating_sub(t0), STEP_TXN
+                );
+            }
+            None
+        }
+    }
+}
+
+/// PUMPWEDGE (`sessionwedge::look`): `Some((holder tid, holder cpu))` while task `tid` waits on the conversation lock.
+pub fn txn_wait_holder(tid: u64) -> Option<(u64, i64)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    if tid == 0 || TXN_WAITER.load(Relaxed) != tid {
+        return None;
+    }
+    let o = TXN_OWNER.load(Relaxed);
+    Some((o >> 8, (o & 0xff) as i64 - 1))
+}
+
+/// `tests sessionwedge`: `smc-batt` is running.
+pub fn battery_task_armed() -> bool {
+    BATT_TASK.load(core::sync::atomic::Ordering::Relaxed)
 }

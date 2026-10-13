@@ -252,3 +252,9 @@ pub fn cmd(arg: &str, resolved: &str) -> String {
         Err(e) => alloc::format!("wallpaper: {}: {}", resolved, e),
     }
 }
+
+/// SESSIONWEDGE (rmbp-ledger B525, `tests sessionwedge`): default-probe tries this boot (LOGINRENDER's `wall-probe`
+/// runs each on `worker_cpu(0)`, re-armed by the desktop's build at ignition).
+pub fn probe_tries() -> u32 {
+    TRIES.load(Ordering::Relaxed)
+}

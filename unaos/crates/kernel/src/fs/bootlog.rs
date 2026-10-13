@@ -157,3 +157,11 @@ fn flush(snapshot: fn() -> Option<(Vec<u8>, usize)>) {
         }
     }
 }
+
+/// SESSIONWEDGE (rmbp-ledger B525, `tests sessionwedge`): the `bootlog-flush` task was started (SMALLFIX8). It runs on
+/// `xhci_worker_cpu(0)` — in the Exclusive tier the SAME core as `worker_cpu(0)`, where `smc-batt` and the witness tasks
+/// live — so its IRQ-masked UnaFS write is a stall of that whole core, and the verb names it among the armed.
+#[cfg(all(feature = "unafs", target_arch = "x86_64"))]
+pub fn flusher_armed() -> bool {
+    FLUSHER.load(Ordering::Relaxed)
+}
