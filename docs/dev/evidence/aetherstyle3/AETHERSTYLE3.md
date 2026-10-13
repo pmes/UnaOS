@@ -123,3 +123,31 @@ one fixture test; the tests, WPT and EYES are the seat's at the fold (R107).
 expectations this arc did not touch: `vertical_text`'s upright "ab" still has two cells, `web_animations`' samples
 are unchanged by the pending state). `cargo test -p aether --test animations` runs two:
 `composite_iteration_start_and_commit_styles` and `css_transition_pause_play_and_ready`.
+
+## AETHERRENDER3 (LEDGER SR126) — the painters follow SR122's layout
+
+Charter: Aether (CODEX §2, Web) — the host painter (handlers/aether/src/render) and APPS/AETHER.ELF's painter
+(unaos/crates/user-aether/src/paint.rs), each the face of the shared-core seam (layout_core, read only in this arc).
+Branch `exec-host-aetherrender3`, base 12393dd6. Status words: nothing here has run. Each row is compiled code (`cargo
+check -p aether --tests` rc=0; the AETHER.ELF x86 build rc=0 once) with one pixel test in
+handlers/aether/tests/render_frags.rs; the tests, WPT and EYES are the seat's at the fold (R107).
+
+| item | commit | paint | test | still refused |
+|---|---|---|---|---|
+| a box split across columns (`col_frags`) | 4af6eb69 | render/mod.rs `deco_passes` / `frag_pass`: the outer shadow, background, gradient, background image, inset shadow and borders run once per `BoxFragment` — slice: the whole box moved by the fragment's shift, clipped to the piece's band (open above the first piece, below the last and sideways), so the block-start edges show on the first piece and the block-end edges on the last, the background against the whole box; clone: a piece-sized box at its place with every edge, its own shadow, its background against the piece. Children carry their own `col_shift`; a fragmented box never clips (layout_core multicol.rs plain_block / fragmentable refuse `clip`), so its content clip is the inherited one | `box_decoration_break_paints_each_column_fragment`: slice — top border on piece 1 only, bottom border on piece 2 only, piece 2 red in column 2, white below the 90px columns; clone — both 100px boxes carry all four borders | `mask-image` on a fragmented box keeps the whole box's mask size (its origin follows the piece); the author outline of a fragmented box rings the unfragmented border box (focusring.rs `paint_outlines` follows no fragment, as it follows no transform) |
+| `text-combine-upright: all` | 4af6eb69 | render/mod.rs `combined_cell` / `compress_combined`: the run draws at its natural width, its span returns to the staging backdrop, and each column of the 1em cell takes the box-filtered average of the drawn columns under `cell.scale` about the cell's start (inked columns only); the cell is upright, so the composite translates it into the column | `text_combine_upright_compresses_into_its_cell`: `1234` at 20px — scale < 1, every inked pixel inside the 20x20 cell, spanning it | `digits <n>` (not laid out either); the compression is a box filter of the rasterized run, not a re-shaped narrow face |
+| the caret of a vertical editing host | 4af6eb69 | render/mod.rs `editable_caret`: a collapsed selection in a Text node under a `contenteditable` element of a vertical IFC → its fragment and byte (`layout_core::hit::align`); the text box's `layout_core::hit::caret_rect` bar (1px tall, across the column) filled in the text colour after the staging composite | `vertical_editing_host_caret_is_a_horizontal_bar`: after `a`, the bar row solid in the text colour; not without the selection | a blink phase and the "host is focused" condition for editing hosts (the engine's caret state, `FocusPaint`, covers form controls only — lib.rs, outside this arc); the caret of a horizontal editing host (none was drawn before either; left out so every horizontal frame stays byte-identical) |
+| `filter` on the image ring | db2a0fde | user-aether paint.rs `paint_box` / `filter_group`: a box with a `filter` paints as a group over a canvas snapshot; the changed pixels become an opaque straight-alpha layer padded by `effects::filter_margin_box`, run through `effects::filter_rgba_refs` (svg_core's CSS filter functions; `url(#id)` through the page's `<filter>` serialized from the arena's `attrs`, fef02110) and composite source-over (`effects::over`) | `ring3_filter_raster_path_greys_the_group`: the same steps over a 0xRRGGBB canvas — `grayscale(1)` and `url(#g)` (feColorMatrix saturate 0) turn a red square grey, the backdrop untouched (the ring-3 crate has no test harness) | `backdrop-filter` on ring 3; a filter whose snapshot or layer cannot be allocated paints unfiltered (heap.rs: classes up to 8 MiB) |
+| author outlines drawn once | — (checked) | focusring.rs `paint_outlines` is the only outline painter, called once from `focusring::paint`, render_frame's last step; draw_node / boxpaint / effects draw none | a11y.rs `outline_none_and_author_outlines_replace_the_ring` (SR124) | — |
+
+### What the fold should see
+
+`cargo test -p aether --test render_frags` runs four tests: `box_decoration_break_paints_each_column_fragment`,
+`text_combine_upright_compresses_into_its_cell`, `vertical_editing_host_caret_is_a_horizontal_bar`,
+`ring3_filter_raster_path_greys_the_group`. AETHER.ELF (x86, db2a0fde): 3,397,056 bytes unstripped, 3,073,064 bytes after
+build_user_aether_x86's strip — under the 3.2 MB bound; `user_elf_window_check` need = 3,340,232 (span 3,073,992 + 256 KiB
+stack + guard) of the 64 MiB window. The filter's cost, by `llvm-nm -S` attribution (no baseline build, R107): the
+`url(#id)` leg links svg_core's parser and renderer (~180 KB of symbols), the primitives ~56 KB; dropping the url() leg
+on ring 3 (`effects::filter_rgba` in place of `filter_rgba_refs`) is the lever if the bound tightens. Existing
+horizontal frames are byte-identical by construction (the caret and combine paths run in vertical IFCs only; a box
+without `col_frags` takes one pass at its own place).
