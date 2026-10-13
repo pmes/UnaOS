@@ -1242,6 +1242,8 @@ fi
 [ -n "${UNAOS_SONDE:-}" ] && _feats="${_feats}sonde,"   # REALSENSE (LEDGER SR92, R112): `tests sonde` (kernel sonde.rs: the D435i census fixture, then the boot's D400 record — SKIP(no-device) without the camera) + drivers/uvc.rs `multi` + drivers/realsense_xu.rs; implies uvc. x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
 # AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (crate::aether: APPS/AETHER.ELF validated, spawned, its page report read; implies selfdiag for SYS_PATH_READ). x86 (no K8_FEATS arm: scripts/k8-reach.registry NA row). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_AETHER:-}" ] && _feats="${_feats}aether,"
+# STRIAMETAL (LEDGER SR139): UNAOS_STRIA=1 arms `tests stria` (crate::striaapp: APPS/STRIA.ELF validated, spawned on system/test-f/TEST.WEBM, its end line read) and STRIA.ELF first for the media types it declares (fs/assoc.rs); implies selfdiag for SYS_PATH_READ. Both arches (the K8_FEATS arm is in kernel8(); esp_jetson builds from this line). Kept in sync with builder/src/main.rs, banner-cert.sh and the three image-line env files.
+[ -n "${UNAOS_STRIA:-}" ] && _feats="${_feats}stria,"
 # NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
 # SELFDIAG (B324, R82): UNAOS_SELFDIAG=1 arms the boot log on disk (/var/log/boot.<n>.witness on a UnaFS root), SYS_PATH_READ 59 / SYS_PATH_WRITE 60 for APPS/DIAG.ELF and `tests selfdiag`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
@@ -4385,6 +4387,32 @@ build_user_aether_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Aether app: AETHER-X86.ELF${COLOR_RESET}"
 }
 
+# STRIAMETAL (LEDGER SR139): build STRIA.ELF — Stria, the A/V handler, as ONE ring-3 program (crates/user-stria linking
+# demux_core + vp8_core + vp9_core + av1_core + h264_core + audio_core: demux, decode, present against the sound's
+# clock — una-abi STRIAMETAL's SYS_AUDIO_*). build_user_aether_x86's shape: linked at the ELF-window VA
+# (user-stria-x86.ld, no PHDRS, 256 KiB stack from -z stack-size), syms before the strip, e_machine, the window check,
+# the APPRES stamp (res/: name, icon, signature org.unaos.stria, the media doctypes). target/STRIA-X86.ELF, staged by
+# the builder as APPS/STRIA.ELF. Inert until launched; UNAOS_STRIA=1 adds the `tests stria` fixture.
+build_user_stria_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Stria app (crates/user-stria → target/STRIA-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-stria"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-stria/user-stria-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-stria/target/x86_64-unknown-none/release/user-stria" STRIA  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-stria/target/x86_64-unknown-none/release/user-stria" \
+      "${WORKSPACE_DIR}/target/STRIA-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/STRIA-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: STRIA-X86.ELF missing/empty — x86 STRIA build failed${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/STRIA-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: STRIA-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/STRIA-X86.ELF" "STRIA-X86.ELF"
+    una_res_stamp "${WORKSPACE_DIR}/crates/user-stria" "${WORKSPACE_DIR}/target/STRIA-X86.ELF"  # APPRES (B398): Stria's icon, name, signature, version, doctypes
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 Stria app: STRIA-X86.ELF${COLOR_RESET}"
+}
+
 # HOLOCRON2 (rmbp-ledger B355, R82): build HOLOCRON.ELF — Holocron, the metal's secrets handler (crates/user-holocron
 # linking holocron_core: verbs 144..=151 over the BANDY3 mailbox, the store over SYS_PATH_* on the UnaFS root, the
 # ring KDF through SYS_KDF) → target/HOLOCRON-X86.ELF, staged by the builder as APPS/HOLOCRON.ELF. The
@@ -4508,6 +4536,7 @@ build_user_lumen_aarch64()  { build_user_xwin_aarch64 user-lumen  LUMEN  "Lumen 
 build_user_midden_aarch64() { build_user_xwin_aarch64 user-midden MIDDEN "Midden app"; }
 build_user_una_aarch64()    { build_user_xwin_aarch64 user-una    UNA    "Una IDE"; }
 build_user_aether_aarch64() { build_user_xwin_aarch64 user-aether AETHER "Aether app" --target "${WORKSPACE_DIR}/aarch64-base.json"; }   # its .cargo/config.toml defaults to x86_64-unknown-none.json
+build_user_stria_aarch64()  { build_user_xwin_aarch64 user-stria  STRIA  "Stria app" --target "${WORKSPACE_DIR}/aarch64-base.json"; }   # STRIAMETAL (SR139): its .cargo/config.toml defaults to x86_64-unknown-none.json, as Aether's
 
 # VEINTLS (SR36): NET.ELF runs on vein_ring3 (the transport LUMEN uses: verified TLS 1.3 with tls_core), linked at
 # the ELF window (RING3ABI2's user-net-x86.ld, taken verbatim) and built `--features cryptocore`.
@@ -4628,6 +4657,7 @@ launch_x86_64() {
     build_user_midden_x86   # UIREDS26 (B566): the QEMU launch stages MIDDEN.ELF too (the ESP path at esp_x86 does) — dockpins' midden tile no longer `refused=stat`
     build_user_una_x86      # UIREDS26 (B566): and UNA.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
+    build_user_stria_x86   # STRIAMETAL (SR139): target/STRIA-X86.ELF — staged as APPS/STRIA.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -5105,12 +5135,13 @@ test_aarch64() {
     # `/boot` and `/apps` to this volume — plus the aarch64 MIDDEN/UNA/LUMEN/AETHER.ELF in APPS/ and Aether's pages in
     # system/doc/ (stage_jetson_el0_images' shape). Without the kernel on it `/apps` is unbound and the four fixtures
     # SKIP. docs/dev/evidence/armaether/ARMAETHER.md.
-    if [ "${UNAOS_FATIMG:-}" = sf ]; then case ",${_feats}" in *",midden,"*|*",una,"*|*",lumen,"*|*",aether,"*)
+    if [ "${UNAOS_FATIMG:-}" = sf ]; then case ",${_feats}" in *",midden,"*|*",una,"*|*",lumen,"*|*",aether,"*|*",stria,"*)
         local _apps="${WORKSPACE_DIR}/target/armapps-stick.img" _p
         { cp "$STICK_IMG" "$_apps" && mcopy -o -i "$_apps" "$ESP_DIR_ARM/kernel.elf" ::/kernel.elf; } || { echo -e "${COLOR_RED}test-arm: cannot stage the app stick from ${STICK_IMG} (./arroyo fat-img; mtools)${COLOR_RESET}"; return 2; }
         mmd -i "$_apps" ::/APPS 2>/dev/null; mmd -i "$_apps" ::/system 2>/dev/null; mmd -i "$_apps" ::/system/doc 2>/dev/null
-        for _p in midden:MIDDEN una:UNA lumen:LUMEN aether:AETHER; do case ",${_feats}" in *",${_p%%:*},"*) "build_user_${_p%%:*}_aarch64"; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/${_p##*:}.ELF" ::/APPS/ || return 2 ;; esac; done
+        for _p in midden:MIDDEN una:UNA lumen:LUMEN aether:AETHER stria:STRIA; do case ",${_feats}" in *",${_p%%:*},"*) "build_user_${_p%%:*}_aarch64"; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/${_p##*:}.ELF" ::/APPS/ || return 2 ;; esac; done
         case ",${_feats}" in *",aether,"*) mcopy -o -i "$_apps" "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html ::/system/doc/ || return 2 ;; esac
+        case ",${_feats}" in *",stria,"*) if [ -s "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ]; then mmd -i "$_apps" ::/system/test-f 2>/dev/null; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ::/system/test-f/ || return 2; else echo -e "${COLOR_YELLOW}  ⚠ STRIAMETAL: target/testf-cache/TEST.WEBM absent (the builder fetches it, builder/testf.list) — tests stria SKIPs no-clip on this stick${COLOR_RESET}"; fi ;; esac   # STRIAMETAL (SR139): the clip `tests stria` plays
         STICK_IMG="$_apps"; echo -e "${COLOR_YELLOW}⚡ app stick: ${_apps} (kernel.elf + APPS/ for tests midden/una/lumen/aether):${COLOR_RESET}"; mdir -i "$_apps" ::/APPS
         ;; esac; fi
 
@@ -5616,6 +5647,7 @@ test_x86_64() {
     build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
     build_user_una_x86      # UNAMETAL (SR90): target/UNA-X86.ELF — staged as APPS/UNA.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
+    build_user_stria_x86   # STRIAMETAL (SR139): target/STRIA-X86.ELF — staged as APPS/STRIA.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -6085,6 +6117,7 @@ USER_CHECK_MATRIX=(
   "user-midden   x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-una      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-una/user-una-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-aether   x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-stria    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-stria/user-stria-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-diag     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
@@ -6097,6 +6130,7 @@ USER_CHECK_MATRIX=(
   "user-midden   aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-una      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-una/user-una.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-aether   aarch64 ${WORKSPACE_DIR}/aarch64-base.json        -C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-stria    aarch64 ${WORKSPACE_DIR}/aarch64-base.json        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stria/user-stria.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
 )
 
 # Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
@@ -7636,7 +7670,7 @@ KERNEL_CFG_MATRIX=(
   # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
   "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,login,loginst"
   # ARMAETHER (orin-ledger A110): the ring-3 app fixtures (`tests midden/una/lumen/aether`) over the arch launch facade with NO desktop knob — `launch_push`'s knob-free body compiled alone; `aether` implies `selfdiag` (Cargo.toml), so path_write_as's -ENOSYS arm is not this leg's. Board legs +1, universe +0 (every term is on x86-image or arm-only).
-  "arm-virt-apps-min ../../aarch64-unaos.json virt_el0,login,midden,una,lumen,aether"
+  "arm-virt-apps-min ../../aarch64-unaos.json virt_el0,login,midden,una,lumen,aether,stria"   # STRIAMETAL (SR139): + stria — `tests stria` over the same facade, no desktop knob
   "arm-virt-apps-nosd ../../aarch64-unaos.json virt_el0,login,midden,una,lumen"   # ARMAETHER (A110): no aether → no selfdiag: the facade's -ENOSYS branch type-checked
   # NET6 (SOCK-7) — the ARMED polarity of the shared aarch64 socket surface, and the ONLY leg that
   # compiles it. It carries `vnet` + `net6` + `virt_el0` together because that triple is exactly what
@@ -8126,9 +8160,9 @@ KERNEL_CFG_MATRIX=(
   # (in the universe as "unclaimed => x86"); the two arm rows alone would have deleted those six from
   # every x86 mix leg. `x86-image` names all ten on a literal x86 leg, so the universe is unchanged
   # (+0 features) and the armed x86 polarity of the set is compiled by construction. Board legs +3.
-  "arm-tegra-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet"
-  "arm-pi-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet"
-  "x86-image ../../x86_64-unaos.json witness,unafs,login,holocron,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet"
+  "arm-tegra-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"
+  "arm-pi-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"
+  "x86-image ../../x86_64-unaos.json witness,unafs,login,holocron,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"   # STRIAMETAL (SR139): + stria on the three image legs (the image lines carry UNAOS_STRIA)
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -9663,6 +9697,7 @@ esp_x86() {
     build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
     build_user_una_x86      # UNAMETAL (SR90): target/UNA-X86.ELF — staged as APPS/UNA.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
+    build_user_stria_x86   # STRIAMETAL (SR139): target/STRIA-X86.ELF — staged as APPS/STRIA.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -9727,6 +9762,7 @@ vm_image() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
+    build_user_stria_x86   # STRIAMETAL (SR139): target/STRIA-X86.ELF — staged as APPS/STRIA.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -9775,6 +9811,7 @@ fat_img() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
+    build_user_stria_x86   # STRIAMETAL (SR139): target/STRIA-X86.ELF — staged as APPS/STRIA.ELF
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
@@ -10167,6 +10204,20 @@ stage_jetson_el0_images() {
             cp "${WORKSPACE_DIR}/target/AETHER.ELF" "${APPS_DIR_ARM}/AETHER.ELF"
             staged=$((staged + 1))
             mkdir -p "${ESP_DIR_ARM}/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${ESP_DIR_ARM}/system/doc/"
+            ;;
+    esac
+    # STRIAMETAL (SR139): STRIA.ELF under `stria`, and the clip `tests stria` plays (builder/testf.list's TEST.WEBM, the
+    # builder's sha-pinned fetch in target/testf-cache/) at system/test-f — read at /boot/system/test-f/TEST.WEBM.
+    case ",${_feats}" in
+        *",stria,"*)
+            build_user_stria_aarch64
+            cp "${WORKSPACE_DIR}/target/STRIA.ELF" "${APPS_DIR_ARM}/STRIA.ELF"
+            staged=$((staged + 1))
+            if [ -s "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ]; then
+                mkdir -p "${ESP_DIR_ARM}/system/test-f" && cp "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" "${ESP_DIR_ARM}/system/test-f/TEST.WEBM"
+            else
+                echo -e "${COLOR_YELLOW}  ⚠ STRIAMETAL: target/testf-cache/TEST.WEBM absent (the builder fetches it) — tests stria SKIPs no-clip on this card${COLOR_RESET}"
+            fi
             ;;
     esac
     # HELLO.BIN: only when `tegra_el0` armed `build_user_blob` above (see the block header).
@@ -12058,6 +12109,10 @@ kernel8() {
         K8_FEATS="${K8_FEATS},aether"
         echo -e "${COLOR_YELLOW}  • UNAOS_AETHER: AETHERMETAL — tests aether (APPS/AETHER.ELF spawned, its page report read); implies selfdiag${COLOR_RESET}"
     fi
+    if [ -n "${UNAOS_STRIA:-}" ]; then
+        K8_FEATS="${K8_FEATS},stria"
+        echo -e "${COLOR_YELLOW}  • UNAOS_STRIA: STRIAMETAL — tests stria (APPS/STRIA.ELF spawned on system/test-f/TEST.WEBM, its end line read; the Pi's sound is refused by name); implies selfdiag${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_UVC:-}" ]; then
         K8_FEATS="${K8_FEATS},uvc"
         echo -e "${COLOR_YELLOW}  • UNAOS_UVC: the USB Video Class driver (descriptor census, probe/commit, frames)${COLOR_RESET}"
@@ -12217,6 +12272,18 @@ kernel8() {
             build_user_aether_aarch64
             cp "${WORKSPACE_DIR}/target/AETHER.ELF" "$KERNEL8_DIR/APPS/AETHER.ELF"
             mkdir -p "$KERNEL8_DIR/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "$KERNEL8_DIR/system/doc/"
+            ;;
+    esac
+    # STRIAMETAL (SR139): STRIA.ELF under `stria`, and the clip `tests stria` plays at system/test-f (the builder's fetch).
+    case ",${K8_FEATS}," in
+        *",stria,"*)
+            build_user_stria_aarch64
+            cp "${WORKSPACE_DIR}/target/STRIA.ELF" "$KERNEL8_DIR/APPS/STRIA.ELF"
+            if [ -s "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ]; then
+                mkdir -p "$KERNEL8_DIR/system/test-f" && cp "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" "$KERNEL8_DIR/system/test-f/TEST.WEBM"
+            else
+                echo -e "${COLOR_YELLOW}  ⚠ STRIAMETAL: target/testf-cache/TEST.WEBM absent (the builder fetches it) — tests stria SKIPs no-clip on this card${COLOR_RESET}"
+            fi
             ;;
     esac
 

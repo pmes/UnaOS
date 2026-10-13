@@ -984,6 +984,7 @@ fn main() {
     if std::env::var("UNAOS_SONDE").is_ok() { feats.push("sonde"); } // REALSENSE (LEDGER SR92): `tests sonde` (kernel sonde.rs; implies uvc in Cargo.toml). Kept in sync with arroyo.
     // AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (APPS/AETHER.ELF validated, spawned, its page report read). Kept in sync with arroyo.
     if std::env::var("UNAOS_AETHER").is_ok() { feats.push("aether"); }
+    if std::env::var("UNAOS_STRIA").is_ok() { feats.push("stria"); } // STRIAMETAL (LEDGER SR139): `tests stria` (kernel striaapp.rs: APPS/STRIA.ELF spawned on system/test-f/TEST.WEBM) and STRIA.ELF first for its media types (fs/assoc.rs). Kept in sync with arroyo.
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.
     if std::env::var("UNAOS_NETRING3").is_ok() { feats.push("netring3"); }
     // SELFDIAG (B324): UNAOS_SELFDIAG=1 arms the boot log on disk, SYS_PATH_READ/WRITE and `tests selfdiag`. Kept in sync with arroyo.
@@ -1389,6 +1390,16 @@ fn main() {
         println!("   AETHER: target/AETHER-X86.ELF absent — ESP has no AETHER.ELF (run via ./arroyo esp-x86)");
     }
     let _ = stage_welcome(&workspace_dir, &esp_dir);
+    // STRIAMETAL (LEDGER SR139): Stria, the A/V handler, as ONE ring-3 program (crates/user-stria, built by arroyo's
+    // build_user_stria_x86 to target/STRIA-X86.ELF), staged as APPS/STRIA.ELF — `stria <file>`, or a Quarry
+    // double-click on a video or a sound (its APPRES doctypes), plays it in a window.
+    let stria_elf = target_dir.join("STRIA-X86.ELF");
+    if stria_elf.exists() {
+        std::fs::copy(&stria_elf, esp_apps.join("STRIA.ELF")).unwrap();
+        println!("   STRIA: copied STRIA.ELF into APPS/ on the ESP (stria)");
+    } else {
+        println!("   STRIA: target/STRIA-X86.ELF absent — ESP has no STRIA.ELF (run via ./arroyo esp-x86)");
+    }
     // NETRING3 M3 (B306): the ring-3 network client (crates/user-net, built by arroyo's build_user_net_x86 to
     // target/NET-X86.ELF), staged as APPS/NET.ELF — `bg /apps/NET.ELF` resolves, connects :80 and prints
     // the `:: NETRING3:` verdict (UNAOS_NETRING3=1).
@@ -1514,6 +1525,8 @@ fn main() {
         (target_dir.join("HOLOCRON-X86.ELF"), "HOLOCRON.ELF"),
         // AETHERMETAL (SR66): the browser rides the DATA volume too — `aether` and `tests aether` read it there.
         (target_dir.join("AETHER-X86.ELF"), "AETHER.ELF"),
+        // STRIAMETAL (SR139): the A/V handler rides the DATA volume too — `stria`, Quarry's opens and `tests stria` read it there.
+        (target_dir.join("STRIA-X86.ELF"), "STRIA.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
