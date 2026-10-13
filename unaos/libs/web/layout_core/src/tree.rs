@@ -320,8 +320,9 @@ pub fn build_taffy_tree<H: Host>(
         }
     }
     // <video>/<audio> are replaced elements: their <source>/<track>
-    // children and fallback content never render.
-    let replaced_media = node_tag.as_deref().is_some_and(|t| matches!(t, "video" | "audio"));
+    // children and fallback content never render; an <iframe>'s children are its fallback too
+    // (HTML §4.8.5: never rendered when frames are supported — AETHERSUITE, SR131).
+    let replaced_media = node_tag.as_deref().is_some_and(|t| matches!(t, "video" | "audio" | "iframe"));
 
     let mut kids: Vec<(taffy::NodeId, bool)> = Vec::new();
     // A textarea's text is its VALUE, painted inside the control, not

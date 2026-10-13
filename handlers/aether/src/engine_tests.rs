@@ -243,7 +243,7 @@ mod tests {
     fn test_ledger_records_unimplemented_apis() {
         crate::ledger::reset();
         let html = r#"<html><head><style>
-            div { filter: blur(2px); display: grid; }
+            div { filter: blur(2px); grid-template-columns: 1fr 1fr; display: grid; }
         </style></head><body>
             <div id="t">x</div>
             <script>
@@ -255,7 +255,11 @@ mod tests {
 
         let snap = crate::ledger::snapshot();
         use crate::ledger::ApiCategory;
-        assert!(snap.contains(ApiCategory::Css, "property:filter"), "unhandled CSS property must be recorded");
+        // AETHERSTYLE3 (SR103, 8b695a6f) implemented `filter` (layout_core css.rs, the "filter" arm): a
+        // handled property is NOT a gap. Grid layout is still unimplemented: `grid-template-columns` falls to
+        // the unhandled-property arm and `display: grid` to apply_display's unhandled-value arm.
+        assert!(!snap.contains(ApiCategory::Css, "property:filter"), "a handled CSS property must not be recorded");
+        assert!(snap.contains(ApiCategory::Css, "property:grid-template-columns"), "unhandled CSS property must be recorded");
         assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
         // clearTimeout used to be the JS-side example here; it is a real
         // implementation now (see event_loop), so the honest never-delivers
@@ -3077,7 +3081,9 @@ mod tests {
             #l li::before { content: counter(list-item) ":"; }"#);
         let got: Vec<String> = generated_texts(&t, "o").iter().map(|s| s.trim().to_string()).collect();
         assert_eq!(got, ["1", "1.1", "1.2", "2", "2.1", "2.1.1"]);
-        assert_eq!(generated_texts(&t, "s"), ["iii/C/03/\u{2022}", "v/E/05/\u{2022}", "vii/G/07/\u{2022}", "\u{3BC}0"]);
+        // lower-greek is `system: alphabetic` over 24 symbols (css-counter-styles-3 §6.2.2, the alphabetic
+        // algorithm §3.1.4): 40 = 1×24 + 16 → "α" then the 16th symbol "π" ("μ", the 12th, is 12).
+        assert_eq!(generated_texts(&t, "s"), ["iii/C/03/\u{2022}", "v/E/05/\u{2022}", "vii/G/07/\u{2022}", "\u{3B1}\u{3C0}0"]);
         assert_eq!(generated_texts(&t, "l"), ["3:", "10:", "11:"]);
     }
 
@@ -3361,7 +3367,10 @@ mod tests {
         let nav = engine.take_pending_nav().expect("post");
         assert_eq!(nav.method, forms::HttpMethod::Post);
         assert_eq!(nav.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(nav.body.as_deref(), Some("r=2\r\ns=bee\r\nact=post\r\n"));
+        // A `method=get` form posted by `formmethod=post formenctype=text/plain` sends its body URLENCODED
+        // under a text/plain header in Chromium (tests/data/forms_oracle/getform-postplain.expect, the
+        // sha-pinned measured vector for this exact shape; forms/mod.rs plan_navigation reproduces it).
+        assert_eq!(nav.body.as_deref(), Some("r=2&s=bee&act=post"));
     }
 
     /// A `submit` listener that cancels keeps the page (a scripted form submits itself).
