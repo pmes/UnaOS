@@ -559,7 +559,14 @@ fn net_es_open(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn storage_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let area = str_arg(vm, ctx, 0)?;
     let op = str_arg(vm, ctx, 1)?;
-    let origin = page_origin();
+    // AETHERDEBT SR93 (Storage Partitioning): the area is keyed by the storage key — the calling
+    // context's origin AND the top-level site (`storage::storage_key`), so a document embedded under
+    // another site does not share an area with the same origin at top level.
+    let caller = super::window::frames::incumbent_origin(vm).unwrap_or_else(page_origin);
+    let origin = crate::storage::storage_key(&super::page_url(), &caller);
+    if op == "id" {
+        return Ok(s(&origin));
+    }
     let local = area == "local";
     let a = arg(vm, ctx, 2);
     let b = arg(vm, ctx, 3);

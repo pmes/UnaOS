@@ -51,6 +51,33 @@ thread_local! {
     /// Bumped on every change: the engine repaints when it moves.
     static GEN: Cell<u64> = const { Cell::new(0) };
     static ORDER: RefCell<Option<((u64, usize, usize), Rc<Order>)>> = const { RefCell::new(None) };
+    /// Find-in-page marks (AETHERDEBT SR93): every match of the find bar's query, painted behind the
+    /// text in [`FIND_MARK`] (the active one is also the selection).
+    static MARKS: RefCell<Vec<(Point, Point)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Chromium's find-in-page match highlight (inactive matches): yellow.
+pub const FIND_MARK: (u8, u8, u8) = (255, 255, 0);
+
+/// Most find marks painted (a page full of one-letter matches stays cheap to paint).
+const MARKS_CAP: usize = 1000;
+
+/// Sets the find marks (empty clears them); bumps the generation so the engine repaints.
+pub fn set_find_marks(marks: Vec<(Point, Point)>) {
+    let mut marks = marks;
+    marks.truncate(MARKS_CAP);
+    let changed = MARKS.with(|m| {
+        let mut m = m.borrow_mut();
+        if *m == marks {
+            false
+        } else {
+            *m = marks;
+            true
+        }
+    });
+    if changed {
+        GEN.with(|g| g.set(g.get().wrapping_add(1)));
+    }
 }
 
 /// The current selection, if any.
@@ -73,6 +100,7 @@ pub fn set(sel: Option<Selection>) -> bool {
 /// Clears the selection without an event (a new document).
 pub fn reset() {
     SEL.with(|s| s.set(None));
+    MARKS.with(|m| m.borrow_mut().clear());
     GEN.with(|g| g.set(g.get().wrapping_add(1)));
 }
 
@@ -267,11 +295,34 @@ fn collapses_at(layout: &LayoutTree, tid: taffy::NodeId) -> bool {
 /// For every text fragment of the IFC rooted at `root`, the selected part (indexed like `il.frags`).
 /// Empty when nothing is selected.
 pub fn plan_ifc(layout: &LayoutTree, root: taffy::NodeId) -> HashMap<usize, FragSel> {
-    let mut out = HashMap::new();
-    let Some(sel) = get() else { return out };
+    let Some(sel) = get() else { return HashMap::new() };
     if sel.is_collapsed() {
+        return HashMap::new();
+    }
+    plan_range(layout, root, sel)
+}
+
+/// For every text fragment of the IFC rooted at `root`, the byte ranges the find marks cover
+/// (AETHERDEBT SR93). Empty when there are no marks.
+pub fn plan_marks(layout: &LayoutTree, root: taffy::NodeId) -> HashMap<usize, Vec<(usize, usize)>> {
+    let marks = MARKS.with(|m| m.borrow().clone());
+    let mut out: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    if marks.is_empty() || !layout.inline.contains_key(&root) {
         return out;
     }
+    for (a, b) in marks {
+        for (fi, fs) in plan_range(layout, root, Selection { anchor: a, focus: b }) {
+            if fs.end > fs.start {
+                out.entry(fi).or_default().push((fs.start, fs.end));
+            }
+        }
+    }
+    out
+}
+
+/// The part of each text fragment of the IFC at `root` that the range `sel` covers.
+fn plan_range(layout: &LayoutTree, root: taffy::NodeId, sel: Selection) -> HashMap<usize, FragSel> {
+    let mut out = HashMap::new();
     let Some(il) = layout.inline.get(&root) else { return out };
     let Some(doc) = layout.node_map.values().next().map(|n| n.document_node()) else { return out };
     let Some(((ks, _), (ke, _))) = ordered(&doc, sel) else { return out };

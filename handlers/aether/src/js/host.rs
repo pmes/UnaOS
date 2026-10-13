@@ -170,6 +170,13 @@ impl Host for AetherHost {
 
     fn promise_rejection(&mut self, _promise: Obj, _operation: u8) {}
 
+    /// HostEnsureCanCompileStrings (AETHERDEBT SR93): the document's CSP decides eval / new Function
+    /// (`'unsafe-eval'`); the refusal is reported (console, ledger, report POSTs, the violation event
+    /// queued for the next script) and js_core throws the EvalError. Replaces the JS eval guard.
+    fn ensure_can_compile_strings(&mut self, source: &str) -> Result<(), String> {
+        crate::security::compile_strings_allowed(source)
+    }
+
     fn random_seed(&mut self) -> u64 {
         use std::io::Read;
         let mut b = [0u8; 8];

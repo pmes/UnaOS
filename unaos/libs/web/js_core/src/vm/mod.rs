@@ -60,6 +60,13 @@ pub trait Host {
     fn random_seed(&mut self) -> u64 {
         0x9E37_79B9_7F4A_7C15
     }
+    /// HostEnsureCanCompileStrings (ECMA-262 §19.2.1.2; HTML §8.1.6.3 and CSP3 §4.4 define the web's):
+    /// asked before `eval` (direct or indirect) and the Function / GeneratorFunction / AsyncFunction /
+    /// AsyncGeneratorFunction constructors compile `source`. `Err(message)` refuses — the caller throws
+    /// an EvalError carrying it. Default: every compilation is allowed.
+    fn ensure_can_compile_strings(&mut self, _source: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct NullHost;
@@ -408,6 +415,18 @@ impl Vm {
     }
     pub fn throw_syntax<T>(&mut self, msg: &str) -> JsResult<T> {
         Err(self.syntax_error(msg))
+    }
+
+    /// HostEnsureCanCompileStrings through the host (see [`Host::ensure_can_compile_strings`]): an
+    /// EvalError when the host refuses.
+    pub(crate) fn ensure_can_compile(&mut self, source: &JsStr) -> JsResult<()> {
+        match self.host.ensure_can_compile_strings(&source.to_rust()) {
+            Ok(()) => Ok(()),
+            Err(m) => {
+                let p = self.intr().eval_error_proto;
+                Err(self.make_error(p, &m))
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------- functions

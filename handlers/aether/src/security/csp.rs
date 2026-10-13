@@ -414,6 +414,18 @@ impl PolicyList {
         })
     }
 
+    /// The `style-src-elem` pre-request check for an external stylesheet (`<link rel=stylesheet>`,
+    /// `@import`): the link's nonce, else the URL against the source list.
+    pub fn check_external_style(&self, url: &str, nonce: &str) -> Verdict {
+        if self.is_empty() {
+            return Verdict { allowed: true, violations: Vec::new() };
+        }
+        let so = self.self_origin.clone();
+        self.evaluate("style-src-elem", url, "", |l| {
+            (!nonce.is_empty() && l.iter().any(|e| nonce_of(e) == Some(nonce))) || url_matches_list(l, url, &so, false)
+        })
+    }
+
     /// `eval()` / `new Function()` (§4.4 EnsureCSPDoesNotBlockStringCompilation).
     pub fn check_eval(&self, sample: &str) -> Verdict {
         if self.is_empty() {
@@ -618,43 +630,8 @@ pub const ARM_PRELUDE: &str = r#"
 })();
 "#;
 
-/// The eval guard (installed when the document's policies refuse `'unsafe-eval'`): `eval(string)` and the
-/// Function constructors throw `EvalError` after reporting. `eval` of a non-string returns it unchanged, as
-/// the spec's PerformEval does before the host check. `__V__` is the violation init (JSON), `__M__` the
-/// message.
-pub const EVAL_GUARD: &str = r#"
-(function () {
-    if (globalThis.__csp_eval_guarded) { return; }
-    Object.defineProperty(globalThis, '__csp_eval_guarded', { value: true, configurable: true, enumerable: false });
-    var V = __V__, M = __M__;
-    var refuse = function (s) {
-        var init = JSON.parse(JSON.stringify(V));
-        init.sample = String(s === undefined ? '' : s).slice(0, 40);
-        __ledger('security-csp-eval');
-        try { console.error(M); } catch (x) {}
-        if (typeof __csp_violation === 'function') { __csp_violation(init, null); }
-        throw new EvalError(M);
-    };
-    var ev = function eval(x) { if (typeof x !== 'string') { return x; } return refuse(x); };
-    Object.defineProperty(globalThis, 'eval', { value: ev, writable: true, configurable: true, enumerable: false });
-    var guard = function (C) {
-        if (typeof C !== 'function') { return C; }
-        var P = new Proxy(C, {
-            apply: function (t, th, args) { return refuse(args.length ? args[args.length - 1] : ''); },
-            construct: function (t, args) { return refuse(args.length ? args[args.length - 1] : ''); },
-        });
-        try { Object.defineProperty(C.prototype, 'constructor', { value: P, writable: true, configurable: true, enumerable: false }); } catch (x) {}
-        return P;
-    };
-    Object.defineProperty(globalThis, 'Function', { value: guard(Function), writable: true, configurable: true, enumerable: false });
-    try { guard(Object.getPrototypeOf(async function () {}).constructor); } catch (x) {}
-    try { guard(Object.getPrototypeOf(function* () {}).constructor); } catch (x) {}
-    try { guard(Object.getPrototypeOf(async function* () {}).constructor); } catch (x) {}
-})();
-"#;
-
 /// Before a script runs (js/loader.rs): re-read the document's policies, install the page half once per
-/// document, install the eval guard when `'unsafe-eval'` is refused, and dispatch the violation events
+/// document, and dispatch the violation events
 /// queued since the last script (fetch pre-checks, `style=` refusals, …).
 pub fn arm(vm: &mut js_core::vm::Vm) {
     let (url, first, policies, events) = super::sync_for_script();
@@ -664,15 +641,8 @@ pub fn arm(vm: &mut js_core::vm::Vm) {
     if first {
         let _ = crate::js::run_classic_no_checkpoint(vm, ARM_PRELUDE, "csp-arm");
     }
-    if !policies.is_empty() && super::take_eval_guard_due() {
-        let v = policies.check_eval("");
-        if !v.allowed {
-            let init = v.violations.first().map(|x| event_init(x, &url)).unwrap_or_else(|| "{}".into());
-            let msg = v.violations.iter().find(|x| !x.report_only).map(message).unwrap_or_default();
-            let src = EVAL_GUARD.replace("__V__", &init).replace("__M__", &serde_json::Value::String(msg).to_string());
-            let _ = crate::js::run_classic_no_checkpoint(vm, &src, "csp-eval-guard");
-        }
-    }
+    // `'unsafe-eval'` is js_core's HostEnsureCanCompileStrings hook (`js::host`, AETHERDEBT SR93).
+    let _ = &policies;
     for (init, target) in events {
         dispatch_event(vm, &init, target);
     }

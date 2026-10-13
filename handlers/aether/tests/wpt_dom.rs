@@ -191,6 +191,57 @@ fn needs_server(name: &str, src: &str) -> bool {
 
 /// Files that need what this binding does not provide, with the reason. The covered subset is the run
 /// set minus these; the reasons name a surface outside this arc, never a failing one inside it.
+/// The local helper scripts a test loads — `<script src>` (and `// META: script=` for `.window.js` /
+/// `.any.js`), the harness's own `/resources/testharness*.js` and remote URLs left out — read from the
+/// checkout (AETHERDEBT SR93: `excluded()` grepped only the test file, so a test whose iframes or
+/// workers come from a helper was counted as covered).
+fn helper_sources(root: &Path, name: &str, src: &str) -> String {
+    let dir = name.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let mut urls: Vec<String> = Vec::new();
+    let lower = src.to_ascii_lowercase();
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("<script") {
+        let start = at + i;
+        let end = lower[start..].find('>').map(|e| start + e).unwrap_or(lower.len());
+        let tag = &src[start..end];
+        let tl = &lower[start..end];
+        if let Some(j) = tl.find("src=") {
+            let v = &tag[j + 4..];
+            let (q, rest) = match v.chars().next() {
+                Some(c @ ('"' | '\'')) => (Some(c), &v[1..]),
+                _ => (None, v),
+            };
+            let val: String = match q {
+                Some(q) => rest.chars().take_while(|&c| c != q).collect(),
+                None => rest.chars().take_while(|c| !c.is_whitespace()).collect(),
+            };
+            urls.push(val);
+        }
+        at = end.max(start + 7);
+    }
+    for l in src.lines() {
+        if let Some(v) = l.trim().strip_prefix("// META: script=") {
+            urls.push(v.trim().to_string());
+        }
+    }
+    let mut out = String::new();
+    for u in urls {
+        let u = u.split(['?', '#']).next().unwrap_or("").to_string();
+        if u.is_empty() || u.contains("://") || u.starts_with("/resources/testharness") || u.starts_with("/resources/testdriver") {
+            continue;
+        }
+        let path = match u.strip_prefix('/') {
+            Some(abs) => root.join(abs),
+            None => root.join(dir).join(&u),
+        };
+        if let Ok(h) = std::fs::read_to_string(&path) {
+            out.push('\n');
+            out.push_str(&h);
+        }
+    }
+    out
+}
+
 fn excluded(name: &str, src: &str) -> Option<&'static str> {
     let base = name.rsplit('/').next().unwrap_or(name);
     if src.contains("window.open(")
@@ -198,6 +249,11 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
         || src.contains("<object")
     {
         return Some("frames / browsing contexts");
+    }
+    // Documents that stop being fully active (an iframe navigated away or removed while its realm's
+    // listeners are still reachable): `not-fully-active-helpers.js` builds them.
+    if src.contains("not-fully-active-helpers.js") || src.contains("globalThis.navigateFrame") {
+        return Some("frames / browsing contexts (documents not fully active)");
     }
     if base.contains("moveBefore") {
         return Some("moveBefore (2025 proposal)");
@@ -371,7 +427,8 @@ fn run_dir(dir: &str, recurse: bool) -> Option<(usize, usize)> {
         } else {
             f.clone()
         };
-        let ex = excluded(f, &src);
+        let scan = format!("{src}{}", helper_sources(&root, f, &src));
+        let ex = excluded(f, &scan);
         let t0 = std::time::Instant::now();
         let r = run_file(&rt, port, &rel);
         let secs = t0.elapsed().as_secs_f64();

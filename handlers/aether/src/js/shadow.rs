@@ -69,7 +69,17 @@ fn attach_shadow(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             }
         }
     }
-    if with_doc(|d| sh::shadow_root_of(d, NodeId(el))).is_some() {
+    if let Some(existing) = with_doc(|d| sh::shadow_root_of(d, NodeId(el))) {
+        // DOM §4.9 "attach a shadow root" step 5: a declarative root of the same mode is reused —
+        // its children removed, the declarative flag cleared — instead of throwing.
+        if existing.declarative && existing.mode == mode {
+            let kids = dom::children_of(existing.root.0);
+            for k in kids {
+                dom::remove(vm, k);
+            }
+            with_doc(|d| sh::set_declarative(d, existing.root, false));
+            return Ok(wrap(vm, existing.root.0));
+        }
         return throw_dom(vm, "NotSupportedError", &format!("{fail}Shadow root cannot be created on a host which already hosts a shadow tree."));
     }
     let a = arena();
@@ -143,17 +153,111 @@ fn sr_inner_html_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(s(&dom::serialize_inner(i.root.0)))
 }
 
-/// The fragment parsing algorithm with the host as context, then "replace all" (`innerHTML`,
-/// `setHTMLUnsafe` without declarative shadow roots).
-fn sr_set_markup(vm: &mut Vm, i: sh::ShadowRootInfo, markup: &str) {
+/// The fragment parsing algorithm with the host as context, then "replace all" (`innerHTML`; with
+/// `declarative`, `setHTMLUnsafe`: the fragment's `<template shadowrootmode>` elements attach first).
+fn sr_set_markup(vm: &mut Vm, i: sh::ShadowRootInfo, markup: &str, declarative: bool) {
     let frag = parse_fragment(i.host.0, markup);
+    if declarative {
+        attach_declarative(frag);
+    }
     replace_all(vm, Some(frag), i.root.0);
+}
+
+/// Is `t` a `<template>` whose `shadowrootmode` is a valid ShadowRootMode (HTML §13.2.6.4.4, the
+/// "template" start tag in "in head")?
+fn declarative_mode(d: &html_core::Document, t: NodeId) -> Option<ShadowMode> {
+    let e = d.element(t)?;
+    if !e.is_html("template") {
+        return None;
+    }
+    match e.attr("shadowrootmode")?.to_ascii_lowercase().as_str() {
+        "open" => Some(ShadowMode::Open),
+        "closed" => Some(ShadowMode::Closed),
+        _ => None,
+    }
+}
+
+/// Declarative shadow roots (HTML §13.2.6.4.4 + §13.2.6.4.7, AETHERDEBT SR93) over the parsed tree
+/// under `root`: each `<template shadowrootmode=open|closed>` whose parent is an HTML element that
+/// may host a shadow root and hosts none yet attaches a shadow root to that parent (mode,
+/// `shadowrootdelegatesfocus`, `shadowrootclonable`, `shadowrootserializable`; declarative), its
+/// contents become the shadow root's children and the template leaves the tree, as if it had never
+/// been inserted. A template that cannot attach stays an ordinary template. Templates nested in a
+/// declarative template's contents are processed once those contents are in the shadow root, so a
+/// nested declarative tree attaches inside its parent's. Runs over a tree no script has seen yet
+/// (the page parser's newly parsed nodes, `setHTMLUnsafe`'s fragment), so it records nothing.
+pub fn attach_declarative(root: usize) {
+    attach_declarative_where(root, &|_| true);
+}
+
+/// [`attach_declarative`] restricted to the templates `ok` accepts (the page parser passes "this
+/// template is closed", i.e. not an ancestor of the insertion point).
+pub fn attach_declarative_where(root: usize, ok: &dyn Fn(usize) -> bool) {
+    let mut work: Vec<NodeId> = with_doc(|d| d.descendants(NodeId(root)).filter(|&n| declarative_mode(d, n).is_some()).collect());
+    let mut i = 0;
+    while i < work.len() {
+        let t = work[i];
+        i += 1;
+        if !ok(t.0) {
+            continue;
+        }
+        let plan = with_doc(|d| {
+            let mode = declarative_mode(d, t)?;
+            let e = d.element(t)?;
+            let contents = e.template_contents?;
+            let host = d.parent(t)?;
+            let he = d.element(host)?;
+            if he.ns != html_core::Namespace::Html || !sh::is_valid_shadow_host_name(&he.local) || sh::shadow_root_of(d, host).is_some() {
+                return None;
+            }
+            let init = ShadowInit {
+                mode,
+                delegates_focus: e.attr("shadowrootdelegatesfocus").is_some(),
+                slot_assignment: SlotAssignment::Named,
+                clonable: e.attr("shadowrootclonable").is_some(),
+                serializable: e.attr("shadowrootserializable").is_some(),
+            };
+            Some((host, contents, init))
+        });
+        let Some((host, contents, init)) = plan else { continue };
+        let a = arena();
+        let sroot = sh::attach(&a, host, init);
+        drop(a);
+        let doc = node_document(host.0);
+        let moved: Vec<usize> = super::dom::with_doc_mut(|d| {
+            d.reparent_children(contents, sroot);
+            d.detach(t);
+            std::iter::once(sroot).chain(d.descendants(sroot)).map(|n| n.0).collect()
+        });
+        with_doc(|d| sh::set_declarative(d, sroot, true));
+        for m in moved {
+            set_node_doc(m, doc);
+            if with_doc(|d| d.element(NodeId(m)).is_some_and(|e| e.template_contents.is_some())) {
+                super::dom::set_template_contents_doc(m, doc);
+            }
+        }
+        let nested: Vec<NodeId> = with_doc(|d| d.descendants(sroot).filter(|&n| declarative_mode(d, n).is_some()).collect());
+        work.extend(nested);
+    }
+}
+
+/// `Element.setHTMLUnsafe(html)` (HTML §8.5.1): the fragment parsing algorithm with declarative
+/// shadow roots allowed, then "replace all" over the element (a template's contents for `<template>`).
+fn el_set_html_unsafe(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    need(vm, ctx, 1, "Element", "setHTMLUnsafe")?;
+    let markup = string(vm, &arg(vm, ctx, 0))?;
+    let frag = parse_fragment(el, &markup);
+    attach_declarative(frag);
+    let target = with_doc(|d| d.element(NodeId(el)).and_then(|e| e.template_contents).map(|t| t.0)).unwrap_or(el);
+    replace_all(vm, Some(frag), target);
+    Ok(Value::Undefined)
 }
 
 fn sr_inner_html_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let i = this_shadow(vm, ctx)?;
     let markup = string_null_empty(vm, &arg(vm, ctx, 0))?;
-    sr_set_markup(vm, i, &markup);
+    sr_set_markup(vm, i, &markup, false);
     Ok(Value::Undefined)
 }
 
@@ -161,7 +265,7 @@ fn sr_set_html_unsafe(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let i = this_shadow(vm, ctx)?;
     need(vm, ctx, 1, "ShadowRoot", "setHTMLUnsafe")?;
     let markup = string(vm, &arg(vm, ctx, 0))?;
-    sr_set_markup(vm, i, &markup);
+    sr_set_markup(vm, i, &markup, true);
     Ok(Value::Undefined)
 }
 
@@ -246,6 +350,7 @@ fn slot_assign(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 pub fn install(vm: &mut Vm) {
     let el = iface("Element").expect("Element").proto;
     op(vm, el, "attachShadow", 1, attach_shadow);
+    op(vm, el, "setHTMLUnsafe", 1, el_set_html_unsafe);
     attr(vm, el, "shadowRoot", shadow_root_get, None);
     attr(vm, el, "assignedSlot", assigned_slot, None);
     if let Some(t) = iface("Text") {

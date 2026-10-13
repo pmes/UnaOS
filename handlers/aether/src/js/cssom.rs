@@ -1053,12 +1053,16 @@ pub fn get_computed_style(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 /// tree order) then the external sheets.
 fn current_sheets() -> Vec<String> {
     let doc = dom::main_doc();
-    let mut sheets: Vec<String> = with_doc(|d| {
+    let styles: Vec<(usize, String)> = with_doc(|d| {
         d.descendants(NodeId(doc))
             .filter(|i| d.element(*i).is_some_and(|e| e.is_html("style")))
-            .map(|i| d.text_content(i))
+            .map(|i| (i.0, d.text_content(i)))
             .collect()
     });
+    // AETHERDEBT SR93: a `<style>` CSP refuses (style-src-elem, nonce / hash) is not applied here
+    // either (the load-time collection in lib.rs applies the same gate).
+    let mut sheets: Vec<String> =
+        styles.into_iter().filter(|(el, text)| crate::security::style_element_allowed(*el, text)).map(|(_, t)| t).collect();
     sheets.extend(page(|p| p.external_css.clone()));
     sheets
 }

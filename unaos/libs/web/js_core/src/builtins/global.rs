@@ -31,6 +31,7 @@ fn eval(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         Value::String(s) => s,
         other => return Ok(other),
     };
+    vm.ensure_can_compile(&src)?;
     let ec = crate::parser::EvalContext::default();
     let prog = match crate::parser::parse_eval(src.units(), &ec) {
         Ok(p) => p,

@@ -200,6 +200,9 @@ pub(crate) struct PageState {
     /// Node document for nodes not owned by the main document.
     pub node_doc: HashMap<usize, usize>,
     pub docs: HashMap<usize, DocMeta>,
+    /// HTML "appropriate template contents owner document" per document (AETHERDEBT SR93): document →
+    /// its inert template contents owner.
+    pub template_owner: HashMap<usize, usize>,
     /// Attr objects: (element, attribute key) → (Attr, root).
     pub attrs: HashMap<(usize, String), (Obj, usize)>,
     pub listeners: HashMap<TargetKey, Vec<Listener>>,
@@ -431,8 +434,16 @@ pub(crate) fn invoke_callback(vm: &mut Vm, label: &str, f: &Value, args: &[Value
     invoke(vm, label, f, &Value::Undefined, args)
 }
 
-/// A string timer handler: compiled and run as a classic script.
+/// A string timer handler: compiled and run as a classic script — after HostEnsureCanCompileStrings
+/// (HTML §8.6 timer initialization steps, AETHERDEBT SR93): under a CSP without `'unsafe-eval'` the
+/// EvalError is reported for the global and the handler does not run.
 pub(crate) fn run_timer_source(vm: &mut Vm, src: &str) -> Result<Value, Value> {
+    if let Err(m) = crate::security::compile_strings_allowed(src) {
+        let p = vm.intr().eval_error_proto;
+        let e = vm.make_error(p, &m);
+        events::report_exception(vm, &e);
+        return Err(e);
+    }
     run_classic(vm, src, "timer-source")
 }
 
@@ -544,6 +555,8 @@ impl Engine {
         window::install(&mut vm);
         net::install(&mut vm);
         forms::install(&mut vm);
+        // AETHERDEBT SR93: DataTransfer (its FileList feeds `input.files`) — after forms: File exists.
+        controls::install_data_transfer(&mut vm);
         // After window::install: these replace the platform.rs MutationObserver/customElements stubs.
         shadow::install(&mut vm);
         mutation::install(&mut vm);

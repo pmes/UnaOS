@@ -107,8 +107,7 @@ pub fn top_level_site(top_level_url: &str) -> String {
 /// Storage Partitioning (the storage key, HTML §12.2 / Storage §4): an area is keyed by its origin AND the
 /// top-level site, so a document embedded under another site does not share `localStorage` with the same
 /// origin at top level. A same-site (or top-level) document's key is its origin, which keeps every area
-/// stored before partitioning addressable. (js/net.rs passes the origin today; with AETHERFRAMES it passes
-/// `storage_key(top-level URL, origin)`.)
+/// stored before partitioning addressable. (js/net.rs keys every area by it — AETHERDEBT SR93.)
 pub fn storage_key(top_level_url: &str, origin: &str) -> String {
     if top_level_url.is_empty() {
         return origin.to_string();
@@ -207,6 +206,8 @@ pub const PRELUDE: &str = r#"
     // HTML §12.2.1 "broadcast": a write in another document of this origin arrives as a task here.
     Object.defineProperty(globalThis, '__storage_event', {
         value: function (origin, key, oldValue, newValue, url) {
+            // Only documents whose storage key is the writer's hear it (AETHERDEBT SR93).
+            if (origin !== __storage('local', 'id')) { return; }
             __net_fire(globalThis, 'StorageEvent', 'storage',
                 { key: key, oldValue: oldValue, newValue: newValue, url: url, storageArea: ls });
         },

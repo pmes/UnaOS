@@ -427,13 +427,19 @@ pub fn scan(doc: &NodeRef, base: &str) -> bool {
                 continue;
             }
             let Some((src, mime)) = source_for(&node, base) else { continue };
+            // AETHERDEBT SR93: media-src and mixed content (passive media autoupgrades) decide the fetch.
+            let dest = if node.as_element().is_some_and(|e| e.name.local.as_ref() == "video") { "video" } else { "audio" };
+            let Some(src) = crate::security::subresource_url(&src, dest) else { continue };
             // http(s): Stria plays the cache file; the fetch may still be running
             let (url, fetching) = if is_remote(&src) { (format!("file://{}", cache_path(&src).display()), ensure_cached(&src)) } else { (src.clone(), false) };
             let el = node.as_element().unwrap();
             let kind = if el.name.local.as_ref() == "video" { Kind::Video } else { Kind::Audio };
             let attrs = el.attributes.borrow();
             let poster = if kind == Kind::Video {
-                attrs.get("poster").filter(|p| !p.trim().is_empty()).map(|p| crate::images::resolve(base, p.trim()))
+                attrs
+                    .get("poster")
+                    .filter(|p| !p.trim().is_empty())
+                    .and_then(|p| crate::security::subresource_url(&crate::images::resolve(base, p.trim()), "image"))
             } else {
                 None
             };

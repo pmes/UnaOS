@@ -266,7 +266,11 @@ mod imp_entry {
                 if let Some(e) = w1.upgrade() {
                     e.imp().focused.set(true);
                     im1.focus_in();
-                    e.queue_draw();
+                    // AETHERDEBT SR93: focus that arrives by keyboard or shortcut (Ctrl+L's
+                    // `grab_focus`, Tab) selects the whole text, as a browser's address field does;
+                    // a press collapses it right after (the drag gesture sets the caret once it has
+                    // taken focus).
+                    e.select_all();
                 }
             });
             focus.connect_leave(move |_| {
@@ -392,6 +396,15 @@ impl GlyphEntry {
         self.queue_draw();
     }
 
+    /// Selects the whole text (the caret at the end), as Ctrl+A does — AETHERDEBT SR93, for the
+    /// address field's Ctrl+L.
+    pub fn select_all(&self) {
+        let len = self.imp().text.borrow().len();
+        self.imp().anchor.set(0);
+        self.imp().caret.set(len);
+        self.queue_draw();
+    }
+
     /// Calls `f` when Enter is pressed.
     pub fn connect_activate(&self, f: impl Fn(&GlyphEntry) + 'static) {
         self.imp().on_activate.borrow_mut().push(Box::new(f));
@@ -484,10 +497,7 @@ impl GlyphEntry {
             }
             gdk::Key::Home | gdk::Key::KP_Home => self.set_caret(0, shift),
             gdk::Key::End | gdk::Key::KP_End => self.set_caret(len, shift),
-            gdk::Key::a | gdk::Key::A if ctrl => {
-                self.imp().anchor.set(0);
-                self.set_caret(len, true);
-            }
+            gdk::Key::a | gdk::Key::A if ctrl => self.select_all(),
             gdk::Key::c | gdk::Key::C | gdk::Key::x | gdk::Key::X if ctrl => {
                 if a != b {
                     let t = self.text();

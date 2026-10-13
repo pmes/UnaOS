@@ -203,6 +203,21 @@ pub async fn post_document_typed(url: &str, content_type: &str, body: &str) -> R
 /// Collects absolute URLs of `<link rel="stylesheet">` sheets in `html`,
 /// resolved against `base_url`. Pure (no network) — unit-testable offline.
 pub fn collect_stylesheet_urls(base_url: &str, html: &str) -> Vec<String> {
+    collect_stylesheet_links(base_url, html).into_iter().map(|l| l.url).collect()
+}
+
+/// One `<link rel=stylesheet>`: its absolute URL and what CSP and SRI read from the element
+/// (AETHERDEBT SR93).
+#[derive(Debug, Clone)]
+pub struct SheetLink {
+    pub url: String,
+    pub integrity: Option<String>,
+    pub nonce: String,
+    pub crossorigin: bool,
+}
+
+/// [`collect_stylesheet_urls`] with each link's `integrity`, `nonce` and `crossorigin`.
+pub fn collect_stylesheet_links(base_url: &str, html: &str) -> Vec<SheetLink> {
     let document = crate::dom::parse_html(html);
     let base = url::Url::parse(base_url).ok();
     let mut out = Vec::new();
@@ -223,7 +238,12 @@ pub fn collect_stylesheet_urls(base_url: &str, html: &str) -> Vec<String> {
             };
             if let Some(u) = resolved {
                 if u.starts_with("http://") || u.starts_with("https://") {
-                    out.push(u);
+                    out.push(SheetLink {
+                        url: u,
+                        integrity: attrs.get("integrity").map(str::to_string).filter(|v| !v.trim().is_empty()),
+                        nonce: attrs.get("nonce").map(str::to_string).unwrap_or_default(),
+                        crossorigin: attrs.get("crossorigin").is_some(),
+                    });
                 }
             }
         }
@@ -781,15 +801,26 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
         fonts: 0,
         partition: partition.clone(),
     };
+    // AETHERDEBT SR93: the document's CSP (headers + <meta>) and mixed content gate what the load
+    // itself fetches — style-src-elem for the links (SRI on arrival), font-src, img-src.
+    let policy = crate::security::LoadPolicy::for_document(&base, &html);
     // Discovery from the document itself, in priority classes.
-    let sheet_urls = collect_stylesheet_urls(&base, &html);
-    let mut sheet_texts: Vec<Option<String>> = vec![None; sheet_urls.len()];
-    for (i, u) in sheet_urls.iter().enumerate() {
-        loader.push(Load::Sheet(i, u.clone()));
+    let sheet_links: Vec<SheetLink> = collect_stylesheet_links(&base, &html)
+        .into_iter()
+        .filter_map(|mut l| {
+            l.url = policy.stylesheet(&l.url, &l.nonce)?;
+            Some(l)
+        })
+        .collect();
+    let mut sheet_texts: Vec<Option<String>> = vec![None; sheet_links.len()];
+    for (i, l) in sheet_links.iter().enumerate() {
+        loader.push(Load::Sheet(i, l.url.clone()));
     }
     for css in inline_style_blocks(&html) {
         for u in crate::fonts::webfont::font_urls(&css, &base) {
-            loader.push(Load::Font(u));
+            if let Some(u) = policy.subresource(&u, "font") {
+                loader.push(Load::Font(u));
+            }
         }
     }
     let (mut slots, external) = collect_scripts(&base, &html);
@@ -805,7 +836,9 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     let mut refs: Vec<(String, String)> = collect_image_urls(&base, &html).into_iter().map(|u| (u.clone(), u)).collect();
     collect_css_image_refs(&base, &base, &html, &mut refs);
     for (u, key) in &refs {
-        loader.push(Load::Image(u.clone(), key.clone()));
+        if let Some(fu) = policy.subresource(u, "image") {
+            loader.push(Load::Image(fu, key.clone()));
+        }
     }
 
     let mut images = Vec::new();
@@ -822,14 +855,26 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
         let Some(done) = in_flight.next().await else { break };
         match done {
             Loaded::Sheet(i, sheet_url, Ok(css)) => {
+                // SRI (`<link integrity>`): a sheet whose digest does not match is not applied.
+                if let Some(integrity) = sheet_links.get(i).and_then(|l| l.integrity.clone()) {
+                    let same = crate::security::origin::Origin::of(&base).same_origin(&crate::security::origin::Origin::of(&sheet_url));
+                    let eligible = same || sheet_links.get(i).is_some_and(|l| l.crossorigin);
+                    if !policy.stylesheet_integrity(&sheet_url, &integrity, &css, eligible) {
+                        continue;
+                    }
+                }
                 // What the sheet references joins the queue now: its fonts, its images.
                 for u in crate::fonts::webfont::font_urls(&css, &sheet_url) {
-                    loader.push(Load::Font(u));
+                    if let Some(u) = policy.subresource(&u, "font") {
+                        loader.push(Load::Font(u));
+                    }
                 }
                 let before = refs.len();
                 collect_css_image_refs(&sheet_url, &base, &css, &mut refs);
                 for (u, key) in refs[before..].to_vec() {
-                    loader.push(Load::Image(u, key));
+                    if let Some(fu) = policy.subresource(&u, "image") {
+                        loader.push(Load::Image(fu, key));
+                    }
                 }
                 sheet_texts[i] = Some(css);
             }

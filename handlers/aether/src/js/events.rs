@@ -460,9 +460,21 @@ fn handler_value(vm: &mut Vm, t: TargetKey, ty: &str) -> Value {
     let Some(r) = page(|p| p.handlers.get(&(t, ty.to_string())).copied()) else { return Value::Null };
     let v = idl::rooted(vm, r);
     if let Value::String(body) = &v {
+        // AETHERDEBT SR93 (HTML §8.1.8.1 step 1.3, CSP3 §4.2.3): the attribute's body compiles only when
+        // `script-src-attr` admits it; refused, the handler's value is null.
+        let el = match t {
+            TargetKey::Node(n) => Some(n),
+            _ => dom::body_of(dom::main_doc()),
+        };
+        if !crate::security::inline_handler_allowed(el, &body.to_rust()) {
+            vm.host_roots[r] = Value::Null;
+            return Value::Null;
+        }
         let params = if t == TargetKey::Window && ty == "error" { "event, source, lineno, colno, error" } else { "event" };
         let fc = vm.intr().function_ctor;
-        let compiled = super::enter(vm, "handler-compile", |vm| vm.construct(&Value::Object(fc), &[s(params), Value::String(body.clone())], None));
+        let compiled = crate::security::compiling_trusted(|| {
+            super::enter(vm, "handler-compile", |vm| vm.construct(&Value::Object(fc), &[s(params), Value::String(body.clone())], None))
+        });
         let f = match compiled {
             Some(Ok(f)) => f,
             Some(Err(e)) => {
@@ -558,17 +570,44 @@ pub fn install_handlers(vm: &mut Vm, o: Obj, names: &[&str]) {
 
 /// The "get the parent" chain of a target: node ancestors, then the Window above the main Document
 /// (except for `load`, which does not propagate from the document to the window).
-fn event_path(t: TargetKey, ty: &str, composed: bool) -> Vec<TargetKey> {
+fn event_path(t: TargetKey, ty: &str, composed: bool, related: Option<usize>) -> Vec<TargetKey> {
     let mut path = vec![t];
     if let TargetKey::Node(n) = t {
         let mut cur = n;
+        // AETHERDEBT SR93 (DOM §2.9 step 5.9.6): the shadow-adjusted target so far — a parent outside
+        // its tree that IS the relatedTarget retargeted against it ends the path (a mouseover
+        // between two nodes of one shadow tree does not reach the host's side).
+        let mut adjusted = n;
         // AETHERSHADOW: DOM §2.9 "get the parent" (assigned slot, shadow root → host unless contained).
         while let Some(p) = dom::with_doc(|d| crate::dom::shadow::event_parent(d, html_core::NodeId(cur), composed, html_core::NodeId(n))).map(|p| p.0) {
+            if let Some(rt) = related {
+                let stop = dom::with_doc(|d| {
+                    use crate::dom::shadow as sh;
+                    let in_tree = sh::is_shadow_including_inclusive_ancestor(d, sh::root(d, html_core::NodeId(adjusted)), html_core::NodeId(p));
+                    if in_tree {
+                        return Some(false);
+                    }
+                    if sh::retarget(d, html_core::NodeId(rt), Some(html_core::NodeId(p))).0 == p {
+                        return None;
+                    }
+                    Some(true)
+                });
+                match stop {
+                    None => break,
+                    Some(true) => adjusted = p,
+                    Some(false) => {}
+                }
+            }
             path.push(TargetKey::Node(p));
             cur = p;
         }
         if dom::kind(cur) == dom::NK::Document && cur == dom::main_doc() && ty != "load" {
             path.push(TargetKey::Window);
+        } else if dom::kind(cur) == dom::NK::Document && ty != "load" {
+            // AETHERDEBT SR93: a nested document's parent is its own window (AETHERFRAMES gap).
+            if let Some(w) = super::window::frames::window_target_of_document(cur) {
+                path.push(w);
+            }
         }
     }
     path
@@ -583,7 +622,21 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
     set_flag(vm, e, F_DISPATCH, true);
     let tv = target_value(vm, t);
     set_slot(vm, e, E_TARGET, tv);
-    let path = event_path(t, &ty, flags(vm, e) & F_COMPOSED != 0);
+    // AETHERDEBT SR93: relatedTarget retargeting (DOM §2.9 steps 5.4–5.5, 5.9, 7) — only when the
+    // page has shadow trees (retargeting is the identity otherwise).
+    let related = related_node(vm, e).filter(|_| dom::with_doc(crate::dom::shadow::any));
+    if let (Some(rt), TargetKey::Node(n)) = (related, t) {
+        let r0 = dom::with_doc(|d| crate::dom::shadow::retarget(d, html_core::NodeId(rt), Some(html_core::NodeId(n)))).0;
+        if r0 == n && rt != n {
+            // "If target is not relatedTarget or target is event's relatedTarget" fails: nothing
+            // is invoked (a mouse move between two nodes of one closed tree, seen from outside).
+            set_flag(vm, e, F_DISPATCH, false);
+            set_flag(vm, e, F_STOP, false);
+            set_flag(vm, e, F_STOP_IMMEDIATE, false);
+            return (flags(vm, e) & F_CANCELED == 0, false);
+        }
+    }
+    let path = event_path(t, &ty, flags(vm, e) & F_COMPOSED != 0, related);
     let path_vals: Vec<Value> = path.iter().map(|k| target_value(vm, *k)).collect();
     let arr = vm.new_array(path_vals);
     set_slot(vm, e, E_PATH, Value::Object(arr));
@@ -619,10 +672,12 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
         let phase = if i == 0 { 2.0 } else { 1.0 };
         set_slot(vm, e, E_PHASE, num(phase));
         shadow_adjusted_target(vm, e, t, *k);
+        shadow_adjusted_related(vm, e, related, *k);
         ran |= invoke_listeners(vm, e, *k, &ty, true);
     }
     for (i, k) in path.iter().enumerate() {
         shadow_adjusted_target(vm, e, t, *k);
+        shadow_adjusted_related(vm, e, related, *k);
         if i == 0 {
             set_slot(vm, e, E_PHASE, num(2.0));
         } else {
@@ -649,6 +704,19 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
         };
         set_slot(vm, e, E_TARGET, v);
     }
+    // relatedTarget after dispatch: the original, or null when it is left inside a shadow tree.
+    if let Some(rt) = related {
+        let against = match path.last() {
+            Some(TargetKey::Node(l)) => Some(html_core::NodeId(*l)),
+            _ => None,
+        };
+        let fin = dom::with_doc(|d| {
+            let r = crate::dom::shadow::retarget(d, html_core::NodeId(rt), against);
+            !crate::dom::shadow::is_shadow_root(d, crate::dom::shadow::root(d, r))
+        });
+        let v = if fin { wrap(vm, rt) } else { Value::Null };
+        set_related(vm, e, v);
+    }
     set_flag(vm, e, F_DISPATCH, false);
     set_flag(vm, e, F_STOP, false);
     set_flag(vm, e, F_STOP_IMMEDIATE, false);
@@ -674,6 +742,33 @@ fn shadow_adjusted_target(vm: &mut Vm, e: Obj, t: TargetKey, k: TargetKey) {
         let v = wrap(vm, r);
         set_slot(vm, e, E_TARGET, v);
     }
+}
+
+/// The event's `relatedTarget` when it is a Node (MouseEvent, FocusEvent, … keep it in the
+/// initialized dictionary).
+fn related_node(vm: &mut Vm, e: Obj) -> Option<usize> {
+    let Value::Object(init) = slot(vm, e, E_INIT) else { return None };
+    let key = PropertyKey::from_str("relatedTarget");
+    vm.heap.get(init).props.get(&key)?;
+    let v = vm.get(init, &key).ok()?;
+    node_of(vm, &v)
+}
+
+fn set_related(vm: &mut Vm, e: Obj, v: Value) {
+    if let Value::Object(init) = slot(vm, e, E_INIT) {
+        let _ = vm.create_data_property(init, PropertyKey::from_str("relatedTarget"), v);
+    }
+}
+
+/// AETHERDEBT SR93: the event's relatedTarget while `k`'s listeners run — the original
+/// relatedTarget retargeted against `k` (DOM §2.9 "invoke": the struct's shadow-adjusted
+/// relatedTarget).
+fn shadow_adjusted_related(vm: &mut Vm, e: Obj, related: Option<usize>, k: TargetKey) {
+    let Some(rt) = related else { return };
+    let against = if let TargetKey::Node(n) = k { Some(html_core::NodeId(n)) } else { None };
+    let r = dom::with_doc(|d| crate::dom::shadow::retarget(d, html_core::NodeId(rt), against)).0;
+    let v = wrap(vm, r);
+    set_related(vm, e, v);
 }
 
 fn is_mouse_event(vm: &Vm, e: Obj) -> bool {
@@ -817,19 +912,20 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
             // evaluated by the page either way (the shell cannot run it).
             if let Some(href) = dom::attr_value(a, "href") {
                 if javascript_url_source(&href).is_some() || !trusted {
-                    follow_hyperlink(vm, &href);
+                    follow_hyperlink_from(vm, Some(a), &href);
                 }
             }
         }
         "summary" => {
             let Some(d) = parent_of(a) else { return };
             let was_open = dom::attr_value(d, "open").is_some();
+            // The toggle task is queued by the `open` attribute change steps (js/dom.rs), for script
+            // and user alike.
             if was_open {
                 dom::remove_attr(vm, d, "open");
             } else {
                 dom::set_attr(vm, d, "open", "");
             }
-            queue_details_toggle(vm, d, was_open);
         }
         "label" => {
             let control = dom::with_doc(|d| super::controls::label_control_in(d, a));
@@ -889,8 +985,12 @@ fn javascript_url_source(href: &str) -> Option<String> {
 
 /// HTML "follow the hyperlink": a `javascript:` URL queues a task (navigation and traversal task
 /// source) that runs its script as a classic script; any other URL navigates.
-fn follow_hyperlink(vm: &mut Vm, href: &str) {
+/// `el`: the hyperlink element (the CSP violation's target).
+fn follow_hyperlink_from(vm: &mut Vm, el: Option<usize>, href: &str) {
     match javascript_url_source(href) {
+        // AETHERDEBT SR93 (CSP3 §4.2.4): a `javascript:` navigation runs only when `script-src-elem`
+        // admits the URL as inline script.
+        Some(_) if !crate::security::javascript_url_allowed(el, href.trim()) => {}
         Some(src) => {
             let fp = vm.intr().function_proto;
             let f = vm.make_native_with("", 0, run_javascript_url, false, Some(fp), vec![s(&src)]);
@@ -917,7 +1017,7 @@ thread_local! {
 
 /// HTML §4.11.1 "queue a details toggle event task": a pending task for `d` keeps its oldState (the
 /// new state is read when it runs); otherwise a task is queued that fires a ToggleEvent at `d`.
-fn queue_details_toggle(vm: &mut Vm, d: usize, was_open: bool) {
+pub(crate) fn queue_details_toggle(vm: &mut Vm, d: usize, was_open: bool) {
     let pending = TOGGLE_PENDING.with(|t| t.borrow().contains_key(&d));
     if pending {
         return;
@@ -1155,6 +1255,31 @@ pub fn fire_simple(vm: &mut Vm, t: TargetKey, ty: &str, bubbles: bool, cancelabl
     let e = new_event(vm, "Event", ty, bubbles, cancelable, None);
     let r = root(vm, Value::Object(e));
     let (_, ran) = dispatch(vm, e, t);
+    unroot(vm, r);
+    ran
+}
+
+/// HTML "fire a focus event" (§6.6.4, AETHERDEBT SR93): a trusted, composed FocusEvent `ty` at `n`
+/// whose `relatedTarget` is `related` (the element focus moves from or to; null when none), `view`
+/// the Window. `focus`/`blur` do not bubble, `focusin`/`focusout` do (UI Events §5.2.2).
+pub fn fire_focus(vm: &mut Vm, n: usize, ty: &str, related: Option<usize>) -> bool {
+    if super::engine_poisoned() {
+        return false;
+    }
+    let init = vm.new_plain_object();
+    let rel = match related {
+        Some(r) => wrap(vm, r),
+        None => Value::Null,
+    };
+    let _ = vm.create_data_property(init, PropertyKey::from_str("relatedTarget"), rel);
+    let view = target_value(vm, TargetKey::Window);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("view"), view);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("detail"), num(0.0));
+    let bubbles = matches!(ty, "focusin" | "focusout");
+    let e = new_event(vm, "FocusEvent", ty, bubbles, false, Some(init));
+    set_flag(vm, e, F_COMPOSED, true);
+    let r = root(vm, Value::Object(e));
+    let (_, ran) = dispatch(vm, e, TargetKey::Node(n));
     unroot(vm, r);
     ran
 }

@@ -117,6 +117,56 @@ pub async fn probe(input: &str) -> Probe {
 /// row as it starts, every 256 KiB, and once finished (done, or failed with the reason). Returns the
 /// final row.
 pub async fn download(id: u64, url: String, name: String, total: Option<u64>, report: impl Fn(&Download)) -> Download {
+    run_download(id, url, name, total, None, report).await
+}
+
+/// The cancel flags of the downloads each tab started (tab id → (download id, flag)).
+fn tab_downloads() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Vec<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Vec<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// [`download`] on behalf of tab `tab` (AETHERDEBT SR93): the download stops — its `.part` removed,
+/// the row finished with the error "cancelled: the tab was closed" — when [`cancel_tab_downloads`]
+/// is called for that tab.
+pub async fn download_in_tab(tab: u64, id: u64, url: String, name: String, total: Option<u64>, report: impl Fn(&Download)) -> Download {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut m) = tab_downloads().lock() {
+        m.entry(tab).or_default().push((id, flag.clone()));
+    }
+    let d = run_download(id, url, name, total, Some(flag), report).await;
+    if let Ok(mut m) = tab_downloads().lock() {
+        if let Some(v) = m.get_mut(&tab) {
+            v.retain(|(i, _)| *i != id);
+            if v.is_empty() {
+                m.remove(&tab);
+            }
+        }
+    }
+    d
+}
+
+/// Tab `tab` closed: every download it started and that is still running stops at its next chunk.
+pub fn cancel_tab_downloads(tab: u64) {
+    if let Ok(mut m) = tab_downloads().lock() {
+        if let Some(v) = m.remove(&tab) {
+            for (_, f) in v {
+                f.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+async fn run_download(
+    id: u64,
+    url: String,
+    name: String,
+    total: Option<u64>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    report: impl Fn(&Download),
+) -> Download {
+    let cancelled = || cancel.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
     let dir = downloads_dir();
     let mut d = Download::new(id, &name, &url, total);
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -139,6 +189,9 @@ pub async fn download(id: u64, url: String, name: String, total: Option<u64>, re
         let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
         let mut reported = 0u64;
         while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            if cancelled() {
+                return Err("cancelled: the tab was closed".to_string());
+            }
             file.write_all(&chunk).map_err(|e| e.to_string())?;
             d.received += chunk.len() as u64;
             if d.received - reported >= 256 * 1024 {
