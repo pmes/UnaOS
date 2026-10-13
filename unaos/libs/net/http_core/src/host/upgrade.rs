@@ -233,7 +233,7 @@ fn open(cfg: &AgentConfig, key: &PoolKey) -> Result<Tcp, Error> {
     let s = tcp_connect(&dial_host, dial_port, cfg.connect_timeout, &cfg.resolve)?;
     let _ = s.set_read_timeout(cfg.timeout);
     let _ = s.set_write_timeout(cfg.timeout);
-    let mut t = Tcp { s, last: None };
+    let mut t = Tcp { s, last: None, rec: None };
     if key.proxy.is_some() {
         tunnel(&mut t, &key.host, key.port)?;
     }

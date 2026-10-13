@@ -1,8 +1,8 @@
 //! The host transport (feature `host`, std): HTTP/1.1 over a std `TcpStream`, plain for `http://` and under
 //! UnaOS's own TLS 1.3 / 1.2 (`tls_core`, crypto from CRYPTOCORE) for `https://`, every certificate verified against
 //! a PEM trust store at the system clock and the host name matched (RFC 6125) — the same verifier VEINTLS runs
-//! on the metal. ALPN offers `http/1.1`. HTTP CONNECT proxies (`HTTPS_PROXY`/`HTTP_PROXY`, `NO_PROXY`) are
-//! honoured as every other client on the machine honours them.
+//! on the metal. ALPN offers `h2` first, then `http/1.1` (AETHERCACHE, SR88). HTTP CONNECT proxies
+//! (`HTTPS_PROXY`/`HTTP_PROXY`, `NO_PROXY`) are honoured as every other client on the machine honours them.
 //!
 //! Threading: `tls_core`'s client borrows a provider that is not `Sync`, so a TLS connection cannot change
 //! threads. Each connection therefore OWNS a thread: it connects, handshakes, serves one exchange at a time
@@ -10,6 +10,17 @@
 //! it idles out. Response events (head, body chunks, end) go back through an [`EventSink`] — a std channel for
 //! the blocking API here, a tokio channel in `gneiss_pal::api::http`. Content codings are decoded on that
 //! thread as the body arrives (pixel_core's inflater over the live body).
+//!
+//! HTTP/2 (RFC 9113) is the default for `https://`: one connection per origin carries every concurrent request
+//! as its own stream. An `h2` connection stays in the pool while it serves (a dispatcher hands it a job without
+//! taking it out); its thread admits jobs from the channel, opens streams up to the peer's
+//! SETTINGS_MAX_CONCURRENT_STREAMS, and reads ONE frame at a time only when bytes wait (a frame already
+//! buffered, decrypted plaintext pending, or a `peek` on the socket within [`MUX_POLL`]) so a new job is
+//! admitted while other streams are idle. The socket under TLS is read record by record ([`RecordBound`]),
+//! so `tls_core` never holds a whole record the `peek` cannot see. A burst of requests to an origin whose
+//! connection is still handshaking WAITS for it (coalescing): if ALPN says `h2` they all become its streams,
+//! otherwise each gets its own HTTP/1.1 connection as before. GOAWAY / REFUSED_STREAM: unprocessed streams are
+//! retried on a new connection; `Alt-Svc` is ignored.
 //!
 //! Trust: `AgentConfig::trust`, else `$SSL_CERT_FILE` (the convention OpenSSL, curl and rustls-native follow),
 //! else UnaOS's staged Mozilla bundle `system/trust/roots.pem` when present, else the distribution bundle.
@@ -352,6 +363,45 @@ pub use upgrade::Upgraded;
 struct Tcp {
     s: TcpStream,
     last: Option<Error>,
+    /// Under TLS: reads stop at record boundaries (see [`RecordBound`]).
+    rec: Option<RecordBound>,
+}
+
+/// TLS record framing (RFC 8446 §5.1: a 5-byte header whose last two bytes are the length) tracked under
+/// `tls_core`, so a read never hands it bytes past the record it is assembling. After `recv` returns, the
+/// library therefore buffers nothing undelivered, and a `peek` on the socket tells the h2 loop truthfully
+/// whether a frame can be read without waiting.
+#[derive(Default)]
+struct RecordBound {
+    hdr: [u8; 5],
+    got: usize,
+    left: usize,
+}
+
+impl RecordBound {
+    /// How many bytes the next read may take.
+    fn limit(&self, want: usize) -> usize {
+        if self.left > 0 { want.min(self.left) } else { want.min(5 - self.got) }
+    }
+    fn account(&mut self, b: &[u8]) {
+        let mut b = b;
+        while !b.is_empty() {
+            if self.left > 0 {
+                let n = b.len().min(self.left);
+                self.left -= n;
+                b = &b[n..];
+            } else {
+                let n = b.len().min(5 - self.got);
+                self.hdr[self.got..self.got + n].copy_from_slice(&b[..n]);
+                self.got += n;
+                b = &b[n..];
+                if self.got == 5 {
+                    self.got = 0;
+                    self.left = u16::from_be_bytes([self.hdr[3], self.hdr[4]]) as usize;
+                }
+            }
+        }
+    }
 }
 
 fn io_err(e: std::io::Error) -> Error {
@@ -372,10 +422,18 @@ impl Transport for Tcp {
 
 impl tls_core::Transport for Tcp {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
-        self.s.read(buf).map_err(|e| {
+        let n = match &self.rec {
+            Some(r) => r.limit(buf.len()),
+            None => buf.len(),
+        };
+        let got = self.s.read(&mut buf[..n]).map_err(|e| {
             self.last = Some(io_err(e));
             TlsError::Transport
-        })
+        })?;
+        if let Some(r) = &mut self.rec {
+            r.account(&buf[..got]);
+        }
+        Ok(got)
     }
     fn write_all(&mut self, data: &[u8]) -> Result<(), TlsError> {
         self.s.write_all(data).map_err(|e| {
@@ -393,6 +451,10 @@ struct Tls<'a> {
 }
 
 impl Tls<'_> {
+    /// Decrypted application data not yet handed to the HTTP layer.
+    fn has_pending(&self) -> bool {
+        self.pos < self.pending.len()
+    }
     fn err(&mut self, e: TlsError) -> Error {
         match (e, self.c.transport_mut().last.take()) {
             (TlsError::Transport, Some(io)) => io,
@@ -458,7 +520,12 @@ pub struct Job {
     /// Read and discard the body of a redirect that carries a Location (the dispatcher follows it).
     pub discard_redirect_body: bool,
     pub sink: Box<dyn EventSink>,
+    /// Times this job was handed to another connection (a stale keep-alive, a refused h2 stream).
+    retries: u8,
 }
+
+/// After this many re-dispatches a job goes to a brand-new connection (never a parked one) or fails.
+const MAX_RETRIES: u8 = 3;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct PoolKey {
@@ -471,6 +538,8 @@ struct PoolKey {
 struct Idle {
     id: u64,
     tx: Sender<Job>,
+    /// An h2 connection: it takes every job for its origin and stays parked while it serves.
+    mux: bool,
 }
 
 /// Agent configuration.
@@ -488,7 +557,7 @@ pub struct AgentConfig {
     pub trust: Trust,
     pub proxy: ProxyMode,
     pub cookies: Option<Arc<Mutex<CookieJar>>>,
-    /// ALPN protocols offered (default `http/1.1`).
+    /// ALPN protocols offered, in preference order (default `h2`, then `http/1.1`).
     pub alpn: Vec<Vec<u8>>,
     /// Name → address overrides consulted before DNS (curl's `--resolve`): tests, split-horizon setups.
     pub resolve: Vec<(String, SocketAddr)>,
@@ -513,7 +582,7 @@ impl Default for AgentConfig {
             trust: Trust::System,
             proxy: ProxyMode::Env,
             cookies: None,
-            alpn: vec![b"http/1.1".to_vec()],
+            alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             resolve: Vec::new(),
             tickets: Some(Arc::new(SharedTicketStore::memory())),
             aia: true,
@@ -571,6 +640,10 @@ struct Inner {
     cfg: AgentConfig,
     pool: Mutex<HashMap<PoolKey, Vec<Idle>>>,
     next_id: Mutex<u64>,
+    /// Origins whose (h2-offering) connection is still handshaking, with the jobs waiting to learn its ALPN.
+    connecting: Mutex<HashMap<PoolKey, Vec<Job>>>,
+    /// Origins that answered ALPN with HTTP/1.1: a burst to them no longer waits on a handshake.
+    h1_origins: Mutex<std::collections::HashSet<PoolKey>>,
 }
 
 /// A client: configuration, a cookie jar (optional), and a pool of keep-alive connection threads.
@@ -608,7 +681,7 @@ fn now_secs() -> i64 {
 
 impl Agent {
     pub fn new(cfg: AgentConfig) -> Self {
-        Agent { inner: Arc::new(Inner { cfg, pool: Mutex::new(HashMap::new()), next_id: Mutex::new(1) }) }
+        Agent { inner: Arc::new(Inner { cfg, pool: Mutex::new(HashMap::new()), next_id: Mutex::new(1), connecting: Mutex::new(HashMap::new()), h1_origins: Mutex::new(std::collections::HashSet::new()) }) }
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -628,8 +701,16 @@ impl Agent {
             decode: cfg.decode,
             discard_redirect_body: cfg.max_redirects > 0,
             sink,
+            retries: 0,
         };
-        let key = match pool_key(&job.url, &cfg.proxy) {
+        self.route(job, true);
+    }
+
+    /// Hand a prepared job to a connection for its origin: an h2 connection (shared, stays parked), else a
+    /// parked HTTP/1.1 connection (taken), else — for an h2-offering https origin — the connection still
+    /// handshaking for it (coalescing), else a new connection thread. `parked = false` skips the first three.
+    fn route(&self, job: Job, parked: bool) {
+        let key = match pool_key(&job.url, &self.inner.cfg.proxy) {
             Ok(k) => k,
             Err(e) => {
                 let mut s = job.sink;
@@ -638,15 +719,38 @@ impl Agent {
             }
         };
         let mut job = job;
-        loop {
-            let idle = self.inner.pool.lock().ok().and_then(|mut p| p.get_mut(&key).and_then(|v| v.pop()));
+        while parked {
+            let idle = self.inner.pool.lock().ok().and_then(|mut p| {
+                let v = p.get_mut(&key)?;
+                match v.iter().find(|i| i.mux) {
+                    Some(m) => Some((m.id, m.tx.clone(), true)),
+                    None => v.pop().map(|i| (i.id, i.tx, false)),
+                }
+            });
             match idle {
-                Some(conn) => match conn.tx.send(job) {
+                Some((cid, tx, mux)) => match tx.send(job) {
                     Ok(()) => return,
-                    Err(mpsc::SendError(j)) => job = j, // that thread is gone; try the next
+                    Err(mpsc::SendError(j)) => {
+                        // That thread is gone; forget it and try the next.
+                        job = j;
+                        if mux {
+                            unpark(&self.inner, &key, cid);
+                        }
+                    }
                 },
                 None => break,
             }
+        }
+        let coalesce = key.scheme == "https"
+            && offers_h2(&self.inner.cfg)
+            && !self.inner.h1_origins.lock().map(|h| h.contains(&key)).unwrap_or(false);
+        if coalesce && parked {
+            let Ok(mut c) = self.inner.connecting.lock() else { return };
+            if let Some(waiting) = c.get_mut(&key) {
+                waiting.push(job);
+                return;
+            }
+            c.insert(key.clone(), Vec::new());
         }
         let id = {
             let mut n = self.inner.next_id.lock().unwrap();
@@ -654,9 +758,10 @@ impl Agent {
             *n
         };
         let inner = self.inner.clone();
+        let owns_coalesce = coalesce && parked;
         std::thread::Builder::new()
             .name(format!("http-conn-{id}"))
-            .spawn(move || connection_thread(inner, key, id, job))
+            .spawn(move || connection_thread(inner, key, id, job, owns_coalesce))
             .expect("spawn connection thread");
     }
 
@@ -879,7 +984,48 @@ fn with_tls<R>(cfg: &AgentConfig, host: &str, alpn: Vec<Vec<u8>>, t: Tcp, f: imp
     }
 }
 
-fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
+fn offers_h2(cfg: &AgentConfig) -> bool {
+    cfg.alpn.iter().any(|p| p.as_slice() == b"h2")
+}
+
+/// Drop connection `id` from the pool (an h2 connection leaving service).
+fn unpark(inner: &Arc<Inner>, key: &PoolKey, id: u64) {
+    if let Ok(mut p) = inner.pool.lock() {
+        if let Some(v) = p.get_mut(key) {
+            v.retain(|i| i.id != id);
+        }
+    }
+}
+
+/// The coalescing slot a connection thread owns while it handshakes: released with the waiting jobs either
+/// into its own h2 queue, or — HTTP/1.1, or any failure (Drop) — each onto a connection of its own.
+struct Coalesce {
+    inner: Arc<Inner>,
+    key: PoolKey,
+    armed: bool,
+}
+
+impl Coalesce {
+    fn take(&mut self) -> Vec<Job> {
+        if !self.armed {
+            return Vec::new();
+        }
+        self.armed = false;
+        self.inner.connecting.lock().ok().and_then(|mut c| c.remove(&self.key)).unwrap_or_default()
+    }
+}
+
+impl Drop for Coalesce {
+    fn drop(&mut self) {
+        let agent = Agent { inner: self.inner.clone() };
+        for j in self.take() {
+            agent.route(j, false);
+        }
+    }
+}
+
+fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coalescing: bool) {
+    let mut coalesce = coalescing.then(|| Coalesce { inner: inner.clone(), key: key.clone(), armed: true });
     let cfg = inner.cfg.clone();
     let fail = |job: Job, e: Error| {
         let mut s = job.sink;
@@ -892,36 +1038,58 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
     };
     let _ = tcp.set_read_timeout(cfg.timeout);
     let _ = tcp.set_write_timeout(cfg.timeout);
-    let mut t = Tcp { s: tcp, last: None };
+    let mut t = Tcp { s: tcp, last: None, rec: None };
     if key.scheme == "https" && key.proxy.is_some() {
         if let Err(e) = tunnel(&mut t, &key.host, key.port) {
             return fail(first, e);
         }
     }
     if key.scheme == "https" {
-        with_tls(&cfg, &key.host, cfg.alpn.clone(), t, |client| {
-            let client = match client {
+        let store = match resolve_trust(&cfg.trust) {
+            Ok(s) => s,
+            Err(e) => return fail(first, e),
+        };
+        let provider = CryptoCoreProvider::new();
+        let web = WebPkiVerifier { store: &store, clock: &SystemClock };
+        let fetcher = HttpIssuerFetcher::new(&cfg);
+        let aia = tls_core::x509::aia::AiaVerifier::new(WebPkiVerifier { store: &store, clock: &SystemClock }, &fetcher);
+        let verifier: &dyn tls_core::ServerCertVerifier = if cfg.aia { &aia } else { &web };
+        let name = key.host.trim_start_matches('[').trim_end_matches(']').to_string();
+        let mut tcfg = ClientConfig::new(Some(&name), verifier);
+        tcfg.enable_tls12(); // TLSCORE2 (SR58): TLS 1.3 preferred, 1.2 (ECDHE + AEAD, EMS) for the long tail
+        tcfg.alpn = cfg.alpn.clone();
+        tcfg.resumption = cfg
+            .tickets
+            .as_ref()
+            .map(|t| tls_core::resumption::Resumption { store: &**t, clock: &SystemClock });
+        // A second handle on the socket for the h2 loop's readiness `peek` (never read through).
+        let probe = t.s.try_clone().ok();
+        t.rec = Some(RecordBound::default());
+        let client = match TlsClient::connect(&provider, &tcfg, t) {
+            Ok(c) => c,
+            Err(e) => {
+                return fail(first, Error::Tls(describe_tls(&e)));
+            }
+        };
+        let alpn_h2 = client.negotiated().alpn.as_deref() == Some(b"h2");
+        let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
+        if alpn_h2 {
+            let mut h2c = match crate::h2::H2Conn::handshake(tls) {
                 Ok(c) => c,
                 Err(e) => return fail(first, e),
             };
-            let alpn_h2 = client.negotiated().alpn.as_deref() == Some(b"h2");
-            let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
-            #[cfg(feature = "h2")]
-            if alpn_h2 {
-                let mut h2c = match crate::h2::H2Conn::handshake(tls) {
-                    Ok(c) => c,
-                    Err(e) => return fail(first, e),
-                };
-                serve(&inner, &key, id, first, |job, reused| exchange_h2(&mut h2c, &key, job, reused));
-                let _ = h2c.transport_mut().c.close();
-                return;
-            }
-            #[cfg(not(feature = "h2"))]
-            let _ = alpn_h2;
-            let mut conn = Conn::new(tls);
-            serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
-            let _ = conn.transport.c.close();
-        });
+            serve_h2(&inner, &key, id, first, &mut h2c, probe.as_ref(), coalesce.as_mut());
+            let _ = h2c.transport_mut().c.close();
+            return;
+        }
+        // HTTP/1.1: whoever waited on this handshake gets a connection of its own (Coalesce's Drop routes them).
+        if let Ok(mut h) = inner.h1_origins.lock() {
+            h.insert(key.clone());
+        }
+        drop(coalesce);
+        let mut conn = Conn::new(tls);
+        serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
+        let _ = conn.transport.c.close();
     } else {
         let mut conn = Conn::new(t);
         serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
@@ -939,7 +1107,7 @@ fn serve(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, mut run: impl F
             Outcome::Reusable(finish) => {
                 // Park BEFORE telling the caller the exchange ended, so its next request finds this connection.
                 if let Ok(mut p) = inner.pool.lock() {
-                    p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone() });
+                    p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone(), mux: false });
                 }
                 if let Some((mut sink, r)) = finish {
                     sink.send(Event::End(r));
@@ -986,26 +1154,13 @@ fn serve(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, mut run: impl F
 }
 
 impl Agent {
-    /// Re-dispatch an already-prepared job on a fresh connection (cookies/UA already applied).
-    fn dispatch_job(&self, job: Job) {
-        let key = match pool_key(&job.url, &self.inner.cfg.proxy) {
-            Ok(k) => k,
-            Err(e) => {
-                let mut s = job.sink;
-                s.send(Event::End(Err(e)));
-                return;
-            }
-        };
-        let id = {
-            let mut n = self.inner.next_id.lock().unwrap();
-            *n += 1;
-            *n
-        };
-        let inner = self.inner.clone();
-        std::thread::Builder::new()
-            .name(format!("http-conn-{id}"))
-            .spawn(move || connection_thread(inner, key, id, job))
-            .expect("spawn connection thread");
+    /// Re-dispatch an already-prepared job (cookies/UA already applied) after its connection could not serve
+    /// it: through the pool while retries remain (an h2 connection or a connection being set up absorbs it),
+    /// then on a brand-new connection.
+    fn dispatch_job(&self, mut job: Job) {
+        job.retries = job.retries.saturating_add(1);
+        let parked = job.retries < MAX_RETRIES;
+        self.route(job, parked);
     }
 }
 
@@ -1081,54 +1236,259 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
     finish(job, end, clean && reusable && dec.is_done() && conn.buffered() == 0)
 }
 
-/// One exchange as an HTTP/2 stream on a negotiated `h2` connection.
-#[cfg(feature = "h2")]
-fn exchange_h2<T: Transport>(h2c: &mut crate::h2::H2Conn<T>, key: &PoolKey, mut job: Job, reused: bool) -> Outcome {
-    let body = job.body.clone();
-    let authority = job.url.host_str();
-    let id = match h2c.send_request(&job.method, &key.scheme, &authority, &job.url.request_target(), &job.headers, &body) {
-        Ok(id) => id,
-        Err(e) => {
-            if reused {
-                return Outcome::RetryFresh(job);
-            }
-            job.sink.send(Event::End(Err(e)));
-            return Outcome::Closed;
-        }
-    };
-    let (status, headers) = match h2c.read_head(id) {
-        Ok(v) => v,
-        Err(Error::Http(H1Error::Truncated)) if reused => return Outcome::RetryFresh(job),
-        Err(e) => {
-            job.sink.send(Event::End(Err(e)));
-            return Outcome::Closed;
-        }
-    };
-    let rhead = ResponseHead { version: (2, 0), status, reason: String::new(), headers };
-    let no_body = job.method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304;
-    let mut ended = no_body;
-    let (clean, end) = deliver(&mut job, rhead, true, &mut || {
-        if ended {
-            return Ok(None);
-        }
-        let r = h2c.read_data(id);
-        if matches!(r, Ok(None)) {
-            ended = true;
-        }
-        r
-    });
-    if !ended {
-        // An abandoned body: cancel the stream (RFC 9113 §8.1), the connection stays usable.
-        let _ = h2c.transport_mut().write_all(&crate::h2::frame::encode(
-            crate::h2::frame::RST_STREAM,
-            0,
-            id,
-            &crate::h2::frame::ErrorCode::Cancel.to_u32().to_be_bytes(),
-        ));
+/// How long the h2 loop waits for socket bytes before it looks at its job channel again.
+pub const MUX_POLL: Duration = Duration::from_millis(20);
+
+/// A content-coded body on a multiplexed stream is gathered and decoded at END_STREAM (the inflater pulls,
+/// and one stream must not hold the connection); beyond this it fails.
+const MUX_CODED_CAP: usize = 256 << 20;
+
+/// One request in flight as an h2 stream.
+struct MuxStream {
+    job: Job,
+    head: bool,
+    /// A followed redirect: its body is read and dropped.
+    drain: bool,
+    coded: Option<(Vec<Coding>, Vec<u8>)>,
+}
+
+enum Pump {
+    Pending,
+    Done(Result<(), Error>),
+    /// The receiver went away: cancel the stream.
+    Gone,
+    /// Never processed by the server: retry elsewhere.
+    Refused,
+}
+
+/// Is a frame readable without blocking? A whole frame buffered, decrypted plaintext pending, or the
+/// socket has bytes (or EOF / an error, which the read will report) within [`MUX_POLL`].
+fn h2_ready(h2c: &mut crate::h2::H2Conn<Tls<'_>>, probe: Option<&TcpStream>, normal: Option<Duration>) -> bool {
+    if h2c.has_buffered_frame() || h2c.transport_mut().has_pending() {
+        return true;
     }
-    h2c.close_stream(id);
-    let ok = clean && h2c.reusable();
-    finish(job, end, ok)
+    let Some(p) = probe else { return true };
+    let _ = p.set_read_timeout(Some(MUX_POLL));
+    let mut b = [0u8; 1];
+    let r = p.peek(&mut b);
+    let _ = p.set_read_timeout(normal);
+    !matches!(r, Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+}
+
+fn idempotent(method: &str) -> bool {
+    matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE")
+}
+
+/// Advance one stream as far as its buffered frames allow, without blocking.
+fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pump {
+    use crate::h2::client::DataPoll;
+    if !m.head {
+        if h2c.refused(sid) {
+            return Pump::Refused;
+        }
+        match h2c.try_head(sid) {
+            Ok(None) => return Pump::Pending,
+            Err(e) => return Pump::Done(Err(e)),
+            Ok(Some((status, headers))) => {
+                let mut rhead = ResponseHead { version: (2, 0), status, reason: String::new(), headers };
+                if m.job.discard_redirect_body && redirect::is_redirect(status) && rhead.headers.contains("location") {
+                    m.drain = true;
+                } else if m.job.decode {
+                    let codings = encoding::content_codings(&rhead.headers);
+                    if codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate) {
+                        rhead.headers.remove("content-encoding");
+                        rhead.headers.remove("content-length");
+                        m.coded = Some((codings, Vec::new()));
+                    }
+                }
+                m.head = true;
+                if !m.job.sink.send(Event::Head(rhead)) {
+                    return Pump::Gone;
+                }
+            }
+        }
+    }
+    loop {
+        match h2c.try_data(sid) {
+            Err(e) => return Pump::Done(Err(e)),
+            Ok(DataPoll::Pending) => return Pump::Pending,
+            Ok(DataPoll::End) => {
+                if let Some((codings, buf)) = m.coded.take() {
+                    match encoding::decode(&codings, &buf) {
+                        Ok(d) => {
+                            for c in d.chunks(16 * 1024) {
+                                if !m.job.sink.send(Event::Data(c.to_vec())) {
+                                    return Pump::Gone;
+                                }
+                            }
+                        }
+                        Err(e) => return Pump::Done(Err(Error::Decode(e))),
+                    }
+                }
+                return Pump::Done(Ok(()));
+            }
+            Ok(DataPoll::Chunk(d)) => {
+                if m.drain {
+                    continue;
+                }
+                if let Some((_, buf)) = &mut m.coded {
+                    buf.extend_from_slice(&d);
+                    if buf.len() > MUX_CODED_CAP {
+                        return Pump::Done(Err(Error::Io("h2: content-coded body too large to decode".into())));
+                    }
+                    continue;
+                }
+                if !m.job.sink.send(Event::Data(d)) {
+                    return Pump::Gone;
+                }
+            }
+        }
+    }
+}
+
+/// Serve an `h2` connection: every job for this origin becomes a stream on it, concurrently, until GOAWAY,
+/// a connection error, or the idle timeout with no stream open.
+fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut crate::h2::H2Conn<Tls<'_>>, probe: Option<&TcpStream>, coalesce: Option<&mut Coalesce>) {
+    let agent = Agent { inner: inner.clone() };
+    let (tx, rx) = mpsc::channel::<Job>();
+    let mut queue: alloc::collections::VecDeque<Job> = alloc::collections::VecDeque::new();
+    queue.push_back(first);
+    if let Ok(mut p) = inner.pool.lock() {
+        p.entry(key.clone()).or_default().push(Idle { id, tx, mux: true });
+    }
+    let mut parked = true;
+    // Registered first, then the waiters move in: a dispatcher sees the pool entry or the waiting list.
+    if let Some(c) = coalesce {
+        queue.extend(c.take());
+    }
+    let mut active: alloc::collections::BTreeMap<u32, MuxStream> = alloc::collections::BTreeMap::new();
+    let mut proven = false;
+    let mut last_progress = Instant::now();
+    let timeout = inner.cfg.timeout;
+    // Hand a job that never reached the server to another connection (or fail it past the retry budget).
+    let retry = |job: Job, why: Error| {
+        if job.retries >= MAX_RETRIES {
+            let mut s = job.sink;
+            s.send(Event::End(Err(why)));
+        } else {
+            agent.dispatch_job(job);
+        }
+    };
+    let conn_err: Option<Error> = 'conn: loop {
+        while let Ok(j) = rx.try_recv() {
+            queue.push_back(j);
+        }
+        if parked && !h2c.reusable() {
+            unpark(inner, key, id);
+            parked = false;
+        }
+        // Open streams for waiting jobs, up to the peer's limit.
+        while h2c.can_open() {
+            let Some(mut job) = queue.pop_front() else { break };
+            let body = job.body.clone();
+            let authority = job.url.host_str();
+            match h2c.send_request(&job.method, &key.scheme, &authority, &job.url.request_target(), &job.headers, &body) {
+                Ok(sid) => {
+                    active.insert(sid, MuxStream { job, head: false, drain: false, coded: None });
+                }
+                Err(e) => {
+                    // The connection cannot carry it (write failed, GOAWAY): a job on a connection that
+                    // already served is retried elsewhere; a first job reports the failure.
+                    if proven || !h2c.reusable() {
+                        queue.push_front(job);
+                    } else {
+                        job.sink.send(Event::End(Err(e.clone())));
+                    }
+                    break 'conn Some(e);
+                }
+            }
+        }
+        // Progress every stream from what is buffered (send_request may have read frames for others).
+        let ids: Vec<u32> = active.keys().copied().collect();
+        for sid in ids {
+            let m = active.get_mut(&sid).expect("listed");
+            let r = pump(h2c, sid, m);
+            if m.head {
+                proven = true;
+            }
+            match r {
+                Pump::Pending => {}
+                Pump::Done(res) => {
+                    h2c.close_stream(sid);
+                    let mut m = active.remove(&sid).expect("listed");
+                    m.job.sink.send(Event::End(res));
+                }
+                Pump::Gone => {
+                    active.remove(&sid);
+                    let _ = h2c.cancel(sid);
+                }
+                Pump::Refused => {
+                    h2c.close_stream(sid);
+                    let m = active.remove(&sid).expect("listed");
+                    retry(m.job, Error::Io("h2: stream refused".into()));
+                }
+            }
+        }
+        if active.is_empty() {
+            if !queue.is_empty() {
+                if h2c.can_open() {
+                    continue;
+                }
+                break None; // GOAWAY (or a zero stream limit) with jobs waiting: they go elsewhere below
+            }
+            if !h2c.reusable() {
+                break None;
+            }
+            match rx.recv_timeout(inner.cfg.idle_timeout) {
+                Ok(j) => {
+                    queue.push_back(j);
+                    continue;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    unpark(inner, key, id);
+                    parked = false;
+                    // A dispatcher may have handed us a job just before the unpark.
+                    while let Ok(j) = rx.try_recv() {
+                        queue.push_back(j);
+                    }
+                    if queue.is_empty() {
+                        break None;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break None,
+            }
+        }
+        if !h2_ready(h2c, probe, timeout) {
+            if timeout.is_some_and(|t| last_progress.elapsed() > t) {
+                break Some(Error::Timeout);
+            }
+            continue;
+        }
+        if let Err(e) = h2c.step_frame() {
+            break Some(e);
+        }
+        last_progress = Instant::now();
+    };
+    if parked {
+        unpark(inner, key, id);
+    }
+    while let Ok(j) = rx.try_recv() {
+        queue.push_back(j);
+    }
+    for j in queue {
+        retry(j, Error::Io("h2: connection closed before the request was sent".into()));
+    }
+    let why = conn_err.unwrap_or_else(|| Error::Io("h2: connection closed".into()));
+    for (sid, mut m) in active {
+        // A stream the server never answered may be retried when that is safe (refused, or idempotent and
+        // no byte of a response arrived); everything else reports the connection's failure.
+        if !m.head && (h2c.refused(sid) || idempotent(&m.job.method)) {
+            retry(m.job, why.clone());
+        } else {
+            m.job.sink.send(Event::End(Err(why.clone())));
+        }
+    }
 }
 
 /// A pull of body chunks as an inflater source.

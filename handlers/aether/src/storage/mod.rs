@@ -186,6 +186,15 @@ pub const PRELUDE: &str = r#"
 })();
 "#;
 
+/// AETHERCACHE (SR88): the HTTP cache's disk tier — `http-cache/` under the same platform data directory the
+/// localStorage files live in (one file per cached response, written and bounded by gneiss_pal's HttpCache).
+pub fn http_cache_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "UnaOS", "Aether")
+        .map(|p| p.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp/aether_storage"))
+        .join("http-cache")
+}
+
 #[derive(Debug)]
 pub struct LocalStorage {
     data: HashMap<String, String>,
