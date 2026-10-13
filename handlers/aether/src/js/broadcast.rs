@@ -72,10 +72,45 @@ impl Drop for Inbox {
 
 thread_local! {
     static INBOX: RefCell<Option<Inbox>> = const { RefCell::new(None) };
+    /// AETHERWORKERS2 (SR125): on a dedicated worker's thread, the worker's own inbox serial ([`enter_worker`]).
+    static THREAD_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A worker inbox's delivery: (kind, payload) onto the worker thread's own queue; false when it is gone.
+pub type Route = Box<dyn Fn(&str, String) -> bool + Send>;
+
+fn routes() -> std::sync::MutexGuard<'static, HashMap<u64, Route>> {
+    static R: OnceLock<Mutex<HashMap<u64, Route>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// AETHERWORKERS2 (SR125): gives the current (dedicated worker) thread an inbox serial of its own, drawn from
+/// the documents' serial space, whose messages `route` hands to the worker's task queue. From here on
+/// [`doc`] on this thread answers it, so the storage family (IndexedDB connections, Web Locks requests,
+/// BroadcastChannel objects) and the worker's nested workers address this realm exactly as they address a
+/// document; [`leave_worker`] retires it.
+pub fn enter_worker(route: Route) -> u64 {
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+    routes().insert(serial, route);
+    THREAD_SERIAL.with(|t| t.set(serial));
+    serial
+}
+
+/// The worker thread is ending: its serial retires (connections close, locks release, channels go).
+pub fn leave_worker() {
+    let serial = THREAD_SERIAL.with(|t| t.replace(0));
+    if serial != 0 {
+        retire(serial);
+    }
 }
 
 /// The running document's serial (its inbox address; the `clientId` Web Locks and service workers report).
+/// On a dedicated worker's thread: the worker's serial ([`enter_worker`]).
 pub fn doc() -> u64 {
+    let w = THREAD_SERIAL.with(std::cell::Cell::get);
+    if w != 0 {
+        return w;
+    }
     INBOX.with(|i| {
         let mut i = i.borrow_mut();
         if i.is_none() {
@@ -90,13 +125,14 @@ pub fn post(doc: u64, kind: &str, payload: String) -> bool {
     let tx = inboxes().get(&doc).cloned();
     match tx {
         Some(tx) => tx.send((kind.to_string(), payload)).is_ok(),
-        None => false,
+        None => routes().get(&doc).is_some_and(|r| r(kind, payload)),
     }
 }
 
 /// A document is gone: everything the storage family held for it is released.
 pub fn retire(doc: u64) {
     inboxes().remove(&doc);
+    routes().remove(&doc);
     channels().retain(|c| c.doc != doc);
     crate::storage::idb::doc_gone(doc);
     crate::storage::locks::doc_gone(doc);
@@ -204,6 +240,18 @@ pub fn install(vm: &mut Vm) {
             crate::ledger::record_js(&format!("{label}-prelude-failed:{}", super::clip(&m, 64)));
             eprintln!("[aether] {label} prelude failed: {m}");
         }
+    }
+}
+
+/// AETHERWORKERS2 (SR125): a dedicated worker's realm gets `__bc` and the inbox dispatcher + BroadcastChannel
+/// prelude (the serializer it already runs); its inbox is the serial [`enter_worker`] gave its thread, so this
+/// installs no `Inbox`. The realm must have `EventTarget`, `DOMException`, `__net_handlers` and `__net_fire`.
+pub fn install_worker(vm: &mut Vm) {
+    let g = vm.realm().global;
+    let fo = vm.make_native("__bc", 3, bc_native as NativeFn, false);
+    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("__bc"), Prop::data(Value::Object(fo), WC));
+    if let Err(e) = vm.run_script_str(PRELUDE) {
+        eprintln!("[aether-worker] broadcast prelude failed: {}", vm.error_string(&e));
     }
 }
 

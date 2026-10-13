@@ -116,6 +116,9 @@ impl Vm {
                 }
                 *b -= 1;
             }
+            if self.interrupt_pending() {
+                return Err(self.interrupted());
+            }
             match op {
                 Op::Undef => self.stack.push(Value::Undefined),
                 Op::Null => self.stack.push(Value::Null),

@@ -48,7 +48,6 @@ fn console_prints_the_frames_and_the_source_excerpt_under_an_uncaught_error() {
 }
 
 #[test]
-#[ignore = "JSPOS: needs js/events.rs report_exception to read js::error_site (AETHERWORKERS2's file; change named in the JSPOS report)"]
 fn error_event_carries_filename_lineno_and_colno_of_the_throw_site() {
     let mut engine = load(
         "<!doctype html><html><body><script>var got = '';\nwindow.addEventListener('error', function (e) { got = e.filename + '|' + e.lineno + '|' + e.colno; });</script><script>\nfunction f() {\n  throw new Error('x');\n}\nf();\n</script></body></html>",

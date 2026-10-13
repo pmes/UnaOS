@@ -3,7 +3,7 @@
 //!
 //! 1. a worker echoes a message (DedicatedWorkerGlobalScope, `name`, MessageEvent origin "" and no ports);
 //! 2. an ArrayBuffer in the transfer list is detached on the sender, both ways;
-//! 3. an uncaught worker error fires an ErrorEvent at the Worker (message, filename, a SyntaxError's lineno),
+//! 3. an uncaught worker error fires an ErrorEvent at the Worker (message, filename, the throw site's lineno — JSPOS),
 //!    a worker `onerror` returning true cancels it, and a cross-origin script URL fires a simple `error`;
 //! 4. `terminate()` drops the worker's queued messages and stops the thread, including a script spinning in a
 //!    loop (at its next call into a worker native);
@@ -13,6 +13,17 @@
 //!    and a callback whose timeout passed (didTimeout, timeRemaining 0);
 //! 7. a same-origin http(s) worker fetched through the page's loader, its `importScripts`, and a module
 //!    worker's static import.
+//!
+//! AETHERWORKERS2 (LEDGER SR125), one test per item:
+//!
+//! 8. `terminate()` interrupts a loop that calls nothing (js_core `Vm::interrupt`);
+//! 9. the worker script goes out as `Sec-Fetch-Dest: worker` (importScripts as `script`) and a non-JavaScript
+//!    MIME type is refused, the console naming it;
+//! 10. the Worker's ErrorEvent is cancelable (uncanceled, it reaches the Window) and `new MessageEvent(type,
+//!     { ports })` carries its ports;
+//! 11. IndexedDB, Web Locks and BroadcastChannel in a worker share the owner document's storage;
+//! 12. `unhandledrejection` / `rejectionhandled` at the worker global;
+//! 13. nested workers under the parent's captured URL, origin and CSP, terminated with it.
 //!
 //! No WPT: the seat runs the suites. Storage lives under CARGO_TARGET_TMPDIR.
 
@@ -151,7 +162,7 @@ fn an_uncaught_worker_error_fires_error_at_the_worker() {
              w4.onerror = function (e) {{ d = e.constructor.name + '|' + e.type; }};"
         ),
     );
-    assert_eq!(run_until(&mut p, "a !== null", "a", 20), "ErrorEvent|Uncaught TypeError: boom|true|0");
+    assert_eq!(run_until(&mut p, "a !== null", "a", 20), "ErrorEvent|Uncaught TypeError: boom|true|1");
     assert_eq!(run_until(&mut p, "b !== null", "b", 20), "Uncaught SyntaxError|2", "a SyntaxError's line is the worker script's");
     assert_eq!(run_until(&mut p, "c !== null", "c", 20), "seen:Uncaught Error: x");
     assert_eq!(run_until(&mut p, "d !== null", "d", 20), "Event|error", "a cross-origin worker script is a fetch failure: a simple error event");
@@ -310,4 +321,242 @@ fn a_same_origin_worker_loads_through_the_page_loader() {
     );
     assert_eq!(run_until(&mut p, "a !== null", "a", 20), "hi!|/w.js");
     assert_eq!(run_until(&mut p, "b !== null", "b", 20), "mod:x|TypeError", "a module worker imports statically and refuses importScripts");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 1
+
+/// `terminate()` of a worker spinning in a loop that calls nothing: the kill flag is the realm's
+/// `Vm::interrupt`, which js_core checks beside the instruction budget, so the thread stops at its next
+/// instruction. Without it the loop runs out its whole task budget (`js::TASK_BUDGET`, 400M instructions,
+/// seconds of interpretation); the bound below is far inside one budget.
+#[test]
+fn terminate_interrupts_a_loop_that_calls_nothing() {
+    let spinner = data_url("postMessage('spinning'); while (true) {}");
+    let mut p = page(PAGE, &format!("var s = null; var w = new Worker('{spinner}'); w.onmessage = function (e) {{ s = e.data; }};"));
+    let doc = aether::js::broadcast::doc();
+    assert_eq!(run_until(&mut p, "s !== null", "s", 20), "spinning");
+    assert_eq!(aether::workers::dedicated::threads(doc), 1, "the worker thread is spinning");
+    eval(&mut p, "w.terminate();");
+    let t0 = Instant::now();
+    while aether::workers::dedicated::threads(doc) > 0 {
+        assert!(t0.elapsed() < Duration::from_millis(1000), "the spinning worker was not interrupted within one TASK_BUDGET");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 2
+
+/// (path, `Sec-Fetch-Dest`) of every request [`recording_server`] answered.
+static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// [`server`] that also records each request's path and `Sec-Fetch-Dest` header in [`SEEN`].
+fn recording_server(route: fn(&str) -> Option<(&'static str, String)>) -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut tmp) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split(' ').nth(1).unwrap_or("/").split('?').next().unwrap_or("/").to_string();
+                let dest = head
+                    .lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("sec-fetch-dest")).map(|(_, v)| v.trim().to_string()))
+                    .unwrap_or_default();
+                SEEN.lock().unwrap().push((path.clone(), dest));
+                let (status, ctype, body) = match route(&path) {
+                    Some((t, b)) => ("200 OK", t, b),
+                    None => ("404 Not Found", "text/plain", String::from("no")),
+                };
+                let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = c.flush();
+            });
+        }
+    });
+    port
+}
+
+fn seen_dest(port_path: &str) -> String {
+    SEEN.lock().unwrap().iter().rev().find(|(p, _)| p == port_path).map(|(_, d)| d.clone()).unwrap_or_else(|| "<not requested>".into())
+}
+
+/// The worker script is requested with destination `worker` (`Sec-Fetch-Dest: worker`), its `importScripts`
+/// with destination `script`; a script served as `text/html` is refused (HTML §10.2.4: not a JavaScript MIME
+/// type) — a simple `error` event at the Worker, and the console names the MIME type.
+#[test]
+fn a_worker_script_is_fetched_as_a_worker_and_must_be_javascript() {
+    let port = recording_server(|path| match path {
+        "/mime/ok.js" => Some(("text/javascript; charset=utf-8", "importScripts('lib2.js'); postMessage(lib2());".into())),
+        "/mime/lib2.js" => Some(("application/javascript", "function lib2() { return 'ran'; }".into())),
+        "/mime/html.js" => Some(("text/html", "postMessage('should not run');".into())),
+        _ => None,
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let mut p = page(
+        &format!("{origin}/mime/page"),
+        "var a = null, b = null;
+         var ok = new Worker('/mime/ok.js'); ok.onmessage = function (e) { a = e.data; };
+         var bad = new Worker('/mime/html.js');
+         bad.onmessage = function () { b = 'ran'; };
+         bad.onerror = function (e) { b = e.constructor.name + '|' + e.type; };",
+    );
+    assert_eq!(run_until(&mut p, "a !== null", "a", 20), "ran");
+    assert_eq!(run_until(&mut p, "b !== null", "b", 20), "Event|error", "a text/html worker script is a fetch failure");
+    assert_eq!(seen_dest("/mime/ok.js"), "worker", "Sec-Fetch-Dest of the worker script");
+    assert_eq!(seen_dest("/mime/lib2.js"), "script", "Sec-Fetch-Dest of importScripts");
+    let console = aether::js::console_lines();
+    assert!(console.iter().any(|(_, l)| l.contains("MIME type ('text/html')")), "the console names the refused MIME type: {console:?}");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 6
+
+/// A worker creates workers: the child's URL resolves against the parent worker's location, its messages
+/// arrive at the parent's `Worker` object, a cross-origin child is a simple `error` at the parent, a `data:`
+/// child is refused by the document's CSP (`worker-src 'self'`) that the parent captured, and terminating the
+/// parent terminates the child.
+#[test]
+fn a_worker_creates_nested_workers_under_its_captured_context() {
+    let port = server(|path| match path {
+        "/w/parent.js" => Some((
+            "text/javascript",
+            "var c = new Worker('child.js', { name: 'kid' });
+             c.onmessage = function (e) { postMessage('child:' + e.data); };
+             var x = new Worker('http://elsewhere.invalid/x.js');
+             x.onerror = function (e) { postMessage('xo:' + e.constructor.name); };
+             var d = new Worker('data:text/javascript,postMessage(1)');
+             d.onmessage = function () { postMessage('csp:ran'); };
+             d.onerror = function (e) { postMessage('csp:' + e.type); };"
+                .into(),
+        )),
+        "/w/child.js" => Some(("text/javascript", "postMessage(location.pathname + '|' + name); setInterval(function () {}, 5);".into())),
+        _ => None,
+    });
+    init();
+    let mut p = aether::AetherEngine::new();
+    let html = "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"worker-src 'self'\"></head><body><script>
+        var got = []; var w = new Worker('/w/parent.js'); w.onmessage = function (e) { got.push(e.data); };
+        </script></body></html>";
+    p.load_html_styled(&format!("http://127.0.0.1:{port}/page"), html, &[], true);
+    let doc = aether::js::broadcast::doc();
+    assert_eq!(run_until(&mut p, "got.length >= 3", "got.slice().sort().join(' ; ')", 20), "child:/w/child.js|kid ; csp:error ; xo:Event");
+    assert_eq!(aether::workers::dedicated::threads(doc), 2, "the parent and its child run");
+    eval(&mut p, "w.terminate();");
+    let end = Instant::now() + Duration::from_secs(5);
+    while aether::workers::dedicated::threads(doc) > 0 {
+        assert!(Instant::now() < end, "terminating the parent did not stop its child");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 3
+
+/// The ErrorEvent a worker error fires at the Worker is cancelable (HTML §10.2.5): canceled there, the
+/// Window never hears it; not canceled, it is reported again at the Window as a cancelable ErrorEvent. And
+/// `new MessageEvent(type, { ports })` from script carries its ports (a frozen array; a non-port throws).
+#[test]
+fn the_worker_error_event_is_cancelable_and_message_event_init_has_ports() {
+    let up = data_url("throw new Error('up');");
+    let kept = data_url("throw new Error('kept');");
+    let mut p = page(
+        PAGE,
+        &format!(
+            "var a = null, b = null, winA = 0, winB = null;
+             window.addEventListener('error', function (e) {{
+                 if (String(e.message).indexOf('up') >= 0) {{ winA++; }}
+                 if (String(e.message).indexOf('kept') >= 0) {{ winB = e.constructor.name + '|' + e.cancelable; e.preventDefault(); }}
+             }});
+             var w1 = new Worker('{up}'); w1.onerror = function (e) {{ a = e.cancelable + '|' + e.message; e.preventDefault(); }};
+             var w2 = new Worker('{kept}'); w2.onerror = function (e) {{ b = String(e.cancelable); }};
+             var ch = new MessageChannel();
+             var me = new MessageEvent('message', {{ data: 1, ports: [ch.port1] }});
+             var mp = [me.ports.length, me.ports[0] === ch.port1, Object.isFrozen(me.ports), new MessageEvent('x').ports.length, me.ports === me.ports].join('|');
+             var bad = 'none'; try {{ new MessageEvent('x', {{ ports: [{{}}] }}); }} catch (x) {{ bad = x.name; }}"
+        ),
+    );
+    assert_eq!(eval(&mut p, "mp"), "1|true|true|0|true", "MessageEventInit.ports");
+    assert_eq!(eval(&mut p, "bad"), "TypeError", "a non-MessagePort in ports");
+    assert_eq!(run_until(&mut p, "a !== null", "a", 20), "true|Uncaught Error: up");
+    assert_eq!(run_until(&mut p, "winB !== null", "winB + '|' + b", 20), "ErrorEvent|true|true", "not canceled at the Worker, the error reaches the Window");
+    spin(&mut p, 100);
+    assert_eq!(eval(&mut p, "winA"), "0", "canceled at the Worker, the Window never hears it");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 4
+
+/// IndexedDB, Web Locks and BroadcastChannel inside a worker run over the owner document's storage key: a
+/// record the worker writes is the document's to read, a lock the document holds queues the worker's request
+/// until it is released (the grant arrives at the worker's own inbox), and a BroadcastChannel of the same
+/// name carries messages both ways between the document and the worker.
+#[test]
+fn a_worker_shares_its_documents_storage() {
+    let port = server(|path| match path {
+        "/s/w.js" => Some((
+            "text/javascript",
+            "var bc = new BroadcastChannel('wk');
+             bc.onmessage = function (e) { postMessage('bc:' + e.data); };
+             onmessage = function (e) {
+                 if (e.data !== 'go') { return; }
+                 navigator.locks.request('L', function (lock) { postMessage('lock:' + lock.name + ':' + lock.mode); });
+                 navigator.locks.request('L2', function () { postMessage('lock2'); });
+                 var r = indexedDB.open('wdb', 1);
+                 r.onupgradeneeded = function () { r.result.createObjectStore('s'); };
+                 r.onsuccess = function () {
+                     var db = r.result;
+                     var tx = db.transaction('s', 'readwrite');
+                     tx.objectStore('s').put('from-worker', 'k');
+                     tx.oncomplete = function () { db.close(); bc.postMessage('from-worker'); postMessage('idb:done'); };
+                 };
+             };"
+                .into(),
+        )),
+        _ => None,
+    });
+    let mut p = page(
+        &format!("http://127.0.0.1:{port}/s/page"),
+        "var got = []; var release = null;
+         navigator.locks.request('L2', function () { return new Promise(function (res) { release = res; }); });
+         var pbc = new BroadcastChannel('wk');
+         pbc.onmessage = function (e) { got.push('page-bc:' + e.data); };
+         var w = new Worker('/s/w.js'); w.onmessage = function (e) { got.push(e.data); };
+         w.postMessage('go');",
+    );
+    run_until(&mut p, "got.indexOf('idb:done') >= 0 && got.indexOf('lock:L:exclusive') >= 0 && got.indexOf('page-bc:from-worker') >= 0", "got.join(',')", 20);
+    spin(&mut p, 100);
+    assert_eq!(eval(&mut p, "got.indexOf('lock2')"), "-1", "the document holds L2: the worker's request waits");
+    eval(&mut p, "release(); pbc.postMessage('hello');");
+    run_until(&mut p, "got.indexOf('lock2') >= 0 && got.indexOf('bc:hello') >= 0", "got.join(',')", 20);
+    eval(
+        &mut p,
+        "var v = null; var r2 = indexedDB.open('wdb', 1);
+         r2.onsuccess = function () { var q = r2.result.transaction('s').objectStore('s').get('k'); q.onsuccess = function () { v = q.result; }; };",
+    );
+    assert_eq!(run_until(&mut p, "v !== null", "v", 20), "from-worker", "the worker's record is in the document's database");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 5
+
+/// Rejection tracking in the worker realm: an unhandled rejection fires a cancelable PromiseRejectionEvent
+/// `unhandledrejection` at the worker global, and a handler attached later fires `rejectionhandled`.
+#[test]
+fn a_worker_fires_unhandledrejection_and_rejectionhandled() {
+    let w = data_url(
+        "self.addEventListener('unhandledrejection', function (e) {
+             postMessage('un:' + e.reason + ':' + (e.promise instanceof Promise) + ':' + e.cancelable + ':' + (e instanceof PromiseRejectionEvent));
+             e.preventDefault();
+             var p = e.promise;
+             setTimeout(function () { p.catch(function () {}); }, 0);
+         });
+         self.onrejectionhandled = function (e) { postMessage('handled:' + e.reason); };
+         Promise.reject('r1');",
+    );
+    let mut p = page(PAGE, &format!("var got = []; var w = new Worker('{w}'); w.onmessage = function (e) {{ got.push(e.data); }};"));
+    assert_eq!(run_until(&mut p, "got.length >= 2", "got.join(',')", 20), "un:r1:true:true:true,handled:r1");
 }

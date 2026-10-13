@@ -27,9 +27,10 @@
 //! buffer or an already shipped port throws DataCloneError), serializes through `js::broadcast`'s serializer
 //! with each transferred port as an index into the message's port list, then ships the ports and detaches the
 //! buffers. `__msg_fire` dispatches a MessageEvent with its `ports`: in the page through `js::net`'s trusted
-//! `__net_fire` (whose MessageEvent init has no `ports` member — `events.rs` is not this binding's file — so
-//! the ports ride a per-dispatch stash read by a `MessageEvent.prototype.ports` getter, recorded by a listener
-//! each port and Worker registers first), in a worker through that realm's own MessageEvent.
+//! `__net_fire`, whose MessageEvent init carries a `ports` member (a frozen array — `events.rs`'s
+//! MessageEventInit has it since AETHERWORKERS2, SR125, so `new MessageEvent(type, { ports })` from script
+//! carries its ports too and the per-dispatch stash is gone), in a worker through that realm's own
+//! MessageEvent.
 
 use super::idl::{arg, num};
 use js_core::vm::*;
@@ -221,7 +222,7 @@ pub const PRELUDE: &str = r#"
     var PAGE = typeof __net_fire === 'function';
     var TOKEN = {};
     var ST = new WeakMap(), BY_ID = new Map(), CH = new WeakMap();
-    var PORTS = new WeakMap(), CUR = null, EMPTY = Object.freeze([]);
+    var EMPTY = Object.freeze([]);
     var dce = function (m) { return new DOMException(m, 'DataCloneError'); };
     var tagOf = function (x) { return Object.prototype.toString.call(x).slice(8, -1); };
     var st = function (o) {
@@ -233,20 +234,14 @@ pub const PRELUDE: &str = r#"
     // ---- the MessageEvent a message task fires (with its ports)
     var fireMsg = function (t, type, data, origin, ports) {
         if (PAGE) {
-            CUR = Object.freeze(ports.slice());
-            try { return __net_fire(t, 'MessageEvent', type, { data: data, origin: origin }); }
-            finally { CUR = null; }
+            return __net_fire(t, 'MessageEvent', type, { data: data, origin: origin, ports: ports.length ? Object.freeze(ports.slice()) : EMPTY });
         }
         var e = new MessageEvent(type, { data: data, origin: origin, ports: ports });
         if (typeof __w_trust === 'function') { __w_trust(e); }
         return t.dispatchEvent(e);
     };
-    var stash = function (e) { if (CUR !== null && !PORTS.has(e)) { PORTS.set(e, CUR); } };
-    if (PAGE && typeof MessageEvent === 'function') {
-        Object.defineProperty(MessageEvent.prototype, 'ports', {
-            get: function () { return PORTS.get(this) || EMPTY; }, configurable: true, enumerable: true,
-        });
-    }
+    // Kept for callers that registered it before the stash went (a no-op listener).
+    var stash = function () {};
 
     // ---- StructuredSerializeWithTransfer (HTML §2.7.6) for every messaging binding
     var xferList = function (t, iface) {
@@ -325,7 +320,6 @@ pub const PRELUDE: &str = r#"
             super();
             ST.set(this, { id: id, started: false, closed: false, shipped: false, q: [], backlog: 0 });
             BY_ID.set(id, this);
-            EventTarget.prototype.addEventListener.call(this, 'message', stash);
         }
         postMessage(message, transfer) {
             var s = st(this);

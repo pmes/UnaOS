@@ -146,6 +146,10 @@ pub struct Vm {
     /// Instruction budget (fuzzing / watchdog); None = unlimited.
     pub budget: Option<u64>,
     pub terminated: bool,
+    /// A cross-thread interrupt (AETHERWORKERS2, SR125): another thread sets the flag and the running script
+    /// stops at its next instruction (or [`Vm::tick`]) the way an exhausted budget stops it — `terminated`
+    /// set, an uncatchable Err. The embedder owns the flag; None (the default) costs one branch.
+    pub interrupt: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
     pub kept_alive: Vec<Obj>,
     pub rng: u64,
     pub modules: Vec<(JsStr, Obj)>,
@@ -216,6 +220,7 @@ impl Vm {
             loop_now: 0.0,
             budget: None,
             terminated: false,
+            interrupt: None,
             kept_alive: Vec::new(),
             rng: seed | 1,
             modules: Vec::new(),
@@ -379,7 +384,23 @@ impl Vm {
             }
             *b -= 1;
         }
+        if self.interrupt_pending() {
+            return Err(self.interrupted());
+        }
         Ok(())
+    }
+
+    /// Whether the embedder's [`interrupt`](Vm::interrupt) flag is set.
+    #[inline]
+    pub fn interrupt_pending(&self) -> bool {
+        matches!(&self.interrupt, Some(f) if f.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The interrupt's termination: `terminated` set (no handler catches it), the error value to return.
+    #[cold]
+    pub fn interrupted(&mut self) -> Value {
+        self.terminated = true;
+        Value::str("execution interrupted")
     }
 
     /// RangeError when a string of `len` code units would exceed `max_string_len`.
