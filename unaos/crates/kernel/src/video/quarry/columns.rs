@@ -608,6 +608,8 @@ pub(super) fn paint_list(m: &Model, px: &mut [u32], li: Rect, lsb: usize, lvis: 
         if sel {
             let col = if m.focus == super::Pane::List { theme::accent() } else { theme::scroll_thumb() };
             fill(px, g, li.x, y, li.w - lsb, row_h, col);
+        } else if m.hover == super::Hover::List(i) {
+            super::hover_wash(px, g, li.x, y, li.w - lsb, row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
         }
         let ink = if sel && m.focus == super::Pane::List { theme::chrome_face() } else { theme::content_text() };
         let dir = matches!(ent.kind, NodeKind::Dir);

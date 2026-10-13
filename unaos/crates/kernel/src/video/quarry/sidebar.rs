@@ -40,6 +40,52 @@ static SIDE: crate::sync::Mutex<Vec<Ent>> = crate::sync::Mutex::new(Vec::new());
 static ROWS: AtomicUsize = AtomicUsize::new(10);
 /// The volume generation the rows were derived against. `u64::MAX` = never.
 static GEN: AtomicU64 = AtomicU64::new(u64::MAX);
+/// QUARRYHOVER (B647): the first row shown — the sidebar scrolls under the wheel when its rows outgrow its height
+/// (`h` is capped at half the panes'). Clamped at every read ([`scroll_of`]), so a re-derive needs no reset.
+static SCROLL: AtomicUsize = AtomicUsize::new(0);
+
+/// Rows the sidebar can show at this geometry (the painter's own cut-off: a row must fit whole).
+pub(super) fn vis(g: &Geom) -> usize {
+    h(g).saturating_sub(g.ts) / g.row_h().max(1)
+}
+
+/// The first row shown, clamped so the last page is full.
+fn scroll_of(g: &Geom) -> usize {
+    SCROLL.load(Ordering::Relaxed).min(ROWS.load(Ordering::Relaxed).saturating_sub(vis(g)))
+}
+
+/// The raw offset (the fixture saves it) and its restore.
+pub(super) fn scroll() -> usize {
+    SCROLL.load(Ordering::Relaxed)
+}
+pub(super) fn set_scroll(s: usize) {
+    SCROLL.store(s, Ordering::Relaxed);
+}
+
+/// QUARRYHOVER (B647): the wheel over the sidebar — one row a detent (QSCROLL's sign: positive = toward row 0).
+pub(super) fn wheel(m: &Model, detents: i32) -> super::WheelHit {
+    let g = &m.geom;
+    let max = ROWS.load(Ordering::Relaxed).saturating_sub(vis(g));
+    let cur = scroll_of(g);
+    let step = detents.unsigned_abs() as usize;
+    let next = if detents > 0 { cur.saturating_sub(step) } else { cur.saturating_add(step).min(max) };
+    SCROLL.store(next, Ordering::Relaxed);
+    super::WheelHit { pane: "sidebar", scroll: next, max, moved: next != cur }
+}
+
+/// QUARRYHOVER (B647): the row under surface `(sx, sy)` — a real row (never a header), by the press's arithmetic.
+pub(super) fn row_at(g: &Geom, sx: usize, sy: usize) -> Option<usize> {
+    let r = rect(g);
+    if !r.contains(sx, sy) || sy < r.y + g.ts {
+        return None;
+    }
+    let k = (sy - r.y - g.ts) / g.row_h().max(1);
+    if k >= vis(g) {
+        return None;
+    }
+    let i = k + scroll_of(g);
+    SIDE.lock().get(i).filter(|e| !e.path.is_empty()).map(|_| i)
+}
 
 /// The favorites, in the Finder's order: (label, path).
 pub(super) fn favorites() -> [(&'static str, String); 6] {
@@ -138,8 +184,9 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     fill(px, g, r.x, r.y + r.h - 1, r.w, 1, theme::frame_line());
     let row_h = g.row_h();
     let side = SIDE.lock();
-    for (i, e) in side.iter().enumerate() {
-        let y = r.y + g.ts + i * row_h;
+    let top = scroll_of(g); // QUARRYHOVER (B647): the rows above the offset are scrolled off
+    for (i, e) in side.iter().enumerate().skip(top) {
+        let y = r.y + g.ts + (i - top) * row_h;
         if y + row_h > r.y + r.h {
             break;
         }
@@ -150,6 +197,8 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
         let here = m.cwd == e.path;
         if here {
             fill(px, g, r.x + PAD() / 2, y, r.w - PAD(), row_h, theme::accent());
+        } else if m.hover == super::Hover::Side(i) {
+            super::hover_wash(px, g, r.x + PAD() / 2, y, r.w - PAD(), row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
         }
         let ink = if here {
             theme::chrome_face()
@@ -174,7 +223,7 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
     if !r.contains(sx, sy) {
         return None;
     }
-    let i = (sy.saturating_sub(r.y + g.ts)) / g.row_h();
+    let i = (sy.saturating_sub(r.y + g.ts)) / g.row_h() + scroll_of(&g); // QUARRYHOVER (B647): past the scrolled-off rows
     let Some(e) = SIDE.lock().get(i).cloned() else { return Some(Act::None) };
     if e.path.is_empty() {
         return Some(Act::None);
