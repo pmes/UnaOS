@@ -345,8 +345,8 @@ pub const BUDGETS: [(&str, u64, &str); 5] = [
 ];
 /// A step not in [`BUDGETS`] gets the held splash's bound.
 pub const DEFAULT_BUDGET_MS: u64 = 5000;
-/// How often an over-budget step repeats its OVER line (wire and panel).
-pub const OVER_EVERY_MS: u64 = 5000;
+/// How often an over-budget step repeats its OVER line on the wire (the panel repaints every [`PANEL_EVERY_MS`], RESOLVEHANG2).
+pub const OVER_EVERY_MS: u64 = 5000; pub const PANEL_EVERY_MS: u64 = 1000; static PANEL_NEXT: AtomicU64 = AtomicU64::new(0); // RESOLVEHANG2 (B531): the panel's OVER line is repainted every second with the live step's `last` sub-step — the glass is the only witness when the wire is not up
 /// The watchdog's look period.
 pub const WATCH_MS: u64 = 250;
 
@@ -498,11 +498,11 @@ pub fn poll() -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let now = crate::arch::ms();
     let mut due = [("", "", 0u64, 0u64, "", 0u64); LIVE_CAP];
-    let mut n = 0usize;
+    let mut n = 0usize; let mut pan: Option<(&'static str, &'static str, u64, u64, &'static str, u64)> = None; // RESOLVEHANG2 (B531): the innermost over-budget step, for the panel's 1 s line
     let any = {
         let Some(mut g) = LIVE.try_lock() else { return true };
         for l in g.iter_mut().filter(|l| !l.name.is_empty()) {
-            let el = now.saturating_sub(l.t0);
+            let el = now.saturating_sub(l.t0); if el >= l.budget { pan = Some((l.name, l.label, l.budget, el, l.last, io().since(l.io0).cmds())); } // RESOLVEHANG2 (B531): `last` read live on every look
             if el >= l.budget && now >= l.next_over {
                 if l.overs == 0 {
                     OVER_N.fetch_add(1, Relaxed);
@@ -515,9 +515,9 @@ pub fn poll() -> bool {
         }
         g.iter().any(|l| !l.name.is_empty())
     };
-    if n > 0 {
+    if let Some(d) = pan.filter(|_| n > 0 || now >= PANEL_NEXT.load(Relaxed)) { PANEL_NEXT.store(now + PANEL_EVERY_MS, Relaxed); // RESOLVEHANG2 (B531): every PANEL_EVERY_MS (and with every wire OVER), not every OVER_EVERY_MS
         // RESOLVEHANG (B524): the PANEL first, the wire second — a stepping task that wedged holding the serial sink would otherwise stop this look at its `serial_println!` before the glass ever shows the step. The panel's line: the innermost over step, in words under the splash's own word.
-        let d = due[n - 1];
+        // RESOLVEHANG2 (B531): `d` is `pan` — the innermost over-budget step as THIS look read it (its elapsed and `last` move every second on the glass)
         let mut ln = PanelLine { b: [0; 160], n: 0 };
         use core::fmt::Write;
         let _ = write!(

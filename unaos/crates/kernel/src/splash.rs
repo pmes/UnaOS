@@ -771,7 +771,7 @@ pub fn hold_open() {
     };
     let id = crate::video::wm::splash_open(addr, len, w, h);
     if id == crate::video::wm::WIN_NONE {
-        *HOLD_SURF.lock() = None;
+        *HOLD_SURF.lock() = None; #[cfg(all(target_arch = "x86_64", feature = "wc"))] PANEL_LIVE.store(false, Ordering::Release); // RESOLVEHANG2 (B531): no held row, no panel witness (it would paint over whatever the glass shows next)
         serial_println!("[splash] hold DECLINE reason=window-table");
         return;
     }
@@ -793,7 +793,7 @@ pub fn hold_release(by: &str) {
     let t_rel = crate::arch::ms();
     crate::video::wm::clear_modal_top(id);
     crate::video::wm::close(id);
-    *HOLD_SURF.lock() = None; // after the row is gone: nothing reads the surface any more
+    *HOLD_SURF.lock() = None; #[cfg(all(target_arch = "x86_64", feature = "wc"))] PANEL_LIVE.store(false, Ordering::Release); // after the row is gone: nothing reads the surface any more. RESOLVEHANG2 (B531): the panel witness ends HERE, after `wm::close` returned (HOLD_WIN went to 0 at this function's top, so a step hung inside the close is still painted by `over_panel`)
     OVER_UP.store(false, Ordering::Relaxed); crate::fs::bootstep::splash_released(by); // SPLASHSTALL (B510): the splash's waits (`store-wait`, `first-screen`) end with the glass
     crate::bootlog_println!(
         "[splash] held_ms={} released_by={} fade_ms={}",
@@ -806,7 +806,7 @@ pub fn hold_release(by: &str) {
 /// The 5 s bound: a store that never answers must not strand the splash. Polled from the device-service pass.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn hold_service() {
-    if HOLD_WIN.load(Ordering::Relaxed) != 0 && crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) >= 5000 {
+    if HOLD_WIN.load(Ordering::Relaxed) != 0 && crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) >= 5000 && !crate::fs::users::resolve_waiting() { // RESOLVEHANG2 (B531): not while stage-resolve waits (bounded, 8 s) for the console — the splash and its watchdog witness stay up through the step
         hold_release("timeout");
     }
 }
@@ -852,7 +852,7 @@ pub fn takeover_blit(fb: &crate::video::FrameBuffer) -> bool {
         fb.blit(y * pitch, &surf[y * row..(y + 1) * row]);
     }
     fb.flush_all();
-    HOLD_GLASS.store(true, Ordering::Relaxed);
+    HOLD_GLASS.store(true, Ordering::Relaxed); if !PANEL_SET.swap(true, Ordering::AcqRel) { unsafe { *PANEL.0.get() = *fb; } PANEL_LIVE.store(true, Ordering::Release); } // RESOLVEHANG2 (B531): THIS handle put the splash on the glass, so it is the one the watchdog paints through — kept once, read lock-free (SAFETY: written only here, once, before the Release store `over_panel` acquires)
     serial_println!(":: SPLASH: stage=takeover at_ms={} ::", crate::arch::ms());
     true
 }
@@ -932,7 +932,7 @@ pub fn step_label(text: &str) {
 
 /// Whether the OVER band is painted (the next step's word clears it).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-static OVER_UP: AtomicBool = AtomicBool::new(false);
+static OVER_UP: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL_LIVE: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL_SET: AtomicBool = AtomicBool::new(false); #[cfg(all(target_arch = "x86_64", feature = "wc"))] struct PanelSlot(core::cell::UnsafeCell<crate::video::FrameBuffer>); #[cfg(all(target_arch = "x86_64", feature = "wc"))] unsafe impl Sync for PanelSlot {} #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PANEL: PanelSlot = PanelSlot(core::cell::UnsafeCell::new(crate::video::FrameBuffer::new())); // RESOLVEHANG2 (B531): the takeover's panel handle (`takeover_blit`, written once) and whether the watchdog may paint through it (from the takeover until `hold_release` has closed the row)
 
 /// Whether the splash holds the glass (a held row is open) — the steps that are the splash's own waits
 /// (`store-wait`, `first-screen`) exist only while this is true.
@@ -958,9 +958,9 @@ fn over_band_clear(surf: &mut alloc::vec::Vec<u8>, w: usize, y0: usize, band_h: 
 /// Paint `text` as the OVER line under the step's word (or clear it with `""`), on the surface and the panel.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn over_label(text: &str) {
-    if HOLD_WIN.load(Ordering::Acquire) == 0 {
-        return;
-    }
+    // RESOLVEHANG2 (B531): the PANEL first and lock-free — flight 30's boot 2 held "Resolving the session" with no OVER line under it; the old panel write went through `WRITER.try_lock` and a geometry test against the surface, and nothing on the glass says which refused
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] over_panel(text);
+    if HOLD_WIN.load(Ordering::Acquire) == 0 { return; }
     let ch = crate::video::font::Face::Chrome.cell_h();
     let Some(mut g) = HOLD_SURF.try_lock() else { return };
     let Some((surf, w, h)) = g.as_mut() else { return };
@@ -986,22 +986,22 @@ pub fn over_label(text: &str) {
             put(surf, o, crate::video::font::blend(bg, crate::video::theme::painter::SPLASH_CAPTION_INK, a));
         });
     }
-    OVER_UP.store(!text.is_empty(), Ordering::Relaxed);
-    // Straight onto the panel: the same handle and geometry test `takeover_blit` uses. A busy handle skips
-    // this look (the next one, 5 s on, tries again); a compositor that is alive carries the surface anyway.
-    #[cfg(target_arch = "x86_64")]
-    if let Some(fbg) = crate::video::WRITER.try_lock() {
-        let fb = *fbg;
-        drop(fbg);
-        let i = fb.info();
-        if fb.is_ready() && i.bytes_per_pixel == 4 && i.width == w && i.height == h {
-            let (row, pitch) = (w * 4, i.stride * 4);
-            for y in y0..y0 + band_h {
-                fb.blit(y * pitch, &surf[y * row..(y + 1) * row]);
-            }
-            fb.flush_rect(0, y0, w, band_h);
-        }
-    }
+    OVER_UP.store(!text.is_empty(), Ordering::Relaxed); // the surface carries the line for a compositor that is alive; `over_panel` (above) put it on the glass already
+}
+
+/// RESOLVEHANG2 (rmbp-ledger B531) — the OVER line straight onto the panel, from the watchdog task, taking NOTHING:
+/// the takeover's own handle ([`PANEL`], kept once), the static bitmap face (`font::glyph`, compile-time rodata — no
+/// TrueType engine, no heap), a computed background (write-only VRAM is never read). Same band as the surface's.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn over_panel(text: &str) {
+    if !PANEL_LIVE.load(Ordering::Acquire) { return; }
+    let fb = unsafe { *PANEL.0.get() }; // SAFETY: written once in `takeover_blit` before the Release store acquired above, never again
+    let face = crate::video::font::Face::Chrome; let (cw, ch, w, h) = (face.cell_w(), face.cell_h(), fb.width(), fb.height()); let band_h = ch * 2;
+    if !fb.is_ready() || cw == 0 || w < cw || h < band_h * 4 { return; }
+    let y0 = h - band_h * 2; fb.fill_rect(0, y0, w, band_h, SPLASH_BG);
+    let n = text.len().min(w / cw); let (x0, ty) = ((w - n * cw) / 2, y0 + (band_h - ch) / 2);
+    for (i, &b) in text.as_bytes()[..n].iter().enumerate() { crate::video::font::draw_glyph_fb(&fb, b, x0 + i * cw, ty, crate::video::theme::painter::SPLASH_CAPTION_INK, SPLASH_BG, false, face); }
+    fb.flush_rect(0, y0, w, band_h);
 }
 
 /// SPLASHSTALL: builds without a compositor hold no glass.
