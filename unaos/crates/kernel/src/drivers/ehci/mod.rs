@@ -14223,11 +14223,11 @@ impl Controller {
                                     let mut hb = [0u8; TP_RAW2_HEX_MAX];
                                     serial_println!(":: TPRAW2: fingers={} bytes={} ::", report[WSP2_NFINGER_OFF], tp_hex_raw2(&mut hb, report));
                                 }
-                                let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); { let l = e.tp.mt_last; finemotion::note(idx, true, (l.0, l.1), (l.2, l.3), (dx, dy), f.fingers); } // TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
+                                let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); { let l = e.tp.mt_last; finemotion::note(idx, true, (l.0, l.1), (l.2, l.3), (dx, dy), f.fingers); } if f.fingers > 0 && f.touch0 != 0 { finemotion::range_note(f.x0, f.y0); } // POINTERSCALE (B540): the live pad's position widens the range the one scale is derived from (LINE-NEUTRAL fold, code first). TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
                                 if wit {
                                     crate::bootlog_println!(
-                                        ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} curve={}/{}@{} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
-                                        idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, e.tp.mt_frames
+                                        ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} {} knee={} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units. POINTERSCALE (B540): the live range-derived scale
+                                        idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, finemotion::Scale, TP_MT_CURVE_KNEE, e.tp.mt_frames
                                     );
                                 }
                                 let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } crate::pointerfeel::note(now_ms, true, f.fingers > 0); // POINTERFEEL (B535): the vendor frame counted for `tests pointerfeel` (LINE-NEUTRAL append, code first). HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
@@ -17477,8 +17477,8 @@ struct TpCensus {
     raw2_done: bool,
     /// TPDRAG — two-finger `[tp] mt` witnesses emitted (bounded by `TP_2F_WITNESS_MAX`).
     mt_2f_wit: u8,
-    /// FINEMOTION (B496) — the curve's carried Q8 remainder per axis (`finemotion::step`); zeroed with `mt_prev`.
-    mt_res: (i32, i32),
+    /// FINEMOTION (B496) — the curve's carried Q8 remainder per axis (`finemotion::step2`); zeroed with `mt_prev`.
+    mt_res: (i32, i32), mt_ms: u64, // POINTERSCALE (B540): `mt_ms` = `arch::ms()` of the last touching frame, for `finemotion::is_jump`'s silence rule. LINE-NEUTRAL fold, code first.
     /// FINEMOTION — the last frame's raw delta and the Q8 pixels it added, `(rx, ry, qx, qy)`, for the `[ptr]` witness.
     mt_last: (i32, i32, i32, i32),
 }
@@ -17500,7 +17500,7 @@ impl TpCensus {
         mt_mover: 0,
         raw2_done: false,
         mt_2f_wit: 0,
-        mt_res: (0, 0),
+        mt_res: (0, 0), mt_ms: 0, // POINTERSCALE (B540). LINE-NEUTRAL fold, code first.
         mt_last: (0, 0, 0, 0),
     };
 
@@ -17540,7 +17540,7 @@ impl TpCensus {
     /// arm decodes, plus whether this frame carries the bounded `[tp] mt` witness. The delta is the
     /// primary finger's absolute motion since the previous touching frame, in sensor units 1:1 (the
     /// retired `mtraw_inject` path's scale; the gain is a glass question), y negated as wsp does
-    /// (direction `unverified`), clamped to `TP_MT_MAX_STEP`. A frame with no finger, or with
+    /// (direction `unverified`), no clamp — a JUMP re-baselines (POINTERSCALE B540; was clamped to `TP_MT_MAX_STEP`). A frame with no finger, or with
     /// `touch_major == 0`, clears the baseline: the NEXT touch starts from where it lands. The button
     /// is `ibt`@15 (`unverified`), mapped to the 0x02 arm's bit 0 so `note_buttons` sees one shape.
     fn mt_step(&mut self, f: Wsp2Frame) -> (u8, i32, i32, bool) {
@@ -17555,7 +17555,7 @@ impl TpCensus {
             self.mt_prev1 = None;
             self.mt_mover = 0;
         } else {
-            let p0 = (f.x0, -f.y0);
+            let p0 = (f.x0, -f.y0); let now_ms = crate::arch::ms(); let gap_ms = now_ms.saturating_sub(self.mt_ms); self.mt_ms = now_ms; // POINTERSCALE (B540): the silence since the last touching frame (a stream hole, or a re-touch whose lift frame never came). LINE-NEUTRAL fold, code first.
             let two = f.fingers >= 2 && f.touch1 != 0;
             let was_two = self.mt_prev1.is_some();
             let mut prev = self.mt_prev;
@@ -17583,10 +17583,10 @@ impl TpCensus {
                 self.mt_prev1 = None;
             }
             if let Some((px, py)) = prev {
-                let (rx, ry) = ((cur.0 - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP), (cur.1 - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP));
-                dx = finemotion::step(rx, &mut self.mt_res.0); // FINEMOTION (B496): TPSCALE's curve in Q8 with the remainder CARRIED — `tp_scale` floored every sub-divisor frame to 0 px, the dead zone of flight 27
-                dy = finemotion::step(ry, &mut self.mt_res.1);
-                self.mt_last = (rx, ry, finemotion::curve_q8(rx), finemotion::curve_q8(ry));
+                let (rx, ry) = (cur.0 - px, cur.1 - py); let jump = finemotion::is_jump((rx, ry), gap_ms); if jump { self.mt_res = (0, 0); } // POINTERSCALE (B540): NO per-axis clamp — `TP_MT_MAX_STEP` capped every frame at curve(128) = 37.67 px (flight 32's `[tp] mt dx=±37/38`) and bent a fast diagonal; a JUMP (quarter-range step, or the first frame after a silence) re-baselines instead
+                let ((ox, oy), (qx, qy)) = if jump { ((0, 0), (0, 0)) } else { finemotion::step2((rx, ry), &mut self.mt_res) }; dx = ox; // FINEMOTION (B496): the curve in Q8 with the remainder CARRIED — `tp_scale` floored every sub-divisor frame to 0 px, the dead zone of flight 27. POINTERSCALE (B540): ONE curve on the vector magnitude, one gain on both legs (flight 32's `in=-18,-51 scaled=-2.25,-12.00` was x below the knee, y above it)
+                dy = oy;
+                if !jump { self.mt_last = (rx, ry, qx, qy); }
             }
             self.mt_prev = Some(p0);
         }
@@ -17819,7 +17819,7 @@ unsafe fn tpframe_selftest() {
     let seq: [&[u8]; 7] = [&F2, &F3, &F4, &down, &F4, &lift, &F2];
     let want_raw: [(u8, i32, i32); 7] = // the corpus's RAW sensor deltas (flight 12's frames), the fixture's truth
         [(0, 0, 0), (0, -30, -12), (0, -3, -5), (1, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)];
-    let want: [(u8, i32, i32); 7] = { let mut r = (0, 0); core::array::from_fn(|k| { if k == 5 { r = (0, 0); } (want_raw[k].0, finemotion::step(want_raw[k].1, &mut r.0), finemotion::step(want_raw[k].2, &mut r.1)) }) }; // TPSCALE (B214): `mt_step` now returns PIXELS — raw/8 toward zero (-30/-12 -> -3/-1, -3/-5 -> 0/0); the witness `d=` prints what the router takes
+    let want: [(u8, i32, i32); 7] = { let mut r = (0, 0); core::array::from_fn(|k| { if k == 5 { r = (0, 0); } let (o, _) = finemotion::step2((want_raw[k].1, want_raw[k].2), &mut r); (want_raw[k].0, o.0, o.1) }) }; // POINTERSCALE (B540): the vector curve, as `mt_step` now applies it. // TPSCALE (B214): `mt_step` now returns PIXELS — raw/8 toward zero (-30/-12 -> -3/-1, -3/-5 -> 0/0); the witness `d=` prints what the router takes
 
     let mut c = TpCensus::EMPTY;
     c.latched = true;

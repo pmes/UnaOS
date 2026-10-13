@@ -24,7 +24,11 @@
 //!   over the longest login gap and the `usb-pump` step in flight when it ended (`hid_gap_holder=` on the `[login] key
 //!   latency` line, [`LoginGapHolder`]).
 //!
-//! Writers: [`note`] and [`note_login_gap`] run on the `hid-pump` only (one writer), so every field is a relaxed atomic.
+//! * POINTERSCALE (rmbp-ledger B540): the vendor lane's ONE scale and the window's CARRIED share ([`note_fine`], from
+//!   `drivers/ehci/finemotion.rs`) — `scale=<units per px>u/px range=<span> carried=<reports that moved nothing>/<reports
+//!   with motion>` on the verdict line, so the glass reading of "slow motion is swallowed" is a number.
+//!
+//! Writers: [`note`], [`note_fine`] and [`note_login_gap`] run on the `hid-pump` only (one writer), so every field is a relaxed atomic.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
@@ -59,6 +63,12 @@ static GAP_MAX_STEP: AtomicU32 = AtomicU32::new(0);
 /// The first [`GAP_LOG`] gaps: `at_ms << 24 | gap_ms (≤ 2^16-1) << 8 | step`, and their holder `(ix + 1) << 32 | held_ms`.
 static GAP_AT: [AtomicU64; GAP_LOG] = [const { AtomicU64::new(0) }; GAP_LOG];
 static GAP_WHO: [AtomicU64; GAP_LOG] = [const { AtomicU64::new(0) }; GAP_LOG];
+
+/// POINTERSCALE: the window's motion reports, those whose travel stayed in the sub-pixel carry, and the scale.
+static FINE_N: AtomicU32 = AtomicU32::new(0);
+static FINE_CARRIED: AtomicU32 = AtomicU32::new(0);
+static FINE_DIV_Q8: AtomicU32 = AtomicU32::new(0);
+static FINE_SPAN: AtomicU32 = AtomicU32::new(0);
 
 static REASSERTS: AtomicU32 = AtomicU32::new(0);
 static REASSERT_LATCHED: AtomicU32 = AtomicU32::new(0);
@@ -118,6 +128,34 @@ pub fn note(now: u64, vendor: bool, down: bool) {
         GAP_MAX_MS.store(gap, Relaxed);
         GAP_MAX_WHO.store(who, Relaxed);
         GAP_MAX_STEP.store(step as u32, Relaxed);
+    }
+}
+
+/// POINTERSCALE (B540): one vendor-lane report WITH motion (`drivers/ehci/finemotion.rs`' `note`) — `carried` = it put
+/// no whole pixel out, its travel stayed in the sub-pixel remainder; `div_q8` / `span` = the scale it ran at.
+/// Counted only inside an open window (after the first touch), like [`note`].
+#[inline]
+pub fn note_fine(carried: bool, div_q8: i32, span: i32) {
+    if !ARMED.load(Relaxed) || START_MS.load(Relaxed) == 0 {
+        return;
+    }
+    FINE_N.fetch_add(1, Relaxed);
+    if carried {
+        FINE_CARRIED.fetch_add(1, Relaxed);
+    }
+    FINE_DIV_Q8.store(div_q8.max(0) as u32, Relaxed);
+    FINE_SPAN.store(span.max(0) as u32, Relaxed);
+}
+
+/// `scale=<u/px>u/px range=<span> carried=<c>/<n>` — the window's scale and carried share (`-` before any motion).
+struct FineWord;
+impl core::fmt::Display for FineWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (n, c, d) = (FINE_N.load(Relaxed), FINE_CARRIED.load(Relaxed), FINE_DIV_Q8.load(Relaxed));
+        if n == 0 {
+            return f.write_str("scale=- carried=0/0");
+        }
+        write!(f, "scale={}.{:02}u/px range={} carried={}/{} carried_pct={}", d / 256, (d % 256) * 100 / 256, FINE_SPAN.load(Relaxed), c, n, c * 100 / n)
     }
 }
 
@@ -230,7 +268,7 @@ fn run() {
     START_MS.store(0, Relaxed);
     LAST_MS.store(0, Relaxed);
     PREV_DOWN.store(false, Relaxed);
-    for c in [&REPORTS, &MT, &LEGACY, &GAPS] {
+    for c in [&REPORTS, &MT, &LEGACY, &GAPS, &FINE_N, &FINE_CARRIED, &FINE_DIV_Q8, &FINE_SPAN] {
         c.store(0, Relaxed);
     }
     GAP_MAX_MS.store(0, Relaxed);
@@ -273,8 +311,8 @@ fn report() {
     let gmax = GAP_MAX_MS.load(Relaxed);
     let worst = if gaps == 0 { None } else { Some(Holder(GAP_MAX_WHO.load(Relaxed), 0, GAP_MAX_STEP.load(Relaxed) as u8)) };
     serial_println!(
-        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} via=tests",
-        n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, WorstWord(worst), if mt > leg { "mt" } else { "legacy" },
+        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} via=tests",
+        n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, WorstWord(worst), if mt > leg { "mt" } else { "legacy" }, FineWord,
         if verdict(n, gaps, mt, leg) { "PASS" } else { "FAIL" }, BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
         REASSERT_LATCHED.load(Relaxed), fr, fr_worst, LOGIN_GAP_MS.load(Relaxed), LoginGapHolder
     );
