@@ -332,3 +332,115 @@ fn terminate_interrupts_a_loop_that_calls_nothing() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 2
+
+/// (path, `Sec-Fetch-Dest`) of every request [`recording_server`] answered.
+static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// [`server`] that also records each request's path and `Sec-Fetch-Dest` header in [`SEEN`].
+fn recording_server(route: fn(&str) -> Option<(&'static str, String)>) -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut tmp) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split(' ').nth(1).unwrap_or("/").split('?').next().unwrap_or("/").to_string();
+                let dest = head
+                    .lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("sec-fetch-dest")).map(|(_, v)| v.trim().to_string()))
+                    .unwrap_or_default();
+                SEEN.lock().unwrap().push((path.clone(), dest));
+                let (status, ctype, body) = match route(&path) {
+                    Some((t, b)) => ("200 OK", t, b),
+                    None => ("404 Not Found", "text/plain", String::from("no")),
+                };
+                let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = c.flush();
+            });
+        }
+    });
+    port
+}
+
+fn seen_dest(port_path: &str) -> String {
+    SEEN.lock().unwrap().iter().rev().find(|(p, _)| p == port_path).map(|(_, d)| d.clone()).unwrap_or_else(|| "<not requested>".into())
+}
+
+/// The worker script is requested with destination `worker` (`Sec-Fetch-Dest: worker`), its `importScripts`
+/// with destination `script`; a script served as `text/html` is refused (HTML §10.2.4: not a JavaScript MIME
+/// type) — a simple `error` event at the Worker, and the console names the MIME type.
+#[test]
+fn a_worker_script_is_fetched_as_a_worker_and_must_be_javascript() {
+    let port = recording_server(|path| match path {
+        "/mime/ok.js" => Some(("text/javascript; charset=utf-8", "importScripts('lib2.js'); postMessage(lib2());".into())),
+        "/mime/lib2.js" => Some(("application/javascript", "function lib2() { return 'ran'; }".into())),
+        "/mime/html.js" => Some(("text/html", "postMessage('should not run');".into())),
+        _ => None,
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let mut p = page(
+        &format!("{origin}/mime/page"),
+        "var a = null, b = null;
+         var ok = new Worker('/mime/ok.js'); ok.onmessage = function (e) { a = e.data; };
+         var bad = new Worker('/mime/html.js');
+         bad.onmessage = function () { b = 'ran'; };
+         bad.onerror = function (e) { b = e.constructor.name + '|' + e.type; };",
+    );
+    assert_eq!(run_until(&mut p, "a !== null", "a", 20), "ran");
+    assert_eq!(run_until(&mut p, "b !== null", "b", 20), "Event|error", "a text/html worker script is a fetch failure");
+    assert_eq!(seen_dest("/mime/ok.js"), "worker", "Sec-Fetch-Dest of the worker script");
+    assert_eq!(seen_dest("/mime/lib2.js"), "script", "Sec-Fetch-Dest of importScripts");
+    let console = aether::js::console_lines();
+    assert!(console.iter().any(|(_, l)| l.contains("MIME type ('text/html')")), "the console names the refused MIME type: {console:?}");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS2 (SR125) item 6
+
+/// A worker creates workers: the child's URL resolves against the parent worker's location, its messages
+/// arrive at the parent's `Worker` object, a cross-origin child is a simple `error` at the parent, a `data:`
+/// child is refused by the document's CSP (`worker-src 'self'`) that the parent captured, and terminating the
+/// parent terminates the child.
+#[test]
+fn a_worker_creates_nested_workers_under_its_captured_context() {
+    let port = server(|path| match path {
+        "/w/parent.js" => Some((
+            "text/javascript",
+            "var c = new Worker('child.js', { name: 'kid' });
+             c.onmessage = function (e) { postMessage('child:' + e.data); };
+             var x = new Worker('http://elsewhere.invalid/x.js');
+             x.onerror = function (e) { postMessage('xo:' + e.constructor.name); };
+             var d = new Worker('data:text/javascript,postMessage(1)');
+             d.onmessage = function () { postMessage('csp:ran'); };
+             d.onerror = function (e) { postMessage('csp:' + e.type); };"
+                .into(),
+        )),
+        "/w/child.js" => Some(("text/javascript", "postMessage(location.pathname + '|' + name); setInterval(function () {}, 5);".into())),
+        _ => None,
+    });
+    init();
+    let mut p = aether::AetherEngine::new();
+    let html = "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"worker-src 'self'\"></head><body><script>
+        var got = []; var w = new Worker('/w/parent.js'); w.onmessage = function (e) { got.push(e.data); };
+        </script></body></html>";
+    p.load_html_styled(&format!("http://127.0.0.1:{port}/page"), html, &[], true);
+    let doc = aether::js::broadcast::doc();
+    assert_eq!(run_until(&mut p, "got.length >= 3", "got.slice().sort().join(' ; ')", 20), "child:/w/child.js|kid ; csp:error ; xo:Event");
+    assert_eq!(aether::workers::dedicated::threads(doc), 2, "the parent and its child run");
+    eval(&mut p, "w.terminate();");
+    let end = Instant::now() + Duration::from_secs(5);
+    while aether::workers::dedicated::threads(doc) > 0 {
+        assert!(Instant::now() < end, "terminating the parent did not stop its child");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

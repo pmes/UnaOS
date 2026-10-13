@@ -62,18 +62,8 @@ pub fn fetch_script_text(url: &str) -> Result<String, String> {
 /// `Referer` under the document's referrer policy, `Sec-Fetch-Dest: script`, per-hop mixed content, cookies
 /// under SameSite, CORS / CORP; `integrity` (SRI) is checked on the bytes before they become text.
 pub fn fetch_script(url: &str, module: bool, crossorigin: Option<&str>, integrity: &str) -> Result<String, String> {
-    if let Some(path) = url.strip_prefix("file://") {
-        let path = percent_decode(path.split(['?', '#']).next().unwrap_or(path));
-        return std::fs::read_to_string(&path).map_err(|e| format!("{url}: {e}"));
-    }
-    if let Some(rest) = url.strip_prefix("data:") {
-        let (meta, body) = rest.split_once(',').ok_or_else(|| format!("bad data URL {url}"))?;
-        if meta.ends_with(";base64") {
-            use base64::Engine as _;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(body.trim()).map_err(|e| e.to_string())?;
-            return String::from_utf8(bytes).map_err(|e| e.to_string());
-        }
-        return Ok(percent_decode(body));
+    if let Some(r) = local_script(url) {
+        return r.map(|(text, _)| text);
     }
     if url.starts_with("http://") || url.starts_with("https://") {
         let ctx = crate::security::RequestContext::for_script(module, crossorigin, integrity);
@@ -110,6 +100,110 @@ pub fn fetch_script(url: &str, module: bool, crossorigin: Option<&str>, integrit
         return r;
     }
     Err(format!("unsupported script URL scheme: {url}"))
+}
+
+/// A `file:` or `data:` script: Some((text, content type)) — the `data:` URL's MIME type, "" for a file —
+/// or None for any other scheme.
+fn local_script(url: &str) -> Option<Result<(String, String), String>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        let path = percent_decode(path.split(['?', '#']).next().unwrap_or(path));
+        return Some(std::fs::read_to_string(&path).map(|t| (t, String::new())).map_err(|e| format!("{url}: {e}")));
+    }
+    let rest = url.strip_prefix("data:")?;
+    let Some((meta, body)) = rest.split_once(',') else { return Some(Err(format!("bad data URL {url}"))) };
+    let ctype = meta.strip_suffix(";base64").unwrap_or(meta).to_string();
+    if meta.ends_with(";base64") {
+        use base64::Engine as _;
+        let r = base64::engine::general_purpose::STANDARD.decode(body.trim()).map_err(|e| e.to_string()).and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
+        return Some(r.map(|t| (t, ctype)));
+    }
+    Some(Ok((percent_decode(body), ctype)))
+}
+
+/// The JavaScript MIME type essences (MIME Sniffing §4.6), the set `js::loader`'s script-type check uses.
+pub const JS_MIME_ESSENCES: &[&str] = &[
+    "application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript",
+    "text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+    "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript",
+    "text/x-ecmascript", "text/x-javascript",
+];
+
+/// Whether a `Content-Type` value's essence is a JavaScript MIME type.
+pub fn is_javascript_mime(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    JS_MIME_ESSENCES.contains(&essence.as_str())
+}
+
+/// AETHERWORKERS2 (SR125): the page's request context for a worker script (page thread): HTML §10.2.4 "fetch
+/// a classic / module worker script" — destination `worker` (so `Sec-Fetch-Dest: worker` and CSP
+/// `worker-src` in [`RequestContext::check_hop`](crate::security::RequestContext::check_hop)), mode
+/// `same-origin`, credentials `same-origin`, the document as client and referrer. The worker thread keeps a
+/// clone (re-based on the worker's own URL) for its imports and its nested workers.
+pub fn worker_request_context() -> crate::security::RequestContext {
+    let mut ctx = crate::security::RequestContext::for_script(true, None, "");
+    ctx.destination = "worker".into();
+    ctx.mode = "same-origin".into();
+    ctx.credentials = "same-origin".into();
+    ctx
+}
+
+/// AETHERWORKERS2 (SR125): fetches a worker's script — or one script of its graph (`importScripts`, a module
+/// worker's imports) — under `ctx`, from any thread: (text, content type). `file:` and `data:` read locally;
+/// `http(s):` goes through the policed exchange with `ctx`'s destination, mode and credentials (precheck:
+/// same-origin mode, mixed content, CSP for the destination), and refuses a response whose MIME type is not
+/// a JavaScript MIME type (HTML §10.2.4 / §10.3.4.1: "if response's URL's scheme is an HTTP(S) scheme and the
+/// result of extracting a MIME type from response's header list is not a JavaScript MIME type", the fetch
+/// fails) — the error names the type. Refusals off the page thread queue for `security::drain`; the page
+/// caller drains.
+pub fn fetch_worker_script(url: &str, ctx: &crate::security::RequestContext) -> Result<(String, String), String> {
+    if let Some(r) = local_script(url) {
+        return r;
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("unsupported script URL scheme: {url}"));
+    }
+    let u = ctx.precheck(url, "GET")?;
+    let req = crate::api::fetch::HttpReq {
+        method: "GET".into(),
+        url: u,
+        headers: vec![("accept".into(), "*/*".into())],
+        body: Vec::new(),
+        redirect: "follow".into(),
+        timeout_ms: 10_000,
+    };
+    let ctx = ctx.clone();
+    std::thread::spawn(move || -> Result<(String, String), String> {
+        let ex = crate::api::fetch::policed_send(&req, &ctx)?;
+        let status = ex.resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(format!("HTTP {status} for {}", req.url));
+        }
+        let ctype = ex.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.clone()).unwrap_or_default();
+        if !is_javascript_mime(&ctype) {
+            let essence = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            return Err(crate::security::refusal(
+                "worker-script-mime",
+                &req.url,
+                &format!("Refused to execute script from '{}' because its MIME type ('{essence}') is not executable, and strict MIME type checking is enabled.", req.url),
+                None,
+            ));
+        }
+        let bytes = ex.resp.bytes().map_err(|e| e.to_string())?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(format!("{}: script larger than 4 MiB", req.url));
+        }
+        Ok((String::from_utf8_lossy(&bytes).into_owned(), ctype))
+    })
+    .join()
+    .map_err(|_| "fetch thread panicked".to_string())?
+}
+
+/// A refusal string (`security::ERR_PREFIX` message `\u{1}` event) as its message alone.
+pub fn refusal_message(e: &str) -> String {
+    match e.strip_prefix(crate::security::ERR_PREFIX) {
+        Some(rest) => rest.split('\u{1}').next().unwrap_or(rest).to_string(),
+        None => e.to_string(),
+    }
 }
 
 fn percent_decode(s: &str) -> String {

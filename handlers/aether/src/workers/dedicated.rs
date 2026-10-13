@@ -29,6 +29,15 @@
 //! event-loop drivers. While a worker has commands outstanding or a timer due within [`SOON_MS`], [`busy`]
 //! answers true and `event_loop::settle` waits on real time for it, as it does for network operations.
 //!
+//! # The worker's inbox and nested workers (AETHERWORKERS2, SR125)
+//! Each worker thread takes an inbox serial of its own from `js::broadcast::enter_worker`, in the documents'
+//! serial space: `js::broadcast::post(serial, kind, payload)` becomes a [`Cmd::Inbox`] task that runs the
+//! realm's `__inbox` dispatcher. Its nested workers post to it (`worker-message`, `worker-error` — a child's
+//! [`Spawn::owner`] is its parent's serial), and the realm runs `js::worker`'s own binding, whose spawn path
+//! reads [`creator`]: the worker's URL as the base and origin, its captured request context ([`rebase`]d
+//! from the creator's: the document's CSP, referrer policy and loader policy, the worker as client), the
+//! owner document's storage key. A worker that ends or is terminated terminates its children.
+//!
 //! # Errors and termination
 //! An uncaught exception (in the script, a task, a timer, a listener, a microtask) is reported: an ErrorEvent
 //! at the global (cancelable; `onerror(message, filename, lineno, colno, error)` returning true cancels), and if
@@ -67,6 +76,10 @@ pub enum Cmd {
     Message { data: String, ports: String },
     /// A message for one of the realm's MessagePorts (`js::ports`).
     Port { port: u64, data: String, ports: String },
+    /// A message for the realm's inbox (AETHERWORKERS2, SR125): its nested workers' `worker-message` /
+    /// `worker-error`, the storage family's grants and notices — whatever `js::broadcast::post` sends to the
+    /// worker's serial. Runs `__inbox(kind, payload)` as a task.
+    Inbox { kind: String, payload: String },
     Stop,
 }
 
@@ -80,8 +93,13 @@ pub enum Kind {
 /// Everything a worker thread starts from.
 pub struct Spawn {
     pub id: u64,
-    /// The owning document (its `js::broadcast` inbox serial).
+    /// The owning document (its `js::broadcast` inbox serial): the worker dies with it.
     pub doc: u64,
+    /// The inbox serial of the realm that created the worker — the document's, or the parent worker's for a
+    /// nested worker (AETHERWORKERS2, SR125): the worker's `worker-message` / `worker-error` go there.
+    pub owner: u64,
+    /// The parent worker of a nested worker (None: a document's worker); the child dies with it.
+    pub parent: Option<u64>,
     /// The script's URL (the worker's location; its origin is the worker's origin).
     pub url: String,
     pub kind: Kind,
@@ -92,6 +110,50 @@ pub struct Spawn {
     pub storage_key: String,
     /// The page's navigator snapshot (JSON) the WorkerNavigator mirrors.
     pub navigator: String,
+    /// The owner document's secure-context flag (Web Locks).
+    pub secure: bool,
+    /// The creating realm's request context, destination `worker` (`js::host::worker_request_context`, or the
+    /// parent worker's): the worker re-bases it on its own URL for `importScripts`, module imports and nested
+    /// workers — the page-thread facts (origin, CSP, referrer policy) a worker thread cannot read.
+    pub ctx: crate::security::RequestContext,
+}
+
+/// What `new Worker()` takes from the realm that calls it (HTML §10.2.6 "outside settings"): the document's
+/// facts on the page thread (`js::worker` builds them), the owning worker's captured ones on a worker thread.
+pub struct Creator {
+    /// The base URL the script URL resolves against (the document's, or the worker's location).
+    pub base: String,
+    pub doc: u64,
+    /// The creating realm's inbox serial.
+    pub owner: u64,
+    pub parent: Option<u64>,
+    pub storage_key: String,
+    pub secure: bool,
+    pub ctx: crate::security::RequestContext,
+}
+
+/// On a dedicated worker's thread: the worker's facts as the creator of a nested worker; None elsewhere.
+pub fn creator() -> Option<Creator> {
+    with_w(|w| Creator {
+        base: w.url.clone(),
+        doc: w.doc,
+        owner: w.serial,
+        parent: Some(w.id),
+        storage_key: w.storage_key.clone(),
+        secure: w.secure,
+        ctx: w.ctx.clone(),
+    })
+}
+
+/// A request context re-based on the worker as its client: the worker's URL is the client and the referrer,
+/// its origin the request's origin; the document's policies stay (a worker's own CSP header is not read).
+fn rebase(mut ctx: crate::security::RequestContext, url: &str) -> crate::security::RequestContext {
+    if ctx.has_page {
+        ctx.client_url = url.to_string();
+        ctx.client_origin = crate::security::origin::Origin::of(url);
+        ctx.referrer = Some(url.to_string());
+    }
+    ctx
 }
 
 struct Shared {
@@ -105,6 +167,7 @@ struct Shared {
 
 struct Handle {
     doc: u64,
+    parent: Option<u64>,
     tx: Sender<Cmd>,
     shared: Arc<Shared>,
 }
@@ -126,7 +189,7 @@ pub fn spawn(sp: Spawn) -> Result<(), String> {
     let (tx, rx) = channel::<Cmd>();
     let shared = Arc::new(Shared { kill: Arc::new(AtomicBool::new(false)), pending: AtomicUsize::new(1), timer_soon: AtomicBool::new(false) });
     let id = sp.id;
-    workers().insert(id, Handle { doc: sp.doc, tx, shared: shared.clone() });
+    workers().insert(id, Handle { doc: sp.doc, parent: sp.parent, tx, shared: shared.clone() });
     let r = std::thread::Builder::new().name("aether-dedicated-worker".into()).stack_size(8 << 20).spawn(move || worker_main(sp, rx, shared));
     if let Err(e) = r {
         workers().remove(&id);
@@ -159,7 +222,8 @@ pub fn deliver_port(id: u64, port: u64, data: &str, ports: &str) -> bool {
     send(id, Cmd::Port { port, data: data.to_string(), ports: ports.to_string() })
 }
 
-/// `worker.terminate()`: nothing more is delivered either way; the thread stops at its next checkpoint.
+/// `worker.terminate()`: nothing more is delivered either way; the running script is interrupted at its next
+/// instruction (`Vm::interrupt`); the worker's nested workers terminate with it.
 pub fn terminate(id: u64) {
     let h = workers().remove(&id);
     if let Some(h) = h {
@@ -167,6 +231,15 @@ pub fn terminate(id: u64) {
         let _ = h.tx.send(Cmd::Stop);
     }
     crate::js::ports::owner_gone(crate::js::ports::Owner::Worker(id));
+    terminate_children(id);
+}
+
+/// HTML §10.2.3: a worker whose owner set empties is terminated — the nested workers of `parent`.
+fn terminate_children(parent: u64) {
+    let ids: Vec<u64> = workers().iter().filter(|(_, h)| h.parent == Some(parent)).map(|(id, _)| *id).collect();
+    for id in ids {
+        terminate(id);
+    }
 }
 
 /// The document went away: its workers terminate.
@@ -204,6 +277,14 @@ pub fn threads(doc: u64) -> usize {
 struct WState {
     id: u64,
     doc: u64,
+    /// This worker's own inbox serial (`js::broadcast::enter_worker`).
+    serial: u64,
+    /// The creating realm's inbox serial.
+    owner: u64,
+    storage_key: String,
+    secure: bool,
+    /// The request context re-based on this worker ([`rebase`]).
+    ctx: crate::security::RequestContext,
     url: String,
     kind: Kind,
     shared: Arc<Shared>,
@@ -254,6 +335,8 @@ fn str_arg(vm: &mut Vm, c: &CallCtx, i: usize) -> JsResult<String> {
 struct WorkerHost {
     url: String,
     modules: usize,
+    /// The worker's request context: module imports go out as `cors` requests of destination `worker`.
+    ctx: crate::security::RequestContext,
 }
 
 impl Host for WorkerHost {
@@ -265,7 +348,8 @@ impl Host for WorkerHost {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| (d.as_secs_f64() * 1000.0).floor()).unwrap_or(0.0)
     }
     /// A module worker's static and dynamic imports: resolved against the importing module (bare specifiers
-    /// refuse — a worker has no import map), fetched through the script loader (`js::host::fetch_script`).
+    /// refuse — a worker has no import map), fetched under the worker's request context (destination
+    /// `worker`, mode `cors`, a JavaScript MIME type required: `js::host::fetch_worker_script`).
     fn load_module(&mut self, referrer: Option<&str>, specifier: &str) -> Result<(String, String), String> {
         let base = referrer.unwrap_or(&self.url).to_string();
         let bare = !(specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../") || specifier.contains(':'));
@@ -277,7 +361,9 @@ impl Host for WorkerHost {
         if self.modules > MODULE_CAP {
             return Err(format!("module fetch cap reached loading {resolved}"));
         }
-        let src = crate::js::host::fetch_script(&resolved, true, None, "")?;
+        let mut ctx = self.ctx.clone();
+        ctx.mode = "cors".into();
+        let (src, _) = crate::js::host::fetch_worker_script(&resolved, &ctx).map_err(|e| crate::js::host::refusal_message(&e))?;
         Ok((resolved, src))
     }
 }
@@ -287,8 +373,8 @@ fn post_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     checkpoint_kill(vm)?;
     let data = str_arg(vm, c, 0)?;
     let ports = str_arg(vm, c, 1)?;
-    let (id, doc) = with_w(|w| (w.id, w.doc)).unwrap_or((0, 0));
-    crate::js::broadcast::post(doc, "worker-message", json!({ "id": id, "data": data, "ports": ports }).to_string());
+    let (id, owner) = with_w(|w| (w.id, w.owner)).unwrap_or((0, 0));
+    crate::js::broadcast::post(owner, "worker-message", json!({ "id": id, "data": data, "ports": ports }).to_string());
     Ok(Value::Undefined)
 }
 
@@ -299,14 +385,23 @@ fn close_native(vm: &mut Vm, _c: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
-/// `__w_import(url)`: one script of `importScripts` — fetched synchronously and run in the realm. A failed
-/// fetch answers its message (the prelude throws the NetworkError DOMException in the realm's own class).
+/// `__w_import(url)`: one script of `importScripts` — fetched synchronously under the worker's request context
+/// (destination `script`, mode `no-cors`, a JavaScript MIME type required — HTML §10.3.4.1) and run in the
+/// realm. A failed fetch answers its message (the prelude throws the NetworkError DOMException in the realm's
+/// own class).
 fn import_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     checkpoint_kill(vm)?;
     let url = str_arg(vm, c, 0)?;
-    let src = match crate::js::host::fetch_script(&url, false, None, "") {
-        Ok(t) => t,
-        Err(e) => return Ok(s(&format!("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '{url}' failed to load: {e}"))),
+    let mut ctx = with_w(|w| w.ctx.clone()).unwrap_or_else(crate::security::RequestContext::none);
+    ctx.destination = "script".into();
+    ctx.mode = "no-cors".into();
+    ctx.credentials = "include".into();
+    let src = match crate::js::host::fetch_worker_script(&url, &ctx) {
+        Ok((t, _)) => t,
+        Err(e) => {
+            let e = crate::js::host::refusal_message(&e);
+            return Ok(s(&format!("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '{url}' failed to load: {e}")));
+        }
     };
     vm.run_script_str(&src)?;
     checkpoint_kill(vm)?;
@@ -361,7 +456,7 @@ fn report(vm: &mut Vm, err: &Value, src: Option<&str>) {
     }
     let text = vm.error_string(err);
     let msg = format!("Uncaught {text}");
-    let (url, kind, id, doc) = with_w(|w| (w.url.clone(), w.kind, w.id, w.doc)).unwrap_or((String::new(), Kind::Classic, 0, 0));
+    let (url, kind, id, owner) = with_w(|w| (w.url.clone(), w.kind, w.id, w.owner)).unwrap_or((String::new(), Kind::Classic, 0, 0));
     let (mut line, mut col) = (0u32, 0u32);
     if let (Some(src), true) = (src, text.starts_with("SyntaxError")) {
         let u: Vec<u16> = src.encode_utf16().collect();
@@ -388,7 +483,7 @@ fn report(vm: &mut Vm, err: &Value, src: Option<&str>) {
     }
     if not_canceled {
         eprintln!("[aether-worker] {msg} ({url}:{line}:{col})");
-        crate::js::broadcast::post(doc, "worker-error", json!({ "id": id, "message": msg, "filename": url, "lineno": line, "colno": col }).to_string());
+        crate::js::broadcast::post(owner, "worker-error", json!({ "id": id, "message": msg, "filename": url, "lineno": line, "colno": col }).to_string());
     }
 }
 
@@ -407,9 +502,9 @@ fn task(vm: &mut Vm, src: Option<&str>, f: impl FnOnce(&mut Vm) -> JsResult<()>)
                 if !killed() {
                     let m = vm.error_string(&e);
                     eprintln!("[aether-worker] task terminated: {m}");
-                    let (id, doc, url) = with_w(|w| (w.id, w.doc, w.url.clone())).unwrap_or((0, 0, String::new()));
+                    let (id, owner, url) = with_w(|w| (w.id, w.owner, w.url.clone())).unwrap_or((0, 0, String::new()));
                     let msg = format!("Uncaught RangeError: the worker task was terminated ({m})");
-                    crate::js::broadcast::post(doc, "worker-error", json!({ "id": id, "message": msg, "filename": url, "lineno": 0, "colno": 0 }).to_string());
+                    crate::js::broadcast::post(owner, "worker-error", json!({ "id": id, "message": msg, "filename": url, "lineno": 0, "colno": 0 }).to_string());
                 }
                 return;
             }
@@ -429,13 +524,13 @@ fn task(vm: &mut Vm, src: Option<&str>, f: impl FnOnce(&mut Vm) -> JsResult<()>)
     }));
     if r.is_err() {
         // A binding bug must cost the worker, not the browser: the worker closes, the page hears an error.
-        let (id, doc, url) = with_w(|w| {
+        let (id, owner, url) = with_w(|w| {
             w.closing = true;
-            (w.id, w.doc, w.url.clone())
+            (w.id, w.owner, w.url.clone())
         })
         .unwrap_or((0, 0, String::new()));
         crate::ledger::record_js("worker-engine-panicked");
-        crate::js::broadcast::post(doc, "worker-error", json!({ "id": id, "message": "Uncaught Error: the worker's engine failed", "filename": url, "lineno": 0, "colno": 0 }).to_string());
+        crate::js::broadcast::post(owner, "worker-error", json!({ "id": id, "message": "Uncaught Error: the worker's engine failed", "filename": url, "lineno": 0, "colno": 0 }).to_string());
     }
 }
 
@@ -472,7 +567,8 @@ fn next_due(vm: &Vm) -> Option<f64> {
 
 /// Builds the DedicatedWorkerGlobalScope realm.
 fn build(sp: &Spawn, shared: &Shared) -> Vm {
-    let mut vm = Vm::new(Box::new(WorkerHost { url: sp.url.clone(), modules: 0 }));
+    let ctx = rebase(sp.ctx.clone(), &sp.url);
+    let mut vm = Vm::new(Box::new(WorkerHost { url: sp.url.clone(), modules: 0, ctx }));
     // terminate() interrupts the running script at its next instruction (js_core vm/interp.rs run_inner).
     vm.interrupt = Some(shared.kill.clone());
     js_core::builtins::host::install_host_globals(&mut vm);
@@ -504,6 +600,10 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
     if let Err(e) = vm.run_script_str(SCOPE) {
         eprintln!("[aether-worker] scope prelude failed: {}", vm.error_string(&e));
     }
+    // AETHERWORKERS2 (SR125): the inbox dispatcher and BroadcastChannel over this thread's serial, and `Worker`
+    // itself — a nested worker's spawn path reads this worker's captured facts (`creator`).
+    crate::js::broadcast::install_worker(&mut vm);
+    crate::js::worker::install(&mut vm);
     let info = json!({
         "url": sp.url,
         "name": sp.name,
@@ -522,7 +622,25 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
     *threads_map().entry(sp.doc).or_default() += 1;
     crate::js::ports::set_worker_owner(Some(sp.id));
     super::realm::enter(super::realm::RealmCtx { key: sp.storage_key.clone(), scope: String::new(), script_url: sp.url.clone() });
-    W.with(|w| *w.borrow_mut() = Some(WState { id: sp.id, doc: sp.doc, url: sp.url.clone(), kind: sp.kind, shared: shared.clone(), closing: false, start: Instant::now() }));
+    // The worker's own inbox serial: what `js::broadcast::post` sends to it becomes a `Cmd::Inbox` task here.
+    let my_id = sp.id;
+    let serial = crate::js::broadcast::enter_worker(Box::new(move |kind: &str, payload: String| send(my_id, Cmd::Inbox { kind: kind.to_string(), payload })));
+    W.with(|w| {
+        *w.borrow_mut() = Some(WState {
+            id: sp.id,
+            doc: sp.doc,
+            serial,
+            owner: sp.owner,
+            storage_key: sp.storage_key.clone(),
+            secure: sp.secure,
+            ctx: rebase(sp.ctx.clone(), &sp.url),
+            url: sp.url.clone(),
+            kind: sp.kind,
+            shared: shared.clone(),
+            closing: false,
+            start: Instant::now(),
+        })
+    });
     let mut vm = build(&sp, &shared);
     let (kind, url, source) = (sp.kind, sp.url.clone(), sp.source.clone());
     task(&mut vm, Some(&source), |vm| match kind {
@@ -551,6 +669,10 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 task(&mut vm, None, |vm| call_global(vm, "__port_deliver", &[Value::Number(port as f64), s(&data), s(&ports)]).map(|_| ()));
                 shared.pending.fetch_sub(1, Ordering::SeqCst);
             }
+            Ok(Cmd::Inbox { kind, payload }) => {
+                task(&mut vm, None, |vm| call_global(vm, "__inbox", &[s(&kind), s(&payload)]).map(|_| ()));
+                shared.pending.fetch_sub(1, Ordering::SeqCst);
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
         fire_due_timers(&mut vm);
@@ -565,6 +687,9 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
     }
     crate::js::ports::owner_gone(crate::js::ports::Owner::Worker(sp.id));
     crate::js::ports::set_worker_owner(None);
+    // Its nested workers lose their owner; its serial retires (connections, locks, channels).
+    terminate_children(sp.id);
+    crate::js::broadcast::leave_worker();
     W.with(|w| *w.borrow_mut() = None);
     let mut t = threads_map();
     if let Some(n) = t.get_mut(&sp.doc) {
@@ -793,6 +918,16 @@ const SCOPE: &str = r#"
             },
         });
     })();
+    // `__net_fire(target, iface, type, init, cancelable)`: the page binding's trusted-event helper, for the
+    // preludes both realms run (BroadcastChannel, IndexedDB, Web Locks, Worker). Defined after js::ports'
+    // prelude, which reads its absence as "a worker realm".
+    hide('__net_fire', function (t, iface, type, init, cancelable) {
+        var C = (typeof G[iface] === 'function' && G[iface].prototype instanceof Event) ? G[iface] : Event;
+        var d = {};
+        if (init !== null && typeof init === 'object') { for (var k in init) { d[k] = init[k]; } }
+        d.cancelable = !!cancelable;
+        return t.dispatchEvent(trusted(new C(String(type), d)));
+    });
     hide('self', G);
     hide('postMessage', function postMessage(message, transfer) {
         if (arguments.length < 1) { throw new TypeError("Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present."); }
