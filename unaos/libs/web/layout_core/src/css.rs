@@ -93,6 +93,12 @@ pub struct SpecifiedStyle<H: Host> {
     pub cursor: Option<&'static str>,
     /// AETHERGEN (SR71): the generated-content properties (css-content-3, css-lists-3).
     pub generated: GenStyle,
+    /// AETHERSTYLE3 (SR103): the `transition-*` and `animation-*` lists (`anim`), and the specified text of
+    /// every animatable property in cascade order — the before- and after-change values a transition runs
+    /// between, and the base value of an implicit keyframe.
+    pub transition: crate::anim::TransitionLists,
+    pub animation: crate::anim::AnimationLists,
+    pub animatable: Vec<(String, String)>,
 }
 
 /// The generated-content properties of one element or pseudo-element, as specified: `content`
@@ -396,6 +402,22 @@ impl<H: Host> SpecifiedStyle<H> {
 /// Values arrive as raw strings so function values (rgb()...) parse uniformly.
 pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
     let value = value.trim();
+    // AETHERSTYLE3 (SR103): transitions and animations (css-transitions-1, css-animations-1).
+    let unprefixed = prop
+        .strip_prefix("-webkit-")
+        .or_else(|| prop.strip_prefix("-moz-"))
+        .or_else(|| prop.strip_prefix("-o-"))
+        .unwrap_or(prop);
+    if unprefixed.starts_with("transition") || unprefixed.starts_with("animation") {
+        if !crate::anim::apply_declaration(unprefixed, value, style) && !is_neutral_keyword(value) {
+            H::record_css(&format!("{}-value:{}", unprefixed, clip(value)));
+        }
+        return;
+    }
+    if crate::anim::is_animatable(prop) {
+        style.animatable.retain(|(p, _)| p != prop);
+        style.animatable.push((prop.to_string(), value.to_string()));
+    }
     if is_length_property(prop) {
         // Kept in cascade order for the font-relative re-resolution.
         let list = style.paint.font_rel.get_or_insert_with(Vec::new);
@@ -2448,6 +2470,12 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis, aspect_ratio);
     merge_paint(&mut dst.paint, &src.paint);
+    dst.transition.merge(&src.transition);
+    dst.animation.merge(&src.animation);
+    for (p, v) in &src.animatable {
+        dst.animatable.retain(|(q, _)| q != p);
+        dst.animatable.push((p.clone(), v.clone()));
+    }
     let (d, g) = (&mut dst.generated, &src.generated);
     if g.content.is_some() { d.content = g.content.clone(); }
     if g.counter_reset.is_some() { d.counter_reset = g.counter_reset.clone(); }

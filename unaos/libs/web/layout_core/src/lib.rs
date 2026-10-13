@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub use taffy;
 
+pub mod anim;
 pub mod blockwidth;
 pub mod collapse;
 pub mod css;

@@ -571,6 +571,27 @@ impl AetherEngine {
         if js::take_mutated() {
             self.relayout();
         }
+        // AETHERSTYLE3 (SR103): CSS transitions and animations advance one frame on the shell's tick.
+        let frame = self.layout_tree.as_mut().map(css::animation_frame).unwrap_or(css::anim::Frame::Idle);
+        match frame {
+            css::anim::Frame::Relayout => self.relayout(),
+            css::anim::Frame::Repaint => {
+                self.damage_rects.push((0, 0, self.width, self.height));
+                self.needs_repaint = true;
+            }
+            css::anim::Frame::Idle => {}
+        }
+        let events = css::take_animation_events();
+        if !events.is_empty() {
+            if let (Some(tree), Some(js_engine)) = (self.layout_tree.as_ref(), self.js_engine.as_mut()) {
+                for e in events {
+                    let node = tree.node_map.values().find(|n| n.id() == *e.key()).cloned();
+                    if let Some(node) = node {
+                        js_engine.fire(&node, e.kind(), true);
+                    }
+                }
+            }
+        }
         self.sel_changed();
         // The focused field's caret blinks: repaint its box when the phase flips.
         if let Some(node) = self.editing_node() {
@@ -1825,6 +1846,7 @@ impl AetherEngine {
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         layout::forget_scroll(); // AETHERSTYLE3 (SR103): a new document's boxes start unscrolled
+        css::anim::reset(); // AETHERSTYLE3 (SR103): and nothing of the old one keeps animating
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
         // Focus never survives a navigation; the new document's first `autofocus` control that can

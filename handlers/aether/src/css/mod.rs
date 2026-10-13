@@ -5,6 +5,8 @@
 //! host's parse context (the cascade's viewport, the initial 16px font basis).
 
 use crate::layout::{AetherHost, LayoutTree};
+
+pub(crate) mod anim;
 use taffy::prelude::*;
 use taffy::style::{FlexDirection, LengthPercentage, LengthPercentageAuto};
 
@@ -156,7 +158,7 @@ fn ledger_rules(rules: &[css_core::stylesheet::CssRule]) {
             CssRule::LayerStatement(_) => {}
             CssRule::Import(_) => crate::ledger::record_css("at-rule:@import"),
             CssRule::FontFace(_) => {}
-            CssRule::Keyframes(_) => crate::ledger::record_css("at-rule:@keyframes"),
+            CssRule::Keyframes(_) => {} // AETHERSTYLE3 (SR103): run by `anim`
             CssRule::Container(_, inner) => ledger_rules(inner),
             CssRule::Other(a) => crate::ledger::record_css(&format!("at-rule:@{}", a.name.to_ascii_lowercase())),
         }
@@ -387,16 +389,31 @@ fn container_sizes(tree: &LayoutTree) -> ContainerSizes {
 /// cascaded again with those sizes (css-contain-3 §4: container rules apply against the containers' laid-out
 /// size; one round, so a rule that resizes its own container does not loop).
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
-    let Some(sizes) = apply_stylesheets_with(layout_tree, sheets, None) else { return };
-    let Some(root) = layout_tree.node_map.get(&layout_tree.root_node).cloned() else { return };
-    let (vw, vh) = layout_tree.viewport;
-    *layout_tree = crate::layout::build_tree(&root, vw, vh);
-    apply_stylesheets_with(layout_tree, sheets, Some(&sizes));
+    let mut round = apply_stylesheets_with(layout_tree, sheets, None);
+    if let Some(sizes) = round.containers.take() {
+        if let Some(root) = layout_tree.node_map.get(&layout_tree.root_node).cloned() {
+            let (vw, vh) = layout_tree.viewport;
+            *layout_tree = crate::layout::build_tree(&root, vw, vh);
+            round = apply_stylesheets_with(layout_tree, sheets, Some(&sizes));
+        }
+    }
+    // AETHERSTYLE3 (SR103): transitions start from the style change, animations follow the names, and the
+    // values running now are applied over the fresh layout.
+    anim::sync(layout_tree, &round.styles, round.keyframes);
+}
+
+/// What one cascade round hands back: the query-container sizes when a second round is due, each element's
+/// computed style and the document's `@keyframes`.
+#[derive(Default)]
+struct Round {
+    containers: Option<ContainerSizes>,
+    styles: std::collections::HashMap<html_core::NodeId, std::rc::Rc<SpecifiedStyle>>,
+    keyframes: Vec<(String, layout_core::anim::KeyframeSet)>,
 }
 
 /// One cascade + layout. With `containers` None, returns the query-container sizes when the sheets carry
 /// `@container` rules and the page has query containers (the caller's cue for the second round).
-fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], containers: Option<&ContainerSizes>) -> Option<ContainerSizes> {
+fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], containers: Option<&ContainerSizes>) -> Round {
     let t0 = std::time::Instant::now();
     let (vw, vh) = layout_tree.viewport;
     set_viewport(vw, vh);
@@ -435,7 +452,7 @@ fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], conta
     }
     let Some(any) = any else {
         STYLE_TIMING.with(|t| t.set((t0.elapsed(), std::time::Duration::ZERO)));
-        return None;
+        return Round::default();
     };
     let boxed: std::collections::HashSet<html_core::NodeId> = boxes.keys().copied().collect();
     // AETHERGEN (SR71): the rules that style ::marker, ::before and ::after, one hashed set each.
@@ -489,6 +506,13 @@ fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], conta
         c.clear();
         c.extend(styles.iter().filter_map(|(id, s)| s.cursor.map(|k| (*id, k))));
     });
+    let round_styles = styles.clone();
+    // the last `@keyframes` of each name wins (css-animations-1 §3)
+    let mut keyframes: Vec<(String, layout_core::anim::KeyframeSet)> = Vec::new();
+    for k in &rules.keyframes {
+        keyframes.retain(|(n, _)| *n != k.name);
+        keyframes.push((k.name.clone(), layout_core::anim::KeyframeSet::from_rule(k)));
+    }
     // AETHERGEN (SR71): counters, quotes and the ::marker/::before/::after boxes (layout::generated),
     // the generated boxes folded with their pseudo-element's cascaded style below like any other box.
     let generated = crate::layout::generated::generate(layout_tree, &any, &styles, &pseudo_styles, &boxes);
@@ -510,13 +534,24 @@ fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], conta
     // AETHERSTYLE3 (SR103): scroll containers keep their offsets across a relayout.
     crate::layout::restore_scroll(layout_tree);
     STYLE_TIMING.with(|t| t.set((t1 - t0, t1.elapsed())));
+    let mut round = Round { containers: None, styles: round_styles, keyframes };
     if containers.is_none() && rules.has_container_rules() {
         let sizes = container_sizes(layout_tree);
         if !sizes.is_empty() {
-            return Some(sizes);
+            round.containers = Some(sizes);
         }
     }
-    None
+    round
+}
+
+/// AETHERSTYLE3 (SR103): one animation frame (`anim::frame`) — the engine repaints or relayouts on its answer.
+pub(crate) fn animation_frame(tree: &mut LayoutTree) -> anim::Frame {
+    anim::frame(tree)
+}
+
+/// AETHERSTYLE3 (SR103): the transition / animation events queued since the last call.
+pub(crate) fn take_animation_events() -> Vec<layout_core::anim::AnimEvent<html_core::NodeId>> {
+    anim::take_events()
 }
 
 thread_local! {
@@ -785,6 +820,10 @@ fn property_supported(prop: &str) -> bool {
             | "column-rule-width" | "column-rule-style" | "column-rule-color"
             | "writing-mode" | "text-orientation"
             | "container" | "container-type" | "container-name" | "contain"
+            | "transition" | "transition-property" | "transition-duration" | "transition-timing-function"
+            | "transition-delay" | "transition-behavior" | "animation" | "animation-name" | "animation-duration"
+            | "animation-timing-function" | "animation-delay" | "animation-iteration-count"
+            | "animation-direction" | "animation-fill-mode" | "animation-play-state"
     )
 }
 
