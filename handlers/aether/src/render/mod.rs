@@ -2590,6 +2590,8 @@ pub fn render_frame(
             walk_inh(layout, node_id, root_inh, false, &mut inh, &mut skip);
             // AETHERSELECT: the selected part of each text fragment (empty without a selection).
             let sel_plan = crate::selection::plan_ifc(layout, node_id);
+            // AETHERDEBT SR93: every find-in-page match, highlighted behind its text.
+            let mark_plan = crate::selection::plan_marks(layout, node_id);
             for (fi, frag) in ifc.frags.iter().enumerate() {
                 match frag {
                     crate::layout::inline::Frag::Box { node, x, y, w, h, first, last } => {
@@ -2702,6 +2704,23 @@ pub fn render_frame(
                             t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox, w: fw, top: ltop, bottom: lbot, adv, scroll: (sx, sy) })
                         });
                         let deco = Deco { underline: i.underline, line_through: i.line_through };
+                        if let Some(marks) = mark_plan.get(&fi) {
+                            for &(m0, m1) in marks {
+                                let (hx0, hx1) = (
+                                    (ox + crate::selection::caret_x(&adv, text, m0)).round(),
+                                    (ox + crate::selection::caret_x(&adv, text, m1)).round(),
+                                );
+                                let (ax, ay) = (hx0.max(child_clip.0).max(0.0) as u32, ltop.max(child_clip.1).max(0.0) as u32);
+                                let (bx, by1) = ((hx1.min(child_clip.2).max(0.0) as u32).min(width), (lbot.min(child_clip.3).max(0.0) as u32).min(height));
+                                for yy in ay..by1 {
+                                    for xx in ax..bx {
+                                        if in_damage(xx, yy, damage_rects) {
+                                            blend_px(surface, width, xx, yy, crate::selection::FIND_MARK, 255);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         match sel_plan.get(&fi) {
                             None => {
                                 draw_glyph_run(text, ox, by, &adv, i.color, deco, i.shadows(layout), surface, width, height, damage_rects, child_clip);

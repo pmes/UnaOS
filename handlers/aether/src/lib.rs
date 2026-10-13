@@ -100,7 +100,8 @@ pub struct AetherEngine {
     /// Find in page: the bar's state, and every hit as (text node, UTF-16 start, end) for the layout
     /// epoch `find_epoch` it was searched in.
     find: chrome::find::FindState,
-    find_hits: Vec<(usize, u32, u32)>,
+    /// Each hit as (start node, UTF-16 offset, end node, UTF-16 offset): a hit may span text nodes.
+    find_hits: Vec<(usize, u32, usize, u32)>,
     find_epoch: u64,
 }
 
@@ -1424,15 +1425,23 @@ impl AetherEngine {
 
     /// Find in page (Ctrl+F): a new `query` searches every rendered text run ([`chrome::find`]); the
     /// same query again steps to the next (`forward`) or previous hit, wrapping. The active hit becomes
-    /// the selection — painted with the selection highlight — and is scrolled into view. Returns
-    /// `(matches, current)` (1-based; 0 = none). A hit is within one text node (a match spanning an
-    /// element boundary, `<b>un</b>a`, is not found).
+    /// the selection — painted with the selection highlight — and is scrolled into view; every hit is
+    /// marked (`selection::set_find_marks`, painted yellow behind its text). Returns `(matches,
+    /// current)` (1-based; 0 = none). AETHERDEBT SR93: a hit may span element boundaries inside one
+    /// block (`<b>un</b>a` finds "una"), over the text with its white space collapsed.
     pub fn find(&mut self, query: &str, forward: bool) -> (u32, u32) {
         let cur = if self.find.is_repeat(query) && self.find_epoch == self.layout_epoch {
             self.find.step(forward)
         } else {
             self.find_hits = self.collect_find_hits(query);
             self.find_epoch = self.layout_epoch;
+            let marks = self
+                .find_hits
+                .iter()
+                .map(|&(n0, a, n1, b)| (selection::Point { node: n0, offset: a }, selection::Point { node: n1, offset: b }))
+                .collect();
+            selection::set_find_marks(marks);
+            self.sel_changed();
             self.find.begin(query, self.find_hits.len(), forward)
         };
         if let Some(i) = cur {
@@ -1445,21 +1454,37 @@ impl AetherEngine {
     pub fn find_close(&mut self) {
         if self.find.current.is_some() {
             selection::set(None);
-            self.sel_changed();
         }
+        selection::set_find_marks(Vec::new());
+        self.sel_changed();
         self.find.clear();
         self.find_hits.clear();
     }
 
-    fn collect_find_hits(&self, query: &str) -> Vec<(usize, u32, u32)> {
+    /// Every hit of `query` in the rendered text (AETHERDEBT SR93). The findable text nodes (those a box
+    /// was laid out for, outside script/style/…) are joined in tree order into one haystack per block —
+    /// a text node whose nearest block-level ancestor differs from the previous one starts after a line
+    /// break no query matches — with runs of white space collapsed to one space, so a match can span
+    /// inline elements and source line breaks; each match maps back to DOM boundary points.
+    fn collect_find_hits(&self, query: &str) -> Vec<(usize, u32, usize, u32)> {
         let mut out = Vec::new();
         let (Some(doc), Some(layout)) = (self.document.clone(), self.layout_tree.as_ref()) else { return out };
+        let query: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
         if query.is_empty() {
             return out;
         }
+        const INLINE: &[&str] = &[
+            "a", "abbr", "b", "bdi", "bdo", "big", "cite", "code", "data", "del", "dfn", "em", "font", "i", "ins", "kbd",
+            "label", "mark", "q", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "time", "tt", "u", "var",
+        ];
         // Only text a box was laid out for is findable (display:none subtrees have no box).
         let boxed: std::collections::HashSet<usize> = layout.node_map.values().map(|n| n.id().0).collect();
         let root = doc.select_first("body").map(|b| b.as_node().clone()).unwrap_or(doc);
+        // The haystack, and per haystack byte-start: (text node, byte range of that char in its data).
+        let mut hay = String::new();
+        let mut map: Vec<(usize, usize, usize, usize)> = Vec::new(); // (hay byte, node, data start, data end)
+        let mut nodes: Vec<(usize, String)> = Vec::new();
+        let mut last_block: Option<usize> = None;
         for n in root.descendants() {
             let Some(text) = n.as_text() else { continue };
             let Some(parent) = n.parent() else { continue };
@@ -1471,19 +1496,51 @@ impl AetherEngine {
             }) {
                 continue;
             }
-            let data = text.borrow().clone();
-            for (a, b) in chrome::find::find_all(&data, query) {
-                out.push((n.id().0, selection::byte_to_utf16(&data, a), selection::byte_to_utf16(&data, b)));
+            let block = n
+                .ancestors()
+                .find(|a| a.is_element() && !a.local_name().as_deref().is_some_and(|t| INLINE.contains(&t)))
+                .map(|a| a.id().0);
+            if last_block.is_some() && block != last_block {
+                hay.push('\n');
             }
+            last_block = block;
+            let data = text.borrow().clone();
+            let id = n.id().0;
+            for (i, c) in data.char_indices() {
+                let ws = matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C');
+                if ws {
+                    if hay.is_empty() || hay.ends_with(' ') || hay.ends_with('\n') {
+                        continue;
+                    }
+                    map.push((hay.len(), id, i, i + c.len_utf8()));
+                    hay.push(' ');
+                } else {
+                    map.push((hay.len(), id, i, i + c.len_utf8()));
+                    hay.push(c);
+                }
+            }
+            nodes.push((id, data));
+        }
+        let data_of = |id: usize| nodes.iter().find(|(n, _)| *n == id).map(|(_, d)| d.as_str()).unwrap_or("");
+        for (a, b) in chrome::find::find_all(&hay, &query) {
+            let Ok(ia) = map.binary_search_by_key(&a, |m| m.0) else { continue };
+            // The last mapped char before `b`.
+            let ib = match map.binary_search_by_key(&b, |m| m.0) {
+                Ok(k) | Err(k) => k.checked_sub(1),
+            };
+            let Some(ib) = ib else { continue };
+            let (_, n0, s0, _) = map[ia];
+            let (_, n1, _, e1) = map[ib];
+            out.push((n0, selection::byte_to_utf16(data_of(n0), s0), n1, selection::byte_to_utf16(data_of(n1), e1)));
         }
         out
     }
 
     fn show_find_hit(&mut self, i: usize) {
-        let Some(&(node, a, b)) = self.find_hits.get(i) else { return };
+        let Some(&(node, a, end_node, b)) = self.find_hits.get(i) else { return };
         selection::set(Some(selection::Selection {
             anchor: selection::Point { node, offset: a },
-            focus: selection::Point { node, offset: b },
+            focus: selection::Point { node: end_node, offset: b },
         }));
         self.sel_drag = None;
         self.sel_changed();
