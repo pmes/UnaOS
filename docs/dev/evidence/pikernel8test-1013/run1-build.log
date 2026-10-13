@@ -1,0 +1,45 @@
+⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/una-abi)
+   Compiling user-blob v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/user-blob)
+    Finished `release` profile [optimized] target(s) in 16.35s
+✅ EL0 user blob: 51 bytes
+✅ K2 EL0 programs: owner_blob.bin (128 B) + imp_blob.bin (74 B)
+✅ midden EL0 program: midden_blob.bin (4084 B)
+⚡ Building EL0 static-ELF program (crates/user-elf → target/ELFHELLO.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/una-abi)
+   Compiling user-elf v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/user-elf)
+    Finished `release` profile [optimized] target(s) in 14.68s
+✅ static-ELF EL0 program: ELFHELLO.ELF (8560 B)
+⚡ Building EL0 mini-vug static-ELF program (crates/user-vug → target/VUG.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 21.33s
+✅ static-ELF EL0 mini-vug program: VUG.ELF (12648 B)
+⚡ Building EL0 mini-vug static-ELF program (crates/user-vug [pinlo] → target/VUGC.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 13.79s
+✅ static-ELF EL0 mini-vug program: VUGC.ELF (12648 B)
+⚡ Building EL0 mini-vug static-ELF program (crates/user-vug [pinhi] → target/VUGX.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 13.01s
+✅ static-ELF EL0 mini-vug program: VUGX.ELF (12648 B)
+⚡ Building EL0 KERNEL-VUG static-ELF program (crates/user-vug [kvug] → target/VUGK.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-afea35045e37c5f5c/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 12.69s
+ERROR: VUGK.ELF 16744 bytes > USER_REGION_SIZE (16384)
+rc=1 wall=92s
