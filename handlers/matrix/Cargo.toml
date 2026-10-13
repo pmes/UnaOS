@@ -22,6 +22,9 @@ unafs = { path = "../../unaos/libs/fs/unafs" }
 una-abi = { path = "../../unaos/crates/una-abi" }
 # TRASHCORE (B449): the one Trash core; VaultTrash is only its I/O over a UnaFS vault.
 trash_core = { path = "../../unaos/libs/fs/trash_core" }
+# MATRIXCORE (SR99, R104): the Map core — genesis tree, ignore rules, the Finder's listing and sandbox, the token
+# indexer, the query model; this handler is its std volume and its bus face, UNA.ELF links the same core.
+matrix_core = { path = "../../unaos/libs/fs/matrix_core" }
 
 [dev-dependencies]
 tempfile = "3"

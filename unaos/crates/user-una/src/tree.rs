@@ -10,11 +10,48 @@
 //
 // KEYS (focused): Up/Down move the selection; Enter or Right opens a directory (Enter again, or Left, closes it) and
 // on a file asks the IDE to open it in the editor (the same as Ctrl+O); Left on a closed entry jumps to its parent.
+//
+// MATRIXCORE (SR99, R104): the listing is Matrix's own — `matrix_core::list_dir`, the rule the host Finder lists
+// with (the build-noise set `target` / `.git` / `node_modules` left out, directories first, then files, each by
+// name in byte order), over `PathVolume`: the core's `Volume` seam on SYS_PATH_READ + PATH_R_LIST (list),
+// SYS_STAT (stat) and SYS_PATH_READ (read). The tree keeps its lazy shape: one listing per opened directory.
 
-use crate::fs::{errno_word, list, resolve};
+use crate::fs::{errno_word, list, read_file, resolve, stat, CAT_MAX};
 use alloc::string::String;
 use alloc::vec::Vec;
+use matrix_core::{Entry, Ignore, Kind, Stat, Volume};
 use una_abi::{KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_UP};
+
+/// The core's `Volume` over the ring-3 file surface. Paths are absolute (`/home/<user>/…`). A listing's names
+/// carry the surface's own directory mark (a trailing `/`); it gives no size or link facts, so entries are
+/// `Dir` or `File` with size 0 (the surface does not expose links to ring 3). The error is the -errno.
+pub struct PathVolume;
+
+impl Volume for PathVolume {
+    type Error = i64;
+
+    fn list(&mut self, dir: &str) -> Result<Vec<Entry>, i64> {
+        Ok(list(dir)?
+            .into_iter()
+            .map(|n| {
+                let is_dir = n.ends_with('/');
+                let name = String::from(n.trim_end_matches('/'));
+                Entry { name, kind: if is_dir { Kind::Dir } else { Kind::File }, size: 0 }
+            })
+            .collect())
+    }
+
+    fn stat(&mut self, path: &str) -> Option<Stat> {
+        stat(path).ok().map(|s| {
+            let kind = if s.kind == 1 { Kind::Dir } else { Kind::File };
+            Stat { kind, size: if kind == Kind::File { s.size } else { 0 } }
+        })
+    }
+
+    fn read(&mut self, path: &str) -> Option<Vec<u8>> {
+        read_file(path, CAT_MAX, true).ok()
+    }
+}
 
 /// Directory depth the tree indents to (deeper entries are listed, flush at this indent).
 const DEPTH_MAX: u8 = 8;
@@ -43,22 +80,14 @@ pub enum Act {
     Open(String),
 }
 
+/// `dir` (absolute, normal) listed by the core: `.`/`..` and the build noise dropped, directories first, then
+/// files, each by name in byte order (the surface's names are ASCII 8.3 or UTF-8); `path` = `join(dir, name)`.
 fn children(dir: &str, depth: u8) -> Vec<Node> {
-    match list(dir) {
-        Ok(names) => {
-            let mut v: Vec<Node> = names
-                .into_iter()
-                .filter(|n| n != "./" && n != "../")
-                .map(|n| {
-                    let is_dir = n.ends_with('/');
-                    let name = String::from(n.trim_end_matches('/'));
-                    Node { path: resolve(dir, &name), name, depth, dir: is_dir, open: false, err: false }
-                })
-                .collect();
-            // Directories first, then files; each group by name (byte order: the surface's names are ASCII 8.3 or UTF-8).
-            v.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
-            v
-        }
+    match matrix_core::list_dir(&mut PathVolume, dir, &Ignore::build_noise()) {
+        Ok(items) => items
+            .into_iter()
+            .map(|it| Node { path: it.path, name: it.name, depth, dir: it.kind == Kind::Dir, open: false, err: false })
+            .collect(),
         Err(e) => alloc::vec![Node {
             path: String::from(dir),
             name: alloc::format!("({} {})", errno_word(e), e),
@@ -72,7 +101,8 @@ fn children(dir: &str, depth: u8) -> Vec<Node> {
 
 impl Tree {
     pub fn new(root: String) -> Tree {
-        let nodes = children(&root, 0);
+        // The core joins paths without folding, so the root is listed in its normal form (`resolve` from `/`).
+        let nodes = children(&resolve("/", &root), 0);
         Tree { root, nodes, sel: 0, top: 0, dirty: true }
     }
 
