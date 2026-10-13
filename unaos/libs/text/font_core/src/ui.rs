@@ -32,6 +32,11 @@
 //!   the panel's scale — under the one byte bound; an overflow drops whole atlases least-recently-used first, so
 //!   drawing a 40-pt clock never flushes the 13-pt body.
 //! * The fallback chain primary → [`Role::Fallback`] (Noto Sans, then DejaVu Sans) → [`Role::Script`] faces.
+//!
+//! FONTS2 (rmbp-ledger B650) reads two more variation tables through [`crate::Font`]: `MVAR` (the line metrics,
+//! x-height, cap height and underline of an instance; [`Engine::line_metrics`] takes the regular instance at the
+//! size) and GSUB/GPOS FeatureVariations (a feature's lookups at the instance's coordinates, inside the shaping
+//! plan). `tnum` for figures that change in place is the KERNEL seam's rule (`video/text.rs`), not the engine's.
 
 use crate::bidi::Direction;
 use crate::cache::{split_position, CacheKey, SUBPIXEL_STEPS};
@@ -344,9 +349,12 @@ impl<'a> Engine<'a> {
     }
 
     /// (ascent, descent, line height) in px at `size` for the primary regular face of `role` — browser line
-    /// metrics ([`Font::line_metrics`]); descent is positive below the baseline.
+    /// metrics ([`Font::line_metrics`]); descent is positive below the baseline. FONTS2 (B650): read from the
+    /// REGULAR instance at that size (`opsz` from the size, `wght` as loaded), so `MVAR` follows the optical size
+    /// while a bold or heavier run never makes its line a different height.
     pub fn line_metrics(&self, role: Role, size: f32) -> Option<(f32, f32, f32)> {
-        let f = &self.slots[self.primary(role, false)?].font;
+        let p = self.primary(role, false)?;
+        let f = self.instance(p, &Style::new(role, false, size));
         let (a, d, g) = f.line_metrics();
         let s = size / f.units_per_em.max(1) as f32;
         Some((a as f32 * s, -(d as f32) * s, (a as f32 - d as f32 + g as f32) * s))

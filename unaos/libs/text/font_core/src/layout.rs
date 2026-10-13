@@ -111,6 +111,9 @@ pub struct LayoutTable<'a> {
     features: &'a [u8],
     lookups: &'a [u8],
     ext_kind: u16,
+    /// FONTS2 (B650): the FeatureVariations table (header version 1.1, `featureVariationsOffset` at byte 10), or
+    /// `None` for a 1.0 header or a zero offset.
+    fvars: Option<&'a [u8]>,
 }
 
 pub const LOOKUP_IGNORE_BASE: u16 = 0x0002;
@@ -125,13 +128,73 @@ impl<'a> LayoutTable<'a> {
         if u16_at(data, 0)? != 1 {
             return None;
         }
+        let fvars = if u16_at(data, 2)? >= 1 { u32_at(data, 10).filter(|&o| o != 0).and_then(|o| data.get(o as usize..)) } else { None };
         Some(LayoutTable {
             data,
             scripts: sub(data, 0, 4)?,
             features: sub(data, 0, 6)?,
             lookups: sub(data, 0, 8)?,
             ext_kind,
+            fvars,
         })
+    }
+
+    // ------------------------------------------------------------------- FONTS2 (B650): Feature Variations
+
+    /// How many FeatureVariationRecords the table carries (0 without a FeatureVariations table).
+    pub fn feature_variation_count(&self) -> usize {
+        self.fvars.and_then(|t| u32_at(t, 4)).unwrap_or(0) as usize
+    }
+
+    /// The index of the FeatureVariationRecord selected at `coords` — OpenType 1.9, OpenType Layout Common Table
+    /// Formats, "FeatureVariations table": the records are tried in order and the FIRST whose ConditionSet is
+    /// satisfied applies; `None` when none does (or there is no table). `coords` are the instance's normalized
+    /// axis coordinates (the default instance is all zero, and a missing axis reads 0).
+    pub fn selected_variation(&self, coords: &[f32]) -> Option<usize> {
+        let t = self.fvars?;
+        if u16_at(t, 0)? != 1 {
+            return None;
+        }
+        let n = u32_at(t, 4)? as usize;
+        (0..n).find(|&i| {
+            let cs = u32_at(t, 8 + 8 * i).unwrap_or(0) as usize;
+            // A zero (null) ConditionSet offset is a record that applies unconditionally.
+            cs == 0 || t.get(cs..).is_some_and(|c| condition_set_ok(c, coords))
+        })
+    }
+
+    /// The FeatureTableSubstitution table of the record selected at `coords`.
+    fn feature_substitution(&self, coords: &[f32]) -> Option<&'a [u8]> {
+        let t = self.fvars?;
+        let i = self.selected_variation(coords)?;
+        let off = u32_at(t, 12 + 8 * i)? as usize;
+        let s = t.get(off..)?;
+        (u16_at(s, 0)? == 1).then_some(s)
+    }
+
+    /// The Feature table (featureParams, lookupIndexCount, lookupListIndices) for FeatureList index `fi`: the
+    /// alternate from `subst` (a FeatureTableSubstitution: substitutionCount, then records of featureIndex and an
+    /// Offset32 to the alternate Feature table, from the substitution table's start) when it lists `fi`, else the
+    /// FeatureList's own.
+    fn feature_table(&self, fi: u16, subst: Option<&'a [u8]>) -> Option<&'a [u8]> {
+        if let Some(s) = subst {
+            let n = u16_at(s, 4).unwrap_or(0) as usize;
+            for k in 0..n {
+                let rec = 6 + 6 * k;
+                if u16_at(s, rec) == Some(fi) {
+                    if let Some(alt) = u32_at(s, rec + 2).and_then(|o| s.get(o as usize..)) {
+                        return Some(alt);
+                    }
+                }
+            }
+        }
+        sub(self.features, 0, 2 + 6 * fi as usize + 4)
+    }
+
+    /// The lookup indices of a Feature table.
+    fn feature_lookup_indices(f: &[u8], out: &mut Vec<u16>) {
+        let cnt = u16_at(f, 2).unwrap_or(0) as usize;
+        out.extend((0..cnt).filter_map(|k| u16_at(f, 4 + 2 * k)));
     }
 
     pub fn raw(&self) -> &'a [u8] {
@@ -178,6 +241,7 @@ impl<'a> LayoutTable<'a> {
             idxs.push(req);
         }
         let nf = u16_at(self.features, 0).unwrap_or(0);
+        let subst = self.feature_substitution(&[]); // FONTS2: the default instance's substitutions, if any apply at 0
         for fi in idxs {
             if fi >= nf {
                 continue;
@@ -187,13 +251,8 @@ impl<'a> LayoutTable<'a> {
             if !features.iter().any(|t| t == tag) {
                 continue;
             }
-            let Some(f) = sub(self.features, 0, rec + 4) else { continue };
-            let cnt = u16_at(f, 2).unwrap_or(0) as usize;
-            for k in 0..cnt {
-                if let Some(l) = u16_at(f, 4 + 2 * k) {
-                    out.push(l);
-                }
-            }
+            let Some(f) = self.feature_table(fi, subst) else { continue };
+            Self::feature_lookup_indices(f, &mut out);
         }
         out.sort_unstable();
         out.dedup();
@@ -217,9 +276,17 @@ impl<'a> LayoutTable<'a> {
     }
 
     /// The lookup indices of `feature` in the default LangSys of the first matching script (None if the feature is
-    /// not in that LangSys). The required feature counts under its own tag.
+    /// not in that LangSys). The required feature counts under its own tag. The default instance's view.
     pub fn feature_lookups(&self, scripts: &[Tag], feature: Tag) -> Option<Vec<u16>> {
+        self.feature_lookups_at(scripts, feature, &[])
+    }
+
+    /// FONTS2 (B650): [`LayoutTable::feature_lookups`] at an instance — a FeatureVariationRecord whose conditions
+    /// hold at `coords` replaces the Feature tables its FeatureTableSubstitution names (Inter's `opsz`-conditional
+    /// alternates are this mechanism), so the lookups come from the alternate Feature table.
+    pub fn feature_lookups_at(&self, scripts: &[Tag], feature: Tag, coords: &[f32]) -> Option<Vec<u16>> {
         let ls = self.lang_sys(scripts)?;
+        let subst = self.feature_substitution(coords);
         let req = u16_at(ls, 2).unwrap_or(0xFFFF);
         let n = u16_at(ls, 4).unwrap_or(0) as usize;
         let nf = u16_at(self.features, 0).unwrap_or(0);
@@ -235,9 +302,8 @@ impl<'a> LayoutTable<'a> {
                 continue;
             }
             found = true;
-            let Some(f) = sub(self.features, 0, rec + 4) else { continue };
-            let cnt = u16_at(f, 2).unwrap_or(0) as usize;
-            out.extend((0..cnt).filter_map(|k| u16_at(f, 4 + 2 * k)));
+            let Some(f) = self.feature_table(fi, subst) else { continue };
+            Self::feature_lookup_indices(f, &mut out);
         }
         found.then_some(out)
     }
@@ -248,6 +314,7 @@ impl<'a> LayoutTable<'a> {
     pub fn collect_lookups(&self, scripts: &[Tag], features: Option<&[Tag]>) -> Vec<u16> {
         let mut out = Vec::new();
         let nf = u16_at(self.features, 0).unwrap_or(0);
+        let subst = self.feature_substitution(&[]); // FONTS2: the default instance
         for &t in scripts {
             let Some(s) = self.find_script(t) else { continue };
             let mut langs: Vec<&[u8]> = Vec::new();
@@ -277,9 +344,8 @@ impl<'a> LayoutTable<'a> {
                             continue;
                         }
                     }
-                    let Some(f) = sub(self.features, 0, rec + 4) else { continue };
-                    let cnt = u16_at(f, 2).unwrap_or(0) as usize;
-                    out.extend((0..cnt).filter_map(|k| u16_at(f, 4 + 2 * k)));
+                    let Some(f) = self.feature_table(fi, subst) else { continue };
+                    Self::feature_lookup_indices(f, &mut out);
                 }
             }
         }
@@ -322,6 +388,52 @@ impl<'a> LayoutTable<'a> {
         Some(Lookup { kind, flag, mark_set, subtables })
     }
 }
+
+/// FONTS2 (B650): a ConditionSet (conditionCount, Offset32 conditionOffsets from the set's start) holds at `coords`
+/// when EVERY condition does; an empty set always holds. Condition format 1 (OpenType 1.9, "Condition Table Format
+/// 1: Font Variation Axis Range"): axisIndex, filterRangeMinValue, filterRangeMaxValue (F2Dot14), satisfied when
+/// min <= coord <= max. A format this reader does not know (1.9.1's 2–5) is not satisfied, HarfBuzz's reading of an
+/// unknown condition.
+fn condition_set_ok(cs: &[u8], coords: &[f32]) -> bool {
+    let Some(n) = u16_at(cs, 0) else { return false };
+    for k in 0..n as usize {
+        let Some(c) = u32_at(cs, 2 + 4 * k).and_then(|o| cs.get(o as usize..)) else { return false };
+        let ok = match u16_at(c, 0) {
+            Some(1) => match (u16_at(c, 2), i16_at(c, 4), i16_at(c, 6)) {
+                (Some(axis), Some(lo), Some(hi)) => {
+                    let v = coords.get(axis as usize).copied().unwrap_or(0.0);
+                    let (lo, hi) = (lo as f32 / 16384.0, hi as f32 / 16384.0);
+                    lo <= v && v <= hi
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// FONTS2 (B650): a complete synthetic GSUB 1.1 table, the Feature Variations reader's CONTROL — the tree's
+/// vendored faces carry no FeatureVariations (Inter 4.1's GSUB is 1.0), so the host test and the kernel fixture
+/// prove the reader on this: script `DFLT`, one feature `ss01` → lookup 0 (two type-1 single substitutions,
+/// delta +1 and +2, coverage glyph 1), one FeatureVariationRecord whose ConditionSet is axis 0 in [0.5, 1.0] and
+/// whose FeatureTableSubstitution replaces feature 0 with an alternate naming lookup 1. So `ss01` is lookup 0 at
+/// the default instance and lookup 1 at coordinate 0.5 and above. Built and parsed back independently by a script
+/// (docs/dev/evidence/fonts2/probe.py) before being typed here.
+pub const FEATURE_VARIATIONS_PROBE: &[u8] = &[
+    0x00, 0x01, 0x00, 0x01, 0x00, 0x0E, 0x00, 0x22, 0x00, 0x30, 0x00, 0x00, 0x00, 0x5E, 0x00, 0x01,
+    0x44, 0x46, 0x4C, 0x54, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x01, 0x73, 0x73, 0x30, 0x31, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x02, 0x00, 0x06, 0x00, 0x1A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01,
+    0x00, 0x06, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x08, 0x00, 0x01, 0x00, 0x06, 0x00, 0x02, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x20, 0x00, 0x40, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Gsub<'a>(pub LayoutTable<'a>);

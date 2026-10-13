@@ -387,7 +387,7 @@ fn match_syllable(cat: &[u8], i: usize) -> (usize, u16) {
 
 /// Lookup indices of `feature` for the plan's script.
 fn feature_lookups(font: &Font, plan: &Plan, feature: Tag) -> Option<Vec<u16>> {
-    font.gsub.and_then(|g| g.0.feature_lookups(&plan.script_tags, feature))
+    font.gsub.and_then(|g| g.0.feature_lookups_at(&plan.script_tags, feature, font.coords()))
 }
 
 /// Whether any lookup of `lookups` would substitute exactly the glyph sequence `glyphs` (zero context).

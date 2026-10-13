@@ -154,7 +154,7 @@ impl Plan {
                 add(&mut feats, stage, b"rlig", F_GLOBAL | F_MANUAL_ZWJ);
                 pause!(Pause::None);
                 add(&mut feats, stage, b"calt", F_GLOBAL | F_MANUAL_ZWJ);
-                if font.gsub.is_none_or(|g| g.0.feature_lookups(&script_tags, *b"rclt").is_none()) {
+                if font.gsub.is_none_or(|g| g.0.feature_lookups_at(&script_tags, *b"rclt", font.coords()).is_none()) {
                     pause!(Pause::None);
                 }
                 add(&mut feats, stage, b"liga", F_GLOBAL | F_MANUAL_ZWJ);
@@ -242,8 +242,10 @@ impl Plan {
         }
         let mut gsub: Vec<Vec<LookupReq>> = (0..nstages).map(|_| Vec::new()).collect();
         let mut gpos: Vec<LookupReq> = Vec::new();
+        // FONTS2 (B650): the feature's lookups at THIS instance — a GSUB/GPOS FeatureVariationRecord that holds at
+        // the font's coordinates swaps in its alternate Feature tables.
         let collect = |t: &LayoutTable, out: &mut Vec<LookupReq>, f: &FeatureReq, mask: u32| {
-            if let Some(ls) = t.feature_lookups(&script_tags, f.tag) {
+            if let Some(ls) = t.feature_lookups_at(&script_tags, f.tag, font.coords()) {
                 for li in ls {
                     out.push(LookupReq {
                         index: li,
@@ -286,7 +288,7 @@ impl Plan {
         finish(&mut gpos);
         pauses.push(Pause::None);
         let has_gpos_kern = opts.kerning
-            && font.gpos.is_some_and(|g| g.0.feature_lookups(&script_tags, *b"kern").is_some());
+            && font.gpos.is_some_and(|g| g.0.feature_lookups_at(&script_tags, *b"kern", font.coords()).is_some());
         let apply_kern_table = opts.kerning && !has_gpos_kern && font.kern.is_some() && font.gpos.is_none_or(|_| true);
         Plan { script_tags, shaper, gsub, pauses, gpos, masks, apply_kern_table }
     }
