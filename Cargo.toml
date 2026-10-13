@@ -43,6 +43,7 @@ members = [
     "unaos/libs/media/probe_core", # REALSENSE (SR92, R112): Sonde's probe core — frames (Z16/Y8/Y16/YUY2), depth model, IMU samples; no_std, both rings
     "unaos/libs/media/vp8_core",
     "unaos/libs/media/av1_core",
+    "unaos/libs/media/vp9_core", # VP9CORE (SR116): the from-spec VP9 decoder (profiles 0 and 2) Stria links beside vp8_core; no_std, zero deps
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.
     "unaos/libs/media/svg_core",
     "unaos/libs/sys/holocron_core",
