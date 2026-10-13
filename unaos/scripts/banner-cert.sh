@@ -372,9 +372,9 @@ wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the kn
 selfhost|:: SELFHOST:|-|measured
 unafs|:: UNAFSX86: root=|-|measured
 lumen|:: LUMENAPP:|-|measured
-midden|:: MIDDENAPP: image=|@arch:x86_64|unmeasured-here
-una|:: UNAAPP: image=|@arch:x86_64|unmeasured-here
-sonde|:: SONDE:|@arch:x86_64|unmeasured-here
+midden|:: MIDDENAPP: image=|@arch:x86_64|measured(1)
+una|:: UNAAPP: image=|@arch:x86_64|measured(1)
+sonde|:: SONDE:|@arch:x86_64|measured(5)
 aether|:: AETHERAPP:|-|measured
 stria|:: STRIAAPP: image=|-|unmeasured-here
 netring3|:: ENTROPY:|-|measured
