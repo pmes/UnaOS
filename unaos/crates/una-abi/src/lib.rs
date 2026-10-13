@@ -853,8 +853,8 @@ pub const BUS_VERB_PREF_GET: u8 = 16;
 pub const BUS_VERB_PREF_SET: u8 = 17;
 /// Bus verb: list a namespace (or every namespace).
 pub const BUS_VERB_PREF_LIST: u8 = 18;
-/// RESERVED for BANDY-3: the unsolicited PrefChanged frame (kind REPLY, corr 0, body = the SET body).
-/// Not admitted by `verb_valid` until interest registration exists to deliver it.
+/// PrefChanged: as a REQUEST, interest registration (body = a `<ns>.<key>` prefix, PREFCHANGED B558 at the
+/// file tail); delivered as the unsolicited frame (kind REPLY, corr 0, body `<ns>.<key>` NUL `<literal>`).
 pub const BUS_VERB_PREF_CHANGED: u8 = 19;
 // BANDY3 (ROADMAP §3b, the fulfiller seam) — fulfiller registration on the wire. A ring-3 program
 // registers the verb tags it fulfils; the kernel relays a caller's request to it re-stamped with the
@@ -2523,3 +2523,31 @@ pub const CURSOR_BUSY: u64 = 7;
 /// One past the last shape: the table width, and the first value `SYS_CURSOR_SHAPE` refuses.
 pub const CURSOR_SHAPES: u64 = 8;
 const _: () = assert!(SYS_CURSOR_SHAPE == SYS_SPAWN_PATH + 1 && CURSOR_BUSY + 1 == CURSOR_SHAPES);
+
+// =================================================================================================
+// PREFCHANGED (rmbp-ledger B558; B337 SETTINGSBUS the parent) — PrefChanged (verb 19) DELIVERED to ring 3.
+//
+//   subscribe  SYS_MSEND of a v1 REQUEST, verb `BUS_VERB_PREF_CHANGED`, body = a key-address PREFIX: UTF-8, no NUL,
+//              at most `PREF_SUB_PREFIX_MAX` bytes, matched against the changed key's `<ns>.<key>` with
+//              `starts_with` (`system.appearance.` = the appearance keys; empty = every key). Reply: status 0,
+//              empty body. -EINVAL a bad body (or the shared/kernel row); -ENOSPC past `PREF_SUB_MAX` prefixes
+//              for this owner. The same prefix twice is one subscription (idempotent).
+//   delivery   on every accepted write whose address matches one of the owner's prefixes, ONE frame per write
+//              into the owner's mailbox: kind REPLY, verb 19, corr 0, status 0, the kernel reply principal,
+//              body `<ns>.<key>` NUL `<literal>` [NUL `clamped=true`] (prefs_core::wire, the kernel's own frame of
+//              record). The mailbox stays bounded by its depth; a frame that does not fit (one slot is kept for
+//              the owner's own replies) is dropped and counted, said once on the wire.
+//   teardown   the subscription dies with the address space (x86 slot / aarch64 ASID teardown); a frame raced
+//              past it carries the dead tenant's generation and is discarded by MRECV.
+//   waiting    `SYS_MRECV(buf, len, MRECV_NOWAIT)` answers -EAGAIN on an empty mailbox instead of parking, so a
+//              frame loop drains its PrefChanged frames beside its input ring. Any other third argument blocks,
+//              exactly as before (the value is a magic word, not a bit, so a caller leaving garbage in the third
+//              register never turns non-blocking by accident).
+// =================================================================================================
+
+/// A PrefChanged subscription prefix's byte ceiling.
+pub const PREF_SUB_PREFIX_MAX: usize = 64;
+/// Prefixes one owner may hold (a program subscribes once per namespace it repaints from).
+pub const PREF_SUB_MAX: usize = 4;
+/// `SYS_MRECV`'s third argument: return -EAGAIN on an empty mailbox instead of blocking (ASCII "NOWAIT").
+pub const MRECV_NOWAIT: u64 = 0x4E4F_5741_4954;

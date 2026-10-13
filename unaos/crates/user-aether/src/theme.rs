@@ -296,14 +296,50 @@ pub fn load() -> bool {
         moved
     }
 }
-/// The frame loop's clock: `true` once every [`POLL_MS`] (or at once after a PrefChanged frame) — time to re-read.
+/// PREFCHANGED (rmbp-ledger B558): the frame loop's question — `true` when the store moved, time to re-read. The first
+/// call subscribes this program to PrefChanged (verb 19 as a REQUEST, one per prefix below) and answers `true` once (a
+/// write may land between [`load`] and the subscription); every call then drains the mailbox WITHOUT blocking
+/// (`SYS_MRECV(…, MRECV_NOWAIT)`) and answers `true` iff a delivered PrefChanged frame was met. The [`POLL_MS`]
+/// re-read survives only as the fallback for a kernel that refuses the subscription; otherwise every [`POLL_MS`] the
+/// civil hour alone is checked (an `auto` look turns on the hour without a write).
 pub fn due(now_ms: u64) -> bool {
+    const SUBSCRIBE: &[&str] = &["system.appearance."];
+    static mut SUB: i64 = 1; // 1 = not yet asked; 0 = subscribed; < 0 = refused (the poll fallback)
+    static mut HOUR: i64 = -1; // the civil hour at the last clock check
     unsafe {
-        if !HINT && now_ms < NEXT {
+        if SUB == 1 {
+            SUB = 0;
+            for p in SUBSCRIBE {
+                if let Err(e) = call(BUS_VERB_PREF_CHANGED, p.as_bytes(), &mut []) {
+                    SUB = e;
+                }
+            }
+            HINT = true;
+        }
+        let rx = &mut *core::ptr::addr_of_mut!(RX);
+        while SUB == 0 {
+            let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, una_abi::MRECV_NOWAIT, 0);
+            if n < BUS_HDR_LEN as i64 {
+                break; // -EAGAIN: the mailbox is empty
+            }
+            if rx[0..4] == BUS_MAGIC && rx[5] == BUS_KIND_REPLY && rx[6] == BUS_VERB_PREF_CHANGED && rx[8..12] == [0; 4] {
+                HINT = true;
+            }
+        }
+        if now_ms >= NEXT {
+            // No store re-read here: the civil hour is checked, because `auto` turns dark/light on it with no write.
+            NEXT = now_ms + POLL_MS;
+            let t = sys(SYS_TIME, 0, 0, 0, 0);
+            let h = if t >= 0 { (t / 3600) % 24 } else { -1 };
+            if SUB < 0 || (HOUR >= 0 && h != HOUR) {
+                HINT = true;
+            }
+            HOUR = h;
+        }
+        if !HINT {
             return false;
         }
         HINT = false;
-        NEXT = now_ms + POLL_MS;
     }
     true
 }
