@@ -7346,7 +7346,7 @@ pub fn wc_route_tail(raw: crate::pal::Event) {
         raw,
         crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
     ) {
-        wc_drag_motion(); #[cfg(feature = "wc")] crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } #[cfg(feature = "wc")] if crate::video::capture::held() { let (x, y) = click_pointer_pos(); crate::video::capture::motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
+        wc_drag_motion(); #[cfg(feature = "wc")] wc_resize_hover(); #[cfg(feature = "wc")] crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } #[cfg(feature = "wc")] if crate::video::capture::held() { let (x, y) = click_pointer_pos(); crate::video::capture::motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
     }
 }
 
@@ -29700,7 +29700,7 @@ pub fn winresize_selftest() {
         (ox + 1, oy + oh - 2, wm::RS_L | wm::RS_B),
         (ox + ow - 2, oy + oh - 2, wm::RS_R | wm::RS_B),
     ];
-    let mut zones = 0u32;
+    let mut zones = 0u32; let (cursor_ok, cursor_shapes) = winresize_cursor_leg(w, &probes, (i0.x as i32 + cw / 2, i0.y as i32 + ch / 2)); // WINRESIZE2 (B635): the hover leg, run BEFORE the drag legs move the frame — the eight probes are the eight zones (file tail). ⚠ LINE-NEUTRAL fold, code before this comment.
     for (px, py, want) in probes.iter() {
         if wm::resize_zone_at(w, *px, *py) == *want {
             zones += 1;
@@ -29766,10 +29766,10 @@ pub fn winresize_selftest() {
     wm::close(w);
     wm::composite();
     user_input_set_active(saved_focus);
-    let pass = zones == 8 && strip_clear && drag_ok && clamp_ok && min_ok && aspect_ok && keys_ok && drags >= 3;
+    let pass = zones == 8 && strip_clear && drag_ok && clamp_ok && min_ok && aspect_ok && keys_ok && drags >= 3 && cursor_ok; // WINRESIZE2 (B635): `cursor_ok` folded in. ⚠ LINE-NEUTRAL.
     serial_println!(
-        ":: WINRESIZE: zones={} strip={} min={}x{} drags={} clamped={} drag={} clamp={} minstop={} aspect={} keys={} -> {} ::",
-        zones, strip_clear, wm::RS_MIN_W, wm::RS_MIN_H, drags, clamped, drag_ok, clamp_ok, min_ok, aspect_ok, keys_ok,
+        ":: WINRESIZE: zones={} strip={} min={}x{} drags={} clamped={} drag={} clamp={} minstop={} aspect={} keys={} cursor={} cursor_shapes={} -> {} ::",
+        zones, strip_clear, wm::RS_MIN_W, wm::RS_MIN_H, drags, clamped, drag_ok, clamp_ok, min_ok, aspect_ok, keys_ok, if cursor_ok { "ok" } else { "fail" }, cursor_shapes,
         if pass { "PASS" } else { "FAIL" }
     );
 }
@@ -31696,4 +31696,153 @@ pub fn dragmouse_selftest() {
     user_input_set_active(saved_focus);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
     wm::focus_reset();
+}
+
+// =================================================================================================
+// WINRESIZE2 (rmbp-ledger B635; R117 — "WINDOW RESIZE BY EDGE AND CORNER DRAG, every window, live, the standard
+// cursor shapes at the edges") — TAIL-APPENDED. The HOVER half of the frame's resize zones.
+// =================================================================================================
+//
+// The one classification site: `wc_route_tail`'s motion arm (`Event::Mouse`/`MouseAbsolute`), folded onto its line
+// AFTER `wc_drag_motion()` so a live gesture's state is current when it is read. It asks exactly the question the
+// press arm asks (`wc_click_route_at` → `wc_resize_press`): the topmost window under the point (`wm::hit_test`), not a
+// control disc (`wm::control_hit` is judged before the zones on the press too), not the shell/desktop furniture
+// (`wc_resize_press` declines owner 0 and `KERNEL_OWNER_DESKTOP`), then `wm::resize_zone_at`. So a resize shape is
+// shown exactly where a press would begin a resize, and nowhere else.
+//
+// While a RESIZE is live (`wm::drag_active()` with `wm::resize_zone_now()` nonzero) the zone is the GESTURE's, not
+// the point's: the shape stays the one the press took until the release ends the gesture, however far the hand
+// outruns the edge. A plain title-bar move has zone 0 and shows the program's shape, as before.
+//
+// Edge-only: the (win, zone) pair is swapped into `WRZ_HOVER`; an unchanged pair returns before any store or print,
+// so the motion stream costs one swap per report. On a change the frame's shape is published through
+// `video::cursor::set_zone_shape` (Some on entry, None on exit — the program's own shape, or the arrow, comes back by
+// precedence, nothing is saved), and an ENTRY prints one `[cursor] zone=<n|s|e|w|ne|nw|se|sw> shape=<name> win=N`.
+
+/// WINRESIZE2 — the (win << 8 | zone) the pointer is on, `0` off every frame zone.
+#[cfg(feature = "wc")]
+static WRZ_HOVER: AtomicU64 = AtomicU64::new(0);
+/// WINRESIZE2 — `[cursor] zone=` lines printed (bounded: one per entry edge, a hard ceiling beside it).
+#[cfg(feature = "wc")]
+static WRZ_HOVER_LOG: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wc")]
+const WRZ_HOVER_LOG_MAX: u64 = 4096;
+
+/// WINRESIZE2 — a zone's compass token and the sprite row it selects: the top/bottom edges the vertical double
+/// arrow, the sides the horizontal one, the `tl`/`br` corners the NW-SE diagonal and `tr`/`bl` the NE-SW one.
+#[cfg(feature = "wc")]
+fn wrz_zone_cursor(zone: u8) -> (&'static str, u8) {
+    use crate::video::cursor::{SHAPE_RESIZE_NESW, SHAPE_RESIZE_NWSE};
+    use crate::video::wm::{RS_B, RS_L, RS_R, RS_T};
+    const NS: u8 = una_abi::CURSOR_RESIZE_NS as u8;
+    const EW: u8 = una_abi::CURSOR_RESIZE_EW as u8;
+    match zone {
+        z if z == RS_T => ("n", NS),
+        z if z == RS_B => ("s", NS),
+        z if z == RS_L => ("w", EW),
+        z if z == RS_R => ("e", EW),
+        z if z == RS_T | RS_L => ("nw", SHAPE_RESIZE_NWSE),
+        z if z == RS_B | RS_R => ("se", SHAPE_RESIZE_NWSE),
+        z if z == RS_T | RS_R => ("ne", SHAPE_RESIZE_NESW),
+        z if z == RS_B | RS_L => ("sw", SHAPE_RESIZE_NESW),
+        _ => ("none", una_abi::CURSOR_ARROW as u8),
+    }
+}
+
+/// WINRESIZE2 — the live entry: the hover classification at the pointer (`wc_route_tail`'s motion arm).
+#[cfg(feature = "wc")]
+fn wc_resize_hover() {
+    let (x, y) = click_pointer_pos();
+    wc_resize_hover_at(x, y);
+}
+
+/// WINRESIZE2 — [`wc_resize_hover`] with the position supplied, `wc_click_route_at`'s idiom: drivable with no
+/// pointer at all, which is how `tests winresize` covers it in QEMU. See the block header for the rule.
+#[cfg(feature = "wc")]
+fn wc_resize_hover_at(x: i32, y: i32) {
+    use crate::video::wm;
+    let live = wm::drag_active();
+    let (win, zone) = if live != wm::WIN_NONE {
+        // A gesture is live: a resize keeps its own zone until the release; a move shows no zone.
+        (live, wm::resize_zone_now())
+    } else {
+        match wm::hit_test(x, y) {
+            Some((w, owner, _z)) if owner != 0 && owner != wm::KERNEL_OWNER_DESKTOP && wm::control_hit(w, x, y).is_none() => {
+                (w, wm::resize_zone_at(w, x, y))
+            }
+            _ => (wm::WIN_NONE, 0),
+        }
+    };
+    let key = if zone == 0 { 0 } else { ((win as u64) << 8) | zone as u64 };
+    if WRZ_HOVER.swap(key, Ordering::AcqRel) == key {
+        return;
+    }
+    if zone == 0 {
+        crate::video::cursor::set_zone_shape(None);
+        return;
+    }
+    let (tok, shape) = wrz_zone_cursor(zone);
+    crate::video::cursor::set_zone_shape(Some(shape));
+    if WRZ_HOVER_LOG.fetch_add(1, Ordering::Relaxed) < WRZ_HOVER_LOG_MAX {
+        serial_println!("[cursor] zone={} shape={} win={}", tok, crate::video::cursor::shape_name(shape), win);
+    }
+}
+
+/// WINRESIZE2 — `tests winresize`'s hover leg, on the fixture's own window `w` before its drag legs move it.
+///
+/// With the program's ask set to the HAND (so the restore is a real program shape, not the arrow it would match by
+/// accident): the pointer is put over each of the eight `probes` (the fixture's zone probes, in its order L R T B
+/// TL TR BL BR) and the frame's shape must be the one R117 names, checked against a table written here and not
+/// against `wrz_zone_cursor`; back over `content` the hand must return. Then a corner PRESS through the real router
+/// begins a resize and the pointer leaves the frame: the gesture's shape must hold until the release, and after it
+/// the content point must show the hand again. The program's ask and the hover word are restored on the way out.
+/// Returns (all legs held, the sprite rows the table can draw).
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn winresize_cursor_leg(w: u32, probes: &[(i32, i32, u8); 8], content: (i32, i32)) -> (bool, usize) {
+    use crate::pal::Event;
+    use crate::video::cursor::{self, SHAPE_RESIZE_NESW, SHAPE_RESIZE_NWSE};
+    use crate::video::wm;
+    const NS: u8 = una_abi::CURSOR_RESIZE_NS as u8;
+    const EW: u8 = una_abi::CURSOR_RESIZE_EW as u8;
+    const WANT: [u8; 8] = [EW, EW, NS, NS, SHAPE_RESIZE_NWSE, SHAPE_RESIZE_NESW, SHAPE_RESIZE_NESW, SHAPE_RESIZE_NWSE];
+    let hand = una_abi::CURSOR_HAND as u8;
+    let req0 = cursor::shape_index();
+    cursor::set_shape(una_abi::CURSOR_HAND);
+    wc_resize_hover_at(content.0, content.1);
+    let mut ok = cursor::shape_index() == hand;
+    let mut seen = 0u32;
+    for (i, (px, py, _zone)) in probes.iter().enumerate() {
+        wc_resize_hover_at(*px, *py);
+        if cursor::shape_index() == WANT[i] && cursor::zone_shape() == Some(WANT[i]) {
+            seen += 1;
+        }
+    }
+    ok &= seen == 8;
+    wc_resize_hover_at(content.0, content.1);
+    let restored = cursor::shape_index() == hand && cursor::zone_shape().is_none();
+    // A resize in progress keeps its shape: press the BR corner (probe 7) through the router, leave the frame.
+    let (bx, by, _) = probes[7];
+    wc_resize_hover_at(bx, by);
+    crate::pal::cursor::set_button_level(true);
+    let consumed = wc_click_route_at(Event::Button(1), bx, by);
+    let live = consumed && wm::drag_active() == w && wm::resize_zone_now() != 0;
+    wc_resize_hover_at(content.0, content.1);
+    let held = live && cursor::shape_index() == SHAPE_RESIZE_NWSE;
+    drag_settle_arm(bx, by);
+    crate::pal::cursor::set_button_level(false);
+    wc_click_route_at(Event::Button(0), bx, by);
+    wm::drag_end();
+    wc_resize_hover_at(content.0, content.1);
+    let released = cursor::shape_index() == hand;
+    ok &= restored && held && released;
+    cursor::set_shape(req0 as u64);
+    WRZ_HOVER.store(0, Ordering::Release);
+    cursor::set_zone_shape(None);
+    if !ok {
+        serial_println!(
+            "[cursor] winresize leg seen={}/8 restored={} held={} released={} live={}",
+            seen, restored, held, released, live
+        );
+    }
+    (ok, cursor::shape_count())
 }
