@@ -698,6 +698,8 @@ fn property_supported(prop: &str) -> bool {
             | "padding-block" | "padding-inline-start" | "padding-inline-end" | "padding-block-start"
             | "padding-block-end" | "inset-inline" | "inset-block" | "inset-inline-start" | "inset-inline-end"
             | "inset-block-start" | "inset-block-end"
+            // AETHERSTYLE3 (SR103)
+            | "filter" | "backdrop-filter" | "-webkit-filter" | "-webkit-backdrop-filter"
     )
 }
 

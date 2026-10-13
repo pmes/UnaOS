@@ -683,6 +683,23 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         // css-will-change-1 §2: a hint a UA may ignore.
         "will-change" => {}
+        // AETHERSTYLE3 (SR103): Filter Effects 1 §5 / Filter Effects 2 §3 — the list svg_core parses.
+        "filter" | "backdrop-filter" => {
+            let v = value.trim();
+            let parsed = if v.eq_ignore_ascii_case("none") {
+                Some(None)
+            } else if crate::effects::filter_valid(v) {
+                Some(Some(v.to_string()))
+            } else {
+                None
+            };
+            match parsed {
+                Some(f) if prop == "filter" => style.paint.filter = Some(f),
+                Some(f) => style.paint.backdrop_filter = Some(f),
+                None if is_neutral_keyword(v) => {}
+                None => H::record_css(&format!("{}-value:{}", prop, clip(v))),
+            }
+        }
         // css-break-3 §3: break controls apply only to fragmented flows; Aether paginates nothing and
         // lays out no columns, so there is nothing for them to do (the column-* properties stay ledgered).
         "break-before" | "break-after" | "break-inside" | "page-break-before" | "page-break-after"
@@ -1438,6 +1455,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                             | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
                             | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
                             | "backface-visibility" | "perspective" | "perspective-origin"
+                            | "filter" | "backdrop-filter"
                     )
                 }) =>
         {
@@ -2087,7 +2105,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
     );
-    clone!(text_shadows, transform, clip_path);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {

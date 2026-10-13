@@ -18,3 +18,7 @@ description = "LAYOUTCORE (AETHERMETAL M2, SR76): Aether's layout engine — box
 taffy = { version = "0.15", default-features = false, features = ["alloc", "taffy_tree", "block_layout", "flexbox", "grid", "calc", "content_size"] }
 css_core = { path = "../css_core" }
 font_core = { path = "../../text/font_core" }
+# AETHERSTYLE3 (SR103): `filter` / `backdrop-filter` on HTML boxes run through SVGCORE's filter hook
+# (`svg_core::filter::apply_css_filter`, Filter Effects 1 §13) — the same primitives an SVG `<filter>` runs, no_std
+# like this crate, so both rings get the CSS filter functions from one implementation (`effects`).
+svg_core = { path = "../../media/svg_core" }

@@ -177,6 +177,11 @@ pub struct PaintStyle<H: Host> {
     /// a percentage or `auto` side is None): a sticky box's constraint rectangle (css-position-3 §3.4),
     /// read by the painter because a sticky box's insets are not folded into taffy.
     pub inset_px: Option<[Option<f32>; 4]>,
+    /// AETHERSTYLE3 (SR103): `filter` (Filter Effects 1 §5) as written, validated by svg_core's parser;
+    /// Some(None) = `none`. Painted as a group through [`crate::effects::filter_rgba`].
+    pub filter: Option<Option<String>>,
+    /// `backdrop-filter` (Filter Effects 2 §3) as written; Some(None) = `none`.
+    pub backdrop_filter: Option<Option<String>>,
 }
 
 
@@ -255,6 +260,8 @@ impl<H: Host> Default for PaintStyle<H> {
             transform_origin: None,
             clip_path: None,
             inset_px: None,
+            filter: None,
+            backdrop_filter: None,
         }
     }
 }

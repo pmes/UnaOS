@@ -27,6 +27,7 @@ pub use taffy;
 pub mod blockwidth;
 pub mod collapse;
 pub mod css;
+pub mod effects;
 pub mod fmath;
 pub mod hit;
 pub mod inline;

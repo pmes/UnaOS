@@ -757,6 +757,9 @@ pub(crate) fn is_stacking_context(layout: &LayoutTree, id: NodeId) -> bool {
         || p.tf_rotate.is_some()
         || p.tf_scale.is_some()
         || p.clip_path.as_ref().is_some_and(|c| c.is_some())
+        // Filter Effects 1 §5 / 2 §3: a filter or backdrop-filter other than none (AETHERSTYLE3 SR103).
+        || p.filter.as_ref().is_some_and(|f| f.is_some())
+        || p.backdrop_filter.as_ref().is_some_and(|f| f.is_some())
     {
         return true;
     }
@@ -1429,6 +1432,111 @@ fn paint_audio_controls(
     }
 }
 
+/// The bounding box (x0, y0, x1, y1 inclusive) of the pixels `surface` changed against `snap`; None = none.
+fn changed_bounds(surface: &[u8], snap: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for y in 0..height {
+        for x in 0..width {
+            let i = ((y * width + x) * 4) as usize;
+            if surface[i..i + 3] != snap[i..i + 3] {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    (x0 <= x1 && y0 <= y1).then_some((x0, y0, x1, y1))
+}
+
+/// AETHERSTYLE3 (SR103): a `filter` group. The pixels the subtree changed against `snap` are the group (a
+/// straight-alpha layer, opaque where drawn), padded by the list's spread, run through svg_core's CSS filter
+/// hook (`layout_core::effects::filter_rgba`) and composited source-over onto the snapshot, clipped to `clip`.
+fn filter_group(surface: &mut [u8], snap: &[u8], width: u32, height: u32, value: &str, cx: &layout_core::effects::FilterCx, clip: Clip) {
+    let Some((x0, y0, x1, y1)) = changed_bounds(surface, snap, width, height) else { return };
+    let m = layout_core::effects::filter_margin(value, cx) as i64;
+    let rx0 = (x0 as i64 - m).max(0).max(clip.0.floor() as i64) as u32;
+    let ry0 = (y0 as i64 - m).max(0).max(clip.1.floor() as i64) as u32;
+    let rx1 = ((x1 as i64 + 1 + m).min(width as i64).min(clip.2.ceil() as i64)).max(rx0 as i64) as u32;
+    let ry1 = ((y1 as i64 + 1 + m).min(height as i64).min(clip.3.ceil() as i64)).max(ry0 as i64) as u32;
+    let (lw, lh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
+    if lw == 0 || lh == 0 {
+        return;
+    }
+    let mut layer = vec![0u8; lw * lh * 4];
+    for y in 0..lh {
+        for x in 0..lw {
+            let i = (((ry0 as usize + y) * width as usize) + rx0 as usize + x) * 4;
+            if surface[i..i + 3] != snap[i..i + 3] {
+                let o = (y * lw + x) * 4;
+                layer[o..o + 4].copy_from_slice(&[surface[i + 2], surface[i + 1], surface[i], 255]);
+            }
+        }
+    }
+    if !layout_core::effects::filter_rgba(&mut layer, lw, lh, value, cx) {
+        return;
+    }
+    // the whole surface returns to the backdrop, then the filtered layer composites over it
+    for y in y0..=y1 {
+        let a = ((y * width + x0) * 4) as usize;
+        let b = ((y * width + x1) * 4 + 4) as usize;
+        surface[a..b].copy_from_slice(&snap[a..b]);
+    }
+    for y in 0..lh {
+        for x in 0..lw {
+            let i = (((ry0 as usize + y) * width as usize) + rx0 as usize + x) * 4;
+            let o = (y * lw + x) * 4;
+            let src = [layer[o], layer[o + 1], layer[o + 2], layer[o + 3]];
+            let (r, g, b) = layout_core::effects::over((snap[i + 2], snap[i + 1], snap[i]), src);
+            surface[i] = b;
+            surface[i + 1] = g;
+            surface[i + 2] = r;
+            surface[i + 3] = 255;
+        }
+    }
+}
+
+/// AETHERSTYLE3 (SR103): `backdrop-filter` (Filter Effects 2 §3) — the backdrop under the box's border box
+/// (`rect`, screen px) is filtered before the box paints: the region padded by the list's spread is read
+/// opaque, filtered, and written back inside the border box (and `clip`) only.
+fn backdrop_group(surface: &mut [u8], width: u32, height: u32, rect: Clip, value: &str, cx: &layout_core::effects::FilterCx, clip: Clip) {
+    let m = layout_core::effects::filter_margin(value, cx);
+    let rx0 = (rect.0 - m).floor().max(0.0) as u32;
+    let ry0 = (rect.1 - m).floor().max(0.0) as u32;
+    let rx1 = ((rect.2 + m).ceil().max(0.0) as u32).min(width);
+    let ry1 = ((rect.3 + m).ceil().max(0.0) as u32).min(height);
+    if rx1 <= rx0 || ry1 <= ry0 {
+        return;
+    }
+    let (lw, lh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
+    let mut layer = vec![0u8; lw * lh * 4];
+    for y in 0..lh {
+        for x in 0..lw {
+            let i = (((ry0 as usize + y) * width as usize) + rx0 as usize + x) * 4;
+            let o = (y * lw + x) * 4;
+            layer[o..o + 4].copy_from_slice(&[surface[i + 2], surface[i + 1], surface[i], 255]);
+        }
+    }
+    if !layout_core::effects::filter_rgba(&mut layer, lw, lh, value, cx) {
+        return;
+    }
+    let bx0 = rect.0.max(clip.0).max(0.0).floor() as u32;
+    let by0 = rect.1.max(clip.1).max(0.0).floor() as u32;
+    let bx1 = (rect.2.min(clip.2).max(0.0).ceil() as u32).min(width);
+    let by1 = (rect.3.min(clip.3).max(0.0).ceil() as u32).min(height);
+    for y in by0.max(ry0)..by1.min(ry1) {
+        for x in bx0.max(rx0)..bx1.min(rx1) {
+            let i = ((y * width + x) * 4) as usize;
+            let o = (((y - ry0) as usize) * lw + (x - rx0) as usize) * 4;
+            let src = [layer[o], layer[o + 1], layer[o + 2], layer[o + 3]];
+            let (r, g, b) = layout_core::effects::over((surface[i + 2], surface[i + 1], surface[i]), src);
+            surface[i] = b;
+            surface[i + 1] = g;
+            surface[i + 2] = r;
+        }
+    }
+}
+
 /// Where a box's border box sits in page coordinates: its laid-out place (`abs` + its location), except
 /// `position: fixed` — the containing block is the viewport (CSS 2.2 §10.1): insets resolve against it
 /// and the box ignores scrolling — and `position: sticky` (css-position-3 §3.4, AETHERSTYLE2 SR95): the
@@ -1587,7 +1695,22 @@ pub fn render_frame(
             (Some(p), Some(lb)) => p.transform_matrix(lb.size.width, lb.size.height),
             _ => None,
         };
-        let (Some(lb), true) = (lb, tf.is_some() || shape.is_some()) else {
+        // AETHERSTYLE3 (SR103): filter / backdrop-filter, resolved against the element's font and colour.
+        let hidden = paint.and_then(|p| p.hidden).unwrap_or(false);
+        let filter = paint.and_then(|p| p.filter.clone()).flatten().filter(|_| !hidden);
+        let backdrop = paint.and_then(|p| p.backdrop_filter.clone()).flatten().filter(|_| !hidden);
+        let fcx = layout_core::effects::FilterCx {
+            scale: 1.0,
+            font_size: paint.and_then(|p| p.used_font_size).unwrap_or(inherited.font_size),
+            viewport: (width as f32, height as f32),
+            color: paint.and_then(|p| p.color).unwrap_or(inherited.color),
+        };
+        if let (Some(bf), Some(lb)) = (&backdrop, lb) {
+            let (ox, oy) = placed_origin(layout, node_id, abs_x, abs_y, &lb, width, height, sx, sy);
+            let (bx, by) = (ox - sx as f32, oy - sy as f32);
+            backdrop_group(surface, width, height, (bx, by, bx + lb.size.width, by + lb.size.height), bf, &fcx, clip);
+        }
+        let (Some(lb), true) = (lb, tf.is_some() || shape.is_some() || filter.is_some()) else {
             draw_node_op(
                 node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
                 damage_rects, clip,
@@ -1602,21 +1725,13 @@ pub fn render_frame(
             node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
             damage_rects, clip,
         );
-        let changed = |surface: &[u8], i: usize| surface[i..i + 3] != snap[i..i + 3];
-        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        for y in 0..height {
-            for x in 0..width {
-                if changed(surface, ((y * width + x) * 4) as usize) {
-                    x0 = x0.min(x);
-                    y0 = y0.min(y);
-                    x1 = x1.max(x);
-                    y1 = y1.max(y);
-                }
-            }
+        // Filter Effects 1 §5: the filter applies first, then clipping, then the transform.
+        if let Some(f) = &filter {
+            filter_group(surface, &snap, width, height, f, &fcx, clip);
         }
-        if x0 > x1 || y0 > y1 {
+        let Some((x0, y0, x1, y1)) = changed_bounds(surface, &snap, width, height) else {
             return; // the group drew nothing
-        }
+        };
         if let Some(shape) = &shape {
             for y in y0..=y1 {
                 for x in x0..=x1 {
