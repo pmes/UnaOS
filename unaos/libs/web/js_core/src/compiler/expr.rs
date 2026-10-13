@@ -1231,6 +1231,7 @@ impl Gen {
                 positions: Vec::new(),
                 free_temps: Vec::new(),
                 strict: f.strict,
+                using_cap: None,
             },
         );
         self.function_body(f, fs);
@@ -1405,7 +1406,11 @@ impl Gen {
             }
             self.emit_return();
         } else {
-            self.stmts(&f.body);
+            match super::using_in(&f.body) {
+                // The function body's DisposeCapability is disposed before the function returns.
+                Some(is_async) => self.with_disposal(is_async, |g| g.stmts(&f.body)),
+                None => self.stmts(&f.body),
+            }
             self.emit(Op::Undef);
             self.emit_return();
         }

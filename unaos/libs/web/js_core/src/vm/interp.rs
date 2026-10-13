@@ -1211,6 +1211,43 @@ impl Vm {
 
                 // ---- misc
                 Op::Debugger | Op::Nop => {}
+                Op::UsingNew(i) => {
+                    let b = self.frames[fi].base;
+                    let cap = crate::builtins::es2026::using_new(self);
+                    self.stack[b + i as usize] = cap;
+                }
+                Op::UsingAdd(i, is_async) => {
+                    let b = self.frames[fi].base;
+                    let cap = self.stack[b + i as usize].clone();
+                    let v = self.top().clone();
+                    crate::builtins::es2026::using_add(self, &cap, &v, is_async)?;
+                }
+                Op::UsingSeed(i) => {
+                    let v = self.pop();
+                    let k = self.pop();
+                    let b = self.frames[fi].base;
+                    let cap = self.stack[b + i as usize].clone();
+                    crate::builtins::es2026::using_seed(self, &cap, &k, v);
+                }
+                Op::UsingStep(i, done) => {
+                    let b = self.frames[fi].base;
+                    let cap = self.stack[b + i as usize].clone();
+                    match crate::builtins::es2026::using_step(self, &cap) {
+                        Some(v) => self.stack.push(v),
+                        None => self.frames[fi].pc = done as usize,
+                    }
+                }
+                Op::UsingError(i) => {
+                    let e = self.pop();
+                    let b = self.frames[fi].base;
+                    let cap = self.stack[b + i as usize].clone();
+                    crate::builtins::es2026::using_error(self, &cap, e);
+                }
+                Op::UsingFinish(i) => {
+                    let b = self.frames[fi].base;
+                    let cap = self.stack[b + i as usize].clone();
+                    crate::builtins::es2026::using_finish(self, &cap)?;
+                }
                 Op::TemplateObject(k) => {
                     let o = self.template_object(k)?;
                     self.stack.push(Value::Object(o));

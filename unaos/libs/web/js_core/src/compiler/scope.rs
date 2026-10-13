@@ -219,7 +219,7 @@ fn lexical_names_stmt(s: &Stmt, include_functions: bool, out: &mut Vec<(Atom, Bi
                 d.target.bound_names(&mut ids);
             }
             for i in ids {
-                out.push((i.name, if v.kind == VarKind::Const { BindKind::Const } else { BindKind::Let }));
+                out.push((i.name, if v.kind.is_const() { BindKind::Const } else { BindKind::Let }));
             }
         }
         Stmt::Class(c) => {
@@ -532,7 +532,7 @@ impl Analyzer {
                             d.target.bound_names(&mut ids);
                         }
                         for i in ids {
-                            self.declare(sc, &i.name, if v.kind == VarKind::Const { BindKind::Const } else { BindKind::Let });
+                            self.declare(sc, &i.name, if v.kind.is_const() { BindKind::Const } else { BindKind::Let });
                         }
                     }
                 }
@@ -565,7 +565,7 @@ impl Analyzer {
                         let mut ids = Vec::new();
                         p.bound_names(&mut ids);
                         for i in ids {
-                            self.declare(sc, &i.name, if *k == VarKind::Const { BindKind::Const } else { BindKind::Let });
+                            self.declare(sc, &i.name, if k.is_const() { BindKind::Const } else { BindKind::Let });
                         }
                     }
                 }

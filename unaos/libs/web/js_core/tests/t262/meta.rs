@@ -77,7 +77,7 @@ pub fn parse_meta(src: &str) -> Meta {
 /// Features outside ECMAScript 2025 (proposals and post-2025 editions) plus host-specific hooks: tests needing
 /// them are reported as skipped, separately from failures.
 pub const OUT_OF_SCOPE: &[&str] = &[
-    "Temporal", "ShadowRealm", "decorators", "explicit-resource-management", "import-defer", "source-phase-imports",
+    "Temporal", "ShadowRealm", "decorators", "import-defer", "source-phase-imports", // USINGSYNTAX (SR114): explicit-resource-management is scored now; the bench runs test262 (R107)
     "source-phase-imports-module-source", "iterator-sequencing", "Math.sumPrecise", "uint8array-base64", "Error.isError",
     "Array.fromAsync", "json-parse-with-source", "upsert", "joint-iteration", "immutable-arraybuffer", "canonical-tz",
     "legacy-regexp", "Atomics.waitAsync", "await-dictionary", "iterator-zip", "nonextensible-applies-to-private",

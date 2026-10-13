@@ -39,6 +39,22 @@ pub enum VarKind {
     Var,
     Let,
     Const,
+    /// `using x = …` (Explicit Resource Management, ES2026 §14.3.1): an immutable binding whose value is
+    /// registered with the scope's DisposeCapability (hint sync-dispose).
+    Using,
+    /// `await using x = …` (hint async-dispose; only where `await` is a keyword).
+    AwaitUsing,
+}
+
+impl VarKind {
+    /// The binding is immutable (const, using, await using).
+    pub fn is_const(self) -> bool {
+        matches!(self, VarKind::Const | VarKind::Using | VarKind::AwaitUsing)
+    }
+    /// The declaration registers its values for disposal at scope exit.
+    pub fn is_using(self) -> bool {
+        matches!(self, VarKind::Using | VarKind::AwaitUsing)
+    }
 }
 
 #[derive(Debug)]

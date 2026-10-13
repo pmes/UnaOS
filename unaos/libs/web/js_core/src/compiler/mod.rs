@@ -68,6 +68,9 @@ pub(crate) struct FnState {
     pub positions: Vec<(u32, u32)>,
     pub free_temps: Vec<u32>,
     pub strict: bool,
+    /// The register of the innermost scope's DisposeCapability while compiling a statement list that holds
+    /// `using` / `await using` declarations.
+    pub using_cap: Option<u32>,
 }
 
 pub(crate) struct Gen {
@@ -164,6 +167,7 @@ impl Gen {
                 positions: Vec::new(),
                 free_temps: Vec::new(),
                 strict,
+                using_cap: None,
             },
             mode,
             class_has_fields: false,
@@ -234,6 +238,7 @@ impl Gen {
             Op::ForInNext(_) => Op::ForInNext(t),
             Op::GenDispatch(_) => Op::GenDispatch(t),
             Op::JumpIfNullishKeep(_) => Op::JumpIfNullishKeep(t),
+            Op::UsingStep(c, _) => Op::UsingStep(c, t),
             other => other,
         };
     }
@@ -583,8 +588,10 @@ impl Gen {
                 self.emit(Op::GenStart);
             }
         }
-        for s in &p.body {
-            self.stmt(s);
+        match using_in(&p.body) {
+            // Module code (the only top level a `using` may sit at) disposes when its evaluation completes.
+            Some(is_async) => self.with_disposal(is_async, |g| g.stmts(&p.body)),
+            None => self.stmts(&p.body),
         }
         if let Some(cv) = self.f.cv {
             self.emit(Op::GetLocal(cv));
@@ -871,6 +878,13 @@ impl Gen {
     }
 
     pub(crate) fn block(&mut self, id: ScopeId, body: &[Stmt]) {
+        match using_in(body) {
+            Some(is_async) => self.with_disposal(is_async, |g| g.block_inner(id, body)),
+            None => self.block_inner(id, body),
+        }
+    }
+
+    fn block_inner(&mut self, id: ScopeId, body: &[Stmt]) {
         let idx = self.tree.get(id);
         let saved = self.f.scope;
         self.enter_scope(idx);
@@ -892,6 +906,10 @@ impl Gen {
                         self.expr_named(init, &JsStr::from_str(&id.name));
                     } else {
                         self.expr(init);
+                    }
+                    if v.kind.is_using() {
+                        self.pos(id.span.start);
+                        self.using_add(v.kind);
                     }
                     if v.kind == VarKind::Var {
                         self.store_name(&id.name);
@@ -946,6 +964,17 @@ impl Gen {
 
     fn for_stmt(&mut self, f: &ForStmt, labels: Vec<Atom>) {
         self.cv_undefined();
+        match &f.init {
+            // The loop's DisposeCapability is disposed when the whole statement completes (ForLoopEvaluation).
+            Some(ForInit::Var(v)) if v.kind.is_using() => {
+                let is_async = v.kind == VarKind::AwaitUsing;
+                self.with_disposal(is_async, |g| g.for_stmt_inner(f, labels));
+            }
+            _ => self.for_stmt_inner(f, labels),
+        }
+    }
+
+    fn for_stmt_inner(&mut self, f: &ForStmt, labels: Vec<Atom>) {
         let idx = self.tree.get(f.scope);
         let saved = self.f.scope;
         let lexical = matches!(&f.init, Some(ForInit::Var(v)) if v.kind != VarKind::Var);
@@ -1043,6 +1072,25 @@ impl Gen {
             ForHead::Decl(VarKind::Var, p) | ForHead::VarInit(p, _) => {
                 self.bind_pattern(p, BindMode::Assign);
                 self.stmt(&f.body);
+            }
+            ForHead::Decl(k, p) if k.is_using() => {
+                // Each iteration's binding is disposed at the end of that iteration (ForIn/OfBodyEvaluation).
+                let k = *k;
+                let t = self.temp();
+                self.emit(Op::PutLocal(t));
+                self.with_disposal(k == VarKind::AwaitUsing, |g| {
+                    g.enter_scope(idx);
+                    g.f.ctl.push(Ctl::Scope(idx));
+                    g.emit(Op::GetLocal(t));
+                    g.pos(p.span().start);
+                    g.using_add(k);
+                    g.bind_pattern(p, BindMode::Init);
+                    g.stmt(&f.body);
+                    g.f.ctl.pop();
+                    g.exit_scope(idx);
+                    g.f.scope = saved;
+                });
+                self.free_temp(t);
             }
             ForHead::Decl(_, p) => {
                 self.enter_scope(idx);
@@ -1276,6 +1324,96 @@ impl Gen {
         self.emit(Op::RequireObjectCoercibleResult);
     }
 
+    // ------------------------------------------------------------------------------------- using / await using
+
+    /// `value -> value`: AddDisposableResource on the innermost DisposeCapability.
+    pub(crate) fn using_add(&mut self, kind: VarKind) {
+        if let Some(cap) = self.f.using_cap {
+            self.emit(Op::UsingAdd(cap, kind == VarKind::AwaitUsing));
+        }
+    }
+
+    /// Run `body` (a statement list holding `using` / `await using` declarations, with its scope) and then
+    /// DisposeResources (ES2026 §9.1.1.x / §14.2.2 Block Evaluation step 5): the list runs under a
+    /// finally-shaped handler (the `Ctl::Finally` machinery of `try_stmt`, so break / continue / return and
+    /// throws are routed through the disposal), a fresh capability lives in a register, a throw completion seeds
+    /// its pending error, `UsingStep` calls the dispose methods in reverse order (an `await using` scope awaits
+    /// each async result, a rejected Await joining the pending error), `UsingFinish` throws the error the
+    /// disposals left (a SuppressedError chain over the completion's own error), and otherwise the original
+    /// completion continues.
+    pub(crate) fn with_disposal(&mut self, is_async: bool, body: impl FnOnce(&mut Gen)) {
+        let cap = self.alloc_local();
+        self.emit(Op::UsingNew(cap));
+        let saved_cap = self.f.using_cap.replace(cap);
+        let kloc = self.alloc_local();
+        let vloc = self.alloc_local();
+        let h = self.emit(Op::PushHandler(0));
+        let scope = self.f.scope;
+        self.f.ctl.push(Ctl::Finally { kind: kloc, value: vloc, pending: Vec::new(), entry_jumps: Vec::new(), scope });
+        body(self);
+        let ctl = self.f.ctl.pop().unwrap();
+        self.f.using_cap = saved_cap;
+        self.emit(Op::PopHandler);
+        // normal completion: kind 0
+        self.emit(Op::Int(0));
+        self.emit(Op::PutLocal(kloc));
+        let to_fin = self.emit(Op::Jump(0));
+        // throw completion: kind 1
+        self.patch(h);
+        self.emit(Op::PutLocal(vloc));
+        self.emit(Op::Int(1));
+        self.emit(Op::PutLocal(kloc));
+        self.patch(to_fin);
+        let (pending, entry_jumps) = match ctl {
+            Ctl::Finally { pending, entry_jumps, .. } => (pending, entry_jumps),
+            _ => unreachable!(),
+        };
+        for j in entry_jumps {
+            self.patch(j);
+        }
+        // DisposeResources(cap, completion)
+        self.emit(Op::GetLocal(kloc));
+        self.emit(Op::GetLocal(vloc));
+        self.emit(Op::UsingSeed(cap));
+        let top = self.here() as u32;
+        let step = self.emit(Op::UsingStep(cap, 0));
+        if is_async {
+            let ah = self.emit(Op::PushHandler(0));
+            self.emit(Op::Await);
+            self.emit(Op::PopHandler);
+            self.emit(Op::Pop);
+            self.emit(Op::Jump(top));
+            self.patch(ah);
+            self.emit(Op::UsingError(cap));
+            self.emit(Op::Jump(top));
+        } else {
+            // A scope with only sync `using` never has a value to await.
+            self.emit(Op::Pop);
+            self.emit(Op::Jump(top));
+        }
+        self.patch(step);
+        self.emit(Op::UsingFinish(cap));
+        // The disposals completed normally: continue with the original completion.
+        self.emit(Op::GetLocal(kloc));
+        self.emit(Op::Int(1));
+        self.emit(Op::StrictEq);
+        let not_throw = self.emit(Op::JumpIfFalse(0));
+        self.emit(Op::GetLocal(vloc));
+        self.emit(Op::Throw);
+        self.patch(not_throw);
+        for (n, (kind, label, _)) in pending.into_iter().enumerate() {
+            self.emit(Op::GetLocal(kloc));
+            self.emit(Op::Int(3 + n as i32));
+            self.emit(Op::StrictEq);
+            let skip = self.emit(Op::JumpIfFalse(0));
+            if kind == JumpKind::Return {
+                self.emit(Op::GetLocal(vloc));
+            }
+            self.jump_out(kind, label);
+            self.patch(skip);
+        }
+    }
+
     // ------------------------------------------------------------------------------------- try / switch
 
     fn try_stmt(&mut self, t: &TryStmt, labels: Vec<Atom>) {
@@ -1432,6 +1570,21 @@ pub(crate) enum BindMode {
     Assign,
     /// Initialisation of lexical bindings / parameters.
     Init,
+}
+
+/// Some(is_async) when the statement list directly holds a `using` (false) or an `await using` (true) declaration.
+pub(crate) fn using_in(body: &[Stmt]) -> Option<bool> {
+    let mut found = None;
+    for s in body {
+        if let Stmt::Var(v) = s {
+            match v.kind {
+                VarKind::AwaitUsing => return Some(true),
+                VarKind::Using => found = Some(false),
+                _ => {}
+            }
+        }
+    }
+    found
 }
 
 fn collect_annexb(body: &[Stmt], annexb: &[usize], out: &mut Vec<Atom>) {

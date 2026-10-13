@@ -39,12 +39,80 @@ impl Parser {
                             return Ok(Stmt::Function(f));
                         }
                     }
+                    "using" if self.using_is_declaration()? => {
+                        self.check_using_position(start)?;
+                        self.advance()?;
+                        let d = self.parse_using_list(VarKind::Using, true, start)?;
+                        self.semicolon()?;
+                        return Ok(Stmt::Var(Box::new(d)));
+                    }
+                    "await" if self.ctx.await_kw && self.await_using_is_declaration()? => {
+                        self.check_using_position(start)?;
+                        if !self.ctx.in_function {
+                            self.has_top_await = true;
+                        }
+                        self.advance()?;
+                        self.advance()?;
+                        let d = self.parse_using_list(VarKind::AwaitUsing, true, start)?;
+                        self.semicolon()?;
+                        return Ok(Stmt::Var(Box::new(d)));
+                    }
                     "import" if self.goal == Goal::Script => {}
                     _ => {}
                 }
             }
         }
         self.parse_statement()
+    }
+
+    /// `using` (current token, unescaped) starts a UsingDeclaration when the next token is a BindingIdentifier
+    /// on the same line (ES2026 §14.3.1: `using [no LineTerminator here] BindingList`); `using[x]`, `using in o`,
+    /// `using instanceof C` and a `using` that ends its line stay expressions.
+    fn using_is_declaration(&mut self) -> PResult<bool> {
+        let nx = self.peek()?;
+        Ok(!nx.nl_before && matches!(&nx.t, T::Name(n) if !is_reserved(n)))
+    }
+
+    /// `await using x` (current token `await` where it is a keyword): `await [no LineTerminator here] using [no
+    /// LineTerminator here] BindingIdentifier` (CoverAwaitExpressionAndAwaitUsingDeclarationHead).
+    fn await_using_is_declaration(&mut self) -> PResult<bool> {
+        let (a, b) = self.peek2()?;
+        Ok(!a.nl_before && !a.escaped && matches!(&a.t, T::Name(u) if &**u == "using") && !b.nl_before && matches!(&b.t, T::Name(n) if !is_reserved(n)))
+    }
+
+    /// Early errors on a UsingDeclaration's position (ES2026 §14.3.1.1): not at the top level of a Script (eval
+    /// code included), not directly in a CaseClause / DefaultClause.
+    fn check_using_position(&self, pos: u32) -> PResult<()> {
+        if self.scopes.last().map(|s| s.kind == ScopeKind::Script).unwrap_or(false) {
+            return self.err_at(pos, "using declarations are not allowed at the top level of a script");
+        }
+        if self.case_clause_depth == Some(self.scopes.len()) {
+            return self.err_at(pos, "using declarations are not allowed directly in a case clause");
+        }
+        Ok(())
+    }
+
+    /// BindingList of a `using` / `await using` declaration (the keyword(s) already consumed): BindingIdentifiers
+    /// only (~Pattern), each with an Initializer.
+    fn parse_using_list(&mut self, kind: VarKind, allow_in: bool, start: u32) -> PResult<VarDecl> {
+        let mut decls = Vec::new();
+        loop {
+            if !matches!(self.tok.t, T::Name(_)) {
+                return self.err("using declarations bind identifiers only");
+            }
+            let id = self.parse_binding_ident()?;
+            let target = Pat::Ident(id);
+            self.declare_pattern(&target, kind, false)?;
+            if !self.eat(P::Assign)? {
+                return self.err("missing initializer in using declaration");
+            }
+            let init = self.parse_assign(allow_in)?;
+            decls.push(Declarator { target, init: Some(init) });
+            if !self.eat(P::Comma)? {
+                break;
+            }
+        }
+        Ok(VarDecl { kind, decls, span: self.span_from(start) })
     }
 
     /// `let` starts a LexicalDeclaration when followed by an identifier, `[` or `{`.
@@ -453,6 +521,9 @@ impl Parser {
                 return self.unexpected();
             }
         } else {
+            if let Some(kind) = self.for_using_head()? {
+                return self.parse_for_using(start, is_await, scope, kind);
+            }
             let decl_kind = if self.is_kw("var") {
                 Some(VarKind::Var)
             } else if self.is_kw("const") {
@@ -580,6 +651,84 @@ impl Parser {
         self.parse_for_classic(start, init, scope)
     }
 
+    /// A `using` / `await using` ForDeclaration or LexicalDeclaration at the start of a for head (ES2026 §14.7.4,
+    /// §14.7.5). `for (using of …` is the identifier `using` (the `[lookahead ≠ using of]` restriction) except in
+    /// the classic head `for (using of = …;`; `for (await using of …` declares `of`.
+    fn for_using_head(&mut self) -> PResult<Option<VarKind>> {
+        if self.is_kw("using") {
+            let (a, b) = self.peek2()?;
+            if a.nl_before {
+                return Ok(None);
+            }
+            return Ok(match &a.t {
+                T::Name(n) if !is_reserved(n) => {
+                    if &**n == "of" && !a.escaped && b.t != T::Punct(P::Assign) {
+                        None
+                    } else {
+                        Some(VarKind::Using)
+                    }
+                }
+                _ => None,
+            });
+        }
+        if self.ctx.await_kw && self.is_kw("await") && self.await_using_is_declaration()? {
+            return Ok(Some(VarKind::AwaitUsing));
+        }
+        Ok(None)
+    }
+
+    fn parse_for_using(&mut self, start: u32, is_await: bool, scope: ScopeId, kind: VarKind) -> PResult<Stmt> {
+        let dstart = self.tok.start;
+        if kind == VarKind::AwaitUsing {
+            if !self.ctx.in_function {
+                self.has_top_await = true;
+            }
+            self.advance()?;
+        }
+        self.advance()?;
+        if !matches!(self.tok.t, T::Name(_)) {
+            return self.err("using declarations bind identifiers only");
+        }
+        let target = Pat::Ident(self.parse_binding_ident()?);
+        if self.is_kw("of") {
+            self.advance()?;
+            self.declare_pattern(&target, kind, true)?;
+            let right = self.parse_assign(true)?;
+            self.expect(P::RParen)?;
+            let body = self.parse_loop_body()?;
+            self.check_for_body_lex(&target, kind, &body)?;
+            let f = ForInStmt { left: ForHead::Decl(kind, target), right, body, is_await, scope, span: self.span_from(start) };
+            return Ok(Stmt::ForOf(Box::new(f)));
+        }
+        if self.is_kw("in") {
+            return self.err("using declarations are not allowed in for-in heads");
+        }
+        if is_await {
+            return self.unexpected();
+        }
+        // for ( using x = a, y = b ; … ; … ): every binding initialised, `in` not allowed in the initialisers.
+        self.declare_pattern(&target, kind, false)?;
+        if !self.eat(P::Assign)? {
+            return self.err("missing initializer in using declaration");
+        }
+        let first = self.parse_assign(false)?;
+        let mut decls = vec![Declarator { target, init: Some(first) }];
+        while self.eat(P::Comma)? {
+            if !matches!(self.tok.t, T::Name(_)) {
+                return self.err("using declarations bind identifiers only");
+            }
+            let t = Pat::Ident(self.parse_binding_ident()?);
+            self.declare_pattern(&t, kind, false)?;
+            if !self.eat(P::Assign)? {
+                return self.err("missing initializer in using declaration");
+            }
+            let i = self.parse_assign(false)?;
+            decls.push(Declarator { target: t, init: Some(i) });
+        }
+        let init = Some(ForInit::Var(Box::new(VarDecl { kind, decls, span: self.span_from(dstart) })));
+        self.parse_for_classic(start, init, scope)
+    }
+
     fn parse_for_classic(&mut self, start: u32, init: Option<ForInit>, scope: ScopeId) -> PResult<Stmt> {
         self.expect(P::Semi)?;
         let test = if self.is(P::Semi) { None } else { Some(self.parse_expression(true)?) };
@@ -645,6 +794,7 @@ impl Parser {
         self.push_scope(ScopeKind::Block);
         let saved = self.ctx.in_switch;
         self.ctx.in_switch = true;
+        let saved_case = self.case_clause_depth.replace(self.scopes.len());
         let mut cases = Vec::new();
         let mut has_default = false;
         while !self.is(P::RBrace) {
@@ -671,6 +821,7 @@ impl Parser {
         }
         self.advance()?;
         self.ctx.in_switch = saved;
+        self.case_clause_depth = saved_case;
         self.pop_scope();
         Ok(Stmt::Switch(Box::new(SwitchStmt { disc, cases, scope, span: self.span_from(start) })))
     }

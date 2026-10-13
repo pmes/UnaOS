@@ -4,8 +4,9 @@
 //! getOrInsert / getOrInsertComputed (the upsert proposal, stage 4), Error.captureStackTrace (the
 //! de-facto API every engine ships, which libraries call when present), and the library half of explicit
 //! resource management (Symbol.dispose / asyncDispose, SuppressedError, DisposableStack,
-//! AsyncDisposableStack, Iterator/AsyncIterator disposal) — the `using` declarations themselves are
-//! parser/compiler work this commit does not do.
+//! AsyncDisposableStack, Iterator/AsyncIterator disposal), and the runtime half of the `using` /
+//! `await using` declarations (USINGSYNTAX, SR114): the DisposeCapability the compiler keeps in a register
+//! per scope and the `Using*` ops' AddDisposableResource / DisposeResources steps.
 
 use super::*;
 use crate::bignum::BigUint;
@@ -1270,4 +1271,177 @@ fn async_iterator_async_dispose(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
     }
     Ok(Value::Object(p))
+}
+
+// ============================================================================================ `using` declarations
+
+// A scope's DisposeCapability (ES2026 §9.1.1.x, §27.x DisposeResources) as an internal record:
+// [has_error, error, needs_await, has_awaited, (value, method, hint)*], resources in registration order.
+// Hints: 0 sync-dispose, 1 async-dispose through @@asyncDispose, 2 async-dispose through the @@dispose fallback
+// (GetDisposeMethod's closure: the sync method is called, its result dropped, the closure's promise awaited).
+const U_HAS: usize = 0;
+const U_ERR: usize = 1;
+const U_NEED: usize = 2;
+const U_AWAITED: usize = 3;
+const U_BASE: usize = 4;
+
+/// NewDisposeCapability().
+pub fn using_new(vm: &mut Vm) -> Value {
+    let slots = vec![Value::Bool(false), Value::Undefined, Value::Bool(false), Value::Bool(false)];
+    Value::Object(vm.alloc(ObjectData::new(None, Kind::Internal(slots))))
+}
+
+fn using_cap(v: &Value) -> Option<Obj> {
+    v.as_object()
+}
+
+fn using_flag(vm: &Vm, cap: Obj, i: usize) -> bool {
+    matches!(st_get(vm, cap, i), Value::Bool(true))
+}
+
+fn using_push(vm: &mut Vm, cap: Obj, v: Value, m: Value, hint: u8) {
+    if let Kind::Internal(slots) = &mut vm.heap.get_mut(cap).kind {
+        slots.push(v);
+        slots.push(m);
+        slots.push(Value::Number(hint as f64));
+    }
+}
+
+/// AddDisposableResource(cap, V, hint) for a `using` (sync) or `await using` (async) binding: a nullish value is
+/// skipped by `using` and recorded without a method by `await using` (it still implies an Await); any other
+/// non-object is a TypeError; the method is GetDisposeMethod(V, hint) and must exist.
+pub fn using_add(vm: &mut Vm, cap: &Value, v: &Value, is_async: bool) -> JsResult<()> {
+    let Some(cap) = using_cap(cap) else { return Ok(()) };
+    if v.is_nullish() {
+        if is_async {
+            using_push(vm, cap, Value::Undefined, Value::Undefined, 1);
+        }
+        return Ok(());
+    }
+    if !v.is_object() {
+        let what = if is_async { "await using" } else { "using" };
+        return vm.throw_type(&alloc::format!("{what}: the initializer is not an object"));
+    }
+    let mut hint = 0u8;
+    let mut m = None;
+    if is_async {
+        let ak = PropertyKey::Sym(vm.wk.async_dispose.clone());
+        m = vm.get_method(v, &ak)?;
+        hint = 1;
+    }
+    if m.is_none() {
+        let dk = PropertyKey::Sym(vm.wk.dispose.clone());
+        m = vm.get_method(v, &dk)?;
+        if is_async {
+            hint = 2;
+        }
+    }
+    let Some(m) = m else {
+        let msg = if is_async { "await using: the value has no [Symbol.asyncDispose] or [Symbol.dispose] method" } else { "using: the value has no [Symbol.dispose] method" };
+        return vm.throw_type(msg);
+    };
+    using_push(vm, cap, v.clone(), m, hint);
+    Ok(())
+}
+
+/// A throw completion entering DisposeResources becomes the pending error.
+pub fn using_seed(vm: &mut Vm, cap: &Value, kind: &Value, value: Value) {
+    if let (Some(cap), Value::Number(k)) = (using_cap(cap), kind) {
+        if *k == 1.0 {
+            st_set(vm, cap, U_ERR, value);
+            st_set(vm, cap, U_HAS, Value::Bool(true));
+        }
+    }
+}
+
+/// A disposal threw `e`: the completion becomes SuppressedError(e, previous) when an error is already pending.
+pub fn using_error(vm: &mut Vm, cap: &Value, e: Value) {
+    let Some(cap) = using_cap(cap) else { return };
+    let v = if using_flag(vm, cap, U_HAS) {
+        let prev = st_get(vm, cap, U_ERR);
+        suppressed(vm, e, prev)
+    } else {
+        e
+    };
+    st_set(vm, cap, U_ERR, v);
+    st_set(vm, cap, U_HAS, Value::Bool(true));
+}
+
+/// DisposeResources, resumable around its Awaits: dispose resources in reverse registration order and return
+/// `Some(value)` when the caller must Await it (an async-dispose result, or the `Await(undefined)` owed by a
+/// method-less `await using` resource before a sync one or at the end), `None` when the stack is empty.
+pub fn using_step(vm: &mut Vm, cap: &Value) -> Option<Value> {
+    let cap = using_cap(cap)?;
+    loop {
+        let len = match &vm.heap.get(cap).kind {
+            Kind::Internal(slots) => slots.len(),
+            _ => return None,
+        };
+        let need = using_flag(vm, cap, U_NEED);
+        let awaited = using_flag(vm, cap, U_AWAITED);
+        if len < U_BASE + 3 {
+            if need && !awaited {
+                st_set(vm, cap, U_NEED, Value::Bool(false));
+                return Some(Value::Undefined);
+            }
+            return None;
+        }
+        let hint = match st_get(vm, cap, len - 1) {
+            Value::Number(n) => n as u8,
+            _ => 0,
+        };
+        if hint == 0 && need && !awaited {
+            st_set(vm, cap, U_NEED, Value::Bool(false));
+            return Some(Value::Undefined);
+        }
+        let (v, m) = match &mut vm.heap.get_mut(cap).kind {
+            Kind::Internal(slots) => {
+                slots.pop();
+                let m = slots.pop().unwrap_or(Value::Undefined);
+                let v = slots.pop().unwrap_or(Value::Undefined);
+                (v, m)
+            }
+            _ => return None,
+        };
+        if m.is_undefined() {
+            st_set(vm, cap, U_NEED, Value::Bool(true));
+            continue;
+        }
+        let mark = vm.temp_roots.len();
+        vm.temp_roots.push(v.clone());
+        vm.temp_roots.push(m.clone());
+        let r = vm.call(&m, &v, &[]);
+        vm.temp_roots.truncate(mark);
+        match (r, hint) {
+            (Ok(_), 0) => {}
+            (Ok(x), 1) => {
+                st_set(vm, cap, U_AWAITED, Value::Bool(true));
+                return Some(x);
+            }
+            (Ok(_), _) => {
+                st_set(vm, cap, U_AWAITED, Value::Bool(true));
+                return Some(Value::Undefined);
+            }
+            (Err(e), 2) => {
+                // The fallback closure turns the throw into a rejected promise that is then awaited: the error
+                // joins the completion now and the Await still happens.
+                using_error(vm, &Value::Object(cap), e);
+                st_set(vm, cap, U_AWAITED, Value::Bool(true));
+                return Some(Value::Undefined);
+            }
+            (Err(e), _) => using_error(vm, &Value::Object(cap), e),
+        }
+    }
+}
+
+/// The end of DisposeResources: `Err(error)` when a disposal (or the completion) left one.
+pub fn using_finish(vm: &mut Vm, cap: &Value) -> JsResult<()> {
+    let Some(cap) = using_cap(cap) else { return Ok(()) };
+    if using_flag(vm, cap, U_HAS) {
+        let e = st_get(vm, cap, U_ERR);
+        st_set(vm, cap, U_HAS, Value::Bool(false));
+        st_set(vm, cap, U_ERR, Value::Undefined);
+        return Err(e);
+    }
+    Ok(())
 }
