@@ -705,6 +705,10 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   line, a STATE cites it as `image-line.env @<sha>` and never restates it, `./arroyo gates` row `image-line` checks it
   against arroyo's knob map and the builder's, and `./arroyo foldleg` (the x86 kernel + loader built under it) is a fold
   leg beside the compile legs.
+- **Every fold boots the image line twice** (TWOBOOT, rmbp-ledger B526; flight 29's two defects were a second boot and
+  a post-desktop wedge, out of reach of a compile and of one userless `./arroyo test`): `./arroyo twoboot` — boot 1 on a
+  fresh volume types the first user and must reach `[desktop] built` and the services, boot 2 of the same image on the
+  same volume must reach the login screen — is a fold leg beside `foldleg`, and its FAIL is the fold's FAIL.
 
 ## 6. Bench, media, serial
 

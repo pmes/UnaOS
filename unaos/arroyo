@@ -13911,6 +13911,26 @@ case "${1:-}" in
     bootleg)
         bash "$WORKSPACE_DIR/scripts/boot-leg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # SMALLFIX7 (B501): the metal feature line BOOTED under QEMU, tests-at-boot OFF (flight 27 PREHEAP). NOT a host gate: the seat's fold gate runs it; `--judge <log>` reads a capture only
         ;;
+    twoboot)
+        # TWOBOOT (B526): the two-boot fold leg — boot 1 on a fresh volume through the first-user form to the desktop, boot 2
+        # of the same image on the same volume to the login screen. `./arroyo twoboot` runs scripts/twoboot.sh (the knob set
+        # derived from scripts/image-line.env + scripts/twoboot-knobs.env, the QMP typist, the volume, the verdict); the
+        # script re-enters HERE with `--boot <n> <cap>` once per boot, and that arm IS `./arroyo test`'s path (test_x86_64:
+        # the user blobs, the kernel, the builder, FASTTEST's wall) with two changes and no others: the completion spec is the
+        # boot's own, and SELFBUILD's toolchain staging is not entered (the LLVM/rustc fetch B501's bootleg died on, disk).
+        # NOT in the battery-arming case at the head of this file, so `tests-at-boot` and `census` stay off: the metal shape.
+        if [ "${2:-}" = "--boot" ]; then
+            case "${3:-}" in
+                1) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-1.spec" ;;
+                2) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-2.spec" ;;
+                *) echo "twoboot: --boot wants 1 or 2"; exit 2 ;;
+            esac
+            build_selfbuild_x86() { echo "   TWOBOOT: SELFBUILD staging not entered (build_selfbuild_x86 stubbed by the twoboot arm; no fetch, no LLD, no LIB)"; }
+            test_x86_64 "${4:-60}"   # bare, as the `test)` arm calls it: under `||` bash would drop errexit inside the whole path
+        else
+            bash "$WORKSPACE_DIR/scripts/twoboot.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # `--judge <log1> [<log2>]` reads captures only. NOT a host gate: a fold leg beside foldleg (PLAYBOOK §2)
+        fi
+        ;;
     foldleg)
         bash "$WORKSPACE_DIR/scripts/foldleg.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # FOLDBUILD (B517): the x86 kernel + loader BUILT under scripts/image-line.env (the builder's own derivation, --build-only), a fold leg beside the compile legs; no media, no QEMU, never SELFBUILD's staging. The banner arroyo printed above is the CALLER's env; the leg prints the line's own
         ;;
@@ -13924,7 +13944,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|jobs-image|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|jobs-image|twoboot [--judge <log1> [<log2>]]|clean]"
         exit 1
         ;;
 esac
