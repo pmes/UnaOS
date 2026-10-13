@@ -14,6 +14,14 @@
 //! ExtendableEvent / FetchEvent / ExtendableMessageEvent and drives the realm's microtasks and timers until
 //! every `waitUntil` promise (and a `fetch` event's `respondWith` promise) settles or [`EVENT_LIMIT`] passes.
 //! A `fetch` event nobody answered with `respondWith` falls back to the network (`None`).
+//!
+//! AETHERSW (LEDGER SR104): a `fetch` event's answer carries its response TYPE ([`SwResponse::kind`]) so the
+//! caller's policy (`workers::sw::vet`) can refuse an opaque answer to a `navigate` / `cors` request; a rejected
+//! `respondWith` (or `Response.error()`) answers kind `error` — a network error, never a silent fallback. The
+//! worker's own `fetch` is a client of the worker's origin: a cross-origin `no-cors` request answers an
+//! OPAQUE response (status 0, no headers; its body stays hidden from script and rides only to the page that
+//! asked), a cross-origin `cors` one passes `security::cors::cors_check` against the worker's origin, and a
+//! cross-origin `same-origin` one is refused — each refusal through `security::refusal`.
 
 use js_core::vm::*;
 use serde_json::{json, Value as J};
@@ -33,6 +41,9 @@ pub struct SwResponse {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The Response's type: `default` (constructed), `basic`, `cors`, `opaque`, or `error` (a network error:
+    /// `Response.error()` or a rejected `respondWith`).
+    pub kind: String,
 }
 
 /// How one event settled.
@@ -105,11 +116,23 @@ fn url_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     }
 }
 
-/// `__sw_fetch(method, url, [k, v, …], body)` → `[status, statusText, url, [k, v, …], ArrayBuffer]`; a network
-/// error throws a TypeError ("Failed to fetch").
+/// `__sw_fetch(method, url, [k, v, …], body, mode)` → `[status, statusText, url, [k, v, …], ArrayBuffer, type]`;
+/// a network error throws a TypeError ("Failed to fetch"). The worker is the request's client: a cross-origin
+/// target is refused under `same-origin`, CORS-checked under `cors`, and answered opaque under `no-cors`.
 fn fetch_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
+    use crate::security::origin::Origin;
     let method = str_arg(vm, c, 0)?;
     let url = str_arg(vm, c, 1)?;
+    let mode = {
+        let m = vm.arg(c, 4);
+        if m.is_nullish() { "cors".to_string() } else { vm.to_string(&m)?.to_rust() }
+    };
+    let me = Origin::of(&ctx().script_url);
+    let cross = !me.same_origin(&Origin::of(&url));
+    if cross && mode == "same-origin" {
+        let e = crate::security::refusal("sw-same-origin-mode", &url, &format!("Request mode is \"same-origin\" but the service worker ({}) fetched {url}.", me.serialize()), None);
+        return vm.throw_type(&format!("Failed to fetch: {e}"));
+    }
     let hv = vm.arg(c, 2);
     let mut flat = Vec::new();
     if let Value::Object(o) = hv {
@@ -123,13 +146,29 @@ fn fetch_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     let headers: Vec<(String, String)> = flat.chunks(2).filter(|p| p.len() == 2).map(|p| (p[0].clone(), p[1].clone())).collect();
     let bv = vm.arg(c, 3);
     let body = crate::js::net::buffer_bytes(vm, &bv).unwrap_or_default();
-    let req = crate::api::fetch::HttpReq { method, url, headers, body, redirect: "follow".into(), timeout_ms: 30_000 };
+    let req = crate::api::fetch::HttpReq { method, url: url.clone(), headers, body, redirect: "follow".into(), timeout_ms: 30_000 };
     match crate::api::fetch::http_sync(req) {
         Ok(r) => {
-            let hs: Vec<Value> = r.headers.iter().map(|h| s(h)).collect();
+            let kind = if !cross || mode == "navigate" {
+                "basic"
+            } else if mode == "no-cors" {
+                "opaque"
+            } else {
+                let pairs: Vec<(String, String)> = r.headers.chunks(2).filter(|p| p.len() == 2).map(|p| (p[0].to_ascii_lowercase(), p[1].clone())).collect();
+                if let Err(e) = crate::security::cors::cors_check(&pairs, &me.serialize(), false) {
+                    let e = crate::security::refusal("sw-cors", &url, &format!("Access to fetch at '{url}' from the service worker of origin '{}' has been blocked by CORS policy: {e}.", me.serialize()), None);
+                    return vm.throw_type(&format!("Failed to fetch: {e}"));
+                }
+                "cors"
+            };
+            let opaque = kind == "opaque";
+            let hs: Vec<Value> = if opaque { Vec::new() } else { r.headers.iter().map(|h| s(h)).collect() };
             let hl = vm.new_array(hs);
+            // An opaque body rides hidden (`Response.__b`): script reads it as empty, the requester gets it.
             let buf = crate::js::net::array_buffer(vm, &r.body)?;
-            let out = vm.new_array(vec![Value::Number(r.status as f64), s(&r.status_text), s(&r.url), Value::Object(hl), Value::Object(buf)]);
+            let status = if opaque { 0.0 } else { r.status as f64 };
+            let (st_text, r_url) = if opaque { (String::new(), String::new()) } else { (r.status_text, r.url) };
+            let out = vm.new_array(vec![Value::Number(status), s(&st_text), s(&r_url), Value::Object(hl), Value::Object(buf), s(kind)]);
             Ok(Value::Object(out))
         }
         Err(e) => vm.throw_type(&format!("Failed to fetch: {e}")),
@@ -227,7 +266,7 @@ fn build(rc: &RealmCtx, script: &str) -> Result<Vm, String> {
     let g = vm.realm().global;
     for (name, len, f) in [
         ("__sw_url", 2, url_native as NativeFn),
-        ("__sw_fetch", 4, fetch_native),
+        ("__sw_fetch", 5, fetch_native),
         ("__sw_utf8_decode", 1, utf8_decode),
         ("__sw_utf8_encode", 1, utf8_encode),
         ("__sw_skip_waiting", 0, skip_waiting),
@@ -291,6 +330,7 @@ fn run_event(vm: &mut Vm, kind: &str, payload: &str) -> Result<Option<SwResponse
                 url: r.get("url").and_then(J::as_str).unwrap_or("").to_string(),
                 headers,
                 body,
+                kind: r.get("type").and_then(J::as_str).unwrap_or("default").to_string(),
             }));
         }
         if vm.terminated || start.elapsed() > EVENT_LIMIT {
@@ -432,6 +472,8 @@ const SCOPE: &str = r#"
         C.prototype.arrayBuffer = function () {
             if (this.__used) { return Promise.reject(new TypeError('Body has already been consumed.')); }
             this.__used = true;
+            // An opaque response's body is not script's to read (Fetch §2.2.6 opaque filtered response).
+            if (this.__type === 'opaque') { return Promise.resolve(new ArrayBuffer(0)); }
             return Promise.resolve(this.__b === null ? new ArrayBuffer(0) : this.__b.slice(0));
         };
         C.prototype.text = function () { return this.arrayBuffer().then(function (b) { return __sw_utf8_decode(b); }); };
@@ -449,6 +491,7 @@ const SCOPE: &str = r#"
             hidden(this, '__method', String(init.method || (src ? src.method : 'GET')).toUpperCase());
             hidden(this, '__headers', new Headers(init.headers || (src ? src.headers : undefined)));
             hidden(this, '__mode', init.mode || (src ? src.mode : 'cors'));
+            hidden(this, '__dest', init.__destination !== undefined ? String(init.__destination) : (src ? src.__dest : ''));
             hidden(this, '__b', init.body !== undefined ? toBytes(init.body) : (src ? src.__b : null));
             hidden(this, '__used', false);
         }
@@ -456,7 +499,7 @@ const SCOPE: &str = r#"
         get method() { return this.__method; }
         get headers() { return this.__headers; }
         get mode() { return this.__mode; }
-        get destination() { return ''; }
+        get destination() { return this.__dest; }
         clone() { return new Request(this); }
     }
     bodyMixin(Request);
@@ -504,13 +547,13 @@ const SCOPE: &str = r#"
                 var q = new Request(input, init);
                 var flat = [];
                 q.headers.forEach(function (v, k) { flat.push(k, v); });
-                var a = __sw_fetch(q.method, q.url, flat, q.__b === null ? undefined : q.__b);
+                var a = __sw_fetch(q.method, q.url, flat, q.__b === null ? undefined : q.__b, q.mode);
                 var hl = [];
                 for (var i = 0; i + 1 < a[3].length; i += 2) { hl.push([a[3][i], a[3][i + 1]]); }
                 var st = a[0] >= 200 && a[0] <= 599 ? a[0] : 200;
                 var nullBody = [101, 103, 204, 205, 304].indexOf(st) >= 0;
                 var r = new Response(nullBody ? null : a[4], { status: st, statusText: a[1], headers: hl });
-                r.__status = a[0]; r.__url = a[2]; r.__type = a[0] === 0 ? 'opaque' : 'basic';
+                r.__status = a[0]; r.__url = a[2]; r.__type = a[5] || (a[0] === 0 ? 'opaque' : 'basic');
                 resolve(r);
             } catch (e) { reject(e instanceof TypeError ? e : new TypeError(String(e && e.message || e))); }
         });
@@ -600,7 +643,7 @@ const SCOPE: &str = r#"
     hide('__sw_dispatch', function (type, payload) {
         var id = ++next, p = JSON.parse(payload), ev;
         if (type === 'fetch') {
-            var req = new Request(p.url, { method: p.method, headers: p.headers, body: p.body ? unhex(p.body) : undefined, mode: p.mode });
+            var req = new Request(p.url, { method: p.method, headers: p.headers, body: p.body ? unhex(p.body) : undefined, mode: p.mode, __destination: p.destination || '' });
             ev = new FetchEvent('fetch', { request: req, clientId: p.clientId, resultingClientId: p.resultingClientId });
         } else if (type === 'message') {
             var data;
@@ -617,16 +660,24 @@ const SCOPE: &str = r#"
         var fail = function (e) { job.ok = false; job.err = String(e && e.message !== undefined ? e.message : e); job.done = true; };
         if (type === 'fetch') {
             if (ev.__r === null) { finish(); return id; }
+            // §6.4 "handle fetch": a rejected respondWith, a non-Response or a network-error Response is a
+            // NETWORK ERROR for the request (type 'error'), never the network fallback.
+            var netError = function (e) {
+                if (e !== undefined) { console.error('respondWith: ' + String(e && e.message !== undefined ? e.message : e)); }
+                job.resp = { status: 0, statusText: '', headers: [], url: '', type: 'error' };
+                job.body = null;
+                finish();
+            };
             ev.__r.then(function (r) {
                 if (!(r instanceof Response)) { throw new TypeError('The FetchEvent resolved with a value that is not a Response.'); }
-                if (r.type === 'error') { throw new TypeError('The FetchEvent resolved with a network error response.'); }
-                return r.arrayBuffer().then(function (b) {
-                    var hl = [];
-                    r.headers.forEach(function (v, k) { hl.push([k, v]); });
-                    job.resp = { status: r.status, statusText: r.statusText, headers: hl, url: r.url || p.url };
-                    job.body = b;
-                });
-            }).then(finish, fail);
+                if (r.type === 'error') { return 'error'; }
+                if (r.__used) { throw new TypeError('The FetchEvent resolved with a Response whose body is already used.'); }
+                r.__used = true;
+                var hl = [];
+                r.headers.forEach(function (v, k) { hl.push([k, v]); });
+                job.resp = { status: r.status, statusText: r.statusText, headers: hl, url: r.url || p.url, type: r.type };
+                job.body = r.__b === null ? new ArrayBuffer(0) : r.__b.slice(0);
+            }).then(function (v) { if (v === 'error') { netError(); } else { finish(); } }, netError);
             return id;
         }
         Promise.all(ev.__p).then(finish, fail);
