@@ -243,7 +243,7 @@ mod tests {
     fn test_ledger_records_unimplemented_apis() {
         crate::ledger::reset();
         let html = r#"<html><head><style>
-            div { filter: blur(2px); display: grid; }
+            div { filter: blur(2px); grid-template-columns: 1fr 1fr; display: grid; }
         </style></head><body>
             <div id="t">x</div>
             <script>
@@ -255,7 +255,11 @@ mod tests {
 
         let snap = crate::ledger::snapshot();
         use crate::ledger::ApiCategory;
-        assert!(snap.contains(ApiCategory::Css, "property:filter"), "unhandled CSS property must be recorded");
+        // AETHERSTYLE3 (SR103, 8b695a6f) implemented `filter` (layout_core css.rs, the "filter" arm): a
+        // handled property is NOT a gap. Grid layout is still unimplemented: `grid-template-columns` falls to
+        // the unhandled-property arm and `display: grid` to apply_display's unhandled-value arm.
+        assert!(!snap.contains(ApiCategory::Css, "property:filter"), "a handled CSS property must not be recorded");
+        assert!(snap.contains(ApiCategory::Css, "property:grid-template-columns"), "unhandled CSS property must be recorded");
         assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
         // clearTimeout used to be the JS-side example here; it is a real
         // implementation now (see event_loop), so the honest never-delivers
