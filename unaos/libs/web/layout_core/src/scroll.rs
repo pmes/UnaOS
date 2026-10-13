@@ -16,6 +16,12 @@
 //! every programmatic scroll on a snap position of its `scroll-snap-align` descendants ([`snap_offset`]); a
 //! programmatic scroll ([`scroll_target`]) animates as a [`SmoothScroll`] under `scroll-behavior: smooth`, driven
 //! per frame by the host.
+//!
+//! AETHERSTYLE3C (SR122): a snap area is its box's border box outset by `scroll-margin` (css-scroll-snap-1
+//! §6.3), and a snap container keeps its snapped TARGET across a relayout, not its offset (§5.5 re-snapping):
+//! [`snapped_targets`] names the box each snapped axis sits on, the host records it by element with the offset,
+//! and after the relayout [`resnap`] puts the offset on that element's new snap position (the nearest position
+//! when it has none, or no longer snaps).
 
 use crate::inline::Frag;
 use crate::prelude::*;
@@ -240,17 +246,15 @@ pub fn snap_axes<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (bool, bool) {
     }
 }
 
-/// The scroll offsets per axis at which a snap area of `id` aligns with its snapport (§6.1): every descendant
-/// whose nearest scroll container is `id` and whose `scroll-snap-align` is not `none` on that axis, at its
-/// start / end / center against the padding box less `scroll-padding`. Sorted, clamped to the scroll range,
-/// deduplicated; each with its `scroll-snap-stop: always`.
-pub fn snap_positions<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (Vec<(f32, bool)>, Vec<(f32, bool)>) {
+/// AETHERSTYLE3C (SR122): every snap area of `id` — the box, its snap position per axis (None where its
+/// `scroll-snap-align` is `none`), clamped to the scroll range, and its `scroll-snap-stop: always` — in tree
+/// order: each descendant whose nearest scroll container is `id`, its border box outset by `scroll-margin`
+/// (§6.3), aligned start / end / center against the padding box less `scroll-padding` (§6.1).
+pub fn snap_areas<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Vec<(NodeId, Option<f32>, Option<f32>, bool)> {
     let (_, _, cw, ch) = client_rect(tree, id);
     let (mx, my) = max_scroll(tree, id);
     let sp = tree.paint_map.get(&id).and_then(|p| p.scroll_padding).unwrap_or([0.0; 4]);
-    let Ok(l) = tree.taffy.layout(id) else { return (Vec::new(), Vec::new()) };
-    let mut xs: Vec<(f32, bool)> = Vec::new();
-    let mut ys: Vec<(f32, bool)> = Vec::new();
+    let Ok(l) = tree.taffy.layout(id) else { return Vec::new() };
     // areas in the padding-box space of `id` (unscrolled)
     fn walk<H: Host>(tree: &LayoutTree<H>, id: NodeId, ox: f32, oy: f32, out: &mut Vec<(NodeId, f32, f32, f32, f32)>) {
         for k in tree.taffy.children(id).unwrap_or_default() {
@@ -266,12 +270,15 @@ pub fn snap_positions<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (Vec<(f32, b
             }
         }
     }
-    let mut areas = Vec::new();
-    walk(tree, id, -l.border.left, -l.border.top, &mut areas);
-    for (k, x, y, w, h) in areas {
+    let mut boxes = Vec::new();
+    walk(tree, id, -l.border.left, -l.border.top, &mut boxes);
+    let mut out = Vec::new();
+    for (k, x, y, w, h) in boxes {
         let Some(p) = tree.paint_map.get(&k) else { continue };
         let Some(align) = p.snap_align else { continue };
         let stop = p.snap_stop == Some(true);
+        let m = p.scroll_margin.unwrap_or([0.0; 4]);
+        let (x, y, w, h) = (x - m[3], y - m[0], w + m[1] + m[3], h + m[0] + m[2]);
         let pos = |a: u8, start: f32, size: f32, port: f32, ps: f32, pe: f32| -> Option<f32> {
             let port_size = (port - ps - pe).max(0.0);
             Some(match a {
@@ -281,11 +288,26 @@ pub fn snap_positions<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (Vec<(f32, b
                 _ => return None,
             })
         };
-        if let Some(v) = pos(align[0], x, w, cw, sp[3], sp[1]) {
-            xs.push((v.clamp(0.0, mx), stop));
+        let px = pos(align[0], x, w, cw, sp[3], sp[1]).map(|v| v.clamp(0.0, mx));
+        let py = pos(align[1], y, h, ch, sp[0], sp[2]).map(|v| v.clamp(0.0, my));
+        if px.is_some() || py.is_some() {
+            out.push((k, px, py, stop));
         }
-        if let Some(v) = pos(align[1], y, h, ch, sp[0], sp[2]) {
-            ys.push((v.clamp(0.0, my), stop));
+    }
+    out
+}
+
+/// The scroll offsets per axis at which a snap area of `id` aligns with its snapport (§6.1): [`snap_areas`]'
+/// positions, sorted and deduplicated; each with its `scroll-snap-stop: always`.
+pub fn snap_positions<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (Vec<(f32, bool)>, Vec<(f32, bool)>) {
+    let mut xs: Vec<(f32, bool)> = Vec::new();
+    let mut ys: Vec<(f32, bool)> = Vec::new();
+    for (_, px, py, stop) in snap_areas(tree, id) {
+        if let Some(v) = px {
+            xs.push((v, stop));
+        }
+        if let Some(v) = py {
+            ys.push((v, stop));
         }
     }
     let tidy = |v: &mut Vec<(f32, bool)>| {
@@ -302,6 +324,46 @@ pub fn snap_positions<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (Vec<(f32, b
     tidy(&mut xs);
     tidy(&mut ys);
     (xs, ys)
+}
+
+/// AETHERSTYLE3C (SR122): the boxes (x, y) whose snap position the current offset of snap container `id` sits
+/// on, per snapping axis (the first such area in tree order; None when the axis does not snap or sits between
+/// positions).
+pub fn snapped_targets<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> (Option<NodeId>, Option<NodeId>) {
+    let (sx, sy) = snap_axes(tree, id);
+    if !sx && !sy {
+        return (None, None);
+    }
+    let (ox, oy) = offset(tree, id);
+    let areas = snap_areas(tree, id);
+    let on = |cur: f32, get: &dyn Fn(&(NodeId, Option<f32>, Option<f32>, bool)) -> Option<f32>| {
+        areas.iter().find(|a| get(a).is_some_and(|p| (p - cur).abs() < 0.5)).map(|a| a.0)
+    };
+    (
+        if sx { on(ox, &|a| a.1) } else { None },
+        if sy { on(oy, &|a| a.2) } else { None },
+    )
+}
+
+/// AETHERSTYLE3C (SR122): re-snaps snap container `id` after a relayout (§5.5): an axis whose recorded target
+/// (`targets`, the boxes the host found for the elements [`snapped_targets`] named before) still has a snap
+/// position there goes to that position; any other snapping axis snaps from its current offset to the nearest
+/// position (mandatory always, proximity only when near). Returns the offset applied.
+pub fn resnap<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, targets: (Option<NodeId>, Option<NodeId>)) -> (f32, f32) {
+    let (sx, sy) = snap_axes(tree, id);
+    let cur = offset(tree, id);
+    if !sx && !sy {
+        return cur;
+    }
+    let areas = snap_areas(tree, id);
+    let at = |t: Option<NodeId>, axis: u8| -> Option<f32> {
+        let t = t?;
+        areas.iter().find(|a| a.0 == t).and_then(|a| if axis == 0 { a.1 } else { a.2 })
+    };
+    let nearest = snap_offset(tree, id, cur, cur, (0.0, 0.0));
+    let x = if sx { at(targets.0, 0).unwrap_or(nearest.0) } else { cur.0 };
+    let y = if sy { at(targets.1, 1).unwrap_or(nearest.1) } else { cur.1 };
+    set_offset(tree, id, x, y)
 }
 
 /// One axis's snapped offset (§7): `dir` > 0 / < 0 picks among the positions past `cur` that way — the nearest

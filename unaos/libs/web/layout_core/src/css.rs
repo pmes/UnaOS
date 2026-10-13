@@ -740,6 +740,54 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 H::record_css(&format!("{}-value:{}", prop, clip(value)));
             }
         }
+        // AETHERSTYLE3C (SR122): css-scroll-snap-1 §6.3 — the snap area's outsets (lengths only; logical sides
+        // through the element's own writing mode).
+        "scroll-margin" | "scroll-margin-top" | "scroll-margin-right" | "scroll-margin-bottom" | "scroll-margin-left" => {
+            let px = |v: &str| parse_px(v, cx).filter(|_| !v.ends_with('%'));
+            let mut sm = style.paint.scroll_margin.unwrap_or([0.0; 4]);
+            let parts: Vec<Option<f32>> = value.split_whitespace().map(px).collect();
+            let ok = if prop == "scroll-margin" {
+                match parts.as_slice() {
+                    [Some(a)] => { sm = [*a; 4]; true }
+                    [Some(a), Some(b)] => { sm = [*a, *b, *a, *b]; true }
+                    [Some(a), Some(b), Some(c)] => { sm = [*a, *b, *c, *b]; true }
+                    [Some(a), Some(b), Some(c), Some(d)] => { sm = [*a, *b, *c, *d]; true }
+                    _ => false,
+                }
+            } else if let [Some(v)] = parts.as_slice() {
+                let i = match prop { "scroll-margin-top" => 0, "scroll-margin-right" => 1, "scroll-margin-bottom" => 2, _ => 3 };
+                sm[i] = *v;
+                true
+            } else {
+                false
+            };
+            if ok {
+                style.paint.scroll_margin = Some(sm);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("{}-value:{}", prop, clip(value)));
+            }
+        }
+        "scroll-margin-block-start" | "scroll-margin-block-end" | "scroll-margin-inline-start" | "scroll-margin-inline-end" => {
+            let mode = style.paint.writing_mode.unwrap_or(0);
+            let (is, ie, bs, be) = crate::writing::logical_sides(mode, style.paint.rtl == Some(true));
+            let side = match prop {
+                "scroll-margin-block-start" => bs,
+                "scroll-margin-block-end" => be,
+                "scroll-margin-inline-start" => is,
+                _ => ie,
+            };
+            apply_declaration(&format!("scroll-margin-{side}"), value, style, cx);
+        }
+        "scroll-margin-block" | "scroll-margin-inline" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let (a, b) = match parts.as_slice() {
+                [a] => (*a, *a),
+                [a, b] => (*a, *b),
+                _ => return H::record_css(&format!("{}-value:{}", prop, clip(value))),
+            };
+            apply_declaration(&format!("{prop}-start"), a, style, cx);
+            apply_declaration(&format!("{prop}-end"), b, style, cx);
+        }
         "padding" => {
             if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v, cx)) {
                 style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
@@ -2454,7 +2502,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
-        deco_clone, text_combine,
+        deco_clone, text_combine, scroll_margin,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {

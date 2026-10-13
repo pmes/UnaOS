@@ -226,6 +226,9 @@ pub struct PaintStyle<H: Host> {
     pub deco_clone: Option<bool>,
     /// AETHERSTYLE3C (SR122): `text-combine-upright` (css-writing-modes-4 §9.1), inherited: true = `all`.
     pub text_combine: Option<bool>,
+    /// AETHERSTYLE3C (SR122): `scroll-margin` (css-scroll-snap-1 §6.3) in px: [top, right, bottom, left] — the
+    /// snap area's outsets from the border box.
+    pub scroll_margin: Option<[f32; 4]>,
 }
 
 
@@ -328,6 +331,7 @@ impl<H: Host> Default for PaintStyle<H> {
             col_span: None,
             deco_clone: None,
             text_combine: None,
+            scroll_margin: None,
         }
     }
 }

@@ -576,6 +576,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
             cur_x = 0.0;
             has_content = false;
             forced = false;
+            let _ = (has_content, forced); // a caller may overwrite them at once
         }};
     }
 

@@ -837,6 +837,9 @@ fn property_supported(prop: &str) -> bool {
             // AETHERSTYLE3C (SR122)
             | "column-span" | "box-decoration-break" | "-webkit-box-decoration-break"
             | "text-combine-upright" | "-webkit-text-combine"
+            | "scroll-margin" | "scroll-margin-top" | "scroll-margin-right" | "scroll-margin-bottom"
+            | "scroll-margin-left" | "scroll-margin-block" | "scroll-margin-inline" | "scroll-margin-block-start"
+            | "scroll-margin-block-end" | "scroll-margin-inline-start" | "scroll-margin-inline-end"
     )
 }
 
