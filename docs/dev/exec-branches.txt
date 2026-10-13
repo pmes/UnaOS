@@ -498,3 +498,5 @@ refs/heads/exec-rmbp-settingscraft              817f7945 IN-FLIGHT cloud 2026-10
 refs/heads/exec-rmbp-desktopcraft               817f7945 IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-dhcpreplug                 817f7945 IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-ptrpress2                  817f7945 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-doorsplit                  aa3c9c70 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-winresize2                 aa3c9c70 IN-FLIGHT cloud 2026-10-14
