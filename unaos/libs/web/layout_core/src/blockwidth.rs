@@ -13,19 +13,21 @@
 //! with a `max-width` the placeholder stays (100% clamped by max-width,
 //! the auto margins split the rest — §10.3.3's over-constrained case);
 //! without one, CSS resolves both auto margins to 0 and the box fills.
-use super::LayoutTree;
+use crate::prelude::*;
+use crate::tree::LayoutTree;
+use crate::Host;
 use taffy::prelude::*;
 use taffy::style::{AlignSelf, LengthPercentageAuto, Position};
 
 pub(crate) type Saved = Vec<(NodeId, Style)>;
 
-fn walk(tree: &mut LayoutTree, id: NodeId, saved: &mut Saved) {
+fn walk<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, saved: &mut Saved) {
     let Ok(st) = tree.taffy.style(id).cloned() else { return };
     let kids = tree.taffy.children(id).unwrap_or_default();
-    if super::collapse::is_block_container_pub(tree, id, &st) {
+    if crate::collapse::is_block_container_pub(tree, id, &st) {
         for &k in &kids {
             let Ok(kst) = tree.taffy.style(k).cloned() else { continue };
-            if !super::collapse::in_flow_block_pub(tree, k, &kst)
+            if !crate::collapse::in_flow_block_pub(tree, k, &kst)
                 || kst.position == Position::Absolute
                 || kst.size.width != Dimension::percent(1.0)
             {
@@ -56,7 +58,7 @@ fn walk(tree: &mut LayoutTree, id: NodeId, saved: &mut Saved) {
     }
 }
 
-pub(crate) fn apply(tree: &mut LayoutTree) -> Saved {
+pub(crate) fn apply<H: Host>(tree: &mut LayoutTree<H>) -> Saved {
     let mut saved = Saved::new();
     let root = tree.root_node;
     walk(tree, root, &mut saved);
@@ -65,7 +67,7 @@ pub(crate) fn apply(tree: &mut LayoutTree) -> Saved {
 
 /// Restores width/margins/align-self only: the collapse pass, which runs
 /// after this one, restores its own vertical margins first.
-pub(crate) fn restore(tree: &mut LayoutTree, saved: Saved) {
+pub(crate) fn restore<H: Host>(tree: &mut LayoutTree<H>, saved: Saved) {
     for (id, old) in saved.into_iter().rev() {
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();

@@ -25,25 +25,27 @@
 //! settle, §17.2.1 / §17.5.3), and `table-layout: fixed` (§17.5.2.1: the
 //! first row's specified cell widths fix their columns, the rest share the
 //! remainder equally; cell content does not widen anything).
-use super::LayoutTree;
+use crate::prelude::*;
+use crate::tree::LayoutTree;
+use crate::{DomNode, Host};
 use taffy::prelude::*;
 use taffy::style::{AlignItems, AlignSelf, BoxSizing, FlexWrap, LengthPercentage, LengthPercentageAuto};
 
-fn tag(tree: &LayoutTree, id: NodeId) -> Option<String> {
-    tree.node_map.get(&id).and_then(|n| n.as_element().map(|e| e.name.local.as_ref().to_string()))
+fn tag<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Option<String> {
+    tree.node_map.get(&id).and_then(|n| n.tag())
 }
 
 /// The tables in the tree.
-pub(crate) fn tables(tree: &LayoutTree) -> Vec<NodeId> {
+pub fn tables<H: Host>(tree: &LayoutTree<H>) -> Vec<NodeId> {
     tree.node_map
         .iter()
-        .filter(|(_, n)| n.as_element().is_some_and(|e| e.name.local.as_ref() == "table"))
+        .filter(|(_, n)| n.tag().is_some_and(|t| t == "table"))
         .map(|(id, _)| *id)
         .collect()
 }
 
 /// Rows of a table in order: direct `tr`s and those of its row groups.
-fn rows(tree: &LayoutTree, table: NodeId) -> Vec<NodeId> {
+fn rows<H: Host>(tree: &LayoutTree<H>, table: NodeId) -> Vec<NodeId> {
     let mut out = Vec::new();
     for k in tree.taffy.children(table).unwrap_or_default() {
         match tag(tree, k).as_deref() {
@@ -57,32 +59,29 @@ fn rows(tree: &LayoutTree, table: NodeId) -> Vec<NodeId> {
     out
 }
 
-fn span_attr(tree: &LayoutTree, cell: NodeId, name: &str) -> usize {
+fn span_attr<H: Host>(tree: &LayoutTree<H>, cell: NodeId, name: &str) -> usize {
     tree.node_map
         .get(&cell)
-        .and_then(|n| n.as_element().and_then(|e| e.attributes.borrow().get(name).and_then(|v| v.trim().parse::<usize>().ok())))
+        .and_then(|n| n.attr(name).and_then(|v| v.trim().parse::<usize>().ok()))
         .unwrap_or(1)
         .clamp(1, 1000)
 }
 
-fn colspan(tree: &LayoutTree, cell: NodeId) -> usize {
+fn colspan<H: Host>(tree: &LayoutTree<H>, cell: NodeId) -> usize {
     span_attr(tree, cell, "colspan")
 }
 
-fn rowspan(tree: &LayoutTree, cell: NodeId) -> usize {
+fn rowspan<H: Host>(tree: &LayoutTree<H>, cell: NodeId) -> usize {
     span_attr(tree, cell, "rowspan")
 }
 
-// Cells spanning rows, as (cell, first row index, rows spanned), per table:
-// placed in pass two, sized by `fix_rowspans` once the rows settle.
-thread_local! {
-    static ROWSPANS: std::cell::RefCell<Vec<(NodeId, Vec<NodeId>)>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+// Cells spanning rows (`LayoutTree::rowspans`, was a thread-local): placed in pass two, sized by
+// `fix_rowspans` once the rows settle.
 
 /// Sizes every row-spanning cell to the rows it spans (their border boxes
 /// plus the spacing between them). Returns whether any height changed.
-pub(crate) fn fix_rowspans(tree: &mut LayoutTree) -> bool {
-    let spans = ROWSPANS.with(|r| r.borrow().clone());
+pub fn fix_rowspans<H: Host>(tree: &mut LayoutTree<H>) -> bool {
+    let spans = tree.rowspans.clone();
     let mut changed = false;
     for (cell, rows) in spans {
         let mut top = f32::MAX;
@@ -111,14 +110,14 @@ pub(crate) fn fix_rowspans(tree: &mut LayoutTree) -> bool {
 
 /// Builds the UA defaults the separated model needs at build time: none —
 /// spacing is applied here, after the cascade (it depends on the model).
-pub(crate) fn apply(tree: &mut LayoutTree, min_content: &dyn Fn(&LayoutTree, NodeId) -> f32) {
-    ROWSPANS.with(|r| r.borrow_mut().clear());
+pub fn apply<H: Host>(tree: &mut LayoutTree<H>, min_content: &dyn Fn(&LayoutTree<H>, NodeId) -> f32) {
+    tree.rowspans.clear();
     for table in tables(tree) {
         layout_table(tree, table, min_content);
     }
 }
 
-fn layout_table(tree: &mut LayoutTree, table: NodeId, min_content: &dyn Fn(&LayoutTree, NodeId) -> f32) {
+fn layout_table<H: Host>(tree: &mut LayoutTree<H>, table: NodeId, min_content: &dyn Fn(&LayoutTree<H>, NodeId) -> f32) {
     let rows = rows(tree, table);
     if rows.is_empty() {
         return;
@@ -169,7 +168,7 @@ fn layout_table(tree: &mut LayoutTree, table: NodeId, min_content: &dyn Fn(&Layo
     if ncols == 0 {
         return;
     }
-    let cell_w = |tree: &LayoutTree, c: NodeId| tree.taffy.layout(c).map(|l| l.size.width).unwrap_or(0.0);
+    let cell_w = |tree: &LayoutTree<H>, c: NodeId| tree.taffy.layout(c).map(|l| l.size.width).unwrap_or(0.0);
     let mut maxw = vec![0.0f32; ncols];
     let mut minw = vec![0.0f32; ncols];
     let fixed_layout = paint.table_fixed == Some(true);
@@ -211,7 +210,7 @@ fn layout_table(tree: &mut LayoutTree, table: NodeId, min_content: &dyn Fn(&Layo
         }
     }
     // Collapsed: neighbouring cells share one border line.
-    let overlap = |tree: &LayoutTree, c: NodeId| -> f32 {
+    let overlap = |tree: &LayoutTree<H>, c: NodeId| -> f32 {
         if !collapse {
             return 0.0;
         }
@@ -321,7 +320,7 @@ fn layout_table(tree: &mut LayoutTree, table: NodeId, min_content: &dyn Fn(&Layo
             let mut st = st.clone();
             st.flex_direction = taffy::style::FlexDirection::Row;
             st.flex_wrap = FlexWrap::NoWrap;
-            st.align_items = Some(AlignItems::STRETCH);
+            st.align_items = AlignItems::STRETCH;
             st.gap.width = LengthPercentage::length(spacing);
             st.margin.top = LengthPercentageAuto::length(if !collapse { if ri == 0 { spacing } else { 0.0 } } else if ri == 0 { 0.0 } else { -shared });
             let _ = tree.taffy.set_style(r, st);
@@ -362,10 +361,7 @@ fn layout_table(tree: &mut LayoutTree, table: NodeId, min_content: &dyn Fn(&Layo
         }
         let _ = (ri, flow_i);
     }
-    ROWSPANS.with(|reg| {
-        let mut reg = reg.borrow_mut();
-        for &(c, ri, _, rs) in &spanning {
-            reg.push((c, rows[ri..ri + rs].to_vec()));
-        }
-    });
+    for &(c, ri, _, rs) in &spanning {
+        tree.rowspans.push((c, rows[ri..ri + rs].to_vec()));
+    }
 }

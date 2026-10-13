@@ -1,0 +1,20 @@
+[package]
+name = "layout_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "LAYOUTCORE (AETHERMETAL M2, SR76): Aether's layout engine — box generation, the taffy style mapping, the inline formatter, tables, margin collapsing — as ONE no_std + alloc shared core over the `Dom` and `Fonts` traits, linked by the host browser and by APPS/AETHER.ELF."
+
+# LAYOUTCORE (LEDGER SR76, AETHERMETAL M2): `#![no_std]` + `alloc`, the midden_core / css_core shape (CODEX §2
+# seam `shared-core`). Cut from handlers/aether/src/layout/ and the taffy-style half of handlers/aether/src/css/;
+# both rings lay out with this crate: handlers/aether implements `Dom` over its NodeRef and `Fonts` over fonts/,
+# crates/user-aether implements them over html_core's arena and font_core::ui. Design and the seam:
+# docs/dev/evidence/aethermetal/AETHERMETAL.md §M2.
+#
+# taffy is pinned HERE (not inherited from the root workspace) so the ring-3 program, which is its own
+# workspace, resolves the same line; the root `[workspace.dependencies] taffy` names the same version and
+# features for the host crates. taffy's `std` default is OFF: its no_std path carries its own float helpers.
+[dependencies]
+taffy = { version = "0.15", default-features = false, features = ["alloc", "taffy_tree", "block_layout", "flexbox", "grid", "calc", "content_size"] }
+css_core = { path = "../css_core" }
+font_core = { path = "../../text/font_core" }
