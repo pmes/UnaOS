@@ -1299,9 +1299,780 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
     serial_println!("[uvc] commit=withheld reason=no-iso-pipe");
 }
 
+// ── XHCIISO (rmbp-ledger B534): the stream on xHCI — the commit, the isochronous pipe, the payload, the frames ──
+//
+// INSERTED between `probe` and the fixture, so not one line of `probe` moves or changes: the EHCI path above
+// still ends `commit=withheld reason=no-iso-pipe`, because EHCI still has no iTD/siTD path and that line is
+// still TRUE there (and `banner-cert.sh` certifies it in the artifact). This section is the OTHER host:
+// `probe_iso` is reached from the xHCI driver's main-loop service (`drivers/xhci/isoch.rs`) for a slot whose
+// device class is 0xEF (root port) or whose 64-byte configuration window carries a video IAD (behind a hub).
+// It owns no hardware either: every wire action goes through the `IsoHost` the controller hands it — EP0 into
+// a 4 KiB buffer (the 256-byte ceiling of §8 in uvc.md is EHCI's buffer, not USB's), and the isochronous IN
+// endpoint's Configure Endpoint / ring fill / drop. The frames come back up through `stream_payload`, called
+// by the controller's transfer-event claim once per completed Isoch TD.
+//
+// Sources, as above: UVC 1.1 (and 1.5, whose §2.4.3.3 payload header and §4.3.1.1 Probe/Commit block are the
+// same bytes) and USB 2.0 / USB 3.2 for the endpoint and companion descriptors. Every constant names its table.
+
+/// UVC 1.1 Appendix A.9.8 (1.5 Table A-13): `VS_COMMIT_CONTROL`. `VS_PROBE_CONTROL` (0x01) is above.
+const VS_COMMIT_CONTROL: u8 = 0x02;
+/// USB 3.2 §9.6.7, Table 9-27: `SUPERSPEED_USB_ENDPOINT_COMPANION` descriptor type.
+const DT_SS_EP_COMPANION: u8 = 0x30;
+
+/// UVC 1.5 §2.4.3.3 (the Payload Header table; 1.1 §2.4.3.3 is byte-identical): `bmHeaderInfo` bits.
+const BFH_FID: u8 = 0x01; // D0 Frame ID — toggles at every frame boundary
+const BFH_EOF: u8 = 0x02; // D1 End of Frame — set on the last payload of a frame
+const BFH_PTS: u8 = 0x04; // D2 dwPresentationTime (4 bytes) follows bmHeaderInfo
+const BFH_SCR: u8 = 0x08; // D3 scrSourceClock (6 bytes: 32-bit STC + 16-bit SOF counter) follows the PTS
+const BFH_ERR: u8 = 0x40; // D6 Error — the device says this payload's frame is bad
+const BFH_EOH: u8 = 0x80; // D7 End of Header
+
+/// The EP0 data buffer the xHCI host offers (one 4 KiB page, 4 KiB-aligned so the single Data TRB can never
+/// cross a 64 KiB boundary — xHCI 1.2 §6.4.1.1/§6.4.1.2.2 data-buffer rule). 4096 covers every configuration
+/// descriptor a camera has been seen to declare and the 1024-byte vendor XU command REALSENSE names.
+pub const XHCI_EP0_CAP: usize = 4096;
+
+/// The double-buffer ceiling: a frame larger than this is COUNTED, not stored (`store=count-only` on the arm
+/// line). 4 MiB covers 1280x720 YUY2 (1 843 200) and the D435i's 848x480 Z16 (814 080) twice over.
+const STREAM_STORE_MAX: usize = 4 * 1024 * 1024;
+
+/// The isochronous IN endpoint of one VideoStreaming alternate, read from the full configuration descriptor:
+/// the endpoint descriptor (USB 2.0 §9.6.6, Table 9-13) and, on a SuperSpeed device, the companion after it.
+#[derive(Clone, Copy, Default)]
+pub struct IsoEp {
+    pub intf: u8,
+    pub alt: u8,
+    /// `bEndpointAddress` (direction bit set — only IN endpoints are returned).
+    pub addr: u8,
+    /// `wMaxPacketSize` bits 10..0.
+    pub mps: u16,
+    /// `wMaxPacketSize` bits 12..11: ADDITIONAL transactions per microframe (high-speed, Table 9-13).
+    pub hs_extra: u8,
+    /// `bInterval` as the descriptor holds it (an exponent for HS/SS/FS isochronous: 2^(bInterval-1)).
+    pub interval: u8,
+    /// A SuperSpeed Endpoint Companion followed the endpoint (USB 3.2 §9.6.7) — the device is at SuperSpeed.
+    pub ss: bool,
+    /// Companion `bMaxBurst` (0..15: packets per burst minus one).
+    pub ss_burst: u8,
+    /// Companion `bmAttributes` bits 1..0 for an isochronous endpoint: `Mult` (bursts per interval minus one).
+    pub ss_mult: u8,
+    /// Companion `wBytesPerInterval`.
+    pub ss_bpi: u16,
+}
+
+impl IsoEp {
+    /// Bytes one service interval can carry: high-speed `mps x (1 + extra)` (USB 2.0 §5.6.3 + Table 9-13);
+    /// SuperSpeed `wBytesPerInterval` (USB 3.2 §9.6.7), or `mps x burst x mult` when a device leaves it zero.
+    pub fn esit_bytes(&self) -> u32 {
+        if self.ss {
+            if self.ss_bpi != 0 {
+                self.ss_bpi as u32
+            } else {
+                self.mps as u32 * (self.ss_burst as u32 + 1) * (self.ss_mult as u32 + 1)
+            }
+        } else {
+            self.mps as u32 * (self.hs_extra as u32 + 1)
+        }
+    }
+
+    /// Transactions (HS) or bursts (SS) per interval, as the census line counts `mult`.
+    pub fn mult(&self) -> u8 {
+        if self.ss { self.ss_mult + 1 } else { self.hs_extra + 1 }
+    }
+}
+
+/// PURE: the isochronous IN endpoint of `(intf, alt)` in a full configuration descriptor, and its companion.
+/// `None` when that alternate has no isochronous IN endpoint (an OUT one — the fixture's alt 3 — included).
+pub fn iso_ep_of(cfg: &[u8], intf: u8, alt: u8) -> Option<IsoEp> {
+    let mut off = 0usize;
+    let mut here = false;
+    let mut found: Option<IsoEp> = None;
+    while off + 2 <= cfg.len() {
+        let len = cfg[off] as usize;
+        if len < 2 || off + len > cfg.len() {
+            break;
+        }
+        let d = &cfg[off..off + len];
+        match d[1] {
+            // USB 2.0 Table 9-12: bInterfaceNumber[2] bAlternateSetting[3].
+            DT_INTERFACE if len >= 9 => {
+                if found.is_some() {
+                    break; // the next interface: no companion can follow any more
+                }
+                here = d[2] == intf && d[3] == alt;
+            }
+            // Table 9-13: bEndpointAddress[2] bmAttributes[3] (bits 1..0 = 01 isochronous)
+            // wMaxPacketSize[4..6] bInterval[6].
+            DT_ENDPOINT if here && len >= 7 && found.is_none() => {
+                if d[2] & 0x80 != 0 && (d[3] & 0x03) == 0x01 {
+                    let w = le16(d, 4);
+                    found = Some(IsoEp {
+                        intf,
+                        alt,
+                        addr: d[2],
+                        mps: w & 0x07FF,
+                        hs_extra: ((w >> 11) & 0x03) as u8,
+                        interval: d[6],
+                        ..IsoEp::default()
+                    });
+                }
+            }
+            // USB 3.2 Table 9-27: bMaxBurst[2] bmAttributes[3] wBytesPerInterval[4..6]. It immediately follows
+            // its endpoint descriptor, so the FIRST companion after `found` is that endpoint's.
+            DT_SS_EP_COMPANION if len >= 6 => {
+                if let Some(e) = found.as_mut() {
+                    if !e.ss {
+                        e.ss = true;
+                        e.ss_burst = d[2] & 0x0F;
+                        e.ss_mult = d[3] & 0x03;
+                        e.ss_bpi = le16(d, 4);
+                    }
+                    return found;
+                }
+            }
+            DT_ENDPOINT if found.is_some() => return found, // another endpoint: no companion for ours
+            _ => {}
+        }
+        off += len;
+    }
+    found
+}
+
+/// PURE: the length of the prefix of `cfg` that holds the configuration, the VideoControl interface and the
+/// FIRST VideoStreaming function only — cut at the first interface descriptor (on a descriptor boundary) whose
+/// number differs from the first VideoStreaming interface's, once that one has been seen. `parse` keeps ONE
+/// `vs_intf` and one format list, so on a multi-function camera (the D435i: depth, IR and colour functions)
+/// the census of the whole window mixes three functions' formats and alternates; the census of this prefix is
+/// one function's, which is the one this rung streams. Returns `cfg.len()` for a single-function camera.
+pub fn first_function_len(cfg: &[u8]) -> usize {
+    let mut off = 0usize;
+    let mut vs: Option<u8> = None;
+    while off + 2 <= cfg.len() {
+        let len = cfg[off] as usize;
+        if len < 2 || off + len > cfg.len() {
+            break;
+        }
+        if cfg[off + 1] == DT_INTERFACE && len >= 9 {
+            let n = cfg[off + 2];
+            match vs {
+                Some(v) if v != n => return off,
+                None if cfg[off + 5] == CC_VIDEO && cfg[off + 6] == SC_VIDEOSTREAMING => vs = Some(n),
+                _ => {}
+            }
+        }
+        off += len;
+    }
+    cfg.len()
+}
+
+/// UVC 1.5 §2.4.3.3: one payload header, decoded.
+#[derive(Clone, Copy, Default)]
+pub struct PayloadHdr {
+    pub len: usize,
+    pub fid: bool,
+    pub eof: bool,
+    pub err: bool,
+    pub eoh: bool,
+    pub pts: Option<u32>,
+    /// (32-bit source time clock, 16-bit SOF counter — bits 10..0 are the 1 kHz SOF number).
+    pub scr: Option<(u32, u16)>,
+}
+
+/// PURE: decode the header at the front of one isochronous payload. Refused (and the payload dropped by the
+/// caller) when `bHeaderLength` is under 2, longer than the payload, or shorter than the fields its own
+/// `bmHeaderInfo` declares (2 + 4 for PTS + 6 for SCR) — a header that lies about its length would otherwise
+/// shift every image byte after it.
+pub fn payload_header(p: &[u8]) -> Result<PayloadHdr, &'static str> {
+    if p.len() < 2 {
+        return Err("runt");
+    }
+    let hlen = p[0] as usize;
+    let info = p[1];
+    if hlen < 2 {
+        return Err("hlen<2");
+    }
+    if hlen > p.len() {
+        return Err("hlen>payload");
+    }
+    let need = 2 + if info & BFH_PTS != 0 { 4 } else { 0 } + if info & BFH_SCR != 0 { 6 } else { 0 };
+    if hlen < need {
+        return Err("hlen<fields");
+    }
+    let mut o = 2usize;
+    let pts = if info & BFH_PTS != 0 {
+        let v = le32(p, o);
+        o += 4;
+        Some(v)
+    } else {
+        None
+    };
+    let scr = if info & BFH_SCR != 0 { Some((le32(p, o), le16(p, o + 4))) } else { None };
+    Ok(PayloadHdr {
+        len: hlen,
+        fid: info & BFH_FID != 0,
+        eof: info & BFH_EOF != 0,
+        err: info & BFH_ERR != 0,
+        eoh: info & BFH_EOH != 0,
+        pts,
+        scr,
+    })
+}
+
+/// THE FRAME ASSEMBLER. Pure (it owns two byte buffers and counters, and touches nothing else), so the self-test
+/// drives the SAME code the claim path does.
+///
+/// Frame boundaries, UVC 1.5 §2.4.3.3: a frame is the run of payloads sharing one FID; `EOF` on a payload closes
+/// it early (the next payload's FID toggle then finds nothing open). A toggle with no EOF closes it too — EOF is
+/// optional for a device, the toggle is not. `ERR` marks the open frame bad. A closed frame that is neither bad
+/// nor larger than the store is SWAPPED to the front (the double buffer: the back is written by the claim path,
+/// the front is what `latest_frame` hands up) and `seq` advances; its length against `expect`
+/// (`dwMaxVideoFrameSize`) sorts it `good` or `short`.
+pub struct Assembler {
+    back: alloc::vec::Vec<u8>,
+    front: alloc::vec::Vec<u8>,
+    expect: usize,
+    len: usize,
+    fid: Option<bool>,
+    bad: bool,
+    pub front_len: usize,
+    pub seq: u32,
+    pub payloads: u32,
+    pub bytes: u64,
+    pub frames: u32,
+    pub good: u32,
+    pub short: u32,
+    pub errf: u32,
+    pub over: u32,
+    pub bad_hdr: u32,
+}
+
+impl Assembler {
+    /// `store` bytes per buffer (0 = count-only), `expect` = the frame size the commit block names.
+    pub fn new(store: usize, expect: usize) -> Self {
+        let mut back = alloc::vec::Vec::new();
+        let mut front = alloc::vec::Vec::new();
+        if store != 0 && back.try_reserve_exact(store).is_ok() && front.try_reserve_exact(store).is_ok() {
+            back.resize(store, 0);
+            front.resize(store, 0);
+        } else {
+            back = alloc::vec::Vec::new();
+            front = alloc::vec::Vec::new();
+        }
+        Assembler {
+            back, front, expect, len: 0, fid: None, bad: false, front_len: 0, seq: 0,
+            payloads: 0, bytes: 0, frames: 0, good: 0, short: 0, errf: 0, over: 0, bad_hdr: 0,
+        }
+    }
+
+    pub fn stores(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    pub fn front(&self) -> &[u8] {
+        &self.front[..self.front_len.min(self.front.len())]
+    }
+
+    fn close(&mut self) {
+        if self.len == 0 && !self.bad {
+            return; // an EOF already closed it; the toggle after finds nothing open
+        }
+        self.frames = self.frames.wrapping_add(1);
+        let over = self.len > self.back.len();
+        if self.bad {
+            self.errf = self.errf.wrapping_add(1);
+        } else if over {
+            self.over = self.over.wrapping_add(1);
+        } else {
+            if self.expect != 0 && self.len != self.expect {
+                self.short = self.short.wrapping_add(1);
+            } else {
+                self.good = self.good.wrapping_add(1);
+            }
+            core::mem::swap(&mut self.back, &mut self.front);
+            self.front_len = self.len;
+            self.seq = self.seq.wrapping_add(1);
+        }
+        self.len = 0;
+        self.bad = false;
+    }
+
+    /// One isochronous payload (one Isoch TD's bytes). Returns the frames it closed (0, 1 or 2 — a toggle that
+    /// closes the previous frame and an EOF that closes this one).
+    pub fn push(&mut self, p: &[u8]) -> u32 {
+        if p.is_empty() {
+            return 0; // a microframe the device had nothing for: normal, not counted
+        }
+        self.payloads = self.payloads.wrapping_add(1);
+        let h = match payload_header(p) {
+            Ok(h) => h,
+            Err(_) => {
+                self.bad_hdr = self.bad_hdr.wrapping_add(1);
+                return 0;
+            }
+        };
+        let before = self.frames;
+        if let Some(f) = self.fid {
+            if f != h.fid {
+                self.close();
+            }
+        }
+        self.fid = Some(h.fid);
+        if h.err {
+            self.bad = true;
+        }
+        let data = &p[h.len..];
+        let room = self.back.len().saturating_sub(self.len);
+        let n = data.len().min(room);
+        if n != 0 {
+            self.back[self.len..self.len + n].copy_from_slice(&data[..n]);
+        }
+        self.len += data.len(); // counted in full: a frame past the store is `over`, not silently truncated
+        self.bytes = self.bytes.wrapping_add(data.len() as u64);
+        if h.eof {
+            self.close();
+        }
+        self.frames.wrapping_sub(before)
+    }
+}
+
+/// The xHCI side of the stream, as the class driver sees it. `drivers/xhci/isoch.rs` implements it over one
+/// slot; nothing in this file names a register.
+pub trait IsoHost {
+    /// EP0, the `Xfer` contract: bytes transferred, or the reason. Data lands in / leaves from `buf()`.
+    fn control(&mut self, bm: u8, br: u8, wv: u16, wi: u16, wl: u16, dir_in: bool) -> Result<u32, &'static str>;
+    fn buf(&mut self) -> *mut u8;
+    fn cap(&self) -> usize;
+    fn name(&self) -> &'static str;
+    /// Configure Endpoint (Add) for `ep` — the controller reserves the bandwidth. Err((completion code, name)).
+    fn iso_configure(&mut self, ep: &IsoEp) -> Result<(), (u8, &'static str)>;
+    /// Fill the ring and ring the doorbell. Ok((TDs outstanding, lead in microframes, scheduling name)).
+    fn iso_start(&mut self, ep: &IsoEp) -> Result<(u32, u32, &'static str), &'static str>;
+    /// The unwind of `iso_configure` (Configure Endpoint, Drop).
+    fn iso_drop(&mut self, ep: &IsoEp);
+}
+
+static STREAM: crate::sync::Mutex<Option<Assembler>> = crate::sync::Mutex::new(None);
+static STREAM_ARMED: AtomicBool = AtomicBool::new(false);
+/// (addr << 24) | fourcc-less identity for `tests uvc`: addr, width, height, packed.
+static STREAM_ADDR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static STREAM_WH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static STREAM_CC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn stream_arm(addr: u8, w: u16, h: u16, cc: [u8; 4], expect: u32) -> bool {
+    let store = if expect != 0 && (expect as usize) <= STREAM_STORE_MAX { expect as usize } else { 0 };
+    let a = Assembler::new(store, expect as usize);
+    let stores = a.stores();
+    *STREAM.lock() = Some(a);
+    STREAM_ADDR.store(addr as u32, Ordering::Relaxed);
+    STREAM_WH.store(((w as u32) << 16) | h as u32, Ordering::Relaxed);
+    STREAM_CC.store(u32::from_le_bytes(cc), Ordering::Relaxed);
+    STREAM_ARMED.store(true, Ordering::Release);
+    stores
+}
+
+/// The stream is gone (unwind, or the device left). The assembler and its buffers are dropped here, in the
+/// service context — never on the claim path.
+pub fn stream_disarm() {
+    STREAM_ARMED.store(false, Ordering::Release);
+    let _ = STREAM.lock().take();
+}
+
+/// THE HAND-UP FROM THE CONTROLLER: one completed Isoch TD's bytes. Called from the xHCI transfer-event claim.
+pub fn stream_payload(p: &[u8]) {
+    if let Some(a) = STREAM.lock().as_mut() {
+        a.push(p);
+    }
+}
+
+/// THE HAND-UP TO A CONSUMER: the latest complete frame (the front buffer) and its sequence number, under the
+/// stream lock (hold it briefly — the claim path waits on it). `false` when no frame has completed yet.
+pub fn latest_frame(f: &mut dyn FnMut(&[u8], u32)) -> bool {
+    match STREAM.lock().as_ref() {
+        Some(a) if a.seq != 0 => {
+            f(a.front(), a.seq);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn cc_str(c: u32) -> [char; 4] {
+    fourcc(&{
+        let mut g = [0u8; 16];
+        g[..4].copy_from_slice(&c.to_le_bytes());
+        g
+    })
+}
+
+/// THE xHCI ENTRY POINT — `probe`'s negotiation, then the commit `probe` withholds. Called once per candidate
+/// slot from the controller's main-loop service, never from an event handler (every transfer here pumps the
+/// event ring). `cfg` is the first 64 bytes of the configuration descriptor, copied OUT of the EP0 buffer by
+/// the caller (so, unlike `probe`'s window, it stays valid across the transfers below).
+///
+/// The order is the spec's and Linux-shaped where the spec leaves it open: negotiate (Probe), reserve the
+/// bandwidth on the host (Configure Endpoint — no device state yet, so a refusal costs nothing), COMMIT
+/// (UVC 1.1 §4.3.1.1: the device arms its streaming state machine), SET_INTERFACE to the chosen alternate
+/// (USB 2.0 §9.4.10: the endpoint exists on the device from here), then the ring. Each failure names its stage
+/// and unwinds what came before it.
+pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn IsoHost) {
+    if !SELFTEST_RUN.swap(true, Ordering::Relaxed) {
+        if !crate::tests::defer("uvc", uvc_fixture) { selftest(); let _ = stream_selftest(); } // the same once-per-boot rule as `probe`; `tests uvc` fires it
+    }
+    if !cfg_has_video_iad(cfg) {
+        crate::bootlog_println!("[uvc] skip addr={} host={} reason=no-video-iad", addr, h.name());
+        return;
+    }
+    let cap = h.cap();
+    let wtotal = if cfg.len() >= 4 { le16(cfg, 2) } else { 0 };
+    let want = (wtotal as usize).min(cap) as u16;
+    crate::census_println!(
+        "[uvc] candidate addr={} host={} cfg_value={} wTotalLength={} reading={} ep0_cap={}{}",
+        addr, h.name(), config_value, wtotal, want, cap,
+        if wtotal as usize > cap { " (the tail of this descriptor is UNREAD)" } else { "" }
+    );
+    let buf = h.buf();
+    let n = match h.control(0x80, 6, 0x0200, 0, want, true) {
+        Ok(n) if n >= 9 => (n as usize).min(cap),
+        Ok(n) => {
+            serial_println!("[uvc] abort addr={} host={} stage=cfg-reread req=GET_DESCRIPTOR(CONFIGURATION) wLength={} got={} reason=runt", addr, h.name(), want, n);
+            return;
+        }
+        Err(e) => {
+            serial_println!("[uvc] abort addr={} host={} stage=cfg-reread req=GET_DESCRIPTOR(CONFIGURATION) wLength={} reason={}", addr, h.name(), want, e);
+            return;
+        }
+    };
+    // SAFETY: `buf` is the host's EP0 buffer, valid for `cap` bytes, and the transfer above wrote `n` <= cap.
+    // `full` is read only until the next transfer, which reuses the buffer.
+    let full = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
+    let call = parse(full);
+    print_census(idx, addr, &call);
+    let cut = first_function_len(full);
+    let c = if cut < full.len() { parse(&full[..cut]) } else { call };
+    if cut < full.len() {
+        crate::census_println!("[uvc] stream fn intf={} is the first VideoStreaming function (window cut at {} of {})", c.vs_intf, cut, n);
+    }
+    if !c.have_vs {
+        serial_println!("[uvc] probe skipped addr={} host={} reason=no-videostreaming-interface read={} wTotalLength={}", addr, h.name(), n, wtotal);
+        return;
+    }
+    // Every alternate's endpoint, read NOW — the next transfer overwrites `full`.
+    let mut eps = [IsoEp::default(); MAX_ALT];
+    let mut neps = 0usize;
+    for a in c.alts[..c.nalt].iter() {
+        if let Some(e) = iso_ep_of(full, c.vs_intf, a.alt) {
+            eps[neps] = e;
+            neps += 1;
+        }
+    }
+    // The format: `probe`'s rule (the first UNCOMPRESSED format, its default frame) — a size that is arithmetic,
+    // so `dwMaxVideoFrameSize` and every assembled frame are numbers the fixture can CHECK.
+    let mut pick: Option<(u8, u8, u32, u16, u16, [u8; 4])> = None;
+    for f in c.fmts[..c.nfmt].iter() {
+        if f.kind != Kind::Uncompressed || f.nframes == 0 {
+            continue;
+        }
+        let fr = f.frames[..f.nframes].iter().find(|fr| fr.index == f.default_frame).unwrap_or(&f.frames[0]);
+        pick = Some((f.index, fr.index, fr.default_interval, fr.width, fr.height, [f.guid[0], f.guid[1], f.guid[2], f.guid[3]]));
+        break;
+    }
+    let Some((fmt_i, frame_i, interval, fw, fh, cc4)) = pick else {
+        serial_println!("[uvc] probe skipped addr={} host={} reason=no-uncompressed-format", addr, h.name());
+        return;
+    };
+    if neps == 0 {
+        serial_println!("[uvc] commit=withheld reason=no-iso-in-alternate addr={} host={} vs_intf={} alts={}", addr, h.name(), c.vs_intf, c.nalt);
+        return;
+    }
+    let wvalue = (VS_PROBE_CONTROL as u16) << 8;
+    let windex = c.vs_intf as u16;
+    if h.control(0x00, 9, config_value as u16, 0, 0, false).is_err() {
+        serial_println!("[uvc] abort addr={} host={} stage=set-configuration req=SET_CONFIGURATION({}) reason=stalled-or-timeout", addr, h.name(), config_value);
+        return;
+    }
+    crate::bootlog_println!("[uvc] configured addr={} host={} cfg_value={} vs_intf={}", addr, h.name(), config_value, c.vs_intf);
+    let mut blk_len = 0usize;
+    for (stage, req) in [("min", RQ_GET_MIN), ("max", RQ_GET_MAX), ("def", RQ_GET_DEF)] {
+        match h.control(BMREQ_GET_INTF, req, wvalue, windex, PROBE_LEN_ASK, true) {
+            Ok(got) => {
+                // SAFETY: as `full` above; `got` <= PROBE_LEN_ASK <= cap.
+                let b = unsafe { core::slice::from_raw_parts(buf as *const u8, (got as usize).min(cap)) };
+                if let Some(p) = parse_probe(b) {
+                    blk_len = p.len.min(PROBE_LEN_ASK as usize);
+                    crate::census_println!(
+                        "[uvc] probe stage={} req={:#04x} len={} bmHint={:#06x} bFormatIndex={} bFrameIndex={} dwFrameInterval={} dwMaxVideoFrameSize={} dwMaxPayloadTransferSize={}",
+                        stage, req, p.len, p.hint, p.format_index, p.frame_index, p.frame_interval, p.max_video_frame_size, p.max_payload_transfer_size
+                    );
+                }
+            }
+            Err(e) => {
+                serial_println!("[uvc] probe stage={} req={:#04x} host={} STALLED reason={} — sequence ended, NOT retried", stage, req, h.name(), e);
+                return;
+            }
+        }
+    }
+    if blk_len < PROBE_LEN_MIN {
+        serial_println!("[uvc] probe abort addr={} host={} reason=no-usable-block-length", addr, h.name());
+        return;
+    }
+    {
+        // SAFETY: `buf` valid for `cap` >= blk_len bytes; no transfer is in flight.
+        let w = unsafe { core::slice::from_raw_parts_mut(buf, blk_len) };
+        build_probe(w, fmt_i, frame_i, interval);
+    }
+    if let Err(e) = h.control(BMREQ_SET_INTF, RQ_SET_CUR, wvalue, windex, blk_len as u16, false) {
+        serial_println!("[uvc] probe stage=set req={:#04x} host={} STALLED reason={} — sequence ended, NOT retried", RQ_SET_CUR, h.name(), e);
+        return;
+    }
+    let mut commit = [0u8; PROBE_LEN_ASK as usize];
+    let p = match h.control(BMREQ_GET_INTF, RQ_GET_CUR, wvalue, windex, blk_len as u16, true) {
+        Ok(got) => {
+            let got = (got as usize).min(blk_len);
+            // SAFETY: as above; `got` <= blk_len <= cap.
+            let b = unsafe { core::slice::from_raw_parts(buf as *const u8, got) };
+            commit[..got].copy_from_slice(b);
+            match parse_probe(b) {
+                Some(p) => p,
+                None => {
+                    serial_println!("[uvc] probe stage=cur req={:#04x} host={} RUNT got={} need>={}", RQ_GET_CUR, h.name(), got, PROBE_LEN_MIN);
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            serial_println!("[uvc] probe stage=cur req={:#04x} host={} STALLED reason={}", RQ_GET_CUR, h.name(), e);
+            return;
+        }
+    };
+    serial_println!(
+        "[uvc] probe negotiated host={} asked=({},{},{}) got=({},{},{}) agreed={} dwMaxVideoFrameSize={} dwMaxPayloadTransferSize={}",
+        h.name(), fmt_i, frame_i, interval, p.format_index, p.frame_index, p.frame_interval,
+        p.format_index == fmt_i && p.frame_index == frame_i && p.frame_interval == interval,
+        p.max_video_frame_size, p.max_payload_transfer_size
+    );
+    // The alternate: the SMALLEST whose per-interval bytes cover dwMaxPayloadTransferSize (uvc.md §9.1 — the
+    // bandwidth a camera reserves is the alternate's, so the smallest that fits is the polite one). A device
+    // that names 0, or more than its widest alternate carries, gets the widest, and the line says which.
+    let need = p.max_payload_transfer_size;
+    let mut best: Option<usize> = None;
+    let mut widest = 0usize;
+    for i in 0..neps {
+        let b = eps[i].esit_bytes();
+        if b > eps[widest].esit_bytes() {
+            widest = i;
+        }
+        if need != 0 && b >= need && best.map(|j| b < eps[j].esit_bytes()).unwrap_or(true) {
+            best = Some(i);
+        }
+    }
+    let why = if best.is_some() { "smallest-covering" } else if need == 0 { "widest(payload=0)" } else { "widest(payload-exceeds-all)" };
+    let ep = eps[best.unwrap_or(widest)];
+    crate::census_println!(
+        "[uvc] alt-choice alt={} ep={:#04x} esit={} need={} why={} ss={} burst={} mult={} bpi={}",
+        ep.alt, ep.addr, ep.esit_bytes(), need, why, ep.ss, ep.ss_burst as u32 + 1, ep.mult(), ep.ss_bpi
+    );
+    // Host first: Configure Endpoint changes nothing on the device, so a bandwidth refusal leaves the camera
+    // exactly as negotiation left it — uncommitted.
+    if let Err((code, name)) = h.iso_configure(&ep) {
+        serial_println!("[uvc] commit=withheld reason=configure-endpoint-refused cc={} ({}) host={} alt={} esit={}", code, name, h.name(), ep.alt, ep.esit_bytes());
+        return;
+    }
+    // COMMIT: the negotiated block exactly as GET_CUR returned it (UVC 1.1 §4.3.1.1: "the host shall issue a
+    // SET_CUR(Commit) with the values returned by the last GET_CUR(Probe)").
+    // SAFETY: `buf` valid for `cap` >= blk_len; no transfer in flight.
+    unsafe { core::slice::from_raw_parts_mut(buf, blk_len) }.copy_from_slice(&commit[..blk_len]);
+    let cvalue = (VS_COMMIT_CONTROL as u16) << 8;
+    if let Err(e) = h.control(BMREQ_SET_INTF, RQ_SET_CUR, cvalue, windex, blk_len as u16, false) {
+        h.iso_drop(&ep);
+        serial_println!("[uvc] commit=failed stage=commit req=SET_CUR(VS_COMMIT_CONTROL) host={} reason={} — endpoint dropped", h.name(), e);
+        return;
+    }
+    // SET_INTERFACE (USB 2.0 §9.4.10: bmRequestType 0x01, bRequest 11, wValue = alternate, wIndex = interface).
+    if let Err(e) = h.control(0x01, 11, ep.alt as u16, ep.intf as u16, 0, false) {
+        h.iso_drop(&ep);
+        serial_println!("[uvc] commit=failed stage=set-interface alt={} intf={} host={} reason={} — endpoint dropped", ep.alt, ep.intf, h.name(), e);
+        return;
+    }
+    let stores = stream_arm(addr, fw, fh, cc4, p.max_video_frame_size);
+    match h.iso_start(&ep) {
+        Ok((tds, lead, sched)) => {
+            let cc = cc_str(u32::from_le_bytes(cc4));
+            serial_println!(
+                "[uvc] commit=armed pipe=iso ep={} mps={} mult={} interval={} alt={} esit={} payload={} host={} tds={} lead_uframes={} sched={} frame={}x{} fourcc={}{}{}{} frame_bytes={} store={}",
+                ep.addr & 0x0F, ep.mps, ep.mult(), ep.interval, ep.alt, ep.esit_bytes(), need, h.name(), tds, lead, sched,
+                fw, fh, cc[0], cc[1], cc[2], cc[3], p.max_video_frame_size, if stores { "double-buffer" } else { "count-only" }
+            );
+        }
+        Err(e) => {
+            let _ = h.control(0x01, 11, 0, ep.intf as u16, 0, false); // alternate 0: the device stops streaming
+            h.iso_drop(&ep);
+            stream_disarm();
+            serial_println!("[uvc] commit=failed stage=ring-start host={} reason={} — alt 0 selected, endpoint dropped", h.name(), e);
+        }
+    }
+}
+
+/// The stream half of the self-test: `payload_header`, the `Assembler`, `iso_ep_of` and `first_function_len`,
+/// each against bytes written here out of the spec tables, each check naming its field (the `selftest` shape).
+fn stream_selftest() -> bool {
+    let mut fails = 0u32;
+    let mut first: (&'static str, u64, u64) = ("", 0, 0);
+    let mut check = |name: &'static str, got: u64, want: u64| {
+        if got != want {
+            if fails == 0 {
+                first = (name, got, want);
+            }
+            fails += 1;
+        }
+    };
+    // Headers. P2 carries BOTH optional fields with distinct values, so a PTS/SCR offset mutation cannot alias.
+    let p2: [u8; 14] = [12, BFH_EOH | BFH_SCR | BFH_PTS | BFH_EOF, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0x23, 0x01, b'E', b'F'];
+    match payload_header(&p2) {
+        Ok(h) => {
+            check("hdr.len", h.len as u64, 12);
+            check("hdr.fid", h.fid as u64, 0);
+            check("hdr.eof", h.eof as u64, 1);
+            check("hdr.eoh", h.eoh as u64, 1);
+            check("hdr.pts", h.pts.unwrap_or(0) as u64, 0x1122_3344);
+            check("hdr.scr.stc", h.scr.map(|s| s.0).unwrap_or(0) as u64, 0x5566_7788);
+            check("hdr.scr.sof", h.scr.map(|s| s.1).unwrap_or(0) as u64, 0x0123);
+        }
+        Err(_) => check("hdr.parsed", 0, 1),
+    }
+    check("hdr.refuse.hlen_over", payload_header(&[13, BFH_EOH, 1, 2, 3]).is_err() as u64, 1);
+    check("hdr.refuse.fields", payload_header(&[4, BFH_EOH | BFH_PTS, 1, 2, 3, 4]).is_err() as u64, 1);
+    check("hdr.refuse.hlen1", payload_header(&[1, BFH_EOH]).is_err() as u64, 1);
+    // The assembler: store 6, expect 6. Frame 1 = "ABCD" + "EF" closed by EOF (good); frame 2 = 3 bytes closed by
+    // a toggle with no EOF (short); frame 3 = 6 bytes with ERR (errf, not published); frame 4 = 8 bytes (over).
+    let mut a = Assembler::new(6, 6);
+    let p1: [u8; 6] = [2, BFH_EOH, b'A', b'B', b'C', b'D'];
+    let p3: [u8; 9] = [6, BFH_EOH | BFH_PTS | BFH_FID, 9, 9, 9, 9, b'x', b'y', b'z'];
+    let p4: [u8; 3] = [2, BFH_EOH, b'q'];
+    let p5: [u8; 7] = [2, BFH_EOH | BFH_ERR | BFH_EOF, 1, 2, 3, 4, 5];
+    let p8: [u8; 10] = [2, BFH_EOH | BFH_FID, 1, 2, 3, 4, 5, 6, 7, 8];
+    let p9: [u8; 2] = [2, BFH_EOH | BFH_FID | BFH_EOF];
+    let bad: [u8; 5] = [13, BFH_EOH, 1, 2, 3];
+    check("asm.p1.closed", a.push(&p1) as u64, 0);
+    check("asm.p2.closed", a.push(&p2) as u64, 1);
+    check("asm.f1.seq", a.seq as u64, 1);
+    check("asm.f1.len", a.front_len as u64, 6);
+    let f1 = a.front().iter().take(8).enumerate().fold(0u64, |acc, (i, b)| acc | ((*b as u64) << (8 * i)));
+    check("asm.f1.bytes", f1, u64::from_le_bytes([b'A', b'B', b'C', b'D', b'E', b'F', 0, 0]));
+    check("asm.empty.ignored", a.push(&[]) as u64, 0);
+    check("asm.p3.closed", a.push(&p3) as u64, 0);
+    check("asm.p4.closed", a.push(&p4) as u64, 1);
+    check("asm.f2.len", a.front_len as u64, 3);
+    check("asm.f2.byte0", a.front().first().copied().unwrap_or(0) as u64, b'x' as u64);
+    check("asm.p5.closed", a.push(&p5) as u64, 1);
+    check("asm.bad.closed", a.push(&bad) as u64, 0);
+    check("asm.p8.closed", a.push(&p8) as u64, 0);
+    check("asm.p9.closed", a.push(&p9) as u64, 1);
+    check("asm.frames", a.frames as u64, 4);
+    check("asm.good", a.good as u64, 1);
+    check("asm.short", a.short as u64, 1);
+    check("asm.errf", a.errf as u64, 1);
+    check("asm.over", a.over as u64, 1);
+    check("asm.bad_hdr", a.bad_hdr as u64, 1);
+    check("asm.payloads", a.payloads as u64, 8);
+    check("asm.bytes", a.bytes, 4 + 2 + 3 + 1 + 5 + 8);
+    check("asm.seq", a.seq as u64, 2);
+    // Endpoints out of the CAMERA1 fixture: alt 1 is 0x81 / 1024 x (1+1) / bInterval 1, alt 2 is 1024 x 3, alt 3
+    // (the isochronous OUT) has no IN endpoint, and the whole fixture is one function.
+    match iso_ep_of(&FIXTURE, 1, 1) {
+        Some(e) => {
+            check("ep.alt1.addr", e.addr as u64, 0x81);
+            check("ep.alt1.mps", e.mps as u64, 1024);
+            check("ep.alt1.extra", e.hs_extra as u64, 1);
+            check("ep.alt1.interval", e.interval as u64, 1);
+            check("ep.alt1.ss", e.ss as u64, 0);
+            check("ep.alt1.esit", e.esit_bytes() as u64, 2048);
+        }
+        None => check("ep.alt1.found", 0, 1),
+    }
+    check("ep.alt2.esit", iso_ep_of(&FIXTURE, 1, 2).map(|e| e.esit_bytes()).unwrap_or(0) as u64, 3072);
+    check("ep.alt3.out_refused", iso_ep_of(&FIXTURE, 1, 3).is_none() as u64, 1);
+    check("fn.single", first_function_len(&FIXTURE) as u64, FIXTURE.len() as u64);
+    // A SuperSpeed alternate: endpoint 0x82, mps 1024, bInterval 1, then its companion (bMaxBurst 15, Mult 2,
+    // wBytesPerInterval 0xC000 = 49152) — and a second VideoStreaming function after it, where the cut falls.
+    #[rustfmt::skip]
+    let ss: [u8; 49] = [
+        9, 0x02, 49, 0, 2, 1, 0, 0x80, 50,
+        9, DT_INTERFACE, 1, 1, 1, CC_VIDEO, SC_VIDEOSTREAMING, 0, 0,
+        7, DT_ENDPOINT, 0x82, 0x05, 0x00, 0x04, 1,
+        6, DT_SS_EP_COMPANION, 15, 2, 0x00, 0xC0,
+        9, DT_INTERFACE, 2, 0, 0, CC_VIDEO, SC_VIDEOSTREAMING, 0, 0,
+        9, DT_INTERFACE, 2, 1, 0, CC_VIDEO, SC_VIDEOSTREAMING, 0, 0,
+    ];
+    match iso_ep_of(&ss, 1, 1) {
+        Some(e) => {
+            check("ss.addr", e.addr as u64, 0x82);
+            check("ss.flag", e.ss as u64, 1);
+            check("ss.burst", e.ss_burst as u64, 15);
+            check("ss.mult", e.ss_mult as u64, 2);
+            check("ss.bpi", e.ss_bpi as u64, 49_152);
+            check("ss.esit", e.esit_bytes() as u64, 49_152);
+        }
+        None => check("ss.found", 0, 1),
+    }
+    check("fn.cut", first_function_len(&ss) as u64, 31);
+    if fails == 0 {
+        serial_println!(":: uvc: stream-selftest hdr=ok asm frames={} good={} short={} errf={} over={} ep=ok ss=ok cut=ok -> PASS ::", a.frames, a.good, a.short, a.errf, a.over);
+        true
+    } else {
+        serial_println!(":: uvc: stream-selftest failures={} first={} got={} want={} -> FAIL ::", fails, first.0, first.1, first.2);
+        false
+    }
+}
+
+/// `tests uvc`, the stream half: frames over two seconds of wall clock from the armed xHCI stream, or SKIP by
+/// name when there is none (QEMU's xHCI carries a UVC device only with a host webcam passed through).
+fn stream_fixture(parsed: bool) {
+    let streamed = stream_selftest();
+    let ok = |b: bool| if b { "PASS" } else { "FAIL" };
+    if !STREAM_ARMED.load(Ordering::Acquire) {
+        // CPUID.01H:ECX bit 31 — set by a hypervisor for its guest (QEMU sets it on its x86 models).
+        let vm = core::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+        let reason = if vm { "qemu-no-uvc-stream" } else { "no-xhci-uvc-stream" };
+        if parsed && streamed {
+            serial_println!(":: UVC: selftest=PASS stream_selftest=PASS host=- frames_2s=- fps=- -> SKIP reason={} ::", reason);
+        } else {
+            serial_println!(":: UVC: selftest={} stream_selftest={} host=- frames_2s=- fps=- -> FAIL ::", ok(parsed), ok(streamed));
+        }
+        return;
+    }
+    let snap = || STREAM.lock().as_ref().map(|a| (a.frames, a.good, a.short, a.errf, a.over, a.payloads, a.bytes, a.bad_hdr)).unwrap_or_default();
+    let i0 = crate::drivers::xhci::isoch::stats();
+    let s0 = snap();
+    let t0 = crate::arch::now_cycles();
+    let span = crate::arch::hw_wait_budget(); // 2 s of wall clock once the TSC is calibrated
+    while crate::arch::now_cycles().wrapping_sub(t0) < span {
+        crate::arch::sched::sleep_ticks(10);
+        core::hint::spin_loop();
+    }
+    let dt = crate::arch::now_cycles().wrapping_sub(t0).max(1);
+    let s1 = snap();
+    let i1 = crate::drivers::xhci::isoch::stats();
+    let frames = s1.0.wrapping_sub(s0.0);
+    let hz = crate::arch::apic::tsc_hz();
+    let fps10 = if hz != 0 { (frames as u64).saturating_mul(10).saturating_mul(hz) / dt } else { frames as u64 * 5 };
+    let wh = STREAM_WH.load(Ordering::Relaxed);
+    let cc = cc_str(STREAM_CC.load(Ordering::Relaxed));
+    let pass = parsed && streamed && frames > 0;
+    serial_println!(
+        ":: UVC: selftest={} stream_selftest={} host=xhci addr={} {}x{} fourcc={}{}{}{} frames_2s={} fps={}.{} good={} short={} err={} over={} payloads={} bytes={} bad_hdr={} tds={} missed={} overrun={} xact={} dup={} resync={} sched={} -> {}{} ::",
+        ok(parsed), ok(streamed), STREAM_ADDR.load(Ordering::Relaxed), wh >> 16, wh & 0xFFFF, cc[0], cc[1], cc[2], cc[3],
+        frames, fps10 / 10, fps10 % 10, s1.1.wrapping_sub(s0.1), s1.2.wrapping_sub(s0.2), s1.3.wrapping_sub(s0.3),
+        s1.4.wrapping_sub(s0.4), s1.5.wrapping_sub(s0.5), s1.6.wrapping_sub(s0.6), s1.7.wrapping_sub(s0.7),
+        i1.tds.wrapping_sub(i0.tds), i1.missed.wrapping_sub(i0.missed), i1.overrun.wrapping_sub(i0.overrun),
+        i1.xact.wrapping_sub(i0.xact), i1.dup.wrapping_sub(i0.dup), i1.resync.wrapping_sub(i0.resync),
+        if i1.sia { "sia" } else { "frameid" },
+        if pass { "PASS" } else { "FAIL" }, if pass || frames != 0 { "" } else { " reason=no-frames" }
+    );
+}
+
 /// QUIETBOOT3 (rmbp-ledger B352, R80) — the parser self-test as a `tests uvc` fixture (the boot no longer runs it).
 fn uvc_fixture() {
-    let _ = selftest();
+    let parsed = selftest(); stream_fixture(parsed); // XHCIISO (rmbp-ledger B534): the stream half — its own self-test, then frames_2s from the armed xHCI stream, or SKIP by name
 }
 
 // ── REALSENSE (LEDGER SR92, R112): the multi-interface census and the D400's XU reads ───────────────

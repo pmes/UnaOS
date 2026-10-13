@@ -340,3 +340,144 @@ The gate built to catch that caught it, which doubles as the go-red proof of thi
 `banner-cert.sh` row — the same command on the knob-ON artifact reads `hits=1 -> OK`, exit 0. The
 KNOB->BUILDER WIRING CHECK in `check_kernel_cfg` now holds the invariant from the other side: with
 `uvc` named on a literal `x86-*` leg, deleting the builder line reds `./arroyo check` by name.
+
+## 11. XHCIISO (rmbp-ledger B534) — the stream on xHCI
+
+REALSENSE (SR92) found that no camera on this machine had ever delivered a frame: §2's withheld commit
+on EHCI, no isochronous path anywhere, and the D435i's native bus is xHCI. This arc builds the stream
+on **xHCI** and leaves EHCI exactly as §2–§8 describe it (its `commit=withheld reason=no-iso-pipe`
+is still true there, and `banner-cert.sh` still certifies it). Code: `drivers/xhci/isoch.rs` (new,
+cfg-erased with the knob) and the `XHCIISO` section of `drivers/uvc.rs` between `probe` and the
+fixture; `drivers/xhci/mod.rs` gains eight same-line cfg-gated folds and no lines. No new knob:
+everything is under `uvc`, and on x86_64 only (`all(target_arch = "x86_64", feature = "uvc")`, the
+`pub mod uvc` gate).
+
+```
+root FSM "no driver for class 0xef"  ─┐ isoch::note_root        (no traffic: a queue of 4 slots)
+hub walk, video IAD in the 64 B window ┘ isoch::note_downstream
+service_ftdi ladder slot → service_uvc (never while a root port enumerates; one candidate a pass)
+  └ 64 B window into the 4 KiB EP0 buffer → uvc::probe_iso(.., &mut XhciUvc)
+       full cfg re-read (≤ 4096) → parse → census → first VideoStreaming function (cut)
+       SET_CONFIGURATION → GET_MIN/MAX/DEF → SET_CUR/GET_CUR(Probe)
+       alternate = smallest whose ESIT bytes ≥ dwMaxPayloadTransferSize
+       Configure Endpoint (Add, Isoch IN) → SET_CUR(Commit) → SET_INTERFACE(alt) → ring fill + doorbell
+       "[uvc] commit=armed pipe=iso ep=<n> mps=<n> mult=<n> interval=<n> …"
+transfer event (slot, DCI) → isoch::claim: retire TDs in ring order through the named TRB,
+       uvc::stream_payload(TD bytes) → Assembler (FID/EOF/ERR, double buffer) → latest_frame()
+       re-produce one TD per retired one, Frame ID from MFINDEX, doorbell
+```
+
+### 11.1 Capture
+
+None yet (DRIVERS-METHOD §2). The first flight's `[uvc-iso] cfg-ep`, `cfg-ep out`, `start` and the
+first four `[uvc-iso] event` lines ARE the capture: the endpoint context as the controller holds it
+after Configure Endpoint (DW0/DW1/DW4 decoded), MFINDEX at the start, and the first completions'
+codes and residuals. Kept, when it exists, in `docs/dev/evidence/<round>/xhciiso/`.
+
+### 11.2 Rung ledger
+
+No rung below has a `STATUS.tsv` row yet; each is `open` until the fold's flight quotes its line.
+
+| rung | hypothesis | writes | confirms | refutes | alternatives |
+|---|---|---|---|---|---|
+| R0 premise | no isochronous pipe exists on any host here, so no frame ever arrived | none | REALSENSE's `commit=withheld reason=no-iso-pipe` on every boot (EHCI) and no xHCI UVC path in the tree (read) | a `[uvc]` frame count from an earlier boot (none known) | — |
+| R1 EP0 > 256 B | xHCI EP0 needs only a bigger buffer: one Data TRB of ≤ 4096 B, 4 KiB-aligned | GET_DESCRIPTOR(CONFIGURATION, wTotalLength ≤ 4096) | `[uvc] candidate … host=xhci … reading=<wTotalLength>` and a census without `INCOMPLETE` | `[uvc] abort … stage=cfg-reread reason=<e>` | a controller that splits the Data stage (none known) |
+| R2 Configure Endpoint | the Isoch IN context (§6.2.3: EP Type 5, CErr 0, MaxBurst, Mult, Interval, Max ESIT Payload) is accepted | Input Context A0+A(dci), Configure Endpoint | `[uvc-iso] cfg-ep … epstate=0(Disabled)->1(Running) result=cc=1 (Success)` | `result=Bandwidth-Error` / `Parameter-Error` / `Resource-Error`, and `[uvc] commit=withheld reason=configure-endpoint-refused cc=<n>` | a wrong Interval encoding (refuted by `cfg-ep out dw0 interval=`), Max ESIT Payload split (dw0 esit_hi / dw4 esit_lo) |
+| R3 commit + alt | SET_CUR(Commit) with GET_CUR's block, then SET_INTERFACE(alt) | the two control requests | `[uvc] commit=armed pipe=iso …` | `[uvc] commit=failed stage=commit\|set-interface reason=<e>` | a device that wants SET_INTERFACE before Commit (Linux's order is Commit first) |
+| R4 Frame-ID scheduling | TDs with Frame ID = (MFINDEX + IST + 16 µframes) >> 3, then one interval apart, are executed | Isoch TRBs (§6.4.1.3), doorbell DB[slot]=DCI | first `[uvc-iso] event` cc=1 or 13 with `residual` < td_len | 64 missed with 0 delivered → `[uvc-iso] sched frameid->sia …` (the SIA rung runs in the same boot) | SIA (bit 31) from the first TD; a Frame ID off by the IST unit (frames vs µframes, §5.3.4) |
+| R5 TBC/TLBPC | HS: TBC 0, TLBPC = packets−1; SS: bursts of bMaxBurst+1 [ONE-SOURCE + recalled Linux] | same TRBs | cc=1/13 events | cc=5 TRB Error on the first TD | the HS mult encoded into TBC instead |
+| R6 payload/frames | the UVC payload header (§2.4.3.3) delimits frames by FID toggle/EOF | none (host only) | `tests uvc` → `frames_2s>0`, `good>0` | `payloads>0 frames_2s=0` (header/FID reading wrong), `bad_hdr` ≈ `payloads` | a camera that streams MJPEG only (the format pick takes the first UNCOMPRESSED one) |
+
+### 11.3 This boot's tree
+
+Read top to bottom; the first line that differs from its "confirms" column is the wall.
+
+1. no `[uvc-iso] candidate` → the camera did not reach either fold (root: its device class is not
+   0xEF; hub: no video IAD in the first 64 bytes) — read the `xHCI: no driver for device class` line.
+2. `[uvc] candidate … host=xhci` then `[uvc] abort` → R1.
+3. `[uvc-iso] cfg-ep … result=<not Success>` → R2; the `cfg-ep out` line names the field.
+4. `[uvc] commit=failed` → R3.
+5. `[uvc-iso] start …` and then no `[uvc-iso] event` at all → the doorbell or the context's TR
+   Dequeue Pointer (read `cfg-ep out`), or a Frame ID the controller holds for later (compare
+   `mfindex=` / `first_frame~=`).
+6. events with cc=23 only → R4 refuted; the `frameid->sia` line follows within 64 TDs and the SIA
+   rung decides in the same boot.
+7. events cc=5 → R5. Events cc=1/13 but `frames_2s=0` → R6.
+
+### 11.4 Walls known and unapplied
+
+* **Bulk-streaming cameras.** A UVC function whose VideoStreaming alt 0 carries a BULK IN endpoint
+  (UVC 1.5 §2.4.3: bulk is allowed) gets `commit=withheld reason=no-iso-in-alternate`; whether the
+  D435i streams isochronous or bulk on this bus is unread (REALSENSE's census line names its
+  endpoints — read it first).
+* **The D435i's three functions.** `probe_iso` streams the FIRST VideoStreaming function only (the
+  cut, `first_function_len`); REALSENSE's `multi::census` names which role that is. REALSENSE's two
+  `sonde` folds live in EHCI's `probe`; on xHCI the same two calls belong in `probe_iso` (after the
+  full re-read and after `parse`) — a seat fold, both branches being unfolded.
+* **One stream per boot** (`one-stream-already-armed`), **no re-arm after a detach** without a
+  re-enumeration, and the ring/TD buffers of a detached stream are leaked (≤ 1 MiB + 4 KiB each):
+  the controller may still hold the TR Dequeue Pointer until the slot is disabled.
+* **A camera with a HID button** behind a hub is armed by the HID walk first (its SET_CONFIGURATION
+  is the same value); `probe_iso`'s SET_CONFIGURATION repeats it and resets the HID endpoint's
+  toggle on the device side. Unseen; named.
+* **SuperSpeedPlus isochronous companions** (USB 3.2 §9.6.8) and ESITs over 64 KiB are refused by
+  name (`esit-over-64KiB`).
+
+### 11.5 Constants
+
+| constant | value | sources |
+|---|---|---|
+| Isoch TRB type / fields | 5; ISP b2, IOC b5, TBC b8:7, BEI b9, TLBPC b19:16, Frame ID b30:20, SIA b31 | xHCI 1.2 §6.4.1.3 · Linux xhci-ring.c (recalled) |
+| Endpoint Context Isoch IN | EP Type 5, CErr 0, Mult DW0 9:8 (SS only), Interval DW0 23:16, Max ESIT Payload hi DW0 31:24 / lo DW4 31:16 | xHCI 1.2 §6.2.3 · the hub path's DW0/DW4 fix in mod.rs (XHCIHUB S1) |
+| Interval encoding | HS/SS bInterval−1; FS bInterval−1+3 | xHCI 1.2 §6.2.3.6 · USB 2.0 Table 9-13 · the hub path's encoding |
+| MFINDEX / IST | Runtime+0 b13:0; HCSPARAMS2 b3:0 (b3 = frames) | xHCI 1.2 §5.5.1, §5.3.4 [ONE-SOURCE] |
+| Frame window | > MFINDEX+IST, < +895 ms; start margin 16 µframes (chosen) | xHCI 1.2 §4.11.2.5 [ONE-SOURCE] |
+| Ring slack 8 | spurious Success after Short Packet (Panther Point 0x1e31) | Linux XHCI_SPURIOUS_SUCCESS · mod.rs `mouse_prev_phys` |
+| TBC/TLBPC | HS 0 / packets−1; SS ceil(p/(B+1))−1 / last burst−1 | xHCI 1.2 §6.4.1.3 · Linux xhci_get_burst_count (recalled) |
+| Payload header | bHeaderLength, bmHeaderInfo FID b0 EOF b1 PTS b2 SCR b3 STI b5 ERR b6 EOH b7; PTS 4 B, SCR 6 B | UVC 1.5 §2.4.3.3 (= 1.1) · the self-test |
+| VS_COMMIT_CONTROL | 0x02 | UVC 1.1 A.9.8 |
+| SS companion | type 0x30: bMaxBurst[2] bmAttributes[3] (Mult b1:0) wBytesPerInterval[4..6] | USB 3.2 §9.6.7 Table 9-27 · the self-test's SS fixture |
+
+### 11.6 Unwind
+
+* Configure Endpoint refused → nothing on the device changed (no Commit yet); the ring and TD
+  buffers are freed (never referenced by a context that took effect).
+* Commit or SET_INTERFACE failed → Configure Endpoint with the Drop flag; the device is left at alt 0.
+* Ring start failed → SET_INTERFACE(alt 0), Drop, the assembler disarmed.
+* An early return after a successful Configure Endpoint → `service_uvc` drops the endpoint.
+* Detach → `isoch::disconnect` unpublishes the pipe and disarms the assembler (buffers leaked, above).
+* Nothing here is destructive: every write is a standard request or a host-controller command, and
+  alt 0 returns the camera to its idle state (USB 2.0 §9.4.10, UVC 1.1 §2.4.3).
+
+### 11.7 What the next flight reads
+
+`UNAOS_UVC=1` media, a UVC webcam on an xHCI port (and the D435i on another boot), then
+`tests uvc`:
+
+```
+[uvc-iso] candidate slot=<n> path=<root|hub> queued
+[uvc] candidate addr=<slot> host=xhci cfg_value=<n> wTotalLength=<n> reading=<n> ep0_cap=4096
+[uvc] … census lines (§5) …
+[uvc] probe negotiated host=xhci asked=(f,fr,iv) got=(f,fr,iv) agreed=<b> dwMaxVideoFrameSize=<n> dwMaxPayloadTransferSize=<n>
+[uvc] alt-choice alt=<n> ep=0x8<n> esit=<n> need=<n> why=<smallest-covering|widest(…)> ss=<b> burst=<n> mult=<n> bpi=<n>
+[uvc-iso] cfg-ep slot=<n> dci=<n> speed=<n> type=isoch-in mps=<n> burst=<n> mult=<n> esit=<n> interval_enc=<n> (<n> uframes) ring=0x… slots=<n> epstate=0(Disabled)->1(Running) result=cc=1 (Success)
+[uvc-iso] cfg-ep out dw0=0x…[state=1 mult=<n> interval=<n> esit_hi=<n>] dw1=0x…[type=5 burst=<n> mps=<n>] dw4=0x…[avg=<n> esit_lo=<n>]
+[uvc-iso] start slot=<n> dci=<n> tds=<n> slack=8 stride=<n> td_len=<n> interval_uf=<n> ist_uf=<n> mfindex=<n> first_frame~<n> lead_uframes=<n> sched=frameid ring=0x… bufs=0x…
+[uvc] commit=armed pipe=iso ep=<n> mps=<n> mult=<n> interval=<n> alt=<n> esit=<n> payload=<n> host=xhci tds=<n> lead_uframes=<n> sched=frameid frame=<w>x<h> fourcc=YUY2 frame_bytes=<n> store=double-buffer
+[uvc-iso] event n=0 slot=<n> dci=<n> cc=<13 (Short-Packet)|1 (Success)> trb=0x… residual=<n> mfindex=<n> outstanding=<n>
+:: uvc: selftest fixture=289B formats=2 frames=3 alts=2 probe_roundtrip=ok probe_reply=ok -> PASS ::
+:: uvc: stream-selftest hdr=ok asm frames=4 good=1 short=1 errf=1 over=1 ep=ok ss=ok cut=ok -> PASS ::
+:: UVC: selftest=PASS stream_selftest=PASS host=xhci addr=<n> <w>x<h> fourcc=YUY2 frames_2s=<n> fps=<f> good=<n> short=<n> err=<n> over=<n> payloads=<n> bytes=<n> bad_hdr=<n> tds=<n> missed=<n> overrun=<n> xact=<n> dup=<n> resync=<n> sched=<frameid|sia> -> PASS ::
+```
+
+QEMU (no UVC device on its xHCI unless a host webcam is passed through) reads, by name:
+
+```
+:: UVC: selftest=PASS stream_selftest=PASS host=- frames_2s=- fps=- -> SKIP reason=qemu-no-uvc-stream ::
+```
+
+and metal with no camera on xHCI reads `-> SKIP reason=no-xhci-uvc-stream`. A FAIL names the half
+that failed (`selftest=FAIL` / `stream_selftest=FAIL`, the first failing field on its own line), or
+`frames_2s=0 … -> FAIL reason=no-frames` with the counters that say where the bytes stopped.
+`tests sonde`'s `frames_2s>0` (the row's last item) is REALSENSE's fixture and reads this stream
+only once the seat folds the two branches.
