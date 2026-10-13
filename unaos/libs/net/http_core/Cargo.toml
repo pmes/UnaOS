@@ -12,7 +12,7 @@ description = "UnaOS's own HTTP client core — WHATWG URL, HTTP/1.1 (RFC 9112),
 # docs/dev/evidence/net-1005/HTTPCORE.md.
 #
 # Dependencies: UnaOS crates only. `pixel_core` (its inflater: gzip/deflate content codings), `html_core` (its
-# `url` module, URLCORE SR87). Feature `host`
+# `url` module, URLCORE SR87), `psl_core` (the Public Suffix List, NETDEBT SR97). Feature `host`
 # (std): `tls_core` + `crypto_core` through tls_core's `cryptocore-std` (the PRODUCT provider) — the host
 # transport gneiss_pal::api::http drives. Dev-dependencies: none (the tests carry a tiny JSON reader and shell
 # out to curl for the vectors listed in vectors.txt).
@@ -26,6 +26,8 @@ h2 = []
 pixel_core = { path = "../../media/pixel_core" }
 # URLCORE (SR87): the WHATWG URL parser is html_core::url (re-exported as http_core::url).
 html_core = { path = "../../web/html_core" }
+# NETDEBT (SR97): the Public Suffix List — the cache partition's site is the registrable domain.
+psl_core = { path = "../psl_core" }
 tls_core = { path = "../../sys/tls_core", optional = true, features = ["cryptocore-std"] }
 
 [[test]]

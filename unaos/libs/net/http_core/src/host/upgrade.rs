@@ -19,21 +19,22 @@
 //! `with_tls`'s frame, so the session cannot move into the handle. It stays on a PUMP thread that owns it; the
 //! handle talks to it over two channels. The pump alternates: first every queued write (in order, sealed with
 //! `Client::send`), then it PEEKS the socket for up to [`POLL`] — and only when a byte is readable does it call
-//! `Client::recv`, with the socket's timeout back at the Agent's per-read timeout. That gate matters:
-//! `Client::recv` treats any transport error, a timeout included, as fatal (`tls_core` client.rs `recv` → `fail`),
+//! `Client::recv_step`, with the socket's timeout back at the Agent's per-read timeout. That gate matters:
+//! `tls_core` treats any transport error, a timeout included, as fatal (client.rs `recv_step` → `fail`),
 //! so it must never be entered just to wait. Decrypted chunks go to the handle (a bounded channel: a reader that
 //! falls behind holds the pump as a full socket buffer would); the end of the stream (close_notify or a TCP close)
 //! is an empty chunk; a failure is an `Err` chunk. Writes from the handle are queued and never wait on the pump,
 //! so the handle never blocks on a pump that is blocked on it. `shutdown` (and drop) queue a close after any
 //! pending writes: the pump sends them, then close_notify, and ends.
 //!
-//! The one stall left is `tls_core`'s: once `recv` is entered it returns only with application data, so a
-//! post-handshake record (a late NewSessionTicket or a KeyUpdate) that arrives ALONE holds queued writes until the
-//! server's next record or the per-read timeout. A non-blocking `recv` in `tls_core` would remove it.
+//! The pump reads through `Client::recv_step` (NETDEBT, SR97), which returns after ONE record: a post-handshake
+//! record (a late NewSessionTicket, a KeyUpdate) that arrives alone hands control straight back to the write
+//! queue instead of holding queued writes until the server's next data record or the per-read timeout.
 
 use super::*;
 use std::io;
 use std::sync::mpsc::TryRecvError;
+use tls_core::RecvStep;
 
 /// How long the TLS pump waits for a readable byte before it looks at the write queue again (the latency a write
 /// can see while the connection is idle).
@@ -285,14 +286,16 @@ fn pump(mut c: TlsClient<'_, Tcp>, cmds: Receiver<Cmd>, out: SyncSender<Result<V
             }
             Ok(_) => {
                 let _ = c.transport().s.set_read_timeout(timeout);
-                match c.recv() {
-                    Ok(Some(d)) => {
+                match c.recv_step() {
+                    Ok(RecvStep::Data(d)) => {
                         if out.send(Ok(d)).is_err() {
                             let _ = c.close();
                             return;
                         }
                     }
-                    Ok(None) | Err(TlsError::UnexpectedEof) => {
+                    // A post-handshake record (or an empty one): back to the write queue at once.
+                    Ok(RecvStep::Progress) => {}
+                    Ok(RecvStep::Closed) | Err(TlsError::UnexpectedEof) => {
                         let _ = drain(&mut c, &cmds, &out);
                         let _ = out.send(Ok(Vec::new()));
                         return;
@@ -352,13 +355,16 @@ impl Agent {
             std::thread::Builder::new()
                 .name(format!("http-upgrade-{id}"))
                 .spawn(move || {
-                    let t = match open(&cfg, &key) {
+                    let mut t = match open(&cfg, &key) {
                         Ok(t) => t,
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
                             return;
                         }
                     };
+                    // Record-bounded reads (as the h2 loop's): `tls_core` never holds a record the pump's
+                    // `peek` cannot see, so returning from `recv_step` after one record never strands another.
+                    t.rec = Some(RecordBound::default());
                     with_tls(&cfg, &key.host, vec![b"http/1.1".to_vec()], t, |client| {
                         let client = match client {
                             Ok(c) => c,

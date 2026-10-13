@@ -20,7 +20,8 @@
 //! so `tls_core` never holds a whole record the `peek` cannot see. A burst of requests to an origin whose
 //! connection is still handshaking WAITS for it (coalescing): if ALPN says `h2` they all become its streams,
 //! otherwise each gets its own HTTP/1.1 connection as before. GOAWAY / REFUSED_STREAM: unprocessed streams are
-//! retried on a new connection; `Alt-Svc` is ignored.
+//! retried on a new connection; `Alt-Svc` is ignored. A gzip/deflate body on an h2 stream is decoded as it
+//! arrives on a decoder thread of its own ([`DecodeSink`], NETDEBT SR97).
 //!
 //! Trust: `AgentConfig::trust`, else `$SSL_CERT_FILE` (the convention OpenSSL, curl and rustls-native follow),
 //! else UnaOS's staged Mozilla bundle `system/trust/roots.pem` when present, else the distribution bundle.
@@ -501,11 +502,86 @@ pub enum Event {
 /// Where a connection thread sends events. `false` = the receiver is gone (the exchange is abandoned).
 pub trait EventSink: Send {
     fn send(&mut self, ev: Event) -> bool;
+    /// NETDEBT (SR97): send without waiting — an h2 connection serves many streams on one thread and must not
+    /// block on one slow reader. `Full` hands the event back to be offered again. Default: the blocking `send`
+    /// (a sink that cannot tell is never full).
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        if self.send(ev) { TrySend::Sent } else { TrySend::Gone }
+    }
+    /// NETDEBT (SR97): the TLS peer of the connection that is about to answer this exchange, told before its
+    /// `Head` (again if the job moves to another connection). Default: ignored. [`WithPeer`] keeps it.
+    fn peer(&mut self, _chain: &Arc<PeerChain>) {}
+}
+
+/// NETDEBT (SR97): what the TLS handshake of a response's connection established about the server — the
+/// certificate chain for a page-info view (gneiss_pal `Response::peer_chain`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerChain {
+    /// DER certificates as the server sent them, leaf first. Empty when the session was resumed from a ticket
+    /// (no Certificate message; the chain was verified on the connection that issued the ticket).
+    pub certs: Vec<Vec<u8>>,
+    pub resumed: bool,
+    /// 0x0304 (TLS 1.3) or 0x0303 (TLS 1.2).
+    pub tls_version: u16,
+}
+
+impl PeerChain {
+    fn of<T: tls_core::Transport>(c: &TlsClient<'_, T>) -> Arc<PeerChain> {
+        let n = c.negotiated();
+        Arc::new(PeerChain { certs: n.peer_chain.clone(), resumed: n.resumed, tls_version: n.version })
+    }
+}
+
+/// Where a [`WithPeer`] sink leaves the peer it was told about.
+pub type PeerSlot = Arc<Mutex<Option<Arc<PeerChain>>>>;
+
+/// Any sink, plus a [`PeerSlot`] the connection fills with the answering connection's [`PeerChain`].
+pub struct WithPeer<S: EventSink> {
+    pub inner: S,
+    pub slot: PeerSlot,
+}
+
+impl<S: EventSink> WithPeer<S> {
+    pub fn new(inner: S, slot: PeerSlot) -> Self {
+        WithPeer { inner, slot }
+    }
+}
+
+impl<S: EventSink> EventSink for WithPeer<S> {
+    fn send(&mut self, ev: Event) -> bool {
+        self.inner.send(ev)
+    }
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        self.inner.try_send(ev)
+    }
+    fn peer(&mut self, chain: &Arc<PeerChain>) {
+        if let Ok(mut s) = self.slot.lock() {
+            *s = Some(chain.clone());
+        }
+        self.inner.peer(chain);
+    }
+}
+
+/// What [`EventSink::try_send`] did.
+#[derive(Debug)]
+pub enum TrySend {
+    Sent,
+    /// The receiver has no room now: the event, to offer again later.
+    Full(Event),
+    /// The receiver is gone (the exchange is abandoned).
+    Gone,
 }
 
 impl EventSink for SyncSender<Event> {
     fn send(&mut self, ev: Event) -> bool {
         SyncSender::send(self, ev).is_ok()
+    }
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        match SyncSender::try_send(self, ev) {
+            Ok(()) => TrySend::Sent,
+            Err(mpsc::TrySendError::Full(ev)) => TrySend::Full(ev),
+            Err(mpsc::TrySendError::Disconnected(_)) => TrySend::Gone,
+        }
     }
 }
 
@@ -644,6 +720,84 @@ struct Inner {
     connecting: Mutex<HashMap<PoolKey, Vec<Job>>>,
     /// Origins that answered ALPN with HTTP/1.1: a burst to them no longer waits on a handshake.
     h1_origins: Mutex<std::collections::HashSet<PoolKey>>,
+    /// NETDEBT (SR97): HTTP/1.1 connection threads per origin and the jobs waiting for one
+    /// ([`MAX_H1_PER_ORIGIN`]). Lock order: `connecting`, then `h1_slots`, then `pool`.
+    h1_slots: Mutex<HashMap<PoolKey, H1Slots>>,
+}
+
+/// NETDEBT (SR97): at most this many HTTP/1.1 connections per origin at once (the browsers' long-standing
+/// six; RFC 9112 §9.4 asks a client to limit them). A request beyond it waits for one of them to finish an
+/// exchange (it is served next on that connection) or to close (a new connection is opened for it).
+pub const MAX_H1_PER_ORIGIN: usize = 6;
+
+#[derive(Default)]
+struct H1Slots {
+    /// Connection threads that hold a slot (dialling, handshaking, serving or parked).
+    live: usize,
+    waiting: alloc::collections::VecDeque<Job>,
+}
+
+/// What [`Agent::admit`] decided for a job that needs a new connection.
+enum Admit {
+    /// A slot is taken: spawn the connection.
+    Spawn(Job),
+    /// At the cap, but a parked connection is free: hand it the job.
+    Idle(Sender<Job>, Job),
+    /// At the cap: the job waits for a slot.
+    Queued,
+}
+
+/// The slot a connection thread holds; released when the thread ends or its connection turns out to be h2.
+/// A waiting job inherits a released slot on a connection of its own.
+struct H1Slot {
+    inner: Arc<Inner>,
+    key: PoolKey,
+    held: bool,
+}
+
+impl H1Slot {
+    fn release(&mut self) {
+        if !self.held {
+            return;
+        }
+        self.held = false;
+        let next = self.inner.h1_slots.lock().ok().and_then(|mut m| {
+            let e = m.get_mut(&self.key)?;
+            match e.waiting.pop_front() {
+                Some(j) => Some(j), // the slot passes to it: `live` unchanged
+                None => {
+                    e.live = e.live.saturating_sub(1);
+                    if e.live == 0 {
+                        m.remove(&self.key);
+                    }
+                    None
+                }
+            }
+        });
+        if let Some(j) = next {
+            spawn_connection(self.inner.clone(), self.key.clone(), j, false);
+        }
+    }
+}
+
+impl Drop for H1Slot {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A connection thread for `job` that already owns a slot for `key`.
+fn spawn_connection(inner: Arc<Inner>, key: PoolKey, job: Job, owns_coalesce: bool) {
+    let id = {
+        let mut n = inner.next_id.lock().unwrap();
+        *n += 1;
+        *n
+    };
+    let slot = H1Slot { inner: inner.clone(), key: key.clone(), held: true };
+    std::thread::Builder::new()
+        .name(format!("http-conn-{id}"))
+        .spawn(move || connection_thread(inner, key, id, job, owns_coalesce, slot))
+        .expect("spawn connection thread");
 }
 
 /// A client: configuration, a cookie jar (optional), and a pool of keep-alive connection threads.
@@ -681,7 +835,16 @@ fn now_secs() -> i64 {
 
 impl Agent {
     pub fn new(cfg: AgentConfig) -> Self {
-        Agent { inner: Arc::new(Inner { cfg, pool: Mutex::new(HashMap::new()), next_id: Mutex::new(1), connecting: Mutex::new(HashMap::new()), h1_origins: Mutex::new(std::collections::HashSet::new()) }) }
+        Agent {
+            inner: Arc::new(Inner {
+                cfg,
+                pool: Mutex::new(HashMap::new()),
+                next_id: Mutex::new(1),
+                connecting: Mutex::new(HashMap::new()),
+                h1_origins: Mutex::new(std::collections::HashSet::new()),
+                h1_slots: Mutex::new(HashMap::new()),
+            }),
+        }
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -744,25 +907,56 @@ impl Agent {
         let coalesce = key.scheme == "https"
             && offers_h2(&self.inner.cfg)
             && !self.inner.h1_origins.lock().map(|h| h.contains(&key)).unwrap_or(false);
-        if coalesce && parked {
-            let Ok(mut c) = self.inner.connecting.lock() else { return };
-            if let Some(waiting) = c.get_mut(&key) {
-                waiting.push(job);
-                return;
-            }
-            c.insert(key.clone(), Vec::new());
-        }
-        let id = {
-            let mut n = self.inner.next_id.lock().unwrap();
-            *n += 1;
-            *n
-        };
-        let inner = self.inner.clone();
         let owns_coalesce = coalesce && parked;
-        std::thread::Builder::new()
-            .name(format!("http-conn-{id}"))
-            .spawn(move || connection_thread(inner, key, id, job, owns_coalesce))
-            .expect("spawn connection thread");
+        loop {
+            // NETDEBT (SR97): a new connection only under the per-origin cap.
+            let admitted = if owns_coalesce {
+                let Ok(mut c) = self.inner.connecting.lock() else { return };
+                if let Some(waiting) = c.get_mut(&key) {
+                    waiting.push(job);
+                    return;
+                }
+                let a = self.admit(&key, job);
+                if matches!(a, Admit::Spawn(_)) {
+                    c.insert(key.clone(), Vec::new());
+                }
+                a
+            } else {
+                self.admit(&key, job)
+            };
+            match admitted {
+                Admit::Spawn(j) => return spawn_connection(self.inner.clone(), key, j, owns_coalesce),
+                Admit::Queued => return,
+                Admit::Idle(tx, j) => match tx.send(j) {
+                    Ok(()) => return,
+                    Err(mpsc::SendError(j)) => job = j, // that thread is gone (its slot goes with it): again
+                },
+            }
+        }
+    }
+
+    /// NETDEBT (SR97): take a connection slot for `key`, or — at [`MAX_H1_PER_ORIGIN`] — a parked HTTP/1.1
+    /// connection that is free after all, or queue the job until a slot frees. Checked under the slots lock,
+    /// which `serve` also holds while it parks, so a job is never queued past a connection that just parked.
+    fn admit(&self, key: &PoolKey, job: Job) -> Admit {
+        let Ok(mut m) = self.inner.h1_slots.lock() else { return Admit::Spawn(job) };
+        let e = m.entry(key.clone()).or_default();
+        if e.live < MAX_H1_PER_ORIGIN {
+            e.live += 1;
+            return Admit::Spawn(job);
+        }
+        let idle = self.inner.pool.lock().ok().and_then(|mut p| {
+            let v = p.get_mut(key)?;
+            let i = v.iter().rposition(|i| !i.mux)?;
+            Some(v.remove(i).tx)
+        });
+        match idle {
+            Some(tx) => Admit::Idle(tx, job),
+            None => {
+                e.waiting.push_back(job);
+                Admit::Queued
+            }
+        }
     }
 
     /// The fields every request carries from this Agent: the jar's cookies, the User-Agent, and (when the
@@ -826,14 +1020,15 @@ impl Agent {
         let mut hops = 0;
         loop {
             let (tx, rx) = mpsc::sync_channel::<Event>(16);
-            self.dispatch(&req, Box::new(tx));
+            let peer: PeerSlot = Arc::new(Mutex::new(None));
+            self.dispatch(&req, Box::new(WithPeer::new(tx, peer.clone())));
             let head = match rx.recv() {
                 Ok(Event::Head(h)) => h,
                 Ok(Event::End(Err(e))) => return Err(e),
                 Ok(_) | Err(_) => return Err(Error::Io("connection thread ended without a response".into())),
             };
             match self.after_head(&req, &head, hops)? {
-                Next::Final => return Ok(Response { head, url: req.url, rx, done: false }),
+                Next::Final => return Ok(Response { head, url: req.url, rx, done: false, peer }),
                 Next::Follow(next) => {
                     // Wait for the discarded body to finish so the connection is parked before reuse.
                     while let Ok(ev) = rx.recv() {
@@ -865,11 +1060,16 @@ pub struct Response {
     pub url: Url,
     rx: Receiver<Event>,
     done: bool,
+    peer: PeerSlot,
 }
 
 impl Response {
     pub fn status(&self) -> u16 {
         self.head.status
+    }
+    /// NETDEBT (SR97): the TLS peer of the connection that answered (`None` over plain HTTP).
+    pub fn peer_chain(&self) -> Option<Arc<PeerChain>> {
+        self.peer.lock().ok().and_then(|s| s.clone())
     }
     pub fn headers(&self) -> &Headers {
         &self.head.headers
@@ -1024,7 +1224,8 @@ impl Drop for Coalesce {
     }
 }
 
-fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coalescing: bool) {
+fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coalescing: bool, slot: H1Slot) {
+    let mut slot = slot;
     let mut coalesce = coalescing.then(|| Coalesce { inner: inner.clone(), key: key.clone(), armed: true });
     let cfg = inner.cfg.clone();
     let fail = |job: Job, e: Error| {
@@ -1072,13 +1273,16 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coale
             }
         };
         let alpn_h2 = client.negotiated().alpn.as_deref() == Some(b"h2");
+        let peer = PeerChain::of(&client);
         let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
         if alpn_h2 {
+            // An h2 connection multiplexes: it is not one of the origin's HTTP/1.1 connections.
+            slot.release();
             let mut h2c = match crate::h2::H2Conn::handshake(tls) {
                 Ok(c) => c,
                 Err(e) => return fail(first, e),
             };
-            serve_h2(&inner, &key, id, first, &mut h2c, probe.as_ref(), coalesce.as_mut());
+            serve_h2(&inner, &key, id, first, &mut h2c, probe.as_ref(), coalesce.as_mut(), &peer);
             let _ = h2c.transport_mut().c.close();
             return;
         }
@@ -1088,7 +1292,10 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coale
         }
         drop(coalesce);
         let mut conn = Conn::new(tls);
-        serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
+        serve(&inner, &key, id, first, |mut job, reused| {
+            job.sink.peer(&peer);
+            exchange(&mut conn, &key, job, reused)
+        });
         let _ = conn.transport.c.close();
     } else {
         let mut conn = Conn::new(t);
@@ -1105,12 +1312,28 @@ fn serve(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, mut run: impl F
         let outcome = run(job, reused);
         let job_back = match outcome {
             Outcome::Reusable(finish) => {
-                // Park BEFORE telling the caller the exchange ended, so its next request finds this connection.
-                if let Ok(mut p) = inner.pool.lock() {
-                    p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone(), mux: false });
-                }
+                // NETDEBT (SR97): a job waiting on the origin's connection cap is served here next; otherwise
+                // park BEFORE telling the caller the exchange ended, so its next request finds this connection.
+                // Both under the slots lock (see `Agent::admit`).
+                let queued = match inner.h1_slots.lock() {
+                    Ok(mut m) => match m.get_mut(key).and_then(|e| e.waiting.pop_front()) {
+                        Some(j) => Some(j),
+                        None => {
+                            if let Ok(mut p) = inner.pool.lock() {
+                                p.entry(key.clone()).or_default().push(Idle { id, tx: tx.clone(), mux: false });
+                            }
+                            None
+                        }
+                    },
+                    Err(_) => None,
+                };
                 if let Some((mut sink, r)) = finish {
                     sink.send(Event::End(r));
+                }
+                if let Some(j) = queued {
+                    job = j;
+                    reused = true;
+                    continue;
                 }
                 None
             }
@@ -1239,21 +1462,86 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
 /// How long the h2 loop waits for socket bytes before it looks at its job channel again.
 pub const MUX_POLL: Duration = Duration::from_millis(20);
 
-/// A content-coded body on a multiplexed stream is gathered and decoded at END_STREAM (the inflater pulls,
-/// and one stream must not hold the connection); beyond this it fails.
-const MUX_CODED_CAP: usize = 256 << 20;
-
 /// One request in flight as an h2 stream.
 struct MuxStream {
     job: Job,
     head: bool,
     /// A followed redirect: its body is read and dropped.
     drain: bool,
-    coded: Option<(Vec<Coding>, Vec<u8>)>,
+    /// NETDEBT (SR97): a chunk the reader had no room for. While it is held the stream's DATA stays in
+    /// `H2Conn`'s buffer, untaken, so its flow-control window is not re-opened: the server stops on THIS stream
+    /// at RECV_WINDOW, and the connection thread goes on serving the others.
+    held: Option<Event>,
+}
+
+/// NETDEBT (SR97): a content-coded body on a multiplexed stream is decoded AS IT ARRIVES, on a thread of its
+/// own — pixel_core's inflater PULLS its input, and a pull that waited on the socket would hold every other
+/// stream of the connection. The stream's sink is swapped for a [`DecodeSink`] after its head went out: DATA
+/// chunks and the End are FED to the decoder thread, which owns the real sink and sends it decoded `Data`
+/// (16 KiB batches, as HTTP/1.1's `deliver`) and then the End. Nothing is gathered to END_STREAM any more.
+enum Feed {
+    Chunk(Vec<u8>),
+    End(Result<(), Error>),
+}
+
+/// Coded chunks queued for a decoder that has not taken them yet (a slow reader slows its own stream only:
+/// see `pump`).
+const DECODE_FEED_DEPTH: usize = 16;
+
+/// The sink side of a decoder thread (the connection thread holds it in the stream's `Job`).
+struct DecodeSink {
+    feed: SyncSender<Feed>,
+}
+
+impl EventSink for DecodeSink {
+    fn send(&mut self, ev: Event) -> bool {
+        match ev {
+            Event::Data(d) => self.feed.send(Feed::Chunk(d)).is_ok(),
+            Event::End(r) => self.feed.send(Feed::End(r)).is_ok(),
+            Event::Head(_) => true, // the head went to the real sink before the swap
+        }
+    }
+    fn try_send(&mut self, ev: Event) -> TrySend {
+        let feed = match ev {
+            Event::Data(d) => Feed::Chunk(d),
+            Event::End(r) => Feed::End(r),
+            Event::Head(_) => return TrySend::Sent,
+        };
+        match self.feed.try_send(feed) {
+            Ok(()) => TrySend::Sent,
+            Err(mpsc::TrySendError::Full(Feed::Chunk(d))) => TrySend::Full(Event::Data(d)),
+            Err(mpsc::TrySendError::Full(Feed::End(r))) => TrySend::Full(Event::End(r)),
+            Err(mpsc::TrySendError::Disconnected(_)) => TrySend::Gone,
+        }
+    }
+}
+
+/// Start a decoder for `coding` that delivers to `sink` (dropped with the closure if the thread cannot start).
+fn spawn_decoder(sink: Box<dyn EventSink>, coding: Coding) -> Result<DecodeSink, ()> {
+    let (tx, rx) = mpsc::sync_channel::<Feed>(DECODE_FEED_DEPTH);
+    std::thread::Builder::new()
+        .name("http-h2-decode".into())
+        .spawn(move || {
+            let mut sink = sink;
+            let mut pull = || match rx.recv() {
+                Ok(Feed::Chunk(d)) => Ok(Some(d)),
+                Ok(Feed::End(Ok(()))) => Ok(None),
+                Ok(Feed::End(Err(e))) => Err(e),
+                Err(_) => Err(Error::Io("h2: stream abandoned mid-body".into())),
+            };
+            // `None`: the reader went away; dropping `rx` makes the stream's next feed fail (→ cancelled).
+            if let Some(end) = decode_into(&mut *sink, &coding, &mut pull) {
+                sink.send(Event::End(end));
+            }
+        })
+        .map(|_| DecodeSink { feed: tx })
+        .map_err(|_| ())
 }
 
 enum Pump {
     Pending,
+    /// The reader has no room: the stream waits for it (not for the server).
+    Stalled,
     Done(Result<(), Error>),
     /// The receiver went away: cancel the stream.
     Gone,
@@ -1291,6 +1579,7 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
             Err(e) => return Pump::Done(Err(e)),
             Ok(Some((status, headers))) => {
                 let mut rhead = ResponseHead { version: (2, 0), status, reason: String::new(), headers };
+                let mut coded: Option<Coding> = None;
                 if m.job.discard_redirect_body && redirect::is_redirect(status) && rhead.headers.contains("location") {
                     m.drain = true;
                 } else if m.job.decode {
@@ -1298,48 +1587,51 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
                     if codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate) {
                         rhead.headers.remove("content-encoding");
                         rhead.headers.remove("content-length");
-                        m.coded = Some((codings, Vec::new()));
+                        coded = Some(codings[0].clone());
                     }
                 }
                 m.head = true;
                 if !m.job.sink.send(Event::Head(rhead)) {
                     return Pump::Gone;
                 }
+                if let Some(coding) = coded {
+                    // The decoder takes the real sink; the stream feeds it from here on.
+                    let real = core::mem::replace(&mut m.job.sink, Box::new(DecodeSink { feed: mpsc::sync_channel(0).0 }));
+                    match spawn_decoder(real, coding) {
+                        Ok(d) => m.job.sink = Box::new(d),
+                        Err(()) => return Pump::Done(Err(Error::Io("h2: cannot start the body decoder".into()))),
+                    }
+                }
             }
+        }
+    }
+    // Never block on the reader: offer, and hold what it has no room for.
+    if let Some(ev) = m.held.take() {
+        match m.job.sink.try_send(ev) {
+            TrySend::Sent => {}
+            TrySend::Full(ev) => {
+                m.held = Some(ev);
+                return Pump::Stalled;
+            }
+            TrySend::Gone => return Pump::Gone,
         }
     }
     loop {
         match h2c.try_data(sid) {
             Err(e) => return Pump::Done(Err(e)),
             Ok(DataPoll::Pending) => return Pump::Pending,
-            Ok(DataPoll::End) => {
-                if let Some((codings, buf)) = m.coded.take() {
-                    match encoding::decode(&codings, &buf) {
-                        Ok(d) => {
-                            for c in d.chunks(16 * 1024) {
-                                if !m.job.sink.send(Event::Data(c.to_vec())) {
-                                    return Pump::Gone;
-                                }
-                            }
-                        }
-                        Err(e) => return Pump::Done(Err(Error::Decode(e))),
-                    }
-                }
-                return Pump::Done(Ok(()));
-            }
+            Ok(DataPoll::End) => return Pump::Done(Ok(())),
             Ok(DataPoll::Chunk(d)) => {
                 if m.drain {
                     continue;
                 }
-                if let Some((_, buf)) = &mut m.coded {
-                    buf.extend_from_slice(&d);
-                    if buf.len() > MUX_CODED_CAP {
-                        return Pump::Done(Err(Error::Io("h2: content-coded body too large to decode".into())));
+                match m.job.sink.try_send(Event::Data(d)) {
+                    TrySend::Sent => {}
+                    TrySend::Full(ev) => {
+                        m.held = Some(ev);
+                        return Pump::Stalled;
                     }
-                    continue;
-                }
-                if !m.job.sink.send(Event::Data(d)) {
-                    return Pump::Gone;
+                    TrySend::Gone => return Pump::Gone,
                 }
             }
         }
@@ -1348,7 +1640,7 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
 
 /// Serve an `h2` connection: every job for this origin becomes a stream on it, concurrently, until GOAWAY,
 /// a connection error, or the idle timeout with no stream open.
-fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut crate::h2::H2Conn<Tls<'_>>, probe: Option<&TcpStream>, coalesce: Option<&mut Coalesce>) {
+fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut crate::h2::H2Conn<Tls<'_>>, probe: Option<&TcpStream>, coalesce: Option<&mut Coalesce>, peer: &Arc<PeerChain>) {
     let agent = Agent { inner: inner.clone() };
     let (tx, rx) = mpsc::channel::<Job>();
     let mut queue: alloc::collections::VecDeque<Job> = alloc::collections::VecDeque::new();
@@ -1362,6 +1654,8 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
         queue.extend(c.take());
     }
     let mut active: alloc::collections::BTreeMap<u32, MuxStream> = alloc::collections::BTreeMap::new();
+    // NETDEBT (SR97): finished streams whose End the reader had no room for yet (offered again each turn).
+    let mut ending: Vec<(Box<dyn EventSink>, Event)> = Vec::new();
     let mut proven = false;
     let mut last_progress = Instant::now();
     let timeout = inner.cfg.timeout;
@@ -1385,11 +1679,12 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
         // Open streams for waiting jobs, up to the peer's limit.
         while h2c.can_open() {
             let Some(mut job) = queue.pop_front() else { break };
+            job.sink.peer(peer);
             let body = job.body.clone();
             let authority = job.url.host_str();
             match h2c.send_request(&job.method, &key.scheme, &authority, &job.url.request_target(), &job.headers, &body) {
                 Ok(sid) => {
-                    active.insert(sid, MuxStream { job, head: false, drain: false, coded: None });
+                    active.insert(sid, MuxStream { job, head: false, drain: false, held: None });
                 }
                 Err(e) => {
                     // The connection cannot carry it (write failed, GOAWAY): a job on a connection that
@@ -1403,7 +1698,13 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
                 }
             }
         }
+        for (mut sink, ev) in core::mem::take(&mut ending) {
+            if let TrySend::Full(ev) = sink.try_send(ev) {
+                ending.push((sink, ev));
+            }
+        }
         // Progress every stream from what is buffered (send_request may have read frames for others).
+        let mut waiting_on_readers = !ending.is_empty();
         let ids: Vec<u32> = active.keys().copied().collect();
         for sid in ids {
             let m = active.get_mut(&sid).expect("listed");
@@ -1413,10 +1714,15 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
             }
             match r {
                 Pump::Pending => {}
+                Pump::Stalled => waiting_on_readers = true,
                 Pump::Done(res) => {
                     h2c.close_stream(sid);
-                    let mut m = active.remove(&sid).expect("listed");
-                    m.job.sink.send(Event::End(res));
+                    let m = active.remove(&sid).expect("listed");
+                    let mut sink = m.job.sink;
+                    if let TrySend::Full(ev) = sink.try_send(Event::End(res)) {
+                        ending.push((sink, ev));
+                        waiting_on_readers = true;
+                    }
                 }
                 Pump::Gone => {
                     active.remove(&sid);
@@ -1429,7 +1735,11 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
                 }
             }
         }
-        if active.is_empty() {
+        if waiting_on_readers {
+            // The connection is waiting on our readers, not on the server: that is not an idle socket.
+            last_progress = Instant::now();
+        }
+        if active.is_empty() && ending.is_empty() {
             if !queue.is_empty() {
                 if h2c.can_open() {
                     continue;
@@ -1478,6 +1788,9 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
     }
     for j in queue {
         retry(j, Error::Io("h2: connection closed before the request was sent".into()));
+    }
+    for (mut sink, ev) in ending {
+        sink.send(ev); // the connection is ending: wait for these readers
     }
     let why = conn_err.unwrap_or_else(|| Error::Io("h2: connection closed".into()));
     for (sid, mut m) in active {
@@ -1541,6 +1854,32 @@ fn finish(job: Job, end: Option<Result<(), Error>>, reusable: bool) -> Outcome {
     Outcome::Closed
 }
 
+/// Decode `coding` from the body chunks `pull` yields into `sink` as `Data` events, AS THEY ARRIVE, then consume
+/// whatever framing remains (the chunked terminator, trailers, END_STREAM). The result is the End to deliver;
+/// `None` when the receiver went away.
+fn decode_into(sink: &mut dyn EventSink, coding: &Coding, pull: &mut dyn FnMut() -> Result<Option<Vec<u8>>, Error>) -> Option<Result<(), Error>> {
+    let mut cs = ChunkSink { sink, buf: Vec::new(), gone: false };
+    let mut src = PullSource { pull: &mut *pull, chunk: Vec::new(), pos: 0, error: None, done: false };
+    let r = encoding::decode_stream(coding, &mut src, &mut cs);
+    let (src_err, src_done) = (src.error.take(), src.done);
+    cs.flush();
+    if cs.gone {
+        return None;
+    }
+    Some(match (src_err, r) {
+        (Some(e), _) => Err(e),
+        (None, Err(e)) => Err(Error::Decode(e)),
+        (None, Ok(_)) if src_done => Ok(()),
+        (None, Ok(_)) => loop {
+            match pull() {
+                Ok(Some(_)) => {}
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        },
+    })
+}
+
 /// Returns (consumed cleanly to the end, the End result still to deliver — `None` when the receiver is gone).
 fn deliver(job: &mut Job, mut rhead: ResponseHead, small_redirect: bool, pull: &mut dyn FnMut() -> Result<Option<Vec<u8>>, Error>) -> (bool, Option<Result<(), Error>>) {
     // A followed redirect: drain (small) bodies so the connection stays usable.
@@ -1577,28 +1916,9 @@ fn deliver(job: &mut Job, mut rhead: ResponseHead, small_redirect: bool, pull: &
         return (false, None);
     }
     let result: Result<(), Error> = if decodable {
-        let mut cs = ChunkSink { sink: &mut *job.sink, buf: Vec::new(), gone: false };
-        let mut src = PullSource { pull: &mut *pull, chunk: Vec::new(), pos: 0, error: None, done: false };
-        let r = encoding::decode_stream(&codings[0], &mut src, &mut cs);
-        let (src_err, src_done) = (src.error.take(), src.done);
-        cs.flush();
-        if cs.gone {
-            return (false, None);
-        }
-        match (src_err, r) {
-            (Some(e), _) => Err(e),
-            (None, Err(e)) => Err(Error::Decode(e)),
-            (None, Ok(_)) if src_done => Ok(()),
-            (None, Ok(_)) => {
-                // Consume whatever framing remains (the chunked terminator, trailers, END_STREAM).
-                loop {
-                    match pull() {
-                        Ok(Some(_)) => {}
-                        Ok(None) => break Ok(()),
-                        Err(e) => break Err(e),
-                    }
-                }
-            }
+        match decode_into(&mut *job.sink, &codings[0], pull) {
+            Some(r) => r,
+            None => return (false, None),
         }
     } else {
         loop {

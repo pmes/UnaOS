@@ -44,8 +44,10 @@ use std::time::Duration;
 
 use http_core::cache::{self as hcache, Decision, Entry};
 use http_core::h1::ResponseHead;
-use http_core::host::{self, Agent, AgentConfig, Event, EventSink, Next};
+use http_core::host::{self, Agent, AgentConfig, Event, EventSink, Next, PeerSlot, WithPeer};
 pub use http_core::cache::CacheMode;
+/// NETDEBT (SR97): the answering connection's TLS peer ([`Response::peer_chain`]).
+pub use http_core::host::PeerChain;
 pub use http_core::cookie::{CookieContext, CookieJar};
 pub use http_core::headers::Headers;
 pub use http_core::url::Url;
@@ -545,6 +547,15 @@ impl EventSink for TokioSink {
     fn send(&mut self, ev: Event) -> bool {
         self.0.blocking_send(ev).is_ok()
     }
+    /// NETDEBT (SR97): an h2 connection offers each stream's chunks without waiting, so a slow reader slows
+    /// only its own stream.
+    fn try_send(&mut self, ev: Event) -> host::TrySend {
+        match self.0.try_send(ev) {
+            Ok(()) => host::TrySend::Sent,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => host::TrySend::Full(ev),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => host::TrySend::Gone,
+        }
+    }
 }
 
 /// Builder for [`Client`].
@@ -756,7 +767,8 @@ impl RequestBuilder {
                 }
                 HopStart::Net(wire, hc) => {
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
-                    agent.dispatch(&wire, Box::new(TokioSink(tx)));
+                    let peer: PeerSlot = Arc::new(Mutex::new(None));
+                    agent.dispatch(&wire, Box::new(WithPeer::new(TokioSink(tx), peer.clone())));
                     let head = match rx.recv().await {
                         Some(Event::Head(h)) => h,
                         Some(Event::End(Err(e))) => return Err(e.into()),
@@ -782,6 +794,7 @@ impl RequestBuilder {
                                     body: AsyncBody::Net(rx),
                                     done: false,
                                     tee,
+                                    peer: Some(peer),
                                 });
                             }
                             Next::Follow(next) => {
@@ -804,6 +817,7 @@ impl RequestBuilder {
                         body: AsyncBody::Mem(body_chunks(stored.body)),
                         done: false,
                         tee: None,
+                        peer: None,
                     });
                 }
                 Next::Follow(next) => {
@@ -849,6 +863,8 @@ pub struct Response {
     body: AsyncBody,
     done: bool,
     tee: Option<Tee>,
+    /// The answering connection's TLS peer, filled by the connection thread (`None`: served from the cache).
+    peer: Option<PeerSlot>,
 }
 
 impl Response {
@@ -861,6 +877,12 @@ impl Response {
     /// The final URL, after redirects.
     pub fn url(&self) -> &Url {
         &self.url
+    }
+    /// NETDEBT (SR97): the certificate chain (and TLS version, resumption) of the connection that answered the
+    /// final hop — for the page-info popover. `None` over plain HTTP or for a response served from the cache;
+    /// `certs` is empty on a resumed TLS 1.3 session.
+    pub fn peer_chain(&self) -> Option<Arc<PeerChain>> {
+        self.peer.as_ref().and_then(|p| p.lock().ok().and_then(|s| s.clone()))
     }
     /// `Content-Length` when the body is not content-coded (a decoded body has no known length).
     pub fn content_length(&self) -> Option<u64> {
@@ -1007,9 +1029,9 @@ pub mod blocking {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use http_core::host::{self, Agent, AgentConfig, Event, Next};
+    use http_core::host::{self, Agent, AgentConfig, Event, Next, PeerSlot, WithPeer};
 
-    use super::{AfterHead, CacheCtx, CacheMode, CookieJar, Error, Headers, HopStart, HttpCache, StatusCode, Tee, Url};
+    use super::{AfterHead, CacheCtx, CacheMode, CookieJar, Error, Headers, HopStart, HttpCache, PeerChain, StatusCode, Tee, Url};
     use super::{body_chunks, hcache, hop_head, hop_start, revalidate_detached, stored_head};
 
     pub struct ClientBuilder {
@@ -1162,7 +1184,8 @@ pub mod blocking {
                     }
                     HopStart::Net(wire, hc) => {
                         let (tx, rx) = sync_channel::<Event>(16);
-                        agent.dispatch(&wire, Box::new(tx));
+                        let peer: PeerSlot = Arc::new(Mutex::new(None));
+                        agent.dispatch(&wire, Box::new(WithPeer::new(tx, peer.clone())));
                         let head = match rx.recv() {
                             Ok(Event::Head(h)) => h,
                             Ok(Event::End(Err(e))) => return Err(e.into()),
@@ -1191,6 +1214,7 @@ pub mod blocking {
                                         tee,
                                         pending: Vec::new(),
                                         pos: 0,
+                                        peer: Some(peer),
                                     });
                                 }
                                 Next::Follow(next) => {
@@ -1216,6 +1240,7 @@ pub mod blocking {
                             tee: None,
                             pending: Vec::new(),
                             pos: 0,
+                            peer: None,
                         });
                     }
                     Next::Follow(next) => {
@@ -1243,6 +1268,7 @@ pub mod blocking {
         tee: Option<Tee>,
         pending: Vec<u8>,
         pos: usize,
+        peer: Option<PeerSlot>,
     }
 
     impl Response {
@@ -1316,6 +1342,10 @@ pub mod blocking {
         }
         pub fn url(&self) -> &Url {
             &self.url
+        }
+        /// NETDEBT (SR97): the answering connection's TLS peer (see the async `Response::peer_chain`).
+        pub fn peer_chain(&self) -> Option<Arc<PeerChain>> {
+            self.peer.as_ref().and_then(|p| p.lock().ok().and_then(|s| s.clone()))
         }
         pub fn content_length(&self) -> Option<u64> {
             self.headers.get("content-length").and_then(|v| v.trim().parse().ok())

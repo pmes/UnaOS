@@ -161,6 +161,9 @@ pub struct Negotiated {
     pub alpn: Option<Vec<u8>>,
     pub hello_retry: bool,
     pub peer_chain_len: usize,
+    /// NETDEBT (SR97): the server's Certificate chain as received (DER, leaf first, the order the server sent),
+    /// for a caller that shows it (Aether's page info). Empty on a resumed connection (no Certificate is sent).
+    pub peer_chain: Vec<Vec<u8>>,
     pub client_cert_requested: bool,
     /// TLS 1.2: the RFC 7627 extended master secret was negotiated (always true — it is required).
     pub extended_master_secret: bool,
@@ -177,6 +180,18 @@ pub struct Negotiated {
     pub crl: x509::crl::CrlReport,
     /// Intermediates the verifier took from the trust store's pool because the server omitted them.
     pub pool_intermediates: usize,
+}
+
+/// What one [`Client::recv_step`] read produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecvStep {
+    /// Decrypted application data (never empty).
+    Data(Vec<u8>),
+    /// A record that carried no application data: a post-handshake message (or part of one) handled, or an empty
+    /// application-data record. Nothing for the caller; call again when the transport is readable.
+    Progress,
+    /// The peer's close_notify: the read side is over.
+    Closed,
 }
 
 struct Share {
@@ -789,9 +804,9 @@ impl<'a, T: Transport> Client<'a, T> {
         // ---- resumed (PSK): no CertificateRequest, Certificate, CertificateVerify (§2.2, §4.3.2)
         let mut cert_request_ctx: Option<Vec<u8>> = None;
         let mut cert_verdict: Option<x509::CertVerdict> = None;
-        let (scheme, chain_len) = if resumed {
+        let (scheme, peer_chain) = if resumed {
             let t = ticket.as_ref().expect("resumed implies a ticket");
-            (SignatureScheme::from_code(t.signature_scheme).unwrap_or(SignatureScheme::EcdsaSecp256r1Sha256), 0)
+            (SignatureScheme::from_code(t.signature_scheme).unwrap_or(SignatureScheme::EcdsaSecp256r1Sha256), Vec::new())
         } else {
             // ---- CertificateRequest? Certificate
             let mut m = self.next_handshake()?;
@@ -836,7 +851,7 @@ impl<'a, T: Transport> Client<'a, T> {
                 other => other,
             })?;
             transcript.add(&cv_msg);
-            (scheme, chain.len())
+            (scheme, chain)
         };
         let peer_alpn = ee.alpn.clone();
 
@@ -888,7 +903,8 @@ impl<'a, T: Transport> Client<'a, T> {
             signature_scheme: scheme,
             alpn: peer_alpn,
             hello_retry,
-            peer_chain_len: chain_len,
+            peer_chain_len: peer_chain.len(),
+            peer_chain,
             client_cert_requested: cert_request_ctx.is_some(),
             extended_master_secret: false,
             version: msgs::TLS13,
@@ -942,45 +958,67 @@ impl<'a, T: Transport> Client<'a, T> {
         self.send_protected(ContentType::ApplicationData, data)
     }
 
-    /// Receives the next chunk of application data. `Ok(None)` after the peer's close_notify.
+    /// Receives the next chunk of application data. `Ok(None)` after the peer's close_notify. Blocks across
+    /// records that carry no application data (post-handshake messages, empty records): [`Client::recv_step`] is
+    /// the one-record form for a caller that must regain control after each.
     pub fn recv(&mut self) -> Result<Option<Vec<u8>>, TlsError> {
+        loop {
+            match self.recv_step()? {
+                RecvStep::Data(d) => return Ok(Some(d)),
+                RecvStep::Closed => return Ok(None),
+                RecvStep::Progress => {}
+            }
+        }
+    }
+
+    /// NETDEBT (SR97): reads at most ONE record and returns. [`RecvStep::Data`] for application data,
+    /// [`RecvStep::Closed`] after the peer's close_notify, and [`RecvStep::Progress`] when the record carried no
+    /// application data — a post-handshake message (a NewSessionTicket kept, a KeyUpdate applied and, when asked,
+    /// answered), a fragment of one, or an empty application-data record — so a caller that also has writes to
+    /// make (a WebSocket pump) gets control back instead of blocking until the server's next data record. Handshake
+    /// messages already buffered whole are processed without reading. Errors are fatal, as for `recv`.
+    pub fn recv_step(&mut self) -> Result<RecvStep, TlsError> {
         if self.failed {
             return Err(TlsError::Closed);
         }
+        if self.peer_closed {
+            return Ok(RecvStep::Closed);
+        }
+        if self.drain_post_handshake()? {
+            return Ok(RecvStep::Progress);
+        }
+        let (ty, content) = match self.read_content(false) {
+            Ok(v) => v,
+            Err(e) => return Err(self.fail(e)),
+        };
+        match ty {
+            ContentType::ApplicationData => {
+                if !self.hs_buf.is_empty() {
+                    return Err(self.fail(unexpected("application data inside a handshake message")));
+                }
+                if content.is_empty() {
+                    return Ok(RecvStep::Progress);
+                }
+                Ok(RecvStep::Data(content))
+            }
+            ContentType::Alert => Ok(RecvStep::Closed),
+            ContentType::Handshake => {
+                self.hs_buf.extend_from_slice(&content);
+                self.drain_post_handshake()?;
+                Ok(RecvStep::Progress)
+            }
+            ContentType::ChangeCipherSpec => Err(self.fail(unexpected("change_cipher_spec"))),
+        }
+    }
+
+    /// Every complete post-handshake message in `hs_buf`, processed in order. `true` if there was one.
+    fn drain_post_handshake(&mut self) -> Result<bool, TlsError> {
+        let mut any = false;
         loop {
-            if self.peer_closed {
-                return Ok(None);
-            }
-            if !self.hs_buf.is_empty() {
-                if let Some(r) = self.try_post_handshake()? {
-                    let _ = r;
-                    continue;
-                }
-            }
-            let r = self.read_content(false);
-            let (ty, content) = match r {
-                Ok(v) => v,
+            match self.try_post_handshake() {
+                Ok(Some(())) => any = true,
+                Ok(None) => return Ok(any),
                 Err(e) => return Err(self.fail(e)),
-            };
-            match ty {
-                ContentType::ApplicationData => {
-                    if !self.hs_buf.is_empty() {
-                        return Err(self.fail(unexpected("application data inside a handshake message")));
-                    }
-                    if content.is_empty() {
-                        continue;
-                    }
-                    return Ok(Some(content));
-                }
-                ContentType::Alert => return Ok(None),
-                ContentType::Handshake => {
-                    self.hs_buf.extend_from_slice(&content);
-                    while let Some(()) = match self.try_post_handshake() {
-                        Ok(v) => v,
-                        Err(e) => return Err(self.fail(e)),
-                    } {}
-                }
-                ContentType::ChangeCipherSpec => return Err(self.fail(unexpected("change_cipher_spec"))),
             }
         }
     }

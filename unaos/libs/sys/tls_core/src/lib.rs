@@ -42,6 +42,6 @@ pub mod test_provider;
 #[cfg(feature = "cryptocore")]
 pub mod cryptocore_provider;
 
-pub use client::{Client, ClientConfig, Negotiated, ServerCertVerifier, Transport};
+pub use client::{Client, ClientConfig, Negotiated, RecvStep, ServerCertVerifier, Transport};
 pub use crypto::CryptoProvider;
 pub use error::{AlertDescription, CertError, TlsError};
