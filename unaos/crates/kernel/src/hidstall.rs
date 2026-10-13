@@ -195,11 +195,11 @@ fn selftest() {
     let s = HID_STALL_S.load(Relaxed);
     let k = KEYQ_MAX_MS.load(Relaxed);
     serial_println!(
-        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={} dock_undecoded={}",
+        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={} dock_undecoded={} fr={}",
         h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed),
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
         holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
-        HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed)
+        HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed), FrPlace
     );
 }
 
@@ -533,4 +533,22 @@ static DOCK_UNDECODED: AtomicU32 = AtomicU32::new(0);
 fn release_undecoded(now: u64) -> bool {
     let (p, r) = (PRESS_PUSH_MS.load(Relaxed), RELEASE_PUSH_MS.load(Relaxed));
     p != 0 && r < p && now.saturating_sub(p) <= DOCK_RELEASE_TIMEOUT_MS + HELD_WINDOW_MS
+}
+
+// ── PUMPHOLE (rmbp-ledger B541) — the HIDSTALL line says where the flight recorder's body runs. FILE-TAIL append. ────────
+// Flight 32 failed this verdict with `hold_worst=usb-pump:flight-recorder:209` while `tests pointerfeel` said `fr=inline`:
+// the body's hand to its `flightrec` worker sat below the global-slot gate, which an internal-card-only boot never passes
+// (flight_recorder.rs, the PUMPHOLE fold at the gate). ` fr=worker:c<n> fr_worst_ms=<n>` (or `fr=inline`, `-` off x86)
+// now rides the end of the line, so a capture reads the recorder's placement beside the holder census it explains.
+struct FrPlace;
+impl core::fmt::Display for FrPlace {
+    #[cfg(target_arch = "x86_64")]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (c, w) = crate::flight_recorder::worker_state();
+        if c == usize::MAX { f.write_str("inline") } else { write!(f, "worker:c{} fr_worst_ms={}", c, w) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("-")
+    }
 }

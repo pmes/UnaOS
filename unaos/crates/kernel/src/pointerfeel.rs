@@ -108,7 +108,7 @@ pub fn note(now: u64, vendor: bool, down: bool) {
     }
     REPORTS.fetch_add(1, Relaxed);
     if vendor { MT.fetch_add(1, Relaxed); } else { LEGACY.fetch_add(1, Relaxed); }
-    let prev = LAST_MS.swap(now, Relaxed);
+    let prev = LAST_MS.swap(now, Relaxed); let pass_gap = PASS_GAP_MS.swap(0, Relaxed); // PUMPHOLE (B541): the longest hid-pass gap since the previous report, taken at EVERY counted report
     let prev_down = PREV_DOWN.swap(down, Relaxed);
     if prev == 0 || !prev_down || !down {
         return;
@@ -119,7 +119,7 @@ pub fn note(now: u64, vendor: bool, down: bool) {
     }
     let (held, who) = crate::hidstall::holder_between(prev, now);
     let step = crate::video::lag::pump_step_now() as u64;
-    let k = GAPS.fetch_add(1, Relaxed) as usize;
+    let k = GAPS.fetch_add(1, Relaxed) as usize; note_class(k, gap, pass_gap, who); // PUMPHOLE (B541): the gap classed starved (the hid pass itself was late or held) or silent (the pass ran on cadence and no frame came)
     if let (Some(a), Some(w)) = (GAP_AT.get(k), GAP_WHO.get(k)) {
         a.store(now << 24 | gap.min(0xFFFF) << 8 | (step & 0xff), Relaxed);
         w.store(if who == usize::MAX { 0 } else { (who as u64 + 1) << 32 } | held.min(0xFFFF_FFFF), Relaxed);
@@ -127,7 +127,7 @@ pub fn note(now: u64, vendor: bool, down: bool) {
     if gap > GAP_MAX_MS.load(Relaxed) {
         GAP_MAX_MS.store(gap, Relaxed);
         GAP_MAX_WHO.store(who, Relaxed);
-        GAP_MAX_STEP.store(step as u32, Relaxed);
+        GAP_MAX_STEP.store(step as u32, Relaxed); GAP_MAX_PASS.store(pass_gap, Relaxed); // PUMPHOLE (B541): the worst gap's own pass gap
     }
 }
 
@@ -220,7 +220,7 @@ impl core::fmt::Display for Holder {
 
 // ── the fixture ────────────────────────────────────────────────────────────────────────────────────────────────────
 
-/// The PASS rule. Pure.
+/// The PASS rule (PUMPHOLE B541: `gaps` is the STARVED count — a silent gap is the pad's, said apart). Pure.
 pub fn verdict(reports: u32, gaps: u32, mt: u32, legacy: u32) -> bool {
     reports > 0 && gaps == 0 && mt > legacy
 }
@@ -273,7 +273,7 @@ fn run() {
     }
     GAP_MAX_MS.store(0, Relaxed);
     GAP_MAX_WHO.store(usize::MAX, Relaxed);
-    GAP_MAX_STEP.store(0, Relaxed);
+    GAP_MAX_STEP.store(0, Relaxed); reset_class(); // PUMPHOLE (B541)
     ARMED.store(true, core::sync::atomic::Ordering::Release);
     serial_println!("[ptrfeel] move one finger on the trackpad for {} s (waiting up to {} s for the first touch)", WINDOW_MS / 1000, TOUCH_WAIT_MS / 1000);
     let _ = crate::video::notify(b"pointerfeel", b"Trackpad test", b"Move one finger on the trackpad for 5 seconds", b"", 0, b"");
@@ -311,18 +311,18 @@ fn report() {
     let gmax = GAP_MAX_MS.load(Relaxed);
     let worst = if gaps == 0 { None } else { Some(Holder(GAP_MAX_WHO.load(Relaxed), 0, GAP_MAX_STEP.load(Relaxed) as u8)) };
     serial_println!(
-        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} via=tests",
-        n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, WorstWord(worst), if mt > leg { "mt" } else { "legacy" }, FineWord,
-        if verdict(n, gaps, mt, leg) { "PASS" } else { "FAIL" }, BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
-        REASSERT_LATCHED.load(Relaxed), fr, fr_worst, LOGIN_GAP_MS.load(Relaxed), LoginGapHolder
+        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} starved={} starved_max_ms={} silent={} silent_max_ms={} pass_max_ms={} pass_bound_ms={} via=tests",
+        n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, Classed(silent_worst(gaps), WorstWord(worst)), if mt > leg { "mt" } else { "legacy" }, FineWord,
+        if verdict(n, STARVED.load(Relaxed), mt, leg) { "PASS" } else { "FAIL" }, BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
+        REASSERT_LATCHED.load(Relaxed), fr, fr_worst, LOGIN_GAP_MS.load(Relaxed), LoginGapHolder, STARVED.load(Relaxed), STARVED_MAX_MS.load(Relaxed), SILENT.load(Relaxed), SILENT_MAX_MS.load(Relaxed), PASS_MAX_MS.load(Relaxed), BOUND_MS
     );
     let start = START_MS.load(Relaxed);
     for k in 0..(gaps as usize).min(GAP_LOG) {
         let (a, w) = (GAP_AT[k].load(Relaxed), GAP_WHO[k].load(Relaxed));
         let who = if w >> 32 == 0 { usize::MAX } else { (w >> 32) as usize - 1 };
         serial_println!(
-            "[ptrfeel] gap n={} at_ms={} ms={} holder={} (POINTERFEEL: a finger-down report stream silent over {} ms)",
-            k + 1, (a >> 24).saturating_sub(start), (a >> 8) & 0xFFFF, Holder(who, w & 0xFFFF_FFFF, (a & 0xff) as u8), BOUND_MS
+            "[ptrfeel] gap n={} at_ms={} ms={} holder={} (POINTERFEEL: a finger-down report stream silent over {} ms){}",
+            k + 1, (a >> 24).saturating_sub(start), (a >> 8) & 0xFFFF, Holder(who, w & 0xFFFF_FFFF, (a & 0xff) as u8), BOUND_MS, GapClass(k)
         );
     }
 }
@@ -344,5 +344,107 @@ struct FrWord(usize);
 impl core::fmt::Display for FrWord {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.0 == usize::MAX { f.write_str("inline") } else { write!(f, "worker:c{}", self.0) }
+    }
+}
+
+// ── PUMPHOLE (rmbp-ledger B541) — a report gap is classed by the hid pass's OWN cadence over it. FILE-TAIL append. ────────
+//
+// THE WIRE (flight 32 boot 1, `tests pointerfeel` with a finger moving): `gaps=11 gap_max_ms=2016
+// worst_holder=unheld/step=bootlog`. Read against the same second: `[lag] stall … hid_gap_ms=8 … pump=bootlog pump_ms=53.2
+// masked_ms=0 holder=-` — the hid pass ran at most 8 ms apart while the usb-pump sat 53 ms in its `bootlog` step, and the
+// census (`[hid] stall census … holders=5`) names NO hold in step `bootlog` all session. The two pumps are separate
+// PRIO_NORMAL tasks on one core and the scheduler preempts at `QUANTUM_TICKS` (4 ticks, arch/x86_64/sched.rs:174), so an
+// UNMASKED step cannot hold the hid pass past one quantum; `step=` was a sample of where the usb-pump happened to be when
+// the next report landed (its longest non-nap step), never a holder. What that step does is `bootpace::service_dump()`
+// (main.rs:6026): `clock_x1_poll`, `fb_wc_witness`, `ftdi::late_verdict` (latched one-liners), `video::dimidle::service`,
+// `video::wm::paygo_service` and the BPACE ledger's early-return snapshot — 17–53 ms per pass on the wire, unmasked.
+//
+// So the fixture now measures the half it could not see: [`note_pass`] (the hid pass, after it takes `EHCI_HID`, so a pass
+// that waited on the lock is charged its wait) keeps the longest pass-to-pass gap since the last report; each report gap
+// over [`BOUND_MS`] is STARVED when that pass gap also exceeded the bound or the pump core was held over it (the kernel's
+// loss — the verdict's count), else SILENT (the pass polled on cadence and the pad sent no frame — the device's, said
+// apart: `silent=<n> silent_max_ms=<n>`). The bound the verdict holds: every finger-down report gap the KERNEL causes is
+// one with a hid-pass gap over 16 ms, and PASS says there was none in the window (`pass_max_ms=` is the window's worst pass
+// gap, `pass_bound_ms=16`). `gaps=`/`gap_max_ms=` stay the raw stream, so the longitudinal reading does not move.
+
+/// The hid pass's last entry in the window (0 = none yet) and the longest pass gap since the previous report.
+static PASS_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static PASS_GAP_MS: AtomicU64 = AtomicU64::new(0);
+/// The window's longest pass gap.
+static PASS_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static STARVED: AtomicU32 = AtomicU32::new(0);
+static STARVED_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static SILENT: AtomicU32 = AtomicU32::new(0);
+static SILENT_MAX_MS: AtomicU64 = AtomicU64::new(0);
+/// The worst gap's pass gap; the first [`GAP_LOG`] gaps' pass gaps (`u64::MAX` = not classed).
+static GAP_MAX_PASS: AtomicU64 = AtomicU64::new(0);
+static GAP_PASS: [AtomicU64; GAP_LOG] = [const { AtomicU64::new(u64::MAX) }; GAP_LOG];
+
+/// The hid pass ran at `now` (`drivers/ehci/mod.rs` `service_ehci_hid`, under `EHCI_HID`; hid-pump only). One relaxed
+/// load when the window is shut.
+#[inline]
+pub fn note_pass(now: u64) {
+    if !ARMED.load(Relaxed) {
+        return;
+    }
+    let prev = PASS_LAST_MS.swap(now, Relaxed);
+    if prev != 0 && now > prev {
+        PASS_GAP_MS.fetch_max(now - prev, Relaxed);
+        PASS_MAX_MS.fetch_max(now - prev, Relaxed);
+    }
+}
+
+/// Is a report gap the kernel's? The pass itself was late over it, or the pump core was held over it. Pure.
+pub fn is_starved(pass_gap_ms: u64, held_who: usize) -> bool {
+    pass_gap_ms > BOUND_MS || held_who != usize::MAX
+}
+
+fn note_class(k: usize, gap: u64, pass_gap: u64, who: usize) {
+    if let Some(a) = GAP_PASS.get(k) {
+        a.store(pass_gap, Relaxed);
+    }
+    if is_starved(pass_gap, who) {
+        STARVED.fetch_add(1, Relaxed);
+        STARVED_MAX_MS.fetch_max(gap, Relaxed);
+    } else {
+        SILENT.fetch_add(1, Relaxed);
+        SILENT_MAX_MS.fetch_max(gap, Relaxed);
+    }
+}
+
+fn reset_class() {
+    for a in GAP_PASS.iter() {
+        a.store(u64::MAX, Relaxed);
+    }
+    for a in [&PASS_LAST_MS, &PASS_GAP_MS, &PASS_MAX_MS, &STARVED_MAX_MS, &SILENT_MAX_MS, &GAP_MAX_PASS] {
+        a.store(0, Relaxed);
+    }
+    STARVED.store(0, Relaxed);
+    SILENT.store(0, Relaxed);
+}
+
+/// The worst gap was SILENT (unheld, the pass on cadence over it).
+fn silent_worst(gaps: u32) -> bool {
+    gaps > 0 && !is_starved(GAP_MAX_PASS.load(Relaxed), GAP_MAX_WHO.load(Relaxed))
+}
+
+/// `worst_holder=`: `silent/pass_max_ms=<n>` for a silent worst gap (the pad's), else the holder word as before.
+struct Classed<T: core::fmt::Display>(bool, T);
+impl<T: core::fmt::Display> core::fmt::Display for Classed<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 { write!(f, "silent/pass_max_ms={}", GAP_MAX_PASS.load(Relaxed)) } else { self.1.fmt(f) }
+    }
+}
+
+/// The `[ptrfeel] gap` line's tail: ` pass_max_ms=<n> cause=<starved|silent>`.
+struct GapClass(usize);
+impl core::fmt::Display for GapClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let p = GAP_PASS.get(self.0).map(|a| a.load(Relaxed)).unwrap_or(u64::MAX);
+        if p == u64::MAX {
+            return Ok(());
+        }
+        let held = GAP_WHO.get(self.0).map(|w| w.load(Relaxed) >> 32 != 0).unwrap_or(false);
+        write!(f, " pass_max_ms={} cause={}", p, if p > BOUND_MS || held { "starved" } else { "silent" })
     }
 }
