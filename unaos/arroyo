@@ -687,7 +687,9 @@ _feats="${_feats}sdw,"
 # emitting `:: INSTALL: gpt+fat32+copy verify => PASS ::`. The engine refuses any target whose leading
 # sectors are not blank. Arch-neutral engine (compiles both arches under the feature); witness is
 # x86-only. Default OFF => module + call site vanish, media byte-identical. Kept in sync with
-# builder/src/main.rs.
+# builder/src/main.rs. INSTALL4 (rmbp-ledger B619): the knob rides scripts/image-line.env (the `install` verb family
+# on the card, flight 35); the unattended witness (`install_probe_once` -> `run_fixture`/`run_demo`) writes ONLY in a
+# build with `tests-at-boot` (the battery lanes' head `case` exports it), so on media it prints one line and writes nothing.
 [ -n "${UNAOS_INSTALLDEMO:-}" ] && _feats="${_feats}installdemo,"
 # SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17, Peter's ruling). The mature
 # smoltcp TCP/IP stack (ROADMAP §1b) carries the shell's ping/arp/ifconfig + the socket syscalls + the
