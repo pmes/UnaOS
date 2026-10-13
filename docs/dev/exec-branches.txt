@@ -457,5 +457,5 @@ refs/heads/exec-rmbp-shellabi                 c4c99344 FOLDED-BY-HAND ac648889
 refs/heads/exec-host-a11yface                 c4c99344 FOLDED-BY-HAND ac648889
 refs/heads/exec-host-aetherworkers2           12393dd6 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-aetherrender3            12393dd6 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-host-jspos                    12393dd6 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-jspos                    12393dd6 FOLDED-BY-HAND e65920c4
 refs/heads/exec-orin-armpipe                  12393dd6 IN-FLIGHT cloud 2026-10-13
