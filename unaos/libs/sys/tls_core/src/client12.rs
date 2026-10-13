@@ -252,6 +252,7 @@ impl<'a, T: Transport> Client<'a, T> {
             alpn,
             hello_retry: false,
             peer_chain_len: chain.len(),
+            peer_chain: chain,
             client_cert_requested: cert_requested,
             extended_master_secret: true,
             resumed: false,

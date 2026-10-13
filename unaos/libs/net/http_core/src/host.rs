@@ -501,6 +501,55 @@ pub enum Event {
 /// Where a connection thread sends events. `false` = the receiver is gone (the exchange is abandoned).
 pub trait EventSink: Send {
     fn send(&mut self, ev: Event) -> bool;
+    /// NETDEBT (SR97): the TLS peer of the connection that is about to answer this exchange, told before its
+    /// `Head` (again if the job moves to another connection). Default: ignored. [`WithPeer`] keeps it.
+    fn peer(&mut self, _chain: &Arc<PeerChain>) {}
+}
+
+/// NETDEBT (SR97): what the TLS handshake of a response's connection established about the server — the
+/// certificate chain for a page-info view (gneiss_pal `Response::peer_chain`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerChain {
+    /// DER certificates as the server sent them, leaf first. Empty when the session was resumed from a ticket
+    /// (no Certificate message; the chain was verified on the connection that issued the ticket).
+    pub certs: Vec<Vec<u8>>,
+    pub resumed: bool,
+    /// 0x0304 (TLS 1.3) or 0x0303 (TLS 1.2).
+    pub tls_version: u16,
+}
+
+impl PeerChain {
+    fn of<T: tls_core::Transport>(c: &TlsClient<'_, T>) -> Arc<PeerChain> {
+        let n = c.negotiated();
+        Arc::new(PeerChain { certs: n.peer_chain.clone(), resumed: n.resumed, tls_version: n.version })
+    }
+}
+
+/// Where a [`WithPeer`] sink leaves the peer it was told about.
+pub type PeerSlot = Arc<Mutex<Option<Arc<PeerChain>>>>;
+
+/// Any sink, plus a [`PeerSlot`] the connection fills with the answering connection's [`PeerChain`].
+pub struct WithPeer<S: EventSink> {
+    pub inner: S,
+    pub slot: PeerSlot,
+}
+
+impl<S: EventSink> WithPeer<S> {
+    pub fn new(inner: S, slot: PeerSlot) -> Self {
+        WithPeer { inner, slot }
+    }
+}
+
+impl<S: EventSink> EventSink for WithPeer<S> {
+    fn send(&mut self, ev: Event) -> bool {
+        self.inner.send(ev)
+    }
+    fn peer(&mut self, chain: &Arc<PeerChain>) {
+        if let Ok(mut s) = self.slot.lock() {
+            *s = Some(chain.clone());
+        }
+        self.inner.peer(chain);
+    }
 }
 
 impl EventSink for SyncSender<Event> {
@@ -826,14 +875,15 @@ impl Agent {
         let mut hops = 0;
         loop {
             let (tx, rx) = mpsc::sync_channel::<Event>(16);
-            self.dispatch(&req, Box::new(tx));
+            let peer: PeerSlot = Arc::new(Mutex::new(None));
+            self.dispatch(&req, Box::new(WithPeer::new(tx, peer.clone())));
             let head = match rx.recv() {
                 Ok(Event::Head(h)) => h,
                 Ok(Event::End(Err(e))) => return Err(e),
                 Ok(_) | Err(_) => return Err(Error::Io("connection thread ended without a response".into())),
             };
             match self.after_head(&req, &head, hops)? {
-                Next::Final => return Ok(Response { head, url: req.url, rx, done: false }),
+                Next::Final => return Ok(Response { head, url: req.url, rx, done: false, peer }),
                 Next::Follow(next) => {
                     // Wait for the discarded body to finish so the connection is parked before reuse.
                     while let Ok(ev) = rx.recv() {
@@ -865,11 +915,16 @@ pub struct Response {
     pub url: Url,
     rx: Receiver<Event>,
     done: bool,
+    peer: PeerSlot,
 }
 
 impl Response {
     pub fn status(&self) -> u16 {
         self.head.status
+    }
+    /// NETDEBT (SR97): the TLS peer of the connection that answered (`None` over plain HTTP).
+    pub fn peer_chain(&self) -> Option<Arc<PeerChain>> {
+        self.peer.lock().ok().and_then(|s| s.clone())
     }
     pub fn headers(&self) -> &Headers {
         &self.head.headers
@@ -1072,13 +1127,14 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coale
             }
         };
         let alpn_h2 = client.negotiated().alpn.as_deref() == Some(b"h2");
+        let peer = PeerChain::of(&client);
         let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
         if alpn_h2 {
             let mut h2c = match crate::h2::H2Conn::handshake(tls) {
                 Ok(c) => c,
                 Err(e) => return fail(first, e),
             };
-            serve_h2(&inner, &key, id, first, &mut h2c, probe.as_ref(), coalesce.as_mut());
+            serve_h2(&inner, &key, id, first, &mut h2c, probe.as_ref(), coalesce.as_mut(), &peer);
             let _ = h2c.transport_mut().c.close();
             return;
         }
@@ -1088,7 +1144,10 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job, coale
         }
         drop(coalesce);
         let mut conn = Conn::new(tls);
-        serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
+        serve(&inner, &key, id, first, |mut job, reused| {
+            job.sink.peer(&peer);
+            exchange(&mut conn, &key, job, reused)
+        });
         let _ = conn.transport.c.close();
     } else {
         let mut conn = Conn::new(t);
@@ -1348,7 +1407,7 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
 
 /// Serve an `h2` connection: every job for this origin becomes a stream on it, concurrently, until GOAWAY,
 /// a connection error, or the idle timeout with no stream open.
-fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut crate::h2::H2Conn<Tls<'_>>, probe: Option<&TcpStream>, coalesce: Option<&mut Coalesce>) {
+fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut crate::h2::H2Conn<Tls<'_>>, probe: Option<&TcpStream>, coalesce: Option<&mut Coalesce>, peer: &Arc<PeerChain>) {
     let agent = Agent { inner: inner.clone() };
     let (tx, rx) = mpsc::channel::<Job>();
     let mut queue: alloc::collections::VecDeque<Job> = alloc::collections::VecDeque::new();
@@ -1385,6 +1444,7 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
         // Open streams for waiting jobs, up to the peer's limit.
         while h2c.can_open() {
             let Some(mut job) = queue.pop_front() else { break };
+            job.sink.peer(peer);
             let body = job.body.clone();
             let authority = job.url.host_str();
             match h2c.send_request(&job.method, &key.scheme, &authority, &job.url.request_target(), &job.headers, &body) {

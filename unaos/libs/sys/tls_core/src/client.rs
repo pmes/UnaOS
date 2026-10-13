@@ -161,6 +161,9 @@ pub struct Negotiated {
     pub alpn: Option<Vec<u8>>,
     pub hello_retry: bool,
     pub peer_chain_len: usize,
+    /// NETDEBT (SR97): the server's Certificate chain as received (DER, leaf first, the order the server sent),
+    /// for a caller that shows it (Aether's page info). Empty on a resumed connection (no Certificate is sent).
+    pub peer_chain: Vec<Vec<u8>>,
     pub client_cert_requested: bool,
     /// TLS 1.2: the RFC 7627 extended master secret was negotiated (always true — it is required).
     pub extended_master_secret: bool,
@@ -801,9 +804,9 @@ impl<'a, T: Transport> Client<'a, T> {
         // ---- resumed (PSK): no CertificateRequest, Certificate, CertificateVerify (§2.2, §4.3.2)
         let mut cert_request_ctx: Option<Vec<u8>> = None;
         let mut cert_verdict: Option<x509::CertVerdict> = None;
-        let (scheme, chain_len) = if resumed {
+        let (scheme, peer_chain) = if resumed {
             let t = ticket.as_ref().expect("resumed implies a ticket");
-            (SignatureScheme::from_code(t.signature_scheme).unwrap_or(SignatureScheme::EcdsaSecp256r1Sha256), 0)
+            (SignatureScheme::from_code(t.signature_scheme).unwrap_or(SignatureScheme::EcdsaSecp256r1Sha256), Vec::new())
         } else {
             // ---- CertificateRequest? Certificate
             let mut m = self.next_handshake()?;
@@ -848,7 +851,7 @@ impl<'a, T: Transport> Client<'a, T> {
                 other => other,
             })?;
             transcript.add(&cv_msg);
-            (scheme, chain.len())
+            (scheme, chain)
         };
         let peer_alpn = ee.alpn.clone();
 
@@ -900,7 +903,8 @@ impl<'a, T: Transport> Client<'a, T> {
             signature_scheme: scheme,
             alpn: peer_alpn,
             hello_retry,
-            peer_chain_len: chain_len,
+            peer_chain_len: peer_chain.len(),
+            peer_chain,
             client_cert_requested: cert_request_ctx.is_some(),
             extended_master_secret: false,
             version: msgs::TLS13,
