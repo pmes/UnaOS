@@ -195,7 +195,7 @@ fn url_matches_expression(expr: &str, url: &url::Url, self_origin: &Origin, redi
         }
         // The secure upgrade of 'self' (http → https, ws → wss, on the default ports) also matches.
         if let Origin::Tuple { scheme: s, host, port } = self_origin {
-            let host_ok = { let hs = url.host_str(); !hs.is_empty() && hs.eq_ignore_ascii_case(host) };
+            let host_ok = { let hs = url.hostname(); !hs.is_empty() && hs.eq_ignore_ascii_case(host) };
             let up = (s == "http" && matches!(scheme, "https" | "ws" | "wss")) || (s == "https" && scheme == "wss") || (s == "ws" && scheme == "wss");
             let port_ok = port.is_none() && url.port().is_none();
             return host_ok && up && port_ok;
@@ -244,7 +244,9 @@ fn url_matches_expression(expr: &str, url: &url::Url, self_origin: &Origin, redi
             None => (hostport, None),
         }
     };
-    let url_host = url.host_str();
+    // The URL's host WITHOUT its port (html_core's `host_str` is URL `host`, hostname[:port]); the port is
+    // matched below (CSP3 "port-part matches").
+    let url_host = url.hostname();
     if url_host.is_empty() { return false; }
     let url_host = url_host.to_ascii_lowercase();
     let host_ok = if host_pat == "*" {
