@@ -967,17 +967,19 @@ pub fn refusalui_selftest() {
             return "not-posted";
         }
         open_pending();
-        let up = matches!(current(), Some((t, n, _, _)) if &t[..n] == what);
+        let up = matches!(current(), Some((t, n, _, _)) if &t[..n] == &what[..what.len().min(TL)]); // UIREDS26 (B589): the title as `Dlg::new` stores it (cut at TL; WHAT_SYSTEM_FILES is 26 B)
         answer(Answer::Default);
         if up && REF_ALERTS.load(Ordering::Relaxed) == a0 + 1 { "alert" } else { "FAIL" }
     };
     let opener = alert_leg(WHAT_OPENER, b"preferred=/apps/EVIL.ELF refused=not-a-registrant");
     let rootacl = alert_leg(WHAT_SYSTEM_FILES, b"attr-set path=/system/types refused=system-tree principal=anon");
     // fwpin: information — a toast, no alert
-    let t0 = super::toast::queued();
-    let fwpin = if refused(WHAT_FIRMWARE, b"b43-ucode reason=unpinned") && super::toast::queued() == t0 + 1 && !is_up() { "toast" } else { "FAIL" };
+    // UIREDS26 (B589): the router's OWN toast count, not `toast::queued()` — NOTIFY's live pass drains that queue
+    // (`notify::take_inbound` -> `toast::take_full`) between two reads, which read as a second showing.
+    let t0 = REF_TOASTS.load(Ordering::Relaxed);
+    let fwpin = if refused(WHAT_FIRMWARE, b"b43-ucode reason=unpinned") && REF_TOASTS.load(Ordering::Relaxed) == t0 + 1 && !is_up() { "toast" } else { "FAIL" };
     // once: the same refusal again shows nothing
-    let repeat = if !refused(WHAT_FIRMWARE, b"b43-ucode reason=unpinned") && super::toast::queued() == t0 + 1 { "once" } else { "SHOWN-TWICE" };
+    let repeat = if !refused(WHAT_FIRMWARE, b"b43-ucode reason=unpinned") && REF_TOASTS.load(Ordering::Relaxed) == t0 + 1 { "once" } else { "SHOWN-TWICE" };
     super::toast::fixture_drain();
     // the TOAST verb: its queued entry carries the button; NOTIFY's press answers the poster with the token
     let mut toast_action = "FAIL";

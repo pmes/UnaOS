@@ -13,6 +13,9 @@ use crate::video::theme;
 /// DIALOG2's power row (Sleep / Restart / Shut Down) is on the login window: its row sets this at its first paint
 /// (one line at the fold). Until it does the witness says `login_window=users` and FAILs on `power`.
 pub static POWER_ROW: AtomicBool = AtomicBool::new(false);
+/// UIREDS26 (B571): the LOG-IN form (the one that carries the power row, `login.rs` `power_row_on`) opened this boot.
+/// A first-user boot opens only the setter form, which has no power row; set at `login.rs`'s screen-open line.
+pub static LOGIN_FORM_OPENED: AtomicBool = AtomicBool::new(false);
 /// Avatars drawn this boot (the witness's evidence the tiles carry them).
 static AVATARS: AtomicU32 = AtomicU32::new(0);
 
@@ -80,7 +83,9 @@ pub fn word() -> (&'static str, bool) {
         (false, true) => "power",
         (false, false) => "none",
     };
-    (w, users && power)
+    // UIREDS26 (B571): the power row is owed only once the log-in form has opened — a boot that showed only the setter
+    // is whole with its roster; a log-in form that opened without its row is still red.
+    (w, users && (power || !LOGIN_FORM_OPENED.load(Ordering::Acquire)))
 }
 
 /// Avatars drawn this boot (`tests firstuser` evidence; 0 before the window's first paint).

@@ -863,9 +863,14 @@ pub fn test() {
     let center_ok = center_ok_a && clear_press && cleared && outside && !center_open();
     let badge_ok = badge_before >= RING as u32 && unread() == 0;
     // (4) DND: a post collects silently (no card, the badge counts it)
+    // UIREDS26 (B582): a card's `until` is on the PASS clock since NOTICEFIX (d0061623), so the ring leg's last four
+    // cards (shown at t0+13..t0+114) still stand here; one pass past every `until` expires them first, so `banners()`
+    // below measures the DND post alone. Before d0061623 `until` was `arch::ms() + CARD_MS`, below t0, and they were gone.
+    let t_dnd = t0 + 300 + CARD_MS;
+    pass(t_dnd);
     DND.store(true, Ordering::Relaxed);
     let _ = post_full(b"system", b"DND fixture", b"collected", b"", ACT_NONE, b"");
-    pass(t0 + 300);
+    pass(t_dnd + 1);
     let dnd_ok = banners() == 0 && unread() == 1 && ST.lock().ring.len() == 1;
     let kept = FOCUS_MOVED.load(Ordering::Relaxed) == 0;
     restore(h);

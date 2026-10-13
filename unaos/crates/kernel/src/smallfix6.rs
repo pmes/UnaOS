@@ -79,7 +79,7 @@ fn selftest() {
     let steps = crate::fs::bootstep::overlaps(h_end.saturating_sub(h_ms), h_end);
     // The Player is the video registrant on every build; it is RUNNABLE only under `videoplayer`.
     let openers_ok = mp4.starts_with("player") && webm.starts_with("player");
-    let fw_ok = fw == "-" || fw.starts_with("searchable") || fw.starts_with("no-unafs");
+    let fw_ok = fw == "-" || fw.starts_with("searchable") || fw.starts_with("no-unafs") || fw.starts_with("skipped("); // UIREDS26 (B596): a root volume that is not searchable by name is a skip, not a red; `refused(` stays red
     let pass = openers_ok && fw_ok && notfound == "said";
     serial_println!(
         ":: SMALLFIX6: fwvol={} openers={}/{} windowcap=registered notfound={} lag={}@{}:{} lumen=split -> {} :: spans={}",

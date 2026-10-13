@@ -3027,7 +3027,7 @@ pub fn wl_box_center() -> Option<(i32, i32)> {
     if !s.win || s.n == 0 {
         return None;
     }
-    let k = s.n - 1;
+    let k = (0..s.n).find(|&k| s.kind[k] == KIND_WIN)?; // UIREDS26 (B606): the Window box BY KIND — APPMENU2 (59b7a6db) put Help after it, so the last box is Help
     Some(((s.x[k] + s.w[k] / 2) as i32, (s.bar.1 + s.bar.3 / 2) as i32))
 }
 

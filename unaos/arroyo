@@ -4625,6 +4625,8 @@ launch_x86_64() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_midden_x86   # UIREDS26 (B566): the QEMU launch stages MIDDEN.ELF too (the ESP path at esp_x86 does) — dockpins' midden tile no longer `refused=stat`
+    build_user_una_x86      # UIREDS26 (B566): and UNA.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
