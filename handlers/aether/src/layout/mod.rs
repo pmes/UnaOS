@@ -225,6 +225,12 @@ impl layout_core::DomNode for NodeRef {
         let attrs = el.attributes.borrow();
         attrs.get(name).map(str::to_string)
     }
+    // AETHERSTYLE3B (SR115): a referenced SVG `<filter>` is serialized for svg_core with every attribute.
+    fn attrs(&self) -> Vec<(String, String)> {
+        let Some(el) = self.as_element() else { return Vec::new() };
+        let attrs = el.attributes.borrow();
+        attrs.map.iter().map(|(n, a)| (n.local.to_string(), a.value.to_string())).collect()
+    }
     fn text(&self) -> String {
         self.text_contents()
     }

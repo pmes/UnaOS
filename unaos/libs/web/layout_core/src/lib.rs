@@ -82,6 +82,12 @@ pub trait DomNode: Clone {
     fn has_attr(&self, name: &str) -> bool {
         self.attr(name).is_some()
     }
+    /// AETHERSTYLE3B (SR115): an element's attributes (name, value) in source order — what serializing a
+    /// referenced SVG `<filter>` for svg_core needs (`effects::filter_markup`). The default lists none: a ring
+    /// that cannot enumerate attributes resolves no `url()` filter (the reference is skipped).
+    fn attrs(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// Text content: a text node's data, else the concatenated text of the inclusive subtree.
     fn text(&self) -> String;
     fn children(&self) -> Vec<Self>;

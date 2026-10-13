@@ -1456,9 +1456,23 @@ fn changed_bounds(surface: &[u8], snap: &[u8], width: u32, height: u32) -> Optio
 /// AETHERSTYLE3 (SR103): a `filter` group. The pixels the subtree changed against `snap` are the group (a
 /// straight-alpha layer, opaque where drawn), padded by the list's spread, run through svg_core's CSS filter
 /// hook (`layout_core::effects::filter_rgba`) and composited source-over onto the snapshot, clipped to `clip`.
-fn filter_group(surface: &mut [u8], snap: &[u8], width: u32, height: u32, value: &str, cx: &layout_core::effects::FilterCx, clip: Clip) {
+///
+/// AETHERSTYLE3B (SR115): a `url(#id)` entry runs the page's SVG `<filter>` `resolve` serializes, with `rect`
+/// (the element's border box, screen px) as its bounding box (`layout_core::effects::filter_rgba_refs`).
+#[allow(clippy::too_many_arguments)]
+fn filter_group(
+    surface: &mut [u8],
+    snap: &[u8],
+    width: u32,
+    height: u32,
+    value: &str,
+    cx: &layout_core::effects::FilterCx,
+    clip: Clip,
+    rect: Clip,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) {
     let Some((x0, y0, x1, y1)) = changed_bounds(surface, snap, width, height) else { return };
-    let m = layout_core::effects::filter_margin(value, cx) as i64;
+    let m = layout_core::effects::filter_margin_box(value, cx, rect.2 - rect.0, rect.3 - rect.1) as i64;
     let rx0 = (x0 as i64 - m).max(0).max(clip.0.floor() as i64) as u32;
     let ry0 = (y0 as i64 - m).max(0).max(clip.1.floor() as i64) as u32;
     let rx1 = ((x1 as i64 + 1 + m).min(width as i64).min(clip.2.ceil() as i64)).max(rx0 as i64) as u32;
@@ -1477,7 +1491,8 @@ fn filter_group(surface: &mut [u8], snap: &[u8], width: u32, height: u32, value:
             }
         }
     }
-    if !layout_core::effects::filter_rgba(&mut layer, lw, lh, value, cx) {
+    let bbox = (rect.0 - rx0 as f32, rect.1 - ry0 as f32, rect.2 - rect.0, rect.3 - rect.1);
+    if !layout_core::effects::filter_rgba_refs(&mut layer, lw, lh, value, cx, bbox, resolve) {
         return;
     }
     // the whole surface returns to the backdrop, then the filtered layer composites over it
@@ -1503,8 +1518,18 @@ fn filter_group(surface: &mut [u8], snap: &[u8], width: u32, height: u32, value:
 /// AETHERSTYLE3 (SR103): `backdrop-filter` (Filter Effects 2 §3) — the backdrop under the box's border box
 /// (`rect`, screen px) is filtered before the box paints: the region padded by the list's spread is read
 /// opaque, filtered, and written back inside the border box (and `clip`) only.
-fn backdrop_group(surface: &mut [u8], width: u32, height: u32, rect: Clip, value: &str, cx: &layout_core::effects::FilterCx, clip: Clip) {
-    let m = layout_core::effects::filter_margin(value, cx);
+#[allow(clippy::too_many_arguments)]
+fn backdrop_group(
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    rect: Clip,
+    value: &str,
+    cx: &layout_core::effects::FilterCx,
+    clip: Clip,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) {
+    let m = layout_core::effects::filter_margin_box(value, cx, rect.2 - rect.0, rect.3 - rect.1);
     let rx0 = (rect.0 - m).floor().max(0.0) as u32;
     let ry0 = (rect.1 - m).floor().max(0.0) as u32;
     let rx1 = ((rect.2 + m).ceil().max(0.0) as u32).min(width);
@@ -1521,7 +1546,8 @@ fn backdrop_group(surface: &mut [u8], width: u32, height: u32, rect: Clip, value
             layer[o..o + 4].copy_from_slice(&[surface[i + 2], surface[i + 1], surface[i], 255]);
         }
     }
-    if !layout_core::effects::filter_rgba(&mut layer, lw, lh, value, cx) {
+    let bbox = (rect.0 - rx0 as f32, rect.1 - ry0 as f32, rect.2 - rect.0, rect.3 - rect.1);
+    if !layout_core::effects::filter_rgba_refs(&mut layer, lw, lh, value, cx, bbox, resolve) {
         return;
     }
     let bx0 = rect.0.max(clip.0).max(0.0).floor() as u32;
@@ -1709,10 +1735,15 @@ pub fn render_frame(
             viewport: (width as f32, height as f32),
             color: paint.and_then(|p| p.color).unwrap_or(inherited.color),
         };
+        // AETHERSTYLE3B (SR115): `url(#id)` entries resolve against this element's document.
+        let resolve = |id: &str| -> Option<String> {
+            let n = layout.node_map.get(&node_id)?;
+            layout_core::effects::resolve_filter(n, id)
+        };
         if let (Some(bf), Some(lb)) = (&backdrop, lb) {
             let (ox, oy) = placed_origin(layout, node_id, abs_x, abs_y, &lb, width, height, sx, sy);
             let (bx, by) = (ox - sx as f32, oy - sy as f32);
-            backdrop_group(surface, width, height, (bx, by, bx + lb.size.width, by + lb.size.height), bf, &fcx, clip);
+            backdrop_group(surface, width, height, (bx, by, bx + lb.size.width, by + lb.size.height), bf, &fcx, clip, &resolve);
         }
         let (Some(lb), true) = (lb, tf.is_some() || shape.is_some() || filter.is_some()) else {
             draw_node_op(
@@ -1731,7 +1762,7 @@ pub fn render_frame(
         );
         // Filter Effects 1 §5: the filter applies first, then clipping, then the transform.
         if let Some(f) = &filter {
-            filter_group(surface, &snap, width, height, f, &fcx, clip);
+            filter_group(surface, &snap, width, height, f, &fcx, clip, (bx, by, bx + w, by + h), &resolve);
         }
         let Some((x0, y0, x1, y1)) = changed_bounds(surface, &snap, width, height) else {
             return; // the group drew nothing
