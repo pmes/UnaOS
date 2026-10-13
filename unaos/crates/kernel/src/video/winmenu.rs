@@ -1128,6 +1128,8 @@ const BORDER: usize = crystal::DROP_BORDER;
 #[allow(non_snake_case)] #[inline] fn ITEM_H() -> usize { crystal::DROP_ITEM_H() }
 #[allow(non_snake_case)] #[inline] fn SEP_H() -> usize { crystal::DROP_SEP_H() }
 #[allow(non_snake_case)] #[inline] fn PADX() -> usize { crystal::DROP_PADX() }
+/// MENUSCRAFT (B642) — the container's vertical padding, the SHARD sheet's own.
+#[allow(non_snake_case)] #[inline] fn PADY() -> usize { crystal::DROP_PADY() }
 
 /// The check column, in glyphs: a mark and a space. Reserved on every row so the labels of a menu
 /// with one marked item still line up with each other.
@@ -1150,7 +1152,7 @@ fn item_chord(it: &MenuItem) -> Option<&'static str> {
 #[inline]
 fn item_glyphs(it: &MenuItem, name_len: usize) -> usize {
     let named = if it.flags & (FLAG_APPNAME | FLAG_APPNAME_PRE) != 0 && name_len > 0 { 1 + name_len } else { 0 }; // APPMENU2
-    let chord = item_chord(it).map_or(0, |c| 2 + c.len()); // SHORTCUTS M3 — the chord sits right-aligned, two glyphs clear of the label
+    let chord = item_chord(it).map_or(0, |c| 2 + crystal::sheet::chord_cells(c)); // SHORTCUTS M3 — the chord sits right-aligned, two glyphs clear of the label; MENUSCRAFT: as keycaps, measured by the painter's own rule
     it.label.len() + named + chord
 }
 
@@ -1158,7 +1160,7 @@ fn item_glyphs(it: &MenuItem, name_len: usize) -> usize {
 /// which [`FLAG_APPNAME`] rows carry as a suffix (SO3).
 fn drop_extent(items: &[MenuItem], name_len: usize) -> (usize, usize) {
     let mut widest = 0usize;
-    let mut h = 2 * BORDER;
+    let mut h = 2 * BORDER + 2 * PADY(); // MENUSCRAFT: the container's padding
     for it in items.iter() {
         if it.flags & FLAG_SEPARATOR != 0 {
             h += SEP_H();
@@ -1170,7 +1172,7 @@ fn drop_extent(items: &[MenuItem], name_len: usize) -> (usize, usize) {
             widest = g;
         }
     }
-    let w = 2 * BORDER + 2 * PADX() + (widest + CHECK_GLYPHS) * CELL_W();
+    let w = (2 * BORDER + 2 * PADX() + (widest + CHECK_GLYPHS) * CELL_W()).max(crystal::sheet::MIN_W()); // MENUSCRAFT: §3.7's min-width
     (w, h)
 }
 
@@ -1231,7 +1233,7 @@ fn menu_of(s: &BarSnapshot, k: usize, site: &str) -> Menu {
 
 /// The top of item `i` as an offset from the dropdown's top edge.
 fn item_top(items: &[MenuItem], i: usize) -> usize {
-    let mut y = BORDER;
+    let mut y = BORDER + PADY(); // MENUSCRAFT: below the container's padding
     for it in items.iter().take(i) {
         y += if it.flags & FLAG_SEPARATOR != 0 { SEP_H() } else { ITEM_H() };
     }
@@ -1301,6 +1303,7 @@ fn layout_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Layout {
     };
     let (_, name_len) = app_name();
     let (mw, mh) = drop_extent(items, name_len);
+    let (mw, mh) = (mw + crystal::sheet::BAND(), mh + crystal::sheet::BAND()); // MENUSCRAFT (B642): the published rect carries the shadow's band; `sheet::body` is what a press hits
     let (_bx, by, _bw, bh) = s.bar;
     let my = by + bh;
     if mw > pw || my + mh > ph {
@@ -1489,7 +1492,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
 
     if is_open() {
         if let Some(r) = open_rect(pw, ph) {
-            let (mx, my, mw, mh) = r;
+            let (mx, my, mw, mh) = crystal::sheet::body(r); // MENUSCRAFT: the shadow band is outside the menu
             if px >= mx && px < mx + mw && py >= my && py < my + mh {
                 // SO3 — the snapshot and the published rect DISAGREE: `is_open()` is true and a rect
                 // is on the panel, but this pass's layout says no box is down (the owner moved, the
@@ -1662,9 +1665,12 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
         // The open title's box is filled for the FULL height of the bar bar its keyline, so the
         // dropdown reads as hanging from a lit title rather than floating under a flat strip.
         if open && j + 1 < bh {
-            for i in x0..(x0 + bw_k).min(w) {
-                out[i] = theme::accent();
-            }
+            // MENUSCRAFT (B642): the lit title is a rounded accent pill inset from the bar's edges (was the box
+            // filled square for the bar's whole height).
+            let inset = crate::ui::px(3).min(bh / 4);
+            let mut sf = super::draw::Surf::new(&mut out[..w], w);
+            let pill = super::draw::Rect::new(x0 as i32, inset as i32 - j as i32, bw_k as i32, bh.saturating_sub(1 + 2 * inset) as i32);
+            super::draw::fill_rrect(&mut sf, pill, crate::ui::px(5) as i32, theme::accent());
         }
         if j < ty0 || j >= ty0 + CELL_H() {
             continue;
@@ -1771,7 +1777,8 @@ pub fn compose() -> bool {
     // SHARD menu's condition, asked the same way: one bounded table scan, only while open.
     let mut rows = super::dock::ModelBuf::take(); // WINDOWCAP-2: a warm, growable model buffer
     let (_, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
-    let sig = drop_sig(&s, r);
+    let hov = sheet_hover(&s, r, pw, ph); // MENUSCRAFT (B642): the hovered row lights its pill, so it is part of what was painted
+    let sig = strip::seal(strip::fnv1a_u64(drop_sig(&s, r), hov as u64));
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {
         return false;
     }
@@ -1788,7 +1795,12 @@ pub fn compose() -> bool {
     };
     let (name, name_len) = app_name();
     let t1 = crate::arch::now_cycles();
-    if !strip::paint("winmenu", r, |out, j| compose_row(out, r, items, j, &name[..name_len])) {
+    let under = crystal::sheet::Under::scan(&rows[..]); // MENUSCRAFT: the scene the shadow band blends over
+    if !strip::paint("winmenu", r, |out, j| {
+        crystal::sheet::row(out, r, j, &under, true);
+        compose_row(out, r, items, j, &name[..name_len]);
+        crystal::sheet::seal_row(out);
+    }) {
         return false;
     }
     LEDGER.paint(crate::arch::now_cycles().saturating_sub(t1), (r.2 * r.3) as u64);
@@ -1839,17 +1851,11 @@ fn repaint_vacated(r: strip::Rect) {
 /// face and the four keylines, then the item's label overlaid — with a check column in front of the
 /// label and a dim ink for a disabled row.
 fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, name: &[u8]) {
-    let (_mx, _my, w, h) = r;
-    let base = if j < BORDER || j + BORDER >= h { theme::frame_line() } else { theme::chrome_face() };
-    for i in 0..w {
-        out[i] = base;
-    }
-    for i in 0..w {
-        if i < BORDER || i + BORDER >= w {
-            out[i] = theme::frame_line();
-        }
-    }
-    if j < BORDER || j + BORDER >= h {
+    // MENUSCRAFT (B642) — the face and the keylines are the SHARD sheet's (`crystal::sheet::row`, painted first
+    // into this row); this overlays the content in BODY coordinates: the accent pill under the pointer, the check
+    // column, the label, the keycap hint, and the inset separator.
+    let (_mx, _my, w, h) = crystal::sheet::body(r);
+    if j < BORDER + PADY() || j + BORDER + PADY() >= h {
         return;
     }
     let Some(idx) = item_at_row(items, j, h) else {
@@ -1858,23 +1864,32 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     let it = items[idx];
     let top = item_top(items, idx);
     if it.flags & FLAG_SEPARATOR != 0 {
-        if j == top + SEP_H() / 2 {
-            for i in (BORDER + PADX())..(w - BORDER - PADX()) {
-                out[i] = theme::frame_line();
-            }
-        }
+        crystal::sheet::separator(out, w, j, top + SEP_H() / 2);
         return;
+    }
+    let disabled = it.flags & FLAG_DISABLED != 0;
+    let lit = !disabled && HOVER.load(Ordering::Relaxed) == idx + 1;
+    if lit {
+        crystal::sheet::pill(out, w, j, top, ITEM_H());
     }
     let vpad = (ITEM_H() - CELL_H()) / 2;
     let gtop = top + vpad;
+    // SHORTCUTS M3 — the row's chord, right-aligned inside the padding; MENUSCRAFT: as keycaps (`text.secondary`
+    // in `line.control` outlines; the white label on the pill).
+    if let Some(c) = item_chord(&it) {
+        let kink = if lit { crystal::sheet::on_accent() } else if disabled { crystal::sheet::text_disabled() } else { crystal::sheet::text_secondary() };
+        crystal::sheet::keycaps(out, w, j, gtop, CELL_H(), c, w.saturating_sub(BORDER + PADX()), kink, lit, BOLD, FACE);
+    }
     if j < gtop || j >= gtop + CELL_H() {
         return;
     }
     let sy = j - gtop;
-    let ink = if it.flags & FLAG_DISABLED != 0 {
-        theme::title_text_inactive()
+    let ink = if lit {
+        crystal::sheet::on_accent()
+    } else if disabled {
+        crystal::sheet::text_disabled()
     } else {
-        theme::title_text_active()
+        crystal::sheet::text_primary()
     };
     // SO2 — every glyph on this surface is now drawn at the BAR'S weight, the check mark included:
     // the drop-down is the bar's own text hanging below the bar, not a second typeface.
@@ -1892,11 +1907,6 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     if it.flags & FLAG_APPNAME != 0 && !name.is_empty() {
         let nx = lx + super::text::advance(it.label.as_bytes(), BOLD, FACE) + super::text::advance(b" ", BOLD, FACE); // KERNELFONT: the shaped width
         super::text::draw_row(out, w, name, nx, sy, ink, BOLD, FACE);
-    }
-    // SHORTCUTS M3 — the row's chord, right-aligned inside the padding.
-    if let Some(c) = item_chord(&it) {
-        let cx = w.saturating_sub(BORDER + PADX() + super::text::advance(c.as_bytes(), BOLD, FACE)); // KERNELFONT: right-aligned by the shaped width
-        super::text::draw_row(out, w, c.as_bytes(), cx, sy, theme::title_text_inactive(), BOLD, FACE);
     }
 }
 
@@ -3057,4 +3067,34 @@ fn about_box(win_name: &[u8]) {
     }
     #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
     let _ = (name, version, sig);
+}
+
+// ── MENUSCRAFT (rmbp-ledger B642) — the window menus' hover ───────────────────────────────────────────────────────
+
+/// The open dropdown's hovered item + 1 (`0` = none), latched by [`compose`] for [`compose_row`].
+static HOVER: AtomicUsize = AtomicUsize::new(0);
+
+/// The item under the pointer (+1) on the open dropdown published at `r`: a pickable row only (a separator or a
+/// disabled row lights nothing). Folded into the damage signature, so a hover change repaints the sheet.
+fn sheet_hover(s: &BarSnapshot, r: strip::Rect, pw: usize, ph: usize) -> usize {
+    let hot = match menu_of(s, s.open.saturating_sub(1), "hover") {
+        Menu::Found(items, _) => {
+            let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
+            let (bx, by, bw, bh) = crystal::sheet::body(r);
+            let inset = crystal::sheet::INSET();
+            if cx < 0 || cy < 0 {
+                0
+            } else {
+                let (px, py) = (cx as usize, cy as usize);
+                if px >= bx + inset && px + inset < bx + bw && py >= by && py < by + bh {
+                    item_at_row(items, py - by, bh).filter(|&i| items[i].flags & (FLAG_SEPARATOR | FLAG_DISABLED) == 0).map_or(0, |i| i + 1)
+                } else {
+                    0
+                }
+            }
+        }
+        _ => 0,
+    };
+    HOVER.store(hot, Ordering::Relaxed);
+    hot
 }

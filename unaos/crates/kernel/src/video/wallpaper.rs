@@ -105,6 +105,7 @@ pub fn back() -> Option<crate::video::wm::desktop::Back<'static>> {
 /// default probe's worker on x86). Witness: `:: WALLPAPER: src=procedural WxH=<w>x<h> scaled=<w>x<h> letterbox=0 ms=<n> -> PASS ::`.
 fn generate() -> bool {
     let t0 = crate::arch::ms();
+    let epoch = crate::video::theme::epoch(); // MENUSCRAFT (B642): the accent this picture is drawn in
     let Some(pi) = crate::video::panel_info_nonblocking() else { return false };
     let (pw, ph) = (pi.width, pi.height);
     if pw == 0 || ph == 0 {
@@ -122,6 +123,7 @@ fn generate() -> bool {
     }
     install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh }));
     PROCEDURAL.store(true, Ordering::Relaxed);
+    GEN_EPOCH.store(epoch, Ordering::Release); // MENUSCRAFT
     STALE.store(true, Ordering::Release);
     crate::video::wm::desktop_repaint();
     crate::census_println!(
@@ -185,6 +187,7 @@ pub fn paint(fb: &FrameBuffer) {
 /// `Screen::flush`'s hook: retry the default probe when due, and report (and clear) a pending
 /// repaint of the desktop layer.
 pub fn take_stale() -> bool {
+    regen_on_theme(); // MENUSCRAFT (B642): a theme or accent change redraws the generated default and its VEIL
     poll();
     crate::video::desktop_scene_owns_backdrop() && STALE.swap(false, Ordering::AcqRel)
 }
@@ -357,4 +360,55 @@ pub fn cmd(arg: &str, resolved: &str) -> String {
 /// runs each on `worker_cpu(0)`, re-armed by the desktop's build at ignition).
 pub fn probe_tries() -> u32 {
     TRIES.load(Ordering::Relaxed)
+}
+
+// ── MENUSCRAFT (rmbp-ledger B642) — the wallpaper and the VEIL follow the theme ────────────────────────────────────
+//
+// The generated default (`wm::desktop::wall_gen`) is drawn in the live accent, and the VEIL every translucent strip
+// samples is built from it — so an accent (or Light/Dark) change left the old accent's picture and its blur on the
+// glass. `theme::epoch` counts every change; the flush hook compares it with the epoch the installed picture was
+// generated at and regenerates (picture + VEIL, one `install`) on the worker core, the probe's own path. A picture
+// FILE is never regenerated: it does not depend on the theme, and its VEIL is the picture's (the tint is applied at
+// sample time). Rate-limited to one try per `RETRY_MS`, so a panel that is busy does not spawn a task per flush.
+// Witness: the regeneration's `:: WALLPAPER: src=procedural … -> PASS ::` line, after the theme's own.
+
+/// The theme epoch the installed generated picture was drawn at (`u32::MAX` = none generated yet).
+static GEN_EPOCH: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The last regeneration try (ms), the rate limit.
+static REGEN_MS: AtomicU64 = AtomicU64::new(0);
+/// A regeneration is in flight on its worker.
+static REGENERATING: AtomicBool = AtomicBool::new(false);
+
+fn regen_on_theme() {
+    if !PROCEDURAL.load(Ordering::Relaxed) || OFF.load(Ordering::Relaxed) {
+        return;
+    }
+    let had = GEN_EPOCH.load(Ordering::Acquire);
+    if had == u32::MAX || had == crate::video::theme::epoch() {
+        return;
+    }
+    let now = crate::arch::ms() as u64;
+    let last = REGEN_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < RETRY_MS {
+        return;
+    }
+    if REGENERATING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    REGEN_MS.store(now.max(1), Ordering::Relaxed);
+    serial_println!("[wallpaper] regen epoch={}->{} src=procedural", had, crate::video::theme::epoch());
+    #[cfg(target_arch = "x86_64")]
+    if let Some(cpu) = crate::arch::smp::worker_cpu(0) {
+        crate::arch::sched::spawn_stack("wall-regen", regen_task, cpu, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::RENDER_PATH_STACK_SIZE);
+        return;
+    }
+    let _ = generate();
+    REGENERATING.store(false, Ordering::Release);
+}
+
+/// The `wall-regen` task — one generation, then exit.
+#[cfg(target_arch = "x86_64")]
+fn regen_task(_cpu: usize) {
+    let _ = generate();
+    REGENERATING.store(false, Ordering::Release);
 }

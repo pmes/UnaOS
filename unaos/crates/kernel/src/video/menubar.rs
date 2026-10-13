@@ -1935,7 +1935,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     if let (Some(it), Some(bx0)) = (m.batt, batt_slot(w)) {
         draw_battery_glyph(out, w, h, j, bx0, it);
     }
-    bell_row(out, w, h, j); // NOTIFY (B418): the bell status item, left of the battery's slot
+    status_glyphs_row(out, w, h, j, &m.tray); // MENUSCRAFT (B642): the bell, network and volume glyphs from the kit, centred in their hit boxes (was NOTIFY's bitmap bell; the tray's speaker and network label)
 
     // The two texts share a baseline: vertically centred in the bar.
     let ty0 = (h - CELL_H()) / 2;
@@ -1995,7 +1995,6 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         let tx = bx0 + BATT_GLYPH_W() + BATT_GAP();
         super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::title_text_inactive(), false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
     }
-    bell_count(out, w, sy); // NOTIFY (B418): the bell's unread badge
 
     tray_paint(out, w, sy, &m.tray); // STATUSTRAY (B426): input, network and volume, left of the battery
 
@@ -3124,22 +3123,9 @@ pub fn volatile_rects(pw: usize, ph: usize) -> (Option<strip::Rect>, Option<stri
 // the unread count in accent ink (`9+` past nine). Lit (active ink) while the Center is open or anything is
 // unread. The press cell is [`bell_box_abs`], read by `notify::press_at` — the first furniture arm.
 
-const BELL_BITS: [u16; 12] = [
-    0b0000_0110_0000,
-    0b0000_1111_0000,
-    0b0001_1111_1000,
-    0b0011_1111_1100,
-    0b0011_1111_1100,
-    0b0011_1111_1100,
-    0b0011_1111_1100,
-    0b0111_1111_1110,
-    0b1111_1111_1111,
-    0b0000_0000_0000,
-    0b0000_0110_0000,
-    0b0000_0000_0000,
-];
-#[allow(non_snake_case)] #[inline] fn BELL_G() -> usize { crate::ui::px(12).min(BAR_H().saturating_sub(4)).max(6) }
-#[allow(non_snake_case)] #[inline] fn BELL_ITEM_W() -> usize { BELL_G() + BATT_GAP() + 2 * CELL_W() }
+// MENUSCRAFT (B642): the bell is the kit's glyph now ([`status_glyphs_row`]); its cell is one icon hit box, from the
+// status-item table ([`STATUS`]) like every other item's.
+#[allow(non_snake_case)] #[inline] fn BELL_ITEM_W() -> usize { ICON_HIT() }
 
 /// The bell item's left inset inside a bar `w` px wide, or `None` when the bar cannot seat it.
 fn bell_slot(w: usize) -> Option<usize> {
@@ -3153,37 +3139,6 @@ pub fn bell_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     Some((rx + x0, ry, BELL_ITEM_W(), h))
 }
 
-fn bell_row(out: &mut [u32], w: usize, h: usize, j: usize) {
-    let Some(x0) = bell_slot(w) else { return };
-    let g = BELL_G();
-    let y0 = (h - g.min(h)) / 2;
-    if j < y0 || j >= y0 + g {
-        return;
-    }
-    let lit = super::notify::center_open() || super::notify::unread() > 0;
-    let ink = if lit { theme::title_text_active() } else { theme::title_text_inactive() };
-    let bits = BELL_BITS[((j - y0) * 12 / g).min(11)];
-    for u in 0..g {
-        let b = (u * 12 / g).min(11);
-        if bits & (1 << (11 - b)) != 0 {
-            if let Some(d) = out.get_mut(x0 + u).filter(|_| x0 + u < w) {
-                *d = ink;
-            }
-        }
-    }
-}
-
-fn bell_count(out: &mut [u32], w: usize, sy: usize) {
-    let n = super::notify::unread();
-    let Some(x0) = bell_slot(w) else { return };
-    if n == 0 {
-        return;
-    }
-    let mut d = [b' '; 2];
-    let k = if n > 9 { d = *b"9+"; 2 } else { d[0] = b'0' + n as u8; 1 };
-    super::text::draw_row(out, w, &d[..k], x0 + BELL_G() + BATT_GAP(), sy, theme::accent(), true, FACE);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 // STATUSTRAY (rmbp-ledger B426, MACPARITY row 3) — the tray's items LEFT of the battery: volume, network, input
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -3194,9 +3149,7 @@ fn bell_count(out: &mut [u32], w: usize, sy: usize) {
 // (`status::item_known`) is not drawn and has no press cell; a slot the panel cannot seat (left of the first
 // title glyph) declines like the battery's. Every colour is the status area's token ink.
 
-#[allow(non_snake_case)] #[inline] fn TRAY_VOL_W() -> usize { 2 * CELL_W() }
-#[allow(non_snake_case)] #[inline] fn TRAY_NET_W() -> usize { 4 * CELL_W() }
-#[allow(non_snake_case)] #[inline] fn TRAY_IN_W() -> usize { 2 * CELL_W() }
+#[allow(non_snake_case)] #[inline] fn TRAY_IN_W() -> usize { 2 * CELL_W() } // MENUSCRAFT: volume and network are icon hit boxes now (`ICON_HIT`)
 
 /// Item `i`'s slot `(x0, width)` inside a bar `w` wide, or `None` when the panel cannot seat it.
 fn tray_slot(i: u8, w: usize) -> Option<(usize, usize)> {
@@ -3235,66 +3188,16 @@ fn tray_sig(t: &Option<super::status::Tray>) -> u64 {
     1 | (v << 1) | (n << 9) | ((t.pc as u64) << 15)
 }
 
-/// One glyph-band scanline (`sy` in `0..CELL_H`) of the tray: the volume glyph, the network label (struck
-/// through while the link is down), the input label.
+/// One glyph-band scanline (`sy` in `0..CELL_H`) of the tray's TEXT item: the input label. MENUSCRAFT (B642): the
+/// volume and network items are the kit's glyphs, centred in the full bar height by [`status_glyphs_row`].
 fn tray_paint(out: &mut [u32], w: usize, sy: usize, t: &Option<super::status::Tray>) {
-    use super::status::{ITEM_INPUT, ITEM_NET, ITEM_VOLUME, NET_USB};
+    use super::status::ITEM_INPUT;
     let Some(t) = t else { return };
     let ink = theme::title_text_inactive();
-    if let (Some((lv, muted)), Some((x0, _))) = (t.volume, tray_slot(ITEM_VOLUME, w)) {
-        tray_speaker(out, w, sy, x0, lv, muted, ink);
-    }
-    if let (Some(n), Some((x0, sw))) = (t.net, tray_slot(ITEM_NET, w)) {
-        let label: &[u8] = if n.medium == NET_USB { b"ETH" } else { b"WiFi" };
-        let tw = super::text::advance(label, false, FACE);
-        let tx = (x0 + sw).saturating_sub(tw);
-        super::text::draw_row(out, w, label, tx, sy, ink, false, FACE);
-        if !n.up && sy == CELL_H() / 2 {
-            for i in tx..(tx + tw).min(w) {
-                out[i] = ink;
-            }
-        }
-    }
     if let Some((x0, sw)) = tray_slot(ITEM_INPUT, w) {
         let label: &[u8] = if t.pc { b"PC" } else { b"US" };
         let tw = super::text::advance(label, false, FACE);
         super::text::draw_row(out, w, label, (x0 + sw).saturating_sub(tw), sy, ink, false, FACE);
-    }
-}
-
-/// The speaker: a box, a cone, and up to three level bars (none when muted, a cross instead).
-fn tray_speaker(out: &mut [u32], w: usize, sy: usize, x0: usize, lv: u8, muted: bool, ink: u32) {
-    let hh = CELL_H();
-    let u = (CELL_W() / 4).max(1);
-    let mid = hh / 2;
-    let d = if sy >= mid { sy - mid } else { mid - sy };
-    let mut put = |a: usize, b: usize| {
-        for i in a..b.min(w) {
-            out[i] = ink;
-        }
-    };
-    if d < hh / 6 {
-        put(x0, x0 + u);
-    }
-    for k in 0..u {
-        if d < hh / 6 + (hh / 6) * k / u {
-            put(x0 + u + k, x0 + u + k + 1);
-        }
-    }
-    if muted {
-        let xc = x0 + 5 * u;
-        if d <= u + u / 2 {
-            put(xc - d, xc - d + crate::ui::px(1).max(1));
-            put(xc + d, xc + d + crate::ui::px(1).max(1));
-        }
-        return;
-    }
-    let bars = (lv as usize * 3 + 15) / 16;
-    for k in 1..=bars.min(3) {
-        if d < hh / 6 + k * hh / 9 {
-            let xk = x0 + 2 * u + (2 * k - 1) * u;
-            put(xk, xk + (u / 2).max(1));
-        }
     }
 }
 
@@ -3366,23 +3269,57 @@ fn strip_items_witness(m: &Model, rect: Option<strip::Rect>) {
 // own width ([`flow_w`]) and sits one [`strip::PAD`] left of its right neighbour. The slots are reserved (a
 // function of the bar width alone), so no item moves when another's fact comes or goes.
 
-/// The status items, RIGHT to left: clock, the Notification Center's bell, battery, network, volume, input.
-const FLOW: [u8; 6] = {
+/// MENUSCRAFT (B642) — what a status item's slot paints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Glyph {
+    /// The clock's text.
+    Clock,
+    /// The Notification Center's bell (R116's press cell: [`bell_box_abs`]).
+    Bell,
+    /// The battery cell and its percent (MENUSTAT).
+    Battery,
+    /// The network: Wi-Fi arcs, or the wired glyph on the USB dongle.
+    Net,
+    /// The speaker and its level waves.
+    Speaker,
+    /// A short text label (the input table).
+    Label,
+}
+
+/// **THE status-item table** — one row per item, RIGHT to left in the Mac's order: the item and its glyph. The
+/// glyph decides the item's width ([`flow_w`]), so the press router's slots ([`flow_slot`] -> `tray_box_abs`,
+/// `bell_box_abs`, `batt_box_abs`) and the painter ([`status_glyphs_row`]) are read off ONE table and cannot drift.
+const STATUS: [(u8, Glyph); 6] = {
     use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_INPUT, ITEM_NET, ITEM_NOTIFY, ITEM_VOLUME};
-    [ITEM_CLOCK, ITEM_NOTIFY, ITEM_BATTERY, ITEM_NET, ITEM_VOLUME, ITEM_INPUT]
+    [(ITEM_CLOCK, Glyph::Clock), (ITEM_NOTIFY, Glyph::Bell), (ITEM_BATTERY, Glyph::Battery), (ITEM_NET, Glyph::Net), (ITEM_VOLUME, Glyph::Speaker), (ITEM_INPUT, Glyph::Label)]
 };
 
-/// Item `i`'s own width in bar pixels (0 for an item not in [`FLOW`]).
+/// The status items, RIGHT to left: [`STATUS`]'s ids.
+const FLOW: [u8; 6] = {
+    let mut f = [0u8; 6];
+    let mut k = 0;
+    while k < 6 {
+        f[k] = STATUS[k].0;
+        k += 1;
+    }
+    f
+};
+
+/// An icon item's hit box: 28 wide, the bar's full height (DESIGN-LANGUAGE §3.2: "16 icons in 28 hit boxes").
+#[allow(non_snake_case)] #[inline] fn ICON_HIT() -> usize { crate::ui::px(28) }
+/// The icon's live square inside its hit box (16, held inside the bar).
+#[allow(non_snake_case)] #[inline] fn ICON() -> usize { crate::ui::px(16).min(BAR_H().saturating_sub(4)).max(8) }
+/// The gap between two status items (§3.2: "4 apart"; was one PAD).
+#[allow(non_snake_case)] #[inline] fn ITEM_GAP() -> usize { crate::ui::px(4) }
+
+/// Item `i`'s own width in bar pixels (0 for an item not in [`STATUS`]).
 fn flow_w(i: u8) -> usize {
-    use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_INPUT, ITEM_NET, ITEM_NOTIFY, ITEM_VOLUME};
-    match i {
-        ITEM_CLOCK => CLOCK_GLYPHS * CELL_W(),
-        ITEM_NOTIFY => BELL_ITEM_W(),
-        ITEM_BATTERY => BATT_ITEM_W(),
-        ITEM_NET => TRAY_NET_W(),
-        ITEM_VOLUME => TRAY_VOL_W(),
-        ITEM_INPUT => TRAY_IN_W(),
-        _ => 0,
+    match STATUS.iter().find(|r| r.0 == i).map(|r| r.1) {
+        Some(Glyph::Clock) => CLOCK_GLYPHS * CELL_W(),
+        Some(Glyph::Bell) | Some(Glyph::Net) | Some(Glyph::Speaker) => ICON_HIT(),
+        Some(Glyph::Battery) => BATT_ITEM_W(),
+        Some(Glyph::Label) => TRAY_IN_W(),
+        None => 0,
     }
 }
 
@@ -3397,7 +3334,7 @@ fn flow_slot(i: u8, w: usize) -> Option<(usize, usize)> {
         let x0 = if k == super::status::ITEM_CLOCK {
             right
         } else {
-            let x0 = right.checked_sub(strip::PAD() + iw)?;
+            let x0 = right.checked_sub(ITEM_GAP() + iw)?; // MENUSCRAFT: even spacing, 4 apart
             if x0 < TITLE_X0() + CELL_W() {
                 return None;
             }
@@ -3472,5 +3409,330 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("menubar", slots_selftest);
+        crate::tests::register("menuscraft", menuscraft_selftest); // MENUSCRAFT (B642): the sheet and the status glyphs
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// MENUSCRAFT (rmbp-ledger B642) — THE STATUS-ITEM GLYPHS, FROM THE KIT
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// The bell, the network and the speaker are drawn with GLASSKIT (`video::draw`) on DESIGN-LANGUAGE §2.8's 16-pt grid:
+// outline strokes 1.5 pt wide, the FILLED variant for the active state (the bell while the Center is open). Each is
+// centred in its [`ICON_HIT`] cell, the full bar height, at the x [`flow_slot`] gives — the same slot the press
+// router hit-tests, read off [`STATUS`]. Inks are the status area's own: `title_text_inactive` (glanced at), the
+// bell `title_text_active` while lit, the unread badge an `accent` dot. Pixels are ours (§7.3): arcs, discs and
+// strokes from code, no icon from another system.
+
+/// The stroke width of a 16-pt icon (1.5 pt), device px.
+#[inline]
+fn icon_stroke() -> i32 {
+    ((crate::ui::px(3) / 2).max(1)) as i32
+}
+
+/// Row `j` of the three icon items into the bar row `out[..w]` (`h` = the bar's height).
+fn status_glyphs_row(out: &mut [u32], w: usize, h: usize, j: usize, tray: &Option<super::status::Tray>) {
+    let g = ICON();
+    let by = (h.saturating_sub(g) / 2) as i32;
+    if (j as i32) < by - 2 || j as i32 >= by + g as i32 + 2 {
+        return;
+    }
+    let ink = theme::title_text_inactive();
+    for &(i, glyph) in STATUS.iter() {
+        let slot = match glyph {
+            Glyph::Bell => bell_slot(w).map(|x| (x, BELL_ITEM_W())),
+            Glyph::Net | Glyph::Speaker => match tray {
+                Some(t) if super::status::item_known(t, i) => tray_slot(i, w),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((x0, sw)) = slot else { continue };
+        let bx = (x0 + sw.saturating_sub(g) / 2) as i32;
+        let o = Ico { bx, by: by - j as i32, g: g as i32 };
+        match glyph {
+            Glyph::Bell => {
+                let open = super::notify::center_open();
+                let unread = super::notify::unread() > 0;
+                let lit = open || unread;
+                o.bell(out, w, if lit { theme::title_text_active() } else { ink }, open, unread);
+            }
+            Glyph::Net => {
+                if let Some(n) = tray.as_ref().and_then(|t| t.net) {
+                    if n.medium == super::status::NET_USB {
+                        o.wired(out, w, ink, n.up);
+                    } else {
+                        o.wifi(out, w, j, ink, n.up);
+                    }
+                }
+            }
+            Glyph::Speaker => {
+                if let Some((lv, muted)) = tray.as_ref().and_then(|t| t.volume) {
+                    o.speaker(out, w, j, ink, lv, muted);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One icon's box on the current bar row: `bx` its left x, `by` its top relative to the row (negative above it),
+/// `g` its side. Coordinates inside are sixteenths of `g` (the 16-pt grid).
+struct Ico {
+    bx: i32,
+    by: i32,
+    g: i32,
+}
+
+impl Ico {
+    /// Grid units -> device px (relative to the box).
+    #[inline]
+    fn u(&self, n: i32) -> i32 {
+        n * self.g / 16
+    }
+    /// Grid units -> line_aa sub-pixel units, absolute x / row-relative y.
+    #[inline]
+    fn sx(&self, n: i32) -> i32 {
+        self.bx * super::draw::SUB + n * self.g * super::draw::SUB / 16
+    }
+    #[inline]
+    fn sy(&self, n: i32) -> i32 {
+        self.by * super::draw::SUB + n * self.g * super::draw::SUB / 16
+    }
+    fn rect(&self, x: i32, y: i32, w: i32, h: i32) -> super::draw::Rect {
+        super::draw::Rect::new(self.bx + self.u(x), self.by + self.u(y), self.u(w).max(1), self.u(h).max(1))
+    }
+
+    /// The bell: a domed body, a lip, a clapper; filled while the Center is open; an accent dot while unread.
+    fn bell(&self, out: &mut [u32], w: usize, ink: u32, filled: bool, unread: bool) {
+        use super::draw::{self, Radii, Surf};
+        let mut s = Surf::new(&mut out[..w], w);
+        let sw = icon_stroke();
+        let body = self.rect(3, 2, 10, 11);
+        let top = self.u(5);
+        let rad = Radii::new(top, top, self.u(1).max(1), self.u(1).max(1));
+        if filled {
+            draw::fill_rrect(&mut s, body, rad, ink);
+        } else {
+            draw::stroke_rrect(&mut s, body, rad, sw, ink);
+        }
+        let lip = super::draw::Rect::new(self.bx + self.u(1), self.by + self.u(13) - sw, self.u(14), sw.max(1));
+        draw::fill_rrect(&mut s, lip, (sw / 2).max(0), ink);
+        draw::fill_circle(&mut s, self.bx + self.u(8), self.by + self.u(14) + sw / 2, (self.g * 3 / 32).max(1), ink);
+        if unread {
+            draw::fill_circle(&mut s, self.bx + self.u(13), self.by + self.u(3), self.u(3).max(2), theme::accent());
+        }
+    }
+
+    /// Wi-Fi: a dot and three arcs fanned ±45° above it; a link that is down draws them faint.
+    fn wifi(&self, out: &mut [u32], w: usize, j: usize, ink: u32, up: bool) {
+        use super::draw::{self, Ink, Surf};
+        let a = if up { 255 } else { 90 };
+        let (cx, cy) = (self.sx(8), self.sy(14));
+        let sw = icon_stroke() * draw::SUB;
+        for r in [5, 9, 13] {
+            ring_wedge(out, w, j, cx, cy, r * self.g * draw::SUB / 16, sw, false, Ink::new(ink, a));
+        }
+        let mut s = Surf::new(&mut out[..w], w);
+        draw::fill_circle(&mut s, self.bx + self.u(8), self.by + self.u(14), self.u(1).max(1) + icon_stroke() / 2, Ink::new(ink, a));
+    }
+
+    /// Wired (the USB Ethernet dongle): three nodes joined by a bus; a link that is down draws them faint.
+    fn wired(&self, out: &mut [u32], w: usize, ink: u32, up: bool) {
+        use super::draw::{self, Ink, Surf};
+        let ink = Ink::new(ink, if up { 255 } else { 90 });
+        let mut s = Surf::new(&mut out[..w], w);
+        let sw = icon_stroke();
+        let r = self.u(1).max(1);
+        for (x, y) in [(5, 1), (0, 10), (10, 10)] {
+            draw::stroke_rrect(&mut s, self.rect(x, y, 6, 5), r, sw, ink);
+        }
+        let lw = sw * draw::SUB;
+        draw::line_aa(&mut s, self.sx(8), self.sy(6), self.sx(8), self.sy(8), lw, ink);
+        draw::line_aa(&mut s, self.sx(3), self.sy(8), self.sx(13), self.sy(8), lw, ink);
+        draw::line_aa(&mut s, self.sx(3), self.sy(8), self.sx(3), self.sy(10), lw, ink);
+        draw::line_aa(&mut s, self.sx(13), self.sy(8), self.sx(13), self.sy(10), lw, ink);
+    }
+
+    /// The speaker: a box, a flared cone, and up to three waves for the level (none when silent); muted: an x.
+    fn speaker(&self, out: &mut [u32], w: usize, j: usize, ink: u32, lv: u8, muted: bool) {
+        use super::draw::{self, Ink, Surf};
+        {
+            let mut s = Surf::new(&mut out[..w], w);
+            draw::fill_rrect(&mut s, self.rect(1, 6, 3, 4), self.u(1).max(1) / 2, ink);
+        }
+        // The cone: from the box's face (half height 2/16) flaring to 6/16 at x = 7/16, coverage-blended per pixel.
+        let (x0, x1) = (self.bx + self.u(4), self.bx + self.u(7));
+        let cy = (self.by * 16 + 8 * self.g) as i64; // the icon's centre line, 1/16 px, row-relative
+        let py = 8i64; // this row's centre, 1/16 px, row-relative
+        for x in x0.max(0)..x1.min(w as i32) {
+            let t = (((x - x0) * 16 + 8) as i64 * 256) / ((x1 - x0).max(1) as i64 * 16);
+            let hh = (2 * self.g as i64 + (4 * self.g as i64 * t >> 8)) as i64; // half height, 1/16 px
+            let d = (py - cy).abs();
+            let c = (hh + 8 - d).clamp(0, 16) as u32;
+            if c > 0 {
+                let p = &mut out[x as usize];
+                *p = draw::blend(*p, ink & 0x00FF_FFFF, c * 255 / 16);
+            }
+        }
+        let sw = icon_stroke() * draw::SUB;
+        if muted {
+            let mut s = Surf::new(&mut out[..w], w);
+            draw::line_aa(&mut s, self.sx(10), self.sy(6), self.sx(14), self.sy(10), sw, ink);
+            draw::line_aa(&mut s, self.sx(10), self.sy(10), self.sx(14), self.sy(6), sw, ink);
+            return;
+        }
+        let waves = ((lv as usize * 3 + 15) / 16).min(3);
+        for r in [3, 5, 8].into_iter().take(waves) {
+            ring_wedge(out, w, j, self.sx(7), self.sy(8), r * self.g * draw::SUB / 16, sw, true, Ink::solid(ink));
+        }
+    }
+}
+
+/// An anti-aliased arc of the circle centred `(cx, cy)` (x absolute, y relative to this row — both in
+/// [`super::draw::SUB`] units), radius `r`, stroke `sw` (SUB units), limited to the 90° wedge facing up (`right` =
+/// false) or right (`true`), on the current row of `out[..w]`. The wedge's edges are anti-aliased too.
+#[allow(clippy::too_many_arguments)]
+fn ring_wedge(out: &mut [u32], w: usize, _j: usize, cx: i32, cy: i32, r: i32, sw: i32, right: bool, ink: super::draw::Ink) {
+    let sub = super::draw::SUB as i64;
+    let (cx, cy, r, hw) = (cx as i64, cy as i64, r as i64, (sw as i64) / 2);
+    let py = sub / 2; // this row's pixel centre, row-relative
+    let dy = py - cy;
+    let reach = r + hw + sub;
+    if dy.abs() > reach {
+        return;
+    }
+    let xa = ((cx - reach) / sub).max(0);
+    let xb = ((cx + reach) / sub + 1).min(w as i64);
+    for x in xa..xb {
+        let dx = x * sub + sub / 2 - cx;
+        // The wedge: |dx| <= -dy (up) or |dy| <= dx (right); `e` is that margin, ~sqrt(2) x the edge distance.
+        let e = if right { dx - dy.abs() } else { -dy - dx.abs() };
+        let cw = (e * 11 / 16 + sub / 2).clamp(0, sub);
+        if cw == 0 {
+            continue;
+        }
+        let d = super::draw::isqrt((dx * dx + dy * dy) as u64) as i64;
+        let cr = (hw + sub / 2 - (d - r).abs()).clamp(0, sub);
+        if cr == 0 {
+            continue;
+        }
+        let a = (cr * cw * ink.a as i64 / (sub * sub)) as u32;
+        let p = &mut out[x as usize];
+        *p = super::draw::blend(*p, ink.rgb, a);
+    }
+}
+
+// ── MENUSCRAFT — `tests menuscraft` (R80: a verb, never at boot) ──────────────────────────────────────────────────
+
+/// Luma of an `0x00RRGGBB`, 0..=255 (the shadow legs compare darkness, not hue).
+fn luma(c: u32) -> u32 {
+    (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8
+}
+
+/// **`tests menuscraft`** — the sheet every dropdown paints, and the status items' glyph/slot table, measured off
+/// the SAME painters and accessors the live paths use, on synthetic inputs (no panel, no open menu, no press):
+///
+/// * `sheet` — a sheet rect `MIN_W + BAND` x `120 + BAND` over the flat scene: the body's bottom-left corner pixel
+///   is NOT the face (rounded, `corners`), the body's centre IS `surface.overlay` (`face`), the foot row is the
+///   hairline (`hairline`), the band just below the body is darker than the scene and darker than the band's far
+///   row (`shadow` — the falloff), a pill row is `accent.fill` inside the inset and not outside it (`pill`), and no
+///   pixel of any painted row is pure white (`white=0`, MENU-UNDER).
+/// * `glyphs` — the bell, network and volume glyphs painted for a fake tray at the live bar width and at the floor
+///   width + 6 x 64: every icon item with a slot draws (`drawn=3/3` at the live width), every changed pixel lies in
+///   an icon slot (`inside`), and adjacent seated items are exactly `ITEM_GAP` apart (`gap`).
+pub fn menuscraft_selftest() {
+    use super::crystal::sheet;
+    // ── leg 1: the sheet ──
+    let band = sheet::BAND();
+    let (w, h) = (sheet::MIN_W() + band, crate::ui::px(120) + band);
+    let r: strip::Rect = (0, 0, w, h);
+    let (_, _, bw, bh) = sheet::body(r);
+    let under = sheet::Under::none();
+    let mut row = alloc::vec![0u32; w];
+    let paint = |j: usize, row: &mut alloc::vec::Vec<u32>| {
+        row.fill(0);
+        sheet::row(row, r, j, &under, true);
+        sheet::seal_row(row);
+    };
+    let face = sheet::surface_overlay();
+    let mut white = 0usize;
+    paint(bh - 1, &mut row);
+    let corners = row[0] != face;
+    let hairline = row[bw / 2] != face;
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    paint(bh / 2, &mut row);
+    let face_ok = row[bw / 2] == face;
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    paint(bh + 1, &mut row);
+    let near = luma(row[bw / 2]);
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    paint(h - 1, &mut row);
+    let far = luma(row[bw / 2]);
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    let scene = luma(theme::DESKTOP_BG);
+    let shadow = near < scene && near < far;
+    let (top, ih) = (crate::ui::px(10), crate::ui::px(20));
+    paint(top + ih / 2, &mut row);
+    sheet::pill(&mut row, bw, top + ih / 2, top, ih);
+    sheet::seal_row(&mut row);
+    let pill = row[bw / 2] == sheet::accent_fill() && row[sheet::INSET() / 2] != sheet::accent_fill();
+    white += row.iter().filter(|&&c| c & 0x00FF_FFFF == 0x00FF_FFFF).count();
+    let sheet_ok = corners && face_ok && hairline && shadow && pill && white == 0;
+
+    // ── leg 2: the glyphs against their slots ──
+    use super::status::{ITEM_NET, ITEM_VOLUME};
+    let tray = Some(super::status::Tray { volume: Some((16, false)), net: Some(super::status::Net { medium: super::status::NET_WIFI, up: true, ip: None }), pc: false, clock: false });
+    let live = {
+        let fb = *super::WRITER.lock();
+        strip_rect(fb.width(), fb.height()).map(|(_, _, w, _)| w).unwrap_or(fb.width())
+    };
+    let bar_h = BAR_H();
+    const SENTINEL: u32 = 0x0001_0203;
+    let (mut drawn_live, mut seated_live, mut inside, mut gap_ok) = (0usize, 0usize, true, true);
+    for (pass, bw) in [live, FLOOR_W() + 6 * 64].into_iter().enumerate() {
+        if bw == 0 {
+            continue;
+        }
+        let slots: [Option<(usize, usize)>; 3] = [bell_slot(bw).map(|x| (x, BELL_ITEM_W())), tray_slot(ITEM_NET, bw), tray_slot(ITEM_VOLUME, bw)];
+        let mut hit = [false; 3];
+        let mut out = alloc::vec![SENTINEL; bw];
+        for j in 0..bar_h {
+            out.fill(SENTINEL);
+            status_glyphs_row(&mut out, bw, bar_h, j, &tray);
+            for (x, &c) in out.iter().enumerate() {
+                if c == SENTINEL {
+                    continue;
+                }
+                match slots.iter().position(|s| matches!(s, Some((x0, sw)) if x >= *x0 && x < x0 + sw)) {
+                    Some(k) => hit[k] = true,
+                    None => inside = false,
+                }
+            }
+        }
+        if pass == 0 {
+            seated_live = slots.iter().filter(|s| s.is_some()).count();
+            drawn_live = hit.iter().zip(slots.iter()).filter(|(h, s)| **h && s.is_some()).count();
+        }
+        // Adjacent seated items in the flow are ITEM_GAP apart (right-to-left: the right one's x0 = left's end + gap).
+        let mut prev: Option<usize> = None;
+        for &i in FLOW.iter() {
+            let Some((x0, iw)) = flow_slot(i, bw) else { break };
+            if let Some(px0) = prev {
+                if x0 + iw + ITEM_GAP() != px0 {
+                    gap_ok = false;
+                }
+            }
+            prev = Some(x0);
+        }
+    }
+    let glyphs_ok = seated_live > 0 && drawn_live == seated_live && inside && gap_ok;
+    let ok = sheet_ok && glyphs_ok;
+    serial_println!(
+        ":: MENUSCRAFT: sheet={}x{} band={} corners={} face={} hairline={} shadow={}({}<{},{}) pill={} white={} glyphs={}/{} inside={} gap={}({}) -> {} ::",
+        w, h, band, if corners { "ok" } else { "BAD" }, if face_ok { "ok" } else { "BAD" }, if hairline { "ok" } else { "BAD" },
+        if shadow { "ok" } else { "BAD" }, near, scene, far, if pill { "ok" } else { "BAD" }, white,
+        drawn_live, seated_live, if inside { "ok" } else { "BAD" }, if gap_ok { "ok" } else { "BAD" }, ITEM_GAP(),
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
