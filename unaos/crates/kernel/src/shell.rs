@@ -6608,7 +6608,7 @@ fn cyc_to_us(dt: u64) -> u64 {
 fn run_program(console: &mut Console, path: &str, rest: &[&str]) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
-    }; let mut argv = alloc::vec![path]; argv.extend_from_slice(rest); run_image(console, path, bytes, &argv) } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] fn run_image(console: &mut Console, path: &str, bytes: alloc::vec::Vec<u8>, argv: &[&str]) { // EXECNAME (B322) — ⚠ SAME-LINE fold, line-NEUTRAL: `run` is split at its read so the bare-name launch (bare_exec, a foreground program) runs the bytes it already read through this SAME body; `run <path>` is unchanged.
+    }; let canon = vfs_path(path); if !crate::fs::apptrust::launch_gate(&vfs_mount_table(), &canon) { serial_println!("[run] refused=apptrust path={}", canon); console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("[run] refused=apptrust path={}", canon)); return; } let mut argv = alloc::vec![path]; argv.extend_from_slice(rest); run_image(console, path, bytes, &argv) } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] fn run_image(console: &mut Console, path: &str, bytes: alloc::vec::Vec<u8>, argv: &[&str]) { // EXECNAME (B322) — ⚠ SAME-LINE fold, line-NEUTRAL: `run` is split at its read so the bare-name launch (bare_exec, a foreground program) runs the bytes it already read through this SAME body; `run <path>` is unchanged.
     // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
