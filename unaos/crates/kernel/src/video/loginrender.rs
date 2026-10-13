@@ -36,7 +36,7 @@ pub const WINDOW_MS: u64 = 30_000;
 pub const BOUND_MS: u64 = 100;
 
 /// Stamp names ([`stamp`] ids index this). A new non-render job on the render task adds its name here.
-pub const WHAT_NAMES: [&str; 11] = ["-", "wallpaper-probe", "dock-console", "quarry", "quarry.open", "quarry.viewers", "quarry.settings", "quarry.font", "quarry.activity", "quarry.panes", "prefs-watch"];
+pub const WHAT_NAMES: [&str; 22] = ["-", "wallpaper-probe", "dock-console", "quarry", "quarry.open", "quarry.viewers", "quarry.settings", "quarry.font", "quarry.activity", "quarry.panes", "prefs-watch", "settings.launcher", "settings.assoc", "settings.nameindex", "settings.prefs", "settings.loginitems", "settings.files", "settings.appearance", "settings.load", "settings.persist", "settings.mode", "settings.session"]; // KVMLAT2 (B579): ids 11.. are the parts of `settings::service` (W_S_*, file tail)
 /// WALLPAPER's default probe (`~/Desktop/WALL.PNG`, `/WALL.PNG`): two volume stats and, when found, a decode.
 pub const W_WALLPAPER: u8 = 1;
 /// The dock's console launch drain (`dock::console_launch_service`).
@@ -112,20 +112,20 @@ fn render_here() -> bool {
 /// [`INNER`], and the enclosing stamp, when it drops, is RECORDED UNDER ITS LONGEST CHILD'S NAME if that child
 /// took at least half of it — so the stall line and the witness say `quarry.settings:225`, not `quarry:225`,
 /// and a stamp whose time was spread across its parts keeps its own name.
-pub struct Stamp(u64, u64);
+pub struct Stamp(u64, u64, u64); // KVMLAT2 (B579): `.2` = the parent's children before this one began, put back (max'd with this one) at drop
 
 /// A non-render job begins on the render task: its name goes in [`CUR`] until the returned [`Stamp`] drops.
 #[inline]
 pub fn stamp(id: u8) -> Stamp {
     if !ON || !render_here() {
-        return Stamp(0, 0);
+        return Stamp(0, 0, 0);
     }
     let w = (crate::arch::ms().max(1) << 8) | id as u64;
     let outer = CUR.swap(w, AcqRel);
-    if outer == 0 {
-        INNER.store(0, Release); // a fresh outermost stamp: no child of an earlier one is charged to it
-    }
-    Stamp(w, outer)
+    let saved = INNER.swap(0, AcqRel); // KVMLAT2 (B579): every level starts with no children charged to it
+    let saved = if outer == 0 { 0 } else { saved }; // a fresh outermost stamp: no child of an earlier one is charged to it
+    // a nested stamp keeps its parent's children so far (`.2`) and puts them back, max'd with itself, when it drops
+    Stamp(w, outer, saved)
 }
 
 impl Drop for Stamp {
@@ -136,13 +136,13 @@ impl Drop for Stamp {
         let _ = CUR.compare_exchange(self.0, self.1, AcqRel, Relaxed); // SMALLFIX10: the enclosing stamp is in flight again
         let (start, mut id) = (self.0 >> 8, self.0 & 0xff);
         let dur = crate::arch::ms().saturating_sub(start).min(0xff_ffff);
-        if self.1 != 0 {
-            INNER.fetch_max((dur << 8) | id, Relaxed); // SMALLFIX10: a child — charged to its parent's record, not the ring
-            return;
-        }
-        let inner = INNER.swap(0, AcqRel);
+        let inner = INNER.swap(0, AcqRel); // KVMLAT2 (B579): THIS stamp's own children only (stamp() set the parent's aside)
         if inner != 0 && (inner >> 8) * 2 >= dur {
-            id = inner & 0xff; // SMALLFIX10: the child that took at least half names the record
+            id = inner & 0xff; // SMALLFIX10: the child that took at least half names the record — KVMLAT2: at every depth
+        }
+        if self.1 != 0 {
+            INNER.store(self.2.max((dur << 8) | id), Release); // SMALLFIX10: a child — charged to its parent's record, not the ring
+            return;
         }
         let i = (RING_HEAD.fetch_add(1, Relaxed) as usize) % RING.len();
         RING[i].store(((start & 0xffff_ffff) << 32) | (dur << 8) | id, Release);
@@ -308,3 +308,33 @@ pub fn selftest() {
         TURNS.load(Relaxed), ZP_TURNS.load(Relaxed)
     );
 }
+
+// KVMLAT2 (rmbp-ledger B579): THE PARTS OF `settings::service`. Image 26's KVM boot: `:: LOGINRENDER: …
+// zero_pass_max_ms=271 worst_what=quarry.settings:271` and `[lag] stall … stage=render-handler stage_ms=271 …
+// handler_what=quarry.settings:271` (serial.log 838) — the whole of `settings::service` on the render task, its part
+// unnamed. Each part is now a stamp nested inside `quarry.settings` (video/settings.rs `service`), and the nesting
+// rule applies at every depth (`Stamp::drop`: a child that took at least half its parent names the record), so the
+// next run says `worst_what=settings.<part>:<ms>`. Appended at the tail so no line above moves.
+/// `launcher::service` + `appswitch::service`.
+pub const W_S_LAUNCHER: u8 = 11;
+/// `fs::assoc::view_service` (the filetype registry's view).
+pub const W_S_ASSOC: u8 = 12;
+/// `fs::nameindex::service` (the login's chunked name-index build).
+pub const W_S_NAMEINDEX: u8 = 13;
+/// `prefs::service`.
+pub const W_S_PREFS: u8 = 14;
+/// `loginitems::service`.
+pub const W_S_LOGINITEMS: u8 = 15;
+/// `settingsfiles::service`.
+pub const W_S_FILES: u8 = 16;
+/// `appearance::service`.
+pub const W_S_APPEARANCE: u8 = 17;
+/// `load_for_login` (the session's settings, SAFE_SETTLE_MS after it opened: PrefGets over the bus, the trackpad,
+/// the display mode, the appearance).
+pub const W_S_LOAD: u8 = 18;
+/// `persist` (a changed level's PrefSet).
+pub const W_S_PERSIST: u8 = 19;
+/// `mode_service` + `tp_service` + `bus_changes`.
+pub const W_S_MODE: u8 = 20;
+/// The session check (`prefs::user_name_in`: the users table, read when the login generation moved).
+pub const W_S_SESSION: u8 = 21;

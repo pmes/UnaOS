@@ -66,7 +66,7 @@ const PAGE_MAX: u64 = 64 * 1024;
 const NAME_MAX: u64 = 4096;
 static ON_WORKER: AtomicBool = AtomicBool::new(false);
 /// How long the worker waits for the bar before scanning anyway.
-const BAR_WAIT_MS: u64 = 10_000;
+pub const BAR_WAIT_MS: u64 = 10_000; // KVMLAT2 (B576): also the HDA bring-up's fallback (`drivers/hda.rs` `bar_holds`)
 
 /// What `/jobs` holds, once the scan has landed.
 #[derive(Clone, Copy)]
