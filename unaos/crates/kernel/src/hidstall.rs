@@ -290,7 +290,7 @@ pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8
         return;
     }
     let at = crate::arch::ms(); // SMALLFIX8 (B516): the hold's end, into the ring `held_between` reads (overflow holds too)
-    HELD_RING[HELD_IX.fetch_add(1, Relaxed) % HELD_RING_N].store(at << 20 | hold_ms.min(HELD_MS_MASK), Relaxed);
+    let hslot = HELD_IX.fetch_add(1, Relaxed) % HELD_RING_N; HELD_WHO[hslot].store(0, Relaxed); HELD_RING[hslot].store(at << 20 | hold_ms.min(HELD_MS_MASK), Relaxed); // POINTERFEEL (B535): the slot's holder is stamped below once known (0 = unnamed/overflow)
     let (np, nl) = name.map(|n| (n.as_ptr() as usize, n.len())).unwrap_or((0, 0));
     let mut ix = usize::MAX;
     for (i, h) in HOLD.iter().enumerate() {
@@ -312,7 +312,7 @@ pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8
         HOLD_OVERFLOW.fetch_add(1, Relaxed);
         return;
     };
-    h.n_min.fetch_add(1, Relaxed);
+    h.n_min.fetch_add(1, Relaxed); HELD_WHO[hslot].store(ix as u8 + 1, Relaxed); // POINTERFEEL (B535): which holder this ringed hold was
     h.worst_min.fetch_max(hold_ms, Relaxed);
     h.n_all.fetch_add(1, Relaxed);
     h.worst_all.fetch_max(hold_ms, Relaxed);
@@ -484,4 +484,29 @@ static TP_WIRE_LAST: AtomicU64 = AtomicU64::new(0);
 pub fn tp_wire_due(now: u64) -> bool {
     let last = TP_WIRE_LAST.load(Relaxed);
     (last == 0 || now.saturating_sub(last) >= TP_WIRE_MS) && TP_WIRE_LAST.compare_exchange(last, now.max(1), Relaxed, Relaxed).is_ok()
+}
+
+// ── POINTERFEEL (B535): which holder held the pump core over an interval ──────────────────────────────────────────────
+
+/// The holder index (`+ 1`, 0 = unnamed) of each [`HELD_RING`] slot, written by [`note_hold`] beside the slot.
+static HELD_WHO: [AtomicU8; HELD_RING_N] = [const { AtomicU8::new(0) }; HELD_RING_N];
+
+/// Over `[from, to]`: the ringed hold with the largest overlap — `(overlap ms, holder index)`, `(0, usize::MAX)` when
+/// the pump core was not held in the interval (or the hold was unnamed). `pointerfeel` names a report gap and the
+/// login screen's longest HID gap with it.
+pub fn holder_between(from: u64, to: u64) -> (u64, usize) {
+    let mut best = (0u64, usize::MAX);
+    for (i, e) in HELD_RING.iter().enumerate() {
+        let w = e.load(Relaxed);
+        if w == 0 {
+            continue;
+        }
+        let (end, ms) = (w >> 20, w & HELD_MS_MASK);
+        let ov = end.min(to).saturating_sub(end.saturating_sub(ms).max(from));
+        let who = HELD_WHO[i].load(Relaxed);
+        if ov > best.0 && who != 0 {
+            best = (ov, who as usize - 1);
+        }
+    }
+    best
 }

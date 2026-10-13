@@ -13691,7 +13691,7 @@ impl Controller {
         // keyboards toggle a lock in the SAME service pass neither write is dropped; `Target` is
         // `Copy`, so the array is plain stack scratch and costs nothing when nothing toggles.
         let mut led_pushes: [Option<(usize, Target, u8, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
-        let mut n_led = 0usize;
+        let mut n_led = 0usize; let mut tp_reassert: Option<(usize, Target, u8)> = None; // POINTERFEEL (B535): a trackpad whose stream contradicted its latched readback, re-asserted after the walk (EP0 needs `&mut self`, as `led_pushes`). LINE-NEUTRAL fold, code first.
         // KBDFLAP: stalled endpoints discovered during the walk, deferred for the same reason and
         // in the same shape as `led_pushes` above — `ClearFeature(ENDPOINT_HALT)` is a control
         // transfer and needs `&mut self`. Entries are `(index into int_eps, the device's EP0
@@ -14134,7 +14134,7 @@ impl Controller {
                                 serial_println!(
                                     ":: EHCI-HID: [{}] [tp] mode-mismatch readback={} stream={} -> route={} (the wire beats the register) == witness ::",
                                     idx, rb, st, st
-                                );
+                                ); if rb == "vendor" && st == "legacy" && crate::pointerfeel::reassert_due() { tp_reassert = Some((ep_i, e.kbd_target, e.kbd_intf)); } // POINTERFEEL (B535): the pad latched the vendor selector and still streams HID-mode reports — ask for the mode again after the walk (bounded: pointerfeel::REASSERT_MAX). LINE-NEUTRAL fold, code first.
                             }
                             match route {
                               TpRoute::Rel { buttons, dx, dy } => {
@@ -14174,7 +14174,7 @@ impl Controller {
                                 // and identical to the predicate this same call decides to emit a
                                 // `Mouse` event on. This is THE path the boot-3 phantom storm was
                                 // measured on.
-                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); finemotion::note(idx, false, (dx, dy), (dx * finemotion::Q, dy * finemotion::Q), (dx, dy), 1); crate::hidstall::note_button_edge(press, release); if (dx != 0 || dy != 0 || buttons != 0) && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=legacy ep={} buttons={:#04x} dx={} dy={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, buttons, dx, dy, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } // FINEMOTION (B496) + HIDSTALL2 (B509): the button edge's push time (the Dock reads how long a release sat in the lane), and the pointer route back on the wire at a low rate
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); finemotion::note(idx, false, (dx, dy), (dx * finemotion::Q, dy * finemotion::Q), (dx, dy), 1); crate::hidstall::note_button_edge(press, release); if (dx != 0 || dy != 0 || buttons != 0) && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=legacy ep={} buttons={:#04x} dx={} dy={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, buttons, dx, dy, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } crate::pointerfeel::note(now_ms, false, dx != 0 || dy != 0 || buttons != 0); // POINTERFEEL (B535): the legacy report counted for `tests pointerfeel` (LINE-NEUTRAL append, code first). FINEMOTION (B496) + HIDSTALL2 (B509): the button edge's push time (the Dock reads how long a release sat in the lane), and the pointer route back on the wire at a low rate
                                 crate::pal::push_pointer_report(
                                     if dx != 0 || dy != 0 {
                                         Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -14230,7 +14230,7 @@ impl Controller {
                                         idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, e.tp.mt_frames
                                     );
                                 }
-                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } // HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } crate::pointerfeel::note(now_ms, true, f.fingers > 0); // POINTERFEEL (B535): the vendor frame counted for `tests pointerfeel` (LINE-NEUTRAL append, code first). HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
                                 crate::pal::push_pointer_report(
                                     if dx != 0 || dy != 0 {
                                         Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -14393,7 +14393,7 @@ impl Controller {
                     self.int_eps[ep_i].kbd_led_ok = false;
                 }
             }
-        }
+        } if let Some((ep_i, t, intf)) = tp_reassert { self.tp_mode_reassert(ep_i, &t, intf); } // POINTERFEEL (B535): the endpoint borrow is released, EP0 is usable — the trackpad's mode re-assert (FILE-TAIL `impl Controller`). LINE-NEUTRAL fold, code first.
         // KBDFLAP: the endpoint borrow is released here, so EP0 is usable — clear the device-side
         // stall on every endpoint the walk classified `stall`, then re-arm it. ORDER IS LOAD-
         // BEARING and is the whole point of doing this here rather than in the walk: the clear
@@ -19678,3 +19678,90 @@ fn tpmode_witness(idx: usize, armed_ms: u64) {
 /// FINEMOTION (rmbp-ledger B496) — the vendor lane's sub-pixel curve stage, its `[ptr]` witness and `tests finemotion`.
 /// Tail append.
 mod finemotion;
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// POINTERFEEL (rmbp-ledger B535) — THE ROUTE: the trackpad's mode RE-ASSERTED when its stream contradicts its readback.
+// FILE-TAIL append, so no `panic::Location` above moves.
+//
+// THE WIRE, flight by flight (the evidence directories under docs/dev/evidence/rmbp-0915/):
+//   * flights 13–20 sent the mode switch as `wIndex=intf` FIRST: the device NAKed both data stages until the 2 s budget
+//     ran out (`STOP-NOTE EP0 DATA timeout … req=0xa1/0x01`, then `0x21/0x09`), and only THEN the index-0 attempt —
+//     `[tp] mode wrote=01 05 … readback=01 05 … latched=yes` some 4 s after the GET_DESCRIPTOR(Report). The stream
+//     that followed was the VENDOR stream: f13 `[tp] mt fingers=1 x=584 y=1361 … frame=1`, f18/f20 likewise, f20's
+//     census `ids=02:1,44:0,other:2241 sizes=2/64` (one stray id-0x02 report in 2,242);
+//   * TPMODE (B459, landed for flight 27) put index 0 FIRST — the switch now lands ~1 ms after the report descriptor
+//     (`[tp] mode req=1..3 … widx=0 status=ok ms=0`), readback latched=yes on every boot (`:: TPMODE: requests=3
+//     timeouts=0 first=index0 latched=yes`) — and from that flight on the stream is LEGACY on every boot that has the
+//     line to say so: f28/f30/f31 `[ptr] fine … rel=<n> vendor=0`, f31 `[tp] mt route=legacy … ids=02:229,44:0,other:1`,
+//     `[tp] mode-mismatch readback=vendor stream=legacy -> route=legacy` on the first touch.
+// So the register latches and the sensor engine does not follow when the selector is written while the pad is still
+// coming up; the same write seconds later (flights 13–20) took. FINEMOTION (B496) read flight 27 as "the pointer rides
+// the vendor lane" from flights 13–20's shape; FINEMOTION's own route counter (`vendor=0`) refutes it from flight 28 on.
+//
+// THE FIX. The first legacy report while the readback says vendor (TPFRAME's one-shot `stream_check` direction 2, at the
+// person's first touch — the pad is long up by then) asks for ONE re-assert, run after the endpoint walk where EP0 is
+// usable: the documented read-modify-write at index 0 (TPMODE's request, unchanged), written NORMAL (0x08) first and
+// then VENDOR (0x01) with a settle between — the off→on edge FreeBSD wsp.c's sequence uses (the PROVENANCE block on
+// `BCM5974_MODE_NORMAL`; the value is restated here because that constant is `mtraw`-only), so a firmware that acts on a
+// CHANGE of the selector sees one even though the register already reads 0x01 — then read back. The census's
+// direction-2 bit is cleared so a stream that is STILL legacy says so again, and a second re-assert may follow
+// (`pointerfeel::REASSERT_MAX` = 2 per boot, `REASSERT_GAP_MS` apart). Boot-time TPMODE is untouched (requests=3).
+// Wire: `[tp] mode reassert n=<k> why=stream-legacy was=<b0> normal=<ok> vendor=<ok> readback=<b0> latched=<yes|no>
+// ms=<t>`; after it the stream's own words — `[tp] mt route=vendor …`, `[ptr] fine … vendor=<n>` climbing.
+
+/// POINTERFEEL: the NORMAL (HID-mode) selector of byte 0 — wsp.c's documented OFF value, as `BCM5974_MODE_NORMAL`.
+const PTRFEEL_MODE_NORMAL: u8 = 0x08;
+/// POINTERFEEL: the settle between the OFF and ON writes (the `mtraw` helper's 5 ms).
+const PTRFEEL_SETTLE_MS: u64 = 5;
+
+/// POINTERFEEL: a bounded TSC spin (`ehci_scout::settle_ms` is `ehciconfig`-only); no settle when the TSC is unknown.
+fn ptrfeel_settle(ms: u64) {
+    let hz = crate::arch::x86_64::apic::tsc_hz();
+    if hz == 0 {
+        return;
+    }
+    let budget = hz / 1000 * ms;
+    let t0 = crate::arch::now_cycles();
+    while crate::arch::now_cycles().wrapping_sub(t0) < budget {
+        core::hint::spin_loop();
+    }
+}
+
+impl Controller {
+    /// POINTERFEEL (B535) — re-assert the trackpad's vendor mode: GET, SET NORMAL, settle, SET VENDOR, settle, GET.
+    /// Every stage non-fatal (the endpoint stays armed either way); the readback restamps `latched`.
+    unsafe fn tp_mode_reassert(&mut self, ep_i: usize, t: &Target, intf: u8) {
+        const N: usize = BCM5974_MODE_LEN as usize;
+        let t0 = crate::arch::ms();
+        let read = self.tp_mode_req(t, intf, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_INDEX, true).is_ok();
+        if !read {
+            for k in 0..N {
+                self.data_buf.add(k).write(0);
+            }
+        }
+        let was = *self.data_buf;
+        self.data_buf.write(PTRFEEL_MODE_NORMAL);
+        let off = self.tp_mode_req(t, intf, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_INDEX, false).is_ok();
+        ptrfeel_settle(PTRFEEL_SETTLE_MS);
+        self.data_buf.write(BCM5974_MODE_VENDOR);
+        let on = self.tp_mode_req(t, intf, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_INDEX, false).is_ok();
+        ptrfeel_settle(PTRFEEL_SETTLE_MS);
+        let back = if on && self.tp_mode_req(t, intf, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_INDEX, true).is_ok() {
+            Some(*self.data_buf)
+        } else {
+            None
+        };
+        let latched = back == Some(BCM5974_MODE_VENDOR);
+        if let Some(e) = self.int_eps.get_mut(ep_i) {
+            e.tp.latched = latched;
+            e.tp.mismatch &= !2;
+        }
+        TP_MODE_LATCHED.store(latched as u32, Ordering::Relaxed);
+        crate::pointerfeel::note_reassert(latched);
+        serial_println!(
+            "[tp] mode reassert n={} why=stream-legacy addr={} if={} was={:#04x} normal={} vendor={} readback={:#04x} readback_ok={} latched={} ms={} (POINTERFEEL: the pad latched vendor and streamed HID-mode reports; the selector written off then on)",
+            crate::pointerfeel::reasserts(), t.addr, intf, was, if off { "ok" } else { "fail" }, if on { "ok" } else { "fail" },
+            back.unwrap_or(0xFF), back.is_some(), if latched { "yes" } else { "no" }, crate::arch::ms().saturating_sub(t0)
+        );
+    }
+}

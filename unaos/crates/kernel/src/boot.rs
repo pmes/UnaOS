@@ -315,8 +315,8 @@ pub fn key_taken() {
         PRE_KEY_MAX.fetch_max(ms, Ordering::Relaxed);
     }
     serial_println!(
-        "[login] key latency ms={} max={} n={} hid_gap_max_ms={} bound={} (R86: the screen's input is never blocked)",
-        ms, max, n, HID_GAP_MAX.load(Ordering::Relaxed), KEY_BOUND_MS
+        "[login] key latency ms={} max={} n={} hid_gap_max_ms={} hid_gap_holder={} bound={} (R86: the screen's input is never blocked; POINTERFEEL B535: the longest gap named by the pump core's holder)",
+        ms, max, n, HID_GAP_MAX.load(Ordering::Relaxed), crate::pointerfeel::LoginGapHolder, KEY_BOUND_MS
     );
 }
 
@@ -328,7 +328,7 @@ pub fn hid_pass() {
         crate::video::lag::hid_gap(now.saturating_sub(last)); // INPUTSTALL M1 (B375): every gap, every phase, on the stall line
     }
     if last != 0 && SCREEN_UP.load(Ordering::Acquire) && phase() != Phase::Desktop {
-        HID_GAP_MAX.fetch_max(now.saturating_sub(last), Ordering::Relaxed);
+        if HID_GAP_MAX.fetch_max(now.saturating_sub(last), Ordering::Relaxed) < now.saturating_sub(last) { crate::pointerfeel::note_login_gap(last, now); } // POINTERFEEL (B535): a new longest login gap is named (holder, or the usb-pump step when unheld)
     }
 }
 
