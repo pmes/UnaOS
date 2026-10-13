@@ -3686,15 +3686,22 @@ hda-sie = ["hda-tone"]
 # reaches a VideoControl control — brightness/exposure/focus are read as capability BITMAPS out of
 # the descriptors and never written.
 #
-# IMPLIES `ehcihid`, for the reason `bt` does: the driver's ONE call site is inside
-# `drivers/ehci/mod.rs`, whose own declaration is `#[cfg(all(target_arch = "x86_64", feature =
-# "ehcihid"))]`, so without it the knob would arm a module nothing calls. `ehcihid` is default-ON,
-# so pushing `uvc` alone is the whole delta.
+# IMPLIES NOTHING since ARMSONDE (LEDGER SR101). It used to imply `ehcihid`, when the driver's ONE call
+# site was inside `drivers/ehci/mod.rs` (declared `#[cfg(all(target_arch = "x86_64", feature =
+# "ehcihid"))]`). XHCIISO (rmbp-ledger B534) gave it a second, arch-neutral caller — the shared xHCI
+# driver's `isoch::service_uvc` -> `uvc::probe_iso` — and `uvc.rs` has no reach into `drivers::ehci` at
+# all (the EHCI site calls IN through the `Xfer` closure), so the EHCI half is simply present wherever
+# `ehcihid` is: the x86 image line carries `ehcihid` explicitly (default-ON in the plumbing), so x86 is
+# unchanged, and an aarch64 image gets the xHCI half alone.
 #
 # Default OFF => `drivers/mod.rs`'s `pub mod uvc` is `#[cfg]`-erased (never lexed — the one case
 # LAWS §5 names as byte-safe) and the single call site in `configure_hid` is a LINE-NEUTRAL
 # same-line fold, so no `panic::Location` in that 18k-line file moves and the knob-off image is
-# byte-identical (`./arroyo knoboff uvc`). x86_64 only.
+# byte-identical (`./arroyo knoboff uvc`). BOTH ARCHES (ARMSONDE, SR101): every gate in `drivers/mod.rs`,
+# `drivers/xhci/mod.rs` and `isoch.rs` is `feature = "uvc"` alone, so the knob reaches the Orin's XUSB
+# (polled HS) and the Pi's VL805 through the one shared xHCI driver; the Orin's service pass is the
+# tegra-only fold on `service_enum`'s line. aarch64 wiring (esp-jetson / kernel8 knob maps, the arm legs)
+# is ARMLINE's, in `unaos/arroyo`.
 #
 # WIRED IN THREE PLACES, and none of them is optional: `unaos/arroyo`'s knob map, `unaos/builder/
 # src/main.rs` (which re-derives the x86 feature list from its OWN env for every media verb AND for
@@ -3705,7 +3712,7 @@ hda-sie = ["hda-tone"]
 # `scripts/banner-cert.sh`, certifies the feature ON THE ARTIFACT; a fifth, `scripts/
 # k8-reach.registry`, records why this knob has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
-uvc = ["ehcihid"]
+uvc = []
 # REALSENSE (LEDGER SR92, R112): `UNAOS_SONDE=1` arms Sonde's first probe, the Intel RealSense D435i —
 # `drivers/uvc.rs`'s appended `multi` census (one record per VideoStreaming function: depth Z16, infrared
 # Y8, colour YUY2; every extension unit; the HID interface), a D400's three XU `GET_CUR`s (laser power,
@@ -3714,7 +3721,9 @@ uvc = ["ehcihid"]
 # `:: SONDE: dev=… -> SKIP(no-device)` or the device's census `-> SKIP(no-iso-pipe)`). IMPLIES `uvc`: both
 # folds live in `uvc::probe`. Default OFF => `pub mod realsense_xu` and `pub mod sonde` are never lexed,
 # uvc.rs's appended block and its two same-line folds are `#[cfg]`-erased, and the image is byte-identical
-# (`./arroyo knoboff sonde`). x86_64 only. FIVE places (LAWS §4): this line, `unaos/arroyo`'s `_feats`,
+# (`./arroyo knoboff sonde`). BOTH ARCHES (ARMSONDE, SR101): `pub mod sonde`, `pub mod realsense_xu` and the
+# `tests sonde` registration are `feature = "sonde"` alone, and `uvc::probe_iso` carries the same two folds as
+# `uvc::probe`, so a D400 on xHCI (every board's USB-A ports) is recorded too. FIVE places (LAWS §4): this line, `unaos/arroyo`'s `_feats`,
 # `unaos/builder/src/main.rs`, `scripts/banner-cert.sh`, `scripts/k8-reach.registry`.
 sonde = ["uvc"]
 # IOAPIC (rmbp-ledger B147): `UNAOS_IOAPIC=1` arms `arch/x86_64/ioapic.rs` — the Intel 82093AA

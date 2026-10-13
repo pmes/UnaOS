@@ -4,7 +4,7 @@
 
 //! XHCIISO (rmbp-ledger B534) — isochronous IN on xHCI, the 4 KiB EP0 buffer, and the UVC hand-off.
 //!
-//! Declared from `xhci/mod.rs` as `#[cfg(all(target_arch = "x86_64", feature = "uvc"))]` on an existing line,
+//! Declared from `xhci/mod.rs` as `#[cfg(feature = "uvc")]` on an existing line (both arches — ARMSONDE, SR101),
 //! so a knob-off build never lexes this file; every reach into it from `mod.rs` is a same-line cfg-gated
 //! append (the usbnet shape). Nothing here runs unless the `uvc` knob is armed AND a camera enumerates.
 //!
