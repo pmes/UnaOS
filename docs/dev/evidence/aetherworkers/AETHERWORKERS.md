@@ -1,0 +1,76 @@
+# AETHERWORKERS (LEDGER SR123): dedicated workers, MessageChannel, requestIdleCallback: feature table
+
+Branch `exec-host-aetherworkers`, cut from `6427870e`. Compiled with
+`CARGO_TARGET_DIR=/root/unaos-bench/scratch/cloud/wave28/target cargo check -p aether --tests` (rc=0). Under
+R107 nothing here was run: every row's test is written and owed to the fold. The **Test** column names the
+`#[test]` in `handlers/aether/tests/workers.rs` that asserts the row's observable.
+
+CHARTER: Aether (docs/CODEX.md §2, Web), seam `handler` (host-native Ring 3, `handlers/aether`): every file
+of this arc is Aether's own engine or binding; no kernel file, no shared core.
+
+## The mechanism in one paragraph
+
+`new Worker(url, {type, name})` (`js/worker.rs`) resolves the URL on the page thread, refuses a cross-origin
+URL (a `data:` URL is allowed, opaque origin), runs mixed content and CSP `worker-src` through
+`security::subresource_url(url, "worker")`, and fetches the script with the page loader's
+`js::host::fetch_script`; a refusal or a failed fetch queues a simple `error` event at the Worker. The script
+goes to `workers::dedicated::spawn`: one thread, one `js_core` realm built like the service-worker realm
+(`workers/realm.rs` now exports its shared natives and the `Headers`/`Request`/`Response`/`fetch` prelude as
+`install_shared` and `FETCH`). Page to worker is a `Cmd` on the thread's channel; worker to page is a
+`js::broadcast` inbox message (`worker-message`, `worker-error`, `port-message`), so it runs as a task on the
+page's event loop wherever the inbox is polled (`Engine::tick`, `run_network_tasks`, the boot drain, `settle`).
+Messages are serialized by `js::broadcast`'s serializer, which takes an optional transferred-port index map
+(`__sc_ser(value, xp)` / `__sc_de(text, ports)`). MessagePorts (`js/ports.rs`) are process-wide ids in one
+registry holding each port's peer and owner (a document, a worker, or in transit); a post queues one task on
+the peer owner's loop, and a port in transit buffers until the receiving realm adopts it.
+`requestIdleCallback` (`event_loop/mod.rs`) runs in the idle pass of `fire_due_timers`.
+
+## What works
+
+| Feature | Spec | Where | Test |
+|---|---|---|---|
+| `new Worker(url, { type: 'classic' \| 'module', name, credentials })`, WorkerType / RequestCredentials enum checks, an unparsable URL throws SyntaxError | HTML §10.2.6 | `js/worker.rs` | `a_worker_echoes_a_message`, `a_same_origin_worker_loads_through_the_page_loader` |
+| The script fetched through the page's loader (`js::host::fetch_script`), same-origin or `data:`, mixed content + CSP `worker-src` (fallback `child-src`, `script-src`, `default-src`); refusal and fetch failure fire a simple `error` event, not an exception | HTML §10.2.4, CSP3 §6.8.3 | `js/worker.rs`, `security/mod.rs` subresource_url | `an_uncaught_worker_error_fires_error_at_the_worker` (cross-origin), `a_same_origin_worker_loads_through_the_page_loader` |
+| DedicatedWorkerGlobalScope on its own thread: `self` (an EventTarget; `String(self)` is `[object DedicatedWorkerGlobalScope]`), `location` (WorkerLocation), `navigator` (WorkerNavigator from the page's snapshot), `name`, `close()`, `postMessage`, `onmessage` / `onmessageerror` / `onerror` | HTML §10.2.1, §10.3 | `workers/dedicated.rs` EVENTS, SCOPE | `a_worker_echoes_a_message`, `a_same_origin_worker_loads_through_the_page_loader` |
+| Timers on real time (`setTimeout` family on js_core's built-in timers, `loop_now` set to the worker clock per task, one generation per pass), `queueMicrotask`, a microtask checkpoint after every task | HTML §8.6, §8.1.7.3 | `workers/dedicated.rs` fire_due_timers, task | `terminate_stops_the_worker` (setInterval), `an_uncaught_worker_error_fires_error_at_the_worker` |
+| `importScripts` (classic only, synchronous fetch of each URL, run in the realm; a module worker throws TypeError; a failed fetch throws NetworkError) | HTML §10.3.4.1 | `workers/dedicated.rs` | `a_same_origin_worker_loads_through_the_page_loader` |
+| Module workers: `run_module`, static and dynamic imports resolved against the importing module and fetched through the loader (bare specifiers refused: no import map in a worker) | HTML §10.2.4 "fetch a module worker script graph" | `workers/dedicated.rs` WorkerHost::load_module | `a_same_origin_worker_loads_through_the_page_loader` |
+| `fetch`, `Request`, `Response`, `Headers` (a client of the worker's origin: CORS-checked cross-origin, opaque under `no-cors`; the service-worker realm's code, now shared) | Fetch §5 | `workers/realm.rs` FETCH, install_shared | not separately (service_worker.rs covers the shared code) |
+| `XMLHttpRequest` (open / setRequestHeader / send sync and async / abort / response types '' text json arraybuffer blob / headers / the event handlers) over the same fetch native | XHR §3 | `workers/dedicated.rs` SCOPE | none (owed) |
+| `structuredClone`, `console`, `TextEncoder` / `TextDecoder`, `URL` / `URLSearchParams`, `AbortController` / `AbortSignal`, `crypto.getRandomValues` / `randomUUID`, `Blob` / `File`, `performance.now()` / `timeOrigin` | HTML §2.7.11, URL, Encoding, DOM §3, WebCrypto §10 | `api/platform.rs` init_worker, `workers/dedicated.rs` SCOPE | none (shared preludes; owed) |
+| `caches` (the Cache API over the page's storage key, secure contexts only; SecurityError for an opaque-origin worker) | Service Workers §5 | `workers/realm.rs` cache_native | none (owed) |
+| `postMessage(value, transfer)` both ways through structured serialization; MessageEvent `data`, `origin` "", `ports`, trusted; `messageerror` when deserialization fails | HTML §10.2.6, §9.4.3 | `js/worker.rs`, `js/ports.rs` __msg_pack / __msg_dispatch | `a_worker_echoes_a_message` |
+| Transfer of ArrayBuffers (the sender's buffer detached at once; a detached or duplicate buffer throws DataCloneError) and MessagePorts (shipped; a port outside the transfer list throws DataCloneError) | HTML §2.7.6 StructuredSerializeWithTransfer | `js/ports.rs` pack, `js/broadcast.rs` ser/de | `a_transferred_array_buffer_is_detached_on_the_sender`, `a_port_pair_across_page_and_worker` |
+| An uncaught worker error (script, task, timer, listener, microtask): ErrorEvent at the worker global first (`onerror(message, filename, lineno, colno, error)` returning true cancels), then ErrorEvent at the Worker (`message`, `filename`, `lineno`, `colno`); `lineno`/`colno` exact for a SyntaxError in the worker's script | HTML §10.2.5 "runtime script errors", §8.1.4.6 | `workers/dedicated.rs` report, `js/worker.rs` | `an_uncaught_worker_error_fires_error_at_the_worker` |
+| `worker.terminate()`: unregistered at once, nothing more delivered either way, messages already queued on the page dropped, the thread stops at its next checkpoint (between tasks, or at the next worker-native call inside a task: `vm.budget` zeroed, `vm.terminated`) | HTML §10.2.6 "terminate a worker" | `workers/dedicated.rs` terminate, checkpoint_kill | `terminate_stops_the_worker` |
+| MessageChannel / MessagePort as a real task source: entangled pair, `postMessage` queues one task on the receiving side's loop (page inbox or worker channel), the port message queue held until `start()` (setting `onmessage` starts it), each queued message its own task, `close()` disentangles both ends, ports transfer across any `postMessage` transfer list, messages posted to a port in flight buffer and arrive first after adoption, a shipped port's undispatched messages travel with it | HTML §9.4.4, §9.4.5 | `js/ports.rs` | `a_port_pair_across_page_and_worker` |
+| `e.ports` on the page's MessageEvent (Worker and MessagePort messages) | HTML §9.2 MessageEvent | `js/ports.rs` (stash + `MessageEvent.prototype.ports`) | `a_port_pair_across_page_and_worker` |
+| `requestIdleCallback(cb, { timeout })` / `cancelIdleCallback` / `IdleDeadline` (`timeRemaining()` = max(0, deadline − now), deadline = min(now + FRAME_BUDGET_MS 16, next timer due); `didTimeout`); an idle period starts when a pass fired nothing and the task queue is empty; callbacks queued during a period wait for the next; a timed-out callback runs at the next pass, idle or not | Cooperative Scheduling of Background Tasks §4 | `event_loop/mod.rs` | `an_idle_callback_gets_a_deadline` |
+| `event_loop::settle` waits on real time while one of the document's workers has commands outstanding or a timer due within 100 ms | (engine) | `event_loop/mod.rs`, `workers/dedicated.rs` busy | none (owed: a settle-driven test) |
+| The platform.rs shims are gone: MessageChannel over the timer queue, `requestIdleCallback` as `setTimeout(0)` with `timeRemaining() = 50` | — | `api/platform.rs` COMPAT | `engine_tests.rs` test_message_channel_delivers_through_timer_queue still asserts delivery in the boot drain |
+
+## Refused, and why
+
+| Feature | Why refused | What it would take |
+|---|---|---|
+| `terminate()` of a pure compute loop that calls nothing | js_core has no cross-thread interrupt: the instruction budget is its only preemption point (`unaos/libs/web/js_core/src/vm/interp.rs` run_inner, the `budget` check), and js_core is not this arc's file. Such a loop stops when its task budget (`js::TASK_BUDGET`) runs out. | `Vm.interrupt: Option<Arc<AtomicBool>>` (vm/mod.rs) checked beside the budget in run_inner and `Vm::tick` (terminate as an exhausted budget does); `dedicated.rs` sets it in `terminate`. |
+| Worker script MIME-type check and `Sec-Fetch-Dest: worker` | `js::host::fetch_script` answers text only and sends destination `script`; `js/host.rs` is not this arc's file. | A `fetch_worker_script` in `js/host.rs` answering (text, content-type) with destination `worker`; refuse a non-JavaScript MIME type. |
+| Asynchronous script fetch | The page's policed request context (`security::RequestContext`, cookies, referrer, CSP precheck) is captured on the page thread and `api::fetch::policed_send` is private, so the fetch runs on the page thread (bounded by the loader's 10 s timeout). | A context handed to the worker thread (`policed_send` reachable from `workers::`). |
+| ErrorEvent at the Worker cancelable from the page (and `new MessageEvent(type, { ports })` from script carrying its ports) | The page fires through `js::net`'s `__net_fire`, which creates non-cancelable events, and `events.rs`'s MessageEvent init has no `ports` member; `events.rs` is AETHERA11Y's live file. So the page console always gets the worker error, and page-dispatched MessageEvents get `ports` through a per-dispatch stash. | A `cancelable` argument on `__net_fire` and a `ports` member (sequence<MessagePort>) in events.rs's MessageEvent init. |
+| `lineno` / `colno` of a runtime error (not a SyntaxError) | js_core's error traces carry function names only (`Vm::stack_trace`), no source positions; `last_positions` is never written. They are 0, as the page's own `report_exception` reports. | Source positions on js_core frames. |
+| IndexedDB, Web Locks and BroadcastChannel inside a worker | `storage::idb` (versionchange, `doc_gone`), `storage::locks` and `__bc` are keyed by a DOCUMENT's inbox serial (`js::broadcast::doc()` / `post(doc, …)`); a worker realm has no document inbox, and giving it one changes the storage family's ownership model. | A worker-serial inbox in `js/broadcast.rs` and the three engines' "client gone" hooks keyed by it. |
+| Nested workers (`new Worker` inside a worker) | The spawn path reads the page's URL, CSP state (`security` DOC) and storage key from page-thread state; none of it exists on a worker thread. | The spawn path parameterized by the creating realm (URL, policies, storage key) instead of the page thread's. |
+| SharedWorker | It does not fall out of (1) cheaply: it needs a process-wide registry keyed by (origin, URL, name), a lifetime that outlives any one document (a dedicated worker is owned by one document's serial and dies with it), and a `connect` event per client. The port half is ready (`js/ports.rs` would carry each client's port). Left undefined so feature-detecting pages take their fallback. | A shared registry + refcount by connected documents; `Cmd::Connect(port)` firing `connect` at a SharedWorkerGlobalScope. |
+| `unhandledrejection` / `rejectionhandled` in a worker | The worker realm does not turn on js_core rejection tracking (`vm.track_rejections`); not wired this arc. | Track rejections in the worker realm and fire PromiseRejectionEvent at the global after each checkpoint. |
+| Transferables other than ArrayBuffer and MessagePort (ImageBitmap, OffscreenCanvas, streams, VideoFrame, AudioData); SharedArrayBuffer | Each is a "Value does not have a transferable type" DataCloneError; js_core has no SharedArrayBuffer. | Per-type transfer steps. |
+| Port garbage collection | A port lives until `close()` or its owner goes; an unreferenced port is not disentangled by GC. | Weak ownership from the realm's collector. |
+| WPT for workers and messaging | `handlers/aether/tests/wpt_dom.rs` still excludes "workers / messaging" and net tests with `new Worker(`; not this arc's file. | Lift those exclusions in the seat's next WPT round. |
+
+## The ring-3 program (`user-aether`, later arc)
+
+AETHER.ELF has no threads. A cooperative single-thread worker there needs: a second `js_core` Vm in the same
+process; a scheduler that interleaves worker tasks with page tasks, yielding at task boundaries (and, for a
+long task, at a budget slice, which needs js_core to suspend and resume on budget exhaustion instead of
+terminating); the `js::ports` registry with `Owner::Worker` mapped to an in-process queue instead of a thread
+channel; the worker script fetched through the ring-3 net stack; and `busy` folded into its event loop's idle
+test.

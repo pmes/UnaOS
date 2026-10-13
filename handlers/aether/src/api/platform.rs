@@ -163,6 +163,27 @@ pub fn init(vm: &mut Vm) {
     }
 }
 
+/// AETHERWORKERS (SR123): the DOM-less half of [`init`] for a dedicated worker's realm (`workers::dedicated`):
+/// `URL` / `URLSearchParams`, `TextEncoder` / `TextDecoder`, `AbortController`, `crypto` — the natives and the
+/// prelude without `__parse_document` (a worker has no Document) and without the page-only compat shapes.
+pub(crate) fn init_worker(vm: &mut Vm) {
+    let g = vm.realm().global;
+    for (name, len, f) in [
+        ("__url_parse", 2, url_parse as NativeFn),
+        ("__url_set", 3, url_set),
+        ("__form_parse", 1, form_parse),
+        ("__form_byte", 1, form_byte),
+        ("__random_bytes", 1, random_bytes),
+    ] {
+        let fo = vm.make_native(name, len, f, false);
+        vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
+    }
+    if let Err(e) = vm.run_script_str(PRELUDE) {
+        let m = vm.error_string(&e);
+        eprintln!("[aether-worker] platform prelude failed: {m}");
+    }
+}
+
 /// The WHATWG object shapes over the natives above.
 const PRELUDE: &str = r#"
 
@@ -590,37 +611,14 @@ const PRELUDE: &str = r#"
 "#;
 
 
-/// Platform pieces with honest, self-reporting approximations: MessageChannel over the timer queue, the
-/// observer families (register, never deliver), `requestIdleCallback`. (AETHERSTORAGE, SR94: the in-page
+/// Platform pieces with honest, self-reporting approximations: the observer families (register, never
+/// deliver). (AETHERWORKERS, SR123: the MessageChannel-over-the-timer-queue and `requestIdleCallback` shims are
+/// gone — `js::ports` installs HTML §9.4.5's entangled ports and `event_loop` the idle-callback task source with
+/// a real IdleDeadline.) (AETHERSTORAGE, SR94: the in-page
 /// `localStorage`/`sessionStorage` shim is gone — `js::net` installs the real Storage over `crate::storage` —
 /// and so is the JSON-round-trip `structuredClone`: `js::broadcast` installs HTML §2.7's.)
 const COMPAT: &str = r#"
 (function () {
-    globalThis.MessageChannel = function MessageChannel() {
-        var mk = function () {
-            return {
-                onmessage: null, _l: [],
-                addEventListener: function (ev, cb) { if (ev === 'message') this._l.push(cb); },
-                removeEventListener: function (ev, cb) {
-                    if (ev === 'message') { var i = this._l.indexOf(cb); if (i >= 0) this._l.splice(i, 1); }
-                },
-                start: function () {}, close: function () {},
-            };
-        };
-        var a = mk(), b = mk();
-        var wire = function (from, to) {
-            from.postMessage = function (data) {
-                setTimeout(function () {
-                    var e = new MessageEvent('message', { data: data });
-                    if (typeof to.onmessage === 'function') { to.onmessage(e); }
-                    for (var i = 0; i < to._l.length; i++) { to._l[i](e); }
-                }, 0);
-            };
-        };
-        wire(a, b); wire(b, a);
-        this.port1 = a; this.port2 = b;
-    };
-
     var mkObserver = function (kind) {
         var C = function (cb) {
             this._cb = cb;
@@ -637,13 +635,6 @@ const COMPAT: &str = r#"
     globalThis.IntersectionObserver = mkObserver('IntersectionObserver');
     globalThis.ResizeObserver = mkObserver('ResizeObserver');
     globalThis.PerformanceObserver = mkObserver('PerformanceObserver');
-
-    globalThis.requestIdleCallback = function (cb) {
-        return setTimeout(function () {
-            cb({ didTimeout: false, timeRemaining: function () { return 50; } });
-        }, 0);
-    };
-    globalThis.cancelIdleCallback = function (id) { clearTimeout(id); };
 
     globalThis.customElements = {
         define: function (name) { __ledger('customElements.define-not-upgrading:' + name); },
