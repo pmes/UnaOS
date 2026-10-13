@@ -1,0 +1,17 @@
+SETTINGSCRAFT (rmbp-ledger B630) — the arc's one compile, exec-rmbp-settingscraft, parent 817f7945.
+
+cd unaos/crates/kernel && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/root/unaos-bench/scratch/cloud/wave32/target cargo +nightly check -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec --target ../../x86_64-unknown-none.json --features "$(cat /root/unaos-bench/scratch/cloud/wave32/kfeats24.txt)"
+
+features: witness,selfhost,logts,wcg-paygo,wcdvalve,quarry,facet,ehcihid,kbdwit,smc,sdwrite,sdw,sdhcblk,ahci,unafs,hda,hda-tone,usbnet,wifi,wifi2,wifi3,wifi4,bt,btc,login,nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-ce,beam,wc,noaspm,nvidia-kepler-vblank,deadman,linuxabi,busreg,lumen,netring3,selfdiag,lidsleep,videoplayer,intel-ivb,unaos_ivb,gen7,gen7,gen7r8,gen7,gen7blit,gmux_igd,smolnet,ftdirx,uvc,ioapic,midden,aether,una,sonde
+
+rc=0
+    Checking unaos-kernel v0.1.0 (/home/user/exec/settingscraft/unaos/crates/kernel)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 13s
+
+Warnings in this arc's files (both dead code, harmless): row_of (its one caller, the old 3-px selection bar, is gone: the kit's focus ring replaced it) and sel (dead at the parent too):
+warning: function `row_of` is never used
+   --> crates/kernel/src/video/settings.rs:491:10
+warning: function `sel` is never used
+    --> crates/kernel/src/video/settings.rs:1241:4
+
+Not run (R107, the seat's at the fold): the aarch64 desktop_firmware leg of ./arroyo check, tests settings / tests glasskit on QEMU (craft=ok in both sets), appearance-check.py (no literal was added: the tiles are theme::ACCENTS, the masks are & operands), knoboff.

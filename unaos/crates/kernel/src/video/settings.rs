@@ -33,6 +33,15 @@
 //! `[settings] users op= name= ok= reason=` line; Display = brightness (BRIGHTFLOOR M5), idle blank, UI scale (read-only: the compositor fixes it at
 //! takeover), clock (fixed: CLOCKBAR has no runtime switch); About = version, board, CPUs, RAM, uptime.
 //!
+//! SETTINGSCRAFT (rmbp-ledger B630): the window is drawn with GLASSKIT's kit (`video::draw`), DESIGN-LANGUAGE §3.4's
+//! Settings: a sidebar (the user card, a search field that filters the tab names, one 28-px pill per tab with a drawn
+//! icon tile), and panes whose rows sit in inset GROUP BOXES (hairline, rounded, separators inset from the left, the
+//! label left and the control right) with every control one of the kit's (toggle, checkbox, slider, push button,
+//! segmented, text field, popup). Hover is polled on the desktop service pass ([`hover_poll`], one repaint per control
+//! crossed), a press shows its pressed face for [`PRESS_MS`], the wheel scrolls the column and pages the File Types
+//! pane. Every colour is a theme role or derived from one; `tests settings` paints both sets offscreen and checks the
+//! pixels (`craft=ok`).
+//!
 //! Witness: `:: SETTINGS: controls=<n> tabs=<n> loaded=<n> saved=<n> -> PASS ::` on open and on save, and the
 //! `tests` fixture `settings` ([`selftest`]: set idle to 5, save, re-read the file, compare).
 
@@ -40,6 +49,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::video::draw::{self, Ink, Rect};
 use crate::video::{theme, wm};
 
 /// Kernel-furniture owner slot (`+ 7`, after TEXTEDIT's `+ 6`).
@@ -59,37 +69,65 @@ pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
 const WALL_MAX: usize = 120;
 
-// SETTINGSTABS (B623, R118): the tab COLUMN on the left; every pane's geometry hangs off ONE origin (PANE_X, PANE_Y).
-// All values are LOGICAL px: the surface is `metrics::size` of them (UIMETRICS B372), so the column scales with the rest.
+// SETTINGSTABS (B623, R118) -> SETTINGSCRAFT (B630): the tab COLUMN on the left (the user card, the search field, one
+// row per tab with its icon tile); every pane's geometry hangs off ONE origin (PANE_X, PANE_Y). All values are LOGICAL
+// px: the surface is `metrics::size` of them (UIMETRICS B372), so the column scales with the rest. The numbers are
+// DESIGN-LANGUAGE §3.4's Settings on its 4 pt grid: sidebar 220, pills 28 tall inset 8, a 16 icon at 8 with the label
+// 8 after it, pane padding 20, grouped-list rows 48 (the language's minimum is 40) with an inset of 12.
 /// The tab column's width (logical px).
-pub const COL_W: usize = 160;
-/// One tab row in the column.
+pub const COL_W: usize = 220;
+/// One tab row's pitch in the column (the pill is [`PILL_H`] tall, centred in it).
 const COL_ROW: usize = 32;
-/// The column's inset above its first row.
-const COL_PAD: usize = 8;
+/// The user card at the column's top: the avatar disc, the name, the role (a press opens Users).
+const CARD_Y: usize = 12;
+const AVATAR: usize = 32;
+const CARD_H: usize = AVATAR + 8;
+/// The search field under the card: it filters the tab names.
+const SEARCH_X: usize = 8;
+const SEARCH_Y: usize = CARD_Y + CARD_H + 8;
+const SEARCH_W: usize = COL_W - 2 * SEARCH_X;
+const SEARCH_H: usize = draw::DIMS.field_h;
+/// The first tab row's top.
+const COL_PAD: usize = SEARCH_Y + SEARCH_H + 12;
+/// The pill's inset and height, the icon tile and the label after it.
+const PILL_X: usize = 8;
+const PILL_H: usize = draw::DIMS.row_h;
+const ICON: usize = 16;
+const ICON_X: usize = PILL_X + 8;
+const COL_LABEL_X: usize = ICON_X + ICON + 8;
 /// The pane's content origin: x right of the column, y below the pane's title band (the tab's name as a heading).
 const PANE_X: usize = COL_W;
-const PANE_Y: usize = 40;
-/// The pane's own width — the old window's (APPEARANCE B408 600; FILETYPES B423 680; NOTIFYPANE B435 800).
-const PANE_W: usize = 800;
+const PANE_Y: usize = 60;
+/// The pane's own width (SETTINGSCRAFT: the window is 920 x 560, the proportion the language's Settings keeps).
+const PANE_W: usize = 700;
 const WIN_W: usize = PANE_X + PANE_W;
 /// The first control row's top: the pane origin (the title band is above it).
 const TOP: usize = PANE_Y;
-const ROW_H: usize = 40;
+const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
 pub const TABS: usize = 9;
 const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8
-const WIN_H: usize = TOP + ROWS * ROW_H + 8;
-/// Tab rows the column shows at once; more than this and it scrolls (the selected row is kept in view).
-const COL_VIS: usize = (WIN_H - COL_PAD) / COL_ROW;
-const LABEL_X: usize = PANE_X + 12;
-const TRACK_X: usize = PANE_X + 150;
+const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
+/// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
+const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
+/// The pane's padding, a group box's inset from its band of rows, a row's inset inside its box.
+const PAD: usize = 20;
+const GAP: usize = 4;
+const INSET: usize = 12;
+const BOX_X: usize = PANE_X + PAD;
+const BOX_W: usize = PANE_W - 2 * PAD;
+const LABEL_X: usize = BOX_X + INSET;
+/// The right edge every row's control is aligned to.
+const CTRL_R: usize = BOX_X + BOX_W - INSET;
+const TRACK_X: usize = PANE_X + 300;
 const TRACK_W: usize = 240;
 const VAL_X: usize = TRACK_X + TRACK_W + 12;
 const BTN_W: usize = 70;
-const BTN_H: usize = 26;
-const KNOB_W: usize = 8;
+const BTN_H: usize = draw::DIMS.button_h;
+const FIELD_H: usize = draw::DIMS.field_h;
+/// A row's switch, right-aligned.
+const TOG_X: usize = CTRL_R - draw::DIMS.toggle_w;
 
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 static LOADED_N: AtomicU32 = AtomicU32::new(0);
@@ -132,6 +170,26 @@ struct State {
     w: usize,
     h: usize,
     surf: Vec<u32>,
+    /// SETTINGSCRAFT: the column's search text and whether the field holds the keys.
+    query: String,
+    search: bool,
+    /// The last selection move came from the keyboard (the focus ring shows only then: DESIGN-LANGUAGE §2.7).
+    kbd: bool,
+    /// The pointer over the window (logical px), a press being shown pressed `(x, y, at ms)`, the controls' rects
+    /// this paint drew (logical `x, y, w, h`) and which of them is under the pointer.
+    ptr: Option<(usize, usize)>,
+    press: Option<(usize, usize, u64)>,
+    hits: Vec<[u16; 4]>,
+    hot: Option<usize>,
+}
+
+impl State {
+    fn new(w: usize, h: usize, surf: Vec<u32>, sel: usize, strip: bool, col_top: usize) -> State {
+        State {
+            sel, strip, col_top, col_hover: None, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf,
+            query: String::new(), search: false, kbd: false, ptr: None, press: None, hits: Vec::new(), hot: None,
+        }
+    }
 }
 
 // ── The store: Principia's, through `crate::prefs` ─────────────────────────────────────────────
@@ -434,71 +492,358 @@ const fn row_of(i: usize) -> usize {
     match i { 0 => 0, 1 => 0, 2 => 1, 3 => 1, 4 => 2, 5 => 3, 6 | 7 => 4, 9 => 4, 10 => 5, _ => 5 }
 }
 
-fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
-    // UIMETRICS (B372): `w` and the rect are LOGICAL px; the surface is the native (physical) one.
-    super::metrics::fill(s, super::metrics::size(w), x, y, rw, rh, c);
+// ── SETTINGSCRAFT (rmbp-ledger B630) — the window drawn with the kit (`video::draw`, GLASSKIT B628) ──────────────────
+// Every control below is one of the kit's: no bare `fill_rect` box, no 1-px border made of fills. A control's state
+// comes from [`cs`], which also records its logical rect in `State::hits`, so the hover pass ([`hover_route`]) knows
+// when the pointer crosses into another control: one repaint per crossing, none per motion sample.
+
+/// How long a press shows its pressed face (DESIGN-LANGUAGE §2.6 `motion.fast`).
+pub const PRESS_MS: u64 = 100;
+/// The column's ground: the window's face this far (of 255) toward the ink — darker on Light, lighter on Dark, as
+/// DESIGN-LANGUAGE §2.3's `surface.sidebar` sits against `surface.window` in each set. Derived, never a literal.
+const SIDEBAR_TINT: u32 = 12;
+
+/// A logical coordinate's device edge (the kit draws in device px).
+fn e(v: usize) -> i32 {
+    super::metrics::edge(v) as i32
 }
 
-fn txt(st: &mut State, x: usize, r: usize, t: &str) {
+/// A logical span's device width.
+fn ew(x: usize, w: usize) -> i32 {
+    e(x + w) - e(x)
+}
+
+/// A logical length at the panel's scale (device px), as the kit sizes its controls.
+fn dp(n: usize) -> i32 {
+    crate::ui::px(n) as i32
+}
+
+/// Row `r`'s logical top.
+const fn row_top(r: usize) -> usize {
+    TOP + r * ROW_H
+}
+
+/// The top of an `h`-tall control centred in row `r`.
+const fn mid_y(r: usize, h: usize) -> usize {
+    row_top(r) + (ROW_H - h) / 2
+}
+
+/// The kit's surface over the window's pixels.
+fn sf(st: &mut State) -> draw::Surf<'_> {
+    let pw = super::metrics::size(st.w);
+    draw::Surf::new(&mut st.surf, pw)
+}
+
+fn sidebar_bg() -> u32 {
+    draw::blend(theme::chrome_face(), theme::content_text(), SIDEBAR_TINT)
+}
+
+/// A control's state at the logical rect `(x, y, w, h)` (hover / pressed from the pointer); records the rect.
+fn cs(st: &mut State, x: usize, y: usize, w: usize, h: usize, focused: bool) -> draw::ControlState {
+    st.hits.push([x as u16, y as u16, w as u16, h as u16]);
+    let inside = |p: Option<(usize, usize)>| p.is_some_and(|(px, py)| px >= x && px < x + w && py >= y && py < y + h);
+    draw::ControlState { hover: inside(st.ptr), pressed: inside(st.press.map(|(a, b, _)| (a, b))), disabled: false, focused }
+}
+
+/// The topmost recorded control under `p`.
+fn hit_at(hits: &[[u16; 4]], p: Option<(usize, usize)>) -> Option<usize> {
+    let (px, py) = p?;
+    hits.iter().rposition(|h| {
+        let (x, y, w, hh) = (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
+        px >= x && px < x + w && py >= y && py < y + hh
+    })
+}
+
+/// Text with its line top at the logical `(x, y)`, clipped at the logical `clip`; returns the pen.
+#[allow(clippy::too_many_arguments)]
+fn text_at(st: &mut State, x: usize, y: usize, clip: usize, t: &str, ink: u32, bold: bool, face: super::text::Face) -> usize {
+    let (w, h) = (st.w, st.h);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), clip, x, y, t.as_bytes(), ink, bold, face)
+}
+
+/// A row's text in `ink`, vertically centred in row `r`, clipped at the controls' right edge.
+fn txt_ink(st: &mut State, x: usize, r: usize, t: &str, ink: u32) {
     let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
-    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::content_text(), false, face);
+    let ch = super::metrics::lcell_h(face);
+    text_at(st, x, row_top(r) + (ROW_H - ch) / 2, CTRL_R.max(x + 1), t, ink, false, face);
 }
 
+/// A row's label (the primary ink).
+fn txt(st: &mut State, x: usize, r: usize, t: &str) {
+    txt_ink(st, x, r, t, theme::content_text());
+}
+
+/// A row's value, a section header or help text (the secondary ink).
+fn txt2(st: &mut State, x: usize, r: usize, t: &str) {
+    txt_ink(st, x, r, t, theme::ink_secondary());
+}
+
+/// The kit's push button `w` wide at the logical `(x, y)`.
+#[allow(clippy::too_many_arguments)]
+fn btn_at(st: &mut State, x: usize, y: usize, w: usize, t: &str, default: bool, focus: bool) {
+    let c = cs(st, x, y, w, BTN_H, focus);
+    draw::push_button(&mut sf(st), e(x), e(y), ew(x, w), t.as_bytes(), default, c);
+}
+
+/// A [`BTN_W`] push button in row `r` at `x`.
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
-    let face = super::text::Face::Ui; // KERNELFONT: button captions in the UI face
-    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
-    let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
-    fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::button_face());
-    fill(&mut st.surf, w, x, y, BTN_W, 1, theme::frame_line());
-    fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::frame_line());
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::button_text(), false, face);
+    btn_at(st, x, mid_y(r, BTN_H), BTN_W, t, false, false);
 }
 
+/// [`btn`] that may be the pane's default action and may hold the keyboard focus.
+fn btn_f(st: &mut State, r: usize, x: usize, t: &str, default: bool, focus: bool) {
+    btn_at(st, x, mid_y(r, BTN_H), BTN_W, t, default, focus);
+}
+
+/// The kit's text field in row `r` from the track to the controls' edge; focused, it carries the caret and the ring.
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
-    let face = super::text::Face::Body;
-    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(face));
-    fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::button_face());
-    let mut shown = String::from(t);
-    if focus { shown.push('_'); }
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 14, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::button_text(), false, face);
+    let (y, w) = (mid_y(r, FIELD_H), CTRL_R - TRACK_X);
+    let c = cs(st, TRACK_X, y, w, FIELD_H, focus);
+    draw::text_field(&mut sf(st), e(TRACK_X), e(y), ew(TRACK_X, w), t.as_bytes(), c);
 }
 
-fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
-    let w = st.w;
-    let y = TOP + r * ROW_H + ROW_H / 2;
-    fill(&mut st.surf, w, TRACK_X, y - 2, TRACK_W, 4, theme::scroll_track());
-    let kx = TRACK_X + pos * TRACK_W / max.max(1);
-    fill(&mut st.surf, w, TRACK_X, y - 2, kx - TRACK_X, 4, theme::accent());
-    fill(&mut st.surf, w, kx.saturating_sub(KNOB_W / 2), y - 9, KNOB_W, 18, theme::accent());
+/// The kit's slider over the track in row `r`. The knob's centre is the press map's point (`slider_at`): the drawn
+/// rail is the track grown by half a knob at each end.
+fn slider(st: &mut State, r: usize, pos: usize, max: usize, focus: bool) {
+    let kd = draw::DIMS.slider_knob;
+    let y = mid_y(r, kd);
+    let c = cs(st, TRACK_X, y, TRACK_W, kd, focus);
+    let k = dp(kd);
+    draw::slider(&mut sf(st), e(TRACK_X) - k / 2, e(y), ew(TRACK_X, TRACK_W) + k, pos as u32, max as u32, c);
+}
+
+/// The kit's switch in row `r` at `x`.
+fn tog(st: &mut State, r: usize, x: usize, on: bool, focus: bool) {
+    let (tw, th) = (draw::DIMS.toggle_w, draw::DIMS.toggle_h);
+    let y = mid_y(r, th);
+    let c = cs(st, x, y, tw, th, focus);
+    draw::toggle(&mut sf(st), e(x), e(y), on, c);
+}
+
+/// The kit's check box in row `r` at `x`.
+fn check(st: &mut State, r: usize, x: usize, on: bool) {
+    let b = draw::DIMS.check;
+    let y = mid_y(r, b);
+    let c = cs(st, x, y, b, b, false);
+    draw::checkbox(&mut sf(st), e(x), e(y), on, c);
+}
+
+/// The kit's segmented control over the track in row `r` (equal segments: the press map is `x / (TRACK_W / n)`).
+fn seg(st: &mut State, r: usize, labels: &[&[u8]], sel: usize, focus: bool) {
+    let h = draw::DIMS.seg_h;
+    let y = mid_y(r, h);
+    let c = cs(st, TRACK_X, y, TRACK_W, h, focus);
+    draw::segmented_w(&mut sf(st), e(TRACK_X), e(y), ew(TRACK_X, TRACK_W), labels, sel, c);
+}
+
+/// The inset grouped boxes of a pane: one per `(first row, last row)`, a hairline between its rows inset from the
+/// left (DESIGN-LANGUAGE §3.4's grouped list). Drawn first; the rows' text and controls go on top.
+fn groups(st: &mut State, g: &[(usize, usize)]) {
+    let mut s = sf(st);
+    for &(a, b) in g {
+        let (y0, y1) = (row_top(a) + GAP, row_top(b + 1) - GAP);
+        let r = Rect::new(e(BOX_X), e(y0), ew(BOX_X, BOX_W), e(y1) - e(y0));
+        draw::group_box(&mut s, r, b"");
+        let x = e(BOX_X + INSET);
+        for k in a + 1..=b {
+            draw::hairline_h(&mut s, x, e(row_top(k)), r.right() - 1 - x, Ink::argb(theme::hairline()));
+        }
+    }
+}
+
+/// A wash over row `r` inside its box (a list's selected or hovered row).
+fn row_wash(st: &mut State, r: usize) {
+    let (x, y) = (BOX_X + GAP, row_top(r) + GAP);
+    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H - 2 * GAP));
+    draw::fill_rrect(&mut sf(st), rr, dp(draw::DIMS.row_radius), Ink::argb(theme::hairline()));
+}
+
+/// An avatar disc `d` across at the logical `(x, y)` with the name's initial (the user card, the Users list).
+fn avatar(st: &mut State, x: usize, y: usize, d: usize, name: &str) {
+    draw::fill_disc(&mut sf(st), Rect::new(e(x), e(y), ew(x, d), ew(y, d)), theme::accent());
+    let one = [name.bytes().find(|b| b.is_ascii_alphanumeric()).map(|b| b.to_ascii_uppercase()).unwrap_or(b'?')];
+    let face = super::text::Face::Ui;
+    let (iw, ih) = (super::metrics::ladvance(&one, true, face), super::metrics::lcell_h(face));
+    text_at(st, x + d.saturating_sub(iw) / 2, y + d.saturating_sub(ih) / 2, x + d, core::str::from_utf8(&one).unwrap_or("?"), theme::ink_on_accent(), true, face);
+}
+
+// ── The tab icons: our own glyphs, drawn as code on a rounded tile (DESIGN-LANGUAGE §2.8, §7.3 item 1) ────────────
+
+/// A tab's tile colour: the accents table and the ink — no literal (General, About, Login Items, Trackpad and File
+/// Types the slate; Users and Display the first accent; Appearance the ink itself; Notifications the rose).
+fn icon_tile(tab: usize) -> u32 {
+    match tab {
+        1 | 2 => theme::ACCENTS[0],
+        5 => theme::content_text(),
+        8 => theme::ACCENTS[5],
+        _ => theme::ACCENTS[7],
+    }
+}
+
+/// Tab `tab`'s icon: a `t`-px rounded tile at the device `(x, y)` (in `tile`, or the tab's own colour) and its glyph
+/// in the ink drawn on a fill. Every shape is a kit primitive at a fraction of the tile, so it scales with the panel.
+fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option<u32>) {
+    use draw::{fill_circle, fill_rrect, line_aa, stroke_circle, stroke_rrect, Radii, SUB};
+    let bg = tile.unwrap_or_else(|| icon_tile(tab));
+    fill_rrect(s, Rect::new(x, y, t, t), draw::icon_radius(t as usize) as i32, bg);
+    let ink = if tab == 5 && tile.is_none() { theme::field_bg() } else { theme::ink_on_accent() };
+    let f = |n: i32| t * n / 100;
+    let (cx, cy) = (x + t / 2, y + t / 2);
+    let sw = f(10).max(1);
+    let saved = s.clip;
+    s.set_clip(saved.intersect(Rect::new(x, y, t, t)));
+    match tab {
+        0 => {
+            // General: a gear — a disc, eight teeth off the axes, a hole in the tile's colour.
+            const DIRS: [(i32, i32); 8] = [(92, 38), (38, 92), (-38, 92), (-92, 38), (-92, -38), (-38, -92), (38, -92), (92, -38)];
+            fill_circle(s, cx, cy, f(27).max(2), ink);
+            let (r1, w) = (f(36), f(15).max(1) * SUB);
+            for (dx, dy) in DIRS {
+                line_aa(s, cx * SUB, cy * SUB, cx * SUB + dx * r1 * SUB / 100, cy * SUB + dy * r1 * SUB / 100, w, ink);
+            }
+            fill_circle(s, cx, cy, f(11).max(1), bg);
+        }
+        1 => {
+            // Users: a head and shoulders.
+            fill_circle(s, cx, y + f(36), f(17).max(1), ink);
+            fill_rrect(s, Rect::new(x + f(20), y + f(60), f(60), f(40)), Radii::new(f(28), f(28), 0, 0), ink);
+        }
+        2 => {
+            // Display: a screen on a stand.
+            stroke_rrect(s, Rect::new(x + f(16), y + f(20), f(68), f(46)), f(8), sw, ink);
+            fill_rrect(s, Rect::new(cx - f(6), y + f(66), f(12).max(1), f(10).max(1)), 0, ink);
+            fill_rrect(s, Rect::new(x + f(30), y + f(74), f(40), f(8).max(1)), f(4), ink);
+        }
+        3 => {
+            // About: an "i" — a dot over a stem.
+            fill_circle(s, cx, y + f(27), f(9).max(1), ink);
+            fill_rrect(s, Rect::new(cx - f(7), y + f(42), f(14).max(2), f(36)), f(7), ink);
+        }
+        4 => {
+            // Login Items: a list — three bullets and three bars.
+            for i in 0..3 {
+                let yy = y + f(28 + 22 * i);
+                fill_circle(s, x + f(28), yy, f(6).max(1), ink);
+                fill_rrect(s, Rect::new(x + f(40), yy - f(5), f(38), f(10).max(1)), f(5), ink);
+            }
+        }
+        5 => {
+            // Appearance: a half-lit disc — the light half filled, the dark half the tile's, one ring around both.
+            let r = f(32).max(2);
+            fill_circle(s, cx, cy, r, ink);
+            s.set_clip(saved.intersect(Rect::new(cx, y, t / 2 + 1, t)));
+            fill_circle(s, cx, cy, r - sw, bg);
+            s.set_clip(saved.intersect(Rect::new(x, y, t, t)));
+            stroke_circle(s, cx, cy, r, sw, ink);
+        }
+        6 => {
+            // Trackpad: a rounded pad with its click strip.
+            let pad = Rect::new(x + f(18), y + f(22), f(64), f(56));
+            stroke_rrect(s, pad, f(12), sw, ink);
+            fill_rrect(s, Rect::new(pad.x, y + f(62), pad.w, sw), 0, ink);
+        }
+        7 => {
+            // File Types: a page with its corner turned and two lines of text.
+            fill_rrect(s, Rect::new(x + f(26), y + f(16), f(48), f(68)), Radii::new(f(6), f(22), f(6), f(6)), ink);
+            fill_rrect(s, Rect::new(x + f(34), y + f(46), f(32), sw), 0, bg);
+            fill_rrect(s, Rect::new(x + f(34), y + f(60), f(22), sw), 0, bg);
+        }
+        _ => {
+            // Notifications: a bell — the dome, the rim, the clapper, the crown.
+            fill_rrect(s, Rect::new(x + f(28), y + f(24), f(44), f(42)), Radii::new(f(22), f(22), f(4), f(4)), ink);
+            fill_rrect(s, Rect::new(x + f(20), y + f(60), f(60), f(10).max(1)), f(5), ink);
+            fill_circle(s, cx, y + f(76), f(8).max(1), ink);
+            fill_circle(s, cx, y + f(22), f(6).max(1), ink);
+        }
+    }
+    s.clip = saved;
+}
+
+// ── The column ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The column's pill top for list position `i` (with `top` the first visible).
+const fn pill_y(i: usize, top: usize) -> usize {
+    COL_PAD + (i - top) * COL_ROW + (COL_ROW - PILL_H) / 2
+}
+
+fn paint_column(st: &mut State, tab: usize) {
+    let h = st.h;
+    {
+        let mut s = sf(st);
+        draw::fill(&mut s, Rect::new(0, 0, e(COL_W), e(h)), sidebar_bg());
+        draw::hairline_v(&mut s, e(COL_W) - 1, 0, e(h), Ink::argb(theme::hairline()));
+    }
+    // The user card: who is signed in and in what role. A press opens Users.
+    let who = user_name();
+    let (name, role) = match who.as_deref() {
+        Some(n) => (String::from(n), if users_is_admin(n) { "Administrator" } else { "Standard user" }),
+        None => (String::from("No session"), "Sign in to keep settings"),
+    };
+    let cw = COL_W - 2 * PILL_X;
+    let c = cs(st, PILL_X, CARD_Y, cw, CARD_H, false);
+    if c.hover || c.pressed {
+        let r = Rect::new(e(PILL_X), e(CARD_Y), ew(PILL_X, cw), ew(CARD_Y, CARD_H));
+        draw::fill_rrect(&mut sf(st), r, dp(draw::DIMS.row_radius), Ink::argb(theme::hairline()));
+    }
+    let (ax, ay) = (PILL_X + 4, CARD_Y + (CARD_H - AVATAR) / 2);
+    avatar(st, ax, ay, AVATAR, &name);
+    let face = super::text::Face::Ui;
+    let ch = super::metrics::lcell_h(face);
+    let tx = ax + AVATAR + 10;
+    text_at(st, tx, CARD_Y + CARD_H / 2 - ch, COL_W - PILL_X, &name, theme::content_text(), true, face);
+    text_at(st, tx, CARD_Y + CARD_H / 2, COL_W - PILL_X, role, theme::ink_secondary(), false, face);
+    // The search field (a real filter over the tab names); its placeholder in the secondary ink.
+    let foc = st.search;
+    let c = cs(st, SEARCH_X, SEARCH_Y, SEARCH_W, SEARCH_H, foc);
+    let q = st.query.clone();
+    draw::text_field(&mut sf(st), e(SEARCH_X), e(SEARCH_Y), ew(SEARCH_X, SEARCH_W), q.as_bytes(), c);
+    if q.is_empty() && !foc {
+        text_at(st, SEARCH_X + draw::DIMS.field_pad_x, SEARCH_Y + (SEARCH_H - ch) / 2, SEARCH_X + SEARCH_W, "Search", theme::ink_secondary(), false, face);
+    }
+    // The tab rows: the selected one a full-width accent pill with the light ink, the hovered one washed.
+    let (list, n) = col_list(&st.query);
+    st.col_top = col_clamp(st.col_top, n);
+    let top = st.col_top;
+    for i in top..(top + COL_VIS).min(n) {
+        let k = list[i] as usize;
+        let y = pill_y(i, top);
+        let on = k == tab;
+        let state = draw::ControlState { hover: st.col_hover == Some(k), pressed: false, disabled: false, focused: on && st.strip && st.kbd };
+        {
+            let mut s = sf(st);
+            draw::sidebar_row(&mut s, e(PILL_X), e(y), ew(PILL_X, cw), b"", on, state);
+            let iy = y + (PILL_H - ICON) / 2;
+            tab_icon(&mut s, k, e(ICON_X), e(iy), ew(ICON_X, ICON), None);
+        }
+        let ink = if on { theme::ink_on_accent() } else { theme::content_text() };
+        text_at(st, COL_LABEL_X, y + (PILL_H - ch) / 2, COL_W - PILL_X, TAB_NAMES[k], ink, on, face);
+    }
+    if n == 0 {
+        text_at(st, ICON_X, pill_y(0, 0) + (PILL_H - ch) / 2, COL_W - PILL_X, "No results", theme::ink_secondary(), false, face);
+    }
+    if n > COL_VIS {
+        // The scroll thumb: where the visible rows sit in the whole column.
+        let track = h - COL_PAD - 8;
+        let (ty, th) = (COL_PAD + top * track / n, (COL_VIS * track / n).max(8));
+        let r = Rect::new(e(COL_W - 6), e(ty), ew(COL_W - 6, 3), ew(ty, th));
+        draw::fill_rrect(&mut sf(st), r, r.w / 2, Ink::argb(theme::control_edge()));
+    }
 }
 
 fn paint(st: &mut State, v: &Values) {
-    let (w, h) = (st.w, st.h);
-    for p in st.surf.iter_mut() { *p = theme::content_fill(); }
-    let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
-    let ch = super::metrics::lcell_h(face);
-    // SETTINGSTABS (B623): the tab column — one row per tab, the selected one in the accent, the hovered one lit.
+    let w = st.w;
+    st.hits.clear();
+    {
+        let mut s = sf(st);
+        let all = Rect::new(0, 0, s.w as i32, s.h as i32);
+        draw::fill(&mut s, all, theme::chrome_face());
+    }
     let tab = (v.tab as usize).min(TABS - 1);
-    st.col_top = col_scrolled(st.col_top, tab);
-    fill(&mut st.surf, w, 0, 0, COL_W - 1, h, theme::scroll_track());
-    fill(&mut st.surf, w, COL_W - 1, 0, 1, h, theme::frame_line());
-    for k in st.col_top..(st.col_top + COL_VIS).min(TABS) {
-        let y = COL_PAD + (k - st.col_top) * COL_ROW;
-        if k == tab { fill(&mut st.surf, w, 4, y, COL_W - 9, COL_ROW - 2, theme::accent()); }
-        else if st.col_hover == Some(k) { fill(&mut st.surf, w, 4, y, COL_W - 9, COL_ROW - 2, theme::button_face()); }
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), COL_W - 6, 14, y + (COL_ROW - 2 - ch) / 2, TAB_NAMES[k].as_bytes(), theme::content_text(), false, face);
-    }
-    if TABS > COL_VIS { // the scroll thumb: where the visible rows sit in the whole column
-        let track = h - 2 * COL_PAD;
-        fill(&mut st.surf, w, COL_W - 5, COL_PAD + st.col_top * track / TABS, 2, (COL_VIS * track / TABS).max(8), theme::frame_line());
-    }
-    if st.strip { fill(&mut st.surf, w, 0, 0, 3, h, theme::accent()); } // column focus
-    // The pane's title band: the tab's name as its heading.
-    let hf = super::text::Face::Body;
-    let hc = super::metrics::lcell_h(hf);
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, LABEL_X, (PANE_Y - hc) / 2, TAB_NAMES[tab].as_bytes(), theme::content_text(), false, hf);
-    fill(&mut st.surf, w, PANE_X, PANE_Y - 2, PANE_W, 1, theme::frame_line());
+    paint_column(st, tab);
+    // The pane's title band: the tab's name in the title face, bold (DESIGN-LANGUAGE §3.4: the pane title).
+    let tf = super::text::Face::Chrome;
+    let tc = super::metrics::lcell_h(tf);
+    text_at(st, BOX_X, (PANE_Y - tc) / 2, w, TAB_NAMES[tab], theme::content_text(), true, tf);
     match v.tab {
         0 => paint_general(st, v),
         1 => paint_users(st),
@@ -509,112 +854,122 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == NP_TAB => paint_notifypane(st), // NOTIFYPANE (B435)
         _ => paint_about(st),
     }
-    // SETTINGSFILES (B407, R98): the pane's file, as a link that reveals `<home>/settings` in Quarry.
-    if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, WIN_W, LABEL_X) {
-        let fc = super::metrics::lcell_h(face);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, x, TOP + r * ROW_H + (ROW_H - fc) / 2, t.as_bytes(), theme::accent(), false, face);
+    // SETTINGSFILES (B407, R98): the pane's file, as a link (the accent ink) that reveals `<home>/settings` in Quarry.
+    if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, CTRL_R, LABEL_X) {
+        txt_ink(st, x, r, &t, theme::accent());
     }
-    if !st.strip && matches!(v.tab, 0 | 2) {
-        let r = row_of(st.sel);
-        fill(&mut st.surf, w, PANE_X + 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent());
-        if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + BTN_W + 10, TOP + 4 * ROW_H + ROW_H - 8, BTN_W, 2, theme::accent()); }
-    }
+    st.hot = hit_at(&st.hits, st.ptr);
 }
 
 fn paint_general(st: &mut State, v: &Values) {
-    let (w, h, ch) = (st.w, st.h, super::metrics::lcell_h(super::text::Face::Body));
-    let face = super::text::Face::Body;
-    // BRIGHTFLOOR M5: Brightness moved to the Display tab; every General row moved up one.
+    // BRIGHTFLOOR M5: Brightness moved to the Display tab. SETTINGSCRAFT: Sound · Desktop · Account · Dock, four boxes.
+    groups(st, &[(0, 1), (2, 4), (5, 5), (6, 7)]);
+    let (k, sel) = (st.kbd && !st.strip, st.sel);
+    let fo = move |i: usize| k && sel == i;
     txt(st, LABEL_X, 0, "Volume");
-    slider(st, 0, v.vol as usize, 16);
-    txt(st, VAL_X, 0, &alloc::format!("{}/16", v.vol));
+    slider(st, 0, v.vol as usize, 16, fo(1));
+    txt2(st, VAL_X, 0, &alloc::format!("{}/16", v.vol));
     txt(st, LABEL_X, 1, "Mute");
-    fill(&mut st.surf, w, TRACK_X, TOP + ROW_H + 8, 24, 24, theme::scroll_track());
-    if v.mute { fill(&mut st.surf, w, TRACK_X + 4, TOP + ROW_H + 12, 16, 16, theme::accent()); }
-    txt(st, VAL_X, 1, if v.mute { "muted" } else { "sound on" });
+    tog(st, 1, TOG_X, v.mute, fo(2));
     txt(st, LABEL_X, 2, "Pointer");
-    let _ = (h, ch, face, PTR_NAMES); btn(st, 2, TRACK_X, "Trackpad"); txt(st, TRACK_X + BTN_W + 12, 2, &alloc::format!("speed {}/10", TPV.lock().speed)); // TRACKPADPANE (B412): the R75 3-step became the Trackpad tab's speed slider
+    btn_f(st, 2, TRACK_X, "Trackpad", false, fo(4)); // TRACKPADPANE (B412): the R75 3-step became the Trackpad tab's speed slider
+    txt2(st, TRACK_X + BTN_W + 12, 2, &alloc::format!("speed {}/10", TPV.lock().speed));
     txt(st, LABEL_X, 3, "Wallpaper");
     let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
     field(st, 3, &wall, focus);
-    btn(st, 4, TRACK_X, "Apply");
-    btn(st, 4, TRACK_X + BTN_W + 10, "Off");
+    btn_f(st, 4, TRACK_X, "Apply", false, fo(6));
+    btn_f(st, 4, TRACK_X + BTN_W + 10, "Off", false, fo(7));
     txt(st, LABEL_X, 5, "Account");
     let who = user_name().unwrap_or_else(|| String::from("(no session)"));
-    txt(st, TRACK_X, 5, &who);
-    btn(st, 5, VAL_X - 30, "Password");
+    txt2(st, TRACK_X, 5, &who);
+    btn_f(st, 5, VAL_X - 30, "Password", false, fo(8));
     paint_dock_rows(st); // NOTIFYPANE (B435): Do Not Disturb moved to the Notifications tab. DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
 }
 
 fn paint_display(st: &mut State, v: &Values) {
+    groups(st, &[(0, 1), (2, 3), (4, 7), (8, 8)]);
+    let (k, sel) = (st.kbd && !st.strip, st.sel);
+    let fo = move |i: usize| k && sel == i;
     // BRIGHTFLOOR M5: Brightness lives here (row 0) — where Peter looked for it on flight 19.
     txt(st, LABEL_X, 0, "Brightness");
     // BRIGHTSLIDER M2 (B377): the knob and the % are the REGISTER's (its last readback), never the window's copy.
     let (braw, bmax) = (crate::video::backlight::cur_raw(), crate::video::backlight::panel_range());
     PAINTED_RAW.store(braw, Ordering::Relaxed);
-    slider(st, 0, braw.min(bmax) as usize, bmax as usize);
-    txt(st, VAL_X, 0, &alloc::format!("{}%", crate::video::backlight::pct_of(braw, bmax)));
+    slider(st, 0, braw.min(bmax) as usize, bmax as usize, fo(0));
+    txt2(st, VAL_X, 0, &alloc::format!("{}%", crate::video::backlight::pct_of(braw, bmax)));
     txt(st, LABEL_X, 1, "Blank screen");
-    slider(st, 1, idle_index(v.idle_min), IDLE_STEPS.len() - 1);
+    slider(st, 1, idle_index(v.idle_min), IDLE_STEPS.len() - 1, fo(3));
     let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
-    txt(st, VAL_X, 1, &it);
-    txt(st, LABEL_X, 2, "Resolution"); // PREFSUI (R93): the dropdown of the modes the display path can set (was the read-only UI scale row)
+    txt2(st, VAL_X, 1, &it);
+    txt(st, LABEL_X, 2, "Resolution"); // PREFSUI (R93): the popup of the modes the display path can set (was the read-only UI scale row)
     mode_field(st);
-    txt(st, LABEL_X, 3, "Menubar clock");
-    txt(st, TRACK_X, 3, "24h - fixed, no runtime switch");
-    // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments (the
-    // Pointer row's shape) and the size as - / + — writing Principia's `system.display.font` / `font_size`
-    // (`video::text` follows them within a second and every window repaints once); the faces drawing now and a
-    // sample line IN the UI face below.
-    let (w, h) = (st.w, st.h);
-    let face = super::text::Face::Ui;
-    let ch = super::metrics::lcell_h(face);
+    txt(st, LABEL_X, 3, "Menu bar clock");
+    txt2(st, TRACK_X, 3, "24-hour (fixed: no runtime switch)");
+    // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments and the
+    // size as - / + — writing Principia's `system.display.font` / `font_size` (`video::text` follows them within a
+    // second and every window repaints once); the faces drawing now and a sample line IN the UI face below.
     txt(st, LABEL_X, 4, "Font");
     let (fam, size) = (font_fam(), font_size());
-    let seg = TRACK_W / 3;
-    for k in 0..3usize {
-        let c = if k == fam { theme::accent() } else { theme::scroll_track() };
-        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 4 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, FONT_FAMS[k].as_bytes(), theme::content_text(), false, face);
-    }
-    txt(st, VAL_X, 4, &super::text::face_name(face));
+    seg(st, 4, &[FONT_FAMS[0].as_bytes(), FONT_FAMS[1].as_bytes(), FONT_FAMS[2].as_bytes()], fam, fo(9));
+    txt2(st, VAL_X, 4, &super::text::face_name(super::text::Face::Ui));
     txt(st, LABEL_X, 5, "Font size");
-    btn(st, 5, TRACK_X, "  -");
-    btn(st, 5, TRACK_X + BTN_W + 10, "  +");
-    txt(st, TRACK_X + 2 * BTN_W + 24, 5, &alloc::format!("{} px", size));
+    btn_f(st, 5, TRACK_X, "-", false, fo(10));
+    btn_f(st, 5, TRACK_X + BTN_W + 10, "+", false, fo(10));
+    txt2(st, TRACK_X + 2 * BTN_W + 24, 5, &alloc::format!("{} px", size));
     txt(st, LABEL_X, 6, "Console");
     let (cw, chh) = super::text::grid_cell();
     let s2 = super::dpi::scale_x2();
-    txt(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
-    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w - 12, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, SAMPLE.as_bytes(), theme::content_text(), false, face);
-    if !st.strip && st.sel == 10 { fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + ROW_H - 8, 2 * BTN_W + 10, 2, theme::accent()); }
-    if st.modes_open { mode_list(st); } // PREFSUI: the open dropdown paints over the rows below it
+    txt2(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
+    txt(st, LABEL_X, 7, "Sample");
+    txt(st, TRACK_X, 7, SAMPLE);
+    if st.modes_open { mode_list(st); } // PREFSUI: the open popup paints over the rows below it
 }
 
 /// KERNELFONT M3: the Display tab's sample line.
 pub const SAMPLE: &str = "The quick brown fox jumps over the lazy dog 0123456789";
 
+/// About: one centred card — the mark, the name, the version, then the facts as `label: value` around the centre.
 fn paint_about(st: &mut State) {
     let ver = option_env!("UNAOS_GIT_SHA").unwrap_or("dev build");
-    txt(st, LABEL_X, 0, "Version");
-    txt(st, TRACK_X, 0, ver);
-    txt(st, LABEL_X, 1, "Board");
-    txt(st, TRACK_X, 1, if cfg!(target_arch = "x86_64") { "x86_64 (UEFI)" } else { "aarch64" });
-    txt(st, LABEL_X, 2, "CPUs");
+    let (y0, y1) = (row_top(0) + GAP, row_top(9) - GAP);
+    let mark = 64;
+    let cx = PANE_X + PANE_W / 2;
+    {
+        let mut s = sf(st);
+        draw::group_box(&mut s, Rect::new(e(BOX_X), e(y0), ew(BOX_X, BOX_W), e(y1) - e(y0)), b"");
+        tab_icon(&mut s, 3, e(cx - mark / 2), e(y0 + 24), ew(cx - mark / 2, mark), Some(theme::accent()));
+    }
+    let (tf, uf) = (super::text::Face::Chrome, super::text::Face::Ui);
+    let (tc, uc) = (super::metrics::lcell_h(tf), super::metrics::lcell_h(uf));
+    let mut y = y0 + 24 + mark + 12;
+    let tw = super::metrics::ladvance(b"UnaOS", true, tf);
+    text_at(st, cx - tw / 2, y, CTRL_R, "UnaOS", theme::content_text(), true, tf);
+    y += tc + 4;
+    let vw = super::metrics::ladvance(ver.as_bytes(), false, uf);
+    text_at(st, cx.saturating_sub(vw / 2).max(LABEL_X), y, CTRL_R, ver, theme::ink_secondary(), false, uf);
+    y += uc + 20;
     #[cfg(target_arch = "x86_64")]
     let cpus = alloc::format!("{}", crate::arch::x86_64::acpi::cpu_count());
     #[cfg(not(target_arch = "x86_64"))]
     let cpus = String::from("n/a");
-    txt(st, TRACK_X, 2, &cpus);
-    txt(st, LABEL_X, 3, "Memory");
     let (a, b) = crate::allocator::heap_bounds();
-    txt(st, TRACK_X, 3, &alloc::format!("{} MiB kernel heap", b.saturating_sub(a) >> 20));
-    txt(st, LABEL_X, 4, "Uptime");
+    let mem = alloc::format!("{} MiB kernel heap", b.saturating_sub(a) >> 20);
     let up = crate::clock::uptime_secs().map(|u| alloc::format!("{}h {}m {}s", u / 3600, (u / 60) % 60, u % 60)).unwrap_or_else(|| String::from("n/a"));
-    txt(st, TRACK_X, 4, &up);
-    txt(st, LABEL_X, 5, "Safe mode");
-    txt(st, TRACK_X, 5, "hold Shift after login: display prefs reset");
-    txt(st, TRACK_X, 6, "(or boot an UNAOS_PREFS_RESET=1 image)");
+    let board = if cfg!(target_arch = "x86_64") { "x86_64 (UEFI)" } else { "aarch64" };
+    let facts: [(&str, &str); 6] = [
+        ("Board", board),
+        ("CPUs", &cpus),
+        ("Memory", &mem),
+        ("Uptime", &up),
+        ("Safe mode", "hold Shift after login: display prefs reset"),
+        ("", "(or boot an UNAOS_PREFS_RESET=1 image)"),
+    ];
+    for (k, val) in facts {
+        let kw = super::metrics::ladvance(k.as_bytes(), false, uf);
+        text_at(st, (cx - 8).saturating_sub(kw), y, cx, k, theme::ink_secondary(), false, uf);
+        text_at(st, cx + 8, y, CTRL_R, val, theme::content_text(), false, uf);
+        y += uc + 10;
+    }
 }
 
 // ── Users tab (M2) ────────────────────────────────────────────────────────────────────────────
@@ -724,7 +1079,8 @@ fn paint_users(st: &mut State) {
     let root = is_root();
     let me = user_name().unwrap_or_default();
     if st.u.form {
-        txt(st, LABEL_X, 0, "New user");
+        txt2(st, LABEL_X, 0, "New user");
+        groups(st, &[(1, 3)]);
         txt(st, LABEL_X, 1, "Name");
         let (n, f) = (st.u.name.clone(), st.u.focus == 0);
         field(st, 1, &n, f);
@@ -734,23 +1090,33 @@ fn paint_users(st: &mut State) {
         txt(st, LABEL_X, 3, "Retype");
         let (p, f) = ("*".repeat(st.u.pw2.len()), st.u.focus == 2);
         field(st, 3, &p, f);
-        btn(st, 4, TRACK_X, "Create");
+        btn_f(st, 4, TRACK_X, "Create", true, false);
         btn(st, 4, TRACK_X + BTN_W + 10, "Cancel");
-        let role = if st.u.admin { "Admin: yes" } else { "Admin: no" };
-        btn(st, 4, TRACK_X + 2 * (BTN_W + 10), role); // FIRSTUSER (R100): admin or standard — Settings > Users is the one place
+        // FIRSTUSER (R100): admin or standard — Settings > Users is the one place. SETTINGSCRAFT: a check box and its
+        // label inside the old button's press span.
+        let ax = TRACK_X + 2 * (BTN_W + 10);
+        let adm = st.u.admin;
+        check(st, 4, ax, adm);
+        txt(st, ax + draw::DIMS.check + 8, 4, "Admin");
     } else {
-        txt(st, LABEL_X, 0, &alloc::format!("Users ({})", list.len()));
-        if root { btn(st, 0, TRACK_X, "Add user"); } else { txt(st, TRACK_X, 0, "(only an administrator can change the list)"); }
+        txt2(st, LABEL_X, 0, &alloc::format!("Users ({})", list.len()));
+        if root { btn(st, 0, TRACK_X, "Add user"); } else { txt2(st, TRACK_X, 0, "Only an administrator can change the list."); }
+        let shown = list.len().min(8);
+        if shown > 0 { groups(st, &[(1, shown)]); }
         let sel = st.u.sel.min(list.len().saturating_sub(1));
+        let face = super::text::Face::Ui;
         for (i, (nm, unset)) in list.iter().enumerate().take(8) {
             let r = 1 + i;
             let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else if users_is_admin(nm) { " (admin)" } else { "" };
-            let w = st.w;
-            if i == sel { fill(&mut st.surf, w, PANE_X + 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent()); }
-            txt(st, LABEL_X, r, &alloc::format!("{}{}", nm, tag));
+            if i == sel && !st.strip { row_wash(st, r); }
+            let d = 24;
+            avatar(st, LABEL_X, mid_y(r, d), d, nm);
+            let ch = super::metrics::lcell_h(face);
+            let pen = text_at(st, LABEL_X + d + 10, row_top(r) + (ROW_H - ch) / 2, TRACK_X - 8, nm, theme::content_text(), false, face);
+            if !tag.is_empty() { text_at(st, pen, row_top(r) + (ROW_H - ch) / 2, TRACK_X - 8, tag, theme::ink_secondary(), false, face); }
             if st.u.confirm.as_deref() == Some(nm.as_str()) {
-                txt(st, TRACK_X + 130, r, "delete?");
-                btn(st, r, TRACK_X + 200, "Yes");
+                txt2(st, TRACK_X + 130, r, "Delete?");
+                btn_f(st, r, TRACK_X + 200, "Yes", true, false);
                 btn(st, r, TRACK_X + 200 + BTN_W + 6, "No");
             } else if root {
                 btn(st, r, TRACK_X, if *nm == me { "Password" } else { "Reset" });
@@ -761,7 +1127,7 @@ fn paint_users(st: &mut State) {
         }
     }
     let m = st.u.msg.clone();
-    txt(st, LABEL_X, 9, &m);
+    txt2(st, LABEL_X, 9, &m);
 }
 
 fn users_form_submit() {
@@ -840,7 +1206,8 @@ pub fn open() -> Result<(), String> {
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
     let tab0 = CUR.lock().tab as usize;
     let (sel0, strip0) = take_at(tab0); // LAUNCHER (B417): a launcher pick opens on its row
-    let mut st = State { sel: sel0, strip: strip0, col_top: col_scrolled(0, tab0), col_hover: None, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
+    let mut st = State::new(w, h, surf, sel0, strip0, col_scrolled(0, tab0, TABS));
+    LAST_PTR.store(u64::MAX, Ordering::Relaxed); // SETTINGSCRAFT: the hover pass reads the pointer afresh over the new window
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
@@ -882,7 +1249,10 @@ fn switch_tab(t: usize) {
     if let Some(st) = STATE.lock().as_mut() {
         st.u = UsersUi::new();
         st.strip = true;
+        st.modes_open = false;
         if let Some(&c) = tab_ctrls(t).first() { st.sel = c; }
+        let (list, n) = col_list(&st.query); // SETTINGSCRAFT: the chosen row is kept in view of the (filtered) column
+        if let Some(p) = list[..n].iter().position(|&k| k as usize == t) { st.col_top = col_scrolled(st.col_top, p, n); }
     }
     serial_println!("[settings] tab={}", TAB_NAMES[t]);
     if t == FT_TAB { crate::fs::assoc::owe_view(); } // FILETYPES (B423): the pane's rows are read on the service pass
@@ -894,46 +1264,139 @@ fn cur_tab() -> usize { CUR.lock().tab as usize }
 
 // ── SETTINGSTABS (rmbp-ledger B623, R118) — the tab column ────────────────────────────────────────────────────────
 // "settings tabs typically go on the left since there get to be a lot of them." Rows are `COL_ROW` tall from `COL_PAD`;
-// `COL_VIS` show at once and the column scrolls so the selected tab stays in view. Pure helpers, shared by the paint,
-// the press router and the fixture.
+// `COL_VIS` show at once and the column scrolls. SETTINGSCRAFT (B630): the column lists the tabs whose name holds the
+// search text ([`col_list`]); positions below are positions in THAT list. Pure helpers, shared by the paint, the press
+// router, the wheel and the fixture.
 
-/// The column's first visible row so that tab `sel` is in view, starting from `top`.
-fn col_scrolled(top: usize, sel: usize) -> usize {
-    let top = if sel < top { sel } else if sel >= top + COL_VIS { sel + 1 - COL_VIS } else { top };
-    top.min(TABS.saturating_sub(COL_VIS))
+/// Does tab name `name` hold `q` (ASCII case-insensitive; the empty query holds everywhere)?
+fn name_matches(name: &str, q: &str) -> bool {
+    q.is_empty() || name.as_bytes().windows(q.len()).any(|w| w.eq_ignore_ascii_case(q.as_bytes()))
 }
 
-/// The tab under logical `cy` in the column whose first visible row is `top` (`None` = the inset or past the last).
-fn col_tab_at(cy: usize, top: usize) -> Option<usize> {
+/// The tabs the column lists for the search text `q`, in column order, and how many.
+fn col_list(q: &str) -> ([u8; TABS], usize) {
+    let mut out = [0u8; TABS];
+    let mut n = 0;
+    for (k, name) in TAB_NAMES.iter().enumerate() {
+        if name_matches(name, q) { out[n] = k as u8; n += 1; }
+    }
+    (out, n)
+}
+
+/// The first visible row held to a list of `n`.
+fn col_clamp(top: usize, n: usize) -> usize {
+    top.min(n.saturating_sub(COL_VIS))
+}
+
+/// The column's first visible row so that list position `pos` is in view, starting from `top`.
+fn col_scrolled(top: usize, pos: usize, n: usize) -> usize {
+    let top = if pos < top { pos } else if pos >= top + COL_VIS { pos + 1 - COL_VIS } else { top };
+    col_clamp(top, n)
+}
+
+/// The tab under logical `cy` in a column listing `list[..n]` from row `top` (`None` = the inset or past the last).
+fn col_tab_at(cy: usize, top: usize, list: &[u8; TABS], n: usize) -> Option<usize> {
     if cy < COL_PAD { return None; }
     let r = (cy - COL_PAD) / COL_ROW;
-    let t = top + r;
-    (r < COL_VIS && t < TABS).then_some(t)
+    let i = top + r;
+    (r < COL_VIS && i < n).then(|| list[i] as usize)
 }
 
-/// Pointer motion over the window: light the column row under it. Never consumes. The motion router owes the call
-/// (`quarry/live.rs`, beside `settings::press_route`) — until it is wired the column lights on press only.
-#[allow(dead_code)]
+/// The last pointer position the hover pass read (`x << 32 | y`; `u64::MAX` = read it afresh).
+static LAST_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Pointer motion over the window: light the column row and the control under it, and repaint only when either
+/// changed. Never consumes. SETTINGSCRAFT: called by [`hover_poll`] on the desktop's service pass (the motion itself
+/// is routed in `arch/x86_64/syscall.rs`, which this arc does not touch; the dock's hover reads the cursor the same way).
 pub fn hover_route(x: i32, y: i32) -> bool {
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE { return false; }
     let Some(info) = wm::info(id) else { return false };
     let inside = x >= info.x as i32 && y >= info.y as i32 && matches!(wm::hit_test(x, y), Some((w, _, _)) if w == id);
-    let hov = if inside {
+    let p = if inside {
         let sc = info.scale.max(1);
-        let (cx, cy) = (super::metrics::to_logical((x as usize - info.x) / sc), super::metrics::to_logical((y as usize - info.y) / sc));
-        let top = STATE.lock().as_ref().map(|s| s.col_top).unwrap_or(0);
-        if cx < COL_W { col_tab_at(cy, top) } else { None }
+        Some((super::metrics::to_logical((x as usize - info.x) / sc), super::metrics::to_logical((y as usize - info.y) / sc)))
     } else { None };
-    let changed = STATE.lock().as_mut().map(|s| core::mem::replace(&mut s.col_hover, hov) != hov).unwrap_or(false);
+    let changed = {
+        let mut g = STATE.lock();
+        let Some(s) = g.as_mut() else { return false };
+        let (list, n) = col_list(&s.query);
+        let col = p.and_then(|(cx, cy)| if cx < COL_W { col_tab_at(cy, s.col_top, &list, n) } else { None });
+        let hot = hit_at(&s.hits, p);
+        s.ptr = p;
+        let c = s.col_hover != col || s.hot != hot;
+        s.col_hover = col;
+        s.hot = hot;
+        c
+    };
     if changed { repaint(); }
     false
+}
+
+/// SETTINGSCRAFT: the hover and pressed-face pass, chained beside [`service`] from `quarry::live::service` (one line
+/// there). Ends a press's pressed face after [`PRESS_MS`]; reads the cursor and, when it moved, asks [`hover_route`].
+/// A closed window costs one load.
+pub fn hover_poll() {
+    if !is_open() { return; }
+    let now = crate::arch::ms();
+    let done = STATE.lock().as_mut().is_some_and(|s| match s.press {
+        Some((_, _, t)) if now.saturating_sub(t) >= PRESS_MS => { s.press = None; true }
+        _ => false,
+    });
+    if done { repaint(); }
+    let Some(i) = crate::video::panel_info_nonblocking() else { return };
+    let (x, y) = crate::pal::cursor::pos(i.width as i32, i.height as i32);
+    let k = ((x as u32 as u64) << 32) | y as u32 as u64;
+    if LAST_PTR.swap(k, Ordering::Relaxed) == k { return; }
+    hover_route(x, y);
+}
+
+/// SETTINGSCRAFT: a wheel detent over the window (`pal::Event::Wheel`, reaching [`key_route`] first in
+/// `quarry::live::key_route`'s chain — scroll-under-pointer, never focus-gated, as QSCROLL rules). Over the column it
+/// scrolls the rows (positive = away = toward the top, QSCROLL's sign); over the File Types pane it pages. `true` when
+/// the pointer is over this window (consumed), `false` otherwise (the event falls through untouched).
+fn wheel(d: i8) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE || d == 0 { return false; }
+    let Some(i) = crate::video::panel_info_nonblocking() else { return false };
+    let (x, y) = crate::pal::cursor::pos(i.width as i32, i.height as i32);
+    match wm::hit_test(x, y) {
+        Some((w, _, _)) if w == id => {}
+        _ => return false,
+    }
+    let Some(info) = wm::info(id) else { return true };
+    if x < info.x as i32 || y < info.y as i32 { return true; }
+    let cx = super::metrics::to_logical((x as usize - info.x) / info.scale.max(1));
+    let step = d.unsigned_abs() as usize;
+    let (area, moved) = if cx < COL_W {
+        let mut g = STATE.lock();
+        let Some(s) = g.as_mut() else { return true };
+        let n = col_list(&s.query).1;
+        let top = s.col_top;
+        let next = col_clamp(if d > 0 { top.saturating_sub(step) } else { top + step }, n);
+        s.col_top = next;
+        ("column", next != top)
+    } else if cur_tab() == FT_TAB {
+        let pages = crate::fs::assoc::view().len().div_ceil(FT_ROWS).max(1);
+        let page = FT_PAGE.load(Ordering::Relaxed).min(pages - 1);
+        let next = if d > 0 { page.saturating_sub(step) } else { (page + step).min(pages - 1) };
+        FT_PAGE.store(next, Ordering::Relaxed);
+        ("pane", next != page)
+    } else {
+        ("pane", false)
+    };
+    serial_println!("[settings] wheel area={} d={} moved={}", area, d, moved as u8);
+    if moved { repaint(); }
+    true
 }
 
 /// Keys and actions, only while this window holds focus. `true` when consumed.
 pub fn key_route(ev: crate::pal::Event) -> bool {
     use crate::video::keymap::Action;
+    if let crate::pal::Event::Wheel(d) = ev { return wheel(d); } // SETTINGSCRAFT: the wheel goes by the pointer, not the focus
     if !is_open() || wm::focus_asid() != OWNER { return false; }
+    let searching = STATE.lock().as_mut().map(|x| { x.kbd = true; x.search }).unwrap_or(false); // SETTINGSCRAFT: a key shows the focus ring
+    if searching { return search_key(ev); }
     let (s, strip) = STATE.lock().as_ref().map(|x| (x.sel, x.strip)).unwrap_or((0, true));
     let tab = cur_tab();
     let form = tab == 1 && STATE.lock().as_ref().map(|x| x.u.form).unwrap_or(false);
@@ -955,7 +1418,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                 0x1E => {
                     // Up: previous control; from the first one, the tab column. SETTINGSTABS: on the column, the previous tab.
                     if strip {
-                        if tab > 0 { switch_tab(tab - 1); }
+                        strip_step(tab, false);
                     } else if tab == 1 {
                         let mut g = STATE.lock();
                         if let Some(x) = g.as_mut() { if x.strip { } else if x.u.sel > 0 { x.u.sel -= 1; } else { x.strip = true; } }
@@ -967,7 +1430,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                     }
                     true
                 }
-                0x1F if strip => { if tab + 1 < TABS { switch_tab(tab + 1); } true } // SETTINGSTABS: Down on the column, the next tab
+                0x1F if strip => { strip_step(tab, true); true } // SETTINGSTABS: Down on the column, the next tab (SETTINGSCRAFT: of those the search lists)
                 0x09 if !strip => { if let Some(x) = STATE.lock().as_mut() { x.strip = true; } repaint(); true } // SETTINGSTABS: Tab, pane -> column
                 0x1F | 0x09 => {
                     if tab == 1 {
@@ -1001,6 +1464,52 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         }
         _ => false,
     }
+}
+
+/// SETTINGSCRAFT: Up / Down on the column — the previous / next tab the (filtered) column lists; Up from the first
+/// row takes the search field.
+fn strip_step(tab: usize, down: bool) {
+    let q = STATE.lock().as_ref().map(|x| x.query.clone()).unwrap_or_default();
+    let (list, n) = col_list(&q);
+    let pos = list[..n].iter().position(|&k| k as usize == tab);
+    let next = match (pos, down) {
+        (None, _) => list[..n].first().copied(),
+        (Some(p), true) => list[..n].get(p + 1).copied(),
+        (Some(0), false) => { if let Some(x) = STATE.lock().as_mut() { x.search = true; } repaint(); return; }
+        (Some(p), false) => Some(list[p - 1]),
+    };
+    if let Some(k) = next { switch_tab(k as usize); }
+}
+
+/// SETTINGSCRAFT: a key while the search field holds the keys — type to filter, Backspace, Enter opens the first
+/// match, Esc clears and leaves, Down leaves to the column. Every key is consumed (the field has the keyboard).
+fn search_key(ev: crate::pal::Event) -> bool {
+    let crate::pal::Event::Key(c) = ev else { return true };
+    let mut pick = None;
+    {
+        let mut g = STATE.lock();
+        let Some(x) = g.as_mut() else { return true };
+        match c {
+            0x08 | 0x7F => { x.query.pop(); }
+            0x1B => { x.query.clear(); x.search = false; }
+            0x0A | 0x0D | 0x1F => {
+                let (list, n) = col_list(&x.query);
+                x.search = false;
+                x.strip = true;
+                if n > 0 { pick = Some(list[0] as usize); }
+                x.col_top = 0;
+            }
+            0x20..=0x7e => { if x.query.len() < 24 { x.query.push(c as char); x.col_top = 0; } }
+            _ => {}
+        }
+    }
+    let q = STATE.lock().as_ref().map(|x| x.query.clone()).unwrap_or_default();
+    serial_println!("[settings] search q={} matches={}", q, col_list(&q).1);
+    match pick {
+        Some(t) if t != cur_tab() => switch_tab(t),
+        _ => repaint(),
+    }
+    true
 }
 
 fn users_key_name() -> Option<String> {
@@ -1064,15 +1573,25 @@ pub fn press_route(x: i32, y: i32) -> bool {
     let lw = super::metrics::to_logical(info.w);
     if cx >= lw || cy >= super::metrics::to_logical(info.h) { return false; }
     wm::focus_changed(OWNER);
+    // SETTINGSCRAFT: the press shows its control's pressed face for PRESS_MS (the action's own repaint draws it); a
+    // press anywhere but the search field takes the keys back from it; the focus ring hides until the next key.
+    let in_search = cx >= SEARCH_X && cx < SEARCH_X + SEARCH_W && cy >= SEARCH_Y && cy < SEARCH_Y + SEARCH_H;
+    let (top, query) = match STATE.lock().as_mut() {
+        Some(s) => { s.press = Some((cx, cy, crate::arch::ms().max(1))); s.kbd = false; s.search = in_search; (s.col_top, s.query.clone()) }
+        None => return true,
+    };
     if cx < COL_W { // SETTINGSTABS (B623): a press in the column selects by row
-        let top = STATE.lock().as_ref().map(|s| s.col_top).unwrap_or(0);
-        let Some(t) = col_tab_at(cy, top) else { return true };
+        if in_search { repaint(); return true; }
+        if cy < CARD_Y + CARD_H { if cur_tab() != 1 { switch_tab(1); } else { repaint(); } return true; } // the user card opens Users
+        let (list, n) = col_list(&query);
+        let Some(t) = col_tab_at(cy, top, &list, n) else { repaint(); return true };
         if t != cur_tab() { switch_tab(t); } else { if let Some(st) = STATE.lock().as_mut() { st.strip = true; } repaint(); }
         return true;
     }
-    if cy < TOP { return true; }
+    if cy < TOP { repaint(); return true; }
     let row = (cy - TOP) / ROW_H;
-    if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, WIN_W, LABEL_X) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link
+    if row >= ROWS { repaint(); return true; }
+    if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, CTRL_R, LABEL_X) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link
     match cur_tab() {
         0 => press_general(row, cx),
         1 => press_users(row, cx),
@@ -1098,7 +1617,7 @@ fn press_general(row: usize, cx: usize) {
     // BRIGHTFLOOR M5: rows moved up one (Brightness is on the Display tab).
     match row {
         0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); drag_begin(1, cx); } // PREFSUI (R93): press-and-drag
-        1 => { select(2); if cx >= TRACK_X && cx < TRACK_X + 24 { let m = CUR.lock().mute; set(2, (!m) as usize); } }
+        1 => { select(2); if cx >= TOG_X && cx < TOG_X + draw::DIMS.toggle_w { let m = CUR.lock().mute; set(2, (!m) as usize); } } // SETTINGSCRAFT: the switch, right-aligned
         2 => { if cx >= TRACK_X && cx < TRACK_X + BTN_W { switch_tab(TP_TAB); } } // TRACKPADPANE (B412): the Trackpad tab holds the speed now
         3 => select(5),
         4 => {
@@ -1177,10 +1696,94 @@ pub fn selftest() {
     set(3, idle_index(before.idle_min));
     if opened { close(); }
     // SETTINGSTABS (B623): every tab's column row maps back to that tab, and the pane starts right of the column.
-    let col_ok = PANE_X == COL_W && WIN_W == COL_W + PANE_W && (0..TABS).all(|k| { let t = col_scrolled(0, k); col_tab_at(COL_PAD + (k - t) * COL_ROW + COL_ROW / 2, t) == Some(k) });
-    let ok = saved && same && live && col_ok;
-    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={} store={} tabs=left col_w={} sel={} col_ok={}", opened as u8, saved, same as u8, live as u8, crate::prefs::path(), COL_W, TAB_NAMES[(CUR.lock().tab as usize).min(TABS - 1)], col_ok as u8);
+    // SETTINGSCRAFT (B630): ... and the search filters the column by name.
+    let (all, n_all) = col_list("");
+    let (disp, n_disp) = col_list("DISP");
+    let col_ok = PANE_X == COL_W && WIN_W == COL_W + PANE_W && n_all == TABS && n_disp == 1 && disp[0] == 2 && col_list("zzz").1 == 0
+        && (0..TABS).all(|k| { let t = col_scrolled(0, k, TABS); col_tab_at(COL_PAD + (k - t) * COL_ROW + COL_ROW / 2, t, &all, TABS) == Some(k) });
+    let craft = craft_check();
+    let ok = saved && same && live && col_ok && craft.is_ok();
+    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={} store={} tabs=left col_w={} sel={} col_ok={} craft={} win={}x{}", opened as u8, saved, same as u8, live as u8, crate::prefs::path(), COL_W, TAB_NAMES[(CUR.lock().tab as usize).min(TABS - 1)], col_ok as u8, craft.err().unwrap_or("ok"), WIN_W, WIN_H);
     witness(ok);
+}
+
+/// SETTINGSCRAFT (B630) — `craft=`: paint the General pane OFFSCREEN in the Light set and again in the Dark set (the
+/// live set, accent and highlight restored after), and read the pixels back:
+/// * **icons** — every tab row's tile is a rounded tile (its corner pixel is not the tile's colour) with a glyph on it
+///   (inside it, both the tile's colour and other ink);
+/// * **hairline** — the first group box's top edge is the hairline over the box's fill, the window's face above it and
+///   the box's fill below it; the separator between its rows is the hairline from the row inset and the fill left of it;
+/// * **round** — the box's and the selected pill's corner pixels are the ground under them: no bare 1-px-bordered
+///   rectangle (the old raw boxes had a square, inked corner);
+/// * **sets** — the column differs from the pane in both sets and the pane's face differs between them.
+///
+/// `Ok` or the first failing check's name (`-light` / `-dark` appended).
+#[cfg(feature = "witness")]
+fn craft_check() -> Result<(), &'static str> {
+    let (dark0, acc0, hl0) = (theme::is_dark(), theme::accent_index(), theme::highlight_index());
+    let mut face = [0u32; 2];
+    let mut r = Ok(());
+    for (i, dark) in [false, true].into_iter().enumerate() {
+        theme::set(dark, acc0, hl0);
+        match craft_probe() {
+            Ok(f) => face[i] = f,
+            Err(e) => { r = Err(if dark { craft_dark(e) } else { e }); break; }
+        }
+    }
+    theme::set(dark0, acc0, hl0);
+    if r.is_ok() && face[0] == face[1] { r = Err("sets"); }
+    r
+}
+
+#[cfg(feature = "witness")]
+fn craft_dark(e: &'static str) -> &'static str {
+    match e {
+        "icons" => "icons-dark",
+        "hairline" => "hairline-dark",
+        "round" => "round-dark",
+        "sets" => "sets-dark",
+        x => x,
+    }
+}
+
+/// One set's probe: the General pane painted into a fresh surface; returns the pane's face.
+#[cfg(feature = "witness")]
+fn craft_probe() -> Result<u32, &'static str> {
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let mut surf: Vec<u32> = Vec::new();
+    if surf.try_reserve_exact(pw * ph).is_err() { return Err("oom"); }
+    surf.resize(pw * ph, 0);
+    let mut st = State::new(WIN_W, WIN_H, surf, 1, true, 0);
+    let mut v = CUR.lock().clone();
+    v.tab = 0;
+    paint(&mut st, &v);
+    let px = |x: i32, y: i32| -> u32 { if x < 0 || y < 0 { return u32::MAX; } st.surf.get(y as usize * pw + x as usize).map_or(u32::MAX, |p| p & 0x00FF_FFFF) };
+    let (face, sb, fill) = (theme::chrome_face(), sidebar_bg(), theme::group_fill());
+    let hair = draw::blend(fill, theme::content_text(), theme::HAIRLINE_ALPHA);
+    if sb == face { return Err("sets"); }
+    // icons
+    for k in 0..TABS {
+        let iy = pill_y(k, 0) + (PILL_H - ICON) / 2;
+        let (x0, y0, t) = (e(ICON_X), e(iy), ew(ICON_X, ICON));
+        let tile = icon_tile(k);
+        if px(x0, y0) == tile { return Err("icons"); }
+        let (mut on, mut ink) = (0, 0);
+        for yy in y0 + 1..y0 + t - 1 {
+            for xx in x0 + 1..x0 + t - 1 {
+                if px(xx, yy) == tile { on += 1; } else { ink += 1; }
+            }
+        }
+        if on < 4 || ink < 3 { return Err("icons"); }
+    }
+    // hairline: the Sound box (rows 0-1) — its top edge, and the separator between its rows
+    let (bx, by) = (e(BOX_X), e(row_top(0) + GAP));
+    let mx = e(BOX_X + BOX_W / 2);
+    if px(mx, by) != hair || px(mx, by - 1) != face || px(mx, by + 1) != fill { return Err("hairline"); }
+    let sy = e(row_top(1));
+    if px(e(LABEL_X) + 2, sy) != hair || px(bx + 2, sy) != fill { return Err("hairline"); }
+    // round: the box's corner and the selected (General) pill's corner are the ground under them
+    if px(bx, by) != face || px(e(PILL_X), e(pill_y(0, 0))) != sb { return Err("round"); }
+    Ok(face)
 }
 
 /// SETTINGS-USERS — the Users tab's ops against the real table: list, add `tmpuser`, delete it, and the refusals
@@ -1596,6 +2199,8 @@ const LI_UP_X: usize = PANE_X + 230;
 const LI_DOWN_X: usize = LI_UP_X + BTN_W + 10;
 const LI_DEL_X: usize = LI_DOWN_X + BTN_W + 10;
 const LI_ADD_ROW: usize = 9;
+/// The Add row's "previous" button (the chooser's `<`).
+const LI_PREV_X: usize = PANE_X + 80;
 
 /// The installed programs not yet in the list (the Add chooser's choices).
 fn li_candidates() -> Vec<&'static str> {
@@ -1605,23 +2210,24 @@ fn li_candidates() -> Vec<&'static str> {
 
 fn paint_login(st: &mut State) {
     let l = super::loginitems::items();
-    txt(st, LABEL_X, 0, &alloc::format!("Open at login ({}), in this order:", l.len()));
-    if l.is_empty() { txt(st, LABEL_X + 12, 1, "None - nothing opens itself at login."); }
+    txt2(st, LABEL_X, 0, &alloc::format!("Open at login ({}), in this order:", l.len()));
+    groups(st, &[(1, l.len().clamp(1, LI_ROWS)), (LI_ADD_ROW, LI_ADD_ROW)]);
+    if l.is_empty() { txt2(st, LABEL_X, 1, "None: nothing opens itself at login."); }
     for (k, n) in l.iter().take(LI_ROWS).enumerate() {
-        txt(st, LABEL_X + 12, 1 + k, n);
+        txt(st, LABEL_X, 1 + k, n);
         btn(st, 1 + k, LI_UP_X, "Up");
         btn(st, 1 + k, LI_DOWN_X, "Down");
         btn(st, 1 + k, LI_DEL_X, "Remove");
     }
-    if l.len() > LI_ROWS { txt(st, LABEL_X + 12, 1 + LI_ROWS, &alloc::format!("+{} more", l.len() - LI_ROWS)); }
+    if l.len() > LI_ROWS { txt2(st, LABEL_X, 1 + LI_ROWS, &alloc::format!("+{} more", l.len() - LI_ROWS)); }
     let c = li_candidates();
     txt(st, LABEL_X, LI_ADD_ROW, "Add");
-    if c.is_empty() { txt(st, TRACK_X, LI_ADD_ROW, "every program is in the list"); return; }
+    if c.is_empty() { txt2(st, TRACK_X, LI_ADD_ROW, "Every program is in the list."); return; }
     let i = st.li_add % c.len();
-    btn(st, LI_ADD_ROW, TRACK_X - 70, "  <");
+    btn(st, LI_ADD_ROW, LI_PREV_X, "<");
     txt(st, LI_UP_X - 70, LI_ADD_ROW, c[i]);
-    btn(st, LI_ADD_ROW, LI_DOWN_X, "  >");
-    btn(st, LI_ADD_ROW, LI_DEL_X, "Add");
+    btn(st, LI_ADD_ROW, LI_DOWN_X, ">");
+    btn_f(st, LI_ADD_ROW, LI_DEL_X, "Add", true, false);
 }
 
 fn press_login(row: usize, cx: usize) {
@@ -1637,7 +2243,7 @@ fn press_login(row: usize, cx: usize) {
         let mut g = STATE.lock();
         let Some(st) = g.as_mut() else { return };
         let i = st.li_add % c.len();
-        if in_b(TRACK_X - 70) { st.li_add = (i + c.len() - 1) % c.len(); }
+        if in_b(LI_PREV_X) { st.li_add = (i + c.len() - 1) % c.len(); }
         else if in_b(LI_DOWN_X) { st.li_add = (i + 1) % c.len(); }
         else if in_b(LI_DEL_X) { drop(g); super::loginitems::edit("add", c[i], "settings"); }
     } else { return; }
@@ -1672,29 +2278,56 @@ fn mode_caption(m: &prefs_core::modes::Mode) -> String {
     alloc::format!("{} ({}x)", m.label(), super::dpi::scale_str(m.s2))
 }
 
-/// The closed dropdown: the current entry and a `v`.
+/// The closed popup: the kit's button across the row with the current entry and a chevron; the panel's own mode below.
 fn mode_field(st: &mut State) {
     let ms = display_modes();
-    let w = st.w;
-    fill(&mut st.surf, w, TRACK_X, TOP + 2 * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::button_face());
+    let (y, w) = (mid_y(2, BTN_H), CTRL_R - TRACK_X);
+    let c = cs(st, TRACK_X, y, w, BTN_H, false);
+    {
+        let mut s = sf(st);
+        draw::push_button(&mut s, e(TRACK_X), e(y), ew(TRACK_X, w), b"", false, c);
+        // The chevron: two strokes, down.
+        let (cx, cy, a) = (e(CTRL_R - 14), e(y + BTN_H / 2), dp(4));
+        let sw = dp(2).max(1) * draw::SUB * 3 / 4;
+        let ink = theme::ink_secondary();
+        draw::line_aa(&mut s, (cx - a) * draw::SUB, (cy - a / 2) * draw::SUB, cx * draw::SUB, (cy + a / 2) * draw::SUB, sw, ink);
+        draw::line_aa(&mut s, cx * draw::SUB, (cy + a / 2) * draw::SUB, (cx + a) * draw::SUB, (cy - a / 2) * draw::SUB, sw, ink);
+    }
     let t = match ms.get(mode_cur(&ms)) { Some(m) => mode_caption(m), None => String::from("panel busy") };
-    txt(st, TRACK_X + 6, 2, &t);
-    txt(st, w - 30, 2, "v");
+    txt(st, TRACK_X + 10, 2, &t);
     // PREFSUI M6 (seat): the panel's own mode, said once, so no one reads a scale choice as the panel changing.
     txt(st, LABEL_X, 8, "Panel");
     let native = match ms.first() { Some(m) => alloc::format!("{}x{} native (a choice above is a scale)", m.w, m.h), None => String::from("panel busy") };
-    txt(st, TRACK_X, 8, &native);
+    txt2(st, TRACK_X, 8, &native);
 }
 
-/// The open dropdown: one row per entry under the field, the current one in the accent.
+/// The open popup: a raised overlay under the field (shadowed, rounded, hairline-edged), one row per entry, the
+/// current one an accent pill, the hovered one washed.
 fn mode_list(st: &mut State) {
     let ms = display_modes();
-    let (w, cur) = (st.w, mode_cur(&ms));
-    for (k, m) in ms.iter().enumerate().take(ROWS - 3) {
-        let y = TOP + (3 + k) * ROW_H;
-        fill(&mut st.surf, w, TRACK_X, y, w - TRACK_X - 12, ROW_H, theme::frame_line());
-        fill(&mut st.surf, w, TRACK_X + 1, y + 1, w - TRACK_X - 14, ROW_H - 2, if k == cur { theme::accent() } else { theme::button_face() });
-        txt(st, TRACK_X + 6, 3 + k, &mode_caption(m));
+    let cur = mode_cur(&ms);
+    let n = ms.len().min(ROWS - 3);
+    if n == 0 { return; }
+    let (x, y, w) = (TRACK_X, row_top(3), CTRL_R - TRACK_X);
+    {
+        let mut s = sf(st);
+        let r = Rect::new(e(x), e(y), ew(x, w), ew(y, n * ROW_H));
+        let rad = dp(draw::DIMS.group_radius);
+        draw::shadow_rrect(&mut s, r.offset(0, dp(2)), rad, dp(12), theme::shadow_window());
+        draw::fill_rrect(&mut s, r, rad, theme::group_fill());
+        draw::stroke_rrect(&mut s, r, rad, 1, Ink::argb(theme::control_edge()));
+    }
+    for (k, m) in ms.iter().enumerate().take(n) {
+        let ry = row_top(3 + k);
+        let c = cs(st, x, ry, w, ROW_H, false);
+        let on = k == cur;
+        if on || c.hover {
+            let (px, py) = (x + 6, ry + 6);
+            let r = Rect::new(e(px), e(py), ew(px, w - 12), ew(py, ROW_H - 12));
+            let ink = if on { Ink::solid(theme::accent()) } else { Ink::argb(theme::hairline()) };
+            draw::fill_rrect(&mut sf(st), r, dp(draw::DIMS.row_radius), ink);
+        }
+        txt_ink(st, x + 14, 3 + k, &mode_caption(m), if on { theme::ink_on_accent() } else { theme::content_text() });
     }
 }
 
@@ -1776,22 +2409,11 @@ pub fn selftest_prefsui() {
 const DOCK_POS_NAMES: [&str; 3] = ["Bottom", "Left", "Right"];
 
 fn paint_dock_rows(st: &mut State) {
-    let (w, h) = (st.w, st.h);
-    let face = super::text::Face::Body;
-    let ch = super::metrics::lcell_h(face);
-    txt(st, LABEL_X, 6, "Dock");
-    let seg = TRACK_W / 3;
+    txt(st, LABEL_X, 6, "Dock position");
     let p = super::dock::position() as usize;
-    for k in 0..3usize {
-        let c = if k == p { theme::accent() } else { theme::scroll_track() };
-        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 6 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + 6 * ROW_H + (ROW_H - ch) / 2, DOCK_POS_NAMES[k].as_bytes(), theme::content_text(), false, face);
-    }
-    txt(st, LABEL_X, 7, "Auto-hide dock");
-    fill(&mut st.surf, w, TRACK_X, TOP + 7 * ROW_H + 8, 24, 24, theme::scroll_track());
-    let on = super::dock::autohide();
-    if on { fill(&mut st.surf, w, TRACK_X + 4, TOP + 7 * ROW_H + 12, 16, 16, theme::accent()); }
-    txt(st, VAL_X, 7, if on { "on" } else { "off" });
+    seg(st, 6, &[DOCK_POS_NAMES[0].as_bytes(), DOCK_POS_NAMES[1].as_bytes(), DOCK_POS_NAMES[2].as_bytes()], p, false);
+    txt(st, LABEL_X, 7, "Automatically hide the dock");
+    tog(st, 7, TOG_X, super::dock::autohide(), false);
 }
 
 fn dock_rows_press(row: usize, cx: usize) {
@@ -1800,7 +2422,7 @@ fn dock_rows_press(row: usize, cx: usize) {
         let p = ["bottom", "left", "right"][k];
         let ok = super::dock::set_position(p, true);
         say("dock_position", p, ok);
-    } else if row == 7 && cx >= TRACK_X && cx < TRACK_X + 24 {
+    } else if row == 7 && cx >= TOG_X && cx < TOG_X + draw::DIMS.toggle_w { // SETTINGSCRAFT: the switch, right-aligned
         let on = !super::dock::autohide();
         super::dock::set_autohide(on, true);
         say("dock_autohide", if on { "1" } else { "0" }, true);
@@ -1828,41 +2450,48 @@ const AP_MODES: [&str; 3] = ["Light", "Dark", "Auto"];
 const SW: usize = 20;
 const SW_PITCH: usize = 26;
 
+/// A colour swatch: a disc with a hairline edge; the chosen one ringed in the ink, a hovered one in the control edge.
 fn swatch(st: &mut State, r: usize, k: usize, c: u32, on: bool) {
-    let w = st.w;
-    let (x, y) = (TRACK_X + k * SW_PITCH, TOP + r * ROW_H + (ROW_H - SW) / 2);
-    if on { fill(&mut st.surf, w, x - 3, y - 3, SW + 6, SW + 6, theme::content_text()); fill(&mut st.surf, w, x - 1, y - 1, SW + 2, SW + 2, theme::content_fill()); }
-    fill(&mut st.surf, w, x, y, SW, SW, c);
+    let (x, y) = (TRACK_X + k * SW_PITCH, mid_y(r, SW));
+    let state = cs(st, x, y, SW, SW, false);
+    let mut s = sf(st);
+    let rad = ew(x, SW) / 2;
+    let (cx, cy) = (e(x) + rad, e(y) + rad);
+    if on {
+        draw::stroke_circle(&mut s, cx, cy, rad + dp(3), dp(2).max(1), theme::content_text());
+    } else if state.hover {
+        draw::stroke_circle(&mut s, cx, cy, rad + dp(3), dp(1).max(1), Ink::argb(theme::control_edge()));
+    }
+    draw::fill_circle(&mut s, cx, cy, rad, c);
+    draw::stroke_circle(&mut s, cx, cy, rad, 1, Ink::argb(theme::hairline()));
 }
 
 fn paint_appearance(st: &mut State) {
     use prefs_core::appearance as ap;
-    let (w, h) = (st.w, st.h);
-    let face = super::text::Face::Body;
-    let ch = super::metrics::lcell_h(face);
+    groups(st, &[(0, 0), (2, 4)]);
     let m = super::appearance::mode().index();
     txt(st, LABEL_X, 0, "Appearance");
-    let seg = TRACK_W / 3;
-    for k in 0..3usize {
-        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 6, seg - 2, ROW_H - 12, if k == m { theme::accent() } else { theme::scroll_track() });
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, TRACK_X + k * seg + 8, TOP + (ROW_H - ch) / 2, AP_MODES[k].as_bytes(), theme::content_text(), false, face);
-    }
-    txt(st, VAL_X, 0, if theme::is_dark() { "dark now" } else { "light now" });
+    seg(st, 0, &[AP_MODES[0].as_bytes(), AP_MODES[1].as_bytes(), AP_MODES[2].as_bytes()], m, false);
+    txt2(st, VAL_X, 0, if theme::is_dark() { "Dark now" } else { "Light now" });
     let clock = match super::appearance::local_hour() { Some(hr) => alloc::format!("now {:02}h", hr), None => String::from("no clock: light") };
-    txt(st, LABEL_X + 12, 1, &alloc::format!("Auto = dark {:02}:00-{:02}:00 by the RTC until NETCLOCK sets the time ({})", ap::AUTO_DARK_FROM, ap::AUTO_DARK_UNTIL, clock));
+    txt2(st, LABEL_X, 1, &alloc::format!("Auto = dark {:02}:00-{:02}:00 by the RTC until NETCLOCK sets the time ({})", ap::AUTO_DARK_FROM, ap::AUTO_DARK_UNTIL, clock));
     txt(st, LABEL_X, 2, "Accent colour");
     let a = super::appearance::accent_ix();
     for k in 0..theme::ACCENTS.len() { swatch(st, 2, k, theme::ACCENTS[k], k == a); }
-    txt(st, VAL_X, 2, ap::ACCENTS[a.min(7)]);
+    txt2(st, VAL_X, 2, ap::ACCENTS[a.min(7)]);
     txt(st, LABEL_X, 3, "Highlight colour");
     let hr = super::appearance::highlight_raw();
     for k in 0..ap::HIGHLIGHTS.len() { swatch(st, 3, k, if k == 0 { theme::ACCENTS[a.min(7)] } else { theme::ACCENTS[k - 1] }, k == hr); }
-    txt(st, VAL_X, 3, super::appearance::highlight_name());
-    let sx = TRACK_X;
-    fill(&mut st.surf, w, sx, TOP + 4 * ROW_H + 8, TRACK_W, ROW_H - 16, theme::selection());
-    txt(st, sx + 6, 4, "Selected text looks like this");
-    txt(st, LABEL_X, 5, "The accent marks the default button, the selection, the focus ring,");
-    txt(st, LABEL_X, 6, "the slider knob and the menu highlight; the highlight is text selection.");
+    txt2(st, VAL_X, 3, super::appearance::highlight_name());
+    txt(st, LABEL_X, 4, "Selection");
+    {
+        let y = row_top(4) + 10;
+        let r = Rect::new(e(TRACK_X), e(y), ew(TRACK_X, TRACK_W), ew(y, ROW_H - 20));
+        draw::fill_rrect(&mut sf(st), r, dp(draw::DIMS.row_radius), theme::selection());
+    }
+    txt(st, TRACK_X + 8, 4, "Selected text looks like this");
+    txt2(st, LABEL_X, 5, "The accent marks the default button, the selection, the focus ring,");
+    txt2(st, LABEL_X, 6, "the slider knob and the menu highlight; the highlight is text selection.");
 }
 
 fn press_appearance(row: usize, cx: usize) {
@@ -1986,22 +2615,19 @@ fn tp_service() {
 
 fn paint_trackpad(st: &mut State) {
     let v = *TPV.lock();
-    let w = st.w;
+    groups(st, &[(0, 4)]);
     txt(st, LABEL_X, 0, "Tracking speed");
-    slider(st, 0, (v.speed - 1) as usize, 9);
+    slider(st, 0, (v.speed - 1) as usize, 9, false);
     let g = prefs_core::trackpad::gain8(v.speed);
-    txt(st, VAL_X, 0, &alloc::format!("{}/10 x{}.{:02}", v.speed, g / 8, g % 8 * 100 / 8));
+    txt2(st, VAL_X, 0, &alloc::format!("{}/10 x{}.{:02}", v.speed, g / 8, g % 8 * 100 / 8));
     let on = [v.tap, v.natural, v.secondary, v.three];
     for (k, &b) in on.iter().enumerate() {
         let r = 1 + k;
         txt(st, LABEL_X, r, TP_ROW_NAMES[k]);
-        let bx = TRACK_X + 110;
-        fill(&mut st.surf, w, bx, TOP + r * ROW_H + 8, 24, 24, theme::scroll_track());
-        if b { fill(&mut st.surf, w, bx + 4, TOP + r * ROW_H + 12, 16, 16, theme::accent()); }
-        txt(st, bx + 36, r, if b { "on" } else { "off" });
+        tog(st, r, TOG_X, b, false); // SETTINGSCRAFT: the kit's switch, right-aligned (a press anywhere on the row flips it)
     }
-    txt(st, LABEL_X, 5, if tp_live().is_some() { "Applied live to the internal trackpad." } else { "No Wellspring trackpad path on this build; stored only." });
-    txt(st, LABEL_X, 6, "Speed scales the pointer curve; its shape stays as flown.");
+    txt2(st, LABEL_X, 5, if tp_live().is_some() { "Applied live to the internal trackpad." } else { "No Wellspring trackpad path on this build; stored only." });
+    txt2(st, LABEL_X, 6, "Speed scales the pointer curve; its shape stays as flown.");
 }
 
 /// A press on the Trackpad tab: the speed slider captures; a toggle box (or its label) flips.
@@ -2167,48 +2793,41 @@ const NP_STEP_W: usize = 28;
 /// Row 1's -/+ boxes: from-, from+, until-, until+ (x of each box).
 const NP_STEPS: [usize; 4] = [TRACK_X, TRACK_X + 90, TRACK_X + 150, TRACK_X + 240];
 
-fn np_box(st: &mut State, r: usize, x: usize, on: bool) {
-    fill(&mut st.surf, st.w, x, TOP + r * ROW_H + 8, 24, 24, theme::scroll_track());
-    if on { fill(&mut st.surf, st.w, x + 4, TOP + r * ROW_H + 12, 16, 16, theme::accent()); }
-}
-
-fn np_step(st: &mut State, x: usize, t: &str) {
-    fill(&mut st.surf, st.w, x, TOP + ROW_H + 8, NP_STEP_W, 24, theme::button_face());
-    txt(st, x + 10, 1, t);
-}
-
 fn paint_notifypane(st: &mut State) {
     let np = super::notifypane::window();
     let dnd = super::notify::dnd();
+    let rows = super::notifypane::rows();
+    let shown = rows.len().min(NP_APP_ROWS);
+    if shown > 0 { groups(st, &[(0, 1), (NP_ROW0, NP_ROW0 + shown - 1)]); } else { groups(st, &[(0, 1)]); }
     txt(st, LABEL_X, 0, "Do Not Disturb");
-    np_box(st, 0, TRACK_X, dnd);
+    tog(st, 0, TOG_X, dnd, false);
     let sched = super::notifypane::in_window_now();
-    txt(st, TRACK_X + 36, 0, if dnd { "on" } else if sched { "on (scheduled)" } else { "off" });
+    txt2(st, TRACK_X, 0, if dnd { "On" } else if sched { "On (scheduled)" } else { "Off" });
     txt(st, LABEL_X, 1, "Scheduled");
-    for (k, x) in NP_STEPS.iter().enumerate() { np_step(st, *x, if k % 2 == 0 { "-" } else { "+" }); }
+    let sy = mid_y(1, BTN_H);
+    for (k, x) in NP_STEPS.iter().enumerate() { btn_at(st, *x, sy, NP_STEP_W, if k % 2 == 0 { "-" } else { "+" }, false, false); }
     txt(st, NP_STEPS[0] + NP_STEP_W + 8, 1, &alloc::format!("{:02}:00", np.0));
     txt(st, NP_STEPS[2] + NP_STEP_W + 8, 1, &alloc::format!("{:02}:00", np.1));
-    txt(st, NP_STEPS[3] + NP_STEP_W + 12, 1, if np.0 == np.1 { "no schedule (from = until)" } else { "quiet in this window" });
-    txt(st, LABEL_X, 2, "App");
-    txt(st, NP_ALLOW_X - 4, 2, "Allow");
-    txt(st, NP_STYLE_X, 2, "Style");
-    txt(st, NP_SOUND_X - 4, 2, "Sound");
-    let rows = super::notifypane::rows();
-    if rows.is_empty() { txt(st, LABEL_X, NP_ROW0, "No app has posted a notification yet."); }
+    txt2(st, NP_STEPS[3] + NP_STEP_W + 12, 1, if np.0 == np.1 { "no schedule" } else { "quiet hours" });
+    txt2(st, LABEL_X, 2, "App");
+    txt2(st, NP_ALLOW_X - 8, 2, "Allow");
+    txt2(st, NP_STYLE_X, 2, "Style");
+    txt2(st, NP_SOUND_X - 8, 2, "Sound");
+    if rows.is_empty() { txt2(st, LABEL_X, NP_ROW0, "No app has posted a notification yet."); }
     for (k, (name, r)) in rows.iter().take(NP_APP_ROWS).enumerate() {
         let row = NP_ROW0 + k;
         txt(st, LABEL_X, row, name);
-        np_box(st, row, NP_ALLOW_X, r.allow);
+        check(st, row, NP_ALLOW_X, r.allow);
         btn(st, row, NP_STYLE_X, if r.center { "Center" } else { "Banner" });
-        np_box(st, row, NP_SOUND_X, r.sound);
+        check(st, row, NP_SOUND_X, r.sound);
     }
-    if rows.len() > NP_APP_ROWS { txt(st, NP_SOUND_X + 40, NP_ROW0 + NP_APP_ROWS - 1, &alloc::format!("+{} more", rows.len() - NP_APP_ROWS)); }
+    if rows.len() > NP_APP_ROWS { txt2(st, NP_SOUND_X + 40, NP_ROW0 + NP_APP_ROWS - 1, &alloc::format!("+{} more", rows.len() - NP_APP_ROWS)); }
 }
 
 fn press_notifypane(row: usize, cx: usize) {
     let on_box = |x: usize| cx >= x && cx < x + 24;
     match row {
-        0 if on_box(TRACK_X) => {
+        0 if cx >= TOG_X && cx < TOG_X + draw::DIMS.toggle_w => { // SETTINGSCRAFT: the switch, right-aligned
             let on = !super::notify::dnd();
             super::notify::set_dnd(on, true);
             say("notify_dnd", if on { "1" } else { "0" }, true);
@@ -2247,18 +2866,31 @@ static FT_PAGE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 fn paint_filetypes(st: &mut State) {
     let v = crate::fs::assoc::view();
     let preferred = v.iter().filter(|r| !r.preferred.is_empty()).count();
-    txt(st, LABEL_X, 0, &alloc::format!("File types ({}, {} with an app). Click a type to change its app:", v.len(), preferred));
-    if v.is_empty() { crate::fs::assoc::owe_view(); txt(st, LABEL_X + 12, 1, "Reading /system/filetypes ..."); return; }
+    txt2(st, LABEL_X, 0, &alloc::format!("File types ({}, {} with an app). Click a type to change its app:", v.len(), preferred));
+    if v.is_empty() { crate::fs::assoc::owe_view(); txt2(st, LABEL_X, 1, "Reading /system/filetypes ..."); return; }
     let pages = v.len().div_ceil(FT_ROWS).max(1);
     let page = FT_PAGE.load(Ordering::Relaxed).min(pages - 1);
+    let shown = v.len().saturating_sub(page * FT_ROWS).min(FT_ROWS);
+    groups(st, &[(1, shown.max(1))]);
+    let face = super::text::Face::Ui;
+    let ch = super::metrics::lcell_h(face);
+    let app_x = CTRL_R - 140;
     for (k, r) in v.iter().skip(page * FT_ROWS).take(FT_ROWS).enumerate() {
+        let row = 1 + k;
+        // A type's row is one press target (it hands the type to its next app): it lights under the pointer.
+        let c = cs(st, BOX_X, row_top(row), BOX_W, ROW_H, false);
+        if c.hover || c.pressed { row_wash(st, row); }
+        let t = 20;
+        tab_icon(&mut sf(st), FT_TAB, e(LABEL_X), e(mid_y(row, t)), ew(LABEL_X, t), None);
         let app = if r.preferred.is_empty() { String::from("(no app)") } else { r.preferred_name.clone() };
         let ext = if r.extensions.is_empty() { String::new() } else { alloc::format!(" .{}", r.extensions.replace(", ", " .")) };
-        txt(st, LABEL_X, 1 + k, &alloc::format!("[{}] {} - {}{}", r.icon, r.description, r.mime, ext));
-        txt(st, WIN_W - 150, 1 + k, &alloc::format!("{} ({})", app, r.registrants));
+        let ty = row_top(row) + (ROW_H - ch) / 2;
+        let pen = text_at(st, LABEL_X + t + 10, ty, app_x - 8, &r.description, theme::content_text(), false, face);
+        text_at(st, pen + 8, ty, app_x - 8, &alloc::format!("{}{}", r.mime, ext), theme::ink_secondary(), false, face);
+        text_at(st, app_x, ty, CTRL_R, &alloc::format!("{} ({})", app, r.registrants), theme::ink_secondary(), false, face);
     }
-    btn(st, FT_NAV_ROW, FT_PREV_X, "  < Prev");
-    txt(st, FT_PREV_X + BTN_W + 14, FT_NAV_ROW, &alloc::format!("{}/{}", page + 1, pages));
+    btn(st, FT_NAV_ROW, FT_PREV_X, "< Prev");
+    txt2(st, FT_PREV_X + BTN_W + 14, FT_NAV_ROW, &alloc::format!("{}/{}", page + 1, pages));
     btn(st, FT_NAV_ROW, FT_NEXT_X, "Next >");
 }
 

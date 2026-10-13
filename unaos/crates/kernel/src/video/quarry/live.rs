@@ -2899,7 +2899,7 @@ pub fn service() {
     }
     {
         let _s = lr::stamp(lr::W_Q_SETTINGS);
-        crate::video::settings::service();
+        crate::video::settings::service(); crate::video::settings::hover_poll(); // SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
     }
     {
         let _s = lr::stamp(lr::W_Q_FONT);

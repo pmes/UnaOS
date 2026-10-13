@@ -963,6 +963,14 @@ pub fn push_button(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], default: b
 pub fn segmented(s: &mut Surf, x: i32, y: i32, labels: &[&[u8]], sel: usize, st: ControlState) -> Rect {
     let n = labels.len().max(1) as i32;
     let sw = labels.iter().map(|l| label_w(l, false)).max().unwrap_or(0) + 2 * d(DIMS.seg_pad_x);
+    segmented_w(s, x, y, sw * n, labels, sel, st)
+}
+
+/// SETTINGSCRAFT (B630): [`segmented`] `w` device px wide, split into equal segments — for a window whose press
+/// router already maps `x / (w / n)` to a segment, so the painted segments and the hit segments are one geometry.
+pub fn segmented_w(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel: usize, st: ControlState) -> Rect {
+    let n = labels.len().max(1) as i32;
+    let sw = w / n;
     let r = Rect::new(x, y, sw * n, d(DIMS.seg_h));
     let (rad, a, i) = (d(DIMS.seg_radius), st.alpha(), d(DIMS.seg_inset));
     let well = theme::control_track();
