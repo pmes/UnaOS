@@ -664,37 +664,60 @@ pub fn set_password(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
     if password.is_empty() {
         return Err(UsersError::Refused);
     }
-    let mut t = TABLE.lock();
-    if !t.loaded {
-        return Err(UsersError::Volume);
-    }
-    let Some(i) = (0..t.count as usize).find(|&i| t.rows[i].name() == name) else {
-        return Err(UsersError::Refused);
-    };
-    let iters = calibrated_iters(&mut t);
-    if iters < PBKDF2_ITERS_MIN {
-        serial_println!("[users] kdf REFUSED iters={} floor={} (a credential is never written below the floor)", iters, PBKDF2_ITERS_MIN);
-        return Err(UsersError::WeakKdf);
-    }
-    let first = t.rows[i].kdf == KDF_UNSET;
-    let saved = t.rows[i];
-    let mut r = saved;
-    r.salt = new_salt(name, t.seq);
-    r.kdf = KDF_PBKDF2;
-    r.iters = iters;
-    r.hash = password_hash(&r, password);
-    t.rows[i] = r;
-    match flush(&mut t) {
-        Ok(()) => {
-            serial_println!("[users] password set user={} first={} (LOGIN14/R65: chosen at the keyboard, never on the line or the wire)", wire_name(name), first);
-            Ok(())
+    // KVMLAT2 (B578): the KDF runs OUTSIDE `TABLE`. Flight image-26's KVM boot held this lock 357 ms
+    // (`[lock] held-too-long name=users.rs:364 at=users.rs:667`, serial.log 760; `kdf_ms=271`, 773) across the
+    // calibration and the PBKDF2 stretch, and every `TABLE` reader (the login screen's painter, `whoami`) waited
+    // behind it. Now: snapshot the row, the store's `seq` and the calibrated count under the lock; drop it;
+    // calibrate (first use this boot) and hash; re-take it and publish ONLY if `seq` is unchanged — every write
+    // to the table goes through `flush`/`flush_unafs`, which advance `seq` before anything else, so an unchanged
+    // `seq` proves no row moved, was added, deleted or re-keyed meanwhile. A changed `seq` re-reads and hashes
+    // again (bounded: `SETPW_TRIES`), then refuses `Volume` rather than publish over a store it did not read.
+    for _ in 0..SETPW_TRIES {
+        let (i, saved, seq, cached) = {
+            let t = TABLE.lock();
+            if !t.loaded {
+                return Err(UsersError::Volume);
+            }
+            let Some(i) = (0..t.count as usize).find(|&i| t.rows[i].name() == name) else {
+                return Err(UsersError::Refused);
+            };
+            (i, t.rows[i], t.seq, t.kdf_iters)
+        };
+        let iters = if cached != 0 { cached } else { kdf_measure() };
+        if iters < PBKDF2_ITERS_MIN {
+            serial_println!("[users] kdf REFUSED iters={} floor={} (a credential is never written below the floor)", iters, PBKDF2_ITERS_MIN);
+            return Err(UsersError::WeakKdf);
         }
-        Err(e) => {
-            t.rows[i] = saved;
-            Err(e)
+        let first = saved.kdf == KDF_UNSET;
+        let mut r = saved;
+        r.salt = new_salt(name, seq);
+        r.kdf = KDF_PBKDF2;
+        r.iters = iters;
+        r.hash = password_hash(&r, password);
+        let mut t = TABLE.lock();
+        if t.kdf_iters == 0 {
+            t.kdf_iters = iters; // the measurement this call made off the lock is the boot's count
         }
+        if !t.loaded || t.seq != seq || i >= t.count as usize || t.rows[i].name() != name {
+            serial_println!("[users] password set retry user={} seq={}->{} (KVMLAT2: the store moved while the KDF ran off the lock)", wire_name(name), seq, t.seq);
+            continue;
+        }
+        t.rows[i] = r;
+        return match flush(&mut t) {
+            Ok(()) => {
+                serial_println!("[users] password set user={} first={} (LOGIN14/R65: chosen at the keyboard, never on the line or the wire)", wire_name(name), first);
+                Ok(())
+            }
+            Err(e) => {
+                t.rows[i] = saved;
+                Err(e)
+            }
+        };
     }
+    Err(UsersError::Volume)
 }
+/// KVMLAT2 (B578): how many times `set_password` re-hashes when the store moved under its off-lock KDF.
+const SETPW_TRIES: usize = 3;
 
 /// LOGIN14: the set-password SCREEN's entry — refused unless the row's password is unset, so the screen
 /// (which anyone at the glass can reach) can only ever CHOOSE a first password, never change one.
@@ -1486,6 +1509,13 @@ fn calibrated_iters(t: &mut Table) -> u32 {
     if t.kdf_iters != 0 {
         return t.kdf_iters;
     }
+    let iters = kdf_measure();
+    t.kdf_iters = iters;
+    iters
+}
+/// The calibration itself, with no lock held (KVMLAT2 B578: `set_password` measures off `TABLE`; the other
+/// callers reach it through [`calibrated_iters`], unchanged). Said once per measurement on the wire.
+fn kdf_measure() -> u32 {
     let mut probe = PBKDF2_CAL_PROBE;
     let mut ms;
     loop {
@@ -1500,7 +1530,6 @@ fn calibrated_iters(t: &mut Table) -> u32 {
     }
     let scaled = (probe as u64).saturating_mul(PBKDF2_TARGET_MS) / core::cmp::max(ms, 1);
     let iters = scaled.clamp(PBKDF2_ITERS_MIN as u64, PBKDF2_ITERS_MAX as u64) as u32;
-    t.kdf_iters = iters;
     serial_println!("[users] kdf calibrated iters={} ms={} (probe={} took {} ms; target {} ms; floor {})", iters, PBKDF2_TARGET_MS, probe, ms, PBKDF2_TARGET_MS, PBKDF2_ITERS_MIN);
     iters
 }
