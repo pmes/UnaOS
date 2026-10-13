@@ -69,9 +69,9 @@ pub fn stamp() {
     if PUMP_TID.load(Relaxed) == 0 {
         if let Some(t) = crate::arch::sched::current_id() {
             PUMP_TID.store(t, Relaxed);
-            PUMP_CPU.store(crate::arch::percpu::this_cpu().cpu_index as u64, Relaxed);
         }
     }
+    PUMP_CPU.store(crate::arch::percpu::this_cpu().cpu_index as u64, Relaxed); // GATESTEAL (B657): every pass, not once — the re-home MOVES the pump, and `pump=<tid>@cpu<n>` must read the core it stamps from
     let ig = crate::boot::ignite_ms();
     if ig == 0 || now < ig {
         return;
@@ -118,9 +118,11 @@ fn say(age_ms: u64, fixture: bool) {
     let step = crate::video::lag::qs_step_name(crate::video::lag::pump_step_now());
     let mut h = Line::new();
     holder(&mut h);
+    let mut rh = Line::new();
+    rehome_word(&mut rh); // GATESTEAL (B657): `rehome=<ok(pump=<tid>@cpu<n>)|none>` — the loop's other half, on the line that names the wedge
     serial_println!(
-        ":: PUMPWEDGE: age_ms={} last_step={} holder={} -> {} :: pump={}@cpu{} passes={} wedges={} bound_ms={}{}",
-        age_ms, step, h.as_str(), if fixture { "SEEN" } else { "FAIL" },
+        ":: PUMPWEDGE: age_ms={} last_step={} holder={} rehome={} -> {} :: pump={}@cpu{} passes={} wedges={} bound_ms={}{}",
+        age_ms, step, h.as_str(), rh.as_str(), if fixture { "SEEN" } else { "FAIL" },
         PUMP_TID.load(Relaxed), PUMP_CPU.load(Relaxed) as i64, PASSES.load(Relaxed), WEDGES.load(Relaxed), WEDGE_MS,
         if fixture { " fixture=1" } else { "" }
     );
@@ -132,18 +134,20 @@ fn say(age_ms: u64, fixture: bool) {
 /// One look (`render-watch`, every 250 ms in the desktop phase). Never waits.
 pub fn look(now: u64) {
     WATCHED.store(true, Relaxed);
+    gatesteal_rehome_maybe(now); // GATESTEAL (B657): the steal's dead core, when it is the pump's own, is re-homed from HERE — the one lane the pump's death cannot kill
     let last = LAST_MS.load(Relaxed);
     if last != 0 && now.saturating_sub(last) >= WEDGE_MS {
         let age = now.saturating_sub(last);
         if !FIRED.swap(true, AcqRel) {
             WEDGES.fetch_add(1, Relaxed);
             NEXT_PAINT.store(now + PAINT_EVERY_MS, Relaxed);
-            say(age, false);
+            say(age, GATESTEAL_ACTIVE.load(Acquire)); // GATESTEAL (B657): a wedge the fixture's forced long step makes reads `-> SEEN :: fixture=1`, never a live FAIL
             let t = PUMP_TID.load(Relaxed);
             if t != 0 {
                 crate::sync::name_task(t, "PUMPWEDGE: the usb-pump, stopped"); // LOCKREG: its holds and the lock it spins on
             }
             census("wedge"); // SETTERWEDGE (B553): every core's running task and the lock it spins on, once per wedge
+            gatesteal_probe(PUMP_CPU.load(Relaxed) as usize); // GATESTEAL (B657): a second NMI sample of the pump's core at the wedge — is it still on the instruction the steal found it on, and masked?
         } else if now >= NEXT_PAINT.load(Relaxed) {
             NEXT_PAINT.store(now + PAINT_EVERY_MS, Relaxed);
             let mut ln = Line::new();
@@ -469,6 +473,7 @@ fn setter_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, AcqRel) {
         crate::tests::register("setterwedge", setter_selftest);
+        crate::tests::register("gatesteal", gatesteal_selftest); // GATESTEAL (B657)
     }
 }
 
@@ -523,5 +528,295 @@ fn setter_selftest() {
         ":: SETTERWEDGE: from={} watch={} armed_ms={} watch_cpu={} running={} replay={} replay_ms={} census={} cable={} -> {} :: ignite_ms={} fixture_census={} rescues={} rescue_bytes={} wedges={}",
         from, watch, armed, ARMED_CPU.load(Relaxed) as i64, running as u8, replay, REPLAY_MS.load(Relaxed), cores, cable,
         if ok { "PASS" } else { "FAIL" }, ig, FIX_CENSUS.load(Relaxed), RESCUES.load(Relaxed), RESCUE_BYTES.load(Relaxed), WEDGES.load(Relaxed)
+    );
+}
+
+// ── GATESTEAL (rmbp-ledger B657, flight 35 boots 1 and 3) — the pump's core dies on every W5 steal ─────────────────
+//
+// THE WIRE (f35-boot1.log 21:32:42, f35-boot3.log 22:04:01, the same shape byte for byte): `:: W5: site=post-steal
+// from=c1 dead=c7 held=1671 ::`, `:: W5: nmi core=c7 taken=y rip=0x798b5ac6 in_blit=n cs=0x8 ::`, `:: [wcser] GATE
+// STOLEN from c7 by c1 after 1671ms — the holder was in phase 4 row 1238 and had not moved … c7 is DEAD and its
+// singleton roles are owed a re-home ::`, then `:: PUMPWEDGE: age_ms=2003 last_step=bootlog holder=- -> FAIL ::
+// pump=9@cpu7`, `[lock] task=9 holds=[] waits=none`, `[pump] census … c7=-`, and the cable rescue once a second to
+// power-off: the pump task on c7 never stamps again. The full read is docs/dev/evidence/gatesteal/GATESTEAL.md §2.
+//
+// WHAT THE RECORDS SETTLE. (1) The re-home's only consumer ran on the corpse: `wm::comp_dead_core_take` is called
+// from `render_rehome_service` (main.rs), which is called from `usb_pump` — on the pump, on the SERVICE core, "the
+// core the steal has never killed". Flight 35 killed it twice (`dead=c7 svc=7`), so the death was published to the
+// one task that could not read it. That is this block's job: the pump WATCH runs on a sibling core and never on the
+// pump, so it is the lane that reads a death of the pump's core. (2) "Had not moved" is a stale breadcrumb: the
+// `phase`/`row` gauges are stamped inside the window draw only; everything a holder runs after its window loop (the
+// strip, the cursor tail, the WC-D read-back inside the phase-4 witness bracket, the re-run gates) stamps nothing.
+// The NMI probe is the instrument that decides: `taken=y` (not hardware-parked), `cs=0x8` (kernel text), and the
+// SAME text offset in both boots (rip − memcpy_lo = −0x99F13A on boot 1 and on boot 3: the image moved by 0x1A0000
+// between them and both deltas agree). One instruction, 1.5 s into the hold, in two boots whose steps differ: a loop,
+// untracked (`holds=[] waits=none`), that the pump was in BEFORE the steal; the steal then did nothing to c7 but
+// that one NMI (interrupts.rs `nmi_handler`: straight-line, `iretq` back to the same rip). (3) Where the pump's steps
+// take the gate: the `bootlog` step is `bootpace::service_dump`, whose paygo taker (`wm::paygo_service`, "a 1.6 s
+// read-back") composites on the device core as an UNMASKED holder — re-run rounds and all; the `prtscr` step takes
+// no compositor gate at all (`prtscr.rs`: `panel_snapshot`'s handle, no `composite`/`COMP_GATE`), so boot 3's c7
+// holder was another c7 lane's present (the console/serial-door route, reached from a print with interrupts off, or
+// a staged `paint_window` at the caption phase that `phase 46` names); `[lag] … holder=usb-pump:prtscr hold_ms=96
+// masked_ms=400` says the pump held IRQs masked 400 ms of that second, and a MASKED holder on the device core
+// starves every task pinned there — `xhci-poll`, `ehci-hid`, the pump's own tick — which is "the glass dies".
+// NOT settled: the function at `nm(memcpy) − 0x99F13A` and whether the holder spins masked; the W5 line now carries
+// `if=<0|1>` and [`gatesteal_probe`] takes a second sample at the wedge, so the next flight answers both.
+//
+// THE FIX. (a) The pump's lane never holds the gate long: the paygo taker runs on `paygo-take` on a sibling core
+// ([`paygo_off_pump`]); in `wm::composite` the SERVICE core is a ONE-PASS holder (no re-run, no lost-wakeup
+// re-acquire) and a MASKED composite on the service core DECLINES (publishes COMP_PENDING for the render lane).
+// (b) When W5 does steal the pump's core, the roles ARE re-homed, by the scheduler, from this watch:
+// [`gatesteal_rehome_maybe`] → `sched::rehome_dead_core(dead, live)` moves every task on the dead core's run queue
+// and sleeper list the way `try_steal` moves one (the pin is void on a dead core), the SERVICE role follows the pump
+// (`smp::publish_sched_split(render, live)`: the XHCI_CONTROLLER deadlock rule and `try_steal`'s exclusion follow
+// it), the dead core is PARKED BY NAME (`sched::note_dead_core`: no placement lands on it again). The one task the
+// scheduler cannot move is the one CURRENT on the dead core; the line says so, and the watch retries while that is
+// the pump (a pump asleep between passes is caught in SLEEPERS on the next look). (c) `tests gatesteal` below.
+// (d) PUMPWEDGE carries `rehome=`.
+//
+// `tests gatesteal`: `:: GATESTEAL: long_step=<held|none> steal=<seen|none> rehome=<ok(pump=<tid>@cpu<live>)|none>
+// passes_after=<n> input=<alive|stale> -> PASS|FAIL|SKIP :: hold_ms= gen= dead=c<n> live=c<n> drive=c<n> tries=
+// svc_masked_declined= hold=<stolen|kept|untaken>`. The pump's `bootlog` step takes the gate exactly as `composite`
+// does and holds it SLEEPING for `GATESTEAL_HOLD_MS` (`wm::comp_gate_hold_fixture`, armed by [`gatesteal_long_step_maybe`]
+// from `bootpace::service_dump` — the step flight 35 boot 1 died in); a `gatesteal-drive` task on a sibling core calls
+// `wm::composite()` and [`look`] every 100 ms (WEDGEINJ's lesson: the steal is a branch inside `composite`, not a
+// timer, and on an idle QEMU desktop nothing asks). PASS iff the hold began, the steal generation rose, the pump
+// STAMPED from a core that is not the dead one, and it stamped again in the second after (input and the serial door
+// ride that cadence; `input=alive` also requires the `xhci-poll` task). Go-red by mutation: [`GATESTEAL_REHOME`] =
+// false → `rehome=none` → FAIL. A wedge the hold makes prints `-> SEEN :: fixture=1` while the fixture is active.
+
+/// GATESTEAL — the re-home, enabled. The go-red mutation: `false` leaves the dead core's roles where the steal found
+/// them and `tests gatesteal` prints `rehome=none -> FAIL`.
+const GATESTEAL_REHOME: bool = true;
+/// GATESTEAL — the fixture's forced long step: 3000 ms, twice the steal bound (1500 + the 250 ms rung grace) with
+/// room for the watch's look and the scheduler's move before the hold ends.
+const GATESTEAL_HOLD_MS: u64 = 3_000;
+/// GATESTEAL — looks the watch spends retrying while the pump is the task CURRENT on the dead core.
+const GATESTEAL_REHOME_TRIES: u32 = 8;
+
+static PAYGO_TASK: AtomicBool = AtomicBool::new(false);
+static GATESTEAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static HOLD_ARMED: AtomicBool = AtomicBool::new(false);
+/// 0 = not held, 1 = holding, 2 = held and stolen, 3 = could not take the gate, 4 = held, never stolen.
+static HOLD_STATE: AtomicU32 = AtomicU32::new(0);
+static DRIVE_STOP: AtomicBool = AtomicBool::new(false);
+/// The steal generation the watch has finished with (acted, declined, or not the pump's core).
+static REHOME_GEN_DONE: AtomicU64 = AtomicU64::new(0);
+static REHOME_TRY_GEN: AtomicU64 = AtomicU64::new(0);
+static REHOME_TRIES: AtomicU32 = AtomicU32::new(0);
+static REHOME_DEAD: AtomicU64 = AtomicU64::new(u64::MAX);
+static REHOME_LIVE: AtomicU64 = AtomicU64::new(u64::MAX);
+static REHOME_AT: AtomicU64 = AtomicU64::new(0);
+
+/// GATESTEAL — the PAYGO taker (`wm::paygo_service`, bootpace.rs's bootlog step) runs on a `paygo-take` task on a
+/// sibling core, never on the pump. Spawned once, from a scheduled task (the pump); the BSP's inline loop and a leg
+/// with no dispatching sibling keep the inline take exactly as before.
+pub fn paygo_off_pump() {
+    if PAYGO_TASK.load(Acquire) {
+        return;
+    }
+    if crate::arch::sched::current_id().is_none() {
+        crate::video::wm::paygo_service();
+        return;
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        crate::video::wm::paygo_service();
+        return;
+    }
+    if PAYGO_TASK.swap(true, AcqRel) {
+        return;
+    }
+    crate::arch::sched::spawn("paygo-take", paygo_task, 0, cpu, crate::arch::sched::PRIO_LOW);
+    serial_println!("[pump] paygo-take task on c{} from c{} (GATESTEAL B657: the PAYGO read-back never holds the gate on the pump's core)", cpu, me);
+}
+
+fn paygo_task(_arg: usize) {
+    loop {
+        crate::arch::sched::sleep_ms(250);
+        crate::video::wm::paygo_service();
+    }
+}
+
+/// GATESTEAL — the fixture's forced long step, on the pump, in its `bootlog` step: one relaxed load per pass.
+pub fn gatesteal_long_step_maybe() {
+    if !HOLD_ARMED.load(Relaxed) {
+        return;
+    }
+    let tid = PUMP_TID.load(Relaxed);
+    if tid == 0 || crate::arch::sched::current_id() != Some(tid) {
+        return;
+    }
+    if !HOLD_ARMED.swap(false, AcqRel) {
+        return;
+    }
+    HOLD_STATE.store(1, Release);
+    let (held, stolen) = crate::video::wm::comp_gate_hold_fixture(GATESTEAL_HOLD_MS);
+    HOLD_STATE.store(if !held { 3 } else if stolen { 2 } else { 4 }, Release);
+}
+
+/// GATESTEAL — a live core for the pump: the placement authority's xHCI worker (never the render core, never the
+/// service/dead core, never a core parked by name), else the dead core's least-loaded sibling under the same rules.
+fn pick_live(dead: usize, render: Option<usize>) -> Option<usize> {
+    let n = crate::arch::smp::online_aps().len();
+    for i in 0..n {
+        match crate::arch::smp::xhci_worker_cpu(i) {
+            Some(c) if c != dead && Some(c) != render && !crate::arch::sched::is_dead_core(c) => return Some(c),
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    let c = crate::arch::sched::sibling_online_cpu(dead);
+    if c != dead && Some(c) != render && !crate::arch::sched::is_dead_core(c) { Some(c) } else { None }
+}
+
+/// GATESTEAL — the watch's half of the loop (see the block above). Two relaxed loads per look when no steal has
+/// happened; once per steal generation otherwise.
+fn gatesteal_rehome_maybe(now: u64) {
+    if !GATESTEAL_REHOME {
+        return;
+    }
+    let Some(dead) = crate::video::wm::comp_dead_core_last() else { return };
+    let sgen = crate::video::wm::comp_steal_gen();
+    if REHOME_GEN_DONE.load(Acquire) == sgen {
+        return;
+    }
+    let tid = PUMP_TID.load(Relaxed);
+    if tid == 0 || PUMP_CPU.load(Relaxed) as usize != dead {
+        // Not the pump's core: that death's roles are the render path's (main.rs render_rehome_service), which runs.
+        REHOME_GEN_DONE.store(sgen, Release);
+        return;
+    }
+    if REHOME_TRY_GEN.swap(sgen, AcqRel) != sgen {
+        REHOME_TRIES.store(0, Relaxed);
+    }
+    let render = crate::arch::smp::render_cpu();
+    let Some(live) = pick_live(dead, render) else {
+        serial_println!(":: [pump] REHOME DECLINED: c{} is dead and carried the usb-pump (tid {}) and there is no live core that is neither it nor the render core — co-locating with the render service is the XHCI_CONTROLLER deadlock, so the roles stay down == tripwire ::", dead, tid);
+        REHOME_GEN_DONE.store(sgen, Release);
+        return;
+    };
+    let r = crate::arch::sched::rehome_dead_core(dead, live);
+    crate::arch::sched::note_dead_core(dead);
+    if crate::arch::smp::service_cpu() == Some(dead) {
+        if let Some(rc) = render {
+            crate::arch::smp::publish_sched_split(rc, live); // the SERVICE role follows the pump
+        }
+    }
+    let tries = REHOME_TRIES.fetch_add(1, Relaxed) + 1;
+    REHOME_DEAD.store(dead as u64, Relaxed);
+    REHOME_LIVE.store(live as u64, Relaxed);
+    REHOME_AT.store(now.max(1), Release);
+    let pump_stuck = r.current == Some(tid);
+    serial_println!(
+        ":: [pump] REHOME: c{} is dead and carried the usb-pump (tid {}): moved ready={} sleeping={} left={} current={} -> c{} svc=c{} try={} (GATESTEAL B657: the mailbox's consumer ran on the corpse; the watch re-homes from a live core; the current task is in no queue and stays) == tripwire ::",
+        dead, tid, r.ready, r.sleeping, r.left, r.current.map_or(-1i64, |t| t as i64), live, live, tries
+    );
+    if !pump_stuck || tries >= GATESTEAL_REHOME_TRIES {
+        REHOME_GEN_DONE.store(sgen, Release);
+    }
+}
+
+/// GATESTEAL — `rehome=` for the PUMPWEDGE line: `ok(pump=<tid>@cpu<n>)` once the pump has STAMPED from a core that
+/// is not the one the steal declared dead, else `none`.
+fn rehome_word(out: &mut Line) {
+    use core::fmt::Write;
+    let dead = REHOME_DEAD.load(Relaxed);
+    let cpu = PUMP_CPU.load(Relaxed);
+    if REHOME_AT.load(Acquire) != 0 && dead != u64::MAX && cpu != dead {
+        let _ = write!(out, "ok(pump={}@cpu{})", PUMP_TID.load(Relaxed), cpu as i64);
+    } else {
+        let _ = out.write_str("none");
+    }
+}
+
+/// GATESTEAL — a second NMI sample of the pump's core at the wedge, beside the steal's own. Prints nothing when the
+/// probe is not built (`witness`/`bar1wedge`), when the core is this one, or when no core is known.
+fn gatesteal_probe(cpu: usize) {
+    #[cfg(any(feature = "witness", feature = "bar1wedge"))]
+    {
+        if cpu >= crate::arch::gdt::MAX_CPUS || cpu == crate::arch::percpu::this_cpu().cpu_index as usize {
+            return;
+        }
+        if let Some(p) = crate::arch::interrupts::nmi_probe(cpu) {
+            serial_println!(
+                ":: GATESTEAL: probe core=c{} taken={} rip={:#x} cs={:#x} if={} (the pump's core at the wedge: the same instruction as the steal's probe is a loop; if=0 is a masked one) ::",
+                cpu, if p.taken { "y" } else { "n" }, p.rip, p.cs, (p.rflags >> 9) & 1
+            );
+        }
+    }
+    #[cfg(not(any(feature = "witness", feature = "bar1wedge")))]
+    let _ = cpu;
+}
+
+fn gatesteal_drive(_arg: usize) {
+    loop {
+        crate::arch::sched::sleep_ms(100);
+        if DRIVE_STOP.load(Acquire) {
+            return;
+        }
+        crate::video::wm::composite();
+        look(crate::arch::ms());
+    }
+}
+
+/// `:: GATESTEAL: … -> PASS|FAIL|SKIP ::` — see the block above.
+fn gatesteal_selftest() {
+    let tid = PUMP_TID.load(Relaxed);
+    if tid == 0 {
+        serial_println!(":: GATESTEAL: long_step=- steal=- rehome=- passes_after=- input=- -> SKIP :: reason=no-pump-stamp");
+        return;
+    }
+    let dead = PUMP_CPU.load(Relaxed) as usize;
+    let render = crate::arch::smp::render_cpu();
+    let Some(drive) = pick_live(dead, render).or_else(|| {
+        let c = crate::arch::sched::sibling_online_cpu(dead);
+        if c != dead { Some(c) } else { None }
+    }) else {
+        serial_println!(":: GATESTEAL: long_step=- steal=- rehome=- passes_after=- input=- -> SKIP :: reason=no-sibling-core dead=c{}", dead);
+        return;
+    };
+    let gen0 = crate::video::wm::comp_steal_gen();
+    REHOME_GEN_DONE.store(gen0, Release);
+    REHOME_AT.store(0, Release);
+    REHOME_DEAD.store(u64::MAX, Relaxed);
+    REHOME_LIVE.store(u64::MAX, Relaxed);
+    HOLD_STATE.store(0, Release);
+    DRIVE_STOP.store(false, Release);
+    GATESTEAL_ACTIVE.store(true, Release);
+    let t0 = crate::arch::ms();
+    crate::arch::sched::spawn("gatesteal-drive", gatesteal_drive, 0, drive, crate::arch::sched::PRIO_NORMAL);
+    HOLD_ARMED.store(true, Release);
+    let held = wait_for(3_000, || HOLD_STATE.load(Acquire) != 0);
+    let steal = wait_for(GATESTEAL_HOLD_MS + 1_500, || crate::video::wm::comp_steal_gen() != gen0);
+    let rehomed = wait_for(GATESTEAL_HOLD_MS + 2_000, || REHOME_AT.load(Acquire) != 0 && PUMP_CPU.load(Relaxed) as usize != dead);
+    let p1 = PASSES.load(Relaxed);
+    crate::arch::sched::sleep_ms(1_000);
+    let passes_after = PASSES.load(Relaxed).saturating_sub(p1);
+    let input = passes_after > 0 && crate::drivers::xhci::poll_task_armed();
+    DRIVE_STOP.store(true, Release);
+    HOLD_ARMED.store(false, Release);
+    GATESTEAL_ACTIVE.store(false, Release);
+    let mut rh = Line::new();
+    rehome_word(&mut rh);
+    let ok = held && steal && rehomed && passes_after > 0;
+    serial_println!(
+        ":: GATESTEAL: long_step={} steal={} rehome={} passes_after={} input={} -> {} :: hold_ms={} gen={} dead=c{} live=c{} drive=c{} tries={} svc_masked_declined={} hold={} elapsed_ms={}",
+        if held { "held" } else { "none" },
+        if steal { "seen" } else { "none" },
+        rh.as_str(),
+        passes_after,
+        if input { "alive" } else { "stale" },
+        if ok { "PASS" } else { "FAIL" },
+        GATESTEAL_HOLD_MS,
+        crate::video::wm::comp_steal_gen(),
+        dead,
+        REHOME_LIVE.load(Relaxed) as i64,
+        drive,
+        REHOME_TRIES.load(Relaxed),
+        crate::video::wm::comp_svc_masked_declined(),
+        match HOLD_STATE.load(Acquire) { 2 => "stolen", 4 => "kept", 3 => "untaken", 1 => "holding", _ => "none" },
+        crate::arch::ms().saturating_sub(t0)
     );
 }

@@ -969,7 +969,7 @@ mod w5nmi {
     static BUSY: AtomicBool = AtomicBool::new(false);
     /// Per-core record: the interrupted rip, cs, and a counter that says the record is fresh.
     static RIP: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-    static CS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static CS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS]; static RFLAGS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS]; // GATESTEAL (B657): the interrupted RFLAGS beside rip/cs — bit 9 (IF) says whether the holder sits on its instruction MASKED (a masked composite on the device core starves its pinned tasks: flight 35's dead input) or open; flight 35's two probes read the same text offset (rip − memcpy_lo = −0x99F13A on both boots) and could not say which
     static TAKEN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
     /// Bytes scanned past `memcpy`'s entry for its `ret`. The function is 47 bytes on 891c4dec;
@@ -994,7 +994,7 @@ mod w5nmi {
             return;
         }
         RIP[slot].store(frame.instruction_pointer.as_u64(), Ordering::Relaxed);
-        CS[slot].store(frame.code_segment.0 as u64, Ordering::Relaxed);
+        CS[slot].store(frame.code_segment.0 as u64, Ordering::Relaxed); RFLAGS[slot].store(frame.cpu_flags.bits(), Ordering::Relaxed); // GATESTEAL (B657): one more relaxed store, same contract
         TAKEN[slot].fetch_add(1, Ordering::Release);
     }
 
@@ -1004,7 +1004,7 @@ mod w5nmi {
     pub struct NmiProbe {
         pub taken: bool,
         pub rip: u64,
-        pub cs: u64,
+        pub cs: u64, pub rflags: u64,
         pub in_blit: Option<bool>,
     }
 
@@ -1061,7 +1061,7 @@ mod w5nmi {
     /// Probe `core` with an NMI and print ONE line:
     ///
     /// ```text
-    /// :: W5: nmi core=c<n> taken=<y/n> rip=<hex|-> in_blit=<y/n/?> cs=<hex|-> memcpy=<lo>..<hi> icr=<ok|busy> ::
+    /// :: W5: nmi core=c<n> taken=<y/n> rip=<hex|-> in_blit=<y/n/?> cs=<hex|-> if=<0|1> memcpy=<lo>..<hi> icr=<ok|busy> ::
     /// ```
     ///
     /// `taken=n` after the 10 ms wait is the hardware-parked verdict (the NMI is left pending on
@@ -1111,10 +1111,10 @@ mod w5nmi {
             TAKEN[core].load(Ordering::Acquire) != before
         });
         TARGET.store(u32::MAX, Ordering::Release);
-        let (rip, cs) = if taken {
-            (RIP[core].load(Ordering::Relaxed), CS[core].load(Ordering::Relaxed))
+        let (rip, cs, rflags) = if taken {
+            (RIP[core].load(Ordering::Relaxed), CS[core].load(Ordering::Relaxed), RFLAGS[core].load(Ordering::Relaxed))
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
         let range = memcpy_range();
         let in_blit = match (taken, range) {
@@ -1129,8 +1129,8 @@ mod w5nmi {
         let icr = if icr_ok { "ok" } else { "busy" };
         if taken {
             serial_println!(
-                ":: W5: nmi core=c{} taken=y rip={:#x} in_blit={} cs={:#x} memcpy={} icr={} ::",
-                core, rip, yn(in_blit), cs, Range(range), icr
+                ":: W5: nmi core=c{} taken=y rip={:#x} in_blit={} cs={:#x} if={} memcpy={} icr={} ::",
+                core, rip, yn(in_blit), cs, (rflags >> 9) & 1, Range(range), icr
             );
         } else {
             serial_println!(
@@ -1139,7 +1139,7 @@ mod w5nmi {
             );
         }
         BUSY.store(false, Ordering::Release);
-        Some(NmiProbe { taken, rip, cs, in_blit })
+        Some(NmiProbe { taken, rip, cs, rflags, in_blit })
     }
 
     /// The x86 witness self-test (W5I2 job 2): prove the probe on a known spin loop, then on an

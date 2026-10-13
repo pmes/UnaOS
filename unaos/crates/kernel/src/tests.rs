@@ -109,7 +109,7 @@ pub fn source_done(bit: u32) {
 
 /// Run one named fixture (`Some`) or all (`None`); returns how many ran.
 pub fn run(name: Option<&str>) -> usize {
-    ensure_shellux();
+    ensure_shellux(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::sessionwedge::ensure_tests(); // GATESTEAL (B657): `tests gatesteal` (and sessionwedge/setterwedge, which SKIP without an ignition) are reachable on a leg with no session ignition — the lazy registration rode the render task's desktop-phase roll (same-line fold)
     if RUNNING.swap(true, Ordering::AcqRel) {
         serial_println!(":: TESTS: already running — refused ::");
         return 0;

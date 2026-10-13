@@ -4888,7 +4888,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
                     // Latched, not overwritten: a second steal from a different core must not erase
                     // an un-acted-on first death. `compare_exchange` from the free sentinel keeps the
                     // FIRST death standing until `comp_dead_core_take` retires it.
-                    let _ = COMP_DEAD_CORE.compare_exchange(usize::MAX, dead, AcqRel, Relaxed);
+                    let _ = COMP_DEAD_CORE.compare_exchange(usize::MAX, dead, AcqRel, Relaxed); COMP_DEAD_LAST.store(dead, Relaxed); COMP_STEAL_GEN.fetch_add(1, Relaxed); // GATESTEAL (B657): the gauge beside the mailbox — read by the pump watch when `dead` is the pump's own core, the one case the mailbox's consumer cannot reach (same-line fold)
                     #[cfg(feature = "witness")]
                     {
                         COMP_STEALS.fetch_add(1, Relaxed); #[cfg(feature = "nvidia-kepler")] crate::drivers::gpu::pcihealth::w5_post_steal(me, dead, held, BLIT_AIM_CORE[dead.min(7)].load(Relaxed)); // W5I1 (PCIE-RP-RECOVERY.md §12.3 I1, rmbp-ledger B119): the post-steal BAR0 dump, from THIS core — the one that just took the gate — never from the sampler path (a non-posted read to the endpoint while the store is stuck cannot pass it and would park the service core; here the link is proven within 70–369 ms to be sinking the next holder's writes). One `:: W5: site=post-steal … ::` line, each register read once, no write, no lock, same print path as `GATE STOLEN` below. Same-line fold, LINE-NEUTRAL: `wm.rs` is ~26k lines and a line here would renumber every panic `Location` below it; cfg-erased knob-off with the call, so no byte moves.
@@ -4908,7 +4908,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
                              phase {} row {} and had not moved. blits_retired={} blit_aim={:#x} \
                              blit_inflight={} The acquirer was CHOSEN, not next in \
                              line: pick={} render={} svc={}; desktop resumes on this core, c{} is \
-                             DEAD and its singleton roles are owed a re-home == tripwire ::",
+                             DEAD and its singleton roles are owed a re-home == tripwire :: holder_tid={} steal_gen={}",
                             dead,
                             me,
                             held,
@@ -4921,16 +4921,16 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
                             pick.map_or("-", StealPick::name),
                             crate::arch::smp::render_cpu().map_or(-1, |c| c as isize),
                             crate::arch::smp::service_cpu().map_or(-1, |c| c as isize),
-                            dead
+                            dead, COMP_HOLDER_TID.load(Relaxed), COMP_STEAL_GEN.load(Relaxed) // GATESTEAL (B657): WHICH task on the dead core held it, and the steal's generation the watch's `[pump] REHOME` line answers to (same-line fold)
                         );
                     }
                 }
             }
         }
-        if !stole
-            && COMP_GATE
+        if !stole && (comp_svc_masked_decline() // GATESTEAL (B657): a MASKED composite on the SERVICE core declines before the CAS — never a masked pass on the device core (same-line fold; the `||` below closes it)
+            || COMP_GATE
                 .compare_exchange(false, true, AcqRel, Relaxed)
-                .is_err()
+                .is_err())
         {
             // DECLINED. This pass composites nothing and — crucially — CLEARS NOTHING: it never
             // reached the table snapshot, so every `damaged` flag it would have consumed is still
@@ -4980,7 +4980,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
         // age. Two relaxed stores on the acquire path; the probe that reads them runs on the input
         // service's clock, not here.
         COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
-        COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
+        COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed); COMP_HOLDER_TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed); // GATESTEAL (B657): the holder's task beside its core (same-line fold)
         // DEBTCLEAR — consume the zombie-store taint before the pass, so the pass this holder is
         // about to run IS the full present the settle promised. One swap when clean.
         blit_debt_heal_maybe();
@@ -5023,7 +5023,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
         // So the question both gates ask is now "is anything OWED", and a non-empty erase queue is
         // owed. One relaxed load on a path that has just run a whole composite; `DEFER_N` is the flag
         // `drain_deferred` already reads once per pass for exactly this "is anything owed" purpose.
-        let masked = crate::arch::irqs_masked();
+        let masked = crate::arch::irqs_masked() || Some(crate::arch::sched::meter_current_cpu()) == crate::arch::smp::service_cpu(); // GATESTEAL (B657): the SERVICE core is a ONE-PASS holder exactly as a masked one is — no re-run rounds, no lost-wakeup re-acquire below. Flight 35 boot 1 held the gate 1671 ms from the pump's bootlog step (bootpace::service_dump -> paygo_service -> this loop on c7, the device core); its damage stays on the table for the render lane (`service_damage`, the standing backstop). Same-line fold, line-NEUTRAL.
         let mut rounds = 0u32;
         while !masked && rounds < COMP_RERUN_MAX && !(COMP_PENDING.load(Acquire) && crate::video::lag::input_first()) && COMP_PENDING.swap(false, AcqRel) { // INPUTSTALL M3 (B375): the render task does not re-run folded presents while a key or press waits for it — the damage stays on the table (same-line fold).
             let dmg = any_damaged();
@@ -5082,7 +5082,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
         {
             // WCSER-H — the re-acquire winner is a holder like any other: stamp it, t0 first.
             COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
-            COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
+            COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed); COMP_HOLDER_TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed); // GATESTEAL (B657): same stamp as the main acquire (same-line fold)
             if COMP_PENDING.swap(false, AcqRel) {
                 let dmg = any_damaged();
                 let owed = deferred_owed();
@@ -9477,7 +9477,7 @@ static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 static COMP_HOLDER_CORE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
 #[cfg(target_arch = "x86_64")]
-static COMP_HOLD_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COMP_HOLD_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(target_arch = "x86_64")] static COMP_HOLDER_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(target_arch = "x86_64")] static COMP_DEAD_LAST: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX); #[cfg(target_arch = "x86_64")] static COMP_STEAL_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(target_arch = "x86_64")] static COMP_SVC_MASKED_DECLINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(target_arch = "x86_64")] fn comp_svc_masked_decline() -> bool { let d = crate::arch::irqs_masked() && Some(crate::arch::sched::meter_current_cpu()) == crate::arch::smp::service_cpu(); if d { COMP_SVC_MASKED_DECLINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); } d } // GATESTEAL (rmbp-ledger B657, flight 35 boots 1 and 3: `dead=c7 svc=7`) — ⚠ LINE-NEUTRAL fold. Four gauges beside the holder: the holder's TASK (`COMP_HOLDER_TID`, stamped with the core: c7 carries four pinned tasks and the GATE STOLEN line named only the core), the LAST dead core and the steal GENERATION (`COMP_DEAD_LAST`/`COMP_STEAL_GEN`: gauges, never taken — the `COMP_DEAD_CORE` mailbox's only consumer is `render_rehome_service`, which runs ON the pump (main.rs usb_pump), so a death of the pump's own core was published to a corpse; the pump WATCH (sessionwedge::look, a sibling core) reads these two and re-homes through the scheduler), and the count of MASKED composites the SERVICE core declined (`comp_svc_masked_decline`: a masked pass on the device core starves every task pinned there — xhci-poll, ehci-hid, the pump's own tick — which is flight 35's "glass dies while the wire lives"; the decline publishes COMP_PENDING exactly as a contended decline does and the render lane services it).
 /// WCSER-H — once-per-held-epoch latch for the overdue tripwire, re-armed at release so the NEXT
 /// wedge also names itself; paired pacer for the standing 5 s repeat while a pass stays held.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
@@ -10016,7 +10016,7 @@ pub fn comp_dead_core_take() -> Option<usize> {
         .compare_exchange(dead, usize::MAX, AcqRel, Relaxed)
         .ok()
         .map(|_| dead)
-}
+} #[cfg(target_arch = "x86_64")] pub fn comp_dead_core_last() -> Option<usize> { let d = COMP_DEAD_LAST.load(core::sync::atomic::Ordering::Relaxed); if d == usize::MAX { None } else { Some(d) } } #[cfg(target_arch = "x86_64")] pub fn comp_steal_gen() -> u64 { COMP_STEAL_GEN.load(core::sync::atomic::Ordering::Relaxed) } #[cfg(target_arch = "x86_64")] pub fn comp_svc_masked_declined() -> u64 { COMP_SVC_MASKED_DECLINED.load(core::sync::atomic::Ordering::Relaxed) } #[cfg(target_arch = "x86_64")] pub fn comp_gate_hold_fixture(ms: u64) -> (bool, bool) { use core::sync::atomic::Ordering::{AcqRel, Relaxed}; let t0 = crate::arch::ms(); while COMP_GATE.compare_exchange(false, true, AcqRel, Relaxed).is_err() { if crate::arch::ms().saturating_sub(t0) > 1_000 { return (false, false); } crate::arch::sched::sleep_ms(1); } let me = crate::arch::sched::meter_current_cpu(); COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed); COMP_HOLDER_CORE.store(me, Relaxed); COMP_HOLDER_TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed); comp_mark(0, 4); comp_mark_row(1238); let h0 = crate::arch::ms(); while crate::arch::ms().saturating_sub(h0) < ms { crate::arch::sched::sleep_ms(10); } let stolen = COMP_HOLDER_CORE.load(Relaxed) != me; comp_mark(0, 0); comp_gate_release(); (true, stolen) } // GATESTEAL (B657) — ⚠ LINE-NEUTRAL fold. The readers the pump watch and `tests gatesteal` use (`comp_dead_core_last`, `comp_steal_gen`: gauges beside the mailbox, see COMP_DEAD_LAST; `comp_svc_masked_declined`), and the fixture's FORCED LONG STEP: take the gate exactly as `composite` does (CAS, t0, holder core and task, boot 1's own `phase 4 row 1238` breadcrumb), then hold it SLEEPING for `ms` — the pump stays a migratable task (in `SLEEPERS`, never `current`) while the steal fires on its own unmodified timer from a live core, and the release afterwards is the revenant decline `comp_gate_release` already makes. Returns (held, stolen).
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // WCSER-REMINT — THE SHELL WINDOW DOES NOT STAY A CORPSE ACROSS A REHOME.
