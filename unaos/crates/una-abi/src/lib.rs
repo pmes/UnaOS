@@ -2563,3 +2563,43 @@ pub const PREF_SUB_PREFIX_MAX: usize = 64;
 pub const PREF_SUB_MAX: usize = 4;
 /// `SYS_MRECV`'s third argument: return -EAGAIN on an empty mailbox instead of blocking (ASCII "NOWAIT").
 pub const MRECV_NOWAIT: u64 = 0x4E4F_5741_4954;
+
+// =================================================================================================
+// RING3PIPE (rmbp-ledger B562; SR111 UNAIDE2's owed: "a launched program runs detached and its output does not come
+// back to the pane, because ring 3 has no pipe") — a launcher reads its child's console output. ONE verb pair:
+//
+//   create   `SYS_SPAWN_PATH(path_ptr, path_len, argv_ptr, argc | SPAWN_PIPE)` — the flag rides argc's high half
+//            (argc is `argc & SPAWN_ARGC_MASK`; any other high bit is -EINVAL). The kernel reserves a pipe for the
+//            CALLER before the child exists and binds it to the child's slot before the child can run, so no byte
+//            the child writes is missed. The answer is the child's pid, exactly as without the flag: the pid NAMES
+//            the pipe. -EAGAIN (`refused=pipe-table-full`) when PIPE_MAX pipes are live, before any spawn.
+//   capture  every `SYS_WRITE` the child makes through its Console handle lands in the pipe's bounded ring
+//            (PIPE_RING_BYTES); it is still printed on the console as before. A write that does not fit is cut
+//            to what fits; the rest is DROPPED and counted (never blocks the child, never grows the ring).
+//   read     `SYS_PIPE_READ(pid, buf_ptr, buf_len)` -> n > 0 bytes copied out (oldest first);
+//            0 = EOF: the ring is drained AND the child has exited — the pipe is closed by that answer, and the
+//                kernel says `[pipe] close pid=<p> bytes=<b> dropped=<d>`;
+//            -EAGAIN = the ring is empty and the child still runs (poll it beside the input ring);
+//            -EBADF = no live pipe with that pid; -EACCES = the pipe is another program's (only the launcher —
+//                the slot and generation that asked for it — reads it; a capability, not a name).
+//            `buf_len == 0` consumes nothing and answers the DROPPED byte count (>= 0).
+//   arches   x86 attaches (SYS_SPAWN_PATH is x86's). aarch64's launch path has no ring-3 spawn-by-path, so it
+//            cannot attach one: `SYS_PIPE_READ` answers -ENOSYS there by name (`[pipe] read … -> refused=no-launch-pipe`).
+//   teardown the child's slot teardown (its generation bump) is the EOF; a launcher that dies leaves its pipes to be
+//            reclaimed at the next reserve.
+// Numbered 70: the next free number after CURSORSHAPE's SYS_CURSOR_SHAPE (69), the tail-append order.
+// =================================================================================================
+
+/// `SYS_PIPE_READ(pid, buf_ptr, buf_len)` — see the block above.
+pub const SYS_PIPE_READ: u64 = 70; // after CURSORSHAPE's SYS_CURSOR_SHAPE (69)
+/// `SYS_SPAWN_PATH`'s argc flag: attach a pipe to the child's console output.
+pub const SPAWN_PIPE: u64 = 1 << 32;
+/// The argc count bits of `SYS_SPAWN_PATH`'s fourth argument (the high half carries flags).
+pub const SPAWN_ARGC_MASK: u64 = 0xFFFF_FFFF;
+/// Every flag `SYS_SPAWN_PATH` knows.
+pub const SPAWN_FLAGS: u64 = SPAWN_PIPE;
+/// One pipe's ring, in bytes (the child's output beyond what the launcher has read is cut at this).
+pub const PIPE_RING_BYTES: usize = 64 * 1024;
+/// Pipes live at once, system-wide.
+pub const PIPE_MAX: usize = 8;
+const _: () = assert!(SYS_PIPE_READ == SYS_CURSOR_SHAPE + 1 && SPAWN_FLAGS & SPAWN_ARGC_MASK == 0 && ARGS_MAX as u64 <= SPAWN_ARGC_MASK);

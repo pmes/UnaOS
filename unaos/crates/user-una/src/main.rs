@@ -53,6 +53,8 @@
 // commits, Esc drops it); a new file opens in a tab, a renamed file's tab follows it. Ctrl+R (`run`) runs the first
 // line of `.run` in the active file's folder, else the workspace root's (`$FILE` = the active file), else the line
 // typed in the console, through the console's midden_core plan; `:: UNA: run src=<path|typed> line=<l> ::`.
+// RING3PIPE (rmbp-ledger B562): the launched program's console output arrives in the console pane as it is written
+// (console.rs `pump`, once per frame, over `SYS_PIPE_READ`); `:: UNA: pipe … ::` per chunk, `:: UNA: pipe eof … ::`.
 // POINTER (B543/B550) in every pane: the hand over the tab strip, the beam over the editor's text and the console,
 // the arrow over the tree and the status line; a press on the tree's selected row opens it, as Enter does.
 //
@@ -1091,6 +1093,8 @@ pub extern "C" fn _start() -> ! {
                 theme_wire();
             }
         }
+        // RING3PIPE (B562): what the programs Run launched have written since the last frame, into the console.
+        app.con.pump();
         app.paint();
         sleep_ms(16);
     }

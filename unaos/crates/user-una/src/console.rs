@@ -13,8 +13,13 @@
 // IDE to quit (returned as `Act::Quit`, the window is the IDE's), and the wire tag is `:: UNA: plan=`.
 //
 // UNAIDE2 (LEDGER SR111): `run` is the door the IDE's Run verb (Ctrl+R, main.rs) uses — a `.run` line or the typed
-// line goes through the same plan; a launched program is DETACHED (SYS_SPAWN_PATH is the `bg` body) and ring 3 has no
-// pipe door, so its output is not this pane's — the launch row says so rather than leave the pane silent.
+// line goes through the same plan. RING3PIPE (rmbp-ledger B562): a launch asks SYS_SPAWN_PATH for a pipe
+// (`una_abi::SPAWN_PIPE`); the program still runs detached, and its console output comes back through
+// `SYS_PIPE_READ(pid)` — `pump` (called once per frame by main.rs) drains every open pipe into this scrollback as the
+// bytes arrive, one row per line, and closes it at EOF (the child exited and the ring is empty). A kernel that does
+// not know the flag (it answers E2BIG to the high argc bits) gets the plain detached launch and the old note.
+// Wire: `:: UNA: pipe pid=<p> bytes=<n> lines=<l> ::` per chunk read, `:: UNA: pipe eof ok=<0|1> pid=<p> lines=<n>
+// bytes=<b> dropped=<d> rows=<r> pane=console ::` at EOF (ok = at least one line reached the pane and none dropped).
 // `git` (`git status`, `git diff [path]`) is served here, read-only, through git.rs over git_core (SR59) at the
 // workspace root; any other git word is refused by name. Wire `:: UNA: git verb=<status|diff> … ::`.
 
@@ -25,11 +30,26 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use midden_core::{plan, ring3, Facts, Message, Plan, Volume};
 use una_abi::{KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_UP};
+use vein_ring3::sys::sys;
 
 /// The scrollback ring's byte budget: lines are dropped from the top once their text exceeds it.
 const SCROLL_BYTES: usize = 8 * 1024;
 const INP_CAP: usize = 240;
 const HIST_CAP: usize = 32;
+/// RING3PIPE: one SYS_PIPE_READ's buffer, and the reads one pipe gets per frame (a burst lands over a few frames).
+const PIPE_CHUNK: usize = 4096;
+const PIPE_READS: usize = 4;
+/// RING3PIPE: a line longer than this with no newline is pushed as it stands (the pane wraps it).
+const PIPE_LINE_MAX: usize = 1024;
+
+/// RING3PIPE: a launched program whose output this pane is reading.
+struct Piped {
+    pid: i64,
+    part: Vec<u8>,
+    lines: u32,
+    bytes: u64,
+    dropped: u64,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -70,6 +90,8 @@ pub struct Console {
     /// The pane's text columns, set by the painter before any text is pushed.
     pub cols: usize,
     pub dirty: bool,
+    /// RING3PIPE: the launched programs whose output is still arriving.
+    pipes: Vec<Piped>,
 }
 
 impl Console {
@@ -89,6 +111,7 @@ impl Console {
             last_verb: 0,
             cols,
             dirty: true,
+            pipes: Vec::new(),
         }
     }
 
@@ -195,7 +218,7 @@ impl Console {
                 if word == "help" {
                     self.say(Tone::Out, &alloc::format!("UNA.ELF console serves: {} (+ the core's own words above)", ring3::SERVED.join(" ")));
                     if facts.exec {
-                        self.say(Tone::Out, "UNA.ELF console launches: run <path> [args], and bare names (detached)");
+                        self.say(Tone::Out, "UNA.ELF console launches: run <path> [args], and bare names (detached; their output arrives here)");
                     }
                     self.say(Tone::Out, "keys: Ctrl+1 tree, Ctrl+2 editor, Ctrl+3 console (Esc cycles), Ctrl+O open, Ctrl+S save, Ctrl+Q quit");
                     self.say(Tone::Out, "tabs: Ctrl+T next, Ctrl+4..9 tab 1..6, Ctrl+W close; Ctrl+F find, Ctrl+L replace (Tab swaps, Ctrl+W whole-word, Ctrl+A all), Ctrl+G line");
@@ -241,15 +264,114 @@ impl Console {
             return Err(una_abi::ENOENT);
         };
         let path = resolve(&self.cwd, name);
-        let r = spawn_path(&path, argv);
+        // RING3PIPE: ask for a pipe; a kernel without the flag answers E2BIG to the high argc bits — launch plainly.
+        let mut piped = true;
+        let mut r = spawn_piped(&path, argv);
+        if r == una_abi::E2BIG {
+            piped = false;
+            r = spawn_path(&path, argv);
+        }
         if r > 0 {
             self.say(Tone::Out, &alloc::format!("{}: {} started - pid {}", verb, path, r));
-            self.say(Tone::Out, "(detached: its output is not this pane's - ring 3 has no pipe door)");
+            if piped {
+                self.pipes.push(Piped { pid: r, part: Vec::new(), lines: 0, bytes: 0, dropped: 0 });
+            } else {
+                self.say(Tone::Out, "(detached: this kernel has no pipe for its output)");
+            }
             Ok(r)
         } else {
             self.say(Tone::Err, &alloc::format!("{}: {}: {} {}", verb, path, r, errno_text(r)));
             Err(r)
         }
+    }
+
+    /// RING3PIPE: drain every open pipe into the scrollback (called once per frame). True when a row was added.
+    pub fn pump(&mut self) -> bool {
+        if self.pipes.is_empty() {
+            return false;
+        }
+        let mut added = false;
+        let mut buf = alloc::vec![0u8; PIPE_CHUNK];
+        let mut i = 0;
+        while i < self.pipes.len() {
+            let pid = self.pipes[i].pid;
+            let mut closed: Option<i64> = None;
+            for _ in 0..PIPE_READS {
+                let r = sys(una_abi::SYS_PIPE_READ, pid as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
+                if r > 0 {
+                    let n = r as usize;
+                    let lines = self.pipe_bytes(i, &buf[..n]);
+                    added |= lines > 0;
+                    let mut l = Line::new(b":: UNA: pipe pid=");
+                    l.dec(pid).put(b" bytes=").dec(n as i64).put(b" lines=").dec(lines as i64).put(b" ::");
+                    l.wire();
+                    if n < buf.len() {
+                        let d = sys(una_abi::SYS_PIPE_READ, pid as u64, 0, 0, 0);
+                        if d >= 0 {
+                            self.pipes[i].dropped = d as u64;
+                        }
+                        break;
+                    }
+                } else if r == una_abi::EAGAIN {
+                    break;
+                } else {
+                    closed = Some(r);
+                    break;
+                }
+            }
+            match closed {
+                None => i += 1,
+                Some(r) => {
+                    let mut p = self.pipes.remove(i);
+                    if !p.part.is_empty() {
+                        let tail = String::from_utf8_lossy(&p.part).into_owned();
+                        self.say(Tone::Out, &tail);
+                        p.lines += 1;
+                        p.part.clear();
+                    }
+                    if r == 0 {
+                        let m = alloc::format!("run: pid {} exited - {} lines{}", pid, p.lines, if p.dropped > 0 { alloc::format!(", {} bytes dropped", p.dropped) } else { String::new() });
+                        self.say(Tone::Echo, &m);
+                    } else {
+                        let m = alloc::format!("run: pid {}: output lost - {} {}", pid, r, errno_text(r));
+                        self.say(Tone::Err, &m);
+                    }
+                    added = true;
+                    let ok = r == 0 && p.lines > 0 && p.dropped == 0;
+                    let mut l = Line::new(b":: UNA: pipe eof ok=");
+                    l.dec(ok as i64).put(b" pid=").dec(pid).put(b" lines=").dec(p.lines as i64).put(b" bytes=").dec(p.bytes as i64);
+                    l.put(b" dropped=").dec(p.dropped as i64).put(b" rows=").dec(self.rows.len() as i64);
+                    if r != 0 {
+                        l.put(b" err=").dec(r);
+                    }
+                    l.put(b" pane=console ::");
+                    l.wire();
+                }
+            }
+        }
+        added
+    }
+
+    /// RING3PIPE: `b` from pipe `i` — complete lines into the scrollback, the rest held for the next chunk.
+    fn pipe_bytes(&mut self, i: usize, b: &[u8]) -> u32 {
+        self.pipes[i].bytes += b.len() as u64;
+        self.pipes[i].part.extend_from_slice(b);
+        let mut n = 0;
+        loop {
+            let part = &self.pipes[i].part;
+            let cut = match part.iter().position(|&c| c == b'\n') {
+                Some(k) => k,
+                None if part.len() >= PIPE_LINE_MAX => part.len(),
+                None => break,
+            };
+            let line = String::from_utf8_lossy(&part[..cut]).into_owned();
+            let drop_to = (cut + 1).min(part.len());
+            self.pipes[i].part.drain(..drop_to);
+            self.say(Tone::Out, line.trim_end_matches('\r'));
+            n += 1;
+        }
+        self.pipes[i].lines += n;
+        n
     }
 
     /// `:: UNA: plan=Exec verb=<v> served=1 pid=<n> ::` or `served=0 err=<errno>`.
@@ -521,4 +643,10 @@ impl Console {
         self.dirty = true;
         act
     }
+}
+
+/// RING3PIPE (B562): `SYS_SPAWN_PATH` with `SPAWN_PIPE` on argc's high half — the pid names the child's output pipe.
+fn spawn_piped(path: &str, argv: &[&str]) -> i64 {
+    let descs: Vec<una_abi::SpawnArg> = argv.iter().map(|a| una_abi::SpawnArg { ptr: a.as_ptr() as u64, len: a.len() as u64 }).collect();
+    sys(una_abi::SYS_SPAWN_PATH, path.as_ptr() as u64, path.len() as u64, descs.as_ptr() as u64, descs.len() as u64 | una_abi::SPAWN_PIPE)
 }

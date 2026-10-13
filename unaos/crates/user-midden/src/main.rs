@@ -37,6 +37,17 @@
 // name) is `:: MIDDEN: plan=Exec verb=<run|typed> served=1 pid=<n> ::`, or `served=0 err=<errno>` — and on exit
 // `:: MIDDEN: exit status=<s> rows=<n> cmds=<n> ::`. The exit status packs the same facts
 // (`midden_core::ring3::status`) — the channel `tests midden` (kernel `middenapp.rs`) reads back.
+//
+// RING3PIPE (rmbp-ledger B562). `run` and a bare-name launch ask SYS_SPAWN_PATH for a pipe (`una_abi::SPAWN_PIPE`): the
+// program still runs detached, and what it writes to its console comes back through `SYS_PIPE_READ(pid)` — `pump`,
+// once per frame, drains every open pipe into the scrollback as the bytes arrive (one row per line) and closes it at
+// EOF (the child exited, the ring is empty). A kernel that does not know the flag (E2BIG to the high argc bits) gets
+// the plain detached launch. Wire: `:: MIDDEN: pipe pid=<p> bytes=<n> lines=<l> ::` per chunk, `:: MIDDEN: pipe eof
+// ok=<0|1> pid=<p> lines=<n> bytes=<b> dropped=<d> rows=<r> ::` at EOF (ok = a line reached the scrollback, none dropped).
+// ONE-SHOT: `MIDDEN.ELF -c <words…>` opens no window — it plans the words as one line, writes every Out/Err row to its
+// console (SYS_WRITE handle 1, so a launcher's pipe carries it), says `:: MIDDEN: oneshot rows=<n> cmds=<n> status=<s>
+// ::` and exits with the packed status: the shell's `sh -c`, and the program `tests midden` / `tests una` run through
+// a pipe.
 
 extern crate alloc;
 
@@ -67,6 +78,20 @@ const INP_CAP: usize = 240;
 const HIST_CAP: usize = 32;
 /// The most a `cat` reads (the window shows the tail; the ring keeps 8 KB of it).
 const CAT_MAX: usize = 64 * 1024;
+/// RING3PIPE: one SYS_PIPE_READ's buffer, and the reads one pipe gets per frame.
+const PIPE_CHUNK: usize = 4096;
+const PIPE_READS: usize = 4;
+/// RING3PIPE: a line longer than this with no newline is pushed as it stands (the window wraps it).
+const PIPE_LINE_MAX: usize = 1024;
+
+/// RING3PIPE: a launched program whose output this shell is reading.
+struct Piped {
+    pid: i64,
+    part: Vec<u8>,
+    lines: u32,
+    bytes: u64,
+    dropped: u64,
+}
 
 static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY;
 
@@ -200,6 +225,10 @@ struct App {
     last_kind: u32,
     last_verb: u8,
     dirty: bool,
+    /// RING3PIPE: the launched programs whose output is still arriving.
+    pipes: Vec<Piped>,
+    /// ONE-SHOT (`-c`): no window; every Out/Err line is written to the console as it is said.
+    oneshot: bool,
 }
 
 impl App {
@@ -217,6 +246,12 @@ impl App {
     fn say(&mut self, tone: Tone, text: &str) {
         let cols = self.cols().max(8);
         for l in text.split('\n') {
+            if self.oneshot && tone != Tone::Echo {
+                let mut o = Vec::with_capacity(l.len() + 1);
+                o.extend_from_slice(l.as_bytes());
+                o.push(b'\n');
+                write(&o);
+            }
             let clean: String = l.chars().map(|c| if (' '..='~').contains(&c) { c } else if c == '\t' { ' ' } else { '?' }).collect();
             let mut rest: &str = &clean;
             loop {
@@ -295,7 +330,7 @@ impl App {
                 if word == "help" {
                     self.say(Tone::Out, &alloc::format!("MIDDEN.ELF serves: {} (+ the core's own words above)", ring3::SERVED.join(" ")));
                     if facts.exec {
-                        self.say(Tone::Out, "MIDDEN.ELF launches: run <path> [args], and bare names (detached, as this program's user)");
+                        self.say(Tone::Out, "MIDDEN.ELF launches: run <path> [args], and bare names (detached, as this program's user; their output arrives here)");
                     }
                 }
                 (1, word.clone(), true)
@@ -338,14 +373,108 @@ impl App {
             return Err(una_abi::ENOENT);
         };
         let path = resolve(&self.cwd, name);
-        let r = spawn_path(&path, argv);
+        // RING3PIPE: ask for a pipe; a kernel without the flag answers E2BIG to the high argc bits — launch plainly.
+        let mut piped = !self.oneshot;
+        let mut r = if piped { spawn_piped(&path, argv) } else { spawn_path(&path, argv) };
+        if piped && r == una_abi::E2BIG {
+            piped = false;
+            r = spawn_path(&path, argv);
+        }
         if r > 0 {
             self.say(Tone::Out, &alloc::format!("{}: {} started - pid {}", verb, path, r));
+            if piped {
+                self.pipes.push(Piped { pid: r, part: Vec::new(), lines: 0, bytes: 0, dropped: 0 });
+            }
             Ok(r)
         } else {
             self.say(Tone::Err, &alloc::format!("{}: {}: {} {}", verb, path, r, errno_text(r)));
             Err(r)
         }
+    }
+
+    /// RING3PIPE: drain every open pipe into the scrollback (called once per frame).
+    fn pump(&mut self) {
+        if self.pipes.is_empty() {
+            return;
+        }
+        let mut buf = alloc::vec![0u8; PIPE_CHUNK];
+        let mut i = 0;
+        while i < self.pipes.len() {
+            let pid = self.pipes[i].pid;
+            let mut closed: Option<i64> = None;
+            for _ in 0..PIPE_READS {
+                let r = sys(una_abi::SYS_PIPE_READ, pid as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
+                if r > 0 {
+                    let n = r as usize;
+                    let lines = self.pipe_bytes(i, &buf[..n]);
+                    let mut l = Line::new(b":: MIDDEN: pipe pid=");
+                    l.dec(pid).put(b" bytes=").dec(n as i64).put(b" lines=").dec(lines as i64).put(b" ::");
+                    l.wire();
+                    if n < buf.len() {
+                        let d = sys(una_abi::SYS_PIPE_READ, pid as u64, 0, 0, 0);
+                        if d >= 0 {
+                            self.pipes[i].dropped = d as u64;
+                        }
+                        break;
+                    }
+                } else if r == una_abi::EAGAIN {
+                    break;
+                } else {
+                    closed = Some(r);
+                    break;
+                }
+            }
+            match closed {
+                None => i += 1,
+                Some(r) => {
+                    let mut p = self.pipes.remove(i);
+                    if !p.part.is_empty() {
+                        let tail = String::from_utf8_lossy(&p.part).into_owned();
+                        self.say(Tone::Out, &tail);
+                        p.lines += 1;
+                        p.part.clear();
+                    }
+                    if r == 0 {
+                        let m = alloc::format!("run: pid {} exited - {} lines{}", pid, p.lines, if p.dropped > 0 { alloc::format!(", {} bytes dropped", p.dropped) } else { String::new() });
+                        self.say(Tone::Echo, &m);
+                    } else {
+                        let m = alloc::format!("run: pid {}: output lost - {} {}", pid, r, errno_text(r));
+                        self.say(Tone::Err, &m);
+                    }
+                    let ok = r == 0 && p.lines > 0 && p.dropped == 0;
+                    let mut l = Line::new(b":: MIDDEN: pipe eof ok=");
+                    l.dec(ok as i64).put(b" pid=").dec(pid).put(b" lines=").dec(p.lines as i64).put(b" bytes=").dec(p.bytes as i64);
+                    l.put(b" dropped=").dec(p.dropped as i64).put(b" rows=").dec(self.rows.len() as i64);
+                    if r != 0 {
+                        l.put(b" err=").dec(r);
+                    }
+                    l.put(b" ::");
+                    l.wire();
+                }
+            }
+        }
+    }
+
+    /// RING3PIPE: `b` from pipe `i` — complete lines into the scrollback, the rest held for the next chunk.
+    fn pipe_bytes(&mut self, i: usize, b: &[u8]) -> u32 {
+        self.pipes[i].bytes += b.len() as u64;
+        self.pipes[i].part.extend_from_slice(b);
+        let mut n = 0;
+        loop {
+            let part = &self.pipes[i].part;
+            let cut = match part.iter().position(|&c| c == b'\n') {
+                Some(k) => k,
+                None if part.len() >= PIPE_LINE_MAX => part.len(),
+                None => break,
+            };
+            let line = String::from_utf8_lossy(&part[..cut]).into_owned();
+            let drop_to = (cut + 1).min(part.len());
+            self.pipes[i].part.drain(..drop_to);
+            self.say(Tone::Out, line.trim_end_matches('\r'));
+            n += 1;
+        }
+        self.pipes[i].lines += n;
+        n
     }
 
     /// RING3EXEC (B521): account a launch line and put it on the wire —
@@ -554,7 +683,7 @@ impl App {
         }
     }
     fn paint(&mut self) {
-        if !self.dirty {
+        if !self.dirty || self.win < 0 {
             return;
         }
         self.dirty = false;
@@ -654,6 +783,59 @@ fn spawn_path(path: &str, argv: &[&str]) -> i64 {
     sys(una_abi::SYS_SPAWN_PATH, path.as_ptr() as u64, path.len() as u64, descs.as_ptr() as u64, descs.len() as u64)
 }
 
+/// RING3PIPE (B562): `SYS_SPAWN_PATH` with `SPAWN_PIPE` on argc's high half — the pid names the child's output pipe.
+fn spawn_piped(path: &str, argv: &[&str]) -> i64 {
+    let descs: Vec<una_abi::SpawnArg> = argv.iter().map(|a| una_abi::SpawnArg { ptr: a.as_ptr() as u64, len: a.len() as u64 }).collect();
+    sys(una_abi::SYS_SPAWN_PATH, path.as_ptr() as u64, path.len() as u64, descs.as_ptr() as u64, descs.len() as u64 | una_abi::SPAWN_PIPE)
+}
+
+/// ONE-SHOT: `-c <words…>` — the words after `-c`, joined by one space; `None` without `-c`.
+fn oneshot_line() -> Option<String> {
+    let a = una_abi::args()?;
+    if a.get(1)? != b"-c" {
+        return None;
+    }
+    let mut line = String::new();
+    for i in 2..a.argc() {
+        if let Some(w) = a.get(i).and_then(|b| core::str::from_utf8(b).ok()) {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(w);
+        }
+    }
+    Some(line)
+}
+
+/// ONE-SHOT: plan `line` with no window, its rows written to the console, then exit with the packed status.
+fn oneshot(line: &str) -> ! {
+    let mut app = App {
+        surf: core::ptr::null_mut(),
+        win: -1,
+        face: None,
+        rows: VecDeque::new(),
+        bytes: 0,
+        inp: Vec::new(),
+        caret: 0,
+        hist: VecDeque::new(),
+        hist_at: None,
+        cwd: home(),
+        facts: Facts { exec: cfg!(target_arch = "x86_64"), ..Facts::ring3(cfg!(target_arch = "x86_64")) },
+        cmds: 0,
+        last_kind: 0,
+        last_verb: 0,
+        dirty: false,
+        pipes: Vec::new(),
+        oneshot: true,
+    };
+    app.run_line(line);
+    let st = ring3::status(app.rows.len() as u32, app.cmds, app.last_kind, app.last_verb, false, false);
+    let mut l = Line::new(b":: MIDDEN: oneshot rows=");
+    l.dec(app.rows.len() as i64).put(b" cmds=").dec(app.cmds as i64).put(b" status=").dec(st as i64).put(b" ::");
+    l.wire();
+    exit(st)
+}
+
 /// The start cwd: the session home (SYS_WHOAMI) when a user is logged in, else the root.
 fn home() -> String {
     let mut rec = [0u8; una_abi::WHOAMI_MAX];
@@ -690,6 +872,9 @@ fn landmark_base() -> u64 {
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     let _ = &APP_NOTE;
+    if let Some(line) = oneshot_line() {
+        oneshot(&line); // ONE-SHOT (RING3PIPE, B562): `-c <words…>` — no window
+    }
     let base = landmark_base();
     let win = sys(SYS_WIN_CREATE, W as u64, H as u64, 0, 0);
     if win < 0 {
@@ -721,6 +906,8 @@ pub extern "C" fn _start() -> ! {
         last_kind: 0,
         last_verb: 0,
         dirty: true,
+        pipes: Vec::new(),
+        oneshot: false,
     };
     let mut l = Line::new(b":: MIDDEN: start window=");
     l.dec(win).put(b" font=");
@@ -763,6 +950,7 @@ pub extern "C" fn _start() -> ! {
             app.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
             theme_wire();
         }
+        app.pump(); // RING3PIPE (B562): what the launched programs wrote since the last frame
         app.paint();
         sleep_ms(16);
     }
