@@ -46,10 +46,71 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
 }
 
 /// Recomputes layout with real text measurement (`layout_core::remeasure` over [`HostFonts`]).
+///
+/// AETHERPAINTPERF2 (SR132): a twin [`build_tree_kept`] made for the kept tree goes through
+/// `layout_core::remeasure_kept` instead — the kept tree takes the twin's values and its taffy passes re-lay only
+/// the boxes whose style, children or measure inputs moved — and the kept tree is swapped into `tree`. The kept tree
+/// is used only while the font generation is the one it was measured in (a web font that arrived changes every
+/// run's measure without changing its inputs).
 pub fn remeasure(tree: &mut LayoutTree) {
-    layout_core::remeasure(tree, &HostFonts);
-    // AETHERPAINTPERF (SR130): every node of a fresh tree is laid out (the taffy passes stay whole-page).
-    crate::perf::add_laid_out(tree.taffy.total_node_count() as u64);
+    let generation = crate::fonts::webfont::generation();
+    let kept = if tree.kept_token != 0 {
+        KEPT.with(|k| {
+            let mut k = k.borrow_mut();
+            if k.as_ref().is_some_and(|(t, _)| *t == tree.kept_token) {
+                k.take().map(|(_, kept)| kept)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    match kept {
+        Some(mut kept) if kept.measure_epoch == generation => {
+            if layout_core::remeasure_kept(tree, &mut kept, &HostFonts) {
+                std::mem::swap(tree, &mut kept);
+            }
+        }
+        _ => {
+            tree.kept_token = 0;
+            layout_core::remeasure(tree, &HostFonts);
+        }
+    }
+    tree.measure_epoch = generation;
+    // AETHERPAINTPERF (SR130) / AETHERPAINTPERF2 (SR132): the boxes taffy re-laid (the dirty boxes of each taffy pass).
+    crate::perf::add_laid_out(tree.relaid);
+}
+
+thread_local! {
+    /// AETHERPAINTPERF2 (SR132): the kept tree a twin targets, under the twin's token, from [`build_tree_kept`] to the
+    /// [`remeasure`] that lays the twin out (or [`end_kept`]).
+    static KEPT: std::cell::RefCell<Option<(u64, LayoutTree)>> = const { std::cell::RefCell::new(None) };
+    static KEPT_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// AETHERPAINTPERF2 (SR132): [`build_tree`] for a relayout of the document `kept` was laid out from: the fresh box tree
+/// `layout_core::retarget`ed onto `kept`'s boxes (DOM nodes paired by arena id), `kept` held until the cascade's
+/// [`remeasure`] lays the twin out on it. A fresh tree, and `kept` dropped, when the scopes are off, the viewport
+/// changed, or the sheets carry `@container` rules (their second cascade round rebuilds the tree).
+pub fn build_tree_kept(dom: &NodeRef, vw: f32, vh: f32, kept: Option<LayoutTree>, sheets: &[String]) -> LayoutTree {
+    let fresh = build_tree(dom, vw, vh);
+    let Some(kept) = kept else { return fresh };
+    if !crate::perf::scoped() || kept.viewport != (vw, vh) || sheets.iter().any(|s| s.to_ascii_lowercase().contains("@container")) {
+        return fresh;
+    }
+    let token = KEPT_TOKEN.with(|t| {
+        t.set(t.get().wrapping_add(1).max(1));
+        t.get()
+    });
+    let twin = layout_core::retarget(fresh, &kept, token, &|n: &NodeRef| n.id().0 as u64);
+    KEPT.with(|k| *k.borrow_mut() = Some((token, kept)));
+    twin
+}
+
+/// AETHERPAINTPERF2 (SR132): the relayout is over — a kept tree no remeasure took is dropped.
+pub fn end_kept() {
+    KEPT.with(|k| k.borrow_mut().take());
 }
 
 // ---- AETHERSTYLE3 (SR103): scroll containers' offsets across relayouts ---------------------------------

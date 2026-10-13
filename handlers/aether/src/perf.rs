@@ -6,8 +6,10 @@
 //!
 //! * `cascaded` — elements run through the cascade (`css::apply_stylesheets*`: a scoped restyle re-cascades
 //!   only the elements a dirty root reaches and reuses the last cascade for the rest);
-//! * `laid_out` — taffy nodes of every tree `layout::remeasure` laid out (the box build and the taffy passes
-//!   stay whole-page: see docs/dev/evidence/aetherpaintperf/AETHERPAINTPERF.md);
+//! * `laid_out` — taffy nodes the taffy passes of `layout::remeasure` re-laid: before each pass, the dirty boxes
+//!   reachable from the root through dirty boxes (`LayoutTree::relaid`). AETHERPAINTPERF2 (SR132): a relayout keeps
+//!   the previous tree, so a clean box is a cache hit and is not counted (the box build and the style rewrites still
+//!   run over the whole tree: see docs/dev/evidence/aetherpaintperf/AETHERPAINTPERF2.md);
 //! * `painted` — boxes whose paint ran (`render::render_frame`: the paint index skips a box whose subtree's
 //!   ink bounds meet no damage rect); `skipped` counts the boxes it skipped;
 //! * `glyph_hits` — glyph runs drawn from the rasterized-run cache instead of being shaped and rasterized.

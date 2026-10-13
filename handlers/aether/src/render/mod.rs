@@ -139,6 +139,45 @@ struct PaintIndex {
     scroll: (i32, i32),
     painted: u64,
     skipped: u64,
+    /// AETHERPAINTPERF2 (SR132): the `draw_node` calls the index walk has opened (preorder count), the calls open now
+    /// (innermost last) with whether each one's OWN ink is unbounded, and the on-screen boxes it placed.
+    seq: u32,
+    open: Vec<(NodeId, bool)>,
+    snap: FrameSnap,
+}
+
+/// AETHERPAINTPERF2 (SR132): one box of an indexed frame whose subtree ink meets the viewport, as the walk placed it.
+#[derive(Clone, Copy, Debug)]
+struct BoxSnap {
+    /// Its `draw_node` call's place in the walk (preorder), and the call that encloses it.
+    seq: u32,
+    enclosing: Option<NodeId>,
+    /// Its subtree ink, and whether its own ink is unbounded (a transform, filter or clip-path group, a shadow, a
+    /// control, media, scrollbars, …).
+    ink: Ink,
+    own_unbounded: bool,
+    /// The origin the walk handed its call, and its layout box.
+    abs: (f32, f32),
+    layout: Option<taffy::Layout>,
+}
+
+/// AETHERPAINTPERF2 (SR132): what an indexed frame placed on screen — the engine keeps the last one, so the frame
+/// after a relayout can damage only the boxes that moved or changed ([`relayout_damage`]).
+#[derive(Default)]
+pub(crate) struct FrameSnap {
+    boxes: std::collections::HashMap<NodeId, BoxSnap>,
+    scroll: (i32, i32),
+    size: (u32, u32),
+}
+
+/// AETHERPAINTPERF2 (SR132): the last frame's on-screen boxes with the paint inputs of each, read off the tree it
+/// painted before a relayout replaces it ([`before_relayout`]).
+pub(crate) struct Before {
+    snap: FrameSnap,
+    /// Each box's paint inputs as text (None: never taken as unchanged — images, canvases, media, frames, controls).
+    inputs: std::collections::HashMap<NodeId, Option<String>>,
+    canvas: Option<(u8, u8, u8)>,
+    outlines: bool,
 }
 
 thread_local! {
@@ -152,10 +191,163 @@ fn walk_mode() -> u8 {
 /// Adds `r` to the ink of the innermost open `draw_node` call (index walk only).
 fn ink_add(r: Ink) {
     INDEX.with(|x| {
-        if let Some(top) = x.borrow_mut().stack.last_mut() {
+        let mut x = x.borrow_mut();
+        if let Some(top) = x.stack.last_mut() {
             *top = ink_union(*top, r);
         }
+        // AETHERPAINTPERF2 (SR132): the innermost open call's own ink is unbounded.
+        if !ink_bounded(r) {
+            if let Some(o) = x.open.last_mut() {
+                o.1 = true;
+            }
+        }
     });
+}
+
+/// Whether `r` is a finite rect (an unbounded ink is infinite on a side).
+fn ink_bounded(r: Ink) -> bool {
+    r.0 != f32::NEG_INFINITY && r.1 != f32::NEG_INFINITY && r.2 != f32::INFINITY && r.3 != f32::INFINITY
+}
+
+/// AETHERPAINTPERF2 (SR132): a box's paint inputs besides its place and layout box, as text: its DOM node (and a
+/// text node's data), its paint style (inherited values follow the ancestors', which are compared too), its line
+/// boxes, its scroll offset and multicol shift. None for what is never taken as unchanged: replaced content whose
+/// pixels arrive later (images, background images, canvases, SVG, frames, media) and form controls.
+fn box_inputs(layout: &LayoutTree, id: NodeId) -> Option<String> {
+    let n = layout.node_map.get(&id);
+    let tag = n.and_then(|n| n.as_element().map(|e| e.name.local.as_ref().to_string()));
+    if tag.as_deref().is_some_and(|t| {
+        matches!(t, "img" | "picture" | "canvas" | "svg" | "iframe" | "object" | "embed" | "video" | "audio" | "input" | "textarea" | "select" | "button")
+    }) {
+        return None;
+    }
+    let p = layout.paint_map.get(&id);
+    if p.is_some_and(|p| p.bg_image.is_some()) {
+        return None;
+    }
+    let text = n.filter(|n| layout_core::DomNode::is_text(*n)).map(layout_core::DomNode::text);
+    Some(format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        n.map(|n| n.id()),
+        text,
+        p,
+        layout.inline.get(&id),
+        layout.scroll.get(&id),
+        layout.col_shift.get(&id)
+    ))
+}
+
+/// Whether any box has an author outline (painted after the walk, in box-key order).
+fn any_outline(layout: &LayoutTree) -> bool {
+    layout.paint_map.values().any(|p| layout_core::paint::outline_of(p).is_some())
+}
+
+/// AETHERPAINTPERF2 (SR132): the engine took the last indexed frame's boxes (`take_snapshot`).
+pub(crate) fn take_snapshot() -> FrameSnap {
+    INDEX.with(|x| std::mem::take(&mut x.borrow_mut().snap))
+}
+
+/// AETHERPAINTPERF2 (SR132): reads the paint inputs of the boxes `snap` (the last frame of `layout`) placed on
+/// screen, before a relayout replaces or rewrites `layout`.
+pub(crate) fn before_relayout(layout: &LayoutTree, snap: FrameSnap) -> Before {
+    let inputs = snap.boxes.keys().map(|id| (*id, box_inputs(layout, *id))).collect();
+    Before { snap, inputs, canvas: canvas_background(layout), outlines: any_outline(layout) }
+}
+
+/// AETHERPAINTPERF2 (SR132): the damage of the first frame after a relayout — the union of the old and new subtree
+/// ink of every box whose place in the walk, origin, layout box or paint inputs differ between the frame `before`
+/// read and an index walk of `layout` now (a box that left the screen: its old ink; one that came onto it: its new
+/// ink). Box keys are stable across a kept relayout (`layout_core::retarget`), so an unchanged box compares equal.
+/// A box that changed paints only inside its subtree ink, and every painter clips to the damage, so the frame is the
+/// frame a viewport damage paints. None (the viewport) when the viewport, the scroll offset or the canvas background
+/// moved, an author outline exists, or a changed box sits in a call whose own ink is unbounded (a transform or filter
+/// group draws it elsewhere). The index walk leaves this layout's index and text boxes behind.
+pub(crate) fn relayout_damage(
+    layout: &LayoutTree,
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    scroll_x: f64,
+    scroll_y: f64,
+    before: &Before,
+) -> Option<Vec<(u32, u32, u32, u32)>> {
+    if before.snap.size != (width, height) || before.snap.scroll != (scroll_x as i32, scroll_y as i32) || before.snap.boxes.is_empty() {
+        return None;
+    }
+    if before.outlines || any_outline(layout) || canvas_background(layout) != before.canvas {
+        return None;
+    }
+    frame_walk(layout, surface, width, height, scroll_x, scroll_y, &[(0, 0, width, height)], true);
+    INDEX.with(|x| {
+        let x = x.borrow();
+        let now = &x.snap;
+        if now.size != (width, height) {
+            return None;
+        }
+        // A call whose own ink is unbounded, or that sits in one: its pixels are not where its ink says.
+        let grouped = |snap: &FrameSnap, id: NodeId| -> bool {
+            let mut cur = Some(id);
+            let mut hops = 0;
+            while let Some(c) = cur {
+                let Some(b) = snap.boxes.get(&c) else { return false };
+                if b.own_unbounded {
+                    return true;
+                }
+                cur = b.enclosing;
+                hops += 1;
+                if hops > 4096 {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut rects: Vec<Ink> = Vec::new();
+        for (id, old) in &before.snap.boxes {
+            match now.boxes.get(id) {
+                None => {
+                    if grouped(&before.snap, *id) {
+                        return None;
+                    }
+                    rects.push(old.ink);
+                }
+                Some(new) => {
+                    let placed = old.seq == new.seq && old.enclosing == new.enclosing && old.abs == new.abs && old.layout == new.layout;
+                    let same = placed && before.inputs.get(id).and_then(|t| t.as_ref()).is_some_and(|t| box_inputs(layout, *id).as_ref() == Some(t));
+                    if !same {
+                        if grouped(&before.snap, *id) || grouped(now, *id) {
+                            return None;
+                        }
+                        rects.push(old.ink);
+                        rects.push(new.ink);
+                    }
+                }
+            }
+        }
+        for (id, new) in &now.boxes {
+            if !before.snap.boxes.contains_key(id) {
+                if grouped(now, *id) {
+                    return None;
+                }
+                rects.push(new.ink);
+            }
+        }
+        // Screen pixels, clamped to the viewport; many rects become their union.
+        let (w, h) = (width as f32, height as f32);
+        let mut out: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut all = INK_NONE;
+        for r in rects {
+            let (x0, y0, x1, y1) = (r.0.max(0.0).floor(), r.1.max(0.0).floor(), r.2.min(w).ceil(), r.3.min(h).ceil());
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            all = ink_union(all, (x0, y0, x1, y1));
+            out.push((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32));
+        }
+        if out.len() > 64 {
+            out = vec![(all.0 as u32, all.1 as u32, (all.2 - all.0) as u32, (all.3 - all.1) as u32)];
+        }
+        Some(out)
+    })
 }
 
 /// The union of the last frame's subtree ink of `nodes` (boxes it did not paint add nothing), and the scroll
@@ -1935,17 +2127,35 @@ pub fn render_frame(
     scroll_y: f64,
     damage_rects: &[(u32, u32, u32, u32)],
 ) {
+    frame_walk(layout, surface, width, height, scroll_x, scroll_y, damage_rects, false);
+}
+
+/// The frame's walks. `index_only` (AETHERPAINTPERF2, SR132): the index walk alone — no pixel written — for
+/// [`relayout_damage`].
+#[allow(clippy::too_many_arguments)]
+fn frame_walk(
+    layout: &LayoutTree,
+    surface: &mut [u8],
+    width: u32,
+    height: u32,
+    scroll_x: f64,
+    scroll_y: f64,
+    damage_rects: &[(u32, u32, u32, u32)],
+    index_only: bool,
+) {
     if damage_rects.is_empty() {
         return;
     }
-    dump_layout(layout);
+    if !index_only {
+        dump_layout(layout);
+    }
     TEXT_BOXES.with(|t| t.borrow_mut().clear());
 
     // Clear damaged regions to the CANVAS background: the root element's
     // background, else body's (CSS Backgrounds §2.11.2 — the root/body
     // background propagates to the whole canvas, not just their boxes).
     let canvas = canvas_background(layout).unwrap_or((255, 255, 255));
-    for &(dx, dy, dw, dh) in damage_rects {
+    for &(dx, dy, dw, dh) in damage_rects.iter().filter(|_| !index_only) {
         let ex = (dx + dw).min(width);
         let ey = (dy + dh).min(height);
         for y in dy..ey {
@@ -1983,7 +2193,15 @@ pub fn render_frame(
     ) {
         match walk_mode() {
             1 => {
-                INDEX.with(|x| x.borrow_mut().stack.push(INK_NONE));
+                // AETHERPAINTPERF2 (SR132): the call's place in the walk and the call enclosing it.
+                let (seq, enclosing) = INDEX.with(|x| {
+                    let mut x = x.borrow_mut();
+                    x.stack.push(INK_NONE);
+                    x.seq += 1;
+                    let enclosing = x.open.last().map(|o| o.0);
+                    x.open.push((node_id, false));
+                    (x.seq, enclosing)
+                });
                 draw_node_body(
                     node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
                     damage_rects, clip,
@@ -1991,9 +2209,15 @@ pub fn render_frame(
                 INDEX.with(|x| {
                     let mut x = x.borrow_mut();
                     let r = x.stack.pop().unwrap_or(INK_NONE);
+                    let own_unbounded = x.open.pop().is_some_and(|o| o.1);
                     x.ink.insert(node_id, r);
                     if let Some(top) = x.stack.last_mut() {
                         *top = ink_union(*top, r);
+                    }
+                    // AETHERPAINTPERF2 (SR132): an on-screen box goes into the frame's snapshot.
+                    if ink_meets(r, &[(0, 0, width, height)]) {
+                        let lb = layout.taffy.layout(node_id).ok().copied();
+                        x.snap.boxes.insert(node_id, BoxSnap { seq, enclosing, ink: r, own_unbounded, abs: (abs_x, abs_y), layout: lb });
                     }
                 });
             }
@@ -3652,7 +3876,7 @@ pub fn render_frame(
     let root_inherited = root_inherited();
     // AETHERPAINTPERF (SR130): the index walk, then the paint walk that skips what meets no damage rect (one
     // classic walk when the scopes are off).
-    let indexed = crate::perf::scoped();
+    let indexed = crate::perf::scoped() || index_only;
     INDEX.with(|x| {
         let mut x = x.borrow_mut();
         x.ink.clear();
@@ -3661,13 +3885,20 @@ pub fn render_frame(
         x.painted = 0;
         x.skipped = 0;
         x.mode = if indexed { 1 } else { 0 };
+        // AETHERPAINTPERF2 (SR132): the index walk records the frame's on-screen boxes afresh.
+        x.seq = 0;
+        x.open.clear();
+        x.snap = FrameSnap { boxes: std::collections::HashMap::new(), scroll: (sx, sy), size: if indexed { (width, height) } else { (0, 0) } };
     });
     if indexed {
         draw_node(
             layout.root_node, 0.0, 0.0, root_inherited, layout, &font, &font_bold, surface, width, height, sx, sy,
             damage_rects, (0.0, 0.0, width as f32, height as f32),
         );
-        INDEX.with(|x| x.borrow_mut().mode = 2);
+        INDEX.with(|x| x.borrow_mut().mode = if index_only { 0 } else { 2 });
+        if index_only {
+            return;
+        }
     }
     draw_node(
         layout.root_node,

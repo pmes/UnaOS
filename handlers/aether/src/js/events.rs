@@ -876,6 +876,7 @@ fn legacy_canceled_activation(vm: &mut Vm, a: usize, l: Legacy) {
             if prev != Some(a) {
                 page(|p| p.checked.insert(a, false));
                 super::touch();
+                crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: a, name: "checked".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
             }
             if let Some(p) = prev.filter(|p| *p != a) {
                 if super::controls::input_type(p) == "radio" {

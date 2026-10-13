@@ -5,9 +5,12 @@
 //! on — reading `aether::perf` counters over the measured frames:
 //!
 //! * `list` — 2,000 rows (`.row:nth-child(odd)` zebra), one visible row's text changes by script: the restyle
-//!   re-cascades that row only; the box build and the taffy passes stay whole-page (laid_out is the tree);
-//!   the frame after the relayout damages the viewport, and the paint index paints only the boxes on screen;
-//!   the unchanged rows redraw from the glyph-run cache.
+//!   re-cascades that row only; AETHERPAINTPERF2 (SR132): the relayout keeps the previous tree and taffy re-lays
+//!   the row, its text and their ancestors only (laid_out ≤ 16 of 4,004); the frame after it damages the changed
+//!   row's ink, not the viewport, and paints the boxes that ink meets.
+//! * `spa` — AETHERPAINTPERF2 (SR132): 2,000 rows in 40 pages of 50; script replaces the first page's 50 rows
+//!   by `innerHTML` (an SPA re-render): the restyle re-cascades that page, the relayout re-lays it and its
+//!   ancestors (laid_out ≤ 120), the frame damages the replaced rows' ink.
 //! * `anim` — 300 boxes, one with a `background-color` CSS animation: ten frames, each damaging only the
 //!   animated box's ink, no cascade, no layout.
 //! * `keys` — a form field and 200 paragraphs, 20 typed characters: each frame damages the field only.
@@ -99,12 +102,65 @@ fn list_row_text_change() {
     // The changed row's children changed and a selector reads sibling structure: the row's subtree re-cascades.
     assert!(after.cascaded <= 4, "a one-row change re-cascades at most 4 of {elements} elements: {after:?}");
     // The viewport (800x600) shows ~35 rows of 18 px: the index paints those and the ancestors.
-    assert!(after.painted <= 100, "the paint touches at most 100 of {elements} boxes (5%): {after:?}");
+    // AETHERPAINTPERF2 (SR132): the kept tree re-lays the document node, html, body, #list, the row and its new text.
+    assert!(before.laid_out >= 4000, "a whole relayout lays out every box: {before:?}");
+    assert!(after.laid_out <= 16, "a one-row text change re-lays at most 16 of 4,004 boxes: {after:?}");
+    // AETHERPAINTPERF2 (SR132): the frame damages the changed row's ink (its neighbours' ink overhangs it), not the
+    // viewport: the ancestors and a handful of rows paint, and the unchanged ones among them redraw from the run cache.
+    assert!(after.painted <= 30, "the paint touches the changed row's neighbourhood only: {after:?}");
     assert!(after.skipped >= 1900, "the off-screen rows are skipped: {after:?}");
-    assert!(after.glyph_hits >= 20, "the unchanged visible rows redraw from the run cache: {after:?}");
+    assert!(after.glyph_hits >= 1, "an unchanged row in the damage redraws from the run cache: {after:?}");
     let scoped = e.surface().to_vec();
     let whole = whole_frame(&mut e, true);
     same_frame(&scoped, &whole, e.width, "list");
+}
+
+fn spa_html() -> String {
+    let pages: String = (0..40)
+        .map(|p| {
+            let rows: String = (0..50).map(|r| format!("<div class=\"row\">Row {}</div>", p * 50 + r)).collect();
+            format!("<div class=\"page\">{rows}</div>")
+        })
+        .collect();
+    format!(
+        "<!doctype html><html><head><style>\
+         body {{ margin: 0; font: 14px sans-serif }}\
+         .row {{ height: 18px; padding: 0 4px }}\
+         .row:nth-child(odd) {{ background: rgb(238, 238, 238) }}\
+         </style></head><body><div id=\"list\">{pages}</div></body></html>"
+    )
+}
+
+/// The first page's 50 rows are replaced by `innerHTML` (an SPA re-render of one page of the list).
+fn spa_measure(scoped: bool) -> (perf::Counters, AetherEngine) {
+    let mut e = load(&spa_html(), scoped);
+    perf::reset();
+    let js = "var p = document.getElementById('list').children[0]; var h = ''; \
+              for (var i = 0; i < 50; i++) h += '<div class=\"row\">Fresh row ' + i + '</div>'; \
+              p.innerHTML = h; 'ok'";
+    assert_eq!(eval(&mut e, js), "ok");
+    e.tick(); // the mutation relayouts
+    e.render_frame();
+    (perf::counters(), e)
+}
+
+#[test]
+fn spa_page_replaced_by_inner_html() {
+    let elements = 2045; // html, head, style, body, #list, 40 pages and 2,000 rows
+    let (before, _) = spa_measure(false);
+    let (after, mut e) = spa_measure(true);
+    line("spa", elements, &before, &after);
+    assert!(before.cascaded >= 2000, "the whole cascade runs every element: {before:?}");
+    assert!(before.laid_out >= 4000, "a whole relayout lays out every box: {before:?}");
+    assert_eq!((after.scoped_restyles, after.whole_restyles), (1, 0), "the innerHTML change is recorded, the restyle scoped: {after:?}");
+    // The page's children changed and a selector reads sibling structure: the page's subtree (the page, 50 rows).
+    assert!(after.cascaded <= 60, "a 50-row re-render re-cascades at most 60 of {elements} elements: {after:?}");
+    // The document node, html, body, #list, the page, its 50 rows and their 50 texts.
+    assert!(after.laid_out <= 120, "a 50-row re-render re-lays at most 120 of 4,044 boxes: {after:?}");
+    assert!(after.painted <= 100, "the paint touches at most 100 of {elements} boxes: {after:?}");
+    let scoped = e.surface().to_vec();
+    let whole = whole_frame(&mut e, true);
+    same_frame(&scoped, &whole, e.width, "spa");
 }
 
 fn anim_html() -> String {
@@ -190,6 +246,8 @@ fn twenty_keystrokes() {
     println!("PAINTPERF fixture=keys per-frame-max before: painted={} | after: cascaded={} laid_out={} painted={}", before_worst.painted, worst.cascaded, worst.laid_out, worst.painted);
     assert_eq!(eval(&mut e, "document.getElementById('f').value"), "abcdefghijklmnopqrst");
     assert!(before_worst.painted >= 200, "the classic walk reaches every box: {before_worst:?}");
+    // AETHERPAINTPERF2 (SR132): laid_out 0 — typing changes the field's value, which no box's layout reads here
+    // (the field keeps its specified width), so no relayout runs at all.
     assert_eq!((worst.cascaded, worst.laid_out), (0, 0), "typing without a listener neither cascades nor lays out");
     // The document node, html, body, form and the field.
     assert!(worst.painted <= 8, "a keystroke frame paints at most 8 of {elements} boxes: {worst:?}");

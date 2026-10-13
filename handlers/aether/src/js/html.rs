@@ -991,6 +991,7 @@ pub fn set_checkedness(_vm: &mut Vm, n: usize, v: bool) {
         }
     }
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: n, name: "checked".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
 }
 
 fn input_type(el: usize) -> String {
@@ -1051,6 +1052,7 @@ fn input_value_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let v = sanitize(&ty, &v);
     page(|p| p.values.insert(el, v));
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "value".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     Ok(Value::Undefined)
 }
 
@@ -1077,6 +1079,7 @@ fn textarea_value_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let v = string_null_empty(vm, &arg(vm, ctx, 0))?;
     page(|p| p.values.insert(el, v));
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "value".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     Ok(Value::Undefined)
 }
 
@@ -1131,6 +1134,7 @@ fn select_value_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         page(|p| p.checked.insert(o, sel));
     }
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "selected".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     Ok(Value::Undefined)
 }
 
@@ -1148,6 +1152,7 @@ fn select_selected_index_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         page(|p| p.checked.insert(o, k as i32 == i));
     }
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "selected".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     Ok(Value::Undefined)
 }
 
@@ -1214,6 +1219,7 @@ fn option_selected_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     page(|p| p.checked.insert(el, b));
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "selected".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     Ok(Value::Undefined)
 }
 
@@ -1289,6 +1295,7 @@ fn form_reset(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
     });
     super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "value".into(), old: None, new: None }); // AETHERPAINTPERF2 (SR132): form state, which no selector reads (css_core matches the attribute)
     Ok(Value::Undefined)
 }
 
