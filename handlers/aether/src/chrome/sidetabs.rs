@@ -96,6 +96,17 @@ impl SideStrip {
         if self.collapsed { RAIL_W } else { SIDE_W }
     }
 
+    /// The column's width in a window `window_w` px wide (AETHERSIDETABS2, SR143): [`SideStrip::width`], but
+    /// the open column never takes more than a third of a narrow window (the UnaOS face's 288 px surface), and
+    /// never less than the rail.
+    pub fn width_for(&self, window_w: u32) -> u32 {
+        if self.collapsed {
+            RAIL_W
+        } else {
+            SIDE_W.min(window_w / 3).max(RAIL_W)
+        }
+    }
+
     /// Collapse to the rail or open again; answers whether it is now collapsed.
     pub fn toggle(&mut self) -> bool {
         self.collapsed = !self.collapsed;
@@ -148,7 +159,12 @@ impl SideStrip {
 
     /// What column point `(x, y)` is over in a column `h` px tall (None: outside it, or empty space).
     pub fn hit(&self, strip: &TabStrip, h: u32, x: i32, y: i32) -> Option<SideHit> {
-        let w = self.width() as i32;
+        self.hit_w(strip, self.width(), h, x, y)
+    }
+
+    /// [`SideStrip::hit`] for a column `w` px wide ([`SideStrip::width_for`] on a narrow window).
+    pub fn hit_w(&self, strip: &TabStrip, w: u32, h: u32, x: i32, y: i32) -> Option<SideHit> {
+        let w = w as i32;
         if x < 0 || y < 0 || x >= w || y >= h as i32 {
             return None;
         }
@@ -199,4 +215,52 @@ impl TabSearch {
         let id = *r.get(self.sel.min(r.len().saturating_sub(1)))?;
         strip.select(id).then_some(id)
     }
+}
+
+// ---- AETHERSIDETABS2 (SR143): the favicon tile ---------------------------------------------------------------------
+
+/// The strip's favicon tile: [`FAVICON_PX`] x [`FAVICON_PX`] RGBA, what both faces draw in place of the letter tile.
+pub const FAVICON_PX: u32 = 16;
+
+/// Scale a decoded icon (`w` x `h`, tightly packed 8-bit RGBA, top row first — what the engine's image cores
+/// hand back for a `<link rel=icon>`) into the strip's tile: fitted inside [`FAVICON_PX`] square keeping its
+/// aspect, centred on transparency; each tile pixel the alpha-weighted mean of the source pixels under it (a box
+/// filter, so a 32 or 48 px icon stays crisp and a 1 px hairline does not vanish into black), a source smaller
+/// than the tile repeated (nearest). `None` for an empty or short buffer.
+pub fn favicon_tile(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return None;
+    }
+    let n = FAVICON_PX as usize;
+    let big = w.max(h);
+    let (tw, th) = ((w * n / big).max(1), (h * n / big).max(1));
+    let (ox, oy) = ((n - tw) / 2, (n - th) / 2);
+    let mut out = alloc::vec![0u8; n * n * 4];
+    for ty in 0..th {
+        let (y0, y1) = (ty * h / th, ((ty + 1) * h / th).max(ty * h / th + 1).min(h));
+        for tx in 0..tw {
+            let (x0, x1) = (tx * w / tw, ((tx + 1) * w / tw).max(tx * w / tw + 1).min(w));
+            let (mut r, mut g, mut b, mut a, mut k) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = (sy * w + sx) * 4;
+                    let al = rgba[i + 3] as u64;
+                    r += rgba[i] as u64 * al;
+                    g += rgba[i + 1] as u64 * al;
+                    b += rgba[i + 2] as u64 * al;
+                    a += al;
+                    k += 1;
+                }
+            }
+            let o = ((oy + ty) * n + ox + tx) * 4;
+            if a > 0 {
+                out[o] = (r / a) as u8;
+                out[o + 1] = (g / a) as u8;
+                out[o + 2] = (b / a) as u8;
+                out[o + 3] = (a / k.max(1)) as u8;
+            }
+        }
+    }
+    Some(out)
 }

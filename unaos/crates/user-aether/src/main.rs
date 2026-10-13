@@ -71,6 +71,10 @@
 // page's LOGICAL size; `App::hist` is the tab's `SessionHistory`; `load` asks the chrome for the new-tab page and
 // tells it what loaded; a link to a file Aether does not render is a download; the frame goes up through
 // `chrome::blit` (the chrome on top, the page scaled under it).
+//
+// AETHERSIDETABS2 (LEDGER SR143): the page's ORIGIN is the chrome's (`Chrome::page_x`/`page_y`: (0, CHROME_H) with the
+// tabs on top, (the side column's width, BAR_H) with them on the side); the frame loop asks `chrome::prefs` every turn
+// (it reads Principia's `aether.tabs.layout` when the store moved or its poll is due) so the switch is live.
 
 extern crate alloc;
 
@@ -951,7 +955,9 @@ pub extern "C" fn _start() -> ! {
             app.flash = None;
             app.dirty = true;
         }
-        if theme::due(now_ms()) && theme::load() {
+        let moved = theme::due(now_ms());
+        chrome::prefs(&mut app, now_ms(), moved); // AETHERSIDETABS2 (SR143): `aether.tabs.layout` — the tabs' side, live
+        if moved && theme::load() {
             app.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
             theme_wire();
         }

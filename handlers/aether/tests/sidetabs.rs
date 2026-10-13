@@ -141,3 +141,86 @@ fn the_letter_tile_reads_the_host_or_the_title() {
     s.update(a, Some("  über alles"), None, None);
     assert_eq!(s.get(a).unwrap().initial(), 'Ü');
 }
+
+// ---- AETHERSIDETABS2 (SR143): the wire, the favicon tile, the narrow column ------------------------------------------
+
+use aether::chrome::{apply_tab_verb, tabs_message};
+use bandy::SMessage;
+
+/// Through the wire as the bus carries it: JSON out and back.
+fn wire(m: &SMessage) -> SMessage {
+    serde_json::from_str(&serde_json::to_string(m).unwrap()).unwrap()
+}
+
+#[test]
+fn the_group_and_move_wire_round_trips_through_the_model() {
+    let (mut s, ids) = strip(4);
+    // The face's verbs, each through the wire, applied by the model.
+    let verb = |s: &mut TabStrip, m: SMessage| apply_tab_verb(s, &wire(&m));
+    assert_eq!(verb(&mut s, SMessage::BrowserTabGroupNew { tabs: vec![ids[1], ids[2]], name: "work".into(), color: None }), Some(true));
+    let g = s.groups()[0].id;
+    assert_eq!(s.group(g).unwrap().color, GroupColor::Grey, "no colour named: the first one no group uses");
+    assert_eq!(verb(&mut s, SMessage::BrowserTabMove { id: ids[3], to: 0 }), Some(true));
+    assert_eq!(order(&s), vec![ids[3], ids[0], ids[1], ids[2]]);
+    assert_eq!(verb(&mut s, SMessage::BrowserTabGroupAdd { id: ids[0], group: g }), Some(true));
+    assert_eq!(s.group_tabs(g), vec![ids[1], ids[2], ids[0]]);
+    assert_eq!(verb(&mut s, SMessage::BrowserTabGroupRecolor { group: g, color: None }), Some(true));
+    assert_eq!(s.group(g).unwrap().color, GroupColor::Blue, "no colour named: the next one");
+    assert_eq!(verb(&mut s, SMessage::BrowserTabGroupRename { group: g, name: "play".into() }), Some(true));
+    assert_eq!(verb(&mut s, SMessage::BrowserTabUngroup(ids[0])), Some(true));
+    assert_eq!(verb(&mut s, SMessage::BrowserTabGroupToggle(g)), Some(true));
+    assert!(s.group(g).unwrap().collapsed);
+    assert_eq!(verb(&mut s, SMessage::BrowserTabGroupAdd { id: ids[0], group: 999 }), Some(false), "an unknown group misses");
+    assert_eq!(verb(&mut s, SMessage::BrowserTabSelect(ids[0])), None, "not a strip verb: the shell routes it");
+
+    // The strip out on the wire: rows in order with URL, group and letter tile; the groups with their colour.
+    let SMessage::BrowserTabs { active, tabs, groups } = wire(&tabs_message(&s)) else { panic!("not BrowserTabs") };
+    assert_eq!(active, s.active());
+    assert_eq!(tabs.iter().map(|t| t.id).collect::<Vec<_>>(), order(&s));
+    let row = tabs.iter().find(|t| t.id == ids[1]).unwrap();
+    assert_eq!((row.label.as_str(), row.url.as_str(), row.group, row.initial.as_str()), ("t2", "https://site2.test/", Some(g), "T"));
+    assert_eq!(tabs.iter().find(|t| t.id == ids[0]).unwrap().group, None);
+    assert_eq!(groups.len(), 1);
+    assert_eq!((groups[0].name.as_str(), groups[0].color.as_str(), groups[0].rgb, groups[0].collapsed), ("play", "blue", GroupColor::Blue.rgb(), true));
+
+    assert_eq!(verb(&mut s, SMessage::BrowserTabGroupDissolve(g)), Some(true));
+    assert!(s.groups().is_empty());
+}
+
+#[test]
+fn the_favicon_decodes_to_the_strip_tile() {
+    use aether::chrome::sidetabs::{favicon_tile, FAVICON_PX};
+    // A 32 px PNG icon, left half red, right half blue — through the engine's own decoder (pixel_core).
+    let icon = image::RgbaImage::from_fn(32, 32, |x, _| if x < 16 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+    let mut png = Vec::new();
+    icon.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let decoded = aether::images::decode_raster(&png).expect("the PNG decodes");
+    let (w, h) = decoded.dimensions();
+    let tile = favicon_tile(w, h, decoded.as_raw()).expect("a tile");
+    let n = FAVICON_PX as usize;
+    assert_eq!(tile.len(), n * n * 4);
+    let px = |x: usize, y: usize| &tile[(y * n + x) * 4..(y * n + x) * 4 + 4];
+    assert_eq!(px(2, 8), &[255, 0, 0, 255]);
+    assert_eq!(px(13, 8), &[0, 0, 255, 255]);
+    // A wide icon is fitted, centred on transparency; a short buffer is refused.
+    let wide = vec![255u8; 32 * 16 * 4];
+    let t = favicon_tile(32, 16, &wide).unwrap();
+    assert_eq!(t[3], 0, "the band above a wide icon is transparent");
+    assert_eq!(t[(8 * n + 8) * 4 + 3], 255);
+    assert!(favicon_tile(4, 4, &[0u8; 8]).is_none());
+}
+
+#[test]
+fn the_side_column_takes_a_third_of_a_narrow_window() {
+    let (s, ids) = strip(3);
+    let mut side = SideStrip::default();
+    assert_eq!(side.width_for(1280), SIDE_W);
+    assert_eq!(side.width_for(288), 96, "the UnaOS face's 288 px surface");
+    assert_eq!(side.width_for(90), RAIL_W, "never narrower than the rail");
+    let h = 8 * ROW_H;
+    let y = ROW_H as i32 + 5;
+    assert_eq!(side.hit_w(&s, 96, h, 90, y), Some(SideHit::Close(ids[0])), "the close box at the narrow column's edge");
+    assert_eq!(side.hit_w(&s, 96, h, 97, y), None);
+    side.toggle();
+    assert_eq!(side.width_for(1280), RAIL_W);
+}

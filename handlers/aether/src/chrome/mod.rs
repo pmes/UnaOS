@@ -28,6 +28,64 @@ pub mod host;
 // this re-export keeps the `chrome::devtools` path the host frame call and the faces name.
 pub use crate::devtools;
 
+// ---- AETHERSIDETABS2 (SR143): the strip on the wire ---------------------------------------------------------------
+// The model above is std-free; these two are the std seam between it and bandy (the shell publishes with
+// `tabs_message` and routes the face's drag and group verbs through `apply_tab_verb`), here so the round trip is
+// testable without a shell.
+
+/// The strip as bandy's `BrowserTabs`: every tab's row (label, URL, group, letter tile) and every group.
+pub fn tabs_message(strip: &tabs::TabStrip) -> bandy::SMessage {
+    let tabs = strip
+        .tabs()
+        .iter()
+        .map(|t| bandy::BrowserTabRow {
+            id: t.id,
+            label: t.label().to_string(),
+            url: t.url.clone(),
+            loading: t.loading,
+            group: t.group,
+            initial: t.initial().to_string(),
+        })
+        .collect();
+    let groups = strip
+        .groups()
+        .iter()
+        .map(|g| bandy::BrowserTabGroupRow {
+            id: g.id,
+            name: g.name.clone(),
+            color: g.color.name().to_string(),
+            rgb: g.color.rgb(),
+            collapsed: g.collapsed,
+        })
+        .collect();
+    bandy::SMessage::BrowserTabs { active: strip.active(), tabs, groups }
+}
+
+/// Apply a drag or group verb from the face to the strip. `None`: `m` is not one of them (the caller routes it);
+/// `Some(changed)`: it was, and whether the strip moved (the caller republishes, and re-activates when the active
+/// tab changed — collapsing the active tab's group moves it).
+pub fn apply_tab_verb(strip: &mut tabs::TabStrip, m: &bandy::SMessage) -> Option<bool> {
+    use bandy::SMessage as M;
+    let color = |c: &Option<String>| c.as_deref().and_then(tabs::GroupColor::parse);
+    Some(match m {
+        M::BrowserTabMove { id, to } => strip.move_to(*id, *to as usize),
+        M::BrowserTabGroupNew { tabs: ids, name, color: c } => {
+            let col = color(c).unwrap_or_else(|| strip.next_color());
+            strip.group_new(name, col, ids).is_some()
+        }
+        M::BrowserTabGroupAdd { id, group } => strip.group_add(*id, *group),
+        M::BrowserTabUngroup(id) => strip.ungroup(*id),
+        M::BrowserTabGroupToggle(g) => strip.group_toggle(*g).is_some(),
+        M::BrowserTabGroupRename { group, name } => strip.group_rename(*group, name),
+        M::BrowserTabGroupRecolor { group, color: c } => {
+            let Some(cur) = strip.group(*group).map(|g| g.color) else { return Some(false) };
+            strip.group_recolor(*group, color(c).unwrap_or(cur.next()))
+        }
+        M::BrowserTabGroupDissolve(g) => strip.group_dissolve(*g),
+        _ => return None,
+    })
+}
+
 /// Where the developer-tools pane sits in the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DevtoolsDock {

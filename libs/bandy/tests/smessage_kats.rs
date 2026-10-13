@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use bandy::ontology::WeightedSkeleton;
 use bandy::signals::{
-    A11yVerb, FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom, LogEvent, MatrixEvent, PrefValue,
+    A11yVerb, BrowserTabGroupRow, BrowserTabRow, FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom, LogEvent, MatrixEvent, PrefValue,
     PrincipiaCommand, SMessage, TabulaCommand,
 };
 use bandy::state::{
@@ -378,8 +378,48 @@ kat!(kat_browser_bookmark_toggle, SMessage::BrowserBookmarkToggle, r#""BrowserBo
 kat!(kat_browser_page_info_ask, SMessage::BrowserPageInfoAsk, r#""BrowserPageInfoAsk""#);
 kat!(
     kat_browser_tabs,
-    SMessage::BrowserTabs { active: 2, tabs: vec![(1, "UnaOS".to_string(), false), (2, "New Tab".to_string(), true)] },
-    r#"{"BrowserTabs":{"active":2,"tabs":[[1,"UnaOS",false],[2,"New Tab",true]]}}"#
+    SMessage::BrowserTabs {
+        active: 2,
+        tabs: vec![
+            BrowserTabRow {
+                id: 1,
+                label: "UnaOS".to_string(),
+                url: "https://una.os/".to_string(),
+                loading: false,
+                group: Some(1),
+                initial: "U".to_string(),
+            },
+            BrowserTabRow { id: 2, label: "New Tab".to_string(), url: String::new(), loading: true, group: None, initial: "+".to_string() },
+        ],
+        groups: vec![BrowserTabGroupRow { id: 1, name: "work".to_string(), color: "blue".to_string(), rgb: 0x1A73E8, collapsed: false }],
+    },
+    r#"{"BrowserTabs":{"active":2,"tabs":[{"id":1,"label":"UnaOS","url":"https://una.os/","loading":false,"group":1,"initial":"U"},{"id":2,"label":"New Tab","url":"","loading":true,"group":null,"initial":"+"}],"groups":[{"id":1,"name":"work","color":"blue","rgb":1733608,"collapsed":false}]}}"#
+);
+// --- AETHERSIDETABS2 (SR143): the drag, the group verbs, the per-tab favicon ---
+kat!(kat_browser_tab_move, SMessage::BrowserTabMove { id: 3, to: 0 }, r#"{"BrowserTabMove":{"id":3,"to":0}}"#);
+kat!(
+    kat_browser_tab_group_new,
+    SMessage::BrowserTabGroupNew { tabs: vec![1, 3], name: "work".to_string(), color: None },
+    r#"{"BrowserTabGroupNew":{"tabs":[1,3],"name":"work","color":null}}"#
+);
+kat!(kat_browser_tab_group_add, SMessage::BrowserTabGroupAdd { id: 4, group: 1 }, r#"{"BrowserTabGroupAdd":{"id":4,"group":1}}"#);
+kat!(kat_browser_tab_ungroup, SMessage::BrowserTabUngroup(4), r#"{"BrowserTabUngroup":4}"#);
+kat!(kat_browser_tab_group_toggle, SMessage::BrowserTabGroupToggle(1), r#"{"BrowserTabGroupToggle":1}"#);
+kat!(
+    kat_browser_tab_group_rename,
+    SMessage::BrowserTabGroupRename { group: 1, name: "play".to_string() },
+    r#"{"BrowserTabGroupRename":{"group":1,"name":"play"}}"#
+);
+kat!(
+    kat_browser_tab_group_recolor,
+    SMessage::BrowserTabGroupRecolor { group: 1, color: Some("green".to_string()) },
+    r#"{"BrowserTabGroupRecolor":{"group":1,"color":"green"}}"#
+);
+kat!(kat_browser_tab_group_dissolve, SMessage::BrowserTabGroupDissolve(1), r#"{"BrowserTabGroupDissolve":1}"#);
+kat!(
+    kat_browser_tab_favicon,
+    SMessage::BrowserTabFavicon { id: 2, size: 1, rgba: vec![0, 128, 255, 255] },
+    r#"{"BrowserTabFavicon":{"id":2,"size":1,"rgba":[0,128,255,255]}}"#
 );
 kat!(
     kat_browser_nav_state,
@@ -1406,6 +1446,15 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserTabClose(_) => "BrowserTabClose",
         SMessage::BrowserTabSelect(_) => "BrowserTabSelect",
         SMessage::BrowserTabStep(_) => "BrowserTabStep",
+        SMessage::BrowserTabMove { .. } => "BrowserTabMove",
+        SMessage::BrowserTabGroupNew { .. } => "BrowserTabGroupNew",
+        SMessage::BrowserTabGroupAdd { .. } => "BrowserTabGroupAdd",
+        SMessage::BrowserTabUngroup(_) => "BrowserTabUngroup",
+        SMessage::BrowserTabGroupToggle(_) => "BrowserTabGroupToggle",
+        SMessage::BrowserTabGroupRename { .. } => "BrowserTabGroupRename",
+        SMessage::BrowserTabGroupRecolor { .. } => "BrowserTabGroupRecolor",
+        SMessage::BrowserTabGroupDissolve(_) => "BrowserTabGroupDissolve",
+        SMessage::BrowserTabFavicon { .. } => "BrowserTabFavicon",
         SMessage::BrowserZoom(_) => "BrowserZoom",
         SMessage::BrowserFind { .. } => "BrowserFind",
         SMessage::BrowserFindClose => "BrowserFindClose",
