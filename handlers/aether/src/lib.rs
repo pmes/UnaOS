@@ -1220,7 +1220,14 @@ impl AetherEngine {
     /// Pastes `text` (the shell's `BrowserPaste`, from the platform clipboard) into the focused text
     /// control at its caret: the same insertion as typing, line breaks kept only in a textarea.
     pub fn paste(&mut self, text: &str) {
+        crate::js::clipboard::set_platform_text(text);
         self.insert_text(text);
+    }
+
+    /// AETHERAPIS (SR145): text a page wrote through `navigator.clipboard.writeText` since the last call, as the
+    /// shell's clipboard signal (the same one AETHERSELECT uses for a selection copy); None when nothing was written.
+    pub fn clipboard_written(&self) -> Option<bandy::SMessage> {
+        crate::js::clipboard::take_written().map(bandy::SMessage::BrowserClipboardSet)
     }
 
     /// The caret position (byte offset into the value) nearest to the viewport point (`x`, `y`) inside

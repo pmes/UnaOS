@@ -246,9 +246,6 @@ mod tests {
             div { filter: blur(2px); grid-template-columns: 1fr 1fr; display: grid; }
         </style></head><body>
             <div id="t">x</div>
-            <script>
-                new IntersectionObserver(function () {}).observe(document.body);
-            </script>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
         engine.load_html("fixture://ledger", html, true);
@@ -261,12 +258,9 @@ mod tests {
         assert!(!snap.contains(ApiCategory::Css, "property:filter"), "a handled CSS property must not be recorded");
         assert!(snap.contains(ApiCategory::Css, "property:grid-template-columns"), "unhandled CSS property must be recorded");
         assert!(snap.contains(ApiCategory::Css, "display:grid"), "unhandled display value must be recorded");
-        // clearTimeout used to be the JS-side example here; it is a real
-        // implementation now (see event_loop), so the honest never-delivers
-        // shim stands in for the "shim reports itself" contract.
-        // AETHERSHADOW (SR82): MutationObserver delivers now; IntersectionObserver is the shim that stands in.
-        assert!(snap.contains(ApiCategory::Js, "observer-never-delivers:IntersectionObserver"),
-            "a shim that answers without knowing must record itself");
+        // AETHERAPIS (SR145): no self-reporting observer shim remains (MutationObserver SR82, PerformanceObserver
+        // SR135, IntersectionObserver / ResizeObserver SR145 all deliver), so the CSS rows alone carry the
+        // "an unhandled thing records itself" contract here.
     }
 
     #[test]
