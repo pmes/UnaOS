@@ -1191,7 +1191,7 @@ fn form_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn form_elements(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
-    Ok(dom::cached(vm, el, SO_ELEMENTS, |vm| dom::make_collection(vm, dom::CK_DOCFILTER, el, "formelements", "")))
+    Ok(dom::cached(vm, el, SO_ELEMENTS, |vm| dom::make_collection(vm, dom::CK_FORMCONTROLS, el, "formelements", "")))
 }
 
 fn form_length(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -2143,34 +2143,43 @@ fn fire_form_event(vm: &mut Vm, form: usize, ty: &str, submitter: Option<usize>)
     ok
 }
 
-/// "submit" a form from a submitter (§4.10.21.3) up to the submit event; navigation is the shell's.
+/// "submit" a form from a submitter (§4.10.21.3), navigation included (`requestSubmit()`).
 pub fn submit_form(vm: &mut Vm, el: usize, submitter: Option<usize>) {
-    if SUBMITTING.with(|f| f.borrow().contains(&el)) {
+    submit_form_with(vm, el, submitter, true);
+}
+
+/// "submit" a form from a submitter (§4.10.21.3): nothing for a form that cannot navigate
+/// (disconnected); the "firing submission events" flag around interactive validation and the `submit`
+/// event; then, when `navigate` and the event was not canceled, the entry list and the staged
+/// navigation (`js::forms::navigate`). A user's trusted click passes `navigate: false` — the shell
+/// builds that navigation itself (`AetherEngine::submit_form`).
+pub fn submit_form_with(vm: &mut Vm, el: usize, submitter: Option<usize>, navigate: bool) {
+    if !dom::is_connected(el) || SUBMITTING.with(|f| f.borrow().contains(&el)) {
         return;
     }
     SUBMITTING.with(|f| f.borrow_mut().insert(el));
-    let _ = submit_events(vm, el, submitter);
+    let go = submit_events(vm, el, submitter);
     SUBMITTING.with(|f| f.borrow_mut().remove(&el));
+    if go && navigate {
+        super::forms::navigate(vm, el, submitter);
+    }
 }
 
-fn submit_events(vm: &mut Vm, el: usize, submitter: Option<usize>) -> JsResult<Value> {
+/// Validation (unless `novalidate` / `formnovalidate`) and the cancelable `submit` SubmitEvent; true
+/// when the submission continues.
+fn submit_events(vm: &mut Vm, el: usize, submitter: Option<usize>) -> bool {
     let novalidate = submitter.is_some_and(|s| attr_value(s, "formnovalidate").is_some());
-    if novalidate {
-        fire_form_event(vm, el, "submit", submitter);
-        return Ok(Value::Undefined);
-    }
-    if attr_value(el, "novalidate").is_none() {
+    if !novalidate && attr_value(el, "novalidate").is_none() {
         let els = with_doc(|d| form_elements_in(d, el));
         let mut ok = true;
         for e in els {
             ok &= check_one(vm, e);
         }
         if !ok {
-            return Ok(Value::Undefined);
+            return false;
         }
     }
-    fire_form_event(vm, el, "submit", submitter);
-    Ok(Value::Undefined)
+    fire_form_event(vm, el, "submit", submitter)
 }
 
 pub fn install(vm: &mut Vm) {

@@ -285,6 +285,9 @@ pub fn wrap(vm: &mut Vm, id: usize) -> Value {
     }
     let p = proto(interface_name(id));
     let o = host_obj(vm, p, T_NODE, vec![num(id as f64)]);
+    // HTMLFormElement / HTMLSelectElement are legacy platform objects: a proxy adds their indexed (and
+    // the form's named) properties (AETHERFORMS).
+    let o = super::forms::legacy_wrapper(vm, id, o);
     let r = root(vm, Value::Object(o));
     page(|p| p.wrappers.insert(id, (o, r)));
     Value::Object(o)
@@ -299,7 +302,7 @@ pub fn wrap_opt(vm: &mut Vm, id: Option<usize>) -> Value {
 
 /// The node id behind a wrapper value.
 pub fn node_of(vm: &Vm, v: &Value) -> Option<usize> {
-    let o = v.as_object()?;
+    let o = unproxy(vm, v.as_object()?);
     if tag_of(vm, o) != Some(T_NODE) {
         return None;
     }
@@ -2952,6 +2955,10 @@ pub const CK_TOKENS: u8 = 9;
 pub const CK_SELECTOR: u8 = 10;
 /// A select's HTMLOptionsCollection (AETHERWPT): its list of options.
 pub const CK_OPTIONS: u8 = 11;
+/// A form's HTMLFormControlsCollection (`form.elements`; AETHERFORMS).
+pub const CK_FORMCONTROLS: u8 = 12;
+/// A RadioNodeList: `form.elements` filtered by an id/name (`a`).
+pub const CK_RADIO: u8 = 13;
 
 thread_local! {
     static COLL_HANDLER: std::cell::Cell<Option<Obj>> = const { std::cell::Cell::new(None) };
@@ -2963,9 +2970,11 @@ fn coll_proto(k: u8) -> Obj {
         CK_ATTRMAP => "NamedNodeMap",
         CK_TOKENS => "DOMTokenList",
         CK_OPTIONS => "HTMLOptionsCollection",
+        CK_FORMCONTROLS => "HTMLFormControlsCollection",
+        CK_RADIO => "RadioNodeList",
         _ => "HTMLCollection",
     };
-    iface(name).unwrap().proto
+    iface(name).or_else(|| iface("HTMLCollection")).unwrap().proto
 }
 
 /// A live collection proxy. `a`/`b` are the kind's string arguments (tag name, classes, attribute).
@@ -3119,6 +3128,8 @@ fn coll_items(vm: &Vm, t: Obj) -> Vec<usize> {
             .map(|c| c.0)
             .collect(),
         CK_OPTIONS => super::controls::list_of_options_in(d, root),
+        CK_FORMCONTROLS => super::controls::form_elements_in(d, root),
+        CK_RADIO => super::forms::radio_list_in(d, root, &a),
         CK_DOCFILTER if a == "selectedoptions" => super::controls::selected_options_in(d, root),
         CK_DOCFILTER if a == "formelements" => super::controls::form_elements_in(d, root),
         CK_DOCFILTER if a == "fieldsetelements" => super::controls::fieldset_elements_in(d, root),
@@ -3160,7 +3171,7 @@ fn tokens_of(vm: &Vm, t: Obj) -> Vec<String> {
 /// Named properties of an HTMLCollection (HTML §2.7.2.1 "supported property names") in order.
 fn coll_names(vm: &Vm, t: Obj, items: &[usize]) -> Vec<(String, usize)> {
     let k = coll_kind(vm, t);
-    if matches!(k, CK_CHILDNODES | CK_STATIC | CK_NAME | CK_TOKENS) {
+    if matches!(k, CK_CHILDNODES | CK_STATIC | CK_NAME | CK_TOKENS | CK_RADIO) {
         return Vec::new();
     }
     if k == CK_ATTRMAP {
@@ -3237,6 +3248,10 @@ fn coll_named(vm: &mut Vm, t: Obj, name: &str) -> Option<Value> {
         let el = slot_num(vm, t, 1) as usize;
         let i = find_attr_qname(el, name)?;
         return attr_object(vm, el, i);
+    }
+    if coll_kind(vm, t) == CK_FORMCONTROLS {
+        let form = slot_num(vm, t, 1) as usize;
+        return super::forms::controls_named_item(vm, form, name);
     }
     let items = coll_items(vm, t);
     let names = coll_names(vm, t, &items);

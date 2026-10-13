@@ -754,9 +754,10 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
             }
             "submit" | "image" => {
                 if !super::controls::disabled(a) {
-                    // HTML form submission step 1: a form that is not connected cannot navigate.
+                    // HTML form submission step 1: a form that is not connected cannot navigate (AETHEREVENTS);
+                    // a script-started submission continues to the entry list (AETHERFORMS: `!trusted`).
                     if let Some(f) = super::controls::form_owner(a).filter(|f| dom::is_connected(*f)) {
-                        super::controls::submit_form(vm, f, Some(a));
+                        super::controls::submit_form_with(vm, f, Some(a), !trusted);
                     }
                 }
             }
@@ -779,7 +780,7 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
                     "reset" => super::controls::reset_form(vm, f),
                     "button" => {}
                     _ if !dom::is_connected(f) => {}
-                    _ => super::controls::submit_form(vm, f, Some(a)),
+                    _ => super::controls::submit_form_with(vm, f, Some(a), !trusted),
                 }
             }
         }
@@ -1342,6 +1343,13 @@ fn convert_member(vm: &mut Vm, v: Value, kind: char) -> JsResult<Value> {
                 v
             }
         }
+        // A required FormData (FormDataEventInit.formData; AETHERFORMS).
+        'F' => {
+            if !super::forms::is_form_data(vm, &v)? {
+                return vm.throw_type("Failed to construct 'FormDataEvent': Failed to read the 'formData' property from 'FormDataEventInit': required member formData is not of type 'FormData'.");
+            }
+            v
+        }
         _ => {
             if v.is_undefined() {
                 Value::Null
@@ -1420,6 +1428,7 @@ fn members(iface: &str) -> &'static [(&'static str, char)] {
         "MessageEvent" => &[("data", 'a'), ("origin", 's'), ("lastEventId", 's'), ("source", 'o')],
         "PageTransitionEvent" => &[("persisted", 'b')],
         "SubmitEvent" => &[("submitter", 'o')],
+        "FormDataEvent" => &[("formData", 'F')],
         "AnimationEvent" => &[("animationName", 's'), ("elapsedTime", 'n'), ("pseudoElement", 's')],
         "TransitionEvent" => &[("propertyName", 's'), ("elapsedTime", 'n'), ("pseudoElement", 's')],
         "StorageEvent" => &[("key", 'a'), ("oldValue", 'a'), ("newValue", 'a'), ("url", 's'), ("storageArea", 'o')],
@@ -1431,7 +1440,7 @@ fn members(iface: &str) -> &'static [(&'static str, char)] {
 fn parent_event(iface: &str) -> Option<&'static str> {
     Some(match iface {
         "UIEvent" | "CustomEvent" | "ErrorEvent" | "PromiseRejectionEvent" | "PopStateEvent" | "HashChangeEvent"
-        | "ProgressEvent" | "MessageEvent" | "PageTransitionEvent" | "SubmitEvent" | "AnimationEvent"
+        | "ProgressEvent" | "MessageEvent" | "PageTransitionEvent" | "SubmitEvent" | "FormDataEvent" | "AnimationEvent"
         | "TransitionEvent" | "StorageEvent" | "CloseEvent" | "ToggleEvent" | "BeforeUnloadEvent" => "Event",
         "MouseEvent" | "KeyboardEvent" | "FocusEvent" | "InputEvent" | "CompositionEvent" | "TouchEvent" => "UIEvent",
         "WheelEvent" | "PointerEvent" | "DragEvent" => "MouseEvent",
@@ -1861,6 +1870,7 @@ pub fn install(vm: &mut Vm) {
         "MessageEvent",
         "PageTransitionEvent",
         "SubmitEvent",
+        "FormDataEvent",
         "AnimationEvent",
         "TransitionEvent",
         "StorageEvent",

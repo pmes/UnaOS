@@ -453,9 +453,8 @@ fn document_base(doc_url: &str, node: &NodeRef) -> String {
 
 /// Builds the navigation a form submission performs (HTML §4.10.21.3 "submit"), for `control` (the
 /// field Return was pressed in, or the button clicked) and `submitter` (the submit button, when one
-/// submits). Honors the submitter's `formaction`/`formmethod`/`formenctype`; GET replaces the action's
-/// query with the urlencoded entry list; POST sends the list as the body in the enctype. None when the
-/// control has no form owner, the method is `dialog`, or the action's scheme is not submittable here.
+/// submits): the entry list, then [`plan_navigation`]. None when the control has no form owner, the
+/// method is `dialog`, or the action's scheme is not submittable here.
 pub fn build_form_submission(
     doc_url: &str,
     control: &NodeRef,
@@ -463,6 +462,18 @@ pub fn build_form_submission(
     coords: (i32, i32),
 ) -> Option<OpenDocument> {
     let form = form_owner(submitter.unwrap_or(control))?;
+    let entries = construct_entry_list(&form, submitter, coords);
+    plan_navigation(doc_url, &form, submitter, entries)
+}
+
+/// The navigation steps of "submit" (HTML §4.10.21.3, from the action URL on) over an entry list
+/// already constructed — by [`construct_entry_list`] for the shell's own submissions, or by the
+/// script binding (`js::forms`, which fires `formdata` first) for `submit()` / `requestSubmit()`.
+/// Honors the submitter's `formaction`/`formmethod`/`formenctype`; GET replaces the action's query with
+/// the urlencoded entry list; POST sends the list as the body in the enctype. None when the method is
+/// `dialog` or the action's scheme is not submittable here.
+pub fn plan_navigation(doc_url: &str, form: &NodeRef, submitter: Option<&NodeRef>, entries: Vec<Entry>) -> Option<OpenDocument> {
+    let form = form.clone();
     let pick = |form_attr: &str, sub_attr: &str| -> Option<String> {
         submitter.and_then(|s| attr(s, sub_attr)).or_else(|| attr(&form, form_attr))
     };
@@ -472,13 +483,12 @@ pub fn build_form_submission(
     if method == "dialog" {
         return None;
     }
-    let base = document_base(doc_url, control);
+    let base = document_base(doc_url, &form);
     let resolved = if action.trim().is_empty() {
         url::Url::parse(doc_url).ok()?
     } else {
         url::Url::parse(&base).and_then(|b| b.join(action.trim())).ok()?
     };
-    let entries = construct_entry_list(&form, submitter, coords);
     let post = method == "post";
     let form_method_post = attr(&form, "method").is_some_and(|m| m.trim().eq_ignore_ascii_case("post"));
     match (resolved.scheme(), post) {
