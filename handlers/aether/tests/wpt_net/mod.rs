@@ -286,6 +286,52 @@ fn wrapper(root: &Path, stem: &str, kind: &str, report_js: &str) -> Option<Vec<u
     )
 }
 
+/// The `// META:` lines of a test source: (`<script src>` / `importScripts` URLs, the title).
+fn metas(src: &str) -> (Vec<String>, String) {
+    let mut scripts = Vec::new();
+    let mut title = String::new();
+    for l in src.lines() {
+        if let Some(sc) = l.strip_prefix("// META: script=") {
+            scripts.push(sc.trim().to_string());
+        } else if let Some(t) = l.strip_prefix("// META: title=") {
+            title = t.trim().to_string();
+        }
+    }
+    (scripts, title)
+}
+
+/// AETHERWORKERS3 (SR129): wptserve's `WorkersHandler` — the `.worker.html` page of a `X.worker.js` test (and
+/// the `.any.worker.html` page of a `X.any.js` test): testharness in the window, the test itself in a dedicated
+/// worker whose results `fetch_tests_from_worker` (testharness.js's worker shim: a MessageChannel the worker's
+/// harness reports through) brings back. `script`: the worker script's suffix (`worker.js` / `any.worker.js`);
+/// `source`: the test file's (`worker.js` / `any.js`), which must exist.
+fn worker_wrapper(root: &Path, stem: &str, script: &str, source: &str) -> Option<Vec<u8>> {
+    let src = std::fs::read_to_string(root.join(format!("{stem}.{source}"))).ok()?;
+    let (_, title) = metas(&src);
+    let title = if title.is_empty() { String::new() } else { format!("<title>{title}</title>\n") };
+    let name = Path::new(stem).file_name()?.to_string_lossy().to_string();
+    Some(
+        format!(
+            "<!doctype html>\n<meta charset=utf-8>\n{title}<script src=\"/resources/testharness.js\"></script>\n<script src=\"/resources/testharnessreport.js\"></script>\n<div id=log></div>\n<script>\nfetch_tests_from_worker(new Worker(\"{name}.{script}\" + location.search));\n</script>\n"
+        )
+        .into_bytes(),
+    )
+}
+
+/// AETHERWORKERS3 (SR129): wptserve's `ClassicWorkerHandler` — the generated `X.any.worker.js`: the worker
+/// global's `GLOBAL`, testharness, each `// META: script=` through `importScripts`, the `.any.js` test, `done()`.
+fn any_worker_script(root: &Path, stem: &str) -> Option<Vec<u8>> {
+    let src = std::fs::read_to_string(root.join(format!("{stem}.any.js"))).ok()?;
+    let (scripts, _) = metas(&src);
+    let imports: String = scripts.iter().map(|u| format!("importScripts({u:?});\n")).collect();
+    Some(
+        format!(
+            "self.GLOBAL = {{ isWindow: function () {{ return false; }}, isWorker: function () {{ return true; }}, isShadowRealm: function () {{ return false; }} }};\nimportScripts(\"/resources/testharness.js\");\n{imports}importScripts(\"/{stem}.any.js\");\ndone();\n"
+        )
+        .into_bytes(),
+    )
+}
+
 fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
 }
@@ -494,6 +540,23 @@ fn http_conn(mut s: TcpStream, root: PathBuf, ports: Ports, report_js: &'static 
         }
     } else if let Some(stem) = rel.strip_suffix(".window.html") {
         match wrapper(&root, stem, "window", report_js) {
+            Some(b) => Resp::new(200, "OK", "text/html; charset=utf-8", b),
+            None => Resp::new(404, "Not Found", "text/plain", b"not found".to_vec()),
+        }
+    } else if let Some(stem) = rel.strip_suffix(".any.worker.html") {
+        // AETHERWORKERS3 (SR129): the worker-global variant of an `.any.js` test.
+        match worker_wrapper(&root, stem, "any.worker.js", "any.js") {
+            Some(b) => Resp::new(200, "OK", "text/html; charset=utf-8", b),
+            None => Resp::new(404, "Not Found", "text/plain", b"not found".to_vec()),
+        }
+    } else if let Some(stem) = rel.strip_suffix(".any.worker.js") {
+        match any_worker_script(&root, stem) {
+            Some(b) => Resp::new(200, "OK", "text/javascript; charset=utf-8", b),
+            None => Resp::new(404, "Not Found", "text/plain", b"not found".to_vec()),
+        }
+    } else if let Some(stem) = rel.strip_suffix(".worker.html") {
+        // AETHERWORKERS3 (SR129): a `.worker.js` test's page (the `.worker.js` itself is served as a file).
+        match worker_wrapper(&root, stem, "worker.js", "worker.js") {
             Some(b) => Resp::new(200, "OK", "text/html; charset=utf-8", b),
             None => Resp::new(404, "Not Found", "text/plain", b"not found".to_vec()),
         }
