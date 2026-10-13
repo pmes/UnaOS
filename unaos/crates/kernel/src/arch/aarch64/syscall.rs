@@ -13206,7 +13206,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     if wc_click_route(ev) {
         return false; // consumed, not queued — `[el0in] routed` must stay truthful
     }
-    let asid = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    #[cfg(feature = "desktop_firmware")] arm_resize_hover(ev); let asid = USER_INPUT_ACTIVE.load(Ordering::Acquire); // ARMRESIZE (orin-ledger A96; R117): the HOVER half of the frame's resize zones on the FOCUSED-APP pointer path — the cursor is already current here (the drain applied this report before calling in), the press/focus arms above have run, and a non-pointer event costs one `matches!`. Fn at the FILE TAIL; knob-off the `#[cfg]` erases the statement. ⚠ LINE-NEUTRAL append, code before this comment.
     if asid == 0 || asid as usize > crate::procslot::SLOT_ID_MAX {
         return false;
     }
@@ -13338,7 +13338,7 @@ fn focus_ring_apps(out: &mut alloc::vec::Vec<u64>) -> usize { // WINDOWCAP-2: a 
 /// TABKEY: the rotation is over [`focus_ring_apps`], not `wm::focus_ring` directly — see that helper for
 /// why, and for the Pi capture that proves the raw ring parks focus on rows with no ring 41% of the time.
 fn wc_focus_key(ev: crate::pal::Event) -> bool {
-    const K_TAB: u8 = b'\t'; #[cfg(feature = "desktop_firmware")] if let crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow) = ev { return match crate::video::wm::cycle_pick() { Some((id, owner)) => { if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); } user_input_set_active(owner); crate::video::wm::cycle_commit(id, owner); true } None => true }; } #[cfg(all(feature = "desktop_firmware", feature = "login"))] if let crate::pal::Event::Action(crate::video::keymap::Action::LockScreen) = ev { let _ = crate::video::crystal::login::lock(); return true; } // ARMROUTER — WINCYCLE (Alt+Tab/Cmd+Tab -> keymap `CycleWindow`) and SCREENLOCK (Cmd-L / Ctrl-Alt-L -> `LockScreen`) arms, the x86 `wc_focus_key` pair with the SAME seam calls (`wm::cycle_pick`/`cycle_commit`, `login::lock`); no `drag_settle_disarm` (x86 PTRDEAD machinery, absent here). Same-line fold, line-neutral.
+    const K_TAB: u8 = b'\t'; #[cfg(feature = "desktop_firmware")] if let crate::pal::Event::Action(a) = ev { if let Some((dx, dy, rz)) = a.win_key() { crate::video::wm::win_key(dx, dy, rz); return true; } } #[cfg(feature = "desktop_firmware")] if let crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow) = ev { return match crate::video::wm::cycle_pick() { Some((id, owner)) => { if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); } user_input_set_active(owner); crate::video::wm::cycle_commit(id, owner); true } None => true }; } #[cfg(all(feature = "desktop_firmware", feature = "login"))] if let crate::pal::Event::Action(crate::video::keymap::Action::LockScreen) = ev { let _ = crate::video::crystal::login::lock(); return true; } // ARMROUTER — WINCYCLE (Alt+Tab/Cmd+Tab -> keymap `CycleWindow`) and SCREENLOCK (Cmd-L / Ctrl-Alt-L -> `LockScreen`) arms, the x86 `wc_focus_key` pair with the SAME seam calls (`wm::cycle_pick`/`cycle_commit`, `login::lock`); no `drag_settle_disarm` (x86 PTRDEAD machinery, absent here). Same-line fold, line-neutral.
     let down = match ev {
         crate::pal::Event::Key(K_TAB) => true,
         crate::pal::Event::KeyUp(K_TAB) => false,
@@ -14383,7 +14383,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 true
             }
             // DRAG-PI M3 — CHROME (title strip / border) is judged AFTER the three controls and BEFORE every app arm, exactly as the x86 twin orders it: a press on kernel-drawn chrome is an instruction to the WINDOW SYSTEM and is consumed here, a press on content is the app's input and falls through. Neither starves the other — `chrome_hit` is `outer_box` MINUS `content_box`, a region the app's surface does not cover a pixel of, and it declines COMPAT rows so a full-screen app keeps its whole panel. FURNITURE follows x86's rule rather than inventing a Pi one: a kernel-band row (the console) IS draggable — its title bar is a grip like any other — but the KEYBOARD goes to the shell, because there is no ring behind a kernel owner to hand it to. `drag_begin` self-guards on `title_bar_hit`, so a press on a BORDER raises and consumes without minting a grab the geometry does not support; the gesture is steered by `wm::drag_route_tail` from the two drains and ended by the release edge below. The click grammar is untouched: this arm SELECTS and grabs, it stops nothing and starts nothing. ⚠ ONE-LINE shape and long prose are not style — this file is compiled into the knob-off `kernel8.img` and a line ADDED anywhere in it breaks that image's byte-identity proof (panic `Location` records embed line numbers), so this arm is 2 lines paid for by 2 removed below; the diff is line-NEUTRAL and must stay so.
-            #[cfg(feature = "desktop_firmware")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
+            #[cfg(feature = "desktop_firmware")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if arm_resize_press(win, owner, cur, x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
             #[cfg(feature = "desktop_firmware")] Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => { serial_println!("[clickroute] press hit furniture asid={} win={} (was {}) consume -> shell focus", owner, win, cur); user_input_set_active(0); crate::video::wm::focus_changed(owner); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true } // SHELLWIN-PI: KERNEL FURNITURE, on its CONTENT — raise it, hand the keyboard to the SHELL (asid 0), consume the press. Exact parity with the x86 arm of the same name (`arch/x86_64/syscall.rs`, "KERNEL FURNITURE — raise it, hand the keyboard to the shell"), including its POSITION: there the chrome block answers a furniture press on the title strip/border and this `hit_test` arm answers one on the content, and DRAG-PI's chrome arm directly above is that same first half on this arch. Without this second half the shell window is a trap — a press on its TEXT (chrome_hit is `outer_box` MINUS `content_box`, so the text is not chrome) would fall to the `owner != cur` arm below and `user_input_set_active(KERNEL_OWNER_DESKTOP)`, an "ASID" with no ring: clicking your own shell would take the keyboard AWAY from it, the SHELLWIN defect re-entered through the pointer. Below the close/minimise/zoom arms rather than above them as on x86, deliberately: those arms are where PA38's refused-close ruling lives on this arch, and this arc rides that path instead of diverting it. ⚠ ONE LINE, paid for by one line merged in this fn's header — panic `Location` records embed line numbers, so the knob-off `kernel8.img` byte-identity proof requires this diff to stay line-NEUTRAL.
             Some((win, owner, _z)) if owner != cur => {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
@@ -15485,7 +15485,7 @@ fn wcb_launcher(_demo_cpu: usize) {
     crate::tests::register("dragperf", || crate::video::wm::dragperf_selftest()); // ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // DRAGWEDGE: the PA41 freeze fixture, immediately after the drag COST witness because it is the same shape of scene one hazard over — it mints a KERNEL-BAND row, presses its title strip through this file's own router, then holds a `BlitGuard` open to reproduce the metal's `blit_active=1` and proves the drag path is BOUNDED, that the grab it could not service is RELEASED, that a fresh grab is REFUSED while the stall stands, and that the refusal LIFTS when the compositor recovers. It runs AFTER `dragperf` deliberately: that fixture measures a healthy drag path and this one deliberately stalls the compositor for a bounded interval, so the order keeps the measurement out of the stall's shadow.
     #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
-    crate::tests::register("dragwedge", || crate::video::wm::dragwedge_selftest()); // ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
+    crate::tests::register("dragwedge", || crate::video::wm::dragwedge_selftest()); #[cfg(all(feature = "witness", feature = "desktop_firmware"))] crate::tests::register("winresize", arm_winresize_selftest); // ARMRESIZE (orin-ledger A96): `tests winresize` on this arch, the x86 fixture's legs and verdict line over THIS router (fn at the FILE TAIL); ⚠ LINE-NEUTRAL append, code before this comment. ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
     // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).
@@ -26866,4 +26866,358 @@ fn sys_audio_open(rate: u64, ch: u64, bits: u64) -> i64 {
 fn sys_audio_nostream(nr: u64, handle: u64) -> i64 {
     let _ = (nr, handle);
     una_abi::EBADF
+}
+
+// =================================================================================================
+// ARMRESIZE (orin-ledger A96; R117, RULINGS.md:148 — "WINDOW RESIZE BY EDGE AND CORNER DRAG, every window, live, the
+// standard cursor shapes at the edges") — TAIL-APPENDED. CHARTER: Kernel — wm (the compositor seam).
+// =================================================================================================
+//
+// x86 has carried the whole gesture since WINRESIZE (R75) and WINRESIZE2 (B635); this arch carried none of it: the
+// chrome arm of `wc_click_route` only ever called `wm::drag_begin`, which grabs on the title strip alone, so a press on
+// a border raised the window and was consumed. The window-system half is ALREADY SHARED and is not copied here:
+// `wm::resize_zone_at` classifies, `wm::resize_begin` publishes `DRAG_WIN`/`DRAG_OWNER` with `RS_ZONE` set, and
+// `wm::drag_motion` diverts to `resize_motion` while `RS_ZONE` is nonzero. So:
+//
+// * PRESS — `arm_resize_press`, folded onto the chrome arm AHEAD of its title-strip grab (x86's order: the controls,
+//   then the zones, then the chrome), declines exactly what x86's `wc_resize_press` declines (owner 0 and the
+//   desktop/shell row) and otherwise focuses on the chrome arm's own rule and calls `wm::resize_begin`.
+// * MOTION — nothing new. Both aarch64 pointer paths already steer a live gesture through `wm::drag_motion_paced`
+//   (the Pi's `wm::drag_route_tail`, `main.rs`; the Orin's `display_tegra::orin_drag_steer`), and that reaches
+//   `drag_motion` and so `resize_motion`. The resize is paced exactly as the title-bar move is.
+// * RELEASE — nothing new. The release edge's `wm::drag_end()` (this file, `wc_click_route`'s release arm: the
+//   button EDGE alone, no level belt — DRAGNOMOVE §2) calls `resize_finish`, which prints
+//   `[wm-act] resize win= from=WxH to=WxH zone=` and clears the zone. A `<TAB>` focus switch's `drag_cancel` ends it
+//   the same way.
+// * KEYS — Ctrl+arrow / Ctrl+Shift+arrow (`keymap::Action::win_key`) folded onto `wc_focus_key`, the x86
+//   `wc_route_event` arm in the same shape, over the shared `wm::win_key`.
+// * HOVER — `arm_resize_hover`, x86's `wc_resize_hover_at` rule on this arch's pointer: the topmost window under the
+//   point, not a control disc, not owner 0 / the desktop row, then `wm::resize_zone_at`; a live resize keeps its own
+//   zone until the release. Edge-only into `ARZ_HOVER`; an ENTRY prints `[cursor] zone=… shape=… win=N` once.
+//   Called from `user_input_enqueue` (the focused-app pointer path). The SHELL-focused path (`main.rs`
+//   `render_service`'s `Mouse`/`MouseAbsolute` arms) and the Orin's coalesced pump (`main.rs` `jd2_console_pump`,
+//   beside `orin_drag_steer`) are outside this arc's files: each needs ONE folded statement,
+//   `unaos_kernel::arch::aarch64::syscall::arm_resize_hover(ev)` / `…::arm_resize_hover_at(x, y)`, named in the
+//   ARMRESIZE report and in docs/dev/evidence/armresize/ARMRESIZE.md.
+
+/// ARMRESIZE — the (win << 8 | zone) the pointer is on, `0` off every frame zone.
+#[cfg(feature = "desktop_firmware")]
+static ARZ_HOVER: AtomicU64 = AtomicU64::new(0);
+/// ARMRESIZE — `[cursor] zone=` lines printed (one per entry edge, a hard ceiling beside it).
+#[cfg(feature = "desktop_firmware")]
+static ARZ_HOVER_LOG: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "desktop_firmware")]
+const ARZ_HOVER_LOG_MAX: u64 = 4096;
+
+/// ARMRESIZE — a press at `(x, y)` on window `win` (the chrome arm's hit): if it lands in one of the eight frame zones,
+/// focus exactly as the chrome arm does and begin a resize. `true` = consumed (the caller stores the DROP target).
+/// Owner 0 and the desktop/shell row are declined, as x86's `wc_resize_press` declines them, so their frames keep
+/// the chrome arm's behaviour.
+#[cfg(feature = "desktop_firmware")]
+fn arm_resize_press(win: crate::video::wm::WinId, owner: u64, cur: u64, x: i32, y: i32) -> bool {
+    use crate::video::wm;
+    if owner == 0 || owner == wm::KERNEL_OWNER_DESKTOP {
+        return false;
+    }
+    let zone = wm::resize_zone_at(win, x, y);
+    if zone == 0 {
+        return false;
+    }
+    if wm::is_kernel_owner(owner) {
+        user_input_set_active(0);
+    } else if owner != cur {
+        user_input_set_active(owner);
+    }
+    wm::focus_changed(owner);
+    let how = if wm::resize_begin(win, zone, x, y) { "resize" } else { "chrome" };
+    if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+        serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how);
+    }
+    true
+}
+
+/// ARMRESIZE — a zone's compass token and the sprite row it selects (x86's `wrz_zone_cursor` table): top/bottom the
+/// vertical double arrow, the sides the horizontal one, `tl`/`br` the NW-SE diagonal and `tr`/`bl` the NE-SW one.
+#[cfg(feature = "desktop_firmware")]
+fn arz_zone_cursor(zone: u8) -> (&'static str, u8) {
+    use crate::video::cursor::{SHAPE_RESIZE_NESW, SHAPE_RESIZE_NWSE};
+    use crate::video::wm::{RS_B, RS_L, RS_R, RS_T};
+    const NS: u8 = una_abi::CURSOR_RESIZE_NS as u8;
+    const EW: u8 = una_abi::CURSOR_RESIZE_EW as u8;
+    match zone {
+        z if z == RS_T => ("n", NS),
+        z if z == RS_B => ("s", NS),
+        z if z == RS_L => ("w", EW),
+        z if z == RS_R => ("e", EW),
+        z if z == RS_T | RS_L => ("nw", SHAPE_RESIZE_NWSE),
+        z if z == RS_B | RS_R => ("se", SHAPE_RESIZE_NWSE),
+        z if z == RS_T | RS_R => ("ne", SHAPE_RESIZE_NESW),
+        z if z == RS_B | RS_L => ("sw", SHAPE_RESIZE_NESW),
+        _ => ("none", una_abi::CURSOR_ARROW as u8),
+    }
+}
+
+/// ARMRESIZE — the live entry: a pointer report (`Mouse`/`MouseAbsolute`) classifies at the CURRENT cursor; every
+/// other event is a no-op. Call it where the cursor is fresh (after the report was applied), as `wm::drag_route_tail`.
+#[cfg(feature = "desktop_firmware")]
+pub fn arm_resize_hover(ev: crate::pal::Event) {
+    if matches!(ev, crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }) {
+        let (x, y) = click_pointer_pos();
+        arm_resize_hover_at(x, y);
+    }
+}
+
+/// ARMRESIZE — [`arm_resize_hover`] with the position supplied (the Orin pump's coalesced frame, and the fixture).
+#[cfg(feature = "desktop_firmware")]
+pub fn arm_resize_hover_at(x: i32, y: i32) {
+    use crate::video::wm;
+    let live = wm::drag_active();
+    let (win, zone) = if live != wm::WIN_NONE {
+        // A gesture is live: a resize keeps its own zone until the release; a move shows no zone.
+        (live, wm::resize_zone_now())
+    } else {
+        match wm::hit_test(x, y) {
+            Some((w, owner, _z)) if owner != 0 && owner != wm::KERNEL_OWNER_DESKTOP && wm::control_hit(w, x, y).is_none() => {
+                (w, wm::resize_zone_at(w, x, y))
+            }
+            _ => (wm::WIN_NONE, 0),
+        }
+    };
+    let key = if zone == 0 { 0 } else { ((win as u64) << 8) | zone as u64 };
+    if ARZ_HOVER.swap(key, Ordering::AcqRel) == key {
+        return;
+    }
+    if zone == 0 {
+        crate::video::cursor::set_zone_shape(None);
+        return;
+    }
+    let (tok, shape) = arz_zone_cursor(zone);
+    crate::video::cursor::set_zone_shape(Some(shape));
+    if ARZ_HOVER_LOG.fetch_add(1, Ordering::Relaxed) < ARZ_HOVER_LOG_MAX {
+        serial_println!("[cursor] zone={} shape={} win={}", tok, crate::video::cursor::shape_name(shape), win);
+    }
+}
+
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+#[repr(align(4))]
+struct ArzSurf([u32; ARZ_CW * ARZ_CH]);
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+const ARZ_CW: usize = 320;
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+const ARZ_CH: usize = 200;
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+static ARZ_SURF: ArzSurf = ArzSurf([0x0040_9060; ARZ_CW * ARZ_CH]);
+
+/// ARMRESIZE — `tests winresize` on this arch: x86's `winresize_selftest` legs and verdict line, over THIS router.
+///
+/// One ring-3-band row (200x120 over a 320x200 slot; owner `0xD41`, outside the private-slot range on dragperf's
+/// `0xD40` idiom, so a focus move drains nothing and `resize_notify` pushes nowhere). Legs: `zones` — the eight probes
+/// classify to the eight zones; `strip` — the title strip is not a zone; `cursor` — the hover shapes at the eight
+/// probes (EW EW NS NS NWSE NESW NESW NWSE, a table written here), the program's HAND back over content, a BR press
+/// that holds NWSE off the frame until the release, HAND after it; `drag` — a BR drag grows the content by the
+/// scale-divided delta; `clamp` — past the panel edge it stops inside the panel and the slot and counts a clamp;
+/// `minstop` — toward the origin it stops at `RS_MIN_W x RS_MIN_H`; `aspect` — Shift keeps the ratio; `keys` — the
+/// Ctrl+arrow / Ctrl+Shift+arrow ACTIONS through `wc_focus_key` move 16 px and resize 16/scale.
+///
+/// This router reads the pointer, not a parameter (x86 has `wc_click_route_at`; this arch does not), so the window is
+/// moved UNDER the pointer (dragperf's CLICK-PLAIN rule — the pointer is never moved): its BR probe is put on the
+/// cursor, and the cursor leg's press and the plain drag's press go through `wc_click_route` itself. Presses at
+/// points the pointer is not on (the clamp, min and aspect legs, after the frame has moved) call `arm_resize_press`,
+/// the function the router's chrome arm calls. `[cursor] winresize press routed=<n>/2` names how many presses the
+/// router took; a pointer too near the panel's top-left to aim at reads `routed=0/2` and the legs still score.
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+pub fn arm_winresize_selftest() {
+    use crate::pal::Event;
+    use crate::video::cursor::{self, SHAPE_RESIZE_NESW, SHAPE_RESIZE_NWSE};
+    use crate::video::keymap::Action;
+    use crate::video::wm;
+    use core::sync::atomic::Ordering::Relaxed;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!(":: WINRESIZE: -> SKIP (framebuffer not ready) ::");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 480 || ph < 360 {
+        serial_println!(":: WINRESIZE: -> SKIP (panel {}x{} too small) ::", pw, ph);
+        return;
+    }
+    const OWNER: u64 = 0xD41;
+    const _: () = assert!(OWNER != 0 && !crate::video::wm::is_kernel_owner(OWNER));
+    let s = &raw const ARZ_SURF as usize;
+    let len = core::mem::size_of_val(&ARZ_SURF);
+    let w = wm::create(OWNER, s, len, 200, 120, (ARZ_CW * 4) as u32, b"arz");
+    if w == wm::WIN_NONE {
+        serial_println!(":: WINRESIZE: -> SKIP (window table full) ::");
+        return;
+    }
+    let saved_focus = user_input_active();
+    user_input_set_active(OWNER);
+    wm::focus_changed(OWNER);
+    let (b, t) = (wm::BORDER() as i32, wm::TITLE_H() as i32);
+    // Aim: the BR probe (`ox + ow - 2`, `oy + oh - 2` = content edge + border - 2) on the cursor.
+    let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
+    let aimed = match wm::info(w) {
+        Some(i) => {
+            let (cw, ch) = ((i.w * i.scale) as i32, (i.h * i.scale) as i32);
+            let (ix, iy) = (cx - cw - b + 2, cy - ch - b + 2);
+            ix >= b && iy >= t + b && wm::move_to(w, ix as usize, iy as usize) && wm::info(w).is_some_and(|j| (j.x as i32, j.y as i32) == (ix, iy))
+                && wm::resize_zone_at(w, cx, cy) == (wm::RS_R | wm::RS_B)
+                && wm::hit_test(cx, cy).is_some_and(|(hw, _, _)| hw == w)
+        }
+        None => false,
+    };
+    if !aimed {
+        wm::move_to(w, pw / 4, ph / 4 + wm::TITLE_H() + wm::BORDER());
+    }
+    let Some(i0) = wm::info(w) else {
+        serial_println!(":: WINRESIZE: -> SKIP (row vanished) ::");
+        return;
+    };
+    let sc = i0.scale.max(1) as i64;
+    let (cw, ch) = ((i0.w * i0.scale) as i32, (i0.h * i0.scale) as i32);
+    let (ox, oy) = (i0.x as i32 - b, i0.y as i32 - (t + b));
+    let (ow, oh) = (cw + 2 * b, ch + t + 2 * b);
+    let probes = [
+        (ox + 1, i0.y as i32 + ch / 2, wm::RS_L),
+        (ox + ow - 2, i0.y as i32 + ch / 2, wm::RS_R),
+        (ox + ow / 2, oy + 1, wm::RS_T),
+        (ox + ow / 2, oy + oh - 2, wm::RS_B),
+        (ox + 1, oy + 1, wm::RS_L | wm::RS_T),
+        (ox + ow - 2, oy + 1, wm::RS_R | wm::RS_T),
+        (ox + 1, oy + oh - 2, wm::RS_L | wm::RS_B),
+        (ox + ow - 2, oy + oh - 2, wm::RS_R | wm::RS_B),
+    ];
+    let content = (i0.x as i32 + cw / 2, i0.y as i32 + ch / 2);
+    let routed = core::cell::Cell::new(0u32);
+    // PRESS at `(fx, fy)`: through the router when the cursor is on it, else the chrome arm's own resize press.
+    let press = |fx: i32, fy: i32| -> bool {
+        if aimed && (fx, fy) == (cx, cy) {
+            routed.set(routed.get() + 1);
+            wc_click_route(Event::Button(1))
+        } else {
+            arm_resize_press(w, OWNER, user_input_active(), fx, fy)
+        }
+    };
+    // RELEASE: the router's edge when the press was routed (its release arm calls `drag_end`), then `drag_end`.
+    let release = |was_routed: bool| {
+        if was_routed {
+            wc_click_route(Event::Button(0));
+        }
+        wm::drag_end();
+    };
+    // Leg 1 (cursor) — x86's `winresize_cursor_leg`, run BEFORE the drag legs move the frame.
+    let (cursor_ok, cursor_shapes) = {
+        const NS: u8 = una_abi::CURSOR_RESIZE_NS as u8;
+        const EW: u8 = una_abi::CURSOR_RESIZE_EW as u8;
+        const WANT: [u8; 8] = [EW, EW, NS, NS, SHAPE_RESIZE_NWSE, SHAPE_RESIZE_NESW, SHAPE_RESIZE_NESW, SHAPE_RESIZE_NWSE];
+        let hand = una_abi::CURSOR_HAND as u8;
+        let req0 = cursor::shape_index();
+        cursor::set_shape(una_abi::CURSOR_HAND);
+        arm_resize_hover_at(content.0, content.1);
+        let mut ok = cursor::shape_index() == hand;
+        let mut seen = 0u32;
+        for (i, (px, py, _zone)) in probes.iter().enumerate() {
+            arm_resize_hover_at(*px, *py);
+            if cursor::shape_index() == WANT[i] && cursor::zone_shape() == Some(WANT[i]) {
+                seen += 1;
+            }
+        }
+        ok &= seen == 8;
+        arm_resize_hover_at(content.0, content.1);
+        let restored = cursor::shape_index() == hand && cursor::zone_shape().is_none();
+        let (bx, by, _) = probes[7];
+        arm_resize_hover_at(bx, by);
+        let r0 = routed.get();
+        let consumed = press(bx, by);
+        let live = consumed && wm::drag_active() == w && wm::resize_zone_now() != 0;
+        arm_resize_hover_at(content.0, content.1);
+        let held = live && cursor::shape_index() == SHAPE_RESIZE_NWSE;
+        release(routed.get() != r0);
+        arm_resize_hover_at(content.0, content.1);
+        let released = cursor::shape_index() == hand;
+        ok &= restored && held && released;
+        cursor::set_shape(req0 as u64);
+        ARZ_HOVER.store(0, Ordering::Release);
+        cursor::set_zone_shape(None);
+        if !ok {
+            serial_println!(
+                "[cursor] winresize leg seen={}/8 restored={} held={} released={} live={}",
+                seen, restored, held, released, live
+            );
+        }
+        (ok, cursor::shape_count())
+    };
+    // Leg 2 (zones) — each probe classifies to its zone; the title strip's drag handle is not a zone.
+    let zones = probes.iter().filter(|(px, py, want)| wm::resize_zone_at(w, *px, *py) == *want).count() as u32;
+    let strip_clear = wm::resize_zone_at(w, i0.x as i32 + 1, i0.y as i32 - (t / 2 + b)) == 0;
+    // One drag: press at the zone, steer on the live seam, release. Returns (w, h) after.
+    let drag = |fx: i32, fy: i32, tx: i32, ty: i32| -> Option<(usize, usize)> {
+        let r0 = routed.get();
+        let consumed = press(fx, fy);
+        let was_routed = routed.get() != r0;
+        if !consumed || wm::drag_active() != w || wm::resize_zone_now() == 0 {
+            release(was_routed);
+            return None;
+        }
+        wm::drag_motion(tx, ty);
+        release(was_routed);
+        wm::info(w).map(|i| (i.w, i.h))
+    };
+    let br = |i: &wm::WindowInfo| ((i.x + i.w * i.scale + wm::BORDER()) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER()) as i32 - 2);
+    let (brx, bry) = (probes[7].0, probes[7].1);
+    // Leg 3 (drag) — the plain BR drag: through the router when aimed (the cursor is on the BR probe).
+    let (dx, dy) = (40i32, 30i32);
+    let drag_ok = drag(brx, bry, brx + dx, bry + dy) == Some(((i0.w as i64 + dx as i64 / sc) as usize, (i0.h as i64 + dy as i64 / sc) as usize));
+    // Leg 4 (clamp) — past the panel edge: clamps inside the panel and inside the slot.
+    let c0 = wm::RS_CLAMPED.load(Relaxed);
+    let (bx1, by1) = wm::info(w).map(|i| br(&i)).unwrap_or((brx, bry));
+    let r3 = drag(bx1, by1, pw as i32 + 400, ph as i32 + 400);
+    let clamp_ok = match (r3, wm::info(w)) {
+        (Some((w3, h3)), Some(i)) => w3 <= ARZ_CW && h3 <= ARZ_CH && i.x + w3 * i.scale + wm::BORDER() <= pw && i.y + h3 * i.scale + wm::BORDER() <= ph && wm::RS_CLAMPED.load(Relaxed) > c0,
+        _ => false,
+    };
+    // Leg 5 (minstop) — toward the origin: stops at the minimum.
+    let (bx2, by2) = wm::info(w).map(|i| br(&i)).unwrap_or((brx, bry));
+    let min_ok = drag(bx2, by2, 0, 0) == Some((wm::RS_MIN_W, wm::RS_MIN_H));
+    // Leg 6 (aspect) — Shift keeps the aspect (from the minimum, grow width only).
+    crate::video::keymap::note_mods(crate::drivers::xhci::HID_MOD_SHIFT);
+    let a0 = wm::info(w);
+    let (bx3, by3) = a0.map(|i| br(&i)).unwrap_or((brx, bry));
+    let ar = drag(bx3, by3, bx3 + 60 * sc as i32, by3);
+    crate::video::keymap::note_mods(0);
+    let aspect_ok = match (a0, ar) {
+        (Some(a), Some((aw, ah))) => aw > a.w && ((aw * a.h) as i64 - (ah * a.w) as i64).abs() <= a.w.max(a.h) as i64,
+        _ => false,
+    };
+    // Leg 7 (keys) — the keymap ACTIONS through this router's key arm: Ctrl+arrow nudges 16 px, Ctrl+Shift+arrow
+    // resizes 16 px / scale.
+    let k0 = wm::info(w);
+    let nudged = wc_focus_key(Event::Action(Action::WinNudgeRight));
+    let k1 = wm::info(w);
+    let sized = wc_focus_key(Event::Action(Action::WinSizeRight));
+    let k2 = wm::info(w);
+    let keys_ok = match (k0, k1, k2) {
+        (Some(a), Some(b2), Some(c)) => nudged && sized && b2.x == a.x + 16 && c.w as i64 == b2.w as i64 + 16 / sc,
+        _ => false,
+    };
+    let drags = wm::RS_DRAGS.load(Relaxed);
+    let clamped = wm::RS_CLAMPED.load(Relaxed);
+    wm::close(w);
+    wm::composite();
+    user_input_set_active(saved_focus);
+    serial_println!("[cursor] winresize press routed={}/2 pointer=({},{}) aimed={}", routed.get(), cx, cy, aimed);
+    let pass = zones == 8 && strip_clear && drag_ok && clamp_ok && min_ok && aspect_ok && keys_ok && drags >= 3 && cursor_ok;
+    serial_println!(
+        ":: WINRESIZE: zones={} strip={} min={}x{} drags={} clamped={} drag={} clamp={} minstop={} aspect={} keys={} cursor={} cursor_shapes={} -> {} ::",
+        zones, strip_clear, wm::RS_MIN_W, wm::RS_MIN_H, drags, clamped, drag_ok, clamp_ok, min_ok, aspect_ok, keys_ok, if cursor_ok { "ok" } else { "fail" }, cursor_shapes,
+        if pass { "PASS" } else { "FAIL" }
+    );
 }
