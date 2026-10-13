@@ -24,7 +24,14 @@
 //! implementation time. `--model` overrides the default for a caller who wants a
 //! different one; when Principia owns the settings surface, the selection comes
 //! from there instead.
+//!
+//! TRANSPORT (NETDEBT, SR97): UnaOS's own HTTP client, `gneiss_pal::api::http`'s
+//! blocking client (http_core over tls_core, verified against the trust store) —
+//! the last `reqwest` in the workspace is gone, and with it the `url`/`idna`
+//! crates under it. The blocking client needs no async runtime, so the trait's
+//! synchronous `request` calls it directly.
 
+use gneiss_pal::api::http::blocking;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -49,8 +56,7 @@ pub struct ClaudeConnector {
     credential: Credential,
     base_url: String,
     model: String,
-    runtime: tokio::runtime::Runtime,
-    client: reqwest::Client,
+    client: blocking::Client,
 }
 
 impl ClaudeConnector {
@@ -89,17 +95,11 @@ impl ClaudeConnector {
             .map(str::to_string)
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| ProviderError::Transport(format!("runtime: {e}")))?;
-
-        let client = reqwest::Client::builder()
+        let client = blocking::Client::builder()
             .build()
             .map_err(|e| ProviderError::Transport(format!("http client: {e}")))?;
 
-        Ok(ClaudeConnector { credential, base_url, model, runtime, client })
+        Ok(ClaudeConnector { credential, base_url, model, client })
     }
 
     pub fn model(&self) -> &str {
@@ -176,6 +176,8 @@ impl Provider for ClaudeConnector {
         }
 
         let url = format!("{}/v1/messages", self.base_url);
+        let payload = serde_json::to_vec(&body)
+            .map_err(|e| ProviderError::Malformed(format!("request body: {e}")))?;
         let mut rb = self
             .client
             .post(&url)
@@ -188,24 +190,18 @@ impl Provider for ClaudeConnector {
                 .header("anthropic-beta", OAUTH_BETA),
         };
 
-        let (status, retry_after, text) = self.runtime.block_on(async {
-            let resp = rb
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| ProviderError::Transport(e.to_string()))?;
-            let status = resp.status();
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| ProviderError::Transport(e.to_string()))?;
-            Ok::<_, ProviderError>((status, retry_after, text))
-        })?;
+        let resp = rb
+            .body(payload)
+            .send()
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let text = resp
+            .text()
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !status.is_success() {
             // The body may echo request content; it never carries the credential
