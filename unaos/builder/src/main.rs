@@ -110,6 +110,15 @@ fn stage_welcome(workspace_dir: &std::path::Path, volume: &std::path::Path) -> b
     let dir = volume.join("system/doc");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(&src, dir.join("welcome.html")).unwrap();
+    // AETHERMETAL M3 (SR96): every page under doc/ rides too — the click's target (keys.html) must be on the volume.
+    if let Ok(rd) = std::fs::read_dir(src.parent().unwrap()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "html") && p.file_name().is_some_and(|n| n != "welcome.html") {
+                let _ = std::fs::copy(&p, dir.join(p.file_name().unwrap()));
+            }
+        }
+    }
     true
 }
 
@@ -1521,6 +1530,7 @@ fn main() {
     // AETHERMETAL (SR66): the page AETHER.ELF opens rides the DATA volume too (system/doc/welcome.html).
     if stage_welcome(&workspace_dir, &data_dir) {
         staged_data.push("system/doc/welcome.html");
+        staged_data.push("system/doc/keys.html"); // AETHERMETAL M3 (SR96): the navigation fixture's target
     }
     // KERNELFONT (B359): the faces ride the DATA volume too — `video::text` reads /system/fonts there.
     if !stage_fonts(&kfont_dirs_env(), &data_dir).is_empty() {

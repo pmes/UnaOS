@@ -2278,6 +2278,23 @@ struct Sleeper {
     task: Box<Task>,
 }
 
+/// TESTWATCH (B532/B533): is task `tid` in a timed park (a wake source exists)? `Some(true)` found in a
+/// `SLEEPERS` list, `Some(false)` in none of them (every list read), `None` when a list was busy. Never waits.
+pub fn sleeping(tid: u64) -> Option<bool> {
+    let mut all_read = true;
+    for cpu in 0..MAX_CPUS {
+        match SLEEPERS[cpu].try_lock() {
+            Some(l) => {
+                if l.iter().any(|s| s.task.id as u64 == tid) {
+                    return Some(true);
+                }
+            }
+            None => all_read = false,
+        }
+    }
+    if all_read { Some(false) } else { None }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Context switch (the only assembly in the scheduler)
 // ---------------------------------------------------------------------------------------------

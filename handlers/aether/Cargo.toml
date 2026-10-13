@@ -19,6 +19,7 @@ image-fallback = ["image/default-formats"]
 svg = ["dep:resvg"]
 
 [dependencies]
+psl_core = { path = "../../unaos/libs/net/psl_core" } # NETDEBT (SR97): the registrable domain for the cookie partition and same-site
 # AETHERJS (SR63): pages run on UnaOS's own ECMAScript engine (JSCORE, SR55) — boa_engine/boa_gc are gone.
 js_core = { path = "../../unaos/libs/web/js_core" }
 # AETHERDOM (SR49): the document model is UnaOS's own WHATWG parser + arena DOM (HTMLCORE, SR46).

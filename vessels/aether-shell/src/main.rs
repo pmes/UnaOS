@@ -103,7 +103,7 @@ enum TabReport {
     Title(u64, String),
     Loading(u64, bool),
     /// A navigation's response is a download: the coordinator runs it (so it outlives its tab).
-    StartDownload { url: String, name: String, total: Option<u64> },
+    StartDownload { tab: u64, url: String, name: String, total: Option<u64> },
     /// A download's progress row.
     Download(chrome::downloads::Download),
 }
@@ -309,7 +309,7 @@ impl Tab {
         match probe {
             None => {}
             Some(chrome::host::Probe::Download { url, name, total }) => {
-                self.report(TabReport::StartDownload { url, name, total });
+                self.report(TabReport::StartDownload { tab: self.id, url, name, total });
             }
             Some(chrome::host::Probe::Document) => self.load(url, true).await,
         }
@@ -565,6 +565,7 @@ impl Coordinator {
 
     fn close_tab(&mut self, id: u64) {
         let was_active = self.strip.active() == id;
+        chrome::host::cancel_tab_downloads(id); // AETHERDEBT (SR93)
         self.send(id, TabCmd::Shutdown);
         self.tabs.remove(&id);
         match self.strip.close(id) {
@@ -681,11 +682,12 @@ impl Coordinator {
                     self.publish_tabs();
                 }
             }
-            TabReport::StartDownload { url, name, total } => {
+            TabReport::StartDownload { tab, url, name, total } => {
                 self.next_download += 1;
                 let (id, reports) = (self.next_download, self.reports.clone());
                 tokio::task::spawn_local(async move {
-                    chrome::host::download(id, url, name, total, |d| {
+                    // AETHERDEBT (SR93): the download belongs to its tab — closing the tab cancels it.
+                    chrome::host::download_in_tab(tab, id, url, name, total, |d| {
                         let _ = reports.send(TabReport::Download(d.clone()));
                     })
                     .await;

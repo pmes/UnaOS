@@ -239,13 +239,14 @@ fn look(now: u64) {
         if let Some(c) = cpu {
             SEEN_CPU[i].store(c, Relaxed);
         }
-        if cpu.is_none() && waits.is_none() {
+        let park = crate::arch::x86_64::sched::sleeping(tid); // SMALLFIX9 (B533): a park without a wake source is not alive
+        if cpu.is_none() && waits.is_none() && park != Some(false) {
             LAST[i].store(now.max(1), Relaxed); // off every core, in no registered wait: it gave its core back
         }
         let last = LAST[i].load(Relaxed);
         let age = now.saturating_sub(last);
         let name = core::str::from_utf8(&names[i].0[..names[i].1]).unwrap_or("?");
-        let state = if waits.is_some() { "spin" } else if cpu.is_some() { "run" } else { "off" };
+        let state = if waits.is_some() { "spin" } else if cpu.is_some() { "run" } else if park == Some(false) { "park" } else { "off" };
         let seen = SEEN_CPU[i].load(Relaxed);
         if now >= NEXT_LINE[i].load(Relaxed) {
             NEXT_LINE[i].store(now + LINE_MS, Relaxed);
@@ -253,7 +254,7 @@ fn look(now: u64) {
             holders(&mut h, tid, waits);
             serial_println!("[tests] watch verb={} task={}@{} last={} age_ms={} holders={} state={}", name, tid, CpuWord(seen), last, age, h.as_str(), state);
         }
-        if age >= WEDGE_MS && (cpu.is_some() || waits.is_some()) {
+        if age >= WEDGE_MS && (cpu.is_some() || waits.is_some() || park == Some(false)) {
             if !FIRED[i].swap(true, AcqRel) {
                 WEDGES.fetch_add(1, Relaxed);
                 let mut h = Line::new();

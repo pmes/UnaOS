@@ -9,7 +9,7 @@
 //!
 //! OWED: the registrable domain needs the public suffix list (http_core's cookie jar owes the same); until it
 //! lands, [`site_of`] takes the last two labels, or three under the short multi-part suffixes in
-//! [`MULTI_SUFFIX`].
+//! psl_core (NETDEBT SR97).
 
 use html_core::url;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,13 +124,6 @@ impl Origin {
     }
 }
 
-/// Multi-label public suffixes recognised without the public suffix list.
-pub const MULTI_SUFFIX: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.jp", "ne.jp", "or.jp", "co.nz", "com.br", "com.cn",
-    "co.in", "co.kr", "com.mx", "co.za", "github.io", "gitlab.io", "pages.dev", "netlify.app", "vercel.app", "herokuapp.com",
-    "appspot.com", "blogspot.com", "cloudfront.net", "azurewebsites.net",
-];
-
 fn is_ip_host(host: &str) -> bool {
     host.starts_with('[') || host.parse::<std::net::Ipv4Addr>().is_ok()
 }
@@ -142,19 +135,12 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// The registrable domain of `host` (approximate: see the module's OWED note); an IP address is itself.
 pub fn registrable_domain(host: &str) -> String {
+    // NETDEBT (SR97): the Public Suffix List (psl_core) decides; an IP address is itself.
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     if is_ip_host(&h) {
         return h;
     }
-    let labels: Vec<&str> = h.split('.').collect();
-    if labels.len() <= 2 {
-        return h;
-    }
-    let last2 = labels[labels.len() - 2..].join(".");
-    if MULTI_SUFFIX.contains(&last2.as_str()) {
-        return labels[labels.len() - 3..].join(".");
-    }
-    last2
+    psl_core::site_host(&h).to_string()
 }
 
 /// The site of `url`, serialized (`null` for an opaque origin).

@@ -806,7 +806,7 @@ pub fn hold_release(by: &str) {
 /// The 5 s bound: a store that never answers must not strand the splash. Polled from the device-service pass.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn hold_service() {
-    if HOLD_WIN.load(Ordering::Relaxed) != 0 && crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) >= 5000 && !crate::fs::users::resolve_waiting() { // RESOLVEHANG2 (B531): not while stage-resolve waits (bounded, 8 s) for the console — the splash and its watchdog witness stay up through the step
+    if HOLD_WIN.load(Ordering::Relaxed) != 0 && crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) >= 5000 && !resolve_waiting_any() { // RESOLVEHANG2 (B531): not while stage-resolve waits (bounded, 8 s) for the console — the splash and its watchdog witness stay up through the step
         hold_release("timeout");
     }
 }
@@ -1017,3 +1017,9 @@ pub fn over_label(_text: &str) {}
 /// BOOT80: builds without a compositor hold no glass to label.
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn step_label(_text: &str) {}
+
+/// XHCIISO's fold (B534): `hold_service` compiles on every knob set — the console wait is `login`'s.
+#[cfg(feature = "login")]
+fn resolve_waiting_any() -> bool { crate::fs::users::resolve_waiting() }
+#[cfg(not(feature = "login"))]
+fn resolve_waiting_any() -> bool { false }

@@ -396,9 +396,9 @@ impl CookieJar {
                 if !domain_match(&host, d) {
                     return false;
                 }
-                // §5.3 step 5, the part that needs no list: a single-label Domain (a TLD such as `org`) is a
-                // public suffix — refused unless it IS the request host. The public suffix list is owed.
-                if !d.contains('.') && d != host {
+                // §5.3 step 5: a Domain that is a public suffix (`org`, `co.uk`, `github.io` — psl_core, NETDEBT SR97)
+                // is refused unless it IS the request host.
+                if (!d.contains('.') || psl_core::is_public_suffix(d)) && d != host {
                     return false;
                 }
                 (false, d.to_string())

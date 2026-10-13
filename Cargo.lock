@@ -62,6 +62,7 @@ dependencies = [
  "js_core",
  "layout_core",
  "pixel_core",
+ "psl_core",
  "resvg",
  "serde",
  "serde_json",
