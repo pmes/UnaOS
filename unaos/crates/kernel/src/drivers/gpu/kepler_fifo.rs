@@ -2578,6 +2578,12 @@ pub mod host {
 #[path = "kepler_gr.rs"]
 pub mod gr4;
 
+/// KEPLERUCODE (rmbp-ledger B637, R119) — the FECS/GPCCS context-switch firmware read from the ESP's FW/KEPLER/ under
+/// the `unaos/firmware/kepler.pins` digests, uploaded and started; `kgr` below is its only caller. Same gate as `kgr`.
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
+#[path = "kepler_ucode.rs"]
+pub mod ucode;
+
 #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler", feature = "nvidia-kepler-takeover"))]
 pub mod kgr {
     use super::host as kf;
@@ -2738,19 +2744,27 @@ pub mod kgr {
     /// reads running — ONE GP entry: SET_OBJECT KEPLER_A, the I2M line of 256 bytes into K_DST, KEPLERGR3's
     /// report semaphore and the host WFI fence. Runs only after `nop=ok` on the bound channel. `pre_ok` is the
     /// PFIFO preamble's verdict.
-    fn gr_rung(bar0: usize, w: usize, inst: usize, userd: usize, pre_ok: bool) -> GrOut {
+    fn gr_rung(bar0: usize, w: usize, inst: usize, userd: usize, pre_ok: bool, uc: &Result<u32, alloc::string::String>) -> GrOut {
         use super::gr4;
         let chip = (mr(PMC_BOOT_0) >> 20) & 0xFF;
         gr4::class_line(chip, GR_RL.load(Relaxed), GR_ENG.load(Relaxed));
+        // KEPLERUCODE (B637): the firmware outcome rides in KGR4's fecs word (`ucode=running ctx_size=…` or `ucode=<why>`).
+        let ucw = match uc {
+            Ok(sz) => alloc::format!("ucode=running ctx_size={:#x}", sz),
+            Err(why) => alloc::format!("ucode={}", why),
+        };
         let class = match gr_precondition(bar0, inst) {
             Ok(c) => c,
             Err((why, fecs, cpuctl)) => {
                 serial_println!("[kgr] setobj class={:04X} subch={} -> declined({})", CLASS_KEPLER_A, GR_SUBCH, why);
                 serial_println!("[kgr] method=report-semaphore wrote=- sem=- -> declined");
                 // KGR4 (brief item 3): FECS halted with no ctxsw ucode is the ucode gate — the rung stops before
-                // the SET_OBJECT and PASSes as `(ucode-gated)` when everything up to it held.
+                // the SET_OBJECT and PASSes as `(ucode-gated)` when everything up to it held. KEPLERUCODE: halted
+                // AFTER our firmware reported ready is not that gate — it is a decline of its own.
                 let k4_verdict = if !pre_ok {
                     alloc::string::String::from("DECLINED reason=preamble-wall")
+                } else if fecs == "halted" && uc.is_ok() {
+                    alloc::string::String::from("DECLINED reason=fecs-halted-after-start")
                 } else if fecs == "halted" {
                     alloc::string::String::from("PASS (ucode-gated)")
                 } else {
@@ -2763,11 +2777,34 @@ pub mod kgr {
                     stuck: false,
                     k4_setobj: alloc::string::String::from(if fecs == "halted" { "gated" } else { "declined" }),
                     k4_landed: alloc::string::String::from("-"),
-                    k4_fecs: alloc::format!("{} cpuctl={:08X}", fecs, cpuctl),
+                    k4_fecs: alloc::format!("{} cpuctl={:08X} {}", fecs, cpuctl, ucw),
                     k4_verdict,
                 };
             }
         };
+        // KEPLERUCODE (B637): FECS reads running. Nouveau never names a GR object before a golden context image
+        // exists for the channel (gf100.c:440-443; `gf100_grctx_generate`, ctxgf100.c:1436-1558, writes the instance
+        // block's 0x210/0x214 context pointer at :1488-1489 and asks FECS to save the image at :1531). This tree has
+        // no generator yet (keplerucode.md §3), and the instance block's ctx210 is 0 — so the SET_OBJECT is GATED,
+        // never pushed, whether FECS runs our firmware (`ucode=running`) or was found running some other way.
+        if !super::ucode::GOLDEN_CONTEXT {
+            let why = if uc.is_ok() { "no-golden-context" } else { "fecs-running-without-our-ucode" };
+            serial_println!("[kgr] setobj class={:04X} subch={} -> gated({}; ctx210={:08X})", class, GR_SUBCH, why, vr(inst + INST_GR_CTX));
+            return GrOut {
+                setobj: alloc::string::String::from("gated"),
+                method: alloc::string::String::from("-"),
+                verdict: alloc::format!("DECLINED reason={}", why),
+                stuck: false,
+                k4_setobj: alloc::string::String::from("gated"),
+                k4_landed: alloc::string::String::from("-"),
+                k4_fecs: alloc::format!("running {}", ucw),
+                k4_verdict: if !pre_ok {
+                    alloc::string::String::from("DECLINED reason=preamble-wall")
+                } else {
+                    alloc::format!("DECLINED reason={}", why)
+                },
+            };
+        }
         // G10 + G11 + KGR4: one GP entry (entry 1), built by gr4 (cla097.h methods, cla06f.h headers).
         let (push, grsem, fence, dst) = (w + K_PUSH_GR, w + K_GRSEM, w + K_FENCE, w + K_DST);
         let before = vr(grsem);
@@ -2910,6 +2947,10 @@ pub mod kgr {
         // KEPLERGR4: the PFIFO preamble (PMC PFIFO + GR's reset bit, mc/base.c:57 BIT(reset); the PBDMA probe and
         // enable; the runlist masks read) through `host`, the ONE path, before `fifo_init`.
         let pa = kf::preamble(bar0, &mut pre, if rst < 32 { 1u32 << rst } else { 0 });
+        // KEPLERUCODE (B637): with PGRAPH's PMC bit raised and before any channel is bound (nouveau starts ctxctl at the
+        // end of GR init, ahead of every channel: gf100.c:2463), the pinned FW/KEPLER set is uploaded and started.
+        // A set that is absent or unpinned writes nothing and the rung reads exactly as KEPLERGR4 left it.
+        let uc = super::ucode::load_and_start(bar0);
         let Some(io) = kf::fifo_init(bar0, utab, rl, &mut pre) else {
             let mut r = alloc::string::String::new();
             let _ = pre.restore(bar0, &mut r); // nothing bound yet: only the preamble's PMC + 0x204 pre-images to put back
@@ -2992,7 +3033,7 @@ pub mod kgr {
             "EXEC-WALL"
         };
         // KEPLERGR3: past the NOP, the GR rung (G8..G11) decides the verdict; a GR push left stuck is unwound.
-        let gr = if verdict == "PASS" { Some(gr_rung(bar0, w, inst, userd, pa.ok())) } else { None };
+        let gr = if verdict == "PASS" { Some(gr_rung(bar0, w, inst, userd, pa.ok(), &uc)) } else { None };
         if verdict != "PASS" || gr.as_ref().map_or(false, |g| g.stuck) {
             let _ = kf::unwind(bar0, kf::CHID_GR, rl, w + K_RUNL0, &pre);
         }
