@@ -202,8 +202,8 @@ fn ink_element(
     if spec.list_item.unwrap_or(tag == "li") && !inherited.text_hidden {
         let fs = spec.marker.as_ref().map_or(inherited.font_size, |m| m.size(inherited.font_size).max(inherited.font_size));
         r.0 -= 40.0 * fs + 4.0;
-        r.1 -= 2.0 * fs;
-        r.3 += 2.0 * fs;
+        r.1 -= 4.0 * fs; // the marker's glyphs about the first baseline (an empty item's sits below its top)
+        r.3 += 4.0 * fs;
     }
     ink_add(r);
 }
@@ -3470,8 +3470,8 @@ pub fn render_frame(
                         // the content box's physical origin — the space `layout_core::hit` maps a pointer into.
                         let (rx, ry) = if vmode != 0 { (vorigin.0 as f32, vorigin.1 as f32) } else { (0.0, 0.0) };
                         // AETHERPAINTPERF (SR130): the index walk records the text boxes (the indexed paint walk skips
-                        // boxes, so it records none), and the fragment's ink: its advance and line box, two ems of
-                        // glyph overhang and the spacing a selected line break adds.
+                        // boxes, so it records none), and the fragment's ink: its advance and line box, glyph overhang
+                        // (3 em up, 2 em down, 2 em across) and the spacing a selected line break adds.
                         if walk_mode() != 2 {
                             TEXT_BOXES.with(|t| {
                                 t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox + rx, w: fw, top: ltop + ry, bottom: lbot + ry, adv, scroll: (sx, sy) })
@@ -3481,7 +3481,8 @@ pub fn render_frame(
                             let fs = i.font_size;
                             let m = 2.0 * fs + 4.0 + i.letter_spacing.abs() + i.word_spacing.abs();
                             if i.shadows(layout).is_empty() {
-                                ink_add((ox - m, ltop.min(by - 2.0 * fs) - m, ox + fw + m, lbot.max(by + fs) + m));
+                                // 3 em above the baseline, 2 em below it, 2 em and the spacing either side.
+                                ink_add((ox - m, ltop.min(by - 3.0 * fs) - 4.0, ox + fw + m, lbot.max(by + 2.0 * fs) + 4.0));
                             } else {
                                 ink_add(INK_ALL);
                             }
