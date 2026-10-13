@@ -1,0 +1,25 @@
+# FLIGHT 33 — image 25 on the UNAFS CARD IMAGE (rmbp12flight33, hw-rmbp@34927a4c), 2026-10-13, main bench
+
+Captures: `f33-boot1.log` (the rotated bench file `ttyUSB1.20261013T055802Z.log`'s tail), `f33-boot2.log` (pinned at the end of the flight). Medium: the 4.1 GiB card image (`UnaOS-rmbp-esp-rmbp12flight33-20261013T0550Z-34927a4`, sha256 280ff0a0…). Knob line = image 24's exactly (`image-line.env` + AETHER + MIDDEN + UNA + SONDE = 48). Tree = the cloud's image-25 fold 34927a4c: flight 32's seven reds (POINTERSCALE, PUMPHOLE, TWOCURSORS, AETHERPTR, SPLASHWORD2, USBNETRX, DOCKPINS). Build: gate33s rc=0, banner-cert 54/0, pins MATCH. Mac only (Peter).
+
+## Peter, verbatim (the glass)
+- "next boot is up we are only doing mac here not pi or orin"
+- "machine not responding" (boot 1)
+- "machine is back but mouse even less responsive than ever!" (boot 2)
+
+## 1. Boot 1 (fresh card) — WEDGED at the desktop ignition on the first-user path
+`:: LOADER: 13802ms/2730ms`; `:: BOOT: total=22532ms lines=211`; the form; `[login] submit kdf_ms=2479 … input_blocked_ms=0`; `[login] session open user=una role=admin`; `WINDOWCAP … -> armed`; then **`[boot] phase=desktop from=setter why=session at=35088ms pre_wi`** — the serial line CUT mid-word at 05:57:25 and NOTHING after (the seat's `tests pointerfeel` at 05:58:02 got no echo; the bench capture rotated its file at that second — the rotated file ends on the cut). Flight 29's SESSIONWEDGE shape exactly (its line cut at `why=sessio`). No panic, no witness row. Peter: "machine not responding". The three image-25 arcs that touch that instant: SPLASHWORD2 (the desktop present repaints rows no strip paints — at ignition), PUMPHOLE (the flight recorder's hand at the early return), TWOCURSORS (the compose path).
+
+## 2. Boot 2 (cold, una in the store) — ignites; SPLASHWORD2, DOCKPINS, PUMPHOLE land
+`U2.5: FTDI console up`; `[login] screen open window=2 … modal=true power_row=1`; **`[fbdirect] clear painter=splash-word rect=0,1680,2880x80 -> damage handed=1 painted=1`**; **`[fbdirect] expose why=screen-open rects=1 px=230400 handed=2 painted=1`**; `stage-resolve end ms=235`; login; `[login] desktop bare`; **`[desktop] built at=login ok bar_ms=46 … pins=10`** (DOCKPINS: 7 → 10); `[jobs] volume records=1785 on=worker ms=513`; the pointer alive. The first-user path wedges, the login-screen path ignites: SETTERWEDGE — one sample.
+
+**The pointer (Peter's order).** `[tp] mode reassert n=1 why=stream-legacy … latched=yes ms=12`, then route=mt. `tests pointerfeel` (finger moving): **`POINTERFEEL: reports=244 rate_hz=48.8 gaps=3 gap_max_ms=1001 worst_holder=silent/pass_max_ms=2 route=mt scale=5.07u/px carried=0/241 carried_pct=0 -> PASS`** `fr=worker:c2 fr_worst_ms=1 starved=0 silent=3 silent_max_ms=1001 pass_max_ms=8`; the three gaps `cause=silent` (18, 223, 1001 ms: the pad sent nothing, the HID pass ≤5 ms). HIDSTALL PASS (`fr` off the pump; census still names usb-pump:flight-recorder 141 ms from before login). INPUTSTALL FAIL `comp_max_ms=258 hid_gap_max_ms=396`. Peter: **"mouse even less responsive than ever!"**
+
+## 3. Findings
+- **SETTERWEDGE (boot 1)**: the desktop ignition from the setter (first-user) path wedges the kernel with the serial line cut mid-print, flight 29's shape; the login-screen path ignites. Every fresh card's first boot is dead on this image. BEFORE everything.
+- **POINTERSCALE2 — the range-derived scale DRIFTS with use**: `[ptr] fine … rebase=0 div=5.07u/px range=x-3243..4069` at the first report → `rebase=8 div=5.55u/px range=x-3243..4751` two minutes later. The scale is derived from the pad's OBSERVED extremes, so every new extreme lowers the gain for the rest of the session (10 % slower in two minutes, monotone): "even less responsive than ever", and worse the longer it runs. The scale must come from the pad's declared range (or be fixed once at the first full-width swipe), never re-derived live. `rebase=8` in two minutes: eight "jumps" re-baselined — motion discarded under fast strokes (the ±37 clamp's replacement throws the stroke away instead of clamping it).
+- **The rate**: 48.8 Hz under a continuous finger, with "silent" gaps of 223 and 1001 ms the HID pass did not cause (`pass_max_ms=2`). The pad in vendor mode reports at ~100 Hz on this hardware; half the reports are not arriving at the kernel — the interrupt-IN polling interval / the EHCI schedule is the next suspect, and "silent" is where the fixture stops looking.
+- SPLASHWORD2 (painted=1, expose rects=1), DOCKPINS (pins=10), PUMPHOLE (`fr=worker:c2`), POINTERSCALE's isotropy (`carried=0`) landed on boot 2.
+
+## 4. Owed (the cloud's, in Peter's order)
+SETTERWEDGE (a fresh card's first boot wedges at ignition — the image is unflyable for a new user until fixed); POINTERSCALE2 (the drifting gain + the jump rebase discarding strokes + the 49 Hz stream); then the rest of this flight's list (below, as it lands).
