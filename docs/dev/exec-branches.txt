@@ -431,3 +431,5 @@ refs/heads/exec-host-aethermedia              98d9f842 IN-FLIGHT cloud 2026-10-1
 refs/heads/exec-rmbp-sonde3                   98d9f842 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-prefchanged              98d9f842 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-palettecore              98d9f842 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-aethermetal4             73cd904b IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-aethernet                73cd904b IN-FLIGHT cloud 2026-10-13
