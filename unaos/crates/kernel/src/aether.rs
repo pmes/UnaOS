@@ -7,8 +7,8 @@
 //! user-aether) parses, cascades, lays out and paints in ring 3 on the shared cores. This file is lumen.rs's
 //! LUMENAPP + LUMENCRASH shape (B323, B326) for that image:
 //!
-//! 1. STATIC. `/apps/AETHER.ELF` is on the program volume; the production validator (`arch::x86_64::elf::
-//!    validate_elf`, the one `bg` runs) accepts it in the ELF-window model; its `.note.unaos.app` names "UnaOS",
+//! 1. STATIC. `/apps/AETHER.ELF` is on the program volume; the production validator (`arch::syscall::
+//!    launch_plan`, the arch's loader check — ARMAETHER A110) accepts it in the ELF-window model; its `.note.unaos.app` names "UnaOS",
 //!    type 1, flags bit0 = windowed (`midden_core::app_note_flags`, the shell's own reader).
 //! 2. SPAWN. The image runs as `bg` runs it (`spawn_user_image_bg`, the APPRES sight first and the launch name
 //!    armed, LUMENFAST's order) and the fixture waits up to 20 s for the program's report line, then kills the
@@ -25,7 +25,7 @@
 //! (it read the page) with `lines > 0` and `painted > 0`.
 //!
 //! 4. DRIVE (AETHERMETAL M3, LEDGER SR96). Before the kill, the fixture plays the operator into the program's
-//!    ring by owner (`user_input_push_owner`, unaapp.rs's channel), one step per wire line, each watched at the
+//!    ring by owner (`arch::syscall::launch_push` of the launch handle, unaapp.rs's channel), one step per wire line, each watched at the
 //!    seam (`line_watch_arm`) and read from the verdict tail: Tab (`:: AETHER: focus -> PASS href=… at=x0,y,x1`
 //!    — the first link's first text box, window px), the pointer placed on that box by one MOUSE_ABS in window px
 //!    (AETHERPTR B543: the ring's pointer contract; `:: AETHER: hover -> PASS href=…` → `hover=1`), a left-button drag
@@ -58,9 +58,15 @@
 //! The knob is `UNAOS_AETHER=1` → feature `aether` (it implies `selfdiag`: SYS_PATH_READ is the file surface the
 //! program reads the page and the faces through). Registered from `tests::ensure_shellux`, so the QEMU lanes
 //! (`tests-at-boot`) run it at boot and the desktop runs it as `tests aether`.
+//!
+//! ARMAETHER (orin-ledger A110): every term above goes through the arch's launch facade (`crate::arch::syscall`,
+//! ARMTESTS A109) — the validator, the compositor owner of the launch handle and the by-handle push — so the same
+//! fixture runs on x86 and on every `aarch64_el0` build (lib.rs and tests.rs cfg it so). The launch handle is the
+//! 0-based slot on x86 and the ASID on aarch64; the `[aetherapp]` line prints it under `slot=` on both.
+
+use crate::arch::syscall as sc;
 
 const IMAGE: &str = "/apps/AETHER.ELF";
-#[cfg(target_arch = "x86_64")]
 const REPORT: &str = ":: AETHER: page";
 
 /// Register `tests aether` exactly once.
@@ -72,14 +78,6 @@ pub fn ensure() {
     }
 }
 
-/// aarch64: no AETHER.ELF image is built for that loader yet (owed with Lumen's).
-#[cfg(not(target_arch = "x86_64"))]
-pub fn selftest() {
-    serial_println!(":: AETHERAPP: reason=aarch64-image-owed ::");
-    serial_println!(":: AETHERAPP: image={} window=bad painted=0 lines=0 hover=0 nav=0 select=0 tab=0 url=0 back=0 find=0 -> SKIP reason=aarch64-image-owed ::", IMAGE);
-}
-
-#[cfg(target_arch = "x86_64")]
 pub fn selftest() {
     let verdict_m3 = |window: &str, painted: u64, lines: u64, d: &Drive, v: &str| {
         crate::serial_line::tail_arm(); // the glass reads THIS line's tail, not the program's
@@ -104,9 +102,9 @@ pub fn selftest() {
     crate::serial_line::line_watch_arm(REPORT);
     crate::serial_line::tail_arm();
     let t_spawn = crate::arch::ms();
-    let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(&img) {
+    let (pid, slot, entry) = match sc::spawn_user_image_bg(&img) {
         Ok(t) => {
-            crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1), IMAGE);
+            crate::video::wm::app_name_arm_launch(sc::owner_of_launch(t.1), IMAGE);
             t
         }
         Err(e) => {
@@ -135,7 +133,7 @@ pub fn selftest() {
     let tail = crate::serial_line::tail_take();
     // M3: play the operator into the ring before the kill (only once the program has painted its page).
     let drive = if hit && tail.as_deref().is_some_and(|t| t.starts_with("PASS")) { drive(slot) } else { Drive::default() };
-    let killed = crate::arch::syscall::bg_kill(pid, slot);
+    let killed = sc::bg_kill(pid, slot);
     serial_println!(
         "[aetherapp] pid={} slot={} entry={:#x} sight_ms={} spawn_ms={} report_ms={} wait_ms={} kill={} tail={:?}",
         pid, slot, entry, sight_ms, spawn_ms, took, WAIT_MS, killed, tail.as_deref()
@@ -182,15 +180,19 @@ pub fn selftest() {
 /// ring-3 socket ABI (crates/user-aether/src/net.rs, `:: AETHER: net url=… status=… bytes=… ms=… tls=… -> …`), and the
 /// drive would aim it at a page the KERNEL serves, so the leg needs no outside network. On x86 there is none: no
 /// in-kernel HTTP responder exists and smolnet carries no loopback interface a ring-3 socket reaches (the one in-kernel
-/// HTTP loopback is aarch64 genet.rs's NET-GATE battery, kernel-side only, and AETHER.ELF is not on that loader yet).
-/// So the leg is a SKIP by name, never a pass; the program's own line is the proof on a networked boot (`aether <url>`).
+/// HTTP loopback is aarch64 genet.rs's NET-GATE battery, kernel-side only, so a ring-3 socket reaches no kernel page on
+/// aarch64 either — ARMAETHER: the `reason=` names the arch). So the leg is a SKIP by name, never a pass; the program's
+/// own line is the proof on a networked boot (`aether <url>`).
 ///
 /// AETHERMETAL5: the omnibox's https step (`chrome`, last) is reported on the same terms — `routed=url` when the field
 /// sent `https://example.org` to the network path (the program's `:: AETHER: net` line follows on its own), the
 /// omnibox tail's word otherwise — and SKIP(no-server) by name, never a pass.
-#[cfg(target_arch = "x86_64")]
 fn net_drive(omni: Option<&str>) {
-    serial_println!(":: AETHERNET: drive=SKIP(no-server) reason=no-kernel-served-page (x86: no in-kernel HTTP responder, no ring-3 loopback) proof=aether-url-on-a-networked-boot ::");
+    #[cfg(target_arch = "x86_64")]
+    const WHY: &str = "x86: no in-kernel HTTP responder, no ring-3 loopback";
+    #[cfg(not(target_arch = "x86_64"))]
+    const WHY: &str = "aarch64: the in-kernel HTTP loopback is kernel-side only, no ring-3 loopback";
+    serial_println!(":: AETHERNET: drive=SKIP(no-server) reason=no-kernel-served-page ({}) proof=aether-url-on-a-networked-boot ::", WHY);
     let routed = match omni {
         Some(t) if t.starts_with("PASS") && t.contains("kind=url") => "url",
         Some(t) if t.starts_with("PASS") => "other",
@@ -202,7 +204,6 @@ fn net_drive(omni: Option<&str>) {
 
 /// AETHERMETAL M3 (SR96): what the drive read back — each step's verdict tail (focus, hover, select, clip, nav)
 /// and the three facts the witness carries.
-#[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct Drive {
     /// M3: focus, hover, select, clip, nav; SR109: tab, url, find, back, zoom, close; AETHERMETAL5: the https omnibox.
@@ -216,9 +217,8 @@ struct Drive {
     find: u64,
 }
 
-/// One drive step: arm the seam's watch on `prefix`, push `evs` into the program's ring (owner `slot + 1`), wait up
-/// to `STEP_MS` for the line, and return its verdict tail.
-#[cfg(target_arch = "x86_64")]
+/// One drive step: arm the seam's watch on `prefix`, push `evs` into the program's ring (the launch handle `slot`'s
+/// owner, resolved by the arch), wait up to `STEP_MS` for the line, and return its verdict tail.
 fn step(slot: u64, prefix: &'static str, evs: &[u64]) -> Option<alloc::string::String> {
     const STEP_MS: u64 = 3_000;
     crate::serial_line::line_watch_arm(prefix);
@@ -246,13 +246,13 @@ fn step(slot: u64, prefix: &'static str, evs: &[u64]) -> Option<alloc::string::S
     if hit { tail } else { None }
 }
 
-/// Push `evs` into the program's ring (owner `slot + 1`) in order; a full ring (32 events) is waited on for up to
-/// 500 ms while the program drains it (SR109: a typed URL is ~26 events). False when it never drained.
-#[cfg(target_arch = "x86_64")]
+/// Push `evs` into the program's ring in order — `sc::launch_push` of the launch handle (ARMAETHER: x86's owner is
+/// `slot + 1`, aarch64's the ASID itself; the arch answers, never arithmetic here); a full ring (32 events) is waited
+/// on for up to 500 ms while the program drains it (SR109: a typed URL is ~26 events). False when it never drained.
 fn push(slot: u64, evs: &[u64]) -> bool {
     for &e in evs {
         let t0 = crate::arch::ticks();
-        while !crate::arch::syscall::user_input_push_owner(slot + 1, e) {
+        while !sc::launch_push(slot, e) {
             if crate::arch::ticks() >= t0 + 500 {
                 return false;
             }
@@ -263,21 +263,17 @@ fn push(slot: u64, evs: &[u64]) -> bool {
 }
 
 /// The packed events the drive pushes (the router's encoding, `una_abi::input_ev_pack`).
-#[cfg(target_arch = "x86_64")]
 fn key(b: u8) -> u64 {
     una_abi::input_ev_pack(una_abi::INPUT_EV_KEY_DOWN, b as u64)
 }
-#[cfg(target_arch = "x86_64")]
 fn abs(x: i64, y: i64) -> u64 {
     una_abi::input_ev_pack(una_abi::INPUT_EV_MOUSE_ABS, una_abi::input_ev_xy_payload(x as i32, y as i32)) // AETHERPTR (B543): window px, what x86's producer hands a windowed program
 }
-#[cfg(target_arch = "x86_64")]
 fn button(mask: u8) -> u64 {
     una_abi::input_ev_pack(una_abi::INPUT_EV_BUTTON, mask as u64)
 }
 
 /// `key=<int>[,<int>…]` out of a tail: the integers after `key`, comma separated.
-#[cfg(target_arch = "x86_64")]
 fn ints(t: &str, key: &str) -> alloc::vec::Vec<i64> {
     let Some(at) = t.find(key) else { return alloc::vec::Vec::new() };
     let rest = &t[at + key.len()..];
@@ -287,7 +283,6 @@ fn ints(t: &str, key: &str) -> alloc::vec::Vec<i64> {
 
 /// AETHERMETAL M3: Tab → the first link's box; pointer onto it (hover); drag across it (select); Ctrl+C (clip);
 /// click (nav).
-#[cfg(target_arch = "x86_64")]
 fn drive(slot: u64) -> Drive {
     let mut d = Drive::default();
     d.tails[0] = step(slot, ":: AETHER: focus", &[key(b'\t')]);
@@ -307,7 +302,6 @@ fn drive(slot: u64) -> Drive {
 
 /// AETHERMETAL4 (SR109): the chrome, one drive per feature — open a tab, type a URL to a local page, find in it,
 /// back; then zoom and close the tab (reported); last the omnibox's https step (reported, AETHERMETAL5).
-#[cfg(target_arch = "x86_64")]
 fn chrome(slot: u64, d: &mut Drive) {
     let pass = |t: &Option<alloc::string::String>, want: &str| t.as_deref().is_some_and(|t| t.starts_with("PASS") && t.contains(want));
     d.tails[5] = step(slot, ":: AETHER: tab", &[key(0x14)]);
@@ -340,13 +334,12 @@ fn chrome(slot: u64, d: &mut Drive) {
 /// The static half: the image off the program volume, the loader's plan, the app note. `Ok((image, window))`;
 /// `Err` is the verdict word — SKIP when there is no program volume or the image is not staged on it (Lumen's
 /// rule), FAIL when it is there and cannot be read or loaded.
-#[cfg(target_arch = "x86_64")]
 fn check(why: &dyn Fn(&str)) -> Result<(alloc::vec::Vec<u8>, &'static str), &'static str> {
     let Ok(fs) = crate::fs::rootdisk::program_source() else {
         why("no-program-volume");
         return Err("SKIP");
     };
-    let cap = crate::arch::syscall::user_image_cap();
+    let cap = sc::user_image_cap();
     let img = match fs.find_app("AETHER.ELF") {
         Ok(de) if de.size != 0 && de.size as usize <= cap => {
             let mut b = alloc::vec::Vec::new();
@@ -365,7 +358,7 @@ fn check(why: &dyn Fn(&str)) -> Result<(alloc::vec::Vec<u8>, &'static str), &'st
             return Err("SKIP");
         }
     };
-    let plan = match crate::arch::x86_64::elf::validate_elf(&img, crate::arch::syscall::user_window_size()) {
+    let plan = match sc::launch_plan(&img) {
         Ok(p) => p,
         Err(e) => {
             serial_println!(":: AETHERAPP: reason=loader-refused ({}) ::", e);
