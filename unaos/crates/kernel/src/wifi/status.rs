@@ -99,3 +99,18 @@ pub fn unwind_token() -> &'static str {
         _ => if cfg!(feature = "wifi5") { "armed-unreached" } else { "off" },
     }
 }
+
+// ── WIFI8 (B529): S5r, the PHY reset's verdict this boot — for `tests wifi`. ─────────────────────
+/// 0 not run, 1 done (IOCTL restored), 2 failed, 3 refused by the version gate.
+static PHY_RESET: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub fn set_phy_reset(v: u8) {
+    PHY_RESET.store(v, Ordering::Relaxed);
+}
+pub fn phy_reset_token() -> &'static str {
+    match PHY_RESET.load(Ordering::Relaxed) {
+        1 => "done",
+        2 => "failed",
+        3 => "refused(gate)",
+        _ => if cfg!(feature = "wifi4") { "not-run" } else { "off" },
+    }
+}

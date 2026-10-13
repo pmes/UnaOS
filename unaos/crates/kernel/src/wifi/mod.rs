@@ -113,6 +113,11 @@
 /// single write.
 #[cfg(feature = "wifi2")]
 pub mod bringup;
+// WIFI8 (B529, R110): the HT-PHY table RAM contents and the 2059 radio's tables, as DATA (b43 names).
+#[cfg(feature = "wifi4")]
+pub mod htphy_tables;
+#[cfg(feature = "wifi4")]
+pub mod radio2059;
 pub mod bus;
 pub mod firmware;
 pub mod ladder;

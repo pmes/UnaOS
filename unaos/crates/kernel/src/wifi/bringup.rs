@@ -2308,13 +2308,15 @@ unsafe fn w16(base: u64, off: u64, val: u16) {
 struct PhyWrites {
     /// `d11+0x3F6`, the radio-register address port — the only register this rung writes.
     radio_addr: u32,
-    /// `d11+0x3F8` / `d11+0x3FA`, the radio DATA ports. No write site exists: writing one would set
-    /// a radio-silicon register, which is what the whole safety argument for (a) rests on NOT doing.
+    /// `d11+0x3F8` / `d11+0x3FA` (and the rev>=24 pair's data port `0x3DA`), the radio DATA ports. No
+    /// write site exists: writing one would set a radio-silicon register, which is what the whole
+    /// safety argument for (a) rests on NOT doing — WIFI8 reads through `0x3D8`/`0x3DA` and writes
+    /// only the ADDRESS port, counted in `radio_addr`.
     radio_data: u32,
     /// `MACCTL`, `SHM_CONTROL`, `SHM_DATA`, `RADIO_CONTROL` (0x3E2) — no write site in this rung.
     core_regs: u32,
-    /// Wrapper `IOCTL` / `RESET_CTL` — no write site in this rung. The PHY reset sub-stage that
-    /// would need them is REFUSED for an unpinned bit position, not merely skipped.
+    /// Wrapper `IOCTL` / `RESET_CTL` — WIFI8 (B529): `bringup/phyreset.rs` writes `IOCTL` three
+    /// times (the b43 reset sequence, bits pinned under R110); `RESET_CTL` still has no write site here.
     wrapper: u32,
 }
 
@@ -2474,16 +2476,14 @@ fn phy_once(bar0: u64) {
         if alive { "PHY-ALIVE" } else { "PHY-SUSPECT" }
     );
 
-    // ── S5(b), the half that is REFUSED — and what it would take to build it. ────────────────────
-    serial_println!(
-        ":: wifi4: phy-reset REFUSED reason=ai-wrapper-phy-reset-bit-UNPINNED -> DECLINED(S5r) {} — WIFI7 (B505): the tree's AI-wrapper map (`drivers/bcma.rs` WRAP_IOCTL/IOCTL_*) cites Linux bcma.h and b43, never a SPEC-V4 agent page, so no Group-A pin exists to take; the CoreFlags>>16 decode is coherence with PHY-ALIVE, not a pin; and S5-0's premise (the EFI's PHY tune survives S4) is exactly what a PHY reset would erase while S5c has no table to rebuild it. The SEQUENCE is citable: [SPEC-V4 802.11/CoreReset] orders \"reset the core on the backplane using the flags ORed with PHY Clock Enable and PHY Reset\", then \"wait for the PLL to turn on (150 microseconds)\" ([SPEC-V4 802.11/PHY]: \"between putting the PHY into reset and taking it out, there must be at least a 150 uSec delay for the PLL to settle\"), then take the PHY out of reset. The FLAG VALUES are pinned only for the SSB-era TM State Low register ([SPEC-V4 802.11/CoreFlags]: PHY Reset 0x00080000, PHY Clock Enable 0x00040000, MAC PHY Clock Control Enable 0x00100000) and THIS part is socitype 1 — an AI/BCMA part with an EROM (bcm4331.md §0, Boot AJ) — whose equivalent bits live in the AI wrapper IOCTL at +0x408, a register that appears in NEITHER spec generation (§S4-W5 fact 7 / residual 1: both document only the SSB-era backplane). IOCTL flag values are NOT composed from unpinned sources, which is the same rule the wifi3 prologue obeys by preserving the measured word instead of building one. So no PHY reset is performed and none is faked: what stands is the read-back above. WHAT WOULD SETTLE IT: an AI-wrapper IOCTL bit map for the d11 core from a Group-A source, or a metal reading that discriminates the bit ::",
-        live::s5r_advisory(ioctl)
-    );
+    // ── S5(r): the PHY reset, built (WIFI8, B529, R110) — bringup/phyreset.rs. ──────────────────
+    let rv = phyreset::run(bar0, &mut pw, id_ok && alive, phy & 0xF, ver);
+    let _ = live::s5r_advisory(ioctl);
 
-    // ── S5(c) and (d). ──────────────────────────────────────────────────────────────────────────
+    // ── S5(c): the channel tune — DECLINED by the seat's rule for this arc, the tables now pinned. ──
     serial_println!(
-        ":: wifi4: channel-tune REFUSED reason=htphy-2059-tables-UNPINNED -> DECLINED(S5c) owed={} — WIFI7 (B505): the tables owed, by name, before any tune is written. [SPEC-V4] carries radio pages for 2055/2056/2057/2062/2063 and channel tables for the A and B/G PHYs only; there is no HT-PHY (type 7) channel path and no 2059 radio page in either generation. Checked: /802.11/Radio/, /802.11/Radio/Channel/, /802.11/Radio/Init/, /802.11/Radio/Registers/, /802.11/Radio/RadioID/, /802.11/PHY/, /802.11/CoreReset/, /802.11/CoreFlags/ and the PageIndex on bcm-v4.sipsolutions.net, plus /Radio/, /RadioID/ and /RadioRegister/ on bcm-specs.sipsolutions.net. bcm4331.md §S5 says the tables \"cannot be derived, checked, or reasoned about — only transcribed\", and the only place to transcribe them from is off-limits for this module. NO register is written from a table that exists in no legal source ::",
-        live::S5C_OWED
+        ":: wifi4: channel-tune DECLINED reason=seat-rule(receive-only-rung-after-S5r-flies) tables=pinned(wifi/htphy_tables.rs,wifi/radio2059.rs; was owed: {}) phy_reset={} tables_before={}/{} survived={} -> DECLINED(S5c) — the tune (phy_ht.c:35-77, :763-805, SHM 0x00A0) is a radio DATA write path; it follows as its own rung once S5r has flown ::",
+        live::S5C_OWED, if rv.reset_done { "done" } else { "not-done" }, rv.before_match, rv.elems, rv.survived
     );
     serial_println!(
         ":: wifi4: rx-chain NOT ATTEMPTED reason=depends-on-channel-tune instead=s5d-on-efi-channel at=tests-wifi — WIFI7 (B505): the rung that needs no table, a 5 s SHM watch on the channel the firmware left (`[wifi] rx-watch`). §S5(d) sits on top of (c) and has no read-back predicate of its own before S6 in any case (bcm4331.md §S5: \"(c) and (d) do not, until S6\") ::"
@@ -2506,6 +2506,9 @@ mod capture;
 // WIFI7 (B505): S5u/S5r/S5c on the boot, S5d's 5 s SHM watch at `tests wifi`.
 #[cfg(feature = "wifi4")]
 pub(super) mod live;
+// WIFI8 (B529, R110): rung S5r — the PHY reset through the AI wrapper and the table/radio read-backs around it.
+#[cfg(feature = "wifi4")]
+mod phyreset;
 
 // WIFI6 (B439): rung S2r, the SPROM identity on the flown wifi2 path.
 mod ident;

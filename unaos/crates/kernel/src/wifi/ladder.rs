@@ -39,16 +39,16 @@ const LEDGER: [(&str, St, &str); 27] = [
     ("S3o", St::Confirmed, "f13 shared[+0x00]=0x0288 vs ours 0x029a"),
     ("S3s", St::Confirmed, "f13 window-answers=YES shm-enabled=0"),
     ("S4p", St::Confirmed, "f13 prologue post psm-run=0 MATCH"),
-    ("S4m", St::Open, "f13 macctl 0x404 readback 0x80000404 took=0 (bit 31)"),
+    ("S4m", St::Open, "f13 macctl 0x404 readback 0x80000404 took=0 (bit 31 = GMODE, b43.h:475, R110)"),
     ("S4", St::Confirmed, "f13 upload handshake rev=666"),
     ("S4u", St::Confirmed, "f14 core-pre psm-run=1 shared 0x0288 after f13's upload"),
     ("S4w", St::Refuted, "f13 prologue post macctl=0x80000000 psm-run=0"),
     ("S4i", St::Open, "C1 pre-image read not yet flown"),
     ("S5a", St::Confirmed, "f13 V4 order 0x0205917f radio 0x2059 mfg 0x17f"),
     ("S5b", St::Confirmed, "f13 phy-alive verdict=PHY-ALIVE"),
-    ("S5r", St::Parked, "AI wrapper PHY_RESET bit unpinned"),
+    ("S5r", St::Open, "WIFI8: reset rung built (b43 main.c:1233-1245), reads `:: wifi8: phy-reset`"),
     ("S5i", St::Open, "initvals never written on metal"),
-    ("S5c", St::Parked, "HT-PHY 2059 tables in no legal source; reopens on C2"),
+    ("S5c", St::Parked, "tables pinned (R110); the tune is a receive-only rung after S5r flies"),
     ("S6", St::Open, "DMA rings unbuilt"),
     ("S7", St::Open, "MAC/station unbuilt"),
     ("S8", St::Open, "WPA2 unbuilt"),
@@ -98,8 +98,8 @@ pub fn witness() {
     let urev = urev.map(|r| alloc::format!("{}", r)).unwrap_or_else(|| alloc::string::String::from("none"));
     let rx5 = mv.map(|n| alloc::format!("unpinned(movers={})", n)).unwrap_or_else(|| alloc::string::String::from("not-watched"));
     serial_println!(
-        ":: WIFI5: rungs={} confirmed={} refuted={} open={} parked={} upload_unwind={} staged={}/3 {} uploaded_this_boot={} ucode_rev={} rx_frames_5s={} -> {}{} ::",
-        LEDGER.len(), c, r, o, p, unwind, staged, fw, uploaded as u8, urev, rx5,
+        ":: WIFI5: rungs={} confirmed={} refuted={} open={} parked={} upload_unwind={} staged={}/3 {} uploaded_this_boot={} ucode_rev={} rx_frames_5s={} phy_reset={} tune=declined(seat-rule) rx=declined(no-counter) -> {}{} ::",
+        LEDGER.len(), c, r, o, p, unwind, staged, fw, uploaded as u8, urev, rx5, status::phy_reset_token(),
         if reason.is_none() { "READY" } else { "NOT-READY" },
         reason.map(|s| alloc::format!(" reason={}{}", s, hint)).unwrap_or_default()
     );
