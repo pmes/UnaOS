@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use gneiss_pal::api::http::{self, Client, CookieJar};
+use html_core::url;
 use std::sync::{Arc, Mutex};
 
 // HTTPCORE (SR51): every Aether fetch goes through gneiss_pal::api::http — UnaOS's own http_core (WHATWG URL,
@@ -299,7 +300,7 @@ pub fn favicon_url(base_url: &str, html: &str) -> Option<String> {
     if !(origin.scheme() == "http" || origin.scheme() == "https") {
         return None;
     }
-    origin.set_path("/favicon.ico");
+    origin.set_pathname("/favicon.ico");
     origin.set_query(None);
     origin.set_fragment(None);
     Some(origin.to_string())

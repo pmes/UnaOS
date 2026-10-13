@@ -22,7 +22,7 @@ use super::{page, touch};
 #[path = "selection.rs"]
 pub mod selection;
 use crate::dom::{Arena, NodeRef, Selectors};
-use html_core::{Attribute, Document, Namespace, NodeData, NodeId};
+use html_core::{url, Attribute, Document, Namespace, NodeData, NodeId};
 use js_core::string::JsStr;
 use js_core::vm::*;
 use std::collections::HashSet;

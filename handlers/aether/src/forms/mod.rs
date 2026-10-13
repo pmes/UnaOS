@@ -6,6 +6,7 @@
 pub mod edit;
 
 use crate::dom::NodeRef;
+use html_core::url;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HttpMethod {
@@ -362,9 +363,9 @@ pub fn urlencoded(entries: &[Entry]) -> String {
         if !out.is_empty() {
             out.push('&');
         }
-        out.extend(url::form_urlencoded::byte_serialize(normalize_crlf(&e.name).as_bytes()));
+        url::form::byte_serialize_into(&mut out, normalize_crlf(&e.name).as_bytes());
         out.push('=');
-        out.extend(url::form_urlencoded::byte_serialize(entry_text(e).as_bytes()));
+        url::form::byte_serialize_into(&mut out, entry_text(e).as_bytes());
     }
     out
 }

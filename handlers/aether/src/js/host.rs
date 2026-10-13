@@ -9,6 +9,7 @@
 //! - the clock is the wall clock (`Date.now`); local time is UTC (this host has no zone database);
 //! - `Math.random` is seeded from the OS entropy pool.
 
+use html_core::url;
 use js_core::vm::{Host, Obj};
 
 /// Most module fetches one page may make.

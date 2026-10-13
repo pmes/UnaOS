@@ -12,6 +12,7 @@
 use super::dom::{self, iface, register_iface, with_doc, wrap};
 use super::idl::{self, *};
 use super::{page, TargetKey};
+use html_core::url;
 use js_core::builtins::host::Timer;
 use js_core::vm::*;
 
@@ -606,7 +607,7 @@ fn loc_part_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     let Some(mut u) = current_url() else { return Ok(Value::Undefined) };
     super::html::set_url_part(&mut u, &part, &v);
-    navigate(vm, u.as_str(), false)?;
+    navigate(vm, &u.href(), false)?;
     Ok(Value::Undefined)
 }
 
@@ -675,12 +676,12 @@ fn history_push(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         let u = string(vm, &u)?;
         let base = super::page_url();
         if let Ok(nu) = url::Url::parse(&base).and_then(|b| b.join(&u)) {
-            let same_origin = current_url().is_some_and(|c| c.origin() == nu.origin());
+            let same_origin = current_url().is_some_and(|c| c.same_origin(&nu));
             if !same_origin {
                 return throw_dom(vm, "SecurityError", "A history state object with URL cannot be created in a document with a different origin.");
             }
             page(|p| p.url = nu.to_string());
-            super::Engine::set_doc_url(nu.as_str());
+            super::Engine::set_doc_url(&nu.href());
         }
     }
     if which == "pushState" {
@@ -822,7 +823,7 @@ fn doc_str(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let which = callee_str(vm, ctx);
     Ok(s(&match which.as_str() {
         "referrer" => String::new(),
-        "domain" => current_url().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default(),
+        "domain" => current_url().map(|u| u.hostname()).unwrap_or_default(),
         "visibilityState" => "visible".into(),
         "designMode" => "off".into(),
         "lastModified" => {

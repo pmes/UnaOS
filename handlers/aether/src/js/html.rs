@@ -7,7 +7,7 @@
 use super::dom::{self, attr_value, iface, register_iface, remove_attr, set_attr, this_element, with_doc, wrap};
 use super::idl::*;
 use super::page;
-use html_core::{Namespace, NodeId};
+use html_core::{url, Namespace, NodeId};
 use js_core::vm::*;
 
 /// tag → HTML interface (HTML §4 element index). Hyphenated names are custom elements (HTMLElement).
@@ -1322,59 +1322,36 @@ fn hyper_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 pub fn url_part(u: &url::Url, part: &str) -> String {
     match part {
-        "href" => u.as_str().to_string(),
-        "origin" => match u.origin() {
-            url::Origin::Tuple(..) => u.origin().ascii_serialization(),
-            url::Origin::Opaque(_) => "null".into(),
-        },
-        "protocol" => format!("{}:", u.scheme()),
+        "href" => u.href(),
+        "origin" => u.origin(),
+        "protocol" => u.protocol(),
         "username" => u.username().to_string(),
-        "password" => u.password().unwrap_or("").to_string(),
-        "host" => match (u.host_str(), u.port()) {
-            (Some(h), Some(p)) => format!("{h}:{p}"),
-            (Some(h), None) => h.to_string(),
-            _ => String::new(),
-        },
-        "hostname" => u.host_str().unwrap_or("").to_string(),
-        "port" => u.port().map(|p| p.to_string()).unwrap_or_default(),
-        "pathname" => u.path().to_string(),
-        "search" => u.query().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default(),
-        "hash" => u.fragment().filter(|f| !f.is_empty()).map(|f| format!("#{f}")).unwrap_or_default(),
+        "password" => u.password().to_string(),
+        "host" => u.host_str(),
+        "hostname" => u.hostname(),
+        "port" => u.port_str(),
+        "pathname" => u.pathname(),
+        "search" => u.search(),
+        "hash" => u.hash(),
         _ => String::new(),
     }
 }
 
-/// Applies a URL component write the way the URL Standard's setters do.
+/// Applies a URL component write through the URL Standard's own setters (html_core::url, each one a basic
+/// URL parse with that component's state override).
 pub fn set_url_part(u: &mut url::Url, part: &str, v: &str) {
-    let _ = match part {
-        "protocol" => u.set_scheme(v.trim_end_matches(':')).map_err(|_| ()),
+    match part {
+        "protocol" => u.set_protocol(v),
         "username" => u.set_username(v),
-        "password" => u.set_password(if v.is_empty() { None } else { Some(v) }),
-        "hostname" => u.set_host(if v.is_empty() { None } else { Some(v) }).map_err(|_| ()),
-        "host" => {
-            let (h, p) = match v.rsplit_once(':') {
-                Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
-                None => (v.to_string(), None),
-            };
-            u.set_host(if h.is_empty() { None } else { Some(&h) }).map_err(|_| ()).and_then(|_| u.set_port(p))
-        }
-        "port" => u.set_port(if v.is_empty() { None } else { v.parse::<u16>().ok() }),
-        "pathname" => {
-            u.set_path(v);
-            Ok(())
-        }
-        "search" => {
-            let q = v.trim_start_matches('?');
-            u.set_query(if q.is_empty() { None } else { Some(q) });
-            Ok(())
-        }
-        "hash" => {
-            let f = v.trim_start_matches('#');
-            u.set_fragment(if f.is_empty() { None } else { Some(f) });
-            Ok(())
-        }
-        _ => Ok(()),
-    };
+        "password" => u.set_password(v),
+        "hostname" => u.set_hostname(v),
+        "host" => u.set_host(v),
+        "port" => u.set_port(v),
+        "pathname" => u.set_pathname(v),
+        "search" => u.set_search(v),
+        "hash" => u.set_hash(v),
+        _ => {}
+    }
 }
 
 fn hyper_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1387,7 +1364,7 @@ fn hyper_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     if let Some(mut u) = href_url(el) {
         set_url_part(&mut u, &part, &v);
-        set_attr(vm, el, "href", u.as_str());
+        set_attr(vm, el, "href", &u.href());
     }
     Ok(Value::Undefined)
 }

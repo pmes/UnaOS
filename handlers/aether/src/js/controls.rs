@@ -12,7 +12,7 @@
 use super::dom::{self, attr_value, remove_attr, set_attr, this_element, with_doc, wrap, wrap_opt};
 use super::idl::*;
 use super::page;
-use html_core::{Document, Namespace, NodeId};
+use html_core::{url, Document, Namespace, NodeId};
 use js_core::vm::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
