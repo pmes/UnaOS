@@ -44,6 +44,8 @@ infer_core = { path = "../../unaos/libs/ml/infer_core", optional = true, feature
 demux_core = { path = "../../unaos/libs/media/demux_core" }
 # VP8CORE (SR40): the from-spec VP8 decoder behind `dsp::video::vp8` (`no_std`, no dependencies).
 vp8_core = { path = "../../unaos/libs/media/vp8_core" }
+# VP9CORE (SR116): the from-spec VP9 decoder (profiles 0 and 2) behind `dsp::video::vp9` (`no_std`, no dependencies).
+vp9_core = { path = "../../unaos/libs/media/vp9_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }

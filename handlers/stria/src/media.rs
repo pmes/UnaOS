@@ -676,7 +676,8 @@ impl Player {
         let Some(out) = self.aout.as_mut() else {
             // no device: the samples behind the clock are gone (wall-clock playback, silent)
             let now = self.clock.media_ns();
-            let behind = ((now - (self.audio_next_ns() - self.audio_ahead_ns())) as i128 * self.audio_rate as i128 / 1_000_000_000).max(0) as usize;
+            // i128 throughout: a fresh player's next/ahead can sit at the type's edge, and i64 would overflow here.
+            let behind = ((now as i128 - (self.audio_next_ns() as i128 - self.audio_ahead_ns() as i128)) * self.audio_rate as i128 / 1_000_000_000).max(0) as usize;
             let k = (behind * 2).min(self.pending.len());
             self.pending.drain(..k);
             return;

@@ -168,8 +168,8 @@ fn poster_is_frame_zero_while_paused() {
 #[test]
 fn codec_without_decoder_plays_the_labelled_stand_in() {
     let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10);
-    t.spec.fourcc = *b"vp09";
-    t.spec.config_box = Some(*b"vpcC");
+    t.spec.fourcc = *b"avc1";
+    t.spec.config_box = Some(*b"avcC");
     t.spec.config = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let file = build::mp4(&[t], &Mp4Options::default());
     let time = ManualTime::new();

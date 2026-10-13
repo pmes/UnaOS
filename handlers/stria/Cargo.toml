@@ -17,6 +17,8 @@ resonance = { path = "../../libs/resonance" }
 # PLAYBACK (SR26): the A/V pipeline pieces (dsp::demux, dsp::video, dsp::avsync, dsp::audio_track).
 # AETHERMEDIA (SR107): `av1` puts AVCODEC's decoder (av1_core) in the registry (dsp/video.rs), so AV1 streams
 # play real frames instead of the labelled stand-in.
+# VP9CORE (SR116): VP9 (WebM V_VP9, MP4 vp09; profiles 0 and 2) plays real frames through gneiss_pal's
+# unconditional `dsp::video::vp9` arm over unaos/libs/media/vp9_core, beside vp8_core — no feature to name.
 gneiss_pal = { path = "../../libs/gneiss_pal", features = ["av1"] }
 tokio = { version = "1.53", features = ["rt", "sync", "time", "macros"] }
 anyhow = "1.0"
