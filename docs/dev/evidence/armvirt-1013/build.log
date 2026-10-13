@@ -1,0 +1,325 @@
+⚡ kernel features: witness,ehcihid,kbdwit,sdw,sdhcblk,tests-at-boot,census,smolnet,sdwrite
+⚡ Building aarch64 Kernel...
+⚡ aarch64 effective features: witness,tests-at-boot,census,sdwrite
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling libm v0.2.16
+   Compiling thiserror v2.0.21
+   Compiling syn v3.0.6
+   Compiling thiserror-impl v2.0.21
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling scopeguard v1.2.0
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/crates/una-abi)
+   Compiling elf_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/elf_core)
+   Compiling demux_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/media/demux_core)
+   Compiling vp8_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/media/vp8_core)
+   Compiling raw_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/media/raw_core)
+   Compiling spin v0.9.9
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/text/font_core)
+   Compiling unaos-boot-info v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/crates/boot-info)
+   Compiling fdt v0.1.5
+   Compiling volatile v0.6.1
+   Compiling ldso_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/ldso_core)
+   Compiling amber_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/amber_core)
+   Compiling prefs_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/prefs_core)
+   Compiling net v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/crates/net)
+   Compiling font8x8 v0.3.1
+   Compiling exfat_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/fs/exfat_core)
+   Compiling lock_api v0.4.14
+   Compiling type_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/type_core)
+   Compiling lazy_static v1.5.1
+   Compiling noto-sans-mono-bitmap v0.3.2
+   Compiling cfg-if v1.0.5
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/crypto_core)
+   Compiling midden_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/midden_core)
+   Compiling trash_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/fs/trash_core)
+   Compiling jobs_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/sys/jobs_core)
+   Compiling spinning_top v0.2.5
+   Compiling linked_list_allocator v0.10.6
+   Compiling spin v0.12.3
+   Compiling pixel_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/media/pixel_core)
+   Compiling audio_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/media/audio_core)
+   Compiling unafs v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/libs/fs/unafs)
+   Compiling unaos-kernel v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-aca81e8e42f35052b/unaos/crates/kernel)
+error[E0433]: cannot find `cursorshape` in `cursor`
+    --> crates/kernel/src/tests.rs:149:318
+     |
+ 149 | ...all::ensure(); crate::video::cursor::cursorshape::ensure(); // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests sm...
+     |                                         ^^^^^^^^^^^ could not find `cursorshape` in `cursor`
+     |
+note: found an item that was configured out
+    --> crates/kernel/src/video/cursor.rs:5350:9
+     |
+5348 | #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+     |          ------------------------------------------------- the item is gated here
+5349 | #[path = "cursorshape.rs"]
+5350 | pub mod cursorshape;
+     |         ^^^^^^^^^^^
+
+warning: unnecessary braces around block return value
+    --> crates/kernel/src/arch/aarch64/sched.rs:5622:5
+     |
+5622 |     { #[cfg(feature = "tegra")] { percpu::METER_CPU_COUNT } #[cfg(not(feature = "tegra"))] { NUM_CPUS } } // VUGFIX: tegra DISPLAY...
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                           ^^
+     |
+     = note: `#[warn(unused_braces)]` (part of `#[warn(unused)]`) on by default
+help: remove these braces
+     |
+5622 -     { #[cfg(feature = "tegra")] { percpu::METER_CPU_COUNT } #[cfg(not(feature = "tegra"))] { NUM_CPUS } } // VUGFIX: tegra DISPLAYS 6 (DTB /cpus), not the 8-slot array bound; one line => pi/virt byte-identical
+5622 +     #[cfg(not(feature = "tegra"))] { NUM_CPUS } // VUGFIX: tegra DISPLAYS 6 (DTB /cpus), not the 8-slot array bound; one line => pi/virt byte-identical
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:1955:34
+     |
+1955 |     let _ = EL0_RESIDENTS[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |                                  ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1955 -     let _ = EL0_RESIDENTS[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+1955 +     let _ = EL0_RESIDENTS[cpu].0.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:2021:31
+     |
+2021 |     let _ = EL0_PARKED[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |                               ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+2021 -     let _ = EL0_PARKED[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+2021 +     let _ = EL0_PARKED[cpu].0.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:2187:32
+     |
+2187 |             let _ = row[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |                                ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+2187 -             let _ = row[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+2187 +             let _ = row[cpu].0.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:5981:32
+     |
+5981 |     let _ = SPREAD15_RESID_MIN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+     |                                ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+5981 -     let _ = SPREAD15_RESID_MIN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+5981 +     let _ = SPREAD15_RESID_MIN.try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+     --> crates/kernel/src/arch/aarch64/sched.rs:11166:38
+      |
+11166 |         let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+      |                                      ^^^^^^^^^^^^
+      |
+help: replace the use of the deprecated method
+      |
+11166 -         let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+11166 +         let _ = NOPREEMPT[self.core].try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+      |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/kernel/src/pal.rs:836:46
+    |
+836 |                 let _ = RELEASE_EDGE_IN_RING.fetch_update(
+    |                                              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+836 -                 let _ = RELEASE_EDGE_IN_RING.fetch_update(
+836 +                 let _ = RELEASE_EDGE_IN_RING.try_update(
+    |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/pal.rs:1167:35
+     |
+1167 |     let _ = RELEASE_EDGES_PENDING.fetch_update(
+     |                                   ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1167 -     let _ = RELEASE_EDGES_PENDING.fetch_update(
+1167 +     let _ = RELEASE_EDGES_PENDING.try_update(
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/kernel/src/loginfurn.rs:196:20
+    |
+196 |     if ITEM_CREDIT.fetch_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+    |                    ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+196 -     if ITEM_CREDIT.fetch_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+196 +     if ITEM_CREDIT.try_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+    |
+
+warning: unused variable: `reg`
+  --> crates/kernel/src/arch/aarch64/pci.rs:51:41
+   |
+51 | ...                   if let Some(reg) = node.property("reg") {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_reg`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/kernel/src/arch/aarch64/sched.rs:7396:9
+     |
+7396 |     let mut n = futex_wake_killed();
+     |         ----^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> crates/kernel/src/drivers/xhci/mod.rs:467:24
+    |
+442 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+467 |                     || unsafe { core::ptr::read_volatile(usblegsup as *const u32) } & HC_BIOS_OWNED == 0,
+    |                        ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `current_intf_class` is never read
+    --> crates/kernel/src/drivers/xhci/mod.rs:4722:74
+     |
+4722 | ...                   let mut current_intf_class: u8 = 0;
+     |                                                        ^ this value is reassigned later and never used
+...
+4742 | ...                           current_intf_class = desc_data[offset + 5];
+     |                               ------------------------------------------ `current_intf_class` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `current_intf_protocol` is never read
+    --> crates/kernel/src/drivers/xhci/mod.rs:4723:77
+     |
+4723 | ...                         let mut current_intf_protocol: u8 = 0;
+     |                                                                 ^ this value is reassigned later and never used
+...
+4744 | ...                                 current_intf_protocol = desc_data[offset + 7]; #[cfg(feature = "usbnet")] { if usbnet::note_in...
+     |                                     --------------------------------------------- `current_intf_protocol` is overwritten here before the previous value is read
+
+warning: value assigned to `lba` is never read
+     --> crates/kernel/src/drivers/xhci/mod.rs:13447:23
+      |
+13447 |         let mut lba = (nb - 1) as u32;
+      |                       ^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+13466 |             lba = candidates[0];
+      |             ------------------- `lba` is overwritten here before the previous value is read
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:15520:9
+      |
+15520 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:15912:9
+      |
+15912 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:16066:9
+      |
+16066 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:16106:9
+      |
+16106 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unused variable: `cleared_from`
+   --> crates/kernel/src/video/framebuffer.rs:565:13
+    |
+565 |         let cleared_from = self.info.height.saturating_sub(dy);
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cleared_from`
+
+warning: value assigned to `placed` is never read
+    --> crates/kernel/src/video/wm.rs:2386:22
+     |
+2386 |     let mut placed = Moved::NoRow;
+     |                      ^^^^^^^^^^^^ this value is reassigned later and never used
+...
+2432 |                 placed = Moved::Placed { x: r.x, y: r.y, changed };
+     |                 -------------------------------------------------- `placed` is overwritten here before the previous value is read
+
+warning: variable does not need to be mutable
+    --> crates/kernel/src/video/wm.rs:6844:13
+     |
+6844 |         let mut rows_done = r1;
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `a_col`
+     --> crates/kernel/src/video/wm.rs:23010:17
+      |
+23010 |     let (k_col, a_col, f_col) = (HT_SURF[0], FV_SURF_A[0], FV_SURF_B[0]);
+      |                 ^^^^^ help: if this is intentional, prefix it with an underscore: `_a_col`
+
+warning: unused variable: `ph`
+     --> crates/kernel/src/video/wm.rs:23758:19
+      |
+23758 | fn legibility_cap(ph: usize) -> usize {
+      |                   ^^ help: if this is intentional, prefix it with an underscore: `_ph`
+
+warning: unused variable: `fb`
+    --> crates/kernel/src/video/cursor.rs:1963:16
+     |
+1963 | fn block_scale(fb: &FrameBuffer) -> usize {
+     |                ^^ help: if this is intentional, prefix it with an underscore: `_fb`
+
+warning: variable does not need to be mutable
+   --> crates/kernel/src/video/shortcuts.rs:317:9
+    |
+317 |     let mut ok = entries >= 12 && scopes >= 5 && shown_n == entries && chord_for("Keyboard Shortcuts") == Some(C_CMD_SLASH);
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused variable: `ink`
+   --> crates/kernel/src/video/text.rs:255:86
+    |
+255 | ...ize, y: isize, max_w: usize, ink: u32, put: &mut dyn FnMut(isize, isize, u8)) -> usize {
+    |                                 ^^^ help: if this is intentional, prefix it with an underscore: `_ink`
+
+warning: unused variable: `bold`
+   --> crates/kernel/src/video/text.rs:306:26
+    |
+306 | pub fn advance(s: &[u8], bold: bool, face: Face) -> usize {
+    |                          ^^^^ help: if this is intentional, prefix it with an underscore: `_bold`
+
+warning: variable does not need to be mutable
+  --> crates/kernel/src/video/metrics.rs:69:9
+   |
+69 |     let mut pairs: alloc::vec::Vec<(usize, usize)> = alloc::vec![
+   |         ----^^^^^
+   |         |
+   |         help: remove this `mut`
+
+For more information about this error, try `rustc --explain E0433`.
+warning: `unaos-kernel` (lib) generated 29 warnings
+error: could not compile `unaos-kernel` (lib) due to 1 previous error; 29 warnings emitted
