@@ -9,10 +9,6 @@
 # (`⚡ KEPLER-FW: <file> sha256=… pin-row: <role> <hex>`) — never typed from memory.
 # Lines starting with `#` and blank lines are ignored.
 
-# NO ROWS YET (2026-10-13, KEPLERUCODE): linux-firmware does NOT ship nvidia/gk107/ — the four files have no
-# linux-firmware source (docs/dev/evidence/keplerucode/keplerucode.md §1). Until the bunker holds a set, every
-# `tests kgr` reads `[kgr] ucode … -> absent` and KGR4 stays `(ucode-gated)`.
-
 # KEPLERGOLD (rmbp-ledger B656, R119 + R127, 2026-10-14): THE SOURCE IS RULED — R127 (Peter: "1"): the four files are
 # CUT FROM NVIDIA'S OWN DRIVER INTO THE BUNKER, b43-fwcutter style. The cutter is unaos/scripts/kepler-bunker.sh
 # (envytools extract_firmware.py's PGRAPH-archive recipe, GK107 = archive 10 of driver 325.15's fifteen). On the
@@ -25,3 +21,10 @@
 #   gpccs_data <sha256 of fuc41ad>
 # Paste those four printed lines below this comment, unedited. No digest is typed here that the bench did not
 # measure (docs/dev/evidence/keplergold/KEPLERGOLD.md §1).
+# rows written 2026-10-13 by exec-rmbp-local-keplercut (KEPLERCUT, R127) from the bunker's drivers/nvidia-gk107/SHA256SUMS
+# (bunker 58ab57e; the set cut from NVIDIA-Linux-x86_64-325.15 nv-kernel.o, PGRAPH archive nve7 —
+# docs/dev/evidence/keplerucode/KEPLERCUT.md); arroyo's KEPLER-FW line on the esp-x86 build is the check: -> MATCH
+fecs_code d6433d02c2cd0798cdd0fd6aea0709cfa97f60cccacb1c83fdba02f181ba28b9
+fecs_data 69086258f93c8d37685a04999fdb73af30e2cc6a2ccb10c2d78f4e7e734a4a9a
+gpccs_code 9127043ea43960e71de1ff31c51eae6e344d06eff8abf4e57bef6210a39fc02c
+gpccs_data 63adc4049a3080aaca7a836e9842499a13c1087f0d198ae91610630478f5b08e
