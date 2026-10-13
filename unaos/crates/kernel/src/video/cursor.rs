@@ -1972,7 +1972,7 @@ fn block_scale(fb: &FrameBuffer) -> usize {
 /// same scan order and pair up entry for entry with no per-pixel bookkeeping.
 fn sprite_color(s: usize, col: usize, row: usize) -> Option<u32> {
     // CURSORSHAPE (B550): the glyph is the LATCHED row of the one sprite table (`SHAPES`, file tail) — latched only inside `draw_locked` while the sprite is DOWN, so every save, restore and plan of one drawn sprite walks the same pixel set and the same colours (the colour guard's premise). SHOTREGION's crosshair is that table's row 3. ⚠ LINE-NEUTRAL: edited in place.
-    let g = &SHAPES[(LIVE_SHAPE.load(Ordering::Relaxed) as usize).min(SHAPES.len() - 1)];
+    let g = glyph(LIVE_SHAPE.load(Ordering::Relaxed)); // WINRESIZE2 (B635): `glyph` (file tail) is this same `SHAPES` row for every `una_abi::CURSOR_*` value; under x86 `wc` it also answers the two SYSTEM rows past the ABI table (the diagonal resize shapes the frame's corner zones select). ⚠ LINE-NEUTRAL: edited in place, code before this comment.
     let hit = |c: usize, r: usize| -> bool {
         c < crate::ui::BASE_CELL * s
             && r < crate::ui::BASE_CELL * s
@@ -5282,7 +5282,7 @@ fn shape_effective() -> u8 {
     if CROSSHAIR.load(Ordering::Relaxed) {
         una_abi::CURSOR_CROSSHAIR as u8
     } else {
-        REQ_SHAPE.load(Ordering::Acquire)
+        zone_over(REQ_SHAPE.load(Ordering::Acquire)) // WINRESIZE2 (B635): the frame's zone shape, while the pointer is on a resize zone, OVERRIDES the program's ask (the frame is the system's); off the frame the ask is returned untouched. ⚠ LINE-NEUTRAL: edited in place.
     }
 }
 
@@ -5295,7 +5295,7 @@ fn shape_latch() {
 /// The box origin for a pointer at `p` drawn at block scale `s`: the pointer minus the LIVE glyph's hotspot.
 #[inline]
 fn shape_hot(p: (i32, i32), s: usize) -> (i32, i32) {
-    let g = &SHAPES[(LIVE_SHAPE.load(Ordering::Relaxed) as usize).min(SHAPES.len() - 1)];
+    let g = glyph(LIVE_SHAPE.load(Ordering::Relaxed)); // WINRESIZE2 (B635): the hotspot of the latched row, system rows included. ⚠ LINE-NEUTRAL: edited in place.
     (p.0 - g.hot.0 as i32 * s as i32, p.1 - g.hot.1 as i32 * s as i32)
 }
 
@@ -5339,7 +5339,7 @@ pub fn shape_name(i: u8) -> &'static str {
         una_abi::CURSOR_RESIZE_NS => "resize-ns",
         una_abi::CURSOR_RESIZE_EW => "resize-ew",
         una_abi::CURSOR_BUSY => "busy",
-        _ => "?",
+        _ => zone_shape_name(i), // WINRESIZE2 (B635): the system rows past the ABI table, else "?". ⚠ LINE-NEUTRAL: edited in place.
     }
 }
 
@@ -5348,3 +5348,131 @@ pub fn shape_name(i: u8) -> &'static str {
 #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 #[path = "cursorshape.rs"]
 pub mod cursorshape;
+
+// =================================================================================================
+// WINRESIZE2 (rmbp-ledger B635; R117 — "the standard cursor shapes at the edges") — THE FRAME'S OWN SHAPE
+// =================================================================================================
+//
+// Appended at the TAIL; above it the arc is four SAME-LINE edits, code first (LEDGER P7): `sprite_color`'s and
+// `shape_hot`'s row lookup (now [`glyph`]), `shape_effective`'s request arm (now [`zone_over`]) and `shape_name`'s
+// fallback arm (now [`zone_shape_name`]). Off x86 `wc` every one of the three helpers is the expression it replaced.
+//
+// # What the frame adds
+//
+// CURSORSHAPE's table holds the shapes a PROGRAM may ask for (`una_abi::CURSOR_*`, `SYS_CURSOR_SHAPE` refuses
+// anything past `CURSOR_SHAPES`). The resize zones of a window frame are the window SYSTEM's, so their shape is a
+// third word beside `REQ_SHAPE` and `LIVE_SHAPE`: [`ZONE_SHAPE`], written only by the x86 motion router
+// (`arch/x86_64/syscall.rs`, `wc_resize_hover_at`) on a zone ENTRY or EXIT edge. Precedence in `shape_effective`:
+// SHOTREGION's crosshair, then the zone, then the program's ask — so the program's shape comes back untouched the
+// moment the pointer leaves the frame, with no save/restore of anyone's word. The top/bottom edges select the
+// existing `CURSOR_RESIZE_NS` row and the side edges `CURSOR_RESIZE_EW`; the corners select two SYSTEM rows
+// ([`ZONE_SHAPES`], ids `CURSOR_SHAPES` and `CURSOR_SHAPES + 1`) that the ABI table does not carry, so no program
+// can ask for them and the ABI's shape count is unchanged. `CURSOR_MOVE` already exists (row 4).
+//
+// The latch is untouched: `set_zone_shape` stores the word and calls `shape_owe`, exactly as `set_shape` does, and
+// the draw that follows latches it under the sprite loan with the sprite down, so the drawn and restored glyph are
+// still one row.
+
+/// WINRESIZE2 — the sentinel "no zone": the program's ask (or the arrow) is the shape.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const ZONE_NONE: u8 = 0xFF;
+/// WINRESIZE2 — the north-west/south-east double arrow (the `tl` and `br` corners). A SYSTEM row: past the ABI table.
+pub const SHAPE_RESIZE_NWSE: u8 = una_abi::CURSOR_SHAPES as u8;
+/// WINRESIZE2 — the north-east/south-west double arrow (the `tr` and `bl` corners). A SYSTEM row.
+pub const SHAPE_RESIZE_NESW: u8 = una_abi::CURSOR_SHAPES as u8 + 1;
+
+/// WINRESIZE2 — the system rows, in the `SHAPES` style: an 8x8 block mask, MSB leftmost, the hotspot on the stem
+/// (the NS/EW rule: the pixel of the shaft nearest the glyph's centre), the resize rows' ink (`POINTER_SHAPE_INK[5]`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub const ZONE_SHAPES: [Glyph; 2] = [
+    // SHAPE_RESIZE_NWSE — a diagonal double arrow, heads in the top-left and bottom-right corners.
+    Glyph {
+        mask: [0b1111_0000, 0b1100_0000, 0b1010_0000, 0b1001_0000, 0b0000_1001, 0b0000_0101, 0b0000_0011, 0b0000_1111],
+        hot: (3, 3),
+        fill: ink(5).0,
+        shadow: ink(5).1,
+    },
+    // SHAPE_RESIZE_NESW — its mirror, heads in the top-right and bottom-left corners.
+    Glyph {
+        mask: [0b0000_1111, 0b0000_0011, 0b0000_0101, 0b0000_1001, 0b1001_0000, 0b1010_0000, 0b1100_0000, 0b1111_0000],
+        hot: (4, 3),
+        fill: ink(5).0,
+        shadow: ink(5).1,
+    },
+];
+
+/// WINRESIZE2 — the zone shape the frame selected, or [`ZONE_NONE`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static ZONE_SHAPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(ZONE_NONE);
+
+/// WINRESIZE2 — the table row for sprite index `i`: `SHAPES` for every ABI value (clamped as before), the system
+/// rows past it under x86 `wc`.
+#[inline(always)]
+fn glyph(i: u8) -> &'static Glyph {
+    let t: &'static [Glyph; una_abi::CURSOR_SHAPES as usize] = &SHAPES;
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if (i as usize) >= t.len() && ((i as usize) - t.len()) < ZONE_SHAPES.len() {
+        let z: &'static [Glyph; 2] = &ZONE_SHAPES;
+        return &z[(i as usize) - t.len()];
+    }
+    &t[(i as usize).min(t.len() - 1)]
+}
+
+/// WINRESIZE2 — the zone shape over the program's ask `req` (see the block header).
+#[inline(always)]
+fn zone_over(req: u8) -> u8 {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        let z = ZONE_SHAPE.load(Ordering::Acquire);
+        if z != ZONE_NONE {
+            return z;
+        }
+    }
+    req
+}
+
+/// WINRESIZE2 — the system rows' wire names under x86 `wc`; anything else (and everything off it) is `"?"`, the arm
+/// it replaced.
+fn zone_shape_name(i: u8) -> &'static str {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    match i {
+        SHAPE_RESIZE_NWSE => return "resize-nwse",
+        SHAPE_RESIZE_NESW => return "resize-nesw",
+        _ => {}
+    }
+    let _ = i;
+    "?"
+}
+
+/// WINRESIZE2 — the frame's zone shape: `Some(row)` on a zone entry (an ABI row or a system row; anything else is
+/// refused as `None`), `None` on the exit. Atomics only, like [`set_shape`]: owes the sprite a repaint when the row
+/// the next draw latches is not the drawn one.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn set_zone_shape(s: Option<u8>) {
+    let v = match s {
+        Some(r) if (r as usize) < shape_count() => r,
+        _ => ZONE_NONE,
+    };
+    ZONE_SHAPE.store(v, Ordering::Release);
+    shape_owe();
+}
+
+/// WINRESIZE2 — the frame's zone shape now, `None` off the frame.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn zone_shape() -> Option<u8> {
+    let z = ZONE_SHAPE.load(Ordering::Acquire);
+    if z == ZONE_NONE { None } else { Some(z) }
+}
+
+/// WINRESIZE2 — every row the sprite can be drawn with: the ABI table plus, under x86 `wc`, the system rows
+/// (`tests winresize`'s `cursor_shapes=`).
+pub const fn shape_count() -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        return SHAPES.len() + ZONE_SHAPES.len();
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        SHAPES.len()
+    }
+}
