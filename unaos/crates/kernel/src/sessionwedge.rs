@@ -190,8 +190,8 @@ fn paint(text: &str) {
     fb.flush_rect(0, y0, i.width, band_h);
 }
 
-const BAND: u32 = 0x0060_1010;
-const INK: u32 = 0x00FF_F0E0;
+const BAND: u32 = crate::video::theme::WEDGE_BAND;
+const INK: u32 = crate::video::theme::WEDGE_INK;
 
 /// A bounded, allocation-free line (bootstep's `PanelLine` shape): what does not fit is dropped.
 struct Line {

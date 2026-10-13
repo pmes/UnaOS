@@ -83,6 +83,13 @@ impl<T: 'static> SlotVec<T> {
         }
     }
 
+    /// Row `i` if it exists — the `peek` name's twin for callers written against the `get` idiom
+    /// (`arch/x86_64/syscall.rs` present_pace, feature `vsyncpace`); never allocates.
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<&T> {
+        self.peek(i)
+    }
+
     /// One past the highest slot row ever touched (the shared row excluded) — every "all slots" scan's bound.
     #[inline]
     pub fn hwm(&self) -> usize {

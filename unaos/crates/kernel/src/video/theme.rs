@@ -865,6 +865,9 @@ pub const BEZEL_INK: u32 = 0x00EE_EEF0;
 pub const BEZEL_DIM: u32 = 0x004A_4A50;
 pub const PANIC_INK: u32 = 0x00EC_ECEE;
 pub const PANIC_INK_SMALL: u32 = 0x00A0_A0A6;
+// SESSIONWEDGE (B525): the PUMPWEDGE band painted over the panel while the usb-pump is wedged (fixed-look, like PANIC).
+pub const WEDGE_BAND: u32 = 0x0060_1010;
+pub const WEDGE_INK: u32 = 0x00FF_F0E0;
 // PLAYER (B419): the player's dim caption and the scrubber knob's edge (moved here at merge17).
 pub const PLAYER_DIM_TEXT: u32 = 0x0070_6E6A;
 pub const PLAYER_KNOB_EDGE: u32 = 0x00FF_FFFF;
