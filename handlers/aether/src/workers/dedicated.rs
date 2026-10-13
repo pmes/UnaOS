@@ -15,8 +15,12 @@
 //! `location`, `navigator`, `name`, `postMessage`, `close`, `importScripts`, `onmessage`/`onmessageerror`/
 //! `onerror`, `XMLHttpRequest`, `Blob`/`File`, `performance`).
 //!
-//! The page fetched the script (through its loader, under its CSP and origin — `js::worker`) before the thread
-//! starts; the thread evaluates it (classic: ScriptEvaluation; module: `run_module`, whose static imports load
+//! AETHERWORKERS3 (SR129): the thread fetches its own script (`prepare`: under the creator's captured request
+//! context, asynchronously to the creator), takes its policy container from the response (an http(s)
+//! script's `Content-Security-Policy`, a local-scheme script's creator's — it governs `eval`, `importScripts`,
+//! module imports, nested workers and `fetch`/XHR's `connect-src`) and, for a `data:` URL, an opaque origin
+//! with no storage key; a shared worker (`Spawn::shared`, `workers::shared`) runs the same thread with a
+//! SharedWorkerGlobalScope whose tasks include `connect` ([`Cmd::Connect`]). Then the thread evaluates it (classic: ScriptEvaluation; module: `run_module`, whose static imports load
 //! through [`WorkerHost::load_module`]), then runs [`Cmd`]s as tasks: a `Message` from the page fires `message`
 //! (or `messageerror`) at the global, a `Port` delivers to one of the realm's MessagePorts. Between commands the
 //! thread fires its own timers on REAL time (js_core's built-in timers carry `due = loop_now + delay`; every
@@ -80,6 +84,9 @@ pub enum Cmd {
     /// `worker-error`, the storage family's grants and notices — whatever `js::broadcast::post` sends to the
     /// worker's serial. Runs `__inbox(kind, payload)` as a task.
     Inbox { kind: String, payload: String },
+    /// AETHERWORKERS3 (SR129): a shared worker's `connect` (HTML §10.2.6.4 step 12): the inside port of a new
+    /// client's MessageChannel, in transit to this realm, which adopts it and fires `connect` with it.
+    Connect { port: u64 },
     Stop,
 }
 
@@ -104,8 +111,9 @@ pub struct Spawn {
     pub url: String,
     pub kind: Kind,
     pub name: String,
-    /// The script, fetched by the page.
-    pub source: String,
+    /// The script, when the creator already has it; None (every page-made worker since AETHERWORKERS3, SR129):
+    /// the worker thread fetches `url` itself under [`Spawn::ctx`], asynchronously to its creator.
+    pub source: Option<String>,
     /// The page's storage key ("" for an opaque origin: no Cache API).
     pub storage_key: String,
     /// The page's navigator snapshot (JSON) the WorkerNavigator mirrors.
@@ -116,6 +124,10 @@ pub struct Spawn {
     /// parent worker's): the worker re-bases it on its own URL for `importScripts`, module imports and nested
     /// workers — the page-thread facts (origin, CSP, referrer policy) a worker thread cannot read.
     pub ctx: crate::security::RequestContext,
+    /// AETHERWORKERS3 (SR129): a shared worker (`workers::shared`): its global is a SharedWorkerGlobalScope
+    /// (`connect` events, no `postMessage`), it has no owning document (`doc` 0) and no creator inbox (`owner`
+    /// 0), and its lifetime is its clients' (`workers::shared`).
+    pub shared: bool,
 }
 
 /// What `new Worker()` takes from the realm that calls it (HTML §10.2.6 "outside settings"): the document's
@@ -146,7 +158,8 @@ pub fn creator() -> Option<Creator> {
 }
 
 /// A request context re-based on the worker as its client: the worker's URL is the client and the referrer,
-/// its origin the request's origin; the document's policies stay (a worker's own CSP header is not read).
+/// its origin the request's origin. The policies are the creator's here; [`worker_main`] replaces them with
+/// the worker's own (AETHERWORKERS3, SR129) once its script response is in.
 fn rebase(mut ctx: crate::security::RequestContext, url: &str) -> crate::security::RequestContext {
     if ctx.has_page {
         ctx.client_url = url.to_string();
@@ -222,6 +235,30 @@ pub fn deliver_port(id: u64, port: u64, data: &str, ports: &str) -> bool {
     send(id, Cmd::Port { port, data: data.to_string(), ports: ports.to_string() })
 }
 
+/// AETHERWORKERS3 (SR129): a shared worker's new client — the inside port in transit; false when it is gone.
+pub fn connect_port(id: u64, port: u64) -> bool {
+    send(id, Cmd::Connect { port })
+}
+
+/// AETHERWORKERS3 (SR129): a message for worker `id`'s inbox dispatcher (`__inbox(kind, payload)` as a task) —
+/// what `js::ports` sends a realm whose port lost its peer.
+pub fn deliver_inbox(id: u64, kind: &str, payload: String) -> bool {
+    send(id, Cmd::Inbox { kind: kind.to_string(), payload })
+}
+
+/// AETHERWORKERS3 (SR129): CSP `connect-src` for a `fetch` / `XMLHttpRequest` the running dedicated or shared
+/// worker makes, under the worker's OWN policy container ([`worker_main`]: its script response's policies,
+/// or its creator's for a local-scheme worker). Ok off a worker thread (a service worker's realm).
+pub fn connect_allowed(url: &str) -> Result<(), String> {
+    let Some(p) = with_w(|w| w.ctx.policies.clone()) else { return Ok(()) };
+    let v = p.check_url("connect-src", url, false);
+    if v.allowed {
+        return Ok(());
+    }
+    let msg = v.violations.iter().find(|x| !x.report_only).map(crate::security::csp::message).unwrap_or_else(|| format!("Refused to connect to '{url}' (connect-src)."));
+    Err(crate::security::refusal("csp-worker-connect-src", url, &msg, None))
+}
+
 /// `worker.terminate()`: nothing more is delivered either way; the running script is interrupted at its next
 /// instruction (`Vm::interrupt`); the worker's nested workers terminate with it.
 pub fn terminate(id: u64) {
@@ -242,18 +279,24 @@ fn terminate_children(parent: u64) {
     }
 }
 
-/// The document went away: its workers terminate.
+/// The document went away: its workers terminate, and it leaves the client lists of the shared workers it
+/// connected to (one whose last client it was ends — `workers::shared`).
 pub fn doc_gone(doc: u64) {
     let ids: Vec<u64> = workers().iter().filter(|(_, h)| h.doc == doc).map(|(id, _)| *id).collect();
     for id in ids {
         terminate(id);
     }
+    super::shared::doc_gone(doc);
 }
 
 /// Whether one of `doc`'s workers has work outstanding (commands not yet run, or a timer due within
 /// [`SOON_MS`]): the virtual-time drivers wait on real time for it.
 pub fn busy(doc: u64) -> bool {
-    workers().values().any(|h| h.doc == doc && !h.shared.kill.load(Ordering::Relaxed) && (h.shared.pending.load(Ordering::SeqCst) > 0 || h.shared.timer_soon.load(Ordering::Relaxed)))
+    // AETHERWORKERS3 (SR129): the shared workers `doc` is a client of count as its own.
+    let served = super::shared::serves(doc);
+    workers().iter().any(|(id, h)| {
+        (h.doc == doc || served.contains(id)) && !h.shared.kill.load(Ordering::Relaxed) && (h.shared.pending.load(Ordering::SeqCst) > 0 || h.shared.timer_soon.load(Ordering::Relaxed))
+    })
 }
 
 /// How many of `doc`'s workers are alive (registered and not terminated).
@@ -384,8 +427,25 @@ impl Host for WorkerHost {
         }
         let mut ctx = self.ctx.clone();
         ctx.mode = "cors".into();
+        if !(resolved.starts_with("http://") || resolved.starts_with("https://")) {
+            ctx.check_hop(&resolved, false).map_err(|e| crate::js::host::refusal_message(&e))?;
+        }
         let (src, _) = crate::js::host::fetch_worker_script(&resolved, &ctx).map_err(|e| crate::js::host::refusal_message(&e))?;
         Ok((resolved, src))
+    }
+    /// HostEnsureCanCompileStrings (AETHERWORKERS3, SR129): `eval` / `new Function` under the worker's OWN
+    /// policy container (`'unsafe-eval'` in `script-src`, CSP3 §4.4) — its script response's policies, or its
+    /// creator's for a local-scheme worker.
+    fn ensure_can_compile_strings(&mut self, source: &str) -> Result<(), String> {
+        let v = self.ctx.policies.check_eval(source);
+        if v.allowed {
+            return Ok(());
+        }
+        let msg = v.violations.iter().find(|x| !x.report_only).map(crate::security::csp::message).unwrap_or_else(|| {
+            "Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source of script in the worker's Content Security Policy.".to_string()
+        });
+        crate::security::refuse("csp-worker-eval", &self.url, &msg);
+        Err(msg)
     }
 }
 
@@ -417,6 +477,20 @@ fn import_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     ctx.destination = "script".into();
     ctx.mode = "no-cors".into();
     ctx.credentials = "include".into();
+    // AETHERWORKERS3 (SR129): a local-scheme URL (`data:`) skips the fetch's precheck, so the worker's policy
+    // (`script-src`) and mixed content are asked here, as `js::worker` asks them for a `data:` worker.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        if let Err(e) = ctx.check_hop(&url, false) {
+            let e = crate::js::host::refusal_message(&e);
+            return Ok(s(&format!("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '{url}' failed to load: {e}")));
+        }
+        // `check_hop` leaves `script` destinations to the script element's own check; a worker has none, so
+        // `script-src` is asked here (CSP3 §6.1.11: a `data:` import needs `data:` in the worker's policy).
+        let v = ctx.policies.check_url("script-src", &url, false);
+        if !v.allowed {
+            return Ok(s(&format!("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '{url}' failed to load: Refused to load the script (Content Security Policy script-src)")));
+        }
+    }
     let src = match crate::js::host::fetch_worker_script(&url, &ctx) {
         Ok((t, _)) => t,
         Err(e) => {
@@ -694,6 +768,9 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
     }
+    // AETHERWORKERS3 (SR129): EVENTS and SCOPE read which global this is (Dedicated / SharedWorkerGlobalScope).
+    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("__w_shared"), Prop::data(Value::Bool(sp.shared), WC));
+    crate::js::idl::install_domexception(&mut vm); // the natives' DOMException (throw_dom) in this realm: name/message/code as the page's
     vm.budget = Some(crate::js::TASK_BUDGET);
     for (label, src) in [("worker-events", EVENTS), ("serialize", crate::js::broadcast::SERIALIZE)] {
         if let Err(e) = vm.run_script_str(src) {
@@ -713,6 +790,11 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
     // AETHERWORKERS2 (SR125): the inbox dispatcher and BroadcastChannel over this thread's serial, and `Worker`
     // itself — a nested worker's spawn path reads this worker's captured facts (`creator`).
     crate::js::broadcast::install_worker(&mut vm);
+    // AETHERWORKERS3 (SR129): the ports prelude ran before the inbox existed here; a port whose peer went
+    // (`js::ports` notify_unentangled) becomes collectable through this realm's inbox.
+    if let Err(e) = vm.run_script_str("__inbox_on('port-unentangled', function (m) { __port_unentangled(m.port); });") {
+        eprintln!("[aether-worker] port inbox failed: {}", vm.error_string(&e));
+    }
     // IndexedDB (and navigator.storage) and Web Locks over the owner document's storage key: the bindings the
     // page runs, whose natives read `storage::page_storage_key` / `js::broadcast::doc` — this thread's worker
     // client and inbox serial. `Navigator` names WorkerNavigator only while their preludes look it up.
@@ -739,8 +821,61 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
     vm
 }
 
-fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
+/// AETHERWORKERS3 (SR129), "run a worker" steps 12-13 on the worker's own thread: fetch the script under the
+/// creator's captured request context (asynchronously to the creator), then initialize the worker's policy
+/// container — an http(s) script's response policies (`csp::PolicyList::for_worker_response`; none if it
+/// sent none), a local-scheme (`data:`, `file:`) script's creator's — and its origin: a `data:` worker's is
+/// opaque, so it has no storage key (IndexedDB, Web Locks and the Cache API refuse with SecurityError). A
+/// failed fetch answers the failure message (the simple `error` event's reason).
+fn prepare(sp: &mut Spawn) -> Result<(), String> {
+    if sp.source.is_none() {
+        match crate::js::host::fetch_worker_script_full(&sp.url, &sp.ctx) {
+            Ok((text, _, headers)) => {
+                let mut ctx = rebase(sp.ctx.clone(), &sp.url);
+                if sp.url.starts_with("http://") || sp.url.starts_with("https://") {
+                    ctx.policies = Arc::new(crate::security::csp::PolicyList::for_worker_response(&headers, &sp.url));
+                }
+                sp.ctx = ctx;
+                sp.source = Some(text);
+            }
+            Err(e) => {
+                crate::ledger::record_js(&format!("worker-script-fetch-failed:{}", crate::js::clip(&sp.url, 48)));
+                return Err(crate::js::worker::script_failure_message(&sp.url, &e));
+            }
+        }
+    }
+    if crate::security::origin::Origin::of(&sp.url).is_opaque() {
+        sp.storage_key = String::new();
+    }
+    Ok(())
+}
+
+fn worker_main(mut sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
     *threads_map().entry(sp.doc).or_default() += 1;
+    if let Err(why) = prepare(&mut sp) {
+        eprintln!("[aether-worker] {why}");
+        if sp.shared {
+            super::shared::fetch_failed(sp.id, &why);
+        } else {
+            crate::js::broadcast::post(sp.owner, "worker-error", json!({ "id": sp.id, "simple": true, "message": why }).to_string());
+        }
+        shared.kill.store(true, Ordering::SeqCst);
+        shared.pending.store(0, Ordering::SeqCst);
+        {
+            let mut w = workers();
+            if w.get(&sp.id).is_some_and(|h| Arc::ptr_eq(&h.shared, &shared)) {
+                w.remove(&sp.id);
+            }
+        }
+        let mut t = threads_map();
+        if let Some(n) = t.get_mut(&sp.doc) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                t.remove(&sp.doc);
+            }
+        }
+        return;
+    }
     crate::js::ports::set_worker_owner(Some(sp.id));
     super::realm::enter(super::realm::RealmCtx { key: sp.storage_key.clone(), scope: String::new(), script_url: sp.url.clone() });
     // The worker's own inbox serial: what `js::broadcast::post` sends to it becomes a `Cmd::Inbox` task here.
@@ -768,7 +903,7 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
         })
     });
     let mut vm = build(&sp, &shared);
-    let (kind, url, source) = (sp.kind, sp.url.clone(), sp.source.clone());
+    let (kind, url, source) = (sp.kind, sp.url.clone(), sp.source.clone().unwrap_or_default());
     task(&mut vm, Some(&source), |vm| match kind {
         Kind::Classic => vm.run_script_str_at(&source, &url).map(|_| ()), // JSPOS (SR127): frames name the worker script
         Kind::Module => vm.run_module(&url, &source).map(|_| ()),
@@ -799,6 +934,10 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
                 task(&mut vm, None, |vm| call_global(vm, "__inbox", &[s(&kind), s(&payload)]).map(|_| ()));
                 shared.pending.fetch_sub(1, Ordering::SeqCst);
             }
+            Ok(Cmd::Connect { port }) => {
+                task(&mut vm, None, |vm| call_global(vm, "__w_connect", &[Value::Number(port as f64)]).map(|_| ()));
+                shared.pending.fetch_sub(1, Ordering::SeqCst);
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
         fire_due_timers(&mut vm);
@@ -815,6 +954,9 @@ fn worker_main(sp: Spawn, rx: Receiver<Cmd>, shared: Arc<Shared>) {
     crate::js::ports::set_worker_owner(None);
     // Its nested workers lose their owner; its serial retires (connections, locks, channels).
     terminate_children(sp.id);
+    if sp.shared {
+        super::shared::worker_gone(sp.id);
+    }
     crate::js::broadcast::leave_worker();
     crate::storage::enter_worker_client(None);
     OUTSTANDING.with(|o| o.borrow_mut().clear());
@@ -983,18 +1125,23 @@ const EVENTS: &str = r#"
         hide(C.name, C);
     });
 
-    // The global: DedicatedWorkerGlobalScope → WorkerGlobalScope → EventTarget.
+    // The global: DedicatedWorkerGlobalScope (or, AETHERWORKERS3 SR129, SharedWorkerGlobalScope — HTML §10.2.1.3,
+    // each [Exposed] only in its own kind of worker) → WorkerGlobalScope → EventTarget.
     class WorkerGlobalScope extends EventTarget {
         constructor() { throw new TypeError('Illegal constructor'); }
     }
     class DedicatedWorkerGlobalScope extends WorkerGlobalScope {
         constructor() { throw new TypeError('Illegal constructor'); }
     }
+    class SharedWorkerGlobalScope extends WorkerGlobalScope {
+        constructor() { throw new TypeError('Illegal constructor'); }
+    }
+    var Mine = G.__w_shared === true ? SharedWorkerGlobalScope : DedicatedWorkerGlobalScope;
     Object.defineProperty(WorkerGlobalScope.prototype, Symbol.toStringTag, { value: 'WorkerGlobalScope', configurable: true });
-    Object.defineProperty(DedicatedWorkerGlobalScope.prototype, Symbol.toStringTag, { value: 'DedicatedWorkerGlobalScope', configurable: true });
+    Object.defineProperty(Mine.prototype, Symbol.toStringTag, { value: Mine.name, configurable: true });
     hide('WorkerGlobalScope', WorkerGlobalScope);
-    hide('DedicatedWorkerGlobalScope', DedicatedWorkerGlobalScope);
-    try { Object.setPrototypeOf(G, DedicatedWorkerGlobalScope.prototype); } catch (e) {}
+    hide(Mine.name, Mine);
+    try { Object.setPrototypeOf(G, Mine.prototype); } catch (e) {}
     if (typeof G.addEventListener !== 'function') {
         ['addEventListener', 'removeEventListener', 'dispatchEvent'].forEach(function (n) { hide(n, EventTarget.prototype[n]); });
     }
@@ -1036,12 +1183,16 @@ const SCOPE: &str = r#"
     var hide = function (n, v) { Object.defineProperty(G, n, { value: v, writable: true, configurable: true, enumerable: false }); };
     var INFO = { url: '', name: '', type: 'classic', navigator: null };
     var trusted = function (e) { __w_trust(e); return e; };
+    var SHARED = G.__w_shared === true;
+    delete G.__w_shared;
 
     // The handler attributes live on the global's prototypes; if the engine refused to re-parent the global,
     // they go on the global itself.
-    var GP = (G instanceof DedicatedWorkerGlobalScope) ? DedicatedWorkerGlobalScope.prototype : G;
+    var Mine = SHARED ? G.SharedWorkerGlobalScope : G.DedicatedWorkerGlobalScope;
+    var GP = (typeof Mine === 'function' && G instanceof Mine) ? Mine.prototype : G;
     var WP = (G instanceof WorkerGlobalScope) ? WorkerGlobalScope.prototype : G;
-    __net_handlers(GP, ['message', 'messageerror']);
+    // A shared worker hears `connect` (HTML §10.2.1.3); a dedicated one `message` / `messageerror`.
+    __net_handlers(GP, SHARED ? ['connect'] : ['message', 'messageerror']);
     __net_handlers(WP, ['unhandledrejection', 'rejectionhandled']);
     // WorkerNavigator (HTML §8.10.1.1): `navigator.storage` and `navigator.locks` are getters the IndexedDB and
     // Web Locks preludes put on its prototype (they find it as `Navigator`, deleted after they ran).
@@ -1081,10 +1232,19 @@ const SCOPE: &str = r#"
         return t.dispatchEvent(trusted(new C(String(type), d)));
     });
     hide('self', G);
-    hide('postMessage', function postMessage(message, transfer) {
-        if (arguments.length < 1) { throw new TypeError("Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present."); }
-        var pkt = __msg_pack(message, __msg_xfer(transfer, 'DedicatedWorkerGlobalScope'));
-        __w_post(pkt.data, pkt.ports);
+    if (!SHARED) {
+        hide('postMessage', function postMessage(message, transfer) {
+            if (arguments.length < 1) { throw new TypeError("Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present."); }
+            var pkt = __msg_pack(message, __msg_xfer(transfer, 'DedicatedWorkerGlobalScope'));
+            __w_post(pkt.data, pkt.ports);
+        });
+    }
+    // AETHERWORKERS3 (SR129): a new client of this shared worker — adopt the inside port and fire `connect`
+    // (HTML §10.2.6.4 step 12: a MessageEvent, data "", the port as `source` and as `ports[0]`).
+    hide('__w_connect', function (id) {
+        var ports = __msg_adopt(String(id));
+        var e = new MessageEvent('connect', { data: '', origin: '', lastEventId: '', source: ports[0], ports: ports });
+        G.dispatchEvent(trusted(e));
     });
     hide('close', function close() { __w_close(); });
     hide('importScripts', function importScripts() {

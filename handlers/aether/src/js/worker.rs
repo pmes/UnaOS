@@ -12,8 +12,15 @@
 //! the precheck for http(s) and in `check_hop` for `data:`, and a response whose MIME type is not a JavaScript
 //! MIME type refused. A refusal or a failed fetch is not an exception: the Worker object receives a simple
 //! `error` event as a task (`worker-error` through the creator's inbox), as the spec's "fetch failure" path
-//! says, and the console names the reason. The fetched script goes to the worker thread with the owner
-//! document's storage key, a navigator snapshot and the request context.
+//! says, and the console names the reason.
+//!
+//! AETHERWORKERS3 (SR129): the decisions above that need no network (the URL, same origin, CSP for a `data:`
+//! URL) stay on the creating thread; the FETCH itself runs on the worker's thread (`workers::dedicated`
+//! worker_main), asynchronously, under the request context captured here, so `new Worker()` never blocks
+//! its creator on the network. The worker then takes its own policy container from the script response
+//! (`csp::PolicyList::for_worker_response`; a `data:` worker keeps its creator's), and a `data:` worker gets
+//! an opaque origin and no storage key. `new SharedWorker()` (HTML §10.2.6.4) is this file's second
+//! binding, over `workers::shared`.
 //!
 //! The creator is the document on the page thread, or — a nested worker — the dedicated worker whose realm
 //! runs this same binding (`workers::dedicated::creator`: its URL, origin, captured CSP and request context,
@@ -52,6 +59,17 @@ fn id_arg(vm: &mut Vm, ctx: &CallCtx, i: usize) -> JsResult<u64> {
 fn fail(owner: u64, id: u64, rule: &str, url: &str, why: &str) {
     crate::ledger::record_js(&format!("worker-{rule}:{}", super::clip(url, 48)));
     super::broadcast::post(owner, "worker-error", json!({ "id": id, "simple": true, "message": why }).to_string());
+}
+
+/// AETHERWORKERS3 (SR129): the console message of a failed worker script fetch (`e`: the fetch's error, a
+/// refusal string or a network message) — the worker thread reports it as the simple `error` event's reason.
+pub(crate) fn script_failure_message(url: &str, e: &str) -> String {
+    let m = super::host::refusal_message(e);
+    if m.contains("Content Security Policy") {
+        format!("Refused to create a worker from '{url}' because it violates the document's Content Security Policy (worker-src).")
+    } else {
+        format!("Failed to load the worker script '{url}': {m}")
+    }
 }
 
 /// `__worker(op, …)`: `spawn(url, type, name, navigatorJson)` → id; `post(id, data, ports)`; `terminate(id)`.
@@ -107,19 +125,8 @@ fn worker_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
                     return Ok(num(id as f64));
                 }
             }
-            let fetched = super::host::fetch_worker_script(&url, &cr.ctx);
-            if on_page {
-                crate::security::drain();
-            }
-            let source = match fetched {
-                Ok((t, _)) => t,
-                Err(e) => {
-                    let m = super::host::refusal_message(&e);
-                    let why = if m.contains("Content Security Policy") { csp_msg(&url) } else { format!("Failed to load the worker script '{url}': {m}") };
-                    fail(cr.owner, id, "script-fetch-failed", &url, &why);
-                    return Ok(num(id as f64));
-                }
-            };
+            // AETHERWORKERS3 (SR129): the script is fetched on the worker's own thread, asynchronously, under
+            // the request context captured here (`Spawn::ctx`); its failure arrives as the same simple `error`.
             let sp = crate::workers::dedicated::Spawn {
                 id,
                 doc: cr.doc,
@@ -128,17 +135,19 @@ fn worker_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
                 url: url.clone(),
                 kind,
                 name,
-                source,
+                source: None,
                 storage_key: cr.storage_key,
                 navigator,
                 secure: cr.secure,
                 ctx: cr.ctx,
+                shared: false,
             };
             if let Err(e) = crate::workers::dedicated::spawn(sp) {
                 fail(cr.owner, id, "thread-failed", &url, &format!("Failed to start the worker: {e}"));
             }
             Ok(num(id as f64))
         }
+        "shared" => shared_native(vm, ctx),
         "post" => {
             let id = id_arg(vm, ctx, 1)?;
             let data = str_arg(vm, ctx, 2)?;
@@ -153,6 +162,77 @@ fn worker_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
         _ => vm.throw_type("__worker: unknown operation"),
     }
+}
+
+/// AETHERWORKERS3 (SR129): the simple `error` event a SharedWorker object gets when it cannot connect.
+fn shared_fail(doc: u64, object: u64, rule: &str, url: &str, why: &str) {
+    crate::ledger::record_js(&format!("sharedworker-{rule}:{}", super::clip(url, 48)));
+    super::broadcast::post(doc, "sharedworker-error", json!({ "id": object, "message": why }).to_string());
+}
+
+/// AETHERWORKERS3 (SR129): `__worker('shared', url, type, name, navigatorJson, insidePortId, outsidePortId)` →
+/// the SharedWorker object's id. HTML §10.2.6.4 on the page thread: the URL parsed against the document's base
+/// (a failure throws SyntaxError), same origin with the document or a `data:` URL, CSP `worker-src` for a
+/// `data:` URL here (an http(s) URL in the fetch's precheck on the worker thread, destination `sharedworker`);
+/// then `workers::shared::connect` with the document's storage key, request context and the shipped inside
+/// port. A refusal is a simple `error` event at the object (and the inside port closes), never an exception.
+fn shared_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let input = str_arg(vm, ctx, 1)?;
+    let kind = if str_arg(vm, ctx, 2)? == "module" { crate::workers::dedicated::Kind::Module } else { crate::workers::dedicated::Kind::Classic };
+    let name = str_arg(vm, ctx, 3)?;
+    let navigator = str_arg(vm, ctx, 4)?;
+    let inside = id_arg(vm, ctx, 5)?;
+    let outside = id_arg(vm, ctx, 6)?;
+    if crate::workers::dedicated::creator().is_some() {
+        crate::js::ports::close(inside);
+        return vm.throw_type("SharedWorker is not exposed in a worker.");
+    }
+    let doc = super::broadcast::doc();
+    let base = super::page_url();
+    let Ok(url) = html_core::url::Url::parse(&base).and_then(|b| b.join(&input)).map(|u| u.to_string()) else {
+        crate::js::ports::close(inside);
+        return idl::throw_dom(vm, "SyntaxError", &format!("Failed to construct 'SharedWorker': The URL '{input}' is invalid."));
+    };
+    let object = crate::workers::dedicated::next_id();
+    use crate::security::origin::Origin;
+    let me = Origin::of(&base);
+    if !url.starts_with("data:") && !me.same_origin(&Origin::of(&url)) {
+        let msg = format!("Failed to construct 'SharedWorker': Script at '{url}' cannot be accessed from origin '{}'.", me.serialize());
+        crate::security::refuse("sharedworker-same-origin", &url, &msg);
+        crate::js::ports::close(inside);
+        shared_fail(doc, object, "refused", &url, &msg);
+        return Ok(num(object as f64));
+    }
+    let mut rctx = super::host::worker_request_context();
+    rctx.destination = "sharedworker".into();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        if let Err(e) = rctx.check_hop(&url, false) {
+            crate::security::drain();
+            crate::js::ports::close(inside);
+            shared_fail(doc, object, "refused", &url, &script_failure_message(&url, &e));
+            return Ok(num(object as f64));
+        }
+    }
+    let key = crate::storage::page_storage_key();
+    let c = crate::workers::shared::Connect {
+        match_key: key.clone().unwrap_or_else(|| format!("opaque:{doc}")),
+        storage_key: key.unwrap_or_default(),
+        url: url.clone(),
+        name,
+        kind,
+        doc,
+        object,
+        inside_port: inside,
+        outside_port: outside,
+        navigator,
+        secure: crate::storage::page_is_secure(),
+        ctx: rctx,
+    };
+    if let Err(why) = crate::workers::shared::connect(c) {
+        crate::js::ports::close(inside);
+        shared_fail(doc, object, "connect-failed", &url, &why);
+    }
+    Ok(num(object as f64))
 }
 
 /// Installs `Worker` (after `js::ports`, whose transfer helpers it uses).
@@ -223,6 +303,55 @@ const PRELUDE: &str = r#"
     __net_handlers(Worker.prototype, ['message', 'messageerror', 'error']);
     Object.defineProperty(Worker.prototype, Symbol.toStringTag, { value: 'Worker', configurable: true });
     hide('Worker', Worker);
+
+    // AETHERWORKERS3 (SR129): SharedWorker (HTML §10.2.6.4), [Exposed=Window] — a document realm only (a worker
+    // realm runs this prelude too, and has `__w_post`).
+    if (typeof __w_post !== 'function') {
+        var SST = new WeakMap(), SBY_ID = new Map();
+        class SharedWorker extends EventTarget {
+            constructor(url, options) {
+                if (arguments.length < 1) { throw new TypeError("Failed to construct 'SharedWorker': 1 argument required, but only 0 present."); }
+                // (DOMString or WorkerOptions) options = {}: an object (or null) is the dictionary, anything else its name.
+                var o = options === undefined ? {} : options;
+                var name = '', type = 'classic';
+                if (o === null || typeof o === 'object' || typeof o === 'function') {
+                    o = o || {};
+                    type = o.type === undefined ? 'classic' : String(o.type);
+                    if (type !== 'classic' && type !== 'module') {
+                        throw new TypeError("Failed to construct 'SharedWorker': Failed to read the 'type' property from 'WorkerOptions': The provided value '" + type + "' is not a valid enum value of type WorkerType.");
+                    }
+                    if (o.credentials !== undefined && ['omit', 'same-origin', 'include'].indexOf(String(o.credentials)) < 0) {
+                        throw new TypeError("Failed to construct 'SharedWorker': The provided value '" + o.credentials + "' is not a valid enum value of type RequestCredentials.");
+                    }
+                    name = o.name === undefined ? '' : String(o.name);
+                } else {
+                    name = String(o);
+                }
+                var href = String(url);
+                super();
+                var ch = new MessageChannel();
+                var outside = ch.port1;
+                var inside = __msg_pack(null, [ch.port2]).ports;
+                var id = __worker('shared', href, type, name, navSnapshot(), inside, __port_id(outside));
+                SST.set(this, { id: id, port: outside });
+                SBY_ID.set(id, this);
+            }
+            get port() {
+                var s = (this !== null && typeof this === 'object') ? SST.get(this) : undefined;
+                if (s === undefined) { throw new TypeError('Illegal invocation'); }
+                return s.port;
+            }
+        }
+        __net_handlers(SharedWorker.prototype, ['error']);
+        Object.defineProperty(SharedWorker.prototype, Symbol.toStringTag, { value: 'SharedWorker', configurable: true });
+        hide('SharedWorker', SharedWorker);
+        __inbox_on('sharedworker-error', function (m) {
+            var w = SBY_ID.get(m.id);
+            if (!w) { return; }
+            console.error(m.message);
+            __net_fire(w, 'Event', 'error', undefined);
+        });
+    }
     __inbox_on('worker-message', function (m) {
         var w = BY_ID.get(m.id);
         if (!w) { return; }

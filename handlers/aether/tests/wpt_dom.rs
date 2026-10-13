@@ -30,8 +30,9 @@
 //! `wpt_xhr`), served by `wpt_net` — a local stand-in for wptserve (static files, `.headers`, the `sub`
 //! pipe, the `.any.js` / `.window.js` wrappers, the Python handlers those directories use most, and a
 //! WebSocket server for pywebsocket's handlers). wptserve is not available: a test that needs what the
-//! stand-in does not serve (another handler, TLS, a second origin, frames, workers, XML documents, …) is
-//! skipped by name with the reason ([`net_excluded`]). Per-file results go to
+//! stand-in does not serve (another handler, TLS, a second origin, frames, service workers, XML documents, …) is
+//! skipped by name with the reason ([`net_excluded`]). AETHERWORKERS3 (SR129): `.worker.js` tests run in the
+//! stand-in's generated `.worker.html` page (`fetch_tests_from_worker`), as wptserve serves them. Per-file results go to
 //! `target/wpt-<dir>.tsv`; `.any.js` tests run their window variant (`?default` for websockets).
 
 use std::io::{BufRead, BufReader, Write};
@@ -264,10 +265,11 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
     if src.contains("testdriver.js") || src.contains("test_driver") {
         return Some("testdriver (WebDriver input automation)");
     }
-    // AETHERWORKERS2 (SR125): dedicated workers (`new Worker`), MessageChannel and postMessage run now; what
-    // stays out is SharedWorker (not implemented) and service workers (their WPT needs a TLS origin).
-    if src.contains("SharedWorker") || src.contains("serviceWorker") {
-        return Some("shared / service workers");
+    // AETHERWORKERS2 (SR125): dedicated workers (`new Worker`), MessageChannel and postMessage run now.
+    // AETHERWORKERS3 (SR129): SharedWorker runs too; what stays out is service workers (their WPT needs a TLS
+    // origin).
+    if src.contains("serviceWorker") {
+        return Some("service workers");
     }
     if name.contains("/scrolling/")
         || name.starts_with("html/webappapis/update-rendering/")
@@ -670,12 +672,9 @@ fn net_excluded(rel: &str, src: &str) -> Option<String> {
     if name.contains(".https.") || name.contains(".h2.") || name.contains(".serviceworker.") {
         return Some("needs a TLS server (https / h2)".into());
     }
-    // AETHERWORKERS2 (SR125): a page that starts a dedicated worker (`new Worker(`) runs now. Still out: SharedWorker,
-    // and the worker-context variants (`.worker.js`, `fetch_tests_from_worker`), which need the stand-in to
-    // serve wptserve's `.worker.html` wrapper (tests/wpt_net.rs).
-    if name.ends_with(".worker.js") || name.contains(".sharedworker.") || src.contains("SharedWorker(") || src.contains("fetch_tests_from_worker") {
-        return Some("shared workers / worker-context tests".into());
-    }
+    // AETHERWORKERS2 (SR125): a page that starts a dedicated worker (`new Worker(`) runs now. AETHERWORKERS3 (SR129):
+    // so do SharedWorker pages, `fetch_tests_from_worker` pages, and `.worker.js` tests — through the stand-in's
+    // `.worker.html` wrapper (wpt_net `worker_wrapper`, wptserve's WorkersHandler).
     if src.contains("RemoteContextHelper") || name.contains("back-forward-cache") {
         return Some("bfcache / remote browsing contexts".into());
     }
@@ -826,6 +825,9 @@ fn run_net_dir(dir: &str, floor_pct: usize) {
                 format!("{stem}.any.html{v}")
             } else if let Some(stem) = rel.strip_suffix(".window.js") {
                 format!("{stem}.window.html{v}")
+            } else if let Some(stem) = rel.strip_suffix(".worker.js") {
+                // AETHERWORKERS3 (SR129): a worker-context test runs in its generated `.worker.html` page.
+                format!("{stem}.worker.html{v}")
             } else {
                 format!("{rel}{v}")
             };

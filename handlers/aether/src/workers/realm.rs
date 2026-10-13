@@ -127,6 +127,12 @@ fn fetch_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
         let m = vm.arg(c, 4);
         if m.is_nullish() { "cors".to_string() } else { vm.to_string(&m)?.to_rust() }
     };
+    // AETHERWORKERS3 (SR129): on a dedicated / shared worker thread the worker's OWN policy container governs
+    // its fetches (`connect-src`, CSP3 §6.8.1) — the policies of its script response, or its creator's for a
+    // local-scheme worker (`workers::dedicated::connect_allowed`). A service worker's realm has none here.
+    if let Err(e) = super::dedicated::connect_allowed(&url) {
+        return vm.throw_type(&format!("Failed to fetch: {}", crate::js::host::refusal_message(&e)));
+    }
     let me = Origin::of(&ctx().script_url);
     let cross = !me.same_origin(&Origin::of(&url));
     if cross && mode == "same-origin" {
@@ -236,7 +242,9 @@ fn cache_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     let x = ctx();
     // AETHERWORKERS (SR123): a dedicated worker of an opaque origin has no storage key (SecurityError), and
     // `caches` is a secure-context member of a worker realm as of a page (a service worker always is one).
-    let secure = crate::security::origin::is_potentially_trustworthy_url(&x.script_url);
+    // AETHERWORKERS3 (SR129): a dedicated / shared worker's flag is its owner document's (a `data:` worker's
+    // URL is never trustworthy, yet its `caches` is defined and refuses with SecurityError: no storage key).
+    let secure = crate::storage::worker_client_secure().unwrap_or_else(|| crate::security::origin::is_potentially_trustworthy_url(&x.script_url));
     let key = (!x.key.is_empty()).then_some(x.key);
     crate::js::cache_api::run(vm, c, key, secure)
 }
@@ -653,19 +661,32 @@ const SCOPE: &str = r#"
     expose('ExtendableMessageEvent', ExtendableMessageEvent);
 
     // ---- clients, registration, skipWaiting
+    // AETHERWORKERS3 (SR129): every client this engine tracks is a top-level document, so each is a WindowClient
+    // (Service Workers §4.3): `visibilityState` 'visible' (a headless page is never hidden), `focused` false, and
+    // `focus()` rejects with InvalidAccessError — the spec's answer when the worker has no transient user
+    // activation to spend ("If this algorithm is not triggered by user activation, reject").
     var clientObj = function (c) {
         return {
             id: c.id, url: c.url, type: c.type || 'window', frameType: 'top-level',
+            visibilityState: 'visible', focused: false,
             postMessage: function (msg) { __sw_client_post(c.id, __sc_ser(msg)); },
+            focus: function () { return Promise.reject(new DOMException("Failed to execute 'focus' on 'WindowClient': Not allowed to focus a window.", 'InvalidAccessError')); },
         };
     };
+    // ClientQueryOptions.type (Service Workers §4.4.2): 'window' by default; 'worker' / 'sharedworker' match no
+    // tracked client (dedicated and shared workers are not service-worker clients here); 'all' matches every one.
+    var CLIENT_TYPES = ['window', 'worker', 'sharedworker', 'all'];
     expose('clients', {
         get: function (id) {
             return Promise.resolve(JSON.parse(__sw_clients(true)).filter(function (c) { return c.id === String(id); }).map(clientObj)[0]);
         },
         matchAll: function (o) {
             var all = !!(o && o.includeUncontrolled);
-            return Promise.resolve(JSON.parse(__sw_clients(all)).map(clientObj));
+            var type = (o && o.type !== undefined) ? String(o.type) : 'window';
+            if (CLIENT_TYPES.indexOf(type) < 0) {
+                return Promise.reject(new TypeError("Failed to execute 'matchAll' on 'Clients': The provided value '" + type + "' is not a valid enum value of type ClientType."));
+            }
+            return Promise.resolve(JSON.parse(__sw_clients(all)).filter(function (c) { return type === 'all' || (c.type || 'window') === type; }).map(clientObj));
         },
         claim: function () { __sw_claim(); return Promise.resolve(undefined); },
         openWindow: function () { __ledger('clients.openWindow-unsupported'); return Promise.reject(new TypeError('clients.openWindow is not supported.')); },

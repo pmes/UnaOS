@@ -7,9 +7,13 @@
 //!
 //! AETHERWORKERS (SR123): [`dedicated`] — `new Worker()`'s thread and DedicatedWorkerGlobalScope realm (the page
 //! half is `js::worker`; MessagePorts are `js::ports`).
+//!
+//! AETHERWORKERS3 (SR129): [`shared`] — `new SharedWorker()`'s process-wide registry, `connect`, and the
+//! lifetime that outlives any one document (the thread and realm are `dedicated`'s, run as shared).
 
 pub mod dedicated;
 pub mod realm;
+pub mod shared;
 pub mod sw;
 
 use std::sync::mpsc::{self, Receiver, Sender};

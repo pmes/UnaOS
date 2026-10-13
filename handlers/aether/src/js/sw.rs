@@ -6,8 +6,8 @@
 //! `register()` runs the whole job (fetch, evaluate, install, activate-or-wait) synchronously on the page
 //! thread inside the native call and settles its promise from the outcome; the registration's `updatefound`
 //! and the worker's `statechange` follow as tasks. `controller` is decided once per document (see
-//! `workers::sw`); `ready` resolves with the registration whose scope covers the page once one has an active
-//! worker. `controllerchange` (a `clients.claim()` or a `skipWaiting()` takeover) and the worker's
+//! `workers::sw`); `ready` — one promise per container (AETHERWORKERS3, SR129) — resolves with the registration
+//! whose scope covers the page once one has an active worker. `controllerchange` (a `clients.claim()` or a `skipWaiting()` takeover) and the worker's
 //! `client.postMessage` arrive through the `js::broadcast` inbox. `[SecureContext]`: `navigator.serviceWorker`
 //! is `undefined` in an insecure context.
 
@@ -173,7 +173,9 @@ const PRELUDE: &str = r#"
         return r;
     };
 
-    var controller = null, controllerScope = null, readyWaiters = [];
+    // AETHERWORKERS3 (SR129): `ready` is ONE promise per container (Service Workers §3.4.4: the container's ready
+    // promise), resolved once with the registration whose scope covers the page when it has an active worker.
+    var controller = null, controllerScope = null, readyWaiters = [], readyPromise = null;
     var refreshController = function () {
         var j = call('controller', {});
         if (j === null) { controller = null; controllerScope = null; return null; }
@@ -198,7 +200,11 @@ const PRELUDE: &str = r#"
             return controller;
         }
         get ready() {
-            return new Promise(function (res) { readyWaiters.push(res); setTimeout(flushReady, 0); });
+            if (readyPromise === null) {
+                readyPromise = new Promise(function (res) { readyWaiters.push(res); });
+            }
+            setTimeout(flushReady, 0);
+            return readyPromise;
         }
         register(scriptURL, options) {
             var o = options || {};

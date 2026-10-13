@@ -345,6 +345,24 @@ impl PolicyList {
         self.policies.is_empty()
     }
 
+    /// AETHERWORKERS3 (SR129): a worker's OWN policy list (HTML §10.2.4 "run a worker" step 13.3, "initialize a
+    /// worker global scope's policy container"; CSP3 §4.2.2 "initialize a global object's CSP list"): every
+    /// `Content-Security-Policy` (enforced) and `Content-Security-Policy-Report-Only` value of the worker script's
+    /// response, parsed as a header list (§2.3), with `'self'` meaning the worker's own origin (`worker_url`).
+    /// No header: an empty list — an http(s) worker does not inherit its creator's policies (only a local-scheme
+    /// worker does, and its caller keeps the creator's list for it).
+    pub fn for_worker_response(headers: &[(String, String)], worker_url: &str) -> PolicyList {
+        let mut policies = Vec::new();
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case("content-security-policy") {
+                policies.extend(Policy::parse_header(v, false));
+            } else if k.eq_ignore_ascii_case("content-security-policy-report-only") {
+                policies.extend(Policy::parse_header(v, true));
+            }
+        }
+        PolicyList::new(policies, worker_url)
+    }
+
     fn evaluate(&self, effective: &str, blocked: &str, sample: &str, mut pass: impl FnMut(&[String]) -> bool) -> Verdict {
         let mut v = Verdict { allowed: true, violations: Vec::new() };
         for p in &self.policies {

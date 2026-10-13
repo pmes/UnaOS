@@ -156,8 +156,17 @@ pub fn worker_request_context() -> crate::security::RequestContext {
 /// fails) — the error names the type. Refusals off the page thread queue for `security::drain`; the page
 /// caller drains.
 pub fn fetch_worker_script(url: &str, ctx: &crate::security::RequestContext) -> Result<(String, String), String> {
+    fetch_worker_script_full(url, ctx).map(|(text, ctype, _)| (text, ctype))
+}
+
+/// AETHERWORKERS3 (SR129): [`fetch_worker_script`] answering the response's header list too — (text, content
+/// type, headers; empty for `file:` / `data:`) — so the worker thread can build the worker's OWN policy
+/// container from it (HTML §10.2.4 "run a worker" step 13.3 / CSP3 §4.2.2: a worker whose script came over
+/// http(s) takes the `Content-Security-Policy` of its script response, a local-scheme worker inherits its
+/// creator's).
+pub fn fetch_worker_script_full(url: &str, ctx: &crate::security::RequestContext) -> Result<(String, String, Vec<(String, String)>), String> {
     if let Some(r) = local_script(url) {
-        return r;
+        return r.map(|(text, ctype)| (text, ctype, Vec::new()));
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("unsupported script URL scheme: {url}"));
@@ -172,7 +181,7 @@ pub fn fetch_worker_script(url: &str, ctx: &crate::security::RequestContext) -> 
         timeout_ms: 10_000,
     };
     let ctx = ctx.clone();
-    std::thread::spawn(move || -> Result<(String, String), String> {
+    std::thread::spawn(move || -> Result<(String, String, Vec<(String, String)>), String> {
         let ex = crate::api::fetch::policed_send(&req, &ctx)?;
         let status = ex.resp.status().as_u16();
         if !(200..300).contains(&status) {
@@ -192,7 +201,7 @@ pub fn fetch_worker_script(url: &str, ctx: &crate::security::RequestContext) -> 
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(format!("{}: script larger than 4 MiB", req.url));
         }
-        Ok((String::from_utf8_lossy(&bytes).into_owned(), ctype))
+        Ok((String::from_utf8_lossy(&bytes).into_owned(), ctype, ex.headers))
     })
     .join()
     .map_err(|_| "fetch thread panicked".to_string())?
