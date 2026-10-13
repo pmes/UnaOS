@@ -19,6 +19,8 @@ extern crate std;
 pub mod bits;
 pub mod bool_decoder;
 pub mod consts;
+pub mod header;
+pub mod probs;
 pub mod tables;
 
 /// Every way a decode can fail.
