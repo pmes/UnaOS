@@ -148,7 +148,12 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
                     return Err(anyhow::anyhow!("HTTP Error: {}", response.status()));
                 }
                 let final_url = response.url().to_string();
-                
+                // AETHERORIGIN (SR86): the document's response headers (CSP, Referrer-Policy, Reporting-Endpoints)
+                // are the navigation's, read before the document loads.
+                let doc_headers: Vec<(String, String)> =
+                    response.headers().iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect();
+                crate::security::set_document_headers(&final_url, &doc_headers);
+
                 if response.content_length().unwrap_or(0) > 10 * 1024 * 1024 {
                     anyhow::bail!("Response exceeds size limit");
                 }

@@ -108,6 +108,19 @@ impl layout_core::Host for AetherHost {
         crate::render::transform_text(text, tt)
     }
     fn media_intrinsic(node: &NodeRef) -> Option<(f32, f32)> {
+        if let Some(el) = node.as_element() {
+            match el.name.local.as_ref() {
+                // AETHERFRAMES (SR83): a nested browsing context's box (the iframe's own size rules).
+                "iframe" => return crate::frames::replaced_size(node),
+                // AETHERCANVAS (SR85): HTML §4.12.5 — the bitmap's width/height attributes, else 300×150.
+                "canvas" => {
+                    let attrs = el.attributes.borrow();
+                    let px = |n: &str| attrs.get(n).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| *v >= 0.0);
+                    return Some((px("width").unwrap_or(300.0), px("height").unwrap_or(150.0)));
+                }
+                _ => {}
+            }
+        }
         crate::media::intrinsic_size(node)
     }
     fn img_intrinsic(node: &NodeRef) -> Option<(f32, f32)> {

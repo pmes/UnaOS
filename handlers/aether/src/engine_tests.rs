@@ -247,7 +247,7 @@ mod tests {
         </style></head><body>
             <div id="t">x</div>
             <script>
-                new MutationObserver(function () {}).observe(document.body);
+                new IntersectionObserver(function () {}).observe(document.body);
             </script>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
@@ -260,7 +260,8 @@ mod tests {
         // clearTimeout used to be the JS-side example here; it is a real
         // implementation now (see event_loop), so the honest never-delivers
         // shim stands in for the "shim reports itself" contract.
-        assert!(snap.contains(ApiCategory::Js, "observer-never-delivers:MutationObserver"),
+        // AETHERSHADOW (SR82): MutationObserver delivers now; IntersectionObserver is the shim that stands in.
+        assert!(snap.contains(ApiCategory::Js, "observer-never-delivers:IntersectionObserver"),
             "a shim that answers without knowing must record itself");
     }
 

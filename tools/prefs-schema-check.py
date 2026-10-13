@@ -129,6 +129,8 @@ def refs_in(path, src, consts):
     for g in re.finditer(r"Pref(?:Get|Set)\s*\{\s*ns:\s*\"(" + SEG + r")\"[^}]*?key:\s*\"(" + KEY + r")\"", src):
         yield g.group(1) + "." + g.group(2), line_of(g.start()), "R5"
     for g in re.finditer(r"(?<![\w])set\(\s*\"(" + SEG + r")\"\s*,\s*\"(" + KEY + r")\"", src):
+        if g.group(1)[:1].isupper():
+            continue  # `headers.set("Cache-Control", "no-cache")`: an HTTP header, never a namespace (a namespace is lowercase)
         yield g.group(1) + "." + g.group(2), line_of(g.start()), "R5"
     # R7
     for g in re.finditer(r"prefs::(?:get|set|set_applied)\(\s*\"(" + SEG + r")\"\s*,\s*\"(" + KEY + r")\"", src):

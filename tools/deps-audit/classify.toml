@@ -140,10 +140,6 @@ replacement = "on the host the audio server is the host's; Ring 0 has its own HD
 # `bincode` left the tree with UNAFSCODEC (SR53): UnaFS records are encoded by `unafs::codec` from
 # docs/dev/OS/09_FILESYSTEM/unafs-records.md. A crate that serialises our own formats is chicken wire.
 
-[chicken_wire.wincode]
-capability = "binary serialisation (declared by Lumen, no use in `vessels/lumen/src`)"
-verdict = "OWED"
-replacement = "remove the dependency (no caller); any future Lumen record format gets an in-tree codec"
 
 # ---------------------------------------------------------------- git
 # `gix` (and its ~40 gix-* crates) left the tree with GITCORE (SR59): Vaire reads repositories through

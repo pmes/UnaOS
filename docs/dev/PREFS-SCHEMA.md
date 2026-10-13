@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 48.
+Rows: 49.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -47,6 +47,7 @@ Rows: 48.
 | `system.trackpad.speed` | int `1..=10` | `5` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad. |
 | `system.trackpad.tap_to_click` | bool | `false` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A short touch with no travel and no press is a click. Edited in Settings > Trackpad. |
 | `system.trackpad.three_finger_drag` | bool | `false` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Three fingers down hold the primary button and move the pointer (a drag without a press). Edited in Settings > Trackpad. |
+| `tabula.highlight` | enum `core \| sourceview` | `"core"` | operator | — | tabula HighlightPrefs (`handlers/tabula/src/highlight.rs`) | Who paints the editor's syntax colours: `core` = UnaOS's own syntax core (`syntax_core`) through text tags, `sourceview` = GtkSourceView's language definitions, the other-OS face kept beside it (R104, R105). |
 | `vein.claude.api_key_env` | string ≤128 printable | `"ANTHROPIC_API_KEY"` | operator | — | gneiss_pal ProviderConfig | NAME of the environment variable holding the Claude key (the key is never a preference). |
 | `vein.claude.fallbacks` | bool | `true` | operator | — | gneiss_pal ProviderConfig | Let the Claude client fall back to the next model on overload. |
 | `vein.claudecode.bin` | string ≤4096 printable | `"claude"` | operator | — | gneiss_pal ProviderConfig | The Claude Code CLI binary for provider claudecode: a path, or a name looked up on PATH (CLAUDECODE, SR38). |

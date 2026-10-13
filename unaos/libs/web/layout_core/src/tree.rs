@@ -83,7 +83,7 @@ fn is_non_rendered(name: &str) -> bool {
     matches!(
         name,
         "head" | "script" | "style" | "title" | "meta" | "link" | "template"
-            | "noscript" | "iframe" | "object" | "embed"
+            | "noscript" | "object" | "embed"
             | "option" | "optgroup"
     )
 }
@@ -1169,7 +1169,7 @@ fn min_content_width<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, id: taffy
             || tree
                 .node_map
                 .get(&id)
-                .and_then(|n| n.tag().map(|t| matches!(t.as_str(), "img" | "input" | "select" | "button" | "textarea" | "video" | "svg" | "canvas")))
+                .and_then(|n| n.tag().map(|t| matches!(t.as_str(), "img" | "input" | "select" | "button" | "textarea" | "video" | "svg" | "canvas" | "iframe")))
                 .unwrap_or(false)
         {
             l.size.width

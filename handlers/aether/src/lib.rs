@@ -506,6 +506,9 @@ impl AetherEngine {
         if let Some(url) = js::take_script_navigation() {
             self.pending_nav = Some(forms::OpenDocument::get(url));
         }
+        if let Some(nav) = js::take_form_submission() {
+            self.pending_nav = Some(nav); // AETHERFORMS (SR79): a script-started submission (POST or GET) navigates
+        }
         self.drain_history_ops();
         if js::take_mutated() {
             self.relayout();
@@ -624,6 +627,9 @@ impl AetherEngine {
         }
         if let Some(url) = js::take_script_navigation() {
             self.pending_nav = Some(forms::OpenDocument { url, method: forms::HttpMethod::Get, body: None, content_type: None });
+        }
+        if let Some(nav) = js::take_form_submission() {
+            self.pending_nav = Some(nav); // AETHERFORMS (SR79): a script-started submission (POST or GET) navigates
         }
         let cursor = match &target {
             Some(t) => css::cursor_for(t, hit.as_ref().is_some_and(|(_, text)| *text)),
@@ -1624,6 +1630,9 @@ impl AetherEngine {
         }
         if let Some(nav) = js::take_script_navigation() {
             self.pending_nav = Some(forms::OpenDocument::get(nav));
+        }
+        if let Some(nav) = js::take_form_submission() {
+            self.pending_nav = Some(nav); // AETHERFORMS (SR79): a script-started submission (POST or GET) navigates
         }
         js::take_mutated();
 

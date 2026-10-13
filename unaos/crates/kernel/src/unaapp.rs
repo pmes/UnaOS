@@ -1,4 +1,4 @@
-//! CHARTER: Una — vessel over shared-core edit_core (Tabula) + midden_core (Midden); ring-3 app, MIDDENTWIN shape
+//! CHARTER: Tabula — shared-core edit_core (the centre pane) and Midden — shared-core midden_core (the console); the Una vessel's ring-3 face, MIDDENTWIN shape
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
