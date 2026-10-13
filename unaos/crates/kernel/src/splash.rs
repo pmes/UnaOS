@@ -994,11 +994,7 @@ pub fn over_label(text: &str) {
 /// TrueType engine, no heap), a computed background (write-only VRAM is never read). Same band as the surface's.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn over_panel(text: &str) {
-<<<<<<< HEAD
-    if !PANEL_LIVE.load(Ordering::Acquire) { panel_skip(1, "not-live"); return; }
-=======
-    if text.is_empty() && !PANEL_LIVE.load(Ordering::Acquire) { crate::video::wm::fbdirect::clear(crate::video::wm::fbdirect::BOOT_OVER); return; } if !PANEL_LIVE.load(Ordering::Acquire) { return; } // FBDIRECT (B536): a clear after the release (the step outlived the splash) is a DAMAGE of the band this paint registered — the old early return left the OVER line on the glass with nothing owing it; while the splash still holds, `""` keeps the backdrop fill (the held row under it carries the same backdrop)
->>>>>>> exec-rmbp-fbdirect
+    if text.is_empty() && !PANEL_LIVE.load(Ordering::Acquire) { crate::video::wm::fbdirect::clear(crate::video::wm::fbdirect::BOOT_OVER); return; } if !PANEL_LIVE.load(Ordering::Acquire) { panel_skip(1, "not-live"); return; } // FBDIRECT (B536): a clear after the release (the step outlived the splash) is a DAMAGE of the band this paint registered — the old early return left the OVER line on the glass with nothing owing it; while the splash still holds, `""` keeps the backdrop fill (the held row under it carries the same backdrop)
     let fb = unsafe { *PANEL.0.get() }; // SAFETY: written once in `takeover_blit` before the Release store acquired above, never again
     let face = crate::video::font::Face::Chrome; let (cw, ch, w, h) = (face.cell_w(), face.cell_h(), fb.width(), fb.height()); let band_h = ch * 2;
     if !fb.is_ready() || cw == 0 || w < cw || h < band_h * 4 { if fb.is_ready() { panel_skip(4, "geometry"); } else { panel_skip(2, "not-ready"); } return; }
