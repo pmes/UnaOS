@@ -295,8 +295,13 @@ fn band_clear() {
 }
 
 /// The panel line, straight onto the framebuffer — no compositor, no pump, no heap (SESSIONWEDGE's `paint`, one band
-/// higher so a PUMPWEDGE band and this one never cover each other). A busy `WRITER` skips this paint; empty clears.
+/// higher so a PUMPWEDGE band and this one never cover each other). A busy `WRITER` skips this paint. Empty clears —
+/// FBDIRECT (B536): by handing the registered rect back to the compositor (`video::wm::fbdirect::clear`), never a fill.
 fn paint(text: &str) {
+    if text.is_empty() {
+        crate::video::wm::fbdirect::clear(crate::video::wm::fbdirect::TEST_WATCH);
+        return;
+    }
     let Some(fbg) = crate::video::WRITER.try_lock() else { return };
     let fb = *fbg;
     drop(fbg);
@@ -311,20 +316,19 @@ fn paint(text: &str) {
     }
     let y0 = i.height - band_h * 5;
     fb.fill_rect(0, y0, i.width, band_h, BAND);
-    if !text.is_empty() {
-        let bytes = text.as_bytes();
-        let face = crate::video::text::Face::Chrome;
-        let n = crate::video::text::fit(bytes, false, face, i.width);
-        let x0 = (i.width - crate::video::text::advance(&bytes[..n], false, face).min(i.width)) / 2;
-        let ty = (y0 + (band_h - ch) / 2) as isize;
-        let (w, h) = (i.width, i.height);
-        let _ = crate::video::text::draw_with(&bytes[..n], false, face, x0, ty, w - x0, INK, &mut |px, py, a| {
-            if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h && a >= 96 {
-                fb.put_pixel(px as usize, py as usize, INK);
-            }
-        });
-    }
+    let bytes = text.as_bytes();
+    let face = crate::video::text::Face::Chrome;
+    let n = crate::video::text::fit(bytes, false, face, i.width);
+    let x0 = (i.width - crate::video::text::advance(&bytes[..n], false, face).min(i.width)) / 2;
+    let ty = (y0 + (band_h - ch) / 2) as isize;
+    let (w, h) = (i.width, i.height);
+    let _ = crate::video::text::draw_with(&bytes[..n], false, face, x0, ty, w - x0, INK, &mut |px, py, a| {
+        if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h && a >= 96 {
+            fb.put_pixel(px as usize, py as usize, INK);
+        }
+    });
     fb.flush_rect(0, y0, i.width, band_h);
+    crate::video::wm::fbdirect::note(crate::video::wm::fbdirect::TEST_WATCH, 0, y0, i.width, band_h); // FBDIRECT (B536): on the glass, owed to the compositor until the clear
 }
 
 const BAND: u32 = crate::video::theme::WEDGE_BAND;

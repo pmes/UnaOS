@@ -1,4 +1,4 @@
-//! CHARTER: Sonde — driver
+//! CHARTER: Kernel — driver (the D435i vendor extension unit as cited data; the probe is Sonde's, R112, CODEX Amendment IV pending)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 

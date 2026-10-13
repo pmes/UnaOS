@@ -24,7 +24,8 @@
 //! 4. `tests sessionwedge` — `:: SESSIONWEDGE: bare_to_built_ms=<n> pump_gap_max_ms=<n> pump_passes=<n>
 //!    through=<0|1> armed=<task:0|1,…> watch=<seen|silent> -> PASS|FAIL|SKIP ::`: PASS iff `[desktop] built` came within
 //!    5 s of the ignition, the pump stamped through the whole 5 s window with no gap of [`WEDGE_MS`], and the watch's
-//!    print path fired on a fixture-fed stale stamp (`-> SEEN :: fixture=1`, the same formatter, painted too).
+//!    print path fired on a fixture-fed stale stamp (`-> SEEN :: fixture=1`, the same formatter, painted too), and
+//!    the fixture's band was handed back to the compositor, not filled (`cleared=damage rects=<n>`, FBDIRECT B536).
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
@@ -158,8 +159,16 @@ pub fn look(now: u64) {
 }
 
 /// The panel line, straight onto the framebuffer — no compositor, no pump, no heap. A busy `WRITER` skips this paint
-/// (the next one tries again). Empty `text` clears the band. Bottom band, two chrome cells high (SPLASHSTALL's).
+/// (the next one tries again). Bottom band, two chrome cells high (SPLASHSTALL's). Empty `text` clears the band —
+/// FBDIRECT (B536, flight 31 REDBAND): the clear is a DAMAGE, never a fill. The old `""` filled the rect with the band
+/// colour again and told the compositor nothing, so the band outlived the wedge until the cursor and the app bar
+/// overpainted it piecemeal; now each paint registers its rect (`video::wm::fbdirect::note`) and the clear hands it
+/// back (`fbdirect::clear`: `wm::damage_intersecting` + `screen::request_present_rect`, after the pump moved again).
 fn paint(text: &str) {
+    if text.is_empty() {
+        crate::video::wm::fbdirect::clear(crate::video::wm::fbdirect::PUMP_WEDGE);
+        return;
+    }
     let Some(fbg) = crate::video::WRITER.try_lock() else { return };
     let fb = *fbg;
     drop(fbg);
@@ -174,20 +183,19 @@ fn paint(text: &str) {
     }
     let y0 = i.height - band_h * 3;
     fb.fill_rect(0, y0, i.width, band_h, BAND);
-    if !text.is_empty() {
-        let bytes = text.as_bytes();
-        let face = crate::video::text::Face::Chrome;
-        let n = crate::video::text::fit(bytes, false, face, i.width);
-        let x0 = (i.width - crate::video::text::advance(&bytes[..n], false, face).min(i.width)) / 2;
-        let ty = (y0 + (band_h - ch) / 2) as isize;
-        let (w, h) = (i.width, i.height);
-        let _ = crate::video::text::draw_with(&bytes[..n], false, face, x0, ty, w - x0, INK, &mut |px, py, a| {
-            if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h && a >= 96 {
-                fb.put_pixel(px as usize, py as usize, INK);
-            }
-        });
-    }
+    let bytes = text.as_bytes();
+    let face = crate::video::text::Face::Chrome;
+    let n = crate::video::text::fit(bytes, false, face, i.width);
+    let x0 = (i.width - crate::video::text::advance(&bytes[..n], false, face).min(i.width)) / 2;
+    let ty = (y0 + (band_h - ch) / 2) as isize;
+    let (w, h) = (i.width, i.height);
+    let _ = crate::video::text::draw_with(&bytes[..n], false, face, x0, ty, w - x0, INK, &mut |px, py, a| {
+        if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h && a >= 96 {
+            fb.put_pixel(px as usize, py as usize, INK);
+        }
+    });
     fb.flush_rect(0, y0, i.width, band_h);
+    crate::video::wm::fbdirect::note(crate::video::wm::fbdirect::PUMP_WEDGE, 0, y0, i.width, band_h); // FBDIRECT (B536): on the glass, owed to the compositor until the clear
 }
 
 const BAND: u32 = crate::video::theme::WEDGE_BAND;
@@ -270,14 +278,17 @@ fn selftest() {
     FIX_LAST_MS.store(crate::arch::ms().saturating_sub(WEDGE_MS).max(1), Release);
     let seen = wait_for(WEDGE_MS + 2_000, || FIX_FIRES.load(Acquire) != f0);
     FIX_LAST_MS.store(0, Release);
-    if seen {
-        paint(""); // the fixture's band goes
+    if seen && !FIRED.load(Acquire) {
+        paint(""); // the fixture's band goes — handed back to the compositor (FBDIRECT B536), not filled
     }
-    let ok = matches!(built, Some(ms) if ms <= IGNITION_MS) && through && gap < WEDGE_MS && passes > 0 && seen;
+    // FBDIRECT (B536): no PUMPWEDGE band left on the glass that the compositor was not handed (a live wedge keeps its own).
+    let cleared = FIRED.load(Acquire) || !crate::video::wm::fbdirect::owed(crate::video::wm::fbdirect::PUMP_WEDGE);
+    let ok = matches!(built, Some(ms) if ms <= IGNITION_MS) && through && gap < WEDGE_MS && passes > 0 && seen && cleared;
     serial_println!(
-        ":: SESSIONWEDGE: bare_to_built_ms={} pump_gap_max_ms={} pump_passes={} through={} armed={} watch={}:{} -> {} :: window_ms={} wedge_ms={} wedges={} watched={}",
+        ":: SESSIONWEDGE: bare_to_built_ms={} pump_gap_max_ms={} pump_passes={} through={} armed={} watch={}:{} cleared={} rects={} -> {} :: window_ms={} wedge_ms={} wedges={} watched={}",
         match built { Some(ms) => alloc::format!("{}", ms), None => alloc::string::String::from("never") },
         gap, passes, through as u8, a.as_str(), if seen { "seen" } else { "silent" }, FIX_AGE.load(Relaxed),
+        if cleared { "damage" } else { "owed" }, crate::video::wm::fbdirect::handed(),
         if ok { "PASS" } else { "FAIL" }, IGNITION_MS, WEDGE_MS, WEDGES.load(Relaxed), WATCHED.load(Relaxed) as u8
     );
 }

@@ -794,7 +794,7 @@ pub fn hold_release(by: &str) {
     crate::video::wm::clear_modal_top(id);
     crate::video::wm::close(id);
     *HOLD_SURF.lock() = None; #[cfg(all(target_arch = "x86_64", feature = "wc"))] PANEL_LIVE.store(false, Ordering::Release); // after the row is gone: nothing reads the surface any more. RESOLVEHANG2 (B531): the panel witness ends HERE, after `wm::close` returned (HOLD_WIN went to 0 at this function's top, so a step hung inside the close is still painted by `over_panel`)
-    OVER_UP.store(false, Ordering::Relaxed); crate::fs::bootstep::splash_released(by); // SPLASHSTALL (B510): the splash's waits (`store-wait`, `first-screen`) end with the glass
+    OVER_UP.store(false, Ordering::Relaxed); crate::fs::bootstep::splash_released(by); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::video::wm::fbdirect::clear(crate::video::wm::fbdirect::SPLASH_WORD); } // FBDIRECT (B536): the word's end, AFTER `wm::close` returned — its band handed back to the compositor (windows beneath + backdrop), never left on the glass. SPLASHSTALL (B510): the splash's waits (`store-wait`, `first-screen`) end with the glass
     crate::bootlog_println!(
         "[splash] held_ms={} released_by={} fade_ms={}",
         t_rel.saturating_sub(HOLD_T0.load(Ordering::Relaxed)),
@@ -917,7 +917,7 @@ pub fn step_label(text: &str) {
         //
         (y0, band_h, w)
     };
-    crate::video::wm::damage_intersecting(0, band.0, band.2, band.1 * 2); // SPLASHSTALL (B510): the word's band and the OVER band under it
+    crate::video::wm::damage_intersecting(0, band.0, band.2, band.1 * 2); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::wm::fbdirect::note(crate::video::wm::fbdirect::SPLASH_WORD, 0, band.0, band.2, band.1 * 2); // SPLASHSTALL (B510): the word's band and the OVER band under it. FBDIRECT (B536): the same rect registered — the word is on the glass until `hold_release` hands it back (boot 2 of flight 31 kept "Resolving the session" under the login window)
     crate::video::wm::composite();
 }
 
@@ -994,14 +994,18 @@ pub fn over_label(text: &str) {
 /// TrueType engine, no heap), a computed background (write-only VRAM is never read). Same band as the surface's.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn over_panel(text: &str) {
+<<<<<<< HEAD
     if !PANEL_LIVE.load(Ordering::Acquire) { panel_skip(1, "not-live"); return; }
+=======
+    if text.is_empty() && !PANEL_LIVE.load(Ordering::Acquire) { crate::video::wm::fbdirect::clear(crate::video::wm::fbdirect::BOOT_OVER); return; } if !PANEL_LIVE.load(Ordering::Acquire) { return; } // FBDIRECT (B536): a clear after the release (the step outlived the splash) is a DAMAGE of the band this paint registered — the old early return left the OVER line on the glass with nothing owing it; while the splash still holds, `""` keeps the backdrop fill (the held row under it carries the same backdrop)
+>>>>>>> exec-rmbp-fbdirect
     let fb = unsafe { *PANEL.0.get() }; // SAFETY: written once in `takeover_blit` before the Release store acquired above, never again
     let face = crate::video::font::Face::Chrome; let (cw, ch, w, h) = (face.cell_w(), face.cell_h(), fb.width(), fb.height()); let band_h = ch * 2;
     if !fb.is_ready() || cw == 0 || w < cw || h < band_h * 4 { if fb.is_ready() { panel_skip(4, "geometry"); } else { panel_skip(2, "not-ready"); } return; }
     let y0 = h - band_h * 2; fb.fill_rect(0, y0, w, band_h, SPLASH_BG);
     let n = text.len().min(w / cw); let (x0, ty) = ((w - n * cw) / 2, y0 + (band_h - ch) / 2);
     for (i, &b) in text.as_bytes()[..n].iter().enumerate() { crate::video::font::draw_glyph_fb(&fb, b, x0 + i * cw, ty, crate::video::theme::painter::SPLASH_CAPTION_INK, SPLASH_BG, false, face); }
-    fb.flush_rect(0, y0, w, band_h);
+    fb.flush_rect(0, y0, w, band_h); crate::video::wm::fbdirect::note(crate::video::wm::fbdirect::BOOT_OVER, 0, y0, w, band_h); // FBDIRECT (B536): on the glass, owed to the compositor (a release-side clear or the screen open's `expose_all`)
 }
 
 /// SPLASHSTALL: builds without a compositor hold no glass.

@@ -728,7 +728,7 @@ fn open_as(state: State) {
     fbcon::console_present_suspend(true);
     crate::bootlog_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true power_row={}", id, ow, oh, ox, oy, (state == State::Open) as u8);
     repaint();
-    crate::splash::hold_release("first-screen"); // SPLASH2 M3: the first real screen (setter / create-user / login) is PAINTED — the splash gives the glass up now
+    crate::splash::hold_release("first-screen"); #[cfg(target_arch = "x86_64")] { let _ = crate::video::wm::fbdirect::expose_all("screen-open"); } // FBDIRECT (B536): the screen is up and the splash released — every direct-paint rect still on the glass (the stage word, an OVER line, a PUMPWEDGE/TESTWATCH band) is handed back to the compositor once. SPLASH2 M3: the first real screen (setter / create-user / login) is PAINTED — the splash gives the glass up now
 }
 
 fn take_down() {
@@ -759,7 +759,7 @@ fn close_into_session() {
     take_down();
     FORM.lock().state = State::Session;
     crate::fs::assoc::owe();
-    crate::video::desktopbuild::build("login ok"); // DESKTOPBUILT (B387, R93): the desktop — bar with its battery, dock with its pins, the wallpaper (rearmed by the build) — is BUILT here and painted in one pass
+    crate::video::desktopbuild::build("login ok"); #[cfg(target_arch = "x86_64")] { let _ = crate::video::wm::fbdirect::expose_all("desktop-built"); } // FBDIRECT (B536): the desktop's first pass repaints any direct-paint band left from the login screen. DESKTOPBUILT (B387, R93): the desktop — bar with its battery, dock with its pins, the wallpaper (rearmed by the build) — is BUILT here and painted in one pass
     #[cfg(feature = "unafs")]
     crate::fs::jobs::owe(); // JOBSCAN (B497): the scan is owed — a worker task, after the bar, one directory per chunk. UNAOSVOLUME (B427, R93): the one `[jobs] volume=/jobs records=<n> …` line — a count, no test (R80)
 }
