@@ -1,0 +1,4 @@
+s2=2 dark=0 bot=56 old_clause=FAIL (first=76 last=0) new_clause=ok ramp_a=59/0 ramp_dark=76/0 mono=true
+s2=2 dark=1 bot=56 old_clause=FAIL (first=165 last=0) new_clause=ok ramp_a=128/0 ramp_dark=165/0 mono=true
+s2=4 dark=0 bot=112 old_clause=FAIL (first=81 last=0) new_clause=ok ramp_a=62/0 ramp_dark=81/0 mono=true
+s2=4 dark=1 bot=112 old_clause=FAIL (first=172 last=0) new_clause=ok ramp_a=133/0 ramp_dark=172/0 mono=true
