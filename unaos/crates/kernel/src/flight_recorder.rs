@@ -427,7 +427,7 @@ pub fn service() { #[cfg(feature = "unafs")] if worker::off_this_task() { return
     crate::serial_ring::mirror_service(); #[cfg(target_arch = "x86_64")] crate::fs::removable::service(); // USBSTOR (B384): pin the boot medium, then mount/unmount removable disks on a registry change — unmasked, lock-free, ahead of the storage gate (a machine whose only disk is the internal card has no global slot).
 
     if crate::drivers::block::info().is_none() {
-        return; // storage not up yet — nothing to flush to
+        #[cfg(feature = "unafs")] worker::hand(); return; // PUMPHOLE (B541): hand the body to the `flightrec` worker HERE too — on a machine whose only disk is the internal card the global slot stays empty for the whole boot (flight 32: no FRGUARD slot verdict, no `[flight] service` line, `fr=inline`), so the hand below `divert` never ran and this body (mirror_service + USBSTOR) stayed on the hid pump's core (`usb-pump:flight-recorder` 209 ms). LINE-NEUTRAL fold, code first. Storage not up yet — nothing to flush to
     }
 
     // FRGUARD (GR21): derive the boot-medium verdict before asking for it. This is THE unmasked,
@@ -674,11 +674,11 @@ mod worker {
         o != 0 && crate::arch::sched::current_id() != Some(o)
     }
 
-    /// Start the worker once (from the body, on the first storage pass); no eligible core = stay inline.
+    /// Start the worker once (from the body: the first pass with no global slot, or the first storage pass); no eligible core = stay inline.
     pub fn hand() {
         static TRIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        if TRIED.swap(true, Ordering::AcqRel) {
-            return;
+        if TRIED.load(Ordering::Acquire) || crate::arch::smp::service_cpu().is_none() || TRIED.swap(true, Ordering::AcqRel) {
+            return; // PUMPHOLE (B541): now reached from the FIRST pass, so not before SCHED-X86 publishes its split (unpublished, `xhci_worker_cpu` indexes every AP, the render core included) — one load per pass until it does; decided once after
         }
         let pump = crate::hidstall::pump_cpu();
         let Some(c) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != pump) else {

@@ -19068,7 +19068,7 @@ pub fn service_ehci_hid() {
     // passes per second and this measures the gap BETWEEN them, which is the quantity `dark_gap_ms`
     // is made of; stamped here, beside its twin and above the lock, for the identical reason.
     pass_period_note();
-    let mut g = EHCI_HID.lock();
+    let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); // PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
         unsafe { c.service() };
