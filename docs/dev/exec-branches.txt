@@ -490,7 +490,7 @@ refs/heads/exec-rmbp-tpstream                   d616bf98 FOLDED-BY-HAND 9de8376d
 refs/heads/exec-rmbp-wifi9                      bd3d399d FOLDED-BY-HAND 1623d1c3
 refs/heads/exec-rmbp-gen7r9b                    bd3d399d FOLDED-BY-HAND c5e4b486
 refs/heads/exec-rmbp-keplergr4                  bd3d399d FOLDED-BY-HAND c5e4b486
-refs/heads/exec-pi-piemptybin                 bd3d399d IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-pi-piemptybin                 bd3d399d FOLDED-BY-HAND 105162dd
 refs/heads/exec-rmbp-glasskit                   bd3d399d FOLDED-BY-HAND 817f7945
 refs/heads/exec-rmbp-softy                      bd3d399d FOLDED-BY-HAND 817f7945
 refs/heads/exec-host-designlang                 bd3d399d FOLDED-BY-HAND 817f7945
@@ -500,7 +500,7 @@ refs/heads/exec-rmbp-dhcpreplug                 817f7945 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-ptrpress2                  817f7945 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-doorsplit                  aa3c9c70 FOLDED-BY-HAND e524f792
 refs/heads/exec-rmbp-winresize2                 aa3c9c70 FOLDED-BY-HAND e524f792
-refs/heads/exec-orin-armresize                  360dbad9 IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-rmbp-firstlogin                 360dbad9 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-orin-armresize                  360dbad9 FOLDED-BY-HAND 4f687b59
+refs/heads/exec-rmbp-firstlogin                 360dbad9 FOLDED-BY-HAND a76e79c2
 refs/heads/exec-host-aethersidetabs2            360dbad9 IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-host-aetherwpt4                 360dbad9 IN-FLIGHT cloud 2026-10-14
