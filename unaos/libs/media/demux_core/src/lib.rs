@@ -44,11 +44,15 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 pub mod build;
+/// AETHERMEDIA2 (SR134): the MSE byte-stream segment parser, coded frame processing and journal.
+pub mod fragment;
 pub mod mkv;
 pub mod mime;
 pub mod facts;
 pub mod mp4;
 mod read;
+/// AETHERMEDIA2 (SR134): WebVTT for `<track>`.
+pub mod vtt;
 
 /// Why a file could not be demuxed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +378,65 @@ impl Demuxer {
     }
     pub fn rewind(&mut self) {
         self.pos = 0;
+    }
+
+    /// AETHERMEDIA2 (SR134): the cursor — the index into [`Demuxer::samples`] of the next packet.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// AETHERMEDIA2 (SR134): move the cursor (a player resuming in a rebuilt demuxer after an append).
+    pub fn set_position(&mut self, pos: usize) {
+        self.pos = pos.min(self.order.len());
+    }
+
+    /// AETHERMEDIA2 (SR134): a demuxer over coded frames already in hand (an MSE track buffer):
+    /// `frames` pairs a track index with its frame; each track's frames are kept in decode order,
+    /// times are nanoseconds (every track gets [`Timebase::NANOS`]), the payloads already carry any
+    /// header-stripping prefix, and edit facts are dropped (the fragment parse applied them).
+    pub fn from_frames<'a>(
+        format: Format,
+        mut tracks: Vec<Track>,
+        frames: impl IntoIterator<Item = (usize, &'a fragment::CodedFrame)>,
+        declared_duration_ns: Option<u64>,
+    ) -> Demuxer {
+        let mut data: Vec<u8> = Vec::new();
+        let mut per: Vec<Vec<Sample>> = (0..tracks.len()).map(|_| Vec::new()).collect();
+        for (ti, f) in frames {
+            if ti >= tracks.len() {
+                continue;
+            }
+            let offset = data.len() as u64;
+            data.extend_from_slice(&f.data);
+            per[ti].push(Sample {
+                track_index: ti,
+                offset,
+                size: f.data.len() as u32,
+                pts: f.pts_ns,
+                dts: f.dts_ns,
+                duration: f.duration_ns.max(0) as u64,
+                keyframe: f.keyframe,
+                discard_ns: f.discard_ns,
+            });
+        }
+        for (i, t) in tracks.iter_mut().enumerate() {
+            per[i].sort_by_key(|s| s.dts);
+            t.timebase = Timebase::NANOS;
+            t.frame_prefix.clear();
+            t.edit = None;
+            t.smpb = None;
+            t.play_ns = None;
+            t.trim_start_ns = 0;
+            t.sample_count = per[i].len() as u64;
+            let lo = per[i].iter().map(|x| x.pts).min();
+            let hi = per[i].iter().map(|x| x.pts.saturating_add(x.duration as i64)).max();
+            t.duration_ns = match (lo, hi) {
+                (Some(lo), Some(hi)) => (hi - lo).max(0) as u64,
+                _ => 0,
+            };
+        }
+        let order = merge(&tracks, per);
+        Demuxer { data: Arc::new(data), format, tracks, order, pos: 0, declared_duration_ns }
     }
     /// Seek to the last keyframe of the reference track (first video track, else track 0) whose
     /// presentation time is ≤ `target_ns` (the first keyframe if none is). Packets of every track
