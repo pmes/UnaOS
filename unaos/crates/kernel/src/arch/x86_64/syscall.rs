@@ -31413,3 +31413,43 @@ fn wc_tab_to_app(cur: u64, down: bool) -> bool {
     }
     true
 }
+
+// =================================================================================================
+// ARMTESTS (orin-ledger A109) — THE LAUNCH FACADE the ring-3 fixtures (`tests midden`, `tests una`, `tests lumen`)
+// reach through `crate::arch::syscall`, the same names on both arches (the aarch64 twin is at the tail of
+// arch/aarch64/syscall.rs). The fixtures used to name this module by its x86 path, call `elf::validate_elf` with
+// `user_window_size()` themselves and type into `slot + 1`; the launch handle is the 0-based slot here and the ASID
+// there (`video::wm::owner_of_launch`), so the ring a fixture types into is now the arch's answer, never arithmetic in
+// the caller. Appended at the TAIL so no existing line moves; nothing here is called by the default image.
+// =================================================================================================
+
+/// ARMTESTS: what the production validator says of a program image, in arch-neutral terms (the fields the fixtures
+/// print). `model_elf` = the ELF-window model; `entry` and `stack` are the validator's own values.
+pub struct LaunchPlan {
+    pub model_elf: bool,
+    pub entry: u64,
+    pub nsegs: usize,
+    pub stack: usize,
+}
+
+/// ARMTESTS: the compositor owner (the input ring's key) of the handle `spawn_user_image_bg*` returns — `slot + 1`
+/// on this arch, by the one function that writes the fact down.
+pub fn owner_of_launch(handle: u64) -> u64 {
+    crate::video::wm::owner_of_launch(handle)
+}
+
+/// ARMTESTS: the validator `bg` runs (`elf::validate_elf` over the program window), its plan in [`LaunchPlan`] terms.
+pub fn launch_plan(img: &[u8]) -> Result<LaunchPlan, &'static str> {
+    super::elf::validate_elf(img, user_window_size()).map(|p| LaunchPlan { model_elf: p.model_elf, entry: p.entry, nsegs: p.nsegs, stack: p.stack })
+}
+
+/// ARMTESTS: push one pre-packed event into the ring of the program the launch `handle` names (APPMENU's by-owner
+/// push, the owner resolved by [`owner_of_launch`]).
+pub fn launch_push(handle: u64, packed: u64) -> bool {
+    user_input_push_owner(owner_of_launch(handle), packed)
+}
+
+/// ARMTESTS: events sitting unread in the ring of the program the launch `handle` names.
+pub fn launch_depth(handle: u64) -> u32 {
+    user_input_depth(owner_of_launch(handle))
+}

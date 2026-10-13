@@ -2471,7 +2471,7 @@ const _: () = assert!(RING_KDF_M_KIB <= WINDOW2_KDF_M_KIB && RING_KDF_M_KIB >= 1
 // everyone), applies the shell's `run`/bare-name pre-checks (regular file, non-empty, within the user image cap,
 // short read, ELF64 magic/class/data/e_machine), APPTRUST's direct-launch door (a program off the system volume
 // is launched only once the user said Open this session), and spawns it DETACHED — the `bg` body — under the
-// CALLER's principal (an anonymous caller's child is anonymous). x86 only; elsewhere the unknown-syscall default.
+// CALLER's principal (an anonymous caller's child is anonymous). Both arches: aarch64 serves it since ARMPIPE (A108).
 // Appended at the file tail so no existing line moves. Design: docs/dev/OS/02_KERNEL_CORE/userspace.md §RING3EXEC.
 //
 //   `SYS_SPAWN_PATH(path_ptr, path_len, argv_ptr, argc)` -> the child's pid (> 0) or -errno.
@@ -2637,10 +2637,10 @@ const _: () = assert!(PATH_W_RENAME & (PATH_W_TRUNC | PATH_W_MKDIRS | PATH_W_UNL
 //            kill it — anything else is refused by name, `[kill] pid=<p> by=<k> -> refused=not-my-child`
 //            (-ESRCH no pipe with that pid, -EACCES another program's pipe); -ESRCH also when the child already
 //            exited. Wire: `[pipe] kill pid=<p> by=<k> -> ok (<reap>)` or `-> refused=<why>`.
-//   arches   x86 attaches (SYS_SPAWN_PATH is x86's). aarch64's launch path has no ring-3 spawn-by-path, so it
-//            cannot attach one: `SYS_PIPE_READ` and `SYS_PIPE_WRITE` answer -ENOSYS there by name (`[pipe] read …
-//            -> refused=no-launch-pipe`, `[pipe] write … -> refused=no-launch-pipe`), and `SYS_KILL` -ESRCH by the
-//            parenthood refusal (no ring-3 program there has a child).
+//   arches   both attach, over one arch-neutral table (the kernel's `pipe.rs`): x86 keys it by (slot, SLOT_GEN),
+//            aarch64 (ARMPIPE, orin-ledger A108) by (ASID, ASID_GEN), so the `row=` / `by=` value on that arch's
+//            wire is the ASID. Every answer and refusal above is the same on both; the kernel fixtures that drive
+//            the verbs (`tests midden`, `tests una`) are built on both (ARMTESTS, orin-ledger A109).
 //   teardown the child's slot teardown (its generation bump) is the EOF; a launcher that dies leaves its pipes to be
 //            reclaimed at the next reserve.
 // Numbered 70: the next free number after CURSORSHAPE's SYS_CURSOR_SHAPE (69), the tail-append order; SHELLABI's

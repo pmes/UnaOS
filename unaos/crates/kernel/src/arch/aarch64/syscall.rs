@@ -7267,7 +7267,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         for &b in &chunk[..n] {
             port.write_byte(b);
         }
-        pipe_feed_write(asid, &chunk[..n]); off += n; // ARMPIPE (A108): a launcher's pipe takes the console bytes too (fn at the FILE TAIL; one atomic load when no pipe is bound). ⚠ LINE-NEUTRAL fold.
+        pipe_feed_write(asid, &chunk[..n]); off += n; if let Ok(t) = core::str::from_utf8(&chunk[..n]) { crate::serial_line::line_watch_check(t); } // ARMTESTS (A109): the fixtures' line watch sees ring-3 console text on this arch too. ARMPIPE (A108): a launcher's pipe takes the console bytes too (fn at the FILE TAIL; one atomic load when no pipe is bound). ⚠ LINE-NEUTRAL fold.
     }
     len as i64
 }
@@ -26733,4 +26733,109 @@ fn wc_tab_to_app(cur: u64, down: bool) -> bool {
         serial_println!("[wc] tab -> app pid={} owner={}", pid, cur);
     }
     true
+}
+
+// =================================================================================================
+// ARMTESTS (orin-ledger A109) — THE LAUNCH FACADE the ring-3 fixtures (`tests midden`, `tests una`, `tests lumen`)
+// reach through `crate::arch::syscall`, the same names as the x86 twin at the tail of arch/x86_64/syscall.rs. The
+// launch handle `spawn_user_image_bg*` returns is the ASID here and the 0-based slot there; the fixtures typed into
+// `slot + 1`, which on this arch is the NEXT tenant's ring (ARMPIPE.md item 5). Appended at the TAIL so no existing
+// line moves; nothing here is called by the default image.
+// =================================================================================================
+
+/// ARMTESTS: what the validator says of a program image, in arch-neutral terms (x86's `LaunchPlan`).
+pub struct LaunchPlan {
+    pub model_elf: bool,
+    pub entry: u64,
+    pub nsegs: usize,
+    pub stack: usize,
+}
+
+/// ARMTESTS: the classic slot window's size in bytes (x86's `user_window_size`, the bound `validate_elf` fits a
+/// fixed-model image's spans into).
+pub fn user_window_size() -> usize {
+    super::uslots::user_region().1
+}
+
+/// ARMTESTS: the largest program image a reader may hand the loader (x86's `user_image_cap`) — the spawn's own bound.
+pub fn user_image_cap() -> usize {
+    super::xwin::IMAGE_CAP
+}
+
+/// ARMTESTS: the compositor owner of a launch handle — the ASID itself on this arch (`video::wm::owner_of_launch`).
+pub fn owner_of_launch(handle: u64) -> u64 {
+    crate::video::wm::owner_of_launch(handle)
+}
+
+/// ARMTESTS: the loader's validation of `img` WITHOUT claiming a slot. An image whose lowest PT_LOAD sits at or above
+/// `una_abi::USER_XWIN_VA_ARM` is the ELF-window model, which `xwin::place_elf_model` validates AS it places (it
+/// allocates, so a fixture cannot call it before the spawn): such an image is checked here by `validate_elf` over
+/// the window's bytes (ident, ET_EXEC, EM_AARCH64, segment ranges, W^X, the entry in an executable segment) and its
+/// stack request by `place`'s rule (PT_GNU_STACK p_memsz page-rounded, else the default, at most the cap); the
+/// spawn remains the placing check and a fixture reports its refusal by name. A fixed-model image is checked over
+/// the classic slot window, the bound `map_image_into_slot` applies.
+pub fn launch_plan(img: &[u8]) -> Result<LaunchPlan, &'static str> {
+    const PT_GNU_STACK: u32 = 0x6474_E551;
+    if !is_elf_image(img) {
+        return Err("not an ELF image");
+    }
+    let wide = validate_elf(img, super::xwin::XWIN_BYTES)?;
+    if wide.min_vaddr < una_abi::USER_XWIN_VA_ARM {
+        let p = validate_elf(img, user_window_size())?;
+        return Ok(LaunchPlan { model_elf: false, entry: p.entry, nsegs: p.nsegs, stack: 0 });
+    }
+    let (phoff, phnum) = (rd_u64(img, 32).ok_or("bad e_phoff")? as usize, rd_u16(img, 56).ok_or("bad e_phnum")? as usize);
+    let mut req = 0usize;
+    for i in 0..phnum {
+        let ph = phoff + i * PHDR_SIZE;
+        if rd_u32(img, ph) == Some(PT_GNU_STACK) {
+            req = rd_u64(img, ph + 40).ok_or("bad p_memsz")? as usize;
+        }
+    }
+    let stack = if req == 0 { una_abi::USER_STACK_DEFAULT as usize } else { (req + 0xFFF) & !0xFFF };
+    if stack > una_abi::USER_STACK_MAX as usize {
+        return Err("declared stack exceeds the 1 MiB cap (-ENOMEM)");
+    }
+    Ok(LaunchPlan { model_elf: true, entry: wide.entry, nsegs: wide.nsegs, stack })
+}
+
+/// ARMTESTS: push one pre-packed event into the ring of the program the launch `handle` names — APPMENU's by-owner
+/// push (`user_input_push_owner`, which is `desktop_firmware`-only) without the knob: a fixture drives a launched
+/// program on every `aarch64_el0` build, as `SYS_PIPE_WRITE` does.
+pub fn launch_push(handle: u64, packed: u64) -> bool {
+    let owner = owner_of_launch(handle);
+    if owner == 0 || owner as usize > crate::procslot::SLOT_ID_MAX {
+        return false;
+    }
+    user_input_push(owner, packed)
+}
+
+/// ARMTESTS: events sitting unread in the ring of the program the launch `handle` names.
+pub fn launch_depth(handle: u64) -> u32 {
+    user_input_depth(owner_of_launch(handle))
+}
+
+/// ARMTESTS: x86's `path_write_as` (UNAMETAL2's ACL leg) on this arch: the bytes go through the SAME fulfiller a
+/// ring-3 `SYS_PATH_WRITE` reaches here (`selfdiag::path_fulfil`, the request laid out as una-abi's PATH_IO header),
+/// as `who`. Without `selfdiag` this arch serves no path write, so the answer is -ENOSYS, what the program would get.
+pub fn path_write_as(path: &str, flags: u16, off: u64, data: &[u8], who: &str) -> i64 {
+    #[cfg(feature = "selfdiag")]
+    {
+        let mut req = alloc::vec::Vec::with_capacity(una_abi::PATH_IO_HDR_LEN + path.len() + data.len());
+        req.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        req.extend_from_slice(&flags.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&off.to_le_bytes());
+        req.extend_from_slice(path.as_bytes());
+        req.extend_from_slice(data);
+        return match crate::selfdiag::path_fulfil(una_abi::SYS_PATH_WRITE, &req, who, 0) {
+            Ok((_, n)) => n,
+            Err(e) => e,
+        };
+    }
+    #[cfg(not(feature = "selfdiag"))]
+    {
+        let _ = (path, flags, off, data, who);
+        una_abi::ENOSYS
+    }
 }

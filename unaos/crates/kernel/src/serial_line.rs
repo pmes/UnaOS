@@ -375,7 +375,7 @@ pub fn line_watch_hit() -> bool {
     WATCH_HIT.load(core::sync::atomic::Ordering::Acquire)
 }
 
-fn line_watch_check(text: &str) {
+pub fn line_watch_check(text: &str) { // ARMTESTS (A109): the aarch64 console loop latches the fixtures' watched lines too
     let p = WATCH_PTR.load(core::sync::atomic::Ordering::Acquire);
     if p == 0 {
         return;

@@ -7,11 +7,11 @@
 //! `APPS/MIDDEN.ELF` (crates/user-midden) is Midden as a ring-3 program — the Code layout's bottom pane — and
 //! it plans every line through `midden_core`, the core this kernel's shell links (`shell.rs`). This fixture is
 //! `lumen.rs`'s shape (LUMENAPP + LUMENCRASH): find the image on the volume, run the production validator
-//! (`arch::x86_64::elf::validate_elf`, the one `bg` runs) in the ELF-window model, check the windowed app note
+//! (`arch::syscall::launch_plan`, the arch's loader check — ARMTESTS A109) in the ELF-window model, check the windowed app note
 //! (`midden_core::app_note_flags`, the reader the bare-name launch uses), SPAWN it the way `bg` does
 //! (`spawn_user_image_bg`), wait for its first wire line `:: MIDDEN: start`, then TYPE into it the way the
-//! input router delivers keys — `INPUT_EV_KEY_DOWN` events into its ring by owner (`user_input_push_owner`,
-//! the APPMENU seam) — `help⏎`, then `ls⏎`, each waited on its `:: MIDDEN: plan=` line, then `exit⏎`, and
+//! input router delivers keys — `INPUT_EV_KEY_DOWN` events into its ring by owner (`arch::syscall::launch_push`:
+//! the APPMENU by-owner push, the owner the arch's `owner_of_launch` of the launch handle) — `help⏎`, then `ls⏎`, each waited on its `:: MIDDEN: plan=` line, then `exit⏎`, and
 //! read the program's EXIT STATUS back through `bg_poll` (the reap `jobs` performs). The status packs what the
 //! program did (`midden_core::ring3::status`): scrollback rows, lines planned, the last plan's kind and verb.
 //!
@@ -53,7 +53,7 @@
 //! preceded by `[middenapp] …` (pid, slot, timings, the decoded status) and, on FAIL/SKIP, `:: MIDDENAPP:
 //! reason=… ::`. No `MIDDEN.ELF` on the volume is a SKIP (the builder stages it; a bare kernel has none).
 
-use crate::arch::x86_64::syscall::{self as sc, BgPoll};
+use crate::arch::syscall::{self as sc, BgPoll}; // ARMTESTS (A109): the arch's facade, x86 and aarch64 alike
 
 const IMAGE: &str = "/apps/MIDDEN.ELF";
 const START: &str = ":: MIDDEN: start";
@@ -130,17 +130,18 @@ fn wait_line(pid: u64, ms: u64) -> Result<u64, &'static str> {
     Err("timeout")
 }
 
-/// Type `s` into the ring of the process in `slot`, one KEY_DOWN per byte (`\n` is Enter, as the router sends it).
+/// Type `s` into the ring of the program the launch handle `h` names (ARMTESTS: the arch resolves the owner — `slot + 1`
+/// on x86, the ASID on aarch64), one KEY_DOWN per byte (`\n` is Enter, as the router sends it).
 /// SHELLABI (B565): PACED — a byte waits (yielding, up to TYPE_MS) while TYPE_DEPTH events sit unread, so a line longer
 /// than the 32-event ring arrives whole instead of being cut at the ring's end; a stalled program still fails the drive.
-fn type_line(slot: u64, s: &[u8]) -> bool {
+fn type_line(h: u64, s: &[u8]) -> bool {
     let mut ok = true;
     for &b in s {
         let t0 = crate::arch::ticks();
-        while sc::user_input_depth(slot + 1) >= TYPE_DEPTH && crate::arch::ticks() < t0 + TYPE_MS {
+        while sc::launch_depth(h) >= TYPE_DEPTH && crate::arch::ticks() < t0 + TYPE_MS {
             crate::arch::sched::yield_now();
         }
-        ok &= sc::user_input_push_owner(slot + 1, una_abi::input_ev_pack(una_abi::INPUT_EV_KEY_DOWN, b as u64));
+        ok &= sc::launch_push(h, una_abi::input_ev_pack(una_abi::INPUT_EV_KEY_DOWN, b as u64));
     }
     ok
 }
@@ -173,7 +174,7 @@ pub fn selftest() {
             return verdict("bad", 0, "none", "SKIP");
         }
     };
-    let plan = match crate::arch::x86_64::elf::validate_elf(&img, sc::user_window_size()) {
+    let plan = match sc::launch_plan(&img) {
         Ok(p) => p,
         Err(e) => {
             serial_println!(":: MIDDENAPP: reason=loader-refused ({}) ::", e);
@@ -196,7 +197,7 @@ pub fn selftest() {
     crate::serial_line::line_watch_arm(START);
     let (pid, slot, entry) = match sc::spawn_user_image_bg(&img) {
         Ok(t) => {
-            crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1), IMAGE);
+            crate::video::wm::app_name_arm_launch(sc::owner_of_launch(t.1), IMAGE);
             t
         }
         Err(e) => {
