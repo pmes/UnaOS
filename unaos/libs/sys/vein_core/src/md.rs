@@ -58,6 +58,10 @@ pub enum Block {
     Fence = 6,
     Rule = 7,
     Blank = 8,
+    /// LUMEN2 (SR121): a table row (`| a | b |`), its cells joined by a dim ` | `.
+    Table = 9,
+    /// LUMEN2: a table's delimiter row (`|---|:--:|`), drawn as a rule.
+    TableRule = 10,
 }
 
 impl Block {
@@ -71,6 +75,8 @@ impl Block {
             6 => Block::Fence,
             7 => Block::Rule,
             8 => Block::Blank,
+            9 => Block::Table,
+            10 => Block::TableRule,
             _ => Block::Para,
         }
     }
@@ -199,13 +205,43 @@ pub fn line(st: &mut State, src: &[u8], text: &mut [u8], spans: &mut [Span]) -> 
             out.hang = 2;
             w.push(b"| ", Tint::Dim, false, false);
             inline(&mut w, rest.strip_prefix(b" ").unwrap_or(rest), Tint::Quote, false, false, 0);
+        } else if let Some(cells) = table_row(s) {
+            if is_table_rule(cells) {
+                out.block = Block::TableRule;
+            } else {
+                out.block = Block::Table;
+                out.hang = 2;
+                let mut first = true;
+                for cell in split_cells(cells) {
+                    if !first {
+                        w.push(b" | ", Tint::Dim, false, false);
+                    }
+                    first = false;
+                    inline(&mut w, trim(cell), Tint::Plain, false, false, 0);
+                }
+            }
         } else if s.len() >= 2 && matches!(s[0], b'-' | b'*' | b'+') && s[1] == b' ' {
             out.block = Block::Bullet;
             let pad = (ind / 2) * 2;
             spaces(&mut w, pad);
             w.push(b"- ", Tint::Dim, false, false);
             out.hang = pad + 2;
-            inline(&mut w, &s[2..], Tint::Plain, false, false, 0);
+            // LUMEN2: a task-list item (`- [ ]` / `- [x]`) keeps its box, dim, inside the hang
+            let body = &s[2..];
+            let body = match body.get(..4) {
+                Some(b"[ ] ") => {
+                    w.push(b"[ ] ", Tint::Dim, false, false);
+                    out.hang += 4;
+                    &body[4..]
+                }
+                Some(b"[x] " | b"[X] ") => {
+                    w.push(b"[x] ", Tint::Dim, false, false);
+                    out.hang += 4;
+                    &body[4..]
+                }
+                _ => body,
+            };
+            inline(&mut w, body, Tint::Plain, false, false, 0);
         } else if let Some(m) = number_marker(s) {
             out.block = Block::Number;
             let pad = (ind / 2) * 2;
@@ -221,6 +257,110 @@ pub fn line(st: &mut State, src: &[u8], text: &mut [u8], spans: &mut [Span]) -> 
     out.spans = w.ns;
     out.over = w.over;
     out
+}
+
+/// LUMEN2: a GFM table row — starts with `|` and holds another `|`; the cells between the outer pipes.
+fn table_row(s: &[u8]) -> Option<&[u8]> {
+    let t = trim(s);
+    let inner = t.strip_prefix(b"|")?;
+    if !inner.contains(&b'|') && !inner.is_empty() {
+        return None;
+    }
+    let inner = inner.strip_suffix(b"|").unwrap_or(inner);
+    if inner.is_empty() { None } else { Some(inner) }
+}
+
+/// A delimiter row's cells: only `-`, `:`, spaces and pipes, with at least one `-`.
+fn is_table_rule(cells: &[u8]) -> bool {
+    cells.contains(&b'-') && cells.iter().all(|&c| matches!(c, b'-' | b':' | b' ' | b'|'))
+}
+
+/// The cells of a row (a `\|` and a pipe inside a code span are not separators).
+fn split_cells(cells: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut a = 0usize;
+    let mut i = 0usize;
+    let mut code = false;
+    let mut done = false;
+    core::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        while i < cells.len() {
+            let c = cells[i];
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'`' {
+                code = !code;
+            } else if c == b'|' && !code {
+                let cell = &cells[a..i];
+                i += 1;
+                a = i;
+                return Some(cell);
+            }
+            i += 1;
+        }
+        done = true;
+        Some(&cells[a.min(cells.len())..])
+    })
+}
+
+/// LUMEN2 (SR121): the info string's first word of a fence line (` ```rust ` → `rust`, a bare fence → empty),
+/// or `None` when `src` is not a fence line. The window picks the code block's grammar from it.
+pub fn fence_info(src: &[u8]) -> Option<&[u8]> {
+    let src = src.strip_suffix(b"\r").unwrap_or(src);
+    if !is_fence(src) {
+        return None;
+    }
+    let i = lead_ws(src);
+    let m = src[i];
+    let rest = &src[i..];
+    let run = rest.iter().take_while(|&&c| c == m).count();
+    let info = trim(&rest[run..]);
+    let end = info.iter().position(|&c| c == b' ' || c == b'{' || c == b',').unwrap_or(info.len());
+    Some(&info[..end])
+}
+
+/// One fenced code block of a text: the info word and the body (the lines between the fences, without the
+/// final newline), as byte ranges of the text. An unclosed block runs to the text's end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeBlock {
+    pub lang: (usize, usize),
+    pub body: (usize, usize),
+    /// Byte offset of the opening fence line.
+    pub open: usize,
+}
+
+/// Every fenced code block of `text`, in order (the copy verb's source: the window copies a block's body).
+pub fn code_blocks(text: &[u8], on: &mut dyn FnMut(CodeBlock)) {
+    let mut pos = 0usize;
+    let mut cur: Option<CodeBlock> = None;
+    for l in text.split(|&c| c == b'\n') {
+        let start = pos;
+        pos += l.len() + 1;
+        if let Some(info) = fence_info(l) {
+            match cur.take() {
+                Some(mut b) => {
+                    b.body.1 = start.saturating_sub(1).max(b.body.0);
+                    on(b);
+                }
+                None => {
+                    let a = info.as_ptr() as usize - text.as_ptr() as usize;
+                    let body0 = pos.min(text.len());
+                    cur = Some(CodeBlock { lang: (a, a + info.len()), body: (body0, body0), open: start });
+                }
+            }
+        }
+    }
+    if let Some(mut b) = cur {
+        let mut e = text.len();
+        while e > b.body.0 && text[e - 1] == b'\n' {
+            e -= 1;
+        }
+        b.body.1 = e;
+        on(b);
+    }
 }
 
 fn spaces(w: &mut W<'_>, n: usize) {
@@ -502,6 +642,33 @@ mod tests {
         assert_eq!(all[2], "Some bold and it and c.");
         assert_eq!(all[5], "x = [1](2)");
         assert_eq!(all[7], "- a (b) *c");
+    }
+
+    #[test]
+    fn tables_task_lists_and_code_blocks() {
+        let mut st = State::default();
+        let (l, t, sp) = r(&mut st, "| Name | `a|b` | **x** |");
+        assert_eq!((l.block, t.as_str()), (Block::Table, "Name | a|b | x"));
+        assert!(sp.iter().any(|s| s.tint == Tint::Code) && sp.iter().any(|s| s.bold));
+        assert_eq!(r(&mut st, "|---|:--:|---:|").0.block, Block::TableRule);
+        assert_eq!(r(&mut st, "| one |").1, "one");
+        assert_eq!(r(&mut st, "|").0.block, Block::Para);
+        let (l, t, _) = r(&mut st, "- [x] done thing");
+        assert_eq!((l.block, t.as_str(), l.hang), (Block::Bullet, "- [x] done thing", 6));
+        let (_, t, _) = r(&mut st, "- [ ] todo");
+        assert_eq!(t, "- [ ] todo");
+        assert_eq!(fence_info(b"```rust ignore"), Some(b"rust".as_slice()));
+        assert_eq!(fence_info(b"  ~~~"), Some(b"".as_slice()));
+        assert_eq!(fence_info(b"text"), None);
+        let text = b"intro\n```rust\nfn a() {}\nlet x = 1;\n```\nmid\n```\nraw\n";
+        let mut got = std::vec::Vec::new();
+        code_blocks(text, &mut |b| got.push(b));
+        assert_eq!(got.len(), 2);
+        assert_eq!(&text[got[0].lang.0..got[0].lang.1], b"rust");
+        assert_eq!(&text[got[0].body.0..got[0].body.1], b"fn a() {}\nlet x = 1;");
+        assert_eq!(got[0].open, 6);
+        assert_eq!(&text[got[1].body.0..got[1].body.1], b"raw");
+        assert_eq!(Block::from_u8(Block::TableRule as u8), Block::TableRule);
     }
 
     #[test]

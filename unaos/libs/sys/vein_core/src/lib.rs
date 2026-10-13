@@ -19,6 +19,11 @@
 //! * [`md`] / [`scroll`] / [`history`] (LUMENUX B348) — the markdown line renderer, the scrollback ring of
 //!   rendered rows, and the conversation-file codec the ring-3 Lumen window uses.
 //! * [`json`] — the minimal no-alloc JSON string escape/scan the above share.
+//! * LUMEN2 (LEDGER SR121): [`gemini`] — the Gemini `streamGenerateContent` request (its SSE stream decoded by
+//!   [`claude::StreamDecoder`] in [`claude::Dialect::Gemini`], driven by [`client::exchange_dialect`]);
+//!   [`models`] — the model table (dialect, context window) and the `ctx used/limit` indicator; [`convo`] — the
+//!   conversations sidebar's index (list, new, switch, rename, trash path, search); [`fixture`] — the fixture
+//!   provider (one recorded stream per dialect and a replaying transport) the host tests and `tests lumen` drive.
 //! * [`model`] / [`context`] (feature `alloc`) — the conversation model and the pure context assembler.
 #![no_std]
 #![forbid(unsafe_code)]
@@ -28,6 +33,10 @@ extern crate alloc;
 
 pub mod claude;
 pub mod client;
+pub mod convo;
+pub mod fixture;
+pub mod gemini;
+pub mod models;
 pub mod http;
 pub mod history;
 pub mod json;

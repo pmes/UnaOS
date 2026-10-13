@@ -206,11 +206,23 @@ pub enum Event<'a> {
     Dropped,
 }
 
+/// LUMEN2 (LEDGER SR121): which provider's event stream a [`StreamDecoder`] reads. Both are server-sent events
+/// carrying one JSON object per `data:` line; the objects differ (Claude's typed `message_*` /
+/// `content_block_*` events; Gemini's `GenerateContentResponse` chunks, [`crate::gemini`]) and both decode to
+/// the same [`Event`]s, so the window renders either stream token by token through one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Claude,
+    Gemini,
+}
+
 /// The incremental SSE decoder: feed it the response body in any split; it yields [`Event`]s. The line
 /// buffer is the caller's (ring 3 gives it a static; a `data:` line longer than it is skipped, reported
 /// once as [`Event::Dropped`]).
 pub struct StreamDecoder<'b> {
     line: &'b mut [u8],
+    /// LUMEN2: the stream's dialect ([`StreamDecoder::new`] = Claude).
+    pub dialect: Dialect,
     n: usize,
     overflow: bool,
     pub stop: Option<Stop>,
@@ -224,7 +236,12 @@ pub struct StreamDecoder<'b> {
 
 impl<'b> StreamDecoder<'b> {
     pub fn new(line: &'b mut [u8]) -> Self {
-        StreamDecoder { line, n: 0, overflow: false, stop: None, done: false, text_bytes: 0, input_tokens: None, output_tokens: None }
+        Self::with_dialect(line, Dialect::Claude)
+    }
+
+    /// LUMEN2: a decoder for `dialect`'s stream.
+    pub fn with_dialect(line: &'b mut [u8], dialect: Dialect) -> Self {
+        StreamDecoder { line, dialect, n: 0, overflow: false, stop: None, done: false, text_bytes: 0, input_tokens: None, output_tokens: None }
     }
 
     pub fn feed(&mut self, mut b: &[u8], on: &mut dyn FnMut(Event<'_>)) {
@@ -247,6 +264,12 @@ impl<'b> StreamDecoder<'b> {
     pub fn finish(&mut self, on: &mut dyn FnMut(Event<'_>)) {
         if self.n > 0 || self.overflow {
             self.line_done(on);
+        }
+        // LUMEN2: Gemini sends no `message_stop`; a stream that carried a `finishReason` and then ended is
+        // complete (one that ended without one stays `done == false`: truncated).
+        if self.dialect == Dialect::Gemini && self.stop.is_some() && !self.done {
+            self.done = true;
+            on(Event::Done);
         }
     }
 
@@ -279,6 +302,9 @@ impl<'b> StreamDecoder<'b> {
 
     /// Decode one `data:` JSON payload at `line[s..e]`.
     fn event(&mut self, s: usize, e: usize, on: &mut dyn FnMut(Event<'_>)) {
+        if self.dialect == Dialect::Gemini {
+            return self.gemini_event(s, e, on);
+        }
         let base = self.line.as_ptr() as usize;
         let d = &self.line[s..e];
         let Some(ty) = json::get(d, "type").and_then(json::plain_str) else { return };
@@ -341,6 +367,90 @@ impl<'b> StreamDecoder<'b> {
             on(Event::Text(t));
         } else {
             on(Event::Error(t));
+        }
+    }
+}
+
+impl StreamDecoder<'_> {
+    /// LUMEN2: one Gemini `GenerateContentResponse` chunk at `line[s..e]` — the visible text of
+    /// `candidates[0].content.parts[*].text` (a `"thought": true` part is the model's thinking, not the answer),
+    /// then `finishReason` / `promptFeedback.blockReason` as [`Event::Stop`], `usageMetadata` into the counts, and
+    /// a top-level `error` object as [`Event::Error`].
+    fn gemini_event(&mut self, s: usize, e: usize, on: &mut dyn FnMut(Event<'_>)) {
+        const PARTS: usize = 16;
+        let base = self.line.as_ptr() as usize;
+        let mut texts = [(0usize, 0usize); PARTS];
+        let mut nt = 0usize;
+        let mut err: Option<(usize, usize)> = None;
+        let mut stop: Option<Stop> = None;
+        {
+            let d = &self.line[s..e];
+            let pick = |v: &[u8]| -> (usize, usize) {
+                let a = v.as_ptr() as usize - base;
+                (a, a + v.len())
+            };
+            if let Some(x) = json::get(d, "error") {
+                match json::get(x, "message") {
+                    Some(m) => err = Some(pick(m)),
+                    None => {
+                        on(Event::Error("stream error"));
+                        return;
+                    }
+                }
+            }
+            if let Some(u) = json::get(d, "usageMetadata") {
+                let f = |k: &str| json::get(u, k).and_then(json::uint);
+                if let Some(p) = f("promptTokenCount") {
+                    self.input_tokens = Some(p);
+                }
+                if let Some(c) = f("candidatesTokenCount") {
+                    self.output_tokens = Some(c.saturating_add(f("thoughtsTokenCount").unwrap_or(0)));
+                }
+            }
+            if json::get(d, "promptFeedback").and_then(|p| json::get(p, "blockReason")).is_some() {
+                stop = Some(Stop::Refusal);
+            }
+            if let Some(c) = json::get(d, "candidates").and_then(|c| json::index(c, 0)) {
+                if let Some(parts) = json::get(c, "content").and_then(|x| json::get(x, "parts")) {
+                    let mut i = 0;
+                    while let Some(p) = json::index(parts, i) {
+                        i += 1;
+                        if json::get(p, "thought") == Some(b"true".as_slice()) {
+                            continue;
+                        }
+                        if let Some(t) = json::get(p, "text") {
+                            if nt < PARTS {
+                                texts[nt] = pick(t);
+                                nt += 1;
+                            }
+                        }
+                    }
+                }
+                if let Some(fr) = json::get(c, "finishReason").and_then(json::plain_str) {
+                    stop = Some(crate::gemini::finish_stop(fr));
+                }
+            }
+        }
+        // Each range is unescaped inside itself, so the later ranges stay valid.
+        for &(a, b) in &texts[..nt] {
+            let Some(r) = json::unescape_in_place(self.line, a, b) else { continue };
+            let Ok(t) = core::str::from_utf8(&self.line[r]) else { continue };
+            if t.is_empty() {
+                continue;
+            }
+            self.text_bytes += t.len();
+            on(Event::Text(t));
+        }
+        if let Some((a, b)) = err {
+            if let Some(r) = json::unescape_in_place(self.line, a, b) {
+                if let Ok(t) = core::str::from_utf8(&self.line[r]) {
+                    on(Event::Error(t));
+                }
+            }
+        }
+        if let Some(st) = stop {
+            self.stop = Some(st);
+            on(Event::Stop(st));
         }
     }
 }

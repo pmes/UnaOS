@@ -40,6 +40,9 @@ vein_ring3 = { path = "../../libs/sys/vein_ring3" }
 # KERNELFONT2 (rmbp-ledger B363, R85): the window's text through font_core::ui — the engine the kernel's video::text
 # fulfils (KERNELFONT, B359) — from the DejaVu faces on the volume; font8x8 stays the grid when no face is there.
 font_core = { path = "../../libs/text/font_core" }
+# LUMEN2 (LEDGER SR121): a reply's fenced code blocks highlighted through syntax_core — UnaOS's own syntax engine
+# (SR89 SYNTAXCORE; R105: tree-sitter is OUT), the same grammars Tabula links; no_std + alloc, zero deps.
+syntax_core = { path = "../../libs/text/syntax_core" }
 
 # VEINTLS (SR36): `cryptocore` = CRYPTOCORE's provider under tls_core. The MEDIA build (arroyo's
 # build_user_lumen_x86) passes `--features cryptocore`; until CRYPTOCORE's fold file is on the branch that build
