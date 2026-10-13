@@ -98,6 +98,26 @@ impl StreamKind {
         }
     }
 
+    /// SONDE2 (LEDGER SR105): the stream a UVC VideoStreaming function carries, from its FIRST format's
+    /// GUID FourCC — the D400 census's classification, decided here once for both rings (the kernel's
+    /// `drivers/uvc.rs` `multi::role_of` and the host face read the same table). A superset of
+    /// [`PixelFormat::from_fourcc`]: the D400 also declares two formats that are not single-plane frames
+    /// this crate lays out — `Y8I ` (the two infrared imagers interleaved, left/right in one 16-bit word)
+    /// and `UYVY` (4:2:2 in the other byte order, the colour imager's alternative) — and a function whose
+    /// first format is one of them is still that stream's function (librealsense `d400-device.cpp:55-75`
+    /// lists both beside the four above; the kernel census carried the same two since REALSENSE).
+    /// `None` = not a probe stream this crate knows (an MJPEG webcam, an unknown GUID).
+    pub fn of_uvc_fourcc(cc: [u8; 4]) -> Option<StreamKind> {
+        if let Some(f) = PixelFormat::from_fourcc(cc) {
+            return Some(StreamKind::for_format(f));
+        }
+        match &cc {
+            b"Y8I " => Some(StreamKind::Infrared),
+            b"UYVY" => Some(StreamKind::Color),
+            _ => None,
+        }
+    }
+
     /// The stream a video format is carried on, for a D400 (librealsense
     /// `d400-device.cpp:71-75`: YUY2 → COLOR, GREY → INFRARED; Z16 is the depth interface's).
     pub const fn for_format(f: PixelFormat) -> StreamKind {

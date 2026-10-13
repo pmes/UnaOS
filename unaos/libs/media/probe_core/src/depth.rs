@@ -165,3 +165,85 @@ pub fn census(frame: &Frame) -> (u32, u32, u16, u16) {
     }
     (valid, holes, lo, hi)
 }
+
+/// SONDE2 (LEDGER SR105): one Z16 frame's statistics — what the kernel prints on `tests sonde`'s device line
+/// (`min_mm= max_mm= median_mm= valid_pct=`) and what a face shows beside the ramp. Raw units; turn them into
+/// millimetres with [`Z16Stats::mm`] and the firmware's micrometres per unit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Z16Stats {
+    /// Pixels with a depth (raw != 0).
+    pub valid: u32,
+    /// Pixels the D400 marked "no depth" (raw == 0).
+    pub holes: u32,
+    pub min_raw: u16,
+    pub max_raw: u16,
+    /// The LOWER median of the valid samples (the `(valid - 1) / 2`-th smallest, 0-based); 0 when none.
+    pub median_raw: u16,
+}
+
+impl Z16Stats {
+    /// `raw` units in whole millimetres at `um_per_unit` micrometres per unit (integer: `raw * um / 1000`,
+    /// truncated — the kernel has no floating point on its print path).
+    pub fn mm(raw: u16, um_per_unit: u32) -> u32 {
+        ((raw as u64 * um_per_unit as u64) / 1000) as u32
+    }
+
+    /// Valid pixels in tenths of a percent (0..=1000), so `valid_pct=87.3` prints from integers.
+    pub fn valid_permille(&self) -> u32 {
+        let n = self.valid as u64 + self.holes as u64;
+        if n == 0 { 0 } else { (self.valid as u64 * 1000 / n) as u32 }
+    }
+}
+
+/// [`Z16Stats`] of a Z16 frame (`None` for any other format). No allocation and an exact median: two passes
+/// of a 256-bin histogram — the HIGH byte of every valid sample first, which names the bucket the median
+/// falls in and how many valid samples lie below it, then the LOW byte of the samples in that bucket alone.
+/// 2 KiB of stack, two reads of the frame, the same answer a full sort gives.
+pub fn z16_stats(frame: &Frame) -> Option<Z16Stats> {
+    if frame.format != PixelFormat::Z16 {
+        return None;
+    }
+    let mut s = Z16Stats { min_raw: u16::MAX, ..Z16Stats::default() };
+    let mut hi = [0u32; 256];
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            match frame.u16_at(x, y) {
+                Some(0) | None => s.holes += 1,
+                Some(v) => {
+                    s.valid += 1;
+                    s.min_raw = s.min_raw.min(v);
+                    s.max_raw = s.max_raw.max(v);
+                    hi[(v >> 8) as usize] += 1;
+                }
+            }
+        }
+    }
+    if s.valid == 0 {
+        s.min_raw = 0;
+        return Some(s);
+    }
+    let k = (s.valid - 1) / 2; // the rank of the lower median
+    let (mut bucket, mut below) = (0usize, 0u32);
+    while bucket < 255 && below + hi[bucket] <= k {
+        below += hi[bucket];
+        bucket += 1;
+    }
+    let mut lo = [0u32; 256];
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            if let Some(v) = frame.u16_at(x, y) {
+                if v != 0 && (v >> 8) as usize == bucket {
+                    lo[(v & 0xFF) as usize] += 1;
+                }
+            }
+        }
+    }
+    let mut b = 0usize;
+    let mut acc = below;
+    while b < 255 && acc + lo[b] <= k {
+        acc += lo[b];
+        b += 1;
+    }
+    s.median_raw = ((bucket as u16) << 8) | b as u16;
+    Some(s)
+}

@@ -29,6 +29,7 @@
 //! | [`ramp`] | the faces' pixels: depth as a colour ramp, Y8 as grey, YUY2 as RGB (all RGBA8) |
 //! | [`imu`] | an [`ImuSample`] and the D400 HID motion report it is read from |
 //! | [`replay`] | deterministic synthetic frames — the fixture a host without a camera is fed |
+//! | [`wire`] | one frame as bytes: the 80-byte `PRB1` header + data the kernel publishes at `/dev/probe/depth0` (SONDE2, SR105) |
 //!
 //! The first probe is the Intel RealSense D435i (REALSENSE, LEDGER SR92). Every hardware fact taken from
 //! librealsense (Apache-2.0, v2.55.1) is cited by file and line where it is used, R110's shape: the fact
@@ -48,7 +49,8 @@ pub mod frame;
 pub mod imu;
 pub mod ramp;
 pub mod replay;
+pub mod wire;
 
-pub use depth::{DepthScale, Intrinsics, Point3};
+pub use depth::{DepthScale, Intrinsics, Point3, Z16Stats};
 pub use frame::{Frame, FrameError, PixelFormat, StreamKind};
 pub use imu::{ImuKind, ImuSample};

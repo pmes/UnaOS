@@ -12,20 +12,66 @@
 //!    `drivers::realsense_xu`'s builders (the HW-monitor `GET_ADV(etDepthTableControl)` command, the XU
 //!    reply reader, the request words) against hand-laid bytes. Field by field; the first failure is
 //!    named. Runs on every machine: `-> PASS` or `-> FAIL`.
-//! 2. THE DEVICE — what this boot's EHCI walk, or its xHCI `probe_iso` (ARMSONDE, SR101), recorded for a D400 (`uvc::multi::record`):
-//!    `:: SONDE: dev=8086:0b3a streams=<depth,ir,color> fmt=Z16 w=<n> h=<n> depth_scale=<f> frames_2s=<n>
-//!    -> … ::`. With no D400 on the bus (every QEMU run, every bench without the camera) it is
-//!    `-> SKIP(no-device)`. With one, the census, the XU reads and the depth scale are printed and the
-//!    verdict is `-> SKIP(no-iso-pipe)` with `frames_2s=0`, by name: the tree has no isochronous pipe
-//!    (CAMERA1's `[uvc] commit=withheld reason=no-iso-pipe`; EHCI has no iTD path and the D435i's native
-//!    bus is xHCI), so a frame count is the NEXT rung's to measure and this line does not pretend one.
+//! 2. THE DEVICE — what this boot's EHCI walk, or its xHCI `probe_iso` (ARMSONDE, SR101), recorded for a D400
+//!    (`uvc::multi::record`), and — SONDE2 (LEDGER SR105) — the DEPTH STREAM `probe_iso` armed on it. With no
+//!    D400 on the bus (every QEMU run, every bench without the camera) it is
+//!    `:: SONDE: dev=none … frames_2s=0 -> SKIP(no-device) ::`. With one, `probe_iso`'s two SONDE2 folds have
+//!    committed the depth VideoStreaming function's `Z16 ` format on its isochronous endpoint (XHCIISO, B534),
+//!    and this line counts that stream's frames over two seconds of wall clock, takes ONE complete frame,
+//!    decodes it with `probe_core` (`Frame` → `depth::z16_stats`) and publishes it at `/dev/probe/depth0`
+//!    (`probe_core::wire`'s 80-byte `PRB1` header + the Z16 bytes — the fields of SR92's
+//!    `SMessage::ProbeFrame`):
+//!    `:: SONDE: dev=8086:0b3a … fmt=Z16 w=<n> h=<n> … frames_2s=<n> fps=<f> … min_mm=<n> max_mm=<n>
+//!    median_mm=<n> valid_pct=<f> depth0=<bytes> -> PASS ::` when `frames_2s > 0`; `-> FAIL reason=…` by name
+//!    otherwise (no stream armed — the `[uvc] commit=` line says why —, a stream that is not this camera's
+//!    depth, or no frames). The old `SKIP(no-iso-pipe)` is gone: the pipe exists.
 //!
-//! The depth scale on the device line is the D400 default (1000 µm per unit = 0.001 m,
-//! librealsense `src/ds/d400/d400-device.cpp:912`) marked `(default)`: its true read is the HW-monitor
-//! channel, a 1 KiB XU transfer the 256-byte EP0 buffer cannot carry (see `realsense_xu`).
+//! The depth scale is the D400 default (1000 µm per unit = 0.001 m, librealsense
+//! `src/ds/d400/d400-device.cpp:912`) marked `(default)`: its true read is the HW-monitor channel, a 1 KiB XU
+//! transfer (see `realsense_xu`), which the xHCI host's 4 KiB EP0 buffer can now carry and `after_census`
+//! still withholds (owed). Every millimetre on the line is `raw * 1000 µm / 1000`.
+//!
+//! RING 3: `depth0_read` is the reader `SYS_PATH_READ` of `/dev/probe/depth0` calls; the one-line hook in
+//! `selfdiag::path_fulfil` (and `sys_pathread` on a kernel without `selfdiag`) is outside this arc's files
+//! and is named in the SR105 row as owed.
 
 use crate::drivers::realsense_xu as rs;
+use crate::drivers::uvc::depth_tap;
 use crate::drivers::uvc::multi::{self, Role};
+use alloc::vec::Vec;
+use probe_core::depth::{self, Z16Stats};
+use probe_core::{wire, Frame, PixelFormat, StreamKind};
+
+/// SONDE2 (LEDGER SR105): the path ring 3 reads the published depth frame at (`SYS_PATH_READ`, any offset,
+/// `una_abi::PATH_IO_MAX` per call): `probe_core::wire`'s header, then the frame's Z16 bytes.
+pub const DEPTH0_PATH: &str = "/dev/probe/depth0";
+
+/// The published record (`None` until a `tests sonde` with the camera streaming took a frame).
+static DEPTH0: crate::sync::Mutex<Option<Vec<u8>>> = crate::sync::Mutex::new(None);
+
+/// `SYS_PATH_READ` of [`DEPTH0_PATH`]: up to `cap` bytes from `off` (an empty read at or past the end), or
+/// `-ENOENT` while nothing is published. The shape of `selfdiag::path_fulfil`'s return, so its hook is one
+/// line: `if path == crate::sonde::DEPTH0_PATH { return crate::sonde::depth0_read(off, cap); }`.
+pub fn depth0_read(off: u64, cap: usize) -> Result<(Vec<u8>, i64), i64> {
+    let g = DEPTH0.lock();
+    let Some(rec) = g.as_ref() else { return Err(una_abi::ENOENT) };
+    if off >= rec.len() as u64 || cap == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let o = off as usize;
+    let n = (rec.len() - o).min(cap);
+    let mut out = Vec::new();
+    if out.try_reserve_exact(n).is_err() {
+        return Err(una_abi::EAGAIN);
+    }
+    out.extend_from_slice(&rec[o..o + n]);
+    Ok((out, n as i64))
+}
+
+/// The published record's length (0 = none).
+pub fn depth0_len() -> usize {
+    DEPTH0.lock().as_ref().map(|r| r.len()).unwrap_or(0)
+}
 
 pub fn ensure() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -179,7 +225,44 @@ fn selftest() {
     short[rs::HWMON_DATA_SIZE_OFFSET] = 16; // fewer bytes than a depth table
     check("hwmon.short_table_refused", rs::hwmon_reply_depth_units(&short).is_none() as u64, 1);
 
-    let (ip, fp) = um_parts(rs::DEPTH_UNITS_DEFAULT_UM);
+    // ── 3. SONDE2 (SR105): the shared core the device path decodes with ──
+    check("core.role.z16", (multi::role_of(*b"Z16 ") == Role::Depth) as u64, 1);
+    check("core.role.y8i", (multi::role_of(*b"Y8I ") == Role::Ir) as u64, 1);
+    check("core.role.uyvy", (multi::role_of(*b"UYVY") == Role::Color) as u64, 1);
+    check("core.role.mjpg", (multi::role_of(*b"MJPG") == Role::Unknown) as u64, 1);
+    // 4x2 Z16: hole, 300, 1000, 260 / hole, 261, 2000, 255 -> valid 6, min 255, max 2000, lower median 261
+    // (rank (6-1)/2 = 2 of 255 260 261 300 1000 2000), valid 75.0 %.
+    let px: [u16; 8] = [0, 300, 1000, 260, 0, 261, 2000, 255];
+    let mut zb = Vec::with_capacity(16);
+    for v in px {
+        zb.extend_from_slice(&v.to_le_bytes());
+    }
+    match Frame::packed(StreamKind::Depth, PixelFormat::Z16, 4, 2, 0, 7, zb) {
+        Ok(zf) => {
+            let st = depth::z16_stats(&zf).unwrap_or_default();
+            check("core.z16.valid", st.valid as u64, 6);
+            check("core.z16.min", st.min_raw as u64, 255);
+            check("core.z16.max", st.max_raw as u64, 2000);
+            check("core.z16.median", st.median_raw as u64, 261);
+            check("core.z16.permille", st.valid_permille() as u64, 750);
+            match wire::encode(&zf, "uvc:8086:0b3a", rs::DEPTH_UNITS_DEFAULT_UM, None) {
+                Ok(h) => match wire::decode(&h) {
+                    Ok(d) => {
+                        check("core.wire.wh", ((d.width as u64) << 16) | d.height as u64, (4 << 16) | 2);
+                        check("core.wire.stride", d.stride as u64, 8);
+                        check("core.wire.seq", d.seq, 7);
+                        check("core.wire.data_len", d.data_len as u64, 16);
+                        check("core.wire.um", d.depth_units_um as u64, rs::DEPTH_UNITS_DEFAULT_UM as u64);
+                        check("core.wire.id", (d.id_str() == "uvc:8086:0b3a") as u64, 1);
+                    }
+                    Err(_) => check("core.wire.decode", 0, 1),
+                },
+                Err(_) => check("core.wire.encode", 0, 1),
+            }
+        }
+        Err(_) => check("core.z16.frame", 0, 1),
+    }
+
     if fails == 0 {
         serial_println!(
             ":: SONDE: fixture={}B fns={} streams={} fmt=Z16 w={} h={} xu={} hid={} hwmon_cmd=ok depth_units_reply=100 -> PASS ::",
@@ -193,43 +276,131 @@ fn selftest() {
         );
     }
 
-    // ── 3. the device this boot saw ──
-    match multi::record() {
-        None => serial_println!(
-            ":: SONDE: dev=none streams=- fmt=- w=0 h=0 depth_scale=- frames_2s=0 -> SKIP(no-device) ::"
-        ),
-        Some(r) => {
-            let mut names = [0u8; 32];
-            let mut k = 0usize;
-            for (bit, name) in [(1u32, &b"depth"[..]), (2, &b"ir"[..]), (4, &b"color"[..])] {
-                if r.roles & bit != 0 {
-                    if k != 0 {
-                        names[k] = b',';
-                        k += 1;
-                    }
-                    names[k..k + name.len()].copy_from_slice(name);
-                    k += name.len();
-                }
+    // ── 4. the device this boot saw, and its depth stream ──
+    let Some(r) = multi::record() else {
+        serial_println!(":: SONDE: dev=none streams=- fmt=- w=0 h=0 depth_scale=- frames_2s=0 -> SKIP(no-device) ::");
+        return;
+    };
+    let mut names = [0u8; 32];
+    let mut k = 0usize;
+    for (bit, name) in [(1u32, &b"depth"[..]), (2, &b"ir"[..]), (4, &b"color"[..])] {
+        if r.roles & bit != 0 {
+            if k != 0 {
+                names[k] = b',';
+                k += 1;
             }
-            if k == 0 {
-                names[0] = b'-';
-                k = 1;
-            }
-            let fmt = r.depth_cc;
-            let fmt = if fmt == [0; 4] { [b'-', b' ', b' ', b' '] } else { fmt };
-            let v = |x: u32| -> i64 {
-                match x {
-                    multi::NOT_READ => -1,
-                    multi::STALLED => -2,
-                    n => n as i64,
-                }
+            names[k..k + name.len()].copy_from_slice(name);
+            k += name.len();
+        }
+    }
+    if k == 0 {
+        names[0] = b'-';
+        k = 1;
+    }
+    let v = |x: u32| -> i64 {
+        match x {
+            multi::NOT_READ => -1,
+            multi::STALLED => -2,
+            n => n as i64,
+        }
+    };
+    let streams = core::str::from_utf8(&names[..k]).unwrap_or("?");
+    let um = rs::DEPTH_UNITS_DEFAULT_UM;
+    let (ip, fp) = um_parts(um);
+
+    // The stream `probe_iso` armed must be THIS camera's depth (`Z16 `) — anything else is named, not counted.
+    let (w, h) = match depth_tap::armed() {
+        Some((addr, w, h, cc)) if addr == r.addr && cc == *b"Z16 " => (w, h),
+        armed => {
+            let (why, a, cc) = match armed {
+                None => ("no-armed-stream(see-[uvc]-commit=)", 0u8, *b"-   "),
+                Some((a, _, _, cc)) if a != r.addr => ("armed-stream-is-another-device", a, cc),
+                Some((a, _, _, cc)) => ("armed-stream-is-not-z16", a, cc),
             };
             serial_println!(
-                ":: SONDE: dev={:04x}:{:04x} addr={} streams={} fmt={} w={} h={} depth_scale={}.{:06}(default) laser_mw={} emitter={} preset={} xu_unit={} window_short={} frames_2s=0 -> SKIP(no-iso-pipe) ::",
-                r.vid, r.pid, r.addr, core::str::from_utf8(&names[..k]).unwrap_or("?"),
-                core::str::from_utf8(&fmt).unwrap_or("?").trim_end(), r.depth_w, r.depth_h, ip, fp,
-                v(r.xu[0]), v(r.xu[1]), v(r.xu[2]), r.xu_unit, r.ran_short
+                ":: SONDE: dev={:04x}:{:04x} addr={} streams={} fmt=Z16 w={} h={} depth_scale={}.{:06}(default) laser_mw={} emitter={} preset={} xu_unit={} window_short={} stream_addr={} stream_fourcc={} frames_2s=0 -> FAIL reason={} ::",
+                r.vid, r.pid, r.addr, streams, r.depth_w, r.depth_h, ip, fp, v(r.xu[0]), v(r.xu[1]), v(r.xu[2]), r.xu_unit,
+                r.ran_short, a, core::str::from_utf8(&cc).unwrap_or("?").trim_end(), why
             );
+            return;
         }
+    };
+
+    // Two seconds of wall clock — `tests uvc`'s window, verbatim in shape (uvc.rs `stream_fixture`).
+    let c0 = depth_tap::counts();
+    let t0 = crate::arch::now_cycles();
+    let span = crate::arch::hw_wait_budget();
+    while crate::arch::now_cycles().wrapping_sub(t0) < span {
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::sched::sleep_ticks(10);
+        // aarch64: the window drives the event ring itself (uvc.rs `stream_fixture`'s ARMSONDE note).
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            if let Ok(mut x) = crate::drivers::xhci::claim() {
+                x.poll_events();
+            }
+            crate::arch::sched::yield_now();
+        }
+        core::hint::spin_loop();
+    }
+    let dt = crate::arch::now_cycles().wrapping_sub(t0).max(1);
+    let c1 = depth_tap::counts();
+    let frames = c1.0.wrapping_sub(c0.0);
+    #[cfg(target_arch = "x86_64")]
+    let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "aarch64")]
+    let hz = crate::arch::timer::cntfrq();
+    let fps10 = if hz != 0 { (frames as u64).saturating_mul(10).saturating_mul(hz) / dt } else { frames as u64 * 5 };
+
+    // ONE frame: copied out of the front buffer, decoded by probe_core, published for ring 3.
+    let row = w as usize * 2;
+    let need = row * h as usize;
+    let mut buf = Vec::new();
+    let got = if need != 0 && buf.try_reserve_exact(need).is_ok() { depth_tap::copy_latest(&mut buf) } else { None };
+    let ts_us = if hz != 0 { (crate::arch::now_cycles() as u128 * 1_000_000 / hz as u128) as u64 } else { 0 };
+    let (stats, seq, depth0): (Option<Z16Stats>, u32, Result<usize, &'static str>) = match got {
+        None => (None, 0, Err("no-complete-frame")),
+        Some((seq, len)) if buf.len() != len => (None, seq, if len > need { Err("frame-larger-than-geometry") } else { Err("copy") }),
+        Some((seq, _)) => match Frame::new(StreamKind::Depth, PixelFormat::Z16, w as u32, h as u32, row, ts_us, seq as u64, core::mem::take(&mut buf)) {
+            Err(_) => (None, seq, Err("frame-short-of-geometry")),
+            Ok(mut f) => {
+                let st = depth::z16_stats(&f);
+                let id = alloc::format!("uvc:{:04x}:{:04x}", r.vid, r.pid);
+                let pub_ = match wire::encode(&f, &id, um, None) {
+                    Err(_) => Err("wire-encode"),
+                    Ok(hd) => {
+                        let mut rec = Vec::new();
+                        if rec.try_reserve_exact(hd.len() + f.data.len()).is_err() {
+                            Err("heap")
+                        } else {
+                            rec.extend_from_slice(&hd);
+                            rec.append(&mut f.data);
+                            let n = rec.len();
+                            *DEPTH0.lock() = Some(rec);
+                            Ok(n)
+                        }
+                    }
+                };
+                (st, seq, pub_)
+            }
+        },
+    };
+    let mm = |raw: Option<u16>| -> i64 { raw.map(|x| Z16Stats::mm(x, um) as i64).unwrap_or(-1) };
+    let pm = stats.map(|s| s.valid_permille()).unwrap_or(0);
+    let pass = frames > 0;
+    serial_println!(
+        ":: SONDE: dev={:04x}:{:04x} addr={} streams={} fmt=Z16 w={} h={} depth_scale={}.{:06}(default) laser_mw={} emitter={} preset={} xu_unit={} window_short={} frames_2s={} fps={}.{} good={} short={} err={} over={} bad_hdr={} seq={} min_mm={} max_mm={} median_mm={} valid_pct={}.{} depth0={} -> {}{} ::",
+        r.vid, r.pid, r.addr, streams, w, h, ip, fp, v(r.xu[0]), v(r.xu[1]), v(r.xu[2]), r.xu_unit, r.ran_short,
+        frames, fps10 / 10, fps10 % 10, c1.1.wrapping_sub(c0.1), c1.2.wrapping_sub(c0.2), c1.3.wrapping_sub(c0.3),
+        c1.4.wrapping_sub(c0.4), c1.6.wrapping_sub(c0.6), seq,
+        mm(stats.map(|s| s.min_raw)), mm(stats.map(|s| s.max_raw)), mm(stats.map(|s| s.median_raw)), pm / 10, pm % 10,
+        match depth0 { Ok(n) => n as i64, Err(_) => 0 },
+        if pass { "PASS" } else { "FAIL" },
+        if pass { "" } else { " reason=no-frames" }
+    );
+    if let Err(why) = depth0 {
+        serial_println!("[sonde] depth0=withheld path={} reason={}", DEPTH0_PATH, why);
+    } else {
+        crate::census_println!("[sonde] depth0=published path={} bytes={} header={} seq={}", DEPTH0_PATH, depth0_len(), wire::HEADER_LEN, seq);
     }
 }

@@ -1748,7 +1748,7 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
     let call = parse(full);
     print_census(idx, addr, &call);
     let cut = first_function_len(full);
-    let c = if cut < full.len() { parse(&full[..cut]) } else { call };
+    let c = if cut < full.len() { parse(&full[..cut]) } else { call }; #[cfg(feature = "sonde")] let c = multi::depth_fn(full, c); // SONDE2 (LEDGER SR105): a camera whose census has a DEPTH function (first format `Z16 `, probe_core's classification) streams THAT function, not the first one — `parse` of its own interface run in `full`. LINE-NEUTRAL append, before this comment; knob off erases it.
     if cut < full.len() {
         crate::census_println!("[uvc] stream fn intf={} is the first VideoStreaming function (window cut at {} of {})", c.vs_intf, cut, n);
     }
@@ -1768,7 +1768,7 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
     // The format: `probe`'s rule (the first UNCOMPRESSED format, its default frame) — a size that is arithmetic,
     // so `dwMaxVideoFrameSize` and every assembled frame are numbers the fixture can CHECK.
     let mut pick: Option<(u8, u8, u32, u16, u16, [u8; 4])> = None;
-    for f in c.fmts[..c.nfmt].iter() {
+    for f in c.fmts[..c.nfmt].iter() { #[cfg(feature = "sonde")] { if multi::skip_for_z16(&c, f) { continue; } } // SONDE2 (LEDGER SR105): in a function that declares `Z16 `, the depth format is the one committed. LINE-NEUTRAL append, before this comment.
         if f.kind != Kind::Uncompressed || f.nframes == 0 {
             continue;
         }
@@ -2116,13 +2116,64 @@ pub mod multi {
         Unknown,
     }
 
+    /// SONDE2 (LEDGER SR105): the classification is the shared core's (`probe_core::StreamKind::of_uvc_fourcc`,
+    /// the table handlers/sonde reads); this file keeps only the descriptor walk, which is the bus's.
     pub fn role_of(cc: [u8; 4]) -> Role {
-        match &cc {
-            b"Z16 " => Role::Depth,
-            b"GREY" | b"Y8  " | b"Y16 " | b"Y8I " => Role::Ir,
-            b"YUY2" | b"YUYV" | b"UYVY" => Role::Color,
+        use probe_core::StreamKind as K;
+        match K::of_uvc_fourcc(cc) {
+            Some(K::Depth) => Role::Depth,
+            Some(K::Infrared) => Role::Ir,
+            Some(K::Color) => Role::Color,
             _ => Role::Unknown,
         }
+    }
+
+    /// SONDE2 (LEDGER SR105): `probe_iso`'s fold on its `let c` line. When the full window's census holds a
+    /// DEPTH function that is not the one `c` describes, return `parse` of that function's own run of
+    /// descriptors — from its first interface descriptor to the next interface descriptor with another
+    /// number (USB 2.0 §9.6.5: every alternate of one interface follows it contiguously) — so the
+    /// negotiation, the alternate choice and the commit below are the depth function's. `parse` needs no
+    /// configuration or VideoControl descriptor in front (it keys each arm on the interface it last saw).
+    /// Otherwise `c`, untouched: a single-function webcam streams exactly as before.
+    pub fn depth_fn(full: &[u8], c: super::Census) -> super::Census {
+        let s = census(full);
+        let Some(d) = s.find(Role::Depth) else { return c };
+        if c.have_vs && c.vs_intf == d.intf {
+            return c;
+        }
+        let (mut off, mut start, mut end) = (0usize, None, full.len());
+        while off + 2 <= full.len() {
+            let len = full[off] as usize;
+            if len < 2 || off + len > full.len() {
+                end = off;
+                break;
+            }
+            if full[off + 1] == DT_INTERFACE && len >= 9 {
+                match start {
+                    None if full[off + 2] == d.intf => start = Some(off),
+                    Some(_) if full[off + 2] != d.intf => {
+                        end = off;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            off += len;
+        }
+        let Some(st) = start else { return c };
+        let p = super::parse(&full[st..end]);
+        if !p.have_vs || p.vs_intf != d.intf {
+            return c;
+        }
+        crate::census_println!("[sonde] stream fn intf={} role=depth window={}..{} of {} (was intf={})", d.intf, st, end, full.len(), c.vs_intf);
+        p
+    }
+
+    /// SONDE2 (LEDGER SR105): `probe_iso`'s fold on its format loop — skip every format but `Z16 ` in a
+    /// function that declares one, so the first-uncompressed rule below lands on the depth format.
+    pub fn skip_for_z16(c: &super::Census, f: &super::Fmt) -> bool {
+        let z = |g: &[u8; 16]| g[..4] == *b"Z16 ";
+        c.fmts[..c.nfmt].iter().any(|x| z(&x.guid)) && !z(&f.guid)
     }
 
     pub fn role_name(r: Role) -> &'static str {
@@ -2499,4 +2550,43 @@ pub mod multi {
 /// (aarch64 only, so the x86 fixture table is unchanged). Appended at the file tail: no line above moves.
 pub fn ensure_tests() {
     let _ = crate::tests::defer("uvc", uvc_fixture);
+}
+
+// ── SONDE2 (LEDGER SR105): the depth tap — the armed stream as `tests sonde` and `/dev/probe/depth0` read it ──
+//
+// APPENDED at the file tail and `#[cfg(feature = "sonde")]`-erased whole: no line above moves, and a knob-off
+// image (sonde off, uvc on or off) carries this file's text exactly as before. A child module of this file,
+// so it reads the stream's private statics without one of them changing visibility.
+#[cfg(feature = "sonde")]
+pub mod depth_tap {
+    use super::{Ordering, STREAM, STREAM_ADDR, STREAM_ARMED, STREAM_CC, STREAM_WH};
+
+    /// What the armed xHCI stream is: (device address, width, height, FourCC). `None` = nothing armed.
+    pub fn armed() -> Option<(u8, u16, u16, [u8; 4])> {
+        if !STREAM_ARMED.load(Ordering::Acquire) {
+            return None;
+        }
+        let wh = STREAM_WH.load(Ordering::Relaxed);
+        Some((STREAM_ADDR.load(Ordering::Relaxed) as u8, (wh >> 16) as u16, wh as u16, STREAM_CC.load(Ordering::Relaxed).to_le_bytes()))
+    }
+
+    /// The assembler's counters: (frames closed, good, short, error, over, payloads, bad headers).
+    pub fn counts() -> (u32, u32, u32, u32, u32, u32, u32) {
+        STREAM.lock().as_ref().map(|a| (a.frames, a.good, a.short, a.errf, a.over, a.payloads, a.bad_hdr)).unwrap_or_default()
+    }
+
+    /// The latest complete frame: its sequence number and length, and its bytes COPIED into `out` when they
+    /// fit `out`'s capacity (cleared first; the caller reserves, so the copy under the stream lock allocates
+    /// nothing — a frame that does not fit leaves `out` empty and the length says why). `None` = no frame yet.
+    pub fn copy_latest(out: &mut alloc::vec::Vec<u8>) -> Option<(u32, usize)> {
+        out.clear();
+        let mut got = None;
+        super::latest_frame(&mut |b, s| {
+            if out.capacity() >= b.len() {
+                out.extend_from_slice(b);
+            }
+            got = Some((s, b.len()));
+        });
+        got
+    }
 }

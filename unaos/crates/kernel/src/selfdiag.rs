@@ -129,7 +129,7 @@ pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec
     if nr == una_abi::SYS_PATH_WRITE {
         crate::video::text::resident_forget(path); // LUMENFAST (B507): the file changes; the resident copy no longer stands for it
     }
-    let mt = crate::shell::vfs_mount_table();
+    #[cfg(feature = "sonde")] if nr == una_abi::SYS_PATH_READ && path == crate::sonde::DEPTH0_PATH { return crate::sonde::depth0_read(off, cap); } let mt = crate::shell::vfs_mount_table(); // SONDE2 (SR105): the published depth frame, read by name before any volume walk
     if nr == una_abi::SYS_PATH_READ {
         if !data.is_empty() {
             return Err(una_abi::EINVAL);
