@@ -17,6 +17,7 @@ pub fn init(vm: &mut Vm) {
     let tst = PropertyKey::Sym(vm.wk.to_string_tag.clone());
     accessor(vm, ip, tst, "[Symbol.toStringTag]", Some(tag_get), Some(tag_set), C);
     method(vm, c, "from", 1, iterator_from);
+    method(vm, c, "concat", 0, iterator_concat);
     for (n, l, f) in [
         ("map", 1, map as NativeFn),
         ("filter", 1, filter),
@@ -211,6 +212,31 @@ fn make_helper(vm: &mut Vm, kind: u8, it: Value, next: Value, func: Value, remai
         Kind::Iterator(Box::new(IterData::Helper(Box::new(HelperData { kind, iter: it, next, func, counter: 0.0, remaining, inner: None, state: 0, buf: Vec::new() })))),
     ));
     Value::Object(h)
+}
+
+/// Iterator.concat(...items) (ES2026 §27.1.2.1): an Iterator Helper (kind 7) over each iterable in turn; the
+/// (iterable, @@iterator method) pairs wait in `buf`, `counter` is the next pair, `inner` the open iterator.
+fn iterator_concat(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let args = vm.args(ctx);
+    let mut buf = Vec::with_capacity(args.len() * 2);
+    let ik = PropertyKey::Sym(vm.wk.iterator.clone());
+    for item in args {
+        if !item.is_object() {
+            return vm.throw_type("Iterator.concat: every argument must be an object");
+        }
+        match vm.get_method(&item, &ik)? {
+            Some(m) => {
+                buf.push(item);
+                buf.push(m);
+            }
+            None => return vm.throw_type("Iterator.concat: argument is not iterable"),
+        }
+    }
+    let h = make_helper(vm, 7, Value::Undefined, Value::Undefined, Value::Undefined, 0.0);
+    if let Value::Object(o) = h {
+        with_helper(vm, o, |hd| hd.buf = buf);
+    }
+    Ok(h)
 }
 
 fn map(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -414,6 +440,27 @@ fn helper_step(vm: &mut Vm, o: Obj) -> JsResult<Option<Value>> {
                 }
             }
         }
+        7 => loop {
+            let inner = with_helper(vm, o, |h| h.inner.clone());
+            if let Some((ii, inext)) = inner {
+                match vm.iterator_step_value(&ii, &inext)? {
+                    Some(v) => return Ok(Some(v)),
+                    None => {
+                        with_helper(vm, o, |h| h.inner = None);
+                        continue;
+                    }
+                }
+            }
+            let idx = with_helper(vm, o, |h| h.counter as usize);
+            let pair = with_helper(vm, o, |h| if idx * 2 + 1 < h.buf.len() { Some((h.buf[idx * 2].clone(), h.buf[idx * 2 + 1].clone())) } else { None });
+            let (iterable, m) = match pair {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            with_helper(vm, o, |h| h.counter += 1.0);
+            let pair = vm.get_iterator_from_method(&iterable, &m)?;
+            with_helper(vm, o, |h| h.inner = Some(pair));
+        },
         _ => loop {
             let inner = with_helper(vm, o, |h| h.inner.clone());
             if let Some((ii, inext)) = inner {
@@ -457,6 +504,13 @@ fn helper_return(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         return Ok(Value::Object(vm.iter_result(Value::Undefined, true)));
     }
     with_helper(vm, o, |h| h.state = 2);
+    if with_helper(vm, o, |h| h.kind) == 7 {
+        // Iterator.concat: only the open inner iterator (if any) is closed.
+        if let Some((ii, _)) = inner {
+            vm.iterator_close(&ii)?;
+        }
+        return Ok(Value::Object(vm.iter_result(Value::Undefined, true)));
+    }
     if let Some((ii, _)) = inner {
         let r = vm.iterator_close(&ii);
         if let Err(e) = r {

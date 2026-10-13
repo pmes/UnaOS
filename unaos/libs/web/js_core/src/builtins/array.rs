@@ -994,8 +994,10 @@ fn splice(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Object(a))
 }
 
+/// Array.prototype.toLocaleString (ECMA-402 §19.5.1: each element's toLocaleString gets locales, options).
 fn to_locale_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let (o, len) = this_len(vm, ctx)?;
+    let la = [vm.arg(ctx, 0), vm.arg(ctx, 1)];
     let mut out: Vec<u16> = Vec::new();
     let mut k = 0.0;
     while k < len {
@@ -1004,7 +1006,7 @@ fn to_locale_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
         let v = vm.get(o, &key_of(k))?;
         if !v.is_nullish() {
-            let r = vm.invoke(&v, &PropertyKey::from_str("toLocaleString"), &[])?;
+            let r = vm.invoke(&v, &PropertyKey::from_str("toLocaleString"), &la)?;
             let s = vm.to_string(&r)?;
             out.extend_from_slice(s.units());
         }

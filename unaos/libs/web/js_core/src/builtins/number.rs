@@ -90,9 +90,12 @@ fn to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::String(JsStr::from_str(&numconv::f64_to_radix_string(x, radix as u32))))
 }
 
+/// Number.prototype.toLocaleString (ECMA-402 §19.2.1): Intl.NumberFormat with the arguments.
 fn to_locale_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let x = this_num(vm, &ctx.this)?;
-    Ok(Value::String(crate::vm::ops::number_to_jsstr(x)))
+    let l = vm.arg(ctx, 0);
+    let o = vm.arg(ctx, 1);
+    crate::builtins::intl::number::to_locale_string(vm, crate::builtins::intl::number::mv_of(x), &l, &o)
 }
 
 fn value_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {

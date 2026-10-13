@@ -198,9 +198,9 @@ pub fn init(vm: &mut Vm) {
         ("toDateString", 0, to_date_string as NativeFn),
         ("toISOString", 0, to_iso_string),
         ("toJSON", 1, to_json),
-        ("toLocaleDateString", 0, to_date_string),
-        ("toLocaleString", 0, to_string),
-        ("toLocaleTimeString", 0, to_time_string),
+        ("toLocaleDateString", 0, to_locale_date_string),
+        ("toLocaleString", 0, to_locale_string),
+        ("toLocaleTimeString", 0, to_locale_time_string),
         ("toString", 0, to_string),
         ("toTimeString", 0, to_time_string),
     ] {
@@ -879,3 +879,21 @@ pub fn parse_date(vm: &mut Vm, s: &JsStr) -> f64 {
 }
 
 use alloc::string::String;
+
+// ================================================================================================ ECMA-402 §20.4
+
+fn locale_impl(vm: &mut Vm, ctx: &CallCtx, required: &str, defaults: &str) -> JsResult<Value> {
+    let t = this_tv(vm, ctx)?;
+    let l = vm.arg(ctx, 0);
+    let o = vm.arg(ctx, 1);
+    crate::builtins::intl::datetime::date_to_locale(vm, t, &l, &o, required, defaults)
+}
+fn to_locale_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    locale_impl(vm, ctx, "any", "all")
+}
+fn to_locale_date_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    locale_impl(vm, ctx, "date", "date")
+}
+fn to_locale_time_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    locale_impl(vm, ctx, "time", "time")
+}

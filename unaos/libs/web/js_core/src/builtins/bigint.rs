@@ -376,9 +376,14 @@ fn to_string_m(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     Ok(Value::String(JsStr::from_str(&to_string_radix(&b, radix as u32))))
 }
+/// BigInt.prototype.toLocaleString (ECMA-402 §19.3.1).
 fn to_locale_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let b = this_bigint(vm, &ctx.this)?;
-    Ok(Value::String(JsStr::from_str(&to_string_radix(&b, 10))))
+    let digits = if b.mag.is_zero() { Vec::new() } else { b.mag.to_string_radix(10) };
+    let mv = crate::builtins::intl::number::Mv::Fin(crate::builtins::intl::number::Dec::from_digits(b.neg, digits, 0));
+    let l = vm.arg(ctx, 0);
+    let o = vm.arg(ctx, 1);
+    crate::builtins::intl::number::to_locale_string(vm, mv, &l, &o)
 }
 fn value_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::BigInt(this_bigint(vm, &ctx.this)?))
