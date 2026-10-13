@@ -20,7 +20,8 @@
 //! so `tls_core` never holds a whole record the `peek` cannot see. A burst of requests to an origin whose
 //! connection is still handshaking WAITS for it (coalescing): if ALPN says `h2` they all become its streams,
 //! otherwise each gets its own HTTP/1.1 connection as before. GOAWAY / REFUSED_STREAM: unprocessed streams are
-//! retried on a new connection; `Alt-Svc` is ignored.
+//! retried on a new connection; `Alt-Svc` is ignored. A gzip/deflate body on an h2 stream is decoded as it
+//! arrives on a decoder thread of its own ([`DecodeSink`], NETDEBT SR97).
 //!
 //! Trust: `AgentConfig::trust`, else `$SSL_CERT_FILE` (the convention OpenSSL, curl and rustls-native follow),
 //! else UnaOS's staged Mozilla bundle `system/trust/roots.pem` when present, else the distribution bundle.
@@ -1435,17 +1436,63 @@ fn exchange<T: Transport>(conn: &mut Conn<T>, key: &PoolKey, mut job: Job, reuse
 /// How long the h2 loop waits for socket bytes before it looks at its job channel again.
 pub const MUX_POLL: Duration = Duration::from_millis(20);
 
-/// A content-coded body on a multiplexed stream is gathered and decoded at END_STREAM (the inflater pulls,
-/// and one stream must not hold the connection); beyond this it fails.
-const MUX_CODED_CAP: usize = 256 << 20;
-
 /// One request in flight as an h2 stream.
 struct MuxStream {
     job: Job,
     head: bool,
     /// A followed redirect: its body is read and dropped.
     drain: bool,
-    coded: Option<(Vec<Coding>, Vec<u8>)>,
+}
+
+/// NETDEBT (SR97): a content-coded body on a multiplexed stream is decoded AS IT ARRIVES, on a thread of its
+/// own — pixel_core's inflater PULLS its input, and a pull that waited on the socket would hold every other
+/// stream of the connection. The stream's sink is swapped for a [`DecodeSink`] after its head went out: DATA
+/// chunks and the End are FED to the decoder thread, which owns the real sink and sends it decoded `Data`
+/// (16 KiB batches, as HTTP/1.1's `deliver`) and then the End. Nothing is gathered to END_STREAM any more.
+enum Feed {
+    Chunk(Vec<u8>),
+    End(Result<(), Error>),
+}
+
+/// Coded chunks queued for a decoder that has not taken them yet (a slow reader slows its own stream only:
+/// see `pump`).
+const DECODE_FEED_DEPTH: usize = 16;
+
+/// The sink side of a decoder thread (the connection thread holds it in the stream's `Job`).
+struct DecodeSink {
+    feed: SyncSender<Feed>,
+}
+
+impl EventSink for DecodeSink {
+    fn send(&mut self, ev: Event) -> bool {
+        match ev {
+            Event::Data(d) => self.feed.send(Feed::Chunk(d)).is_ok(),
+            Event::End(r) => self.feed.send(Feed::End(r)).is_ok(),
+            Event::Head(_) => true, // the head went to the real sink before the swap
+        }
+    }
+}
+
+/// Start a decoder for `coding` that delivers to `sink` (dropped with the closure if the thread cannot start).
+fn spawn_decoder(sink: Box<dyn EventSink>, coding: Coding) -> Result<DecodeSink, ()> {
+    let (tx, rx) = mpsc::sync_channel::<Feed>(DECODE_FEED_DEPTH);
+    std::thread::Builder::new()
+        .name("http-h2-decode".into())
+        .spawn(move || {
+            let mut sink = sink;
+            let mut pull = || match rx.recv() {
+                Ok(Feed::Chunk(d)) => Ok(Some(d)),
+                Ok(Feed::End(Ok(()))) => Ok(None),
+                Ok(Feed::End(Err(e))) => Err(e),
+                Err(_) => Err(Error::Io("h2: stream abandoned mid-body".into())),
+            };
+            // `None`: the reader went away; dropping `rx` makes the stream's next feed fail (→ cancelled).
+            if let Some(end) = decode_into(&mut *sink, &coding, &mut pull) {
+                sink.send(Event::End(end));
+            }
+        })
+        .map(|_| DecodeSink { feed: tx })
+        .map_err(|_| ())
 }
 
 enum Pump {
@@ -1487,6 +1534,7 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
             Err(e) => return Pump::Done(Err(e)),
             Ok(Some((status, headers))) => {
                 let mut rhead = ResponseHead { version: (2, 0), status, reason: String::new(), headers };
+                let mut coded: Option<Coding> = None;
                 if m.job.discard_redirect_body && redirect::is_redirect(status) && rhead.headers.contains("location") {
                     m.drain = true;
                 } else if m.job.decode {
@@ -1494,12 +1542,20 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
                     if codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate) {
                         rhead.headers.remove("content-encoding");
                         rhead.headers.remove("content-length");
-                        m.coded = Some((codings, Vec::new()));
+                        coded = Some(codings[0].clone());
                     }
                 }
                 m.head = true;
                 if !m.job.sink.send(Event::Head(rhead)) {
                     return Pump::Gone;
+                }
+                if let Some(coding) = coded {
+                    // The decoder takes the real sink; the stream feeds it from here on.
+                    let real = core::mem::replace(&mut m.job.sink, Box::new(DecodeSink { feed: mpsc::sync_channel(0).0 }));
+                    match spawn_decoder(real, coding) {
+                        Ok(d) => m.job.sink = Box::new(d),
+                        Err(()) => return Pump::Done(Err(Error::Io("h2: cannot start the body decoder".into()))),
+                    }
                 }
             }
         }
@@ -1508,30 +1564,9 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
         match h2c.try_data(sid) {
             Err(e) => return Pump::Done(Err(e)),
             Ok(DataPoll::Pending) => return Pump::Pending,
-            Ok(DataPoll::End) => {
-                if let Some((codings, buf)) = m.coded.take() {
-                    match encoding::decode(&codings, &buf) {
-                        Ok(d) => {
-                            for c in d.chunks(16 * 1024) {
-                                if !m.job.sink.send(Event::Data(c.to_vec())) {
-                                    return Pump::Gone;
-                                }
-                            }
-                        }
-                        Err(e) => return Pump::Done(Err(Error::Decode(e))),
-                    }
-                }
-                return Pump::Done(Ok(()));
-            }
+            Ok(DataPoll::End) => return Pump::Done(Ok(())),
             Ok(DataPoll::Chunk(d)) => {
                 if m.drain {
-                    continue;
-                }
-                if let Some((_, buf)) = &mut m.coded {
-                    buf.extend_from_slice(&d);
-                    if buf.len() > MUX_CODED_CAP {
-                        return Pump::Done(Err(Error::Io("h2: content-coded body too large to decode".into())));
-                    }
                     continue;
                 }
                 if !m.job.sink.send(Event::Data(d)) {
@@ -1586,7 +1621,7 @@ fn serve_h2(inner: &Arc<Inner>, key: &PoolKey, id: u64, first: Job, h2c: &mut cr
             let authority = job.url.host_str();
             match h2c.send_request(&job.method, &key.scheme, &authority, &job.url.request_target(), &job.headers, &body) {
                 Ok(sid) => {
-                    active.insert(sid, MuxStream { job, head: false, drain: false, coded: None });
+                    active.insert(sid, MuxStream { job, head: false, drain: false });
                 }
                 Err(e) => {
                     // The connection cannot carry it (write failed, GOAWAY): a job on a connection that
@@ -1738,6 +1773,32 @@ fn finish(job: Job, end: Option<Result<(), Error>>, reusable: bool) -> Outcome {
     Outcome::Closed
 }
 
+/// Decode `coding` from the body chunks `pull` yields into `sink` as `Data` events, AS THEY ARRIVE, then consume
+/// whatever framing remains (the chunked terminator, trailers, END_STREAM). The result is the End to deliver;
+/// `None` when the receiver went away.
+fn decode_into(sink: &mut dyn EventSink, coding: &Coding, pull: &mut dyn FnMut() -> Result<Option<Vec<u8>>, Error>) -> Option<Result<(), Error>> {
+    let mut cs = ChunkSink { sink, buf: Vec::new(), gone: false };
+    let mut src = PullSource { pull: &mut *pull, chunk: Vec::new(), pos: 0, error: None, done: false };
+    let r = encoding::decode_stream(coding, &mut src, &mut cs);
+    let (src_err, src_done) = (src.error.take(), src.done);
+    cs.flush();
+    if cs.gone {
+        return None;
+    }
+    Some(match (src_err, r) {
+        (Some(e), _) => Err(e),
+        (None, Err(e)) => Err(Error::Decode(e)),
+        (None, Ok(_)) if src_done => Ok(()),
+        (None, Ok(_)) => loop {
+            match pull() {
+                Ok(Some(_)) => {}
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        },
+    })
+}
+
 /// Returns (consumed cleanly to the end, the End result still to deliver — `None` when the receiver is gone).
 fn deliver(job: &mut Job, mut rhead: ResponseHead, small_redirect: bool, pull: &mut dyn FnMut() -> Result<Option<Vec<u8>>, Error>) -> (bool, Option<Result<(), Error>>) {
     // A followed redirect: drain (small) bodies so the connection stays usable.
@@ -1774,28 +1835,9 @@ fn deliver(job: &mut Job, mut rhead: ResponseHead, small_redirect: bool, pull: &
         return (false, None);
     }
     let result: Result<(), Error> = if decodable {
-        let mut cs = ChunkSink { sink: &mut *job.sink, buf: Vec::new(), gone: false };
-        let mut src = PullSource { pull: &mut *pull, chunk: Vec::new(), pos: 0, error: None, done: false };
-        let r = encoding::decode_stream(&codings[0], &mut src, &mut cs);
-        let (src_err, src_done) = (src.error.take(), src.done);
-        cs.flush();
-        if cs.gone {
-            return (false, None);
-        }
-        match (src_err, r) {
-            (Some(e), _) => Err(e),
-            (None, Err(e)) => Err(Error::Decode(e)),
-            (None, Ok(_)) if src_done => Ok(()),
-            (None, Ok(_)) => {
-                // Consume whatever framing remains (the chunked terminator, trailers, END_STREAM).
-                loop {
-                    match pull() {
-                        Ok(Some(_)) => {}
-                        Ok(None) => break Ok(()),
-                        Err(e) => break Err(e),
-                    }
-                }
-            }
+        match decode_into(&mut *job.sink, &codings[0], pull) {
+            Some(r) => r,
+            None => return (false, None),
         }
     } else {
         loop {
