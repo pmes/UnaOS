@@ -16,6 +16,8 @@
 //! | [`cabac`]         | 9.3 CABAC: context init, arithmetic decoding engine, residual blocks |
 //! | [`cavlc`]         | 9.2 CAVLC residual blocks                                            |
 //! | [`ps`]            | 7.3.2 SPS / PPS (+ VUI E.1), scaling lists, 7.3.3 slice header       |
+//! | [`picture`]       | decoded frames, motion field, per-macroblock neighbour facts         |
+//! | [`mb`]            | 7.3.5 macroblock layer, 9.3.3.1 CABAC contexts, 9.2.1 nC             |
 //! | [`tables`]        | generated constant tables (tools/gen_tables.py)                      |
 
 #![no_std]
@@ -32,7 +34,9 @@ extern crate std;
 pub mod bits;
 pub mod cabac;
 pub mod cavlc;
+pub mod mb;
 pub mod nal;
+pub mod picture;
 pub mod ps;
 pub mod tables;
 

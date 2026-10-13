@@ -67,6 +67,11 @@ impl<'a> Cabac<'a> {
         }
     }
 
+    /// The slice data the engine reads (for the I_PCM samples).
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// Bit position of the next unread bit.
     pub fn pos(&self) -> usize {
         self.pos
