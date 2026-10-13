@@ -22,10 +22,9 @@ pub mod zoom;
 pub mod host;
 
 // AETHERDEVTOOLS (SR112): the developer-tools pane. It READS the engine (std, thread-local page state), so
-// like `host` it is not part of the std-free model; its files live in `src/devtools/`, declared from here
-// because this arc's brief owns the chrome and not `lib.rs` (`crate::chrome::devtools`).
-#[path = "../devtools/mod.rs"]
-pub mod devtools;
+// like `host` it is not part of the std-free model: it is the crate's own `devtools` module (lib.rs), and
+// this re-export keeps the `chrome::devtools` path the host frame call and the faces name.
+pub use crate::devtools;
 
 /// Where the developer-tools pane sits in the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

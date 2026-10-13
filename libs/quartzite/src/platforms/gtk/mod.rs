@@ -213,6 +213,8 @@ pub mod tab_strip;
 pub mod url_bar;
 // REALSENSE (SR92, R112): Sonde's GTK face — the probe pane (depth ramp beside colour) as surface + input + resize.
 pub mod probe_view;
+// AETHERDEVTOOLS2 (SR112): the developer-tools pane's face — the split beside the page, the splitter, the dock pref.
+pub mod devtools_view;
 
 /// AETHERCHROME (SR84): the Aether browser window — the tab strip, the address row with the bookmark
 /// bar, and the page with its find bar / status line / downloads overlays — and the browser's keyboard
@@ -226,9 +228,11 @@ pub fn bootstrap_browser_chrome(window: &gtk4::ApplicationWindow, synapse: bandy
     let strip = tab_strip::bootstrap_tab_strip(synapse.clone());
     let bar = url_bar::bootstrap_url_bar(synapse.clone());
     let page = image_view::bootstrap_page_view("viewport", synapse.clone());
+    // AETHERDEVTOOLS2 (SR112): the page sits in the developer-tools split (the pane hidden until F12).
+    let devtools = devtools_view::bootstrap_devtools(synapse.clone(), &page.root);
     root.append(&strip);
     root.append(&bar.root);
-    root.append(&page.root);
+    root.append(&devtools.root);
 
     let shortcuts = ShortcutController::new();
     shortcuts.set_propagation_phase(PropagationPhase::Capture);
@@ -264,6 +268,11 @@ pub fn bootstrap_browser_chrome(window: &gtk4::ApplicationWindow, synapse: bandy
         ("<Control>KP_Subtract", SMessage::BrowserZoom(-1)),
         ("<Control>0", SMessage::BrowserZoom(0)),
         ("<Control>KP_0", SMessage::BrowserZoom(0)),
+        // AETHERDEVTOOLS2 (SR112): the developer-tools toggle, taken here in the capture phase so the page
+        // never sees it; the shell's `DevtoolsChrome::on_key` decides what it does.
+        ("F12", SMessage::BrowserDevtoolsKey { key: "F12".into(), ctrl: false, shift: false, alt: false }),
+        ("<Control><Shift>i", SMessage::BrowserDevtoolsKey { key: "I".into(), ctrl: true, shift: true, alt: false }),
+        ("<Control><Shift>I", SMessage::BrowserDevtoolsKey { key: "I".into(), ctrl: true, shift: true, alt: false }),
     ] {
         add(trigger, send(msg));
     }

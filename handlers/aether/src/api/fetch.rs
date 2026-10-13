@@ -28,6 +28,152 @@ pub fn reset_budget() {}
 /// `js::net::install` (after the platform prelude, which they supersede).
 pub fn init(_vm: &mut js_core::vm::Vm) {}
 
+// ── AETHERDEVTOOLS2 (SR112): the script request log ─────────────────────────────────────────────────
+//
+// The Network panel's rows for requests SCRIPT made. The document's own loads are found from the DOM and
+// the HTTP cache (`devtools::network`), but a `fetch()` / XHR whose answer left no cache entry (`no-store`,
+// a POST, an opaque answer, a failure) left nothing to find. Every page-made exchange that goes through
+// [`spawn_http`] (fetch, asynchronous XHR) or [`http_sync`] (synchronous XHR, an iframe's document, a
+// worker's `importScripts`) is recorded here as it happens: begun on the page thread with the page's URL
+// (`RequestContext::client_url`), its status / Content-Type at the head, its bytes per chunk, its time and
+// error at the end. Engine-internal requests (no page) are not recorded. Process-wide (the exchange runs
+// on its own thread), bounded to [`REQUEST_LOG_CAP`] rows, oldest dropped first.
+
+/// One script request as the log holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptRequest {
+    /// The log's ordinal (increasing over the process).
+    pub id: u64,
+    /// The URL of the page that made it (`RequestContext::client_url`).
+    pub page: String,
+    pub method: String,
+    pub url: String,
+    /// `false`: fetch / asynchronous XHR ([`spawn_http`]); `true`: a synchronous exchange ([`http_sync`]).
+    pub sync: bool,
+    /// The status the page saw (0 for an opaque answer); None until the head arrives.
+    pub status: Option<u16>,
+    /// The answer's `Content-Type` as the page may see it.
+    pub mime: Option<String>,
+    /// Body bytes received so far.
+    pub size: usize,
+    /// Wall time from the request to its end, in ms; None while it runs.
+    pub time_ms: Option<u64>,
+    /// The exchange finished (answered, failed or abandoned).
+    pub done: bool,
+    /// Why it failed (a refusal, a network error, `cancelled`).
+    pub error: Option<String>,
+}
+
+/// Rows the request log keeps.
+pub const REQUEST_LOG_CAP: usize = 256;
+
+struct LogRow {
+    req: ScriptRequest,
+    started: std::time::Instant,
+}
+
+fn request_log_store() -> &'static std::sync::Mutex<(u64, std::collections::VecDeque<LogRow>)> {
+    static LOG: std::sync::OnceLock<std::sync::Mutex<(u64, std::collections::VecDeque<LogRow>)>> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| std::sync::Mutex::new((0, std::collections::VecDeque::new())))
+}
+
+fn log_edit(id: u64, f: impl FnOnce(&mut LogRow)) {
+    if let Ok(mut g) = request_log_store().lock() {
+        if let Some(row) = g.1.iter_mut().find(|r| r.req.id == id) {
+            f(row);
+        }
+    }
+}
+
+/// One exchange's handle on its log row: records the head, the bytes and the end; a row its exchange
+/// dropped without an end (the page went away, the reader cancelled) ends as `cancelled`.
+struct LogGuard(Option<u64>);
+
+impl LogGuard {
+    /// Begin a row for a request the page `ctx` made (none for an engine-internal request).
+    fn begin(ctx: &crate::security::RequestContext, method: &str, url: &str, sync: bool) -> LogGuard {
+        if !ctx.has_page {
+            return LogGuard(None);
+        }
+        let Ok(mut g) = request_log_store().lock() else { return LogGuard(None) };
+        g.0 += 1;
+        let id = g.0;
+        if g.1.len() == REQUEST_LOG_CAP {
+            g.1.pop_front();
+        }
+        g.1.push_back(LogRow {
+            req: ScriptRequest {
+                id,
+                page: ctx.client_url.clone(),
+                method: method.to_ascii_uppercase(),
+                url: url.to_string(),
+                sync,
+                status: None,
+                mime: None,
+                size: 0,
+                time_ms: None,
+                done: false,
+                error: None,
+            },
+            started: std::time::Instant::now(),
+        });
+        LogGuard(Some(id))
+    }
+
+    /// The head: the status and the visible fields (`(name, value)`, any case).
+    fn head(&self, status: u16, headers: &[(String, String)]) {
+        if let Some(id) = self.0 {
+            let mime = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.clone());
+            log_edit(id, |r| {
+                r.req.status = Some(status);
+                r.req.mime = mime;
+            });
+        }
+    }
+
+    fn bytes(&self, n: usize) {
+        if let Some(id) = self.0 {
+            log_edit(id, |r| r.req.size += n);
+        }
+    }
+
+    /// The end: answered (`None`) or failed with `error`.
+    fn finish(&mut self, error: Option<&str>) {
+        if let Some(id) = self.0.take() {
+            log_edit(id, |r| {
+                r.req.done = true;
+                r.req.time_ms = Some(r.started.elapsed().as_millis() as u64);
+                r.req.error = error.map(str::to_string);
+            });
+        }
+    }
+}
+
+impl Drop for LogGuard {
+    fn drop(&mut self) {
+        self.finish(Some("cancelled"));
+    }
+}
+
+/// The script requests page `page` made, oldest first (a fragment on either side is ignored).
+pub fn request_log(page: &str) -> Vec<ScriptRequest> {
+    let bare = |u: &str| u.split('#').next().unwrap_or(u).to_string();
+    let want = bare(page);
+    request_log_store()
+        .lock()
+        .map(|g| g.1.iter().filter(|r| bare(&r.req.page) == want).map(|r| r.req.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Forget the rows of page `page` (the Network panel's Clear).
+pub fn clear_request_log(page: &str) {
+    let bare = |u: &str| u.split('#').next().unwrap_or(u).to_string();
+    let want = bare(page);
+    if let Ok(mut g) = request_log_store().lock() {
+        g.1.retain(|r| bare(&r.req.page) != want);
+    }
+}
+
 /// One request as the page built it.
 pub struct HttpReq {
     pub method: String,
@@ -240,9 +386,11 @@ pub fn policed_send(req: &HttpReq, ctx: &crate::security::RequestContext) -> Res
 /// only after Subresource Integrity passes.
 pub fn spawn_http(mut req: HttpReq, p: Poster) {
     let ctx = crate::security::RequestContext::capture(&mut req.headers);
+    let mut log = LogGuard::begin(&ctx, &req.method, &req.url, false);
     match ctx.precheck(&req.url, &req.method) {
         Ok(u) => req.url = u,
         Err(e) => {
+            log.finish(Some(&e));
             p.finish("error", vec![NetArg::Str(e)]);
             return;
         }
@@ -265,6 +413,8 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
                         "cors" => "cors",
                         _ => "basic",
                     };
+                    log.head(if opaque { 0 } else { r.status }, if opaque { &[][..] } else { &r.headers[..] });
+                    log.bytes(if opaque { 0 } else { r.body.len() });
                     let head = vec![
                         NetArg::Num(if opaque { 0.0 } else { r.status as f64 }),
                         NetArg::Str(if opaque { String::new() } else { r.status_text }),
@@ -274,11 +424,13 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
                         NetArg::Str(kind.into()),
                     ];
                     if p.post("head", head) && (opaque || r.body.is_empty() || p.post("data", vec![NetArg::Bytes(r.body)])) {
+                        log.finish(None);
                         p.finish("end", vec![]);
                     }
                     return;
                 }
                 SwAnswer::Error(e) => {
+                    log.finish(Some(&e));
                     crate::ledger::record_js(&format!("sw-network-error:{}", crate::js::clip(&req.url, 48)));
                     p.finish("error", vec![NetArg::Str(e)]);
                     return;
@@ -289,6 +441,7 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
         let ex = match policed_send(&req, &ctx) {
             Ok(r) => r,
             Err(e) => {
+                log.finish(Some(&e));
                 crate::ledger::record_js(&format!("fetch-failed:{}", crate::js::clip(&req.url, 48)));
                 p.finish("error", vec![NetArg::Str(e)]);
                 return;
@@ -297,6 +450,7 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
         let Exchange { mut resp, kind, headers, url, redirected } = ex;
         let opaque = kind == "opaque";
         let st = if opaque { 0 } else { resp.status().as_u16() };
+        log.head(st, &headers);
         let head = vec![
             NetArg::Num(st as f64),
             NetArg::Str(if opaque { String::new() } else { resp.reason().to_string() }),
@@ -310,14 +464,17 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
             loop {
                 match resp.chunk() {
                     Ok(Some(c)) => {
+                        log.bytes(c.len());
                         body.extend_from_slice(&c);
                         if body.len() > SYNC_BODY_CAP {
+                            log.finish(Some("integrity-checked body larger than 64 MiB"));
                             p.finish("error", vec![NetArg::Str("integrity-checked body larger than 64 MiB".into())]);
                             return;
                         }
                     }
                     Ok(None) => break,
                     Err(e) => {
+                        log.finish(Some(&e.to_string()));
                         p.finish("error", vec![NetArg::Str(e.to_string())]);
                         return;
                     }
@@ -325,6 +482,7 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
             }
             if let Err(e) = crate::security::sri::check(&ctx.integrity, &body, !opaque) {
                 let msg = format!("Failed to find a valid digest in the 'integrity' attribute for resource '{url}': {e}. The resource has been blocked.");
+                log.finish(Some(&msg));
                 p.finish("error", vec![NetArg::Str(crate::security::refusal("sri", &url, &msg, None))]);
                 return;
             }
@@ -334,6 +492,7 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
             if !opaque && !body.is_empty() && !p.post("data", vec![NetArg::Bytes(body)]) {
                 return;
             }
+            log.finish(None);
             p.finish("end", vec![]);
             return;
         }
@@ -341,6 +500,7 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
             return;
         }
         if opaque {
+            log.finish(None);
             p.finish("end", vec![]);
             return;
         }
@@ -353,15 +513,18 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
                     if c.is_empty() {
                         continue;
                     }
+                    log.bytes(c.len());
                     if !p.post("data", vec![NetArg::Bytes(c)]) {
                         return;
                     }
                 }
                 Ok(None) => {
+                    log.finish(None);
                     p.finish("end", vec![]);
                     return;
                 }
                 Err(e) => {
+                    log.finish(Some(&e.to_string()));
                     p.finish("error", vec![NetArg::Str(e.to_string())]);
                     return;
                 }
@@ -384,7 +547,14 @@ pub struct SyncResponse {
 /// and the worker's refusals are replayed into the page's ledger after the join.
 pub fn http_sync(mut req: HttpReq) -> Result<SyncResponse, String> {
     let ctx = crate::security::RequestContext::capture(&mut req.headers);
-    req.url = ctx.precheck(&req.url, &req.method)?;
+    let mut log = LogGuard::begin(&ctx, &req.method, &req.url, true);
+    req.url = match ctx.precheck(&req.url, &req.method) {
+        Ok(u) => u,
+        Err(e) => {
+            log.finish(Some(&e));
+            return Err(e);
+        }
+    };
     let r = std::thread::spawn(move || -> Result<SyncResponse, String> {
         let ex = policed_send(&req, &ctx)?;
         let Exchange { mut resp, kind, headers, url, .. } = ex;
@@ -409,8 +579,24 @@ pub fn http_sync(mut req: HttpReq) -> Result<SyncResponse, String> {
         })
     })
     .join()
-    .map_err(|_| "fetch thread panicked".to_string())?;
+    .map_err(|_| "fetch thread panicked".to_string());
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            log.finish(Some(&e));
+            return Err(e);
+        }
+    };
     crate::security::drain();
+    match &r {
+        Ok(s) => {
+            let fields: Vec<(String, String)> = s.headers.chunks(2).filter(|kv| kv.len() == 2).map(|kv| (kv[0].clone(), kv[1].clone())).collect();
+            log.head(s.status, &fields);
+            log.bytes(s.body.len());
+            log.finish(None);
+        }
+        Err(e) => log.finish(Some(e)),
+    }
     r
 }
 
