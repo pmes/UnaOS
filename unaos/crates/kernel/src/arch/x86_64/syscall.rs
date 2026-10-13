@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), // RING3PIPE (B562): the launcher's read of its child's console, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), una_abi::SYS_PIPE_WRITE => sys_pipe_write(a0, a1, a2), una_abi::SYS_KILL => sys_kill(a0), // SHELLABI (B565): the launcher's write into its child's input ring and its kill of that child, bodies at the FILE TAIL (same-line fold). RING3PIPE (B562): the launcher's read of its child's console, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1, a2), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -5843,7 +5843,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     crate::wedge2::mark("<F1>");
     let mut ring: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = focus_ring_apps(&mut ring);
-    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire); if wc_tab_to_app(cur, down) { return false; } // SHELLABI (B565): a bare Tab while a LIVE ring-3 program holds the keys is that program's key — returned undelivered so the router hands it (and its release) to the focused ring; `[wc] tab -> app pid=…`, fn at this file's tail. The cycle stays on Alt/Cmd+Tab (`CycleWindow`, above) and on the shell. ⚠ LINE-NEUTRAL append.
     if cur == 0 && n == 0 {
         return false; // shell, no windows — TAB stays an ordinary key and reaches the console
     }
@@ -5890,7 +5890,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
         drag_settle_disarm();
     }
     // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
-    crate::wedge2::mark("<F2>");
+    crate::wedge2::mark("<F2>"); serial_println!("[wc] tab -> cycle cur={} next={} ring={}", cur, next, n); // SHELLABI (B565): the shell (or a focus no live program holds) cycles, said beside `[wc-c]`. ⚠ LINE-NEUTRAL append.
     // Focus moves through the ONE primitive, so the cycle inherits what already hangs off it: the
     // incoming ring is reset, so a fresh focus starts clean.
     //
@@ -31281,4 +31281,135 @@ fn sys_pipe_read(pid: u64, buf: u64, len: u64) -> i64 {
             EACCES
         }
     }
+}
+
+// =================================================================================================
+// SHELLABI (rmbp-ledger B565) — this arch's half of una-abi's SHELLABI verbs: `SYS_PIPE_WRITE` (71) and `SYS_KILL`
+// (72) over RING3PIPE's table, and the bare-Tab route `wc_focus_key` asks. TAIL-APPENDED; above this block the arc
+// is same-line folds only: the dispatch arm (beside SYS_PIPE_READ) and two folds in `wc_focus_key` (the app route
+// on the `cur` line, the `[wc] tab -> cycle` line beside `<F2>`).
+//
+// * PARENTHOOD IS THE PIPE. `crate::pipe::read(row, gen, pid, &mut [], …)` is RING3PIPE's own zero-length read: it
+//   answers before anything is taken or closed (pipe.rs `read`: `out.is_empty()` -> `Dropped`), so it is a side-
+//   effect-free probe — `Dropped(_)` = pid names a live pipe THIS launcher holds, `NotYours` = another program's,
+//   `NoPipe` = none. No second table, no new key: the capability `SYS_PIPE_READ` checks is the one these check.
+// * THE CHILD'S SLOT is found by pid in PROCS (`slot + 1`, PRUNNING only — the reverse of `appquit_pid`); the pid
+//   is the scheduler's task id, so a recycled slot is never mistaken for the child. Not running = exited (-EPIPE /
+//   the kill refused `exited`); the pipe itself stays until its launcher reads the EOF.
+// * THE INPUT LANE is the keyboard's: each byte is `input_ev_pack(INPUT_EV_KEY_DOWN, b)` — exactly what
+//   `pack_input` makes of `Event::Key(b)` — pushed by `user_input_push` into the child's ring, which its
+//   `SYS_INPUT_POLL` drains (and whose push wakes its `SYS_INPUT_WAIT` park). The ring is SPSC with the router as
+//   its producer, and the router produces only into the FOCUSED slot (`user_input_enqueue`), so a write while the
+//   child holds the focus is refused -EAGAIN (the operator's keys are its input then), and launcher writes are
+//   serialised by `PIPEW_LOCK`. A full ring takes what fits; the rest is the caller's to resend (no drop).
+// * THE KILL is `bg_kill` — the kernel shell's `kill`, the U3.5 kill switch every `SYS_SPAWN_PATH` child is
+//   registered with (`spawn_user_image_bg_inner`: `bg_kill_register`) — so the reap, the window retirement and the
+//   slot teardown (whose generation bump is the pipe's EOF) are the existing exit path, unchanged.
+// =================================================================================================
+
+/// SHELLABI: serialises the launchers' pushes into child rings (the router never pushes into an unfocused slot).
+static PIPEW_LOCK: SpinMutex<()> = SpinMutex::new(());
+
+/// SHELLABI: is `pid` a live pipe the caller `row` launched? `Ok(())`, or the errno and the refusal word.
+fn pipe_parent_of(row: usize, pid: u64) -> Result<(), (i64, &'static str)> {
+    use crate::pipe::Read;
+    match crate::pipe::read(row, pipe_gen(row), pid, &mut [], pipe_alive) {
+        Read::Dropped(_) => Ok(()),
+        Read::NotYours => Err((EACCES, "not-the-launcher")),
+        _ => Err((una_abi::ESRCH, "no-pipe")),
+    }
+}
+
+/// SHELLABI: the slot of the RUNNING process `pid` (PROCS stores `slot + 1`), or `None` once it has exited.
+fn pipe_child_slot(pid: u64) -> Option<usize> {
+    if pid == 0 {
+        return None;
+    }
+    for pi in 0..procs_rows() {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].pid.load(Ordering::Acquire) == pid {
+            return PROCS[pi].slot.load(Ordering::Acquire).checked_sub(1).filter(|&s| slot_in_range(s));
+        }
+    }
+    None
+}
+
+/// SHELLABI: `SYS_PIPE_WRITE(pid, buf, len)` — see una-abi's RING3PIPE/SHELLABI block. `len == 0` is end-of-input
+/// (one `KEY_EOT`); otherwise up to one ring's worth of bytes, each a KEY_DOWN into the child's ring.
+fn sys_pipe_write(pid: u64, buf: u64, len: u64) -> i64 {
+    let row = caller_row();
+    if let Err((e, why)) = pipe_parent_of(row, pid) {
+        let why = if e == una_abi::ESRCH { "no-pipe" } else { why };
+        serial_println!("[pipe] write pid={} row={} -> refused={}", pid, row, why);
+        return if e == una_abi::ESRCH { una_abi::ENOSYS } else { e };
+    }
+    let Some(slot) = pipe_child_slot(pid) else {
+        serial_println!("[pipe] write pid={} row={} -> refused=child-exited", pid, row);
+        return una_abi::EPIPE;
+    };
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == slot as u64 + 1 {
+        return EAGAIN; // the child holds the keyboard: its ring has the router as producer until focus moves
+    }
+    let n = (len as usize).min(INPUT_RING_CAP);
+    let mut k = [0u8; INPUT_RING_CAP];
+    if n > 0 {
+        if let Err(e) = copy_from_user(&mut k[..n], buf) {
+            return e;
+        }
+    }
+    let _g = PIPEW_LOCK.lock();
+    if n == 0 {
+        return if user_input_push(slot, una_abi::input_ev_pack(INPUT_EV_KEY_DOWN, una_abi::KEY_EOT as u64)) { 0 } else { EAGAIN };
+    }
+    let mut done = 0usize;
+    for &b in &k[..n] {
+        if !user_input_push(slot, una_abi::input_ev_pack(INPUT_EV_KEY_DOWN, b as u64)) {
+            break;
+        }
+        done += 1;
+    }
+    if done == 0 { EAGAIN } else { done as i64 }
+}
+
+/// SHELLABI: `SYS_KILL(pid)` — the caller's own SPAWN_PIPE child only (parenthood is the gate), killed and reaped
+/// through `bg_kill`. 0 on a kill (or an already-armed one); the refusal is named on the wire.
+fn sys_kill(pid: u64) -> i64 {
+    let row = caller_row();
+    if let Err((e, _)) = pipe_parent_of(row, pid) {
+        serial_println!("[kill] pid={} by={} -> refused=not-my-child", pid, row);
+        return e;
+    }
+    let Some(slot) = pipe_child_slot(pid) else {
+        serial_println!("[pipe] kill pid={} by={} -> refused=exited", pid, row);
+        return una_abi::ESRCH;
+    };
+    let said = bg_kill(pid, slot as u64);
+    if said.starts_with("killed") || said.starts_with("kill armed") || said.starts_with("already killed") {
+        serial_println!("[pipe] kill pid={} by={} -> ok ({})", pid, row, said);
+        0
+    } else {
+        serial_println!("[pipe] kill pid={} by={} -> refused=exited ({})", pid, row, said);
+        una_abi::ESRCH
+    }
+}
+
+/// SHELLABI: `wc_focus_key`'s bare-Tab route. `true` = the focused `cur` (`slot + 1`) is a LIVE ring-3 program, so
+/// the Tab (press and release) is its key: a live drag is still cancelled (Tab stays the operator's escape), then
+/// the caller returns it undelivered and the router queues it on that program's ring. `false` = the shell has the
+/// keys, or the focus names no running program (a dead or fixture slot): the cycle below runs, which is also the
+/// rescue of a focus left on a slot nobody drains.
+fn wc_tab_to_app(cur: u64, down: bool) -> bool {
+    if cur == 0 {
+        return false;
+    }
+    let Some(pid) = appquit_pid(cur) else {
+        return false;
+    };
+    if down {
+        if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
+            crate::video::wm::drag_cancel("focus-key");
+            drag_settle_disarm();
+        }
+        serial_println!("[wc] tab -> app pid={} owner={}", pid, cur);
+    }
+    true
 }

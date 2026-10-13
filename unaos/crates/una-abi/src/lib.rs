@@ -395,8 +395,8 @@ pub const INPUT_EV_TYPE_SHIFT: u32 = 48;
 /// Mask for the type field once shifted down.
 pub const INPUT_EV_TYPE_MASK: u64 = 0xFF;
 
-/// A key PRESS. Payload `[7:0]` = ASCII, or one of the `KEY_*` C0 arrow codes, or a [`KEY_CTRL_DIGIT`] / [`KEY_CTRL_TAB`] chord
-/// byte (`0x80..=0x8D`: the payload carries no modifier field, so a modified key the ring must tell apart presses as
+/// A key PRESS. Payload `[7:0]` = ASCII, or one of the `KEY_*` C0 arrow codes, or a [`KEY_CTRL_DIGIT`] / [`KEY_CTRL_TAB`] /
+/// [`KEY_CTRL_ENTER`] chord byte or [`KEY_PGUP`] / [`KEY_PGDN`] (`0x80..=0x90`: the payload carries no modifier field, so a modified key the ring must tell apart presses as
 /// a byte of its own).
 pub const INPUT_EV_KEY_DOWN: u64 = 1;
 /// A key RELEASE. Same payload as the press.
@@ -511,6 +511,21 @@ pub const KEY_CTRL_SHIFT_TAB: u8 = 0x8B;
 pub const KEY_CTRL_PLUS: u8 = 0x8C;
 /// See [`KEY_CTRL_TAB`].
 pub const KEY_CTRL_MINUS: u8 = 0x8D;
+/// Ctrl+Enter PRESSES as `0x8E` (SHELLABI, rmbp-ledger B565: the same shared HID fold, `HID_KEY_CTRL_ENTER`), the
+/// next byte after [`KEY_CTRL_MINUS`] and on the same terms: no key and no other fold produces it, an ASCII consumer
+/// ignores it, the RELEASE is the bare Enter (`KEY_UP '\n'`). The main-row Return only (usage 0x28); the keypad
+/// Enter and Alt/Cmd+Enter stay suppressed. Lumen sends on it.
+pub const KEY_CTRL_ENTER: u8 = 0x8E;
+/// A bare PageUp PRESSES (and releases) as `0x8F`, PageDown as `0x90` (SHELLABI B565: the HID table's rows 0x4B / 0x4E,
+/// which held no byte). They are NOT C0 codes like the arrows: every C0 byte is already taken (the arrows 0x1C..=0x1F,
+/// Esc, BS/Tab/LF/CR, and Ctrl+letter's folds 0x01..=0x1A), so they take the next bytes of the chord range, whose
+/// terms they share (no other key produces them; an ASCII consumer ignores them). Shift does not change them — as
+/// with the arrows, Shift+PgUp/PgDn ALSO delivers the keymap's ScrollPageUp/Down action, so a program binds one of
+/// the two, never both. Ctrl/Alt/Cmd+PgUp/PgDn stay suppressed.
+pub const KEY_PGUP: u8 = 0x8F;
+/// See [`KEY_PGUP`].
+pub const KEY_PGDN: u8 = 0x90;
+const _: () = assert!(KEY_CTRL_ENTER == KEY_CTRL_MINUS + 1 && KEY_PGUP == KEY_CTRL_ENTER + 1 && KEY_PGDN == KEY_PGUP + 1);
 
 /// [`SYS_GETINFO`]'s payload: `#[repr(C)]`, no padding, so the byte view is exactly the two fields
 /// in declaration order — `pid` at 0, `ticks` at 8.
@@ -2607,11 +2622,29 @@ const _: () = assert!(PATH_W_RENAME & (PATH_W_TRUNC | PATH_W_MKDIRS | PATH_W_UNL
 //            -EBADF = no live pipe with that pid; -EACCES = the pipe is another program's (only the launcher —
 //                the slot and generation that asked for it — reads it; a capability, not a name).
 //            `buf_len == 0` consumes nothing and answers the DROPPED byte count (>= 0).
+//   write    SHELLABI (rmbp-ledger B565): `SYS_PIPE_WRITE(pid, buf_ptr, buf_len)` -> n > 0 bytes taken, each one
+//            delivered into the CHILD's input ring as an `INPUT_EV_KEY_DOWN` carrying that byte — the event a key
+//            press is, read by the child's ordinary `SYS_INPUT_POLL` drain, so a program reads a pipeline's input
+//            exactly as it reads the keyboard. At most one input ring's worth is taken per call (the rest is the
+//            caller's to resend); `buf_len == 0` delivers ONE end-of-input byte, `KEY_EOT` (0x04, what Ctrl+D
+//            presses) and answers 0. -EAGAIN = the child's ring is full, or the child holds the keyboard focus
+//            (the operator's keys are its input then — retry later); -EPIPE = the child has exited (the pipe may
+//            still hold output to read); -ENOSYS = no live pipe with that pid (`[pipe] write … -> refused=no-pipe`);
+//            -EACCES = the pipe is another program's. Only the launcher writes, on the same capability as `read`.
+//   kill     SHELLABI: `SYS_KILL(pid)` -> 0 once the child is killed (or its kill is armed), reaped through the
+//            same path as the kernel shell's `kill` (the scheduler's kill switch; the slot's teardown then makes
+//            the pipe's EOF). THE TRUST GATE IS PARENTHOOD: only the launcher holding the child's live pipe may
+//            kill it — anything else is refused by name, `[kill] pid=<p> by=<k> -> refused=not-my-child`
+//            (-ESRCH no pipe with that pid, -EACCES another program's pipe); -ESRCH also when the child already
+//            exited. Wire: `[pipe] kill pid=<p> by=<k> -> ok (<reap>)` or `-> refused=<why>`.
 //   arches   x86 attaches (SYS_SPAWN_PATH is x86's). aarch64's launch path has no ring-3 spawn-by-path, so it
-//            cannot attach one: `SYS_PIPE_READ` answers -ENOSYS there by name (`[pipe] read … -> refused=no-launch-pipe`).
+//            cannot attach one: `SYS_PIPE_READ` and `SYS_PIPE_WRITE` answer -ENOSYS there by name (`[pipe] read …
+//            -> refused=no-launch-pipe`, `[pipe] write … -> refused=no-launch-pipe`), and `SYS_KILL` -ESRCH by the
+//            parenthood refusal (no ring-3 program there has a child).
 //   teardown the child's slot teardown (its generation bump) is the EOF; a launcher that dies leaves its pipes to be
 //            reclaimed at the next reserve.
-// Numbered 70: the next free number after CURSORSHAPE's SYS_CURSOR_SHAPE (69), the tail-append order.
+// Numbered 70: the next free number after CURSORSHAPE's SYS_CURSOR_SHAPE (69), the tail-append order; SHELLABI's
+// SYS_PIPE_WRITE 71 and SYS_KILL 72 follow it in the same order.
 // =================================================================================================
 
 /// `SYS_PIPE_READ(pid, buf_ptr, buf_len)` — see the block above.
@@ -2626,4 +2659,12 @@ pub const SPAWN_FLAGS: u64 = SPAWN_PIPE;
 pub const PIPE_RING_BYTES: usize = 64 * 1024;
 /// Pipes live at once, system-wide.
 pub const PIPE_MAX: usize = 8;
-const _: () = assert!(SYS_PIPE_READ == SYS_CURSOR_SHAPE + 1 && SPAWN_FLAGS & SPAWN_ARGC_MASK == 0 && ARGS_MAX as u64 <= SPAWN_ARGC_MASK);
+/// SHELLABI (B565): `SYS_PIPE_WRITE(pid, buf_ptr, buf_len)` — bytes into a SPAWN_PIPE child's input ring (see the block above).
+pub const SYS_PIPE_WRITE: u64 = 71; // after RING3PIPE's SYS_PIPE_READ (70)
+/// SHELLABI (B565): `SYS_KILL(pid)` — kill one of the caller's own SPAWN_PIPE children (see the block above).
+pub const SYS_KILL: u64 = 72; // after SHELLABI's SYS_PIPE_WRITE (71)
+/// SHELLABI: the end-of-input byte a zero-length `SYS_PIPE_WRITE` delivers — ASCII EOT, the byte Ctrl+D presses.
+pub const KEY_EOT: u8 = 0x04;
+/// SHELLABI: broken pipe — `SYS_PIPE_WRITE` to a child that has exited.
+pub const EPIPE: i64 = -32;
+const _: () = assert!(SYS_PIPE_READ == SYS_CURSOR_SHAPE + 1 && SYS_PIPE_WRITE == SYS_PIPE_READ + 1 && SYS_KILL == SYS_PIPE_WRITE + 1 && SPAWN_FLAGS & SPAWN_ARGC_MASK == 0 && ARGS_MAX as u64 <= SPAWN_ARGC_MASK);
