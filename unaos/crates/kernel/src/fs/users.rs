@@ -3023,7 +3023,7 @@ fn stage_publish(st: BootStage, why: &str) {
     if prev == st as u8 {
         return;
     }
-    crate::fs::bootstep::witness("stage-witness"); stage_witness(why); crate::fs::bootstep::witness("published"); // SPLASHSTALL (B510)
+    crate::fs::bootstep::witness("stage-witness"); serial_println!("[users] stage-resolve sub=stage-witness why={} at_ms={}", why, crate::arch::ms()); stage_witness(why); crate::fs::bootstep::witness("published"); serial_println!("[users] stage-resolve sub=published why={} at_ms={}", why, crate::arch::ms()); // RESOLVEHANG (B524): each sub-step its own wire line. SPLASHSTALL (B510)
     if why == "store-has-users" {
         serial_println!("[login] installer: stage=login-screen (R86: the login dialog only; the desktop ignites at the first login)"); // INSTALLBARE: was the stray `stage=desktop` at boot 2's login screen
     } else {
@@ -3038,16 +3038,16 @@ fn stage_publish(st: BootStage, why: &str) {
         // a window (the R86/R88 latch and sweep, and R92's unconditional enable, are gone). The Desktop stage asks for the
         // build (idempotent after `login ok` asked; the store-less Desktop's only ask); boot 2's login screen builds nothing.
         if st == BootStage::Desktop && why != "store-has-users" {
-            crate::fs::bootstep::witness("desktop-build"); crate::video::desktopbuild::build("stage"); // SPLASHSTALL (B510)
+            crate::fs::bootstep::witness("desktop-build"); serial_println!("[users] stage-resolve sub=desktop-build why={} at_ms={}", why, crate::arch::ms()); crate::video::desktopbuild::build("stage"); // RESOLVEHANG (B524). SPLASHSTALL (B510)
         }
-        if st == BootStage::Desktop { crate::splash::hold_release("first-screen"); } // SPLASH2 M3: the desktop is asked for above (DESKTOPBUILT) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
+        if st == BootStage::Desktop && why != "store-has-users" { crate::splash::hold_release("first-screen"); } // RESOLVEHANG (B524): NOT on boot 2's login-screen resolution — that release ran on the device-service pass INSIDE stage-resolve, before any screen existed: it zeroed HOLD_WIN (muting the B510 watchdog's panel line and the 5 s bound) and ran `wm::close`'s drain + composite from the stepping task; boot 2's screen releases from `login::open_as` after its first paint like every other screen. SPLASH2 M3: the desktop is asked for above (DESKTOPBUILT) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
     }
 }
 
 /// Read the stage from the store and publish it; open the create-user form when that is the stage.
 /// Called once at the end of [`service`]'s load arm (after the `loginst` chain), and by the advance below.
 pub fn stage_resolve(why: &str) {
-    let st = stage_of_store(); crate::fs::bootstep::witness("store-read"); // SPLASHSTALL (B510): the OVER line's `last=` (stage-resolve's sub-stages, here and in `stage_publish`)
+    let st = stage_of_store(); crate::fs::bootstep::witness("store-read"); serial_println!("[users] stage-resolve sub=store-read why={} stage={} users={} at_ms={}", why, st.word(), user_count(), crate::arch::ms()); // RESOLVEHANG (B524): the hang names its sub-step on the wire (store-read, stage-witness, published, desktop-build, login-screen, create-user-form, done). SPLASHSTALL (B510): the OVER line's `last=` (stage-resolve's sub-stages, here and in `stage_publish`)
     // LOGINFLOW2 M1 — BOOT 2: a store with root's password AND users resolves to the LOGIN SCREEN, over an empty desktop (R64/R65;
     // R77 "root is not the assumed login"). `user-created` is the installer's own advance (the form already logged that user in).
     let boot2 = st == BootStage::Desktop && why == "store-loaded" && user_count() > 0;
@@ -3055,7 +3055,7 @@ pub fn stage_resolve(why: &str) {
     stage_publish(st, if boot2 { "store-has-users" } else { why });
     if boot2 {
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
-            crate::fs::bootstep::witness("login-screen"); screen_boot2(); // SPLASHSTALL (B510)
+            crate::fs::bootstep::witness("login-screen"); serial_println!("[users] stage-resolve sub=login-screen at_ms={}", crate::arch::ms()); screen_boot2(); // RESOLVEHANG (B524). SPLASHSTALL (B510)
         } else {
             BOOT2_PENDING.store(true, core::sync::atomic::Ordering::Release);
             serial_println!("[login] boot 2: login screen deferred to the glass (the screen's window needs the surface)");
@@ -3063,12 +3063,12 @@ pub fn stage_resolve(why: &str) {
     }
     if st == BootStage::Installer && TABLE.lock().loaded { // FIRSTUSER (R100): the Installer's one screen is the first-user form
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
-            crate::fs::bootstep::witness("create-user-form"); screen_create_user(); // SPLASHSTALL (B510)
+            crate::fs::bootstep::witness("create-user-form"); serial_println!("[users] stage-resolve sub=create-user-form at_ms={}", crate::arch::ms()); screen_create_user(); // RESOLVEHANG (B524). SPLASHSTALL (B510)
         } else {
             CREATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
             serial_println!("[login] installer: create-user form deferred to the glass (the setter's window needs the surface)");
         }
-    }
+    } serial_println!("[users] stage-resolve sub=done why={} at_ms={}", why, crate::arch::ms()); // RESOLVEHANG (B524)
 }
 
 /// The store could not be mounted after the bound: there is nothing to install into; the machine is a Desktop.
