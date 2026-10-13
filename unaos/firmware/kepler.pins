@@ -12,3 +12,16 @@
 # NO ROWS YET (2026-10-13, KEPLERUCODE): linux-firmware does NOT ship nvidia/gk107/ — the four files have no
 # linux-firmware source (docs/dev/evidence/keplerucode/keplerucode.md §1). Until the bunker holds a set, every
 # `tests kgr` reads `[kgr] ucode … -> absent` and KGR4 stays `(ucode-gated)`.
+
+# KEPLERGOLD (rmbp-ledger B656, R119 + R127, 2026-10-14): THE SOURCE IS RULED — R127 (Peter: "1"): the four files are
+# CUT FROM NVIDIA'S OWN DRIVER INTO THE BUNKER, b43-fwcutter style. The cutter is unaos/scripts/kepler-bunker.sh
+# (envytools extract_firmware.py's PGRAPH-archive recipe, GK107 = archive 10 of driver 325.15's fifteen). On the
+# BENCH: `bash unaos/scripts/kepler-bunker.sh NVIDIA-Linux-x86_64-325.15.run <bunker>/drivers/nvidia-gk107` writes
+# fuc409c fuc409d fuc41ac fuc41ad + SHA256SUMS + PROVENANCE and prints, last, exactly four rows of this file's
+# grammar, in this order:
+#   fecs_code <sha256 of fuc409c>
+#   fecs_data <sha256 of fuc409d>
+#   gpccs_code <sha256 of fuc41ac>
+#   gpccs_data <sha256 of fuc41ad>
+# Paste those four printed lines below this comment, unedited. No digest is typed here that the bench did not
+# measure (docs/dev/evidence/keplergold/KEPLERGOLD.md §1).
