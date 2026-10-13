@@ -48,7 +48,7 @@
 //! early boot (before clock init), from IRQ-masked handlers, and on every core.
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 /// True while the next byte written to the UART begins a fresh line (so it should be prefixed).
 /// Persists across `serial_print!` fragments that build one line piecewise, so a partial-line print
@@ -78,6 +78,7 @@ fn render_prefix(buf: &mut [u8]) -> usize {
     let mut w = FixedBuf { buf, len: 0 };
     match unix {
         Some(secs) => {
+            let (secs, _) = advance(secs); // BOOTVERDICTS2 (B616): a frozen civil clock advances on `arch::ms()`
             let (_, _, _, h, m, s) = crate::clock::civil_from_unix(secs);
             let _ = write!(w, "[{:02}:{:02}:{:02}Z] ", h, m, s);
         }
@@ -399,4 +400,105 @@ mod logwit {
 #[cfg(all(feature = "witness", feature = "logts"))]
 pub fn logwit1() {
     logwit::run();
+}
+
+// ---------------------------------------------------------------------------------------------
+// BOOTVERDICTS2 (rmbp-ledger B616) — the stamp advances when the civil clock does not.
+// ---------------------------------------------------------------------------------------------
+//
+// KVMLAT/UIREDS26 (B564): on the image-26 KVM boot every line read `[07:13:52Z]` (the RTC anchor) until the SNTP
+// sync, then `[07:14:21Z]` for six minutes (docs/dev/evidence/qemu-image26/serial.log, 965 onward). The civil clock
+// extends its anchor by `clock::monotonic()`, which on x86 is the INVARIANT TSC only (`clock.rs` `monotonic`, the
+// CLOCK-X1 gate on `apic::tsc_invariant`); KVM's default vCPU advertises none (`[clock] source=apic … invariant=0`,
+// serial.log:3), so `monotonic()` is `None`, `logts_now`'s elapsed is 0 and every stamp is the anchor's own second.
+// The kernel's millisecond clock (`arch::ms()`: CLOCKCORE's tick on that machine) runs on regardless. Where the
+// civil clock has no counter, the prefix extends the anchor itself: it latches the anchor's second with `arch::ms()`
+// at the first line that shows it (a frozen clock repeats its anchor's second exactly, so a different second IS a
+// new anchor) and adds the whole seconds since. The latch lands at the first print after the anchor, so the stamp
+// can lag the anchor instant by the gap to that print (the SNTP sync prints its own line at once). The civil clock
+// itself (`unix_now`, the menu bar, `time`, FAT mtimes) is unchanged here — `clock.rs` is that fix (B618).
+
+/// The anchor second the fallback last latched (`u64::MAX` = none yet), and `arch::ms()` at that latch.
+static LATCH_UNIX: AtomicU64 = AtomicU64::new(u64::MAX);
+static LATCH_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Which clock moved the stamp: the civil clock's own counter, or the fallback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StampSrc {
+    /// `clock::mono_ticks()` is `Some`: `logts_now` already extrapolated the anchor (aarch64 CNTPCT, x86 invariant TSC).
+    Counter,
+    /// The civil clock has no counter: the anchor's second plus whole `arch::ms()` seconds since its latch.
+    ArchMs,
+}
+
+impl StampSrc {
+    fn name(self) -> &'static str {
+        match self {
+            StampSrc::Counter => "counter",
+            StampSrc::ArchMs => "arch-ms",
+        }
+    }
+}
+
+/// `unix` is `logts_now`'s civil second. Lock-free (atomics, one `arch::ms()` read, the CPUID+atomic of
+/// `mono_ticks`), so it is safe on every print path the prefix is.
+fn advance(unix: u64) -> (u64, StampSrc) {
+    if crate::clock::mono_ticks().is_some() {
+        return (unix, StampSrc::Counter);
+    }
+    let now = crate::arch::ms();
+    if LATCH_UNIX.load(Ordering::Acquire) != unix {
+        LATCH_MS.store(now, Ordering::Relaxed);
+        LATCH_UNIX.store(unix, Ordering::Release);
+        return (unix, StampSrc::ArchMs);
+    }
+    (unix.saturating_add(now.saturating_sub(LATCH_MS.load(Ordering::Relaxed)) / 1000), StampSrc::ArchMs)
+}
+
+/// How long the probe watches one anchor before it says whether the stamp moved.
+const PROBE_SPAN_MS: u64 = 3000;
+/// 0 = no sample, 1 = sampled (watching), 2 = said for the anchor in `P_BASE`.
+static PROBE: AtomicU8 = AtomicU8::new(0);
+static P_BASE: AtomicU64 = AtomicU64::new(0);
+static P_MS: AtomicU64 = AtomicU64::new(0);
+static P_STAMP: AtomicU64 = AtomicU64::new(0);
+
+/// The probe that proves the stamp moves: once per civil anchor (the RTC at boot, then each SNTP sync or `date -s`),
+/// sample the stamp, wait [`PROBE_SPAN_MS`] of `arch::ms()`, sample again, and say
+/// `[logts] source=<counter|arch-ms> anchor=<rtc|sntp|manual> advancing=<0|1> span_ms=<n> moved_s=<n>`.
+/// `advancing=0` is the frozen stamp B564 saw. No verdict word: it is a boot line, not a test (R80).
+/// Called from `serial_ring::mirror_service` (IRQs on, no lock held, not a print context), on both arches.
+pub fn probe_poll() {
+    let Some((base, source)) = crate::clock::raw_anchor() else { return };
+    let Some(unix) = crate::clock::logts_now().1 else { return }; // the anchor lock was contended: next pass
+    let (stamp, src) = advance(unix);
+    let now = crate::arch::ms();
+    let st = PROBE.load(Ordering::Relaxed);
+    if st == 0 || P_BASE.load(Ordering::Relaxed) != base {
+        P_BASE.store(base, Ordering::Relaxed);
+        P_MS.store(now, Ordering::Relaxed);
+        P_STAMP.store(stamp, Ordering::Relaxed);
+        PROBE.store(1, Ordering::Relaxed);
+        return;
+    }
+    let span = now.saturating_sub(P_MS.load(Ordering::Relaxed));
+    if st != 1 || span < PROBE_SPAN_MS {
+        return;
+    }
+    PROBE.store(2, Ordering::Relaxed);
+    let moved = stamp.saturating_sub(P_STAMP.load(Ordering::Relaxed));
+    let anchor = match source {
+        crate::clock::ClockSource::Unset => "unset",
+        crate::clock::ClockSource::Manual => "manual",
+        crate::clock::ClockSource::Sntp { .. } => "sntp",
+        crate::clock::ClockSource::Rtc => "rtc",
+    };
+    serial_println!(
+        "[logts] source={} anchor={} advancing={} span_ms={} moved_s={}",
+        src.name(),
+        anchor,
+        (moved > 0) as u8,
+        span,
+        moved
+    );
 }

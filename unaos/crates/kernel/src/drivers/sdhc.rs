@@ -3889,7 +3889,7 @@ static SDW_MB_READBACK: Mutex<[u8; SDW_MB_BLOCKS as usize * 512]> =
 /// spelled as a small number that looks like a fast card, which is why the `verify=` token is what a
 /// reader keys on and `busy_ms` is only ever read beside it.
 #[cfg(feature = "sdw")]
-fn mb_verdict(lba: Option<u64>, count: u16, verify: &str, busy_ms: u64, restore: &str, reason: &str, verdict: &str) {
+fn mb_verdict(lba: Option<u64>, count: u16, verify: &'static str, busy_ms: u64, restore: &'static str, reason: &'static str, verdict: &'static str) { let verdict = w2_bank(lba, count, verify, busy_ms, restore, reason, verdict); // BOOTVERDICTS2 (rmbp-ledger B616, R80): the boot line is the RECORD of the write (`ok`/`NOT-OK` until the operator's first `tests` run, `tests::boot_word`); `tests sdhcw2` prints the banked verdict. LINE-NEUTRAL fold onto the signature line, before its first `//`; the bank is a FILE-TAIL append.
     match lba {
         Some(l) => {
             crate::bootlog_println!(
@@ -4168,5 +4168,79 @@ pub fn wr_census_idle() {
     let last = wrcensus::LAST_WRITE.load(core::sync::atomic::Ordering::Relaxed);
     if last != 0 && wrcensus::now_ms().saturating_sub(last) > wrcensus::BURST_GAP_MS {
         wr_burst_flush();
+    }
+}
+
+// ===================================================================================
+// BOOTVERDICTS2 (rmbp-ledger B616, R80) — FILE-TAIL append. The `w2` verdict, banked for `tests sdhcw2`.
+//
+// UIREDS26 (B597/B605): `:: sdhc: w2 … -> PASS ::` printed at boot, before the `TESTS: deferred=` announce, on
+// every machine whose single-block ladder passed — so `tests verdicts` counted it on QEMU and not on a machine
+// whose ladder refused. The WRITE stays at boot: it is the instrument's ordering (Step 9b: after `w1`'s PASS,
+// seconds later, and before `bring_up` publishes the card to the block layer — after that the window would be
+// written under a live filesystem). What moves is the VERDICT: the boot line says `ok`/`NOT-OK` (a record, R80's
+// shape, `tests::boot_word`), `REFUSED` unchanged, and `tests sdhcw2` prints the same fields with PASS/FAIL.
+// ===================================================================================
+
+/// One banked `w2` verdict: the fields [`mb_verdict`] printed, every one a literal of its callers.
+#[cfg(feature = "sdw")]
+#[derive(Clone, Copy)]
+struct W2 {
+    lba: Option<u64>,
+    count: u16,
+    verify: &'static str,
+    busy_ms: u64,
+    restore: &'static str,
+    reason: &'static str,
+    verdict: &'static str,
+}
+
+#[cfg(feature = "sdw")]
+static W2_BANK: Mutex<Option<W2>> = Mutex::new(None);
+
+/// Bank this boot's `w2` verdict, register `tests sdhcw2` once, and return the word the boot line prints:
+/// `PASS`/`FAIL` through [`crate::tests::boot_word`] (`ok`/`NOT-OK` before the operator's first `tests` run,
+/// unchanged under `tests-at-boot`), any other verdict (`REFUSED`) as it is.
+#[cfg(feature = "sdw")]
+fn w2_bank(
+    lba: Option<u64>,
+    count: u16,
+    verify: &'static str,
+    busy_ms: u64,
+    restore: &'static str,
+    reason: &'static str,
+    verdict: &'static str,
+) -> &'static str {
+    *W2_BANK.lock() = Some(W2 { lba, count, verify, busy_ms, restore, reason, verdict });
+    if !cfg!(feature = "tests-at-boot") {
+        static REG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !REG.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            crate::tests::register("sdhcw2", w2_selftest);
+        }
+    }
+    match verdict {
+        "PASS" => crate::tests::boot_word(true),
+        "FAIL" => crate::tests::boot_word(false),
+        v => v,
+    }
+}
+
+/// `tests sdhcw2`: this boot's `w2` verdict, as banked. Registered only by a boot whose `w2` ran.
+#[cfg(feature = "sdw")]
+fn w2_selftest() {
+    let banked = *W2_BANK.lock();
+    let Some(w) = banked else {
+        serial_println!(":: sdhc: w2 at=boot -> SKIP reason=not-run ::");
+        return;
+    };
+    match w.lba {
+        Some(l) => serial_println!(
+            ":: sdhc: w2 armed=1 lba={} n={} verify={} busy_ms={} restore={} reason={} at=boot -> {} ::",
+            l, w.count, w.verify, w.busy_ms, w.restore, w.reason, w.verdict
+        ),
+        None => serial_println!(
+            ":: sdhc: w2 armed=1 lba=NONE n={} verify={} busy_ms={} restore={} reason={} at=boot -> {} ::",
+            w.count, w.verify, w.busy_ms, w.restore, w.reason, w.verdict
+        ),
     }
 }

@@ -9,7 +9,7 @@
 //! sink is the wire, so the transcript the job writes (`shelltask::out` → [`service`] → `place_from_task`) and every
 //! inline `println` land on the serial console the door is. A shell window, when one exists, keeps the door's lines.
 //!
-//! Wire: `[serialdoor] key=… -> shell(window|headless)` (syscall.rs `wc_route_event`), `[serialdoor] line verb=<v>
+//! Wire: `[serialdoor] key=… -> shell(window|headless|backdrop-console)` (syscall.rs `wc_route_event`), `[serialdoor] line verb=<v>
 //! -> shell(headless) on=<task|render>`, then `[midden]`; `tests door` → `:: DOOR: headless=1 ran=1 window=0 -> PASS ::`.
 
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
@@ -42,7 +42,7 @@ mod imp {
     }
     /// The `[serialdoor] key=` witness's route word.
     pub fn route_word() -> &'static str {
-        if SHELL_WIN.load(Acquire) { "window" } else { "headless" }
+        if !crate::video::desktop_uefi::is_active() { "backdrop-console" } else if SHELL_WIN.load(Acquire) { "window" } else { "headless" } // BOOTVERDICTS2 (rmbp-ledger B616, B567's wording item): with no takeover the render key arm (main.rs `desktop_owns_backdrop()` false) hands the byte to the BACKDROP console's `handle_key`, never `key` below — the same latch `desktop_owns_backdrop` reads
     }
 
     /// The headless console's sink: the wire.
