@@ -2,8 +2,8 @@
 //!
 //! Interfaces: `CanvasRenderingContext2D`, `OffscreenCanvasRenderingContext2D`, `Path2D`, `CanvasGradient`,
 //! `CanvasPattern`, `ImageData`, `TextMetrics`, `OffscreenCanvas`, `ImageBitmap`; on `HTMLCanvasElement`
-//! `getContext` (`'2d'` with its settings dictionary; `webgl`/`webgl2`/`webgpu`/`bitmaprenderer` answer
-//! null — WebGL is not this arc), `toDataURL`, `toBlob`, and `width`/`height` whose setters reset the
+//! `getContext` (`'2d'` with its settings dictionary; `webgl` / `experimental-webgl` are js/webgl.rs's (WEBGL1,
+//! SR136); `webgl2`/`webgpu`/`bitmaprenderer` answer null), `toDataURL`, `toBlob`, and `width`/`height` whose setters reset the
 //! bitmap and the context (also on a same-value set). A JS prelude adds `DOMMatrixReadOnly`/`DOMMatrix`
 //! (what `getTransform` returns), `toBlob`, `OffscreenCanvas.convertToBlob` and `createImageBitmap`.
 //!
@@ -1499,8 +1499,19 @@ fn canvas_get_context(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_canvas(vm, ctx)?;
     need(vm, ctx, 1, "HTMLCanvasElement", "getContext")?;
     let id = string(vm, &arg(vm, ctx, 0))?;
+    // WEBGL1 (SR136): one context type per canvas — a canvas holding one kind answers null for the other.
+    if matches!(id.as_str(), "webgl" | "experimental-webgl") {
+        if page(|p| p.same_object.contains_key(&(el, SO_CTX))) {
+            return Ok(Value::Null);
+        }
+        let attrs = arg(vm, ctx, 1);
+        return super::webgl::element_context(vm, el, &attrs);
+    }
+    if id == "2d" && page(|p| p.same_object.contains_key(&(el, super::webgl::SO_GL))) {
+        return Ok(Value::Null);
+    }
     if id != "2d" {
-        if matches!(id.as_str(), "webgl" | "experimental-webgl" | "webgl2" | "webgpu" | "bitmaprenderer") {
+        if matches!(id.as_str(), "webgl2" | "webgpu" | "bitmaprenderer") {
             crate::ledger::record_dom(&format!("canvas-context-refused:{id}"));
         }
         return Ok(Value::Null);

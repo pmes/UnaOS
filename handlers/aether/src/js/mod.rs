@@ -30,6 +30,7 @@
 //!   [CEReactions] / observer-microtask boundary the mutation algorithms end with.
 //! - [`canvas`] — the 2D canvas (AETHERCANVAS, SR85): CanvasRenderingContext2D, Path2D, gradients,
 //!   patterns, ImageData, TextMetrics, OffscreenCanvas, ImageBitmap, DOMMatrix, over `crate::canvas`.
+//! - [`webgl`] — WebGL 1.0 (WEBGL1, SR136): WebGLRenderingContext and the WebGL objects over `gl_core`.
 //! - [`broadcast`], [`idb`], [`cache_api`], [`locks`], [`sw`] — the storage family (AETHERSTORAGE, SR94): the
 //!   cross-document inbox, BroadcastChannel and structured serialization; IndexedDB and `navigator.storage`;
 //!   the Cache API; Web Locks; `navigator.serviceWorker` — over `crate::storage` and `crate::workers`.
@@ -72,6 +73,7 @@ pub mod shadow;
 pub mod sw;
 /// AETHERMEDIA2 (SR134): text tracks, requestVideoFrameCallback, PiP / captureStream refusals.
 pub mod tracks;
+pub mod webgl;
 pub mod traversal;
 pub mod net;
 pub mod window;
@@ -801,6 +803,8 @@ impl Engine {
         mutation::install(&mut vm);
         custom::install(&mut vm);
         canvas::install(&mut vm);
+        // WEBGL1 (SR136): WebGLRenderingContext over gl_core (after canvas: the same surface store).
+        webgl::install(&mut vm);
         // AETHERSTORAGE (SR94): the inbox and serializer first, then the APIs that use them.
         broadcast::install(&mut vm);
         // AETHERWORKERS (SR123): MessagePort/MessageChannel, then Worker; the idle-callback task source.

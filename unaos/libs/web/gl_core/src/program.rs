@@ -351,11 +351,12 @@ impl Context {
     /// uniform{1,2,3,4}{f,i}[v] (ES 2.0 §2.10.4 with WebGL 1.0's checks). `count_form` = the *v form (the data
     /// may hold several elements); a null location is ignored silently.
     pub fn uniform(&mut self, loc: Option<&UniformLoc>, kind: UKind, comps: u8, data: &[f64], count_form: bool) {
+        // WebGL 1.0 uniform*: a null location is silently ignored, before any other check.
+        let Some(loc) = loc else { return };
         let cur = self.current_program;
         if cur == 0 {
             return self.err(INVALID_OPERATION);
         }
-        let Some(loc) = loc else { return };
         let Some((l, ui, e)) = self.resolve_loc(cur, loc) else { return };
         let u = &l.uniforms[ui as usize];
         let base = u.ty.base;
@@ -395,11 +396,11 @@ impl Context {
 
     /// uniformMatrix{2,3,4}fv (WebGL 1.0: `transpose` must be false).
     pub fn uniform_matrix(&mut self, loc: Option<&UniformLoc>, n: u8, transpose: bool, data: &[f32]) {
+        let Some(loc) = loc else { return };
         let cur = self.current_program;
         if cur == 0 {
             return self.err(INVALID_OPERATION);
         }
-        let Some(loc) = loc else { return };
         if transpose {
             return self.err(INVALID_VALUE);
         }

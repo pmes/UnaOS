@@ -12,6 +12,7 @@
 
 use crate::consts::*;
 use crate::context::{Context, DrawStats, State, StencilFace, POINT_SIZE_MAX};
+use crate::fmath as fm;
 use crate::glsl::codegen::StageCode;
 use crate::link::Linked;
 use crate::object::Attach;
@@ -472,7 +473,7 @@ impl Pipe<'_> {
             offset,
         };
         // Fixed point, 8 sub-pixel bits.
-        let fx = |c: f64| (c * 256.0).round() as i64;
+        let fx = |c: f64| fm::round(c * 256.0) as i64;
         let q: [[i64; 2]; 3] = [[fx(pp[0][0]), fx(pp[0][1])], [fx(pp[1][0]), fx(pp[1][1])], [fx(pp[2][0]), fx(pp[2][1])]];
         let x0 = (q.iter().map(|a| a[0]).min().unwrap() >> 8).max(self.scissor[0] as i64);
         let y0 = (q.iter().map(|a| a[1]).min().unwrap() >> 8).max(self.scissor[1] as i64);
@@ -519,7 +520,7 @@ impl Pipe<'_> {
         // ES 2.0 §3.4.1 (the diamond-exit rule approximated by major-axis stepping): one fragment per column
         // (x-major) between the start pixel and the end pixel, the end pixel excluded.
         let (s, e, s2, e2) = if xmajor { (x0, x1, y0, y1) } else { (y0, y1, x0, x1) };
-        let (c0, c1) = (s.floor() as i64, e.floor() as i64);
+        let (c0, c1) = (fm::floor(s) as i64, fm::floor(e) as i64);
         if c0 == c1 {
             return;
         }
@@ -528,7 +529,7 @@ impl Pipe<'_> {
         while c != c1 {
             let pc = c as f64 + 0.5;
             let t = ((pc - s) / (e - s)).clamp(0.0, 1.0);
-            let other = (s2 + t * (e2 - s2)).floor() as i64;
+            let other = fm::floor(s2 + t * (e2 - s2)) as i64;
             let (x, y) = if xmajor { (c, other) } else { (other, c) };
             if x >= 0 && y >= 0 && self.inside_scissor(x as i32, y as i32) {
                 self.fragment(&setup, x as i32, y as i32);
@@ -544,10 +545,10 @@ impl Pipe<'_> {
         let (cx, cy) = (v.0[0], v.0[1]);
         let setup = Setup::Point { c: [cx, cy], z: v.0[2], iw: v.0[3], base: v.1, size };
         let h = size / 2.0;
-        let xs = (cx - h - 0.5).ceil() as i64;
-        let xe = (cx + h - 0.5).ceil() as i64;
-        let ys = (cy - h - 0.5).ceil() as i64;
-        let ye = (cy + h - 0.5).ceil() as i64;
+        let xs = fm::ceil(cx - h - 0.5) as i64;
+        let xe = fm::ceil(cx + h - 0.5) as i64;
+        let ys = fm::ceil(cy - h - 0.5) as i64;
+        let ye = fm::ceil(cy + h - 0.5) as i64;
         for y in ys.max(self.scissor[1] as i64)..ye.min(self.scissor[3] as i64) {
             for x in xs.max(self.scissor[0] as i64)..xe.min(self.scissor[2] as i64) {
                 self.fragment(&setup, x as i32, y as i32);

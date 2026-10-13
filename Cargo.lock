@@ -57,6 +57,7 @@ dependencies = [
  "directories",
  "font_core",
  "futures-util",
+ "gl_core",
  "gneiss_pal",
  "html_core",
  "image",
