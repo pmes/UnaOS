@@ -394,12 +394,53 @@ pub fn set_node_doc(id: usize, doc: usize) {
     });
 }
 
+/// HTML §4.12.3 "appropriate template contents owner document" of `doc` (AETHERDEBT SR93): a
+/// document with no browsing context, made on first use and kept per document; an owner document is
+/// its own (so `template.content.ownerDocument` is never the page's document, and a nested template's
+/// contents share the outer contents' owner).
+pub fn template_owner(doc: usize) -> usize {
+    if let Some(o) = page(|p| p.template_owner.get(&doc).copied()) {
+        return o;
+    }
+    if page(|p| p.template_owner.values().any(|&v| v == doc)) {
+        return doc;
+    }
+    let html = is_html_doc(doc);
+    let o = new_document(html, if html { "text/html" } else { "application/xml" }, "about:blank");
+    page(|p| p.template_owner.insert(doc, o));
+    o
+}
+
+/// The node document of `template`'s contents fragment and of every node in it (nested templates'
+/// contents included) becomes `doc`'s template contents owner (a template's node document is `doc`).
+pub fn set_template_contents_doc(template: usize, doc: usize) {
+    let ids: Vec<usize> = with_doc(|d| {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = d.element(NodeId(template)).and_then(|e| e.template_contents).into_iter().collect();
+        while let Some(f) = stack.pop() {
+            out.push(f.0);
+            for n in d.descendants(f) {
+                out.push(n.0);
+                if let Some(t) = d.element(n).and_then(|e| e.template_contents) {
+                    stack.push(t);
+                }
+            }
+        }
+        out
+    });
+    if ids.is_empty() {
+        return;
+    }
+    let owner = template_owner(doc);
+    for i in ids {
+        set_node_doc(i, owner);
+    }
+}
+
 pub fn create_element(doc: usize, ns: Namespace, local: &str) -> usize {
     let id = with_doc_mut(|d| d.create_element(ns, local, Vec::new()).0);
     set_node_doc(id, doc);
-    if let Some(t) = with_doc(|d| d.element(NodeId(id)).and_then(|e| e.template_contents)) {
-        set_node_doc(t.0, doc);
-    }
+    set_template_contents_doc(id, doc);
     id
 }
 
@@ -421,25 +462,37 @@ pub fn adopt(node: usize, doc: usize) {
     if parent_of(node).is_some() {
         detach_node(node);
     }
-    if node_document(node) == doc && kind(node) != NK::Document {
+    let old = node_document(node);
+    if old == doc && kind(node) != NK::Document {
         return;
     }
-    let ids: Vec<usize> = with_doc(|d| {
-        let mut v = vec![node];
-        v.extend(d.descendants(NodeId(node)).map(|n| n.0));
-        // template contents ride with their element.
-        let mut extra = Vec::new();
-        for &i in &v {
-            if let Some(t) = d.element(NodeId(i)).and_then(|e| e.template_contents) {
-                extra.push(t.0);
-                extra.extend(d.descendants(t).map(|n| n.0));
-            }
-        }
-        v.extend(extra);
-        v
-    });
-    for i in ids {
+    // Shadow-including inclusive descendants (AETHERDEBT SR93: a host's shadow tree moves with it).
+    let ids: Vec<usize> =
+        with_doc(|d| crate::dom::shadow::shadow_including_descendants(d, NodeId(node), true).into_iter().map(|n| n.0).collect());
+    for &i in &ids {
         set_node_doc(i, doc);
+    }
+    for &i in &ids {
+        // HTML §4.12.3 template adopting steps: the contents go to the new document's owner.
+        if with_doc(|d| d.element(NodeId(i)).is_some_and(|e| e.template_contents.is_some())) {
+            set_template_contents_doc(i, doc);
+        }
+    }
+    // DOM §4.5 adopt step 3.2: adoptedCallback(oldDocument, newDocument) for each custom element;
+    // the reaction runs at the caller's settle.
+    if kind(node) != NK::Document {
+        with_doc(|d| {
+            for &i in &ids {
+                let n = NodeId(i);
+                if d.element(n).is_some() && crate::dom::custom::state(d, n) == crate::dom::custom::CeState::Custom {
+                    crate::dom::custom::enqueue_callback(
+                        n,
+                        crate::dom::custom::Callback::Adopted,
+                        vec![crate::dom::custom::Arg::Node(NodeId(old)), crate::dom::custom::Arg::Node(NodeId(doc))],
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -483,8 +536,30 @@ pub fn clone_node(id: usize, deep: bool, doc: Option<usize>) -> usize {
             }
         });
         super::controls::cloned(src, dst);
-        if let Some(t) = with_doc(|d| d.element(NodeId(dst)).and_then(|e| e.template_contents)) {
-            set_node_doc(t.0, doc);
+        set_template_contents_doc(dst, doc);
+        // DOM §4.4 "clone a node" step 7 (AETHERDEBT SR93): a host whose shadow root is clonable gets
+        // a shadow root of the same mode and flags, its children cloned (subtree) into it.
+        let sr = with_doc(|d| crate::dom::shadow::shadow_root_of(d, NodeId(src))).filter(|i| i.clonable);
+        if let Some(info) = sr {
+            let a = arena();
+            let root = crate::dom::shadow::attach(
+                &a,
+                NodeId(dst),
+                crate::dom::shadow::ShadowInit {
+                    mode: info.mode,
+                    delegates_focus: info.delegates_focus,
+                    slot_assignment: info.slot_assignment,
+                    clonable: info.clonable,
+                    serializable: info.serializable,
+                },
+            );
+            drop(a);
+            set_node_doc(root.0, doc);
+            with_doc(|d| crate::dom::shadow::set_declarative(d, root, info.declarative));
+            for k in children_of(info.root.0) {
+                let kc = clone_node(k, true, Some(doc));
+                with_doc_mut(|d| d.append(root, NodeId(kc)));
+            }
         }
     }
     if kind(copy) == NK::Document {
@@ -2166,9 +2241,7 @@ pub fn parse_fragment(context: usize, markup: &str) -> usize {
         if with_doc(|d| d.element(NodeId(i)).is_some_and(|e| e.is_html("script"))) {
             page(|p| p.started.insert(i));
         }
-        if let Some(t) = with_doc(|d| d.element(NodeId(i)).and_then(|e| e.template_contents)) {
-            set_node_doc(t.0, doc);
-        }
+        set_template_contents_doc(i, doc);
     }
     frag
 }
@@ -2624,12 +2697,17 @@ fn adopt_node(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if kind(n) == NK::Document {
         return throw_dom(vm, "NotSupportedError", "The node provided is a document, which may not be adopted.");
     }
+    if with_doc(|dd| crate::dom::shadow::is_shadow_root(dd, NodeId(n))) {
+        return throw_dom(vm, "HierarchyRequestError", "The node provided is a shadow root, which may not be adopted.");
+    }
     if let Some(p) = parent_of(n) {
         detach_node(n);
         touch();
         super::loader::children_changed(vm, p);
     }
     adopt(n, d);
+    // [CEReactions]: adoptedCallback (and a removal's disconnectedCallback) run before returning.
+    super::mutation::settle(vm);
     Ok(wrap(vm, n))
 }
 

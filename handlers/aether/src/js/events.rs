@@ -558,12 +558,34 @@ pub fn install_handlers(vm: &mut Vm, o: Obj, names: &[&str]) {
 
 /// The "get the parent" chain of a target: node ancestors, then the Window above the main Document
 /// (except for `load`, which does not propagate from the document to the window).
-fn event_path(t: TargetKey, ty: &str, composed: bool) -> Vec<TargetKey> {
+fn event_path(t: TargetKey, ty: &str, composed: bool, related: Option<usize>) -> Vec<TargetKey> {
     let mut path = vec![t];
     if let TargetKey::Node(n) = t {
         let mut cur = n;
+        // AETHERDEBT SR93 (DOM §2.9 step 5.9.6): the shadow-adjusted target so far — a parent outside
+        // its tree that IS the relatedTarget retargeted against it ends the path (a mouseover
+        // between two nodes of one shadow tree does not reach the host's side).
+        let mut adjusted = n;
         // AETHERSHADOW: DOM §2.9 "get the parent" (assigned slot, shadow root → host unless contained).
         while let Some(p) = dom::with_doc(|d| crate::dom::shadow::event_parent(d, html_core::NodeId(cur), composed, html_core::NodeId(n))).map(|p| p.0) {
+            if let Some(rt) = related {
+                let stop = dom::with_doc(|d| {
+                    use crate::dom::shadow as sh;
+                    let in_tree = sh::is_shadow_including_inclusive_ancestor(d, sh::root(d, html_core::NodeId(adjusted)), html_core::NodeId(p));
+                    if in_tree {
+                        return Some(false);
+                    }
+                    if sh::retarget(d, html_core::NodeId(rt), Some(html_core::NodeId(p))).0 == p {
+                        return None;
+                    }
+                    Some(true)
+                });
+                match stop {
+                    None => break,
+                    Some(true) => adjusted = p,
+                    Some(false) => {}
+                }
+            }
             path.push(TargetKey::Node(p));
             cur = p;
         }
@@ -583,7 +605,21 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
     set_flag(vm, e, F_DISPATCH, true);
     let tv = target_value(vm, t);
     set_slot(vm, e, E_TARGET, tv);
-    let path = event_path(t, &ty, flags(vm, e) & F_COMPOSED != 0);
+    // AETHERDEBT SR93: relatedTarget retargeting (DOM §2.9 steps 5.4–5.5, 5.9, 7) — only when the
+    // page has shadow trees (retargeting is the identity otherwise).
+    let related = related_node(vm, e).filter(|_| dom::with_doc(crate::dom::shadow::any));
+    if let (Some(rt), TargetKey::Node(n)) = (related, t) {
+        let r0 = dom::with_doc(|d| crate::dom::shadow::retarget(d, html_core::NodeId(rt), Some(html_core::NodeId(n)))).0;
+        if r0 == n && rt != n {
+            // "If target is not relatedTarget or target is event's relatedTarget" fails: nothing
+            // is invoked (a mouse move between two nodes of one closed tree, seen from outside).
+            set_flag(vm, e, F_DISPATCH, false);
+            set_flag(vm, e, F_STOP, false);
+            set_flag(vm, e, F_STOP_IMMEDIATE, false);
+            return (flags(vm, e) & F_CANCELED == 0, false);
+        }
+    }
+    let path = event_path(t, &ty, flags(vm, e) & F_COMPOSED != 0, related);
     let path_vals: Vec<Value> = path.iter().map(|k| target_value(vm, *k)).collect();
     let arr = vm.new_array(path_vals);
     set_slot(vm, e, E_PATH, Value::Object(arr));
@@ -619,10 +655,12 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
         let phase = if i == 0 { 2.0 } else { 1.0 };
         set_slot(vm, e, E_PHASE, num(phase));
         shadow_adjusted_target(vm, e, t, *k);
+        shadow_adjusted_related(vm, e, related, *k);
         ran |= invoke_listeners(vm, e, *k, &ty, true);
     }
     for (i, k) in path.iter().enumerate() {
         shadow_adjusted_target(vm, e, t, *k);
+        shadow_adjusted_related(vm, e, related, *k);
         if i == 0 {
             set_slot(vm, e, E_PHASE, num(2.0));
         } else {
@@ -649,6 +687,19 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
         };
         set_slot(vm, e, E_TARGET, v);
     }
+    // relatedTarget after dispatch: the original, or null when it is left inside a shadow tree.
+    if let Some(rt) = related {
+        let against = match path.last() {
+            Some(TargetKey::Node(l)) => Some(html_core::NodeId(*l)),
+            _ => None,
+        };
+        let fin = dom::with_doc(|d| {
+            let r = crate::dom::shadow::retarget(d, html_core::NodeId(rt), against);
+            !crate::dom::shadow::is_shadow_root(d, crate::dom::shadow::root(d, r))
+        });
+        let v = if fin { wrap(vm, rt) } else { Value::Null };
+        set_related(vm, e, v);
+    }
     set_flag(vm, e, F_DISPATCH, false);
     set_flag(vm, e, F_STOP, false);
     set_flag(vm, e, F_STOP_IMMEDIATE, false);
@@ -674,6 +725,33 @@ fn shadow_adjusted_target(vm: &mut Vm, e: Obj, t: TargetKey, k: TargetKey) {
         let v = wrap(vm, r);
         set_slot(vm, e, E_TARGET, v);
     }
+}
+
+/// The event's `relatedTarget` when it is a Node (MouseEvent, FocusEvent, … keep it in the
+/// initialized dictionary).
+fn related_node(vm: &mut Vm, e: Obj) -> Option<usize> {
+    let Value::Object(init) = slot(vm, e, E_INIT) else { return None };
+    let key = PropertyKey::from_str("relatedTarget");
+    vm.heap.get(init).props.get(&key)?;
+    let v = vm.get(init, &key).ok()?;
+    node_of(vm, &v)
+}
+
+fn set_related(vm: &mut Vm, e: Obj, v: Value) {
+    if let Value::Object(init) = slot(vm, e, E_INIT) {
+        let _ = vm.create_data_property(init, PropertyKey::from_str("relatedTarget"), v);
+    }
+}
+
+/// AETHERDEBT SR93: the event's relatedTarget while `k`'s listeners run — the original
+/// relatedTarget retargeted against `k` (DOM §2.9 "invoke": the struct's shadow-adjusted
+/// relatedTarget).
+fn shadow_adjusted_related(vm: &mut Vm, e: Obj, related: Option<usize>, k: TargetKey) {
+    let Some(rt) = related else { return };
+    let against = if let TargetKey::Node(n) = k { Some(html_core::NodeId(n)) } else { None };
+    let r = dom::with_doc(|d| crate::dom::shadow::retarget(d, html_core::NodeId(rt), against)).0;
+    let v = wrap(vm, r);
+    set_related(vm, e, v);
 }
 
 fn is_mouse_event(vm: &Vm, e: Obj) -> bool {

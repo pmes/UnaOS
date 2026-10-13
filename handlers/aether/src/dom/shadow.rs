@@ -188,6 +188,18 @@ pub fn attach(arena: &Arena, host: NodeId, init: ShadowInit) -> NodeId {
     root
 }
 
+/// Marks shadow root `root` as declarative (HTML §13.2.6.4.4: a `<template shadowrootmode>` attached
+/// it) or not (an `attachShadow` that reused a declarative root clears it).
+pub fn set_declarative(d: &Document, root: NodeId, declarative: bool) {
+    with_table_mut(d, |t| {
+        if let Some(h) = t.host_of.get(&root).copied() {
+            if let Some(i) = t.by_host.get_mut(&h) {
+                i.declarative = declarative;
+            }
+        }
+    });
+}
+
 /// `host`'s shadow root, if `host` is a shadow host.
 pub fn shadow_root_of(d: &Document, host: NodeId) -> Option<ShadowRootInfo> {
     with_table(d, |t| t.by_host.get(&host).copied()).flatten()

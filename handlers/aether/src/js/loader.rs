@@ -75,6 +75,99 @@ thread_local! {
     static OPENED: RefCell<HashMap<usize, String>> = RefCell::new(HashMap::new());
     /// The executing script is external and was not inserted by the parser (`document.write` is ignored).
     static EXTERNAL_ASYNC_RUNNING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The arena length up to which the parser's insertions have been handed to the DOM hooks (nodes
+    /// at or past it were created since: by the parser, or by a script — see [`parser_inserted`]).
+    static PARSED_UPTO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Every node created so far is known to the DOM hooks (a script's nodes went through the binding's
+/// own mutation algorithms; only what the parser makes from here on is new to them).
+fn mark_parsed_upto() {
+    let n = with_doc(|d| d.nodes.len());
+    PARSED_UPTO.with(|w| w.set(n));
+}
+
+/// The parser's insertions since the last call, handed to the DOM's insertion hooks (AETHERDEBT SR93,
+/// the AETHERSHADOW owed loader hook). The tree builder works on the document while it is out of the
+/// page arena, so nothing it inserts passes through the binding's mutation algorithms; here, each time
+/// the document comes back to the arena (a script end tag, a `document.write` returning, EOF), the
+/// nodes created since then are walked once:
+///
+/// - template contents ownership: a new subtree under a template's contents takes that contents'
+///   node document; a new `<template>`'s contents take the template contents owner;
+/// - declarative shadow roots for the templates that are closed (not an ancestor of `current`, the
+///   script the parser stopped at — the parser may still be appending into an open one);
+/// - for each new node whose parent existed before (the top of an inserted subtree), DOM "insert"'s
+///   steps (`dom::inserted_steps`): the childList record for MutationObservers (one record per node,
+///   as the parser inserts them one at a time), slot assignment, and connectedCallback / upgrade for
+///   the custom elements that became connected (a definition registered before the parser reached
+///   the element now upgrades it, HTML §13.2.6.1 "create an element for the token" at the next
+///   script boundary); a new declarative shadow root under an older host is connected the same way;
+/// - `settle`: the observer microtask and the custom element reactions run before `current` does.
+fn parser_inserted(vm: &mut Vm, current: Option<usize>) {
+    let from = PARSED_UPTO.with(|w| w.get());
+    let to = with_doc(|d| d.nodes.len());
+    if from >= to {
+        return;
+    }
+    // Template contents ownership.
+    let tops: Vec<(usize, usize)> = with_doc(|d| {
+        (from..to).filter_map(|i| d.parent(NodeId(i)).filter(|p| p.0 < from).map(|p| (i, p.0))).collect()
+    });
+    for &(n, p) in &tops {
+        let doc = dom::node_document(p);
+        if doc != dom::main_doc() {
+            let ids: Vec<usize> = with_doc(|d| std::iter::once(NodeId(n)).chain(d.descendants(NodeId(n))).map(|i| i.0).collect());
+            for i in ids {
+                dom::set_node_doc(i, doc);
+            }
+        }
+    }
+    let templates: Vec<usize> =
+        with_doc(|d| (from..to).filter(|&i| d.element(NodeId(i)).is_some_and(|e| e.template_contents.is_some())).collect());
+    for t in templates {
+        dom::set_template_contents_doc(t, dom::node_document(t));
+    }
+    // Declarative shadow roots: templates that are closed.
+    let open: Vec<usize> = match current {
+        Some(c) => with_doc(|d| {
+            let mut v = Vec::new();
+            let mut cur = Some(NodeId(c));
+            while let Some(n) = cur {
+                v.push(n.0);
+                cur = d.parent(n).or_else(|| {
+                    (0..d.nodes.len()).find(|&i| d.element(NodeId(i)).and_then(|e| e.template_contents) == Some(n)).map(NodeId)
+                });
+            }
+            v
+        }),
+        None => Vec::new(),
+    };
+    let fresh = |i: usize| i >= from && !open.contains(&i);
+    super::shadow::attach_declarative_where(Document::ROOT.0, &fresh);
+    let end = with_doc(|d| d.nodes.len());
+    PARSED_UPTO.with(|w| w.set(end));
+    // DOM "insert" steps for the top of each inserted subtree (still in the tree after the pass).
+    with_doc(|d| {
+        for i in from..end {
+            let n = NodeId(i);
+            match d.parent(n) {
+                Some(p) if p.0 < from => {
+                    crate::dom::inserted_steps(d, p, &[n], d.prev_sibling(n), d.next_sibling(n));
+                }
+                None => {
+                    if let Some(h) = crate::dom::shadow::host_of(d, n).filter(|h| h.0 < from) {
+                        crate::dom::shadow::refresh(d, n);
+                        if crate::dom::shadow::is_connected(d, h) {
+                            crate::dom::custom::connected(d, n);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    super::mutation::settle(vm);
 }
 
 fn arena() -> crate::dom::Arena {
@@ -154,6 +247,9 @@ pub fn load(url: &str, html: &str, pre: Prefetched, viewport: (f32, f32), extern
     let mut ctx = Box::new(ParserCtx { tb, tz, blocking: None, deferred: Vec::new(), asap: Vec::new(), nesting: 0 });
     // The tree builder starts with the (empty) document; the arena holds a placeholder while parsing.
     doc_to_parser(&mut ctx);
+    // Everything the new document holds before the first token is known to the hooks.
+    let known = ctx.tb.doc.nodes.len();
+    PARSED_UPTO.with(|w| w.set(known));
     put_ctx(ctx);
     parse_until_eof(&mut engine.vm);
     the_end(&mut engine, was_frozen);
@@ -169,6 +265,7 @@ fn parse_until_eof(vm: &mut Vm) {
         if let Some(el) = ready {
             doc_to_arena(&mut ctx);
             put_ctx(ctx);
+            parser_inserted(vm, Some(el.0));
             prepare_parser_script(vm, el.0);
             // A written external script blocks the parser until it has run.
             loop {
@@ -180,6 +277,7 @@ fn parse_until_eof(vm: &mut Vm) {
                     None => break,
                 }
             }
+            mark_parsed_upto();
             let Some(mut ctx) = take_ctx() else { return };
             doc_to_parser(&mut ctx);
             put_ctx(ctx);
@@ -190,6 +288,7 @@ fn parse_until_eof(vm: &mut Vm) {
             doc_to_arena(&mut ctx);
             // Keep the context (with the deferred lists) for the end; the arena now owns the doc.
             put_ctx(ctx);
+            parser_inserted(vm, None);
             return;
         }
         put_ctx(ctx);
@@ -618,6 +717,8 @@ pub fn document_write(vm: &mut Vm, doc: usize, text: &str) -> JsResult<()> {
 
 /// Inserts `text` at the parser's insertion point and spins the parser over it.
 fn write_into_parser(vm: &mut Vm, text: &str) {
+    let writer = page(|p| p.current_script);
+    mark_parsed_upto();
     let Some(mut ctx) = take_ctx() else { return };
     let limit = ctx.tz.insert_at_cursor(text);
     doc_to_parser(&mut ctx);
@@ -629,7 +730,9 @@ fn write_into_parser(vm: &mut Vm, text: &str) {
         if let Some(el) = ctx.tb.script_ready.take() {
             doc_to_arena(&mut ctx);
             put_ctx(ctx);
+            parser_inserted(vm, Some(el.0));
             prepare_parser_script(vm, el.0);
+            mark_parsed_upto();
             let Some(c) = take_ctx() else { return };
             ctx = c;
             doc_to_parser(&mut ctx);
@@ -645,6 +748,7 @@ fn write_into_parser(vm: &mut Vm, text: &str) {
     }
     doc_to_arena(&mut ctx);
     put_ctx(ctx);
+    parser_inserted(vm, writer);
 }
 
 /// `document.open()`: an opened document's content is replaced by what is written to it.

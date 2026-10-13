@@ -200,6 +200,9 @@ pub(crate) struct PageState {
     /// Node document for nodes not owned by the main document.
     pub node_doc: HashMap<usize, usize>,
     pub docs: HashMap<usize, DocMeta>,
+    /// HTML "appropriate template contents owner document" per document (AETHERDEBT SR93): document →
+    /// its inert template contents owner.
+    pub template_owner: HashMap<usize, usize>,
     /// Attr objects: (element, attribute key) → (Attr, root).
     pub attrs: HashMap<(usize, String), (Obj, usize)>,
     pub listeners: HashMap<TargetKey, Vec<Listener>>,

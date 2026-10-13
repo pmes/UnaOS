@@ -19,7 +19,10 @@
 //! siblings are out of reach, and the host alone reports the reserved attribute [`HOST_MARK`] that
 //! `:host` / `:host(<compound>)` are rewritten to before css_core parses (css_core has no `:host`;
 //! `[attr]` has the pseudo-class's specificity). Outside a shadow tree nothing reports the mark, so
-//! `:host` matches nothing, as the spec says. [`Selectors::matches_slotted`] matches `::slotted()`.
+//! `:host` matches nothing, as the spec says. In its tree's scope the host is FEATURELESS
+//! (AETHERDEBT SR93): every other selector misses it, and a `:host(<compound>)` argument — rewritten
+//! to a second reserved attribute indexing the compiled compound — is matched against the host with
+//! its features on. [`Selectors::matches_slotted`] matches `::slotted()`.
 
 use super::NodeRef;
 use css_core::matching::{html_state, matches_list, Element, MatchContext};
@@ -33,24 +36,76 @@ pub struct El<'a> {
     pub id: NodeId,
     /// The shadow host whose shadow tree this match runs in (None: a light-tree match).
     pub host: Option<NodeId>,
+    /// The scoped host is matched by a `:host(<compound>)` argument, where it has its own features
+    /// (elsewhere in its shadow tree's scope it is featureless — AETHERDEBT SR93).
+    featured: bool,
 }
 
 /// The attribute only the in-scope shadow host reports (`:host` is rewritten to it).
 pub const HOST_MARK: &str = "__aether_host__";
 
+/// The attribute-name prefix `:host(<compound>)` is rewritten to: `[__aether_hostctx_<n>]`, where
+/// `<n>` indexes the compiled compound in [`HOST_ARGS`]; the in-scope host reports the name when the
+/// compound matches it with its features on.
+const HOST_ARG_PREFIX: &str = "__aether_hostctx_";
+
+thread_local! {
+    /// `:host()` arguments compiled once each (source text, list), indexed by the rewrite.
+    static HOST_ARGS: std::cell::RefCell<Vec<(String, SelectorList)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The index of `:host()` argument `text` in [`HOST_ARGS`] (compiled on first sight; None when it
+/// does not parse, or the table is full — then the rewrite keeps the old `:is()` form).
+fn host_arg_index(text: &str) -> Option<usize> {
+    HOST_ARGS.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(i) = t.iter().position(|(s, _)| s == text) {
+            return Some(i);
+        }
+        if t.len() >= 4096 {
+            return None;
+        }
+        let list = parse_selector_str(text, &Namespaces::default()).ok()?;
+        t.push((text.to_string(), list));
+        Some(t.len() - 1)
+    })
+}
+
 impl<'a> El<'a> {
     pub fn new(doc: &'a Document, id: NodeId) -> Self {
-        El { doc, id, host: None }
+        El { doc, id, host: None, featured: false }
     }
     /// An element matched inside the shadow tree of `host` (None: as [`El::new`]).
     pub fn in_tree(doc: &'a Document, id: NodeId, host: Option<NodeId>) -> Self {
-        El { doc, id, host }
+        El { doc, id, host, featured: false }
     }
     fn hop(&self, id: Option<NodeId>) -> Option<Self> {
-        id.map(|id| El { doc: self.doc, id, host: self.host })
+        id.map(|id| El { doc: self.doc, id, host: self.host, featured: false })
     }
     fn is_scoped_host(&self) -> bool {
         self.host == Some(self.id)
+    }
+    /// CSS Scoping §3.1: in its own shadow tree's scope the host is featureless — only `:host`,
+    /// `:host()` (and `:host-context()`) see it; type, class, id, attribute and state selectors
+    /// match nothing on it.
+    fn featureless(&self) -> bool {
+        self.is_scoped_host() && !self.featured
+    }
+    /// Does the scoped host match `:host()` argument `n` (with its features on)?
+    fn host_arg_matches(&self, n: usize) -> bool {
+        let me = El { doc: self.doc, id: self.id, host: self.host, featured: true };
+        HOST_ARGS.with(|t| {
+            let t = t.borrow();
+            t.get(n).is_some_and(|(_, list)| matches_list(list, &me, &MatchContext { scope: None }))
+        })
+    }
+    /// The `:host()` arguments the scoped host matches, as their rewritten attribute names.
+    fn host_arg_names(&self) -> Vec<String> {
+        if !self.featureless() {
+            return Vec::new();
+        }
+        let n = HOST_ARGS.with(|t| t.borrow().len());
+        (0..n).filter(|&i| self.host_arg_matches(i)).map(|i| format!("{HOST_ARG_PREFIX}{i}")).collect()
     }
     fn element(&self) -> Option<&'a html_core::Element> {
         self.doc.element(self.id)
@@ -75,14 +130,20 @@ fn is_html_ws(c: char) -> bool {
 
 impl Element for El<'_> {
     fn local_name(&self) -> &str {
+        if self.featureless() {
+            return "";
+        }
         self.element().map(|e| e.local.as_str()).unwrap_or("")
     }
     fn namespace_url(&self) -> &str {
         self.element().map(|e| e.ns.url()).unwrap_or("")
     }
     fn each_attr(&self, f: &mut dyn FnMut(&str, &str, &str) -> bool) -> bool {
-        if self.is_scoped_host() && f("", HOST_MARK, "") {
-            return true;
+        if self.featureless() {
+            if f("", HOST_MARK, "") {
+                return true;
+            }
+            return self.host_arg_names().iter().any(|n| f("", n, ""));
         }
         match self.element() {
             Some(e) => e.attrs.iter().any(|a| f(a.ns.url(), &a.local, &a.value)),
@@ -118,6 +179,9 @@ impl Element for El<'_> {
         self.hop(self.doc.element_children(self.id).next())
     }
     fn is_empty(&self) -> bool {
+        if self.featureless() {
+            return false;
+        }
         self.doc.children(self.id).all(|c| match self.doc.data(c) {
             NodeData::Element(_) => false,
             NodeData::Text(t) => t.is_empty(),
@@ -127,25 +191,47 @@ impl Element for El<'_> {
     /// The document element: the parent is the Document node (a detached element or a fragment's
     /// top element has no element parent either, but is not `:root`).
     fn is_root(&self) -> bool {
+        if self.featureless() {
+            return false;
+        }
         self.doc.parent(self.id).is_some_and(|p| matches!(self.doc.data(p), NodeData::Document))
     }
     // The hot simple selectors read the attribute list directly.
     fn attr(&self, name: &str) -> Option<String> {
         if name == HOST_MARK {
-            return self.is_scoped_host().then(String::new);
+            return self.featureless().then(String::new);
+        }
+        if let Some(n) = name.strip_prefix(HOST_ARG_PREFIX) {
+            let n: usize = n.parse().ok()?;
+            return (self.featureless() && self.host_arg_matches(n)).then(String::new);
+        }
+        if self.featureless() {
+            return None;
         }
         self.element()?.attrs.iter().find(|a| a.ns.url().is_empty() && a.local == name).map(|a| a.value.clone())
     }
     fn has_attr(&self, name: &str) -> bool {
         if name == HOST_MARK {
-            return self.is_scoped_host();
+            return self.featureless();
+        }
+        if let Some(n) = name.strip_prefix(HOST_ARG_PREFIX) {
+            return self.featureless() && n.parse().is_ok_and(|n| self.host_arg_matches(n));
+        }
+        if self.featureless() {
+            return false;
         }
         self.element().is_some_and(|e| e.attrs.iter().any(|a| a.ns.url().is_empty() && a.local == name))
     }
     fn id_is(&self, id: &str) -> bool {
+        if self.featureless() {
+            return false;
+        }
         self.element().and_then(|e| e.attr("id")).is_some_and(|v| v == id)
     }
     fn has_class(&self, class: &str) -> bool {
+        if self.featureless() {
+            return false;
+        }
         self.element().and_then(|e| e.attr("class")).is_some_and(|v| v.split(is_html_ws).any(|c| c == class))
     }
     // `state` is css_core's `html_state` (the attribute-derived states: `:link`, `:checked`,
@@ -154,6 +240,9 @@ impl Element for El<'_> {
     // ancestors, as [`El::set_hover_chain`] last set it) and the focus states read from the engine's
     // focus (AETHERGEN, SR71). A static render has no pointer and no focus, so neither matches.
     fn state(&self, s: ElementState) -> bool {
+        if self.featureless() {
+            return false;
+        }
         match s {
             ElementState::Hover => is_hovered(self.doc, self.id),
             ElementState::Focus | ElementState::FocusVisible | ElementState::FocusWithin => {
@@ -354,11 +443,24 @@ fn rewrite_host(s: &str) -> Option<String> {
                 }
                 let Some(end) = end else { return None };
                 let inner: String = b[i + 6..end].iter().collect();
+                // `[mark][__aether_hostctx_<n>]`: the compound is matched against the host with its
+                // features on (the host is featureless to everything else in its tree).
                 out.push('[');
                 out.push_str(HOST_MARK);
-                out.push_str("]:is(");
-                out.push_str(&inner);
-                out.push(')');
+                out.push(']');
+                match host_arg_index(inner.trim()) {
+                    Some(n) => {
+                        out.push('[');
+                        out.push_str(HOST_ARG_PREFIX);
+                        out.push_str(&n.to_string());
+                        out.push(']');
+                    }
+                    None => {
+                        out.push_str(":is(");
+                        out.push_str(&inner);
+                        out.push(')');
+                    }
+                }
                 i = end + 1;
             } else {
                 out.push('[');
