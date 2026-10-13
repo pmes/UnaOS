@@ -1459,6 +1459,90 @@ fn table_part(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(dom::wrap_opt(vm, hit))
 }
 
+/// Where HTML §4.9.1 puts a table's `which` part: a caption is "the first node of the table element"; a thead
+/// goes "immediately before the first element in the table element that is neither a caption element nor a
+/// colgroup element, if any, or at the end"; a tfoot "at the end".
+fn table_part_reference(el: usize, which: &str) -> Option<usize> {
+    with_doc(|d| match which {
+        "caption" => d.first_child(NodeId(el)).map(|c| c.0),
+        "thead" => d.children(NodeId(el)).find(|c| d.element(*c).is_some_and(|e| !e.is_html("caption") && !e.is_html("colgroup"))).map(|c| c.0),
+        _ => None,
+    })
+}
+
+/// The `caption` / `tHead` / `tFoot` setters (HTML §4.9.1): the value's IDL type is
+/// `HTMLTableCaptionElement?` / `HTMLTableSectionElement?` (anything else is a TypeError); a section that is not
+/// the right one is a HierarchyRequestError; the first such child is removed and the value inserted in its place
+/// (see [`table_part_reference`]).
+fn table_part_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let which = callee_str(vm, ctx);
+    let (iface_name, prop, tags): (&str, &str, &[&str]) = match which.as_str() {
+        "caption" => ("HTMLTableCaptionElement", "caption", &["caption"]),
+        "thead" => ("HTMLTableSectionElement", "tHead", &["thead", "tbody", "tfoot"]),
+        _ => ("HTMLTableSectionElement", "tFoot", &["thead", "tbody", "tfoot"]),
+    };
+    let v = arg(vm, ctx, 0);
+    let new = if matches!(v, Value::Null) {
+        None
+    } else {
+        match dom::node_of(vm, &v) {
+            Some(n) if with_doc(|d| tags.iter().any(|t| dom::is_html_tag(d, n, t))) => Some(n),
+            _ => return vm.throw_type(&format!("Failed to set the '{prop}' property on 'HTMLTableElement': The provided value is not of type '{iface_name}'.")),
+        }
+    };
+    if let Some(n) = new {
+        if !with_doc(|d| dom::is_html_tag(d, n, &which)) {
+            return throw_dom(vm, "HierarchyRequestError", &format!("Failed to set the '{prop}' property on 'HTMLTableElement': Not a {which} element."));
+        }
+    }
+    if let Some(old) = first_child_tag(el, &which) {
+        dom::remove(vm, old);
+    }
+    if let Some(n) = new {
+        let reference = table_part_reference(el, &which);
+        dom::pre_insert(vm, n, el, reference)?;
+    }
+    Ok(Value::Undefined)
+}
+
+/// `createCaption()` / `createTHead()` / `createTFoot()`: the first such child, or a new one inserted where
+/// [`table_part_reference`] says.
+fn table_create_part(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let which = callee_str(vm, ctx);
+    if let Some(n) = first_child_tag(el, &which) {
+        return Ok(wrap(vm, n));
+    }
+    let n = dom::create_element(dom::node_document(el), Namespace::Html, &which);
+    let reference = table_part_reference(el, &which);
+    dom::insert(vm, n, el, reference);
+    Ok(wrap(vm, n))
+}
+
+/// `deleteCaption()` / `deleteTHead()` / `deleteTFoot()`: remove the first such child, if any.
+fn table_delete_part(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let which = callee_str(vm, ctx);
+    if let Some(n) = first_child_tag(el, &which) {
+        dom::remove(vm, n);
+    }
+    Ok(Value::Undefined)
+}
+
+/// `createTBody()`: a new tbody "immediately after the last tbody element child in the table element, if any, or
+/// at the end of the table element".
+fn table_create_tbody(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let el = this_element(vm, ctx)?;
+    let n = dom::create_element(dom::node_document(el), Namespace::Html, "tbody");
+    let reference = with_doc(|d| {
+        let last = d.children(NodeId(el)).filter(|c| d.element(*c).is_some_and(|e| e.is_html("tbody"))).last();
+        last.and_then(|l| d.next_sibling(l)).map(|c| c.0)
+    });
+    dom::insert(vm, n, el, reference);
+    Ok(wrap(vm, n))
+}
+
 fn index_in(parent_list: Vec<usize>, el: usize) -> f64 {
     parent_list.iter().position(|x| *x == el).map(|i| i as f64).unwrap_or(-1.0)
 }
@@ -2031,9 +2115,17 @@ pub fn install(vm: &mut Vm) {
     let tbl = iface("HTMLTableElement").unwrap().proto;
     attr_with(vm, tbl, "rows", table_coll, None, s("rows"));
     attr_with(vm, tbl, "tBodies", table_coll, None, s("tbodies"));
-    attr_with(vm, tbl, "caption", table_part, None, s("caption"));
-    attr_with(vm, tbl, "tHead", table_part, None, s("thead"));
-    attr_with(vm, tbl, "tFoot", table_part, None, s("tfoot"));
+    // AETHERWPT2 (SR135): HTML §4.9.1's settable caption / tHead / tFoot and their create / delete methods.
+    attr_with(vm, tbl, "caption", table_part, Some(table_part_set), s("caption"));
+    attr_with(vm, tbl, "tHead", table_part, Some(table_part_set), s("thead"));
+    attr_with(vm, tbl, "tFoot", table_part, Some(table_part_set), s("tfoot"));
+    for (name, tag) in [("createCaption", "caption"), ("createTHead", "thead"), ("createTFoot", "tfoot")] {
+        op_with(vm, tbl, name, 0, table_create_part, s(tag));
+    }
+    for (name, tag) in [("deleteCaption", "caption"), ("deleteTHead", "thead"), ("deleteTFoot", "tfoot")] {
+        op_with(vm, tbl, name, 0, table_delete_part, s(tag));
+    }
+    op(vm, tbl, "createTBody", 0, table_create_tbody);
     op(vm, tbl, "insertRow", 0, insert_row);
     op(vm, tbl, "deleteRow", 1, delete_row);
     let sec = iface("HTMLTableSectionElement").unwrap().proto;

@@ -118,3 +118,53 @@ new Blob(['a\r\nb\rc'], { endings: 'native' }).text().then(function (t) { R.push
     ));
     assert_eq!(eval(&mut e, "R.join('|')"), "TypeError|TypeError|2|5|4|-1|0|1|\"a\\nb\\nc\"");
 }
+
+/// G5 — HTML §4.9.1: `caption` / `tHead` / `tFoot` setters (type check, HierarchyRequestError, placement), the
+/// create / delete methods and `createTBody` placement.
+#[test]
+fn g5_table_caption_thead_tfoot_tbody() {
+    let got = answers(
+        r#"
+var t = document.createElement('table');
+t.appendChild(document.createElement('colgroup'));
+t.appendChild(document.createElement('tbody'));
+var tags = function () { return Array.prototype.map.call(t.childNodes, function (n) { return n.localName; }).join(','); };
+var h = t.createTHead(), c = t.createCaption(), f = t.createTFoot();
+R.push(tags(), t.createTHead() === h, t.tHead === h);
+var b = t.createTBody();
+R.push(tags(), b.previousSibling.localName);
+try { t.caption = document.createElement('div'); R.push('no throw'); } catch (e) { R.push(e.name); }
+try { t.tHead = document.createElement('tbody'); R.push('no throw'); } catch (e) { R.push(e.name); }
+var c2 = document.createElement('caption');
+t.caption = c2;
+R.push(t.caption === c2, t.firstChild === c2, c.parentNode === null);
+t.deleteTHead(); t.deleteTFoot(); t.deleteCaption();
+R.push(tags());
+t.tFoot = f;
+R.push(tags());
+t.caption = null;
+R.push(String(t.caption));
+"#,
+    );
+    assert_eq!(
+        got,
+        "caption,colgroup,thead,tbody,tfoot|true|true|caption,colgroup,thead,tbody,tbody,tfoot|tbody|TypeError|HierarchyRequestError|true|true|true|colgroup,tbody,tbody|colgroup,tbody,tbody,tfoot|null"
+    );
+}
+
+/// G9 — Console §1.2/§1.4 and WebIDL §3.13: a throwing label conversion propagates; the namespace object's
+/// [[Prototype]] is an empty object whose [[Prototype]] is %Object.prototype%.
+#[test]
+fn g9_console_namespace_and_labels() {
+    let got = answers(
+        r#"
+var proto = Object.getPrototypeOf(console);
+R.push(Object.getOwnPropertyNames(proto).length, Object.getPrototypeOf(proto) === Object.prototype, Object.prototype.toString.call(console));
+['count', 'countReset', 'time', 'timeLog', 'timeEnd'].forEach(function (m) {
+    try { console[m]({ toString: function () { throw new Error('conversion error'); } }); R.push(m + ':no throw'); }
+    catch (e) { R.push(m + ':' + e.message); }
+});
+"#,
+    );
+    assert_eq!(got, "0|true|[object console]|count:conversion error|countReset:conversion error|time:conversion error|timeLog:conversion error|timeEnd:conversion error");
+}

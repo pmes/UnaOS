@@ -276,10 +276,12 @@ fn console_method(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             std::cell::RefCell::new(ConsoleState { page: String::new(), lines: 0, depth: 0, counts: Vec::new(), timers: Vec::new() })
         };
     }
-    fn label_of(vm: &mut Vm, ctx: &CallCtx) -> String {
+    // AETHERWPT2 (SR135): the label is a DOMString argument (console §1.2, §1.4) — its conversion's exception
+    // propagates to the caller (console-label-conversion), it is not swallowed into "default".
+    fn label_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<String> {
         match arg(vm, ctx, 0) {
-            Value::Undefined => "default".to_string(),
-            v => vm.to_string(&v).map(|s| s.to_rust()).unwrap_or_else(|_| "default".to_string()),
+            Value::Undefined => Ok("default".to_string()),
+            v => Ok(vm.to_string(&v)?.to_rust()),
         }
     }
     fn key_text(k: &PropertyKey) -> Option<String> {
@@ -401,7 +403,7 @@ fn console_method(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
         "groupEnd" => None,
         "count" | "countReset" => {
-            let label = label_of(vm, ctx);
+            let label = label_of(vm, ctx)?;
             STATE.with(|st| {
                 let mut st = st.borrow_mut();
                 let at = st.counts.iter().position(|(l, _)| *l == label);
@@ -426,7 +428,7 @@ fn console_method(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             })
         }
         "time" | "timeLog" | "timeEnd" => {
-            let label = label_of(vm, ctx);
+            let label = label_of(vm, ctx)?;
             let extra = if level == "timeLog" { console_format(vm, ctx, 1) } else { String::new() };
             STATE.with(|st| {
                 let mut st = st.borrow_mut();
@@ -1454,7 +1456,10 @@ pub fn install(vm: &mut Vm) {
 
     // console
     let op_ = vm.intr().object_proto;
-    let console = vm.new_object(Some(op_));
+    // AETHERWPT2 (SR135): a WebIDL namespace object's [[Prototype]] is an empty object whose [[Prototype]] is
+    // %Object.prototype% (WebIDL §3.13, console-is-a-namespace).
+    let ns_proto = vm.new_object(Some(op_));
+    let console = vm.new_object(Some(ns_proto));
     let fp = vm.intr().function_proto;
     for name in ["log", "info", "warn", "error", "debug", "trace", "dir", "dirxml", "table", "group", "groupCollapsed", "groupEnd", "time", "timeEnd", "timeLog", "count", "countReset"] {
         let f = vm.make_native_with(name, 0, console_method, false, Some(fp), vec![s(name)]);
