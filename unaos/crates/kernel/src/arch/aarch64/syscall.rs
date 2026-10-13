@@ -16247,7 +16247,7 @@ macro_rules! u7stk {
 }
 
 pub fn u7_launcher(demo_cpu: usize) {
-    u7stk!("entry");
+    u7stk!("entry"); #[cfg(feature = "desktop_firmware")] crate::video::desktop_firmware::cascade_claim(); // PIWM: the boot witness cascade claims the panel FIRST, before any launcher below mints or reads a row — the splash hold (a full-panel modal compat row, `SPLASH_BG` 0x060608) does not go up over it, or comes down now if the desktop activated first (`desktop_firmware::cascade_claim`); `arm()` at this chain's end hands the panel back. Knob-off the `#[cfg]` erases the statement. ⚠ LINE-NEUTRAL append.
     // U8, then U9, then U10, ride the SAME kernel task, each strictly after the prior flow (every exit path —
     // PASS, FAIL, or skip — falls through): the ordering gate the *_LAUNCH_DONE statics provide between
     // separately spawned launchers is here the program order of one task. Each launcher's verdict waits on its
