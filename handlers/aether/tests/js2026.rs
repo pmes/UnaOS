@@ -1,8 +1,9 @@
 //! AETHERJS2 (LEDGER SR106): the page-level half of the 2026 JavaScript surface, each test asserting the
 //! observable a page reads back — import maps through every module path (HTML §8.1.5.3/§8.1.5.5), the
-//! event loop's ordering rules (HTML §8.1.7.3: microtasks after each task and script, timers by due time,
-//! animation frames with one timestamp, microtasks between frame callbacks, in-frame cancellation,
-//! `unhandledrejection` / `rejectionhandled` tasks per §8.1.5.7), `structuredClone` with `transfer`,
+//! event loop's ordering rules, one test per rule (HTML §8.1.7.3: microtasks after each task and script,
+//! timers by due time, animation frames with one timestamp, microtasks between frame callbacks, in-frame
+//! cancellation, `unhandledrejection` / `rejectionhandled` tasks per §8.1.5.7, the Prioritized Task
+//! Scheduling queues), `structuredClone` with `transfer`,
 //! `AbortSignal` across `fetch`, the inline event handler scope chain (§8.1.8.1) with [Unscopable], and Intl
 //! inside a page. Expected values are Chromium's for the same pages.
 
@@ -69,49 +70,80 @@ res.tla = (await import('lib')).name;
     assert_eq!(eval(&mut e, "[res.classic, res.bare, res.module, res.meta, res.tla].join('|')"), "lib|TypeError|42,lib,util,alt|true|lib");
 }
 
-/// HTML §8.1.7.3 / §8.1.5.7: one ordering assertion per rule (see the module docs).
+fn page(script: &str) -> String {
+    format!("<!doctype html><html><body><script>{script}</script></body></html>")
+}
+
+/// HTML §8.1.7.3 rule 1: the microtask checkpoint after a script runs every promise job and
+/// `queueMicrotask` callback, in FIFO order, before any task (here a 0 ms timer).
 #[test]
-fn event_loop_ordering_rules() {
-    let html = r#"<!doctype html><html><body>
-<script>
-var log = [];
-addEventListener('unhandledrejection', function (e) { log.push('ur:' + e.reason); e.preventDefault(); });
-addEventListener('rejectionhandled', function (e) { log.push('rh:' + e.reason); });
-setTimeout(function () { log.push('late'); }, 1000);
-setTimeout(function () { log.push('t1'); Promise.resolve().then(function () { log.push('t1m'); }); }, 0);
-setTimeout(function () { log.push('t2'); }, 0);
-Promise.resolve().then(function () { log.push('m1'); });
-queueMicrotask(function () { log.push('m2'); });
-var rejected = Promise.reject('y');
-setTimeout(function () { rejected.catch(function () {}); }, 0);
-log.push('s');
-var order2 = [];
-</script>
-<script>Promise.resolve().then(function () { order2.push('mA'); });</script>
-<script>order2.push('B');</script>
-<script>
-var raf = [], t1, id2;
-requestAnimationFrame(function (ts) {
-  raf.push('r1'); t1 = ts;
-  Promise.resolve().then(function () { raf.push('r1m'); });
-  requestAnimationFrame(function () { raf.push('r3'); });
-  cancelAnimationFrame(id2);
-});
-id2 = requestAnimationFrame(function () { raf.push('r2'); });
-requestAnimationFrame(function (ts) { raf.push(ts === t1 ? 'r4same' : 'r4diff'); });
-</script>
-</body></html>"#;
-    let mut e = load("http://ordering.test/", html, 3_000);
-    // Microtasks run after the script, a rejection is notified by a task before the timers of the same
-    // turn, each timer is a task with its own checkpoint, a handler attached later queues rejectionhandled.
-    assert_eq!(eval(&mut e, "log.join()"), "s,m1,m2,ur:y,t1,t1m,t2,rh:y,late");
-    // A checkpoint between two parser-inserted scripts.
-    assert_eq!(eval(&mut e, "order2.join()"), "mA,B");
-    // One frame: microtasks between callbacks, a canceled sibling skipped, one timestamp; a callback
-    // registered during the frame waits for the next one.
+fn event_loop_microtasks_before_the_next_task() {
+    let mut e = load(
+        "http://ordering.test/1",
+        &page("var log = []; setTimeout(function () { log.push('t'); }, 0); Promise.resolve().then(function () { log.push('m1'); }); queueMicrotask(function () { log.push('m2'); }); log.push('s');"),
+        500,
+    );
+    assert_eq!(eval(&mut e, "log.join()"), "s,m1,m2,t");
+}
+
+/// Rule 2: "clean up after running script" checkpoints between two parser-inserted scripts.
+#[test]
+fn event_loop_checkpoint_between_scripts() {
+    let html = "<!doctype html><html><body><script>var log = []; Promise.resolve().then(function () { log.push('mA'); });</script><script>log.push('B');</script></body></html>";
+    let mut e = load("http://ordering.test/2", html, 500);
+    assert_eq!(eval(&mut e, "log.join()"), "mA,B");
+}
+
+/// Rule 3 (HTML §8.6 timers): timers run in due order, ties in insertion order, each its own task with
+/// its own checkpoint (a microtask a timer queues runs before the next timer).
+#[test]
+fn event_loop_timers_are_tasks_in_due_order() {
+    let mut e = load(
+        "http://ordering.test/3",
+        &page("var log = []; setTimeout(function () { log.push('late'); }, 50); setTimeout(function () { log.push('t1'); Promise.resolve().then(function () { log.push('t1m'); }); }, 0); setTimeout(function () { log.push('t2'); }, 0);"),
+        500,
+    );
+    assert_eq!(eval(&mut e, "log.join()"), "t1,t1m,t2,late");
+}
+
+/// Rule 4 (HTML "run the animation frame callbacks"): one timestamp for the frame, microtasks between
+/// callbacks, a sibling canceled by an earlier callback is skipped, a callback registered during the frame
+/// runs in the next one.
+#[test]
+fn event_loop_animation_frame_rules() {
+    let mut e = load(
+        "http://ordering.test/4",
+        &page("var raf = [], t1, id2; requestAnimationFrame(function (ts) { raf.push('r1'); t1 = ts; Promise.resolve().then(function () { raf.push('r1m'); }); requestAnimationFrame(function () { raf.push('r3'); }); cancelAnimationFrame(id2); }); id2 = requestAnimationFrame(function () { raf.push('r2'); }); requestAnimationFrame(function (ts) { raf.push(ts === t1 ? 'r4same' : 'r4diff'); });"),
+        500,
+    );
     assert_eq!(eval(&mut e, "raf.join()"), "r1,r1m,r4same,r3");
-    // The canceled unhandledrejection never reached the console.
+}
+
+/// Rule 5 (HTML §8.1.5.7): a rejection still unhandled after the checkpoint is notified by a task
+/// (`unhandledrejection`, cancelable — canceled, nothing reaches the console) that runs before the timers
+/// of the same turn; handling it later queues `rejectionhandled`.
+#[test]
+fn event_loop_rejection_notification_tasks() {
+    let mut e = load(
+        "http://ordering.test/5",
+        &page("var log = []; addEventListener('unhandledrejection', function (e) { log.push('ur:' + e.reason); e.preventDefault(); }); addEventListener('rejectionhandled', function (e) { log.push('rh:' + e.reason); }); var p = Promise.reject('y'); setTimeout(function () { log.push('t'); p.catch(function () {}); }, 0); setTimeout(function () { log.push('t2'); }, 20);"),
+        500,
+    );
+    assert_eq!(eval(&mut e, "log.join()"), "ur:y,t,rh:y,t2");
     assert!(!aether::js::console_lines().iter().any(|(_, l)| l.contains("Uncaught (in promise)")));
+}
+
+/// Rule 6 (WICG Prioritized Task Scheduling): user-blocking before user-visible before background, a
+/// yield() continuation ahead of its priority's tasks, setPriority moving a queued task, abort rejecting.
+#[test]
+fn event_loop_scheduler_priorities() {
+    let mut e = load(
+        "http://ordering.test/6",
+        &page("var sch = []; scheduler.postTask(function () { sch.push('bg'); }, { priority: 'background' }); scheduler.postTask(function () { sch.push('uv'); }); scheduler.postTask(function () { sch.push('ub'); }, { priority: 'user-blocking' }); (async function () { sch.push('y0'); await scheduler.yield(); sch.push('y1'); })(); var tc = new TaskController({ priority: 'background' }); scheduler.postTask(function () { sch.push('moved'); }, { signal: tc.signal }); tc.setPriority('user-blocking'); var ac = new AbortController(); scheduler.postTask(function () { sch.push('never'); }, { signal: ac.signal }).catch(function (err) { sch.push(err.name); }); ac.abort();"),
+        500,
+    );
+    assert_eq!(eval(&mut e, "sch.join()"), "y0,AbortError,ub,moved,y1,uv,bg");
+    assert_eq!(eval(&mut e, "tc.signal.priority + ',' + (tc.signal instanceof AbortSignal)"), "user-blocking,true");
 }
 
 /// HTML §2.7 structuredClone (graph, types, DataCloneError, `transfer`) and DOM §3.1 AbortSignal through

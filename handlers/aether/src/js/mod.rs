@@ -633,6 +633,7 @@ impl Engine {
         cssom::install(&mut vm);
         window::install(&mut vm);
         net::install(&mut vm);
+        window::install_scheduler(&mut vm);
         forms::install(&mut vm);
         // AETHERDEBT SR93: DataTransfer (its FileList feeds `input.files`) — after forms: File exists.
         controls::install_data_transfer(&mut vm);

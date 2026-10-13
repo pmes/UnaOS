@@ -1382,3 +1382,138 @@ pub fn install(vm: &mut Vm) {
     // the top context's record (after the preludes, which the nested realms share).
     frames::install(vm);
 }
+
+/// AETHERJS2: installs [`SCHEDULER`]. Runs after `net::install`, whose fetch prelude defines the
+/// EventTarget-based AbortSignal (and `__net_handlers`) that TaskSignal extends.
+pub fn install_scheduler(vm: &mut Vm) {
+    if let Err(e) = vm.run_script_str(SCHEDULER) {
+        let m = vm.error_string(&e);
+        crate::ledger::record_js(&format!("scheduler-prelude-failed:{}", super::clip(&m, 64)));
+    }
+}
+
+/// WICG Prioritized Task Scheduling (`scheduler.postTask`, `scheduler.yield`, `TaskController`,
+/// `TaskSignal`), as Chromium ships it: three priority queues ("user-blocking" before "user-visible" before
+/// "background") drained one task per event-loop task (a 0 ms timer), `yield()` continuations ahead of the
+/// tasks of their priority, `delay`, abort through the signal (the promise rejects with its reason), and
+/// `setPriority` moving the queued tasks of a TaskController's signal (with a `prioritychange` event).
+const SCHEDULER: &str = r#"
+(function () {
+    var PRIOS = ['user-blocking', 'user-visible', 'background'];
+    var queues = { 'user-blocking': [], 'user-visible': [], 'background': [] };
+    var conts = { 'user-blocking': [], 'user-visible': [], 'background': [] };
+    var prio = new WeakMap();
+    var armed = false;
+    var hasWork = function () {
+        for (var i = 0; i < 3; i++) { if (queues[PRIOS[i]].length || conts[PRIOS[i]].length) { return true; } }
+        return false;
+    };
+    var arm = function () {
+        if (!armed && hasWork()) { armed = true; setTimeout(pump, 0); }
+    };
+    var pump = function () {
+        armed = false;
+        for (var i = 0; i < 3; i++) {
+            var p = PRIOS[i];
+            var q = conts[p].length ? conts[p] : queues[p];
+            if (q.length) {
+                var t = q.shift();
+                arm();
+                t.run();
+                return;
+            }
+        }
+    };
+    var checkPrio = function (p, what) {
+        if (PRIOS.indexOf(p) < 0) {
+            throw new TypeError("Failed to execute '" + what + "': The provided value '" + p + "' is not a valid enum value of type TaskPriority.");
+        }
+        return p;
+    };
+    var hide = function (o, name, v) {
+        Object.defineProperty(o, name, { value: v, writable: true, configurable: true, enumerable: false });
+    };
+    function TaskSignal() { throw new TypeError('Illegal constructor'); }
+    TaskSignal.prototype = Object.create(AbortSignal.prototype, {
+        constructor: { value: TaskSignal, writable: true, configurable: true },
+        priority: {
+            get: function () { if (!prio.has(this)) { throw new TypeError('Illegal invocation'); } return prio.get(this); },
+            configurable: true, enumerable: true,
+        },
+    });
+    Object.defineProperty(TaskSignal.prototype, Symbol.toStringTag, { value: 'TaskSignal', configurable: true });
+    __net_handlers(TaskSignal.prototype, ['prioritychange']);
+    class TaskController extends AbortController {
+        constructor(init) {
+            super();
+            var p = init && init.priority !== undefined ? checkPrio(String(init.priority), 'TaskController') : 'user-visible';
+            var sig = this.signal;
+            Object.setPrototypeOf(sig, TaskSignal.prototype);
+            prio.set(sig, p);
+        }
+        setPriority(p) {
+            p = checkPrio(String(p), 'setPriority');
+            var sig = this.signal, old = prio.get(sig);
+            if (p === old) { return; }
+            prio.set(sig, p);
+            [queues, conts].forEach(function (qs) {
+                var moved = qs[old].filter(function (t) { return t.sig === sig && !t.fixed; });
+                qs[old] = qs[old].filter(function (t) { return moved.indexOf(t) < 0; });
+                moved.forEach(function (t) { t.prio = p; qs[p].push(t); });
+            });
+            var e = new Event('prioritychange');
+            Object.defineProperty(e, 'previousPriority', { value: old, enumerable: true });
+            sig.dispatchEvent(e);
+        }
+    }
+    Object.defineProperty(TaskController.prototype, Symbol.toStringTag, { value: 'TaskController', configurable: true });
+    var remove = function (t) {
+        PRIOS.forEach(function (p) {
+            var i = queues[p].indexOf(t);
+            if (i >= 0) { queues[p].splice(i, 1); }
+        });
+    };
+    function Scheduler() { throw new TypeError('Illegal constructor'); }
+    var scheduler = Object.create(Scheduler.prototype);
+    hide(Scheduler.prototype, 'postTask', function postTask(callback, options) {
+        if (typeof callback !== 'function') {
+            throw new TypeError("Failed to execute 'postTask' on 'Scheduler': parameter 1 is not of type 'SchedulerPostTaskCallback'.");
+        }
+        options = options || {};
+        var signal = options.signal;
+        var fixed = options.priority !== undefined;
+        var p = fixed ? checkPrio(String(options.priority), 'postTask') : (signal && prio.has(signal) ? prio.get(signal) : 'user-visible');
+        var delay = Math.max(0, Number(options.delay) || 0);
+        return new Promise(function (resolve, reject) {
+            if (signal && signal.aborted) { reject(signal.reason); return; }
+            var t = { sig: signal, fixed: fixed, prio: p, done: false };
+            t.run = function () {
+                if (t.done) { return; }
+                t.done = true;
+                try { resolve(callback()); } catch (e) { reject(e); }
+            };
+            if (signal) {
+                signal.addEventListener('abort', function () {
+                    if (t.done) { return; }
+                    t.done = true;
+                    remove(t);
+                    reject(signal.reason);
+                });
+            }
+            var enqueue = function () { if (!t.done) { queues[t.prio].push(t); arm(); } };
+            if (delay > 0) { setTimeout(enqueue, delay); } else { enqueue(); }
+        });
+    });
+    hide(Scheduler.prototype, 'yield', function () {
+        return new Promise(function (resolve) {
+            conts['user-visible'].push({ run: function () { resolve(); } });
+            arm();
+        });
+    });
+    Object.defineProperty(Scheduler.prototype, Symbol.toStringTag, { value: 'Scheduler', configurable: true });
+    hide(globalThis, 'Scheduler', Scheduler);
+    hide(globalThis, 'TaskSignal', TaskSignal);
+    hide(globalThis, 'TaskController', TaskController);
+    Object.defineProperty(globalThis, 'scheduler', { value: scheduler, writable: true, configurable: true, enumerable: true });
+})();
+"#;

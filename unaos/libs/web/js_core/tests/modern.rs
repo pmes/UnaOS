@@ -160,6 +160,29 @@ fn intl_list_relative_segmenter_locale() {
     ]);
 }
 
+/// ECMA-402 2025: Intl.DurationFormat; ECMA-402 §12: Intl.DisplayNames.
+#[test]
+fn intl_duration_format_and_display_names() {
+    check(&[
+        ("new Intl.DurationFormat('en', {style: 'long'}).format({hours: 1, minutes: 2, seconds: 3})", "1 hour, 2 minutes, 3 seconds"),
+        ("new Intl.DurationFormat('en').format({hours: 1, minutes: 2})", "1 hr, 2 min"),
+        ("new Intl.DurationFormat('en', {style: 'narrow'}).format({hours: 1, minutes: 2, seconds: 3})", "1h 2m 3s"),
+        ("new Intl.DurationFormat('en', {style: 'digital'}).format({hours: 1, minutes: 2, seconds: 3})", "1:02:03"),
+        ("new Intl.DurationFormat('en', {style: 'digital'}).format({minutes: 5, seconds: 7, milliseconds: 250})", "0:05:07.25"),
+        ("new Intl.DurationFormat('en').format({days: 2})", "2 days"),
+        ("try { new Intl.DurationFormat('en').format({hours: 1, minutes: -2}) } catch (e) { e.name }", "RangeError"),
+        ("new Intl.DisplayNames('en', {type: 'region'}).of('DE')", "Germany"),
+        ("new Intl.DisplayNames('en', {type: 'language'}).of('en-GB')", "British English"),
+        ("new Intl.DisplayNames('en', {type: 'language'}).of('de-AT')", "Austrian German"),
+        ("new Intl.DisplayNames('en', {type: 'language'}).of('fr-BE')", "French (Belgium)"),
+        ("new Intl.DisplayNames('en', {type: 'language', languageDisplay: 'standard'}).of('en-GB')", "English (United Kingdom)"),
+        ("new Intl.DisplayNames('en', {type: 'currency'}).of('usd')", "US Dollar"),
+        ("new Intl.DisplayNames('en', {type: 'script'}).of('latn')", "Latin"),
+        ("new Intl.DisplayNames('en', {type: 'region', fallback: 'none'}).of('ZZ')", "undefined"),
+        ("try { new Intl.DisplayNames('en') } catch (e) { e.name }", "TypeError"),
+    ]);
+}
+
 /// ES2026: Array.fromAsync, Error.isError, Math.sumPrecise, Uint8Array base64/hex, Iterator.concat, upsert,
 /// Error.captureStackTrace.
 #[test]

@@ -44,7 +44,8 @@ intrinsics!(
     eval_fn, throw_type_error, array_proto_values, promise_then, object_proto_to_string, atomics,
     for_in_iterator_proto, intl_number_format_proto, intl_date_time_format_proto, intl_collator_proto,
     intl_plural_rules_proto, intl_list_format_proto, intl_relative_time_format_proto, intl_segmenter_proto,
-    intl_segments_proto, intl_segment_iterator_proto, intl_locale_proto,
+    intl_segments_proto, intl_segment_iterator_proto, intl_locale_proto, intl_duration_format_proto,
+    intl_display_names_proto,
 );
 
 pub struct Realm {

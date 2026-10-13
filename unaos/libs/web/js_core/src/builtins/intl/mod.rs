@@ -1,6 +1,6 @@
 //! ECMA-402 (the ECMAScript Internationalization API, 12th edition): the `Intl` namespace with
 //! NumberFormat (§15), DateTimeFormat (§11), Collator (§10), PluralRules (§16), ListFormat (§13),
-//! RelativeTimeFormat (§17), Segmenter (§18) and Locale (§14), plus the locale-sensitive methods of
+//! RelativeTimeFormat (§17), Segmenter (§18), Locale (§14), DisplayNames (§12) and DurationFormat (2025), plus the locale-sensitive methods of
 //! Number, BigInt, Date, String and Array (§19) that route through them.
 //!
 //! ICU-free: the locale data is in this tree (`data.rs`), written from CLDR 46's `en`, `en-US` and
@@ -16,6 +16,8 @@ use alloc::vec;
 pub mod collator;
 pub mod data;
 pub mod datetime;
+pub mod displaynames;
+pub mod duration;
 pub mod list;
 pub mod locale;
 pub mod number;
@@ -41,6 +43,8 @@ pub enum IntlData {
     Segments { seg: segmenter::Seg, s: JsStr },
     SegmentIterator { seg: segmenter::Seg, s: JsStr, pos: usize },
     Locale(Box<locale::LangTag>),
+    DurationFormat(Box<duration::DurFmt>),
+    DisplayNames(Box<displaynames::DnFmt>),
 }
 
 pub fn alloc_intl(vm: &mut Vm, proto: Obj, data: IntlData) -> Obj {
@@ -66,6 +70,8 @@ pub fn init(vm: &mut Vm) {
     relative::init(vm, intl);
     segmenter::init(vm, intl);
     locale::init(vm, intl);
+    duration::init(vm, intl);
+    displaynames::init(vm, intl);
     global(vm, "Intl", Value::Object(intl));
 }
 
@@ -361,7 +367,8 @@ fn supported_values_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let key = vm.to_string(&kv)?.to_rust();
     let mut list: Vec<String> = match key.as_str() {
         "calendar" => strs(&["gregory"]),
-        "collation" => strs(&["emoji", "eor"]),
+        // The collator implements the root order only (no tailorings such as "emoji" or "phonebk").
+        "collation" => Vec::new(),
         "currency" => data::CURRENCIES.iter().map(|c| c.code.to_string()).collect(),
         "numberingSystem" => strs(&["latn"]),
         "timeZone" => data::ZONES.iter().map(|z| z.id.to_string()).chain(core::iter::once(String::from("UTC"))).collect(),
