@@ -57,6 +57,11 @@
 //   Enter follows it. Ctrl+F (0x06) or `/` opens the FIND BAR over the page text: typing searches (ASCII case
 //   folded), Enter steps to the next match, Esc closes; matches paint yellow, the current one orange. Esc with
 //   nothing open exits, as before.
+//
+// THEME. UNAKEYS (rmbp-ledger B552): every colour over the page is a field of `theme::Theme` (theme.rs: Principia's
+// `system.appearance.*` over the PREFS bus, the kernel palette's Light/Dark rows), read once at start and again when
+// the store moves (`theme::due`, PrefChanged's ring-3 stand-in); the page's own initial colours are `theme::PAGE_*`.
+// `:: AETHER: theme mode=<light|dark> accent=<name> bus=<0|-errno> ::` at start and on every change.
 
 extern crate alloc;
 
@@ -64,6 +69,7 @@ mod heap;
 mod paint;
 mod style;
 mod sys;
+mod theme;
 mod txt;
 mod ui;
 
@@ -209,7 +215,7 @@ impl Page {
             doc_h: 0.0,
             lines: 0,
             blocks: 0,
-            bg: 0x00FF_FFFF,
+            bg: theme::PAGE_BG,
             path,
             inks: NodeMap::new(),
             boxes: Vec::new(),
@@ -612,7 +618,7 @@ fn overlay(app: &App, page: &Page, cv: &mut paint::Canvas, fonts: &txt::Fonts) {
         for (i, b) in page.boxes.iter().enumerate() {
             if page.box_link[i] == Some(link) {
                 let y = (b.top - app.scroll) as i32;
-                paint::outline(cv, b.x as i32 - 1, y, b.w as i32 + 2, (b.bottom - b.top) as i32, 0x002F_8FD8);
+                paint::outline(cv, b.x as i32 - 1, y, b.w as i32 + 2, (b.bottom - b.top) as i32, theme::cur().focus);
             }
         }
     }
@@ -696,8 +702,10 @@ pub extern "C" fn _start() -> ! {
             }
         }
     }
-    // The faces.
+    // The faces, and the look (UNAKEYS B552: Principia's appearance, before the first paint).
     let (txt, why) = txt::load();
+    theme::load();
+    theme_wire();
 
     let mut l = Line::new(b":: AETHER: start src=");
     match src {
@@ -907,6 +915,10 @@ pub extern "C" fn _start() -> ! {
             app.flash = None;
             app.dirty = true;
         }
+        if theme::due(now_ms()) && theme::load() {
+            app.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
+            theme_wire();
+        }
         if app.dirty && (app.visible() || !reported) {
             if cv.w != app.w || cv.h != app.h {
                 cv = paint::Canvas::new(app.w, app.h);
@@ -925,6 +937,14 @@ pub extern "C" fn _start() -> ! {
         }
         sleep_ms(16);
     }
+}
+
+/// `:: AETHER: theme mode=<light|dark> accent=<name> bus=<0|-errno> ::` — the look in force.
+fn theme_wire() {
+    let l = theme::cur().look;
+    let mut w = Line::new(b":: AETHER: theme mode=");
+    w.put(l.mode_name().as_bytes()).put(b" accent=").put(l.accent_name().as_bytes()).put(b" bus=").dec(theme::bus_err()).put(b" ::");
+    w.wire();
 }
 
 /// The one line `tests aether` reads (aether.rs): the verdict, then the numbers after it.

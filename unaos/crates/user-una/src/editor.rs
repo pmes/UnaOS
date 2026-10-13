@@ -20,14 +20,14 @@
 // deselect, and TERMSEL2's caret moves — the ring carries no modifier bits, so Shift+arrow arrives that way.
 //
 // HIGHLIGHT — UNAMETAL2 (LEDGER SR98) fills SYNTAXCORE's (SR89) seam with the core itself: `highlight` holds the
-// grammar (`syntax_core::language_for_id`, chosen from the file's extension by Tabula's table), the incremental
-// `Highlighter` and the `Theme`. Open lexes the document through a `Source` over edit_core's Buffer (one line at a
-// time, never the document as one String); every edit's `Change`s are spliced and re-lexed (Tabula's
-// `TabulaDocument::sync_syntax` shape), so a keystroke re-lexes one line in the common case. A character's ink is the
-// APPEARANCE TOKEN the theme map names for its kind (`Theme::token`), resolved by [`token_ink`] through the painter's
-// DARK set (kernel `video/theme.rs`; this program paints a dark ground) — no colour belongs to a kind. Owed: ring 3
-// reads neither the live theme (Light/Dark, the chosen accent) nor Principia's `tabula.theme.<kind>`; the default
-// theme and the default accent stand until a syscall carries them. A file with no grammar draws in the one ink.
+// grammar (`syntax_core::language_for_id`, chosen from the file's extension by Tabula's table) and the incremental
+// `Highlighter`. Open lexes the document through a `Source` over edit_core's Buffer (one line at a time, never the
+// document as one String); every edit's `Change`s are spliced and re-lexed (Tabula's `TabulaDocument::sync_syntax`
+// shape), so a keystroke re-lexes one line in the common case. A character's KIND ([`Syntax::kind_at`]) goes through
+// the theme map (`map`, `syntax_core::Theme` — UNAKEYS (rmbp-ledger B552): Principia's `tabula.theme.<kind>` applied,
+// read by `theme::syntax_map`) to an APPEARANCE TOKEN, and the painter resolves the token through the live look
+// (`theme::Theme::token_ink`: Light/Dark and the chosen accent) — no colour belongs to a kind, and none is spelled
+// here. A file with no grammar draws in the one ink.
 
 use crate::fs::{errno_word, read_file, write_file, EDIT_MAX};
 use crate::Line;
@@ -52,22 +52,6 @@ fn language_for(path: &str) -> &'static str {
     }
 }
 
-/// An appearance token's ink (`0xAARRGGBB`): the DARK rows of kernel `video/theme.rs` for the tokens
-/// `syntax_core::APPEARANCE_TOKENS` may name, `Accent` = the default accent (`ACCENTS[0]`). An unknown name is the
-/// content ink.
-pub fn token_ink(token: &str) -> u32 {
-    0xFF00_0000
-        | match token {
-            "SyntaxCode" => 0x006C_C88A,
-            "SyntaxNum" => 0x00E3_9A55,
-            "SyntaxLit" => 0x00C3_8BE0,
-            "ErrorText" => 0x00E5_7373,
-            "TitleTextInactive" => 0x008E_8E94,
-            "Accent" => 0x004A_73AA,
-            _ => 0x00E6_E4DF, // ContentText
-        }
-}
-
 /// edit_core's Buffer as syntax_core reads text: lines, never the whole document.
 struct BufSource<'a>(&'a Buffer);
 impl Source for BufSource<'_> {
@@ -82,11 +66,10 @@ impl Source for BufSource<'_> {
     }
 }
 
-/// The document's grammar, its per-line checkpoints and tokens, and the theme map.
+/// The document's grammar and its per-line checkpoints and tokens.
 pub struct Syntax {
     lang: Box<dyn Language>,
     hl: Highlighter,
-    theme: Theme,
 }
 
 impl Syntax {
@@ -95,7 +78,7 @@ impl Syntax {
         let lang = syntax_core::language_for_id(language_for(path))?;
         let mut hl = Highlighter::new();
         hl.reset(lang.as_ref(), &BufSource(buf));
-        Some(Syntax { lang, hl, theme: Theme::default() })
+        Some(Syntax { lang, hl })
     }
     /// Splice an edit's changed line ranges into the checkpoints and re-lex from the first touched line.
     fn sync(&mut self, buf: &Buffer, changes: &[Change]) {
@@ -111,10 +94,10 @@ impl Syntax {
     pub fn spans(&self) -> usize {
         (0..self.hl.line_count()).map(|l| self.hl.line_tokens(l).len()).sum()
     }
-    /// The ink of byte `byte` of `line`: its token's kind through the theme map, else the content ink.
-    pub fn ink_at(&self, line: usize, byte: usize) -> u32 {
+    /// The kind of byte `byte` of `line`: its token's, else `Identifier` (the content ink through the shipped map).
+    pub fn kind_at(&self, line: usize, byte: usize) -> HighlightKind {
         let k = self.hl.line_tokens(line).iter().find(|t| byte >= t.start as usize && byte < t.end as usize).map(|t| t.kind);
-        token_ink(self.theme.token(k.unwrap_or(HighlightKind::Identifier)))
+        k.unwrap_or(HighlightKind::Identifier)
     }
 }
 
@@ -132,6 +115,8 @@ pub struct Editor {
     discard_armed: bool,
     /// UNAMETAL2: the open document's syntax core (`None` = a language with no grammar, or no document).
     pub highlight: Option<Syntax>,
+    /// UNAKEYS (B552): kind -> appearance token, Principia's `tabula.theme.<kind>` applied (`theme::syntax_map`).
+    pub map: Theme,
     /// UNAMETAL2: the last Ctrl+S answered rc=0 (the exit status's SAVED bit).
     pub saved: bool,
     pub repaint: bool,
@@ -150,6 +135,7 @@ impl Editor {
             msg: String::from("Ctrl+1 tree, Enter opens a file"),
             discard_armed: false,
             highlight: None,
+            map: Theme::default(),
             saved: false,
             repaint: true,
         }
