@@ -429,3 +429,74 @@ R.push(nav instanceof PerformanceNavigationTiming, nav.type, nav.name, nav.initi
         "1|3|312|12|30|404|gzip|6|true|resource:http://127.0.0.1:8000/a,resource:http://other.test/b,resource:http://other.test/c,nav:navigate"
     );
 }
+
+/// O8 — HTML §7.2.2.1 the window open steps (the URL parsed against the source document — SyntaxError; "tokenize the
+/// features argument" and "parse a boolean feature" for `noopener` / `noreferrer`; null under noopener), §7.3.1.7 the
+/// rules for choosing a navigable (`_self` / `_top`, a case-sensitive name match), §7.3.1.4 auxiliary browsing
+/// contexts (`opener`, `opener = null` disowning, `top` / `parent` themselves, `close()` → `closed` at once and the
+/// context gone after the queued close, an iframe inside it), a navigated auxiliary context running its script; and
+/// §7.2.6 the Navigation API (entries / currentEntry / canGoBack, navigate() with state and info, the navigate event's
+/// members, `currententrychange` and its `from`, a replaceState keeping the entry's navigation API state, an intercepted
+/// fragment navigation firing no `hashchange` and leaving a null classic state, a canceled navigate event rejecting
+/// `committed` with AbortError after `navigateerror`).
+#[test]
+fn o8_auxiliary_contexts_and_navigation_api() {
+    let mut e = load_with(
+        &page(
+            r#"
+var M = [], H = 0, N = [], K = 0;
+addEventListener('message', function (e) { M.push(e.data); });
+addEventListener('hashchange', function () { H++; });
+var w = window.open();
+R.push(w !== null && w !== window, w.opener === window, w.top === w, w.parent === w, w.name === '', w.closed, w.document.URL, w.frameElement);
+var w2 = window.open('', 'named'), w3 = window.open('about:blank', 'NAMED'), w4 = window.open('about:blank', 'named');
+R.push(w2 === w4, w2 !== w3, w2.name);
+R.push(window.open('', '', ' noopener') === null, window.open('', '', 'noopener=0') !== null, window.open('', '', 'NOREFERRER=-1') === null,
+       window.open('', '', 'noopenerRRR') !== null, window.open('', '', 'foo=\u000Cnoopener') !== null, window.open('', '', 'noopener=1.5') === null);
+try { window.open('http://[bad'); R.push('no-throw'); } catch (x) { R.push(x.name); }
+R.push(window.open('', '_self') === window, window.open('', '_top') === window);
+w.document.body.appendChild(w.document.createElement('iframe'));
+R.push(w.length);
+w.close();
+R.push(w.closed, w[0].closed);
+w2.opener = null;
+R.push(w2.opener, w3.opener === window);
+var kid = window.open('data:text/html,<script>opener.postMessage("hi:" + (opener !== null) + ":" + name + ":" + (parent === window) + ":" + (top === window), "*")<\/script>', 'kid');
+R.push(kid !== null);
+
+navigation.onnavigate = function (e) {
+    N.push('nav:' + e.navigationType + ':' + e.destination.url.split('/').pop() + ':' + e.hashChange + ':' + e.canIntercept + ':' + e.isTrusted + ':' + e.cancelable);
+    if (e.destination.url.indexOf('#i') >= 0) { e.intercept({ handler: function () { return Promise.resolve(); } }); }
+    if (e.destination.url.indexOf('#no') >= 0) { e.preventDefault(); }
+};
+navigation.oncurrententrychange = function (e) { N.push('cec:' + e.navigationType + ':' + e.from.index); };
+navigation.onnavigatesuccess = function () { K++; };
+navigation.onnavigateerror = function (e) { N.push('err:' + e.error.name); };
+var e0 = navigation.currentEntry;
+R.push(navigation.entries().length, e0.index, e0.url.split('/').pop(), navigation.canGoBack);
+navigation.navigate('#a', { state: { s: 1 }, info: 'x' });
+R.push(location.hash, navigation.currentEntry.getState().s, navigation.currentEntry.index, navigation.canGoBack);
+history.replaceState('cs', '', '#b');
+R.push(location.hash, history.state, navigation.currentEntry.getState().s, navigation.entries().length);
+location.hash = 'i';
+R.push(location.hash, String(history.state), navigation.entries().length);
+try { new NavigateEvent('navigate'); } catch (x) { R.push(x.name); }
+R.push(navigation.activation.navigationType);
+"#,
+        ),
+        5_000,
+    );
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        "true|true|true|true|true|false|about:blank||true|true|named|true|true|true|true|true|true|SyntaxError|true|true|1|true|false||true|true\
+         |1|0|wpt3.html|false|#a|1|1|true|#b|cs|1|2|#i|null|3|TypeError|push"
+    );
+    assert_eq!(run_until(&mut e, "M.length > 0", "M.join()", 10), "hi:true:kid:true:true");
+    assert_eq!(
+        eval(&mut e, "[w.closed, typeof w[0], N.join(), K, H].join('|')"),
+        "true|undefined|nav:push:wpt3.html#a:true:true:true:true,cec:push:0,nav:replace:wpt3.html#b:true:true:true:true,cec:replace:-1,\
+         nav:push:wpt3.html#i:true:true:true:true,cec:push:1|3|1"
+    );
+    eval(&mut e, "N = []; navigation.navigate('#no').committed.catch(function (x) { N.push('rej:' + x.name); }); 0");
+    assert_eq!(eval(&mut e, "N.join() + '|' + location.hash"), "nav:push:wpt3.html#no:true:true:true:true,err:AbortError,rej:AbortError|#i");
+}

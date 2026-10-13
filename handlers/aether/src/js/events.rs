@@ -46,6 +46,16 @@ fn set_flag(vm: &mut Vm, e: Obj, f: u32, on: bool) {
     set_slot(vm, e, E_FLAGS, num(v as f64));
 }
 
+/// AETHERWPT3 (SR138): dispatches the script-built event `e` at `target` as the user agent fires it (`isTrusted`
+/// true) — the Navigation API's events, which its prelude (js/navigation.rs) constructs. Some(false) when a
+/// listener canceled it; None when `target` / `e` are not an EventTarget / Event.
+pub fn dispatch_trusted(vm: &mut Vm, target: &Value, e: &Value) -> Option<bool> {
+    let t = target_of(vm, target)?;
+    let e = this_tagged(vm, e, T_EVENT)?;
+    set_flag(vm, e, F_TRUSTED, true);
+    Some(dispatch(vm, e, t).0)
+}
+
 /// Milliseconds since the page's time origin (DOMHighResTimeStamp).
 pub fn now_hr() -> f64 {
     let origin = page(|p| p.time_origin);

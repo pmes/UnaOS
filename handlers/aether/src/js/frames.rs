@@ -88,6 +88,37 @@ thread_local! {
     static SERVICING: Cell<bool> = const { Cell::new(false) };
     /// The top realm's `__aether_clone` and `__aether_xo` (rooted).
     static HELPERS: Cell<Option<(Obj, Obj)>> = const { Cell::new(None) };
+    /// AETHERWPT3 (SR138): the auxiliary browsing contexts `window.open` created (HTML §7.3.1.4).
+    static AUX: RefCell<HashMap<ContextId, Aux>> = RefCell::new(HashMap::new());
+    /// Auxiliary contexts whose `close()` queued "definitely close" (HTML §7.2.2.1).
+    static CLOSES: RefCell<Vec<ContextId>> = const { RefCell::new(Vec::new()) };
+}
+
+/// AETHERWPT3 (SR138): an auxiliary browsing context — a top-level traversable with no container, held in the
+/// page's tree with no parent (`crate::frames` keeps it; [`container_live`] treats it as live).
+#[derive(Clone, Copy, Debug, Default)]
+struct Aux {
+    /// The opener browsing context (HTML §7.3.1 "opener browsing context"); None after `noopener` or a
+    /// `window.opener = null` disown.
+    opener: Option<ContextId>,
+    /// "is closing" (§7.2.2.1 `close()`): `closed` reads true before the queued close runs.
+    closing: bool,
+}
+
+fn aux(id: ContextId) -> Option<Aux> {
+    AUX.with(|a| a.borrow().get(&id).copied())
+}
+
+fn is_aux(id: ContextId) -> bool {
+    aux(id).is_some()
+}
+
+/// The live auxiliary contexts, in creation order.
+fn aux_roots() -> Vec<ContextId> {
+    let mut v: Vec<ContextId> = AUX.with(|a| a.borrow().keys().copied().collect());
+    v.retain(|id| tree::get(*id).is_some());
+    v.sort_unstable();
+    v
 }
 
 /// A new page (called from `event_loop::reset`, inside `Engine::with_viewport`, once the page state
@@ -99,6 +130,8 @@ pub fn reset() {
     SCANNING.with(|b| b.set(false));
     SERVICING.with(|b| b.set(false));
     HELPERS.with(|h| h.set(None));
+    AUX.with(|a| a.borrow_mut().clear());
+    CLOSES.with(|c| c.borrow_mut().clear());
     tree::reset(dom::main_doc(), &crate::js::page_url());
 }
 
@@ -197,6 +230,9 @@ fn window_for(vm: &mut Vm, id: ContextId) -> Value {
 
 /// Whether context `c`'s container is still connected to its parent's active document.
 fn container_live(c: &tree::BrowsingContext) -> bool {
+    if is_aux(c.id) {
+        return true;
+    }
     let (Some(el), Some(p)) = (c.container, c.parent) else { return c.id == TOP };
     match tree::get(p) {
         Some(pc) => dom::root_of(el) == pc.document,
@@ -368,6 +404,13 @@ fn create_child(vm: &mut Vm, parent: ContextId, container: usize) -> Option<Cont
     if sandbox.is_some_and(|s| !s.same_origin) {
         tree::update(id, |c| c.origin = format!("null#{id}"));
     }
+    attach_realm(vm, id, doc);
+    Some(id)
+}
+
+/// The realm and global of a new context `id` showing `doc` (an iframe's child navigable, or an auxiliary
+/// context's top-level traversable).
+fn attach_realm(vm: &mut Vm, id: ContextId, doc: usize) {
     let saved = vm.cur_realm;
     let realm = vm.create_realm();
     // The members below are the binding's natives: they belong to the top realm, as every binding
@@ -400,7 +443,6 @@ fn create_child(vm: &mut Vm, parent: ContextId, container: usize) -> Option<Cont
         let m = vm.error_string(&e);
         crate::ledger::record_js(&format!("frame-realm-setup-failed:{}", crate::js::clip(&m, 64)));
     }
-    Some(id)
 }
 
 /// The per-context Window members, as own properties of the child global.
@@ -415,12 +457,13 @@ fn define_window_members(vm: &mut Vm, id: ContextId, g: Obj) {
     member_accessor(vm, g, id, "frameElement", w_frame_element, None, false);
     member_accessor(vm, g, id, "length", w_length, Some(w_replace), false);
     member_accessor(vm, g, id, "name", w_name, Some(w_name_set), false);
-    member_accessor(vm, g, id, "opener", w_null, Some(w_replace), false);
+    member_accessor(vm, g, id, "opener", w_opener, Some(w_opener_set), false);
     member_accessor(vm, g, id, "closed", w_closed, None, false);
     member_accessor(vm, g, id, "origin", w_origin, Some(w_replace), false);
     member_op(vm, g, id, "postMessage", 1, w_post_message);
     member_op(vm, g, id, "open", 0, w_open);
-    for name in ["close", "stop", "focus", "blur"] {
+    member_op(vm, g, id, "close", 0, w_close);
+    for name in ["stop", "focus", "blur"] {
         member_op(vm, g, id, name, 0, w_noop);
     }
 }
@@ -500,13 +543,17 @@ fn w_top(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if tree::get(id).is_none() {
         return Ok(Value::Null);
     }
-    Ok(window_for(vm, TOP))
+    // AETHERWPT3 (SR138): the top-level traversable of the context's tree — TOP for an iframe of the page, the
+    // auxiliary context itself (or the one an iframe sits in) for a `window.open` window.
+    let top = tree::ancestors(id).last().copied().unwrap_or(id);
+    Ok(window_for(vm, top))
 }
 
 fn w_parent(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let id = slot_id(vm, ctx);
-    match tree::get(id).and_then(|c| c.parent) {
-        Some(p) => Ok(window_for(vm, p)),
+    // HTML §7.2.4 `parent`: a top-level traversable's (an auxiliary context's) parent is itself.
+    match tree::get(id) {
+        Some(c) => Ok(window_for(vm, c.parent.unwrap_or(id))),
         None => Ok(Value::Null),
     }
 }
@@ -540,13 +587,59 @@ fn w_name_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
-fn w_null(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
-    Ok(Value::Null)
+/// HTML §7.2.2.1 `opener` getter: the opener browsing context's WindowProxy, or null.
+fn w_opener(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let id = slot_id(vm, ctx);
+    if tree::get(id).is_none() {
+        return Ok(Value::Null);
+    }
+    match aux(id).and_then(|a| a.opener) {
+        Some(o) => Ok(window_for(vm, o)),
+        None => Ok(Value::Null),
+    }
 }
 
+/// The `opener` setter: null disowns the opener; anything else becomes an own data property.
+fn w_opener_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let id = slot_id(vm, ctx);
+    if matches!(arg(vm, ctx, 0), Value::Null) {
+        if tree::get(id).is_some() {
+            AUX.with(|a| {
+                if let Some(x) = a.borrow_mut().get_mut(&id) {
+                    x.opener = None;
+                }
+            });
+        }
+        return Ok(Value::Undefined);
+    }
+    w_replace(vm, ctx)
+}
+
+/// `closed`: the context is gone, or it "is closing".
 fn w_closed(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let id = slot_id(vm, ctx);
-    Ok(Value::Bool(tree::get(id).is_none()))
+    Ok(Value::Bool(tree::get(id).is_none() || aux(id).is_some_and(|a| a.closing)))
+}
+
+/// HTML §7.2.2.1 `close()`: only a top-level traversable that is script-closable (every auxiliary context
+/// here was created by script) closes; it is marked closing at once and "definitely close" is queued
+/// ([`service`]). An iframe's window ignores it.
+fn w_close(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let id = slot_id(vm, ctx);
+    if tree::get(id).is_none() {
+        return Ok(Value::Undefined);
+    }
+    let queued = AUX.with(|a| match a.borrow_mut().get_mut(&id) {
+        Some(x) if !x.closing => {
+            x.closing = true;
+            true
+        }
+        _ => false,
+    });
+    if queued {
+        CLOSES.with(|c| c.borrow_mut().push(id));
+    }
+    Ok(Value::Undefined)
 }
 
 fn w_origin(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -569,11 +662,10 @@ fn w_noop(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
-/// `window.open()` from a nested document: popups are policy, and Aether's policy refuses them (null,
-/// as a blocked popup reads).
-fn w_open(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
-    crate::ledger::record_js("window.open-refused");
-    Ok(Value::Null)
+/// `window.open()` from a nested or auxiliary document (AETHERWPT3, SR138: the window open steps).
+fn w_open(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let id = slot_id(vm, ctx);
+    window_open(vm, ctx, id)
 }
 
 fn w_post_message(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -591,6 +683,228 @@ fn w_location_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let v = string(vm, &arg(vm, ctx, 0))?;
     navigate_ctx(vm, id, &v)?;
     Ok(Value::Undefined)
+}
+
+// =================================================================================================
+// AETHERWPT3 (SR138): the window open steps (HTML §7.2.2.1) and auxiliary browsing contexts (§7.3.1.4)
+// =================================================================================================
+
+/// HTML §7.2.2.1 "window feature separator": ASCII whitespace, `=` or `,`.
+fn is_feature_sep(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{0C}' | '\r' | ' ' | '=' | ',')
+}
+
+/// §7.2.2.1 "normalizing the feature name".
+fn normalize_feature_name(n: &str) -> &str {
+    match n {
+        "screenx" => "left",
+        "screeny" => "top",
+        "innerwidth" => "width",
+        "innerheight" => "height",
+        other => other,
+    }
+}
+
+/// §7.2.2.1 "tokenize the features argument": (name, value) pairs, names and values ASCII-lowercased, a
+/// later duplicate replacing an earlier one.
+pub fn tokenize_features(features: &str) -> Vec<(String, String)> {
+    let cs: Vec<char> = features.chars().collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut pos = 0usize;
+    while pos < cs.len() {
+        while pos < cs.len() && is_feature_sep(cs[pos]) {
+            pos += 1;
+        }
+        let mut name = String::new();
+        while pos < cs.len() && !is_feature_sep(cs[pos]) {
+            name.push(cs[pos].to_ascii_lowercase());
+            pos += 1;
+        }
+        let name = normalize_feature_name(&name).to_string();
+        while pos < cs.len() && cs[pos] != '=' {
+            if cs[pos] == ',' || !is_feature_sep(cs[pos]) {
+                break;
+            }
+            pos += 1;
+        }
+        let mut value = String::new();
+        if pos < cs.len() && is_feature_sep(cs[pos]) {
+            while pos < cs.len() && is_feature_sep(cs[pos]) {
+                if cs[pos] == ',' {
+                    break;
+                }
+                pos += 1;
+            }
+            while pos < cs.len() && !is_feature_sep(cs[pos]) {
+                value.push(cs[pos].to_ascii_lowercase());
+                pos += 1;
+            }
+        }
+        if !name.is_empty() {
+            match out.iter_mut().find(|(k, _)| *k == name) {
+                Some(e) => e.1 = value,
+                None => out.push((name, value)),
+            }
+        }
+    }
+    out
+}
+
+/// HTML §2.3.4.1 "rules for parsing integers".
+fn parse_integer(v: &str) -> Option<i64> {
+    let t = v.trim_start_matches(['\t', '\n', '\u{0C}', '\r', ' ']);
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let d: String = digits.chars().take_while(char::is_ascii_digit).collect();
+    if d.is_empty() {
+        return None;
+    }
+    let n: i64 = d.chars().take(18).collect::<String>().parse().ok()?;
+    Some(if neg { -n } else { n })
+}
+
+/// §7.2.2.1 "parse a boolean feature".
+pub fn parse_boolean_feature(v: &str) -> bool {
+    if v.is_empty() || v == "yes" || v == "true" {
+        return true;
+    }
+    parse_integer(v).unwrap_or(0) != 0
+}
+
+/// The window type the rules for choosing a navigable return (§7.3.1.7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WindowType {
+    Existing,
+    NewUnrestricted,
+    NewNoOpener,
+}
+
+/// The browsing-context name of context `id` (the top's is its global's `name`).
+fn name_of(vm: &mut Vm, id: ContextId) -> String {
+    if id == TOP {
+        let g = vm.realms[0].global;
+        return match vm.get(g, &PropertyKey::from_str("name")) {
+            Ok(Value::String(st)) => st.to_rust(),
+            _ => String::new(),
+        };
+    }
+    tree::get(id).map(|c| c.name).unwrap_or_default()
+}
+
+/// §7.3.1.4 "create a new auxiliary browsing context": a top-level traversable with the initial about:blank,
+/// its origin the creator's (an opaque one when there is no opener), named `name`.
+fn create_aux(vm: &mut Vm, source: ContextId, name: &str, opener: Option<ContextId>) -> Option<ContextId> {
+    let doc = dom::new_document(true, "text/html", "about:blank");
+    populate(doc, "");
+    let sandbox = tree::get(source).and_then(|c| c.sandbox);
+    let id = tree::create(TOP, doc, doc, "about:blank", &origin_of(source), name, sandbox)?;
+    tree::update(id, |c| {
+        c.parent = None;
+        c.container = None;
+        if opener.is_none() || sandbox.is_some_and(|s| !s.same_origin) {
+            c.origin = format!("null#{id}");
+        }
+    });
+    AUX.with(|a| a.borrow_mut().insert(id, Aux { opener, closing: false }));
+    attach_realm(vm, id, doc);
+    Some(id)
+}
+
+/// §7.3.1.7 "the rules for choosing a navigable" for `name` from `current`.
+fn choose_navigable(vm: &mut Vm, name: &str, current: ContextId, noopener: bool) -> (Option<ContextId>, WindowType) {
+    let lower = name.to_ascii_lowercase();
+    if lower.is_empty() || lower == "_self" {
+        return (Some(current), WindowType::Existing);
+    }
+    if lower == "_parent" {
+        return (Some(tree::get(current).and_then(|c| c.parent).unwrap_or(current)), WindowType::Existing);
+    }
+    if lower == "_top" {
+        return (Some(tree::ancestors(current).last().copied().unwrap_or(current)), WindowType::Existing);
+    }
+    if lower != "_blank" {
+        ensure(vm);
+        let mut ids: Vec<ContextId> = tree::all().into_iter().map(|c| c.id).collect();
+        ids.retain(|id| !aux(*id).is_some_and(|a| a.closing));
+        // The current context's own tree first (the most related), then the rest in creation order.
+        ids.sort_by_key(|id| *id != current);
+        for id in ids {
+            if name_of(vm, id) == name {
+                return (Some(id), WindowType::Existing);
+            }
+        }
+    }
+    // A new top-level traversable: refused under the sandboxed auxiliary navigation browsing context flag.
+    if tree::get(current).and_then(|c| c.sandbox).is_some_and(|s| !s.popups) {
+        crate::ledger::record_js("window.open-sandboxed-popups");
+        return (None, WindowType::Existing);
+    }
+    let target_name = if lower == "_blank" { "" } else { name };
+    if noopener {
+        (create_aux(vm, current, target_name, None), WindowType::NewNoOpener)
+    } else {
+        (create_aux(vm, current, target_name, Some(current)), WindowType::NewUnrestricted)
+    }
+}
+
+/// The optional DOMString argument `i` with its default.
+fn opt_string(vm: &mut Vm, ctx: &CallCtx, i: usize, default: &str, null_is_empty: bool) -> JsResult<String> {
+    match arg(vm, ctx, i) {
+        Value::Undefined => Ok(default.to_string()),
+        Value::Null if null_is_empty => Ok(String::new()),
+        v => string(vm, &v),
+    }
+}
+
+/// HTML §7.2.2.1 "window open steps" for `open(url, target, features)` called on context `source`'s window:
+/// parse the URL against the source document (SyntaxError), the features (`noopener`, `noreferrer`), the
+/// rules for choosing a navigable, a navigation of the chosen one, and its WindowProxy unless `noopener`.
+pub fn window_open(vm: &mut Vm, ctx: &CallCtx, source: ContextId) -> JsResult<Value> {
+    let url = opt_string(vm, ctx, 0, "", false)?;
+    let mut target = opt_string(vm, ctx, 1, "_blank", false)?;
+    let features = opt_string(vm, ctx, 2, "", true)?;
+    let mut url_record: Option<String> = None;
+    if !url.is_empty() {
+        match dom::resolve_url(document_of(source), &url).filter(|u| url::Url::parse(u).is_ok()) {
+            Some(u) => url_record = Some(u),
+            None => {
+                return throw_dom(vm, "SyntaxError", &format!("Failed to execute 'open' on 'Window': Unable to open a window with invalid URL '{url}'."));
+            }
+        }
+    }
+    if target.is_empty() {
+        target = "_blank".into();
+    }
+    let tokens = tokenize_features(&features);
+    let flag = |k: &str| tokens.iter().find(|(n, _)| n == k).is_some_and(|(_, v)| parse_boolean_feature(v));
+    let noreferrer = flag("noreferrer");
+    let noopener = flag("noopener") || noreferrer;
+    let (chosen, wtype) = choose_navigable(vm, &target, source, noopener);
+    let Some(chosen) = chosen else { return Ok(Value::Null) };
+    match wtype {
+        WindowType::NewUnrestricted | WindowType::NewNoOpener => {
+            // about:blank (or no URL) keeps the initial about:blank document; anything else navigates.
+            if let Some(u) = url_record.filter(|u| !is_about_blank(u)) {
+                queue_nav(chosen, u, None);
+            }
+        }
+        WindowType::Existing => {
+            if let Some(u) = url_record {
+                if chosen == TOP {
+                    crate::js::window::navigate_from_link(vm, &u)?;
+                } else {
+                    navigate_ctx(vm, chosen, &u)?;
+                }
+            }
+        }
+    }
+    if noopener || wtype == WindowType::NewNoOpener {
+        return Ok(Value::Null);
+    }
+    Ok(window_for(vm, chosen))
 }
 
 // =================================================================================================
@@ -760,6 +1074,7 @@ fn scan(vm: &mut Vm) -> usize {
         }
     }
     let mut queue = vec![TOP];
+    queue.extend(aux_roots());
     let mut i = 0;
     while i < queue.len() {
         let id = queue[i];
@@ -812,6 +1127,16 @@ pub fn service(vm: &mut Vm) -> usize {
         return 0;
     }
     let mut n = scan(vm);
+    // AETHERWPT3 (SR138): "definitely close" each auxiliary context whose close() ran (HTML §7.3.1.5: prompt to
+    // unload, then destroy — `beforeunload`, then `pagehide` / `unload` children first).
+    let closes: Vec<ContextId> = CLOSES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for id in closes {
+        if let Some(t) = target_key(id) {
+            events::fire_simple_cancelable(vm, t, "beforeunload");
+        }
+        discard(vm, id);
+        n += 1;
+    }
     let navs: Vec<NavRequest> = NAVS.with(|q| std::mem::take(&mut *q.borrow_mut()));
     for nav in navs {
         if crate::js::engine_poisoned() {
@@ -894,7 +1219,11 @@ fn percent_decode(v: &str) -> String {
 /// One navigation of a child context (HTML §7.4.2), run as a task. False when nothing happened.
 fn navigate_now(vm: &mut Vm, nav: NavRequest) -> bool {
     let Some(c) = tree::get(nav.ctx) else { return false };
-    let Some(container) = c.container else { return false };
+    // AETHERWPT3 (SR138): an auxiliary context has no container.
+    let container = c.container;
+    if container.is_none() && !is_aux(nav.ctx) {
+        return false;
+    }
     if !container_live(&c) {
         return false;
     }
@@ -906,8 +1235,11 @@ fn navigate_now(vm: &mut Vm, nav: NavRequest) -> bool {
             return false;
         }
     }
-    let parent_origin = c.parent.map(origin_of).unwrap_or_default();
-    let sandbox = dom::attr_value(container, "sandbox").map(|v| Sandbox::parse(&v));
+    let parent_origin = c.parent.map(origin_of).unwrap_or_else(|| c.origin.clone());
+    let sandbox = match container {
+        Some(el) => dom::attr_value(el, "sandbox").map(|v| Sandbox::parse(&v)),
+        None => c.sandbox,
+    };
     // `javascript:` URLs: the script runs in the context's realm; a string result is the new document.
     // AETHERWPT3 (SR138): the encoding the response was decoded from (HTML §13.2.3), for document.characterSet.
     let mut charset: &'static str = "UTF-8";
@@ -985,9 +1317,11 @@ fn navigate_now(vm: &mut Vm, nav: NavRequest) -> bool {
         events::fire_simple(vm, t, "load", false, false);
         crate::js::checkpoint(vm);
     }
-    if tree::get(nav.ctx).is_some_and(|c| container_live(&c)) {
-        events::fire_simple(vm, TargetKey::Node(container), "load", false, false);
-        crate::js::checkpoint(vm);
+    if let Some(container) = container {
+        if tree::get(nav.ctx).is_some_and(|c| container_live(&c)) {
+            events::fire_simple(vm, TargetKey::Node(container), "load", false, false);
+            crate::js::checkpoint(vm);
+        }
     }
     true
 }

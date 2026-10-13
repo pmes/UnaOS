@@ -64,6 +64,7 @@ pub mod internals;
 pub mod loader;
 pub mod locks;
 pub mod mutation;
+pub mod navigation;
 /// AETHERWPT3 (SR138): pointer capture (Pointer Events §10).
 pub mod pointer;
 /// AETHERMEDIA2 (SR134): Media Source Extensions.
@@ -824,6 +825,8 @@ impl Engine {
         locks::install(&mut vm);
         sw::install(&mut vm);
         animations::install(&mut vm);
+        // AETHERWPT3 (SR138): the Navigation API — after fetch (AbortController) and ports (structuredClone).
+        navigation::install(&mut vm);
         // AETHERMEDIA2 (SR134): after window (URL, the element interfaces) — MSE, then text tracks.
         mse::install(&mut vm);
         tracks::install(&mut vm);

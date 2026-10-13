@@ -17,7 +17,7 @@ pub mod frames;
 
 use super::dom::{self, iface, register_iface, with_doc, wrap};
 use super::idl::{self, *};
-use super::{page, TargetKey};
+use super::{navigation, page, TargetKey};
 use html_core::url;
 use js_core::builtins::host::Timer;
 use js_core::vm::*;
@@ -542,12 +542,16 @@ fn global_origin(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
     Ok(s(&url::Url::parse(&u).map(|u| super::html::url_part(&u, "origin")).unwrap_or_else(|_| "null".into())))
 }
 
+fn window_open(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    frames::window_open(vm, ctx, crate::frames::TOP)
+}
+
 fn dialog_stub(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let which = callee_str(vm, ctx);
     crate::ledger::record_js(&format!("window.{which}-headless"));
     Ok(match which.as_str() {
         "confirm" => Value::Bool(false),
-        "prompt" | "open" => Value::Null,
+        "prompt" => Value::Null,
         _ => Value::Undefined,
     })
 }
@@ -775,6 +779,17 @@ fn navigate(vm: &mut Vm, target: &str, replace: bool) -> JsResult<()> {
             let old = cur.to_string();
             let new = resolved.to_string();
             if old != new {
+                // AETHERWPT3 (SR138): "navigate to a fragment" step 1 — the navigate event (HTML §7.2.6.10); an
+                // intercepted one is the URL and history update steps alone (no `hashchange`).
+                match navigation::begin(vm, &new, if replace { "replace" } else { "push" }, true) {
+                    navigation::Begin::Cancel => return Ok(()),
+                    navigation::Begin::Intercept => {
+                        url_update(vm, &new, replace);
+                        navigation::commit(vm);
+                        return Ok(());
+                    }
+                    navigation::Begin::Proceed => {}
+                }
                 page(|p| p.url = new.clone());
                 super::Engine::set_doc_url(&new);
                 // A fragment navigation is a same-document session history entry (HTML §7.4.2.3.3
@@ -791,13 +806,46 @@ fn navigate(vm: &mut Vm, target: &str, replace: bool) -> JsResult<()> {
                 let f = vm.make_native_with("", 0, fire_hashchange, false, Some(fp), vec![Value::Object(init)]);
                 let r = root(vm, Value::Object(f));
                 page(|p| p.tasks.push_back(super::Task::Callback(r)));
+                navigation::commit(vm);
             }
             return Ok(());
+        }
+    }
+    // AETHERWPT3 (SR138): a cross-document navigation's navigate event (HTML §7.2.6.10, "fire a push/replace/reload
+    // navigate event", isSameDocument false): canceled, intercepted (a same-document navigation after all), or
+    // staged for the shell. A `javascript:` URL fires none.
+    if resolved.scheme() != "javascript" {
+        let href = resolved.to_string();
+        let ty = if replace || href == super::page_url() { "replace" } else { "push" };
+        match navigation::begin(vm, &href, ty, false) {
+            navigation::Begin::Cancel => return Ok(()),
+            navigation::Begin::Intercept => {
+                url_update(vm, &href, ty == "replace");
+                navigation::commit(vm);
+                return Ok(());
+            }
+            navigation::Begin::Proceed => {}
         }
     }
     page(|p| p.pending_nav = Some(resolved.to_string()));
     crate::ledger::record_dom("location-navigation-staged");
     Ok(())
+}
+
+/// AETHERWPT3 (SR138): an intercepted navigation's "URL and history update steps" (HTML §7.4.4): the document's URL
+/// and a new (or the replaced) session history entry whose classic history state is null — no fetch, no
+/// `hashchange`.
+fn url_update(vm: &mut Vm, url: &str, replace: bool) {
+    page(|p| p.url = url.to_string());
+    super::Engine::set_doc_url(url);
+    if let Value::Object(h) = history_obj(vm) {
+        set_slot(vm, h, 0, Value::Null);
+    }
+    history::queue(if replace {
+        history::Op::Replace { url: url.to_string(), state: None }
+    } else {
+        history::Op::Push { url: url.to_string(), state: None }
+    });
 }
 
 /// Following a hyperlink from a script-dispatched click (fragment links stay in the document).
@@ -857,8 +905,17 @@ fn loc_replace(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Undefined)
 }
 
-fn loc_reload(_vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
+fn loc_reload(vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
     let u = super::page_url();
+    // AETHERWPT3 (SR138): the reload navigate event (HTML §7.2.6.10); an intercepted reload stays in the document.
+    match navigation::begin(vm, &u, "reload", false) {
+        navigation::Begin::Cancel => return Ok(Value::Undefined),
+        navigation::Begin::Intercept => {
+            navigation::commit(vm);
+            return Ok(Value::Undefined);
+        }
+        navigation::Begin::Proceed => {}
+    }
     page(|p| p.pending_nav = Some(u));
     Ok(Value::Undefined)
 }
@@ -910,8 +967,8 @@ fn history_push(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let text = vm.call(&stringify, &Value::Object(json), &[state])?;
     let serialized = if text.is_undefined() { None } else { Some(string(vm, &text)?) };
     let cloned = if text.is_undefined() { Value::Null } else { vm.call(&parse, &Value::Object(json), &[text])? };
-    set_slot(vm, o, 0, cloned);
     let mut entry_url = super::page_url();
+    let mut new_url = None;
     let u = arg(vm, ctx, 2);
     if !u.is_nullish() {
         let u = string(vm, &u)?;
@@ -921,10 +978,20 @@ fn history_push(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             if !same_origin {
                 return throw_dom(vm, "SecurityError", "A history state object with URL cannot be created in a document with a different origin.");
             }
-            page(|p| p.url = nu.to_string());
-            super::Engine::set_doc_url(&nu.href());
             entry_url = nu.href();
+            new_url = Some(nu);
         }
+    }
+    // AETHERWPT3 (SR138): "shared history push/replace state steps" step 8 — the navigate event (HTML §7.2.6.10,
+    // isSameDocument true); a canceled one leaves the URL and state as they were.
+    let ty = if which == "pushState" { "push" } else { "replace" };
+    if navigation::begin(vm, &entry_url, ty, true) == navigation::Begin::Cancel {
+        return Ok(Value::Undefined);
+    }
+    set_slot(vm, o, 0, cloned);
+    if let Some(nu) = new_url {
+        page(|p| p.url = nu.to_string());
+        super::Engine::set_doc_url(&nu.href());
     }
     // The session history entry (AETHERCHROME): pushState adds one, replaceState rewrites the current.
     history::queue(if which == "pushState" {
@@ -932,6 +999,7 @@ fn history_push(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     } else {
         history::Op::Replace { url: entry_url, state: serialized }
     });
+    navigation::commit(vm);
     Ok(Value::Undefined)
 }
 
@@ -1445,9 +1513,11 @@ pub fn install(vm: &mut Vm) {
     global_op(vm, "reportError", 1, report_error, None);
     global_op(vm, "postMessage", 1, post_message, None);
     global_op(vm, "getSelection", 0, get_selection, None);
-    for name in ["alert", "confirm", "prompt", "open", "print", "stop", "focus", "blur", "close"] {
+    for name in ["alert", "confirm", "prompt", "print", "stop", "focus", "blur", "close"] {
         global_op(vm, name, 0, dialog_stub, Some(name));
     }
+    // AETHERWPT3 (SR138): the window open steps (HTML §7.2.2.1), auxiliary contexts in js/frames.rs.
+    global_op(vm, "open", 0, window_open, None);
     for name in ["scroll", "scrollTo", "scrollBy"] {
         global_op(vm, name, 0, window_scroll, Some(name));
     }
