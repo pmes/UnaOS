@@ -3840,3 +3840,27 @@ pub fn ring3_rename(mt: &MountTable, from: &str, off: u64, to_raw: &[u8], who: &
         }
     }
 }
+
+// =================================================================================================
+// QEMUSKIP (rmbp-ledger B613) — TAIL-APPENDED (this file's panic Locations are line-pinned). THE ONE "CAN A FIXTURE WRITE
+// UNDER THE HOME" QUESTION. SCREENSHOTFAT (B556) made rung 0 the native root (`volume_name("/") == "native"`, prtscr's
+// `native_root`); a non-native root is a FAT, and whether that FAT takes a write is `write_veto` — the one definition of
+// "may an ordinary file mutation reach this volume" (`FatBackend::write_veto`: R99's sacred boot FAT, then the block
+// source's own refusal). QEMUIMAGE26 (B558–B607) booted with `/` = the ESP on ide-hd (`root mount / = fat boot volume
+// source=ahci5 rw=no`) and every home-writing fixture failed on `create … Unsupported` / `no-writable-path` / `why=Io`.
+// A fixture asks this first and prints `-> SKIP reason=home-not-writable(<kind>)`; a writable FAT (the QEMU lanes whose
+// specs REQUIRE those fixtures' PASS) answers `None` and the fixture runs exactly as before.
+
+/// QEMUSKIP (B613): `None` = a fixture may write under `path` (the native UnaFS root, or a FAT whose `write_veto` is
+/// clear, or a path no volume claims — the fixture's own refusal says that one); `Some("fat")` = the volume claiming
+/// `path` is a non-native volume that refuses writes.
+pub fn home_unwritable(mt: &MountTable, path: &str) -> Option<&'static str> {
+    match mt.volume_name(path) {
+        Ok(v) if v == "native" => None,
+        Ok(_) => match mt.write_veto(path) {
+            Ok(Some(_)) => Some("fat"),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}

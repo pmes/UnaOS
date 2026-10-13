@@ -905,7 +905,7 @@ pub fn codec_selftest() -> bool {
 /// operator's own file is restored byte for byte. Prints `:: PREFS-FIXTURE: ... -> PASS ::`.
 #[cfg(feature = "witness")]
 pub fn selftest() {
-    ensure_loaded();
+    if let Some(k) = crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &path()) { serial_println!(":: PREFS-FIXTURE: dir={} -> SKIP reason=home-not-writable({}) ::", path(), k); serial_println!(":: SETTINGSFILES: dir={} -> SKIP reason=home-not-writable({}) ::", path(), k); return; } ensure_loaded(); // QEMUSKIP (B613): every leg saves to <home>/settings — a refused volume is SKIP (the run's `[prefs] set … ok=0 why=Io`)
     #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] let codec = codec_selftest(); // ARMNOEL0: widened (with its twin) to the `crate::bus` cfg
     #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware"))))] let codec = true; // no bus on this build: the codec leg is vacuous, not failed
     // SETTINGSFILES (R98): the legs below run on the `general` domain file (power.lowbat_shutdown_pct's)
@@ -1169,7 +1169,7 @@ pub fn prefscap_selftest() {
     use prefs_core::cap::Caller;
     use prefs_core::wire::{fulfil_as, EACCES, ENOSPC, VERB_DECLARE, VERB_SET};
     ensure_loaded();
-    const ME: Caller = Caller::Program("pcaptest");
+    const ME: Caller = Caller::Program("pcaptest"); if let Some(k) = crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &path()) { serial_println!(":: PREFSCAP: dir={} -> SKIP reason=home-not-writable({}) ::", path(), k); return; } // QEMUSKIP (B613): `own=` is a save to <home>/settings
     let mut o = Vec::new();
     let own = fulfil_as(&mut KernelStore, VERB_SET, b"app.pcaptest.level\x003", true, ME, &mut o) == 0
         && get(prefs_core::files::APP_NS, "pcaptest.level") == Some(PrefValue::Int(3));

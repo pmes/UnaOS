@@ -437,7 +437,7 @@ pub fn selftest() {
         let _ = mt.unlink(c, p);
     }
     let Some(path) = written else {
-        serial_println!(":: PLAYWAV: path=- reason=no-writable-path -> FAIL ::");
+        if let Some(k) = crate::fs::vfs::home_unwritable(&mt, "/home") { serial_println!(":: PLAYWAV: path=- -> SKIP reason=home-not-writable({}) ::", k); } else { serial_println!(":: PLAYWAV: path=- reason=no-writable-path -> FAIL ::"); } // QEMUSKIP (B613): a home the volume refuses is SKIP, never FAIL
         return;
     };
     // AUDIO7 M4: the completion is the ring's drain (`report()` from `service()`), not a wall clock. The loop

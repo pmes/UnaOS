@@ -883,7 +883,7 @@ pub fn fixture() {
                     c
                 }
                 None => {
-                    serial_println!(":: PLAYER: reason=no-TEST.WAV-and-no-writable-path -> FAIL ::");
+                    if let Some(k) = crate::fs::vfs::home_unwritable(&mt, "/home") { serial_println!(":: PLAYER: reason=no-TEST.WAV -> SKIP reason=home-not-writable({}) ::", k); } else { serial_println!(":: PLAYER: reason=no-TEST.WAV-and-no-writable-path -> FAIL ::"); } // QEMUSKIP (B613): a home the volume refuses is SKIP, never FAIL
                     return;
                 }
             }

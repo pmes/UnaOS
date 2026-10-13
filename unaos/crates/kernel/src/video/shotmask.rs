@@ -552,7 +552,7 @@ pub fn ensure_tests() {
 
 /// `tests shot` — shoot `desktop`, decode the PNG back with the kernel's own decoder (`facet::decode_file`), decode
 /// the mask and check it covers the clock's rectangle and leaves the panel's middle scored.
-pub fn selftest() {
+pub fn selftest() { if let Some(k) = super::prtscr::session_home().ok().and_then(|h| crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &h)) { serial_println!(":: GLASSEYES: states={} shot=desktop png=none mask=none -> SKIP reason=home-not-writable({}) ::", STATES.len(), k); return; } // QEMUSKIP (B613): the shot and its mask are written under the home — asked first (same-line fold)
     let r = match run(State::Desktop) {
         Ok(r) => r,
         Err(e) => {
