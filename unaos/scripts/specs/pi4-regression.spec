@@ -2175,9 +2175,9 @@ FORBID :: CERAMIC: .* :: FAIL ::
 # ---    1. THE WIRE LINE names every derived parameter AND the FNV-1a 64 of the tile produced,
 # ---       AND `box=` the control diameter the material was sized against — so Peter's size ruling
 # ---       ("window buttons are very small", `theme::CONTROL_BOX` 12 -> 24) is legible in the
-# ---       capture rather than inferred from the chrome. Emitted once from the first generation and
-# ---       NOT witness-gated, so the metal image prints it too.
-REQUIRE \[knurl\] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=24 tile=4x4 hash=0x56957202a422b4b1
+# ---       capture. UIMETRICS M1 (c6ec712b) made it `ui::px(12)` = 12 x the dpi scale (12 at QEMU 640x480, 24 at 2x), so
+# ---       `box=` is pinned as a number, not 24 (PISPEC, pi-ledger PI16). NOT witness-gated: the metal image prints it too.
+REQUIRE \[knurl\] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=[1-9][0-9]* tile=4x4 hash=0x56957202a422b4b1
 #
 # ---    2. THE FIXTURE VERDICT. `knurl::selftest` recomputes every factor from scratch and asserts
 # ---       determinism AND the pinned checksum; asserts the AMPLITUDE BUDGET on every pixel (the
