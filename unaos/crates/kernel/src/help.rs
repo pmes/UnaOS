@@ -101,7 +101,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("nc", "network", "send a message over TCP, or UDP with -u, and print the reply", "nc [-u] <a.b.c.d> <port> [message]", &["nc 10.0.2.2 80 hi", "nc -u 10.0.2.2 7 ping"]),
     d("curl", "network", "minimal HTTP/1.0 GET to an IPv4 host, response printed", "curl [http://]<a.b.c.d>[:port][/path]", &["curl 10.0.2.2/", "curl http://10.0.2.2:8080/index.html"]),
     d("fetch", "network", "download an http URL to a file (or `-` to print it); https unsupported", "fetch <http-url> [<dest-path>] | fetch - <http-url>", &["fetch http://10.0.2.2/a.txt A.TXT", "fetch - http://10.0.2.2/a.txt"]),
-    d("dns", "network", "resolve a hostname (aarch64 net6 builds; elsewhere refuses by name)", "dns <hostname>", &["dns example.com"]),
+    d("dns", "network", "resolve a hostname (aarch64 net6 builds; elsewhere refuses by name)", "dns <hostname>", &["dns example.com"]), d("wifi", "network", "the Wi-Fi radio (BCM4331): status, the bring-up note, scan, join an open network (x86 `wifi` images; elsewhere refuses by name)", "wifi [status|up|scan|join <ssid>]", &["wifi", "wifi up", "wifi scan", "wifi join HomeNet"]), // UIREDS26 (B573): the `wifi` HOST verb's row, from wifi/verb.rs's arm — folded onto this line (help.rs is in every image)
     // ── system ──
     d("help", "system", "list verbs by group, or show one verb's usage", "help [verb]", &["help", "help ls"]),
     d("echo", "system", "print the arguments", "echo [text...]", &["echo hello"]),
