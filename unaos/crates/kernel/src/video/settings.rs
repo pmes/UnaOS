@@ -25,8 +25,11 @@
 //! and stores); a toggle/segment/button to act. Keyboard: Up/Down/Tab move the selection,
 //! Left/Right adjust, Enter toggles/applies; typing edits the wallpaper path while it is selected.
 //!
-//! SETTINGS2: four TABS (General · Users · Display · About; Left/Right on the strip or a click switches, the choice
-//! persists as `system.settings.tab`); Users = list + Add / Delete (two-step) / Reset password, every action a
+//! SETTINGS2: TABS (General · Users · Display · About · …; a click or the keys switch, the choice persists as
+//! `system.settings.tab`). SETTINGSTABS (rmbp-ledger B623, R118): the tabs are a LEFT COLUMN ([`COL_W`] wide, one
+//! [`COL_ROW`] row per tab, scrolling past [`COL_VIS`] rows); every pane draws from ONE origin, [`PANE_X`] x
+//! [`PANE_Y`], under a title band carrying the tab's name. Column focus: Up/Down move the tab; Tab moves focus
+//! between the column and the pane. Wire: `[settings] tabs=left col_w=<n> rows=<n> sel=<name>` once per open. Users = list + Add / Delete (two-step) / Reset password, every action a
 //! `[settings] users op= name= ok= reason=` line; Display = brightness (BRIGHTFLOOR M5), idle blank, UI scale (read-only: the compositor fixes it at
 //! takeover), clock (fixed: CLOCKBAR has no runtime switch); About = version, board, CPUs, RAM, uptime.
 //!
@@ -56,17 +59,32 @@ pub const IDLE_STEPS: [u32; 8] = [0, 1, 2, 5, 10, 15, 30, 60];
 const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
 const WALL_MAX: usize = 120;
 
-const WIN_W: usize = 800; // APPEARANCE (B408): 520 -> 600; FILETYPES (B423) 680; NOTIFYPANE (B435) 800 for nine tabs
-const TAB_H: usize = 28;
-const TOP: usize = 12 + TAB_H;
+// SETTINGSTABS (B623, R118): the tab COLUMN on the left; every pane's geometry hangs off ONE origin (PANE_X, PANE_Y).
+// All values are LOGICAL px: the surface is `metrics::size` of them (UIMETRICS B372), so the column scales with the rest.
+/// The tab column's width (logical px).
+pub const COL_W: usize = 160;
+/// One tab row in the column.
+const COL_ROW: usize = 32;
+/// The column's inset above its first row.
+const COL_PAD: usize = 8;
+/// The pane's content origin: x right of the column, y below the pane's title band (the tab's name as a heading).
+const PANE_X: usize = COL_W;
+const PANE_Y: usize = 40;
+/// The pane's own width — the old window's (APPEARANCE B408 600; FILETYPES B423 680; NOTIFYPANE B435 800).
+const PANE_W: usize = 800;
+const WIN_W: usize = PANE_X + PANE_W;
+/// The first control row's top: the pane origin (the title band is above it).
+const TOP: usize = PANE_Y;
 const ROW_H: usize = 40;
 const ROWS: usize = 10;
-/// The tab strip: General · Users · Display · About.
+/// The tabs, in the column's order.
 pub const TABS: usize = 9;
 const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
-const LABEL_X: usize = 12;
-const TRACK_X: usize = 150;
+/// Tab rows the column shows at once; more than this and it scrolls (the selected row is kept in view).
+const COL_VIS: usize = (WIN_H - COL_PAD) / COL_ROW;
+const LABEL_X: usize = PANE_X + 12;
+const TRACK_X: usize = PANE_X + 150;
 const TRACK_W: usize = 240;
 const VAL_X: usize = TRACK_X + TRACK_W + 12;
 const BTN_W: usize = 70;
@@ -101,8 +119,11 @@ impl Values {
 
 struct State {
     sel: usize,
-    /// Focus is on the tab strip (Left/Right switch tabs).
+    /// Focus is on the tab column (Up/Down move the tab; Tab moves focus to the pane).
     strip: bool,
+    /// SETTINGSTABS: the column's first visible tab row (it scrolls past `COL_VIS`) and the hovered row.
+    col_top: usize,
+    col_hover: Option<usize>,
     u: UsersUi,
     /// PREFSUI: the Login Items tab's Add chooser (an index into `loginitems::installed()`), and the Display
     /// tab's Resolution dropdown (open or not).
@@ -457,14 +478,27 @@ fn paint(st: &mut State, v: &Values) {
     for p in st.surf.iter_mut() { *p = theme::content_fill(); }
     let face = super::text::Face::Ui; // KERNELFONT: tab names in the UI face
     let ch = super::metrics::lcell_h(face);
-    // The tab strip.
-    let tw = w / TABS;
-    for k in 0..TABS {
-        let on = k == v.tab as usize;
-        fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::accent() } else { theme::scroll_track() });
-        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::content_text(), false, face);
+    // SETTINGSTABS (B623): the tab column — one row per tab, the selected one in the accent, the hovered one lit.
+    let tab = (v.tab as usize).min(TABS - 1);
+    st.col_top = col_scrolled(st.col_top, tab);
+    fill(&mut st.surf, w, 0, 0, COL_W - 1, h, theme::scroll_track());
+    fill(&mut st.surf, w, COL_W - 1, 0, 1, h, theme::frame_line());
+    for k in st.col_top..(st.col_top + COL_VIS).min(TABS) {
+        let y = COL_PAD + (k - st.col_top) * COL_ROW;
+        if k == tab { fill(&mut st.surf, w, 4, y, COL_W - 9, COL_ROW - 2, theme::accent()); }
+        else if st.col_hover == Some(k) { fill(&mut st.surf, w, 4, y, COL_W - 9, COL_ROW - 2, theme::button_face()); }
+        super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), COL_W - 6, 14, y + (COL_ROW - 2 - ch) / 2, TAB_NAMES[k].as_bytes(), theme::content_text(), false, face);
     }
-    if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::accent()); }
+    if TABS > COL_VIS { // the scroll thumb: where the visible rows sit in the whole column
+        let track = h - 2 * COL_PAD;
+        fill(&mut st.surf, w, COL_W - 5, COL_PAD + st.col_top * track / TABS, 2, (COL_VIS * track / TABS).max(8), theme::frame_line());
+    }
+    if st.strip { fill(&mut st.surf, w, 0, 0, 3, h, theme::accent()); } // column focus
+    // The pane's title band: the tab's name as its heading.
+    let hf = super::text::Face::Body;
+    let hc = super::metrics::lcell_h(hf);
+    super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, LABEL_X, (PANE_Y - hc) / 2, TAB_NAMES[tab].as_bytes(), theme::content_text(), false, hf);
+    fill(&mut st.surf, w, PANE_X, PANE_Y - 2, PANE_W, 1, theme::frame_line());
     match v.tab {
         0 => paint_general(st, v),
         1 => paint_users(st),
@@ -482,7 +516,7 @@ fn paint(st: &mut State, v: &Values) {
     }
     if !st.strip && matches!(v.tab, 0 | 2) {
         let r = row_of(st.sel);
-        fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent());
+        fill(&mut st.surf, w, PANE_X + 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent());
         if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + BTN_W + 10, TOP + 4 * ROW_H + ROW_H - 8, BTN_W, 2, theme::accent()); }
     }
 }
@@ -712,7 +746,7 @@ fn paint_users(st: &mut State) {
             let r = 1 + i;
             let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else if users_is_admin(nm) { " (admin)" } else { "" };
             let w = st.w;
-            if i == sel { fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent()); }
+            if i == sel { fill(&mut st.surf, w, PANE_X + 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::accent()); }
             txt(st, LABEL_X, r, &alloc::format!("{}{}", nm, tag));
             if st.u.confirm.as_deref() == Some(nm.as_str()) {
                 txt(st, TRACK_X + 130, r, "delete?");
@@ -806,7 +840,7 @@ pub fn open() -> Result<(), String> {
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
     let tab0 = CUR.lock().tab as usize;
     let (sel0, strip0) = take_at(tab0); // LAUNCHER (B417): a launcher pick opens on its row
-    let mut st = State { sel: sel0, strip: strip0, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
+    let mut st = State { sel: sel0, strip: strip0, col_top: col_scrolled(0, tab0), col_hover: None, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
@@ -817,6 +851,7 @@ pub fn open() -> Result<(), String> {
     wm::focus_changed(OWNER);
     let _ = wm::present(id);
     serial_println!("[settings] open win={}", id);
+    serial_println!("[settings] tabs=left col_w={} rows={} sel={}", COL_W, TABS, TAB_NAMES[tab0.min(TABS - 1)]); // SETTINGSTABS (B623)
     witness(true);
     Ok(())
 }
@@ -857,6 +892,44 @@ fn switch_tab(t: usize) {
 
 fn cur_tab() -> usize { CUR.lock().tab as usize }
 
+// ── SETTINGSTABS (rmbp-ledger B623, R118) — the tab column ────────────────────────────────────────────────────────
+// "settings tabs typically go on the left since there get to be a lot of them." Rows are `COL_ROW` tall from `COL_PAD`;
+// `COL_VIS` show at once and the column scrolls so the selected tab stays in view. Pure helpers, shared by the paint,
+// the press router and the fixture.
+
+/// The column's first visible row so that tab `sel` is in view, starting from `top`.
+fn col_scrolled(top: usize, sel: usize) -> usize {
+    let top = if sel < top { sel } else if sel >= top + COL_VIS { sel + 1 - COL_VIS } else { top };
+    top.min(TABS.saturating_sub(COL_VIS))
+}
+
+/// The tab under logical `cy` in the column whose first visible row is `top` (`None` = the inset or past the last).
+fn col_tab_at(cy: usize, top: usize) -> Option<usize> {
+    if cy < COL_PAD { return None; }
+    let r = (cy - COL_PAD) / COL_ROW;
+    let t = top + r;
+    (r < COL_VIS && t < TABS).then_some(t)
+}
+
+/// Pointer motion over the window: light the column row under it. Never consumes. The motion router owes the call
+/// (`quarry/live.rs`, beside `settings::press_route`) — until it is wired the column lights on press only.
+#[allow(dead_code)]
+pub fn hover_route(x: i32, y: i32) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE { return false; }
+    let Some(info) = wm::info(id) else { return false };
+    let inside = x >= info.x as i32 && y >= info.y as i32 && matches!(wm::hit_test(x, y), Some((w, _, _)) if w == id);
+    let hov = if inside {
+        let sc = info.scale.max(1);
+        let (cx, cy) = (super::metrics::to_logical((x as usize - info.x) / sc), super::metrics::to_logical((y as usize - info.y) / sc));
+        let top = STATE.lock().as_ref().map(|s| s.col_top).unwrap_or(0);
+        if cx < COL_W { col_tab_at(cy, top) } else { None }
+    } else { None };
+    let changed = STATE.lock().as_mut().map(|s| core::mem::replace(&mut s.col_hover, hov) != hov).unwrap_or(false);
+    if changed { repaint(); }
+    false
+}
+
 /// Keys and actions, only while this window holds focus. `true` when consumed.
 pub fn key_route(ev: crate::pal::Event) -> bool {
     use crate::video::keymap::Action;
@@ -880,18 +953,22 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             match c {
                 0x1C | 0x1D => true,
                 0x1E => {
-                    // Up: previous control; from the first one, the tab strip.
-                    if tab == 1 {
+                    // Up: previous control; from the first one, the tab column. SETTINGSTABS: on the column, the previous tab.
+                    if strip {
+                        if tab > 0 { switch_tab(tab - 1); }
+                    } else if tab == 1 {
                         let mut g = STATE.lock();
                         if let Some(x) = g.as_mut() { if x.strip { } else if x.u.sel > 0 { x.u.sel -= 1; } else { x.strip = true; } }
                         drop(g);
                         repaint();
-                    } else if !strip {
+                    } else {
                         let p = ctrls.iter().position(|&k| k == s).unwrap_or(0);
                         if p == 0 { if let Some(x) = STATE.lock().as_mut() { x.strip = true; } repaint(); } else { select(ctrls[p - 1]); }
                     }
                     true
                 }
+                0x1F if strip => { if tab + 1 < TABS { switch_tab(tab + 1); } true } // SETTINGSTABS: Down on the column, the next tab
+                0x09 if !strip => { if let Some(x) = STATE.lock().as_mut() { x.strip = true; } repaint(); true } // SETTINGSTABS: Tab, pane -> column
                 0x1F | 0x09 => {
                     if tab == 1 {
                         let n = user_list().len();
@@ -987,8 +1064,9 @@ pub fn press_route(x: i32, y: i32) -> bool {
     let lw = super::metrics::to_logical(info.w);
     if cx >= lw || cy >= super::metrics::to_logical(info.h) { return false; }
     wm::focus_changed(OWNER);
-    if cy < TAB_H {
-        let t = (cx / (lw / TABS).max(1)).min(TABS - 1);
+    if cx < COL_W { // SETTINGSTABS (B623): a press in the column selects by row
+        let top = STATE.lock().as_ref().map(|s| s.col_top).unwrap_or(0);
+        let Some(t) = col_tab_at(cy, top) else { return true };
         if t != cur_tab() { switch_tab(t); } else { if let Some(st) = STATE.lock().as_mut() { st.strip = true; } repaint(); }
         return true;
     }
@@ -1098,8 +1176,10 @@ pub fn selftest() {
     // Restore the operator's idle value (and its key).
     set(3, idle_index(before.idle_min));
     if opened { close(); }
-    let ok = saved && same && live;
-    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={} store={}", opened as u8, saved, same as u8, live as u8, crate::prefs::path());
+    // SETTINGSTABS (B623): every tab's column row maps back to that tab, and the pane starts right of the column.
+    let col_ok = PANE_X == COL_W && WIN_W == COL_W + PANE_W && (0..TABS).all(|k| { let t = col_scrolled(0, k); col_tab_at(COL_PAD + (k - t) * COL_ROW + COL_ROW / 2, t) == Some(k) });
+    let ok = saved && same && live && col_ok;
+    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={} store={} tabs=left col_w={} sel={} col_ok={}", opened as u8, saved, same as u8, live as u8, crate::prefs::path(), COL_W, TAB_NAMES[(CUR.lock().tab as usize).min(TABS - 1)], col_ok as u8);
     witness(ok);
 }
 
@@ -1512,7 +1592,7 @@ fn drag_selftest() -> &'static str {
 // `loginitems::edit` (one latched store write of `system.login.items`, the key the dock menu's Open at Login edits).
 
 const LI_ROWS: usize = 7;
-const LI_UP_X: usize = 230;
+const LI_UP_X: usize = PANE_X + 230;
 const LI_DOWN_X: usize = LI_UP_X + BTN_W + 10;
 const LI_DEL_X: usize = LI_DOWN_X + BTN_W + 10;
 const LI_ADD_ROW: usize = 9;
@@ -2080,9 +2160,9 @@ fn take_at(tab: usize) -> (usize, bool) {
 pub const NP_TAB: usize = TABS - 1;
 const NP_ROW0: usize = 3;
 const NP_APP_ROWS: usize = 6;
-const NP_ALLOW_X: usize = 300;
-const NP_STYLE_X: usize = 400;
-const NP_SOUND_X: usize = 540;
+const NP_ALLOW_X: usize = PANE_X + 300;
+const NP_STYLE_X: usize = PANE_X + 400;
+const NP_SOUND_X: usize = PANE_X + 540;
 const NP_STEP_W: usize = 28;
 /// Row 1's -/+ boxes: from-, from+, until-, until+ (x of each box).
 const NP_STEPS: [usize; 4] = [TRACK_X, TRACK_X + 90, TRACK_X + 150, TRACK_X + 240];
