@@ -2757,7 +2757,12 @@ pub fn parse_color_str<H: Host>(value: &str) -> Option<(u8, u8, u8)> {
     }
     // Function notations the arm above does not read (hsl(), hwb(), the modern syntaxes): css_core's
     // parser; fully transparent paints nothing, as above.
+    // Only a COMPLETE function (it ends in `)`): a whitespace-split fragment of a shorthand (`rgb(238,`) is
+    // no colour, and the host's parser must never be asked to re-enter this one with it.
     if lower.contains('(') {
+        if !lower.ends_with(')') {
+            return None;
+        }
         return match H::parse_color_alpha(v) {
             Some((c, a)) if a > 0.0 => Some(c),
             _ => None,

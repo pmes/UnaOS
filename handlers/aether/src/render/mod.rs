@@ -95,7 +95,122 @@ pub fn text_boxes() -> Vec<TextBox> {
     TEXT_BOXES.with(|t| t.borrow().clone())
 }
 
+// ---- AETHERPAINTPERF (SR130): the paint index ----------------------------------------------------------
+//
+// A frame used to walk and paint every box of the tree, clipping each pixel to the damage rects: a page of
+// 2,000 rows shaped and clipped 2,000 rows for a one-box damage. Now a frame walks twice. The INDEX walk runs the
+// paint's own control flow with no pixels — every box at the place the paint puts it (placed_origin, the
+// multicol shift, scroll offsets, atomic inlines, stacking-context layers) — and records each `draw_node`
+// call's SUBTREE INK: the screen rect every pixel its paint (its own and its nested calls') can touch, or
+// unbounded when the shape is not bounded here (transforms, filters, clip-paths, backdrop filters, box shadows,
+// text shadows, vertical writing, column fragments, multicol rules, scrollbars, form controls and media,
+// author ::marker text, text outside an inline formatting context). It records the text boxes too. The PAINT
+// walk then skips a `draw_node` call whose subtree ink meets no damage rect: such a box writes no pixel of the
+// damage, every pixel it would write is outside it, and every painter clips to the damage — the skip moves no
+// pixel. The ink is a flat map of (box -> rect) in paint order of recording, rebuilt every frame, so it is never
+// stale; `subtree_ink` hands the last frame's to the engine (the damage of an animation frame).
+
+/// Screen-space rect (x0, y0, x1, y1) a paint can touch.
+pub(crate) type Ink = (f32, f32, f32, f32);
+const INK_NONE: Ink = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+const INK_ALL: Ink = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
+
+fn ink_union(a: Ink, b: Ink) -> Ink {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+/// Whether `r` meets any damage rect.
+fn ink_meets(r: Ink, damage_rects: &[(u32, u32, u32, u32)]) -> bool {
+    damage_rects.iter().any(|&(dx, dy, dw, dh)| {
+        r.2 > dx as f32 && r.0 < (dx + dw) as f32 && r.3 > dy as f32 && r.1 < (dy + dh) as f32
+    })
+}
+
+#[derive(Default)]
+struct PaintIndex {
+    /// The walk in progress: 0 the classic walk (paints every box it reaches and records the text boxes), 1 the
+    /// index walk (no pixels: subtree ink and text boxes), 2 the indexed paint walk.
+    mode: u8,
+    /// The ink of the `draw_node` calls open on the index walk (innermost last).
+    stack: Vec<Ink>,
+    /// Each box's subtree ink, from the last index walk.
+    ink: std::collections::HashMap<NodeId, Ink>,
+    /// The scroll offset that walk painted at.
+    scroll: (i32, i32),
+    painted: u64,
+    skipped: u64,
+}
+
+thread_local! {
+    static INDEX: std::cell::RefCell<PaintIndex> = std::cell::RefCell::new(PaintIndex::default());
+}
+
+fn walk_mode() -> u8 {
+    INDEX.with(|x| x.borrow().mode)
+}
+
+/// Adds `r` to the ink of the innermost open `draw_node` call (index walk only).
+fn ink_add(r: Ink) {
+    INDEX.with(|x| {
+        if let Some(top) = x.borrow_mut().stack.last_mut() {
+            *top = ink_union(*top, r);
+        }
+    });
+}
+
+/// The union of the last frame's subtree ink of `nodes` (boxes it did not paint add nothing), and the scroll
+/// offset that frame painted at; the rect is None when one of them is unbounded.
+pub(crate) fn subtree_ink(nodes: &[NodeId]) -> (Option<Ink>, (i32, i32)) {
+    INDEX.with(|x| {
+        let x = x.borrow();
+        let mut acc = INK_NONE;
+        for n in nodes {
+            if let Some(r) = x.ink.get(n) {
+                if r.0 == f32::NEG_INFINITY || r.2 == f32::INFINITY || r.1 == f32::NEG_INFINITY || r.3 == f32::INFINITY {
+                    return (None, x.scroll);
+                }
+                acc = ink_union(acc, *r);
+            }
+        }
+        (Some(acc), x.scroll)
+    })
+}
+
+/// An element box's own ink (index walk): its border box, an outside list marker's reach left of it, or
+/// unbounded for the painters whose extent is not bounded here.
+#[allow(clippy::too_many_arguments)]
+fn ink_element(
+    layout: &LayoutTree, node_id: NodeId, tag: &str, spec: &crate::layout::PaintStyle, lb: &taffy::Layout, box_sx: f32, box_sy: f32,
+    inherited: &Inherited,
+) {
+    let bars = layout_core::scroll::scrollbars(layout, node_id);
+    let unbounded = layout.col_frags.get(&node_id).is_some_and(|f| !f.is_empty())
+        || spec.shadows.as_ref().is_some_and(|s| !s.is_empty())
+        || layout.multicol.contains_key(&node_id)
+        || bars.v.is_some()
+        || bars.h.is_some()
+        || matches!(tag, "input" | "textarea" | "select" | "button" | "video" | "audio")
+        || spec.marker.as_ref().is_some_and(|m| m.text.is_some());
+    if unbounded {
+        ink_add(INK_ALL);
+        return;
+    }
+    let (bw, bh) = (lb.size.width.max(0.0), lb.size.height.max(0.0));
+    let mut r = (box_sx - 2.0, box_sy - 2.0, box_sx + bw + 2.0, box_sy + bh + 2.0);
+    // An outside marker ends at the content edge on the first line: a bullet one em before it, a counter
+    // its text's width before it (40 em covers any ordinal the counter styles print).
+    if spec.list_item.unwrap_or(tag == "li") && !inherited.text_hidden {
+        let fs = spec.marker.as_ref().map_or(inherited.font_size, |m| m.size(inherited.font_size).max(inherited.font_size));
+        r.0 -= 40.0 * fs + 4.0;
+        r.1 -= 4.0 * fs; // the marker's glyphs about the first baseline (an empty item's sits below its top)
+        r.3 += 4.0 * fs;
+    }
+    ink_add(r);
+}
+
 mod boxpaint;
+// AETHERPAINTPERF (SR130): rasterized glyph runs kept across frames.
+mod glyphcache;
 // AETHERA11Y (SR119): the keyboard focus ring, painted last from the accessibility theme.
 pub mod focusring;
 pub(crate) mod effects;
@@ -255,22 +370,52 @@ fn draw_shaped(
     text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, color: (u8, u8, u8),
     surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
 ) -> f32 {
+    // AETHERPAINTPERF (SR130): the same run at the same pen (exact bits), size, spacing, direction, colour and font
+    // set draws the same coverage: replay the pixels the rasterizer emitted, through the same clip, in order.
+    let key = crate::perf::scoped().then(|| glyphcache::key(text, adv, origin_x, baseline_y, color));
+    if let Some(run) = key.as_ref().and_then(glyphcache::get) {
+        crate::perf::add_glyph(true);
+        for &(px, py, a) in &run.px {
+            plot_glyph_px(surface, width, height, damage_rects, clip, color, px, py, a);
+        }
+        return run.advance;
+    }
+    let record = key.is_some();
+    let mut emitted: Vec<(i32, i32, u8)> = Vec::new();
     let lut = crate::fonts::raster::preblend(color);
     let placed = adv.place(text);
     let mut end = 0.0f32;
     for (g, x, dy) in &placed {
         end = end.max(*x - g.dx * adv.size + g.adv * adv.size);
         crate::fonts::raster::draw_glyph(g.face, g.gid, adv.size, origin_x + x, baseline_y + dy, &lut, &mut |px, py, a| {
-            if px < 0 || py < 0 {
-                return;
+            if record {
+                emitted.push((px, py, a));
             }
-            let (px, py) = (px as u32, py as u32);
-            if px < width && py < height && in_damage(px, py, damage_rects) && in_clip(px, py, clip) {
-                blend_px(surface, width, px, py, color, a);
-            }
+            plot_glyph_px(surface, width, height, damage_rects, clip, color, px, py, a);
         });
     }
-    adv.str(text).max(end)
+    let advance = adv.str(text).max(end);
+    if let Some(k) = key {
+        crate::perf::add_glyph(false);
+        glyphcache::put(k, glyphcache::Run { px: emitted, advance });
+    }
+    advance
+}
+
+/// One rasterized glyph pixel of coverage `a` (already through the ink's pre-blend), clipped to the surface,
+/// the damage and the clip.
+#[allow(clippy::too_many_arguments)]
+fn plot_glyph_px(
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip, color: (u8, u8, u8),
+    px: i32, py: i32, a: u8,
+) {
+    if px < 0 || py < 0 {
+        return;
+    }
+    let (px, py) = (px as u32, py as u32);
+    if px < width && py < height && in_damage(px, py, damage_rects) && in_clip(px, py, clip) {
+        blend_px(surface, width, px, py, color, a);
+    }
 }
 
 /// css-text-decor-3 §4: each shadow layer is the text's glyph coverage offset by (dx, dy), blurred by a
@@ -1816,6 +1961,64 @@ pub fn render_frame(
     let sy = scroll_y as i32;
     let sx = scroll_x as i32;
 
+    /// AETHERPAINTPERF (SR130): one box of the walk — on the index walk, its subtree ink is the union of what
+    /// its body adds and what its nested calls record; on the indexed paint walk it is skipped when that ink meets
+    /// no damage rect (its text boxes were recorded by the index walk).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_node(
+        node_id: NodeId,
+        abs_x: f32,
+        abs_y: f32,
+        inherited: Inherited,
+        layout: &LayoutTree,
+        font: &Option<&'static Font>,
+        font_bold: &Option<&'static Font>,
+        surface: &mut [u8],
+        width: u32,
+        height: u32,
+        sx: i32,
+        sy: i32,
+        damage_rects: &[(u32, u32, u32, u32)],
+        clip: Clip,
+    ) {
+        match walk_mode() {
+            1 => {
+                INDEX.with(|x| x.borrow_mut().stack.push(INK_NONE));
+                draw_node_body(
+                    node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+                    damage_rects, clip,
+                );
+                INDEX.with(|x| {
+                    let mut x = x.borrow_mut();
+                    let r = x.stack.pop().unwrap_or(INK_NONE);
+                    x.ink.insert(node_id, r);
+                    if let Some(top) = x.stack.last_mut() {
+                        *top = ink_union(*top, r);
+                    }
+                });
+            }
+            2 => {
+                let hit = INDEX.with(|x| x.borrow().ink.get(&node_id).is_none_or(|r| ink_meets(*r, damage_rects)));
+                if !hit {
+                    INDEX.with(|x| x.borrow_mut().skipped += 1);
+                    return;
+                }
+                INDEX.with(|x| x.borrow_mut().painted += 1);
+                draw_node_body(
+                    node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+                    damage_rects, clip,
+                );
+            }
+            _ => {
+                INDEX.with(|x| x.borrow_mut().painted += 1);
+                draw_node_body(
+                    node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+                    damage_rects, clip,
+                );
+            }
+        }
+    }
+
     /// css-color-4 / css-masking: `opacity` < 1 paints the subtree as a
     /// GROUP and composites it once. Painting the group straight onto the
     /// backdrop and then mixing with a snapshot of the backdrop by the
@@ -1829,7 +2032,7 @@ pub fn render_frame(
     /// (nearest). The group is drawn where the untransformed box sits, so what the surface edge or an
     /// ancestor clip cut off there is not in the group.
     #[allow(clippy::too_many_arguments)]
-    fn draw_node(
+    fn draw_node_body(
         node_id: NodeId,
         abs_x: f32,
         abs_y: f32,
@@ -1868,9 +2071,13 @@ pub fn render_frame(
             layout_core::effects::resolve_filter(n, id)
         };
         if let (Some(bf), Some(lb)) = (&backdrop, lb) {
+            if walk_mode() == 1 {
+                ink_add(INK_ALL); // AETHERPAINTPERF: a backdrop filter reads and writes around the box
+            } else {
             let (ox, oy) = placed_origin(layout, node_id, abs_x, abs_y, &lb, width, height, sx, sy);
             let (bx, by) = (ox - sx as f32, oy - sy as f32);
             backdrop_group(surface, width, height, (bx, by, bx + lb.size.width, by + lb.size.height), bf, &fcx, clip, &resolve);
+            }
         }
         let (Some(lb), true) = (lb, tf.is_some() || shape.is_some() || filter.is_some()) else {
             draw_node_op(
@@ -1879,6 +2086,15 @@ pub fn render_frame(
             );
             return;
         };
+        if walk_mode() == 1 {
+            // AETHERPAINTPERF: a transformed, filtered or clip-pathed group lands where its matrix sends it.
+            ink_add(INK_ALL);
+            draw_node_op(
+                node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
+                damage_rects, clip,
+            );
+            return;
+        }
         let (w, h) = (lb.size.width, lb.size.height);
         let (ox, oy) = placed_origin(layout, node_id, abs_x, abs_y, &lb, width, height, sx, sy);
         let (bx, by) = (ox - sx as f32, oy - sy as f32);
@@ -1957,7 +2173,7 @@ pub fn render_frame(
         clip: Clip,
     ) {
         let op = layout.paint_map.get(&node_id).and_then(|p| p.opacity).unwrap_or(1.0);
-        if op > 0.0 && op < 1.0 {
+        if op > 0.0 && op < 1.0 && walk_mode() != 1 {
             let snap = surface.to_vec();
             draw_node_inner(
                 node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
@@ -2141,6 +2357,12 @@ pub fn render_frame(
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
                 inherit_element(&mut inherited, tag, &spec, dom_node, node_id);
+                // AETHERPAINTPERF (SR130): the index walk records the box's own ink and paints nothing.
+                'paint: {
+                if walk_mode() == 1 {
+                    ink_element(layout, node_id, tag, &spec, layout_box, current_x - sx as f32, current_y - sy as f32, &inherited);
+                    break 'paint;
+                }
 
                 let bw = layout_box.size.width.max(0.0);
                 let bh = layout_box.size.height.max(0.0);
@@ -2829,6 +3051,11 @@ pub fn render_frame(
                         );
                     }
                 }
+                }
+            } else if dom_node.as_text().is_some() && !inherited.text_hidden && walk_mode() == 1 {
+                // AETHERPAINTPERF (SR130): a text run outside an inline formatting context wraps (or does not) at
+                // paint time; its lines are not bounded here.
+                ink_add(INK_ALL);
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {
                 // The same face the measurer wrapped this run with
                 // (fonts::face): family x weight x style. The preloaded sans
@@ -2931,7 +3158,7 @@ pub fn render_frame(
         let round_clip = layout
             .paint_map
             .get(&node_id)
-            .filter(|p| p.clip.unwrap_or(false) && p.radius.is_some_and(|r| r.iter().any(|&v| v != 0.0)))
+            .filter(|p| walk_mode() != 1 && p.clip.unwrap_or(false) && p.radius.is_some_and(|r| r.iter().any(|&v| v != 0.0)))
             .map(|p| {
                 let (bw, bh) = (layout_box.size.width, layout_box.size.height);
                 let outer = boxpaint::used_radii(p.radius.unwrap_or([0.0; 4]), bw, bh);
@@ -3070,6 +3297,9 @@ pub fn render_frame(
             // vertical-lr keeps that glyph turn with the lines left to right, sideways-lr turns them
             // counter-clockwise).
             let vmode = ifc.vertical;
+            if vmode != 0 && walk_mode() == 1 {
+                ink_add(INK_ALL); // AETHERPAINTPERF: vertical lines land through the staging map
+            }
             let (vbw, vbh) = if vmode != 0 {
                 ((ifc.inline_extent.ceil().max(1.0)) as u32, (ifc.height.ceil().max(1.0)) as u32)
             } else {
@@ -3133,6 +3363,10 @@ pub fn render_frame(
                         let Some(spec) = layout.paint_map.get(node) else { continue };
                         let fx = content_x + x - sx as f32;
                         let fy = content_y + y - sy as f32;
+                        if walk_mode() == 1 {
+                            ink_add((fx - 2.0, fy - 2.0, fx + *w + 2.0, fy + *h + 2.0));
+                            continue;
+                        }
                         let mut sides: [boxpaint::Side; 4] = [None; 4];
                         if let Some(b) = spec.border {
                             let styles = spec.border_style.unwrap_or([0; 4]);
@@ -3235,9 +3469,25 @@ pub fn render_frame(
                         // AETHERSTYLE3B (SR115): a vertical IFC's box is recorded in its staging space anchored at
                         // the content box's physical origin — the space `layout_core::hit` maps a pointer into.
                         let (rx, ry) = if vmode != 0 { (vorigin.0 as f32, vorigin.1 as f32) } else { (0.0, 0.0) };
-                        TEXT_BOXES.with(|t| {
-                            t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox + rx, w: fw, top: ltop + ry, bottom: lbot + ry, adv, scroll: (sx, sy) })
-                        });
+                        // AETHERPAINTPERF (SR130): the index walk records the text boxes (the indexed paint walk skips
+                        // boxes, so it records none), and the fragment's ink: its advance and line box, glyph overhang
+                        // (3 em up, 2 em down, 2 em across) and the spacing a selected line break adds.
+                        if walk_mode() != 2 {
+                            TEXT_BOXES.with(|t| {
+                                t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox + rx, w: fw, top: ltop + ry, bottom: lbot + ry, adv, scroll: (sx, sy) })
+                            });
+                        }
+                        if walk_mode() == 1 {
+                            let fs = i.font_size;
+                            let m = 2.0 * fs + 4.0 + i.letter_spacing.abs() + i.word_spacing.abs();
+                            if i.shadows(layout).is_empty() {
+                                // 3 em above the baseline, 2 em below it, 2 em and the spacing either side.
+                                ink_add((ox - m, ltop.min(by - 3.0 * fs) - 4.0, ox + fw + m, lbot.max(by + 2.0 * fs) + 4.0));
+                            } else {
+                                ink_add(INK_ALL);
+                            }
+                            continue;
+                        }
                         let deco = Deco { underline: i.underline, line_through: i.line_through };
                         // AETHERRENDER3 (SR126): the caret of an editable vertical field — `layout_core::hit::caret_rect` maps the
                         // caret offset of this text box to the physical bar (a horizontal bar across the column), painted on the
@@ -3370,7 +3620,7 @@ pub fn render_frame(
         finish_round_clip(surface);
         // AETHERSTYLE3 (SR103): css-multicol-1 §4.2 — a column rule midway in each gap between columns that
         // hold content, as tall as the column boxes (painted solid whatever its style).
-        if let Some(cols) = layout.multicol.get(&node_id) {
+        if let Some(cols) = layout.multicol.get(&node_id).filter(|_| walk_mode() != 1) {
             if let Some((rw, rc, _)) = cols.rule {
                 let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
                 let cx0 = current_x - sx as f32 + shx + layout_box.border.left + layout_box.padding.left;
@@ -3391,7 +3641,7 @@ pub fn render_frame(
         // AETHERSTYLE3 (SR103): a scroll container's overlay scrollbars, over its content.
         let bars = layout_core::scroll::scrollbars(layout, node_id);
         let (bx0, by0) = (current_x - sx as f32, current_y - sy as f32);
-        for bar in [bars.v, bars.h].into_iter().flatten() {
+        for bar in [bars.v, bars.h].into_iter().flatten().filter(|_| walk_mode() != 1) {
             let (tx, ty, tw, th) = bar.track;
             fill_rect(bx0 + tx, by0 + ty, bx0 + tx + tw, by0 + ty + th, SCROLL_TRACK, 255, surface, width, height, damage_rects, clip);
             let (mx, my, mw, mh) = bar.thumb;
@@ -3400,6 +3650,25 @@ pub fn render_frame(
     }
 
     let root_inherited = root_inherited();
+    // AETHERPAINTPERF (SR130): the index walk, then the paint walk that skips what meets no damage rect (one
+    // classic walk when the scopes are off).
+    let indexed = crate::perf::scoped();
+    INDEX.with(|x| {
+        let mut x = x.borrow_mut();
+        x.ink.clear();
+        x.stack.clear();
+        x.scroll = (sx, sy);
+        x.painted = 0;
+        x.skipped = 0;
+        x.mode = if indexed { 1 } else { 0 };
+    });
+    if indexed {
+        draw_node(
+            layout.root_node, 0.0, 0.0, root_inherited, layout, &font, &font_bold, surface, width, height, sx, sy,
+            damage_rects, (0.0, 0.0, width as f32, height as f32),
+        );
+        INDEX.with(|x| x.borrow_mut().mode = 2);
+    }
     draw_node(
         layout.root_node,
         0.0,
@@ -3416,6 +3685,12 @@ pub fn render_frame(
         damage_rects,
         (0.0, 0.0, width as f32, height as f32),
     );
+    let (painted, skipped) = INDEX.with(|x| {
+        let mut x = x.borrow_mut();
+        x.mode = 0;
+        (x.painted, x.skipped)
+    });
+    crate::perf::add_painted(painted, skipped);
     // AETHERA11Y (SR119): `:focus-visible` from the keyboard — the ring over everything.
     focusring::paint(layout, surface, width, height, sx, sy, damage_rects);
 }

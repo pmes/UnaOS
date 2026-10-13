@@ -48,6 +48,8 @@ pub fn build_tree(dom: &NodeRef, vw: f32, vh: f32) -> LayoutTree {
 /// Recomputes layout with real text measurement (`layout_core::remeasure` over [`HostFonts`]).
 pub fn remeasure(tree: &mut LayoutTree) {
     layout_core::remeasure(tree, &HostFonts);
+    // AETHERPAINTPERF (SR130): every node of a fresh tree is laid out (the taffy passes stay whole-page).
+    crate::perf::add_laid_out(tree.taffy.total_node_count() as u64);
 }
 
 // ---- AETHERSTYLE3 (SR103): scroll containers' offsets across relayouts ---------------------------------

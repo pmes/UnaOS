@@ -42,6 +42,15 @@ pub fn parse_color_alpha(v: &str) -> Option<Rgba> {
             return Some((rgb, alpha.clamp(0.0, 1.0)));
         }
     }
+    if t.contains('(') {
+        // A function notation the arms above do not read (hsl(), hwb(), lab(), color(), color-mix() …):
+        // css_core's colour parser, never layout_core's `parse_color_str` (it delegates HERE for these).
+        let cv = css_core::parser::parse_component_values(&t);
+        return match css_core::color::parse_color(&cv)? {
+            css_core::color::Color::Rgba(c) => Some(((c.r.round() as u8, c.g.round() as u8, c.b.round() as u8), c.a as f32)),
+            css_core::color::Color::CurrentColor => None,
+        };
+    }
     crate::css::parse_color_str(&t).map(|c| (c, 1.0))
 }
 

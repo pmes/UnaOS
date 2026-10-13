@@ -26,6 +26,8 @@ pub mod frames;
 pub mod chrome;
 // AETHERDEVTOOLS (SR112): the developer-tools pane — a std reader of the engine, beside the std-free chrome model.
 pub mod devtools;
+// AETHERPAINTPERF (SR130): the work counters (`perf::counters()`) and the scoping switch.
+pub mod perf;
 
 #[cfg(test)]
 mod engine_tests;
@@ -76,6 +78,8 @@ pub struct AetherEngine {
     /// (the frame whose text fragments a pointer is hit-tested against).
     layout_epoch: u64,
     painted_epoch: u64,
+    /// AETHERPAINTPERF (SR130): the layout epoch the paint index (`render::subtree_ink`) was last built for.
+    index_epoch: u64,
     /// AETHERINPUT (SR68): the focused text control's caret and selection anchor (byte offsets into its
     /// value; see `forms::edit`).
     pub edit: forms::edit::EditState,
@@ -152,6 +156,7 @@ impl AetherEngine {
             sel_gen: selection::generation(),
             layout_epoch: 1,
             painted_epoch: 0,
+            index_epoch: 0,
             edit: forms::edit::EditState::default(),
             caret_epoch: std::time::Instant::now(),
             caret_on: true,
@@ -259,7 +264,9 @@ impl AetherEngine {
         let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
         media::scan(&document, &base);
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
-        css::apply_stylesheets(&mut layout_tree, &self.stylesheets);
+        // AETHERPAINTPERF (SR130): the restyle re-cascades only what the DOM changes since the last one can re-match.
+        let hover: Vec<html_core::NodeId> = self.hover_path.iter().map(|n| n.id()).collect();
+        css::apply_stylesheets_scoped(&mut layout_tree, &self.stylesheets, &hover);
         self.layout_tree = Some(layout_tree);
         self.layout_epoch += 1;
         self.needs_repaint = true;
@@ -603,11 +610,15 @@ impl AetherEngine {
             self.relayout();
         }
         // AETHERSTYLE3 (SR103): CSS transitions and animations advance one frame on the shell's tick.
-        let frame = self.layout_tree.as_mut().map(css::animation_frame).unwrap_or(css::anim::Frame::Idle);
+        // AETHERPAINTPERF (SR130): a frame that only moved ink-bounded values damages the animated boxes' ink.
+        let (frame, animated) = self.layout_tree.as_mut().map(css::animation_frame_scoped).unwrap_or((css::anim::Frame::Idle, None));
         match frame {
             css::anim::Frame::Relayout => self.relayout(),
             css::anim::Frame::Repaint => {
-                self.damage_rects.push((0, 0, self.width, self.height));
+                match animated.and_then(|keys| self.animation_damage(&keys)) {
+                    Some(rects) => self.damage_rects.extend(rects),
+                    None => self.damage_rects.push((0, 0, self.width, self.height)),
+                }
                 self.needs_repaint = true;
             }
             css::anim::Frame::Idle => {}
@@ -1059,6 +1070,51 @@ impl AetherEngine {
             self.damage_node(n);
         }
         self.focused_node = node;
+    }
+
+    /// AETHERPAINTPERF (SR130): the damage of an animation frame that moved only ink-bounded values on `keys`
+    /// (`css::animation_frame_scoped`): the last frame's subtree ink of every box of those elements and every box
+    /// under them (a colour inherits; an opacity group hoists its positioned descendants), as one viewport rect.
+    /// The values moved no box (they are paint-only) and their ink stays inside that ink. None — damage the
+    /// viewport — when the scopes are off, the index is not this layout's or this scroll's, an animated element
+    /// is the root or `body` (the canvas takes their background), one of the boxes has an outline (painted after
+    /// the walk, outside the box, in `currentColor`), or some of that ink is unbounded.
+    fn animation_damage(&self, keys: &[html_core::NodeId]) -> Option<Vec<(u32, u32, u32, u32)>> {
+        if !crate::perf::scoped() || self.index_epoch != self.layout_epoch {
+            return None;
+        }
+        let layout = self.layout_tree.as_ref()?;
+        let doc = self.document.as_ref()?;
+        let canvas_owner = doc.with_doc(|d, _| {
+            keys.iter().any(|k| d.parent(*k) == Some(html_core::Document::ROOT) || d.element(*k).is_some_and(|e| e.local.as_str() == "body"))
+        });
+        if canvas_owner {
+            return None;
+        }
+        let mut stack: Vec<taffy::prelude::NodeId> =
+            layout.node_map.iter().filter(|(_, n)| n.is_element() && keys.contains(&n.id())).map(|(t, _)| *t).collect();
+        let mut boxes = Vec::new();
+        while let Some(t) = stack.pop() {
+            boxes.push(t);
+            stack.extend(layout.taffy.children(t).unwrap_or_default());
+        }
+        // An outline paints after the walk, outside the box (`render::focusring`), in `currentColor` by default.
+        if boxes.iter().any(|t| layout.paint_map.get(t).and_then(layout_core::paint::outline_of).is_some()) {
+            return None;
+        }
+        let (ink, scroll) = render::subtree_ink(&boxes);
+        if scroll != (self.scroll_x as i32, self.scroll_y as i32) {
+            return None;
+        }
+        let ink = ink?;
+        let x0 = ink.0.floor().max(0.0);
+        let y0 = ink.1.floor().max(0.0);
+        let x1 = ink.2.ceil().min(self.width as f32);
+        let y1 = ink.3.ceil().min(self.height as f32);
+        if x1 <= x0 || y1 <= y0 {
+            return Some(Vec::new()); // nothing of them is on screen
+        }
+        Some(vec![(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)])
     }
 
     /// Marks `node`'s box damaged for the next frame.
@@ -1868,7 +1924,9 @@ impl AetherEngine {
         media::scan(&document, url);
 
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
-        css::apply_stylesheets(&mut layout_tree, &sheets);
+        // AETHERPAINTPERF (SR130): a new document's first cascade is whole and records itself for the restyles after it.
+        css::forget_restyle();
+        css::apply_stylesheets_scoped(&mut layout_tree, &sheets, &[]);
         self.stylesheets = sheets;
         
         self.document = Some(document);
@@ -1927,6 +1985,7 @@ impl AetherEngine {
             render::render_frame(layout, &mut self.surface, self.width, self.height, self.scroll_x, self.scroll_y, &damages);
             if !damages.is_empty() {
                 self.painted_epoch = self.layout_epoch;
+                self.index_epoch = self.layout_epoch; // AETHERPAINTPERF (SR130): the walk rebuilt the paint index
             }
         } else {
             for chunk in self.surface.chunks_exact_mut(4) {
@@ -1937,6 +1996,7 @@ impl AetherEngine {
             }
         }
         
+        crate::perf::end_frame(); // AETHERPAINTPERF (SR130): this frame's counts (the wire line under AETHER_PERF=1)
         if damages.is_empty() {
             vec![(0, 0, self.width, self.height)]
         } else {
