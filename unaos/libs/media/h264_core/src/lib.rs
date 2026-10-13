@@ -15,6 +15,7 @@
 //! | [`nal`]           | 7.3.1 NAL unit, emulation prevention, Annex B byte stream, avcC      |
 //! | [`cabac`]         | 9.3 CABAC: context init, arithmetic decoding engine, residual blocks |
 //! | [`cavlc`]         | 9.2 CAVLC residual blocks                                            |
+//! | [`ps`]            | 7.3.2 SPS / PPS (+ VUI E.1), scaling lists, 7.3.3 slice header       |
 //! | [`tables`]        | generated constant tables (tools/gen_tables.py)                      |
 
 #![no_std]
@@ -32,6 +33,7 @@ pub mod bits;
 pub mod cabac;
 pub mod cavlc;
 pub mod nal;
+pub mod ps;
 pub mod tables;
 
 /// Every way a decode can fail.
