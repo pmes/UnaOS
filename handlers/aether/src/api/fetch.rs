@@ -1295,6 +1295,32 @@ pub const PRELUDE: &str = r#"
         return [206, 'Partial Content', ['content-length', String(part.length), 'content-type', type, 'content-range', 'bytes ' + start + '-' + end + '/' + full], part];
     };
     hide(globalThis, '__blob_response', blobResponse);
+    // AETHERWPT3 (SR138): Resource Timing §4.6 "mark resource timing" for a fetch this prelude (or XHR's) ran: the
+    // times it observed (fetch start, the head, the end), the body sizes, the status and type, and Fetch's TAO
+    // check (same-origin, or a Timing-Allow-Origin value of * or this origin) deciding what the entry exposes.
+    var rtRecord = function (url, initiator, t0, tHead, n, headers, type, status) {
+        if (typeof __perf_resource !== 'function' || !/^https?:/i.test(url)) { return; }
+        headers = headers || [];
+        var hv = function (name) {
+            for (var i = 0; i + 1 < headers.length; i += 2) { if (String(headers[i]).toLowerCase() === name) { return String(headers[i + 1]); } }
+            return null;
+        };
+        var tao = type === 'basic';
+        if (!tao) {
+            var v = hv('timing-allow-origin'), here = hereOrigin();
+            if (v !== null) { v.split(',').forEach(function (x) { x = x.trim(); if (x === '*' || x === here) { tao = true; } }); }
+        }
+        var ce = hv('content-encoding') || '', cl = hv('content-length');
+        var enc = ce && cl !== null && /^\d+$/.test(cl.trim()) ? Number(cl) : n;
+        var opaque = type === 'opaque';
+        __perf_resource({
+            name: url, initiatorType: initiator, fetchStart: t0, responseStart: tHead, responseEnd: performance.now(),
+            decodedBodySize: n, encodedBodySize: enc, responseStatus: opaque ? 0 : status,
+            contentType: opaque ? '' : (hv('content-type') || '').split(';')[0].trim().toLowerCase(),
+            contentEncoding: opaque ? '' : ce, tao: tao, corsSameOrigin: !opaque,
+        });
+    };
+    hide(globalThis, '__rt_record', rtRecord);
     hide(globalThis, '__here_origin', hereOrigin);
     var fetch = function fetch(input, init) {
         return new Promise(function (resolve, reject) {
@@ -1338,6 +1364,7 @@ pub const PRELUDE: &str = r#"
             flat.push(':aether-mode', rs.mode, ':aether-credentials', rs.credentials,
                       ':aether-referrer', rs.referrer === '' ? 'no-referrer' : rs.referrer,
                       ':aether-referrer-policy', rs.referrerPolicy, ':aether-integrity', rs.integrity);
+            var rtStart = performance.now(), rtHead, rtBytes = 0, rtHeaders = null, rtType = 'basic', rtStatus = 0;
             var id = __net_http(rs.method, url.replace(/#.*$/, ''), flat, rs.bytes, rs.redirect);
             if (!id) { reject(new TypeError('Failed to fetch')); return; }
             var resp = null, controller = null, done = false;
@@ -1347,6 +1374,7 @@ pub const PRELUDE: &str = r#"
                         var status = a[0];
                         var h = headersFrom(a[3], 'immutable');
                         var type = a[5] === 'cors' || a[5] === 'opaque' ? a[5] : 'basic';
+                        rtHead = performance.now(); rtHeaders = a[3]; rtType = type; rtStatus = status;
                         if (rs.redirect === 'manual' && status >= 300 && status < 400 && h.has('location')) {
                             type = 'opaqueredirect';
                         }
@@ -1367,8 +1395,10 @@ pub const PRELUDE: &str = r#"
                         resp = new Response();
                         resolve(resp);
                     } else if (kind === 'data') {
+                        rtBytes += a[0].byteLength;
                         if (controller && !done) { controller.enqueue(new Uint8Array(a[0])); }
                     } else if (kind === 'end') {
+                        rtRecord(url.replace(/#.*$/, ''), 'fetch', rtStart, rtHead, rtBytes, rtHeaders, rtType, rtStatus);
                         done = true;
                         if (controller) { try { controller.close(); } catch (e) {} }
                     } else if (kind === 'error') {

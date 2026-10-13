@@ -385,3 +385,47 @@ R.push(a.hasPointerCapture(1));
         "NotFoundError|InvalidStateError|false / a:pointerdown:1:mouse,has:true,a:mousedown,a:gotpointercapture:1:mouse,a:pointermove:1:mouse,a:mousemove,a:pointerup:1:mouse,a:mouseup,a:lostpointercapture:1:mouse"
     );
 }
+
+/// O6 — Resource Timing L2 §4 (entries from the fetch path's record — `__rt_record`, what fetch() and XHR call at the
+/// end of a response: times, sizes with the 300-byte header allowance, Fetch's TAO check zeroing a cross-origin
+/// entry's detailed timings and transferSize, a Timing-Allow-Origin match exposing them; the buffer limit, the
+/// secondary buffer and `resourcetimingbufferfull`, observers of `resource`) and Navigation Timing L2 (the
+/// document's entry, its lifecycle in order, queued to a buffered observer once, after load).
+#[test]
+fn o6_resource_and_navigation_timing() {
+    let mut e = load_with(
+        &page(
+            r#"
+var full = 0, seen = [];
+new PerformanceObserver(function (l) { l.getEntries().forEach(function (x) { seen.push(x.entryType + ':' + x.name); }); }).observe({ type: 'resource' });
+new PerformanceObserver(function (l) { seen.push('nav:' + l.getEntries().map(function (x) { return x.type; }).join('+')); }).observe({ type: 'navigation', buffered: true });
+performance.onresourcetimingbufferfull = function () { full++; performance.setResourceTimingBufferSize(10); };
+performance.setResourceTimingBufferSize(2);
+__rt_record('http://127.0.0.1:8000/a', 'fetch', 1, 2, 10, ['content-type', 'text/plain; charset=utf-8'], 'basic', 200);
+__rt_record('http://other.test/b', 'fetch', 3, 4, 20, ['content-type', 'text/css'], 'cors', 200);
+__rt_record('http://other.test/c', 'xmlhttprequest', 5, 6, 30, ['timing-allow-origin', 'http://127.0.0.1:8000', 'content-encoding', 'gzip', 'content-length', '12'], 'cors', 404);
+var a = performance.getEntriesByName('http://127.0.0.1:8000/a')[0], b = performance.getEntriesByName('http://other.test/b')[0];
+R.push(a instanceof PerformanceResourceTiming, a.initiatorType, a.decodedBodySize, a.encodedBodySize, a.transferSize, a.contentType, a.responseStatus, a.nextHopProtocol, a.fetchStart, a.responseStart);
+R.push(b.transferSize, b.responseStart, b.decodedBodySize, b.nextHopProtocol, performance.getEntriesByType('resource').length);
+var nav = performance.getEntriesByType('navigation')[0];
+R.push(nav instanceof PerformanceNavigationTiming, nav.type, nav.name, nav.initiatorType, PerformanceObserver.supportedEntryTypes.join(','));
+"#,
+        ),
+        5_000,
+    );
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        "true|fetch|10|10|310|text/plain|200|http/1.1|1|2|0|0|20||2|true|navigate|http://127.0.0.1:8000/wpt3.html|navigation|mark,measure,navigation,resource"
+    );
+    assert_eq!(
+        eval(
+            &mut e,
+            "var c = performance.getEntriesByName('http://other.test/c')[0], n = performance.getEntriesByType('navigation')[0];
+             [full, performance.getEntriesByType('resource').length, c.transferSize, c.encodedBodySize, c.decodedBodySize, c.responseStatus, c.contentEncoding, c.responseStart,
+              n.domInteractive <= n.domContentLoadedEventStart && n.domContentLoadedEventStart <= n.domContentLoadedEventEnd && n.domContentLoadedEventEnd <= n.domComplete
+                && n.domComplete <= n.loadEventStart && n.loadEventStart <= n.loadEventEnd && n.duration === n.loadEventEnd,
+              seen.join(',')].join('|')"
+        ),
+        "1|3|312|12|30|404|gzip|6|true|resource:http://127.0.0.1:8000/a,resource:http://other.test/b,resource:http://other.test/c,nav:navigate"
+    );
+}

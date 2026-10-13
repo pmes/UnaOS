@@ -264,6 +264,7 @@ pub const PRELUDE: &str = r#"
                 armTimer(this);
                 return;
             }
+            s.rtStart = performance.now(); // AETHERWPT3 (SR138): Resource Timing
             s.id = /^https?:/i.test(s.reqURL) ? __net_http(s.method, s.reqURL.replace(/#.*$/, ''), flat, bytes, 'follow') : 0;
             if (!s.id) {
                 setTimeout(function () { if (s.gen === gen && s.send) { requestError(self, s, 'error'); } }, 0);
@@ -343,6 +344,7 @@ pub const PRELUDE: &str = r#"
     var onNet = function (xhr, s, kind, a) {
         if (kind === 'head') {
             s.error = false;
+            s.rtHead = performance.now();
             s.status = a[0]; s.statusText = a[1]; s.url = a[2]; s.headers = a[3];
             var cl = headerOf(a[3], 'content-length');
             s.total = cl !== null && /^\d+$/.test(cl.trim()) ? Number(cl) : 0;
@@ -361,6 +363,11 @@ pub const PRELUDE: &str = r#"
             fire(xhr, 'progress', s.received, s.total, false);
         } else if (kind === 'end') {
             s.id = 0;
+            if (typeof __rt_record === 'function' && s.rtStart !== undefined) {
+                var same = false;
+                try { same = new URL(s.reqURL).origin === String(location.origin); } catch (e) {}
+                __rt_record(s.reqURL.replace(/#.*$/, ''), 'xmlhttprequest', s.rtStart, s.rtHead, s.received, s.headers, same ? 'basic' : 'cors', s.status);
+            }
             if (s.timer) { clearTimeout(s.timer); s.timer = 0; }
             if (s.readyState === 2 && s.received > 0) {
                 s.readyState = 3;
