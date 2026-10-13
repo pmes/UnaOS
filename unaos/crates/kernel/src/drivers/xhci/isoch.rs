@@ -719,7 +719,7 @@ impl XhciController {
     /// The main-loop pass (folded onto the FTDI ladder slot in `service_ftdi`): ONE camera candidate per pass,
     /// and never while a root port is mid-enumeration (the one-port-at-a-time invariant `service_hub_changes`
     /// keeps — every transfer here pumps the event ring the root FSM is driven from).
-    pub(super) fn service_uvc(&mut self) {
+    pub(super) fn service_uvc(&mut self) { #[cfg(feature = "sonde")] crate::sonde::tap_service(); // SONDE3 (LEDGER SR108): the continuous depth tap — republishes /dev/probe/depth0 from every Nth completed frame, one decode per pass at most (2 ms bound), before the enum_active guard because it makes no USB transfer. LINE-NEUTRAL append, before this comment; a sonde-off image compiles this line as it was.
         if self.enum_active {
             return;
         }

@@ -1140,7 +1140,7 @@ pub unsafe fn probe(idx: usize, addr: u8, cfg: &[u8], config_value: u8, buf: *mu
         }
     };
     let full = core::slice::from_raw_parts(buf as *const u8, n);
-    let c = parse(full); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, &mut *xfer); // REALSENSE (LEDGER SR92): the per-interface census (depth/ir/color functions, XUs, HID) of the same window, and a D400's three XU GET_CURs; `full` is read before its first transfer and never after. LINE-NEUTRAL append, before this comment.
+    let c = parse(full); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, 256, &mut *xfer); // REALSENSE (LEDGER SR92): the per-interface census (depth/ir/color functions, XUs, HID) of the same window, and a D400's three XU GET_CURs; `full` is read before its first transfer and never after. LINE-NEUTRAL append, before this comment.
     print_census(idx, addr, &c);
 
     if !c.have_vs {
@@ -1790,7 +1790,7 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
         serial_println!("[uvc] abort addr={} host={} stage=set-configuration req=SET_CONFIGURATION({}) reason=stalled-or-timeout", addr, h.name(), config_value);
         return;
     }
-    crate::bootlog_println!("[uvc] configured addr={} host={} cfg_value={} vs_intf={}", addr, h.name(), config_value, c.vs_intf); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, &mut |bm, br, wv, wi, wl, di| h.control(bm, br, wv, wi, wl, di)); // ARMSONDE (LEDGER SR101): `probe`'s FOLD 2 on the xHCI path — the multi-function census of the full descriptor and, for a D400, the record plus the three XU GET_CURs. Placed AFTER SET_CONFIGURATION so the XU reads address a configured device, and `full` is still the descriptor here: the only transfer since its read is SET_CONFIGURATION, wLength 0, which has no data stage (`sync_control` touches the buffer only when `w_length > 0`). Every later read in this function is of owned copies (`c`, `eps`, the pick) or of a fresh transfer.
+    crate::bootlog_println!("[uvc] configured addr={} host={} cfg_value={} vs_intf={}", addr, h.name(), config_value, c.vs_intf); #[cfg(feature = "sonde")] multi::after_census(addr, config_value, full, buf, cap, &mut |bm, br, wv, wi, wl, di| h.control(bm, br, wv, wi, wl, di)); // ARMSONDE (LEDGER SR101): `probe`'s FOLD 2 on the xHCI path — the multi-function census of the full descriptor and, for a D400, the record plus the three XU GET_CURs. Placed AFTER SET_CONFIGURATION so the XU reads address a configured device, and `full` is still the descriptor here: the only transfer since its read is SET_CONFIGURATION, wLength 0, which has no data stage (`sync_control` touches the buffer only when `w_length > 0`). Every later read in this function is of owned copies (`c`, `eps`, the pick) or of a fresh transfer.
     let mut blk_len = 0usize;
     for (stage, req) in [("min", RQ_GET_MIN), ("max", RQ_GET_MAX), ("def", RQ_GET_DEF)] {
         match h.control(BMREQ_GET_INTF, req, wvalue, windex, PROBE_LEN_ASK, true) {
@@ -2446,10 +2446,10 @@ pub mod multi {
         }
     }
 
-    /// FOLD 2 (after `parse(full)` in `probe`): the multi-interface census of the same window, printed,
-    /// and for a D400 the record `tests sonde` reads plus the three XU `GET_CUR`s. `full` aliases `buf`:
-    /// it is read ONLY before the first transfer below.
-    pub fn after_census(addr: u8, config_value: u8, full: &[u8], buf: *mut u8, xfer: Xfer) {
+    /// FOLD 2 (after `parse(full)` in `probe`): the multi-interface census of the same window, printed, and for a
+    /// D400 the record `tests sonde` reads, the three XU `GET_CUR`s and (SONDE3, SR108) the HW-monitor depth scale
+    /// when `cap` — the EP0 buffer's size: 256 from EHCI, 4 KiB from xHCI — carries it. `full` aliases `buf`.
+    pub fn after_census(addr: u8, config_value: u8, full: &[u8], buf: *mut u8, cap: usize, xfer: Xfer) {
         let s = census(full);
         let vp = PENDING.load(Ordering::Relaxed);
         let (vid, pid) = ((vp >> 16) as u16, vp as u16);
@@ -2534,11 +2534,11 @@ pub mod multi {
             }
         }
         // The depth scale's own read is the HW-monitor GET_ADV(etDepthTableControl) — a 1024-byte XU
-        // SET_CUR/GET_CUR pair (realsense_xu::hwmon_*), which the 256-byte EP0 buffer cannot carry.
-        serial_println!(
-            "[sonde] hwmon=withheld reason=ep0-buf-256-lt-{} depth_scale=default({} um, d400-device.cpp:912)",
-            rs::HWMON_BUF, rs::DEPTH_UNITS_DEFAULT_UM
-        );
+        // SET_CUR/GET_CUR pair (realsense_xu::hwmon_*). SONDE3 (SR108): sent when `cap` carries it (the
+        // xHCI 4 KiB EP0); EHCI's 256-byte buffer keeps `[sonde] hwmon=withheld reason=ep0-buf-256-lt-1024`.
+        super::hwmon::depth_units(addr, unit, vc, buf, cap, xfer);
+        // (The exchange lives in `super::hwmon`, appended at the file tail, so this module keeps its line
+        // count and nothing below it — `ensure_tests` is compiled with `uvc` alone — moves.)
     }
 }
 
@@ -2575,6 +2575,12 @@ pub mod depth_tap {
         STREAM.lock().as_ref().map(|a| (a.frames, a.good, a.short, a.errf, a.over, a.payloads, a.bad_hdr)).unwrap_or_default()
     }
 
+    /// SONDE3 (SR108): the latest complete frame's sequence number (0 = none yet) — a peek, nothing copied, so
+    /// the continuous tap can decide whether a pass has work before it touches a frame.
+    pub fn latest_seq() -> u32 {
+        STREAM.lock().as_ref().map(|a| a.seq).unwrap_or(0)
+    }
+
     /// The latest complete frame: its sequence number and length, and its bytes COPIED into `out` when they
     /// fit `out`'s capacity (cleared first; the caller reserves, so the copy under the stream lock allocates
     /// nothing — a frame that does not fit leaves `out` empty and the length says why). `None` = no frame yet.
@@ -2588,5 +2594,100 @@ pub mod depth_tap {
             got = Some((s, b.len()));
         });
         got
+    }
+}
+
+// ── SONDE3 (LEDGER SR108): the camera's own depth scale over the HW-monitor channel ──────────────────────────────
+//
+// APPENDED at the file tail and `#[cfg(feature = "sonde")]`-erased whole, like `depth_tap`: no line above moves.
+#[cfg(feature = "sonde")]
+pub mod hwmon {
+    use super::{Ordering, Xfer};
+    use crate::drivers::realsense_xu as rs;
+    use core::sync::atomic::AtomicU32;
+
+    /// The depth scale the camera reported, micrometres per Z16 unit; 0 = not read (withheld on EHCI, or the
+    /// exchange failed — its `[sonde] hwmon=` line names the stage). Written once per D400 census.
+    static DEPTH_UM: AtomicU32 = AtomicU32::new(0);
+
+    /// The camera's depth units (µm), or 0 when this boot did not read them. `sonde` falls back to
+    /// `realsense_xu::DEPTH_UNITS_DEFAULT_UM` and marks the line `(default)`.
+    pub fn depth_um() -> u32 {
+        DEPTH_UM.load(Ordering::Relaxed)
+    }
+
+    /// Called at the end of `multi::after_census` for a D400 (after SET_CONFIGURATION and the three XU reads).
+    ///
+    /// librealsense's `uvc-option.cpp:132-151` shape: `SET_CUR(DS5_HWMONITOR)` carrying the 1024-byte buffer whose
+    /// head is the `GET_ADV(etDepthTableControl, GET_VAL)` command (`ds-options.cpp:336-341`, laid out by
+    /// `realsense_xu::hwmon_build_depth_units`), then `GET_CUR(DS5_HWMONITOR)` of 1024 bytes, read by
+    /// `realsense_xu::hwmon_reply_depth_units` (opcode echo at 0, data size at 1020, `depth_units` the table's
+    /// first u32). ONE attempt each, never retried; a failure names its stage and the scale stays 0. The command
+    /// READS the depth table — the SET_CUR is the channel's write half, not a change to the device. `buf` is the
+    /// live EP0 data buffer of the controller `xfer` drives, valid for `cap` bytes.
+    pub fn depth_units(addr: u8, unit: u8, vc: u8, buf: *mut u8, cap: usize, xfer: Xfer) {
+        DEPTH_UM.store(0, Ordering::Relaxed);
+        if !rs::hwmon_fits(cap) {
+            serial_println!(
+                "[sonde] hwmon=withheld reason=ep0-buf-{}-lt-{} depth_scale=default({} um, d400-device.cpp:912)",
+                cap, rs::HWMON_BUF, rs::DEPTH_UNITS_DEFAULT_UM
+            );
+            return;
+        }
+        let (wv, wi) = (rs::xu_wvalue(rs::CTRL_HWMONITOR), rs::xu_windex(unit, vc));
+        let len = rs::HWMON_BUF as u16;
+        let built = {
+            // SAFETY: `buf` holds `cap` >= HWMON_BUF bytes (checked above) and no transfer is in flight while this
+            // slice lives; it ends before the SET_CUR below hands the buffer to the controller.
+            let b = unsafe { core::slice::from_raw_parts_mut(buf, rs::HWMON_BUF) };
+            rs::hwmon_build_depth_units(b)
+        };
+        if built == 0 {
+            serial_println!("[sonde] hwmon=failed addr={} stage=build reason=buffer-short depth_scale=default({} um)", addr, rs::DEPTH_UNITS_DEFAULT_UM);
+            return;
+        }
+        if let Err(e) = xfer(rs::BM_CLASS_INTF_OUT, rs::RQ_SET_CUR, wv, wi, len, false) {
+            serial_println!(
+                "[sonde] hwmon=failed addr={} stage=set-cur unit={} wValue={:#06x} wIndex={:#06x} len={} reason={} depth_scale=default({} um) — NOT retried",
+                addr, unit, wv, wi, len, e, rs::DEPTH_UNITS_DEFAULT_UM
+            );
+            return;
+        }
+        let got = match xfer(rs::BM_CLASS_INTF_IN, rs::RQ_GET_CUR, wv, wi, len, true) {
+            Ok(got) => got as usize,
+            Err(e) => {
+                serial_println!(
+                    "[sonde] hwmon=failed addr={} stage=get-cur unit={} len={} reason={} depth_scale=default({} um) — NOT retried",
+                    addr, unit, len, e, rs::DEPTH_UNITS_DEFAULT_UM
+                );
+                return;
+            }
+        };
+        if got < rs::HWMON_BUF {
+            serial_println!("[sonde] hwmon=failed addr={} stage=get-cur got={} need={} reason=runt depth_scale=default({} um)", addr, got, rs::HWMON_BUF, rs::DEPTH_UNITS_DEFAULT_UM);
+            return;
+        }
+        // SAFETY: the GET_CUR just wrote `got` >= HWMON_BUF bytes into the live EP0 buffer; the next transfer is
+        // the caller's, after this function returns.
+        let r = unsafe { core::slice::from_raw_parts(buf as *const u8, rs::HWMON_BUF) };
+        let le32 = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+        let (echo, size) = (le32(0), le32(rs::HWMON_DATA_SIZE_OFFSET));
+        match rs::hwmon_reply_depth_units(r) {
+            Some(um) if um != 0 => {
+                DEPTH_UM.store(um, Ordering::Relaxed);
+                crate::census_println!(
+                    "[sonde] hwmon op=GET_ADV(etDepthTableControl) unit={} set_cur=ok get_cur={} echo={:#x} size={} depth_units={} -> depth_scale={}.{:06}(device)",
+                    unit, got, echo, size, um, um / 1_000_000, um % 1_000_000
+                );
+            }
+            Some(_) => serial_println!(
+                "[sonde] hwmon=failed addr={} stage=reply echo={:#x} size={} reason=depth-units-zero depth_scale=default({} um)",
+                addr, echo, size, rs::DEPTH_UNITS_DEFAULT_UM
+            ),
+            None => serial_println!(
+                "[sonde] hwmon=failed addr={} stage=reply echo={:#x} want_echo={:#x} size={} reason={} depth_scale=default({} um)",
+                addr, echo, rs::OP_GET_ADV, size, if echo != rs::OP_GET_ADV as u32 { "error-echo" } else { "short-table" }, rs::DEPTH_UNITS_DEFAULT_UM
+            ),
+        }
     }
 }
