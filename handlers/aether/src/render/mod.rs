@@ -1432,6 +1432,10 @@ fn paint_audio_controls(
     }
 }
 
+/// AETHERSTYLE3 (SR103): the overlay scrollbar colours (Chromium's light-theme track and thumb).
+const SCROLL_TRACK: (u8, u8, u8) = (241, 241, 241);
+const SCROLL_THUMB: (u8, u8, u8) = (193, 193, 193);
+
 /// The bounding box (x0, y0, x1, y1 inclusive) of the pixels `surface` changed against `snap`; None = none.
 fn changed_bounds(surface: &[u8], snap: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
     let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
@@ -1850,6 +1854,9 @@ pub fn render_frame(
         let Ok(lb) = layout.taffy.layout(node) else { return };
         // The children with the parent origin draw_node expects for each.
         let mut kids: Vec<(NodeId, f32, f32, Inherited)> = Vec::new();
+        // AETHERSTYLE3 (SR103): a scroll container's content moves by its offset.
+        let (shx, shy) = layout_core::scroll::content_shift(layout, node);
+        let cur = (cur.0 + shx, cur.1 + shy);
         if let Some(il) = layout.inline.get(&node) {
             let cx = cur.0 + lb.border.left + lb.padding.left;
             let cy = cur.1 + lb.border.top + lb.padding.top;
@@ -1866,7 +1873,8 @@ pub fn render_frame(
             }
         } else {
             for c in layout.taffy.children(node).unwrap_or_default() {
-                kids.push((c, cur.0, cur.1, inh));
+                let (mx, my) = layout_core::col_shift(layout, c);
+                kids.push((c, cur.0 + mx, cur.1 + my, inh));
             }
         }
         for (c, ax, ay, ci) in kids {
@@ -2810,11 +2818,13 @@ pub fn render_frame(
             // An inline formatting context: its line-box fragments, in tree
             // order (CSS 2.2 Appendix E step 7: each inline box's background
             // and borders, then its text; atomic inlines as whole boxes).
-            let content_x = current_x + layout_box.border.left + layout_box.padding.left;
+            // AETHERSTYLE3 (SR103): a scroll container's lines move by its offset.
+            let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
+            let content_x = current_x + shx + layout_box.border.left + layout_box.padding.left;
             // A table cell's vertical-align places its lines in the cell
             // (§17.5.4; html.css: middle).
             let valign_off = cell_valign_offset(layout, node_id, ifc.height);
-            let content_y = current_y + layout_box.border.top + layout_box.padding.top + valign_off;
+            let content_y = current_y + shy + layout_box.border.top + layout_box.padding.top + valign_off;
             // Text baselines snap to whole pixels from the EXACT (unrounded)
             // position, as Skia rounds a glyph run's fractional origin; the
             // box tree's rounded block positions can be up to half a pixel
@@ -3066,12 +3076,16 @@ pub fn render_frame(
         if ifc.is_none() {
             // Normal flow (Appendix E steps 3-5), tree order; positioned and
             // stacking-context boxes were hoisted into their context's layers.
+            // AETHERSTYLE3 (SR103): a scroll container's children move by its offset, a multicol
+            // container's by the column they were balanced into.
+            let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
             for child in layout.taffy.children(node_id).unwrap_or_default() {
                 if is_layered(layout, child) {
                     continue;
                 }
+                let (mx, my) = layout_core::col_shift(layout, child);
                 draw_node(
-                    child, current_x, current_y, inherited, layout, font, font_bold, surface,
+                    child, current_x + shx + mx, current_y + shy + my, inherited, layout, font, font_bold, surface,
                     width, height, sx, sy, damage_rects, child_clip,
                 );
             }
@@ -3080,6 +3094,15 @@ pub fn render_frame(
         // positive z-index ascending.
         paint_layers(&layers[split..], surface);
         finish_round_clip(surface);
+        // AETHERSTYLE3 (SR103): a scroll container's overlay scrollbars, over its content.
+        let bars = layout_core::scroll::scrollbars(layout, node_id);
+        let (bx0, by0) = (current_x - sx as f32, current_y - sy as f32);
+        for bar in [bars.v, bars.h].into_iter().flatten() {
+            let (tx, ty, tw, th) = bar.track;
+            fill_rect(bx0 + tx, by0 + ty, bx0 + tx + tw, by0 + ty + th, SCROLL_TRACK, 255, surface, width, height, damage_rects, clip);
+            let (mx, my, mw, mh) = bar.thumb;
+            fill_rect(bx0 + mx, by0 + my, bx0 + mx + mw, by0 + my + mh, SCROLL_THUMB, 255, surface, width, height, damage_rects, clip);
+        }
     }
 
     let root_inherited = root_inherited();

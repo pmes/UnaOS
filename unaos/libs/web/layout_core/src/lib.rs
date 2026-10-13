@@ -34,6 +34,7 @@ pub mod inline;
 pub mod lines;
 mod map;
 pub mod paint;
+pub mod scroll;
 pub mod table;
 mod tree;
 

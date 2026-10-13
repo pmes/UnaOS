@@ -323,7 +323,9 @@ fn walk<H: Host>(tree: &LayoutTree<H>, id: NodeId, x: f32, y: f32, out: &mut Vec
         return;
     }
     let hidden = tree.paint_map.get(&id).and_then(|p| p.hidden).unwrap_or(false);
-    let (ox, oy) = (x + l.border.left + l.padding.left, y + l.border.top + l.padding.top);
+    // AETHERSTYLE3 (SR103): a scroll container's content moves by its offset.
+    let (shx, shy) = crate::scroll::content_shift(tree, id);
+    let (ox, oy) = (x + shx + l.border.left + l.padding.left, y + shy + l.border.top + l.padding.top);
     if let Some(il) = tree.inline.get(&id) {
         for (i, f) in il.frags.iter().enumerate() {
             match f {
@@ -345,7 +347,8 @@ fn walk<H: Host>(tree: &LayoutTree<H>, id: NodeId, x: f32, y: f32, out: &mut Vec
     }
     for k in tree.taffy.children(id).unwrap_or_default() {
         let Ok(kl) = tree.taffy.layout(k) else { continue };
-        walk(tree, k, x + kl.location.x, y + kl.location.y, out);
+        let (cx, cy) = crate::col_shift(tree, k);
+        walk(tree, k, x + shx + cx + kl.location.x, y + shy + cy + kl.location.y, out);
     }
 }
 

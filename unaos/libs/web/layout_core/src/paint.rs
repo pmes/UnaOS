@@ -182,6 +182,10 @@ pub struct PaintStyle<H: Host> {
     pub filter: Option<Option<String>>,
     /// `backdrop-filter` (Filter Effects 2 §3) as written; Some(None) = `none`.
     pub backdrop_filter: Option<Option<String>>,
+    /// AETHERSTYLE3 (SR103): `overflow-x` / `overflow-y` (css-overflow-3 §3) as [x, y] codes —
+    /// [`crate::scroll::VISIBLE`] 0, `HIDDEN` 1, `CLIP` 2, `SCROLL` 3, `AUTO` 4. `clip` above stays the
+    /// paint-time "clips its descendants" flag every non-visible value sets.
+    pub overflow: Option<[u8; 2]>,
 }
 
 
@@ -262,6 +266,7 @@ impl<H: Host> Default for PaintStyle<H> {
             inset_px: None,
             filter: None,
             backdrop_filter: None,
+            overflow: None,
         }
     }
 }

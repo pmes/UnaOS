@@ -436,6 +436,8 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     let t1 = std::time::Instant::now();
     // set_style only marks nodes dirty; re-lay out with text measurement.
     crate::layout::remeasure(layout_tree);
+    // AETHERSTYLE3 (SR103): scroll containers keep their offsets across a relayout.
+    crate::layout::restore_scroll(layout_tree);
     STYLE_TIMING.with(|t| t.set((t1 - t0, t1.elapsed())));
 }
 

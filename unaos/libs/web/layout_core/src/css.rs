@@ -369,6 +369,19 @@ impl<H: Host> SpecifiedStyle<H> {
         if let Some(bs) = self.box_sizing {
             node_style.box_sizing = bs;
         }
+        // AETHERSTYLE3 (SR103): a scroll container's automatic minimum size is 0 (css-flexbox-1 §4.5), which
+        // taffy reads from its own `overflow`; scrollbars are overlays, so no gutter is reserved.
+        if let Some(o) = self.paint.overflow {
+            use taffy::style::Overflow as O;
+            let map = |v: u8| match v {
+                crate::scroll::HIDDEN | crate::scroll::AUTO => O::Hidden,
+                crate::scroll::SCROLL => O::Scroll,
+                crate::scroll::CLIP => O::Clip,
+                _ => O::Visible,
+            };
+            node_style.overflow = taffy::geometry::Point { x: map(o[0]), y: map(o[1]) };
+            node_style.scrollbar_width = 0.0;
+        }
     }
 }
 
@@ -546,11 +559,42 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
         // scrollbars yet — clipping is the honest approximation; visible
         // overflow was smearing collapsed menus over the page).
-        "overflow" | "overflow-x" | "overflow-y" => match value {
-            "hidden" | "clip" | "auto" | "scroll" => style.paint.clip = Some(true),
-            "visible" => style.paint.clip = Some(false),
-            _ => {}
-        },
+        // AETHERSTYLE3 (SR103): css-overflow-3 §3 — `overflow: <x> <y>?` and the axis longhands (the
+        // flow-relative `overflow-inline` / `-block` map in horizontal-tb). hidden / scroll / auto make a
+        // scroll container with its own offset (`scroll`); every non-visible value clips paint.
+        "overflow" | "overflow-x" | "overflow-y" | "overflow-inline" | "overflow-block" => {
+            let code = |v: &str| -> Option<u8> {
+                Some(match v {
+                    "visible" => crate::scroll::VISIBLE,
+                    "hidden" => crate::scroll::HIDDEN,
+                    "clip" => crate::scroll::CLIP,
+                    "scroll" => crate::scroll::SCROLL,
+                    "auto" | "overlay" => crate::scroll::AUTO,
+                    _ => return None,
+                })
+            };
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let mut o = style.paint.overflow.unwrap_or([crate::scroll::VISIBLE; 2]);
+            let ok = match (prop, parts.as_slice()) {
+                ("overflow", [a]) => code(a).map(|a| o = [a, a]).is_some(),
+                ("overflow", [a, b]) => match (code(a), code(b)) {
+                    (Some(a), Some(b)) => {
+                        o = [a, b];
+                        true
+                    }
+                    _ => false,
+                },
+                ("overflow-x" | "overflow-inline", [a]) => code(a).map(|a| o[0] = a).is_some(),
+                ("overflow-y" | "overflow-block", [a]) => code(a).map(|a| o[1] = a).is_some(),
+                _ => false,
+            };
+            if ok {
+                style.paint.overflow = Some(o);
+                style.paint.clip = Some(o != [crate::scroll::VISIBLE; 2]);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("{}-value:{}", prop, clip(value)));
+            }
+        }
         "padding" => {
             if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v, cx)) {
                 style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
@@ -2104,6 +2148,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
+        overflow,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter);
     if let Some(src_list) = &src.font_rel {

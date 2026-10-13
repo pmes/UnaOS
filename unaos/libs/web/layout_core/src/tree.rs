@@ -24,6 +24,18 @@ pub struct LayoutTree<H: Host> {
     /// Cells spanning rows, as (cell, the rows it spans), placed by the table pass and sized by
     /// `table::fix_rowspans` once the rows settle (was table.rs's thread-local).
     pub rowspans: Vec<(taffy::NodeId, Vec<taffy::NodeId>)>,
+    /// AETHERSTYLE3 (SR103): each scroll container's scroll offset (css-overflow-3 §2.3), keyed by box; the
+    /// host restores it from its per-element record after a relayout ([`crate::scroll`]).
+    pub scroll: NodeMap<(f32, f32)>,
+    /// AETHERSTYLE3 (SR103): where multi-column layout moved a block-level child of a multicol container
+    /// from its single-column place (css-multicol-1 §3: the column box it fragments into); painters and hit
+    /// tests add it to the child's origin ([`col_shift`]).
+    pub col_shift: NodeMap<(f32, f32)>,
+}
+
+/// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
+pub fn col_shift<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> (f32, f32) {
+    tree.col_shift.get(&id).copied().unwrap_or((0.0, 0.0))
 }
 
 impl<H: Host> LayoutTree<H> {
@@ -246,6 +258,8 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         dirty: false,
         inline: NodeMap::new(),
         rowspans: Vec::new(),
+        scroll: NodeMap::new(),
+        col_shift: NodeMap::new(),
     }
 }
 
@@ -1341,6 +1355,7 @@ fn size_flex_items_by_content<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy
 /// Called after building the tree and after every cascade application.
 pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) {
     fix_display_contexts(tree);
+    crate::scroll::prepare(tree);
     propagate_text_align(tree);
     collapse_inline_whitespace(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
