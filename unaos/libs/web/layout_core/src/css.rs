@@ -734,6 +734,21 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         // css-will-change-1 §2: a hint a UA may ignore.
         "will-change" => {}
+        // AETHERSTYLE3 (SR103): css-writing-modes-4 §3.1 / §5.1 (laid out by `writing`).
+        "writing-mode" => match crate::writing::parse_writing_mode(value) {
+            Some(m) => style.paint.writing_mode = Some(m),
+            None if is_neutral_keyword(value) => {}
+            None => H::record_css(&format!("writing-mode-value:{}", clip(value))),
+        },
+        "text-orientation" => match value {
+            "mixed" => style.paint.text_orientation = Some(0),
+            "upright" => {
+                style.paint.text_orientation = Some(1);
+                H::record_css("text-orientation-value:upright");
+            }
+            "sideways" | "sideways-right" => style.paint.text_orientation = Some(2),
+            _ => {}
+        },
         // AETHERSTYLE3 (SR103): css-multicol-1 §3-§6 (laid out by `multicol`).
         "column-count" => match value {
             "auto" => style.paint.col_count = Some(None),
@@ -1580,6 +1595,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                             | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
                             | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
                             | "column-rule-style" | "column-rule-color" | "column-span"
+                            | "writing-mode" | "text-orientation"
                     )
                 }) =>
         {
@@ -1608,18 +1624,21 @@ fn apply_column_gap<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &Pa
     }
 }
 
-/// css-logical-1 §4-§6 in horizontal-tb (Aether lays out no vertical writing mode): a flow-relative
-/// property is re-applied as its physical longhand(s). The inline axis is horizontal and its start is
-/// `left`, or `right` when this element's own declarations already set `direction: rtl` (an inherited
-/// rtl is not visible at declaration time). `false` = not a logical property this engine maps.
+/// css-logical-1 §4-§6: a flow-relative property is re-applied as its physical longhand(s), through this
+/// element's own `writing-mode` and `direction` (css-writing-modes-4 §6.4, `writing::logical_sides`;
+/// AETHERSTYLE3 SR103 added the vertical modes). An inherited writing mode or rtl is not visible at
+/// declaration time. `false` = not a logical property this engine maps.
 fn apply_logical<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) -> bool {
+    // AETHERSTYLE3 (SR103): through this element's own `writing-mode` (a vertical mode swaps the axes).
+    let mode = style.paint.writing_mode.unwrap_or(crate::writing::HORIZONTAL_TB);
+    let vertical = crate::writing::is_vertical(mode);
     let size = match prop {
-        "inline-size" => Some("width"),
-        "block-size" => Some("height"),
-        "min-inline-size" => Some("min-width"),
-        "min-block-size" => Some("min-height"),
-        "max-inline-size" => Some("max-width"),
-        "max-block-size" => Some("max-height"),
+        "inline-size" => Some(if vertical { "height" } else { "width" }),
+        "block-size" => Some(if vertical { "width" } else { "height" }),
+        "min-inline-size" => Some(if vertical { "min-height" } else { "min-width" }),
+        "min-block-size" => Some(if vertical { "min-width" } else { "min-height" }),
+        "max-inline-size" => Some(if vertical { "max-height" } else { "max-width" }),
+        "max-block-size" => Some(if vertical { "max-width" } else { "max-height" }),
         _ => None,
     };
     if let Some(p) = size {
@@ -1627,6 +1646,7 @@ fn apply_logical<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>
         return true;
     }
     let rtl = style.paint.rtl == Some(true);
+    let (is_, ie, bs, be) = crate::writing::logical_sides(mode, rtl);
     for fam in ["margin", "padding", "inset", "border"] {
         let Some(rest) = prop.strip_prefix(fam).and_then(|r| r.strip_prefix('-')) else { continue };
         let (inline, rest) = if let Some(r) = rest.strip_prefix("inline") {
@@ -1636,11 +1656,7 @@ fn apply_logical<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>
         } else {
             return false;
         };
-        let (start, end) = match (inline, rtl) {
-            (true, false) => ("left", "right"),
-            (true, true) => ("right", "left"),
-            (false, _) => ("top", "bottom"),
-        };
+        let (start, end) = if inline { (is_, ie) } else { (bs, be) };
         let (edge, suffix) = if let Some(s) = rest.strip_prefix("-start") {
             (1u8, s)
         } else if let Some(s) = rest.strip_prefix("-end") {
@@ -2239,6 +2255,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
+        writing_mode, text_orientation,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter);
     if let Some(src_list) = &src.font_rel {

@@ -38,6 +38,7 @@ pub mod paint;
 pub mod scroll;
 pub mod table;
 mod tree;
+pub mod writing;
 
 pub use map::{Entry, NodeMap};
 pub use paint::{ClipShape, FontWeight, MarkerPaint, PaintStyle, ShapeRadius, TransformOp};

@@ -1444,6 +1444,9 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
                 if let Some(tt) = paint.and_then(|p| p.text_transform) {
                     size.text_transform = tt;
                 }
+                if let Some(wm) = paint.and_then(|p| p.writing_mode) {
+                    size.writing_mode = wm;
+                }
                 let attr_px = |name: &str| dom_node.attr(name).and_then(|v| v.trim().parse::<f32>().ok());
                 if let Some((iw, ih)) = H::media_intrinsic(dom_node) {
                     // width/height attributes win, the other axis keeps the intrinsic ratio.
@@ -1521,6 +1524,8 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
         }
     }
     rescale_ua_margins(tree, &sizes);
+    // AETHERSTYLE3 (SR103): vertical writing modes' flow (restored after the passes).
+    let writing_saved = crate::writing::apply(tree, &elem_info);
     // A replaced media box with an auto width is its own (attribute / intrinsic) width — not
     // stretched across a column container the way an auto-width block is. Height follows when
     // both axes are auto; with only the width specified the measure keeps the aspect ratio.
@@ -1665,12 +1670,50 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
     let is_cell = |tree: &LayoutTree<H>, id: taffy::NodeId| {
         tree.node_map.get(&id).and_then(|n| n.tag().map(|t| matches!(t.as_str(), "td" | "th"))).unwrap_or(false)
     };
+    let mut saved_widths: Vec<(taffy::NodeId, Dimension)> = Vec::new();
     for _ in 0..4 {
         let heights = inline::layout_all(tree, &text_info, &elem_info, fonts);
         let mut changed = false;
         for (id, h) in heights {
             let h = clear_floats(tree, id, h);
             let Ok(st) = tree.taffy.style(id) else { continue };
+            // AETHERSTYLE3 (SR103): a vertical IFC root is as wide as its lines' block extent and as tall as
+            // its inline size (or its longest line).
+            if let Some(ext) = tree.inline.get(&id).filter(|il| il.vertical != 0).map(|il| il.inline_extent) {
+                let Ok(l) = tree.taffy.layout(id).cloned() else { continue };
+                let ex = l.padding.left + l.padding.right + l.border.left + l.border.right;
+                let ey = l.padding.top + l.padding.bottom + l.border.top + l.border.bottom;
+                let bb = st.box_sizing == taffy::style::BoxSizing::BorderBox;
+                let mut st2 = st.clone();
+                let has_width = tree.paint_map.get(&id).and_then(|p| p.has_width) == Some(true);
+                if !has_width {
+                    let want = Dimension::length(if bb { h + ex } else { h });
+                    if st2.size.width != want {
+                        if !saved_widths.iter().any(|(s, _)| *s == id) {
+                            saved_widths.push((id, st.size.width));
+                        }
+                        st2.size.width = want;
+                        if (l.size.width - ex - h).abs() >= 0.01 {
+                            changed = true;
+                        }
+                    }
+                }
+                let orig_h = saved_heights.iter().find(|(s, _)| *s == id).map(|(_, d)| *d).unwrap_or(st.size.height);
+                if orig_h == Dimension::auto() {
+                    let want = Dimension::length(if bb { ext + ey } else { ext });
+                    if st2.size.height != want {
+                        if !saved_heights.iter().any(|(s, _)| *s == id) {
+                            saved_heights.push((id, st.size.height));
+                        }
+                        st2.size.height = want;
+                        if (l.size.height - ey - ext).abs() >= 0.01 {
+                            changed = true;
+                        }
+                    }
+                }
+                let _ = tree.taffy.set_style(id, st2);
+                continue;
+            }
             if is_cell(tree, id) {
                 // A table cell stretches to its row (§17.5.3): its line boxes
                 // set a MINIMUM height; vertical-align places them inside.
@@ -1773,6 +1816,14 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
             let _ = tree.taffy.set_style(id, st);
         }
     }
+    for (id, d) in saved_widths {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            st.size.width = d;
+            let _ = tree.taffy.set_style(id, st);
+        }
+    }
+    crate::writing::restore(tree, writing_saved);
     collapse::restore(tree, collapsed);
     blockwidth::restore(tree, widths);
 }
@@ -1835,6 +1886,8 @@ pub(crate) struct TextRun {
     /// absolute size up the chain): only then does switching to monospace
     /// scale it by 13/16 (Blink's fixed-pitch default).
     pub(crate) fs_absolute: bool,
+    /// AETHERSTYLE3 (SR103): the inherited `writing-mode` (`writing` codes).
+    pub(crate) writing_mode: u8,
 }
 
 impl TextRun {

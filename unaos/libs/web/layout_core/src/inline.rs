@@ -59,6 +59,11 @@ pub struct InlineLayout {
     /// AETHERSTYLE3 (SR103): the root is a multicol container — its lines were laid out at the column width
     /// and fragmented into these columns (`multicol::balance_ifc`).
     pub columns: Option<crate::multicol::Columns>,
+    /// AETHERSTYLE3 (SR103): the root's writing mode when vertical (`writing` codes; 0 = horizontal): the
+    /// fragments are in the horizontal staging space and paint through `writing::to_physical`.
+    pub vertical: u8,
+    /// A vertical root's used inline size: what it fills, or its longest line.
+    pub inline_extent: f32,
 }
 
 enum Item {
@@ -318,6 +323,14 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
         None
     };
     let avail_w = mc.map(|(_, w, _)| w + 0.01).unwrap_or(avail_w);
+    // AETHERSTYLE3 (SR103): a vertical root's lines run along its inline (physical vertical) size.
+    let vmode = root_run.writing_mode;
+    let (v_avail, v_fill) = if crate::writing::is_vertical(vmode) {
+        crate::writing::inline_avail(tree, ctx.elems, root)
+    } else {
+        (0.0, false)
+    };
+    let avail_w = if crate::writing::is_vertical(vmode) { v_avail + 0.01 } else { avail_w };
     let mut items = Vec::new();
     collect(tree, root, &mut items);
 
@@ -704,6 +717,19 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
     }
     if let Some((n, w, gap)) = mc {
         out.columns = Some(crate::multicol::balance_ifc(tree, root, &mut out, n, w, gap));
+    }
+    if crate::writing::is_vertical(vmode) {
+        out.vertical = vmode;
+        let longest = out
+            .frags
+            .iter()
+            .map(|f| match f {
+                Frag::Text { x, width, .. } => x + width,
+                Frag::Box { x, w, .. } => x + w,
+                Frag::Atomic { node, x, .. } => x + tree.taffy.layout(*node).map(|l| l.size.width).unwrap_or(0.0),
+            })
+            .fold(0.0f32, f32::max);
+        out.inline_extent = if v_fill { v_avail } else { longest.ceil() };
     }
     out
 }

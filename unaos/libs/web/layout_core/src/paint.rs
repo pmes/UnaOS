@@ -196,6 +196,11 @@ pub struct PaintStyle<H: Host> {
     pub col_rule_width: Option<f32>,
     pub col_rule_style: Option<u8>,
     pub col_rule_color: Option<(u8, u8, u8)>,
+    /// AETHERSTYLE3 (SR103): `writing-mode` (css-writing-modes-4 §3.1; [`crate::writing`] codes), inherited.
+    pub writing_mode: Option<u8>,
+    /// `text-orientation` (§5.1): 0 mixed, 1 upright, 2 sideways. Glyphs paint sideways in every vertical
+    /// mode (the `mixed` rendering of Latin); upright CJK is not rotated back.
+    pub text_orientation: Option<u8>,
 }
 
 
@@ -284,6 +289,8 @@ impl<H: Host> Default for PaintStyle<H> {
             col_rule_width: None,
             col_rule_style: None,
             col_rule_color: None,
+            writing_mode: None,
+            text_orientation: None,
         }
     }
 }

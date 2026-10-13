@@ -2892,6 +2892,60 @@ pub fn render_frame(
             let sel_plan = crate::selection::plan_ifc(layout, node_id);
             // AETHERDEBT SR93: every find-in-page match, highlighted behind its text.
             let mark_plan = crate::selection::plan_marks(layout, node_id);
+            // AETHERSTYLE3 (SR103): a vertical writing mode's fragments are laid out in a horizontal staging
+            // space (inline along x, lines along y). They paint into an offscreen buffer pre-filled with the
+            // backdrop each staging pixel lands on, then every pixel the text changed goes to its place in the
+            // content box through `writing::to_physical` (vertical-rl / sideways-rl turn the lines clockwise,
+            // vertical-lr keeps that glyph turn with the lines left to right, sideways-lr turns them
+            // counter-clockwise).
+            let vmode = ifc.vertical;
+            let (vbw, vbh) = if vmode != 0 {
+                ((ifc.inline_extent.ceil().max(1.0)) as u32, (ifc.height.ceil().max(1.0)) as u32)
+            } else {
+                (0, 0)
+            };
+            let vorigin = ((content_x - sx as f32).floor() as i32, (content_y - sy as f32).floor() as i32);
+            let vline = |y: i32| {
+                ifc.lines.iter().find(|(t, h, _)| y as f32 >= t.floor() && (y as f32) < (t + h).floor()).map(|(t, h, _)| {
+                    (t.floor() as i32, ((t + h).floor() - t.floor()) as i32)
+                })
+            };
+            let vmap = |x: i32, y: i32| {
+                let (px, py) = layout_core::writing::to_physical(vmode, x, y, vbh as i32, vbw as i32, &vline);
+                (vorigin.0 + px, vorigin.1 + py)
+            };
+            let mut vbuf: Vec<u8> = Vec::new();
+            if vmode != 0 {
+                vbuf = vec![255; (vbw * vbh * 4) as usize];
+                for y in 0..vbh as i32 {
+                    for x in 0..vbw as i32 {
+                        let (dx, dy) = vmap(x, y);
+                        if dx >= 0 && dy >= 0 && (dx as u32) < width && (dy as u32) < height {
+                            let si = ((dy as u32 * width + dx as u32) * 4) as usize;
+                            let di = ((y as u32 * vbw + x as u32) * 4) as usize;
+                            vbuf[di..di + 4].copy_from_slice(&surface[si..si + 4]);
+                        }
+                    }
+                }
+            }
+            let vinit = vbuf.clone();
+            {
+            let vdamage = [(0u32, 0u32, vbw, vbh)];
+            #[allow(clippy::type_complexity)]
+            let (surface, width, height, damage_rects, child_clip, content_x, content_y, exact_content_y): (
+                &mut [u8],
+                u32,
+                u32,
+                &[(u32, u32, u32, u32)],
+                Clip,
+                f32,
+                f32,
+                f32,
+            ) = if vmode != 0 {
+                (&mut vbuf[..], vbw, vbh, &vdamage[..], (0.0, 0.0, vbw as f32, vbh as f32), sx as f32, sy as f32, sy as f32)
+            } else {
+                (&mut *surface, width, height, damage_rects, child_clip, content_x, content_y, exact_content_y)
+            };
             for (fi, frag) in ifc.frags.iter().enumerate() {
                 match frag {
                     crate::layout::inline::Frag::Box { node, x, y, w, h, first, last } => {
@@ -3069,6 +3123,27 @@ pub fn render_frame(
                             *node, content_x + x - loc.x, content_y + y - loc.y, i, layout, font, font_bold, surface,
                             width, height, sx, sy, damage_rects, child_clip,
                         );
+                    }
+                }
+            }
+            }
+            if vmode != 0 {
+                for y in 0..vbh as i32 {
+                    for x in 0..vbw as i32 {
+                        let di = ((y as u32 * vbw + x as u32) * 4) as usize;
+                        if vbuf[di..di + 3] == vinit[di..di + 3] {
+                            continue;
+                        }
+                        let (px, py) = vmap(x, y);
+                        if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
+                            continue;
+                        }
+                        let (pxu, pyu) = (px as u32, py as u32);
+                        if !in_damage(pxu, pyu, damage_rects) || !in_clip(pxu, pyu, child_clip) {
+                            continue;
+                        }
+                        let si = ((pyu * width + pxu) * 4) as usize;
+                        surface[si..si + 4].copy_from_slice(&vbuf[di..di + 4]);
                     }
                 }
             }
