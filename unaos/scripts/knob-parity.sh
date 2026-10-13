@@ -54,6 +54,138 @@ set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── --line <file> --board orin|pi: GATE-IMAGE-LINE for the two aarch64 lines (ARMPARITY) ──────────
+# The `--line` gate below holds every kernel knob to the x86 builder's env→feature map, and neither
+# aarch64 card is built by the builder: `esp-jetson` compiles from arroyo's TOP-LEVEL `_feats` map,
+# `kernel8` from its own CURATED `K8_FEATS` arms (it never reads `_feats`). Run over
+# image-line-orin.env / image-line-pi.env that gate reds the board-only knobs by construction (SR102).
+# `--board` gates each aarch64 line the way the x86 line is gated, against the map that BOARD builds
+# from, at the knob → feature → Cargo.toml → banner-cert places of LAWS' "A knob lives in FIVE places":
+#   board map   orin: `[ -n "${UNAOS_X:-}" ] && _feats="${_feats}<f>,"` at column 0 (what esp_jetson
+#               builds from); pi: `if|elif [ -n "${UNAOS_X:-}" ]; then` … `K8_FEATS="${K8_FEATS},<f>"`
+#               inside kernel8(). A kernel knob missing from it is built WITHOUT its feature (red).
+#   Cargo.toml  every feature the board map gives the knob is in crates/kernel's [features] (red).
+#   banner-cert every such feature has a bc_table row, or the board's armed build stops NO VERDICT (red).
+#   k8-reach    pi only: the knob has no `NA` row in k8-reach.registry ("deliberately absent from the
+#               Pi image" contradicts a line that arms it) (red).
+#   x86 parity  a knob NOT in the board's BOARD_ONLY row below is a SHARED knob and is held to the x86
+#               line's two maps exactly as `--line` holds it — arroyo's top-level map AND the builder.
+#               A BOARD_ONLY knob is exempt from the builder; a BOARD_ONLY entry the builder DOES map,
+#               or that the board map does not know, is a stale table row (red).
+# plus `--line`'s shape, comment, duplicate, UNKNOWN and [media] checks; order = the board map's order.
+# Exit 2: a control probe failed (a parser broke). usage: knob-parity.sh --line <file> --board orin|pi [<ws>]
+#
+# BOARD_ONLY — the knobs a board's line may arm that the x86 builder never maps. One row per board;
+# a knob joins by an edit HERE, never by an exclusion in the checks below.
+BOARD_ONLY_orin="UNAOS_ORINDESK UNAOS_ORINCLICK UNAOS_TEGRA_EL0 UNAOS_ORINCONWIN UNAOS_ORINRENDER"
+BOARD_ONLY_pi="UNAOS_SMP7 UNAOS_V3D UNAOS_VUGPAR UNAOS_PIUSB UNAOS_GENET UNAOS_NETTEST UNAOS_PIRAST UNAOS_PIDESK"
+if [ "${1:-}" = "--line" ] && [ "${3:-}" = "--board" ]; then
+    LINE="${2:?usage: knob-parity.sh --line <file> --board orin|pi [<workspace-dir>]}"
+    BOARD="${4:-}"
+    case "$BOARD" in
+        orin) BONLY=" ${BOARD_ONLY_orin} " ;;
+        pi)   BONLY=" ${BOARD_ONLY_pi} " ;;
+        *) echo "❌ image-line[${BOARD:-?}]: NO VERDICT — --board takes orin|pi"; exit 2 ;;
+    esac
+    WS="${5:-$(dirname "$HERE")}"
+    ARROYO="${WS}/arroyo"; BUILDER="${WS}/builder/src/main.rs"; KSRC="${WS}/crates/kernel/src"
+    CARGO="${WS}/crates/kernel/Cargo.toml"; BCERT="${WS}/scripts/banner-cert.sh"; K8REG="${WS}/scripts/k8-reach.registry"
+    for f in "$LINE" "$ARROYO" "$BUILDER" "$CARGO" "$BCERT" "$K8REG"; do
+        [ -f "$f" ] || { echo "❌ image-line[${BOARD}]: NO VERDICT — missing ${f}"; exit 2; }
+    done
+    # (a') arroyo's top-level knob map as knob|line|features — the x86 parity map, and orin's board map.
+    amap="$(awk '/^\[ -n "\$\{UNAOS_[A-Z0-9_]+:-\}" \] && _feats="\$\{_feats\}/ {
+                 match($0, /UNAOS_[A-Z0-9_]+/); k = substr($0, RSTART, RLENGTH); s = $0
+                 while (match(s, /_feats="\$\{_feats\}[A-Za-z0-9_,-]*,"/)) {
+                     t = substr(s, RSTART + 17, RLENGTH - 19); s = substr(s, RSTART + RLENGTH); f[k] = f[k] "," t }
+                 if (!(k in l)) { l[k] = NR; o[++n] = k } }
+             END { for (i = 1; i <= n; i++) { k = o[i]; x = f[k]; gsub(/,,+/, ",", x); sub(/^,/, "", x); print k "|" l[k] "|" x } }' "$ARROYO")"
+    # (b') the builder's env→feature map, read exactly as `--line` reads it.
+    bmap="$(awk '{ l = $0; i = index(l, "//"); if (i > 0) l = substr(l, 1, i - 1)
+                   if (index(l, "feats.push(") && match(l, /env::var\("UNAOS_[A-Z0-9_]+"\)/)) {
+                       k = substr(l, RSTART + 10, RLENGTH - 12); if (!(k in s)) { s[k] = 1; print k "|" NR } } }' "$BUILDER")"
+    if [ "$BOARD" = orin ]; then
+        dmap="$amap"; dname="arroyo's top-level _feats map (esp_jetson)"
+    else
+        dname="kernel8()'s K8_FEATS arms"
+        dmap="$(awk '/^kernel8\(\) \{/ { in8 = 1; next }  in8 && /^\}/ { in8 = 0 }
+                     in8 && /^[ \t]*(if|elif) \[ -n "\$\{UNAOS_[A-Z0-9_]+:-\}" \]; then/ { match($0, /UNAOS_[A-Z0-9_]+/); k = substr($0, RSTART, RLENGTH) }
+                     in8 && /^    fi/ { k = "" }
+                     in8 && k != "" && match($0, /K8_FEATS="\$\{K8_FEATS\},[A-Za-z0-9_,-]*"/) {
+                         t = substr($0, RSTART + 22, RLENGTH - 23); f[k] = f[k] "," t
+                         if (!(k in l)) { l[k] = NR; o[++n] = k } }
+                     END { for (i = 1; i <= n; i++) { k = o[i]; x = f[k]; gsub(/,,+/, ",", x); sub(/^,/, "", x); print k "|" l[k] "|" x } }' "$ARROYO")"
+    fi
+    cfeat=" $(awk '/^\[features\]/ { f = 1; next } /^\[/ { f = 0 } f && /^[A-Za-z0-9_-]+[ \t]*=/ { n = $1; sub(/[ \t]*=.*$/, "", n); printf "%s ", n }' "$CARGO")"
+    brow=" $(awk '/^bc_table\(\) \{/ { t = 1; next } t && /^TABLE$/ { t = 0 } t && /\|/ { split($0, p, "|"); printf "%s ", p[1] }' "$BCERT")"
+    k8na=" $(awk '/^UNAOS_[A-Z0-9_]+[ \t]+NA[ \t]/ { printf "%s ", $1 }' "$K8REG")"
+    ctl() { echo "❌ image-line[${BOARD}]: NO VERDICT — control probe: $* (parser broke)"; exit 2; }
+    printf '%s\n' "$amap" | grep -q '^UNAOS_WC|[0-9]*|\(.*,\)\?wc\(,\|$\)' || ctl "UNAOS_WC→wc not in arroyo's knob map"
+    printf '%s\n' "$bmap" | grep -q '^UNAOS_WC|' || ctl "UNAOS_WC not in the builder's env→feature map"
+    printf '%s\n' "$dmap" | grep -q '^UNAOS_WITNESS|[0-9]*|\(.*,\)\?witness\(,\|$\)' || ctl "UNAOS_WITNESS→witness not in ${dname}"
+    if [ "$BOARD" = orin ]; then printf '%s\n' "$dmap" | grep -q '^UNAOS_TEGRA|[0-9]*|\(.*,\)\?tegra\(,\|$\)' || ctl "UNAOS_TEGRA→tegra not in ${dname}"
+    else printf '%s\n' "$dmap" | grep -q '^UNAOS_SMP7|[0-9]*|smp7$' || ctl "UNAOS_SMP7→smp7 (the elif arm) not in ${dname}"; fi
+    case "$cfeat" in *" witness "*) ;; *) ctl "witness not in ${CARGO}'s [features]" ;; esac
+    case "$brow" in *" witness "*) ;; *) ctl "witness has no row in banner-cert's bc_table" ;; esac
+    case "$k8na" in *" UNAOS_AHCI "*) ;; *) ctl "UNAOS_AHCI has no NA row in k8-reach.registry" ;; esac
+    rc=0 n=0 nk=0 nm=0 nb=0 prev=0 prevk="" seen=" "
+    red() { echo "❌ image-line[${BOARD}]: $*"; rc=1; }
+    for k in $BONLY; do
+        printf '%s\n' "$dmap" | grep -q "^${k}|" || red "BOARD_ONLY_${BOARD}: ${k} is not in ${dname} — a stale table row"
+        printf '%s\n' "$bmap" | grep -q "^${k}|" && red "BOARD_ONLY_${BOARD}: ${k} IS mapped by builder/src/main.rs — not board-only, a stale table row"
+    done
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        n=$((n+1))
+        case "$raw" in ''|'#'*) continue ;; esac
+        if [[ "$raw" =~ ^export\ (UNAOS_[A-Z0-9_]+)=1[[:space:]]+#\ (.+)$ ]]; then
+            k="${BASH_REMATCH[1]}"; cls=kernel
+        elif [[ "$raw" =~ ^export\ (UNAOS_[A-Z0-9_]+)=\"\$\{(UNAOS_[A-Z0-9_]+):\?[^}]+\}\"[[:space:]]+#\ \[media\]\ (.+)$ ]]; then
+            k="${BASH_REMATCH[1]}"; cls=media
+            [ "$k" = "${BASH_REMATCH[2]}" ] || { red "line ${n}: ${k} takes its value from ${BASH_REMATCH[2]}"; continue; }
+        else
+            red "line ${n}: MALFORMED (want \`export UNAOS_X=1  # <who added it>\` or the [media] form): ${raw:0:100}"; continue
+        fi
+        case "$seen" in *" $k "*) red "line ${n}: ${k} DUPLICATE"; continue ;; esac
+        seen="${seen}${k} "
+        al="$(printf '%s\n' "$amap" | awk -F'|' -v k="$k" '$1==k{print $2; exit}')"
+        bl="$(printf '%s\n' "$bmap" | awk -F'|' -v k="$k" '$1==k{print $2; exit}')"
+        dl="$(printf '%s\n' "$dmap" | awk -F'|' -v k="$k" '$1==k{print $2; exit}')"
+        df="$(printf '%s\n' "$dmap" | awk -F'|' -v k="$k" '$1==k{print $3; exit}')"
+        if [ "$cls" = kernel ]; then
+            nk=$((nk+1))
+            if [ -z "$dl" ]; then
+                if [ -n "$al" ] || [ -n "$bl" ] || grep -q "\${${k}[:}]" "$ARROYO"; then
+                    red "line ${n}: ${k} — not in ${dname} (the ${BOARD} image would be built WITHOUT it)"
+                else red "line ${n}: ${k} UNKNOWN — in no map arroyo or the builder keeps"; fi
+                continue
+            fi
+            for f in ${df//,/ }; do
+                case "$cfeat" in *" $f "*) ;; *) red "line ${n}: ${k} → ${f} — crates/kernel/Cargo.toml declares no such feature" ;; esac
+                case "$brow" in *" $f "*) ;; *) red "line ${n}: ${k} → ${f} — no banner-cert row (an armed ${BOARD} build stops NO VERDICT on it)" ;; esac
+            done
+            if [ "$BOARD" = pi ]; then case "$k8na" in *" $k "*) red "line ${n}: ${k} has an NA row in k8-reach.registry (deliberately absent from the Pi image) yet the line arms it" ;; esac; fi
+            case "$BONLY" in
+                *" $k "*) nb=$((nb+1)) ;;
+                *) [ -n "$al" ] || red "line ${n}: ${k} — shared (not BOARD_ONLY_${BOARD}) and arroyo's top-level knob map does not map it (the x86 banner would not name it)"
+                   [ -n "$bl" ] || red "line ${n}: ${k} — shared (not BOARD_ONLY_${BOARD}) and builder/src/main.rs does not map it (the x86 image would be built WITHOUT it); board-only? add it to BOARD_ONLY_${BOARD}" ;;
+            esac
+            pos="$dl"
+        else
+            nm=$((nm+1))
+            pos="$(grep -n "\${${k}[:}]" "$ARROYO" | head -1 | cut -d: -f1)"
+            [ -n "$pos" ] || { red "line ${n}: ${k} UNKNOWN — [media] but arroyo never reads it"; continue; }
+            if [ -n "$bl" ] || grep -q "\"${k}\"" "$BUILDER"; then red "line ${n}: ${k} is marked [media] but builder/src/main.rs reads it"; fi
+            if grep -rqs "env!(\"${k}\")" "$KSRC"; then red "line ${n}: ${k} is marked [media] but the kernel reads it with env!/option_env!"; fi
+        fi
+        if [ "$pos" -lt "$prev" ]; then red "line ${n}: ${k} (arroyo:${pos}) OUT OF ORDER after ${prevk} (arroyo:${prev}) — the file is in ${dname} order"
+        else prev="$pos"; prevk="$k"; fi
+    done < "$LINE"
+    [ $((nk+nm)) -gt 0 ] || red "${LINE} holds no knob"
+    if [ "$rc" -eq 0 ]; then echo "✅ image-line[${BOARD}] OK: ${nk} kernel knobs in ${dname}, every feature in Cargo.toml and banner-cert; $((nk-nb)) shared in arroyo's map AND the builder's, ${nb} BOARD_ONLY_${BOARD}; ${nm} [media]; nothing unknown, in board-map order"
+    else echo "❌ image-line[${BOARD}]: $(basename "$LINE") -> FAIL"; fi
+    exit "$rc"
+fi
+
 # ── --line <file>: GATE-IMAGE-LINE (FOLDBUILD, rmbp-ledger B517) ───────────────────────────────
 # The image build line lives in ONE file (scripts/image-line.env). This entry checks that file
 # against the SAME two vocabularies this script reads below, keyed by KNOB rather than feature:
