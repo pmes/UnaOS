@@ -498,7 +498,143 @@ def find_kernel(path):
     return path
 
 
-def main():
+# =====================================================================================
+# --self-test (TOOLING1, 2026-10-13; ARCH-CONFORMANCE 14, rmbp-ledger B107). Until this, NOTHING
+# ran this tool: `grep -c orin-specscore unaos/arroyo` was 0, and B107 recorded adding `--explain`
+# to it "with no regression protection at all: if --explain breaks tomorrow, nothing notices".
+# This is what a gate runs, headless, in about a second, touching no hardware and no bench file:
+#   (1) THE CORPUS LOOP B107 named as the test -- `--explain` over EVERY scripts/specs/*.spec, each
+#       rc 0 with a directive count; a spec that stops parsing reds here by name.
+#   (2) the six `--explain` REFUSALS (a capture or any capture-side flag beside --explain is rc 2);
+#   (3) scoring with no --image: a canned PASS is rc 0 and says the coverage question was not asked,
+#       a canned missing REQUIRE is rc 1 (mbench's verdict, passed through unchanged);
+#   (4) THE COVERAGE COLUMN, the reason the tool exists, on a synthetic source tree + "image": one
+#       rule of each class IMG / WIRE / DEAD / FOREIGN classifies as such, a clean pass carrying a
+#       DEAD FORBID is RC_VACUOUS (4), and --no-coverage-gate / --accept-dead each restore rc 0;
+#   (5) the checked-in real pair specs/jetson-sync1.spec + jetson-sync1-green.capture scores PASS.
+# Fixtures live in a TemporaryDirectory, so the caller pins TMPDIR (LAWS: never /tmp on this bench;
+# `arroyo gates` points it into unaos/target/).
+# =====================================================================================
+_ST_SRC = r"""
+fn alpha() { serial_println!(":: DEMO: alpha ready ::"); }
+fn beta(x: bool) { serial_println!("[demo] live={} mode=ok", if x { "LIVE" } else { "FROZEN" }); }
+fn ghost() { serial_println!("[ghost] compiled out entirely ::"); }
+"""
+# The "image": alpha's whole literal, beta's two chunks and both of its values -- and NOT ghost.
+_ST_IMG = b"\x7fELF\x00:: DEMO: alpha ready ::\x00[demo] live=\x00 mode=ok\x00LIVE\x00FROZEN\x00"
+_ST_SPEC = """\
+# orin-specscore self-test spec
+REQUIRE :: DEMO: alpha ready ::
+REQUIRE \\[demo\\] live=FROZEN mode=ok
+FORBID \\[ghost\\] compiled out
+OPTIONAL NVIDIA firmware says hello
+"""
+_ST_CAP_PASS = b":: DEMO: alpha ready ::\r\n[demo] live=FROZEN mode=ok\r\n"
+_ST_CAP_FAIL = b":: DEMO: alpha ready ::\r\n"
+
+
+def run_self_test():
+    import contextlib
+    import glob
+    import io
+    import tempfile
+    results = []
+
+    def check(name, cond, detail=""):
+        results.append((name, bool(cond), detail))
+
+    def call(argv):
+        """main(argv) in-process, output captured; argparse's exit becomes an rc."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = main(argv)
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 2
+        return rc, out.getvalue() + err.getvalue()
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    specs = sorted(glob.glob(os.path.join(here, "specs", "*.spec")))
+    check("corpus: specs/*.spec found", len(specs) > 0, f"{len(specs)} spec(s)")
+    for sp in specs:
+        rc, out = call(["--explain", "--spec", sp])
+        check(f"explain {os.path.basename(sp)}", rc == 0 and "effective directive(s)" in out,
+              f"rc={rc}" + ("" if rc == 0 else " " + out.strip().splitlines()[-1][:120] if out.strip() else ""))
+
+    with tempfile.TemporaryDirectory(prefix="specscore-selftest-") as td:
+        src = os.path.join(td, "src")
+        os.makedirs(src)
+        with open(os.path.join(src, "demo.rs"), "w") as f:
+            f.write(_ST_SRC)
+        img = os.path.join(td, "kernel.elf")
+        spec = os.path.join(td, "selftest.spec")
+        cap_pass = os.path.join(td, "pass.log")
+        cap_fail = os.path.join(td, "fail.log")
+        for path, data in ((img, _ST_IMG), (spec, _ST_SPEC.encode()),
+                           (cap_pass, _ST_CAP_PASS), (cap_fail, _ST_CAP_FAIL)):
+            with open(path, "wb") as f:
+                f.write(data)
+
+        # (2) the refusals -- every capture-side input beside --explain is rc 2, never a silent no-op
+        for label, extra in (("a capture", [cap_pass]), ("--image", ["--image", img]),
+                             ("--source", ["--source", src]), ("--accept-dead", ["--accept-dead", "x"]),
+                             ("--no-coverage-gate", ["--no-coverage-gate"]),
+                             ("--quiet-optional", ["--quiet-optional"])):
+            rc, out = call(["--explain", "--spec", spec] + extra)
+            check(f"explain refuses {label}", rc == 2 and "--explain takes no capture" in out, f"rc={rc}")
+
+        # (3) no --image: mbench's verdict, unchanged, and the warning that coverage was not asked
+        rc, out = call([cap_pass, "--spec", spec])
+        check("no-image PASS is rc 0 and says coverage unasked",
+              rc == mbench.RC_PASS and "no --image" in out, f"rc={rc}")
+        rc, out = call([cap_fail, "--spec", spec])
+        check("no-image missing REQUIRE is rc 1", rc == mbench.RC_FAIL, f"rc={rc}")
+
+        # (4) the coverage column: one rule per class, then the exit code it moves
+        with open(img, "rb") as f:
+            imgb = f.read()
+        literals = load_source(src)
+        blob = "\x00".join(lit for lit, _ in literals)
+        index = build_index(literals)
+        for pat, want in ((r":: DEMO: alpha ready ::", IMG),
+                          (r"\[demo\] live=FROZEN mode=ok", WIRE),
+                          (r"\[ghost\] compiled out", DEAD),
+                          (r"NVIDIA firmware says hello", FOREIGN)):
+            got = classify(pat, imgb, literals, blob, index)[0]
+            check(f"classify {want:<7} {pat}", got == want, f"got={got}")
+        rc, out = call([cap_pass, "--spec", spec, "--image", img, "--source", src])
+        check("clean pass with a DEAD FORBID is PASS-BUT-VACUOUS (4)",
+              rc == RC_VACUOUS and "PASS-BUT-VACUOUS" in out, f"rc={rc}")
+        rc, out = call([cap_pass, "--spec", spec, "--image", img, "--source", src, "--no-coverage-gate"])
+        check("--no-coverage-gate restores rc 0", rc == mbench.RC_PASS, f"rc={rc}")
+        rc, out = call([cap_pass, "--spec", spec, "--image", img, "--source", src, "--accept-dead", "ghost"])
+        check("--accept-dead <substring> restores rc 0", rc == mbench.RC_PASS, f"rc={rc}")
+        rc, out = call([cap_fail, "--spec", spec, "--image", img, "--source", src])
+        check("a FAIL stays FAIL with --image (never turned into a pass)", rc == mbench.RC_FAIL, f"rc={rc}")
+
+    # (5) the real checked-in pair
+    rspec = os.path.join(here, "specs", "jetson-sync1.spec")
+    rcap = os.path.join(here, "specs", "jetson-sync1-green.capture")
+    if os.path.exists(rspec) and os.path.exists(rcap):
+        rc, out = call([rcap, "--spec", rspec])
+        check("real pair jetson-sync1 green capture scores PASS", rc == mbench.RC_PASS, f"rc={rc}")
+    else:
+        check("real pair jetson-sync1 present", False, "specs/jetson-sync1{.spec,-green.capture} missing")
+
+    bad = [r for r in results if not r[1]]
+    for name, ok, detail in results:
+        if not ok or os.environ.get("SPECSCORE_SELFTEST_VERBOSE"):
+            print(f"  {'✅' if ok else '❌'} {name}" + (f"  ({detail})" if detail else ""))
+    n_explain = sum(1 for r in results if r[0].startswith("explain ") and "refuses" not in r[0])
+    print(f"  (corpus: --explain over {n_explain} spec(s); set SPECSCORE_SELFTEST_VERBOSE=1 to list every check)")
+    if bad:
+        print(f"  ❌ SPECSCORE SELF-TEST FAIL — {len(bad)}/{len(results)} check(s) failed")
+        return 1
+    print(f"  ✅ SPECSCORE SELF-TEST PASS — {len(results)}/{len(results)}")
+    return 0
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description="score a jetson capture and report, per rule, whether it could have fired")
     # --explain (rmbp 17, rmbp-ledger B103): `capture` is OPTIONAL so the spec can be asked what
@@ -510,7 +646,7 @@ def main():
     # a capture, and reading the spec file cannot see it. See the --explain block in main().
     ap.add_argument("capture", nargs="?", default=None,
                     help="the serial capture to score (a finished log); omit it with --explain")
-    ap.add_argument("--spec", required=True, help="the witness spec")
+    ap.add_argument("--spec", help="the witness spec (required unless --self-test)")
     ap.add_argument("--image", help="staged flash dir, or the kernel.elf the capture came from")
     ap.add_argument("--source", default=None,
                     help="kernel source root the image was built from "
@@ -533,7 +669,22 @@ def main():
                     help="print the EFFECTIVE directive list for --spec (builtins included, "
                          "marked) and exit. No capture, no image, no scoring: it answers "
                          "'what does this spec actually enforce' before a boot exists.")
-    args = ap.parse_args()
+    ap.add_argument("--self-test", action="store_true",
+                    help="no capture, no image, no hardware: prove this tool on canned fixtures and "
+                         "the whole checked-in spec corpus, then exit 0/1 (what `arroyo gates` runs)")
+    args = ap.parse_args(argv)
+
+    if args.self_test:
+        _other = [n for n, v in (("a capture", args.capture), ("--spec", args.spec),
+                                 ("--image", args.image), ("--source", args.source),
+                                 ("--accept-dead", args.accept_dead), ("--explain", args.explain),
+                                 ("--no-coverage-gate", args.no_coverage_gate),
+                                 ("--quiet-optional", args.quiet_optional)) if v]
+        if _other:
+            ap.error("--self-test takes no other argument; got " + ", ".join(_other))
+        return run_self_test()
+    if not args.spec:
+        ap.error("the following arguments are required: --spec")
 
     if not args.explain and args.capture is None:
         ap.error("a capture is required unless --explain is given")

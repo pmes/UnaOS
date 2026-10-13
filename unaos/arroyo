@@ -13856,7 +13856,12 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py"
+# TOOLING1 (2026-10-13; ARCH-CONFORMANCE 14, rmbp-ledger B107): the last two rows are the bench's two SCORERS'
+# own self-tests, headless and seconds-long (mbench ~4 s, of which most is its FIFO round-trip; specscore ~1 s).
+# `mbench --self-test` was reachable only through `check`'s GATE-HOSTTESTS (behind the cargo legs) and
+# `orin-specscore.py` through NOTHING — `grep -c orin-specscore unaos/arroyo` was 0. Both write their fixtures
+# through tempfile, so TMPDIR is pinned into the tree's own target/ (LAWS: never /tmp on this bench).
 _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary line, returns the gate's rc
     local R="$1" n="$2" log="$3" p rc=0 e
     p="$(printf '%s\n' $GATES_SET | awk -F: -v n="$n" '$1==n{print $2}')"
@@ -13867,10 +13872,12 @@ _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary li
         deps) e=(--check) ;;
         banner) e=(--registry "${_feats%,}") ;;
         image-line) e=(--line "$R/unaos/scripts/image-line.env") ;;   # FOLDBUILD (B517): the image build line's file against arroyo's knob map and the builder's
+        mbench-selftest|specscore) e=(--self-test) ;;   # TOOLING1: the scorers' own self-tests (see GATES_SET)
         *) e=() ;;
     esac
+    local tdir="$R/unaos/target/gates-tmp"; mkdir -p "$tdir" 2>/dev/null || tdir="${TMPDIR:-}"
     case "$p" in
-        *.py) python3 "$R/$p" "${e[@]}" > "$log" 2>&1 || rc=$? ;;
+        *.py) TMPDIR="$tdir" python3 "$R/$p" "${e[@]}" > "$log" 2>&1 || rc=$? ;;
         *)    bash "$R/$p" "${e[@]}" > "$log" 2>&1 || rc=$? ;;
     esac
     echo "gate=${n} rc=${rc} $(sed 's/\x1b\[[0-9;]*m//g' "$log" | awk 'NF{l=$0} END{sub(/^[ \t]+/,"",l); print l}')"
@@ -13891,7 +13898,9 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         banner)     sed -i '/^bc_table() {$/,/^TABLE$/ s/^\(ahci|AHCI: selfcheck|-|measured\)$/\1\nzzgateplant|:: ZZGATEPLANT: row for no feature|-|measured/' "$C/unaos/scripts/banner-cert.sh"; echo zzgateplant ;;
         k8reach)    sed -i 's/^_feats=""$/&\n[ -n "${UNAOS_ZZGATEPLANT:-}" ] \&\& _feats="${_feats}zzgateplant,"/' "$C/unaos/arroyo"; echo ZZGATEPLANT ;;
         sanity)     printf 'pub fn p() { assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 2); }\n' > "$K/video/zz_gateplant_sanity.rs"; echo zz_gateplant_sanity ;; # SANITYLEGS (B488): flight 26's reboot-loop assert, planted as a runtime assert over consts
-        image-line) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line.env"; echo ZZGATEPLANT ;; # FOLDBUILD (B517); last in GATES_SET, so no restore is owed
+        image-line) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line.env"; echo ZZGATEPLANT ;; # FOLDBUILD (B517); no later gate reads image-line.env, so no restore is owed
+        mbench-selftest) sed -i 's/, r"-> FLICKER"\]/]/' "$C/unaos/scripts/mbench.py"; echo "SELF-TEST FAIL" ;; # TOOLING1: a default FORBID dropped from DEFAULT_FORBIDS — every spec silently stops forbidding it (renaming RC_TRUNCATED was tried first and MISSED: the self-test compares against the constant, so it moves with it)
+        specscore)  sed -i 's/^    return DEAD, (f"the only site/    return WIRE, (f"the only site/' "$C/unaos/scripts/orin-specscore.py"; echo "SPECSCORE SELF-TEST FAIL" ;; # TOOLING1: a compiled-out emitter read as reachable — the coverage lie the tool exists to catch
         *) return 1 ;;
     esac
 }
@@ -13926,7 +13935,7 @@ gates_selftest() {
     for p in $GATES_SET; do
         n="${p%%:*}"; plants=$((plants+1)); log="$C/.gate-$n.log"
         rm -rf "$C.bak"; mkdir -p "$C.bak"
-        cp -p "$C/docs/dev/STATUS.tsv" "$C/unaos/libs/sys/midden_core/src/lib.rs" "$C/unaos/scripts/banner-cert.sh" "$C/unaos/arroyo" "$C.bak/"
+        cp -p "$C/docs/dev/STATUS.tsv" "$C/unaos/libs/sys/midden_core/src/lib.rs" "$C/unaos/scripts/banner-cert.sh" "$C/unaos/arroyo" "$C/unaos/scripts/mbench.py" "$C/unaos/scripts/orin-specscore.py" "$C.bak/"
         tok="$(_gates_plant "$C" "$n")" || tok=""
         rc=0; line="$(_gates_one "$C" "$n" "$log")" || rc=$?
         if [ -n "$tok" ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ] && LC_ALL=C grep -a -q -F -- "$tok" "$log"; then
@@ -13936,7 +13945,7 @@ gates_selftest() {
         fi
         rm -f "$C"/unaos/crates/kernel/src/video/zz_gateplant_*.rs; rm -rf "$C/zzgateplant"
         cp -p "$C.bak/STATUS.tsv" "$C/docs/dev/"; cp -p "$C.bak/lib.rs" "$C/unaos/libs/sys/midden_core/src/"
-        cp -p "$C.bak/banner-cert.sh" "$C/unaos/scripts/"; cp -p "$C.bak/arroyo" "$C/unaos/"
+        cp -p "$C.bak/banner-cert.sh" "$C.bak/mbench.py" "$C.bak/orin-specscore.py" "$C/unaos/scripts/"; cp -p "$C.bak/arroyo" "$C/unaos/"
     done
     rm -rf "$C.bak"
     echo "GATEPATH selftest: plants=${plants} caught=${caught} -> $([ "$caught" -eq "$plants" ] && echo PASS || echo FAIL)"
