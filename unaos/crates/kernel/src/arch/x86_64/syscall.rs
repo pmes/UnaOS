@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), // CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), // RING3PIPE (B562): the launcher's read of its child's console, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1, a2), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -9626,7 +9626,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
             (unsafe { core::str::from_utf8_unchecked(&bytes[..v]) }, v as u64)
         }
     };
-    crate::serial_line::emit_user(row, text);
+    pipe_feed_write(row, text.as_bytes()); crate::serial_line::emit_user(row, text); // RING3PIPE (B562): a launcher's pipe takes the bytes too (file tail). ⚠ LINE-NEUTRAL fold.
     written as i64
 }
 
@@ -16969,7 +16969,7 @@ pub fn run_user_image_argv(
 /// runs the BGRUN-SCAV sweep before refusing, reclaiming `bg_owned` rows that exited and were never
 /// reaped. So a shell that never runs `jobs` loses exit STATUSES, not launch capacity.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, false, &[], None)
+    spawn_user_image_bg_inner(bytes, false, &[], None, None)
 }
 
 /// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
@@ -16986,17 +16986,17 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 /// and has exactly one caller — and it is `wc`-gated, because that caller is.
 #[cfg(feature = "wc")]
 pub fn spawn_user_image_bg_no_autofocus(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, true, &[], None)
+    spawn_user_image_bg_inner(bytes, true, &[], None, None)
 }
 
 fn spawn_user_image_bg_inner(
     bytes: &[u8],
     no_autofocus: bool,
-    argv: &[&str], as_row: Option<usize>,
+    argv: &[&str], as_row: Option<usize>, pipe: Option<usize>,
 ) -> Result<(u64, u64, u64), &'static str> {
     let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists
-    let (mapped, pi) = load_program_common(bytes)?; super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
     // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
     // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
@@ -30093,7 +30093,7 @@ pub fn run_user_image(name: &'static str, bytes: &[u8], deadline_ms: u64) -> Res
 /// RING3ABI2 M2: the background launcher WITH words — `bg <path> a b`, and a bare name that detaches.
 /// `argv[0]` is the word that named the program. Otherwise exactly [`spawn_user_image_bg`].
 pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
-    spawn_user_image_bg_inner(bytes, false, argv, None)
+    spawn_user_image_bg_inner(bytes, false, argv, None, None)
 }
 
 /// RING3ABI2 M3: `SYS_WHOAMI(buf, len)` — who the CALLER's slot runs as. With `login`, a slot stamped
@@ -30781,7 +30781,7 @@ fn sys_spawn_path(path_ptr: u64, path_len: u64, argv_ptr: u64, argc: u64) -> i64
     if !ring3_path_ok(path) {
         return EINVAL;
     }
-    let argc = argc as usize;
+    if argc & !(una_abi::SPAWN_ARGC_MASK | una_abi::SPAWN_FLAGS) != 0 { return EINVAL; } let pipe = argc & una_abi::SPAWN_PIPE != 0; let argc = (argc & una_abi::SPAWN_ARGC_MASK) as usize; // RING3PIPE (B562): the flags ride argc's high half. ⚠ LINE-NEUTRAL fold.
     if argc > una_abi::ARGS_MAX {
         return una_abi::E2BIG;
     }
@@ -30813,7 +30813,7 @@ fn sys_spawn_path(path_ptr: u64, path_len: u64, argv_ptr: u64, argc: u64) -> i64
         }
     }
     let who = attrsurf_principal(row);
-    match spawn_path_checked(path, &words, &who, row) {
+    match spawn_path_checked(path, &words, &who, row, pipe) {
         Ok(pid) => pid as i64,
         Err((e, why)) => {
             serial_println!("[spawnpath] path={} principal={} argc={} -> refused={} errno={}", path, who, words.len(), why, e);
@@ -30824,7 +30824,7 @@ fn sys_spawn_path(path_ptr: u64, path_len: u64, argv_ptr: u64, argc: u64) -> i64
 
 /// RING3EXEC: the shell's checks on `path` as `who`, APPTRUST's door, then `bg`'s body under the caller's
 /// principal (see the block above). `Ok(pid)` once the child is spawned.
-fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, row: usize) -> Result<u64, (i64, &'static str)> {
+fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, row: usize, pipe: bool) -> Result<u64, (i64, &'static str)> {
     use crate::fs::vfs::{NodeKind, VfsError};
     let mt = crate::shell::vfs_mount_table();
     let st = mt.open_read(path, who).map_err(|e| (crate::fs::attrsys::errno_of(&e), if matches!(e, VfsError::Denied) { "acl-read" } else { "open" }))?;
@@ -30858,11 +30858,11 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ro
     }
     let note = super::elf::app_flags(&bytes);
     let argv: alloc::vec::Vec<&str> = words.iter().map(|s| s.as_str()).collect();
-    crate::prof::launching(path);
-    match spawn_user_image_bg_inner(&bytes, false, &argv, Some(row)) {
+    let pipe_idx = pipe_reserve(pipe, row).map_err(|why| (EAGAIN, why))?; crate::prof::launching(path); // RING3PIPE (B562): reserved BEFORE a slot exists, so a full table refuses the launch, not the pipe. ⚠ LINE-NEUTRAL fold.
+    match spawn_user_image_bg_inner(&bytes, false, &argv, Some(row), pipe_idx) {
         Ok((pid, slot, entry)) => {
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), path);
-            crate::fs::appres::sight(path);
+            crate::fs::appres::sight(path); pipe_named(pipe_idx, pid); // RING3PIPE (B562): the pid names the pipe. ⚠ LINE-NEUTRAL fold.
             serial_println!(
                 "[spawnpath] path={} principal={} bytes={} note={} pid={} slot={} entry={:#x} argc={} -> started",
                 path, who, bytes.len(), note, pid, slot, entry, argv.len()
@@ -30870,7 +30870,7 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ro
             Ok(pid)
         }
         Err(why) => {
-            serial_println!("[spawnpath] path={} loader={}", path, why);
+            if let Some(i) = pipe_idx { crate::pipe::release(i); } serial_println!("[spawnpath] path={} loader={}", path, why); // RING3PIPE (B562): the reserved pipe goes with the refused launch. ⚠ LINE-NEUTRAL fold.
             Err((if why.contains("args page") { una_abi::E2BIG } else { EAGAIN }, "loader"))
         }
     }
@@ -31208,4 +31208,77 @@ pub fn prefchanged_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
         return None;
     }
     busx_mbox_pop(row).map(|m| m.frame)
+}
+
+// =================================================================================================
+// RING3PIPE (rmbp-ledger B562) — this arch's half of una-abi's RING3PIPE block: `SYS_SPAWN_PATH`'s SPAWN_PIPE flag
+// and `SYS_PIPE_READ` (70) over the arch-neutral table in `crate::pipe`. TAIL-APPENDED; above this block the arc is
+// same-line folds only: the dispatch arm (beside SYS_CURSOR_SHAPE), `sys_write`'s Console path (`pipe_feed_write`
+// before `emit_user`), `sys_spawn_path`'s argc split, `spawn_path_checked`'s reserve / name / release, and
+// `spawn_user_image_bg_inner`'s `pipe` argument (bound right after `load_program_common`, before the task exists).
+//
+// * A pipe's KEY is the process slot (`caller_row()`; the shared kernel row for a shared-window caller) and its
+//   GENERATION is `SLOT_GEN` — bumped at the top of `clear_handle_row`, i.e. at the slot's teardown, which the
+//   scheduler runs when the last thread exits (`sched.rs` "Last holder: free the slot"). So the child is alive while
+//   its row still carries the generation bound at launch, a reused slot never writes into the old tenant's pipe, and
+//   the launcher's own death is seen the same way (its pipes are reclaimed at the next reserve).
+// * Every read goes through `peek` (never allocates): `pipe_feed_write` runs on every console write of every program.
+// =================================================================================================
+
+/// RING3PIPE: `row`'s tenant generation (0 for a row never touched).
+fn pipe_gen(row: usize) -> u64 {
+    SLOT_GEN.peek(row).map_or(0, |g| g.load(Ordering::Acquire))
+}
+
+/// RING3PIPE: is the tenant `(row, tgen)` still the one in `row`?
+fn pipe_alive(row: usize, tgen: u64) -> bool {
+    row < SLOT_GEN.len() && pipe_gen(row) == tgen
+}
+
+/// RING3PIPE: reserve a pipe for the launcher `row` when `want` (SPAWN_PIPE); `Ok(None)` without the flag.
+fn pipe_reserve(want: bool, row: usize) -> Result<Option<usize>, &'static str> {
+    if !want {
+        return Ok(None);
+    }
+    crate::pipe::reserve(row, pipe_gen(row), pipe_alive).map(Some)
+}
+
+/// RING3PIPE: the spawn answered `pid` — it names the reserved pipe.
+fn pipe_named(idx: Option<usize>, pid: u64) {
+    if let Some(i) = idx {
+        crate::pipe::set_pid(i, pid);
+    }
+}
+
+/// RING3PIPE: `sys_write`'s Console path — the bytes into the writer's pipe, if a launcher attached one.
+fn pipe_feed_write(row: usize, bytes: &[u8]) {
+    crate::pipe::feed(row, pipe_gen(row), bytes);
+}
+
+/// RING3PIPE: `SYS_PIPE_READ(pid, buf, len)` — see una-abi's block. The destination is validated WRITABLE before
+/// anything is taken off the ring, so a bad pointer is -EFAULT with no byte lost.
+fn sys_pipe_read(pid: u64, buf: u64, len: u64) -> i64 {
+    use crate::pipe::Read;
+    let row = caller_row();
+    let n = (len as usize).min(una_abi::PIPE_RING_BYTES);
+    if n > 0 {
+        if let Err(e) = user_range_ok(buf, n as u64, UserAccess::Write) {
+            return e;
+        }
+    }
+    let mut k = alloc::vec![0u8; n];
+    match crate::pipe::read(row, pipe_gen(row), pid, &mut k, pipe_alive) {
+        Read::Data(c) => match copy_to_user(buf, &k[..c]) {
+            Ok(()) => c as i64,
+            Err(e) => e,
+        },
+        Read::Eof(..) => 0,
+        Read::Empty => EAGAIN,
+        Read::Dropped(d) => d as i64,
+        Read::NoPipe => una_abi::EBADF,
+        Read::NotYours => {
+            serial_println!("[pipe] read pid={} row={} -> refused=not-the-launcher", pid, row);
+            EACCES
+        }
+    }
 }

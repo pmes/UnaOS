@@ -344,3 +344,5 @@ pub mod aether;
 #[cfg(feature = "sonde")] pub mod sonde; // REALSENSE (LEDGER SR92, R112): `tests sonde` — the D435i census fixture (three streaming functions, the depth XU, the HID interface), the XU/HW-monitor builders, and the boot's D400 record read back. Tail statement, so no existing line moves.
 // POINTERFEEL (rmbp-ledger B535, R103 §2): `tests pointerfeel` — the trackpad's real report stream under a finger, its gaps named by holder; the mode re-assert bound; the login gap's holder. Tail statement, so no existing line moves.
 pub mod pointerfeel;
+// RING3PIPE (rmbp-ledger B562): a launcher reads its child's console output — the arch-neutral pipe table `SYS_SPAWN_PATH`'s SPAWN_PIPE and `SYS_PIPE_READ` meet in. Tail statement, so no existing line moves.
+pub mod pipe;

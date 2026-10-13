@@ -22,7 +22,14 @@
 //! is a second one for the length of the test, which is safe while no operator types into the new window (the
 //! QEMU lanes have no keyboard input; on the bench, do not type during `tests midden`).
 //!
-//! WITNESS. `:: MIDDENAPP: image=/apps/MIDDEN.ELF window=<elf|fixed|bad> lines=<n> plan=<verb> -> PASS|FAIL ::`
+//! RING3PIPE (rmbp-ledger B562) — THE RUN DRIVE, between `help` and `ls`: [`RUN_LINE`]⏎ — the program's `run` launches
+//! `/apps/MIDDEN.ELF -c help` (a second MIDDEN.ELF in its windowless one-shot mode) with SYS_SPAWN_PATH's SPAWN_PIPE;
+//! the child writes the core's help to its console and exits, and the shell's `pump` drains the pipe into its
+//! scrollback line by line, then says `:: MIDDEN: pipe eof ok=1 …` only when at least one line arrived and none was
+//! dropped — the watched prefix [`W_RUN`] (the child prints no `pipe` line: only the launcher reads a pipe). The
+//! status then carries cmds=3 (help, run, ls), the last plan still `Host ls`.
+//!
+//! WITNESS. `:: MIDDENAPP: image=/apps/MIDDEN.ELF window=<elf|fixed|bad> lines=<n> plan=<verb> run=<ok|step> -> PASS|FAIL ::`
 //! preceded by `[middenapp] …` (pid, slot, timings, the decoded status) and, on FAIL/SKIP, `:: MIDDENAPP:
 //! reason=… ::`. No `MIDDEN.ELF` on the volume is a SKIP (the builder stages it; a bare kernel has none).
 
@@ -36,6 +43,10 @@ const PLANNED: &str = ":: MIDDEN: plan=";
 const START_MS: u64 = 20_000;
 const LINE_MS: u64 = 5_000;
 const EXIT_MS: u64 = 5_000;
+/// RING3PIPE (B562): the Run drive's line (Enter included) and the watched EOF prefix; the child loads off the volume.
+const RUN_LINE: &[u8] = b"run /apps/MIDDEN.ELF -c help\n";
+const W_RUN: &str = ":: MIDDEN: pipe eof ok=1 ";
+const RUN_MS: u64 = 10_000;
 
 /// Register `tests midden` once (`tests::ensure_shellux`'s line; `tests-at-boot` runs it there).
 pub fn ensure() {
@@ -47,7 +58,12 @@ pub fn ensure() {
 }
 
 fn verdict(window: &str, lines: u32, plan: &str, v: &str) {
-    serial_println!(":: MIDDENAPP: image={} window={} lines={} plan={} -> {} ::", IMAGE, window, lines, plan, v);
+    verdict_run(window, lines, plan, "unrun", v)
+}
+
+/// RING3PIPE: the witness with the Run drive's word.
+fn verdict_run(window: &str, lines: u32, plan: &str, run: &str, v: &str) {
+    serial_println!(":: MIDDENAPP: image={} window={} lines={} plan={} run={} -> {} ::", IMAGE, window, lines, plan, run, v);
 }
 
 fn why(r: &str) {
@@ -140,8 +156,25 @@ pub fn selftest() {
     let started = wait_line(pid, START_MS);
     let mut typed = [None::<u64>; 2];
     let mut fail: Option<&'static str> = started.err();
+    let mut run: &'static str = "unrun";
+    let mut run_ms: Option<u64> = None;
     if fail.is_none() {
         for (i, l) in [&b"help\n"[..], &b"ls\n"[..]].iter().enumerate() {
+            if i == 1 {
+                // RING3PIPE (B562): the Run drive, between `help` and `ls` — the child's output through the pipe.
+                crate::serial_line::line_watch_arm(W_RUN);
+                if !type_line(slot, RUN_LINE) {
+                    run = "input-ring-full";
+                } else {
+                    match wait_line(pid, RUN_MS) {
+                        Ok(ms) => {
+                            run = "ok";
+                            run_ms = Some(ms);
+                        }
+                        Err(e) => run = e,
+                    }
+                }
+            }
             crate::serial_line::line_watch_arm(PLANNED);
             if !type_line(slot, l) {
                 fail = Some("input-ring-full");
@@ -189,12 +222,16 @@ pub fn selftest() {
         "[middenapp] pid={} slot={} entry={:#x} start_ms={:?} help_ms={:?} ls_ms={:?} status={:?} rows={} cmds={} kind={} verb={} window_ok={} face={} kill={}",
         pid, slot, entry, started.ok(), typed[0], typed[1], status, rows, cmds, midden_core::ring3::kind_name(kind), verb, win_ok, face, killed
     );
+    serial_println!("[middenapp] run={} run_ms={:?} line={}", run, run_ms, core::str::from_utf8(RUN_LINE).unwrap_or("?").trim_end());
     let help_rows = midden_core::help(&midden_core::Facts::ring3(true)).lines().count() as u32;
-    let ok = fail.is_none() && status.is_some() && win_ok && cmds == 2 && kind == 2 && verb == "ls" && rows > help_rows;
+    let base = fail.is_none() && status.is_some() && win_ok && cmds == 3 && kind == 2 && verb == "ls" && rows > help_rows;
+    let ok = base && run == "ok";
     if let Some(r) = fail {
         why(r);
+    } else if !base {
+        serial_println!(":: MIDDENAPP: reason=status-mismatch (want cmds=3 kind=Host verb=ls rows>{}) ::", help_rows);
     } else if !ok {
-        serial_println!(":: MIDDENAPP: reason=status-mismatch (want cmds=2 kind=Host verb=ls rows>{}) ::", help_rows);
+        serial_println!(":: MIDDENAPP: reason=run-mismatch (run={}: want `{}` from `run`'s pipe) ::", run, W_RUN.trim_end());
     }
-    verdict(window, rows, verb, if ok { "PASS" } else { "FAIL" });
+    verdict_run(window, rows, verb, run, if ok { "PASS" } else { "FAIL" });
 }

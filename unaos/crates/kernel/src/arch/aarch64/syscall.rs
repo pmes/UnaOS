@@ -6871,7 +6871,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), una_abi::SYS_SBRK => super::xwin::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), // CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), // RING3PIPE (B562): refused by name on this arch, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_LISTEN => net6_sys_listen(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_ACCEPT => net6_sys_accept(a0), // ARMRESOLVE (B560): SYS_LISTEN 47 / SYS_ACCEPT 48, the passive half x86 has answered since SOCK-6/SOCK-7, same fold, bodies at the FILE TAIL. NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
@@ -26380,4 +26380,19 @@ fn net6_sys_accept(handle: u64) -> i64 {
         crate::net_phy::net6::AcceptOutcome::Pending => NET6_EAGAIN,
         crate::net_phy::net6::AcceptOutcome::NotListening => EINVAL,
     }
+}
+
+// =================================================================================================
+// RING3PIPE (rmbp-ledger B562) — `SYS_PIPE_READ` (70, una-abi's RING3PIPE block) on this arch: REFUSED BY NAME. A pipe
+// is created only by `SYS_SPAWN_PATH`'s SPAWN_PIPE flag, and this arch's ring-3 launch path has no spawn-by-path
+// (`run_user_image` is the kernel shell's foreground door; `SYS_SPAWN_PATH` falls to the `_ => -38` arm), so no
+// launcher here can hold a pipe and none can be read. The verb answers -ENOSYS with its reason on the wire instead of
+// the silent default, so a program written against the pair learns why. TAIL-APPENDED; the dispatch arm is a
+// same-line fold beside SYS_CURSOR_SHAPE.
+// =================================================================================================
+
+/// RING3PIPE: `SYS_PIPE_READ(pid, buf, len)` — `-ENOSYS`, said once per call with the caller's ASID.
+fn sys_pipe_read(pid: u64, _buf: u64, _len: u64) -> i64 {
+    serial_println!("[pipe] read pid={} asid={} -> refused=no-launch-pipe (this arch has no SYS_SPAWN_PATH to attach one)", pid, current_asid());
+    una_abi::ENOSYS
 }

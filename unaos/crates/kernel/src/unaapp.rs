@@ -63,9 +63,17 @@
 //! [`TRASH_SRC`] byte-exact with the same object id, and carries `una:trash-origin` = the old path (trash_core's
 //! record on the object). With no session `<home>/.Trash` = `/home/.Trash` is laid (kernel authority, when absent) so
 //! the drive does not hang on `/home`'s ACL. `[unaapp] trash=<ok|bad|skip|step> id=<same|moved|n/a> home=<h> …`.
+//! RING3PIPE (rmbp-ledger B562) — THE RUN DRIVE, on any root, after the IDE drives and before legs 1–3: Ctrl+3 (the
+//! KEY_CTRL_DIGIT press and its bare release), [`RUN_LINE`] typed into the console WITHOUT Enter, then Ctrl+R (0x12) —
+//! the IDE's Run verb takes the typed line (no `.run` exists beside the fixture) through the console's `run`, which
+//! launches `/apps/MIDDEN.ELF -c help` with SYS_SPAWN_PATH's SPAWN_PIPE. MIDDEN.ELF's one-shot mode writes the core's
+//! help to its console and exits; the console's `pump` drains the pipe into the pane line by line and, at EOF, says
+//! `:: UNA: pipe eof ok=1 …` only when at least one line reached the pane and none was dropped — the watched prefix
+//! [`W_RUN`]. The status then carries cmds=2 (the run, then `help`), the last plan still `Say help`. No MIDDEN.ELF on the
+//! volume is `run=skip` (the drive is not attempted; cmds=1 as before).
 //!
 //! WITNESS. `:: UNAAPP: image=/apps/UNA.ELF window=<elf|fixed|bad> panes=<n> lines=<n> saved=<1|0|skip>
-//! highlight=<n> ide=<ok|skip|step> -> PASS|FAIL|SKIP ::` preceded by `[unaapp] …` (pid, slot, timings, the decoded status, the bytes
+//! highlight=<n> ide=<ok|skip|step> run=<ok|skip|unrun|timeout|…> -> PASS|FAIL|SKIP ::` preceded by `[unaapp] …` (pid, slot, timings, the decoded status, the bytes
 //! check, the ACL leg) and, on FAIL/SKIP, `:: UNAAPP: reason=… ::`. No `UNA.ELF` on the volume is a SKIP (the
 //! builder stages it; a bare kernel has none).
 
@@ -101,6 +109,12 @@ const W_RENAME: &str = ":: UNA: tree op=rename path=/var/tmp/una/fix2.txt to=/va
 const TRASH_FIX_DIR: &str = ".una-trashfix";
 const TRASH_LEAF: &str = "unatrash.txt";
 const TRASH_SRC: &[u8] = b"trash me\n";
+/// RING3PIPE (B562): the Run drive — the line typed into the console, the child it launches, the watched EOF prefix.
+const RUN_LINE: &[u8] = b"run /apps/MIDDEN.ELF -c help";
+const RUN_CHILD: &str = "MIDDEN.ELF";
+const W_RUN: &str = ":: UNA: pipe eof ok=1 ";
+/// The child loads off the volume, plans one line and exits; the pane reads it at frame pace.
+const RUN_MS: u64 = 10_000;
 /// UNAMETAL2: the ACL leg's probe — a name under ROOTACL's `system` tree `/apps`, which `anon` may not create.
 const ACL_PROBE: &str = "/apps/UNAPROBE.TXT";
 /// The window, one mono face off the volume and the workspace's first listing come before the start line.
@@ -138,12 +152,14 @@ const fn status_parse(s: i32) -> (u32, u32, u32, u8, u32, bool, bool, bool, u32)
 }
 
 fn verdict(window: &str, panes: u32, lines: u32, saved: &str, spans: u32, v: &str) {
-    verdict_ide(window, panes, lines, saved, spans, "skip", v)
+    verdict_ide(window, panes, lines, saved, spans, "skip", "skip", v)
 }
 
-/// UNAIDE2: the witness with the IDE drives' word (`ok`, `skip`, or the step that failed).
-fn verdict_ide(window: &str, panes: u32, lines: u32, saved: &str, spans: u32, ide: &str, v: &str) {
-    serial_println!(":: UNAAPP: image={} window={} panes={} lines={} saved={} highlight={} ide={} -> {} ::", IMAGE, window, panes, lines, saved, spans, ide, v);
+/// UNAIDE2: the witness with the IDE drives' word (`ok`, `skip`, or the step that failed); RING3PIPE: and the Run
+/// drive's.
+#[allow(clippy::too_many_arguments)]
+fn verdict_ide(window: &str, panes: u32, lines: u32, saved: &str, spans: u32, ide: &str, run: &str, v: &str) {
+    serial_println!(":: UNAAPP: image={} window={} panes={} lines={} saved={} highlight={} ide={} run={} -> {} ::", IMAGE, window, panes, lines, saved, spans, ide, run, v);
 }
 
 /// UNAMETAL2: lay [`FIX_PATH`] = [`FIX_SRC`] with KERNEL authority (missing directories made, an old file replaced).
@@ -382,6 +398,21 @@ fn ide_drives(pid: u64, slot: u64) -> Result<[u64; 7], &'static str> {
     Ok(ms)
 }
 
+/// RING3PIPE (B562): the Run drive (module doc) — Ctrl+3, the line typed, Ctrl+R; waited on [`W_RUN`].
+fn run_drive(pid: u64, slot: u64) -> Result<u64, &'static str> {
+    use una_abi::{INPUT_EV_KEY_DOWN as D, INPUT_EV_KEY_UP as U, KEY_CTRL_DIGIT};
+    crate::serial_line::line_watch_arm(W_RUN);
+    let mut ev = alloc::vec![(D, KEY_CTRL_DIGIT | 3), (U, b'3')];
+    ev.extend(RUN_LINE.iter().map(|&b| (D, b)));
+    ev.push((D, 0x12));
+    for (ty, b) in ev {
+        if !push(slot, ty, b) {
+            return Err("input-ring-full");
+        }
+    }
+    wait_line(pid, RUN_MS)
+}
+
 pub fn selftest() {
     let Ok(fs) = crate::fs::rootdisk::program_source() else {
         why("no-program-volume");
@@ -415,6 +446,8 @@ pub fn selftest() {
     };
     let window = if plan.model_elf { "elf" } else { "fixed" };
     let note = midden_core::app_note_flags(&img);
+    // RING3PIPE: the Run drive's child must be on the volume, or the drive is skipped.
+    let child = fs.find_app(RUN_CHILD).map_or(false, |de| de.size != 0);
     if !plan.model_elf {
         why("not-the-elf-model");
         return verdict(window, 0, 0, "skip", 0, "FAIL");
@@ -486,6 +519,18 @@ pub fn selftest() {
             Err(step) => ide = step,
         }
     }
+    // RING3PIPE: the Run drive — the launched program's output into the console pane through its pipe.
+    let mut run: &'static str = if child { "unrun" } else { "skip" };
+    let mut run_ms: Option<u64> = None;
+    if fail.is_none() && child {
+        match run_drive(pid, slot) {
+            Ok(ms) => {
+                run = "ok";
+                run_ms = Some(ms);
+            }
+            Err(e) => run = e,
+        }
+    }
     if fail.is_none() {
         // Ctrl+3 as the decoder delivers it (a bare release of `3`), then the line into the console.
         crate::serial_line::line_watch_arm(PLANNED);
@@ -548,6 +593,7 @@ pub fn selftest() {
         trash_word,
         trash_id
     );
+    serial_println!("[unaapp] run={} run_ms={:?} line={}", run, run_ms, core::str::from_utf8(RUN_LINE).unwrap_or("?"));
     serial_println!(
         "[unaapp] ide={} ms(open2,switch,find,goto,switch2,replace,save2)={:?} bytes2={}",
         ide,
@@ -560,19 +606,23 @@ pub fn selftest() {
         if laid.is_err() { "n/a" } else if bytes_ok { "ok" } else { "bad" }, acl, killed
     );
     let help_rows = midden_core::help(&midden_core::Facts::ring3(true)).lines().count() as u32;
-    let base = fail.is_none() && status.is_some() && win_ok && panes == PANES && cmds == 1 && kind == 1 && verb == "help" && rows > help_rows;
+    let want_cmds = if child { 2 } else { 1 };
+    let base = fail.is_none() && status.is_some() && win_ok && panes == PANES && cmds == want_cmds && kind == 1 && verb == "help" && rows > help_rows;
+    let run_ok = !child || run == "ok";
     let save_ok = laid.is_err() || (saved && bytes_ok && spans > 0);
     let ide_ok = laid.is_err() || (ide == "ok" && bytes2_ok && rename_ok && id_word == "same" && trash_word == "ok");
-    let ok = base && save_ok && ide_ok;
+    let ok = base && save_ok && ide_ok && run_ok;
     if let Some(r) = fail {
         why(r);
     } else if !base {
-        serial_println!(":: UNAAPP: reason=status-mismatch (want panes=3 cmds=1 kind=Say verb=help rows>{}) ::", help_rows);
+        serial_println!(":: UNAAPP: reason=status-mismatch (want panes=3 cmds={} kind=Say verb=help rows>{}) ::", want_cmds, help_rows);
     } else if !save_ok {
         serial_println!(":: UNAAPP: reason=save-mismatch (want saved=1 bytes=ok highlight>0 at {}) ::", FIX_PATH);
     } else if !ide_ok {
         serial_println!(":: UNAAPP: reason=ide-mismatch (step={} bytes2={} at {} rename={} id={} trash={}) ::", ide, if bytes2_ok { "ok" } else { "bad" }, MOVED_PATH, rename_ok, id_word, trash_word);
+    } else if !run_ok {
+        serial_println!(":: UNAAPP: reason=run-mismatch (run={}: want `{}` from the Run verb's pipe) ::", run, W_RUN.trim_end());
     }
     let saved_word = if laid.is_err() { "skip" } else if saved { "1" } else { "0" };
-    verdict_ide(window, panes, rows, saved_word, spans, ide, if ok { "PASS" } else { "FAIL" });
+    verdict_ide(window, panes, rows, saved_word, spans, ide, run, if ok { "PASS" } else { "FAIL" });
 }
