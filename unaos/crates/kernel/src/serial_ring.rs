@@ -1948,8 +1948,8 @@ fn draincap_wire(s: &str) {
 
 /// DRAINCAP, once per boot. Called from [`mirror_service`].
 #[cfg(feature = "witness")]
-fn draincap_selftest() {
-    if DRAINCAP_DONE.swap(true, Ordering::Relaxed) {
+fn draincap_selftest() { if crate::tests::defer_polled("draincap", draincap_body, &DRAINCAP_DONE) { return; } draincap_body() } #[cfg(feature = "witness")] fn draincap_body() { // BOOTVERDICTS2 (rmbp-ledger B616, R80): the poll registers `tests draincap` and returns; the body runs when `tests` runs it (and from this poll, once, under `tests-at-boot`). LINE-NEUTRAL fold onto the signature line, before its first `//`: the body keeps its lines.
+    if DRAINCAP_DONE.swap(true, Ordering::Relaxed) && cfg!(feature = "tests-at-boot") {
         return;
     }
     if uart_absent() {
@@ -2095,8 +2095,8 @@ const BPRESS_PROBE: &str =
 
 /// SERWIT-1B PARITY, once per boot. Called from [`mirror_service`].
 #[cfg(feature = "witness")]
-fn backpressure_selftest() {
-    if BACKPRESSURE_DONE.swap(true, Ordering::Relaxed) {
+fn backpressure_selftest() { if crate::tests::defer_polled("serwit1b", backpressure_body, &BACKPRESSURE_DONE) { return; } backpressure_body() } #[cfg(feature = "witness")] fn backpressure_body() { // BOOTVERDICTS2 (rmbp-ledger B616, R80): the poll registers `tests serwit1b` and returns; the body runs when `tests` runs it (and from this poll, once, under `tests-at-boot`). LINE-NEUTRAL fold onto the signature line, before its first `//`: the body keeps its lines.
+    if BACKPRESSURE_DONE.swap(true, Ordering::Relaxed) && cfg!(feature = "tests-at-boot") {
         return;
     }
     if uart_absent() {
@@ -2237,8 +2237,8 @@ const _: () = assert!(
 
 /// PWRDRAIN, once per boot. Called from [`mirror_service`].
 #[cfg(feature = "witness")]
-fn pwrdrain_selftest() {
-    if PWRDRAIN_DONE.swap(true, Ordering::Relaxed) {
+fn pwrdrain_selftest() { if crate::tests::defer_polled("pwrdrain", pwrdrain_body, &PWRDRAIN_DONE) { return; } pwrdrain_body() } #[cfg(feature = "witness")] fn pwrdrain_body() { // BOOTVERDICTS2 (rmbp-ledger B616, R80): the poll registers `tests pwrdrain` and returns; the body runs when `tests` runs it (and from this poll, once, under `tests-at-boot`). LINE-NEUTRAL fold onto the signature line, before its first `//`: the body keeps its lines.
+    if PWRDRAIN_DONE.swap(true, Ordering::Relaxed) && cfg!(feature = "tests-at-boot") {
         return;
     }
     if uart_absent() {
@@ -2996,8 +2996,8 @@ static SERWIRE_DONE: AtomicBool = AtomicBool::new(false);
 /// SERWIRE, once per boot. Called from [`mirror_service`], LAST — it fills the ring and empties it
 /// again, for the same reason PWRDRAIN states, and it must not run before a fixture that reads it.
 #[cfg(feature = "witness")]
-fn serwire_selftest() {
-    if SERWIRE_DONE.swap(true, Ordering::Relaxed) {
+fn serwire_selftest() { if crate::tests::defer_polled("serwire", serwire_body, &SERWIRE_DONE) { return; } serwire_body() } #[cfg(feature = "witness")] fn serwire_body() { // BOOTVERDICTS2 (rmbp-ledger B616, R80): the poll registers `tests serwire` and returns; the body runs when `tests` runs it (and from this poll, once, under `tests-at-boot`). LINE-NEUTRAL fold onto the signature line, before its first `//`: the body keeps its lines.
+    if SERWIRE_DONE.swap(true, Ordering::Relaxed) && cfg!(feature = "tests-at-boot") {
         return;
     }
     if uart_absent() {
@@ -3431,8 +3431,8 @@ static SERTX_DONE: AtomicBool = AtomicBool::new(false);
 /// traffic (SERWIRE's reason), and unlike SINKDRAIN it reads no other ring's tail, so nothing it does
 /// can be measured by a fixture that has already run.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
-fn sertx_selftest() {
-    if SERTX_DONE.swap(true, Ordering::Relaxed) {
+fn sertx_selftest() { if crate::tests::defer_polled("serialtx", sertx_body, &SERTX_DONE) { return; } sertx_body() } #[cfg(all(target_arch = "x86_64", feature = "witness"))] fn sertx_body() { // BOOTVERDICTS2 (rmbp-ledger B616, R80): the poll registers `tests serialtx` and returns; the body runs when `tests` runs it (and from this poll, once, under `tests-at-boot`). LINE-NEUTRAL fold onto the signature line, before its first `//`: the body keeps its lines.
+    if SERTX_DONE.swap(true, Ordering::Relaxed) && cfg!(feature = "tests-at-boot") {
         return;
     }
     if uart_absent() {

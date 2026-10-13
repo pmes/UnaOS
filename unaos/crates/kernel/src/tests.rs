@@ -503,7 +503,7 @@ pub fn verdicts_selftest() {
     let n = BOOT_VERDICTS.load(Ordering::Relaxed);
     serial_println!(
         ":: VERDICTS: before_deferred={} moved={} reworded={} announced={} tags={} -> {} ::",
-        n, VERDICTS_MOVED, VERDICTS_REWORDED + SMALLFIX7_REWORDED, ANNOUNCED.load(Ordering::Relaxed) as u8, boot_tags(), if n == 0 { "PASS" } else { "FAIL" }
+        n, VERDICTS_MOVED + BOOTVERDICTS2_MOVED, VERDICTS_REWORDED + SMALLFIX7_REWORDED + BOOTVERDICTS2_REWORDED, ANNOUNCED.load(Ordering::Relaxed) as u8, boot_tags(), if n == 0 { "PASS" } else { "FAIL" }
     );
 }
 
@@ -601,4 +601,31 @@ pub fn boot_verdicts() -> (u32, alloc::string::String) {
 /// SMALLFIX7: is a fixture registered by `name`?
 pub fn registered(name: &str) -> bool {
     TABLE.lock().iter().flatten().any(|e| e.0 == name)
+}
+
+// BOOTVERDICTS2 (rmbp-ledger B616, R80) — TAIL-APPENDED. UIREDS26 (B597/B605) read `verdicts=6:sdhc,DRAINCAP,SERWIT-1B,
+// PWRDRAIN,SERWIRE,SERIALTX` on QEMU where the rMBP reads `0:-`: the five serial-ring fixtures ran from
+// `serial_ring::mirror_service`'s first pass and printed PASS on any machine with a 16550, and the SDHC-4b `w2` line
+// printed PASS on any machine whose `w1` ladder passed. The five now register through [`defer_polled`] and run when
+// `tests` runs them; `w2` keeps its boot write (it runs before the card is published, `drivers/sdhc.rs`) and its
+// boot line speaks [`boot_word`], the verdict banked for `tests sdhcw2`.
+
+/// The five serial-ring fixtures BOOTVERDICTS2 moved: `draincap`, `serwit1b`, `pwrdrain`, `serwire`, `serialtx`.
+const BOOTVERDICTS2_MOVED: u32 = 5;
+/// The boot line BOOTVERDICTS2 reworded through [`boot_word`]: `sdhc: w2`.
+const BOOTVERDICTS2_REWORDED: u32 = 1;
+
+/// [`defer`] for a fixture called from a POLL that passes many times (`serial_ring::mirror_service`). The poll never
+/// runs the body: its first pass registers `f` under `name` (the caller's `latch` makes every later pass one swap, no
+/// table scan) and every pass returns `true`. Unlike [`defer_fast`] the registered `f` is a DIFFERENT function from the
+/// polled one, so another core's poll during `tests <name>` cannot run the body a second time beside it. `false` (the
+/// poll runs the body, as before) under `tests-at-boot`, where the caller's own one-shot latch keeps it to one run.
+pub fn defer_polled(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
+    if cfg!(feature = "tests-at-boot") {
+        return false;
+    }
+    if !latch.swap(true, Ordering::AcqRel) {
+        register(name, f);
+    }
+    true
 }
