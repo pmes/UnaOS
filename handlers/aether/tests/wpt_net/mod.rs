@@ -18,6 +18,11 @@
 //!   wrong_accept_key, invalid, origin, echo-cookie, set-cookie, set-cookie_http, handshake_sleep_2,
 //!   referrer, remote-close, delayed-passive-close).
 //!
+//! AETHERWPT2 (SR135) adds the handlers `fetch/api/` calls most (`fetch/api/resources/{redirect,inspect-headers,
+//! clean-stash,stash-put,stash-take,status,method,echo-content,trickle,infinite-slow-response}.py`) and two of
+//! `common/` (`slow.py`, `echo.py`), with wptserve's stash (one process-wide map keyed by key and URL directory,
+//! `take` removes, a second `put` of a live key is an error) behind the stash-using ones.
+//!
 //! Cross-origin hosts (`www`, `alt`) map to `localhost` — a different origin from `127.0.0.1` on the same
 //! loopback — and wss/h2/https variants are not served (no TLS server).
 
@@ -26,6 +31,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// The Python handlers this server re-implements (by path relative to the WPT root).
 pub const PY_HANDLERS: &[&str] = &[
@@ -47,6 +54,19 @@ pub const PY_HANDLERS: &[&str] = &[
     "xhr/resources/requri.py",
     "xhr/resources/corsenabled.py",
     "common/redirect.py",
+    // AETHERWPT2 (SR135)
+    "fetch/api/resources/redirect.py",
+    "fetch/api/resources/inspect-headers.py",
+    "fetch/api/resources/clean-stash.py",
+    "fetch/api/resources/stash-put.py",
+    "fetch/api/resources/stash-take.py",
+    "fetch/api/resources/status.py",
+    "fetch/api/resources/method.py",
+    "fetch/api/resources/echo-content.py",
+    "fetch/api/resources/trickle.py",
+    "fetch/api/resources/infinite-slow-response.py",
+    "common/slow.py",
+    "common/echo.py",
 ];
 
 /// The pywebsocket handlers the WebSocket server re-implements (`/name` = `websockets/handlers/name_wsh.py`).
@@ -217,6 +237,10 @@ fn content_type(path: &Path) -> &'static str {
         Some("txt") => "text/plain",
         Some("event_stream") => "text/event-stream",
         Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
         _ => "application/octet-stream",
     }
 }
@@ -330,6 +354,78 @@ fn any_worker_script(root: &Path, stem: &str) -> Option<Vec<u8>> {
         )
         .into_bytes(),
     )
+}
+
+// ------------------------------------------------------------------------------------------------ stash
+
+/// A value in wptserve's stash: a string (`stash-put.py`) or `redirect.py`'s dictionary.
+#[derive(Clone)]
+enum Stashed {
+    Str(String),
+    Redirect { count: u32, preflight: bool },
+}
+
+/// wptserve's stash: (key, URL directory) → value. Process-wide, as wptserve's is server-wide.
+static STASH: Mutex<Option<HashMap<(String, String), Stashed>>> = Mutex::new(None);
+
+fn stash_take(key: &str, dir: &str) -> Option<Stashed> {
+    STASH.lock().unwrap().get_or_insert_with(HashMap::new).remove(&(key.to_string(), dir.to_string()))
+}
+
+/// `stash.put`: false when the key is already present (wptserve raises StashError).
+fn stash_put(key: &str, dir: &str, v: Stashed) -> bool {
+    let mut g = STASH.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    let k = (key.to_string(), dir.to_string());
+    if m.contains_key(&k) {
+        return false;
+    }
+    m.insert(k, v);
+    true
+}
+
+/// `request.url_parts.path`'s directory with its trailing `/` (the stash's default path).
+fn url_dir(req: &Req) -> String {
+    match req.path.rfind('/') {
+        Some(i) => req.path[..=i].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// Bytes as Python's `isomorphic_decode` sees them (Latin-1), then `urllib.parse.quote_plus` of that `str`
+/// (UTF-8, `+` for a space, `_.-~` and alphanumerics kept).
+fn quote_plus(b: &[u8]) -> String {
+    let s: String = b.iter().map(|&c| c as char).collect();
+    let mut out = String::new();
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => out.push(*byte as char),
+            b' ' => out.push('+'),
+            c => out.push_str(&format!("%{c:02X}")),
+        }
+    }
+    out
+}
+
+/// `urlparse(url).scheme`: the leading `[A-Za-z][A-Za-z0-9+.-]*` before a `:`, lowercased, or "".
+fn url_scheme(u: &str) -> String {
+    match u.find(':') {
+        Some(i) if i > 0 && u.as_bytes()[0].is_ascii_alphabetic() && u[..i].bytes().all(|c| c.is_ascii_alphanumeric() || b"+.-".contains(&c)) => u[..i].to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// The query's (name, first value) pairs in first-seen order (Python's `dict` over `request.GET.items()`).
+fn query_pairs(query: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for kv in query.split('&').filter(|x| !x.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        let (k, v) = (pct(k), pct(v));
+        if !out.iter().any(|(x, _)| *x == k) {
+            out.push((k, v));
+        }
+    }
+    out
 }
 
 fn sleep_ms(ms: u64) {
@@ -524,6 +620,208 @@ fn py(rel: &str, req: &Req, s: &mut TcpStream) -> Option<Option<Resp>> {
             let loc = req.get_str("location").unwrap_or_default();
             Resp::new(status, "Redirect", "", Vec::new()).header("Location", &loc)
         }
+        // ---- AETHERWPT2 (SR135): fetch/api/resources/*.py and common/{slow,echo}.py, from their sources.
+        "fetch/api/resources/redirect.py" => {
+            let dir = url_dir(req);
+            let mut count = 0u32;
+            let mut preflight = false;
+            let mut headers: Vec<(String, String)> = vec![("Content-Type".into(), "text/plain".into()), ("Cache-Control".into(), "no-cache".into()), ("Pragma".into(), "no-cache".into())];
+            match req.header("origin") {
+                Some(o) => {
+                    headers.push(("Access-Control-Allow-Origin".into(), o.to_string()));
+                    headers.push(("Access-Control-Allow-Credentials".into(), "true".into()));
+                }
+                None => headers.push(("Access-Control-Allow-Origin".into(), "*".into())),
+            }
+            let token = req.get_str("token");
+            if let Some(t) = &token {
+                if let Some(Stashed::Redirect { count: c, preflight: p }) = stash_take(t, &dir) {
+                    count = c;
+                    preflight = p;
+                }
+            }
+            let resp = |status: u16, headers: Vec<(String, String)>, body: Vec<u8>| Resp { status, reason: if status == 200 { "OK".into() } else { "Redirect".into() }, headers, body };
+            if req.method == "OPTIONS" {
+                if let Some(h) = req.get_str("allow_headers") {
+                    headers.push(("Access-Control-Allow-Headers".into(), h));
+                }
+                preflight = true;
+                if req.get("redirect_preflight").is_none() {
+                    if let Some(t) = &token {
+                        stash_put(t, &dir, Stashed::Redirect { count, preflight });
+                    }
+                    return Some(Some(resp(200, headers, Vec::new())));
+                }
+            }
+            let form = String::from_utf8_lossy(&req.body).into_owned();
+            let status: u16 = req
+                .get_str("redirect_status")
+                .or_else(|| query_pairs(&form).into_iter().find(|(k, _)| k == b"redirect_status").map(|(_, v)| String::from_utf8_lossy(&v).into_owned()))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(302);
+            count += 1;
+            if let Some(loc) = req.get("location") {
+                let mut url: String = loc.iter().map(|&c| c as char).collect();
+                if req.get("simple").is_none() && matches!(url_scheme(&url).as_str(), "" | "http" | "https") {
+                    url.push(if url.contains('?') { '&' } else { '?' });
+                    let enc: Vec<String> = query_pairs(&req.query).iter().map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v))).collect();
+                    url.push_str(&enc.join("&"));
+                    url.push_str(&format!("&count={count}"));
+                }
+                headers.push(("Location".into(), url));
+            }
+            if let Some(p) = req.get_str("redirect_referrerpolicy") {
+                headers.push(("Referrer-Policy".into(), p));
+            }
+            if let Some(d) = req.get_str("delay").and_then(|v| v.parse::<f64>().ok()) {
+                sleep_ms(d as u64);
+            }
+            if let Some(t) = &token {
+                stash_put(t, &dir, Stashed::Redirect { count, preflight });
+                if let Some(max) = req.get_str("max_count").and_then(|v| v.parse::<u32>().ok()) {
+                    if count > max {
+                        return Some(Some(Resp::new(200, "OK", "text/html", (count - 1).to_string().into_bytes())));
+                    }
+                }
+            }
+            resp(status, headers, Vec::new())
+        }
+        "fetch/api/resources/inspect-headers.py" => {
+            let mut r = Resp::new(200, "OK", "", Vec::new());
+            let checked: Vec<String> = req.get_str("headers").map(|h| h.split('|').map(str::to_string).collect()).unwrap_or_default();
+            for h in &checked {
+                if let Some(v) = req.header(h) {
+                    r = r.header(&format!("x-request-{h}"), v);
+                }
+            }
+            if req.get("cors").is_some() {
+                r = r.header("Access-Control-Allow-Origin", req.header("origin").unwrap_or("*"));
+                r = r.header("Access-Control-Allow-Credentials", "true").header("Access-Control-Allow-Methods", "GET, POST, HEAD");
+                let exposed: Vec<String> = checked.iter().map(|h| format!("x-request-{h}")).collect();
+                r = r.header("Access-Control-Expose-Headers", &exposed.join(", "));
+                let allow = req.get_str("allow_headers").unwrap_or_else(|| req.headers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>().join(", "));
+                r = r.header("Access-Control-Allow-Headers", &allow);
+            }
+            r.header("content-type", "text/plain")
+        }
+        "fetch/api/resources/clean-stash.py" => {
+            let token = req.get_str("token").unwrap_or_default();
+            let hit = stash_take(&token, &url_dir(req)).is_some();
+            Resp::new(200, "OK", "text/html", if hit { b"1".to_vec() } else { b"0".to_vec() })
+        }
+        "fetch/api/resources/stash-put.py" => {
+            if req.method == "OPTIONS" {
+                return Some(Some(
+                    Resp::new(200, "OK", "text/html", b"done".to_vec())
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Methods", "*")
+                        .header("Access-Control-Allow-Headers", "*"),
+                ));
+            }
+            let mut r = Resp::new(200, "OK", "text/html", b"done".to_vec());
+            if req.get("disallow_cross_origin").is_none() {
+                r = r.header("Access-Control-Allow-Origin", "*");
+            } else {
+                let host_origin = format!("http://{}", req.header("host").unwrap_or(""));
+                let same = req.get("mode").as_deref() == Some(b"no-cors") || req.get_str("frame_origin").as_deref() == Some(host_origin.as_str());
+                if !same {
+                    return Some(Some(Resp::new(200, "OK", "text/html", b"not stashing for cors request".to_vec())));
+                }
+            }
+            let key = req.get_str("key").unwrap_or_default();
+            let value: String = req.get("value").unwrap_or_default().iter().map(|&c| c as char).collect();
+            if !stash_put(&key, &url_dir(req), Stashed::Str(value)) {
+                return Some(Some(Resp::new(500, "Internal Server Error", "text/plain", b"StashError: key already exists".to_vec())));
+            }
+            r
+        }
+        "fetch/api/resources/stash-take.py" => {
+            let key = req.get_str("key").unwrap_or_default();
+            let body = match stash_take(&key, &url_dir(req)) {
+                Some(Stashed::Str(v)) => serde_json::to_string(&v).unwrap_or_else(|_| "null".into()),
+                Some(Stashed::Redirect { count, preflight }) => format!("{{\"count\": {count}, \"preflight\": \"{}\"}}", if preflight { 1 } else { 0 }),
+                None => "null".into(),
+            };
+            Resp::new(200, "OK", "application/json", body.into_bytes()).header("Access-Control-Allow-Origin", "*")
+        }
+        "fetch/api/resources/status.py" => {
+            let code: u16 = req.get_str("code").and_then(|v| v.parse().ok()).unwrap_or(200);
+            let text = req.get_str("text").unwrap_or_else(|| "OMG".into());
+            let mut r = Resp::new(code, &text, "", req.get("content").unwrap_or_default());
+            r.headers.push(("Content-Type".into(), req.get_str("type").unwrap_or_default()));
+            r.header("X-Request-Method", &req.method)
+        }
+        "fetch/api/resources/method.py" => {
+            let mut r = Resp::new(200, "OK", "", req.body.clone());
+            if req.get("cors").is_some() {
+                r = r
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Credentials", "true")
+                    .header("Access-Control-Allow-Methods", "GET, POST, PUT, FOO")
+                    .header("Access-Control-Allow-Headers", "x-test, x-foo")
+                    .header("Access-Control-Expose-Headers", "x-request-method");
+            }
+            r = r.header("x-request-method", &req.method);
+            for (h, name) in [("content-type", "Content-Type"), ("content-length", "Content-Length"), ("content-encoding", "Content-Encoding"), ("content-language", "Content-Language"), ("content-location", "Content-Location")] {
+                r = r.header(&format!("x-request-{h}"), req.header(name).unwrap_or("NO"));
+            }
+            r
+        }
+        "fetch/api/resources/echo-content.py" => Resp::new(200, "OK", "text/plain", req.body.clone())
+            .header("X-Request-Method", &req.method)
+            .header("X-Request-Content-Length", req.header("content-length").unwrap_or("NO"))
+            .header("X-Request-Content-Type", req.header("content-type").unwrap_or("NO")),
+        "fetch/api/resources/trickle.py" => {
+            let delay: f64 = req.get_str("ms").and_then(|v| v.parse().ok()).unwrap_or(500.0);
+            let count: usize = req.get_str("count").and_then(|v| v.parse().ok()).unwrap_or(50);
+            sleep_ms(delay as u64);
+            let mut head = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+            if req.get("notype").is_none() {
+                head.push_str("Content-type: text/plain\r\n");
+            }
+            head.push_str("\r\n");
+            let _ = s.write_all(head.as_bytes());
+            sleep_ms(delay as u64);
+            for _ in 0..count {
+                if s.write_all(b"TEST_TRICKLE\n").is_err() {
+                    break;
+                }
+                sleep_ms(delay as u64);
+            }
+            return Some(None);
+        }
+        "fetch/api/resources/infinite-slow-response.py" => {
+            let dir = url_dir(req);
+            let state_key = req.get_str("stateKey").unwrap_or_default();
+            let abort_key = req.get_str("abortKey").unwrap_or_default();
+            let write_state = |v: &str| {
+                if !state_key.is_empty() {
+                    stash_take(&state_key, &dir);
+                    stash_put(&state_key, &dir, Stashed::Str(v.into()));
+                }
+            };
+            write_state("open");
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-type: text/plain\r\nConnection: close\r\n\r\n");
+            let mut ok = s.write_all(&[b'.'; 2048]).is_ok();
+            // wptserve writes until the client goes away; the stand-in also stops after a minute so an
+            // abandoned page cannot hold a thread for the rest of the run.
+            let began = std::time::Instant::now();
+            while ok && began.elapsed().as_secs() < 60 {
+                ok = s.write_all(b".").is_ok() && s.flush().is_ok();
+                if !abort_key.is_empty() && stash_take(&abort_key, &dir).is_some() {
+                    break;
+                }
+                sleep_ms(10);
+            }
+            write_state("closed");
+            return Some(None);
+        }
+        "common/slow.py" => {
+            let ms: f64 = req.get_str("delay").and_then(|v| v.parse().ok()).unwrap_or(2000.0);
+            sleep_ms(ms as u64);
+            Resp::new(200, "OK", "", Vec::new())
+        }
+        "common/echo.py" => Resp::new(200, "OK", "text/html", req.get("content").unwrap_or_default()).header("X-XSS-Protection", "0"),
         _ => return None,
     }))
 }

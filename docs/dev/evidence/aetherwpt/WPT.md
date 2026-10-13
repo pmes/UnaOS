@@ -70,3 +70,80 @@ Known misses at hand-off: html/webappapis below 90% (promise-rejection events, e
 compilation details, document.write cases); html/semantics/forms tests that need navigation
 (`form-double-submit-*`, `input-type-change-submit`), image load (`image-width-height`), FormData
 (SR70's XHR surface). No js_core defect was isolated.
+
+## AETHERWPT2 (SR135) — the rest of the platform
+
+Runner: the same file, `handlers/aether/tests/wpt_dom.rs` — `WPT2_DIRS` (27 directories, one `wpt2_*` test
+each, recursive), served by the `tests/wpt_net` stand-in, the `.any.js` window variant only. Command (the
+bench's; R107 — no executor ran it):
+
+    cargo test --release -p aether --test wpt_dom wpt2_ -- --nocapture --test-threads=4
+
+Exclusion is infrastructure only (`wpt2_excluded`): a test that needs what the stand-in or a headless page
+cannot give it is skipped with the reason; a test that needs an API Aether lacks RUNS and fails, and is named
+in the gap list below. Reftests, crash tests and manual pages (no `testharness.js`) are counted per directory
+and not run. Every floor is 0 at landing; the bench's first run raises each to its measured value.
+
+The stand-in gained `fetch/api/resources/{redirect,inspect-headers,clean-stash,stash-put,stash-take,status,
+method,echo-content,trickle,infinite-slow-response}.py` and `common/{slow,echo}.py` (re-implemented from their
+sources at the pinned commit) and wptserve's stash. `/resources/*.js`, `/common/*`, `/xhr/resources/*`,
+`/fetch/api/resources/*` (static), `/FileAPI/support/*` and `/images/*` are served as files from the checkout.
+
+Test files: testharness `.any.js` / `.window.js` / `.html` at `da1f6d20`, counted with `find` over the sparse
+checkout (resources/ and support/ left out); the bench's run gives served and skipped per file.
+
+| directory | test files (any / window / html) | what it needs that this run cannot give (`wpt2_excluded` reasons) | floor |
+|---|---|---|---|
+| url | 24 / 4 / 4 | handler percent-encoding.py; `.xhtml` not collected | 0 |
+| encoding | 37 / 4 / 111 | TLS (sharedarraybuffer.https); handlers single-byte-raw.py, text-plain-charset.py, json-charset.py, text-html-meta-charset.py; idlharness | 0 |
+| fetch/api | 139 / 4 / 43 | cross-origin hosts (cors/, credentials/, REMOTE origins); TLS and h2 (17 `.https.`); service workers; handlers preflight.py, cache.py, authentication.py, …; window.open (keepalive); idlharness | 0 |
+| streams | 73 / 6 / 9 | idlharness; TLS (3); window.open | 0 |
+| FileAPI | 36 / 5 / 39 | window.open (url/); cross-origin; TLS (5); `-manual`; idlharness | 0 |
+| webstorage | 0 / 30 / 24 | window.open (event tests); TLS (1) | 0 |
+| IndexedDB | 210 / 4 / 15 | TLS (5, storage buckets); testdriver (1); window.open; bfcache; idlharness | 0 |
+| html/browsers/history | 0 / 6 / 142 | window.open (36 files); handlers; testdriver (2); bfcache / remote contexts | 0 |
+| html/browsers/the-window-object | 0 / 15 / 80 | window.open (55); cross-origin; testdriver (1); TLS (2) | 0 |
+| html/browsers/browsing-the-web | 1 / 57 / 272 | remote contexts (/common/dispatcher/); bfcache; window.open (65); handlers slow.py, refresh.py, redirect.py, …; testdriver (13); TLS (11) | 0 |
+| html/semantics/scripting-1 | 27 / 1 / 499 | handlers serve-custom-response.py, serve-with-content-type.py, load-error-events.py, referrer-checker.py, log.py, …; cross-origin; TLS (6) | 0 |
+| html/semantics/embedded-content | 0 / 17 / 732 | `/media/` fixtures (not in the sparse checkout); layout; testdriver (25); handlers; cross-origin; TLS (9); reftests | 0 |
+| html/semantics/tabular-data | 0 / 0 / 32 | layout (a few); reftests | 0 |
+| html/semantics/interactive-elements | 0 / 0 / 112 | testdriver (51: dialog, popover, details input); layout; reftests | 0 |
+| html/semantics/text-level-semantics | 0 / 0 / 10 | reftests; layout | 0 |
+| html/semantics/grouping-content | 0 / 0 / 15 | reftests; layout | 0 |
+| custom-elements | 0 / 9 / 177 | window.open; testdriver (5); layout; handlers form-echo.py, echo-content-escaped.py | 0 |
+| shadow-dom | 0 / 0 / 277 | testdriver (98: focus, input, selection by input); layout; reftests | 0 |
+| selection | 0 / 1 / 123 | testdriver (32); layout (caret and extent by coordinates); reftests | 0 |
+| uievents (keyboard events are `uievents/keyboard`) | 0 / 1 / 71 | testdriver (52: keyboard, mouse, wheel, click order); layout; manual pages | 0 |
+| pointerevents | 0 / 1 / 192 | testdriver (171 — nearly every test drives a real pointer); TLS (16); layout | 0 |
+| WebCryptoAPI | 129 / 2 / 1 | idlharness; cross-origin (secure_context/); h2. `.https.` alone RUNS: it asks only for a secure context and 127.0.0.1 is potentially trustworthy (Secure Contexts §3.2) | 0 |
+| compression | 20 / 0 / 0 | nothing infrastructural (its `.https.` file runs as a secure context) | 0 |
+| resource-timing | 13 / 0 / 135 | handlers status-code.py, compressed-js.py, redirect-cors.py, fake_responses.py, …; cross-origin (TAO); TLS (13); window.open; layout | 0 |
+| performance-timeline | 21 / 13 / 17 | bfcache / remote contexts (back-forward-cache, not-restored-reasons); window.open; idlharness | 0 |
+| console | 7 / 0 / 5 | testdriver and `-manual` / `-logging` pages read by a person; idlharness | 0 |
+| html/infrastructure/urls | 0 / 11 / 13 | TLS (10); legacy-charset documents through handlers resource.py, stash.py, blank.py; cross-origin | 0 |
+
+### Gap list (APIs and behaviours the tests use that Aether lacked at fe30fa59)
+
+Found by reading each directory's tests against `handlers/aether/src/{js,api,storage}`. **done** = implemented
+in this series (spec section, the `wpt2_gaps.rs` test that pins it); **owed** = named with what it needs.
+
+| # | directory | gap | status |
+|---|---|---|---|
+| G1 | url | URLSearchParams (URL §6.2): `entries()/keys()/values()` returned arrays, not live `URLSearchParams Iterator`s; `has`/`delete` ignored their `value` argument; the init union (sequence pairs must be length 2, record of own enumerable keys, USVString) unchecked; `url.search = …` / `url.href = …` replaced the query object instead of updating it, so `url.searchParams` lost its identity | owed |
+| G2 | encoding | TextDecoder (Encoding §7.2): no label table (every non-UTF-8 label decoded as UTF-8 under the label's name), no `fatal`, no `ignoreBOM`, no `{stream: true}`, no UTF-16LE/BE, a UTF-8 decoder that accepted overlongs and surrogates, `replacement` labels not refused; `encodeInto` reported `read` 0 for a partial write | owed |
+| G3 | streams | `CountQueuingStrategy`, `ByteLengthQueuingStrategy` (Streams §7) absent; `ReadableStream` ignored `strategy.size` (desiredSize counted chunks) | owed |
+| G4 | FileAPI | Blob constructor (File API §3.1): parts converted by `Array.from` (array-likes accepted, iterables' errors lost), no `endings`, `File.lastModified` not converted as `long long` | owed |
+| G5 | html/semantics/tabular-data | HTMLTableElement (HTML §4.9.1): `caption`/`tHead`/`tFoot` read-only, no `createCaption`/`deleteCaption`/`createTHead`/`deleteTHead`/`createTFoot`/`deleteTFoot`/`createTBody` | owed |
+| G6 | WebCryptoAPI | `crypto.getRandomValues` (WebCrypto §10.1.1): no TypeMismatchError for float / DataView, no QuotaExceededError over 65,536 bytes, BigInt64 arrays left unfilled; no `QuotaExceededError` interface (WebIDL) | owed |
+| G7 | WebCryptoAPI | `crypto.subtle` undefined | owed |
+| G8 | performance-timeline | `performance.mark` / `measure` / `getEntries*` / `clearMarks` / `clearMeasures` absent; `PerformanceObserver` registered and never delivered | owed |
+| G9 | console | label conversion swallowed a throwing `toString`; the namespace object's [[Prototype]] was %Object.prototype% (WebIDL §3.13: an empty object whose [[Prototype]] is %Object.prototype%) | owed |
+| O1 | streams, encoding, compression, fetch/api | `WritableStream`, `TransformStream`, `pipeTo` / `pipeThrough`, byte streams (`ReadableByteStreamController`, BYOB reader), transferable streams — needs a Streams core (the Streams Standard's writable / transform / pipe algorithms); `TextEncoderStream` / `TextDecoderStream` and `CompressionStream` / `DecompressionStream` (plus a deflate encoder) wait on it | owed |
+| O2 | encoding, html/infrastructure/urls | legacy single-byte decoders other than windows-1252 and x-user-defined, every legacy multi-byte codec (Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, Big5, GBK / gb18030) — needs the WHATWG index tables; documents in a legacy charset (the HTML parser decodes UTF-8 only) | owed |
+| O3 | FileAPI, url | `URL.createObjectURL` hands out a URL with no blob store behind it (a fetch / XHR / `<img>` of it gets nothing) — needs the blob URL store and the `blob:` scheme fetch (Fetch §4.3); `FileReaderSync` (worker-only; workers/ is not this arc's) | owed |
+| O4 | custom-elements | `ElementInternals` / `attachInternals` (form-associated custom elements, `states`) | owed |
+| O5 | pointerevents | `setPointerCapture` / `releasePointerCapture` / `hasPointerCapture` and the capture-target override in dispatch | owed |
+| O6 | resource-timing | `PerformanceResourceTiming` entries (the script request log in `api/fetch.rs` has the requests, not the timings) | owed |
+| O7 | WebCryptoAPI | ECDSA / ECDH / Ed25519 / X25519 / RSA in `crypto.subtle` (crypto_core has the primitives), `jwk` / `pkcs8` / `spki` formats, `wrapKey` / `unwrapKey`, AES-KW | owed |
+| O8 | html/browsers/* | auxiliary browsing contexts (`window.open` is a stub), the Navigation API (`navigation`, `NavigateEvent`), bfcache | owed |
+| O9 | shadow-dom, selection | `adoptedStyleSheets` / constructable stylesheets, `Selection.getComposedRanges`, `Selection.modify` (needs layout) | owed |
