@@ -54,12 +54,12 @@ impl Theme {
         let p = palette_core::Theme::of(l);
         Theme {
             look: l,
-            bg: opaque(p.tok(Tok::ContentFill)),
-            ink: opaque(p.tok(Tok::ContentText)),
-            err_ink: opaque(p.tok(Tok::ErrorText)),
+            bg: opaque(p.tok(Tok::SurfaceContent)),
+            ink: opaque(p.tok(Tok::TextPrimary)),
+            err_ink: opaque(p.tok(Tok::InkCritical)),
             echo_ink: opaque(p.accent),
             caret: opaque(p.accent),
-            rule: opaque(p.tok(Tok::FrameLine)),
+            rule: opaque(p.tok(Tok::LineSubtle)),
         }
     }
 }

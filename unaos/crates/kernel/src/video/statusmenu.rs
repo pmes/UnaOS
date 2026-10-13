@@ -286,7 +286,7 @@ pub fn paint_slider(out: &mut [u32], w: usize, x0: usize, inner: usize, sy: usiz
     for k in 0..inner {
         let i = x0 + k;
         if i < w {
-            out[i] = if k < fill { theme::accent() } else { theme::frame_line() };
+            out[i] = if k < fill { theme::accent() } else { theme::line_subtle() };
         }
     }
 }
@@ -311,9 +311,9 @@ pub fn paint_grid(out: &mut [u32], w: usize, x0: usize, inner: usize, sy: usize,
             for i in bx0..(right + strip::PAD() / 2).min(w) {
                 out[i] = theme::accent();
             }
-            theme::bevel_light()
+            theme::surface_raised()
         } else {
-            theme::title_text_active()
+            theme::text_primary()
         };
         super::text::draw_row(out, w, txt, tx, sy, ink, false, FACE);
     }

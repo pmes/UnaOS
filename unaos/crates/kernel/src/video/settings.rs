@@ -535,7 +535,7 @@ fn sf(st: &mut State) -> draw::Surf<'_> {
 }
 
 fn sidebar_bg() -> u32 {
-    draw::blend(theme::chrome_face(), theme::content_text(), SIDEBAR_TINT)
+    let _ = SIDEBAR_TINT; theme::surface_sidebar() // DESIGNAPPLY (B639): `surface.sidebar` (§2.3), the token for this job (was the face 12/255 toward the ink)
 }
 
 /// A control's state at the logical rect `(x, y, w, h)` (hover / pressed from the pointer); records the rect.
@@ -570,7 +570,7 @@ fn txt_ink(st: &mut State, x: usize, r: usize, t: &str, ink: u32) {
 
 /// A row's label (the primary ink).
 fn txt(st: &mut State, x: usize, r: usize, t: &str) {
-    txt_ink(st, x, r, t, theme::content_text());
+    txt_ink(st, x, r, t, theme::text_primary());
 }
 
 /// A row's value, a section header or help text (the secondary ink).
@@ -674,7 +674,7 @@ fn avatar(st: &mut State, x: usize, y: usize, d: usize, name: &str) {
 fn icon_tile(tab: usize) -> u32 {
     match tab {
         1 | 2 => theme::ACCENTS[0],
-        5 => theme::content_text(),
+        5 => theme::text_primary(),
         8 => theme::ACCENTS[5],
         _ => theme::ACCENTS[7],
     }
@@ -686,7 +686,7 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
     use draw::{fill_circle, fill_rrect, line_aa, stroke_circle, stroke_rrect, Radii, SUB};
     let bg = tile.unwrap_or_else(|| icon_tile(tab));
     fill_rrect(s, Rect::new(x, y, t, t), draw::icon_radius(t as usize) as i32, bg);
-    let ink = if tab == 5 && tile.is_none() { theme::field_bg() } else { theme::ink_on_accent() };
+    let ink = if tab == 5 && tile.is_none() { theme::surface_content() } else { theme::ink_on_accent() };
     let f = |n: i32| t * n / 100;
     let (cx, cy) = (x + t / 2, y + t / 2);
     let sw = f(10).max(1);
@@ -790,7 +790,7 @@ fn paint_column(st: &mut State, tab: usize) {
     let face = super::text::Face::Ui;
     let ch = super::metrics::lcell_h(face);
     let tx = ax + AVATAR + 10;
-    text_at(st, tx, CARD_Y + CARD_H / 2 - ch, COL_W - PILL_X, &name, theme::content_text(), true, face);
+    text_at(st, tx, CARD_Y + CARD_H / 2 - ch, COL_W - PILL_X, &name, theme::text_primary(), true, face);
     text_at(st, tx, CARD_Y + CARD_H / 2, COL_W - PILL_X, role, theme::ink_secondary(), false, face);
     // The search field (a real filter over the tab names); its placeholder in the secondary ink.
     let foc = st.search;
@@ -815,7 +815,7 @@ fn paint_column(st: &mut State, tab: usize) {
             let iy = y + (PILL_H - ICON) / 2;
             tab_icon(&mut s, k, e(ICON_X), e(iy), ew(ICON_X, ICON), None);
         }
-        let ink = if on { theme::ink_on_accent() } else { theme::content_text() };
+        let ink = if on { theme::ink_on_accent() } else { theme::text_primary() };
         text_at(st, COL_LABEL_X, y + (PILL_H - ch) / 2, COL_W - PILL_X, TAB_NAMES[k], ink, on, face);
     }
     if n == 0 {
@@ -836,14 +836,14 @@ fn paint(st: &mut State, v: &Values) {
     {
         let mut s = sf(st);
         let all = Rect::new(0, 0, s.w as i32, s.h as i32);
-        draw::fill(&mut s, all, theme::chrome_face());
+        draw::fill(&mut s, all, theme::surface_window());
     }
     let tab = (v.tab as usize).min(TABS - 1);
     paint_column(st, tab);
     // The pane's title band: the tab's name in the title face, bold (DESIGN-LANGUAGE §3.4: the pane title).
     let tf = super::text::Face::Chrome;
     let tc = super::metrics::lcell_h(tf);
-    text_at(st, BOX_X, (PANE_Y - tc) / 2, w, TAB_NAMES[tab], theme::content_text(), true, tf);
+    text_at(st, BOX_X, (PANE_Y - tc) / 2, w, TAB_NAMES[tab], theme::text_primary(), true, tf);
     match v.tab {
         0 => paint_general(st, v),
         1 => paint_users(st),
@@ -943,7 +943,7 @@ fn paint_about(st: &mut State) {
     let (tc, uc) = (super::metrics::lcell_h(tf), super::metrics::lcell_h(uf));
     let mut y = y0 + 24 + mark + 12;
     let tw = super::metrics::ladvance(b"UnaOS", true, tf);
-    text_at(st, cx - tw / 2, y, CTRL_R, "UnaOS", theme::content_text(), true, tf);
+    text_at(st, cx - tw / 2, y, CTRL_R, "UnaOS", theme::text_primary(), true, tf);
     y += tc + 4;
     let vw = super::metrics::ladvance(ver.as_bytes(), false, uf);
     text_at(st, cx.saturating_sub(vw / 2).max(LABEL_X), y, CTRL_R, ver, theme::ink_secondary(), false, uf);
@@ -967,7 +967,7 @@ fn paint_about(st: &mut State) {
     for (k, val) in facts {
         let kw = super::metrics::ladvance(k.as_bytes(), false, uf);
         text_at(st, (cx - 8).saturating_sub(kw), y, cx, k, theme::ink_secondary(), false, uf);
-        text_at(st, cx + 8, y, CTRL_R, val, theme::content_text(), false, uf);
+        text_at(st, cx + 8, y, CTRL_R, val, theme::text_primary(), false, uf);
         y += uc + 10;
     }
 }
@@ -1112,7 +1112,7 @@ fn paint_users(st: &mut State) {
             let d = 24;
             avatar(st, LABEL_X, mid_y(r, d), d, nm);
             let ch = super::metrics::lcell_h(face);
-            let pen = text_at(st, LABEL_X + d + 10, row_top(r) + (ROW_H - ch) / 2, TRACK_X - 8, nm, theme::content_text(), false, face);
+            let pen = text_at(st, LABEL_X + d + 10, row_top(r) + (ROW_H - ch) / 2, TRACK_X - 8, nm, theme::text_primary(), false, face);
             if !tag.is_empty() { text_at(st, pen, row_top(r) + (ROW_H - ch) / 2, TRACK_X - 8, tag, theme::ink_secondary(), false, face); }
             if st.u.confirm.as_deref() == Some(nm.as_str()) {
                 txt2(st, TRACK_X + 130, r, "Delete?");
@@ -1196,7 +1196,7 @@ pub fn open() -> Result<(), String> {
     let len = sw * sh;
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(len).is_err() { return Err(String::from("out of memory")); }
-    surf.resize(len, theme::content_fill());
+    surf.resize(len, theme::surface_content());
     if is_open() { close(); }
     // Pick up the file's values (and apply them) if the login hook has not yet.
     if user_name().is_some() && LOADED_FOR.lock().is_empty() { service(); }
@@ -1758,8 +1758,8 @@ fn craft_probe() -> Result<u32, &'static str> {
     v.tab = 0;
     paint(&mut st, &v);
     let px = |x: i32, y: i32| -> u32 { if x < 0 || y < 0 { return u32::MAX; } st.surf.get(y as usize * pw + x as usize).map_or(u32::MAX, |p| p & 0x00FF_FFFF) };
-    let (face, sb, fill) = (theme::chrome_face(), sidebar_bg(), theme::group_fill());
-    let hair = draw::blend(fill, theme::content_text(), theme::HAIRLINE_ALPHA);
+    let (face, sb, fill) = (theme::surface_window(), sidebar_bg(), theme::group_fill());
+    let hair = draw::blend(fill, theme::text_primary(), theme::HAIRLINE_ALPHA);
     if sb == face { return Err("sets"); }
     // icons
     for k in 0..TABS {
@@ -2327,7 +2327,7 @@ fn mode_list(st: &mut State) {
             let ink = if on { Ink::solid(theme::accent()) } else { Ink::argb(theme::hairline()) };
             draw::fill_rrect(&mut sf(st), r, dp(draw::DIMS.row_radius), ink);
         }
-        txt_ink(st, x + 14, 3 + k, &mode_caption(m), if on { theme::ink_on_accent() } else { theme::content_text() });
+        txt_ink(st, x + 14, 3 + k, &mode_caption(m), if on { theme::ink_on_accent() } else { theme::text_primary() });
     }
 }
 
@@ -2458,7 +2458,7 @@ fn swatch(st: &mut State, r: usize, k: usize, c: u32, on: bool) {
     let rad = ew(x, SW) / 2;
     let (cx, cy) = (e(x) + rad, e(y) + rad);
     if on {
-        draw::stroke_circle(&mut s, cx, cy, rad + dp(3), dp(2).max(1), theme::content_text());
+        draw::stroke_circle(&mut s, cx, cy, rad + dp(3), dp(2).max(1), theme::text_primary());
     } else if state.hover {
         draw::stroke_circle(&mut s, cx, cy, rad + dp(3), dp(1).max(1), Ink::argb(theme::control_edge()));
     }
@@ -2885,7 +2885,7 @@ fn paint_filetypes(st: &mut State) {
         let app = if r.preferred.is_empty() { String::from("(no app)") } else { r.preferred_name.clone() };
         let ext = if r.extensions.is_empty() { String::new() } else { alloc::format!(" .{}", r.extensions.replace(", ", " .")) };
         let ty = row_top(row) + (ROW_H - ch) / 2;
-        let pen = text_at(st, LABEL_X + t + 10, ty, app_x - 8, &r.description, theme::content_text(), false, face);
+        let pen = text_at(st, LABEL_X + t + 10, ty, app_x - 8, &r.description, theme::text_primary(), false, face);
         text_at(st, pen + 8, ty, app_x - 8, &alloc::format!("{}{}", r.mime, ext), theme::ink_secondary(), false, face);
         text_at(st, app_x, ty, CTRL_R, &alloc::format!("{} ({})", app, r.registrants), theme::ink_secondary(), false, face);
     }

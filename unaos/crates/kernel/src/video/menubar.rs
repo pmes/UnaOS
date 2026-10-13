@@ -1798,9 +1798,9 @@ fn crystal_facet(u: usize, v: usize) -> Option<u32> {
         return None;
     }
     Some(if v < CRYSTAL_CROWN_H() {
-        if u < cx { theme::control_close() } else { theme::control_zoom() }
+        if u < cx { theme::accent_pressed() } else { theme::accent_tint() }
     } else {
-        theme::control_mid()
+        theme::accent()
     })
 }
 
@@ -1834,8 +1834,8 @@ fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, 
         return;
     }
     let v = j - by0;
-    let outline = theme::title_text_inactive();
-    let ink = theme::title_text_active();
+    let outline = theme::text_secondary();
+    let ink = theme::text_primary();
     // The fill, in columns of the cell's INTERIOR (the outline takes one column each side). Integer
     // arithmetic, no float — the crystal's discipline. `percent` is already clamped at the decode
     // (`status::decode`), so this can never exceed the interior.
@@ -1881,7 +1881,7 @@ fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, 
         let cell = bx + u;
         let i = x0 + cell;
         if i < w {
-            out[i] = if cell - 1 < fill { theme::bevel_light() } else { ink };
+            out[i] = if cell - 1 < fill { theme::surface_raised() } else { ink };
         }
     }
 }
@@ -1896,13 +1896,13 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     let (_, _, w, h) = r;
     // The material is anchored to the STRIP, not to the panel: index ceramic by the row's offset
     // inside the box, exactly as the window chrome indexes it by the row's offset inside the window.
-    let face = ceramic::shade(theme::chrome_face(), j);
+    let face = ceramic::shade(theme::surface_window(), j);
     let fill = if j < theme::BEVEL() {
-        theme::bevel_light()
+        theme::surface_raised()
     } else if j + 1 == h {
         // The bar's ONE keyline: the bottom edge, where it meets the desktop. The other three edges
         // are the panel's, and a keyline there would be a line drawn against nothing.
-        ceramic::shade(theme::frame_line(), j)
+        ceramic::shade(theme::line_subtle(), j)
     } else {
         face
     };
@@ -1971,7 +1971,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // other half of the same convention, kept HERE because the bar owns the caption's glyphs and
     // `draw_bar_row` deliberately does not redraw them.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    let cap_ink = if m.menus.app_open() { theme::bevel_light() } else { theme::title_text_active() };
+    let cap_ink = if m.menus.app_open() { theme::surface_raised() } else { theme::text_primary() };
     super::text::draw_row(out, w, &m.title[..cols], TITLE_X0(), sy, cap_ink, BOLD, FACE);
 
     // MENUSTAT — the battery's PERCENT, right-aligned in its fixed [`BATT_PCT_GLYPHS`] slot so the
@@ -1993,7 +1993,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
             pct[BATT_PCT_GLYPHS - 2] = b'0' + p as u8;
         }
         let tx = bx0 + BATT_GLYPH_W() + BATT_GAP();
-        super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::title_text_inactive(), false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
+        super::text::draw_row(out, w, &pct, (tx + BATT_PCT_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&pct, false, FACE)), sy, theme::text_secondary(), false, FACE); // KERNELFONT: right-aligned in its slot by the shaped width
     }
     bell_count(out, w, sy); // NOTIFY (B418): the bell's unread badge
 
@@ -2008,7 +2008,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // at once. Same arithmetic, same guard, one definition — and it is the definition the fixture's
     // `clock=` term and [`batt_slot`] both read.
     if let (c, Some(cx)) = (m.clock.unwrap_or(*b"--:--"), clock_slot(w)) {
-        super::text::draw_row(out, w, &c, (cx + CLOCK_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&c, false, FACE)), sy, theme::title_text_inactive(), false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W(), CELL_H()))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
+        super::text::draw_row(out, w, &c, (cx + CLOCK_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&c, false, FACE)), sy, theme::text_secondary(), false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W(), CELL_H()))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
     }
 }
 
@@ -2863,9 +2863,9 @@ fn crystal_readback(r: strip::Rect) -> Option<(u32, u32, u32, bool)> {
         for u in 0..CRYSTAL_W() {
             let px = fb.read_pixel(bx + u, by + v);
             cls[u] = match px {
-                Some(p) if p == theme::control_close() => 1,
-                Some(p) if p == theme::control_mid() => 2,
-                Some(p) if p == theme::control_zoom() => 3,
+                Some(p) if p == theme::accent_pressed() => 1,
+                Some(p) if p == theme::accent() => 2,
+                Some(p) if p == theme::accent_tint() => 3,
                 _ => 0,
             };
             match crystal_facet(u, v) {
@@ -3072,7 +3072,7 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
             let right = tray_left(w).or_else(|| batt_slot(w)).unwrap_or(cx); // STATUSTRAY: left of the whole tray
             if let Some(dx) = right.checked_sub(strip::PAD() + dw) {
                 let date = clockbar_date(secs);
-                super::text::draw_row(out, w, &date, dx, sy, theme::title_text_inactive(), false, FACE);
+                super::text::draw_row(out, w, &date, dx, sy, theme::text_secondary(), false, FACE);
             }
         }
     }
@@ -3161,7 +3161,7 @@ fn bell_row(out: &mut [u32], w: usize, h: usize, j: usize) {
         return;
     }
     let lit = super::notify::center_open() || super::notify::unread() > 0;
-    let ink = if lit { theme::title_text_active() } else { theme::title_text_inactive() };
+    let ink = if lit { theme::text_primary() } else { theme::text_secondary() };
     let bits = BELL_BITS[((j - y0) * 12 / g).min(11)];
     for u in 0..g {
         let b = (u * 12 / g).min(11);
@@ -3240,7 +3240,7 @@ fn tray_sig(t: &Option<super::status::Tray>) -> u64 {
 fn tray_paint(out: &mut [u32], w: usize, sy: usize, t: &Option<super::status::Tray>) {
     use super::status::{ITEM_INPUT, ITEM_NET, ITEM_VOLUME, NET_USB};
     let Some(t) = t else { return };
-    let ink = theme::title_text_inactive();
+    let ink = theme::text_secondary();
     if let (Some((lv, muted)), Some((x0, _))) = (t.volume, tray_slot(ITEM_VOLUME, w)) {
         tray_speaker(out, w, sy, x0, lv, muted, ink);
     }

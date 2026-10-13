@@ -91,26 +91,26 @@ pub(super) fn draw_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: us
     let u = (s / 16).max(1);
     if dir {
         // A tabbed folder: the tab, then the body.
-        fill_raw(px, stride, h, x + u, y + 3 * u, 6 * u, 2 * u, theme::control_mid());
-        fill_raw(px, stride, h, x + u, y + 4 * u, 14 * u, 10 * u, theme::control_mid());
-        fill_raw(px, stride, h, x + u, y + 6 * u, 14 * u, 8 * u, theme::control_zoom());
+        fill_raw(px, stride, h, x + u, y + 3 * u, 6 * u, 2 * u, theme::accent());
+        fill_raw(px, stride, h, x + u, y + 4 * u, 14 * u, 10 * u, theme::accent());
+        fill_raw(px, stride, h, x + u, y + 6 * u, 14 * u, 8 * u, theme::accent_tint());
         return "folder";
     }
     // A page with a folded corner and the type tag.
     let (px0, pw, ph) = (x + 3 * u, 10 * u, 14 * u);
-    fill_raw(px, stride, h, px0, y + u, pw, ph, theme::frame_line());
-    fill_raw(px, stride, h, px0 + 1, y + u + 1, pw.saturating_sub(2), ph.saturating_sub(2), theme::bevel_light());
+    fill_raw(px, stride, h, px0, y + u, pw, ph, theme::line_subtle());
+    fill_raw(px, stride, h, px0 + 1, y + u + 1, pw.saturating_sub(2), ph.saturating_sub(2), theme::surface_raised());
     for i in 0..3 * u {
-        fill_raw(px, stride, h, px0 + pw - 3 * u + i, y + u + i, 3 * u - i, 1, theme::content_fill());
+        fill_raw(px, stride, h, px0 + pw - 3 * u + i, y + u + i, 3 * u - i, 1, theme::surface_content());
     }
-    fill_raw(px, stride, h, px0 + pw - 3 * u, y + 4 * u, 3 * u, 1, theme::frame_line());
+    fill_raw(px, stride, h, px0 + pw - 3 * u, y + 4 * u, 3 * u, 1, theme::line_subtle());
     let leaf = path.rsplit('/').next().unwrap_or(path);
     let tag = tag_of(leaf);
     if !tag.is_empty() {
         let tw = tag.len() * face.cell_w();
         let bx = px0 + pw / 2 - (tw / 2).min(pw / 2);
         fill_raw(px, stride, h, px0 + 1, y + 9 * u, pw.saturating_sub(2), face.cell_h().min(4 * u), theme::accent());
-        crate::video::text::draw_text(px, stride, (px0 + pw).min(stride), h, bx, y + 9 * u, tag.as_bytes(), theme::chrome_face(), true, face);
+        crate::video::text::draw_text(px, stride, (px0 + pw).min(stride), h, bx, y + 9 * u, tag.as_bytes(), theme::surface_window(), true, face);
     }
     "document"
 }
@@ -118,9 +118,9 @@ pub(super) fn draw_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: us
 /// Paint the grid over the list pane's interior `li` (after the list painted, when the view is Icons).
 pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
     let g = &m.geom;
-    fill(px, g, li.x, li.y, li.w, li.h, theme::content_fill());
+    fill(px, g, li.x, li.y, li.w, li.h, theme::surface_content());
     if let Some(e) = &m.err {
-        text(px, g, li.x + PAD(), li.y + PAD(), e.as_bytes(), li.x + li.w, theme::content_text());
+        text(px, g, li.x + PAD(), li.y + PAD(), e.as_bytes(), li.x + li.w, theme::text_primary());
         return 0;
     }
     let (cw, ch) = cell(g);
@@ -135,7 +135,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
             let (x, y) = (li.x + c * cw, li.y + r * ch);
             let sel = i == m.list_sel;
             if sel {
-                let c2 = if m.focus == Pane::List { theme::accent() } else { theme::scroll_thumb() };
+                let c2 = if m.focus == Pane::List { theme::accent() } else { theme::line_strong() };
                 fill(px, g, x + PAD() / 2, y + PAD() / 2, cw - PAD(), ch - PAD(), c2);
             }
             let path = super::join(&m.cwd, &e.name);
@@ -149,7 +149,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
                 nm.extend_from_slice(b"..");
             }
             let tw = nm.len() * g.cell_w();
-            let ink = if sel && m.focus == Pane::List { theme::chrome_face() } else { theme::content_text() };
+            let ink = if sel && m.focus == Pane::List { theme::surface_window() } else { theme::text_primary() };
             text(px, g, x + cw.saturating_sub(tw) / 2, y + PAD() + s + PAD(), &nm, x + cw, ink);
             drawn += 1;
         }

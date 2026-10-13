@@ -195,7 +195,7 @@ const _: () = assert!(ENV_A_Q16 + ENV_B_Q16 == 65536);
 /// is what `palette.content_fill` rounds to as well. `theme.rs` and engine.md §9 both state the
 /// two agree by construction and that the paper reads its base from `CONTENT_FILL`; this is the
 /// tripwire that says so out loud if a future kit ever separates them.
-const _: () = assert!(theme::CONTENT_FILL == crate::video::theme::fixture::PAPER_BASE); // const context: the Light kit value (APPEARANCE)
+const _: () = assert!(theme::material::PAPER == crate::video::theme::fixture::PAPER_BASE); // const context: the material's base (DESIGNAPPLY B639: `surface.content` is a token now, the paper keeps the kit tone)
 
 // ---------------------------------------------------------------------------
 // The tile
@@ -400,11 +400,11 @@ fn field_q16(px: i64, py: i64) -> i64 {
     ((inner * env) >> 16).clamp(-65536, 65536)
 }
 
-/// The kit's `base_rgb` at Q16, taken from [`theme::CONTENT_FILL`] (see the module note): each
+/// The kit's `base_rgb` at Q16, taken from [`theme::material::PAPER`] (DESIGNAPPLY B639; see the module note): each
 /// `u8` channel re-expanded as `c * 65536 / 255`, round-half-up.
 #[inline]
 fn base_q16(shift: u32) -> i64 {
-    let c = ((theme::content_fill() >> shift) & 0xFF) as i64;
+    let c = ((theme::material::PAPER >> shift) & 0xFF) as i64;
     (c * 65536 + 127) / 255
 }
 
@@ -469,7 +469,7 @@ fn witness(px: &[u32]) {
         SCALE,
         AMP_Q16,
         SEED,
-        theme::content_fill(),
+        theme::material::PAPER,
         TILE_W,
         TILE_H,
         fnv1a(px),

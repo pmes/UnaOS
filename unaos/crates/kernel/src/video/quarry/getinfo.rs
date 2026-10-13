@@ -76,7 +76,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     let n = 3 + p.rows.len().max(1);
     let h = (n * rh + 2).min(li.h);
     let (x, y, w) = (li.x + PAD(), li.y + rh, li.w.saturating_sub(2 * PAD()));
-    fill(px, g, x, y, w, h, theme::button_face());
+    fill(px, g, x, y, w, h, theme::surface_raised());
     keyline(px, g, Rect { x, y, w, h }, theme::accent());
     let clip = x + w;
     let mut line = |i: usize, s: &str, ink: u32| {
@@ -85,18 +85,18 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
             text(px, g, x + PAD(), y + 1 + i * rh + g.ts, &b, clip, ink);
         }
     };
-    line(0, &alloc::format!("Get Info: {}", p.path), theme::button_text());
-    line(1, &p.head, theme::title_text_inactive());
-    line(2, "attribute                type    value                         changed", theme::title_text_inactive());
+    line(0, &alloc::format!("Get Info: {}", p.path), theme::text_primary());
+    line(1, &p.head, theme::text_secondary());
+    line(2, "attribute                type    value                         changed", theme::text_secondary());
     if let Some(note) = p.note {
-        line(3, note, theme::button_text());
+        line(3, note, theme::text_primary());
     } else if p.rows.is_empty() {
-        line(3, "no attributes", theme::button_text());
+        line(3, "no attributes", theme::text_primary());
     }
     for (i, r) in p.rows.iter().enumerate() {
         let mut v = r.val.clone();
         v.truncate(29);
         let s = alloc::format!("{:<24} {:<7} {:<29} {}", r.key, r.ty, v, r.when.map(af::fmt_when).unwrap_or_else(|| String::from("-")));
-        line(3 + i, &s, theme::button_text());
+        line(3 + i, &s, theme::text_primary());
     }
 }

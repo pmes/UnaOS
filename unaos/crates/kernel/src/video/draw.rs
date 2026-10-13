@@ -706,9 +706,9 @@ impl ControlState {
         if self.disabled {
             c
         } else if self.pressed {
-            blend(c, theme::content_text(), DIMS.press_tint)
+            blend(c, theme::text_primary(), DIMS.press_tint)
         } else if self.hover {
-            blend(c, theme::content_text(), DIMS.hover_tint)
+            blend(c, theme::text_primary(), DIMS.hover_tint)
         } else {
             c
         }
@@ -953,7 +953,7 @@ pub fn push_button(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], default: b
     if !default {
         stroke_rrect(s, r, rad, DIMS.hairline_dev as i32, Ink::argb(theme::control_edge()).fade(a));
     }
-    let ink = if default { theme::ink_on_accent() } else { theme::content_text() };
+    let ink = if default { theme::ink_on_accent() } else { theme::text_primary() };
     label(s, r.x + (r.w - lw) / 2, label_top(r), text, label_ink(ink, face, st), false);
     focus_ring(s, r, rad, st);
     r
@@ -988,7 +988,7 @@ pub fn segmented_w(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel: 
             hairline_v(s, seg.x, seg.y + 2 * i, seg.h - 4 * i, Ink::argb(theme::control_edge()).fade(a));
         }
         let bg = if on { theme::knob_face() } else { well };
-        label(s, seg.x + (sw - label_w(l, on)) / 2, label_top(seg), l, label_ink(theme::content_text(), bg, st), on);
+        label(s, seg.x + (sw - label_w(l, on)) / 2, label_top(seg), l, label_ink(theme::text_primary(), bg, st), on);
     }
     focus_ring(s, r, rad, st);
     r
@@ -998,18 +998,18 @@ pub fn segmented_w(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel: 
 pub fn text_field(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], st: ControlState) -> Rect {
     let r = Rect::new(x, y, w, d(DIMS.field_h));
     let (rad, a) = (d(DIMS.field_radius), st.alpha());
-    let bg = theme::field_bg();
+    let bg = theme::surface_content();
     fill_rrect_alpha(s, r, rad, bg, a);
     stroke_rrect(s, r, rad, DIMS.hairline_dev as i32, Ink::argb(theme::control_edge()).fade(a));
     let inner = r.inset(d(DIMS.field_pad_x) / 2);
     let saved = s.clip;
     s.set_clip(saved.intersect(Rect::new(r.x + d(DIMS.field_pad_x), r.y, r.w - 2 * d(DIMS.field_pad_x), r.h)));
-    let pen = label(s, r.x + d(DIMS.field_pad_x), label_top(r), text, label_ink(theme::content_text(), bg, st), false);
+    let pen = label(s, r.x + d(DIMS.field_pad_x), label_top(r), text, label_ink(theme::text_primary(), bg, st), false);
     s.clip = saved;
     if st.focused && !st.disabled {
         let ch = LABEL_FACE.cell_h() as i32;
         let cx = pen.min(inner.right() - 1);
-        fill(s, Rect::new(cx, label_top(r), d(DIMS.caret_w), ch), theme::content_text());
+        fill(s, Rect::new(cx, label_top(r), d(DIMS.caret_w), ch), theme::text_primary());
     }
     focus_ring(s, r, rad, st);
     r
@@ -1019,16 +1019,16 @@ pub fn text_field(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], st: Control
 pub fn sidebar_row(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], selected: bool, st: ControlState) -> Rect {
     let r = Rect::new(x, y, w, d(DIMS.row_h));
     let rad = d(DIMS.row_radius);
-    let base = theme::chrome_face();
+    let base = theme::surface_window();
     let (ink, bg) = if selected {
         let f = st.face(theme::accent());
         fill_rrect_alpha(s, r, rad, f, st.alpha());
         (theme::ink_on_accent(), f)
     } else if st.hover || st.pressed {
         fill_rrect(s, r, rad, Ink::argb(theme::hairline()));
-        (theme::content_text(), base)
+        (theme::text_primary(), base)
     } else {
-        (theme::content_text(), base)
+        (theme::text_primary(), base)
     };
     let saved = s.clip;
     s.set_clip(saved.intersect(r.inset(1)));
@@ -1080,9 +1080,9 @@ fn check() -> (bool, u32) {
         return (false, u32::MAX);
     }
     buf.resize(T * T, 0u32);
-    let bg = theme::chrome_face();
+    let bg = theme::surface_window();
     let fg = theme::accent();
-    let ink = theme::content_text();
+    let ink = theme::text_primary();
     let mut bad = 0u32;
     let mut s = Surf::new(&mut buf, T);
     let clear = |s: &mut Surf| s.px.fill(bg);
@@ -1257,7 +1257,7 @@ fn cost() {
         serial_println!(":: GLASSKIT: cost no-surface ::");
         return;
     }
-    buf.resize(side * side, theme::chrome_face());
+    buf.resize(side * side, theme::surface_window());
     let mut s = Surf::new(&mut buf, side);
     let mut time = |n: u64, f: &mut dyn FnMut(&mut Surf)| -> u64 {
         let (t0, _) = now_ns();
@@ -1269,9 +1269,9 @@ fn cost() {
     let r = Rect::new(16, 16, 200, 120);
     let a = time(64, &mut |s| fill_rrect(s, r, 12, theme::accent()));
     let b = time(64, &mut |s| stroke_rrect(s, r, 12, 1, Ink::argb(theme::hairline())));
-    let c = time(64, &mut |s| gradient_v(s, r, theme::accent(), theme::chrome_face()));
+    let c = time(64, &mut |s| gradient_v(s, r, theme::accent(), theme::surface_window()));
     let e = time(64, &mut |s| fill_circle(s, 100, 100, 20, theme::accent()));
-    let l = time(64, &mut |s| line_aa(s, 20 * SUB, 20 * SUB, 200 * SUB, 90 * SUB, 2 * SUB, theme::content_text()));
+    let l = time(64, &mut |s| line_aa(s, 20 * SUB, 20 * SUB, 200 * SUB, 90 * SUB, 2 * SUB, theme::text_primary()));
     let k = time(16, &mut |s| {
         toggle(s, 8, 8, true, ControlState::NORMAL);
         checkbox(s, 80, 8, true, ControlState::NORMAL);

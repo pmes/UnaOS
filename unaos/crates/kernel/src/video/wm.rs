@@ -14598,29 +14598,29 @@ fn crispy_witness() {
     }
     use super::theme;
     crate::bootlog_println!(
-        "[crispy] theme=us-crispy-modern@0787ba9f frame={} bevel={} title_h={} radius={} ctrl={} gap={} face={:#08x} keyline={:#08x} bevels={:#08x}/{:#08x} title_act={:#08x}->{:#08x} title_ina={:#08x}->{:#08x} ink={:#08x}/{:#08x} ctrls={:#08x}/{:#08x}/{:#08x} gloss_q16={}/{}/{} desktop={:#08x}",
-        theme::FRAME(),
-        theme::BEVEL(),
+        "[crispy] theme=designlang@B639 frame={} title_h={} radius={} ctrl={} gap={} surfaces={:#08x}/{:#08x}/{:#08x}/{:#08x}/{:#08x} lines={:#08x}/{:#08x}/{:#08x} text={:#08x}/{:#08x}/{:#08x} discs={:#08x}/{:#08x}/{:#08x} accent={:#08x}/{:#08x}/{:#08x} desktop={:#08x}", // DESIGNAPPLY (B639): the semantic tokens (window/sidebar/content/raised/overlay, subtle/strong/control, primary/secondary/tertiary, the discs, fill/hover/pressed); frame=0 (§2.4: no frame, a shadow outside the box)
+        BORDER(),
         theme::TITLE_HEIGHT(),
         theme::CORNER_RADIUS(),
         theme::CONTROL_BOX(),
         theme::GAP(),
-        theme::chrome_face(),
-        theme::frame_line(),
-        theme::bevel_light(),
-        theme::bevel_shadow(),
-        theme::title_active_top(),
-        theme::title_active_bottom(),
-        theme::title_inactive_top(),
-        theme::title_inactive_bottom(),
-        theme::title_text_active(),
-        theme::title_text_inactive(),
-        theme::control_close(),
-        theme::control_mid(),
-        theme::control_zoom(),
-        theme::GLOSS_TOP_ALPHA_Q16,
-        theme::GLOSS_FALLOFF_Q16,
-        theme::GLOSS_BOTTOM_ALPHA_Q16,
+        theme::surface_window(),
+        theme::surface_sidebar(),
+        theme::surface_content(),
+        theme::surface_raised(),
+        theme::surface_overlay(),
+        theme::line_subtle(),
+        theme::line_strong(),
+        theme::line_control(),
+        theme::text_primary(),
+        theme::text_secondary(),
+        theme::text_tertiary(),
+        theme::ctrl_close(),
+        theme::ctrl_min(),
+        theme::ctrl_zoom(),
+        theme::accent(),
+        theme::accent_hover(),
+        theme::accent_pressed(),
         DESKTOP_BG,
     );
     // The resolved title ramp's two ENDPOINT rows, computed by the interpolator that will draw
@@ -14664,7 +14664,7 @@ const fn pack(r: u32, g: u32, b: u32) -> u32 {
 /// half-up in both directions rather than toward negative infinity. **Residual: at most 1/2 LSB per
 /// channel per blend**, i.e. a drawn channel is never more than one 8-bit step from the value the
 /// host's `f32` ramp would round to. No float, no `libm`, and no intermediate that can overflow.
-#[inline]
+#[inline] #[allow(dead_code)] // DESIGNAPPLY (B639): the gloss ramp it served is retired; kept for the record of the Q16 bound
 fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
     let t = t.min(super::theme::Q16_ONE) as i64;
     let (ar, ag, ab) = chans(a);
@@ -14698,35 +14698,35 @@ fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
 /// what the kit's own sample renders show. The alternative reading (falloff as an exponent) would
 /// need a power function, i.e. float or a table, for no gain the kit asks for.
 pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
-    use super::theme;
-    let (top, bot) = if focused {
-        (theme::title_active_top(), theme::title_active_bottom())
-    } else {
-        (theme::title_inactive_top(), theme::title_inactive_bottom())
-    };
-    let span = h.saturating_sub(1).max(1);
-    let t = ((j.min(span) as u64 * theme::Q16_ONE as u64) / span as u64) as u32;
-    let base = blend_q16(top, bot, t);
-    // The gloss band, in rows: `falloff` of the strip height, at least one row so a degenerate
-    // falloff still puts the top stop's highlight somewhere rather than dividing by zero.
-    let band = ((h as u64 * theme::GLOSS_FALLOFF_Q16 as u64) >> 16).max(1) as usize;
-    let g = if j >= band {
-        theme::GLOSS_BOTTOM_ALPHA_Q16
-    } else {
-        let gt = ((j as u64 * theme::Q16_ONE as u64) / band as u64) as u32;
-        // The alpha ramp is itself a Q16 blend — of scalars rather than colours, so it is done
-        // inline: `top + (bottom - top) * gt`, same round-half-up bias as `blend_q16`.
-        let (a, b) = (
-            theme::GLOSS_TOP_ALPHA_Q16 as i64,
-            theme::GLOSS_BOTTOM_ALPHA_Q16 as i64,
-        );
-        (a + (((b - a) * gt as i64 + (1 << 15)) >> 16)).clamp(0, theme::Q16_ONE as i64) as u32
-    };
-    if g == 0 {
-        base
-    } else {
-        blend_q16(base, theme::gloss_highlight(), g)
-    }
+    // DESIGNAPPLY (rmbp-ledger B639, R122; DESIGN-LANGUAGE §3.1 "Removed: … the gloss gradient"): the title bar is
+    // `surface.window`, flat, focused or not — focus is carried by the shadow's size (§2.4 elev.3 / elev.3i) and
+    // the title ink, never by a colour change in the bar. The kit's two-stop gradient and its Q16 gloss band that
+    // this function interpolated are retired with the material tokens they read; the signature stays so the
+    // stock chrome and the `[crispy] ramp` witness keep their call shape (the ramp now reads one value).
+    let _ = (j, h, focused);
+    super::theme::surface_window()
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
+    // (line held: LINE-NEUTRAL, wm.rs keeps every later line where the ledger cites it)
 }
 
 /// CRISPYWIRE — the title caption's ink for a focused / unfocused window. `theme::TITLE_TEXT_*`.
@@ -14741,9 +14741,9 @@ pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
 #[inline]
 fn title_ink(focused: bool) -> u32 {
     if focused {
-        super::theme::title_text_active()
+        super::theme::text_primary()
     } else {
-        super::theme::title_text_inactive()
+        super::theme::text_secondary()
     }
 }
 
@@ -20412,7 +20412,7 @@ fn paint_window(
         // (WC-H), still the four-rect subtraction (COMPOSITE-2), and still focus-independent, since
         // the material is a function of the row and nothing else. The cost is per chrome ROW, not
         // per pixel — see `fill_rect_ceramic`.
-        let border = super::theme::chrome_face();
+        let border = super::theme::surface_window();
         crispy_witness();
         // PHASE31 — CHROMEBAND's own loop begins here. `fill_rect_ceramic` stamps `row=` per
         // machined row, so a wedge in the face fill names the row it stopped on.
@@ -20482,7 +20482,7 @@ fn paint_window(
         // each of `kl`, `bl` and `bs`.
         comp_mark(r.id, mk + PW_FRAME);
         let bev = super::theme::BEVEL();
-        let kl = super::theme::frame_line();
+        let kl = super::theme::line_subtle();
         // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
         // `metrics.bevel` is the kit's hairline metric ("iteration 3 makes the bevel a true
         // hairline"), and the keyline is the frame's other hairline; there is no second metric in
@@ -20498,7 +20498,7 @@ fn paint_window(
         fill_rect_v(dst, lbx + bw.saturating_sub(kw), lby, kw, bh, kl);
         // Bevel, inside the keyline. `theme::BEVEL < theme::FRAME` is a const-assert, so these can
         // never reach the strip.
-        let (bl, bs) = (super::theme::bevel_light(), super::theme::bevel_shadow());
+        let (bl, bs) = (super::theme::surface_raised(), super::theme::line_strong());
         fill_rect_v(dst, lbx + kw, lby + kw as isize, bw.saturating_sub(2 * kw), bev, bl);
         fill_rect_v(dst, lbx + kw, lby + kw as isize, bev, bh.saturating_sub(2 * kw), bl);
         fill_rect_v(
@@ -20580,9 +20580,9 @@ fn paint_window(
                 // symbol reads as the surface showing through rather than as a fourth colour. It
                 // invents nothing — see the SHARED-SOURCE note above `ctrl_glyph`.
                 let punch = if focused {
-                    super::theme::title_active_top()
+                    super::theme::surface_window()
                 } else {
-                    super::theme::title_inactive_top()
+                    super::theme::surface_window()
                 };
                 //
                 // CERAMIC — the discs are machined too, at `ceramic::CONTROL_GAIN_Q16` (half), so
@@ -22299,7 +22299,7 @@ fn movevacate_selftest() {
     // is the desktop at every one of them and the rule is byte-identical to the one this replaced.
     // `gone` is the KEYLINE rather than the content colour: these three points are on the old box's
     // OUTER EDGE, so an unerased sliver shows `theme::FRAME_LINE`, not the surface.
-    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::frame_line());
+    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::line_subtle());
     // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
     // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col

@@ -25,8 +25,8 @@ pub fn avatar(fill: &mut dyn FnMut(usize, usize, usize, usize, u32), x: usize, y
     if d < 8 {
         return 0;
     }
-    let disc = if picked { theme::bevel_light() } else { theme::title_text_inactive() };
-    let figure = if picked { theme::accent() } else { theme::content_fill() };
+    let disc = if picked { theme::surface_raised() } else { theme::text_secondary() };
+    let figure = if picked { theme::accent() } else { theme::surface_content() };
     let r = d as isize / 2;
     let (cx, cy) = (r, r);
     // the disc, one horizontal span per row (r² - dy² ≥ dx²)
@@ -186,7 +186,7 @@ pub fn tile_avatar(draw: &mut dyn FnMut(Draw) -> bool, name: &[u8], x: usize, y:
         }
     }
     // the initials on a disc: picked = a light disc with accent letters on the accent tile, else the reverse
-    let (disc, ink) = if picked { (theme::bevel_light(), theme::accent()) } else { (theme::accent(), theme::bevel_light()) };
+    let (disc, ink) = if picked { (theme::surface_raised(), theme::accent()) } else { (theme::accent(), theme::surface_raised()) };
     let r = d as isize / 2;
     for row in 0..d as isize {
         let dy = row - r;

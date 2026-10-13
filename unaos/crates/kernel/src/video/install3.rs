@@ -573,12 +573,12 @@ fn line(px: &mut [u32], y: usize, s: &str, fg: u32) {
 }
 
 fn title(px: &mut [u32], s: &str) {
-    line(px, 20, s, theme::content_text());
-    fill(px, LX, 42, W - 2 * LX, 2, theme::frame_line());
+    line(px, 20, s, theme::text_primary());
+    fill(px, LX, 42, W - 2 * LX, 2, theme::line_subtle());
 }
 
 fn hint(px: &mut [u32], s: &str) {
-    line(px, H - 40, s, theme::title_text_inactive());
+    line(px, H - 40, s, theme::text_secondary());
 }
 
 fn mib(sectors: u64) -> u64 {
@@ -593,8 +593,8 @@ pub(super) fn paint(px: &mut [u32]) -> bool {
     let mut g = M.lock();
     let Some(m) = g.as_mut() else { return false };
     m.painted |= m.screen.bit();
-    let dim = theme::title_text_inactive();
-    let ink = theme::content_text();
+    let dim = theme::text_secondary();
+    let ink = theme::text_primary();
     match m.screen {
         Screen::Census => {
             title(px, "Install UnaOS on the SSD - what is on each disk");
@@ -607,7 +607,7 @@ pub(super) fn paint(px: &mut [u32]) -> bool {
                     break;
                 }
                 let sel = i == m.sel && d.port.is_some();
-                fill(px, LX, y - 3, W - 2 * LX, 2 * STEP + 2, if sel { theme::scroll_thumb() } else { theme::content_fill() });
+                fill(px, LX, y - 3, W - 2 * LX, 2 * STEP + 2, if sel { theme::line_strong() } else { theme::surface_content() });
                 if sel {
                     rect(px, LX, y - 3, W - 2 * LX, 2 * STEP + 2, theme::accent());
                 }
@@ -652,7 +652,7 @@ pub(super) fn paint(px: &mut [u32]) -> bool {
         }
         Screen::Confirm => {
             title(px, if m.dry { "Confirm (dry run - nothing is written)" } else { "Confirm - this erases the disk" });
-            fill(px, LX, 54, W - 2 * LX, 7 * STEP, theme::button_face_pressed());
+            fill(px, LX, 54, W - 2 * LX, 7 * STEP, theme::surface_sunken());
             rect(px, LX + 2, 56, W - 2 * LX - 4, 7 * STEP - 4, theme::accent());
             if let Some(d) = m.disk() {
                 line(px, 62, &alloc::format!("  {}  {}  {} MiB", d.name, d.model, mib(d.sectors)), ink);
@@ -664,7 +664,7 @@ pub(super) fn paint(px: &mut [u32]) -> bool {
                 } else if d.kind.typed() {
                     line(px, 62 + 2 * STEP, "  EVERYTHING ON IT IS LOST. To erase it, type", ink);
                     line(px, 62 + 3 * STEP, &alloc::format!("  the disk's name:  {}", d.confirm_name()), ink);
-                    fill(px, LX + 12, 62 + 4 * STEP + 2, W - 2 * LX - 24, CELL_H + 6, theme::content_fill());
+                    fill(px, LX + 12, 62 + 4 * STEP + 2, W - 2 * LX - 24, CELL_H + 6, theme::surface_content());
                     rect(px, LX + 12, 62 + 4 * STEP + 2, W - 2 * LX - 24, CELL_H + 6, theme::accent());
                     let shown = alloc::format!("{}_", m.typed);
                     text(px, LX + 18, 62 + 4 * STEP + 5, shown.as_bytes(), ink);

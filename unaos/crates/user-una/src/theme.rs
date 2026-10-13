@@ -70,19 +70,19 @@ impl Theme {
         let sel = p.selection;
         Theme {
             look: l,
-            con_bg: opaque(p.tok(Tok::FieldBg)),
-            side_bg: opaque(p.tok(Tok::WindowBg)),
-            ed_bg: opaque(p.tok(Tok::ContentFill)),
-            status_bg: opaque(p.tok(Tok::TitleActiveBottom)),
-            ink: opaque(p.tok(Tok::ContentText)),
-            dim_ink: opaque(p.tok(Tok::TitleTextInactive)),
+            con_bg: opaque(p.tok(Tok::SurfaceSunken)),
+            side_bg: opaque(p.tok(Tok::SurfaceSidebar)),
+            ed_bg: opaque(p.tok(Tok::SurfaceContent)),
+            status_bg: opaque(p.tok(Tok::SurfaceWindow)),
+            ink: opaque(p.tok(Tok::TextPrimary)),
+            dim_ink: opaque(p.tok(Tok::TextSecondary)),
             dir_ink: opaque(p.tok(Tok::SyntaxCode)),
-            err_ink: opaque(p.tok(Tok::ErrorText)),
+            err_ink: opaque(p.tok(Tok::InkCritical)),
             echo_ink: opaque(p.accent),
             caret: opaque(p.accent),
-            rule: opaque(p.tok(Tok::FrameLine)),
+            rule: opaque(p.tok(Tok::LineSubtle)),
             sel_bg: opaque(sel),
-            row_sel: opaque(mix(sel, p.tok(Tok::WindowBg), 1, 2)),
+            row_sel: opaque(mix(sel, p.tok(Tok::SurfaceSidebar), 1, 2)),
         }
     }
     /// An appearance token's ink (the names `syntax_core::APPEARANCE_TOKENS` holds; `Accent` = the chosen accent).
@@ -93,10 +93,10 @@ impl Theme {
             "SyntaxCode" => l.tok(Tok::SyntaxCode),
             "SyntaxNum" => l.tok(Tok::SyntaxNum),
             "SyntaxLit" => l.tok(Tok::SyntaxLit),
-            "ErrorText" => l.tok(Tok::ErrorText),
-            "TitleTextInactive" => l.tok(Tok::TitleTextInactive),
-            "Accent" => l.accent(),
-            _ => l.tok(Tok::ContentText),
+            "ErrorText" => l.tok(Tok::InkCritical), // syntax_core's vocabulary keeps the old spellings (its lane);
+            "TitleTextInactive" => l.tok(Tok::TextSecondary), // DESIGNAPPLY (B639) maps them to the tokens doing the job
+            "Accent" => l.accent_ink(),
+            _ => l.tok(Tok::TextPrimary),
         })
     }
 }

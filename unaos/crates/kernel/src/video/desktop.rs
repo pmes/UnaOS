@@ -254,7 +254,7 @@ fn body(h: &Head) -> (Rect, i32) {
 
 /// The title band's two stops: a gentle vertical gradient on Light, flat on Dark.
 fn title_stops() -> (u32, u32) {
-    let face = theme::chrome_face();
+    let face = theme::surface_window();
     if theme::is_dark() {
         (face, face)
     } else {
@@ -265,7 +265,7 @@ fn title_stops() -> (u32, u32) {
 /// A disc's fill: the theme's control colour, or the desaturated grey on an unfocused window.
 fn disc_fill(which: usize, focused: bool) -> u32 {
     if !focused {
-        return draw::blend(theme::chrome_face(), theme::content_text(), CRAFT.idle_disc);
+        return draw::blend(theme::surface_window(), theme::text_primary(), CRAFT.idle_disc);
     }
     match which {
         0 => theme::ctrl_close(),
@@ -357,7 +357,7 @@ pub fn chrome_row(row: &mut [u32], h: &Head, j: usize, bx: usize, by: usize, bac
     }
     let adv = text::advance(&h.title[..n], true, face);
     let tx = (bw.saturating_sub(adv) / 2).max(reserve);
-    let ink = if h.focused { theme::title_text_active() } else { theme::title_text_inactive() };
+    let ink = if h.focused { theme::text_primary() } else { theme::text_secondary() };
     text::draw_row(&mut *s.px, bw, &h.title[..n], tx, (jj - ty) as usize, ink, true, face);
 }
 
@@ -498,7 +498,7 @@ fn damage_head(id: super::WinId) {
 pub fn bar_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize, back: Option<&Back>) {
     let out = &mut out[..w];
     back_soft(back, out, x0, y0 + j);
-    let face = theme::chrome_face();
+    let face = theme::surface_window();
     for p in out.iter_mut() {
         *p = draw::blend(*p, face, CRAFT.bar_tint);
     }
@@ -524,8 +524,8 @@ pub fn battery_row(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, bod
     let y0 = (h as i32 - bh) / 2 - j as i32;
     let x0 = x0 as i32;
     let mut s = Surf::new(&mut out[..w], w);
-    let outline = theme::title_text_inactive();
-    let ink = if percent <= 10 && !charging { theme::error_text() } else { theme::title_text_active() };
+    let outline = theme::text_secondary();
+    let ink = if percent <= 10 && !charging { theme::ink_critical() } else { theme::text_primary() };
     let r = Rect::new(x0, y0, bw, bh);
     let rad = (bh / 4).max(1);
     draw::stroke_rrect(&mut s, r, rad, 1, Ink::new(outline, 200));
@@ -556,7 +556,7 @@ pub fn battery_row(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, bod
 pub fn dock_plate_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize, back: Option<&Back>) {
     let out = &mut out[..w];
     back_soft(back, out, x0, y0 + j);
-    let face = theme::chrome_face();
+    let face = theme::surface_window();
     for p in out.iter_mut() {
         *p = draw::blend(*p, face, CRAFT.dock_tint);
     }
@@ -601,7 +601,7 @@ pub fn dock_tile_row(out: &mut [u32], w: usize, j: usize, x: usize, y: usize, tw
         if running && j < y + th + pad {
             let dd = d(CRAFT.dot).max(2);
             let r = Rect::new((x + tw / 2) as i32 - dd / 2, (y + th) as i32 + (pad as i32 - dd) / 2 - jj, dd, dd);
-            draw::fill_disc(&mut s, r, Ink::new(theme::content_text(), CRAFT.dot_alpha));
+            draw::fill_disc(&mut s, r, Ink::new(theme::text_primary(), CRAFT.dot_alpha));
         }
         return;
     }
@@ -610,10 +610,10 @@ pub fn dock_tile_row(out: &mut [u32], w: usize, j: usize, x: usize, y: usize, tw
     }
     let r = Rect::new(x as i32, y as i32 - jj, tw as i32, th as i32);
     let rad = draw::icon_radius(tw.min(th)) as i32;
-    let face = if pressed { theme::button_face_pressed() } else { theme::button_face() };
+    let face = if pressed { theme::surface_sunken() } else { theme::surface_raised() };
     draw::fill_rrect(&mut s, r, rad, face);
     if hover {
-        draw::fill_rrect(&mut s, r, rad, Ink::new(theme::content_text(), CRAFT.dock_hover));
+        draw::fill_rrect(&mut s, r, rad, Ink::new(theme::text_primary(), CRAFT.dock_hover));
     }
     draw::stroke_rrect(&mut s, r, rad, 1, Ink::argb(theme::hairline()));
 }
@@ -846,7 +846,7 @@ pub fn selftest() {
             });
         }
         // The content (a flat document face; the app paints this on the glass).
-        let cf = theme::content_fill();
+        let cf = theme::surface_content();
         for y in fy + b + t..fy + bh - b {
             frame[y * pw + fx + b..y * pw + fx + bw - b].fill(cf);
         }

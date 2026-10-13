@@ -953,11 +953,11 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
     // The strip's material is anchored to the STRIP, not to the panel: index ceramic by the row's
     // offset inside the box, exactly as the window chrome indexes it by the row's offset inside the
     // window. The grain then belongs to the object.
-    let face = ceramic::shade(theme::chrome_face(), j);
-    let line = ceramic::shade(theme::frame_line(), j);
+    let face = ceramic::shade(theme::surface_window(), j);
+    let line = ceramic::shade(theme::line_subtle(), j);
     // The row's interior colour: the top bevel hairline for the first `BEVEL` rows under the keyline,
     // the chrome face everywhere else.
-    let fill = if j >= 1 && j < 1 + theme::BEVEL() { theme::bevel_light() } else { face };
+    let fill = if j >= 1 && j < 1 + theme::BEVEL() { theme::surface_raised() } else { face };
     if j == 0 || j + 1 == l.h {
         for i in 0..l.w {
             out[i] = line;
@@ -991,7 +991,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
             let d = IND_D();
             let px0 = bx + tw / 2 - d / 2;
             let py0 = by + th + (PAD() - d) / 2;
-            let ink = if r.visible { theme::accent() } else { theme::scroll_thumb() };
+            let ink = if r.visible { theme::accent() } else { theme::line_strong() };
             for i in px0..(px0 + d).min(l.w) {
                 if strip::in_disc(i, j, px0, py0, d) {
                     out[i] = ink;
@@ -1004,9 +1004,9 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         }
         // The tile face — the material at the CONTROL gain (see the module header).
         let base = if r.id == pressed || dnd_app_lit(r.id) {
-            theme::button_face_pressed()
+            theme::surface_sunken()
         } else {
-            theme::button_face()
+            theme::surface_raised()
         };
         let tface = ceramic::shade_gain(base, j, ceramic::CONTROL_GAIN_Q16);
         // Same span-then-patch shape as the strip: the tile's straight middle is a flat run, and the
@@ -1045,9 +1045,9 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         }
         let sy = j - ty0;
         let ink = if r.focused {
-            theme::title_text_active()
+            theme::text_primary()
         } else {
-            theme::title_text_inactive()
+            theme::text_secondary()
         };
         // FONT (GR27) — the shared anti-aliased face, alpha-composited over the tile face the row
         // loop above just painted (a RAM scratch row, so the blend's read is cached). Regular
@@ -3038,11 +3038,11 @@ fn menu_box(out: &mut [u32], ow: usize, bx: usize, g: MenuGeo, j: usize) {
     if j >= g.mh { return; }
     let (row, sy0) = (j / TILE_H(), (j % TILE_H()) as isize - ((TILE_H() - CELL_H()) / 2) as isize);
     let hot = row == g.hover;
-    let face = if hot { theme::accent() } else { theme::button_face() };
-    let ink = if hot { theme::button_face() } else { theme::title_text_active() };
+    let face = if hot { theme::accent() } else { theme::surface_raised() };
+    let ink = if hot { theme::surface_raised() } else { theme::text_primary() };
     let edge_row = j == 0 || j + 1 == g.mh;
     for i in 0..g.mw {
-        out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::frame_line() } else { face };
+        out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::line_subtle() } else { face };
     }
     let mut wbuf = [0u8; wm::MAX_TITLE];
     let label: &[u8] = if g.owner == TRASH_OWNER { b"Empty Trash..." } else if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3; DOCK2 the six items
@@ -3888,7 +3888,7 @@ fn thumbs_refresh(l: &Layout, rows: &[wm::DockEntry]) {
         if dock2_group(r) != 1 || l.is_overflow(t) { continue; }
         let mut px = alloc::vec::Vec::new();
         if px.try_reserve_exact(w * h).is_err() { continue; }
-        px.resize(w * h, ceramic::shade_gain(theme::button_face(), 0, ceramic::CONTROL_GAIN_Q16));
+        px.resize(w * h, ceramic::shade_gain(theme::surface_raised(), 0, ceramic::CONTROL_GAIN_Q16));
         if wm::thumb(r.id, &mut px, w, h) { th.push((r.id, w, h, px)); }
     }
 }
@@ -3901,10 +3901,10 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
             let (bx, by) = (tx - l.x, ty - l.y);
             if l.vert {
                 let sy = by.saturating_sub((PAD() / 8).max(1) + 1);
-                if j == sy { for i in bx..(bx + tw).min(l.w) { out[i] = theme::frame_line(); } }
+                if j == sy { for i in bx..(bx + tw).min(l.w) { out[i] = theme::line_subtle(); } }
             } else if j >= by && j < by + th {
                 let sx = bx.saturating_sub(PAD() / 2 + 1);
-                if sx < l.w { out[sx] = theme::frame_line(); }
+                if sx < l.w { out[sx] = theme::line_subtle(); }
             }
         }
     }
@@ -3925,7 +3925,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
             let d = IND_D();
             let (px0, py0) = (bx + tw / 2 - d / 2, by + th + (PAD() - d) / 2);
             let lit = LAUNCH_PHASE.load(Ordering::Relaxed) & 1 == 0;
-            let ink = if r.id == TRASH_PIN_ID { ceramic::shade(theme::chrome_face(), j) } else if lit { theme::accent() } else { theme::scroll_thumb() };
+            let ink = if r.id == TRASH_PIN_ID { ceramic::shade(theme::surface_window(), j) } else if lit { theme::accent() } else { theme::line_strong() };
             for i in px0.saturating_sub(1)..(px0 + d + 1).min(l.w) {
                 if strip::in_disc(i, j, px0, py0, d) || r.id == TRASH_PIN_ID { out[i] = ink; }
             }
@@ -3947,7 +3947,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
 
 /// Our Trash glyph, one row: a lid with a handle over a can; FULL fills the can, EMPTY draws its ribs.
 fn trash_glyph_row(out: &mut [u32], bx: usize, tw: usize, th: usize, y: usize, full: bool, face: u32) {
-    let ink = theme::title_text_active();
+    let ink = theme::text_primary();
     for i in bx + 2..bx + tw - 2 { if i < out.len() { out[i] = face; } }
     let gh = (th * 2 / 3).max(8);
     let gw = (gh * 3 / 4).max(6);
@@ -4467,7 +4467,7 @@ pub(crate) fn dnd_hover(on: bool) {
 
 /// The Trash glyph's face while a drag hovers it.
 fn dnd_face() -> u32 {
-    if DND_HOT.load(Ordering::Relaxed) { theme::selection() } else { theme::button_face() }
+    if DND_HOT.load(Ordering::Relaxed) { theme::selection() } else { theme::surface_raised() }
 }
 
 /// A drop on the Trash tile: DOCK2's trash path for one item. `Ok(<name in the Trash>)`.
@@ -5051,7 +5051,7 @@ fn craft_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32, 
         if j < ty0 || j >= ty0 + CELL_H() {
             continue;
         }
-        let ink = if r.focused { theme::title_text_active() } else { theme::title_text_inactive() };
+        let ink = if r.focused { theme::text_primary() } else { theme::text_secondary() };
         let mut ob = [0u8; 8];
         let (cap, cap_len) = if l.is_overflow(t) { let k = overflow_label(l.overflow, &mut ob); (&ob[..], k) } else { (&r.title[..], r.title_len) };
         let cols = super::text::fit(&cap[..l.glyphs.min(cap_len)], false, FACE, l.glyphs * FACE.cell_w());

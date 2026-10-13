@@ -383,13 +383,13 @@ fn ghost_open(label: &str, x: i32, y: i32) {
             serial_println!("[dnd] ghost DECLINE reason=oom");
             return;
         }
-        let bg = theme::content_fill();
+        let bg = theme::surface_content();
         surf.resize(w * h, mix50(theme::selection(), bg));
         for i in 0..w {
-            surf[i] = mix50(theme::frame_line(), bg);
-            surf[(h - 1) * w + i] = mix50(theme::frame_line(), bg);
+            surf[i] = mix50(theme::line_subtle(), bg);
+            surf[(h - 1) * w + i] = mix50(theme::line_subtle(), bg);
         }
-        text::draw_text(&mut surf, w, w, h, pad, pad, s, mix50(theme::content_text(), bg), false, face);
+        text::draw_text(&mut surf, w, w, h, pad, pad, s, mix50(theme::text_primary(), bg), false, face);
         let (gx, gy) = ghost_at(x, y, w, h);
         let win = wm::overlay_open(surf.as_ptr() as usize, w * h * 4, w, h, gx, gy);
         if win == wm::WIN_NONE {

@@ -397,9 +397,9 @@ fn rect(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
 /// CRISPY raised/sunken bevel: light on top+left when raised, inverted when sunken.
 fn bevel(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, raised: bool) {
     let (lt, rb) = if raised {
-        (theme::bevel_light(), theme::bevel_shadow())
+        (theme::surface_raised(), theme::line_strong())
     } else {
-        (theme::bevel_shadow(), theme::bevel_light())
+        (theme::line_strong(), theme::surface_raised())
     };
     for i in 0..crate::ui::base::BEVEL {
         fill(px, x + i, y + i, w - 2 * i, 1, lt);
@@ -443,10 +443,10 @@ fn fmt_size(buf: &mut [u8; 16], bytes: u64) -> &[u8] {
 
 fn button(px: &mut [u32], x: usize, y: usize, w: usize, label: &[u8], primary: bool) {
     let h = crate::ui::base::BUTTON_HEIGHT + 6;
-    fill(px, x, y, w, h, if primary { theme::button_face() } else { theme::chrome_face() });
+    fill(px, x, y, w, h, if primary { theme::surface_raised() } else { theme::surface_window() });
     bevel(px, x, y, w, h, true);
     let tx = x + (w.saturating_sub(label.len() * CELL_W)) / 2;
-    text(px, tx, y + (h - CELL_H) / 2, label, theme::button_text());
+    text(px, tx, y + (h - CELL_H) / 2, label, theme::text_primary());
     if primary {
         rect(px, x - 2, y - 2, w + 4, h + 4, theme::accent());
     }
@@ -466,7 +466,7 @@ fn repaint() {
     // — every other window's pixels belong to a ring-3 app. `super::paper` derives its base from
     // `theme::CONTENT_FILL`, so the flat fill this replaces is exactly the texture's mean; nothing
     // drawn on top (text, rows, buttons) moves by a pixel.
-    fill(px, 0, 0, W, H, theme::chrome_face());
+    fill(px, 0, 0, W, H, theme::surface_window());
     bevel(px, 4, 4, W - 8, H - 8, false);
     super::paper::fill_rect(
         px,
@@ -480,9 +480,9 @@ fn repaint() {
     let lx = 24; #[cfg(feature = "ahciroot")] if install3::paint(px) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } if st == State::Choose && plan_view_paint(px, lx) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } // SELFINSTALL2 M3: the SSD plan view (key `i`), see the file tail
     match st {
         State::Choose => {
-            text(px, lx, 20, b"Install UnaOS", theme::content_text());
-            fill(px, lx, 42, W - 2 * lx, 2, theme::frame_line());
-            text(px, lx, 54, b"Choose a target disk:", theme::content_text());
+            text(px, lx, 20, b"Install UnaOS", theme::text_primary());
+            fill(px, lx, 42, W - 2 * lx, 2, theme::line_subtle());
+            text(px, lx, 54, b"Choose a target disk:", theme::text_primary());
 
             let mut devs: [Option<Row>; 2] = [None; 2];
             let n = devices(&mut devs);
@@ -491,9 +491,9 @@ fn repaint() {
                 // Storage enumerates asynchronously (USB bring-up finishes well after the
                 // compositor activates), so "none yet" is the normal opening state — say so,
                 // and keep re-checking (`service`) rather than freezing the first answer.
-                text(px, lx, 84, b"No disks yet - waiting for USB", theme::content_text());
-                text(px, lx, 84 + CELL_H + 6, b"enumeration. Attach a disk and", theme::title_text_inactive());
-                text(px, lx, 84 + 2 * (CELL_H + 6), b"it appears here by itself.", theme::title_text_inactive());
+                text(px, lx, 84, b"No disks yet - waiting for USB", theme::text_primary());
+                text(px, lx, 84 + CELL_H + 6, b"enumeration. Attach a disk and", theme::text_secondary());
+                text(px, lx, 84 + 2 * (CELL_H + 6), b"it appears here by itself.", theme::text_secondary());
             }
             let mut boot_rows = 0usize;
             for i in 0..n {
@@ -504,7 +504,7 @@ fn repaint() {
                 // land on it (see `step_selectable`), so painting one would be a lie about what Enter
                 // would do.
                 let selected = i == sel && !row.boot;
-                let row_bg = if selected { theme::scroll_thumb() } else { theme::content_fill() };
+                let row_bg = if selected { theme::line_strong() } else { theme::surface_content() };
                 fill(px, lx, ry - 4, W - 2 * lx, CELL_H + 12, row_bg);
                 if selected {
                     rect(px, lx, ry - 4, W - 2 * lx, CELL_H + 12, theme::accent());
@@ -523,9 +523,9 @@ fn repaint() {
                 // theme uses everywhere else for an inert control.
                 let fg = if row.boot {
                     line[22..27].copy_from_slice(b" BOOT");
-                    theme::title_text_inactive()
+                    theme::text_secondary()
                 } else {
-                    theme::content_text()
+                    theme::text_primary()
                 };
                 if row.boot {
                     boot_rows += 1;
@@ -537,18 +537,18 @@ fn repaint() {
             // is the kind of thing an operator works around by rebooting into something less careful.
             if boot_rows > 0 {
                 let ry = 84 + n * (CELL_H + 22) + 4;
-                text(px, lx, ry, b"BOOT = the disk this system", theme::title_text_inactive());
-                text(px, lx, ry + CELL_H + 4, b"booted from. Not installable.", theme::title_text_inactive());
+                text(px, lx, ry, b"BOOT = the disk this system", theme::text_secondary());
+                text(px, lx, ry + CELL_H + 4, b"booted from. Not installable.", theme::text_secondary());
             }
             if n > 0 && !selectable {
                 let ry = 84 + n * (CELL_H + 22) + 2 * (CELL_H + 4) + 8;
-                text(px, lx, ry, b"Attach another disk to", theme::content_text());
-                text(px, lx, ry + CELL_H + 4, b"install onto.", theme::content_text());
+                text(px, lx, ry, b"Attach another disk to", theme::text_primary());
+                text(px, lx, ry + CELL_H + 4, b"install onto.", theme::text_primary());
             }
             // Exits are ALWAYS on screen: an installer that can only go forward is a trap.
-            text(px, lx, H - 100, b"w/s select   Enter continue", theme::title_text_inactive());
-            text(px, lx, H - 100 + CELL_H + 4, b"Esc boot this live system", theme::title_text_inactive());
-            text(px, lx, H - 100 + 2 * (CELL_H + 4), b"q  halt the machine", theme::title_text_inactive()); text(px, lx, H - 100 + 3 * (CELL_H + 4), b"i  SSD install plan", theme::title_text_inactive()); // SELFINSTALL2 M3
+            text(px, lx, H - 100, b"w/s select   Enter continue", theme::text_secondary());
+            text(px, lx, H - 100 + CELL_H + 4, b"Esc boot this live system", theme::text_secondary());
+            text(px, lx, H - 100 + 2 * (CELL_H + 4), b"q  halt the machine", theme::text_secondary()); text(px, lx, H - 100 + 3 * (CELL_H + 4), b"i  SSD install plan", theme::text_secondary()); // SELFINSTALL2 M3
             if n > 0 && selectable {
                 button(px, W - 190, H - 52, 160, b"Continue", true);
             }
@@ -558,16 +558,16 @@ fn repaint() {
             // glass, in the same words the serial log carries. What the operator is being shown is
             // the DISK'S OWN CONTENT — read off the medium, not read off the partition table's
             // declarations — because that is what decides whether a slot is ours to take.
-            text(px, lx, 20, b"What is on this disk", theme::content_text());
-            fill(px, lx, 42, W - 2 * lx, 2, theme::frame_line());
+            text(px, lx, 20, b"What is on this disk", theme::text_primary());
+            fill(px, lx, 42, W - 2 * lx, 2, theme::line_subtle());
             let parts = PARTS.lock();
             let psel = PSEL.load(Ordering::Relaxed) as usize;
             let whole_ok = WHOLE_OK.load(Ordering::Relaxed);
             let has_gpt = HAS_GPT.load(Ordering::Relaxed);
             let selectable = parts.iter().any(|p| p.empty);
             if !has_gpt {
-                text(px, lx, 62, b"No partition table here.", theme::content_text());
-                text(px, lx, 62 + CELL_H + 6, b"Nothing to install into.", theme::title_text_inactive());
+                text(px, lx, 62, b"No partition table here.", theme::text_primary());
+                text(px, lx, 62 + CELL_H + 6, b"Nothing to install into.", theme::text_secondary());
             }
             for (i, pr) in parts.iter().enumerate() {
                 let ry = 62 + i * (CELL_H + 10);
@@ -575,7 +575,7 @@ fn repaint() {
                     break; // the fixture disk has five; a bigger table simply paints what fits
                 }
                 let sel = i == psel && pr.empty;
-                fill(px, lx, ry - 3, W - 2 * lx, CELL_H + 6, if sel { theme::scroll_thumb() } else { theme::content_fill() });
+                fill(px, lx, ry - 3, W - 2 * lx, CELL_H + 6, if sel { theme::line_strong() } else { theme::surface_content() });
                 if sel {
                     rect(px, lx, ry - 3, W - 2 * lx, CELL_H + 6, theme::accent());
                 }
@@ -584,7 +584,7 @@ fn repaint() {
                     Some(t) => glass_reason(t),
                 };
                 let line = alloc::format!("p{} {:>5}M {:<7} {}", pr.index, pr.mib, pr.tag, label);
-                let fg = if pr.refusal.is_none() { theme::content_text() } else { theme::title_text_inactive() };
+                let fg = if pr.refusal.is_none() { theme::text_primary() } else { theme::text_secondary() };
                 text(px, lx + 6, ry, line.as_bytes(), fg);
             }
             // THE WHOLE-DISK AFFORDANCE, AND WHERE IT IS NOT. On a disk carrying anything that is
@@ -592,17 +592,17 @@ fn repaint() {
             // modifier — it is ABSENT, and the reason is on the glass in place of it. R25.
             let ry = H - 116;
             if whole_ok {
-                text(px, lx, ry, b"d  erase the WHOLE disk", theme::content_text());
+                text(px, lx, ry, b"d  erase the WHOLE disk", theme::text_primary());
             } else {
-                text(px, lx, ry, b"Whole-disk install is not", theme::title_text_inactive());
-                text(px, lx, ry + CELL_H + 2, b"offered: this disk holds", theme::title_text_inactive());
-                text(px, lx, ry + 2 * (CELL_H + 2), b"volumes that are not ours.", theme::title_text_inactive());
+                text(px, lx, ry, b"Whole-disk install is not", theme::text_secondary());
+                text(px, lx, ry + CELL_H + 2, b"offered: this disk holds", theme::text_secondary());
+                text(px, lx, ry + 2 * (CELL_H + 2), b"volumes that are not ours.", theme::text_secondary());
             }
             text(px, lx, H - 52 + 4, if selectable {
                 b"w/s pick  Enter install  Esc".as_slice()
             } else {
                 b"Esc back   q halt".as_slice()
-            }, theme::title_text_inactive());
+            }, theme::text_secondary());
             if selectable {
                 button(px, W - 190, H - 52, 160, b"Install", true);
             }
@@ -610,9 +610,9 @@ fn repaint() {
         State::Warn => {
             // The warning panel: CRISPY has no alarm red by design; the accent
             // frame + pressed-face field + explicit words carry the weight.
-            text(px, lx, 20, b"Erase and install?", theme::content_text());
-            fill(px, lx, 42, W - 2 * lx, 2, theme::frame_line());
-            fill(px, lx, 58, W - 2 * lx, 120, theme::button_face_pressed());
+            text(px, lx, 20, b"Erase and install?", theme::text_primary());
+            fill(px, lx, 42, W - 2 * lx, 2, theme::line_subtle());
+            fill(px, lx, 58, W - 2 * lx, 120, theme::surface_sunken());
             bevel(px, lx, 58, W - 2 * lx, 120, false);
             rect(px, lx + 2, 60, W - 2 * lx - 4, 116, theme::accent());
             // INSTALL-SEL: the device named here is resolved from the COMMITTED identity through
@@ -626,11 +626,11 @@ fn repaint() {
             let bound = pending.and_then(|(id, _)| block::lookup(id).map(|d| (id, d)));
             match bound {
                 Some((_, d)) => {
-                    text(px, lx + 14, 72, b"THIS ERASES EVERYTHING", theme::content_text());
-                    text(px, lx + 14, 72 + CELL_H + 6, b"on the disk named below:", theme::content_text());
+                    text(px, lx + 14, 72, b"THIS ERASES EVERYTHING", theme::text_primary());
+                    text(px, lx + 14, 72 + CELL_H + 6, b"on the disk named below:", theme::text_primary());
                     // Product is the operator-legible name; vendor + slot + size are what let them
                     // tell two similar sticks apart on a bench where both are plugged in.
-                    text(px, lx + 14, 72 + 2 * (CELL_H + 6), &d.product, theme::content_text());
+                    text(px, lx + 14, 72 + 2 * (CELL_H + 6), &d.product, theme::text_primary());
                     let mut line = [b' '; 26];
                     line[..8].copy_from_slice(&d.vendor);
                     line[9..13].copy_from_slice(b"slot");
@@ -639,17 +639,17 @@ fn repaint() {
                     let s = fmt_size(&mut sz, d.num_blocks * d.block_size as u64);
                     let tail = 26 - s.len();
                     line[tail..].copy_from_slice(s);
-                    text(px, lx + 14, 72 + 3 * (CELL_H + 6), &line, theme::content_text());
+                    text(px, lx + 14, 72 + 3 * (CELL_H + 6), &line, theme::text_primary());
                 }
                 None => {
                     // The chosen disk left between the chooser and this frame (a disconnect retracts
                     // its registry entry). Say so plainly and withdraw the Install affordance — the
                     // engine would refuse anyway, but an installer must not offer a go it knows is
                     // dead, and it must never quietly re-aim at a disk still in the list.
-                    text(px, lx + 14, 72, b"The disk you chose is no", theme::content_text());
-                    text(px, lx + 14, 72 + CELL_H + 6, b"longer attached.", theme::content_text());
-                    text(px, lx + 14, 72 + 2 * (CELL_H + 6), b"Nothing has been written.", theme::content_text());
-                    text(px, lx + 14, 72 + 3 * (CELL_H + 6), b"Esc back, then choose again.", theme::title_text_inactive());
+                    text(px, lx + 14, 72, b"The disk you chose is no", theme::text_primary());
+                    text(px, lx + 14, 72 + CELL_H + 6, b"longer attached.", theme::text_primary());
+                    text(px, lx + 14, 72 + 2 * (CELL_H + 6), b"Nothing has been written.", theme::text_primary());
+                    text(px, lx + 14, 72 + 3 * (CELL_H + 6), b"Esc back, then choose again.", theme::text_secondary());
                 }
             }
             // INSTALLVERB: say WHICH engine this screen arms. It is the WHOLE-DISK one, and this
@@ -658,43 +658,43 @@ fn repaint() {
             // FONTS2X carry: the SENTENCE is hw-rmbp's (INSTALLVERB replaced the blank-check wording
             // ad62cf09 still carried); the CELL -> CELL_H rename is FONTS2X's, and `font::CELL_H` is
             // the same 16 the old `CELL` was, so the layout is unchanged to the pixel.
-            text(px, lx, 200, b"This erases the WHOLE disk.", theme::content_text());
-            text(px, lx, 200 + CELL_H + 4, b"The census found nothing here", theme::title_text_inactive());
-            text(px, lx, 200 + 2 * (CELL_H + 4), b"that is not ours.", theme::title_text_inactive());
+            text(px, lx, 200, b"This erases the WHOLE disk.", theme::text_primary());
+            text(px, lx, 200 + CELL_H + 4, b"The census found nothing here", theme::text_secondary());
+            text(px, lx, 200 + 2 * (CELL_H + 4), b"that is not ours.", theme::text_secondary());
             if bound.is_some() {
-                text(px, lx, H - 92, b"Enter install    Esc back", theme::title_text_inactive());
+                text(px, lx, H - 92, b"Enter install    Esc back", theme::text_secondary());
                 button(px, W - 190, H - 52, 160, b"Install", true);
             } else {
-                text(px, lx, H - 92, b"Esc back", theme::title_text_inactive());
+                text(px, lx, H - 92, b"Esc back", theme::text_secondary());
             }
             button(px, W - 370, H - 52, 160, b"Back", false);
         }
         State::Running => {
-            text(px, lx, 20, b"Installing...", theme::content_text());
-            fill(px, lx, 42, W - 2 * lx, 2, theme::frame_line());
-            text(px, lx, 84, b"GPT + FAT32 + payload + verify", theme::content_text());
-            text(px, lx, 84 + CELL_H + 6, b"Progress on the console window.", theme::title_text_inactive());
+            text(px, lx, 20, b"Installing...", theme::text_primary());
+            fill(px, lx, 42, W - 2 * lx, 2, theme::line_subtle());
+            text(px, lx, 84, b"GPT + FAT32 + payload + verify", theme::text_primary());
+            text(px, lx, 84 + CELL_H + 6, b"Progress on the console window.", theme::text_secondary());
             // Indeterminate bar: the engine is synchronous; this frame shows
             // during the run because we present before calling it.
-            fill(px, lx, 150, W - 2 * lx, 22, theme::scroll_track());
+            fill(px, lx, 150, W - 2 * lx, 22, theme::surface_sunken());
             bevel(px, lx, 150, W - 2 * lx, 22, false);
             fill(px, lx + 4, 154, (W - 2 * lx) / 3, 14, theme::accent());
         }
         State::Done(ok) => {
-            text(px, lx, 20, if ok { b"Install PASSED".as_slice() } else { b"Install refused/failed".as_slice() }, theme::content_text());
-            fill(px, lx, 42, W - 2 * lx, 2, theme::frame_line());
+            text(px, lx, 20, if ok { b"Install PASSED".as_slice() } else { b"Install refused/failed".as_slice() }, theme::text_primary());
+            fill(px, lx, 42, W - 2 * lx, 2, theme::line_subtle());
             if ok {
-                text(px, lx, 84, b"GPT written, ESP formatted,", theme::content_text());
-                text(px, lx, 84 + CELL_H + 6, b"payload verified extent-by-", theme::content_text());
-                text(px, lx, 84 + 2 * (CELL_H + 6), b"extent. See console verdicts.", theme::content_text());
+                text(px, lx, 84, b"GPT written, ESP formatted,", theme::text_primary());
+                text(px, lx, 84 + CELL_H + 6, b"payload verified extent-by-", theme::text_primary());
+                text(px, lx, 84 + 2 * (CELL_H + 6), b"extent. See console verdicts.", theme::text_primary());
             } else {
                 // FONTS2X carry: hw-rmbp's sentence, FONTS2X's CELL -> CELL_H.
-                text(px, lx, 84, b"The installer declined and", theme::content_text());
-                text(px, lx, 84 + CELL_H + 6, b"wrote nothing. The console", theme::content_text());
-                text(px, lx, 84 + 2 * (CELL_H + 6), b"log names the exact reason", theme::content_text());
-                text(px, lx, 84 + 3 * (CELL_H + 6), b"it gave.", theme::content_text());
+                text(px, lx, 84, b"The installer declined and", theme::text_primary());
+                text(px, lx, 84 + CELL_H + 6, b"wrote nothing. The console", theme::text_primary());
+                text(px, lx, 84 + 2 * (CELL_H + 6), b"log names the exact reason", theme::text_primary());
+                text(px, lx, 84 + 3 * (CELL_H + 6), b"it gave.", theme::text_primary());
             }
-            text(px, lx, H - 92, b"Esc close", theme::title_text_inactive());
+            text(px, lx, H - 92, b"Esc close", theme::text_secondary());
             button(px, W - 190, H - 52, 160, b"Close", true);
         }
         State::Gone => {
@@ -702,14 +702,14 @@ fn repaint() {
             // screen but not at the instant the engine bound it (or when it never resolved and a key
             // still arrived). The one thing worth saying loudest is the thing an operator will
             // actually worry about: no disk was touched, including the ones still attached.
-            text(px, lx, 20, b"Target disk is gone", theme::content_text());
-            fill(px, lx, 42, W - 2 * lx, 2, theme::frame_line());
-            text(px, lx, 84, b"The disk you selected was not", theme::content_text());
-            text(px, lx, 84 + CELL_H + 6, b"attached when the install was", theme::content_text());
-            text(px, lx, 84 + 2 * (CELL_H + 6), b"about to begin. NOTHING was", theme::content_text());
-            text(px, lx, 84 + 3 * (CELL_H + 6), b"written - not to it, and not", theme::content_text());
-            text(px, lx, 84 + 4 * (CELL_H + 6), b"to any other disk.", theme::content_text());
-            text(px, lx, H - 92, b"Enter choose again   Esc close", theme::title_text_inactive());
+            text(px, lx, 20, b"Target disk is gone", theme::text_primary());
+            fill(px, lx, 42, W - 2 * lx, 2, theme::line_subtle());
+            text(px, lx, 84, b"The disk you selected was not", theme::text_primary());
+            text(px, lx, 84 + CELL_H + 6, b"attached when the install was", theme::text_primary());
+            text(px, lx, 84 + 2 * (CELL_H + 6), b"about to begin. NOTHING was", theme::text_primary());
+            text(px, lx, 84 + 3 * (CELL_H + 6), b"written - not to it, and not", theme::text_primary());
+            text(px, lx, 84 + 4 * (CELL_H + 6), b"to any other disk.", theme::text_primary());
+            text(px, lx, H - 92, b"Enter choose again   Esc close", theme::text_secondary());
             button(px, W - 190, H - 52, 160, b"Choose", true);
         }
         State::Closed => {}
@@ -1200,8 +1200,8 @@ fn plan_view_paint(px: &mut [u32], lx: usize) -> bool {
     }
     let guard = PLAN_LINES.lock();
     let Some(lines) = guard.as_ref() else { return false };
-    text(px, lx, 20, b"SSD install plan", theme::content_text());
-    fill(px, lx, 42, W - 2 * lx, 2, theme::frame_line());
+    text(px, lx, 20, b"SSD install plan", theme::text_primary());
+    fill(px, lx, 42, W - 2 * lx, 2, theme::line_subtle());
     let cols = (W - 2 * lx) / CELL_W;
     let mut y = 54;
     for l in lines.iter() {
@@ -1210,13 +1210,13 @@ fn plan_view_paint(px: &mut [u32], lx: usize) -> bool {
         // Wrap long lines at the column budget so nothing the verb prints is clipped off glass.
         while off < b.len() && y + CELL_H < H - 60 {
             let end = core::cmp::min(off + cols, b.len());
-            text(px, lx, y, &b[off..end], theme::content_text());
+            text(px, lx, y, &b[off..end], theme::text_primary());
             off = end;
             y += CELL_H + 4;
         }
     }
-    text(px, lx, H - 52, b"Enter/Esc back - write it with", theme::title_text_inactive());
-    text(px, lx, H - 52 + CELL_H + 4, b"`install ssd --write` in the shell", theme::title_text_inactive());
+    text(px, lx, H - 52, b"Enter/Esc back - write it with", theme::text_secondary());
+    text(px, lx, H - 52 + CELL_H + 4, b"`install ssd --write` in the shell", theme::text_secondary());
     true
 }
 

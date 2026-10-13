@@ -230,20 +230,20 @@ pub fn open() -> bool {
     if buf.try_reserve_exact(w * h).is_err() {
         return false;
     }
-    buf.resize(w * h, theme::chrome_face());
+    buf.resize(w * h, theme::surface_window());
     for x in 0..w {
-        buf[x] = theme::frame_line();
-        buf[(h - 1) * w + x] = theme::frame_line();
+        buf[x] = theme::line_subtle();
+        buf[(h - 1) * w + x] = theme::line_subtle();
     }
     for y in 0..h {
-        buf[y * w] = theme::frame_line();
-        buf[y * w + w - 1] = theme::frame_line();
+        buf[y * w] = theme::line_subtle();
+        buf[y * w + w - 1] = theme::line_subtle();
     }
     let draw = |buf: &mut [u32], text: &[u8], x: usize, top: usize, bold: bool| {
         for sy in 0..ch {
             let y = top + sy;
             if y < h {
-                super::text::draw_row(&mut buf[y * w..(y + 1) * w], w, text, x, sy, theme::title_text_active(), bold, menubar::BAR_FACE);
+                super::text::draw_row(&mut buf[y * w..(y + 1) * w], w, text, x, sy, theme::text_primary(), bold, menubar::BAR_FACE);
             }
         }
     };
