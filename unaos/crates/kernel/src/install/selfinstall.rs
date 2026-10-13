@@ -1060,7 +1060,9 @@ impl BesideConsent {
 
 #[cfg(feature = "ahciroot")]
 fn beside_consent(port: u8, sectors: u64, typed: &str) -> Option<BesideConsent> {
-    (typed == beside_token(port, sectors).as_str()).then_some(BesideConsent { port, sectors })
+    // Case-blind: the token binds the port and the exact sector count, not the shift key (the QEMU typist
+    // types letters lower-case, and so may a person).
+    typed.eq_ignore_ascii_case(&beside_token(port, sectors)).then_some(BesideConsent { port, sectors })
 }
 
 /// The table editor's target: reads through the disk, writes ONLY through the two table grants.

@@ -5608,6 +5608,37 @@ x86_install_typist() { # $1 = QMP port, $2 = the capture arroyo is about to writ
     echo "[typist] install sequence typed: install / install global 2 / install global 1 / install --gui + Enter + Enter" >&2
 }
 
+# ── INSTALL4 (rmbp-ledger B619): the SSD verb, typed — `install ssd --dry-run`, then the write ──────────────────
+# The partition legs above never typed `install ssd`, never wrote a SATA disk through the verb and never booted off
+# one (docs/dev/evidence/install4/AUDIT.md row 14). This typist drives the verb on a build whose ONLY SATA target is
+# the virtual SSD `UNAOS_AHCI_DISK` attaches on `ide.1` (the boot ESP keeps `ide.0`; `install ssd` names the first
+# AHCI disk that is not the boot disk). Same chain discipline as `x86_install_typist`: every burst holds on a line
+# the previous one caused; `[desktop] built` (serial_println, ungated — this build has no witness/tests-at-boot)
+# is the boot's ready line. BLANK: the dry run, then `install ssd --write` (verdict blank → the whole-disk install).
+# BESIDE (a stranger fixture): the dry run prints `[install] beside token=BESIDE-<port>-<sectors>`; the plain write
+# must REFUSE; the token is read back off the capture and typed. `qmp_type.py` types letters lower-case, which is
+# why the kernel compares the token without regard to case (`selfinstall::beside_consent`).
+x86_install_ssd_typist() { # $1 = QMP port, $2 = the capture, $3 = the wall, $4 = blank|beside
+    local port="$1" log="$2" secs="$3" mode="$4" budget tok
+    budget=$(( secs > 40 ? secs - 20 : secs ))
+    local -a q=(python3 "${WORKSPACE_DIR}/scripts/qmp_type.py" --port "$port" --connect-timeout 900
+                --marker-log "$log" --marker-timeout "$budget" --char-delay 0.10 --postwait 0)
+    "${q[@]}" --marker '[desktop] built' --wait 20 --text 'install ssd --dry-run' --enter || return $?
+    if [ "$mode" = blank ]; then
+        "${q[@]}" --marker 'cmd="install ssd --dry-run"' --wait 15 --text 'install ssd --write' --enter || return $?
+        echo "[typist] install ssd sequence typed (blank): --dry-run, --write" >&2
+        return 0
+    fi
+    "${q[@]}" --marker '[install] beside token=' --wait 5 --text 'install ssd --write' --enter || return $?
+    tok=$(awk 'index($0, "[install] beside token=") { s = substr($0, index($0, "token=") + 6); sub(/[ \t\r].*$/, "", s); print s; exit }' "$log")
+    if [ -z "$tok" ]; then
+        echo "[typist] the dry run printed no beside token — nothing more typed" >&2
+        return 1
+    fi
+    "${q[@]}" --marker 'cmd="install ssd --write" ->' --wait 10 --text "install ssd --write --beside ${tok}" --enter || return $?
+    echo "[typist] install ssd sequence typed (beside): --dry-run, --write (refused), --write --beside ${tok}" >&2
+}
+
 test_x86_64() {
     local secs="${1:-20}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
@@ -9912,7 +9943,234 @@ test_install() {
         return 1
     }
     echo -e "${COLOR_CYAN}⚡ INSTALLTYPIST: booting the installer leg and typing the install sequence into it (${secs}s, full wall)${COLOR_RESET}"
-    test_x86_64 "$secs"
+    local rc=0
+    test_x86_64 "$secs" || rc=$?
+    # INSTALL4 (B619): the partition leg's capture is kept beside the SSD legs', which write their own logs.
+    cp -f "$SERIAL_LOG" "${WORKSPACE_DIR}/target/serial-install-part.log" 2>/dev/null || true
+    echo -e "${COLOR_CYAN}⚡ INSTALL4: the SSD legs — blank install, reboot off it, beside a stranger, reboot off it${COLOR_RESET}"
+    test_install_ssd "${UNAOS_INSTALL_SSD_SECS:-600}" || rc=1
+    return "$rc"
+}
+
+# ── INSTALL4 (rmbp-ledger B619): the SSD legs of `test-install` ────────────────────────────────────────────────
+# FOUR LEGS after the spec'd partition leg, each verdict an `awk` on its own capture (no spec: these lines are new
+# and a spec nobody has watched pass is the defect the replay rule names):
+#   1. ssd-blank   a sparse 6 GiB BLANK virtual SSD on ide.1; typed `install ssd --dry-run` (verdict=blank,
+#                  plan=gpt+esp512M+clone) and `install ssd --write` (`:: SELFINSTALL: … -> PASS`, `:: SELFINSTALL2:
+#                  plan=2 … fsck=ok … -> PASS`). The builder attaches a FRESH COPY (`UNAOS_AHCI_WRITE`):
+#                  target/ahcifixture.img is the disk the guest wrote.
+#   2. boot-blank  that image as the ONLY disk (OVMF, q35, no ESP, no stick): the firmware's fallback
+#                  EFI/BOOT/BOOTX64.EFI must start, the kernel must find itself on it and root `/` on its UnaFS —
+#                  `:: UNAFSX86: root=unafs src=ahci:… boot=ahci… -> PASS ::`.
+#   3. ssd-beside  a STRANGER fixture (protective MBR, a GPT whose slot 0 is APFS-typed with `NXSB` at +32 — the
+#                  census reads it `content=APFS` — and free space after it): the dry run (`:: INSTALL4: beside …
+#                  -> DRY`), the plain write REFUSED (`verdict=stranger`), `--write --beside <token>` (`:: INSTALL4:
+#                  beside … table=ok … -> PASS`); then, OFF THE IMAGE, LBA 0, the APFS entry and the APFS
+#                  partition's first MiB byte-identical to the fixture, the table valid (both headers, both arrays,
+#                  CRC-32s) with three in-use entries.
+#   4. boot-beside that image as the only disk: `:: UNAFSX86: root=unafs src=ahci:… -> PASS ::`. In QEMU the APFS
+#                  slot is not FAT, so the installed ESP is the disk's FIRST FAT; on the rMBP the Mac's own EFI is
+#                  first and the card-less boot is owed in fs/fat.rs (AUDIT row 12) — this leg cannot see that.
+# The SSD legs build WITHOUT witness / tests-at-boot / census (`env -u`): the unattended install fixture must not
+# race the typist for the virtual SSD (it writes nothing without tests-at-boot, INSTALL4 M1), and the verb is what
+# is under test. Each leg's wall is UNAOS_INSTALL_SSD_SECS (default 600; full wall — the builder has no spec here, and the per-sector WRITE DMA of a 4 GiB volume under TCG is minutes).
+install_ssd_has() { # $1 = log, $2.. = substrings that must ALL be on one line
+    local f="$1"; shift
+    awk -v a="${1:-}" -v b="${2:-}" -v c="${3:-}" '(a == "" || index($0, a)) && (b == "" || index($0, b)) && (c == "" || index($0, c)) { f = 1 } END { exit f ? 0 : 1 }' "$f"
+}
+
+install_ssd_need() { # $1 = leg label, $2 = log, $3.. = substrings (one line carries all)
+    local lbl="$1" f="$2"; shift 2
+    if [ -f "$f" ] && install_ssd_has "$f" "$@"; then
+        echo -e "${COLOR_GREEN}  ✔ ${lbl}: $*${COLOR_RESET}"
+        return 0
+    fi
+    echo -e "${COLOR_RED}  ✖ ${lbl}: no line carries: $*${COLOR_RESET}"
+    return 1
+}
+
+install_ssd_faults() { # $1 = leg label, $2 = log — a panic or a CPU exception reds the leg
+    local n
+    [ -f "$2" ] || { echo -e "${COLOR_RED}  ✖ $1: no capture at $2${COLOR_RESET}"; return 1; }
+    n=$(awk 'index($0, "PANIC") || index($0, "panicked at ") || index($0, "EXCEPTION:") { n++ } END { print n + 0 }' "$2")
+    if [ "$n" -ne 0 ]; then
+        awk 'index($0, "PANIC") || index($0, "panicked at ") || index($0, "EXCEPTION:") { if (++k <= 10) printf("  ✖ %d: %s\n", FNR, $0) }' "$2"
+        echo -e "${COLOR_RED}  ✖ $1: ${n} fault line(s) in $2${COLOR_RESET}"
+        return 1
+    fi
+    return 0
+}
+
+# One typed SSD leg (blank|beside). Entered ONLY through `test_install_ssd`'s sub-invocation `"$0" test-install-ssd`,
+# which carries the knobs in the environment BEFORE dispatch (the `_feats` map is read at script load — the re-exec
+# lesson `test_install` records).
+install_ssd_leg() { # $1 = blank|beside, $2 = wall seconds
+    local mode="$1" secs="${2:-300}" tgt="${WORKSPACE_DIR}/target" port="" pid="" rc=0
+    local log="${tgt}/serial-install-ssd-${mode}.log" tlog="${tgt}/install-ssd-${mode}-typist.log"
+    build_user_hello_x86; build_user_stat_x86; build_user_vug_x86; build_user_pulse_x86; build_user_lumen_x86
+    build_user_midden_x86; build_user_una_x86; build_user_aether_x86; build_user_net_x86; build_user_diag_x86
+    build_user_holocron_x86; build_user_prefs_x86; build_user_big_x86
+    build_kernel_x86_64
+    port="${UNAOS_QMP_PORT:-4484}"
+    while lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; do port=$((port + 1)); done
+    export UNAOS_QEMU_EXTRA="-qmp tcp:127.0.0.1:${port},server,nowait"
+    rm -f "$tlog"
+    x86_install_ssd_typist "$port" "$log" "$secs" "$mode" 2> "$tlog" &
+    pid=$!
+    rm -f "$log"
+    echo -e "${COLOR_CYAN}⚡ INSTALL4 ssd-${mode}: booting with the virtual SSD on ide.1 and typing install ssd (${secs}s full wall); serial -> ${log}${COLOR_RESET}"
+    (cd "$WORKSPACE_DIR/builder" && UNAOS_SERIAL_LOG="$log" UNAOS_TEST_SECS="$secs" cargo +nightly run --release) || true
+    wait "$pid" 2>/dev/null || true
+    echo -e "${COLOR_PURPLE}──────── ssd-${mode} typist transcript (${tlog}) ────────${COLOR_RESET}"
+    cat "$tlog" 2>/dev/null || echo "(no typist transcript)"
+    awk 'index($0, "[install]") || index($0, ":: SELFINSTALL") || index($0, ":: INSTALL4:") || index($0, ":: INSTALL: grant") || index($0, "[midden] cmd=\"install") || index($0, "[ahci] grant") { print "  " $0 }' "$log" 2>/dev/null | head -80
+    install_ssd_need "ssd-${mode}" "$log" 'cmd="install ssd --dry-run"' || rc=1
+    if [ "$mode" = blank ]; then
+        install_ssd_need "ssd-blank" "$log" '[install] target=ahci:' 'verdict=blank' 'plan=gpt+esp512M+clone(' || rc=1
+        install_ssd_need "ssd-blank" "$log" 'cmd="install ssd --write"' || rc=1
+        install_ssd_need "ssd-blank" "$log" ':: SELFINSTALL: files=' '-> PASS ::' || rc=1
+        install_ssd_need "ssd-blank" "$log" ':: SELFINSTALL2: plan=2' 'fsck=ok' '-> PASS ::' || rc=1
+    else
+        install_ssd_need "ssd-beside" "$log" ':: INSTALL4: beside port=' 'existing=1' '-> DRY ::' || rc=1
+        install_ssd_need "ssd-beside" "$log" '[install] REFUSED target=ahci:' 'verdict=stranger' || rc=1
+        install_ssd_need "ssd-beside" "$log" ':: INSTALL4: beside port=' 'table=ok' '-> PASS ::' || rc=1
+    fi
+    install_ssd_faults "ssd-${mode}" "$log" || rc=1
+    return "$rc"
+}
+
+# Boot the image the last SSD leg wrote as the ONLY disk: OVMF (the builder's own search list), q35, no ESP, no stick.
+install_ssd_boot() { # $1 = leg label, $2 = wall seconds
+    local lbl="$1" secs="${2:-300}" tgt="${WORKSPACE_DIR}/target" code="" vars="" p qpid="" t=0 rc=0
+    local img="${tgt}/ahcifixture.img" log="${tgt}/serial-install-boot-${1}.log" vcopy="${tgt}/OVMF_VARS-ssdboot.fd"
+    [ -f "$img" ] || { echo -e "${COLOR_RED}  ✖ boot-${lbl}: no written SSD image at ${img}${COLOR_RESET}"; return 1; }
+    for p in /usr/local/share/qemu/edk2-x86_64-code.fd /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+             /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2-ovmf/x64/OVMF_CODE.fd /usr/share/qemu/OVMF.fd; do
+        [ -f "$p" ] && { code="$p"; break; }
+    done
+    for p in /usr/local/share/qemu/edk2-i386-vars.fd /opt/homebrew/share/qemu/edk2-i386-vars.fd \
+             /usr/share/OVMF/OVMF_VARS.fd /usr/share/edk2/ovmf/OVMF_VARS.fd /usr/share/edk2-ovmf/x64/OVMF_VARS.fd; do
+        [ -f "$p" ] && { vars="$p"; break; }
+    done
+    [ -n "$code" ] || { echo -e "${COLOR_RED}  ✖ boot-${lbl}: OVMF code firmware not found — NO VERDICT${COLOR_RESET}"; return 1; }
+    local -a fw=(-drive "if=pflash,unit=0,format=raw,readonly=on,file=${code}")
+    if [ -n "$vars" ]; then cp -f "$vars" "$vcopy"; fw+=(-drive "if=pflash,unit=1,format=raw,file=${vcopy}"); fi
+    rm -f "$log"
+    echo -e "${COLOR_CYAN}⚡ INSTALL4 boot-${lbl}: ${img} as the ONLY disk (${secs}s at most); serial -> ${log}${COLOR_RESET}"
+    qemu-system-x86_64 -machine "${UNAOS_QEMU_MACHINE:-pc-q35-10.0}" -m 1G -smp "${UNAOS_SMP:-6}" -cpu "${UNAOS_CPU:-qemu64,+x2apic}" \
+        "${fw[@]}" -drive "if=none,id=ssd,format=raw,file=${img}" -device ide-hd,drive=ssd,bootindex=0 \
+        -device isa-debug-exit,iobase=0xf4,iosize=0x04 -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+        -display none -serial "file:${log}" >/dev/null 2>&1 &
+    qpid=$!
+    while [ "$t" -lt "$secs" ] && kill -0 "$qpid" 2>/dev/null; do
+        if [ -f "$log" ] && awk 'index($0, ":: UNAFSX86:") { f = 1 } END { exit f ? 0 : 1 }' "$log"; then
+            sleep 5; break
+        fi
+        sleep 2; t=$((t + 2))
+    done
+    kill "$qpid" 2>/dev/null || true
+    wait "$qpid" 2>/dev/null || true
+    awk 'index($0, "[bootdisk]") || index($0, ":: UNAFSX86:") || index($0, "[vfs] root") { print "  " $0 }' "$log" 2>/dev/null | head -20
+    install_ssd_need "boot-${lbl}" "$log" ':: UNAFSX86: root=unafs src=ahci:' 'boot=ahci' '-> PASS ::' || rc=1
+    install_ssd_faults "boot-${lbl}" "$log" || rc=1
+    return "$rc"
+}
+
+# The stranger fixture: protective MBR, a valid GPT (both headers, both arrays, CRC-32s) whose slot 0 is a 256 MiB
+# APFS-typed partition carrying `NXSB` at +32 of its first sector, and free space after it to the usable end.
+install_ssd_stranger() { # $1 = image path, $2 = MiB
+    python3 - "$1" "$2" <<'PY'
+import struct, sys, uuid, zlib
+path, mib = sys.argv[1], int(sys.argv[2])
+S = 512
+total = mib * 2048
+g = lambda s: uuid.UUID(s).bytes_le
+apfs, uniq, disk = g('7C3457EF-0000-11AA-AA11-00306543ECAC'), g('4F2D6E4A-1C2B-4E7A-9C11-0123456789AB'), g('A1B2C3D4-0000-4000-8000-000000000001')
+first_usable, last_usable = 34, total - 34
+p_first, p_last = 2048, 2048 + 256 * 2048 - 1
+arr = bytearray(128 * 128)
+arr[0:128] = apfs + uniq + struct.pack('<QQQ', p_first, p_last, 0) + 'Macintosh HD'.encode('utf-16-le').ljust(72, b'\0')
+acrc = zlib.crc32(bytes(arr)) & 0xffffffff
+def hdr(cur, back, ents):
+    h = bytearray(S)
+    struct.pack_into('<8sIIIIQQQQ16sQIII', h, 0, b'EFI PART', 0x10000, 92, 0, 0, cur, back, first_usable, last_usable, disk, ents, 128, 128, acrc)
+    struct.pack_into('<I', h, 16, zlib.crc32(bytes(h[:92])) & 0xffffffff)
+    return bytes(h)
+mbr = bytearray(S)
+mbr[446:462] = struct.pack('<B3sB3sII', 0, b'\x00\x02\x00', 0xEE, b'\xff\xff\xff', 1, min(total - 1, 0xFFFFFFFF))
+mbr[510:512] = b'\x55\xaa'
+nx = bytearray(S)
+nx[0:32] = bytes(range(1, 33))
+nx[32:36] = b'NXSB'
+with open(path, 'wb') as f:
+    f.truncate(total * S)
+    for lba, data in ((0, mbr), (1, hdr(1, total - 1, 2)), (2, arr), (total - 33, arr), (total - 1, hdr(total - 1, 1, total - 33)), (p_first, nx)):
+        f.seek(lba * S)
+        f.write(bytes(data))
+print("stranger fixture: %s total=%d apfs=%d..%d free=%d..%d" % (path, total, p_first, p_last, p_last + 1, last_usable))
+PY
+}
+
+# Off the image: LBA 0, slot 0 and the APFS partition's first MiB byte-identical to the fixture; the table valid with
+# three in-use entries (one ESP-typed). Independent of the kernel's own reader.
+install_ssd_beside_image() { # $1 = the fixture, $2 = the written image
+    python3 - "$1" "$2" <<'PY'
+import struct, sys, zlib
+a, b = sys.argv[1], sys.argv[2]
+S = 512
+fa, fb = open(a, 'rb'), open(b, 'rb')
+def rd(f, lba, n=1):
+    f.seek(lba * S); return f.read(n * S)
+total = (fb.seek(0, 2)) // S
+bad = []
+if rd(fa, 0) != rd(fb, 0): bad.append('LBA 0 changed')
+if rd(fa, 2048, 2048) != rd(fb, 2048, 2048): bad.append('the APFS partition head changed')
+def table(f, lba):
+    h = bytearray(rd(f, lba))
+    if h[0:8] != b'EFI PART': return None, 'no signature at %d' % lba
+    hs = struct.unpack_from('<I', h, 12)[0]; crc = struct.unpack_from('<I', h, 16)[0]
+    h2 = bytearray(h); h2[16:20] = b'\0\0\0\0'
+    if zlib.crc32(bytes(h2[:hs])) & 0xffffffff != crc: return None, 'header CRC at %d' % lba
+    cur, back, fu, lu = struct.unpack_from('<QQQQ', h, 24); ents, n, es, acrc = struct.unpack_from('<QIII', h, 72)
+    raw = rd(f, ents, (n * es + S - 1) // S)[:n * es]
+    if zlib.crc32(raw) & 0xffffffff != acrc: return None, 'array CRC at %d' % ents
+    return (cur, back, fu, lu, raw, es), None
+p, e1 = table(fb, 1)
+k, e2 = table(fb, total - 1)
+if e1: bad.append('primary: ' + e1)
+if e2: bad.append('backup: ' + e2)
+if p and k:
+    if p[4] != k[4]: bad.append('the two arrays differ')
+    used = [i for i in range(len(p[4]) // p[5]) if any(p[4][i * p[5]:i * p[5] + 16])]
+    if len(used) != 3: bad.append('in-use entries=%d (want 3)' % len(used))
+    if p[4][0:128] != rd(fa, 2)[0:128]: bad.append('slot 0 (APFS) changed')
+    esp = bytes.fromhex('28732AC11FF8D211BA4B00A0C93EC93B')
+    if not any(p[4][i * p[5]:i * p[5] + 16] == esp for i in used): bad.append('no ESP-typed entry')
+print('beside image: ' + ('OK — LBA 0, the APFS entry and its first MiB byte-identical; both tables valid; 3 entries' if not bad else 'BAD — ' + '; '.join(bad)))
+sys.exit(1 if bad else 0)
+PY
+}
+
+test_install_ssd() { # $1 = each leg's wall
+    local secs="${1:-300}" tgt="${WORKSPACE_DIR}/target" rc=0 r1=0 r2=0 r3=0 r4=0 r5=0
+    local blank="${tgt}/ssd-blank.img" stranger="${tgt}/ssd-stranger.img"
+    local -a clean=(env -u UNAOS_WITNESS -u UNAOS_TESTS_AT_BOOT -u UNAOS_CENSUS -u UNAOS_INSTTYPIST -u UNAOS_INSTGUI
+                    -u UNAOS_INSTALLDEMO -u UNAOS_PART_DISK -u UNAOS_QEMU_EXTRA -u UNAOS_QMP_SHOT)
+    local -a knobs=(UNAOS_WC=1 UNAOS_AHCI=1 UNAOS_AHCI_WRITE=1 UNAOS_AHCIROOT=1 UNAOS_QEMU_FULL=1)
+    mkdir -p "$tgt"
+    rm -f "$blank"; truncate -s 6G "$blank"
+    "${clean[@]}" "${knobs[@]}" UNAOS_AHCI_DISK="$blank" "$0" test-install-ssd blank "$secs" || r1=1
+    install_ssd_boot blank "$secs" || r2=1
+    install_ssd_stranger "$stranger" 6144 || { echo -e "${COLOR_RED}❌ test-install: the stranger fixture did not build${COLOR_RESET}"; r3=1; }
+    if [ "$r3" -eq 0 ]; then
+        "${clean[@]}" "${knobs[@]}" UNAOS_AHCI_DISK="$stranger" "$0" test-install-ssd beside "$secs" || r3=1
+        install_ssd_beside_image "$stranger" "${tgt}/ahcifixture.img" || r4=1
+        install_ssd_boot beside "$secs" || r5=1
+    fi
+    for v in "ssd-blank:$r1" "boot-blank:$r2" "ssd-beside:$r3" "beside-image:$r4" "boot-beside:$r5"; do
+        if [ "${v##*:}" -eq 0 ]; then echo -e "${COLOR_GREEN}  ✔ INSTALL4 ${v%%:*} -> PASS${COLOR_RESET}"; else echo -e "${COLOR_RED}  ✖ INSTALL4 ${v%%:*} -> FAIL${COLOR_RESET}"; rc=1; fi
+    done
+    return "$rc"
 }
 
 # PTRLANE: `./arroyo test-ptr [secs]` — THE RELATIVE POINTER, DRIVEN, so PTRINSTALL2's identity is on a wire.
@@ -14066,6 +14324,11 @@ case "${1:-}" in
         # test_install), so this arm is entered twice per invocation and the second time carries
         # UNAOS_INSTTYPIST=1. Fold-gate command, not a leg of `check`.
         test_install "${2:-180}"
+        ;;
+    test-install-ssd)
+        # INSTALL4 (B619): one typed SSD leg (blank|beside) — entered only through `test_install_ssd`'s
+        # sub-invocation, which sets the knobs before dispatch. Part of `test-install`, not a verb of its own.
+        install_ssd_leg "${2:-blank}" "${3:-600}"
         ;;
     test-ptr|test_ptr)
         # PTRLANE: the relative-pointer leg. Re-execs itself with UNAOS_PTRLANE / UNAOS_WC /
