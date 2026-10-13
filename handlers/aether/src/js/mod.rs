@@ -30,6 +30,9 @@
 //!   [CEReactions] / observer-microtask boundary the mutation algorithms end with.
 //! - [`canvas`] — the 2D canvas (AETHERCANVAS, SR85): CanvasRenderingContext2D, Path2D, gradients,
 //!   patterns, ImageData, TextMetrics, OffscreenCanvas, ImageBitmap, DOMMatrix, over `crate::canvas`.
+//! - [`broadcast`], [`idb`], [`cache_api`], [`locks`], [`sw`] — the storage family (AETHERSTORAGE, SR94): the
+//!   cross-document inbox, BroadcastChannel and structured serialization; IndexedDB and `navigator.storage`;
+//!   the Cache API; Web Locks; `navigator.serviceWorker` — over `crate::storage` and `crate::workers`.
 //! - [`loader`] — HTML §4.12.1 script processing driven by the parser: parser-blocking, `defer`,
 //!   `async` and module scripts, `document.write` during parse, dynamically inserted scripts, and
 //!   §13.2.7 "the end" (DOMContentLoaded, load).
@@ -40,6 +43,8 @@
 //! engine (no more script on this page; the DOM still renders) instead of ending the process, and a
 //! per-task instruction budget turns a runaway script into a reported, uncatchable termination.
 
+pub mod broadcast;
+pub mod cache_api;
 pub mod canvas;
 pub mod controls;
 pub mod cssom;
@@ -49,13 +54,16 @@ pub mod events;
 pub mod forms;
 pub mod host;
 pub mod html;
+pub mod idb;
 pub mod idl;
 pub mod loader;
+pub mod locks;
 pub mod mutation;
 pub mod range;
 pub mod reflect;
 mod reflect_table;
 pub mod shadow;
+pub mod sw;
 pub mod traversal;
 pub mod net;
 pub mod window;
@@ -562,6 +570,12 @@ impl Engine {
         mutation::install(&mut vm);
         custom::install(&mut vm);
         canvas::install(&mut vm);
+        // AETHERSTORAGE (SR94): the inbox and serializer first, then the APIs that use them.
+        broadcast::install(&mut vm);
+        idb::install(&mut vm);
+        cache_api::install(&mut vm);
+        locks::install(&mut vm);
+        sw::install(&mut vm);
         Engine { vm }
     }
 
@@ -649,6 +663,7 @@ impl Engine {
     pub fn tick(&mut self) -> usize {
         let mut n = self.run_tasks();
         n += net::poll(&mut self.vm);
+        n += broadcast::poll(&mut self.vm);
         n += crate::event_loop::fire_due_timers(&mut self.vm);
         checkpoint(&mut self.vm);
         n
@@ -687,7 +702,7 @@ impl Engine {
     /// Runs the queued network tasks (body chunks, socket messages, server-sent events, storage events
     /// from other documents). Returns how many ran.
     pub fn run_network_tasks(&mut self) -> usize {
-        net::poll(&mut self.vm)
+        net::poll(&mut self.vm) + broadcast::poll(&mut self.vm)
     }
 
     /// Records a same-document URL change (fragment navigation, `history.pushState`).

@@ -1,6 +1,12 @@
 //! A script worker thread: its own js_core realm (no DOM), fed source text over a channel, answering
 //! with each completion value as a string ("Error: …" for a throw). The groundwork for dedicated
 //! workers; not yet exposed to pages as `Worker`.
+//!
+//! AETHERSTORAGE (SR94): [`sw`] — service-worker registrations, lifecycle, control and the fetch interception
+//! hook — and [`realm`], the ServiceWorkerGlobalScope realm each running worker gets on its own thread.
+
+pub mod realm;
+pub mod sw;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;

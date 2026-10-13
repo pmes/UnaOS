@@ -590,28 +590,12 @@ const PRELUDE: &str = r#"
 "#;
 
 
-/// Platform pieces with honest, self-reporting approximations: Web Storage (in memory, per page),
-/// MessageChannel over the timer queue, the observer families (register, never deliver),
-/// `structuredClone` over the JSON-representable graph, `requestIdleCallback`.
+/// Platform pieces with honest, self-reporting approximations: MessageChannel over the timer queue, the
+/// observer families (register, never deliver), `requestIdleCallback`. (AETHERSTORAGE, SR94: the in-page
+/// `localStorage`/`sessionStorage` shim is gone — `js::net` installs the real Storage over `crate::storage` —
+/// and so is the JSON-round-trip `structuredClone`: `js::broadcast` installs HTML §2.7's.)
 const COMPAT: &str = r#"
 (function () {
-    var mkStorage = function () {
-        var m = Object.create(null);
-        var keys = [];
-        var s = {
-            getItem: function (k) { k = String(k); return k in m ? m[k] : null; },
-            setItem: function (k, v) { k = String(k); if (!(k in m)) { keys.push(k); } m[k] = String(v); },
-            removeItem: function (k) { k = String(k); if (k in m) { delete m[k]; keys.splice(keys.indexOf(k), 1); } },
-            clear: function () { m = Object.create(null); keys = []; },
-            key: function (i) { return i >= 0 && i < keys.length ? keys[i] : null; },
-        };
-        Object.defineProperty(s, 'length', { get: function () { return keys.length; } });
-        return s;
-    };
-    var ls = mkStorage(), ss = mkStorage();
-    Object.defineProperty(globalThis, 'localStorage', { get: function () { return ls; }, configurable: true, enumerable: true });
-    Object.defineProperty(globalThis, 'sessionStorage', { get: function () { return ss; }, configurable: true, enumerable: true });
-
     globalThis.MessageChannel = function MessageChannel() {
         var mk = function () {
             return {
@@ -653,11 +637,6 @@ const COMPAT: &str = r#"
     globalThis.IntersectionObserver = mkObserver('IntersectionObserver');
     globalThis.ResizeObserver = mkObserver('ResizeObserver');
     globalThis.PerformanceObserver = mkObserver('PerformanceObserver');
-
-    globalThis.structuredClone = function (v) {
-        try { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
-        catch (e) { __ledger('structuredClone-nonjson'); return v; }
-    };
 
     globalThis.requestIdleCallback = function (cb) {
         return setTimeout(function () {

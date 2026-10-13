@@ -9,6 +9,27 @@
 //!   access through a Proxy, and the `storage` event's receiving half.
 //! - [`LocalStorage`] — the persistent per-origin JSON file store (under the platform data directory), the
 //!   persistence layer a later arc wires behind the areas.
+//!
+//! AETHERSTORAGE (SR94) adds the rest of the Storage Standard's buckets, every one keyed by the page's
+//! [`storage_key`] (origin + top-level site) and laid out under [`root_dir`]`/<area>/<`[`key_dir`]`>/`:
+//!
+//! - [`idb`] — the Indexed Database API 3.0 engine: databases (one `kvstore_core` file each), object
+//!   stores, indexes, key ranges, cursors' positioning, the key generator, and the process-wide connection
+//!   and transaction registry whose scheduler orders transactions across every document of the process.
+//! - [`cache`] — the Cache API's disk store (`caches.open/match/put/delete/keys`): an index file per storage
+//!   key, one body file per cached response.
+//! - [`quota`] — `navigator.storage`: `estimate()` (usage summed over the key's buckets, the UA quota) and
+//!   `persist()/persisted()` (the bucket mode, kept in a kvstore file).
+//! - [`locks`] — the Web Locks lock manager (per storage key, process-wide: exclusive/shared, `ifAvailable`,
+//!   `steal`, the request queue, `query()`).
+//!
+//! CHARTER: Aether — the engine half; `kvstore_core` (unaos/libs/fs) is the shared core, `js::idb`,
+//! `js::cache_api`, `js::locks`, `js::sw` and `js::broadcast` are the page-facing bindings.
+
+pub mod cache;
+pub mod idb;
+pub mod locks;
+pub mod quota;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -215,6 +236,67 @@ pub const PRELUDE: &str = r#"
     });
 })();
 "#;
+
+/// Where a test points every storage bucket instead of the platform data directory.
+fn root_override() -> &'static Mutex<Option<PathBuf>> {
+    static R: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(None))
+}
+
+/// Points the storage buckets ([`root_dir`]) at `dir` (KATs; `None` restores the platform directory).
+pub fn set_root_dir(dir: Option<PathBuf>) {
+    *root_override().lock().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
+/// The directory every AETHERSTORAGE bucket lives under: the platform data directory (the one the
+/// localStorage files and the HTTP cache use), unless a test pointed it elsewhere.
+pub fn root_dir() -> PathBuf {
+    if let Some(d) = root_override().lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return d;
+    }
+    directories::ProjectDirs::from("", "UnaOS", "Aether")
+        .map(|p| p.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp/aether_storage"))
+}
+
+/// A storage key as one path component: `[A-Za-z0-9.-]` kept, every other byte `_XX` (hex), so two keys
+/// never share a directory and none escapes its parent.
+pub fn key_dir(storage_key: &str) -> String {
+    let mut out = String::with_capacity(storage_key.len());
+    for b in storage_key.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'.' || b == b'-' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("_{b:02x}"));
+        }
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        out = format!("_{out}");
+    }
+    out
+}
+
+/// The directory of one bucket area (`idb`, `caches`, …) for one storage key.
+pub fn bucket_dir(area: &str, storage_key: &str) -> PathBuf {
+    root_dir().join(area).join(key_dir(storage_key))
+}
+
+/// The storage key of the running page (its origin + top-level site), or `None` for an opaque origin (no
+/// storage bucket: IndexedDB, the Cache API and Web Locks throw "SecurityError"). Nested documents share the
+/// top document's key for now (the incumbent realm's origin does not reach the natives — the same rule
+/// `localStorage` follows in `js::net`).
+pub fn page_storage_key() -> Option<String> {
+    let origin = crate::js::net::page_origin();
+    if origin.starts_with("null") {
+        return None;
+    }
+    Some(storage_key(&crate::js::page_url(), &origin))
+}
+
+/// Secure Contexts §3.1 for the running page (the Cache API, service workers and Web Locks need one).
+pub fn page_is_secure() -> bool {
+    crate::security::origin::is_potentially_trustworthy_url(&crate::js::page_url())
+}
 
 /// AETHERCACHE (SR88): the HTTP cache's disk tier — `http-cache/` under the same platform data directory the
 /// localStorage files live in (one file per cached response, written and bounded by gneiss_pal's HttpCache).

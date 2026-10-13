@@ -1,0 +1,19 @@
+[package]
+name = "kvstore_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "UnaOS's ordered key-value store: named trees over one append-only, checksummed log file per database (the log is the write-ahead journal), undoable transactions, compaction, and the Indexed DB key encoding — no_std + alloc, zero dependencies."
+
+# AETHERSTORAGE (LEDGER SR94). `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the trash_core/html_core shape:
+# a member of the ROOT host workspace (Aether's IndexedDB, Cache API, service-worker registry and quota store
+# link it; the KATs run here) and, later, a path dependency of the image's Aether. The I/O is the caller's,
+# through the `Backing` trait; feature `std` adds `DirBacking` (one directory, std::fs, fsync on append).
+#
+# Dependencies: none.
+
+[features]
+default = []
+std = []
+
+[dependencies]

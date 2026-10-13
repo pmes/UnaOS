@@ -247,7 +247,27 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
             return;
         }
     }
+    // AETHERSTORAGE (SR94): Service Workers §6.4 "handle fetch" — a controlled page's request is the
+    // controlling worker's `fetch` event first (decided here, on the page thread); its answer, if any, is
+    // the response, and the network serves the request otherwise.
+    let sw = crate::workers::sw::fetch_handle(&req.url);
     std::thread::spawn(move || {
+        if let Some((h, client)) = sw {
+            if let Some(r) = h.fetch(&req.method, &req.url, &req.headers, &req.body, client) {
+                let head = vec![
+                    NetArg::Num(r.status as f64),
+                    NetArg::Str(r.status_text),
+                    NetArg::Str(if r.url.is_empty() { req.url.clone() } else { r.url }),
+                    NetArg::List(header_list(&r.headers)),
+                    NetArg::Bool(false),
+                    NetArg::Str("basic".into()),
+                ];
+                if p.post("head", head) && (r.body.is_empty() || p.post("data", vec![NetArg::Bytes(r.body)])) {
+                    p.finish("end", vec![]);
+                }
+                return;
+            }
+        }
         let ex = match policed_send(&req, &ctx) {
             Ok(r) => r,
             Err(e) => {
