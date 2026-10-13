@@ -15485,7 +15485,7 @@ fn wcb_launcher(_demo_cpu: usize) {
     crate::tests::register("dragperf", || crate::video::wm::dragperf_selftest()); // ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // DRAGWEDGE: the PA41 freeze fixture, immediately after the drag COST witness because it is the same shape of scene one hazard over — it mints a KERNEL-BAND row, presses its title strip through this file's own router, then holds a `BlitGuard` open to reproduce the metal's `blit_active=1` and proves the drag path is BOUNDED, that the grab it could not service is RELEASED, that a fresh grab is REFUSED while the stall stands, and that the refusal LIFTS when the compositor recovers. It runs AFTER `dragperf` deliberately: that fixture measures a healthy drag path and this one deliberately stalls the compositor for a bounded interval, so the order keeps the measurement out of the stall's shadow.
     #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
-    crate::tests::register("dragwedge", || crate::video::wm::dragwedge_selftest()); #[cfg(all(feature = "witness", feature = "desktop_firmware"))] crate::tests::register("winresize", arm_winresize_selftest); // ARMRESIZE (orin-ledger A96): `tests winresize` on this arch, the x86 fixture's legs and verdict line over THIS router (fn at the FILE TAIL); ⚠ LINE-NEUTRAL append, code before this comment. ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
+    crate::tests::register("dragwedge", || crate::video::wm::dragwedge_selftest()); #[cfg(all(feature = "witness", feature = "desktop_firmware"))] crate::tests::register("winresize", arm_winresize_selftest); #[cfg(all(feature = "witness", feature = "desktop_firmware"))] crate::tests::register("appmenubus", arm_appmenu_selftest); // APPMENUARM (orin-ledger A112): `tests appmenubus`, x86's APPMENU fixture over this arch's bus and ring (fn at the FILE TAIL); LINE-NEUTRAL fold, code before this comment. ARMRESIZE (orin-ledger A96): `tests winresize` on this arch, the x86 fixture's legs and verdict line over THIS router (fn at the FILE TAIL); ⚠ LINE-NEUTRAL append, code before this comment. ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
     // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).
@@ -27220,4 +27220,106 @@ pub fn arm_winresize_selftest() {
         zones, strip_clear, wm::RS_MIN_W, wm::RS_MIN_H, drags, clamped, drag_ok, clamp_ok, min_ok, aspect_ok, keys_ok, if cursor_ok { "ok" } else { "fail" }, cursor_shapes,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// =================================================================================================
+// APPMENUARM (orin-ledger A112) — `tests appmenubus`: x86's APPMENU fixture (`arch/x86_64/syscall.rs`
+// `appmenu_fixture`, R73) over THIS arch's bus body and input ring. The three verb arms (:23112, ARMROUTER),
+// the pick seam (`user_input_push_owner` above) and the reap on close (`clear_handle_row` -> `wm::close_owner`
+// -> `appmenu::reap`) were already here; this is the proof that drives them. Appended at the tail so no
+// existing line moves (knob-off kernel8.img byte-identity, PARITY.md 5.3); the registration is a LINE-NEUTRAL
+// fold onto the `winresize` registration in `wcb_launcher`.
+// =================================================================================================
+
+/// APPMENUARM: one bus round trip as scratch ASID `asid` through the PRODUCTION `sys_msend_for` body (the
+/// `bandy_stamp_check` idiom) — request in, `(send rc, reply status, reply body)`. `stamp` nonzero plants a
+/// CALLER principal byte (the leg-2 probe): `request_validate` refuses the frame before any verb runs.
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+fn appmenu_call(asid: u64, agen: u64, verb: u8, corr: u32, body: &[u8], stamp: u8) -> (i64, i32, alloc::vec::Vec<u8>) {
+    let mut f = alloc::vec![0u8; crate::bus::BUS_FRAME_MAX];
+    let n = crate::bus::build_request(verb, corr, body, &mut f);
+    f[16] = stamp; // 0 = honest; nonzero = a hand-planted CALLER principal
+    let rc = sys_msend_for(asid, agen, PrincipalRecord::program(b"prog:APPMENUARM"), &f[..n]);
+    if rc != 0 {
+        return (rc, 0, alloc::vec::Vec::new());
+    }
+    match bus_mbox_pop(asid) {
+        Some(m) => match crate::bus::frame_parse(&m.frame) {
+            Ok(h) => (0, h.status, m.frame[crate::bus::BUS_HDR_LEN..].to_vec()),
+            Err(_) => (0, i32::MIN, alloc::vec::Vec::new()),
+        },
+        None => (0, i32::MIN, alloc::vec::Vec::new()),
+    }
+}
+
+/// APPMENUARM: `tests appmenubus`. A kernel-minted owner (a scratch ASID; on this arch the wm owner IS the
+/// ASID, `appmenu::owner_of_row`) publishes a 3-item menu through `sys_msend_for`, reads it back through
+/// GET, has a 65-item tree and a caller-stamped principal refused with the registry unchanged, receives a
+/// pick in ITS ring while no other ring moves (ledger leg 1), and is reaped (leg 4). The four verdict lines
+/// are x86's, byte for byte, so one spec row scores both arches; `verb_publish` prints its own
+/// `:: APPMENU: owner=<n> items=3 published=1 -> PASS ::` on the way. The scratch ASID is 7 (the K-line bus
+/// fixtures' row) unless a tenant is stamped there, then the first unstamped ASID above it.
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+#[inline(never)]
+pub fn arm_appmenu_selftest() {
+    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
+    {
+        serial_println!(":: APPMENU: -> SKIP (video::appmenu::owner_of_row names no owner without baremetal/tegra_el0) ::");
+    }
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+    {
+        use una_abi::{MenuWireItem as W, BUS_VERB_MENU_GET, BUS_VERB_MENU_PUBLISH, INPUT_EV_MENU_PICK, MENU_FLAG_SUBMENU};
+        let free = |a: u64| *SLOT_PPID[a as usize].lock() == PrincipalRecord::NONE;
+        let Some(asid) = (7..=crate::procslot::SLOT_ID_MAX as u64).find(|&a| free(a)) else {
+            serial_println!(":: APPMENU: -> SKIP (no unstamped ASID in 7..={}) ::", crate::procslot::SLOT_ID_MAX);
+            return;
+        };
+        let owner: u64 = asid;
+        bus_sem_init_once();
+        let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+        bus_mbox_clear(asid);
+        let items = [W::new(1, 0, MENU_FLAG_SUBMENU, b"Tools"), W::new(10, 1, 0, b"Run"), W::new(11, 1, 0, b"Stop")];
+        let mut body = alloc::vec![una_abi::MENU_WIRE_VERSION, 3, 0, 0];
+        for it in items.iter() {
+            body.extend_from_slice(&it.to_bytes());
+        }
+        let (rc, st, _) = appmenu_call(asid, agen, BUS_VERB_MENU_PUBLISH, 31, &body, 0);
+        let published = rc == 0 && st == 0 && crate::video::appmenu::has(owner);
+        // Leg: read-back through GET is byte-identical.
+        let (grc, gst, got) = appmenu_call(asid, agen, BUS_VERB_MENU_GET, 32, &[], 0);
+        let rb = grc == 0 && gst == 0 && got == body;
+        serial_println!(":: APPMENU: readback owner={} items=3 match={} -> {} ::", owner, rb, if rb && published { "PASS" } else { "FAIL" });
+        // Leg 3 + 2: an over-cap tree and a caller-stamped principal are refused; the registry is unchanged.
+        let mut big = alloc::vec![una_abi::MENU_WIRE_VERSION, 65, 0, 0];
+        for i in 0..65u32 {
+            big.extend_from_slice(&W::new(100 + i, 1, 0, b"x").to_bytes());
+        }
+        let (_, cst, _) = appmenu_call(asid, agen, BUS_VERB_MENU_PUBLISH, 33, &big, 0);
+        let (srcrc, _, _) = appmenu_call(asid, agen, BUS_VERB_MENU_PUBLISH, 34, &body, 2);
+        let (_, _, again) = appmenu_call(asid, agen, BUS_VERB_MENU_GET, 35, &[], 0);
+        bus_mbox_clear(asid);
+        let refused = cst == -22 && srcrc == EINVAL && again == body;
+        serial_println!(":: APPMENU: refuse items=65 principal=caller registry_unchanged={} -> {} ::", again == body, if refused { "PASS" } else { "FAIL" });
+        // Leg 1: the pick lands in the OWNER's ring; every other ring is untouched. Rows are read with `peek`
+        // (never allocated by the scan); the owner's own row exists from `clear_input_row`.
+        clear_input_row(asid);
+        let a = asid as usize;
+        let n_rows = USER_INPUT_TAIL.hwm().max(a + 1);
+        let tail_of = |s: usize| USER_INPUT_TAIL.peek(s).map_or(0u32, |t| t.load(Ordering::Acquire));
+        let before: alloc::vec::Vec<u32> = (0..n_rows).map(tail_of).collect();
+        let sent = crate::video::appmenu::deliver_pick(owner, 10);
+        let tail = USER_INPUT_TAIL[a].load(Ordering::Acquire);
+        let ev = USER_INPUT_BUF[a][(before[a] as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+        let others_quiet = (0..n_rows).all(|s| s == a || tail_of(s) == before[s]);
+        let ok = sent && tail == before[a].wrapping_add(1) && ev == una_abi::input_ev_pack(INPUT_EV_MENU_PICK, 10) && others_quiet;
+        clear_input_row(asid);
+        serial_println!(":: APPMENU: owner={} items=3 pick_to=owner others_quiet={} -> {} ::", owner, others_quiet, if ok { "PASS" } else { "FAIL" });
+        // Leg 4: reaped on owner death (the `clear_handle_row` -> `wm::close_owner` path's call), and GET then
+        // answers empty, not a dead tree.
+        crate::video::appmenu::reap(owner);
+        let (_, rst, after) = appmenu_call(asid, agen, BUS_VERB_MENU_GET, 36, &[], 0);
+        bus_mbox_clear(asid);
+        let reaped = rst == 0 && after.is_empty() && !crate::video::appmenu::has(owner);
+        serial_println!(":: APPMENU: owner={} reaped empty={} -> {} ::", owner, reaped, if reaped { "PASS" } else { "FAIL" });
+    }
 }
