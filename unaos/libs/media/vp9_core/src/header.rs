@@ -114,6 +114,8 @@ pub struct FrameHeader {
     pub interp_filter: u8,
     pub refresh_frame_context: bool,
     pub frame_parallel: bool,
+    /// frame_context_idx as coded; the frame uses context 0 when `past_independence` is set
+    /// (reset_frame_context = 2 still resets the coded index's context).
     pub frame_context_idx: u8,
     pub base_q_idx: u8,
     pub y_dc_delta_q: i8,
@@ -269,7 +271,6 @@ pub fn parse_uncompressed(data: &[u8], st: &mut HeaderState) -> Result<FrameHead
         st.lf.mode_deltas = [0, 0];
         st.lf.delta_enabled = true;
         h.sign_bias = [false; 4];
-        h.frame_context_idx = 0;
     }
     // loop_filter_params (§6.2.8).
     st.lf.level = r.f(6) as u8;
