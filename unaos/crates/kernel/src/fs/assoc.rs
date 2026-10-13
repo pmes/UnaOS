@@ -121,7 +121,7 @@ fn reg_attr(mt: &MountTable, mime: &str, key: &str) -> Option<String> {
 
 /// The registrants of `mime` (built-ins by their resources, then APPRES's ring-3 programs).
 pub fn registrants_in(mt: &MountTable, mime: &str) -> Vec<Registrant> {
-    appres::registrants(mt, mime, &object_path(mime))
+    let regs = appres::registrants(mt, mime, &object_path(mime)); #[cfg(feature = "stria")] let regs = stria_first(regs); regs // STRIAMETAL (LEDGER SR139): under `stria`, a sighted STRIA.ELF opens the media types it declares ahead of the built-in Player (fn at the file tail). LINE-NEUTRAL fold.
 }
 
 /// The opener for `path` of type `mime`, and the source that decided: `override` (the file's own
@@ -1214,4 +1214,31 @@ pub fn build_owed() {
         build_stamped("worker", false); // FILETYPES2 (B513): the worker's build, recorded as the worker's (never the login's)
     }
     TAKEN.store(false, Ordering::Release);
+}
+
+// =================================================================================================
+// STRIAMETAL (LEDGER SR139) — Stria first for its own media. CODEX §2 gives moving pictures and sound to Stria, and
+// APPS/STRIA.ELF is Stria's own program (crates/user-stria); the kernel Player (`unaos/res/player`, video/player.rs)
+// is its FULFILLER (vplay.rs CHARTER). Both declare the media types (STRIA.ELF in its APPRES block, res/app.res:
+// video/webm, video/mp4, video/x-matroska, audio/wav, audio/mpeg, audio/flac, audio/ogg, audio/aac, audio/mp4,
+// audio/aiff), and the registrant order puts every built-in first (`appres::registrants`), so a double-click on a
+// .webm went to the Player. Under `stria` the program is moved to the front of the registrants of exactly the types
+// it declares — once APPRES has sighted it (its launch, or a Quarry listing of /apps) — so the `registrant` answer of
+// `opener_for_in` and the `una:preferred` a registry object is BUILT or FILLED with name it. A preference already
+// stored on a type object is the operator's (or an earlier build's) and is never overwritten here: `assoc video/webm
+// org.unaos.stria`, or the Settings File Types row, moves such a type.
+// =================================================================================================
+
+/// STRIAMETAL: STRIA.ELF's signature (crates/user-stria/res/app.res).
+#[cfg(feature = "stria")]
+const STRIA_SIG: &str = "org.unaos.stria";
+
+/// STRIAMETAL: `regs` with Stria's registrant (when it declares this type) moved to the front, the rest in order.
+#[cfg(feature = "stria")]
+fn stria_first(mut regs: Vec<Registrant>) -> Vec<Registrant> {
+    if let Some(i) = regs.iter().position(|r| r.signature == STRIA_SIG).filter(|&i| i > 0) {
+        let r = regs.remove(i);
+        regs.insert(0, r);
+    }
+    regs
 }

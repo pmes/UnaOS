@@ -52,12 +52,6 @@ pub fn bytes_per_px(c: &Codec) -> usize {
     }
 }
 
-/// The video rect a picture is converted into (the window's top `w x h`).
-pub struct Frame {
-    pub pts_ms: u64,
-    pub px: Vec<u32>,
-}
-
 /// One picture's planes, borrowed from whichever decoder made it.
 struct Planes<'a, T> {
     y: &'a [T],

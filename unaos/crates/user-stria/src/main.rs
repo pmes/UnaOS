@@ -31,6 +31,18 @@
 // (pts + frame_ms <= clock) it is decoded (references) and counted dropped, never drawn — the kernel Player's rule
 // (vplay.rs `present`: the newest due frame wins, the older ones are drops).
 //
+// TRANSPORT (bar.rs). Under the picture: play/pause, the time, the track (a click seeks there), the speaker (mute) and
+// five volume steps. Keys: Space plays/pauses, Left/Right seek 5 s, Up/Down step the volume, `m` mutes, Esc quits.
+// The pointer is the one the kernel delivers (AETHERPTR B543: INPUT_EV_MOUSE_ABS in window px) and its shape is asked
+// of the compositor (CURSORSHAPE B550: the hand over a control). Pause CLOSES the sound's stream (nothing queued plays
+// on); resume and seek reopen it at the clock (audio_core's own seek table, demux_core's keyframe seek, the pictures
+// decoded unseen up to the target). Every act: `:: STRIA: transport how=<key|click> act=<a> ms=<n> vol=<n> muted=<n> ::`.
+//
+// FILE ASSOCIATION. res/app.res declares the media types (video/webm, video/mp4, video/x-matroska, audio/wav,
+// audio/mpeg, audio/flac, audio/ogg, audio/aac, audio/mp4, audio/aiff); APPRES publishes them at the program's sight
+// and, under the kernel's `stria`, fs/assoc.rs puts STRIA.ELF first among their registrants, so a Quarry double-click
+// opens the file here (the path arrives in the mailbox: `notice_path`).
+//
 // HEAP. The file is read whole (SYS_STAT-sized, one allocation, at most FILE_CAP) and a picture's decoder state is
 // budgeted per codec (media.rs `bytes_per_px`): file + frames + WORK over HEAP_BUDGET is refused BY NAME on the window
 // and the wire before any decoder exists.
@@ -44,6 +56,7 @@
 
 extern crate alloc;
 
+mod bar;
 mod heap;
 mod media;
 mod sys;
@@ -55,9 +68,10 @@ use demux_core::Demuxer;
 use media::{Out, Sound, VDec};
 use sys::{exit, now_ms, sleep_ms, sys, write};
 use una_abi::{
-    input_ev_payload, input_ev_type, AUDIO_POS_PLAYED, AUDIO_POS_UNDERRUNS, AUDIO_WRITE_MAX, BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_MAGIC,
-    BUS_VERB_NOTICE, EAGAIN, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, KEY_ESC, MRECV_NOWAIT, SYS_AUDIO_CLOSE, SYS_AUDIO_OPEN, SYS_AUDIO_POS,
-    SYS_AUDIO_WRITE, SYS_INPUT_POLL, SYS_MRECV, SYS_WIN_CREATE, SYS_WIN_PRESENT,
+    input_ev_payload, input_ev_type, input_ev_xy, AUDIO_POS_PLAYED, AUDIO_POS_UNDERRUNS, AUDIO_WRITE_MAX, BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY,
+    BUS_MAGIC, BUS_VERB_NOTICE, CURSOR_ARROW, CURSOR_HAND, EAGAIN, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, KEY_DOWN,
+    KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP, MRECV_NOWAIT, SYS_AUDIO_CLOSE, SYS_AUDIO_OPEN, SYS_AUDIO_POS, SYS_AUDIO_WRITE, SYS_CURSOR_SHAPE, SYS_INPUT_POLL,
+    SYS_MRECV, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
 
 #[global_allocator]
@@ -763,28 +777,57 @@ pub extern "C" fn _start() -> ! {
             None
         }
     };
+    let mut t = Transport { vol: bar::VOL_MAX, muted: false, ptr: None, buttons: 0, sec: u64::MAX };
     loop {
         let now = now_ms();
-        // Input: Esc and the window's close quit.
+        let mut dirty = false;
+        // Input: the keys and the pointer drive the transport; Esc and the window's close quit.
         let mut k = 0;
         while k < 32 {
             let ev = sys(SYS_INPUT_POLL, 0, 0, 0, 0);
             if ev < 0 {
                 break;
             }
+            k += 1;
             let ev = ev as u64;
+            let p = input_ev_payload(ev);
             match input_ev_type(ev) {
-                INPUT_EV_KEY_DOWN if input_ev_payload(ev) as u8 == KEY_ESC => exit(0),
                 INPUT_EV_CLOSE_REQ => exit(0),
+                INPUT_EV_KEY_DOWN if p as u8 == KEY_ESC => exit(0),
+                INPUT_EV_KEY_DOWN => {
+                    if let Some(s) = cur.as_mut() {
+                        dirty |= t.key(s, p as u8);
+                    }
+                }
+                INPUT_EV_MOUSE_ABS => {
+                    // AETHERPTR (B543): the system pointer in this window's px; CURSORSHAPE (B550): the hand over a
+                    // control, asked of the compositor on every pointer event (the kernel compares, no ring-3 cache).
+                    let (x, y) = input_ev_xy(p);
+                    t.ptr = Some((x, y));
+                    let over = cur.as_ref().is_some_and(|s| bar::over_control(x, y, s));
+                    let _ = sys(SYS_CURSOR_SHAPE, if over { CURSOR_HAND } else { CURSOR_ARROW }, 0, 0, 0);
+                }
+                INPUT_EV_BUTTON => {
+                    let (m, was) = (p as u8, t.buttons);
+                    t.buttons = m;
+                    if m & 1 != 0 && was & 1 == 0 {
+                        if let (Some(s), Some((x, y))) = (cur.as_mut(), t.ptr) {
+                            dirty |= t.click(s, x, y);
+                        }
+                    }
+                }
                 _ => {}
             }
-            k += 1;
         }
         if let Some(p) = notice_path() {
             if let Some(mut s) = cur.take() {
                 s.audio_stop();
             }
             cur = open(&mut win, &p);
+            if let Some(s) = cur.as_mut() {
+                s.gain = t.gain();
+            }
+            t.sec = u64::MAX;
         }
         let Some(s) = cur.as_mut() else {
             sleep_ms(50);
@@ -793,7 +836,7 @@ pub extern "C" fn _start() -> ! {
         s.clock(now);
         s.feed_audio();
         s.pull_video();
-        let mut dirty = s.show_due(&mut win.fb);
+        dirty |= s.show_due(&mut win.fb);
         if !s.ended && s.playing && s.done(now) {
             s.ended = true;
             s.playing = false;
@@ -801,14 +844,106 @@ pub extern "C" fn _start() -> ! {
             s.audio_stop();
             dirty = true;
         }
-        if dirty && win.visible() {
-            win.present();
+        // The bar: on every picture, every second of the clock, and every transport act.
+        let sec = s.media_ms / 1000 + if s.playing { 0 } else { 1 << 40 };
+        if dirty || sec != t.sec {
+            t.sec = sec;
+            bar::paint(&mut win.fb, s, t.vol, t.muted);
+            if win.visible() {
+                win.present();
+            }
         }
         let wait = match s.next {
-            Some(t) if s.playing => t.saturating_sub(s.media_ms).clamp(1, 10),
+            Some(n) if s.playing => n.saturating_sub(s.media_ms).clamp(1, 10),
             _ => 10,
         };
         sleep_ms(wait);
+    }
+}
+
+/// The transport's own state: the volume (0 ..= bar::VOL_MAX), mute, the pointer, the buttons held, the bar's last
+/// painted second.
+struct Transport {
+    vol: i32,
+    muted: bool,
+    ptr: Option<(i32, i32)>,
+    buttons: u8,
+    sec: u64,
+}
+
+impl Transport {
+    /// The sound's gain (Q8): the volume step, 0 when muted. A new gain reaches the blocks decoded from now on (the
+    /// stream already holds about a ring of the old one).
+    fn gain(&self) -> i32 {
+        if self.muted { 0 } else { self.vol * 256 / bar::VOL_MAX }
+    }
+
+    /// The wire line of every transport act: `:: STRIA: transport how=<key|click> act=<a> ms=<clock> vol=<v> muted=<0|1> ::`.
+    fn said(&self, s: &Session, how: &[u8], act: &[u8]) {
+        let mut l = Line::new(b":: STRIA: transport how=");
+        l.put(how).put(b" act=").put(act).put(b" ms=").dec(s.media_ms as i64).put(b" vol=").dec(self.vol as i64);
+        l.put(b" muted=").dec(self.muted as i64).put(b" ::");
+        l.wire();
+    }
+
+    /// Space plays/pauses, Left/Right seek 5 s, Up/Down step the volume, `m` mutes. `true` = repaint.
+    fn key(&mut self, s: &mut Session, c: u8) -> bool {
+        match c {
+            b' ' => {
+                let on = !s.playing;
+                s.set_playing(on);
+                self.said(s, b"key", if on { b"play" } else { b"pause" });
+            }
+            KEY_LEFT => {
+                s.seek(s.media_ms.saturating_sub(5_000));
+                self.said(s, b"key", b"seek");
+            }
+            KEY_RIGHT => {
+                s.seek(s.media_ms + 5_000);
+                self.said(s, b"key", b"seek");
+            }
+            KEY_UP | KEY_DOWN => {
+                self.vol = (self.vol + if c == KEY_UP { 1 } else { -1 }).clamp(0, bar::VOL_MAX);
+                self.muted = false;
+                s.gain = self.gain();
+                self.said(s, b"key", b"vol");
+            }
+            b'm' | b'M' => {
+                self.muted = !self.muted;
+                s.gain = self.gain();
+                self.said(s, b"key", b"mute");
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// A left press at `(x, y)` (window px): the bar's control under it. `true` = repaint.
+    fn click(&mut self, s: &mut Session, x: i32, y: i32) -> bool {
+        match bar::hit(x, y, s) {
+            bar::Hit::Play => {
+                let on = !s.playing;
+                s.set_playing(on);
+                self.said(s, b"click", if on { b"play" } else { b"pause" });
+            }
+            bar::Hit::Seek(ms) => {
+                s.seek(ms);
+                self.said(s, b"click", b"seek");
+            }
+            bar::Hit::Mute => {
+                self.muted = !self.muted;
+                s.gain = self.gain();
+                self.said(s, b"click", b"mute");
+            }
+            bar::Hit::Vol(v) => {
+                self.vol = v.clamp(0, bar::VOL_MAX);
+                self.muted = false;
+                s.gain = self.gain();
+                self.said(s, b"click", b"vol");
+            }
+            bar::Hit::Nothing => return false,
+        }
+        true
     }
 }
 
