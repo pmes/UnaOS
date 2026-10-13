@@ -22,6 +22,7 @@
 //! | [`intra`]         | 8.3 Intra_4x4, Intra_8x8 (+ reference filtering), Intra_16x16, chroma |
 //! | [`inter`]         | 8.4 MV prediction, P_Skip, B direct, interpolation, weighting        |
 //! | [`dpb`]           | 8.2.1 POC, 8.2.4 reference lists, 8.2.5 marking, C.4 output order    |
+//! | [`deblock`]       | 8.7 deblocking filter                                                |
 //! | [`tables`]        | generated constant tables (tools/gen_tables.py)                      |
 
 #![no_std]
@@ -40,6 +41,7 @@ extern crate std;
 pub mod bits;
 pub mod cabac;
 pub mod cavlc;
+pub mod deblock;
 pub mod dpb;
 pub mod inter;
 pub mod intra;
