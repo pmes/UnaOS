@@ -32,6 +32,7 @@ codegen-units = 1
 # vein_ring3: only its ring-3 plumbing — the syscall stub (`sys`), the SYS_SBRK size-class heap and the
 #   SYS_PATH_READ request (`files::path_read`), the ones LUMEN.ELF uses; no network or TLS code is called.
 # font_core: the window's text (KERNELFONT2's engine); font8x8: the grid when no face is on the volume.
+# edit_core: the prompt line's buffer (MIDDEN2).
 [dependencies]
 una-abi = { path = "../una-abi" }
 # PALETTECORE (rmbp-ledger B559): the one no_std palette (LIGHT / DARK / ACCENTS, Look, the role struct) the kernel's
@@ -41,3 +42,5 @@ midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 vein_ring3 = { path = "../../libs/sys/vein_ring3" }
 font_core = { path = "../../libs/text/font_core" }
 font8x8 = { version = "0.3.1", default-features = false }
+# MIDDEN2 (LEDGER SR120): the prompt line is an edit_core Buffer (Tabula's core, SR73: UAX #29 word moves, kills, undo).
+edit_core = { path = "../../libs/text/edit_core" }
