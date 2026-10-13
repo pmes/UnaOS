@@ -3,7 +3,7 @@
 //! The `<canvas>` 2D context's engine, independent of script: [`geom`] (CTM, paths, Path2D's SVG path data,
 //! arc rules), [`raster`] (coverage through font_core's exact-area rasterizer, the stroker, dashes, the
 //! shadow blur), [`paint`] (colours, gradients, patterns, image sampling), [`composite`] (the Porter-Duff
-//! operators and blend modes), [`text`] (the `font` shorthand, glyph outlines as paths, TextMetrics) and
+//! operators and blend modes), [`filter`] (the `filter` attribute's CSS filter functions), [`text`] (the `font` shorthand, glyph outlines as paths, TextMetrics) and
 //! [`context`] (the bitmap, the state stack and the drawing model). The WebIDL face is `js/canvas.rs`.
 //!
 //! Bitmaps live here, per page thread, keyed by a surface id: an HTMLCanvasElement's context binds its node
@@ -12,6 +12,7 @@
 
 pub mod composite;
 pub mod context;
+pub mod filter;
 pub mod geom;
 pub mod paint;
 pub mod raster;

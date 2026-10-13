@@ -1859,6 +1859,11 @@ fn attribute_changed(vm: &mut Vm, el: usize, local: &str, ns: Namespace, old: Op
     if ns == Namespace::None && local.starts_with("on") {
         super::events::handler_attribute_changed(vm, el, &local[2..], new.is_some());
     }
+    // HTML §4.12.5 (AETHERDEBT SR93): a canvas's width/height set (even redundantly) or removed
+    // resets its bitmap and context.
+    if ns == Namespace::None && matches!(local, "width" | "height") && with_doc(|d| d.element(NodeId(el)).is_some_and(|e| e.is_html("canvas"))) {
+        super::canvas::dimension_attribute_changed(vm, el);
+    }
     // HTML §4.11.1 details attribute change steps (AETHERDEBT SR93): `open` added or removed — by
     // script or by the summary's activation — queues the toggle task with the old state.
     if ns == Namespace::None && local == "open" && old.is_some() != new.is_some() && with_doc(|d| d.element(NodeId(el)).is_some_and(|e| e.is_html("details"))) {

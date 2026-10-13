@@ -1247,11 +1247,12 @@ fn ctx_attr_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             }
         }
         "filter" => {
+            // AETHERDEBT SR93: the value is a CSS <filter-value-list> (or `none`), applied by the drawing
+            // model (`canvas::filter`); one that does not parse is ignored.
             let t = string(vm, &v)?;
-            if t != "none" {
-                crate::ledger::record_dom("canvas-filter-unapplied");
+            if canvas::filter::parse(&t).is_some() {
+                canvas::with(id, |c| c.state.filter = t);
             }
-            canvas::with(id, |c| c.state.filter = t);
         }
         "font" => {
             let t = string(vm, &v)?;
@@ -1601,8 +1602,17 @@ fn canvas_dim_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let which = callee_str(vm, ctx);
     let v = vm.to_uint32(&arg(vm, ctx, 0))?;
     let v = if v > 2_147_483_647 { if which == "width" { 300 } else { 150 } } else { v };
+    // HTML: setting width or height (even to its current value) resets the bitmap and the context —
+    // the attribute change steps do it ([`dimension_attribute_changed`]), for setAttribute too.
     set_attr(vm, el, &which, &v.to_string());
-    // HTML: setting width or height (even to its current value) resets the bitmap and the context.
+    Ok(Value::Undefined)
+}
+
+/// The canvas element's attribute change steps for `width` / `height` (HTML §4.12.5: "whenever the
+/// width and height content attributes are set, removed, changed, or redundantly set to the value
+/// they already have", the bitmap and the context reset — AETHERDEBT SR93; `js/dom.rs`
+/// `attribute_changed` calls this).
+pub fn dimension_attribute_changed(vm: &mut Vm, el: usize) {
     if let Some(sid) = canvas::element_surface(el) {
         let (w, h) = element_size(el);
         canvas::with(sid, |c| c.resize(w, h));
@@ -1610,7 +1620,6 @@ fn canvas_dim_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             refresh_keepalive(vm, o, sid);
         }
     }
-    Ok(Value::Undefined)
 }
 
 // ------------------------------------------------------------------------------------------------ OffscreenCanvas, ImageBitmap

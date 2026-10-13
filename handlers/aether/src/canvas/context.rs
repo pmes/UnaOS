@@ -209,6 +209,78 @@ impl Canvas2D {
         Layer { x: cov.x as i64, y: cov.y as i64, w: cov.w, h: cov.h, data }
     }
 
+    /// The drawing model's "apply the filter" (AETHERDEBT SR93): the state's `filter` list over layer
+    /// `l`, in order (`canvas::filter`). `none` (or a list that no longer parses) leaves it as is.
+    fn filtered(&self, l: Layer) -> Layer {
+        use super::filter::{self, Filter};
+        let f = &self.state.filter;
+        if f.is_empty() || f.eq_ignore_ascii_case("none") || l.w == 0 || l.h == 0 {
+            return l;
+        }
+        let Some(list) = filter::parse(f) else { return l };
+        let mut l = l;
+        for step in list {
+            l = match step {
+                Filter::Matrix(m) => {
+                    filter::apply_matrix(&mut l.data, &m);
+                    l
+                }
+                Filter::Blur(sigma) if sigma > 0.0 => {
+                    let (data, w, h, pad) = filter::blur_layer(&l.data, l.w, l.h, sigma);
+                    Layer { x: l.x - pad as i64, y: l.y - pad as i64, w, h, data }
+                }
+                Filter::Blur(_) => l,
+                Filter::DropShadow { dx, dy, blur, color } => {
+                    // The shadow: the layer's alpha, blurred (σ = blur / 2), in `color`, offset; the
+                    // layer over it (source-over) in the union of both boxes.
+                    let sigma = blur / 2.0;
+                    let pad = if sigma > 0.0 { (sigma * 3.0).ceil() as usize + 1 } else { 0 };
+                    let (sw, sh) = (l.w + 2 * pad, l.h + 2 * pad);
+                    if sw.saturating_mul(sh) > MAX_PIXELS {
+                        l
+                    } else {
+                        let mut alpha = vec![0f32; sw * sh];
+                        for yy in 0..l.h {
+                            for xx in 0..l.w {
+                                alpha[(yy + pad) * sw + xx + pad] = l.data[yy * l.w + xx][3];
+                            }
+                        }
+                        super::raster::blur(&mut alpha, sw, sh, sigma);
+                        let c = premul(color);
+                        let shadow = Layer {
+                            x: l.x - pad as i64 + dx.round() as i64,
+                            y: l.y - pad as i64 + dy.round() as i64,
+                            w: sw,
+                            h: sh,
+                            data: alpha.iter().map(|&k| [c[0] * k, c[1] * k, c[2] * k, c[3] * k]).collect(),
+                        };
+                        let x0 = l.x.min(shadow.x);
+                        let y0 = l.y.min(shadow.y);
+                        let x1 = (l.x + l.w as i64).max(shadow.x + shadow.w as i64);
+                        let y1 = (l.y + l.h as i64).max(shadow.y + shadow.h as i64);
+                        let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+                        if w.saturating_mul(h) > MAX_PIXELS {
+                            l
+                        } else {
+                            let mut data = vec![[0f32; 4]; w * h];
+                            for y in 0..h {
+                                for x in 0..w {
+                                    let (gx, gy) = (x0 + x as i64, y0 + y as i64);
+                                    let s = l.get(gx, gy);
+                                    let d = shadow.get(gx, gy);
+                                    let k = 1.0 - s[3];
+                                    data[y * w + x] = [s[0] + d[0] * k, s[1] + d[1] * k, s[2] + d[2] * k, s[3] + d[3] * k];
+                                }
+                            }
+                            Layer { x: x0, y: y0, w, h, data }
+                        }
+                    }
+                }
+            };
+        }
+        l
+    }
+
     fn shadow_of(&self, a: &Layer) -> Layer {
         let s = &self.state;
         let sigma = s.shadow_blur / 2.0;
@@ -284,6 +356,8 @@ impl Canvas2D {
         self.generation = self.generation.wrapping_add(1);
         let cov = cov.unwrap_or_default();
         let a = self.layer_from(&cov, paint);
+        // AETHERDEBT SR93: the `filter` applies to the drawing before its shadow and compositing.
+        let a = self.filtered(a);
         if self.shadows_on() && cov.w > 0 {
             let b = self.shadow_of(&a);
             self.composite_layer(&b);
