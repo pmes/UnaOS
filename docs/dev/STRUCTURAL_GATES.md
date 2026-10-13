@@ -2648,6 +2648,19 @@ copy exit 2.
 
 **Today.** `GATES: 11 run 10 green -> FAIL`, rc 1: deps (objc2 0.6.4 behind 0.6.5, ARC DEPSLAG).
 
+**The scorers' rows (TOOLING1, 2026-10-13; ARCH-CONFORMANCE 14, rmbp-ledger B107).** `mbench-selftest`
+(`mbench.py --self-test`, ~4 s) and `specscore` (`orin-specscore.py --self-test`, ~1 s) close the last two rows
+of the set. mbench's self-test was reachable only through `check`'s GATE-HOSTTESTS, behind the cargo legs; the
+specscore tool was run by nothing (`grep -c orin-specscore unaos/arroyo` was 0) and had no self-test at all. Its
+`--self-test` runs `--explain` over every `scripts/specs/*.spec` (the corpus loop B107 named), the six
+`--explain` refusals, a no-image PASS/FAIL, one rule per reachability class (IMG/WIRE/DEAD/FOREIGN) on a synthetic
+source tree and image, RC_VACUOUS on a clean pass with a DEAD FORBID (and `--no-coverage-gate` / `--accept-dead`
+restoring 0), and the checked-in `jetson-sync1` green capture. Both rows run with TMPDIR pinned to
+`unaos/target/gates-tmp`. Plants: mbench drops `-> FLICKER` from DEFAULT_FORBIDS (an `RC_TRUNCATED` rename was
+tried first and MISSED: the self-test compares against the constant); specscore returns WIRE where an emitter is
+compiled out. `gates_selftest` backs up and restores both scripts around every plant. Witness at TOOLING1:
+`GATEPATH selftest: plants=15 caught=15 -> PASS`.
+
 ## GATEFIX — the seven gate arcs GATEREVIEW left unbuilt (B476, 2026-10-06)
 
 **The holes.** `docs/dev/review/GATES-2026-10-06.md` planted 25 defects; seven passed a gate and were named as arcs:

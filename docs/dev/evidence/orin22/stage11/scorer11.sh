@@ -48,6 +48,15 @@
 #   never FAIL. (UNAOS-LAWS: "a check is trusted only when its corpus can produce more than one
 #   outcome"; memory: "a check that cannot fire".)
 #
+# LEG (g) STAMP-MATCH (TOOLING1, 2026-10-13; orin-queue TOOLING/AUDIT): the wire's `sha=` — the
+#   build identity the kernel prints on its `[vfs] root …` line (fs/bootdisk.rs, BUILD_SHA from
+#   UNAOS_GIT_SHA) — must EQUAL the stamp carried by the kernel.elf handed in, read with
+#   `strings -a | awk index("UNAOS-BUILD-STAMP-1:")` (fs/bootdisk.rs STAMP_MAGIC, the VERSIONWIN
+#   stamp in .text). A mismatch is WRONG-IMAGE and exits 1: the ELF on the card is not the kernel
+#   that booted, so every other leg was scored against the wrong artifact. Compared as TEXT, exactly
+#   (`<8hex>` or `<8hex>-d<6hex>`): the stamp is a name, not a number. Can-fire proof:
+#   docs/dev/evidence/tooling1-1013/RUN.md (a real render15 wire against its own ELF and a sibling's).
+#
 # CAN-FIRE PROOF: `mutate11.sh` builds the fixture set (mutations of the render9 wire + four
 # artifact fixtures) and drives every leg through every outcome. Table: MUTATIONS.md.
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
@@ -101,6 +110,10 @@ fi
 ARM=$(strings -a "$K" 2>/dev/null | grep -c -F -- '[vfs] root = boot volume'); ARM=${ARM:-0}
 CTL=$(strings -a "$K" 2>/dev/null | grep -c -F -- 'crates/kernel/src/'); CTL=${CTL:-0}
 OLDART=$(strings -a "$K" 2>/dev/null | grep -c -F -- '[sdmmc] root'); OLDART=${OLDART:-0}
+# (g) the VERSIONWIN build stamp: `UNAOS-BUILD-STAMP-1:<sha>` + NUL padding, so `strings` ends it.
+STAMP_N=$(strings -a "$K" 2>/dev/null | LC_ALL=C awk 'index($0,"UNAOS-BUILD-STAMP-1:"){n++} END{print n+0}')
+ELF_STAMP=$(strings -a "$K" 2>/dev/null | LC_ALL=C awk 'i=index($0,"UNAOS-BUILD-STAMP-1:"){s=substr($0,i+20); sub(/[ \t].*/,"",s); print s; exit}')
+[ -n "$ELF_STAMP" ] || ELF_STAMP="-"
 if [ "$CTL" -eq 0 ]; then
   echo "ARMING: positive control 'crates/kernel/src/'=0 in '$K' (arming literal count=$ARM, ignored) -> NO-ARMING-FIELD — REFUSING TO SCORE. The control is the panic::Location path prefix that every UnaOS kernel build carries whatever its features; a zero means `strings -a` read nothing usable from this file or the file is not a kernel image. A zero counted next to a control that does not fire is not evidence of anything."
   exit 2
@@ -133,6 +146,10 @@ index($0,"[vfs] root -> NONE") {
   if (match($0,/serial=0x[0-9a-fA-F]+/))  nn_serial=norm(substr($0,RSTART+9,RLENGTH-9))
 }
 index($0,"[sdmmc] root") { old_n++; old_line=$0 }
+index($0,"[vfs] root = boot volume") || index($0,"[vfs] root -> NONE") {
+  r_n++
+  if (match($0,/ sha=[^ ]+/)) { t=substr($0,RSTART+5,RLENGTH-5); st_n++; if (!(t in st_seen)) { st_seen[t]=1; st_d++; st_list=st_list (st_list==""?"":",") t } ; st_last=t }
+}
 index($0,"[vfs] root")   { vfs_any++ }
 function q(s){ gsub(/\047/,"",s); return s }
 END{
@@ -142,11 +159,13 @@ END{
   printf "S_D=%d; S_MAL=%d; S_LAST=%s; S_LIST=%s;\n", s_d+0, s_mal+0, (s_last==""?"-":s_last), (s_list==""?"-":s_list)
   printf "NN_N=%d; NN_REASON=%s; NN_SERIAL=%s;\n", nn_n+0, (nn_reason==""?"-":nn_reason), (nn_serial==""?"-":nn_serial)
   printf "OLD_N=%d; VFS_ANY=%d;\n", old_n+0, vfs_any+0
+  printf "R_N=%d; ST_N=%d; ST_D=%d; ST_LAST=\047%s\047; ST_LIST=\047%s\047;\n", r_n+0, st_n+0, st_d+0, q(st_last==""?"-":st_last), q(st_list==""?"-":st_list)
   printf "LD_LINE=\047%s\047; B_LINE=\047%s\047; NN_LINE=\047%s\047; OLD_LINE=\047%s\047;\n", q(substr(ld_line,1,150)), q(substr(b_line,1,170)), q(substr(nn_line,1,170)), q(substr(old_line,1,150))
 }')"
 
 echo "-- scorer11: wire=$W ($N_TOTAL lines) | artifact=$K"
 echo "   ARTIFACT strings: arming '[vfs] root = boot volume'=$ARM | positive control 'crates/kernel/src/'=$CTL | retired '[sdmmc] root'=$OLDART -> ARMED=$ARMED"
+echo "   ARTIFACT build stamp: 'UNAOS-BUILD-STAMP-1:' literals=$STAMP_N value=$ELF_STAMP"
 echo "   WIRE controls: loader lines=$C_LOADER | kernel lines=$C_KERNEL"
 echo
 
@@ -252,6 +271,37 @@ leg SOURCE-VOCAB "SOURCE-VOCAB: source token(s) seen=$S_LIST (distinct=$S_D, lin
       global|usb|sdhc|tegra-sd) echo "PASS SOURCE-VOCAB (source=$S_LAST, in the contract's set global|usb|sdhc|tegra-sd)" ;;
       *) echo "NOTE — source=$S_LAST is NOT in the contract's set (global|usb|sdhc|tegra-sd). Either a backend was added since this scorer was cut, or the token is being read out of a line this parser does not understand. Not a flight failure; a signal to re-read the emit site before the next round." ;;
     esac
+  fi)"
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# LEG (g) — STAMP-MATCH (TOOLING1). The wire's own build identity vs the ELF's. Not gated on ARMING:
+# a stamp on the wire that the artifact does not carry is a wrong-image finding whatever is armed.
+# Gated on the kernel having spoken, and on a root line existing to carry `sha=` — an armed image
+# whose kernel printed no root line is ROOT-BIND's red, and is not counted twice here.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+leg STAMP-MATCH "STAMP-MATCH: wire sha=$ST_LAST (root lines=$R_N, carrying sha=: $ST_N, distinct=$ST_D) vs artifact stamp $ELF_STAMP (literals=$STAMP_N) || CONTROLS kernel lines=$C_KERNEL, artifact control=$CTL" "$(
+  if [ "$C_KERNEL" -eq 0 ]; then
+    echo "NOT-SCORED — the kernel never spoke on this wire, so there is no wire identity to compare with the artifact's stamp ($ELF_STAMP)."
+  elif [ "$R_N" -eq 0 ]; then
+    if [ "$ARMED" = armed ]; then
+      echo "NOTE — no [vfs] root line on this wire to carry sha= (ROOT-BIND carries that red; not counted twice). The artifact's stamp is $ELF_STAMP; the image that booted is UNIDENTIFIED by this leg."
+    else
+      echo "NOT-EXERCISED — no root line on the wire and no bind emitter in the artifact; the identity line was not printed by the image that flew."
+    fi
+  elif [ "$ST_D" -gt 1 ]; then
+    echo "FAIL — $ST_D DISTINCT sha= values on one wire ($ST_LIST): the window spans more than one boot of more than one build. Re-scope to a single boot and re-score."
+  elif [ "$ST_N" -eq 0 ] && [ "$STAMP_N" -eq 0 ]; then
+    echo "NOT-EXERCISED — neither the wire's root line nor the artifact carries a build stamp: both predate VERSIONWIN, so identity is not comparable by this leg."
+  elif [ "$ST_N" -eq 0 ]; then
+    echo "WRONG-IMAGE — the artifact is stamped $ELF_STAMP, but the kernel that booted printed its root line with NO sha= field: it predates the stamp, so it is NOT this ELF. Find the ELF that was actually on the card and re-score."
+  elif [ "$STAMP_N" -eq 0 ]; then
+    echo "WRONG-IMAGE — the wire names build sha=$ST_LAST, but the artifact handed in carries NO 'UNAOS-BUILD-STAMP-1:' stamp (control $CTL fires, so the zero is real). The ELF scored here is not the kernel that booted."
+  elif [ "$ST_LAST" != "$ELF_STAMP" ]; then
+    echo "WRONG-IMAGE — the wire says the booted kernel is sha=$ST_LAST and the card ELF is stamped $ELF_STAMP. Every other leg was scored against an artifact that did NOT fly. Score against the FLIGHTID's ELF, or re-derive which card was in the reader."
+  elif [ "$ST_LAST" = unstamped ]; then
+    echo "NOTE — both sides read 'unstamped' (built without UNAOS_GIT_SHA): they agree, but an unstamped pair identifies nothing. Rebuild through arroyo to get a stamp."
+  else
+    echo "PASS STAMP-MATCH (the kernel that booted is the card ELF: wire sha=$ST_LAST == artifact stamp $ELF_STAMP, $ST_N line(s))"
   fi)"
 
 echo

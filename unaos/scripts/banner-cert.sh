@@ -358,6 +358,11 @@ genet|SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state)|bare
 nettest|:: NET20-GATE: mdns host-name publish battery|baremetal|measured(1)
 pirast|:: RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::|-|measured(1)
 desktop_firmware|[deskfw] activate DECLINE reason=no-panel|@arch:aarch64|measured(1)
+orindesk|[orinwm1] DECLINE reason=no-panel|@arch:aarch64|unmeasured-here
+orinclick|[orinclick] arm panel=|@arch:aarch64|unmeasured-here
+orinconwin|[orinconwin] DECLINE reason=no-panel|@arch:aarch64|unmeasured-here
+orinrender|[render] arm conwin=|@arch:aarch64|unmeasured-here
+tegra_el0|:: TEGRA-EL0: el0-hello round-trip|@arch:aarch64|unmeasured-here
 quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
 selfhost|:: SELFHOST:|-|measured

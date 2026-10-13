@@ -460,10 +460,10 @@ Evidence `docs/dev/evidence/orin28/render15-4f-brfetch.log` (1,121 lines from th
 · NIC descriptor-17 OPEN (R19); net5V REFETCH-WRONGSLOT=3 carried since render8.
 
 ## TOOLING / AUDIT
-· scorer11 STAMP-MATCH leg (wire `sha=` == card elf stamp, WRONG-IMAGE exit 1).
-· orin-specscore.py / mbench --self-test are run by NO verb (ARCH-CONFORMANCE 14).
+✓ DONE 2026-10-13 (TOOLING1, `exec-rmbp-local-tooling1`): scorer11 STAMP-MATCH leg (wire `sha=` == card elf stamp, WRONG-IMAGE exit 1) — leg (g) in `docs/dev/evidence/orin22/stage11/scorer11.sh`; a real render15 wire against its sibling ELF now reds where the six older legs all passed (`docs/dev/evidence/tooling1-1013/RUN.md` §2).
+✓ DONE 2026-10-13 (TOOLING1): orin-specscore.py / mbench --self-test are run by NO verb (ARCH-CONFORMANCE 14) — `orin-specscore.py --self-test` written (41 checks); both are `./arroyo gates` rows `specscore` / `mbench-selftest`, with GATEPATH plants (15/15 caught).
 · 28 board-named shared scripts — R4 scour, its own arc.
-· media-writer.sh is un-versioned (rmbp B97).
+✓ DONE 2026-10-13 (TOOLING1): media-writer.sh is un-versioned (rmbp B97) — canonical copy now `unaos/scripts/media-writer.sh` (imported byte-identical, then C14 TREE-FITS + release-on-failure + `--version`/self-sha stamp); the bench copy is an install of it. The seat installs it with `cp -p`.
 · winmenu APP_OWNER unregistered WinId holder (pi 10's question) — prove or refute.
 
 ## BENCH FACTS THIS ROUND (orin 27, 2026-09-12)
