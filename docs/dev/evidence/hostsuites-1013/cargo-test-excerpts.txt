@@ -1,0 +1,1268 @@
+### pass 1 (cargo test --workspace --exclude aether --no-fail-fast) - full.log lines 280-342 (where it stopped)
+   Compiling linux-raw-sys v0.12.1
+   Compiling clap_lex v1.1.1
+   Compiling strsim v0.11.1
+   Compiling alsa-sys v0.4.0
+   Compiling fastrand v2.5.0
+   Compiling anstream v1.0.0
+   Compiling prefs_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a65897a7a69dd4936/unaos/libs/sys/prefs_core)
+   Compiling clap_builder v4.6.7
+error: failed to run custom build command for `alsa-sys v0.4.0`
+
+Caused by:
+  process didn't exit successfully: `/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/alsa-sys/48fb1bfb5937da0b/out/build_script_build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-env-changed=ALSA_NO_PKG_CONFIG
+  cargo:rerun-if-env-changed=PKG_CONFIG_x86_64-unknown-linux-gnu
+  cargo:rerun-if-env-changed=PKG_CONFIG_x86_64_unknown_linux_gnu
+  cargo:rerun-if-env-changed=HOST_PKG_CONFIG
+  cargo:rerun-if-env-changed=PKG_CONFIG
+  cargo:rerun-if-env-changed=PKG_CONFIG_PATH_x86_64-unknown-linux-gnu
+  cargo:rerun-if-env-changed=PKG_CONFIG_PATH_x86_64_unknown_linux_gnu
+  cargo:rerun-if-env-changed=HOST_PKG_CONFIG_PATH
+  cargo:rerun-if-env-changed=PKG_CONFIG_PATH
+  cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR_x86_64-unknown-linux-gnu
+  cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu
+  cargo:rerun-if-env-changed=HOST_PKG_CONFIG_LIBDIR
+  cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR
+  cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR_x86_64-unknown-linux-gnu
+  cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR_x86_64_unknown_linux_gnu
+  cargo:rerun-if-env-changed=HOST_PKG_CONFIG_SYSROOT_DIR
+  cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR
+  cargo:rerun-if-env-changed=PKG_CONFIG_PATH_x86_64-unknown-linux-gnu
+  cargo:rerun-if-env-changed=PKG_CONFIG_PATH_x86_64_unknown_linux_gnu
+  cargo:rerun-if-env-changed=HOST_PKG_CONFIG_PATH
+  cargo:rerun-if-env-changed=PKG_CONFIG_PATH
+  cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR_x86_64-unknown-linux-gnu
+  cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu
+  cargo:rerun-if-env-changed=HOST_PKG_CONFIG_LIBDIR
+  cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR
+  cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR_x86_64-unknown-linux-gnu
+  cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR_x86_64_unknown_linux_gnu
+  cargo:rerun-if-env-changed=HOST_PKG_CONFIG_SYSROOT_DIR
+  cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR
+
+  --- stderr
+
+  thread 'main' (140581) panicked at /home/pmes/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/alsa-sys-0.4.0/build.rs:13:19:
+  Could not run `PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1 pkg-config --libs --cflags alsa`
+  The pkg-config command could not be found.
+
+  Most likely, you need to install a pkg-config package for your OS.
+  Try `apt install pkg-config`, or `yum install pkg-config`, or `brew install pkgconf`
+  or `pkg install pkg-config`, or `apk add pkgconfig` depending on your distribution.
+
+  If you've already installed it, ensure the pkg-config command is one of the
+  directories in the PATH environment variable.
+
+  If you did not expect this build to link to a pre-installed system library,
+  then check documentation of the alsa-sys crate for an option to
+  build the library from source, or disable features or dependencies
+  that require pkg-config.
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...
+EXIT=101
+
+### pass 2 - pass2.log: every Running / Doc-tests / test-result line
+394:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/amber_bytes/73e1dcd291edc753/out/amber_bytes-73e1dcd291edc753)
+404:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+406:     Running unittests src/bin/amber.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/amber_bytes/e6b4ee90a2049e56/out/amber-e6b4ee90a2049e56)
+410:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+412:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/amber_bytes/685346638a4e283b/out/amber_bytes-685346638a4e283b)
+417:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+419:     Running tests/amber_cli.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/amber_bytes/20be99f956a92dcb/out/amber_cli-20be99f956a92dcb)
+428:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.64s
+430:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/amber_core/4c43a42bb094be32/out/amber_core-4c43a42bb094be32)
+438:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+440:     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/amber_core/39c3438db870fbb8/out/oracle-39c3438db870fbb8)
+448:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+450:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio-check/bfbfb7243f6f7684/out/audio_check-bfbfb7243f6f7684)
+454:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+456:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/8ffb10429cc537b0/out/audio_core-8ffb10429cc537b0)
+469:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+471:     Running tests/aac_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/8e06ac47d4c63e25/out/aac_kat-8e06ac47d4c63e25)
+477:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.99s
+479:     Running tests/facts_testf.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/08b1f207a7eaf6d2/out/facts_testf-08b1f207a7eaf6d2)
+485:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+487:     Running tests/flac_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/63f81996ca390abd/out/flac_kat-63f81996ca390abd)
+493:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 42.73s
+495:     Running tests/lossy_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/5d1b34f4b6337b75/out/lossy_oracle-5d1b34f4b6337b75)
+502:test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.07s
+504:     Running tests/mime_testf.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/678d9834dd9765c7/out/mime_testf-678d9834dd9765c7)
+511:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+513:     Running tests/mp3_iso.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/8dafa78381c4179e/out/mp3_iso-8dafa78381c4179e)
+518:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.27s
+520:     Running tests/mp4one_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/bb87fd3db03922ec/out/mp4one_kat-bb87fd3db03922ec)
+527:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+529:     Running tests/ogg_container.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/35a5327538b939d1/out/ogg_container-35a5327538b939d1)
+535:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+537:     Running tests/opus_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/715b35265f8ec8db/out/opus_kat-715b35265f8ec8db)
+543:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.33s
+545:     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/10f5b4729a4f74f3/out/oracle-10f5b4729a4f74f3)
+551:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.86s
+553:     Running tests/robust.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/a6635131bca0f50e/out/robust-a6635131bca0f50e)
+563:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.34s
+565:     Running tests/route.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/1d160503afe7e6f8/out/route-1d160503afe7e6f8)
+570:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+572:     Running tests/seek_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/42d0ecaa9a88afc7/out/seek_kat-42d0ecaa9a88afc7)
+584:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 66.09s
+586:     Running tests/vplayaudio_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/audio_core/3cbee7a966947ccd/out/vplayaudio_kat-3cbee7a966947ccd)
+593:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+595:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/aule/a1bdbf8ad9c4b01c/out/aule-a1bdbf8ad9c4b01c)
+602:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+604:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/av1-check/0a5ae0344c811b93/out/av1_check-0a5ae0344c811b93)
+608:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+610:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/av1_core/2911832d2cac84a8/out/av1_core-2911832d2cac84a8)
+634:test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+636:     Running tests/m1_headers.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/av1_core/effafed91d473817/out/m1_headers-effafed91d473817)
+648:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+650:     Running tests/m3_decode.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/av1_core/383c8b7b64310366/out/m3_decode-383c8b7b64310366)
+657:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.47s
+659:     Running tests/m5_inter.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/av1_core/c87ae5ca1f881d69/out/m5_inter-c87ae5ca1f881d69)
+674:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.06s
+676:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/bandy/b380fd402dcf7c7e/out/bandy-b380fd402dcf7c7e)
+680:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+682:     Running tests/smessage_kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/bandy/15e473e5b657c9fa/out/smessage_kats-15e473e5b657c9fa)
+857:test result: ok. 171 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+859:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/comscan/b57ccd449cf98afc/out/comscan-b57ccd449cf98afc)
+863:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+865:     Running tests/console.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/comscan/fee058f90e0d2121/out/console-fee058f90e0d2121)
+878:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+880:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/crypto-check/5f78caead7f7da44/out/crypto_check-5f78caead7f7da44)
+884:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+886:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/crypto_core/d86eb8a85f30ee67/out/crypto_core-d86eb8a85f30ee67)
+903:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+905:     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/crypto_core/3aed009187f08821/out/kat-3aed009187f08821)
+916:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.89s
+918:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/css_core/4459e556ce34e25a/out/css_core-4459e556ce34e25a)
+922:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+924:     Running tests/cascade.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/css_core/77d6191056357bad/out/cascade-77d6191056357bad)
+934:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+936:     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/css_core/f75892c3d0d6961b/out/oracle-f75892c3d0d6961b)
+943:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+945:     Running tests/selectors.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/css_core/5807dd258555a012/out/selectors-5807dd258555a012)
+952:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+954:     Running tests/syntax.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/css_core/2fac513d79726abb/out/syntax-2fac513d79726abb)
+959:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+961:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/7e460637337f3829/out/demux_core-7e460637337f3829)
+965:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+967:     Running tests/common.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/c5ba26a6a632516a/out/common-c5ba26a6a632516a)
+971:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+973:     Running tests/facts_testf.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/b462b6605af2049b/out/facts_testf-b462b6605af2049b)
+978:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+980:     Running tests/kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/6178587c01bc1543/out/kats-6178587c01bc1543)
+1000:test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1002:     Running tests/mime_testf.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/743cbec3a9599186/out/mime_testf-743cbec3a9599186)
+1009:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1011:     Running tests/samples.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/3a4d0d94a31ecba8/out/samples-3a4d0d94a31ecba8)
+1018:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+1020:     Running tests/seek_track.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/1ed0a133f2dc44c7/out/seek_track-1ed0a133f2dc44c7)
+1025:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1027:     Running tests/videoplayer_testf.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/demux_core/b552a9d926934ddb/out/videoplayer_testf-b552a9d926934ddb)
+1034:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1036:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/diag_core/bb58faaaaafd8d07/out/diag_core-bb58faaaaafd8d07)
+1050:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1052:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/edit_core/7f69a090acfa547a/out/edit_core-7f69a090acfa547a)
+1056:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1058:     Running tests/fuzz.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/edit_core/01b40bd9c36e4c5f/out/fuzz-01b40bd9c36e4c5f)
+1064:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+1066:     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/edit_core/8a86030dfa2b6afb/out/kat-8a86030dfa2b6afb)
+1096:test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1098:     Running tests/uax29.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/edit_core/ce0cb834a213635e/out/uax29-ce0cb834a213635e)
+1104:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1106:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/elessar/8462aca1f10d5213/out/elessar-8462aca1f10d5213)
+1111:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1113:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/elf_core/18bb6d3d81b885f3/out/elf_core-18bb6d3d81b885f3)
+1123:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1125:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/exfat_core/ba0721fffa9af2d4/out/exfat_core-ba0721fffa9af2d4)
+1134:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1136:     Running tests/image.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/exfat_core/1e56b865078dba46/out/image-1e56b865078dba46)
+1146:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1148:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/eyes/bf59d387bcdf3b83/out/eyes-bf59d387bcdf3b83)
+1152:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1154:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/facet/e3947c33de0f38f8/out/facet-e3947c33de0f38f8)
+1180:test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1182:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/facet/9f5511d847f3ce58/out/facet-9f5511d847f3ce58)
+1186:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1188:     Running tests/bus.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/facet/947640cea7baebde/out/bus-947640cea7baebde)
+1193:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1195:     Running tests/oracles.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/facet/028c7115336bcaa1/out/oracles-028c7115336bcaa1)
+1207:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+1209:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/facet-view/2e3dacc13713325c/out/facet_view-2e3dacc13713325c)
+1213:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1215:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/facet-view/e1be5257ae28e711/out/facet_view-e1be5257ae28e711)
+1219:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1221:     Running tests/viewer.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/facet-view/f8d336d2608a07b9/out/viewer-f8d336d2608a07b9)
+1228:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1230:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/1211b8b9dd217ad6/out/font_core-1211b8b9dd217ad6)
+1242:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1244:     Running tests/bidi.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/efd5df974901f176/out/bidi-efd5df974901f176)
+1251:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.23s
+1253:     Running tests/complex_shape.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/f21622950f86e1f7/out/complex_shape-f21622950f86e1f7)
+1258:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.53s
+1260:     Running tests/fontbidi_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/0ae9e2f9d2663162/out/fontbidi_oracle-0ae9e2f9d2663162)
+1266:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+1268:     Running tests/fuzz.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/c54f18bd0233e086/out/fuzz-c54f18bd0233e086)
+1275:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.07s
+1277:     Running tests/hint_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/7819d47dce45abbe/out/hint_kat-7819d47dce45abbe)
+1283:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+1285:     Running tests/hint_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/30503aae9f63f5ec/out/hint_oracle-30503aae9f63f5ec)
+1290:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+1292:     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/5c24b47116dc69da/out/kat-5c24b47116dc69da)
+1316:test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+1319:     Running tests/kernelfont.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/1900331743944bda/out/kernelfont-1900331743944bda)
+1334:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+1336:     Running tests/linebreak.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/a97430b5f379211a/out/linebreak-a97430b5f379211a)
+1343:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+1345:     Running tests/name.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/238e84b233c068aa/out/name-238e84b233c068aa)
+1372:test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+1375:     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/c8a5e9150a0d5f68/out/oracle-c8a5e9150a0d5f68)
+1380:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1382:     Running tests/raster.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/dcdc283db9b5dcd4/out/raster-dcdc283db9b5dcd4)
+1407:test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+1410:     Running tests/shape.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/d4497b0080bbe505/out/shape-d4497b0080bbe505)
+1417:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+1419:     Running tests/text_units.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/3e8302cb1f3b5bcd/out/text_units-3e8302cb1f3b5bcd)
+1427:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.51s
+1429:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/foreman/836e0bbd4a2d3296/out/foreman-836e0bbd4a2d3296)
+1471:test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+1473:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/foreman/858723b8da00e2f7/out/foreman-858723b8da00e2f7)
+1477:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1479:     Running tests/agreement.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/foreman/d0c02dcb0ae91ad0/out/agreement-d0c02dcb0ae91ad0)
+1485:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+1487:     Running tests/preflight.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/foreman/450afe2699e235c6/out/preflight-450afe2699e235c6)
+1493:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1495:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/044d2b85164b8968/out/git_core-044d2b85164b8968)
+1510:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1512:     Running tests/deflate.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/e596af32e57f775f/out/deflate-e596af32e57f775f)
+1519:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.37s
+1521:     Running tests/diff.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/49ebe9399f50f5df/out/diff-49ebe9399f50f5df)
+1528:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.25s
+1530:     Running tests/formats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/336863d2751a4ab9/out/formats-336863d2751a4ab9)
+1552:test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+1555:     Running tests/fuzz.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/a62054d9244891bf/out/fuzz-a62054d9244891bf)
+1560:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.48s
+1562:     Running tests/http.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/822dccbcbee66bbd/out/http-822dccbcbee66bbd)
+1569:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.64s
+1571:     Running tests/loose.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/0a4ac3a8c40f1c50/out/loose-0a4ac3a8c40f1c50)
+1577:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1579:     Running tests/pack.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/2f79d48c60a7e627/out/pack-2f79d48c60a7e627)
+1588:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 63.25s
+1590:     Running tests/worktree.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/ccdcaea95a6b72c6/out/worktree-ccdcaea95a6b72c6)
+1598:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+1600:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/gneiss_pal/6859ca1c2f90e6a7/out/gneiss_pal-6859ca1c2f90e6a7)
+1699:test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+1701:     Running tests/audio_track.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/gneiss_pal/a22a3feb2167325e/out/audio_track-a22a3feb2167325e)
+1710:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.07s
+1712:     Running tests/local_embed_golden.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/gneiss_pal/0588ddd20a9b85e2/out/local_embed_golden-0588ddd20a9b85e2)
+1716:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1718:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/helm/85980c804714be05/out/helm-85980c804714be05)
+1722:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1724:     Running tests/rover_invariants.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/helm/5b73e6a098100843/out/rover_invariants-5b73e6a098100843)
+1741:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1743:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron/8cf287b3810ff376/out/holocron-8cf287b3810ff376)
+1747:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1749:     Running tests/m1_store.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron/74983696dc88d50e/out/m1_store-74983696dc88d50e)
+1757:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1759:     Running tests/m2_bus.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron/e11672f2901f6ea1/out/m2_bus-e11672f2901f6ea1)
+1766:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+1768:     Running tests/m3_metal_frame.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron/8f89b32423138a74/out/m3_metal_frame-8f89b32423138a74)
+1774:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1776:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron-cli/89b17670ef16d384/out/holocron-89b17670ef16d384)
+1780:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1782:     Running tests/e2e.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron-cli/31bcefe8bed5931e/out/e2e-31bcefe8bed5931e)
+1788:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+1790:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/5d6356f7396ef6c6/out/holocron_core-5d6356f7396ef6c6)
+1795:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1797:     Running tests/agent.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/e956da89e78ad2bc/out/agent-e956da89e78ad2bc)
+1804:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1806:     Running tests/bus.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/0e480a78f404631d/out/bus-0e480a78f404631d)
+1819:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1821:     Running tests/cc.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/c5ea4e316a271871/out/cc-c5ea4e316a271871)
+1829:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+1831:     Running tests/frame.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/3303ba66d4b76cce/out/frame-3303ba66d4b76cce)
+1838:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1840:     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/0fa49487b2eeb44e/out/kat-0fa49487b2eeb44e)
+1856:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1858:     Running tests/ringlogin.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/e391591db4265e45/out/ringlogin-e391591db4265e45)
+1865:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+1867:     Running tests/root.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/9427e9c518af4cdb/out/root-9427e9c518af4cdb)
+1877:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1879:     Running tests/session.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/holocron_core/713452d87599a3f7/out/session-713452d87599a3f7)
+1885:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1887:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/html_core/3494131b491f696e/out/html_core-3494131b491f696e)
+1895:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1897:     Running tests/m1_tokenizer.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/html_core/7316da347e245cb8/out/m1_tokenizer-7316da347e245cb8)
+1904:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.89s
+1906:     Running tests/m2_dom.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/html_core/b8ef8b17461fdcd6/out/m2_dom-b8ef8b17461fdcd6)
+1913:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1915:     Running tests/m2_tree.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/html_core/23a4cda57e8fac15/out/m2_tree-23a4cda57e8fac15)
+1920:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.28s
+1922:     Running tests/m3_fuzz.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/html_core/9103e270b7f93097/out/m3_fuzz-9103e270b7f93097)
+1927:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+1929:     Running tests/m3_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/html_core/508a79b66602d040/out/m3_oracle-508a79b66602d040)
+1936:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
+1938:     Running tests/url_wpt.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/html_core/b02615fe871a7c1b/out/url_wpt-b02615fe871a7c1b)
+1946:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1948:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/6af21abb9e5853f1/out/http_core-6af21abb9e5853f1)
+1986:test result: FAILED. 19 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1989:     Running tests/aia_e2e.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/a6209c79f9e97190/out/aia_e2e-a6209c79f9e97190)
+1994:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+1996:     Running tests/cookies_http_state.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/fe388928ccf12e19/out/cookies_http_state-fe388928ccf12e19)
+2001:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.82s
+2003:     Running tests/h1_kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/c627c7660eefc2c3/out/h1_kats-c627c7660eefc2c3)
+2016:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2018:     Running tests/host_e2e.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/df738968c3ca0193/out/host_e2e-df738968c3ca0193)
+2030:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.92s
+2032:     Running tests/url_wpt.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/ac0ef1aa75bf0e2c/out/url_wpt-ac0ef1aa75bf0e2c)
+2059:test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+2062:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/ibus/3f3851aae87b9a62/out/ibus-3f3851aae87b9a62)
+2066:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2068:     Running tests/kat_vectors.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/ibus/a8105e2c2150f9c7/out/kat_vectors-a8105e2c2150f9c7)
+2084:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2086:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/infer_core/a6722e1fde8f9d71/out/infer_core-a6722e1fde8f9d71)
+2110:test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+2112:     Running tests/fuzz.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/infer_core/c7fc2227c806791f/out/fuzz-c7fc2227c806791f)
+2119:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.06s
+2121:     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/infer_core/557b565bf144f792/out/oracle-557b565bf144f792)
+2127:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 293.70s
+2129:     Running tests/safetensors_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/infer_core/d9acc7f554e3b9df/out/safetensors_kat-d9acc7f554e3b9df)
+2135:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.76s
+2137:     Running tests/tokenizer_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/infer_core/e08db3adc0468351/out/tokenizer_kat-e08db3adc0468351)
+2142:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+2144:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/jobs_core/48b96b0de81d3fbc/out/jobs_core-48b96b0de81d3fbc)
+2151:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2153:     Running tests/roundtrip.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/jobs_core/48c0bf1fd328dc58/out/roundtrip-48c0bf1fd328dc58)
+2163:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+2165:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/js_core/9f4fd34c25ed6798/out/js_core-9f4fd34c25ed6798)
+2169:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2171:     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/js_core/1ef66bb2b0929806/out/oracle-1ef66bb2b0929806)
+2176:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+2178:     Running tests/smoke.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/js_core/2777c470f4be4938/out/smoke-2777c470f4be4938)
+2187:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+2189:     Running tests/test262.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/js_core/06fc37feb2224d17/out/test262-06fc37feb2224d17)
+2197:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 692.67s
+2199:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/kvstore_core/cd4b8590aedd655b/out/kvstore_core-cd4b8590aedd655b)
+2211:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+2213:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/layout_core/b26429053eb9c166/out/layout_core-b26429053eb9c166)
+2217:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2219:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/ldso_core/0e6ac288e9f7ec95/out/ldso_core-0e6ac288e9f7ec95)
+2229:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2231:     Running tests/host.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/ldso_core/b61ea2290e9dfe82/out/host-b61ea2290e9dfe82)
+2237:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2239:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/lux/3811ec363cc6ee37/out/lux-3811ec363cc6ee37)
+2243:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2245:     Running tests/decode.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/lux/052b5c976cba8aea/out/decode-052b5c976cba8aea)
+2258:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2260:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/matrix/3e7e731df4324fdc/out/matrix-3e7e731df4324fdc)
+2286:test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2288:     Running tests/core_kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/matrix/3466b8776667d321/out/core_kats-3466b8776667d321)
+2302:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2304:     Running tests/finder.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/matrix/8acd8ba08a360168/out/finder-8acd8ba08a360168)
+2326:test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2328:     Running tests/finder_bus.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/matrix/e63b95c1e457fab8/out/finder_bus-e63b95c1e457fab8)
+2334:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+2336:     Running tests/genesis.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/matrix/2de99bab67167cc7/out/genesis-2de99bab67167cc7)
+2345:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2347:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/matrix_core/4ad3a2c2155e7652/out/matrix_core-4ad3a2c2155e7652)
+2351:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2353:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/mica/149dada09c3693eb/out/mica-149dada09c3693eb)
+2357:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2359:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/mica/60e458dc33838230/out/mica-60e458dc33838230)
+2363:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2365:     Running tests/next.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/mica/c103e951d64597ed/out/next-c103e951d64597ed)
+2371:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+2373:     Running tests/volume.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/mica/d2d3314b22b44ee9/out/volume-d2d3314b22b44ee9)
+2379:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.08s
+2381:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/midden/f5836b05501cfd26/out/midden-f5836b05501cfd26)
+2388:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2390:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/midden_core/75977f9c55d45322/out/midden_core-75977f9c55d45322)
+2428:test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2430:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pca9685/fd49b9f35fce2447/out/pca9685-fd49b9f35fce2447)
+2434:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2436:     Running tests/kat_vectors.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pca9685/8beff05ef8d2e24f/out/kat_vectors-8beff05ef8d2e24f)
+2455:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2457:     Running tests/seam_drive.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pca9685/ef1b0da3feacf161/out/seam_drive-ef1b0da3feacf161)
+2463:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2465:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel-check/b516235e13a364d8/out/pixel_check-b516235e13a364d8)
+2469:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2471:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/19acb1905167d20c/out/pixel_core-19acb1905167d20c)
+2476:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2478:     Running tests/anim_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/8fe36970fdcb1210/out/anim_kat-8fe36970fdcb1210)
+2489:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2491:     Running tests/facetanim_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/6286a5fa8489c618/out/facetanim_kat-6286a5fa8489c618)
+2501:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2503:     Running tests/facts_testf.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/c07b202ba18ce9f1/out/facts_testf-c07b202ba18ce9f1)
+2509:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2511:     Running tests/inflate_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/a9bc508af9b53bc7/out/inflate_kat-a9bc508af9b53bc7)
+2517:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2519:     Running tests/jpeg_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/fdb07bd7094ace55/out/jpeg_kat-fdb07bd7094ace55)
+2526:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2528:     Running tests/m3_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/a48c934e85084b76/out/m3_kat-a48c934e85084b76)
+2536:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2538:     Running tests/mime_testf.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/512f3dd8347a7578/out/mime_testf-512f3dd8347a7578)
+2544:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2546:     Running tests/oracle_digests.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/3f9a7dceb7f00725/out/oracle_digests-3f9a7dceb7f00725)
+2551:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+2553:     Running tests/png_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/3b5a42c5e3c59b0f/out/png_kat-3b5a42c5e3c59b0f)
+2559:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2561:     Running tests/raw_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/919e66ed60fc47dc/out/raw_kat-919e66ed60fc47dc)
+2567:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2569:     Running tests/webp_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/pixel_core/ec63b6195681b47d/out/webp_kat-ec63b6195681b47d)
+2575:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2577:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/prefs_core/a38a53ff493cdd2c/out/prefs_core-a38a53ff493cdd2c)
+2634:test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+2636:     Running tests/kernel_store.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/prefs_core/26df1d37e760ffca/out/kernel_store-26df1d37e760ffca)
+2642:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2644:     Running tests/schema_gate.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/prefs_core/561f9d67953f3071/out/schema_gate-561f9d67953f3071)
+2651:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+2653:     Running tests/wire_abi.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/prefs_core/1ecf2119836366c4/out/wire_abi-1ecf2119836366c4)
+2658:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2660:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/principia/90a9a6554c2de8a6/out/principia-90a9a6554c2de8a6)
+2689:test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2691:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/probe_core/fb672d978febb6c8/out/probe_core-fb672d978febb6c8)
+2695:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2697:     Running tests/probe_kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/probe_core/45ac03de68eefbb8/out/probe_kats-45ac03de68eefbb8)
+2714:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2716:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/psl_core/47ccef6ee4dee721/out/psl_core-47ccef6ee4dee721)
+2722:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2724:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/raw_core/92185cf5a9393691/out/raw_core-92185cf5a9393691)
+2728:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2730:     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/raw_core/722aa3c87703248f/out/kat-722aa3c87703248f)
+2740:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2742:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/sentinel/893254d32005730a/out/sentinel-893254d32005730a)
+2746:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2748:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/sonde/62357e4005eacd9e/out/sonde-62357e4005eacd9e)
+2752:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2754:     Running tests/sonde_bus.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/sonde/d101e2efff638c74/out/sonde_bus-d101e2efff638c74)
+2765:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+2767:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/svg_core/3d4f3232164b0c55/out/svg_core-3d4f3232164b0c55)
+2800:test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+2802:     Running tests/digests.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/svg_core/a94aa3aa1649b46f/out/digests-a94aa3aa1649b46f)
+2807:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2809:     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/svg_core/233eb53606f6b63b/out/oracle-233eb53606f6b63b)
+2814:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2816:     Running tests/pixel_face.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/svg_core/ab6112649fb97017/out/pixel_face-ab6112649fb97017)
+2823:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2825:     Running tests/render_kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/svg_core/034a24a169b969d9/out/render_kat-034a24a169b969d9)
+2841:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2843:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/syntax_core/cb32c9cb8a164767/out/syntax_core-cb32c9cb8a164767)
+2847:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2849:     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/syntax_core/a157daa0bfb5c4d6/out/kat-a157daa0bfb5c4d6)
+3001:test result: FAILED. 11 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+3004:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tabula/83e7810d9c5f49e4/out/tabula-83e7810d9c5f49e4)
+3051:test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+3053:     Running tests/console_view.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tabula/8396ec23866a65a7/out/console_view-8396ec23866a65a7)
+3062:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3064:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/text_host/d4f5e93f618b1c01/out/text_host-d4f5e93f618b1c01)
+3094:test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+3097:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/0e90d1a46bf2db2d/out/tls_core-0e90d1a46bf2db2d)
+3102:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3104:     Running tests/m10_revocation.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/a612c1a0986e1716/out/m10_revocation-a612c1a0986e1716)
+3111:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.82s
+3113:     Running tests/m11_hybrid.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/3dee7c0a519949e4/out/m11_hybrid-3dee7c0a519949e4)
+3119:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+3121:     Running tests/m1_records_key_schedule.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/2e8f6a1b775da9be/out/m1_records_key_schedule-2e8f6a1b775da9be)
+3130:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3132:     Running tests/m2_handshake.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/c86dd30f47c6b40d/out/m2_handshake-c86dd30f47c6b40d)
+3146:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3148:     Running tests/m3_x509.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/79ac027a9797f404/out/m3_x509-79ac027a9797f404)
+3159:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+3161:     Running tests/m4_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/f8c7a18a17d5559f/out/m4_oracle-f8c7a18a17d5559f)
+3168:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+3170:     Running tests/m5_tls12.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/d030af60e74f9b1c/out/m5_tls12-d030af60e74f9b1c)
+3178:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+3180:     Running tests/m6_resumption.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/d39adf01d71c4b1d/out/m6_resumption-d39adf01d71c4b1d)
+3187:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+3189:     Running tests/m7_pki.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/d82e8d657aa7ca47/out/m7_pki-d82e8d657aa7ca47)
+3198:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.36s
+3200:     Running tests/m8_negative.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/2c68c892376ccda9/out/m8_negative-2c68c892376ccda9)
+3207:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+3209:     Running tests/m9_ct.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/f0c3e4bc29c79f05/out/m9_ct-f0c3e4bc29c79f05)
+3220:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.71s
+3222:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/trash_core/a3bba8f980001a64/out/trash_core-a3bba8f980001a64)
+3226:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3228:     Running tests/core.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/trash_core/928c6221cd05e360/out/core-928c6221cd05e360)
+3240:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3242:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/type_core/9fc7841721f031a1/out/type_core-9fc7841721f031a1)
+3253:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3255:     Running tests/attrkeys_pin.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/type_core/a75acd42ed11bff0/out/attrkeys_pin-a75acd42ed11bff0)
+3260:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3262:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/una-abi/6cf7914e785a8705/out/una_abi-6cf7914e785a8705)
+3281:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+3283:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/una-card/659823c877dc7e03/out/una_card-659823c877dc7e03)
+3287:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3289:     Running tests/card_table.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/una-card/ff8b67e0006d653a/out/card_table-ff8b67e0006d653a)
+3294:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+3296:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/una-res/1c9b3e256b469d2b/out/una_res-1c9b3e256b469d2b)
+3302:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+3304:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/a0bc3898aa14c2a4/out/unafs-a0bc3898aa14c2a4)
+3319:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+3321:     Running tests/adapter.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/5f890a963203f09d/out/adapter-5f890a963203f09d)
+3335:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3337:     Running tests/attrkeys_pin.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/377f11b92c6b1ac0/out/attrkeys_pin-377f11b92c6b1ac0)
+3342:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3344:     Running tests/batch_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/970416f91129e716/out/batch_logic-970416f91129e716)
+3361:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+3363:     Running tests/boot80_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/36bd01c493fb57ef/out/boot80_logic-36bd01c493fb57ef)
+3371:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+3373:     Running tests/btree_kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/65bb2adf12a72c3e/out/btree_kats-65bb2adf12a72c3e)
+3384:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3386:     Running tests/btree_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/959092f467cb7b3b/out/btree_logic-959092f467cb7b3b)
+3412:test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.25s
+3414:     Running tests/codec_fuzz.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/08ffe682052c7632/out/codec_fuzz-08ffe682052c7632)
+3422:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+3424:     Running tests/codec_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/718bbfbd45fc637f/out/codec_oracle-718bbfbd45fc637f)
+3441:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+3443:     Running tests/codec_volume.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/9d67915075a15ed2/out/codec_volume-9d67915075a15ed2)
+3451:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+3453:     Running tests/core_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/99553fe6c5d7ce69/out/core_logic-99553fe6c5d7ce69)
+3458:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3460:     Running tests/extent_indirection.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/5911cff61721d657/out/extent_indirection-5911cff61721d657)
+3470:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.63s
+3472:     Running tests/find_names.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/928097a47253adff/out/find_names-928097a47253adff)
+3478:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+3480:     Running tests/format_entry.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/441731e4acbb9629/out/format_entry-441731e4acbb9629)
+3489:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+3491:     Running tests/genesis.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/69d273242deccc46/out/genesis-69d273242deccc46)
+3496:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+3498:     Running tests/grow_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/e20b1f398a478375/out/grow_logic-e20b1f398a478375)
+3508:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+3510:     Running tests/hostile_volume.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/39db8a3c63850276/out/hostile_volume-39db8a3c63850276)
+3543:test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+3545:     Running tests/index_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/5135d2a0d5cb720c/out/index_logic-5135d2a0d5cb720c)
+3558:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.16s
+3560:     Running tests/kat_vectors.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/2e703b7a7b80adbc/out/kat_vectors-2e703b7a7b80adbc)
+3579:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3581:     Running tests/map_bench.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/df550ae7406c456e/out/map_bench-df550ae7406c456e)
+3588:test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.71s
+3590:     Running tests/map_tree.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/c1c332c6bd847032/out/map_tree-c1c332c6bd847032)
+3601:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.88s
+3603:     Running tests/migration_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/adb4f11ad13b81ca/out/migration_logic-adb4f11ad13b81ca)
+3608:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+3610:     Running tests/mutation_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/91297c4d7103c12e/out/mutation_logic-91297c4d7103c12e)
+3627:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+3629:     Running tests/name_index.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/5275907f72fc2f4f/out/name_index-5275907f72fc2f4f)
+3638:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+3640:     Running tests/path_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/ccbd71d50c49576f/out/path_logic-ccbd71d50c49576f)
+3649:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+3651:     Running tests/query_kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/d4ea9581a09e2418/out/query_kats-d4ea9581a09e2418)
+3663:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+3665:     Running tests/recovery_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/724a205e39c4ad29/out/recovery_logic-724a205e39c4ad29)
+3678:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+3680:     Running tests/refmap_two_level.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/58fb24d47c07ecaf/out/refmap_two_level-58fb24d47c07ecaf)
+3690:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.10s
+3692:     Running tests/snapshot_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/4fe30dabf2645b7f/out/snapshot_logic-4fe30dabf2645b7f)
+3707:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+3709:     Running tests/snapshot_read.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/e2b596ac93c66724/out/snapshot_read-e2b596ac93c66724)
+3719:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+3721:     Running tests/soul_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/4aa087e1653eeefc/out/soul_logic-4aa087e1653eeefc)
+3726:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+3728:     Running tests/time_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/59f75cf4aea88bcf/out/time_logic-59f75cf4aea88bcf)
+3733:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+3735:     Running tests/tree_logic.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs/5f651711fd12701b/out/tree_logic-5f651711fd12701b)
+3740:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+3742:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs-cli/9435c832d9c86e4f/out/unafs-9435c832d9c86e4f)
+3746:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3748:     Running tests/dump_records.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs-cli/258b67cf3faa088d/out/dump_records-258b67cf3faa088d)
+3755:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+3757:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/unafs_bench/5130822763e7af4f/out/unafs_bench-5130822763e7af4f)
+3761:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3763:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/usbnet_core/8a1a777d6d290915/out/usbnet_core-8a1a777d6d290915)
+3780:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3782:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vaire/c875fd7607915492/out/vaire-c875fd7607915492)
+3850:test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+3852:     Running unittests src/bin/vaire.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vaire/c18a46a8cd33e6ae/out/vaire-c18a46a8cd33e6ae)
+3856:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3858:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vein_core/affba02a051bb75d/out/vein_core-affba02a051bb75d)
+3895:test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3897:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vein_ring3/774c3a7800426abf/out/vein_ring3-774c3a7800426abf)
+3905:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3907:     Running tests/veintls.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vein_ring3/85095b852511a3de/out/veintls-85095b852511a3de)
+3920:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+3922:     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vertex/c7601bf7fe5c54d6/out/vertex-c7601bf7fe5c54d6)
+3927:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3929:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vp8_core/95595784c01bb23b/out/vp8_core-95595784c01bb23b)
+3938:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3940:     Running tests/conformance.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/vp8_core/f139be3af4ec05a6/out/conformance-f139be3af4ec05a6)
+3964:test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 54.48s
+3966:     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/wifi_core/74054773901cc0d4/out/wifi_core-74054773901cc0d4)
+3980:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3982:   Doc-tests amber_bytes
+3986:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3988:   Doc-tests amber_core
+3992:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3994:   Doc-tests audio_core
+3998:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4000:   Doc-tests aule
+4004:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4006:   Doc-tests av1_core
+4010:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4012:   Doc-tests bandy
+4016:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4018:   Doc-tests comscan
+4022:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4024:   Doc-tests crypto_core
+4028:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4030:   Doc-tests css_core
+4034:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4036:   Doc-tests demux_core
+4040:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4042:   Doc-tests diag_core
+4046:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4048:   Doc-tests edit_core
+4052:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4054:   Doc-tests elessar
+4058:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4060:   Doc-tests elf_core
+4064:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4066:   Doc-tests exfat_core
+4070:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4072:   Doc-tests facet
+4076:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4078:   Doc-tests facet_view
+4082:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4084:   Doc-tests font_core
+4088:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4090:   Doc-tests foreman
+4094:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4096:   Doc-tests git_core
+4100:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4102:   Doc-tests gneiss_pal
+4106:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4108:   Doc-tests helm
+4112:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4114:   Doc-tests holocron
+4118:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4120:   Doc-tests holocron_core
+4124:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4126:   Doc-tests html_core
+4132:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4135:   Doc-tests http_core
+4139:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4141:   Doc-tests ibus
+4145:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4147:   Doc-tests infer_core
+4151:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4153:   Doc-tests jobs_core
+4157:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4159:   Doc-tests js_core
+4163:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4165:   Doc-tests kvstore_core
+4169:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4171:   Doc-tests layout_core
+4175:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4177:   Doc-tests ldso_core
+4181:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4183:   Doc-tests lux
+4187:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4189:   Doc-tests matrix
+4193:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4195:   Doc-tests matrix_core
+4199:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4201:   Doc-tests mica
+4205:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4207:   Doc-tests midden
+4211:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4213:   Doc-tests midden_core
+4217:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4219:   Doc-tests pca9685
+4223:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4225:   Doc-tests pixel_core
+4229:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4231:   Doc-tests prefs_core
+4235:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4237:   Doc-tests principia
+4241:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4243:   Doc-tests probe_core
+4247:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4249:   Doc-tests psl_core
+4253:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4255:   Doc-tests raw_core
+4259:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4261:   Doc-tests sonde
+4265:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4267:   Doc-tests svg_core
+4272:test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4275:   Doc-tests syntax_core
+4279:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4281:   Doc-tests tabula
+4285:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4287:   Doc-tests text_host
+4291:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4293:   Doc-tests tls_core
+4298:test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4301:   Doc-tests trash_core
+4305:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4307:   Doc-tests type_core
+4311:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4313:   Doc-tests una_abi
+4317:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4319:   Doc-tests unafs
+4323:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4325:   Doc-tests usbnet_core
+4329:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4331:   Doc-tests vaire
+4335:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4337:   Doc-tests vein_core
+4341:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4343:   Doc-tests vein_ring3
+4347:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4349:   Doc-tests vp8_core
+4353:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4355:   Doc-tests wifi_core
+4359:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### pass 2 - failure blocks (pass2.log lines 1290-1410, 1525-1556, 1950-2062, 2850-3100)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/5c24b47116dc69da/out/kat-5c24b47116dc69da)
+
+running 3 tests
+test gsub_ligatures_and_gpos_pairs_match_fonttools ... ok
+test cmap_subtable_formats_agree ... ok
+test tables_match_fonttools ... FAILED
+
+failures:
+
+---- tables_match_fonttools stdout ----
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf: sha256 differs from the KAT source
+KAT: 0 fonts, 0 cmap lookups, 0 outlines, 0 composites, 0 kern pairs
+
+thread 'tables_match_fonttools' (211287) panicked at unaos/libs/text/font_core/tests/kat.rs:101:5:
+no KAT font available on this host
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tables_match_fonttools
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p font_core --test kat`
+     Running tests/kernelfont.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/1900331743944bda/out/kernelfont-1900331743944bda)
+
+running 11 tests
+test edid_ppi_and_css_px ... ok
+test login_mock_vs_chromium_rasters ... ok
+test preblend_tables_are_skias_formula ... ok
+test kernel_sizes ... ok
+test kernelfont2_console_grid_follows_ppi_and_font_size ... ok
+test clip_is_all_or_nothing ... ok
+test script_fallback_draws_through_the_stack ... ok
+test kernelfont2_noto_script_faces_draw ... ok
+test run_cache_shapes_once_and_rows_match_the_whole_draw ... ok
+test login_strings_match_chromium_widths ... ok
+test glyph_cache_is_bounded_and_counts_evictions ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/linebreak.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/a97430b5f379211a/out/linebreak-a97430b5f379211a)
+
+running 3 tests
+test mandatory_and_basic_breaks ... ok
+test line_break_test_subset ... ok
+test line_break_test_in_full ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/name.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/238e84b233c068aa/out/name-238e84b233c068aa)
+
+running 2 tests
+test family_names_order ... ok
+test name_records_match_fonttools ... FAILED
+
+failures:
+
+---- name_records_match_fonttools stdout ----
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf: sha256 differs from the KAT source
+name: 0 faces, 0 records identical to fontTools
+
+thread 'name_records_match_fonttools' (211308) panicked at unaos/libs/text/font_core/tests/name.rs:59:5:
+no font of the KAT set is present
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    name_records_match_fonttools
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `-p font_core --test name`
+     Running tests/oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/c8a5e9150a0d5f68/out/oracle-c8a5e9150a0d5f68)
+
+running 1 test
+test chromium_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/raster.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/dcdc283db9b5dcd4/out/raster-dcdc283db9b5dcd4)
+
+running 4 tests
+test subpixel_positions_and_cache ... ok
+test frozen_chromium_crops ... ok
+test coverage_integrates_to_the_outline_area ... FAILED
+test every_glyph_rasterizes ... ok
+
+failures:
+
+---- coverage_integrates_to_the_outline_area stdout ----
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf: sha256 differs from the KAT source
+SKIP /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf: sha256 differs from the KAT source
+area: 0 glyphs, worst signed-area error 0.0000 %, 0 with overlapping contours
+
+thread 'coverage_integrates_to_the_outline_area' (211312) panicked at unaos/libs/text/font_core/tests/raster.rs:52:5:
+assertion failed: n > 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    coverage_integrates_to_the_outline_area
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+error: test failed, to rerun pass `-p font_core --test raster`
+     Running tests/shape.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/font_core/d4497b0080bbe505/out/shape-d4497b0080bbe505)
+test diff_200_pairs_of_self has been running for over 60 seconds
+test diff_200_pairs_of_self ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.25s
+
+     Running tests/formats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/336863d2751a4ab9/out/formats-336863d2751a4ab9)
+
+running 4 tests
+test config_matches_git_list ... FAILED
+test gitattributes_match_git ... ok
+test gitignore_matches_git ... ok
+test packed_refs_and_reflog_roundtrip ... ok
+
+failures:
+
+---- config_matches_git_list stdout ----
+
+thread 'config_matches_git_list' (225929) panicked at unaos/libs/vcs/git_core/tests/formats.rs:103:5:
+assertion `left == right` failed
+  left: "core.repositoryformatversion=0\ncore.filemode=true\ncore.bare\ncore.empty=\ncore.spaced=a   b  c\ncore.quoted=  lead mid  trail  \ncore.escapes=tab\there\nnl \"q\" back\\slash\ncore.cont=one   two three\ncore.semi=a;b#c\nremote.origin.url=https://example.com/x.git\nremote.origin.fetch=+refs/heads/*:refs/remotes/origin/*\nremote.Origin.url=second\nbranch.main.remote=origin\nsec.sub \"q\" \\ x.key-name=v\ninclude.path=inc/one.cfg\ninc.level=1\ninclude.path=two.cfg\ninc.level=2\ninc.size=3k\ncore.after=include\n"
+ right: "core.repositoryformatversion=0\ncore.filemode=true\ncore.bare\ncore.empty=\ncore.spaced=a   b\t\tc\ncore.quoted=  lead mid  trail  \ncore.escapes=tab\there\nnl \"q\" back\\slash\ncore.cont=one   two three\ncore.semi=a;b#c\nremote.origin.url=https://example.com/x.git\nremote.origin.fetch=+refs/heads/*:refs/remotes/origin/*\nremote.Origin.url=second\nbranch.main.remote=origin\nsec.sub \"q\" \\ x.key-name=v\ninclude.path=inc/one.cfg\ninc.level=1\ninclude.path=two.cfg\ninc.level=2\ninc.size=3k\ncore.after=include\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    config_matches_git_list
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p git_core --test formats`
+     Running tests/fuzz.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/git_core/a62054d9244891bf/out/fuzz-a62054d9244891bf)
+
+running 20 tests
+test cache::tests::cache_age_calculation ... ok
+test cache::tests::cache_control_directives ... ok
+test cache::tests::cache_http_date_three_formats ... ok
+test cache::tests::cache_unsafe_method_invalidation ... ok
+test cache::tests::cache_304_freshen_merges_fields ... FAILED
+test cache::tests::cache_decide_modes ... ok
+test cache::tests::cache_freshness_explicit_and_heuristic ... ok
+test cookie::tests::paths ... ok
+test cookie::tests::dates ... ok
+test cache::tests::cache_vary_secondary_key ... ok
+test cache::tests::cache_storable_rules ... ok
+test h2::hpack::tests::rfc7541_c1_integers ... ok
+test cookie::tests::rfc6265bis_rules ... ok
+test cache::tests::cache_memory_lru_and_disk_form ... ok
+test h2::hpack::tests::huffman_table_is_a_complete_prefix_code ... ok
+test host::upgrade::tests::upgrade_refuses_other_schemes ... ok
+test host::upgrade::tests::upgrade_refuses_a_non_101_answer ... ok
+test host::upgrade::tests::upgrade_keeps_bytes_past_the_101_head ... ok
+test h2::hpack::tests::huffman_refusals_and_round_trip ... ok
+test h2::hpack::tests::rfc7541_c4_and_c6 ... ok
+
+failures:
+
+---- cache::tests::cache_304_freshen_merges_fields stdout ----
+
+thread 'cache::tests::cache_304_freshen_merges_fields' (230949) panicked at unaos/libs/net/http_core/src/cache.rs:908:9:
+assertion `left == right` failed
+  left: Some("W/\"v1\"")
+ right: Some("\"v1\"")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cache::tests::cache_304_freshen_merges_fields
+
+test result: FAILED. 19 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p http_core --lib`
+     Running tests/aia_e2e.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/a6209c79f9e97190/out/aia_e2e-a6209c79f9e97190)
+
+running 1 test
+test aia_fetch_through_http_core ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+     Running tests/cookies_http_state.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/fe388928ccf12e19/out/cookies_http_state-fe388928ccf12e19)
+
+running 1 test
+test http_state_parser_suite ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.82s
+
+     Running tests/h1_kats.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/c627c7660eefc2c3/out/h1_kats-c627c7660eefc2c3)
+
+running 9 tests
+test multipart_golden ... ok
+test message_body_length_rules ... ok
+test request_head_encoding ... ok
+test redirect_rules ... ok
+test status_line_and_fields ... ok
+test exchange_over_a_scripted_transport ... ok
+test content_codings ... ok
+test malformed_heads_are_refused ... ok
+test chunked_every_split ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/host_e2e.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/df738968c3ca0193/out/host_e2e-df738968c3ca0193)
+
+running 8 tests
+test online_connect_proxy ... ok
+test chromium_oracle_byte_equal ... ok
+test online_api_anthropic_com ... ok
+test tls13_resumption_across_agents_and_processes ... ok
+test refusals ... ok
+test plain_http ... ok
+test https_tls12_against_python_ssl ... ok
+test https_against_python_ssl ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.92s
+
+     Running tests/url_wpt.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/ac0ef1aa75bf0e2c/out/url_wpt-ac0ef1aa75bf0e2c)
+
+running 2 tests
+test wpt_urltestdata ... FAILED
+test wpt_idna_v2 ... ok
+
+failures:
+
+---- wpt_urltestdata stdout ----
+FAIL "http://a.b.c.xn--pokxncvks" base=None: failed (invalid host), want Some("http://a.b.c.xn--pokxncvks/")
+FAIL "http://10.0.0.xn--pokxncvks" base=None: failed (invalid host), want Some("http://10.0.0.xn--pokxncvks/")
+FAIL "http://a.b.c.XN--pokxncvks" base=None: failed (invalid host), want Some("http://a.b.c.xn--pokxncvks/")
+FAIL "http://a.b.c.Xn--pokxncvks" base=None: failed (invalid host), want Some("http://a.b.c.xn--pokxncvks/")
+FAIL "http://10.0.0.XN--pokxncvks" base=None: failed (invalid host), want Some("http://10.0.0.xn--pokxncvks/")
+FAIL "http://10.0.0.xN--pokxncvks" base=None: failed (invalid host), want Some("http://10.0.0.xn--pokxncvks/")
+FAIL "file://xn--/p" base=None: failed (invalid host), want Some("file://xn--/p")
+FAIL "https://xn--/" base=None: failed (invalid host), want Some("https://xn--/")
+WPT urltestdata: 888/896 pass
+
+thread 'wpt_urltestdata' (231203) panicked at unaos/libs/net/http_core/tests/url_wpt.rs:100:5:
+WPT urltestdata regressed: 888/896 < 896
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    wpt_urltestdata
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+error: test failed, to rerun pass `-p http_core --test url_wpt`
+     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/ibus/3f3851aae87b9a62/out/ibus-3f3851aae87b9a62)
+
+running 14 tests
+test grammar_change_lexes_afresh ... ok
+test highlights_are_absolute_and_crlf_is_a_terminator ... ok
+test folds_and_brackets ... ok
+test kat_markdown ... ok
+test language_ids ... ok
+test kat_shell ... ok
+test kat_c ... FAILED
+test multi_line_splice_matches_a_fresh_lex ... ok
+test one_character_edit_relexes_one_line ... ok
+test kat_toml ... FAILED
+test kat_rust ... ok
+test opening_a_block_comment_relexes_as_far_as_it_reaches ... ok
+test theme_map_names_tokens_and_takes_preferences ... ok
+test incremental_equals_fresh_under_a_seeded_edit_stream ... FAILED
+
+failures:
+
+---- kat_c stdout ----
+
+thread 'kat_c' (297002) panicked at unaos/libs/text/syntax_core/tests/kat.rs:45:9:
+assertion `left == right` failed: c: token 39 differs
+ got: [
+    "0 macro |#include <stdio.h>|",
+    "1 macro |#define MAX(a, b) \\|",
+    "2 macro |    ((a) > (b) ? (a) : (b))|",
+    "3 comment |/* block|",
+    "4 comment |   comment */|",
+    "5 keyword |static|",
+    "5 keyword |const|",
+    "5 builtin |char|",
+    "5 operator |*|",
+    "5 identifier |s|",
+    "5 operator |=|",
+    "5 string |u8\"x|",
+    "5 escape |\\n\\101|",
+    "5 string |\"|",
+    "5 string |\"??=\"|",
+    "5 punctuation |;|",
+    "6 builtin |int|",
+    "6 function |main|",
+    "6 punctuation |(|",
+    "6 builtin |void|",
+    "6 punctuation |)|",
+    "6 punctuation |{|",
+    "7 type |size_t|",
+    "7 identifier |n|",
+    "7 operator |=|",
+    "7 keyword |sizeof|",
+    "7 punctuation |(|",
+    "7 builtin |int|",
+    "7 punctuation |)|",
+    "7 operator |+|",
+    "7 number |0x1Fu|",
+    "7 operator |+|",
+    "7 number |1.5e-3f|",
+    "7 punctuation |;|",
+    "7 comment |// tail \\|",
+    "8 comment |    continued|",
+    "9 type |wchar_t|",
+    "9 identifier |c|",
+    "9 operator |=|",
+    "9 char |L'é'|",
+    "9 punctuation |;|",
+    "10 keyword |return|",
+    "10 function |MAX|",
+    "10 punctuation |(|",
+    "10 identifier |n|",
+    "10 punctuation |,|",
+    "10 number |2|",
+    "10 punctuation |)|",
+    "10 punctuation |;|",
+    "11 punctuation |}|",
+]
+  left: "9 char |L'é'|"
+ right: "9 char |L'|"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- kat_toml stdout ----
+
+thread 'kat_toml' (297006) panicked at unaos/libs/text/syntax_core/tests/kat.rs:45:9:
+assertion `left == right` failed: toml: token 6 differs
+ got: [
+    "0 comment |# comment|",
+    "1 variable |title|",
+    "1 operator |=|",
+    "1 string |\"TOML|",
+    "1 escape |\\\"|",
+    "1 string |x|",
+    "1 escape |\\\"|",
+    "1 string |é\"|",
+    "2 heading |[owner]|",
+    "3 variable |name|",
+    "3 punctuation |.|",
+    "3 variable |first|",
+    "3 operator |=|",
+    "3 string |'Tom'|",
+    "4 variable |dob|",
+    "4 operator |=|",
+    "4 number |1979-05-27 07:32:00-08:00|",
+    "5 heading |[[products]]|",
+    "6 variable |ports|",
+    "6 operator |=|",
+    "6 punctuation |[|",
+    "6 number |8000|",
+    "6 punctuation |,|",
+    "6 number |0xDEAD_BEEF|",
+    "6 punctuation |,|",
+    "7 number |-inf|",
+    "7 punctuation |,|",
+    "7 number |nan|",
+    "7 punctuation |]|",
+    "8 variable |flag|",
+    "8 operator |=|",
+    "8 keyword |true|",
+    "9 variable |inline|",
+    "9 operator |=|",
+    "9 punctuation |{|",
+    "9 variable |a|",
+    "9 operator |=|",
+    "9 number |1|",
+    "9 punctuation |,|",
+    "9 string |\"b c\"|",
+    "9 operator |=|",
+    "9 number |2.5e-3|",
+    "9 punctuation |}|",
+    "10 variable |text|",
+    "10 operator |=|",
+    "10 string |\"\"\"|",
+    "11 string |line|",
+    "11 escape |\\|",
+    "12 string |  end\"\"\"|",
+    "13 variable |lit|",
+    "13 operator |=|",
+    "13 string |'''raw'''|",
+]
+  left: "1 escape |\\\"|"
+ right: "1 escape |\\\"é|"
+
+---- incremental_equals_fresh_under_a_seeded_edit_stream stdout ----
+
+thread 'incremental_equals_fresh_under_a_seeded_edit_stream' (297001) panicked at unaos/libs/text/syntax_core/tests/kat.rs:85:21:
+end byte index 23 is not a char boundary; it is inside 'é' (bytes 22..24 of string)
+
+
+failures:
+    incremental_equals_fresh_under_a_seeded_edit_stream
+    kat_c
+    kat_toml
+
+test result: FAILED. 11 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p syntax_core --test kat`
+     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tabula/83e7810d9c5f49e4/out/tabula-83e7810d9c5f49e4)
+
+running 43 tests
+test bus::tests::goto_offsets_are_one_based_and_clamped ... ok
+test document::tests::language_detection ... ok
+test document::tests::load_file_with_unknown_extension_is_txt ... ok
+test document::tests::language_for_edge_cases ... ok
+test document::tests::loaded_shell_and_markdown_get_their_grammars ... ok
+test document::tests::core_is_the_record_and_the_snapshot_follows ... ok
+test document::tests::dirty_flag_transitions ... ok
+test bus::tests::edited_close_and_inert_answers ... ok
+test document::tests::load_file_without_extension_is_txt ... ok
+test document::tests::read_only_refuses_core_edits ... ok
+test document::tests::load_missing_file_errors ... ok
+test document::tests::save_with_no_path_errors ... ok
+test document::tests::save_roundtrip_via_tempdir ... ok
+test document::tests::set_buffer_is_one_minimal_undoable_edit ... ok
+test document::tests::dirty_lifecycle_and_roundtrip ... ok
+test highlight::tests::core_source_reads_the_piece_table_by_line ... ok
+test bus::tests::bus_unreadable_path_is_an_error ... ok
+test highlight::tests::engine_preference_defaults_to_core ... ok
+test logview::tests::an_overlong_escape_gives_up_and_resumes ... ok
+test bus::tests::bus_log_loads_read_only ... ok
+test highlight::tests::theme_preferences_reach_the_map_and_the_palette ... ok
+test logview::tests::ansi_escapes_are_stripped ... ok
+test logview::tests::crlf_and_lone_cr_normalise_to_lf ... ok
+test document::tests::syntax_core_follows_the_language_and_the_edits ... ok
+test logview::tests::interior_control_bytes_are_shown_not_obeyed ... ok
+test logview::tests::empty_and_all_nul_inputs_are_safe ... ok
+test logview::tests::invalid_utf8_decodes_lossily ... ok
+test logview::tests::log_paths_are_recognised ... ok
+test logview::tests::log_matching_is_by_component_not_substring ... ok
+test bus::tests::bus_open_insert_dirty_save_saved ... ok
+test logview::tests::an_unterminated_csi_stops_at_the_line_break ... ok
+test logview::tests::an_unterminated_osc_cannot_eat_the_rest_of_the_log ... ok
+test logview::tests::tabs_and_newlines_survive ... ok
+test logview::tests::truncated_escape_at_end_of_buffer_does_not_panic ... ok
+test logview::tests::a_file_exactly_at_the_cap_is_whole ... ok
+test logview::tests::trailing_nul_padding_is_trimmed ... ok
+test logview::tests::empty_and_all_nul_files_open_clean ... ok
+test logview::tests::valid_utf8_is_not_flagged_lossy ... ok
+test logview::tests::under_cap_log_is_untouched_and_unbannered ... ok
+test logview::tests::a_single_enormous_line_still_shows_something ... ok
+test logview::tests::padding_is_trimmed_before_the_cap_is_applied ... ok
+test logview::tests::oversized_log_keeps_the_tail_and_says_so ... ok
+test logview::tests::newest_log_in_picks_the_freshest_log_and_ignores_source ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/console_view.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tabula/8396ec23866a65a7/out/console_view-8396ec23866a65a7)
+
+running 5 tests
+test a_real_log_never_writes_itself_back ... ok
+test ftdi_capture_shows_its_stray_control_byte ... ok
+test flight_recorder_log_opens_read_only_and_clean ... ok
+test source_files_are_not_treated_as_logs ... ok
+test a_full_size_flight_recorder_reservation_loads_promptly ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/text_host/d4f5e93f618b1c01/out/text_host-d4f5e93f618b1c01)
+
+running 12 tests
+test fontconfig::tests::hint_rule_kat ... ok
+test db::tests::match_style_kat ... ok
+test raster::tests::embolden_and_skew_kat ... ok
+test fontconfig::tests::xml_and_alias_kat ... ok
+test raster::tests::preblend_matches_fontcore_dark_table ... ok
+test raster::tests::quarter_pixel_split ... ok
+test db::tests::style_of_dejavu ... ok
+test line::tests::caret_and_hit ... ok
+test line::tests::paint_inks_premultiplied ... ok
+test line::tests::shaped_widths_and_kerning ... ok
+test raster::tests::synthetic_bold_inks_more ... ok
+test db::tests::resolution_and_fallback_vs_fontconfig ... FAILED
+
+failures:
+
+---- db::tests::resolution_and_fallback_vs_fontconfig stdout ----
+
+thread 'db::tests::resolution_and_fallback_vs_fontconfig' (297089) panicked at libs/text_host/src/db.rs:461:9:
+assertion `left == right` failed: family order of the first 6 fc-match -s sans-serif faces
+  left: ["Noto Sans", "DejaVu Sans", "DejaVu Sans Mono", "DejaVu Serif", "Noto Mono"]
+ right: ["Noto Sans", "DejaVu Sans", "Noto Sans Adlam", "Noto Sans Hebrew", "Noto Sans WarangCiti"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    db::tests::resolution_and_fallback_vs_fontconfig
+
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+error: test failed, to rerun pass `-p text_host --lib`
+     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/tls_core/0e90d1a46bf2db2d/out/tls_core-0e90d1a46bf2db2d)
+
+running 1 test
+test ct::json::tests::parses_and_refuses ... ok
+
+### pass 2 - tail
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 8 targets failed:
+    `-p font_core --test kat`
+    `-p font_core --test name`
+    `-p font_core --test raster`
+    `-p git_core --test formats`
+    `-p http_core --lib`
+    `-p http_core --test url_wpt`
+    `-p syntax_core --test kat`
+    `-p text_host --lib`
+EXIT=101
+
+### re-runs of the fixed tests
+     Running tests/kat.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/syntax_core/a157daa0bfb5c4d6/out/kat-a157daa0bfb5c4d6)
+test highlights_are_absolute_and_crlf_is_a_terminator ... ok
+test grammar_change_lexes_afresh ... ok
+test kat_c ... ok
+test language_ids ... ok
+test folds_and_brackets ... ok
+test kat_markdown ... ok
+test kat_rust ... ok
+test kat_shell ... ok
+test kat_toml ... ok
+test theme_map_names_tokens_and_takes_preferences ... ok
+test one_character_edit_relexes_one_line ... ok
+test multi_line_splice_matches_a_fresh_lex ... ok
+test opening_a_block_comment_relexes_as_far_as_it_reaches ... ok
+test incremental_equals_fresh_under_a_seeded_edit_stream ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/hostsuites/target/debug/build/http_core/a5de44d9cfd84c33/out/http_core-a5de44d9cfd84c33)
+test cache::tests::cache_304_freshen_merges_fields ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
