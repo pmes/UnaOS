@@ -905,7 +905,9 @@ mod tests {
         assert_eq!(e.response_time, T0 + 100);
         let mut req = Headers::new();
         assert!(e.add_conditionals(&mut req));
-        assert_eq!(req.get("if-none-match"), Some("\"v1\""));
+        // §3.2: the 304's ETag replaced the stored one (freshen keeps only the stored body's framing/codings),
+        // so revalidation now sends the validator the server last gave.
+        assert_eq!(req.get("if-none-match"), Some("W/\"v1\""));
     }
 
     #[test]
