@@ -1,4 +1,4 @@
-//! CHARTER: Kernel — compositor seam
+//! CHARTER: Kernel — wm (the compositor seam: the sprite is the kernel's; the shape is a program's ask through the pane contract, R108)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
