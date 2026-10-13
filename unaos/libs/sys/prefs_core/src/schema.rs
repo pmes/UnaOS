@@ -212,9 +212,9 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "dock.pins", kind: Kind::Str { max_len: 256, printable: true },
-        default: Default::Consumer("every pin the build carries (lumen only on a `lumen` build)"),
+        default: Default::Consumer("every pin the build carries (lumen, aether, midden, una each only on its own build)"),
         writers: &[Writer::Dock], reader: "kernel dock",
-        doc: "Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen); TOML arrays are outside the subset.",
+        doc: "Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen, aether, midden, una); TOML arrays are outside the subset.",
     },
     Key {
         ns: "system", key: "dock.position", kind: Kind::Enum(&["bottom", "left", "right"]), default: Default::Str("bottom"),
