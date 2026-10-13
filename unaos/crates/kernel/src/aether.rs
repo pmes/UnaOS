@@ -49,6 +49,12 @@
 //! WITNESS (SR109). `… hover=<0|1> nav=<0|1> select=<n> tab=<0|1> url=<0|1> back=<0|1> find=<n> -> PASS|FAIL|SKIP ::`
 //! — PASS additionally needs tab=1, url=1, back=1 and find > 0; `[aetherapp] chrome …` carries each step's tail.
 //!
+//! 6. OMNIBOX TO THE NETWORK (AETHERMETAL5, SR109 with AETHERNET SR110): last, Ctrl+L + `https://example.org` + Enter
+//!    (`:: AETHER: omnibox -> PASS how=enter kind=url text=https://example.org` — written before the fetch starts, so
+//!    the step never waits on a network). The fetch itself has no server to reach here (`net_drive`'s reason), so the
+//!    step is reported as `:: AETHERNET: omnibox=SKIP(no-server) routed=<url|…> …`, beside the drive's own SKIP line,
+//!    and is not in the verdict: the SR109 verdict above is unchanged.
+//!
 //! The knob is `UNAOS_AETHER=1` → feature `aether` (it implies `selfdiag`: SYS_PATH_READ is the file surface the
 //! program reads the page and the faces through). Registered from `tests::ensure_shellux`, so the QEMU lanes
 //! (`tests-at-boot`) run it at boot and the desktop runs it as `tests aether`.
@@ -157,8 +163,9 @@ pub fn selftest() {
         drive.tails[0].as_deref(), drive.tails[1].as_deref(), drive.tails[2].as_deref(), drive.tails[3].as_deref(), drive.tails[4].as_deref()
     );
     serial_println!(
-        "[aetherapp] chrome tab={:?} url={:?} find={:?} back={:?} zoom={:?} close={:?}",
-        drive.tails[5].as_deref(), drive.tails[6].as_deref(), drive.tails[7].as_deref(), drive.tails[8].as_deref(), drive.tails[9].as_deref(), drive.tails[10].as_deref()
+        "[aetherapp] chrome tab={:?} url={:?} find={:?} back={:?} zoom={:?} close={:?} https={:?}",
+        drive.tails[5].as_deref(), drive.tails[6].as_deref(), drive.tails[7].as_deref(), drive.tails[8].as_deref(), drive.tails[9].as_deref(), drive.tails[10].as_deref(),
+        drive.tails[11].as_deref()
     );
     let m3 = drive.hover && drive.nav && drive.select > 0;
     let chrome = drive.tab && drive.url && drive.back && drive.find > 0; // SR109
@@ -167,7 +174,7 @@ pub fn selftest() {
     } else if ok && !chrome {
         why(if !drive.tab { "no-tab" } else if !drive.url { "no-omnibox-nav" } else if drive.find == 0 { "no-find" } else { "no-back" });
     }
-    net_drive();
+    net_drive(drive.tails[11].as_deref());
     verdict_m3(window, painted, lines, &drive, if ok && m3 && chrome { "PASS" } else { "FAIL" });
 }
 
@@ -177,9 +184,20 @@ pub fn selftest() {
 /// in-kernel HTTP responder exists and smolnet carries no loopback interface a ring-3 socket reaches (the one in-kernel
 /// HTTP loopback is aarch64 genet.rs's NET-GATE battery, kernel-side only, and AETHER.ELF is not on that loader yet).
 /// So the leg is a SKIP by name, never a pass; the program's own line is the proof on a networked boot (`aether <url>`).
+///
+/// AETHERMETAL5: the omnibox's https step (`chrome`, last) is reported on the same terms — `routed=url` when the field
+/// sent `https://example.org` to the network path (the program's `:: AETHER: net` line follows on its own), the
+/// omnibox tail's word otherwise — and SKIP(no-server) by name, never a pass.
 #[cfg(target_arch = "x86_64")]
-fn net_drive() {
+fn net_drive(omni: Option<&str>) {
     serial_println!(":: AETHERNET: drive=SKIP(no-server) reason=no-kernel-served-page (x86: no in-kernel HTTP responder, no ring-3 loopback) proof=aether-url-on-a-networked-boot ::");
+    let routed = match omni {
+        Some(t) if t.starts_with("PASS") && t.contains("kind=url") => "url",
+        Some(t) if t.starts_with("PASS") => "other",
+        Some(_) => "fail",
+        None => "no-line",
+    };
+    serial_println!(":: AETHERNET: omnibox=SKIP(no-server) text=https://example.org routed={} proof=aether-omnibox-on-a-networked-boot ::", routed);
 }
 
 /// AETHERMETAL M3 (SR96): what the drive read back — each step's verdict tail (focus, hover, select, clip, nav)
@@ -187,8 +205,8 @@ fn net_drive() {
 #[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct Drive {
-    /// M3: focus, hover, select, clip, nav; SR109: tab, url, find, back, zoom, close.
-    tails: [Option<alloc::string::String>; 11],
+    /// M3: focus, hover, select, clip, nav; SR109: tab, url, find, back, zoom, close; AETHERMETAL5: the https omnibox.
+    tails: [Option<alloc::string::String>; 12],
     hover: bool,
     nav: bool,
     select: u64,
@@ -288,7 +306,7 @@ fn drive(slot: u64) -> Drive {
 }
 
 /// AETHERMETAL4 (SR109): the chrome, one drive per feature — open a tab, type a URL to a local page, find in it,
-/// back; then zoom and close the tab (reported).
+/// back; then zoom and close the tab (reported); last the omnibox's https step (reported, AETHERMETAL5).
 #[cfg(target_arch = "x86_64")]
 fn chrome(slot: u64, d: &mut Drive) {
     let pass = |t: &Option<alloc::string::String>, want: &str| t.as_deref().is_some_and(|t| t.starts_with("PASS") && t.contains(want));
@@ -311,6 +329,12 @@ fn chrome(slot: u64, d: &mut Drive) {
     d.back = pass(&d.tails[8], "how=back");
     d.tails[9] = step(slot, ":: AETHER: zoom", &[key(b'=')]);
     d.tails[10] = step(slot, ":: AETHER: tab", &[key(0x17)]);
+    // AETHERMETAL5: LAST, because the fetch it starts holds the program until its deadline; the omnibox line is
+    // written before the fetch, so the step reads it at once. Reported by `net_drive`, never in the verdict.
+    let mut evs: alloc::vec::Vec<u64> = alloc::vec![key(0x0C)];
+    evs.extend(b"https://example.org".iter().map(|&c| key(c)));
+    evs.push(key(b'\n'));
+    d.tails[11] = step(slot, ":: AETHER: omnibox", &evs);
 }
 
 /// The static half: the image off the program volume, the loader's plan, the app note. `Ok((image, window))`;

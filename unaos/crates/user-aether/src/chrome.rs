@@ -22,18 +22,18 @@
 // * TABS (`tabs::TabStrip`): Ctrl+T (0x14) a new tab (the new-tab page: bookmarks, recent history, the volume's
 //   pages; the address field focused), Ctrl+W (0x17) closes the active tab (the last one closed opens a fresh
 //   new-tab page, the host's rule), Ctrl+1..8 (0x81..0x88, SMALLFIX9's chord bytes) the n-th tab, Ctrl+9 (0x89) the
-//   last; a click on a tab selects it, on its × closes it, on `+` opens one. Each tab owns its page (arena + layout),
-//   its session history and its scroll: the inactive ones are PARKED here, the active one is main.rs's `page` /
-//   `App::hist` / `App::scroll`; a switch swaps them. Ctrl+Tab cannot arrive: the HID fold suppresses every
-//   Ctrl+non-letter-non-digit (kernel drivers/xhci/mod.rs `hid_key_ascii`) — the report names the change.
+//   last, Ctrl+Tab (0x8A, una-abi KEY_CTRL_TAB: AETHERMETAL5's chord byte out of the kernel's HID fold) the next tab and
+//   Ctrl+Shift+Tab (0x8B) the previous, wrapping; a click on a tab selects it, on its × closes it, on `+` opens one.
+//   Each tab owns its page (arena + layout), its session history and its scroll: the inactive ones are PARKED here,
+//   the active one is main.rs's `page` / `App::hist` / `App::scroll`; a switch swaps them.
 // * SESSION HISTORY (`history::SessionHistory`, per tab, in `App::hist`): Back/Forward buttons beside the keys
 //   main.rs already binds (Backspace/Left/button 4, Right/button 5); a fragment link is a same-document entry.
 // * OMNIBOX (`omnibox::resolve` + an `edit_core::Buffer`): Ctrl+L (0x0C) or a click focuses it with the URL
 //   selected; typing, Backspace, Left/Right, Home/End and the APPCLIP actions (copy, cut, paste, select-all, the
 //   caret and selection actions) edit through edit_core (the core the host Tabula links); Enter navigates — a path
-//   (`/…`) or a name beside the page opens off the volume, a URL is followed (a non-`file:` URL needs the network,
-//   which the image's Aether opens through its net module, else the nav line says `not-a-file-url`), anything else
-//   is a search through Principia's `aether.search` template; Esc restores the URL and gives the page its keys back.
+//   (`/…`) or a name beside the page opens off the volume, a URL is followed (an http(s) URL — typed, or a bare name
+//   completed to `https://` — through AETHERNET's `net::fetch`, SR110, its `:: AETHER: net` line before the nav
+//   line), anything else is a search through Principia's `aether.search` template, fetched the same way; Esc restores the URL and gives the page its keys back.
 // * FIND (`find::find_all`, ui.rs): main.rs's Ctrl+F bar, the matcher now the model's (Unicode simple case fold).
 // * BOOKMARKS (`bookmarks::Bookmarks`): Ctrl+D (0x04) or the star toggles the page; the file is the host's
 //   `bookmarks.tsv` under the home (store.rs), written on every toggle. HISTORY: every page read is a visit,
@@ -41,9 +41,9 @@
 // * DOWNLOADS (`downloads::*`): a link whose target is not a document Aether renders (`downloads::renderable` on the
 //   extension's type) is saved instead of opened, and Ctrl+S (0x13) saves the page: the model's file name
 //   (sanitized, made unique against what is there) in `<home>/Desktop`.
-// * ZOOM (`zoom::step`, Chromium's ladder): Ctrl+0 (0x80) back to 100 %; Ctrl+plus/minus are suppressed by the same
-//   HID fold, so `+`/`=` and `-` (the page has no text input on the image, as `/` for find) and the toolbar's
-//   buttons step it.
+// * ZOOM (`zoom::step`, Chromium's ladder): Ctrl+0 (0x80) back to 100 %, Ctrl+plus (0x8C, Ctrl+`=` with or without
+//   Shift) and Ctrl+minus (0x8D) step it, as do bare `+`/`=` and `-` (the page has no text input on the image, as
+//   `/` for find) and the toolbar's buttons. Every chord byte (0x80..=0x8D) works from the address field too.
 //
 // POINTER (AETHERPTR B543/B547, CURSORSHAPE B550): every MOUSE_ABS is the system pointer in window px. Over the
 // chrome the chrome hit-tests it (the hand over a tab or a button, the text beam over the address field) and the
@@ -62,7 +62,8 @@ use edit_core::{Buffer, Direction, Motion, Selection, Unit};
 use layout_core::FontSel;
 use una_abi::{
     input_ev_pack, input_ev_payload, input_ev_type, input_ev_xy, input_ev_xy_payload, CURSOR_ARROW, CURSOR_HAND, CURSOR_TEXT, INPUT_EV_ACTION,
-    INPUT_EV_BUTTON, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
+    INPUT_EV_BUTTON, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, INPUT_EV_WIN_RESIZE, KEY_CTRL_MINUS, KEY_CTRL_PLUS, KEY_CTRL_SHIFT_TAB, KEY_CTRL_TAB,
+    KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
 };
 
 use crate::paint::Canvas;
@@ -235,9 +236,16 @@ pub fn to_window(app: &App, x: f32, y: f32) -> (i64, i64) {
     ((x * z) as i64, (y * z) as i64 + CHROME_H as i64)
 }
 
-/// The URL the chrome shows for a page path (`file://` + the path; nothing for the new-tab page).
+/// The URL the chrome shows for a page path (`file://` + the path; a network page's path is its URL already; nothing
+/// for the new-tab page).
 pub fn url_of(path: &str) -> String {
-    if path == NEWTAB { String::new() } else { alloc::format!("file://{}", path) }
+    if path == NEWTAB {
+        String::new()
+    } else if crate::net::is_net(path) {
+        String::from(path)
+    } else {
+        alloc::format!("file://{}", path)
+    }
 }
 
 /// The page's `<title>`, whitespace collapsed.
@@ -480,6 +488,16 @@ fn select_tab(app: &mut App, page: &mut Page, id: u64) {
     tab_wire(app, b"select");
 }
 
+/// Ctrl+Tab / Ctrl+Shift+Tab: the tab `dir` places along the strip, wrapping (`TabStrip::step`'s rule, applied
+/// through `select_tab` so the pages swap).
+fn cycle_tab(app: &mut App, page: &mut Page, dir: i32) {
+    let tabs = app.ch.strip.tabs();
+    let Some(i) = tabs.iter().position(|t| t.id == app.ch.strip.active()) else { return };
+    let j = (i as i64 + dir as i64).rem_euclid(tabs.len() as i64) as usize;
+    let id = tabs[j].id;
+    select_tab(app, page, id);
+}
+
 fn select_nth(app: &mut App, page: &mut Page, n: Option<usize>) {
     let tabs = app.ch.strip.tabs();
     let id = match n {
@@ -540,9 +558,10 @@ fn content_type(path: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether following a link to `path` saves it rather than opens it.
+/// Whether following a link to `path` saves it rather than opens it. A network URL always opens: its type is the
+/// server's, not its last path segment's (`?q=rust+1.80`, `/page.php`), and net::fetch reads the page either way.
 pub fn is_download(path: &str) -> bool {
-    path != NEWTAB && !downloads::renderable(content_type(path))
+    path != NEWTAB && !crate::net::is_net(path) && !downloads::renderable(content_type(path))
 }
 
 /// Save the volume file `path` in `<home>/Desktop` under the model's name.
@@ -617,7 +636,9 @@ fn omni_enter(app: &mut App, page: &mut Page, fonts: &mut Fonts) {
                 let lower = u.to_ascii_lowercase();
                 let has_scheme = lower.contains("://") || ["about:", "data:", "file:", "mailto:", "blob:", "view-source:"].iter().any(|s| lower.starts_with(s));
                 // A scheme-less name: a file beside the page when the volume has one (`keys.html`), else the web.
-                let beside = if has_scheme { None } else { crate::resolve(&page.path, &u).ok().map(|(p, _)| p).filter(|p| crate::fetch(p).is_ok()) };
+                // Only a VOLUME file is probed: beside a network page the name would resolve to a URL, and probing it would be
+                // a navigation of its own.
+                let beside = if has_scheme { None } else { crate::resolve(&page.path, &u).ok().map(|(p, _)| p).filter(|p| !crate::net::is_net(p) && crate::fetch(p).is_ok()) };
                 match beside {
                     Some(_) => (b"file", u),
                     None if has_scheme => (b"url", u),
@@ -817,8 +838,8 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
     match input_ev_type(ev) {
         INPUT_EV_KEY_DOWN => {
             let c = p as u8;
-            // The tab chords work from the field too; every other key is the field's while it has the keys.
-            if app.ch.omni.is_some() && !matches!(c, 0x14 | 0x17 | 0x81..=0x89) {
+            // The tab chords and every chord byte (0x80..=0x8D) work from the field too; every other key is the field's while it has the keys.
+            if app.ch.omni.is_some() && !matches!(c, 0x14 | 0x17 | 0x80..=0x8D) {
                 omni_key(app, page, fonts, c);
                 return None;
             }
@@ -841,6 +862,10 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
                 0x80 => zoom_step(app, 0),
                 0x81..=0x88 => select_nth(app, page, Some((c - 0x81) as usize)),
                 0x89 => select_nth(app, page, None),
+                KEY_CTRL_TAB => cycle_tab(app, page, 1),
+                KEY_CTRL_SHIFT_TAB => cycle_tab(app, page, -1),
+                KEY_CTRL_PLUS => zoom_step(app, 1),
+                KEY_CTRL_MINUS => zoom_step(app, -1),
                 b'+' | b'=' if app.find.is_none() => zoom_step(app, 1),
                 b'-' if app.find.is_none() => zoom_step(app, -1),
                 _ => return Some(ev),

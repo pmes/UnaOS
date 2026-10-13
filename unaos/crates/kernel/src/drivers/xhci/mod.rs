@@ -200,7 +200,7 @@ pub(crate) const HID_MOD_GUI: u8 = 0x88; // bit 3 LGUI   | bit 7 RGUI (Cmd on Ap
 ///   = 0x1A (Ctrl-Z). Two collision classes are then carved back out, because `Event::Key` is one
 ///   `u8` with no modifier field, so a consumer literally cannot tell a folded Ctrl-combo from the
 ///   dedicated key that produces the same byte:
-///     - Ctrl with a NON-letter is suppressed (SMALLFIX9 B533: except a main-row digit, which presses `HID_KEY_CTRL_DIGIT | d`): the classic codes (Ctrl-\ = 0x1C, Ctrl-] = 0x1D,
+///     - Ctrl with a NON-letter is suppressed (SMALLFIX9 B533: except a main-row digit, which presses `HID_KEY_CTRL_DIGIT | d`; AETHERMETAL5: and Tab, `=` and `-`, which press `HID_KEY_CTRL_TAB` / `_SHIFT_TAB` / `_PLUS` / `_MINUS`, 0x8A..=0x8D): the classic codes (Ctrl-\ = 0x1C, Ctrl-] = 0x1D,
 ///       Ctrl-^ = 0x1E, Ctrl-_ = 0x1F) land dead-on this table's arrow encoding at 0x1C..0x1F, and
 ///       `user-vug` binds 0x1C as yaw-right.
 ///     - Ctrl+letter folds landing on **0x08 / 0x09 / 0x0A / 0x0D** are suppressed too — these are
@@ -229,7 +229,7 @@ pub(crate) fn hid_key_ascii(keycode: u8, modifiers: u8, caps: bool) -> u8 {
     }
     if modifiers & HID_MOD_CTRL != 0 {
         if !is_letter {
-            return if (0x1E..=0x27).contains(&keycode) { HID_KEY_CTRL_DIGIT | ((keycode - 0x1D) % 10) } else { 0 }; // SMALLFIX9 (B533, UNAMETAL's workaround) — ⚠ SAME-LINE fold, line-NEUTRAL: Ctrl + a main-row DIGIT is a PRESS of its own byte, `HID_KEY_CTRL_DIGIT | d` (Ctrl+1 = 0x81 .. Ctrl+9 = 0x89, Ctrl+0 = 0x80) — a range no key of this table and no other fold produces (`pwwire::key_class` already files 0x80..=0xFF as `nav`; every ASCII consumer takes 0x20..=0x7E only), so the arrow carve-out above is untouched and ring 3 sees Ctrl+1/2/3 as presses. The RELEASE stays the bare digit (`hid_key_release_ascii`, ALLKEYS: spurious release safe, missing release not); every other Ctrl+non-letter stays suppressed
+            return if (0x1E..=0x27).contains(&keycode) { HID_KEY_CTRL_DIGIT | ((keycode - 0x1D) % 10) } else { match keycode { 0x2B if modifiers & HID_MOD_SHIFT != 0 => HID_KEY_CTRL_SHIFT_TAB, 0x2B => HID_KEY_CTRL_TAB, 0x2E => HID_KEY_CTRL_PLUS, 0x2D => HID_KEY_CTRL_MINUS, _ => 0 } }; // AETHERMETAL5 (SR109): Ctrl+Tab (usage 0x2B) presses 0x8A, Ctrl+Shift+Tab 0x8B, Ctrl+`=`/`+` (0x2E, Shift or not) 0x8C, Ctrl+`-` (0x2D) 0x8D — the bytes after the digit chords, same range, same release rule (the release is the bare Tab/`=`/`-`), so the browser chrome's tab cycle and zoom reach ring 3 (una-abi KEY_CTRL_TAB..KEY_CTRL_MINUS). // SMALLFIX9 (B533, UNAMETAL's workaround) — ⚠ SAME-LINE fold, line-NEUTRAL: Ctrl + a main-row DIGIT is a PRESS of its own byte, `HID_KEY_CTRL_DIGIT | d` (Ctrl+1 = 0x81 .. Ctrl+9 = 0x89, Ctrl+0 = 0x80) — a range no key of this table and no other fold produces (`pwwire::key_class` already files 0x80..=0xFF as `nav`; every ASCII consumer takes 0x20..=0x7E only), so the arrow carve-out above is untouched and ring 3 sees Ctrl+1/2/3 as presses. The RELEASE stays the bare digit (`hid_key_release_ascii`, ALLKEYS: spurious release safe, missing release not); every other Ctrl+non-letter (but AETHERMETAL5's Tab/`=`/`-` chords) stays suppressed
         }
         let c0 = keycode - 0x03;
         // Carve out the folds that collide with dedicated-key bytes a consumer binds bare:
@@ -297,7 +297,7 @@ pub(crate) const HID_LOCK_KEYS: [(u8, u8); 3] = [
 /// It sits at `(0, 0)` in [`HID_SCANCODE_TO_ASCII`] and stays there: PrintScreen types nothing, and
 /// the table's contract is "the character this key types". It is a COMMAND, like Application and
 /// Power beside it.
-pub(crate) const HID_USAGE_PRINT_SCREEN: u8 = 0x46; pub(crate) const HID_KEY_CTRL_DIGIT: u8 = 0x80; // SMALLFIX9 (B533): the base of the Ctrl+digit press bytes (`hid_key_ascii`), 0x80..=0x89
+pub(crate) const HID_USAGE_PRINT_SCREEN: u8 = 0x46; pub(crate) const HID_KEY_CTRL_DIGIT: u8 = 0x80; pub(crate) const HID_KEY_CTRL_TAB: u8 = 0x8A; pub(crate) const HID_KEY_CTRL_SHIFT_TAB: u8 = 0x8B; pub(crate) const HID_KEY_CTRL_PLUS: u8 = 0x8C; pub(crate) const HID_KEY_CTRL_MINUS: u8 = 0x8D; // AETHERMETAL5 (SR109): the Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+`=` / Ctrl+`-` press bytes (`hid_key_ascii`), 0x8A..=0x8D, beside the digit chords. // SMALLFIX9 (B533): the base of the Ctrl+digit press bytes (`hid_key_ascii`), 0x80..=0x89
 
 /// PRTSCR — **did PrintScreen go DOWN in this report?** The shared press-edge predicate both
 /// decoders ask, so a key is a key whichever controller carried it.
