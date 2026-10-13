@@ -5,6 +5,8 @@
 //! host's parse context (the cascade's viewport, the initial 16px font basis).
 
 use crate::layout::{AetherHost, LayoutTree};
+
+pub(crate) mod anim;
 use taffy::prelude::*;
 use taffy::style::{FlexDirection, LengthPercentage, LengthPercentageAuto};
 
@@ -156,7 +158,8 @@ fn ledger_rules(rules: &[css_core::stylesheet::CssRule]) {
             CssRule::LayerStatement(_) => {}
             CssRule::Import(_) => crate::ledger::record_css("at-rule:@import"),
             CssRule::FontFace(_) => {}
-            CssRule::Keyframes(_) => crate::ledger::record_css("at-rule:@keyframes"),
+            CssRule::Keyframes(_) => {} // AETHERSTYLE3 (SR103): run by `anim`
+            CssRule::Container(_, inner) => ledger_rules(inner),
             CssRule::Other(a) => crate::ledger::record_css(&format!("at-rule:@{}", a.name.to_ascii_lowercase())),
         }
     }
@@ -185,6 +188,7 @@ fn cascade_document(
     rules: &css_core::cascade::RuleSet<'_>,
     pseudo_rules: &[css_core::cascade::RuleSet<'_>; 3],
     boxed: &std::collections::HashSet<html_core::NodeId>,
+    containers: Option<&ContainerSizes>,
 ) -> (
     std::collections::HashMap<html_core::NodeId, std::rc::Rc<SpecifiedStyle>>,
     std::collections::BTreeMap<String, Vec<css_core::CV>>,
@@ -213,7 +217,22 @@ fn cascade_document(
         let inline = el.attr("style").filter(|t| crate::security::csp::allow_style_attr(t)).map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
         let me_el = crate::dom::El::new(doc, id);
         let filter = doc.parent_element(id).and_then(|p| child_filter.get(&p)).copied().unwrap_or_default();
-        let applied = css_core::cascade::cascade_filtered(rules, &me_el, &inline, None, Some(&filter));
+        // AETHERSTYLE3 (SR103): `@container` rules ask the element's query container (the nearest ancestor
+        // container whose name matches, css-contain-3 §3.1) as the first layout sized it.
+        let query = |c: &css_core::container::ContainerRule| -> bool {
+            let Some(sizes) = containers else { return false };
+            let mut cur = doc.parent_element(id);
+            while let Some(a) = cur {
+                if let Some(q) = sizes.get(&a) {
+                    if c.names(&q.names) {
+                        return c.evaluate(&q.size) == css_core::media::Tri::True;
+                    }
+                }
+                cur = doc.parent_element(a);
+            }
+            false
+        };
+        let applied = css_core::cascade::cascade_contained(rules, &me_el, &inline, None, Some(&filter), Some(&query));
         child_filter.insert(id, filter.with_element(&me_el));
         // custom properties: inherited from the parent element, overridden by this element's own
         let parent = doc.parent_element(id).and_then(|p| customs.get(&p)).cloned().unwrap_or_else(|| empty.clone());
@@ -238,7 +257,7 @@ fn cascade_document(
             if prs.entries.is_empty() {
                 continue;
             }
-            let applied = css_core::cascade::cascade_filtered(prs, &me_el, &[], Some(&pseudo_kinds[k]), Some(&filter));
+            let applied = css_core::cascade::cascade_contained(prs, &me_el, &[], Some(&pseudo_kinds[k]), Some(&filter), Some(&query));
             if applied.is_empty() {
                 continue;
             }
@@ -325,20 +344,88 @@ fn cascade_document(
 /// rule styles it).
 pub(crate) type PseudoStyles = [Option<std::rc::Rc<SpecifiedStyle>>; 3];
 
+/// AETHERSTYLE3 (SR103): each query container's names and content-box size, by element, from a first layout.
+pub(crate) struct QueryContainer {
+    pub names: Vec<String>,
+    pub size: css_core::container::ContainerSize,
+}
+pub(crate) type ContainerSizes = std::collections::HashMap<html_core::NodeId, QueryContainer>;
+
+/// The query containers of a laid-out tree: every element whose `container-type` is `size` (both axes) or
+/// `inline-size` (the inline axis), at its content-box size.
+fn container_sizes(tree: &LayoutTree) -> ContainerSizes {
+    let mut out = ContainerSizes::new();
+    for (tid, n) in &tree.node_map {
+        let Some(p) = tree.paint_map.get(tid) else { continue };
+        let ty = p.container_type.unwrap_or(0);
+        if ty == 0 || !n.is_element() {
+            continue;
+        }
+        let Ok(l) = tree.taffy.layout(*tid) else { continue };
+        let w = (l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right).max(0.0) as f64;
+        let h = (l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom).max(0.0) as f64;
+        let vertical = layout_core::writing::is_vertical(p.writing_mode.unwrap_or(0));
+        let (iw, ih) = match (ty, vertical) {
+            (1, _) => (Some(w), Some(h)),
+            (_, false) => (Some(w), None),
+            (_, true) => (None, Some(h)),
+        };
+        let fs = p.used_font_size.unwrap_or(16.0) as f64;
+        out.insert(
+            n.id(),
+            QueryContainer {
+                names: p.container_name.clone().unwrap_or_default(),
+                size: css_core::container::ContainerSize { width: iw, height: ih, vertical, font_size: fs },
+            },
+        );
+    }
+    out
+}
+
 /// Applies a set of stylesheets (document order, author origin) as ONE cascade through css_core, with
 /// each element's `style` attribute at its CSS priority (above normal rules, below `!important` ones;
-/// an `!important` style attribute beats every author rule).
+/// an `!important` style attribute beats every author rule). AETHERSTYLE3 (SR103): when the sheets hold
+/// `@container` rules, the first cascade + layout sizes the query containers and the tree is rebuilt and
+/// cascaded again with those sizes (css-contain-3 §4: container rules apply against the containers' laid-out
+/// size; one round, so a rule that resizes its own container does not loop).
 pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
+    let mut round = apply_stylesheets_with(layout_tree, sheets, None);
+    if let Some(sizes) = round.containers.take() {
+        if let Some(root) = layout_tree.node_map.get(&layout_tree.root_node).cloned() {
+            let (vw, vh) = layout_tree.viewport;
+            *layout_tree = crate::layout::build_tree(&root, vw, vh);
+            round = apply_stylesheets_with(layout_tree, sheets, Some(&sizes));
+        }
+    }
+    // AETHERSTYLE3 (SR103): transitions start from the style change, animations follow the names, and the
+    // values running now are applied over the fresh layout.
+    anim::sync(layout_tree, &round.styles, round.keyframes);
+}
+
+/// What one cascade round hands back: the query-container sizes when a second round is due, each element's
+/// computed style and the document's `@keyframes`.
+#[derive(Default)]
+struct Round {
+    containers: Option<ContainerSizes>,
+    styles: std::collections::HashMap<html_core::NodeId, std::rc::Rc<SpecifiedStyle>>,
+    keyframes: Vec<(String, layout_core::anim::KeyframeSet)>,
+}
+
+/// One cascade + layout. With `containers` None, returns the query-container sizes when the sheets carry
+/// `@container` rules and the page has query containers (the caller's cue for the second round).
+fn apply_stylesheets_with(layout_tree: &mut LayoutTree, sheets: &[String], containers: Option<&ContainerSizes>) -> Round {
     let t0 = std::time::Instant::now();
     let (vw, vh) = layout_tree.viewport;
     set_viewport(vw, vh);
     let parsed: Vec<css_core::stylesheet::Stylesheet> =
         sheets.iter().map(|s| css_core::stylesheet::parse_stylesheet(s)).collect();
-    for s in &parsed {
-        ledger_rules(&s.rules);
+    if containers.is_none() {
+        for s in &parsed {
+            ledger_rules(&s.rules);
+        }
+        // css-fonts-4 §4: the document's @font-face faces (AETHERFONT); a changed set bumps the font caches.
+        crate::fonts::webfont::apply_rules(&parsed, &crate::images::page_base());
     }
-    // css-fonts-4 §4: the document's @font-face faces (AETHERFONT); a changed set bumps the font caches.
-    crate::fonts::webfont::apply_rules(&parsed, &crate::images::page_base());
     let env = media_environment(vw, vh);
     let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
     let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
@@ -365,7 +452,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     }
     let Some(any) = any else {
         STYLE_TIMING.with(|t| t.set((t0.elapsed(), std::time::Duration::ZERO)));
-        return;
+        return Round::default();
     };
     let boxed: std::collections::HashSet<html_core::NodeId> = boxes.keys().copied().collect();
     // AETHERGEN (SR71): the rules that style ::marker, ::before and ::after, one hashed set each.
@@ -384,6 +471,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
                     origin: e.origin,
                     layer: e.layer.clone(),
                     order: e.order,
+                    container: e.container.clone(),
                 });
             }
         }
@@ -394,7 +482,7 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     });
     let t_c = std::time::Instant::now();
     let (styles, root_customs, pseudo_styles) =
-        any.with_doc(|doc, _| cascade_document(doc, &rules, &pseudo_rules, &boxed));
+        any.with_doc(|doc, _| cascade_document(doc, &rules, &pseudo_rules, &boxed, containers));
     if std::env::var_os("AETHER_STYLE_PROFILE").is_some() {
         eprintln!(
             "[style] parse + rule set {:?}, cascade {:?}, {} selector entries, rule hash {}",
@@ -418,6 +506,13 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
         c.clear();
         c.extend(styles.iter().filter_map(|(id, s)| s.cursor.map(|k| (*id, k))));
     });
+    let round_styles = styles.clone();
+    // the last `@keyframes` of each name wins (css-animations-1 §3)
+    let mut keyframes: Vec<(String, layout_core::anim::KeyframeSet)> = Vec::new();
+    for k in &rules.keyframes {
+        keyframes.retain(|(n, _)| *n != k.name);
+        keyframes.push((k.name.clone(), layout_core::anim::KeyframeSet::from_rule(k)));
+    }
     // AETHERGEN (SR71): counters, quotes and the ::marker/::before/::after boxes (layout::generated),
     // the generated boxes folded with their pseudo-element's cascaded style below like any other box.
     let generated = crate::layout::generated::generate(layout_tree, &any, &styles, &pseudo_styles, &boxes);
@@ -436,7 +531,27 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
     let t1 = std::time::Instant::now();
     // set_style only marks nodes dirty; re-lay out with text measurement.
     crate::layout::remeasure(layout_tree);
+    // AETHERSTYLE3 (SR103): scroll containers keep their offsets across a relayout.
+    crate::layout::restore_scroll(layout_tree);
     STYLE_TIMING.with(|t| t.set((t1 - t0, t1.elapsed())));
+    let mut round = Round { containers: None, styles: round_styles, keyframes };
+    if containers.is_none() && rules.has_container_rules() {
+        let sizes = container_sizes(layout_tree);
+        if !sizes.is_empty() {
+            round.containers = Some(sizes);
+        }
+    }
+    round
+}
+
+/// AETHERSTYLE3 (SR103): one animation frame (`anim::frame`) — the engine repaints or relayouts on its answer.
+pub(crate) fn animation_frame(tree: &mut LayoutTree) -> anim::Frame {
+    anim::frame(tree)
+}
+
+/// AETHERSTYLE3 (SR103): the transition / animation events queued since the last call.
+pub(crate) fn take_animation_events() -> Vec<layout_core::anim::AnimEvent<html_core::NodeId>> {
+    anim::take_events()
 }
 
 thread_local! {
@@ -698,6 +813,17 @@ fn property_supported(prop: &str) -> bool {
             | "padding-block" | "padding-inline-start" | "padding-inline-end" | "padding-block-start"
             | "padding-block-end" | "inset-inline" | "inset-block" | "inset-inline-start" | "inset-inline-end"
             | "inset-block-start" | "inset-block-end"
+            // AETHERSTYLE3 (SR103)
+            | "filter" | "backdrop-filter" | "-webkit-filter" | "-webkit-backdrop-filter"
+            | "overflow-inline" | "overflow-block"
+            | "columns" | "column-count" | "column-width" | "column-fill" | "column-rule"
+            | "column-rule-width" | "column-rule-style" | "column-rule-color"
+            | "writing-mode" | "text-orientation"
+            | "container" | "container-type" | "container-name" | "contain"
+            | "transition" | "transition-property" | "transition-duration" | "transition-timing-function"
+            | "transition-delay" | "transition-behavior" | "animation" | "animation-name" | "animation-duration"
+            | "animation-timing-function" | "animation-delay" | "animation-iteration-count"
+            | "animation-direction" | "animation-fill-mode" | "animation-play-state"
     )
 }
 

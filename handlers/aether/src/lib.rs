@@ -306,6 +306,11 @@ impl AetherEngine {
     /// the same granularity while the button is held.
     pub fn press_at(&mut self, x: f64, y: f64, clicks: u8, shift: bool) {
         self.button_down = true;
+        // AETHERSTYLE3 (SR103): a press on a scroll container's scrollbar drags its thumb, or pages the
+        // track toward the press; it starts no selection.
+        if self.scrollbar_press(x, y) {
+            return;
+        }
         let Some(hit) = self.hit_text(x, y) else {
             selection::set(None);
             self.sel_drag = None;
@@ -350,6 +355,9 @@ impl AetherEngine {
         if !self.button_down {
             return;
         }
+        if self.scrollbar_drag(x, y) {
+            return;
+        }
         let Some(drag) = self.sel_drag else { return };
         let Some(hit) = self.hit_text(x, y) else { return };
         let Some(doc) = self.document.clone() else { return };
@@ -373,6 +381,55 @@ impl AetherEngine {
     /// The button went up: the drag ends (the selection stays). SR68's `MouseUp` arm calls this.
     pub fn pointer_released(&mut self) {
         self.button_down = false;
+        layout::end_scroll_drag();
+    }
+
+    /// AETHERSTYLE3 (SR103): the press at viewport (`x`, `y`) over a scroll container's scrollbar — the thumb
+    /// starts a drag (`layout::begin_scroll_drag`), the track pages by the client size toward the press.
+    /// `false` when no scrollbar is under the point.
+    fn scrollbar_press(&mut self, x: f64, y: f64) -> bool {
+        let Some(tree) = self.layout_tree.as_mut() else { return false };
+        let vs = (self.scroll_x as i32 as f32, self.scroll_y as i32 as f32);
+        let (px, py) = ((x + self.scroll_x) as f32, (y + self.scroll_y) as f32);
+        for id in layout_core::scroll::scrollers_at(tree, px, py, vs) {
+            let Some((ox, oy)) = layout_core::scroll::box_origin(tree, id, vs) else { continue };
+            let Some((axis, on_thumb, along)) = layout_core::scroll::hit_scrollbar(tree, id, px - ox, py - oy) else { continue };
+            let (cur_x, cur_y) = layout_core::scroll::offset(tree, id);
+            if on_thumb {
+                layout::begin_scroll_drag(tree, id, axis, if axis == 1 { py } else { px }, if axis == 1 { cur_y } else { cur_x });
+            } else {
+                let bars = layout_core::scroll::scrollbars(tree, id);
+                let (_, _, cw, ch) = layout_core::scroll::client_rect(tree, id);
+                let before = match (axis, bars.v, bars.h) {
+                    (1, Some(b), _) => along < b.thumb.1 - b.track.1,
+                    (0, _, Some(b)) => along < b.thumb.0 - b.track.0,
+                    _ => false,
+                };
+                let step = if axis == 1 { ch } else { cw } * if before { -1.0 } else { 1.0 };
+                if axis == 1 {
+                    layout_core::scroll::set_offset(tree, id, cur_x, cur_y + step);
+                } else {
+                    layout_core::scroll::set_offset(tree, id, cur_x + step, cur_y);
+                }
+                layout::remember_scroll(tree);
+            }
+            self.damage_rects.push((0, 0, self.width, self.height));
+            self.needs_repaint = true;
+            return true;
+        }
+        false
+    }
+
+    /// AETHERSTYLE3 (SR103): pointer motion during a thumb drag moves the scroller's offset along with it.
+    fn scrollbar_drag(&mut self, x: f64, y: f64) -> bool {
+        let Some(tree) = self.layout_tree.as_mut() else { return false };
+        let (px, py) = ((x + self.scroll_x) as f32, (y + self.scroll_y) as f32);
+        if !layout::continue_scroll_drag(tree, px, py) {
+            return false;
+        }
+        self.damage_rects.push((0, 0, self.width, self.height));
+        self.needs_repaint = true;
+        true
     }
 
     /// Ctrl/Cmd+A: select the document's contents (the body's children).
@@ -513,6 +570,27 @@ impl AetherEngine {
         self.drain_history_ops();
         if js::take_mutated() {
             self.relayout();
+        }
+        // AETHERSTYLE3 (SR103): CSS transitions and animations advance one frame on the shell's tick.
+        let frame = self.layout_tree.as_mut().map(css::animation_frame).unwrap_or(css::anim::Frame::Idle);
+        match frame {
+            css::anim::Frame::Relayout => self.relayout(),
+            css::anim::Frame::Repaint => {
+                self.damage_rects.push((0, 0, self.width, self.height));
+                self.needs_repaint = true;
+            }
+            css::anim::Frame::Idle => {}
+        }
+        let events = css::take_animation_events();
+        if !events.is_empty() {
+            if let (Some(tree), Some(js_engine)) = (self.layout_tree.as_ref(), self.js_engine.as_mut()) {
+                for e in events {
+                    let node = tree.node_map.values().find(|n| n.id() == *e.key()).cloned();
+                    if let Some(node) = node {
+                        js_engine.fire(&node, e.kind(), true);
+                    }
+                }
+            }
         }
         self.sel_changed();
         // The focused field's caret blinks: repaint its box when the phase flips.
@@ -666,7 +744,27 @@ impl AetherEngine {
 
     pub fn handle_event(&mut self, event: api::events::Event) {
         match event {
-            api::events::Event::Scroll(_dx, dy) => {
+            api::events::Event::Scroll(dx, dy) => {
+                // AETHERSTYLE3 (SR103): the innermost user-scrollable box under the pointer takes the delta
+                // first; what its chain cannot take scrolls the viewport (css-overscroll-1 §2).
+                let dy = match (self.pointer, self.layout_tree.as_mut()) {
+                    (Some((px, py)), Some(tree)) => {
+                        let vs = (self.scroll_x as i32 as f32, self.scroll_y as i32 as f32);
+                        let chain = layout_core::scroll::scrollers_at(tree, (px + self.scroll_x) as f32, (py + self.scroll_y) as f32, vs);
+                        if chain.is_empty() {
+                            dy
+                        } else {
+                            let (_, ry) = layout_core::scroll::scroll_by(tree, &chain, dx as f32, dy as f32);
+                            if (ry as f64 - dy).abs() > 1e-6 {
+                                layout::remember_scroll(tree);
+                                self.damage_rects.push((0, 0, self.width, self.height));
+                                self.needs_repaint = true;
+                            }
+                            ry as f64
+                        }
+                    }
+                    _ => dy,
+                };
                 let old_sy = self.scroll_y;
                 // Clamp to the document: [0, content height - viewport].
                 let max_scroll = self
@@ -1747,6 +1845,8 @@ impl AetherEngine {
         self.js_engine = Some(js_engine);
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
+        layout::forget_scroll(); // AETHERSTYLE3 (SR103): a new document's boxes start unscrolled
+        css::anim::reset(); // AETHERSTYLE3 (SR103): and nothing of the old one keeps animating
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
         // Focus never survives a navigation; the new document's first `autofocus` control that can
@@ -1903,6 +2003,9 @@ fn hit_origin(cx: &HitCtx, id: taffy::prelude::NodeId, parent: (f32, f32)) -> (f
 fn hit_kids(layout: &layout::LayoutTree, node: taffy::prelude::NodeId, o: (f32, f32)) -> Vec<(taffy::prelude::NodeId, (f32, f32))> {
     let mut kids = Vec::new();
     let Ok(lb) = layout.taffy.layout(node) else { return kids };
+    // AETHERSTYLE3 (SR103): a scroll container's content moves by its offset (render's rule).
+    let (shx, shy) = layout_core::scroll::content_shift(layout, node);
+    let o = (o.0 + shx, o.1 + shy);
     if let Some(il) = layout.inline.get(&node) {
         let (cx, cy) = (o.0 + lb.border.left + lb.padding.left, o.1 + lb.border.top + lb.padding.top);
         for f in &il.frags {
@@ -1918,7 +2021,8 @@ fn hit_kids(layout: &layout::LayoutTree, node: taffy::prelude::NodeId, o: (f32, 
         }
     } else {
         for c in layout.taffy.children(node).unwrap_or_default() {
-            kids.push((c, o));
+            let (mx, my) = layout_core::col_shift(layout, c);
+            kids.push((c, (o.0 + mx, o.1 + my)));
         }
     }
     kids
@@ -1935,7 +2039,8 @@ fn hit_box_entries(cx: &HitCtx, id: taffy::prelude::NodeId, o: (f32, f32), clip:
         clip
     };
     if layout.inline.contains_key(&id) {
-        let content = (o.0 + l.border.left + l.padding.left, o.1 + l.border.top + l.padding.top);
+        let (shx, shy) = layout_core::scroll::content_shift(layout, id);
+        let content = (o.0 + shx + l.border.left + l.padding.left, o.1 + shy + l.border.top + l.padding.top);
         out.push(HitEntry::Ifc(id, content, inner));
     }
     inner

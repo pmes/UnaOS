@@ -190,6 +190,12 @@ fn parse_media_query(v: &[CV]) -> MediaQuery {
     }
 }
 
+/// A bare `<media-condition>` (the grammar `@container` reuses for its `<container-condition>`, AETHERSTYLE3
+/// SR103); `None` when it does not parse.
+pub fn parse_media_condition(v: &[CV]) -> Option<MediaCondition> {
+    condition(&nonws(v), true)
+}
+
 /// `<media-condition>` (or `-without-or`) over non-whitespace values.
 fn condition(w: &[&CV], allow_or: bool) -> Option<MediaCondition> {
     if w.is_empty() {

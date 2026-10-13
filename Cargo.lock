@@ -2569,6 +2569,7 @@ version = "0.1.0"
 dependencies = [
  "css_core",
  "font_core",
+ "svg_core",
  "taffy",
 ]
 

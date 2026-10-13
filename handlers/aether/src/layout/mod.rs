@@ -50,6 +50,77 @@ pub fn remeasure(tree: &mut LayoutTree) {
     layout_core::remeasure(tree, &HostFonts);
 }
 
+// ---- AETHERSTYLE3 (SR103): scroll containers' offsets across relayouts ---------------------------------
+
+thread_local! {
+    /// Each scroll container's offset by ELEMENT (a relayout rebuilds the boxes; the element keeps its scroll
+    /// position, css-overflow-3 §2.3), and the thumb drag in progress: (element, axis, pointer start, offset start).
+    static SCROLLED: std::cell::RefCell<std::collections::HashMap<html_core::NodeId, (f32, f32)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static SCROLL_DRAG: std::cell::Cell<Option<(html_core::NodeId, u8, f32, f32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Records every box's current offset under its element.
+pub(crate) fn remember_scroll(tree: &LayoutTree) {
+    SCROLLED.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        for (id, off) in &tree.scroll {
+            if let Some(n) = tree.node_map.get(id) {
+                m.insert(n.id(), *off);
+            }
+        }
+    });
+}
+
+/// Puts the recorded offsets back onto a freshly laid-out tree (clamped to the new scroll range).
+pub(crate) fn restore_scroll(tree: &mut LayoutTree) {
+    let saved: Vec<(html_core::NodeId, (f32, f32))> = SCROLLED.with(|m| m.borrow().iter().map(|(k, v)| (*k, *v)).collect());
+    if saved.is_empty() {
+        return;
+    }
+    let boxes: Vec<(taffy::NodeId, html_core::NodeId)> = tree.node_map.iter().map(|(t, n)| (*t, n.id())).collect();
+    for (tid, nid) in boxes {
+        if let Some((_, (x, y))) = saved.iter().find(|(k, _)| *k == nid) {
+            layout_core::scroll::set_offset(tree, tid, *x, *y);
+        }
+    }
+}
+
+/// A new document: no element is scrolled.
+pub(crate) fn forget_scroll() {
+    SCROLLED.with(|m| m.borrow_mut().clear());
+    SCROLL_DRAG.with(|d| d.set(None));
+}
+
+/// A thumb drag starts on box `id` along `axis` at pointer coordinate `at` with the offset `start`.
+pub(crate) fn begin_scroll_drag(tree: &LayoutTree, id: taffy::NodeId, axis: u8, at: f32, start: f32) {
+    if let Some(n) = tree.node_map.get(&id) {
+        SCROLL_DRAG.with(|d| d.set(Some((n.id(), axis, at, start))));
+    }
+}
+
+/// The drag follows the pointer (document px); `false` when no drag is in progress.
+pub(crate) fn continue_scroll_drag(tree: &mut LayoutTree, px: f32, py: f32) -> bool {
+    let Some((nid, axis, at, start)) = SCROLL_DRAG.with(|d| d.get()) else { return false };
+    let Some(tid) = tree.node_map.iter().find(|(_, n)| n.id() == nid).map(|(t, _)| *t) else { return false };
+    let delta = if axis == 1 { py - at } else { px - at };
+    let v = layout_core::scroll::drag_offset(tree, tid, axis, start, delta);
+    let (cx, cy) = layout_core::scroll::offset(tree, tid);
+    if axis == 1 {
+        layout_core::scroll::set_offset(tree, tid, cx, v);
+    } else {
+        layout_core::scroll::set_offset(tree, tid, v, cy);
+    }
+    remember_scroll(tree);
+    true
+}
+
+/// The button went up: the drag ends.
+pub(crate) fn end_scroll_drag() {
+    SCROLL_DRAG.with(|d| d.set(None));
+}
+
 /// The (submit value, display label) of a `<select>`'s selected option (`layout_core::select_selected_option`).
 pub(crate) fn select_selected_option(select: &NodeRef) -> Option<(String, String)> {
     layout_core::select_selected_option::<AetherHost>(select)

@@ -757,6 +757,9 @@ pub(crate) fn is_stacking_context(layout: &LayoutTree, id: NodeId) -> bool {
         || p.tf_rotate.is_some()
         || p.tf_scale.is_some()
         || p.clip_path.as_ref().is_some_and(|c| c.is_some())
+        // Filter Effects 1 §5 / 2 §3: a filter or backdrop-filter other than none (AETHERSTYLE3 SR103).
+        || p.filter.as_ref().is_some_and(|f| f.is_some())
+        || p.backdrop_filter.as_ref().is_some_and(|f| f.is_some())
     {
         return true;
     }
@@ -1429,6 +1432,115 @@ fn paint_audio_controls(
     }
 }
 
+/// AETHERSTYLE3 (SR103): the overlay scrollbar colours (Chromium's light-theme track and thumb).
+const SCROLL_TRACK: (u8, u8, u8) = (241, 241, 241);
+const SCROLL_THUMB: (u8, u8, u8) = (193, 193, 193);
+
+/// The bounding box (x0, y0, x1, y1 inclusive) of the pixels `surface` changed against `snap`; None = none.
+fn changed_bounds(surface: &[u8], snap: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for y in 0..height {
+        for x in 0..width {
+            let i = ((y * width + x) * 4) as usize;
+            if surface[i..i + 3] != snap[i..i + 3] {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    (x0 <= x1 && y0 <= y1).then_some((x0, y0, x1, y1))
+}
+
+/// AETHERSTYLE3 (SR103): a `filter` group. The pixels the subtree changed against `snap` are the group (a
+/// straight-alpha layer, opaque where drawn), padded by the list's spread, run through svg_core's CSS filter
+/// hook (`layout_core::effects::filter_rgba`) and composited source-over onto the snapshot, clipped to `clip`.
+fn filter_group(surface: &mut [u8], snap: &[u8], width: u32, height: u32, value: &str, cx: &layout_core::effects::FilterCx, clip: Clip) {
+    let Some((x0, y0, x1, y1)) = changed_bounds(surface, snap, width, height) else { return };
+    let m = layout_core::effects::filter_margin(value, cx) as i64;
+    let rx0 = (x0 as i64 - m).max(0).max(clip.0.floor() as i64) as u32;
+    let ry0 = (y0 as i64 - m).max(0).max(clip.1.floor() as i64) as u32;
+    let rx1 = ((x1 as i64 + 1 + m).min(width as i64).min(clip.2.ceil() as i64)).max(rx0 as i64) as u32;
+    let ry1 = ((y1 as i64 + 1 + m).min(height as i64).min(clip.3.ceil() as i64)).max(ry0 as i64) as u32;
+    let (lw, lh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
+    if lw == 0 || lh == 0 {
+        return;
+    }
+    let mut layer = vec![0u8; lw * lh * 4];
+    for y in 0..lh {
+        for x in 0..lw {
+            let i = (((ry0 as usize + y) * width as usize) + rx0 as usize + x) * 4;
+            if surface[i..i + 3] != snap[i..i + 3] {
+                let o = (y * lw + x) * 4;
+                layer[o..o + 4].copy_from_slice(&[surface[i + 2], surface[i + 1], surface[i], 255]);
+            }
+        }
+    }
+    if !layout_core::effects::filter_rgba(&mut layer, lw, lh, value, cx) {
+        return;
+    }
+    // the whole surface returns to the backdrop, then the filtered layer composites over it
+    for y in y0..=y1 {
+        let a = ((y * width + x0) * 4) as usize;
+        let b = ((y * width + x1) * 4 + 4) as usize;
+        surface[a..b].copy_from_slice(&snap[a..b]);
+    }
+    for y in 0..lh {
+        for x in 0..lw {
+            let i = (((ry0 as usize + y) * width as usize) + rx0 as usize + x) * 4;
+            let o = (y * lw + x) * 4;
+            let src = [layer[o], layer[o + 1], layer[o + 2], layer[o + 3]];
+            let (r, g, b) = layout_core::effects::over((snap[i + 2], snap[i + 1], snap[i]), src);
+            surface[i] = b;
+            surface[i + 1] = g;
+            surface[i + 2] = r;
+            surface[i + 3] = 255;
+        }
+    }
+}
+
+/// AETHERSTYLE3 (SR103): `backdrop-filter` (Filter Effects 2 §3) — the backdrop under the box's border box
+/// (`rect`, screen px) is filtered before the box paints: the region padded by the list's spread is read
+/// opaque, filtered, and written back inside the border box (and `clip`) only.
+fn backdrop_group(surface: &mut [u8], width: u32, height: u32, rect: Clip, value: &str, cx: &layout_core::effects::FilterCx, clip: Clip) {
+    let m = layout_core::effects::filter_margin(value, cx);
+    let rx0 = (rect.0 - m).floor().max(0.0) as u32;
+    let ry0 = (rect.1 - m).floor().max(0.0) as u32;
+    let rx1 = ((rect.2 + m).ceil().max(0.0) as u32).min(width);
+    let ry1 = ((rect.3 + m).ceil().max(0.0) as u32).min(height);
+    if rx1 <= rx0 || ry1 <= ry0 {
+        return;
+    }
+    let (lw, lh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
+    let mut layer = vec![0u8; lw * lh * 4];
+    for y in 0..lh {
+        for x in 0..lw {
+            let i = (((ry0 as usize + y) * width as usize) + rx0 as usize + x) * 4;
+            let o = (y * lw + x) * 4;
+            layer[o..o + 4].copy_from_slice(&[surface[i + 2], surface[i + 1], surface[i], 255]);
+        }
+    }
+    if !layout_core::effects::filter_rgba(&mut layer, lw, lh, value, cx) {
+        return;
+    }
+    let bx0 = rect.0.max(clip.0).max(0.0).floor() as u32;
+    let by0 = rect.1.max(clip.1).max(0.0).floor() as u32;
+    let bx1 = (rect.2.min(clip.2).max(0.0).ceil() as u32).min(width);
+    let by1 = (rect.3.min(clip.3).max(0.0).ceil() as u32).min(height);
+    for y in by0.max(ry0)..by1.min(ry1) {
+        for x in bx0.max(rx0)..bx1.min(rx1) {
+            let i = ((y * width + x) * 4) as usize;
+            let o = (((y - ry0) as usize) * lw + (x - rx0) as usize) * 4;
+            let src = [layer[o], layer[o + 1], layer[o + 2], layer[o + 3]];
+            let (r, g, b) = layout_core::effects::over((surface[i + 2], surface[i + 1], surface[i]), src);
+            surface[i] = b;
+            surface[i + 1] = g;
+            surface[i + 2] = r;
+        }
+    }
+}
+
 /// Where a box's border box sits in page coordinates: its laid-out place (`abs` + its location), except
 /// `position: fixed` — the containing block is the viewport (CSS 2.2 §10.1): insets resolve against it
 /// and the box ignores scrolling — and `position: sticky` (css-position-3 §3.4, AETHERSTYLE2 SR95): the
@@ -1587,7 +1699,22 @@ pub fn render_frame(
             (Some(p), Some(lb)) => p.transform_matrix(lb.size.width, lb.size.height),
             _ => None,
         };
-        let (Some(lb), true) = (lb, tf.is_some() || shape.is_some()) else {
+        // AETHERSTYLE3 (SR103): filter / backdrop-filter, resolved against the element's font and colour.
+        let hidden = paint.and_then(|p| p.hidden).unwrap_or(false);
+        let filter = paint.and_then(|p| p.filter.clone()).flatten().filter(|_| !hidden);
+        let backdrop = paint.and_then(|p| p.backdrop_filter.clone()).flatten().filter(|_| !hidden);
+        let fcx = layout_core::effects::FilterCx {
+            scale: 1.0,
+            font_size: paint.and_then(|p| p.used_font_size).unwrap_or(inherited.font_size),
+            viewport: (width as f32, height as f32),
+            color: paint.and_then(|p| p.color).unwrap_or(inherited.color),
+        };
+        if let (Some(bf), Some(lb)) = (&backdrop, lb) {
+            let (ox, oy) = placed_origin(layout, node_id, abs_x, abs_y, &lb, width, height, sx, sy);
+            let (bx, by) = (ox - sx as f32, oy - sy as f32);
+            backdrop_group(surface, width, height, (bx, by, bx + lb.size.width, by + lb.size.height), bf, &fcx, clip);
+        }
+        let (Some(lb), true) = (lb, tf.is_some() || shape.is_some() || filter.is_some()) else {
             draw_node_op(
                 node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
                 damage_rects, clip,
@@ -1602,21 +1729,13 @@ pub fn render_frame(
             node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
             damage_rects, clip,
         );
-        let changed = |surface: &[u8], i: usize| surface[i..i + 3] != snap[i..i + 3];
-        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        for y in 0..height {
-            for x in 0..width {
-                if changed(surface, ((y * width + x) * 4) as usize) {
-                    x0 = x0.min(x);
-                    y0 = y0.min(y);
-                    x1 = x1.max(x);
-                    y1 = y1.max(y);
-                }
-            }
+        // Filter Effects 1 §5: the filter applies first, then clipping, then the transform.
+        if let Some(f) = &filter {
+            filter_group(surface, &snap, width, height, f, &fcx, clip);
         }
-        if x0 > x1 || y0 > y1 {
+        let Some((x0, y0, x1, y1)) = changed_bounds(surface, &snap, width, height) else {
             return; // the group drew nothing
-        }
+        };
         if let Some(shape) = &shape {
             for y in y0..=y1 {
                 for x in x0..=x1 {
@@ -1735,6 +1854,9 @@ pub fn render_frame(
         let Ok(lb) = layout.taffy.layout(node) else { return };
         // The children with the parent origin draw_node expects for each.
         let mut kids: Vec<(NodeId, f32, f32, Inherited)> = Vec::new();
+        // AETHERSTYLE3 (SR103): a scroll container's content moves by its offset.
+        let (shx, shy) = layout_core::scroll::content_shift(layout, node);
+        let cur = (cur.0 + shx, cur.1 + shy);
         if let Some(il) = layout.inline.get(&node) {
             let cx = cur.0 + lb.border.left + lb.padding.left;
             let cy = cur.1 + lb.border.top + lb.padding.top;
@@ -1751,7 +1873,8 @@ pub fn render_frame(
             }
         } else {
             for c in layout.taffy.children(node).unwrap_or_default() {
-                kids.push((c, cur.0, cur.1, inh));
+                let (mx, my) = layout_core::col_shift(layout, c);
+                kids.push((c, cur.0 + mx, cur.1 + my, inh));
             }
         }
         for (c, ax, ay, ci) in kids {
@@ -2695,11 +2818,13 @@ pub fn render_frame(
             // An inline formatting context: its line-box fragments, in tree
             // order (CSS 2.2 Appendix E step 7: each inline box's background
             // and borders, then its text; atomic inlines as whole boxes).
-            let content_x = current_x + layout_box.border.left + layout_box.padding.left;
+            // AETHERSTYLE3 (SR103): a scroll container's lines move by its offset.
+            let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
+            let content_x = current_x + shx + layout_box.border.left + layout_box.padding.left;
             // A table cell's vertical-align places its lines in the cell
             // (§17.5.4; html.css: middle).
             let valign_off = cell_valign_offset(layout, node_id, ifc.height);
-            let content_y = current_y + layout_box.border.top + layout_box.padding.top + valign_off;
+            let content_y = current_y + shy + layout_box.border.top + layout_box.padding.top + valign_off;
             // Text baselines snap to whole pixels from the EXACT (unrounded)
             // position, as Skia rounds a glyph run's fractional origin; the
             // box tree's rounded block positions can be up to half a pixel
@@ -2767,6 +2892,60 @@ pub fn render_frame(
             let sel_plan = crate::selection::plan_ifc(layout, node_id);
             // AETHERDEBT SR93: every find-in-page match, highlighted behind its text.
             let mark_plan = crate::selection::plan_marks(layout, node_id);
+            // AETHERSTYLE3 (SR103): a vertical writing mode's fragments are laid out in a horizontal staging
+            // space (inline along x, lines along y). They paint into an offscreen buffer pre-filled with the
+            // backdrop each staging pixel lands on, then every pixel the text changed goes to its place in the
+            // content box through `writing::to_physical` (vertical-rl / sideways-rl turn the lines clockwise,
+            // vertical-lr keeps that glyph turn with the lines left to right, sideways-lr turns them
+            // counter-clockwise).
+            let vmode = ifc.vertical;
+            let (vbw, vbh) = if vmode != 0 {
+                ((ifc.inline_extent.ceil().max(1.0)) as u32, (ifc.height.ceil().max(1.0)) as u32)
+            } else {
+                (0, 0)
+            };
+            let vorigin = ((content_x - sx as f32).floor() as i32, (content_y - sy as f32).floor() as i32);
+            let vline = |y: i32| {
+                ifc.lines.iter().find(|(t, h, _)| y as f32 >= t.floor() && (y as f32) < (t + h).floor()).map(|(t, h, _)| {
+                    (t.floor() as i32, ((t + h).floor() - t.floor()) as i32)
+                })
+            };
+            let vmap = |x: i32, y: i32| {
+                let (px, py) = layout_core::writing::to_physical(vmode, x, y, vbh as i32, vbw as i32, &vline);
+                (vorigin.0 + px, vorigin.1 + py)
+            };
+            let mut vbuf: Vec<u8> = Vec::new();
+            if vmode != 0 {
+                vbuf = vec![255; (vbw * vbh * 4) as usize];
+                for y in 0..vbh as i32 {
+                    for x in 0..vbw as i32 {
+                        let (dx, dy) = vmap(x, y);
+                        if dx >= 0 && dy >= 0 && (dx as u32) < width && (dy as u32) < height {
+                            let si = ((dy as u32 * width + dx as u32) * 4) as usize;
+                            let di = ((y as u32 * vbw + x as u32) * 4) as usize;
+                            vbuf[di..di + 4].copy_from_slice(&surface[si..si + 4]);
+                        }
+                    }
+                }
+            }
+            let vinit = vbuf.clone();
+            {
+            let vdamage = [(0u32, 0u32, vbw, vbh)];
+            #[allow(clippy::type_complexity)]
+            let (surface, width, height, damage_rects, child_clip, content_x, content_y, exact_content_y): (
+                &mut [u8],
+                u32,
+                u32,
+                &[(u32, u32, u32, u32)],
+                Clip,
+                f32,
+                f32,
+                f32,
+            ) = if vmode != 0 {
+                (&mut vbuf[..], vbw, vbh, &vdamage[..], (0.0, 0.0, vbw as f32, vbh as f32), sx as f32, sy as f32, sy as f32)
+            } else {
+                (&mut *surface, width, height, damage_rects, child_clip, content_x, content_y, exact_content_y)
+            };
             for (fi, frag) in ifc.frags.iter().enumerate() {
                 match frag {
                     crate::layout::inline::Frag::Box { node, x, y, w, h, first, last } => {
@@ -2947,16 +3126,41 @@ pub fn render_frame(
                     }
                 }
             }
+            }
+            if vmode != 0 {
+                for y in 0..vbh as i32 {
+                    for x in 0..vbw as i32 {
+                        let di = ((y as u32 * vbw + x as u32) * 4) as usize;
+                        if vbuf[di..di + 3] == vinit[di..di + 3] {
+                            continue;
+                        }
+                        let (px, py) = vmap(x, y);
+                        if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
+                            continue;
+                        }
+                        let (pxu, pyu) = (px as u32, py as u32);
+                        if !in_damage(pxu, pyu, damage_rects) || !in_clip(pxu, pyu, child_clip) {
+                            continue;
+                        }
+                        let si = ((pyu * width + pxu) * 4) as usize;
+                        surface[si..si + 4].copy_from_slice(&vbuf[di..di + 4]);
+                    }
+                }
+            }
         }
         if ifc.is_none() {
             // Normal flow (Appendix E steps 3-5), tree order; positioned and
             // stacking-context boxes were hoisted into their context's layers.
+            // AETHERSTYLE3 (SR103): a scroll container's children move by its offset, a multicol
+            // container's by the column they were balanced into.
+            let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
             for child in layout.taffy.children(node_id).unwrap_or_default() {
                 if is_layered(layout, child) {
                     continue;
                 }
+                let (mx, my) = layout_core::col_shift(layout, child);
                 draw_node(
-                    child, current_x, current_y, inherited, layout, font, font_bold, surface,
+                    child, current_x + shx + mx, current_y + shy + my, inherited, layout, font, font_bold, surface,
                     width, height, sx, sy, damage_rects, child_clip,
                 );
             }
@@ -2965,6 +3169,29 @@ pub fn render_frame(
         // positive z-index ascending.
         paint_layers(&layers[split..], surface);
         finish_round_clip(surface);
+        // AETHERSTYLE3 (SR103): css-multicol-1 §4.2 — a column rule midway in each gap between columns that
+        // hold content, as tall as the column boxes (painted solid whatever its style).
+        if let Some(cols) = layout.multicol.get(&node_id) {
+            if let Some((rw, rc, _)) = cols.rule {
+                let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
+                let cx0 = current_x - sx as f32 + shx + layout_box.border.left + layout_box.padding.left;
+                let cy0 = current_y - sy as f32 + shy + layout_box.border.top + layout_box.padding.top;
+                for k in 1..cols.filled {
+                    let mid = cx0 + k as f32 * (cols.width + cols.gap) - cols.gap / 2.0;
+                    let x0 = (mid - rw / 2.0).round();
+                    fill_rect(x0, cy0, x0 + rw.max(1.0).round(), cy0 + cols.height, rc, 255, surface, width, height, damage_rects, child_clip);
+                }
+            }
+        }
+        // AETHERSTYLE3 (SR103): a scroll container's overlay scrollbars, over its content.
+        let bars = layout_core::scroll::scrollbars(layout, node_id);
+        let (bx0, by0) = (current_x - sx as f32, current_y - sy as f32);
+        for bar in [bars.v, bars.h].into_iter().flatten() {
+            let (tx, ty, tw, th) = bar.track;
+            fill_rect(bx0 + tx, by0 + ty, bx0 + tx + tw, by0 + ty + th, SCROLL_TRACK, 255, surface, width, height, damage_rects, clip);
+            let (mx, my, mw, mh) = bar.thumb;
+            fill_rect(bx0 + mx, by0 + my, bx0 + mx + mw, by0 + my + mh, SCROLL_THUMB, 255, surface, width, height, damage_rects, clip);
+        }
     }
 
     let root_inherited = root_inherited();

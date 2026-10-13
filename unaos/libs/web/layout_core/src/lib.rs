@@ -24,17 +24,22 @@ extern crate alloc;
 
 pub use taffy;
 
+pub mod anim;
 pub mod blockwidth;
 pub mod collapse;
 pub mod css;
+pub mod effects;
 pub mod fmath;
 pub mod hit;
 pub mod inline;
 pub mod lines;
 mod map;
+pub mod multicol;
 pub mod paint;
+pub mod scroll;
 pub mod table;
 mod tree;
+pub mod writing;
 
 pub use map::{Entry, NodeMap};
 pub use paint::{ClipShape, FontWeight, MarkerPaint, PaintStyle, ShapeRadius, TransformOp};

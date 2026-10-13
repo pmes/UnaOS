@@ -5,7 +5,8 @@
 //! * [`selectors`] — Selectors Level 4 grammar and specificity; [`matching`] — the matcher over the
 //!   abstract [`matching::Element`] trait.
 //! * [`stylesheet`] — rules as data (`@media` `@supports` `@layer` `@import` `@namespace` `@font-face`
-//!   `@keyframes`, CSS Nesting); [`media`] — Media Queries 4; [`cascade`] — the cascade sort.
+//!   `@keyframes`, `@container`, CSS Nesting); [`media`] — Media Queries 4; [`container`] — container queries
+//!   (AETHERSTYLE3 SR103); [`cascade`] — the cascade sort.
 //! * [`values`] — lengths, `calc()` / `min()` / `max()` / `clamp()` trees, `var()` substitution;
 //!   [`color`] — CSS Color 4 sRGB colors; [`serialize`] — CSSOM serialization.
 //!
@@ -18,6 +19,7 @@ extern crate alloc;
 pub mod anb;
 pub mod cascade;
 pub mod color;
+pub mod container;
 pub mod matching;
 pub mod media;
 pub mod parser;

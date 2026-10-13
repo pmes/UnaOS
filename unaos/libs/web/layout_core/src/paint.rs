@@ -177,6 +177,35 @@ pub struct PaintStyle<H: Host> {
     /// a percentage or `auto` side is None): a sticky box's constraint rectangle (css-position-3 §3.4),
     /// read by the painter because a sticky box's insets are not folded into taffy.
     pub inset_px: Option<[Option<f32>; 4]>,
+    /// AETHERSTYLE3 (SR103): `filter` (Filter Effects 1 §5) as written, validated by svg_core's parser;
+    /// Some(None) = `none`. Painted as a group through [`crate::effects::filter_rgba`].
+    pub filter: Option<Option<String>>,
+    /// `backdrop-filter` (Filter Effects 2 §3) as written; Some(None) = `none`.
+    pub backdrop_filter: Option<Option<String>>,
+    /// AETHERSTYLE3 (SR103): `overflow-x` / `overflow-y` (css-overflow-3 §3) as [x, y] codes —
+    /// [`crate::scroll::VISIBLE`] 0, `HIDDEN` 1, `CLIP` 2, `SCROLL` 3, `AUTO` 4. `clip` above stays the
+    /// paint-time "clips its descendants" flag every non-visible value sets.
+    pub overflow: Option<[u8; 2]>,
+    /// AETHERSTYLE3 (SR103): css-multicol-1 — `column-count` / `column-width` (Some(None) = `auto`), the
+    /// multicol gutter in px (`column-gap`; None = `normal`, 1em), `column-fill` (0 balance, 1 auto) and the
+    /// `column-rule` longhands (style [`crate::multicol::RULE_NONE`] = none / hidden).
+    pub col_count: Option<Option<u32>>,
+    pub col_width: Option<Option<f32>>,
+    pub col_gap: Option<f32>,
+    pub col_fill: Option<u8>,
+    pub col_rule_width: Option<f32>,
+    pub col_rule_style: Option<u8>,
+    pub col_rule_color: Option<(u8, u8, u8)>,
+    /// AETHERSTYLE3 (SR103): `writing-mode` (css-writing-modes-4 §3.1; [`crate::writing`] codes), inherited.
+    pub writing_mode: Option<u8>,
+    /// `text-orientation` (§5.1): 0 mixed, 1 upright, 2 sideways. Glyphs paint sideways in every vertical
+    /// mode (the `mixed` rendering of Latin); upright CJK is not rotated back.
+    pub text_orientation: Option<u8>,
+    /// AETHERSTYLE3 (SR103): `container-type` (css-contain-3 §3.1): 0 normal, 1 size, 2 inline-size;
+    /// `container-name` (Some(empty) = none); `contain`'s size containment (0 none, 1 size, 2 inline-size).
+    pub container_type: Option<u8>,
+    pub container_name: Option<Vec<String>>,
+    pub contain_size: Option<u8>,
 }
 
 
@@ -255,6 +284,21 @@ impl<H: Host> Default for PaintStyle<H> {
             transform_origin: None,
             clip_path: None,
             inset_px: None,
+            filter: None,
+            backdrop_filter: None,
+            overflow: None,
+            col_count: None,
+            col_width: None,
+            col_gap: None,
+            col_fill: None,
+            col_rule_width: None,
+            col_rule_style: None,
+            col_rule_color: None,
+            writing_mode: None,
+            text_orientation: None,
+            container_type: None,
+            container_name: None,
+            contain_size: None,
         }
     }
 }

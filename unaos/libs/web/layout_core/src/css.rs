@@ -93,6 +93,12 @@ pub struct SpecifiedStyle<H: Host> {
     pub cursor: Option<&'static str>,
     /// AETHERGEN (SR71): the generated-content properties (css-content-3, css-lists-3).
     pub generated: GenStyle,
+    /// AETHERSTYLE3 (SR103): the `transition-*` and `animation-*` lists (`anim`), and the specified text of
+    /// every animatable property in cascade order — the before- and after-change values a transition runs
+    /// between, and the base value of an implicit keyframe.
+    pub transition: crate::anim::TransitionLists,
+    pub animation: crate::anim::AnimationLists,
+    pub animatable: Vec<(String, String)>,
 }
 
 /// The generated-content properties of one element or pseudo-element, as specified: `content`
@@ -369,6 +375,26 @@ impl<H: Host> SpecifiedStyle<H> {
         if let Some(bs) = self.box_sizing {
             node_style.box_sizing = bs;
         }
+        // AETHERSTYLE3 (SR103): size containment (css-contain-2 §3.2) — an auto height is laid out as if the
+        // box were empty (0 plus its padding and border); inline-size containment leaves a block's width to its
+        // containing block, which already does not depend on its content.
+        if (self.paint.container_type == Some(1) || self.paint.contain_size == Some(1)) && self.height.is_none() {
+            node_style.size.height = Dimension::length(0.0);
+            node_style.min_size.height = LengthPercentageAuto::auto();
+        }
+        // AETHERSTYLE3 (SR103): a scroll container's automatic minimum size is 0 (css-flexbox-1 §4.5), which
+        // taffy reads from its own `overflow`; scrollbars are overlays, so no gutter is reserved.
+        if let Some(o) = self.paint.overflow {
+            use taffy::style::Overflow as O;
+            let map = |v: u8| match v {
+                crate::scroll::HIDDEN | crate::scroll::AUTO => O::Hidden,
+                crate::scroll::SCROLL => O::Scroll,
+                crate::scroll::CLIP => O::Clip,
+                _ => O::Visible,
+            };
+            node_style.overflow = taffy::geometry::Point { x: map(o[0]), y: map(o[1]) };
+            node_style.scrollbar_width = 0.0;
+        }
     }
 }
 
@@ -376,6 +402,22 @@ impl<H: Host> SpecifiedStyle<H> {
 /// Values arrive as raw strings so function values (rgb()...) parse uniformly.
 pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
     let value = value.trim();
+    // AETHERSTYLE3 (SR103): transitions and animations (css-transitions-1, css-animations-1).
+    let unprefixed = prop
+        .strip_prefix("-webkit-")
+        .or_else(|| prop.strip_prefix("-moz-"))
+        .or_else(|| prop.strip_prefix("-o-"))
+        .unwrap_or(prop);
+    if unprefixed.starts_with("transition") || unprefixed.starts_with("animation") {
+        if !crate::anim::apply_declaration(unprefixed, value, style) && !is_neutral_keyword(value) {
+            H::record_css(&format!("{}-value:{}", unprefixed, clip(value)));
+        }
+        return;
+    }
+    if crate::anim::is_animatable(prop) {
+        style.animatable.retain(|(p, _)| p != prop);
+        style.animatable.push((prop.to_string(), value.to_string()));
+    }
     if is_length_property(prop) {
         // Kept in cascade order for the font-relative re-resolution.
         let list = style.paint.font_rel.get_or_insert_with(Vec::new);
@@ -481,10 +523,17 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             Some(v) => style.row_gap = Some(v),
             None => H::record_css(&format!("gap-value:{}", clip(value))),
         },
-        "column-gap" | "grid-column-gap" => match parse_length_percentage_str(value, cx) {
-            Some(v) => style.column_gap = Some(v),
-            None => H::record_css(&format!("gap-value:{}", clip(value))),
-        },
+        "column-gap" | "grid-column-gap" => {
+            // AETHERSTYLE3 (SR103): the multicol gutter too (css-multicol-1 §4.1; `normal` = 1em there).
+            if prop == "column-gap" {
+                if let Some(px) = parse_px(value, cx).filter(|_| !value.ends_with('%')) {
+                    style.paint.col_gap = Some(px);
+                } else if value == "normal" {
+                    style.paint.col_gap = None;
+                }
+            }
+            apply_column_gap(value, style, cx);
+        }
         "flex-grow" => match value.parse::<f32>() {
             Ok(v) if v >= 0.0 => style.flex_grow = Some(v),
             _ => H::record_css(&format!("flex-grow-value:{}", clip(value))),
@@ -546,11 +595,42 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
         // scrollbars yet — clipping is the honest approximation; visible
         // overflow was smearing collapsed menus over the page).
-        "overflow" | "overflow-x" | "overflow-y" => match value {
-            "hidden" | "clip" | "auto" | "scroll" => style.paint.clip = Some(true),
-            "visible" => style.paint.clip = Some(false),
-            _ => {}
-        },
+        // AETHERSTYLE3 (SR103): css-overflow-3 §3 — `overflow: <x> <y>?` and the axis longhands (the
+        // flow-relative `overflow-inline` / `-block` map in horizontal-tb). hidden / scroll / auto make a
+        // scroll container with its own offset (`scroll`); every non-visible value clips paint.
+        "overflow" | "overflow-x" | "overflow-y" | "overflow-inline" | "overflow-block" => {
+            let code = |v: &str| -> Option<u8> {
+                Some(match v {
+                    "visible" => crate::scroll::VISIBLE,
+                    "hidden" => crate::scroll::HIDDEN,
+                    "clip" => crate::scroll::CLIP,
+                    "scroll" => crate::scroll::SCROLL,
+                    "auto" | "overlay" => crate::scroll::AUTO,
+                    _ => return None,
+                })
+            };
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            let mut o = style.paint.overflow.unwrap_or([crate::scroll::VISIBLE; 2]);
+            let ok = match (prop, parts.as_slice()) {
+                ("overflow", [a]) => code(a).map(|a| o = [a, a]).is_some(),
+                ("overflow", [a, b]) => match (code(a), code(b)) {
+                    (Some(a), Some(b)) => {
+                        o = [a, b];
+                        true
+                    }
+                    _ => false,
+                },
+                ("overflow-x" | "overflow-inline", [a]) => code(a).map(|a| o[0] = a).is_some(),
+                ("overflow-y" | "overflow-block", [a]) => code(a).map(|a| o[1] = a).is_some(),
+                _ => false,
+            };
+            if ok {
+                style.paint.overflow = Some(o);
+                style.paint.clip = Some(o != [crate::scroll::VISIBLE; 2]);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("{}-value:{}", prop, clip(value)));
+            }
+        }
         "padding" => {
             if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v, cx)) {
                 style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
@@ -683,6 +763,151 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         // css-will-change-1 §2: a hint a UA may ignore.
         "will-change" => {}
+        // AETHERSTYLE3 (SR103): css-contain-3 §3 — query containers (the host's second cascade evaluates
+        // `@container` against their sizes) and size containment (`fold_into`).
+        "container-type" => match value {
+            "normal" => style.paint.container_type = Some(0),
+            "size" => style.paint.container_type = Some(1),
+            "inline-size" => style.paint.container_type = Some(2),
+            v if is_neutral_keyword(v) => {}
+            v => H::record_css(&format!("container-type-value:{}", clip(v))),
+        },
+        "container-name" => {
+            let names: Vec<String> = value.split_whitespace().filter(|n| *n != "none").map(|n| n.to_string()).collect();
+            style.paint.container_name = Some(names);
+        }
+        "container" => {
+            let (names, ty) = match value.split_once('/') {
+                Some((n, t)) => (n.trim(), Some(t.trim())),
+                None => (value, None),
+            };
+            apply_declaration("container-name", names, style, cx);
+            apply_declaration("container-type", ty.unwrap_or("normal"), style, cx);
+        }
+        "contain" => {
+            let mut size = 0u8;
+            let mut paint = false;
+            for k in value.split_whitespace() {
+                match k {
+                    "size" => size = 1,
+                    "inline-size" if size != 1 => size = 2,
+                    "strict" => {
+                        size = 1;
+                        paint = true;
+                    }
+                    "content" | "paint" => paint = true,
+                    "none" | "layout" | "style" => {}
+                    _ => {}
+                }
+            }
+            style.paint.contain_size = Some(size);
+            if paint {
+                style.paint.clip = Some(true);
+            }
+        }
+        // AETHERSTYLE3 (SR103): css-writing-modes-4 §3.1 / §5.1 (laid out by `writing`).
+        "writing-mode" => match crate::writing::parse_writing_mode(value) {
+            Some(m) => style.paint.writing_mode = Some(m),
+            None if is_neutral_keyword(value) => {}
+            None => H::record_css(&format!("writing-mode-value:{}", clip(value))),
+        },
+        "text-orientation" => match value {
+            "mixed" => style.paint.text_orientation = Some(0),
+            "upright" => {
+                style.paint.text_orientation = Some(1);
+                H::record_css("text-orientation-value:upright");
+            }
+            "sideways" | "sideways-right" => style.paint.text_orientation = Some(2),
+            _ => {}
+        },
+        // AETHERSTYLE3 (SR103): css-multicol-1 §3-§6 (laid out by `multicol`).
+        "column-count" => match value {
+            "auto" => style.paint.col_count = Some(None),
+            v => match v.parse::<u32>() {
+                Ok(n) if n > 0 => style.paint.col_count = Some(Some(n)),
+                _ if is_neutral_keyword(v) => {}
+                _ => H::record_css(&format!("column-count-value:{}", clip(v))),
+            },
+        },
+        "column-width" => match value {
+            "auto" => style.paint.col_width = Some(None),
+            v => match parse_px(v, cx).filter(|px| *px >= 0.0 && !v.ends_with('%')) {
+                Some(px) => style.paint.col_width = Some(Some(px)),
+                None if is_neutral_keyword(v) => {}
+                None => H::record_css(&format!("column-width-value:{}", clip(v))),
+            },
+        },
+        "columns" => {
+            // `<'column-width'> || <'column-count'>`: an omitted half resets to auto.
+            let (mut count, mut width, mut ok) = (None, None, true);
+            for part in value.split_whitespace() {
+                if part == "auto" {
+                    continue;
+                }
+                if let Ok(n) = part.parse::<u32>() {
+                    ok &= n > 0 && count.is_none();
+                    count = Some(n);
+                } else if let Some(px) = parse_px(part, cx).filter(|_| !part.ends_with('%')) {
+                    ok &= width.is_none();
+                    width = Some(px);
+                } else {
+                    ok = false;
+                }
+            }
+            if ok {
+                style.paint.col_count = Some(count);
+                style.paint.col_width = Some(width);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("columns-value:{}", clip(value)));
+            }
+        }
+        "column-fill" => match value {
+            "balance" | "balance-all" => style.paint.col_fill = Some(0),
+            "auto" => style.paint.col_fill = Some(1),
+            _ => {}
+        },
+        "column-rule" | "column-rule-width" | "column-rule-style" | "column-rule-color" => {
+            for part in split_top_level(value) {
+                let st = match part {
+                    "none" | "hidden" => Some(crate::multicol::RULE_NONE),
+                    p => border_style_code(p),
+                };
+                let w = match part {
+                    "thin" => Some(1.0),
+                    "medium" => Some(3.0),
+                    "thick" => Some(5.0),
+                    p => parse_px(p, cx),
+                };
+                if prop != "column-rule-color" && prop != "column-rule-width" && st.is_some() {
+                    style.paint.col_rule_style = st;
+                } else if prop != "column-rule-color" && prop != "column-rule-style" && w.is_some() {
+                    style.paint.col_rule_width = w;
+                } else if prop != "column-rule-width" && prop != "column-rule-style" {
+                    if let Some(c) = parse_color_str::<H>(part) {
+                        style.paint.col_rule_color = Some(c);
+                    }
+                }
+            }
+        }
+        // css-multicol-1 §6: a spanning element splits the column flow; Aether does not split it.
+        "column-span" if value == "none" => {}
+        // AETHERSTYLE3 (SR103): Filter Effects 1 §5 / Filter Effects 2 §3 — the list svg_core parses.
+        "filter" | "backdrop-filter" => {
+            let v = value.trim();
+            let parsed = if v.eq_ignore_ascii_case("none") {
+                Some(None)
+            } else if crate::effects::filter_valid(v) {
+                Some(Some(v.to_string()))
+            } else {
+                None
+            };
+            match parsed {
+                Some(f) if prop == "filter" => style.paint.filter = Some(f),
+                Some(f) => style.paint.backdrop_filter = Some(f),
+                None if is_neutral_keyword(v) => {}
+                None => H::record_css(&format!("{}-value:{}", prop, clip(v))),
+            }
+        }
         // css-break-3 §3: break controls apply only to fragmented flows; Aether paginates nothing and
         // lays out no columns, so there is nothing for them to do (the column-* properties stay ledgered).
         "break-before" | "break-after" | "break-inside" | "page-break-before" | "page-break-after"
@@ -1438,6 +1663,10 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                             | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
                             | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
                             | "backface-visibility" | "perspective" | "perspective-origin"
+                            | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
+                            | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
+                            | "column-rule-style" | "column-rule-color" | "column-span"
+                            | "writing-mode" | "text-orientation"
                     )
                 }) =>
         {
@@ -1456,18 +1685,31 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
     }
 }
 
-/// css-logical-1 §4-§6 in horizontal-tb (Aether lays out no vertical writing mode): a flow-relative
-/// property is re-applied as its physical longhand(s). The inline axis is horizontal and its start is
-/// `left`, or `right` when this element's own declarations already set `direction: rtl` (an inherited
-/// rtl is not visible at declaration time). `false` = not a logical property this engine maps.
+/// The flex / grid `column-gap` (taffy's horizontal gap), as the arm always folded it.
+fn apply_column_gap<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    match parse_length_percentage_str(value, cx) {
+        Some(v) => style.column_gap = Some(v),
+        // `normal`: the flex/grid gap's initial 0 (css-align-3 §8.1) — nothing to fold.
+        None if value == "normal" => {}
+        None => H::record_css(&format!("gap-value:{}", clip(value))),
+    }
+}
+
+/// css-logical-1 §4-§6: a flow-relative property is re-applied as its physical longhand(s), through this
+/// element's own `writing-mode` and `direction` (css-writing-modes-4 §6.4, `writing::logical_sides`;
+/// AETHERSTYLE3 SR103 added the vertical modes). An inherited writing mode or rtl is not visible at
+/// declaration time. `false` = not a logical property this engine maps.
 fn apply_logical<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) -> bool {
+    // AETHERSTYLE3 (SR103): through this element's own `writing-mode` (a vertical mode swaps the axes).
+    let mode = style.paint.writing_mode.unwrap_or(crate::writing::HORIZONTAL_TB);
+    let vertical = crate::writing::is_vertical(mode);
     let size = match prop {
-        "inline-size" => Some("width"),
-        "block-size" => Some("height"),
-        "min-inline-size" => Some("min-width"),
-        "min-block-size" => Some("min-height"),
-        "max-inline-size" => Some("max-width"),
-        "max-block-size" => Some("max-height"),
+        "inline-size" => Some(if vertical { "height" } else { "width" }),
+        "block-size" => Some(if vertical { "width" } else { "height" }),
+        "min-inline-size" => Some(if vertical { "min-height" } else { "min-width" }),
+        "min-block-size" => Some(if vertical { "min-width" } else { "min-height" }),
+        "max-inline-size" => Some(if vertical { "max-height" } else { "max-width" }),
+        "max-block-size" => Some(if vertical { "max-width" } else { "max-height" }),
         _ => None,
     };
     if let Some(p) = size {
@@ -1475,6 +1717,7 @@ fn apply_logical<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>
         return true;
     }
     let rtl = style.paint.rtl == Some(true);
+    let (is_, ie, bs, be) = crate::writing::logical_sides(mode, rtl);
     for fam in ["margin", "padding", "inset", "border"] {
         let Some(rest) = prop.strip_prefix(fam).and_then(|r| r.strip_prefix('-')) else { continue };
         let (inline, rest) = if let Some(r) = rest.strip_prefix("inline") {
@@ -1484,11 +1727,7 @@ fn apply_logical<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>
         } else {
             return false;
         };
-        let (start, end) = match (inline, rtl) {
-            (true, false) => ("left", "right"),
-            (true, true) => ("right", "left"),
-            (false, _) => ("top", "bottom"),
-        };
+        let (start, end) = if inline { (is_, ie) } else { (bs, be) };
         let (edge, suffix) = if let Some(s) = rest.strip_prefix("-start") {
             (1u8, s)
         } else if let Some(s) = rest.strip_prefix("-end") {
@@ -2086,8 +2325,10 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
+        overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
+        writing_mode, text_orientation, container_type, contain_size,
     );
-    clone!(text_shadows, transform, clip_path);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -2229,6 +2470,12 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis, aspect_ratio);
     merge_paint(&mut dst.paint, &src.paint);
+    dst.transition.merge(&src.transition);
+    dst.animation.merge(&src.animation);
+    for (p, v) in &src.animatable {
+        dst.animatable.retain(|(q, _)| q != p);
+        dst.animatable.push((p.clone(), v.clone()));
+    }
     let (d, g) = (&mut dst.generated, &src.generated);
     if g.content.is_some() { d.content = g.content.clone(); }
     if g.counter_reset.is_some() { d.counter_reset = g.counter_reset.clone(); }
