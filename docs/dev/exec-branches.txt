@@ -421,3 +421,8 @@ refs/heads/exec-host-aetherstyle3             abcb8d33 IN-FLIGHT cloud 2026-10-1
 refs/heads/exec-host-aethersw                 ba928bd0 FOLDED-BY-HAND 13e01cbc 2026-10-13
 refs/heads/exec-rmbp-sonde2                   abcb8d33 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-unakeys                  abcb8d33 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-setterwedge              cc2b7a8a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-pointerscale2            cc2b7a8a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-dockshell                cc2b7a8a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-screenshotfat            cc2b7a8a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-queuesleep2              cc2b7a8a IN-FLIGHT cloud 2026-10-13
