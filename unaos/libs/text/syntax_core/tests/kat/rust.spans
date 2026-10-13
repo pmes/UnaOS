@@ -1,0 +1,64 @@
+# SYNTAXCORE KAT — Rust (the Reference, lexical structure). <line> <kind> |<lexeme>|
+0 doc-comment |//! Crate doc.|
+1 doc-comment |/// Item doc.|
+2 attribute |#[derive(Debug)]|
+3 keyword |pub|
+3 keyword |struct|
+3 type |S|
+3 operator |<|
+3 lifetime |'a|
+3 operator |>|
+3 punctuation |{|
+3 identifier |c|
+3 punctuation |:|
+3 builtin |char|
+3 punctuation |,|
+3 identifier |s|
+3 punctuation |:|
+3 operator |&|
+3 lifetime |'a|
+3 builtin |str|
+3 punctuation |}|
+4 keyword |fn|
+4 function |main|
+4 punctuation |(|
+4 punctuation |)|
+4 punctuation |{|
+5 keyword |let|
+5 identifier |r|
+5 operator |=|
+5 string |r#"raw "quoted""#|
+5 punctuation |;|
+6 keyword |let|
+6 identifier |b|
+6 operator |=|
+6 char |b'|
+6 escape |\x7f|
+6 char |'|
+6 punctuation |;|
+7 keyword |let|
+7 identifier |e|
+7 operator |=|
+7 string |"tab|
+7 escape |\t\u{1F600}|
+7 string |"|
+7 punctuation |;|
+8 comment |/* outer /* inner */ still */|
+8 keyword |let|
+8 identifier |n|
+8 operator |=|
+8 number |0x1F_u8|
+8 operator |+|
+8 number |1.5e3|
+8 punctuation |;|
+9 macro |println!|
+9 punctuation |(|
+9 string |"{}"|
+9 punctuation |,|
+9 char |'x'|
+9 punctuation |)|
+9 punctuation |;|
+10 punctuation |}|
+11 doc-comment |/** doc|
+12 doc-comment |  block */|
+13 comment |//// not doc|

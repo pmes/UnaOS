@@ -1,0 +1,53 @@
+# SYNTAXCORE KAT — C (C17 §6.4). <line> <kind> |<lexeme>|
+0 macro |#include <stdio.h>|
+1 macro |#define MAX(a, b) \|
+2 macro |    ((a) > (b) ? (a) : (b))|
+3 comment |/* block|
+4 comment |   comment */|
+5 keyword |static|
+5 keyword |const|
+5 builtin |char|
+5 operator |*|
+5 identifier |s|
+5 operator |=|
+5 string |u8"x|
+5 escape |\n\101|
+5 string |"|
+5 string |"??="|
+5 punctuation |;|
+6 builtin |int|
+6 function |main|
+6 punctuation |(|
+6 builtin |void|
+6 punctuation |)|
+6 punctuation |{|
+7 type |size_t|
+7 identifier |n|
+7 operator |=|
+7 keyword |sizeof|
+7 punctuation |(|
+7 builtin |int|
+7 punctuation |)|
+7 operator |+|
+7 number |0x1Fu|
+7 operator |+|
+7 number |1.5e-3f|
+7 punctuation |;|
+7 comment |// tail \|
+8 comment |    continued|
+9 type |wchar_t|
+9 identifier |c|
+9 operator |=|
+9 char |L'|
+9 escape |é|
+9 char |'|
+9 punctuation |;|
+10 keyword |return|
+10 function |MAX|
+10 punctuation |(|
+10 identifier |n|
+10 punctuation |,|
+10 number |2|
+10 punctuation |)|
+10 punctuation |;|
+11 punctuation |}|

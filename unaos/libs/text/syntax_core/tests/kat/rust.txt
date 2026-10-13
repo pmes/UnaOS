@@ -1,0 +1,14 @@
+//! Crate doc.
+/// Item doc.
+#[derive(Debug)]
+pub struct S<'a> { c: char, s: &'a str }
+fn main() {
+    let r = r#"raw "quoted""#;
+    let b = b'\x7f';
+    let e = "tab\t\u{1F600}";
+    /* outer /* inner */ still */ let n = 0x1F_u8 + 1.5e3;
+    println!("{}", 'x');
+}
+/** doc
+  block */
+//// not doc

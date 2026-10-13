@@ -1,0 +1,12 @@
+#include <stdio.h>
+#define MAX(a, b) \
+    ((a) > (b) ? (a) : (b))
+/* block
+   comment */
+static const char *s = u8"x\n\101" "??=";
+int main(void) {
+    size_t n = sizeof(int) + 0x1Fu + 1.5e-3f; // tail \
+    continued
+    wchar_t c = L'é';
+    return MAX(n, 2);
+}

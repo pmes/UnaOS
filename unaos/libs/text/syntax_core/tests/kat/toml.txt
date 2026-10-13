@@ -1,0 +1,14 @@
+# comment
+title = "TOML\"x\"é"
+[owner]
+name.first = 'Tom'
+dob = 1979-05-27 07:32:00-08:00
+[[products]]
+ports = [ 8000, 0xDEAD_BEEF,
+  -inf, nan ]
+flag = true
+inline = { a = 1, "b c" = 2.5e-3 }
+text = """
+line\
+  end"""
+lit = '''raw'''

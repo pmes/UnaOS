@@ -26,6 +26,7 @@ members = [
     # FONTCORE (SR48): the no_std font core (OpenType/TrueType/CFF, rasterizer, shaper, UAX #14).
     "unaos/libs/text/font_core",
     "unaos/libs/text/edit_core", # EDITCORE (SR73): the no_std text-editing core (piece table, UAX #29 motion, undo) Tabula's buffer of record
+    "unaos/libs/text/syntax_core", # SYNTAXCORE (SR89, R105): the no_std syntax core (incremental lexers from the specs: Rust, C, TOML, CommonMark, shell) Tabula highlights with
     "unaos/libs/web/js_core", # JSCORE (SR55): ECMAScript 2025 from the specification, no_std, zero deps
 
     "unaos/libs/sys/elf_core", # STORMFAULT (B351): the ring-3 ELF segment plan both loaders share

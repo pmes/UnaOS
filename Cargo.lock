@@ -5088,6 +5088,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "syntax_core"
+version = "0.1.0"
+
+[[package]]
 name = "sysinfo"
 version = "0.39.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5158,7 +5162,9 @@ dependencies = [
  "glib",
  "gtk4",
  "libspelling",
+ "principia",
  "sourceview5",
+ "syntax_core",
  "tokio",
 ]
 

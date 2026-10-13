@@ -1,0 +1,12 @@
+#!/bin/sh
+# comment
+NAME="v$HOME" cmd --flag 2>&1 | grep -v x
+if [ -n "${NAME:-dflt}" ]; then echo "$(date +%s)`id -u`"; fi
+for f in a b; do printf '%s\n' "$f"; done
+cat <<'EOF' >out
+literal $x
+EOF
+cat <<-END
+	tab $USER \$y
+	END
+x=$((1 + y)) ; echo $'a\tb' $1

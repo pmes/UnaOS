@@ -11,6 +11,12 @@ gtk = ["dep:gtk4", "dep:glib", "dep:sourceview5", "dep:libspelling"]
 [dependencies]
 # EDITCORE (SR73): the UnaOS text-editing core — `TabulaDocument`'s buffer of record (no_std, zero deps).
 edit_core = { path = "../../unaos/libs/text/edit_core" }
+# SYNTAXCORE (SR89, R105): UnaOS's own syntax core — the grammar `TabulaDocument.syntax` holds and the spans
+# the GTK view paints as tags when `tabula.highlight` = core (no_std, zero deps; tree-sitter is OUT).
+syntax_core = { path = "../../unaos/libs/text/syntax_core" }
+# SYNTAXCORE: the `tabula.highlight` / `tabula.theme.*` preferences, read-only from Principia's store
+# (the Vein shape: `principia::PrefStore::load(principia::default_prefs_path())`).
+principia = { path = "../principia" }
 elessar = { path = "../../libs/elessar" }
 # TABULABUS (SR74): `tabula::ignite` serves the Editor verbs on the Synapse.
 bandy = { path = "../../libs/bandy" }
