@@ -825,7 +825,7 @@ pub static NMI_ON_IST: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// progress; it must stay leaf and lock-free (no run queues, no `current`, no spin locks). We
 /// only count, witness the IST switch, and return — that keeps `switch_context` NMI-reentrant-safe.
 extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
-    NMI_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    NMI_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed); super::stackguard::nmi_catch_up(_stack_frame.instruction_pointer.as_u64(), _stack_frame.cpu_flags.bits()); // KVMLAT (B598): a TLB shootdown's escalation NMI flushes and acks here (one load when none waits; GS-free, lock-free — this handler's contract). LINE-NEUTRAL fold, code first
     // Read the handler's own RSP and check it against the NMI IST bounds (GS-free — no per-CPU
     // lookup). If it falls inside a CPU's NMI IST stack, the unconditional IST switch happened.
     let rsp: u64;

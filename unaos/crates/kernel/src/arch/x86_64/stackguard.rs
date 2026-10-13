@@ -439,15 +439,15 @@ pub fn shootdown() -> (u32, u32) {
         spins += 1;
         core::hint::spin_loop();
     };
-    let us = if hz == 0 { 0 } else { crate::arch::now_cycles().wrapping_sub(t0) / (hz / 1_000_000).max(1) };
+    let acked = if acked < cpus { nmi_escalate(mask, g, me, hz, cpus) } else { acked }; let us = if hz == 0 { 0 } else { crate::arch::now_cycles().wrapping_sub(t0) / (hz / 1_000_000).max(1) }; // KVMLAT (B598): past the IPI bound the late cores get an NMI (file tail); `acked < cpus` below is now a FAULT — LINE-NEUTRAL fold, code first
     SHOOTS.fetch_add(1, Ordering::Relaxed);
     if acked < cpus {
         let t = SHOOT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
-        if t > 3 && t % 256 != 0 {
-            return (cpus, acked); // the first three, then one in 256: a masked core is a fact, not a flood (QUIETBOOT)
+        if t > 64 && t % 256 != 0 {
+            return (cpus, acked); // KVMLAT (B598): a FAULT is said the first 64 times, then one in 256 (the faulted core left the online set, so it cannot flood); was the first three (QUIETBOOT)
         }
         let missing = (0..MAX_CPUS).filter(|&c| mask & (1 << c) != 0 && SEEN_GEN[c].load(Ordering::Acquire) < g).fold(0u32, |m, c| m | (1 << c));
-        serial_println!("[tlb] shootdown pages=1 cpus={} acked={} us={} timeout=1 timeouts={} missing_mask={} (the tick catches them up)", cpus, acked, us, t, missing);
+        serial_println!("[tlb] shootdown FAULT pages=1 cpus={} acked={} us={} nmi=1 timeouts={} missing_mask={} (KVMLAT: neither the IPI nor the NMI was acked; the cores left the online set and flush at their next tick before they rejoin)", cpus, acked, us, t, missing);
     } else if !SHOOT_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[tlb] shootdown pages=1 cpus={} acked={} us={}", cpus, acked, us);
     }
@@ -623,7 +623,7 @@ fn stackroom2(n: u32) {
     let fail = ARM_FAIL.load(Ordering::Relaxed);
     let pass = fail == 0 && ARMED.load(Ordering::Relaxed) > 0 && ist != 0 && (ipi == "ok" || ipi == "solo");
     serial_println!(
-        ":: STACKROOM: tasks={} aps={} ist={} armed={} live={} failed={} ipi_flush={} shootdowns={} timeouts={} bsp={} page={} -> {} ::",
+        ":: STACKROOM: tasks={} aps={} ist={} armed={} live={} failed={} ipi_flush={} shootdowns={} timeouts={} escalated={} bsp={} page={} -> {} ::",
         n,
         aps.count_ones(),
         ist.count_ones(),
@@ -632,7 +632,7 @@ fn stackroom2(n: u32) {
         fail,
         ipi,
         SHOOTS.load(Ordering::Relaxed),
-        SHOOT_TIMEOUTS.load(Ordering::Relaxed),
+        SHOOT_TIMEOUTS.load(Ordering::Relaxed), SHOOT_NMI.load(Ordering::Relaxed), // KVMLAT (B598): `timeouts=` = shootdowns that FAULTED (neither IPI nor NMI acked); `escalated=` = completed by the NMI phase
         if b != 0 { "armed" } else { "owed" },
         PAGE,
         if pass { "PASS" } else { "FAIL" }
@@ -688,4 +688,108 @@ fn scratch_deep(d: u64) -> u64 {
         return 0;
     }
     scratch_deep(d + 1).wrapping_add(core::hint::black_box(&b)[7] as u64)
+}
+
+// ── KVMLAT (rmbp-ledger B598, arc row B614) — a missed shootdown ESCALATES to an NMI, then completes or FAULTS. ────────
+// FILE-TAIL append: nothing above this block moves (the `PT_LOCK`/`REG`/`ARM_WHY`/`BSP_WHY` construction sites are
+// LOCKREG names). QEMUIMAGE26 (one KVM boot, 6 vCPUs): `[tlb] shootdown … us=2000 timeout=1 … missing_mask=4` twice
+// (cpu 2, the worker core) and `missing_mask=33` once (cpus 0 and 5; 5 is the hid pump's core, whose own masked span
+// HIDSTALL measured at `masked_max_ms=9`), 23 of 371 in all, and `tests stackroom` read `ipi_flush=timeout`. The
+// fixed IPI is MASKABLE and the wait was ONE bound (SHOOT_BOUND_US, 2 ms of TSC): a core with IF=0 past it, or a vCPU
+// the host did not run inside it (the TSC keeps counting while a vCPU thread is descheduled), was left for its next
+// tick — the shootdown returned with that core's TLB still holding the old leaf over the new guard, said once in 256.
+// Now: past the IPI bound, every core still behind gets an NMI (IF-independent; `interrupts.rs`'s handler calls
+// [`nmi_catch_up`], which flushes and acks exactly as the IPI handler does), bounded at SHOOT_NMI_BOUND_US. A core that
+// acks neither is a FAULT: said on the wire every time (the first 64, then one in 256), and the core leaves the online
+// set, so it rejoins only through its next tick's `tlb_sync` — which flushes BEFORE it is IPI-able again and before
+// the scheduler on it dispatches anything new. The escalation names its own cause: `masked_mask=` = the cores the NMI
+// found with IF=0 (a guest masked hold: `rip=` is where), the rest of `nmi_mask=` were IF=1 (the IPI was late, not
+// refused: a vCPU not run by the host).
+//   `[tlb] shootdown escalated nmi_mask=<m> acked=<n>/<k> masked_mask=<m> rip=<hex|-> nmi_us=<us> escalations=<n>`
+//   `[tlb] shootdown FAULT pages=1 cpus=<n> acked=<n> us=<us> nmi=1 timeouts=<n> missing_mask=<m> (…)`
+//   `:: STACKROOM: … ipi_flush=ok shootdowns=<n> timeouts=0 escalated=<n> … -> PASS ::`
+
+/// The NMI phase's bound: a vCPU the host descheduled is run again well inside it; a core that cannot take an NMI
+/// in 100 ms is parked (SMM, a hardware wedge), and the shootdown says so instead of waiting on it.
+const SHOOT_NMI_BOUND_US: u64 = 100_000;
+/// Shootdowns completed by the NMI phase.
+static SHOOT_NMI: AtomicU32 = AtomicU32::new(0);
+/// Cores an escalation is waiting on (the NMI handler's gate: an NMI for anything else costs one load).
+static ESC_MASK: AtomicU32 = AtomicU32::new(0);
+/// Cores the escalation's NMI found with IF=0, and where each was.
+static NMI_MASKED: AtomicU32 = AtomicU32::new(0);
+static NMI_RIP: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// The cores in `mask` whose ack generation is still below `g`.
+#[inline]
+fn behind(mask: u32, g: u64) -> u32 {
+    (0..MAX_CPUS).filter(|&c| mask & (1 << c) != 0 && SEEN_GEN[c].load(Ordering::Acquire) < g).fold(0u32, |m, c| m | (1 << c))
+}
+
+/// [`shootdown`] past its IPI bound: NMI every core still behind `g`, wait (bounded) for their acks, name what the
+/// NMI found, and drop a core that never acked from the online set. Returns the acked count (`cpus` = complete).
+fn nmi_escalate(mask: u32, g: u64, me: usize, hz: u64, cpus: u32) -> u32 {
+    let late = behind(mask, g);
+    if late == 0 {
+        return cpus; // the last ack landed between the bound and here
+    }
+    NMI_MASKED.fetch_and(!late, Ordering::AcqRel);
+    ESC_MASK.fetch_or(late, Ordering::AcqRel);
+    let t0 = crate::arch::now_cycles();
+    for c in (0..MAX_CPUS).filter(|c| late & (1 << c) != 0) {
+        if let Some(p) = super::percpu::cpu(c) {
+            let id = p.apic_id;
+            crate::arch::without_interrupts(|| super::apic::send_ipi(id, 0x0000_4400)); // level-assert | delivery mode 100b (NMI): `syscall::nmi_self_fire`'s word
+        }
+    }
+    let bound = if hz == 0 { 0 } else { hz / 1_000_000 * SHOOT_NMI_BOUND_US };
+    let mut spins = 0u64;
+    let left = loop {
+        let left = behind(late, g);
+        if left == 0 {
+            break 0;
+        }
+        let over = if hz == 0 { spins > 100_000_000 } else { crate::arch::now_cycles().wrapping_sub(t0) > bound };
+        if over {
+            break left;
+        }
+        tlb_catch_up(me);
+        spins += 1;
+        core::hint::spin_loop();
+    };
+    ESC_MASK.fetch_and(!late, Ordering::AcqRel);
+    if left != 0 {
+        ONLINE.fetch_and(!left, Ordering::AcqRel); // FAULT: rejoins through its next tick's `tlb_sync` (flush first)
+    }
+    let n = SHOOT_NMI.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n % 256 == 0 || left != 0 {
+        let masked = NMI_MASKED.load(Ordering::Acquire) & late;
+        let rip = (0..MAX_CPUS).find(|&c| masked & (1 << c) != 0).map(|c| NMI_RIP[c].load(Ordering::Relaxed));
+        let us = if hz == 0 { 0 } else { crate::arch::now_cycles().wrapping_sub(t0) / (hz / 1_000_000).max(1) };
+        match rip {
+            Some(r) => serial_println!("[tlb] shootdown escalated nmi_mask={} acked={}/{} masked_mask={} rip={:#x} nmi_us={} escalations={} (KVMLAT: past the {} us IPI bound)", late, (late & !left).count_ones(), late.count_ones(), masked, r, us, n, SHOOT_BOUND_US),
+            None => serial_println!("[tlb] shootdown escalated nmi_mask={} acked={}/{} masked_mask=0 rip=- nmi_us={} escalations={} (KVMLAT: past the {} us IPI bound; IF=1 at the NMI: the IPI was late, not refused)", late, (late & !left).count_ones(), late.count_ones(), us, n, SHOOT_BOUND_US),
+        }
+    }
+    cpus - left.count_ones()
+}
+
+/// The NMI handler's half (`interrupts.rs` `nmi_handler`, every NMI): if an escalation is waiting on THIS core, flush
+/// and ack — the IPI handler's [`tlb_catch_up`], which is atomics and CR4/CR3 writes only. GS-free (the core is found
+/// by its LAPIC id), lock-free, no print: NMI context. `rflags` is the interrupted context's (IF = bit 9).
+#[inline]
+pub fn nmi_catch_up(rip: u64, rflags: u64) {
+    let esc = ESC_MASK.load(Ordering::Acquire);
+    if esc == 0 {
+        return;
+    }
+    let id = super::apic::apic_id_u32();
+    let Some(cpu) = (0..MAX_CPUS).find(|&c| esc & (1 << c) != 0 && super::percpu::cpu(c).is_some_and(|p| p.apic_id == id)) else { return };
+    if SEEN_GEN[cpu].load(Ordering::Relaxed) < TLB_GEN.load(Ordering::Acquire) {
+        NMI_RIP[cpu].store(rip, Ordering::Relaxed);
+        if rflags & (1 << 9) == 0 {
+            NMI_MASKED.fetch_or(1 << cpu, Ordering::AcqRel);
+        }
+    }
+    tlb_catch_up(cpu);
 }
