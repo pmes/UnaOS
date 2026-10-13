@@ -341,3 +341,5 @@ pub mod queuesleep; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod 
 #[cfg(feature = "aether")]
 pub mod aether;
 #[cfg(all(feature = "una", target_arch = "x86_64"))] pub mod unaapp; // UNAMETAL (LEDGER SR90): `tests una` — APPS/UNA.ELF, the ring-3 IDE (tree + edit_core editor + midden_core console), driven and read back. Tail statement, so no existing line moves.
+// POINTERFEEL (rmbp-ledger B535, R103 §2): `tests pointerfeel` — the trackpad's real report stream under a finger, its gaps named by holder; the mode re-assert bound; the login gap's holder. Tail statement, so no existing line moves.
+pub mod pointerfeel;

@@ -412,7 +412,7 @@ fn write_log(data: &[u8]) -> Result<usize, crate::fs::fat::FatError> {
 /// block device is present, flush the captured log to `/UNAOS.LOG`: the first time storage comes up,
 /// and thereafter whenever the ring has grown since the last successful flush (throttled). Honest-and-
 /// silent: one witness on the first success, one on failure; never panics, never blocks boot.
-pub fn service() {
+pub fn service() { #[cfg(feature = "unafs")] if worker::off_this_task() { return; } // POINTERFEEL (B535): once handed, the `flightrec` worker is the only caller that runs the body (LINE-NEUTRAL fold, code first)
     static LAST_FLUSHED: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = never flushed
     static ITERS: AtomicUsize = AtomicUsize::new(0);
     static ANNOUNCED: AtomicBool = AtomicBool::new(false);
@@ -439,7 +439,7 @@ pub fn service() {
     // and already holding the xHCI loan. Idempotent: one acquire load after the first call, re-armed
     // only when a new device claims the global slot.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-    crate::drivers::block::evaluate_boot_medium_once(); if crate::fs::bootlog::divert(snapshot) { return; } // ROOTDISK2 (B401, R99): no UNAOS.LOG reservation on the sacred boot FAT — the ring flushes to /var/log/boot-<n>.log on UnaFS
+    crate::drivers::block::evaluate_boot_medium_once(); if crate::fs::bootlog::divert(snapshot) { #[cfg(feature = "unafs")] worker::hand(); return; } // POINTERFEEL (B535): the FRGUARD verdict is derived (above, inline, on this first storage pass), so the body leaves the hid pump's core from here. ROOTDISK2 (B401, R99): no UNAOS.LOG reservation on the sacred boot FAT — the ring flushes to /var/log/boot-<n>.log on UnaFS
 
     // FRGUARD (GR21): do not even ATTEMPT a reservation on a volume the block layer will refuse to
     // write. The refusal would surface anyway — every mutating path below ends at `write_block` /
@@ -615,4 +615,92 @@ pub fn panic_tail(out: &mut [u8]) -> usize {
     let k = out.len().min(t.bytes.len());
     out[..k].copy_from_slice(&t.bytes[t.bytes.len() - k..]);
     k
+}
+
+// ── POINTERFEEL (rmbp-ledger B535) — the flight-recorder STEP leaves the hid pump's core. FILE-TAIL append. ─────────────
+//
+// THE WIRE. `[hid] stall census holder=usb-pump:flight-recorder n=15 worst_ms=234` (flight 31 boot 2; n=47 worst 199 on
+// boot 1, n=51 worst 161 on flight 30) — AFTER SMALLFIX8 moved the boot-log WRITE to its own `bootlog-flush` worker
+// (`fs/bootlog.rs` `off_pump`). The holder is the `usb-pump` task inside its `P_FLIGHT` step (`video/lag.rs`
+// `pump_next(P_CONSOLE) = P_FLIGHT`), and that step is `service()` (`main.rs` usb_pump: `flight_recorder::service();
+// bootwit::service(); pump_seg(P_FLIGHT)`). It is NOT the capture tap: `serial.rs` calls `capture` →
+// `boot_ring::capture`, a `try_lock` + memcpy that stages on contention and never touches storage (boot_ring.rs:359).
+// What remains in the step on a UnaFS build is the body ahead of `divert` — `serial_ring::mirror_service` (the residual
+// drain, the census polls, the `[sertx]` rollup), `fs::removable::service` (USBSTOR: a registry change re-surveys and
+// mounts — sector reads, the storage loan) and the FRGUARD derivation — and every one of them is contracted "unmasked,
+// lock-free" but none is contracted "fast"; whichever of them blocks, it blocks on the core the `hid-pump` shares.
+//
+// THE MOVE. After the first storage pass (FRGUARD's verdict derived INLINE, ahead of every Default writer on that pass,
+// exactly as before), the body runs on ONE `flightrec` task on `smp::xhci_worker_cpu(0)` (a core apart from the render
+// and service cores — USBSTOR's reads may take the xHCI loan — and never the hid pump's), every
+// [`worker::PACE_MS`]; the pump's step is then one relaxed load. UnaFS builds only: on a FAT root the recorder's
+// reservation keeps its single-writer ordering contract with the `U*` ladder (this file's header), which a second core
+// would break. No such core → it stays inline, as before. Wire: `[flight] service on=worker cpu=<c> pace_ms=<n>` once;
+// `tests pointerfeel` carries `fr=worker:c<n> fr_worst_ms=<n>` (the body's longest pass on the worker).
+
+/// `(worker cpu or usize::MAX when inline, the body's longest worker pass in ms)` — `tests pointerfeel`.
+pub fn worker_state() -> (usize, u64) {
+    #[cfg(feature = "unafs")]
+    return (worker::cpu(), worker::worst_ms());
+    #[allow(unreachable_code)]
+    (usize::MAX, 0)
+}
+
+#[cfg(feature = "unafs")]
+mod worker {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// The worker's pace between body passes (the pump's ~1 ms nap; the body is cheap when idle).
+    pub const PACE_MS: u64 = 1;
+    static CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static WORST_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn cpu() -> usize {
+        CPU.load(Ordering::Acquire)
+    }
+
+    pub fn worst_ms() -> u64 {
+        WORST_MS.load(Ordering::Relaxed)
+    }
+
+    /// The worker's task id (0 = not running): the body's owner once handed.
+    static OWNER: AtomicU64 = AtomicU64::new(0);
+
+    /// `service()`'s first statement: `true` = the body belongs to the worker and this caller is not it (by task id,
+    /// so a migrated worker still owns it).
+    #[inline]
+    pub fn off_this_task() -> bool {
+        let o = OWNER.load(Ordering::Acquire);
+        o != 0 && crate::arch::sched::current_id() != Some(o)
+    }
+
+    /// Start the worker once (from the body, on the first storage pass); no eligible core = stay inline.
+    pub fn hand() {
+        static TRIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if TRIED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pump = crate::hidstall::pump_cpu();
+        let Some(c) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != pump) else {
+            serial_println!("[flight] service on=inline why=no-worker-core (POINTERFEEL: the step stays on the usb-pump) ::");
+            return;
+        };
+        crate::arch::sched::spawn("flightrec", run, 0, c, crate::arch::sched::PRIO_NORMAL);
+        serial_println!("[flight] service on=worker cpu={} pace_ms={} hid_pump_cpu={} (POINTERFEEL: the flight-recorder step leaves the hid pump's core) ::", c, PACE_MS, pump);
+    }
+
+    fn run(_: usize) {
+        let Some(id) = crate::arch::sched::current_id() else {
+            serial_println!("[flight] service on=inline why=worker-has-no-task-id (POINTERFEEL) ::");
+            crate::arch::sched::exit();
+        };
+        CPU.store(crate::arch::sched::meter_current_cpu(), Ordering::Release);
+        OWNER.store(id, Ordering::Release);
+        loop {
+            let t0 = crate::arch::ms();
+            super::service();
+            WORST_MS.fetch_max(crate::arch::ms().saturating_sub(t0), Ordering::Relaxed);
+            crate::arch::sched::sleep_ms(PACE_MS);
+        }
+    }
 }
