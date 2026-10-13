@@ -1,0 +1,180 @@
+// DESIGNAPPLY (B639) evidence: a host copy of video/desktop.rs's pure shadow-tile functions. Build: rustc -O --edition 2021 --crate-name tilecheck tilecheck.rs.txt -o tilecheck && ./tilecheck  (output: tilecheck.out)
+// It reads no kernel state: the elevation table is CRAFT.elev as applied, px = pt x scale (dpi::px_at).
+fn isqrt(n: u64) -> u64 {
+    if n < 2 { return n; }
+    let mut x = 1u64 << (64 - n.leading_zeros()).div_ceil(2);
+    loop { let y = (x + n / x) / 2; if y >= x { return x; } x = y; }
+}
+fn px_at(n: usize, s2: u32) -> usize { (n * s2 as usize + 1) / 2 }
+#[derive(Clone, Copy)] struct Layer { dy: usize, blur: usize, alpha: u32 }
+const fn ly(dy: usize, blur: usize, alpha: u32) -> Layer { Layer { dy, blur, alpha } }
+const NO: Layer = ly(0, 0, 0);
+const ELEV: [[[Layer; 2]; 2]; 4] = [
+    [[ly(1, 2, 36), ly(0, 1, 26)], [ly(1, 2, 102), NO]],
+    [[ly(0, 2, 31), ly(8, 24, 46)], [ly(0, 2, 77), ly(8, 24, 115)]],
+    [[ly(0, 2, 31), ly(16, 40, 66)], [ly(0, 2, 102), ly(16, 40, 140)]],
+    [[ly(0, 2, 20), ly(8, 20, 36)], [ly(0, 2, 77), ly(8, 20, 89)]],
+];
+fn layers_px(level: usize, dark: bool, s2: u32) -> [(i32, i32, u32); 2] {
+    let mut out = [(0i32, 0i32, 0u32); 2];
+    for (k, l) in ELEV[level][dark as usize].iter().enumerate() {
+        if l.alpha == 0 || l.blur == 0 { continue; }
+        let px = |n: usize| px_at(n, s2) as i32;
+        out[k] = (px(l.dy), px(l.blur).max(1), l.alpha.min(255));
+    }
+    out
+}
+fn margins(level: usize, dark: bool, s2: u32) -> (i32, i32, i32) {
+    let (mut t, mut s, mut b) = (0i32, 0i32, 0i32);
+    for &(dy, bl, a) in layers_px(level, dark, s2).iter() {
+        if a == 0 { continue; }
+        s = s.max(bl); t = t.max(bl - dy); b = b.max(bl + dy);
+    }
+    (t, s, b)
+}
+fn fall(sd4: i64, blur: i32, alpha: u32) -> u32 {
+    let b4 = 4 * blur as i64;
+    let t = (((sd4 + b4).clamp(0, 2 * b4) << 16) / (2 * b4).max(1)) as u64;
+    let ss = (t * t >> 16) * (3 * 65536 - 2 * t) >> 16;
+    ((alpha as u64 * (65536 - ss.min(65536)) + 32768) >> 16) as u32
+}
+fn sd_corner(qx: i64, qy: i64, r4: i64) -> i64 {
+    let (ox, oy) = (qx.max(0), qy.max(0));
+    let out = isqrt((ox * ox + oy * oy) as u64) as i64;
+    out + qx.max(qy).min(0) - r4
+}
+fn combine(ls: &[(i32, i32, u32); 2], mut each: impl FnMut(i32, i32) -> i64) -> u8 {
+    let mut keep = 255u32;
+    for &(dy, bl, a) in ls.iter() {
+        if a == 0 { continue; }
+        let ak = fall(each(dy, bl), bl, a);
+        keep = keep * (255 - ak.min(255)) / 255;
+    }
+    (255 - keep) as u8
+}
+struct Tiles { top: i32, side: i32, bot: i32, r: i32, cw: i32, th: i32, bh: i32, top_c: Vec<u8>, bot_c: Vec<u8>, side_r: Vec<u8>, top_r: Vec<u8>, bot_r: Vec<u8> }
+fn build(level: usize, dark: bool, s2: u32, r: i32) -> Tiles {
+    let ls = layers_px(level, dark, s2);
+    let (top, side, bot) = margins(level, dark, s2);
+    let dymax = ls.iter().map(|l| l.0).max().unwrap_or(0);
+    let (cw, th, bh) = (side + r, top + r + dymax, r + bot);
+    let (cwu, thu, bhu) = (cw as usize, th as usize, bh as usize);
+    let (mut top_c, mut bot_c, mut side_r, mut top_r, mut bot_r) = (vec![0u8; thu * cwu], vec![0u8; bhu * cwu], vec![0u8; cwu], vec![0u8; thu], vec![0u8; bhu]);
+    let r4 = 4 * r as i64;
+    let (x0, yt, yb) = (4 * side as i64, 4 * top as i64, 4 * r as i64);
+    for v in 0..thu {
+        let py = 4 * v as i64 + 2;
+        for u in 0..cwu {
+            let px = 4 * u as i64 + 2;
+            top_c[v * cwu + u] = combine(&ls, |dy, _| { let (cx, cy) = (x0 + r4, yt + 4 * dy as i64 + r4); sd_corner(cx - px, cy - py, r4) });
+        }
+        top_r[v] = combine(&ls, |dy, _| yt + 4 * dy as i64 - py);
+    }
+    for w in 0..bhu {
+        let py = 4 * w as i64 + 2;
+        for u in 0..cwu {
+            let px = 4 * u as i64 + 2;
+            bot_c[w * cwu + u] = combine(&ls, |dy, _| { let (cx, cy) = (x0 + r4, yb + 4 * dy as i64 - r4); sd_corner(cx - px, py - cy, r4) });
+        }
+        bot_r[w] = combine(&ls, |dy, _| py - (yb + 4 * dy as i64));
+    }
+    for u in 0..cwu { let px = 4 * u as i64 + 2; side_r[u] = combine(&ls, |_, _| x0 - px); }
+    Tiles { top, side, bot, r, cw, th, bh, top_c, bot_c, side_r, top_r, bot_r }
+}
+struct Cast<'a> { x0: i32, y0: i32, x1: i32, y1: i32, t: &'a Tiles }
+impl Cast<'_> {
+    fn for_each_alpha(&self, y: i32, a: i32, b: i32, mut f: impl FnMut(i32, u32)) {
+        let t = self.t;
+        if y < self.y0 - t.top || y >= self.y1 + t.bot { return; }
+        let cw = t.cw as usize;
+        let (tile_row, ramp): (&[u8], u32) = if y < self.y0 - t.top + t.th {
+            let ri = (y - (self.y0 - t.top)) as usize;
+            (t.top_c.get(ri * cw..(ri + 1) * cw).unwrap_or(&[]), t.top_r.get(ri).copied().unwrap_or(0) as u32)
+        } else if y >= self.y1 - t.r {
+            let ri = (y - (self.y1 - t.r)) as usize;
+            (t.bot_c.get(ri * cw..(ri + 1) * cw).unwrap_or(&[]), t.bot_r.get(ri).copied().unwrap_or(0) as u32)
+        } else { (&t.side_r[..], 0) };
+        if tile_row.len() < cw { return; }
+        let (lx0, rx1) = (self.x0 - t.side, self.x1 + t.side);
+        let (lx1, rx0) = (lx0 + t.cw, rx1 - t.cw);
+        for x in a.max(lx0)..b.min(lx1) { f(x, tile_row[(x - lx0) as usize] as u32); }
+        if ramp != 0 { for x in a.max(lx1)..b.min(rx0) { f(x, ramp); } }
+        for x in a.max(rx0).max(lx1)..b.min(rx1) { f(x, tile_row[(rx1 - 1 - x) as usize] as u32); }
+    }
+    fn alpha(&self, x: i32, y: i32) -> u32 {
+        let t = self.t;
+        let (row, ri) = if y < self.y0 - t.top || y >= self.y1 + t.bot { return 0; }
+            else if y < self.y0 - t.top + t.th { (0u8, y - (self.y0 - t.top)) }
+            else if y >= self.y1 - t.r { (1, y - (self.y1 - t.r)) } else { (2, 0) };
+        let (corner, ci) = if x < self.x0 - t.side || x >= self.x1 + t.side { return 0; }
+            else if x < self.x0 - t.side + t.cw { (true, x - (self.x0 - t.side)) }
+            else if x >= self.x1 + t.side - t.cw { (true, (self.x1 + t.side - 1) - x) } else { (false, 0) };
+        let (cw, ci, ri) = (t.cw as usize, ci as usize, ri as usize);
+        let a = match (row, corner) {
+            (0, true) => t.top_c.get(ri * cw + ci), (1, true) => t.bot_c.get(ri * cw + ci), (2, true) => t.side_r.get(ci),
+            (0, false) => t.top_r.get(ri), (1, false) => t.bot_r.get(ri), _ => None };
+        a.copied().unwrap_or(0) as u32
+    }
+}
+fn main() {
+    let mut bad = 0;
+    for &s2 in &[2u32, 3, 4, 5] {
+        for level in [2usize, 3] {
+            for dark in [false, true] {
+                let r = px_at(12, s2) as i32;
+                let t = build(level, dark, s2, r);
+                let (mt, ms, mb) = margins(level, dark, s2);
+                let bytes = t.top_c.len() + t.bot_c.len() + t.side_r.len() + t.top_r.len() + t.bot_r.len();
+                // a 900x600 pt window
+                let (w, h) = (px_at(900, s2) as i32, px_at(600, s2) as i32);
+                let c = Cast { x0: 1000, y0: 1000, x1: 1000 + w, y1: 1000 + h, t: &t };
+                // continuity: max jump between neighbours over the ring
+                let mut maxjump = 0i32; let mut maxa = 0; let mut nonzero_outside = 0;
+                let mut area = 0u64;
+                for y in (c.y0 - mt - 2)..(c.y1 + mb + 2) {
+                    for x in (c.x0 - ms - 2)..(c.x1 + ms + 2) {
+                        let inside_box = x >= c.x0 && x < c.x1 && y >= c.y0 && y < c.y1;
+                        let a = c.alpha(x, y) as i32;
+                        if !inside_box {
+                            area += 1;
+                            maxa = maxa.max(a);
+                            let ax = c.alpha(x + 1, y) as i32; let ay = c.alpha(x, y + 1) as i32;
+                            let nb_in = |x: i32, y: i32| x >= c.x0 && x < c.x1 && y >= c.y0 && y < c.y1;
+                            if !nb_in(x + 1, y) { maxjump = maxjump.max((a - ax).abs()); }
+                            if !nb_in(x, y + 1) { maxjump = maxjump.max((a - ay).abs()); }
+                            if (y < c.y0 - mt || y >= c.y1 + mb || x < c.x0 - ms || x >= c.x1 + ms) && a != 0 { nonzero_outside += 1; }
+                        }
+                    }
+                }
+                // profiles
+                let mx = (c.x0 + c.x1) / 2;
+                let below: Vec<u32> = (0..mb).step_by((mb as usize / 8).max(1)).map(|k| c.alpha(mx, c.y1 + k)).collect();
+                let above: Vec<u32> = (1..=mt.max(1)).step_by((mt as usize / 6).max(1)).map(|k| c.alpha(mx, c.y0 - k)).collect();
+                let side: Vec<u32> = (1..=ms).step_by((ms as usize / 6).max(1)).map(|k| c.alpha(c.x0 - k, (c.y0 + c.y1) / 2)).collect();
+                let last_below = c.alpha(mx, c.y1 + mb - 1);
+                let corner_px = c.alpha(c.x0, c.y0);
+                let mut mono = true;
+                let mut prev = 999;
+                for k in 0..mb { let a = c.alpha(mx, c.y1 + k); if a > prev { mono = false; } prev = a; }
+                println!("s2={} {} dark={} margin={}/{}/{} r={} tiles={}B ring_px={} maxa={} maxjump={} out_nonzero={} corner(0,0)={} last_below={} mono={} below={:?} above={:?} side={:?}",
+                    s2, if level == 2 { "elev.3 " } else { "elev.3i" }, dark as u8, mt, ms, mb, r, bytes, area, maxa, maxjump, nonzero_outside, corner_px, last_below, mono, below, above, side);
+                if nonzero_outside > 0 || !mono || last_below > 2 || maxjump > 24 { bad += 1; }
+            }
+        }
+    }
+    let mut diff = 0u64; let mut n = 0u64;
+    for &s2 in &[2u32, 4] { for level in [2usize, 3] { for dark in [false, true] {
+        let r = px_at(12, s2) as i32; let t = build(level, dark, s2, r);
+        for &(w, h) in &[(900i32, 600i32), (60, 40), (2 * t.cw - 3, 2 * t.r + 5), (300, 120)] {
+            let c = Cast { x0: 500, y0: 400, x1: 500 + w, y1: 400 + h, t: &t };
+            for y in (c.y0 - t.top - 3)..(c.y1 + t.bot + 3) {
+                let mut row = vec![0u32; (w + 2 * t.side + 10) as usize];
+                let x0 = c.x0 - t.side - 5;
+                c.for_each_alpha(y, x0, x0 + row.len() as i32, |x, a| row[(x - x0) as usize] = a);
+                for (i, &a) in row.iter().enumerate() { n += 1; if a != c.alpha(x0 + i as i32, y) { diff += 1; } }
+            }
+        }
+    }}}
+    println!("equivalence: px={} diff={}", n, diff);
+    println!("bad={}", bad);
+}
