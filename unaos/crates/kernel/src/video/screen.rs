@@ -1715,7 +1715,7 @@ impl Screen {
             let nw = super::wm::occluders(&mut occ); // WINDOWCAP-2: straight into the growable list
             let mut n = nw;
             let mut strips = [None; super::strip::STRIP_MAX];
-            let _ = super::strip::rects(self.info.width, self.info.height, &mut strips);
+            let _ = super::strip::rects(self.info.width, self.info.height, &mut strips); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !super::wm::fbdirect::strips_paint() { strips = [None; super::strip::STRIP_MAX]; } // SPLASHWORD2 (rmbp-ledger B544) ⚠ SAME-LINE fold, line-NEUTRAL: a strip withholds its rows from the desktop only while something PAINTS them (`strip::compose_all`'s own gate, `fbdirect::strips_paint`). Before the desktop is built the dock's `strip_rect` still answers its pinned layout (centred, bottom) though nothing paints there, so every desktop present — the splash close's drain request and FBDIRECT's hand-back — skipped exactly the rows "Resolving the session" stood on (flight 32 boot 2)
             for s in strips.iter().flatten() {
                 if s.2 != 0 && s.3 != 0 {
                     occ.push(*s);
