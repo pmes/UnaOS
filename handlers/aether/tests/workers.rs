@@ -25,6 +25,14 @@
 //! 12. `unhandledrejection` / `rejectionhandled` at the worker global;
 //! 13. nested workers under the parent's captured URL, origin and CSP, terminated with it.
 //!
+//! AETHERWORKERS3 (LEDGER SR129):
+//!
+//! 14. a SharedWorker outlives the document that started it, serves a second document's `connect`, and ends
+//!     when its last client port closes;
+//! 15. the worker script is fetched on the worker's thread (`new Worker()` returns before a slow script
+//!     arrives) and the worker's CSP is its script response's (`eval`, `fetch`, `importScripts`), not the
+//!     document's;
+//! 16. a `data:` worker has an opaque origin: IndexedDB and the Cache API refuse with SecurityError;
 //! No WPT: the seat runs the suites. Storage lives under CARGO_TARGET_TMPDIR.
 
 use std::io::{Read, Write};
@@ -420,23 +428,25 @@ fn a_worker_script_is_fetched_as_a_worker_and_must_be_javascript() {
 
 /// A worker creates workers: the child's URL resolves against the parent worker's location, its messages
 /// arrive at the parent's `Worker` object, a cross-origin child is a simple `error` at the parent, a `data:`
-/// child is refused by the document's CSP (`worker-src 'self'`) that the parent captured, and terminating the
-/// parent terminates the child.
+/// child is refused by the parent's CSP (`worker-src 'self'`), and terminating the parent terminates the child.
+///
+/// AETHERWORKERS3 (SR129): the parent's policy is its OWN — the `Content-Security-Policy` header of its script
+/// response (HTML §10.2.4 step 13.3), which the fixture now sends; the document's `<meta>` policy governs only
+/// the parent's own fetch. (Under AETHERWORKERS2 the parent captured the document's policy instead.)
 #[test]
 fn a_worker_creates_nested_workers_under_its_captured_context() {
-    let port = server(|path| match path {
-        "/w/parent.js" => Some((
-            "text/javascript",
+    let port = server_ex(|path| match path {
+        "/w/parent.js" => Some(Fixture::js(
             "var c = new Worker('child.js', { name: 'kid' });
              c.onmessage = function (e) { postMessage('child:' + e.data); };
              var x = new Worker('http://elsewhere.invalid/x.js');
              x.onerror = function (e) { postMessage('xo:' + e.constructor.name); };
              var d = new Worker('data:text/javascript,postMessage(1)');
              d.onmessage = function () { postMessage('csp:ran'); };
-             d.onerror = function (e) { postMessage('csp:' + e.type); };"
-                .into(),
-        )),
-        "/w/child.js" => Some(("text/javascript", "postMessage(location.pathname + '|' + name); setInterval(function () {}, 5);".into())),
+             d.onerror = function (e) { postMessage('csp:' + e.type); };",
+        )
+        .header("Content-Security-Policy", "worker-src 'self'")),
+        "/w/child.js" => Some(Fixture::js("postMessage(location.pathname + '|' + name); setInterval(function () {}, 5);")),
         _ => None,
     });
     init();
@@ -559,4 +569,197 @@ fn a_worker_fires_unhandledrejection_and_rejectionhandled() {
     );
     let mut p = page(PAGE, &format!("var got = []; var w = new Worker('{w}'); w.onmessage = function (e) {{ got.push(e.data); }};"));
     assert_eq!(run_until(&mut p, "got.length >= 2", "got.join(',')", 20), "un:r1:true:true:true,handled:r1");
+}
+
+// ------------------------------------------------------------------------------ AETHERWORKERS3 (SR129) fixtures
+
+/// A fixture response: content type, extra headers, body, and a delay before the answer.
+struct Fixture {
+    ctype: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+    delay_ms: u64,
+}
+
+impl Fixture {
+    fn js(body: &str) -> Fixture {
+        Fixture { ctype: "text/javascript", headers: Vec::new(), body: body.to_string(), delay_ms: 0 }
+    }
+    fn text(body: &str) -> Fixture {
+        Fixture { ctype: "text/plain", headers: Vec::new(), body: body.to_string(), delay_ms: 0 }
+    }
+    fn header(mut self, k: &'static str, v: &str) -> Fixture {
+        self.headers.push((k, v.to_string()));
+        self
+    }
+    fn delayed(mut self, ms: u64) -> Fixture {
+        self.delay_ms = ms;
+        self
+    }
+}
+
+/// [`server`] whose routes answer a [`Fixture`] (extra headers, a delay); 404 otherwise.
+fn server_ex(route: fn(&str) -> Option<Fixture>) -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut tmp) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split(' ').nth(1).unwrap_or("/").split('?').next().unwrap_or("/").to_string();
+                let (status, f) = match route(&path) {
+                    Some(f) => ("200 OK", f),
+                    None => ("404 Not Found", Fixture::text("no")),
+                };
+                if f.delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(f.delay_ms));
+                }
+                let extra: String = f.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 {status}\r\nContent-Type: {}\r\n{extra}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+                    f.ctype,
+                    f.body.len(),
+                    f.body
+                );
+                let _ = c.flush();
+            });
+        }
+    });
+    port
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS3 (SR129) item 1
+
+/// HTML §10.2.6.4 / §10.2.3: a SharedWorker started by document A serves document B's `connect` (one realm:
+/// its connection counter reaches 2; `name`, a SharedWorkerGlobalScope, `e.source` the connect port), keeps
+/// running after A's thread ends and A retires, and is terminated when B — its last client — closes its port.
+#[test]
+fn a_shared_worker_outlives_its_first_document_and_ends_with_its_last_port() {
+    let w = data_url(
+        "var n = 0;
+         onconnect = function (e) {
+             n++;
+             var p = e.ports[0];
+             var src = e.source === p;
+             p.onmessage = function (m) { p.postMessage([m.data, n, name, String(self), src, typeof postMessage].join(':')); };
+         };",
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let wa = w.clone();
+    let a = std::thread::spawn(move || {
+        let mut p = page(PAGE, &format!("var a = null; var sw = new SharedWorker('{wa}', 'outlive'); sw.port.onmessage = function (e) {{ a = e.data; }}; sw.port.postMessage('A');"));
+        let got = run_until(&mut p, "a !== null", "a", 20);
+        tx.send(got).unwrap();
+        // Document A stays alive until B has connected; then this thread ends and A retires.
+        let _ = go_rx.recv_timeout(Duration::from_secs(30));
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(30)).unwrap(), "A:1:outlive:[object SharedWorkerGlobalScope]:true:undefined");
+    let mut b = page(PAGE, &format!("var b = []; var sw = new SharedWorker('{w}', {{ name: 'outlive' }}); sw.port.onmessage = function (e) {{ b.push(e.data); }}; sw.port.postMessage('B1');"));
+    assert_eq!(run_until(&mut b, "b.length >= 1", "b[0]", 20), "B1:2:outlive:[object SharedWorkerGlobalScope]:true:undefined", "B connects to A's worker");
+    go_tx.send(()).unwrap();
+    a.join().unwrap();
+    eval(&mut b, "sw.port.postMessage('B2');");
+    assert_eq!(run_until(&mut b, "b.length >= 2", "b[1]", 20), "B2:2:outlive:[object SharedWorkerGlobalScope]:true:undefined", "the worker outlived document A");
+    assert!(aether::workers::shared::is_running(&w, "outlive"), "still registered while B is a client");
+    eval(&mut b, "sw.port.close();");
+    let end = Instant::now() + Duration::from_secs(5);
+    while aether::workers::shared::is_running(&w, "outlive") {
+        assert!(Instant::now() < end, "the shared worker did not end with its last client port");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A different name is a different worker; a type mismatch for a running one is an error at the object.
+    let mut c = page(
+        PAGE,
+        &format!(
+            "var r = null; var k1 = new SharedWorker('{w}', 'kind'); k1.port.start();
+             var k2 = new SharedWorker('{w}', {{ name: 'kind', type: 'module' }});
+             k2.onerror = function (e) {{ r = e.type; }};"
+        ),
+    );
+    assert_eq!(run_until(&mut c, "r !== null", "r", 20), "error");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS3 (SR129) item 2
+
+/// The worker script is fetched on the worker's own thread: `new Worker()` returns at once although the script
+/// answers after 1.5 s. The worker's policy container is its script response's (HTML §10.2.4 step 13.3):
+/// a worker served with `script-src 'self'; connect-src 'none'` cannot `eval`, `fetch` or `importScripts` a
+/// `data:` URL, while a worker served with no policy, in a document whose `<meta>` policy forbids `eval`
+/// and every connection, can do both.
+#[test]
+fn a_worker_fetches_its_script_on_its_own_thread_and_takes_its_own_csp() {
+    let port = server_ex(|path| match path {
+        "/csp/strict.js" => Some(
+            Fixture::js(
+                "var out = [];
+                 try { eval('1'); out.push('eval:ok'); } catch (e) { out.push('eval:' + e.name); }
+                 try { importScripts('lib.js'); out.push('import:' + lib()); } catch (e) { out.push('import:' + e.name); }
+                 try { importScripts('data:text/javascript,1'); out.push('import-data:ok'); } catch (e) { out.push('import-data:' + e.name); }
+                 fetch('data.txt').then(function (r) { out.push('fetch:' + r.status); postMessage(out.join(',')); },
+                                        function (e) { out.push('fetch:' + e.name); postMessage(out.join(',')); });",
+            )
+            .header("Content-Security-Policy", "script-src 'self'; connect-src 'none'"),
+        ),
+        "/csp/loose.js" => Some(Fixture::js(
+            "var out = [];
+             try { out.push('eval:' + eval('6 * 7')); } catch (e) { out.push('eval:' + e.name); }
+             fetch('data.txt').then(function (r) { out.push('fetch:' + r.status); postMessage(out.join(',')); },
+                                    function (e) { out.push('fetch:' + e.name); postMessage(out.join(',')); });",
+        )),
+        "/csp/slow.js" => Some(Fixture::js("postMessage('slow');").delayed(1500)),
+        "/csp/lib.js" => Some(Fixture::js("function lib() { return 'ok'; }")),
+        "/csp/data.txt" => Some(Fixture::text("data")),
+        _ => None,
+    });
+    init();
+    let mut p = aether::AetherEngine::new();
+    let html = "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"worker-src 'self'; connect-src 'none'; script-src 'self' 'unsafe-inline'\"></head><body><script>
+        var strict = null, loose = null, slow = null;
+        var t0 = Date.now();
+        var w0 = new Worker('/csp/slow.js'); w0.onmessage = function (e) { slow = e.data; };
+        var dt = Date.now() - t0;
+        var w1 = new Worker('/csp/strict.js'); w1.onmessage = function (e) { strict = e.data; };
+        var w2 = new Worker('/csp/loose.js'); w2.onmessage = function (e) { loose = e.data; };
+        </script></body></html>";
+    p.load_html_styled(&format!("http://127.0.0.1:{port}/csp/page"), html, &[], true);
+    let dt: f64 = eval(&mut p, "dt").parse().unwrap_or(f64::MAX);
+    assert!(dt < 750.0, "new Worker() waited {dt} ms for the script: the fetch is not on the worker's thread");
+    assert_eq!(run_until(&mut p, "strict !== null", "strict", 20), "eval:EvalError,import:ok,import-data:NetworkError,fetch:TypeError", "the worker's own policy");
+    assert_eq!(run_until(&mut p, "loose !== null", "loose", 20), "eval:42,fetch:200", "the document's policy does not bind an http(s) worker");
+    assert_eq!(run_until(&mut p, "slow !== null", "slow", 20), "slow");
+}
+
+// ------------------------------------------------------------------------- AETHERWORKERS3 (SR129) item 2b
+
+/// A `data:` worker's origin is opaque (HTML §10.2.4: "if worker URL's scheme is data, then … a new opaque
+/// origin"), so it has no storage key: IndexedDB and the Cache API refuse with SecurityError, where a
+/// same-origin worker shares its document's (`a_worker_shares_its_documents_storage`).
+#[test]
+fn a_data_worker_has_an_opaque_origin_and_no_storage() {
+    let w = data_url(
+        "var out = [];
+         var fin = function (x) { out.push(x); if (out.length === 2) { postMessage(out.sort().join('|')); } };
+         try {
+             var r = indexedDB.open('d');
+             r.onsuccess = function () { fin('idb:ok'); };
+             r.onerror = function () { fin('idb:' + (r.error && r.error.name)); };
+         } catch (e) { fin('idb:' + e.name); }
+         try {
+             (typeof caches === 'undefined' ? Promise.reject({ name: 'undefined' }) : caches.open('c'))
+                 .then(function () { fin('caches:ok'); }, function (e) { fin('caches:' + e.name); });
+         } catch (e) { fin('caches:' + e.name); }",
+    );
+    let mut p = page(PAGE, &format!("var got = null; var w = new Worker('{w}'); w.onmessage = function (e) {{ got = e.data; }};"));
+    assert_eq!(run_until(&mut p, "got !== null", "got", 20), "caches:SecurityError|idb:SecurityError");
 }

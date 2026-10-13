@@ -334,6 +334,15 @@ pub fn worker_client_origin() -> Option<String> {
     WORKER_CLIENT.with(|w| w.borrow().as_ref().map(|c| c.origin.clone()))
 }
 
+/// AETHERWORKERS3 (SR129): the owner document's secure-context flag on a dedicated or shared worker thread
+/// ([`enter_worker_client`]); None elsewhere (a service worker's realm decides from its script URL). A `data:`
+/// worker's own URL is never potentially trustworthy, but its settings object's secure-context flag is its
+/// creator's (HTML §10.2.4 "set up a worker environment settings object"): `caches` stays defined there and
+/// refuses with SecurityError for want of a storage key, as HTML says.
+pub fn worker_client_secure() -> Option<bool> {
+    WORKER_CLIENT.with(|w| w.borrow().as_ref().map(|c| c.secure))
+}
+
 /// AETHERCACHE (SR88): the HTTP cache's disk tier — `http-cache/` under the same platform data directory the
 /// localStorage files live in (one file per cached response, written and bounded by gneiss_pal's HttpCache).
 pub fn http_cache_dir() -> PathBuf {

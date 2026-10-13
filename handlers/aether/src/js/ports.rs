@@ -94,14 +94,41 @@ fn deliver(owner: Owner, port: u64, data: &str, ports: &str) -> bool {
 
 /// Disentangles every port `owner` held (a document retired, a worker ended).
 pub fn owner_gone(owner: Owner) {
-    let mut r = reg();
-    let gone: Vec<u64> = r.iter().filter(|(_, e)| e.owner == owner).map(|(id, _)| *id).collect();
-    for id in gone {
-        if let Some(e) = r.remove(&id) {
-            if let Some(p) = e.peer.and_then(|p| r.get_mut(&p)) {
-                p.peer = None;
+    let gone: Vec<u64> = {
+        let mut r = reg();
+        let gone: Vec<u64> = r.iter().filter(|(_, e)| e.owner == owner).map(|(id, _)| *id).collect();
+        for id in &gone {
+            if let Some(e) = r.remove(id) {
+                if let Some(p) = e.peer.and_then(|p| r.get_mut(&p)) {
+                    p.peer = None;
+                }
             }
         }
+        gone
+    };
+    // AETHERWORKERS3 (SR129): outside the registry lock — a shared worker whose last client port this was ends.
+    for id in gone {
+        crate::workers::shared::port_closed(id);
+    }
+}
+
+/// AETHERWORKERS3 (SR129): closes port `id` from the engine side (both ends disentangle) — a shared worker
+/// connection that failed closes the inside port it had shipped.
+pub fn close(id: u64) {
+    let removed = {
+        let mut r = reg();
+        match r.remove(&id) {
+            Some(e) => {
+                if let Some(p) = e.peer.and_then(|p| r.get_mut(&p)) {
+                    p.peer = None;
+                }
+                true
+            }
+            None => false,
+        }
+    };
+    if removed {
+        crate::workers::shared::port_closed(id);
     }
 }
 
@@ -182,12 +209,7 @@ fn port_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         }
         "close" => {
             let id = id_arg(vm, ctx, 1)?;
-            let mut r = reg();
-            if let Some(e) = r.remove(&id) {
-                if let Some(p) = e.peer.and_then(|p| r.get_mut(&p)) {
-                    p.peer = None;
-                }
-            }
+            close(id);
             Ok(Value::Undefined)
         }
         _ => vm.throw_type("__port: unknown operation"),
@@ -385,6 +407,9 @@ pub const PRELUDE: &str = r#"
     hide('__msg_fire', fireMsg);
     hide('__msg_stash', stash);
     hide('__msg_dispatch', dispatch);
+    // AETHERWORKERS3 (SR129): a shared worker's `connect` adopts its inside port; SharedWorker reads a port's id.
+    hide('__msg_adopt', adoptAll);
+    hide('__port_id', function (p) { return st(p).id; });
     if (typeof __inbox_on === 'function') {
         __inbox_on('port-message', function (m) { __port_deliver(m.port, m.data, m.ports); });
     }

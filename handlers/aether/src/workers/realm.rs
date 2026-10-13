@@ -127,6 +127,12 @@ fn fetch_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
         let m = vm.arg(c, 4);
         if m.is_nullish() { "cors".to_string() } else { vm.to_string(&m)?.to_rust() }
     };
+    // AETHERWORKERS3 (SR129): on a dedicated / shared worker thread the worker's OWN policy container governs
+    // its fetches (`connect-src`, CSP3 §6.8.1) — the policies of its script response, or its creator's for a
+    // local-scheme worker (`workers::dedicated::connect_allowed`). A service worker's realm has none here.
+    if let Err(e) = super::dedicated::connect_allowed(&url) {
+        return vm.throw_type(&format!("Failed to fetch: {}", crate::js::host::refusal_message(&e)));
+    }
     let me = Origin::of(&ctx().script_url);
     let cross = !me.same_origin(&Origin::of(&url));
     if cross && mode == "same-origin" {
@@ -236,7 +242,9 @@ fn cache_native(vm: &mut Vm, c: &CallCtx) -> JsResult<Value> {
     let x = ctx();
     // AETHERWORKERS (SR123): a dedicated worker of an opaque origin has no storage key (SecurityError), and
     // `caches` is a secure-context member of a worker realm as of a page (a service worker always is one).
-    let secure = crate::security::origin::is_potentially_trustworthy_url(&x.script_url);
+    // AETHERWORKERS3 (SR129): a dedicated / shared worker's flag is its owner document's (a `data:` worker's
+    // URL is never trustworthy, yet its `caches` is defined and refuses with SecurityError: no storage key).
+    let secure = crate::storage::worker_client_secure().unwrap_or_else(|| crate::security::origin::is_potentially_trustworthy_url(&x.script_url));
     let key = (!x.key.is_empty()).then_some(x.key);
     crate::js::cache_api::run(vm, c, key, secure)
 }
