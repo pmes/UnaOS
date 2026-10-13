@@ -238,3 +238,28 @@ pub fn page_info(url: &str) -> (bool, String) {
         (false, format!("Fetched over {}.", url.split(':').next().unwrap_or("an unknown scheme")))
     }
 }
+
+/// AETHERDEVTOOLS (SR112): one frame of a window whose developer-tools pane may be open — the std half
+/// of the pane, the face's single call per tick. The engine's device size follows the page rect of the
+/// split (the pane takes its share of the window); while the pane is open the frame runs through the
+/// Performance panel's recorder ([`super::devtools::timeline::Timeline::frame`]), otherwise it is the
+/// engine's own `tick` + `render_frame`. Returns the paint's damage (None when nothing was painted) and
+/// the pane's text lines (None when the pane is closed).
+pub fn devtools_frame(
+    engine: &mut crate::AetherEngine,
+    chrome: &super::DevtoolsChrome,
+    tools: &mut super::devtools::DevTools,
+    window: (u32, u32),
+) -> (Option<Vec<(u32, u32, u32, u32)>>, Option<Vec<String>>) {
+    let ((_, _, pw, ph), pane) = chrome.split(window.0, window.1);
+    if engine.device_size() != (pw.max(1), ph.max(1)) {
+        engine.set_device_size(pw.max(1), ph.max(1));
+    }
+    if pane.is_none() {
+        let damage = engine.tick().then(|| engine.render_frame());
+        return (damage, None);
+    }
+    let damage = tools.timeline.frame(engine);
+    let lines = tools.render(engine);
+    (damage, Some(lines))
+}
