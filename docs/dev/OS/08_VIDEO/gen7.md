@@ -1135,5 +1135,19 @@ not a 3DPRIMITIVE. i915 names the render-target SURFACE_STATE and the binding ta
 writes=0 -> DECLINED reason=page-3DSTATE_PUSH_CONSTANT_ALLOC_VS-uncited`, and `-> GATED reason=r9-not-verified`
 when R9 did not verify. gen7_renderstate.c's null state (rs:18-158) is a complete gen7 3D batch with values but
 no names. Pairing its headers needs the PRM, and that pairing is owed.
+**R11 (the first composited surface, GEN7R11 / B654, 2026-10-13)**: `gen7_r11.rs`, a child of `gen7_r10.rs`, run
+after R10's line under `tests gen7` and gated on `r10-triangle-verified` this run. It re-runs R10's stream with the
+rows GEN7R10.md §6 left open, each paired to i915's gen7 null-state batch (gen7_renderstate.c, a textured-quad
+pipeline) bit for bit: a 3-element vertex (position + texcoord), SBE with one attribute, PS with one sampler and a
+two-entry binding table, SAMPLER_STATE (nearest, clamp, non-normalized coordinates), 3DSTATE_SAMPLER_STATE_POINTERS_PS,
+and the 32-dword kernel rs:195-226 (2 `pln`, a SIMD16 sampler send, 4 `mov`, R10's RT-write EOT), all const-asserted.
+The source is the front window's surface copied 1:1 through `wm::thumb` (read-only); the target is the window's
+composited size (w*scale x h*scale, B8G8R8A8, the compositor's integer nearest upscale), drawn as two TRILIST
+triangles; the CPU compares every pixel with `src[y/scale][x/scale]`. No scanout change: R12 is the present. The PRM
+page cites are carried from GEN7R10.md §6 (the cloud could not reach the PRM); the bench re-reads them.
+`[gen7] r11 draw=quad src=<id>:<w>x<h>@s<scale> rt=<W>x<H>:b8g8r8a8 sampled=ok mismatch=0 landed=1 … -> r11-quad-verified`
+and `:: GEN7: r11 draw=quad src=<id> rt=<W>x<H> sampled=ok mismatch=0 landed=1 -> PASS ::`; otherwise
+`r11-drew-nothing` / `r11-quad-mismatch first=… at=(x,y)` / `r11-fence-miss` / `r11-head-stuck passed=<cmd>` /
+`REFUSED reason=… writes=0` / `GATED reason=r10-not-verified`. Rows and wire: `docs/dev/evidence/gen7r11/GEN7R11.md`.
 **PPS**: rungs 03/07 of the `igpu-dpy` ladder now print `why=panel-not-handed-to-igd bits=cited` — the bits were
 cited at rung 07b all along; the write still waits on a gmux hand-off and a T-value source.

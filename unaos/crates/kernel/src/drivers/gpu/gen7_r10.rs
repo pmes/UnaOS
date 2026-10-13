@@ -300,8 +300,14 @@ struct Out {
     passed: &'static str,
 }
 
-/// R10 under `tests gen7`, after R9: gated on R9's verified run this boot, then the table, then the draw.
+/// R10 under `tests gen7`, after R9, then R11 (GEN7R11, B654) on R10's word: `gen7_r11.rs`, gated on
+/// `r10-triangle-verified` this run.
 pub(super) fn run(r9: &str) {
+    quad::run(run_inner(r9))
+}
+
+/// R10's body: gated on R9's verified run this boot, then the table, then the draw. Returns R10's word for R11.
+fn run_inner(r9: &str) -> &'static str {
     let cited = R10_PAGES.iter().filter(|p| p.src.is_some()).count();
     let rows = R10_PAGES.len();
     if r9 != "verified" {
@@ -309,19 +315,19 @@ pub(super) fn run(r9: &str) {
             "[gen7] r10 draw=3dprimitive r9={} rows_cited={}/{} writes=0 -> GATED reason=r9-not-verified",
             r9, cited, rows
         );
-        return;
+        return "gated";
     }
     if let Some(p) = R10_PAGES.iter().find(|p| p.src.is_none()) {
         serial_println!(
             "[gen7] r10 draw=3dprimitive r9={} rows_cited={}/{} writes=0 -> DECLINED reason=page-{}-uncited field={} owed={}",
             r9, cited, rows, p.name, p.field, p.owed
         );
-        return;
+        return "declined";
     }
     let bank = *super::super::ladder::BANK.lock();
     let Some(b) = bank else {
         serial_println!("[gen7] r10 draw=3dprimitive r9={} writes=0 -> REFUSED reason=no-boot-bank", r9);
-        return;
+        return "refused";
     };
     // SAFETY: `bar0` is the IGD BAR0 mapping `igpu::init` published and banked; never unmapped. `exec` writes only
     // its own proven-unowned GGTT window, `0x101008`, one forcewake request (restored) and the four RCS ring
@@ -332,7 +338,7 @@ pub(super) fn run(r9: &str) {
     let o = match res {
         Err(why) => {
             serial_println!("[gen7] r10 draw=3dprimitive r9={} writes=0 -> REFUSED reason={} us={}", r9, why, us);
-            return;
+            return "refused";
         }
         Ok(o) => o,
     };
@@ -389,6 +395,7 @@ pub(super) fn run(r9: &str) {
         us,
         verdict
     );
+    verdict
 }
 
 /// The stream builder: the ring page, the write cursor, and the end-dword marks.
@@ -684,3 +691,8 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
     }
     Ok(out)
 }
+
+// R11 — the first composited surface (GEN7R11, B654): two textured triangles sampling the front window, read back and
+// compared with the CPU composite. A child of this file so it reuses R10's encodings; GEN7R11.md carries its rows.
+#[path = "gen7_r11.rs"]
+mod quad;
