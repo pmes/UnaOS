@@ -1,0 +1,12 @@
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `tls_core` (lib) generated 1 warning
+    Checking gneiss_pal v0.1.0 (/home/user/exec/h264core/libs/gneiss_pal)
+    Checking stria v0.1.0 (/home/user/exec/h264core/handlers/stria)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.55s

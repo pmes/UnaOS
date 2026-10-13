@@ -13,7 +13,8 @@
 //! [`VideoDecoder`], and the registry arm below is already written against it. VP8 (WebM `V_VP8`,
 //! MP4 `vp08`) is real: [`vp8::Vp8Decoder`] over `vp8_core` (VP8CORE, LEDGER SR40). VP9 (WebM
 //! `V_VP9`, MP4 `vp09`, profiles 0 and 2) is real: [`vp9::Vp9Decoder`] over `vp9_core` (VP9CORE,
-//! LEDGER SR116).
+//! LEDGER SR116). H.264 / AVC (MP4 `avc1` / `avc3`, Matroska `V_MPEG4/ISO/AVC`; Baseline, Main and
+//! High at 8-bit 4:2:0) is real: [`h264::H264Decoder`] over `h264_core` (H264CORE, LEDGER SR133).
 
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
@@ -104,7 +105,7 @@ pub trait VideoDecoder: Send {
 /// Pick the decoder for a video track.
 ///
 /// `utp1` → [`TestPattern`] (real: it is that stream's decoder). VP8 → [`vp8::Vp8Decoder`]. VP9 →
-/// [`vp9::Vp9Decoder`]. AV1 →
+/// [`vp9::Vp9Decoder`]. H.264 → [`h264::H264Decoder`]. AV1 →
 /// `av1::Av1Decoder` when the `av1` feature is on. Anything else → `Err(Unsupported)`; the caller may then ask for
 /// [`TestPattern::stand_in`] to keep the pipeline (clock, scheduling, sink) running, which marks
 /// itself `is_real() == false`.
@@ -113,6 +114,7 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
         Codec::TestPattern => Ok(Box::new(TestPattern::new(track))),
         Codec::Vp8 => Ok(Box::new(vp8::Vp8Decoder::new(track)?)),
         Codec::Vp9 => Ok(Box::new(vp9::Vp9Decoder::new(track)?)),
+        Codec::Avc => Ok(Box::new(h264::H264Decoder::new(track)?)),
         #[cfg(feature = "av1")]
         Codec::Av1 => Ok(Box::new(av1::Av1Decoder::new(track)?)),
         other => Err(DecodeError::Unsupported(format!("{other:?} ({})", track.codec_name))),
@@ -122,6 +124,7 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
 #[cfg(feature = "av1")]
 pub mod av1;
 pub mod vp8;
+pub mod h264;
 pub mod vp9;
 
 // ---------------------------------------------------------------------------------------------
@@ -330,10 +333,10 @@ mod tests {
 
     #[test]
     fn unsupported_codec_is_named_and_stand_in_is_labelled() {
-        // VP9 has a decoder since VP9CORE (SR116); H.264 still has none.
+        // H.264 has a decoder since H264CORE (SR133); HEVC still has none.
         let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10).spec;
-        t.fourcc = *b"avc1";
-        t.config_box = Some(*b"avcC");
+        t.fourcc = *b"hvc1";
+        t.config_box = Some(*b"hvcC");
         let file = build::mp4(&[build::MediaTrack { spec: t, samples: vec![] }], &Mp4Options::default());
         let d = Demuxer::open(file).unwrap();
         assert!(matches!(decoder_for(&d.tracks()[0]), Err(DecodeError::Unsupported(_))));
@@ -406,6 +409,31 @@ mod tests {
         assert!(matches!(dec.decode(&pkt), Err(DecodeError::Corrupt(_))));
         let empty = crate::dsp::demux::Packet { data: vec![], ..pkt };
         assert_eq!(dec.decode(&empty), Ok(None));
+    }
+
+    /// H264CORE (SR133): an avc1 track gets the real decoder (its avcC read at construction), a
+    /// sample it cannot parse is a named error, never a stand-in frame, and an empty one is
+    /// nothing.
+    #[test]
+    fn h264_track_gets_h264_core() {
+        let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10).spec;
+        t.fourcc = *b"avc1";
+        t.config_box = Some(*b"avcC");
+        // AVCDecoderConfigurationRecord: version 1, Baseline, level 3.0, 4-byte lengths, no
+        // parameter sets yet (they may arrive in band).
+        t.config = vec![1, 66, 0, 30, 0xff, 0xe0, 0];
+        let file = build::mp4(&[build::MediaTrack { spec: t, samples: vec![] }], &Mp4Options::default());
+        let d = Demuxer::open(file).unwrap();
+        let vt = d.tracks()[0].clone();
+        assert_eq!(vt.codec, Codec::Avc);
+        let mut dec = decoder_for(&vt).unwrap();
+        assert!(dec.is_real());
+        assert_eq!(dec.name(), "h264 (h264_core)");
+        let pkt = crate::dsp::demux::Packet { track: vt.id, pts: 0, dts: 0, duration: 0, keyframe: true, data: vec![0x55; 16], discard_ns: 0 };
+        assert!(matches!(dec.decode(&pkt), Err(DecodeError::Corrupt(_))));
+        let empty = crate::dsp::demux::Packet { data: vec![], ..pkt };
+        assert_eq!(dec.decode(&empty), Ok(None));
+        assert!(dec.flush().is_empty());
     }
 
     #[test]

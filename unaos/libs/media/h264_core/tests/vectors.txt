@@ -1,0 +1,58 @@
+# H264CORE KAT vectors: <sha256> <path under the vector cache> <url>. Fetched at test time (curl) into
+# $H264_VECTORS or target/tmp/h264-vectors/, verified by sha256; never committed. Offline => SKIP.
+# The JVT conformance suite of ITU-T H.264.1: each zip holds a bitstream and the reference decoder's
+# decoded YUV (I420, cropped, output order), which every decoded frame must equal byte for byte.
+#
+# PIN OWED: www.itu.int answered 403 at the authoring seat's egress proxy (2026-10-13), so these
+# rows carry `-` instead of a digest and the package names follow the suite's naming without having
+# been listed. tests/common/mod.rs fetches a `-` row unverified and prints `UNPINNED <path> <sha256>`;
+# the first seat with access replaces each `-` with that digest (and corrects any name that 404s,
+# which the harness reports as SKIP).
+#
+# Baseline (CAVLC): I/P, multiple slices, nal_ref_idc variants, multiple IDRs, non-reference frames,
+# several parameter sets, constrained intra, I_PCM, multiple reference frames, per-MB QP.
+- jvt/BA1_Sony_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/BA1_Sony_D.zip
+- jvt/BA2_Sony_F.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/BA2_Sony_F.zip
+- jvt/BA_MW_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/BA_MW_D.zip
+- jvt/BANM_MW_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/BANM_MW_D.zip
+- jvt/BA1_FT_C.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/BA1_FT_C.zip
+- jvt/NL1_Sony_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/NL1_Sony_D.zip
+- jvt/NL2_Sony_H.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/NL2_Sony_H.zip
+- jvt/SVA_BA1_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/SVA_BA1_B.zip
+- jvt/SVA_NL1_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/SVA_NL1_B.zip
+- jvt/MIDR_MW_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/MIDR_MW_D.zip
+- jvt/NRF_MW_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/NRF_MW_E.zip
+- jvt/MPS_MW_A.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/MPS_MW_A.zip
+- jvt/CI_MW_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CI_MW_D.zip
+- jvt/LS_SVA_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/LS_SVA_D.zip
+- jvt/CVPCMNL1_SVA_C.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CVPCMNL1_SVA_C.zip
+- jvt/MR1_BT_A.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/MR1_BT_A.zip
+- jvt/BAMQ1_JVC_C.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/BAMQ1_JVC_C.zip
+# Main (CABAC, B slices, weighted prediction, cropping, chroma QP offset, CABAC I_PCM).
+- jvt/CABA1_SVA_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CABA1_SVA_B.zip
+- jvt/CABA2_Sony_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CABA2_Sony_E.zip
+- jvt/CABA3_SVA_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CABA3_SVA_B.zip
+- jvt/CABA3_TOSHIBA_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CABA3_TOSHIBA_E.zip
+- jvt/CACQP3_Sony_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CACQP3_Sony_D.zip
+- jvt/CAPCM1_Sand_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CAPCM1_Sand_E.zip
+- jvt/CABAST3_Sony_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CABAST3_Sony_E.zip
+- jvt/CVBS3_Sony_C.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CVBS3_Sony_C.zip
+- jvt/CVWP1_TOSHIBA_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CVWP1_TOSHIBA_E.zip
+- jvt/CVWP2_TOSHIBA_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CVWP2_TOSHIBA_E.zip
+- jvt/CAWP1_TOSHIBA_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CAWP1_TOSHIBA_E.zip
+- jvt/MR2_TANDBERG_E.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/MR2_TANDBERG_E.zip
+- jvt/CVSE2_Sony_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CVSE2_Sony_B.zip
+- jvt/CVFC1_Sony_C.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CVFC1_Sony_C.zip
+# High (FRExt: 8x8 transform and Intra_8x8, CAVLC and CABAC, scaling matrices).
+- jvt/FRExt/FRExt1_Panasonic_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/FRExt1_Panasonic_D.zip
+- jvt/FRExt/FRExt2_Panasonic_C.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/FRExt2_Panasonic_C.zip
+- jvt/FRExt/HCAFR1_HHI.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/HCAFR1_HHI.zip
+- jvt/FRExt/HPCV_BRCM_A.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/HPCV_BRCM_A.zip
+- jvt/FRExt/HPCVNL_BRCM_A.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/HPCVNL_BRCM_A.zip
+- jvt/FRExt/HPCADQ_BRCM_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/HPCADQ_BRCM_B.zip
+- jvt/FRExt/HPCALQ_BRCM_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/HPCALQ_BRCM_B.zip
+# Refused by name: MBAFF, field pictures, FMO, 4:2:2.
+- jvt/CAMA1_Sony_C.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CAMA1_Sony_C.zip
+- jvt/CVFI1_Sony_D.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/CVFI1_Sony_D.zip
+- jvt/FM1_BT_B.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FM1_BT_B.zip
+- jvt/FRExt/Hi422FR1_SONY_A.zip https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/FRExt/Hi422FR1_SONY_A.zip

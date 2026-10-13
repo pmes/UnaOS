@@ -1989,6 +1989,7 @@ dependencies = [
  "demux_core",
  "futures-core",
  "futures-util",
+ "h264_core",
  "http_core",
  "infer_core",
  "log",
@@ -2139,6 +2140,10 @@ dependencies = [
  "pango-sys",
  "system-deps 9.0.0",
 ]
+
+[[package]]
+name = "h264_core"
+version = "0.1.0"
 
 [[package]]
 name = "half"
