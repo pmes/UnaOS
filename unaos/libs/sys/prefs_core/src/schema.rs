@@ -290,6 +290,12 @@ pub static SCHEMA: &[Key] = &[
         writers: &[Writer::Settings, Writer::Program], reader: "kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`)",
         doc: "Three fingers down hold the primary button and move the pointer (a drag without a press). Edited in Settings > Trackpad.",
     },
+    // ── tabula — the Text handler (SYNTAXCORE SR89, R104/R105) ─────────────────────────────────────────
+    Key {
+        ns: "tabula", key: "highlight", kind: Kind::Enum(&["core", "sourceview"]), default: Default::Str("core"),
+        writers: OP, reader: "tabula HighlightPrefs (`handlers/tabula/src/highlight.rs`)",
+        doc: "Who paints the editor's syntax colours: `core` = UnaOS's own syntax core (`syntax_core`) through text tags, `sourceview` = GtkSourceView's language definitions, the other-OS face kept beside it (R104, R105).",
+    },
     // ── vein — the conversation handler's provider slot (VEINPROV B303, EMBED B317, R81) ───────────────
     Key {
         ns: "vein", key: "claude.api_key_env", kind: NAME, default: Default::Str("ANTHROPIC_API_KEY"),

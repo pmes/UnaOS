@@ -1,0 +1,17 @@
+# Title
+Some *emphasis*, **strong** and `code *not em*`.
+A [link](http://x.y/(z)) and <https://a.b> and \*esc\* &amp;.
+Setext
+------
+> quote _under_score_ snake_case_word
+- item one
+1. item two
+```rust
+fn x() {}
+```
+    indented code
+<!-- a
+comment -->
+***
+## Sub
+[ref]: /url "t"

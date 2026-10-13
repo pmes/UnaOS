@@ -1,0 +1,16 @@
+[package]
+name = "syntax_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "UnaOS's own syntax core: incremental per-line lexers with checkpointed state, a shallow structural pass (folds, bracket matching) and grammars written from each language's specification — no_std + alloc, zero dependencies."
+
+# SYNTAXCORE (LEDGER SR89, R105: tree-sitter is OUT; R104: the GtkSourceView face stays beside this core).
+# CHARTER: Tabula owns Text (docs/CODEX.md §2); seam `shared-core` — the edit_core shape: `#![no_std]` + `alloc`,
+# `#![forbid(unsafe_code)]`, zero dependencies, builds for `aarch64-unknown-none-softfloat` so a ring-3 editor on
+# the image links the same lexers the host Tabula links. The core reads its text through the `Source` trait
+# (edit_core's piece table is adapted in handlers/tabula, never copied into one String).
+#
+# Dependencies: none. Dev-dependencies: none.
+
+[dependencies]

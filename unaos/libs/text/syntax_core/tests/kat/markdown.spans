@@ -1,0 +1,24 @@
+# SYNTAXCORE KAT — CommonMark 0.31.2. <line> <kind> |<lexeme>|
+0 heading |# Title|
+1 emphasis |*emphasis*|
+1 emphasis |**strong**|
+1 code |`code *not em*`|
+2 link |[link](http://x.y/(z))|
+2 link |<https://a.b>|
+2 escape |\*|
+2 escape |\*|
+2 escape |&amp;|
+4 heading |------|
+5 punctuation |>|
+5 emphasis |_under_score_|
+6 punctuation |-|
+7 punctuation |1.|
+8 code |```rust|
+9 code |fn x() {}|
+10 code |```|
+11 code |    indented code|
+12 comment |<!-- a|
+13 comment |comment -->|
+14 punctuation |***|
+15 heading |## Sub|
+16 link |[ref]: /url "t"|

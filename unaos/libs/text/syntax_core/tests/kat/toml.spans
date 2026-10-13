@@ -1,0 +1,53 @@
+# SYNTAXCORE KAT — TOML v1.0.0. <line> <kind> |<lexeme>|
+0 comment |# comment|
+1 variable |title|
+1 operator |=|
+1 string |"TOML|
+1 escape |\"|
+1 string |x|
+1 escape |\"é|
+1 string |"|
+2 heading |[owner]|
+3 variable |name|
+3 punctuation |.|
+3 variable |first|
+3 operator |=|
+3 string |'Tom'|
+4 variable |dob|
+4 operator |=|
+4 number |1979-05-27 07:32:00-08:00|
+5 heading |[[products]]|
+6 variable |ports|
+6 operator |=|
+6 punctuation |[|
+6 number |8000|
+6 punctuation |,|
+6 number |0xDEAD_BEEF|
+6 punctuation |,|
+7 number |-inf|
+7 punctuation |,|
+7 number |nan|
+7 punctuation |]|
+8 variable |flag|
+8 operator |=|
+8 keyword |true|
+9 variable |inline|
+9 operator |=|
+9 punctuation |{|
+9 variable |a|
+9 operator |=|
+9 number |1|
+9 punctuation |,|
+9 string |"b c"|
+9 operator |=|
+9 number |2.5e-3|
+9 punctuation |}|
+10 variable |text|
+10 operator |=|
+10 string |"""|
+11 string |line|
+11 escape |\|
+12 string |  end"""|
+13 variable |lit|
+13 operator |=|
+13 string |'''raw'''|

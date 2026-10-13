@@ -25,16 +25,27 @@
 //! own no_std editing core (`unaos/libs/text/edit_core`), the same bytes a
 //! ring-3 editor on the image links. `load`, `save`, `set_buffer` and every
 //! edit go through it; the GTK view mirrors it both ways (`src/lib.rs`).
+//!
+//! SYNTAXCORE (SR89, R105): the document also carries its grammar — `syntax`, UnaOS's own syntax core
+//! chosen by `language` — and the core's per-line lexer checkpoints (`highlights`). Every edit made
+//! through this type splices the changed line range into the checkpoints and re-lexes from there
+//! (`crate::highlight`), so a one-character edit re-lexes one line in the common case.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 pub use edit_core::{Buffer as EditBuffer, Change};
+use syntax_core::{Highlight, Highlighter, Language};
+
+use crate::highlight::CoreSource;
 
 /// An in-memory editor document, decoupled from any UI toolkit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Clone`, `PartialEq` and `Debug` are written by hand: the grammar is a `Box<dyn Language>`, compared
+/// and cloned by its id.
 pub struct TabulaDocument {
     /// Backing file, if this document has been loaded from / bound to one.
     pub path: Option<PathBuf>,
@@ -67,6 +78,58 @@ pub struct TabulaDocument {
     ///
     /// `save()` refuses and `set_buffer()` is inert.
     pub read_only: bool,
+    /// SYNTAXCORE: the grammar for `language` (`syntax_core::language_for_id`), `None` for a language the
+    /// core has no grammar for ("txt", a console log). [`Self::set_language`] keeps the two together; a
+    /// `language` written directly is noticed on the next edit or [`Self::highlight_spans`].
+    pub syntax: Option<Box<dyn Language>>,
+    /// The core's per-line lexer checkpoints and tokens for `core`'s text.
+    pub highlights: Highlighter,
+    /// Lines re-lexed since a view last took them ([`Self::take_syntax_dirty`]).
+    syntax_dirty: Option<Range<usize>>,
+}
+
+impl Clone for TabulaDocument {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            core: self.core.clone(),
+            buffer: self.buffer.clone(),
+            language: self.language.clone(),
+            dirty: self.dirty,
+            read_only: self.read_only,
+            syntax: self.syntax.as_ref().and_then(|l| syntax_core::language_for_id(l.id())),
+            highlights: self.highlights.clone(),
+            syntax_dirty: self.syntax_dirty.clone(),
+        }
+    }
+}
+
+impl PartialEq for TabulaDocument {
+    fn eq(&self, o: &Self) -> bool {
+        self.path == o.path
+            && self.core == o.core
+            && self.buffer == o.buffer
+            && self.language == o.language
+            && self.dirty == o.dirty
+            && self.read_only == o.read_only
+            && self.syntax.as_ref().map(|l| l.id()) == o.syntax.as_ref().map(|l| l.id())
+    }
+}
+
+impl Eq for TabulaDocument {}
+
+impl fmt::Debug for TabulaDocument {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TabulaDocument")
+            .field("path", &self.path)
+            .field("core", &self.core)
+            .field("buffer", &self.buffer)
+            .field("language", &self.language)
+            .field("dirty", &self.dirty)
+            .field("read_only", &self.read_only)
+            .field("syntax", &self.syntax.as_ref().map(|l| l.id()))
+            .finish()
+    }
 }
 
 impl Default for TabulaDocument {
@@ -90,6 +153,9 @@ impl TabulaDocument {
             language: "txt".to_string(),
             dirty: false,
             read_only: false,
+            syntax: None,
+            highlights: Highlighter::new(),
+            syntax_dirty: None,
         }
     }
 
@@ -107,6 +173,7 @@ impl TabulaDocument {
         }
         let changes = f(&mut self.core);
         self.fold(&changes);
+        self.sync_syntax(&changes);
         changes
     }
 
@@ -144,6 +211,86 @@ impl TabulaDocument {
         }
     }
 
+    /// Choose the language (a sourceview-style id) and its grammar, and lex the document afresh.
+    pub fn set_language(&mut self, id: &str) {
+        self.language = id.to_string();
+        self.syntax = syntax_core::language_for_id(id);
+        self.rehighlight();
+    }
+
+    /// Lex the whole document with its grammar (or drop the checkpoints when it has none); every line
+    /// becomes dirty for the view.
+    pub fn rehighlight(&mut self) {
+        match self.syntax.as_deref() {
+            Some(lang) => {
+                self.highlights.reset(lang, &CoreSource(&self.core));
+            }
+            None => self.highlights = Highlighter::new(),
+        }
+        let n = self.core.line_count();
+        self.mark_syntax_dirty(0..n);
+    }
+
+    /// The core's checkpoints and tokens (line-relative), as last lexed.
+    pub fn highlighter(&self) -> &Highlighter {
+        &self.highlights
+    }
+
+    /// The lines re-lexed since the last call (the range a view re-paints), clearing it.
+    pub fn take_syntax_dirty(&mut self) -> Option<Range<usize>> {
+        self.syntax_dirty.take()
+    }
+
+    /// Absolute-offset spans for `lines`, re-choosing the grammar first if `language` was written directly.
+    pub fn highlight_spans(&mut self, lines: Range<usize>) -> Vec<Highlight> {
+        self.ensure_syntax();
+        self.highlights.highlights(&CoreSource(&self.core), lines)
+    }
+
+    /// Re-choose the grammar when `language` no longer names the one held.
+    fn ensure_syntax(&mut self) {
+        let want = syntax_core::language_for_id(&self.language);
+        let same = match (&want, &self.syntax) {
+            (Some(a), Some(b)) => a.id() == b.id(),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.syntax = want;
+            self.rehighlight();
+        }
+    }
+
+    /// Splice `changes` into the checkpoints and re-lex what they touched.
+    fn sync_syntax(&mut self, changes: &[Change]) {
+        if changes.is_empty() {
+            return;
+        }
+        let held = self.syntax.as_ref().map(|l| l.id());
+        self.ensure_syntax();
+        if self.syntax.as_ref().map(|l| l.id()) != held {
+            return; // ensure_syntax lexed the whole (already edited) document
+        }
+        let Some(lang) = self.syntax.as_deref() else {
+            return;
+        };
+        for c in changes {
+            self.highlights.splice(c.first_line, c.old_last_line, c.new_last_line);
+        }
+        let r = self.highlights.relex(lang, &CoreSource(&self.core));
+        self.mark_syntax_dirty(r);
+    }
+
+    fn mark_syntax_dirty(&mut self, r: Range<usize>) {
+        if r.start >= r.end {
+            return;
+        }
+        self.syntax_dirty = Some(match self.syntax_dirty.take() {
+            Some(d) => d.start.min(r.start)..d.end.max(r.end),
+            None => r,
+        });
+    }
+
     /// Map a file extension to a sourceview language id.
     ///
     /// Lifted verbatim from the GTK `load_file` auto-detection table so the
@@ -157,6 +304,7 @@ impl TabulaDocument {
             "js" | "ts" => "javascript",
             "json" => "json",
             "c" | "h" | "cpp" => "c",
+            "sh" | "bash" => "sh",
             _ => "txt",
         }
     }
@@ -172,14 +320,19 @@ impl TabulaDocument {
             .map(Self::language_for)
             .unwrap_or("txt")
             .to_string();
-        Ok(Self {
+        let mut doc = Self {
             path: Some(path.to_path_buf()),
             core: edit_core::Buffer::new(&buffer),
             buffer,
-            language,
+            language: String::new(),
             dirty: false,
             read_only: false,
-        })
+            syntax: None,
+            highlights: Highlighter::new(),
+            syntax_dirty: None,
+        };
+        doc.set_language(&language);
+        Ok(doc)
     }
 
     /// Load a console/serial log for viewing: read-only, control-byte-safe,
@@ -195,6 +348,9 @@ impl TabulaDocument {
             language: "txt".to_string(),
             dirty: false,
             read_only: true,
+            syntax: None,
+            highlights: Highlighter::new(),
+            syntax_dirty: None,
         })
     }
 
@@ -440,6 +596,42 @@ mod tests {
         doc.set_buffer("other");
         assert_eq!(doc.text(), "log line\n");
         assert!(!doc.dirty);
+    }
+
+    #[test]
+    fn syntax_core_follows_the_language_and_the_edits() {
+        let mut doc = TabulaDocument::with_text("fn a() {}\nlet x = 1;\n");
+        assert!(doc.syntax.is_none(), "txt has no grammar");
+        doc.set_language("rust");
+        assert_eq!(doc.syntax.as_ref().map(|l| l.id()), Some("rust"));
+        assert_eq!(doc.take_syntax_dirty(), Some(0..3));
+        assert_eq!(doc.highlighter().line_tokens(0)[0].kind, syntax_core::HighlightKind::Keyword);
+        // "fn a() {}\n" is 10 bytes: the `x` of line 1 is byte 14.
+        doc.replace_range(14..15, "y");
+        assert_eq!(doc.take_syntax_dirty(), Some(1..2), "a one-character edit re-lexes one line");
+        let spans = doc.highlight_spans(1..2);
+        assert_eq!(&doc.text()[spans[1].range.clone()], "y");
+        // A clone carries the grammar; a language with no grammar drops it.
+        assert_eq!(doc.clone(), doc);
+        doc.set_language("txt");
+        assert!(doc.syntax.is_none());
+        // A language written directly is noticed.
+        doc.language = "sh".to_string();
+        assert!(!doc.highlight_spans(0..1).is_empty());
+        assert_eq!(doc.syntax.as_ref().map(|l| l.id()), Some("sh"));
+    }
+
+    #[test]
+    fn loaded_shell_and_markdown_get_their_grammars() {
+        assert_eq!(TabulaDocument::language_for("sh"), "sh");
+        let path = scratch_path("syntax.md");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"# Title\n").unwrap();
+        let doc = TabulaDocument::load(&path).unwrap();
+        assert_eq!(doc.syntax.as_ref().map(|l| l.id()), Some("markdown"));
+        assert_eq!(doc.highlighter().line_tokens(0)[0].kind, syntax_core::HighlightKind::Heading);
+        assert!(!doc.dirty);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

@@ -16,9 +16,11 @@
 
 pub mod bus;
 pub mod document;
+pub mod highlight;
 pub mod logview;
 pub use bus::ignite;
 pub use document::TabulaDocument;
+pub use highlight::{HighlightEngine, HighlightPrefs};
 pub use logview::{default_console_log, is_log_path, LogText};
 
 #[cfg(feature = "gtk")]
@@ -58,6 +60,9 @@ pub struct TabulaView {
     /// Set while the view applies a core change (or loads a file) so the
     /// GtkTextBuffer signals it raises are not echoed back into the core.
     guard: Rc<Cell<bool>>,
+    /// SYNTAXCORE (SR89, R104): who paints syntax (`tabula.highlight`: the
+    /// UnaOS core through tags, or GtkSourceView's own), and the core's theme.
+    prefs: HighlightPrefs,
 }
 
 /// The byte offset in the core of a GtkTextIter. GTK and the core agree on
@@ -77,6 +82,8 @@ fn iter_byte_offset(buf: &gtk4::TextBuffer, core: &edit_core::Buffer, it: &gtk4:
 impl TabulaView {
     pub fn new(mode: EditorMode) -> Self {
         let view = SourceView::builder().auto_indent(true).build();
+        let prefs = HighlightPrefs::load();
+        let core_paints = prefs.engine == HighlightEngine::Core;
 
         match &mode {
             EditorMode::Code(lang_id) => {
@@ -85,10 +92,13 @@ impl TabulaView {
                 view.set_wrap_mode(gtk4::WrapMode::None);
 
                 let lm = LanguageManager::default();
-                if let Some(lang) = lm.language(lang_id) {
-                    if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
+                if let Some(buffer) = view.buffer().downcast::<sourceview5::Buffer>().ok() {
+                    if let Some(lang) = lm.language(lang_id) {
                         buffer.set_language(Some(&lang));
                     }
+                    // SYNTAXCORE: the core paints through tags; sourceview keeps
+                    // its language (indentation, brackets) but not its colours.
+                    buffer.set_highlight_syntax(!core_paints);
                 }
             }
             EditorMode::Prose => {
@@ -116,6 +126,9 @@ impl TabulaView {
         // The mirror, GTK → core. Both handlers run BEFORE the default
         // handler, so the iters still describe the text the core holds.
         let doc = Rc::new(RefCell::new(TabulaDocument::new()));
+        if let EditorMode::Code(lang_id) = &mode {
+            doc.borrow_mut().set_language(lang_id);
+        }
         let guard = Rc::new(Cell::new(false));
         let buffer = view.buffer();
         {
@@ -141,6 +154,20 @@ impl TabulaView {
                 d.replace_range(a.min(b)..a.max(b), "");
             });
         }
+        // SYNTAXCORE: after GTK has applied an edit the mirror already gave
+        // the core, paint the lines the core re-lexed.
+        if core_paints {
+            let (doc, guard, prefs) = (doc.clone(), guard.clone(), prefs.clone());
+            buffer.connect_changed(move |buf| {
+                if guard.get() {
+                    return;
+                }
+                let mut d = doc.borrow_mut();
+                if let Some(r) = d.take_syntax_dirty() {
+                    highlight::highlight_with_core(buf, &d, &prefs, Some(r));
+                }
+            });
+        }
 
         Self {
             view,
@@ -148,7 +175,27 @@ impl TabulaView {
             mode,
             doc,
             guard,
+            prefs,
         }
+    }
+
+    /// The `highlight_with_core` path for this view: paint what the core
+    /// re-lexed (every line when `all`). Inert when sourceview paints.
+    fn paint_core(&self, all: bool) {
+        if self.prefs.engine != HighlightEngine::Core {
+            return;
+        }
+        let mut d = self.doc.borrow_mut();
+        let dirty = d.take_syntax_dirty();
+        let lines = if all { None } else { dirty };
+        if all || lines.is_some() {
+            highlight::highlight_with_core(&self.view.buffer(), &d, &self.prefs, lines);
+        }
+    }
+
+    /// The highlighting preferences this view was built with.
+    pub fn highlight_prefs(&self) -> &HighlightPrefs {
+        &self.prefs
     }
 
     /// The document of record behind this view (shared with the mirror).
@@ -183,11 +230,14 @@ impl TabulaView {
             }
         }
         let d = self.doc.borrow();
-        if !in_step || buf.line_count().max(0) as usize != d.core.line_count() {
+        let resync = !in_step || buf.line_count().max(0) as usize != d.core.line_count();
+        if resync {
             // The view and the record disagree on structure: resync wholesale.
             buf.set_text(&d.text());
         }
+        drop(d);
         self.guard.set(false);
+        self.paint_core(resync);
     }
 
     /// Show `doc` in the view and make it the record, without echoing the
@@ -198,6 +248,7 @@ impl TabulaView {
         self.guard.set(true);
         self.view.buffer().set_text(&text);
         self.guard.set(false);
+        self.paint_core(true);
     }
 
     pub fn widget(&self) -> Widget {
@@ -245,6 +296,7 @@ impl TabulaView {
                 "js" | "ts" => "javascript",
                 "json" => "json",
                 "c" | "h" | "cpp" => "c",
+                "sh" | "bash" => "sh",
                 _ => "txt",
             };
             if let Some(lang) = lm.language(lang_id) {
@@ -253,6 +305,7 @@ impl TabulaView {
                 buffer.set_language(None::<&sourceview5::Language>);
             }
         }
+        buffer.set_highlight_syntax(self.prefs.engine == HighlightEngine::SourceView);
 
         // EDITCORE: the file loads into the buffer of record and the view
         // shows it; a read failure becomes a clean, path-less document so the
