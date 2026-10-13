@@ -11,9 +11,11 @@
 //!   focuses them (R88). A press reaches them through [`press_at`], the first furniture arm of
 //!   `strip::press_route`; it only RECORDS (atomics) and [`service`] acts. A card's action button runs its action; a
 //!   press elsewhere on the card dismisses it; the pointer over a card pauses its timeout.
-//! - **The ring** is the session's last [`RING`] notifications, in memory (nothing outlives a boot); the bar's bell
-//!   carries the unread count (`menubar::bell_*`), and a press on it opens the Center: the ring newest first,
-//!   grouped by app, with `Clear`.
+//! - **The ring** is the session's last [`RING`] notifications, in memory (nothing outlives a boot), each with its app,
+//!   title, line, time and READ flag (NOTIFYCENTER B622, R116: a card that times out is not gone — the timeout marks
+//!   nothing read). The bar's bell carries the ring's unread count (`menubar::bell_*` read [`unread`], the ring's
+//!   mirror), and a press on it opens the Center: the ring newest first, grouped by app, `Clear` (all), a per-item
+//!   `x` (dismiss), a press on an item runs its action; opening it marks the items it SHOWS read.
 //! - **Do Not Disturb** is Principia's `system.notify.dnd` (R79: a preference is Principia's), toggled in Settings >
 //!   Notifications (NOTIFYPANE B435; it was a General row); on — or inside its schedule — a notification
 //!   collects silently (the badge counts it, no card shows, no sound).
@@ -23,8 +25,10 @@
 //!
 //! Wire: `[notify] post app=<a> title=<t> dnd=<0|1> -> banner|collected`, `[notify] show win=<n> slot=<i> title=<t>
 //! ms=<ms> focus=kept`, `[notify] closed by=<timeout|click|overflow> title=<t>`, `[notify] action <label> -> <what>`,
-//! `[notify] center open items=<n> apps=<n>` / `[notify] center closed by=<bell|outside|clear>`, and `tests notify` →
-//! `:: NOTIFY: stack_max=4 center=ok ring=100 badge=ok dnd=<0|1> posted=<n> -> PASS ::`.
+//! `[notify] bell press at=(<x>,<y>) box=(<x>,<y>,<w>,<h>) -> center-open|center-close|miss`, `[notify] center open
+//! items=<n> unread=<n> apps=<n> shown=<n>` / `[notify] center close by=<bell|outside|action>`, `[notify] center
+//! dismiss title=<t> left=<n>`, and `tests notify` → `:: NOTIFY: stack_max=4 center=ok ring=64 badge=ok dnd=<0|1>
+//! posted=<n> center_kept=2 unread=2 -> PASS :: …`.
 //! Design: `docs/dev/evidence/rmbp-1005/notify.md`; the pane and the sound: `notifypane.md`.
 
 use alloc::string::String;
@@ -35,8 +39,8 @@ use super::{metrics, theme, wm};
 
 /// Cards visible at once.
 pub const STACK_MAX: usize = 4;
-/// The session ring the Center lists.
-pub const RING: usize = 100;
+/// The session ring the Center lists (NOTIFYCENTER B622: N=64).
+pub const RING: usize = 64;
 /// How long a card stays (the toast's time).
 pub const CARD_MS: u64 = super::toast::TOAST_MS;
 /// A hovered card keeps at least this much time once the pointer leaves.
@@ -50,6 +54,8 @@ pub const ACT_SHOW_LOG: u8 = 1;
 pub const ACT_OPEN_DIR: u8 = 2;
 /// A program's own action: `arg` = owner (8 bytes LE) + token (4 bytes LE) + button (1); answered on the dialog bus path.
 pub const ACT_ANSWER: u8 = 3;
+/// NOTIFYCENTER (B622): open the file at the path in `arg` in the image viewer (`facet::request_open`).
+pub const ACT_OPEN_FILE: u8 = 4;
 
 /// Principia's key (namespace `system`).
 pub const KEY_DND: &str = "notify.dnd";
@@ -65,6 +71,10 @@ const CH: usize = 460;
 const HEAD_H: usize = 36;
 const GROUP_H: usize = 22;
 const ITEM_H: usize = 40;
+/// NOTIFYCENTER (B622): an item row's dismiss box (logical, inside the row) and its age column's left edge.
+const DX_W: usize = 16;
+const DX_X: usize = CW - 12 - DX_W;
+const AGE_X: usize = DX_X - 44;
 
 const AL: usize = 16;
 const TL: usize = 32;
@@ -88,6 +98,8 @@ pub struct Note {
     quiet: bool,
     seq: u32,
     at: u64,
+    /// NOTIFYCENTER (B622): seen in the open Center (a card's timeout never sets it).
+    read: bool,
 }
 
 fn put(dst: &mut [u8], src: &[u8], first_line: bool) -> u8 {
@@ -103,7 +115,7 @@ fn put(dst: &mut [u8], src: &[u8], first_line: bool) -> u8 {
 }
 
 impl Note {
-    const EMPTY: Note = Note { app: [0; AL], al: 0, title: [0; TL], tl: 0, line: [0; LL], ll: 0, label: [0; BL], bl: 0, act: 0, arg: [0; XL], xl: 0, quiet: false, seq: 0, at: 0 };
+    const EMPTY: Note = Note { app: [0; AL], al: 0, title: [0; TL], tl: 0, line: [0; LL], ll: 0, label: [0; BL], bl: 0, act: 0, arg: [0; XL], xl: 0, quiet: false, seq: 0, at: 0, read: false };
     fn make(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, arg: &[u8]) -> Note {
         let mut n = Note::EMPTY;
         n.al = put(&mut n.app, app, true);
@@ -217,6 +229,20 @@ static REQ_ACT: AtomicU32 = AtomicU32::new(0);
 static REQ_CENTER: AtomicU32 = AtomicU32::new(0); // 1 toggle (bell), 2 close (outside), 3 clear
 /// The ring changed while the Center is open (repaint it on the next pass).
 static CENTER_STALE: AtomicBool = AtomicBool::new(false);
+/// NOTIFYCENTER (B622): a press on an open Center item — its `x` (dismiss) or its body (its action), by seq.
+static REQ_ITEM_DISMISS: AtomicU32 = AtomicU32::new(0);
+static REQ_ITEM_ACT: AtomicU32 = AtomicU32::new(0);
+/// The Center's painted item rows for the press router: logical top y, seq, has-action. `ROW_N` rows are live.
+const ROWS_MAX: usize = CH / ITEM_H + 1;
+static ROW_N: AtomicUsize = AtomicUsize::new(0);
+static ROW_Y: [AtomicUsize; ROWS_MAX] = [const { AtomicUsize::new(0) }; ROWS_MAX];
+static ROW_SEQ: [AtomicU32; ROWS_MAX] = [const { AtomicU32::new(0) }; ROWS_MAX];
+static ROW_ACT: [AtomicBool; ROWS_MAX] = [const { AtomicBool::new(false) }; ROWS_MAX];
+
+/// NOTIFYCENTER (B622): the badge is the RING's unread count — published after every ring change.
+fn recount(ring: &[Note]) {
+    UNREAD.store(ring.iter().filter(|n| !n.read).count() as u32, Ordering::Relaxed);
+}
 
 const SURF_N: usize = STACK_MAX + 1; // + the Center
 static SURF_AT: [AtomicUsize; SURF_N] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -227,7 +253,7 @@ fn surf(i: usize) -> &'static mut [u32] {
     metrics::leaked_surf(&SURF_AT[i], n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
-/// The unread count the bell's badge shows (lock-free: the bar's painter reads it).
+/// The unread count the bell's badge shows (lock-free: the bar's painter reads it) — the ring's unread items.
 pub fn unread() -> u32 {
     UNREAD.load(Ordering::Relaxed)
 }
@@ -364,7 +390,15 @@ fn center_model(ring: &[Note]) -> (usize, usize, Vec<(bool, usize)>) {
     (ring.len(), apps.len(), rows)
 }
 
-fn paint_center(ring: &[Note]) -> (usize, usize) {
+fn age(now: u64, at: u64) -> String {
+    let sec = now.saturating_sub(at) / 1000;
+    if sec < 60 { String::from("now") } else if sec < 3600 { alloc::format!("{}m", sec / 60) } else { alloc::format!("{}h", sec / 3600) }
+}
+
+/// Paint the Center and publish its item rows for the press router. Returns `(items, apps, shown)` — `shown` the
+/// ring indices of the items drawn (what opening the Center marks read).
+fn paint_center(ring: &[Note], now: u64) -> (usize, usize, Vec<usize>) {
+    ROW_N.store(0, Ordering::Release);
     let px = surf(STACK_MAX);
     let (pw, ph) = (metrics::size(CW), metrics::size(CH));
     frame(px, pw, CW, CH);
@@ -376,8 +410,9 @@ fn paint_center(ring: &[Note]) -> (usize, usize) {
     let (items, apps, rows) = center_model(ring);
     if items == 0 {
         let _ = metrics::text(px, pw, ph, CW, 12, HEAD_H + 16, b"No Notifications", theme::title_text_inactive(), false, face);
-        return (0, 0);
+        return (0, 0, Vec::new());
     }
+    let mut shown = Vec::new();
     let mut y = HEAD_H + 4;
     for (head, k) in rows {
         let n = &ring[k];
@@ -388,13 +423,26 @@ fn paint_center(ring: &[Note]) -> (usize, usize) {
         if head {
             let _ = metrics::text(px, pw, ph, CW, 12, y + (GROUP_H - ch) / 2, n.app(), theme::title_text_inactive(), true, face);
         } else {
+            if !n.read {
+                metrics::fill(px, pw, 5, y + ITEM_H / 2 - 3, 6, 6, theme::accent()); // unread dot
+            }
             icon(px, pw, ph, 14, y + 6, 28, n.app());
-            let _ = metrics::text(px, pw, ph, CW - 8, 52, y + 2, n.title(), theme::content_text(), true, face);
-            let _ = metrics::text(px, pw, ph, CW - 8, 52, y + 2 + ch, n.line(), theme::title_text_active(), false, face);
+            let _ = metrics::text(px, pw, ph, AGE_X - 4, 52, y + 2, n.title(), theme::content_text(), true, face);
+            let _ = metrics::text(px, pw, ph, AGE_X - 4, 52, y + 2 + ch, n.line(), theme::title_text_active(), false, face);
+            let _ = metrics::text(px, pw, ph, DX_X - 2, AGE_X, y + 2, age(now, n.at).as_bytes(), theme::title_text_inactive(), false, face);
+            let _ = metrics::text(px, pw, ph, CW - 8, DX_X + 4, y + (ITEM_H - ch) / 2, b"x", theme::title_text_inactive(), true, face);
+            let r = shown.len();
+            if r < ROWS_MAX {
+                ROW_Y[r].store(y, Ordering::Relaxed);
+                ROW_SEQ[r].store(n.seq, Ordering::Relaxed);
+                ROW_ACT[r].store(n.act != ACT_NONE, Ordering::Relaxed);
+                ROW_N.store(r + 1, Ordering::Release);
+            }
+            shown.push(k);
         }
         y += need;
     }
-    (items, apps)
+    (items, apps, shown)
 }
 
 // ── opening and closing rows ─────────────────────────────────────────────────────────────────────────────
@@ -490,20 +538,26 @@ fn center_close(st: &mut St, by: &str) {
     if w != wm::WIN_NONE {
         wm::close(w);
     }
-    serial_println!("[notify] center closed by={}", by);
+    ROW_N.store(0, Ordering::Release);
+    serial_println!("[notify] center close by={}", by);
 }
 
-fn center_show(st: &mut St, pw: usize) -> (usize, usize) {
+/// Paint and open (or repaint) the Center; the items it SHOWS are marked read and the badge recounted.
+/// Returns `(items, apps, shown)`.
+fn center_show(st: &mut St, pw: usize, now: u64) -> (usize, usize, usize) {
     let w = core::mem::replace(&mut st.center, wm::WIN_NONE);
     if w != wm::WIN_NONE {
         wm::close(w);
     }
-    let (items, apps) = paint_center(&st.ring);
+    let (items, apps, shown) = paint_center(&st.ring, now);
+    for &k in shown.iter() {
+        st.ring[k].read = true;
+    }
+    recount(&st.ring);
     let (x, y, _, _) = center_rect(pw);
     st.center = open_row(STACK_MAX, x, y);
     CENTER_OPEN.store(true, Ordering::Release);
-    UNREAD.store(0, Ordering::Relaxed);
-    (items, apps)
+    (items, apps, shown.len())
 }
 
 fn run_action(n: &Note) {
@@ -521,6 +575,18 @@ fn run_action(n: &Note) {
             if ok { "quarry-opened" } else { "quarry-declined" }
         }
         ACT_ANSWER => answer_poster(n.arg()), // REFUSALUI (B468): the bus poster gets INPUT_EV_DIALOG_ANSWER
+        ACT_OPEN_FILE => {
+            // NOTIFYCENTER (B622): the viewer's click-safe latch (drained by its own service pass).
+            #[cfg(feature = "facet")]
+            {
+                super::facet::request_open(s(n.arg()));
+                "viewer-requested"
+            }
+            #[cfg(not(feature = "facet"))]
+            {
+                "viewer-absent"
+            }
+        }
         _ => "none",
     };
     serial_println!("[notify] action {} app={} title={} -> {}", s(n.label()), s(n.app()), s(n.title()), what);
@@ -543,9 +609,14 @@ pub fn press_at(x: i32, y: i32) -> bool {
     }
     if let Some(b) = super::menubar::bell_box_abs(pw, ph) {
         if inside(px, py, b) {
+            serial_println!("[notify] bell press at=({},{}) box=({},{},{},{}) -> {}", px, py, b.0, b.1, b.2, b.3, if CENTER_OPEN.load(Ordering::Relaxed) { "center-close" } else { "center-open" }); // NOTIFYCENTER (B622)
             bell_switch(); // SMALLFIX4 (STATUSTRAY fold): a status menu that is down closes first — one press switches
             REQ_CENTER.store(1, Ordering::Release);
             return true;
+        }
+        if py >= b.1 && py < b.1 + b.3 && px + b.2 >= b.0 && px < b.0 + 2 * b.2 {
+            // NOTIFYCENTER (B622): a bar press within one bell width of the cell — the geometry witness.
+            serial_println!("[notify] bell press at=({},{}) box=({},{},{},{}) -> miss", px, py, b.0, b.1, b.2, b.3);
         }
     }
     if CENTER_OPEN.load(Ordering::Relaxed) && center_switch(pw, ph, px, py) {
@@ -557,6 +628,20 @@ pub fn press_at(x: i32, y: i32) -> bool {
             let (lx, ly) = (metrics::to_logical(px - r.0), metrics::to_logical(py - r.1));
             if inside(lx, ly, clear_rect()) {
                 REQ_CENTER.store(3, Ordering::Release);
+            } else {
+                // NOTIFYCENTER (B622): an item row — its `x` dismisses it, its body runs its action (if any).
+                for r in 0..ROW_N.load(Ordering::Acquire).min(ROWS_MAX) {
+                    let y0 = ROW_Y[r].load(Ordering::Relaxed);
+                    if ly >= y0 && ly < y0 + ITEM_H {
+                        let seq = ROW_SEQ[r].load(Ordering::Relaxed);
+                        if lx >= DX_X - 4 && lx < DX_X + DX_W + 4 {
+                            REQ_ITEM_DISMISS.store(seq, Ordering::Release);
+                        } else if ROW_ACT[r].load(Ordering::Relaxed) {
+                            REQ_ITEM_ACT.store(seq, Ordering::Release);
+                        }
+                        break;
+                    }
+                }
             }
             return true;
         }
@@ -644,7 +729,9 @@ fn pass(now: u64) {
     let creq = REQ_CENTER.swap(0, Ordering::AcqRel);
     let dis = REQ_DISMISS.swap(0, Ordering::AcqRel);
     let act = REQ_ACT.swap(0, Ordering::AcqRel);
-    let busy = k > 0 || creq != 0 || dis != 0 || act != 0 || CENTER_STALE.load(Ordering::Relaxed) || ST.try_lock().map(|g| g.cards.iter().any(|c| c.is_some())).unwrap_or(true);
+    let idis = REQ_ITEM_DISMISS.swap(0, Ordering::AcqRel);
+    let iact = REQ_ITEM_ACT.swap(0, Ordering::AcqRel);
+    let busy = k > 0 || creq != 0 || dis != 0 || act != 0 || idis != 0 || iact != 0 || CENTER_STALE.load(Ordering::Relaxed) || ST.try_lock().map(|g| g.cards.iter().any(|c| c.is_some())).unwrap_or(true);
     if !busy {
         return;
     }
@@ -665,18 +752,18 @@ fn pass(now: u64) {
         st.seq = st.seq.wrapping_add(1).max(1);
         n.seq = st.seq;
         n.at = now;
+        n.read = false;
         if st.ring.len() >= RING {
             st.ring.remove(0);
         }
         st.ring.push(*n);
+        recount(&st.ring); // NOTIFYCENTER (B622): the badge is the ring's unread count
         if !headless {
             POSTED.fetch_add(1, Ordering::Relaxed);
         }
         let collect = !shown || CENTER_OPEN.load(Ordering::Relaxed);
-        if !CENTER_OPEN.load(Ordering::Relaxed) {
-            UNREAD.fetch_add(1, Ordering::Relaxed);
-        } else {
-            CENTER_STALE.store(true, Ordering::Relaxed);
+        if CENTER_OPEN.load(Ordering::Relaxed) {
+            CENTER_STALE.store(true, Ordering::Relaxed); // the open Center repaints it (and marks it read)
         }
         if wire() { serial_println!("[notify] post app={} title={} dnd={} -> {}", s(n.app()), s(n.title()), dnd_now as u8, if collect { "collected" } else { "banner" }); }
         if !collect {
@@ -705,24 +792,42 @@ fn pass(now: u64) {
             }
         }
     }
+    // NOTIFYCENTER (B622): the open Center's item presses — dismiss one, or run one's action (the Center closes)
+    if idis != 0 && CENTER_OPEN.load(Ordering::Relaxed) {
+        if let Some(k) = st.ring.iter().position(|n| n.seq == idis) {
+            let n = st.ring.remove(k);
+            recount(&st.ring);
+            serial_println!("[notify] center dismiss title={} left={}", s(n.title()), st.ring.len());
+            CENTER_STALE.store(true, Ordering::Relaxed);
+        }
+    }
+    if iact != 0 && CENTER_OPEN.load(Ordering::Relaxed) {
+        if let Some(k) = st.ring.iter().position(|n| n.seq == iact) {
+            st.ring[k].read = true;
+            recount(&st.ring);
+            let n = st.ring[k];
+            center_close(&mut st, "action");
+            run_action(&n);
+        }
+    }
     match creq {
         1 if CENTER_OPEN.load(Ordering::Relaxed) => center_close(&mut st, "bell"),
         1 => {
-            let (items, apps) = center_show(&mut st, pw);
-            serial_println!("[notify] center open items={} apps={} unread=0", items, apps);
+            let (items, apps, shown) = center_show(&mut st, pw, now);
+            serial_println!("[notify] center open items={} unread={} apps={} shown={}", items, unread(), apps, shown);
         }
         2 => center_close(&mut st, "outside"),
         3 => {
             let n = st.ring.len();
             st.ring.clear();
-            UNREAD.store(0, Ordering::Relaxed);
+            recount(&st.ring);
             serial_println!("[notify] clear n={}", n);
-            let _ = center_show(&mut st, pw);
+            let _ = center_show(&mut st, pw, now);
         }
         _ => {}
     }
     if CENTER_STALE.swap(false, Ordering::Relaxed) && CENTER_OPEN.load(Ordering::Relaxed) {
-        let _ = center_show(&mut st, pw);
+        let _ = center_show(&mut st, pw, now);
     }
     // hover pauses; time closes
     let ptr = if headless {
@@ -797,7 +902,10 @@ fn restore(h: Held) {
     REQ_CENTER.store(0, Ordering::Relaxed);
     REQ_DISMISS.store(0, Ordering::Relaxed);
     REQ_ACT.store(0, Ordering::Relaxed);
-    CENTER_STALE.store(false, Ordering::Relaxed);
+    REQ_ITEM_DISMISS.store(0, Ordering::Relaxed);
+    REQ_ITEM_ACT.store(0, Ordering::Relaxed);
+    ROW_N.store(0, Ordering::Relaxed);
+    CENTER_STALE.store(h.4, Ordering::Relaxed); // NOTIFYCENTER (B622): a live open Center repaints (its press rows republish)
 }
 
 fn top_title_is(t: &[u8]) -> bool {
@@ -810,15 +918,20 @@ pub fn test() {
     let h = hold();
     DND.store(false, Ordering::Relaxed);
     let t0 = 1_000_000u64;
-    // (1) the stack: six posts, four cards, newest on top, the toast's front included
+    // (1) the stack: six posts, four cards, newest on top, the toast's front included.
+    // NOTIFYCENTER (B622): the toast posts in its OWN pass after the five. One pass drains the toast queue BEFORE the
+    // inbound queue (`take_inbound`), so a same-pass toast was the OLDEST card and closed by overflow — flight 34's
+    // `-> FAIL` with every printed field ok: `top` was false and `stack_max=` printed the count (4) either way.
     let mut posted_ok = true;
     for k in 0..5u8 {
         posted_ok &= post_full(b"quarry", &[b'N', b'0' + k], b"fixture line", b"", ACT_NONE, b"");
     }
+    pass(t0);
     posted_ok &= super::toast::post(b"Screenshot saved", b"fixture toast");
     pass(t0);
     let stack = banners();
-    let stack_ok = stack == STACK_MAX && top_title_is(b"Screenshot saved");
+    let top_ok = top_title_is(b"Screenshot saved");
+    let stack_ok = stack == STACK_MAX && top_ok;
     // a press on the top card's body dismisses it; on a button runs the action
     let pk = PANEL.load(Ordering::Relaxed);
     let pw = (pk >> 32) as usize;
@@ -834,7 +947,7 @@ pub fn test() {
     // hover-free expiry
     pass(t0 + 3 + CARD_MS + 1);
     let expire_ok = banners() == 0;
-    // (2) the ring: 105 posts keep the last 100 (the wire muted for the bulk)
+    // (2) the ring: 105 posts keep the last RING (the wire muted for the bulk)
     MUTE.store(true, Ordering::Relaxed);
     for k in 0..105u32 {
         let d = [b'0' + (k / 100) as u8, b'0' + (k / 10 % 10) as u8, b'0' + (k % 10) as u8];
@@ -845,14 +958,17 @@ pub fn test() {
     }
     MUTE.store(false, Ordering::Relaxed);
     let ring_n = ST.lock().ring.len();
-    let ring_ok = ring_n == RING && ST.lock().ring.last().map(|n| n.line() == b"104").unwrap_or(false);
+    let ring_last = ST.lock().ring.last().map(|n| n.line() == b"104").unwrap_or(false);
+    let ring_ok = ring_n == RING && ring_last;
     let badge_before = unread();
-    // (3) the Center: the bell opens it (badge clears), grouped by app, Clear empties it, a press outside closes it
+    // (3) the Center: the bell opens it (the items it SHOWS are read), grouped by app, Clear empties it, a press outside
+    // closes it
     REQ_CENTER.store(1, Ordering::Release);
     pass(t0 + 200);
     let (items, apps, rows) = { let g = ST.lock(); center_model(&g.ring) };
     let first_newest = ST.lock().ring.get(rows.get(1).map(|r| r.1).unwrap_or(0)).map(|n| n.line() == b"104").unwrap_or(false);
-    let center_ok_a = center_open() && unread() == 0 && items == RING && apps >= 2 && first_newest;
+    let read_n = ST.lock().ring.iter().filter(|n| n.read).count();
+    let center_ok_a = center_open() && read_n > 0 && unread() as usize == RING - read_n && items == RING && apps >= 2 && first_newest;
     let cr = center_rect(pw);
     let c = clear_rect();
     let clear_press = press_at((cr.0 + metrics::size(c.0 + 4)) as i32, (cr.1 + metrics::size(c.1 + 4)) as i32);
@@ -872,16 +988,45 @@ pub fn test() {
     let _ = post_full(b"system", b"DND fixture", b"collected", b"", ACT_NONE, b"");
     pass(t_dnd + 1);
     let dnd_ok = banners() == 0 && unread() == 1 && ST.lock().ring.len() == 1;
+    // (5) NOTIFYCENTER (B622, R116): two posts, their cards time out — both KEPT and unread=2; the bell's open marks
+    // them read (unread=0); an item's `x` dismisses it; a press outside closes the Center.
+    DND.store(false, Ordering::Relaxed);
+    { let mut g = ST.lock(); g.ring.clear(); recount(&g.ring); }
+    let t5 = t_dnd + 10;
+    let _ = post_full(b"system", b"Kept one", b"first", b"", ACT_NONE, b"");
+    let _ = post_full(b"system", b"Kept two", b"second", b"", ACT_NONE, b"");
+    pass(t5);
+    let shown2 = banners() == 2;
+    pass(t5 + CARD_MS + 1);
+    let center_kept = ST.lock().ring.len();
+    let unread_kept = unread();
+    let kept_ok = shown2 && banners() == 0 && center_kept == 2 && unread_kept == 2;
+    REQ_CENTER.store(1, Ordering::Release);
+    pass(t5 + CARD_MS + 2);
+    let opened_unread = unread();
+    let open_ok = center_open() && opened_unread == 0 && ROW_N.load(Ordering::Acquire) == 2;
+    let cr = center_rect(pw);
+    let dy = ROW_Y[0].load(Ordering::Relaxed) + ITEM_H / 2;
+    let dismiss_ok = press_at((cr.0 + metrics::size(DX_X + DX_W / 2)) as i32, (cr.1 + metrics::size(dy)) as i32) && REQ_ITEM_DISMISS.load(Ordering::Acquire) != 0 && {
+        pass(t5 + CARD_MS + 3);
+        let g = ST.lock();
+        let left_oldest = g.ring.len() == 1 && g.ring[0].title() == b"Kept one"; // the newest (row 0) went
+        left_oldest
+    };
+    let _ = press_at(4, (cr.1 + cr.3 + 40) as i32);
+    pass(t5 + CARD_MS + 4);
+    let center_leg = kept_ok && open_ok && dismiss_ok && !center_open();
     let kept = FOCUS_MOVED.load(Ordering::Relaxed) == 0;
     restore(h);
     let posted = POSTED.load(Ordering::Relaxed);
-    let ok = posted_ok && stack_ok && press_ok && action_ok && expire_ok && ring_ok && center_ok && badge_ok && dnd_ok && kept;
+    let ok = posted_ok && stack_ok && press_ok && action_ok && expire_ok && ring_ok && center_ok && badge_ok && dnd_ok && center_leg && kept;
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: NOTIFY: stack_max={} center={} ring={} badge={} dnd={} posted={} -> {} :: press={} action={} expire={} dnd_collect={} focus={} dropped={}",
-        if stack_ok { STACK_MAX } else { stack }, if center_ok { "ok" } else { "FAIL" }, ring_n, if badge_ok { "ok" } else { "FAIL" },
-        dnd_real as u8, posted, if ok { "PASS" } else { "FAIL" },
-        if press_ok { "ok" } else { "FAIL" }, if action_ok { "ok" } else { "FAIL" }, if expire_ok { "ok" } else { "FAIL" },
-        if dnd_ok { "ok" } else { "FAIL" }, if kept { "kept" } else { "MOVED" }, DROPPED.load(Ordering::Relaxed)
+        ":: NOTIFY: stack_max={} center={} ring={} badge={} dnd={} posted={} center_kept={} unread={} -> {} :: top={} posts={} ring_last={} press={} action={} expire={} dnd_collect={} opened_unread={} dismiss={} focus={} dropped={}",
+        if stack_ok { STACK_MAX } else { stack }, w(center_ok), ring_n, w(badge_ok),
+        dnd_real as u8, posted, center_kept, unread_kept, if ok { "PASS" } else { "FAIL" },
+        w(top_ok), w(posted_ok), w(ring_last), w(press_ok), w(action_ok), w(expire_ok),
+        w(dnd_ok), opened_unread, w(dismiss_ok), if kept { "kept" } else { "MOVED" }, DROPPED.load(Ordering::Relaxed)
     );
 }
 
