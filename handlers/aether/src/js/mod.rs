@@ -72,6 +72,8 @@ pub mod shadow;
 pub mod sw;
 /// AETHERMEDIA2 (SR134): text tracks, requestVideoFrameCallback, PiP / captureStream refusals.
 pub mod tracks;
+/// AETHERWPT2 (SR135): User Timing and the Performance Timeline (marks, measures, PerformanceObserver).
+pub mod timeline;
 pub mod traversal;
 pub mod net;
 pub mod window;

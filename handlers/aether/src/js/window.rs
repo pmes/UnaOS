@@ -1583,6 +1583,8 @@ pub fn install(vm: &mut Vm) {
     // crypto, fetch/XMLHttpRequest, storage, MessageChannel, the observer stubs, structuredClone.
     crate::api::fetch::init(vm);
     crate::api::platform::init(vm);
+    // AETHERWPT2 (SR135): marks, measures and a delivering PerformanceObserver (after COMPAT's stub).
+    super::timeline::install(vm);
 
     // AETHERFRAMES (SR83): `contentDocument`/`contentWindow`, the clone and cross-origin helpers, and
     // the top context's record (after the preludes, which the nested realms share).

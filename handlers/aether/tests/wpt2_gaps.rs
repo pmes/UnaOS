@@ -168,3 +168,31 @@ R.push(Object.getOwnPropertyNames(proto).length, Object.getPrototypeOf(proto) ==
     );
     assert_eq!(got, "0|true|[object console]|count:conversion error|countReset:conversion error|time:conversion error|timeLog:conversion error|timeEnd:conversion error");
 }
+
+/// G8 — User Timing §3.1 and Performance Timeline §3–§4: marks and measures in the entry buffer, `measure`
+/// between marks, a PerformanceTiming name refused as a mark, an unknown mark a SyntaxError, and an observer that
+/// is delivered its entries (with `droppedEntriesCount` 0 on the first callback) in a task.
+#[test]
+fn g8_performance_timeline_delivers() {
+    let mut e = load(&page(
+        r#"
+var obs = new PerformanceObserver(function (list, o, options) {
+    R.push(list.getEntries().map(function (x) { return x.entryType + ':' + x.name; }).join(','), options.droppedEntriesCount, o === obs);
+});
+obs.observe({ type: 'mark' });
+try { obs.observe({ entryTypes: ['measure'] }); R.push('no throw'); } catch (e) { R.push(e.name); }
+performance.mark('a', { startTime: 3, detail: { x: 1 } });
+performance.mark('b', { startTime: 12.5 });
+var m = performance.measure('m', 'a', 'b');
+R.push(m.startTime, m.duration, m.entryType, m instanceof PerformanceEntry, performance.getEntriesByName('a')[0].detail.x);
+try { performance.mark('navigationStart'); R.push('no throw'); } catch (e) { R.push(e.name); }
+try { performance.measure('z', 'nope'); R.push('no throw'); } catch (e) { R.push(e.name); }
+R.push(performance.getEntries().map(function (x) { return x.name; }).join(','), JSON.stringify(m.toJSON()));
+R.push(PerformanceObserver.supportedEntryTypes === PerformanceObserver.supportedEntryTypes, PerformanceObserver.supportedEntryTypes.join(','));
+"#,
+    ));
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        "InvalidModificationError|3|9.5|measure|true|1|SyntaxError|SyntaxError|a,m,b|{\"name\":\"m\",\"entryType\":\"measure\",\"startTime\":3,\"duration\":9.5}|true|mark,measure|mark:a,mark:b|0|true"
+    );
+}
