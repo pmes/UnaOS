@@ -479,3 +479,19 @@ pub fn vertical_pointer(il: &InlineLayout, b: &TextBox, p: (f32, f32)) -> (f32, 
     let (sx, sy) = crate::writing::to_logical(il.vertical, p.0 - ox, p.1 - oy, il.height.ceil(), il.inline_extent.ceil(), &lines);
     (ox + sx, oy + sy)
 }
+
+/// AETHERSTYLE3C (SR122): the caret before `caret_x` (from the fragment's pen origin) in text box `b` of IFC
+/// `il`, as a rectangle (x, y, w, h) in the box's space: a vertical bar on the line in horizontal text, a
+/// horizontal bar across the line's column in vertical text (`writing::caret_rect`, the inverse of
+/// [`vertical_pointer`]'s mapping) — the caret of a vertical edit field.
+pub fn caret_rect(il: &InlineLayout, b: &TextBox, caret_x: f32) -> (f32, f32, f32, f32) {
+    let flat = (b.x + caret_x, b.top, 1.0, b.bottom - b.top);
+    if il.vertical == 0 {
+        return flat;
+    }
+    let Some(Frag::Text { x: fx, baseline, .. }) = il.frags.get(b.frag) else { return flat };
+    let Some((_, lt, lh)) = line_of(il, *baseline) else { return flat };
+    let (ox, oy) = (b.x - fx, b.top - lt);
+    let (x, y, w, h) = crate::writing::caret_rect(il.vertical, fx + caret_x, lt, lh, il.height.ceil(), il.inline_extent.ceil());
+    (ox + x, oy + y, w, h)
+}

@@ -16,8 +16,15 @@
 //!   TransitionEvent / AnimationEvent with `propertyName` / `animationName`, `elapsedTime` and `pseudoElement`;
 //!   the script animations that finished resolve `finished` and fire `finish` (an AnimationPlaybackEvent).
 //!
-//! Not modelled: `composite` other than `replace`, `iterationStart`, `commitStyles()` (a no-op),
-//! `ScrollTimeline` / `ViewTimeline`, the pending (play-pending) state — `ready` is resolved at once.
+//! AETHERSTYLE3C (SR122): the effect's `composite` (`replace` / `add` / `accumulate`, from the options or the
+//! `composite` setter) and `iterationStart` go to the timeline with the timing; `commitStyles()` writes the
+//! values the animation applies now (`Timeline::effect_values`, composited onto the cascaded value) into the
+//! target's inline style through `style.setProperty`; `pause()` / `play()` work on a CSSTransition (the
+//! timeline holds and resumes the transition); `play()` / `pause()` / a new animation are pending until the next
+//! frame samples the timeline — `pending` is true, `startTime` null, and `ready` resolves when [`poll`] hands
+//! the frame's resolved handles (`Timeline::take_ready`) to the prelude.
+//!
+//! Not modelled: per-keyframe `composite`, `iterationComposite`, `ScrollTimeline` / `ViewTimeline`.
 
 use super::events;
 use super::idl::{arg, s};
@@ -80,6 +87,17 @@ fn timing_of(t: &J) -> Result<ScriptTiming, String> {
     let easing = Easing::parse(easing_s).ok_or_else(|| format!("'{easing_s}' is not a valid value for easing"))?;
     let direction = t.get("direction").and_then(J::as_str).unwrap_or("normal");
     let fill = t.get("fill").and_then(J::as_str).unwrap_or("auto");
+    let iteration_start = n("iterationStart", 0.0);
+    if !(iteration_start >= 0.0) || !iteration_start.is_finite() {
+        return Err("iterationStart must be non-negative".into());
+    }
+    let composite = t.get("composite").and_then(J::as_str).unwrap_or("replace");
+    let composite = match composite {
+        "replace" | "auto" => 0,
+        "add" => 1,
+        "accumulate" => 2,
+        c => return Err(format!("'{c}' is not a valid value for composite")),
+    };
     Ok(ScriptTiming {
         duration: n("duration", 0.0).max(0.0),
         delay: n("delay", 0.0),
@@ -88,8 +106,12 @@ fn timing_of(t: &J) -> Result<ScriptTiming, String> {
         direction: DIRECTIONS.iter().position(|d| *d == direction).ok_or_else(|| format!("'{direction}' is not a valid value for direction"))? as u8,
         fill: if fill == "auto" { 0 } else { FILLS.iter().position(|f| *f == fill).ok_or_else(|| format!("'{fill}' is not a valid value for fill"))? as u8 },
         easing,
+        iteration_start,
+        composite,
     })
 }
+
+const COMPOSITES: [&str; 3] = ["replace", "add", "accumulate"];
 
 fn timing_json(t: &ScriptTiming) -> J {
     json!({
@@ -100,6 +122,8 @@ fn timing_json(t: &ScriptTiming) -> J {
         "direction": DIRECTIONS[(t.direction & 3) as usize],
         "fill": FILLS[(t.fill & 3) as usize],
         "easing": easing_text(&t.easing),
+        "iterationStart": t.iteration_start,
+        "composite": COMPOSITES[(t.composite as usize).min(2)],
     })
 }
 
@@ -213,7 +237,12 @@ fn anim_native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
                 "progress": i.progress,
                 "iteration": i.current_iteration,
                 "target": i.key.0,
+                "pending": i.pending,
             }),
+        },
+        "commit" => match with_timeline(|t| t.info(id, now)).map(|i| i.key) {
+            None => J::Null,
+            Some(k) => J::Object(crate::css::anim::commit_values(id, k).into_iter().map(|(p, v)| (p, J::String(v))).collect()),
         },
         "list" => json!(with_timeline(|t| t.animation_ids(el.map(NodeId).as_ref()))),
         "target" => {
@@ -319,6 +348,21 @@ pub fn poll(vm: &mut Vm) -> usize {
             return n;
         }
     }
+    // AETHERSTYLE3C (SR122): the pending plays / pauses the last frame resolved — their `ready` promises.
+    let ready = crate::css::anim::with_timeline(|t| t.take_ready());
+    if !ready.is_empty() {
+        let g = vm.realm().global;
+        let f = vm.get(g, &PropertyKey::from_str("__anim_ready")).unwrap_or(Value::Undefined);
+        if vm.is_callable(&f) {
+            let ids = json!(ready).to_string();
+            super::invoke(vm, "animation-ready", &f, &Value::Undefined, &[s(&ids)]);
+            super::checkpoint(vm);
+            n += ready.len();
+        }
+        if super::engine_poisoned() {
+            return n;
+        }
+    }
     let done = crate::css::anim::with_timeline(|t| t.take_finished());
     if !done.is_empty() {
         let g = vm.realm().global;
@@ -399,11 +443,15 @@ const PRELUDE: &str = r#"
         return out;
     };
     var normTiming = function (o) {
-        var t = { duration: 0, delay: 0, endDelay: 0, iterations: 1, direction: 'normal', fill: 'auto', easing: 'linear', iterationStart: 0 };
+        var t = { duration: 0, delay: 0, endDelay: 0, iterations: 1, direction: 'normal', fill: 'auto', easing: 'linear', iterationStart: 0, composite: 'replace' };
         if (typeof o === 'number') { t.duration = o; }
         else if (o !== null && o !== undefined && typeof o === 'object') {
-            ['duration', 'delay', 'endDelay', 'iterations', 'direction', 'fill', 'easing', 'iterationStart'].forEach(function (k) { if (o[k] !== undefined) { t[k] = o[k]; } });
+            ['duration', 'delay', 'endDelay', 'iterations', 'direction', 'fill', 'easing', 'iterationStart', 'composite'].forEach(function (k) { if (o[k] !== undefined) { t[k] = o[k]; } });
         }
+        t.iterationStart = Number(t.iterationStart);
+        if (!(t.iterationStart >= 0) || !isFinite(t.iterationStart)) { throw new TypeError("iterationStart must be non-negative"); }
+        t.composite = String(t.composite);
+        if (['replace', 'add', 'accumulate'].indexOf(t.composite) < 0) { throw new TypeError("'" + t.composite + "' is not a valid value for composite"); }
         if (t.duration === 'auto') { t.duration = 0; }
         t.duration = Number(t.duration); t.delay = Number(t.delay); t.endDelay = Number(t.endDelay); t.iterations = Number(t.iterations);
         if (!(t.duration >= 0)) { throw new TypeError("duration must be non-negative or auto"); }
@@ -413,10 +461,10 @@ const PRELUDE: &str = r#"
         return t;
     };
     var wire = function (t) {
-        return { duration: t.duration, delay: t.delay, endDelay: t.endDelay, iterations: t.iterations === Infinity ? -1 : t.iterations, direction: t.direction, fill: t.fill, easing: t.easing };
+        return { duration: t.duration, delay: t.delay, endDelay: t.endDelay, iterations: t.iterations === Infinity ? -1 : t.iterations, direction: t.direction, fill: t.fill, easing: t.easing, iterationStart: t.iterationStart || 0, composite: t.composite || 'replace' };
     };
     var unwire = function (t) {
-        return { delay: t.delay, endDelay: t.endDelay, fill: t.fill, iterationStart: 0, iterations: t.iterations < 0 ? Infinity : t.iterations, duration: t.duration, direction: t.direction, easing: t.easing };
+        return { delay: t.delay, endDelay: t.endDelay, fill: t.fill, iterationStart: t.iterationStart || 0, iterations: t.iterations < 0 ? Infinity : t.iterations, duration: t.duration, direction: t.direction, easing: t.easing };
     };
     var framesOut = function (list) {
         return list.map(function (f) {
@@ -443,7 +491,7 @@ const PRELUDE: &str = r#"
         }
         updateTiming(o) {
             var fx = FX.get(this), cur = this.getTiming();
-            var t = normTiming(Object.assign({}, cur, o || {}));
+            var t = normTiming(Object.assign({}, cur, { composite: fx.timing.composite }, o || {}));
             fx.timing = t;
             var id = fx.anim ? ST.get(fx.anim).id : 0;
             if (id) { call('timing', null, { id: id, timing: wire(t) }); }
@@ -463,7 +511,19 @@ const PRELUDE: &str = r#"
         get target() { return FX.get(this).target; }
         set target(v) { FX.get(this).target = v; }
         get pseudoElement() { return null; }
-        get composite() { return 'replace'; }
+        get composite() {
+            var fx = FX.get(this), id = fx.anim ? ST.get(fx.anim).id : 0;
+            if (id) { var i = call('info', null, { id: id }); if (i) { return i.timing.composite; } }
+            return fx.timing.composite || 'replace';
+        }
+        set composite(v) {
+            var c = String(v);
+            if (['replace', 'add', 'accumulate'].indexOf(c) < 0) { throw new TypeError("'" + c + "' is not a valid value for composite"); }
+            var fx = FX.get(this);
+            fx.timing.composite = c;
+            var id = fx.anim ? ST.get(fx.anim).id : 0;
+            if (id) { call('timing', null, { id: id, timing: wire(fx.timing) }); }
+        }
         getKeyframes() {
             var fx = FX.get(this), id = fx.anim ? ST.get(fx.anim).id : 0;
             if (id) { var k = call('frames', null, { id: id }); if (k) { return framesOut(k); } }
@@ -500,6 +560,11 @@ const PRELUDE: &str = r#"
         st.done = false;
     };
     var state = function (a) { return ST.get(a); };
+    // AETHERSTYLE3C (SR122): a play / pause makes `ready` a fresh promise the next frame resolves
+    var arm = function (st) {
+        st.readyP = new Promise(function (res, rej) { st.readyRes = res; st.readyRej = rej; });
+        st.readyP.catch(function () {});
+    };
     var ensure = function (a, idle) {
         var st = state(a);
         if (st.id) { return st.id; }
@@ -507,6 +572,7 @@ const PRELUDE: &str = r#"
         if (!fx || !fx.target) { return 0; }
         var r = call('animate', fx.target, { keyframes: fx.frames, timing: wire(fx.timing), name: st.name, idle: !!idle });
         st.id = r.id;
+        if (!idle) { arm(st); }
         OBJS.set(st.id, a);
         return st.id;
     };
@@ -534,7 +600,7 @@ const PRELUDE: &str = r#"
         get timeline() { return timeline; }
         get playState() { var i = info(this); return i ? i.state : 'idle'; }
         get replaceState() { return 'active'; }
-        get pending() { return false; }
+        get pending() { var i = info(this); return i ? !!i.pending : false; }
         get currentTime() { var i = info(this); return i ? i.currentTime : null; }
         set currentTime(v) {
             if (v === null) { return; }
@@ -550,7 +616,7 @@ const PRELUDE: &str = r#"
         get playbackRate() { var i = info(this); return i ? i.rate : 1; }
         set playbackRate(v) { var id = ensure(this, true); if (id) { call('rate', null, { id: id, rate: Number(v) }); } }
         updatePlaybackRate(v) { this.playbackRate = v; }
-        get ready() { return Promise.resolve(this); }
+        get ready() { var st = state(this); if (!st.readyP) { st.readyP = Promise.resolve(this); } return st.readyP; }
         get finished() { return state(this).finished; }
         get onfinish() { return state(this).handlers.finish || null; }
         set onfinish(f) { state(this).handlers.finish = f; }
@@ -566,12 +632,15 @@ const PRELUDE: &str = r#"
             if (call('play', null, { id: id }) !== true) {
                 throw new DOMException("Failed to execute 'play' on 'Animation': Cannot play reversed Animation with infinite target effect end.", 'InvalidStateError');
             }
+            if (!st.readyRes) { arm(st); }
         }
         pause() {
             var id = ensure(this, true);
             if (id && call('pause', null, { id: id }) !== true) {
                 throw new DOMException("Failed to execute 'pause' on 'Animation': Cannot pause, Animation has infinite target effect end.", 'InvalidStateError');
             }
+            var pst = state(this);
+            if (id && !pst.readyRes) { arm(pst); }
         }
         finish() {
             var id = ensure(this, true);
@@ -584,6 +653,11 @@ const PRELUDE: &str = r#"
             if (!st.id) { return; }
             var was = this.playState;
             call('cancel', null, { id: st.id });
+            if (st.readyRes) {
+                st.readyRej(new DOMException('The user aborted a request.', 'AbortError'));
+                st.readyRes = null;
+                st.readyP = null;
+            }
             if (was !== 'idle') {
                 if (!st.done) {
                     st.reject(new DOMException('The user aborted a request.', 'AbortError'));
@@ -597,7 +671,13 @@ const PRELUDE: &str = r#"
             if (id) { var st = state(this); if (st.done) { fresh(st, this); } call('reverse', null, { id: id }); }
         }
         persist() {}
-        commitStyles() {}
+        commitStyles() {
+            var st = state(this), fx = st.effect ? FX.get(st.effect) : null;
+            if (!st.id || !fx || !fx.target || !fx.target.style) { return; }
+            var vals = call('commit', null, { id: st.id }) || {};
+            var tgt = fx.target;
+            Object.keys(vals).forEach(function (p) { tgt.style.setProperty(p, vals[p]); });
+        }
     }
     class CSSAnimation extends Animation {
         get animationName() { return state(this).cssName; }
@@ -624,6 +704,14 @@ const PRELUDE: &str = r#"
         return call('list', el, {}).map(wrapCss).filter(function (a) { return a !== null; });
     };
     timeline = new DocumentTimeline();
+    hide('__anim_ready', function (json) {
+        JSON.parse(json).forEach(function (id) {
+            var a = OBJS.get(id);
+            if (!a) { return; }
+            var st = state(a);
+            if (st.readyRes) { var r = st.readyRes; st.readyRes = null; r(a); }
+        });
+    });
     hide('__anim_settle', function (json) {
         JSON.parse(json).forEach(function (id) {
             var a = OBJS.get(id);

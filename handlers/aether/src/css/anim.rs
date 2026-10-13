@@ -75,6 +75,19 @@ pub(crate) fn base_value(el: NodeId, prop: &str) -> Option<String> {
     PREV.with(|p| value_of(p.borrow().get(&el).map(|s| &**s), prop))
 }
 
+/// AETHERSTYLE3C (SR122): `commitStyles()` — the values animation `id` applies now on `el`, as (property, CSS
+/// text), composited onto `el`'s cascaded values (`layout_core::anim::Timeline::effect_values`).
+pub(crate) fn commit_values(id: u64, el: NodeId) -> Vec<(String, String)> {
+    let cx = parse_cx();
+    let now = now_ms();
+    let vals = PREV.with(|p| {
+        let p = p.borrow();
+        let base = |prop: &str| value_of(p.get(&el).map(|s| &**s), prop);
+        TIMELINE.with(|t| t.borrow().effect_values::<AetherHost>(id, now, &base, &cx))
+    });
+    vals.unwrap_or_default().into_iter().map(|(p, v)| (p, layout_core::anim::to_css(&v))).collect()
+}
+
 /// AETHERSTYLE3B (SR115): the events since the last call, with their `elapsedTime`, for the script lane.
 pub(crate) fn take_timed_events() -> Vec<TimedEvent<NodeId>> {
     drain_events();

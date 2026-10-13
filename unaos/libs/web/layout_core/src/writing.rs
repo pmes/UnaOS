@@ -24,6 +24,13 @@
 //! inline advance stays the horizontal one (a full-width glyph's advance is its 1em vertical advance; a
 //! proportional glyph forced upright keeps its own width as its cell). Pointer hit testing maps a physical
 //! point back into the staging space ([`to_logical`]), which is what makes selection work in vertical text.
+//!
+//! AETHERSTYLE3C (SR122): `text-combine-upright: all` (§9.1) lays a run out as ONE upright cell 1em long in the
+//! inline direction; its glyphs keep their horizontal axis and are compressed horizontally to fit
+//! ([`CombinedCell`]: the cell and its scale). Under `text-orientation: upright` a glyph that is not natively
+//! upright (Latin, digits) takes a 1em vertical advance, centred in its cell (the font's vertical metrics; a
+//! full-width glyph already advances 1em). A caret in vertical text is a horizontal bar across its line's
+//! column ([`caret_rect`]; `hit::caret_rect` maps a text box's caret offset into the box's physical space).
 
 use crate::prelude::*;
 use crate::tree::TextRun;
@@ -149,6 +156,26 @@ pub struct UprightCell {
     pub w: f32,
     pub top: f32,
     pub h: f32,
+}
+
+/// AETHERSTYLE3C (SR122): one `text-combine-upright: all` run of a vertical IFC: its 1em cell (in the IFC's
+/// `upright` cells too) and the horizontal scale (<= 1) the painter draws its glyphs at so they fit the cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CombinedCell {
+    pub cell: UprightCell,
+    pub scale: f32,
+}
+
+/// AETHERSTYLE3C (SR122): the caret before staging x `x` on the line (`top`, `h`) of a vertical IFC (`block` /
+/// `inline` as in [`to_physical`]) as a physical rectangle (x, y, w, h) in its content box: a 1px bar across
+/// the line's column at the inline position. A horizontal root's caret is the usual vertical bar.
+pub fn caret_rect(mode: u8, x: f32, top: f32, h: f32, block: f32, inline: f32) -> (f32, f32, f32, f32) {
+    match mode {
+        HORIZONTAL_TB => (x, top, 1.0, h),
+        VERTICAL_LR => (top, x, h, 1.0),
+        SIDEWAYS_LR => (top, inline - x, h, 1.0),
+        _ => (block - top - h, x, h, 1.0),
+    }
 }
 
 /// Where staging pixel (x, y) lands when it lies in an upright cell (None otherwise, or in a sideways mode,

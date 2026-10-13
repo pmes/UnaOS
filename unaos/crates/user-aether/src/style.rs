@@ -55,6 +55,22 @@ impl DomNode for N {
     fn attr(&self, name: &str) -> Option<String> {
         self.doc.element(self.id).and_then(|e| e.attr(name)).map(String::from)
     }
+    // AETHERSTYLE3C (SR122): the element's attributes in source order (a foreign attribute under its prefix,
+    // `xlink:href`), so `layout_core::effects::resolve_filter` can serialize a referenced SVG `<filter>` for
+    // svg_core — `filter: url(#id)` resolves on this ring as on the host.
+    fn attrs(&self) -> Vec<(String, String)> {
+        let Some(e) = self.doc.element(self.id) else { return Vec::new() };
+        e.attrs
+            .iter()
+            .map(|a| {
+                let name = match a.prefix {
+                    Some(p) => alloc::format!("{}:{}", p, a.local),
+                    None => a.local.clone(),
+                };
+                (name, a.value.clone())
+            })
+            .collect()
+    }
     fn text(&self) -> String {
         match self.doc.data(self.id) {
             NodeData::Text(t) => t.clone(),

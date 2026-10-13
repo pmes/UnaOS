@@ -222,6 +222,16 @@ pub struct PaintStyle<H: Host> {
     pub scroll_padding: Option<[f32; 4]>,
     /// AETHERSTYLE3B (SR115): `column-span` (css-multicol-1 §6.1): true = `all`.
     pub col_span: Option<bool>,
+    /// AETHERSTYLE3C (SR122): `box-decoration-break` (css-break-3 §5.4): true = `clone`, false = `slice`.
+    pub deco_clone: Option<bool>,
+    /// AETHERSTYLE3C (SR122): `text-combine-upright` (css-writing-modes-4 §9.1), inherited: true = `all`.
+    pub text_combine: Option<bool>,
+    /// AETHERSTYLE3C (SR122): `scroll-margin` (css-scroll-snap-1 §6.3) in px: [top, right, bottom, left] — the
+    /// snap area's outsets from the border box.
+    pub scroll_margin: Option<[f32; 4]>,
+    /// AETHERSTYLE3C (SR122): `container-type` names `scroll-state` (css-conditional-5 §2.1): the box answers
+    /// `@container scroll-state()` queries ([`crate::scroll::scroll_state`]).
+    pub container_scroll: Option<bool>,
 }
 
 
@@ -322,6 +332,10 @@ impl<H: Host> Default for PaintStyle<H> {
             snap_stop: None,
             scroll_padding: None,
             col_span: None,
+            deco_clone: None,
+            text_combine: None,
+            scroll_margin: None,
+            container_scroll: None,
         }
     }
 }

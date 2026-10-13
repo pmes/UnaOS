@@ -1019,9 +1019,94 @@ pub fn to_css(v: &AnimValue) -> String {
             let ch = |x: f32| x.round().clamp(0.0, 255.0) as u8;
             format!("rgba({}, {}, {}, {})", ch(c[0]), ch(c[1]), ch(c[2]), fmt_f(c[3].clamp(0.0, 1.0)))
         }
-        AnimValue::Transform(_) => String::from("none"),
+        AnimValue::Transform(ops) => transform_css(ops),
         AnimValue::Discrete(s) => s.clone(),
     }
+}
+
+/// AETHERSTYLE3C (SR122): a transform list as CSS text (`none` when empty): translations as
+/// `translate(<px> + <pct>)` lengths, every other function as the `matrix()` it was flattened to.
+pub fn transform_css(ops: &[TransformOp]) -> String {
+    if ops.is_empty() {
+        return String::from("none");
+    }
+    let lp = |v: crate::paint::LenPct| match (v[0] != 0.0, v[1] != 0.0) {
+        (_, false) => format!("{}px", fmt_f(v[0])),
+        (false, true) => format!("{}%", fmt_f(v[1] * 100.0)),
+        (true, true) => format!("calc({}px + {}%)", fmt_f(v[0]), fmt_f(v[1] * 100.0)),
+    };
+    let parts: Vec<String> = ops
+        .iter()
+        .map(|o| match o {
+            TransformOp::Translate(x, y) => format!("translate({}, {})", lp(*x), lp(*y)),
+            TransformOp::Matrix(m) => format!("matrix({}, {}, {}, {}, {}, {})", fmt_f(m[0]), fmt_f(m[1]), fmt_f(m[2]), fmt_f(m[3]), fmt_f(m[4]), fmt_f(m[5])),
+        })
+        .collect();
+    parts.join(" ")
+}
+
+/// AETHERSTYLE3C (SR122): `top` composited onto the underlying value `under` (Web Animations 1 §5.4.4,
+/// css-values-4 §3 value addition / accumulation): numbers, lengths, percentages and angles add per component
+/// (a unitless zero is a length); colours add per channel (clamped, straight alpha); transform lists append under
+/// `add` and, under `accumulate`, combine function by function when the lists match (translations sum, a
+/// matrix's decomposed scale accumulates as s1 + s2 - 1, its angle, translation and shear sum), else append.
+/// A pair that does not combine is `top` alone (replace).
+pub fn composite_value(prop: &str, under: &AnimValue, top: &AnimValue, accumulate: bool) -> AnimValue {
+    let _ = prop;
+    match (under, top) {
+        (AnimValue::Nums(a), AnimValue::Nums(b)) if a.len() == b.len() => {
+            let mut out = Vec::with_capacity(a.len());
+            for (u, v) in a.iter().zip(b.iter()) {
+                out.push(match (u, v) {
+                    (Num::N(u), Num::N(v)) => Num::N(u + v),
+                    (Num::Px(u), Num::Px(v)) => Num::Px(u + v),
+                    (Num::Pct(u), Num::Pct(v)) => Num::Pct(u + v),
+                    (Num::Deg(u), Num::Deg(v)) => Num::Deg(u + v),
+                    (Num::N(z), Num::Px(v)) if *z == 0.0 => Num::Px(*v),
+                    (Num::Px(u), Num::N(z)) if *z == 0.0 => Num::Px(*u),
+                    _ => return top.clone(),
+                });
+            }
+            AnimValue::Nums(out)
+        }
+        (AnimValue::Color(a), AnimValue::Color(b)) => {
+            let c = |i: usize| (a[i] + b[i]).clamp(0.0, 255.0);
+            AnimValue::Color([c(0), c(1), c(2), (a[3] + b[3]).clamp(0.0, 1.0)])
+        }
+        (AnimValue::Transform(a), AnimValue::Transform(b)) => {
+            let same = a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| core::mem::discriminant(x) == core::mem::discriminant(y));
+            if accumulate && same {
+                let ops = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| match (x, y) {
+                        (TransformOp::Translate(ax, ay), TransformOp::Translate(bx, by)) => {
+                            TransformOp::Translate([ax[0] + bx[0], ax[1] + bx[1]], [ay[0] + by[0], ay[1] + by[1]])
+                        }
+                        (TransformOp::Matrix(m), TransformOp::Matrix(n)) => TransformOp::Matrix(accumulate_matrix(*m, *n)),
+                        _ => *y,
+                    })
+                    .collect();
+                AnimValue::Transform(ops)
+            } else {
+                let mut ops = a.clone();
+                ops.extend(b.iter().copied());
+                AnimValue::Transform(ops)
+            }
+        }
+        _ => top.clone(),
+    }
+}
+
+/// css-transforms-1 §13.2: two 2D matrices accumulated through their decompositions.
+fn accumulate_matrix(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+    let (da, db) = (decompose(a), decompose(b));
+    recompose(Decomposed {
+        t: (da.t.0 + db.t.0, da.t.1 + db.t.1),
+        s: (da.s.0 + db.s.0 - 1.0, da.s.1 + db.s.1 - 1.0),
+        angle: da.angle + db.angle,
+        k: [da.k[0] + db.k[0] - 1.0, da.k[1] + db.k[1], da.k[2] + db.k[2], da.k[3] + db.k[3] - 1.0],
+    })
 }
 
 /// Applies an animated value onto an element's style: a transform list directly (`PaintStyle::transform`),
@@ -1167,6 +1252,17 @@ struct Transition<K> {
     reversing_from: AnimValue,
     shortening: f64,
     started: bool,
+    /// AETHERSTYLE3C (SR122): held by `pause()` at this local time (ms since `start`); play-pending until the
+    /// next frame after a `play()` / `pause()`.
+    paused_at: Option<f64>,
+    pending: bool,
+}
+
+impl<K> Transition<K> {
+    /// The timeline time this transition is sampled at: `now`, or the held time while paused.
+    fn at(&self, now: f64) -> f64 {
+        self.paused_at.map(|l| self.start + l).unwrap_or(now)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1191,6 +1287,11 @@ struct Animation<K> {
     idle: bool,
     /// The finish was reported to the host (`take_finished`).
     finish_reported: bool,
+    /// AETHERSTYLE3C (SR122): `iterationStart`, the effect's `composite` (0 replace, 1 add, 2 accumulate), and
+    /// the play-pending / pause-pending state (cleared, and `ready` reported, by the next frame's sample).
+    iteration_start: f64,
+    composite: u8,
+    pending: bool,
 }
 
 impl<K> Animation<K> {
@@ -1257,11 +1358,25 @@ pub struct ScriptTiming {
     /// 0 none, 1 forwards, 2 backwards, 3 both (`auto` = none).
     pub fill: u8,
     pub easing: Easing,
+    /// AETHERSTYLE3C (SR122): `iterationStart` (§4.8.2: the iteration progress the active interval starts at)
+    /// and the keyframe effect's `composite` (§5.4.4: 0 replace, 1 add, 2 accumulate).
+    pub iteration_start: f64,
+    pub composite: u8,
 }
 
 impl Default for ScriptTiming {
     fn default() -> Self {
-        ScriptTiming { duration: 0.0, delay: 0.0, end_delay: 0.0, iterations: 1.0, direction: 0, fill: 0, easing: Easing::Linear }
+        ScriptTiming {
+            duration: 0.0,
+            delay: 0.0,
+            end_delay: 0.0,
+            iterations: 1.0,
+            direction: 0,
+            fill: 0,
+            easing: Easing::Linear,
+            iteration_start: 0.0,
+            composite: 0,
+        }
     }
 }
 
@@ -1295,6 +1410,9 @@ pub struct AnimInfo<K> {
     /// None outside the active interval when not filling.
     pub progress: Option<f64>,
     pub current_iteration: Option<f64>,
+    /// AETHERSTYLE3C (SR122): play- or pause-pending (Web Animations 1 §4.4.11): `pending` is true and the start
+    /// time unresolved until the next frame.
+    pub pending: bool,
 }
 
 /// Running transitions and animations, sampled per frame.
@@ -1306,12 +1424,60 @@ pub struct Timeline<K> {
     next_id: u64,
     /// Script animations that finished since the last `take_finished`.
     finished: Vec<u64>,
+    /// AETHERSTYLE3C (SR122): animations whose pending play / pause a frame resolved since the last `take_ready`.
+    ready: Vec<u64>,
 }
 
 impl<K> Default for Timeline<K> {
     fn default() -> Self {
-        Timeline { transitions: Vec::new(), animations: Vec::new(), events: Vec::new(), next_id: 1, finished: Vec::new() }
+        Timeline { transitions: Vec::new(), animations: Vec::new(), events: Vec::new(), next_id: 1, finished: Vec::new(), ready: Vec::new() }
     }
+}
+
+/// AETHERSTYLE3C (SR122): an animation's phase (0 before, 1 active, 2 after), iteration progress and current
+/// iteration at local time `local` (Web Animations 1 §4.8, `iterationStart` included: the overall progress is
+/// `iteration_start + active time / duration`).
+fn timing_state(s: &AnimationSpec, iteration_start: f64, local: f64) -> (u8, f64, i64) {
+    let dur = s.duration as f64;
+    let active = dur * s.iterations as f64;
+    let t = local - s.delay as f64;
+    let split = |ip: f64, at_end: bool| -> (f64, i64) {
+        let whole = floor64(ip);
+        let frac = ip - whole;
+        if at_end && frac == 0.0 && ip > 0.0 { (1.0, whole as i64 - 1) } else { (frac, whole as i64) }
+    };
+    if t < 0.0 {
+        let (p, i) = split(iteration_start, false);
+        (0, p, i)
+    } else if t >= active && active.is_finite() {
+        let (p, i) = split(iteration_start + s.iterations as f64, true);
+        (2, p, i)
+    } else if dur <= 0.0 {
+        (1, 1.0, floor64(iteration_start) as i64)
+    } else {
+        let (p, i) = split(iteration_start + t / dur, false);
+        (1, p, i)
+    }
+}
+
+/// The directed iteration progress an animation applies at (None: outside its active interval and not filling
+/// that way).
+fn effect_progress(s: &AnimationSpec, phase: u8, it_progress: f64, iteration: i64) -> Option<f32> {
+    let fills = match phase {
+        0 => s.fill == 2 || s.fill == 3,
+        2 => s.fill == 1 || s.fill == 3,
+        _ => true,
+    };
+    if !fills {
+        return None;
+    }
+    let reversed = match s.direction {
+        1 => true,
+        2 => iteration % 2 != 0,
+        3 => iteration % 2 == 0,
+        _ => false,
+    };
+    Some(if reversed { 1.0 - it_progress } else { it_progress } as f32)
 }
 
 fn ev<K>(events: &mut Vec<TimedEvent<K>>, event: AnimEvent<K>, elapsed_ms: f64) {
@@ -1331,7 +1497,7 @@ impl<K: Clone + PartialEq> Timeline<K> {
 
     /// Anything is running or waiting to start (the shell keeps sending frames).
     pub fn active(&self) -> bool {
-        !self.transitions.is_empty() || self.animations.iter().any(|a| !a.idle && !a.ended && a.paused_at.is_none())
+        !self.transitions.is_empty() || self.animations.iter().any(|a| a.pending || (!a.idle && !a.ended && a.paused_at.is_none()))
     }
 
     /// The events since the last call.
@@ -1347,7 +1513,7 @@ impl<K: Clone + PartialEq> Timeline<K> {
     /// The current value of a running transition of `prop` on `key`.
     fn current(&self, key: &K, prop: &str, now: f64) -> Option<AnimValue> {
         let t = self.transitions.iter().find(|t| &t.key == key && t.prop == prop)?;
-        Some(transition_value(prop, t, now))
+        Some(transition_value(prop, t, t.at(now)))
     }
 
     /// A transition's active time at `now` (ms, clamped to its duration).
@@ -1416,6 +1582,8 @@ impl<K: Clone + PartialEq> Timeline<K> {
             reversing_from,
             shortening,
             started: false,
+            paused_at: None,
+            pending: false,
         });
         true
     }
@@ -1463,6 +1631,9 @@ impl<K: Clone + PartialEq> Timeline<K> {
                         rate: 1.0,
                         idle: false,
                         finish_reported: false,
+                        iteration_start: 0.0,
+                        composite: 0,
+                        pending: false,
                     });
                     keep.push(true);
                 }
@@ -1516,6 +1687,15 @@ impl<K: Clone + PartialEq> Timeline<K> {
             e.retain(|(p, _)| p != prop);
             e.push((String::from(prop), v));
         };
+        // AETHERSTYLE3C (SR122): this frame resolves every pending play / pause (`ready`)
+        for a in self.animations.iter_mut().filter(|a| a.pending) {
+            a.pending = false;
+            self.ready.push(a.id);
+        }
+        for t in self.transitions.iter_mut().filter(|t| t.pending) {
+            t.pending = false;
+            self.ready.push(t.id);
+        }
         // CSS animations apply below script animations (Web Animations 1 §5.4.2 composite order)
         let mut order: Vec<usize> = (0..self.animations.len()).filter(|&i| !self.animations[i].script).collect();
         order.extend((0..self.animations.len()).filter(|&i| self.animations[i].script));
@@ -1528,20 +1708,7 @@ impl<K: Clone + PartialEq> Timeline<K> {
             let s = &a.spec;
             let dur = s.duration as f64;
             let active = dur * s.iterations as f64;
-            let t = local - s.delay as f64;
-            let (phase, it_progress, iteration) = if t < 0.0 {
-                (0u8, 0.0f64, 0i64)
-            } else if t >= active && active.is_finite() {
-                let it = s.iterations as f64;
-                let whole = floor64(it);
-                let frac = it - whole;
-                if frac == 0.0 && whole > 0.0 { (2, 1.0, whole as i64 - 1) } else { (2, frac, whole as i64) }
-            } else if dur <= 0.0 {
-                (1, 1.0, 0)
-            } else {
-                let it = floor64(t / dur);
-                (1, t / dur - it, it as i64)
-            };
+            let (phase, it_progress, iteration) = timing_state(s, a.iteration_start, local);
             if a.script {
                 // script animations fire no CSS events; their finish is reported (the `finish` event, `finished`)
                 let fin = a.finished_at(local);
@@ -1565,23 +1732,24 @@ impl<K: Clone + PartialEq> Timeline<K> {
                     ev(&mut self.events, AnimEvent::AnimationEnd(a.key.clone(), s.name.clone()), active);
                 }
             }
-            let fills = match phase {
-                0 => s.fill == 2 || s.fill == 3,
-                2 => s.fill == 1 || s.fill == 3,
-                _ => true,
-            };
-            if !fills {
-                continue;
-            }
-            let reversed = match s.direction {
-                1 => true,
-                2 => iteration % 2 == 1,
-                3 => iteration % 2 == 0,
-                _ => false,
-            };
-            let p = if reversed { 1.0 - it_progress } else { it_progress } as f32;
+            let Some(p) = effect_progress(s, phase, it_progress, iteration) else { continue };
             for prop in a.frames.properties() {
                 if let Some(v) = keyframe_value::<H>(&a.frames, &prop, p, &s.easing, &|pp| base(&a.key, pp), cx) {
+                    // AETHERSTYLE3C (SR122): `add` / `accumulate` composite onto what lies below — an earlier
+                    // animation's value for the property this frame, else the cascaded base value
+                    let v = if a.composite != 0 {
+                        let under = out
+                            .iter()
+                            .find(|(k, _)| *k == a.key)
+                            .and_then(|(_, l)| l.iter().find(|(pp, _)| *pp == prop).map(|(_, v)| v.clone()))
+                            .or_else(|| base(&a.key, &prop).map(|b| parse_value::<H>(&prop, &b, cx)));
+                        match under {
+                            Some(u) => composite_value(&prop, &u, &v, a.composite == 2),
+                            None => v,
+                        }
+                    } else {
+                        v
+                    };
                     push(&mut out, &a.key, &prop, v);
                 }
             }
@@ -1591,7 +1759,9 @@ impl<K: Clone + PartialEq> Timeline<K> {
         self.animations.retain(|a| a.script || !(a.ended && !(a.spec.fill == 1 || a.spec.fill == 3)));
         let mut done = Vec::new();
         for (i, t) in self.transitions.iter_mut().enumerate() {
-            let local = now - t.start;
+            // AETHERSTYLE3C (SR122): a paused transition samples at its held time
+            let tnow = t.at(now);
+            let local = tnow - t.start;
             if local >= t.delay && !t.started {
                 t.started = true;
                 let el = (-t.delay).max(0.0).min(t.duration);
@@ -1602,7 +1772,7 @@ impl<K: Clone + PartialEq> Timeline<K> {
                 ev(&mut self.events, AnimEvent::TransitionEnd(t.key.clone(), t.prop.clone()), t.duration);
                 continue;
             }
-            let v = transition_value(&t.prop, t, now);
+            let v = transition_value(&t.prop, t, tnow);
             push(&mut out, &t.key, &t.prop, v);
         }
         for i in done.into_iter().rev() {
@@ -1642,6 +1812,10 @@ impl<K: Clone + PartialEq> Timeline<K> {
             rate: 1.0,
             idle: false,
             finish_reported: false,
+            iteration_start: if timing.iteration_start.is_finite() { timing.iteration_start.max(0.0) } else { 0.0 },
+            composite: timing.composite.min(2),
+            // a new animation is play-pending until the next frame (its start stays anchored at `now`)
+            pending: true,
         });
         // a page that makes animations forever: the oldest finished, non-filling ones go
         let scripts = self.animations.iter().filter(|a| a.script).count();
@@ -1667,20 +1841,29 @@ impl<K: Clone + PartialEq> Timeline<K> {
     /// are gone).
     pub fn info(&self, id: u64, now: f64) -> Option<AnimInfo<K>> {
         if let Some(t) = self.transitions.iter().find(|t| t.id == id) {
-            let local = now - t.start;
-            let p = progress_of(t, now);
+            let tnow = t.at(now);
+            let local = tnow - t.start;
+            let p = progress_of(t, tnow);
+            let play_state = if t.paused_at.is_some() {
+                PlayState::Paused
+            } else if local >= t.delay + t.duration {
+                PlayState::Finished
+            } else {
+                PlayState::Running
+            };
             return Some(AnimInfo {
                 id,
                 key: t.key.clone(),
                 kind: AnimKind::Transition,
                 name: t.prop.clone(),
-                play_state: if local >= t.delay + t.duration { PlayState::Finished } else { PlayState::Running },
+                play_state,
                 current_time: Some(local),
-                start_time: Some(t.start),
+                start_time: (t.paused_at.is_none() && !t.pending).then_some(t.start),
                 rate: 1.0,
                 timing: ScriptTiming { duration: t.duration, delay: t.delay, easing: t.easing.clone(), fill: 1, ..ScriptTiming::default() },
                 progress: (local >= t.delay).then_some(p),
                 current_iteration: (local >= t.delay).then_some(0.0),
+                pending: t.pending,
             });
         }
         let a = self.animations.iter().find(|a| a.id == id)?;
@@ -1694,6 +1877,8 @@ impl<K: Clone + PartialEq> Timeline<K> {
             direction: s.direction,
             fill: s.fill,
             easing: s.easing.clone(),
+            iteration_start: a.iteration_start,
+            composite: a.composite,
         };
         let play_state = if a.idle {
             PlayState::Idle
@@ -1704,26 +1889,12 @@ impl<K: Clone + PartialEq> Timeline<K> {
         } else {
             PlayState::Running
         };
-        let dur = s.duration as f64;
-        let active = dur * s.iterations as f64;
-        let t = local - s.delay as f64;
-        let (progress, iteration) = if a.idle {
-            (None, None)
-        } else if t < 0.0 {
-            if s.fill & 2 != 0 { (Some(0.0), Some(0.0)) } else { (None, None) }
-        } else if t >= active {
-            if s.fill & 1 != 0 && active.is_finite() {
-                let it = s.iterations as f64;
-                let whole = floor64(it);
-                if it - whole == 0.0 && whole > 0.0 { (Some(1.0), Some(whole - 1.0)) } else { (Some(it - whole), Some(whole)) }
-            } else {
-                (None, None)
-            }
-        } else if dur <= 0.0 {
-            (Some(1.0), Some(0.0))
-        } else {
-            let it = floor64(t / dur);
-            (Some(t / dur - it), Some(it))
+        let (phase, p, it) = timing_state(s, a.iteration_start, local);
+        let (progress, iteration) = match phase {
+            _ if a.idle => (None, None),
+            0 if s.fill & 2 == 0 => (None, None),
+            2 if s.fill & 1 == 0 => (None, None),
+            _ => (Some(p), Some(it as f64)),
         };
         Some(AnimInfo {
             id,
@@ -1732,17 +1903,28 @@ impl<K: Clone + PartialEq> Timeline<K> {
             name: s.name.clone(),
             play_state,
             current_time: (!a.idle).then_some(local),
-            start_time: (!a.idle && a.paused_at.is_none()).then_some(a.start),
+            start_time: (!a.idle && !a.pending && a.paused_at.is_none()).then_some(a.start),
             rate: a.rate,
             timing,
             progress,
             current_iteration: iteration,
+            pending: a.pending,
         })
     }
 
     /// `play()` (§4.4.10): resumes a paused animation, restarts a finished one from its start (its end when
     /// playing backwards), revives an idle (cancelled) one.
+    ///
+    /// AETHERSTYLE3C (SR122): a CSS transition resumes from where `pause()` held it; either is play-pending
+    /// until the next frame (its start stays anchored at `now`).
     pub fn play(&mut self, id: u64, now: f64) -> bool {
+        if let Some(t) = self.transitions.iter_mut().find(|t| t.id == id) {
+            if let Some(l) = t.paused_at.take() {
+                t.start = now - l;
+            }
+            t.pending = true;
+            return true;
+        }
         let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
         let mut local = if a.idle { if a.rate < 0.0 { a.end_time() } else { 0.0 } } else { a.local(now) };
         if a.rate > 0.0 && (local < 0.0 || local >= a.end_time()) {
@@ -1756,6 +1938,7 @@ impl<K: Clone + PartialEq> Timeline<K> {
         a.idle = false;
         a.ended = false;
         a.finish_reported = false;
+        a.pending = true;
         if a.rate != 0.0 {
             a.paused_at = None;
             a.start = now - local / a.rate;
@@ -1766,13 +1949,24 @@ impl<K: Clone + PartialEq> Timeline<K> {
     }
 
     /// `pause()` (§4.4.12): holds the current local time (an idle animation pauses at its start).
+    ///
+    /// AETHERSTYLE3C (SR122): a CSS transition holds its current time too; either is pause-pending until the
+    /// next frame.
     pub fn pause(&mut self, id: u64, now: f64) -> bool {
+        if let Some(t) = self.transitions.iter_mut().find(|t| t.id == id) {
+            if t.paused_at.is_none() {
+                t.paused_at = Some(now - t.start);
+            }
+            t.pending = true;
+            return true;
+        }
         let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
         let local = if a.idle { if a.rate < 0.0 { a.end_time() } else { 0.0 } } else { a.local(now) };
         if local.is_infinite() {
             return false;
         }
         a.idle = false;
+        a.pending = true;
         a.paused_at = Some(local);
         true
     }
@@ -1781,6 +1975,7 @@ impl<K: Clone + PartialEq> Timeline<K> {
     /// playback rate 0 or forwards into an infinite end.
     pub fn finish(&mut self, id: u64, now: f64) -> bool {
         if let Some(t) = self.transitions.iter_mut().find(|t| t.id == id) {
+            t.paused_at = None;
             t.start = now - t.delay - t.duration;
             return true;
         }
@@ -1809,10 +2004,12 @@ impl<K: Clone + PartialEq> Timeline<K> {
             let active = (a.local(now) - a.spec.delay as f64).clamp(0.0, (a.spec.duration * a.spec.iterations) as f64);
             let e = AnimEvent::AnimationCancel(a.key.clone(), a.spec.name.clone());
             a.idle = true;
+            a.pending = false;
             ev(&mut self.events, e, active);
             return true;
         }
         a.idle = true;
+        a.pending = false;
         a.paused_at = None;
         true
     }
@@ -1894,6 +2091,8 @@ impl<K: Clone + PartialEq> Timeline<K> {
         a.spec.fill = timing.fill;
         a.spec.easing = timing.easing.clone();
         a.end_delay = timing.end_delay;
+        a.iteration_start = if timing.iteration_start.is_finite() { timing.iteration_start.max(0.0) } else { 0.0 };
+        a.composite = timing.composite.min(2);
         a.ended = false;
         a.finish_reported = false;
         true
@@ -1903,6 +2102,38 @@ impl<K: Clone + PartialEq> Timeline<K> {
     /// resolves `finished`).
     pub fn take_finished(&mut self) -> Vec<u64> {
         core::mem::take(&mut self.finished)
+    }
+
+    /// AETHERSTYLE3C (SR122): the animations whose pending play / pause a frame resolved since the last call
+    /// (the host resolves their `ready` promises).
+    pub fn take_ready(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.ready)
+    }
+
+    /// AETHERSTYLE3C (SR122): `commitStyles()` (Web Animations 1 §4.4.20): the values animation `id` applies at
+    /// `now` — its keyframes at its current progress, composited onto the base value `base(prop)` under `add` /
+    /// `accumulate`; a transition its current value. Empty when it applies nothing (idle, or outside its active
+    /// interval without a fill); None when there is no such animation.
+    pub fn effect_values<H: Host>(&self, id: u64, now: f64, base: &dyn Fn(&str) -> Option<String>, cx: &ParseCx) -> Option<Vec<(String, AnimValue)>> {
+        if let Some(t) = self.transitions.iter().find(|t| t.id == id) {
+            return Some(vec![(t.prop.clone(), transition_value(&t.prop, t, t.at(now)))]);
+        }
+        let a = self.animations.iter().find(|a| a.id == id)?;
+        let mut out = Vec::new();
+        if a.idle {
+            return Some(out);
+        }
+        let (phase, it_progress, iteration) = timing_state(&a.spec, a.iteration_start, a.local(now));
+        let Some(p) = effect_progress(&a.spec, phase, it_progress, iteration) else { return Some(out) };
+        for prop in a.frames.properties() {
+            let Some(v) = keyframe_value::<H>(&a.frames, &prop, p, &a.spec.easing, base, cx) else { continue };
+            let v = match (a.composite, base(&prop)) {
+                (1 | 2, Some(b)) => composite_value(&prop, &parse_value::<H>(&prop, &b, cx), &v, a.composite == 2),
+                _ => v,
+            };
+            out.push((prop, v));
+        }
+        Some(out)
     }
 }
 

@@ -58,6 +58,20 @@ thread_local! {
     static SCROLLED: std::cell::RefCell<std::collections::HashMap<html_core::NodeId, (f32, f32)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     static SCROLL_DRAG: std::cell::Cell<Option<(html_core::NodeId, u8, f32, f32)>> = const { std::cell::Cell::new(None) };
+    /// AETHERSTYLE3C (SR122): each snap container's snapped target per axis, by ELEMENT (css-scroll-snap-1 §5.5:
+    /// after a relayout the container re-snaps to the same element, wherever it moved).
+    static SNAPPED: std::cell::RefCell<std::collections::HashMap<html_core::NodeId, (Option<html_core::NodeId>, Option<html_core::NodeId>)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The snap containers of a tree (`scroll-snap-type` on a scroll container).
+fn snap_containers(tree: &LayoutTree) -> Vec<taffy::NodeId> {
+    tree.paint_map
+        .iter()
+        .filter(|(_, p)| p.snap_type.is_some_and(|(a, _)| a != 0))
+        .map(|(id, _)| *id)
+        .filter(|id| layout_core::scroll::snap_axes(tree, *id) != (false, false))
+        .collect()
 }
 
 /// Records every box's current offset under its element.
@@ -71,18 +85,51 @@ pub(crate) fn remember_scroll(tree: &LayoutTree) {
             }
         }
     });
+    SNAPPED.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        let el = |t: Option<taffy::NodeId>| t.and_then(|t| tree.node_map.get(&t)).map(|n| n.id());
+        for id in snap_containers(tree) {
+            let (tx, ty) = layout_core::scroll::snapped_targets(tree, id);
+            if let (Some(n), true) = (tree.node_map.get(&id), tx.is_some() || ty.is_some()) {
+                m.insert(n.id(), (el(tx), el(ty)));
+            }
+        }
+    });
 }
 
 /// Puts the recorded offsets back onto a freshly laid-out tree (clamped to the new scroll range).
 pub(crate) fn restore_scroll(tree: &mut LayoutTree) {
     let saved: Vec<(html_core::NodeId, (f32, f32))> = SCROLLED.with(|m| m.borrow().iter().map(|(k, v)| (*k, *v)).collect());
-    if saved.is_empty() {
+    let boxes: Vec<(taffy::NodeId, html_core::NodeId)> = tree.node_map.iter().map(|(t, n)| (*t, n.id())).collect();
+    if !saved.is_empty() {
+        for &(tid, nid) in &boxes {
+            if let Some((_, (x, y))) = saved.iter().find(|(k, _)| *k == nid) {
+                layout_core::scroll::set_offset(tree, tid, *x, *y);
+            }
+        }
+    }
+    // AETHERSTYLE3C (SR122): every snap container re-snaps — to the element it was snapped to, else to the
+    // nearest position from the restored offset — and its new offset is what is remembered for it.
+    let snaps = snap_containers(tree);
+    if snaps.is_empty() {
         return;
     }
-    let boxes: Vec<(taffy::NodeId, html_core::NodeId)> = tree.node_map.iter().map(|(t, n)| (*t, n.id())).collect();
-    for (tid, nid) in boxes {
-        if let Some((_, (x, y))) = saved.iter().find(|(k, _)| *k == nid) {
-            layout_core::scroll::set_offset(tree, tid, *x, *y);
+    let targets = SNAPPED.with(|m| m.borrow().clone());
+    let find = |n: Option<html_core::NodeId>| n.and_then(|n| boxes.iter().find(|(_, b)| *b == n).map(|(t, _)| *t));
+    for id in snaps {
+        let el = tree.node_map.get(&id).map(|n| n.id());
+        let (tx, ty) = el.and_then(|e| targets.get(&e).copied()).unwrap_or((None, None));
+        let off = layout_core::scroll::resnap(tree, id, (find(tx), find(ty)));
+        if let Some(e) = el {
+            SCROLLED.with(|m| {
+                let mut m = m.borrow_mut();
+                if off == (0.0, 0.0) {
+                    m.remove(&e);
+                } else {
+                    m.insert(e, off);
+                }
+            });
         }
     }
 }
@@ -91,6 +138,7 @@ pub(crate) fn restore_scroll(tree: &mut LayoutTree) {
 pub(crate) fn forget_scroll() {
     SCROLLED.with(|m| m.borrow_mut().clear());
     SCROLL_DRAG.with(|d| d.set(None));
+    SNAPPED.with(|m| m.borrow_mut().clear());
     SCROLL_REQUESTS.with(|r| r.borrow_mut().clear());
     SMOOTH.with(|s| s.borrow_mut().clear());
 }

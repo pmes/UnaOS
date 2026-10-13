@@ -66,6 +66,9 @@ pub struct InlineLayout {
     pub inline_extent: f32,
     /// AETHERSTYLE3B (SR115): a vertical root's upright glyph cells in staging space (`writing::upright`).
     pub upright: Vec<crate::writing::UprightCell>,
+    /// AETHERSTYLE3C (SR122): its `text-combine-upright: all` runs — each one cell 1em long (also listed in
+    /// `upright`, so the painters translate it) and the horizontal scale its glyphs draw at to fit it.
+    pub combined: Vec<crate::writing::CombinedCell>,
 }
 
 enum Item {
@@ -558,6 +561,25 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
         *y += line_h;
     }
 
+    // Ends the line in progress and opens the next one (the wrap every item kind makes).
+    macro_rules! break_line {
+        () => {{
+            let (left, right) = edges(&floats, y);
+            finish_line(
+                tree, ctx, root, root_m, &default_run, &shift, &mut pieces, &line_open, &stack, cur_x, has_content,
+                forced, left, right, align, &mut y, &mut out,
+            );
+            for (f, side) in pending_floats.drain(..) {
+                place_float(&mut floats, &mut out, f, side, y);
+            }
+            line_open = stack.clone();
+            cur_x = 0.0;
+            has_content = false;
+            forced = false;
+            let _ = (has_content, forced); // a caller may overwrite them at once
+        }};
+    }
+
     let mut idx = 0;
     while idx < items.len() {
         let (left, right) = edges(&floats, y);
@@ -618,6 +640,69 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                     continue;
                 }
                 let adv = run.advancer();
+                // AETHERSTYLE3C (SR122): in `vertical-rl` / `vertical-lr`, a `text-combine-upright: all` run is
+                // one upright cell 1em long (css-writing-modes-4 §9.1), and under `text-orientation: upright` a
+                // glyph that is not natively upright takes a 1em vertical advance (§5.1: the vertical metrics),
+                // centred in its cell; words wrap at spaces, a word longer than the line between glyphs.
+                if matches!(vmode, crate::writing::VERTICAL_RL | crate::writing::VERTICAL_LR) {
+                    let em = run.font_size;
+                    if inherited(tree, *id, |p| p.text_combine) == Some(true) {
+                        let t = run.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        if !t.is_empty() {
+                            if has_content && cur_x + em > line_w + 0.01 {
+                                break_line!();
+                            }
+                            pieces.push(Piece::Text { node: *id, parent, text: t, x: cur_x, w: em });
+                            cur_x += em;
+                            has_content = true;
+                        }
+                        idx += 1;
+                        continue;
+                    }
+                    if inherited(tree, *id, |p| p.text_orientation) == Some(1) {
+                        let chars: Vec<char> = run.text.chars().collect();
+                        let mut i = 0;
+                        while i < chars.len() {
+                            if chars[i].is_whitespace() {
+                                if has_content || cur_x > 0.0 {
+                                    let sw = ctx.fonts.measure(" ", &adv);
+                                    pieces.push(Piece::Text { node: *id, parent, text: String::from(" "), x: cur_x, w: sw });
+                                    cur_x += sw;
+                                }
+                                i += 1;
+                                continue;
+                            }
+                            let mut j = i;
+                            while j < chars.len() && !chars[j].is_whitespace() {
+                                j += 1;
+                            }
+                            let cells: Vec<(char, f32, f32)> = chars[i..j]
+                                .iter()
+                                .map(|&c| {
+                                    let mut b = [0u8; 4];
+                                    let nat = ctx.fonts.measure(c.encode_utf8(&mut b), &adv);
+                                    (c, if crate::writing::is_upright_char(c) { nat } else { em }, nat)
+                                })
+                                .collect();
+                            let word: f32 = cells.iter().map(|c| c.1).sum();
+                            if has_content && cur_x + word > line_w + 0.01 {
+                                break_line!();
+                            }
+                            for (c, a, nat) in cells {
+                                if has_content && cur_x + a > line_w + 0.01 {
+                                    break_line!();
+                                }
+                                let off = ((a - nat) / 2.0).max(0.0);
+                                pieces.push(Piece::Text { node: *id, parent, text: c.to_string(), x: cur_x + off, w: a - off });
+                                cur_x += a;
+                                has_content = true;
+                            }
+                            i = j;
+                        }
+                        idx += 1;
+                        continue;
+                    }
+                }
                 let lines = ctx.fonts.break_lines(&run.text, &mode, &adv, line_w, cur_x, has_content);
                 let preserved = matches!(mode.white_space, 2 | 3 | 5);
                 for (i, l) in lines.into_iter().enumerate() {
@@ -732,46 +817,78 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
             })
             .fold(0.0f32, f32::max);
         out.inline_extent = if v_fill { v_avail } else { longest.ceil() };
-        out.upright = upright_cells(tree, ctx, &out, &default_run);
+        let (cells, combined) = upright_cells(tree, ctx, &out, &default_run);
+        out.upright = cells;
+        out.combined = combined;
     }
     out
 }
 
+/// The nearest specified value of an inherited paint field, from `id` up the box tree.
+fn inherited<H: Host, T>(tree: &LayoutTree<H>, id: NodeId, f: impl Fn(&crate::PaintStyle<H>) -> Option<T>) -> Option<T> {
+    let mut cur = Some(id);
+    while let Some(c) = cur {
+        if let Some(v) = tree.paint_map.get(&c).and_then(&f) {
+            return Some(v);
+        }
+        cur = tree.taffy.parent(c);
+    }
+    None
+}
+
 /// AETHERSTYLE3B (SR115): the upright glyphs of a vertical IFC (`writing::upright` under each text's inherited
 /// `text-orientation`): each one's staging cell, from the measured advance of the text before and through it.
-fn upright_cells<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx: &Ctx<F>, il: &InlineLayout, fallback: &TextRun) -> Vec<crate::writing::UprightCell> {
+/// AETHERSTYLE3C (SR122): a glyph forced upright that is not natively upright is its own fragment, centred in a
+/// 1em cell; a `text-combine-upright: all` fragment is one 1em cell (also returned as a [`CombinedCell`] with
+/// the scale that fits its glyphs into it).
+///
+/// [`CombinedCell`]: crate::writing::CombinedCell
+fn upright_cells<H: Host, F: Fonts + ?Sized>(
+    tree: &LayoutTree<H>,
+    ctx: &Ctx<F>,
+    il: &InlineLayout,
+    fallback: &TextRun,
+) -> (Vec<crate::writing::UprightCell>, Vec<crate::writing::CombinedCell>) {
     let mut cells = Vec::new();
+    let mut combined = Vec::new();
     if !matches!(il.vertical, crate::writing::VERTICAL_RL | crate::writing::VERTICAL_LR) {
-        return cells;
+        return (cells, combined);
     }
     for f in &il.frags {
-        let Frag::Text { node, text, x, baseline, .. } = f else { continue };
+        let Frag::Text { node, text, x, baseline, width } = f else { continue };
         // text-orientation is inherited: the nearest box that sets it
-        let mut orient = 0u8;
-        let mut cur = Some(*node);
-        while let Some(c) = cur {
-            if let Some(o) = tree.paint_map.get(&c).and_then(|p| p.text_orientation) {
-                orient = o;
-                break;
-            }
-            cur = tree.taffy.parent(c);
-        }
-        if !text.chars().any(|c| crate::writing::upright(c, orient)) {
+        let orient = inherited(tree, *node, |p| p.text_orientation).unwrap_or(0);
+        let combine = inherited(tree, *node, |p| p.text_combine) == Some(true);
+        if !combine && !text.chars().any(|c| crate::writing::upright(c, orient)) {
             continue;
         }
         let Some((_, top, h)) = crate::hit::line_of(il, *baseline) else { continue };
         let run = run_of(ctx, *node, fallback);
         let adv = run.advancer();
+        if combine {
+            let natural = ctx.fonts.measure(text, &adv);
+            let cell = crate::writing::UprightCell { x: *x, w: *width, top, h };
+            cells.push(cell);
+            combined.push(crate::writing::CombinedCell { cell, scale: if natural > *width { *width / natural } else { 1.0 } });
+            continue;
+        }
+        let single = text.chars().count() == 1;
         let mut pen = 0.0f32;
         for (i, c) in text.char_indices() {
             let end = ctx.fonts.measure(&text[..i + c.len_utf8()], &adv);
             if crate::writing::upright(c, orient) {
-                cells.push(crate::writing::UprightCell { x: x + pen, w: (end - pen).max(0.0), top, h });
+                if orient == 1 && single && !crate::writing::is_upright_char(c) {
+                    let em = run.font_size;
+                    let off = ((em - end).max(0.0)) / 2.0;
+                    cells.push(crate::writing::UprightCell { x: x - off, w: em, top, h });
+                } else {
+                    cells.push(crate::writing::UprightCell { x: x + pen, w: (end - pen).max(0.0), top, h });
+                }
             }
             pen = end;
         }
     }
-    cells
+    (cells, combined)
 }
 
 fn trailing_space_width<F: Fonts + ?Sized>(ctx: &Ctx<F>, node: NodeId, fallback: &TextRun, n: usize) -> f32 {

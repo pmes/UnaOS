@@ -587,6 +587,7 @@ impl AetherEngine {
     /// therefore always returns — which is the whole point, since the shell's
     /// `select!` loop cannot service navigation while it is inside one.
     pub fn tick(&mut self) -> bool {
+        crate::css::set_page_scroll(self.scroll_x, self.scroll_y); // AETHERSTYLE3C (SR122): scroll-state(stuck) reads it
         if let Some(js) = &mut self.js_engine {
             js.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
             js.tick();

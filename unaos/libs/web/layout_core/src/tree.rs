@@ -36,6 +36,9 @@ pub struct LayoutTree<H: Host> {
     /// AETHERSTYLE3B (SR115): a multicol container a `column-span: all` element splits — its column sets in
     /// order (css-multicol-1 §6.1); absent when the container is one set ([`LayoutTree::multicol`] alone).
     pub col_sets: NodeMap<Vec<crate::multicol::ColumnSet>>,
+    /// AETHERSTYLE3C (SR122): a decorated box multi-column layout split across columns — its fragments in
+    /// order (css-break-3 §5.4); painters draw the box once per fragment instead of at its single-column place.
+    pub col_frags: NodeMap<Vec<crate::multicol::BoxFragment>>,
 }
 
 /// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
@@ -267,6 +270,7 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         col_shift: NodeMap::new(),
         multicol: NodeMap::new(),
         col_sets: NodeMap::new(),
+        col_frags: NodeMap::new(),
     }
 }
 
@@ -1366,6 +1370,7 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
     tree.col_shift.clear();
     tree.multicol.clear();
     tree.col_sets.clear();
+    tree.col_frags.clear();
     propagate_text_align(tree);
     collapse_inline_whitespace(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
@@ -1658,11 +1663,9 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
             let fs = tree.paint_map.get(&id).and_then(|p| p.used_font_size).unwrap_or(16.0);
             let Some((n, w, gap)) = crate::multicol::used_columns(tree, id, cw, fs) else { continue };
             mc_geom.push((id, n, w, gap));
-            for k in crate::multicol::flow_children(tree, id) {
-                // AETHERSTYLE3B (SR115): a `column-span: all` child keeps the container's full width.
-                if crate::multicol::is_spanner(tree, k) {
-                    continue;
-                }
+            // AETHERSTYLE3B (SR115): a `column-span: all` child keeps the container's full width;
+            // AETHERSTYLE3C (SR122): so does a wrapper holding one, whose other children narrow instead.
+            for k in crate::multicol::narrow_targets(tree, id) {
                 let Ok(st) = tree.taffy.style(k) else { continue };
                 mc_saved.push((k, st.max_size.width, st.flex_shrink));
                 let mut st = st.clone();

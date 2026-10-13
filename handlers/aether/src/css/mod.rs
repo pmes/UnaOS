@@ -212,6 +212,10 @@ fn cascade_document(
         css_core::selectors::PseudoElement::After,
     ];
     let mut root_customs = BTreeMap::new();
+    // AETHERSTYLE3C (SR122): each element's resolved declarations (name, value text), kept only when a
+    // container rule's `style()` names a standard property.
+    let want_decls = rules.entries.iter().any(|e| e.container.iter().any(|c| c.queries_standard_style()));
+    let mut resolved: HashMap<html_core::NodeId, Vec<(String, String)>> = HashMap::new();
     for id in doc.descendants(html_core::Document::ROOT) {
         let Some(el) = doc.element(id) else { continue };
         let inline = el.attr("style").filter(|t| crate::security::csp::allow_style_attr(t)).map(css_core::stylesheet::parse_style_attribute).unwrap_or_default();
@@ -222,8 +226,12 @@ fn cascade_document(
         // AETHERSTYLE3B (SR115): every element is a style container — a rule with only `style()` queries asks the
         // nearest (named) ancestor's computed custom properties, in the first round already; a rule with size
         // features needs a size container.
+        // AETHERSTYLE3C (SR122): a rule with `scroll-state()` asks the nearest (named) scroll-state container; a
+        // standard property in `style()` reads the container's resolved declaration (an inherited one from the
+        // nearest ancestor that declares it).
         let query = |c: &css_core::container::ContainerRule| -> bool {
             let needs_size = c.needs_size();
+            let needs_scroll = c.needs_scroll_state();
             let mut cur = doc.parent_element(id);
             while let Some(a) = cur {
                 let sized = containers.and_then(|s| s.get(&a));
@@ -231,16 +239,43 @@ fn cascade_document(
                     Some(q) => q.names.clone(),
                     None => out.get(&a).and_then(|s: &std::rc::Rc<SpecifiedStyle>| s.paint.container_name.clone()).unwrap_or_default(),
                 };
-                if (!needs_size || sized.is_some()) && c.names(&names) {
+                let size_ok = !needs_size || sized.is_some_and(|q| q.size.width.is_some() || q.size.height.is_some());
+                let scroll_ok = !needs_scroll || sized.is_some_and(|q| q.scroll.is_some());
+                if size_ok && scroll_ok && c.names(&names) {
                     let props = customs.get(&a);
-                    let lookup = |n: &str| props.and_then(|m| m.get(n)).map(|v| css_core::serialize::to_css(css_core::parser::trim_ws(v)));
-                    return c.evaluate_with(sized.map(|q| &q.size), &lookup) == css_core::media::Tri::True;
+                    let lookup = |n: &str| -> Option<String> {
+                        if n.starts_with("--") {
+                            return props.and_then(|m| m.get(n)).map(|v| css_core::serialize::to_css(css_core::parser::trim_ws(v)));
+                        }
+                        let mut k = Some(a);
+                        while let Some(e) = k {
+                            if let Some(v) = resolved.get(&e).and_then(|d| d.iter().rev().find(|(p, _)| p == n)) {
+                                return Some(v.1.clone());
+                            }
+                            if !css_core::container::inherited_property(n) {
+                                return None;
+                            }
+                            k = doc.parent_element(e);
+                        }
+                        None
+                    };
+                    let size = sized.map(|q| &q.size).filter(|q| q.width.is_some() || q.height.is_some());
+                    return c.evaluate_full(size, &lookup, sized.and_then(|q| q.scroll.as_ref())) == css_core::media::Tri::True;
                 }
                 cur = doc.parent_element(a);
             }
             false
         };
         let applied = css_core::cascade::cascade_contained(rules, &me_el, &inline, None, Some(&filter), Some(&query));
+        let mut own_resolved: Option<Vec<(String, String)>> = want_decls
+            .then(|| {
+                applied
+                    .iter()
+                    .filter(|a| !a.declaration.name.starts_with("--"))
+                    .map(|a| (a.declaration.name.to_ascii_lowercase(), css_core::serialize::to_css(css_core::parser::trim_ws(&a.declaration.value))))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
         child_filter.insert(id, filter.with_element(&me_el));
         // custom properties: inherited from the parent element, overridden by this element's own
         let parent = doc.parent_element(id).and_then(|p| customs.get(&p)).cloned().unwrap_or_else(|| empty.clone());
@@ -254,6 +289,9 @@ fn cascade_document(
             root_customs = (*mine).clone();
         }
         if !boxed.contains(&id) {
+            if let Some(r) = own_resolved.take() {
+                resolved.insert(id, r);
+            }
             customs.insert(id, mine);
             continue;
         }
@@ -310,6 +348,9 @@ fn cascade_document(
         let decls: Vec<&css_core::parser::Declaration> =
             applied.iter().map(|a| a.declaration).filter(|d| !d.name.starts_with("--")).collect();
         if decls.is_empty() {
+            if let Some(r) = own_resolved.take() {
+                resolved.insert(id, r);
+            }
             customs.insert(id, mine);
             continue;
         }
@@ -343,6 +384,9 @@ fn cascade_document(
             }
         };
         out.insert(id, style);
+        if let Some(r) = own_resolved.take() {
+            resolved.insert(id, r);
+        }
         customs.insert(id, mine);
     }
     (out, root_customs, pseudo_out)
@@ -355,7 +399,21 @@ pub(crate) type PseudoStyles = [Option<std::rc::Rc<SpecifiedStyle>>; 3];
 /// AETHERSTYLE3 (SR103): each query container's names and content-box size, by element, from a first layout.
 pub(crate) struct QueryContainer {
     pub names: Vec<String>,
+    /// Width / height None on both axes: not a size container.
     pub size: css_core::container::ContainerSize,
+    /// AETHERSTYLE3C (SR122): a `container-type: scroll-state` container's state as this layout left it.
+    pub scroll: Option<css_core::container::ScrollState>,
+}
+
+thread_local! {
+    /// AETHERSTYLE3C (SR122): the page's viewport scroll, which `scroll-state(stuck)` measures sticky boxes
+    /// against (set by the engine when it scrolls, `set_page_scroll`).
+    static PAGE_SCROLL: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((0.0, 0.0)) };
+}
+
+/// AETHERSTYLE3C (SR122): the engine's viewport scroll offset, for `scroll-state(stuck)` queries.
+pub fn set_page_scroll(x: f64, y: f64) {
+    PAGE_SCROLL.with(|p| p.set((x as f32, y as f32)));
 }
 pub(crate) type ContainerSizes = std::collections::HashMap<html_core::NodeId, QueryContainer>;
 
@@ -366,7 +424,8 @@ fn container_sizes(tree: &LayoutTree) -> ContainerSizes {
     for (tid, n) in &tree.node_map {
         let Some(p) = tree.paint_map.get(tid) else { continue };
         let ty = p.container_type.unwrap_or(0);
-        if ty == 0 || !n.is_element() {
+        let scrolls = p.container_scroll == Some(true);
+        if (ty == 0 && !scrolls) || !n.is_element() {
             continue;
         }
         let Ok(l) = tree.taffy.layout(*tid) else { continue };
@@ -374,16 +433,19 @@ fn container_sizes(tree: &LayoutTree) -> ContainerSizes {
         let h = (l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom).max(0.0) as f64;
         let vertical = layout_core::writing::is_vertical(p.writing_mode.unwrap_or(0));
         let (iw, ih) = match (ty, vertical) {
+            (0, _) => (None, None),
             (1, _) => (Some(w), Some(h)),
             (_, false) => (Some(w), None),
             (_, true) => (None, Some(h)),
         };
+        let scroll = scrolls.then(|| layout_core::scroll::scroll_state(tree, *tid, PAGE_SCROLL.with(|p| p.get()), tree.viewport));
         let fs = p.used_font_size.unwrap_or(16.0) as f64;
         out.insert(
             n.id(),
             QueryContainer {
                 names: p.container_name.clone().unwrap_or_default(),
                 size: css_core::container::ContainerSize { width: iw, height: ih, vertical, font_size: fs },
+                scroll,
             },
         );
     }
@@ -834,6 +896,12 @@ fn property_supported(prop: &str) -> bool {
             | "transition-delay" | "transition-behavior" | "animation" | "animation-name" | "animation-duration"
             | "animation-timing-function" | "animation-delay" | "animation-iteration-count"
             | "animation-direction" | "animation-fill-mode" | "animation-play-state"
+            // AETHERSTYLE3C (SR122)
+            | "column-span" | "box-decoration-break" | "-webkit-box-decoration-break"
+            | "text-combine-upright" | "-webkit-text-combine"
+            | "scroll-margin" | "scroll-margin-top" | "scroll-margin-right" | "scroll-margin-bottom"
+            | "scroll-margin-left" | "scroll-margin-block" | "scroll-margin-inline" | "scroll-margin-block-start"
+            | "scroll-margin-block-end" | "scroll-margin-inline-start" | "scroll-margin-inline-end"
     )
 }
 
