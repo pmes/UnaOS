@@ -45,6 +45,11 @@ impl Origin {
         if !u.has_tuple_origin() {
             return Origin::opaque();
         }
+        // URL §4.7 origin, `blob`: the origin of the URL the path parses to (http/https; anything else is
+        // opaque, which `has_tuple_origin` already answered). The tuple is the INNER URL's, never `blob://`.
+        if u.scheme() == "blob" {
+            return url::Url::parse(&u.pathname()).map(|inner| Origin::of_url(&inner)).unwrap_or_else(|_| Origin::opaque());
+        }
         let scheme = u.scheme().to_string();
         let default = url::Url::parse(&format!("{scheme}://x/")).ok().and_then(|d| d.port_or_default());
         let port = u.port_or_default();
