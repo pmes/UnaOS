@@ -815,6 +815,10 @@ _feats="${_feats}sdw,"
 # channel-11 tune, one RX ring and a 5 s beacon count). Implies wifi4. x86_64-only. Kept in sync with
 # builder/src/main.rs.
 [ -n "${UNAOS_WIFI9:-}" ] && _feats="${_feats}wifi9,"
+# WIFI-10 (B646, R110): UNAOS_WIFI10=1 arms rung S7's probe-request half `tests wifi` runs after wifi9 (one frame
+# out through a TX DMA ring, the probe responses counted). THE FIRST TRANSMIT KNOB. Implies wifi9. x86_64-only.
+# Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_WIFI10:-}" ] && _feats="${_feats}wifi10,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -3143,6 +3147,7 @@ arm_features() {
     # `src/wifi/bringup/unwind.rs`, inside the x86-gated `src/wifi/`.
     f="${f//,wifi5,/,}"
     f="${f//,wifi9,/,}" # WIFI9 (B625): the same strip, the same argument — `wifi9` implies `wifi4`; its two files are x86-gated
+    f="${f//,wifi10,/,}" # WIFI10 (B646): the same strip, the same argument — `wifi10` implies `wifi9`; its file is x86-gated
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -6588,7 +6593,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

@@ -89,3 +89,11 @@ pub(super) fn identity_line() {
         );
     }
 }
+
+/// WIFI10 (B646): the station MAC S7 transmits from — the SPROM `il0macaddr` this boot read, only when
+/// S2r judged it plausible (unicast, not all-zero, not all-ones: `wifi_core::sprom::decode`).
+#[cfg(feature = "wifi10")]
+pub(super) fn mac() -> Option<[u8; 6]> {
+    let id = (*ID.lock())?;
+    if id.mac_ok { Some(id.mac) } else { None }
+}
