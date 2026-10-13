@@ -1,5 +1,5 @@
 //! Texture objects (ES 2.0 §3.7): the image arrays of a 2D or cube-map texture, the sampler parameters
-//! (§3.7.4), and completeness (§3.7.10, with WebGL 1.0 §5.14.8's non-power-of-two rule from ES 2.0 §3.8.2).
+//! (§3.7.4), and completeness (§3.7.10, with WebGL 1.0's non-power-of-two rule from ES 2.0 §3.8.2).
 //!
 //! Storage: every level image is kept EXPANDED to RGBA8 (`data`, `w × h × 4`, row 0 = the first row the
 //! application supplied, i.e. t = 0) beside its declared `format`/`ty`. Packed and reduced formats are

@@ -1,9 +1,10 @@
 //! The OpenGL ES 2.0 objects (ES 2.0 §2.9 buffers, §2.10.3 programs and shaders, §4.4 framebuffers and
-//! renderbuffers; textures live in [`crate::texture`]). Names are never reused (WebGL 1.0 §5.1: a deleted
+//! renderbuffers; textures live in [`crate::texture`]). Names are never reused (WebGL 1.0 "WebGLObject": a deleted
 //! WebGLObject must stay deleted, and a recycled name would make a stale wrapper alias a new object), so each
 //! store is `Vec<Option<T>>` indexed by `name - 1`.
 
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -37,7 +38,7 @@ impl<T> Store<T> {
     }
 }
 
-/// ES 2.0 §2.9: a buffer object. `target` is fixed by the first bind (WebGL 1.0 §6.1: a buffer bound to
+/// ES 2.0 §2.9: a buffer object. `target` is fixed by the first bind (WebGL 1.0 "Buffer Object Binding": a buffer bound to
 /// ARRAY_BUFFER can never be bound to ELEMENT_ARRAY_BUFFER and vice versa).
 pub struct Buffer {
     pub target: u32,
@@ -54,6 +55,7 @@ pub struct Shader {
     pub log: String,
     pub deleted: bool,
     pub attached: u32,
+    pub code: Option<Rc<crate::glsl::Compiled>>,
 }
 
 /// ES 2.0 §2.10.3: a program object. `bindings` are the bindAttribLocation requests, applied at the next link.
@@ -64,12 +66,12 @@ pub struct Program {
     pub linked: bool,
     pub log: String,
     pub validated: bool,
-    /// Bumped on every link attempt: a WebGLUniformLocation from an older link is invalid (WebGL 1.0 §5.14.10).
+    /// Bumped on every link attempt: a WebGLUniformLocation from an older link is invalid (WebGL 1.0 "Uniforms and attributes").
     pub link_gen: u32,
     pub bindings: BTreeMap<String, u32>,
 }
 
-/// A renderbuffer's storage (ES 2.0 §4.4.2; WebGL 1.0 §6.6 adds DEPTH_STENCIL).
+/// A renderbuffer's storage (ES 2.0 §4.4.2; WebGL 1.0 "Framebuffer Object Attachments" adds DEPTH_STENCIL).
 pub struct Renderbuffer {
     pub format: u32,
     pub w: u32,
@@ -92,7 +94,7 @@ pub enum Attach {
     Tex(u32, u32, i32),
 }
 
-/// ES 2.0 §4.4.1: a framebuffer object. WebGL 1.0 §6.6 keeps DEPTH_STENCIL_ATTACHMENT as its own point.
+/// ES 2.0 §4.4.1: a framebuffer object. WebGL 1.0 "Framebuffer Object Attachments" keeps DEPTH_STENCIL_ATTACHMENT as its own point.
 #[derive(Default)]
 pub struct Framebuffer {
     pub color: Attach,

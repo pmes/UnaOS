@@ -1,5 +1,5 @@
-//! Framebuffer and renderbuffer objects (ES 2.0 §4.4) with WebGL 1.0's DEPTH_STENCIL (§6.6) and its
-//! attachment-combination rule (§6.6: more than one of DEPTH, STENCIL and DEPTH_STENCIL is UNSUPPORTED), and
+//! Framebuffer and renderbuffer objects (ES 2.0 §4.4) with WebGL 1.0's DEPTH_STENCIL and its attachment-combination rule
+//! ("Framebuffer Object Attachments": more than one of DEPTH, STENCIL and DEPTH_STENCIL is UNSUPPORTED), and
 //! framebuffer completeness (ES 2.0 §4.4.5).
 
 use crate::consts::*;
@@ -39,7 +39,7 @@ impl Context {
         self.sweep();
     }
 
-    /// ES 2.0 §4.4.3 RenderbufferStorage. Storage is initialized to 0 (WebGL 1.0 §4.1 "resource restrictions").
+    /// ES 2.0 §4.4.3 RenderbufferStorage. Storage is initialized to 0 (WebGL 1.0 "Resource Restrictions").
     pub fn renderbuffer_storage(&mut self, target: u32, format: u32, w: i32, h: i32) {
         if target != RENDERBUFFER {
             return self.err(INVALID_ENUM);
@@ -117,7 +117,7 @@ impl Context {
         self.set_attachment(point, if rb == 0 { Attach::None } else { Attach::Rb(rb) });
     }
 
-    /// ES 2.0 §4.4.3 FramebufferTexture2D (WebGL 1.0 §6.6: level must be 0).
+    /// ES 2.0 §4.4.3 FramebufferTexture2D (WebGL 1.0 "Framebuffer Object Attachments": level must be 0).
     pub fn framebuffer_texture_2d(&mut self, target: u32, attachment: u32, textarget: u32, tex: u32, level: i32) {
         if target != FRAMEBUFFER {
             return self.err(INVALID_ENUM);

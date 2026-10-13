@@ -1,4 +1,4 @@
-//! The WebGL 1.0 constant table (WebGL 1.0 §5.14, the `WebGLRenderingContextBase` IDL), one `pub const` per
+//! The WebGL 1.0 constant table (the WebGL 1.0 `WebGLRenderingContextBase` IDL), one `pub const` per
 //! IDL constant plus [`TABLE`], the (name, value) list Aether installs on `WebGLRenderingContext` and its
 //! prototype (WebIDL §3.7.4). Generated from the IDL text below by the `consts!` macro: each IDL line
 //! `const GLenum NAME = VALUE;` became `NAME = VALUE;` — the macro emits the constant and its table row, so

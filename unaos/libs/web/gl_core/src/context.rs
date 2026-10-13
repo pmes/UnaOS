@@ -1,10 +1,10 @@
-//! The OpenGL ES 2.0 state machine with WebGL 1.0's additions (WebGL 1.0 §5.14 methods, §6 differences from
-//! ES 2.0). One [`Context`] per WebGLRenderingContext: the error flags (ES 2.0 §2.5), the object stores, the
-//! bindings, the per-fragment state of ES 2.0 Chapter 4 and the drawing buffer (WebGL 1.0 §2.2).
+//! The OpenGL ES 2.0 state machine with WebGL 1.0's additions (WebGL 1.0's methods and its "Differences Between WebGL and OpenGL
+//! ES 2.0"). One [`Context`] per WebGLRenderingContext: the error flags (ES 2.0 §2.5), the object stores, the
+//! bindings, the per-fragment state of ES 2.0 Chapter 4 and the drawing buffer (WebGL 1.0 "The Drawing Buffer").
 //!
 //! Every entry point validates exactly as ES 2.0 and the WebGL deltas say and records an error with
 //! [`Context::err`] instead of acting; [`Context::get_error`] hands the flags back one at a time. While the
-//! context is lost (WebGL 1.0 §5.15.2) the binding answers every call itself; the core only keeps `lost` so
+//! context is lost (WebGL 1.0 "lose the context") the binding answers every call itself; the core only keeps `lost` so
 //! that getError reports CONTEXT_LOST_WEBGL once.
 
 use crate::consts::*;
@@ -28,7 +28,7 @@ pub const MAX_VERTEX_TEXTURE_UNITS_V: u32 = 16;
 pub const MAX_COMBINED_UNITS: usize = 32;
 pub const POINT_SIZE_MAX: f32 = 64.0;
 
-/// WebGLContextAttributes (WebGL 1.0 §5.2) as granted: `antialias` is always false (no multisampling).
+/// WebGLContextAttributes (WebGL 1.0 "WebGLContextAttributes") as granted: `antialias` is always false (no multisampling).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Attributes {
     pub alpha: bool,
@@ -59,7 +59,7 @@ impl Default for Attributes {
     }
 }
 
-/// A getParameter-family answer, typed the way WebGL 1.0 §5.14.3 returns it.
+/// A getParameter-family answer, typed the way WebGL 1.0's getParameter table returns it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
     Null,
@@ -84,7 +84,7 @@ pub enum ObjKind {
     Shader,
 }
 
-/// WebGLActiveInfo (WebGL 1.0 §5.11).
+/// WebGLActiveInfo .
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveInfo {
     pub size: i32,
@@ -92,7 +92,7 @@ pub struct ActiveInfo {
     pub name: String,
 }
 
-/// WebGLShaderPrecisionFormat (WebGL 1.0 §5.12).
+/// WebGLShaderPrecisionFormat .
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PrecisionFormat {
     pub range_min: i32,
@@ -243,7 +243,7 @@ impl State {
     }
 }
 
-/// The default framebuffer (WebGL 1.0 §2.2 "the drawing buffer"): RGBA8 colour, optional 24-bit depth and
+/// The default framebuffer (WebGL 1.0 "The Drawing Buffer"): RGBA8 colour, optional 24-bit depth and
 /// 8-bit stencil, rows bottom-up (row 0 = window y 0, ES 2.0 §2.12's window coordinates).
 pub struct DrawingBuffer {
     pub w: u32,
@@ -254,7 +254,7 @@ pub struct DrawingBuffer {
     /// Bumped on every change to the drawing buffer's pixels (the compositor's cache key).
     pub generation: u64,
     /// `preserveDrawingBuffer: false`: the buffer was presented and must read as cleared before the next
-    /// operation that touches it (WebGL 1.0 §2.2).
+    /// operation that touches it (WebGL 1.0 "The Drawing Buffer").
     pub clear_pending: bool,
 }
 
@@ -306,14 +306,14 @@ pub struct Context {
     pub stats: DrawStats,
 }
 
-/// The largest drawing buffer we allocate; a bigger canvas gets a smaller drawing buffer (WebGL 1.0 §2.2
+/// The largest drawing buffer we allocate; a bigger canvas gets a smaller drawing buffer (WebGL 1.0 "The Drawing Buffer"
 /// permits it; drawingBufferWidth/Height report the truth).
 pub fn drawing_buffer_size(w: u32, h: u32) -> (u32, u32) {
     (w.min(MAX_VIEWPORT_V as u32), h.min(MAX_VIEWPORT_V as u32))
 }
 
 impl Context {
-    /// A new context for a `w × h` canvas (WebGL 1.0 §2.1 "context creation").
+    /// A new context for a `w × h` canvas (WebGL 1.0 "Context Creation").
     pub fn new(w: u32, h: u32, mut attrs: Attributes) -> Context {
         attrs.antialias = false;
         let (w, h) = drawing_buffer_size(w, h);
@@ -352,8 +352,8 @@ impl Context {
         }
     }
 
-    /// ES 2.0 §2.5 / WebGL 1.0 §5.14.13 getError: one flag per call, cleared as returned. A lost context
-    /// answers CONTEXT_LOST_WEBGL once, then NO_ERROR (WebGL 1.0 §5.15.2).
+    /// ES 2.0 §2.5 / WebGL 1.0 getError: one flag per call, cleared as returned. A lost context
+    /// answers CONTEXT_LOST_WEBGL once, then NO_ERROR (WebGL 1.0 "lose the context").
     pub fn get_error(&mut self) -> u32 {
         if self.lost {
             if !self.lost_reported {
@@ -365,7 +365,7 @@ impl Context {
         if self.errors.is_empty() { NO_ERROR } else { self.errors.remove(0) }
     }
 
-    /// WebGL 1.0 §5.15.2 "lose the context": every object is invalidated and the drawing buffer dropped.
+    /// WebGL 1.0 "lose the context" "lose the context": every object is invalidated and the drawing buffer dropped.
     pub fn lose(&mut self) {
         let (w, h) = (self.db.w, self.db.h);
         let attrs = self.attrs;
@@ -375,7 +375,7 @@ impl Context {
         self.lost_reported = false;
     }
 
-    /// "restore the context": a fresh context in its initial state (WebGL 1.0 §5.15.3).
+    /// WebGL 1.0 "restore the context": a fresh context in its initial state.
     pub fn restore(&mut self) {
         let (w, h) = (self.db.w, self.db.h);
         let attrs = self.attrs;
@@ -383,8 +383,8 @@ impl Context {
         self.attrs = attrs;
     }
 
-    /// The canvas was resized: a new drawing buffer, cleared (HTML §4.12.5 / WebGL 1.0 §2.3). The viewport
-    /// and scissor are NOT changed (WebGL 1.0 §2.3).
+    /// The canvas was resized: a new drawing buffer, cleared (HTML §4.12.5 / WebGL 1.0 "Changing the Size of the Canvas"). The viewport
+    /// and scissor are NOT changed (WebGL 1.0 "Changing the Size of the Canvas").
     pub fn resize(&mut self, w: u32, h: u32) {
         let (w, h) = drawing_buffer_size(w, h);
         if (w, h) == (self.db.w, self.db.h) {
@@ -434,6 +434,7 @@ impl Context {
             log: String::new(),
             deleted: false,
             attached: 0,
+            code: None,
         })
     }
 
@@ -451,7 +452,7 @@ impl Context {
     }
 
     /// Whether `name` of `kind` exists, is not deleted and (for the bindable kinds) has been bound once — the
-    /// is* queries (ES 2.0 §6.1.x; WebGL 1.0 §5.14: false for a deleted object).
+    /// is* queries (ES 2.0 §6.1; WebGL 1.0: false for a deleted object).
     pub fn is_object(&self, kind: ObjKind, name: u32) -> bool {
         match kind {
             ObjKind::Buffer => self.buffers.get(name).is_some_and(|b| !b.deleted && b.target != 0),
@@ -734,7 +735,7 @@ impl Context {
         }
     }
 
-    /// ES 2.0 §2.9.2 bufferData: `data` None = `size` zero bytes (WebGL 1.0 §5.14.5: initialized to 0).
+    /// ES 2.0 §2.9.2 bufferData: `data` None = `size` zero bytes (WebGL 1.0 bufferData: a size-only store is zero-filled).
     pub fn buffer_data(&mut self, target: u32, size: i64, data: Option<&[u8]>, usage: u32) {
         let Some(name) = self.bound_buffer(target) else { return self.err(INVALID_ENUM) };
         if !matches!(usage, STREAM_DRAW | STATIC_DRAW | DYNAMIC_DRAW) {
@@ -757,7 +758,7 @@ impl Context {
         b.usage = usage;
     }
 
-    /// ES 2.0 §2.9.2 bufferSubData (WebGL 1.0 §5.14.5: out of range is INVALID_VALUE).
+    /// ES 2.0 §2.9.2 bufferSubData (WebGL 1.0 bufferSubData: out of range is INVALID_VALUE).
     pub fn buffer_sub_data(&mut self, target: u32, offset: i64, data: &[u8]) {
         let Some(name) = self.bound_buffer(target) else { return self.err(INVALID_ENUM) };
         if offset < 0 {
@@ -799,8 +800,8 @@ impl Context {
         self.attribs[index as usize].enabled = on;
     }
 
-    /// ES 2.0 §2.8 VertexAttribPointer with WebGL 1.0 §6.4 (stride ≤ 255), §6.5 (offset and stride multiples of
-    /// the type size) and §6.7 (no ARRAY_BUFFER and a non-zero offset).
+    /// ES 2.0 §2.8 VertexAttribPointer with WebGL 1.0 "Vertex Attribute Data Stride" (stride ≤ 255), "Buffer Offset and
+    /// Stride Requirements" (multiples of the type size) and the no-ARRAY_BUFFER rule with a non-zero offset.
     #[allow(clippy::too_many_arguments)]
     pub fn vertex_attrib_pointer(&mut self, index: u32, size: i32, ty: u32, normalized: bool, stride: i32, offset: i64) {
         if index as usize >= MAX_ATTRIBS {
@@ -935,7 +936,7 @@ impl Context {
         ) || (src && f == SRC_ALPHA_SATURATE)
     }
 
-    /// WebGL 1.0 §6.13: a constant-colour factor and a constant-alpha factor may not be paired.
+    /// WebGL 1.0 "Blending With Constant Color": a constant-colour factor and a constant-alpha factor may not be paired.
     fn constant_conflict(a: u32, b: u32) -> bool {
         let cc = |f| f == CONSTANT_COLOR || f == ONE_MINUS_CONSTANT_COLOR;
         let ca = |f| f == CONSTANT_ALPHA || f == ONE_MINUS_CONSTANT_ALPHA;
@@ -1051,7 +1052,7 @@ impl Context {
         self.st.line_width = w;
     }
 
-    /// ES 2.0 §2.12.1 DepthRangef, WebGL 1.0 §6.12: zNear > zFar is INVALID_OPERATION.
+    /// ES 2.0 §2.12.1 DepthRangef, WebGL 1.0 "Viewport Depth Range": zNear > zFar is INVALID_OPERATION.
     pub fn depth_range(&mut self, n: f32, f: f32) {
         if n > f {
             return self.err(INVALID_OPERATION);
@@ -1114,7 +1115,7 @@ impl Context {
         }
     }
 
-    /// ES 2.0 §3.6.1 PixelStorei with WebGL 1.0 §5.14.8's three WebGL parameters.
+    /// ES 2.0 §3.6.1 PixelStorei with WebGL 1.0's three WebGL parameters ("Pixel Storage Parameters").
     pub fn pixel_storei(&mut self, pname: u32, v: i32) {
         match pname {
             PACK_ALIGNMENT | UNPACK_ALIGNMENT => {
@@ -1249,7 +1250,7 @@ impl Context {
         if n == 0 { Param::Null } else { Param::Object(kind, n) }
     }
 
-    /// WebGL 1.0 §5.14.3 getParameter: every pname of the table there, typed as it says.
+    /// WebGL 1.0 getParameter: every pname of the table there, typed as it says.
     pub fn get_parameter(&mut self, pname: u32) -> Param {
         let s = self.st.clone();
         let f2 = |a: f32, b: f32| Param::F32s(vec![a, b]);
@@ -1363,7 +1364,7 @@ impl Context {
         }
     }
 
-    /// WebGL 1.0 §5.14.10 getShaderPrecisionFormat: every type is evaluated at IEEE single precision (the
+    /// WebGL 1.0 getShaderPrecisionFormat: every type is evaluated at IEEE single precision (the
     /// interpreter's lanes are f32), so all three precisions report highp's (127, 127, 23) and the ints (24, 24, 0) —
     /// 24-bit integers are what an f32 lane holds exactly.
     pub fn get_shader_precision_format(&mut self, shader: u32, prec: u32) -> Option<PrecisionFormat> {
