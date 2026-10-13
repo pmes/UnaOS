@@ -186,6 +186,16 @@ pub struct PaintStyle<H: Host> {
     /// [`crate::scroll::VISIBLE`] 0, `HIDDEN` 1, `CLIP` 2, `SCROLL` 3, `AUTO` 4. `clip` above stays the
     /// paint-time "clips its descendants" flag every non-visible value sets.
     pub overflow: Option<[u8; 2]>,
+    /// AETHERSTYLE3 (SR103): css-multicol-1 — `column-count` / `column-width` (Some(None) = `auto`), the
+    /// multicol gutter in px (`column-gap`; None = `normal`, 1em), `column-fill` (0 balance, 1 auto) and the
+    /// `column-rule` longhands (style [`crate::multicol::RULE_NONE`] = none / hidden).
+    pub col_count: Option<Option<u32>>,
+    pub col_width: Option<Option<f32>>,
+    pub col_gap: Option<f32>,
+    pub col_fill: Option<u8>,
+    pub col_rule_width: Option<f32>,
+    pub col_rule_style: Option<u8>,
+    pub col_rule_color: Option<(u8, u8, u8)>,
 }
 
 
@@ -267,6 +277,13 @@ impl<H: Host> Default for PaintStyle<H> {
             filter: None,
             backdrop_filter: None,
             overflow: None,
+            col_count: None,
+            col_width: None,
+            col_gap: None,
+            col_fill: None,
+            col_rule_width: None,
+            col_rule_style: None,
+            col_rule_color: None,
         }
     }
 }

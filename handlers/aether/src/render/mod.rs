@@ -3094,6 +3094,20 @@ pub fn render_frame(
         // positive z-index ascending.
         paint_layers(&layers[split..], surface);
         finish_round_clip(surface);
+        // AETHERSTYLE3 (SR103): css-multicol-1 §4.2 — a column rule midway in each gap between columns that
+        // hold content, as tall as the column boxes (painted solid whatever its style).
+        if let Some(cols) = layout.multicol.get(&node_id) {
+            if let Some((rw, rc, _)) = cols.rule {
+                let (shx, shy) = layout_core::scroll::content_shift(layout, node_id);
+                let cx0 = current_x - sx as f32 + shx + layout_box.border.left + layout_box.padding.left;
+                let cy0 = current_y - sy as f32 + shy + layout_box.border.top + layout_box.padding.top;
+                for k in 1..cols.filled {
+                    let mid = cx0 + k as f32 * (cols.width + cols.gap) - cols.gap / 2.0;
+                    let x0 = (mid - rw / 2.0).round();
+                    fill_rect(x0, cy0, x0 + rw.max(1.0).round(), cy0 + cols.height, rc, 255, surface, width, height, damage_rects, child_clip);
+                }
+            }
+        }
         // AETHERSTYLE3 (SR103): a scroll container's overlay scrollbars, over its content.
         let bars = layout_core::scroll::scrollbars(layout, node_id);
         let (bx0, by0) = (current_x - sx as f32, current_y - sy as f32);

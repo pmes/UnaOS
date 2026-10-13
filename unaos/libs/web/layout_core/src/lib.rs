@@ -33,6 +33,7 @@ pub mod hit;
 pub mod inline;
 pub mod lines;
 mod map;
+pub mod multicol;
 pub mod paint;
 pub mod scroll;
 pub mod table;

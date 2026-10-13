@@ -31,6 +31,8 @@ pub struct LayoutTree<H: Host> {
     /// from its single-column place (css-multicol-1 §3: the column box it fragments into); painters and hit
     /// tests add it to the child's origin ([`col_shift`]).
     pub col_shift: NodeMap<(f32, f32)>,
+    /// AETHERSTYLE3 (SR103): each multicol container's used column geometry (the painter's column rules).
+    pub multicol: NodeMap<crate::multicol::Columns>,
 }
 
 /// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
@@ -260,6 +262,7 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         rowspans: Vec::new(),
         scroll: NodeMap::new(),
         col_shift: NodeMap::new(),
+        multicol: NodeMap::new(),
     }
 }
 
@@ -1356,6 +1359,8 @@ fn size_flex_items_by_content<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy
 pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) {
     fix_display_contexts(tree);
     crate::scroll::prepare(tree);
+    tree.col_shift.clear();
+    tree.multicol.clear();
     propagate_text_align(tree);
     collapse_inline_whitespace(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
@@ -1622,6 +1627,35 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
     if has_tables && table::fix_rowspans(tree) {
         run_pass(tree);
     }
+    // AETHERSTYLE3 (SR103): a block multicol container lays its in-flow children out in ONE column of the
+    // used column width (css-multicol-1 §3.4); they keep their content height (no shrinking into it). The
+    // IFC-root multicol container narrows its own lines in `inline::layout_root`.
+    let mut mc_geom: Vec<(taffy::NodeId, u32, f32, f32)> = Vec::new();
+    let mut mc_saved: Vec<(taffy::NodeId, LengthPercentageAuto, f32)> = Vec::new();
+    {
+        let ids: Vec<taffy::NodeId> = tree.paint_map.keys().copied().collect();
+        for id in ids {
+            if !crate::multicol::is_multicol(tree, id) || inline::is_ifc_root(tree, id) {
+                continue;
+            }
+            let Ok(l) = tree.taffy.layout(id) else { continue };
+            let cw = l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right;
+            let fs = tree.paint_map.get(&id).and_then(|p| p.used_font_size).unwrap_or(16.0);
+            let Some((n, w, gap)) = crate::multicol::used_columns(tree, id, cw, fs) else { continue };
+            mc_geom.push((id, n, w, gap));
+            for k in crate::multicol::flow_children(tree, id) {
+                let Ok(st) = tree.taffy.style(k) else { continue };
+                mc_saved.push((k, st.max_size.width, st.flex_shrink));
+                let mut st = st.clone();
+                st.max_size.width = LengthPercentageAuto::length(w);
+                st.flex_shrink = 0.0;
+                let _ = tree.taffy.set_style(k, st);
+            }
+        }
+        if !mc_geom.is_empty() {
+            run_pass(tree);
+        }
+    }
     // Inline formatting contexts (CSS 2.2 §9.4.2): line boxes at the widths
     // the block pass settled; each root's height becomes the sum of its
     // line boxes, and the tree is laid out again until heights are stable
@@ -1688,6 +1722,42 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
             break;
         }
         run_pass(tree);
+    }
+    // AETHERSTYLE3 (SR103): the block multicol containers fragment their settled content into the columns
+    // and take the tallest column's height (one more pass places what follows them).
+    let mut mc_heights: Vec<(taffy::NodeId, Dimension)> = Vec::new();
+    for &(id, n, w, gap) in &mc_geom {
+        let cols = crate::multicol::balance_blocks(tree, id, n, w, gap);
+        tree.multicol.insert(id, cols);
+        let Ok(st) = tree.taffy.style(id) else { continue };
+        if st.size.height != Dimension::auto() {
+            continue;
+        }
+        let Ok(l) = tree.taffy.layout(id) else { continue };
+        let edges = l.padding.top + l.padding.bottom + l.border.top + l.border.bottom;
+        let want = if st.box_sizing == taffy::style::BoxSizing::BorderBox { cols.height + edges } else { cols.height };
+        mc_heights.push((id, st.size.height));
+        let mut st = st.clone();
+        st.size.height = Dimension::length(want);
+        let _ = tree.taffy.set_style(id, st);
+    }
+    if !mc_geom.is_empty() {
+        run_pass(tree);
+    }
+    for (id, d) in mc_heights {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            st.size.height = d;
+            let _ = tree.taffy.set_style(id, st);
+        }
+    }
+    for (id, mw, shrink) in mc_saved {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            st.max_size.width = mw;
+            st.flex_shrink = shrink;
+            let _ = tree.taffy.set_style(id, st);
+        }
     }
     for (id, d) in saved_min {
         if let Ok(st) = tree.taffy.style(id) {

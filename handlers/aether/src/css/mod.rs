@@ -702,6 +702,9 @@ fn property_supported(prop: &str) -> bool {
             | "inset-block-start" | "inset-block-end"
             // AETHERSTYLE3 (SR103)
             | "filter" | "backdrop-filter" | "-webkit-filter" | "-webkit-backdrop-filter"
+            | "overflow-inline" | "overflow-block"
+            | "columns" | "column-count" | "column-width" | "column-fill" | "column-rule"
+            | "column-rule-width" | "column-rule-style" | "column-rule-color"
     )
 }
 

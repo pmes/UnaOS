@@ -56,6 +56,9 @@ pub struct InlineLayout {
     pub last_baseline: Option<f32>,
     /// Line boxes: (top, height, baseline) — for tests and debugging.
     pub lines: Vec<(f32, f32, f32)>,
+    /// AETHERSTYLE3 (SR103): the root is a multicol container — its lines were laid out at the column width
+    /// and fragmented into these columns (`multicol::balance_ifc`).
+    pub columns: Option<crate::multicol::Columns>,
 }
 
 enum Item {
@@ -308,6 +311,13 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
     // fraction narrower (which would wrap its last word).
     let rl = tree.taffy.unrounded_layout(root);
     let avail_w = (rl.size.width - rl.padding.left - rl.padding.right - rl.border.left - rl.border.right + 0.01).max(0.0);
+    // AETHERSTYLE3 (SR103): a multicol IFC root breaks its lines at the used column width.
+    let mc = if crate::multicol::is_multicol(tree, root) {
+        crate::multicol::used_columns(tree, root, avail_w - 0.01, root_run.font_size)
+    } else {
+        None
+    };
+    let avail_w = mc.map(|(_, w, _)| w + 0.01).unwrap_or(avail_w);
     let mut items = Vec::new();
     collect(tree, root, &mut items);
 
@@ -692,6 +702,9 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
         let fb = floats.iter().map(|f| f.y + f.h).fold(0.0f32, f32::max);
         out.height = out.height.max(fb);
     }
+    if let Some((n, w, gap)) = mc {
+        out.columns = Some(crate::multicol::balance_ifc(tree, root, &mut out, n, w, gap));
+    }
     out
 }
 
@@ -785,6 +798,11 @@ pub(crate) fn layout_all<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, t
         }
         heights.push((r, il.height));
         layouts.insert(r, il);
+    }
+    for (r, il) in &layouts {
+        if let Some(c) = il.columns {
+            tree.multicol.insert(*r, c);
+        }
     }
     tree.inline = layouts;
     heights

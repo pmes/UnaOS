@@ -494,10 +494,17 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             Some(v) => style.row_gap = Some(v),
             None => H::record_css(&format!("gap-value:{}", clip(value))),
         },
-        "column-gap" | "grid-column-gap" => match parse_length_percentage_str(value, cx) {
-            Some(v) => style.column_gap = Some(v),
-            None => H::record_css(&format!("gap-value:{}", clip(value))),
-        },
+        "column-gap" | "grid-column-gap" => {
+            // AETHERSTYLE3 (SR103): the multicol gutter too (css-multicol-1 §4.1; `normal` = 1em there).
+            if prop == "column-gap" {
+                if let Some(px) = parse_px(value, cx).filter(|_| !value.ends_with('%')) {
+                    style.paint.col_gap = Some(px);
+                } else if value == "normal" {
+                    style.paint.col_gap = None;
+                }
+            }
+            apply_column_gap(value, style, cx);
+        }
         "flex-grow" => match value.parse::<f32>() {
             Ok(v) if v >= 0.0 => style.flex_grow = Some(v),
             _ => H::record_css(&format!("flex-grow-value:{}", clip(value))),
@@ -727,6 +734,77 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         // css-will-change-1 §2: a hint a UA may ignore.
         "will-change" => {}
+        // AETHERSTYLE3 (SR103): css-multicol-1 §3-§6 (laid out by `multicol`).
+        "column-count" => match value {
+            "auto" => style.paint.col_count = Some(None),
+            v => match v.parse::<u32>() {
+                Ok(n) if n > 0 => style.paint.col_count = Some(Some(n)),
+                _ if is_neutral_keyword(v) => {}
+                _ => H::record_css(&format!("column-count-value:{}", clip(v))),
+            },
+        },
+        "column-width" => match value {
+            "auto" => style.paint.col_width = Some(None),
+            v => match parse_px(v, cx).filter(|px| *px >= 0.0 && !v.ends_with('%')) {
+                Some(px) => style.paint.col_width = Some(Some(px)),
+                None if is_neutral_keyword(v) => {}
+                None => H::record_css(&format!("column-width-value:{}", clip(v))),
+            },
+        },
+        "columns" => {
+            // `<'column-width'> || <'column-count'>`: an omitted half resets to auto.
+            let (mut count, mut width, mut ok) = (None, None, true);
+            for part in value.split_whitespace() {
+                if part == "auto" {
+                    continue;
+                }
+                if let Ok(n) = part.parse::<u32>() {
+                    ok &= n > 0 && count.is_none();
+                    count = Some(n);
+                } else if let Some(px) = parse_px(part, cx).filter(|_| !part.ends_with('%')) {
+                    ok &= width.is_none();
+                    width = Some(px);
+                } else {
+                    ok = false;
+                }
+            }
+            if ok {
+                style.paint.col_count = Some(count);
+                style.paint.col_width = Some(width);
+            } else if !is_neutral_keyword(value) {
+                H::record_css(&format!("columns-value:{}", clip(value)));
+            }
+        }
+        "column-fill" => match value {
+            "balance" | "balance-all" => style.paint.col_fill = Some(0),
+            "auto" => style.paint.col_fill = Some(1),
+            _ => {}
+        },
+        "column-rule" | "column-rule-width" | "column-rule-style" | "column-rule-color" => {
+            for part in split_top_level(value) {
+                let st = match part {
+                    "none" | "hidden" => Some(crate::multicol::RULE_NONE),
+                    p => border_style_code(p),
+                };
+                let w = match part {
+                    "thin" => Some(1.0),
+                    "medium" => Some(3.0),
+                    "thick" => Some(5.0),
+                    p => parse_px(p, cx),
+                };
+                if prop != "column-rule-color" && prop != "column-rule-width" && st.is_some() {
+                    style.paint.col_rule_style = st;
+                } else if prop != "column-rule-color" && prop != "column-rule-style" && w.is_some() {
+                    style.paint.col_rule_width = w;
+                } else if prop != "column-rule-width" && prop != "column-rule-style" {
+                    if let Some(c) = parse_color_str::<H>(part) {
+                        style.paint.col_rule_color = Some(c);
+                    }
+                }
+            }
+        }
+        // css-multicol-1 §6: a spanning element splits the column flow; Aether does not split it.
+        "column-span" if value == "none" => {}
         // AETHERSTYLE3 (SR103): Filter Effects 1 §5 / Filter Effects 2 §3 — the list svg_core parses.
         "filter" | "backdrop-filter" => {
             let v = value.trim();
@@ -1499,7 +1577,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                             | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
                             | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
                             | "backface-visibility" | "perspective" | "perspective-origin"
-                            | "filter" | "backdrop-filter"
+                            | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
+                            | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
+                            | "column-rule-style" | "column-rule-color" | "column-span"
                     )
                 }) =>
         {
@@ -1515,6 +1595,16 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 H::record_css(&format!("property:{}", other));
             }
         }
+    }
+}
+
+/// The flex / grid `column-gap` (taffy's horizontal gap), as the arm always folded it.
+fn apply_column_gap<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    match parse_length_percentage_str(value, cx) {
+        Some(v) => style.column_gap = Some(v),
+        // `normal`: the flex/grid gap's initial 0 (css-align-3 §8.1) — nothing to fold.
+        None if value == "normal" => {}
+        None => H::record_css(&format!("gap-value:{}", clip(value))),
     }
 }
 
@@ -2148,7 +2238,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         ua_vmargin, border_collapse, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
-        overflow,
+        overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter);
     if let Some(src_list) = &src.font_rel {
