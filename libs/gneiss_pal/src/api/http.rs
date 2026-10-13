@@ -26,12 +26,26 @@
 //!
 //! Runtime-agnostic: each exchange runs on its connection's own thread (`http_core::host`) and reports
 //! through a tokio channel, so these futures are `Send` and need no particular executor.
+//!
+//! AETHERCACHE (SR88): HTTP/2 is the default for `https://` (ALPN `h2` first — [`ClientBuilder::http2`] turns it
+//! off), and both clients may carry an [`HttpCache`]: RFC 9111 (`http_core::cache`) consulted per HOP of a
+//! redirect chain under the request's Fetch cache mode ([`RequestBuilder::cache_mode`]) and partitioned by the
+//! top-level site ([`RequestBuilder::partition`]). A memory tier for the page's lifetime over an optional disk
+//! tier (one file per entry, byte-bounded, LRU). A response body is TEED into the cache as the caller reads it
+//! and committed only when it ends cleanly; a served entry carries `Age`; a 304 freshens the stored response
+//! and the caller sees the stored status and body; `stale-while-revalidate` serves at once and revalidates on a
+//! thread of its own.
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use http_core::cache::{self as hcache, Decision, Entry};
+use http_core::h1::ResponseHead;
 use http_core::host::{self, Agent, AgentConfig, Event, EventSink, Next};
+pub use http_core::cache::CacheMode;
 pub use http_core::cookie::CookieJar;
 pub use http_core::headers::Headers;
 pub use http_core::url::Url;
@@ -157,6 +171,371 @@ pub mod header {
     pub const USER_AGENT: &str = "user-agent";
 }
 
+// ---------------------------------------------------------------- the HTTP cache (AETHERCACHE, SR88)
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The `scheme://host` site of `url` — the partition a top-level document's requests are cached under.
+pub fn site_of(url: &str) -> Option<String> {
+    Url::parse(url).ok().map(|u| hcache::site_of(&u))
+}
+
+/// An RFC 9111 private cache: a memory tier (byte-bounded LRU — the embedder empties it per page with
+/// [`HttpCache::clear_memory`]) over an optional disk tier. Shared by every client given the same `Arc`.
+pub struct HttpCache {
+    mem: Mutex<hcache::MemoryCache>,
+    mem_bytes: usize,
+    disk: Option<DiskCache>,
+}
+
+impl HttpCache {
+    /// Memory only.
+    pub fn memory(max_bytes: usize) -> Self {
+        HttpCache { mem: Mutex::new(hcache::MemoryCache::new(max_bytes)), mem_bytes: max_bytes, disk: None }
+    }
+
+    /// A memory tier of `mem_bytes` over a disk tier in `dir` (created) bounded to `disk_bytes`.
+    pub fn with_disk(mem_bytes: usize, dir: impl Into<PathBuf>, disk_bytes: u64) -> Self {
+        HttpCache { mem: Mutex::new(hcache::MemoryCache::new(mem_bytes)), mem_bytes, disk: Some(DiskCache::open(dir.into(), disk_bytes)) }
+    }
+
+    /// Forget the memory tier (a new page); the disk tier stays.
+    pub fn clear_memory(&self) {
+        if let Ok(mut m) = self.mem.lock() {
+            m.clear();
+        }
+    }
+
+    /// Entries in the memory tier.
+    pub fn memory_entries(&self) -> usize {
+        self.mem.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// The stored response for a primary key: memory first, then disk (promoted into memory).
+    pub fn get(&self, key: &str) -> Option<Entry> {
+        if let Some(e) = self.mem.lock().ok().and_then(|mut m| m.get(key).cloned()) {
+            return Some(e);
+        }
+        let e = self.disk.as_ref()?.get(key)?;
+        if let Ok(mut m) = self.mem.lock() {
+            m.put(e.clone());
+        }
+        Some(e)
+    }
+
+    pub fn put(&self, e: Entry) {
+        if let Some(d) = &self.disk {
+            d.put(&e);
+        }
+        if let Ok(mut m) = self.mem.lock() {
+            m.put(e);
+        }
+    }
+
+    pub fn remove(&self, key: &str) {
+        if let Ok(mut m) = self.mem.lock() {
+            m.remove(key);
+        }
+        if let Some(d) = &self.disk {
+            d.remove(key);
+        }
+    }
+
+    /// The largest body a response may have and still be stored.
+    fn max_body(&self) -> usize {
+        match &self.disk {
+            Some(d) => (self.mem_bytes / 8).max(((d.max / 8) as usize).min(32 << 20)),
+            None => self.mem_bytes / 8,
+        }
+    }
+}
+
+/// The disk tier: `<dir>/<fnv64(key)>.uhc`, each file an [`Entry::encode`] (whose key is checked on load),
+/// written to a temp name and renamed; the index (size, last use) is rebuilt from the directory at open, and
+/// the least recently used files go when the total passes the bound (down to 90% of it).
+struct DiskCache {
+    dir: PathBuf,
+    max: u64,
+    index: Mutex<DiskIndex>,
+}
+
+#[derive(Default)]
+struct DiskIndex {
+    /// name → (bytes, last use on the LRU clock).
+    files: HashMap<String, (u64, u64)>,
+    total: u64,
+    /// Microseconds-of-wall-clock ticks, strictly increasing per use (ties within a second keep their order).
+    clock: u64,
+}
+
+impl DiskIndex {
+    fn tick(&mut self) -> u64 {
+        self.clock = (self.clock + 1).max(now_secs() as u64 * 1_000_000);
+        self.clock
+    }
+}
+
+fn file_name(key: &str) -> String {
+    format!("{:016x}.uhc", hcache::key_hash(key))
+}
+
+impl DiskCache {
+    fn open(dir: PathBuf, max: u64) -> Self {
+        let _ = std::fs::create_dir_all(&dir);
+        let mut idx = DiskIndex::default();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().into_owned();
+                let Ok(meta) = ent.metadata() else { continue };
+                if name.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(ent.path());
+                    continue;
+                }
+                if !name.ends_with(".uhc") {
+                    continue;
+                }
+                let used = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_micros() as u64).unwrap_or(0);
+                idx.clock = idx.clock.max(used);
+                idx.total += meta.len();
+                idx.files.insert(name, (meta.len(), used));
+            }
+        }
+        DiskCache { dir, max, index: Mutex::new(idx) }
+    }
+
+    fn get(&self, key: &str) -> Option<Entry> {
+        let name = file_name(key);
+        if !self.index.lock().ok()?.files.contains_key(&name) {
+            return None;
+        }
+        let path = self.dir.join(&name);
+        let e = std::fs::read(&path).ok().and_then(|b| Entry::decode(&b));
+        match e {
+            Some(e) if e.key == key => {
+                if let Ok(mut i) = self.index.lock() {
+                    let t = i.tick();
+                    if let Some(f) = i.files.get_mut(&name) {
+                        f.1 = t;
+                    }
+                }
+                if let Ok(f) = std::fs::File::options().write(true).open(&path) {
+                    let _ = f.set_modified(std::time::SystemTime::now());
+                }
+                Some(e)
+            }
+            Some(_) => None, // another key with the same hash: a miss, the file stays
+            None => {
+                self.remove_name(&name);
+                None
+            }
+        }
+    }
+
+    fn put(&self, e: &Entry) {
+        let bytes = e.encode();
+        let name = file_name(&e.key);
+        if bytes.len() as u64 > self.max / 8 {
+            self.remove_name(&name);
+            return;
+        }
+        let path = self.dir.join(&name);
+        let tmp = self.dir.join(format!("{name}.tmp"));
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        let Ok(mut i) = self.index.lock() else { return };
+        let t = i.tick();
+        if let Some((old, _)) = i.files.insert(name, (bytes.len() as u64, t)) {
+            i.total -= old;
+        }
+        i.total += bytes.len() as u64;
+        if i.total > self.max {
+            let mut by_age: Vec<(u64, String)> = i.files.iter().map(|(n, (_, used))| (*used, n.clone())).collect();
+            by_age.sort();
+            for (_, n) in by_age {
+                if i.total <= self.max / 10 * 9 {
+                    break;
+                }
+                if let Some((size, _)) = i.files.remove(&n) {
+                    i.total -= size;
+                    let _ = std::fs::remove_file(self.dir.join(&n));
+                }
+            }
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        self.remove_name(&file_name(key));
+    }
+
+    fn remove_name(&self, name: &str) {
+        if let Ok(mut i) = self.index.lock() {
+            if let Some((size, _)) = i.files.remove(name) {
+                i.total -= size;
+                let _ = std::fs::remove_file(self.dir.join(name));
+            }
+        }
+    }
+}
+
+/// A request's cache context, fixed for its whole redirect chain.
+#[derive(Clone)]
+struct CacheCtx {
+    cache: Arc<HttpCache>,
+    mode: CacheMode,
+    partition: String,
+}
+
+/// One network hop's cache state.
+struct HopCache {
+    ctx: CacheCtx,
+    key: String,
+    mode: CacheMode,
+    /// The stored response the conditional request validates.
+    validating: Option<Entry>,
+    request_time: i64,
+    req_headers: Headers,
+}
+
+enum HopStart {
+    /// Serve this stored response (and maybe revalidate it in the background with this request).
+    Serve(Entry, Option<(host::Request, HopCache)>),
+    /// Send this request (the hop's request plus any conditional fields).
+    Net(host::Request, Option<HopCache>),
+    Fail(Error),
+}
+
+/// Before a hop: Fetch's cache-mode request fields, then the lookup and RFC 9111's decision.
+fn hop_start(ctx: Option<&CacheCtx>, req: &mut host::Request, mode_override: Option<CacheMode>) -> HopStart {
+    let Some(ctx) = ctx else { return HopStart::Net(req.clone(), None) };
+    let now = now_secs();
+    // Fetch: a conditional or ranged request in `default` becomes `no-store`; then the mode's request fields.
+    let fetch_mode = hcache::effective_mode(mode_override.unwrap_or(ctx.mode), "GET", &req.headers);
+    hcache::apply_mode_headers(fetch_mode, &mut req.headers);
+    let mode = if req.method.eq_ignore_ascii_case("GET") { fetch_mode } else { CacheMode::NoStore };
+    let key = hcache::cache_key(&ctx.partition, &req.url);
+    let hop = |validating: Option<Entry>| HopCache { ctx: ctx.clone(), key: key.clone(), mode, validating, request_time: now, req_headers: req.headers.clone() };
+    let entry = if mode.reads() { ctx.cache.get(&key) } else { None };
+    match (hcache::decide(mode, entry.as_ref(), &req.headers, now), entry) {
+        (Decision::Fail, _) => HopStart::Fail(Error::new("only-if-cached: no stored response")),
+        (Decision::Serve, Some(e)) => HopStart::Serve(e, None),
+        (Decision::ServeAndRevalidate, Some(e)) => {
+            let mut wire = req.clone();
+            e.add_conditionals(&mut wire.headers);
+            let hc = hop(Some(e.clone()));
+            HopStart::Serve(e, Some((wire, hc)))
+        }
+        (Decision::Validate, Some(e)) => {
+            let mut wire = req.clone();
+            e.add_conditionals(&mut wire.headers);
+            HopStart::Net(wire, Some(hop(Some(e))))
+        }
+        _ => HopStart::Net(req.clone(), Some(hop(None))),
+    }
+}
+
+/// A response body being copied into the cache as it is read.
+struct Tee {
+    cache: Arc<HttpCache>,
+    entry: Entry,
+    limit: usize,
+    over: bool,
+}
+
+impl Tee {
+    fn push(&mut self, d: &[u8]) {
+        if self.over {
+            return;
+        }
+        if self.entry.body.len() + d.len() > self.limit {
+            self.over = true;
+            self.entry.body = Vec::new();
+            return;
+        }
+        self.entry.body.extend_from_slice(d);
+    }
+    /// The body ended cleanly: store it.
+    fn commit(self) {
+        if !self.over {
+            self.cache.put(self.entry);
+        }
+    }
+}
+
+enum AfterHead {
+    /// A 304 freshened the stored response: deliver it (the network body is empty).
+    Stored(Entry),
+    /// Deliver the network response, teeing it into the cache when storable.
+    Net(Option<Tee>),
+    /// A 304 that matches nothing stored: repeat the hop unconditionally (`reload`).
+    Retry,
+}
+
+/// After a hop's head arrived: §4.4 invalidation, §4.3.4 freshening, §3 storage.
+fn hop_head(hc: Option<HopCache>, req: &host::Request, head: &ResponseHead) -> AfterHead {
+    let Some(hc) = hc else { return AfterHead::Net(None) };
+    let now = now_secs();
+    for u in hcache::invalidation_targets(&req.method, &req.url, head.status, &head.headers) {
+        hc.ctx.cache.remove(&hcache::cache_key(&hc.ctx.partition, &u));
+    }
+    if head.status == 304 {
+        if let Some(mut e) = hc.validating {
+            if e.validator_matches(&head.headers) {
+                e.freshen(&head.headers, hc.request_time, now);
+                hc.ctx.cache.put(e.clone());
+                return AfterHead::Stored(e);
+            }
+            hc.ctx.cache.remove(&hc.key);
+            return AfterHead::Retry;
+        }
+    }
+    // The connection adds `Cookie` itself, so a response that varies on it cannot be keyed here: not stored.
+    let varies_on_cookie = head.headers.get_all("vary").any(|v| v.split(',').any(|f| f.trim().eq_ignore_ascii_case("cookie")));
+    if hc.mode.writes() && !varies_on_cookie && hcache::storable(&req.method, &hc.req_headers, head.status, &head.headers) {
+        let entry = Entry::new(hc.key.clone(), &req.url, &hc.req_headers, head.status, &head.reason, &head.headers, hc.request_time, now);
+        let limit = hc.ctx.cache.max_body();
+        return AfterHead::Net(Some(Tee { cache: hc.ctx.cache.clone(), entry, limit, over: false }));
+    }
+    if hc.mode.writes() {
+        // A newer response that may not be stored supersedes what was.
+        hc.ctx.cache.remove(&hc.key);
+    }
+    AfterHead::Net(None)
+}
+
+fn stored_head(e: &Entry) -> ResponseHead {
+    ResponseHead { version: (1, 1), status: e.status, reason: e.reason.clone(), headers: e.headers_at(now_secs()) }
+}
+
+fn body_chunks(body: Vec<u8>) -> VecDeque<Vec<u8>> {
+    let mut q = VecDeque::new();
+    if !body.is_empty() {
+        q.push_back(body);
+    }
+    q
+}
+
+/// RFC 5861: revalidate a stale-while-revalidate response on a thread of its own (std channel, blocking).
+fn revalidate_detached(agent: Agent, wire: host::Request, hc: HopCache) {
+    let _ = std::thread::Builder::new().name("http-revalidate".into()).spawn(move || {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Event>(16);
+        agent.dispatch(&wire, Box::new(tx));
+        let Ok(Event::Head(head)) = rx.recv() else { return };
+        if let AfterHead::Net(Some(mut tee)) = hop_head(Some(hc), &wire, &head) {
+            while let Ok(ev) = rx.recv() {
+                match ev {
+                    Event::Data(d) => tee.push(&d),
+                    Event::End(Ok(())) => return tee.commit(),
+                    _ => return,
+                }
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------- the async client
 
 /// A tokio channel as the connection thread's event sink (a plain std thread: `blocking_send` is safe there).
@@ -171,6 +550,7 @@ impl EventSink for TokioSink {
 /// Builder for [`Client`].
 pub struct ClientBuilder {
     cfg: AgentConfig,
+    cache: Option<Arc<HttpCache>>,
 }
 
 impl Default for ClientBuilder {
@@ -181,7 +561,7 @@ impl Default for ClientBuilder {
 
 impl ClientBuilder {
     pub fn new() -> Self {
-        ClientBuilder { cfg: AgentConfig { user_agent: Some(default_user_agent()), ..Default::default() } }
+        ClientBuilder { cfg: AgentConfig { user_agent: Some(default_user_agent()), ..Default::default() }, cache: None }
     }
     /// Idle limit on each socket read/write (the exchange may run longer while bytes flow).
     pub fn timeout(mut self, d: Duration) -> Self {
@@ -215,19 +595,34 @@ impl ClientBuilder {
         self.cfg.proxy = host::ProxyMode::None;
         self
     }
-    pub fn build(self) -> Result<Client, Error> {
-        Ok(Client { agent: Agent::new(self.cfg) })
+    /// Offer HTTP/2 by ALPN (the default: `h2`, then `http/1.1`); `false` offers `http/1.1` only.
+    pub fn http2(mut self, on: bool) -> Self {
+        self.cfg.alpn = alpn_for(on);
+        self
     }
+    /// Consult and fill this RFC 9111 cache (per request: [`RequestBuilder::cache_mode`]).
+    pub fn cache(mut self, cache: Arc<HttpCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+    pub fn build(self) -> Result<Client, Error> {
+        Ok(Client { agent: Agent::new(self.cfg), cache: self.cache })
+    }
+}
+
+fn alpn_for(h2: bool) -> Vec<Vec<u8>> {
+    if h2 { vec![b"h2".to_vec(), b"http/1.1".to_vec()] } else { vec![b"http/1.1".to_vec()] }
 }
 
 fn default_user_agent() -> String {
     format!("UnaOS-gneiss/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// The async HTTP client. Cheap to clone (the connection pool is shared).
+/// The async HTTP client. Cheap to clone (the connection pool and the cache are shared).
 #[derive(Clone)]
 pub struct Client {
     agent: Agent,
+    cache: Option<Arc<HttpCache>>,
 }
 
 impl Default for Client {
@@ -251,6 +646,8 @@ impl Client {
             headers: Headers::new(),
             body: Arc::new(Vec::new()),
             err: None,
+            cache_mode: CacheMode::Default,
+            partition: None,
         }
     }
     pub fn get(&self, url: impl AsRef<str>) -> RequestBuilder {
@@ -276,9 +673,21 @@ pub struct RequestBuilder {
     headers: Headers,
     body: Arc<Vec<u8>>,
     err: Option<Error>,
+    cache_mode: CacheMode,
+    partition: Option<String>,
 }
 
 impl RequestBuilder {
+    /// The Fetch cache mode (`default` unless set); meaningful when the client has an [`HttpCache`].
+    pub fn cache_mode(mut self, mode: CacheMode) -> Self {
+        self.cache_mode = mode;
+        self
+    }
+    /// The top-level site this request is made for (the cache partition); default: the request URL's own site.
+    pub fn partition(mut self, site: impl Into<String>) -> Self {
+        self.partition = Some(site.into());
+        self
+    }
     pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
         if let Err(e) = self.headers.set(name.as_ref(), value.as_ref()) {
             self.err.get_or_insert(Error::new(format!("invalid header {}: {e:?}", name.as_ref())));
@@ -317,36 +726,87 @@ impl RequestBuilder {
         Some(self.clone())
     }
 
-    fn into_request(self) -> Result<(Agent, host::Request), Error> {
+    fn into_request(self) -> Result<(Agent, host::Request, Option<CacheCtx>), Error> {
         if let Some(e) = self.err {
             return Err(e);
         }
         let url = self.url?;
-        Ok((self.client.agent, host::Request { method: self.method, url, headers: self.headers, body: self.body }))
+        let ctx = self.client.cache.map(|cache| CacheCtx {
+            cache,
+            mode: self.cache_mode,
+            partition: self.partition.unwrap_or_else(|| hcache::site_of(&url)),
+        });
+        Ok((self.client.agent, host::Request { method: self.method, url, headers: self.headers, body: self.body }, ctx))
     }
 
-    /// Send, following redirects (RFC 9110 §15.4 / Fetch rules) and keeping cookies.
+    /// Send, following redirects (RFC 9110 §15.4 / Fetch rules), keeping cookies, and consulting the cache
+    /// per hop.
     pub async fn send(self) -> Result<Response, Error> {
-        let (agent, mut req) = self.into_request()?;
+        let (agent, mut req, ctx) = self.into_request()?;
         let mut hops = 0;
+        let mut mode_override = None;
         loop {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
-            agent.dispatch(&req, Box::new(TokioSink(tx)));
-            let head = match rx.recv().await {
-                Some(Event::Head(h)) => h,
-                Some(Event::End(Err(e))) => return Err(e.into()),
-                _ => return Err(Error::new("connection ended without a response")),
+            let stored = match hop_start(ctx.as_ref(), &mut req, mode_override.take()) {
+                HopStart::Fail(e) => return Err(e),
+                HopStart::Serve(e, reval) => {
+                    if let Some((wire, hc)) = reval {
+                        revalidate_detached(agent.clone(), wire, hc);
+                    }
+                    e
+                }
+                HopStart::Net(wire, hc) => {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+                    agent.dispatch(&wire, Box::new(TokioSink(tx)));
+                    let head = match rx.recv().await {
+                        Some(Event::Head(h)) => h,
+                        Some(Event::End(Err(e))) => return Err(e.into()),
+                        _ => return Err(Error::new("connection ended without a response")),
+                    };
+                    match hop_head(hc, &req, &head) {
+                        AfterHead::Retry => {
+                            drain_async(&mut rx, None).await;
+                            mode_override = Some(CacheMode::Reload);
+                            continue;
+                        }
+                        AfterHead::Stored(e) => {
+                            drain_async(&mut rx, None).await;
+                            let _ = agent.after_head(&req, &head, hops); // the 304's Set-Cookie reaches the jar
+                            e
+                        }
+                        AfterHead::Net(tee) => match agent.after_head(&req, &head, hops)? {
+                            Next::Final => {
+                                return Ok(Response {
+                                    status: StatusCode(head.status),
+                                    headers: head.headers,
+                                    url: req.url,
+                                    body: AsyncBody::Net(rx),
+                                    done: false,
+                                    tee,
+                                });
+                            }
+                            Next::Follow(next) => {
+                                drain_async(&mut rx, tee).await;
+                                req = next;
+                                hops += 1;
+                                continue;
+                            }
+                        },
+                    }
+                }
             };
+            let head = stored_head(&stored);
             match agent.after_head(&req, &head, hops)? {
                 Next::Final => {
-                    return Ok(Response { status: StatusCode(head.status), headers: head.headers, url: req.url, rx, done: false });
+                    return Ok(Response {
+                        status: StatusCode(head.status),
+                        headers: head.headers,
+                        url: req.url,
+                        body: AsyncBody::Mem(body_chunks(stored.body)),
+                        done: false,
+                        tee: None,
+                    });
                 }
                 Next::Follow(next) => {
-                    while let Some(ev) = rx.recv().await {
-                        if matches!(ev, Event::End(_)) {
-                            break;
-                        }
-                    }
                     req = next;
                     hops += 1;
                 }
@@ -355,13 +815,40 @@ impl RequestBuilder {
     }
 }
 
-/// A response whose body streams in as it arrives (content codings already decoded).
+/// Read a hop's remaining events to its end (committing its tee on a clean end).
+async fn drain_async(rx: &mut tokio::sync::mpsc::Receiver<Event>, mut tee: Option<Tee>) {
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            Event::Data(d) => {
+                if let Some(t) = &mut tee {
+                    t.push(&d);
+                }
+            }
+            Event::End(r) => {
+                if let (Ok(()), Some(t)) = (r, tee) {
+                    t.commit();
+                }
+                return;
+            }
+            Event::Head(_) => return,
+        }
+    }
+}
+
+enum AsyncBody {
+    Net(tokio::sync::mpsc::Receiver<Event>),
+    Mem(VecDeque<Vec<u8>>),
+}
+
+/// A response whose body streams in as it arrives (content codings already decoded) — or, served from the
+/// cache, from memory.
 pub struct Response {
     status: StatusCode,
     headers: Headers,
     url: Url,
-    rx: tokio::sync::mpsc::Receiver<Event>,
+    body: AsyncBody,
     done: bool,
+    tee: Option<Tee>,
 }
 
 impl Response {
@@ -384,10 +871,28 @@ impl Response {
         if self.done {
             return Ok(None);
         }
-        match self.rx.recv().await {
-            Some(Event::Data(d)) => Ok(Some(d)),
+        let rx = match &mut self.body {
+            AsyncBody::Mem(q) => {
+                let c = q.pop_front();
+                self.done = c.is_none();
+                return Ok(c);
+            }
+            AsyncBody::Net(rx) => rx,
+        };
+        match rx.recv().await {
+            Some(Event::Data(d)) => {
+                if let Some(t) = &mut self.tee {
+                    t.push(&d);
+                }
+                Ok(Some(d))
+            }
             Some(Event::End(r)) => {
                 self.done = true;
+                if r.is_ok() {
+                    if let Some(t) = self.tee.take() {
+                        t.commit();
+                    }
+                }
                 r.map(|_| None).map_err(Error::from)
             }
             _ => {
@@ -497,15 +1002,19 @@ pub mod multipart {
 
 /// The blocking client (Aether's JS `fetch`/XHR run it on their own thread, off the async runtime).
 pub mod blocking {
+    use std::collections::VecDeque;
+    use std::sync::mpsc::{Receiver, sync_channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use http_core::host::{self, Agent, AgentConfig};
+    use http_core::host::{self, Agent, AgentConfig, Event, Next};
 
-    use super::{CookieJar, Error, Headers, StatusCode, Url};
+    use super::{AfterHead, CacheCtx, CacheMode, CookieJar, Error, Headers, HopStart, HttpCache, StatusCode, Tee, Url};
+    use super::{body_chunks, hcache, hop_head, hop_start, revalidate_detached, stored_head};
 
     pub struct ClientBuilder {
         cfg: AgentConfig,
+        cache: Option<Arc<HttpCache>>,
     }
 
     impl Default for ClientBuilder {
@@ -516,7 +1025,7 @@ pub mod blocking {
 
     impl ClientBuilder {
         pub fn new() -> Self {
-            ClientBuilder { cfg: AgentConfig { user_agent: Some(super::default_user_agent()), ..Default::default() } }
+            ClientBuilder { cfg: AgentConfig { user_agent: Some(super::default_user_agent()), ..Default::default() }, cache: None }
         }
         pub fn timeout(mut self, d: Duration) -> Self {
             self.cfg.timeout = Some(d);
@@ -535,14 +1044,25 @@ pub mod blocking {
             self.cfg.max_redirects = n;
             self
         }
+        /// Offer HTTP/2 by ALPN (default on).
+        pub fn http2(mut self, on: bool) -> Self {
+            self.cfg.alpn = super::alpn_for(on);
+            self
+        }
+        /// Consult and fill this RFC 9111 cache.
+        pub fn cache(mut self, cache: Arc<HttpCache>) -> Self {
+            self.cache = Some(cache);
+            self
+        }
         pub fn build(self) -> Result<Client, Error> {
-            Ok(Client { agent: Agent::new(self.cfg) })
+            Ok(Client { agent: Agent::new(self.cfg), cache: self.cache })
         }
     }
 
     #[derive(Clone)]
     pub struct Client {
         agent: Agent,
+        cache: Option<Arc<HttpCache>>,
     }
 
     impl Client {
@@ -552,10 +1072,13 @@ pub mod blocking {
         pub fn request(&self, method: &str, url: &str) -> RequestBuilder {
             RequestBuilder {
                 agent: self.agent.clone(),
+                cache: self.cache.clone(),
                 method: method.to_ascii_uppercase(),
                 url: Url::parse(url).map_err(Error::from),
                 headers: Headers::new(),
                 body: Vec::new(),
+                cache_mode: CacheMode::Default,
+                partition: None,
             }
         }
         pub fn get(&self, url: &str) -> RequestBuilder {
@@ -568,10 +1091,33 @@ pub mod blocking {
 
     pub struct RequestBuilder {
         agent: Agent,
+        cache: Option<Arc<HttpCache>>,
         method: String,
         url: Result<Url, Error>,
         headers: Headers,
         body: Vec<u8>,
+        cache_mode: CacheMode,
+        partition: Option<String>,
+    }
+
+    /// Read the rest of a hop (committing its tee on a clean end).
+    fn drain(rx: &Receiver<Event>, mut tee: Option<Tee>) {
+        while let Ok(ev) = rx.recv() {
+            match ev {
+                Event::Data(d) => {
+                    if let Some(t) = &mut tee {
+                        t.push(&d);
+                    }
+                }
+                Event::End(r) => {
+                    if let (Ok(()), Some(t)) = (r, tee) {
+                        t.commit();
+                    }
+                    return;
+                }
+                Event::Head(_) => return,
+            }
+        }
     }
 
     impl RequestBuilder {
@@ -583,19 +1129,158 @@ pub mod blocking {
             self.body = b.into();
             self
         }
+        /// The Fetch cache mode (`default` unless set).
+        pub fn cache_mode(mut self, mode: CacheMode) -> Self {
+            self.cache_mode = mode;
+            self
+        }
+        /// The top-level site this request is made for (the cache partition).
+        pub fn partition(mut self, site: impl Into<String>) -> Self {
+            self.partition = Some(site.into());
+            self
+        }
+        /// Send, following redirects and consulting the cache per hop (as the async client does).
         pub fn send(self) -> Result<Response, Error> {
             let url = self.url?;
-            let req = host::Request { method: self.method, url, headers: self.headers, body: Arc::new(self.body) };
-            let inner = self.agent.send(req)?;
-            Ok(Response { inner, pending: Vec::new(), pos: 0 })
+            let ctx = self.cache.map(|cache| CacheCtx {
+                cache,
+                mode: self.cache_mode,
+                partition: self.partition.unwrap_or_else(|| hcache::site_of(&url)),
+            });
+            let agent = self.agent;
+            let mut req = host::Request { method: self.method, url, headers: self.headers, body: Arc::new(self.body) };
+            let mut hops = 0;
+            let mut mode_override = None;
+            loop {
+                let stored = match hop_start(ctx.as_ref(), &mut req, mode_override.take()) {
+                    HopStart::Fail(e) => return Err(e),
+                    HopStart::Serve(e, reval) => {
+                        if let Some((wire, hc)) = reval {
+                            revalidate_detached(agent.clone(), wire, hc);
+                        }
+                        e
+                    }
+                    HopStart::Net(wire, hc) => {
+                        let (tx, rx) = sync_channel::<Event>(16);
+                        agent.dispatch(&wire, Box::new(tx));
+                        let head = match rx.recv() {
+                            Ok(Event::Head(h)) => h,
+                            Ok(Event::End(Err(e))) => return Err(e.into()),
+                            _ => return Err(Error::new("connection thread ended without a response")),
+                        };
+                        match hop_head(hc, &req, &head) {
+                            AfterHead::Retry => {
+                                drain(&rx, None);
+                                mode_override = Some(CacheMode::Reload);
+                                continue;
+                            }
+                            AfterHead::Stored(e) => {
+                                drain(&rx, None);
+                                let _ = agent.after_head(&req, &head, hops); // the 304's Set-Cookie reaches the jar
+                                e
+                            }
+                            AfterHead::Net(tee) => match agent.after_head(&req, &head, hops)? {
+                                Next::Final => {
+                                    return Ok(Response {
+                                        status: head.status,
+                                        reason: head.reason,
+                                        headers: head.headers,
+                                        url: req.url,
+                                        body: SyncBody::Net(rx),
+                                        done: false,
+                                        tee,
+                                        pending: Vec::new(),
+                                        pos: 0,
+                                    });
+                                }
+                                Next::Follow(next) => {
+                                    drain(&rx, tee);
+                                    req = next;
+                                    hops += 1;
+                                    continue;
+                                }
+                            },
+                        }
+                    }
+                };
+                let head = stored_head(&stored);
+                match agent.after_head(&req, &head, hops)? {
+                    Next::Final => {
+                        return Ok(Response {
+                            status: head.status,
+                            reason: head.reason,
+                            headers: head.headers,
+                            url: req.url,
+                            body: SyncBody::Mem(body_chunks(stored.body)),
+                            done: false,
+                            tee: None,
+                            pending: Vec::new(),
+                            pos: 0,
+                        });
+                    }
+                    Next::Follow(next) => {
+                        req = next;
+                        hops += 1;
+                    }
+                }
+            }
         }
+    }
+
+    enum SyncBody {
+        Net(Receiver<Event>),
+        Mem(VecDeque<Vec<u8>>),
     }
 
     /// A blocking response; the body streams through [`std::io::Read`] (or `bytes`/`text`).
     pub struct Response {
-        inner: host::Response,
+        status: u16,
+        reason: String,
+        headers: Headers,
+        url: Url,
+        body: SyncBody,
+        done: bool,
+        tee: Option<Tee>,
         pending: Vec<u8>,
         pos: usize,
+    }
+
+    impl Response {
+        /// The next body chunk from the network (teed into the cache) or from the stored body.
+        fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, http_core::Error> {
+            if self.done {
+                return Ok(None);
+            }
+            let rx = match &mut self.body {
+                SyncBody::Mem(q) => {
+                    let c = q.pop_front();
+                    self.done = c.is_none();
+                    return Ok(c);
+                }
+                SyncBody::Net(rx) => rx,
+            };
+            match rx.recv() {
+                Ok(Event::Data(d)) => {
+                    if let Some(t) = &mut self.tee {
+                        t.push(&d);
+                    }
+                    Ok(Some(d))
+                }
+                Ok(Event::End(r)) => {
+                    self.done = true;
+                    if r.is_ok() {
+                        if let Some(t) = self.tee.take() {
+                            t.commit();
+                        }
+                    }
+                    r.map(|_| None)
+                }
+                Ok(Event::Head(_)) | Err(_) => {
+                    self.done = true;
+                    Err(http_core::Error::Io("connection thread ended mid-body".into()))
+                }
+            }
+        }
     }
 
     /// Reads the decoded body as it arrives; a transport/TLS/framing error mid-body is an `io::Error`
@@ -603,7 +1288,7 @@ pub mod blocking {
     impl std::io::Read for Response {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             while self.pos >= self.pending.len() {
-                match self.inner.chunk() {
+                match self.next_chunk() {
                     Ok(Some(c)) => {
                         self.pending = c;
                         self.pos = 0;
@@ -624,16 +1309,16 @@ pub mod blocking {
 
     impl Response {
         pub fn status(&self) -> StatusCode {
-            StatusCode(self.inner.status())
+            StatusCode(self.status)
         }
         pub fn headers(&self) -> &Headers {
-            self.inner.headers()
+            &self.headers
         }
         pub fn url(&self) -> &Url {
-            &self.inner.url
+            &self.url
         }
         pub fn content_length(&self) -> Option<u64> {
-            self.inner.headers().get("content-length").and_then(|v| v.trim().parse().ok())
+            self.headers.get("content-length").and_then(|v| v.trim().parse().ok())
         }
         /// The next decoded body chunk as the connection delivers it (`None` at the end) — what a page's
         /// streaming `fetch` body, `XMLHttpRequest` progress and `EventSource` read before EOF (AETHERNET, SR70).
@@ -644,16 +1329,16 @@ pub mod blocking {
                 self.pos = 0;
                 return Ok(Some(rest));
             }
-            Ok(self.inner.chunk()?)
+            Ok(self.next_chunk()?)
         }
         /// The status line's reason phrase as the server sent it (`statusText`).
         pub fn reason(&self) -> &str {
-            &self.inner.head.reason
+            &self.reason
         }
         pub fn bytes(mut self) -> Result<Vec<u8>, Error> {
             let mut all = self.pending.split_off(self.pos);
             self.pending.clear();
-            while let Some(c) = self.inner.chunk()? {
+            while let Some(c) = self.next_chunk()? {
                 all.extend_from_slice(&c);
             }
             Ok(all)
@@ -1533,5 +2218,173 @@ mod ws_tests {
         assert_eq!((frames[1].opcode, &frames[1].payload[..]), (OP_PONG, &b"p2"[..]));
         assert_eq!((frames[2].fin, frames[2].opcode, &frames[2].payload[..]), (false, OP_BINARY, &b"ab"[..]));
         assert_eq!((frames[3].fin, frames[3].opcode, &frames[3].payload[..]), (true, OP_CONT, &b"cd"[..]));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    //! AETHERCACHE (SR88): the cache through the blocking client against a local HTTP/1.1 origin that counts
+    //! its requests. `/fresh` is `max-age=60`; `/etag` is `max-age=0` with an ETag and answers a matching
+    //! `If-None-Match` with 304; `/nostore` is `no-store`; `/redir` 301s (max-age=60) to `/fresh`.
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn origin() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let not_modified = Arc::new(AtomicUsize::new(0));
+        let (h, nm) = (hits.clone(), not_modified.clone());
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let (h, nm) = (h.clone(), nm.clone());
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut w = s;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        let mut inm = None;
+                        let mut clen = 0usize;
+                        loop {
+                            let mut f = String::new();
+                            if r.read_line(&mut f).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if f.trim().is_empty() {
+                                break;
+                            }
+                            if let Some((k, v)) = f.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("if-none-match") {
+                                    inm = Some(v.trim().to_string());
+                                }
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    clen = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                        let mut body_in = vec![0u8; clen];
+                        if std::io::Read::read_exact(&mut r, &mut body_in).is_err() {
+                            return;
+                        }
+                        h.fetch_add(1, Ordering::SeqCst);
+                        let (status, extra, body): (&str, String, &str) = match path.as_str() {
+                            "/fresh" => ("200 OK", "Cache-Control: max-age=60\r\n".into(), "fresh-body"),
+                            "/etag" if inm.as_deref() == Some("\"v1\"") => {
+                                nm.fetch_add(1, Ordering::SeqCst);
+                                ("304 Not Modified", "ETag: \"v1\"\r\nCache-Control: max-age=0\r\nX-Fresh: yes\r\n".into(), "")
+                            }
+                            "/etag" => ("200 OK", "ETag: \"v1\"\r\nCache-Control: max-age=0\r\n".into(), "etag-body"),
+                            "/nostore" => ("200 OK", "Cache-Control: no-store\r\n".into(), "nostore-body"),
+                            "/redir" => ("301 Moved Permanently", "Location: /fresh\r\nCache-Control: max-age=60\r\n".into(), ""),
+                            _ => ("404 Not Found", String::new(), "missing"),
+                        };
+                        let resp = format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len());
+                        if w.write_all(resp.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (base, hits, not_modified)
+    }
+
+    fn client(cache: &Arc<HttpCache>) -> blocking::Client {
+        blocking::ClientBuilder::new().cache(cache.clone()).build().unwrap()
+    }
+
+    #[test]
+    fn cache_fresh_response_served_without_network() {
+        let (base, hits, _) = origin();
+        let cache = Arc::new(HttpCache::memory(1 << 20));
+        let c = client(&cache);
+        assert_eq!(c.get(&format!("{base}/fresh")).send().unwrap().text().unwrap(), "fresh-body");
+        let r = c.get(&format!("{base}/fresh#frag")).send().unwrap();
+        assert!(r.headers().contains("age"), "a served entry carries Age");
+        assert_eq!(r.text().unwrap(), "fresh-body");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // `reload` goes to the network (and stores); `no-store` neither reads nor writes.
+        c.get(&format!("{base}/fresh")).cache_mode(CacheMode::Reload).send().unwrap().bytes().unwrap();
+        c.get(&format!("{base}/fresh")).cache_mode(CacheMode::NoStore).send().unwrap().bytes().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn cache_stale_revalidates_with_304() {
+        let (base, hits, nm) = origin();
+        let cache = Arc::new(HttpCache::memory(1 << 20));
+        let c = client(&cache);
+        assert_eq!(c.get(&format!("{base}/etag")).send().unwrap().text().unwrap(), "etag-body");
+        let r = c.get(&format!("{base}/etag")).send().unwrap();
+        assert_eq!(r.status().as_u16(), 200, "the 304 is merged; the stored 200 is delivered");
+        assert_eq!(r.headers().get("x-fresh"), Some("yes"), "the 304's fields freshen the entry");
+        assert_eq!(r.text().unwrap(), "etag-body");
+        assert_eq!((hits.load(Ordering::SeqCst), nm.load(Ordering::SeqCst)), (2, 1));
+        // `force-cache` uses the stale entry without asking.
+        assert_eq!(c.get(&format!("{base}/etag")).cache_mode(CacheMode::ForceCache).send().unwrap().text().unwrap(), "etag-body");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cache_modes_no_store_and_only_if_cached() {
+        let (base, hits, _) = origin();
+        let cache = Arc::new(HttpCache::memory(1 << 20));
+        let c = client(&cache);
+        c.get(&format!("{base}/nostore")).send().unwrap().bytes().unwrap();
+        c.get(&format!("{base}/nostore")).send().unwrap().bytes().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "no-store responses are never stored");
+        assert!(c.get(&format!("{base}/never")).cache_mode(CacheMode::OnlyIfCached).send().is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "only-if-cached never touches the network");
+        // A redirect hop is cached on its own: the second chain is served entirely from the cache.
+        assert_eq!(c.get(&format!("{base}/redir")).send().unwrap().text().unwrap(), "fresh-body");
+        assert_eq!(c.get(&format!("{base}/redir")).send().unwrap().text().unwrap(), "fresh-body");
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        // The partition is part of the key: another top-level site misses.
+        c.get(&format!("{base}/fresh")).partition("https://other.example").send().unwrap().bytes().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn cache_unsafe_method_invalidates() {
+        let (base, hits, _) = origin();
+        let cache = Arc::new(HttpCache::memory(1 << 20));
+        let c = client(&cache);
+        c.get(&format!("{base}/fresh")).send().unwrap().bytes().unwrap();
+        // POST to the same URI: the 200 invalidates the stored GET response (§4.4).
+        c.post(&format!("{base}/fresh")).body("x").send().unwrap().bytes().unwrap();
+        c.get(&format!("{base}/fresh")).send().unwrap().bytes().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn cache_disk_tier_persists_and_bounds() {
+        let (base, hits, _) = origin();
+        let dir = std::env::temp_dir().join(format!("gneiss-http-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let cache = Arc::new(HttpCache::with_disk(1 << 20, &dir, 1 << 20));
+            client(&cache).get(&format!("{base}/fresh")).send().unwrap().bytes().unwrap();
+        }
+        // A new process (a new HttpCache over the same directory) finds it on disk.
+        let cache = Arc::new(HttpCache::with_disk(1 << 20, &dir, 1 << 20));
+        assert_eq!(client(&cache).get(&format!("{base}/fresh")).send().unwrap().text().unwrap(), "fresh-body");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The byte bound: a tier of 4 KiB keeps the newest entries only.
+        let small = DiskCache::open(dir.join("small"), 4096);
+        for n in 0..32 {
+            let url = Url::parse(&format!("https://a.example/{n}")).unwrap();
+            let mut e = Entry::new(hcache::cache_key("p", &url), &url, &Headers::new(), 200, "OK", &Headers::new(), 0, 0);
+            e.body = vec![7u8; 300];
+            small.put(&e);
+        }
+        let total = small.index.lock().unwrap().total;
+        assert!(total <= 4096, "disk tier over its bound: {total}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

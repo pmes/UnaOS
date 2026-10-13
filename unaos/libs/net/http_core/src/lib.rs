@@ -9,7 +9,8 @@
 //! * [`cookie`] — RFC 6265 §5 parser, dates, jar, Cookie header.
 //! * [`encoding`] — gzip/deflate content codings through pixel_core's inflater (br owed).
 //! * [`multipart`] — RFC 7578 `multipart/form-data`.
-//! * [`h2`] (feature `h2`) — RFC 9113 framing and RFC 7541 HPACK.
+//! * [`cache`] — RFC 9111 HTTP caching (private cache) and the Fetch cache modes (AETHERCACHE, SR88).
+//! * [`h2`] (feature `h2`, and always with `host`) — RFC 9113 framing and RFC 7541 HPACK.
 //! * `host` (feature `host`, std) — the host transport: std `TcpStream`, `tls_core` verified against a PEM
 //!   trust store, HTTP CONNECT proxies, a keep-alive pool of connection threads.
 //!
@@ -23,6 +24,7 @@ extern crate alloc;
 #[cfg(feature = "host")]
 extern crate std;
 
+pub mod cache;
 pub mod conn;
 pub mod cookie;
 pub mod encoding;
@@ -32,7 +34,8 @@ pub mod multipart;
 pub mod redirect;
 pub mod url;
 
-#[cfg(feature = "h2")]
+// AETHERCACHE (SR88): the host transport offers ALPN `h2` first by default, so `host` carries the h2 module.
+#[cfg(any(feature = "h2", feature = "host"))]
 pub mod h2;
 
 #[cfg(feature = "host")]

@@ -1,9 +1,60 @@
 use anyhow::{Context, Result};
-use gneiss_pal::api::http::{self, Client, CookieJar};
+use gneiss_pal::api::http::{self, CacheMode, Client, CookieJar, HttpCache};
 use std::sync::{Arc, Mutex};
 
 // HTTPCORE (SR51): every Aether fetch goes through gneiss_pal::api::http — UnaOS's own http_core (WHATWG URL,
 // HTTP/1.1, RFC 6265 jar, gzip/deflate) over tls_core (TLS 1.3, verified). reqwest and its cookie_store are gone.
+//
+// AETHERCACHE (SR88): HTTP/2 by default for https (one multiplexed connection per origin), one RFC 9111 cache
+// for the page loader and the page's own fetch/XHR (a memory tier emptied per page load over a disk tier in
+// storage::http_cache_dir(), 256 MiB, LRU), every request partitioned by the top-level site, and the page's
+// subresources loaded through a PRIORITY QUEUE — document > CSS > fonts > scripts > images — with bounded
+// concurrency, deduplicated, each request carrying its RFC 9218 `Priority` urgency.
+
+/// Memory tier: the current page's responses.
+const CACHE_MEMORY_BYTES: usize = 64 << 20;
+/// Disk tier bound.
+const CACHE_DISK_BYTES: u64 = 256 << 20;
+
+/// The process-wide HTTP cache every Aether client shares.
+pub fn http_cache() -> Arc<HttpCache> {
+    static CACHE: std::sync::OnceLock<Arc<HttpCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| Arc::new(HttpCache::with_disk(CACHE_MEMORY_BYTES, crate::storage::http_cache_dir(), CACHE_DISK_BYTES)))
+        .clone()
+}
+
+/// A page's resource classes in load priority order (lower loads first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Priority {
+    Document = 0,
+    Css = 1,
+    Font = 2,
+    Script = 3,
+    Image = 4,
+}
+
+impl Priority {
+    /// RFC 9218 §4: the `Priority` request field (urgency 0 highest; images are incremental).
+    pub fn header(self) -> &'static str {
+        match self {
+            Priority::Document => "u=0",
+            Priority::Css => "u=1",
+            Priority::Font => "u=2",
+            Priority::Script => "u=3",
+            Priority::Image => "u=5, i",
+        }
+    }
+}
+
+/// A GET through the shared client: priority, cache partition (the top-level site), default cache mode.
+async fn get(url: &str, pri: Priority, partition: Option<&str>) -> std::result::Result<http::Response, http::Error> {
+    let mut rb = client().get(url).header("Priority", pri.header()).cache_mode(CacheMode::Default);
+    if let Some(p) = partition {
+        rb = rb.partition(p);
+    }
+    rb.send().await
+}
 
 /// Process-wide, in-memory cookie jar (session-scoped: nothing is written
 /// to disk, so quitting Aether logs you out). Shared by every client we
@@ -43,7 +94,7 @@ pub fn set_cookie(url: &str, cookie_str: &str) {
 /// own thread, off the tokio runtime). Pre-wired to the shared jar so those
 /// requests carry — and record — the same cookies as the page load.
 pub fn blocking_client_builder() -> http::blocking::ClientBuilder {
-    http::blocking::ClientBuilder::new().user_agent("UnaOS Aether/0.1.0").cookie_jar(cookie_jar())
+    http::blocking::ClientBuilder::new().user_agent("UnaOS Aether/0.1.0").cookie_jar(cookie_jar()).cache(http_cache())
 }
 
 /// One shared HTTP client: connection pooling (keep-alive connection threads)
@@ -55,6 +106,7 @@ fn client() -> &'static Client {
         Client::builder()
             .user_agent("UnaOS Aether/0.1.0")
             .cookie_jar(cookie_jar())
+            .cache(http_cache())
             .build()
             .expect("http client")
     })
@@ -87,10 +139,9 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
         anyhow::bail!("Invalid URL");
     }
 
-    let client = client();
     let mut last_err = None;
     for url in urls {
-        match client.get(&url).send().await {
+        match get(&url, Priority::Document, None).await {
             Ok(response) => {
                 if !response.status().is_success() {
                     return Err(anyhow::anyhow!("HTTP Error: {}", response.status()));
@@ -483,9 +534,29 @@ fn inline_style_blocks(html: &str) -> Vec<String> {
     out
 }
 
+/// Text of a subresource (a sheet or a script): success status, 10 MB cap, UTF-8.
+async fn fetch_text_p(url: &str, pri: Priority, partition: Option<&str>) -> Result<String> {
+    let response = get(url, pri, partition).await.context("Connection failure")?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP Error: {}", response.status());
+    }
+    if response.content_length().unwrap_or(0) > 10 * 1024 * 1024 {
+        anyhow::bail!("Response exceeds size limit");
+    }
+    let bytes = response.bytes().await.context("Failed to read body")?;
+    if bytes.len() > 10 * 1024 * 1024 {
+        anyhow::bail!("Response body exceeds size limit");
+    }
+    String::from_utf8(bytes).context("Invalid UTF-8")
+}
+
 /// Fetches raw bytes (images etc), same limits as fetch_document.
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = client().get(url).send().await?;
+    fetch_bytes_p(url, Priority::Image, None).await
+}
+
+async fn fetch_bytes_p(url: &str, pri: Priority, partition: Option<&str>) -> Result<Vec<u8>> {
+    let response = get(url, pri, partition).await?;
     if !response.status().is_success() {
         anyhow::bail!("HTTP Error: {}", response.status());
     }
@@ -533,7 +604,11 @@ pub fn sniff_image_kind(bytes: &[u8]) -> Option<&'static str> {
 /// magic bytes do. A non-image response is rejected after ~1 KiB rather
 /// than buffered whole; the 10 MB body cap matches `fetch_bytes`.
 pub async fn fetch_image_bytes(url: &str) -> Result<Vec<u8>> {
-    let mut response = client().get(url).send().await?;
+    fetch_image_bytes_p(url, None).await
+}
+
+async fn fetch_image_bytes_p(url: &str, partition: Option<&str>) -> Result<Vec<u8>> {
+    let mut response = get(url, Priority::Image, partition).await?;
     if !response.status().is_success() {
         anyhow::bail!("HTTP Error: {}", response.status());
     }
@@ -575,109 +650,221 @@ pub async fn fetch_image_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Fetches a page, its external stylesheets, and its images: the async
-/// half of the fetch-then-apply pattern. Resource failures are skipped
-/// (and ledgered), never fatal to the page load.
+/// Requests in flight at once for a page's subresources (one h2 connection per origin multiplexes them).
+const MAX_IN_FLIGHT: usize = 16;
+/// Images in flight at once: a skin's icon sprites plus a page's photos run to the hundreds, and firing them
+/// all at once earns 429s from upload.wikimedia.org.
+const MAX_IMAGES_IN_FLIGHT: usize = 8;
+/// @font-face sources fetched per page.
+const MAX_FONTS: usize = 32;
+
+/// One queued subresource.
+enum Load {
+    /// The `i`th stylesheet in document order.
+    Sheet(usize, String),
+    Script(String),
+    Font(String),
+    /// (fetch URL, paint-lookup key).
+    Image(String, String),
+}
+
+impl Load {
+    fn priority(&self) -> Priority {
+        match self {
+            Load::Sheet(..) => Priority::Css,
+            Load::Font(_) => Priority::Font,
+            Load::Script(_) => Priority::Script,
+            Load::Image(..) => Priority::Image,
+        }
+    }
+}
+
+enum Loaded {
+    Sheet(usize, String, Result<String>),
+    Script(String, Result<String>),
+    Font(String, Result<Vec<u8>>),
+    Image(String, String, Result<Vec<u8>>),
+}
+
+/// The page's subresource scheduler: a priority queue (class, then discovery order), a bound on requests in
+/// flight (and a lower one on images), and deduplication by (class, URL) — a script referenced twice is
+/// fetched once and fills both slots.
+struct Loader {
+    queue: std::collections::BinaryHeap<std::cmp::Reverse<(Priority, u64)>>,
+    jobs: std::collections::HashMap<u64, Load>,
+    seen: std::collections::HashSet<(Priority, String)>,
+    seq: u64,
+    fonts: usize,
+    partition: Option<String>,
+}
+
+impl Loader {
+    fn push(&mut self, load: Load) {
+        let url = match &load {
+            Load::Sheet(_, u) | Load::Script(u) | Load::Font(u) | Load::Image(u, _) => u.clone(),
+        };
+        let pri = load.priority();
+        if !self.seen.insert((pri, url)) {
+            return;
+        }
+        if pri == Priority::Font {
+            if self.fonts >= MAX_FONTS {
+                return;
+            }
+            self.fonts += 1;
+        }
+        self.seq += 1;
+        self.queue.push(std::cmp::Reverse((pri, self.seq)));
+        self.jobs.insert(self.seq, load);
+    }
+
+    /// The next load allowed to start, highest priority first.
+    fn next(&mut self, images_in_flight: usize) -> Option<Load> {
+        let std::cmp::Reverse((pri, seq)) = *self.queue.peek()?;
+        if pri == Priority::Image && images_in_flight >= MAX_IMAGES_IN_FLIGHT {
+            return None; // only images remain queued, and enough of them are in flight
+        }
+        self.queue.pop();
+        self.jobs.remove(&seq)
+    }
+}
+
+type LoadFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Loaded> + Send>>;
+
+fn start(load: Load, partition: Option<String>) -> LoadFuture {
+    Box::pin(async move {
+        let p = partition.as_deref();
+        match load {
+            Load::Sheet(i, u) => {
+                let r = fetch_text_p(&u, Priority::Css, p).await;
+                Loaded::Sheet(i, u, r)
+            }
+            Load::Script(u) => {
+                let r = fetch_text_p(&u, Priority::Script, p).await;
+                Loaded::Script(u, r)
+            }
+            Load::Font(u) => {
+                let r = fetch_bytes_p(&u, Priority::Font, p).await;
+                Loaded::Font(u, r)
+            }
+            Load::Image(u, key) => {
+                let r = fetch_image_bytes_p(&u, p).await;
+                Loaded::Image(u, key, r)
+            }
+        }
+    })
+}
+
+/// Fetches a page, its external stylesheets, fonts, scripts and images: the async half of the
+/// fetch-then-apply pattern. Subresources go through the [`Loader`]'s priority queue; what a sheet references
+/// (its fonts, its images) is queued as the sheet arrives. Resource failures are skipped (and ledgered),
+/// never fatal to the page load.
 pub async fn fetch_page(input: &str) -> Result<Page> {
+    use futures_util::StreamExt as _;
+    // A new page: the memory tier starts empty (the disk tier still answers).
+    http_cache().clear_memory();
     // The page's base is the FINAL response URL (after redirects): relative stylesheet, script,
     // image and link URLs resolve against it, and it is the history entry the address bar shows.
     let (html, base) = fetch_document_final(input).await?;
-    // All stylesheets fetch CONCURRENTLY (a page with a dozen sheets paid
-    // a dozen round-trips in series before this).
-    let sheet_results = futures_util::future::join_all(
-        collect_stylesheet_urls(&base, &html)
-            .into_iter()
-            .map(|u| async move { (fetch_document(&u).await, u) }),
-    )
-    .await;
-    let mut sheets = Vec::new();
-    let mut sheet_sources: Vec<(String, String)> = Vec::new(); // (sheet url, css)
-    for (result, sheet_url) in sheet_results {
-        match result {
-            Ok(css) => {
-                sheets.push(css.clone());
-                sheet_sources.push((sheet_url, css));
-            }
-            Err(_) => crate::ledger::record_css(&format!("stylesheet-fetch-failed:{}", sheet_url)),
+    let partition = http::site_of(&base);
+    let mut loader = Loader {
+        queue: std::collections::BinaryHeap::new(),
+        jobs: std::collections::HashMap::new(),
+        seen: std::collections::HashSet::new(),
+        seq: 0,
+        fonts: 0,
+        partition: partition.clone(),
+    };
+    // Discovery from the document itself, in priority classes.
+    let sheet_urls = collect_stylesheet_urls(&base, &html);
+    let mut sheet_texts: Vec<Option<String>> = vec![None; sheet_urls.len()];
+    for (i, u) in sheet_urls.iter().enumerate() {
+        loader.push(Load::Sheet(i, u.clone()));
+    }
+    for css in inline_style_blocks(&html) {
+        for u in crate::fonts::webfont::font_urls(&css, &base) {
+            loader.push(Load::Font(u));
         }
+    }
+    let (mut slots, external) = collect_scripts(&base, &html);
+    let mut script_slots: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (slot, u) in external {
+        script_slots.entry(u.clone()).or_default().push(slot);
+        loader.push(Load::Script(u));
     }
     // <img> srcs plus CSS background images. Each css ref carries a fetch
     // URL (relative to its OWNING sheet's host) and a paint-lookup key
     // (page-base resolution, which is what images::get computes at paint);
     // the decoded image is stored under both.
-    let mut refs: Vec<(String, String)> = collect_image_urls(&base, &html)
-        .into_iter()
-        .map(|u| (u.clone(), u))
-        .collect();
+    let mut refs: Vec<(String, String)> = collect_image_urls(&base, &html).into_iter().map(|u| (u.clone(), u)).collect();
     collect_css_image_refs(&base, &base, &html, &mut refs);
-    for (sheet_url, css) in &sheet_sources {
-        collect_css_image_refs(sheet_url, &base, css, &mut refs);
+    for (u, key) in &refs {
+        loader.push(Load::Image(u.clone(), key.clone()));
     }
-    // Images fetch concurrently but BOUNDED: a skin's icon sprites plus a
-    // page's photos run to the hundreds, and firing them all at once earns
-    // 429s from upload.wikimedia.org. Decode stays on this thread.
-    use futures_util::StreamExt as _;
-    let img_results: Vec<_> = futures_util::stream::iter(
-        refs
-            .into_iter()
-            .map(|(u, key)| async move { (fetch_image_bytes(&u).await, u, key) }),
-    )
-    .buffer_unordered(8)
-    .collect()
-    .await;
+
     let mut images = Vec::new();
-    for (result, img_url, key) in img_results {
-        match result {
-            Ok(bytes) => {
-                let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes));
-                match decoded {
-                    Some(img) => {
-                        if key != img_url {
-                            images.push((key, img.clone()));
+    let mut in_flight = futures_util::stream::FuturesUnordered::<LoadFuture>::new();
+    let mut images_in_flight = 0usize;
+    loop {
+        while in_flight.len() < MAX_IN_FLIGHT {
+            let Some(load) = loader.next(images_in_flight) else { break };
+            if matches!(load, Load::Image(..)) {
+                images_in_flight += 1;
+            }
+            in_flight.push(start(load, loader.partition.clone()));
+        }
+        let Some(done) = in_flight.next().await else { break };
+        match done {
+            Loaded::Sheet(i, sheet_url, Ok(css)) => {
+                // What the sheet references joins the queue now: its fonts, its images.
+                for u in crate::fonts::webfont::font_urls(&css, &sheet_url) {
+                    loader.push(Load::Font(u));
+                }
+                let before = refs.len();
+                collect_css_image_refs(&sheet_url, &base, &css, &mut refs);
+                for (u, key) in refs[before..].to_vec() {
+                    loader.push(Load::Image(u, key));
+                }
+                sheet_texts[i] = Some(css);
+            }
+            Loaded::Sheet(_, sheet_url, Err(_)) => crate::ledger::record_css(&format!("stylesheet-fetch-failed:{}", sheet_url)),
+            Loaded::Script(url, result) => {
+                let slot_list = script_slots.remove(&url).unwrap_or_default();
+                match result {
+                    Ok(text) if text.len() <= 2 * 1024 * 1024 => {
+                        for slot in slot_list {
+                            slots[slot].text = Some(text.clone());
                         }
-                        images.push((img_url, img));
                     }
-                    None => crate::ledger::record_dom(&format!("img-decode-failed:{}", &img_url[..img_url.len().min(48)])),
+                    Ok(_) => crate::ledger::record_js(&format!("script-too-large:{}", &url[..url.len().min(48)])),
+                    Err(_) => crate::ledger::record_js(&format!("script-fetch-failed:{}", &url[..url.len().min(48)])),
                 }
             }
-            Err(e) => crate::ledger::record_dom(&format!("img-fetch-failed:{}: {e}", &img_url[..img_url.len().min(48)])),
+            Loaded::Font(url, Ok(bytes)) => crate::fonts::webfont::store_bytes(&url, bytes),
+            Loaded::Font(url, Err(e)) => crate::ledger::record_css(&format!("font-fetch-failed:{}: {e}", &url[..url.len().min(48)])),
+            Loaded::Image(img_url, key, result) => {
+                images_in_flight -= 1;
+                // Decode stays on this thread.
+                match result {
+                    Ok(bytes) => {
+                        let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes));
+                        match decoded {
+                            Some(img) => {
+                                if key != img_url {
+                                    images.push((key, img.clone()));
+                                }
+                                images.push((img_url, img));
+                            }
+                            None => crate::ledger::record_dom(&format!("img-decode-failed:{}", &img_url[..img_url.len().min(48)])),
+                        }
+                    }
+                    Err(e) => crate::ledger::record_dom(&format!("img-fetch-failed:{}: {e}", &img_url[..img_url.len().min(48)])),
+                }
+            }
         }
     }
-    // @font-face sources (AETHERFONT): every url() of the inline and external sheets, fetched through
-    // http_core beside the images, handed to the font registry by absolute URL.
-    let mut font_refs: Vec<String> = Vec::new();
-    for css in inline_style_blocks(&html) {
-        font_refs.extend(crate::fonts::webfont::font_urls(&css, &base));
-    }
-    for (sheet_url, css) in &sheet_sources {
-        font_refs.extend(crate::fonts::webfont::font_urls(css, sheet_url));
-    }
-    font_refs.dedup();
-    font_refs.truncate(32);
-    let font_results = futures_util::future::join_all(font_refs.into_iter().map(|u| async move { (fetch_bytes(&u).await, u) })).await;
-    for (result, url) in font_results {
-        match result {
-            Ok(bytes) => crate::fonts::webfont::store_bytes(&url, bytes),
-            Err(e) => crate::ledger::record_css(&format!("font-fetch-failed:{}: {e}", &url[..url.len().min(48)])),
-        }
-    }
-    // Scripts: inline bodies fill their slots directly; externals fetch
-    // concurrently into theirs (2 MB/script cap — failures ledger and the
-    // slot drops, later scripts still run).
-    let (mut slots, external) = collect_scripts(&base, &html);
-    let script_results = futures_util::future::join_all(
-        external
-            .into_iter()
-            .map(|(slot, u)| async move { (slot, fetch_document(&u).await, u) }),
-    )
-    .await;
-    for (slot, result, url) in script_results {
-        match result {
-            Ok(text) if text.len() <= 2 * 1024 * 1024 => slots[slot].text = Some(text),
-            Ok(_) => crate::ledger::record_js(&format!("script-too-large:{}", &url[..url.len().min(48)])),
-            Err(_) => crate::ledger::record_js(&format!("script-fetch-failed:{}", &url[..url.len().min(48)])),
-        }
-    }
+    // Sheets in document order (the cascade's order), failures dropped.
+    let sheets: Vec<String> = sheet_texts.into_iter().flatten().collect();
     let mut scripts = Vec::new();
     let mut script_nodes = Vec::new();
     let mut script_urls = Vec::new();
@@ -817,6 +1004,35 @@ mod tests {
         );
         assert_eq!(sniff_image_kind(b"<!doctype html><html>"), None);
         assert_eq!(sniff_image_kind(b"{\"error\":\"nope\"}"), None);
+    }
+
+    /// AETHERCACHE (SR88): the loader starts CSS before fonts before scripts before images, whatever the
+    /// discovery order, dedups by (class, URL), and holds images to their own in-flight bound.
+    #[test]
+    fn test_loader_priority_order_and_dedup() {
+        let mut l = Loader {
+            queue: std::collections::BinaryHeap::new(),
+            jobs: std::collections::HashMap::new(),
+            seen: std::collections::HashSet::new(),
+            seq: 0,
+            fonts: 0,
+            partition: None,
+        };
+        l.push(Load::Image("https://a.example/1.png".into(), "k".into()));
+        l.push(Load::Script("https://a.example/a.js".into()));
+        l.push(Load::Script("https://a.example/a.js".into()));
+        l.push(Load::Font("https://a.example/f.woff2".into()));
+        l.push(Load::Sheet(0, "https://a.example/s.css".into()));
+        l.push(Load::Image("https://a.example/2.png".into(), "k2".into()));
+        let mut order = Vec::new();
+        while let Some(load) = l.next(0) {
+            order.push(load.priority());
+        }
+        assert_eq!(order, vec![Priority::Css, Priority::Font, Priority::Script, Priority::Image, Priority::Image]);
+        l.push(Load::Image("https://a.example/3.png".into(), "k3".into()));
+        assert!(l.next(MAX_IMAGES_IN_FLIGHT).is_none(), "images wait for a free image slot");
+        assert!(l.next(0).is_some());
+        assert_eq!(Priority::Document.header(), "u=0");
     }
 
     #[test]

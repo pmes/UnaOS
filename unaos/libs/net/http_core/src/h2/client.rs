@@ -4,6 +4,13 @@
 //! SETTINGS applied (INITIAL_WINDOW_SIZE deltas, HEADER_TABLE_SIZE, MAX_FRAME_SIZE), GOAWAY / RST_STREAM
 //! honoured, server push refused (we send ENABLE_PUSH = 0), and responses checked for the §8.3.2 pseudo-header
 //! and §8.2 field rules.
+//!
+//! Multiplexing (AETHERCACHE, SR88): many streams are open at once, bounded by the peer's
+//! SETTINGS_MAX_CONCURRENT_STREAMS ([`H2Conn::can_open`]). The blocking [`H2Conn::read_head`] /
+//! [`H2Conn::read_data`] serve one exchange; a multiplexing owner instead reads ONE frame at a time
+//! ([`H2Conn::step_frame`], when [`H2Conn::has_buffered_frame`] or its socket says bytes wait) and polls every open
+//! stream without blocking ([`H2Conn::try_head`], [`H2Conn::try_data`]). GOAWAY marks every stream above its
+//! last-stream-id REFUSED (§6.8: never processed, safe to retry on a new connection — [`H2Conn::refused`]).
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -29,6 +36,19 @@ struct Stream {
     reset: Option<ErrorCode>,
 }
 
+/// What [`H2Conn::try_data`] found on a stream.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DataPoll {
+    Chunk(Vec<u8>),
+    /// END_STREAM: the body is complete.
+    End,
+    /// Nothing buffered yet.
+    Pending,
+}
+
+/// Before the peer's SETTINGS names a limit (§5.1.2 says unlimited; RFC 9113 advises at least 100).
+const DEFAULT_MAX_CONCURRENT: u32 = 100;
+
 /// One HTTP/2 connection.
 pub struct H2Conn<T: Transport> {
     t: T,
@@ -37,6 +57,7 @@ pub struct H2Conn<T: Transport> {
     dec: Decoder,
     peer_max_frame: u32,
     peer_initial_window: u32,
+    peer_max_concurrent: u32,
     conn_send_window: i64,
     conn_recv_consumed: u32,
     next_stream: u32,
@@ -72,6 +93,7 @@ impl<T: Transport> H2Conn<T> {
             dec: Decoder::new(4096),
             peer_max_frame: frame::DEFAULT_MAX_FRAME_SIZE,
             peer_initial_window: 65_535,
+            peer_max_concurrent: DEFAULT_MAX_CONCURRENT,
             conn_send_window: 65_535,
             conn_recv_consumed: 0,
             next_stream: 1,
@@ -177,6 +199,7 @@ impl<T: Transport> H2Conn<T> {
                             self.peer_initial_window = v;
                         }
                         frame::SETTINGS_MAX_FRAME_SIZE => self.peer_max_frame = v,
+                        frame::SETTINGS_MAX_CONCURRENT_STREAMS => self.peer_max_concurrent = v,
                         frame::SETTINGS_HEADER_TABLE_SIZE => self.enc.set_max(v.min(4096) as usize),
                         _ => {}
                     }
@@ -185,7 +208,15 @@ impl<T: Transport> H2Conn<T> {
             }
             Frame::Ping { ack: false, data } => self.t.write_all(&frame::encode(frame::PING, frame::FLAG_ACK, 0, &data))?,
             Frame::Ping { ack: true, .. } => {}
-            Frame::GoAway { last_stream, code, .. } => self.goaway = Some((last_stream, code)),
+            Frame::GoAway { last_stream, code, .. } => {
+                // §6.8: streams above last_stream were not (and will not be) processed — refused, retryable.
+                for (id, st) in self.streams.iter_mut() {
+                    if *id > last_stream && st.reset.is_none() {
+                        st.reset = Some(ErrorCode::RefusedStream);
+                    }
+                }
+                self.goaway = Some((last_stream, code));
+            }
             Frame::WindowUpdate { stream: 0, increment } => {
                 self.conn_send_window += increment as i64;
                 if self.conn_send_window > frame::MAX_WINDOW as i64 {
@@ -384,22 +415,47 @@ impl<T: Transport> H2Conn<T> {
     /// Wait for the final response head of stream `id`.
     pub fn read_head(&mut self, id: u32) -> Result<(u16, Headers), Error> {
         loop {
-            self.check_reset(id)?;
-            if let Some(h) = self.streams.get_mut(&id).and_then(|s| s.head.take()) {
-                // Keep a marker that the head arrived (trailers are told apart from it).
-                self.streams.get_mut(&id).unwrap().head = Some((h.0, Headers::new()));
+            if let Some(h) = self.try_head(id)? {
                 return Ok(h);
-            }
-            if self.streams.get(&id).is_some_and(|s| s.end) {
-                return Err(Error::Http(crate::h1::H1Error::Truncated));
             }
             self.step()?;
         }
     }
 
+    /// The final response head of stream `id` if it has arrived (never blocks). A stream that ended without
+    /// one is truncated.
+    pub fn try_head(&mut self, id: u32) -> Result<Option<(u16, Headers)>, Error> {
+        self.check_reset(id)?;
+        let st = self.streams.get_mut(&id).ok_or(Error::Io("h2: unknown stream".into()))?;
+        if let Some(h) = st.head.take() {
+            if h.1.is_empty() && h.0 == 0 {
+                st.head = Some(h);
+                return Err(Error::Io("h2: head already taken".into()));
+            }
+            // Keep a marker that the head arrived (trailers are told apart from it).
+            st.head = Some((0, Headers::new()));
+            return Ok(Some(h));
+        }
+        if st.end {
+            return Err(Error::Http(crate::h1::H1Error::Truncated));
+        }
+        Ok(None)
+    }
+
     /// The next DATA payload of stream `id` (`None` at END_STREAM). Credits the windows back.
     pub fn read_data(&mut self, id: u32) -> Result<Option<Vec<u8>>, Error> {
         loop {
+            match self.try_data(id)? {
+                DataPoll::Chunk(d) => return Ok(Some(d)),
+                DataPoll::End => return Ok(None),
+                DataPoll::Pending => self.step()?,
+            }
+        }
+    }
+
+    /// The next buffered DATA payload of stream `id` without blocking. Credits the windows back.
+    pub fn try_data(&mut self, id: u32) -> Result<DataPoll, Error> {
+        {
             self.check_reset(id)?;
             let st = self.streams.get_mut(&id).ok_or(Error::Io("h2: unknown stream".into()))?;
             if let Some(d) = st.data.pop_front() {
@@ -416,13 +472,53 @@ impl<T: Transport> H2Conn<T> {
                 if !out.is_empty() && !st.end {
                     self.t.write_all(&out)?;
                 }
-                return Ok(Some(d));
+                return Ok(DataPoll::Chunk(d));
             }
             if st.end {
-                return Ok(None);
+                return Ok(DataPoll::End);
             }
-            self.step()?;
+            Ok(DataPoll::Pending)
         }
+    }
+
+    /// Read and process exactly one frame (blocking until it is whole).
+    pub fn step_frame(&mut self) -> Result<(), Error> {
+        self.step()
+    }
+
+    /// Is a whole frame already in the read buffer (so [`H2Conn::step_frame`] will not wait on the socket)?
+    pub fn has_buffered_frame(&self) -> bool {
+        if self.rbuf.len() < 9 {
+            return false;
+        }
+        let len = ((self.rbuf[0] as usize) << 16) | ((self.rbuf[1] as usize) << 8) | self.rbuf[2] as usize;
+        self.rbuf.len() >= 9 + len
+    }
+
+    /// May another stream be opened now (no GOAWAY, under the peer's concurrency limit, ids left)?
+    pub fn can_open(&self) -> bool {
+        self.reusable() && (self.streams.len() as u64) < self.peer_max_concurrent as u64
+    }
+
+    /// Open streams (opened and not yet closed with [`H2Conn::close_stream`]).
+    pub fn open_streams(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Was stream `id` refused — RST_STREAM REFUSED_STREAM, or above a GOAWAY's last-stream-id — so the
+    /// server never processed it (§8.7) and the request may be retried on another connection?
+    pub fn refused(&self, id: u32) -> bool {
+        self.streams.get(&id).and_then(|s| s.reset) == Some(ErrorCode::RefusedStream)
+    }
+
+    /// Abandon stream `id`: RST_STREAM CANCEL (§8.1) and forget it; the connection stays usable.
+    pub fn cancel(&mut self, id: u32) -> Result<(), Error> {
+        let open = self.streams.get(&id).is_some_and(|s| !s.end && s.reset.is_none());
+        self.streams.remove(&id);
+        if open {
+            self.t.write_all(&frame::encode(frame::RST_STREAM, 0, id, &ErrorCode::Cancel.to_u32().to_be_bytes()))?;
+        }
+        Ok(())
     }
 
     pub fn trailers(&self, id: u32) -> Option<&Headers> {

@@ -8,6 +8,11 @@
 //! posts `head` / `data` / `end` | `error` messages into the page's network queue (`js::net`), so script
 //! sees the first chunk while the server is still sending the rest. `XMLHttpRequest` (`api::xhr`) runs on
 //! the same worker, and its synchronous mode on [`http_sync`].
+//!
+//! AETHERCACHE (SR88): `Request.cache` is honoured — the prelude passes the Fetch cache mode and the top-level
+//! site to the worker as two pseudo-fields (`:cache-mode`, `:top-level-site`: names no page can set, since a
+//! `:` is not a token character and `Headers` refuses it), which [`send`] lifts off the field list onto the
+//! blocking client (`cache_mode`, `partition`) — the shared RFC 9111 cache of `crate::net::http_cache`.
 
 use crate::js::net::{NetArg, Poster};
 use std::time::Duration;
@@ -54,10 +59,19 @@ fn header_list(h: &gneiss_pal::api::http::Headers) -> Vec<String> {
 }
 
 fn send(req: &HttpReq) -> Result<gneiss_pal::api::http::blocking::Response, String> {
+    use gneiss_pal::api::http::{site_of, CacheMode};
     let c = client(req)?;
     let mut rb = c.request(&req.method, &req.url);
     for (k, v) in &req.headers {
-        rb = rb.header(k, v);
+        match k.as_str() {
+            ":cache-mode" => rb = rb.cache_mode(CacheMode::parse(v).unwrap_or_default()),
+            ":top-level-site" => {
+                if let Some(site) = site_of(v) {
+                    rb = rb.partition(site);
+                }
+            }
+            _ => rb = rb.header(k, v),
+        }
     }
     if !req.body.is_empty() || !matches!(req.method.as_str(), "GET" | "HEAD") {
         rb = rb.body(req.body.clone());
@@ -782,11 +796,16 @@ pub const PRELUDE: &str = r#"
             }
             var redirect = init.redirect !== undefined ? String(init.redirect) : (src ? src.redirect : 'follow');
             if (['follow', 'error', 'manual'].indexOf(redirect) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + redirect + "' is not a valid enum value of type RequestRedirect."); }
+            var mode = init.mode !== undefined ? String(init.mode) : (src ? src.mode : 'cors');
+            var cache = init.cache !== undefined ? String(init.cache) : (src ? src.cache : 'default');
+            if (['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached'].indexOf(cache) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + cache + "' is not a valid enum value of type RequestCache."); }
+            // Fetch, the Request constructor: only-if-cached is for same-origin requests only.
+            if (cache === 'only-if-cached' && mode !== 'same-origin') { throw new TypeError("Failed to construct 'Request': 'only-if-cached' can be set only with 'same-origin' mode"); }
             ST.set(this, {
                 url: url, method: m, headers: headers, body: body, bytes: bytes, signal: own, redirect: redirect,
                 credentials: init.credentials !== undefined ? String(init.credentials) : (src ? src.credentials : 'same-origin'),
-                mode: init.mode !== undefined ? String(init.mode) : (src ? src.mode : 'cors'),
-                cache: init.cache !== undefined ? String(init.cache) : (src ? src.cache : 'default'),
+                mode: mode,
+                cache: cache,
                 keepalive: !!init.keepalive,
             });
         }
@@ -925,6 +944,12 @@ pub const PRELUDE: &str = r#"
             }
             var flat = [];
             st(rs.headers).list.forEach(function (p) { flat.push(p[0], p[1]); });
+            // The cache mode and the top-level site ride as pseudo-fields the worker lifts off (AETHERCACHE).
+            flat.push(':cache-mode', rs.cache);
+            try {
+                var top = (globalThis.top && globalThis.top.location) ? globalThis.top.location : globalThis.location;
+                if (top && top.href) { flat.push(':top-level-site', String(top.href)); }
+            } catch (e) {}
             var id = __net_http(rs.method, url.replace(/#.*$/, ''), flat, rs.bytes, rs.redirect);
             if (!id) { reject(new TypeError('Failed to fetch')); return; }
             var resp = null, controller = null, done = false;
