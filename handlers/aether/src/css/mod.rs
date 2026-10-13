@@ -564,7 +564,8 @@ pub(crate) fn animation_frame(tree: &mut LayoutTree) -> anim::Frame {
     }
 }
 
-/// AETHERSTYLE3 (SR103): the transition / animation events queued since the last call.
+/// AETHERSTYLE3 (SR103): the transition / animation events queued since the last call. AETHERSTYLE3B (SR115):
+/// empty — the script lane dispatches them as typed TransitionEvent / AnimationEvent (`js::animations::poll`).
 pub(crate) fn take_animation_events() -> Vec<layout_core::anim::AnimEvent<html_core::NodeId>> {
     anim::take_events()
 }

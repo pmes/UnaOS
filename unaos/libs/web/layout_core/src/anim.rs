@@ -17,6 +17,13 @@
 //!   direction, fill, pause), sampled at the frame time the shell passes, with the events (`transitionstart`,
 //!   `transitionend`, `animationstart`, `animationiteration`, `animationend`) the host dispatches.
 //!
+//! AETHERSTYLE3B (SR115): every event carries its `elapsedTime` ([`TimedEvent`]; `animationcancel` added), and
+//! the timeline is also the Web Animations model: [`Timeline::animate`] adds a script animation (keyframes +
+//! [`ScriptTiming`], end delay, playback rate) composited above the CSS animations, every animation and
+//! transition has a handle ([`Timeline::animation_ids`], [`Timeline::info`] with its [`PlayState`] and computed
+//! timing), and `play` / `pause` / `finish` / `cancel` / `reverse` / `set_rate` / `set_current_time` /
+//! `set_start_time` / `set_keyframes` / `set_timing` are Web Animations 1 §4.4's procedures over local time.
+//!
 //! An animated value is applied by re-applying the property onto the element's cascaded style
 //! ([`apply_value`]: the CSS text through `css::apply_declaration`, a transform list directly) — animations
 //! below transitions (the cascade's Animation origin under its Transition origin, css-cascade-5 §6.1).
@@ -1088,6 +1095,8 @@ pub enum AnimEvent<K> {
     AnimationStart(K, String),
     AnimationIteration(K, String),
     AnimationEnd(K, String),
+    /// AETHERSTYLE3B (SR115): a running CSS animation removed before its end (css-animations-2 §4.2).
+    AnimationCancel(K, String),
 }
 
 impl<K> AnimEvent<K> {
@@ -1100,6 +1109,7 @@ impl<K> AnimEvent<K> {
             AnimEvent::AnimationStart(..) => "animationstart",
             AnimEvent::AnimationIteration(..) => "animationiteration",
             AnimEvent::AnimationEnd(..) => "animationend",
+            AnimEvent::AnimationCancel(..) => "animationcancel",
         }
     }
     pub fn key(&self) -> &K {
@@ -1109,13 +1119,42 @@ impl<K> AnimEvent<K> {
             | AnimEvent::TransitionCancel(k, _)
             | AnimEvent::AnimationStart(k, _)
             | AnimEvent::AnimationIteration(k, _)
-            | AnimEvent::AnimationEnd(k, _) => k,
+            | AnimEvent::AnimationEnd(k, _)
+            | AnimEvent::AnimationCancel(k, _) => k,
+        }
+    }
+    /// AETHERSTYLE3B (SR115): the TransitionEvent `propertyName` / AnimationEvent `animationName`.
+    pub fn name(&self) -> &str {
+        match self {
+            AnimEvent::TransitionStart(_, n)
+            | AnimEvent::TransitionEnd(_, n)
+            | AnimEvent::TransitionCancel(_, n)
+            | AnimEvent::AnimationStart(_, n)
+            | AnimEvent::AnimationIteration(_, n)
+            | AnimEvent::AnimationEnd(_, n)
+            | AnimEvent::AnimationCancel(_, n) => n,
+        }
+    }
+    /// The DOM interface the event is (`TransitionEvent` / `AnimationEvent`).
+    pub fn interface(&self) -> &'static str {
+        match self {
+            AnimEvent::TransitionStart(..) | AnimEvent::TransitionEnd(..) | AnimEvent::TransitionCancel(..) => "TransitionEvent",
+            _ => "AnimationEvent",
         }
     }
 }
 
+/// AETHERSTYLE3B (SR115): an event with its `elapsedTime` in seconds (css-transitions-1 §6.1,
+/// css-animations-1 §4.1): the transition's or animation's active time when it fired, excluding the delay.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimedEvent<K> {
+    pub event: AnimEvent<K>,
+    pub elapsed: f64,
+}
+
 #[derive(Clone, Debug)]
 struct Transition<K> {
+    id: u64,
     key: K,
     prop: String,
     from: AnimValue,
@@ -1132,15 +1171,130 @@ struct Transition<K> {
 
 #[derive(Clone, Debug)]
 struct Animation<K> {
+    /// AETHERSTYLE3B (SR115): the Web Animations handle (unique in the timeline).
+    id: u64,
     key: K,
     spec: AnimationSpec,
     frames: KeyframeSet,
+    /// The timeline time at which local time was 0 (at playback rate `rate`).
     start: f64,
-    /// While paused: the local time it froze at.
+    /// While paused (or held at playback rate 0): the local time it froze at.
     paused_at: Option<f64>,
     started: bool,
     iteration: i64,
     ended: bool,
+    /// AETHERSTYLE3B (SR115): made by `element.animate()` / `new Animation()` (no CSS events, not governed by
+    /// `animation-name`); its end delay (ms) and playback rate; cancelled (idle) but kept for `play()`.
+    script: bool,
+    end_delay: f64,
+    rate: f64,
+    idle: bool,
+    /// The finish was reported to the host (`take_finished`).
+    finish_reported: bool,
+}
+
+impl<K> Animation<K> {
+    fn local(&self, now: f64) -> f64 {
+        match self.paused_at {
+            Some(l) => l,
+            None => (now - self.start) * self.rate,
+        }
+    }
+    /// Delay + active duration + end delay (Web Animations 1 §4.5.3); infinite for infinite iterations.
+    fn end_time(&self) -> f64 {
+        let active = self.spec.duration as f64 * self.spec.iterations as f64;
+        (self.spec.delay as f64 + active + self.end_delay).max(0.0)
+    }
+    fn finished_at(&self, local: f64) -> bool {
+        if self.rate > 0.0 {
+            local >= self.end_time()
+        } else if self.rate < 0.0 {
+            local <= 0.0
+        } else {
+            false
+        }
+    }
+    /// Re-anchors so local time is `local` at `now` (running) or holds it (paused / rate 0).
+    fn seek(&mut self, local: f64, now: f64) {
+        if self.paused_at.is_some() || self.rate == 0.0 {
+            self.paused_at = Some(local);
+        } else {
+            self.start = now - local / self.rate;
+        }
+    }
+}
+
+/// AETHERSTYLE3B (SR115): Web Animations 1 §4.4.17 play states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayState {
+    Idle,
+    Running,
+    Paused,
+    Finished,
+}
+
+impl PlayState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlayState::Idle => "idle",
+            PlayState::Running => "running",
+            PlayState::Paused => "paused",
+            PlayState::Finished => "finished",
+        }
+    }
+}
+
+/// AETHERSTYLE3B (SR115): an effect's timing (Web Animations 1 §4.5, `EffectTiming`) — times in ms.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptTiming {
+    pub duration: f64,
+    pub delay: f64,
+    pub end_delay: f64,
+    /// `f64::INFINITY` = infinite.
+    pub iterations: f64,
+    /// 0 normal, 1 reverse, 2 alternate, 3 alternate-reverse.
+    pub direction: u8,
+    /// 0 none, 1 forwards, 2 backwards, 3 both (`auto` = none).
+    pub fill: u8,
+    pub easing: Easing,
+}
+
+impl Default for ScriptTiming {
+    fn default() -> Self {
+        ScriptTiming { duration: 0.0, delay: 0.0, end_delay: 0.0, iterations: 1.0, direction: 0, fill: 0, easing: Easing::Linear }
+    }
+}
+
+/// What kind of animation a handle names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimKind {
+    /// `element.animate()` / `new Animation()`.
+    Script,
+    /// A CSS animation (`animation-name`): a CSSAnimation.
+    Css,
+    /// A CSS transition: a CSSTransition.
+    Transition,
+}
+
+/// AETHERSTYLE3B (SR115): a snapshot of one animation for the Web Animations binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimInfo<K> {
+    pub id: u64,
+    pub key: K,
+    pub kind: AnimKind,
+    /// The animation name (CSS), the transitioned property, or the script animation's `id`.
+    pub name: String,
+    pub play_state: PlayState,
+    /// Local (current) time in ms; None when idle.
+    pub current_time: Option<f64>,
+    /// The timeline time local time 0 maps to (None while paused or idle).
+    pub start_time: Option<f64>,
+    pub rate: f64,
+    pub timing: ScriptTiming,
+    /// The computed timing (§4.8): overall progress within the current iteration and that iteration's index,
+    /// None outside the active interval when not filling.
+    pub progress: Option<f64>,
+    pub current_iteration: Option<f64>,
 }
 
 /// Running transitions and animations, sampled per frame.
@@ -1148,13 +1302,20 @@ struct Animation<K> {
 pub struct Timeline<K> {
     transitions: Vec<Transition<K>>,
     animations: Vec<Animation<K>>,
-    events: Vec<AnimEvent<K>>,
+    events: Vec<TimedEvent<K>>,
+    next_id: u64,
+    /// Script animations that finished since the last `take_finished`.
+    finished: Vec<u64>,
 }
 
 impl<K> Default for Timeline<K> {
     fn default() -> Self {
-        Timeline { transitions: Vec::new(), animations: Vec::new(), events: Vec::new() }
+        Timeline { transitions: Vec::new(), animations: Vec::new(), events: Vec::new(), next_id: 1, finished: Vec::new() }
     }
+}
+
+fn ev<K>(events: &mut Vec<TimedEvent<K>>, event: AnimEvent<K>, elapsed_ms: f64) {
+    events.push(TimedEvent { event, elapsed: elapsed_ms.max(0.0) / 1000.0 });
 }
 
 impl<K: Clone + PartialEq> Timeline<K> {
@@ -1162,13 +1323,24 @@ impl<K: Clone + PartialEq> Timeline<K> {
         Self::default()
     }
 
+    fn fresh_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
     /// Anything is running or waiting to start (the shell keeps sending frames).
     pub fn active(&self) -> bool {
-        !self.transitions.is_empty() || self.animations.iter().any(|a| !a.ended && a.paused_at.is_none())
+        !self.transitions.is_empty() || self.animations.iter().any(|a| !a.idle && !a.ended && a.paused_at.is_none())
     }
 
     /// The events since the last call.
     pub fn take_events(&mut self) -> Vec<AnimEvent<K>> {
+        core::mem::take(&mut self.events).into_iter().map(|e| e.event).collect()
+    }
+
+    /// AETHERSTYLE3B (SR115): the events since the last call with their `elapsedTime`.
+    pub fn take_timed_events(&mut self) -> Vec<TimedEvent<K>> {
         core::mem::take(&mut self.events)
     }
 
@@ -1176,6 +1348,11 @@ impl<K: Clone + PartialEq> Timeline<K> {
     fn current(&self, key: &K, prop: &str, now: f64) -> Option<AnimValue> {
         let t = self.transitions.iter().find(|t| &t.key == key && t.prop == prop)?;
         Some(transition_value(prop, t, now))
+    }
+
+    /// A transition's active time at `now` (ms, clamped to its duration).
+    fn transition_elapsed(t: &Transition<K>, now: f64) -> f64 {
+        (now - t.start - t.delay).clamp(0.0, t.duration.max(0.0))
     }
 
     /// A style change of `prop` on `key` from `before` to `after` (computed-value texts) under `spec`
@@ -1193,7 +1370,8 @@ impl<K: Clone + PartialEq> Timeline<K> {
         let Some(spec) = spec.filter(|s| s.duration > 0.0 || s.delay > 0.0) else {
             if let Some(i) = running {
                 let t = self.transitions.remove(i);
-                self.events.push(AnimEvent::TransitionCancel(t.key, t.prop));
+                let el = Self::transition_elapsed(&t, now);
+                ev(&mut self.events, AnimEvent::TransitionCancel(t.key, t.prop), el);
             }
             return false;
         };
@@ -1204,7 +1382,8 @@ impl<K: Clone + PartialEq> Timeline<K> {
         if from == to || (!interpolable(prop, &from, &to) && !spec.discrete) {
             if let Some(i) = running {
                 let t = self.transitions.remove(i);
-                self.events.push(AnimEvent::TransitionCancel(t.key, t.prop));
+                let el = Self::transition_elapsed(&t, now);
+                ev(&mut self.events, AnimEvent::TransitionCancel(t.key, t.prop), el);
             }
             return false;
         }
@@ -1223,7 +1402,9 @@ impl<K: Clone + PartialEq> Timeline<K> {
             }
             self.transitions.remove(i);
         }
+        let id = self.fresh_id();
         self.transitions.push(Transition {
+            id,
             key: key.clone(),
             prop: String::from(prop),
             from,
@@ -1242,18 +1423,19 @@ impl<K: Clone + PartialEq> Timeline<K> {
     /// The animations `key`'s style names now (css-animations-1 §4): a newly listed name starts at `now` with
     /// its `@keyframes` (`frames(name)`; an unknown name runs nothing), a name that stays keeps running with
     /// its timing updated (play-state toggles freeze / resume local time), a name that left is cancelled.
+    /// Script animations on `key` are not governed by the list.
     pub fn set_animations(&mut self, key: &K, specs: &[AnimationSpec], frames: &dyn Fn(&str) -> Option<KeyframeSet>, now: f64) {
         let mut keep = vec![false; self.animations.len()];
         for spec in specs {
-            let found = self.animations.iter().position(|a| &a.key == key && a.spec.name == spec.name);
+            let found = self.animations.iter().position(|a| &a.key == key && !a.script && a.spec.name == spec.name);
             match found {
                 Some(i) => {
                     keep[i] = true;
                     let a = &mut self.animations[i];
                     match (a.paused_at, spec.paused) {
-                        (None, true) => a.paused_at = Some(now - a.start),
-                        (Some(local), false) => {
-                            a.start = now - local;
+                        (None, true) => a.paused_at = Some(a.local(now)),
+                        (Some(local), false) if a.rate != 0.0 => {
+                            a.start = now - local / a.rate;
                             a.paused_at = None;
                         }
                         _ => {}
@@ -1265,7 +1447,9 @@ impl<K: Clone + PartialEq> Timeline<K> {
                 }
                 None => {
                     let Some(f) = frames(&spec.name) else { continue };
+                    let id = self.fresh_id();
                     self.animations.push(Animation {
+                        id,
                         key: key.clone(),
                         spec: spec.clone(),
                         frames: f,
@@ -1274,17 +1458,28 @@ impl<K: Clone + PartialEq> Timeline<K> {
                         started: false,
                         iteration: 0,
                         ended: false,
+                        script: false,
+                        end_delay: 0.0,
+                        rate: 1.0,
+                        idle: false,
+                        finish_reported: false,
                     });
                     keep.push(true);
                 }
             }
         }
         let mut i = 0;
+        let mut cancelled: Vec<TimedEvent<K>> = Vec::new();
         self.animations.retain(|a| {
-            let k = keep.get(i).copied().unwrap_or(true) || &a.key != key;
+            let k = keep.get(i).copied().unwrap_or(true) || &a.key != key || a.script;
             i += 1;
+            if !k && a.started && !a.ended && !a.idle {
+                let active = (a.local(now) - a.spec.delay as f64).clamp(0.0, (a.spec.duration * a.spec.iterations) as f64);
+                cancelled.push(TimedEvent { event: AnimEvent::AnimationCancel(a.key.clone(), a.spec.name.clone()), elapsed: active / 1000.0 });
+            }
             k
         });
+        self.events.extend(cancelled);
     }
 
     /// Drops everything for `key` (its element left the document or lost its box).
@@ -1304,10 +1499,10 @@ impl<K: Clone + PartialEq> Timeline<K> {
         out
     }
 
-    /// The animated values at `now`, per key: animations first (in list order), then transitions (they win,
-    /// css-cascade-5 §6.1). `base(key, prop)` is the element's cascaded value (implicit 0% / 100% keyframes).
-    /// Finished transitions are dropped and finished animations stop applying unless they fill forwards; the
-    /// events are queued.
+    /// The animated values at `now`, per key: animations first (in list order: CSS animations, then script
+    /// animations in creation order), then transitions (they win, css-cascade-5 §6.1). `base(key, prop)` is the
+    /// element's cascaded value (implicit 0% / 100% keyframes). Finished transitions are dropped and finished
+    /// animations stop applying unless they fill forwards; the events are queued.
     pub fn sample<H: Host>(&mut self, now: f64, base: &dyn Fn(&K, &str) -> Option<String>, cx: &ParseCx) -> Vec<(K, Vec<(String, AnimValue)>)> {
         let mut out: Vec<(K, Vec<(String, AnimValue)>)> = Vec::new();
         let push = |out: &mut Vec<(K, Vec<(String, AnimValue)>)>, k: &K, prop: &str, v: AnimValue| {
@@ -1321,11 +1516,15 @@ impl<K: Clone + PartialEq> Timeline<K> {
             e.retain(|(p, _)| p != prop);
             e.push((String::from(prop), v));
         };
-        for a in self.animations.iter_mut() {
-            let local = match a.paused_at {
-                Some(l) => l,
-                None => now - a.start,
-            };
+        // CSS animations apply below script animations (Web Animations 1 §5.4.2 composite order)
+        let mut order: Vec<usize> = (0..self.animations.len()).filter(|&i| !self.animations[i].script).collect();
+        order.extend((0..self.animations.len()).filter(|&i| self.animations[i].script));
+        for i in order {
+            let a = &mut self.animations[i];
+            if a.idle {
+                continue;
+            }
+            let local = a.local(now);
             let s = &a.spec;
             let dur = s.duration as f64;
             let active = dur * s.iterations as f64;
@@ -1333,7 +1532,7 @@ impl<K: Clone + PartialEq> Timeline<K> {
             let (phase, it_progress, iteration) = if t < 0.0 {
                 (0u8, 0.0f64, 0i64)
             } else if t >= active && active.is_finite() {
-                let it = if dur > 0.0 { s.iterations as f64 } else { s.iterations as f64 };
+                let it = s.iterations as f64;
                 let whole = floor64(it);
                 let frac = it - whole;
                 if frac == 0.0 && whole > 0.0 { (2, 1.0, whole as i64 - 1) } else { (2, frac, whole as i64) }
@@ -1343,18 +1542,28 @@ impl<K: Clone + PartialEq> Timeline<K> {
                 let it = floor64(t / dur);
                 (1, t / dur - it, it as i64)
             };
-            // events
-            if phase >= 1 && !a.started {
-                a.started = true;
-                self.events.push(AnimEvent::AnimationStart(a.key.clone(), s.name.clone()));
-            }
-            if phase == 1 && iteration > a.iteration {
-                a.iteration = iteration;
-                self.events.push(AnimEvent::AnimationIteration(a.key.clone(), s.name.clone()));
-            }
-            if phase == 2 && !a.ended {
-                a.ended = true;
-                self.events.push(AnimEvent::AnimationEnd(a.key.clone(), s.name.clone()));
+            if a.script {
+                // script animations fire no CSS events; their finish is reported (the `finish` event, `finished`)
+                let fin = a.finished_at(local);
+                if fin && !a.finish_reported {
+                    a.finish_reported = true;
+                    self.finished.push(a.id);
+                }
+                a.ended = fin;
+            } else {
+                if phase >= 1 && !a.started {
+                    a.started = true;
+                    let el = (-(s.delay as f64)).max(0.0).min(active);
+                    ev(&mut self.events, AnimEvent::AnimationStart(a.key.clone(), s.name.clone()), el);
+                }
+                if phase == 1 && iteration > a.iteration {
+                    a.iteration = iteration;
+                    ev(&mut self.events, AnimEvent::AnimationIteration(a.key.clone(), s.name.clone()), iteration as f64 * dur);
+                }
+                if phase == 2 && !a.ended {
+                    a.ended = true;
+                    ev(&mut self.events, AnimEvent::AnimationEnd(a.key.clone(), s.name.clone()), active);
+                }
             }
             let fills = match phase {
                 0 => s.fill == 2 || s.fill == 3,
@@ -1377,18 +1586,20 @@ impl<K: Clone + PartialEq> Timeline<K> {
                 }
             }
         }
-        // finished animations that do not fill forwards are dropped
-        self.animations.retain(|a| !(a.ended && !(a.spec.fill == 1 || a.spec.fill == 3)));
+        // finished CSS animations that do not fill forwards are dropped (a script animation stays until it is
+        // cancelled or its element leaves: its object can play it again)
+        self.animations.retain(|a| a.script || !(a.ended && !(a.spec.fill == 1 || a.spec.fill == 3)));
         let mut done = Vec::new();
         for (i, t) in self.transitions.iter_mut().enumerate() {
             let local = now - t.start;
             if local >= t.delay && !t.started {
                 t.started = true;
-                self.events.push(AnimEvent::TransitionStart(t.key.clone(), t.prop.clone()));
+                let el = (-t.delay).max(0.0).min(t.duration);
+                ev(&mut self.events, AnimEvent::TransitionStart(t.key.clone(), t.prop.clone()), el);
             }
             if local >= t.delay + t.duration {
                 done.push(i);
-                self.events.push(AnimEvent::TransitionEnd(t.key.clone(), t.prop.clone()));
+                ev(&mut self.events, AnimEvent::TransitionEnd(t.key.clone(), t.prop.clone()), t.duration);
                 continue;
             }
             let v = transition_value(&t.prop, t, now);
@@ -1398,6 +1609,300 @@ impl<K: Clone + PartialEq> Timeline<K> {
             self.transitions.remove(i);
         }
         out
+    }
+
+    // ---- AETHERSTYLE3B (SR115): the Web Animations API's model (Web Animations 1 §4) -------------------------
+
+    /// `element.animate(keyframes, options)`: a script animation of `key`, playing from `now`. `name` is the
+    /// animation's `id`. Returns its handle.
+    pub fn animate(&mut self, key: &K, frames: KeyframeSet, timing: ScriptTiming, name: &str, now: f64) -> u64 {
+        let id = self.fresh_id();
+        let spec = AnimationSpec {
+            name: String::from(name),
+            duration: timing.duration.max(0.0) as f32,
+            delay: timing.delay as f32,
+            easing: timing.easing.clone(),
+            iterations: if timing.iterations.is_nan() { 1.0 } else { timing.iterations.max(0.0) as f32 },
+            direction: timing.direction,
+            fill: timing.fill,
+            paused: false,
+        };
+        self.animations.push(Animation {
+            id,
+            key: key.clone(),
+            spec,
+            frames,
+            start: now,
+            paused_at: None,
+            started: false,
+            iteration: 0,
+            ended: false,
+            script: true,
+            end_delay: timing.end_delay,
+            rate: 1.0,
+            idle: false,
+            finish_reported: false,
+        });
+        // a page that makes animations forever: the oldest finished, non-filling ones go
+        let scripts = self.animations.iter().filter(|a| a.script).count();
+        if scripts > 512 {
+            if let Some(i) = self.animations.iter().position(|a| a.script && a.ended && a.spec.fill & 1 == 0) {
+                self.animations.remove(i);
+            }
+        }
+        id
+    }
+
+    /// The handles of the animations on `key` (every key when None) in composite order: CSS transitions, CSS
+    /// animations, script animations (`getAnimations()`, Web Animations 1 §5.5.1; idle ones are not listed).
+    pub fn animation_ids(&self, key: Option<&K>) -> Vec<u64> {
+        let on = |k: &K| key.is_none_or(|kk| kk == k);
+        let mut out: Vec<u64> = self.transitions.iter().filter(|t| on(&t.key)).map(|t| t.id).collect();
+        out.extend(self.animations.iter().filter(|a| !a.script && !a.idle && on(&a.key)).map(|a| a.id));
+        out.extend(self.animations.iter().filter(|a| a.script && !a.idle && on(&a.key)).map(|a| a.id));
+        out
+    }
+
+    /// A snapshot of animation `id` at `now` (None: no such animation — finished CSS animations and transitions
+    /// are gone).
+    pub fn info(&self, id: u64, now: f64) -> Option<AnimInfo<K>> {
+        if let Some(t) = self.transitions.iter().find(|t| t.id == id) {
+            let local = now - t.start;
+            let p = progress_of(t, now);
+            return Some(AnimInfo {
+                id,
+                key: t.key.clone(),
+                kind: AnimKind::Transition,
+                name: t.prop.clone(),
+                play_state: if local >= t.delay + t.duration { PlayState::Finished } else { PlayState::Running },
+                current_time: Some(local),
+                start_time: Some(t.start),
+                rate: 1.0,
+                timing: ScriptTiming { duration: t.duration, delay: t.delay, easing: t.easing.clone(), fill: 1, ..ScriptTiming::default() },
+                progress: (local >= t.delay).then_some(p),
+                current_iteration: (local >= t.delay).then_some(0.0),
+            });
+        }
+        let a = self.animations.iter().find(|a| a.id == id)?;
+        let local = a.local(now);
+        let s = &a.spec;
+        let timing = ScriptTiming {
+            duration: s.duration as f64,
+            delay: s.delay as f64,
+            end_delay: a.end_delay,
+            iterations: s.iterations as f64,
+            direction: s.direction,
+            fill: s.fill,
+            easing: s.easing.clone(),
+        };
+        let play_state = if a.idle {
+            PlayState::Idle
+        } else if a.paused_at.is_some() && a.rate != 0.0 {
+            PlayState::Paused
+        } else if a.finished_at(local) {
+            PlayState::Finished
+        } else {
+            PlayState::Running
+        };
+        let dur = s.duration as f64;
+        let active = dur * s.iterations as f64;
+        let t = local - s.delay as f64;
+        let (progress, iteration) = if a.idle {
+            (None, None)
+        } else if t < 0.0 {
+            if s.fill & 2 != 0 { (Some(0.0), Some(0.0)) } else { (None, None) }
+        } else if t >= active {
+            if s.fill & 1 != 0 && active.is_finite() {
+                let it = s.iterations as f64;
+                let whole = floor64(it);
+                if it - whole == 0.0 && whole > 0.0 { (Some(1.0), Some(whole - 1.0)) } else { (Some(it - whole), Some(whole)) }
+            } else {
+                (None, None)
+            }
+        } else if dur <= 0.0 {
+            (Some(1.0), Some(0.0))
+        } else {
+            let it = floor64(t / dur);
+            (Some(t / dur - it), Some(it))
+        };
+        Some(AnimInfo {
+            id,
+            key: a.key.clone(),
+            kind: if a.script { AnimKind::Script } else { AnimKind::Css },
+            name: s.name.clone(),
+            play_state,
+            current_time: (!a.idle).then_some(local),
+            start_time: (!a.idle && a.paused_at.is_none()).then_some(a.start),
+            rate: a.rate,
+            timing,
+            progress,
+            current_iteration: iteration,
+        })
+    }
+
+    /// `play()` (§4.4.10): resumes a paused animation, restarts a finished one from its start (its end when
+    /// playing backwards), revives an idle (cancelled) one.
+    pub fn play(&mut self, id: u64, now: f64) -> bool {
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        let mut local = if a.idle { if a.rate < 0.0 { a.end_time() } else { 0.0 } } else { a.local(now) };
+        if a.rate > 0.0 && (local < 0.0 || local >= a.end_time()) {
+            local = 0.0;
+        } else if a.rate < 0.0 && (local <= 0.0 || local > a.end_time()) {
+            local = a.end_time();
+        }
+        if local.is_infinite() {
+            return false;
+        }
+        a.idle = false;
+        a.ended = false;
+        a.finish_reported = false;
+        if a.rate != 0.0 {
+            a.paused_at = None;
+            a.start = now - local / a.rate;
+        } else {
+            a.paused_at = Some(local);
+        }
+        true
+    }
+
+    /// `pause()` (§4.4.12): holds the current local time (an idle animation pauses at its start).
+    pub fn pause(&mut self, id: u64, now: f64) -> bool {
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        let local = if a.idle { if a.rate < 0.0 { a.end_time() } else { 0.0 } } else { a.local(now) };
+        if local.is_infinite() {
+            return false;
+        }
+        a.idle = false;
+        a.paused_at = Some(local);
+        true
+    }
+
+    /// `finish()` (§4.4.15): seeks to the end in the playback direction. `false` (InvalidStateError) at
+    /// playback rate 0 or forwards into an infinite end.
+    pub fn finish(&mut self, id: u64, now: f64) -> bool {
+        if let Some(t) = self.transitions.iter_mut().find(|t| t.id == id) {
+            t.start = now - t.delay - t.duration;
+            return true;
+        }
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        if a.rate == 0.0 || (a.rate > 0.0 && a.end_time().is_infinite()) {
+            return false;
+        }
+        let end = if a.rate > 0.0 { a.end_time() } else { 0.0 };
+        a.idle = false;
+        a.paused_at = None;
+        a.start = now - end / a.rate;
+        true
+    }
+
+    /// `cancel()` (§4.4.14): the animation stops applying and goes idle (a transition is removed, with its
+    /// `transitioncancel`; a CSS animation stays cancelled until `animation-name` changes).
+    pub fn cancel(&mut self, id: u64, now: f64) -> bool {
+        if let Some(i) = self.transitions.iter().position(|t| t.id == id) {
+            let t = self.transitions.remove(i);
+            let el = Self::transition_elapsed(&t, now);
+            ev(&mut self.events, AnimEvent::TransitionCancel(t.key, t.prop), el);
+            return true;
+        }
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        if !a.script && a.started && !a.ended && !a.idle {
+            let active = (a.local(now) - a.spec.delay as f64).clamp(0.0, (a.spec.duration * a.spec.iterations) as f64);
+            let e = AnimEvent::AnimationCancel(a.key.clone(), a.spec.name.clone());
+            a.idle = true;
+            ev(&mut self.events, e, active);
+            return true;
+        }
+        a.idle = true;
+        a.paused_at = None;
+        true
+    }
+
+    /// `playbackRate =` / `updatePlaybackRate()` (§4.4.16): the current time is kept.
+    pub fn set_rate(&mut self, id: u64, rate: f64, now: f64) -> bool {
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        if !rate.is_finite() {
+            return false;
+        }
+        let local = a.local(now);
+        let paused = a.paused_at.is_some() && a.rate != 0.0;
+        a.rate = rate;
+        if paused || rate == 0.0 {
+            a.paused_at = Some(local);
+        } else {
+            a.paused_at = None;
+            a.start = now - local / rate;
+        }
+        true
+    }
+
+    /// `reverse()` (§4.4.18): the playback rate flips and the animation plays (from its end when it was at
+    /// its start).
+    pub fn reverse(&mut self, id: u64, now: f64) -> bool {
+        let Some(rate) = self.animations.iter().find(|a| a.id == id).map(|a| a.rate) else { return false };
+        self.set_rate(id, -rate, now);
+        if let Some(a) = self.animations.iter_mut().find(|a| a.id == id) {
+            if a.paused_at.is_some() && a.rate != 0.0 {
+                let l = a.paused_at.unwrap_or(0.0);
+                a.paused_at = None;
+                a.start = now - l / a.rate;
+            }
+        }
+        self.play(id, now)
+    }
+
+    /// `currentTime =` (§4.4.4): seeks local time to `t` ms.
+    pub fn set_current_time(&mut self, id: u64, t: f64, now: f64) -> bool {
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        if !t.is_finite() {
+            return false;
+        }
+        a.idle = false;
+        a.seek(t, now);
+        a.ended = false;
+        a.finish_reported = false;
+        true
+    }
+
+    /// `startTime =` (§4.4.5): local time 0 maps to timeline time `t` (the animation runs).
+    pub fn set_start_time(&mut self, id: u64, t: f64) -> bool {
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        a.idle = false;
+        a.paused_at = None;
+        a.start = t;
+        true
+    }
+
+    /// The keyframes of animation `id` (`KeyframeEffect.getKeyframes()`).
+    pub fn keyframes(&self, id: u64) -> Option<KeyframeSet> {
+        self.animations.iter().find(|a| a.id == id).map(|a| a.frames.clone())
+    }
+
+    /// `KeyframeEffect.setKeyframes()`.
+    pub fn set_keyframes(&mut self, id: u64, frames: KeyframeSet) -> bool {
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        a.frames = frames;
+        true
+    }
+
+    /// `KeyframeEffect.updateTiming()`: replaces the effect's timing (the current time is kept).
+    pub fn set_timing(&mut self, id: u64, timing: &ScriptTiming) -> bool {
+        let Some(a) = self.animations.iter_mut().find(|a| a.id == id) else { return false };
+        a.spec.duration = timing.duration.max(0.0) as f32;
+        a.spec.delay = timing.delay as f32;
+        a.spec.iterations = timing.iterations.max(0.0) as f32;
+        a.spec.direction = timing.direction;
+        a.spec.fill = timing.fill;
+        a.spec.easing = timing.easing.clone();
+        a.end_delay = timing.end_delay;
+        a.ended = false;
+        a.finish_reported = false;
+        true
+    }
+
+    /// The script animations that finished since the last call (the host fires their `finish` event and
+    /// resolves `finished`).
+    pub fn take_finished(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.finished)
     }
 }
 

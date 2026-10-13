@@ -43,6 +43,8 @@
 //! engine (no more script on this page; the DOM still renders) instead of ending the process, and a
 //! per-task instruction budget turns a runaway script into a reported, uncatchable termination.
 
+// AETHERSTYLE3B (SR115): the Web Animations API and the typed transition / animation events.
+pub mod animations;
 pub mod broadcast;
 pub mod cache_api;
 pub mod canvas;
@@ -648,6 +650,7 @@ impl Engine {
         cache_api::install(&mut vm);
         locks::install(&mut vm);
         sw::install(&mut vm);
+        animations::install(&mut vm);
         Engine { vm }
     }
 
@@ -738,6 +741,7 @@ impl Engine {
         let mut n = self.run_tasks();
         n += net::poll(&mut self.vm);
         n += broadcast::poll(&mut self.vm);
+        n += animations::poll(&mut self.vm);
         n += crate::event_loop::fire_due_timers(&mut self.vm);
         checkpoint(&mut self.vm);
         n
