@@ -188,6 +188,48 @@ pub enum SMessage {
     /// Engine → chrome: put `text` (the selection serialized per the HTML `innerText` algorithm) on
     /// the platform clipboard.
     BrowserClipboardSet(String),
+    // AETHERCHROME (SR84): the browser chrome — tabs, the address bar's go/stop, zoom, find in page,
+    // bookmarks, page info, downloads and the hovered-link status line. The MODEL of each lives in
+    // `aether::chrome` (std-free); these verbs are the seam between it and whichever face paints it.
+    /// Chrome → shell: the address bar's text and the user's search template (Principia
+    /// `aether.search`, `%s` = the query). The shell decides URL vs search (`aether::chrome::omnibox`).
+    BrowserGo { input: String, search: String },
+    /// Chrome → engine: stop the load in flight (Esc, the stop button).
+    BrowserNavStop,
+    /// Chrome → shell: open a new tab (Ctrl+T) and switch to it.
+    BrowserTabNew,
+    /// Chrome → shell: close tab `id`, or the active tab when `None` (Ctrl+W).
+    BrowserTabClose(Option<u64>),
+    /// Chrome → shell: switch to tab `id`.
+    BrowserTabSelect(u64),
+    /// Chrome → shell: switch `n` tabs right (negative: left), wrapping (Ctrl+Tab / Ctrl+Shift+Tab).
+    BrowserTabStep(i32),
+    /// Chrome → engine: zoom one step in (`1`), out (`-1`), or back to 100 % (`0`).
+    BrowserZoom(i32),
+    /// Chrome → engine: find `query` in the page; a repeat of the same query steps to the next
+    /// (`forward`) or previous match.
+    BrowserFind { query: String, forward: bool },
+    /// Chrome → engine: the find bar closed; the active match's highlight goes.
+    BrowserFindClose,
+    /// Chrome → shell: bookmark the active tab's page, or remove its bookmark (Ctrl+D).
+    BrowserBookmarkToggle,
+    /// Chrome → engine: describe the active page (the page-info popover opened).
+    BrowserPageInfoAsk,
+    /// Shell → chrome: the tab strip — `(id, title, loading)` in strip order, and the active id.
+    BrowserTabs { active: u64, tabs: Vec<(u64, String, bool)> },
+    /// Engine → chrome: what the toolbar shows for the active tab.
+    BrowserNavState { can_back: bool, can_forward: bool, loading: bool, zoom_pct: u32 },
+    /// Engine → chrome: `matches` hits for `query`; `current` is the 1-based active one (0 = none).
+    BrowserFindResult { query: String, matches: u32, current: u32 },
+    /// Engine → chrome: the status line (the hovered link's URL; empty clears it).
+    BrowserStatus(String),
+    /// Shell → chrome: the bookmarks `(title, url)` in order, and whether the active page is one.
+    BrowserBookmarks { items: Vec<(String, String)>, current: bool },
+    /// Engine → chrome: the page-info popover's answer.
+    BrowserPageInfo { url: String, secure: bool, summary: String },
+    /// Shell → chrome: one download's progress row. `total` is `None` when the length is unknown;
+    /// `done` with `error: None` is a saved file.
+    BrowserDownload { id: u64, name: String, received: u64, total: Option<u64>, done: bool, error: Option<String> },
 
     // --- STRIA (A/V playback; PLAYBACK, LEDGER SR26) ---
     // A session is keyed by the media `url` the request named (the same string `PlayMedia`

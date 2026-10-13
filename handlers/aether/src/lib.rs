@@ -1,4 +1,7 @@
 
+// AETHERCHROME (SR84): the chrome model is std-free (`core` + `alloc`), so it names `alloc` itself.
+extern crate alloc;
+
 pub mod net;
 pub mod dom;
 pub mod layout;
@@ -17,6 +20,7 @@ pub mod fonts;
 pub mod api;
 pub mod media;
 pub mod selection;
+pub mod chrome;
 
 #[cfg(test)]
 mod engine_tests;
@@ -75,6 +79,23 @@ pub struct AetherEngine {
     caret_epoch: std::time::Instant,
     /// The blink phase the last frame painted.
     caret_on: bool,
+    /// AETHERCHROME (SR84): the tab's session history — the truth `history` / `history_idx` mirror
+    /// (their URLs and current index), and what `history.pushState` / `popstate` / Back / Forward move.
+    pub session: chrome::history::SessionHistory,
+    /// A traversal that lands on another document (`history.back()` across a load, Back): the shell
+    /// fetches it and loads it with `add_history = false`.
+    pending_traversal: Option<String>,
+    /// Page zoom in percent (Ctrl+plus/minus/0). The page is laid out and painted at a CSS viewport of
+    /// `device / zoom` (`width`/`height` ARE that CSS viewport) and [`Self::present_rgba`] scales the
+    /// frame to the device surface — the reflowing zoom of a browser, rasterized once at CSS size.
+    zoom_pct: u32,
+    /// The surface size the shell shows the page at, in device pixels.
+    device: (u32, u32),
+    /// Find in page: the bar's state, and every hit as (text node, UTF-16 start, end) for the layout
+    /// epoch `find_epoch` it was searched in.
+    find: chrome::find::FindState,
+    find_hits: Vec<(usize, u32, u32)>,
+    find_epoch: u64,
 }
 
 /// A selection drag (AETHERSELECT).
@@ -125,6 +146,13 @@ impl AetherEngine {
             edit: forms::edit::EditState::default(),
             caret_epoch: std::time::Instant::now(),
             caret_on: true,
+            session: chrome::history::SessionHistory::new(),
+            pending_traversal: None,
+            zoom_pct: 100,
+            device: (800, 600),
+            find: chrome::find::FindState::default(),
+            find_hits: Vec::new(),
+            find_epoch: 0,
         }
     }
 
@@ -386,6 +414,7 @@ impl AetherEngine {
         if let Some(url) = js::take_script_navigation() {
             self.pending_nav = Some(forms::OpenDocument::get(url));
         }
+        self.drain_history_ops();
         if js::take_mutated() {
             self.relayout();
         }
@@ -1033,12 +1062,18 @@ impl AetherEngine {
         }
     }
 
+    /// Step the session history back one entry and return its URL (whether or not it is the same
+    /// document). The shell uses [`Self::traverse`], which also fires `popstate` for a same-document
+    /// entry; this is the URL-only form.
     pub fn get_back_url(&mut self) -> Option<String> {
-        if self.history_idx > 0 {
-            self.history_idx -= 1;
-            Some(self.history[self.history_idx].clone())
-        } else {
-            None
+        let url = self.session.go(-1).map(Self::traversal_url);
+        self.sync_history();
+        url
+    }
+
+    fn traversal_url(t: chrome::history::Traversal) -> String {
+        match t {
+            chrome::history::Traversal::SameDocument { url, .. } | chrome::history::Traversal::CrossDocument { url } => url,
         }
     }
 
@@ -1048,13 +1083,264 @@ impl AetherEngine {
         }
     }
 
+    /// [`Self::get_back_url`]'s forward twin.
     pub fn get_forward_url(&mut self) -> Option<String> {
-        if self.history_idx + 1 < self.history.len() {
-            self.history_idx += 1;
-            Some(self.history[self.history_idx].clone())
-        } else {
-            None
+        let url = self.session.go(1).map(Self::traversal_url);
+        self.sync_history();
+        url
+    }
+
+    // =============================================================================================
+    // AETHERCHROME (SR84): session history, zoom, find in page, the hovered link
+    // =============================================================================================
+
+    /// The current entry's URL ("" before the first load).
+    pub fn current_url(&self) -> String {
+        self.session.current().map(|e| e.url.clone()).unwrap_or_default()
+    }
+
+    /// Whether Back (`-1`) / Forward (`1`) has an entry to go to.
+    pub fn can_go(&self, delta: i32) -> bool {
+        self.session.can_go(delta)
+    }
+
+    /// Back / Forward / `history.go(delta)` from the chrome: a same-document entry is applied here
+    /// (URL in place, `popstate` queued on the page's loop); another document's entry returns its URL
+    /// for the shell to fetch and [`Self::load_page`] with `add_history = false`.
+    pub fn traverse(&mut self, delta: i32) -> Option<String> {
+        let out = match self.session.go(delta)? {
+            chrome::history::Traversal::SameDocument { url, state, from_url } => {
+                if let Some(js) = &mut self.js_engine {
+                    js::window::history::traverse_same_document(&mut js.vm, &url, &from_url, state);
+                }
+                None
+            }
+            chrome::history::Traversal::CrossDocument { url } => Some(url),
+        };
+        self.sync_history();
+        out
+    }
+
+    /// A cross-document traversal the PAGE asked for (`history.back()` landing on another document).
+    pub fn take_pending_traversal(&mut self) -> Option<String> {
+        self.drain_history_ops();
+        self.pending_traversal.take()
+    }
+
+    /// Apply what the page asked of the session history since the last drain (`js/history.rs`).
+    fn drain_history_ops(&mut self) {
+        let ops = js::window::history::take_ops();
+        if ops.is_empty() {
+            return;
         }
+        for op in ops {
+            match op {
+                js::window::history::Op::Push { url, state } => self.session.push_same_document(&url, state),
+                js::window::history::Op::Replace { url, state } => self.session.replace(&url, state),
+                js::window::history::Op::Go(delta) => {
+                    if let Some(url) = self.traverse(delta) {
+                        self.pending_traversal = Some(url);
+                    }
+                }
+            }
+        }
+        self.sync_history();
+    }
+
+    /// Mirror the session history into `history` / `history_idx` and the page's `History` binding.
+    fn sync_history(&mut self) {
+        self.history = self.session.urls();
+        self.history_idx = self.session.index();
+        js::window::history::sync(self.session.len(), self.session.index(), self.session.current().and_then(|e| e.state.clone()));
+    }
+
+    /// The zoom in percent.
+    pub fn zoom_pct(&self) -> u32 {
+        self.zoom_pct
+    }
+
+    fn zoom(&self) -> f64 {
+        self.zoom_pct as f64 / 100.0
+    }
+
+    /// One step along the zoom ladder (`1` in, `-1` out, `0` reset); returns the new percentage.
+    pub fn zoom_step(&mut self, dir: i32) -> u32 {
+        let pct = chrome::zoom::step(self.zoom_pct, dir);
+        self.set_zoom_pct(pct);
+        pct
+    }
+
+    /// Lay the page out at `pct` % zoom: the CSS viewport becomes `device / zoom` (a real reflow —
+    /// media queries and wrap widths see it) and `devicePixelRatio` reports the zoom.
+    pub fn set_zoom_pct(&mut self, pct: u32) {
+        let pct = pct.clamp(chrome::zoom::LEVELS[0], chrome::zoom::LEVELS[chrome::zoom::LEVELS.len() - 1]);
+        if pct == self.zoom_pct {
+            return;
+        }
+        self.zoom_pct = pct;
+        js::window::set_device_pixel_ratio(self.zoom());
+        // `scroll_y` is in CSS pixels, so the document point at the top of the viewport stays put.
+        self.apply_device_size();
+    }
+
+    /// The shell's surface is `w`×`h` device pixels (a window resize).
+    pub fn set_device_size(&mut self, w: u32, h: u32) {
+        self.device = (w.max(1), h.max(1));
+        self.apply_device_size();
+    }
+
+    /// The device surface size.
+    pub fn device_size(&self) -> (u32, u32) {
+        self.device
+    }
+
+    fn apply_device_size(&mut self) {
+        let z = self.zoom();
+        let cw = ((self.device.0 as f64 / z).round() as u32).max(1);
+        let ch = ((self.device.1 as f64 / z).round() as u32).max(1);
+        if (cw, ch) != (self.width, self.height) {
+            self.handle_event(api::events::Event::Resize(cw, ch));
+        }
+        self.needs_repaint = true;
+        self.damage_rects.push((0, 0, self.width, self.height));
+    }
+
+    /// A device-pixel point on the surface, in the page's CSS pixels.
+    pub fn to_css(&self, x: f64, y: f64) -> (f64, f64) {
+        let z = self.zoom();
+        (x / z, y / z)
+    }
+
+    /// The frame for the shell, as `(width, height, RGBA)` at the DEVICE size: the BGRA surface with
+    /// its channels swapped (quartzite's set_frame contract is RGBA) and, under zoom, resampled
+    /// bilinearly from the CSS-size frame.
+    pub fn present_rgba(&self) -> (u32, u32, Vec<u8>) {
+        let (sw, sh) = (self.width as usize, self.height as usize);
+        let (dw, dh) = (self.device.0 as usize, self.device.1 as usize);
+        let src = &self.surface;
+        if (sw, sh) == (dw, dh) || sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
+            let mut px = src.to_vec();
+            for p in px.chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+            return (self.width, self.height, px);
+        }
+        let mut out = vec![0u8; dw * dh * 4];
+        let (rx, ry) = (sw as f64 / dw as f64, sh as f64 / dh as f64);
+        for y in 0..dh {
+            let fy = ((y as f64 + 0.5) * ry - 0.5).clamp(0.0, (sh - 1) as f64);
+            let (y0, ty) = (fy.floor() as usize, fy - fy.floor());
+            let y1 = (y0 + 1).min(sh - 1);
+            for x in 0..dw {
+                let fx = ((x as f64 + 0.5) * rx - 0.5).clamp(0.0, (sw - 1) as f64);
+                let (x0, tx) = (fx.floor() as usize, fx - fx.floor());
+                let x1 = (x0 + 1).min(sw - 1);
+                let o = (y * dw + x) * 4;
+                for c in 0..4 {
+                    let at = |xx: usize, yy: usize| src[(yy * sw + xx) * 4 + c] as f64;
+                    let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+                    let bot = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+                    // BGRA → RGBA on the way out.
+                    let dc = match c {
+                        0 => 2,
+                        2 => 0,
+                        k => k,
+                    };
+                    out[o + dc] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        (self.device.0, self.device.1, out)
+    }
+
+    /// Find in page (Ctrl+F): a new `query` searches every rendered text run ([`chrome::find`]); the
+    /// same query again steps to the next (`forward`) or previous hit, wrapping. The active hit becomes
+    /// the selection — painted with the selection highlight — and is scrolled into view. Returns
+    /// `(matches, current)` (1-based; 0 = none). A hit is within one text node (a match spanning an
+    /// element boundary, `<b>un</b>a`, is not found).
+    pub fn find(&mut self, query: &str, forward: bool) -> (u32, u32) {
+        let cur = if self.find.is_repeat(query) && self.find_epoch == self.layout_epoch {
+            self.find.step(forward)
+        } else {
+            self.find_hits = self.collect_find_hits(query);
+            self.find_epoch = self.layout_epoch;
+            self.find.begin(query, self.find_hits.len(), forward)
+        };
+        if let Some(i) = cur {
+            self.show_find_hit(i);
+        }
+        self.find.result()
+    }
+
+    /// The find bar closed: the active hit's highlight goes.
+    pub fn find_close(&mut self) {
+        if self.find.current.is_some() {
+            selection::set(None);
+            self.sel_changed();
+        }
+        self.find.clear();
+        self.find_hits.clear();
+    }
+
+    fn collect_find_hits(&self, query: &str) -> Vec<(usize, u32, u32)> {
+        let mut out = Vec::new();
+        let (Some(doc), Some(layout)) = (self.document.clone(), self.layout_tree.as_ref()) else { return out };
+        if query.is_empty() {
+            return out;
+        }
+        // Only text a box was laid out for is findable (display:none subtrees have no box).
+        let boxed: std::collections::HashSet<usize> = layout.node_map.values().map(|n| n.id().0).collect();
+        let root = doc.select_first("body").map(|b| b.as_node().clone()).unwrap_or(doc);
+        for n in root.descendants() {
+            let Some(text) = n.as_text() else { continue };
+            let Some(parent) = n.parent() else { continue };
+            if !boxed.contains(&parent.id().0) {
+                continue;
+            }
+            if n.ancestors().any(|a| {
+                matches!(a.local_name().as_deref(), Some("script" | "style" | "noscript" | "template" | "title" | "head" | "select"))
+            }) {
+                continue;
+            }
+            let data = text.borrow().clone();
+            for (a, b) in chrome::find::find_all(&data, query) {
+                out.push((n.id().0, selection::byte_to_utf16(&data, a), selection::byte_to_utf16(&data, b)));
+            }
+        }
+        out
+    }
+
+    fn show_find_hit(&mut self, i: usize) {
+        let Some(&(node, a, b)) = self.find_hits.get(i) else { return };
+        selection::set(Some(selection::Selection {
+            anchor: selection::Point { node, offset: a },
+            focus: selection::Point { node, offset: b },
+        }));
+        self.sel_drag = None;
+        self.sel_changed();
+        let Some(doc) = self.document.clone() else { return };
+        let Some(parent) = doc.node_at(html_core::NodeId(node)).parent() else { return };
+        if let Some((_, y, _, h)) = self.box_of(&parent) {
+            let (top, bottom, vh) = (y as f64, (y + h) as f64, self.height as f64);
+            if top < self.scroll_y || bottom > self.scroll_y + vh {
+                let target = (top - vh / 3.0).max(0.0);
+                self.handle_event(api::events::Event::Scroll(0.0, target - self.scroll_y));
+            }
+        }
+    }
+
+    /// The URL of the link under the pointer (the nearest `<a href>` / `<area href>` on the hover
+    /// path), resolved against the document — the chrome's status line.
+    pub fn hovered_link(&self) -> Option<String> {
+        let base = self.current_url();
+        self.hover_path.iter().find_map(|n| {
+            let e = n.as_element()?;
+            if !matches!(e.name.local.as_ref(), "a" | "area") {
+                return None;
+            }
+            let href = e.attributes.borrow().get("href")?.to_string();
+            Some(url::Url::parse(&base).and_then(|b| b.join(&href)).map(|u| u.to_string()).unwrap_or(href))
+        })
     }
 
     #[deprecated(since = "0.1.0", note = "use aether::net::fetch_document and engine.load_html instead to prevent borrow panics")]
@@ -1089,6 +1375,7 @@ impl AetherEngine {
     /// The staged navigation from the last link click / form submit, if
     /// any. The shell consumes it and drives the async load.
     pub fn take_pending_nav(&mut self) -> Option<forms::OpenDocument> {
+        self.drain_history_ops();
         self.pending_nav.take()
     }
 
@@ -1137,16 +1424,20 @@ impl AetherEngine {
         scripts_override: Option<(&[String], &[String])>,
         add_history: bool,
     ) {
+        // AETHERCHROME (SR84): the session history is the truth; `history`/`history_idx` mirror it. A
+        // new navigation drops the forward entries and appends one of a new document; a traversal or
+        // reload (`add_history = false`) re-commits the current entry with the document it now holds.
         if add_history {
-            // Drop any forward entries beyond the current position, then
-            // append. (Truncating AT the index wiped the current entry too —
-            // history never grew past one, so Back never had anywhere to go.)
-            if !self.history.is_empty() {
-                self.history.truncate(self.history_idx + 1);
-            }
-            self.history.push(url.to_string());
-            self.history_idx = self.history.len() - 1;
+            self.session.push_document(url);
+        } else {
+            self.session.commit_traversal_load(url);
         }
+        // Whatever the old document asked of the session and never got applied is moot now.
+        let _ = js::window::history::take_ops();
+        self.pending_traversal = None;
+        self.sync_history();
+        self.find.clear();
+        self.find_hits.clear();
         
         // The previous document's media stop; this one's register below.
         media::reset("Aether Browser");
@@ -1181,6 +1472,7 @@ impl AetherEngine {
         }
 
         media::set_title(&self.title);
+        self.session.set_title(&self.title);
 
         // UNAOS_JSEVAL=<expr>: evaluate one expression against the booted page and print its value.
         if let Ok(expr) = std::env::var("UNAOS_JSEVAL") {
@@ -1231,6 +1523,9 @@ impl AetherEngine {
             })
         });
         self.set_focus(autofocus);
+        // Scripts that ran during the load may already have pushed or replaced entries (a router's
+        // boot `replaceState`).
+        self.drain_history_ops();
     }
 
     /// Test hook: force the caret's blink phase.

@@ -132,6 +132,12 @@ pub const GEMINI_DEFAULT_KEY_ENV: &str = "GEMINI_API_KEY";
 
 /// THE TABLE. Sorted by namespace, then key (the gate asserts it), so the document diffs stably.
 pub static SCHEMA: &[Key] = &[
+    // ── aether — the browser (AETHERCHROME, SR84; read by the GTK address bar, decided by `aether::chrome::omnibox`) ──
+    Key {
+        ns: "aether", key: "search", kind: Kind::Str { max_len: 512, printable: true }, default: Default::Str("https://html.duckduckgo.com/html/?q=%s"),
+        writers: OP, reader: "quartzite GTK url bar (`url_bar::search_template`), aether chrome omnibox",
+        doc: "The address bar's search engine: a URL template whose `%s` (or `{searchTerms}`) becomes the urlencoded query when the typed text is not an address (AETHERCHROME).",
+    },
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     Key {
         ns: "system", key: "appearance.accent", kind: Kind::Enum(&crate::appearance::ACCENTS), default: Default::Str("crispy"),

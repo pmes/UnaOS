@@ -93,6 +93,10 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
                 });
                 return gtk4::glib::Propagation::Stop;
             }
+            // AETHERCHROME (SR84): Esc stops the load in flight — and still reaches the page as a key.
+            if keyval == Key::Escape && !ctrl && !alt && !meta {
+                syn.fire(SMessage::BrowserNavStop);
+            }
             let Some(name) = keyval.name() else { return gtk4::glib::Propagation::Proceed };
             let mut key = String::new();
             for (on, p) in [(ctrl, "Ctrl+"), (alt, "Alt+"), (shift, "Shift+"), (meta, "Meta+")] {
@@ -145,4 +149,175 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
     });
 
     drawing_area.into()
+}
+
+/// AETHERCHROME (SR84): the page surface with the chrome that floats over it — the find bar (Ctrl+F,
+/// top right), the status line (the hovered link, bottom left) and the download progress rows (bottom
+/// right). Overlays only: the page keeps its full height, and the status line takes no pointer input,
+/// so hovering under it still reaches the page.
+pub struct PageView {
+    pub root: gtk4::Widget,
+    /// The page surface itself (focus returns here when the find bar closes).
+    pub surface: gtk4::Widget,
+    pub find_bar: gtk4::Box,
+    pub find_entry: super::glyph::GlyphEntry,
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1000.0 && u < UNITS.len() - 1 {
+        v /= 1000.0;
+        u += 1;
+    }
+    if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+pub fn bootstrap_page_view(id: &str, synapse: Synapse) -> PageView {
+    use super::glyph::{GlyphEntry, GlyphLabel};
+    use gtk4::{Align, Box, Button, Orientation, Overlay, ProgressBar};
+
+    let surface = bootstrap_image_surface(id, synapse.clone());
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&surface));
+    overlay.set_hexpand(true);
+    overlay.set_vexpand(true);
+
+    // The status line.
+    let status = Box::new(Orientation::Horizontal, 0);
+    status.add_css_class("osd");
+    status.set_halign(Align::Start);
+    status.set_valign(Align::End);
+    status.set_can_target(false);
+    status.set_visible(false);
+    let status_label = GlyphLabel::new("");
+    status_label.set_margin_start(6);
+    status_label.set_margin_end(6);
+    status.append(&status_label);
+    overlay.add_overlay(&status);
+
+    // The find bar.
+    let find_bar = Box::new(Orientation::Horizontal, 4);
+    find_bar.add_css_class("osd");
+    find_bar.set_halign(Align::End);
+    find_bar.set_valign(Align::Start);
+    find_bar.set_margin_top(6);
+    find_bar.set_margin_end(6);
+    find_bar.set_visible(false);
+    let find_entry = GlyphEntry::new("Find in page");
+    find_entry.set_size_request(220, -1);
+    let find_count = GlyphLabel::new("");
+    let flat = |label: &str, tip: &str| {
+        let b = Button::new();
+        b.set_child(Some(&GlyphLabel::new(label)));
+        b.add_css_class("flat");
+        b.set_tooltip_text(Some(tip));
+        b
+    };
+    let prev = flat("↑", "Previous match");
+    let next = flat("↓", "Next match (Enter)");
+    let close = flat("×", "Close (Esc)");
+    find_bar.append(&find_entry);
+    find_bar.append(&find_count);
+    find_bar.append(&prev);
+    find_bar.append(&next);
+    find_bar.append(&close);
+    overlay.add_overlay(&find_bar);
+    {
+        let syn = synapse.clone();
+        find_entry.connect_activate(move |e| syn.fire(SMessage::BrowserFind { query: e.text(), forward: true }));
+        let (syn, e) = (synapse.clone(), find_entry.clone());
+        next.connect_clicked(move |_| syn.fire(SMessage::BrowserFind { query: e.text(), forward: true }));
+        let (syn, e) = (synapse.clone(), find_entry.clone());
+        prev.connect_clicked(move |_| syn.fire(SMessage::BrowserFind { query: e.text(), forward: false }));
+        let hide = {
+            let (syn, bar, surf, count) = (synapse.clone(), find_bar.clone(), surface.clone(), find_count.clone());
+            std::rc::Rc::new(move || {
+                bar.set_visible(false);
+                count.set_text("");
+                syn.fire(SMessage::BrowserFindClose);
+                surf.grab_focus();
+            })
+        };
+        let h = hide.clone();
+        close.connect_clicked(move |_| h());
+        let key = gtk4::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk4::gdk::Key::Escape {
+                hide();
+                return gtk4::glib::Propagation::Stop;
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+        find_bar.add_controller(key);
+    }
+
+    // The downloads: one row per download, newest at the bottom.
+    let downloads = Box::new(Orientation::Vertical, 4);
+    downloads.set_halign(Align::End);
+    downloads.set_valign(Align::End);
+    downloads.set_margin_end(6);
+    downloads.set_margin_bottom(6);
+    overlay.add_overlay(&downloads);
+    let rows: std::rc::Rc<RefCell<std::collections::HashMap<u64, (GlyphLabel, ProgressBar)>>> = Default::default();
+
+    let mut rx = synapse.subscribe();
+    let find_count_c = find_count.clone();
+    gtk4::glib::spawn_future_local(async move {
+        loop {
+            match rx.recv().await {
+                Ok(SMessage::BrowserStatus(text)) => {
+                    status.set_visible(!text.is_empty());
+                    status_label.set_text(&text);
+                }
+                Ok(SMessage::BrowserFindResult { matches, current, .. }) => {
+                    find_count_c.set_text(&if matches == 0 { "No results".to_string() } else { format!("{current}/{matches}") });
+                }
+                Ok(SMessage::BrowserDownload { id, name, received, total, done, error }) => {
+                    let mut map = rows.borrow_mut();
+                    let (label, bar) = map
+                        .entry(id)
+                        .or_insert_with(|| {
+                            let row = Box::new(Orientation::Vertical, 2);
+                            row.add_css_class("osd");
+                            let head = Box::new(Orientation::Horizontal, 4);
+                            let label = GlyphLabel::new("");
+                            label.set_hexpand(true);
+                            let dismiss = Button::new();
+                            dismiss.set_child(Some(&GlyphLabel::new("×")));
+                            dismiss.add_css_class("flat");
+                            let (list, r) = (downloads.clone(), row.clone());
+                            dismiss.connect_clicked(move |_| list.remove(&r));
+                            head.append(&label);
+                            head.append(&dismiss);
+                            let bar = ProgressBar::new();
+                            row.append(&head);
+                            row.append(&bar);
+                            row.set_size_request(280, -1);
+                            downloads.append(&row);
+                            (label, bar)
+                        })
+                        .clone();
+                    let text = match (&error, done, total) {
+                        (Some(e), _, _) => format!("{name} — failed: {e}"),
+                        (None, true, _) => format!("{name} — saved"),
+                        (None, false, Some(t)) => format!("{name} — {} of {}", human_bytes(received), human_bytes(t)),
+                        (None, false, None) => format!("{name} — {}", human_bytes(received)),
+                    };
+                    label.set_text(&text);
+                    match total.filter(|&t| t > 0) {
+                        _ if done => bar.set_fraction(if error.is_some() { 0.0 } else { 1.0 }),
+                        Some(t) => bar.set_fraction((received as f64 / t as f64).clamp(0.0, 1.0)),
+                        None => bar.pulse(),
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    PageView { root: overlay.upcast(), surface, find_bar, find_entry }
 }
