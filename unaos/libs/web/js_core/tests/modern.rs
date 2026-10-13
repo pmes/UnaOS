@@ -214,6 +214,33 @@ fn es2026_builtins() {
     assert_eq!(got, "1,2|2,4,6|TypeError|a,b");
 }
 
+/// ES2026 explicit resource management, library half: Symbol.dispose / asyncDispose, DisposableStack,
+/// AsyncDisposableStack, SuppressedError, Iterator.prototype[@@dispose]. (`using` syntax is still refused.)
+#[test]
+fn explicit_resource_management_library() {
+    check(&[
+        ("typeof Symbol.dispose + typeof Symbol.asyncDispose", "symbolsymbol"),
+        (
+            "var log = []; var s = new DisposableStack(); s.use({ [Symbol.dispose]() { log.push('a'); } }); s.defer(() => log.push('b')); s.adopt(1, v => log.push('c' + v)); s.dispose(); [log.join(), s.disposed].join()",
+            "c1,b,a,true",
+        ),
+        (
+            "var s = new DisposableStack(); s.defer(() => { throw new Error('first'); }); s.defer(() => { throw new Error('second'); }); try { s.dispose(); } catch (e) { [e.name, e.error.message, e.suppressed.message].join() }",
+            "SuppressedError,first,second",
+        ),
+        ("var a = new DisposableStack(); a.defer(() => {}); var b = a.move(); [a.disposed, b.disposed].join()", "true,false"),
+        ("var closed = false; var it = { __proto__: Iterator.prototype, next() { return { done: false }; }, return() { closed = true; return {}; } }; it[Symbol.dispose](); closed", "true"),
+        ("new SuppressedError(1, 2, 'm').message + ',' + (new SuppressedError() instanceof Error)", "m,true"),
+    ]);
+    let mut vm = Vm::new(Box::new(NullHost));
+    let got = after_jobs(
+        &mut vm,
+        "var out = []; var as = new AsyncDisposableStack(); as.use({ async [Symbol.asyncDispose]() { out.push('x'); } }); as.defer(async () => { out.push('y'); }); as.disposeAsync().then(() => out.push('done'));",
+        "out.join()",
+    );
+    assert_eq!(got, "y,x,done");
+}
+
 /// ES2022–ES2025 language and library surface the 2026 web leans on (already in the engine; held here).
 #[test]
 fn es2025_language_surface() {

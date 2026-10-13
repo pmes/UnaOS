@@ -109,6 +109,9 @@ pub struct WellKnown {
     pub to_primitive: Sym,
     pub to_string_tag: Sym,
     pub unscopables: Sym,
+    /// ES2026 explicit resource management (§20.4.2.x Symbol.dispose / Symbol.asyncDispose).
+    pub dispose: Sym,
+    pub async_dispose: Sym,
 }
 
 pub struct Vm {
@@ -180,6 +183,8 @@ impl Vm {
             to_primitive: wk_sym("Symbol.toPrimitive"),
             to_string_tag: wk_sym("Symbol.toStringTag"),
             unscopables: wk_sym("Symbol.unscopables"),
+            dispose: wk_sym("Symbol.dispose"),
+            async_dispose: wk_sym("Symbol.asyncDispose"),
         };
         let mut host = host;
         let seed = host.random_seed();

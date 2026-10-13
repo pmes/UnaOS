@@ -1,8 +1,11 @@
 //! The ECMAScript 2026 additions a current page reaches for, beside the ES2025 library: Array.fromAsync
 //! (§23.1.2.2), Error.isError (§20.5.2.1), Math.sumPrecise (§21.3.2.34), the Uint8Array base64 / hex
 //! methods (§23.3.x: fromBase64, fromHex, toBase64, toHex, setFromBase64, setFromHex), Map / WeakMap
-//! getOrInsert / getOrInsertComputed (the upsert proposal, stage 4), and Error.captureStackTrace (the
-//! de-facto API every engine ships, which libraries call when present).
+//! getOrInsert / getOrInsertComputed (the upsert proposal, stage 4), Error.captureStackTrace (the
+//! de-facto API every engine ships, which libraries call when present), and the library half of explicit
+//! resource management (Symbol.dispose / asyncDispose, SuppressedError, DisposableStack,
+//! AsyncDisposableStack, Iterator/AsyncIterator disposal) — the `using` declarations themselves are
+//! parser/compiler work this commit does not do.
 
 use super::*;
 use crate::bignum::BigUint;
@@ -32,6 +35,7 @@ pub fn init(vm: &mut Vm) {
     method(vm, u8p, "toHex", 0, u8_to_hex);
     method(vm, u8p, "setFromBase64", 1, u8_set_from_base64);
     method(vm, u8p, "setFromHex", 1, u8_set_from_hex);
+    init_dispose(vm);
 }
 
 // ============================================================================================ Error
@@ -871,4 +875,399 @@ fn u8_set_from_hex(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     };
     let d = from_hex(s.units(), max);
     set_result(vm, o, d)
+}
+
+// ============================================================================================ explicit resource management
+
+/// A DisposableStack's state: (value, method, hint) per resource — hint 0 `use` (call method on value),
+/// 1 `adopt` (call onDispose(value)), 2 `defer` (call onDispose()), 3 an `@@dispose` used by an async stack
+/// (called, its result not awaited).
+pub struct DisposeData {
+    pub disposed: bool,
+    pub is_async: bool,
+    pub res: Vec<(Value, Value, u8)>,
+}
+
+pub fn init_dispose(vm: &mut Vm) {
+    let r = vm.cur_realm as usize;
+    // SuppressedError (§20.5.8): an Error subclass carrying `error` and `suppressed`.
+    let ep = vm.intr().error_proto;
+    let ec = vm.intr().error_ctor;
+    let sp = vm.new_object(Some(ep));
+    let sc = vm.make_native_with("SuppressedError", 3, suppressed_error_ctor, true, Some(ec), Vec::new());
+    vm.heap.get_mut(sc).props.insert(PropertyKey::from_str("prototype"), Prop::data(Value::Object(sp), 0));
+    vm.heap.get_mut(sp).props.insert(PropertyKey::from_str("constructor"), Prop::data(Value::Object(sc), WC));
+    value(vm, sp, "name", Value::str("SuppressedError"), WC);
+    value(vm, sp, "message", Value::str(""), WC);
+    vm.realms[r].intrinsics.suppressed_error_proto = sp;
+    vm.realms[r].intrinsics.suppressed_error_ctor = sc;
+    global(vm, "SuppressedError", Value::Object(sc));
+    // DisposableStack (§27.3)
+    let op = vm.intr().object_proto;
+    let dp = vm.new_object(Some(op));
+    let dc = ctor(vm, "DisposableStack", 0, ds_ctor, dp);
+    method(vm, dp, "adopt", 2, ds_adopt);
+    method(vm, dp, "defer", 1, ds_defer);
+    let dispose = method(vm, dp, "dispose", 0, ds_dispose);
+    method(vm, dp, "move", 0, ds_move);
+    method(vm, dp, "use", 1, ds_use);
+    accessor(vm, dp, PropertyKey::from_str("disposed"), "disposed", Some(ds_disposed), None, C);
+    let dk = PropertyKey::Sym(vm.wk.dispose.clone());
+    vm.heap.get_mut(dp).props.insert(dk.clone(), Prop::data(Value::Object(dispose), WC));
+    to_str_tag(vm, dp, "DisposableStack");
+    vm.realms[r].intrinsics.disposable_stack_proto = dp;
+    global(vm, "DisposableStack", Value::Object(dc));
+    // AsyncDisposableStack (§27.4)
+    let ap = vm.new_object(Some(op));
+    let acs = ctor(vm, "AsyncDisposableStack", 0, ads_ctor, ap);
+    method(vm, ap, "adopt", 2, ds_adopt);
+    method(vm, ap, "defer", 1, ds_defer);
+    let dispose_async = method(vm, ap, "disposeAsync", 0, ads_dispose_async);
+    method(vm, ap, "move", 0, ds_move);
+    method(vm, ap, "use", 1, ds_use);
+    accessor(vm, ap, PropertyKey::from_str("disposed"), "disposed", Some(ds_disposed), None, C);
+    let adk = PropertyKey::Sym(vm.wk.async_dispose.clone());
+    vm.heap.get_mut(ap).props.insert(adk.clone(), Prop::data(Value::Object(dispose_async), WC));
+    to_str_tag(vm, ap, "AsyncDisposableStack");
+    vm.realms[r].intrinsics.async_disposable_stack_proto = ap;
+    global(vm, "AsyncDisposableStack", Value::Object(acs));
+    // %IteratorPrototype%[@@dispose] and %AsyncIteratorPrototype%[@@asyncDispose] (§27.1.2.x)
+    let ip = vm.intr().iterator_proto;
+    let ds = vm.wk.dispose.clone();
+    method_sym(vm, ip, ds, "[Symbol.dispose]", 0, iterator_dispose, WC);
+    let aip = vm.intr().async_iterator_proto;
+    let ads = vm.wk.async_dispose.clone();
+    method_sym(vm, aip, ads, "[Symbol.asyncDispose]", 0, async_iterator_async_dispose, WC);
+}
+
+fn suppressed_error_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let nt = if ctx.new_target.is_undefined() { Value::Object(ctx.callee) } else { ctx.new_target.clone() };
+    let proto = vm.get_prototype_from_ctor(&nt, |i| i.suppressed_error_proto)?;
+    let trace = vm.stack_trace();
+    let o = vm.alloc(ObjectData::new(Some(proto), Kind::Error(trace)));
+    let msg = vm.arg(ctx, 2);
+    if !msg.is_undefined() {
+        let s = vm.to_string(&msg)?;
+        vm.heap.get_mut(o).props.insert(PropertyKey::from_str("message"), Prop::data(Value::String(s), WC));
+    }
+    let e = vm.arg(ctx, 0);
+    let s = vm.arg(ctx, 1);
+    vm.heap.get_mut(o).props.insert(PropertyKey::from_str("error"), Prop::data(e, WC));
+    vm.heap.get_mut(o).props.insert(PropertyKey::from_str("suppressed"), Prop::data(s, WC));
+    Ok(Value::Object(o))
+}
+
+/// A SuppressedError for a disposal that threw `error` while `suppressed` was already pending.
+fn suppressed(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
+    let proto = vm.intr().suppressed_error_proto;
+    let trace = vm.stack_trace();
+    let o = vm.alloc(ObjectData::new(Some(proto), Kind::Error(trace)));
+    vm.heap.get_mut(o).props.insert(PropertyKey::from_str("error"), Prop::data(error, WC));
+    vm.heap.get_mut(o).props.insert(PropertyKey::from_str("suppressed"), Prop::data(suppressed, WC));
+    Value::Object(o)
+}
+
+fn new_stack(vm: &mut Vm, proto: Obj, is_async: bool, res: Vec<(Value, Value, u8)>) -> Obj {
+    vm.alloc(ObjectData::new(Some(proto), Kind::Disposable(Box::new(DisposeData { disposed: false, is_async, res }))))
+}
+
+fn ds_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    if ctx.new_target.is_undefined() {
+        return vm.throw_type("Constructor DisposableStack requires 'new'");
+    }
+    let p = vm.get_prototype_from_ctor(&ctx.new_target, |i| i.disposable_stack_proto)?;
+    Ok(Value::Object(new_stack(vm, p, false, Vec::new())))
+}
+
+fn ads_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    if ctx.new_target.is_undefined() {
+        return vm.throw_type("Constructor AsyncDisposableStack requires 'new'");
+    }
+    let p = vm.get_prototype_from_ctor(&ctx.new_target, |i| i.async_disposable_stack_proto)?;
+    Ok(Value::Object(new_stack(vm, p, true, Vec::new())))
+}
+
+/// The stack behind `this` (either kind), or a TypeError.
+fn this_stack(vm: &mut Vm, v: &Value, what: &str) -> JsResult<(Obj, bool, bool)> {
+    if let Value::Object(o) = v {
+        if let Kind::Disposable(d) = &vm.heap.get(*o).kind {
+            return Ok((*o, d.is_async, d.disposed));
+        }
+    }
+    vm.throw_type(&alloc::format!("{what} called on incompatible receiver"))
+}
+
+fn push_res(vm: &mut Vm, o: Obj, r: (Value, Value, u8)) {
+    if let Kind::Disposable(d) = &mut vm.heap.get_mut(o).kind {
+        d.res.push(r);
+    }
+}
+
+fn not_disposed(vm: &mut Vm, disposed: bool) -> JsResult<()> {
+    if disposed {
+        return vm.throw_ref("The stack has already been disposed");
+    }
+    Ok(())
+}
+
+fn ds_use(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (o, is_async, disposed) = this_stack(vm, &ctx.this, "DisposableStack.prototype.use")?;
+    not_disposed(vm, disposed)?;
+    let v = vm.arg(ctx, 0);
+    if v.is_nullish() {
+        return Ok(v);
+    }
+    if !v.is_object() {
+        return vm.throw_type("DisposableStack.prototype.use: the value is not an object");
+    }
+    let mut hint = 0u8;
+    let mut m = None;
+    if is_async {
+        let ak = PropertyKey::Sym(vm.wk.async_dispose.clone());
+        m = vm.get_method(&v, &ak)?;
+    }
+    if m.is_none() {
+        let dk = PropertyKey::Sym(vm.wk.dispose.clone());
+        m = vm.get_method(&v, &dk)?;
+        if is_async {
+            hint = 3;
+        }
+    }
+    let Some(m) = m else { return vm.throw_type("The value has no [Symbol.dispose] method") };
+    push_res(vm, o, (v.clone(), m, hint));
+    Ok(v)
+}
+
+fn ds_adopt(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (o, _, disposed) = this_stack(vm, &ctx.this, "DisposableStack.prototype.adopt")?;
+    not_disposed(vm, disposed)?;
+    let v = vm.arg(ctx, 0);
+    let f = vm.arg(ctx, 1);
+    if !vm.is_callable(&f) {
+        return vm.throw_type("onDispose is not a function");
+    }
+    push_res(vm, o, (v.clone(), f, 1));
+    Ok(v)
+}
+
+fn ds_defer(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (o, _, disposed) = this_stack(vm, &ctx.this, "DisposableStack.prototype.defer")?;
+    not_disposed(vm, disposed)?;
+    let f = vm.arg(ctx, 0);
+    if !vm.is_callable(&f) {
+        return vm.throw_type("onDispose is not a function");
+    }
+    push_res(vm, o, (Value::Undefined, f, 2));
+    Ok(Value::Undefined)
+}
+
+fn ds_move(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (o, is_async, disposed) = this_stack(vm, &ctx.this, "DisposableStack.prototype.move")?;
+    not_disposed(vm, disposed)?;
+    let res = match &mut vm.heap.get_mut(o).kind {
+        Kind::Disposable(d) => {
+            d.disposed = true;
+            core::mem::take(&mut d.res)
+        }
+        _ => Vec::new(),
+    };
+    let p = if is_async { vm.intr().async_disposable_stack_proto } else { vm.intr().disposable_stack_proto };
+    Ok(Value::Object(new_stack(vm, p, is_async, res)))
+}
+
+fn ds_disposed(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (_, _, disposed) = this_stack(vm, &ctx.this, "get DisposableStack.prototype.disposed")?;
+    Ok(Value::Bool(disposed))
+}
+
+/// Mark disposed and take the resources (in registration order).
+fn take_for_dispose(vm: &mut Vm, o: Obj) -> Option<Vec<(Value, Value, u8)>> {
+    match &mut vm.heap.get_mut(o).kind {
+        Kind::Disposable(d) if !d.disposed => {
+            d.disposed = true;
+            Some(core::mem::take(&mut d.res))
+        }
+        _ => None,
+    }
+}
+
+fn call_res(vm: &mut Vm, r: &(Value, Value, u8)) -> JsResult<Value> {
+    match r.2 {
+        0 | 3 => vm.call(&r.1, &r.0, &[]),
+        1 => vm.call(&r.1, &Value::Undefined, &[r.0.clone()]),
+        _ => vm.call(&r.1, &Value::Undefined, &[]),
+    }
+}
+
+/// DisposableStack.prototype.dispose: DisposeResources in reverse order; errors chain as SuppressedError.
+fn ds_dispose(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let (o, is_async, _) = this_stack(vm, &ctx.this, "DisposableStack.prototype.dispose")?;
+    if is_async {
+        return vm.throw_type("DisposableStack.prototype.dispose called on an AsyncDisposableStack");
+    }
+    let Some(res) = take_for_dispose(vm, o) else { return Ok(Value::Undefined) };
+    for r in &res {
+        vm.root(&r.0);
+        vm.root(&r.1);
+    }
+    let mut err: Option<Value> = None;
+    for r in res.iter().rev() {
+        if let Err(e) = call_res(vm, r) {
+            vm.root(&e);
+            err = Some(match err {
+                Some(prev) => suppressed(vm, e, prev),
+                None => e,
+            });
+        }
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(Value::Undefined),
+    }
+}
+
+// AsyncDisposableStack.prototype.disposeAsync: a state record [resolve, reject, err, has_err, idx, (v, m, h)*].
+const A_RES: usize = 0;
+const A_REJ: usize = 1;
+const A_ERR: usize = 2;
+const A_HAS: usize = 3;
+const A_IDX: usize = 4;
+const A_BASE: usize = 5;
+
+fn ads_dispose_async(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let pc = Value::Object(vm.intr().promise_ctor);
+    let (p, res, rej) = new_capability(vm, &pc)?;
+    let o = match &ctx.this {
+        Value::Object(o) if matches!(&vm.heap.get(*o).kind, Kind::Disposable(d) if d.is_async) => *o,
+        _ => {
+            let e = vm.type_error("AsyncDisposableStack.prototype.disposeAsync called on incompatible receiver");
+            vm.call(&rej, &Value::Undefined, &[e])?;
+            return Ok(Value::Object(p));
+        }
+    };
+    let Some(list) = take_for_dispose(vm, o) else {
+        vm.call(&res, &Value::Undefined, &[Value::Undefined])?;
+        return Ok(Value::Object(p));
+    };
+    let mut slots = vec![res, rej, Value::Undefined, Value::Bool(false), Value::Number(list.len() as f64)];
+    for (v, m, h) in list {
+        slots.push(v);
+        slots.push(m);
+        slots.push(Value::Number(h as f64));
+    }
+    let st = vm.alloc(ObjectData::new(None, Kind::Internal(slots)));
+    ad_step(vm, st);
+    Ok(Value::Object(p))
+}
+
+fn ad_record_error(vm: &mut Vm, st: Obj, e: Value) {
+    let had = matches!(st_get(vm, st, A_HAS), Value::Bool(true));
+    let v = if had {
+        let prev = st_get(vm, st, A_ERR);
+        suppressed(vm, e, prev)
+    } else {
+        e
+    };
+    st_set(vm, st, A_ERR, v);
+    st_set(vm, st, A_HAS, Value::Bool(true));
+}
+
+fn ad_step(vm: &mut Vm, st: Obj) {
+    loop {
+        let idx = match st_get(vm, st, A_IDX) {
+            Value::Number(n) => n as usize,
+            _ => 0,
+        };
+        if idx == 0 {
+            let (f, arg) = if matches!(st_get(vm, st, A_HAS), Value::Bool(true)) {
+                (st_get(vm, st, A_REJ), st_get(vm, st, A_ERR))
+            } else {
+                (st_get(vm, st, A_RES), Value::Undefined)
+            };
+            let _ = vm.call(&f, &Value::Undefined, &[arg]);
+            return;
+        }
+        let i = idx - 1;
+        st_set(vm, st, A_IDX, Value::Number(i as f64));
+        let b = A_BASE + 3 * i;
+        let h = match st_get(vm, st, b + 2) {
+            Value::Number(n) => n as u8,
+            _ => 0,
+        };
+        let r = (st_get(vm, st, b), st_get(vm, st, b + 1), h);
+        match call_res(vm, &r) {
+            Ok(v) => {
+                let v = if h == 3 { Value::Undefined } else { v };
+                match promise_resolve_intrinsic(vm, v) {
+                    Ok(pr) => {
+                        let fo = vm.make_native_closure("", 1, ad_ok, vec![Value::Object(st)]);
+                        let fe = vm.make_native_closure("", 1, ad_err, vec![Value::Object(st)]);
+                        perform_then(vm, pr, Value::Object(fo), Value::Object(fe), None);
+                        return;
+                    }
+                    Err(e) => ad_record_error(vm, st, e),
+                }
+            }
+            Err(e) => ad_record_error(vm, st, e),
+        }
+    }
+}
+
+fn ad_ok(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let st = vm.native_slot(ctx.callee, 0).as_object().unwrap();
+    ad_step(vm, st);
+    Ok(Value::Undefined)
+}
+
+fn ad_err(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let st = vm.native_slot(ctx.callee, 0).as_object().unwrap();
+    let e = vm.arg(ctx, 0);
+    ad_record_error(vm, st, e);
+    ad_step(vm, st);
+    Ok(Value::Undefined)
+}
+
+/// %IteratorPrototype%[@@dispose]: `this.return?.()`.
+fn iterator_dispose(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let this = ctx.this.clone();
+    if let Some(m) = vm.get_method(&this, &PropertyKey::from_str("return"))? {
+        vm.call(&m, &this, &[])?;
+    }
+    Ok(Value::Undefined)
+}
+
+fn resolve_undefined(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let res = vm.native_slot(ctx.callee, 0);
+    vm.call(&res, &Value::Undefined, &[Value::Undefined])
+}
+
+/// %AsyncIteratorPrototype%[@@asyncDispose]: await `this.return?.()`, fulfil with undefined.
+fn async_iterator_async_dispose(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let pc = Value::Object(vm.intr().promise_ctor);
+    let (p, res, rej) = new_capability(vm, &pc)?;
+    let this = ctx.this.clone();
+    let r = (|| -> JsResult<Option<Value>> {
+        match vm.get_method(&this, &PropertyKey::from_str("return"))? {
+            Some(m) => Ok(Some(vm.call(&m, &this, &[Value::Undefined])?)),
+            None => Ok(None),
+        }
+    })();
+    match r {
+        Ok(None) => {
+            vm.call(&res, &Value::Undefined, &[Value::Undefined])?;
+        }
+        Ok(Some(v)) => match promise_resolve_intrinsic(vm, v) {
+            Ok(pr) => {
+                let ok = vm.make_native_closure("", 1, resolve_undefined, vec![res]);
+                perform_then(vm, pr, Value::Object(ok), rej, None);
+            }
+            Err(e) => {
+                vm.call(&rej, &Value::Undefined, &[e])?;
+            }
+        },
+        Err(e) => {
+            vm.call(&rej, &Value::Undefined, &[e])?;
+        }
+    }
+    Ok(Value::Object(p))
 }

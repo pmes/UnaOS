@@ -20,6 +20,8 @@ pub fn init(vm: &mut Vm) {
         ("toPrimitive", vm.wk.to_primitive.clone()),
         ("toStringTag", vm.wk.to_string_tag.clone()),
         ("unscopables", vm.wk.unscopables.clone()),
+        ("dispose", vm.wk.dispose.clone()),
+        ("asyncDispose", vm.wk.async_dispose.clone()),
     ];
     for (n, s) in wk {
         value(vm, c, n, Value::Symbol(s), 0);

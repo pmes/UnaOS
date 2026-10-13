@@ -45,7 +45,8 @@ intrinsics!(
     for_in_iterator_proto, intl_number_format_proto, intl_date_time_format_proto, intl_collator_proto,
     intl_plural_rules_proto, intl_list_format_proto, intl_relative_time_format_proto, intl_segmenter_proto,
     intl_segments_proto, intl_segment_iterator_proto, intl_locale_proto, intl_duration_format_proto,
-    intl_display_names_proto,
+    intl_display_names_proto, disposable_stack_proto, async_disposable_stack_proto, suppressed_error_proto,
+    suppressed_error_ctor,
 );
 
 pub struct Realm {
