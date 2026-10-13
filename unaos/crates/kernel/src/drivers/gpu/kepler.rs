@@ -1518,24 +1518,12 @@ pub fn init(gpu: &GpuInfo) {
         if cfg!(feature = "nvidia-kepler-fifo") {
             crate::bootlog_println!("[NVIDIA] Starting PFIFO initialization...");
             
-            // Enable PFIFO and SUBFIFO (PBDMA) in PMC
-            let pmc_enable = mmio_read(bar0, regs::NV_PMC_ENABLE);
-            mmio_write(bar0, regs::NV_PMC_ENABLE, pmc_enable | 0x100);
-            
-            // GK104 PBDMA enable (NV_PMC_SUBFIFO_ENABLE at 0x204 in pmc.xml)
-            mmio_write(bar0, 0x000204, 0xFFFFFFFF);
-            let pbdma_count_mask = mmio_read(bar0, 0x000204);
-            let pbdma_count = pbdma_count_mask.count_ones();
-            serial_println!(":: kepler: pbdma-count {} ::", pbdma_count);
-
-            // Bind PBDMA 0 to Engine 0 (PGRAPH) by writing mask `1` to SUBFIFO_ENG_MASK[0]
-            // According to gf100_pfifo.xml, SUBFIFO_ENG_MASK is at offset 0x390 relative to PFIFO (0x2000).
-            let pfifo_base = 0x2000;
-            fecs_write(bar0, pfifo_base + 0x390, 1 << 0);
-            serial_println!(":: kepler: pbdma-eng-mask set ::");
-
-            let check = mmio_read(bar0, regs::NV_PMC_ENABLE);
-            crate::bootlog_println!("[NVIDIA] NV_PMC_ENABLE after bit 8 set: 0x{:08X}", check);
+            // KEPLERGR4 (rmbp-ledger B627): the leg's PFIFO preamble is ROUTED through `kepler_fifo::host::preamble`,
+            // called first in `SeptRoute::route` below (PMC PFIFO bit 8, mc/gk104.c:28; the 0x204 probe and enable,
+            // gf100.c:933-934 + gk104.c:739; 0x2390 READ per PBDMA, gk104.c:392), its pre-images in the route's `Pre`
+            // so the leg's unwind puts them back. Retired here: the bare PMC OR, the 0x204 all-ones left standing, and
+            // the uncited WRITE of 1 to 0x2390 (nouveau only reads that register). `[kfifo] preamble` replaces
+            // `:: kepler: pbdma-count` / `pbdma-eng-mask set`.
 
             if let Some(inst_off) = vram_allocator.alloc(0x1000) {
                 if let Some(gpfifo_off) = vram_allocator.alloc(0x1000) {
@@ -4334,6 +4322,7 @@ impl SeptRoute {
             None => (page, "sept"),
         };
         let mut pre = kf::Pre::new();
+        let _ = kf::preamble(bar0, &mut pre, 0); // KEPLERGR4 (B627): the leg's PFIFO preamble, routed
         let io = kf::fifo_init(bar0, utab, rl, &mut pre);
         let userd = kf::userd_slot(utab, kf::CHID_GR);
         for i in 0..kf::USERD_SLOT / 4 {

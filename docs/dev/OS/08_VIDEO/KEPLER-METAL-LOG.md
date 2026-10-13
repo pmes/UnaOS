@@ -8,6 +8,36 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## PRE-REGISTERED — KEPLERGR4 (rmbp-ledger B627, R101), cut 2026-10-13: the GR class, SET_OBJECT, one readable method; UCODE-GATED
+
+Design, rung table and citations: [`docs/dev/evidence/keplergr4/keplergr4.md`](../../evidence/keplergr4/keplergr4.md). Code:
+`drivers/gpu/kepler_gr.rs` (new, `kepler_fifo::gr4`), `kepler_fifo.rs` (`host::preamble`, `kgr`), `kepler.rs` (the
+September leg's preamble routed). No new knob: the rung rides `nvidia-kepler` + `nvidia-kepler-takeover` (on the image
+line) under `tests kgr` (R80).
+
+- **Premise.** Flight 28 (`f28-boot1.log:3260-3262`) read FECS HALTED (`cpuctl=00000010`, `ctx210=00000000`). KEPLERGR3
+  declined before any GR push.
+- **PFIFO preamble (B463's owed), routed through `host::preamble`** and called by both GR legs:
+  - PMC 0x200 |= 0x100 (mc/gk104.c:28).
+  - The PBDMA probe 0x204 <- FFFFFFFF, read, restore (fifo/gf100.c:933-934).
+  - 0x204 <- the probed mask (fifo/gk104.c:739, base.c:146-150).
+  - 0x2390 + i*4 READ (fifo/gk104.c:392).
+  - 0x200 and 0x204 go into `Pre`, so the unwind restores them. The September leg's uncited WRITE of 1 to 0x2390 is
+    retired.
+- **Class.** KEPLER_A 0xA097, pinned from chipset E7 by nouveau gr/gk104.c:486-491 (sclass 902D, A040, A097, A0C0).
+  Fermi+ has no class register. New wire: `[kgr] class=0xA097 …`.
+- **Method.** KEPLER_A's inline-to-memory: 256 bytes from the pushbuffer page into a second pinned page, read back by
+  the CPU (open-gpu-doc cla097.h:109-193). GK104 GR has no m2mf class; 0x9039 is Fermi's.
+- **Ucode verdict.** Nouveau starts FECS/GPCCS ctxsw ucode in `gf100_gr_init_ctxctl_int` (gf100.c:1832-1880) and
+  builds a golden context (gf100.c:440-443) before any object is used. Its GK104 ucode is nouveau's own, generated
+  from its `.fuc` source, and is **MIT** (`fuc/hubgk104.fuc3.h:1`), not an NVIDIA blob. NVIDIA's `fuc409c…` is
+  opt-in via `NvGrUseFW` (gf100.c:2596-2611). Loading either is Peter's ruling (R52's shape), so the rung STOPS at
+  the design. The three options are in keplergr4.md §3.
+- **Expected wire (prediction):**
+  `:: KGR4: class=0xA097 set_object=gated method=i2m bytes=256 landed=- preamble=ok fecs=halted cpuctl=00000010 -> PASS (ucode-gated) ::`.
+  With FECS running after a ruling, it becomes `set_object=ok landed=1 -> PASS`.
+- **Orin.** This is the rMBP's Kepler only. The GA10B stays at GA10B7's measured door.
+
 ## PRE-REGISTERED — KVBLANK3 (rmbp, the GPU line under R53), cut 2026-09-23
 
 **NOT FLOWN.** Written before the boot and not edited afterwards. Branch `exec-rmbp-kvblank3`, parent
