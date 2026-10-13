@@ -16,7 +16,9 @@
 //!   pressed button are one rectangle by construction — the WMCTRL rule, kept.
 //!
 //! Hover: [`hover_track`] (from the taskbar's per-pass compose) reads the pointer, asks `wm::control_hit`, and on a
-//! change damages the two heads involved; [`paint`] reads the latch. No pressed state yet (SOFTY.md, owed).
+//! change damages the two heads involved; [`paint`] reads the latch. SOFTY2 (B641): the latch carries the PRESSED
+//! state too — the pointer's primary button held over a caption button (`pal::cursor::button_down`, the level every
+//! pointer producer publishes) draws it pressed: twice the hover's wash, the close button's red a step darker.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,8 +26,10 @@ use super::paint::{self as p, Surf};
 use super::palette as k;
 use crate::video::wm::{self, Ctrl, Window};
 
-/// The button the pointer is over: `win << 8 | (slot + 1)`, 0 = none.
+/// The button the pointer is over: `win << 8 | pressed << 7 | (slot + 1)`, 0 = none.
 static HOVER: AtomicU64 = AtomicU64::new(0);
+/// The pressed bit of [`HOVER`].
+const PRESSED_BIT: u64 = 0x80;
 
 /// One composed head row (the widest box the panel can hold); try-locked, never waited on (the compositor holds
 /// the window table with interrupts masked while it paints).
@@ -74,10 +78,16 @@ fn slot_of(c: Ctrl) -> usize {
     }
 }
 
-/// The hovered slot on window `id`, if any.
-fn hover_on(id: wm::WinId) -> Option<usize> {
+/// The hovered slot on window `id` and whether it is held down, if any.
+fn hover_on(id: wm::WinId) -> Option<(usize, bool)> {
     let h = HOVER.load(Ordering::Relaxed);
-    if h != 0 && (h >> 8) as wm::WinId == id { Some(((h & 0xFF) - 1) as usize) } else { None }
+    if h != 0 && (h >> 8) as wm::WinId == id { Some((((h & 0x7F) - 1) as usize, h & PRESSED_BIT != 0)) } else { None }
+}
+
+/// SOFTY2 fixture: the latched caption state `(win, slot, pressed)`, if the pointer is over a button.
+pub fn latched() -> Option<(wm::WinId, usize, bool)> {
+    let h = HOVER.load(Ordering::Relaxed);
+    if h == 0 { None } else { Some(((h >> 8) as wm::WinId, ((h & 0x7F) - 1) as usize, h & PRESSED_BIT != 0)) }
 }
 
 /// The registrar key an icon is looked up by: the caption's first word, lower-cased (`appres`'s own rule).
@@ -109,8 +119,8 @@ pub fn hue_of(title: &[u8]) -> u32 {
 /// Compose box-local row `j` of the frame into `buf[..bw]`.
 #[allow(clippy::too_many_arguments)]
 fn compose_row(buf: &mut [u32], bw: usize, bh: usize, j: usize, id: wm::WinId, focused: bool, ctrls: bool, title: &[u8]) {
-    let face = if focused { k::SURFACE } else { k::SURFACE_IDLE };
-    let edge = if focused { k::ACCENT } else { k::EDGE_IDLE };
+    let face = if focused { k::SURFACE() } else { k::SURFACE_IDLE() };
+    let edge = if focused { k::ACCENT_INK() } else { k::EDGE_IDLE() };
     let mut s = Surf::row(buf, bw, j);
     p::fill(&mut s, (0, j, bw, 1), face, 255);
     let head = head_h();
@@ -125,14 +135,15 @@ fn compose_row(buf: &mut [u32], bw: usize, bh: usize, j: usize, id: wm::WinId, f
             let hov = hover_on(id);
             for (i, c) in BTNS.iter().enumerate() {
                 let x = x0 + i * bwid;
-                let hot = hov == Some(i);
+                let hot = hov.map(|(sl, _)| sl) == Some(i);
+                let down = hot && hov.map(|(_, d)| d).unwrap_or(false);
                 let close = *c == Ctrl::Close;
                 if hot && close {
-                    p::fill(&mut s, (x, 1, bwid, head - 1), k::CLOSE_HOT, 255);
+                    p::fill(&mut s, (x, 1, bwid, head - 1), if down { k::CLOSE_PRESSED() } else { k::CLOSE_HOT() }, 255);
                 } else if hot {
-                    p::fill(&mut s, (x, 1, bwid, head - 1), k::PRESS, k::BTN_HOVER_A);
+                    p::fill(&mut s, (x, 1, bwid, head - 1), k::PRESS(), if down { k::BTN_PRESS_A() } else { k::BTN_HOVER_A() });
                 }
-                let ink = if hot && close { k::CLOSE_INK } else if focused { k::TEXT } else { k::TEXT_IDLE };
+                let ink = if hot && close { k::CLOSE_INK } else if focused { k::TEXT() } else { k::TEXT_IDLE() };
                 let gx = x + (bwid - g) / 2;
                 match c {
                     Ctrl::Minimise => p::hairline_h(&mut s, gx, gy + g / 2, g, ink, 255),
@@ -157,7 +168,7 @@ fn compose_row(buf: &mut [u32], bw: usize, bh: usize, j: usize, id: wm::WinId, f
         let tx = ix + isz + k::px(k::WIN_ICON_GAP);
         let limit = if ctrls { btn_x0(bw) } else { bw.saturating_sub(b) };
         let ty = b + t.saturating_sub(fc.cell_h()) / 2;
-        p::text(&mut s, tx, ty, limit.saturating_sub(tx + k::px(8)), title, if focused { k::TEXT } else { k::TEXT_IDLE }, false, fc);
+        p::text(&mut s, tx, ty, limit.saturating_sub(tx + k::px(8)), title, if focused { k::TEXT() } else { k::TEXT_IDLE() }, false, fc);
     }
     // The 1 px border: rounded at the top (the stroke runs past the bottom so its lower arcs never land), square at
     // the bottom; then the corners outside the arc are the desktop's.
@@ -197,7 +208,7 @@ pub fn paint(dst: &crate::video::FrameBuffer, r: &Window, ox: usize, oy: usize, 
         };
         if j >= head && j + b < bh {
             // A content row: only the two side frames are chrome — the border pixel, then the face.
-            let (face, edge) = if focused { (k::SURFACE, k::ACCENT) } else { (k::SURFACE_IDLE, k::EDGE_IDLE) };
+            let (face, edge) = if focused { (k::SURFACE(), k::ACCENT_INK()) } else { (k::SURFACE_IDLE(), k::EDGE_IDLE()) };
             for i in 0..b.min(bw) {
                 let c = if i == 0 { edge } else { face };
                 put(i, c);
@@ -218,16 +229,31 @@ pub fn paint(dst: &crate::video::FrameBuffer, r: &Window, ox: usize, oy: usize, 
 pub fn hover_track(cx: i32, cy: i32) {
     let now = match wm::hit_test(cx, cy) {
         Some((win, _, _)) => match wm::control_hit(win, cx, cy) {
-            Some(c) => (win as u64) << 8 | (slot_of(c) as u64 + 1),
+            Some(c) => (win as u64) << 8 | (if crate::pal::cursor::button_down() { PRESSED_BIT } else { 0 }) | (slot_of(c) as u64 + 1),
             None => 0,
         },
         None => 0,
     };
+    latch(now);
+}
+
+/// Store a new caption latch; a change damages the heads it left and entered (the same head twice when only the
+/// pressed bit moved — one damage is enough, the second is a no-op union).
+fn latch(now: u64) {
     let was = HOVER.swap(now, Ordering::Relaxed);
     if was != now {
         damage_head((was >> 8) as wm::WinId);
         damage_head((now >> 8) as wm::WinId);
     }
+}
+
+/// SOFTY2 fixture: latch `(win, slot, pressed)` as the pointer would, so `tests softy` reads the pressed paint path
+/// with no hands on the glass; `None` clears it.
+pub fn latch_for_test(v: Option<(wm::WinId, usize, bool)>) {
+    latch(match v {
+        Some((w, sl, down)) => (w as u64) << 8 | (if down { PRESSED_BIT } else { 0 }) | (sl.min(2) as u64 + 1),
+        None => 0,
+    });
 }
 
 fn damage_head(id: wm::WinId) {

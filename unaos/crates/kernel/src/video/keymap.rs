@@ -278,7 +278,7 @@ impl Table {
         if roles & CTRL != 0 && modifiers & HID_MOD_CTRL == 0 {
             return false;
         }
-        if roles & ALT != 0 && modifiers & HID_MOD_ALT == 0 {
+        if roles & ALT != 0 && modifiers & self.option_role() == 0 { // SOFTY2 (B641): the Option role's physical key — HID_MOD_ALT, or HID_MOD_GUI on a MIRRORED table (Boot Camp's swap)
             return false;
         }
         true
@@ -342,7 +342,7 @@ pub fn resolve_edge(
     prev_keys: &[u8; 6],
     modifiers: u8,
 ) -> Option<(Action, &'static str)> {
-    let mut i = 0;
+    note_keys(cur_keys, prev_keys); let mut i = 0; // SOFTY2 (B641): a key edge spoils a Windows-key tap; an Esc edge is counted for the flyouts. SAME-LINE fold, code first.
     while i < cur_keys.len() {
         let u = cur_keys[i];
         if u != 0 && !prev_keys.contains(&u) {
@@ -359,7 +359,7 @@ pub fn resolve_edge(
 /// [`super::theme::PC_BINDINGS`] is a change to this function and to nothing else. Such a knob is
 /// NOT this arc — the PC table exists to prove the seam and is selected by nothing.
 pub fn active() -> &'static Table {
-    if PC_ROLE.load(core::sync::atomic::Ordering::Relaxed) { super::theme::PC_BINDINGS } else { super::theme::CRISPY_BINDINGS } // STATUSTRAY (B426): the input item's one toggle selects the PC table (R61's Command-role swap)
+    softy2_table(PC_ROLE.load(core::sync::atomic::Ordering::Relaxed), softy_look()) // SOFTY2 (B641, R126): the look AND the keyboard pick the table — Una+Mac CRISPY, Una+PC UNA_PC (mirrored), Softy+Mac SOFTY_MAC (Boot Camp: Option = Win, Command = Alt), Softy+PC PC. STATUSTRAY (B426): the input item's one toggle says the keyboard is a PC's (R61's Command-role swap)
 }
 
 // --- fixture ---------------------------------------------------------------------------------
@@ -482,7 +482,7 @@ impl Action {
 static HID_MODS_LAST: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// WINRESIZE — record the latest HID modifier byte.
 pub fn note_mods(m: u8) {
-    HID_MODS_LAST.store(m, core::sync::atomic::Ordering::Relaxed);
+    tap_track(m); HID_MODS_LAST.store(m, core::sync::atomic::Ordering::Relaxed); // SOFTY2 (B641): the Windows-key tap detector reads the edge BEFORE the byte is overwritten. SAME-LINE fold, code first.
 }
 /// WINRESIZE M2 — is Shift down per the latest HID report (either side)?
 pub fn shift_held() -> bool {
@@ -512,11 +512,216 @@ pub fn pc_selected() -> bool {
 /// DRAGDROP (B440) — is Option down per the latest HID report (either side)? Option is physically `HID_MOD_ALT`
 /// on both shipped tables; a drag reads it at the drop (Option forces a copy).
 pub fn option_held() -> bool {
-    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_ALT != 0
+    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & active().option_role() != 0 // SOFTY2 (B641): the Option ROLE's physical key on the live table (the PC Win key under Una on a PC keyboard)
 }
 
 /// DRAGDROP2 (B470) — is the Command ROLE down per the latest HID report (the active table's `cmd_role`: the GUI
 /// key on the Mac table, Alt on the PC one)? Quarry's Cmd-press toggles a row into the selection.
 pub fn command_held() -> bool {
     HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & active().cmd_role != 0
+}
+
+// ══════════════ SOFTY2 (rmbp-ledger B641, R126) — THE BOOT CAMP KEY TABLE — TAIL-APPENDED ══════════════
+//
+// Peter, 2026-10-14 (R126): *"mac has that way to run windows whatever they did we do? i mean, to me its obvious mac
+// option is windows win key and mac command is windows alt."* — and the same table the other way for people on a PC
+// keyboard under the Una look.
+//
+// The two keyboards put the same three keys in the same three places: a Mac's `Ctrl Option Command` and a PC's
+// `Ctrl Win Alt`. Boot Camp maps them BY POSITION — Option plays the Windows key, Command plays Alt — and that is the
+// whole of this block: a MIRRORED table reads the two physical modifiers swapped. The look (Una | Softy) and the
+// keyboard (the STATUSTRAY input item's PC flag) pick one of four tables, and no row is re-typed:
+//
+// | look  | keyboard | table       | Command role (`cmd_role`) | Option role (`option_role`) | the Windows key (Start) |
+// |-------|----------|-------------|---------------------------|-----------------------------|-------------------------|
+// | Una   | Mac      | `crispy`    | Command (GUI)             | Option (ALT)                | —                       |
+// | Una   | PC       | `una-pc`    | Alt (ALT)                 | Win (GUI)                   | —                       |
+// | Softy | Mac      | `softy-mac` | Command (GUI) = Win's Alt | Command (GUI): Ctrl+Command | Option (ALT), a tap     |
+// | Softy | PC       | `pc`        | Alt (ALT)                 | Alt (ALT): Ctrl+Alt         | Win (GUI), a tap        |
+//
+// `softy-mac` is the PC rows (`theme::PC_ROWS`) read mirrored: every `CMD` (Windows' Alt chords — Alt+Tab, Alt+C)
+// is the Mac's Command, every `ALT` (Ctrl+Alt+arrows, Ctrl+Alt+L) is Ctrl+Command, and Option is free to be the
+// Windows key. `una-pc` is the Mac rows (`theme::CRISPY_ROWS`) read mirrored: ⌘C is PC Alt+C, ⌘⌥← is Alt+Win+←.
+//
+// THE WINDOWS KEY is a bare TAP of the key that plays it (down and up with no other modifier and no key between):
+// [`tap_track`] (from `note_mods`, every HID report) and [`note_keys`] (from `resolve_edge`) count it, and the look's
+// service pass (`softy::startmenu::key_service`) toggles Start — never the decoder, which runs where a window may
+// not open. A key edge while it is held spoils the tap (Win+E is a chord, not Start). No `Action` variant carries
+// it: three exhaustive matches outside this lane (smallfix3.rs `ACTIONS`/`listed`, clipboard.rs `terminal_action`
+// and `action_code`, a ring-3 ABI number) would each need a row — SOFTY2's report names them.
+
+/// Softy is the look (`video::look`, a desktop image's module; Una everywhere else).
+#[inline]
+fn softy_look() -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        super::look::is_softy()
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        false
+    }
+}
+
+/// SOFTY on an Apple keyboard — Boot Camp's: the PC rows, mirrored (Command = Alt; Option = the Windows key).
+pub static SOFTY_MAC_BINDINGS: &Table = &Table {
+    name: "softy-mac",
+    cmd_role: HID_MOD_GUI,
+    rows: super::theme::PC_ROWS,
+};
+
+/// UNA on a PC keyboard — the same swap the other way: the Mac rows, mirrored (Alt = Command; Win = Option).
+pub static UNA_PC_BINDINGS: &Table = &Table {
+    name: "una-pc",
+    cmd_role: HID_MOD_ALT,
+    rows: super::theme::CRISPY_ROWS,
+};
+
+/// The four tables by (PC keyboard, Softy look) — `active()`'s one body.
+#[inline]
+pub fn softy2_table(pc: bool, softy: bool) -> &'static Table {
+    match (softy, pc) {
+        (false, false) => super::theme::CRISPY_BINDINGS,
+        (false, true) => UNA_PC_BINDINGS,
+        (true, false) => SOFTY_MAC_BINDINGS,
+        (true, true) => super::theme::PC_BINDINGS,
+    }
+}
+
+impl Table {
+    /// A MIRRORED table reads the GUI and ALT keys swapped (Boot Camp's position mapping).
+    #[inline]
+    pub fn mirrored(&self) -> bool {
+        core::ptr::eq(self, SOFTY_MAC_BINDINGS) || core::ptr::eq(self, UNA_PC_BINDINGS)
+    }
+    /// The physical HID modifier that plays the [`ALT`] (Option) role on this table.
+    #[inline]
+    pub fn option_role(&self) -> u8 {
+        if self.mirrored() { HID_MOD_GUI } else { HID_MOD_ALT }
+    }
+}
+
+/// The physical HID modifier that plays the WINDOWS key on the live look and keyboard: Option (`HID_MOD_ALT`) on a
+/// Mac keyboard under Softy, the Win key (`HID_MOD_GUI`) on a PC keyboard under Softy, none (0) under Una.
+pub fn start_role() -> u8 {
+    if !softy_look() {
+        0
+    } else if PC_ROLE.load(core::sync::atomic::Ordering::Relaxed) {
+        HID_MOD_GUI
+    } else {
+        HID_MOD_ALT
+    }
+}
+
+/// The Windows key's name on this keyboard (the wire's `role=`).
+pub fn start_role_name() -> &'static str {
+    match start_role() {
+        0 => "none",
+        r if r == HID_MOD_GUI => "win",
+        _ => "option",
+    }
+}
+
+/// The tap detector's state: 0 idle, 1 armed (the key went down alone), 2 spoilt (something joined it).
+static TAP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Taps counted and not yet taken by the look's service pass.
+static START_TAPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Esc press edges not yet taken (the flyouts close on one).
+static ESC_EDGES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// From `note_mods` with the NEW modifier byte, before it replaces the last one: the Windows key's edges.
+fn tap_track(m: u8) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let role = start_role();
+    if role == 0 {
+        TAP.store(0, Relaxed);
+        return;
+    }
+    let prev = HID_MODS_LAST.load(Relaxed);
+    let (was, now) = (prev & role != 0, m & role != 0);
+    let others = m & !role;
+    match (was, now) {
+        (false, true) => TAP.store(if others == 0 && prev & !role == 0 { 1 } else { 2 }, Relaxed),
+        (true, true) if others != 0 => TAP.store(2, Relaxed),
+        (true, false) => {
+            if TAP.swap(0, Relaxed) == 1 {
+                START_TAPS.fetch_add(1, Relaxed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// From `resolve_edge` with the report pair: any key press edge spoils an armed tap; an Esc edge is counted.
+fn note_keys(cur: &[u8; 6], prev: &[u8; 6]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    for &u in cur.iter() {
+        if u != 0 && !prev.contains(&u) {
+            if TAP.load(Relaxed) == 1 {
+                TAP.store(2, Relaxed);
+            }
+            if u == 0x29 {
+                ESC_EDGES.fetch_add(1, Relaxed);
+            }
+        }
+    }
+}
+
+/// The Windows-key taps since the last take (the look's service pass toggles Start on an odd count).
+pub fn take_start_taps() -> u32 {
+    START_TAPS.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The Esc press edges since the last take.
+pub fn take_esc_edges() -> u32 {
+    ESC_EDGES.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// `[keymap] table=<name> cmd_role=<gui|alt> option=<gui|alt> start=<option|win|none> via=<who>` — the live table, named.
+pub fn announce(via: &str) {
+    let t = active();
+    let nm = |r: u8| if r == HID_MOD_GUI { "gui" } else if r == HID_MOD_ALT { "alt" } else { "other" };
+    serial_println!("[keymap] table={} cmd_role={} option={} start={} via={}", t.name, nm(t.cmd_role), nm(t.option_role()), start_role_name(), via);
+}
+
+/// SOFTY2's fixture leg (`tests softy` prints it in its line): the two mirrored tables resolved from SYNTHETIC
+/// modifier bytes, and the tap detector driven through `note_mods` / `resolve_edge` exactly as a decoder drives them.
+/// Restores the detector's state and the last modifier byte. Returns `(softy_mac_ok, una_pc_ok, tap_ok, spoil_ok)`:
+///
+/// * softy-mac: physical Command+C (`HID_MOD_GUI`) is Copy, Ctrl+Command+L is LockScreen (Windows' Ctrl+Alt+L);
+///   physical Option+C (`HID_MOD_ALT`) is NOTHING (Option is the Windows key there).
+/// * una-pc: PC Alt+C is Copy (the Mac's ⌘C), Alt+Win+← is SnapLeft (⌘⌥←); Win+C alone is nothing.
+/// * tap: the Windows key down then up alone counts ONE tap (Softy only — the caller has switched the look).
+/// * spoil: down, a key edge (`e`), up counts NONE.
+pub fn softy2_selftest() -> (bool, bool, bool, bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let sm = SOFTY_MAC_BINDINGS;
+    let up = UNA_PC_BINDINGS;
+    let softy_mac_ok = resolve(sm, HID_MOD_GUI, 0x06) == Some(Action::Copy)
+        && resolve(sm, HID_MOD_CTRL | HID_MOD_GUI, 0x0F) == Some(Action::LockScreen)
+        && resolve(sm, HID_MOD_ALT, 0x06).is_none()
+        && sm.option_role() == HID_MOD_GUI;
+    let una_pc_ok = resolve(up, HID_MOD_ALT, 0x06) == Some(Action::Copy)
+        && resolve(up, HID_MOD_ALT | HID_MOD_GUI, 0x50) == Some(Action::SnapLeft)
+        && resolve(up, HID_MOD_GUI, 0x06).is_none()
+        && up.option_role() == HID_MOD_GUI;
+    let mods0 = HID_MODS_LAST.load(Relaxed);
+    let taps0 = START_TAPS.swap(0, Relaxed);
+    let role = start_role();
+    let none = [0u8; 6];
+    let mut e = [0u8; 6];
+    e[0] = 0x08; // `e`
+    note_mods(0);
+    note_mods(role);
+    note_mods(0);
+    let tap_ok = role != 0 && START_TAPS.swap(0, Relaxed) == 1;
+    note_mods(role);
+    let _ = resolve_edge(active(), &e, &none, role);
+    note_mods(0);
+    let spoil_ok = role != 0 && START_TAPS.swap(0, Relaxed) == 0;
+    ESC_EDGES.store(0, Relaxed);
+    TAP.store(0, Relaxed);
+    HID_MODS_LAST.store(mods0, Relaxed);
+    START_TAPS.store(taps0, Relaxed);
+    (softy_mac_ok, una_pc_ok, tap_ok, spoil_ok)
 }
