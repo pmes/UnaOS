@@ -285,7 +285,7 @@ static SEC_HOLD: AtomicU64 = AtomicU64::new(0);
 /// The pump core's tick ISR (LOCKREG `sync::isr_tick`): the tick before this one was `hold_ms` late — interrupts were
 /// masked on this core by `name` (the current task), inside pump step `step` (0 = not the pump), holding `site`
 /// (LOCKREG's outermost acquire site, 0 = none). ISR context: atomics only.
-pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8) { let step = fr_step(step); // PUMPHOLE2 (B563): the `flight-recorder` step is charged to the recorder only while its work runs on this task (LINE-NEUTRAL fold, code first)
+pub fn note_hold(hold_ms: u64, name: Option<&'static str>, site: usize, step: u8) { let step = fr_step(step); // PUMPHOLE2 (B610): the `flight-recorder` step is charged to the recorder only while its work runs on this task (LINE-NEUTRAL fold, code first)
     if hold_ms <= HOLD_OVER_MS {
         return;
     }
@@ -375,7 +375,7 @@ impl core::fmt::Display for HolderName {
         }
         let step = h.step.load(Relaxed);
         if step != 0 {
-            write!(f, ":{}", crate::video::lag::PUMP_NAMES.get(step as usize).copied().unwrap_or(if step == P_FLIGHT_REST { "flight-step:bootwit" } else { "-" }))?; // PUMPHOLE2 (B563): the step's remainder named apart
+            write!(f, ":{}", crate::video::lag::PUMP_NAMES.get(step as usize).copied().unwrap_or(if step == P_FLIGHT_REST { "flight-step:bootwit" } else { "-" }))?; // PUMPHOLE2 (B610): the step's remainder named apart
         }
         let site = h.site.load(Relaxed);
         if site != 0 {
@@ -553,7 +553,7 @@ impl core::fmt::Display for FrPlace {
     }
 }
 
-// ── PUMPHOLE2 (rmbp-ledger B563) — a hold in the pump's `flight-recorder` step is the recorder's only while the recorder's
+// ── PUMPHOLE2 (rmbp-ledger B610) — a hold in the pump's `flight-recorder` step is the recorder's only while the recorder's
 // work runs on the pump. FILE-TAIL append. ────────
 // Flight 33: `[hid] stall census holder=usb-pump:flight-recorder n=42 worst_ms=141` (all before login) beside
 // `fr=worker:c2 fr_worst_ms=1`. The step id is "the step after the pump's last mark" (video/lag.rs `pump_next`), and the

@@ -1,4 +1,4 @@
-# SHELLABI — the ring-3 shell's ABI (rmbp-ledger B565)
+# SHELLABI — the ring-3 shell's ABI (rmbp-ledger B612)
 
 Arc base `c4c99344`, branch `exec-rmbp-shellabi`. Compiled only (R107); no QEMU run, no bench run. Every wire line
 below is the shape the code prints; none is quoted from a capture. The fold's `tests midden` is the first run.

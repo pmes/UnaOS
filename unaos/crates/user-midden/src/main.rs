@@ -24,7 +24,7 @@
 //   * LINES. `shell::split` cuts a line at `;` `&&` `||` and `|`; `shell::should_run` decides each next command.
 //     A pipeline's stages run in order, each stage's Out rows captured as the next stage's input (Err rows still
 //     reach the window, as stderr does). A PROGRAM may be any stage: it is launched with SPAWN_PIPE, its output
-//     collected until EOF, then the rest of the pipeline and of the line runs. SHELLABI (rmbp-ledger B565): a program
+//     collected until EOF, then the rest of the pipeline and of the line runs. SHELLABI (rmbp-ledger B612): a program
 //     in a LATER stage is handed the previous stage's lines through `SYS_PIPE_WRITE(pid)` (una-abi 71: each byte a
 //     KEY_DOWN on the child's input ring, then one KEY_EOT) — `feed`, once per frame beside `pump`, resends what a
 //     full ring did not take. A one-shot `MIDDEN.ELF -c <filter>` with no file operand reads that input (`stdin`).
@@ -48,7 +48,7 @@
 //     setting the system owns is Principia's (its store over the PREFS bus — theme.rs reads the look there).
 //   * CWD. One per window (this program owns one window): `cd [dir | - | ~]`, `pwd`; every path operand resolves
 //     against it, `~` against the session home.
-//   * JOBS. `jobs` lists the launched programs whose pipe is open. SHELLABI (B565): `kill <pid | %n>` kills one of
+//   * JOBS. `jobs` lists the launched programs whose pipe is open. SHELLABI (B612): `kill <pid | %n>` kills one of
 //     them through `SYS_KILL` (una-abi 72 — the kernel's gate is parenthood: only this program's own SPAWN_PIPE
 //     children), and Ctrl+C on an empty line kills the newest job the same way and cancels the rest of its line.
 //   * SCROLLBACK. The wheel (INPUT_EV_WHEEL, 3 rows a detent), PageUp/PageDown — the key bytes una-abi KEY_PGUP /
@@ -71,7 +71,7 @@
 // line=<l|-> …::`; and on exit `:: MIDDEN: exit status=<s> rows=<n> cmds=<n> ::`. The exit status packs the same
 // facts (`midden_core::ring3::status`) — the channel `tests midden` (kernel `middenapp.rs`) reads back.
 //
-// RING3PIPE (rmbp-ledger B562). `run` and a bare-name launch ask SYS_SPAWN_PATH for a pipe (`una_abi::SPAWN_PIPE`): the
+// RING3PIPE (rmbp-ledger B609). `run` and a bare-name launch ask SYS_SPAWN_PATH for a pipe (`una_abi::SPAWN_PIPE`): the
 // program still runs detached, and what it writes to its console comes back through `SYS_PIPE_READ(pid)` — `pump`,
 // once per frame, drains every open pipe into the scrollback as the bytes arrive (one row per line) and closes it at
 // EOF (the child exited, the ring is empty). A kernel that does not know the flag (E2BIG to the high argc bits) gets
@@ -81,7 +81,7 @@
 // console (SYS_WRITE handle 1, so a launcher's pipe carries it), says `:: MIDDEN: oneshot rows=<n> cmds=<n> status=<s>
 // ::` and exits with the packed status: the shell's `sh -c`, and the program `tests midden` / `tests una` run through
 // a pipe. A one-shot reads no rc and writes no history.
-// SHELLABI (rmbp-ledger B565). `:: MIDDEN: pipe feed pid=<p> bytes=<n> ok=<0|1> [err=<e>] ::` when a later stage's
+// SHELLABI (rmbp-ledger B612). `:: MIDDEN: pipe feed pid=<p> bytes=<n> ok=<0|1> [err=<e>] ::` when a later stage's
 // input is delivered (its KEY_EOT taken) or refused; `:: MIDDEN: kill ok=<0|1> via=<builtin|ctrl-c> pid=<p> [err=<e>]
 // [cancelled=<0|1>] ::` (ok first: `tests midden` watches a fixed prefix); a one-shot reading its input says `:: MIDDEN:
 // stdin bytes=<n> eot=<0|1> ::`. A pipeline whose LAST stage is a program says its `pipeline …` line at that
@@ -631,7 +631,7 @@ impl App {
                 if self.pipes.len() <= before {
                     return Step::Done(false);
                 }
-                // SHELLABI (B565): a later stage — the previous stage's lines are its input, through SYS_PIPE_WRITE.
+                // SHELLABI (B612): a later stage — the previous stage's lines are its input, through SYS_PIPE_WRITE.
                 if i > 0 {
                     let mut b: Vec<u8> = Vec::new();
                     for l in input.take().unwrap_or_default() {
@@ -829,7 +829,7 @@ impl App {
         let mut i = 0;
         while i < self.pipes.len() {
             let pid = self.pipes[i].pid;
-            self.feed(i); // SHELLABI (B565): a later stage's input first, then what the program wrote
+            self.feed(i); // SHELLABI (B612): a later stage's input first, then what the program wrote
             let mut closed: Option<i64> = None;
             for _ in 0..PIPE_READS {
                 let r = sys(una_abi::SYS_PIPE_READ, pid as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
@@ -885,7 +885,7 @@ impl App {
                     // MIDDEN2: a pipeline's first stage ended — its lines feed the rest, then the line goes on.
                     if let Some(c) = p.cont.take() {
                         let st = if c.rest.is_empty() {
-                            // SHELLABI (B565): the program was the LAST stage — its lines are the pipeline's output.
+                            // SHELLABI (B612): the program was the LAST stage — its lines are the pipeline's output.
                             for l in &c.got {
                                 self.say(Tone::Out, l);
                             }
@@ -906,7 +906,7 @@ impl App {
         }
     }
 
-    /// SHELLABI (B565): hand pipe `i`'s owed input to the child — SYS_PIPE_WRITE takes up to one input ring per call
+    /// SHELLABI (B612): hand pipe `i`'s owed input to the child — SYS_PIPE_WRITE takes up to one input ring per call
     /// (-EAGAIN = full, or the child holds the focus: the rest waits for the next frame), then one zero-length write
     /// delivers the KEY_EOT. -EPIPE (the child exited without taking it) or any refusal drops the rest, said once.
     fn feed(&mut self, i: usize) {
@@ -949,7 +949,7 @@ impl App {
         }
     }
 
-    /// SHELLABI (B565): a one-shot's standard input — the KEY_DOWN bytes on its own input ring (a launcher's
+    /// SHELLABI (B612): a one-shot's standard input — the KEY_DOWN bytes on its own input ring (a launcher's
     /// SYS_PIPE_WRITE) up to KEY_EOT, or STDIN_IDLE_MS with no byte (said: `eot=0`). Lines, the last one unterminated
     /// or not.
     fn ring_stdin(&mut self) -> Vec<String> {
@@ -987,7 +987,7 @@ impl App {
         v
     }
 
-    /// SHELLABI (B565): `SYS_KILL(pid)` on one of this shell's jobs; a kill cancels the rest of that job's line.
+    /// SHELLABI (B612): `SYS_KILL(pid)` on one of this shell's jobs; a kill cancels the rest of that job's line.
     fn kill_pid(&mut self, pid: i64, via: &str) -> bool {
         let r = sys(una_abi::SYS_KILL, pid as u64, 0, 0, 0);
         let mut cancelled = false;
@@ -1129,7 +1129,7 @@ impl App {
                     self.say(Tone::Err, "usage: kill <pid | %job>");
                 }
                 for op in ops {
-                    // SHELLABI (B565): SYS_KILL — the kernel kills only this program's own SPAWN_PIPE children.
+                    // SHELLABI (B612): SYS_KILL — the kernel kills only this program's own SPAWN_PIPE children.
                     match kill_target(&op, &self.pipes) {
                         Some(pid) => {
                             self.kill_pid(pid, "builtin");
@@ -1202,7 +1202,7 @@ impl App {
         }
         let Some(f) = shell::filter_file(verb, w) else {
             if self.oneshot {
-                return Some(self.ring_stdin()); // SHELLABI (B565): a one-shot's input is its launcher's SYS_PIPE_WRITE
+                return Some(self.ring_stdin()); // SHELLABI (B612): a one-shot's input is its launcher's SYS_PIPE_WRITE
             }
             self.say(Tone::Err, &alloc::format!("{}: no input - give it a file, or a pipeline (`ls | {}`)", verb, verb));
             return None;
@@ -1343,7 +1343,7 @@ impl App {
                                 self.say(Tone::Out, &l);
                             }
                         }
-                        // SHELLABI (B565): a one-shot reads its launcher's SYS_PIPE_WRITE input, as `cat` reads stdin.
+                        // SHELLABI (B612): a one-shot reads its launcher's SYS_PIPE_WRITE input, as `cat` reads stdin.
                         None if self.oneshot => {
                             for l in self.ring_stdin() {
                                 self.say(Tone::Out, &l);
@@ -1528,7 +1528,7 @@ impl App {
                 // Ctrl+C: the line is abandoned, as a terminal does; on an empty line, the newest job is named.
                 let text = self.line_text();
                 if text.is_empty() && !self.pipes.is_empty() {
-                    // SHELLABI (B565): Ctrl+C on an empty line kills the newest job (SYS_KILL) and cancels its line.
+                    // SHELLABI (B612): Ctrl+C on an empty line kills the newest job (SYS_KILL) and cancels its line.
                     let pid = self.pipes[self.pipes.len() - 1].pid;
                     let echo = alloc::format!("{}> ^C", self.cwd);
                     self.say(Tone::Echo, &echo);
@@ -1584,7 +1584,7 @@ impl App {
             }
             0x09 | KEY_CTRL_TAB => self.complete(),
             KEY_PGUP | KEY_PGDN => {
-                // SHELLABI (B565): the key bytes (Shift+PgUp/PgDn press them too; the actions beside are unbound).
+                // SHELLABI (B612): the key bytes (Shift+PgUp/PgDn press them too; the actions beside are unbound).
                 let fit = self.fit();
                 let max = self.rows.len().saturating_sub(fit);
                 let page = fit.saturating_sub(1).max(1);
@@ -1636,7 +1636,7 @@ impl App {
         match a {
             ACT_LINE_START => self.ed.move_cursors(Motion::LineStart, false),
             ACT_LINE_END => self.ed.move_cursors(Motion::LineEnd, false),
-            ACT_PAGE_UP | ACT_PAGE_DOWN => return, // SHELLABI (B565): the KEY_PGUP/KEY_PGDN bytes pressed beside these scroll (`key`)
+            ACT_PAGE_UP | ACT_PAGE_DOWN => return, // SHELLABI (B612): the KEY_PGUP/KEY_PGDN bytes pressed beside these scroll (`key`)
             ACT_TOP => self.scroll = max,
             ACT_BOTTOM => self.scroll = 0,
             ACT_COPY => {
@@ -1831,7 +1831,7 @@ fn landmark_base() -> u64 {
 pub extern "C" fn _start() -> ! {
     let _ = &APP_NOTE;
     if let Some(line) = oneshot_line() {
-        oneshot(&line); // ONE-SHOT (RING3PIPE, B562): `-c <words…>` — no window
+        oneshot(&line); // ONE-SHOT (RING3PIPE, B609): `-c <words…>` — no window
     }
     let base = landmark_base();
     let win = sys(SYS_WIN_CREATE, W as u64, H as u64, 0, 0);
@@ -1894,7 +1894,7 @@ pub extern "C" fn _start() -> ! {
             app.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
             theme_wire();
         }
-        app.pump(); // RING3PIPE (B562): what the launched programs wrote since the last frame
+        app.pump(); // RING3PIPE (B609): what the launched programs wrote since the last frame
         app.paint();
         sleep_ms(16);
     }

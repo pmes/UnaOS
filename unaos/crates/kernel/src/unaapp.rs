@@ -47,14 +47,14 @@
 //!      (whole-word leaves `alphabet`: 2 of the 3 substring hits);
 //!   f. SAVE the second tab — Esc, Ctrl+S -> `:: UNA: save path=<fix2> `, and after the exit [`FIX2_PATH`] must read
 //!      [`FIX2_SAVED`] byte-exact.
-//!   g. RENAME — RING3RENAME (rmbp-ledger B561): Ctrl+1 (the tree), Up, Up, Down (the selection on `fix2.txt`), `r`,
+//!   g. RENAME — RING3RENAME (rmbp-ledger B608): Ctrl+1 (the tree), Up, Up, Down (the selection on `fix2.txt`), `r`,
 //!      eight Backspaces over the prefilled name, `moved.txt`, Enter -> `:: UNA: tree op=rename
 //!      path=/var/tmp/una/fix2.txt to=/var/tmp/una/moved.txt via=rename rc=0 ` (SYS_PATH_WRITE + PATH_W_RENAME).
 //!      After the exit [`FIX2_PATH`] is GONE and [`MOVED_PATH`] reads [`FIX2_SAVED`] byte-exact with the SAME object id
 //!      `fix2.txt` had before the drive (`id=same`: the owner / grants / attribute rows on the object travel).
 //! PASS on a UnaFS root also needs every drive (`ide=ok`); the first one that times out is named (`ide=<step>`).
 //!
-//! RING3RENAME (B561) — THE TRASH DRIVE, on a UnaFS root, after the first window's exit: trash_core moves only files
+//! RING3RENAME (B608) — THE TRASH DRIVE, on a UnaFS root, after the first window's exit: trash_core moves only files
 //! under the trasher's home (`/home/<user>`, or `/home` with no session — trash_core's `Ctx`, the rule UNA.ELF's tree
 //! applies), and the first window's tree is rooted at [`FIX_DIR`], outside every home. So a SECOND window is spawned
 //! on [`TRASH_LEAF`] laid with KERNEL authority in `<home>/`[`TRASH_FIX_DIR`] (its tree: that one file, selected),
@@ -63,7 +63,7 @@
 //! [`TRASH_SRC`] byte-exact with the same object id, and carries `una:trash-origin` = the old path (trash_core's
 //! record on the object). With no session `<home>/.Trash` = `/home/.Trash` is laid (kernel authority, when absent) so
 //! the drive does not hang on `/home`'s ACL. `[unaapp] trash=<ok|bad|skip|step> id=<same|moved|n/a> home=<h> …`.
-//! RING3PIPE (rmbp-ledger B562) — THE RUN DRIVE, on any root, after the IDE drives and before legs 1–3: Ctrl+3 (the
+//! RING3PIPE (rmbp-ledger B609) — THE RUN DRIVE, on any root, after the IDE drives and before legs 1–3: Ctrl+3 (the
 //! KEY_CTRL_DIGIT press and its bare release), [`RUN_LINE`] typed into the console WITHOUT Enter, then Ctrl+R (0x12) —
 //! the IDE's Run verb takes the typed line (no `.run` exists beside the fixture) through the console's `run`, which
 //! launches `/apps/MIDDEN.ELF -c help` with SYS_SPAWN_PATH's SPAWN_PIPE. MIDDEN.ELF's one-shot mode writes the core's
@@ -102,14 +102,14 @@ const W_FIND: &str = ":: UNA: find needle=main word=0 hits=1 at=2:4 ";
 const W_GOTO: &str = ":: UNA: goto line=1 ";
 const W_REPL: &str = ":: UNA: replace needle=alpha with=omega word=1 n=2 ";
 const W_SAVE2: &str = ":: UNA: save path=/var/tmp/una/fix2.txt ";
-/// RING3RENAME (B561): drive g's new path and its watched prefix.
+/// RING3RENAME (B608): drive g's new path and its watched prefix.
 const MOVED_PATH: &str = "/var/tmp/una/moved.txt";
 const W_RENAME: &str = ":: UNA: tree op=rename path=/var/tmp/una/fix2.txt to=/var/tmp/una/moved.txt via=rename rc=0 ";
-/// RING3RENAME (B561): the trash drive's folder under the home, its file, and its text.
+/// RING3RENAME (B608): the trash drive's folder under the home, its file, and its text.
 const TRASH_FIX_DIR: &str = ".una-trashfix";
 const TRASH_LEAF: &str = "unatrash.txt";
 const TRASH_SRC: &[u8] = b"trash me\n";
-/// RING3PIPE (B562): the Run drive — the line typed into the console, the child it launches, the watched EOF prefix.
+/// RING3PIPE (B609): the Run drive — the line typed into the console, the child it launches, the watched EOF prefix.
 const RUN_LINE: &[u8] = b"run /apps/MIDDEN.ELF -c help";
 const RUN_CHILD: &str = "MIDDEN.ELF";
 const W_RUN: &str = ":: UNA: pipe eof ok=1 ";
@@ -183,7 +183,7 @@ fn lay_fixture(mt: &crate::fs::vfs::MountTable) -> Result<(), &'static str> {
         Ok(n) if n == FIX_SRC.len() => {}
         _ => return Err("fixture-write"),
     }
-    // RING3RENAME (B561): drive g's leftover from an earlier run, so the name is free again.
+    // RING3RENAME (B608): drive g's leftover from an earlier run, so the name is free again.
     if mt.stat(MOVED_PATH).is_ok() {
         mt.unlink(MOVED_PATH, K).map_err(|_| "fixture-unlink-moved")?;
     }
@@ -212,7 +212,7 @@ fn acl_leg(mt: &crate::fs::vfs::MountTable) -> &'static str {
     }
 }
 
-/// RING3RENAME (B561): the home UNA.ELF's Trash uses — SYS_WHOAMI's home for the session a new slot is stamped with
+/// RING3RENAME (B608): the home UNA.ELF's Trash uses — SYS_WHOAMI's home for the session a new slot is stamped with
 /// (trailing `/` trimmed), else `/home` (trash_core's `Ctx`: "`/home` with no session"); tree.rs `Tree::trash`'s rule.
 fn trash_home() -> alloc::string::String {
     if let Ok(rec) = crate::ring3abi::whoami_record(crate::ring3abi::session_uid()) {
@@ -228,7 +228,7 @@ fn trash_home() -> alloc::string::String {
     alloc::string::String::from("/home")
 }
 
-/// RING3RENAME (B561): drive g — the rename of `fix2.txt` from the first window's tree. The ms taken, or the step.
+/// RING3RENAME (B608): drive g — the rename of `fix2.txt` from the first window's tree. The ms taken, or the step.
 fn rename_drive(pid: u64, slot: u64) -> Result<u64, &'static str> {
     use una_abi::{INPUT_EV_KEY_DOWN as D, INPUT_EV_KEY_UP as U, KEY_CTRL_DIGIT, KEY_DOWN, KEY_UP};
     let mut ev = alloc::vec![(D, KEY_CTRL_DIGIT | 1), (U, b'1'), (D, KEY_UP), (D, KEY_UP), (D, KEY_DOWN), (D, b'r')];
@@ -237,7 +237,7 @@ fn rename_drive(pid: u64, slot: u64) -> Result<u64, &'static str> {
     drive(pid, slot, W_RENAME, &ev).map_err(|_| "rename")
 }
 
-/// RING3RENAME (B561): the trash drive (module doc) — lay, spawn the second window, Ctrl+1 + Delete, Ctrl+Q, read
+/// RING3RENAME (B608): the trash drive (module doc) — lay, spawn the second window, Ctrl+1 + Delete, Ctrl+Q, read
 /// back. The word for the witness (`ok`, `bad`, or the step that failed) and the id check's word.
 fn trash_leg(mt: &crate::fs::vfs::MountTable, img: &[u8]) -> (&'static str, &'static str) {
     use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as K};
@@ -399,7 +399,7 @@ fn ide_drives(pid: u64, slot: u64) -> Result<[u64; 7], &'static str> {
     Ok(ms)
 }
 
-/// RING3PIPE (B562): the Run drive (module doc) — Ctrl+3, the line typed, Ctrl+R; waited on [`W_RUN`].
+/// RING3PIPE (B609): the Run drive (module doc) — Ctrl+3, the line typed, Ctrl+R; waited on [`W_RUN`].
 fn run_drive(pid: u64, slot: u64) -> Result<u64, &'static str> {
     use una_abi::{INPUT_EV_KEY_DOWN as D, INPUT_EV_KEY_UP as U, KEY_CTRL_DIGIT};
     crate::serial_line::line_watch_arm(W_RUN);
@@ -511,7 +511,7 @@ pub fn selftest() {
             Err(step) => ide = step,
         }
     }
-    // RING3RENAME (B561): drive g after the IDE drives, on the same window; `fix2.txt`'s id taken first.
+    // RING3RENAME (B608): drive g after the IDE drives, on the same window; `fix2.txt`'s id taken first.
     let id_before = if laid.is_ok() { mt.stat(FIX2_PATH).ok().and_then(|s| s.id) } else { None };
     let mut ren_ms: Option<u64> = None;
     if fail.is_none() && ide == "ok" {
@@ -575,7 +575,7 @@ pub fn selftest() {
     let verb = midden_core::ring3::verb_of(code).unwrap_or("none");
     // UNAMETAL2: what the save left on the volume.
     let bytes_ok = laid.is_ok() && matches!(mt.read(FIX_PATH, 0, FIX_SAVED.len() + 64), Ok(b) if b.as_slice() == FIX_SAVED);
-    // UNAIDE2: what the replace-all and the second save left on the volume — RING3RENAME (B561): read at the file's
+    // UNAIDE2: what the replace-all and the second save left on the volume — RING3RENAME (B608): read at the file's
     // new path (drive g renamed it), the old path gone, the object id the one `fix2.txt` had.
     let bytes2_ok = laid.is_ok() && matches!(mt.read(MOVED_PATH, 0, FIX2_SAVED.len() + 64), Ok(b) if b.as_slice() == FIX2_SAVED);
     let rename_ok = laid.is_ok() && mt.stat(FIX2_PATH).is_err() && mt.stat(MOVED_PATH).is_ok();
@@ -584,7 +584,7 @@ pub fn selftest() {
         (Some(_), _) => "moved",
         _ => "n/a",
     };
-    // RING3RENAME (B561): the trash drive, a second window, once the first has gone (UnaFS root, every earlier leg green).
+    // RING3RENAME (B608): the trash drive, a second window, once the first has gone (UnaFS root, every earlier leg green).
     let (trash_word, trash_id) = if laid.is_ok() && status.is_some() && ide == "ok" { trash_leg(&mt, &img) } else { ("skip", "n/a") };
     serial_println!(
         "[unaapp] rename={} id={} ms(rename)={:?} trash={} trash_id={}",

@@ -152,7 +152,7 @@ pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec
     if nr != una_abi::SYS_PATH_WRITE || data.len() > una_abi::PATH_IO_MAX {
         return Err(una_abi::EINVAL);
     }
-    if flags == una_abi::PATH_W_RENAME { crate::video::text::resident_forget(core::str::from_utf8(data).unwrap_or("")); let r = crate::fs::vfs::ring3_rename(&mt, path, off, data, caller); return if r < 0 { Err(r) } else { Ok((Vec::new(), 0)) }; } if flags & !(una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS | una_abi::PATH_W_UNLINK) != 0 { // RING3RENAME (B561): the rename flag, alone, AS THE CALLER (never `principal_for`'s installer grant) through the one body x86's default kernel calls too. LINE-NEUTRAL append, before this comment.
+    if flags == una_abi::PATH_W_RENAME { crate::video::text::resident_forget(core::str::from_utf8(data).unwrap_or("")); let r = crate::fs::vfs::ring3_rename(&mt, path, off, data, caller); return if r < 0 { Err(r) } else { Ok((Vec::new(), 0)) }; } if flags & !(una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS | una_abi::PATH_W_UNLINK) != 0 { // RING3RENAME (B608): the rename flag, alone, AS THE CALLER (never `principal_for`'s installer grant) through the one body x86's default kernel calls too. LINE-NEUTRAL append, before this comment.
         return Err(una_abi::EINVAL);
     }
     if flags & una_abi::PATH_W_UNLINK != 0 {

@@ -49,12 +49,12 @@
 // `:: UNA: close path=<p> dirty=<0|1> tabs=<n> ::`. A press in the editor's text places the caret under the pointer.
 //
 // FILES AND RUN — UNAIDE2 (LEDGER SR111). The tree's operations (tree.rs FILE OPERATIONS: `n`/Ctrl+N new file, `f`
-// new folder, `r` rename, Delete trash — RING3RENAME B561: a real rename and trash_core's Trash) ask their name in the
+// new folder, `r` rename, Delete trash — RING3RENAME B608: a real rename and trash_core's Trash) ask their name in the
 // editor's status line (`ask`; Enter commits, Esc drops it); a new file opens in a tab, a renamed file's tab follows
 // it (a renamed folder's open files too). Ctrl+R (`run`) runs the first
 // line of `.run` in the active file's folder, else the workspace root's (`$FILE` = the active file), else the line
 // typed in the console, through the console's midden_core plan; `:: UNA: run src=<path|typed> line=<l> ::`.
-// RING3PIPE (rmbp-ledger B562): the launched program's console output arrives in the console pane as it is written
+// RING3PIPE (rmbp-ledger B609): the launched program's console output arrives in the console pane as it is written
 // (console.rs `pump`, once per frame, over `SYS_PIPE_READ`); `:: UNA: pipe … ::` per chunk, `:: UNA: pipe eof … ::`.
 // POINTER (B543/B550) in every pane: the hand over the tab strip, the beam over the editor's text and the console,
 // the arrow over the tree and the status line; a press on the tree's selected row opens it, as Enter does.
@@ -381,7 +381,7 @@ impl App {
             },
             tree::Op::Rename => match self.tree.rename(&a.base, &name) {
                 Ok(to) => {
-                    // RING3RENAME (B561): every tab on the renamed path, or under it when it was a folder, follows it.
+                    // RING3RENAME (B608): every tab on the renamed path, or under it when it was a folder, follows it.
                     let under = alloc::format!("{}/", a.base);
                     for e in self.tabs.iter_mut() {
                         let moved = match e.path.as_deref() {
@@ -554,7 +554,7 @@ impl App {
                 tree::Act::Open(p) => self.open_path(&p),
                 tree::Act::Ask(op) => self.begin_ask(op),
                 tree::Act::Trash => {
-                    // RING3RENAME (B561): trash_core's rule over the ring-3 rename door.
+                    // RING3RENAME (B608): trash_core's rule over the ring-3 rename door.
                     let m = match self.tree.trash() {
                         Ok((p, to)) => alloc::format!("trashed {} -> {}", p.rsplit('/').next().unwrap_or(&p), to),
                         Err((p, why)) => alloc::format!("trash {}: {}", p.rsplit('/').next().unwrap_or(&p), why),
@@ -1104,7 +1104,7 @@ pub extern "C" fn _start() -> ! {
                 theme_wire();
             }
         }
-        // RING3PIPE (B562): what the programs Run launched have written since the last frame, into the console.
+        // RING3PIPE (B609): what the programs Run launched have written since the last frame, into the console.
         app.con.pump();
         app.paint();
         sleep_ms(16);

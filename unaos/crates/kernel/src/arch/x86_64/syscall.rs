@@ -2621,7 +2621,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), una_abi::SYS_PIPE_WRITE => sys_pipe_write(a0, a1, a2), una_abi::SYS_KILL => sys_kill(a0), // SHELLABI (B565): the launcher's write into its child's input ring and its kill of that child, bodies at the FILE TAIL (same-line fold). RING3PIPE (B562): the launcher's read of its child's console, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), una_abi::SYS_CLIP_SET => sys_clip_set(a0, a1), una_abi::SYS_CLIP_GET => sys_clip_get(a0, a1), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_READ => sys_pathread(a0, a1, a2, a3), #[cfg(not(feature = "selfdiag"))] una_abi::SYS_PATH_WRITE => sys_pathwrite(a0, a1), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), una_abi::SYS_PIPE_WRITE => sys_pipe_write(a0, a1, a2), una_abi::SYS_KILL => sys_kill(a0), // SHELLABI (B612): the launcher's write into its child's input ring and its kill of that child, bodies at the FILE TAIL (same-line fold). RING3PIPE (B609): the launcher's read of its child's console, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). RING3ABI2 M3 (B333) + SELFDIAG (B324), joined at the merge12 fold. RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block.
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1, a2), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -5843,7 +5843,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     crate::wedge2::mark("<F1>");
     let mut ring: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = focus_ring_apps(&mut ring);
-    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire); if wc_tab_to_app(cur, down) { return false; } // SHELLABI (B565): a bare Tab while a LIVE ring-3 program holds the keys is that program's key — returned undelivered so the router hands it (and its release) to the focused ring; `[wc] tab -> app pid=…`, fn at this file's tail. The cycle stays on Alt/Cmd+Tab (`CycleWindow`, above) and on the shell. ⚠ LINE-NEUTRAL append.
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire); if wc_tab_to_app(cur, down) { return false; } // SHELLABI (B612): a bare Tab while a LIVE ring-3 program holds the keys is that program's key — returned undelivered so the router hands it (and its release) to the focused ring; `[wc] tab -> app pid=…`, fn at this file's tail. The cycle stays on Alt/Cmd+Tab (`CycleWindow`, above) and on the shell. ⚠ LINE-NEUTRAL append.
     if cur == 0 && n == 0 {
         return false; // shell, no windows — TAB stays an ordinary key and reaches the console
     }
@@ -5890,7 +5890,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
         drag_settle_disarm();
     }
     // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
-    crate::wedge2::mark("<F2>"); serial_println!("[wc] tab -> cycle cur={} next={} ring={}", cur, next, n); // SHELLABI (B565): the shell (or a focus no live program holds) cycles, said beside `[wc-c]`. ⚠ LINE-NEUTRAL append.
+    crate::wedge2::mark("<F2>"); serial_println!("[wc] tab -> cycle cur={} next={} ring={}", cur, next, n); // SHELLABI (B612): the shell (or a focus no live program holds) cycles, said beside `[wc-c]`. ⚠ LINE-NEUTRAL append.
     // Focus moves through the ONE primitive, so the cycle inherits what already hangs off it: the
     // incoming ring is reset, so a fresh focus starts clean.
     //
@@ -9626,7 +9626,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
             (unsafe { core::str::from_utf8_unchecked(&bytes[..v]) }, v as u64)
         }
     };
-    pipe_feed_write(row, text.as_bytes()); crate::serial_line::emit_user(row, text); // RING3PIPE (B562): a launcher's pipe takes the bytes too (file tail). ⚠ LINE-NEUTRAL fold.
+    pipe_feed_write(row, text.as_bytes()); crate::serial_line::emit_user(row, text); // RING3PIPE (B609): a launcher's pipe takes the bytes too (file tail). ⚠ LINE-NEUTRAL fold.
     written as i64
 }
 
@@ -30781,7 +30781,7 @@ fn sys_spawn_path(path_ptr: u64, path_len: u64, argv_ptr: u64, argc: u64) -> i64
     if !ring3_path_ok(path) {
         return EINVAL;
     }
-    if argc & !(una_abi::SPAWN_ARGC_MASK | una_abi::SPAWN_FLAGS) != 0 { return EINVAL; } let pipe = argc & una_abi::SPAWN_PIPE != 0; let argc = (argc & una_abi::SPAWN_ARGC_MASK) as usize; // RING3PIPE (B562): the flags ride argc's high half. ⚠ LINE-NEUTRAL fold.
+    if argc & !(una_abi::SPAWN_ARGC_MASK | una_abi::SPAWN_FLAGS) != 0 { return EINVAL; } let pipe = argc & una_abi::SPAWN_PIPE != 0; let argc = (argc & una_abi::SPAWN_ARGC_MASK) as usize; // RING3PIPE (B609): the flags ride argc's high half. ⚠ LINE-NEUTRAL fold.
     if argc > una_abi::ARGS_MAX {
         return una_abi::E2BIG;
     }
@@ -30858,11 +30858,11 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ro
     }
     let note = super::elf::app_flags(&bytes);
     let argv: alloc::vec::Vec<&str> = words.iter().map(|s| s.as_str()).collect();
-    let pipe_idx = pipe_reserve(pipe, row).map_err(|why| (EAGAIN, why))?; crate::prof::launching(path); // RING3PIPE (B562): reserved BEFORE a slot exists, so a full table refuses the launch, not the pipe. ⚠ LINE-NEUTRAL fold.
+    let pipe_idx = pipe_reserve(pipe, row).map_err(|why| (EAGAIN, why))?; crate::prof::launching(path); // RING3PIPE (B609): reserved BEFORE a slot exists, so a full table refuses the launch, not the pipe. ⚠ LINE-NEUTRAL fold.
     match spawn_user_image_bg_inner(&bytes, false, &argv, Some(row), pipe_idx) {
         Ok((pid, slot, entry)) => {
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), path);
-            crate::fs::appres::sight(path); pipe_named(pipe_idx, pid); // RING3PIPE (B562): the pid names the pipe. ⚠ LINE-NEUTRAL fold.
+            crate::fs::appres::sight(path); pipe_named(pipe_idx, pid); // RING3PIPE (B609): the pid names the pipe. ⚠ LINE-NEUTRAL fold.
             serial_println!(
                 "[spawnpath] path={} principal={} bytes={} note={} pid={} slot={} entry={:#x} argc={} -> started",
                 path, who, bytes.len(), note, pid, slot, entry, argv.len()
@@ -30870,7 +30870,7 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ro
             Ok(pid)
         }
         Err(why) => {
-            if let Some(i) = pipe_idx { crate::pipe::release(i); } serial_println!("[spawnpath] path={} loader={}", path, why); // RING3PIPE (B562): the reserved pipe goes with the refused launch. ⚠ LINE-NEUTRAL fold.
+            if let Some(i) = pipe_idx { crate::pipe::release(i); } serial_println!("[spawnpath] path={} loader={}", path, why); // RING3PIPE (B609): the reserved pipe goes with the refused launch. ⚠ LINE-NEUTRAL fold.
             Err((if why.contains("args page") { una_abi::E2BIG } else { EAGAIN }, "loader"))
         }
     }
@@ -30901,7 +30901,7 @@ pub fn path_write_as(path: &str, flags: u16, off: u64, data: &[u8], who: &str) -
     if !ring3_path_ok(path) || data.len() > una_abi::PATH_IO_MAX {
         return EINVAL;
     }
-    if flags == una_abi::PATH_W_RENAME { return crate::fs::vfs::ring3_rename(&crate::shell::vfs_mount_table(), path, off, data, who); } if flags & !(una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS | una_abi::PATH_W_UNLINK) != 0 { // RING3RENAME (B561): `PATH_W_RENAME` alone — `from` = the path, `to` = the data — through the one body `selfdiag::path_fulfil` calls on both arches (fs/vfs.rs tail). LINE-NEUTRAL append, before this comment.
+    if flags == una_abi::PATH_W_RENAME { return crate::fs::vfs::ring3_rename(&crate::shell::vfs_mount_table(), path, off, data, who); } if flags & !(una_abi::PATH_W_TRUNC | una_abi::PATH_W_MKDIRS | una_abi::PATH_W_UNLINK) != 0 { // RING3RENAME (B608): `PATH_W_RENAME` alone — `from` = the path, `to` = the data — through the one body `selfdiag::path_fulfil` calls on both arches (fs/vfs.rs tail). LINE-NEUTRAL append, before this comment.
         return EINVAL;
     }
     let mt = crate::shell::vfs_mount_table();
@@ -31211,7 +31211,7 @@ pub fn prefchanged_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
 }
 
 // =================================================================================================
-// RING3PIPE (rmbp-ledger B562) — this arch's half of una-abi's RING3PIPE block: `SYS_SPAWN_PATH`'s SPAWN_PIPE flag
+// RING3PIPE (rmbp-ledger B609) — this arch's half of una-abi's RING3PIPE block: `SYS_SPAWN_PATH`'s SPAWN_PIPE flag
 // and `SYS_PIPE_READ` (70) over the arch-neutral table in `crate::pipe`. TAIL-APPENDED; above this block the arc is
 // same-line folds only: the dispatch arm (beside SYS_CURSOR_SHAPE), `sys_write`'s Console path (`pipe_feed_write`
 // before `emit_user`), `sys_spawn_path`'s argc split, `spawn_path_checked`'s reserve / name / release, and
@@ -31284,7 +31284,7 @@ fn sys_pipe_read(pid: u64, buf: u64, len: u64) -> i64 {
 }
 
 // =================================================================================================
-// SHELLABI (rmbp-ledger B565) — this arch's half of una-abi's SHELLABI verbs: `SYS_PIPE_WRITE` (71) and `SYS_KILL`
+// SHELLABI (rmbp-ledger B612) — this arch's half of una-abi's SHELLABI verbs: `SYS_PIPE_WRITE` (71) and `SYS_KILL`
 // (72) over RING3PIPE's table, and the bare-Tab route `wc_focus_key` asks. TAIL-APPENDED; above this block the arc
 // is same-line folds only: the dispatch arm (beside SYS_PIPE_READ) and two folds in `wc_focus_key` (the app route
 // on the `cur` line, the `[wc] tab -> cycle` line beside `<F2>`).

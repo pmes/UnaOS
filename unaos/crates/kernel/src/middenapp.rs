@@ -22,7 +22,7 @@
 //! is a second one for the length of the test, which is safe while no operator types into the new window (the
 //! QEMU lanes have no keyboard input; on the bench, do not type during `tests midden`).
 //!
-//! RING3PIPE (rmbp-ledger B562) — THE RUN DRIVE, between `help` and `ls`: [`RUN_LINE`]⏎ — the program's `run` launches
+//! RING3PIPE (rmbp-ledger B609) — THE RUN DRIVE, between `help` and `ls`: [`RUN_LINE`]⏎ — the program's `run` launches
 //! `/apps/MIDDEN.ELF -c help` (a second MIDDEN.ELF in its windowless one-shot mode) with SYS_SPAWN_PATH's SPAWN_PIPE;
 //! the child writes the core's help to its console and exits, and the shell's `pump` drains the pipe into its
 //! scrollback line by line, then says `:: MIDDEN: pipe eof ok=1 …` only when at least one line arrived and none was
@@ -39,7 +39,7 @@
 //! operator presses Ctrl+Tab, which the program binds to the same completion. The status then carries cmds=8 (help,
 //! run, ls, cd, history, cd, echo, wc) and the last plan `Host wc`.
 //!
-//! SHELLABI (rmbp-ledger B565) — TWO MORE DRIVES, before the pipeline one (so the last plan stays `Host wc`): a PROGRAM
+//! SHELLABI (rmbp-ledger B612) — TWO MORE DRIVES, before the pipeline one (so the last plan stays `Host wc`): a PROGRAM
 //! as a pipeline's SECOND stage — [`PROG_PIPE`]: `echo hi | run /apps/MIDDEN.ELF -c cat⏎`, the shell launches the
 //! one-shot child with SPAWN_PIPE and hands it the echo's line through `SYS_PIPE_WRITE` (una-abi 71: each byte a
 //! KEY_DOWN on the child's ring, then KEY_EOT), the child's `cat` reads it off its ring and writes it back through the
@@ -63,13 +63,13 @@ const PLANNED: &str = ":: MIDDEN: plan=";
 const START_MS: u64 = 20_000;
 const LINE_MS: u64 = 5_000;
 const EXIT_MS: u64 = 5_000;
-/// RING3PIPE (B562): the Run drive's line (Enter included) and the watched EOF prefix; the child loads off the volume.
+/// RING3PIPE (B609): the Run drive's line (Enter included) and the watched EOF prefix; the child loads off the volume.
 const RUN_LINE: &[u8] = b"run /apps/MIDDEN.ELF -c help\n";
 const W_RUN: &str = ":: MIDDEN: pipe eof ok=1 ";
 const RUN_MS: u64 = 10_000;
 /// MIDDEN2 (SR120): the shell drives — `(name, keys typed, the watched wire prefix, ms)`, in order. 0x09 Tab, 0x12
 /// Ctrl+R, 0x1F Up (una_abi::KEY_UP), 0x15 Ctrl+U (kill the recalled line before the next line is typed). SHELLABI
-/// (B565): `prog-pipe`, `launch` and `kill` — a child loads off the volume, so they wait RUN_MS.
+/// (B612): `prog-pipe`, `launch` and `kill` — a child loads off the volume, so they wait RUN_MS.
 const DRIVES: [(&str, &[u8], &str, u64); 10] = [
     ("cd", b"cd /apps\n", ":: MIDDEN: cd ok=1 cwd=/apps ::", DRIVE_MS),
     ("complete", b"histo\t", ":: MIDDEN: complete ok=1 word=histo got=history ", DRIVE_MS),
@@ -83,7 +83,7 @@ const DRIVES: [(&str, &[u8], &str, u64); 10] = [
     ("pipe", b"\x15echo alpha beta gamma | wc\n", ":: MIDDEN: pipeline stages=2 last=wc rows=1 ok=1 ::", DRIVE_MS),
 ];
 const DRIVE_MS: u64 = 5_000;
-/// SHELLABI (B565): a program as a pipeline's SECOND stage (Ctrl+U first: the `up` drive left `cd /apps` on the line).
+/// SHELLABI (B612): a program as a pipeline's SECOND stage (Ctrl+U first: the `up` drive left `cd /apps` on the line).
 const PROG_PIPE: &[u8] = b"\x15echo hi | run /apps/MIDDEN.ELF -c cat\n";
 /// MIDDEN2: what the drives leave in the exit status — twelve planned lines (SHELLABI adds echo, run, run, kill), the
 /// last `Host wc`.
@@ -132,7 +132,7 @@ fn wait_line(pid: u64, ms: u64) -> Result<u64, &'static str> {
 
 /// Type `s` into the ring of the program the launch handle `h` names (ARMTESTS: the arch resolves the owner — `slot + 1`
 /// on x86, the ASID on aarch64), one KEY_DOWN per byte (`\n` is Enter, as the router sends it).
-/// SHELLABI (B565): PACED — a byte waits (yielding, up to TYPE_MS) while TYPE_DEPTH events sit unread, so a line longer
+/// SHELLABI (B612): PACED — a byte waits (yielding, up to TYPE_MS) while TYPE_DEPTH events sit unread, so a line longer
 /// than the 32-event ring arrives whole instead of being cut at the ring's end; a stalled program still fails the drive.
 fn type_line(h: u64, s: &[u8]) -> bool {
     let mut ok = true;
@@ -214,7 +214,7 @@ pub fn selftest() {
     if fail.is_none() {
         for (i, l) in [&b"help\n"[..], &b"ls\n"[..]].iter().enumerate() {
             if i == 1 {
-                // RING3PIPE (B562): the Run drive, between `help` and `ls` — the child's output through the pipe.
+                // RING3PIPE (B609): the Run drive, between `help` and `ls` — the child's output through the pipe.
                 crate::serial_line::line_watch_arm(W_RUN);
                 if !type_line(slot, RUN_LINE) {
                     run = "input-ring-full";

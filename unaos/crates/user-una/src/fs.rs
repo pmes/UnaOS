@@ -13,7 +13,7 @@
 //                                  chunk at its offset; UNAMETAL2 (LEDGER SR98): on the default x86 kernel as this
 //                                  program's principal under the volume's write ACL (-EACCES by the ACL's word);
 //                                  UNAIDE2 (LEDGER SR111): PATH_W_UNLINK (`unlink`) and PATH_W_MKDIRS (`mkdir`) too
-//   SYS_PATH_WRITE + PATH_W_RENAME RING3RENAME (rmbp-ledger B561): `rename` — the path to the data's path, a move
+//   SYS_PATH_WRITE + PATH_W_RENAME RING3RENAME (rmbp-ledger B608): `rename` — the path to the data's path, a move
 //                                  anywhere on the native UnaFS root as this program's principal (the object, the
 //                                  folder it leaves and the folder it enters must be writable); FAT refused by name
 //   SYS_ATTR_SET / SYS_ATTR_GET    RING3RENAME: `PathTrash`'s `una:trash-*` record on the object (trash_core's sidecar
@@ -239,7 +239,7 @@ pub fn home() -> String {
     String::from("/")
 }
 
-/// RING3RENAME (rmbp-ledger B561): rename or move `from` to `to` (both absolute) — one SYS_PATH_WRITE with
+/// RING3RENAME (rmbp-ledger B608): rename or move `from` to `to` (both absolute) — one SYS_PATH_WRITE with
 /// PATH_W_RENAME, `to` as the data. A folder moves with everything under it; the object keeps its id, so its owner,
 /// grants and attributes go with it. 0 or -errno (`-ENOTSUP` = an end on FAT, `-EEXIST` = `to` is taken).
 pub fn rename(from: &str, to: &str) -> Result<(), i64> {

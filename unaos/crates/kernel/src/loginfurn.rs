@@ -141,7 +141,7 @@ pub fn ensure_tests() {
     if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
         crate::tests::register("loginfurn", loginfurn_selftest);
     }
-    crate::flightring::ensure_tests(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::echo_ensure(); // FLIGHTRING (B400): `tests flightring`. LOGINECHO (B564): `tests loginecho` — ⚠ LINE-NEUTRAL fold, code before the `//`
+    crate::flightring::ensure_tests(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::echo_ensure(); // FLIGHTRING (B400): `tests flightring`. LOGINECHO (B611): `tests loginecho` — ⚠ LINE-NEUTRAL fold, code before the `//`
 }
 
 /// `tests loginfurn` — what the login opened by itself, and what the console showed when it was opened.

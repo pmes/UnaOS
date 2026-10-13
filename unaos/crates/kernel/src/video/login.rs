@@ -970,7 +970,7 @@ pub fn consume_key(c: u8) -> bool {
     if !KEY_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
-    let echo0 = echo_snapshot(c); // LOGINECHO (B564): taken before the key moves anything — a text edit that moves nothing else is echoed into its field's rect
+    let echo0 = echo_snapshot(c); // LOGINECHO (B611): taken before the key moves anything — a text edit that moves nothing else is echoed into its field's rect
     if (0x20..=0x7e).contains(&c) && PFOCUS.load(Ordering::Relaxed) == 0 && ARMED.swap(false, Ordering::Relaxed) { FORM.lock().focus = Focus::Password; } // LOGINWINDOW: typing on an arrow-picked tile opens its field
     match c {
         b'\t' if power_tab() => {} // DIALOG2: Tab walks Name -> Password -> Sleep -> Restart -> Shut Down -> Name
@@ -2829,7 +2829,7 @@ pub fn settings_rekey_fixture() -> &'static str {
 }
 
 // =================================================================================================
-// LOGINECHO (rmbp-ledger B564) — A KEYSTROKE COSTS ITS FIELD, NOT THE FORM.
+// LOGINECHO (rmbp-ledger B611) — A KEYSTROKE COSTS ITS FIELD, NOT THE FORM.
 //
 // Flight 33 (B557's finding): INPUTSTALL `comp_max_ms=258` was the login screen echoing typed keys, 100-258 ms per
 // key — every key ended in `repaint()`, which redraws the whole dpi-scaled form (roster tiles and avatars, fields,

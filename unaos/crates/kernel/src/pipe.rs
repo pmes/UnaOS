@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! RING3PIPE (rmbp-ledger B562) — the launcher's read of its child's console output (una-abi's RING3PIPE block).
+//! RING3PIPE (rmbp-ledger B609) — the launcher's read of its child's console output (una-abi's RING3PIPE block).
 //!
 //! SR111 UNAIDE2 left it owed: a program UNA.ELF's Run verb or MIDDEN.ELF's `run` launches is DETACHED (the `bg`
 //! body, `SYS_SPAWN_PATH`) and its output went only to the console, never back to the pane that asked. This module is

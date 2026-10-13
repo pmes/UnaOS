@@ -412,7 +412,7 @@ fn write_log(data: &[u8]) -> Result<usize, crate::fs::fat::FatError> {
 /// block device is present, flush the captured log to `/UNAOS.LOG`: the first time storage comes up,
 /// and thereafter whenever the ring has grown since the last successful flush (throttled). Honest-and-
 /// silent: one witness on the first success, one on failure; never panics, never blocks boot.
-pub fn service() { #[cfg(feature = "unafs")] let Some(_inline) = worker::gate() else { return }; // PUMPHOLE2 (B563): the gate decides BEFORE any body work — the worker runs the body; any other caller defers (one count) while the worker is coming, and runs it inline only where no worker can exist (`_inline` names that caller for HIDSTALL until the body returns). POINTERFEEL (B535): once handed, the `flightrec` worker is the only caller that runs the body (LINE-NEUTRAL fold, code first)
+pub fn service() { #[cfg(feature = "unafs")] let Some(_inline) = worker::gate() else { return }; // PUMPHOLE2 (B610): the gate decides BEFORE any body work — the worker runs the body; any other caller defers (one count) while the worker is coming, and runs it inline only where no worker can exist (`_inline` names that caller for HIDSTALL until the body returns). POINTERFEEL (B535): once handed, the `flightrec` worker is the only caller that runs the body (LINE-NEUTRAL fold, code first)
     static LAST_FLUSHED: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX = never flushed
     static ITERS: AtomicUsize = AtomicUsize::new(0);
     static ANNOUNCED: AtomicBool = AtomicBool::new(false);
@@ -646,7 +646,7 @@ pub fn worker_state() -> (usize, u64) {
     (usize::MAX, 0)
 }
 
-/// PUMPHOLE2 (rmbp-ledger B563): is the flight recorder's work running on the CURRENT task as an inline caller (not
+/// PUMPHOLE2 (rmbp-ledger B610): is the flight recorder's work running on the CURRENT task as an inline caller (not
 /// the `flightrec` worker)? HIDSTALL's attribution reads it from the pump core's tick ISR (atomics only): a hold in the
 /// pump's `flight-recorder` step is the recorder's only when this is `true`; otherwise the step ran the gate's one load
 /// and `bootwit::service` (main.rs usb_pump). Without UnaFS there is no worker, so the body is always the caller's.
@@ -677,7 +677,7 @@ mod worker {
     /// The worker's task id (0 = not running): the body's owner once handed.
     static OWNER: AtomicU64 = AtomicU64::new(0);
 
-    // ── PUMPHOLE2 (rmbp-ledger B563) — the hand's state, and the passes the recorder DEFERRED instead of running inline.
+    // ── PUMPHOLE2 (rmbp-ledger B610) — the hand's state, and the passes the recorder DEFERRED instead of running inline.
     /// Not tried: no split published yet, or no caller has reached the gate since.
     const ST_UNTRIED: u8 = 0;
     /// One caller is choosing the core / spawning (any other caller defers meanwhile).

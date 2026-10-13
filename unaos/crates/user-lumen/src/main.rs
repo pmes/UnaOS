@@ -38,14 +38,14 @@
 // last code block of the selected reply. Cmd-C copies the selected reply (default the last), Cmd-V pastes
 // (SYS_CLIP_GET, the clipboard verb). Cmd-K (the desktop's ClearView action) starts a new conversation. Esc
 // cancels an answer in flight (so does the footer's [stop]) and NEVER closes the window (R24). Ctrl+Enter sends too
-// (SHELLABI, rmbp-ledger B565: the HID fold presses it as una-abi KEY_CTRL_ENTER 0x8E, drivers/xhci/mod.rs
+// (SHELLABI, rmbp-ledger B612: the HID fold presses it as una-abi KEY_CTRL_ENTER 0x8E, drivers/xhci/mod.rs
 // hid_key_ascii), exactly as Enter does. Commands: /new /list /open N /rename T /delete /model [M] /system [T|-] /search Q /copy
 // /copycode /help.
 //
 // LUMEN2 — THE CHAT A PERSON USES. Replies STREAM (vein_core's incremental SSE decode, Claude's stream or
 // Gemini's: the conversation's model picks the dialect through vein_core::models) and are drawn as the tokens
 // arrive; a conversations SIDEBAR lists the files LUMENUX's codec defines (`<home>/.config/unaos/lumen/NNNN.md`,
-// vein_core::convo), with new / switch / rename / delete-to-trash (RING3RENAME's PATH_W_RENAME, B561, into
+// vein_core::convo), with new / switch / rename / delete-to-trash (RING3RENAME's PATH_W_RENAME, B608, into
 // `<home>/.Trash/lumen-NNNN.md`); code blocks are highlighted through syntax_core (SR89's grammars) with a
 // [copy] verb on the fence row; tables, task lists and lists render through vein_core::md; the footer shows the
 // context window (`ctx used/limit`, the model table); the model and system prompt are per conversation
@@ -798,7 +798,7 @@ impl App {
             return;
         }
         match k {
-            b'\n' | una_abi::KEY_CTRL_ENTER => {} // SHELLABI (B565): both send — the main loop's `send` arm
+            b'\n' | una_abi::KEY_CTRL_ENTER => {} // SHELLABI (B612): both send — the main loop's `send` arm
             0x08 | 0x7f => {
                 if self.caret > 0 {
                     self.inp.copy_within(self.caret..self.inp_n, self.caret - 1);
@@ -1384,7 +1384,7 @@ fn path_list(path: &[u8], off: u64, out: &mut [u8]) -> i64 {
     sys(una_abi::SYS_PATH_READ, req.as_ptr() as u64, (16 + path.len()) as u64, out.as_mut_ptr() as u64, cap as u64)
 }
 
-/// RING3RENAME (B561): `SYS_PATH_WRITE` with `PATH_W_RENAME` — `from` as the path, `to` as the data.
+/// RING3RENAME (B608): `SYS_PATH_WRITE` with `PATH_W_RENAME` — `from` as the path, `to` as the data.
 fn path_rename(from: &[u8], to: &[u8]) -> i64 {
     let req = unsafe { &mut *core::ptr::addr_of_mut!(REQ) };
     let n = una_abi::PATH_IO_HDR_LEN + from.len() + to.len();
@@ -1538,7 +1538,7 @@ fn switch_to(seq: u16) {
 }
 
 /// LUMEN2: delete-to-trash — rename the conversation's file into `<home>/.Trash/lumen-NNNN.md` (RING3RENAME
-/// B561, PATH_W_RENAME: the object keeps its id, so the Trash can give it back), then open its neighbour.
+/// B608, PATH_W_RENAME: the object keeps its id, so the Trash can give it back), then open its neighbour.
 fn trash_conversation(seq: u16) {
     let a = app();
     if a.hist.f != Files::Path {

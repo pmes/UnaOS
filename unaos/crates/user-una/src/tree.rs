@@ -13,7 +13,7 @@
 //
 // FILE OPERATIONS — UNAIDE2 (LEDGER SR111). `n` new file, `f` new folder, `r` rename (the IDE asks the name in the
 // editor's status line), Backspace/Delete trash. New file = an empty PATH_W_TRUNC write; new folder = fs::mkdir
-// (MKDIRS over `dir/.keep`, then its unlink). RING3RENAME (rmbp-ledger B561) — rename of a file OR a folder is a REAL
+// (MKDIRS over `dir/.keep`, then its unlink). RING3RENAME (rmbp-ledger B608) — rename of a file OR a folder is a REAL
 // rename (`via=rename`): one SYS_PATH_WRITE with PATH_W_RENAME (fs::rename), the object keeps its id, so its
 // attributes, owner and grants follow, and a folder takes its subtree; an end on FAT is refused by name (`-ENOTSUP`).
 // TRASH is trash_core's rule (Matrix, B449) run here over fs::PathTrash: `<home>/.Trash/<name>` (trash_core's
@@ -262,7 +262,7 @@ impl Tree {
         Ok(p)
     }
 
-    /// RING3RENAME (B561): rename the file or folder `path` to `name` in its folder — fs::rename (SYS_PATH_WRITE +
+    /// RING3RENAME (B608): rename the file or folder `path` to `name` in its folder — fs::rename (SYS_PATH_WRITE +
     /// PATH_W_RENAME): the same object under a new name, a folder with its subtree. `Ok(new path)`, or the -errno.
     pub fn rename(&mut self, path: &str, name: &str) -> Result<String, i64> {
         if !name_ok(name) {
@@ -276,7 +276,7 @@ impl Tree {
         Ok(to)
     }
 
-    /// RING3RENAME (B561): trash the selection — `trash_core::trash` over fs::PathTrash, the session home's Trash
+    /// RING3RENAME (B608): trash the selection — `trash_core::trash` over fs::PathTrash, the session home's Trash
     /// (`/home` with no session, trash_core's `Ctx` rule). `Ok((path, its path in the Trash))`; `Err((path, why))` — trash_core's refusal
     /// or the door's errno, in its words.
     pub fn trash(&mut self) -> Result<(String, String), (String, String)> {

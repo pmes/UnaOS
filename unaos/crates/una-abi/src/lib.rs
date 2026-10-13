@@ -511,12 +511,12 @@ pub const KEY_CTRL_SHIFT_TAB: u8 = 0x8B;
 pub const KEY_CTRL_PLUS: u8 = 0x8C;
 /// See [`KEY_CTRL_TAB`].
 pub const KEY_CTRL_MINUS: u8 = 0x8D;
-/// Ctrl+Enter PRESSES as `0x8E` (SHELLABI, rmbp-ledger B565: the same shared HID fold, `HID_KEY_CTRL_ENTER`), the
+/// Ctrl+Enter PRESSES as `0x8E` (SHELLABI, rmbp-ledger B612: the same shared HID fold, `HID_KEY_CTRL_ENTER`), the
 /// next byte after [`KEY_CTRL_MINUS`] and on the same terms: no key and no other fold produces it, an ASCII consumer
 /// ignores it, the RELEASE is the bare Enter (`KEY_UP '\n'`). The main-row Return only (usage 0x28); the keypad
 /// Enter and Alt/Cmd+Enter stay suppressed. Lumen sends on it.
 pub const KEY_CTRL_ENTER: u8 = 0x8E;
-/// A bare PageUp PRESSES (and releases) as `0x8F`, PageDown as `0x90` (SHELLABI B565: the HID table's rows 0x4B / 0x4E,
+/// A bare PageUp PRESSES (and releases) as `0x8F`, PageDown as `0x90` (SHELLABI B612: the HID table's rows 0x4B / 0x4E,
 /// which held no byte). They are NOT C0 codes like the arrows: every C0 byte is already taken (the arrows 0x1C..=0x1F,
 /// Esc, BS/Tab/LF/CR, and Ctrl+letter's folds 0x01..=0x1A), so they take the next bytes of the chord range, whose
 /// terms they share (no other key produces them; an ASCII consumer ignores them). Shift does not change them — as
@@ -2580,7 +2580,7 @@ pub const PREF_SUB_MAX: usize = 4;
 pub const MRECV_NOWAIT: u64 = 0x4E4F_5741_4954;
 
 // =================================================================================================
-// RING3RENAME (rmbp-ledger B561; SR111 UNAIDE2's two refusals the spec, SR98 UNAMETAL2's write ACL the model) — a
+// RING3RENAME (rmbp-ledger B608; SR111 UNAIDE2's two refusals the spec, SR98 UNAMETAL2's write ACL the model) — a
 // path rename/move for ring 3, as a FLAG of `SYS_PATH_WRITE`, not a new number. The SELFDIAG request already carries
 // two variable fields after its header — `[path]` then `[data]` — and a rename needs exactly two strings, so the
 // layout admits it unchanged:
@@ -2604,7 +2604,7 @@ pub const MRECV_NOWAIT: u64 = 0x4E4F_5741_4954;
 /// RING3RENAME: `SYS_PATH_WRITE` flag — rename `path` to the path carried as `data` (see the block above).
 pub const PATH_W_RENAME: u16 = 1 << 4;
 const _: () = assert!(PATH_W_RENAME & (PATH_W_TRUNC | PATH_W_MKDIRS | PATH_W_UNLINK | PATH_R_LIST) == 0);
-// RING3PIPE (rmbp-ledger B562; SR111 UNAIDE2's owed: "a launched program runs detached and its output does not come
+// RING3PIPE (rmbp-ledger B609; SR111 UNAIDE2's owed: "a launched program runs detached and its output does not come
 // back to the pane, because ring 3 has no pipe") — a launcher reads its child's console output. ONE verb pair:
 //
 //   create   `SYS_SPAWN_PATH(path_ptr, path_len, argv_ptr, argc | SPAWN_PIPE)` — the flag rides argc's high half
@@ -2622,7 +2622,7 @@ const _: () = assert!(PATH_W_RENAME & (PATH_W_TRUNC | PATH_W_MKDIRS | PATH_W_UNL
 //            -EBADF = no live pipe with that pid; -EACCES = the pipe is another program's (only the launcher —
 //                the slot and generation that asked for it — reads it; a capability, not a name).
 //            `buf_len == 0` consumes nothing and answers the DROPPED byte count (>= 0).
-//   write    SHELLABI (rmbp-ledger B565): `SYS_PIPE_WRITE(pid, buf_ptr, buf_len)` -> n > 0 bytes taken, each one
+//   write    SHELLABI (rmbp-ledger B612): `SYS_PIPE_WRITE(pid, buf_ptr, buf_len)` -> n > 0 bytes taken, each one
 //            delivered into the CHILD's input ring as an `INPUT_EV_KEY_DOWN` carrying that byte — the event a key
 //            press is, read by the child's ordinary `SYS_INPUT_POLL` drain, so a program reads a pipeline's input
 //            exactly as it reads the keyboard. At most one input ring's worth is taken per call (the rest is the
@@ -2659,9 +2659,9 @@ pub const SPAWN_FLAGS: u64 = SPAWN_PIPE;
 pub const PIPE_RING_BYTES: usize = 64 * 1024;
 /// Pipes live at once, system-wide.
 pub const PIPE_MAX: usize = 8;
-/// SHELLABI (B565): `SYS_PIPE_WRITE(pid, buf_ptr, buf_len)` — bytes into a SPAWN_PIPE child's input ring (see the block above).
+/// SHELLABI (B612): `SYS_PIPE_WRITE(pid, buf_ptr, buf_len)` — bytes into a SPAWN_PIPE child's input ring (see the block above).
 pub const SYS_PIPE_WRITE: u64 = 71; // after RING3PIPE's SYS_PIPE_READ (70)
-/// SHELLABI (B565): `SYS_KILL(pid)` — kill one of the caller's own SPAWN_PIPE children (see the block above).
+/// SHELLABI (B612): `SYS_KILL(pid)` — kill one of the caller's own SPAWN_PIPE children (see the block above).
 pub const SYS_KILL: u64 = 72; // after SHELLABI's SYS_PIPE_WRITE (71)
 /// SHELLABI: the end-of-input byte a zero-length `SYS_PIPE_WRITE` delivers — ASCII EOT, the byte Ctrl+D presses.
 pub const KEY_EOT: u8 = 0x04;

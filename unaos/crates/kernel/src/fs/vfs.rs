@@ -3778,7 +3778,7 @@ fn tx_boot_quiet(us: u64) -> bool {
 }
 
 // =================================================================================================
-// RING3RENAME (rmbp-ledger B561) — TAIL-APPENDED (this file's panic Locations are line-pinned). The ring-3 face of
+// RING3RENAME (rmbp-ledger B608) — TAIL-APPENDED (this file's panic Locations are line-pinned). The ring-3 face of
 // [`MountTable::rename`]: `SYS_PATH_WRITE` with `una_abi::PATH_W_RENAME` (layout in una-abi's RING3RENAME block),
 // called by x86's `path_write_as` (the default kernel) and `selfdiag::path_fulfil` (x86 and aarch64) — one body, so
 // the arches cannot drift. The mount table already owns the primitive (the cross-volume and cross-mount-root

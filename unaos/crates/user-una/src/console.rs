@@ -13,7 +13,7 @@
 // IDE to quit (returned as `Act::Quit`, the window is the IDE's), and the wire tag is `:: UNA: plan=`.
 //
 // UNAIDE2 (LEDGER SR111): `run` is the door the IDE's Run verb (Ctrl+R, main.rs) uses — a `.run` line or the typed
-// line goes through the same plan. RING3PIPE (rmbp-ledger B562): a launch asks SYS_SPAWN_PATH for a pipe
+// line goes through the same plan. RING3PIPE (rmbp-ledger B609): a launch asks SYS_SPAWN_PATH for a pipe
 // (`una_abi::SPAWN_PIPE`); the program still runs detached, and its console output comes back through
 // `SYS_PIPE_READ(pid)` — `pump` (called once per frame by main.rs) drains every open pipe into this scrollback as the
 // bytes arrive, one row per line, and closes it at EOF (the child exited and the ring is empty). A kernel that does
@@ -645,7 +645,7 @@ impl Console {
     }
 }
 
-/// RING3PIPE (B562): `SYS_SPAWN_PATH` with `SPAWN_PIPE` on argc's high half — the pid names the child's output pipe.
+/// RING3PIPE (B609): `SYS_SPAWN_PATH` with `SPAWN_PIPE` on argc's high half — the pid names the child's output pipe.
 fn spawn_piped(path: &str, argv: &[&str]) -> i64 {
     let descs: Vec<una_abi::SpawnArg> = argv.iter().map(|a| una_abi::SpawnArg { ptr: a.as_ptr() as u64, len: a.len() as u64 }).collect();
     sys(una_abi::SYS_SPAWN_PATH, path.as_ptr() as u64, path.len() as u64, descs.as_ptr() as u64, descs.len() as u64 | una_abi::SPAWN_PIPE)
