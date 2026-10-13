@@ -920,6 +920,13 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             None if is_neutral_keyword(value) => {}
             None => H::record_css(&format!("writing-mode-value:{}", clip(value))),
         },
+        // AETHERSTYLE3C (SR122): css-writing-modes-4 §9.1 (`-webkit-text-combine: horizontal` is the legacy `all`).
+        "text-combine-upright" | "-webkit-text-combine" | "-ms-text-combine-horizontal" => match value {
+            "all" | "horizontal" => style.paint.text_combine = Some(true),
+            "none" => style.paint.text_combine = Some(false),
+            v if is_neutral_keyword(v) => {}
+            v => H::record_css(&format!("text-combine-upright-value:{}", clip(v))),
+        },
         "text-orientation" => match value {
             "mixed" => style.paint.text_orientation = Some(0),
             // AETHERSTYLE3B (SR115): painted upright (`writing::upright`).
@@ -2447,7 +2454,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
-        deco_clone,
+        deco_clone, text_combine,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {

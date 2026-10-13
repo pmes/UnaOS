@@ -836,6 +836,7 @@ fn property_supported(prop: &str) -> bool {
             | "animation-direction" | "animation-fill-mode" | "animation-play-state"
             // AETHERSTYLE3C (SR122)
             | "column-span" | "box-decoration-break" | "-webkit-box-decoration-break"
+            | "text-combine-upright" | "-webkit-text-combine"
     )
 }
 
