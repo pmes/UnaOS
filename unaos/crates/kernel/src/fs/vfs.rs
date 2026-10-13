@@ -3692,7 +3692,7 @@ impl TxCost {
     /// After the hold: print the line if the transaction took longer than [`TX_LINE_MS`].
     fn report(&self, what: &str, path: &str) {
         let t2 = crate::hidstall::now_us();
-        if self.t0 == 0 || t2.saturating_sub(self.t0) <= TX_LINE_MS * 1000 {
+        if self.t0 == 0 || t2.saturating_sub(self.t0) <= TX_LINE_MS * 1000 || tx_boot_quiet(t2.saturating_sub(self.t0)) { // SMALLFIX10 (B539 item 7): the boot's lines are the running max only (file tail)
             return;
         }
         let (f, h) = crate::fs::unafs::tx_io();
@@ -3749,4 +3749,30 @@ pub fn listing_window(ents: &[DirEnt], off: u64, cap: usize) -> Vec<u8> {
     let o = (off as usize).min(all.len());
     let n = (all.len() - o).min(cap);
     all[o..o + n].to_vec()
+}
+
+// =================================================================================================
+// SMALLFIX10 (rmbp-ledger B539 item 7, QUIETBOOT) — TAIL-APPENDED (this file's panic Locations are line-pinned).
+// Flight 31's `:: QUIETBOOT: top=[BPACE:59,igpu-dpy:35,[vfs]:30,…]`: 17 of the 30 `[vfs]` lines before `:: BOOT:`
+// were VFSTXCOST's `[vfs] tx` (the font faces' reads, 21-197 ms each, every one over `TX_LINE_MS`). Until the BOOT
+// line is said, a tx prints only when it is SLOWER than every earlier boot tx (the running max: f31 would print 23,
+// 116, 197 — three lines that still name the worst); the rest are not printed. From the BOOT line on, every tx over
+// `TX_LINE_MS` prints as before (JOBSCAN's and FILETYPES' reads, the ones VFSTXCOST is read for, are after it).
+// =================================================================================================
+
+/// SMALLFIX10: the boot's slowest tx so far (us).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+static TX_BOOT_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SMALLFIX10: `true` = hold this `[vfs] tx` line back (the boot is still running and `us` is no new maximum).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn tx_boot_quiet(us: u64) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if crate::bootpace::boot_lines().is_some() {
+        return false;
+    }
+    if TX_BOOT_MAX_US.fetch_max(us, Relaxed) < us {
+        return false;
+    }
+    true
 }
