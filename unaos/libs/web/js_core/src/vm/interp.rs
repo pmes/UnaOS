@@ -512,6 +512,10 @@ impl Vm {
                 }
                 Op::GetProp(k) => {
                     let o = self.pop();
+                    if let Some(v) = self.ic_get_prop(fi, pc, k, &o)? {
+                        self.stack.push(v);
+                        continue;
+                    }
                     let key = PropertyKey::from_js(self.frames[fi].code.str(k).clone());
                     let v = self.get_v(&o, &key)?;
                     self.stack.push(v);
@@ -519,6 +523,10 @@ impl Vm {
                 Op::SetProp(k) => {
                     let v = self.pop();
                     let o = self.pop();
+                    if self.ic_set_prop(fi, pc, k, &o, &v) {
+                        self.stack.push(v);
+                        continue;
+                    }
                     let key = PropertyKey::from_js(self.frames[fi].code.str(k).clone());
                     let strict = self.frames[fi].code.strict;
                     self.put_value(&o, key, v.clone(), strict)?;

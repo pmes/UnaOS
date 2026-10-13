@@ -4,6 +4,7 @@
 
 pub mod collections;
 pub mod heap;
+pub mod ic;
 pub mod interp;
 pub mod module;
 pub mod names;
@@ -163,6 +164,8 @@ pub struct Vm {
     pub rejected_unhandled: Vec<Obj>,
     /// AETHERPERF (SR118): the root hidden class every object allocated through `alloc` starts from.
     pub root_shape: Rc<propmap::Shape>,
+    /// AETHERPERF (SR118): inline-cache slots of the named property get / set sites (vm/ic.rs).
+    pub ic: ic::IcTable,
 }
 
 pub(crate) fn wk_sym(desc: &str) -> Sym {
@@ -224,6 +227,7 @@ impl Vm {
             track_rejections: false,
             rejected_unhandled: Vec::new(),
             root_shape: propmap::Shape::root(),
+            ic: ic::IcTable::default(),
         };
         let r = vm.create_realm();
         vm.cur_realm = r;
