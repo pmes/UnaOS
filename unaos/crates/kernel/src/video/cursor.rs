@@ -546,7 +546,7 @@ pub fn wedge9_rollup(scope: &str) {
     serial_println!(
         "[wedge9] sprite-claim scope={} refused={} masked={} retried={} owed={} serviced={} -> {}",
         scope, refused, masked, retried, u8::from(owed), serviced, verdict
-    ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] ptrpaint_rollup(scope); // PTRPAINT (B141) — chained here rather than given its own call site, on the `[cursor8]` -> `[cursor11]` -> `[wedge9]` precedent this block already states: it is this pass's contention story one DECISION further on, and a reader comparing `nowait_owed=` against `refused=`/`retried=` on the line above is comparing like with like. ⚠ SAME-LINE fold, line-NEUTRAL: `cursor.rs` is compiled into the knob-off image on both arches and panic `Location` records embed line numbers, so the whole of B141 is a tail block plus this one token. The append is BEFORE the line's first `//` (LEDGER P7) and cfg-gated, so the knob-off image cannot move.
+    ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] ptrpaint_rollup(scope); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] ghost_rollup(scope); // PTRPAINT (B141) — chained here rather than given its own call site, on the `[cursor8]` -> `[cursor11]` -> `[wedge9]` precedent this block already states: it is this pass's contention story one DECISION further on, and a reader comparing `nowait_owed=` against `refused=`/`retried=` on the line above is comparing like with like. ⚠ SAME-LINE fold, line-NEUTRAL: `cursor.rs` is compiled into the knob-off image on both arches and panic `Location` records embed line numbers, so the whole of B141 is a tail block plus this one token. The append is BEFORE the line's first `//` (LEDGER P7) and cfg-gated, so the knob-off image cannot move.
 }
 
 /// CURSOR-5 — [`Sprite::epoch`], mirrored where a lock-free reader can see it.
@@ -3789,7 +3789,7 @@ pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> Co
     for w in 0..MASK_WORDS {
         ov.covered.0[w] |= mine.0[w];
     }
-    out.taken = taken; #[cfg(all(target_arch = "x86_64", feature = "wc"))] ghost_note_composed(&plan); // TWOCURSORS (B542) — publish the box this layer just carried an arrow for, lock-free, so a tail that cannot claim the overlay still knows where an orphan can stand. ⚠ SAME-LINE fold, line-NEUTRAL; block at the file tail.
+    out.taken = taken; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] ghost_note_composed(&plan); // TWOCURSORS (B542) — publish the box this layer just carried an arrow for, lock-free, so a tail that cannot claim the overlay still knows where an orphan can stand. ⚠ SAME-LINE fold, line-NEUTRAL; block at the file tail.
     out.missed = missed;
     out
 }
@@ -3840,7 +3840,7 @@ pub fn adopt_overlay() {
     // CURSOR-6 — swap, not load: the flag is per-pass state and the tail is the one place that can
     // retire it. Reading it without clearing would make one dropped clear poison every later pass;
     // clearing it without reading would lose the only evidence the pass produced.
-    let uncover_lost = UNCOVER_LOST.swap(false, Ordering::Relaxed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let ghost = GHOST_COMPOSED.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let mut ghost_box: Option<(usize, usize, usize, usize)> = None; // TWOCURSORS (B542) — take this pass's composed-box mirror; `ghost_box` is the orphan rect owed a repair at the tail. ⚠ SAME-LINE fold, line-NEUTRAL.
+    let uncover_lost = UNCOVER_LOST.swap(false, Ordering::Relaxed); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let ghost = GHOST_COMPOSED.swap(0, Ordering::AcqRel); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let mut ghost_box: Option<(usize, usize, usize, usize)> = None; // TWOCURSORS (B542) — take this pass's composed-box mirror; `ghost_box` is the orphan rect owed a repair at the tail. ⚠ SAME-LINE fold, line-NEUTRAL.
     let mut sp = match claim() {
         Ok(l) => l,
         Err(_) => {
@@ -3869,7 +3869,7 @@ pub fn adopt_overlay() {
                 }
                 Err(_) => owe_overlay_close(),
             }
-            #[cfg(all(target_arch = "x86_64", feature = "wc"))] ghost_on_refuse(ghost); return; // TWOCURSORS (B542) — the sprite claim was refused and the coverage install discarded, so an arrow the layer delivered has no owner: damage its box so the window re-presents over it. ⚠ SAME-LINE fold, line-NEUTRAL.
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] ghost_on_refuse(ghost); return; // TWOCURSORS (B542) — the sprite claim was refused and the coverage install discarded, so an arrow the layer delivered has no owner: damage its box so the window re-presents over it. ⚠ SAME-LINE fold, line-NEUTRAL.
         }
     };
     let restored = {
@@ -3924,7 +3924,7 @@ pub fn adopt_overlay() {
                 // cut suppressed `adopt_incoh` whenever a lost clear coincided, which would have hidden
                 // a real CURSOR-5 incoherence behind a CURSOR-6 one — a silent counter, which is exactly
                 // the failure mode that made P65v2 unreadable.
-                let coherent = c5_coherent && !uncover_lost; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { ghost_box = ghost_restore(&ov, c5_coherent); } // TWOCURSORS (B542) — an install about to be DECLINED for a session that no longer describes the live sprite: take back the arrow the layer delivered, colour-guarded, from the layer save, before the refresh below draws the live one. ⚠ SAME-LINE fold, line-NEUTRAL.
+                let coherent = c5_coherent && !uncover_lost; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { ghost_box = ghost_restore(&ov, c5_coherent); } // TWOCURSORS (B542) — an install about to be DECLINED for a session that no longer describes the live sprite: take back the arrow the layer delivered, colour-guarded, from the layer save, before the refresh below draws the live one. ⚠ SAME-LINE fold, line-NEUTRAL.
                 if coherent {
                     // Install the layer-derived save-under for every pixel a present delivered. Those
                     // pixels are on the panel already — this is bookkeeping, not painting, which is what
@@ -3974,7 +3974,7 @@ pub fn adopt_overlay() {
             // coverage install is discarded — CURSOR-9's documented residual, the same one WEDGE-9's
             // refusal at the sprite claim above accepts.
             Err(_) => {
-                owe_overlay_close(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { ghost_box = ghost_refused_box(ghost); } // TWOCURSORS (B542) — overlay refused: no `ov.saved` to restore from, so the composed box is handed to `repair`. ⚠ SAME-LINE fold, line-NEUTRAL.
+                owe_overlay_close(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { ghost_box = ghost_refused_box(ghost); } // TWOCURSORS (B542) — overlay refused: no `ov.saved` to restore from, so the composed box is handed to `repair`. ⚠ SAME-LINE fold, line-NEUTRAL.
                 false
             }
         };
@@ -4025,7 +4025,7 @@ pub fn adopt_overlay() {
     if let Some((px, py)) = armed_at {
         serial_println!("[cursor] armed x={} y={}", px, py);
     }
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] repair(ghost_box); repair(restored); // TWOCURSORS (B542) — the orphan rect (if any) handed back like a restored one: windows damaged, desktop rect queued. ⚠ SAME-LINE fold, line-NEUTRAL.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] repair(ghost_box); repair(restored); // TWOCURSORS (B542) — the orphan rect (if any) handed back like a restored one: windows damaged, desktop rect queued. ⚠ SAME-LINE fold, line-NEUTRAL.
 }
 
 /// CURSOR-4 — put back the sprite pixels that are still off the panel, saving each from the FRONT.
@@ -5026,7 +5026,8 @@ pub fn crosshair() -> bool {
 // # The witness
 //
 // `[cursorghost] orphan scope=… declined=<n> restored_px=<n> restored_on_refuse=<n> damaged=<n> -> …`,
-// chained off `[ptrpaint]` on `[wedge9]`'s cadence. `declined` — tails that declined an install with
+// chained off `[ptrpaint]` on `[wedge9]`'s cadence (CURSORARM B548: aarch64 `desktop_firmware`, which has no
+// `[ptrpaint]`, chains it straight off `wedge9_rollup`'s closing line — same cadence). `declined` — tails that declined an install with
 // arrow pixels delivered; `restored_px` — pixels taken back from the layer save; `restored_on_refuse` —
 // refused tails whose composed box was handed to `repair`; `damaged` — orphan boxes handed back, which
 // must equal `declined + restored_on_refuse`. `QUIET` when no orphan was ever made; `RESTORED` when
@@ -5036,24 +5037,24 @@ pub fn crosshair() -> bool {
 /// or 0. Written by [`ghost_note_composed`] from `compose_into` (overlay loan held, session open) and
 /// swapped to 0 by `adopt_overlay`, the session's only closer, before it closes — so it describes
 /// exactly the pass being closed.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static GHOST_COMPOSED: AtomicU64 = AtomicU64::new(0);
 
 /// TWOCURSORS — declined installs whose session had arrow pixels delivered (loans held).
-#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 static GH_DECLINED: AtomicU64 = AtomicU64::new(0);
 /// TWOCURSORS — orphan arrow pixels put back from the layer save.
-#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 static GH_PX: AtomicU64 = AtomicU64::new(0);
 /// TWOCURSORS — refused tails whose composed box was handed to [`repair`].
-#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 static GH_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// TWOCURSORS — orphan boxes handed back (both arms).
-#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 static GH_DAMAGED: AtomicU64 = AtomicU64::new(0);
 
 /// TWOCURSORS — `compose_into` delivered `taken > 0` arrow pixels into a layer at `plan`'s geometry.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn ghost_note_composed(plan: &Plan) {
     if let Some(p) = cb_pack(plan.bx, plan.by, plan.bw, plan.bh) {
         GHOST_COMPOSED.store(p, Ordering::Release);
@@ -5061,7 +5062,7 @@ fn ghost_note_composed(plan: &Plan) {
 }
 
 /// TWOCURSORS — count one orphan box handed to [`repair`].
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn ghost_count_damaged() {
     #[cfg(feature = "witness")]
     GH_DAMAGED.fetch_add(1, Ordering::Relaxed);
@@ -5075,7 +5076,7 @@ fn ghost_count_damaged() {
 /// `undraw_locked`'s FLICKER-2 restore writes the panel from. `c5_coherent` alone and not `coherent`:
 /// a decline caused only by `uncover_lost` has the session at the live sprite's own geometry and
 /// epoch, so the arrow the layer delivered IS the live sprite's and `refresh_locked` restores it.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn ghost_restore(ov: &Overlay, c5_coherent: bool) -> Option<(usize, usize, usize, usize)> {
     if c5_coherent || !ov.session || ov.covered.0.iter().all(|&w| w == 0) {
         return None;
@@ -5111,7 +5112,7 @@ fn ghost_restore(ov: &Overlay, c5_coherent: bool) -> Option<(usize, usize, usize
 
 /// TWOCURSORS — a refused tail (overlay claim refused under a held sprite): the composed box, if this
 /// pass composed one, for [`repair`]. No pixel is written — there is no `ov.saved` in hand.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn ghost_refused_box(ghost: u64) -> Option<(usize, usize, usize, usize)> {
     if ghost == 0 {
         return None;
@@ -5125,13 +5126,13 @@ fn ghost_refused_box(ghost: u64) -> Option<(usize, usize, usize, usize)> {
 /// TWOCURSORS — the SPRITE claim was refused at the tail: hand the composed box to [`repair`] now,
 /// with no loan held (the early return skips the function's own `repair`). `repair` takes `TABLE`
 /// through WEDGE-7's bounded micro-guard, the same call `adopt_overlay` already makes at its end.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn ghost_on_refuse(ghost: u64) {
     repair(ghost_refused_box(ghost));
 }
 
 /// TWOCURSORS — the `[cursorghost]` rollup. See the block header for each field.
-#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn ghost_rollup(scope: &str) {
     let declined = GH_DECLINED.load(Ordering::Relaxed);
     let px = GH_PX.load(Ordering::Relaxed);
