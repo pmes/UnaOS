@@ -211,6 +211,8 @@ pub mod console_view;
 // AETHERCHROME (SR84): the browser chrome's GTK face.
 pub mod tab_strip;
 pub mod url_bar;
+// REALSENSE (SR92, R112): Sonde's GTK face — the probe pane (depth ramp beside colour) as surface + input + resize.
+pub mod probe_view;
 
 /// AETHERCHROME (SR84): the Aether browser window — the tab strip, the address row with the bookmark
 /// bar, and the page with its find bar / status line / downloads overlays — and the browser's keyboard

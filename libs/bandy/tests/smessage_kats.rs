@@ -456,6 +456,73 @@ kat!(
     r#"{"MediaError":{"url":"u","error":"no such file"}}"#
 );
 
+// --- SONDE (Probes; REALSENSE, LEDGER SR92) ---
+// The four probe verbs, frozen. ProbeList's ask is the empty list; ProbeClose is both the request and
+// Sonde's "stopped" answer. ProbeFrame's floats are chosen exactly representable or shortest-printing
+// (0.001 prints as 0.001 through serde_json's f32 path), so the golden is the wire, not a rounding.
+
+kat!(kat_probe_list_ask, SMessage::ProbeList { probes: vec![] }, r#"{"ProbeList":{"probes":[]}}"#);
+kat!(
+    kat_probe_list,
+    SMessage::ProbeList {
+        probes: vec![(
+            "replay:d435i".to_string(),
+            "Intel RealSense D435i (replay)".to_string(),
+            vec!["depth".to_string(), "ir".to_string(), "color".to_string()],
+        )],
+    },
+    r#"{"ProbeList":{"probes":[["replay:d435i","Intel RealSense D435i (replay)",["depth","ir","color"]]]}}"#
+);
+kat!(
+    kat_probe_open,
+    SMessage::ProbeOpen { id: "replay:d435i".to_string(), stream: "depth".to_string(), width: 848, height: 480, fps: 30 },
+    r#"{"ProbeOpen":{"id":"replay:d435i","stream":"depth","width":848,"height":480,"fps":30}}"#
+);
+kat!(
+    kat_probe_frame_depth,
+    SMessage::ProbeFrame {
+        id: "replay:d435i".to_string(),
+        stream: "depth".to_string(),
+        format: "Z16".to_string(),
+        seq: 7,
+        timestamp_us: 233_331,
+        width: 2,
+        height: 1,
+        stride: 4,
+        depth_scale: 0.001,
+        intrinsics: Some([3.0, 3.0, 1.0, 0.5]),
+        data: vec![0xE8, 0x03, 0x00, 0x00],
+    },
+    r#"{"ProbeFrame":{"id":"replay:d435i","stream":"depth","format":"Z16","seq":7,"timestamp_us":233331,"width":2,"height":1,"stride":4,"depth_scale":0.001,"intrinsics":[3.0,3.0,1.0,0.5],"data":[232,3,0,0]}}"#
+);
+kat!(
+    kat_probe_frame_color,
+    SMessage::ProbeFrame {
+        id: "replay:d435i".to_string(),
+        stream: "color".to_string(),
+        format: "YUY2".to_string(),
+        seq: 0,
+        timestamp_us: 0,
+        width: 2,
+        height: 1,
+        stride: 4,
+        depth_scale: 0.0,
+        intrinsics: None,
+        data: vec![16, 128, 235, 128],
+    },
+    r#"{"ProbeFrame":{"id":"replay:d435i","stream":"color","format":"YUY2","seq":0,"timestamp_us":0,"width":2,"height":1,"stride":4,"depth_scale":0.0,"intrinsics":null,"data":[16,128,235,128]}}"#
+);
+kat!(
+    kat_probe_close,
+    SMessage::ProbeClose { id: "replay:d435i".to_string(), stream: "depth".to_string() },
+    r#"{"ProbeClose":{"id":"replay:d435i","stream":"depth"}}"#
+);
+kat!(
+    kat_probe_close_all,
+    SMessage::ProbeClose { id: "replay:d435i".to_string(), stream: String::new() },
+    r#"{"ProbeClose":{"id":"replay:d435i","stream":""}}"#
+);
+
 // --- EDITOR (The Code Pane) ---
 
 kat!(
@@ -1223,6 +1290,10 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::MediaFrame { .. } => "MediaFrame",
         SMessage::MediaEnded { .. } => "MediaEnded",
         SMessage::MediaError { .. } => "MediaError",
+        SMessage::ProbeList { .. } => "ProbeList", // REALSENSE (SR92): the four probe verbs
+        SMessage::ProbeOpen { .. } => "ProbeOpen",
+        SMessage::ProbeFrame { .. } => "ProbeFrame",
+        SMessage::ProbeClose { .. } => "ProbeClose",
         SMessage::EditorLoad { .. } => "EditorLoad",
         SMessage::EditorEdited { .. } => "EditorEdited",
         SMessage::EditorSaveRequest => "EditorSaveRequest",

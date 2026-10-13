@@ -1,0 +1,23 @@
+# =====================================================================
+# CRATE: handlers/sonde/Cargo.toml
+# DESCRIPTION: Sonde, the handler of PROBES (R112; CODEX Amendment IV
+#              drafted for Peter's signature). Library crate: the probe
+#              service on the Bandy Synapse (ProbeList / ProbeOpen /
+#              ProbeFrame / ProbeClose), the replay probe, and the pane
+#              model (R108: a surface, an input stream, a resize) that
+#              quartzite's GTK face (probe_view.rs) and a future UnaOS
+#              face both drive. REALSENSE, LEDGER SR92.
+# =====================================================================
+
+[package]
+name = "sonde"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+bandy = { path = "../../libs/bandy" }
+# PROBECORE (R112): the frame / depth / IMU model both rings link.
+probe_core = { path = "../../unaos/libs/media/probe_core" }
+tokio = { version = "1.53", features = ["rt", "sync", "time", "macros"] }
+log = "0.4"
