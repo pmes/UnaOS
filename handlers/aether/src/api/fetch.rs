@@ -154,6 +154,85 @@ pub fn http_sync(req: HttpReq) -> Result<SyncResponse, String> {
     .map_err(|_| "fetch thread panicked".to_string())?
 }
 
+/// AETHERFRAMES (SR83): a nested document's response — what "navigate" fetches for an `<iframe>`.
+pub struct SubDocument {
+    /// The response URL (after redirects).
+    pub url: String,
+    /// The MIME type essence (lowercase, no parameters); empty when the response named none.
+    pub content_type: String,
+    pub status: u16,
+    pub body: String,
+}
+
+/// The MIME essence of a `Content-Type` value.
+fn essence(v: &str) -> String {
+    v.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+/// A local file's type from its extension (what a file server would send).
+fn mime_for_path(path: &str) -> String {
+    let p = path.split(['?', '#']).next().unwrap_or(path).to_ascii_lowercase();
+    let ext = p.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" | "htm" => "text/html",
+        "xhtml" | "xht" => "application/xhtml+xml",
+        "xml" => "text/xml",
+        "svg" => "image/svg+xml",
+        "txt" => "text/plain",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "js" => "text/javascript",
+        "css" => "text/css",
+        _ => "text/html",
+    }
+    .to_string()
+}
+
+/// Fetches the resource an `<iframe>` navigates to (HTML §7.4.5 "populating a session history
+/// entry", the fetch half): `about:blank` is the empty HTML document, `file:` and `data:` come from
+/// disk / the URL itself (`js::host::fetch_script_text`), `http(s):` is one synchronous GET on
+/// [`http_sync`] (the shared cookie jar; redirects followed). The body is decoded as UTF-8 (lossily).
+pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
+    let bare = url.split(['#', '?']).next().unwrap_or(url);
+    if bare == "about:blank" || bare == "about:srcdoc" {
+        return Ok(SubDocument { url: url.to_string(), content_type: "text/html".into(), status: 200, body: String::new() });
+    }
+    if url.starts_with("about:") {
+        return Err(format!("unsupported about: URL {url}"));
+    }
+    if let Some(rest) = url.strip_prefix("data:") {
+        let meta = rest.split(',').next().unwrap_or("");
+        let ct = essence(meta.trim_end_matches(";base64"));
+        let body = crate::js::host::fetch_script_text(url)?;
+        return Ok(SubDocument { url: url.to_string(), content_type: if ct.is_empty() { "text/plain".into() } else { ct }, status: 200, body });
+    }
+    if url.starts_with("file://") {
+        let body = crate::js::host::fetch_script_text(url)?;
+        return Ok(SubDocument { url: url.to_string(), content_type: mime_for_path(url), status: 200, body });
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let r = http_sync(HttpReq {
+            method: "GET".into(),
+            url: url.to_string(),
+            headers: vec![("Accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into())],
+            body: Vec::new(),
+            redirect: "follow".into(),
+            timeout_ms: 30_000,
+        })?;
+        let mut ct = String::new();
+        for kv in r.headers.chunks(2) {
+            if kv.len() == 2 && kv[0].eq_ignore_ascii_case("content-type") {
+                ct = essence(&kv[1]);
+            }
+        }
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        let final_url = if r.url.is_empty() { url.to_string() } else { r.url };
+        return Ok(SubDocument { url: final_url, content_type: ct, status: r.status, body });
+    }
+    Err(format!("unsupported URL scheme: {url}"))
+}
+
 /// The WHATWG shapes: AbortSignal/AbortController, Blob, Headers, the Streams Standard's default
 /// ReadableStream, Request, Response and `fetch`.
 pub const PRELUDE: &str = r#"

@@ -1902,6 +1902,39 @@ pub fn render_frame(
                     }
                 }
 
+                // AETHERFRAMES (SR83): an `<iframe>` is a replaced box whose content is its nested
+                // document's painted surface (`frames::child_surface`, painted by the engine before this
+                // frame), composed 1:1 into the content box from its top-left, clipped to it.
+                if tag == "iframe" {
+                    if let Some(cs) = crate::frames::child_surface(dom_node) {
+                        let (pad, bord) = (layout_box.padding, layout_box.border);
+                        let cx = box_sx + pad.left + bord.left;
+                        let cy = box_sy + pad.top + bord.top;
+                        let cw = (bw - pad.left - bord.left - pad.right - bord.right).max(0.0).min(cs.width as f32);
+                        let ch = (bh - pad.top - bord.top - pad.bottom - bord.bottom).max(0.0).min(cs.height as f32);
+                        let x0 = cx.max(0.0) as u32;
+                        let y0 = cy.max(0.0) as u32;
+                        let x1 = ((cx + cw).max(0.0) as u32).min(width);
+                        let y1 = ((cy + ch).max(0.0) as u32).min(height);
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                    continue;
+                                }
+                                let u = (x as f32 - cx).max(0.0) as u32;
+                                let v = (y as f32 - cy).max(0.0) as u32;
+                                if u >= cs.width || v >= cs.height {
+                                    continue;
+                                }
+                                let i = ((v * cs.width + u) * 4) as usize;
+                                if let Some(p) = cs.pixels.get(i..i + 4) {
+                                    put_px(surface, width, x, y, (p[2], p[1], p[0]));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Form controls get a UA border and their value text.
                 let is_control = matches!(tag, "input" | "textarea" | "select" | "button");
                 let kind = crate::layout::control_kind(dom_node);

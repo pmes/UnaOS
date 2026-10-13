@@ -86,11 +86,13 @@ pub fn clock_frozen() -> bool {
     CLOCK_FROZEN.with(Cell::get)
 }
 
-/// Rewinds the clock for a new page (timers die with the previous page's VM).
+/// Rewinds the clock for a new page (timers die with the previous page's VM; so does the previous
+/// page's browsing-context tree — AETHERFRAMES).
 pub fn reset() {
     CLOCK_OFFSET.with(|o| o.set(0));
     CLOCK_FROZEN.with(|f| f.set(false));
     ARMED.with(|a| a.set(0));
+    crate::js::window::frames::reset();
 }
 
 /// Number of timers currently armed.
@@ -109,10 +111,17 @@ pub fn next_due(vm: &Vm) -> Option<f64> {
 
 /// Fires every timer due at the current clock reading — and nothing else — each as its own task
 /// (callback, then a microtask checkpoint). Returns how many ran.
+///
+/// AETHERFRAMES (SR83): the browsing-context task source runs first (`js::window::frames::service`:
+/// new iframes get their contexts, queued nested navigations load, removed iframes' contexts unload).
+/// Every driver of the loop — the loader's parse-blocking spins and its "spin until nothing delays the
+/// load event", the boot drain, `Engine::tick`, `settle` — reaches it here, so a page's `load` follows
+/// its iframes' and a test's virtual-time settle sees them load. Its tasks count in the return value.
 pub fn fire_due_timers(vm: &mut Vm) -> usize {
     if crate::js::engine_poisoned() {
         return 0;
     }
+    let framed = crate::js::window::frames::service(vm);
     let now = now_ms() as f64;
     // (due, seq, id) snapshot taken before any callback runs.
     let mut due: Vec<(f64, u64, u32)> = vm.timers.iter().filter(|t| t.due <= now).map(|t| (t.due, t.seq, t.id)).collect();
@@ -121,7 +130,7 @@ pub fn fire_due_timers(vm: &mut Vm) -> usize {
         crate::ledger::record_js(&format!("timer-fire-cap:{MAX_FIRES_PER_TICK}"));
         due.truncate(MAX_FIRES_PER_TICK);
     }
-    let mut ran = 0;
+    let mut ran = framed;
     for (_, _, id) in due {
         // A callback earlier in this generation may have cleared this one.
         let Some(i) = vm.timers.iter().position(|t| t.id == id) else { continue };

@@ -17,6 +17,7 @@ pub mod fonts;
 pub mod api;
 pub mod media;
 pub mod selection;
+pub mod frames;
 
 #[cfg(test)]
 mod engine_tests;
@@ -75,6 +76,9 @@ pub struct AetherEngine {
     caret_epoch: std::time::Instant,
     /// The blink phase the last frame painted.
     caret_on: bool,
+    /// AETHERFRAMES (SR83): the (DOM version, layout epoch) the nested documents' surfaces were last
+    /// painted at; None when no surface is registered.
+    frames_painted: Option<(u64, u64)>,
 }
 
 /// A selection drag (AETHERSELECT).
@@ -125,7 +129,93 @@ impl AetherEngine {
             edit: forms::edit::EditState::default(),
             caret_epoch: std::time::Instant::now(),
             caret_on: true,
+            frames_painted: None,
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // AETHERFRAMES (SR83): the tree of documents
+    // ---------------------------------------------------------------------------------------------
+
+    /// Every document the engine holds: the top-level document first, then each nested browsing
+    /// context's active document (creation order) — all Document nodes of the page's one arena.
+    pub fn documents(&self) -> Vec<crate::dom::NodeRef> {
+        let Some(doc) = self.document.clone() else { return Vec::new() };
+        let mut out = vec![doc.clone()];
+        for bc in frames::all() {
+            if bc.id != frames::TOP {
+                out.push(doc.node_at(html_core::NodeId(bc.document)));
+            }
+        }
+        out
+    }
+
+    /// The browsing-context tree as it stands (the top-level traversable first).
+    pub fn frame_tree(&self) -> Vec<frames::BrowsingContext> {
+        frames::all()
+    }
+
+    /// The content-box size of `node`'s layout box in the current layout.
+    fn content_size_of(&self, node: &crate::dom::NodeRef) -> Option<(f32, f32)> {
+        let layout = self.layout_tree.as_ref()?;
+        let tid = layout.node_map.iter().find(|(_, n)| *n == node).map(|(t, _)| *t)?;
+        let l = layout.taffy.layout(tid).ok()?;
+        Some((
+            (l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right).max(0.0),
+            (l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom).max(0.0),
+        ))
+    }
+
+    /// Lays out and paints every nested document into its own surface (descendants first, so a
+    /// nested iframe's surface exists when its parent's snapshot paints), registered by container
+    /// for `render::render_frame` to compose. A nested document is copied into a fresh arena for
+    /// this (the cascade and layout walk from `Document::ROOT`); its size is its container's content
+    /// box in the top layout, else the replaced box's natural size (`frames::replaced_size`). Skipped
+    /// when neither the DOM nor the layout changed since the last paint.
+    fn paint_frames(&mut self) {
+        let order = frames::post_order();
+        if order.is_empty() {
+            if self.frames_painted.take().is_some() {
+                frames::clear_surfaces();
+            }
+            return;
+        }
+        let key = (crate::js::page(|p| p.version), self.layout_epoch);
+        if self.frames_painted == Some(key) {
+            return;
+        }
+        let Some(doc) = self.document.clone() else { return };
+        frames::clear_surfaces();
+        for id in order {
+            let Some(bc) = frames::get(id) else { continue };
+            let Some(container) = bc.container else { continue };
+            let cnode = doc.node_at(html_core::NodeId(container));
+            let laid = if bc.parent == Some(frames::TOP) { self.content_size_of(&cnode) } else { None };
+            let (w, h) = laid
+                .filter(|&(w, h)| w >= 1.0 && h >= 1.0)
+                .or_else(|| frames::replaced_size(&cnode))
+                .unwrap_or((300.0, 150.0));
+            let (w, h) = ((w.round() as u32).clamp(1, 4096), (h.round() as u32).clamp(1, 4096));
+            let (snap, map) = frames::snapshot(&doc, bc.document);
+            frames::alias_surfaces(&doc, &snap, &map);
+            let mut sheets: Vec<String> = Vec::new();
+            if let Ok(styles) = snap.select("style") {
+                for st in styles {
+                    sheets.push(st.as_node().text_contents());
+                }
+            }
+            let mut lt = layout::build_tree(&snap, w as f32, h as f32);
+            css::apply_stylesheets(&mut lt, &sheets);
+            let mut pixels = vec![255u8; (w as usize) * (h as usize) * 4];
+            render::render_frame(&lt, &mut pixels, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
+            frames::clear_aliases();
+            frames::set_child_surface(&cnode, frames::ChildSurface { width: w, height: h, pixels: std::rc::Rc::new(pixels) });
+        }
+        // The nested cascades set their own viewport and @font-face set: the page's come back.
+        crate::css::set_viewport(self.width as f32, self.height as f32);
+        let parsed: Vec<css_core::stylesheet::Stylesheet> = self.stylesheets.iter().map(|s| css_core::stylesheet::parse_stylesheet(s)).collect();
+        crate::fonts::webfont::apply_rules(&parsed, &crate::images::page_base());
+        self.frames_painted = Some(key);
     }
 
     /// Rebuilds layout from the (possibly script-mutated) DOM and re-applies
@@ -1153,8 +1243,11 @@ impl AetherEngine {
         // Nothing of the new document is hovered until the pointer moves over it (SR67).
         self.hover_path.clear();
         crate::dom::El::clear_hover_chain();
-        // A new document has no selection.
+        // A new document has no selection; its nested documents paint afresh (the browsing-context tree
+        // itself is reset with the page state, `event_loop::reset`).
         selection::reset();
+        self.frames_painted = None;
+        frames::clear_surfaces();
         self.sel_drag = None;
         self.button_down = false;
 
@@ -1249,6 +1342,11 @@ impl AetherEngine {
 
     pub fn render_frame(&mut self) -> Vec<(u32, u32, u32, u32)> {
         let damages = std::mem::take(&mut self.damage_rects);
+        // AETHERFRAMES: nested documents paint first (their paint reuses the renderer's per-frame
+        // records, which the top document's paint below then owns).
+        if !damages.is_empty() && self.layout_tree.is_some() {
+            self.paint_frames();
+        }
         render::set_focus(self.focus_paint());
         
         if let Some(layout) = &self.layout_tree {
