@@ -6871,7 +6871,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), una_abi::SYS_SBRK => super::xwin::sys_sbrk(a0 as i64), una_abi::SYS_WHOAMI => sys_whoami(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), una_abi::SYS_PIPE_WRITE => sys_pipe_write(a0, a1, a2), una_abi::SYS_KILL => sys_kill(a0), // SHELLABI (B565): refused by name on this arch (no ring-3 launcher holds a child), bodies at the FILE TAIL (same-line fold). RING3PIPE (B562): refused by name on this arch, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
+        SYS_CLOSE => sys_close(a0), una_abi::SYS_TIME => sys_time(), una_abi::SYS_PROF => sys_prof(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_RINGKEY => sys_ringkey(a0, a1, a2), #[cfg(feature = "lumen")] una_abi::SYS_KDF => sys_kdf(a0, a1, a2, a3), #[cfg(feature = "selfdiag")] una_abi::SYS_PATH_READ | una_abi::SYS_PATH_WRITE => sys_pathio(nr, a0, a1, a2, a3), una_abi::SYS_CURSOR_SHAPE => sys_cursor_shape(a0), una_abi::SYS_PIPE_READ => sys_pipe_read(a0, a1, a2), una_abi::SYS_PIPE_WRITE => sys_pipe_write(a0, a1, a2), una_abi::SYS_KILL => sys_kill(a0), una_abi::SYS_SPAWN_PATH => sys_spawn_path(a0, a1, a2, a3), // ARMPIPE (orin-ledger A108): SYS_SPAWN_PATH (68) with SPAWN_PIPE, and the pipe trio 70/71/72 SERVED on this arch over `crate::pipe` (keys = the ASID and its ASID_GEN), bodies at the FILE TAIL (same-line fold). SHELLABI (B565): the pipe write and kill, first refused by name here. RING3PIPE (B562): refused by name on this arch, body at the FILE TAIL (same-line fold). CURSORSHAPE (B550): the pointer-shape verb, body at the FILE TAIL (same-line fold). HOLOCRONARM (B484): SYS_KDF + the path I/O pair HOLOCRON.ELF's store is, bodies at the FILE TAIL. VEINTLS (SR36): SYS_TIME, body at the FILE TAIL.
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_LISTEN => net6_sys_listen(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_ACCEPT => net6_sys_accept(a0), // ARMRESOLVE (B560): SYS_LISTEN 47 / SYS_ACCEPT 48, the passive half x86 has answered since SOCK-6/SOCK-7, same fold, bodies at the FILE TAIL. NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
@@ -7267,7 +7267,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
         for &b in &chunk[..n] {
             port.write_byte(b);
         }
-        off += n;
+        pipe_feed_write(asid, &chunk[..n]); off += n; // ARMPIPE (A108): a launcher's pipe takes the console bytes too (fn at the FILE TAIL; one atomic load when no pipe is bound). ⚠ LINE-NEUTRAL fold.
     }
     len as i64
 }
@@ -8310,7 +8310,7 @@ pub enum BgPoll {
 /// (the shell's `bg` verb) records the pid and reaps it later via [`bg_poll`]. Mirrors
 /// `run_user_image`'s front half exactly — same bounds, same console-cap endowment, same EXEC1-M
 /// publish order — and diverges only where the contract block above says it does.
-pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
+pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> { spawn_user_image_bg_piped(bytes, argv, None, false) } fn spawn_user_image_bg_piped(bytes: &[u8], argv: &[&str], pipe: Option<usize>, ring3: bool) -> Result<(u64, u64, u64), &'static str> { // ARMPIPE (A108): the bg body with SYS_SPAWN_PATH's two extras — the reserved pipe bound before the task exists, and the caller's principal rule; the shell's `bg` passes neither. ⚠ LINE-NEUTRAL fold.
     if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window
         return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
@@ -8349,7 +8349,7 @@ pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48; super::xwin::args_write(mapped.slot, argv); // RING3ABI2 M2
+    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); // ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
     // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
     // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
     set_detached(asid, true);
@@ -13353,7 +13353,7 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     crate::wedge2::mark("<F1>");
     let mut ring: alloc::vec::Vec<u64> = alloc::vec::Vec::new(); // WINDOWCAP-2
     let n = focus_ring_apps(&mut ring);
-    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire); if wc_tab_to_app(cur, down) { return false; } // ARMPIPE (A108; x86 SHELLABI B565's rule): a bare Tab while a LIVE ring-3 program holds the keys is that program's key — returned undelivered so `user_input_enqueue` queues it (and its release) on the focused ring, `[wc] tab -> app pid=…`; fn at the FILE TAIL. The shell and a focus no running program holds keep the cycle (TABRING's synthetic owners 7/8 included). ⚠ LINE-NEUTRAL append.
     // BGRUN-1 GUARD REWRITE (supersedes WC-TAB's shared `n < 2`, deliberately). The old guard was
     // justified when windows could not outlive `run`: a lone window meant a parked shell, so consuming
     // TAB there could only rebuild the one-way trap. BGRUN-1 makes "focused window + free shell" the
@@ -13398,7 +13398,7 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // `user_input_set_active` clears the target's ring and drains up to 64 events off
     // `pal::EVENT_QUEUE` (a bounded loop against a live producer), so a `<F2>` with no `<F3>` puts
     // the death in the input-queue drain rather than anywhere in the compositor.
-    #[cfg(feature = "desktop_firmware")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); } crate::wedge2::mark("<F2>"); // DRAGREL-A64 (KEYDOORS Table 2) — A FOCUS SWITCH CANCELS A LIVE DRAG, ON THIS ARCH TOO. x86's `wc_focus_key` has carried this arm since DRAGREL (`arch/x86_64/syscall.rs:5330`-:5333) and aarch64's twin never had it: `git grep -n 'drag_cancel('` returned ZERO hits under `arch/aarch64/`. The drag machinery itself IS live here — `:14400`'s chrome arm calls `wm::drag_begin`, `:14485`'s release edge calls `wm::drag_end` — so this was a MISSING ARM ON A DOOR THAT EXISTS, not a missing module, and both boards could reach the state x86's comment names: the previous window silently following the pointer under the newly focused one, with no visible thing to let go of. <TAB> is the one input the operator always has, so it is also the escape. Placed BEFORE the focus primitive, as x86 places it, so the cancel is attributed to the window that was ACTUALLY being dragged; named `focus-key` so a capture can tell this end from the two release ends. WITNESS: none is added — `wm::drag_cancel` already prints `[wm-act] drag-cancel win=N owner=… at (x,y) -> focus-key` (and, under `witness`, the `[drag]` budget line before it), which is the same pair the x86 arm produces, so one grep scores both boards. TWO DELIBERATE DIFFERENCES FROM THE x86 ARM. (1) No `drag_settle_disarm()`: that is PTRDEAD machinery — `DRAG_DOWN_VALID`/`DRAG_LEVEL_UP_MS`/`DRAG_POST_MOTIONS`/`DRAG_LEAD_MOTIONS` — which exists only in `arch/x86_64/syscall.rs` for an EHCI endpoint that can supersede a report before it is read; `git grep -n drag_settle -- arch/aarch64/` is empty, and inventing a settle state this arch has never demonstrated a need for would be machinery with no evidence behind it. (2) GATED `desktop_firmware`, where x86's arm is deliberately ungated. x86 leaves it open because `drag_begin` is reachable in a plain `wc`-less build there; on aarch64 `drag_begin` has exactly ONE call site (`:14400`) and it is `desktop_firmware`-gated, so ungated here the call could never fire — and, worse, it would add instructions to the knob-off `kernel8.img`, whose byte-identity is this track's standing proof. Gated, the knob-off image is unchanged, which is measured (sha before = sha after), not asserted. ⚠ LINE-NEUTRAL fold onto the `<F2>` mark: a line ADDED to this file renumbers every panic `Location` under it and breaks that same proof (PARITY.md §5.3).
+    #[cfg(feature = "desktop_firmware")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); } crate::wedge2::mark("<F2>"); serial_println!("[wc] tab -> cycle cur={} next={} ring={}", cur, next, n); // ARMPIPE (A108): the cycle said beside `[wc-c]`, x86 SHELLABI's line, so one grep scores both arches (LINE-NEUTRAL append, code before this comment). DRAGREL-A64 (KEYDOORS Table 2) — A FOCUS SWITCH CANCELS A LIVE DRAG, ON THIS ARCH TOO. x86's `wc_focus_key` has carried this arm since DRAGREL (`arch/x86_64/syscall.rs:5330`-:5333) and aarch64's twin never had it: `git grep -n 'drag_cancel('` returned ZERO hits under `arch/aarch64/`. The drag machinery itself IS live here — `:14400`'s chrome arm calls `wm::drag_begin`, `:14485`'s release edge calls `wm::drag_end` — so this was a MISSING ARM ON A DOOR THAT EXISTS, not a missing module, and both boards could reach the state x86's comment names: the previous window silently following the pointer under the newly focused one, with no visible thing to let go of. <TAB> is the one input the operator always has, so it is also the escape. Placed BEFORE the focus primitive, as x86 places it, so the cancel is attributed to the window that was ACTUALLY being dragged; named `focus-key` so a capture can tell this end from the two release ends. WITNESS: none is added — `wm::drag_cancel` already prints `[wm-act] drag-cancel win=N owner=… at (x,y) -> focus-key` (and, under `witness`, the `[drag]` budget line before it), which is the same pair the x86 arm produces, so one grep scores both boards. TWO DELIBERATE DIFFERENCES FROM THE x86 ARM. (1) No `drag_settle_disarm()`: that is PTRDEAD machinery — `DRAG_DOWN_VALID`/`DRAG_LEVEL_UP_MS`/`DRAG_POST_MOTIONS`/`DRAG_LEAD_MOTIONS` — which exists only in `arch/x86_64/syscall.rs` for an EHCI endpoint that can supersede a report before it is read; `git grep -n drag_settle -- arch/aarch64/` is empty, and inventing a settle state this arch has never demonstrated a need for would be machinery with no evidence behind it. (2) GATED `desktop_firmware`, where x86's arm is deliberately ungated. x86 leaves it open because `drag_begin` is reachable in a plain `wc`-less build there; on aarch64 `drag_begin` has exactly ONE call site (`:14400`) and it is `desktop_firmware`-gated, so ungated here the call could never fire — and, worse, it would add instructions to the knob-off `kernel8.img`, whose byte-identity is this track's standing proof. Gated, the knob-off image is unchanged, which is measured (sha before = sha after), not asserted. ⚠ LINE-NEUTRAL fold onto the `<F2>` mark: a line ADDED to this file renumbers every panic `Location` under it and breaks that same proof (PARITY.md §5.3).
     user_input_set_active(next);
     // WEDGE-2 `<F3>` — focus routing has moved; the VISIBLE half is next. This is the seam the three
     // silicon wedges all crossed: `[wc-fv] focus raise` is printed from inside `focus_changed`, so
@@ -26383,37 +26383,354 @@ fn net6_sys_accept(handle: u64) -> i64 {
 }
 
 // =================================================================================================
-// RING3PIPE (rmbp-ledger B562) — `SYS_PIPE_READ` (70, una-abi's RING3PIPE block) on this arch: REFUSED BY NAME. A pipe
-// is created only by `SYS_SPAWN_PATH`'s SPAWN_PIPE flag, and this arch's ring-3 launch path has no spawn-by-path
-// (`run_user_image` is the kernel shell's foreground door; `SYS_SPAWN_PATH` falls to the `_ => -38` arm), so no
-// launcher here can hold a pipe and none can be read. The verb answers -ENOSYS with its reason on the wire instead of
-// the silent default, so a program written against the pair learns why. TAIL-APPENDED; the dispatch arm is a
-// same-line fold beside SYS_CURSOR_SHAPE.
+// ARMPIPE (orin-ledger A108) — una-abi's RING3EXEC `SYS_SPAWN_PATH` (68) with RING3PIPE's SPAWN_PIPE, `SYS_PIPE_READ`
+// (70), and SHELLABI's `SYS_PIPE_WRITE` (71) / `SYS_KILL` (72), SERVED on this arch over the arch-neutral table in
+// `crate::pipe` — the same table, the same answers and the same wire lines as x86's tail blocks (arch/x86_64/
+// syscall.rs RING3EXEC / RING3PIPE / SHELLABI). Until this block the three pipe verbs were refused here by name
+// (`refused=no-launch-pipe`, `refused=not-my-child`) because this arch had no ring-3 spawn-by-path. TAIL-REPLACED
+// (those refusals were the file's last block, so no line above moves); above it the arc is same-line folds only:
+// the dispatch arm (beside SYS_KILL), `sys_write`'s Console loop (`pipe_feed_write` per chunk), the bg body split
+// (`spawn_user_image_bg_argv` -> `spawn_user_image_bg_piped`, on the wrapper's own line), `spawn_path_bind` on the
+// `let asid` line (before the task exists), and in `wc_focus_key` the app route on the `cur` line and the
+// `[wc] tab -> cycle` line beside `<F2>`.
+//
+// * What differs from x86 is the EL0 loader, not the pipe. A pipe's KEY is the ASID (`current_asid()`, TTBR0_EL1
+//   [63:48], read synchronously in the SVC) and its GENERATION is `ASID_GEN`, bumped first thing in
+//   `clear_handle_row` — the slot teardown the scheduler runs when the address space's last thread exits. So the
+//   child is alive while its ASID still carries the generation bound at launch, a recycled ASID never feeds the
+//   old pipe, and a dead launcher's pipes are reclaimed at the next reserve (`pipe::reserve`'s sweep).
+// * The launch is the shell's `bg` body, `spawn_user_image_bg_argv` (EL0-EL1CORE pre-check, `proc_reserve`,
+//   `map_image_into_slot`, `install_console_cap`, `spawn_user_slot` on CPU_AUTO), DETACHED; the checks before it are
+//   x86's `spawn_path_checked` verbatim (the VFS ACL read as the caller, dir / empty / over `xwin::IMAGE_CAP` /
+//   short read refused, ELF64 LE, APPTRUST's `launch_gate`), with `e_machine` 183 (EM_AARCH64). The child's row
+//   is a bg row: `bg_poll` reaps it, BGRUN-SCAV reclaims it under table pressure, `bg_kill` kills it.
+// * THE PRINCIPAL (x86's `slot_user_inherit` rule: "a ring-3 program launches only as what it already is"). The
+//   loader stamps the image principal and, with a session open, restamps the SESSION user (`session_restamp`,
+//   the one path that may put PRIN_USER into SLOT_PPID). A caller that is the live session user therefore needs
+//   nothing; a caller that is NOT (launched before the login: its image principal) gets a child stamped back to
+//   the child's own image principal, so a ring-3 launch never mints a session user's authority.
+// * SYS_PIPE_WRITE's lane is the keyboard's: each byte an `INPUT_EV_KEY_DOWN` pushed by `user_input_push` into the
+//   child's ring (its push wakes a `SYS_INPUT_WAIT` park). The router produces only into the FOCUSED ASID
+//   (`user_input_enqueue`), so a write while the child holds the focus is -EAGAIN, and launcher writes are
+//   serialised by `PIPEW_LOCK`. SYS_KILL is `bg_kill` — the kernel shell's `kill` — gated on parenthood: the
+//   zero-length `pipe::read` probe (`Dropped` = the caller's own live pipe).
 // =================================================================================================
 
-/// RING3PIPE: `SYS_PIPE_READ(pid, buf, len)` — `-ENOSYS`, said once per call with the caller's ASID.
-fn sys_pipe_read(pid: u64, _buf: u64, _len: u64) -> i64 {
-    serial_println!("[pipe] read pid={} asid={} -> refused=no-launch-pipe (this arch has no SYS_SPAWN_PATH to attach one)", pid, current_asid());
-    una_abi::ENOSYS
+/// ARMPIPE: `asid`'s tenant generation (0 for a row never touched) — never allocates.
+fn pipe_gen(asid: u64) -> u64 {
+    ASID_GEN.peek(asid as usize).map_or(0, |g| g.load(Ordering::Acquire))
 }
 
-// =================================================================================================
-// SHELLABI (rmbp-ledger B565) — `SYS_PIPE_WRITE` (71) and `SYS_KILL` (72), una-abi's SHELLABI verbs, on this arch:
-// REFUSED BY NAME, for the reason `SYS_PIPE_READ` is (block above): both act on a launcher's SPAWN_PIPE child, and no
-// ring-3 program here can launch one. The write answers -ENOSYS (`refused=no-launch-pipe`, the read's word); the kill
-// answers the parenthood refusal x86 gives a pid that is not the caller's child — `[kill] pid=… by=… -> refused=
-// not-my-child`, -ESRCH — so both arches say the same thing to the same call. TAIL-APPENDED; the dispatch arms are a
-// same-line fold beside SYS_PIPE_READ's.
-// =================================================================================================
-
-/// SHELLABI: `SYS_PIPE_WRITE(pid, buf, len)` — `-ENOSYS`, said once per call with the caller's ASID.
-fn sys_pipe_write(pid: u64, _buf: u64, _len: u64) -> i64 {
-    serial_println!("[pipe] write pid={} asid={} -> refused=no-launch-pipe (this arch has no SYS_SPAWN_PATH to attach one)", pid, current_asid());
-    una_abi::ENOSYS
+/// ARMPIPE: is the tenant `(asid, tgen)` still the one in `asid`? `crate::pipe`'s liveness compare.
+fn pipe_alive(key: usize, tgen: u64) -> bool {
+    key < ASID_GEN.len() && pipe_gen(key as u64) == tgen
 }
 
-/// SHELLABI: `SYS_KILL(pid)` — no ring-3 program on this arch has a child, so every pid is refused by parenthood.
+/// ARMPIPE: `sys_write`'s Console path — the bytes into the writer's pipe, if a launcher attached one.
+fn pipe_feed_write(asid: u64, bytes: &[u8]) {
+    crate::pipe::feed(asid as usize, pipe_gen(asid), bytes);
+}
+
+/// ARMPIPE: reserve a pipe for the launcher `asid` when `want` (SPAWN_PIPE); `Ok(None)` without the flag.
+fn pipe_reserve(want: bool, asid: u64) -> Result<Option<usize>, &'static str> {
+    if !want {
+        return Ok(None);
+    }
+    crate::pipe::reserve(asid as usize, pipe_gen(asid), pipe_alive).map(Some)
+}
+
+/// ARMPIPE: the spawn answered `pid` — it names the reserved pipe.
+fn pipe_named(idx: Option<usize>, pid: u64) {
+    if let Some(i) = idx {
+        crate::pipe::set_pid(i, pid);
+    }
+}
+
+/// ARMPIPE: `spawn_user_image_bg_piped`'s pre-run window (the image mapped, the task not yet spawned): bind the
+/// reserved pipe to the child's `(asid, ASID_GEN)` so its first write is captured, and apply the principal rule to
+/// a ring-3 launch (block above). The shell's `bg` passes `(None, false)` and this does nothing.
+fn spawn_path_bind(asid: u64, bytes: &[u8], pipe: Option<usize>, ring3: bool) {
+    if let Some(i) = pipe {
+        crate::pipe::bind(i, asid as usize, pipe_gen(asid));
+    }
+    #[cfg(feature = "login")]
+    if ring3 && current_principal().kind != PRIN_USER && slot_ppid_of(asid).kind == PRIN_USER {
+        slot_ppid_stamp(asid, PrincipalRecord::image_of(bytes));
+    }
+    #[cfg(not(feature = "login"))]
+    let _ = (bytes, ring3);
+}
+
+/// ARMPIPE: a path the ring-3 spawn door accepts — x86's `ring3_path_ok`: absolute, at most `PATH_IO_PATH_MAX`
+/// bytes, no empty / `.` / `..` component.
+fn spawn_path_ok(p: &str) -> bool {
+    p.starts_with('/') && p.len() >= 2 && p.len() <= una_abi::PATH_IO_PATH_MAX && p[1..].split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// ARMPIPE: `SYS_SPAWN_PATH(path_ptr, path_len, argv_ptr, argc)` — the path and the argv copied in through
+/// `copy_from_user` (the whole range validated, then copied), the flags split off argc's high half, then
+/// [`spawn_path_checked`] as the caller. The pid, or a negative errno (una-abi's RING3EXEC block).
+fn sys_spawn_path(path_ptr: u64, path_len: u64, argv_ptr: u64, argc: u64) -> i64 {
+    let caller = current_asid();
+    let n = path_len as usize;
+    if n < 2 || n > una_abi::PATH_IO_PATH_MAX {
+        return EINVAL;
+    }
+    let mut pb = [0u8; una_abi::PATH_IO_PATH_MAX];
+    if copy_from_user(&mut pb[..n], path_ptr, n).is_err() {
+        return EFAULT;
+    }
+    let Ok(path) = core::str::from_utf8(&pb[..n]) else {
+        return EINVAL;
+    };
+    if !spawn_path_ok(path) {
+        return EINVAL;
+    }
+    if argc & !(una_abi::SPAWN_ARGC_MASK | una_abi::SPAWN_FLAGS) != 0 {
+        return EINVAL;
+    }
+    let pipe = argc & una_abi::SPAWN_PIPE != 0;
+    let argc = (argc & una_abi::SPAWN_ARGC_MASK) as usize;
+    if argc > una_abi::ARGS_MAX {
+        return una_abi::E2BIG;
+    }
+    let mut words: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::with_capacity(argc.max(1));
+    if argc == 0 {
+        words.push(alloc::string::String::from(path));
+    } else {
+        let dlen = argc * core::mem::size_of::<una_abi::SpawnArg>();
+        let mut desc = alloc::vec![0u8; dlen];
+        if copy_from_user(&mut desc, argv_ptr, dlen).is_err() {
+            return EFAULT;
+        }
+        for d in desc.chunks_exact(16) {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&d[0..8]);
+            let p = u64::from_le_bytes(w);
+            w.copy_from_slice(&d[8..16]);
+            let l = u64::from_le_bytes(w) as usize;
+            if l == 0 || l > una_abi::SPAWN_ARG_MAX {
+                return EINVAL;
+            }
+            let mut b = alloc::vec![0u8; l];
+            if copy_from_user(&mut b, p, l).is_err() {
+                return EFAULT;
+            }
+            match alloc::string::String::from_utf8(b) {
+                Ok(s) if !s.contains('\0') => words.push(s),
+                _ => return EINVAL,
+            }
+        }
+    }
+    let who = attrsurf_principal_of(&current_principal());
+    match spawn_path_checked(path, &words, &who, caller, pipe) {
+        Ok(pid) => pid as i64,
+        Err((e, why)) => {
+            serial_println!("[spawnpath] path={} principal={} argc={} -> refused={} errno={}", path, who, words.len(), why, e);
+            e
+        }
+    }
+}
+
+/// ARMPIPE: x86's `spawn_path_checked` on this arch — the shell's checks on `path` as `who`, APPTRUST's door, then
+/// `bg`'s body (with the pipe and the principal rule). `Ok(pid)` once the child is spawned.
+fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, caller: u64, pipe: bool) -> Result<u64, (i64, &'static str)> {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let mt = crate::shell::vfs_mount_table();
+    let st = mt.open_read(path, who).map_err(|e| (crate::fs::attrsys::errno_of(&e), if matches!(e, VfsError::Denied) { "acl-read" } else { "open" }))?;
+    if st.kind == NodeKind::Dir {
+        return Err((una_abi::EISDIR, "is-a-directory"));
+    }
+    if st.size == 0 {
+        return Err((una_abi::ENOEXEC, "empty-file"));
+    }
+    if st.size > super::xwin::IMAGE_CAP as u64 {
+        return Err((una_abi::E2BIG, "over-image-cap"));
+    }
+    if !crate::fs::apptrust::launch_gate(&mt, path) {
+        return Err((una_abi::EACCES, "apptrust"));
+    }
+    let bytes = mt.read(path, 0, st.size as usize).map_err(|e| (crate::fs::attrsys::errno_of(&e), "read"))?;
+    if bytes.len() as u64 != st.size {
+        return Err((EIO, "short-read"));
+    }
+    if !(bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F']) {
+        return Err((una_abi::ENOEXEC, "not-elf"));
+    }
+    if bytes[4] != 2 {
+        return Err((una_abi::ENOEXEC, "not-elf64"));
+    }
+    if bytes[5] != 1 {
+        return Err((una_abi::ENOEXEC, "not-little-endian"));
+    }
+    if u16::from_le_bytes([bytes[18], bytes[19]]) != 183 {
+        return Err((una_abi::ENOEXEC, "not-aarch64"));
+    }
+    let note = midden_core::app_note_flags(&bytes).unwrap_or(0);
+    let argv: alloc::vec::Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    let pipe_idx = pipe_reserve(pipe, caller).map_err(|why| (EAGAIN, why))?;
+    crate::prof::launching(path);
+    match spawn_user_image_bg_piped(&bytes, &argv, pipe_idx, true) {
+        Ok((pid, asid, entry)) => {
+            crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
+            crate::fs::appres::sight(path);
+            pipe_named(pipe_idx, pid);
+            serial_println!(
+                "[spawnpath] path={} principal={} bytes={} note={} pid={} asid={} entry={:#x} argc={} -> started",
+                path, who, bytes.len(), note, pid, asid, entry, argv.len()
+            );
+            Ok(pid)
+        }
+        Err(why) => {
+            if let Some(i) = pipe_idx {
+                crate::pipe::release(i);
+            }
+            serial_println!("[spawnpath] path={} loader={}", path, why);
+            Err((if why.contains("args page") { una_abi::E2BIG } else { EAGAIN }, "loader"))
+        }
+    }
+}
+
+/// ARMPIPE: `SYS_PIPE_READ(pid, buf, len)` — see una-abi's RING3PIPE block. The destination is validated WRITABLE
+/// before anything is taken off the ring, so a bad pointer is -EFAULT with no byte lost.
+fn sys_pipe_read(pid: u64, buf: u64, len: u64) -> i64 {
+    use crate::pipe::Read;
+    let asid = current_asid();
+    let n = (len as usize).min(una_abi::PIPE_RING_BYTES);
+    if n > 0 && !user_range_ok(buf, n, true) {
+        return EFAULT;
+    }
+    let mut k = alloc::vec![0u8; n];
+    match crate::pipe::read(asid as usize, pipe_gen(asid), pid, &mut k, pipe_alive) {
+        Read::Data(c) => match copy_to_user(buf, &k[..c], c) {
+            Ok(()) => c as i64,
+            Err(_) => EFAULT,
+        },
+        Read::Eof(..) => 0,
+        Read::Empty => EAGAIN,
+        Read::Dropped(d) => d as i64,
+        Read::NoPipe => una_abi::EBADF,
+        Read::NotYours => {
+            serial_println!("[pipe] read pid={} row={} -> refused=not-the-launcher", pid, asid);
+            EACCES
+        }
+    }
+}
+
+/// ARMPIPE: serialises the launchers' pushes into child rings (the router never pushes into an unfocused ASID).
+static PIPEW_LOCK: SpinMutex<()> = SpinMutex::new(());
+
+/// ARMPIPE: is `pid` a live pipe the caller `asid` launched? `Ok(())`, or the errno and the refusal word — the
+/// zero-length `pipe::read` (answers before anything is taken or closed).
+fn pipe_parent_of(asid: u64, pid: u64) -> Result<(), (i64, &'static str)> {
+    use crate::pipe::Read;
+    match crate::pipe::read(asid as usize, pipe_gen(asid), pid, &mut [], pipe_alive) {
+        Read::Dropped(_) => Ok(()),
+        Read::NotYours => Err((EACCES, "not-the-launcher")),
+        _ => Err((una_abi::ESRCH, "no-pipe")),
+    }
+}
+
+/// ARMPIPE: the ASID of the RUNNING process `pid` (PROCS stores it beside the pid), or `None` once it has exited.
+fn pipe_child_asid(pid: u64) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    for pi in 0..procs_rows() {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].pid.load(Ordering::Acquire) == pid {
+            let a = PROCS[pi].asid.load(Ordering::Acquire);
+            return if a != 0 && a as usize <= crate::procslot::SLOT_ID_MAX { Some(a) } else { None };
+        }
+    }
+    None
+}
+
+/// ARMPIPE: `SYS_PIPE_WRITE(pid, buf, len)` — una-abi's SHELLABI verb. `len == 0` is end-of-input (one
+/// `KEY_EOT`); otherwise up to one ring's worth of bytes, each a KEY_DOWN into the child's ring.
+fn sys_pipe_write(pid: u64, buf: u64, len: u64) -> i64 {
+    let asid = current_asid();
+    if let Err((e, why)) = pipe_parent_of(asid, pid) {
+        serial_println!("[pipe] write pid={} row={} -> refused={}", pid, asid, why);
+        return if e == una_abi::ESRCH { una_abi::ENOSYS } else { e };
+    }
+    let Some(child) = pipe_child_asid(pid) else {
+        serial_println!("[pipe] write pid={} row={} -> refused=child-exited", pid, asid);
+        return una_abi::EPIPE;
+    };
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == child {
+        return EAGAIN; // the child holds the keyboard: its ring has the router as producer until focus moves
+    }
+    let n = (len as usize).min(INPUT_RING_CAP);
+    let mut k = [0u8; INPUT_RING_CAP];
+    if n > 0 && copy_from_user(&mut k[..n], buf, n).is_err() {
+        return EFAULT;
+    }
+    let _g = PIPEW_LOCK.lock();
+    if n == 0 {
+        return if user_input_push(child, una_abi::input_ev_pack(INPUT_EV_KEY_DOWN, una_abi::KEY_EOT as u64)) { 0 } else { EAGAIN };
+    }
+    let mut done = 0usize;
+    for &b in &k[..n] {
+        if !user_input_push(child, una_abi::input_ev_pack(INPUT_EV_KEY_DOWN, b as u64)) {
+            break;
+        }
+        done += 1;
+    }
+    if done == 0 { EAGAIN } else { done as i64 }
+}
+
+/// ARMPIPE: `SYS_KILL(pid)` — the caller's own SPAWN_PIPE child only (parenthood is the gate), killed and reaped
+/// through `bg_kill`. 0 on a kill (or an already-armed one); the refusal is named on the wire.
 fn sys_kill(pid: u64) -> i64 {
-    serial_println!("[kill] pid={} by={} -> refused=not-my-child (this arch has no SYS_SPAWN_PATH, so ring 3 launches no child)", pid, current_asid());
-    una_abi::ESRCH
+    let asid = current_asid();
+    if let Err((e, _)) = pipe_parent_of(asid, pid) {
+        serial_println!("[kill] pid={} by={} -> refused=not-my-child", pid, asid);
+        return e;
+    }
+    let Some(child) = pipe_child_asid(pid) else {
+        serial_println!("[pipe] kill pid={} by={} -> refused=exited", pid, asid);
+        return una_abi::ESRCH;
+    };
+    let said = bg_kill(pid, child);
+    if said.starts_with("killed") || said.starts_with("kill armed") || said.starts_with("already killed") {
+        serial_println!("[pipe] kill pid={} by={} -> ok ({})", pid, asid, said);
+        0
+    } else {
+        serial_println!("[pipe] kill pid={} by={} -> refused=exited ({})", pid, asid, said);
+        una_abi::ESRCH
+    }
+}
+
+/// ARMPIPE: the ring-3 program running in `asid`, if one does (a PRUNNING PROCS row with a stored pid) — the
+/// aarch64 twin of x86's `appquit_pid`. TABRING's synthetic owners (ASIDs 7/8, no PROCS row) answer `None`.
+fn tab_live_pid(asid: u64) -> Option<u64> {
+    for pi in 0..procs_rows() {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].asid.load(Ordering::Acquire) == asid {
+            let pid = PROCS[pi].pid.load(Ordering::Acquire);
+            return if pid != 0 { Some(pid) } else { None };
+        }
+    }
+    None
+}
+
+/// ARMPIPE: `wc_focus_key`'s bare-Tab route (x86 SHELLABI's `wc_tab_to_app`). `true` = the focused ASID `cur` is a
+/// LIVE ring-3 program, so the Tab (press and release) is its key: a live drag is still cancelled (Tab stays the
+/// operator's escape), then the caller returns it undelivered and `user_input_enqueue` queues it on that ring.
+/// `false` = the shell has the keys, or the focus names no running program: the cycle runs and prints `[wc-c]
+/// focus tab-cycle` (pi4-regression.spec:724's REQUIRE) — which is also the rescue of a focus nobody drains.
+fn wc_tab_to_app(cur: u64, down: bool) -> bool {
+    if cur == 0 {
+        return false;
+    }
+    let Some(pid) = tab_live_pid(cur) else {
+        return false;
+    };
+    if down {
+        #[cfg(feature = "desktop_firmware")]
+        if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
+            crate::video::wm::drag_cancel("focus-key");
+        }
+        serial_println!("[wc] tab -> app pid={} owner={}", pid, cur);
+    }
+    true
 }

@@ -105,7 +105,7 @@ impl Console {
             hist_at: None,
             root: cwd.clone(),
             cwd,
-            facts: Facts { exec: cfg!(target_arch = "x86_64"), ..Facts::ring3(cfg!(target_arch = "x86_64")) }, // RING3EXEC (B521): SYS_SPAWN_PATH is x86's
+            facts: Facts { exec: true, ..Facts::ring3(cfg!(target_arch = "x86_64")) }, // RING3EXEC (B521) + ARMPIPE (A108): SYS_SPAWN_PATH on both arches
             cmds: 0,
             last_kind: 0,
             last_verb: 0,
