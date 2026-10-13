@@ -2129,3 +2129,615 @@ mod middentwin_tests {
         assert_eq!(ring3::status_parse(ring3::status(5000, 99, 1, 0, false, true)), (0x3FF, 0x3F, 1, 0, false, true));
     }
 }
+
+// ── MIDDEN2 (LEDGER SR120) — the person's shell: compound lines, aliases, completion, history search, filters ─────
+// MIDDEN.ELF (crates/user-midden) is the shell a person uses on the image. What it needs beyond `plan` is ring-neutral
+// TEXT work — where a line splits into commands, what an alias expands to, which words complete a prefix, which
+// history line a search finds, what `grep`/`wc`/`head`/`tail` make of a stream of lines — so it lives here, once,
+// host-tested, for any ring (the host Midden can link the same functions). ADDITIVE: appended at the file tail, no
+// existing item changes, `plan` still decides what ONE simple command means; this module only cuts a line into the
+// simple commands `plan` is then asked about.
+pub mod shell {
+    use super::{Facts, CORE_VERBS, HOST_VERBS};
+    use alloc::format;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    /// How the command AFTER this one is reached: `;` (always), `&&` (only when this one succeeded), `||` (only
+    /// when it failed). The last command of a line carries `Seq`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Join {
+        Seq,
+        And,
+        Or,
+    }
+
+    /// One command of a line: a pipeline of one or more stages (`a | b | c`), each stage's text as typed (trimmed,
+    /// quotes kept — `plan` sees exactly what it always saw), and the operator that followed it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Cmd {
+        pub stages: Vec<String>,
+        pub join: Join,
+    }
+
+    /// Why a line does not split.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SplitError {
+        /// An operator with no command on one side (`| wc`, `ls |`, `&& pwd`, `ls ||`).
+        Empty(&'static str),
+        /// A quote opened and never closed.
+        Unterminated(char),
+    }
+
+    impl SplitError {
+        /// The sentence the shell prints.
+        pub fn text(&self) -> String {
+            match self {
+                SplitError::Empty(op) => format!("syntax: `{}` needs a command on both sides", op),
+                SplitError::Unterminated(q) => format!("syntax: unterminated {} quote", q),
+            }
+        }
+        /// The witness word.
+        pub fn word(&self) -> &'static str {
+            match self {
+                SplitError::Empty(_) => "empty-command",
+                SplitError::Unterminated(_) => "unterminated-quote",
+            }
+        }
+    }
+
+    /// Cut `line` into commands at `;`, `&&`, `||` and stages at `|`, outside single and double quotes. A `#` that
+    /// starts a word outside quotes ends the line (a comment, so an rc file can carry them). A lone `&` is an
+    /// ordinary character (every ring-3 launch is already detached). An empty command between `;`s is dropped; an
+    /// empty side of `|`, `&&` or `||` is a [`SplitError::Empty`]. An empty line is `Ok(vec![])`.
+    pub fn split(line: &str) -> Result<Vec<Cmd>, SplitError> {
+        let b = line.as_bytes();
+        let mut cmds: Vec<Cmd> = Vec::new();
+        let mut stages: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<u8> = None;
+        let mut i = 0;
+        // The operator that ended the previous command, for the "nothing after it" check at the end.
+        let mut pending: Option<&'static str> = None;
+        macro_rules! end_stage {
+            ($op:expr) => {{
+                let s = cur.trim();
+                if s.is_empty() {
+                    return Err(SplitError::Empty($op));
+                }
+                stages.push(s.to_string());
+                cur.clear();
+            }};
+        }
+        while i < b.len() {
+            let c = b[i];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                cur.push(c as char);
+                i += 1;
+                continue;
+            }
+            match c {
+                b'\'' | b'"' => {
+                    quote = Some(c);
+                    cur.push(c as char);
+                    i += 1;
+                }
+                b'#' if cur.is_empty() || cur.ends_with(|ch: char| ch.is_ascii_whitespace()) => break,
+                b'|' if b.get(i + 1) == Some(&b'|') => {
+                    end_stage!("||");
+                    cmds.push(Cmd { stages: core::mem::take(&mut stages), join: Join::Or });
+                    pending = Some("||");
+                    i += 2;
+                }
+                b'&' if b.get(i + 1) == Some(&b'&') => {
+                    end_stage!("&&");
+                    cmds.push(Cmd { stages: core::mem::take(&mut stages), join: Join::And });
+                    pending = Some("&&");
+                    i += 2;
+                }
+                b'|' => {
+                    end_stage!("|");
+                    pending = Some("|");
+                    i += 1;
+                }
+                b';' => {
+                    let s = cur.trim();
+                    if !s.is_empty() {
+                        stages.push(s.to_string());
+                        cur.clear();
+                    } else if !stages.is_empty() {
+                        return Err(SplitError::Empty("|"));
+                    }
+                    if !stages.is_empty() {
+                        cmds.push(Cmd { stages: core::mem::take(&mut stages), join: Join::Seq });
+                    } else if let Some(op @ ("&&" | "||")) = pending {
+                        return Err(SplitError::Empty(op));
+                    }
+                    pending = None;
+                    i += 1;
+                }
+                _ => {
+                    // Multi-byte UTF-8 is copied whole so a non-ASCII word survives the cut.
+                    let len = utf8_len(c);
+                    let end = (i + len).min(b.len());
+                    match core::str::from_utf8(&b[i..end]) {
+                        Ok(s) => cur.push_str(s),
+                        Err(_) => cur.push('?'),
+                    }
+                    i = end;
+                }
+            }
+        }
+        if let Some(q) = quote {
+            return Err(SplitError::Unterminated(q as char));
+        }
+        let s = cur.trim();
+        if !s.is_empty() {
+            stages.push(s.to_string());
+        } else if let Some(op) = pending {
+            return Err(SplitError::Empty(op));
+        }
+        if !stages.is_empty() {
+            cmds.push(Cmd { stages, join: Join::Seq });
+        }
+        Ok(cmds)
+    }
+
+    fn utf8_len(lead: u8) -> usize {
+        match lead {
+            0xF0..=0xF7 => 4,
+            0xE0..=0xEF => 3,
+            0xC0..=0xDF => 2,
+            _ => 1,
+        }
+    }
+
+    /// Does the command after one joined by `prev` run, given the status of the last command that RAN? The shell's
+    /// rule: `a && b || c` runs `c` when `a` failed (b is skipped and the status stays a's).
+    pub const fn should_run(prev: Join, last_ok: bool) -> bool {
+        match prev {
+            Join::Seq => true,
+            Join::And => last_ok,
+            Join::Or => !last_ok,
+        }
+    }
+
+    /// `stage` cut into words with one level of `'…'` / `"…"` removed (a quoted word may hold spaces). The words a
+    /// filter verb reads; `plan` keeps its own whitespace split.
+    pub fn words(stage: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        let mut any = false;
+        for c in stage.chars() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => cur.push(c),
+                None if c == '\'' || c == '"' => {
+                    quote = Some(c);
+                    any = true;
+                }
+                None if c.is_whitespace() => {
+                    if any || !cur.is_empty() {
+                        out.push(core::mem::take(&mut cur));
+                    }
+                    any = false;
+                }
+                None => cur.push(c),
+            }
+        }
+        if any || !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    // ---- aliases --------------------------------------------------------------------------------------------------
+
+    /// Is `name` a word an alias may be called? Letters, digits, `_`, `-`, `.`; not empty, not starting with `-`.
+    pub fn alias_name_ok(name: &str) -> bool {
+        !name.is_empty() && !name.starts_with('-') && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+    }
+
+    /// `name=value` (the `alias` verb's operand, the rest of its line): the name and the value with one level of
+    /// quotes removed. `None` = not a definition (no `=`, or a name [`alias_name_ok`] refuses).
+    pub fn parse_alias(def: &str) -> Option<(String, String)> {
+        let def = def.trim();
+        let (n, v) = def.split_once('=')?;
+        if !alias_name_ok(n) {
+            return None;
+        }
+        let v = v.trim();
+        let v = if v.len() >= 2 && ((v.starts_with('\'') && v.ends_with('\'')) || (v.starts_with('"') && v.ends_with('"'))) {
+            &v[1..v.len() - 1]
+        } else {
+            v
+        };
+        Some((n.to_string(), v.to_string()))
+    }
+
+    /// `stage` with its FIRST word replaced by its alias, repeatedly (an alias may name another), but never expanding
+    /// a name a second time — so `alias ls='ls -l'` is `ls -l` and two aliases naming each other stop. `None` = the
+    /// first word is no alias. Expansion never crosses a `|`/`;` (the caller expands each stage).
+    pub fn expand_alias(stage: &str, aliases: &[(String, String)]) -> Option<String> {
+        let mut cur = stage.trim().to_string();
+        let mut seen: Vec<String> = Vec::new();
+        let mut changed = false;
+        loop {
+            let first = cur.split_whitespace().next().unwrap_or("");
+            if first.is_empty() || seen.iter().any(|s| s == first) {
+                break;
+            }
+            let Some((_, v)) = aliases.iter().find(|(n, _)| n == first) else {
+                break;
+            };
+            seen.push(first.to_string());
+            let rest = cur[first.len()..].to_string();
+            cur = format!("{}{}", v, rest);
+            changed = true;
+            if seen.len() >= 16 {
+                break;
+            }
+        }
+        if changed { Some(cur) } else { None }
+    }
+
+    // ---- completion -----------------------------------------------------------------------------------------------
+
+    /// The word the caret is in: `(start byte, command position)`. The word runs from the last whitespace or
+    /// operator byte before `caret`; it is in COMMAND position when only whitespace separates it from the line start
+    /// or from a `|`, `;`, `&&` or `||` (so it names a verb or a program, not a path operand).
+    pub fn word_at(line: &str, caret: usize) -> (usize, bool) {
+        let b = line.as_bytes();
+        let caret = caret.min(b.len());
+        let mut s = caret;
+        while s > 0 && !matches!(b[s - 1], b' ' | b'\t' | b'|' | b';' | b'&') {
+            s -= 1;
+        }
+        let mut j = s;
+        while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
+            j -= 1;
+        }
+        (s, j == 0 || matches!(b[j - 1], b'|' | b';' | b'&'))
+    }
+
+    /// The longest prefix every candidate shares, compared ASCII case-insensitively (a FAT name answers to any case),
+    /// in the FIRST candidate's spelling. Empty for no candidates.
+    pub fn common_prefix(cands: &[String]) -> String {
+        let Some(first) = cands.first() else {
+            return String::new();
+        };
+        let mut n = first.len();
+        for c in &cands[1..] {
+            let m = first.bytes().zip(c.bytes()).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count();
+            n = n.min(m);
+        }
+        while !first.is_char_boundary(n) {
+            n -= 1;
+        }
+        first[..n].to_string()
+    }
+
+    /// Does `name` complete `prefix` (ASCII case-insensitive)?
+    pub fn completes(name: &str, prefix: &str) -> bool {
+        name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    }
+
+    /// The command-position candidates for `prefix`: every verb registered on `facts` (the core's table, so a word the
+    /// build cannot dispatch is never offered), then `extra` (the ring's own builtins, aliases and program names),
+    /// sorted, without duplicates.
+    pub fn verb_candidates(prefix: &str, facts: &Facts, extra: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = CORE_VERBS
+            .iter()
+            .copied()
+            .chain(HOST_VERBS.iter().filter(|(_, a)| a.on(facts)).map(|(n, _)| *n))
+            .chain(extra.iter().copied())
+            .filter(|n| completes(n, prefix))
+            .map(|n| n.to_string())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The listing names (`PATH_R_LIST`'s lines: a directory carries a trailing `/`) that complete `leaf`, sorted.
+    pub fn path_candidates<'a>(leaf: &str, names: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let mut v: Vec<String> = names.filter(|n| !n.is_empty() && completes(n, leaf)).map(|n| n.to_string()).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// What Tab does to the word: `Some((replacement, finished))` when the candidates extend it (`finished` = exactly
+    /// one candidate, so the caller adds a space unless it is a directory), `None` when they do not (the caller lists
+    /// them instead).
+    pub fn complete_word(word: &str, cands: &[String]) -> Option<(String, bool)> {
+        match cands.len() {
+            0 => None,
+            1 => Some((cands[0].clone(), true)),
+            _ => {
+                let p = common_prefix(cands);
+                if p.len() > word.len() { Some((p, false)) } else { None }
+            }
+        }
+    }
+
+    // ---- history --------------------------------------------------------------------------------------------------
+
+    /// The newest history index below `before` whose line contains `q` (Ctrl+R's step: the first search passes
+    /// `hist.len()`, the next passes the last hit). `None` = no older match. An empty `q` matches nothing.
+    pub fn search_back(hist: &[String], q: &str, before: usize) -> Option<usize> {
+        if q.is_empty() {
+            return None;
+        }
+        let end = before.min(hist.len());
+        (0..end).rev().find(|&i| hist[i].contains(q))
+    }
+
+    /// Does a line belong in the history? Not empty, not starting with a space (the operator's "do not keep this"),
+    /// and not secret-shaped ([`super::secret_from`]: a password never reaches the history file).
+    pub fn keep_in_history(line: &str) -> bool {
+        !line.trim().is_empty() && !line.starts_with(' ') && super::secret_from(line).is_none()
+    }
+
+    // ---- filters --------------------------------------------------------------------------------------------------
+
+    /// The verbs that read a stream of lines (a pipeline's input, or a file the ring read): `grep`, `wc`, `head`,
+    /// `tail`. Every one is a `HOST_VERBS` row registered `Always`; the ring that serves them calls [`filter`].
+    pub const FILTERS: &[&str] = &["grep", "wc", "head", "tail"];
+
+    /// The ring's own words, served before `plan` is asked (none is in `HOST_VERBS` on `Facts::ring3`): alias
+    /// table, `source <file>`, the job list and the refused `kill`, and `run`.
+    pub const BUILTINS: &[&str] = &["alias", "unalias", "source", "jobs", "kill", "run"];
+
+    /// `verb args` over `input` — the lines a pipeline handed it, or the file's lines. `Err` is the usage or refusal
+    /// sentence. `grep [-i] [-v] [-c] [-n] <text>` matches a SUBSTRING (no regex: said in its usage line);
+    /// `wc [-l] [-w] [-c]` prints `lines words bytes` (bytes count each line plus its newline); `head`/`tail`
+    /// `[-n N | -N]` keep the first/last N lines (10).
+    pub fn filter(verb: &str, args: &[String], input: &[String]) -> Result<Vec<String>, String> {
+        let flags: Vec<&str> = args.iter().map(|s| s.as_str()).filter(|a| a.starts_with('-') && a.len() > 1).collect();
+        let ops: Vec<&str> = args.iter().map(|s| s.as_str()).filter(|a| !(a.starts_with('-') && a.len() > 1)).collect();
+        match verb {
+            "grep" => {
+                let mut ci = false;
+                let mut inv = false;
+                let mut count = false;
+                let mut num = false;
+                for f in &flags {
+                    for c in f[1..].chars() {
+                        match c {
+                            'i' => ci = true,
+                            'v' => inv = true,
+                            'c' => count = true,
+                            'n' => num = true,
+                            _ => return Err(format!("grep: -{}: unknown flag (usage: grep [-i] [-v] [-c] [-n] <text> [file] - a substring, not a regex)", c)),
+                        }
+                    }
+                }
+                let Some(pat) = ops.first() else {
+                    return Err("usage: grep [-i] [-v] [-c] [-n] <text> [file] - a substring, not a regex".to_string());
+                };
+                let lp = pat.to_ascii_lowercase();
+                let mut out = Vec::new();
+                let mut n = 0usize;
+                for (k, l) in input.iter().enumerate() {
+                    let hit = if ci { l.to_ascii_lowercase().contains(&lp) } else { l.contains(pat) };
+                    if hit != inv {
+                        n += 1;
+                        if !count {
+                            out.push(if num { format!("{}:{}", k + 1, l) } else { l.clone() });
+                        }
+                    }
+                }
+                if count {
+                    out.push(format!("{}", n));
+                }
+                Ok(out)
+            }
+            "wc" => {
+                let l = input.len();
+                let w: usize = input.iter().map(|s| s.split_whitespace().count()).sum();
+                let c: usize = input.iter().map(|s| s.len() + 1).sum();
+                let (mut sl, mut sw, mut sc) = (false, false, false);
+                for f in &flags {
+                    for ch in f[1..].chars() {
+                        match ch {
+                            'l' => sl = true,
+                            'w' => sw = true,
+                            'c' => sc = true,
+                            _ => return Err(format!("wc: -{}: unknown flag (usage: wc [-l] [-w] [-c] [file])", ch)),
+                        }
+                    }
+                }
+                if !(sl || sw || sc) {
+                    sl = true;
+                    sw = true;
+                    sc = true;
+                }
+                let mut parts: Vec<String> = Vec::new();
+                if sl {
+                    parts.push(format!("{}", l));
+                }
+                if sw {
+                    parts.push(format!("{}", w));
+                }
+                if sc {
+                    parts.push(format!("{}", c));
+                }
+                Ok(alloc::vec![parts.join(" ")])
+            }
+            "head" | "tail" => {
+                let mut n = 10usize;
+                let mut it = args.iter();
+                while let Some(a) = it.next() {
+                    if a == "-n" {
+                        let Some(v) = it.next().and_then(|v| v.parse::<usize>().ok()) else {
+                            return Err(format!("usage: {} [-n N | -N] [file]", verb));
+                        };
+                        n = v;
+                    } else if let Some(v) = a.strip_prefix('-') {
+                        match v.parse::<usize>() {
+                            Ok(v) => n = v,
+                            Err(_) => return Err(format!("usage: {} [-n N | -N] [file]", verb)),
+                        }
+                    }
+                }
+                let v: Vec<String> = if verb == "head" {
+                    input.iter().take(n).cloned().collect()
+                } else {
+                    input.iter().skip(input.len().saturating_sub(n)).cloned().collect()
+                };
+                Ok(v)
+            }
+            other => Err(format!("{}: not a filter", other)),
+        }
+    }
+
+    /// The file operand of a filter line (what it reads when no pipeline feeds it): the operand after the pattern for
+    /// `grep`, the first operand for the others; `-n`'s value is not an operand.
+    pub fn filter_file<'a>(verb: &str, args: &'a [String]) -> Option<&'a str> {
+        let mut ops: Vec<&str> = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if (verb == "head" || verb == "tail") && a == "-n" {
+                it.next();
+                continue;
+            }
+            if a.starts_with('-') && a.len() > 1 {
+                continue;
+            }
+            ops.push(a.as_str());
+        }
+        let skip = if verb == "grep" { 1 } else { 0 };
+        ops.get(skip).copied()
+    }
+}
+
+// ── MIDDEN2: the shell module's host tests ────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod midden2_tests {
+    extern crate std;
+    use super::shell::*;
+    use super::Facts;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    fn st(c: &Cmd) -> Vec<&str> {
+        c.stages.iter().map(|s| s.as_str()).collect()
+    }
+
+    #[test]
+    fn a_line_cuts_into_commands_and_stages_outside_quotes() {
+        let c = split("ls /apps | grep ELF && pwd ; echo 'a | b' || echo \"x;y\"").unwrap();
+        assert_eq!(c.len(), 4);
+        assert_eq!(st(&c[0]), ["ls /apps", "grep ELF"]);
+        assert_eq!(c[0].join, Join::And);
+        assert_eq!(st(&c[1]), ["pwd"]);
+        assert_eq!(c[1].join, Join::Seq);
+        assert_eq!(st(&c[2]), ["echo 'a | b'"]);
+        assert_eq!(c[2].join, Join::Or);
+        assert_eq!(st(&c[3]), ["echo \"x;y\""]);
+        assert_eq!(c[3].join, Join::Seq);
+        assert_eq!(split("").unwrap(), []);
+        assert_eq!(split("  ;; ls ; ").unwrap().len(), 1);
+        assert_eq!(split("echo hi # a comment | not a pipe").unwrap(), [Cmd { stages: ["echo hi".to_string()].into(), join: Join::Seq }]);
+        assert_eq!(split("echo a#b").unwrap()[0].stages[0], "echo a#b");
+    }
+
+    #[test]
+    fn an_operator_with_an_empty_side_or_an_open_quote_is_refused_by_name() {
+        assert_eq!(split("| wc"), Err(SplitError::Empty("|")));
+        assert_eq!(split("ls |"), Err(SplitError::Empty("|")));
+        assert_eq!(split("ls && "), Err(SplitError::Empty("&&")));
+        assert_eq!(split("&& ls"), Err(SplitError::Empty("&&")));
+        assert_eq!(split("ls || ; pwd"), Err(SplitError::Empty("||")));
+        assert_eq!(split("echo 'open"), Err(SplitError::Unterminated('\'')));
+        assert!(split("ls |").unwrap_err().text().contains("`|`"));
+    }
+
+    #[test]
+    fn and_or_follow_the_last_command_that_ran() {
+        assert!(should_run(Join::Seq, false) && should_run(Join::Seq, true));
+        assert!(should_run(Join::And, true) && !should_run(Join::And, false));
+        assert!(should_run(Join::Or, false) && !should_run(Join::Or, true));
+    }
+
+    #[test]
+    fn words_drop_one_level_of_quotes() {
+        assert_eq!(words("grep 'a b' file"), ["grep", "a b", "file"]);
+        assert_eq!(words("echo \"\" x"), ["echo", "", "x"]);
+    }
+
+    #[test]
+    fn aliases_define_expand_and_stop_on_a_cycle() {
+        assert_eq!(parse_alias("ll='ls -l'"), Some(("ll".into(), "ls -l".into())));
+        assert_eq!(parse_alias("x=pwd"), Some(("x".into(), "pwd".into())));
+        assert_eq!(parse_alias("no equals"), None);
+        assert_eq!(parse_alias("-x=pwd"), None);
+        let a: Vec<(String, String)> = [("ll", "ls -l"), ("ls", "ls -a"), ("p", "q"), ("q", "p")].iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        assert_eq!(expand_alias("ll /apps", &a).as_deref(), Some("ls -a -l /apps"));
+        assert_eq!(expand_alias("ls", &a).as_deref(), Some("ls -a"));
+        assert_eq!(expand_alias("p", &a).as_deref(), Some("p"));
+        assert_eq!(expand_alias("pwd", &a), None);
+    }
+
+    #[test]
+    fn completion_finds_the_word_its_position_and_the_candidates() {
+        assert_eq!(word_at("histo", 5), (0, true));
+        assert_eq!(word_at("ls /ap", 6), (3, false));
+        assert_eq!(word_at("ls | gr", 7), (5, true));
+        assert_eq!(word_at("pwd && ec", 9), (7, true));
+        let f = Facts::ring3(true);
+        assert_eq!(verb_candidates("histo", &f, &[]), ["history"]);
+        assert_eq!(verb_candidates("al", &f, BUILTINS), ["alias"]);
+        assert!(verb_candidates("r", &f, BUILTINS).contains(&"run".to_string()));
+        let names = ["MIDDEN.ELF", "MAP.ELF", "docs/"];
+        let c = path_candidates("mi", names.iter().copied());
+        assert_eq!(c, ["MIDDEN.ELF"]);
+        assert_eq!(complete_word("mi", &c), Some(("MIDDEN.ELF".into(), true)));
+        let c = path_candidates("m", names.iter().copied());
+        assert_eq!(complete_word("m", &c), None, "MAP/MIDDEN share only the M");
+        let c: Vec<String> = ["history".into(), "historic".into()].into();
+        assert_eq!(complete_word("h", &c), Some(("histor".into(), false)));
+    }
+
+    #[test]
+    fn history_search_walks_older_and_secrets_are_not_kept() {
+        let h: Vec<String> = ["cd /apps", "ls", "cd /home", "pwd"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(search_back(&h, "cd", h.len()), Some(2));
+        assert_eq!(search_back(&h, "cd", 2), Some(0));
+        assert_eq!(search_back(&h, "cd", 0), None);
+        assert_eq!(search_back(&h, "", 4), None);
+        assert!(keep_in_history("ls"));
+        assert!(!keep_in_history(" ls"));
+        assert!(!keep_in_history("login peter qwerty"));
+        assert!(!keep_in_history("   "));
+    }
+
+    #[test]
+    fn the_filters_read_a_stream_of_lines() {
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+        let input = s(&["alpha beta gamma", "Beta two", "three"]);
+        assert_eq!(filter("wc", &[], &s(&["alpha beta gamma"])).unwrap(), ["1 3 17"]);
+        assert_eq!(filter("wc", &s(&["-l"]), &input).unwrap(), ["3"]);
+        assert_eq!(filter("grep", &s(&["beta"]), &input).unwrap(), ["alpha beta gamma"]);
+        assert_eq!(filter("grep", &s(&["-i", "beta"]), &input).unwrap(), ["alpha beta gamma", "Beta two"]);
+        assert_eq!(filter("grep", &s(&["-vc", "beta"]), &input).unwrap(), ["2"]);
+        assert_eq!(filter("grep", &s(&["-n", "three"]), &input).unwrap(), ["3:three"]);
+        assert!(filter("grep", &[], &input).unwrap_err().starts_with("usage: grep"));
+        assert_eq!(filter("head", &s(&["-n", "1"]), &input).unwrap(), ["alpha beta gamma"]);
+        assert_eq!(filter("tail", &s(&["-2"]), &input).unwrap(), ["Beta two", "three"]);
+        assert_eq!(filter_file("grep", &s(&["-i", "x", "f.txt"])), Some("f.txt"));
+        assert_eq!(filter_file("head", &s(&["-n", "5", "f.txt"])), Some("f.txt"));
+        assert_eq!(filter_file("wc", &s(&["-l"])), None);
+        for v in FILTERS {
+            assert!(super::is_verb(v, &Facts::ring3(true)), "{} must be a host verb on ring 3", v);
+        }
+        for v in BUILTINS {
+            assert!(!super::shell::FILTERS.contains(v));
+        }
+    }
+}
