@@ -24,6 +24,19 @@
 //! spawn's timings. PASS = the image validated in the ELF model with a windowed note, the program reported PASS
 //! (it read the page) with `lines > 0` and `painted > 0`.
 //!
+//! 4. DRIVE (AETHERMETAL M3, LEDGER SR96). Before the kill, the fixture plays the operator into the program's
+//!    ring by owner (`user_input_push_owner`, unaapp.rs's channel), one step per wire line, each watched at the
+//!    seam (`line_watch_arm`) and read from the verdict tail: Tab (`:: AETHER: focus -> PASS href=… at=x0,y,x1`
+//!    — the first link's first text box, window px), the pointer pinned to the window's corner by a large
+//!    MOUSE_REL and moved onto that box (`:: AETHER: hover -> PASS href=…` → `hover=1`), a left-button drag
+//!    across it (`:: AETHER: select -> PASS chars=<n>` → `select=<n>`), Ctrl+C (`:: AETHER: clip … set=<rc>`,
+//!    reported, not judged: the clipboard answers only the FOCUSED program), and a click on the link
+//!    (`:: AETHER: nav -> PASS how=click path=…` → `nav=1`: welcome.html's first link is keys.html beside it).
+//!
+//! WITNESS (M3). `:: AETHERAPP: image=/apps/AETHER.ELF window=<…> painted=<n> lines=<n> hover=<0|1> nav=<0|1>
+//! select=<n> -> PASS|FAIL|SKIP ::` — PASS additionally needs hover=1, nav=1 and select > 0; `[aetherapp] drive
+//! …` carries each step's tail and the clip rc.
+//!
 //! The knob is `UNAOS_AETHER=1` → feature `aether` (it implies `selfdiag`: SYS_PATH_READ is the file surface the
 //! program reads the page and the faces through). Registered from `tests::ensure_shellux`, so the QEMU lanes
 //! (`tests-at-boot`) run it at boot and the desktop runs it as `tests aether`.
@@ -45,15 +58,19 @@ pub fn ensure() {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn selftest() {
     serial_println!(":: AETHERAPP: reason=aarch64-image-owed ::");
-    serial_println!(":: AETHERAPP: image={} window=bad painted=0 lines=0 -> SKIP reason=aarch64-image-owed ::", IMAGE);
+    serial_println!(":: AETHERAPP: image={} window=bad painted=0 lines=0 hover=0 nav=0 select=0 -> SKIP reason=aarch64-image-owed ::", IMAGE);
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn selftest() {
-    let verdict = |window: &str, painted: u64, lines: u64, v: &str| {
+    let verdict_m3 = |window: &str, painted: u64, lines: u64, d: &Drive, v: &str| {
         crate::serial_line::tail_arm(); // the glass reads THIS line's tail, not the program's
-        serial_println!(":: AETHERAPP: image={} window={} painted={} lines={} -> {} ::", IMAGE, window, painted, lines, v);
+        serial_println!(
+            ":: AETHERAPP: image={} window={} painted={} lines={} hover={} nav={} select={} -> {} ::",
+            IMAGE, window, painted, lines, d.hover as u8, d.nav as u8, d.select, v
+        );
     };
+    let verdict = |window: &str, painted: u64, lines: u64, v: &str| verdict_m3(window, painted, lines, &Drive::default(), v);
     let why = |r: &str| serial_println!(":: AETHERAPP: reason={} ::", r);
     let (img, window) = match check(&why) {
         Ok(t) => t,
@@ -98,6 +115,8 @@ pub fn selftest() {
         crate::arch::sched::yield_now();
     }
     let tail = crate::serial_line::tail_take();
+    // M3: play the operator into the ring before the kill (only once the program has painted its page).
+    let drive = if hit && tail.as_deref().is_some_and(|t| t.starts_with("PASS")) { drive(slot) } else { Drive::default() };
     let killed = crate::arch::syscall::bg_kill(pid, slot);
     serial_println!(
         "[aetherapp] pid={} slot={} entry={:#x} sight_ms={} spawn_ms={} report_ms={} wait_ms={} kill={} tail={:?}",
@@ -121,7 +140,100 @@ pub fn selftest() {
     if !ok {
         why(if !t.starts_with("PASS") { "program-said-fail" } else { "nothing-painted" });
     }
-    verdict(window, painted, lines, if ok { "PASS" } else { "FAIL" });
+    serial_println!(
+        "[aetherapp] drive focus={:?} hover={:?} select={:?} clip={:?} nav={:?}",
+        drive.tails[0].as_deref(), drive.tails[1].as_deref(), drive.tails[2].as_deref(), drive.tails[3].as_deref(), drive.tails[4].as_deref()
+    );
+    let m3 = drive.hover && drive.nav && drive.select > 0;
+    if ok && !m3 {
+        why(if drive.tails[0].is_none() { "no-focus-line" } else if !drive.hover { "no-hover" } else if drive.select == 0 { "no-selection" } else { "no-nav" });
+    }
+    verdict_m3(window, painted, lines, &drive, if ok && m3 { "PASS" } else { "FAIL" });
+}
+
+/// AETHERMETAL M3 (SR96): what the drive read back — each step's verdict tail (focus, hover, select, clip, nav)
+/// and the three facts the witness carries.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+struct Drive {
+    tails: [Option<alloc::string::String>; 5],
+    hover: bool,
+    nav: bool,
+    select: u64,
+}
+
+/// One drive step: arm the seam's watch on `prefix`, push `evs` into the program's ring (owner `slot + 1`), wait up
+/// to `STEP_MS` for the line, and return its verdict tail.
+#[cfg(target_arch = "x86_64")]
+fn step(slot: u64, prefix: &'static str, evs: &[u64]) -> Option<alloc::string::String> {
+    const STEP_MS: u64 = 3_000;
+    crate::serial_line::line_watch_arm(prefix);
+    crate::serial_line::tail_arm();
+    for &e in evs {
+        if !crate::arch::syscall::user_input_push_owner(slot + 1, e) {
+            crate::serial_line::line_watch_disarm();
+            let _ = crate::serial_line::tail_take();
+            return None;
+        }
+    }
+    let t0 = crate::arch::ticks();
+    let mut hit = false;
+    while crate::arch::ticks() < t0 + STEP_MS {
+        if crate::serial_line::line_watch_hit() {
+            hit = true;
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    crate::serial_line::line_watch_disarm();
+    let t1 = crate::arch::ticks();
+    while hit && crate::arch::ticks() < t1 + 50 {
+        crate::arch::sched::yield_now();
+    }
+    let tail = crate::serial_line::tail_take();
+    if hit { tail } else { None }
+}
+
+/// The packed events the drive pushes (the router's encoding, `una_abi::input_ev_pack`).
+#[cfg(target_arch = "x86_64")]
+fn key(b: u8) -> u64 {
+    una_abi::input_ev_pack(una_abi::INPUT_EV_KEY_DOWN, b as u64)
+}
+#[cfg(target_arch = "x86_64")]
+fn rel(dx: i64, dy: i64) -> u64 {
+    una_abi::input_ev_pack(una_abi::INPUT_EV_MOUSE_REL, (((dx as i16 as u16) as u64) << 16) | (dy as i16 as u16) as u64)
+}
+#[cfg(target_arch = "x86_64")]
+fn button(mask: u8) -> u64 {
+    una_abi::input_ev_pack(una_abi::INPUT_EV_BUTTON, mask as u64)
+}
+
+/// `key=<int>[,<int>…]` out of a tail: the integers after `key`, comma separated.
+#[cfg(target_arch = "x86_64")]
+fn ints(t: &str, key: &str) -> alloc::vec::Vec<i64> {
+    let Some(at) = t.find(key) else { return alloc::vec::Vec::new() };
+    let rest = &t[at + key.len()..];
+    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '-' || c == ',')).unwrap_or(rest.len());
+    rest[..end].split(',').filter_map(|d| d.parse().ok()).collect()
+}
+
+/// AETHERMETAL M3: Tab → the first link's box; pointer onto it (hover); drag across it (select); Ctrl+C (clip);
+/// click (nav).
+#[cfg(target_arch = "x86_64")]
+fn drive(slot: u64) -> Drive {
+    let mut d = Drive::default();
+    d.tails[0] = step(slot, ":: AETHER: focus", &[key(b'\t')]);
+    let at = d.tails[0].as_deref().filter(|t| t.starts_with("PASS")).map(|t| ints(t, "at=")).unwrap_or_default();
+    let [x0, y, x1] = at[..] else { return d };
+    d.tails[1] = step(slot, ":: AETHER: hover", &[rel(-2000, -2000), rel(x0 + 2, y)]);
+    d.hover = d.tails[1].as_deref().is_some_and(|t| t.starts_with("PASS"));
+    let span = (x1 - x0 - 4).max(4);
+    d.tails[2] = step(slot, ":: AETHER: select", &[button(1), rel(span, 0), button(0)]);
+    d.select = d.tails[2].as_deref().filter(|t| t.starts_with("PASS")).and_then(|t| ints(t, "chars=").first().copied()).unwrap_or(0).max(0) as u64;
+    d.tails[3] = step(slot, ":: AETHER: clip", &[key(0x03)]);
+    d.tails[4] = step(slot, ":: AETHER: nav", &[button(1), button(0)]);
+    d.nav = d.tails[4].as_deref().is_some_and(|t| t.starts_with("PASS"));
+    d
 }
 
 /// The static half: the image off the program volume, the loader's plan, the app note. `Ok((image, window))`;

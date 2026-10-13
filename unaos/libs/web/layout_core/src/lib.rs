@@ -28,6 +28,7 @@ pub mod blockwidth;
 pub mod collapse;
 pub mod css;
 pub mod fmath;
+pub mod hit;
 pub mod inline;
 pub mod lines;
 mod map;
