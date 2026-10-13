@@ -250,22 +250,40 @@ pub fn spawn_http(mut req: HttpReq, p: Poster) {
     // AETHERSTORAGE (SR94): Service Workers §6.4 "handle fetch" — a controlled page's request is the
     // controlling worker's `fetch` event first (decided here, on the page thread); its answer, if any, is
     // the response, and the network serves the request otherwise.
+    // AETHERSW (SR104): the event carries the request's mode and destination; `workers::sw::vet` refuses an
+    // opaque answer to a cors / same-origin request, and a rejected `respondWith` is a network error here.
     let sw = crate::workers::sw::fetch_handle(&req.url);
     std::thread::spawn(move || {
         if let Some((h, client)) = sw {
-            if let Some(r) = h.fetch(&req.method, &req.url, &req.headers, &req.body, client) {
-                let head = vec![
-                    NetArg::Num(r.status as f64),
-                    NetArg::Str(r.status_text),
-                    NetArg::Str(if r.url.is_empty() { req.url.clone() } else { r.url }),
-                    NetArg::List(header_list(&r.headers)),
-                    NetArg::Bool(false),
-                    NetArg::Str("basic".into()),
-                ];
-                if p.post("head", head) && (r.body.is_empty() || p.post("data", vec![NetArg::Bytes(r.body)])) {
-                    p.finish("end", vec![]);
+            use crate::workers::sw::{SwAnswer, SwRequest};
+            let q = SwRequest { method: &req.method, url: &req.url, headers: &req.headers, body: &req.body, client, mode: &ctx.mode, destination: &ctx.destination };
+            match h.fetch(&q) {
+                SwAnswer::Respond(r) => {
+                    let opaque = r.kind == "opaque";
+                    let kind = match r.kind.as_str() {
+                        "opaque" => "opaque",
+                        "cors" => "cors",
+                        _ => "basic",
+                    };
+                    let head = vec![
+                        NetArg::Num(if opaque { 0.0 } else { r.status as f64 }),
+                        NetArg::Str(if opaque { String::new() } else { r.status_text }),
+                        NetArg::Str(if opaque { String::new() } else if r.url.is_empty() { req.url.clone() } else { r.url }),
+                        NetArg::List(if opaque { Vec::new() } else { header_list(&r.headers) }),
+                        NetArg::Bool(false),
+                        NetArg::Str(kind.into()),
+                    ];
+                    if p.post("head", head) && (opaque || r.body.is_empty() || p.post("data", vec![NetArg::Bytes(r.body)])) {
+                        p.finish("end", vec![]);
+                    }
+                    return;
                 }
-                return;
+                SwAnswer::Error(e) => {
+                    crate::ledger::record_js(&format!("sw-network-error:{}", crate::js::clip(&req.url, 48)));
+                    p.finish("error", vec![NetArg::Str(e)]);
+                    return;
+                }
+                SwAnswer::Network => {}
             }
         }
         let ex = match policed_send(&req, &ctx) {

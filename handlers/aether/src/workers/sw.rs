@@ -27,8 +27,27 @@
 //! in-scope uncontrolled document of the key and tells it (`controllerchange`). [`fetch_handle`] — called by
 //! `api::fetch::spawn_http` on the page thread, for `fetch()` and asynchronous `XMLHttpRequest` — answers the
 //! controlling worker's handle; on the request's own thread [`SwHandle::fetch`] dispatches a `fetch` event and
-//! waits for its answer, `None` meaning "go to the network". [`intercept_navigation`] is the same question for a
-//! top-level navigation; the navigation loader's call to it is owed (outside this arc's files).
+//! waits for its answer. [`intercept_navigation`] is the same question for a top-level navigation.
+//!
+//! # AETHERSW (LEDGER SR104): pages a worker actually controls
+//! - **The interception rule.** A top-level navigation to an http(s) URL in a secure context
+//!   (`security::origin::is_potentially_trustworthy_url`) is handed to the active worker of the registration whose
+//!   scope is the longest prefix of the URL under the URL's own storage key (`net::fetch_document_final` →
+//!   [`intercept_navigation`]); every subresource of a document that worker controls — the page loader's sheets,
+//!   scripts, fonts and images (`net::fetch_page` → [`navigation_controller`]) and the page's `fetch()` / XHR
+//!   (`api::fetch::spawn_http` → [`fetch_handle`]) — goes to the same worker, whatever its URL's origin.
+//! - **The answer** ([`SwAnswer`]): no `respondWith` → [`SwAnswer::Network`] (the request goes out as if no
+//!   worker existed; a worker that stopped or timed out is the same, ledgered `sw-fetch-fallback`); a Response →
+//!   [`SwAnswer::Respond`]; a rejected `respondWith` or `Response.error()` → [`SwAnswer::Error`], a network error.
+//! - **Policy** ([`vet`], through `security::refusal`, no switch of its own): an OPAQUE answer is only for a
+//!   `no-cors` request — answering a `navigate`, `cors` or `same-origin` request with one is refused
+//!   (`security-sw-opaque-response`), and a `cors`-typed answer to a `same-origin` request likewise
+//!   (`security-sw-same-origin-mode`); registration stays same-origin (§4.2 above, `security::origin::Origin`).
+//! - **The update check on navigation** (§6.4 step "Soft Update", §4.2.4 Update step 7): after a navigation the
+//!   registration's script is re-fetched on a thread ([`soft_update`], one in flight per registration) and
+//!   byte-compared with the active script; only a different script installs a new worker. The fetch bypasses the
+//!   HTTP cache (`:cache-mode` `no-cache`) unless `updateViaCache` is `all` and the last update check is under
+//!   [`STALE_SECS`] (24 h) old — the registration's `lastUpdateCheck` is persisted with it.
 
 use super::realm::{self, Cmd, Outcome, RealmCtx, SwResponse};
 use kvstore_core::dir::DirBacking;
@@ -38,6 +57,60 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Mutex, OnceLock};
+
+/// §4.2.4 Update step 7: a registration whose last update check is older than this is STALE, and its script
+/// fetch bypasses the HTTP cache whatever `updateViaCache` says.
+pub const STALE_SECS: u64 = 86_400;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// One request a `fetch` event carries.
+pub struct SwRequest<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
+    pub body: &'a [u8],
+    /// The requesting document's serial (`event.clientId`; 0 for a navigation, which has no client yet).
+    pub client: u64,
+    /// `navigate` | `cors` | `no-cors` | `same-origin`.
+    pub mode: &'a str,
+    /// `document`, `style`, `script`, `font`, `image`, or empty (`fetch()`).
+    pub destination: &'a str,
+}
+
+/// How a controlled request is answered.
+#[derive(Debug, Clone)]
+pub enum SwAnswer {
+    /// No worker answered (no `respondWith`, no controller, or the worker stopped): the network serves it.
+    Network,
+    /// The worker's Response (already vetted by [`vet`]).
+    Respond(SwResponse),
+    /// A network error (a rejected `respondWith`, `Response.error()`, or a refused answer).
+    Error(String),
+}
+
+/// AETHERSW (SR104): the policy on a worker's answer — what a worker may hand back to which request. Refusals
+/// are `security::refusal` lines (`security-sw-*`), never a switch of this module's own.
+pub fn vet(mode: &str, url: &str, r: SwResponse) -> SwAnswer {
+    match r.kind.as_str() {
+        "error" => SwAnswer::Error(format!("The service worker answered '{url}' with a network error.")),
+        "opaque" if mode != "no-cors" => SwAnswer::Error(crate::security::refusal(
+            "sw-opaque-response",
+            url,
+            &format!("The service worker answered a '{mode}' request for '{url}' with an opaque response; only a 'no-cors' request may receive one."),
+            None,
+        )),
+        "cors" if mode == "same-origin" => SwAnswer::Error(crate::security::refusal(
+            "sw-same-origin-mode",
+            url,
+            &format!("The service worker answered a 'same-origin' request for '{url}' with a cross-origin (cors) response."),
+            None,
+        )),
+        _ => SwAnswer::Respond(r),
+    }
+}
 
 /// A running worker's command channel.
 #[derive(Clone)]
@@ -52,19 +125,24 @@ impl SwHandle {
         rrx.recv_timeout(realm::EVENT_LIMIT + std::time::Duration::from_secs(1)).map_err(|_| "the service worker did not answer".to_string())?
     }
 
-    /// §6.4 "handle fetch": a `fetch` event for the request; `None` = the network serves it.
-    pub fn fetch(&self, method: &str, url: &str, headers: &[(String, String)], body: &[u8], client: u64) -> Option<SwResponse> {
-        let mut hex = String::with_capacity(body.len() * 2);
-        for b in body {
+    /// §6.4 "handle fetch": a `fetch` event for the request, its answer vetted by [`vet`].
+    pub fn fetch(&self, q: &SwRequest) -> SwAnswer {
+        let mut hex = String::with_capacity(q.body.len() * 2);
+        for b in q.body {
             hex.push_str(&format!("{b:02x}"));
         }
-        let hl: Vec<J> = headers.iter().filter(|(k, _)| !k.starts_with(':')).map(|(k, v)| json!([k, v])).collect();
-        let payload = json!({ "method": method, "url": url, "headers": hl, "body": hex, "clientId": client.to_string(), "mode": "cors" });
+        let hl: Vec<J> = q.headers.iter().filter(|(k, _)| !k.starts_with(':')).map(|(k, v)| json!([k, v])).collect();
+        let (client, resulting) = if q.mode == "navigate" { (String::new(), "navigation".to_string()) } else { (q.client.to_string(), String::new()) };
+        let payload = json!({
+            "method": q.method, "url": q.url, "headers": hl, "body": hex, "clientId": client, "resultingClientId": resulting,
+            "mode": if q.mode.is_empty() { "cors" } else { q.mode }, "destination": q.destination,
+        });
         match self.event("fetch", payload.to_string()) {
-            Ok(o) => o.response,
+            Ok(Outcome { response: Some(r), .. }) => vet(q.mode, q.url, r),
+            Ok(_) => SwAnswer::Network,
             Err(e) => {
                 crate::ledger::record_js(&format!("sw-fetch-fallback:{}", crate::js::clip(&e, 48)));
-                None
+                SwAnswer::Network
             }
         }
     }
@@ -85,6 +163,8 @@ struct Reg {
     active: Option<SwHandle>,
     /// A worker installed while the active one still controls documents.
     waiting: Option<(SwHandle, String, String)>,
+    /// AETHERSW: when the script was last fetched for an update check (unix seconds; 0 = never).
+    last_check: u64,
 }
 
 #[derive(Default)]
@@ -135,6 +215,7 @@ fn load_all() -> Vec<Reg> {
                 script,
                 active: None,
                 waiting: None,
+                last_check: j.get("lastUpdateCheck").and_then(J::as_u64).unwrap_or(0),
             });
         }
         out
@@ -146,7 +227,7 @@ fn persist(r: &Reg) -> Result<(), String> {
     with_db(|s| {
         let mut t = s.begin();
         let k = reg_key(&r.key, &r.scope);
-        let v = json!({ "scope": r.scope, "scriptURL": r.script_url, "updateViaCache": r.update_via_cache }).to_string();
+        let v = json!({ "scope": r.scope, "scriptURL": r.script_url, "updateViaCache": r.update_via_cache, "lastUpdateCheck": r.last_check }).to_string();
         let res = s
             .create_tree(&mut t, "reg")
             .and_then(|_| s.create_tree(&mut t, "script"))
@@ -185,19 +266,31 @@ fn forget(key: &str, scope: &str) {
 
 /// A script's text (`importScripts`, the registration's fetch): http(s) through the policed client.
 pub fn fetch_script(url: &str) -> Result<String, String> {
-    fetch_script_full(url).map(|(t, _)| t)
+    fetch_script_full(url, false).map(|(t, _)| t)
+}
+
+/// §4.2.4 Update step 7: whether the script fetch bypasses the HTTP cache — unless `updateViaCache` is `all`,
+/// always; under `all`, only once the registration is stale (its last update check [`STALE_SECS`] ago or more).
+pub fn bypass_http_cache(update_via_cache: &str, last_check: u64, now: u64) -> bool {
+    update_via_cache != "all" || last_check == 0 || now.saturating_sub(last_check) >= STALE_SECS
 }
 
 /// The script and its response headers; refuses a non-2xx answer and a non-JavaScript MIME type (§4.2.4
 /// step 9 "Update" → "fetch a classic worker script": the MIME type must be a JavaScript MIME type).
-fn fetch_script_full(url: &str) -> Result<(String, Vec<(String, String)>), String> {
+/// `no_cache`: the request's cache mode is `no-cache` (validate with the server, [`bypass_http_cache`]).
+fn fetch_script_full(url: &str, no_cache: bool) -> Result<(String, Vec<(String, String)>), String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("the script URL scheme is not http(s): {url}"));
+    }
+    let mut headers = vec![("Service-Worker".to_string(), "script".to_string())];
+    if no_cache {
+        // AETHERCACHE's pseudo-field (`policed_send` lifts it into the request's cache mode).
+        headers.push((":cache-mode".to_string(), "no-cache".to_string()));
     }
     let r = crate::api::fetch::http_sync(crate::api::fetch::HttpReq {
         method: "GET".into(),
         url: url.to_string(),
-        headers: vec![("Service-Worker".into(), "script".into())],
+        headers,
         body: Vec::new(),
         redirect: "error".into(),
         timeout_ms: 30_000,
@@ -282,7 +375,16 @@ pub fn register(key: &str, page_url: &str, script_url: &str, scope: Option<&str>
     if origin_of(&scope) != page_origin {
         return Err(("SecurityError", format!("The origin of the provided scope ('{}') does not match the current origin ('{page_origin}').", origin_of(&scope))));
     }
-    let (text, headers) = fetch_script_full(&script).map_err(|e| ("TypeError", format!("Failed to register a ServiceWorker for scope ('{scope}') with script ('{script}'): {e}")))?;
+    // §4.2.4 Update step 7 (the 24 h rule): the existing registration's mode and last check decide the cache mode.
+    let now = now_secs();
+    let no_cache = {
+        let w = world();
+        match w.regs.iter().find(|r| r.key == key && r.scope == scope) {
+            Some(r) => bypass_http_cache(&r.update_via_cache, r.last_check, now),
+            None => bypass_http_cache(update_via_cache, 0, now),
+        }
+    };
+    let (text, headers) = fetch_script_full(&script, no_cache).map_err(|e| ("TypeError", format!("Failed to register a ServiceWorker for scope ('{scope}') with script ('{script}'): {e}")))?;
     let max_scope = match headers.iter().find(|(k, _)| k == "service-worker-allowed") {
         Some((_, v)) => html_core::url::Url::parse(&script).and_then(|b| b.join(v)).map(|u| u.to_string()).unwrap_or_else(|_| dir_of(&script)),
         None => dir_of(&script),
@@ -300,6 +402,7 @@ pub fn register(key: &str, page_url: &str, script_url: &str, scope: Option<&str>
         let mut w = world();
         if let Some(r) = w.regs.iter_mut().find(|r| r.key == key && r.scope == scope) {
             r.update_via_cache = update_via_cache.to_string();
+            r.last_check = now;
             if r.script_url == script && r.script == text {
                 let out = reg_json(r);
                 let snapshot = r.clone();
@@ -337,12 +440,14 @@ pub fn register(key: &str, page_url: &str, script_url: &str, scope: Option<&str>
                 script: String::new(),
                 active: None,
                 waiting: None,
+                last_check: now,
             });
             w.regs.len() - 1
         }
     };
     let activate_now = !busy || skip;
     let r = &mut w.regs[idx];
+    r.last_check = now;
     if activate_now {
         if let Some(old) = r.active.take() {
             old.stop();
@@ -474,15 +579,61 @@ pub fn fetch_handle(url: &str) -> Option<(SwHandle, u64)> {
     start_active(r).map(|h| (h, doc))
 }
 
-/// A top-level navigation to `url` from a page of storage key `key`: the matching registration's worker
-/// answers its `fetch` event (`None` = the network). The navigation loader's call is owed.
-pub fn intercept_navigation(key: &str, url: &str) -> Option<SwResponse> {
-    let h = {
-        let mut w = world();
-        let i = matching(&w, key, url)?;
-        start_active(&mut w.regs[i])?
-    };
-    h.fetch("GET", url, &[("Accept".into(), "text/html".into())], &[], 0)
+/// AETHERSW: may a worker see a top-level navigation to `url` at all? Only an http(s) URL in a secure context
+/// (Service Workers §6.4 step 4: a non-subresource request whose reserved client is not a secure context is
+/// never handled; Secure Contexts §3.2 through `security::origin`).
+pub fn may_intercept_navigation(url: &str) -> bool {
+    (url.starts_with("http://") || url.starts_with("https://")) && crate::security::origin::is_potentially_trustworthy_url(url)
+}
+
+/// The storage key a top-level document at `url` gets (its origin; the top-level site is its own).
+fn navigation_key(url: &str) -> String {
+    crate::storage::storage_key(url, &origin_of(url))
+}
+
+/// The worker that controls a top-level document at `url` (started on demand): the active worker of the
+/// longest-scope registration matching `url` under its storage key, and that scope. `None`: the document is
+/// not controlled (no registration, no active worker, or [`may_intercept_navigation`] refuses).
+pub fn navigation_controller(url: &str) -> Option<(SwHandle, String)> {
+    if !may_intercept_navigation(url) {
+        return None;
+    }
+    let key = navigation_key(url);
+    let mut w = world();
+    let i = matching(&w, &key, url)?;
+    let scope = w.regs[i].scope.clone();
+    start_active(&mut w.regs[i]).map(|h| (h, scope))
+}
+
+/// A top-level navigation to `url`: the controlling worker's `fetch` event (mode `navigate`, destination
+/// `document`) answers it, then the registration's update check runs ([`soft_update`], off this thread).
+pub fn intercept_navigation(url: &str) -> SwAnswer {
+    let Some((h, scope)) = navigation_controller(url) else { return SwAnswer::Network };
+    let headers = vec![("Accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string())];
+    let answer = h.fetch(&SwRequest { method: "GET", url, headers: &headers, body: &[], client: 0, mode: "navigate", destination: "document" });
+    soft_update(&navigation_key(url), &scope);
+    answer
+}
+
+/// Service Workers §4.2 "Soft Update" for the registration (`key`, `scope`): an Update job on its own thread
+/// (the 24 h cache rule and the byte comparison are [`register`]'s); a second request while one runs is dropped.
+pub fn soft_update(key: &str, scope: &str) {
+    static RUNNING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let id = format!("{key}\n{scope}");
+    let set = RUNNING.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if !set.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone()) {
+        return;
+    }
+    let (key, scope, held) = (key.to_string(), scope.to_string(), id.clone());
+    let spawned = std::thread::Builder::new().name("aether-sw-update".into()).spawn(move || {
+        if let Err((name, m)) = update(&key, &scope, &scope) {
+            crate::ledger::record_js(&format!("sw-soft-update-failed:{name}:{}", crate::js::clip(&m, 40)));
+        }
+        set.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    });
+    if spawned.is_err() {
+        set.lock().unwrap_or_else(|e| e.into_inner()).remove(&held);
+    }
 }
 
 /// `clients.matchAll()` for a worker: the documents it controls (all documents of the key with
@@ -578,5 +729,16 @@ mod tests {
     fn scope_directory() {
         assert_eq!(dir_of("https://a.example/x/sw.js?v=1"), "https://a.example/x/");
         assert_eq!(dir_of("https://a.example/sw.js"), "https://a.example/");
+    }
+
+    /// §4.2.4 Update step 7: `all` keeps the HTTP cache only while the registration is fresh.
+    #[test]
+    fn the_24h_rule() {
+        let now = 10 * STALE_SECS;
+        assert!(bypass_http_cache("imports", now - 5, now));
+        assert!(bypass_http_cache("none", now - 5, now));
+        assert!(!bypass_http_cache("all", now - 5, now));
+        assert!(bypass_http_cache("all", now - STALE_SECS, now));
+        assert!(bypass_http_cache("all", 0, now));
     }
 }

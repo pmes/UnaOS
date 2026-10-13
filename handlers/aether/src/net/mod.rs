@@ -142,6 +142,10 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
 
     let mut last_err = None;
     for url in urls {
+        // AETHERSW (SR104): a navigation under a registered scope is the controlling worker's `fetch` event first.
+        if let Some(answer) = sw_navigate(&url).await {
+            return answer;
+        }
         match get(&url, Priority::Document, None).await {
             Ok(response) => {
                 if !response.status().is_success() {
@@ -173,6 +177,122 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
     }
     
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to fetch URL")))
+}
+
+// ------------------------------------------------------------------------------------------ AETHERSW (SR104)
+//
+// Service Workers §6.4 "handle fetch" at the page loader: the navigation (`fetch_document_final` →
+// `sw_navigate` → `workers::sw::intercept_navigation`) and the controlled document's subresources (`fetch_page`
+// → `workers::sw::navigation_controller` → `Loader::sw` → `sw_subresource`). The worker's exchange blocks (its
+// realm runs on its own thread), so it runs on tokio's blocking pool, never on the executor.
+
+/// Runs a blocking service-worker exchange off the async executor (directly when no runtime is current).
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => h.spawn_blocking(f).await.ok(),
+        Err(_) => Some(f()),
+    }
+}
+
+fn header_of<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+/// A top-level navigation's worker answer: `None` = no worker handled it (the network serves the URL as
+/// before); `Some(Ok((html, final URL)))` = the worker's document; `Some(Err)` = a network error (a rejected
+/// `respondWith`, a refused opaque answer, a non-2xx answer). A worker's redirect (`Response.redirect`) is
+/// followed as a new navigation, intercepted again (20 hops), and handed to the network when no worker takes it.
+async fn sw_navigate(input: &str) -> Option<Result<(String, String)>> {
+    use crate::workers::sw::{self, SwAnswer};
+    if !sw::may_intercept_navigation(input) {
+        return None;
+    }
+    let mut url = input.to_string();
+    for hop in 0..20u32 {
+        let u = url.clone();
+        let answer = blocking(move || sw::intercept_navigation(&u)).await.unwrap_or(SwAnswer::Network);
+        let r = match answer {
+            SwAnswer::Network if hop == 0 => return None,
+            SwAnswer::Network => return Some(network_document(&url).await),
+            SwAnswer::Error(e) => {
+                crate::ledger::record_js(&format!("sw-navigation-error:{}", crate::js::clip(&url, 48)));
+                return Some(Err(anyhow::anyhow!("Service worker network error: {e}")));
+            }
+            SwAnswer::Respond(r) => r,
+        };
+        if matches!(r.status, 301 | 302 | 303 | 307 | 308) {
+            if let Some(next) = header_of(&r.headers, "location").and_then(|loc| url::Url::parse(&url).and_then(|b| b.join(loc)).ok()) {
+                if !matches!(next.scheme(), "http" | "https") {
+                    return Some(Err(anyhow::anyhow!("redirect to unsupported scheme {}", next.scheme())));
+                }
+                url = next.to_string();
+                continue;
+            }
+        }
+        if !(200..300).contains(&r.status) {
+            return Some(Err(anyhow::anyhow!("HTTP Error: {} (from the service worker)", r.status)));
+        }
+        // HTML §7.4.1: the document's URL is the response's (a passed-through `fetch` keeps its final URL; a
+        // constructed Response has none and is the request's).
+        let final_url = if r.url.starts_with("http://") || r.url.starts_with("https://") { r.url.clone() } else { url.clone() };
+        let doc_headers: Vec<(String, String)> = r.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
+        crate::security::set_document_headers(&final_url, &doc_headers);
+        if r.body.len() > 10 * 1024 * 1024 {
+            return Some(Err(anyhow::anyhow!("Response body exceeds size limit")));
+        }
+        return Some(String::from_utf8(r.body).context("Invalid UTF-8").map(|text| (text, final_url)));
+    }
+    Some(Err(anyhow::anyhow!("too many service worker redirects")))
+}
+
+/// One network GET of a document (no worker): the network half of [`fetch_document_final`] for one URL.
+async fn network_document(url: &str) -> Result<(String, String)> {
+    let response = get(url, Priority::Document, None).await.context("Connection failure")?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP Error: {}", response.status());
+    }
+    let final_url = response.url().to_string();
+    let doc_headers: Vec<(String, String)> = response.headers().iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect();
+    crate::security::set_document_headers(&final_url, &doc_headers);
+    let bytes = response.bytes().await.context("Failed to read body")?;
+    if bytes.len() > 10 * 1024 * 1024 {
+        anyhow::bail!("Response body exceeds size limit");
+    }
+    Ok((String::from_utf8(bytes).context("Invalid UTF-8")?, final_url))
+}
+
+/// A controlled document's subresource through its worker: `None` = the network serves it; `Some(Ok(body))` =
+/// the worker's 2xx answer (or an opaque answer to a `no-cors` load, whose body the page may render but script
+/// never reads); `Some(Err)` = a network error.
+async fn sw_subresource(h: &crate::workers::sw::SwHandle, url: &str, pri: Priority) -> Option<Result<Vec<u8>>> {
+    use crate::workers::sw::{SwAnswer, SwRequest};
+    // Fetch's request modes for the loader's classes: `<link rel=stylesheet>`, classic `<script>` and `<img>`
+    // without `crossorigin` are no-cors; fonts are always cors (CSS Fonts §4.8.2).
+    let (mode, dest, accept) = match pri {
+        Priority::Document => ("navigate", "document", "text/html,*/*;q=0.8"),
+        Priority::Css => ("no-cors", "style", "text/css,*/*;q=0.1"),
+        Priority::Font => ("cors", "font", "*/*"),
+        Priority::Script => ("no-cors", "script", "*/*"),
+        Priority::Image => ("no-cors", "image", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"),
+    };
+    let (h, u) = (h.clone(), url.to_string());
+    let answer = blocking(move || {
+        let headers = vec![("Accept".to_string(), accept.to_string())];
+        h.fetch(&SwRequest { method: "GET", url: &u, headers: &headers, body: &[], client: 0, mode, destination: dest })
+    })
+    .await
+    .unwrap_or(SwAnswer::Network);
+    match answer {
+        SwAnswer::Network => None,
+        SwAnswer::Error(e) => Some(Err(anyhow::anyhow!("Service worker network error: {e}"))),
+        SwAnswer::Respond(r) if r.kind == "opaque" || (200..300).contains(&r.status) => {
+            if r.body.len() > 10 * 1024 * 1024 {
+                return Some(Err(anyhow::anyhow!("Response body exceeds size limit")));
+            }
+            Some(Ok(r.body))
+        }
+        SwAnswer::Respond(r) => Some(Err(anyhow::anyhow!("HTTP Error: {} (from the service worker)", r.status))),
+    }
 }
 
 /// POSTs a urlencoded form body and returns the response document.
@@ -722,6 +842,8 @@ struct Loader {
     seq: u64,
     fonts: usize,
     partition: Option<String>,
+    /// AETHERSW (SR104): the worker controlling the document; every subresource is its `fetch` event first.
+    sw: Option<crate::workers::sw::SwHandle>,
 }
 
 impl Loader {
@@ -757,9 +879,26 @@ impl Loader {
 
 type LoadFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Loaded> + Send>>;
 
-fn start(load: Load, partition: Option<String>) -> LoadFuture {
+fn start(load: Load, partition: Option<String>, sw: Option<crate::workers::sw::SwHandle>) -> LoadFuture {
     Box::pin(async move {
         let p = partition.as_deref();
+        if let Some(h) = sw.as_ref() {
+            let (url, pri) = match &load {
+                Load::Sheet(_, u) => (u.clone(), Priority::Css),
+                Load::Script(u) => (u.clone(), Priority::Script),
+                Load::Font(u) => (u.clone(), Priority::Font),
+                Load::Image(u, _) => (u.clone(), Priority::Image),
+            };
+            if let Some(r) = sw_subresource(h, &url, pri).await {
+                let text = |r: Result<Vec<u8>>| r.and_then(|b| String::from_utf8(b).context("Invalid UTF-8"));
+                return match load {
+                    Load::Sheet(i, u) => Loaded::Sheet(i, u, text(r)),
+                    Load::Script(u) => Loaded::Script(u, text(r)),
+                    Load::Font(u) => Loaded::Font(u, r),
+                    Load::Image(u, key) => Loaded::Image(u, key, r),
+                };
+            }
+        }
         match load {
             Load::Sheet(i, u) => {
                 let r = fetch_text_p(&u, Priority::Css, p).await;
@@ -793,6 +932,11 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     // image and link URLs resolve against it, and it is the history entry the address bar shows.
     let (html, base) = fetch_document_final(input).await?;
     let partition = http::site_of(&base);
+    // AETHERSW (SR104): the document's controller (decided at navigation, as `workers::sw` decides a client's).
+    let sw = {
+        let b = base.clone();
+        blocking(move || crate::workers::sw::navigation_controller(&b).map(|(h, _)| h)).await.flatten()
+    };
     let mut loader = Loader {
         queue: std::collections::BinaryHeap::new(),
         jobs: std::collections::HashMap::new(),
@@ -800,6 +944,7 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
         seq: 0,
         fonts: 0,
         partition: partition.clone(),
+        sw,
     };
     // AETHERDEBT SR93: the document's CSP (headers + <meta>) and mixed content gate what the load
     // itself fetches — style-src-elem for the links (SRI on arrival), font-src, img-src.
@@ -850,7 +995,7 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
             if matches!(load, Load::Image(..)) {
                 images_in_flight += 1;
             }
-            in_flight.push(start(load, loader.partition.clone()));
+            in_flight.push(start(load, loader.partition.clone(), loader.sw.clone()));
         }
         let Some(done) = in_flight.next().await else { break };
         match done {
@@ -1068,6 +1213,7 @@ mod tests {
             seq: 0,
             fonts: 0,
             partition: None,
+            sw: None,
         };
         l.push(Load::Image("https://a.example/1.png".into(), "k".into()));
         l.push(Load::Script("https://a.example/a.js".into()));
