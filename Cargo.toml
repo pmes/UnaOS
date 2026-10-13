@@ -44,6 +44,7 @@ members = [
     "unaos/libs/media/vp8_core",
     "unaos/libs/media/av1_core",
     "unaos/libs/media/vp9_core", # VP9CORE (SR116): the from-spec VP9 decoder (profiles 0 and 2) Stria links beside vp8_core; no_std, zero deps
+    "unaos/libs/media/h264_core", # H264CORE (SR133): the from-spec H.264/AVC decoder (Baseline/Main/High 8-bit 4:2:0) Stria links beside vp9_core; no_std, zero deps
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.
     "unaos/libs/media/svg_core",
     "unaos/libs/sys/holocron_core",
