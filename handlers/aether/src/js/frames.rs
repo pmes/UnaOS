@@ -264,6 +264,13 @@ pub fn window_of_document(_vm: &mut Vm, doc: usize) -> Value {
     }
 }
 
+/// The origin of the incumbent realm's context when it is a NESTED context (None for the top's:
+/// the caller uses the page's) — AETHERDEBT SR93, storage keys.
+pub fn incumbent_origin(vm: &Vm) -> Option<String> {
+    let id = incumbent(vm);
+    (id != TOP).then(|| origin_of(id))
+}
+
 /// Is `doc` the active document of a live browsing context (the top's, or a child context whose
 /// container has not been discarded)? AETHERDEBT SR93: `isConnected` and the event path read it.
 pub fn is_active_document(doc: usize) -> bool {

@@ -197,7 +197,6 @@ struct DocState {
     policies: Arc<csp::PolicyList>,
     endpoints: Vec<(String, String)>,
     armed: bool,
-    eval_guard_due: bool,
     reported: HashSet<String>,
     events: Vec<(String, Option<usize>)>,
 }
@@ -252,7 +251,7 @@ pub fn sync() {
         if d.url != url {
             let key = url.split('#').next().unwrap_or(&url).to_string();
             let headers = pending_headers().lock().ok().and_then(|m| m.get(&key).cloned()).unwrap_or_default();
-            *d = DocState { url: url.clone(), endpoints: headers.endpoints.clone(), headers, eval_guard_due: true, ..Default::default() };
+            *d = DocState { url: url.clone(), endpoints: headers.endpoints.clone(), headers, ..Default::default() };
             rebuild = true;
         }
         for m in csp_metas {
@@ -273,7 +272,6 @@ pub fn sync() {
                 pl.self_origin = Origin::opaque();
             }
             d.policies = Arc::new(pl);
-            d.eval_guard_due = true;
         }
     });
 }
@@ -288,11 +286,6 @@ pub(crate) fn sync_for_script() -> (String, bool, Arc<csp::PolicyList>, Vec<(Str
         d.armed = true;
         (d.url.clone(), first, d.policies.clone(), std::mem::take(&mut d.events))
     })
-}
-
-/// Whether the eval guard should be (re)considered now (once per policy change).
-pub(crate) fn take_eval_guard_due() -> bool {
-    DOC.with(|d| std::mem::replace(&mut d.borrow_mut().eval_guard_due, false))
 }
 
 /// The policies read at the last [`sync`] (`None` before any).
@@ -641,6 +634,263 @@ pub fn script_integrity_ok(el: usize, url: &str, source: &str, eligible: bool) -
         Err(e) => {
             refuse("sri", url, &format!("Failed to find a valid digest in the 'integrity' attribute for resource '{url}': {e}. The resource has been blocked."));
             false
+        }
+    }
+}
+
+/// HostEnsureCanCompileStrings's CSP half (CSP3 §4.4 EnsureCSPDoesNotBlockStringCompilation,
+/// AETHERDEBT SR93): `eval`, the Function constructors (js_core asks through `Host`) and a string
+/// timer handler compile `source` only under `'unsafe-eval'`. `Err(message)` refuses; the violation
+/// (sample = the source) is reported here.
+pub fn compile_strings_allowed(source: &str) -> Result<(), String> {
+    if TRUSTED_COMPILE.with(|t| t.get()) > 0 {
+        return Ok(());
+    }
+    let Some(p) = current_policies() else { return Ok(()) };
+    let v = p.check_eval(source);
+    if !v.violations.is_empty() {
+        report_violations(&v, None);
+    }
+    if v.allowed {
+        return Ok(());
+    }
+    let msg = v.violations.iter().find(|x| !x.report_only).map(csp::message).unwrap_or_else(|| {
+        "Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source of script in the Content Security Policy.".to_string()
+    });
+    Err(msg)
+}
+
+/// A `<style>` element's text (HTML §4.2.6 "update a style block" step 5, CSP3 §4.2.3 — AETHERDEBT
+/// SR93): `style-src-elem` with the element's nonce and the text's hash. `false`: the sheet is not
+/// applied. Uses the policies of the last [`sync`] (the style collection must not re-enter the DOM).
+pub fn style_element_allowed(el: usize, text: &str) -> bool {
+    let Some(p) = current_policies() else { return true };
+    if p.is_empty() {
+        return true;
+    }
+    let nonce = crate::js::dom::attr_value(el, "nonce").unwrap_or_default();
+    let v = p.check_inline("style-src-elem", &nonce, text);
+    if !v.violations.is_empty() && first_report_of(&format!("style-elem:{el}:{}", text.len())) {
+        deferring(|| report_violations(&v, Some(el)));
+    }
+    v.allowed
+}
+
+/// A stylesheet fetch for `<link rel=stylesheet>` or `@import` (AETHERDEBT SR93): upgrade/refuse as
+/// mixed content (`style` is blockable), then `style-src-elem` for the URL (a nonce on the link
+/// admits it). The URL to fetch, or None when refused.
+pub fn stylesheet_url(el: Option<usize>, url: &str) -> Option<String> {
+    let Some(p) = current_policies() else { return Some(url.to_string()) };
+    let client = DOC.with(|d| d.borrow().url.clone());
+    let url = match mixed::check(&client, url, "style", p.upgrade_insecure(), p.block_all_mixed()) {
+        mixed::Verdict::Block(why) => {
+            deferring(|| refuse(why, url, &format!("Mixed Content: the page at '{client}' requested an insecure stylesheet '{url}'. This request has been blocked.")));
+            return None;
+        }
+        mixed::Verdict::Upgrade(u) => u,
+        _ => url.to_string(),
+    };
+    if p.is_empty() {
+        return Some(url);
+    }
+    let nonce = el.and_then(|e| crate::js::dom::attr_value(e, "nonce")).unwrap_or_default();
+    let v = p.check_external_style(&url, &nonce);
+    if !v.violations.is_empty() && first_report_of(&format!("style-url:{url}")) {
+        deferring(|| report_violations(&v, el));
+    }
+    v.allowed.then_some(url)
+}
+
+/// Subresource Integrity for a fetched stylesheet's text (`<link integrity>`, AETHERDEBT SR93) —
+/// the script check's twin.
+pub fn stylesheet_integrity_ok(el: usize, url: &str, text: &str, eligible: bool) -> bool {
+    deferring(|| script_integrity_ok(el, url, text, eligible))
+}
+
+/// An image, font or media fetch (`destination` `image` / `font` / `audio` / `video` / `track` —
+/// AETHERDEBT SR93): mixed content (passive content autoupgrades, `block-all-mixed-content`
+/// blocks; a font is blockable) after `upgrade-insecure-requests`, then `img-src` / `font-src` /
+/// `media-src`. The URL to fetch, or None when refused. Callable from any thread (a refusal off the
+/// page thread is queued for [`drain`]).
+pub fn subresource_url(url: &str, destination: &str) -> Option<String> {
+    let Some(p) = current_policies() else { return Some(url.to_string()) };
+    let client = DOC.with(|d| d.borrow().url.clone());
+    let url = match mixed::check(&client, url, destination, p.upgrade_insecure(), p.block_all_mixed()) {
+        mixed::Verdict::Block(why) => {
+            deferring(|| refuse(why, url, &format!("Mixed Content: the page at '{client}' requested an insecure {destination} '{url}'. This request has been blocked.")));
+            return None;
+        }
+        mixed::Verdict::Upgrade(u) => u,
+        _ => url.to_string(),
+    };
+    if p.is_empty() {
+        return Some(url);
+    }
+    let v = p.check_url(csp::directive_for_destination(destination), &url, false);
+    if !v.violations.is_empty() && first_report_of(&format!("{destination}:{url}")) {
+        deferring(|| report_violations(&v, None));
+    }
+    v.allowed.then_some(url)
+}
+
+/// An inline event handler attribute (`onclick="…"`, HTML §8.1.8.1 "get the current value of the
+/// event handler" step 1.3, CSP3 §4.2.3 — AETHERDEBT SR93): `script-src-attr` with the source.
+/// `false`: the handler is not compiled (its value stays null).
+pub fn inline_handler_allowed(el: Option<usize>, source: &str) -> bool {
+    let Some(p) = current_policies() else { return true };
+    if p.is_empty() {
+        return true;
+    }
+    let v = p.check_inline("script-src-attr", "", source);
+    if !v.violations.is_empty() {
+        report_violations(&v, el);
+    }
+    v.allowed
+}
+
+thread_local! {
+    /// Host-initiated compilations in progress (an inline handler body that already passed
+    /// `script-src-attr` is compiled through the Function constructor; `'unsafe-eval'` does not apply).
+    static TRUSTED_COMPILE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Runs `f` — a compilation the ENGINE starts for source CSP has already admitted (an inline event
+/// handler) — without the `'unsafe-eval'` gate of [`compile_strings_allowed`].
+pub fn compiling_trusted<R>(f: impl FnOnce() -> R) -> R {
+    TRUSTED_COMPILE.with(|t| t.set(t.get() + 1));
+    let r = f();
+    TRUSTED_COMPILE.with(|t| t.set(t.get().saturating_sub(1)));
+    r
+}
+
+/// A `javascript:` URL navigation (CSP3 §4.2.4 "should navigation request be blocked", type
+/// "navigation" — AETHERDEBT SR93): `script-src-elem` inline check over the whole URL, the
+/// violation at `el` (the hyperlink or the iframe) when known.
+pub fn javascript_url_allowed(el: Option<usize>, url: &str) -> bool {
+    let Some(p) = current_policies() else { return true };
+    if p.is_empty() {
+        return true;
+    }
+    let v = p.check_inline("script-src-elem", "", url);
+    if !v.violations.is_empty() {
+        report_violations(&v, el);
+    }
+    v.allowed
+}
+
+/// `form-action` for a form submission to `url` (CSP3 §6.4.1 — AETHERDEBT SR93; no fallback).
+pub fn form_action_allowed(form: Option<usize>, url: &str) -> bool {
+    let Some(p) = current_policies() else { return true };
+    if p.is_empty() {
+        return true;
+    }
+    let v = p.check_url("form-action", url, false);
+    if !v.violations.is_empty() {
+        report_violations(&v, form);
+    }
+    v.allowed
+}
+
+/// `base-uri` for a `<base href>` (CSP3 §6.3.1, HTML §4.2.3 "set the frozen base URL" — AETHERDEBT
+/// SR93): `false` keeps the fallback base URL. Reported once per URL per document.
+pub fn base_uri_allowed(url: &str) -> bool {
+    let Some(p) = current_policies() else { return true };
+    if p.is_empty() {
+        return true;
+    }
+    let v = p.check_url("base-uri", url, false);
+    if !v.violations.is_empty() && first_report_of(&format!("base-uri:{url}")) {
+        deferring(|| report_violations(&v, None));
+    }
+    v.allowed
+}
+
+/// The policies a page load enforces on the subresources it fetches BEFORE the document exists as a page
+/// (`net::fetch_page`'s stylesheets, fonts and images — AETHERDEBT SR93): the response headers the
+/// navigation code handed over for the document URL ([`set_document_headers`]) plus the document's
+/// `<meta http-equiv=content-security-policy>` policies, read from the markup. Usable on any thread
+/// (refusals made off the page thread are queued for [`drain`]).
+pub struct LoadPolicy {
+    url: String,
+    endpoints: Vec<(String, String)>,
+    policies: csp::PolicyList,
+}
+
+impl LoadPolicy {
+    pub fn for_document(url: &str, html: &str) -> LoadPolicy {
+        let key = url.split('#').next().unwrap_or(url).to_string();
+        let headers = pending_headers().lock().ok().and_then(|m| m.get(&key).cloned()).unwrap_or_default();
+        let mut list = headers.csp.clone();
+        let parsed = html_core::parse_document(html, crate::dom::parse_opts());
+        let root = html_core::Document::ROOT;
+        let head = parsed
+            .children(root)
+            .find(|c| parsed.element(*c).is_some_and(|e| e.is_html("html")))
+            .and_then(|h| parsed.children(h).find(|c| parsed.element(*c).is_some_and(|e| e.is_html("head"))));
+        if let Some(head) = head {
+            for c in parsed.children(head) {
+                let Some(e) = parsed.element(c) else { continue };
+                if e.is_html("meta") && e.attr("http-equiv").is_some_and(|v| v.trim().eq_ignore_ascii_case("content-security-policy")) {
+                    if let Some(content) = e.attr("content") {
+                        let p = csp::Policy::parse(content, false, true);
+                        if !p.directives.is_empty() {
+                            list.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        let mut pl = csp::PolicyList::new(list, url);
+        if headers.sandboxed {
+            pl.self_origin = Origin::opaque();
+        }
+        LoadPolicy { url: url.to_string(), endpoints: headers.endpoints, policies: pl }
+    }
+
+    fn report(&self, v: &csp::Verdict) {
+        for x in &v.violations {
+            let rule = if x.report_only { "csp-report-only" } else { "csp" };
+            refuse(rule, &format!("{}:{}", x.effective_directive, x.blocked), &csp::message(x));
+            csp::send_reports(x, &self.url, &self.endpoints);
+        }
+    }
+
+    fn mixed(&self, url: &str, destination: &str) -> Option<String> {
+        match mixed::check(&self.url, url, destination, self.policies.upgrade_insecure(), self.policies.block_all_mixed()) {
+            mixed::Verdict::Block(why) => {
+                refuse(why, url, &format!("Mixed Content: the page at '{}' requested an insecure {destination} '{url}'. This request has been blocked.", self.url));
+                None
+            }
+            mixed::Verdict::Upgrade(u) => Some(u),
+            _ => Some(url.to_string()),
+        }
+    }
+
+    /// A `<link rel=stylesheet>` (nonce from the link): the URL to fetch, or None when refused.
+    pub fn stylesheet(&self, url: &str, nonce: &str) -> Option<String> {
+        let url = self.mixed(url, "style")?;
+        let v = self.policies.check_external_style(&url, nonce);
+        self.report(&v);
+        v.allowed.then_some(url)
+    }
+
+    /// An image / font / media fetch: the URL to fetch (maybe upgraded), or None when refused.
+    pub fn subresource(&self, url: &str, destination: &str) -> Option<String> {
+        let url = self.mixed(url, destination)?;
+        let v = self.policies.check_url(csp::directive_for_destination(destination), &url, false);
+        self.report(&v);
+        v.allowed.then_some(url)
+    }
+
+    /// Subresource Integrity for a stylesheet the load fetched (`integrity` from the link; `eligible`:
+    /// same-origin with the document, or requested in CORS mode).
+    pub fn stylesheet_integrity(&self, url: &str, integrity: &str, text: &str, eligible: bool) -> bool {
+        match sri::check(integrity, text.as_bytes(), eligible) {
+            Ok(()) => true,
+            Err(e) => {
+                refuse("sri", url, &format!("Failed to find a valid digest in the 'integrity' attribute for resource '{url}': {e}. The resource has been blocked."));
+                false
+            }
         }
     }
 }

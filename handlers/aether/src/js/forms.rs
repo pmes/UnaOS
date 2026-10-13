@@ -337,6 +337,10 @@ pub fn navigate(vm: &mut Vm, form: usize, submitter: Option<usize>) {
     let sub_ref = submitter.map(|s| doc.node_at(NodeId(s)));
     let url = super::page_url();
     let Some(nav) = core::plan_navigation(&url, &form_ref, sub_ref.as_ref(), entries) else { return };
+    // AETHERDEBT SR93: CSP form-action decides whether the submission navigates.
+    if !crate::security::form_action_allowed(Some(form), &nav.url) {
+        return;
+    }
     stage(nav);
 }
 

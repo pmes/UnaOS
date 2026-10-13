@@ -460,9 +460,21 @@ fn handler_value(vm: &mut Vm, t: TargetKey, ty: &str) -> Value {
     let Some(r) = page(|p| p.handlers.get(&(t, ty.to_string())).copied()) else { return Value::Null };
     let v = idl::rooted(vm, r);
     if let Value::String(body) = &v {
+        // AETHERDEBT SR93 (HTML §8.1.8.1 step 1.3, CSP3 §4.2.3): the attribute's body compiles only when
+        // `script-src-attr` admits it; refused, the handler's value is null.
+        let el = match t {
+            TargetKey::Node(n) => Some(n),
+            _ => dom::body_of(dom::main_doc()),
+        };
+        if !crate::security::inline_handler_allowed(el, &body.to_rust()) {
+            vm.host_roots[r] = Value::Null;
+            return Value::Null;
+        }
         let params = if t == TargetKey::Window && ty == "error" { "event, source, lineno, colno, error" } else { "event" };
         let fc = vm.intr().function_ctor;
-        let compiled = super::enter(vm, "handler-compile", |vm| vm.construct(&Value::Object(fc), &[s(params), Value::String(body.clone())], None));
+        let compiled = crate::security::compiling_trusted(|| {
+            super::enter(vm, "handler-compile", |vm| vm.construct(&Value::Object(fc), &[s(params), Value::String(body.clone())], None))
+        });
         let f = match compiled {
             Some(Ok(f)) => f,
             Some(Err(e)) => {
@@ -900,7 +912,7 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
             // evaluated by the page either way (the shell cannot run it).
             if let Some(href) = dom::attr_value(a, "href") {
                 if javascript_url_source(&href).is_some() || !trusted {
-                    follow_hyperlink(vm, &href);
+                    follow_hyperlink_from(vm, Some(a), &href);
                 }
             }
         }
@@ -973,8 +985,12 @@ fn javascript_url_source(href: &str) -> Option<String> {
 
 /// HTML "follow the hyperlink": a `javascript:` URL queues a task (navigation and traversal task
 /// source) that runs its script as a classic script; any other URL navigates.
-fn follow_hyperlink(vm: &mut Vm, href: &str) {
+/// `el`: the hyperlink element (the CSP violation's target).
+fn follow_hyperlink_from(vm: &mut Vm, el: Option<usize>, href: &str) {
     match javascript_url_source(href) {
+        // AETHERDEBT SR93 (CSP3 §4.2.4): a `javascript:` navigation runs only when `script-src-elem`
+        // admits the URL as inline script.
+        Some(_) if !crate::security::javascript_url_allowed(el, href.trim()) => {}
         Some(src) => {
             let fp = vm.intr().function_proto;
             let f = vm.make_native_with("", 0, run_javascript_url, false, Some(fp), vec![s(&src)]);

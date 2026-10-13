@@ -91,6 +91,8 @@ pub fn create_dynamic_function(vm: &mut Vm, ctx: &CallCtx, kind: u8) -> JsResult
         let b = vm.arg(ctx, n - 1);
         vm.to_string(&b)?
     };
+    // HostEnsureCanCompileStrings with the body string (§20.2.1.1.1 step 5).
+    vm.ensure_can_compile(&body)?;
     let prefix = match kind {
         1 => "function*",
         2 => "async function",

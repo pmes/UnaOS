@@ -1157,6 +1157,10 @@ impl AetherEngine {
             None => forms::build_form_submission(&base, control, submitter, coords),
         };
         if let Some(nav) = nav {
+            // AETHERDEBT SR93: CSP form-action (no fallback) decides whether a user submission navigates.
+            if !crate::security::form_action_allowed(Some(form.id().0), &nav.url) {
+                return;
+            }
             self.pending_nav = Some(nav);
         }
     }
@@ -1657,10 +1661,17 @@ impl AetherEngine {
         }
         js::take_mutated();
 
+        // AETHERDEBT SR93: the document's policies (headers + <meta>) are current before the style
+        // collection and the media scan consult them, script or not.
+        crate::security::sync();
         let mut sheets: Vec<String> = Vec::new();
         if let Ok(styles) = document.select("style") {
             for style_node in styles {
-                sheets.push(style_node.as_node().text_contents());
+                let text = style_node.as_node().text_contents();
+                // CSP style-src-elem (nonce / hash): a refused <style> is not applied.
+                if crate::security::style_element_allowed(style_node.as_node().id().0, &text) {
+                    sheets.push(text);
+                }
             }
         }
         sheets.extend(external_css.iter().cloned());

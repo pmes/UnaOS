@@ -592,6 +592,7 @@ impl Vm {
             Value::String(s) => s,
             other => return Ok(other),
         };
+        self.ensure_can_compile(&src)?;
         let fi = self.frames.len() - 1;
         let caller = &self.frames[fi];
         let strict_caller = caller.code.strict;

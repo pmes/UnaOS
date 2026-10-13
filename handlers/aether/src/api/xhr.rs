@@ -226,6 +226,9 @@ pub const PRELUDE: &str = r#"
                 flat.push(h[0], h[1]);
             });
             if (!hasType && ctype) { flat.push('Content-Type', ctype); }
+            // XHR §3.5.6 (AETHERDEBT SR93): mode cors, credentials 'include' when withCredentials is
+            // set, else 'same-origin' — the policy pseudo-fields the worker lifts off.
+            flat.push(':aether-mode', 'cors', ':aether-credentials', s.withCredentials ? 'include' : 'same-origin');
             var data = null;
             if (/^data:/i.test(s.reqURL)) {
                 // A data: URL is fetched without a network (Fetch §4.2 "scheme fetch").

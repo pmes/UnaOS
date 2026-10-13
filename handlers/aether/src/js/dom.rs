@@ -957,7 +957,15 @@ pub fn base_url(doc: usize) -> String {
             .and_then(|i| d.element(i).and_then(|e| e.attr("href")).map(str::to_string))
     });
     match base {
-        Some(h) => url::Url::parse(&url).and_then(|u| u.join(&h)).map(|u| u.to_string()).unwrap_or(url),
+        Some(h) => {
+            let frozen = url::Url::parse(&url).and_then(|u| u.join(&h)).map(|u| u.to_string()).unwrap_or_else(|_| url.clone());
+            // AETHERDEBT SR93 (HTML §4.2.3 "set the frozen base URL" step 3, CSP3 base-uri): a `<base>`
+            // the page's policy refuses leaves the fallback base URL.
+            if doc == main_doc() && frozen != url && !crate::security::base_uri_allowed(&frozen) {
+                return url;
+            }
+            frozen
+        }
         None => url,
     }
 }

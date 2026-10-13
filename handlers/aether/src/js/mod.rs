@@ -434,8 +434,16 @@ pub(crate) fn invoke_callback(vm: &mut Vm, label: &str, f: &Value, args: &[Value
     invoke(vm, label, f, &Value::Undefined, args)
 }
 
-/// A string timer handler: compiled and run as a classic script.
+/// A string timer handler: compiled and run as a classic script — after HostEnsureCanCompileStrings
+/// (HTML §8.6 timer initialization steps, AETHERDEBT SR93): under a CSP without `'unsafe-eval'` the
+/// EvalError is reported for the global and the handler does not run.
 pub(crate) fn run_timer_source(vm: &mut Vm, src: &str) -> Result<Value, Value> {
+    if let Err(m) = crate::security::compile_strings_allowed(src) {
+        let p = vm.intr().eval_error_proto;
+        let e = vm.make_error(p, &m);
+        events::report_exception(vm, &e);
+        return Err(e);
+    }
     run_classic(vm, src, "timer-source")
 }
 
