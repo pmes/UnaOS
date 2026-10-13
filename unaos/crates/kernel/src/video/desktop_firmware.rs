@@ -158,7 +158,7 @@ pub fn activate() -> bool {
     //    thirty lines below the console's way to glass is its WINDOW, which is why the hold lifts
     //    there by construction rather than by a second call. See `fbcon::panel_mirror_held` for that
     //    term, for the panic override, and for what the decline path gets.
-    crate::splash::hold_prepare(); // SPLASHX86 (M3): the same ray tracer, rendered into RAM before the glass is cleared
+    let splash_declined = cascade_owns_panel(); if !splash_declined { crate::splash::hold_prepare(); } // SPLASHX86 (M3): the same ray tracer, rendered into RAM before the glass is cleared. PIWM: not while the boot witness cascade owns the panel — see `cascade_claim` (file tail); ⚠ SAME-LINE fold
     {
         super::cursor::undraw();
         fbcon::panel_mirror_hold(true);
@@ -166,7 +166,7 @@ pub fn activate() -> bool {
         fb.fill_screen(wm::DESKTOP_BG);
         fb.flush_all();
     }
-    crate::splash::hold_open(); // SPLASHX86 (M3): held above the furniture until `users::stage_publish` releases it (the 5 s `hold_service` poll is x86-only: aarch64 relies on `desktop_allowed`'s no-store publish)
+    splash_hold_open_unless_cascade(splash_declined); // SPLASHX86 (M3): held above the furniture until `users::stage_publish` releases it (the 5 s `hold_service` poll is x86-only: aarch64 relies on `desktop_allowed`'s no-store publish). PIWM: `hold_open` behind the cascade's claim on the panel — see `cascade_claim` (file tail); ⚠ SAME-LINE fold
     serial_println!(
         "[deskfw] desktop-clear panel={}x{} bg={:08X} (pre-desktop residue off the glass; the window table is empty at this line; the panel mirror is held from this line — DESKHOLD)",
         pw,
@@ -596,4 +596,80 @@ pub fn arm() {
 /// alike. No polling task, no new event variant.
 pub fn armed() -> bool {
     ARMED.load(Ordering::Acquire)
+}
+
+// ── PIWM — the splash hold and the boot witness cascade ─────────────────────────────────────────
+//
+// SPLASHX86 M3 (`5adaaff4`) put the boot splash's HOLD into [`activate`]: a full-panel, chromeless
+// compat row (`wm::splash_open`), pinned with `wm::set_modal_top`, whose pin `reassert_modal_top`
+// re-claims — and `damage_all`s — on every create and every raise. On x86 that row goes up at the
+// Kepler takeover, which happens AFTER the witness cascade, so no fixture ever read a panel with it
+// on. The Pi reaches [`activate`] at the GUI handoff while the cascade is running on the APs (the
+// standing rule at `ARMED` above), so the row sat over every panel read-back the cascade made.
+//
+// The capture that convicts it (`docs/dev/evidence/pikernel8test-1013/serial-pi.log`, image-24 Pi
+// line, QEMU raspi4b; record in `docs/dev/evidence/piwm/`): `[splash] hold OPEN win=1 640x480` at
+// line 615; `palette_core::SPLASH_BG` is `0x0006_0608`, and that exact value is what every read-back
+// in the cascade returned — `[chrome-truth] … got=0x060608 -> MISS` on all ten probes (826-837) until
+// the defer budget latched `defers=33 budget=32 exhausted=true` (825), and `[wc-fv] focus-vis …
+// stack=0x060608 raise=0x060608 shell=0x060608 reraise=0x060608 -> FAIL` (1032) on a row `[wc-d]`
+// verified on the glass one line earlier (1025). `[wc-f] twin -> DEFER` (609) is the same row: the
+// first composite that drew was the hold itself, and it overlaps the probe strip edge to edge.
+//
+// The rule this applies is the one written at `ARMED`: a surface on the glass before the cascade has
+// released the panel is inside the cascade's answer. The splash is such a surface, so it does not go
+// up while the cascade owns the panel, and if it is already up when the cascade starts, it comes
+// down. Nothing else about the hold changes: a board whose boot runs no cascade (the Orin's
+// `tegra_desk_cascade` reaches [`activate`] past the `-> !` terminus, so `u7_launcher` never runs and
+// [`cascade_claim`] is never called) keeps the hold exactly as SPLASHX86 built it.
+
+/// PIWM — `true` once the boot witness cascade has started. Never cleared: [`cascade_owns_panel`]
+/// reads it beside [`armed`], which is the cascade's end.
+static CASCADE: AtomicBool = AtomicBool::new(false);
+
+/// PIWM — the boot witness cascade claims the panel. Called once, as the FIRST statement of
+/// `arch::aarch64::syscall::u7_launcher` (the chain whose end is [`arm`]). If the desktop activated
+/// first and the splash hold is already on the glass, it is released here, by name, so the cascade's
+/// read-backs see the windows they mint and not `SPLASH_BG`.
+///
+/// Both orders are covered, and each side checks the other AFTER publishing its own half: this
+/// function stores the claim and then looks for a hold; [`splash_hold_open_unless_cascade`] opens the
+/// hold and then looks for a claim. `hold_release` is idempotent (its first statement swaps the held
+/// id to 0), so the interleaving in which both sides see the other releases once.
+pub fn cascade_claim() {
+    CASCADE.store(true, Ordering::SeqCst);
+    if crate::splash::holding() {
+        crate::splash::hold_release("cascade");
+        serial_println!(
+            "[splash] hold RELEASE reason=cascade-owns-panel (the boot witness cascade reads the panel back; a full-panel modal row over it is inside every reading)"
+        );
+    }
+}
+
+/// PIWM — does the boot witness cascade own the panel right now? From [`cascade_claim`] until [`arm`].
+pub fn cascade_owns_panel() -> bool {
+    CASCADE.load(Ordering::SeqCst) && !armed()
+}
+
+/// PIWM — [`activate`]'s splash hold, behind the cascade's claim. `declined` is the answer
+/// [`activate`] took ONCE, at the `hold_prepare` line, and it is carried here rather than asked again:
+/// a claim that lands between the two lines would otherwise leave a prepared, panel-sized surface
+/// that no open ever names and no release ever frees (`hold_release` frees only a held row's surface).
+/// Declined: one named line, nothing on the glass. Otherwise the hold opens exactly as SPLASHX86 M3
+/// built it, and the claim is re-read so a cascade that started meanwhile still gets the panel back
+/// (the release closes the row AND frees the surface).
+fn splash_hold_open_unless_cascade(declined: bool) {
+    if declined {
+        serial_println!(
+            "[splash] hold SKIP reason=cascade-owns-panel (the boot witness cascade is reading the panel; no full-panel modal row goes over it)"
+        );
+        return;
+    }
+    crate::splash::hold_open();
+    if cascade_owns_panel() && crate::splash::holding() {
+        crate::splash::hold_release("cascade");
+        serial_println!(
+            "[splash] hold RELEASE reason=cascade-owns-panel (the cascade claimed the panel while the hold was opening)"
+        );
+    }
 }

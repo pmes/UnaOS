@@ -14143,9 +14143,9 @@ fn wc_close_click(win: crate::video::wm::WinId, owner: u64) -> &'static str { //
 /// INWEDGE's boot-8 wedge, on this exact band), then the cursor position lock, and both are released
 /// before `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order (§WEDGE-1).
 fn click_pointer_pos() -> (i32, i32) {
-    // LOCKFIX — refused ⇒ (0, 0), the clamp an unset framebuffer has always given this function.
-    let (w, h) = crate::video::panel_info_nonblocking()
-        .map_or((0, 0), |i| (i.width as i32, i.height as i32));
+    // LOCKFIX — refused ⇒ the last geometry this door READ. PIWM: never (0, 0) into `pal::cursor::pos`, whose FIRST caller seeds the boot's pointer at (w/2, h/2) (pal.rs:527-528) — a refused read here, on the cascade's first focus arrival (`ptr_abs_arrival`, AETHERPTR2), pinned the pointer to the crystal's corner cell for the whole boot.
+    static GEOM: AtomicU64 = AtomicU64::new(0); let (w, h) = match crate::video::panel_info_nonblocking() { Some(i) => { GEOM.store(((i.width as u64) << 32) | (i.height as u64 & 0xffff_ffff), Ordering::Relaxed); (i.width as i32, i.height as i32) } None => { let g = GEOM.load(Ordering::Relaxed); ((g >> 32) as i32, (g & 0xffff_ffff) as i32) } };
+    if w <= 0 || h <= 0 { return (0, 0); } // PIWM: no geometry has EVER been read — this one event keeps the old (0, 0) answer, but the shared pointer is NOT seeded with it. ⚠ LINE-NEUTRAL: 4 body lines out, 4 in.
     crate::pal::cursor::pos(w, h)
 }
 
@@ -16247,7 +16247,7 @@ macro_rules! u7stk {
 }
 
 pub fn u7_launcher(demo_cpu: usize) {
-    u7stk!("entry");
+    u7stk!("entry"); #[cfg(feature = "desktop_firmware")] crate::video::desktop_firmware::cascade_claim(); // PIWM: the boot witness cascade claims the panel FIRST, before any launcher below mints or reads a row — the splash hold (a full-panel modal compat row, `SPLASH_BG` 0x060608) does not go up over it, or comes down now if the desktop activated first (`desktop_firmware::cascade_claim`); `arm()` at this chain's end hands the panel back. Knob-off the `#[cfg]` erases the statement. ⚠ LINE-NEUTRAL append.
     // U8, then U9, then U10, ride the SAME kernel task, each strictly after the prior flow (every exit path —
     // PASS, FAIL, or skip — falls through): the ordering gate the *_LAUNCH_DONE statics provide between
     // separately spawned launchers is here the program order of one task. Each launcher's verdict waits on its

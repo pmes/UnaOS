@@ -525,7 +525,16 @@ pub mod cursor {
     /// Unmasked, a tick inside the acquire parks the holder off-CPU and the next masked pointer
     /// report on that core spins forever.
     pub fn pos(w: i32, h: i32) -> (i32, i32) {
-        crate::arch::without_interrupts(|| *POS.lock().get_or_insert((w / 2, h / 2)))
+        // PIWM (PI22): a caller with no panel yet (a refused geometry read: 0x0) must not seed the boot's
+        // pointer at (0,0) — the first real geometry seeds it at the panel centre.
+        crate::arch::without_interrupts(|| {
+            let mut p = POS.lock();
+            match *p {
+                Some(v) => v,
+                None if w > 0 && h > 0 => *p.insert((w / 2, h / 2)),
+                None => (0, 0),
+            }
+        })
     }
 
     /// Apply a relative motion report (trackpad/mouse dx,dy), clamped to the panel.
