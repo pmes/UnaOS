@@ -24,7 +24,20 @@
 //!   `[jobs] volume=/jobs records=<n> claims=<n> ledger=<n> queue=<n> queries=<n> on=<worker|inline> chunks=<m>
 //!    max_chunk_ms=<ms> waited_ms=<bar wait> ms=<total>` (or `volume=absent records=0`).
 //! [`counts`] is `None` (pending) until the scan lands. `tests jobscan` (R80: only when asked):
-//!   `:: JOBSCAN: on=<worker|inline> chunks=<n> max_chunk_ms=<ms> bar_ms=<ms> -> PASS|FAIL ::`.
+//!   `:: JOBSCAN: on=<worker|inline> chunks=<n> bar_ms=<ms> max_chunk_ms=<ms> pages=<n> -> PASS|FAIL :: state=<s>
+//!    bound_ms=50 fallbacks=<n>`.
+//!
+//! JOBSCAN2 (rmbp-ledger B551) — flight 32: `max_chunk_ms=58` against the bound of 50 (B497's, returned to 50 by
+//! VFSTXCOST B522; the input path's 16 ms is HIDSTALL's and is not this walk's). A chunk was ONE whole directory blob
+//! (`read_dir_kinds`: path resolve + the full `Vec<DirEntry>` record in one masked transaction), so a big folder
+//! (`status/` holds 382 rows) was one hold however the walk was sliced. Now each directory on the native volume is read
+//! in PAGES ([`Pager`]): one masked transaction reads the directory's inode and one byte range of its entry blob
+//! (`UnaFS::read_data`, no path resolve — the inode id comes from the parent's own entry, `/jobs`'s from its `stat`),
+//! the page cursor (byte offset, entries left, an entry split across the page edge) is carried to the next pass, the
+//! core breathes between pages, and the page is SIZED BY TIME (halved when one took over half the bound, doubled when
+//! one took under an eighth). A page that cannot be read or decoded, or a blob that changed size mid-walk, falls back
+//! to the whole-blob listing for that directory (`fallbacks=`). The chunk the bound measures is now the page.
+//!   `[jobs] scan chunk=<n>/<m> records=<r> pages=<p> page_max_ms=<ms> ms=<ms>` (one per directory)
 
 use crate::fs::vfs::{MountTable, NodeKind};
 use alloc::format;
@@ -40,6 +53,17 @@ static QUEUE: AtomicU32 = AtomicU32::new(0);
 static QUERIES: AtomicU32 = AtomicU32::new(0);
 static CHUNKS: AtomicU32 = AtomicU32::new(0);
 static MAX_CHUNK_MS: AtomicU64 = AtomicU64::new(0);
+/// JOBSCAN2 (B551): the page transactions the last scan took, and the directories that fell back to one whole blob.
+static PAGES: AtomicU32 = AtomicU32::new(0);
+static FALLBACKS: AtomicU32 = AtomicU32::new(0);
+/// The bound one chunk (one page transaction) is held to — B497's 50 ms, returned by VFSTXCOST (B522).
+pub const CHUNK_BOUND_MS: u64 = 50;
+/// A page's byte range: start, floor, ceiling (time decides between floor and ceiling).
+const PAGE_START: u64 = 8 * 1024;
+const PAGE_MIN: u64 = 4 * 1024;
+const PAGE_MAX: u64 = 64 * 1024;
+/// A directory entry's name longer than this is a corrupt blob (the walk falls back).
+const NAME_MAX: u64 = 4096;
 static ON_WORKER: AtomicBool = AtomicBool::new(false);
 /// How long the worker waits for the bar before scanning anyway.
 const BAR_WAIT_MS: u64 = 10_000;
@@ -119,7 +143,8 @@ fn worker(_: usize) {
     crate::fs::assoc::build_owed(); // FILETYPES (B423): the owed registry, here — not on the pass that pumps hid and paints the bar
 }
 
-/// One chunk: one directory blob (one UnaFS transaction). `(files, sub-folders, ms)`.
+/// One chunk: one directory blob (one UnaFS transaction). `(files, sub-folders, ms)`. JOBSCAN2 (B551): the fallback — a
+/// non-native volume, or a directory whose paged walk failed.
 fn chunk(mt: &MountTable, dir: &str, nested: bool) -> (u32, Vec<String>, u64) {
     let c0 = crate::arch::ms();
     let mut files = 0u32;
@@ -144,11 +169,178 @@ fn breathe() {
     }
 }
 
+/// JOBSCAN2 (B551): ONE directory of the native volume read in pages. The blob is UnaFS's `Vec<DirEntry>` record
+/// (unafs `codec.rs` §R1: a `u64` count, then per entry `u64` name length ‖ UTF-8 ‖ `u64` inode id ‖ `u32` kind, all
+/// LE); the fields below are the CURSOR carried from one page transaction to the next.
+struct Pager {
+    id: u64,
+    /// The blob's size at the first page; a different size later (the directory changed mid-walk) fails the walk.
+    size: u64,
+    /// The next unread byte of the blob.
+    off: u64,
+    /// Entries not yet decoded (the count header, once read).
+    left: u64,
+    head: bool,
+    /// The bytes of an entry split across the page edge, kept for the next page (never re-read).
+    carry: Vec<u8>,
+    pages: u32,
+    max_ms: u64,
+}
+
+fn le64(b: &[u8]) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[..8]);
+    u64::from_le_bytes(a)
+}
+
+impl Pager {
+    fn new(id: u64) -> Self {
+        Pager { id, size: 0, off: 0, left: 0, head: false, carry: Vec::new(), pages: 0, max_ms: 0 }
+    }
+
+    /// One page: one masked transaction (the inode, then `want` bytes from the cursor), decoded outside it.
+    /// `Ok(true)` once every entry is decoded; `Err` = fall back to the whole blob.
+    fn page(&mut self, want: &mut u64, on: &mut dyn FnMut(&str, u64, u32)) -> Result<bool, ()> {
+        let (id, off, size0, first, w) = (self.id, self.off, self.size, self.pages == 0, *want);
+        let c0 = crate::arch::ms();
+        let got = crate::fs::unafs::with_unafs(|fs| -> Result<(u64, Vec<u8>), ()> {
+            let ino = fs.read_inode(id).map_err(|_| ())?;
+            if ino.kind != ::unafs::FileKind::Directory || (!first && ino.size != size0) {
+                return Err(());
+            }
+            let n = w.min(ino.size.saturating_sub(off));
+            let b = if n == 0 { Vec::new() } else { fs.read_data(id, off, n).map_err(|_| ())? };
+            Ok((ino.size, b))
+        });
+        let ms = crate::arch::ms().saturating_sub(c0);
+        self.pages += 1;
+        self.max_ms = self.max_ms.max(ms);
+        // Sized by TIME: the next page halves past half the bound, doubles under an eighth of it.
+        if ms * 2 > CHUNK_BOUND_MS {
+            *want = (*want / 2).max(PAGE_MIN);
+        } else if ms * 8 < CHUNK_BOUND_MS {
+            *want = (*want * 2).min(PAGE_MAX);
+        }
+        let (size, bytes) = match got {
+            Ok(Ok(v)) => v,
+            _ => return Err(()),
+        };
+        if first {
+            self.size = size;
+            if size == 0 {
+                return Ok(true); // an empty directory has no record at all
+            }
+        }
+        if bytes.is_empty() && self.off < self.size {
+            return Err(()); // no progress
+        }
+        self.off += bytes.len() as u64;
+        let mut buf = core::mem::take(&mut self.carry);
+        buf.extend_from_slice(&bytes);
+        let mut pos = 0usize;
+        if !self.head {
+            if buf.len() < 8 {
+                self.carry = buf;
+                return if self.off >= self.size { Err(()) } else { Ok(false) };
+            }
+            self.left = le64(&buf);
+            if self.left > self.size / 20 {
+                return Err(()); // a count the blob cannot hold (an entry is at least 20 bytes)
+            }
+            self.head = true;
+            pos = 8;
+        }
+        while self.left > 0 {
+            let rem = buf.len() - pos;
+            if rem < 8 {
+                break;
+            }
+            let nl = le64(&buf[pos..]);
+            if nl > NAME_MAX {
+                return Err(());
+            }
+            let need = 8 + nl as usize + 12;
+            if rem < need {
+                break;
+            }
+            let name = core::str::from_utf8(&buf[pos + 8..pos + 8 + nl as usize]).map_err(|_| ())?;
+            let ino = le64(&buf[pos + 8 + nl as usize..]);
+            let k = &buf[pos + 16 + nl as usize..pos + need];
+            let kind = u32::from_le_bytes([k[0], k[1], k[2], k[3]]);
+            if kind > 3 {
+                return Err(());
+            }
+            on(name, ino, kind);
+            pos += need;
+            self.left -= 1;
+        }
+        if self.left == 0 {
+            return Ok(true);
+        }
+        self.carry = buf[pos..].to_vec();
+        if self.off >= self.size { Err(()) } else { Ok(false) }
+    }
+}
+
+/// What one directory's walk yields: `(files, sub-folders (path, inode id), pages, page_max_ms, ms)`.
+type Walked = (u32, Vec<(String, u64)>, u32, u64, u64);
+
+/// JOBSCAN2 (B551): `dir` (inode `id`) in pages, the core breathing between them; `nested` keeps its sub-folders.
+/// `None` = a page failed — the caller lists the whole blob instead.
+fn walk_paged(dir: &str, id: u64, nested: bool, want: &mut u64) -> Option<Walked> {
+    let t0 = crate::arch::ms();
+    let mut p = Pager::new(id);
+    let mut files = 0u32;
+    let mut subs: Vec<(String, u64)> = Vec::new();
+    loop {
+        let r = p.page(want, &mut |name: &str, ino: u64, kind: u32| {
+            if name == "." || name == ".." || kind == 3 {
+                return; // `.`/`..` and unafs's System objects are not names here (vfs.rs `read_dir_kinds`' filter)
+            }
+            match kind {
+                1 if nested => subs.push((format!("{}/{}", dir, name), ino)),
+                1 => {}
+                _ => files += 1, // File and Symlink: vfs.rs `native_kind` calls both a file
+            }
+        });
+        match r {
+            Ok(true) => break,
+            Ok(false) => breathe(),
+            Err(()) => {
+                PAGES.fetch_add(p.pages, Relaxed);
+                MAX_CHUNK_MS.fetch_max(p.max_ms, Relaxed);
+                return None;
+            }
+        }
+    }
+    PAGES.fetch_add(p.pages, Relaxed);
+    breathe();
+    Some((files, subs, p.pages, p.max_ms, crate::arch::ms().saturating_sub(t0)))
+}
+
+/// One directory: paged when its inode id is known (the native volume), else — or when a page fails — one whole
+/// blob (`chunk`, counted in `fallbacks=`).
+fn walk(mt: &MountTable, dir: &str, id: Option<u64>, nested: bool, want: &mut u64) -> Walked {
+    if let Some(id) = id {
+        if let Some(w) = walk_paged(dir, id, nested, want) {
+            return w;
+        }
+        FALLBACKS.fetch_add(1, Relaxed);
+    }
+    let (f, subs, ms) = chunk(mt, dir, nested);
+    PAGES.fetch_add(1, Relaxed); // one whole-blob transaction
+    breathe();
+    (f, subs.into_iter().map(|p| (p, 0u64)).collect(), 1, ms, ms)
+}
+
 fn scan(waited_ms: u64) {
     let t0 = crate::arch::ms();
     let mt = crate::shell::vfs_mount_table();
-    match mt.stat(jobs_core::ROOT) {
-        Ok(s) if matches!(s.kind, NodeKind::Dir) => {}
+    PAGES.store(0, Relaxed);
+    FALLBACKS.store(0, Relaxed);
+    MAX_CHUNK_MS.store(0, Relaxed);
+    let root_id = match mt.stat(jobs_core::ROOT) {
+        Ok(s) if matches!(s.kind, NodeKind::Dir) => s.id,
         _ => {
             for a in [&CLAIMS, &LEDGER, &QUEUE, &QUERIES, &CHUNKS] {
                 a.store(0, Relaxed);
@@ -157,41 +349,62 @@ fn scan(waited_ms: u64) {
             serial_println!("[jobs] volume=absent records=0");
             return;
         }
+    };
+    // JOBSCAN2 (B551): pages need the native volume's inode ids — `/jobs`'s from its stat, each folder's from its
+    // parent's entry. Any other volume (or no id) walks whole blobs as before.
+    let native = mt.volume_name(jobs_core::ROOT).map(|n| n == "native").unwrap_or(false);
+    let mut want = PAGE_START;
+    let mut ids: Vec<(String, u64)> = Vec::new();
+    let mut max_ms = 0u64;
+    if let (true, Some(rid)) = (native, root_id) {
+        match walk_paged(jobs_core::ROOT, rid, true, &mut want) {
+            Some((_, subs, _, pm, _)) => {
+                ids = subs;
+                max_ms = pm;
+            }
+            None => {
+                FALLBACKS.fetch_add(1, Relaxed);
+            }
+        }
     }
+    let paged = !ids.is_empty();
+    let id_of = |path: &str| -> Option<u64> { ids.iter().find(|(p, _)| p == path).map(|(_, i)| *i) };
     // The four top folders first (m is known once their sub-folders are), then ledger/queue's sub-folders.
     let top: [(&str, bool, &AtomicU32); 4] =
         [(jobs_core::STATUS_DIR, false, &CLAIMS), (jobs_core::LEDGER_DIR, true, &LEDGER), (jobs_core::QUEUE_DIR, true, &QUEUE), (jobs_core::QUERIES_DIR, false, &QUERIES)];
     let mut tally = [0u32; 4];
-    let mut said: Vec<(u32, u64)> = Vec::new();
-    let mut rest: Vec<(usize, String)> = Vec::new();
-    let mut max_ms = 0u64;
+    let mut said: Vec<(u32, u32, u64, u64)> = Vec::new();
+    let mut rest: Vec<(usize, String, u64)> = Vec::new();
     for (i, (name, nested, _)) in top.iter().enumerate() {
-        let (f, subs, ms) = chunk(&mt, &sub(name), *nested);
+        let path = sub(name);
+        // A top folder absent from `/jobs`'s own listing counts 0 (the whole-blob read of it would fail the same way).
+        let id = if paged { id_of(&path) } else { None };
+        let (f, subs, pages, pm, ms) = if paged && id.is_none() { (0, Vec::new(), 0, 0, 0) } else { walk(&mt, &path, id, *nested, &mut want) };
         tally[i] += f;
-        max_ms = max_ms.max(ms);
-        said.push((f, ms));
-        rest.extend(subs.into_iter().map(|p| (i, p)));
-        breathe();
+        max_ms = max_ms.max(pm);
+        said.push((f, pages, pm, ms));
+        rest.extend(subs.into_iter().map(|(p, id)| (i, p, id)));
     }
     let m = said.len() + rest.len();
-    for (n, (f, ms)) in said.iter().enumerate() {
-        serial_println!("[jobs] scan chunk={}/{} records={} ms={}", n + 1, m, f, ms);
+    for (n, (f, pages, pm, ms)) in said.iter().enumerate() {
+        serial_println!("[jobs] scan chunk={}/{} records={} pages={} page_max_ms={} ms={}", n + 1, m, f, pages, pm, ms);
     }
-    for (k, (i, path)) in rest.iter().enumerate() {
-        let (f, _, ms) = chunk(&mt, path, false);
+    for (k, (i, path, id)) in rest.iter().enumerate() {
+        let id = if paged && *id != 0 { Some(*id) } else { None };
+        let (f, _, pages, pm, ms) = walk(&mt, path, id, false, &mut want);
         tally[*i] += f;
-        max_ms = max_ms.max(ms);
-        serial_println!("[jobs] scan chunk={}/{} records={} ms={}", said.len() + k + 1, m, f, ms);
-        breathe();
+        max_ms = max_ms.max(pm);
+        serial_println!("[jobs] scan chunk={}/{} records={} pages={} page_max_ms={} ms={}", said.len() + k + 1, m, f, pages, pm, ms);
     }
     for (i, (_, _, a)) in top.iter().enumerate() {
         a.store(tally[i], Relaxed);
     }
     CHUNKS.store(m as u32, Relaxed);
+    let max_ms = max_ms.max(MAX_CHUNK_MS.load(Relaxed)); // + a failed walk's pages (counted before it fell back)
     MAX_CHUNK_MS.store(max_ms, Relaxed);
     STATE.store(2, Release);
     serial_println!(
-        "[jobs] volume={} records={} claims={} ledger={} queue={} queries={} on={} chunks={} max_chunk_ms={} waited_ms={} ms={}",
+        "[jobs] volume={} records={} claims={} ledger={} queue={} queries={} on={} chunks={} max_chunk_ms={} waited_ms={} ms={} pages={} fallbacks={} paged={} page_bytes={}",
         jobs_core::ROOT,
         tally[0] + tally[1] + tally[2],
         tally[0],
@@ -202,7 +415,11 @@ fn scan(waited_ms: u64) {
         m,
         max_ms,
         waited_ms,
-        crate::arch::ms().saturating_sub(t0)
+        crate::arch::ms().saturating_sub(t0),
+        PAGES.load(Relaxed),
+        FALLBACKS.load(Relaxed),
+        if paged { "yes" } else { "no" },
+        want
     );
 }
 
@@ -224,11 +441,11 @@ fn selftest() {
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let bar_ms: Option<u64> = None;
     let bar_ok = bar_ms.map_or(true, |b| b <= 200);
-    let pass = landed && on == "worker" && max_ms <= 50 && bar_ok; // VFSTXCOST (B522): the chunk bound is 50 again — the fixed per-transaction cost was the one-window read-ahead cache (fs/unafs.rs `RaSet`)
+    let pass = landed && on == "worker" && max_ms <= CHUNK_BOUND_MS && bar_ok; // VFSTXCOST (B522): the chunk bound is 50 again — the fixed per-transaction cost was the one-window read-ahead cache (fs/unafs.rs `RaSet`); JOBSCAN2 (B551): the chunk is one PAGE now
     let bar = bar_ms.map_or(String::from("none"), |b| format!("{}", b));
     serial_println!(
-        ":: JOBSCAN: on={} chunks={} max_chunk_ms={} bar_ms={} -> {} :: state={}",
-        on, chunks, max_ms, bar, if pass { "PASS" } else { "FAIL" }, state()
+        ":: JOBSCAN: on={} chunks={} bar_ms={} max_chunk_ms={} pages={} -> {} :: state={} bound_ms={} fallbacks={}",
+        on, chunks, bar, max_ms, PAGES.load(Relaxed), if pass { "PASS" } else { "FAIL" }, state(), CHUNK_BOUND_MS, FALLBACKS.load(Relaxed)
     );
 }
 
