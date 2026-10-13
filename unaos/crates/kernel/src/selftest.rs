@@ -65,7 +65,7 @@ use crate::pal::{GneissPal, TargetPal};
 // allocates, and has no contention-loss path left at all — only the ring genuinely filling up, which is
 // counted and reported. This is what lets `tste` REPLAY the boot fixtures it cannot itself re-run.
 
-const RING_CAP: usize = 64;
+const RING_CAP: usize = 256; // PISPEC (PI12): 74 verdict lines print before SERWIT-2's first poll on the Pi line; 64 dropped ten
 const NAME_MAX: usize = 40;
 
 #[derive(Clone, Copy)]

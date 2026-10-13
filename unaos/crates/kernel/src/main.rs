@@ -1409,7 +1409,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             unaos_kernel::tests::register("typematic", || { typematic_selftest(); unaos_kernel::pal::keyrepeat_selftest(); }); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             unaos_kernel::tests::register("inwedge", inwedge_selftest); // INWEDGE: prove the input router refuses a held panel lock instead of wedging the input core on it
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
-            if !desktop_firmware_activate_maybe() { unaos_kernel::video::fbcon::detach(); } rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `desktop_firmware_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
+            if !desktop_firmware_activate_maybe() { unaos_kernel::video::fbcon::detach(); } #[cfg(not(all(feature = "pirast", feature = "desktop_firmware")))] rast_demo_maybe(); // RASTWIN-ARMED (PISPEC, pi-ledger PI23): on a desktop_firmware build the Pi demo no longer runs HERE, over the live witness cascade; it runs once at the armed seam (`rast_demo_armed_once`, file tail, called from the SHELLWIN-PI mint arm). CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `desktop_firmware_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
             // input task is woken by the UART instead of polling. GICD config stays BSP-only (this is
             // global distributor state). A backstop task also periodically wakes the input service so
@@ -5595,7 +5595,7 @@ fn render_pass<W: RenderWait>(w: &mut W) {
             && !shell_declined
             && unaos_kernel::video::desktop_firmware::armed()
         {
-            let info = front_fb.info();
+            let info = front_fb.info(); rast_demo_armed_once(); // RASTWIN-ARMED (PISPEC, PI23) — SAME-LINE fold, line-NEUTRAL: the first pass where `desktop_firmware::armed()` reads true starts the Pi cube ONCE on its own kernel task (never inline: 90 paced frames would stall this pass)
             match open_shell_window(info.width, info.height) {
                 Some((store, fb, id)) => {
                     // SHELLWIN-PI — the BACKDROP hand-off, in the SAME PASS as the window. Until this
@@ -7224,14 +7224,14 @@ fn tegra_darkwin_witness(boot_info: &BootInfo) {
 // (post-drop, at EL1, right before `run_capstone_boot_core`), so the spinning cube is the last panel
 // content of the boot; the panel comes off `video::WRITER` as JD1 seeded it, mapped into BOTH
 // translation tables so it is reachable post-drop at EL1, and `crate::arch::ms()` reads CNTVCT on that
-// timerless core (the VUGFIX tegra fallback). On pi: the aarch64/baremetal GUI-handoff DETACH LINE —
-// after the mailbox panel and the heap and the timer are all long up, and BEFORE any service task
-// exists, so it can neither race bring-up nor fight the compositor (`render_service` is the panel's
-// sole painter and has not been spawned yet, and it repaints the console over the cube the moment it
-// starts). The demo's own `Screen` (a full-panel back buffer, ~9 MiB at 1920x1200) is scoped to this
-// call and dropped before those spawns, so the render task's identical shadow never coexists with it
-// on the 48 MiB metal heap. `rast_demo::run` is bounded (90 paced frames), so boot always reaches the
-// shell.
+// timerless core (the VUGFIX tegra fallback). On pi: the aarch64/baremetal GUI-handoff DETACH LINE on a
+// build without `desktop_firmware`; WITH it (RASTWIN-ARMED, PISPEC PI23) the handoff line no longer calls
+// this — the witness cascade is compositing there (PIWM cause C: the parked 3D row read back as RW_CLEAR
+// under `[wc-iso]`) — and `rast_demo_armed_once` (file tail) runs it ONCE, on its own kernel task, at the
+// first render pass where `desktop_firmware::armed()` reads true. The pi arm builds its `Screen` on an
+// EMPTY framebuffer: `rast_demo::run` renders into its own `wm` row and never reads the `Screen`, and a
+// full-panel back buffer (~9 MiB at 1920x1200) must not coexist with the render task's shadow on the
+// 48 MiB metal heap. `rast_demo::run` is bounded (90 paced frames), so boot always reaches the shell.
 //
 // STILL AT THE FILE TAIL, and still CALLED ON AN EXISTING SOURCE LINE at both sites, for the reason
 // both halves of this block used to state separately: panic `Location` records embed file AND LINE,
@@ -7267,12 +7267,12 @@ fn rast_demo_maybe() {
     if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } // ORIN-CONWIN rung 4 — THE SAME GUARD ITS TWIN AT `jd2_console_pump`'s phase-2 line already carries, and it was missing here. THE DEFECT IT REMOVES: on the terminus line `orin_conwin` runs BEFORE `rast_demo_maybe`, so every image carrying both (all five orinconwin legs carry `rast`) installed the console-window route, printed `[orinconwin] … live=LIVE`, and then reached THIS statement and detached anyway — `GUI_ACTIVE` set, `fbcon::_print` returning at its first test, and the "LIVE" console window receiving no further glyph for the rest of the boot. The guard is the same one and for the same reason: `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the PANEL — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the single-writer guarantee the detach exists for is already true of the mirror path. ⚠ WHAT THE GUARD COSTS HERE, and it is NOT identical to the phase-2 site's cost, so it is stated rather than inherited: this site's stated purpose is "a straggler can't paint over the DEMO FRAMES", and a routed console still reaches glass through `wm`'s paced, damage-limited composite. So a straggler line printed while the cube spins can now composite over it INSIDE the console window's rect, and because `orin_rast_console_owns()` is not latched until phase 2 the census would score that `RAST-PAINTED-OVERWRITTEN`. That is a true reading of a real second writer, not a false one — the conwin+rast image genuinely has two panel owners — and it is the same trade the phase-2 line already took when it chose a live console over a frozen one. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof. Knob-off `tegra_conwin_live` is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been.
     #[cfg(feature = "tegra")]
     serial_println!(":: RAST: tegra — first 3D pixels on the Orin panel (inherited scanout) ::");
-    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    #[cfg(not(feature = "pi"))] let mut screen = unaos_kernel::video::Screen::new(front_fb); #[cfg(feature = "pi")] let mut screen = unaos_kernel::video::Screen::new(unaos_kernel::video::FrameBuffer::new()); // RASTWIN-ARMED: line-NEUTRAL; the pi `Screen` is empty (see the block above)
     #[cfg(feature = "pi")]
     serial_println!(
         ":: RAST: BCM2711 mailbox panel {}x{} (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::",
-        screen.width(),
-        screen.height()
+        front_fb.info().width,
+        front_fb.info().height
     );
     #[cfg(feature = "pi")]
     let t0 = unaos_kernel::arch::ms();
@@ -10650,3 +10650,43 @@ fn virt_users_pass(dtb_addr: u64, dtb_size: usize) {
     );
     unaos_kernel::fs::users::screen_open_at_ignition(false, false);
 }
+
+// ── RASTWIN-ARMED (PISPEC, pi-ledger PI23) ───────────────────────────────────────────────────────
+// PIWM cause C (docs/dev/evidence/piwm/PIWM.md §4): on a `desktop_firmware` + `pirast` build the
+// handoff-line call opened the RASTWIN 3D row (owner `KERNEL_OWNER_BASE + 0x61`) while u7-launch's
+// witness cascade was compositing on the APs, and since RASTWIN's park (`28bcd764`) that row stays on
+// the desktop for the boot: `[wc-iso] close-iso … forced=0x101018/false -> FAIL` (RW_CLEAR). The move:
+// the SHELLWIN-PI mint arm in `render_pass` (the first pass where `video::desktop_firmware::armed()`
+// reads true, i.e. after `:: DESK: desktop armed`) calls this on its existing `let info` line, and it
+// spawns `rast_demo_maybe` ONCE on a load-balanced kernel task. Never inline — 90 paced frames (~3 s)
+// would stall the render pass — and never twice: the mint arm re-fires on a shell quit + relaunch,
+// the latch does not. The task stack is SIZED: the demo opens and composites a `wm` row from it, and
+// the same chain measured `hw=23232` > 16 KiB on the Orin (`TEGRA_JD2_STACK_SIZE`'s note). The tegra
+// call on `tegra_early_stop`'s terminus line is unchanged; every other build gets the inline no-op.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware", feature = "pirast"))]
+fn rast_demo_armed_once() {
+    static STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    unaos_kernel::arch::sched::spawn_stack(
+        "rastwin",
+        rast_demo_task,
+        0,
+        unaos_kernel::arch::sched::CPU_AUTO,
+        RAST_TASK_STACK_SIZE,
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware", feature = "pirast"))]
+fn rast_demo_task(_: usize) {
+    rast_demo_maybe();
+}
+
+/// The RASTWIN-ARMED task's kernel stack: the measured 32 KiB the render-path tasks use.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware", feature = "pirast"))]
+const RAST_TASK_STACK_SIZE: usize = 32 * 1024;
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware", not(feature = "pirast")))]
+#[inline(always)]
+fn rast_demo_armed_once() {}

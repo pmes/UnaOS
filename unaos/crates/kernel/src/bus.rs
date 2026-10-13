@@ -415,7 +415,7 @@ pub fn bus_codec_selftest() {
         m[5] = 9; // kind
         let bad_kind = frame_parse(&m[..n]) == Err(BusDecodeErr::Malformed);
         let mut m = f;
-        m[6] = 9; // verb
+        m[6] = 0; // verb 0 is the one no handler takes: PISPEC (PI14) — 9 became a menu verb (APPMENU)
         let bad_verb = frame_parse(&m[..n]) == Err(BusDecodeErr::Malformed);
         let mut m = f;
         m[12] = 1; // nonzero status in a request
@@ -639,7 +639,7 @@ pub fn bus_codec2_selftest() {
         // a request frame carrying an UNKNOWN verb (7) is Malformed at the header (additive gate).
         let mut f = [0u8; 128];
         let n = build_request(BUS_VERB_RM, 12, b"NOTE.TXT", &mut f);
-        f[6] = 7; // verb 7 is not valid
+        f[6] = 0; // verb 0 is not valid for a frame: PISPEC (PI14) — 7 became valid at merge9
         let bad_verb = frame_parse(&f[..n]) == Err(BusDecodeErr::Malformed);
         if write_ok && rm_ok && mv_ok && bad_verb {
             w |= 1 << 4;

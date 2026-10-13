@@ -783,10 +783,10 @@ REQUIRE \[storm\] boot-baseline \| busy
 # ---   races its own exit. Leg 3 keeps the persistence proof regardless: STAT.ELF has no exit condition
 # ---   AT ALL, focused or not, where VUG's persistence is conditional on the detached bit.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
-# --- PROCS-6: the cap itself, pinned. The reclaim leg below drives MAX_PROCS+2 launches, so its own
-# ---   PASS text cannot tell you which capacity it exercised; this line can, and a silent regression
-# ---   of the cap back to 4 (or a raise past the EL0 slot pool) fails HERE rather than mysteriously.
-REQUIRE BGRUN-ST: process table capacity = 6 rows \(bg programs alive at once; EL0 slots 8\)
+# --- PROCS-6 -> R90 (PISPEC, pi-ledger PI15): the cap is no longer a literal. WINDOWCAP3 M5 (9a9d7930) moved the aarch64
+# ---   table to the heap: the value is video::wincap::proc_limit() (memory's limit; 12 on QEMU raspi4b, `[wm] limit
+# ---   ... procs=12 from=mem:47`) and the text says `EL0 slots=heap, R90`. Pinned: a count, the heap text; :1983 FORBIDs 0 and the fixed-pool text.
+REQUIRE BGRUN-ST: process table capacity = [1-9][0-9]* rows \(bg programs alive at once; EL0 slots=heap, R90\)
 # --- BGRUN-SCAV: exited-but-unreaped rows must not deny a launch the machine can satisfy. MAX_PROCS+2
 # ---   bg launches with NO intervening reap; every one must succeed (8 launches at the PROCS-6 cap, the
 # ---   last two served only by the PEXITED scavenge). Goes red on the pre-fix kernel.
@@ -1980,7 +1980,7 @@ FORBID K4-ready:.*prefix\) FAIL
 FORBID :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?:$|[^0]|0(?:$|[^x]|x(?:$|[^f]|f(?:$|[^1]|1(?:$|[^8]|8(?:$|[^f]|f(?:$|[^9]|9(?:$|[^8]|8(?:$|[^3]|3(?:$|[^5]|5(?:$|[^5]|5(?:$|[^7]|7(?:$|[^b]|b(?:$|[^8]|8(?:$|[^7]|7(?:$|[^a]|a(?:$|[^5]|5(?:$|[^5]))))))))))))))))))
 FORBID \[inroute\] router window — (?:$|[^r]|r(?:$|[^o]|o(?:$|[^u]|u(?:$|[^t]|t(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^s]|s(?:$|[^t]|t(?:$|[^a]|a(?:$|[^l]|l(?:$|[^e]|e(?:$|[^_]|_(?:$|[^d]|d(?:$|[^r]|r(?:$|[^o]|o(?:$|[^p]|p(?:$|[^p]|p(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^1]|1(?:$|[^ ]| (?:$|[^r]|r(?:$|[^e]|e(?:$|[^v]|v(?:$|[^o]|o(?:$|[^k]|k(?:$|[^e]|e(?:$|[^s]|s(?:$|[^=]|=(?:$|[^0]))))))))))))))))))))))))))))))))))
 FORBID \[wc-c\] side-by-side (?:$|[^w]|w(?:$|[^i]|i(?:$|[^n]|n(?:$|[^d]|d(?:$|[^o]|o(?:$|[^w]|w(?:$|[^s]|s(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^d]|d(?:$|[^r]|r(?:$|[^a]|a(?:$|[^w]|w(?:$|[^n]|n(?:$|[^=]|=(?:$|[^2])))))))))))))))))
-FORBID BGRUN-ST: process table capacity = (?:$|[^6]|6(?:$|[^ ]| (?:$|[^r]|r(?:$|[^o]|o(?:$|[^w]|w(?:$|[^s]))))))
+FORBID BGRUN-ST: process table capacity = (?:0 rows|[0-9]+ rows \(bg programs alive at once; EL0 slots [0-9])
 FORBID \[wc-e\] fb-geometry .*row_ok=false
 FORBID \[wc-e\] fb-geometry .*fit_ok=false
 FORBID \[cursor3\] .*-> INCOHERENT
@@ -2175,9 +2175,9 @@ FORBID :: CERAMIC: .* :: FAIL ::
 # ---    1. THE WIRE LINE names every derived parameter AND the FNV-1a 64 of the tile produced,
 # ---       AND `box=` the control diameter the material was sized against — so Peter's size ruling
 # ---       ("window buttons are very small", `theme::CONTROL_BOX` 12 -> 24) is legible in the
-# ---       capture rather than inferred from the chrome. Emitted once from the first generation and
-# ---       NOT witness-gated, so the metal image prints it too.
-REQUIRE \[knurl\] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=24 tile=4x4 hash=0x56957202a422b4b1
+# ---       capture. UIMETRICS M1 (c6ec712b) made it `ui::px(12)` = 12 x the dpi scale (12 at QEMU 640x480, 24 at 2x), so
+# ---       `box=` is pinned as a number, not 24 (PISPEC, pi-ledger PI16). NOT witness-gated: the metal image prints it too.
+REQUIRE \[knurl\] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=[1-9][0-9]* tile=4x4 hash=0x56957202a422b4b1
 #
 # ---    2. THE FIXTURE VERDICT. `knurl::selftest` recomputes every factor from scratch and asserts
 # ---       determinism AND the pinned checksum; asserts the AMPLITUDE BUDGET on every pixel (the
@@ -2288,7 +2288,7 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---    `fired=` and `rl=` are PER-SLOT emission deltas, not a global total: this boot's earlier
 # ---    fixtures mint 32x8 rows that decline legitimately, and a global counter would have let one
 # ---    of them inflate the delta and red a kernel that was behaving perfectly.
-# ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
+# ---    Every leg value is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
 # ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
 # ---    presence check.
 # --- MERGE 6fddbccd (2026-08-18): the trunk's wm work moved the row floor 158 -> 149; the pin
@@ -2297,9 +2297,9 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # --- floor is `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W` and only the last term moved: the
 # --- CHROME face's raster is now derived from `theme::TITLE_HEIGHT` (34 -> Size20) instead of being
 # --- fixed at the body face's Size16, so the mono advance went 7 -> 9. Nothing about the control
-# --- cluster, the frame or the gap changed. See `wm::controls`' doc for the three moves this floor
-# --- has made and why none of them was ever a code change.
-REQUIRE :: WMCTRL: controls-declined — floor=151 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
+# --- cluster, the frame or the gap changed. UIMETRICS M1 (c6ec712b) then scaled every term: at QEMU 640x480 (scale 1)
+# --- 10+12+(36+48)+9 = 115; 151 was the 24-px box. The floor is pinned as a number (PISPEC, pi-ledger PI17).
+REQUIRE :: WMCTRL: controls-declined — floor=[1-9][0-9]* .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
 
 # --- DRAG-PI M4 — the drag COST witness (`[dragperf]`, wm::dragperf_selftest).
