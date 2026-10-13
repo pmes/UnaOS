@@ -311,9 +311,9 @@ fn report() {
     let gmax = GAP_MAX_MS.load(Relaxed);
     let worst = if gaps == 0 { None } else { Some(Holder(GAP_MAX_WHO.load(Relaxed), 0, GAP_MAX_STEP.load(Relaxed) as u8)) };
     serial_println!(
-        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} starved={} starved_max_ms={} silent={} silent_max_ms={} pass_max_ms={} pass_bound_ms={} via=tests",
-        n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, Classed(silent_worst(gaps), WorstWord(worst)), if mt > leg { "mt" } else { "legacy" }, FineWord,
-        if verdict(n, STARVED.load(Relaxed), mt, leg) { "PASS" } else { "FAIL" }, BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
+        ":: POINTERFEEL: reports={} rate_hz={}.{} gaps={} gap_max_ms={} worst_holder={} route={} {} {} -> {} :: bound_ms={} window_ms={} mt={} legacy={} reassert={} reassert_latched={} fr={} fr_worst_ms={} login_gap_ms={} login_gap_holder={} starved={} starved_max_ms={} silent={} silent_max_ms={} pass_max_ms={} pass_bound_ms={} via=tests",
+        n, rate_x10 / 10, rate_x10 % 10, gaps, gmax, Classed(silent_worst(gaps), WorstWord(worst)), if mt > leg { "mt" } else { "legacy" }, FineWord, RateWord(rate_x10), // POINTERSCALE2 (B554): `expected_hz=` from the endpoint's bInterval beside `rate_hz=` (LINE-NEUTRAL, code first)
+        if verdict(n, STARVED.load(Relaxed), mt, leg) && rate_ok(rate_x10, expected_hz()) { "PASS" } else { "FAIL" }, BOUND_MS, WINDOW_MS, mt, leg, reasserts(),
         REASSERT_LATCHED.load(Relaxed), fr, fr_worst, LOGIN_GAP_MS.load(Relaxed), LoginGapHolder, STARVED.load(Relaxed), STARVED_MAX_MS.load(Relaxed), SILENT.load(Relaxed), SILENT_MAX_MS.load(Relaxed), PASS_MAX_MS.load(Relaxed), BOUND_MS
     );
     let start = START_MS.load(Relaxed);
@@ -446,5 +446,60 @@ impl core::fmt::Display for GapClass {
         }
         let held = GAP_WHO.get(self.0).map(|w| w.load(Relaxed) >> 32 != 0).unwrap_or(false);
         write!(f, " pass_max_ms={} cause={}", p, if p > BOUND_MS || held { "starved" } else { "silent" })
+    }
+}
+
+// ── POINTERSCALE2 (rmbp-ledger B554) — the report RATE against what the endpoint promises. FILE-TAIL append. ──────────────
+//
+// THE WIRE (flight 33 boot 2, a finger moving the whole window): `reports=244 rate_hz=48.8 … silent=3 silent_max_ms=1001
+// pass_max_ms=2 -> PASS` — the fixture passed a stream that delivered under half the pad's frames, because PUMPHOLE's
+// rule only charges the kernel a gap its own pass caused and a "silent" gap is called the pad's. The rate itself is the
+// reading Peter feels ("mouse even less responsive than ever!"), so it is now IN the verdict: the vendor endpoint's
+// bInterval (USB 2.0 §9.6.6: FS/LS frames, HS 2^(b-1) microframes; recorded at arm time by `drivers/ehci/mod.rs`'
+// `configure_report_pointer` through [`note_ep`]) gives `expected_hz=` — capped at 1000 because the periodic QH is armed
+// S-mask 0x01, one transaction per 1 ms frame — and the window FAILs when `rate_hz` is below [`RATE_PCT_MIN`] % of it.
+// Wire: ` expected_hz=<n> binterval=<b> speed=<fs|hs> rate_pct=<n> rate=<ok|LOW>` on the verdict line (`expected_hz=-
+// rate=unrated` when no vendor endpoint was armed this boot — the legacy route already fails the verdict).
+
+/// The least share of the endpoint's bInterval rate a finger-down window must deliver.
+pub const RATE_PCT_MIN: u64 = 80;
+/// The vendor trackpad endpoint's bInterval (0 = none armed) and whether it is high-speed.
+static EP_BINTERVAL: AtomicU32 = AtomicU32::new(0);
+static EP_HS: AtomicBool = AtomicBool::new(false);
+
+/// `configure_report_pointer`: the vendor-multitouch endpoint is armed with this `bInterval` at this speed.
+pub fn note_ep(binterval: u8, hs: bool) {
+    EP_HS.store(hs, Relaxed);
+    EP_BINTERVAL.store(binterval as u32, Relaxed);
+}
+
+/// Reports per second the endpoint's bInterval promises, at most one per 1 ms frame (the QH's S-mask). 0 = unknown.
+pub fn expected_hz() -> u64 {
+    let b = EP_BINTERVAL.load(Relaxed) as u64;
+    if b == 0 {
+        return 0;
+    }
+    let hz = if EP_HS.load(Relaxed) { 8000 >> (b.min(16) - 1) } else { 1000 / b };
+    hz.clamp(1, 1000)
+}
+
+/// Is a window's rate (tenths of Hz) at least [`RATE_PCT_MIN`] % of `expected` Hz? An unknown expectation does not rate. Pure.
+pub fn rate_ok(rate_x10: u64, expected: u64) -> bool {
+    expected == 0 || rate_x10 * 100 >= expected * 10 * RATE_PCT_MIN
+}
+
+/// ` expected_hz=<n> binterval=<b> speed=<fs|hs> rate_pct=<n> rate=<ok|LOW>` for a window rate in tenths of Hz.
+struct RateWord(u64);
+impl core::fmt::Display for RateWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let e = expected_hz();
+        if e == 0 {
+            return f.write_str("expected_hz=- rate=unrated");
+        }
+        write!(
+            f, "expected_hz={} binterval={} speed={} rate_pct={} rate={}",
+            e, EP_BINTERVAL.load(Relaxed), if EP_HS.load(Relaxed) { "hs" } else { "fs" }, self.0 * 10 / e,
+            if rate_ok(self.0, e) { "ok" } else { "LOW" }
+        )
     }
 }

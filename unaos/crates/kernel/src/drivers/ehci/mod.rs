@@ -4712,7 +4712,7 @@ impl Controller {
         }
         // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
         // vendor-multitouch interface) is armed — the trackpad-input milestone.
-        crate::bootlog::record("ehci:trackpad-armed");
+        crate::bootlog::record("ehci:trackpad-armed"); if layout.vendor_mt { crate::pointerfeel::note_ep(interval, t.eps == QH_EPS_HIGH); } // POINTERSCALE2 (B554): the vendor endpoint's bInterval and speed, for `tests pointerfeel`'s `expected_hz=` (LINE-NEUTRAL fold, code first)
         if layout.vendor_mt && cfg!(not(feature = "mtraw")) {
             tpmode_witness(self.idx, crate::arch::ms());
         }
@@ -15046,7 +15046,7 @@ unsafe fn isr_publish_ep(
 /// cannot block.
 unsafe fn isr_rearm(ep: &IsrEp) {
     // Flip first, then use the NEW value: `fetch_xor` returns the old one.
-    let toggle = ep.toggle.fetch_xor(1, Ordering::Relaxed) ^ 1;
+    let flip = isr_dt_flip(ep); let toggle = ep.toggle.fetch_xor(flip, Ordering::Relaxed) ^ flip; // POINTERSCALE2 (B554): the toggle advances by the PARITY OF THE PACKETS the retired transfer moved, not by one per transfer — a two-packet TYPE2 frame (86 B over a 64 B MPS) left the old flip one toggle out (`isr_dt_flip`, file tail). LINE-NEUTRAL fold, code first.
     let dt = if toggle & 1 != 0 { QTD_DT } else { 0 };
     let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
     let total = ep.rx_total.load(Ordering::Relaxed);
@@ -17583,7 +17583,7 @@ impl TpCensus {
                 self.mt_prev1 = None;
             }
             if let Some((px, py)) = prev {
-                let (rx, ry) = (cur.0 - px, cur.1 - py); let jump = finemotion::is_jump((rx, ry), gap_ms); if jump { self.mt_res = (0, 0); } // POINTERSCALE (B540): NO per-axis clamp — `TP_MT_MAX_STEP` capped every frame at curve(128) = 37.67 px (flight 32's `[tp] mt dx=±37/38`) and bent a fast diagonal; a JUMP (quarter-range step, or the first frame after a silence) re-baselines instead
+                let (rx, ry) = (cur.0 - px, cur.1 - py); let jump = finemotion::is_jump((rx, ry), gap_ms); if jump { self.mt_res = (0, 0); } let (rx, ry) = if jump { (rx, ry) } else { finemotion::clamp((rx, ry)) }; // POINTERSCALE2 (B554): `is_jump` is now ONLY the re-touch (>= 250 ms silence, no lift); every other step is CLAMPED in magnitude with its direction kept and moves the pointer — never discarded (LINE-NEUTRAL fold, code first). POINTERSCALE (B540): NO per-axis clamp — `TP_MT_MAX_STEP` capped every frame at curve(128) = 37.67 px (flight 32's `[tp] mt dx=±37/38`) and bent a fast diagonal; a JUMP (quarter-range step, or the first frame after a silence) re-baselines instead
                 let ((ox, oy), (qx, qy)) = if jump { ((0, 0), (0, 0)) } else { finemotion::step2((rx, ry), &mut self.mt_res) }; dx = ox; // FINEMOTION (B496): the curve in Q8 with the remainder CARRIED — `tp_scale` floored every sub-divisor frame to 0 px, the dead zone of flight 27. POINTERSCALE (B540): ONE curve on the vector magnitude, one gain on both legs (flight 32's `in=-18,-51 scaled=-2.25,-12.00` was x below the knee, y above it)
                 dy = oy;
                 if !jump { self.mt_last = (rx, ry, qx, qy); }
@@ -19764,4 +19764,43 @@ impl Controller {
             back.unwrap_or(0xFF), back.is_some(), if latched { "yes" } else { "no" }, crate::arch::ms().saturating_sub(t0)
         );
     }
+}
+
+// ── POINTERSCALE2 (rmbp-ledger B554) — the interrupt-IN re-arm's data toggle, by packet parity. FILE-TAIL append. ─────────
+//
+// THE BRIEF ASKED FOR DEPTH (N transfers outstanding, XHCINTD's B44 shape) AND THIS SILICON REFUSES IT: both rMBP EHCI
+// functions run OVERLAY-DIRECT (`Controller::overlay_mode`; the controller HSEs on a qTD fetch — `IntEp`'s doc and the
+// ISRARM block's "Why depth was refused" in this file), so there is no qTD for the controller to chain and the endpoint
+// holds exactly ONE transfer. What closes the dark window on this metal is ISRARM's re-arm from the completion interrupt.
+//
+// The loss this arc CAN close is in that re-arm: `isr_rearm` flipped the data toggle ONCE per retired transfer. With
+// `QH_DTC` the device's toggle advances once per PACKET, and the vendor endpoint's transfer is armed for a whole TYPE2
+// frame (`rx_total` = `INT_BUF_LEN`, 256 B; EHCI 3.5.3 keeps issuing INs until a short packet): a two- or three-finger
+// frame (30 + 28n = 86 / 114 B over this pad's 64 B MPS — `M1 armed vendor-multitouch … mps=64 interval=2` on every
+// metal boot) is TWO packets, the device's toggle moved twice, ours once — so the NEXT frame's first packet is ACKed and
+// discarded as a retransmission, and its second packet lands as a truncated frame. One lost frame per multi-packet frame:
+// every two-finger scroll frame, every frame of a resting palm beside the pointing finger. The fix counts the packets the
+// retired token says moved (`rx_total - remaining`, a short packet ending it) and flips by their parity. A one-packet
+// transfer (every keyboard report, every one-finger frame) is one packet = one flip, exactly the old behaviour.
+
+/// The toggle flips one retired transfer owes: 1 when it moved an odd number of packets, 0 when even. A token that is
+/// not a clean retirement (still active, halted, errored — KBDFLAP's halt-clear re-arm seeds DATA1 and relies on ONE
+/// flip to land on DATA0) or an unreadable MPS keeps the old single flip.
+unsafe fn isr_dt_flip(ep: &IsrEp) -> u32 {
+    let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
+    let tok = if ep.om.load(Ordering::Relaxed) != 0 {
+        core::ptr::read_volatile(&(*qh).overlay[2])
+    } else {
+        core::ptr::read_volatile(&(*(ep.qtd.load(Ordering::Relaxed) as *mut Qtd)).token)
+    };
+    let total = ep.rx_total.load(Ordering::Relaxed);
+    let rem = (tok >> QTD_TOTAL_SHIFT) & 0x7FFF;
+    let mps = (core::ptr::read_volatile(&(*qh).ep_chars) >> QH_MPS_SHIFT) & 0x7FF;
+    if tok & (QTD_ACTIVE | QTD_ERR_MASK) != 0 || mps == 0 || rem > total {
+        return 1;
+    }
+    let moved = total - rem;
+    // Ended on a short (or zero-length) packet unless it filled `total` exactly in whole packets.
+    let packets = if moved == total && moved % mps == 0 { moved / mps } else { moved / mps + 1 };
+    packets & 1
 }
