@@ -428,8 +428,8 @@ refs/heads/exec-rmbp-screenshotfat            d20412c5 FOLDED-BY-HAND e5a8bd8c 2
 refs/heads/exec-rmbp-queuesleep2              cc2b7a8a IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-aetherjs2                98d9f842 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-aethermedia              98d9f842 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-rmbp-sonde3                   98d9f842 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-sonde3                   ac00fced FOLDED-BY-HAND 7435ff67 2026-10-13
 refs/heads/exec-rmbp-prefchanged              98d9f842 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-palettecore              98d9f842 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-aethermetal4             73cd904b IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-rmbp-aethernet                73cd904b IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-aethernet                d5a2c5bf FOLDED-BY-HAND e29d1150 2026-10-13
