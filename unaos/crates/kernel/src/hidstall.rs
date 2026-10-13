@@ -509,6 +509,7 @@ pub fn holder_between(from: u64, to: u64) -> (u64, usize) {
         }
     }
     best
+}
 
 // ── SMALLFIX10 (rmbp-ledger B539 item 4): a timeout whose release the decoder never pushed ─────────────────────────────
 //

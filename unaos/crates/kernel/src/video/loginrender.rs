@@ -36,7 +36,7 @@ pub const WINDOW_MS: u64 = 30_000;
 pub const BOUND_MS: u64 = 100;
 
 /// Stamp names ([`stamp`] ids index this). A new non-render job on the render task adds its name here.
-pub const WHAT_NAMES: [&str; 10] = ["-", "wallpaper-probe", "dock-console", "quarry", "quarry.open", "quarry.viewers", "quarry.settings", "quarry.font", "quarry.activity", "quarry.panes"];
+pub const WHAT_NAMES: [&str; 11] = ["-", "wallpaper-probe", "dock-console", "quarry", "quarry.open", "quarry.viewers", "quarry.settings", "quarry.font", "quarry.activity", "quarry.panes", "prefs-watch"];
 /// WALLPAPER's default probe (`~/Desktop/WALL.PNG`, `/WALL.PNG`): two volume stats and, when found, a decode.
 pub const W_WALLPAPER: u8 = 1;
 /// The dock's console launch drain (`dock::console_launch_service`).
@@ -58,8 +58,11 @@ pub const W_Q_FONT: u8 = 7;
 pub const W_Q_ACTIVITY: u8 = 8;
 /// Quarry's own panes: the jobs status line, Quick Look, columns, open-with, the live directory relist.
 pub const W_Q_PANES: u8 = 9;
+/// SMALLFIX10 (B539 item 3, the seat's fold): the prefs delete watch (two `stat`s per settings domain under `SAVE_LOCK`,
+/// every 2 s) — flight 31's `quarry:225` — runs on a worker core now; its runs are counted by [`moved`].
+pub const W_PREFSWATCH: u8 = 10;
 /// The jobs this arc moved OFF the render task (their runs on the worker are counted by [`moved`]).
-const MOVED_IDS: [u8; 1] = [W_WALLPAPER];
+const MOVED_IDS: [u8; 2] = [W_WALLPAPER, W_PREFSWATCH];
 
 /// The stamp in flight on the render task, packed `start_ms << 8 | id` (0 = none). A nested stamp replaces it
 /// and puts the enclosing one back when it drops (SMALLFIX10), so it always names the INNERMOST job in flight.

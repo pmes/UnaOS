@@ -412,8 +412,29 @@ pub fn service() {
     let now = crate::arch::ms();
     if now.saturating_sub(WATCH_MS.load(Ordering::Relaxed)) >= WATCH_EVERY_MS {
         WATCH_MS.store(now, Ordering::Relaxed);
+        // SMALLFIX10 (B539 item 3): flight 31's LOGINRENDER `quarry:225` was THIS watch on the render task (two
+        // `stat`s per domain under SAVE_LOCK, slowed by the registry build holding the volume masked). On a worker
+        // core now, the wallpaper probe's shape (wallpaper.rs); inline where there is no worker core.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(cpu) = crate::arch::smp::worker_cpu(0) {
+            if !WATCHING.swap(true, Ordering::AcqRel) {
+                crate::arch::sched::spawn_stack("prefs-watch", watch_task, cpu, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::RENDER_PATH_STACK_SIZE);
+            }
+            return;
+        }
         let _ = watch_deleted();
     }
+}
+
+/// SMALLFIX10 (B539 item 3): one delete-watch run in flight on the worker (never two).
+static WATCHING: AtomicBool = AtomicBool::new(false);
+
+/// SMALLFIX10 (B539 item 3): the delete watch's worker task — counted as moved off the render task.
+#[cfg(target_arch = "x86_64")]
+fn watch_task(_cpu: usize) {
+    crate::video::loginrender::moved(crate::video::loginrender::W_PREFSWATCH);
+    let _ = watch_deleted();
+    WATCHING.store(false, Ordering::Release);
 }
 
 /// R98: a domain file the user deleted resets that domain to the schema defaults (the store never holds a
