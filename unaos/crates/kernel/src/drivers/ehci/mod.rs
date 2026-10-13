@@ -13807,7 +13807,7 @@ impl Controller {
                 // that says so is better than an `#[allow]` that would also hide a real one later.
                 let (rpt_ptr, len, dark_gap_ms, _at_ms, from_isr) =
                     if let Some((n, slot_ms, gap)) = handoff {
-                        drained += 1;
+                        drained += 1; tps_isr(e.isr_slot); // TPSTREAM (B624): a completion the ISR lifted (LINE-NEUTRAL, code first)
                         (isr_scratch.as_ptr(), n, gap, slot_ms, true)
                     } else {
                         // ISRARM: claim the endpoint against the ISR for the direct read. Try-only — a pass
@@ -13832,7 +13832,7 @@ impl Controller {
                             core::ptr::read_volatile(&(*e.qtd).token)
                         };
                         if tok & QTD_ACTIVE != 0 {
-                            isr_release_poll(e.isr_slot);
+                            isr_release_poll(e.isr_slot); tps_nak(e.isr_slot, tok); // TPSTREAM (B624): the pass found the transfer still in flight (LINE-NEUTRAL, code first)
                             // KBDWIT-2: is the CONTROLLER actually walking to this queue head? Two volatile
                             // reads of words only it writes (split progress — see `IntEp::kbdwit_walks`),
                             // compared against the previous poll. This runs on every pass, before and after the
@@ -13940,7 +13940,7 @@ impl Controller {
                         // the expression is unchanged; knob-on, on the vendor-multitouch endpoint, it is the
                         // buffer size and the difference is the true length of a multi-packet raw frame.
                         #[cfg(not(feature = "mtraw"))]
-                        let len = (e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
+                        let len = ISR_EPS[e.isr_slot].rx_total.load(Ordering::Relaxed).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize; // TPSTREAM (B624): the bytes moved are the ARMED total minus the residue — the armed total is the registry's `rx_total` (256 on the vendor pad since TRACKPADPANE 963dd2ff), not `mps`; against `mps` every pad frame the pass retired read len=0 and was thrown away unseen
                         #[cfg(feature = "mtraw")]
                         let len = e.rx_total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
                         // ISRARM: the poll arm's tuple. The buffer pointer is `e.buf` — the endpoint's own DMA
@@ -14071,7 +14071,7 @@ impl Controller {
                             // report can fail to reach is a counter about the reports that passed.
                             // The rollup rides `EHCIDARK`'s own cadence and stays silent unless the
                             // census moved — see `tp_census_rollup`.
-                            e.tp.note(report);
+                            e.tp.note(report); tps_mark(e.isr_slot); // TPSTREAM (B624): this slot is the vendor pad (LINE-NEUTRAL, code first)
                             tp_census_rollup(e, idx, now_ms);
                             // M1 (RMBP-FIX, 2026-07-18): the raw-report dump exists ONLY to capture the
                             // opaque stream's byte layout, and that characterization is COMPLETE. Bound it
@@ -14223,14 +14223,14 @@ impl Controller {
                                     let mut hb = [0u8; TP_RAW2_HEX_MAX];
                                     serial_println!(":: TPRAW2: fingers={} bytes={} ::", report[WSP2_NFINGER_OFF], tp_hex_raw2(&mut hb, report));
                                 }
-                                let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); { let l = e.tp.mt_last; finemotion::note(idx, true, (l.0, l.1), (l.2, l.3), (dx, dy), f.fingers); } if f.fingers > 0 && f.touch0 != 0 { finemotion::range_note(f.x0, f.y0); } // POINTERSCALE (B540): the live pad's position widens the range the one scale is derived from (LINE-NEUTRAL fold, code first). TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
+                                tp_mode_ok(idx, e.tp.latched); let (buttons, dx, dy, wit) = e.tp.mt_step(f); let (buttons, dx, dy) = tpgest::shape(f, buttons, dx, dy, report.len(), idx); { let l = e.tp.mt_last; finemotion::note(idx, true, (l.0, l.1), (l.2, l.3), (dx, dy), f.fingers); } if f.fingers > 0 && f.touch0 != 0 { finemotion::range_note(f.x0, f.y0); } // POINTERSCALE (B540): the live pad's position widens the range the one scale is derived from (LINE-NEUTRAL fold, code first). TRACKPADPANE (B412): the Trackpad pane's gain, scroll, secondary, tap and three-finger drag, after the curve
                                 if wit {
                                     crate::bootlog_println!(
                                         ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} {} knee={} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units. POINTERSCALE (B540): the live range-derived scale
                                         idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, finemotion::Scale, TP_MT_CURVE_KNEE, e.tp.mt_frames
                                     );
                                 }
-                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2]); } crate::pointerfeel::note(now_ms, true, f.fingers > 0); // POINTERFEEL (B535): the vendor frame counted for `tests pointerfeel` (LINE-NEUTRAL append, code first). HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2]); tp_stream_row(idx, e.isr_slot, e.qh, e.tp.mt_frames, self.op); } crate::pointerfeel::note(now_ms, true, f.fingers > 0); // POINTERFEEL (B535): the vendor frame counted for `tests pointerfeel` (LINE-NEUTRAL append, code first). HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
                                 crate::pal::push_pointer_report(
                                     if dx != 0 || dy != 0 {
                                         Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -14373,7 +14373,7 @@ impl Controller {
                 // `IsrEp::rx_total` already carries `mps` knob-off and the `mtraw` total knob-on, so
                 // there is one expression rather than two.)
                 isr_rearm(&ISR_EPS[e.isr_slot]);
-                POLL_REARMS.fetch_add(1, Ordering::Relaxed);
+                POLL_REARMS.fetch_add(1, Ordering::Relaxed); tps_poll(e.isr_slot, len, e.mps); // TPSTREAM (B624): a completion the pass retired (LINE-NEUTRAL, code first)
                 isr_release_poll(e.isr_slot);
                 // The endpoint holds exactly one report and it has just been taken, so there is nothing
                 // further to drain on this pass. This is the loop's only unconditional exit.
@@ -15046,7 +15046,7 @@ unsafe fn isr_publish_ep(
 /// cannot block.
 unsafe fn isr_rearm(ep: &IsrEp) {
     // Flip first, then use the NEW value: `fetch_xor` returns the old one.
-    let flip = isr_dt_flip(ep); let toggle = ep.toggle.fetch_xor(flip, Ordering::Relaxed) ^ flip; // POINTERSCALE2 (B554): the toggle advances by the PARITY OF THE PACKETS the retired transfer moved, not by one per transfer — a two-packet TYPE2 frame (86 B over a 64 B MPS) left the old flip one toggle out (`isr_dt_flip`, file tail). LINE-NEUTRAL fold, code first.
+    tps_rearm(ep); let flip = isr_dt_flip(ep); let toggle = ep.toggle.fetch_xor(flip, Ordering::Relaxed) ^ flip; // POINTERSCALE2 (B554): the toggle advances by the PARITY OF THE PACKETS the retired transfer moved, not by one per transfer — a two-packet TYPE2 frame (86 B over a 64 B MPS) left the old flip one toggle out (`isr_dt_flip`, file tail). LINE-NEUTRAL fold, code first.
     let dt = if toggle & 1 != 0 { QTD_DT } else { 0 };
     let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
     let total = ep.rx_total.load(Ordering::Relaxed);
@@ -18625,7 +18625,7 @@ pub fn init() {
                     c.init_schedules();
                     if did_reset {
                         let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
-                        let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_RS);
+                        let _ = mmio_write32(h.op + OP_USBCMD, (cmd & !USBCMD_ITC_MASK) | USBCMD_ITC_1UF | CMD_RS); // TPSTREAM (B624): ITC 8 -> 1 µframe, written while HCHalted (EHCI 1.0 §2.3.1) — the IOC interrupt now follows a completion by <= 125 µs, not <= 1 ms
                         let running = wait_bounded(|| {
                             mmio_read32(h.op + OP_USBSTS).unwrap_or(STS_HCHALTED)
                                 & STS_HCHALTED
@@ -18869,7 +18869,7 @@ pub fn init() {
                             let _ = c.quiesce_if_firmware_stale(); // HSE latched -> resets
                             c.init_schedules();
                             let cmd = mmio_read32(h.op + OP_USBCMD).unwrap_or(0);
-                            let _ = mmio_write32(h.op + OP_USBCMD, cmd | CMD_RS);
+                            let _ = mmio_write32(h.op + OP_USBCMD, (cmd & !USBCMD_ITC_MASK) | USBCMD_ITC_1UF | CMD_RS); // TPSTREAM (B624): ITC 8 -> 1 µframe while halted, as the first init above
                             let _ = wait_bounded(|| {
                                 mmio_read32(h.op + OP_USBSTS).unwrap_or(STS_HCHALTED)
                                     & STS_HCHALTED == 0
@@ -19803,4 +19803,181 @@ unsafe fn isr_dt_flip(ep: &IsrEp) -> u32 {
     // Ended on a short (or zero-length) packet unless it filled `total` exactly in whole packets.
     let packets = if moved == total && moved % mps == 0 { moved / mps } else { moved / mps + 1 };
     packets & 1
+}
+
+// ── TPSTREAM (rmbp-ledger B624) — the pad's transfer path audited against the wire, and its loss closed. FILE-TAIL append. ──
+//
+// THE WIRE (flight 34 boot 1, docs/dev/evidence/rmbp-0915/flight34/f34-boot1.log 15:02:13Z): `:: POINTERFEEL: reports=133
+// rate_hz=26.6 gaps=3 gap_max_ms=1447 worst_holder=silent/pass_max_ms=5 … rate_pct=21 rate=LOW -> FAIL` — a fifth of the
+// pad's cadence, holes to 1.4 s, and the hid pass on cadence (5 ms worst) across every hole. The USB mouse on xHCI the
+// same boot: 8192 reports, no gaps.
+//
+// THE PATH AS FOUND (docs/dev/evidence/tpstream/TPSTREAM.md has the layout in full):
+//   * QH (`arm_interrupt_ep`): EPS=full, DTC=1, MPS=64, Mult=1, S-mask 0x01 (start-split in µframe 0), C-mask 0x1C
+//     (complete-splits in µframes 2, 3, 4 — EHCI 1.0 §4.12.2 / USB 2.0 §11.18.4's Y+2..Y+4 for a start in Y=0), hub
+//     address and port from the enumeration `Target` (the root-matching hub's TT), no FSTN (a µframe-0 start never wraps
+//     a frame). Linked from all 1024 frame-list entries: one poll per 1 ms frame, a legal over-service of bInterval=2.
+//   * Depth: ONE transfer, in the QH OVERLAY (overlay-direct — `Controller::overlay_mode`; both rMBP EHCI functions HSE on
+//     a qTD fetch, ISRARM's "Why depth was refused"). A qTD ring cannot be built on this silicon: there is no qTD the
+//     controller reads. The brief's "≥2 qTDs" is refused for that recorded reason, as POINTERSCALE2 (B554) refused it.
+//   * The transfer is armed for `rx_total` = `INT_BUF_LEN` = 256 B (TRACKPADPANE 963dd2ff: a TYPE2 frame is 30 + 28n B and
+//     must not retire after one 64 B packet); it retires on the frame's short packet.
+//   * Completion is observed TWICE, by whichever gets there first: the ISR (USBINT on IOC, `interrupt_ack`), which lifts the
+//     frame into the hand-off ring and re-arms; and the hid pass (`service`, about 1 kHz), which reads the overlay token.
+//
+// THE DEFECT. The pass's arm computed the frame length as `mps - residue`. 963dd2ff raised the armed total to 256 and left
+// that line on `mps`: a one-finger frame (58 B) leaves residue 198, and 64 - 198 saturates to ZERO. Every frame the PASS
+// retired before the ISR did was therefore read as an empty transfer, skipped by `if len > 0`, and re-armed — lost with no
+// counter, no line and no holder. That is POINTERFEEL's `silent` exactly: the pass ran on cadence and "nothing came". The
+// ISR's arm was right (it uses `rx_total`), so the pad worked exactly as well as the interrupt beat the pass: the
+// controller raises USBINT at the Interrupt Threshold (USBCMD.ITC, reset value 8 µframes = 1 ms), so a pass polling every
+// millisecond wins a large share of completions, and every stretch in which the MSI's core was slow to take the vector
+// (masked, busy) handed ALL of them to the pass — the 1.4 s holes.
+//
+// THE FIX. (1) The pass's length is `rx_total - residue`, read from the registry the re-arm itself uses (one source for the
+// armed total). (2) ITC = 1 µframe, written at the two post-HCRESET run writes in `init`, where HCHalted is 1 (§2.3.1:
+// writing ITC while running is undefined) — the IOC interrupt follows a completion by at most 125 µs, so the re-arm rides
+// the completion and not the pass. (3) `[tp] stream` (below) puts the path on the wire once per 10 s while a finger is down,
+// beside `[tp] mt`. (4) The mode is verified by the stream: the first vendor frame after boot, and after each re-assert,
+// prints `[tp] mode ok stream=vendor at_ms=<n> try=<n>`; the re-assert itself (POINTERFEEL B535) is already triggered by a
+// legacy report on the wire and bounded (`pointerfeel::REASSERT_MAX`).
+
+/// USBCMD Interrupt Threshold Control, bits 23:16 (EHCI 1.0 §2.3.1): the most µframes the controller waits before raising
+/// a pending interrupt. Reset value 0x08 (1 ms).
+const USBCMD_ITC_MASK: u32 = 0xFF << 16;
+/// ITC = 1 µframe (125 µs), the smallest the spec allows.
+const USBCMD_ITC_1UF: u32 = 0x01 << 16;
+/// qTD token status bit 3, Transaction Error (EHCI 1.0 §3.5.3) — a bus error on one try; CERR retried it.
+const TPS_XACT: u32 = 1 << 3;
+/// qTD token status bit 2, Missed Micro-Frame — the controller missed a complete-split the C-mask required.
+const TPS_MISSED: u32 = 1 << 2;
+
+/// Per-endpoint stream census, indexed by `ISR_EPS` slot. Relaxed atomics: the ISR and the pass both write.
+static TPS_ISR: [AtomicU32; ISR_MAX_EPS] = [const { AtomicU32::new(0) }; ISR_MAX_EPS];
+static TPS_POLL: [AtomicU32; ISR_MAX_EPS] = [const { AtomicU32::new(0) }; ISR_MAX_EPS];
+static TPS_RESCUED: [AtomicU32; ISR_MAX_EPS] = [const { AtomicU32::new(0) }; ISR_MAX_EPS];
+static TPS_NAK: [AtomicU32; ISR_MAX_EPS] = [const { AtomicU32::new(0) }; ISR_MAX_EPS];
+static TPS_ERR: [AtomicU32; ISR_MAX_EPS] = [const { AtomicU32::new(0) }; ISR_MAX_EPS];
+static TPS_MISS: [AtomicU32; ISR_MAX_EPS] = [const { AtomicU32::new(0) }; ISR_MAX_EPS];
+static TPS_REARM: [AtomicU32; ISR_MAX_EPS] = [const { AtomicU32::new(0) }; ISR_MAX_EPS];
+/// The vendor pad's slot (+1; 0 = no vendor frame yet), so only its events reach `pointerfeel`'s window.
+static TPS_PAD: AtomicU32 = AtomicU32::new(0);
+/// `[tp] mode ok` said for re-assert count `n` is stored as `n + 1` (0 = never said).
+static TP_MODE_OK_SAID: AtomicU32 = AtomicU32::new(0);
+
+fn tps_bump(a: &[AtomicU32; ISR_MAX_EPS], slot: usize) {
+    if let Some(c) = a.get(slot) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn tps_is_pad(slot: usize) -> bool {
+    TPS_PAD.load(Ordering::Relaxed) == slot as u32 + 1
+}
+
+/// The vendor-multitouch decode ran on `slot`.
+fn tps_mark(slot: usize) {
+    TPS_PAD.store(slot as u32 + 1, Ordering::Relaxed);
+}
+
+/// The ISR lifted a completion on `slot` (counted at the pass's take, so a coalesced idle repeat is not counted).
+fn tps_isr(slot: usize) {
+    tps_bump(&TPS_ISR, slot);
+    if tps_is_pad(slot) {
+        crate::pointerfeel::note_xfer(crate::pointerfeel::XFER_ISR);
+    }
+}
+
+/// The pass found `slot`'s transfer still ACTIVE: the device NAKed the poll (it had no new frame) or the split is pending.
+/// EHCI keeps no NAK count for a periodic QH (RL is 0 there), so this is the count of passes that found it in flight.
+fn tps_nak(slot: usize, tok: u32) {
+    tps_bump(&TPS_NAK, slot);
+    if tok & TPS_XACT != 0 {
+        tps_bump(&TPS_ERR, slot);
+    }
+    if tps_is_pad(slot) {
+        crate::pointerfeel::note_xfer(crate::pointerfeel::XFER_NAK);
+    }
+}
+
+/// The pass retired a completion of `len` bytes on `slot`. `rescued` = the length the line before TPSTREAM computed
+/// (`mps - residue`) would have been 0 — a frame that was thrown away before this fix.
+fn tps_poll(slot: usize, len: usize, mps: u16) {
+    tps_bump(&TPS_POLL, slot);
+    let total = ISR_EPS.get(slot).map(|e| e.rx_total.load(Ordering::Relaxed)).unwrap_or(0);
+    let residue = total.saturating_sub(len as u32);
+    let rescued = len > 0 && (mps as u32).saturating_sub(residue) == 0;
+    if rescued {
+        tps_bump(&TPS_RESCUED, slot);
+    }
+    if tps_is_pad(slot) {
+        crate::pointerfeel::note_xfer(crate::pointerfeel::XFER_POLL);
+        if rescued {
+            crate::pointerfeel::note_xfer(crate::pointerfeel::XFER_RESCUED);
+        }
+    }
+}
+
+/// Every re-arm (ISR, pass, idle coalesce, ring-full, halt clear): count it and read the RETIRED token's error bits.
+/// Interrupt-safe: relaxed atomics and one volatile read.
+unsafe fn tps_rearm(ep: &IsrEp) {
+    let base = ISR_EPS.as_ptr() as usize;
+    let slot = (ep as *const IsrEp as usize).wrapping_sub(base) / core::mem::size_of::<IsrEp>();
+    if slot >= ISR_MAX_EPS {
+        return;
+    }
+    tps_bump(&TPS_REARM, slot);
+    let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
+    if qh.is_null() {
+        return;
+    }
+    let tok = if ep.om.load(Ordering::Relaxed) != 0 {
+        core::ptr::read_volatile(&(*qh).overlay[2])
+    } else {
+        core::ptr::read_volatile(&(*(ep.qtd.load(Ordering::Relaxed) as *mut Qtd)).token)
+    };
+    let pad = tps_is_pad(slot);
+    if tok & TPS_XACT != 0 {
+        tps_bump(&TPS_ERR, slot);
+        if pad {
+            crate::pointerfeel::note_xfer(crate::pointerfeel::XFER_ERR);
+        }
+    }
+    if tok & TPS_MISSED != 0 {
+        tps_bump(&TPS_MISS, slot);
+        if pad {
+            crate::pointerfeel::note_xfer(crate::pointerfeel::XFER_MISS);
+        }
+    }
+}
+
+/// `[tp] stream` — the pad's transfer path on the wire, beside `[tp] mt` (the same one-per-10-s gate, finger down).
+/// The QH's split fields are read from the QH the controller executes, ITC from USBCMD.
+unsafe fn tp_stream_row(idx: usize, slot: usize, qh: *mut Qh, frames: u32, op: u64) {
+    let g = |a: &[AtomicU32; ISR_MAX_EPS]| a.get(slot).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+    let caps = core::ptr::read_volatile(&(*qh).ep_caps);
+    let chars = core::ptr::read_volatile(&(*qh).ep_chars);
+    let itc = mmio_read32(op + OP_USBCMD).map(|c| (c & USBCMD_ITC_MASK) >> 16).unwrap_or(0xFF);
+    let om = ISR_EPS.get(slot).map(|e| e.om.load(Ordering::Relaxed) != 0).unwrap_or(false);
+    serial_println!(
+        "[tp] stream ep={} frames={} isr={} poll={} rescued={} nak={} err={} csplit_miss={} rearm={} inflight=1 depth={} itc={}uf smask={:#04x} cmask={:#04x} tt=hub{}:port{} mps={} irq={} (TPSTREAM B624: one line per 10 s while a finger is down; inflight is the overlay's one transfer)",
+        idx, frames, g(&TPS_ISR), g(&TPS_POLL), g(&TPS_RESCUED), g(&TPS_NAK), g(&TPS_ERR), g(&TPS_MISS), g(&TPS_REARM),
+        if om { "overlay" } else { "qtd" }, itc,
+        (caps >> QH_SMASK_SHIFT) & 0xFF, (caps >> QH_CMASK_SHIFT) & 0xFF,
+        (caps >> QH_HUBADDR_SHIFT) & 0x7F, (caps >> QH_PORT_SHIFT) & 0x7F,
+        (chars >> QH_MPS_SHIFT) & 0x7FF, ISR_ENTRIES.load(Ordering::Relaxed)
+    );
+}
+
+/// The mode, verified by the STREAM: the first vendor frame since boot (try=0) and the first after each re-assert
+/// (try=<n>) prints `[tp] mode ok stream=vendor`. The register's word rides beside it as `readback=`.
+fn tp_mode_ok(idx: usize, latched: bool) {
+    let n = crate::pointerfeel::reasserts();
+    if TP_MODE_OK_SAID.swap(n + 1, Ordering::Relaxed) == n + 1 {
+        return;
+    }
+    serial_println!(
+        ":: EHCI-HID: [{}] [tp] mode ok stream=vendor at_ms={} try={} readback={} (TPSTREAM B624: the vendor mode proved by the stream's own frame, not the register) == witness ::",
+        idx, crate::arch::ms(), n, if latched { "vendor" } else { "other" }
+    );
 }
