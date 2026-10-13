@@ -101,9 +101,9 @@ pub fn root_of(id: usize) -> usize {
     })
 }
 
-/// Connected: in the main document's tree (the only document with a browsing context).
+/// Connected: the shadow-including root is the main document (the only one with a browsing context).
 pub fn is_connected(id: usize) -> bool {
-    root_of(id) == main_doc()
+    with_doc(|d| crate::dom::shadow::shadow_including_root(d, NodeId(id)).0) == main_doc()
 }
 
 pub fn main_doc() -> usize {
@@ -523,7 +523,8 @@ fn host_including_ancestor(d: &Document, a: usize, b: usize) -> bool {
             return false;
         }
         // A template's contents fragment: its host is the template element.
-        let host = (0..d.nodes.len()).find(|&i| d.element(NodeId(i)).and_then(|e| e.template_contents) == Some(root));
+        let host = (0..d.nodes.len()).find(|&i| d.element(NodeId(i)).and_then(|e| e.template_contents) == Some(root))
+            .or_else(|| crate::dom::shadow::host_of(d, root).map(|h| h.0));
         match host {
             Some(h) => cur = h,
             None => return false,
@@ -657,7 +658,9 @@ pub fn detach_node(node: usize) {
     let index = super::range::index_of(node);
     super::traversal::removing(node);
     super::range::removing(node, parent, index);
+    let removal = with_doc(|d| crate::dom::removing_steps(d, NodeId(node), NodeId(parent)));
     with_doc_mut(|d| d.detach(NodeId(node)));
+    with_doc(|d| crate::dom::removed_steps(d, removal));
 }
 
 /// Inserts `n` into `parent` before `child` (arena only) and runs the live-range insert step.
@@ -682,16 +685,28 @@ pub fn insert(vm: &mut Vm, node: usize, parent: usize, child: Option<usize>) {
         return;
     }
     let doc = node_document(parent);
+    // AETHERSHADOW: a fragment's children leave it under one record; `prev` is taken before the moves.
+    let _frag = (kind(node) == NK::Fragment).then(|| {
+        with_doc(|d| crate::dom::mutation::tree_record(d, NodeId(node), Vec::new(), nodes.iter().map(|&n| NodeId(n)).collect(), None, None));
+        crate::dom::mutation::suppress(NodeId(node))
+    });
+    let prev = with_doc(|d| match child {
+        Some(c) => d.prev_sibling(NodeId(c)),
+        None => d.last_child(NodeId(parent)),
+    });
     for &n in &nodes {
         adopt(n, doc);
         insert_one(n, parent, child);
     }
+    let ids: Vec<NodeId> = nodes.iter().map(|&n| NodeId(n)).collect();
+    with_doc(|d| crate::dom::inserted_steps(d, NodeId(parent), &ids, prev, child.map(NodeId)));
     touch();
     // Post-insertion steps: scripts that became connected are prepared (HTML §4.12.1).
     for &n in &nodes {
         super::loader::node_inserted(vm, n);
     }
     super::loader::children_changed(vm, parent);
+    super::mutation::settle(vm);
 }
 
 /// DOM "pre-insert".
@@ -717,6 +732,7 @@ pub fn remove(vm: &mut Vm, node: usize) {
     detach_node(node);
     touch();
     super::loader::children_changed(vm, parent);
+    super::mutation::settle(vm);
 }
 
 /// DOM "replace a child".
@@ -738,11 +754,18 @@ pub fn replace_child(vm: &mut Vm, child: usize, node: usize, parent: usize) -> J
     if reference == Some(node) {
         reference = with_doc(|d| d.next_sibling(NodeId(node)).map(|n| n.0));
     }
+    // AETHERSHADOW: one record for the swap (removal and insertion suppressed for `parent`).
+    let prev = with_doc(|d| d.prev_sibling(NodeId(child)));
+    let added: Vec<NodeId> = if kind(node) == NK::Fragment { children_of(node) } else { vec![node] }.into_iter().map(NodeId).collect();
+    let guard = crate::dom::mutation::suppress(NodeId(parent));
     if child != node {
         detach_node(child);
     }
     insert(vm, node, parent, reference);
+    drop(guard);
+    with_doc(|d| crate::dom::mutation::tree_record(d, NodeId(parent), added, vec![NodeId(child)], prev, reference.map(NodeId)));
     touch();
+    super::mutation::settle(vm);
     Ok(child)
 }
 
@@ -752,6 +775,16 @@ pub fn replace_all(vm: &mut Vm, node: Option<usize>, parent: usize) {
         adopt(n, node_document(parent));
     }
     let kids = children_of(parent);
+    // AETHERSHADOW: one record for the whole replacement (suppressed for `parent` meanwhile).
+    let added: Vec<NodeId> = match node {
+        Some(n) if kind(n) == NK::Fragment => children_of(n),
+        Some(n) => vec![n],
+        None => Vec::new(),
+    }
+    .into_iter()
+    .map(NodeId)
+    .collect();
+    let guard = crate::dom::mutation::suppress(NodeId(parent));
     for k in &kids {
         detach_node(*k);
     }
@@ -761,6 +794,10 @@ pub fn replace_all(vm: &mut Vm, node: Option<usize>, parent: usize) {
     } else if !kids.is_empty() {
         super::loader::children_changed(vm, parent);
     }
+    drop(guard);
+    let removed: Vec<NodeId> = kids.iter().map(|&k| NodeId(k)).collect();
+    with_doc(|d| crate::dom::mutation::tree_record(d, NodeId(parent), added, removed, None, None));
+    super::mutation::settle(vm);
 }
 
 /// "convert nodes into a node" (ParentNode/ChildNode variadics): strings become Text nodes; several
@@ -1467,12 +1504,14 @@ pub fn replace_data(vm: &mut Vm, n: usize, offset: u32, count: u32, data: &str) 
     let mut out = cur[..offset as usize].to_vec();
     out.extend(added);
     out.extend_from_slice(&cur[(offset + count) as usize..]);
+    with_doc(|d| crate::dom::character_data_steps(d, NodeId(n), char_data(d, n)));
     with_doc_mut(|d| set_char_data(d, n, from_utf16(&out)));
     super::range::replaced_data(n, offset, count, added_len);
     touch();
     if let Some(p) = parent_of(n) {
         super::loader::children_changed(vm, p);
     }
+    super::mutation::settle(vm);
     Ok(())
 }
 
@@ -1592,6 +1631,7 @@ pub fn split_text_at(vm: &mut Vm, n: usize, o: u32) -> JsResult<usize> {
     if let Some(p) = parent {
         let next = with_doc(|d| d.next_sibling(NodeId(n)).map(|c| c.0));
         insert_one(new_node, p, next);
+        with_doc(|d| crate::dom::mutation::tree_record(d, NodeId(p), vec![NodeId(new_node)], Vec::new(), Some(NodeId(n)), next.map(NodeId)));
         super::range::split(n, new_node, o, Some(p));
     }
     replace_data(vm, n, o, len - o, "")?;
@@ -1721,6 +1761,7 @@ pub fn attr_at(el: usize, i: usize) -> Option<Attribute> {
 /// HTML "attribute change steps" hook: event handler attributes, form-control default values.
 fn attribute_changed(vm: &mut Vm, el: usize, local: &str, ns: Namespace, old: Option<String>, new: Option<String>) {
     touch();
+    with_doc(|d| crate::dom::attribute_steps(d, NodeId(el), local, ns, old.clone(), new.clone()));
     if ns == Namespace::None {
         super::controls::attribute_changed(el, local, &old, &new);
     }
@@ -1739,6 +1780,7 @@ fn attribute_changed(vm: &mut Vm, el: usize, local: &str, ns: Namespace, old: Op
             let _ = r2;
         }
     }
+    super::mutation::settle(vm);
 }
 
 /// Sets (or creates) an attribute (DOM "set an attribute value").
@@ -2459,6 +2501,7 @@ fn create_element_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let d = this_doc(vm, ctx)?;
     need(vm, ctx, 1, "Document", "createElement")?;
     let l = string(vm, &arg(vm, ctx, 0))?;
+    let is = super::custom::creation_is(vm, &arg(vm, ctx, 1))?;
     if !is_valid_name(&l) {
         return throw_dom(vm, "InvalidCharacterError", &format!("The tag name provided ('{l}') is not a valid name."));
     }
@@ -2470,6 +2513,7 @@ fn create_element_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         Namespace::None
     };
     let id = create_element(d, ns, &l);
+    let id = super::custom::created(vm, d, id, is);
     Ok(wrap(vm, id))
 }
 
@@ -2497,7 +2541,9 @@ fn create_element_ns_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     need(vm, ctx, 2, "Document", "createElementNS")?;
     let ns = opt_string(vm, &arg(vm, ctx, 0))?;
     let q = string(vm, &arg(vm, ctx, 1))?;
+    let is = super::custom::creation_is(vm, &arg(vm, ctx, 2))?;
     let id = create_element_ns(vm, d, ns, &q)?;
+    let id = super::custom::created(vm, d, id, is);
     Ok(wrap(vm, id))
 }
 

@@ -193,9 +193,6 @@ fn needs_server(name: &str, src: &str) -> bool {
 /// set minus these; the reasons name a surface outside this arc, never a failing one inside it.
 fn excluded(name: &str, src: &str) -> Option<&'static str> {
     let base = name.rsplit('/').next().unwrap_or(name);
-    if base.starts_with("MutationObserver") || src.contains("MutationObserver(") || src.contains("mutationobservers.js") {
-        return Some("MutationObserver (a stub that never delivers)");
-    }
     if src.contains("<iframe")
         || src.contains("createElement(\"iframe\")")
         || src.contains("createElement('iframe')")
@@ -205,12 +202,6 @@ fn excluded(name: &str, src: &str) -> Option<&'static str> {
         || src.contains("<object")
     {
         return Some("frames / browsing contexts");
-    }
-    if src.contains("attachShadow") || src.contains("shadowRoot") || src.contains("shadowrootmode") {
-        return Some("shadow DOM");
-    }
-    if src.contains("customElements.define") {
-        return Some("custom elements");
     }
     if base.contains("moveBefore") {
         return Some("moveBefore (2025 proposal)");

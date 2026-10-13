@@ -25,6 +25,9 @@
 //! - [`controls`] — form controls' DOM half: value modes, selection, constraint validation (SR72).
 //! - [`forms`] — the entry list and `formdata`, FormData/File, script-started submission navigation,
 //!   the form and select legacy platform objects (AETHERFORMS, SR79).
+//! - [`shadow`], [`mutation`], [`custom`] — shadow trees, MutationObserver and custom elements over
+//!   `dom::shadow` / `dom::mutation` / `dom::custom` (AETHERSHADOW, SR82); `mutation::settle` is the
+//!   [CEReactions] / observer-microtask boundary the mutation algorithms end with.
 //! - [`loader`] — HTML §4.12.1 script processing driven by the parser: parser-blocking, `defer`,
 //!   `async` and module scripts, `document.write` during parse, dynamically inserted scripts, and
 //!   §13.2.7 "the end" (DOMContentLoaded, load).
@@ -37,6 +40,7 @@
 
 pub mod controls;
 pub mod cssom;
+pub mod custom;
 pub mod dom;
 pub mod events;
 pub mod forms;
@@ -44,9 +48,11 @@ pub mod host;
 pub mod html;
 pub mod idl;
 pub mod loader;
+pub mod mutation;
 pub mod range;
 pub mod reflect;
 mod reflect_table;
+pub mod shadow;
 pub mod traversal;
 pub mod net;
 pub mod window;
@@ -448,6 +454,9 @@ pub(crate) fn checkpoint(vm: &mut Vm) {
     if engine_poisoned() || page(|p| std::mem::replace(&mut p.in_checkpoint, true)) {
         return;
     }
+    // AETHERSHADOW: an observer microtask or custom element reactions a mutation owed without a
+    // settle of its own (a removal outside the binding's algorithms) are taken up here.
+    mutation::settle(vm);
     let mut ran = 0usize;
     loop {
         let Some(job) = vm.jobs.pop_front() else { break };
@@ -515,6 +524,8 @@ impl Engine {
         crate::api::fetch::reset_budget();
         net::reset();
         crate::event_loop::reset();
+        crate::dom::mutation::reset();
+        crate::dom::custom::reset(document.arena());
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
         vm.track_rejections = true;
@@ -530,6 +541,10 @@ impl Engine {
         window::install(&mut vm);
         net::install(&mut vm);
         forms::install(&mut vm);
+        // After window::install: these replace the platform.rs MutationObserver/customElements stubs.
+        shadow::install(&mut vm);
+        mutation::install(&mut vm);
+        custom::install(&mut vm);
         Engine { vm }
     }
 

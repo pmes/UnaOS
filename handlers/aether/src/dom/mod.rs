@@ -16,7 +16,10 @@
 //! script, so `<noscript>` is raw text, as in a JS-enabled browser). Serialization is `html_core`'s
 //! §13.3 serializer.
 
+pub mod custom;
+pub mod mutation;
 mod select;
+pub mod shadow;
 
 pub use select::{El, Selectors};
 
@@ -812,6 +815,66 @@ impl AttributesMut<'_> {
         let i = self.0.iter().position(|a| a.ns == Namespace::None && a.local == name)?;
         Some(self.0.remove(i))
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Mutation hooks (AETHERSHADOW, LEDGER SR82)
+// ---------------------------------------------------------------------------------------------------
+//
+// The DOM-side steps one mutation runs across the three cores — the observer record and transient
+// registrations (`mutation`), slot assignment and slot-change signals (`shadow`), custom element
+// reactions (`custom`) — so each of the binding's mutation algorithms (`js::dom`) makes ONE call.
+// Each takes the arena under a shared borrow and calls no script; the binding's `settle` then queues
+// the observer microtask and runs the reactions.
+
+/// What `removing_steps` saw before the node left its parent.
+pub struct Removal {
+    node: NodeId,
+    parent: NodeId,
+}
+
+/// DOM "remove", the steps before the arena unlink: transient registrations + the childList record
+/// (unless suppressed for `parent`), disconnectedCallback for the custom elements of a connected
+/// subtree.
+pub fn removing_steps(d: &Document, node: NodeId, parent: NodeId) -> Removal {
+    mutation::removing(d, node, parent);
+    if shadow::is_connected(d, parent) {
+        custom::disconnected(d, node);
+    }
+    Removal { node, parent }
+}
+
+/// DOM "remove", the steps after the unlink: slot reassignment and slot-change signals.
+pub fn removed_steps(d: &Document, r: Removal) {
+    shadow::after_remove(d, r.node, r.parent);
+}
+
+/// DOM "insert", the steps after `nodes` went into `parent` (before `next`, after `prev` as the record
+/// reports them): slot assignment, connectedCallback / upgrade for what became connected, then the
+/// childList record (unless suppressed for `parent`).
+pub fn inserted_steps(d: &Document, parent: NodeId, nodes: &[NodeId], prev: Option<NodeId>, next: Option<NodeId>) {
+    shadow::after_insert(d, parent, nodes);
+    if shadow::is_connected(d, parent) {
+        for &n in nodes {
+            custom::connected(d, n);
+        }
+    }
+    mutation::inserted(d, parent, nodes, prev, next);
+}
+
+/// DOM "handle attribute changes": the record, attributeChangedCallback, the slot attribute steps.
+pub fn attribute_steps(d: &Document, el: NodeId, local: &str, ns: Namespace, old: Option<String>, new: Option<String>) {
+    let ns_url = (ns != Namespace::None).then(|| ns.url());
+    mutation::attribute(d, el, local, ns_url, old.clone());
+    custom::attribute_changed(d, el, local, ns, old, new);
+    if ns == Namespace::None {
+        shadow::after_attribute(d, el, local);
+    }
+}
+
+/// DOM "replace data": the characterData record (`old` = the data before the change).
+pub fn character_data_steps(d: &Document, node: NodeId, old: String) {
+    mutation::character_data(d, node, old);
 }
 
 #[cfg(test)]
