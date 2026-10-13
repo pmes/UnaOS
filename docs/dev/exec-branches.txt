@@ -466,3 +466,5 @@ refs/heads/exec-host-aetherpaintperf          4f3a436e FOLDED-BY-HAND 8e4a8cac
 refs/heads/exec-host-aethersuite              96bdc4de IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-aetherpaintperf2         96bdc4de IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-orin-armaether                96bdc4de FOLDED-BY-HAND 7b301403
+refs/heads/exec-host-h264core                 ef3fe22d IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-aethermedia2             ef3fe22d IN-FLIGHT cloud 2026-10-13
