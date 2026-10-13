@@ -472,10 +472,10 @@ impl IntEp {
     /// report per service pass, so a release edge CAN be lost outright (the CLICK-3 ledger above),
     /// and the routing tail reads the level instead of trusting an edge to arrive.
     ///
-    /// KNOWN ASYMMETRY (deliberate, out of this arc's lane): `drivers/xhci/mod.rs` still emits
-    /// `Event::Button` on the DOWN edge only and publishes no level. That path is not the rMBP
-    /// trackpad's, so it is not the drag defect this arc closes; it wants the same two lines and is
-    /// a follow-up.
+    /// DRAGNOMOVE (B620) closed the asymmetry that stood here: xHCI, BT and tap edges published no
+    /// level, so a USB-mouse drag was cancelled `release-level` on its first steer (flight 34). The
+    /// level is now ALSO published by `pal::push_locked` for every queued `Button`; this per-report
+    /// write stays because it is the half a lost EHCI edge cannot destroy.
     fn note_buttons(&mut self, buttons: u8, moved: bool, idx: usize) -> (bool, bool) {
         let now = crate::arch::ms();
         let prev = self.prev_buttons;
