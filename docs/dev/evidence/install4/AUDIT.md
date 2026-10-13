@@ -55,7 +55,7 @@ services in the loader), **R99** (the boot FAT holds only what firmware needs; `
   pre-existing partition's first 4 KiB SHA-256 equal before and after, same rule as
   `neighbours untouched=`); format + clone + verify the ESP; mirror or format + fsck + grow the
   UnaFS; FLUSH (the slot's drop). Witness:
-  `:: INSTALL4: beside port=<p> table=ok old=<n>/<n> untouched=<n>/<n> esp=<MiB> unafs=<MiB> files=<n> verified=<n> fsck=<ok|fail> -> PASS|FAIL ::`.
+  `:: INSTALL4: beside port=<p> table=ok old=<n>/<n> untouched=<m>/<m> esp=<MiB> unafs=<MiB> cloned=<MiB> files=<n> verified=<n> fsck=<ok|fail> ms=<ms> -> PASS|FAIL ::` (`untouched` counts LBA 0 plus every pre-existing partition). The token compare is case-blind (the QEMU typist types letters lower-case); it still binds the port and the exact sector count.
 - Root: `ahciroot::ours_unafs_part` also answers for a `stranger` disk that carries EXACTLY ONE
   partition that is UNAFS-typed AND whose content is a UnaFS superblock (no other OS writes UnaFS);
   the root grant is that partition's extent only, so every macOS sector stays outside it.
@@ -71,3 +71,33 @@ services in the loader), **R99** (the boot FAT holds only what firmware needs; `
 - `install <disk> <slot>` for flight 35 (it writes the synthetic tree, row 9).
 - `--erase-stranger` in the flight-35 procedure: it erases macOS; it needs Peter's own fresh word.
 - The card-less boot off a beside install until `fs/fat.rs` offers every FAT volume (row 12).
+
+## The commits (exec-rmbp-install4, parent 513ca5f8)
+
+| commit | seam(s) | what |
+|---|---|---|
+| `59f801c1` | 3 | the unattended boot fixture writes only under `tests-at-boot` (install/mod.rs, folded) |
+| `f6926776` | 4, 5 | `install ssd` names the first non-boot SATA disk; only a source on the target port is refused |
+| `9fa6fa3f` | 6, 7, 8, 12 | the beside plan and write: `gpt::read_raw_table`/`add_entries`, `partition::mint_beside_*`, `selfinstall` dry run + `--write --beside`, `ahciroot::ours_unafs_part` |
+| `f8077bab` | 1, 2, 13 | `image-line.env`: INSTALLDEMO, AHCI_WRITE, AHCIROOT; INSTGUI named off |
+| `51e638c0` | 14 | `./arroyo test-install`: ssd-blank, boot-blank, ssd-beside, beside-image, boot-beside |
+| the commit carrying this table | — | the flight-35 procedure (`docs/dev/OS/10_INSTALL/FLIGHT35-INSTALL.md`), pointers in SITTING-1.md and partition-install.md, B619's status |
+
+## Owed outside this arc's files (reported, not taken)
+
+- `unaos/crates/kernel/src/fs/fat.rs` — offer bootdisk EVERY FAT volume of a GPT disk (today `scan_gpt`,
+  fat.rs:2018, returns the first): e.g. `pub fn mount_source_all(source) -> Vec<FatFs>` walking
+  `gpt_volume_spans` through `parse_bpb`, and `fs/bootdisk.rs`'s per-source probe (bootdisk.rs:970)
+  iterating it. Without it the kernel cannot find itself on the SSD's ESP when the Mac's EFI partition is
+  the disk's first FAT (the card-less boot off a beside install).
+- `unaos/crates/kernel/src/video/desktop_uefi.rs:655-657` — drop the `instgui::open()` at activation so
+  the window opens only on `install --gui`; then `UNAOS_INSTGUI` can ride the line. A beside screen in
+  `video/install3.rs` follows.
+- `docs/SECURITY.md` §"Installer — what it refuses to touch" and §"The SATA write capability" — they
+  still say "the whole-disk engine can never obtain [a grant]" and "nothing writes … the partition
+  tables in partition mode"; SELFINSTALL's whole-disk grant and INSTALL4's two table grants need rows
+  (the beside grants: free space only; the table grants: `1..primary array end` and `backup array..
+  backup header`, LBA 0 in neither; all behind the typed token).
+- `docs/dev/evidence/foldbuild/IMAGE-LINE.md` — the line's derivation gains the three INSTALL4 knobs.
+- `unaos/libs/sys/amber_core/src/fat32.rs` — a per-install FAT volume serial instead of the constant
+  `UNAS` (row 15), so the boot serial tells the SSD's loader from the card's.
