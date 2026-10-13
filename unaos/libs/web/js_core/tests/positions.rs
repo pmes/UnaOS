@@ -86,3 +86,13 @@ fn line_table_round_trips_and_looks_up_the_covering_row() {
     assert_eq!(t.lookup(1000), Some((3, 1)));
     assert!(t.bytes.len() <= 13, "{} bytes for four rows", t.bytes.len());
 }
+
+#[test]
+fn a_thrown_non_error_is_placed_at_its_throw_statement() {
+    // AETHERDEVTOOLS3 (SR128): `throw "x"` records no trace; `error_position` falls back to `Vm::last_throw`.
+    let (vm, e) = thrown("function f() {\n  throw 'x';\n}\nf();\n");
+    assert!(matches!(e, Value::String(_)), "the thrown value is the string itself");
+    assert_eq!(vm.error_position(&e), pos("t.js", 2, 3), "the `throw` keyword of f()");
+    let (vm, e) = thrown("var n = 1;\n    throw { code: n };\n");
+    assert_eq!(vm.error_position(&e), pos("t.js", 2, 5), "a thrown plain object, top-level");
+}

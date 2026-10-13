@@ -170,6 +170,9 @@ pub struct Vm {
     pub root_shape: Rc<propmap::Shape>,
     /// AETHERPERF (SR118): inline-cache slots of the named property get / set sites (vm/ic.rs).
     pub ic: ic::IcTable,
+    /// AETHERDEVTOOLS3 (SR128): the code and pc of the last `Op::Throw` executed (interp.rs), so
+    /// [`Vm::error_position`] can place a thrown non-error (`throw "x"`), which records no trace of its own.
+    pub last_throw: Option<(Rc<Code>, u32)>,
 }
 
 pub(crate) fn wk_sym(desc: &str) -> Sym {
@@ -233,6 +236,7 @@ impl Vm {
             rejected_unhandled: Vec::new(),
             root_shape: propmap::Shape::root(),
             ic: ic::IcTable::default(),
+            last_throw: None,
         };
         let r = vm.create_realm();
         vm.cur_realm = r;

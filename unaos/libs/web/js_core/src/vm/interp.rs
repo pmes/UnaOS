@@ -983,6 +983,7 @@ impl Vm {
                 }
                 Op::Throw => {
                     let v = self.pop();
+                    self.last_throw = Some((self.frames[fi].code.clone(), pc as u32));
                     return Err(v);
                 }
                 Op::ThrowRef(k) => {
