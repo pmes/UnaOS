@@ -93,9 +93,13 @@ pub(crate) fn parse_state(vm: &mut Vm, text: Option<&str>) -> Value {
 /// entry's state, and `popstate` (then `hashchange`, when only the fragment differs from `from_url`)
 /// is queued as a task on the page's event loop.
 pub fn traverse_same_document(vm: &mut Vm, url: &str, from_url: &str, state: Option<String>) {
+    // AETHERWPT3 (SR138): the traverse navigate event, then the Navigation API's entries follow the traversal
+    // (HTML §7.2.6.10, §7.2.6.8) — before `popstate` (a task).
+    let _ = super::super::navigation::begin(vm, url, "traverse", true);
     page(|p| p.url = url.to_string());
     super::super::Engine::set_doc_url(url);
     STATE.with(|st| *st.borrow_mut() = state.clone());
+    super::super::navigation::commit(vm);
     let fp = vm.intr().function_proto;
     let slot0 = match &state {
         Some(t) => s(t),

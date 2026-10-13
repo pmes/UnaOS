@@ -762,6 +762,8 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
         ("__w_close", 0, close_native),
         ("__w_import", 1, import_native),
         ("__w_now", 0, now_native),
+        ("btoa", 1, crate::js::window::btoa), // AETHERWPT3 (SR138): FileReaderSync.readAsDataURL in a worker (HTML §8.3 WindowOrWorkerGlobalScope)
+        ("atob", 1, crate::js::window::atob),
         ("__w_uncaught", 1, uncaught_native),
         ("__w_forward_error", 4, forward_error_native),
     ] {
@@ -787,6 +789,7 @@ fn build(sp: &Spawn, shared: &Shared) -> Vm {
     if let Err(e) = vm.run_script_str(SCOPE) {
         eprintln!("[aether-worker] scope prelude failed: {}", vm.error_string(&e));
     }
+    crate::api::platform::install_file_reader_sync(&mut vm); // AETHERWPT3 (SR138): FileReaderSync (File API §7), over SCOPE's Blob
     // AETHERWORKERS2 (SR125): the inbox dispatcher and BroadcastChannel over this thread's serial, and `Worker`
     // itself — a nested worker's spawn path reads this worker's captured facts (`creator`).
     crate::js::broadcast::install_worker(&mut vm);

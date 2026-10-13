@@ -6,14 +6,60 @@
 //! register-and-never-deliver observer stub of `api::platform`'s COMPAT prelude.
 //!
 //! The supported entry types are `mark` and `measure`: the buffer holding them is unbounded, so no entry is ever
-//! dropped. Resource, navigation and paint entries are not produced (AETHERWPT2 gap O6), and there is no
-//! PerformanceTiming (Navigation Timing L1): `measure` converts `navigationStart` to 0 (the time origin) and the
-//! other PerformanceTiming names to an InvalidAccessError, as for an attribute whose value is still 0.
+//! dropped. There is no PerformanceTiming (Navigation Timing L1): `measure` converts `navigationStart` to 0 (the
+//! time origin) and the other PerformanceTiming names to an InvalidAccessError, as for an attribute whose value is
+//! still 0.
+//!
+//! AETHERWPT3 (LEDGER SR138): Resource Timing L2 and Navigation Timing L2 — `PerformanceResourceTiming` entries
+//! for `fetch()` and `XMLHttpRequest` (api/fetch.rs, api/xhr.rs: the phases they observe, the body sizes, the
+//! Timing-Allow-Origin check) and for external scripts (js/loader.rs, through [`note_resource`] and the
+//! `__perf_drain` native), the resource timing buffer (250 entries by default, the secondary buffer and the
+//! `resourcetimingbufferfull` event, `setResourceTimingBufferSize`, `clearResourceTimings`), and the document's
+//! `PerformanceNavigationTiming` (its DOM lifecycle times stamped by js/loader.rs "the end" through
+//! [`nav_mark`]); `navigation` and `resource` join the supported entry types.
 
-use js_core::vm::Vm;
+use js_core::vm::*;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Resources the engine fetched outside script (an external script's source): (URL, initiatorType, bytes).
+    static PENDING: RefCell<Vec<(String, String, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Records a resource fetched by the engine for the page (Resource Timing §4.6 "mark resource timing"); the
+/// page's timeline turns it into an entry the next time it reads or delivers its entries. http(s) only.
+pub fn note_resource(url: &str, initiator: &str, size: usize) {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        PENDING.with(|p| p.borrow_mut().push((url.to_string(), initiator.to_string(), size)));
+    }
+}
+
+/// `__perf_drain()` → `[[url, initiatorType, bytes], …]` (and forgets them).
+fn perf_drain(vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
+    let rows = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    let mut out = Vec::with_capacity(rows.len());
+    for (u, i, n) in rows {
+        let row = vm.new_array(vec![super::idl::s(&u), super::idl::s(&i), Value::Number(n as f64)]);
+        out.push(Value::Object(row));
+    }
+    Ok(Value::Object(vm.new_array(out)))
+}
+
+/// Stamps a Navigation Timing L2 attribute of the document's entry with the current time (`field` is the
+/// attribute's name: domInteractive, domContentLoadedEventStart, …, loadEventEnd — which also queues the entry).
+pub fn nav_mark(vm: &mut Vm, field: &str) {
+    let g = vm.realm().global;
+    let Ok(f) = super::idl::get(vm, g, "__perf_nav") else { return };
+    if vm.is_callable(&f) {
+        let _ = vm.call(&f, &Value::Undefined, &[super::idl::s(field)]);
+    }
+}
 
 /// Installs the timeline prelude into a page (Window) realm. Runs after `api::platform::init`.
 pub fn install(vm: &mut Vm) {
+    let g = vm.realm().global;
+    let fo = vm.make_native("__perf_drain", 0, perf_drain, false);
+    vm.heap.get_mut(g).props.insert(PropertyKey::from_str("__perf_drain"), Prop::data(Value::Object(fo), WC));
     if let Err(e) = vm.run_script_str(TIMELINE) {
         let m = vm.error_string(&e);
         crate::ledger::record_js(&format!("timeline-prelude-failed:{}", super::clip(&m, 64)));
@@ -116,7 +162,8 @@ const TIMELINE: &str = r#"
     };
 
     // ---- PerformanceObserver (Performance Timeline §3) -----------------------------------------------
-    var SUPPORTED = Object.freeze(['mark', 'measure']);
+    // AETHERWPT3 (SR138): Resource Timing and Navigation Timing entries join (alphabetical, Performance Timeline §3.4).
+    var SUPPORTED = Object.freeze(['mark', 'measure', 'navigation', 'resource']);
     var registered = [];
     var OS = new WeakMap();
     var os = function (o) {
@@ -144,16 +191,162 @@ const TIMELINE: &str = r#"
             }
         }, 0);
     };
-    // "queue a PerformanceEntry" (§4.5.1).
-    var queueEntry = function (entry) {
+    // "queue a PerformanceEntry" (§4.5.1): the observers' buffers.
+    var queueObservers = function (entry) {
         var type = es(entry).entryType;
         for (var i = 0; i < registered.length; i++) {
             var s = OS.get(registered[i]);
             if (s && s.types.indexOf(type) >= 0) { s.buffer.push(entry); }
         }
-        buffer.push(entry);
         queueTask();
     };
+    // A mark or a measure: queued, and kept in the (unbounded) user timing buffer.
+    var queueEntry = function (entry) {
+        queueObservers(entry);
+        buffer.push(entry);
+    };
+
+    // ---- Resource Timing L2 / Navigation Timing L2 (AETHERWPT3, SR138) --------------------------------
+    var RT_FIELDS = ['initiatorType', 'deliveryType', 'nextHopProtocol', 'workerStart', 'redirectStart', 'redirectEnd',
+        'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart',
+        'requestStart', 'finalResponseHeadersStart', 'firstInterimResponseStart', 'responseStart', 'responseEnd',
+        'transferSize', 'encodedBodySize', 'decodedBodySize', 'responseStatus', 'renderBlockingStatus', 'contentType',
+        'contentEncoding'];
+    var NAV_FIELDS = ['unloadEventStart', 'unloadEventEnd', 'domInteractive', 'domContentLoadedEventStart',
+        'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd', 'type', 'redirectCount',
+        'criticalCHRestart'];
+    class PerformanceResourceTiming extends PerformanceEntry {
+        constructor() { throw new TypeError('Illegal constructor'); }
+    }
+    RT_FIELDS.forEach(function (f) { getter(PerformanceResourceTiming.prototype, f, function () { return es(this)[f]; }); });
+    getter(PerformanceResourceTiming.prototype, 'serverTiming', function () { return es(this).serverTiming; });
+    var json = function (s, fields) {
+        var o = { name: s.name, entryType: s.entryType, startTime: s.startTime, duration: s.duration };
+        fields.forEach(function (f) { o[f] = s[f]; });
+        return o;
+    };
+    op(PerformanceResourceTiming.prototype, 'toJSON', {
+        toJSON() { var s = es(this), o = json(s, RT_FIELDS); o.serverTiming = []; return o; },
+    }.toJSON);
+    class PerformanceNavigationTiming extends PerformanceResourceTiming {
+        constructor() { throw new TypeError('Illegal constructor'); }
+    }
+    NAV_FIELDS.forEach(function (f) { getter(PerformanceNavigationTiming.prototype, f, function () { return es(this)[f]; }); });
+    getter(PerformanceNavigationTiming.prototype, 'notRestoredReasons', function () { es(this); return null; });
+    op(PerformanceNavigationTiming.prototype, 'toJSON', {
+        toJSON() { var s = es(this), o = json(s, RT_FIELDS.concat(NAV_FIELDS)); o.serverTiming = []; return o; },
+    }.toJSON);
+    var rtState = function (name, type, start) {
+        var s = { name: name, entryType: type, startTime: start, duration: 0, serverTiming: Object.freeze([]) };
+        RT_FIELDS.forEach(function (f) { s[f] = 0; });
+        s.initiatorType = 'other'; s.deliveryType = ''; s.nextHopProtocol = ''; s.renderBlockingStatus = 'non-blocking';
+        s.contentType = ''; s.contentEncoding = '';
+        return s;
+    };
+    // The resource timing buffer (Resource Timing §4.4): primary (250 by default), secondary, the full event.
+    var rtBuffer = [], rtLimit = 250, rtSecondary = [], rtFullPending = false, rtHandler = null;
+    var canAddRT = function () { return rtBuffer.length < rtLimit; };
+    var copySecondary = function () {
+        while (rtSecondary.length && canAddRT()) { rtBuffer.push(rtSecondary.shift()); }
+    };
+    var fireBufferFull = function () {
+        while (rtSecondary.length) {
+            var before = rtSecondary.length;
+            if (!canAddRT()) {
+                try { performance.dispatchEvent(new Event('resourcetimingbufferfull')); } catch (e) { reportError(e); }
+            }
+            copySecondary();
+            if (before <= rtSecondary.length) { rtSecondary = []; break; }
+        }
+        rtFullPending = false;
+    };
+    var addRT = function (entry) {
+        if (canAddRT() && !rtFullPending) { rtBuffer.push(entry); return; }
+        if (!rtFullPending) { rtFullPending = true; setTimeout(fireBufferFull, 0); }
+        rtSecondary.push(entry);
+    };
+    // "mark resource timing" (§4.6) from a record of what the fetch observed: {name, initiatorType, fetchStart,
+    // responseStart, responseEnd, decodedBodySize, encodedBodySize, responseStatus, contentType, contentEncoding,
+    // tao (the timing allow check passed), corsSameOrigin}.
+    var markResource = function (r) {
+        var start = r.fetchStart === undefined ? performance.now() : r.fetchStart;
+        var end = r.responseEnd === undefined ? start : r.responseEnd;
+        var s = rtState(String(r.name), 'resource', start);
+        s.initiatorType = r.initiatorType || 'other';
+        s.fetchStart = start;
+        s.responseEnd = end;
+        s.duration = end - start;
+        if (r.tao !== false) {
+            s.domainLookupStart = s.domainLookupEnd = s.connectStart = s.connectEnd = s.requestStart = start;
+            s.responseStart = s.finalResponseHeadersStart = r.responseStart === undefined ? end : r.responseStart;
+            s.nextHopProtocol = 'http/1.1';
+            s.transferSize = (r.encodedBodySize || 0) + 300;
+        }
+        if (r.corsSameOrigin !== false) {
+            s.encodedBodySize = r.encodedBodySize || 0;
+            s.decodedBodySize = r.decodedBodySize || 0;
+            s.responseStatus = r.responseStatus || 0;
+            s.contentType = r.contentType || '';
+            s.contentEncoding = r.contentEncoding || '';
+        }
+        var e = make(PerformanceResourceTiming, s);
+        queueObservers(e);
+        addRT(e);
+    };
+    hide('__perf_resource', markResource);
+    // Resources the engine fetched outside script (js/loader.rs), stamped now.
+    var drain = function () {
+        if (typeof __perf_drain !== 'function') { return; }
+        var rows = __perf_drain();
+        for (var i = 0; i < rows.length; i++) {
+            markResource({ name: rows[i][0], initiatorType: rows[i][1], decodedBodySize: rows[i][2], encodedBodySize: rows[i][2], responseStatus: 200 });
+        }
+    };
+    // The document's PerformanceNavigationTiming (Navigation Timing §3): created with the document, its DOM
+    // lifecycle stamped by js/loader.rs "the end" (__perf_nav), queued to observers once loadEventEnd is set.
+    var navState = rtState('', 'navigation', 0);
+    navState.initiatorType = 'navigation';
+    NAV_FIELDS.forEach(function (f) { navState[f] = 0; });
+    navState.type = 'navigate';
+    var navEntry = make(PerformanceNavigationTiming, navState), navQueued = false;
+    // The document's URL (the entry's name) once the document has one.
+    var navName = function () {
+        if (navState.name !== '') { return; }
+        var u = '';
+        try { u = String(globalThis.location.href); } catch (e) {}
+        navState.name = u;
+        navState.nextHopProtocol = /^https?:/i.test(u) ? 'http/1.1' : '';
+        navState.responseStatus = /^https?:/i.test(u) ? 200 : 0;
+    };
+    hide('__perf_nav', function (field) {
+        navName();
+        navState[field] = performance.now();
+        if (field === 'loadEventEnd') {
+            navState.duration = navState.loadEventEnd;
+            drain();
+            navQueued = true;
+            queueObservers(navEntry);
+        }
+    });
+    // Every entry, for getEntries and buffered observers.
+    var all = function () { drain(); navName(); return buffer.concat([navEntry], rtBuffer); };
+    op(PP, 'setResourceTimingBufferSize', {
+        setResourceTimingBufferSize(maxSize) {
+            need(arguments.length, 1, 'Performance', 'setResourceTimingBufferSize');
+            var n = +maxSize;
+            rtLimit = isFinite(n) ? (Math.trunc(n) >>> 0) : 0;
+        },
+    }.setResourceTimingBufferSize);
+    op(PP, 'clearResourceTimings', { clearResourceTimings() { rtBuffer = []; } }.clearResourceTimings);
+    Object.defineProperty(PP, 'onresourcetimingbufferfull', {
+        get: function () { return rtHandler; },
+        set: function (f) {
+            if (rtHandler) { performance.removeEventListener('resourcetimingbufferfull', rtHandler); }
+            rtHandler = typeof f === 'function' ? f : null;
+            if (rtHandler) { performance.addEventListener('resourcetimingbufferfull', rtHandler); }
+        },
+        enumerable: true, configurable: true,
+    });
     class PerformanceObserver {
         constructor(callback) {
             if (typeof callback !== 'function') { throw new TypeError("Failed to construct 'PerformanceObserver': The callback provided as parameter 1 is not a function."); }
@@ -203,7 +396,8 @@ const TIMELINE: &str = r#"
             if (s.types.indexOf(type) < 0) { s.types.push(type); }
             if (registered.indexOf(this) < 0) { registered.push(this); }
             if (buffered) {
-                var old = filtered(buffer, undefined, type);
+                // The navigation entry reaches observers when it is queued (after the load event), not before.
+                var old = filtered(all().filter(function (x) { return x !== navEntry || navQueued; }), undefined, type);
                 for (var i = 0; i < old.length; i++) { s.buffer.push(old[i]); }
                 queueTask();
             }
@@ -324,19 +518,20 @@ const TIMELINE: &str = r#"
             return m;
         },
     }.measure);
-    op(PP, 'getEntries', { getEntries() { return filtered(buffer); } }.getEntries);
+    op(PP, 'getEntries', { getEntries() { return filtered(all()); } }.getEntries);
     op(PP, 'getEntriesByType', {
-        getEntriesByType(type) { need(arguments.length, 1, 'Performance', 'getEntriesByType'); return filtered(buffer, undefined, str(type)); },
+        getEntriesByType(type) { need(arguments.length, 1, 'Performance', 'getEntriesByType'); return filtered(all(), undefined, str(type)); },
     }.getEntriesByType);
     op(PP, 'getEntriesByName', {
         getEntriesByName(name) {
             need(arguments.length, 1, 'Performance', 'getEntriesByName');
             var t = arguments[1];
-            return filtered(buffer, str(name), t === undefined ? undefined : str(t));
+            return filtered(all(), str(name), t === undefined ? undefined : str(t));
         },
     }.getEntriesByName);
 
-    [PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList].forEach(function (C) {
+    [PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList,
+     PerformanceResourceTiming, PerformanceNavigationTiming].forEach(function (C) {
         Object.defineProperty(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
         hide(C.name, C);
     });

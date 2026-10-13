@@ -84,6 +84,8 @@ fn ws(c: char) -> bool {
 enum Raw {
     Text(String),
     EmptyFile,
+    /// AETHERWPT3 (SR138): a form-associated custom element: its submission value's entries (js/internals.rs).
+    Custom(usize),
     /// A file input with a selection (AETHERDEBT SR93, `input.files = dataTransfer.files`): one entry
     /// per selected File, read with the VM.
     Files(usize),
@@ -118,7 +120,7 @@ fn submittable(form: usize) -> Vec<usize> {
     with_doc(|d| {
         d.descendants(NodeId(root))
             .map(|n| n.0)
-            .filter(|&n| matches!(html_local_in(d, n).as_deref(), Some("button" | "input" | "select" | "textarea")))
+            .filter(|&n| matches!(html_local_in(d, n).as_deref(), Some("button" | "input" | "select" | "textarea")) || super::internals::is_face(n))
             .filter(|&n| controls::form_owner_in(d, n) == Some(form))
             .collect()
     })
@@ -163,6 +165,10 @@ fn raw_entries(form: usize, submitter: Option<usize>) -> Vec<(String, Raw)> {
     let mut out: Vec<(String, Raw)> = Vec::new();
     for field in submittable(form) {
         if in_datalist(field) || controls::disabled(field) {
+            continue;
+        }
+        if super::internals::is_face(field) {
+            out.push((String::new(), Raw::Custom(field)));
             continue;
         }
         let tag = local(field);
@@ -240,6 +246,10 @@ fn entry_list_inner(vm: &mut Vm, form: usize, submitter: Option<usize>) -> JsRes
                 for f in controls::selected_files(vm, el) {
                     pairs.push(Value::Object(vm.new_array(vec![s(&n), f])));
                 }
+                continue;
+            }
+            Raw::Custom(el) => {
+                super::internals::append_entries(vm, el, &mut pairs)?;
                 continue;
             }
         };

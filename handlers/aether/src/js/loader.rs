@@ -342,11 +342,15 @@ fn inline_text(el: usize) -> String {
 /// checked by the caller).
 fn fetch_source(url: &str, el: usize, kind: ScriptKind) -> Result<String, String> {
     if let Some(s) = page(|p| p.script_sources.get(url).cloned()) {
+        super::timeline::note_resource(url, "script", s.len()); // AETHERWPT3 (SR138): Resource Timing §4.6
         return Ok(s);
     }
     let crossorigin = attr_value(el, "crossorigin");
     let integrity = attr_value(el, "integrity").unwrap_or_default();
     let r = super::host::fetch_script(url, kind == ScriptKind::Module, crossorigin.as_deref(), &integrity);
+    if let Ok(s) = &r {
+        super::timeline::note_resource(url, "script", s.len());
+    }
     if let Err(e) = &r {
         crate::ledger::record_js(&format!("script-fetch-failed:{}", super::clip(url, 48)));
         if std::env::var("UNAOS_JSDEBUG").is_ok() {
@@ -630,14 +634,17 @@ fn the_end(engine: &mut Engine, was_frozen: bool) {
     drop(ctx);
     let doc = dom::main_doc();
     page(|p| p.ready_state = "interactive");
+    super::timeline::nav_mark(vm, "domInteractive"); // AETHERWPT3 (SR138): Navigation Timing L2 §3
     super::events::fire_simple(vm, TargetKey::Node(doc), "readystatechange", false, false);
     super::checkpoint(vm);
     for el in deferred {
         run_script_now(vm, el);
         super::checkpoint(vm);
     }
+    super::timeline::nav_mark(vm, "domContentLoadedEventStart");
     super::events::fire_simple(vm, TargetKey::Node(doc), "DOMContentLoaded", true, false);
     super::checkpoint(vm);
+    super::timeline::nav_mark(vm, "domContentLoadedEventEnd");
     for el in asap {
         run_script_now(vm, el);
         super::checkpoint(vm);
@@ -655,10 +662,13 @@ fn the_end(engine: &mut Engine, was_frozen: bool) {
     }
     let vm = &mut engine.vm;
     page(|p| p.ready_state = "complete");
+    super::timeline::nav_mark(vm, "domComplete");
     super::events::fire_simple(vm, TargetKey::Node(doc), "readystatechange", false, false);
     super::checkpoint(vm);
+    super::timeline::nav_mark(vm, "loadEventStart");
     super::events::fire_simple(vm, TargetKey::Window, "load", false, false);
     super::checkpoint(vm);
+    super::timeline::nav_mark(vm, "loadEventEnd");
     crate::event_loop::boot_drain(engine);
     if !was_frozen {
         crate::event_loop::thaw_clock();

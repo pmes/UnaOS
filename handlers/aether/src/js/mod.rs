@@ -48,6 +48,8 @@
 pub mod animations;
 pub mod broadcast;
 pub mod cache_api;
+/// AETHERWPT3 (SR138): Selection.modify()'s caret over the rendered text.
+pub mod caret;
 pub mod canvas;
 pub mod controls;
 pub mod cssom;
@@ -60,9 +62,14 @@ pub mod html;
 pub mod idb;
 pub mod idl;
 pub mod importmap;
+/// AETHERWPT3 (SR138): ElementInternals and form-associated custom elements.
+pub mod internals;
 pub mod loader;
 pub mod locks;
 pub mod mutation;
+pub mod navigation;
+/// AETHERWPT3 (SR138): pointer capture (Pointer Events §10).
+pub mod pointer;
 /// AETHERMEDIA2 (SR134): Media Source Extensions.
 pub mod mse;
 pub mod ports;
@@ -70,6 +77,8 @@ pub mod range;
 pub mod reflect;
 mod reflect_table;
 pub mod shadow;
+/// AETHERWPT3 (SR138): constructable stylesheets and adoptedStyleSheets (CSSOM §6.1).
+pub mod stylesheets;
 pub mod sw;
 /// AETHERMEDIA2 (SR134): text tracks, requestVideoFrameCallback, PiP / captureStream refusals.
 pub mod tracks;
@@ -187,6 +196,8 @@ pub struct DocMeta {
     pub content_type: String,
     pub url: String,
     pub quirks: bool,
+    /// AETHERWPT3 (SR138): the document's character encoding (HTML §13.2.3; `document.characterSet`).
+    pub charset: String,
 }
 
 /// A task queued for the event loop (HTML §8.1.7): run in order by [`Engine::run_tasks`].
@@ -781,6 +792,8 @@ impl Engine {
         importmap::reset();
         crate::dom::mutation::reset();
         crate::dom::custom::reset(document.arena());
+        internals::reset();
+        pointer::reset();
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
         vm.track_rejections = true;
@@ -796,6 +809,7 @@ impl Engine {
         controls::install(&mut vm);
         cssom::install(&mut vm);
         window::install(&mut vm);
+        dom::selection::bind_get_selection(&mut vm); // the live Selection from the first script (the stub that shadowed it is gone — AETHERWPT3 fold)
         net::install(&mut vm);
         window::install_scheduler(&mut vm);
         forms::install(&mut vm);
@@ -805,6 +819,8 @@ impl Engine {
         shadow::install(&mut vm);
         mutation::install(&mut vm);
         custom::install(&mut vm);
+        internals::install(&mut vm);
+        pointer::install(&mut vm);
         canvas::install(&mut vm);
         // WEBGL1 (SR136): WebGLRenderingContext over gl_core (after canvas: the same surface store).
         webgl::install(&mut vm);
@@ -819,6 +835,10 @@ impl Engine {
         locks::install(&mut vm);
         sw::install(&mut vm);
         animations::install(&mut vm);
+        // AETHERWPT3 (SR138): the Navigation API — after fetch (AbortController) and ports (structuredClone).
+        navigation::install(&mut vm);
+        // AETHERWPT3 (SR138): CSSStyleSheet / adoptedStyleSheets — after dom (Document, ShadowRoot) and window (matchMedia).
+        stylesheets::install(&mut vm);
         // AETHERMEDIA2 (SR134): after window (URL, the element interfaces) — MSE, then text tracks.
         mse::install(&mut vm);
         tracks::install(&mut vm);
@@ -867,7 +887,7 @@ impl Engine {
         page(|p| {
             p.url = url.to_string();
             let root = p.doc.as_ref().map(|d| d.id().0).unwrap_or(0);
-            p.docs.insert(root, DocMeta { html: true, content_type: "text/html".into(), url: url.to_string(), quirks: false });
+            p.docs.insert(root, DocMeta { html: true, content_type: "text/html".into(), url: url.to_string(), quirks: false, charset: "UTF-8".into() });
         });
         net::note_url(url);
     }

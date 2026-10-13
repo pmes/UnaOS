@@ -97,6 +97,9 @@ pub fn install(vm: &mut Vm) {
     op(vm, sp, "containsNode", 1, contains_node);
     op(vm, sp, "deleteFromDocument", 0, delete_from_document);
     op(vm, sp, "toString", 0, sel_to_string);
+    // AETHERWPT3 (SR138): Selection API §3 modify() and getComposedRanges().
+    op(vm, sp, "modify", 0, modify);
+    op(vm, sp, "getComposedRanges", 0, get_composed_ranges);
 
     SEL_OBJ.with(|c| c.set(None));
     ASSOC.with(|c| c.set(None));
@@ -189,7 +192,7 @@ pub fn range_changed() {
     if model::get() == Some(sel) {
         return;
     }
-    if !(in_document(s.node) && in_document(e.node)) {
+    if !selectable(s.node, e.node) {
         model::set(None);
         current();
         return;
@@ -231,6 +234,14 @@ fn node_len(id: usize) -> u32 {
 /// Whether `id` is in the document's tree (selections only hold such points).
 fn in_document(id: usize) -> bool {
     root_of(id) == main_doc()
+}
+
+/// AETHERWPT3 (SR138): whether a selection may hold `a` and `b` — both in one tree whose shadow-including root is
+/// the document (the document tree, or one shadow tree in it: Selection API §2, the composed selection's
+/// "shadow-including root is the document" check; a selection spanning two trees is not held).
+fn selectable(a: usize, b: usize) -> bool {
+    let (ra, rb) = (root_of(a), root_of(b));
+    ra == rb && (ra == main_doc() || with_doc(|d| crate::dom::shadow::shadow_including_root(d, html_core::NodeId(ra)).0) == main_doc())
 }
 
 /// Validates a boundary point for the Selection/Range setters (DOM §5.2 "set the start or end").
@@ -417,7 +428,7 @@ fn collapse(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let n = node_arg(vm, ctx, 0, "Selection", "collapse")?;
     let off = offset_arg(vm, ctx, 1)?;
     check_point(vm, n, off)?;
-    if in_document(n) {
+    if selectable(n, n) {
         model::set(Some(Selection::collapsed(Point { node: n, offset: off })));
     }
     Ok(Value::Undefined)
@@ -451,7 +462,7 @@ fn extend(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         return throw_dom(vm, "InvalidStateError", "This Selection object doesn't have any Ranges.");
     };
     check_point(vm, n, off)?;
-    if in_document(n) {
+    if selectable(x.anchor.node, n) {
         model::set(Some(Selection { anchor: x.anchor, focus: Point { node: n, offset: off } }));
     }
     Ok(Value::Undefined)
@@ -466,7 +477,7 @@ fn set_base_and_extent(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let fo = offset_arg(vm, ctx, 3)?;
     check_point(vm, a, ao)?;
     check_point(vm, f, fo)?;
-    if in_document(a) && in_document(f) {
+    if selectable(a, f) {
         model::set(Some(Selection { anchor: Point { node: a, offset: ao }, focus: Point { node: f, offset: fo } }));
     }
     Ok(Value::Undefined)
@@ -478,7 +489,7 @@ fn select_all_children(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if kind(n) == NK::Doctype {
         return throw_dom(vm, "InvalidNodeTypeError", "The node provided is of type 'DocumentType'.");
     }
-    if in_document(n) {
+    if selectable(n, n) {
         let len = node_len(n);
         model::set(Some(Selection { anchor: Point { node: n, offset: 0 }, focus: Point { node: n, offset: len } }));
     }
@@ -532,4 +543,99 @@ fn sel_to_string(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let doc = node_ref(main_doc());
     let text = with_page_layout(|l| model::range_text(l, &doc, x.anchor, x.focus));
     Ok(s(&text))
+}
+
+// =================================================================================================
+// AETHERWPT3 (SR138): modify() and getComposedRanges()
+// =================================================================================================
+
+/// An optional DOMString argument ("" when absent: no value matches).
+fn opt_str(vm: &mut Vm, ctx: &CallCtx, i: usize) -> JsResult<String> {
+    match arg(vm, ctx, i) {
+        Value::Undefined => Ok(String::new()),
+        v => string(vm, &v),
+    }
+}
+
+/// Selection API §3 `modify(alter, direction, granularity)` (js/caret.rs: the caret over the rendered text).
+fn modify(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    this_sel(vm, ctx)?;
+    let alter = opt_str(vm, ctx, 0)?;
+    let direction = opt_str(vm, ctx, 1)?;
+    let granularity = opt_str(vm, ctx, 2)?;
+    let Some(x) = model::get() else { return Ok(Value::Undefined) };
+    if !in_document(x.focus.node) {
+        // The caret model reads the document tree's rendered text; a selection inside a shadow tree stays.
+        return Ok(Value::Undefined);
+    }
+    if let Some(sel) = super::super::caret::modify(x, &alter, &direction, &granularity) {
+        model::set(Some(sel));
+    }
+    Ok(Value::Undefined)
+}
+
+/// The ShadowRoot node behind `v`, or a TypeError naming `what`.
+fn shadow_root_arg(vm: &mut Vm, v: &Value, what: &str) -> JsResult<usize> {
+    let n = super::node_of(vm, v);
+    match n.filter(|&n| with_doc(|d| crate::dom::shadow::is_shadow_root(d, html_core::NodeId(n)))) {
+        Some(n) => Ok(n),
+        None => vm.throw_type(&format!("Failed to execute 'getComposedRanges' on 'Selection': {what} is not of type 'ShadowRoot'.")),
+    }
+}
+
+/// Selection API §3 `getComposedRanges(options)` (and the earlier `getComposedRanges(...shadowRoots)` form): the
+/// selection's range as a StaticRange whose ends are rescoped out of every shadow tree that is not (inside) one
+/// of the given shadow roots — an end inside such a tree moves to its host (before it for the start, after it
+/// for the end), repeatedly.
+fn get_composed_ranges(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    this_sel(vm, ctx)?;
+    let mut roots: Vec<usize> = Vec::new();
+    let first = arg(vm, ctx, 0);
+    let first_is_root = super::node_of(vm, &first).is_some_and(|n| with_doc(|d| crate::dom::shadow::is_shadow_root(d, html_core::NodeId(n))));
+    if first_is_root {
+        for i in 0..ctx.argc {
+            let v = arg(vm, ctx, i);
+            roots.push(shadow_root_arg(vm, &v, &format!("parameter {}", i + 1))?);
+        }
+    } else if let Value::Object(o) = first {
+        // GetComposedRangesOptions { sequence<ShadowRoot> shadowRoots = [] }
+        let list = vm.get(o, &PropertyKey::from_str("shadowRoots"))?;
+        match list {
+            Value::Undefined => {}
+            Value::Object(l) => {
+                let n = vm.get(l, &PropertyKey::from_str("length"))?;
+                let n = vm.to_number(&n)?;
+                let n = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+                for i in 0..n {
+                    let v = vm.get(l, &PropertyKey::Index(i as u32))?;
+                    roots.push(shadow_root_arg(vm, &v, "member shadowRoots")?);
+                }
+            }
+            _ => return vm.throw_type("Failed to execute 'getComposedRanges' on 'Selection': The provided value cannot be converted to a sequence."),
+        }
+    } else if !first.is_nullish() {
+        return vm.throw_type("Failed to execute 'getComposedRanges' on 'Selection': The provided value is not of type 'GetComposedRangesOptions'.");
+    }
+    let Some(x) = model::get() else { return Ok(Value::Object(vm.new_array(Vec::new()))) };
+    let (s, e, _) = start_end(x);
+    let rescope = |mut p: Bp, after: bool| -> Bp {
+        loop {
+            let r = root_of(p.node);
+            let shadow = with_doc(|d| crate::dom::shadow::is_shadow_root(d, html_core::NodeId(r)));
+            if !shadow {
+                break;
+            }
+            let kept = roots.iter().any(|&sr| with_doc(|d| crate::dom::shadow::is_shadow_including_inclusive_ancestor(d, html_core::NodeId(r), html_core::NodeId(sr))));
+            if kept {
+                break;
+            }
+            let Some(host) = with_doc(|d| crate::dom::shadow::host_of(d, html_core::NodeId(r))) else { break };
+            let Some((parent, i)) = index_in_parent(host.0) else { break };
+            p = Bp { node: parent, off: if after { i + 1 } else { i } };
+        }
+        p
+    };
+    let (s, e) = (rescope(s, false), rescope(e, true));
+    let r = range::make_static(vm, s, e);
+    Ok(Value::Object(vm.new_array(vec![r])))
 }

@@ -18,9 +18,15 @@
 //! the same for every key and every block. (This is the property T-table AES does not have: its
 //! cache-line footprint leaks key bytes.)
 //!
-//! Only the FORWARD cipher is provided: GCM, CTR and CMAC never run the inverse. A mode that needs
-//! decryption (CBC) is not a mode UnaOS should be adopting; if a legacy one is ever required the inverse
-//! S-box circuit is the extension point.
+//! The INVERSE cipher (FIPS 197 §5.3, `InvCipher`) is here for the one consumer that needs it: the Web
+//! Cryptography API's AES-CBC decryption and AES-KW unwrapping (Aether's `crypto.subtle`, AETHERWPT3). GCM,
+//! CTR and CMAC never run it. It is bitsliced the same way and table-free:
+//!  * InvSubBytes is the forward circuit between two inverse affine maps — S(x) = A(x^-1), so
+//!    S^-1(y) = (A^-1(y))^-1 = A^-1(S(A^-1(y))), where A^-1 is §5.3.2's
+//!    `b'_i = b_{i+2} ^ b_{i+5} ^ b_{i+7} ^ d_i` (indices mod 8, d = 0x05): plane XORs and two NOTs;
+//!  * InvShiftRows (§5.3.1) is the inverse lane permutation;
+//!  * InvMixColumns (§5.3.3) is MixColumns after the classic pre-multiplication
+//!    `a_r ^= {04}(a_r ^ a_{r+2})` (`{04}` = two `xtime`s), which turns {02,03,01,01} into {0e,0b,0d,09}.
 
 use crate::ct::Zeroize;
 use crate::Error;
@@ -226,6 +232,65 @@ fn mix_columns(p: &mut [u64; 8]) {
     }
 }
 
+/// FIPS 197 §5.3.2's inverse affine map on the planes: `b'_i = b_{(i+2) mod 8} ^ b_{(i+5) mod 8} ^
+/// b_{(i+7) mod 8} ^ d_i` with d = 0x05 (bits 0 and 2 complemented).
+#[inline(always)]
+fn inv_affine(p: &mut [u64; 8]) {
+    let b = *p;
+    for i in 0..8 {
+        p[i] = b[(i + 2) % 8] ^ b[(i + 5) % 8] ^ b[(i + 7) % 8];
+    }
+    p[0] = !p[0];
+    p[2] = !p[2];
+}
+
+/// InvSubBytes (§5.3.2): `A^-1 ∘ S ∘ A^-1`, where S is the forward Boyar–Peralta circuit (see the module
+/// comment); constant-time for the same reason the forward S-box is.
+#[inline(always)]
+fn inv_sub_bytes(p: &mut [u64; 8]) {
+    inv_affine(p);
+    sub_bytes(p);
+    inv_affine(p);
+}
+
+/// InvShiftRows (§5.3.1): row r rotates RIGHT by r columns, i.e. new byte `4c + r` = old byte
+/// `4((c - r) mod 4) + r`.
+#[inline(always)]
+fn inv_shift_rows(p: &mut [u64; 8]) {
+    for x in p.iter_mut() {
+        let v = *x;
+        *x = (v & rep(0x1111))
+            | ((v >> 12) & rep(0x0002))
+            | ((v << 4) & rep(0x2220))
+            | ((v >> 8) & rep(0x0044))
+            | ((v << 8) & rep(0x4400))
+            | ((v >> 4) & rep(0x0888))
+            | ((v << 12) & rep(0x8000));
+    }
+}
+
+/// `xtime` on the planes (multiply every byte by x modulo x^8 + x^4 + x^3 + x + 1).
+#[inline(always)]
+fn xtime_planes(t: &[u64; 8]) -> [u64; 8] {
+    let hi = t[7];
+    [hi, t[0] ^ hi, t[1], t[2] ^ hi, t[3] ^ hi, t[4], t[5], t[6]]
+}
+
+/// InvMixColumns (§5.3.3) as MixColumns after `a_r ^= {04}·(a_r ^ a_{r+2})` for every row r: the
+/// pre-multiplication by {05,00,04,00} composes with {02,03,01,01} into {0e,0b,0d,09}.
+#[inline(always)]
+fn inv_mix_columns(p: &mut [u64; 8]) {
+    let mut u = [0u64; 8];
+    for i in 0..8 {
+        u[i] = p[i] ^ rot2(p[i]);
+    }
+    let u4 = xtime_planes(&xtime_planes(&u));
+    for i in 0..8 {
+        p[i] ^= u4[i];
+    }
+    mix_columns(p);
+}
+
 #[inline(always)]
 fn add_round_key(p: &mut [u64; 8], k: &[u64; 8]) {
     for i in 0..8 {
@@ -362,6 +427,37 @@ impl Aes {
         self.encrypt_blocks(&mut b);
         *block = b[0];
     }
+
+    /// FIPS 197 §5.3 InvCipher on the planes, with the forward round keys in reverse order.
+    fn decrypt_planes(&self, p: &mut [u64; 8]) {
+        add_round_key(p, &self.rk[self.rounds]);
+        for r in (1..self.rounds).rev() {
+            inv_shift_rows(p);
+            inv_sub_bytes(p);
+            add_round_key(p, &self.rk[r]);
+            inv_mix_columns(p);
+        }
+        inv_shift_rows(p);
+        inv_sub_bytes(p);
+        add_round_key(p, &self.rk[0]);
+    }
+
+    /// Decrypt up to four blocks in place (one bitsliced pass). Panics on more than four. Constant-time:
+    /// the same table-free circuits as encryption.
+    pub fn decrypt_blocks(&self, blocks: &mut [[u8; 16]]) {
+        assert!(blocks.len() <= 4);
+        let mut p = pack(blocks);
+        self.decrypt_planes(&mut p);
+        unpack(&p, blocks);
+        p.zeroize();
+    }
+
+    /// Decrypt one block in place (FIPS 197 §5.3).
+    pub fn decrypt_block(&self, block: &mut [u8; 16]) {
+        let mut b = [*block];
+        self.decrypt_blocks(&mut b);
+        *block = b[0];
+    }
 }
 
 impl Drop for Aes {
@@ -421,5 +517,29 @@ mod tests {
         let mut b = pt;
         Aes::new(&k256).unwrap().encrypt_block(&mut b);
         assert_eq!(b, [0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89]);
+    }
+
+    /// FIPS 197 Appendix C.1 / C.2 / C.3 InvCipher: each ciphertext decrypts to 00112233..ff, and four
+    /// blocks in one pass round-trip.
+    #[test]
+    fn fips197_appendix_c_inverse() {
+        let pt: [u8; 16] = core::array::from_fn(|i| (i as u8) * 0x11);
+        let cases: [(usize, [u8; 16]); 3] = [
+            (16, [0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a]),
+            (24, [0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91]),
+            (32, [0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89]),
+        ];
+        for (klen, ct) in cases {
+            let key: [u8; 32] = core::array::from_fn(|i| i as u8);
+            let aes = Aes::new(&key[..klen]).unwrap();
+            let mut b = ct;
+            aes.decrypt_block(&mut b);
+            assert_eq!(b, pt, "AES-{}", klen * 8);
+            let mut four: [[u8; 16]; 4] = core::array::from_fn(|k| core::array::from_fn(|i| (i * 7 + k * 13) as u8));
+            let orig = four;
+            aes.encrypt_blocks(&mut four);
+            aes.decrypt_blocks(&mut four);
+            assert_eq!(four, orig);
+        }
     }
 }

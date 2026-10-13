@@ -1,7 +1,7 @@
 //! The Fetch Standard's page-facing half (AETHERNET, LEDGER SR70): `fetch()` whose `Response.body` is a
 //! `ReadableStream` fed chunk by chunk as the connection delivers it, `Headers`, `Request`, `Response`,
-//! the Streams Standard's default `ReadableStream` / reader / controller, `AbortController` /
-//! `AbortSignal` wired through, and a minimal `Blob` / `FileReader`.
+//! `AbortController` / `AbortSignal` wired through, and a minimal `Blob` / `FileReader`. The Streams Standard
+//! itself is `api::streams` (AETHERWPT3, SR138), installed ahead of this prelude.
 //!
 //! The worker half is here too: [`spawn_http`] runs one exchange on its own thread through
 //! gneiss_pal::api::http's blocking client (the shared cookie jar, http_core + tls_core underneath) and
@@ -608,6 +608,8 @@ pub struct SubDocument {
     pub content_type: String,
     pub status: u16,
     pub body: String,
+    /// AETHERWPT3 (SR138): the encoding the body was decoded from (HTML §13.2.3; `document.characterSet`).
+    pub charset: &'static str,
 }
 
 /// The MIME essence of a `Content-Type` value.
@@ -638,11 +640,12 @@ fn mime_for_path(path: &str) -> String {
 /// Fetches the resource an `<iframe>` navigates to (HTML §7.4.5 "populating a session history
 /// entry", the fetch half): `about:blank` is the empty HTML document, `file:` and `data:` come from
 /// disk / the URL itself (`js::host::fetch_script_text`), `http(s):` is one synchronous GET on
-/// [`http_sync`] (the shared cookie jar; redirects followed). The body is decoded as UTF-8 (lossily).
+/// [`http_sync`] (the shared cookie jar; redirects followed). An http(s) body is decoded by HTML §13.2.3
+/// (`dom::charset`: BOM, transport charset, prescan, windows-1252); the others as UTF-8.
 pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
     let bare = url.split(['#', '?']).next().unwrap_or(url);
     if bare == "about:blank" || bare == "about:srcdoc" {
-        return Ok(SubDocument { url: url.to_string(), content_type: "text/html".into(), status: 200, body: String::new() });
+        return Ok(SubDocument { url: url.to_string(), content_type: "text/html".into(), status: 200, body: String::new(), charset: "UTF-8" });
     }
     if url.starts_with("about:") {
         return Err(format!("unsupported about: URL {url}"));
@@ -651,11 +654,23 @@ pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
         let meta = rest.split(',').next().unwrap_or("");
         let ct = essence(meta.trim_end_matches(";base64"));
         let body = crate::js::host::fetch_script_text(url)?;
-        return Ok(SubDocument { url: url.to_string(), content_type: if ct.is_empty() { "text/plain".into() } else { ct }, status: 200, body });
+        return Ok(SubDocument { url: url.to_string(), content_type: if ct.is_empty() { "text/plain".into() } else { ct }, status: 200, body, charset: "UTF-8" });
     }
     if url.starts_with("file://") {
         let body = crate::js::host::fetch_script_text(url)?;
-        return Ok(SubDocument { url: url.to_string(), content_type: mime_for_path(url), status: 200, body });
+        return Ok(SubDocument { url: url.to_string(), content_type: mime_for_path(url), status: 200, body, charset: "UTF-8" });
+    }
+    // AETHERWPT3 (SR138): a navigation to a blob: URL (Fetch §4.3 blob; navigations resolve across the origin
+    // partition) — the Blob's bytes under its type, decoded as a response of that type.
+    if url.starts_with("blob:") {
+        let e = crate::api::blobstore::resolve(url, None).ok_or_else(|| format!("revoked or unknown blob URL {url}"))?;
+        let ct = essence(&e.mime);
+        let (body, charset) = if ct.is_empty() || ct.contains("html") {
+            crate::dom::charset::decode_html(&e.bytes, &e.mime)
+        } else {
+            crate::dom::charset::decode_text(&e.bytes, &e.mime)
+        };
+        return Ok(SubDocument { url: url.to_string(), content_type: if ct.is_empty() { "text/plain".into() } else { ct }, status: 200, body, charset });
     }
     if url.starts_with("http://") || url.starts_with("https://") {
         let r = http_sync(HttpReq {
@@ -667,14 +682,21 @@ pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
             timeout_ms: 30_000,
         })?;
         let mut ct = String::new();
+        let mut full_ct = String::new();
         for kv in r.headers.chunks(2) {
             if kv.len() == 2 && kv[0].eq_ignore_ascii_case("content-type") {
                 ct = essence(&kv[1]);
+                full_ct = kv[1].clone();
             }
         }
-        let body = String::from_utf8_lossy(&r.body).into_owned();
+        // AETHERWPT3 (SR138): HTML §13.2.3 — the BOM, the transport's charset, the <meta> prescan, the default.
+        let (body, charset) = if ct.is_empty() || ct.contains("html") {
+            crate::dom::charset::decode_html(&r.body, &full_ct)
+        } else {
+            crate::dom::charset::decode_text(&r.body, &full_ct)
+        };
         let final_url = if r.url.is_empty() { url.to_string() } else { r.url };
-        return Ok(SubDocument { url: final_url, content_type: ct, status: r.status, body });
+        return Ok(SubDocument { url: final_url, content_type: ct, status: r.status, body, charset });
     }
     Err(format!("unsupported URL scheme: {url}"))
 }
@@ -988,310 +1010,9 @@ pub const PRELUDE: &str = r#"
     };
     hide(globalThis, '__headers_from', headersFrom);
 
-    // ---- ReadableStream (Streams §4: the default stream, controller and reader) ------------------------
-    var creatingInternal = false;
-    var pullIfNeeded, closeStream, errorStream, fulfillRead, cancelStream;
-    class ReadableStreamDefaultController {
-        constructor() { if (!creatingInternal) { throw new TypeError('Illegal constructor'); } }
-        get desiredSize() {
-            var s = st(st(this).stream);
-            if (s.state === 'errored') { return null; }
-            if (s.state === 'closed') { return 0; }
-            return s.hwm - s.qtotal;
-        }
-        enqueue(chunk) {
-            var stream = st(this).stream, s = st(stream);
-            if (s.closeRequested || s.state !== 'readable') {
-                throw new TypeError("Failed to execute 'enqueue' on 'ReadableStreamDefaultController': Cannot enqueue a chunk into a closed stream");
-            }
-            if (s.reader && st(s.reader).reads.length) {
-                fulfillRead(stream, chunk, false);
-            } else {
-                // AETHERWPT2 (SR135): Streams §4.5 ReadableStreamDefaultControllerEnqueue — the strategy's size
-                // (its result converted to unrestricted double), EnqueueValueWithSize's RangeError, the
-                // controller errored with whatever either throws.
-                var sz = 1;
-                if (s.size !== undefined) {
-                    try { sz = +s.size.call(undefined, chunk); } catch (e) { errorStream(stream, e); throw e; }
-                    if (!(sz >= 0) || sz === Infinity) {
-                        var re = new RangeError("Failed to execute 'enqueue' on 'ReadableStreamDefaultController': The return value of a queuing strategy's size function must be a finite, non-NaN, non-negative number.");
-                        errorStream(stream, re);
-                        throw re;
-                    }
-                }
-                s.queue.push(chunk);
-                s.sizes.push(sz);
-                s.qtotal += sz;
-            }
-            pullIfNeeded(stream);
-        }
-        close() {
-            var stream = st(this).stream, s = st(stream);
-            if (s.closeRequested || s.state !== 'readable') {
-                throw new TypeError("Failed to execute 'close' on 'ReadableStreamDefaultController': Cannot close a closed stream");
-            }
-            s.closeRequested = true;
-            if (!s.queue.length) { closeStream(stream); }
-        }
-        error(e) {
-            var stream = st(this).stream;
-            if (st(stream).state === 'readable') { errorStream(stream, e); }
-        }
-    }
-    class ReadableStreamDefaultReader {
-        constructor(stream) {
-            if (!(stream instanceof ReadableStream)) { throw new TypeError("Failed to construct 'ReadableStreamDefaultReader': parameter 1 is not of type 'ReadableStream'."); }
-            var s = st(stream);
-            if (s.reader) { throw new TypeError("Failed to construct 'ReadableStreamDefaultReader': ReadableStreamDefaultReader constructor can only accept readable streams that are not yet locked to a reader"); }
-            var rs = { stream: stream, reads: [], closed: null, closedResolve: null, closedReject: null };
-            rs.closed = new Promise(function (res, rej) { rs.closedResolve = res; rs.closedReject = rej; });
-            ST.set(this, rs);
-            s.reader = this;
-            if (s.state === 'closed') { rs.closedResolve(undefined); }
-            else if (s.state === 'errored') { rs.closedReject(s.error); rs.closed.catch(function () {}); }
-        }
-        get closed() { return st(this).closed; }
-        read() {
-            var rs = st(this);
-            if (!rs.stream) { return Promise.reject(new TypeError('This readable stream reader has been released and cannot be used to read from its previous owner stream')); }
-            var stream = rs.stream, s = st(stream);
-            s.disturbed = true;
-            if (s.state === 'closed') { return Promise.resolve({ value: undefined, done: true }); }
-            if (s.state === 'errored') { return Promise.reject(s.error); }
-            if (s.queue.length) {
-                var chunk = s.queue.shift();
-                s.qtotal -= s.sizes.shift();
-                if (s.qtotal < 0) { s.qtotal = 0; }
-                if (s.closeRequested && !s.queue.length) { closeStream(stream); } else { pullIfNeeded(stream); }
-                return Promise.resolve({ value: chunk, done: false });
-            }
-            var p = new Promise(function (res, rej) { rs.reads.push({ res: res, rej: rej }); });
-            pullIfNeeded(stream);
-            return p;
-        }
-        releaseLock() {
-            var rs = st(this);
-            if (!rs.stream) { return; }
-            var e = new TypeError('Releasing reader');
-            rs.reads.splice(0).forEach(function (r) { r.rej(e); });
-            if (st(rs.stream).state === 'readable') { rs.closedReject(e); }
-            rs.closed = Promise.reject(e);
-            rs.closed.catch(function () {});
-            st(rs.stream).reader = null;
-            rs.stream = null;
-        }
-        cancel(reason) {
-            var rs = st(this);
-            if (!rs.stream) { return Promise.reject(new TypeError('This readable stream reader has been released')); }
-            return cancelStream(rs.stream, reason);
-        }
-    }
-    class ReadableStream {
-        constructor(source, strategy) {
-            source = source === undefined || source === null ? {} : source;
-            // AETHERWPT2 (SR135): the QueuingStrategy dictionary (Streams §7.1): highWaterMark, then size, which must
-            // be callable (ExtractSizeAlgorithm; absent = every chunk counts 1).
-            if (strategy !== undefined && strategy !== null && typeof strategy !== 'object' && typeof strategy !== 'function') {
-                throw new TypeError("Failed to construct 'ReadableStream': The provided value is not of type 'QueuingStrategy'.");
-            }
-            var hwm = strategy && strategy.highWaterMark !== undefined ? Number(strategy.highWaterMark) : 1;
-            var sizeFn = strategy ? strategy.size : undefined;
-            if (sizeFn !== undefined && typeof sizeFn !== 'function') {
-                throw new TypeError("Failed to construct 'ReadableStream': Failed to read the 'size' property from 'QueuingStrategy': The provided value is not a function.");
-            }
-            if (isNaN(hwm) || hwm < 0) { throw new RangeError('Invalid highWaterMark'); }
-            if (source.type !== undefined && String(source.type) === 'bytes') { __ledger('ReadableStream-byte-source-as-default'); }
-            creatingInternal = true;
-            var controller;
-            try { controller = new ReadableStreamDefaultController(); } finally { creatingInternal = false; }
-            var s = { state: 'readable', queue: [], sizes: [], qtotal: 0, size: sizeFn, reader: null, error: undefined, disturbed: false, closeRequested: false,
-                      started: false, pulling: false, pullAgain: false, hwm: hwm, source: source, controller: controller };
-            ST.set(this, s);
-            ST.set(controller, { stream: this });
-            var self = this;
-            var start = typeof source.start === 'function' ? source.start.call(source, controller) : undefined;
-            Promise.resolve(start).then(function () {
-                s.started = true;
-                pullIfNeeded(self);
-            }, function (e) { if (s.state === 'readable') { errorStream(self, e); } });
-        }
-        get locked() { return st(this).reader !== null; }
-        cancel(reason) {
-            if (st(this).reader) { return Promise.reject(new TypeError("Failed to execute 'cancel' on 'ReadableStream': Cannot cancel a locked stream")); }
-            return cancelStream(this, reason);
-        }
-        getReader(opts) {
-            if (opts && opts.mode !== undefined) {
-                if (String(opts.mode) === 'byob') {
-                    __ledger('ReadableStream-byob-reader');
-                    throw new TypeError("Failed to execute 'getReader' on 'ReadableStream': Cannot get a BYOB reader for a stream that does not have an underlying byte source");
-                }
-                throw new TypeError("Failed to execute 'getReader' on 'ReadableStream': The provided value is not a valid enum value of type ReadableStreamReaderMode.");
-            }
-            return new ReadableStreamDefaultReader(this);
-        }
-        tee() {
-            var reader = this.getReader();
-            var c1, c2, canceled1 = false, canceled2 = false, reason1, reason2, reading = false, cancelResolve;
-            var cancelPromise = new Promise(function (r) { cancelResolve = r; });
-            var pull = function () {
-                if (reading) { return Promise.resolve(); }
-                reading = true;
-                return reader.read().then(function (r) {
-                    reading = false;
-                    if (r.done) {
-                        if (!canceled1) { try { c1.close(); } catch (e) {} }
-                        if (!canceled2) { try { c2.close(); } catch (e) {} }
-                        return;
-                    }
-                    if (!canceled1) { c1.enqueue(r.value); }
-                    if (!canceled2) { c2.enqueue(r.value); }
-                }, function (e) {
-                    reading = false;
-                    try { c1.error(e); } catch (x) {}
-                    try { c2.error(e); } catch (x) {}
-                });
-            };
-            var b1 = new ReadableStream({
-                start: function (c) { c1 = c; }, pull: pull,
-                cancel: function (r) { canceled1 = true; reason1 = r; if (canceled2) { cancelResolve(reader.cancel([reason1, reason2])); } return cancelPromise; },
-            });
-            var b2 = new ReadableStream({
-                start: function (c) { c2 = c; }, pull: pull,
-                cancel: function (r) { canceled2 = true; reason2 = r; if (canceled1) { cancelResolve(reader.cancel([reason1, reason2])); } return cancelPromise; },
-            });
-            return [b1, b2];
-        }
-        values(opts) {
-            var reader = this.getReader(), prevent = !!(opts && opts.preventCancel);
-            var it = {
-                next: function () {
-                    return reader.read().then(function (r) {
-                        if (r.done) { reader.releaseLock(); }
-                        return r;
-                    });
-                },
-                return: function (v) {
-                    var p = prevent ? Promise.resolve() : reader.cancel(v);
-                    return p.then(function () { reader.releaseLock(); return { value: v, done: true }; });
-                },
-            };
-            it[Symbol.asyncIterator] = function () { return it; };
-            return it;
-        }
-        [Symbol.asyncIterator](opts) { return this.values(opts); }
-        static from(iterable) {
-            var it = iterable[Symbol.asyncIterator] ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator]();
-            return new ReadableStream({
-                pull: function (c) {
-                    return Promise.resolve(it.next()).then(function (r) {
-                        if (r.done) { c.close(); } else { return Promise.resolve(r.value).then(function (v) { c.enqueue(v); }); }
-                    });
-                },
-                cancel: function (r) { if (typeof it.return === 'function') { return Promise.resolve(it.return(r)).then(function () {}); } },
-            });
-        }
-    }
-    fulfillRead = function (stream, chunk, done) {
-        var r = st(st(stream).reader).reads.shift();
-        r.res({ value: chunk, done: done });
-    };
-    closeStream = function (stream) {
-        var s = st(stream);
-        if (s.state !== 'readable') { return; }
-        s.state = 'closed';
-        if (s.reader) {
-            var rs = st(s.reader);
-            rs.reads.splice(0).forEach(function (r) { r.res({ value: undefined, done: true }); });
-            rs.closedResolve(undefined);
-        }
-    };
-    errorStream = function (stream, e) {
-        var s = st(stream);
-        if (s.state !== 'readable') { return; }
-        s.state = 'errored';
-        s.error = e;
-        s.queue = [];
-        s.sizes = [];
-        s.qtotal = 0;
-        if (s.reader) {
-            var rs = st(s.reader);
-            rs.reads.splice(0).forEach(function (r) { r.rej(e); });
-            rs.closedReject(e);
-            rs.closed.catch(function () {});
-        }
-    };
-    cancelStream = function (stream, reason) {
-        var s = st(stream);
-        s.disturbed = true;
-        if (s.state === 'closed') { return Promise.resolve(undefined); }
-        if (s.state === 'errored') { return Promise.reject(s.error); }
-        s.queue = [];
-        s.sizes = [];
-        s.qtotal = 0;
-        closeStream(stream);
-        var src = s.source;
-        var r;
-        try { r = typeof src.cancel === 'function' ? src.cancel.call(src, reason) : undefined; }
-        catch (e) { return Promise.reject(e); }
-        return Promise.resolve(r).then(function () { return undefined; });
-    };
-    pullIfNeeded = function (stream) {
-        var s = st(stream);
-        if (!s.started || s.state !== 'readable' || s.closeRequested) { return; }
-        var wants = (s.reader && st(s.reader).reads.length > 0) || (s.hwm - s.qtotal > 0);
-        if (!wants || typeof s.source.pull !== 'function') { return; }
-        if (s.pulling) { s.pullAgain = true; return; }
-        s.pulling = true;
-        var r;
-        try { r = s.source.pull.call(s.source, s.controller); }
-        catch (e) { errorStream(stream, e); return; }
-        Promise.resolve(r).then(function () {
-            s.pulling = false;
-            if (s.pullAgain) { s.pullAgain = false; pullIfNeeded(stream); }
-        }, function (e) { errorStream(stream, e); });
-    };
-    [ReadableStream, ReadableStreamDefaultReader, ReadableStreamDefaultController].forEach(function (C) {
-        Object.defineProperty(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
-        hide(globalThis, C.name, C);
-    });
-    var disturbed = function (stream) { return st(stream).disturbed; };
-
-    // ---- CountQueuingStrategy / ByteLengthQueuingStrategy (Streams §7.2, §7.3) — AETHERWPT2 (SR135) -------
-    // One size function per global (a method, so: named "size", no prototype, not a constructor); the
-    // QueuingStrategyInit dictionary requires highWaterMark (unrestricted double).
-    var countSize = ({ size() { return 1; } }).size;
-    var byteSize = ({ size(chunk) { return chunk.byteLength; } }).size;
-    var strategyInit = function (init, iface) {
-        if (init === undefined || init === null) { init = {}; }
-        if (typeof init !== 'object' && typeof init !== 'function') {
-            throw new TypeError("Failed to construct '" + iface + "': The provided value is not of type 'QueuingStrategyInit'.");
-        }
-        var h = init.highWaterMark;
-        if (h === undefined) {
-            throw new TypeError("Failed to construct '" + iface + "': Failed to read the 'highWaterMark' property from 'QueuingStrategyInit': Required member is undefined.");
-        }
-        return +h;
-    };
-    var QS = new WeakMap();
-    var qs = function (o) {
-        var v = (o !== null && typeof o === 'object') ? QS.get(o) : undefined;
-        if (v === undefined) { throw new TypeError('Illegal invocation'); }
-        return v;
-    };
-    class CountQueuingStrategy {
-        constructor(init) { QS.set(this, strategyInit(init, 'CountQueuingStrategy')); }
-    }
-    class ByteLengthQueuingStrategy {
-        constructor(init) { QS.set(this, strategyInit(init, 'ByteLengthQueuingStrategy')); }
-    }
-    [[CountQueuingStrategy, countSize], [ByteLengthQueuingStrategy, byteSize]].forEach(function (pair) {
-        var C = pair[0], f = pair[1];
-        getter(C.prototype, 'highWaterMark', function () { return qs(this); });
-        getter(C.prototype, 'size', function () { qs(this); return f; });
-        Object.defineProperty(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
-        hide(globalThis, C.name, C);
-    });
+    // AETHERWPT3 (SR138): ReadableStream and the rest of the Streams Standard are api/streams.rs's prelude, installed
+    // ahead of this one (js::net::install); the Body mixin reads a stream's "disturbed" flag through it.
+    var disturbed = function (stream) { return __rs_disturbed(stream); };
 
     // ---- Body (Fetch §5.3) ----------------------------------------------------------------------------
     // Extracts a body: [stream or null, bytes or null, content type or null].
@@ -1426,13 +1147,16 @@ pub const PRELUDE: &str = r#"
                 }
             }
             var integrity = init.integrity !== undefined ? String(init.integrity) : (src ? src.integrity : '');
+            // AETHERWPT3 (SR138): URL parsing attaches a blob: URL's entry (File API §8.3.4), so a Request keeps
+            // its Blob even after the URL is revoked.
+            var blobEntry = src ? src.blobEntry : (/^blob:/i.test(url) && typeof __blob_url_resolve === 'function' ? __blob_url_resolve(url, hereOrigin()) : undefined);
             if (mode === 'no-cors' && ['GET', 'HEAD', 'POST'].indexOf(m) < 0) { throw new TypeError("Failed to construct 'Request': '" + m + "' is unsupported in no-cors mode."); }
             ST.set(this, {
                 url: url, method: m, headers: headers, body: body, bytes: bytes, signal: own, redirect: redirect,
                 credentials: credentials, mode: mode,
                 cache: cache,
                 keepalive: !!init.keepalive,
-                referrer: referrer, referrerPolicy: referrerPolicy, integrity: integrity,
+                referrer: referrer, referrerPolicy: referrerPolicy, integrity: integrity, blobEntry: blobEntry,
             });
         }
         get url() { return st(this).url; }
@@ -1546,6 +1270,58 @@ pub const PRELUDE: &str = r#"
         return [type, bytes];
     };
     hide(globalThis, '__data_url', dataURL);
+    // AETHERWPT3 (SR138): Fetch §4.3 "scheme fetch", blob — the entry's bytes as a 200, or the one range of a
+    // `Range` header (Fetch §2.2.? "parse a single range header value", whitespace allowed) as a 206; a null
+    // entry or a method other than GET is a network error (null here).
+    var hereOrigin = function () { try { return String(globalThis.location.origin); } catch (e) { return 'null'; } };
+    var blobResponse = function (url, method, entry, range) {
+        if (!entry || method !== 'GET') { return null; }
+        var all = new Uint8Array(entry[0]), full = all.length, type = entry[1];
+        if (range === null) {
+            return [200, 'OK', ['content-length', String(full), 'content-type', type], all];
+        }
+        var m = /^bytes[\t ]*=[\t ]*(\d*)[\t ]*-[\t ]*(\d*)[\t ]*$/.exec(range);
+        if (!m || (m[1] === '' && m[2] === '')) { return null; }
+        var start = m[1] === '' ? null : Number(m[1]), end = m[2] === '' ? null : Number(m[2]);
+        if (start !== null && end !== null && start > end) { return null; }
+        if (start === null) {
+            start = Math.max(full - end, 0);
+            end = full - 1;
+        } else {
+            if (start >= full) { return null; }
+            if (end === null || end >= full) { end = full - 1; }
+        }
+        var part = all.slice(start, end + 1);
+        return [206, 'Partial Content', ['content-length', String(part.length), 'content-type', type, 'content-range', 'bytes ' + start + '-' + end + '/' + full], part];
+    };
+    hide(globalThis, '__blob_response', blobResponse);
+    // AETHERWPT3 (SR138): Resource Timing §4.6 "mark resource timing" for a fetch this prelude (or XHR's) ran: the
+    // times it observed (fetch start, the head, the end), the body sizes, the status and type, and Fetch's TAO
+    // check (same-origin, or a Timing-Allow-Origin value of * or this origin) deciding what the entry exposes.
+    var rtRecord = function (url, initiator, t0, tHead, n, headers, type, status) {
+        if (typeof __perf_resource !== 'function' || !/^https?:/i.test(url)) { return; }
+        headers = headers || [];
+        var hv = function (name) {
+            for (var i = 0; i + 1 < headers.length; i += 2) { if (String(headers[i]).toLowerCase() === name) { return String(headers[i + 1]); } }
+            return null;
+        };
+        var tao = type === 'basic';
+        if (!tao) {
+            var v = hv('timing-allow-origin'), here = hereOrigin();
+            if (v !== null) { v.split(',').forEach(function (x) { x = x.trim(); if (x === '*' || x === here) { tao = true; } }); }
+        }
+        var ce = hv('content-encoding') || '', cl = hv('content-length');
+        var enc = ce && cl !== null && /^\d+$/.test(cl.trim()) ? Number(cl) : n;
+        var opaque = type === 'opaque';
+        __perf_resource({
+            name: url, initiatorType: initiator, fetchStart: t0, responseStart: tHead, responseEnd: performance.now(),
+            decodedBodySize: n, encodedBodySize: enc, responseStatus: opaque ? 0 : status,
+            contentType: opaque ? '' : (hv('content-type') || '').split(';')[0].trim().toLowerCase(),
+            contentEncoding: opaque ? '' : ce, tao: tao, corsSameOrigin: !opaque,
+        });
+    };
+    hide(globalThis, '__rt_record', rtRecord);
+    hide(globalThis, '__here_origin', hereOrigin);
     var fetch = function fetch(input, init) {
         return new Promise(function (resolve, reject) {
             var req;
@@ -1559,6 +1335,14 @@ pub const PRELUDE: &str = r#"
                 if (!d) { reject(new TypeError('Failed to fetch')); return; }
                 var hh = headersFrom(['content-type', d[0]], 'immutable');
                 creatingResponse = { type: 'basic', url: url, redirected: false, status: 200, statusText: 'OK', headers: hh, body: streamOf(d[1]) };
+                resolve(new Response());
+                return;
+            }
+            if (/^blob:/i.test(url)) {
+                var entry = rs.blobEntry !== undefined ? rs.blobEntry : (typeof __blob_url_resolve === 'function' ? __blob_url_resolve(url, hereOrigin()) : null);
+                var br = blobResponse(url, rs.method, entry, rs.headers.get('range'));
+                if (!br) { reject(new TypeError('Failed to fetch')); return; }
+                creatingResponse = { type: 'basic', url: url.replace(/#.*$/, ''), redirected: false, status: br[0], statusText: br[1], headers: headersFrom(br[2], 'immutable'), body: streamOf(br[3]) };
                 resolve(new Response());
                 return;
             }
@@ -1580,6 +1364,7 @@ pub const PRELUDE: &str = r#"
             flat.push(':aether-mode', rs.mode, ':aether-credentials', rs.credentials,
                       ':aether-referrer', rs.referrer === '' ? 'no-referrer' : rs.referrer,
                       ':aether-referrer-policy', rs.referrerPolicy, ':aether-integrity', rs.integrity);
+            var rtStart = performance.now(), rtHead, rtBytes = 0, rtHeaders = null, rtType = 'basic', rtStatus = 0;
             var id = __net_http(rs.method, url.replace(/#.*$/, ''), flat, rs.bytes, rs.redirect);
             if (!id) { reject(new TypeError('Failed to fetch')); return; }
             var resp = null, controller = null, done = false;
@@ -1589,6 +1374,7 @@ pub const PRELUDE: &str = r#"
                         var status = a[0];
                         var h = headersFrom(a[3], 'immutable');
                         var type = a[5] === 'cors' || a[5] === 'opaque' ? a[5] : 'basic';
+                        rtHead = performance.now(); rtHeaders = a[3]; rtType = type; rtStatus = status;
                         if (rs.redirect === 'manual' && status >= 300 && status < 400 && h.has('location')) {
                             type = 'opaqueredirect';
                         }
@@ -1609,8 +1395,10 @@ pub const PRELUDE: &str = r#"
                         resp = new Response();
                         resolve(resp);
                     } else if (kind === 'data') {
+                        rtBytes += a[0].byteLength;
                         if (controller && !done) { controller.enqueue(new Uint8Array(a[0])); }
                     } else if (kind === 'end') {
+                        rtRecord(url.replace(/#.*$/, ''), 'fetch', rtStart, rtHead, rtBytes, rtHeaders, rtType, rtStatus);
                         done = true;
                         if (controller) { try { controller.close(); } catch (e) {} }
                     } else if (kind === 'error') {

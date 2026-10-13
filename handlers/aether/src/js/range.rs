@@ -268,6 +268,12 @@ fn proto_of(name: &str) -> Obj {
     dom::proto(name)
 }
 
+/// AETHERWPT3 (SR138): a StaticRange over (start, end) (Selection `getComposedRanges`).
+pub fn make_static(vm: &mut Vm, start: Bp, end: Bp) -> Value {
+    let p = proto_of("StaticRange");
+    Value::Object(host_obj(vm, p, T_STATIC_RANGE, vec![num(start.node as f64), num(start.off as f64), num(end.node as f64), num(end.off as f64)]))
+}
+
 pub fn make_range(vm: &mut Vm, start: Bp, end: Bp) -> Value {
     let id = new_live(start, end);
     wrap_live(vm, id)

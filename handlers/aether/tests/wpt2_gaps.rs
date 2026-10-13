@@ -193,7 +193,7 @@ R.push(PerformanceObserver.supportedEntryTypes === PerformanceObserver.supported
     ));
     assert_eq!(
         eval(&mut e, "R.join('|')"),
-        "InvalidModificationError|3|9.5|measure|true|1|SyntaxError|SyntaxError|a,m,b|{\"name\":\"m\",\"entryType\":\"measure\",\"startTime\":3,\"duration\":9.5}|true|mark,measure|mark:a,mark:b|0|true"
+        "InvalidModificationError|3|9.5|measure|true|1|SyntaxError|SyntaxError|http://127.0.0.1:8000/wpt2.html,a,m,b|{\"name\":\"m\",\"entryType\":\"measure\",\"startTime\":3,\"duration\":9.5}|true|mark,measure,navigation,resource|mark:a,mark:b|0|true"
     );
 }
 

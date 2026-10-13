@@ -1375,7 +1375,8 @@ fn set_range_text(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 const LISTED: &[&str] = &["button", "fieldset", "input", "object", "output", "select", "textarea"];
 
 fn is_listed(d: &Document, el: usize) -> bool {
-    html_local(d, el).is_some_and(|l| LISTED.contains(&l.as_str()))
+    // AETHERWPT3 (SR138): a form-associated custom element is listed (and labelable, submittable, resettable).
+    html_local(d, el).is_some_and(|l| LISTED.contains(&l.as_str())) || super::internals::is_face(el)
 }
 
 fn root_in(d: &Document, n: usize) -> usize {
@@ -1441,6 +1442,9 @@ fn form_length(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 /// Labelable elements (§4.10.2).
 fn labelable(d: &Document, el: usize) -> bool {
+    if super::internals::is_face(el) {
+        return true;
+    }
     match html_local(d, el).as_deref() {
         Some("button" | "meter" | "output" | "progress" | "select" | "textarea") => true,
         Some("input") => !d.element(NodeId(el)).and_then(|e| e.attr("type")).is_some_and(|t| t.eq_ignore_ascii_case("hidden")),
@@ -1471,10 +1475,15 @@ pub fn labels_in(d: &Document, el: usize) -> Vec<usize> {
 
 fn labels_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
+    Ok(labels_value(vm, el))
+}
+
+/// `labels` of a labelable element (null otherwise); also ElementInternals.labels (AETHERWPT3).
+pub fn labels_value(vm: &mut Vm, el: usize) -> Value {
     if !with_doc(|d| labelable(d, el)) {
-        return Ok(Value::Null);
+        return Value::Null;
     }
-    Ok(dom::cached(vm, el, SO_LABELS, |vm| dom::make_collection(vm, dom::CK_DOCFILTER, el, "labels", "")))
+    dom::cached(vm, el, SO_LABELS, |vm| dom::make_collection(vm, dom::CK_DOCFILTER, el, "labels", ""))
 }
 
 fn label_control(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1507,7 +1516,7 @@ fn has(el: usize, a: &str) -> bool {
 /// Disabled (§4.10.18.5): the attribute, or a disabled fieldset ancestor outside its first legend.
 pub fn disabled(el: usize) -> bool {
     let l = local(el);
-    if matches!(l.as_str(), "button" | "input" | "select" | "textarea" | "fieldset" | "optgroup") && has(el, "disabled") {
+    if (matches!(l.as_str(), "button" | "input" | "select" | "textarea" | "fieldset" | "optgroup") || super::internals::is_face(el)) && has(el, "disabled") {
         return true;
     }
     if l == "option" {
@@ -1561,6 +1570,8 @@ pub fn barred(el: usize) -> bool {
         }
         "select" => disabled(el) || in_datalist(el),
         "textarea" => disabled(el) || has(el, "readonly") || in_datalist(el),
+        // AETHERWPT3 (SR138): a form-associated custom element is barred when disabled, readonly, or in a datalist.
+        _ if super::internals::is_face(el) => disabled(el) || has(el, "readonly") || in_datalist(el),
         _ => true,
     }
 }
@@ -1651,11 +1662,25 @@ struct Flags {
     range_overflow: bool,
     step_mismatch: bool,
     custom: bool,
+    // AETHERWPT3 (SR138): the three a form-associated custom element can set (setValidity) that no built-in
+    // control here computes.
+    too_long: bool,
+    too_short: bool,
+    bad_input: bool,
 }
 
 impl Flags {
     fn valid(&self) -> bool {
-        !(self.value_missing || self.type_mismatch || self.pattern_mismatch || self.range_underflow || self.range_overflow || self.step_mismatch || self.custom)
+        !(self.value_missing
+            || self.type_mismatch
+            || self.pattern_mismatch
+            || self.range_underflow
+            || self.range_overflow
+            || self.step_mismatch
+            || self.custom
+            || self.too_long
+            || self.too_short
+            || self.bad_input)
     }
 }
 
@@ -1681,6 +1706,22 @@ fn pattern_matches(vm: &mut Vm, pattern: &str, value: &str) -> bool {
 }
 
 fn flags(vm: &mut Vm, el: usize) -> Flags {
+    if let Some(b) = super::internals::face_flags(el) {
+        // ElementInternals.setValidity's flags, in internals::FLAG_NAMES order.
+        let bit = |i: u16| b & (1 << i) != 0;
+        return Flags {
+            value_missing: bit(0),
+            type_mismatch: bit(1),
+            pattern_mismatch: bit(2),
+            too_long: bit(3),
+            too_short: bit(4),
+            range_underflow: bit(5),
+            range_overflow: bit(6),
+            step_mismatch: bit(7),
+            bad_input: bit(8),
+            custom: bit(9),
+        };
+    }
     let mut f = Flags { custom: CUSTOM.with(|c| c.borrow().get(&el).is_some_and(|m| !m.is_empty())), ..Flags::default() };
     match local(el).as_str() {
         "input" => {
@@ -1754,6 +1795,9 @@ fn validity_flag(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         "rangeOverflow" => f.range_overflow,
         "stepMismatch" => f.step_mismatch,
         "customError" => f.custom,
+        "tooLong" => f.too_long,
+        "tooShort" => f.too_short,
+        "badInput" => f.bad_input,
         "valid" => f.valid(),
         _ => false,
     }))
@@ -1761,10 +1805,15 @@ fn validity_flag(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn validity_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
-    Ok(dom::cached(vm, el, SO_VALIDITY, |vm| {
+    Ok(validity_value(vm, el))
+}
+
+/// The element's ValidityState (also ElementInternals.validity, AETHERWPT3).
+pub fn validity_value(vm: &mut Vm, el: usize) -> Value {
+    dom::cached(vm, el, SO_VALIDITY, |vm| {
         let p = dom::proto("ValidityState");
         host_obj(vm, p, T_VALIDITY, vec![num(el as f64)])
-    }))
+    })
 }
 
 fn will_validate(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1774,14 +1823,22 @@ fn will_validate(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn validation_message(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
+    Ok(s(&validation_message_of(vm, el)))
+}
+
+/// `validationMessage` (also ElementInternals.validationMessage, whose message is setValidity's).
+pub fn validation_message_of(vm: &mut Vm, el: usize) -> String {
     if barred(el) {
-        return Ok(s(""));
+        return String::new();
+    }
+    if super::internals::is_face(el) {
+        return if flags(vm, el).valid() { String::new() } else { super::internals::face_message(el) };
     }
     let f = flags(vm, el);
     if f.custom {
-        return Ok(s(&CUSTOM.with(|c| c.borrow().get(&el).cloned()).unwrap_or_default()));
+        return CUSTOM.with(|c| c.borrow().get(&el).cloned()).unwrap_or_default();
     }
-    Ok(s(if f.value_missing {
+    String::from(if f.value_missing {
         "Please fill out this field."
     } else if f.type_mismatch {
         "Please enter a valid value."
@@ -1795,7 +1852,7 @@ fn validation_message(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         "Please enter a valid value (step)."
     } else {
         ""
-    }))
+    })
 }
 
 fn set_custom_validity(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
@@ -1808,7 +1865,7 @@ fn set_custom_validity(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 
 /// "check validity": fires a cancelable `invalid` at an invalid candidate.
-fn check_one(vm: &mut Vm, el: usize) -> bool {
+pub fn check_one(vm: &mut Vm, el: usize) -> bool {
     if barred(el) || flags(vm, el).valid() {
         return true;
     }
@@ -2291,6 +2348,8 @@ fn dimension_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn form_reset(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
     reset_form(vm, el);
+    // [CEReactions]: a form-associated custom element's formResetCallback runs before reset() returns.
+    super::mutation::settle(vm);
     Ok(Value::Undefined)
 }
 
@@ -2320,6 +2379,11 @@ fn reset_form_inner(vm: &mut Vm, el: usize) -> JsResult<Value> {
 
 /// The reset algorithm of one control (§4.10.21).
 fn reset_control(vm: &mut Vm, el: usize) -> JsResult<()> {
+    if super::internals::is_face(el) {
+        // AETHERWPT3 (SR138): a form-associated custom element's reset algorithm is its formResetCallback.
+        crate::dom::custom::enqueue_callback(NodeId(el), crate::dom::custom::Callback::FormReset, Vec::new());
+        return Ok(());
+    }
     match local(el).as_str() {
         "input" | "textarea" => {
             page(|p| {

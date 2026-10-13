@@ -25,6 +25,8 @@ const FAIL_DEFINE: &str = "Failed to execute 'define' on 'CustomElementRegistry'
 /// by an outer flush (a reaction that mutated the DOM) is left to that flush, so one element's
 /// reactions run in order.
 pub fn flush(vm: &mut Vm) {
+    // AETHERWPT3 (SR138): form-associated custom elements whose form owner / disabled state changed.
+    super::internals::sync();
     if !ce::pending() || super::engine_poisoned() {
         return;
     }
@@ -63,6 +65,7 @@ fn invoke_callback(vm: &mut Vm, el: NodeId, cb: Callback, args: &[Arg]) {
             Arg::Null => Value::Null,
             Arg::Str(t) => s(t),
             Arg::Node(n) => wrap(vm, n.0),
+            Arg::Bool(b) => Value::Bool(*b),
         });
     }
     super::invoke(vm, cb.name(), &f, &this, &vals);
@@ -109,6 +112,7 @@ fn upgrade(vm: &mut Vm, el: NodeId, def_i: usize) -> JsResult<()> {
         return Err(e);
     }
     ce::set_state(el, CeState::Custom);
+    super::internals::note_custom(el);
     Ok(())
 }
 
@@ -151,6 +155,7 @@ fn html_constructor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             let n = NodeId(id);
             ce::set_state(n, CeState::Custom);
             ce::set_definition(n, Some(def_i));
+            super::internals::note_custom(n);
             ce::set_is_value(n, is_value);
             let w = wrap(vm, id);
             if let Value::Object(o) = &w {
@@ -322,12 +327,12 @@ fn define(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     ce::set_running(true);
     let ctor_o = ctor_obj.expect("constructor is an object");
-    let read = (|| -> JsResult<(Vec<String>, [Option<usize>; 4], bool, bool, bool)> {
+    let read = (|| -> JsResult<(Vec<String>, [Option<usize>; 8], bool, bool, bool)> {
         let proto = match get(vm, ctor_o, "prototype")? {
             Value::Object(p) => p,
             _ => return vm.throw_type(&format!("{FAIL_DEFINE}The prototype of this constructor is not an object.")),
         };
-        let mut callbacks: [Option<usize>; 4] = [None; 4];
+        let mut callbacks: [Option<usize>; 8] = [None; 8];
         callbacks[Callback::Connected as usize] = callable_or_none(vm, proto, "connectedCallback")?;
         callbacks[Callback::Disconnected as usize] = callable_or_none(vm, proto, "disconnectedCallback")?;
         callbacks[Callback::Adopted as usize] = callable_or_none(vm, proto, "adoptedCallback")?;
@@ -353,10 +358,14 @@ fn define(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         let v = get(vm, ctor_o, "formAssociated")?;
         let form_associated = boolean(vm, &v);
         if form_associated {
-            for n in ["formAssociatedCallback", "formResetCallback", "formDisabledCallback", "formStateRestoreCallback"] {
-                if let Some(r) = callable_or_none(vm, proto, n)? {
-                    unroot(vm, r);
-                }
+            // AETHERWPT3 (SR138): kept (they were read and dropped): js/internals.rs enqueues them.
+            for (cb, n) in [
+                (Callback::FormAssociated, "formAssociatedCallback"),
+                (Callback::FormReset, "formResetCallback"),
+                (Callback::FormDisabled, "formDisabledCallback"),
+                (Callback::FormStateRestore, "formStateRestoreCallback"),
+            ] {
+                callbacks[cb as usize] = callable_or_none(vm, proto, n)?;
             }
         }
         Ok((observed, callbacks, disable_internals, disable_shadow, form_associated))

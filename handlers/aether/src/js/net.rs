@@ -665,8 +665,11 @@ pub fn install(vm: &mut Vm) {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
     }
+    // AETHERWPT3 (SR138): the Streams Standard (and the stream classes over it) before fetch, whose Body uses it.
+    crate::api::streams::init(vm);
     for (label, src) in [
         ("net", PRELUDE),
+        ("streams", crate::api::streams::PRELUDE),
         ("fetch", crate::api::fetch::PRELUDE),
         ("websocket", crate::api::websockets::PRELUDE),
         ("eventsource", crate::api::eventsource::PRELUDE),
