@@ -1933,7 +1933,7 @@ pub fn kbd_pump_body(_arg: usize) {
     loop {
         if let Ok(mut x) = xhci::claim() {
             x.poll_events();
-        } #[cfg(feature = "orinrx")] super::serial::serialrx::drain(); // SERIALRX (ORINRX) — the headless twin of `jd2_console_pump`'s UART RX drain (serial-only boot: no scanout, so this JB2b loop IS the console pump); the `KEY` line below is then the wire witness. No sweep cadence here, so drain + the one-shot `[serialrx] lsr=` witness only. ⚠ LINE-NEUTRAL append.
+        } #[cfg(feature = "orinrx")] super::serial::serialrx::drain(); #[cfg(feature = "uvc")] orinuvc_service(); // ORINUVC (orin-ledger A107) — the headless twin of the post-drop service pass on `jd2_console_pump`'s phase-2 line. ⚠ LINE-NEUTRAL append. SERIALRX (ORINRX) — the headless twin of `jd2_console_pump`'s UART RX drain (serial-only boot: no scanout, so this JB2b loop IS the console pump); the `KEY` line below is then the wire witness. No sweep cadence here, so drain + the one-shot `[serialrx] lsr=` witness only. ⚠ LINE-NEUTRAL append.
         // Drain the pal queue the HID decoder feeds — the same sink the x86 GUI drains — and
         // print each keystroke as the arc's first-light evidence line. Non-key events (a mouse
         // wiggle) are consumed silently; a flood of motion deltas would drown the serial log.
@@ -2157,4 +2157,24 @@ pub fn oi_rollup(tag: &str) {
         super::syscall::user_input_active(),
         verdict
     );
+}
+
+/// ORINUVC (orin-ledger A107): the post-drop `service_*` pass the Orin never had. The board's only
+/// enumeration window was `jb2b_attach`'s pre-drop pump, so a device (the D435i) plugged after the
+/// EL2->EL1 drop sat in the hot-plug queue forever: the post-drop pumps ran `poll_events` alone. This
+/// is the tegra twin of the Pi's `pump_usb_into_gui` claim block, minus `service_storage` (JD3 keeps
+/// the BOT bring-up pre-drop) and `service_ftdi` (never on this board): the hub descent, the
+/// enumeration FSM, and `service_enum`'s tegra UVC fold (`service_uvc`). The JB2b "park forever"
+/// hazard no longer holds: post-drop `hlt()` is a spin (`timer::is_live()` false, HID-REGRESS-B12) and
+/// every driver wait is a `now_cycles` deadline, so a wedged transfer costs a bounded timeout, never
+/// the core. Called by the post-drop pumps after their own `poll_events` loan is returned; a Busy
+/// claim skips the pass. `uvc`-gated so the knob-off jetson media is unchanged.
+#[cfg(feature = "uvc")]
+pub fn orinuvc_service() {
+    if let Ok(mut x) = xhci::claim() {
+        x.service_hubs();
+        x.service_hid_setproto();
+        x.service_slot_disposal();
+        x.service_enum();
+    }
 }
