@@ -5097,6 +5097,21 @@ test_aarch64() {
     local secs="${1:-20}"
     prepare_aarch64
 
+    # ARMAETHER (orin-ledger A110): THE APP STICK. Under `UNAOS_FATIMG=sf` with an app fixture compiled in, the stick is a
+    # COPY of fat-sf.img (QEMU writes into its backing file) carrying THIS build's kernel.elf — virt enumerates no other
+    # disk that holds the running kernel (fs/bootdisk.rs:584), so fs::bootdisk finds it here by content and binds `/`,
+    # `/boot` and `/apps` to this volume — plus the aarch64 MIDDEN/UNA/LUMEN/AETHER.ELF in APPS/ and Aether's pages in
+    # system/doc/ (stage_jetson_el0_images' shape). Without the kernel on it `/apps` is unbound and the four fixtures
+    # SKIP. docs/dev/evidence/armaether/ARMAETHER.md.
+    if [ "${UNAOS_FATIMG:-}" = sf ]; then case ",${_feats}" in *",midden,"*|*",una,"*|*",lumen,"*|*",aether,"*)
+        local _apps="${WORKSPACE_DIR}/target/armapps-stick.img" _p
+        { cp "$STICK_IMG" "$_apps" && mcopy -o -i "$_apps" "$ESP_DIR_ARM/kernel.elf" ::/kernel.elf; } || { echo -e "${COLOR_RED}test-arm: cannot stage the app stick from ${STICK_IMG} (./arroyo fat-img; mtools)${COLOR_RESET}"; return 2; }
+        mmd -i "$_apps" ::/APPS 2>/dev/null; mmd -i "$_apps" ::/system 2>/dev/null; mmd -i "$_apps" ::/system/doc 2>/dev/null
+        for _p in midden:MIDDEN una:UNA lumen:LUMEN aether:AETHER; do case ",${_feats}" in *",${_p%%:*},"*) "build_user_${_p%%:*}_aarch64"; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/${_p##*:}.ELF" ::/APPS/ || return 2 ;; esac; done
+        case ",${_feats}" in *",aether,"*) mcopy -o -i "$_apps" "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html ::/system/doc/ || return 2 ;; esac
+        STICK_IMG="$_apps"; echo -e "${COLOR_YELLOW}⚡ app stick: ${_apps} (kernel.elf + APPS/ for tests midden/una/lumen/aether):${COLOR_RESET}"; mdir -i "$_apps" ::/APPS
+        ;; esac; fi
+
     # GA10B-PROBE5 fixture (orin-0912b): with the knob set, the usb-storage stick is a FAT32 superfloppy
     # this script builds carrying `GA10B/` — three SYNTHETIC files with the vendor triple's NAMES and SIZES
     # (`yes <line> | head -c <size>`: our bytes, never a vendor byte; their sha256s are the `witness` table
@@ -7618,6 +7633,8 @@ KERNEL_CFG_MATRIX=(
   # UNIVERSE SIDE EFFECT: `virt_el0` is named by this arm-* leg and by no x86 leg, so
   # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
   "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,login,loginst"
+  # ARMAETHER (orin-ledger A110): the ring-3 app fixtures (`tests midden/una/lumen/aether`) over the arch launch facade with NO desktop knob — `launch_push`'s knob-free body compiled alone; `aether` implies `selfdiag` (Cargo.toml), so path_write_as's -ENOSYS arm is not this leg's. Board legs +1, universe +0 (every term is on x86-image or arm-only).
+  "arm-virt-apps-min ../../aarch64-unaos.json virt_el0,login,midden,una,lumen,aether"
   # NET6 (SOCK-7) — the ARMED polarity of the shared aarch64 socket surface, and the ONLY leg that
   # compiles it. It carries `vnet` + `net6` + `virt_el0` together because that triple is exactly what
   # the runtime gate runs and because each term reaches code the others do not: `vnet` supplies the
