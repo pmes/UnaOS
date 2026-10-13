@@ -363,6 +363,7 @@ pub fn other_config(slot: u8) -> Option<u8> {
 /// The controller took the candidate: record the bulk pair and announce it. Called right before
 /// Configure-Endpoint is issued.
 pub fn taken(slot: u8, in_mps: u16, out_mps: u16) {
+    retry_reset(); // PUMPRETRY (B537): a new candidate starts at try 0
     IN_MPS.store(in_mps, Ordering::Relaxed);
     OUT_MPS.store(out_mps, Ordering::Relaxed);
     serial_println!(
@@ -382,8 +383,8 @@ pub fn configured(slot: u8) {
 
 /// Bring-up state for the controller's service pass.
 pub fn bringup_pending() -> Option<u8> {
-    if STATE.load(Ordering::Relaxed) != ST_CONFIGURED || !crate::boot::services_gate("usbnet") {
-        return None; // INSTALLBARE (R86): the class bring-up (the register walk, rx arm, link poll) waits for the Desktop's services; enumeration already ran
+    if STATE.load(Ordering::Relaxed) != ST_CONFIGURED || crate::arch::ms() < RETRY_AT_MS.load(Ordering::Relaxed) || !crate::boot::services_gate("usbnet") {
+        return None; // PUMPRETRY (B537): a refused try waits out its back-off on later passes (the pump runs on). INSTALLBARE (R86): the class bring-up (the register walk, rx arm, link poll) waits for the Desktop's services; enumeration already ran
     }
     crate::boot::note_start("usbnet");
     Some(SLOT.load(Ordering::Relaxed))
@@ -428,6 +429,7 @@ pub fn set_up(slot: u8, filter_ok: bool, failed_at: Option<&'static str>) {
     let m = mac();
     match failed_at {
         None => {
+            try_line(slot, "-", "armed", 0);
             STATE.store(ST_UP, Ordering::Relaxed);
             serial_println!(
                 ":: USBNET: up kind={} slot={} cfg={} ctrl={} data={} alt={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} filter={} -> armed ::",
@@ -439,8 +441,11 @@ pub fn set_up(slot: u8, filter_ok: bool, failed_at: Option<&'static str>) {
             crate::net_phy::net6::register_nic(&NET6_OPS);
         }
         Some(why) => {
+            if retry_after_refusal(slot, why) {
+                return; // PUMPRETRY (B537): still ST_CONFIGURED; `bringup_pending` re-offers the slot once the back-off has run out
+            }
             STATE.store(ST_FAILED, Ordering::Relaxed);
-            serial_println!(":: USBNET: bring-up kind={} slot={} refused at {} -> declined ::", kind_name(), slot, why);
+            serial_println!(":: USBNET: bring-up kind={} slot={} refused at {} retries={} -> declined ::", kind_name(), slot, why, BRINGUP_RETRIES);
             serial_println!(":: USBNET: bus=xhci slot={} mac=00:00:00:00:00:00 link=down speed=0 usb=? rx=0 tx=0 refused={} -> declined ::", slot, why);
         }
     }
@@ -454,6 +459,7 @@ pub fn disconnect(slot: u8) {
     let was_up = STATE.load(Ordering::Relaxed) == ST_UP;
     STATE.store(ST_ABSENT, Ordering::Relaxed);
     SLOT.store(0, Ordering::Relaxed);
+    retry_reset(); // PUMPRETRY (B537): a pull during a back-off forgets the pending retry
     reset_arm(); U9_CARRY.store(0, Ordering::Relaxed); // USBNET9 M2: a carried burst dies with the slot
     tx_reset(); // NETCLOCK: an in-flight OUT TD dies with the slot
     for m in MAC.iter() {
@@ -474,6 +480,168 @@ pub fn disconnect(slot: u8) {
             RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed));
     }
     serial_println!("[usbnet] detach slot={} was_up={} rings=emptied loan=pass -> clean", slot, was_up as u8); // USBNETKILLSFTDI (B486): the teardown ran to its end inside the controller pass; a stalled glass after a pull shows as this line missing
+}
+
+// ── PUMPRETRY (rmbp-ledger B537): a refused bring-up is RETRIED, and no wait holds the pump ────────
+//
+// Flight 31: the dongle's first plug (high-speed, `in_mps=512`) stopped answering EP0 at the CLK_SELECT
+// write; `pump_until_ep0_done` waited its whole `hw_wait_budget()` (2 s on x86, `budget 5387711410` at
+// 2.69 GHz) INSIDE the usb-pump's pass, PUMPWEDGE fired (`age_ms=2160 bound_ms=2000`), and `set_up(.., Some)`
+// stored ST_FAILED — terminal until a re-plug. Now:
+//   * PASS CAP. `service_usbnet` opens a `PassScope`: a deadline `hw_wait_budget()*3/5` (1.2 s x86) from the
+//     pass start. Every EP0 / command wait inside it is `sync_budget(budget)` = min(budget/4, time left),
+//     so one dead transfer costs <= 500 ms and the whole pass (spins included: 10+200+100 ms) ends well
+//     inside PUMPWEDGE's 2 s. A transfer past the deadline fails at once and the try is refused.
+//   * RETRY. A refused try (`set_up(.., Some(why))`) leaves the link ST_CONFIGURED and arms a back-off
+//     (250 / 500 / 1000 ms for retries 1 / 2 / 3); `bringup_pending` re-offers the slot on the first pass
+//     after it — the wait is spread over passes, never spun. Try 0 is the first bring-up; after retry 3
+//     the device is declined (final). Any refusal is retried, not only a timeout: bounded, and the
+//     flight-31 refusal was a timeout followed by a readback on a ring still holding the dead TD.
+//   * EP0 RESET. A retry after a try that timed out first takes EP0 out of its state (Stop Endpoint when
+//     Running, Reset Endpoint when Halted/Error) and moves its dequeue to our enqueue (Set TR Dequeue),
+//     abandoning the stranded TD — `usbnet_rx_reset`'s shape on DCI 1.
+// Wire: `[usbnet] bring-up try=<n> of 3 slot= after_ms= ep0_reset=..` at a retry's start, and one
+// `[usbnet] bring-up try=<n> of 3 kind= slot= ms= ep0_timeouts= at= -> armed | retry backoff_ms= | declined(final)`
+// per try.
+pub const BRINGUP_RETRIES: u8 = 3;
+const BACKOFF_MS: [u64; BRINGUP_RETRIES as usize] = [250, 500, 1000];
+static TRY: AtomicU8 = AtomicU8::new(0);
+static RETRY_AT_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_BACKOFF_MS: AtomicU64 = AtomicU64::new(0);
+static TRY_T0_MS: AtomicU64 = AtomicU64::new(0);
+static EP0_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+static TRY_EP0_BASE: AtomicU32 = AtomicU32::new(0);
+static PREV_TRY_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+/// `now_cycles()` deadline of the open `PassScope`; 0 = no scope (every wait keeps its full budget).
+static PASS_DEADLINE: AtomicU64 = AtomicU64::new(0);
+
+fn retry_reset() {
+    TRY.store(0, Ordering::Relaxed);
+    RETRY_AT_MS.store(0, Ordering::Relaxed);
+    LAST_BACKOFF_MS.store(0, Ordering::Relaxed);
+    PREV_TRY_TIMEOUTS.store(0, Ordering::Relaxed);
+}
+
+/// `pump_until_ep0_done` timed out (mod.rs, same-line append on its TIMEOUT line).
+pub fn note_ep0_timeout() {
+    EP0_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The wall-clock budget (cycles) an EP0 or command wait may spend: unchanged outside the link's pass;
+/// inside it, a quarter of the base budget and never past the pass deadline (at least one cycle, so a
+/// wait past the deadline fails on its first check instead of spinning).
+pub fn sync_budget(budget: u64) -> u64 {
+    let dl = PASS_DEADLINE.load(Ordering::Relaxed);
+    if dl == 0 {
+        return budget;
+    }
+    (budget / 4).min(dl.saturating_sub(crate::arch::now_cycles())).max(1)
+}
+
+/// The link's service pass: opened at the top of `service_usbnet`, closed when it returns (Drop).
+pub struct PassScope(());
+impl PassScope {
+    pub fn enter() -> Self {
+        let allowance = crate::arch::hw_wait_budget() / 5 * 3;
+        PASS_DEADLINE.store(crate::arch::now_cycles().wrapping_add(allowance).max(1), Ordering::Relaxed);
+        PassScope(())
+    }
+}
+impl Drop for PassScope {
+    fn drop(&mut self) {
+        PASS_DEADLINE.store(0, Ordering::Relaxed);
+    }
+}
+
+/// A try starts: returns (try number, whether the previous try timed out on EP0 and the ring wants a reset).
+fn begin_try() -> (u8, bool) {
+    TRY_T0_MS.store(crate::arch::ms(), Ordering::Relaxed);
+    TRY_EP0_BASE.store(EP0_TIMEOUTS.load(Ordering::Relaxed), Ordering::Relaxed);
+    let n = TRY.load(Ordering::Relaxed);
+    (n, n > 0 && PREV_TRY_TIMEOUTS.load(Ordering::Relaxed) > 0)
+}
+
+fn try_timeouts() -> u32 {
+    EP0_TIMEOUTS.load(Ordering::Relaxed).wrapping_sub(TRY_EP0_BASE.load(Ordering::Relaxed))
+}
+
+/// The one per-try verdict line.
+fn try_line(slot: u8, at: &str, verdict: &str, backoff_ms: u64) {
+    let ms = crate::arch::ms().saturating_sub(TRY_T0_MS.load(Ordering::Relaxed));
+    if backoff_ms != 0 {
+        serial_println!(
+            "[usbnet] bring-up try={} of {} kind={} slot={} ms={} ep0_timeouts={} at={} -> {} backoff_ms={}",
+            TRY.load(Ordering::Relaxed), BRINGUP_RETRIES, kind_name(), slot, ms, try_timeouts(), at, verdict, backoff_ms
+        );
+    } else {
+        serial_println!(
+            "[usbnet] bring-up try={} of {} kind={} slot={} ms={} ep0_timeouts={} at={} -> {}",
+            TRY.load(Ordering::Relaxed), BRINGUP_RETRIES, kind_name(), slot, ms, try_timeouts(), at, verdict
+        );
+    }
+}
+
+/// A try was refused at `why`: arm the next retry (true) or, after the last, let the caller decline (false).
+fn retry_after_refusal(slot: u8, why: &'static str) -> bool {
+    let n = TRY.load(Ordering::Relaxed);
+    if n >= BRINGUP_RETRIES {
+        try_line(slot, why, "declined(final)", 0);
+        return false;
+    }
+    let backoff = BACKOFF_MS[n as usize];
+    try_line(slot, why, "retry", backoff);
+    PREV_TRY_TIMEOUTS.store(try_timeouts(), Ordering::Relaxed);
+    LAST_BACKOFF_MS.store(backoff, Ordering::Relaxed);
+    RETRY_AT_MS.store(crate::arch::ms().saturating_add(backoff), Ordering::Relaxed);
+    TRY.store(n + 1, Ordering::Relaxed);
+    true
+}
+
+impl super::XhciController {
+    /// One bring-up try, called from `service_usbnet` once `bringup_pending` offers the slot. A retry
+    /// after a timed-out try resets EP0 first; the try's verdict is printed by `set_up`.
+    pub(super) fn usbnet_bringup_try(&mut self, slot: u8) {
+        let (n, reset) = begin_try();
+        if n > 0 {
+            let after = LAST_BACKOFF_MS.load(Ordering::Relaxed);
+            if reset {
+                let (st, stop_cc, deq_cc) = self.usbnet_ep0_reset(slot);
+                serial_println!(
+                    "[usbnet] bring-up try={} of {} slot={} after_ms={} ep0_reset=state:{} stop_cc={} deq_cc={} now={}",
+                    n, BRINGUP_RETRIES, slot, after, st, stop_cc, deq_cc, self.ep_state_of(slot, 1)
+                );
+            } else {
+                serial_println!("[usbnet] bring-up try={} of {} slot={} after_ms={} ep0_reset=skip", n, BRINGUP_RETRIES, slot, after);
+            }
+        }
+        self.usbnet_bringup(slot);
+    }
+
+    /// EP0 (DCI 1) out of whatever a dead transfer left it in, its dequeue moved past the stranded TD:
+    /// Stop Endpoint (Running) or Reset Endpoint (Halted/Error), then Set TR Dequeue to our enqueue.
+    /// Returns (state before, stop/reset cc, set-dequeue cc); cc 0 = not issued or no completion.
+    fn usbnet_ep0_reset(&mut self, slot: u8) -> (u8, u8, u8) {
+        use super::Trb;
+        let ctx = (1u32 << 16) | ((slot as u32) << 24);
+        let st = self.ep_state_of(slot, 1);
+        let stop_cc = match st {
+            1 => self.recover_cmd(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx }).1,
+            2 | 4 => self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx }).1,
+            _ => 0,
+        };
+        if self.ep_state_of(slot, 1) != 3 {
+            return (st, stop_cc, 0);
+        }
+        let deq = match self.slots[slot as usize].ep0_ring.as_ref() {
+            Some(r) => {
+                let (phys, dcs) = r.dequeue_reset_target();
+                phys | (dcs as u64)
+            }
+            None => return (st, stop_cc, 0),
+        };
+        let deq_cc = self.recover_cmd(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx }).1;
+        (st, stop_cc, deq_cc)
+    }
 }
 
 // ── The bulk-IN arm/claim protocol ───────────────────────────────────────────────────────────────
