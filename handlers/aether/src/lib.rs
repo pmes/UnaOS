@@ -590,51 +590,21 @@ impl AetherEngine {
                 self.insert_text(&text);
             }
             api::events::Event::KeyDown(key) => {
-                // A focused text control takes its editing keys first (forms::edit); the page only
-                // scrolls by keyboard when no field holds the keys.
-                if let Some(node) = self.editing_node() {
-                    let multiline = Self::is_textarea(&node);
-                    let mut value = forms::control_value(&node);
-                    let before = value.clone();
-                    match self.edit.key(&mut value, &key, multiline) {
-                        forms::edit::Outcome::Edited => {
-                            if value != before {
-                                js::set_control_value(&node, value);
-                                self.after_edit(&node, true);
-                            } else {
-                                self.after_edit(&node, false);
-                            }
-                            return;
-                        }
-                        forms::edit::Outcome::Moved | forms::edit::Outcome::Consumed => {
-                            self.after_edit(&node, false);
-                            return;
-                        }
-                        forms::edit::Outcome::Submit => {
-                            self.implicit_submission(&node);
-                            return;
-                        }
-                        forms::edit::Outcome::Unhandled => {}
-                    }
-                } else if let Some(node) = self.focused_node.clone() {
-                    // A focused checkbox, radio or button: Space (and Return on a button) activates it.
-                    let (_, k) = forms::edit::parse_key(&key);
-                    let checkable = matches!(
-                        layout::control_kind(&node),
-                        Some(layout::Control::Checkbox | layout::Control::Radio)
-                    );
-                    let button = layout::control_kind(&node) == Some(layout::Control::Button);
-                    if (k == Some(forms::edit::Key::Space) && (checkable || button))
-                        || (k == Some(forms::edit::Key::Return) && button)
-                    {
-                        self.activate(&node, (0, 0));
-                        return;
-                    }
+                // AETHEREVENTS (SR80): UI Events §5.6 — a trusted `keydown` at the focused element runs
+                // first and a canceled one suppresses the default (editing, activation, scrolling); the
+                // `keyup` follows the default.
+                if self.key_event("keydown", &key) {
+                    self.key_default(key.clone());
                 }
-                self.key_scroll(&key);
+                self.key_event("keyup", &key);
             }
             api::events::Event::MouseMove(x, y) => self.pointer_moved(x, y),
-            api::events::Event::MouseDown(x, y) => self.selection_press(x, y),
+            api::events::Event::MouseDown(x, y) => {
+                // AETHEREVENTS (SR80): a trusted `mousedown` first; a canceled one starts no selection.
+                if self.button_event("mousedown", x, y) {
+                    self.selection_press(x, y);
+                }
+            }
             api::events::Event::MouseUp(x, y) => {
                 self.pointer_released(); // AETHERSELECT (SR69): the drag ends before the click is routed
                 css::note_focus_modality(true); // AETHERGEN (SR71): click focus is pointer-modal
@@ -650,6 +620,7 @@ impl AetherEngine {
                 let mut canceled = false;
                 if let Some(js_engine) = &mut self.js_engine {
                     js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+                    js::events::user_button(&mut js_engine.vm, node.id().0, "mouseup", (x, y)); // AETHEREVENTS (SR80)
                     js_engine.click(&node);
                     canceled = js::last_click_canceled();
                     if js::take_mutated() {
@@ -724,6 +695,81 @@ impl AetherEngine {
     }
 
     /// The focused control when it is a text control the user can type into.
+    /// AETHEREVENTS (SR80): fires a trusted `keydown`/`keyup` for the shell key string `key` at the
+    /// focused element (`api::uievents` maps it to key/code/location/keyCode). Returns false when a
+    /// listener canceled it; true when it went unheard or no script runs.
+    fn key_event(&mut self, ty: &str, key: &str) -> bool {
+        let Some(k) = api::uievents::key_init(key) else { return true };
+        let focused = self.focused_node.as_ref().map(|n| n.id().0);
+        let Some(js_engine) = &mut self.js_engine else { return true };
+        js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+        let ok = js::events::user_key(&mut js_engine.vm, focused, ty, &k);
+        if js::take_mutated() {
+            self.relayout();
+        }
+        ok
+    }
+
+    /// AETHEREVENTS (SR80): fires a trusted `mousedown`/`mouseup` at the element under viewport
+    /// (`x`, `y`). Returns false when a listener canceled it.
+    fn button_event(&mut self, ty: &str, x: f64, y: f64) -> bool {
+        let Some(node) = self.hit_test(x, y) else { return true };
+        let Some(js_engine) = &mut self.js_engine else { return true };
+        js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+        let ok = js::events::user_button(&mut js_engine.vm, node.id().0, ty, (x, y));
+        if js::take_mutated() {
+            self.relayout();
+        }
+        ok
+    }
+
+    /// The default action of a key press (the shell's `KeyDown`), when the page's `keydown` did not
+    /// cancel it.
+    fn key_default(&mut self, key: String) {
+        // A focused text control takes its editing keys first (forms::edit); the page only
+        // scrolls by keyboard when no field holds the keys.
+        if let Some(node) = self.editing_node() {
+            let multiline = Self::is_textarea(&node);
+            let mut value = forms::control_value(&node);
+            let before = value.clone();
+            match self.edit.key(&mut value, &key, multiline) {
+                forms::edit::Outcome::Edited => {
+                    if value != before {
+                        js::set_control_value(&node, value);
+                        self.after_edit(&node, true);
+                    } else {
+                        self.after_edit(&node, false);
+                    }
+                    return;
+                }
+                forms::edit::Outcome::Moved | forms::edit::Outcome::Consumed => {
+                    self.after_edit(&node, false);
+                    return;
+                }
+                forms::edit::Outcome::Submit => {
+                    self.implicit_submission(&node);
+                    return;
+                }
+                forms::edit::Outcome::Unhandled => {}
+            }
+        } else if let Some(node) = self.focused_node.clone() {
+            // A focused checkbox, radio or button: Space (and Return on a button) activates it.
+            let (_, k) = forms::edit::parse_key(&key);
+            let checkable = matches!(
+                layout::control_kind(&node),
+                Some(layout::Control::Checkbox | layout::Control::Radio)
+            );
+            let button = layout::control_kind(&node) == Some(layout::Control::Button);
+            if (k == Some(forms::edit::Key::Space) && (checkable || button))
+                || (k == Some(forms::edit::Key::Return) && button)
+            {
+                self.activate(&node, (0, 0));
+                return;
+            }
+        }
+        self.key_scroll(&key);
+    }
+
     fn editing_node(&self) -> Option<crate::dom::NodeRef> {
         self.focused_node.clone().filter(forms::is_text_editable)
     }

@@ -7,5 +7,6 @@ pub mod events;
 pub mod eventsource;
 pub mod fetch;
 pub mod platform;
+pub mod uievents;
 pub mod websockets;
 pub mod xhr;

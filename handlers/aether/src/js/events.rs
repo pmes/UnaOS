@@ -65,8 +65,11 @@ thread_local! {
     static LAST_HR: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
 }
 
+/// Per-page event state: the timestamp floor and any queued details toggle (a new page reuses node
+/// ids).
 pub fn reset_clock() {
     LAST_HR.with(|l| l.set(-1.0));
+    TOGGLE_PENDING.with(|t| t.borrow_mut().clear());
 }
 
 // =================================================================================================
@@ -137,11 +140,34 @@ fn flatten_options(vm: &mut Vm, v: &Value) -> JsResult<(bool, bool, Option<bool>
             let o = dict_member(vm, v, "once")?;
             let p = dict_member(vm, v, "passive")?;
             let sig = dict_member(vm, v, "signal")?;
+            // `signal` is a non-nullable AbortSignal member: a present value of any other type throws
+            // during conversion, before the operation's steps (even with a null callback).
+            if !sig.is_undefined() && !is_abort_signal(vm, &sig)? {
+                return vm.throw_type("Failed to read the 'signal' property from 'AddEventListenerOptions': Failed to convert value to 'AbortSignal'.");
+            }
             let passive = if p.is_undefined() { None } else { Some(vm.to_boolean(&p)) };
             Ok((vm.to_boolean(&c), vm.to_boolean(&o), passive, sig))
         }
         other => Ok((vm.to_boolean(other), false, None, Value::Undefined)),
     }
+}
+
+/// Whether `v` is an AbortSignal (an object whose prototype chain holds `AbortSignal.prototype`; with
+/// no AbortSignal interface installed, any object is accepted).
+fn is_abort_signal(vm: &mut Vm, v: &Value) -> JsResult<bool> {
+    let Value::Object(o) = v else { return Ok(false) };
+    let g = vm.realm().global;
+    let ctor = vm.get(g, &PropertyKey::from_str("AbortSignal"))?;
+    let Value::Object(c) = ctor else { return Ok(true) };
+    let Value::Object(proto) = vm.get(c, &PropertyKey::from_str("prototype"))? else { return Ok(true) };
+    let mut p = vm.heap.get(*o).proto;
+    while let Some(x) = p {
+        if x == proto {
+            return Ok(true);
+        }
+        p = vm.heap.get(x).proto;
+    }
+    Ok(false)
 }
 
 /// DOM "default passive value": touchstart/touchmove/wheel/mousewheel listeners on the Window, the
@@ -362,11 +388,38 @@ fn set_handler(vm: &mut Vm, t: TargetKey, ty: &str, v: Value) {
     }
 }
 
+/// The webkit-prefixed handlers (HTML §8.1.8.2): IDL/content name suffix → event handler event type.
+const PREFIXED_HANDLERS: &[(&str, &str)] = &[
+    ("webkitanimationend", "webkitAnimationEnd"),
+    ("webkitanimationiteration", "webkitAnimationIteration"),
+    ("webkitanimationstart", "webkitAnimationStart"),
+    ("webkittransitionend", "webkitTransitionEnd"),
+];
+
+/// The event handler event type an `on<name>` attribute listens for (the name itself, except the
+/// camel-cased webkit-prefixed types).
+pub fn handler_event_type(name: &str) -> &str {
+    PREFIXED_HANDLERS.iter().find(|(n, _)| *n == name).map(|(_, t)| *t).unwrap_or(name)
+}
+
+/// DOM §2.10 "invoke" step 8: the legacy type a trusted event of type `ty` falls back to when no
+/// listener of its own type is on the object.
+fn legacy_type(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "animationend" => "webkitAnimationEnd",
+        "animationiteration" => "webkitAnimationIteration",
+        "animationstart" => "webkitAnimationStart",
+        "transitionend" => "webkitTransitionEnd",
+        _ => return None,
+    })
+}
+
 /// An `on*` content attribute of `el` was set or removed (attribute change steps).
-pub fn handler_attribute_changed(vm: &mut Vm, el: usize, ty: &str, present: bool) {
+pub fn handler_attribute_changed(vm: &mut Vm, el: usize, name: &str, present: bool) {
+    let ty = handler_event_type(name);
     let t = handler_target(el, ty);
     let v = if present {
-        match dom::attr_value(el, &format!("on{ty}")) {
+        match dom::attr_value(el, &format!("on{name}")) {
             Some(body) => s(&body),
             None => Value::Null,
         }
@@ -391,11 +444,12 @@ pub fn ensure_attr_handlers(vm: &mut Vm, el: usize) {
             })
             .unwrap_or_default()
     });
-    for ty in names {
+    for name in names {
+        let ty = handler_event_type(&name).to_string();
         let t = handler_target(el, &ty);
         let known = page(|p| p.handlers.contains_key(&(t, ty.clone())));
         if !known {
-            handler_attribute_changed(vm, el, &ty, true);
+            handler_attribute_changed(vm, el, &name, true);
         }
     }
 }
@@ -489,6 +543,13 @@ pub fn install_handlers(vm: &mut Vm, o: Obj, names: &[&str]) {
     for n in names {
         idl::attr_with(vm, o, &format!("on{n}"), handler_get, Some(handler_set), s(n));
     }
+    // GlobalEventHandlers also carries the webkit-prefixed animation/transition handlers, whose event
+    // type is the camel-cased prefixed name (`onwebkitanimationend` listens for `webkitAnimationEnd`).
+    if names.contains(&"animationend") {
+        for (n, ty) in PREFIXED_HANDLERS {
+            idl::attr_with(vm, o, &format!("on{n}"), handler_get, Some(handler_set), s(ty));
+        }
+    }
 }
 
 // =================================================================================================
@@ -537,11 +598,13 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
             _ => {}
         }
     }
-    // DOM §2.9 steps 5.4/5.9.5: a MouseEvent `click` has an activation target — the target or the
-    // nearest inclusive ancestor with activation behavior — whose legacy-pre-activation behavior runs
-    // before the listeners and whose activation (or legacy-canceled-activation) behavior runs after.
+    // DOM §2.9 steps 5.5/5.9.6: a MouseEvent `click` has an activation target — the target when it
+    // has activation behavior, else (only while the event bubbles) the nearest ancestor that does —
+    // whose legacy-pre-activation behavior runs before the listeners and whose activation (or
+    // legacy-canceled-activation) behavior runs after.
     let activation = if ty == "click" && is_mouse_event(vm, e) {
-        path.iter().find_map(|k| match k {
+        let bubbles = flags(vm, e) & F_BUBBLES != 0;
+        path.iter().take(if bubbles { path.len() } else { 1 }).find_map(|k| match k {
             TargetKey::Node(n) if has_activation_behavior(*n) => Some(*n),
             _ => None,
         })
@@ -587,15 +650,7 @@ pub fn dispatch(vm: &mut Vm, e: Obj, t: TargetKey) -> (bool, bool) {
 }
 
 fn is_mouse_event(vm: &Vm, e: Obj) -> bool {
-    let Some(mp) = dom::iface("MouseEvent").map(|i| i.proto) else { return false };
-    let mut p = vm.heap.get(e).proto;
-    while let Some(o) = p {
-        if o == mp {
-            return true;
-        }
-        p = vm.heap.get(o).proto;
-    }
-    false
+    is_iface(vm, e, "MouseEvent")
 }
 
 fn html_tag(n: usize) -> Option<String> {
@@ -699,7 +754,8 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
             }
             "submit" | "image" => {
                 if !super::controls::disabled(a) {
-                    if let Some(f) = super::controls::form_owner(a) {
+                    // HTML form submission step 1: a form that is not connected cannot navigate.
+                    if let Some(f) = super::controls::form_owner(a).filter(|f| dom::is_connected(*f)) {
                         super::controls::submit_form(vm, f, Some(a));
                     }
                 }
@@ -722,26 +778,30 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
                 match ty.as_str() {
                     "reset" => super::controls::reset_form(vm, f),
                     "button" => {}
+                    _ if !dom::is_connected(f) => {}
                     _ => super::controls::submit_form(vm, f, Some(a)),
                 }
             }
         }
         "a" | "area" => {
-            // A user's click follows the link in the shell; a script-dispatched click navigates here
-            // (fragment navigations stay in the document).
-            if !trusted {
-                if let Some(href) = dom::attr_value(a, "href") {
-                    let _ = super::window::navigate_from_link(vm, &href);
+            // A user's click follows an ordinary link in the shell; a script-dispatched click
+            // navigates here (fragment navigations stay in the document). A `javascript:` URL is
+            // evaluated by the page either way (the shell cannot run it).
+            if let Some(href) = dom::attr_value(a, "href") {
+                if javascript_url_source(&href).is_some() || !trusted {
+                    follow_hyperlink(vm, &href);
                 }
             }
         }
         "summary" => {
             let Some(d) = parent_of(a) else { return };
-            if dom::attr_value(d, "open").is_some() {
+            let was_open = dom::attr_value(d, "open").is_some();
+            if was_open {
                 dom::remove_attr(vm, d, "open");
             } else {
                 dom::set_attr(vm, d, "open", "");
             }
+            queue_details_toggle(vm, d, was_open);
         }
         "label" => {
             let control = dom::with_doc(|d| super::controls::label_control_in(d, a));
@@ -774,32 +834,128 @@ fn fire_bubbling_composed(vm: &mut Vm, n: usize, ty: &str) {
     unroot(vm, r);
 }
 
-/// DOM "invoke" + "inner invoke" for one path entry and phase (`capturing` = the capture pass).
+/// The script of a `javascript:` URL (HTML §7.4.2.3.3 "evaluate a javascript: URL": the URL after
+/// the scheme, percent-decoded), or `None` for any other URL.
+fn javascript_url_source(href: &str) -> Option<String> {
+    let t = href.trim_matches(|c: char| c.is_ascii_whitespace() || c.is_ascii_control());
+    if t.len() < 11 || !t[..11].eq_ignore_ascii_case("javascript:") {
+        return None;
+    }
+    let raw = t[11..].as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(raw[i + 1]), hex(raw[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// HTML "follow the hyperlink": a `javascript:` URL queues a task (navigation and traversal task
+/// source) that runs its script as a classic script; any other URL navigates.
+fn follow_hyperlink(vm: &mut Vm, href: &str) {
+    match javascript_url_source(href) {
+        Some(src) => {
+            let fp = vm.intr().function_proto;
+            let f = vm.make_native_with("", 0, run_javascript_url, false, Some(fp), vec![s(&src)]);
+            let r = root(vm, Value::Object(f));
+            page(|p| p.tasks.push_back(super::Task::Callback(r)));
+        }
+        None => {
+            let _ = super::window::navigate_from_link(vm, href);
+        }
+    }
+}
+
+fn run_javascript_url(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    if let Value::String(src) = vm.native_slot(ctx.callee, 0) {
+        let _ = super::run_classic(vm, &src.to_rust(), "javascript-url");
+    }
+    Ok(Value::Undefined)
+}
+
+thread_local! {
+    /// Details elements with a toggle task queued, and the old state that task reports.
+    static TOGGLE_PENDING: std::cell::RefCell<std::collections::HashMap<usize, bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// HTML §4.11.1 "queue a details toggle event task": a pending task for `d` keeps its oldState (the
+/// new state is read when it runs); otherwise a task is queued that fires a ToggleEvent at `d`.
+fn queue_details_toggle(vm: &mut Vm, d: usize, was_open: bool) {
+    let pending = TOGGLE_PENDING.with(|t| t.borrow().contains_key(&d));
+    if pending {
+        return;
+    }
+    TOGGLE_PENDING.with(|t| t.borrow_mut().insert(d, was_open));
+    let dv = wrap(vm, d);
+    let fp = vm.intr().function_proto;
+    let f = vm.make_native_with("", 0, fire_details_toggle, false, Some(fp), vec![dv]);
+    let r = root(vm, Value::Object(f));
+    page(|p| p.tasks.push_back(super::Task::Callback(r)));
+}
+
+fn fire_details_toggle(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let dv = vm.native_slot(ctx.callee, 0);
+    let Some(d) = node_of(vm, &dv) else { return Ok(Value::Undefined) };
+    let Some(was_open) = TOGGLE_PENDING.with(|t| t.borrow_mut().remove(&d)) else { return Ok(Value::Undefined) };
+    let is_open = dom::attr_value(d, "open").is_some();
+    let state = |o: bool| s(if o { "open" } else { "closed" });
+    let init = vm.new_plain_object();
+    vm.create_data_property(init, PropertyKey::from_str("oldState"), state(was_open))?;
+    vm.create_data_property(init, PropertyKey::from_str("newState"), state(is_open))?;
+    let e = new_event(vm, "ToggleEvent", "toggle", false, false, Some(init));
+    let r = root(vm, Value::Object(e));
+    dispatch(vm, e, TargetKey::Node(d));
+    unroot(vm, r);
+    Ok(Value::Undefined)
+}
+
+/// DOM "invoke" for one path entry and phase (`capturing` = the capture pass): sets currentTarget,
+/// runs "inner invoke", and — step 8 — for a trusted animation/transition event that found no listener
+/// of its own type on this object, the webkit-prefixed listeners with the type swapped and restored.
+/// Returns whether any listener or handler ran.
 fn invoke_listeners(vm: &mut Vm, e: Obj, t: TargetKey, ty: &str, capturing: bool) -> bool {
     if flags(vm, e) & F_STOP != 0 {
         return false;
     }
     let cur = target_value(vm, t);
     set_slot(vm, e, E_CURRENT, cur.clone());
+    let (found, mut ran) = inner_invoke(vm, e, t, ty, capturing, &cur);
+    if !found && flags(vm, e) & F_TRUSTED != 0 {
+        if let Some(legacy) = legacy_type(ty) {
+            let original = slot(vm, e, E_TYPE);
+            set_slot(vm, e, E_TYPE, s(legacy));
+            ran |= inner_invoke(vm, e, t, legacy, capturing, &cur).1;
+            set_slot(vm, e, E_TYPE, original);
+        }
+    }
+    ran
+}
+
+/// DOM "inner invoke" over a clone of `t`'s listener list. Returns (found: a live listener of type
+/// `ty` is on the object, whatever its phase; ran: one was called).
+fn inner_invoke(vm: &mut Vm, e: Obj, t: TargetKey, ty: &str, capturing: bool, cur: &Value) -> (bool, bool) {
     let listeners: Vec<Listener> = page(|p| p.listeners.get(&t).cloned().unwrap_or_default());
+    let mut found = false;
     let mut ran = false;
     for l in listeners {
-        if l.ty != ty {
-            continue;
-        }
         // Skip what was removed by an earlier listener of this dispatch.
         let live = page(|p| p.listeners.get(&t).is_some_and(|ls| ls.iter().any(|x| x.serial == l.serial && !x.removed)));
-        if !live {
+        if !live || l.ty != ty {
             continue;
         }
-        let phase = slot_num(vm, e, E_PHASE);
-        if capturing && !l.capture {
+        found = true;
+        if capturing != l.capture {
             continue;
         }
-        if !capturing && l.capture {
-            continue;
-        }
-        let _ = phase;
         if l.once {
             let r = l.callback;
             page(|p| {
@@ -809,25 +965,25 @@ fn invoke_listeners(vm: &mut Vm, e: Obj, t: TargetKey, ty: &str, capturing: bool
             });
             // keep the callback alive for this call; unroot after
             let cb = idl::rooted(vm, r);
-            call_listener(vm, e, &cur, &cb, l.passive, t, ty, false);
+            call_listener(vm, e, cur, &cb, l.passive, t, ty, false);
             unroot(vm, r);
             ran = true;
         } else if l.handler {
             let h = handler_value(vm, t, ty);
             if vm.is_callable(&h) {
-                call_listener(vm, e, &cur, &h, l.passive, t, ty, true);
+                call_listener(vm, e, cur, &h, l.passive, t, ty, true);
                 ran = true;
             }
         } else {
             let cb = idl::rooted(vm, l.callback);
-            call_listener(vm, e, &cur, &cb, l.passive, t, ty, false);
+            call_listener(vm, e, cur, &cb, l.passive, t, ty, false);
             ran = true;
         }
         if flags(vm, e) & F_STOP_IMMEDIATE != 0 {
             break;
         }
     }
-    ran
+    (found, ran)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -880,12 +1036,45 @@ fn call_listener_inner(vm: &mut Vm, e: Obj, this: &Value, cb: &Value, passive: b
     // true return does.
     if is_handler {
         if let Some(r) = result {
+            if ty == "beforeunload" && is_iface(vm, e, "BeforeUnloadEvent") {
+                // A BeforeUnloadEvent: a non-null (DOMString?) return value sets the canceled flag
+                // and fills an empty returnValue.
+                if !r.is_nullish() {
+                    set_flag(vm, e, F_CANCELED, true);
+                    if let Value::Object(init) = slot(vm, e, E_INIT) {
+                        let key = PropertyKey::from_str("returnValue");
+                        let empty = match vm.get(init, &key) {
+                            Ok(Value::String(v)) => v.to_rust().is_empty(),
+                            _ => true,
+                        };
+                        if empty {
+                            if let Some(Ok(sv)) = super::enter(vm, "beforeunload-return", |vm| vm.to_string(&r)) {
+                                let _ = vm.create_data_property(init, key, Value::String(sv));
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             let cancel = if t == TargetKey::Window && ty == "error" { matches!(r, Value::Bool(true)) } else { matches!(r, Value::Bool(false)) };
             if cancel {
                 cancel_event(vm, e);
             }
         }
     }
+}
+
+/// Whether `e`'s prototype chain holds interface `name`'s prototype.
+fn is_iface(vm: &Vm, e: Obj, name: &str) -> bool {
+    let Some(ip) = dom::iface(name).map(|i| i.proto) else { return false };
+    let mut p = vm.heap.get(e).proto;
+    while let Some(o) = p {
+        if o == ip {
+            return true;
+        }
+        p = vm.heap.get(o).proto;
+    }
+    false
 }
 
 fn cancel_event(vm: &mut Vm, e: Obj) {
@@ -985,6 +1174,65 @@ pub fn user_mouse(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64), related: 
     ran
 }
 
+/// A trusted `mousedown`/`mouseup` at the element under the pointer (UI Events §5.3.3: bubbles,
+/// cancelable, composed; the primary button, `buttons` the state after the transition, `detail` 1).
+/// A text-node hit is retargeted to its parent element. Returns false when a listener canceled it.
+pub fn user_button(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64)) -> bool {
+    if super::engine_poisoned() {
+        return true;
+    }
+    let n = if dom::kind(n) == dom::NK::Element { n } else { parent_of(n).unwrap_or(n) };
+    let init = vm.new_plain_object();
+    let ri = root(vm, Value::Object(init));
+    let buttons = if ty == "mousedown" { 1.0 } else { 0.0 };
+    let g = Value::Object(vm.realm().global);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("view"), g);
+    for (k, v) in [("clientX", client.0), ("clientY", client.1), ("screenX", client.0), ("screenY", client.1), ("button", 0.0), ("buttons", buttons), ("detail", 1.0)] {
+        let _ = vm.create_data_property(init, PropertyKey::from_str(k), num(v));
+    }
+    let e = new_event(vm, "MouseEvent", ty, true, true, Some(init));
+    set_flag(vm, e, F_COMPOSED, true);
+    let r = root(vm, Value::Object(e));
+    let (ok, _) = dispatch(vm, e, TargetKey::Node(n));
+    unroot(vm, r);
+    unroot(vm, ri);
+    ok
+}
+
+/// A trusted `keydown`/`keyup` (UI Events §5.6: a KeyboardEvent that bubbles, is cancelable and
+/// composed) at `focused`, else the body, else the document element, else the document. The members
+/// come from the shell's key string (`crate::api::uievents::key_init`). Returns false when a listener
+/// canceled it.
+pub fn user_key(vm: &mut Vm, focused: Option<usize>, ty: &str, k: &crate::api::uievents::KeyInit) -> bool {
+    if super::engine_poisoned() {
+        return true;
+    }
+    let d = dom::main_doc();
+    let t = focused.or_else(|| dom::body_of(d)).or_else(|| dom::document_element_of(d)).unwrap_or(d);
+    let init = vm.new_plain_object();
+    let ri = root(vm, Value::Object(init));
+    let g = Value::Object(vm.realm().global);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("view"), g);
+    let _ = vm.create_data_property(init, PropertyKey::from_str("key"), s(&k.key));
+    let _ = vm.create_data_property(init, PropertyKey::from_str("code"), s(&k.code));
+    for (m, v) in [("location", k.location as f64), ("keyCode", k.key_code as f64), ("which", k.key_code as f64), ("charCode", 0.0), ("detail", 0.0)] {
+        let _ = vm.create_data_property(init, PropertyKey::from_str(m), num(v));
+    }
+    for (m, v) in [("ctrlKey", k.ctrl), ("shiftKey", k.shift), ("altKey", k.alt), ("metaKey", k.meta), ("repeat", false), ("isComposing", false)] {
+        let _ = vm.create_data_property(init, PropertyKey::from_str(m), Value::Bool(v));
+    }
+    for m in crate::api::uievents::MODIFIER_MEMBERS {
+        let _ = vm.create_data_property(init, PropertyKey::from_str(m), Value::Bool(false));
+    }
+    let e = new_event(vm, "KeyboardEvent", ty, true, true, Some(init));
+    set_flag(vm, e, F_COMPOSED, true);
+    let r = root(vm, Value::Object(e));
+    let (ok, _) = dispatch(vm, e, TargetKey::Node(t));
+    unroot(vm, r);
+    unroot(vm, ri);
+    ok
+}
+
 /// Fires `click` at `n` with the checkbox/radio legacy-pre-activation behavior and the `input`/`change`
 /// events that follow (HTML §4.10.5.1.15/16). Returns (not canceled, ran).
 fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
@@ -1070,6 +1318,23 @@ fn convert_member(vm: &mut Vm, v: Value, kind: char) -> JsResult<Value> {
                 Value::String(vm.to_string(&v)?)
             }
         }
+        // DOMString? (null and undefined stay null)
+        'S' => {
+            if v.is_nullish() {
+                Value::Null
+            } else {
+                Value::String(vm.to_string(&v)?)
+            }
+        }
+        // sequence<…> defaulting to the empty list
+        'L' => {
+            if v.is_undefined() {
+                Value::Object(vm.new_array(Vec::new()))
+            } else {
+                let list = vm.array_to_list(&v);
+                Value::Object(vm.new_array(list))
+            }
+        }
         'o' => {
             if v.is_undefined() {
                 Value::Null
@@ -1136,7 +1401,17 @@ fn members(iface: &str) -> &'static [(&'static str, char)] {
             ("keyCode", 'l'),
         ],
         "FocusEvent" => &[("relatedTarget", 'o')],
-        "InputEvent" => &[("data", 'a'), ("inputType", 's'), ("isComposing", 'b')],
+        "InputEvent" => &[("data", 'S'), ("dataTransfer", 'o'), ("inputType", 's'), ("isComposing", 'b')],
+        "TouchEvent" => &[
+            ("touches", 'L'),
+            ("targetTouches", 'L'),
+            ("changedTouches", 'L'),
+            ("altKey", 'b'),
+            ("metaKey", 'b'),
+            ("ctrlKey", 'b'),
+            ("shiftKey", 'b'),
+        ],
+        "ToggleEvent" => &[("oldState", 's'), ("newState", 's')],
         "ErrorEvent" => &[("message", 's'), ("filename", 's'), ("lineno", 'l'), ("colno", 'l'), ("error", 'a')],
         "PromiseRejectionEvent" => &[("promise", 'a'), ("reason", 'a')],
         "PopStateEvent" => &[("state", 'a')],
@@ -1157,8 +1432,8 @@ fn parent_event(iface: &str) -> Option<&'static str> {
     Some(match iface {
         "UIEvent" | "CustomEvent" | "ErrorEvent" | "PromiseRejectionEvent" | "PopStateEvent" | "HashChangeEvent"
         | "ProgressEvent" | "MessageEvent" | "PageTransitionEvent" | "SubmitEvent" | "AnimationEvent"
-        | "TransitionEvent" | "StorageEvent" | "CloseEvent" => "Event",
-        "MouseEvent" | "KeyboardEvent" | "FocusEvent" | "InputEvent" | "CompositionEvent" => "UIEvent",
+        | "TransitionEvent" | "StorageEvent" | "CloseEvent" | "ToggleEvent" | "BeforeUnloadEvent" => "Event",
+        "MouseEvent" | "KeyboardEvent" | "FocusEvent" | "InputEvent" | "CompositionEvent" | "TouchEvent" => "UIEvent",
         "WheelEvent" | "PointerEvent" | "DragEvent" => "MouseEvent",
         _ => return None,
     })
@@ -1202,6 +1477,14 @@ fn event_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             }
             let cv = convert_member(vm, v, *k)?;
             vm.create_data_property(init, PropertyKey::from_str(m), cv)?;
+        }
+        // EventModifierInit's dictionary-only modifier* members (UI Events §3.6.4).
+        if matches!(i.as_str(), "MouseEvent" | "KeyboardEvent" | "TouchEvent") {
+            for m in crate::api::uievents::MODIFIER_MEMBERS {
+                let v = dict_member(vm, &dict, m)?;
+                let b = Value::Bool(vm.to_boolean(&v));
+                vm.create_data_property(init, PropertyKey::from_str(m), b)?;
+            }
         }
     }
     let default = dom::iface(&iface).unwrap().proto;
@@ -1373,6 +1656,7 @@ fn ev_init_legacy(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             ("shiftKey", 'b'),
             ("metaKey", 'b'),
         ],
+        "initCompositionEvent" => &[("view", 'o'), ("data", 's')],
         _ => &[("view", 'o'), ("detail", 'l')],
     };
     let init = match slot(vm, e, E_INIT) {
@@ -1410,7 +1694,7 @@ fn ev_member(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn default_member(name: &str) -> Value {
     match name {
         "message" | "filename" | "inputType" | "code" | "oldURL" | "newURL" | "origin" | "lastEventId"
-        | "animationName" | "propertyName" | "pseudoElement" | "url" | "key" => s(""),
+        | "animationName" | "propertyName" | "pseudoElement" | "url" | "key" | "oldState" | "newState" => s(""),
         "lineno" | "colno" | "button" | "buttons" | "location" | "charCode" | "keyCode" | "which" | "screenX"
         | "screenY" | "clientX" | "clientY" | "movementX" | "movementY" | "loaded" | "total" | "elapsedTime" | "deltaX"
         | "deltaY" | "deltaZ" | "deltaMode" | "pointerId" | "pressure" | "tangentialPressure" | "tiltX" | "tiltY"
@@ -1426,12 +1710,10 @@ fn default_member(name: &str) -> Value {
 fn ev_get_modifier_state(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let e = this_event(vm, ctx)?;
     let k = string(vm, &arg(vm, ctx, 0))?;
-    let m = match k.as_str() {
-        "Control" => "ctrlKey",
-        "Shift" => "shiftKey",
-        "Alt" => "altKey",
-        "Meta" => "metaKey",
-        _ => return Ok(Value::Bool(false)),
+    // UI Events §3.6.3 / §5.6.2: the modifier key names, "Accel" being Control on this platform.
+    let k = if k == "Accel" { "Control".to_string() } else { k };
+    let Some(m) = crate::api::uievents::MODIFIERS.iter().find(|(n, _)| *n == k).map(|(_, m)| *m) else {
+        return Ok(Value::Bool(false));
     };
     match slot(vm, e, E_INIT) {
         Value::Object(o) => {
@@ -1457,8 +1739,11 @@ pub fn create_event(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         "messageevent" => "MessageEvent",
         "storageevent" => "StorageEvent",
         "errorevent" => "ErrorEvent",
-        "compositionevent" | "textevent" | "touchevent" | "dragevent" | "beforeunloadevent" | "devicemotionevent"
-        | "deviceorientationevent" => "Event",
+        "compositionevent" => "CompositionEvent",
+        "touchevent" => "TouchEvent",
+        "dragevent" => "DragEvent",
+        "beforeunloadevent" => "BeforeUnloadEvent",
+        "textevent" | "devicemotionevent" | "deviceorientationevent" => "Event",
         _ => return throw_dom(vm, "NotSupportedError", &format!("The provided event type ('{name}') is invalid.")),
     };
     let p = dom::iface(iface).unwrap().proto;
@@ -1580,6 +1865,8 @@ pub fn install(vm: &mut Vm) {
         "TransitionEvent",
         "StorageEvent",
         "CloseEvent",
+        "TouchEvent",
+        "ToggleEvent",
     ] {
         let parent = dom::iface(parent_event(name).unwrap()).unwrap();
         let i = interface(vm, name, Some(parent), None);
@@ -1598,10 +1885,19 @@ pub fn install(vm: &mut Vm) {
                 konst(vm, i, n, v);
             }
         }
+        if name == "KeyboardEvent" {
+            for (n, v) in [("DOM_KEY_LOCATION_STANDARD", 0.0), ("DOM_KEY_LOCATION_LEFT", 1.0), ("DOM_KEY_LOCATION_RIGHT", 2.0), ("DOM_KEY_LOCATION_NUMPAD", 3.0)] {
+                konst(vm, i, n, v);
+            }
+        }
+        if name == "InputEvent" {
+            op(vm, i.proto, "getTargetRanges", 0, ev_empty_list);
+        }
         let legacy_init = match name {
             "UIEvent" => Some(("initUIEvent", 1)),
             "MouseEvent" => Some(("initMouseEvent", 1)),
             "KeyboardEvent" => Some(("initKeyboardEvent", 1)),
+            "CompositionEvent" => Some(("initCompositionEvent", 1)),
             _ => None,
         };
         if let Some((m, len)) = legacy_init {
@@ -1610,12 +1906,98 @@ pub fn install(vm: &mut Vm) {
         if matches!(name, "MouseEvent" | "KeyboardEvent") {
             op(vm, i.proto, "getModifierState", 1, ev_get_modifier_state);
             if name == "MouseEvent" {
-                for alias in [("pageX", "clientX"), ("pageY", "clientY"), ("x", "clientX"), ("y", "clientY"), ("offsetX", "clientX"), ("offsetY", "clientY")] {
+                for alias in [("x", "clientX"), ("y", "clientY")] {
                     idl::attr_with(vm, i.proto, alias.0, ev_member, None, s(alias.1));
+                }
+                // CSSOM View §10: pageX/Y add the scroll offset; offsetX/Y are target-relative while
+                // the event is being dispatched.
+                for (n, axis) in [("pageX", "x"), ("pageY", "y")] {
+                    idl::attr_with(vm, i.proto, n, ev_page, None, s(axis));
+                }
+                for (n, axis) in [("offsetX", "x"), ("offsetY", "y")] {
+                    idl::attr_with(vm, i.proto, n, ev_offset, None, s(axis));
                 }
             }
         }
     }
+
+    // BeforeUnloadEvent (HTML §7.1.6): no constructor; its returnValue is a DOMString.
+    let bu = interface(vm, "BeforeUnloadEvent", Some(ev), None);
+    dom::register_iface("BeforeUnloadEvent", bu);
+    attr(vm, bu.proto, "returnValue", ev_unload_return_get, Some(ev_unload_return_set));
+}
+
+fn ev_empty_list(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    this_event(vm, ctx)?;
+    Ok(Value::Object(vm.new_array(Vec::new())))
+}
+
+fn ev_unload_return_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let e = this_event(vm, ctx)?;
+    match slot(vm, e, E_INIT) {
+        Value::Object(o) => match vm.get(o, &PropertyKey::from_str("returnValue"))? {
+            v @ Value::String(_) => Ok(v),
+            _ => Ok(s("")),
+        },
+        _ => Ok(s("")),
+    }
+}
+
+fn ev_unload_return_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let e = this_event(vm, ctx)?;
+    let v = Value::String(vm.to_string(&arg(vm, ctx, 0))?);
+    let init = match slot(vm, e, E_INIT) {
+        Value::Object(o) => o,
+        _ => {
+            let o = vm.new_plain_object();
+            set_slot(vm, e, E_INIT, Value::Object(o));
+            o
+        }
+    };
+    vm.create_data_property(init, PropertyKey::from_str("returnValue"), v)?;
+    Ok(Value::Undefined)
+}
+
+/// The initialized `clientX`/`clientY` of a mouse event (`axis` "x" or "y").
+fn client_coord(vm: &mut Vm, e: Obj, axis: &str) -> JsResult<f64> {
+    let name = if axis == "x" { "clientX" } else { "clientY" };
+    match slot(vm, e, E_INIT) {
+        Value::Object(o) => {
+            let v = vm.get(o, &PropertyKey::from_str(name))?;
+            if v.is_undefined() {
+                Ok(0.0)
+            } else {
+                vm.to_number(&v)
+            }
+        }
+        _ => Ok(0.0),
+    }
+}
+
+fn ev_page(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let e = this_event(vm, ctx)?;
+    let axis = callee_str(vm, ctx);
+    let c = client_coord(vm, e, &axis)?;
+    let (sx, sy) = page(|p| p.scroll);
+    Ok(num(c + if axis == "x" { sx } else { sy }))
+}
+
+/// `offsetX/Y`: while the dispatch flag is set and the target is an element with a box, the client
+/// coordinate relative to that box's origin; otherwise the page coordinate.
+fn ev_offset(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let e = this_event(vm, ctx)?;
+    let axis = callee_str(vm, ctx);
+    let c = client_coord(vm, e, &axis)?;
+    if flags(vm, e) & F_DISPATCH != 0 {
+        let tv = slot(vm, e, E_TARGET);
+        if let Some(n) = node_of(vm, &tv).filter(|n| dom::kind(*n) == dom::NK::Element) {
+            if let Some(r) = super::cssom::client_rects(n).first() {
+                return Ok(num(c - if axis == "x" { r.0 } else { r.1 }));
+            }
+        }
+    }
+    let (sx, sy) = page(|p| p.scroll);
+    Ok(num(c + if axis == "x" { sx } else { sy }))
 }
 
 /// Points the global binding, `prototype` and `constructor` links at constructor `c`.
