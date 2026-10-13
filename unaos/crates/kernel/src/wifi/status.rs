@@ -114,3 +114,23 @@ pub fn phy_reset_token() -> &'static str {
         _ => if cfg!(feature = "wifi4") { "not-run" } else { "off" },
     }
 }
+
+// ── WIFI9 (B625): S5i (the HT-PHY re-init read back whole), S5c (the tune read back), S6 (beacons) this boot. ──
+#[cfg(feature = "wifi9")]
+static W9_REINIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "wifi9")]
+static W9_TUNE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "wifi9")]
+static W9_BEACONS: AtomicU32 = AtomicU32::new(u32::MAX);
+/// `reinit`/`tune`: 0 not run, 1 full match, 2 partial. `beacons`: decoded in the 5 s window.
+#[cfg(feature = "wifi9")]
+pub fn set_wifi9(reinit: u8, tune: u8, beacons: Option<u32>) {
+    W9_REINIT.store(reinit, Ordering::Relaxed);
+    W9_TUNE.store(tune, Ordering::Relaxed);
+    W9_BEACONS.store(beacons.unwrap_or(u32::MAX), Ordering::Relaxed);
+}
+#[cfg(feature = "wifi9")]
+pub fn wifi9() -> (u8, u8, Option<u32>) {
+    let b = W9_BEACONS.load(Ordering::Relaxed);
+    (W9_REINIT.load(Ordering::Relaxed), W9_TUNE.load(Ordering::Relaxed), if b == u32::MAX { None } else { Some(b) })
+}

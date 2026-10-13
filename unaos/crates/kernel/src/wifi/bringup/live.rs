@@ -269,3 +269,22 @@ pub(in crate::wifi) fn watch() -> (Option<u32>, Option<u32>) {
     }
     (rev, Some(n))
 }
+
+/// WIFI9 (B625): the d11 handle for the receive-only rungs (`htphyinit.rs`, `rx.rs`) — latched only on a
+/// boot whose ucode was seen EXECUTING — with BOTH window selectors re-read live: cfg:0x80 on the d11
+/// core (as `watch` checks) and cfg:0xAC on its wrapper (the IOCTL/IOST the rungs use). `None` = refuse.
+#[cfg(feature = "wifi9")]
+pub(super) fn handle() -> Result<(u64, u8, u8, u8), String> {
+    let bar0 = BAR0.load(Ordering::Relaxed);
+    if bar0 == 0 {
+        return Err(String::from("no-executing-ucode-this-boot"));
+    }
+    let bdf = BDF.load(Ordering::Relaxed);
+    let (bus, dev, func) = ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8);
+    let win = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win2 = unsafe { read_config_32(bus, dev, func, super::CFG_BAR0_WIN2) };
+    if win != D11_BASE.load(Ordering::Relaxed) || win2 as u64 != super::EXPECT_D11_MWRAP {
+        return Err(alloc::format!("window-not-on-d11 cfg80={:#010x} cfgac={:#010x}", win, win2));
+    }
+    Ok((bar0, bus, dev, func))
+}

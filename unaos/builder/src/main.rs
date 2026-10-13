@@ -680,6 +680,8 @@ fn main() {
     if std::env::var("UNAOS_WIFI4").is_ok() { feats.push("wifi4"); }
     // WIFI-5 (WIFI6, B439): the S4i MMIO unwind of a failed S5i step. Implies wifi3; x86_64-only.
     if std::env::var("UNAOS_WIFI5").is_ok() { feats.push("wifi5"); }
+    // WIFI-9 (B625, R110): the receive-only S5i/S5c/S6 rungs under `tests wifi`. Implies wifi4; x86_64-only.
+    if std::env::var("UNAOS_WIFI9").is_ok() { feats.push("wifi9"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the

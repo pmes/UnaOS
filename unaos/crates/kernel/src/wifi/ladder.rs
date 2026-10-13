@@ -65,7 +65,7 @@ pub fn witness() {
         let st = if *id == "F" && staged >= 3 { St::Confirmed } else { *st };
         // WIFI6 (B439): S2r is the second live row — this boot's SPROM read, PLAUSIBLE on all three
         // corroboration terms (rev 8..11, board == PCI ssid device, unicast MAC).
-        let st = if *id == "S2r" && status::sprom_token() == "ok" { St::Confirmed } else { st };
+        let st = if *id == "S2r" && status::sprom_token() == "ok" { St::Confirmed } else { st }; #[cfg(feature = "wifi9")] let st = wifi9_row(id, st); // WIFI9 (B625): S5r/S5i/S5c/S6 measured live this boot (LINE-NEUTRAL append, before this comment)
         match st {
             St::Confirmed => c += 1,
             St::Refuted => r += 1,
@@ -108,4 +108,20 @@ pub fn witness() {
         ":: WIFI6: rungs={} confirmed={} refuted={} open={} parked={} sprom={} c2_bound={:#x} unwind={} ::",
         LEDGER.len(), c, r, o, p, status::sprom_token(), status::c2_bound(), status::unwind_token()
     );
+}
+
+/// WIFI9 (B625): the four rows this boot measures under `wifi9` — S5r (WIFI8's reset: `phy_reset=done`),
+/// S5i (the HT-PHY re-init read back whole, 2294/2294), S5c (the channel-11 tune read back MATCH), S6
+/// (at least one beacon decoded in the 5 s window). Anything short of that leaves the row as the table has it.
+#[cfg(feature = "wifi9")]
+fn wifi9_row(id: &str, st: St) -> St {
+    let (reinit, tune, beacons) = status::wifi9();
+    let live = match id {
+        "S5r" => status::phy_reset_token() == "done",
+        "S5i" => reinit == 1,
+        "S5c" => tune == 1,
+        "S6" => matches!(beacons, Some(n) if n > 0),
+        _ => false,
+    };
+    if live { St::Confirmed } else { st }
 }

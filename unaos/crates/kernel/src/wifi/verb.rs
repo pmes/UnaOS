@@ -118,7 +118,7 @@ fn join(ssid: Option<&str>, console: &mut Console) {
 /// `tests wifi` — the fixture. One verdict line in the brief's shape.
 pub fn selftest() {
     // WIFI5 (B415): the ladder's state as a line, before the WIFI1 verdict (which returns early).
-    super::ladder::witness();
+    #[cfg(feature = "wifi9")] super::bringup::wifi9(); super::ladder::witness(); // WIFI9 (B625): S5i/S5c/S6 run first, so WIFI5's live rows and WIFI1's scan= read this boot's verdicts (LINE-NEUTRAL append, before this comment)
     let present = radio_present();
     let ucode = if status::ucode_ok() { "ok" } else { "refused" };
     let d11 = if status::d11_up() { "up" } else { "down" };
