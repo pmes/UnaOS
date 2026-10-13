@@ -18,6 +18,8 @@
 //! | [`ps`]            | 7.3.2 SPS / PPS (+ VUI E.1), scaling lists, 7.3.3 slice header       |
 //! | [`picture`]       | decoded frames, motion field, per-macroblock neighbour facts         |
 //! | [`mb`]            | 7.3.5 macroblock layer, 9.3.3.1 CABAC contexts, 9.2.1 nC             |
+//! | [`transform`]     | 8.5 scaling, 4x4 / 8x8 inverse transforms, luma / chroma DC          |
+//! | [`intra`]         | 8.3 Intra_4x4, Intra_8x8 (+ reference filtering), Intra_16x16, chroma |
 //! | [`tables`]        | generated constant tables (tools/gen_tables.py)                      |
 
 #![no_std]
@@ -34,11 +36,13 @@ extern crate std;
 pub mod bits;
 pub mod cabac;
 pub mod cavlc;
+pub mod intra;
 pub mod mb;
 pub mod nal;
 pub mod picture;
 pub mod ps;
 pub mod tables;
+pub mod transform;
 
 /// Every way a decode can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
