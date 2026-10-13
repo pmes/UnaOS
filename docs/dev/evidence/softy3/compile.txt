@@ -1,0 +1,12 @@
+SOFTY3 (rmbp-ledger B651) — the arc's one compile, exec-rmbp-softy3, parent 8da376cb.
+
+cd unaos/crates/kernel && CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/root/unaos-bench/scratch/cloud/wave34/target cargo +nightly check -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec --target ../../x86_64-unknown-none.json --features "$(cat /root/unaos-bench/scratch/cloud/wave34/kfeats24.txt),stria,gen7r9,wifi9,usbnet,wifi10"
+
+features: witness,selfhost,logts,wcg-paygo,wcdvalve,quarry,facet,ehcihid,kbdwit,smc,sdwrite,sdw,sdhcblk,ahci,unafs,hda,hda-tone,usbnet,wifi,wifi2,wifi3,wifi4,bt,btc,login,nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-ce,beam,wc,noaspm,nvidia-kepler-vblank,deadman,linuxabi,busreg,lumen,netring3,selfdiag,lidsleep,videoplayer,intel-ivb,unaos_ivb,gen7,gen7,gen7r8,gen7,gen7blit,gmux_igd,smolnet,ftdirx,uvc,ioapic,midden,aether,una,sonde,stria,gen7r9,wifi9,usbnet,wifi10
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 55s
+rc=0
+
+Warnings naming this arc's files: the two pre-existing private_interfaces warnings at softy/chrome.rs:63 and :185 (SOFTY's compile.txt names the same two); none in notify.rs, statusmenu.rs, softy/mod.rs, softy/startmenu.rs.
+
+Not run (R107, the seat's at the fold): ./arroyo check, the aarch64 leg, knoboff, QEMU, tests softy / statustray / notify.

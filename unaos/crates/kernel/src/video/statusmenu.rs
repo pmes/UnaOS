@@ -396,7 +396,7 @@ pub fn fixture() {
     let muted = panel_press(2, 0, 100) && status::volume() == (8, true);
     OPEN_ITEM.store(ITEM_INPUT, Ordering::Relaxed);
     let _ = super::keymap::set_pc(false);
-    let input_ok = panel_press(2, 0, 100) && super::keymap::active().name == "pc" && panel_press(2, 0, 100) && super::keymap::active().name == "crispy";
+    let n0 = super::keymap::active().name; let input_ok = panel_press(2, 0, 100) && super::keymap::pc_selected() && super::keymap::active().name != n0 && panel_press(2, 0, 100) && !super::keymap::pc_selected() && super::keymap::active().name == n0; // SOFTY3 (B651): the table's name is the KEYMAP's (R126: `una-pc` under Una, `pc` under Softy), read back, never typed here; LINE-NEUTRAL fold, code first
     // the clock on 2026-10-06 09:41 UTC: a Tuesday; the 1st is a Thursday (column 4); today marked.
     let mut cl = Vec::new();
     clock_lines(1_791_279_660, &mut cl);

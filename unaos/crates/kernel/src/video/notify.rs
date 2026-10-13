@@ -26,7 +26,8 @@
 //! Wire: `[notify] post app=<a> title=<t> dnd=<0|1> -> banner|collected`, `[notify] show win=<n> slot=<i> title=<t>
 //! ms=<ms> focus=kept`, `[notify] closed by=<timeout|click|overflow> title=<t>`, `[notify] action <label> -> <what>`,
 //! `[notify] bell press at=(<x>,<y>) box=(<x>,<y>,<w>,<h>) -> center-open|center-close|miss`, `[notify] center open
-//! items=<n> unread=<n> apps=<n> shown=<n>` / `[notify] center close by=<bell|outside|action>`, `[notify] center
+//! items=<n> unread=<n> apps=<n> shown=<n> by=<bell|clock>` / `[notify] center close by=<bell|outside|action|clock>`
+//! (SOFTY3 B651: under Softy the taskbar's clock flyout opens and closes the Center with itself, `request_center`), `[notify] center
 //! dismiss title=<t> left=<n>`, and `tests notify` → `:: NOTIFY: stack_max=4 center=ok ring=64 badge=ok dnd=<0|1>
 //! posted=<n> center_kept=2 unread=2 -> PASS :: …`.
 //! Design: `docs/dev/evidence/rmbp-1005/notify.md`; the pane and the sound: `notifypane.md`.
@@ -314,6 +315,9 @@ fn btn_rect() -> (usize, usize, usize, usize) {
 
 fn center_rect(pw: usize) -> (usize, usize, usize, usize) {
     let (sw, sh) = (metrics::size(CW), metrics::size(CH));
+    if let Some((x, y)) = softy_center_at(pw, sw, sh) {
+        return (x, y, sw, sh); // SOFTY3 (B651): under Softy the Center sits above the taskbar, beside the calendar
+    }
     (pw.saturating_sub(sw + metrics::size(8)), wm::TITLE_H() + metrics::size(4), sw, sh)
 }
 
@@ -328,9 +332,9 @@ fn inside(px: usize, py: usize, r: (usize, usize, usize, usize)) -> bool {
 // ── painting ─────────────────────────────────────────────────────────────────────────────────────────────
 
 fn frame(px: &mut [u32], pw: usize, w: usize, h: usize) {
-    metrics::fill(px, pw, 0, 0, w, h, theme::chrome_face());
+    metrics::fill(px, pw, 0, 0, w, h, theme::surface_window());
     for (x, y, fw, fh) in [(0, 0, w, 1), (0, h - 1, w, 1), (0, 0, 1, h), (w - 1, 0, 1, h)] {
-        metrics::fill(px, pw, x, y, fw, fh, theme::frame_line());
+        metrics::fill(px, pw, x, y, fw, fh, theme::line_subtle());
     }
 }
 
@@ -343,12 +347,12 @@ fn icon(px: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, size: usize, a
 
 fn button(px: &mut [u32], pw: usize, ph: usize, clip: usize, r: (usize, usize, usize, usize), t: &[u8]) {
     let face = super::text::Face::Ui;
-    metrics::fill(px, pw, r.0, r.1, r.2, r.3, theme::button_face());
+    metrics::fill(px, pw, r.0, r.1, r.2, r.3, theme::surface_raised());
     for (x, y, w, h) in [(r.0, r.1, r.2, 1), (r.0, r.1 + r.3 - 1, r.2, 1), (r.0, r.1, 1, r.3), (r.0 + r.2 - 1, r.1, 1, r.3)] {
-        metrics::fill(px, pw, x, y, w, h, theme::frame_line());
+        metrics::fill(px, pw, x, y, w, h, theme::line_subtle());
     }
     let ty = r.1 + r.3.saturating_sub(metrics::lcell_h(face)) / 2;
-    let _ = metrics::text(px, pw, ph, clip, r.0 + 8, ty, t, theme::content_text(), false, face);
+    let _ = metrics::text(px, pw, ph, clip, r.0 + 8, ty, t, theme::text_primary(), false, face);
 }
 
 fn paint_card(i: usize, n: &Note) {
@@ -358,8 +362,8 @@ fn paint_card(i: usize, n: &Note) {
     craft_icon(px, pw, ph, n.app()); // DESKTOPCRAFT (B631): the app's icon, or a rounded accent tile where the registrar has none
     let face = super::text::Face::Ui;
     let clip = if n.has_button() { btn_rect().0 - 6 } else { W - 8 };
-    let _ = metrics::text(px, pw, ph, clip, 62, 10, n.title(), theme::content_text(), true, face);
-    let _ = metrics::text(px, pw, ph, clip, 62, 34, n.line(), theme::title_text_active(), false, face);
+    let _ = metrics::text(px, pw, ph, clip, 62, 10, n.title(), theme::text_primary(), true, face);
+    let _ = metrics::text(px, pw, ph, clip, 62, 34, n.line(), theme::text_primary(), false, face);
     if n.has_button() {
         craft_button(px, pw, ph, btn_rect(), n.label()); // DESKTOPCRAFT (B631): the kit's push button (rounded, hairline edge)
     }
@@ -404,12 +408,12 @@ fn paint_center(ring: &[Note], now: u64) -> (usize, usize, Vec<usize>) {
     frame(px, pw, CW, CH);
     let face = super::text::Face::Ui;
     let ch = metrics::lcell_h(face);
-    let _ = metrics::text(px, pw, ph, CW, 12, (HEAD_H - ch) / 2, b"Notifications", theme::content_text(), true, face);
+    let _ = metrics::text(px, pw, ph, CW, 12, (HEAD_H - ch) / 2, b"Notifications", theme::text_primary(), true, face);
     button(px, pw, ph, CW - 4, clear_rect(), b"Clear");
-    metrics::fill(px, pw, 0, HEAD_H, CW, 1, theme::frame_line());
+    metrics::fill(px, pw, 0, HEAD_H, CW, 1, theme::line_subtle());
     let (items, apps, rows) = center_model(ring);
     if items == 0 {
-        let _ = metrics::text(px, pw, ph, CW, 12, HEAD_H + 16, b"No Notifications", theme::title_text_inactive(), false, face);
+        let _ = metrics::text(px, pw, ph, CW, 12, HEAD_H + 16, b"No Notifications", theme::text_secondary(), false, face);
         return (0, 0, Vec::new());
     }
     let mut shown = Vec::new();
@@ -421,16 +425,16 @@ fn paint_center(ring: &[Note], now: u64) -> (usize, usize, Vec<usize>) {
             break;
         }
         if head {
-            let _ = metrics::text(px, pw, ph, CW, 12, y + (GROUP_H - ch) / 2, n.app(), theme::title_text_inactive(), true, face);
+            let _ = metrics::text(px, pw, ph, CW, 12, y + (GROUP_H - ch) / 2, n.app(), theme::text_secondary(), true, face);
         } else {
             if !n.read {
                 metrics::fill(px, pw, 5, y + ITEM_H / 2 - 3, 6, 6, theme::accent()); // unread dot
             }
             icon(px, pw, ph, 14, y + 6, 28, n.app());
-            let _ = metrics::text(px, pw, ph, AGE_X - 4, 52, y + 2, n.title(), theme::content_text(), true, face);
-            let _ = metrics::text(px, pw, ph, AGE_X - 4, 52, y + 2 + ch, n.line(), theme::title_text_active(), false, face);
-            let _ = metrics::text(px, pw, ph, DX_X - 2, AGE_X, y + 2, age(now, n.at).as_bytes(), theme::title_text_inactive(), false, face);
-            let _ = metrics::text(px, pw, ph, CW - 8, DX_X + 4, y + (ITEM_H - ch) / 2, b"x", theme::title_text_inactive(), true, face);
+            let _ = metrics::text(px, pw, ph, AGE_X - 4, 52, y + 2, n.title(), theme::text_primary(), true, face);
+            let _ = metrics::text(px, pw, ph, AGE_X - 4, 52, y + 2 + ch, n.line(), theme::text_primary(), false, face);
+            let _ = metrics::text(px, pw, ph, DX_X - 2, AGE_X, y + 2, age(now, n.at).as_bytes(), theme::text_secondary(), false, face);
+            let _ = metrics::text(px, pw, ph, CW - 8, DX_X + 4, y + (ITEM_H - ch) / 2, b"x", theme::text_secondary(), true, face);
             let r = shown.len();
             if r < ROWS_MAX {
                 ROW_Y[r].store(y, Ordering::Relaxed);
@@ -645,6 +649,12 @@ pub fn press_at(x: i32, y: i32) -> bool {
             }
             return true;
         }
+        if super::look::is_softy() && super::softy::startmenu::open_kind() == 2 {
+            // SOFTY3 (B651): the Center is the CALENDAR's while that flyout is open — the press is the taskbar's
+            // (inside the flyout it is the flyout's; on the clock or elsewhere it closes the calendar, which closes
+            // the Center through `request_center`), never spent here.
+            return false;
+        }
         REQ_CENTER.store(2, Ordering::Release);
         return true;
     }
@@ -812,11 +822,13 @@ fn pass(now: u64) {
     }
     match creq {
         1 if CENTER_OPEN.load(Ordering::Relaxed) => center_close(&mut st, "bell"),
-        1 => {
+        4 if CENTER_OPEN.load(Ordering::Relaxed) => {} // SOFTY3 (B651): the clock's open request on an open Center is spent
+        1 | 4 => {
             let (items, apps, shown) = center_show(&mut st, pw, now);
-            serial_println!("[notify] center open items={} unread={} apps={} shown={}", items, unread(), apps, shown);
+            serial_println!("[notify] center open items={} unread={} apps={} shown={} by={}", items, unread(), apps, shown, if creq == 4 { "clock" } else { "bell" });
         }
         2 => center_close(&mut st, "outside"),
+        5 => center_close(&mut st, "clock"), // SOFTY3 (B651): the calendar closed, the Center with it
         3 => {
             let n = st.ring.len();
             st.ring.clear();
@@ -1232,7 +1244,7 @@ fn craft_button(px: &mut [u32], pw: usize, ph: usize, r: (usize, usize, usize, u
     let tw = metrics::ladvance(t, false, face);
     let tx = r.0 + r.2.saturating_sub(tw) / 2;
     let ty = r.1 + r.3.saturating_sub(metrics::lcell_h(face)) / 2;
-    let _ = metrics::text(px, pw, ph, r.0 + r.2, tx, ty, t, theme::content_text(), false, face);
+    let _ = metrics::text(px, pw, ph, r.0 + r.2, tx, ty, t, theme::text_primary(), false, face);
 }
 
 // ── MENUSCRAFT (rmbp-ledger B642) — the toast's hover x ───────────────────────────────────────────────────────────
@@ -1283,4 +1295,36 @@ fn craft_close(i: usize) {
     let wdt = (metrics::size(3) as i32 * sub / 2).max(sub);
     draw::line_aa(&mut s, cx - arm, cy - arm, cx + arm, cy + arm, wdt, theme::ink_secondary());
     draw::line_aa(&mut s, cx - arm, cy + arm, cx + arm, cy - arm, wdt, theme::ink_secondary());
+}
+
+// ── SOFTY3 (rmbp-ledger B651) — the clock's Center under the Softy look ──────────────────────────────────────────
+// Windows' clock flyout shows the notifications beside the month. Under Softy the taskbar's clock opens the look's
+// calendar (`softy::startmenu`, kind 2) and that flyout opens notify's OWN Center with itself and closes it with
+// itself, through the one seam below; the Center's rect follows the look (`center_rect` → [`softy_center_at`]).
+
+/// The Softy calendar's seam: `startmenu::open(2)` requests the Center open, `startmenu::close` of the calendar
+/// requests it closed. Atomics only (the press router's rule); [`service`]'s next pass acts (codes 4 open / 5 close,
+/// an open request on an open Center is spent). The Center's own closes (an item's action, a press outside under
+/// the UnaOS look) leave the calendar alone.
+pub fn request_center(open: bool) {
+    REQ_CENTER.store(if open { 4 } else { 5 }, Ordering::Release);
+}
+
+/// Under Softy the Center has no menu bar to hang from: it sits ABOVE the taskbar (`softy::taskbar::top`) with a
+/// `FLY_GAP` band over the bar, at the right edge — and to the LEFT of the calendar flyout while that is open, the
+/// two side by side. `None` under the UnaOS look (the caller keeps the bar placement). The panel height is the one
+/// the pass published (`PANEL`), the same the press router reads.
+fn softy_center_at(pw: usize, sw: usize, sh: usize) -> Option<(usize, usize)> {
+    if !super::look::is_softy() {
+        return None;
+    }
+    let ph = (PANEL.load(Ordering::Relaxed) & 0xffff_ffff) as usize;
+    let gap = super::softy::palette::px(super::softy::palette::FLY_GAP);
+    let top = super::softy::taskbar::top(pw, ph);
+    let y = top.saturating_sub(gap + sh);
+    let x = match super::softy::startmenu::rect() {
+        Some((fx, _, _, _)) if super::softy::startmenu::open_kind() == 2 && fx >= sw + 2 * gap => fx - gap - sw,
+        _ => pw.saturating_sub(sw + gap),
+    };
+    Some((x, y))
 }
