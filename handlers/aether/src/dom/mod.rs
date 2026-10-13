@@ -16,6 +16,8 @@
 //! script, so `<noscript>` is raw text, as in a JS-enabled browser). Serialization is `html_core`'s
 //! §13.3 serializer.
 
+/// AETHERWPT3 (SR138): a document's character encoding (HTML §13.2.3) and its decoding.
+pub mod charset;
 pub mod custom;
 pub mod mutation;
 mod select;

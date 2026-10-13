@@ -2484,7 +2484,7 @@ fn document_ctor(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 /// A new (detached) Document node in the page arena.
 pub fn new_document(html: bool, content_type: &str, url: &str) -> usize {
     let id = with_doc_mut(|d| d.create(NodeData::Document).0);
-    page(|p| p.docs.insert(id, super::DocMeta { html, content_type: content_type.to_string(), url: url.to_string(), quirks: false }));
+    page(|p| p.docs.insert(id, super::DocMeta { html, content_type: content_type.to_string(), url: url.to_string(), quirks: false, charset: "UTF-8".into() }));
     id
 }
 
@@ -2504,9 +2504,11 @@ fn compat_mode(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(s(if quirks { "BackCompat" } else { "CSS1Compat" }))
 }
 
+/// `document.characterSet` (DOM §4.5): the document's encoding's name — UTF-8 unless the document was decoded
+/// from another (AETHERWPT3: a nested document's bytes through dom/charset.rs).
 fn character_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
-    this_doc(vm, ctx)?;
-    Ok(s("UTF-8"))
+    let d = this_doc(vm, ctx)?;
+    Ok(s(&page(|p| p.docs.get(&d).map(|m| m.charset.clone())).unwrap_or_else(|| "UTF-8".into())))
 }
 
 fn content_type(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {

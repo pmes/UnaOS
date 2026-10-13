@@ -608,6 +608,8 @@ pub struct SubDocument {
     pub content_type: String,
     pub status: u16,
     pub body: String,
+    /// AETHERWPT3 (SR138): the encoding the body was decoded from (HTML §13.2.3; `document.characterSet`).
+    pub charset: &'static str,
 }
 
 /// The MIME essence of a `Content-Type` value.
@@ -638,11 +640,12 @@ fn mime_for_path(path: &str) -> String {
 /// Fetches the resource an `<iframe>` navigates to (HTML §7.4.5 "populating a session history
 /// entry", the fetch half): `about:blank` is the empty HTML document, `file:` and `data:` come from
 /// disk / the URL itself (`js::host::fetch_script_text`), `http(s):` is one synchronous GET on
-/// [`http_sync`] (the shared cookie jar; redirects followed). The body is decoded as UTF-8 (lossily).
+/// [`http_sync`] (the shared cookie jar; redirects followed). An http(s) body is decoded by HTML §13.2.3
+/// (`dom::charset`: BOM, transport charset, prescan, windows-1252); the others as UTF-8.
 pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
     let bare = url.split(['#', '?']).next().unwrap_or(url);
     if bare == "about:blank" || bare == "about:srcdoc" {
-        return Ok(SubDocument { url: url.to_string(), content_type: "text/html".into(), status: 200, body: String::new() });
+        return Ok(SubDocument { url: url.to_string(), content_type: "text/html".into(), status: 200, body: String::new(), charset: "UTF-8" });
     }
     if url.starts_with("about:") {
         return Err(format!("unsupported about: URL {url}"));
@@ -651,11 +654,11 @@ pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
         let meta = rest.split(',').next().unwrap_or("");
         let ct = essence(meta.trim_end_matches(";base64"));
         let body = crate::js::host::fetch_script_text(url)?;
-        return Ok(SubDocument { url: url.to_string(), content_type: if ct.is_empty() { "text/plain".into() } else { ct }, status: 200, body });
+        return Ok(SubDocument { url: url.to_string(), content_type: if ct.is_empty() { "text/plain".into() } else { ct }, status: 200, body, charset: "UTF-8" });
     }
     if url.starts_with("file://") {
         let body = crate::js::host::fetch_script_text(url)?;
-        return Ok(SubDocument { url: url.to_string(), content_type: mime_for_path(url), status: 200, body });
+        return Ok(SubDocument { url: url.to_string(), content_type: mime_for_path(url), status: 200, body, charset: "UTF-8" });
     }
     if url.starts_with("http://") || url.starts_with("https://") {
         let r = http_sync(HttpReq {
@@ -667,14 +670,21 @@ pub fn fetch_subdocument(url: &str) -> Result<SubDocument, String> {
             timeout_ms: 30_000,
         })?;
         let mut ct = String::new();
+        let mut full_ct = String::new();
         for kv in r.headers.chunks(2) {
             if kv.len() == 2 && kv[0].eq_ignore_ascii_case("content-type") {
                 ct = essence(&kv[1]);
+                full_ct = kv[1].clone();
             }
         }
-        let body = String::from_utf8_lossy(&r.body).into_owned();
+        // AETHERWPT3 (SR138): HTML §13.2.3 — the BOM, the transport's charset, the <meta> prescan, the default.
+        let (body, charset) = if ct.is_empty() || ct.contains("html") {
+            crate::dom::charset::decode_html(&r.body, &full_ct)
+        } else {
+            crate::dom::charset::decode_text(&r.body, &full_ct)
+        };
         let final_url = if r.url.is_empty() { url.to_string() } else { r.url };
-        return Ok(SubDocument { url: final_url, content_type: ct, status: r.status, body });
+        return Ok(SubDocument { url: final_url, content_type: ct, status: r.status, body, charset });
     }
     Err(format!("unsupported URL scheme: {url}"))
 }

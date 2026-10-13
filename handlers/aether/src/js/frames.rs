@@ -909,6 +909,8 @@ fn navigate_now(vm: &mut Vm, nav: NavRequest) -> bool {
     let parent_origin = c.parent.map(origin_of).unwrap_or_default();
     let sandbox = dom::attr_value(container, "sandbox").map(|v| Sandbox::parse(&v));
     // `javascript:` URLs: the script runs in the context's realm; a string result is the new document.
+    // AETHERWPT3 (SR138): the encoding the response was decoded from (HTML §13.2.3), for document.characterSet.
+    let mut charset: &'static str = "UTF-8";
     let (url, markup, ctype, origin) = if let Some(sd) = nav.srcdoc {
         ("about:srcdoc".to_string(), sd, "text/html".to_string(), parent_origin)
     } else if is_about_blank(&nav.url) {
@@ -930,6 +932,7 @@ fn navigate_now(vm: &mut Vm, nav: NavRequest) -> bool {
     } else {
         match crate::api::fetch::fetch_subdocument(&nav.url) {
             Ok(r) => {
+                charset = r.charset;
                 let o = if r.url.starts_with("data:") { "null".to_string() } else { tree::url_origin(&r.url) };
                 let m = markup_for(&r);
                 (r.url.clone(), m, if r.content_type.is_empty() { "text/html".to_string() } else { r.content_type.clone() }, o)
@@ -954,6 +957,7 @@ fn navigate_now(vm: &mut Vm, nav: NavRequest) -> bool {
     page(|p| {
         if let Some(m) = p.docs.get_mut(&doc) {
             m.quirks = quirks;
+            m.charset = charset.to_string();
         }
     });
     tree::update(nav.ctx, |c| {

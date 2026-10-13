@@ -191,3 +191,27 @@ Promise.all([
         "2:0:w:a,w:b,closed:true|X,YZ,!:false|AbortError|Uint8Array:2:7,8:false:0|utf-8:61f09f92a9|1:20ac|expected output|expected output|TypeError|TypeError"
     );
 }
+
+/// O2 — Encoding §9–§13 through TextDecoder: a single-byte index (KOI8-R, windows-1251, an unmapped ISO-8859-6
+/// byte), Shift_JIS, EUC-JP (JIS X 0212 behind 0x8F, half-width katakana behind 0x8E), ISO-2022-JP escapes, EUC-KR,
+/// Big5 (pointer 1133's two code points), GBK and gb18030 (four-byte ranges; the last ranges pointer, 39419 → U+FFFF),
+/// `fatal`, and `{stream: true}` across a lead byte. The code points are the WHATWG indexes' (index JSON at
+/// whatwg/encoding a985b62a).
+#[test]
+fn o2_legacy_decoders() {
+    let got = answers(
+        r#"
+var hex = function (s) { var o = []; for (var i = 0; i < s.length; i++) { o.push(s.charCodeAt(i).toString(16)); } return o.join(' '); };
+var d = function (l, b, o) { return hex(new TextDecoder(l, o).decode(new Uint8Array(b))); };
+R.push(d('koi8-r', [0xC1, 0x41]), d('cp1251', [0xC0]), d('iso-8859-6', [0xA1]));
+R.push(d('sjis', [0x82, 0xA0, 0x41, 0xB1]), d('euc-jp', [0xA4, 0xA2, 0x8E, 0xB1, 0x8F, 0xB0, 0xA1]));
+R.push(d('iso-2022-jp', [0x1B, 0x24, 0x42, 0x24, 0x22, 0x1B, 0x28, 0x42, 0x41]), d('korean', [0xB0, 0xA1]));
+R.push(d('big5', [0xA4, 0x40, 0x88, 0x62]), d('gb2312', [0xC4, 0xE3, 0x80]), d('gb18030', [0x81, 0x30, 0x81, 0x30, 0x84, 0x31, 0xA4, 0x39]));
+try { new TextDecoder('shift_jis', { fatal: true }).decode(new Uint8Array([0x82])); R.push('no throw'); } catch (e) { R.push(e.name); }
+var t = new TextDecoder('euc-kr'), s = t.decode(new Uint8Array([0x41, 0xB0]), { stream: true });
+s += t.decode(new Uint8Array([0xA1]));
+R.push(hex(s), new TextDecoder('x-sjis').encoding);
+"#,
+    );
+    assert_eq!(got, "430 41|410|fffd|3042 41 ff71|3042 ff71 4e02|3042 41|ac00|4e00 ca 304|4f60 20ac|80 ffff|TypeError|41 ac00|shift_jis");
+}

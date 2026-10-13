@@ -115,6 +115,27 @@ fn form_byte(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     Ok(idl::s(&url::form::byte_serialize(input.as_bytes())))
 }
 
+/// AETHERWPT3 (SR138): `__codec_decode(name, s0, s1, s2, s3, bytes, flush)` → `[text, s0, s1, s2, s3, errors]` — one
+/// run of a legacy decoder (api/encoding: Encoding §9–§13) from the given state; TextDecoder holds the state
+/// between `{stream: true}` calls.
+fn codec_decode(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    let name = str_arg(vm, ctx, 0)?;
+    let mut st = [0u32; 4];
+    for (k, slot) in st.iter_mut().enumerate() {
+        let v = vm.arg(ctx, 1 + k);
+        *slot = vm.to_number(&v)? as u32;
+    }
+    let b = vm.arg(ctx, 5);
+    let bytes = crate::js::net::buffer_bytes(vm, &b).unwrap_or_default();
+    let f = vm.arg(ctx, 6);
+    let flush = vm.to_boolean(&f);
+    let (out, next) = crate::api::encoding::decode_chunk(&name, crate::api::encoding::DecoderState(st), &bytes, flush);
+    let mut vals = vec![idl::s(&String::from_utf16_lossy(&out.units))];
+    vals.extend(next.0.iter().map(|&x| Value::Number(x as f64)));
+    vals.push(Value::Number(out.errors as f64));
+    Ok(Value::Object(vm.new_array(vals)))
+}
+
 /// `__random_bytes(n)` → array of n bytes from the OS entropy pool.
 fn random_bytes(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let v = vm.arg(ctx, 0);
@@ -152,6 +173,7 @@ pub fn init(vm: &mut Vm) {
         ("__form_byte", 1, form_byte),
         ("__random_bytes", 1, random_bytes),
         ("__parse_document", 1, parse_document),
+        ("__codec_decode", 7, codec_decode),
     ] {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
@@ -178,6 +200,7 @@ pub(crate) fn init_worker(vm: &mut Vm) {
         ("__form_parse", 1, form_parse),
         ("__form_byte", 1, form_byte),
         ("__random_bytes", 1, random_bytes),
+        ("__codec_decode", 7, codec_decode),
     ] {
         let fo = vm.make_native(name, len, f, false);
         vm.heap.get_mut(g).props.insert(PropertyKey::from_str(name), Prop::data(Value::Object(fo), WC));
@@ -461,8 +484,8 @@ const PRELUDE: &str = r#"
 // `ignoreBOM`, `{stream: true}`, the UTF-8 decoder of §8.1.1 (bounds-checked
 // continuation bytes, one U+FFFD per maximal subpart), UTF-16LE/BE (§14.2),
 // windows-1252 and x-user-defined; `replacement` refused with a RangeError.
-// The other legacy encodings have no decoder here (gap O2): their labels
-// resolve, and decoding them is ledgered and falls back to UTF-8.
+// AETHERWPT3 (SR138): every other legacy encoding (§9–§13) decodes through
+// `__codec_decode` (api/encoding, the WHATWG indexes), its state carried here.
 (function () {
     var op = function (o, n, f) { Object.defineProperty(o, n, { value: f, writable: true, enumerable: true, configurable: true }); };
     var getter = function (o, n, f) { Object.defineProperty(o, n, { get: f, enumerable: true, configurable: true }); };
@@ -495,7 +518,7 @@ const PRELUDE: &str = r#"
 
     // A decoder instance: run(bytes, emit, error) consumes bytes; end(emit, error) handles end-of-queue.
     // error() returns true when the decoder must stop (fatal mode).
-    var makeDecoder = function (name) {
+    var makeDecoder = function (name, fatal) {
         if (name === 'utf-8') {
             var need = 0, seen = 0, cp = 0, lo = 0x80, hi = 0xBF;
             return {
@@ -567,6 +590,20 @@ const PRELUDE: &str = r#"
                 end: function () {},
             };
         }
+        if (typeof __codec_decode === 'function') {
+            var cst = [0, 0, 0, 0];
+            var runNative = function (b, flush, emit, error) {
+                var r = __codec_decode(name, cst[0], cst[1], cst[2], cst[3], b, flush);
+                cst = [r[1], r[2], r[3], r[4]];
+                if (r[5] > 0 && fatal) { error(); return; }
+                var t = r[0];
+                for (var i = 0; i < t.length; i++) { emit(t.charCodeAt(i)); }
+            };
+            return {
+                run: function (b, emit, error) { runNative(b, false, emit, error); },
+                end: function (emit, error) { runNative(new Uint8Array(0), true, emit, error); },
+            };
+        }
         ledger('TextDecoder-no-decoder-decoded-as-utf8:' + name);
         return makeDecoder('utf-8');
     };
@@ -598,7 +635,7 @@ const PRELUDE: &str = r#"
             var input = arguments[0];
             var bytes = input === undefined ? new Uint8Array(0) : bytesOf(input, 'decode');
             var stream = !!dict(arguments[1], "execute 'decode' on 'TextDecoder'").stream;
-            if (!s.doNotFlush) { s.decoder = makeDecoder(s.name); s.bomSeen = false; }
+            if (!s.doNotFlush) { s.decoder = makeDecoder(s.name, s.fatal); s.bomSeen = false; }
             s.doNotFlush = stream;
             var units = [], out = '', failed = false;
             var bomCheck = !s.ignoreBOM && (s.name === 'utf-8' || s.name === 'utf-16le' || s.name === 'utf-16be');

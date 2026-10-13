@@ -184,6 +184,8 @@ pub struct DocMeta {
     pub content_type: String,
     pub url: String,
     pub quirks: bool,
+    /// AETHERWPT3 (SR138): the document's character encoding (HTML §13.2.3; `document.characterSet`).
+    pub charset: String,
 }
 
 /// A task queued for the event loop (HTML §8.1.7): run in order by [`Engine::run_tasks`].
@@ -862,7 +864,7 @@ impl Engine {
         page(|p| {
             p.url = url.to_string();
             let root = p.doc.as_ref().map(|d| d.id().0).unwrap_or(0);
-            p.docs.insert(root, DocMeta { html: true, content_type: "text/html".into(), url: url.to_string(), quirks: false });
+            p.docs.insert(root, DocMeta { html: true, content_type: "text/html".into(), url: url.to_string(), quirks: false, charset: "UTF-8".into() });
         });
         net::note_url(url);
     }

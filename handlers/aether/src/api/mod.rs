@@ -5,6 +5,8 @@
 pub mod a11y;
 /// AETHERWPT3 (SR138): ASN.1 DER for `crypto.subtle`'s spki / pkcs8 key formats.
 pub mod der;
+/// AETHERWPT3 (SR138): the Encoding Standard's legacy decoders and generated indexes.
+pub mod encoding;
 pub mod events;
 pub mod eventsource;
 pub mod fetch;
