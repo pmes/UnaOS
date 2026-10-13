@@ -23,6 +23,8 @@
 //! - [`traversal`] — NodeFilter, NodeIterator, TreeWalker (SR72).
 //! - [`reflect`] — HTML §2.6.1 reflection of every reflected IDL attribute (SR72).
 //! - [`controls`] — form controls' DOM half: value modes, selection, constraint validation (SR72).
+//! - [`canvas`] — the 2D canvas (AETHERCANVAS, SR85): CanvasRenderingContext2D, Path2D, gradients,
+//!   patterns, ImageData, TextMetrics, OffscreenCanvas, ImageBitmap, DOMMatrix, over `crate::canvas`.
 //! - [`loader`] — HTML §4.12.1 script processing driven by the parser: parser-blocking, `defer`,
 //!   `async` and module scripts, `document.write` during parse, dynamically inserted scripts, and
 //!   §13.2.7 "the end" (DOMContentLoaded, load).
@@ -33,6 +35,7 @@
 //! engine (no more script on this page; the DOM still renders) instead of ending the process, and a
 //! per-task instruction budget turns a runaway script into a reported, uncatchable termination.
 
+pub mod canvas;
 pub mod controls;
 pub mod cssom;
 pub mod dom;
@@ -515,6 +518,7 @@ impl Engine {
         cssom::install(&mut vm);
         window::install(&mut vm);
         net::install(&mut vm);
+        canvas::install(&mut vm);
         Engine { vm }
     }
 

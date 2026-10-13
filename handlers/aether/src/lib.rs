@@ -5,6 +5,7 @@ pub mod layout;
 pub mod render;
 pub mod js;
 pub mod images;
+pub mod canvas;
 pub mod forms;
 pub mod css;
 

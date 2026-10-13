@@ -1889,6 +1889,36 @@ pub fn render_frame(
                     }
                 }
 
+                if tag == "canvas" {
+                    // AETHERCANVAS (SR85): the 2D context's bitmap is the element's replaced content, scaled
+                    // into the content box (nearest neighbour, like <img>), straight alpha over the backdrop.
+                    if let Some((cw, ch, rgba)) = crate::canvas::element_bitmap(dom_node) {
+                        let (pad, bord) = (layout_box.padding, layout_box.border);
+                        let cx = box_sx + pad.left + bord.left;
+                        let cy = box_sy + pad.top + bord.top;
+                        let cbw = (bw - pad.left - bord.left - pad.right - bord.right).max(1.0);
+                        let cbh = (bh - pad.top - bord.top - pad.bottom - bord.bottom).max(1.0);
+                        let x_start = cx.max(0.0) as u32;
+                        let y_start = cy.max(0.0) as u32;
+                        let end_x = ((cx + cbw).max(0.0) as u32).min(width);
+                        let end_y = ((cy + cbh).max(0.0) as u32).min(height);
+                        for y in y_start..end_y {
+                            for x in x_start..end_x {
+                                if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                    continue;
+                                }
+                                let u = (((x as f32 + 0.5 - cx) / cbw * cw as f32).max(0.0) as usize).min(cw - 1);
+                                let v = (((y as f32 + 0.5 - cy) / cbh * ch as f32).max(0.0) as usize).min(ch - 1);
+                                let i = (v * cw + u) * 4;
+                                let a = rgba[i + 3];
+                                if a > 0 {
+                                    blend_px(surface, width, x, y, (rgba[i], rgba[i + 1], rgba[i + 2]), a);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if tag == "video" || tag == "audio" {
                     if let Some(media) = crate::media::paint_for(dom_node) {
                         let (pad, bord) = (layout_box.padding, layout_box.border);
