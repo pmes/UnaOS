@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Una (UnaOS's own design): the Code layout — a sidebar, an editor, a console — on a slate tile. -->
+<rect x="2" y="2" width="60" height="60" rx="13" fill="#1e2430"/>
+<rect x="10" y="12" width="12" height="28" rx="2" fill="#3a3550"/>
+<rect x="25" y="12" width="29" height="28" rx="2" fill="#2b3142"/>
+<path d="M29 19 H48 M29 25 H44 M29 31 H46" stroke="#e6e3ec" stroke-width="3" stroke-linecap="round"/>
+<rect x="10" y="43" width="44" height="10" rx="2" fill="#12141a"/>
+<path d="M14 46 L17 48 L14 50" fill="none" stroke="#9fe6b0" stroke-width="2" stroke-linecap="round"/>
+<rect x="20" y="49" width="8" height="2" rx="1" fill="#b08cff"/>
+</svg>

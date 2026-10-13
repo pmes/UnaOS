@@ -3756,6 +3756,7 @@ busreg = []
 # Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 lumen = ["dep:vein_core", "dep:holocron_core"] # HOLOCRON2 (B355): + holocron_core — SYS_KDF (66), the login launch of APPS/HOLOCRON.ELF and `tests holocron` (crate::keyring)
 midden = [] # MIDDENTWIN (LEDGER SR75, R104): `tests midden` (crate::middenapp, x86) — APPS/MIDDEN.ELF (crates/user-midden, the ring-3 shell over midden_core) validated, spawned, `help` + `ls` typed into it, its exit read back. The program exists on every build. Kept in sync with `unaos/arroyo` and `unaos/builder/src/main.rs`.
+una = [] # UNAMETAL (LEDGER SR90, R104): `tests una` (crate::unaapp, x86) — APPS/UNA.ELF (crates/user-una, the ring-3 IDE: file tree + edit_core editor + midden_core console in one window) validated, spawned, Ctrl+3 then `help` typed into its console, Ctrl+Q, its exit read back. The program exists on every build. Kept in sync with `unaos/arroyo`, `unaos/builder/src/main.rs`, banner-cert.sh, k8-reach.registry.
 
 # AETHERMETAL (LEDGER SR66): UNAOS_AETHER=1 arms `tests aether` (crate::aether) — APPS/AETHER.ELF, the browser as ONE
 # ring-3 program (crates/user-aether: html_core + css_core + font_core, a CSS2 block + inline formatter), validated

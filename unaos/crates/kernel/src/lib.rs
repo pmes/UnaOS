@@ -340,3 +340,4 @@ pub mod queuesleep;
 // AETHERMETAL (LEDGER SR66): `tests aether` — APPS/AETHER.ELF (the browser as a ring-3 program) validated, spawned, its page report read. Tail statement, so no existing line moves.
 #[cfg(feature = "aether")]
 pub mod aether;
+#[cfg(all(feature = "una", target_arch = "x86_64"))] pub mod unaapp; // UNAMETAL (LEDGER SR90): `tests una` — APPS/UNA.ELF, the ring-3 IDE (tree + edit_core editor + midden_core console), driven and read back. Tail statement, so no existing line moves.

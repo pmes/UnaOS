@@ -971,6 +971,7 @@ fn main() {
     // LUMENBIN: UNAOS_LUMEN=1 arms the lumen dock pin by default and `tests lumen`. Kept in sync with arroyo.
     if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
     if std::env::var("UNAOS_MIDDEN").is_ok() { feats.push("midden"); } // MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs). Kept in sync with arroyo.
+    if std::env::var("UNAOS_UNA").is_ok() { feats.push("una"); } // UNAMETAL (LEDGER SR90): `tests una` (kernel unaapp.rs). Kept in sync with arroyo.
     // AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (APPS/AETHER.ELF validated, spawned, its page report read). Kept in sync with arroyo.
     if std::env::var("UNAOS_AETHER").is_ok() { feats.push("aether"); }
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.
@@ -1489,6 +1490,7 @@ fn main() {
         // LUMENBIN: the chat window rides the DATA volume too — `lumen` reads it there.
         (target_dir.join("LUMEN-X86.ELF"), "LUMEN.ELF"),
         (target_dir.join("MIDDEN-X86.ELF"), "MIDDEN.ELF"), // MIDDENTWIN (SR75): the ring-3 shell — `run /apps/MIDDEN.ELF` and `tests midden` read it here
+        (target_dir.join("UNA-X86.ELF"), "UNA.ELF"), // UNAMETAL (SR90): the ring-3 IDE — a bare `una` and `tests una` read it here
         // NETRING3 M3: the network client rides the DATA volume too — `bg /apps/NET.ELF` reads it there.
         (target_dir.join("NET-X86.ELF"), "NET.ELF"),
         // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.ELF there.

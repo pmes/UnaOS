@@ -1238,6 +1238,7 @@ fi
 # LUMENBIN: UNAOS_LUMEN=1 arms the Lumen chat window's dock pin by default and `tests lumen` (crate::lumen). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LUMEN:-}" ] && _feats="${_feats}lumen,"
 [ -n "${UNAOS_MIDDEN:-}" ] && _feats="${_feats}midden,"   # MIDDENTWIN (LEDGER SR75): `tests midden` (kernel middenapp.rs: MIDDEN.ELF spawned, `help` + `ls` typed into it, its exit read back). x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
+[ -n "${UNAOS_UNA:-}" ] && _feats="${_feats}una,"   # UNAMETAL (LEDGER SR90): `tests una` (kernel unaapp.rs: UNA.ELF spawned, Ctrl+3 + `help` typed into its console, Ctrl+Q, its exit read back). x86. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
 # AETHERMETAL (SR66): UNAOS_AETHER=1 arms `tests aether` (crate::aether: APPS/AETHER.ELF validated, spawned, its page report read; implies selfdiag for SYS_PATH_READ). x86 (no K8_FEATS arm: scripts/k8-reach.registry NA row). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_AETHER:-}" ] && _feats="${_feats}aether,"
 # NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
@@ -4332,6 +4333,31 @@ build_user_midden_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 Midden app: MIDDEN-X86.ELF${COLOR_RESET}"
 }
 
+# UNAMETAL (LEDGER SR90, R104): build UNA.ELF — the Una IDE's UnaOS-native face as ONE ring-3 program (crates/user-una:
+# a file tree over SYS_PATH_*, an editor over edit_core, a console that is MIDDEN.ELF's loop over midden_core, one
+# window). Cloned from build_user_midden_x86 (ELF window, syms, strip, e_machine, window check, APPRES stamp) →
+# target/UNA-X86.ELF, staged by the builder as APPS/UNA.ELF. Inert until launched (`una [workspace]`, a bare name
+# resolved on /apps); UNAOS_UNA=1 adds the `tests una` fixture (kernel unaapp.rs).
+build_user_una_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Una IDE (crates/user-una → target/UNA-X86.ELF, ELF window)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-una"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-una/user-una-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-una/target/x86_64-unknown-none/release/user-una" UNA  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-una/target/x86_64-unknown-none/release/user-una" \
+      "${WORKSPACE_DIR}/target/UNA-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/UNA-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: UNA-X86.ELF missing/empty — x86 UNA build failed${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/UNA-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: UNA-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/UNA-X86.ELF" "UNA-X86.ELF"
+    una_res_stamp "${WORKSPACE_DIR}/crates/user-una" "${WORKSPACE_DIR}/target/UNA-X86.ELF"  # APPRES (B398): Una's icon, name, signature, version
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 Una IDE: UNA-X86.ELF${COLOR_RESET}"
+}
+
 # AETHERMETAL (LEDGER SR66): build AETHER.ELF — Aether, the browser, as ONE ring-3 program (crates/user-aether linking
 # html_core + css_core + font_core: parse, cascade, a CSS2 block + inline formatter, paint into one compositor
 # window). The build_user_lumen_x86 shape: linked at the ELF-window VA (user-aether-x86.ld, no PHDRS, 256 KiB stack
@@ -5514,6 +5540,7 @@ test_x86_64() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
+    build_user_una_x86      # UNAMETAL (SR90): target/UNA-X86.ELF — staged as APPS/UNA.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
@@ -5982,6 +6009,7 @@ USER_CHECK_MATRIX=(
   "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-midden   x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-midden/user-midden-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-una      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-una/user-una-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-aether   x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-aether/user-aether-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-diag     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
@@ -9531,6 +9559,7 @@ esp_x86() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
     build_user_midden_x86   # MIDDENTWIN (SR75): target/MIDDEN-X86.ELF — staged as APPS/MIDDEN.ELF
+    build_user_una_x86      # UNAMETAL (SR90): target/UNA-X86.ELF — staged as APPS/UNA.ELF
     build_user_aether_x86  # AETHERMETAL (SR66): target/AETHER-X86.ELF — staged as APPS/AETHER.ELF (+ system/doc/welcome.html)
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
