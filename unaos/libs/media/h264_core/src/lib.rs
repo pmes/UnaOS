@@ -23,7 +23,23 @@
 //! | [`inter`]         | 8.4 MV prediction, P_Skip, B direct, interpolation, weighting        |
 //! | [`dpb`]           | 8.2.1 POC, 8.2.4 reference lists, 8.2.5 marking, C.4 output order    |
 //! | [`deblock`]       | 8.7 deblocking filter                                                |
+//! | [`decoder`]       | 7.4.1.2 access units, slice data 7.3.4, reconstruction, the API      |
 //! | [`tables`]        | generated constant tables (tools/gen_tables.py)                      |
+//!
+//! Decoded: Baseline, Main, Extended-without-partitions and High profile streams at 8-bit 4:2:0 —
+//! I, P and B slices; CAVLC and CABAC; Intra_4x4 / Intra_8x8 / Intra_16x16 / I_PCM; all P and B
+//! partitionings with quarter-sample motion, multiple reference frames, P_Skip, B_Skip and both
+//! direct modes; explicit and implicit weighted prediction; the 4x4 and 8x8 transforms with
+//! scaling matrices; the deblocking filter; POC types 0, 1 and 2; reference list modification,
+//! sliding-window and adaptive marking (MMCO 1-6), frame_num gaps; output in POC order through the
+//! DPB; frame cropping; arbitrary slice order and redundant slices (skipped); Annex B byte streams
+//! and avcC / length-prefixed samples.
+//!
+//! Refused by name ([`Error::Unsupported`]): field pictures and MBAFF (interlace), FMO (slice
+//! groups), data partitioning and SP/SI slices (Extended profile), 4:0:0, 4:2:2 and 4:4:4 chroma,
+//! bit depths above 8, and the lossless transform bypass. Not attempted: error concealment of
+//! missing slices (an absent macroblock stays unfilled) and the SVC / MVC extensions (their NAL
+//! unit types are ignored, the base layer decodes).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -42,6 +58,7 @@ pub mod bits;
 pub mod cabac;
 pub mod cavlc;
 pub mod deblock;
+pub mod decoder;
 pub mod dpb;
 pub mod inter;
 pub mod intra;
@@ -79,6 +96,8 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = core::result::Result<T, Error>;
 
+pub use decoder::Decoder;
+
 /// A decoded frame in output order, cropped (7.4.2.1.1): 8-bit Y, Cb, Cr planes (4:2:0), each
 /// row-major without padding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,7 +107,7 @@ pub struct Frame {
     pub planes: [Vec<u8>; 3],
     /// PicOrderCnt of the frame.
     pub poc: i32,
-    /// The caller's tag of the access unit the frame was decoded from (`Decoder::set_tag`).
+    /// The caller's tag of the access unit the frame was decoded from ([`Decoder::set_tag`]).
     pub tag: i64,
     /// VUI video_full_range_flag.
     pub full_range: bool,
