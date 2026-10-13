@@ -475,4 +475,4 @@ refs/heads/exec-host-aetherwpt3               e3925d80 IN-FLIGHT cloud 2026-10-1
 refs/heads/exec-rmbp-qemuskip                 cb833ebb FOLDED-BY-HAND a487c4dc
 refs/heads/exec-rmbp-kvmlat                   cb833ebb IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-uireds26                 cb833ebb IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-pi-piwm                       cb833ebb IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-pi-piwm                       cb833ebb FOLDED-BY-HAND 23e68944
