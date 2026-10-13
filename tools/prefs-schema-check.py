@@ -118,7 +118,9 @@ def refs_in(path, src, consts):
             yield ns + "." + g.group(2), line_of(g.start()), "R2"
     # R3
     if "fn from_prefs(" in src:
-        ns = consts.get("PREF_NS")
+        # the file's own `PREF_NS` wins over the tree's (Tabula's highlight.rs beside Vein's consumers)
+        own = re.search(r"pub const PREF_NS: &str = \"(" + SEG + r")\"", src)
+        ns = own.group(1) if own else consts.get("PREF_NS")
         for g in re.finditer(r"(?<![\w.])get\(\"(" + KEY + r")\"\)", src):
             if ns:
                 yield ns + "." + g.group(1), line_of(g.start()), "R3"
