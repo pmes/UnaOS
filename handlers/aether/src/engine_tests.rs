@@ -3077,7 +3077,9 @@ mod tests {
             #l li::before { content: counter(list-item) ":"; }"#);
         let got: Vec<String> = generated_texts(&t, "o").iter().map(|s| s.trim().to_string()).collect();
         assert_eq!(got, ["1", "1.1", "1.2", "2", "2.1", "2.1.1"]);
-        assert_eq!(generated_texts(&t, "s"), ["iii/C/03/\u{2022}", "v/E/05/\u{2022}", "vii/G/07/\u{2022}", "\u{3BC}0"]);
+        // lower-greek is `system: alphabetic` over 24 symbols (css-counter-styles-3 §6.2.2, the alphabetic
+        // algorithm §3.1.4): 40 = 1×24 + 16 → "α" then the 16th symbol "π" ("μ", the 12th, is 12).
+        assert_eq!(generated_texts(&t, "s"), ["iii/C/03/\u{2022}", "v/E/05/\u{2022}", "vii/G/07/\u{2022}", "\u{3B1}\u{3C0}0"]);
         assert_eq!(generated_texts(&t, "l"), ["3:", "10:", "11:"]);
     }
 
