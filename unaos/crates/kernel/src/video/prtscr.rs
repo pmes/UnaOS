@@ -431,7 +431,7 @@ pub fn set_rect(kind: u32, x: u32, y: u32, w: u32, h: u32) {
 pub fn request_rect(kind: u32, x: u32, y: u32, w: u32, h: u32) {
     set_rect(kind, x, y, w, h);
     REQUESTS.fetch_add(1, Ordering::Relaxed);
-    PENDING.store(true, Ordering::Relaxed);
+    PENDING.store(true, Ordering::Relaxed); owe(); // QUEUESLEEP2 (B557): the pump's one-load door opens AFTER the request is visible (same-line fold)
 }
 
 /// SHOTREGION — drop an armed rectangle and its request (a refusal that came before `Job::begin` took it).
@@ -510,7 +510,7 @@ pub fn census() -> (u32, u32, u32) {
 pub fn request() {
     RECT_KIND.store(0, Ordering::Relaxed); // SHOTREGION: a plain Print Screen is the whole panel
     REQUESTS.fetch_add(1, Ordering::Relaxed);
-    PENDING.store(true, Ordering::Relaxed);
+    PENDING.store(true, Ordering::Relaxed); owe(); // QUEUESLEEP2 (B557): the pump's one-load door opens AFTER the request is visible (same-line fold)
 }
 
 /// PRTSCR — advance the capture by one bounded slice, opening one first if a request is armed.
@@ -520,17 +520,17 @@ pub fn request() {
 /// returns so its caller can poll the keyboard again. It used to run the whole encode-and-write —
 /// 6–9 s on the Orin, 70 s on the rMBP — from inside the pass that services input, which is SR2.
 ///
-/// Costs THREE relaxed loads per call when idle (two until PRTSCR-HOME added [`dir_fixture`]'s
-/// one-shot latch below), which is why it can still sit unconditionally beside `fat::probe_once()`
+/// Costs ONE relaxed load per call when idle (QUEUESLEEP2 B557: [`OWED`], file tail; it was three after PRTSCR-HOME's
+/// [`dir_fixture`] latch plus an AcqRel swap in `defer_fast`), which is why it can still sit unconditionally beside `fat::probe_once()`
 /// at every storage-ready pass this kernel carries.
-pub fn service() {
+pub fn service() { if !OWED.load(Ordering::Relaxed) { return; } service_owed() } fn service_owed() { // QUEUESLEEP2 (B557): the idle pump pays ONE relaxed load; the old body is `service_owed` (same-line fold, no line below moves)
     // PRTSCR-HOME: the destination fixture, once per boot. It is here rather than behind a knob
     // because the no-session refusal it measures is what EVERY board does today — a gate that only
     // runs when someone remembers a knob would never have measured the ordinary case even once.
     // One relaxed load per pass after the first; see `dir_fixture` for both arms and their go-reds.
     dir_fixture();
     if !PENDING.load(Ordering::Relaxed) && !SLICING.load(Ordering::Relaxed) {
-        return;
+        settle(); return; // QUEUESLEEP2 (B557): nothing pending, nothing slicing, the fixture registered -> close the door (re-checked inside)
     }
 
     // (a) A capture is already open. Advance it by one slice and hand the machine back.
@@ -2272,7 +2272,7 @@ pub fn dir_fixture() { static QB2: AtomicBool = AtomicBool::new(false); if crate
         let was_said = DEFERRED_SAID.swap(false, Ordering::AcqRel);
         let was_slicing = SLICING.load(Ordering::Relaxed);
         if !was_slicing {
-            service();
+            service_owed(); // QUEUESLEEP2 (B557): the fixture drives the body past the one-load door
         }
         let (_, _, r1) = census();
         IN_FLIGHT.store(was_in_flight, Ordering::Release);
@@ -2585,7 +2585,7 @@ pub fn prtscr_selftest() {
     let (_, _, r0) = census();
     let was_pending = PENDING.swap(true, Ordering::AcqRel);
     let was_said = DEFERRED_SAID.swap(false, Ordering::AcqRel);
-    service();
+    service_owed(); // QUEUESLEEP2 (B557): the fixture drives the body past the one-load door
     let (_, _, r1) = census();
     PENDING.store(was_pending, Ordering::Release);
     DEFERRED_SAID.store(was_said, Ordering::Release);
@@ -2705,5 +2705,26 @@ fn stamp_owner(mt: &crate::fs::vfs::MountTable, path: &str, owner: &Option<Strin
     match mt.set_attr(path, "owner", AttrValue::Str(want.clone()), KERNEL_PRINCIPAL) {
         Ok(()) => "set",
         Err(_) => "failed",
+// QUEUESLEEP2 (rmbp-ledger B557) — the pump's idle cost of `service`, ONE relaxed load. FILE TAIL, so no line above moves.
+// Flight 33's `pump_what_worst=prtscr` was a real Cmd-Shift-3 inside the window (the PRTSCR-VOL ladder and its refusal lines,
+// 23 ms, under the bound), but the idle path the promise named was not one load either: `dir_fixture` ran `defer_fast`
+// (an Acquire load of `tests::RUNNING`, a `CUR.try_lock` spin while any `tests` verb runs, and an AcqRel SWAP of its latch
+// on EVERY pass), then `DONE`, `PENDING` and `SLICING`. `OWED` folds all of it into one word: set at boot (the first pass
+// registers the fixture), set by `request`/`request_rect` AFTER `PENDING`, and cleared only by `settle` on the idle return,
+// which clears first and re-checks `PENDING`/`SLICING` second (SeqCst both sides of the race), so a press that lands between
+// the idle check and the clear re-opens the door instead of being stranded.
+static OWED: AtomicBool = AtomicBool::new(true);
+
+/// QUEUESLEEP2 — a request is armed: the next `service` pass takes the body. `Release` orders the `PENDING` store before it.
+#[inline]
+fn owe() {
+    OWED.store(true, Ordering::Release);
+}
+
+/// QUEUESLEEP2 — the idle return: close the one-load door, then re-open it if a request or a slice raced the close.
+fn settle() {
+    OWED.store(false, Ordering::SeqCst);
+    if PENDING.load(Ordering::SeqCst) || SLICING.load(Ordering::SeqCst) {
+        OWED.store(true, Ordering::SeqCst);
     }
 }
