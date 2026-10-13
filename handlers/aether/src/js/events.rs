@@ -1560,6 +1560,9 @@ pub fn user_key(vm: &mut Vm, focused: Option<usize>, ty: &str, k: &crate::api::u
     }
     let d = dom::main_doc();
     let t = focused.or_else(|| dom::body_of(d)).or_else(|| dom::document_element_of(d)).unwrap_or(d);
+    // AETHERTOP (SR146): HTML §6.3 / §4.11.4 — while a modal dialog is shown the rest of the document is inert, and an
+    // inert node is not a target of user interaction events: the key goes to the topmost modal dialog instead.
+    let t = if super::toplayer::is_inert(t) { super::toplayer::modal_dialog().unwrap_or(t) } else { t };
     let init = vm.new_plain_object();
     let ri = root(vm, Value::Object(init));
     let g = Value::Object(vm.realm().global);
@@ -1600,6 +1603,12 @@ pub fn user_key(vm: &mut Vm, focused: Option<usize>, ty: &str, k: &crate::api::u
 /// Fires `click` at `n` with the checkbox/radio legacy-pre-activation behavior and the `input`/`change`
 /// events that follow (HTML §4.10.5.1.15/16). Returns (not canceled, ran).
 fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
+    // AETHERTOP (SR146): HTML §6.3 inert / §4.11.4 "blocked by a modal dialog" — a user click that lands on an inert
+    // node (outside the topmost modal dialog, i.e. on its `::backdrop`) is not dispatched there and runs no
+    // activation behavior: it targets the modal dialog, the backdrop's originating element. Light dismiss still
+    // sees where it landed (`hit`), so a `closedby=any` dialog closes on a backdrop click (§6.12.2).
+    let hit = n;
+    let n = if trusted && super::toplayer::is_inert(n) { super::toplayer::modal_dialog().unwrap_or(n) } else { n };
     // HTMLElement.click(): the "click in progress" flag stops re-entrant clicks.
     if CLICKING.with(|c| c.borrow().contains(&n)) {
         return (true, false);
@@ -1611,7 +1620,7 @@ fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
         // and §6.12.2 light dismiss of the open popovers (and `closedby=any` dialogs) the click lands outside.
         super::activation::note();
         super::closewatcher::note_user_activation(vm);
-        super::toplayer::light_dismiss(vm, n);
+        super::toplayer::light_dismiss(vm, hit);
     }
     let init = vm.new_plain_object();
     let _ = vm.create_data_property(init, PropertyKey::from_str("detail"), num(1.0));

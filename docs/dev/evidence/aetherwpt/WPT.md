@@ -629,3 +629,100 @@ and fail honestly where it differs — those failures are the layout's measureme
   Option<bandy::SMessage>` returning `crate::js::clipboard::take_written().map(bandy::SMessage::BrowserClipboardSet)`
   for the shell's frame loop to poll beside `copy_selection`.
 - `unaos/libs/web/css_core/src/selectors.rs` and `handlers/aether/src/dom/select.rs`: gap 1 above.
+
+## AETHERTOP (SR146) — the top layer: pseudo-classes, painting, inertness, trusted events, observer clipping
+
+Branch `exec-host-aethertop`, cut from 8da376cb (AETHERAPIS folded at c369c236). The arc closes AETHERAPIS's gaps
+1-4 above in that order; gap 6's `CSSColorValue` is not reached (typed_om.rs is not in the arc's files). No suite was
+run (R107): the fold's `wpt_apis` run is the measurement.
+
+### What landed, per spec section
+
+1. **`:popover-open`, `:modal` (HTML §4.16.3) and `:fullscreen` (Fullscreen §6).** css_core parses them as host
+   states (`unaos/libs/web/css_core/src/selectors.rs` `ElementState::{PopoverOpen, Modal, Fullscreen}` and the three
+   arms beside `"open"`; css_core's own `html_state` answers false for them and `invalidation.rs` treats them as
+   host-driven, untouched). Aether answers them in `handlers/aether/src/dom/select.rs` `state()` from a Rust MIRROR
+   of the prelude's top layer (`handlers/aether/src/js/toplayer.rs` `TOP`, fed by `__tl('track', n, elements,
+   kinds)` on every change: 1 a showing popover, 2 a modal dialog) and from `js::fullscreen::element()`, only in the
+   page's own document (`is_page_doc`, the arena-identity check `focused_in` uses). A top-layer change bumps a
+   generation (`toplayer::bump`, also from `fullscreen.rs` `__fs('set')`) that marks the DOM touched and makes
+   `css/mod.rs` `restyle_plan` re-cascade (`StyleCache.toplayer_gen`): the states flip with no DOM mutation.
+2. **The UA sheet** (`css/mod.rs` `UA_SHEET`; HTML §15.3 / §15.5 rendering, Fullscreen §7): a hidden popover is
+   `display: none`; a showing popover and a modal dialog are `position: fixed` boxes of the viewport placed at its
+   top-left (NOT the spec's `inset: 0; margin: auto` centering, which needs `width: fit-content` — layout_core has no
+   `fit-content`; with both insets an auto width would stretch to the viewport); the popover's border, padding,
+   `canvas` / `canvastext` colours; `:not(:root):fullscreen` fills the viewport; `::backdrop` is a fixed viewport
+   box, a modal dialog's `rgba(0, 0, 0, 0.1)`.
+3. **Painting the top layer** (HTML §15.5 "the top layer", CSS Position 4 §top-layer): `render/mod.rs` `frame_walk`
+   skips each top-layer element's box where its parent would paint it (`hoisted_to_top_layer`, after the
+   `display: none` check) and paints the top layer after the document in order (`paint_top_layer`, called after the
+   root `draw_node` of both the index walk and the paint walk): per element, its `::backdrop` colour blended over the
+   damage rects, then the element as its own stacking context from its parent's origin with the paint state inherited
+   down its ancestor chain, clipped to the viewport. The backdrop colour is the winning `background-color` /
+   `background` of the `::backdrop` rules matching the element (`css/mod.rs` `top_layer_backdrops`: Cascade 5 order
+   by importance, origin, specificity, order). A top-layer generation change paints the frame whole
+   (`relayout_damage`, `FrameSnap.top_gen`): a backdrop is not a box the damage snapshot sees.
+4. **Inertness** (HTML §6.3 inert, §4.11.4 "blocked by a modal dialog"): `toplayer::is_inert(id)` — while a modal
+   dialog is shown every node outside the topmost one's subtree (and outside the top-layer elements after it) is
+   inert. `js/events.rs` `click_with_activation`: a trusted click on an inert node targets the modal dialog (the
+   backdrop's originating element) and runs no activation behavior there; light dismiss still sees where it landed,
+   so a `closedby=any` dialog closes on a backdrop click (§6.12.2). `user_key`: a key whose target is inert goes to
+   the modal dialog.
+5. **Trusted events** (DOM §2.2 `isTrusted`; the UA fires them in HTML §6.12 / §4.11.4 and Fullscreen §4): the
+   prelude's `beforetoggle` / `toggle` (popover and dialog), `cancel`, `close` and the fullscreen prelude's
+   `fullscreenchange` / `fullscreenerror` dispatch through the native `__tl('fire', target, event)` →
+   `events::dispatch_trusted`.
+6. **IntersectionObserver clipping** (Intersection Observer §3.2.6 "compute the intersection" step 3, §3.2.5 "root
+   intersection rectangle", §2.2 scroll margin): `js/observers.rs` `clipByAncestors` clips the target's rect by the
+   content clip of each flat-tree ancestor up to the root (an axis whose computed overflow is not `visible` is
+   clipped to the padding box; a scroll container's clip grows by `scrollMargin`; for the implicit root the document
+   element's and a propagated body's overflow are the viewport's); an element root with a content clip intersects
+   at its padding area.
+
+### What the fold should expect
+
+- `wpt_apis_popovers` rises most: every page using `popover-utils.js`'s `assertPopoverVisibility` (`matches(
+  ':popover-open')` no longer throws; a hidden popover computes `display: none`) — `popover-attribute-basic`,
+  `popover-light-dismiss`, `popover-hidden-display`, `popover-types`, `popover-removal*`, `popover-stacking`,
+  `popover-focus*` where no testdriver input is needed; plus every page reading `isTrusted` on a ToggleEvent.
+- `wpt_apis_dialog` and `wpt2_html_semantics_interactive_elements` (`wpt_dom.rs`): `:modal` pages
+  (`dialog-showModal`, `modal-dialog-*` matching asserts), `closedby-*` and `dialog-close-event*` reading
+  `isTrusted`; `inert-*` partly (the script-visible half; pages that click through testdriver go through the hit
+  test, which does not know the top layer — gap 2 below).
+- `wpt_apis_fullscreen`: the `:fullscreen` pseudo-class pages and the `isTrusted` asserts on `fullscreenchange`.
+- `wpt_apis_intersection_observer`: the clipped-target and element-root pages (`clip-path`-free ones such as
+  `containing-block`, `client-rect`, `root-margin-root-element`, `scroll-margin*`, `isIntersecting-change-events`).
+- Stay red: `centering`, `top-layer-position`, `abspos-dialog-layout`, `modal-dialog-scroll-height` (no
+  `fit-content`, gap 1 below); Typed OM's colour pages (gap 7).
+- Nothing in `wpt_dom` outside the dialog pages should move; a page with no popover, dialog or fullscreen element has
+  an empty top layer, paints as before, and its restyle plan is unchanged (generation steady).
+
+### Gap list (dated 2026-10-13; what this arc did not reach — each change outside its files, named exactly)
+
+1. **No `fit-content`** in layout_core (`unaos/libs/web/layout_core/src/css.rs`'s `width` arm has no keyword for it;
+   grep finds none in layout_core): the spec's UA rules for popovers and modal dialogs (`inset: 0; margin: auto;
+   width: fit-content; height: fit-content`) cannot be written, so both sit at the viewport's top-left instead of
+   centred. Change: a `fit-content` width / height keyword (shrink-to-fit) in layout_core, then the UA sheet takes the
+   spec's rules.
+2. **The hit test does not hoist the top layer** (`handlers/aether/src/lib.rs` `hit_origin` / `hit_context`, lines
+   ~2085-2310, mirror render's paint order without the top layer): a click over a top-layer element can hit the
+   document box beneath it. `events.rs` retargets a click on an inert node to the modal dialog, so a modal dialog's
+   own controls are reachable only where they do not overlap document content. Change: test the top layer's boxes
+   first, in reverse order (`js::toplayer::top_layer`), and skip inert boxes.
+3. **The focusing steps do not refuse inert elements** (`focus()` on an element outside a modal dialog still focuses
+   it; HTML §6.6.3 "focusable area" excludes inert nodes): `handlers/aether/src/js/dom.rs`'s focus path needs
+   `toplayer::is_inert`.
+4. **The CloseWatcher interface's own events** (`cancel` / `close` on a page's `CloseWatcher`) are dispatched
+   untrusted by `handlers/aether/src/js/closewatcher.rs` (not in this arc's files): route them through
+   `events::dispatch_trusted` as toplayer.rs does.
+5. **Pointer, mouse and wheel events** (`events.rs` `pointer_event` / `user_mouse` / `user_button` / `user_wheel`) still
+   reach inert nodes; only the click and keys are retargeted.
+6. **`::backdrop` under `@media` / `@container`**: `top_layer_backdrops` reads the rule set without evaluating the
+   conditions of the rule's ancestors; a backdrop's only painted property is its background colour (no image,
+   gradient, border, filter or opacity).
+7. **`CSSColorValue`** and its subclasses (AETHERAPIS gap 6) — typed_om.rs is not in this arc's files.
+8. **The fullscreen element's place in the top layer** is approximated as last (Fullscreen §4 adds it where the
+   request fell); the shell still does not size the viewport to it (AETHERAPIS gap 2).
+9. **IntersectionObserver**: the flat-tree parent chain stands in for the containing-block chain (an absolutely
+   positioned target is clipped by a non-positioned overflow ancestor it escapes); `clip-path` is not a clip; no
+   `delay` / `trackVisibility` (AETHERAPIS gap 4's rest).

@@ -3,7 +3,10 @@
 //! no transient activation — and the `fullscreenchange` / `fullscreenerror` events queued as tasks; §5
 //! `Document.fullscreenEnabled`, `fullscreenElement`, `fullscreen`, `exitFullscreen()`; the event handler IDL
 //! attributes on Document and Element). The fullscreen element is the page's: the shell reads [`element`] to size
-//! the viewport to it (owed: a shell seam that does — docs/dev/evidence/aetherwpt/WPT.md §AETHERAPIS).
+//! the viewport to it (owed: a shell seam that does — docs/dev/evidence/aetherwpt/WPT.md §AETHERAPIS). AETHERTOP
+//! (SR146): it matches `:fullscreen` (dom/select.rs reads [`element`]), the UA sheet makes it a fixed box of the
+//! viewport (`crate::css::UA_SHEET`, Fullscreen §7), `render` paints it in the top layer (js/toplayer.rs
+//! `top_layer` appends it), and its events are trusted (`__tl('fire')`).
 //!
 //! CHARTER: Aether — binding.
 
@@ -31,7 +34,10 @@ fn native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     match op.as_str() {
         "set" => {
             let e = arg(vm, ctx, 1);
-            ELEMENT.with(|c| c.set(super::dom::node_of(vm, &e)));
+            let new = super::dom::node_of(vm, &e);
+            if ELEMENT.with(|c| c.replace(new)) != new {
+                super::toplayer::bump();
+            }
             Ok(Value::Undefined)
         }
         "get" => Ok(super::dom::wrap_opt(vm, element())),
@@ -67,7 +73,7 @@ const PRELUDE: &str = r#"
         queue(function () {
             var t = target;
             if (t.nodeType === 1 && !t.isConnected) { t = document; }
-            t.dispatchEvent(new Event(type, { bubbles: true, composed: true }));
+            __tl('fire', t, new Event(type, { bubbles: true, composed: true }));
         });
     };
     // Fullscreen §5 "fullscreen enabled flag": a nested document needs its iframe's allowfullscreen (or the policy).

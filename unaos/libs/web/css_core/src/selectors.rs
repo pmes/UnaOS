@@ -3,7 +3,8 @@
 //! Covered: type / universal selectors with namespace prefixes (`ns|E`, `*|E`, `|E`), `#id`, `.class`,
 //! attribute selectors with every operator and the `i` / `s` flags, the logical combinations `:not()`
 //! `:is()` `:where()` `:has()`, the child-indexed `:nth-*()` (An+B, `of S`), `:first-child` … `:only-of-type`,
-//! `:root` `:empty` `:scope`, the user-action / location / input pseudo-classes as state hooks,
+//! `:root` `:empty` `:scope`, the user-action / location / input pseudo-classes as state hooks (and the
+//! top-layer states `:popover-open` `:modal` `:fullscreen` — HTML §4.16.3, Fullscreen §6 — AETHERTOP SR146),
 //! `:lang()` `:dir()`, pseudo-elements (`::before` `::after` `::first-line` `::first-letter` `::marker`
 //! `::placeholder` `::selection` `::backdrop` `::file-selector-button`, plus the legacy one-colon forms),
 //! the combinators ` ` `>` `+` `~`, relative selectors, and CSS Nesting's `&`.
@@ -106,6 +107,12 @@ pub enum ElementState {
     Defined,
     Open,
     Autofill,
+    /// `:popover-open` (HTML §4.16.3): a popover element in the showing state.
+    PopoverOpen,
+    /// `:modal` (HTML §4.16.3): a dialog shown by `showModal()` (its is-modal flag).
+    Modal,
+    /// `:fullscreen` (Fullscreen API §6): the document's fullscreen element.
+    Fullscreen,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -636,6 +643,9 @@ fn pseudo_class(n: &str) -> Option<PseudoClass> {
         "defined" => P::State(S::Defined),
         "open" => P::State(S::Open),
         "autofill" => P::State(S::Autofill),
+        "popover-open" => P::State(S::PopoverOpen),
+        "modal" => P::State(S::Modal),
+        "fullscreen" => P::State(S::Fullscreen),
         _ => return None,
     })
 }

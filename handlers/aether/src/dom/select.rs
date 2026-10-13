@@ -255,6 +255,12 @@ impl Element for El<'_> {
             }
             // AETHERSHADOW: `:defined` is the element's custom element state (HTML §4.13.1).
             ElementState::Defined => super::custom::is_defined(self.doc, self.id),
+            // AETHERTOP (SR146): the top-layer states (HTML §4.16.3 `:popover-open` / `:modal`, Fullscreen §6
+            // `:fullscreen`) are the page's (js/toplayer.rs mirrors the prelude's top layer; js/fullscreen.rs
+            // holds the fullscreen element): nothing matches in another arena (a snapshot, a nested document).
+            ElementState::PopoverOpen => is_page_doc(self.doc) && crate::js::toplayer::is_popover_showing(self.id.0),
+            ElementState::Modal => is_page_doc(self.doc) && crate::js::toplayer::is_modal(self.id.0),
+            ElementState::Fullscreen => is_page_doc(self.doc) && crate::js::fullscreen::element() == Some(self.id.0),
             _ => html_state(self, s),
         }
     }
@@ -286,6 +292,14 @@ fn is_hovered(doc: &Document, id: NodeId) -> bool {
     HOVER_CHAIN.with(|h| {
         let h = h.borrow();
         h.0 != 0 && h.0 == doc as *const Document as usize && h.1.contains(&id)
+    })
+}
+
+/// Is `doc` the page's own document (the arena the script lane's state — focus, the top layer — refers to)?
+fn is_page_doc(doc: &Document) -> bool {
+    crate::js::PAGE.with(|p| {
+        let Ok(p) = p.try_borrow() else { return false };
+        p.doc.as_ref().is_some_and(|d| std::ptr::eq(d.doc.as_ptr() as *const Document, doc))
     })
 }
 

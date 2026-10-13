@@ -11,8 +11,10 @@
 //! CHARTER: Aether — binding.
 //!
 //! Both observe the engine's own layout: the rects are `getBoundingClientRect()`'s (AETHERINLINE's boxes in
-//! viewport coordinates) and the content box is the border box less the computed paddings and borders; a root's
-//! clipping by its own `overflow` ancestors is not modelled (the gap list). [`update`] runs once per rendering
+//! viewport coordinates) and the content box is the border box less the computed paddings and borders. AETHERTOP
+//! (SR146): the target's rect is clipped by the content clip of each ancestor up to the root (§3.2.6 step 3, the
+//! flat-tree parent chain standing in for the containing-block chain), a scroll container's clip grown by the
+//! scrollMargin, and an element root with a content clip intersects at its padding area (§3.2.5). [`update`] runs once per rendering
 //! opportunity, after the animation-frame callbacks (HTML §8.1.7.3 "update the rendering" steps 14 and 16:
 //! `Engine::drain_raf_once`, which `event_loop::settle` and the shell's frame call), and returns how many
 //! notifications it queued or delivered, so the loop keeps turning while observations change.
@@ -111,6 +113,46 @@ const PRELUDE: &str = r#"
         return { x: r.x - left, y: r.y - top, w: r.w + left + right, h: r.h + top + bottom };
     };
     var viewportRect = function () { return { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight }; };
+    // AETHERTOP (SR146): an element's content clip (Intersection Observer §3.2.6 "compute the intersection" step 3.3,
+    // CSS Overflow 3 §3): its padding box on each axis whose computed overflow is not `visible` (an unclipped axis is
+    // unbounded); null when neither axis clips. A scroll container's clip (auto / scroll / hidden) grows by the
+    // observer's scrollMargin (§2.2 "scroll margin").
+    var BIG = 1e9;
+    var contentClip = function (el, scrollMargin) {
+        var cs = getComputedStyle(el);
+        var ox = cs.getPropertyValue('overflow-x'), oy = cs.getPropertyValue('overflow-y');
+        var cx = ox !== '' && ox !== 'visible', cy = oy !== '' && oy !== 'visible';
+        if (!cx && !cy) { return null; }
+        var r = rectOf(el), e = edges(el);
+        var pad = { x: r.x + e.bl, y: r.y + e.bt, w: Math.max(0, r.w - e.bl - e.br), h: Math.max(0, r.h - e.bt - e.bb) };
+        var scroller = function (o) { return o === 'auto' || o === 'scroll' || o === 'hidden'; };
+        if (scrollMargin && (scroller(ox) || scroller(oy))) { pad = expand(pad, scrollMargin); }
+        if (!cx) { pad.x = -BIG; pad.w = 2 * BIG; }
+        if (!cy) { pad.y = -BIG; pad.h = 2 * BIG; }
+        return pad;
+    };
+    // The flat-tree parent element (a shadow root's host), the containing-block chain's approximation.
+    var parentEl = function (n) {
+        var p = n.parentNode;
+        if (p && p.nodeType === 11 && p.host) { return p.host; }
+        return p && p.nodeType === 1 ? p : null;
+    };
+    // §3.2.6 step 3: clip `rect` by every ancestor's content clip between `target` and the intersection root
+    // (exclusive; for the implicit root the document element's and a propagated body's overflow belong to the
+    // viewport — CSS Overflow 3 §3.3 — whose rect is the root intersection rectangle already). null: clipped away.
+    var clipByAncestors = function (target, rect, root, scrollMargin) {
+        var html = document.documentElement;
+        var bodyPropagates = html && document.body && getComputedStyle(html).getPropertyValue('overflow-x') === 'visible' && getComputedStyle(html).getPropertyValue('overflow-y') === 'visible';
+        for (var a = parentEl(target); a && a !== root; a = parentEl(a)) {
+            if (a === html || (bodyPropagates && a === document.body)) { continue; }
+            var c = contentClip(a, scrollMargin);
+            if (c) {
+                rect = intersect(rect, c);
+                if (!rect) { return null; }
+            }
+        }
+        return rect;
+    };
     var intersect = function (a, b) {
         var x0 = Math.max(a.x, b.x), y0 = Math.max(a.y, b.y), x1 = Math.min(a.x + a.w, b.x + b.w), y1 = Math.min(a.y + a.h, b.y + b.h);
         if (x1 < x0 || y1 < y0) { return null; }
@@ -205,7 +247,13 @@ const PRELUDE: &str = r#"
             var rootRect, rootConnected = true;
             if (root === null) { rootRect = viewportRect(); }
             else if (root instanceof Document) { rootRect = viewportRect(); rootConnected = root === document; }
-            else { rootConnected = root.isConnected; rootRect = hasBox(root) ? rectOf(root) : null; }
+            else {
+                rootConnected = root.isConnected;
+                // §3.2.5 "root intersection rectangle": an element root with a content clip is its padding area.
+                rootRect = hasBox(root) ? rectOf(root) : null;
+                var rc = rootRect ? contentClip(root, null) : null;
+                if (rc) { rootRect = intersect(rootRect, rc) || { x: rootRect.x, y: rootRect.y, w: 0, h: 0 }; }
+            }
             var rootBounds = rootRect ? expand(rootRect, s.rootMargin) : null;
             s.targets.slice().forEach(function (target) {
                 var prev = s.state.get(target);
@@ -214,7 +262,8 @@ const PRELUDE: &str = r#"
                 var inRoot = root === null || root instanceof Document ? target.isConnected && sameDoc : (root.contains(target) && root !== target);
                 if (sameDoc && target.isConnected && hasBox(target) && rootBounds && rootConnected && inRoot) {
                     targetRect = rectOf(target);
-                    var ir = intersect(targetRect, rootBounds);
+                    var clipped = clipByAncestors(target, targetRect, root instanceof Element ? root : null, s.scrollMargin);
+                    var ir = clipped ? intersect(clipped, rootBounds) : null;
                     if (ir) {
                         isIntersecting = true;
                         intersectionRect = ir;

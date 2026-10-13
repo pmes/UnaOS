@@ -168,6 +168,21 @@ pub(crate) struct FrameSnap {
     boxes: std::collections::HashMap<NodeId, BoxSnap>,
     scroll: (i32, i32),
     size: (u32, u32),
+    /// AETHERTOP (SR146): the top-layer generation (js/toplayer.rs) the frame painted — a changed one paints whole.
+    top_gen: u64,
+}
+
+thread_local! {
+    /// AETHERTOP (SR146): the boxes of the top layer's elements this frame (the document's own walk skips them;
+    /// [`paint_top_layer`] paints each after its `::backdrop`), and the one the top-layer pass is painting now.
+    static TOP_IDS: std::cell::RefCell<Vec<NodeId>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TOP_PASS: std::cell::Cell<Option<NodeId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Is `id` a top-layer box the walk must leave to the top-layer pass (HTML "top layer": an element in it is
+/// painted there, not where its parent would paint it)?
+fn hoisted_to_top_layer(id: NodeId) -> bool {
+    TOP_PASS.with(|t| t.get()) != Some(id) && TOP_IDS.with(|t| t.borrow().contains(&id))
 }
 
 /// AETHERPAINTPERF2 (SR132): the last frame's on-screen boxes with the paint inputs of each, read off the tree it
@@ -275,6 +290,10 @@ pub(crate) fn relayout_damage(
         return None;
     }
     if before.outlines || any_outline(layout) || canvas_background(layout) != before.canvas {
+        return None;
+    }
+    // AETHERTOP (SR146): a top-layer change (a modal dialog's backdrop covers the viewport) paints the frame whole.
+    if before.snap.top_gen != crate::js::toplayer::generation() {
         return None;
     }
     frame_walk(layout, surface, width, height, scroll_x, scroll_y, &[(0, 0, width, height)], true);
@@ -2562,6 +2581,10 @@ fn frame_walk(
         {
             return;
         }
+        // AETHERTOP (SR146): a top-layer element paints in the top-layer pass, not where its parent would.
+        if hoisted_to_top_layer(node_id) {
+            return;
+        }
         // visibility:hidden / opacity:0 keep their space but paint nothing;
         // approximation: the whole subtree skips (no visibility:visible
         // re-reveal inside a hidden ancestor).
@@ -3891,13 +3914,92 @@ fn frame_walk(
         // AETHERPAINTPERF2 (SR132): the index walk records the frame's on-screen boxes afresh.
         x.seq = 0;
         x.open.clear();
-        x.snap = FrameSnap { boxes: std::collections::HashMap::new(), scroll: (sx, sy), size: if indexed { (width, height) } else { (0, 0) } };
+        x.snap = FrameSnap {
+            boxes: std::collections::HashMap::new(),
+            scroll: (sx, sy),
+            size: if indexed { (width, height) } else { (0, 0) },
+            top_gen: crate::js::toplayer::generation(),
+        };
     });
+    // AETHERTOP (SR146): the top layer's boxes (one per element, its first box), in top-layer order, with each
+    // element's `::backdrop` colour from the cascade (`css::top_layer_paint`).
+    let top: Vec<(NodeId, Option<((u8, u8, u8), f32)>)> = crate::css::top_layer_paint()
+        .into_iter()
+        .filter_map(|(dom, backdrop)| {
+            let mut ids: Vec<NodeId> = layout.node_map.iter().filter(|(_, n)| n.is_element() && n.id() == dom).map(|(t, _)| *t).collect();
+            ids.sort_by_key(|t| u64::from(*t));
+            ids.first().map(|t| (*t, backdrop))
+        })
+        .collect();
+    TOP_IDS.with(|t| *t.borrow_mut() = top.iter().map(|(t, _)| *t).collect());
+
+    /// AETHERTOP (SR146): the top layer painted after the document (HTML §15.5.x "the top layer", CSS Position 4
+    /// §top-layer): each element in order, as a stacking context of its own, after its `::backdrop` — a box the
+    /// size of the viewport, blended at the backdrop's colour and alpha over everything painted so far. The element
+    /// is painted from its parent's border-box origin with the paint state inherited along its ancestor chain
+    /// (its UA rule makes it a fixed box, so `placed_origin` places it against the viewport).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_top_layer(
+        top: &[(NodeId, Option<((u8, u8, u8), f32)>)],
+        root_inherited: Inherited,
+        layout: &LayoutTree,
+        font: &Option<&'static Font>,
+        font_bold: &Option<&'static Font>,
+        surface: &mut [u8],
+        width: u32,
+        height: u32,
+        sx: i32,
+        sy: i32,
+        damage_rects: &[(u32, u32, u32, u32)],
+    ) {
+        for (tid, backdrop) in top {
+            if let Some((rgb, a)) = backdrop {
+                if walk_mode() != 1 {
+                    let alpha = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+                    for &(dx, dy, dw, dh) in damage_rects {
+                        for y in dy..(dy + dh).min(height) {
+                            for x in dx..(dx + dw).min(width) {
+                                blend_px(surface, width, x, y, *rgb, alpha);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut chain = Vec::new();
+            let mut cur = layout.taffy.parent(*tid);
+            while let Some(p) = cur {
+                chain.push(p);
+                cur = layout.taffy.parent(p);
+            }
+            let mut inh = root_inherited;
+            let (mut ax, mut ay) = (0.0f32, 0.0f32);
+            for p in chain.iter().rev() {
+                if let Ok(l) = layout.taffy.layout(*p) {
+                    ax += l.location.x;
+                    ay += l.location.y;
+                }
+                if let Some(dn) = layout.node_map.get(p) {
+                    if let Some(el) = dn.as_element() {
+                        let spec = layout.paint_map.get(p).cloned().unwrap_or_default();
+                        inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn, *p);
+                    }
+                }
+            }
+            TOP_PASS.with(|t| t.set(Some(*tid)));
+            draw_node(
+                *tid, ax, ay, inh, layout, font, font_bold, surface, width, height, sx, sy, damage_rects,
+                (0.0, 0.0, width as f32, height as f32),
+            );
+            TOP_PASS.with(|t| t.set(None));
+        }
+    }
+
     if indexed {
         draw_node(
             layout.root_node, 0.0, 0.0, root_inherited, layout, &font, &font_bold, surface, width, height, sx, sy,
             damage_rects, (0.0, 0.0, width as f32, height as f32),
         );
+        paint_top_layer(&top, root_inherited, layout, &font, &font_bold, surface, width, height, sx, sy, damage_rects);
         INDEX.with(|x| x.borrow_mut().mode = if index_only { 0 } else { 2 });
         if index_only {
             return;
@@ -3919,6 +4021,7 @@ fn frame_walk(
         damage_rects,
         (0.0, 0.0, width as f32, height as f32),
     );
+    paint_top_layer(&top, root_inherited, layout, &font, &font_bold, surface, width, height, sx, sy, damage_rects);
     let (painted, skipped) = INDEX.with(|x| {
         let mut x = x.borrow_mut();
         x.mode = 0;

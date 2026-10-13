@@ -9,10 +9,14 @@
 //!
 //! CHARTER: Aether — binding.
 //!
-//! The DOM and event half is here; the rendering half is owed (docs/dev/evidence/aetherwpt/WPT.md §AETHERAPIS):
-//! css_core parses no `:popover-open` / `:modal`, so a hidden popover has no UA `display: none` rule and `matches()`
-//! on those pseudo-classes throws; a closed dialog does get its UA rule (`crate::css` UA sheet). Nothing paints the
-//! top layer above the document or a `::backdrop`.
+//! The DOM and event half is here. AETHERTOP (SR146) added the rendering half's seams: the prelude's top layer is
+//! MIRRORED in Rust (`TOP`, fed by `__tl('track', …)` on every change) so the cascade answers `:popover-open` /
+//! `:modal` (dom/select.rs `state`, css_core's `ElementState::{PopoverOpen, Modal}`) and the UA sheet
+//! (`crate::css::UA_SHEET`) can hide a hidden popover; `render` paints [`top_layer`] above the document in order,
+//! each element after its `::backdrop` (CSS Position 4 §top-layer, HTML §15.5.x "the top layer" rendering);
+//! [`is_inert`] is HTML §4.11.4's "blocked by a modal dialog" for the engine's input path (js/events.rs); and the
+//! events the prelude fires go through `__tl('fire', target, event)` → `events::dispatch_trusted`, so
+//! `beforetoggle` / `toggle` / `cancel` / `close` carry `isTrusted` true as the user agent's events do.
 //!
 //! Hooks from the engine: [`invoker_activation`] (a button's or input's activation behavior, js/events.rs),
 //! [`light_dismiss`] (a trusted click), [`node_removed`] (DOM removal, js/dom.rs), [`attribute_changed`] (the
@@ -21,15 +25,97 @@
 use super::idl::arg;
 use super::Task;
 use js_core::vm::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+/// A top-layer entry's kind, as the prelude reports it: a showing popover, a modal dialog, else (an element the
+/// prelude tracks but paints in flow — nothing today), and the fullscreen element appended by [`top_layer`].
+pub const KIND_POPOVER: u8 = 1;
+pub const KIND_MODAL: u8 = 2;
+pub const KIND_FULLSCREEN: u8 = 3;
 
 thread_local! {
     /// How many elements the prelude is tracking (showing popovers, open dialogs): the hooks skip the JS call at 0.
     static TRACKED: Cell<u32> = const { Cell::new(0) };
+    /// AETHERTOP (SR146): the prelude's top layer, in order (node id, kind) — the Rust mirror the cascade, the
+    /// painter and the input path read.
+    static TOP: RefCell<Vec<(usize, u8)>> = const { RefCell::new(Vec::new()) };
+    /// Bumped on every top-layer change (and every fullscreen change): the restyle's cue that a `:popover-open` /
+    /// `:modal` / `:fullscreen` match may have flipped without a DOM change (css/mod.rs `restyle_plan`), and the
+    /// painter's cue that the last frame's damage is not enough (render `relayout_damage`).
+    static GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 pub fn reset() {
     TRACKED.with(|t| t.set(0));
+    TOP.with(|t| t.borrow_mut().clear());
+    bump();
+}
+
+/// A top-layer change happened (the mirror, or the fullscreen element): the next restyle re-reads the three
+/// states and the next frame repaints whole; the DOM counts as mutated so the engine lays out and paints again.
+pub fn bump() {
+    GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    super::touch();
+}
+
+/// The top-layer generation (see `GENERATION`).
+pub fn generation() -> u64 {
+    GENERATION.with(Cell::get)
+}
+
+/// HTML §4.16.3 `:popover-open`: `id` is a popover in the showing state.
+pub fn is_popover_showing(id: usize) -> bool {
+    TOP.with(|t| t.borrow().iter().any(|&(n, k)| n == id && k == KIND_POPOVER))
+}
+
+/// HTML §4.16.3 `:modal`: `id` is a dialog whose is-modal flag is set.
+pub fn is_modal(id: usize) -> bool {
+    TOP.with(|t| t.borrow().iter().any(|&(n, k)| n == id && k == KIND_MODAL))
+}
+
+/// The document's top layer in order (HTML "top layer": the prelude's list — popovers and modal dialogs as they
+/// were added — then the fullscreen element when it is not already in it; Fullscreen §4 adds it on the request, so
+/// its true place is where that request fell among the others — approximated as last), as (node id, kind).
+pub fn top_layer() -> Vec<(usize, u8)> {
+    let mut v = TOP.with(|t| t.borrow().clone());
+    if let Some(fs) = super::fullscreen::element() {
+        if !v.iter().any(|&(n, _)| n == fs) {
+            v.push((fs, KIND_FULLSCREEN));
+        }
+    }
+    v
+}
+
+/// Is `id` painted in the top layer (so the document's own walk skips it)?
+pub fn in_top_layer(id: usize) -> bool {
+    TOP.with(|t| t.borrow().iter().any(|&(n, _)| n == id)) || super::fullscreen::element() == Some(id)
+}
+
+/// The topmost modal dialog (the last one in the top layer), when one is shown.
+pub fn modal_dialog() -> Option<usize> {
+    TOP.with(|t| t.borrow().iter().rev().find(|&&(_, k)| k == KIND_MODAL).map(|&(n, _)| n))
+}
+
+/// HTML §4.11.4 "blocked by a modal dialog" / §6.3 inert: while a modal dialog is shown, every node outside the
+/// topmost one's subtree is inert (a click does not reach it, a key is retargeted — js/events.rs), except the
+/// top-layer elements added after it (a popover opened from the dialog) and their subtrees.
+pub fn is_inert(id: usize) -> bool {
+    let top = top_layer();
+    let Some(pos) = top.iter().rposition(|&(_, k)| k == KIND_MODAL) else { return false };
+    let roots: Vec<usize> = top[pos..].iter().map(|&(n, _)| n).collect();
+    let mut cur = Some(id);
+    let mut hops = 0;
+    while let Some(n) = cur {
+        if roots.contains(&n) {
+            return false;
+        }
+        cur = super::dom::parent_of(n);
+        hops += 1;
+        if hops > 65_536 {
+            break;
+        }
+    }
+    true
 }
 
 fn call(vm: &mut Vm, name: &str, args: &[Value]) -> Option<Value> {
@@ -81,7 +167,9 @@ pub fn attribute_changed(vm: &mut Vm, el: usize, local: &str, old: &Option<Strin
     call(vm, "__tl_attr", &[v, super::idl::s(local), o, n]);
 }
 
-/// `__tl(op, arg)`: `queue(fn)` queues `fn` as a task; `track(n)` records how many elements are showing.
+/// `__tl(op, …)`: `queue(fn)` queues `fn` as a task; `track(n, elements, kinds)` records how many elements are
+/// showing and mirrors the top layer (`elements[i]` of kind `kinds[i]`, in order); `fire(target, event)` dispatches
+/// a script-built event as a trusted one (`isTrusted` true) and answers whether it was not canceled.
 fn native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let v = arg(vm, ctx, 0);
     let op = vm.to_string(&v)?.to_rust();
@@ -97,6 +185,35 @@ fn native(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             let v = arg(vm, ctx, 1);
             let n = vm.to_number(&v)?;
             TRACKED.with(|t| t.set(n.max(0.0) as u32));
+            let els = arg(vm, ctx, 2);
+            let kinds = arg(vm, ctx, 3);
+            let mut top = Vec::new();
+            if let (Some(eo), Some(ko)) = (els.as_object(), kinds.as_object()) {
+                let len = vm.get(eo, &PropertyKey::from_str("length")).ok().and_then(|l| vm.to_number(&l).ok()).unwrap_or(0.0);
+                for i in 0..len.max(0.0).min(65_536.0) as u32 {
+                    let e = vm.get(eo, &PropertyKey::Index(i)).unwrap_or(Value::Undefined);
+                    let k = vm.get(ko, &PropertyKey::Index(i)).unwrap_or(Value::Undefined);
+                    if let Some(id) = super::dom::node_of(vm, &e) {
+                        let k = vm.to_number(&k).unwrap_or(0.0);
+                        top.push((id, k.clamp(0.0, 255.0) as u8));
+                    }
+                }
+            }
+            let changed = TOP.with(|t| {
+                let mut t = t.borrow_mut();
+                let changed = *t != top;
+                *t = top;
+                changed
+            });
+            if changed {
+                bump();
+            }
+        }
+        "fire" => {
+            let t = arg(vm, ctx, 1);
+            let e = arg(vm, ctx, 2);
+            let ok = super::events::dispatch_trusted(vm, &t, &e).unwrap_or(true);
+            return Ok(Value::Bool(ok));
         }
         _ => {}
     }
@@ -142,7 +259,12 @@ const PRELUDE: &str = r#"
     var autoList = [];       // showing auto popovers
     var hintList = [];       // showing hint popovers
     var dialogs = [];        // open dialogs (for light dismiss with closedby=any)
-    var track = function () { __tl('track', topLayer.length + autoList.length + hintList.length + dialogs.length + (fsElement() ? 1 : 0)); };
+    // AETHERTOP (SR146): the count the hooks gate on, and the top layer mirrored for the cascade and the painter
+    // (1 a showing popover, 2 a modal dialog).
+    var track = function () {
+        var kinds = topLayer.map(function (el) { var s = st(el); return s.vis === 'showing' ? 1 : (s.modal ? 2 : 0); });
+        __tl('track', topLayer.length + autoList.length + hintList.length + dialogs.length + (fsElement() ? 1 : 0), topLayer, kinds);
+    };
     var fsElement = function () { return typeof __fs === 'function' ? __fs('get') : null; };
     var remove = function (list, el) { var i = list.indexOf(el); if (i >= 0) { list.splice(i, 1); } };
     var queueTask = function (f) { __tl('queue', f); };
@@ -153,9 +275,11 @@ const PRELUDE: &str = r#"
         if (p && p.nodeType === 11 && p.host) { return p.host; }
         return p;
     };
+    // The events the user agent fires are trusted: __tl('fire') dispatches with isTrusted true (AETHERTOP SR146).
+    var fire = function (el, e) { return __tl('fire', el, e); };
     var fireToggle = function (el, type, oldState, newState, cancelable) {
         var e = new ToggleEvent(type, { cancelable: !!cancelable, oldState: oldState, newState: newState });
-        el.dispatchEvent(e);
+        fire(el, e);
         return !e.defaultPrevented;
     };
     // "queue a popover toggle event task" / "queue a dialog toggle event task" (HTML §6.12.1 / §4.11.4)
@@ -489,7 +613,7 @@ const PRELUDE: &str = r#"
                 remove(topLayer, el);
                 remove(dialogs, el);
                 if (ds.cw) { ds.cw.destroy(); ds.cw = null; }
-                queueTask(function () { el.dispatchEvent(new Event('close')); });
+                queueTask(function () { fire(el, new Event('close')); });
                 track();
             }
         }
@@ -505,7 +629,7 @@ const PRELUDE: &str = r#"
         return __cw_make({
             cancel: function (canPreventClose) {
                 var e = new Event('cancel', { cancelable: canPreventClose });
-                d.dispatchEvent(e);
+                fire(d, e);
                 return !e.defaultPrevented;
             },
             close: function () { closeDialog(d, null); },
@@ -552,7 +676,7 @@ const PRELUDE: &str = r#"
             for (var n = active; n; n = flatParent(n)) { if (n === d) { inside = true; break; } }
             if (inside || wasModal || !active || active === d.ownerDocument.body) { runFocus(prev); }
         }
-        queueTask(function () { d.dispatchEvent(new Event('close')); });
+        queueTask(function () { fire(d, new Event('close')); });
         track();
     };
     var requestCloseDialog = function (d, result) {
@@ -605,7 +729,7 @@ const PRELUDE: &str = r#"
             var rv = returnValue === undefined ? null : String(returnValue);
             var cw = s.cw;
             s.cw = __cw_make({
-                cancel: function (canPreventClose) { var e = new Event('cancel', { cancelable: canPreventClose }); d.dispatchEvent(e); return !e.defaultPrevented; },
+                cancel: function (canPreventClose) { var e = new Event('cancel', { cancelable: canPreventClose }); fire(d, e); return !e.defaultPrevented; },
                 close: function () { closeDialog(d, rv); },
                 enabled: function () { return d.hasAttribute('open') && computedClosedBy(d) !== 'none'; }
             });
