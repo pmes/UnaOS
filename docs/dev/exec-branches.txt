@@ -409,6 +409,6 @@ refs/heads/exec-rmbp-pointerscale             bf81f7ef IN-FLIGHT cloud 2026-10-1
 refs/heads/exec-rmbp-pumphole                 bf81f7ef IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-twocursors               bf81f7ef IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-aetherptr                bf81f7ef IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-rmbp-splashword2              bf81f7ef IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-splashword2              f416f182 FOLDED-BY-HAND 2996a71c 2026-10-13
 refs/heads/exec-rmbp-dockpins                 bf81f7ef IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-usbnetrx2                36f2e5b7 FOLDED-BY-HAND d72be074 2026-10-13
