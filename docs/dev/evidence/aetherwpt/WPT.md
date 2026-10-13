@@ -336,3 +336,184 @@ for the viewport offset `scrollIntoView` moves (the viewport offset is the scrip
 Beyond the predicates, the API directories outside the run set (the counts above) are the next arcs' run set:
 popovers and dialog, IntersectionObserver / ResizeObserver, Web Animations, CSS Typed OM, the Clipboard API,
 Fullscreen, close-watcher.
+
+## AETHERAPIS (SR145) — the API directories outside the run set
+
+The last paragraph of AETHERWPT4's "Next ten" names the API directories a modern page reaches for that no runner
+serves: popovers and dialog, IntersectionObserver / ResizeObserver, Web Animations, CSS Typed OM, the Clipboard API,
+Fullscreen, close-watcher. This arc measures them, implements them as far as one arc reaches, and gives them their own
+runner (`handlers/aether/tests/wpt_apis.rs`). R107: no executor ran WPT, a test or QEMU; the fold's run is the
+measurement. The commit carrying this section is the one on `exec-host-aetherapis` (parent e57d1b0e).
+
+### Measurement (step 1: the run set and the pinned checkout, 2026-10-13)
+
+**Which of the seven the runner served today.** `tests/wpt_dom.rs` runs `DIRS` (9), `NET_DIRS` (3) and `WPT2_DIRS`
+(27); its `SPARSE` carries no `css/css-typed-om`, `web-animations`, `intersection-observer`, `html/semantics/popovers`,
+`fullscreen`, `clipboard-apis`, `close-watcher` or `resize-observer` — none of those is in the run set. The one
+exception is the dialog element: `html/semantics/interactive-elements/the-dialog-element` is a subdirectory of
+`html/semantics/interactive-elements`, which `wpt2_html_semantics_interactive_elements` runs recursively (floor 0), so
+its 86 testharness pages already ran and failed on the stubs (the AETHERWPT4 table counts them under
+`html/semantics/interactive-elements`: 47 run, 65 excluded, "testdriver (dialog, popover, details input)"). This runner
+lists it too, so the dialog's score is read beside the popovers' (the two share the top layer); the fold may drop one
+of the two runs if the wall time matters.
+
+**Page counts at da1f6d20** (a sparse checkout of the nine directories, counted with the runner's own rules: an
+`.html` / `.htm` that loads testharness.js, a `.window.js`, an `.any.js` whose `META: global` names window;
+`resources/`, `support/`, `tools/`, `crashtests/` and `reference/` left out; "other" = reftests, crash tests, support
+pages without testharness.js). "testdriver" = pages that load testdriver.js directly (the runner also scans their
+helper scripts, so the served count at the fold is a little lower):
+
+| directory | testharness pages | testdriver | https | manual | other | pages this runner serves (no testdriver, no TLS, no second origin, no handler) |
+|---|---|---|---|---|---|---|
+| css/css-typed-om | 359 (the-stylepropertymap 288, of them properties/ 246; stylevalue-subclasses 46; serialization 11; normalization 5; objects 4) | 0 | 0 | 0 | 13 | 359 |
+| web-animations | 144 (animation-model 41, interfaces 47, timing-model 42, responsive 53 minus reftests, animation-trigger 3) | 3 | 0 | 0 | 40 crash tests | 140 (one page fetches `resources/xhr-doc.py`) |
+| intersection-observer | 150 | 0 | 0 | 0 | 5 | ~140 (the `.sub.html` cross-origin iframe pages are excluded) |
+| html/semantics/interactive-elements/the-dialog-element | 86 | 46 | 0 | 0 | 97 | 40 |
+| html/semantics/popovers | 85 | 53 | 0 | 1 | 45 | 32 |
+| fullscreen | 90 | 75 | 4 | 0 | 11 | 9 (six `.sub.html` allowfullscreen pages and the idlharness page excluded) |
+| clipboard-apis | 61 | 51 | 53 | 0 | 0 | 5 (the Clipboard interface is [SecureContext]; the http pages are the ClipboardEvent / DataTransfer ones) |
+| close-watcher | 49 | 47 | 0 | 0 | 0 | 2 |
+| resize-observer | 34 | 0 | 0 | 0 | 7 | ~33 |
+
+By served pages, the order of work was: Typed OM (359), IntersectionObserver (~140), Web Animations (140, already
+implemented), the dialog (40), ResizeObserver (~33), popovers (32), Fullscreen (9), Clipboard (5), CloseWatcher (2).
+The testdriver pages (275 of the 1058) are AETHERWPT5's first group: when its `testdriver-vendor.js` lands, this runner's
+predicate drops the `testdriver` reason and the popover, dialog, fullscreen, clipboard and close-watcher pages that
+drive a real click or an Escape join the served set unchanged.
+
+**What Aether had at e57d1b0e** (grep of `handlers/aether/src`):
+
+- popover: nothing but the `popoverTargetAction` reflection rows (`js/reflect_table.rs:443-444`); no `popover` IDL
+  attribute, no `showPopover`, no top layer, no ToggleEvent for popovers.
+- dialog: `show()` / `showModal()` set the `open` attribute and `close()` removes it and fires `close` synchronously
+  (`js/html.rs:1779-1790`); no modal flag, no top layer, no toggle / cancel events, no `returnValue`, no
+  `requestClose`, no focusing steps; no UA `display: none` for a closed dialog (layout_core's hidden-tag list
+  `tree.rs:122` has no `dialog`; `css/mod.rs` had no UA sheet).
+- IntersectionObserver / ResizeObserver: the COMPAT shim of `api/platform.rs:1167-1182` — `observe()` ledgers
+  `observer-never-delivers:<kind>` and nothing is ever delivered.
+- Web Animations: AETHERSTYLE3B/3C's `js/animations.rs` (SR115 / SR122): `Element.animate`, `Animation`,
+  `KeyframeEffect`, `AnimationEffect`, `DocumentTimeline` / `document.timeline`, `getAnimations`, `commitStyles`,
+  `ready` / `finished`, CSSAnimation / CSSTransition — over `layout_core::anim::Timeline`.
+- CSS Typed OM: nothing (no `attributeStyleMap`, `computedStyleMap`, `CSSUnitValue`, `CSS.px`).
+- Clipboard: the shell seam only — `AetherEngine::copy_selection` (`lib.rs:497`) answers `BrowserCopy` with
+  `BrowserClipboardSet(text)` and `paste(text)` (`lib.rs:1222`) inserts the shell's text into the focused control;
+  no `navigator.clipboard`, no `ClipboardItem`, no `ClipboardEvent` constructor.
+- Fullscreen: `document.fullscreenElement` as a null getter (`js/window.rs:1626`); no `requestFullscreen`,
+  `exitFullscreen`, `fullscreenEnabled`, no events.
+- CloseWatcher: nothing. User activation: `crate::media`'s sticky flag (SR134), set by a trusted click; no transient
+  activation anywhere.
+
+### What landed (step 2), per specification
+
+| feature | specification | what landed (new files under `handlers/aether/src/js/`) |
+|---|---|---|
+| CSS Typed OM | CSS Typed OM Level 1: §3 StylePropertyMapReadOnly / StylePropertyMap, §4 CSSStyleValue / CSSKeywordValue / CSSUnparsedValue / CSSVariableReferenceValue, §5 CSSNumericValue, CSSUnitValue, CSSMathValue family, §5.6 the type algebra, §6 CSSTransformValue and its components, §6.7 serialization, §7 reification | `typed_om.rs` (a prelude over `element.style`, `getComputedStyle`, `CSSStyleRule.style`): `Element.attributeStyleMap`, `Element.computedStyleMap()`, `CSSStyleRule.styleMap`; `get` / `getAll` / `has` / `size` / iteration; `set` / `append` / `delete` / `clear` validated against a property grammar table (`PROPS`: which numeric base types a property takes, its keywords, list-valued, non-negative, integer-valued) — the wrong numeric type, a keyword outside the grammar, an unsupported value bound to another property, a list for a non-list property: TypeError; an out-of-range number is written as `calc()` (so `width: -3.14em` reads back as `CSSMathSum`, as the tests expect); custom properties read and write `CSSUnparsedValue`; `CSSStyleValue.parse` / `parseAll`, `CSSNumericValue.parse`; every unit of §5.1 with the `CSS.px()`… factories (the `CSS` namespace created when absent); `add` / `sub` / `mul` / `div` / `min` / `max` / `equals` / `to` / `toSum` / `type` with "add two types" / "multiply two types" / "invert a type" and the percent hint; `calc()` / `min()` / `max()` / `clamp()` reified as the math tree (sum of products with negate / invert), `calc()` serialization with nested parentheses; `CSSTranslate` / `CSSRotate` / `CSSScale` / `CSSSkew` / `CSSSkewX` / `CSSSkewY` / `CSSPerspective` / `CSSMatrixComponent` with `is2D` and `toMatrix()` (4×4 products into a `DOMMatrix`), a transform list reified from `translate()` … `matrix3d()`; `CSSImageValue` for `url()` / gradients; computed values with relative lengths resolved to px (em / rem / ex / ch / vw / vh / …), times to s, angles to deg, same-unit sums folded, non-negative properties clamped, integer properties rounded |
+| IntersectionObserver | Intersection Observer §2 (constructor options and validation, observe / unobserve / disconnect / takeRecords, IntersectionObserverEntry), §3.2.x "run the update intersection observations steps", "queue an intersection observer task", "notify intersection observers" | `observers.rs`: the implicit root is the viewport (`innerWidth` × `innerHeight`), an element root its border box; `rootMargin` / `scrollMargin` parsed (px or %, SyntaxError otherwise); thresholds validated (RangeError) and sorted; the threshold index and `isIntersecting` compared with the previous ones (edge-adjacent rects intersect), entries with `time` (`performance.now()`), `rootBounds`, `boundingClientRect`, `intersectionRect`, `intersectionRatio`, `target`, `isVisible`; the entries delivered in a task (`__obs('queue')` → `Task::Callback`). The update runs after every frame's animation-frame callbacks: `Engine::drain_raf_once` (HTML §8.1.7.3 steps 14 / 16), which `event_loop::settle` calls each turn |
+| ResizeObserver | Resize Observer §3 (ResizeObserver with `box` options, ResizeObserverEntry, ResizeObserverSize), §4 the processing model: gather active observations at depth, broadcast, the depth limit, the loop error | `observers.rs`: the content box from `getBoundingClientRect()` less the computed paddings and borders, `borderBoxSize` / `contentBoxSize` / `devicePixelContentBoxSize`, `contentRect` at (padding-left, padding-top); observations whose size changed since the last report are delivered in the same rendering update, shallowest first, deeper targets changed by a callback in the next loop iteration, a shallower one skipped with the window `error` event "ResizeObserver loop completed with undelivered notifications." |
+| the dialog element | HTML §4.11.4: `show()`, `showModal()`, `close()`, `requestClose()`, `returnValue`, `closedBy`, the dialog focusing steps, the `open` attribute change steps, the removing steps, `beforetoggle` / `toggle` ToggleEvents with the toggle task tracker, the `cancel` / `close` events, the close watcher a modal dialog establishes | `toplayer.rs`: the InvalidStateError cases (open modal vs modeless, not connected, open as a popover), `beforetoggle` cancelable before `show` / `showModal`, the modal flag and the top layer list, `closedBy` (`any` / `closerequest` / `none`, auto = closerequest when modal), the close watcher whose cancel action fires `cancel` (cancelable when the page has history-action activation or the request came from `requestClose()`), the focusing steps (autofocus delegate, first focusable descendant, else the dialog), focus restored to the previously focused element on close, `close` queued as a task, a dialog whose `open` attribute is removed by script closes (modal flag, top layer, watcher) and queues `close`; `css/mod.rs` gains a UA sheet at `Origin::UserAgent` with `dialog:not([open]) { display: none }` |
+| popovers | HTML §6.12: the `popover` attribute (auto / manual / hint), `showPopover()` / `hidePopover()` / `togglePopover()`, "check popover validity", "show popover", "hide popover", "hide all popovers until", "topmost popover ancestor", the auto and hint stacks, §6.12.2 light dismiss, §6.12.3 the `popovertarget` / `popovertargetaction` activation behavior, `popoverTargetElement`, the popover focusing steps, the removing and attribute change steps | `toplayer.rs` + `reflect_table.rs` (the `popover` IDL attribute: empty = auto, invalid = manual, missing = null): NotSupportedError / InvalidStateError per the validity check, `beforetoggle` (cancelable) and `toggle` (a task, the tracker collapsing a show+hide into one event with the first old state), nested auto popovers hidden from the top down to the new popover's ancestor (flat tree and invoker chain), hint popovers above autos, the `source` option, the invoker element, the previously focused element restored on hide, a close watcher per auto / hint popover (Escape hides the topmost), light dismiss from a trusted click (`events::user_click`: the popovers above the one clicked, or its invoker, are hidden; `closedby=any` dialogs clicked outside get a close request), `popoverTargetElement` (the explicitly set element or the id in the tree scope) on button and input, the activation behavior called from `js/events.rs`'s button and input arms (a submit button with a form owner does nothing), a popover removed from the document is hidden without events, a showing popover whose `popover` attribute changes is hidden |
+| CloseWatcher | HTML §6.6.5: the close watcher manager (groups, allowed number of groups raised by user activation, "next user interaction allows a new group"), establish / request to close / close / destroy / "process close watchers", the `CloseWatcher` interface with its `signal`, `requestClose()`, `close()`, `destroy()`, `cancel` / `close` events | `closewatcher.rs`: the manager in the prelude, the dialog and popover watchers through the hidden `__cw_make`, `close_request()` from an uncanceled Escape keydown (`events::user_key`), `note_user_activation()` from every activation; the `cancel` event cancelable only with history-action activation (consumed when a cancel prevents the close) or from script |
+| user activation | HTML §6.4: sticky, transient (5 s), history-action activation; §6.4.5 `navigator.userActivation` | `activation.rs`: `note()` from a trusted click and a keydown that is not Escape or a modifier (`js/events.rs`), `consume()`, `has_transient()`; `crate::media`'s sticky flag is set from the same notification |
+| Fullscreen | Fullscreen API §4 `requestFullscreen()` (the error conditions, `fullscreenerror`, `fullscreenchange`, the promise), §5 `fullscreenEnabled`, `fullscreenElement`, `fullscreen`, `exitFullscreen()`, the event handler attributes on Document and Element | `fullscreen.rs`: rejected (TypeError, `fullscreenerror` queued) when the element is not connected / not HTML or SVG / a dialog / a showing popover, when fullscreen is not enabled (a nested document without `allowfullscreen`) or without transient activation; else the activation is consumed, the element becomes the fullscreen element (`fullscreen::element()`, the shell's seam) and `fullscreenchange` is queued at it (and at the previous one); `exitFullscreen()` rejects without a fullscreen element; an element removed from the document leaves fullscreen with `fullscreenchange` at the document |
+| Clipboard | Clipboard API and events §4 ClipboardEvent (its constructor's `clipboardData`), §5 `navigator.clipboard`: `read()`, `readText()`, `write()`, `writeText()`, §5.2 ClipboardItem (`types`, `getType()`, `presentationStyle`, `supports()`) | `clipboard.rs` + `events.rs` (ClipboardEvent registered with `clipboardData`): a write needs transient activation (NotAllowedError otherwise) and lands in the page's clipboard store (`clipboard::take_written()` for the shell to send as `BrowserClipboardSet`); a read needs it too (standing in for the `clipboard-read` permission) and answers the shell's text (`clipboard::set_platform_text`); rich items (`text/html`, `image/png`) stay in the page and read back as written; a type outside the mandatory ones is NotAllowedError on write |
+| Web Animations | Web Animations Level 1 | already AETHERSTYLE3B/3C's (`js/animations.rs`); nothing changed in this arc — its directory joins the run set and its gaps are measured by the fold's run (below) |
+
+Hooks into existing files (every one a no-op while nothing is showing): `js/mod.rs` (the eight installs after
+`tracks::install`, the resets, `drain_raf_once` running `observers::update`), `js/dom.rs` (`remove` → the removing
+steps; `attribute_changed` → the `popover` / dialog `open` steps), `js/events.rs` (button / input activation →
+`toplayer::invoker_activation`; a trusted click → `activation::note`, the close watcher manager's notice, light
+dismiss; keydown → activation or, for Escape, a close request; `ClipboardEvent`), `js/reflect_table.rs` (`popover`),
+`css/mod.rs` (the UA sheet).
+
+### The runner (`tests/wpt_apis.rs`) and its exclusion predicate
+
+One `wpt_apis_<dir>` test per directory (`API_DIRS`, 9 entries; `apis_directory_table_is_complete` pins the table and
+`apis_exclusions_are_infrastructure_only` the predicate), served by the same `wpt_net` stand-in through a copy of
+`wpt_dom.rs`'s page loop (`run_page`: 200 ms settles, 30 s real / 16 s page time), with its own checkout locator whose
+`SPARSE` is `wpt_dom.rs`'s plus the eight new directories (one `target/wpt` serves both runners; whichever runs first
+widens it). `wpt_dom.rs` and `tests/wpt_net/**` are untouched (AETHERWPT5's). Floors are 0 at landing.
+
+`apis_excluded(root, rel, src)` names, in this order: crash / tool / reference trees; a non-window `.any.js` global;
+`.h2.` / `.serviceworker.` / `.sharedworker.`; `.https.` (a TLS server); `-manual.`; testdriver (`testdriver.js` or
+`test_driver` in the page or any helper script it loads — the helper scan is `helper_sources`, so the popover and
+dialog pages whose `clickOn` / `sendEscape` live in `popover-utils.js` / `common.js` are named); idlharness; bfcache /
+remote contexts; cross-origin (`.sub.` pages, REMOTE / OTHER origins, `get-host-info`, `cross-origin` / `cross-site`
+names); an un-emulated `.py` handler (outside `wpt_net::PY_HANDLERS`); `/media/` fixtures. **Not a reason here, unlike
+`wpt2_excluded`: the layout tokens** (`getBoundingClientRect`, `offset*`, `client*`, `scroll*`): the intersection and
+resize observers are geometry, their pages run against the engine's own layout (AETHERINLINE's boxes, taffy's sizes)
+and fail honestly where it differs — those failures are the layout's measurement, not the observers'.
+
+### What the fold should expect (R107: no executor ran the suites)
+
+- `cargo test --release -p aether --test wpt_apis -- --nocapture --test-threads=4`: nine `wpt_apis_*` tests, each
+  printing `wpt <dir> (served N test pages): P/T subtests (x%); wall S s` and its skipped pages by reason, plus the two
+  table tests; all floors 0, so nothing reds on a score. Expected served counts near the table's last column; the
+  skipped counts near its `testdriver` + `https` + cross-origin columns.
+- The scores to read first: `css/css-typed-om` (the property pages are the bulk; each runs CSS-wide keywords, `var()`,
+  the property's syntaxes and the rejection of the others), `intersection-observer` (the viewport-root pages; the
+  element-root and clipped pages will show where no ancestor clipping is modelled), `resize-observer`, the dialog and
+  popover pages that need no testdriver (`dialog-open`, `dialog-close-event*`, `dialog-showModal*`, `toggle-events`,
+  `dialog-return-value`, `dialog-requestclose*`, `popover-events`, `togglePopover`, `toggleevent-interface`,
+  `popover-types`, `popover-removal*`, `popovertarget-reflection`, `imperative-invokers`, `popover-stacking`).
+- The `wpt2_html_semantics_interactive_elements` score (`wpt_dom.rs`) should rise with the dialog pages; nothing else
+  in `wpt_dom` should move (the preludes install after everything else and redefine only the dialog operations, the
+  `fullscreenElement` getter and the observer shims).
+- `cargo test -p aether` (the lib tests): `engine_tests::test_ledger_records_unimplemented_apis` will red — see the
+  fold note below.
+
+### Gap list (dated 2026-10-13; what one arc did not reach)
+
+1. **`:popover-open`, `:modal`, `:fullscreen` and `::backdrop`** are not parsed by css_core (`selectors.rs:637` knows
+   `open` but none of these), so `el.matches(':popover-open')` throws SyntaxError and no UA rule can hide a hidden
+   popover: `[popover]:not(:popover-open) { display: none }` cannot be written. `popover-utils.js`'s
+   `assertPopoverVisibility` reads `getComputedStyle(popover).display` and `matches(':popover-open')`, so every page
+   using it fails on those asserts even where the DOM half is right. The exact change (outside this arc's files):
+   `unaos/libs/web/css_core/src/selectors.rs` — `ElementState::{PopoverOpen, Modal, Fullscreen}` and the three arms
+   next to `"open" => P::State(S::Open)`; `handlers/aether/src/dom/select.rs` `state()` — arms answering from
+   `js::toplayer` (the prelude's `__tl_is_popover_showing` / `__tl_is_modal` need a Rust mirror: a thread-local set
+   fed by `__tl('track')`) and `js::fullscreen::element()`; then `css/mod.rs`'s `UA_SHEET` gains the popover rule,
+   `dialog:modal` and `::backdrop`.
+2. **The top layer is not painted** above the document (no `::backdrop`, no "blocked by a modal dialog" inertness in
+   layout or hit testing, no centering of a modal dialog); `fullscreen::element()` is a seam the shell does not yet
+   read (the viewport is not resized to it). The dialog layout pages (`centering`, `top-layer-position`,
+   `abspos-dialog-layout`, `modal-dialog-scroll-height`, `inert-*`) measure this.
+3. **Events the preludes dispatch are untrusted** (`isTrusted` false): the ToggleEvents, `cancel`, `close`,
+   `fullscreenchange` / `fullscreenerror`, the CloseWatcher's events. A trusted path needs a native `__tl('fire')`
+   over `events::new_event` / `dispatch` (the shape `queue_details_toggle` uses).
+4. **IntersectionObserver**: no clipping by `overflow` ancestors other than the root, no `scrollMargin` effect, no
+   `delay` / `trackVisibility` (`isVisible` is always false), no cross-document roots (iframes); entries for a root
+   that is a Document other than the page's are not computed.
+5. **ResizeObserver**: fragments (multi-column) report one box; `devicePixelContentBoxSize` rounds at
+   `devicePixelRatio`; SVG targets use their border box.
+6. **Typed OM**: `CSSColorValue` and its subclasses (`cssColorValue.html`, `cssRGB.html`, `cssHSL.html`, …) are not
+   reified (a color reads as a base `CSSStyleValue`); `<position>` likewise; shorthands read as base values (per
+   spec); `calc()` is simplified only for same-unit sums; the grammar table (`PROPS`) is the properties the tests
+   exercise plus the common ones — a property outside it is "not supported" (TypeError on `get` / `set`), and a
+   keyword list may miss a rare value. `CSSStyleValue.parse` validates with the same table.
+7. **Web Animations**: untouched; the fold's `wpt_apis_web_animations` run is the first measurement of SR115 / SR122
+   against WPT. Known from `animations.rs`'s own notes: per-keyframe `composite`, `iterationComposite`,
+   `ScrollTimeline` / `ViewTimeline`, `new Animation(effect, timeline)` with a timeline other than the document's,
+   `DocumentTimeline({ originTime })`, `Animation.timeline` setter, `Animation.replaceState` / `persist()`.
+8. **Clipboard**: no permission model (transient activation stands in for `clipboard-read` / `clipboard-write`); no
+   `copy` / `cut` / `paste` events from the shell's verbs (lib.rs's `paste` inserts text without a `paste` event);
+   `read()` returns the shell's text as one `text/plain` item unless the page wrote rich items itself.
+9. **Popovers**: `popover=hint` nesting follows the auto rules (no "hint stack above auto stack" invariants beyond
+   "hints are hidden before autos"); no `interesttarget` (not in the pinned WPT); the `popovertarget` activation
+   behavior runs for `input` types button / reset / submit / image only.
+10. **CloseWatcher**: a `signal` that is already aborted makes an inactive watcher without throwing (per spec); the
+    "allowed number of groups" is raised by every activation, not only the ones after the manager was notified.
+
+### Notes for the fold (changes outside this arc's files, named exactly)
+
+- `handlers/aether/src/engine_tests.rs` `test_ledger_records_unimplemented_apis` (lines 250 and 267-269): the fixture's
+  `new IntersectionObserver(function () {}).observe(document.body);` no longer ledgers
+  `observer-never-delivers:IntersectionObserver` (the observer delivers). The COMPAT shim in `api/platform.rs` still
+  installs the four `mkObserver` constructors, but every one is replaced by a real implementation now (MutationObserver
+  SR82, PerformanceObserver SR135, IntersectionObserver / ResizeObserver here), so no shim is left to stand in: delete
+  that fixture line and the assertion (keep the CSS assertions), and the comment above it says the JS-side "shim
+  reports itself" contract has no live example.
+- `handlers/aether/src/lib.rs`: two lines wire the Clipboard API to the shell — in `paste(&mut self, text)` add
+  `crate::js::clipboard::set_platform_text(text);` before the insertion, and a `pub fn clipboard_written(&self) ->
+  Option<bandy::SMessage>` returning `crate::js::clipboard::take_written().map(bandy::SMessage::BrowserClipboardSet)`
+  for the shell's frame loop to poll beside `copy_selection`.
+- `unaos/libs/web/css_core/src/selectors.rs` and `handlers/aether/src/dom/select.rs`: gap 1 above.

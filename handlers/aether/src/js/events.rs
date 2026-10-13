@@ -912,7 +912,9 @@ fn interactive(n: usize) -> bool {
 fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, legacy: Option<Legacy>) {
     let tag = html_tag(a).unwrap_or_default();
     match tag.as_str() {
-        "input" => match super::controls::input_type(a) {
+        "input" => {
+            let input_type = super::controls::input_type(a);
+            match input_type {
             "checkbox" | "radio" => {
                 if dom::is_connected(a) && legacy.is_some() {
                     let changed = match legacy {
@@ -944,7 +946,12 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
                 }
             }
             _ => {}
-        },
+            }
+            // AETHERAPIS (SR145): HTML §6.12.3 the popover target attribute activation behavior of a button input.
+            if matches!(input_type, "button" | "reset" | "submit" | "image") && !super::controls::disabled(a) {
+                super::toplayer::invoker_activation(vm, a);
+            }
+        }
         "button" => {
             if super::controls::disabled(a) {
                 return;
@@ -958,6 +965,8 @@ fn activation_behavior(vm: &mut Vm, a: usize, target: usize, trusted: bool, lega
                     _ => super::controls::submit_form_with(vm, f, Some(a), !trusted),
                 }
             }
+            // AETHERAPIS (SR145): HTML §6.12.3 the popover target attribute activation behavior (`popovertarget`).
+            super::toplayer::invoker_activation(vm, a);
         }
         "a" | "area" => {
             // A user's click follows an ordinary link in the shell; a script-dispatched click
@@ -1536,6 +1545,19 @@ pub fn user_key(vm: &mut Vm, focused: Option<usize>, ty: &str, k: &crate::api::u
     let (ok, _) = dispatch(vm, e, TargetKey::Node(t));
     unroot(vm, r);
     unroot(vm, ri);
+    // AETHERAPIS (SR145): a keydown is an activation triggering input event unless it is Escape or a modifier (HTML
+    // §6.4.3); an uncanceled Escape keydown is a close request (HTML §6.6.5: "process close watchers" — the modal
+    // dialog's `cancel` and close, an auto popover's hide, a page's CloseWatcher).
+    if ty == "keydown" {
+        if k.key == "Escape" {
+            if ok {
+                super::closewatcher::close_request(vm);
+            }
+        } else if !matches!(k.key.as_str(), "Shift" | "Control" | "Alt" | "Meta" | "AltGraph" | "CapsLock" | "Fn" | "NumLock" | "ScrollLock" | "Symbol") {
+            super::activation::note();
+            super::closewatcher::note_user_activation(vm);
+        }
+    }
     ok
 }
 
@@ -1548,7 +1570,12 @@ fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
     }
     CLICKING.with(|c| c.borrow_mut().insert(n));
     if trusted {
-        crate::media::note_user_activation(); // AETHERMEDIA2 (SR134): HTML's sticky activation for autoplay
+        // AETHERAPIS (SR145): HTML §6.4.3 the activation notification steps (sticky, transient and history-action
+        // activation; `crate::media`'s sticky flag for autoplay is set inside), the close watcher manager's notice,
+        // and §6.12.2 light dismiss of the open popovers (and `closedby=any` dialogs) the click lands outside.
+        super::activation::note();
+        super::closewatcher::note_user_activation(vm);
+        super::toplayer::light_dismiss(vm, n);
     }
     let init = vm.new_plain_object();
     let _ = vm.create_data_property(init, PropertyKey::from_str("detail"), num(1.0));
@@ -1752,6 +1779,8 @@ fn members(iface: &str) -> &'static [(&'static str, char)] {
         "TransitionEvent" => &[("propertyName", 's'), ("elapsedTime", 'n'), ("pseudoElement", 's')],
         "StorageEvent" => &[("key", 'a'), ("oldValue", 'a'), ("newValue", 'a'), ("url", 's'), ("storageArea", 'o')],
         "CloseEvent" => &[("wasClean", 'b'), ("code", 'l'), ("reason", 's')],
+        // AETHERAPIS (SR145): Clipboard API §4 ClipboardEvent (`clipboardData`, a DataTransfer or null).
+        "ClipboardEvent" => &[("clipboardData", 'o')],
         _ => &[],
     }
 }
@@ -1760,7 +1789,7 @@ fn parent_event(iface: &str) -> Option<&'static str> {
     Some(match iface {
         "UIEvent" | "CustomEvent" | "ErrorEvent" | "PromiseRejectionEvent" | "PopStateEvent" | "HashChangeEvent"
         | "ProgressEvent" | "MessageEvent" | "PageTransitionEvent" | "SubmitEvent" | "FormDataEvent" | "AnimationEvent"
-        | "TransitionEvent" | "StorageEvent" | "CloseEvent" | "ToggleEvent" | "BeforeUnloadEvent" => "Event",
+        | "TransitionEvent" | "StorageEvent" | "CloseEvent" | "ToggleEvent" | "BeforeUnloadEvent" | "ClipboardEvent" => "Event",
         "MouseEvent" | "KeyboardEvent" | "FocusEvent" | "InputEvent" | "CompositionEvent" | "TouchEvent" => "UIEvent",
         "WheelEvent" | "PointerEvent" | "DragEvent" => "MouseEvent",
         _ => return None,
@@ -2241,6 +2270,7 @@ pub fn install(vm: &mut Vm) {
         "CloseEvent",
         "TouchEvent",
         "ToggleEvent",
+        "ClipboardEvent",
     ] {
         let parent = dom::iface(parent_event(name).unwrap()).unwrap();
         let i = interface(vm, name, Some(parent), None);
