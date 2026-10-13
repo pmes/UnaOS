@@ -75,3 +75,46 @@ R.push(r.read + ',' + r.written);
     );
     assert_eq!(got, "windows-1252|utf-16le|shift_jis|RangeError|fffd fffd fffd|fffd fffd|fffd|41|feff 41|TypeError|d83d dca9|d83d dc00|fffd 41|20ac 178 e9|2,3");
 }
+
+/// G3 — Streams §7.2/§7.3 (the two queuing strategies: one size function per global, named `size`, not a
+/// constructor, the required `highWaterMark`) and §4.5 (a ReadableStream's desiredSize counts the strategy's
+/// sizes; a size that is not a finite non-negative number errors the stream with a RangeError).
+#[test]
+fn g3_queuing_strategies_and_size() {
+    let got = answers(
+        r#"
+var c1 = new CountQueuingStrategy({ highWaterMark: 5 }), c2 = new CountQueuingStrategy({ highWaterMark: 1 });
+var b = new ByteLengthQueuingStrategy({ highWaterMark: 16 });
+R.push(c1.size === c2.size, c1.size.name, 'prototype' in c1.size, c1.size.length, b.size.length, b.size({ byteLength: 7 }), c1.highWaterMark);
+try { new CountQueuingStrategy({}); R.push('no throw'); } catch (e) { R.push(e.name); }
+try { new c1.size(); R.push('no throw'); } catch (e) { R.push(e.name); }
+R.push(new ByteLengthQueuingStrategy({ highWaterMark: '0' }).highWaterMark, String(new CountQueuingStrategy({ highWaterMark: 'foo' }).highWaterMark));
+var ctl;
+var rs = new ReadableStream({ start: function (c) { ctl = c; } }, new ByteLengthQueuingStrategy({ highWaterMark: 10 }));
+ctl.enqueue(new Uint8Array(4));
+R.push(ctl.desiredSize);
+var ctl2;
+new ReadableStream({ start: function (c) { ctl2 = c; } }, { size: function () { return -1; } });
+try { ctl2.enqueue('x'); R.push('no throw'); } catch (e) { R.push(e.name); }
+R.push(ctl2.desiredSize);
+"#,
+    );
+    assert_eq!(got, "true|size|false|0|1|7|5|TypeError|TypeError|0|NaN|6|RangeError|");
+}
+
+/// G4 — File API §3.1 / §4.1: blobParts is an iterable (an array-like is refused), `endings: "native"`
+/// converts string line endings, an invalid `endings` is a TypeError, `File.lastModified` is a `long long`.
+#[test]
+fn g4_blob_and_file_constructors() {
+    let mut e = load(&page(
+        r#"
+try { new Blob({ length: 1, 0: 'x' }); R.push('no throw'); } catch (e) { R.push(e.name); }
+try { new Blob([], { endings: 'bogus' }); R.push('no throw'); } catch (e) { R.push(e.name); }
+var set = new Set(['a', 'b']);
+R.push(new Blob(set).size, new Blob(['a\r\nb\rc'], { endings: 'native' }).size, new Blob(['a\r\nb'], { endings: 'transparent' }).size);
+R.push(new File([], 'f', { lastModified: -1 }).lastModified, new File([], 'f', { lastModified: NaN }).lastModified, new File([], 'f', { lastModified: 1.9 }).lastModified);
+new Blob(['a\r\nb\rc'], { endings: 'native' }).text().then(function (t) { R.push(JSON.stringify(t)); });
+"#,
+    ));
+    assert_eq!(eval(&mut e, "R.join('|')"), "TypeError|TypeError|2|5|4|-1|0|1|\"a\\nb\\nc\"");
+}

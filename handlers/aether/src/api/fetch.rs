@@ -776,18 +776,39 @@ pub const PRELUDE: &str = r#"
     // ---- Blob (File API §3, the parts this platform needs: bytes, type, slice, readers) ---------------
     if (typeof Blob === 'undefined') {
         class Blob {
+            // AETHERWPT2 (SR135): File API §3.1 — blobParts is a WebIDL sequence (its @@iterator, each element
+            // converted as it is read: Blob, BufferSource, else USVString), then BlobPropertyBag in member order
+            // (`endings` enum, `type`); strings get "convert line endings to native" under `endings: "native"`.
             constructor(parts, opts) {
-                var chunks = [];
+                var items = [];
                 if (parts !== undefined) {
-                    if (parts === null || typeof parts !== 'object') { throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence."); }
-                    Array.from(parts).forEach(function (p) {
+                    if (parts === null || (typeof parts !== 'object' && typeof parts !== 'function')) { throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence."); }
+                    if (typeof parts[Symbol.iterator] !== 'function') { throw new TypeError("Failed to construct 'Blob': The object must have a callable @@iterator property."); }
+                    for (var p of parts) {
                         var b = toBytes(p);
-                        if (b) { chunks.push(b); }
-                        else if (p instanceof Blob) { chunks.push(st(p).bytes); }
-                        else { chunks.push(utf8(p)); }
-                    });
+                        if (b) { items.push(b); }
+                        else if (p instanceof Blob) { items.push(st(p).bytes); }
+                        else {
+                            if (typeof p === 'symbol') { throw new TypeError("Failed to construct 'Blob': Cannot convert a Symbol value to a string"); }
+                            items.push(String(p));
+                        }
+                    }
                 }
-                var type = opts && opts.type !== undefined ? String(opts.type) : '';
+                var endings = 'transparent', type = '';
+                if (opts !== undefined && opts !== null) {
+                    if (typeof opts !== 'object' && typeof opts !== 'function') { throw new TypeError("Failed to construct 'Blob': The provided value is not of type 'BlobPropertyBag'."); }
+                    var e = opts.endings;
+                    if (e !== undefined) {
+                        e = String(e);
+                        if (e !== 'transparent' && e !== 'native') { throw new TypeError("Failed to construct 'Blob': Failed to read the 'endings' property from 'BlobPropertyBag': The provided value '" + e + "' is not a valid enum value of type EndingType."); }
+                        endings = e;
+                    }
+                    if (opts.type !== undefined) { type = String(opts.type); }
+                }
+                var chunks = items.map(function (x) {
+                    if (typeof x !== 'string') { return x; }
+                    return utf8(endings === 'native' ? x.replace(/\r\n|\r/g, '\n') : x);
+                });
                 if (/[^ -~]/.test(type)) { type = ''; }
                 ST.set(this, { bytes: concat(chunks), type: type.toLowerCase() });
             }
@@ -976,7 +997,7 @@ pub const PRELUDE: &str = r#"
             var s = st(st(this).stream);
             if (s.state === 'errored') { return null; }
             if (s.state === 'closed') { return 0; }
-            return s.hwm - s.queue.length;
+            return s.hwm - s.qtotal;
         }
         enqueue(chunk) {
             var stream = st(this).stream, s = st(stream);
@@ -986,7 +1007,21 @@ pub const PRELUDE: &str = r#"
             if (s.reader && st(s.reader).reads.length) {
                 fulfillRead(stream, chunk, false);
             } else {
+                // AETHERWPT2 (SR135): Streams §4.5 ReadableStreamDefaultControllerEnqueue — the strategy's size
+                // (its result converted to unrestricted double), EnqueueValueWithSize's RangeError, the
+                // controller errored with whatever either throws.
+                var sz = 1;
+                if (s.size !== undefined) {
+                    try { sz = +s.size.call(undefined, chunk); } catch (e) { errorStream(stream, e); throw e; }
+                    if (!(sz >= 0) || sz === Infinity) {
+                        var re = new RangeError("Failed to execute 'enqueue' on 'ReadableStreamDefaultController': The return value of a queuing strategy's size function must be a finite, non-NaN, non-negative number.");
+                        errorStream(stream, re);
+                        throw re;
+                    }
+                }
                 s.queue.push(chunk);
+                s.sizes.push(sz);
+                s.qtotal += sz;
             }
             pullIfNeeded(stream);
         }
@@ -1025,6 +1060,8 @@ pub const PRELUDE: &str = r#"
             if (s.state === 'errored') { return Promise.reject(s.error); }
             if (s.queue.length) {
                 var chunk = s.queue.shift();
+                s.qtotal -= s.sizes.shift();
+                if (s.qtotal < 0) { s.qtotal = 0; }
                 if (s.closeRequested && !s.queue.length) { closeStream(stream); } else { pullIfNeeded(stream); }
                 return Promise.resolve({ value: chunk, done: false });
             }
@@ -1052,13 +1089,22 @@ pub const PRELUDE: &str = r#"
     class ReadableStream {
         constructor(source, strategy) {
             source = source === undefined || source === null ? {} : source;
+            // AETHERWPT2 (SR135): the QueuingStrategy dictionary (Streams §7.1): highWaterMark, then size, which must
+            // be callable (ExtractSizeAlgorithm; absent = every chunk counts 1).
+            if (strategy !== undefined && strategy !== null && typeof strategy !== 'object' && typeof strategy !== 'function') {
+                throw new TypeError("Failed to construct 'ReadableStream': The provided value is not of type 'QueuingStrategy'.");
+            }
             var hwm = strategy && strategy.highWaterMark !== undefined ? Number(strategy.highWaterMark) : 1;
+            var sizeFn = strategy ? strategy.size : undefined;
+            if (sizeFn !== undefined && typeof sizeFn !== 'function') {
+                throw new TypeError("Failed to construct 'ReadableStream': Failed to read the 'size' property from 'QueuingStrategy': The provided value is not a function.");
+            }
             if (isNaN(hwm) || hwm < 0) { throw new RangeError('Invalid highWaterMark'); }
             if (source.type !== undefined && String(source.type) === 'bytes') { __ledger('ReadableStream-byte-source-as-default'); }
             creatingInternal = true;
             var controller;
             try { controller = new ReadableStreamDefaultController(); } finally { creatingInternal = false; }
-            var s = { state: 'readable', queue: [], reader: null, error: undefined, disturbed: false, closeRequested: false,
+            var s = { state: 'readable', queue: [], sizes: [], qtotal: 0, size: sizeFn, reader: null, error: undefined, disturbed: false, closeRequested: false,
                       started: false, pulling: false, pullAgain: false, hwm: hwm, source: source, controller: controller };
             ST.set(this, s);
             ST.set(controller, { stream: this });
@@ -1166,6 +1212,8 @@ pub const PRELUDE: &str = r#"
         s.state = 'errored';
         s.error = e;
         s.queue = [];
+        s.sizes = [];
+        s.qtotal = 0;
         if (s.reader) {
             var rs = st(s.reader);
             rs.reads.splice(0).forEach(function (r) { r.rej(e); });
@@ -1179,6 +1227,8 @@ pub const PRELUDE: &str = r#"
         if (s.state === 'closed') { return Promise.resolve(undefined); }
         if (s.state === 'errored') { return Promise.reject(s.error); }
         s.queue = [];
+        s.sizes = [];
+        s.qtotal = 0;
         closeStream(stream);
         var src = s.source;
         var r;
@@ -1189,7 +1239,7 @@ pub const PRELUDE: &str = r#"
     pullIfNeeded = function (stream) {
         var s = st(stream);
         if (!s.started || s.state !== 'readable' || s.closeRequested) { return; }
-        var wants = (s.reader && st(s.reader).reads.length > 0) || (s.hwm - s.queue.length > 0);
+        var wants = (s.reader && st(s.reader).reads.length > 0) || (s.hwm - s.qtotal > 0);
         if (!wants || typeof s.source.pull !== 'function') { return; }
         if (s.pulling) { s.pullAgain = true; return; }
         s.pulling = true;
@@ -1206,6 +1256,42 @@ pub const PRELUDE: &str = r#"
         hide(globalThis, C.name, C);
     });
     var disturbed = function (stream) { return st(stream).disturbed; };
+
+    // ---- CountQueuingStrategy / ByteLengthQueuingStrategy (Streams §7.2, §7.3) — AETHERWPT2 (SR135) -------
+    // One size function per global (a method, so: named "size", no prototype, not a constructor); the
+    // QueuingStrategyInit dictionary requires highWaterMark (unrestricted double).
+    var countSize = ({ size() { return 1; } }).size;
+    var byteSize = ({ size(chunk) { return chunk.byteLength; } }).size;
+    var strategyInit = function (init, iface) {
+        if (init === undefined || init === null) { init = {}; }
+        if (typeof init !== 'object' && typeof init !== 'function') {
+            throw new TypeError("Failed to construct '" + iface + "': The provided value is not of type 'QueuingStrategyInit'.");
+        }
+        var h = init.highWaterMark;
+        if (h === undefined) {
+            throw new TypeError("Failed to construct '" + iface + "': Failed to read the 'highWaterMark' property from 'QueuingStrategyInit': Required member is undefined.");
+        }
+        return +h;
+    };
+    var QS = new WeakMap();
+    var qs = function (o) {
+        var v = (o !== null && typeof o === 'object') ? QS.get(o) : undefined;
+        if (v === undefined) { throw new TypeError('Illegal invocation'); }
+        return v;
+    };
+    class CountQueuingStrategy {
+        constructor(init) { QS.set(this, strategyInit(init, 'CountQueuingStrategy')); }
+    }
+    class ByteLengthQueuingStrategy {
+        constructor(init) { QS.set(this, strategyInit(init, 'ByteLengthQueuingStrategy')); }
+    }
+    [[CountQueuingStrategy, countSize], [ByteLengthQueuingStrategy, byteSize]].forEach(function (pair) {
+        var C = pair[0], f = pair[1];
+        getter(C.prototype, 'highWaterMark', function () { return qs(this); });
+        getter(C.prototype, 'size', function () { qs(this); return f; });
+        Object.defineProperty(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
+        hide(globalThis, C.name, C);
+    });
 
     // ---- Body (Fetch §5.3) ----------------------------------------------------------------------------
     // Extracts a body: [stream or null, bytes or null, content type or null].
