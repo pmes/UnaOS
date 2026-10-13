@@ -98,6 +98,35 @@ pub fn with_area(local: bool, origin: &str, f: &mut dyn FnMut(&mut Area)) {
     }
 }
 
+/// The top-level site of a page (HTML §7.1.2, schemeful): the partition every storage key and every
+/// partitioned cookie of the page's tree is keyed by (AETHERORIGIN, SR86).
+pub fn top_level_site(top_level_url: &str) -> String {
+    crate::security::origin::site_of(top_level_url)
+}
+
+/// Storage Partitioning (the storage key, HTML §12.2 / Storage §4): an area is keyed by its origin AND the
+/// top-level site, so a document embedded under another site does not share `localStorage` with the same
+/// origin at top level. A same-site (or top-level) document's key is its origin, which keeps every area
+/// stored before partitioning addressable. (js/net.rs passes the origin today; with AETHERFRAMES it passes
+/// `storage_key(top-level URL, origin)`.)
+pub fn storage_key(top_level_url: &str, origin: &str) -> String {
+    if top_level_url.is_empty() {
+        return origin.to_string();
+    }
+    let top = top_level_site(top_level_url);
+    if origin == "null" || crate::security::origin::site_of(origin) == top {
+        origin.to_string()
+    } else {
+        format!("{origin}^{top}")
+    }
+}
+
+/// The cookie partition key (CHIPS) of a page: its top-level site (`None` for an opaque one).
+pub fn cookie_partition_key(top_level_url: &str) -> Option<String> {
+    let s = top_level_site(top_level_url);
+    (s != "null").then_some(s)
+}
+
 /// The `Storage` interface (HTML §12.2.1) over `__storage`, and the `storage` event's receiving half.
 pub const PRELUDE: &str = r#"
 (function () {

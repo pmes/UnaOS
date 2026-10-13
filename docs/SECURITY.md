@@ -839,3 +839,54 @@ SKIPs `reason=r99-sacred`; `src extract` onto the boot FAT is refused by its own
 Not claimed: `/system` itself is still public under the native ACL (a program may create OTHER names there —
 ROOTACL, B456); a FAT-root boot (no UnaFS) keeps its FAT stores, by R99's own scope; the FAT-LFN witness still runs at
 boot on a FAT-root boot (R80, owed to its knob).
+
+### Aether enforces the web's security model (AETHERORIGIN, LEDGER SR86 — `handlers/aether/src/security/`)
+
+Aether is a JS-enabled browser (CODEX §2, Amendment II), so the page is the attacker. The engine now enforces
+the web platform's own model at its fetch, script and style entry points; every refusal is a named line in the
+engine's ledger (`security-<rule>:<detail>`) and a console error, and a worker thread's refusals are replayed
+into the page's ledger at its next request or script (`security::drain`). Process log: `security::refusals()`.
+- [x] **Origins.** (scheme, host, port) tuples; `data:`, `file:`, `about:` and a CSP-`sandbox`ed document are
+  OPAQUE (serialize `null`, equal only to themselves). `document.domain` relaxation is REFUSED (opaque or a
+  non-suffix: `SecurityError`; otherwise ignored, agent clusters are origin-keyed). Sites are schemeful.
+- [x] **CORS** (Fetch §3.2/§4.8–4.10) on every `fetch()` / XHR hop, run on the page's captured context:
+  response tainting `basic`/`cors`/`opaque` (sticky across redirects); preflight for a non-safelisted method or
+  header (cached by origin/URL/credentials, `Access-Control-Max-Age` ≤ 7200 s); `Access-Control-Allow-Origin`
+  / `-Credentials` on the answer AND on each redirect; `Origin: null` once a cross-origin redirect taints it;
+  `Authorization` dropped across origins; credentials by mode (`omit` / `same-origin` / `include`); the
+  `cors` filtered response exposes only the safelisted names plus `Access-Control-Expose-Headers`; `no-cors`
+  answers are opaque (status 0, no headers, no body) and pass `Cross-Origin-Resource-Policy`. A page can never
+  set a forbidden request-header (`Origin`, `Referer`, `Cookie`, `Sec-*`, `Proxy-*`, …) nor read `Set-Cookie`.
+- [x] **CSP Level 3**: header (`set_document_headers`) and `<meta http-equiv>` (additive; `frame-ancestors`,
+  `report-uri`, `sandbox` ignored there); the fallback lists; source lists (`*`, `'self'`, schemes, wildcard
+  hosts, ports, paths ignored after redirects); inline scripts (nonce, sha256/384/512 hashes,
+  `'unsafe-inline'` disabled by a nonce/hash, `'strict-dynamic'`), external scripts (nonce, integrity hashes,
+  `'strict-dynamic'` admits only non-parser-inserted), module imports, `style=` attributes (`'unsafe-hashes'`),
+  `connect-src` for fetch/XHR per hop, `'unsafe-eval'` (eval / Function constructors guarded), report-only
+  policies; violations fire `SecurityPolicyViolationEvent` at the element or document and POST to
+  `report-uri` (`application/csp-report`) or the `report-to` endpoint `Reporting-Endpoints` names.
+- [x] **Mixed content** (L2): from a secure context, active content over `http:` is blocked; image/audio/video
+  autoupgrade (blocked under `block-all-mixed-content`); `upgrade-insecure-requests` rewrites first.
+- [x] **Referrer-Policy**: all eight policies (+ the default), per request and per redirect hop (`fetch`
+  `referrerPolicy` / `referrer`, document `<meta name=referrer>` over the header), credentials and fragments
+  always stripped, > 4096 bytes falls back to the origin.
+- [x] **Cookies, RFC 6265bis** (http_core `cookie.rs`): `Secure` only from a secure origin, secure cookies left
+  alone, `__Secure-` / `__Host-` prefixes, `SameSite=None` requires `Secure`, Lax-by-default (a cross-site
+  subresource neither sets nor receives a Lax/unspecified cookie; Strict only same-site), `Partitioned` (CHIPS)
+  keyed by the top-level site. Page requests no longer hand the jar to the transport: each hop's cookies are
+  added and stored under its own SameSite / partition context.
+- [x] **SRI** (sha256/384/512 through crypto_core, strongest algorithm wins) on `<script integrity>` (network
+  and pre-fetched sources) and `fetch(…, {integrity})`; an opaque answer with metadata fails.
+- [x] **Embedding** — `security::may_embed(parent_origin, response)` for AETHERFRAMES: `frame-ancestors`
+  decides when present, else `X-Frame-Options` (`DENY`, `SAMEORIGIN`, conflicting lists refuse).
+- [x] **Fetch Metadata**: `Sec-Fetch-Site/-Mode/-Dest` (`-User` on activated navigations) to trustworthy URLs.
+- [ ] Owed — the sites this arc could not touch (each a named call, the function exists): the navigation code
+  (`net/mod.rs` `fetch_document_final` / `post_document_typed`) must call `security::set_document_headers` with
+  the final response headers and send `security::navigation_headers`; COOP's `origin::coop_requires_switch`
+  needs a `window.open` / opener to sever; `<style>` element and `<link rel=stylesheet>` CSP + SRI
+  (`lib.rs` style collection, `js/cssom.rs`), images / fonts / media (`img-src`, `font-src`, `media-src`, passive
+  autoupgrade via `mixed::check`), inline event-handler attributes and `javascript:` URLs (`script-src-attr`,
+  `js/events.rs`), string `setTimeout` (`js/mod.rs`), `form-action` / `base-uri` at their sites, XHR
+  `withCredentials` (api/xhr.rs passes no `:aether-credentials`, so XHR is `same-origin`), storage partitioning
+  of `localStorage` (`js/net.rs` passes the origin, not `storage::storage_key`), the public suffix list for
+  sites, and a js_core HostEnsureCanCompileStrings hook to replace the eval guard.

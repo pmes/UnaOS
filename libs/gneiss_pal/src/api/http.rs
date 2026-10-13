@@ -46,7 +46,7 @@ use http_core::cache::{self as hcache, Decision, Entry};
 use http_core::h1::ResponseHead;
 use http_core::host::{self, Agent, AgentConfig, Event, EventSink, Next};
 pub use http_core::cache::CacheMode;
-pub use http_core::cookie::CookieJar;
+pub use http_core::cookie::{CookieContext, CookieJar};
 pub use http_core::headers::Headers;
 pub use http_core::url::Url;
 

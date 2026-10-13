@@ -16,6 +16,7 @@
 
 use crate::js::net::{NetArg, Poster};
 use std::time::Duration;
+use html_core::url;
 
 /// Most bytes a synchronous XHR buffers (an asynchronous body streams and has no cap).
 const SYNC_BODY_CAP: usize = 64 * 1024 * 1024;
@@ -39,56 +40,215 @@ pub struct HttpReq {
     pub timeout_ms: u64,
 }
 
+/// The transport for one policed exchange: NO cookie jar (cookies are added and stored per hop under the
+/// hop's SameSite / partition context, [`crate::security::cookie_header`]) and NO automatic redirects (each
+/// hop is re-checked: mixed content, CSP, the CORS check on the redirect, the tainted origin).
 fn client(req: &HttpReq) -> Result<gneiss_pal::api::http::blocking::Client, String> {
-    let mut b = crate::net::blocking_client_builder();
-    // A long poll or a server-sent stream over fetch may sit idle for minutes between chunks.
-    b = b.timeout(Duration::from_millis(if req.timeout_ms > 0 { req.timeout_ms } else { 300_000 }));
-    if req.redirect != "follow" {
-        b = b.max_redirects(0);
-    }
-    b.build().map_err(|e| e.to_string())
+    gneiss_pal::api::http::blocking::ClientBuilder::new()
+        .user_agent("UnaOS Aether/0.1.0")
+        // A long poll or a server-sent stream over fetch may sit idle for minutes between chunks.
+        .timeout(Duration::from_millis(if req.timeout_ms > 0 { req.timeout_ms } else { 300_000 }))
+        .max_redirects(0)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
-fn header_list(h: &gneiss_pal::api::http::Headers) -> Vec<String> {
+fn header_list(h: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::with_capacity(h.len() * 2);
-    for (k, v) in h.iter() {
-        out.push(k.to_string());
-        out.push(v.to_string());
+    for (k, v) in h {
+        out.push(k.clone());
+        out.push(v.clone());
     }
     out
 }
 
-fn send(req: &HttpReq) -> Result<gneiss_pal::api::http::blocking::Response, String> {
-    use gneiss_pal::api::http::{site_of, CacheMode};
-    let c = client(req)?;
-    let mut rb = c.request(&req.method, &req.url);
-    for (k, v) in &req.headers {
-        match k.as_str() {
-            ":cache-mode" => rb = rb.cache_mode(CacheMode::parse(v).unwrap_or_default()),
-            ":top-level-site" => {
-                if let Some(site) = site_of(v) {
-                    rb = rb.partition(site);
-                }
-            }
-            _ => rb = rb.header(k, v),
-        }
+/// One policed exchange's answer: the response (body unread), its type (`basic` | `cors` | `opaque`), the
+/// headers script may see, the final URL and whether a redirect was followed.
+pub struct Exchange {
+    pub resp: gneiss_pal::api::http::blocking::Response,
+    pub kind: &'static str,
+    pub headers: Vec<(String, String)>,
+    pub url: String,
+    pub redirected: bool,
+}
+
+fn is_redirect(st: u16) -> bool {
+    matches!(st, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Fetch §4.9 CORS-preflight fetch: `OPTIONS` with `Access-Control-Request-*`, never credentials.
+fn preflight(
+    c: &gneiss_pal::api::http::blocking::Client,
+    ctx: &crate::security::RequestContext,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    origin: &str,
+    include: bool,
+    site: crate::security::origin::FetchSite,
+) -> Result<(), String> {
+    use crate::security::cors;
+    let mut rb = c.request("OPTIONS", url);
+    for (k, v) in cors::preflight_headers(method, headers) {
+        rb = rb.header(k, v);
     }
-    if !req.body.is_empty() || !matches!(req.method.as_str(), "GET" | "HEAD") {
-        rb = rb.body(req.body.clone());
+    for (k, v) in ctx.hop_headers(url, "OPTIONS", site, true, origin) {
+        rb = rb.header(k, v);
     }
     let resp = rb.send().map_err(|e| e.to_string())?;
     let st = resp.status().as_u16();
-    if req.redirect == "error" && (300..400).contains(&st) && resp.headers().contains("location") {
-        return Err("redirect in redirect mode \"error\"".into());
-    }
-    Ok(resp)
+    let rh: Vec<(String, String)> = resp.headers().iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect();
+    drop(resp);
+    cors::check_preflight(st, &rh, origin, url, include, method, headers).map_err(|e| {
+        crate::security::refusal("cors-preflight", url, &format!("Access to fetch at '{url}' from origin '{origin}' has been blocked by CORS policy: {e}."), None)
+    })
 }
 
-/// Runs `req` on its own thread, posting `head(status, statusText, url, [k, v, …], redirected)`, a
-/// `data(ArrayBuffer)` per chunk as it arrives, then `end` — or `error(message)` — as the last message.
-pub fn spawn_http(req: HttpReq, p: Poster) {
+/// The policy hooks at request build and response receipt (AETHERORIGIN, SR86): Fetch §4.1 main fetch,
+/// §4.4 HTTP-redirect fetch and §4.5 HTTP-network-or-cache fetch as far as this engine needs them. Per hop:
+/// the `same-origin` mode, response tainting (`basic` / `cors` / `opaque`, sticky across redirects), the
+/// preflight (cached), `Origin` (`null` once a cross-origin redirect taints it), `Referer` under the
+/// referrer policy, `Sec-Fetch-*`, cookies by credentials mode and SameSite context; on a redirect the CORS
+/// check, the method rewrite, `Authorization` dropped across origins, and the next hop's mixed-content and
+/// CSP checks; on the final answer the CORS check (`cors`), CORP (`opaque`), and the header filter.
+pub fn policed_send(req: &HttpReq, ctx: &crate::security::RequestContext) -> Result<Exchange, String> {
+    use crate::security::{cors, origin::FetchSite, origin::Origin, refusal};
+    let c = client(req)?;
+    let mut url = req.url.clone();
+    let mut method = req.method.clone();
+    let mut body = req.body.clone();
+    let mut headers = req.headers.clone();
+    let mut tainted = false;
+    let mut tainting: &'static str = "basic";
+    let mut site = FetchSite::None;
+    let mut redirected = false;
+    for hop in 0..=20u32 {
+        if hop > 0 {
+            url = ctx.check_hop(&url, true)?;
+        }
+        let target = Origin::of(&url);
+        let same = !ctx.has_page || ctx.client_origin.same_origin(&target);
+        if ctx.has_page && !same {
+            match ctx.mode.as_str() {
+                "same-origin" => {
+                    return Err(refusal("same-origin-mode", &url, &format!("Request mode is \"same-origin\" but a redirect led to {}.", target.serialize()), None));
+                }
+                "cors" if tainting == "basic" => tainting = "cors",
+                "no-cors" if tainting == "basic" => tainting = "opaque",
+                _ => {}
+            }
+        }
+        if tainting == "cors" && url::Url::parse(&url).is_ok_and(|u| !u.username().is_empty() || !u.password().is_empty()) {
+            return Err(refusal("cors-url-credentials", &url, &format!("A CORS request to '{url}' may not carry credentials in its URL."), None));
+        }
+        if ctx.has_page {
+            site = site.step(&ctx.client_origin, &target);
+        }
+        let include = ctx.include_credentials(&target);
+        let origin_ser = if tainted { "null".to_string() } else { ctx.client_origin.serialize() };
+        if tainting == "cors" && cors::needs_preflight(&method, &headers) && !cors::preflight_cached(&origin_ser, &url, include, &method, &headers) {
+            preflight(&c, ctx, &url, &method, &headers, &origin_ser, include, site)?;
+        }
+        let mut rb = c.request(&method, &url);
+        for (k, v) in &headers {
+            // AETHERCACHE (SR88): the cache mode and the top-level site ride as pseudo-fields (names no page
+            // can set); `RequestContext::capture` leaves exactly these two in the list for this hop to lift.
+            match k.as_str() {
+                ":cache-mode" => rb = rb.cache_mode(gneiss_pal::api::http::CacheMode::parse(v).unwrap_or_default()),
+                ":top-level-site" => {
+                    if let Some(site) = gneiss_pal::api::http::site_of(v) {
+                        rb = rb.partition(site);
+                    }
+                }
+                _ => rb = rb.header(k, v),
+            }
+        }
+        for (k, v) in ctx.hop_headers(&url, &method, site, tainting == "cors", &origin_ser) {
+            rb = rb.header(k, v);
+        }
+        if include {
+            if let Some(ck) = crate::security::cookie_header(ctx, &url, &method) {
+                rb = rb.header("cookie", ck);
+            }
+        }
+        if !body.is_empty() || !matches!(method.as_str(), "GET" | "HEAD") {
+            rb = rb.body(body.clone());
+        }
+        let resp = rb.send().map_err(|e| e.to_string())?;
+        let st = resp.status().as_u16();
+        let rh: Vec<(String, String)> = resp.headers().iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect();
+        if include {
+            crate::security::store_cookies(ctx, &url, &method, rh.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.as_str()));
+        }
+        let location = if is_redirect(st) { cors::get(&rh, "location").map(str::to_string) } else { None };
+        if let Some(loc) = location {
+            match req.redirect.as_str() {
+                "error" => return Err("redirect in redirect mode \"error\"".into()),
+                "manual" => {
+                    let filtered = cors::filter_response_headers(&rh, "basic", include);
+                    return Ok(Exchange { resp, kind: tainting, headers: filtered, url, redirected });
+                }
+                _ => {}
+            }
+            if tainting == "cors" {
+                cors::cors_check(&rh, &origin_ser, include).map_err(|e| {
+                    refusal("cors-redirect", &url, &format!("Access to fetch at '{url}' (redirected) from origin '{origin_ser}' has been blocked by CORS policy: {e}."), None)
+                })?;
+            }
+            let next = url::Url::parse(&url).and_then(|b| b.join(&loc)).map_err(|e| format!("bad redirect Location {loc}: {e}"))?;
+            if !matches!(next.scheme(), "http" | "https") {
+                return Err(format!("redirect to unsupported scheme {}", next.scheme()));
+            }
+            let next = next.to_string();
+            if ((st == 301 || st == 302) && method == "POST") || (st == 303 && !matches!(method.as_str(), "GET" | "HEAD")) {
+                method = "GET".into();
+                body.clear();
+                headers.retain(|(k, _)| !matches!(k.to_ascii_lowercase().as_str(), "content-type" | "content-encoding" | "content-language" | "content-location"));
+            }
+            let cur = Origin::of(&url);
+            let nxt = Origin::of(&next);
+            if !cur.same_origin(&nxt) {
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                // Fetch §4.4 step 14: a hop between two origins neither of which is the request's taints it.
+                if ctx.has_page && !ctx.client_origin.same_origin(&cur) {
+                    tainted = true;
+                }
+            }
+            drop(resp);
+            url = next;
+            redirected = true;
+            continue;
+        }
+        if tainting == "cors" {
+            cors::cors_check(&rh, &origin_ser, include).map_err(|e| {
+                refusal("cors", &url, &format!("Access to fetch at '{url}' from origin '{origin_ser}' has been blocked by CORS policy: {e}."), None)
+            })?;
+        }
+        if tainting == "opaque" {
+            cors::corp_check(&ctx.client_origin, &url, &rh).map_err(|e| refusal("corp", &url, &format!("{e} (blocked by Cross-Origin-Resource-Policy)."), None))?;
+        }
+        let filtered = cors::filter_response_headers(&rh, tainting, include);
+        return Ok(Exchange { resp, kind: tainting, headers: filtered, url, redirected });
+    }
+    Err("too many redirects".into())
+}
+
+/// Runs `req` on its own thread, posting `head(status, statusText, url, [k, v, …], redirected, type)`, a
+/// `data(ArrayBuffer)` per chunk as it arrives, then `end` — or `error(message)` — as the last message. The
+/// request context (client, mode, credentials, policies) is captured HERE, on the page thread; an `opaque`
+/// answer posts status 0, no headers and no body; a request with `integrity` buffers its body and posts it
+/// only after Subresource Integrity passes.
+pub fn spawn_http(mut req: HttpReq, p: Poster) {
+    let ctx = crate::security::RequestContext::capture(&mut req.headers);
+    match ctx.precheck(&req.url, &req.method) {
+        Ok(u) => req.url = u,
+        Err(e) => {
+            p.finish("error", vec![NetArg::Str(e)]);
+            return;
+        }
+    }
     std::thread::spawn(move || {
-        let mut resp = match send(&req) {
+        let ex = match policed_send(&req, &ctx) {
             Ok(r) => r,
             Err(e) => {
                 crate::ledger::record_js(&format!("fetch-failed:{}", crate::js::clip(&req.url, 48)));
@@ -96,17 +256,54 @@ pub fn spawn_http(req: HttpReq, p: Poster) {
                 return;
             }
         };
-        let st = resp.status().as_u16();
-        let url = resp.url().href();
-        let redirected = url != req.url;
+        let Exchange { mut resp, kind, headers, url, redirected } = ex;
+        let opaque = kind == "opaque";
+        let st = if opaque { 0 } else { resp.status().as_u16() };
         let head = vec![
             NetArg::Num(st as f64),
-            NetArg::Str(resp.reason().to_string()),
-            NetArg::Str(url),
-            NetArg::List(header_list(resp.headers())),
-            NetArg::Bool(redirected),
+            NetArg::Str(if opaque { String::new() } else { resp.reason().to_string() }),
+            NetArg::Str(if opaque { String::new() } else { url.clone() }),
+            NetArg::List(header_list(&headers)),
+            NetArg::Bool(redirected && !opaque),
+            NetArg::Str(kind.to_string()),
         ];
+        if !ctx.integrity.is_empty() && crate::security::sri::parse(&ctx.integrity).first().is_some() {
+            let mut body = Vec::new();
+            loop {
+                match resp.chunk() {
+                    Ok(Some(c)) => {
+                        body.extend_from_slice(&c);
+                        if body.len() > SYNC_BODY_CAP {
+                            p.finish("error", vec![NetArg::Str("integrity-checked body larger than 64 MiB".into())]);
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        p.finish("error", vec![NetArg::Str(e.to_string())]);
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = crate::security::sri::check(&ctx.integrity, &body, !opaque) {
+                let msg = format!("Failed to find a valid digest in the 'integrity' attribute for resource '{url}': {e}. The resource has been blocked.");
+                p.finish("error", vec![NetArg::Str(crate::security::refusal("sri", &url, &msg, None))]);
+                return;
+            }
+            if !p.post("head", head) {
+                return;
+            }
+            if !opaque && !body.is_empty() && !p.post("data", vec![NetArg::Bytes(body)]) {
+                return;
+            }
+            p.finish("end", vec![]);
+            return;
+        }
         if !p.post("head", head) {
+            return;
+        }
+        if opaque {
+            p.finish("end", vec![]);
             return;
         }
         loop {
@@ -145,27 +342,38 @@ pub struct SyncResponse {
 }
 
 /// Runs `req` to completion on a scoped thread (the engine thread may sit inside a tokio runtime, which
-/// forbids blocking directly) and joins it.
-pub fn http_sync(req: HttpReq) -> Result<SyncResponse, String> {
-    std::thread::spawn(move || -> Result<SyncResponse, String> {
-        let mut resp = send(&req)?;
+/// forbids blocking directly) and joins it. The request context is captured on the calling (page) thread,
+/// and the worker's refusals are replayed into the page's ledger after the join.
+pub fn http_sync(mut req: HttpReq) -> Result<SyncResponse, String> {
+    let ctx = crate::security::RequestContext::capture(&mut req.headers);
+    req.url = ctx.precheck(&req.url, &req.method)?;
+    let r = std::thread::spawn(move || -> Result<SyncResponse, String> {
+        let ex = policed_send(&req, &ctx)?;
+        let Exchange { mut resp, kind, headers, url, .. } = ex;
         let mut body = Vec::new();
-        while let Some(c) = resp.chunk().map_err(|e| e.to_string())? {
-            body.extend_from_slice(&c);
-            if body.len() > SYNC_BODY_CAP {
-                return Err("synchronous response body larger than 64 MiB".into());
+        if kind != "opaque" {
+            while let Some(c) = resp.chunk().map_err(|e| e.to_string())? {
+                body.extend_from_slice(&c);
+                if body.len() > SYNC_BODY_CAP {
+                    return Err("synchronous response body larger than 64 MiB".into());
+                }
             }
         }
+        if !ctx.integrity.is_empty() {
+            crate::security::sri::check(&ctx.integrity, &body, kind != "opaque").map_err(|e| crate::security::refusal("sri", &url, &e, None))?;
+        }
         Ok(SyncResponse {
-            status: resp.status().as_u16(),
-            status_text: resp.reason().to_string(),
-            url: resp.url().href(),
-            headers: header_list(resp.headers()),
+            status: if kind == "opaque" { 0 } else { resp.status().as_u16() },
+            status_text: if kind == "opaque" { String::new() } else { resp.reason().to_string() },
+            url: if kind == "opaque" { String::new() } else { url },
+            headers: header_list(&headers),
             body,
         })
     })
     .join()
-    .map_err(|_| "fetch thread panicked".to_string())?
+    .map_err(|_| "fetch thread panicked".to_string())?;
+    crate::security::drain();
+    r
 }
 
 /// The WHATWG shapes: AbortSignal/AbortController, Blob, Headers, the Streams Standard's default
@@ -758,6 +966,8 @@ pub const PRELUDE: &str = r#"
 
     // ---- Request (Fetch §5.4) -------------------------------------------------------------------------
     var METHODS = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'];
+    var REFERRER_POLICIES = ['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin',
+                             'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'];
     var baseURL = function () { try { return document.baseURI; } catch (e) { return location.href; } };
     class Request {
         constructor(input, init) {
@@ -796,17 +1006,39 @@ pub const PRELUDE: &str = r#"
             }
             var redirect = init.redirect !== undefined ? String(init.redirect) : (src ? src.redirect : 'follow');
             if (['follow', 'error', 'manual'].indexOf(redirect) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + redirect + "' is not a valid enum value of type RequestRedirect."); }
-            var mode = init.mode !== undefined ? String(init.mode) : (src ? src.mode : 'cors');
+            // AETHERORIGIN (SR86): mode, credentials, referrer, referrerPolicy and integrity are kept and
+            // travel with the request (fetch() hands them to the policed exchange as pseudo-headers).
+            var mode = init.mode !== undefined ? String(init.mode) : (src ? (src.mode === 'navigate' ? 'same-origin' : src.mode) : 'cors');
+            if (mode === 'navigate') { throw new TypeError("Failed to construct 'Request': Cannot construct a Request with a RequestInit whose mode member is set as 'navigate'."); }
+            if (['same-origin', 'no-cors', 'cors'].indexOf(mode) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + mode + "' is not a valid enum value of type RequestMode."); }
             var cache = init.cache !== undefined ? String(init.cache) : (src ? src.cache : 'default');
             if (['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached'].indexOf(cache) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + cache + "' is not a valid enum value of type RequestCache."); }
             // Fetch, the Request constructor: only-if-cached is for same-origin requests only.
             if (cache === 'only-if-cached' && mode !== 'same-origin') { throw new TypeError("Failed to construct 'Request': 'only-if-cached' can be set only with 'same-origin' mode"); }
+            var credentials = init.credentials !== undefined ? String(init.credentials) : (src ? src.credentials : 'same-origin');
+            if (['omit', 'same-origin', 'include'].indexOf(credentials) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + credentials + "' is not a valid enum value of type RequestCredentials."); }
+            var referrerPolicy = init.referrerPolicy !== undefined ? String(init.referrerPolicy) : (src ? src.referrerPolicy : '');
+            if (REFERRER_POLICIES.indexOf(referrerPolicy) < 0) { throw new TypeError("Failed to construct 'Request': The provided value '" + referrerPolicy + "' is not a valid enum value of type ReferrerPolicy."); }
+            var referrer = src ? src.referrer : 'about:client';
+            if (init.referrer !== undefined) {
+                var rv = String(init.referrer);
+                if (rv === '') { referrer = ''; }
+                else {
+                    var pr;
+                    try { pr = new URL(rv, baseURL()); } catch (e) { throw new TypeError("Failed to construct 'Request': Referrer '" + rv + "' is not a valid URL."); }
+                    var here = null;
+                    try { here = location.origin; } catch (e) {}
+                    referrer = (pr.href === 'about:client' || (here !== null && pr.origin !== here)) ? 'about:client' : pr.href;
+                }
+            }
+            var integrity = init.integrity !== undefined ? String(init.integrity) : (src ? src.integrity : '');
+            if (mode === 'no-cors' && ['GET', 'HEAD', 'POST'].indexOf(m) < 0) { throw new TypeError("Failed to construct 'Request': '" + m + "' is unsupported in no-cors mode."); }
             ST.set(this, {
                 url: url, method: m, headers: headers, body: body, bytes: bytes, signal: own, redirect: redirect,
-                credentials: init.credentials !== undefined ? String(init.credentials) : (src ? src.credentials : 'same-origin'),
-                mode: mode,
+                credentials: credentials, mode: mode,
                 cache: cache,
                 keepalive: !!init.keepalive,
+                referrer: referrer, referrerPolicy: referrerPolicy, integrity: integrity,
             });
         }
         get url() { return st(this).url; }
@@ -819,9 +1051,9 @@ pub const PRELUDE: &str = r#"
         get cache() { return st(this).cache; }
         get keepalive() { return st(this).keepalive; }
         get destination() { return ''; }
-        get referrer() { return 'about:client'; }
-        get referrerPolicy() { return ''; }
-        get integrity() { return ''; }
+        get referrer() { return st(this).referrer; }
+        get referrerPolicy() { return st(this).referrerPolicy; }
+        get integrity() { return st(this).integrity; }
         clone() {
             var s = st(this);
             if (s.body && (disturbed(s.body) || s.body.locked)) { throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used"); }
@@ -950,6 +1182,10 @@ pub const PRELUDE: &str = r#"
                 var top = (globalThis.top && globalThis.top.location) ? globalThis.top.location : globalThis.location;
                 if (top && top.href) { flat.push(':top-level-site', String(top.href)); }
             } catch (e) {}
+            // The policy inputs (names starting ':' are never a page's header; the exchange strips them).
+            flat.push(':aether-mode', rs.mode, ':aether-credentials', rs.credentials,
+                      ':aether-referrer', rs.referrer === '' ? 'no-referrer' : rs.referrer,
+                      ':aether-referrer-policy', rs.referrerPolicy, ':aether-integrity', rs.integrity);
             var id = __net_http(rs.method, url.replace(/#.*$/, ''), flat, rs.bytes, rs.redirect);
             if (!id) { reject(new TypeError('Failed to fetch')); return; }
             var resp = null, controller = null, done = false;
@@ -958,9 +1194,15 @@ pub const PRELUDE: &str = r#"
                     if (kind === 'head') {
                         var status = a[0];
                         var h = headersFrom(a[3], 'immutable');
-                        var type = 'basic';
+                        var type = a[5] === 'cors' || a[5] === 'opaque' ? a[5] : 'basic';
                         if (rs.redirect === 'manual' && status >= 300 && status < 400 && h.has('location')) {
                             type = 'opaqueredirect';
+                        }
+                        if (type === 'opaque') {
+                            creatingResponse = { type: 'opaque', url: '', redirected: false, status: 0, statusText: '', headers: headersFrom([], 'immutable'), body: null };
+                            resp = new Response();
+                            resolve(resp);
+                            return;
                         }
                         var body = NULL_BODY.indexOf(status) >= 0 || rs.method === 'HEAD' || type === 'opaqueredirect' ? null :
                             new ReadableStream({
@@ -979,6 +1221,11 @@ pub const PRELUDE: &str = r#"
                         if (controller) { try { controller.close(); } catch (e) {} }
                     } else if (kind === 'error') {
                         done = true;
+                        // A security refusal carries its SecurityPolicyViolationEventInit (when CSP refused it).
+                        if (typeof a[0] === 'string' && a[0].indexOf('aether-security\u0001') === 0) {
+                            var sec = a[0].split('\u0001');
+                            if (sec[2] && typeof __csp_violation === 'function') { try { __csp_violation(JSON.parse(sec[2]), null); } catch (x) {} }
+                        }
                         if (!resp) { reject(new TypeError('Failed to fetch')); }
                         else if (controller) { try { controller.error(new TypeError('network error')); } catch (e) {} }
                     }

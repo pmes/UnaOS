@@ -54,6 +54,15 @@ pub fn resolve_specifier(base: &str, specifier: &str) -> Result<String, String> 
 
 /// Fetches a script resource (module or classic) as text: `file:`, `data:` and `http(s):` URLs.
 pub fn fetch_script_text(url: &str) -> Result<String, String> {
+    fetch_script(url, false, None, "")
+}
+
+/// [`fetch_script_text`] with the element's fetch options (AETHERORIGIN, SR86): a module, or a classic script
+/// with `crossorigin`, is a `cors` request (an `Origin` header, the CORS check on the answer); a plain classic
+/// script is `no-cors` with credentials. `http(s):` goes through the policed exchange (`api::fetch`):
+/// `Referer` under the document's referrer policy, `Sec-Fetch-Dest: script`, per-hop mixed content, cookies
+/// under SameSite, CORS / CORP; `integrity` (SRI) is checked on the bytes before they become text.
+pub fn fetch_script(url: &str, module: bool, crossorigin: Option<&str>, integrity: &str) -> Result<String, String> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = percent_decode(path.split(['?', '#']).next().unwrap_or(path));
         return std::fs::read_to_string(&path).map_err(|e| format!("{url}: {e}"));
@@ -68,25 +77,37 @@ pub fn fetch_script_text(url: &str) -> Result<String, String> {
         return Ok(percent_decode(body));
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        let u = url.to_string();
+        let ctx = crate::security::RequestContext::for_script(module, crossorigin, integrity);
+        let u = ctx.precheck(url, "GET")?;
+        let req = crate::api::fetch::HttpReq {
+            method: "GET".into(),
+            url: u,
+            headers: vec![("accept".into(), "*/*".into())],
+            body: Vec::new(),
+            redirect: "follow".into(),
+            timeout_ms: 10_000,
+        };
         let r = std::thread::spawn(move || -> Result<String, String> {
-            let client = crate::net::blocking_client_builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .map_err(|e| e.to_string())?;
-            let resp = client.get(&u).send().map_err(|e| e.to_string())?;
-            let status = resp.status().as_u16();
+            let ex = crate::api::fetch::policed_send(&req, &ctx)?;
+            let status = ex.resp.status().as_u16();
             if !(200..300).contains(&status) {
-                return Err(format!("HTTP {status} for {u}"));
+                return Err(format!("HTTP {status} for {}", req.url));
             }
-            let text = resp.text().map_err(|e| e.to_string())?;
-            if text.len() > 4 * 1024 * 1024 {
-                return Err(format!("{u}: script larger than 4 MiB"));
+            let opaque = ex.kind == "opaque";
+            let bytes = ex.resp.bytes().map_err(|e| e.to_string())?;
+            if bytes.len() > 4 * 1024 * 1024 {
+                return Err(format!("{}: script larger than 4 MiB", req.url));
             }
-            Ok(text)
+            if !ctx.integrity.is_empty() {
+                crate::security::sri::check(&ctx.integrity, &bytes, !opaque).map_err(|e| {
+                    crate::security::refusal("sri", &req.url, &format!("Failed to find a valid digest in the 'integrity' attribute for resource '{}': {e}. The resource has been blocked.", req.url), None)
+                })?;
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
         })
         .join()
         .map_err(|_| "fetch thread panicked".to_string())?;
+        crate::security::drain();
         return r;
     }
     Err(format!("unsupported script URL scheme: {url}"))
@@ -121,6 +142,8 @@ impl Host for AetherHost {
             None => super::page_url(),
         };
         let resolved = resolve_specifier(&base, specifier)?;
+        // CSP script-src-elem and mixed content for the import (AETHERORIGIN, SR86).
+        crate::security::module_import_allowed(&resolved)?;
         // A module already in the page's pre-fetched set needs no request.
         if let Some(src) = super::page(|p| p.script_sources.get(&resolved).cloned()) {
             return Ok((resolved, src));
@@ -130,7 +153,7 @@ impl Host for AetherHost {
             crate::ledger::record_js("module-fetch-cap-reached");
             return Err(format!("module fetch cap reached loading {resolved}"));
         }
-        let src = fetch_script_text(&resolved).map_err(|e| {
+        let src = fetch_script(&resolved, true, None, "").map_err(|e| {
             crate::ledger::record_js(&format!("module-fetch-failed:{}", super::clip(&resolved, 48)));
             e
         })?;
