@@ -441,7 +441,7 @@ refs/heads/exec-rmbp-aethermetal5             6a183dc1 FOLDED-BY-HAND ef281fa6 2
 refs/heads/exec-host-aetherdevtools2          86aa6401 FOLDED-BY-HAND 7af171f2 2026-10-13
 refs/heads/exec-rmbp-ring3rename              6359550e FOLDED-BY-HAND e01dc6c0 2026-10-13
 refs/heads/exec-rmbp-ring3pipe                7af171f2 IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-host-usingsyntax              7af171f2 IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-host-usingsyntax              5acfd6b8 FOLDED-BY-HAND 0b5c37da 2026-10-13
 refs/heads/exec-host-aetherstyle3b            7af171f2 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-vp9core                  7af171f2 IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-host-temporal                 7af171f2 IN-FLIGHT cloud 2026-10-13
