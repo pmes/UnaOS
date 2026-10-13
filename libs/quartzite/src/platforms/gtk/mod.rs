@@ -234,7 +234,7 @@ pub fn bootstrap_browser_chrome(window: &gtk4::ApplicationWindow, synapse: bandy
     let devtools = devtools_view::bootstrap_devtools(synapse.clone(), &page.root);
     root.append(&strip);
     root.append(&bar.root);
-    root.append(&devtools.root);
+    root.append(&tab_strip::bootstrap_side_tabs(synapse.clone(), &devtools.root)); // AETHERSIDETABS (SR140): the side column beside the page (shown only in the `side` layout)
 
     let shortcuts = ShortcutController::new();
     shortcuts.set_propagation_phase(PropagationPhase::Capture);
