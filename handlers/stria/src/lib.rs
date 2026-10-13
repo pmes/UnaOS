@@ -60,6 +60,8 @@
 
 pub mod media;
 pub mod media_bus;
+/// AETHERMEDIA2 (SR134): the Media Source Extensions feed.
+pub mod media_source;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

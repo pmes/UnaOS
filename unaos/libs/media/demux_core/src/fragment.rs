@@ -352,13 +352,20 @@ impl SegmentParser {
 
     fn make_init(&mut self) -> Result<InitSegment, Error> {
         let tracks = self.tracks.clone().ok_or(Error::Invalid("no Tracks element"))?;
-        let mut prefix = self.ebml.clone();
-        prefix.extend_from_slice(&SEGMENT_UNKNOWN);
-        if let Some(i) = &self.info {
-            prefix.extend_from_slice(i);
-        }
-        prefix.extend_from_slice(&tracks);
-        let d = Demuxer::open(prefix.clone())?;
+        let build = |info: Option<&[u8]>| {
+            let mut prefix = self.ebml.clone();
+            prefix.extend_from_slice(&SEGMENT_UNKNOWN);
+            if let Some(i) = info {
+                prefix.extend_from_slice(i);
+            }
+            prefix.extend_from_slice(&tracks);
+            prefix
+        };
+        let d = Demuxer::open(build(self.info.as_deref()))?;
+        // A media segment parses behind an Info WITHOUT Duration: the file demuxer gives a block that
+        // carries no duration the gap to the stream's end, which inside one Cluster is not its own.
+        let stripped = self.info.as_deref().map(strip_duration).transpose()?;
+        let prefix = build(stripped.as_deref());
         let init = InitSegment { format: d.format(), tracks: d.tracks().to_vec(), duration_ns: d.declared_duration_ns(), prefix };
         self.init = Some(init.clone());
         self.fresh = false;
@@ -387,6 +394,31 @@ fn unknown_cluster_end(b: &[u8], eos: bool) -> Result<Option<usize>, Error> {
             }
         }
     }
+}
+
+/// An `Info` element without its `Duration` child (0x4489), re-sized (8-byte size vint).
+fn strip_duration(info: &[u8]) -> Result<Vec<u8>, Error> {
+    let Some((_, hdr, size)) = ebml_header(info)? else { return Err(Error::Truncated) };
+    let end = (hdr as u64 + size).min(info.len() as u64) as usize;
+    let mut body = Vec::new();
+    let mut p = hdr;
+    while p < end {
+        let Some((id, h, sz)) = ebml_header(&info[p..end])? else { break };
+        if sz == UNKNOWN || p + h + sz as usize > end {
+            return Err(Error::Invalid("Info child of unknown or overlong size"));
+        }
+        let e = p + h + sz as usize;
+        if id != 0x4489 {
+            body.extend_from_slice(&info[p..e]);
+        }
+        p = e;
+    }
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(&ID_INFO.to_be_bytes());
+    out.push(0x01);
+    out.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
 /// Every `traf` of a `moof` carries a `tfdt` (MSE ISO BMFF byte stream format §"Media Segments").

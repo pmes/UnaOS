@@ -25,6 +25,12 @@
 //! nothing playable) answer `MediaError`. Urls are `file://` paths or bare paths; network
 //! fetches are Aether's — it caches the http(s) resource and hands Stria the file
 //! (AUDIOTRACK M4).
+//!
+//! AETHERMEDIA2 (SR134): a `mediasource:<journal>` key is a Media Source Extensions session — a
+//! [`MediaSourceFeed`] tails the page's journal of MediaSource records each tick; the session opens
+//! (`MediaOpened`) once every SourceBuffer has its initialization segment, plays the appended frames
+//! through `Player::open_live`, holds at the buffered end, and ends (`MediaEnded`) after endOfStream.
+//! Requests that arrive before it can open are remembered (play / pause).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +44,7 @@ use gneiss_pal::dsp::video::Frame;
 use tokio::sync::broadcast::error::TryRecvError;
 
 use crate::media::{AudioOut, FrameSink, Player, Tick, resonance_out};
+use crate::media_source::{self, MediaSourceFeed};
 
 struct Session {
     player: Player,
@@ -45,6 +52,15 @@ struct Session {
     playing: bool,
     ended: bool,
     levels: Vec<[f32; 2]>,
+    /// AETHERMEDIA2 (SR134): the MediaSource feed of a `mediasource:` session.
+    feed: Option<MediaSourceFeed>,
+}
+
+/// AETHERMEDIA2 (SR134): a `mediasource:` session not yet open (no initialization segment on every
+/// SourceBuffer): its feed and whether the requester asked it to play.
+struct PendingFeed {
+    feed: MediaSourceFeed,
+    play: bool,
 }
 
 struct BusSink<'a> {
@@ -101,15 +117,21 @@ impl MediaService {
             .spawn(move || {
                 let period = Duration::from_nanos(1_000_000_000 / display_hz.max(1) as u64);
                 let mut sessions: HashMap<String, Session> = HashMap::new();
+                let mut feeds: HashMap<String, PendingFeed> = HashMap::new();
                 let mut next = Instant::now();
                 while !st.load(Ordering::Acquire) {
                     loop {
                         match rx.try_recv() {
-                            Ok(msg) => handle(&synapse, &mut sessions, msg, display_hz, with_audio),
+                            Ok(msg) => {
+                                if !handle_feed_request(&mut sessions, &mut feeds, &msg) {
+                                    handle(&synapse, &mut sessions, msg, display_hz, with_audio)
+                                }
+                            }
                             Err(TryRecvError::Lagged(n)) => log::warn!("[STRIA] :: media bus lagged {n}"),
                             Err(_) => break,
                         }
                     }
+                    poll_feeds(&synapse, &mut sessions, &mut feeds, display_hz, with_audio);
                     for (url, s) in sessions.iter_mut() {
                         if s.ended {
                             continue;
@@ -178,10 +200,113 @@ fn open(synapse: &Synapse, url: &str, display_hz: u32, with_audio: bool) -> Opti
                 real_video: i.real_video,
                 audio_clock: i.audio_clock,
             });
-            Some(Session { player, _engine: engine, playing: false, ended: false, levels: Vec::new() })
+            Some(Session { player, _engine: engine, playing: false, ended: false, levels: Vec::new(), feed: None })
         }
         Err(e) => err(e.to_string()),
     }
+}
+
+/// AETHERMEDIA2 (SR134): a request for a `mediasource:` key that has no open session yet is kept on
+/// its pending feed (created by `PlayMedia` / `MediaPoster`). True when the request was consumed.
+fn handle_feed_request(sessions: &mut HashMap<String, Session>, feeds: &mut HashMap<String, PendingFeed>, msg: &SMessage) -> bool {
+    let url = match msg {
+        SMessage::PlayMedia { url, .. }
+        | SMessage::MediaPoster { url }
+        | SMessage::MediaPause { url }
+        | SMessage::MediaResume { url }
+        | SMessage::MediaStop { url } => url,
+        _ => return false,
+    };
+    if !url.starts_with(media_source::SCHEME) || sessions.contains_key(url) {
+        return false;
+    }
+    match msg {
+        SMessage::PlayMedia { .. } | SMessage::MediaPoster { .. } | SMessage::MediaResume { .. } => {
+            let play = !matches!(msg, SMessage::MediaPoster { .. });
+            if let Some(p) = feeds.get_mut(url) {
+                p.play |= play;
+            } else if let Some(feed) = MediaSourceFeed::for_url(url) {
+                feeds.insert(url.clone(), PendingFeed { feed, play });
+            }
+        }
+        SMessage::MediaPause { .. } => {
+            if let Some(p) = feeds.get_mut(url) {
+                p.play = false;
+            }
+        }
+        SMessage::MediaStop { .. } => {
+            feeds.remove(url);
+        }
+        _ => {}
+    }
+    true
+}
+
+/// AETHERMEDIA2 (SR134): read every feed's journal; open the sessions whose SourceBuffers all have an
+/// initialization segment (`MediaOpened`), and hand open sessions their rebuilt demuxer.
+fn poll_feeds(synapse: &Synapse, sessions: &mut HashMap<String, Session>, feeds: &mut HashMap<String, PendingFeed>, hz: u32, with_audio: bool) {
+    let mut ready: Vec<String> = Vec::new();
+    for (url, p) in feeds.iter_mut() {
+        p.feed.poll();
+        if let Some(why) = &p.feed.broken {
+            synapse.fire(SMessage::MediaError { url: url.clone(), error: format!("MediaSource journal: {why}") });
+            ready.push(url.clone());
+        } else if p.feed.ready() {
+            ready.push(url.clone());
+        }
+    }
+    for url in ready {
+        let Some(p) = feeds.remove(&url) else { continue };
+        if p.feed.broken.is_some() {
+            continue;
+        }
+        let Some(demux) = p.feed.demuxer() else { continue };
+        let rate = p.feed.audio_rate();
+        let (engine, out): (Option<resonance::AudioEngine>, Option<Box<dyn AudioOut>>) = if with_audio && rate > 0 {
+            match resonance_out(rate) {
+                Some((e, f)) => (Some(e), Some(Box::new(f))),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        match Player::open_live(demux, Arc::new(SystemTime::new()), out, hz) {
+            Ok(mut player) => {
+                player.refresh_live(demux_again(&p.feed), p.feed.duration_ns(), p.feed.ended());
+                let i = player.info().clone();
+                synapse.fire(SMessage::MediaOpened {
+                    url: url.clone(),
+                    duration_ns: p.feed.duration_ns(),
+                    width: i.width,
+                    height: i.height,
+                    video: i.video,
+                    audio: i.audio,
+                    real_video: i.real_video,
+                    audio_clock: i.audio_clock,
+                });
+                if p.play {
+                    player.play();
+                }
+                sessions.insert(url, Session { player, _engine: engine, playing: p.play, ended: false, levels: Vec::new(), feed: Some(p.feed) });
+            }
+            Err(e) => synapse.fire(SMessage::MediaError { url, error: e.to_string() }),
+        }
+    }
+    for s in sessions.values_mut() {
+        let Some(feed) = s.feed.as_mut() else { continue };
+        if feed.poll() {
+            if let Some(d) = feed.demuxer() {
+                s.player.refresh_live(d, feed.duration_ns(), feed.ended());
+                s.ended = false;
+            }
+        }
+    }
+}
+
+/// The feed's demuxer again (it is Some once the feed is ready), for the first `refresh_live`, which
+/// positions the new session at the keyframe at or before 0 and states endOfStream.
+fn demux_again(feed: &MediaSourceFeed) -> gneiss_pal::dsp::demux::Demuxer {
+    feed.demuxer().unwrap_or_else(|| gneiss_pal::dsp::demux::Demuxer::from_frames(gneiss_pal::dsp::demux::Format::Mp4, Vec::new(), std::iter::empty(), None))
 }
 
 fn handle(synapse: &Synapse, sessions: &mut HashMap<String, Session>, msg: SMessage, hz: u32, with_audio: bool) {
