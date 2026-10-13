@@ -531,5 +531,5 @@ refs/heads/exec-rmbp-a11ypane                     8da376cb FOLDED-BY-HAND 7fda68
 refs/heads/exec-rmbp-keplergold                   8da376cb FOLDED-BY-HAND 269cc521
 refs/heads/exec-rmbp-gatesteal                    45e03964 IN-FLIGHT cloud 2026-10-14
 refs/heads/exec-rmbp-dongleboot                   45e03964 IN-FLIGHT cloud 2026-10-14
-refs/heads/exec-rmbp-winedge                      45e03964 IN-FLIGHT cloud 2026-10-14
+refs/heads/exec-rmbp-winedge                      45e03964 FOLDED-BY-HAND 62cff5f5
 refs/heads/exec-rmbp-quarryio                     45e03964 IN-FLIGHT cloud 2026-10-14
