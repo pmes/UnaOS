@@ -405,7 +405,7 @@ refs/heads/exec-rmbp-smallfix10               4a63aeff FOLDED-BY-HAND f55eaaab 2
 refs/heads/exec-arm-apps                      d338dca4 FOLDED-BY-HAND 1440d4ad 2026-10-13
 refs/heads/exec-arm-sonde                     8f6dde32 FOLDED-BY-HAND 41d1e3c5 2026-10-13
 refs/heads/exec-arm-line                      b36b2193 FOLDED-BY-HAND 1f782366 2026-10-13
-refs/heads/exec-rmbp-pointerscale             bf81f7ef IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-pointerscale             79d6ab5c FOLDED-BY-HAND e279515b 2026-10-13
 refs/heads/exec-rmbp-pumphole                 bf81f7ef IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-twocursors               bf81f7ef IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-aetherptr                bf81f7ef IN-FLIGHT cloud 2026-10-13
