@@ -3077,7 +3077,9 @@ mod tests {
             #l li::before { content: counter(list-item) ":"; }"#);
         let got: Vec<String> = generated_texts(&t, "o").iter().map(|s| s.trim().to_string()).collect();
         assert_eq!(got, ["1", "1.1", "1.2", "2", "2.1", "2.1.1"]);
-        assert_eq!(generated_texts(&t, "s"), ["iii/C/03/\u{2022}", "v/E/05/\u{2022}", "vii/G/07/\u{2022}", "\u{3BC}0"]);
+        // lower-greek is ALPHABETIC over 24 letters (css-counter-styles-3 §6.1): 40 = α(1)·24 + π(16) → "απ"
+        // (Chromium's rendering too); "μ" is the Greek NUMERAL for 40, which no CSS style produces.
+        assert_eq!(generated_texts(&t, "s"), ["iii/C/03/\u{2022}", "v/E/05/\u{2022}", "vii/G/07/\u{2022}", "\u{3B1}\u{3C0}0"]);
         assert_eq!(generated_texts(&t, "l"), ["3:", "10:", "11:"]);
     }
 

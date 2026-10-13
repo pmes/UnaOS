@@ -23,6 +23,9 @@ fn eyes_corpus_dom_equals_html_core_and_chromium() {
         .expect("EYES corpus")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "html"))
+        // The proof's set is pages 01-22 (the ones with Chromium goldens); 25+ joined the corpus later
+        // (AETHERHOVER, controls, AETHERGEN) without a golden here.
+        .filter(|p| p.file_name().and_then(|n| n.to_str()?.get(..2)?.parse::<u32>().ok()).is_some_and(|n| n <= 22))
         .collect();
     pages.sort();
     assert_eq!(pages.len(), 22, "the 22 EYES pages (17-21: AETHERINLINE's cases, 22: AETHERFONT's)");

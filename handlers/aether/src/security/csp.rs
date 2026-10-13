@@ -244,7 +244,7 @@ fn url_matches_expression(expr: &str, url: &url::Url, self_origin: &Origin, redi
             None => (hostport, None),
         }
     };
-    let url_host = url.host_str();
+    let url_host = url.hostname(); // host only: `host_str` carries ":port", which the port check below owns
     if url_host.is_empty() { return false; }
     let url_host = url_host.to_ascii_lowercase();
     let host_ok = if host_pat == "*" {
