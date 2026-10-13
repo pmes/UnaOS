@@ -198,6 +198,17 @@ impl<T: Transport + ?Sized> Session<'_, T> {
     pub fn version(&self) -> u16 {
         self.c.negotiated().version
     }
+
+    /// NETDEBT2 (LEDGER SR113): the application protocol the server chose from what the handshake offered (RFC 7301)
+    /// — `Some(b"h2")`, `Some(b"http/1.1")`, or `None` when it named none (the caller then speaks HTTP/1.1).
+    pub fn alpn(&self) -> Option<&[u8]> {
+        self.c.negotiated().alpn.as_deref()
+    }
+
+    /// The server chose HTTP/2 (only possible when the handshake offered `h2`: [`ALPN_H2_HTTP1`]).
+    pub fn is_h2(&self) -> bool {
+        self.alpn() == Some(b"h2")
+    }
 }
 
 impl<T: Transport + ?Sized> Transport for Session<'_, T> {
@@ -222,11 +233,25 @@ impl<T: Transport + ?Sized> Transport for Session<'_, T> {
     }
 }
 
+/// ALPN `http/1.1` alone: what [`with_session`] offers — its callers (vein_core's exchange, NET.ELF) speak only
+/// HTTP/1.1, so a server must never be allowed to pick h2 for them.
+pub const ALPN_HTTP1: &[&[u8]] = &[b"http/1.1"];
+/// NETDEBT2 (LEDGER SR113): ALPN `h2, http/1.1` (h2 preferred, RFC 9113 §3.2) — for a caller that speaks both
+/// (AETHER.ELF through http_core's `h2`); [`Session::alpn`] says which the server chose.
+pub const ALPN_H2_HTTP1: &[&[u8]] = &[b"h2", b"http/1.1"];
+
 /// Handshake with `host` over `t` (SNI + RFC 6125 name check, ALPN `http/1.1`), verifying the chain against
 /// `ctx.store` at `ctx.clock`; on success run `f` over the session with the verified issuer, then send
 /// close_notify. Nothing `f` would write is written unless the handshake verified. Returns `f`'s result and
 /// the first TLS failure seen while it ran (if any).
 pub fn with_session<T: Transport + ?Sized, R>(t: &mut T, host: &str, ctx: &TlsContext<'_>, f: impl FnOnce(&mut Session<'_, T>, Verified) -> R) -> Result<(R, Option<TlsFail>), TlsFail> {
+    with_session_alpn(t, host, ctx, ALPN_HTTP1, f)
+}
+
+/// [`with_session`] offering the application protocols `alpn` in preference order (NETDEBT2, SR113): the
+/// negotiated one is [`Session::alpn`] inside `f`. Everything else — verification, the refusals, close_notify — is
+/// [`with_session`]'s.
+pub fn with_session_alpn<T: Transport + ?Sized, R>(t: &mut T, host: &str, ctx: &TlsContext<'_>, alpn: &[&[u8]], f: impl FnOnce(&mut Session<'_, T>, Verified) -> R) -> Result<(R, Option<TlsFail>), TlsFail> {
     if ctx.store.anchors.is_empty() {
         return Err(TlsFail { why: "no-trust-anchors", errno: EPROTO });
     }
@@ -236,7 +261,7 @@ pub fn with_session<T: Transport + ?Sized, R>(t: &mut T, host: &str, ctx: &TlsCo
     let verifier = IssuerVerifier { web: WebPkiVerifier { store: ctx.store, clock: ctx.clock }, issuer: Cell::new(None) };
     let mut cfg = ClientConfig::new(Some(host), &verifier);
     cfg.enable_tls12(); // TLSCORE2 (SR58): a TLS-1.2-only relay is reachable; 1.3 stays preferred (downgrade-sentinel guarded)
-    cfg.alpn = alloc::vec![b"http/1.1".to_vec()];
+    cfg.alpn = alpn.iter().map(|p| p.to_vec()).collect();
     let sock = Cell::new(0i64);
     let c = Client::connect(ctx.provider, &cfg, Io { t, err: &sock }).map_err(|e| fail_of(&e, sock.get()))?;
     let Some(v) = verifier.issuer.get() else {
@@ -247,4 +272,125 @@ pub fn with_session<T: Transport + ?Sized, R>(t: &mut T, host: &str, ctx: &TlsCo
     let _ = s.c.close();
     let fail = s.fail;
     Ok((r, fail))
+}
+
+#[cfg(test)]
+mod tests {
+    //! NETDEBT2 (LEDGER SR113) — the h2 ALPN test on the host. One server that is NOT ours (Python `ssl` = OpenSSL,
+    //! TLS 1.3, ALPN `h2, http/1.1`, a CA + intermediate + leaf from tls_core's oracle script) and two verified
+    //! handshakes over std sockets on the PRODUCT provider (CRYPTOCORE): [`with_session_alpn`] with
+    //! [`ALPN_H2_HTTP1`] must negotiate `h2` and report it through [`Session::alpn`] / [`Session::is_h2`];
+    //! [`with_session`] (ALPN `http/1.1` alone, what vein_core's exchange and NET.ELF use) must still get `http/1.1`
+    //! from the same server. The server prints the protocol IT selected and the first application bytes, so both
+    //! ends agree. Offline; skipped with a message when python3 or the openssl CLI is missing.
+    extern crate std;
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::string::String;
+    use std::time::Duration;
+    use tls_core::cryptocore_provider::CryptoCoreProvider;
+
+    struct Sock(TcpStream);
+    impl Transport for Sock {
+        fn send_all(&mut self, b: &[u8]) -> Result<(), i64> {
+            self.0.write_all(b).map_err(|_| -32)
+        }
+        fn recv(&mut self, b: &mut [u8]) -> Result<usize, i64> {
+            self.0.read(b).map_err(|_| -104)
+        }
+    }
+
+    struct Now;
+    impl Clock for Now {
+        fn now(&self) -> i64 {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+        }
+    }
+
+    const SERVER: &str = r#"
+import socket, ssl, sys
+d, n = sys.argv[1], int(sys.argv[2])
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.load_cert_chain(f"{d}/p256_chain.pem", f"{d}/p256.key")
+ctx.set_alpn_protocols(["h2", "http/1.1"])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(n)
+s.settimeout(30)
+print(s.getsockname()[1], flush=True)
+for _ in range(n):
+    c, _ = s.accept()
+    c.settimeout(30)
+    try:
+        t = ctx.wrap_socket(c, server_side=True)
+        got = t.recv(64)
+        print("alpn=%s got=%s" % (t.selected_alpn_protocol(), got.decode("ascii", "replace")), flush=True)
+        t.close()
+    except Exception as e:
+        print("FAIL", repr(e).replace("\n", " "), flush=True)
+"#;
+
+    fn have(cmd: &str, arg: &str) -> bool {
+        Command::new(cmd).arg(arg).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+    }
+
+    #[test]
+    fn alpn_offers_h2_and_reports_the_choice() {
+        if !have("python3", "--version") || !have("openssl", "version") {
+            std::println!("NETDEBT2 ALPN ORACLE SKIPPED: python3 and the openssl CLI are both needed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(std::format!("netdebt2-alpn-{}-{}", std::process::id(), Now.now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tls_core/tests/oracle/gen_certs_openssl.sh");
+        assert!(Command::new("sh").arg(script).arg(&dir).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success(), "PKI generation failed");
+        let (store, _) = crate::trust::parse(&std::fs::read(dir.join("root.pem")).unwrap()).expect("root parses");
+        let provider = CryptoCoreProvider::new();
+        let ctx = TlsContext { provider: &provider, store: &store, clock: &Now };
+
+        let mut child = Command::new("python3").arg("-c").arg(SERVER).arg(&dir).arg("2").stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        let port: u16 = line.trim().parse().expect("port");
+        let dial = || {
+            let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            Sock(s)
+        };
+
+        // Offering h2 first: the server picks it, and the session says so.
+        let mut t = dial();
+        let (h2, _) = with_session_alpn(&mut t, "tlscore.test", &ctx, ALPN_H2_HTTP1, |s, v| {
+            assert_eq!(v.issuer(), "TLSCORE Oracle Intermediate");
+            let r = (s.alpn().map(|a| a.to_vec()), s.is_h2());
+            s.send_all(b"ping-h2").unwrap();
+            r
+        })
+        .expect("verified handshake offering h2");
+        assert_eq!(h2, (Some(b"h2".to_vec()), true));
+
+        // The default offer (http/1.1 alone) never lets the same server choose h2.
+        let mut t = dial();
+        let (h1, _) = with_session(&mut t, "tlscore.test", &ctx, |s, _| {
+            let r = (s.alpn().map(|a| a.to_vec()), s.is_h2());
+            s.send_all(b"ping-h1").unwrap();
+            r
+        })
+        .expect("verified handshake offering http/1.1");
+        assert_eq!(h1, (Some(b"http/1.1".to_vec()), false));
+
+        for want in ["alpn=h2 got=ping-h2", "alpn=http/1.1 got=ping-h1"] {
+            line.clear();
+            out.read_line(&mut line).unwrap();
+            std::println!("server: {}", line.trim());
+            assert_eq!(line.trim(), want);
+        }
+        let _ = child.wait();
+    }
 }

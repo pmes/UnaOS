@@ -20,7 +20,7 @@
 //! so `tls_core` never holds a whole record the `peek` cannot see. A burst of requests to an origin whose
 //! connection is still handshaking WAITS for it (coalescing): if ALPN says `h2` they all become its streams,
 //! otherwise each gets its own HTTP/1.1 connection as before. GOAWAY / REFUSED_STREAM: unprocessed streams are
-//! retried on a new connection; `Alt-Svc` is ignored. A gzip/deflate body on an h2 stream is decoded as it
+//! retried on a new connection; `Alt-Svc` is ignored. A gzip/deflate/br body on an h2 stream is decoded as it
 //! arrives on a decoder thread of its own ([`DecodeSink`], NETDEBT SR97).
 //!
 //! Trust: `AgentConfig::trust`, else `$SSL_CERT_FILE` (the convention OpenSSL, curl and rustls-native follow),
@@ -725,10 +725,11 @@ struct Inner {
     h1_slots: Mutex<HashMap<PoolKey, H1Slots>>,
 }
 
-/// NETDEBT (SR97): at most this many HTTP/1.1 connections per origin at once (the browsers' long-standing
-/// six; RFC 9112 §9.4 asks a client to limit them). A request beyond it waits for one of them to finish an
-/// exchange (it is served next on that connection) or to close (a new connection is opened for it).
-pub const MAX_H1_PER_ORIGIN: usize = 6;
+/// NETDEBT (SR97): at most [`MAX_H1_PER_ORIGIN`] HTTP/1.1 connections per origin at once. A request beyond it
+/// waits for one of them to finish an exchange (it is served next on that connection) or to close (a new connection
+/// is opened for it). NETDEBT2 (SR113): the constant lives in the no_std [`crate::conn`] so AETHER.ELF's pool reads
+/// the SAME limit; re-exported here so `host::MAX_H1_PER_ORIGIN` still names it.
+pub use crate::conn::MAX_H1_PER_ORIGIN;
 
 #[derive(Default)]
 struct H1Slots {
@@ -1584,7 +1585,7 @@ fn pump(h2c: &mut crate::h2::H2Conn<Tls<'_>>, sid: u32, m: &mut MuxStream) -> Pu
                     m.drain = true;
                 } else if m.job.decode {
                     let codings = encoding::content_codings(&rhead.headers);
-                    if codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate) {
+                    if codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate | Coding::Brotli) {
                         rhead.headers.remove("content-encoding");
                         rhead.headers.remove("content-length");
                         coded = Some(codings[0].clone());
@@ -1907,7 +1908,7 @@ fn deliver(job: &mut Job, mut rhead: ResponseHead, small_redirect: bool, pull: &
         return (clean, sink_ok.then_some(Ok(())));
     }
     let codings = if job.decode { encoding::content_codings(&rhead.headers) } else { Vec::new() };
-    let decodable = codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate);
+    let decodable = codings.len() == 1 && matches!(codings[0], Coding::Gzip | Coding::Deflate | Coding::Brotli);
     if decodable {
         rhead.headers.remove("content-encoding");
         rhead.headers.remove("content-length");
