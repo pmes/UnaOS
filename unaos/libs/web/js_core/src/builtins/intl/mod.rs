@@ -414,8 +414,8 @@ fn supported_values_of(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let key = vm.to_string(&kv)?.to_rust();
     let mut list: Vec<String> = match key.as_str() {
         "calendar" => strs(datetime::CALENDARS),
-        // The collator implements the root order only (no tailorings such as "emoji" or "phonebk").
-        "collation" => Vec::new(),
+        // The CLDR collation types beside the locales' defaults (cldr::collation tailorings).
+        "collation" => strs(&["phonebk", "pinyin", "trad"]),
         "currency" => crate::cldr::currency_codes().map(String::from).collect(),
         "numberingSystem" => crate::cldr::numbering_systems().map(String::from).collect(),
         "timeZone" => data::ZONES.iter().map(|z| z.id.to_string()).chain(core::iter::once(String::from("UTC"))).collect(),
