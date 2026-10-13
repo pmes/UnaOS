@@ -71,7 +71,7 @@ impl<T: ?Sized> Mutex<T> {
         {
             let at = Location::caller();
             if let Some(g) = self.raw.try_lock() {
-                return self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at));
+                return self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, true));
             }
             // The slow path: say who waits on what, so the 50 ms scan can name a spin past 10 ms.
             let w = reg::wait_begin(self.addr(), self.site, at);
@@ -84,7 +84,7 @@ impl<T: ?Sized> Mutex<T> {
                 }
             };
             reg::wait_end(w);
-            self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at))
+            self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, true))
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -98,7 +98,7 @@ impl<T: ?Sized> Mutex<T> {
         #[cfg(target_arch = "x86_64")]
         {
             let at = Location::caller();
-            self.raw.try_lock().map(|g| self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at)))
+            self.raw.try_lock().map(|g| self.guard(g, reg::acquire(self.addr(), &self.class, self.site, at, false))) // KVMLAT (B578): a try can never WAIT, so it closes no deadlock cycle: no order edge (the hold is still tracked). LINE-NEUTRAL fold
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -267,7 +267,7 @@ mod reg {
     /// Pending inversions for the scan: `a << 48 | b << 32 | tid << 8 | cpu` (16 kept).
     static INV: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     static INV_N: AtomicU32 = AtomicU32::new(0);
-    static INV_SAID: AtomicU32 = AtomicU32::new(0);
+    static INV_SAID: AtomicU32 = AtomicU32::new(0); static HELD_MAX_SPAN: AtomicU64 = AtomicU64::new(0); static HELD_MAX_CLASS: AtomicU16 = AtomicU16::new(0); // KVMLAT (B578): the boot's longest hold (TSC) and its lock's class, for LOCKREG's `held_max_at=` — LINE-NEUTRAL append
     /// The scan: the next due ms, the lines said, the once-per-site record (site pointer | kind in bit 0..1).
     static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
     static LINES: AtomicU32 = AtomicU32::new(0); static LINES_MIN: AtomicU64 = AtomicU64::new(0); // TRASHLOCK (B523): the minute LINES and SAID were last reset in (the cap is per minute, not per boot) — LINE-NEUTRAL append
@@ -392,7 +392,7 @@ mod reg {
 
     /// A hold begins: one CAS (the entry) + four stores; the order edges against this task's other holds on this core.
     #[inline]
-    pub fn acquire(addr: usize, class: &AtomicU16, site: &'static Loc, at: &'static Loc) -> u16 {
+    pub fn acquire(addr: usize, class: &AtomicU16, site: &'static Loc, at: &'static Loc, edges: bool) -> u16 { // KVMLAT (B578): `edges` = this acquire could have waited (`lock`), false for `try_lock`
         let Some((tid, cpu)) = who() else {
             EARLY.fetch_add(1, Relaxed);
             return NONE;
@@ -408,7 +408,7 @@ mod reg {
             c => c,
         };
         let mut m = p.mask.load(Acquire);
-        if c != 0 {
+        if c != 0 && edges {
             let mut bits = m;
             while bits != 0 {
                 let i = bits.trailing_zeros() as usize;
@@ -451,7 +451,7 @@ mod reg {
         let p = &PARTS[cpu];
         let span = rdtsc().wrapping_sub(p.t0[i].load(Relaxed));
         if span < u64::MAX / 2 && span > p.held_max.load(Relaxed) {
-            p.held_max.fetch_max(span, Relaxed);
+            p.held_max.fetch_max(span, Relaxed); if HELD_MAX_SPAN.fetch_max(span, Relaxed) < span { HELD_MAX_CLASS.store(tag_class(p.tag[i].load(Relaxed)), Relaxed); } // KVMLAT (B578): name the longest hold (LINE-NEUTRAL fold)
         }
         p.tag[i].store(0, Release);
         p.mask.fetch_and(!(1u32 << i), Release);
@@ -594,7 +594,7 @@ mod reg {
         if gap_ms <= 1 + crate::hidstall::HOLD_OVER_MS || gap_ms > (u64::MAX >> 8) {
             return;
         }
-        let name = crate::arch::sched::current_name();
+        let name = crate::arch::sched::current_name().or(Some(crate::arch::sched::between_word(cpu))); // KVMLAT (B574): no current task is the scheduler's own context, named `sched:idle`/`sched:switch`, never `?` (LINE-NEUTRAL fold)
         let step = if matches!(name, Some("usb-pump")) { crate::video::lag::pump_step_now() } else { 0 };
         crate::hidstall::note_hold(gap_ms - 1, name, outer_site(p, tid), step);
     }
@@ -640,7 +640,7 @@ mod reg {
                 if span > (u64::MAX >> 1) || ms(span) <= HELD_MS || p.tag[i].load(Acquire) != tag {
                     continue;
                 }
-                p.held_max.fetch_max(span, Relaxed);
+                p.held_max.fetch_max(span, Relaxed); if HELD_MAX_SPAN.fetch_max(span, Relaxed) < span { HELD_MAX_CLASS.store(tag_class(tag), Relaxed); } // KVMLAT (B578): an in-flight hold past 50 ms names the max too (LINE-NEUTRAL fold)
                 let name = class_site(tag_class(tag));
                 if let Some(n) = name {
                     SEEN_LONG.store(n as *const Loc as *mut Loc, Release);
@@ -861,7 +861,7 @@ mod reg {
         let inv = INV_N.load(Acquire);
         let pass = on && held_done && named && released && inv == 0;
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} named={} -> {} ::",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} named={} -> {} :: held_max_at={}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
@@ -869,7 +869,7 @@ mod reg {
             inv,
             if released { "ok" } else if !died { "no-task" } else if freed != 1 { "not-found" } else { "still-held" },
             if named { "ok" } else if !on { "unarmed" } else if !held_done { "no-task" } else { "missed" },
-            if pass { "PASS" } else { "FAIL" }
+            if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))) // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
         );
     }
 }

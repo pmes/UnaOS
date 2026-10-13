@@ -67,7 +67,7 @@ pub fn gate(ev: Event) -> bool {
         WAKE_OWED.store(true, Ordering::Release);
         if press {
             SWALLOWED.fetch_add(1, Ordering::Relaxed);
-            if let Event::Key(b) = ev { WAKE_KEY_UP.store(b as u32 | 0x100, Ordering::Relaxed); }
+            if let Event::Key(b) = ev { WAKE_KEY_UP.store(b as u32 | 0x100, Ordering::Relaxed); } crate::video::lag::abandon(&ev); // KVMLAT (B574/B575): the swallowed key's timing ends here, not on the next routed key
             return true;
         }
         return false;

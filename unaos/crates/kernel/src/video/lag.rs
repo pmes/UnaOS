@@ -1412,3 +1412,16 @@ pub fn qs_probe_done() -> u64 {
 pub fn qs_now_us() -> u64 {
     now_us()
 }
+
+/// KVMLAT (B574/B575): a key/press consumed before the router (the idle wake's swallow at `pal::pop_event`) ends its
+/// class timing here, uncounted as latency and counted `orphan=` — else the next routed key closes it on this stamp.
+pub fn abandon(ev: &Event) {
+    if !ON {
+        return;
+    }
+    let Some((c, _)) = class_of(ev) else { return };
+    if SLOTS[c].stage.compare_exchange(ISR, IDLE, AcqRel, Relaxed).is_ok() {
+        ORPHANS.fetch_add(1, Relaxed);
+    }
+    pend_routed();
+}
