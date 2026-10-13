@@ -39,6 +39,23 @@ pub struct LayoutTree<H: Host> {
     /// AETHERSTYLE3C (SR122): a decorated box multi-column layout split across columns — its fragments in
     /// order (css-break-3 §5.4); painters draw the box once per fragment instead of at its single-column place.
     pub col_frags: NodeMap<Vec<crate::multicol::BoxFragment>>,
+    /// AETHERPAINTPERF2 (SR132): the boxes taffy re-laid in the last [`remeasure`] / [`remeasure_kept`] — before each
+    /// taffy pass, the dirty boxes reachable from the root through dirty boxes (a clean box is a cache hit and
+    /// taffy does not descend into it), summed over the passes.
+    pub relaid: u64,
+    /// AETHERPAINTPERF2 (SR132): the host's measurement epoch the boxes were measured in (the host's font generation:
+    /// a kept tree is laid out again only under the same one). Set and read by the host only.
+    pub measure_epoch: u64,
+    /// AETHERPAINTPERF2 (SR132): nonzero on a twin [`retarget`] built: the token of the kept tree it targets.
+    pub kept_token: u64,
+    /// AETHERPAINTPERF2 (SR132): each measured leaf's measure inputs at the last taffy pass (a kept tree re-measures
+    /// a leaf only when they moved).
+    measured: NodeMap<Measured>,
+    /// AETHERPAINTPERF2 (SR132): the block-width placeholders (`blockwidth::apply`) a kept-tree remeasure left
+    /// applied, with the specified style each replaced. No reader after layout reads those fields (width, the
+    /// horizontal margins, align-self); [`apply_specs`] and the in-place [`remeasure`] put them back before
+    /// they fold or lay out again.
+    bw_pending: blockwidth::Saved,
 }
 
 /// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
@@ -271,6 +288,11 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         multicol: NodeMap::new(),
         col_sets: NodeMap::new(),
         col_frags: NodeMap::new(),
+        relaid: 0,
+        measure_epoch: 0,
+        kept_token: 0,
+        measured: NodeMap::new(),
+        bw_pending: Vec::new(),
     }
 }
 
@@ -1289,6 +1311,18 @@ fn reresolve_font_relative<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>,
 /// containers' auto-width items by content, and keeps an absolutely positioned box with no inset in flow (its
 /// static position). The host's `apply_stylesheets` and [`layout`] both end here.
 pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, Rc<SpecifiedStyle<H>>)]) {
+    // AETHERPAINTPERF2 (SR132): on a kept tree, the boxes this fold rewrites and the items `size_flex_items_by_content`
+    // reads start from their specified style, as they always did (the block-width placeholders put back).
+    if !tree.bw_pending.is_empty() {
+        let mut at: BTreeSet<u64> = BTreeSet::new();
+        for (id, _) in specs {
+            at.insert(u64::from(*id));
+            for k in tree.taffy.children(*id).unwrap_or_default() {
+                at.insert(u64::from(k));
+            }
+        }
+        undo_blockwidth(tree, Some(&at));
+    }
     let mut abs_nodes: BTreeSet<u64> = BTreeSet::new();
     let mut inset_nodes: BTreeSet<u64> = BTreeSet::new();
     for (node_id, spec) in specs {
@@ -1364,7 +1398,48 @@ fn size_flex_items_by_content<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy
 /// Recomputes layout with real text measurement: resolves each text run's
 /// inherited font size, then lets taffy size text leaves by wrapped extent.
 /// Called after building the tree and after every cascade application.
+///
+/// AETHERPAINTPERF2 (SR132): this is the IN-PLACE remeasure (a fresh tree, an animation frame that moved a layout
+/// property, `apply_css`): it lays out every box, leaves every style as the passes found it, and counts every
+/// laid-out box in [`LayoutTree::relaid`]. A relayout that keeps the previous tree goes through [`retarget`] and
+/// [`remeasure_kept`] instead.
 pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) {
+    // A kept tree carries the block-width placeholders its last remeasure left applied: put them back first, so
+    // this pass starts where the in-place passes always started (every specified style restored).
+    undo_blockwidth(tree, None);
+    tree.relaid = 0;
+    let prep = prepass(tree, fonts);
+    // Taffy caches leaf measurements; a cascade pass can change resolved
+    // font sizes without touching the leaf's style, so stale cached sizes
+    // survive set_style dirtying. Invalidate every measured leaf.
+    for node_id in prep.text_info.keys().chain(prep.img_info.keys()).chain(prep.media_info.keys()) {
+        let _ = tree.taffy.mark_dirty(*node_id);
+    }
+
+    tree.measured = measured_of(&prep);
+    let _ = passes(tree, prep, fonts, true);
+}
+
+/// AETHERPAINTPERF2 (SR132): what the passes before the first taffy pass hand the taffy passes: the measure inputs
+/// (text runs, replaced and media sizes), the resolved element fonts, the rem basis, and the saved specified
+/// values the rewrites replaced for the layout run (vertical writing, block widths, collapsed margins).
+struct Prep {
+    text_info: NodeMap<TextRun>,
+    img_info: NodeMap<(f32, f32)>,
+    media_info: NodeMap<(f32, f32, f32)>,
+    elem_info: NodeMap<TextRun>,
+    root_fs: f32,
+    writing_saved: Vec<(taffy::NodeId, Style)>,
+    widths: blockwidth::Saved,
+    collapsed: collapse::Saved,
+    pct_nodes: Vec<(taffy::NodeId, [Option<String>; 3])>,
+    has_tables: bool,
+}
+
+/// The style rewrites before the first taffy pass (formatting contexts, inherited text properties, font-relative
+/// re-resolution, UA margins, vertical writing, replaced sizes, block widths, margin collapsing). Reads and writes
+/// styles only — no box is laid out here, so a twin tree ([`retarget`]) can run them for a kept one.
+fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> Prep {
     fix_display_contexts(tree);
     crate::scroll::prepare(tree);
     tree.col_shift.clear();
@@ -1554,20 +1629,6 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
         }
     }
 
-    // Taffy caches leaf measurements; a cascade pass can change resolved
-    // font sizes without touching the leaf's style, so stale cached sizes
-    // survive set_style dirtying. Invalidate every measured leaf.
-    for node_id in text_info.keys().chain(img_info.keys()).chain(media_info.keys()) {
-        let _ = tree.taffy.mark_dirty(*node_id);
-    }
-
-    let viewport = Size {
-        width: AvailableSpace::Definite(tree.viewport.0),
-        height: AvailableSpace::Definite(tree.viewport.1),
-    };
-    let vw_cap = tree.viewport.0;
-    // The basis the % math of the second pass parses at (the cascade's: the viewport, the initial font).
-    let pct_cx = ParseCx::new(tree.viewport.0, tree.viewport.1);
     // Block formatting context: adjoining vertical margins collapse for
     // this layout run (CSS 2.2 §8.3.1); specified margins return after.
     let widths = blockwidth::apply(tree);
@@ -1578,8 +1639,25 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
         .filter_map(|(id, p)| p.pct_math.clone().filter(|m| m.iter().any(Option::is_some)).map(|m| (*id, m)))
         .collect();
     let has_tables = !table::tables(tree).is_empty();
+    Prep { text_info, img_info, media_info, elem_info, root_fs, writing_saved, widths, collapsed, pct_nodes, has_tables }
+}
+
+/// The taffy passes and what feeds back into them (tables, % widths, container units, multicol, the inline
+/// formatting contexts), then the restores. `restore_widths` false leaves the block-width placeholders applied and
+/// returns them (a kept tree: see [`remeasure_kept`]); true restores them and returns nothing.
+fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, fonts: &F, restore_widths: bool) -> blockwidth::Saved {
+    let Prep { text_info, img_info, media_info, elem_info, root_fs, writing_saved, widths, collapsed, pct_nodes, has_tables } = prep;
+    let viewport = Size {
+        width: AvailableSpace::Definite(tree.viewport.0),
+        height: AvailableSpace::Definite(tree.viewport.1),
+    };
+    let vw_cap = tree.viewport.0;
+    // The basis the % math of the second pass parses at (the cascade's: the viewport, the initial font).
+    let pct_cx = ParseCx::new(tree.viewport.0, tree.viewport.1);
     let passes = if pct_nodes.is_empty() && !has_tables { 1 } else { 2 };
     let run_pass = |tree: &mut LayoutTree<H>| {
+        // AETHERPAINTPERF2 (SR132): the boxes this taffy pass re-lays (its cache misses start at the dirty ones).
+        tree.relaid += dirty_count(tree);
         let _ = tree.taffy.compute_layout_with_measure(tree.root_node, viewport, |inputs, node_id, _ctx, style| {
             taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
                 if let Some(&(w, h, ratio)) = media_info.get(&node_id) {
@@ -1852,7 +1930,362 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
     }
     crate::writing::restore(tree, writing_saved);
     collapse::restore(tree, collapsed);
-    blockwidth::restore(tree, widths);
+    if restore_widths {
+        blockwidth::restore(tree, widths);
+        return Vec::new();
+    }
+    widths
+}
+
+// ---- AETHERPAINTPERF2 (SR132): a relayout that keeps the previous tree ------------------------------------------
+//
+// Every relayout used to lay out a fresh box tree: taffy's cache starts empty, so every box was laid out again
+// (4,004 boxes for a 2,000-row list where one row's text changed). Keeping the taffy tree across relayouts keeps
+// that cache, but the passes cannot simply run again over the kept tree: they rewrite the styles they are handed
+// (`fix_display_contexts`, `propagate_text_align`, `rescale_ua_margins`, the replaced sizes, the % widths, the
+// block widths, margin collapsing, the multicol narrowing, the inline heights) and several rewrites read their own
+// earlier output as if it were specified (collapsing margins twice collapses them again).
+//
+// So the specified style stays the fresh build's, and the passes keep running from it — on a TWIN of the kept tree.
+// [`retarget`] builds the twin: a copy of the kept tree's taffy arena (same slot keys) holding the fresh build, each
+// fresh box placed on the kept box of the same DOM node (or the anonymous box at the same place under the same
+// parent), every other box on a new slot. The host's cascade, generated content and [`apply_specs`] then run on
+// the twin, and [`remeasure_kept`] runs the style rewrites ([`prepass`]) there too: the twin is the fresh tree's
+// values, box for box, under the kept tree's keys. It then makes the kept tree's taffy hold what the twin holds —
+// the same number of new slots (the arena hands out the same keys: both arenas did the same inserts from the same
+// state, which is checked), each box's style and children set only where they differ, a leaf whose measure inputs
+// moved (its text run, a replaced or media size) dirtied, every dirtied box's ancestors dirtied — and lays the kept
+// tree out ([`passes`]). Taffy re-lays the dirty boxes; a clean box answers from its cache, which holds the layout
+// of the same style, the same subtree and the same measure inputs. The values the passes see are the fresh tree's,
+// so the result is the fresh tree's. The taffy cache was already relied on across the passes of one remeasure.
+//
+// Two rewrites are not put back at the end of a kept tree's remeasure: the block-width placeholders. A row's style
+// at the first taffy pass is its placeholder (`blockwidth::apply` runs before it); restoring it after the last
+// pass and applying it again at the next relayout would dirty every block of the page. No reader after layout reads
+// those fields, and [`apply_specs`] / the in-place [`remeasure`] put them back before they fold or lay out again.
+// Every other rewrite is restored as before, so a box it touches (an auto-height inline formatting root, a box
+// whose margins collapse) is re-laid on every relayout, with its ancestors.
+//
+// What relayouts whole: a tree holding a table (its passes keep cross-box lists keyed by box), a multicol container
+// (its narrowing restores in box-key order), or an author outline (painted in box-key order), and any twin whose
+// key replay does not match.
+
+/// One measured leaf's measure inputs (what `run_pass`'s measure function reads for it).
+#[derive(Clone, Default, PartialEq)]
+struct Measured {
+    text: Option<TextRun>,
+    img: Option<(f32, f32)>,
+    media: Option<(f32, f32, f32)>,
+}
+
+fn measured_of(prep: &Prep) -> NodeMap<Measured> {
+    let mut m: NodeMap<Measured> = NodeMap::new();
+    for (id, r) in &prep.text_info {
+        m.entry(*id).or_default().text = Some(r.clone());
+    }
+    for (id, v) in &prep.img_info {
+        m.entry(*id).or_default().img = Some(*v);
+    }
+    for (id, v) in &prep.media_info {
+        m.entry(*id).or_default().media = Some(*v);
+    }
+    m
+}
+
+/// Puts back the block-width placeholders a kept-tree remeasure left applied: all of them, or those of the boxes
+/// in `only`.
+fn undo_blockwidth<H: Host>(tree: &mut LayoutTree<H>, only: Option<&BTreeSet<u64>>) {
+    if tree.bw_pending.is_empty() {
+        return;
+    }
+    let pending = core::mem::take(&mut tree.bw_pending);
+    let (undo, keep): (blockwidth::Saved, blockwidth::Saved) =
+        pending.into_iter().partition(|(id, _)| only.is_none_or(|s| s.contains(&u64::from(*id))));
+    tree.bw_pending = keep;
+    blockwidth::restore(tree, undo);
+}
+
+/// The dirty boxes reachable from the root through dirty boxes: the boxes the next taffy pass re-lays (a clean box
+/// is a cache hit, and taffy does not descend into it).
+fn dirty_count<H: Host>(tree: &LayoutTree<H>) -> u64 {
+    let mut n = 0u64;
+    let mut stack = vec![tree.root_node];
+    while let Some(id) = stack.pop() {
+        if !tree.taffy.dirty(id).unwrap_or(true) {
+            continue;
+        }
+        n += 1;
+        stack.extend(tree.taffy.children(id).unwrap_or_default());
+    }
+    n
+}
+
+/// Marks `id` and every box above it dirty. taffy's `mark_dirty` stops climbing at a box whose cache is already
+/// empty (a box under `display: none` is never cached), which would leave a cached ancestor over a changed box.
+fn dirty_up<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId) {
+    let mut cur = Some(id);
+    while let Some(c) = cur {
+        let _ = tree.taffy.mark_dirty(c);
+        cur = tree.taffy.parent(c);
+    }
+}
+
+/// Every box of a tree — those reachable from the root in preorder, then those only its maps name (boxes the
+/// passes detached) — and their keys.
+fn boxes_of<H: Host>(tree: &LayoutTree<H>) -> (Vec<taffy::NodeId>, BTreeSet<u64>) {
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(u64::from(id)) {
+            continue;
+        }
+        out.push(id);
+        stack.extend(tree.taffy.children(id).unwrap_or_default().into_iter().rev());
+    }
+    for id in tree.node_map.keys().chain(tree.paint_map.keys()) {
+        if seen.insert(u64::from(*id)) {
+            out.push(*id);
+        }
+    }
+    (out, seen)
+}
+
+/// AETHERPAINTPERF2 (SR132): the twin of `kept` for the freshly built tree `fresh` (see the section comment): a copy
+/// of `kept`'s taffy arena holding `fresh`'s boxes — each on the kept box of the same DOM node by `key` (a node's
+/// identity in its document), an anonymous box on the anonymous kept box at the same place under the same parent,
+/// the rest on new slots — with `fresh`'s styles, children, DOM nodes and paint styles. `token` marks it as
+/// `kept`'s twin for [`remeasure_kept`]. Which kept box a fresh box lands on never changes a value (every box takes
+/// `fresh`'s), only which taffy caches survive.
+pub fn retarget<H: Host>(fresh: LayoutTree<H>, kept: &LayoutTree<H>, token: u64, key: &dyn Fn(&H::Node) -> u64) -> LayoutTree<H> {
+    let mut by_key: BTreeMap<u64, Vec<taffy::NodeId>> = BTreeMap::new();
+    for (id, n) in &kept.node_map {
+        by_key.entry(key(n)).or_default().push(*id);
+    }
+    let mut order: Vec<taffy::NodeId> = Vec::new();
+    let mut stack = vec![fresh.root_node];
+    while let Some(b) = stack.pop() {
+        order.push(b);
+        stack.extend(fresh.taffy.children(b).unwrap_or_default().into_iter().rev());
+    }
+    let mut taken: BTreeSet<u64> = BTreeSet::new();
+    let mut pair: NodeMap<taffy::NodeId> = NodeMap::new();
+    for &b in &order {
+        let cand = match fresh.node_map.get(&b) {
+            Some(n) => by_key.get(&key(n)).and_then(|v| v.iter().copied().find(|k| !taken.contains(&u64::from(*k)))),
+            None => fresh.taffy.parent(b).and_then(|p| {
+                let kp = *pair.get(&p)?;
+                let i = fresh.taffy.children(p).ok()?.iter().position(|&k| k == b)?;
+                let k = *kept.taffy.children(kp).ok()?.get(i)?;
+                (!kept.node_map.contains_key(&k) && kept.paint_map.contains_key(&k) && !taken.contains(&u64::from(k))).then_some(k)
+            }),
+        };
+        if let Some(k) = cand {
+            taken.insert(u64::from(k));
+            pair.insert(b, k);
+        }
+    }
+    let mut taffy = kept.taffy.clone();
+    for &b in &order {
+        if pair.contains_key(&b) {
+            continue;
+        }
+        let st = fresh.taffy.style(b).map(|s| s.clone()).unwrap_or_default();
+        let Ok(t) = taffy.new_leaf(st) else { return fresh };
+        pair.insert(b, t);
+    }
+    for &b in &order {
+        let Some(&t) = pair.get(&b) else { return fresh };
+        if let Ok(st) = fresh.taffy.style(b) {
+            let _ = taffy.set_style(t, st.clone());
+        }
+        let kids: Vec<taffy::NodeId> = fresh.taffy.children(b).unwrap_or_default().iter().filter_map(|k| pair.get(k).copied()).collect();
+        let _ = taffy.set_children(t, &kids);
+    }
+    let Some(&root) = pair.get(&fresh.root_node) else { return fresh };
+    if let Some(p) = taffy.parent(root) {
+        let _ = taffy.remove_child(p, root);
+    }
+    let mut node_map = NodeMap::new();
+    for (b, n) in &fresh.node_map {
+        if let Some(t) = pair.get(b) {
+            node_map.insert(*t, n.clone());
+        }
+    }
+    let mut paint_map = NodeMap::new();
+    for (b, p) in &fresh.paint_map {
+        if let Some(t) = pair.get(b) {
+            paint_map.insert(*t, p.clone());
+        }
+    }
+    LayoutTree {
+        taffy,
+        root_node: root,
+        node_map,
+        paint_map,
+        viewport: fresh.viewport,
+        dirty: false,
+        inline: NodeMap::new(),
+        rowspans: Vec::new(),
+        scroll: NodeMap::new(),
+        col_shift: NodeMap::new(),
+        multicol: NodeMap::new(),
+        col_sets: NodeMap::new(),
+        col_frags: NodeMap::new(),
+        relaid: 0,
+        measure_epoch: 0,
+        kept_token: token,
+        measured: NodeMap::new(),
+        bw_pending: Vec::new(),
+    }
+}
+
+/// Whether a twin's layout may run on the kept tree: no table, no multicol container, no author outline (see the
+/// section comment).
+fn keepable<H: Host>(tree: &LayoutTree<H>) -> bool {
+    table::tables(tree).is_empty()
+        && !tree.paint_map.iter().any(|(id, p)| crate::paint::outline_of(p).is_some() || crate::multicol::is_multicol(tree, *id))
+}
+
+/// Makes `kept`'s taffy tree hold what the twin holds (see the section comment); false, with the twin untouched,
+/// when the twin's new slots are not the ones `kept`'s arena hands out.
+fn sync<H: Host>(twin: &mut LayoutTree<H>, kept: &mut LayoutTree<H>, prep: &Prep) -> bool {
+    let (used, used_set) = boxes_of(twin);
+    let (_, known) = boxes_of(kept);
+    // The twin is a copy of the kept arena plus its own inserts (retarget's new boxes, generated content, the
+    // anonymous boxes of `fix_display_contexts`) and no removal: the kept arena makes as many, and they must be the
+    // keys the twin's new boxes hold.
+    let Some(made) = twin.taffy.total_node_count().checked_sub(kept.taffy.total_node_count()) else { return false };
+    let created: BTreeSet<u64> = used_set.iter().copied().filter(|id| !known.contains(id)).collect();
+    if created.len() != made {
+        return false;
+    }
+    let mut fresh: BTreeSet<u64> = BTreeSet::new();
+    for _ in 0..made {
+        match kept.taffy.new_leaf(Style::default()) {
+            Ok(id) => {
+                fresh.insert(u64::from(id));
+            }
+            Err(_) => return false,
+        }
+    }
+    if fresh != created {
+        return false;
+    }
+    let mut touched: Vec<taffy::NodeId> = Vec::new();
+    for &id in &used {
+        let Ok(ts) = twin.taffy.style(id) else { continue };
+        if kept.taffy.style(id).map_or(true, |ks| ks != ts) {
+            let _ = kept.taffy.set_style(id, ts.clone());
+            touched.push(id);
+        }
+        let tc = twin.taffy.children(id).unwrap_or_default();
+        if kept.taffy.children(id).unwrap_or_default() != tc {
+            for &c in &tc {
+                if let Some(op) = kept.taffy.parent(c).filter(|op| *op != id) {
+                    touched.push(op);
+                }
+            }
+            let _ = kept.taffy.set_children(id, &tc);
+            touched.push(id);
+        }
+    }
+    let root = twin.root_node;
+    if let Some(p) = kept.taffy.parent(root) {
+        let _ = kept.taffy.remove_child(p, root);
+    }
+    let now = measured_of(prep);
+    for (id, m) in &now {
+        if kept.measured.get(id) != Some(m) {
+            touched.push(*id);
+        }
+    }
+    for id in kept.measured.keys() {
+        if !now.contains_key(id) && used_set.contains(&u64::from(*id)) {
+            touched.push(*id);
+        }
+    }
+    for id in touched {
+        if used_set.contains(&u64::from(id)) {
+            dirty_up(kept, id);
+        }
+    }
+    for raw in known.difference(&used_set) {
+        let _ = kept.taffy.remove(taffy::NodeId::from(*raw));
+    }
+    kept.root_node = root;
+    kept.node_map = core::mem::take(&mut twin.node_map);
+    kept.paint_map = core::mem::take(&mut twin.paint_map);
+    kept.viewport = twin.viewport;
+    kept.dirty = twin.dirty;
+    kept.inline = core::mem::take(&mut twin.inline);
+    kept.rowspans = core::mem::take(&mut twin.rowspans);
+    kept.scroll = core::mem::take(&mut twin.scroll);
+    kept.col_shift = core::mem::take(&mut twin.col_shift);
+    kept.multicol = core::mem::take(&mut twin.multicol);
+    kept.col_sets = core::mem::take(&mut twin.col_sets);
+    kept.col_frags = core::mem::take(&mut twin.col_frags);
+    kept.measured = now;
+    kept.bw_pending = Vec::new();
+    kept.kept_token = 0;
+    true
+}
+
+/// AETHERPAINTPERF2 (SR132): [`remeasure`] for a twin [`retarget`] built: the style rewrites run on the twin, the
+/// kept tree takes the twin's values and is laid out (its taffy passes re-lay the boxes whose style, children or
+/// measure inputs moved). true: `kept` is the laid-out tree (the caller swaps it in); false: the twin was laid out
+/// in place, every box (no token, a table, a multicol container, an author outline, a key replay that did not
+/// match), and `kept` is to be dropped.
+pub fn remeasure_kept<H: Host, F: Fonts + ?Sized>(twin: &mut LayoutTree<H>, kept: &mut LayoutTree<H>, fonts: &F) -> bool {
+    twin.relaid = 0;
+    let prep = prepass(twin, fonts);
+    let token = core::mem::take(&mut twin.kept_token);
+    if token == 0 || !keepable(twin) || !sync(twin, kept, &prep) {
+        // Whole: `retarget` set every box's style, which emptied its cache.
+        for node_id in prep.text_info.keys().chain(prep.img_info.keys()).chain(prep.media_info.keys()) {
+            let _ = twin.taffy.mark_dirty(*node_id);
+        }
+        twin.measured = measured_of(&prep);
+        let _ = passes(twin, prep, fonts, true);
+        return false;
+    }
+    kept.relaid = 0;
+    kept.bw_pending = passes(kept, prep, fonts, false);
+    true
+}
+
+/// AETHERPAINTPERF2 (SR132): [`layout`] keeping `kept`, the tree laid out from the same document before: a fresh box
+/// tree [`retarget`]ed onto `kept` by `key`, the cascaded styles folded, then [`remeasure_kept`]. Returns the laid-out
+/// tree (`kept` itself when it could be kept).
+pub fn relayout_kept<H: Host, D: Dom<Node = H::Node>, F: Fonts>(
+    dom: &D,
+    styles: &impl ComputedStyles<H>,
+    fonts: &mut F,
+    viewport: (f32, f32),
+    mut kept: LayoutTree<H>,
+    key: &dyn Fn(&H::Node) -> u64,
+) -> LayoutTree<H> {
+    let root = dom.root();
+    let fresh = build_tree::<H>(&root, viewport.0, viewport.1);
+    let mut twin = if kept.viewport == viewport { retarget(fresh, &kept, 1, key) } else { fresh };
+    let mut specs: Vec<(taffy::NodeId, Rc<SpecifiedStyle<H>>)> = Vec::new();
+    for (tid, n) in &twin.node_map {
+        if n.is_element() {
+            if let Some(s) = styles.style_of(n) {
+                specs.push((*tid, s));
+            }
+        }
+    }
+    apply_specs(&mut twin, &specs);
+    if twin.kept_token == 0 {
+        remeasure(&mut twin, &*fonts);
+        return twin;
+    }
+    if remeasure_kept(&mut twin, &mut kept, &*fonts) {
+        kept
+    } else {
+        twin
+    }
 }
 
 /// AETHERSTYLE3B (SR115): every element holding a container-relative length re-applies its length
@@ -1956,7 +2389,7 @@ fn clear_floats<H: Host>(tree: &LayoutTree<H>, root: taffy::NodeId, h: f32) -> f
 
 /// One text run's resolved text properties (inherited down the box tree the
 /// same way the host's render::draw_node inherits them).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct TextRun {
     pub(crate) text: String,
     pub(crate) font_size: f32,

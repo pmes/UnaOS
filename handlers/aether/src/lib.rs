@@ -263,10 +263,14 @@ impl AetherEngine {
         // A script may have inserted media elements: register them (poster requests queue).
         let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
         media::scan(&document, &base);
-        let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
+        // AETHERPAINTPERF2 (SR132): the new box tree is laid out on the previous one's boxes (`layout::build_tree_kept`):
+        // taffy re-lays only the boxes whose style, children or measure inputs moved.
+        let kept = self.layout_tree.take();
+        let mut layout_tree = layout::build_tree_kept(&document, self.width as f32, self.height as f32, kept, &self.stylesheets);
         // AETHERPAINTPERF (SR130): the restyle re-cascades only what the DOM changes since the last one can re-match.
         let hover: Vec<html_core::NodeId> = self.hover_path.iter().map(|n| n.id()).collect();
         css::apply_stylesheets_scoped(&mut layout_tree, &self.stylesheets, &hover);
+        layout::end_kept();
         self.layout_tree = Some(layout_tree);
         self.layout_epoch += 1;
         self.needs_repaint = true;
