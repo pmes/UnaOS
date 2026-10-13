@@ -7,8 +7,8 @@
 //! on the volume and is the program the loader will take. It runs nothing and fulfils nothing (the old
 //! LUMENBIN fixture drove the window against a VEIN.BIN chat daemon over bus verbs; both are retired).
 //!
-//! WHAT IT CHECKS. `/apps/LUMEN.ELF` is staged; the production validator (`arch::x86_64::elf::
-//! validate_elf`, the one `bg` runs) accepts it in the ELF-window model; its `.note.unaos.app` names
+//! WHAT IT CHECKS. `/apps/LUMEN.ELF` is staged; the production validator (`arch::syscall::launch_plan`, the
+//! arch's loader check — ARMTESTS A109, both arches) accepts it in the ELF-window model; its `.note.unaos.app` names
 //! "UnaOS", type 1, flags bit0 = windowed. And it reports what the program will run on, by the SAME rule
 //! the program applies (`vein_core::prefs::plan` — the shared core, so the two cannot disagree): the
 //! provider from Principia's `vein` namespace, and the key's state from `vein.key_file` stat'ed through
@@ -86,8 +86,10 @@ fn app_note_flags(elf: &[u8]) -> Option<u32> {
     None
 }
 
-/// LUMENAPP's static checks, then (LUMENCRASH M3) the spawn step on the image they accepted.
-#[cfg(target_arch = "x86_64")]
+/// LUMENAPP's static checks, then (LUMENCRASH M3) the spawn step on the image they accepted. ARMTESTS (A109): both
+/// arches — ARMAPPS (SR100) stages LUMEN.ELF on aarch64 media, so the aarch64 `image-owed` SKIP is retired. An
+/// aarch64 build without `aarch64_el0` has no ring-3 loader at all (no `arch::syscall`): the stub below says so.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 pub fn selftest() {
     match check() {
         Some(img) => spawn_step(&img),
@@ -98,7 +100,7 @@ pub fn selftest() {
 }
 
 /// The LUMENAPP verdict; `Some(image)` only on PASS (the image the spawn step then runs).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 fn check() -> Option<alloc::vec::Vec<u8>> {
     let (provider, key) = session();
     let verdict = |window: &str, v: &str| -> Option<alloc::vec::Vec<u8>> {
@@ -131,7 +133,7 @@ fn check() -> Option<alloc::vec::Vec<u8>> {
             return verdict("bad", "SKIP");
         }
     };
-    let plan = match crate::arch::x86_64::elf::validate_elf(&img, crate::arch::syscall::user_window_size()) {
+    let plan = match crate::arch::syscall::launch_plan(&img) {
         Ok(p) => p,
         Err(e) => {
             serial_println!(":: LUMENAPP: reason=loader-refused ({}) ::", e);
@@ -160,13 +162,13 @@ fn check() -> Option<alloc::vec::Vec<u8>> {
     Some(img)
 }
 
-/// aarch64: no ELF window on that loader yet, so no LUMEN.ELF image is built for it (owed).
-#[cfg(not(target_arch = "x86_64"))]
+/// ARMTESTS: an aarch64 build with no EL0 loader (`aarch64_el0` off) cannot spawn a program.
+#[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
 pub fn selftest() {
     let (provider, key) = session();
     let _ = app_note_flags;
-    serial_println!(":: LUMENAPP: reason=aarch64-image-owed ::");
-    serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP reason=window-bad ::", IMAGE, provider, key.as_str());
+    serial_println!(":: LUMENAPP: reason=no-el0-loader ::");
+    serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP ::", IMAGE, provider, key.as_str());
     lumenux();
     lumen2();
 }
@@ -176,8 +178,9 @@ pub fn selftest() {
 // could have seen it: LUMENAPP's checks never run the program. This step spawns the accepted LUMEN.ELF through
 // `spawn_user_image_bg` — the call `bg` and the bare-name launch make — and waits up to 2 s for the program's
 // first wire line `:: LUMEN: start …` (watched at the ring-3 console seam, `serial_line::line_watch_*`) or a
-// ring-3 fault of its pid (`note_ring3_fault`, called by the x86 fault-kill path), then kills the job so the
-// fixture leaves no window and no network session behind.
+// ring-3 fault of its pid (`note_ring3_fault`, called by the x86 fault-kill path; on aarch64 `bg_poll`'s `Faulted`,
+// the EL0 fault-kill net's verdict, which records no vector — printed `vec=el0 rip=unrecorded`), then kills the job
+// so the fixture leaves no window and no network session behind.
 //
 // WITNESS. `:: LUMENCRASH: spawned=1 first_line=<ms|fault vec=N rip=+0x..|timeout> -> PASS|FAIL ::` (rip
 // relative to the entry the loader reported); `spawned=0 … -> FAIL` with the loader's reason if the spawn is
@@ -203,7 +206,17 @@ pub fn note_ring3_fault(vec: u8, rip: u64) {
     FAULT_PID.store(pid, Ordering::Release);
 }
 
-#[cfg(target_arch = "x86_64")]
+/// ARMTESTS: the fault word aarch64's `bg_poll` verdict carries in place of a vector (no vector is recorded there).
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+const FAULT_EL0: u64 = u64::MAX;
+
+/// The fault's vector as the witness spells it.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+fn vec_word(vec: u64) -> alloc::string::String {
+    if vec == FAULT_EL0 { alloc::string::String::from("el0") } else { alloc::format!("{}", vec) }
+}
+
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 fn spawn_step(img: &[u8]) {
     // SMALLFIX (B380): flight 23's typed `lumen` printed its first line 8 s after the spawn (09:24:43 -> 09:24:51,
     // six vugs storming): the program's `:: LUMEN: start` comes AFTER the window, Principia's prefs, the key, the
@@ -220,6 +233,7 @@ fn spawn_step(img: &[u8]) {
     };
     serial_println!("[lumencrash] pid={} slot={} entry={:#x} wait_ms={} kill={} spawn_at_ms={} spawn_ms={} sight_ms={}", r.pid, r.slot, r.entry, WAIT_MS, r.killed, r.t_spawn, r.spawn_ms, r.sight_ms);
     match r.fault {
+        Some((vec, _)) if vec == FAULT_EL0 => serial_println!(":: LUMENCRASH: spawned=1 first_line=fault vec=el0 rip=unrecorded -> FAIL ::"),
         Some((vec, rip)) => serial_println!(
             ":: LUMENCRASH: spawned=1 first_line=fault vec={} rip=+{:#x} -> FAIL ::",
             vec,
@@ -231,7 +245,7 @@ fn spawn_step(img: &[u8]) {
 }
 
 /// One spawn of the accepted image and the wait for its first line (LUMENCRASH's step, LUMENFAST's read).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 struct SpawnRun {
     pid: u64,
     slot: u64,
@@ -245,8 +259,9 @@ struct SpawnRun {
     killed: &'static str,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 fn spawn_run(img: &[u8], wait_ms: u64) -> Result<SpawnRun, &'static str> {
+    #[cfg(target_arch = "x86_64")]
     use core::sync::atomic::Ordering;
     const FIRST: &str = ":: LUMEN: start";
     // LUMENFAST (B507): flight 27's `spawn_ms=6394` was APPRES's FIRST sight of the image (`[appres] sighted` ->
@@ -256,11 +271,12 @@ fn spawn_run(img: &[u8], wait_ms: u64) -> Result<SpawnRun, &'static str> {
     let t_sight = crate::arch::ms();
     crate::fs::appres::sight(IMAGE);
     let sight_ms = crate::arch::ms().saturating_sub(t_sight);
+    #[cfg(target_arch = "x86_64")]
     FAULT_PID.store(0, Ordering::Release);
     crate::serial_line::line_watch_arm(FIRST);
     let t_spawn = crate::arch::ms(); // SMALLFIX6 (B495): the spawn's own cost (the ELF load), on the line below
     let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(img) {
-        Ok(t) => { crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1 as u64), IMAGE); t } // SMALLFIX4 item 11: a path launch arms its APPRES name
+        Ok(t) => { crate::video::wm::app_name_arm_launch(crate::arch::syscall::owner_of_launch(t.1), IMAGE); t } // SMALLFIX4 item 11: a path launch arms its APPRES name
         Err(e) => {
             crate::serial_line::line_watch_disarm();
             return Err(e);
@@ -276,8 +292,14 @@ fn spawn_run(img: &[u8], wait_ms: u64) -> Result<SpawnRun, &'static str> {
             ok = true;
             break;
         }
+        #[cfg(target_arch = "x86_64")]
         if FAULT_PID.load(Ordering::Acquire) == pid {
             fault = Some((FAULT_VEC.load(Ordering::Relaxed), FAULT_RIP.load(Ordering::Relaxed)));
+            break;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        if matches!(crate::arch::syscall::bg_poll(pid, false), crate::arch::syscall::BgPoll::Faulted) {
+            fault = Some((FAULT_EL0, entry)); // ARMTESTS: the EL0 fault-kill net's verdict (no vector recorded here)
             break;
         }
         crate::arch::sched::yield_now();
@@ -418,7 +440,7 @@ fn lumenux() {
 // (`font_served_kib` = resident face bytes served during the judged start; 0 = the faces came off the volume).
 pub fn lumenfast() {
     const BOUND_MS: u64 = 1000;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     {
         let Some(img) = check() else {
             serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=not-spawned ::");
@@ -443,19 +465,19 @@ pub fn lumenfast() {
                 let kib = resident_served().saturating_sub(served0) / 1024;
                 let pass = r.ok && r.took < BOUND_MS;
                 match r.fault {
-                    Some((vec, _)) => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} sight_ms={} spawn_ms={} first_line=fault vec={} font_served_kib={} -> FAIL :: bound_ms={}", cold.sight_ms, cl, r.sight_ms, r.spawn_ms, vec, kib, BOUND_MS),
+                    Some((vec, _)) => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} sight_ms={} spawn_ms={} first_line=fault vec={} font_served_kib={} -> FAIL :: bound_ms={}", cold.sight_ms, cl, r.sight_ms, r.spawn_ms, vec_word(vec), kib, BOUND_MS),
                     None if r.ok => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} sight_ms={} spawn_ms={} first_line={} font_served_kib={} -> {} :: bound_ms={}", cold.sight_ms, cl, r.sight_ms, r.spawn_ms, r.took, kib, if pass { "PASS" } else { "FAIL" }, BOUND_MS),
                     None => serial_println!(":: LUMENFAST: cold_sight_ms={} cold_first_line={} sight_ms={} spawn_ms={} first_line=timeout font_served_kib={} -> FAIL :: bound_ms={}", cold.sight_ms, cl, r.sight_ms, r.spawn_ms, kib, BOUND_MS),
                 }
             }
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=aarch64-image-owed :: bound_ms={}", BOUND_MS);
+    #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
+    serial_println!(":: LUMENFAST: first_line=none -> SKIP reason=no-el0-loader :: bound_ms={}", BOUND_MS);
 }
 
 /// Resident face bytes the fulfiller served this boot; 0 on a build without `selfdiag` (no SYS_PATH_READ).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
 fn resident_served() -> u64 {
     #[cfg(feature = "selfdiag")]
     return crate::video::text::resident_served();

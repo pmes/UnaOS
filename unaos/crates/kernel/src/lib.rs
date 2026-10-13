@@ -336,11 +336,11 @@ pub mod soundopeners;
 pub mod smallfix7;
 // QUEUESLEEP (rmbp-ledger B512, R103 §2): `tests queuesleep` — the input path on an idle desktop, then one key, timed. Tail statement.
 pub mod queuesleep; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod sessionwedge; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod tests_watch; // TESTWATCH (rmbp-ledger B532 QUEUEWEDGE): a running `tests` verb watched from a sibling core. SESSIONWEDGE (rmbp-ledger B525): the usb-pump's liveness stamp, the PUMPWEDGE watch that prints without the pump, `tests sessionwedge` (LINE-NEUTRAL fold, code first)
-#[cfg(all(feature = "midden", target_arch = "x86_64"))] pub mod middenapp; // MIDDENTWIN (LEDGER SR75): `tests midden` — APPS/MIDDEN.ELF, the ring-3 shell over midden_core, driven and read back. Tail statement, so no existing line moves.
+#[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] pub mod middenapp; // ARMTESTS (orin-ledger A109): aarch64 too, through the arch's launch facade. MIDDENTWIN (LEDGER SR75): `tests midden` — APPS/MIDDEN.ELF, the ring-3 shell over midden_core, driven and read back. Tail statement, so no existing line moves.
 // AETHERMETAL (LEDGER SR66): `tests aether` — APPS/AETHER.ELF (the browser as a ring-3 program) validated, spawned, its page report read. Tail statement, so no existing line moves.
 #[cfg(feature = "aether")]
 pub mod aether;
-#[cfg(all(feature = "una", target_arch = "x86_64"))] pub mod unaapp; // UNAMETAL (LEDGER SR90): `tests una` — APPS/UNA.ELF, the ring-3 IDE (tree + edit_core editor + midden_core console), driven and read back. Tail statement, so no existing line moves.
+#[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] pub mod unaapp; // ARMTESTS (orin-ledger A109): aarch64 too, through the arch's launch facade. UNAMETAL (LEDGER SR90): `tests una` — APPS/UNA.ELF, the ring-3 IDE (tree + edit_core editor + midden_core console), driven and read back. Tail statement, so no existing line moves.
 #[cfg(feature = "sonde")] pub mod sonde; // REALSENSE (LEDGER SR92, R112): `tests sonde` — the D435i census fixture (three streaming functions, the depth XU, the HID interface), the XU/HW-monitor builders, and the boot's D400 record read back. Tail statement, so no existing line moves.
 // POINTERFEEL (rmbp-ledger B535, R103 §2): `tests pointerfeel` — the trackpad's real report stream under a finger, its gaps named by holder; the mode re-assert bound; the login gap's holder. Tail statement, so no existing line moves.
 pub mod pointerfeel;

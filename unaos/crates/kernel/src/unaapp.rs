@@ -6,10 +6,10 @@
 //!
 //! `APPS/UNA.ELF` (crates/user-una) is the Una IDE's UnaOS-native face: one window split three ways — a file tree,
 //! an editor over edit_core, a console that is MIDDEN.ELF's loop over midden_core. This fixture is `middenapp.rs`'s
-//! shape: find the image on the volume, run the production validator (`arch::x86_64::elf::validate_elf`, the one
-//! `bg` runs) in the ELF-window model, check the windowed app note (`midden_core::app_note_flags`), SPAWN it the way
+//! shape: find the image on the volume, run the production validator (`arch::syscall::launch_plan`, the arch's
+//! loader check — ARMTESTS A109) in the ELF-window model, check the windowed app note (`midden_core::app_note_flags`), SPAWN it the way
 //! `bg` does (`spawn_user_image_bg`), wait for `:: UNA: start`, then drive it the way the input router does —
-//! events into its ring by owner (`user_input_push_owner`):
+//! events into its ring by owner (`arch::syscall::launch_push`, the owner the arch's `owner_of_launch`):
 //!
 //!   1. a KEY_UP of `3` with no press before it — exactly what the HID decoder delivers for Ctrl+3 (the press of a
 //!      Ctrl+digit is suppressed, its release is not; see user-una's FOCUS note): the console takes the focus
@@ -77,7 +77,7 @@
 //! check, the ACL leg) and, on FAIL/SKIP, `:: UNAAPP: reason=… ::`. No `UNA.ELF` on the volume is a SKIP (the
 //! builder stages it; a bare kernel has none).
 
-use crate::arch::x86_64::syscall::{self as sc, BgPoll};
+use crate::arch::syscall::{self as sc, BgPoll}; // ARMTESTS (A109): the arch's facade, x86 and aarch64 alike
 
 const IMAGE: &str = "/apps/UNA.ELF";
 const START: &str = ":: UNA: start";
@@ -274,7 +274,7 @@ fn trash_leg(mt: &crate::fs::vfs::MountTable, img: &[u8]) -> (&'static str, &'st
     crate::serial_line::line_watch_arm(OPENED);
     let (pid, slot, _) = match sc::spawn_user_image_bg_argv(img, &["UNA.ELF", victim.as_str()]) {
         Ok(t) => {
-            crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1), IMAGE);
+            crate::video::wm::app_name_arm_launch(sc::owner_of_launch(t.1), IMAGE);
             t
         }
         Err(_) => {
@@ -344,9 +344,10 @@ fn wait_line(pid: u64, ms: u64) -> Result<u64, &'static str> {
     Err("timeout")
 }
 
-/// Push one event into the ring of the process in `slot`.
+/// Push one event into the ring of the program the launch handle `slot` names (ARMTESTS: the arch resolves the owner —
+/// `slot + 1` on x86, the ASID on aarch64).
 fn push(slot: u64, ty: u64, b: u8) -> bool {
-    sc::user_input_push_owner(slot + 1, una_abi::input_ev_pack(ty, b as u64))
+    sc::launch_push(slot, una_abi::input_ev_pack(ty, b as u64))
 }
 
 /// Type `s` into the ring, one KEY_DOWN per byte (`\n` is Enter, as the router sends it).
@@ -437,7 +438,7 @@ pub fn selftest() {
             return verdict("bad", 0, 0, "skip", 0, "SKIP");
         }
     };
-    let plan = match crate::arch::x86_64::elf::validate_elf(&img, sc::user_window_size()) {
+    let plan = match sc::launch_plan(&img) {
         Ok(p) => p,
         Err(e) => {
             serial_println!(":: UNAAPP: reason=loader-refused ({}) ::", e);
@@ -473,7 +474,7 @@ pub fn selftest() {
     crate::serial_line::line_watch_arm(if laid.is_ok() { OPENED } else { START });
     let (pid, slot, entry) = match sc::spawn_user_image_bg_argv(&img, argv) {
         Ok(t) => {
-            crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(t.1), IMAGE);
+            crate::video::wm::app_name_arm_launch(sc::owner_of_launch(t.1), IMAGE);
             t
         }
         Err(e) => {
