@@ -129,3 +129,65 @@ Promise.all([
          |DataError"
     );
 }
+
+/// O1 — Streams §5 (WritableStream backpressure: desiredSize over a CountQueuingStrategy), §6 (TransformStream
+/// transform / flush), §4.9.1 ReadableStreamPipeTo (pipeThrough into pipeTo; an AbortSignal shuts the pipe down
+/// with its reason), §4.7 / §4.5 (a byte stream answering a BYOB read through `byobRequest.respond`, the reader's
+/// buffer transferred), §4.2.5 async iteration, Encoding §5 / §6 (TextEncoderStream joining a surrogate pair
+/// split across chunks, TextDecoderStream a UTF-8 sequence split across chunks), Compression Streams §5
+/// (DecompressionStream over zlib split mid-stream, gzip, and deflate-raw with junk after the end: TypeError).
+#[test]
+fn o1_streams_writable_transform_pipes_bytes_codecs() {
+    let mut e = load_with(
+        &page(
+            r#"
+var hex = function (b) { return Array.prototype.map.call(new Uint8Array(b), function (x) { return (x + 256).toString(16).slice(1); }).join(''); };
+var un = function (h) { var o = new Uint8Array(h.length / 2); for (var i = 0; i < o.length; i++) { o[i] = parseInt(h.substr(i * 2, 2), 16); } return o; };
+var collect = async function (readable) { var out = []; for await (const c of readable) { out.push(c); } return out; };
+var bytes = function (chunks) { var n = 0; chunks.forEach(function (c) { n += c.length; }); var o = new Uint8Array(n), at = 0; chunks.forEach(function (c) { o.set(c, at); at += c.length; }); return o; };
+var log = [];
+var ws = new WritableStream({ write: function (c) { log.push('w:' + c); }, close: function () { log.push('closed'); } }, new CountQueuingStrategy({ highWaterMark: 2 }));
+var w = ws.getWriter();
+var d0 = w.desiredSize;
+w.write('a'); w.write('b');
+var d1 = w.desiredSize;
+var pWritable = w.close().then(function () { return d0 + ':' + d1 + ':' + log.join(',') + ':' + ws.locked; });
+var rs = new ReadableStream({ start: function (c) { c.enqueue('x'); c.enqueue('yz'); c.close(); } });
+var upper = new TransformStream({ transform: function (chunk, c) { c.enqueue(chunk.toUpperCase()); }, flush: function (c) { c.enqueue('!'); } });
+var piped = [];
+var pPipe = rs.pipeThrough(upper).pipeTo(new WritableStream({ write: function (c) { piped.push(c); } })).then(function () { return piped.join(',') + ':' + rs.locked; });
+var ac = new AbortController();
+var pAbort = new ReadableStream({ pull: function (c) { c.enqueue(1); } }).pipeTo(new WritableStream(), { signal: ac.signal }).then(function () { return 'resolved'; }, function (e) { return e.name; });
+ac.abort();
+var bs = new ReadableStream({ type: 'bytes', pull: function (c) { var v = c.byobRequest.view; v[0] = 7; v[1] = 8; c.byobRequest.respond(2); } });
+var view = new Uint8Array(4);
+var pByob = bs.getReader({ mode: 'byob' }).read(view).then(function (r) { return r.value.constructor.name + ':' + r.value.length + ':' + r.value[0] + ',' + r.value[1] + ':' + r.done + ':' + view.byteLength; });
+var tes = new TextEncoderStream(), tw = tes.writable.getWriter();
+tw.write('a\uD83D'); tw.write('\uDCA9'); tw.close();
+var pEnc = collect(tes.readable).then(function (c) { return tes.encoding + ':' + hex(bytes(c)); });
+var tds = new TextDecoderStream(), dw = tds.writable.getWriter();
+dw.write(new Uint8Array([0xE2, 0x82])); dw.write(new Uint8Array([0xAC])); dw.close();
+var pDec = collect(tds.readable).then(function (c) { return c.length + ':' + c.join('').charCodeAt(0).toString(16); });
+var inflate = function (format, parts) {
+    var ds = new DecompressionStream(format), wr = ds.writable.getWriter();
+    parts.forEach(function (p) { wr.write(p).catch(function () {}); });
+    wr.close().catch(function () {});
+    return collect(ds.readable).then(function (c) { return new TextDecoder().decode(bytes(c)); }, function (e) { return e.name; });
+};
+var z = un('789c4bad28484d2e494d51c82f2d29282d010030ad0624');
+Promise.all([
+    pWritable, pPipe, pAbort, pByob, pEnc, pDec,
+    inflate('deflate', [z.slice(0, 5), z.slice(5)]),
+    inflate('gzip', [un('1f8b08000000000002034bad28484d2e494d51c82f2d29282d0100b00139b30f000000')]),
+    inflate('deflate-raw', [un('4bad28484d2e494d51c82f2d29282d010000')]),
+    inflate('deflate', [z.slice(0, 7)]),
+]).then(function (r) { R = r; }, function (e) { R = ['rejected ' + e]; });
+"#,
+        ),
+        10_000,
+    );
+    assert_eq!(
+        eval(&mut e, "R.join('|')"),
+        "2:0:w:a,w:b,closed:true|X,YZ,!:false|AbortError|Uint8Array:2:7,8:false:0|utf-8:61f09f92a9|1:20ac|expected output|expected output|TypeError|TypeError"
+    );
+}

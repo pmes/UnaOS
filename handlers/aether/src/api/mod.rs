@@ -9,6 +9,8 @@ pub mod events;
 pub mod eventsource;
 pub mod fetch;
 pub mod platform;
+/// AETHERWPT3 (SR138): the Streams Standard, TextEncoderStream / TextDecoderStream, DecompressionStream.
+pub mod streams;
 /// AETHERWPT2 (SR135): `crypto.subtle` (digest, HMAC, AES-GCM / AES-CTR, HKDF, PBKDF2) over crypto_core.
 pub mod subtle;
 pub mod uievents;
