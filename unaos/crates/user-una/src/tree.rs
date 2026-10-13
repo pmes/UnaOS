@@ -22,6 +22,10 @@
 // the selection on the touched path. Wire: `:: UNA: tree op=<newfile|newdir|rename|trash> path=<p> [to=<p>
 // via=copy] rc=<r> [why=<w>] ::`.
 //
+// GIT MARKS — UNAIDE2 (SR111): with a `.git` under the workspace root (git.rs, read-only through git_core) each row
+// listed carries `M` (modified against the index) or `?` (untracked), computed when its folder is listed, on a
+// rebuild, and for one row after a save (`remark`); `g` on a file asks the IDE for its diff in the console.
+//
 // MATRIXCORE (SR99, R104): the listing is Matrix's own — `matrix_core::list_dir`, the rule the host Finder lists
 // with (the build-noise set `target` / `.git` / `node_modules` left out, directories first, then files, each by
 // name in byte order), over `PathVolume`: the core's `Volume` seam on SYS_PATH_READ + PATH_R_LIST (list),
@@ -76,6 +80,8 @@ pub struct Node {
     pub open: bool,
     /// A refusal row (the listing under the entry above failed): `name` carries the errno word.
     pub err: bool,
+    /// UNAIDE2: the git mark (`M`, `?`, or a space).
+    pub mark: u8,
 }
 
 pub struct Tree {
@@ -84,6 +90,9 @@ pub struct Tree {
     pub sel: usize,
     pub top: usize,
     pub dirty: bool,
+    /// UNAIDE2: the workspace's repository (git.rs), or why it could not be read.
+    pub git: Option<crate::git::Repo>,
+    pub git_err: Option<String>,
 }
 
 /// What a key asks of the IDE.
@@ -94,6 +103,8 @@ pub enum Act {
     Ask(Op),
     /// UNAIDE2: trash the selection (refused by name: `Tree::trash`).
     Trash,
+    /// UNAIDE2: show this file's git diff in the console.
+    Diff(String),
 }
 
 /// UNAIDE2: the file operations that need a name.
@@ -145,11 +156,15 @@ fn op_wire(op: &str, path: &str, to: Option<&str>, rc: i64, why: Option<&str>) {
 
 /// `dir` (absolute, normal) listed by the core: `.`/`..` and the build noise dropped, directories first, then
 /// files, each by name in byte order (the surface's names are ASCII 8.3 or UTF-8); `path` = `join(dir, name)`.
-fn children(dir: &str, depth: u8) -> Vec<Node> {
+fn children(dir: &str, depth: u8, git: Option<&crate::git::Repo>) -> Vec<Node> {
     match matrix_core::list_dir(&mut PathVolume, dir, &Ignore::build_noise()) {
         Ok(items) => items
             .into_iter()
-            .map(|it| Node { path: it.path, name: it.name, depth, dir: it.kind == Kind::Dir, open: false, err: false })
+            .map(|it| {
+                let isdir = it.kind == Kind::Dir;
+                let mark = git.map_or(b' ', |g| g.mark(&it.path, isdir));
+                Node { path: it.path, name: it.name, depth, dir: isdir, open: false, err: false, mark }
+            })
             .collect(),
         Err(e) => alloc::vec![Node {
             path: String::from(dir),
@@ -158,6 +173,7 @@ fn children(dir: &str, depth: u8) -> Vec<Node> {
             dir: false,
             open: false,
             err: true,
+            mark: b' ',
         }],
     }
 }
@@ -165,8 +181,26 @@ fn children(dir: &str, depth: u8) -> Vec<Node> {
 impl Tree {
     pub fn new(root: String) -> Tree {
         // The core joins paths without folding, so the root is listed in its normal form (`resolve` from `/`).
-        let nodes = children(&resolve("/", &root), 0);
-        Tree { root, nodes, sel: 0, top: 0, dirty: true }
+        let (git, git_err) = match crate::git::open(&root) {
+            Ok(g) => (g, None),
+            Err(e) => (None, Some(e)),
+        };
+        let nodes = children(&resolve("/", &root), 0, git.as_ref());
+        Tree { root, nodes, sel: 0, top: 0, dirty: true, git, git_err }
+    }
+
+    /// UNAIDE2: the marks over the rows listed now — (`M` rows, `?` rows).
+    pub fn mark_counts(&self) -> (usize, usize) {
+        (self.nodes.iter().filter(|n| n.mark == b'M').count(), self.nodes.iter().filter(|n| n.mark == b'?').count())
+    }
+
+    /// UNAIDE2: recompute `path`'s mark (after a save).
+    pub fn remark(&mut self, path: &str) {
+        let Some(g) = self.git.as_ref() else { return };
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.path == path && !n.err) {
+            n.mark = g.mark(path, n.dir);
+            self.dirty = true;
+        }
     }
 
     /// Entries that name a file or directory (refusal rows excluded) — the start line's `entries=`.
@@ -192,7 +226,7 @@ impl Tree {
     pub fn rebuild(&mut self, select: Option<&str>) {
         let open: Vec<String> = self.nodes.iter().filter(|n| n.dir && n.open).map(|n| n.path.clone()).collect();
         let keep = self.nodes.get(self.sel).map(|n| n.path.clone());
-        self.nodes = children(&resolve("/", &self.root), 0);
+        self.nodes = children(&resolve("/", &self.root), 0, self.git.as_ref());
         let mut i = 0;
         while i < self.nodes.len() {
             if self.nodes[i].dir && !self.nodes[i].err && open.iter().any(|p| *p == self.nodes[i].path) {
@@ -277,7 +311,7 @@ impl Tree {
             self.nodes.drain(i + 1..end);
             self.nodes[i].open = false;
         } else {
-            let kids = children(&path, depth.saturating_add(1));
+            let kids = children(&path, depth.saturating_add(1), self.git.as_ref());
             let tail = self.nodes.split_off(i + 1);
             self.nodes.extend(kids);
             self.nodes.extend(tail);
@@ -338,6 +372,7 @@ impl Tree {
             b'f' => return Act::Ask(Op::NewDir),
             b'r' if !self.nodes[self.sel].err => return Act::Ask(Op::Rename),
             0x08 | 0x7f => return Act::Trash,
+            b'g' if !self.nodes[self.sel].dir && !self.nodes[self.sel].err => return Act::Diff(self.nodes[self.sel].path.clone()),
             KEY_LEFT => {
                 let n = &self.nodes[self.sel];
                 if n.dir && n.open {

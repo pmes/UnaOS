@@ -56,6 +56,11 @@
 // POINTER (B543/B550) in every pane: the hand over the tab strip, the beam over the editor's text and the console,
 // the arrow over the tree and the status line; a press on the tree's selected row opens it, as Enter does.
 //
+// GIT — UNAIDE2 (SR111), read-only through git_core (git.rs): the tree's rows carry `M` / `?` at their right edge;
+// `g` on a file, or the console's `git diff [path]`, shows its diff against the index in the console; `git status`
+// lists the workspace's state. `:: UNA: git root=<p> gitdir=<p> hk=<k> entries=<n> M=<n> untracked=<n> ::` at start
+// when `.git` exists (`err=<why>` when it cannot be read).
+//
 // THEME. Every colour is a field of `theme::Theme` (theme.rs: Principia's `system.appearance.*` and Tabula's
 // `tabula.theme.<kind>` over the PREFS bus, the kernel palette's Light/Dark rows) — read once at start and again when
 // the store moves (`theme::due`, PrefChanged's ring-3 stand-in); `:: UNA: theme mode=<light|dark> accent=<name>
@@ -82,6 +87,7 @@ use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
 mod console;
 mod editor;
 mod fs;
+mod git;
 mod theme;
 mod tree;
 mod txt;
@@ -506,6 +512,9 @@ impl App {
                 // Ctrl+S
                 self.ed().save();
                 self.saved = self.tabs[self.cur].saved && !self.tabs[self.cur].dirty;
+                if let Some(p) = self.tabs[self.cur].path.clone() {
+                    self.tree.remark(&p); // UNAIDE2: the saved file's git mark
+                }
                 self.dirty = true;
                 return;
             }
@@ -538,6 +547,10 @@ impl App {
                 tree::Act::Trash => {
                     let e = self.tree.trash();
                     self.say(alloc::format!("trash: refused {} - trash_core moves by rename and ring 3 has no rename door", e));
+                }
+                tree::Act::Diff(p) => {
+                    self.set_focus(Pane::Console);
+                    self.con.git_diff(&p);
                 }
                 tree::Act::None => {}
             },
@@ -705,12 +718,18 @@ impl App {
                 }
             };
             let ind = self.tree.indent(i);
+            let gm = self.tree.nodes[i].mark;
             let mut s: Vec<u8> = Vec::new();
             s.extend(core::iter::repeat(b' ').take(ind));
             s.push(mark);
             s.extend(self.tree.nodes[i].name.bytes().map(|b| if (0x20..=0x7e).contains(&b) { b } else { b'?' }));
-            s.truncate(cols);
+            s.truncate(if gm == b' ' { cols } else { cols.saturating_sub(1) });
             self.text(2, y, &s, ink, r);
+            if gm != b' ' {
+                // UNAIDE2: the git mark at the row's right edge — modified in the accent ink, untracked dim.
+                let x = r.x + r.w - self.cell() as i32 - 3;
+                self.text(x, y, &[gm], if gm == b'M' { th.caret } else { th.dim_ink }, r);
+            }
         }
         if n == 0 {
             self.text(4, r.y + 2 + lh, b"(empty)", th.dim_ink, r);
@@ -1006,6 +1025,22 @@ pub extern "C" fn _start() -> ! {
     l.put(b" panes=").dec(PANES as i64).put(b" root=").put(root.as_bytes()).put(b" entries=").dec(app.tree.entries() as i64);
     l.put(b" cwd=").put(app.con.cwd.as_bytes()).put(b" ::");
     l.wire();
+    // UNAIDE2: the workspace's repository, when `.git` is there.
+    match (&app.tree.git, &app.tree.git_err) {
+        (Some(g), _) => {
+            let (m, u) = app.tree.mark_counts();
+            let mut w = Line::new(b":: UNA: git root=");
+            w.put(g.root.as_bytes()).put(b" gitdir=").put(g.gitdir.as_bytes()).put(b" hk=").put(g.hk_name().as_bytes());
+            w.put(b" entries=").dec(g.entries() as i64).put(b" M=").dec(m as i64).put(b" untracked=").dec(u as i64).put(b" ::");
+            w.wire();
+        }
+        (None, Some(e)) => {
+            let mut w = Line::new(b":: UNA: git root=");
+            w.put(app.tree.root.as_bytes()).put(b" err=").put(e.as_bytes()).put(b" ::");
+            w.wire();
+        }
+        _ => {}
+    }
     app.con.say(console::Tone::Out, "Una on UnaOS - the console is Midden. Type help.");
     if let Some(f) = file {
         app.open_path(&f);
