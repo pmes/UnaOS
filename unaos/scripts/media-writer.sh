@@ -35,6 +35,8 @@
 #       (writes, then verifies by read-back)
 #   media-writer.sh --selftest [dir]
 #       (builds file-backed fixtures and proves EVERY check fires in BOTH polarities)
+#   media-writer.sh --version
+#       (prints the version stamp, this file's sha256 and its path; exit 0)
 #
 #   media-writer.sh --image <card.img> --target <dev-or-image> [--write --erase-target]
 #       WHOLE-MEDIUM mode (UNAFSROOT, orin 24). Lays a CARD IMAGE down over the target: partition
@@ -68,8 +70,19 @@
 #
 # EXIT CODES  (SPECFLIGHT discipline — tools/foreman/src/verdict.rs)
 #   0 RC_PASS     every check passed
-#   1 RC_REFUSE   one or more checks REFUSED; nothing was written
+#   1 RC_REFUSE   one or more checks REFUSED; nothing was written — OR a --write that passed every
+#                 check FAILED part-way (copy or read-back), in which case the output says
+#                 "MEDIUM IS NOT LOADED" and the medium has been unmounted regardless
 #   2 RC_ERROR    usage / environment error; nothing was evaluated
+#
+# VERSIONING (TOOLING1, 2026-10-13; rmbp-ledger B97/B105, R30/R33)
+#   THE CANONICAL COPY IS `unaos/scripts/media-writer.sh` IN THE UnaOS REPO. The bench copy at
+#   ~/unaos-bench/tools/media-writer.sh is an INSTALL of it (`cp -p`), never edited in place: an edit
+#   there is a fork with no history, which is how two seats once read two different line 687s minutes
+#   apart and could settle it only by memory (B105). Every run prints `tool media-writer <stamp>
+#   sha256=<this file> path=<this file>` as the FIRST line of its PREFLIGHT and in the FLIGHTID card,
+#   so any transcript names the exact bytes that produced it; `sha256sum` of the repo file at a sha
+#   is the comparison. Bump MEDIAWRITER_VERSION in the same commit as any behaviour change.
 #
 # ⛔ THIS SCRIPT NEVER WRITES WITHOUT --write, AND ITS SELFTEST NEVER TOUCHES A BLOCK DEVICE.
 #    The selftest operates exclusively on file-backed images under its own scratch directory.
@@ -81,6 +94,8 @@ RC_PASS=0; RC_REFUSE=1; RC_ERROR=2
 # relative $0 would resolve to nothing there. (The selftest caught exactly that on its first run —
 # 23/23 red with rc=127. A harness that could not have noticed is not a harness.)
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+MEDIAWRITER_VERSION="2026-10-13.c14"   # bump with every behaviour change (see VERSIONING above)
+mw_version_line() { echo "media-writer $MEDIAWRITER_VERSION sha256=$(sha256sum "$SELF" 2>/dev/null | cut -d' ' -f1) path=$SELF"; }
 # ── orin 23 (2026-09-08), from the first REAL card write this tool ever attempted (two refusals on
 # Peter's terminal): (a) `sudo` resets HOME to /root, so every $HOME path missed the seat's tree —
 # resolve the INVOKING user's home via SUDO_USER; (b) under sudo there is no session bus, so
@@ -117,7 +132,7 @@ ran()    { CHECKS_RUN+=("$1"); }
 passed() { CHECKS_PASS+=("$1"); ran "$1"; }
 failed() { ran "$1"; refuse "$1: $2"; }
 
-usage() { sed -n '2,72p' "$0"; exit "$RC_ERROR"; }
+usage() { awk 'NR>1 && /^set -uo pipefail/{exit} NR>1' "$0"; exit "$RC_ERROR"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -132,6 +147,7 @@ while [ $# -gt 0 ]; do
         --allow-geom-absent) ALLOW_GEOM_ABSENT=1; shift ;;
         --write)             MODE="write"; shift ;;
         --selftest)          SELFTEST=1; SELFTEST_DIR="${2:-$HOME/unaos-bench/scratch/orin20/cardready/selftest}"; shift 2 2>/dev/null || shift ;;
+        --version)           mw_version_line; exit "$RC_PASS" ;;
         -h|--help)           usage ;;
         *) echo "media-writer: unknown argument '$1'" >&2; exit "$RC_ERROR" ;;
     esac
@@ -276,6 +292,124 @@ print("VOL_CLUSTERS=%d" % clusters); print("VOL_FATKIND=%s" % kind)
 PY
 }
 
+# ── C14's MEASUREMENT: does the staged tree fit the FAT volume at byte offset $2 of $1? ─────────────
+# Read straight off the medium (device or image), same as probe_medium, so a file-backed fixture and
+# a real card are the same case. Prints NEED_BYTES / FREE_BYTES / RECLAIM_BYTES / CLUSTER_BYTES, or
+# WHY= and exit 3. FREE is counted from the FAT's own zero entries over clusters 2..N+1 (FSInfo's
+# free-count is a hint the spec lets go stale). RECLAIM walks the volume's directories (8.3 + LFN)
+# for files at the tree's own paths, case-insensitively as FAT compares them. NEED rounds every file
+# up to the cluster and charges each directory that does NOT yet exist on the volume for its entries
+# (one 32-byte slot per 13 name characters plus the short entry, plus `.`/`..`). An EXISTING
+# directory is charged nothing; growth of a full existing directory is the one cost not counted.
+tree_fit() {  # $1 = medium  $2 = volume byte offset  $3 = staged tree
+    python3 - "$1" "$2" "$3" <<'PY'
+import sys, os, array
+path, off, src = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def die(why): print("WHY=%s" % why); sys.exit(3)
+u16 = lambda b, o: b[o] | (b[o+1] << 8)
+u32 = lambda b, o: b[o] | (b[o+1] << 8) | (b[o+2] << 16) | (b[o+3] << 24)
+try:
+    f = open(path, 'rb')
+except OSError as e:
+    die(str(e))
+f.seek(off); bs = f.read(512)
+if len(bs) < 512 or bs[510] != 0x55 or bs[511] != 0xAA: die("no FAT boot sector at byte %d" % off)
+bps, spc, rsvd, nfats, rootent = u16(bs, 11), bs[13], u16(bs, 14), bs[16], u16(bs, 17)
+tot = u16(bs, 19) or u32(bs, 32); fatsz = u16(bs, 22) or u32(bs, 36)
+if not (bps and spc and nfats and fatsz): die("BPB has a zero field (bps=%d spc=%d nfats=%d fatsz=%d)" % (bps, spc, nfats, fatsz))
+rootsec = (rootent * 32 + bps - 1) // bps
+first_data = rsvd + nfats * fatsz + rootsec
+nclus = (tot - first_data) // spc
+kind = 12 if nclus < 4085 else (16 if nclus < 65525 else 32)
+cs = spc * bps
+f.seek(off + rsvd * bps); fat = f.read(fatsz * bps)
+if kind == 32:
+    a = array.array('I'); a.frombytes(fat[:len(fat) // 4 * 4])
+    if sys.byteorder != 'little': a.byteswap()
+    ent = lambda n: a[n] & 0x0FFFFFFF
+    free = sum(1 for n in range(2, min(nclus + 2, len(a))) if (a[n] & 0x0FFFFFFF) == 0)
+    eoc = 0x0FFFFFF8
+elif kind == 16:
+    a = array.array('H'); a.frombytes(fat[:len(fat) // 2 * 2])
+    if sys.byteorder != 'little': a.byteswap()
+    ent = lambda n: a[n]
+    free = sum(1 for n in range(2, min(nclus + 2, len(a))) if a[n] == 0)
+    eoc = 0xFFF8
+else:
+    def ent(n):
+        o = n + n // 2; v = fat[o] | (fat[o+1] << 8)
+        return (v >> 4) if n & 1 else (v & 0xFFF)
+    free = sum(1 for n in range(2, nclus + 2) if ent(n) == 0)
+    eoc = 0xFF8
+def chain(cl):
+    out, seen = [], set()
+    while 2 <= cl < eoc and cl not in seen and len(out) <= nclus:
+        seen.add(cl); out.append(cl); cl = ent(cl)
+    return out
+def read_clusters(cl):
+    data = b''
+    for c in chain(cl):
+        f.seek(off + (first_data + (c - 2) * spc) * bps); data += f.read(cs)
+    return data
+def root_bytes():
+    if kind == 32: return read_clusters(u32(bs, 44))
+    f.seek(off + (rsvd + nfats * fatsz) * bps); return f.read(rootsec * bps)
+def parse_dir(data):
+    """name(lowercased, LFN if present else 8.3) -> (is_dir, first_cluster, size)"""
+    out, lfn = {}, {}
+    for i in range(0, len(data) - 31, 32):
+        e = data[i:i+32]
+        if e[0] == 0x00: break
+        if e[0] == 0xE5: lfn = {}; continue
+        if e[11] == 0x0F:
+            seq = e[0] & 0x1F
+            part = (e[1:11] + e[14:26] + e[28:32]).decode('utf-16-le', 'replace')
+            lfn[seq] = part.split('\x00')[0]
+            continue
+        if e[11] & 0x08: lfn = {}; continue          # volume label
+        base = e[0:8].decode('latin-1').rstrip(); ext = e[8:11].decode('latin-1').rstrip()
+        if e[0] == 0x05: base = '\xe5' + base[1:]
+        short = base + ('.' + ext if ext else '')
+        long_ = ''.join(lfn[k] for k in sorted(lfn)) if lfn else ''
+        lfn = {}
+        if short in ('.', '..'): continue
+        cl = u16(e, 26) | (u16(e, 20) << 16 if kind == 32 else 0)
+        rec = (bool(e[11] & 0x10), cl, u32(e, 28))
+        out[short.lower()] = rec
+        if long_: out[long_.lower()] = rec
+    return out
+dir_cache = {(): parse_dir(root_bytes())}
+def lookup_dir(parts):
+    parts = tuple(parts)
+    if parts in dir_cache: return dir_cache[parts]
+    parent = lookup_dir(parts[:-1])
+    if parent is None: dir_cache[parts] = None; return None
+    rec = parent.get(parts[-1].lower())
+    dir_cache[parts] = parse_dir(read_clusters(rec[1])) if rec and rec[0] and rec[1] else None
+    return dir_cache[parts]
+rnd = lambda n: (n + cs - 1) // cs * cs
+need = reclaim = 0
+src = os.path.abspath(src)
+for dirpath, dirnames, filenames in os.walk(src):
+    rel = os.path.relpath(dirpath, src)
+    parts = [] if rel == '.' else rel.split(os.sep)
+    existing = lookup_dir(parts)
+    if parts and existing is None:              # a directory the copy must CREATE
+        slots = 2 + sum(1 + (len(n) + 12) // 13 for n in dirnames + filenames)
+        need += rnd(slots * 32)
+    for n in filenames:
+        p = os.path.join(dirpath, n)
+        try: sz = os.path.getsize(p)
+        except OSError as e: die("cannot size %s: %s" % (p, e))
+        need += rnd(sz)
+        if existing:
+            rec = existing.get(n.lower())
+            if rec and not rec[0]: reclaim += rnd(rec[2])
+print("CLUSTER_BYTES=%d" % cs); print("FAT_KIND=FAT%d" % kind)
+print("NEED_BYTES=%d" % need); print("FREE_BYTES=%d" % (free * cs)); print("RECLAIM_BYTES=%d" % reclaim)
+PY
+}
+
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
 # THE CHECKS. Each one NAMES ITSELF, states what it saw and what it wanted, and can FIRE — the
 # selftest below drives every one of them red as well as green. Nothing short-circuits.
@@ -404,6 +538,39 @@ run_checks() {
         failed "C8-VOLSERIAL" "$target has BS_VolID 0 — the loader would print \`boot volume FAT serial\` as absent and the flight could not be tied to this medium. Re-format with a serial (mkfs.vfat -i)."
     else
         passed "C8-VOLSERIAL"
+    fi
+
+    # ── C14 TREE-FITS (TOOLING1, 2026-10-13; orin 27's 2026-09-12 incident) — the staged tree fits the
+    #    FAT volume it is about to be copied into, measured off the medium BEFORE any byte is copied.
+    #    A 640 MiB card image left inside a staged tree filled a 127 MiB volume: the copy died part-way
+    #    and the card stayed mounted with a partial file. Need and room are both counted in CLUSTERS,
+    #    because that is how FAT allocates: every file is rounded up to the cluster, every NEW directory
+    #    costs at least one. Room = the free clusters counted IN THE FAT ITSELF (never FSInfo's hint,
+    #    which the spec calls advisory) + the clusters held by files at the SAME PATHS the copy will
+    #    overwrite (cp -R and mcopy -o both release a file before rewriting it — a re-stage of the same
+    #    tree onto a full card is not refused for space it already owns).
+    if [ -z "$VOL_SERIAL" ]; then
+        failed "C14-TREE-FITS" "no FAT volume to measure free space on (see C4-MEDIUM-KIND)"
+    elif [ -z "$src" ] || [ ! -d "$src" ]; then
+        failed "C14-TREE-FITS" "no staged tree to measure (see C1-STAGED-SRC)"
+    else
+        local fit fk fv NEED="" FREE="" RECLAIM="" CBYTES="" FWHY=""
+        fit="$(tree_fit "$target" "${VOL_OFFSET:-0}" "$src" 2>&1)"
+        while IFS= read -r line; do
+            fk="${line%%=*}"; fv="${line#*=}"
+            case "$fk" in
+                NEED_BYTES) NEED="$fv";; FREE_BYTES) FREE="$fv";; RECLAIM_BYTES) RECLAIM="$fv";;
+                CLUSTER_BYTES) CBYTES="$fv";; WHY) FWHY="$fv";;
+            esac
+        done <<< "$fit"
+        if [ -z "$NEED" ] || [ -z "$FREE" ] || [ -z "$RECLAIM" ]; then
+            failed "C14-TREE-FITS" "could not measure the fit of $src on $target (${FWHY:-$(printf '%s' "$fit" | tail -1)}) — refusing to copy a tree of unknown fit"
+        elif [ $((FREE + RECLAIM)) -lt "$NEED" ]; then
+            failed "C14-TREE-FITS" "the staged tree needs $NEED B (cluster-rounded, ${CBYTES} B clusters) and $target has $FREE B free + $RECLAIM B held by files the copy overwrites = $((FREE + RECLAIM)) B — SHORT BY $((NEED - FREE - RECLAIM)) B. The copy would die part-way and leave a partial file on the card (orin 27, 2026-09-12). Look for an image or capture left inside the staged tree."
+        else
+            passed "C14-TREE-FITS"
+            FIT_NOTE="C14: tree needs $NEED B; volume has $FREE B free + $RECLAIM B reclaimable (${CBYTES} B clusters)"
+        fi
     fi
 
     # ── C9 NOT-SYSTEM — never write the host's own disks. ──
@@ -659,9 +826,11 @@ do_write_image() {
 }
 
 GEOM_NOTE=""
+FIT_NOTE=""
 IMAGE_TARGET_WAS=""
 emit_report() {
     echo "=== media-writer PREFLIGHT ==="
+    echo "  tool           $(mw_version_line)"
     if [ -n "$IMAGE_SRC" ]; then
         # WHOLE-MEDIUM: say plainly which object each identity was read off, and what is about to be
         # destroyed. A report that printed one "FAT volume" line here would be ambiguous about the
@@ -681,6 +850,7 @@ emit_report() {
     echo "  geometry       ${PROBE_GEOM:-<none>}"
     fi
     [ -n "$GEOM_NOTE" ] && echo "                 $GEOM_NOTE"
+    [ -n "$FIT_NOTE" ] && echo "                 $FIT_NOTE"
     echo "  checks         ${#CHECKS_PASS[@]}/${#CHECKS_RUN[@]} passed"
     # Name every check that PASSED, not just the ones that failed. A run that prints only failures
     # cannot be asked "did C8 actually run?" — and an unasked check reads exactly like a passing one.
@@ -706,8 +876,40 @@ emit_report() {
 # read-back passed 10/10 and the flight still scored against a different card. The read-back is
 # necessary and it is not sufficient — the FLIGHTID card below is the other half.
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
+# ── RELEASE: every exit from do_write after the medium may be mounted goes through here, success
+#    or failure (TOOLING1, 2026-10-13). Before it, a failed copy returned with the card STILL MOUNTED
+#    and a partial file on it (orin 27, 2026-09-12), and a failed read-back said "Not unmounting;
+#    investigate" — a mounted card is one a pull corrupts, and the operator's next act at a bench is
+#    to pull it. A failed write now leaves the card UNMOUNTED and says plainly that it is NOT LOADED.
+#    $1 = target, $2 = "ok" | "failed". File-backed targets were never mounted (mtools addresses the
+#    image directly) and say so, so the selftest can prove the failure branch reaches this function.
+release_medium() {
+    local target="$1" how="$2" tail
+    if [ "$how" = ok ]; then tail="safe to pull."
+    else tail="after a FAILED write — the medium is NOT LOADED: safe to pull, NOT safe to boot."; fi
+    if [ -b "$target" ]; then
+        [ "$how" = ok ] || tail="$tail Inspect read-only with: udisksctl mount -b ${WRITE_PDEV:-$target} -o ro"
+        if [ -n "${WRITE_MP:-}" ]; then
+            sync; umount "$WRITE_MP" && rmdir "$WRITE_MP" && echo "UNMOUNTED $target $tail" \
+                || echo "⚠ COULD NOT UNMOUNT $WRITE_MP — unmount it by hand before pulling the card."
+        else
+            $HOSTRUN sync
+            if $HOSTRUN udisksctl unmount -b "${WRITE_PDEV:-${target}p${PART}}" >/dev/null 2>&1 \
+               || $HOSTRUN udisksctl unmount -b "$target" >/dev/null 2>&1 \
+               || [ -z "$($HOSTRUN lsblk -rno MOUNTPOINT "${WRITE_PDEV:-$target}" 2>/dev/null | head -1)" ]; then
+                echo "UNMOUNTED $target $tail"
+            else
+                echo "⚠ COULD NOT UNMOUNT ${WRITE_PDEV:-$target} — unmount it by hand before pulling the card."
+            fi
+        fi
+    else
+        echo "RELEASED $target (file-backed: nothing was mounted) $tail"
+    fi
+}
+
 do_write() {
-    local src="$1" target="$2" mp="" via=""
+    local src="$1" target="$2" mp="" via="" crc=0
+    WRITE_MP=""; WRITE_PDEV=""
     if [ -b "$target" ]; then
         # The FAT volume lives in MBR slot $PART, so the device to MOUNT is the partition node, not
         # the whole disk `--target` names (the whole disk is what C7 parses; mounting it fails, and
@@ -716,7 +918,7 @@ do_write() {
         local pdev="$target"
         if [ -b "${target}p${PART}" ]; then pdev="${target}p${PART}"
         elif [ -b "${target}${PART}" ]; then pdev="${target}${PART}"; fi
-        WRITE_MP=""
+        WRITE_PDEV="$pdev"
         if [ "$(id -u)" = 0 ]; then
             mp="$(lsblk -rno MOUNTPOINT "$pdev" | head -1)"
             if [ -z "$mp" ]; then
@@ -727,16 +929,16 @@ do_write() {
             $HOSTRUN udisksctl mount -b "$pdev" >/dev/null 2>&1
             mp="$($HOSTRUN lsblk -rno MOUNTPOINT "$pdev" | head -1)"
         fi
-        [ -n "$mp" ] || { echo "FATAL: $pdev did not mount"; return "$RC_ERROR"; }
+        [ -n "$mp" ] || { echo "FATAL: $pdev did not mount"; release_medium "$target" failed; return "$RC_ERROR"; }
         via="mount:$pdev@$mp"
         # The harvest (what the card held BEFORE this write) is a record, so it does not go to scratch.
         local harvest="$FLASH/harvest/$(date -u +%Y%m%dT%H%M%SZ)-from-$(basename "$target")"
         mkdir -p "$harvest"
         $HOSTRUN cp -R "$mp/." "$harvest/" 2>/dev/null
         echo "HARVEST: previous card contents -> $harvest"
-        $HOSTRUN cp -R "$src/." "$mp/"
-        $HOSTRUN sync
         [ -n "${SUDO_UID:-}" ] && chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$harvest" 2>/dev/null
+        $HOSTRUN cp -R "$src/." "$mp/" || crc=$?
+        $HOSTRUN sync
     else
         # mtools addresses the volume inside the whole-disk image as image@@<byte offset>, so a
         # file-backed target needs no loop device and no root. The path must be ABSOLUTE: the copy
@@ -744,10 +946,19 @@ do_write() {
         # none). The selftest caught this — "Can't open wgood.img" from within src/.
         case "$target" in /*) ;; *) target="$PWD/$target";; esac
         via="mtools:$target@@$PROBE_OFFSET"
+        # COPY-FAILURE POLARITY FIXTURE (TOOLING1): MEDIAWRITER_FAIL_COPY=1 stops the copy after its
+        # FIRST entry and reports failure — a partial copy, the orin 27 shape — so the selftest can
+        # prove the failure branch releases the medium. File-backed only, like the read-back fixture.
         ( cd "$src" && for e in *; do
-            if [ -d "$e" ]; then mcopy -s -o -i "$target@@$PROBE_OFFSET" "$e" "::"
-            else mcopy -o -i "$target@@$PROBE_OFFSET" "$e" "::"; fi
-          done ) || { echo "FATAL: mcopy failed"; return "$RC_ERROR"; }
+            if [ -d "$e" ]; then mcopy -s -o -i "$target@@$PROBE_OFFSET" "$e" "::" || exit $?
+            else mcopy -o -i "$target@@$PROBE_OFFSET" "$e" "::" || exit $?; fi
+            [ -n "${MEDIAWRITER_FAIL_COPY:-}" ] && { echo "  (MEDIAWRITER_FAIL_COPY set: copy stopped after '$e' — partial-copy fixture)"; exit 1; }
+          done; exit 0 ) || crc=$?
+    fi
+    if [ "$crc" -ne 0 ]; then
+        echo "=== FATAL: the copy onto $target FAILED (rc=$crc) — partial files may be on it. MEDIUM IS NOT LOADED. ==="
+        release_medium "$target" failed
+        return "$RC_REFUSE"
     fi
 
     echo "=== READ-BACK SHA MATCH (staged MANIFEST vs the bytes now on $target) ==="
@@ -765,20 +976,14 @@ do_write() {
     done < "$src/MANIFEST"
 
     if [ "$fail" -ne 0 ]; then
-        echo "=== $fail of $n FILES DIFFER — MEDIUM IS NOT LOADED. Not unmounting; investigate. ==="
+        echo "=== $fail of $n FILES DIFFER — MEDIUM IS NOT LOADED. ==="
+        release_medium "$target" failed
         return "$RC_REFUSE"
     fi
     echo "=== $n/$n match. $target carries $SRC_NAME. ==="
     write_flightid "$src" "$target" "$n" "$via"
-    if [ -b "$target" ]; then
-        if [ -n "${WRITE_MP:-}" ]; then
-            sync && umount "$WRITE_MP" && rmdir "$WRITE_MP" && echo "UNMOUNTED $target — safe to pull."
-        else
-            $HOSTRUN udisksctl unmount -b "${target}p${PART}" >/dev/null 2>&1 || $HOSTRUN udisksctl unmount -b "$target" >/dev/null 2>&1
-            echo "UNMOUNTED $target — safe to pull."
-        fi
-        [ -n "${SUDO_UID:-}" ] && chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "${src}.FLIGHTID" 2>/dev/null
-    fi
+    release_medium "$target" ok
+    [ -b "$target" ] && [ -n "${SUDO_UID:-}" ] && chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "${src}.FLIGHTID" 2>/dev/null
     return "$RC_PASS"
 }
 
@@ -793,6 +998,7 @@ write_flightid() {
     {
         echo "# FLIGHTID — $SRC_NAME"
         echo "# written $(date -u +%Y-%m-%dT%H:%M:%SZ) by media-writer.sh onto $target ($via)"
+        echo "# tool: $(mw_version_line)"
         echo "#"
         echo "# SCORE THE BOOT BY THESE LINES, IN THIS ORDER, BEFORE ANY QUESTION IS SCORED."
         echo "# Each is printed by a component that is not this script."
@@ -880,7 +1086,10 @@ selftest() {
         if [ "${1:-}" = "env" ]; then out="$("$@" 2>&1)"; rc=$?
         else                          out="$("$SELF" "$@" 2>&1)"; rc=$?; fi
         local got="PASS"; [ "$rc" -ne 0 ] && got="REFUSE"
-        if [ "$got" = "$expect" ] && printf '%s' "$out" | grep -qF -- "$want"; then
+        # A here-string, not `printf | grep -q`: under `set -o pipefail` grep -q exiting at the first
+        # match can SIGPIPE the printf and fail the pipeline on a MATCHING arm (TOOLING1 measured one
+        # such false FAIL on a C14 arm, 2026-10-13). The verdict must not depend on scheduling.
+        if [ "$got" = "$expect" ] && grep -qF -- "$want" <<< "$out"; then
             printf '  ok    %-34s %-7s rc=%d\n' "$name" "$got" "$rc"; pass=$((pass+1))
         else
             printf '  FAIL  %-34s want=%s/%s got=%s rc=%d\n' "$name" "$expect" "$want" "$got" "$rc"
@@ -1019,7 +1228,7 @@ selftest() {
     arm  "C13 RED   (target mounted)"    REFUSE "MOUNTED partition"      env LOADCARD10_LSBLK_FIXTURE="$PWD/topo-mounted.txt" \
              "$SELF" --image "$PWD/grown.img" --target "$PWD/mmcblk0" --expect-geom "$GROWNGEOM"
 
-    echo "-- C14 WHOLE-MEDIUM WRITE (both polarities) --"
+    echo "-- WHOLE-MEDIUM WRITE (both polarities) --"
     cp tgt-big.img wimg.img; cp tgt-big.img wimgbad.img
     arm  "IMG RED   (write, no --erase)" REFUSE "--erase-target"         --image "$PWD/grown.img" --target wimg.img --expect-geom "$GROWNGEOM" --write
     arm  "IMG green (write + read-back)" PASS   "identical"              --image "$PWD/grown.img" --target wimg.img --expect-geom "$GROWNGEOM" --write --erase-target
@@ -1027,7 +1236,48 @@ selftest() {
              "$SELF" --image "$PWD/grown.img" --target "$PWD/wimgbad.img" --expect-geom "$GROWNGEOM" --write --erase-target
     # The written medium must now BE the card: same geometry, same label, same BS_VolID as the image
     # — proved by running the STAGING checks against it, which is the very thing the next step does.
-    arm  "IMG green (staging accepts it)" PASS  "10/10 passed"             --src "$PWD/src" --target wimg.img --expect-geom "$GROWNGEOM"
+    arm  "IMG green (staging accepts it)" PASS  "11/11 passed"             --src "$PWD/src" --target wimg.img --expect-geom "$GROWNGEOM"
+
+    # ═════════════════════════════════════════════════════════════════════════════════════════
+    # C14 TREE-FITS + RELEASE-ON-FAILURE (TOOLING1, 2026-10-13). good.img's p1 is 55 MiB.
+    echo "-- C14 TREE-FITS (the staged tree fits the target FAT, measured before any copy) --"
+    arm  "C14 green (tree fits)"         PASS   "PASS  C14-TREE-FITS"     $S --target good.img
+    # ⚠ THE orin 27 SHAPE: a card image left inside the staged tree. 60 MiB of it into 55 MiB.
+    rm -rf srcbig; cp -r src srcbig; truncate -s 60M srcbig/UnaOS-card.img
+    cp good.img wfull.img; local fullsha; fullsha="$(sha256sum wfull.img | cut -d' ' -f1)"
+    arm  "C14 RED   (image left in tree)" REFUSE "SHORT BY"               --src "$PWD/srcbig" --target wfull.img --expect-geom "$GOODGEOM" --write
+    # …and the refusal is BEFORE any copy: the target's bytes did not move.
+    if [ "$(sha256sum wfull.img | cut -d' ' -f1)" = "$fullsha" ]; then
+        printf '  ok    %-34s %-7s\n' "C14 RED leaves target untouched" "PASS"; pass=$((pass+1))
+    else
+        printf '  FAIL  %-34s the target changed under a C14 refusal\n' "C14 RED leaves target untouched"; fail=$((fail+1))
+    fi
+    # RECLAIM, both polarities: a 40 MiB file already on the card. Re-staging a tree that carries the
+    # SAME path fits (the copy releases the old file first); the same bytes under a NEW name do not.
+    cp good.img wre.img; truncate -s 40M big40.bin
+    mcopy -o -i "$PWD/wre.img@@$((2048*512))" big40.bin ::BIG40.BIN
+    rm -rf srcre srcnew; cp -r src srcre; cp -r src srcnew
+    truncate -s 40M srcre/BIG40.BIN; truncate -s 40M srcnew/other40.bin
+    arm  "C14 green (same path reclaimed)" PASS  "PASS  C14-TREE-FITS"    --src "$PWD/srcre"  --target wre.img --expect-geom "$GOODGEOM"
+    arm  "C14 RED   (new path, no room)"  REFUSE "SHORT BY"               --src "$PWD/srcnew" --target wre.img --expect-geom "$GOODGEOM"
+    arm  "C14 RED   (no FAT to measure)"  REFUSE "C14-TREE-FITS: no FAT"  $S --target nofat.img
+
+    echo "-- RELEASE ON FAILURE (a failed copy never leaves the medium mounted) --"
+    cp good.img wcopyfail.img
+    arm  "COPY RED  (partial copy)"      REFUSE "MEDIUM IS NOT LOADED"   env MEDIAWRITER_FAIL_COPY=1 \
+             "$SELF" --src "$PWD/src" --target "$PWD/wcopyfail.img" --expect-geom "$GOODGEOM" --write
+    arm  "COPY RED  releases the medium"  REFUSE "after a FAILED write"  env MEDIAWRITER_FAIL_COPY=1 \
+             "$SELF" --src "$PWD/src" --target "$PWD/wcopyfail.img" --expect-geom "$GOODGEOM" --write
+    cp good.img wrbfail.img
+    arm  "C10 RED   releases the medium"  REFUSE "after a FAILED write"  --src "$PWD/srcbad" --target wrbfail.img --expect-geom "$GOODGEOM" --write
+    arm  "VERSION   (stamp + self sha)"   PASS   "media-writer $MEDIAWRITER_VERSION sha256=" --version
+    # THE DRY RUN'S `To load:` HINT IS RUN, NOT TRUSTED (B105: a printed command nobody had executed
+    # dropped a flag the dry run carried). Its --write is stripped so the re-run is a dry run too.
+    printf 'CARDREADY-GEOM: %s\n' "$GOODGEOM" > goodgeom.md
+    local hint; local -a hv
+    hint="$("$SELF" --src "$PWD/src" --target "$PWD/good.img" --geom-from "$PWD/goodgeom.md" 2>&1 | awk -F'To load: ' 'NF>1{print $2}')"
+    read -ra hv <<< "${hint% --write}"
+    arm  "HINT      (re-run as printed)"  PASS   "DRY RUN"               "${hv[@]:1}"
 
     echo
     echo "=== SELFTEST: $pass passed, $fail failed ==="
@@ -1077,7 +1327,11 @@ run_checks "$SRC_DIR" "$TARGET" || exit "$RC_REFUSE"
 if [ "$MODE" != "write" ]; then
     echo
     echo "DRY RUN — every check passed and NOTHING was written."
-    echo "  To load: $0 --src $SRC_NAME --target $TARGET${EXPECT_GEOM:+ --expect-geom $EXPECT_GEOM}$([ "$ALLOW_GEOM_ABSENT" -eq 1 ] && printf " --allow-geom-absent") --write"
+    # The hint carries EVERY option that changed a check's verdict (B105: a hint that drops a flag the
+    # dry run carried tells the operator to run a different preflight). --src is the short name only
+    # when it resolves back to the same directory under $FLASH.
+    _src_arg="$SRC_DIR"; [ "$SRC_DIR" = "$FLASH/$SRC_NAME" ] && _src_arg="$SRC_NAME"
+    echo "  To load: $0 --src $_src_arg --target $TARGET${EXPECT_GEOM:+ --expect-geom $EXPECT_GEOM}${GEOM_FROM:+ --geom-from $GEOM_FROM}$([ "$EXPECT_LABEL" != UNAOS-ORIN ] && printf " --expect-label %s" "$EXPECT_LABEL")$([ "$PART" != 1 ] && printf " --part %s" "$PART")$([ "$ALLOW_GEOM_ABSENT" -eq 1 ] && printf " --allow-geom-absent") --write"
     exit "$RC_PASS"
 fi
 do_write "$SRC_DIR" "$TARGET"; exit $?
