@@ -281,6 +281,21 @@ pub enum Op {
     /// Yield the top of stack without wrapping it in an iterator result (sync yield*).
     YieldRaw,
     Nop,
+
+    // ---- explicit resource management (`using` / `await using`, ES2026): operand = the register holding the
+    // scope's DisposeCapability
+    /// register <- a new, empty DisposeCapability
+    UsingNew(u32),
+    /// value -> value: AddDisposableResource(cap, value, hint); true = async-dispose (`await using`)
+    UsingAdd(u32, bool),
+    /// kind value -> : a throw completion (kind 1) becomes the capability's pending error
+    UsingSeed(u32),
+    /// -> value to await | jump(done): disposes resources in reverse order until one needs an Await
+    UsingStep(u32, u32),
+    /// error -> : a rejected disposal Await joins the pending error (SuppressedError)
+    UsingError(u32),
+    /// -> : throw the pending error, if any
+    UsingFinish(u32),
 }
 
 #[derive(Debug)]

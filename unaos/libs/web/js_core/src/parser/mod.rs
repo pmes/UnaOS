@@ -139,6 +139,9 @@ pub struct Parser {
     pub(crate) async_call_trailing_comma_after_spread: Vec<u32>,
     /// Start positions of `async(` call heads with no line terminator between `async` and `(`.
     pub(crate) async_heads: Vec<u32>,
+    /// `scopes.len()` while parsing the StatementList of a CaseClause / DefaultClause (a `using` declaration
+    /// directly there is an early error, ES2026 §14.3.1.1).
+    pub(crate) case_clause_depth: Option<usize>,
 }
 
 pub fn parse_script(src: &[u16]) -> PResult<Program> {
@@ -206,6 +209,7 @@ impl Parser {
             object_trailing_comma_after_spread: Vec::new(),
             async_call_trailing_comma_after_spread: Vec::new(),
             async_heads: Vec::new(),
+            case_clause_depth: None,
         }
     }
 
@@ -334,6 +338,17 @@ impl Parser {
         self.lx.pos = save_pos;
         self.lx.nl_before = save_nl;
         Ok(t?)
+    }
+
+    /// Lookahead two tokens past the current one (re-lexes, like `peek`).
+    pub(crate) fn peek2(&mut self) -> PResult<(Token, Token)> {
+        let save_pos = self.lx.pos;
+        let save_nl = self.lx.nl_before;
+        let a = self.lx.next_token();
+        let b = if a.is_ok() { self.lx.next_token() } else { Ok(Token { t: T::Eof, start: 0, end: 0, nl_before: false, escaped: false, legacy_octal: false }) };
+        self.lx.pos = save_pos;
+        self.lx.nl_before = save_nl;
+        Ok((a?, b?))
     }
 
     pub(crate) fn span_from(&self, start: u32) -> Span {
