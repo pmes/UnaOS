@@ -8028,6 +8028,27 @@ KERNEL_CFG_MATRIX=(
   # Read the live board/mix counts off `./arroyo check`, which prints them every run.
   "x86-nousblun ../../x86_64-unaos.json witness,logts,wedge2,sched_demo,skip_xhci,nousblun"
   "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,uvc"
+  # ── ARMLINE (appended 2026-10-13, LEDGER SR102, wave24arm) — the image-24 line on both aarch64 boards ──
+  #
+  # Peter: "elevate orin and pi to this level [image 24]". The ten image-24 knobs (login, lumen,
+  # holocron, selfdiag, midden, una, aether, uvc, sonde, usbnet) reach `esp-jetson` through the
+  # top-level knob map and `kernel8` through its curated K8_FEATS arms, and the seat builds each card
+  # from ONE env file (unaos/scripts/image-line-orin.env, image-line-pi.env). These two rows are the
+  # configurations those files produce, so the fold type-checks the line it flies:
+  #   arm-tegra-image = arm-tegra-desk's list + login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet
+  #   arm-pi-image    = arm-pi's list + lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet (holocron, login: on arm-pi already)
+  # uvc/sonde compile on aarch64 only once ARMSONDE lifts their x86 module gates; until it folds these
+  # two legs red on those names (the seat knows — the brief's own caveat).
+  #
+  # UNIVERSE SIDE EFFECT — and why `x86-image` exists. `x86_cfg_universe` SUBTRACTS every feature named
+  # by an arm-* leg and by NO x86-* leg from the derived mix universe. login/holocron/uvc are on x86-all
+  # and selfdiag on x86-selfdiag, but lumen, midden, una, aether, sonde and usbnet were named by NO leg
+  # (in the universe as "unclaimed => x86"); the two arm rows alone would have deleted those six from
+  # every x86 mix leg. `x86-image` names all ten on a literal x86 leg, so the universe is unchanged
+  # (+0 features) and the armed x86 polarity of the set is compiled by construction. Board legs +3.
+  "arm-tegra-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet"
+  "arm-pi-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet"
+  "x86-image ../../x86_64-unaos.json witness,unafs,login,holocron,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -11915,6 +11936,35 @@ kernel8() {
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"
         echo -e "${COLOR_YELLOW}  • UNAOS_FATPERF: the FAT/VFS cost instrument ([fatperf] op=list|read path= sectors= us= — measurement only, no behaviour change)${COLOR_RESET}"
+    fi
+    # ARMLINE (LEDGER SR102, wave24arm): the image-24 knobs the curated list did not carry, appended in
+    # the top-level knob map's order (holocron, midden, una, sonde, aether, uvc). Each was an NA/TODO row
+    # in scripts/k8-reach.registry until this arm; the rows are retired with it (armed + registered is
+    # `k8-reach CONTRADICTION`). midden/una/sonde/uvc/aether are x86-gated in kernel source until the
+    # wave's ARMSONDE/ARMAPPS arcs fold; until then the feature compiles with those modules cfg-erased.
+    if [ -n "${UNAOS_HOLOCRON:-}" ]; then
+        K8_FEATS="${K8_FEATS},holocron"
+        echo -e "${COLOR_YELLOW}  • UNAOS_HOLOCRON: the Holocron record store on the writable FAT volume (fs/holocron.rs; the framing fixture)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_MIDDEN:-}" ]; then
+        K8_FEATS="${K8_FEATS},midden"
+        echo -e "${COLOR_YELLOW}  • UNAOS_MIDDEN: MIDDENTWIN — tests midden (APPS/MIDDEN.ELF spawned, help + ls typed, its exit read back)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_UNA:-}" ]; then
+        K8_FEATS="${K8_FEATS},una"
+        echo -e "${COLOR_YELLOW}  • UNAOS_UNA: UNAMETAL — tests una (APPS/UNA.ELF spawned, Ctrl+3 + help typed, Ctrl+Q, its exit read back)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_SONDE:-}" ]; then
+        K8_FEATS="${K8_FEATS},sonde"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SONDE: REALSENSE — tests sonde (the D435i census; SKIP(no-device) without the camera); implies uvc${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_AETHER:-}" ]; then
+        K8_FEATS="${K8_FEATS},aether"
+        echo -e "${COLOR_YELLOW}  • UNAOS_AETHER: AETHERMETAL — tests aether (APPS/AETHER.ELF spawned, its page report read); implies selfdiag${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_UVC:-}" ]; then
+        K8_FEATS="${K8_FEATS},uvc"
+        echo -e "${COLOR_YELLOW}  • UNAOS_UVC: the USB Video Class driver (descriptor census, probe/commit, frames)${COLOR_RESET}"
     fi
     # TOOLFIX/BANNER: the Pi image's OWN feature banner, printed from the list this build is about to
     # hand cargo — not from the x86/virt `$_feats` map at the top of the script, which is suppressed
