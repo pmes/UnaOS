@@ -11,6 +11,10 @@
 // SYS_SPAWN_PATH. What differs from MIDDEN.ELF is only what a pane inside an IDE must differ in: the scrollback
 // wraps at the pane's columns (set by the painter), the cwd starts at the workspace root, `exit`/`quit` ask the
 // IDE to quit (returned as `Act::Quit`, the window is the IDE's), and the wire tag is `:: UNA: plan=`.
+//
+// UNAIDE2 (LEDGER SR111): `run` is the door the IDE's Run verb (Ctrl+R, main.rs) uses — a `.run` line or the typed
+// line goes through the same plan; a launched program is DETACHED (SYS_SPAWN_PATH is the `bg` body) and ring 3 has no
+// pipe door, so its output is not this pane's — the launch row says so rather than leave the pane silent.
 
 use crate::fs::{errno_text, list, read_file, resolve, spawn_path, stat, CAT_MAX};
 use crate::Line;
@@ -118,6 +122,24 @@ impl Console {
         }
     }
 
+    /// UNAIDE2: run `line` as if typed (the IDE's Run verb).
+    pub fn run(&mut self, line: &str) -> Act {
+        self.dirty = true;
+        self.run_line(line)
+    }
+
+    /// UNAIDE2: the typed line, taken out of the input (Ctrl+R runs it); `None` when nothing is typed.
+    pub fn take_input(&mut self) -> Option<String> {
+        if self.inp.iter().all(|b| *b == b' ') {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&self.inp).into_owned();
+        self.inp.clear();
+        self.caret = 0;
+        self.hist_at = None;
+        Some(line)
+    }
+
     // ---- the plan, executed through the syscalls it names ----
     fn run_line(&mut self, line: &str) -> Act {
         let prompt = alloc::format!("{}> {}", self.cwd, line);
@@ -166,6 +188,7 @@ impl Console {
                     }
                     self.say(Tone::Out, "keys: Ctrl+1 tree, Ctrl+2 editor, Ctrl+3 console (Esc cycles), Ctrl+O open, Ctrl+S save, Ctrl+Q quit");
                     self.say(Tone::Out, "tabs: Ctrl+T next, Ctrl+4..9 tab 1..6, Ctrl+W close; Ctrl+F find, Ctrl+L replace (Tab swaps, Ctrl+W whole-word, Ctrl+A all), Ctrl+G line");
+                    self.say(Tone::Out, "tree: n new file (Ctrl+N anywhere), f new folder, r rename, Delete trash; Ctrl+R runs the .run line or the typed line");
                 }
                 (1, word.clone(), true)
             }
@@ -209,6 +232,7 @@ impl Console {
         let r = spawn_path(&path, argv);
         if r > 0 {
             self.say(Tone::Out, &alloc::format!("{}: {} started - pid {}", verb, path, r));
+            self.say(Tone::Out, "(detached: its output is not this pane's - ring 3 has no pipe door)");
             Ok(r)
         } else {
             self.say(Tone::Err, &alloc::format!("{}: {}: {} {}", verb, path, r, errno_text(r)));

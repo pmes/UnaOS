@@ -48,6 +48,14 @@
 // Wire: `:: UNA: tab active=<i> tabs=<n> path=<p|untitled> dirty=<0|1> ::` on every switch, open and close, and
 // `:: UNA: close path=<p> dirty=<0|1> tabs=<n> ::`. A press in the editor's text places the caret under the pointer.
 //
+// FILES AND RUN — UNAIDE2 (LEDGER SR111). The tree's operations (tree.rs FILE OPERATIONS: `n`/Ctrl+N new file, `f`
+// new folder, `r` rename, Delete trash — refused by name) ask their name in the editor's status line (`ask`; Enter
+// commits, Esc drops it); a new file opens in a tab, a renamed file's tab follows it. Ctrl+R (`run`) runs the first
+// line of `.run` in the active file's folder, else the workspace root's (`$FILE` = the active file), else the line
+// typed in the console, through the console's midden_core plan; `:: UNA: run src=<path|typed> line=<l> ::`.
+// POINTER (B543/B550) in every pane: the hand over the tab strip, the beam over the editor's text and the console,
+// the arrow over the tree and the status line; a press on the tree's selected row opens it, as Enter does.
+//
 // THEME. Every colour is a field of `theme::Theme` (theme.rs: Principia's `system.appearance.*` and Tabula's
 // `tabula.theme.<kind>` over the PREFS bus, the kernel palette's Light/Dark rows) — read once at start and again when
 // the store moves (`theme::due`, PrefChanged's ring-3 stand-in); `:: UNA: theme mode=<light|dark> accent=<name>
@@ -66,7 +74,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use una_abi::{
     input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP,
-    INPUT_EV_MOUSE_ABS, KEY_CTRL_DIGIT, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT, CURSOR_ARROW, CURSOR_TEXT,
+    INPUT_EV_MOUSE_ABS, KEY_CTRL_DIGIT, KEY_ESC, SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT, CURSOR_ARROW, CURSOR_HAND, CURSOR_TEXT,
     SYS_CURSOR_SHAPE,
 };
 use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
@@ -160,6 +168,13 @@ impl Pane {
     }
 }
 
+/// UNAIDE2: a tree operation's name prompt — the op, the folder (or, for a rename, the path) it acts on, the text.
+struct Ask {
+    op: tree::Op,
+    base: String,
+    text: String,
+}
+
 #[derive(Clone, Copy)]
 struct Rect {
     x: i32,
@@ -189,6 +204,8 @@ struct App {
     tab_hits: Vec<(Rect, usize)>,
     /// UNAIDE2: the last Ctrl+S on any tab answered rc=0 (the exit status's SAVED bit).
     saved: bool,
+    /// UNAIDE2: a tree operation waiting for its name (the status-line prompt).
+    ask: Option<Ask>,
     con: console::Console,
     /// Bytes whose KEY_DOWN this program saw and whose KEY_UP it has not (the modified-digit chord test).
     down: [bool; 128],
@@ -320,6 +337,125 @@ impl App {
         self.switch_to(n);
     }
 
+    /// UNAIDE2: start a tree operation's name prompt.
+    fn begin_ask(&mut self, op: tree::Op) {
+        let (base, text) = match op {
+            tree::Op::Rename => match self.tree.selected() {
+                Some((p, _)) => {
+                    let leaf = String::from(p.rsplit('/').next().unwrap_or(&p));
+                    (p, leaf)
+                }
+                None => return self.say(String::from("rename: select a file in the tree")),
+            },
+            _ => (self.tree.target_dir(), String::new()),
+        };
+        self.ask = Some(Ask { op, base, text });
+        self.dirty = true;
+    }
+
+    /// UNAIDE2: Enter on the name prompt — the op through tree.rs, its outcome in the status line.
+    fn commit_ask(&mut self) {
+        let Some(a) = self.ask.take() else { return };
+        self.dirty = true;
+        let name = String::from(a.text.trim());
+        let m = match a.op {
+            tree::Op::NewFile => match self.tree.new_file(&a.base, &name) {
+                Ok(p) => {
+                    self.open_path(&p);
+                    alloc::format!("created {}", name)
+                }
+                Err(e) => alloc::format!("new file: {} {}", fs::errno_word(e), e),
+            },
+            tree::Op::NewDir => match self.tree.new_dir(&a.base, &name) {
+                Ok(_) => alloc::format!("folder {} made", name),
+                Err(e) => alloc::format!("new folder: {} {}", fs::errno_word(e), e),
+            },
+            tree::Op::Rename => match self.tree.rename(&a.base, &name) {
+                Ok(to) => {
+                    for e in self.tabs.iter_mut().filter(|e| e.path.as_deref() == Some(a.base.as_str())) {
+                        e.path = Some(to.clone());
+                        e.repaint = true;
+                    }
+                    alloc::format!("renamed to {} (copied: id and attributes do not follow)", name)
+                }
+                Err((e, why)) => {
+                    self.tree.rebuild(None);
+                    match why {
+                        Some(w) => alloc::format!("rename: {} {} ({})", fs::errno_word(e), e, w),
+                        None => alloc::format!("rename: {} {}", fs::errno_word(e), e),
+                    }
+                }
+            },
+        };
+        self.say(m);
+    }
+
+    /// The name prompt's keys; `false` = not one it takes.
+    fn ask_key(&mut self, k: u8) -> bool {
+        let Some(a) = self.ask.as_mut() else { return false };
+        match k {
+            b'\n' | b'\r' => self.commit_ask(),
+            KEY_ESC => self.ask = None,
+            0x08 | 0x7f => {
+                a.text.pop();
+            }
+            0x20..=0x7e => {
+                if a.text.len() < 255 {
+                    a.text.push(k as char)
+                }
+            }
+            _ => return false,
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// UNAIDE2: Ctrl+R — the `.run` line (active file's folder, then the workspace root), else the typed line.
+    fn run(&mut self) {
+        self.set_focus(Pane::Console);
+        let file = self.tabs[self.cur].path.clone();
+        let root = fs::resolve("/", &self.tree.root);
+        let mut dirs: Vec<String> = Vec::new();
+        if let Some(f) = &file {
+            dirs.push(match f.rfind('/') {
+                Some(0) | None => String::from("/"),
+                Some(i) => String::from(&f[..i]),
+            });
+        }
+        if !dirs.contains(&root) {
+            dirs.push(root);
+        }
+        let mut found: Option<(String, String)> = None;
+        for d in &dirs {
+            let p = if d == "/" { String::from("/.run") } else { alloc::format!("{}/.run", d) };
+            if let Ok(b) = fs::read_file(&p, 4096, false) {
+                let text = String::from_utf8_lossy(&b).into_owned();
+                if let Some(l) = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')) {
+                    found = Some((p, l.replace("$FILE", file.as_deref().unwrap_or(""))));
+                    break;
+                }
+            }
+        }
+        let (src, line) = match found {
+            Some(f) => f,
+            None => match self.con.take_input() {
+                Some(l) => (String::from("typed"), l),
+                None => {
+                    let looked: Vec<String> = dirs.iter().map(|d| alloc::format!("{}/.run", d.trim_end_matches('/'))).collect();
+                    let m = alloc::format!("Ctrl+R: no .run line in {} - type a command here, then Ctrl+R", looked.join(" or "));
+                    self.con.say(console::Tone::Err, &m);
+                    return;
+                }
+            },
+        };
+        let mut w = Line::new(b":: UNA: run src=");
+        w.put(src.as_bytes()).put(b" line=").put(line.as_bytes()).put(b" ::");
+        w.wire();
+        if let console::Act::Quit = self.con.run(&line) {
+            self.quit();
+        }
+    }
+
     fn open_selected(&mut self) {
         match self.tree.selected_file().map(String::from) {
             Some(p) => self.open_path(&p),
@@ -357,7 +493,10 @@ impl App {
         if (k as usize) < self.down.len() {
             self.down[k as usize] = true;
         }
-        // UNAIDE2: the editor's open prompt takes its own keys first (editor.rs `wants`).
+        // UNAIDE2: a tree operation's name prompt, then the editor's open prompt, take their own keys first.
+        if self.ask.is_some() && self.ask_key(k) {
+            return;
+        }
         if self.focus == Pane::Editor && self.tabs[self.cur].wants(k) {
             return self.ed().key(k);
         }
@@ -377,6 +516,8 @@ impl App {
                 return self.switch_to(n);
             }
             0x17 => return self.close_tab(), // UNAIDE2: Ctrl+W
+            0x0E => return self.begin_ask(tree::Op::NewFile), // UNAIDE2: Ctrl+N — a new file, from any pane
+            0x12 => return self.run(),                        // UNAIDE2: Ctrl+R — the Run verb
             0x06 | 0x0C | 0x07 => {
                 // UNAIDE2: Ctrl+F / Ctrl+L / Ctrl+G — the editor's find / replace / line prompt, from any pane
                 self.set_focus(Pane::Editor);
@@ -391,11 +532,15 @@ impl App {
             _ => {}
         }
         match self.focus {
-            Pane::Tree => {
-                if let tree::Act::Open(p) = self.tree.key(k) {
-                    self.open_path(&p);
+            Pane::Tree => match self.tree.key(k) {
+                tree::Act::Open(p) => self.open_path(&p),
+                tree::Act::Ask(op) => self.begin_ask(op),
+                tree::Act::Trash => {
+                    let e = self.tree.trash();
+                    self.say(alloc::format!("trash: refused {} - trash_core moves by rename and ring 3 has no rename door", e));
                 }
-            }
+                tree::Act::None => {}
+            },
             Pane::Editor => self.ed().key(k),
             Pane::Console => {
                 if let console::Act::Quit = self.con.key(k) {
@@ -432,7 +577,15 @@ impl App {
             self.set_focus(Pane::Tree);
             let r = (y - R_TREE.y - 2) / self.lh() - 1;
             if r >= 0 {
+                // UNAIDE2: a press on the row already selected opens it (Enter's act).
+                let i = self.tree.top + r as usize;
+                let again = i == self.tree.sel && i < self.tree.nodes.len();
                 self.tree.select_row(r as usize);
+                if again {
+                    if let tree::Act::Open(p) = self.tree.key(b'\n') {
+                        self.open_path(&p);
+                    }
+                }
             }
         } else if R_ED.has(x, y) {
             self.set_focus(Pane::Editor);
@@ -455,6 +608,25 @@ impl App {
             }
         } else if R_CON.has(x, y) {
             self.set_focus(Pane::Console);
+        }
+    }
+
+    /// UNAIDE2: the pointer shape over (x, y): the hand over the tab strip, the beam over the editor's text and the
+    /// console, the arrow over the tree, the editor's status line and outside the window.
+    fn shape_at(&self, x: i32, y: i32) -> u64 {
+        if R_ED.has(x, y) {
+            let (sy, _) = self.ed_geom();
+            if y < R_ED.y + self.tab_h() {
+                CURSOR_HAND
+            } else if y < sy {
+                CURSOR_TEXT
+            } else {
+                CURSOR_ARROW
+            }
+        } else if R_CON.has(x, y) {
+            CURSOR_TEXT
+        } else {
+            CURSOR_ARROW
         }
     }
 
@@ -661,7 +833,15 @@ impl App {
         let sr = Rect { x: r.x, y: sy, w: r.w, h: r.y + r.h - sy };
         self.fill(sr, th.status_bg);
         let e = &self.tabs[cur];
-        let prompt = e.prompt_text();
+        let prompt = match &self.ask {
+            // UNAIDE2: a tree operation's name prompt has the line first.
+            Some(a) => Some(match a.op {
+                tree::Op::Rename => alloc::format!("rename {} to: {}_", a.base.rsplit('/').next().unwrap_or(&a.base), a.text),
+                tree::Op::NewFile => alloc::format!("new file in {}: {}_", a.base, a.text),
+                tree::Op::NewDir => alloc::format!("new folder in {}: {}_", a.base, a.text),
+            }),
+            None => e.prompt_text(),
+        };
         let asking = prompt.is_some();
         let s = match prompt {
             Some(q) => q,
@@ -798,6 +978,7 @@ pub extern "C" fn _start() -> ! {
         cur: 0,
         tab_hits: Vec::new(),
         saved: false,
+        ask: None,
         con: console::Console::new(root.clone(), con_cols),
         down: [false; 128],
         ptr: None,
@@ -851,10 +1032,10 @@ pub extern "C" fn _start() -> ! {
                 INPUT_EV_MOUSE_ABS => {
                     let (x, y) = una_abi::input_ev_xy(p);
                     app.ptr = Some((x, y));
-                    // CURSORSHAPE (B550): the beam over the editor, the arrow elsewhere. Asked on every pointer
-                    // event, uncached (a focus change resets the shape behind this program's back); the answer
-                    // is ignored — a kernel without the verb leaves the arrow.
-                    let shape = if R_ED.has(x, y) { CURSOR_TEXT } else { CURSOR_ARROW };
+                    // CURSORSHAPE (B550): asked on every pointer event, uncached (a focus change resets the shape
+                    // behind this program's back); the answer is ignored — a kernel without the verb leaves the
+                    // arrow. UNAIDE2: every pane says its shape (`App::shape_at`).
+                    let shape = app.shape_at(x, y);
                     let _ = sys(SYS_CURSOR_SHAPE, shape, 0, 0, 0);
                 }
                 INPUT_EV_BUTTON => app.button(p as u8),
