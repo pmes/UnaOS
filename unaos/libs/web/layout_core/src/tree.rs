@@ -1669,7 +1669,17 @@ pub fn remeasure<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F
                 let Ok(st) = tree.taffy.style(k) else { continue };
                 mc_saved.push((k, st.max_size.width, st.flex_shrink));
                 let mut st = st.clone();
-                st.max_size.width = LengthPercentageAuto::length(w);
+                // AETHERRENDER3 (SR126): `max-width` is a content-box bound under content-box sizing, so a
+                // decorated box gives up its own horizontal border and padding — its BORDER box is the column.
+                let mut cap = w;
+                if st.box_sizing == taffy::style::BoxSizing::ContentBox {
+                    for side in [st.border.left.into_raw(), st.border.right.into_raw(), st.padding.left.into_raw(), st.padding.right.into_raw()] {
+                        if side.tag() == taffy::style::CompactLength::LENGTH_TAG {
+                            cap -= side.value();
+                        }
+                    }
+                }
+                st.max_size.width = LengthPercentageAuto::length(cap.max(0.0));
                 st.flex_shrink = 0.0;
                 let _ = tree.taffy.set_style(k, st);
             }

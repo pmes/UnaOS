@@ -1656,6 +1656,131 @@ fn placed_origin(
     (current_x, current_y)
 }
 
+/// AETHERRENDER3 (SR126): the `text-combine-upright` cell (`InlineLayout::combined`, layout_core inline.rs
+/// `upright_cells`) of the text fragment at staging x `x` on the line of `baseline`, when its glyphs must shrink to
+/// fit it (scale below 1).
+fn combined_cell(il: &layout_core::inline::InlineLayout, x: f32, baseline: f32) -> Option<layout_core::writing::CombinedCell> {
+    let (_, top, _) = layout_core::hit::line_of(il, baseline)?;
+    il.combined.iter().copied().find(|c| (c.cell.x - x).abs() < 0.01 && (c.cell.top - top).abs() < 0.01 && c.scale < 1.0)
+}
+
+/// AETHERRENDER3 (SR126): compresses a combined run drawn at its natural width into its cell (css-writing-modes-4
+/// §9.1: the glyphs are compressed to fit 1em). `pre` is the staging buffer before the run drew; on the rows
+/// `y0` .. `y1` (the line box), the run's natural span `[cell.x, cell.x + cell.w / scale)` (plus 2px of glyph
+/// overhang each side) goes back to `pre`, then each column of the cell takes the box-filtered average of the drawn
+/// columns it covers under the horizontal scale about the cell's start — a column only where the run changed one
+/// of them, so the backdrop outside the glyphs is left as it was.
+fn compress_combined(surface: &mut [u8], pre: &[u8], width: u32, height: u32, c: layout_core::writing::CombinedCell, y0: f32, y1: f32) {
+    if c.scale <= 0.0 || c.scale >= 1.0 {
+        return;
+    }
+    let x0 = c.cell.x;
+    let natural = c.cell.w / c.scale;
+    let (sx0, sx1) = ((x0.floor() as i64 - 2).max(0), ((x0 + natural).ceil() as i64 + 2).min(width as i64));
+    let (dx0, dx1) = (x0.floor() as i64, ((x0 + c.cell.w).ceil() as i64).min(width as i64));
+    if sx1 <= sx0 || dx1 <= dx0 {
+        return;
+    }
+    let (ys, ye) = (y0.max(0.0) as u32, (y1.max(0.0) as u32).min(height));
+    for y in ys..ye {
+        let at = |x: i64| ((y as i64 * width as i64 + x) * 4) as usize;
+        let drawn: Vec<[u8; 4]> = (sx0..sx1).map(|x| {
+            let i = at(x);
+            [surface[i], surface[i + 1], surface[i + 2], surface[i + 3]]
+        }).collect();
+        for x in sx0..sx1 {
+            let i = at(x);
+            surface[i..i + 4].copy_from_slice(&pre[i..i + 4]);
+        }
+        for dx in dx0..dx1 {
+            let a = x0 + (dx as f32 - x0) / c.scale;
+            let b = x0 + (dx as f32 + 1.0 - x0) / c.scale;
+            let (mut acc, mut wsum, mut ink) = ([0.0f32; 3], 0.0f32, false);
+            for s in (a.floor() as i64).max(sx0)..(b.ceil() as i64).min(sx1) {
+                let wgt = (b.min(s as f32 + 1.0) - a.max(s as f32)).max(0.0);
+                let d = drawn[(s - sx0) as usize];
+                let i = at(s);
+                ink |= d[..3] != pre[i..i + 3];
+                for k in 0..3 {
+                    acc[k] += d[k] as f32 * wgt;
+                }
+                wsum += wgt;
+            }
+            if ink && wsum > 0.0 && dx >= 0 {
+                let i = at(dx);
+                for k in 0..3 {
+                    surface[i + k] = (acc[k] / wsum).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// AETHERRENDER3 (SR126): the caret of a vertical editing host — when the selection is collapsed in a Text node of
+/// `il` that sits inside an element whose `contenteditable` is not "false", the text fragment holding the caret and
+/// the caret's byte offset in it (the DOM offset mapped through `layout_core::hit::align`, as the selection painter
+/// maps a range).
+fn editable_caret(layout: &LayoutTree, il: &layout_core::inline::InlineLayout) -> Option<(usize, usize)> {
+    use crate::layout::inline::Frag;
+    let sel = crate::selection::get().filter(|s| s.is_collapsed())?;
+    let p = sel.focus;
+    let mut tid = None;
+    let mut idxs = Vec::new();
+    for (i, f) in il.frags.iter().enumerate() {
+        if let Frag::Text { node, .. } = f {
+            if layout.node_map.get(node).is_some_and(|n| n.id().0 == p.node) {
+                tid = Some(*node);
+                idxs.push(i);
+            }
+        }
+    }
+    let tid = tid?;
+    let dn = layout.node_map.get(&tid)?;
+    let editable = dn.ancestors().any(|a| {
+        a.as_element().is_some_and(|el| el.attributes.borrow().get("contenteditable").is_some_and(|v| !v.trim().eq_ignore_ascii_case("false")))
+    });
+    if !editable {
+        return None;
+    }
+    let texts: Vec<&str> = idxs
+        .iter()
+        .map(|&i| match &il.frags[i] {
+            Frag::Text { text, .. } => text.as_str(),
+            _ => "",
+        })
+        .collect();
+    let maps = layout_core::hit::align(&dn.text_contents(), &texts, layout_core::hit::collapses_at(layout, tid));
+    for (k, &fi) in idxs.iter().enumerate() {
+        let m = maps.get(k)?;
+        let (Some(&first), Some(&last)) = (m.first(), m.last()) else { continue };
+        if p.offset < first || p.offset > last {
+            continue;
+        }
+        let c = m.iter().position(|&o| o >= p.offset).unwrap_or(m.len() - 1);
+        let b = texts[k].char_indices().nth(c).map(|(b, _)| b).unwrap_or(texts[k].len());
+        return Some((fi, b));
+    }
+    None
+}
+
+/// AETHERRENDER3 (SR126): one column fragment's decoration pass (css-break-3 §5.4 `box-decoration-break`) for a box
+/// whose border box sits at screen (`box_sx`, `box_sy`), `bh` tall, painting under `clip`: (origin x, origin y,
+/// height, clip). `slice` paints the whole box moved by the fragment's shift and clipped to the piece's band
+/// (`f.top` .. `f.top + f.height` of the box), so its block-start border, padding and shadow show on the first piece
+/// only and the block-end ones on the last, the background positioned against the whole box; the band is open
+/// above the first piece and below the last (an outer shadow past the box's own block edges still shows) and open
+/// sideways (the box's inline edges are on every piece). `clone` paints a box of its own, `f.height` tall at the
+/// piece's place, with every edge, its own shadow, its background positioned against the piece.
+fn frag_pass(f: &layout_core::multicol::BoxFragment, box_sx: f32, box_sy: f32, bh: f32, clip: Clip) -> (f32, f32, f32, Clip) {
+    let (px, py) = (box_sx + f.shift.0, box_sy + f.shift.1);
+    if f.cloned {
+        return (px, py + f.top, f.height, clip);
+    }
+    let top = if f.edges.0 { clip.1 } else { clip.1.max(py + f.top) };
+    let bottom = if f.edges.1 { clip.3 } else { clip.3.min(py + f.top + f.height) };
+    (px, py, bh, (clip.0, top, clip.2, bottom))
+}
+
 pub fn render_frame(
     layout: &LayoutTree,
     surface: &mut [u8],
@@ -2025,10 +2150,13 @@ pub fn render_frame(
                 // background aligned while scrolling).
                 let box_sx = current_x - sx as f32;
                 let box_sy = current_y - sy as f32;
-                let x_start = (box_sx.max(0.0)) as u32;
-                let y_start = (box_sy.max(0.0)) as u32;
-                let end_x = ((box_sx + bw).max(0.0) as u32).min(width);
-                let end_y = ((box_sy + bh).max(0.0) as u32).min(height);
+                // AETHERRENDER3 (SR126): a box layout_core split across columns (`LayoutTree::col_frags`, css-break-3 §5.4)
+                // paints its shadows, backgrounds and borders once per fragment ([`frag_pass`]); any other box is one pass at
+                // its own place. The span each background loop fills is the CLAMPED screen span of the pass's box.
+                let deco_passes: Vec<(f32, f32, f32, Clip)> = match layout.col_frags.get(&node_id).filter(|f| !f.is_empty()) {
+                    Some(frags) => frags.iter().map(|f| frag_pass(f, box_sx, box_sy, bh, clip)).collect(),
+                    None => vec![(box_sx, box_sy, bh, clip)],
+                };
 
                 // mask-image is an alpha stencil over this box's background
                 // paint: the fill only lands where the mask is opaque. A
@@ -2049,12 +2177,12 @@ pub fn render_frame(
                         (img, g)
                     })
                 });
-                let mask_alpha = |x: u32, y: u32| -> u8 {
+                let mask_alpha = |x: u32, y: u32, ox: f32, oy: f32| -> u8 {
                     match &mask {
                         None => 255,
                         Some(None) => 0,
                         Some(Some((img, g))) => {
-                            let (lx, ly) = (x as f32 - box_sx, y as f32 - box_sy);
+                            let (lx, ly) = (x as f32 - ox, y as f32 - oy);
                             match g.sample(lx, ly, img.width(), img.height()) {
                                 Some((u, v)) => img.get_pixel(u, v).0[3],
                                 None => 0,
@@ -2070,51 +2198,13 @@ pub fn render_frame(
                 // (render/boxpaint.rs) owns the background and the border.
                 let fancy = spec.radius.is_some_and(|r| r.iter().any(|&v| v != 0.0))
                     || spec.border_style.is_some_and(|s| s.iter().any(|&v| v != 0));
-                let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
-                    if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
-                        return;
-                    }
-                    if a >= 0.999 {
-                        put_px(surface, width, x, y, c);
-                    } else if a > 0.0 {
-                        blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
-                    }
-                };
-                // Outer box shadows paint under the box, outside it.
-                if let Some(sh) = spec.shadows.as_ref().filter(|s| !s.is_empty()) {
-                    let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
-                    effects::paint_shadows(sh, box_sx, box_sy, bw, bh, radii, width, height, &boxpaint::sdf, &mut blend_at);
-                }
-                // css-color-4: a translucent background composites source-over.
-                let bga = spec.bg_alpha.unwrap_or(1.0).clamp(0.0, 1.0);
-                let background = spec.background.filter(|_| bga > 0.0);
-                if fancy && mask.is_none() && background.is_some() {
-                    let mut blend_a = |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga);
-                    boxpaint::paint(
-                        box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
-                        [None; 4], background, width, height, &mut blend_a,
-                    );
-                } else if let Some(bg) = background {
-                    let ba = (bga * 255.0).round() as u32;
-                    for y in y_start..end_y {
-                        for x in x_start..end_x {
-                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
-                                continue;
-                            }
-                            match mask_alpha(x, y) as u32 * ba / 255 {
-                                0 => {}
-                                255 => put_px(surface, width, x, y, bg),
-                                a => blend_px(surface, width, x, y, bg, a as u8),
-                            }
-                        }
-                    }
-                }
-
-                if let Some(Some(g)) = spec.bg_gradient.as_ref() {
-                    let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
-                    let (gx, gy) = (box_sx, box_sy);
-                    let cover = move |fx: f32, fy: f32| (0.5 - boxpaint::sdf(fx, fy, gx, gy, gx + bw, gy + bh, radii)).clamp(0.0, 1.0);
-                    let mut blend_g = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                // AETHERRENDER3 (SR126): shadows and backgrounds per column fragment (one pass for an unfragmented box).
+                for &(box_sx, box_sy, bh, clip) in &deco_passes {
+                    let x_start = (box_sx.max(0.0)) as u32;
+                    let y_start = (box_sy.max(0.0)) as u32;
+                    let end_x = ((box_sx + bw).max(0.0) as u32).min(width);
+                    let end_y = ((box_sy + bh).max(0.0) as u32).min(height);
+                    let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                         if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
                             return;
                         }
@@ -2124,67 +2214,112 @@ pub fn render_frame(
                             blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
                         }
                     };
-                    effects::paint_gradient(g, box_sx, box_sy, bw, bh, width, height, &cover, &mut blend_g);
-                }
-                // background-image paints over the color, under content,
-                // honouring background-size / -position / -repeat (the
-                // sprite-sheet idiom is exactly a positioned no-repeat
-                // layer of an intrinsically-sized sheet).
-                if let Some(img) = spec.bg_image.as_deref().and_then(crate::images::get) {
-                    let g = resolve_bg_geometry(
-                        spec.bg_size.as_deref(),
-                        spec.bg_position.as_deref(),
-                        spec.bg_repeat,
-                        bw,
-                        bh,
-                        img.width() as f32,
-                        img.height() as f32,
-                    );
-                    for y in y_start..end_y {
-                        for x in x_start..end_x {
-                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
-                                continue;
-                            }
-                            let Some((u, v)) =
-                                g.sample(x as f32 - box_sx, y as f32 - box_sy, img.width(), img.height())
-                            else {
-                                continue;
-                            };
-                            let [r, gr, b, a] = img.get_pixel(u, v).0;
-                            let a = (a as u32 * mask_alpha(x, y) as u32 / 255) as u8;
-                            if a > 0 {
-                                blend_px(surface, width, x, y, (r, gr, b), a);
+                    // Outer box shadows paint under the box, outside it.
+                    if let Some(sh) = spec.shadows.as_ref().filter(|s| !s.is_empty()) {
+                        let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                        effects::paint_shadows(sh, box_sx, box_sy, bw, bh, radii, width, height, &boxpaint::sdf, &mut blend_at);
+                    }
+                    // css-color-4: a translucent background composites source-over.
+                    let bga = spec.bg_alpha.unwrap_or(1.0).clamp(0.0, 1.0);
+                    let background = spec.background.filter(|_| bga > 0.0);
+                    if fancy && mask.is_none() && background.is_some() {
+                        let mut blend_a = |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga);
+                        boxpaint::paint(
+                            box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
+                            [None; 4], background, width, height, &mut blend_a,
+                        );
+                    } else if let Some(bg) = background {
+                        let ba = (bga * 255.0).round() as u32;
+                        for y in y_start..end_y {
+                            for x in x_start..end_x {
+                                if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                    continue;
+                                }
+                                match mask_alpha(x, y, box_sx, box_sy) as u32 * ba / 255 {
+                                    0 => {}
+                                    255 => put_px(surface, width, x, y, bg),
+                                    a => blend_px(surface, width, x, y, bg, a as u8),
+                                }
                             }
                         }
                     }
-                }
 
-                // Inset box shadows (§7.1.3): over the background, under the
-                // border and content, inside the padding box.
-                if let Some(sh) = spec.shadows.as_ref().filter(|s| s.iter().any(|s| s.inset)) {
-                    let (bl, bt) = (layout_box.border.left, layout_box.border.top);
-                    let (br, bb) = (layout_box.border.right, layout_box.border.bottom);
-                    let outer = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
-                    let inner = [
-                        (outer[0] - bl.max(bt)).max(0.0),
-                        (outer[1] - br.max(bt)).max(0.0),
-                        (outer[2] - br.max(bb)).max(0.0),
-                        (outer[3] - bl.max(bb)).max(0.0),
-                    ];
-                    let mut blend_i = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
-                        if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
-                            return;
+                    if let Some(Some(g)) = spec.bg_gradient.as_ref() {
+                        let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                        let (gx, gy) = (box_sx, box_sy);
+                        let cover = move |fx: f32, fy: f32| (0.5 - boxpaint::sdf(fx, fy, gx, gy, gx + bw, gy + bh, radii)).clamp(0.0, 1.0);
+                        let mut blend_g = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                return;
+                            }
+                            if a >= 0.999 {
+                                put_px(surface, width, x, y, c);
+                            } else if a > 0.0 {
+                                blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                            }
+                        };
+                        effects::paint_gradient(g, box_sx, box_sy, bw, bh, width, height, &cover, &mut blend_g);
+                    }
+                    // background-image paints over the color, under content,
+                    // honouring background-size / -position / -repeat (the
+                    // sprite-sheet idiom is exactly a positioned no-repeat
+                    // layer of an intrinsically-sized sheet).
+                    if let Some(img) = spec.bg_image.as_deref().and_then(crate::images::get) {
+                        let g = resolve_bg_geometry(
+                            spec.bg_size.as_deref(),
+                            spec.bg_position.as_deref(),
+                            spec.bg_repeat,
+                            bw,
+                            bh,
+                            img.width() as f32,
+                            img.height() as f32,
+                        );
+                        for y in y_start..end_y {
+                            for x in x_start..end_x {
+                                if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                    continue;
+                                }
+                                let Some((u, v)) =
+                                    g.sample(x as f32 - box_sx, y as f32 - box_sy, img.width(), img.height())
+                                else {
+                                    continue;
+                                };
+                                let [r, gr, b, a] = img.get_pixel(u, v).0;
+                                let a = (a as u32 * mask_alpha(x, y, box_sx, box_sy) as u32 / 255) as u8;
+                                if a > 0 {
+                                    blend_px(surface, width, x, y, (r, gr, b), a);
+                                }
+                            }
                         }
-                        if a >= 0.999 {
-                            put_px(surface, width, x, y, c);
-                        } else if a > 0.0 {
-                            blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
-                        }
-                    };
-                    effects::paint_inset_shadows(
-                        sh, box_sx + bl, box_sy + bt, (bw - bl - br).max(0.0), (bh - bt - bb).max(0.0), inner,
-                        width, height, &boxpaint::sdf, &mut blend_i,
-                    );
+                    }
+
+                    // Inset box shadows (§7.1.3): over the background, under the
+                    // border and content, inside the padding box.
+                    if let Some(sh) = spec.shadows.as_ref().filter(|s| s.iter().any(|s| s.inset)) {
+                        let (bl, bt) = (layout_box.border.left, layout_box.border.top);
+                        let (br, bb) = (layout_box.border.right, layout_box.border.bottom);
+                        let outer = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
+                        let inner = [
+                            (outer[0] - bl.max(bt)).max(0.0),
+                            (outer[1] - br.max(bt)).max(0.0),
+                            (outer[2] - br.max(bb)).max(0.0),
+                            (outer[3] - bl.max(bb)).max(0.0),
+                        ];
+                        let mut blend_i = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                return;
+                            }
+                            if a >= 0.999 {
+                                put_px(surface, width, x, y, c);
+                            } else if a > 0.0 {
+                                blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                            }
+                        };
+                        effects::paint_inset_shadows(
+                            sh, box_sx + bl, box_sy + bt, (bw - bl - br).max(0.0), (bh - bt - bb).max(0.0), inner,
+                            width, height, &boxpaint::sdf, &mut blend_i,
+                        );
+                    }
                 }
 
                 if tag == "img" {
@@ -2549,76 +2684,79 @@ pub fn render_frame(
                 } else {
                     Vec::new()
                 };
-                if let (true, Some(sides)) = (fancy, border) {
-                    let styles = spec.border_style.unwrap_or([0; 4]);
-                    let mut bs: [boxpaint::Side; 4] = [None; 4];
-                    for i in 0..4 {
-                        bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
-                    }
-                    let bda = spec.border_alpha.unwrap_or(1.0);
-                    let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
-                        let a = a * bda;
-                        if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
-                            return;
+                // AETHERRENDER3 (SR126): the borders per column fragment (one pass for an unfragmented box).
+                for &(box_sx, box_sy, bh, clip) in &deco_passes {
+                    if let (true, Some(sides)) = (fancy, border) {
+                        let styles = spec.border_style.unwrap_or([0; 4]);
+                        let mut bs: [boxpaint::Side; 4] = [None; 4];
+                        for i in 0..4 {
+                            bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
                         }
-                        if a >= 0.999 {
-                            put_px(surface, width, x, y, c);
-                        } else if a > 0.0 {
-                            blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
-                        }
-                    };
-                    boxpaint::paint(
-                        box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
-                        bs, None, width, height, &mut blend_at,
-                    );
-                } else if let Some(sides) = border {
-                    // Same rule as the background/image spans: x_start..end_x
-                    // is the CLAMPED screen span of the unclamped box origin
-                    // (box_sx/box_sy). Re-deriving the end from a clamped
-                    // start pins a scrolled-off box's borders to the viewport
-                    // edge and repeats them on every scroll strip.
-                    // [top, right, bottom, left], each side its own stroke.
-                    // Sides are expressed in unclamped screen floats and the
-                    // stroke clips them into the viewport, so a box whose
-                    // bottom edge lies below the fold does not stamp its
-                    // bottom border across the last visible row.
-                    let (bx0, by0) = (box_sx, box_sy);
-                    let (bx1, by1) = (box_sx + bw, box_sy + bh);
-                    let bda = (spec.border_alpha.unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let mut stroke = |x0: f32, y0: f32, x1: f32, y1: f32, color: (u8, u8, u8)| {
-                        let x0 = x0.max(0.0) as u32;
-                        let y0 = y0.max(0.0) as u32;
-                        let x1 = (x1.max(0.0) as u32).min(width);
-                        let y1 = (y1.max(0.0) as u32).min(height);
-                        for y in y0..y1 {
-                            for x in x0..x1 {
-                                if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
-                                    if bda == 255 {
-                                        put_px(surface, width, x, y, color);
-                                    } else if bda > 0 {
-                                        blend_px(surface, width, x, y, color, bda);
+                        let bda = spec.border_alpha.unwrap_or(1.0);
+                        let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
+                            let a = a * bda;
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                                return;
+                            }
+                            if a >= 0.999 {
+                                put_px(surface, width, x, y, c);
+                            } else if a > 0.0 {
+                                blend_px(surface, width, x, y, c, (a * 255.0).round() as u8);
+                            }
+                        };
+                        boxpaint::paint(
+                            box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
+                            bs, None, width, height, &mut blend_at,
+                        );
+                    } else if let Some(sides) = border {
+                        // Same rule as the background/image spans: x_start..end_x
+                        // is the CLAMPED screen span of the unclamped box origin
+                        // (box_sx/box_sy). Re-deriving the end from a clamped
+                        // start pins a scrolled-off box's borders to the viewport
+                        // edge and repeats them on every scroll strip.
+                        // [top, right, bottom, left], each side its own stroke.
+                        // Sides are expressed in unclamped screen floats and the
+                        // stroke clips them into the viewport, so a box whose
+                        // bottom edge lies below the fold does not stamp its
+                        // bottom border across the last visible row.
+                        let (bx0, by0) = (box_sx, box_sy);
+                        let (bx1, by1) = (box_sx + bw, box_sy + bh);
+                        let bda = (spec.border_alpha.unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let mut stroke = |x0: f32, y0: f32, x1: f32, y1: f32, color: (u8, u8, u8)| {
+                            let x0 = x0.max(0.0) as u32;
+                            let y0 = y0.max(0.0) as u32;
+                            let x1 = (x1.max(0.0) as u32).min(width);
+                            let y1 = (y1.max(0.0) as u32).min(height);
+                            for y in y0..y1 {
+                                for x in x0..x1 {
+                                    if in_damage(x, y, damage_rects) && in_clip(x, y, clip) {
+                                        if bda == 255 {
+                                            put_px(surface, width, x, y, color);
+                                        } else if bda > 0 {
+                                            blend_px(surface, width, x, y, color, bda);
+                                        }
                                     }
                                 }
                             }
+                        };
+                        // A zero-width side draws NOTHING. `border-width: 0`
+                        // with a style and colour still set is the single most
+                        // common declaration on the web (every Tailwind/reset
+                        // preflight opens with it); rounding it up to a hairline
+                        // outlines every box on the page.
+                        let px = |w: f32| if w > 0.0 { w.max(1.0) } else { 0.0 };
+                        if let Some((w, c)) = sides[0].filter(|(w, _)| *w > 0.0) {
+                            stroke(bx0, by0, bx1, by0 + px(w), c);
                         }
-                    };
-                    // A zero-width side draws NOTHING. `border-width: 0`
-                    // with a style and colour still set is the single most
-                    // common declaration on the web (every Tailwind/reset
-                    // preflight opens with it); rounding it up to a hairline
-                    // outlines every box on the page.
-                    let px = |w: f32| if w > 0.0 { w.max(1.0) } else { 0.0 };
-                    if let Some((w, c)) = sides[0].filter(|(w, _)| *w > 0.0) {
-                        stroke(bx0, by0, bx1, by0 + px(w), c);
-                    }
-                    if let Some((w, c)) = sides[2].filter(|(w, _)| *w > 0.0) {
-                        stroke(bx0, by1 - px(w), bx1, by1, c);
-                    }
-                    if let Some((w, c)) = sides[3].filter(|(w, _)| *w > 0.0) {
-                        stroke(bx0, by0, bx0 + px(w), by1, c);
-                    }
-                    if let Some((w, c)) = sides[1].filter(|(w, _)| *w > 0.0) {
-                        stroke(bx1 - px(w), by0, bx1, by1, c);
+                        if let Some((w, c)) = sides[2].filter(|(w, _)| *w > 0.0) {
+                            stroke(bx0, by1 - px(w), bx1, by1, c);
+                        }
+                        if let Some((w, c)) = sides[3].filter(|(w, _)| *w > 0.0) {
+                            stroke(bx0, by0, bx0 + px(w), by1, c);
+                        }
+                        if let Some((w, c)) = sides[1].filter(|(w, _)| *w > 0.0) {
+                            stroke(bx1 - px(w), by0, bx1, by1, c);
+                        }
                     }
                 }
                 for (x, y, p) in corners {
@@ -2965,6 +3103,10 @@ pub fn render_frame(
                 }
             }
             let vinit = vbuf.clone();
+            // AETHERRENDER3 (SR126): a collapsed selection in an editing host of this vertical IFC — the text box
+            // holding it (fragment, byte) and, once that box is drawn, its physical caret rect and colour.
+            let vcaret_at = if vmode != 0 { editable_caret(layout, ifc) } else { None };
+            let mut vcaret: Option<((f32, f32, f32, f32), (u8, u8, u8))> = None;
             {
             let vdamage = [(0u32, 0u32, vbw, vbh)];
             #[allow(clippy::type_complexity)]
@@ -3097,6 +3239,17 @@ pub fn render_frame(
                             t.borrow_mut().push(TextBox { ifc: node_id, frag: fi, node: *node, x: ox + rx, w: fw, top: ltop + ry, bottom: lbot + ry, adv, scroll: (sx, sy) })
                         });
                         let deco = Deco { underline: i.underline, line_through: i.line_through };
+                        // AETHERRENDER3 (SR126): the caret of an editable vertical field — `layout_core::hit::caret_rect` maps the
+                        // caret offset of this text box to the physical bar (a horizontal bar across the column), painted on the
+                        // page once the staging buffer is composited.
+                        if let Some((_, cb)) = vcaret_at.filter(|&(cf, _)| cf == fi) {
+                            let tb = layout_core::hit::TextBox { ifc: node_id, frag: fi, node: *node, x: ox + rx, w: fw, top: ltop + ry, bottom: lbot + ry };
+                            vcaret = Some((layout_core::hit::caret_rect(ifc, &tb, crate::selection::caret_x(&adv, text, cb)), i.color));
+                        }
+                        // AETHERRENDER3 (SR126): a `text-combine-upright` run is drawn at its natural width, then compressed into its
+                        // 1em cell by `cell.scale` about the cell's start ([`compress_combined`]).
+                        let combined = if vmode != 0 { combined_cell(ifc, *x, *baseline) } else { None };
+                        let pre_combine = combined.map(|_| surface.to_vec());
                         if let Some(marks) = mark_plan.get(&fi) {
                             for &(m0, m1) in marks {
                                 let (hx0, hx1) = (
@@ -3151,6 +3304,9 @@ pub fn render_frame(
                                 }
                             }
                         }
+                        if let (Some(c), Some(pre)) = (combined, pre_combine.as_deref()) {
+                            compress_combined(surface, pre, width, height, c, ltop, lbot);
+                        }
                     }
                     crate::layout::inline::Frag::Atomic { node, x, y } => {
                         if skip.contains(node) || is_layered(layout, *node) {
@@ -3184,6 +3340,10 @@ pub fn render_frame(
                         let si = ((pyu * width + pxu) * 4) as usize;
                         surface[si..si + 4].copy_from_slice(&vbuf[di..di + 4]);
                     }
+                }
+                if let Some(((cx, cy, cw, ch), color)) = vcaret {
+                    let (x0, y0) = (cx.floor(), cy.floor());
+                    fill_rect(x0, y0, x0 + cw.round().max(1.0), y0 + ch.round().max(1.0), color, 255, surface, width, height, damage_rects, child_clip);
                 }
             }
         }

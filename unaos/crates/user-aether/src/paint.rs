@@ -210,8 +210,110 @@ fn first_baseline(tree: &Tree, id: NodeId) -> Option<f32> {
     first_baseline(tree, k).map(|b| b + kl.location.y)
 }
 
-/// Paint box `id` with its border box's top-left at (`x`, `y`) on the canvas.
+/// AETHERRENDER3 (SR126): paint box `id` with its border box's top-left at (`x`, `y`) on the canvas, through its
+/// `filter` (Filter Effects 1 §5) when it has one: the box is drawn as a GROUP — the canvas is snapshotted, the box
+/// and its subtree paint ([`paint_box_plain`]), the pixels they changed become a straight-alpha layer padded by the
+/// list's reach, the layer runs through the shared raster path (`layout_core::effects::filter_rgba_refs`: svg_core's
+/// CSS filter functions, and a `url(#id)` through the page's `<filter>` serialized from the arena's `attrs`), and the
+/// result composites source-over onto the snapshot — the host's `render::filter_group` shape. A filter the canvas
+/// cannot afford (the snapshot or the layer not allocatable) leaves the box unfiltered.
 fn paint_box(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
+    let tree = cx.tree;
+    let filter = tree
+        .paint_map
+        .get(&id)
+        .filter(|p| !p.hidden.unwrap_or(false))
+        .and_then(|p| p.filter.as_ref())
+        .and_then(|f| f.as_deref());
+    let (Some(value), Ok(l)) = (filter, tree.taffy.layout(id)) else {
+        paint_box_plain(cv, cx, id, x, y);
+        return;
+    };
+    let (w, h) = (l.size.width, l.size.height);
+    if y > cv.h as f32 || tree.taffy.style(id).is_ok_and(|s| s.display == taffy::style::Display::None) {
+        return;
+    }
+    let mut snap: Vec<u32> = Vec::new();
+    if snap.try_reserve_exact(cv.px.len()).is_err() {
+        paint_box_plain(cv, cx, id, x, y);
+        return;
+    }
+    snap.extend_from_slice(&cv.px);
+    paint_box_plain(cv, cx, id, x, y);
+    let ink = cx.inks.get(&id).map(|i| (i.color, i.size)).unwrap_or((crate::theme::PAGE_INK, 16.0));
+    let fcx = layout_core::effects::FilterCx {
+        scale: 1.0,
+        font_size: tree.paint_map.get(&id).and_then(|p| p.used_font_size).unwrap_or(ink.1),
+        viewport: (cv.w as f32, cv.h as f32),
+        color: ((ink.0 >> 16) as u8, (ink.0 >> 8) as u8, ink.0 as u8),
+    };
+    let resolve = |rid: &str| tree.node_map.get(&id).and_then(|n| layout_core::effects::resolve_filter(n, rid));
+    filter_group(cv, &snap, value, &fcx, (x, y, w, h), &resolve);
+}
+
+/// AETHERRENDER3 (SR126): the `filter` group of [`paint_box`] — `snap` is the canvas before the box painted, `rect`
+/// the box's border box (x, y, w, h, canvas px), the referenced `<filter>`'s bounding box.
+fn filter_group(cv: &mut Canvas, snap: &[u32], value: &str, fcx: &layout_core::effects::FilterCx, rect: (f32, f32, f32, f32), resolve: &dyn Fn(&str) -> Option<alloc::string::String>) {
+    let (cw, ch) = (cv.w as i64, cv.h as i64);
+    let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, -1i64, -1i64);
+    for y in 0..ch {
+        let row = (y * cw) as usize;
+        for x in 0..cw {
+            if cv.px[row + x as usize] != snap[row + x as usize] {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < x0 || y1 < y0 {
+        return; // the group drew nothing
+    }
+    let m = layout_core::effects::filter_margin_box(value, fcx, rect.2, rect.3) as i64;
+    let (rx0, ry0) = ((x0 - m).max(0), (y0 - m).max(0));
+    let (rx1, ry1) = ((x1 + 1 + m).min(cw), (y1 + 1 + m).min(ch));
+    let (lw, lh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
+    if lw == 0 || lh == 0 {
+        return;
+    }
+    let mut layer: Vec<u8> = Vec::new();
+    if layer.try_reserve_exact(lw * lh * 4).is_err() {
+        return; // unaffordable: the box stays as painted, unfiltered
+    }
+    layer.resize(lw * lh * 4, 0);
+    for y in 0..lh {
+        let row = ((ry0 as usize + y) * cw as usize) + rx0 as usize;
+        for x in 0..lw {
+            let (c, b) = (cv.px[row + x], snap[row + x]);
+            if c != b {
+                let o = (y * lw + x) * 4;
+                layer[o..o + 4].copy_from_slice(&[(c >> 16) as u8, (c >> 8) as u8, c as u8, 255]);
+            }
+        }
+    }
+    let bbox = (rect.0 - rx0 as f32, rect.1 - ry0 as f32, rect.2, rect.3);
+    if !layout_core::effects::filter_rgba_refs(&mut layer, lw, lh, value, fcx, bbox, resolve) {
+        return;
+    }
+    // the changed pixels return to the backdrop, then the filtered layer composites over it
+    for y in y0..=y1 {
+        let row = (y * cw) as usize;
+        cv.px[row + x0 as usize..=row + x1 as usize].copy_from_slice(&snap[row + x0 as usize..=row + x1 as usize]);
+    }
+    for y in 0..lh {
+        let row = ((ry0 as usize + y) * cw as usize) + rx0 as usize;
+        for x in 0..lw {
+            let o = (y * lw + x) * 4;
+            let b = snap[row + x];
+            let (r, g, bl) = layout_core::effects::over(((b >> 16) as u8, (b >> 8) as u8, b as u8), [layer[o], layer[o + 1], layer[o + 2], layer[o + 3]]);
+            cv.px[row + x] = ((r as u32) << 16) | ((g as u32) << 8) | bl as u32;
+        }
+    }
+}
+
+/// Paint box `id` (unfiltered) with its border box's top-left at (`x`, `y`) on the canvas.
+fn paint_box_plain(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
     let tree = cx.tree;
     let Ok(l) = tree.taffy.layout(id) else { return };
     if tree.taffy.style(id).is_ok_and(|s| s.display == taffy::style::Display::None) {
