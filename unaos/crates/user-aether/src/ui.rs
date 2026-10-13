@@ -93,23 +93,11 @@ impl Flat {
         }
     }
 
-    /// Every match of `q` (ASCII case folded) as flat start offsets.
-    pub fn find(&self, q: &str) -> Vec<usize> {
-        let mut out = Vec::new();
-        if q.is_empty() {
-            return out;
-        }
-        let hay = self.text.to_ascii_lowercase();
-        let needle = q.to_ascii_lowercase();
-        let mut from = 0;
-        while let Some(k) = hay[from..].find(needle.as_str()) {
-            out.push(from + k);
-            from += k + needle.len().max(1);
-            if from >= hay.len() {
-                break;
-            }
-        }
-        out
+    /// Every match of `q` as flat byte ranges — AETHERMETAL4 (SR109): the host chrome's matcher
+    /// (`chrome::find::find_all`: simple Unicode case folding, non-overlapping, left to right), so a match's length
+    /// is its own, not the query's.
+    pub fn find(&self, q: &str) -> Vec<(usize, usize)> {
+        crate::chrome::find::find_all(&self.text, q)
     }
 
     /// The box holding flat offset `o` (the last box starting at or before it).
@@ -191,10 +179,10 @@ pub fn clip_text(s: &str) -> Vec<u8> {
     out
 }
 
-/// The find bar: the query, its matches (flat offsets), the current one.
+/// The find bar: the query, its matches (flat byte ranges), the current one.
 #[derive(Default)]
 pub struct Find {
     pub q: String,
-    pub hits: Vec<usize>,
+    pub hits: Vec<(usize, usize)>,
     pub cur: usize,
 }

@@ -55,7 +55,7 @@
 //   `:: AETHER: clip -> PASS set=<rc> chars=<n> ::` (FAIL with the refusal's code: -EACCES when not focused).
 // * KEYS. Tab focuses the next link (outlined, scrolled into view; `:: AETHER: focus -> PASS href=<h>
 //   at=<x0>,<y>,<x1> ::` — the link's first text box in window pixels, what `tests aether` aims the pointer at),
-//   Enter follows it. Ctrl+F (0x06) or `/` opens the FIND BAR over the page text: typing searches (ASCII case
+//   Enter follows it. Ctrl+F (0x06) or `/` opens the FIND BAR over the page text: typing searches (SR109: the host model's simple case
 //   folded), Enter steps to the next match, Esc closes; matches paint yellow, the current one orange. Esc with
 //   nothing open exits, as before.
 //
@@ -63,6 +63,14 @@
 // `system.appearance.*` over the PREFS bus, the kernel palette's Light/Dark rows), read once at start and again when
 // the store moves (`theme::due`, PrefChanged's ring-3 stand-in); the page's own initial colours are `theme::PAGE_*`.
 // `:: AETHER: theme mode=<light|dark> accent=<name> bus=<0|-errno> ::` at start and on every change.
+//
+// AETHERMETAL4 (LEDGER SR109): THE CHROME — tabs, the omnibox, per-tab session history, find, bookmarks and history
+// under the home, downloads, zoom — is `chrome.rs` over the host chrome's own model (and `store.rs`, the files).
+// Here: every ring event goes through `chrome::input` first (`None` = taken; a pointer event comes back in PAGE px,
+// below the chrome and under the zoom, so everything below reads the page's own CSS px); `App::w`/`App::h` are the
+// page's LOGICAL size; `App::hist` is the tab's `SessionHistory`; `load` asks the chrome for the new-tab page and
+// tells it what loaded; a link to a file Aether does not render is a download; the frame goes up through
+// `chrome::blit` (the chrome on top, the page scaled under it).
 
 extern crate alloc;
 
@@ -73,6 +81,8 @@ mod sys;
 mod theme;
 mod txt;
 mod ui;
+mod chrome; // AETHERMETAL4 (SR109): the chrome (tabs, omnibox, history, bookmarks, downloads, zoom)
+mod store; // AETHERMETAL4 (SR109): the chrome's files under the home (SYS_WHOAMI + SYS_PATH_*)
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -82,7 +92,7 @@ use layout_core::hit::TextBox;
 use layout_core::{FontSel, NodeMap};
 use una_abi::{
     input_ev_payload, input_ev_type, input_ev_xy, INPUT_EV_ACTION, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, INPUT_EV_WHEEL,
-    INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
+    INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP, SYS_INPUT_POLL, SYS_WIN_CREATE,
     CURSOR_ARROW, CURSOR_HAND, CURSOR_TEXT, SYS_CURSOR_SHAPE,
 };
 
@@ -264,8 +274,9 @@ struct App {
     focus: Option<usize>,
     find: Option<ui::Find>,
     flash: Option<(String, u64)>,
-    hist: Vec<String>,
-    at: usize,
+    /// AETHERMETAL4 (SR109): the active tab's session history (the host model), and the chrome.
+    hist: chrome::history::SessionHistory,
+    ch: chrome::Chrome,
 }
 
 impl App {
@@ -304,17 +315,6 @@ impl App {
     }
     fn visible(&self) -> bool {
         (unsafe { self.flags.read_volatile() } & 2) == 0 // VUGMIN: bit 1 = every window hidden
-    }
-    /// Copy the back buffer onto the surface (stride MAX_W) and present.
-    fn blit(&self, cv: &paint::Canvas) {
-        for y in 0..cv.h.min(MAX_H) {
-            let row = unsafe { self.surf.add(y as usize * STRIDE) as *mut u32 };
-            for x in 0..cv.w.min(MAX_W) {
-                let c = cv.px[(y * cv.w + x) as usize];
-                unsafe { row.add(x as usize).write_volatile(0xFF00_0000 | c) };
-            }
-        }
-        sys(SYS_WIN_PRESENT, self.win as u64, 0, 0, 0);
     }
 }
 
@@ -453,7 +453,8 @@ fn fetch(path: &str) -> Result<(Vec<u8>, String), i64> {
 
 /// Load `path` as the page (`push` = a new history entry; Back/Forward move along the list instead).
 fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how: &[u8], push: bool) {
-    let (html, got, code) = match fetch(path) {
+    let fetched = if path == chrome::NEWTAB { Ok((chrome::newtab_html(app).into_bytes(), String::from(path))) } else { fetch(path) }; // SR109
+    let (html, got, code) = match fetched {
         Ok((b, got)) => (String::from_utf8_lossy(&b).into_owned(), Some(got), 0),
         Err(e) => (
             alloc::format!(
@@ -476,9 +477,7 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
     app.find = None;
     app.reset_view();
     if push {
-        app.hist.truncate(app.at + 1);
-        app.hist.push(page.path.clone());
-        app.at = app.hist.len() - 1;
+        app.hist.push_document(&page.path);
     }
     let mut l = Line::new(b":: AETHER: nav -> ");
     if read && page.lines > 0 {
@@ -487,9 +486,10 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
         l.put(b"FAIL reason=").put(if read { b"no-lines" as &[u8] } else { b"no-page" }).put(b" code=").dec(code).put(b" how=").put(how);
     }
     l.put(b" path=").put(cut(page.path.as_bytes(), 72)).put(b" lines=").dec(page.lines as i64);
-    l.put(b" hist=").dec(app.at as i64 + 1).put(b"/").dec(app.hist.len() as i64).put(b" ::");
+    l.put(b" hist=").dec(app.hist.index() as i64 + 1).put(b"/").dec(app.hist.len() as i64).put(b" ::");
     l.wire();
     app.flash(if read { page.path.clone() } else { alloc::format!("not found: {}", path) });
+    chrome::loaded(app, page, read);
 }
 
 /// Follow `href` from the current page.
@@ -500,50 +500,50 @@ fn follow(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, href: &str, ho
             app.flash(alloc::format!("cannot open {}", href));
         }
         Ok((path, frag)) if path == page.path && frag.is_some() => {
-            // Same document: scroll to the element with that id (its first text box).
+            // Same document: scroll to the element with that id (its first text box); a same-document entry (SR109).
             let id = frag.unwrap_or_default();
-            let target = page.doc.descendants(html_core::Document::ROOT).find(|&n| page.doc.element(n).is_some_and(|e| e.attr("id") == Some(id.as_str())));
-            let top = target.and_then(|t| {
-                page.boxes.iter().position(|b| {
-                    page.tree.as_ref().and_then(|tr| tr.node_map.get(&b.node)).is_some_and(|n| {
-                        let mut c = Some(n.id);
-                        while let Some(x) = c {
-                            if x == t {
-                                return true;
-                            }
-                            c = page.doc.parent(x);
-                        }
-                        false
-                    })
-                })
-            });
-            if let Some(i) = top {
-                let b = page.boxes[i];
-                app.scroll_to(b.top - 4.0, page);
-            }
+            let top = scroll_to_frag(app, page, &id);
+            app.hist.push_same_document(&alloc::format!("{}#{}", page.path, id), None);
             let mut l = Line::new(b":: AETHER: nav -> ");
-            l.put(if top.is_some() { b"PASS" as &[u8] } else { b"FAIL reason=no-anchor" }).put(b" how=").put(how);
+            l.put(if top { b"PASS" as &[u8] } else { b"FAIL reason=no-anchor" }).put(b" how=").put(how);
             l.put(b" path=").put(cut(page.path.as_bytes(), 72)).put(b" frag=").put(cut(id.as_bytes(), 32)).put(b" ::");
             l.wire();
         }
+        Ok((path, _)) if chrome::is_download(&path) => chrome::download(app, &path, b"link"), // SR109
         Ok((path, _)) => load(app, page, fonts, &path, how, true),
     }
 }
 
-fn back(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts) {
-    if app.at > 0 {
-        app.at -= 1;
-        let p = app.hist[app.at].clone();
-        load(app, page, fonts, &p, b"back", false);
+/// Scroll to the element with id `id` (its first text box); whether there was one.
+fn scroll_to_frag(app: &mut App, page: &Page, id: &str) -> bool {
+    let target = page.doc.descendants(html_core::Document::ROOT).find(|&n| page.doc.element(n).is_some_and(|e| e.attr("id") == Some(id)));
+    let top = target.and_then(|t| {
+        page.boxes.iter().position(|b| {
+            page.tree.as_ref().and_then(|tr| tr.node_map.get(&b.node)).is_some_and(|n| {
+                let mut c = Some(n.id);
+                while let Some(x) = c {
+                    if x == t {
+                        return true;
+                    }
+                    c = page.doc.parent(x);
+                }
+                false
+            })
+        })
+    });
+    if let Some(i) = top {
+        let b = page.boxes[i];
+        app.scroll_to(b.top - 4.0, page);
     }
+    top.is_some()
+}
+
+fn back(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts) {
+    chrome::traverse(app, page, fonts, -1); // SR109: the tab's SessionHistory
 }
 
 fn forward(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts) {
-    if app.at + 1 < app.hist.len() {
-        app.at += 1;
-        let p = app.hist[app.at].clone();
-        load(app, page, fonts, &p, b"fwd", false);
-    }
+    chrome::traverse(app, page, fonts, 1);
 }
 
 /// Tab: focus the next link, scroll it into view, say where its first text box is.
@@ -563,7 +563,8 @@ fn focus_next(app: &mut App, page: &Page) {
             app.reveal(b.top, b.bottom, page);
             let y = ((b.top + b.bottom) / 2.0 - app.scroll) as i64;
             let mut l = Line::new(b":: AETHER: focus -> PASS href=");
-            l.put(cut(h.as_bytes(), 48)).put(b" at=").dec(b.x as i64 + 1).put(b",").dec(y).put(b",").dec((b.x + b.w) as i64).put(b" ::");
+            let ((x0, wy), (x1, _)) = (chrome::to_window(app, b.x + 1.0, y as f32), chrome::to_window(app, b.x + b.w, 0.0)); // SR109: window px
+            l.put(cut(h.as_bytes(), 48)).put(b" at=").dec(x0).put(b",").dec(wy).put(b",").dec(x1).put(b" ::");
             l.wire();
         }
         None => {
@@ -601,9 +602,9 @@ fn find_refresh(app: &mut App, page: &Page, step: bool) {
     } else {
         f.hits = page.flat.find(&f.q);
         let scroll = app.scroll;
-        f.cur = f.hits.iter().position(|&h| page.flat.box_at(h).is_some_and(|i| page.boxes[i].top >= scroll)).unwrap_or(0);
+        f.cur = f.hits.iter().position(|&(h, _)| page.flat.box_at(h).is_some_and(|i| page.boxes[i].top >= scroll)).unwrap_or(0);
     }
-    let at = f.hits.get(f.cur).copied();
+    let at = f.hits.get(f.cur).map(|h| h.0);
     let (n, cur) = (f.hits.len(), f.cur);
     if step {
         let mut l = Line::new(b":: AETHER: find -> ");
@@ -621,9 +622,9 @@ fn find_refresh(app: &mut App, page: &Page, step: bool) {
 fn marks(app: &App, page: &Page) -> NodeMap<Vec<paint::Mark>> {
     let mut m = NodeMap::new();
     if let Some(f) = &app.find {
-        for (k, &h) in f.hits.iter().enumerate() {
+        for (k, &(h, e)) in f.hits.iter().enumerate() {
             let kind = if k == f.cur { paint::MarkKind::FindCur } else { paint::MarkKind::Find };
-            page.flat.marks(&page.boxes, h, h + f.q.len(), kind, &mut m);
+            page.flat.marks(&page.boxes, h, e, kind, &mut m);
         }
     }
     if let Some((a, b)) = app.sel {
@@ -681,7 +682,7 @@ pub extern "C" fn _start() -> ! {
         surf: (base + 0x5000) as *mut u8,
         flags: unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4) },
         w: MAX_W,
-        h: MAX_H,
+        h: MAX_H - chrome::CHROME_H, // SR109: the page's logical size, below the chrome at 100 %
         scroll: 0.0,
         dirty: true,
         relayout: false,
@@ -697,8 +698,8 @@ pub extern "C" fn _start() -> ! {
         focus: None,
         find: None,
         flash: None,
-        hist: Vec::new(),
-        at: 0,
+        hist: chrome::history::SessionHistory::new(),
+        ch: chrome::Chrome::new(),
     };
 
     // The page off the volume.
@@ -756,7 +757,8 @@ pub extern "C" fn _start() -> ! {
     drop(html);
     let mut fonts = txt::Fonts(RefCell::new(txt));
     lay(&mut page, &mut fonts, app.w, app.h);
-    app.hist.push(page.path.clone());
+    app.hist.push_document(&page.path);
+    chrome::start(&mut app, &page); // SR109: the person's files, the first tab's title
     let mut cv = paint::Canvas::new(app.w, app.h);
     let mut reported = false;
 
@@ -767,7 +769,11 @@ pub extern "C" fn _start() -> ! {
             if ev < 0 {
                 break;
             }
-            let ev = ev as u64;
+            // SR109: the chrome first — `None` it took the event; a pointer event comes back in page px.
+            let Some(ev) = chrome::input(&mut app, &mut page, &mut fonts, ev as u64) else {
+                k += 1;
+                continue;
+            };
             let p = input_ev_payload(ev);
             let page_step = (app.h as f32 - STEP).max(STEP);
             match input_ev_type(ev) {
@@ -953,7 +959,7 @@ pub extern "C" fn _start() -> ! {
                 report(path, src.is_some(), &page, &cv, now_ms().saturating_sub(t_parse), now_ms().saturating_sub(t0));
             }
             overlay(&app, &page, &mut cv, &fonts);
-            app.blit(&cv);
+            chrome::blit(&app, &cv, &fonts); // SR109: the chrome on top, the page under it
             app.dirty = false;
         }
         sleep_ms(16);

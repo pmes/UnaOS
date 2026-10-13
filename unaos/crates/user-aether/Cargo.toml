@@ -39,6 +39,10 @@ css_core = { path = "../../libs/web/css_core" }
 font_core = { path = "../../libs/text/font_core" }
 layout_core = { path = "../../libs/web/layout_core" }
 font8x8 = { version = "0.3.1", default-features = false }
+# AETHERMETAL4 (SR109): the omnibox's buffer of record — Tabula's editing core (SR73), the one the host Tabula and
+# UNA.ELF link. The chrome's MODEL is not a dependency: handlers/aether/src/chrome/*.rs (std-free) are linked by
+# `#[path]` from src/chrome.rs, because the crate around them is std.
+edit_core = { path = "../../libs/text/edit_core" }
 
 # SR66: `cryptocore` is RESERVED (the media build line is Lumen's; M1 opens no connection, so it gates nothing).
 [features]
