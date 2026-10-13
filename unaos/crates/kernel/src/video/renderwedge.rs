@@ -355,7 +355,7 @@ mod imp {
     fn watch_task(_arg: usize) {
         loop {
             crate::arch::sched::sleep_ms(WATCH_MS);
-            look(crate::arch::ms());
+            look(crate::arch::ms()); crate::sessionwedge::look(crate::arch::ms()); // SESSIONWEDGE (B525): the usb-pump's stamp, read from this sibling core (same-line fold)
         }
     }
 
@@ -422,7 +422,7 @@ mod imp {
     pub fn ensure_tests() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, AcqRel) {
-            crate::tests::register("renderwedge", selftest);
+            crate::tests::register("renderwedge", selftest); crate::sessionwedge::ensure_tests(); // SESSIONWEDGE (B525): `tests sessionwedge` (same-line fold)
         }
     }
 

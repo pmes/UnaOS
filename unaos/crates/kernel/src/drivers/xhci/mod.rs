@@ -13840,7 +13840,7 @@ impl XhciController {
             }
             crate::hlt();
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
-            if elapsed >= budget {
+            if elapsed >= budget && !self.ftdi_done_late() { // SESSIONWEDGE (B525): a budget spent while this task was off its core is not a dead cable — one last look at the ring first (file tail)
                 FTDI_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 serial_println!(
                     ":: FTDI: tx pump budget={} used={} n={} timeouts={} result=TIMEOUT ::",
@@ -17828,4 +17828,42 @@ fn poll_task(_: usize) {
             crate::video::lag::xhci_polled();
         }
     }
+}
+
+// ── SESSIONWEDGE (rmbp-ledger B525): the console sink is never disabled by its own pump's preemption ──────────────────
+//
+// `pump_until_ftdi_done` waits for its bulk-OUT completion in a `drain → hlt → elapsed?` loop on the `usb-pump` task,
+// which is preemptible (pinned cores, arch/x86_64/sched.rs:14-18). The budget is WALL-CLOCK (`now_cycles`), so a pump
+// kept off its core past `hw_wait_budget()` (~2 s) — a masked holder on the pump core, a run of siblings — came back
+// from its `hlt` and declared TIMEOUT without looking at the ring again, though the completion had long since landed;
+// `disable_ftdi_tx("timeout")` then turned the cable off FOR THE BOOT, mid-line, and its own line never reached the
+// wire (it rides the sink it just killed). One last drain decides it now: done = carry on; still pending = a real
+// timeout, exactly as before.
+impl XhciController {
+    /// The in-flight FTDI transfer, after one last full drain of the event ring: `true` = its completion was there.
+    fn ftdi_done_late(&mut self) -> bool {
+        let mut n = 0u32;
+        while n < 4096 && self.drain_event_ring_once() {
+            n += 1;
+        }
+        let done = matches!(&self.ftdi_pending, Some(p) if p.done) || self.ftdi_pending.is_none();
+        if done {
+            FTDI_LATE_SAVES.fetch_add(1, Ordering::Relaxed);
+        }
+        done
+    }
+}
+
+/// SESSIONWEDGE: FTDI transfers whose wait outlived the budget off-core and were found complete on the last look.
+static FTDI_LATE_SAVES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// SESSIONWEDGE (`tests sessionwedge`): the `xhci-poll` task was started (QUEUESLEEP, B512). It sleeps one tick per pass
+/// and holds the loan only for `poll_events`, so a `Busy` it causes costs the pump one pass, never the cable.
+#[cfg(target_arch = "x86_64")]
+pub fn poll_task_armed() -> bool {
+    POLL_TASK.load(Ordering::Relaxed)
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn poll_task_armed() -> bool {
+    false
 }

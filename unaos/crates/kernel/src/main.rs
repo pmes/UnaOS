@@ -5882,7 +5882,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
-        unaos_kernel::video::lag::pump_nap(); unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); // QUEUESLEEP (B512): the nap is measured (`pump_what=nap pump_wait=hlt` when the core kept the loop past the tick).  INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
+        unaos_kernel::video::lag::pump_nap(); unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); #[cfg(feature = "wc")] unaos_kernel::sessionwedge::stamp(); // SESSIONWEDGE (B525): the pump's liveness stamp, every pass — RENDERWEDGE's watch reads it (same-line fold, code first).  QUEUESLEEP (B512): the nap is measured (`pump_what=nap pump_wait=hlt` when the core kept the loop past the tick).  INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
         // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
         // safe non-event context).
         //
