@@ -357,7 +357,9 @@ pub fn rasterize_glyph_hinted(
     mode: RenderMode,
     hinting: crate::hint::Hinting,
 ) -> Option<GlyphBitmap> {
-    if hinting == crate::hint::Hinting::None || !hinter.hintable {
+    // FONTSCRAFT (B640): the auto-hinter reads the stored (default-master) points; an instanced variable face draws
+    // its varied outline unhinted (DESIGN-LANGUAGE §2.2: no hinting at scale >= 2) rather than the wrong master.
+    if hinting == crate::hint::Hinting::None || !hinter.hintable || font.is_instanced() {
         return rasterize_glyph_mode(font, gid, size, sub_x, sub_y, mode);
     }
     match hinter.hint(font, gid, size) {

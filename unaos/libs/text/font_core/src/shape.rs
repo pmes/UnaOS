@@ -113,7 +113,7 @@ impl Plan {
         self.masks.iter().find(|m| m.0 == tag).map_or(0, |m| m.1)
     }
 
-    fn new(font: &Font, script: Script, rtl: bool, opts: &ShapeOptions) -> Plan {
+    fn new(font: &Font, script: Script, rtl: bool, opts: &ShapeOptions, extra: &[Tag]) -> Plan {
         let shaper = Shaper::for_script(script);
         let mut script_tags = script::ot_script_tags(script);
         // Indic: the font may only carry the old tag; Default shapers fall back inside lookups_for.
@@ -197,6 +197,11 @@ impl Plan {
             add(&mut feats, stage, t, F_GLOBAL | F_MANUAL_JOINERS);
         }
         for t in [b"calt", b"clig", b"curs", b"dist", b"kern", b"liga", b"rclt"] {
+            add(&mut feats, stage, t, F_GLOBAL);
+        }
+        // FONTSCRAFT (B640): user features on request (`tnum`, `zero`, `ss01`, `cv01`, …), global, in the last
+        // stage with the default horizontal features — where HarfBuzz puts features a caller enables.
+        for t in extra {
             add(&mut feats, stage, t, F_GLOBAL);
         }
         // Disabled features: Indic turns `liga` off; options turn off ligatures / kerning.
@@ -477,7 +482,23 @@ fn normalize_run(font: &Font, chars: &mut Vec<(u32, usize)>, short_circuit: bool
 /// Shape one run (single script, single direction). `start..end` is a byte range of `text`; clusters are byte
 /// offsets into `text`. Returns glyphs in visual order.
 pub fn shape_run(font: &Font, text: &str, start: usize, end: usize, script: Script, rtl: bool, opts: &ShapeOptions) -> Vec<GlyphPos> {
-    let plan = Plan::new(font, script, rtl, opts);
+    shape_run_with(font, text, start, end, script, rtl, opts, &[])
+}
+
+/// [`shape_run`] with user features `extra` enabled on top of the defaults (FONTSCRAFT, B640: `tnum`, `zero`,
+/// `ss01`, `cv01` …; `kern`/`liga`/`calt` are already on unless `opts` turns them off).
+#[allow(clippy::too_many_arguments)]
+pub fn shape_run_with(
+    font: &Font,
+    text: &str,
+    start: usize,
+    end: usize,
+    script: Script,
+    rtl: bool,
+    opts: &ShapeOptions,
+    extra: &[Tag],
+) -> Vec<GlyphPos> {
+    let plan = Plan::new(font, script, rtl, opts, extra);
     let mut chars: Vec<(u32, usize)> = text[start..end].char_indices().map(|(i, c)| (c as u32, start + i)).collect();
     if chars.is_empty() {
         return Vec::new();
@@ -624,6 +645,11 @@ pub fn shape_dir(font: &Font, text: &str, opts: &ShapeOptions, dir: Direction) -
 /// how a browser falls back per cluster. Returns (font index, glyph) pairs in visual order; advances are in that
 /// font's units.
 pub fn shape_fallback(fonts: &[&Font], text: &str, opts: &ShapeOptions, dir: Direction) -> Vec<(usize, GlyphPos)> {
+    shape_fallback_with(fonts, text, opts, dir, &[])
+}
+
+/// [`shape_fallback`] with user features `extra` (FONTSCRAFT, B640).
+pub fn shape_fallback_with(fonts: &[&Font], text: &str, opts: &ShapeOptions, dir: Direction, extra: &[Tag]) -> Vec<(usize, GlyphPos)> {
     let mut out = Vec::new();
     if text.is_empty() || fonts.is_empty() {
         return out;
@@ -658,7 +684,7 @@ pub fn shape_fallback(fonts: &[&Font], text: &str, opts: &ShapeOptions, dir: Dir
                     segs.reverse();
                 }
                 for (a, b, f) in segs {
-                    out.extend(shape_run(fonts[f], text, a, b, sc, rtl, opts).into_iter().map(|g| (f, g)));
+                    out.extend(shape_run_with(fonts[f], text, a, b, sc, rtl, opts, extra).into_iter().map(|g| (f, g)));
                 }
             }
         }

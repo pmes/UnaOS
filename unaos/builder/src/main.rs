@@ -53,12 +53,20 @@ fn stage_trust(src: &std::path::Path, volume: &std::path::Path) -> bool {
 }
 
 /// KERNELFONT (rmbp-ledger B359): the UI faces the kernel's `video::text` loads from `/system/fonts/`, staged as
-/// DATA from the HOST's font packages (never vendored in the tree). (file, licence candidates). A face is staged
+/// DATA from the HOST's font packages (KERNELFONT vendored nothing; FONTSCRAFT vendors three OFL families, below). (file, family). A face is staged
 /// only with its licence beside it (`system/fonts/LICENSES/<family>.txt`); `system/fonts/MANIFEST.txt` records
 /// file, bytes, sha256, source and licence. Search order: `UNAOS_FONT_DIRS` (colon-separated) first, then the
 /// Debian / Fedora / Arch package directories. A face not found is named on the console and skipped; the kernel
 /// names it again on the wire (`[kfont] load … fallback=` / `scripts_missing=`).
+///
+/// FONTSCRAFT (rmbp-ledger B640, R124): the three UI families of DESIGN-LANGUAGE §2.2 — Inter (variable, wght + opsz),
+/// JetBrains Mono (variable, wght) and Noto Sans (variable, wght; the script fallback) — are VENDORED, OFL 1.1, in the
+/// tree's `fonts/<family>/` with their `LICENSE` ([`kfont_tree_dirs`], searched after `UNAOS_FONT_DIRS` and before the
+/// host's packages), and each is staged only when its SHA-256 equals its row in `firmware/fonts.pins` ([`kfont_pins`]).
 const KFONT_FACES: &[(&str, &str)] = &[
+    ("InterVariable.ttf", "inter"),
+    ("JetBrainsMono-Variable.ttf", "jetbrains-mono"),
+    ("NotoSans-Variable.ttf", "noto-sans"),
     ("DejaVuSans.ttf", "dejavu"),
     ("DejaVuSans-Bold.ttf", "dejavu"),
     ("DejaVuSansMono.ttf", "dejavu"),
@@ -122,13 +130,41 @@ fn stage_welcome(workspace_dir: &std::path::Path, volume: &std::path::Path) -> b
     true
 }
 
+/// FONTSCRAFT (B640): the tree's vendored families, `<repo>/fonts/<family>/` (face + `LICENSE`).
+fn kfont_tree_dirs() -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts");
+    ["inter", "jetbrains-mono", "noto-sans"].iter().map(|f| root.join(f)).collect()
+}
+
+/// FONTSCRAFT (B640): `firmware/fonts.pins` — `(file, sha256)` rows (`#` comments and blank lines skipped).
+fn kfont_pins() -> Vec<(String, String)> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../firmware/fonts.pins");
+    std::fs::read_to_string(p)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.is_empty() || l.starts_with('#') {
+                return None;
+            }
+            let mut it = l.split_whitespace();
+            match (it.next(), it.next(), it.next()) {
+                (Some(f), Some(h), None) if h.len() == 64 => Some((f.to_string(), h.to_ascii_lowercase())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// Stage the KERNELFONT faces into `<volume>/system/fonts/`; returns the files staged.
 fn stage_fonts(extra_dirs: &[std::path::PathBuf], volume: &std::path::Path) -> Vec<String> {
     let mut dirs: Vec<std::path::PathBuf> = extra_dirs.to_vec();
+    dirs.extend(kfont_tree_dirs()); // FONTSCRAFT (B640): the vendored families, before the host's packages
     dirs.extend(KFONT_DIRS.iter().map(std::path::PathBuf::from));
+    let pins = kfont_pins();
     let out = volume.join("system/fonts");
     let mut staged = Vec::new();
-    let mut manifest = String::from("# KERNELFONT (B359): faces staged by the builder from the host's font packages\n# file bytes sha256 source licence\n");
+    let mut manifest = String::from("# KERNELFONT (B359) + FONTSCRAFT (B640): faces staged by the builder from the tree's fonts/ (pinned in firmware/fonts.pins) and the host's font packages\n# file bytes sha256 source licence\n");
     for &(file, family) in KFONT_FACES {
         let Some(src) = dirs.iter().map(|d| d.join(file)).find(|p| p.is_file()) else {
             println!("   FONTS: {} not found on this host (install the {} font package or set UNAOS_FONT_DIRS) — not staged", file, family);
@@ -141,13 +177,20 @@ fn stage_fonts(extra_dirs: &[std::path::PathBuf], volume: &std::path::Path) -> V
             continue;
         };
         let bytes = std::fs::read(&src).unwrap();
+        let sha: String = crypto_core::sha2::sha256(&bytes).iter().map(|b| format!("{:02x}", b)).collect();
+        // FONTSCRAFT (B640): a pinned face stages only at its pin.
+        if let Some((_, want)) = pins.iter().find(|(f, _)| f == file) {
+            if *want != sha {
+                println!("   FONTS: {} sha256={} != pin {} (firmware/fonts.pins) — NOT staged", file, sha, want);
+                continue;
+            }
+        }
         std::fs::create_dir_all(out.join("LICENSES")).unwrap();
         let lic_name = format!("LICENSES/{}.txt", family);
         if !out.join(&lic_name).exists() {
             std::fs::copy(&lic, out.join(&lic_name)).unwrap();
         }
         std::fs::write(out.join(file), &bytes).unwrap();
-        let sha: String = crypto_core::sha2::sha256(&bytes).iter().map(|b| format!("{:02x}", b)).collect();
         manifest.push_str(&format!("{} {} {} {} {} (from {})\n", file, bytes.len(), sha, src.display(), lic_name, lic.display()));
         staged.push(file.to_string());
     }
@@ -2722,7 +2765,7 @@ mod kernelfont_tests {
         let out = std::env::temp_dir().join(format!("kfont-noto-{}", std::process::id()));
         let fallback = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/fonts-noto");
         let staged = super::stage_fonts(&[fallback], &out);
-        let noto = staged.iter().filter(|f| f.starts_with("NotoSans")).count();
+        let noto = staged.iter().filter(|f| f.starts_with("NotoSans") && *f != "NotoSans-Variable.ttf").count(); // FONTSCRAFT: the vendored Noto Sans is not a script face
         println!("KERNELFONT2 builder: faces={}/{} noto={}/4", staged.len(), super::KFONT_FACES.len(), noto);
         if noto == 0 {
             println!("SKIP: no Noto script face on this host (ensure_kfont_noto installs fonts-noto-core)");

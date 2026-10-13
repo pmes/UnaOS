@@ -1,0 +1,25 @@
+# FONTSCRAFT (rmbp-ledger B640, R124, DESIGN-LANGUAGE §2.2) — SHA-256 pins for the UI faces staged from the
+# tree's `fonts/` directory (the b43.pins shape: one fact per row, `<file> <64 lowercase hex>`). The builder
+# (`builder/src/main.rs` stage_fonts) puts a `fonts/<family>/<file>` on the image ONLY when its SHA-256 equals its
+# row here, and refuses it on the console otherwise (`FONTS: <file> sha256=<have> != pin <want> — NOT staged`);
+# arroyo's FONTS line (`ensure_kfont_noto`) prints the same verdict before every media build.
+# All three families are SIL Open Font License 1.1; each directory carries its licence as `LICENSE`, staged beside
+# the faces as `system/fonts/LICENSES/<family>.txt`.
+# Lines starting with `#` and blank lines are ignored.
+#
+# Rows written by the rmbp seat's FONTSCRAFT executor 2026-10-13 from the official releases, downloaded into
+# ~/unaos-bench/scratch/rmbp-0915/local3/fontscraft/dl/ and hashed there (sha256sum), archive -> member:
+#   Inter 4.1 (rsms/inter release v4.1, 2024-11-16): Inter-4.1.zip
+#     sha256 9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e  33707794 B
+#     member InterVariable.ttf (axes opsz 14..32, wght 100..900), LICENSE.txt
+#   JetBrains Mono 2.304 (JetBrains/JetBrainsMono release v2.304, 2023-01-14): JetBrainsMono-2.304.zip
+#     sha256 6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf  5622857 B
+#     member fonts/variable/JetBrainsMono[wght].ttf (wght 100..800), staged as JetBrainsMono-Variable.ttf; OFL.txt
+#   Noto Sans 2.015 (notofonts/latin-greek-cyrillic release NotoSans-v2.015, 2024-11-20): NotoSans-v2.015.zip
+#     sha256 0c34df072a3fa7efbb7cbf34950e1f971a4447cffe365d3a359e2d4089b958f5  117491253 B
+#     member NotoSans/unhinted/slim-variable-ttf/NotoSans[wght].ttf (wght 400..700), staged as
+#     NotoSans-Variable.ttf; OFL.txt
+
+InterVariable.ttf 4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf
+JetBrainsMono-Variable.ttf 662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016
+NotoSans-Variable.ttf fb53504de62e767a54695416123d68d67f71c9b69722175184ad56e7dd13547b

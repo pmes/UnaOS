@@ -876,3 +876,85 @@ pub const GROUP_LIFT: u32 = 8;
 /// SOFTY (B629): the Softy look's colours, re-exported by name from `palette_core::softy` (PALETTECORE B559: the
 /// values live there); `video::softy::palette` re-exports them beside its dimensions.
 pub use palette_core::softy;
+
+// ── FONTSCRAFT (rmbp-ledger B640, R124): DESIGN-LANGUAGE §2.2's type ramp ─────────────────────────────────────────
+// One row per role: (role, the Una step, the Softy step). Una's body is 13 pt (after the Mac), Softy's 14 pt (after
+// Windows 11); the roles and weights are the same, only the base step differs. Line heights are multiples of 2 pt
+// (of 4 pt from 20 pt up). Tracking is in basis points of the em (+0.5 % = 50). Sizes are pt: a device px count is
+// `pt x video::dpi`'s scale. `video::text` draws a role with the UI face (Inter: `wght` = the row's weight, `opsz`
+// = the size in pt) or, for `Mono`, JetBrains Mono. Never below 11 pt; semibold (600), not bold, below 20 pt.
+
+/// A type role of DESIGN-LANGUAGE §2.2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeRole {
+    /// dock tooltips, badges, timestamps
+    Caption,
+    /// secondary row text, section headers (at 600)
+    Footnote,
+    /// every label, menu item, list row, field
+    Body,
+    /// window titles, the app name in the bar, the default button
+    BodyStrong,
+    /// toast title, dialog title (Una), group headers
+    Headline,
+    /// Settings pane title (compact), dialog title (Softy)
+    Title3,
+    /// Settings pane title
+    Title2,
+    /// About, onboarding
+    Title1,
+    /// login clock, hero numbers
+    Display,
+    /// console, code, Activity figures
+    Mono,
+}
+
+/// One step of the ramp: size and line height in pt, `wght`, tracking in basis points of the em, mono face or not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TypeStep {
+    pub size_pt: u8,
+    pub line_pt: u8,
+    pub weight: u16,
+    pub tracking_bp: i16,
+    pub mono: bool,
+}
+
+impl TypeStep {
+    /// Tracking as an em fraction (what `font_core::ui::Style::tracking` takes).
+    pub fn tracking_em(self) -> f32 {
+        self.tracking_bp as f32 / 10_000.0
+    }
+}
+
+const fn ts(size_pt: u8, line_pt: u8, weight: u16, tracking_bp: i16) -> TypeStep {
+    TypeStep { size_pt, line_pt, weight, tracking_bp, mono: false }
+}
+
+/// The base step of each look: (Una's body, Softy's body), in pt.
+pub const TYPE_BASE_PT: (u8, u8) = (13, 14);
+
+/// DESIGN-LANGUAGE §2.2, row for row: (role, Una, Softy).
+pub const TYPE_RAMP: [(TypeRole, TypeStep, TypeStep); 10] = [
+    (TypeRole::Caption, ts(11, 14, 400, 50), ts(12, 16, 400, 50)),
+    (TypeRole::Footnote, ts(12, 16, 400, 25), ts(12, 16, 400, 25)),
+    (TypeRole::Body, ts(13, 18, 400, 0), ts(14, 20, 400, 0)),
+    (TypeRole::BodyStrong, ts(13, 18, 600, 0), ts(14, 20, 600, 0)),
+    (TypeRole::Headline, ts(15, 20, 600, -25), ts(16, 22, 600, -25)),
+    (TypeRole::Title3, ts(17, 22, 600, -50), ts(18, 24, 600, -50)),
+    (TypeRole::Title2, ts(20, 26, 600, -75), ts(20, 28, 600, -75)),
+    (TypeRole::Title1, ts(26, 32, 700, -100), ts(28, 36, 700, -100)),
+    (TypeRole::Display, ts(40, 48, 700, -150), ts(40, 52, 700, -150)),
+    (TypeRole::Mono, TypeStep { mono: true, ..ts(12, 18, 400, 0) }, TypeStep { mono: true, ..ts(13, 20, 400, 0) }),
+];
+
+/// The step of `role` in the Una look (`softy == false`) or the Softy look.
+pub fn type_role(role: TypeRole, softy: bool) -> TypeStep {
+    let mut i = 0;
+    while i < TYPE_RAMP.len() {
+        if TYPE_RAMP[i].0 == role {
+            return if softy { TYPE_RAMP[i].2 } else { TYPE_RAMP[i].1 };
+        }
+        i += 1;
+    }
+    TYPE_RAMP[2].1
+}

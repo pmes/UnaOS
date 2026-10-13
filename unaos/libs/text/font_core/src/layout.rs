@@ -422,8 +422,39 @@ pub(crate) fn read_value(d: &[u8], off: usize, fmt: u16) -> Option<Value> {
     Some(v)
 }
 
-/// GPOS lookup type 2 — pair adjustment. Returns (value for first, value for second, second has a record).
-pub fn pair_adjust(st: &[u8], first: u16, second: u16) -> Option<(Value, Value, bool)> {
+/// FONTSCRAFT (B640): a ValueRecord with its Device / VariationIndex deltas for `font`'s instance added (each
+/// rounded to the unit, as HarfBuzz does). Device offsets are from `base` (the PairPos / SinglePos subtable).
+pub(crate) fn read_value_var(font: &crate::Font, base: &[u8], off: usize, fmt: u16) -> Option<Value> {
+    let mut v = read_value(base, off, fmt)?;
+    if fmt & 0xF0 == 0 || !font.is_instanced() {
+        return Some(v);
+    }
+    let mut p = off + value_size(fmt & 0x0F);
+    for bit in [0x10u16, 0x20, 0x40, 0x80] {
+        if fmt & bit == 0 {
+            continue;
+        }
+        let o = u16_at(base, p)? as usize;
+        p += 2;
+        if o == 0 {
+            continue;
+        }
+        let Some(dev) = base.get(o..) else { continue };
+        let d = crate::fmath::round(font.device_delta(dev)) as i32;
+        let f = match bit {
+            0x10 => &mut v.x_placement,
+            0x20 => &mut v.y_placement,
+            0x40 => &mut v.x_advance,
+            _ => &mut v.y_advance,
+        };
+        *f = (*f as i32 + d).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
+    Some(v)
+}
+
+/// Where the two ValueRecords of the pair (`first`, `second`) sit in PairPos subtable `st`: (offset of record 1,
+/// offset of record 2, valueFormat1, valueFormat2), offsets from `st`.
+fn pair_records(st: &[u8], first: u16, second: u16) -> Option<(usize, usize, u16, u16)> {
     let cov = sub(st, 0, 2)?;
     let ci = coverage_index(cov, first)?;
     let vf1 = u16_at(st, 4)?;
@@ -435,7 +466,8 @@ pub fn pair_adjust(st: &[u8], first: u16, second: u16) -> Option<(Value, Value, 
             if ci >= n {
                 return None;
             }
-            let ps = sub(st, 0, 10 + 2 * ci as usize)?;
+            let pso = u16_at(st, 10 + 2 * ci as usize)? as usize;
+            let ps = st.get(pso..)?;
             let cnt = u16_at(ps, 0)? as usize;
             let rec = 2 + s1 + s2;
             let (mut lo, mut hi) = (0usize, cnt);
@@ -448,7 +480,7 @@ pub fn pair_adjust(st: &[u8], first: u16, second: u16) -> Option<(Value, Value, 
                 } else if g > second {
                     hi = mid;
                 } else {
-                    return Some((read_value(ps, b + 2, vf1)?, read_value(ps, b + 2 + s1, vf2)?, vf2 != 0));
+                    return Some((pso + b + 2, pso + b + 2 + s1, vf1, vf2));
                 }
             }
             None
@@ -465,10 +497,22 @@ pub fn pair_adjust(st: &[u8], first: u16, second: u16) -> Option<(Value, Value, 
             }
             let rec = s1 + s2;
             let b = 16 + (c1 as usize * n2 as usize + c2 as usize) * rec;
-            Some((read_value(st, b, vf1)?, read_value(st, b + s1, vf2)?, vf2 != 0))
+            Some((b, b + s1, vf1, vf2))
         }
         _ => None,
     }
+}
+
+/// GPOS lookup type 2 — pair adjustment. Returns (value for first, value for second, second has a record).
+pub fn pair_adjust(st: &[u8], first: u16, second: u16) -> Option<(Value, Value, bool)> {
+    let (o1, o2, vf1, vf2) = pair_records(st, first, second)?;
+    Some((read_value(st, o1, vf1)?, read_value(st, o2, vf2)?, vf2 != 0))
+}
+
+/// [`pair_adjust`] at `font`'s variation instance (VariationIndex device deltas added).
+pub fn pair_adjust_var(font: &crate::Font, st: &[u8], first: u16, second: u16) -> Option<(Value, Value, bool)> {
+    let (o1, o2, vf1, vf2) = pair_records(st, first, second)?;
+    Some((read_value_var(font, st, o1, vf1)?, read_value_var(font, st, o2, vf2)?, vf2 != 0))
 }
 
 /// `GDEF`: glyph classes (1 base, 2 ligature, 3 mark, 4 component), mark attachment classes and (v1.2+) mark

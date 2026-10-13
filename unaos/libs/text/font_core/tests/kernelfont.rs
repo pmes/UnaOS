@@ -48,9 +48,9 @@ fn kernel_styles(e: &Engine, css_px: f32, ppi: u32) -> [(Style, f32); 3] {
     let chrome = e.fit_size_mean(Role::Sans, true, 9.0, 20.0).unwrap();
     let ui = device_px(css_px, ppi).min(e.fit_size(Role::Sans, None, 16.0).unwrap()).max(6.0);
     [
-        (Style { role: Role::Mono, bold: false, size: body }, e.baseline_in_cell(Role::Mono, body, 16.0)),
-        (Style { role: Role::Sans, bold: true, size: chrome }, e.baseline_in_cell(Role::Sans, chrome, 20.0)),
-        (Style { role: Role::Sans, bold: false, size: ui }, e.baseline_in_cell(Role::Sans, ui, 16.0)),
+        (Style::new(Role::Mono, false, body), e.baseline_in_cell(Role::Mono, body, 16.0)),
+        (Style::new(Role::Sans, true, chrome), e.baseline_in_cell(Role::Sans, chrome, 20.0)),
+        (Style::new(Role::Sans, false, ui), e.baseline_in_cell(Role::Sans, ui, 16.0)),
     ]
 }
 
@@ -114,7 +114,7 @@ fn glyph_cache_is_bounded_and_counts_evictions() {
     let mut px = vec![0x00FF_FFFFu32; 600 * 40];
     let text = b"The quick brown fox jumps over the lazy dog 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     for size in [12.0f32, 16.0, 20.0, 24.0, 28.0] {
-        let st = Style { role: Role::Sans, bold: false, size };
+        let st = Style::new(Role::Sans, false, size);
         e.draw_0rgb(&mut px, 600, 600, 40, 2.0, 30.0, text, st, 0);
         assert!(e.stats.cache_bytes <= cap, "cache {} > cap {cap}", e.stats.cache_bytes);
     }
@@ -123,7 +123,7 @@ fn glyph_cache_is_bounded_and_counts_evictions() {
     // A generous cap never evicts on the same workload.
     let mut big = engine(4 << 20).unwrap();
     for size in [12.0f32, 16.0, 20.0, 24.0, 28.0] {
-        big.draw_0rgb(&mut px, 600, 600, 40, 2.0, 30.0, text, Style { role: Role::Sans, bold: false, size }, 0);
+        big.draw_0rgb(&mut px, 600, 600, 40, 2.0, 30.0, text, Style::new(Role::Sans, false, size), 0);
     }
     assert_eq!(big.stats.evictions, 0);
     eprintln!("KERNELFONT cache @4 MiB: {:?}", big.stats);
@@ -156,7 +156,7 @@ fn run_cache_shapes_once_and_rows_match_the_whole_draw() {
 #[test]
 fn clip_is_all_or_nothing() {
     let Some(mut e) = engine(1 << 20) else { return eprintln!("SKIP: DejaVu not installed") };
-    let st = Style { role: Role::Sans, bold: false, size: 13.0 };
+    let st = Style::new(Role::Sans, false, 13.0);
     let s = b"Password";
     let full = e.measure(s, st);
     let w = 200usize;
@@ -178,7 +178,7 @@ fn clip_is_all_or_nothing() {
 fn script_fallback_draws_through_the_stack() {
     let Some(mut e) = engine(1 << 20) else { return eprintln!("SKIP: DejaVu not installed") };
     // DejaVu Sans has Hebrew and Arabic; the stack must give the mono face's missing glyphs from the sans face.
-    let st = Style { role: Role::Mono, bold: false, size: 12.0 };
+    let st = Style::new(Role::Mono, false, 12.0);
     let p = e.placed("A שלום".as_bytes(), st);
     let sans = e.slots().iter().position(|s| s.name == "dejavu-sans").unwrap() as u8;
     assert!(p.iter().any(|g| g.face == sans && g.glyph != 0), "no glyph from the sans fallback: {p:?}");
@@ -194,9 +194,9 @@ fn login_strings_match_chromium_widths() {
         let c: Vec<&str> = l.splitn(5, '\t').collect();
         let (font, size, chrome, text) = (c[1], c[2].parse::<f32>().unwrap(), c[3].parse::<f32>().unwrap(), c[4]);
         let st = match font {
-            "DejaVuSans-Bold.ttf" => Style { role: Role::Sans, bold: true, size },
-            "DejaVuSansMono.ttf" => Style { role: Role::Mono, bold: false, size },
-            _ => Style { role: Role::Sans, bold: false, size },
+            "DejaVuSans-Bold.ttf" => Style::new(Role::Sans, true, size),
+            "DejaVuSansMono.ttf" => Style::new(Role::Mono, false, size),
+            _ => Style::new(Role::Sans, false, size),
         };
         let ours = e.measure(text.as_bytes(), st);
         let d = (ours - chrome).abs();
@@ -250,9 +250,9 @@ fn login_mock_vs_chromium_rasters() {
         let text = meta["text"].clone();
         tsv += &format!("{id}\t{font}\t{size}\t{}\t{text}\n", meta["measure"]);
         let st = match font.as_str() {
-            "DejaVuSans-Bold.ttf" => Style { role: Role::Sans, bold: true, size },
-            "DejaVuSansMono.ttf" => Style { role: Role::Mono, bold: false, size },
-            _ => Style { role: Role::Sans, bold: false, size },
+            "DejaVuSans-Bold.ttf" => Style::new(Role::Sans, true, size),
+            "DejaVuSansMono.ttf" => Style::new(Role::Mono, false, size),
+            _ => Style::new(Role::Sans, false, size),
         };
         let (left, base): (f32, f32) = (meta["left"].parse().unwrap(), meta["baseline"].parse().unwrap());
         let mut cv = vec![0x00FF_FFFFu32; w * h];
@@ -385,7 +385,7 @@ fn kernelfont2_noto_script_faces_draw() {
         return eprintln!("SKIP: fonts-noto-core not installed");
     }
     assert_eq!(n, 4, "a partial Noto set");
-    let st = Style { role: Role::Sans, bold: false, size: 30.0 };
+    let st = Style::new(Role::Sans, false, 30.0);
     for (label, text) in [("thai", "สวัสดี"), ("devanagari", "नमस्ते"), ("arabic", "مرحبا"), ("hebrew", "שלום")] {
         let p = e.placed(text.as_bytes(), st);
         let names: Vec<&str> = p.iter().map(|g| e.slots()[g.face as usize].name).collect();
