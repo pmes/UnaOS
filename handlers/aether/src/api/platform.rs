@@ -1,6 +1,8 @@
 //! Platform APIs that are *real*, not shaped-like-real: `URL` /
 //! `URLSearchParams` over UnaOS's own WHATWG URL parser (`html_core::url`,
-//! URLCORE SR87 — the one the network stack parses with, via http_core), UTF-8 `TextEncoder`/`TextDecoder`, the `AbortController` object
+//! URLCORE SR87 — the one the network stack parses with, via http_core), `TextEncoder`/`TextDecoder` (the WHATWG
+//! label table, UTF-8 / UTF-16 / windows-1252 / x-user-defined decoders, fatal / ignoreBOM / stream — AETHERWPT2,
+//! SR135), the `AbortController` object
 //! graph, `DOMParser` over the same `html_core` parser (`dom::parse_html`) the
 //! `innerHTML` setter uses, and `crypto` seeded from the OS entropy pool.
 //!
@@ -187,278 +189,500 @@ pub(crate) fn init_worker(vm: &mut Vm) {
 /// The WHATWG object shapes over the natives above.
 const PRELUDE: &str = r#"
 
-// ---- URLSearchParams -------------------------------------------------
-// Real application/x-www-form-urlencoded semantics (URL §5): the parser and
-// the byte serializer are html_core::url's (__form_parse / __form_byte);
-// insertion order is preserved, and repeated names are kept (getAll).
+// ---- URLSearchParams / URL (URL Standard §6) -------------------------
+// The parser, the setters and the application/x-www-form-urlencoded parser and
+// serializer are html_core::url's (__url_parse / __url_set / __form_parse /
+// __form_byte). AETHERWPT2 (SR135): URL §6.2 exactly — the init union
+// (sequence of pairs, record, USVString), `has` / `delete` with a value, live
+// `URLSearchParams Iterator`s, and one query object per URL that the `search`
+// and `href` setters update in place ("update" steps both ways).
 (function () {
-    var enc = function (s) { return __form_byte(String(s)); };
-
-    function URLSearchParams(init) {
-        this._p = [];
-        this._onchange = null;
-        if (init === undefined || init === null) { return; }
-        if (typeof init === 'string') {
-            var q = init.charAt(0) === '?' ? init.slice(1) : init;
-            var rows = __form_parse(q);
-            for (var i = 0; i < rows.length; i++) { this._p.push([rows[i][0], rows[i][1]]); }
-        } else if (Array.isArray(init)) {
-            for (var k = 0; k < init.length; k++) {
-                this._p.push([String(init[k][0]), String(init[k][1])]);
+    var op = function (o, n, f) { Object.defineProperty(o, n, { value: f, writable: true, enumerable: true, configurable: true }); };
+    var acc = function (o, n, get, set) { Object.defineProperty(o, n, { get: get, set: set, enumerable: true, configurable: true }); };
+    // WebIDL USVString: ToString, then every lone surrogate becomes U+FFFD.
+    var usv = function (v) {
+        var s = String(v), n = s.length, out = '', start = 0;
+        for (var i = 0; i < n; i++) {
+            var c = s.charCodeAt(i);
+            if (c < 0xD800 || c > 0xDFFF) { continue; }
+            if (c <= 0xDBFF && i + 1 < n) {
+                var d = s.charCodeAt(i + 1);
+                if (d >= 0xDC00 && d <= 0xDFFF) { i++; continue; }
             }
-        } else if (init instanceof URLSearchParams) {
-            for (var m = 0; m < init._p.length; m++) {
-                this._p.push([init._p[m][0], init._p[m][1]]);
-            }
-        } else if (typeof init === 'object') {
-            for (var key in init) {
-                if (Object.prototype.hasOwnProperty.call(init, key)) {
-                    this._p.push([String(key), String(init[key])]);
-                }
-            }
+            out += s.slice(start, i) + '�';
+            start = i + 1;
         }
-    }
-    URLSearchParams.prototype._changed = function () {
-        if (this._onchange) { this._onchange(this.toString()); }
+        return start === 0 ? s : out + s.slice(start);
     };
-    URLSearchParams.prototype.get = function (n) {
-        n = String(n);
-        for (var i = 0; i < this._p.length; i++) { if (this._p[i][0] === n) { return this._p[i][1]; } }
-        return null;
-    };
-    URLSearchParams.prototype.getAll = function (n) {
-        n = String(n);
-        var out = [];
-        for (var i = 0; i < this._p.length; i++) { if (this._p[i][0] === n) { out.push(this._p[i][1]); } }
+    globalThis.__usv = usv;
+    var enc = function (s) { return __form_byte(s); };
+    var parseQ = function (q) {
+        var rows = __form_parse(q), out = [];
+        for (var i = 0; i < rows.length; i++) { out.push([rows[i][0], rows[i][1]]); }
         return out;
     };
-    URLSearchParams.prototype.has = function (n) { return this.get(n) !== null; };
-    URLSearchParams.prototype.append = function (n, v) {
-        this._p.push([String(n), String(v)]); this._changed();
-    };
-    URLSearchParams.prototype.set = function (n, v) {
-        n = String(n); v = String(v);
-        var seen = false, out = [];
-        for (var i = 0; i < this._p.length; i++) {
-            if (this._p[i][0] !== n) { out.push(this._p[i]); }
-            else if (!seen) { seen = true; out.push([n, v]); }
-        }
-        if (!seen) { out.push([n, v]); }
-        this._p = out; this._changed();
-    };
-    URLSearchParams.prototype['delete'] = function (n) {
-        n = String(n);
+    var serialize = function (list) {
         var out = [];
-        for (var i = 0; i < this._p.length; i++) { if (this._p[i][0] !== n) { out.push(this._p[i]); } }
-        this._p = out; this._changed();
-    };
-    URLSearchParams.prototype.sort = function () {
-        this._p.sort(function (a, b) { return a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0); });
-        this._changed();
-    };
-    URLSearchParams.prototype.forEach = function (cb, thisArg) {
-        for (var i = 0; i < this._p.length; i++) { cb.call(thisArg, this._p[i][1], this._p[i][0], this); }
-    };
-    // entries/keys/values return arrays: boa has generators, but an array is
-    // iterable with for..of and spread and is what every real consumer of
-    // these does with them. Array-vs-iterator identity checks would differ;
-    // no page has been seen to make one.
-    URLSearchParams.prototype.entries = function () {
-        var out = [];
-        for (var i = 0; i < this._p.length; i++) { out.push([this._p[i][0], this._p[i][1]]); }
-        return out;
-    };
-    URLSearchParams.prototype.keys = function () {
-        return this._p.map(function (e) { return e[0]; });
-    };
-    URLSearchParams.prototype.values = function () {
-        return this._p.map(function (e) { return e[1]; });
-    };
-    URLSearchParams.prototype.toString = function () {
-        var out = [];
-        for (var i = 0; i < this._p.length; i++) {
-            out.push(enc(this._p[i][0]) + '=' + enc(this._p[i][1]));
-        }
+        for (var i = 0; i < list.length; i++) { out.push(enc(list[i][0]) + '=' + enc(list[i][1])); }
         return out.join('&');
     };
-    Object.defineProperty(URLSearchParams.prototype, 'size', {
-        configurable: true,
-        get: function () { return this._p.length; },
-    });
-    try {
-        URLSearchParams.prototype[Symbol.iterator] = function () {
-            return this.entries()[Symbol.iterator]();
-        };
-    } catch (e) {}
+    var need = function (n, min, iface, opname) {
+        if (n < min) {
+            throw new TypeError("Failed to execute '" + opname + "' on '" + iface + "': " + min + ' argument' + (min > 1 ? 's' : '') + ' required, but only ' + n + ' present.');
+        }
+    };
+    var SP = new WeakMap();
+    var sp = function (o) {
+        var s = (o !== null && typeof o === 'object') ? SP.get(o) : undefined;
+        if (s === undefined) { throw new TypeError('Illegal invocation'); }
+        return s;
+    };
+    var US = new WeakMap();
+    var us = function (o) {
+        var s = (o !== null && typeof o === 'object') ? US.get(o) : undefined;
+        if (s === undefined) { throw new TypeError('Illegal invocation'); }
+        return s;
+    };
+    // URL §6.2 "update": the URL object's query becomes the serialization (null when empty).
+    var update = function (s) {
+        if (s.url === null) { return; }
+        var u = US.get(s.url);
+        var next = __url_set(u.c.href, 'search', serialize(s.list));
+        if (next) { u.c = next; }
+    };
+
+    class URLSearchParams {
+        constructor() {
+            var init = arguments[0];
+            var list = [];
+            if (init !== undefined) {
+                if (init !== null && (typeof init === 'object' || typeof init === 'function')) {
+                    var m = init[Symbol.iterator];
+                    if (m !== undefined && m !== null) {
+                        if (typeof m !== 'function') { throw new TypeError("Failed to construct 'URLSearchParams': The object's @@iterator is not callable."); }
+                        for (var pair of init) {
+                            if (pair === null || (typeof pair !== 'object' && typeof pair !== 'function')) {
+                                throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                            }
+                            var p = [];
+                            for (var x of pair) { p.push(usv(x)); }
+                            if (p.length !== 2) { throw new TypeError("Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements"); }
+                            list.push(p);
+                        }
+                    } else {
+                        // record<USVString, USVString>: own enumerable keys in [[OwnPropertyKeys]] order.
+                        var keys = Reflect.ownKeys(init);
+                        for (var i = 0; i < keys.length; i++) {
+                            var desc = Reflect.getOwnPropertyDescriptor(init, keys[i]);
+                            if (desc === undefined || !desc.enumerable) { continue; }
+                            if (typeof keys[i] === 'symbol') { throw new TypeError("Failed to construct 'URLSearchParams': Cannot convert a Symbol value to a string"); }
+                            var k = usv(keys[i]);
+                            var v = usv(init[keys[i]]);
+                            var at = -1;
+                            for (var j = 0; j < list.length; j++) { if (list[j][0] === k) { at = j; } }
+                            if (at >= 0) { list[at][1] = v; } else { list.push([k, v]); }
+                        }
+                    }
+                } else {
+                    var q = usv(init);
+                    if (q.charAt(0) === '?') { q = q.slice(1); }
+                    list = parseQ(q);
+                }
+            }
+            SP.set(this, { list: list, url: null });
+        }
+    }
+    var SPM = {
+        append(name, value) {
+            var s = sp(this);
+            need(arguments.length, 2, 'URLSearchParams', 'append');
+            s.list.push([usv(name), usv(value)]);
+            update(s);
+        },
+        delete(name) {
+            var s = sp(this);
+            need(arguments.length, 1, 'URLSearchParams', 'delete');
+            var n = usv(name), value = arguments[1], v = value === undefined ? undefined : usv(value);
+            s.list = s.list.filter(function (p) { return !(p[0] === n && (v === undefined || p[1] === v)); });
+            update(s);
+        },
+        get(name) {
+            var s = sp(this);
+            need(arguments.length, 1, 'URLSearchParams', 'get');
+            var n = usv(name);
+            for (var i = 0; i < s.list.length; i++) { if (s.list[i][0] === n) { return s.list[i][1]; } }
+            return null;
+        },
+        getAll(name) {
+            var s = sp(this);
+            need(arguments.length, 1, 'URLSearchParams', 'getAll');
+            var n = usv(name), out = [];
+            for (var i = 0; i < s.list.length; i++) { if (s.list[i][0] === n) { out.push(s.list[i][1]); } }
+            return out;
+        },
+        has(name) {
+            var s = sp(this);
+            need(arguments.length, 1, 'URLSearchParams', 'has');
+            var n = usv(name), value = arguments[1], v = value === undefined ? undefined : usv(value);
+            for (var i = 0; i < s.list.length; i++) {
+                if (s.list[i][0] === n && (v === undefined || s.list[i][1] === v)) { return true; }
+            }
+            return false;
+        },
+        set(name, value) {
+            var s = sp(this);
+            need(arguments.length, 2, 'URLSearchParams', 'set');
+            var n = usv(name), v = usv(value), seen = false, out = [];
+            for (var i = 0; i < s.list.length; i++) {
+                if (s.list[i][0] !== n) { out.push(s.list[i]); }
+                else if (!seen) { seen = true; out.push([n, v]); }
+            }
+            if (!seen) { out.push([n, v]); }
+            s.list = out;
+            update(s);
+        },
+        sort() {
+            var s = sp(this);
+            // Stable, by code units of the names.
+            var d = s.list.map(function (p, i) { return [p, i]; });
+            d.sort(function (a, b) { return a[0][0] < b[0][0] ? -1 : (a[0][0] > b[0][0] ? 1 : a[1] - b[1]); });
+            s.list = d.map(function (x) { return x[0]; });
+            update(s);
+        },
+        forEach(callback) {
+            var s = sp(this);
+            need(arguments.length, 1, 'URLSearchParams', 'forEach');
+            if (typeof callback !== 'function') { throw new TypeError("Failed to execute 'forEach' on 'URLSearchParams': The callback provided as parameter 1 is not a function."); }
+            var thisArg = arguments[1];
+            for (var i = 0; i < s.list.length; i++) {
+                var p = s.list[i];
+                callback.call(thisArg, p[1], p[0], this);
+            }
+        },
+        entries() { sp(this); return mkIter(this, 2); },
+        keys() { sp(this); return mkIter(this, 0); },
+        values() { sp(this); return mkIter(this, 1); },
+        toString() { return serialize(sp(this).list); },
+    };
+    Object.keys(SPM).forEach(function (k) { op(URLSearchParams.prototype, k, SPM[k]); });
+    Object.defineProperty(URLSearchParams.prototype, Symbol.iterator, { value: SPM.entries, writable: true, enumerable: false, configurable: true });
+    acc(URLSearchParams.prototype, 'size', function () { return sp(this).list.length; }, undefined);
+    Object.defineProperty(URLSearchParams.prototype, Symbol.toStringTag, { value: 'URLSearchParams', configurable: true });
+
+    // The default iterator object (WebIDL §3.7.10.1): live over the list, by index.
+    var IterProto = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+    var SPIter = Object.create(IterProto);
+    var IT = new WeakMap();
+    op(SPIter, 'next', {
+        next() {
+            var st = (this !== null && typeof this === 'object') ? IT.get(this) : undefined;
+            if (st === undefined) { throw new TypeError('Illegal invocation'); }
+            var list = sp(st.target).list;
+            if (st.index >= list.length) { return { value: undefined, done: true }; }
+            var p = list[st.index++];
+            return { value: st.kind === 0 ? p[0] : (st.kind === 1 ? p[1] : [p[0], p[1]]), done: false };
+        },
+    }.next);
+    Object.defineProperty(SPIter, Symbol.toStringTag, { value: 'URLSearchParams Iterator', configurable: true });
+    var mkIter = function (target, kind) {
+        var o = Object.create(SPIter);
+        IT.set(o, { target: target, kind: kind, index: 0 });
+        return o;
+    };
     globalThis.URLSearchParams = URLSearchParams;
+    Object.defineProperty(globalThis, 'URLSearchParams', { enumerable: false });
 
     // ---- URL ---------------------------------------------------------
-    // Every component comes from html_core::url; component writes go back
-    // through it and re-normalise. searchParams is live-linked both ways,
-    // as in the platform.
-    function URL(input, base) {
-        var c = __url_parse(String(input), base === undefined || base === null ? undefined : String(base));
-        if (!c) { throw new TypeError('Failed to construct URL: Invalid URL: ' + input); }
-        this._c = c;
-        this._sp = new URLSearchParams(c.search);
-        var self = this;
-        this._sp._onchange = function (q) {
-            self._c = __url_set(self._c.href, 'search', q);
-        };
+    class URL {
+        constructor(url) {
+            if (arguments.length < 1) { throw new TypeError("Failed to construct 'URL': 1 argument required, but only 0 present."); }
+            var base = arguments[1];
+            var c = __url_parse(usv(url), base === undefined ? undefined : usv(base));
+            if (!c) { throw new TypeError("Failed to construct 'URL': Invalid URL"); }
+            var q = new URLSearchParams(c.search);
+            US.set(this, { c: c, q: q });
+            sp(q).url = this;
+        }
+        static canParse(url) {
+            need(arguments.length, 1, 'URL', 'canParse');
+            var base = arguments[1];
+            return !!__url_parse(usv(url), base === undefined ? undefined : usv(base));
+        }
+        static parse(url) {
+            need(arguments.length, 1, 'URL', 'parse');
+            try { return new URL(url, arguments[1]); } catch (e) { return null; }
+        }
     }
-    // Rebuilds the live searchParams link after the query string changed
-    // out from under it (an href or search write).
-    var relink = function (u) {
-        u._sp = new URLSearchParams(u._c.search);
-        u._sp._onchange = function (q) { u._c = __url_set(u._c.href, 'search', q); };
-    };
-    var PARTS = ['protocol', 'username', 'password', 'host', 'hostname',
-                 'port', 'pathname', 'search', 'hash'];
-    for (var pi = 0; pi < PARTS.length; pi++) {
-        (function (part) {
-            Object.defineProperty(URL.prototype, part, {
-                configurable: true, enumerable: true,
-                get: function () { return this._c[part]; },
-                set: function (v) {
-                    var next = __url_set(this._c.href, part, String(v));
-                    if (next) { this._c = next; }
-                    if (part === 'search') { relink(this); }
-                },
-            });
-        })(PARTS[pi]);
-    }
-    Object.defineProperty(URL.prototype, 'href', {
-        configurable: true, enumerable: true,
-        get: function () { return this._c.href; },
-        set: function (v) {
-            var c = __url_parse(String(v), undefined);
-            if (!c) { throw new TypeError('Invalid URL: ' + v); }
-            this._c = c;
-            relink(this);
+    var PARTS = ['protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'];
+    PARTS.forEach(function (part) {
+        acc(URL.prototype, part, function () { return us(this).c[part]; }, function (v) {
+            var u = us(this);
+            var input = usv(v);
+            var next = __url_set(u.c.href, part, input);
+            if (next) { u.c = next; }
+            if (part === 'search') {
+                // URL §6.1 search setter: the query object's list is the parse of the input (empty when "").
+                if (input.charAt(0) === '?') { input = input.slice(1); }
+                sp(u.q).list = input === '' ? [] : parseQ(input);
+            }
+        });
+    });
+    acc(URL.prototype, 'href', function () { return us(this).c.href; }, function (v) {
+        var u = us(this);
+        var c = __url_parse(usv(v), undefined);
+        if (!c) { throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); }
+        u.c = c;
+        sp(u.q).list = c.search === '' ? [] : parseQ(c.search.slice(1));
+    });
+    acc(URL.prototype, 'origin', function () { return us(this).c.origin; }, undefined);
+    acc(URL.prototype, 'searchParams', function () { return us(this).q; }, undefined);
+    op(URL.prototype, 'toString', { toString() { return us(this).c.href; } }.toString);
+    op(URL.prototype, 'toJSON', { toJSON() { return us(this).c.href; } }.toJSON);
+    Object.defineProperty(URL.prototype, Symbol.toStringTag, { value: 'URL', configurable: true });
+    // Object URLs need a blob store this engine does not have (AETHERWPT2 gap O3); the handle is unique and
+    // revocable but dereferences to nothing.
+    var blobSeq = 0;
+    op(URL, 'createObjectURL', {
+        createObjectURL(obj) {
+            if (typeof __ledger === 'function') { __ledger('URL.createObjectURL-no-blob-store'); }
+            return 'blob:' + (globalThis.location ? location.origin : 'null') + '/' + (++blobSeq);
         },
-    });
-    Object.defineProperty(URL.prototype, 'origin', {
-        configurable: true, enumerable: true,
-        get: function () { return this._c.origin; },
-    });
-    Object.defineProperty(URL.prototype, 'searchParams', {
-        configurable: true, enumerable: true,
-        get: function () { return this._sp; },
-    });
-    URL.prototype.toString = function () { return this._c.href; };
-    URL.prototype.toJSON = function () { return this._c.href; };
-    URL.canParse = function (input, base) {
-        return !!__url_parse(String(input), base === undefined ? undefined : String(base));
-    };
-    URL.parse = function (input, base) {
-        try { return new URL(input, base); } catch (e) { return null; }
-    };
-    // Object URLs need a blob store this engine does not have; the handle
-    // is unique and revocable but dereferences to nothing.
-    var __blobSeq = 0;
-    URL.createObjectURL = function () {
-        __ledger('URL.createObjectURL-no-blob-store');
-        return 'blob:' + (globalThis.location ? location.origin : 'null') + '/' + (++__blobSeq);
-    };
-    URL.revokeObjectURL = function () {};
+    }.createObjectURL);
+    op(URL, 'revokeObjectURL', { revokeObjectURL(url) {} }.revokeObjectURL);
     globalThis.URL = URL;
+    Object.defineProperty(globalThis, 'URL', { enumerable: false });
 })();
 
-// ---- TextEncoder / TextDecoder ---------------------------------------
-// Real UTF-8 in both directions, surrogate pairs included, lone surrogates
-// replaced with U+FFFD exactly as the spec requires.
+// ---- TextEncoder / TextDecoder (Encoding Standard §7) ----------------
+// AETHERWPT2 (SR135): the WHATWG label table (encodings.json), `fatal`,
+// `ignoreBOM`, `{stream: true}`, the UTF-8 decoder of §8.1.1 (bounds-checked
+// continuation bytes, one U+FFFD per maximal subpart), UTF-16LE/BE (§14.2),
+// windows-1252 and x-user-defined; `replacement` refused with a RangeError.
+// The other legacy encodings have no decoder here (gap O2): their labels
+// resolve, and decoding them is ledgered and falls back to UTF-8.
 (function () {
-    var HAS_U8 = (typeof Uint8Array !== 'undefined');
-    if (!HAS_U8) { __ledger('TextEncoder-no-Uint8Array-plain-array'); }
+    var op = function (o, n, f) { Object.defineProperty(o, n, { value: f, writable: true, enumerable: true, configurable: true }); };
+    var getter = function (o, n, f) { Object.defineProperty(o, n, { get: f, enumerable: true, configurable: true }); };
+    var ledger = function (m) { if (typeof __ledger === 'function') { __ledger(m); } };
+    var LABELS = Object.create(null);
+    'utf-8:unicode-1-1-utf-8 unicode11utf8 unicode20utf8 utf-8 utf8 x-unicode20utf8|ibm866:866 cp866 csibm866 ibm866|iso-8859-2:csisolatin2 iso-8859-2 iso-ir-101 iso8859-2 iso88592 iso_8859-2 iso_8859-2:1987 l2 latin2|iso-8859-3:csisolatin3 iso-8859-3 iso-ir-109 iso8859-3 iso88593 iso_8859-3 iso_8859-3:1988 l3 latin3|iso-8859-4:csisolatin4 iso-8859-4 iso-ir-110 iso8859-4 iso88594 iso_8859-4 iso_8859-4:1988 l4 latin4|iso-8859-5:csisolatincyrillic cyrillic iso-8859-5 iso-ir-144 iso8859-5 iso88595 iso_8859-5 iso_8859-5:1988|iso-8859-6:arabic asmo-708 csiso88596e csiso88596i csisolatinarabic ecma-114 iso-8859-6 iso-8859-6-e iso-8859-6-i iso-ir-127 iso8859-6 iso88596 iso_8859-6 iso_8859-6:1987|iso-8859-7:csisolatingreek ecma-118 elot_928 greek greek8 iso-8859-7 iso-ir-126 iso8859-7 iso88597 iso_8859-7 iso_8859-7:1987 sun_eu_greek|iso-8859-8:csiso88598e csisolatinhebrew hebrew iso-8859-8 iso-8859-8-e iso-ir-138 iso8859-8 iso88598 iso_8859-8 iso_8859-8:1988 visual|iso-8859-8-i:csiso88598i iso-8859-8-i logical|iso-8859-10:csisolatin6 iso-8859-10 iso-ir-157 iso8859-10 iso885910 l6 latin6|iso-8859-13:iso-8859-13 iso8859-13 iso885913|iso-8859-14:iso-8859-14 iso8859-14 iso885914|iso-8859-15:csisolatin9 iso-8859-15 iso8859-15 iso885915 iso_8859-15 l9|iso-8859-16:iso-8859-16|koi8-r:cskoi8r koi koi8 koi8-r koi8_r|koi8-u:koi8-ru koi8-u|macintosh:csmacintosh mac macintosh x-mac-roman|windows-874:dos-874 iso-8859-11 iso8859-11 iso885911 tis-620 windows-874|windows-1250:cp1250 windows-1250 x-cp1250|windows-1251:cp1251 windows-1251 x-cp1251|windows-1252:ansi_x3.4-1968 ascii cp1252 cp819 csisolatin1 ibm819 iso-8859-1 iso-ir-100 iso8859-1 iso88591 iso_8859-1 iso_8859-1:1987 l1 latin1 us-ascii windows-1252 x-cp1252|windows-1253:cp1253 windows-1253 x-cp1253|windows-1254:cp1254 csisolatin5 iso-8859-9 iso-ir-148 iso8859-9 iso88599 iso_8859-9 iso_8859-9:1989 l5 latin5 windows-1254 x-cp1254|windows-1255:cp1255 windows-1255 x-cp1255|windows-1256:cp1256 windows-1256 x-cp1256|windows-1257:cp1257 windows-1257 x-cp1257|windows-1258:cp1258 windows-1258 x-cp1258|x-mac-cyrillic:x-mac-cyrillic x-mac-ukrainian|gbk:chinese csgb2312 csiso58gb231280 gb2312 gb_2312 gb_2312-80 gbk iso-ir-58 x-gbk|gb18030:gb18030|big5:big5 big5-hkscs cn-big5 csbig5 x-x-big5|euc-jp:cseucpkdfmtjapanese euc-jp x-euc-jp|iso-2022-jp:csiso2022jp iso-2022-jp|shift_jis:csshiftjis ms932 ms_kanji shift-jis shift_jis sjis windows-31j x-sjis|euc-kr:cseuckr csksc56011987 euc-kr iso-ir-149 korean ks_c_5601-1987 ks_c_5601-1989 ksc5601 ksc_5601 windows-949|replacement:csiso2022kr hz-gb-2312 iso-2022-cn iso-2022-cn-ext iso-2022-kr replacement|utf-16be:unicodefffe utf-16be|utf-16le:csunicode iso-10646-ucs-2 ucs-2 unicode unicodefeff utf-16 utf-16le|x-user-defined:x-user-defined'.split('|').forEach(function (row) {
+        var at = row.indexOf(':'), name = row.slice(0, at);
+        row.slice(at + 1).split(' ').forEach(function (l) { LABELS[l] = name; });
+    });
+    // Encoding §4.2 "get an encoding": strip ASCII whitespace, ASCII-lowercase, look up.
+    var getEncoding = function (label) {
+        var l = String(label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '').replace(/[A-Z]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) + 32); });
+        return LABELS[l] || null;
+    };
+    globalThis.__get_encoding = getEncoding;
+    var dict = function (v, what) {
+        if (v === undefined || v === null) { return {}; }
+        if (typeof v !== 'object' && typeof v !== 'function') { throw new TypeError("Failed to " + what + ": The provided value is not of type 'dictionary'."); }
+        return v;
+    };
+    // BufferSource (AllowShared) → a copy of its bytes.
+    var bytesOf = function (input, what) {
+        if (typeof ArrayBuffer !== 'undefined' && input instanceof ArrayBuffer) { return new Uint8Array(input.slice(0)); }
+        if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) { return new Uint8Array(input.slice(0)); }
+        if (ArrayBuffer.isView(input)) { return new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice(); }
+        throw new TypeError("Failed to execute '" + what + "' on 'TextDecoder': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    };
+    var W1252 = [0x20AC, 0x81, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2C6, 0x2030, 0x160, 0x2039, 0x152, 0x8D, 0x17D, 0x8F,
+                 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x2DC, 0x2122, 0x161, 0x203A, 0x153, 0x9D, 0x17E, 0x178];
 
-    function encodeUtf8(str) {
+    // A decoder instance: run(bytes, emit, error) consumes bytes; end(emit, error) handles end-of-queue.
+    // error() returns true when the decoder must stop (fatal mode).
+    var makeDecoder = function (name) {
+        if (name === 'utf-8') {
+            var need = 0, seen = 0, cp = 0, lo = 0x80, hi = 0xBF;
+            return {
+                run: function (b, emit, error) {
+                    var i = 0, n = b.length;
+                    while (i < n) {
+                        var x = b[i];
+                        if (need === 0) {
+                            i++;
+                            if (x <= 0x7F) { emit(x); }
+                            else if (x >= 0xC2 && x <= 0xDF) { need = 1; cp = x & 0x1F; }
+                            else if (x >= 0xE0 && x <= 0xEF) { if (x === 0xE0) { lo = 0xA0; } if (x === 0xED) { hi = 0x9F; } need = 2; cp = x & 0xF; }
+                            else if (x >= 0xF0 && x <= 0xF4) { if (x === 0xF0) { lo = 0x90; } if (x === 0xF4) { hi = 0x8F; } need = 3; cp = x & 0x7; }
+                            else if (error()) { return; }
+                            continue;
+                        }
+                        if (x < lo || x > hi) {
+                            // The byte is not consumed: it is prepended to the queue and read again.
+                            cp = 0; need = 0; seen = 0; lo = 0x80; hi = 0xBF;
+                            if (error()) { return; }
+                            continue;
+                        }
+                        i++;
+                        lo = 0x80; hi = 0xBF;
+                        cp = (cp << 6) | (x & 0x3F);
+                        if (++seen === need) { var c = cp; cp = 0; need = 0; seen = 0; emit(c); }
+                    }
+                },
+                end: function (emit, error) {
+                    if (need !== 0) { cp = 0; need = 0; seen = 0; lo = 0x80; hi = 0xBF; error(); }
+                },
+            };
+        }
+        if (name === 'utf-16le' || name === 'utf-16be') {
+            var be = name === 'utf-16be', lead = -1, sur = -1;
+            return {
+                run: function (b, emit, error) {
+                    for (var i = 0; i < b.length; i++) {
+                        if (lead === -1) { lead = b[i]; continue; }
+                        var cu = be ? (lead << 8) | b[i] : (b[i] << 8) | lead;
+                        lead = -1;
+                        if (sur !== -1) {
+                            var ls = sur;
+                            sur = -1;
+                            if (cu >= 0xDC00 && cu <= 0xDFFF) { emit(0x10000 + ((ls - 0xD800) << 10) + (cu - 0xDC00)); continue; }
+                            // §14.2.1 step 5.5: the code unit's bytes are restored to the queue; reading them again
+                            // yields this same code unit, so it is processed below after the error.
+                            if (error()) { return; }
+                        }
+                        if (cu >= 0xD800 && cu <= 0xDBFF) { sur = cu; continue; }
+                        if (cu >= 0xDC00 && cu <= 0xDFFF) { if (error()) { return; } continue; }
+                        emit(cu);
+                    }
+                },
+                end: function (emit, error) {
+                    if (lead !== -1 || sur !== -1) { lead = -1; sur = -1; error(); }
+                },
+            };
+        }
+        if (name === 'windows-1252' || name === 'x-user-defined') {
+            var udef = name === 'x-user-defined';
+            return {
+                run: function (b, emit) {
+                    for (var i = 0; i < b.length; i++) {
+                        var x = b[i];
+                        emit(x < 0x80 ? x : (udef ? 0xF780 + x - 0x80 : (x < 0xA0 ? W1252[x - 0x80] : x)));
+                    }
+                },
+                end: function () {},
+            };
+        }
+        ledger('TextDecoder-no-decoder-decoded-as-utf8:' + name);
+        return makeDecoder('utf-8');
+    };
+
+    var TD = new WeakMap();
+    var td = function (o) {
+        var s = (o !== null && typeof o === 'object') ? TD.get(o) : undefined;
+        if (s === undefined) { throw new TypeError('Illegal invocation'); }
+        return s;
+    };
+    class TextDecoder {
+        constructor() {
+            var label = arguments[0] === undefined ? 'utf-8' : String(arguments[0]);
+            var o = dict(arguments[1], "construct 'TextDecoder'");
+            var fatal = !!o.fatal, ignoreBOM = !!o.ignoreBOM;
+            var name = getEncoding(label);
+            if (name === null || name === 'replacement') {
+                throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+            }
+            TD.set(this, { name: name, fatal: fatal, ignoreBOM: ignoreBOM, doNotFlush: false, decoder: null, bomSeen: false });
+        }
+    }
+    getter(TextDecoder.prototype, 'encoding', function () { return td(this).name; });
+    getter(TextDecoder.prototype, 'fatal', function () { return td(this).fatal; });
+    getter(TextDecoder.prototype, 'ignoreBOM', function () { return td(this).ignoreBOM; });
+    op(TextDecoder.prototype, 'decode', {
+        decode() {
+            var s = td(this);
+            var input = arguments[0];
+            var bytes = input === undefined ? new Uint8Array(0) : bytesOf(input, 'decode');
+            var stream = !!dict(arguments[1], "execute 'decode' on 'TextDecoder'").stream;
+            if (!s.doNotFlush) { s.decoder = makeDecoder(s.name); s.bomSeen = false; }
+            s.doNotFlush = stream;
+            var units = [], out = '', failed = false;
+            var bomCheck = !s.ignoreBOM && (s.name === 'utf-8' || s.name === 'utf-16le' || s.name === 'utf-16be');
+            var emit = function (c) {
+                if (bomCheck && !s.bomSeen) { s.bomSeen = true; if (c === 0xFEFF) { return; } }
+                if (c > 0xFFFF) { c -= 0x10000; units.push(0xD800 + (c >> 10), 0xDC00 + (c & 0x3FF)); } else { units.push(c); }
+                if (units.length >= 8192) { out += String.fromCharCode.apply(null, units); units = []; }
+            };
+            var error = function () {
+                if (s.fatal) { failed = true; return true; }
+                emit(0xFFFD);
+                return false;
+            };
+            s.decoder.run(bytes, emit, error);
+            if (!failed && !stream) { s.decoder.end(emit, error); }
+            if (failed) {
+                s.doNotFlush = false;
+                throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
+            }
+            return out + String.fromCharCode.apply(null, units);
+        },
+    }.decode);
+    Object.defineProperty(TextDecoder.prototype, Symbol.toStringTag, { value: 'TextDecoder', configurable: true });
+
+    var TE = new WeakSet();
+    var te = function (o) { if (o === null || typeof o !== 'object' || !TE.has(o)) { throw new TypeError('Illegal invocation'); } };
+    // UTF-8 of a USVString, as code points (lone surrogates are U+FFFD).
+    var encodeUtf8 = function (str) {
         var s = String(str), bytes = [];
         for (var i = 0; i < s.length; i++) {
             var cp = s.charCodeAt(i);
             if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.length) {
                 var lo = s.charCodeAt(i + 1);
-                if (lo >= 0xDC00 && lo <= 0xDFFF) {
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    i++;
-                } else { cp = 0xFFFD; }
+                if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); i++; }
+                else { cp = 0xFFFD; }
             } else if (cp >= 0xD800 && cp <= 0xDFFF) { cp = 0xFFFD; }
             if (cp < 0x80) { bytes.push(cp); }
             else if (cp < 0x800) { bytes.push(0xC0 | (cp >> 6), 0x80 | (cp & 63)); }
-            else if (cp < 0x10000) {
-                bytes.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
-            } else {
-                bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 63),
-                           0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
-            }
+            else if (cp < 0x10000) { bytes.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)); }
+            else { bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)); }
         }
         return bytes;
+    };
+    class TextEncoder {
+        constructor() { TE.add(this); }
     }
-    function decodeUtf8(bytes) {
-        var out = '', i = 0, n = bytes.length;
-        while (i < n) {
-            var b = bytes[i++] & 255, cp, need;
-            if (b < 0x80) { cp = b; need = 0; }
-            else if ((b & 0xE0) === 0xC0) { cp = b & 31; need = 1; }
-            else if ((b & 0xF0) === 0xE0) { cp = b & 15; need = 2; }
-            else if ((b & 0xF8) === 0xF0) { cp = b & 7; need = 3; }
-            else { out += '�'; continue; }
-            var ok = true;
-            for (var k = 0; k < need; k++) {
-                if (i >= n) { ok = false; break; }
-                var c = bytes[i] & 255;
-                if ((c & 0xC0) !== 0x80) { ok = false; break; }
-                cp = (cp << 6) | (c & 63); i++;
+    getter(TextEncoder.prototype, 'encoding', function () { te(this); return 'utf-8'; });
+    op(TextEncoder.prototype, 'encode', {
+        encode() {
+            te(this);
+            var input = arguments[0];
+            return new Uint8Array(encodeUtf8(input === undefined ? '' : input));
+        },
+    }.encode);
+    op(TextEncoder.prototype, 'encodeInto', {
+        encodeInto(source, destination) {
+            te(this);
+            if (arguments.length < 2) { throw new TypeError("Failed to execute 'encodeInto' on 'TextEncoder': 2 arguments required, but only " + arguments.length + ' present.'); }
+            var s = String(source);
+            if (!(destination instanceof Uint8Array)) { throw new TypeError("Failed to execute 'encodeInto' on 'TextEncoder': parameter 2 is not of type 'Uint8Array'."); }
+            // Encoding §7.4.3: whole scalar values while they fit; read counts UTF-16 code units consumed.
+            var read = 0, written = 0, cap = destination.length;
+            for (var i = 0; i < s.length; i++) {
+                var cp = s.charCodeAt(i), units = 1;
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.length) {
+                    var lo = s.charCodeAt(i + 1);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); units = 2; }
+                    else { cp = 0xFFFD; }
+                } else if (cp >= 0xD800 && cp <= 0xDFFF) { cp = 0xFFFD; }
+                var len = cp < 0x80 ? 1 : (cp < 0x800 ? 2 : (cp < 0x10000 ? 3 : 4));
+                if (written + len > cap) { break; }
+                if (len === 1) { destination[written] = cp; }
+                else if (len === 2) { destination[written] = 0xC0 | (cp >> 6); destination[written + 1] = 0x80 | (cp & 63); }
+                else if (len === 3) { destination[written] = 0xE0 | (cp >> 12); destination[written + 1] = 0x80 | ((cp >> 6) & 63); destination[written + 2] = 0x80 | (cp & 63); }
+                else { destination[written] = 0xF0 | (cp >> 18); destination[written + 1] = 0x80 | ((cp >> 12) & 63); destination[written + 2] = 0x80 | ((cp >> 6) & 63); destination[written + 3] = 0x80 | (cp & 63); }
+                written += len;
+                read += units;
+                i += units - 1;
             }
-            if (!ok) { out += '�'; continue; }
-            if (cp > 0x10FFFF) { out += '�'; }
-            else if (cp > 0xFFFF) {
-                cp -= 0x10000;
-                out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 1023));
-            } else { out += String.fromCharCode(cp); }
-        }
-        return out;
-    }
-
-    function TextEncoder() { this.encoding = 'utf-8'; }
-    TextEncoder.prototype.encode = function (str) {
-        var bytes = encodeUtf8(str === undefined ? '' : str);
-        return HAS_U8 ? new Uint8Array(bytes) : bytes;
-    };
-    TextEncoder.prototype.encodeInto = function (str, dest) {
-        var bytes = encodeUtf8(str === undefined ? '' : str);
-        var n = Math.min(bytes.length, dest.length);
-        for (var i = 0; i < n; i++) { dest[i] = bytes[i]; }
-        return { read: n === bytes.length ? String(str).length : 0, written: n };
-    };
+            return { read: read, written: written };
+        },
+    }.encodeInto);
+    Object.defineProperty(TextEncoder.prototype, Symbol.toStringTag, { value: 'TextEncoder', configurable: true });
     globalThis.TextEncoder = TextEncoder;
-
-    function TextDecoder(label) {
-        this.encoding = (label ? String(label) : 'utf-8').toLowerCase();
-        this.fatal = false;
-        this.ignoreBOM = false;
-        if (this.encoding !== 'utf-8' && this.encoding !== 'utf8' && this.encoding !== 'unicode-1-1-utf-8') {
-            __ledger('TextDecoder-non-utf8-decoded-as-utf8:' + this.encoding);
-            this.encoding = 'utf-8';
-        }
-    }
-    TextDecoder.prototype.decode = function (input) {
-        if (input === undefined || input === null) { return ''; }
-        var src = input;
-        if (src.buffer !== undefined && src.BYTES_PER_ELEMENT === undefined) {
-            // Raw ArrayBuffer-alike without a view: wrap it if we can.
-            try { src = new Uint8Array(input); } catch (e) {}
-        } else if (typeof ArrayBuffer !== 'undefined' && input instanceof ArrayBuffer) {
-            try { src = new Uint8Array(input); } catch (e) {}
-        }
-        var bytes = [];
-        for (var i = 0; i < src.length; i++) { bytes.push(src[i] & 255); }
-        if (!this.ignoreBOM && bytes.length >= 3 &&
-            bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
-            bytes = bytes.slice(3);
-        }
-        return decodeUtf8(bytes);
-    };
     globalThis.TextDecoder = TextDecoder;
+    Object.defineProperty(globalThis, 'TextEncoder', { enumerable: false });
+    Object.defineProperty(globalThis, 'TextDecoder', { enumerable: false });
 })();
 
 // ---- AbortController / AbortSignal -----------------------------------
