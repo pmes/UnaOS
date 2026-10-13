@@ -23,8 +23,8 @@
 // the address field is one pill with a quiet border and, focused, the accent inside a soft halo.
 //
 // SIDE TABS AND THE HEADER'S ACTIONS (AETHERSIDETABS2, SR143). Principia's `aether.tabs.layout` (`top` | `side`, the
-// host face's key; read at start, on every store move `theme::due` reports, and every `theme::POLL_MS` while the ring-3
-// PrefChanged subscription names only `system.appearance.`) chooses where the tabs stand. `side`: the model's
+// host face's key; read at start and whenever `theme::due` reports a PrefChanged — its subscription names `aether.tabs.`
+// beside `system.appearance.`; a kernel that refuses it falls back to due's own poll) chooses where the tabs stand. `side`: the model's
 // `sidetabs::SideStrip` (linked by path like the rest) is a COLUMN down the window's left — `width_for(pw)`: 240 px,
 // at most a third of this 288 px surface, or the 48 px rail — over its toggle row and `TabStrip::rows` 32 px each
 // (a group's header with its colour dot, name, count and chevron, a click collapsing it; its tabs with a stripe in
@@ -254,11 +254,10 @@ pub struct Chrome {
     ptr: (i32, i32),
     hot: Hot,
     pressed: Option<Hot>,
-    /// AETHERSIDETABS2 (SR143): where the tabs stand (Principia's row) and the side column's state, when the row is
-    /// read next (ms), whether the menu is open, and each tab's favicon tile (16 x 16 RGBA) when the face has one.
+    /// AETHERSIDETABS2 (SR143): where the tabs stand (Principia's row) and the side column's state, whether the menu
+    /// is open, and each tab's favicon tile (16 x 16 RGBA) when the face has one.
     layout: TabLayout,
     side: SideStrip,
-    pref_at: u64,
     menu: bool,
     icons: Vec<(u64, Vec<u8>)>,
 }
@@ -286,7 +285,6 @@ impl Chrome {
             pressed: None,
             layout: TabLayout::Top,
             side: SideStrip::default(),
-            pref_at: 0,
             menu: false,
             icons: Vec::new(),
         }
@@ -355,7 +353,6 @@ impl Chrome {
 
     /// AETHERSIDETABS2 (SR143): tab `id`'s favicon tile (`sidetabs::FAVICON_PX` square RGBA, what
     /// `sidetabs::favicon_tile` makes of a decoded `<link rel=icon>`), or `None` to show its letter tile again.
-    #[allow(dead_code)]
     pub fn set_icon(&mut self, id: u64, tile: Option<Vec<u8>>) {
         self.icons.retain(|(k, _)| *k != id);
         if let Some(t) = tile.filter(|t| t.len() >= (SIDE_TILE * SIDE_TILE * 4) as usize) {
@@ -505,19 +502,18 @@ pub fn start(app: &mut App, page: &Page) {
     l.put(b" bookmarks=").dec(app.ch.bookmarks.items().len() as i64).put(b" history=").dec(app.ch.visits.len() as i64);
     l.put(b" code=").dec(code).put(b" ::");
     l.wire();
-    prefs(app, 0, true); // AETHERSIDETABS2 (SR143): where the tabs stand, before the first paint
+    prefs(app, true); // AETHERSIDETABS2 (SR143): where the tabs stand, before the first paint
     loaded(app, page, true);
 }
 
 /// AETHERSIDETABS2 (SR143): re-read where the tabs stand — at start, whenever `theme::due` saw the store move
-/// (`moved`), and every `theme::POLL_MS` (the ring-3 PrefChanged subscription names `system.appearance.` only). A
+/// (`moved`: a PrefChanged under `aether.tabs.` or `system.appearance.`, theme.rs's subscription). A
 /// change re-lays the window (the page's origin and logical size move; no tab or page is touched):
 /// `:: AETHER: tabs layout=<top|side> col=<px> ::`.
-pub fn prefs(app: &mut App, now: u64, moved: bool) {
-    if !moved && now < app.ch.pref_at {
+pub fn prefs(app: &mut App, moved: bool) {
+    if !moved {
         return;
     }
-    app.ch.pref_at = now + crate::theme::POLL_MS;
     let want = crate::theme::pref_text(LAYOUT_PREF).map(|t| TabLayout::parse(&t)).unwrap_or_default();
     if want == app.ch.layout {
         return;

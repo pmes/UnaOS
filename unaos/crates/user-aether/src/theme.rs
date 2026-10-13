@@ -264,7 +264,8 @@ pub fn load() -> bool {
 /// re-read survives only as the fallback for a kernel that refuses the subscription; otherwise every [`POLL_MS`] the
 /// civil hour alone is checked (an `auto` look turns on the hour without a write).
 pub fn due(now_ms: u64) -> bool {
-    const SUBSCRIBE: &[&str] = &["system.appearance."];
+    // AETHERSIDETABS2 (SR143): `aether.tabs.` too — where the tabs stand (`chrome::prefs` re-reads on this answer).
+    const SUBSCRIBE: &[&str] = &["system.appearance.", "aether.tabs."];
     static mut SUB: i64 = 1; // 1 = not yet asked; 0 = subscribed; < 0 = refused (the poll fallback)
     static mut HOUR: i64 = -1; // the civil hour at the last clock check
     unsafe {
