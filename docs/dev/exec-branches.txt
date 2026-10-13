@@ -423,6 +423,6 @@ refs/heads/exec-rmbp-sonde2                   0069ca00 FOLDED-BY-HAND 25a2e59d 2
 refs/heads/exec-rmbp-unakeys                  9f64d857 FOLDED-BY-HAND cf2256a5 2026-10-13
 refs/heads/exec-rmbp-setterwedge              cc2b7a8a IN-FLIGHT cloud 2026-10-13
 refs/heads/exec-rmbp-pointerscale2            cc2b7a8a IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-rmbp-dockshell                cc2b7a8a IN-FLIGHT cloud 2026-10-13
-refs/heads/exec-rmbp-screenshotfat            cc2b7a8a IN-FLIGHT cloud 2026-10-13
+refs/heads/exec-rmbp-dockshell                4936bc2c FOLDED-BY-HAND 21901b42 2026-10-13
+refs/heads/exec-rmbp-screenshotfat            d20412c5 FOLDED-BY-HAND e5a8bd8c 2026-10-13
 refs/heads/exec-rmbp-queuesleep2              cc2b7a8a IN-FLIGHT cloud 2026-10-13
