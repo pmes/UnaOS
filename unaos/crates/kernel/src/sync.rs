@@ -594,7 +594,7 @@ mod reg {
         if gap_ms <= 1 + crate::hidstall::HOLD_OVER_MS || gap_ms > (u64::MAX >> 8) {
             return;
         }
-        let name = crate::arch::sched::current_name();
+        let name = crate::arch::sched::current_name().or(Some(crate::arch::sched::between_word(cpu))); // KVMLAT (B574): no current task is the scheduler's own context, named `sched:idle`/`sched:switch`, never `?` (LINE-NEUTRAL fold)
         let step = if matches!(name, Some("usb-pump")) { crate::video::lag::pump_step_now() } else { 0 };
         crate::hidstall::note_hold(gap_ms - 1, name, outer_site(p, tid), step);
     }

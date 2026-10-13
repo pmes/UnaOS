@@ -7865,3 +7865,20 @@ pub fn spawn_stack_killable(
 ) -> u64 {
     spawn_inner(name, entry, arg, target_cpu, priority, stack_bytes, None, Some(kill))
 }
+
+// ── KVMLAT (rmbp-ledger B574, arc row B614) — what a core with NO current task is doing, by name. FILE-TAIL append. ─────
+// QEMUIMAGE26's HIDSTALL read `holders=3 hold_worst_ms=11 hold_worst=?` and the census `[hid] stall census holder=? n=13
+// worst_ms=11`: the pump core's late tick (`sync::pump_core_hold`) found `current_name()` = None, i.e. `run()`'s own
+// context — between two tasks (IF=0: the switch-back, the free, the requeue, `try_steal`) or idle in `enable_and_hlt`
+// (IF=1). The two are different facts: a masked switch is this kernel's hold; a late tick while HALTED with IF=1 is
+// no hold of this kernel at all (on metal it cannot happen; under KVM it is a vCPU the host did not run). `idle_since_ms`
+// is set before the idle arm's `try_steal` and cleared at the next dispatch (`run()`), so it splits them.
+
+/// The name a holder census gives `cpu`'s scheduler context when no task is current: `sched:idle` (the idle arm:
+/// `try_steal`, then `hlt`) or `sched:switch` (between tasks). Atomics only (the tick ISR calls it).
+pub fn between_word(cpu: usize) -> &'static str {
+    match SCHED.get(cpu) {
+        Some(s) if s.idle_since_ms.load(Ordering::Relaxed) != 0 => "sched:idle",
+        _ => "sched:switch",
+    }
+}
