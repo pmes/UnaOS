@@ -69,6 +69,10 @@ pub struct Program {
     /// Bumped on every link attempt: a WebGLUniformLocation from an older link is invalid (WebGL 1.0 "Uniforms and attributes").
     pub link_gen: u32,
     pub bindings: BTreeMap<String, u32>,
+    pub linked_data: Option<Rc<crate::link::Linked>>,
+    /// The uniform store (one vec4 row per uniform register; a mat4 element is 4 rows), indexed by the link's
+    /// row offsets; zero after every successful link (ES 2.0 §2.10.4: uniforms start at 0).
+    pub store: Vec<[f32; 4]>,
 }
 
 /// A renderbuffer's storage (ES 2.0 §4.4.2; WebGL 1.0 "Framebuffer Object Attachments" adds DEPTH_STENCIL).

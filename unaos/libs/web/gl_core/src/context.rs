@@ -448,6 +448,8 @@ impl Context {
             validated: false,
             link_gen: 0,
             bindings: Default::default(),
+            linked_data: None,
+            store: Vec::new(),
         })
     }
 

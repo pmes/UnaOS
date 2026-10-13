@@ -9,7 +9,8 @@
 //!
 //! * [`consts`] — the WebGL 1.0 IDL constant table; [`context`] — the state machine and its error semantics;
 //!   [`object`] / [`texture`] / [`framebuffer`] — the objects, completeness.
-//! * [`glsl`] — GLSL ES 1.00: preprocessor, parser, semantics; [`program`] — shader and program objects.
+//! * [`glsl`] — GLSL ES 1.00: preprocessor, parser, semantics, code generation; [`vm`] — the register
+//!   bytecode and its interpreter; [`link`] — program link; [`program`] — shader and program objects.
 //!
 //! `no_std` + `alloc`, no dependencies, no `unsafe`.
 #![no_std]
@@ -22,8 +23,10 @@ pub mod context;
 pub mod fmath;
 pub mod framebuffer;
 pub mod glsl;
+pub mod link;
 pub mod object;
 pub mod program;
 pub mod texture;
+pub mod vm;
 
 pub use context::{ActiveInfo, Attributes, Context, DrawStats, ObjKind, Param, PrecisionFormat, UniformLoc};

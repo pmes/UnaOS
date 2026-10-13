@@ -6,6 +6,7 @@
 
 pub mod ast;
 pub mod builtins;
+pub mod codegen;
 pub mod parse;
 pub mod pp;
 pub mod sema;
