@@ -1,0 +1,2 @@
+# boot 2 witness lines=1 lost=0 at=desktop ms=6732
+:: BOOT: firmware->loader=14281ms loader->desktop=9029ms total=23310ms lines=216 steps=2 slowest=users-load:87 over=0 ::
