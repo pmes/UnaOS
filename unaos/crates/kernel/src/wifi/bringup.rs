@@ -2515,3 +2515,90 @@ mod ident;
 // WIFI6 (B439): rung S4i's MMIO leg (post-check under wifi3, the unwind under wifi5).
 #[cfg(feature = "wifi3")]
 mod unwind;
+
+// WIFI9 (B625, R110): S5i the HT-PHY re-init, S5c the channel-11 tune, S6 the receive-only RX ring —
+// run once per boot from `tests wifi` (R80: nothing at boot). See bringup/htphyinit.rs and bringup/rx.rs.
+#[cfg(feature = "wifi9")]
+mod htphyinit;
+#[cfg(feature = "wifi9")]
+mod rx;
+
+/// `tests wifi` (verb.rs): WIFI9's three rungs, in b43's order — MAC suspended (`phy_common.c:455`),
+/// the PHY re-init and tune (`htphyinit::run`), the RX ring and the 5 s window (`rx::run`). Once per
+/// boot; a second `tests wifi` prints the recorded verdict. The default channel is 11
+/// (`phy_ht.c:1074-1077`); the SHM_CONTROL pre-image is restored at the end.
+#[cfg(feature = "wifi9")]
+pub fn wifi9() {
+    static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let (r, t, b) = super::status::wifi9();
+        serial_println!(":: wifi9: already ran this boot reinit={} tune={} beacons={} — one pass per boot ::", r, t, b.map(|n| alloc::format!("{}", n)).unwrap_or_else(|| alloc::string::String::from("none")));
+        return;
+    }
+    const CH: u16 = 11;
+    let (bar0, bus, dev, func) = match live::handle() {
+        Ok(h) => h,
+        Err(why) => {
+            serial_println!(":: wifi9: REFUSED reason={} — no PHY, radio, MAC or DMA register written; scan stays 0 ::", why);
+            return;
+        }
+    };
+    // The gates b43 applies before it drives an HT-PHY (main.c:4517-4520) and S5r's verdict this boot.
+    let phy = unsafe { r16(bar0, D11_PHY_VER) };
+    let (ty, rev) = ((phy >> 8) & 0xF, phy & 0xF);
+    if ty != EXPECT_PHY_TYPE || rev > 1 || super::status::phy_reset_token() != "done" {
+        serial_println!(
+            ":: wifi9: REFUSED reason=gate phy_ver={:#06x} type={} rev={} phy_reset={} — needs type 7 rev<=1 (main.c:4517-4520) and S5r done this boot; nothing written ::",
+            phy, ty, rev, super::status::phy_reset_token()
+        );
+        return;
+    }
+    let shm_pre = unsafe { r32(bar0, D11_SHM_CONTROL) };
+    let mut w = rx::Writes::default();
+    let suspended = rx::suspend(bar0, &mut w);
+    let mut cookie_pre: Option<u16> = None;
+    let hv = {
+        let mut cookie = |ch: u16| {
+            let p = rx::chan_cookie(bar0, ch, &mut w);
+            if cookie_pre.is_none() { cookie_pre = Some(p); }
+        };
+        htphyinit::run(bar0, rev, CH, &mut cookie)
+    };
+    let tune_full = hv.tune.as_ref().map(|t| t.readback_ok == t.readback_n).unwrap_or(false);
+    let seen = if hv.tune.is_some() { Some(rx::run(bar0, bus, dev, func, CH, &mut w)) } else { None };
+    unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
+    let shm_ok = unsafe { r32(bar0, D11_SHM_CONTROL) } == shm_pre;
+    let reinit = if hv.elems > 0 && hv.match_ == hv.elems { 1 } else if hv.elems > 0 { 2 } else { 0 };
+    let tune = match &hv.tune { Some(_) if tune_full => 1, Some(_) => 2, None => 0 };
+    match &seen {
+        Some(s) => {
+            super::status::set_scan(s.beacons);
+            super::status::set_wifi9(reinit, tune, Some(s.beacons));
+            let verdict = if s.beacons > 0 {
+                "SEEN"
+            } else if s.frames > 0 && s.fcs_err == s.frames {
+                "FCS-ONLY(S5-feedback: the PHY hears energy it cannot decode)"
+            } else if s.frames > 0 {
+                "FRAMES-NO-BEACON"
+            } else if s.empty > 0 || s.oversize > 0 {
+                "DESCRIPTORS-ONLY"
+            } else {
+                "NOTHING(S6-feedback: the ring never advanced)"
+            };
+            serial_println!(
+                ":: wifi9: rx frames={} beacons={} bytes={} ssids=[{}] fcs_err={} other_chan={} oversize={} empty={} ch={} window=5000ms tx=none -> {} ::",
+                s.frames, s.beacons, s.bytes, s.ssids.join(","), s.fcs_err, s.other_chan, s.oversize, s.empty, CH, verdict
+            );
+        }
+        None => {
+            super::status::set_wifi9(reinit, tune, None);
+            serial_println!(":: wifi9: rx NOT ATTEMPTED reason=no-tune — the ring is not programmed on an untuned PHY ::");
+        }
+    }
+    serial_println!(
+        ":: wifi9: end mac-suspended-first={} cookie_pre={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-irq-ack={} wrote-pci-cmd={} wrote-radio-addr={} wrote-radio-data={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit=none(no TX ring, no template, AP off, PRMAXTIME=1) ::",
+        suspended as u8, cookie_pre.map(|p| alloc::format!("{:#06x}", p)).unwrap_or_else(|| alloc::string::String::from("unread")),
+        w.macctl, w.shm, w.dma, w.irq_ack, w.pci_cmd, hv.c.radio_addr, hv.c.radio_data, hv.c.core_regs, hv.c.wrapper,
+        if shm_ok { "MATCH" } else { "FAILED" }
+    );
+}

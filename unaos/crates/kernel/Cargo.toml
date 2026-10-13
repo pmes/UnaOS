@@ -736,6 +736,12 @@ wifi4 = ["wifi3"]
 # FAILS. Default OFF and OFF the metal line until the seat reads WIFI5's C1 line NON-DISTURBING.
 # IMPLIES `wifi3` (the unwind lives on the upload path). x86_64-only, stripped by arm_features.
 wifi5 = ["wifi3"]
+# WIFI-9 knob (WIFI9 arc, rmbp-ledger B625, R110): UNAOS_WIFI9=1 arms the receive-only rungs `tests wifi` runs
+# once per boot (R80: nothing at boot) — S5i the HT-PHY re-init from the pinned b43 tables after S5r's reset
+# (`src/wifi/bringup/htphyinit.rs`), S5c the 2059 tune to channel 11, S6 one 64-bit RX DMA ring (64 x 2 KiB)
+# and a 5 s beacon count with the SSIDs decoded (`src/wifi/bringup/rx.rs`). NO transmit of any frame.
+# IMPLIES `wifi4` (S5r's reset verdict gates it; it reads WIFI7's latched d11 handle). x86_64-only.
+wifi9 = ["wifi4"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

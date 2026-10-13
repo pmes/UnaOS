@@ -811,6 +811,10 @@ _feats="${_feats}sdw,"
 # written back; no PHY register). Implies wifi3. x86_64-only, stripped by arm_features. Kept in sync
 # with builder/src/main.rs. OFF the metal line until WIFI5's C1 line reads NON-DISTURBING.
 [ -n "${UNAOS_WIFI5:-}" ] && _feats="${_feats}wifi5,"
+# WIFI-9 (B625, R110): UNAOS_WIFI9=1 arms the receive-only S5i/S5c/S6 rungs `tests wifi` runs (HT-PHY re-init,
+# channel-11 tune, one RX ring and a 5 s beacon count). Implies wifi4. x86_64-only. Kept in sync with
+# builder/src/main.rs.
+[ -n "${UNAOS_WIFI9:-}" ] && _feats="${_feats}wifi9,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
