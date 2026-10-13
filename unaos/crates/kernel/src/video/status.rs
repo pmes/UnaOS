@@ -812,6 +812,10 @@ pub fn tray_publish() {
     if !crate::boot::services_gate("status") {
         return; // INSTALLBARE (R86): furniture's — nothing is published under the setter / the login screen
     }
+    #[cfg(feature = "witness")]
+    if !tray_pub_enter() {
+        return; // UIREDS26 (B599): `tests statustray` holds the published facts it injected
+    }
     #[cfg(all(target_arch = "x86_64", feature = "hda"))]
     let sink = crate::drivers::hda::vol::ready();
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
@@ -839,6 +843,8 @@ pub fn tray_publish() {
     TRAY_NET.store(net, Ordering::Relaxed);
     TRAY_CLOCK.store(crate::clock::try_unix_now().is_some() as u8, Ordering::Relaxed);
     TRAY_SEEN.store(1, Ordering::Relaxed);
+    #[cfg(feature = "witness")]
+    TRAY_PUB.store(false, Ordering::SeqCst); // UIREDS26 (B599): this pass's stores are done
     super::statusmenu::ensure_registered(); // `tests statustray` (R80: registered on the desktop pass, never run at boot)
 }
 
@@ -878,9 +884,37 @@ pub fn item_known(t: &Tray, i: u8) -> bool {
     }
 }
 
-/// `tests statustray` fixture hook: replace the published facts (the next [`tray_publish`] restores the live ones).
+// UIREDS26 (B599): QEMUIMAGE26's `net=no` was the desktop pass's `tray_publish` storing the live facts between the
+// fixture's `tray_inject` and its `tray()` read-back (`set_volume`, an HDA write, sits between them). The inject now
+// HOLDS the publish until `tray_restore`: a pass already past its entry check is waited out (Dekker, SeqCst both sides).
+#[cfg(feature = "witness")]
+static TRAY_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "witness")]
+static TRAY_PUB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `tray_publish`'s entry: `false` while the fixture holds the facts (nothing stored).
+#[cfg(feature = "witness")]
+fn tray_pub_enter() -> bool {
+    if TRAY_HELD.load(Ordering::SeqCst) {
+        return false;
+    }
+    TRAY_PUB.store(true, Ordering::SeqCst);
+    if TRAY_HELD.load(Ordering::SeqCst) {
+        TRAY_PUB.store(false, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+/// `tests statustray` fixture hook: replace the published facts and HOLD them (no [`tray_publish`] stores until
+/// [`tray_restore`]).
 #[cfg(feature = "witness")]
 pub fn tray_inject(vol: bool, net: u64, clock: bool) {
+    TRAY_HELD.store(true, Ordering::SeqCst);
+    let t0 = crate::arch::ms();
+    while TRAY_PUB.load(Ordering::SeqCst) && crate::arch::ms().saturating_sub(t0) < 100 {
+        core::hint::spin_loop(); // a pass that entered before the hold finishes its stores (relaxed loads only: microseconds)
+    }
     TRAY_VOL.store(vol as u8, Ordering::Relaxed);
     TRAY_NET.store(net, Ordering::Relaxed);
     TRAY_CLOCK.store(clock as u8, Ordering::Relaxed);
@@ -899,6 +933,7 @@ pub fn tray_restore(r: (u8, u64, u8, u8)) {
     TRAY_NET.store(r.1, Ordering::Relaxed);
     TRAY_CLOCK.store(r.2, Ordering::Relaxed);
     TRAY_SEEN.store(r.3, Ordering::Relaxed);
+    TRAY_HELD.store(false, Ordering::SeqCst); // UIREDS26 (B599): the live facts are back; the next pass publishes
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
