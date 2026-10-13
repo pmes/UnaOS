@@ -285,7 +285,19 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
         let exists = present.iter().any(|n| *n == leaf);
         let want = keys_for_obj(mt, &mime, exists, &sigs);
         let (mut m1, mut f1, mut txs, mut mm) = (0usize, 0usize, 0u32, 0u64);
+        // FIRSTLOGIN (rmbp-ledger B636): flight 34 boot 2 `type=text/html made=1 blocks=344 masked_ms=183` — the boot's first
+        // write to the volume read its cold directory and index blocks INSIDE the create's IRQ-masked UnaFS transaction
+        // (every UnaFS op is one masked `MOUNT` hold, fs/unafs.rs `with_unafs_attempt`). The object's path is read first in
+        // short read-only transactions of their own (a yield between), so the create and the stamp find those blocks
+        // cached; each transaction kind's masked span is said on the per-type row (`masked_pre/create/stamp_max`).
+        let (mut m_pre, mut m_create, mut m_stamp) = (crate::hidstall::scope_masked_take(), 0u64, 0u64); // keys_for_obj's reads count as pre
         if !exists {
+            let _ = mt.stat(TYPES_DIR);
+            breathe_between();
+            let _ = mt.stat(&obj); // the miss walks the same lookup the create walks
+            breathe_between();
+            m_pre = m_pre.max(crate::hidstall::scope_masked_take());
+            mm = mm.max(m_pre);
             // FILETYPES (JOBSCAN2, B551): the object is created BARE (one small transaction: the inode, the directory
             // rewrite, its name facts), then its keys are stamped in groups (`stamp_grouped`). Flight 32's 275 ms
             // masked hold was the one-object create carrying every key (each key two index B-tree inserts, cmds=62 in
@@ -295,10 +307,16 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
                 Ok(n) => {
                     m1 = n;
                     txs += 1;
-                    mm = mm.max(crate::hidstall::scope_masked_take());
+                    m_create = crate::hidstall::scope_masked_take();
+                    mm = mm.max(m_create);
                     breathe_between();
+                    let _ = mt.list_attrs(&obj, k); // FIRSTLOGIN (B636): the new inode's attribute blocks, read before the stamp
+                    breathe_between();
+                    m_pre = m_pre.max(crate::hidstall::scope_masked_take());
+                    mm = mm.max(m_pre);
                     let keys: Vec<(String, Option<AttrValue>)> = want.into_iter().map(|(key, v)| (key, Some(v))).collect();
-                    txs += stamp_grouped(mt, &obj, &keys, k, &mut group, &mut mm)?;
+                    txs += stamp_grouped(mt, &obj, &keys, k, &mut group, &mut m_stamp)?;
+                    mm = mm.max(m_stamp);
                 }
                 Err(VfsError::Unsupported) => { // no batch on this volume: the plain create, then its keys
                     mt.create(&obj, NodeKind::File, k)?;
@@ -311,6 +329,9 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
             }
         } else {
             let have: Vec<(String, AttrValue)> = mt.list_attrs(&obj, k).unwrap_or_default();
+            breathe_between(); // FIRSTLOGIN (B636): the read is its own transaction; the stamp's groups follow
+            m_pre = m_pre.max(crate::hidstall::scope_masked_take());
+            mm = mm.max(m_pre);
             let fill: Vec<(String, Option<AttrValue>)> = want
                 .into_iter()
                 .filter(|(key, _)| !have.iter().any(|(h, v)| h == key && !matches!(v, AttrValue::Str(s) if s.is_empty())))
@@ -318,7 +339,8 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
                 .collect();
             if !fill.is_empty() {
                 f1 = fill.len();
-                txs += stamp_grouped(mt, &obj, &fill, k, &mut group, &mut mm)?; // JOBSCAN2 (B551): grouped like a new object's keys
+                txs += stamp_grouped(mt, &obj, &fill, k, &mut group, &mut m_stamp)?; // JOBSCAN2 (B551): grouped like a new object's keys
+                mm = mm.max(m_stamp);
             }
         }
         made += m1;
@@ -327,8 +349,8 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
         PER_TYPE_MASKED.fetch_max(mm, Ordering::Relaxed);
         if m1 + f1 > 0 {
             let d = sio().since(io0);
-            serial_println!("[filetypes] type={} made={} filled={} blocks={} cmds={} ms={} masked_ms={} txs={} group={}", mime, m1, f1, d.blocks_read(), d.cmds(),
-                crate::arch::ms().saturating_sub(t0), mm, txs, group);
+            serial_println!("[filetypes] type={} made={} filled={} blocks={} cmds={} ms={} masked_ms={} txs={} group={} masked_pre={} masked_create={} masked_stamp_max={}", mime, m1, f1, d.blocks_read(), d.cmds(),
+                crate::arch::ms().saturating_sub(t0), mm, txs, group, m_pre, m_create, m_stamp); // FIRSTLOGIN (B636): each transaction kind's masked span
         }
         breathe_between(); // between objects, never inside a hold: the HID pump and the render lane run (JOBSCAN's worker runs this build)
     }
