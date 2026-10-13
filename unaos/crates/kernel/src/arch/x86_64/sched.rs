@@ -3077,7 +3077,7 @@ pub fn sibling_online_cpu(caller: usize) -> usize {
             let mut elig = [(0usize, 0usize, 0u32); MAX_CPUS]; // (cpu, load, pct)
             let mut n = 0usize;
             for c in 0..MAX_CPUS {
-                if c == caller || SCHED[c].scheduler_rsp.load(Ordering::Acquire) == 0 {
+                if c == caller || is_dead_core(c) || SCHED[c].scheduler_rsp.load(Ordering::Acquire) == 0 { // GATESTEAL (B657): a core the steal declared dead is no sibling (same-line fold)
                     continue;
                 }
                 if tier < 1 && service == Some(c) {
@@ -3532,7 +3532,7 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
             let mut elig = [(0usize, 0usize, 0u32); MAX_CPUS]; // (cpu, load, pct)
             let mut n = 0usize;
             for c in 0..MAX_CPUS {
-                if !cpu_dispatching(c) {
+                if !cpu_dispatching(c) || is_dead_core(c) { // GATESTEAL (B657): a core the steal declared dead takes no placement — PARKED BY NAME (same-line fold)
                     continue;
                 }
                 if cooperative_user && c == 0 {
@@ -7881,4 +7881,143 @@ pub fn between_word(cpu: usize) -> &'static str {
         Some(s) if s.idle_since_ms.load(Ordering::Relaxed) != 0 => "sched:idle",
         _ => "sched:switch",
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// GATESTEAL (rmbp-ledger B657) — RE-HOME A DEAD CORE'S PINNED TASKS, FROM A LIVE CORE.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Flight 35 (f35-boot1.log 21:32:42, f35-boot3.log 22:04:01): WCSER-STEAL declared the SERVICE core
+// (c7) dead and published it to the `COMP_DEAD_CORE` mailbox; the mailbox's only consumer
+// (`render_rehome_service`) runs ON the usb-pump, on c7, so the death was published to a corpse and
+// every task pinned to c7 — `usb-pump`, `xhci-poll`, `ehci-hid`, `smc-batt` — stayed on a core the
+// steal had named dead: USB input and the serial door ride them, and the glass died while the wire
+// lived. The pump WATCH (`sessionwedge::look`, a sibling core) now reads the steal's gauges and calls
+// [`rehome_dead_core`] from a live core.
+//
+// THE MECHANISM IS THE STEAL'S OWN. `try_steal` re-homes a task by rewriting `task.cpu`, `migrations`
+// and `migrate_ms` and pushing the Box it exclusively owns on the thief's queue (step 3 above,
+// `RunQueue::push` + `poke_for`, the `make_ready` shape). [`rehome_dead_core`] does exactly that for
+// EVERY task in `RUN_QUEUES[dead]` and `SLEEPERS[dead]`: the pin contract (`Task::steal_ok`) is a
+// placement promise, and a core the steal declared dead cannot keep it — a pinned task on a dead core is
+// a dead task, so the pin is void there and nowhere else (`steal_one`'s filter is untouched; an idle
+// thief still never takes a pinned task). A SLEEPER's deadline is in the parking core's local tick
+// domain (the SMPBAL note above: "do not helpfully migrate sleepers" — from a LIVE victim), so it is
+// re-based: `live_ticks + (deadline - dead_ticks)`, and the live core's `drain_due_sleepers` wakes it
+// on its own tick. One lock at a time, each released before the next is taken, IF masked for the
+// run-queue lock contract.
+//
+// WHAT CANNOT BE MOVED, said rather than hidden: the task CURRENT on the dead core is in no queue
+// (`SCHED[dead].current` owns it) and no other core may touch a running task's Box; `Rehomed::current`
+// names it and the caller retries while that is the task it wants (a pump that sleeps between its
+// passes is caught in `SLEEPERS` on the next look; one parked for good is named on the wire). A
+// cooperative ring-3 task is never moved onto core 0 (the clock-core rule `pick_cpu` and `steal_one`
+// share); it is left on the dead queue and counted in `left`.
+//
+// The SERVICE-core deadlock rule (`try_steal`'s one exclusion) FOLLOWS the pump: the caller
+// re-publishes the split (`smp::publish_sched_split(render, live)`) so `try_steal` never steals from
+// the pump's new home and `xhci_worker_cpu` never co-locates a preemptible XHCI_CONTROLLER taker with
+// it. The dead core is PARKED BY NAME: [`note_dead_core`] latches it and `pick_cpu` /
+// `sibling_online_cpu` skip it (folds above), so nothing is ever placed on it again this boot; it is
+// never removed from `ONLINE_MASK` (a core that is in fact alive — QEMU's fixture — keeps dispatching
+// what it already holds and takes nothing new).
+
+/// GATESTEAL — cores the compositor steal declared dead and the watch has parked by name. Latched for
+/// the boot; a bitmask so the placement folds cost one load.
+static DEAD_CORES: AtomicU64 = AtomicU64::new(0);
+
+/// GATESTEAL — park `cpu` by name: no placement, no sibling choice lands on it again this boot.
+pub fn note_dead_core(cpu: usize) {
+    if cpu < 64 {
+        DEAD_CORES.fetch_or(1u64 << cpu, Ordering::Relaxed);
+    }
+}
+
+/// GATESTEAL — is `cpu` parked by name?
+pub fn is_dead_core(cpu: usize) -> bool {
+    cpu < 64 && DEAD_CORES.load(Ordering::Relaxed) & (1u64 << cpu) != 0
+}
+
+/// GATESTEAL — what one [`rehome_dead_core`] moved: ready tasks, sleeping tasks, the tasks it had to
+/// leave (cooperative ring-3 onto core 0), and the id of the task that was CURRENT on the dead core
+/// (in no queue; nobody can move it).
+pub struct Rehomed {
+    pub ready: u32,
+    pub sleeping: u32,
+    pub left: u32,
+    pub current: Option<u64>,
+}
+
+/// GATESTEAL — the thief's step 3 for a task leaving a dead core: home, migration count, residency clock.
+fn rehome_fields(task: &mut Task, live: usize, now_ms: u64) {
+    task.cpu = live as u32;
+    task.migrations = task.migrations.saturating_add(1);
+    task.migrate_ms = now_ms;
+}
+
+/// GATESTEAL — move every ready and sleeping task on `dead` to `live` (see the block above). Returns
+/// what moved and what could not. A no-op (all zeros, `current: None`) when `dead`/`live` are out of
+/// range, equal, or `live` does not dispatch — the caller chose badly and nothing is touched.
+pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
+    let mut r = Rehomed { ready: 0, sleeping: 0, left: 0, current: None };
+    if dead >= MAX_CPUS || live >= MAX_CPUS || dead == live || !cpu_dispatching(live) {
+        return r;
+    }
+    let now_ms = crate::arch::ms();
+    let dead_ticks = percpu::cpu(dead).map_or(0, |p| p.ticks.load(Ordering::Relaxed));
+    let live_ticks = percpu::cpu(live).map_or(0, |p| p.ticks.load(Ordering::Relaxed));
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // READY tasks: highest level first, one lock held at a time; a cooperative ring-3 task may not
+        // land on the clock core, so it goes back on the dead queue and is counted as left.
+        let mut keep: alloc::vec::Vec<Box<Task>> = alloc::vec::Vec::new();
+        loop {
+            let took = RUN_QUEUES[dead].lock().pop_highest();
+            let Some(mut task) = took else { break };
+            if live == 0 && task.is_cooperative_user() {
+                keep.push(task);
+                continue;
+            }
+            rehome_fields(&mut task, live, now_ms);
+            let prio = task.priority;
+            RUN_QUEUES[live].lock().push(task);
+            poke_for(live, prio);
+            r.ready += 1;
+        }
+        for task in keep.drain(..) {
+            r.left += 1;
+            RUN_QUEUES[dead].lock().push(task);
+        }
+        // SLEEPERS: the deadline is re-based from the dead core's tick domain to the live core's.
+        let mut keep_s: alloc::vec::Vec<Sleeper> = alloc::vec::Vec::new();
+        loop {
+            let took = SLEEPERS[dead].lock().pop_front();
+            let Some(Sleeper { deadline, mut task }) = took else { break };
+            if live == 0 && task.is_cooperative_user() {
+                keep_s.push(Sleeper { deadline, task });
+                continue;
+            }
+            rehome_fields(&mut task, live, now_ms);
+            let left = deadline.saturating_sub(dead_ticks);
+            SLEEPERS[live].lock().push_back(Sleeper { deadline: live_ticks.saturating_add(left), task });
+            r.sleeping += 1;
+        }
+        for s in keep_s.drain(..) {
+            r.left += 1;
+            SLEEPERS[dead].lock().push_back(s);
+        }
+    });
+    match SCHED[dead].current_tid.load(Ordering::Relaxed) {
+        0 => {}
+        t => r.current = Some(t),
+    }
+    serial_println!(
+        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; the current task is in no queue and stays) ::",
+        dead,
+        live,
+        r.ready,
+        r.sleeping,
+        r.left,
+        r.current.map_or(-1i64, |t| t as i64)
+    );
+    r
 }
