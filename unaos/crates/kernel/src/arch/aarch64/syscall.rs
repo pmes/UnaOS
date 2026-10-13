@@ -26208,6 +26208,8 @@ fn ptr_abs_arrival(asid: u64) {
     let packed = una_abi::input_ev_pack(INPUT_EV_MOUSE_ABS, una_abi::input_ev_xy_payload(x, y));
     USER_INPUT_BUF[a][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
     USER_INPUT_TAIL[a].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
+}
+
 // =================================================================================================
 // CURSORSHAPE (rmbp-ledger B550; R108 — the pane contract's INPUT half) — `SYS_CURSOR_SHAPE` (69, una-abi) on
 // aarch64, the x86 tail block's twin with the ASID as the owner key (this arch's focus word holds the ASID, 0 = the
