@@ -407,7 +407,7 @@ pub fn selftest() {
     let rebind = rebind_probe();
     let icon = crate::fs::appres::icon_probe();
     let launch = launch_probe(&mt);
-    let (copy, copy_admin) = copy_probe(&mt);
+    let (copy, copy_admin) = if attrs { copy_probe(&mt) } else { ("skip", String::from("-(no-attr-root)")) }; // UIREDS26 (B559): `copied`'s precondition — a root that takes no attributes is the read-only boot FAT (R99), nothing to copy into
     GRANTS.lock().retain(|g| !g.path.starts_with("/volumes/apptrust-probe/"));
 
     let ok = foreign_ok && refused && asked != "FAIL" && copied != "refused" && rebind != "FAIL" && icon == "root" && launch != "FAIL" && copy != "REFUSED";
