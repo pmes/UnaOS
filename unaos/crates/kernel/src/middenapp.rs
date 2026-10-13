@@ -39,6 +39,16 @@
 //! operator presses Ctrl+Tab, which the program binds to the same completion. The status then carries cmds=8 (help,
 //! run, ls, cd, history, cd, echo, wc) and the last plan `Host wc`.
 //!
+//! SHELLABI (rmbp-ledger B565) — TWO MORE DRIVES, before the pipeline one (so the last plan stays `Host wc`): a PROGRAM
+//! as a pipeline's SECOND stage — [`PROG_PIPE`]: `echo hi | run /apps/MIDDEN.ELF -c cat⏎`, the shell launches the
+//! one-shot child with SPAWN_PIPE and hands it the echo's line through `SYS_PIPE_WRITE` (una-abi 71: each byte a
+//! KEY_DOWN on the child's ring, then KEY_EOT), the child's `cat` reads it off its ring and writes it back through the
+//! RING3PIPE pipe, and at the child's EOF the shell says `:: MIDDEN: pipeline stages=2 last=/apps/MIDDEN.ELF rows=1
+//! ok=1 ::` (the child's own `:: MIDDEN: ` wire is not counted as data); and a KILL — `run /apps/MIDDEN.ELF -c cat⏎`
+//! (no input fed, so the child waits on its ring) waited on its `plan=Exec … served=1`, then `kill %1⏎`, which the
+//! shell serves with `SYS_KILL` (una-abi 72, parenthood-gated) — `:: MIDDEN: kill ok=1 via=builtin pid=<p> …`. The
+//! status then carries cmds=12 (the eight above, plus echo, run, run, kill).
+//!
 //! WITNESS. `:: MIDDENAPP: image=/apps/MIDDEN.ELF window=<elf|fixed|bad> lines=<n> plan=<verb> run=<ok|step> drives=<name:ok|step,…> -> PASS|FAIL ::`
 //! preceded by `[middenapp] …` (pid, slot, timings, the decoded status) and, on FAIL/SKIP, `:: MIDDENAPP:
 //! reason=… ::`. No `MIDDEN.ELF` on the volume is a SKIP (the builder stages it; a bare kernel has none).
@@ -57,20 +67,27 @@ const EXIT_MS: u64 = 5_000;
 const RUN_LINE: &[u8] = b"run /apps/MIDDEN.ELF -c help\n";
 const W_RUN: &str = ":: MIDDEN: pipe eof ok=1 ";
 const RUN_MS: u64 = 10_000;
-/// MIDDEN2 (SR120): the shell drives — `(name, keys typed, the watched wire prefix)`, in order. 0x09 Tab, 0x12 Ctrl+R,
-/// 0x1F Up (una_abi::KEY_UP), 0x15 Ctrl+U (kill the recalled line before the pipeline is typed).
-const DRIVES: [(&str, &[u8], &str); 7] = [
-    ("cd", b"cd /apps\n", ":: MIDDEN: cd ok=1 cwd=/apps ::"),
-    ("complete", b"histo\t", ":: MIDDEN: complete ok=1 word=histo got=history "),
-    ("complete-run", b"\n", ":: MIDDEN: plan=Host verb=history served=1 "),
-    ("search", b"\x12cd", ":: MIDDEN: recall ok=1 via=search line=cd /apps "),
-    ("search-run", b"\n", ":: MIDDEN: cd ok=1 cwd=/apps ::"),
-    ("up", b"\x1f", ":: MIDDEN: recall ok=1 via=up line=cd /apps "),
-    ("pipe", b"\x15echo alpha beta gamma | wc\n", ":: MIDDEN: pipeline stages=2 last=wc rows=1 ok=1 ::"),
+/// MIDDEN2 (SR120): the shell drives — `(name, keys typed, the watched wire prefix, ms)`, in order. 0x09 Tab, 0x12
+/// Ctrl+R, 0x1F Up (una_abi::KEY_UP), 0x15 Ctrl+U (kill the recalled line before the next line is typed). SHELLABI
+/// (B565): `prog-pipe`, `launch` and `kill` — a child loads off the volume, so they wait RUN_MS.
+const DRIVES: [(&str, &[u8], &str, u64); 10] = [
+    ("cd", b"cd /apps\n", ":: MIDDEN: cd ok=1 cwd=/apps ::", DRIVE_MS),
+    ("complete", b"histo\t", ":: MIDDEN: complete ok=1 word=histo got=history ", DRIVE_MS),
+    ("complete-run", b"\n", ":: MIDDEN: plan=Host verb=history served=1 ", DRIVE_MS),
+    ("search", b"\x12cd", ":: MIDDEN: recall ok=1 via=search line=cd /apps ", DRIVE_MS),
+    ("search-run", b"\n", ":: MIDDEN: cd ok=1 cwd=/apps ::", DRIVE_MS),
+    ("up", b"\x1f", ":: MIDDEN: recall ok=1 via=up line=cd /apps ", DRIVE_MS),
+    ("prog-pipe", PROG_PIPE, ":: MIDDEN: pipeline stages=2 last=/apps/MIDDEN.ELF rows=1 ok=1 ::", RUN_MS),
+    ("launch", b"run /apps/MIDDEN.ELF -c cat\n", ":: MIDDEN: plan=Exec verb=run served=1 ", RUN_MS),
+    ("kill", b"kill %1\n", ":: MIDDEN: kill ok=1 via=builtin ", RUN_MS),
+    ("pipe", b"\x15echo alpha beta gamma | wc\n", ":: MIDDEN: pipeline stages=2 last=wc rows=1 ok=1 ::", DRIVE_MS),
 ];
 const DRIVE_MS: u64 = 5_000;
-/// MIDDEN2: what the drives leave in the exit status — eight planned lines, the last `Host wc`.
-const WANT_CMDS: u32 = 8;
+/// SHELLABI (B565): a program as a pipeline's SECOND stage (Ctrl+U first: the `up` drive left `cd /apps` on the line).
+const PROG_PIPE: &[u8] = b"\x15echo hi | run /apps/MIDDEN.ELF -c cat\n";
+/// MIDDEN2: what the drives leave in the exit status — twelve planned lines (SHELLABI adds echo, run, run, kill), the
+/// last `Host wc`.
+const WANT_CMDS: u32 = 12;
 const WANT_VERB: &str = "wc";
 
 /// Register `tests midden` once (`tests::ensure_shellux`'s line; `tests-at-boot` runs it there).
@@ -114,13 +131,23 @@ fn wait_line(pid: u64, ms: u64) -> Result<u64, &'static str> {
 }
 
 /// Type `s` into the ring of the process in `slot`, one KEY_DOWN per byte (`\n` is Enter, as the router sends it).
+/// SHELLABI (B565): PACED — a byte waits (yielding, up to TYPE_MS) while TYPE_DEPTH events sit unread, so a line longer
+/// than the 32-event ring arrives whole instead of being cut at the ring's end; a stalled program still fails the drive.
 fn type_line(slot: u64, s: &[u8]) -> bool {
     let mut ok = true;
     for &b in s {
+        let t0 = crate::arch::ticks();
+        while sc::user_input_depth(slot + 1) >= TYPE_DEPTH && crate::arch::ticks() < t0 + TYPE_MS {
+            crate::arch::sched::yield_now();
+        }
         ok &= sc::user_input_push_owner(slot + 1, una_abi::input_ev_pack(una_abi::INPUT_EV_KEY_DOWN, b as u64));
     }
     ok
 }
+
+/// SHELLABI: `type_line`'s pacing — the unread depth a byte waits under, and how long it waits.
+const TYPE_DEPTH: u32 = 16;
+const TYPE_MS: u64 = 2_000;
 
 pub fn selftest() {
     let Ok(fs) = crate::fs::rootdisk::program_source() else {
@@ -218,9 +245,9 @@ pub fn selftest() {
     let mut drives = alloc::string::String::new();
     let mut drives_ok = fail.is_none();
     if fail.is_none() {
-        for &(name, keys, watch) in DRIVES.iter() {
+        for &(name, keys, watch, ms) in DRIVES.iter() {
             crate::serial_line::line_watch_arm(watch);
-            let r = if type_line(slot, keys) { wait_line(pid, DRIVE_MS) } else { Err("input-ring-full") };
+            let r = if type_line(slot, keys) { wait_line(pid, ms) } else { Err("input-ring-full") };
             if !drives.is_empty() {
                 drives.push(',');
             }

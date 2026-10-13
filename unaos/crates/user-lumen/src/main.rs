@@ -37,9 +37,9 @@
 // shows / hides the conversations sidebar, Ctrl-P / Ctrl-O select the previous / next reply, Ctrl-Y copies the
 // last code block of the selected reply. Cmd-C copies the selected reply (default the last), Cmd-V pastes
 // (SYS_CLIP_GET, the clipboard verb). Cmd-K (the desktop's ClearView action) starts a new conversation. Esc
-// cancels an answer in flight (so does the footer's [stop]) and NEVER closes the window (R24). Ctrl+Enter is
-// not deliverable: the HID fold suppresses Ctrl with a non-letter (drivers/xhci/mod.rs hid_key_ascii), so Enter
-// alone sends. Commands: /new /list /open N /rename T /delete /model [M] /system [T|-] /search Q /copy
+// cancels an answer in flight (so does the footer's [stop]) and NEVER closes the window (R24). Ctrl+Enter sends too
+// (SHELLABI, rmbp-ledger B565: the HID fold presses it as una-abi KEY_CTRL_ENTER 0x8E, drivers/xhci/mod.rs
+// hid_key_ascii), exactly as Enter does. Commands: /new /list /open N /rename T /delete /model [M] /system [T|-] /search Q /copy
 // /copycode /help.
 //
 // LUMEN2 — THE CHAT A PERSON USES. Replies STREAM (vein_core's incremental SSE decode, Claude's stream or
@@ -798,7 +798,7 @@ impl App {
             return;
         }
         match k {
-            b'\n' => {}
+            b'\n' | una_abi::KEY_CTRL_ENTER => {} // SHELLABI (B565): both send — the main loop's `send` arm
             0x08 | 0x7f => {
                 if self.caret > 0 {
                     self.inp.copy_within(self.caret..self.inp_n, self.caret - 1);
@@ -2815,7 +2815,7 @@ pub extern "C" fn _start() -> ! {
                 if ev < 0 {
                     break;
                 }
-                if input_ev_type(ev as u64) == INPUT_EV_KEY_DOWN && input_ev_payload(ev as u64) as u8 == b'\n' && a.side.search.is_none() {
+                if input_ev_type(ev as u64) == INPUT_EV_KEY_DOWN && matches!(input_ev_payload(ev as u64) as u8, b'\n' | una_abi::KEY_CTRL_ENTER) && a.side.search.is_none() {
                     send = true; // LUMEN2: Enter in the find row opens the pick instead (search_key)
                 }
                 a.event(ev as u64);
