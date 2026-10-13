@@ -41,14 +41,17 @@ static ROOT_PORT: AtomicU16 = AtomicU16::new(0);
 pub fn ours_unafs_part(port: u8) -> Option<(u64, u64)> {
     let sel = block::ahci_info_port(port)?.id(BlockHandle::Ahci { port });
     let p = super::selfinstall::probe(sel, port).ok()?;
-    if !matches!(p.verdict, super::selfinstall::Verdict::Ours) || !p.unafs_present {
+    // INSTALL4 (B619): or a STRANGER's disk the beside install wrote — its one UnaFS partition is ours by
+    // content (no other OS writes a UnaFS superblock) AND by type (UNAFS); the root grant is that extent only.
+    let beside = matches!(p.verdict, super::selfinstall::Verdict::Stranger(_)) && p.unafs_present;
+    if !(matches!(p.verdict, super::selfinstall::Verdict::Ours) && p.unafs_present) && !beside {
         return None;
     }
     let t = super::BlockTarget::bind_id(sel).ok()?;
     let c = super::partition::census(&t).ok()?;
     let rows: alloc::vec::Vec<_> = c.rows.iter().filter(|r| r.content == super::partition::Content::UnaFs).collect();
     // Exactly one UnaFS partition: two would make "the root" a guess.
-    if rows.len() != 1 {
+    if rows.len() != 1 || (beside && !rows[0].entry.is_unafs_type()) {
         return None;
     }
     Some((rows[0].entry.first_lba, rows[0].entry.last_lba))
