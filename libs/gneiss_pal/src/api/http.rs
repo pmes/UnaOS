@@ -672,15 +672,19 @@ pub mod blocking {
 /// masking (§5.3), fragmentation (§5.4), control frames (§5.5: close, ping, pong), UTF-8 validation of text
 /// (§8.1) and the closing handshake with status codes (§7).
 ///
-/// Transport: `ws://` over a std `TcpStream`. `wss://` needs a `tls_core` session the host transport keeps
-/// private (http_core `host::Tls`), so it answers an error naming that until http_core exposes an upgraded
-/// connection — the connection loop is written against [`ws::Transport`] so the TLS stream plugs in unchanged.
+/// Transport: `ws://` over a std `TcpStream`; `wss://` (AETHERWSS, SR77) through http_core's upgraded-connection
+/// API, `host::Agent::upgrade` — the same dial, proxy (CONNECT) and trust store as every https request, the TLS
+/// session kept on its pump thread and the 101 stream handed back as a `host::Upgraded`, which implements
+/// [`ws::Transport`] so the connection loop runs over it unchanged ([`ws::connect_via`] takes any scheme through an
+/// Agent the caller configures).
 pub mod ws {
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    use http_core::host::{self, Agent, AgentConfig, Upgraded};
 
     use super::{CookieJar, Error, Headers, Url};
 
@@ -973,6 +977,15 @@ pub mod ws {
 
     /// The client's opening handshake for `url` (a parsed `ws:`/`wss:` URL): the request bytes and the key.
     pub fn handshake_request(url: &Url, protocols: &[String], extra: &[(String, String)]) -> Result<(Vec<u8>, String), Error> {
+        let (h, key) = handshake_headers(protocols, extra)?;
+        let bytes = http_core::h1::encode_request_head("GET", &url.request_target(), &url.host_str(), &h, None)
+            .map_err(|e| Error::new(format!("websocket handshake: {e:?}")))?;
+        Ok((bytes, key))
+    }
+
+    /// The opening handshake's fields (§4.1: Upgrade, Connection, a fresh Sec-WebSocket-Key, version 13, the
+    /// subprotocols, then `extra`) and the key.
+    pub fn handshake_headers(protocols: &[String], extra: &[(String, String)]) -> Result<(Headers, String), Error> {
         let key = base64(&random_bytes::<16>());
         let mut h = Headers::new();
         let set = |h: &mut Headers, k: &str, v: &str| h.append(k, v).map_err(|e| Error::new(format!("invalid header {k}: {e:?}")));
@@ -986,9 +999,7 @@ pub mod ws {
         for (k, v) in extra {
             set(&mut h, k, v)?;
         }
-        let bytes = http_core::h1::encode_request_head("GET", &url.request_target(), &url.host_str(), &h, None)
-            .map_err(|e| Error::new(format!("websocket handshake: {e:?}")))?;
-        Ok((bytes, key))
+        Ok((h, key))
     }
 
     /// §4.1's client checks on the server's handshake. Answers the selected subprotocol ("" for none).
@@ -1025,7 +1036,7 @@ pub mod ws {
 
     // ------------------------------------------------------------ the connection
 
-    /// A byte stream the connection runs over (a socket now; a TLS session when http_core exposes one).
+    /// A byte stream the connection runs over: a socket (`ws://`) or http_core's upgraded connection (`wss://`).
     pub trait Transport: Send {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
         fn write_all(&mut self, data: &[u8]) -> std::io::Result<()>;
@@ -1045,6 +1056,24 @@ pub mod ws {
         }
         fn shutdown(&mut self) {
             let _ = TcpStream::shutdown(self, std::net::Shutdown::Both);
+        }
+    }
+
+    /// http_core's upgraded connection (plain or TLS) — the `wss://` transport. A read past the timeout answers
+    /// `TimedOut`; writes over TLS are queued to the session's pump in order; `shutdown` sends them, then
+    /// close_notify.
+    impl Transport for Upgraded {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            Read::read(self, buf)
+        }
+        fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+            Write::write_all(self, data)
+        }
+        fn set_read_timeout(&mut self, d: Option<Duration>) -> std::io::Result<()> {
+            Upgraded::set_read_timeout(self, d)
+        }
+        fn shutdown(&mut self) {
+            Upgraded::shutdown(self);
         }
     }
 
@@ -1103,11 +1132,7 @@ pub mod ws {
         let u = Url::parse(url)?;
         match u.scheme() {
             "ws" => {}
-            "wss" => {
-                return Err(Error::new(
-                    "wss:// is owed: http_core's host transport keeps its tls_core session private (no upgraded-connection API)",
-                ));
-            }
+            "wss" => return connect_via(&upgrade_agent(cfg), url, cfg),
             s => return Err(Error::new(format!("not a WebSocket URL scheme: {s}"))),
         }
         let host = u.hostname();
@@ -1130,21 +1155,59 @@ pub mod ws {
         Client::handshake(Box::new(s), &u, cfg)
     }
 
-    impl Client {
-        /// Runs the opening handshake over an already-connected transport.
-        pub fn handshake(mut t: Box<dyn Transport>, u: &Url, cfg: &Config) -> Result<Client, Error> {
-            let mut extra = cfg.headers.clone();
-            if let Some(jar) = &cfg.cookies {
-                // The handshake is an HTTP request to the http(s) form of the URL (WebSockets §4: cookies apply).
-                let http_form = u.href().replacen("ws", "http", 1);
-                if let Ok(hu) = Url::parse(&http_form) {
-                    if let Some(c) = jar.lock().ok().and_then(|mut j| j.cookie_header(&hu, now_secs(), true)) {
-                        if !c.is_empty() {
-                            extra.push(("Cookie".into(), c));
-                        }
+    /// The Agent a `wss://` connect goes through: the environment's proxy and the system trust store, as every
+    /// https request; no jar (the handshake carries `cfg.cookies` itself), no content decoding, no redirects; the
+    /// handshake's connect and per-read timeouts are `cfg.connect_timeout`.
+    fn upgrade_agent(cfg: &Config) -> Agent {
+        Agent::new(AgentConfig {
+            timeout: Some(cfg.connect_timeout),
+            connect_timeout: cfg.connect_timeout,
+            user_agent: None,
+            max_redirects: 0,
+            decode: false,
+            cookies: None,
+            ..Default::default()
+        })
+    }
+
+    /// Opens `url` (`ws:` or `wss:`) through `agent`'s upgraded-connection API (`host::Agent::upgrade`): its dial,
+    /// proxy and trust settings; the opening handshake's request is http_core's, its checks are §4.1's here.
+    pub fn connect_via(agent: &Agent, url: &str, cfg: &Config) -> Result<Client, Error> {
+        let u = Url::parse(url)?;
+        if !matches!(u.scheme(), "ws" | "wss") {
+            return Err(Error::new(format!("not a WebSocket URL scheme: {}", u.scheme())));
+        }
+        let http_form = Url::parse(&u.href().replacen("ws", "http", 1))?;
+        let (headers, key) = handshake_headers(&cfg.protocols, &handshake_extra(&u, cfg))?;
+        let mut req = host::Request::new("GET", http_form);
+        req.headers = headers;
+        let up = agent
+            .upgrade(req)
+            .map_err(|e| Error { timeout: matches!(e, http_core::Error::Timeout), msg: format!("websocket handshake: {e}") })?;
+        let head = up.head.clone();
+        Client::established(Box::new(up), &head, &[], &key, &u, cfg)
+    }
+
+    /// `cfg.headers` plus the jar's Cookie for the URL's http(s) form (WebSockets §4: cookies apply).
+    fn handshake_extra(u: &Url, cfg: &Config) -> Vec<(String, String)> {
+        let mut extra = cfg.headers.clone();
+        if let Some(jar) = &cfg.cookies {
+            let http_form = u.href().replacen("ws", "http", 1);
+            if let Ok(hu) = Url::parse(&http_form) {
+                if let Some(c) = jar.lock().ok().and_then(|mut j| j.cookie_header(&hu, now_secs(), true)) {
+                    if !c.is_empty() {
+                        extra.push(("Cookie".into(), c));
                     }
                 }
             }
+        }
+        extra
+    }
+
+    impl Client {
+        /// Runs the opening handshake over an already-connected transport.
+        pub fn handshake(mut t: Box<dyn Transport>, u: &Url, cfg: &Config) -> Result<Client, Error> {
+            let extra = handshake_extra(u, cfg);
             let (req, key) = handshake_request(u, &cfg.protocols, &extra)?;
             let io = |e: std::io::Error| Error::new(format!("websocket handshake: {e}"));
             t.set_read_timeout(Some(cfg.connect_timeout)).map_err(io)?;
@@ -1164,7 +1227,13 @@ pub mod ws {
                     return Err(Error::new("websocket handshake: response head too large"));
                 }
             };
-            let protocol = check_handshake(&head, &key, &cfg.protocols)?;
+            Client::established(t, &head, &buf[used..], &key, u, cfg)
+        }
+
+        /// §4.1's checks on the server's head, the 101's cookies, and the connection — `rest` being what was read
+        /// past the head (the first frames may already be there).
+        fn established(t: Box<dyn Transport>, head: &http_core::h1::ResponseHead, rest: &[u8], key: &str, u: &Url, cfg: &Config) -> Result<Client, Error> {
+            let protocol = check_handshake(head, key, &cfg.protocols)?;
             let set_cookies: Vec<String> = head.headers.get_all("set-cookie").map(str::to_string).collect();
             if let (Some(jar), true) = (&cfg.cookies, cfg.store_cookies) {
                 let http_form = u.href().replacen("ws", "http", 1);
@@ -1175,7 +1244,7 @@ pub mod ws {
                 }
             }
             let mut dec = FrameDecoder::new();
-            dec.push(&buf[used..]);
+            dec.push(rest);
             Ok(Client {
                 t,
                 dec,
@@ -1347,8 +1416,8 @@ pub mod ws {
 #[cfg(test)]
 mod ws_tests {
     use super::ws::{
-        accept_key, base64, check_handshake, close_payload, connect, encode_frame, handshake_request, parse_close, sha1, Config,
-        FrameDecoder, Message, WsError, OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT,
+        accept_key, base64, check_handshake, close_payload, connect, connect_via, encode_frame, handshake_request, parse_close, sha1,
+        Config, FrameDecoder, Message, WsError, OP_BINARY, OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT,
     };
 
     fn hex(s: &str) -> Vec<u8> {
@@ -1533,5 +1602,84 @@ mod ws_tests {
         assert_eq!((frames[1].opcode, &frames[1].payload[..]), (OP_PONG, &b"p2"[..]));
         assert_eq!((frames[2].fin, frames[2].opcode, &frames[2].payload[..]), (false, OP_BINARY, &b"ab"[..]));
         assert_eq!((frames[3].fin, frames[3].opcode, &frames[3].payload[..]), (true, OP_CONT, &b"cd"[..]));
+    }
+
+    /// AETHERWSS (SR77): the connection over http_core's upgraded-connection API (`host::Agent::upgrade`, the path
+    /// `wss://` takes; `ws://` here so no TLS is involved). The server sends the 101 and its first frame in ONE
+    /// write: that frame must survive the head read inside http_core and be the client's first message.
+    #[test]
+    fn client_over_agent_upgrade_keeps_early_frames() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut tmp).unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            let key = req.lines().find_map(|l| l.strip_prefix("Sec-WebSocket-Key: ")).unwrap().trim().to_string();
+            let mut out = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: chat\r\n\r\n",
+                accept_key(&key)
+            )
+            .into_bytes();
+            out.extend_from_slice(&encode_frame(true, OP_TEXT, b"early", None));
+            s.write_all(&out).unwrap();
+            let mut d = FrameDecoder::new();
+            let frame = loop {
+                if let Some(f) = d.next_frame().unwrap() {
+                    break f;
+                }
+                let n = s.read(&mut tmp).unwrap();
+                assert!(n > 0, "client closed before its frame");
+                d.push(&tmp[..n]);
+            };
+            s.write_all(&encode_frame(true, OP_CLOSE, &close_payload(Some(1000), ""), None)).unwrap();
+            (req, frame)
+        });
+        let agent = http_core::host::Agent::new(http_core::host::AgentConfig {
+            proxy: http_core::host::ProxyMode::None,
+            tickets: None,
+            aia: false,
+            ..Default::default()
+        });
+        let cfg = Config { protocols: vec!["chat".into()], ..Config::default() };
+        let mut c = connect_via(&agent, &format!("ws://127.0.0.1:{port}/sock"), &cfg).unwrap();
+        assert_eq!(c.protocol, "chat");
+        let t = std::time::Duration::from_millis(500);
+        assert_eq!(c.read(t).unwrap(), Some(Message::Text("early".into())));
+        c.send_text("hi").unwrap();
+        let close = loop {
+            if let Some(m) = c.read(t).unwrap() {
+                break m;
+            }
+        };
+        assert_eq!(close, Message::Close(Some((1000, String::new()))));
+        let (req, frame) = srv.join().unwrap();
+        assert!(req.starts_with("GET /sock HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("Sec-WebSocket-Version: 13\r\n"), "{req}");
+        assert!(frame.mask.is_some());
+        assert_eq!((frame.opcode, &frame.payload[..]), (OP_TEXT, &b"hi"[..]));
+    }
+
+    /// `wss://` is no longer refused up front: a connect to a closed port fails at the dial (or at the proxy's
+    /// CONNECT, when the environment names one), not with "owed".
+    #[test]
+    fn wss_is_not_refused_up_front() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cfg = Config { connect_timeout: std::time::Duration::from_secs(2), ..Config::default() };
+        let e = match connect(&format!("wss://127.0.0.1:{port}/"), &cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("nothing listens there"),
+        };
+        assert!(!e.contains("owed"), "{e}");
+        assert!(e.starts_with("websocket handshake:"), "{e}");
     }
 }

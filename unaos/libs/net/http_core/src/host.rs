@@ -344,6 +344,10 @@ fn proxy_for(mode: &ProxyMode, url: &Url) -> Option<(String, u16)> {
 
 // ---------------------------------------------------------------- transports
 
+/// AETHERWSS (SR77): the upgraded-connection API ([`Agent::upgrade`]) — the 101 stream as one `Read + Write + Send`.
+mod upgrade;
+pub use upgrade::Upgraded;
+
 /// A std socket as a byte transport, remembering why it failed.
 struct Tcp {
     s: TcpStream,
@@ -615,22 +619,7 @@ impl Agent {
     /// Events arrive on `sink`. Cookies from the jar are added here.
     pub fn dispatch(&self, req: &Request, sink: Box<dyn EventSink>) {
         let cfg = &self.inner.cfg;
-        let mut headers = req.headers.clone();
-        if let Some(jar) = &cfg.cookies {
-            if !headers.contains("cookie") {
-                if let Some(c) = jar.lock().ok().and_then(|mut j| j.cookie_header(&req.url, now_secs(), true)) {
-                    let _ = headers.set("Cookie", &c);
-                }
-            }
-        }
-        if let Some(ua) = &cfg.user_agent {
-            if !headers.contains("user-agent") {
-                let _ = headers.set("User-Agent", ua);
-            }
-        }
-        if cfg.decode && !headers.contains("accept-encoding") {
-            let _ = headers.set("Accept-Encoding", encoding::ACCEPT_ENCODING);
-        }
+        let headers = self.request_headers(req, cfg.decode);
         let job = Job {
             method: req.method.clone(),
             url: req.url.clone(),
@@ -669,6 +658,29 @@ impl Agent {
             .name(format!("http-conn-{id}"))
             .spawn(move || connection_thread(inner, key, id, job))
             .expect("spawn connection thread");
+    }
+
+    /// The fields every request carries from this Agent: the jar's cookies, the User-Agent, and (when the
+    /// body will be decoded) Accept-Encoding — each only when the caller did not set it.
+    fn request_headers(&self, req: &Request, accept_encoding: bool) -> Headers {
+        let cfg = &self.inner.cfg;
+        let mut headers = req.headers.clone();
+        if let Some(jar) = &cfg.cookies {
+            if !headers.contains("cookie") {
+                if let Some(c) = jar.lock().ok().and_then(|mut j| j.cookie_header(&req.url, now_secs(), true)) {
+                    let _ = headers.set("Cookie", &c);
+                }
+            }
+        }
+        if let Some(ua) = &cfg.user_agent {
+            if !headers.contains("user-agent") {
+                let _ = headers.set("User-Agent", ua);
+            }
+        }
+        if accept_encoding && !headers.contains("accept-encoding") {
+            let _ = headers.set("Accept-Encoding", encoding::ACCEPT_ENCODING);
+        }
+        headers
     }
 
     /// After a hop's head: store its cookies, and decide whether to follow a redirect. `hops` = redirects
@@ -839,6 +851,34 @@ fn tunnel(t: &mut Tcp, host: &str, port: u16) -> Result<(), Error> {
     Ok(())
 }
 
+/// The TLS client for `host` over `t`, exactly as every exchange builds it: the Agent's trust store (CTCORE
+/// intermediates and CT list attached), the AIA issuer fetcher when `cfg.aia`, TLS 1.2 enabled beside 1.3, the
+/// Agent's ticket store for resumption, and `alpn` offered. `tls_core`'s client borrows its provider, config and
+/// verifier, so the session lives inside `f` (on the calling thread) and never outlives this frame.
+fn with_tls<R>(cfg: &AgentConfig, host: &str, alpn: Vec<Vec<u8>>, t: Tcp, f: impl for<'a> FnOnce(Result<TlsClient<'a, Tcp>, Error>) -> R) -> R {
+    let store = match resolve_trust(&cfg.trust) {
+        Ok(s) => s,
+        Err(e) => return f(Err(e)),
+    };
+    let provider = CryptoCoreProvider::new();
+    let web = WebPkiVerifier { store: &store, clock: &SystemClock };
+    let fetcher = HttpIssuerFetcher::new(cfg);
+    let aia = tls_core::x509::aia::AiaVerifier::new(WebPkiVerifier { store: &store, clock: &SystemClock }, &fetcher);
+    let verifier: &dyn tls_core::ServerCertVerifier = if cfg.aia { &aia } else { &web };
+    let name = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let mut tcfg = ClientConfig::new(Some(&name), verifier);
+    tcfg.enable_tls12(); // TLSCORE2 (SR58): TLS 1.3 preferred, 1.2 (ECDHE + AEAD, EMS) for the long tail
+    tcfg.alpn = alpn;
+    tcfg.resumption = cfg
+        .tickets
+        .as_ref()
+        .map(|t| tls_core::resumption::Resumption { store: &**t, clock: &SystemClock });
+    match TlsClient::connect(&provider, &tcfg, t) {
+        Ok(c) => f(Ok(c)),
+        Err(e) => f(Err(Error::Tls(describe_tls(&e)))),
+    }
+}
+
 fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
     let cfg = inner.cfg.clone();
     let fail = |job: Job, e: Error| {
@@ -859,46 +899,29 @@ fn connection_thread(inner: Arc<Inner>, key: PoolKey, id: u64, first: Job) {
         }
     }
     if key.scheme == "https" {
-        let store = match resolve_trust(&cfg.trust) {
-            Ok(s) => s,
-            Err(e) => return fail(first, e),
-        };
-        let provider = CryptoCoreProvider::new();
-        let web = WebPkiVerifier { store: &store, clock: &SystemClock };
-        let fetcher = HttpIssuerFetcher::new(&cfg);
-        let aia = tls_core::x509::aia::AiaVerifier::new(WebPkiVerifier { store: &store, clock: &SystemClock }, &fetcher);
-        let verifier: &dyn tls_core::ServerCertVerifier = if cfg.aia { &aia } else { &web };
-        let name = key.host.trim_start_matches('[').trim_end_matches(']').to_string();
-        let mut tcfg = ClientConfig::new(Some(&name), verifier);
-        tcfg.enable_tls12(); // TLSCORE2 (SR58): TLS 1.3 preferred, 1.2 (ECDHE + AEAD, EMS) for the long tail
-        tcfg.alpn = cfg.alpn.clone();
-        tcfg.resumption = cfg
-            .tickets
-            .as_ref()
-            .map(|t| tls_core::resumption::Resumption { store: &**t, clock: &SystemClock });
-        let client = match TlsClient::connect(&provider, &tcfg, t) {
-            Ok(c) => c,
-            Err(e) => {
-                return fail(first, Error::Tls(describe_tls(&e)));
-            }
-        };
-        let alpn_h2 = client.negotiated().alpn.as_deref() == Some(b"h2");
-        let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
-        #[cfg(feature = "h2")]
-        if alpn_h2 {
-            let mut h2c = match crate::h2::H2Conn::handshake(tls) {
+        with_tls(&cfg, &key.host, cfg.alpn.clone(), t, |client| {
+            let client = match client {
                 Ok(c) => c,
                 Err(e) => return fail(first, e),
             };
-            serve(&inner, &key, id, first, |job, reused| exchange_h2(&mut h2c, &key, job, reused));
-            let _ = h2c.transport_mut().c.close();
-            return;
-        }
-        #[cfg(not(feature = "h2"))]
-        let _ = alpn_h2;
-        let mut conn = Conn::new(tls);
-        serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
-        let _ = conn.transport.c.close();
+            let alpn_h2 = client.negotiated().alpn.as_deref() == Some(b"h2");
+            let tls = Tls { c: client, pending: Vec::new(), pos: 0 };
+            #[cfg(feature = "h2")]
+            if alpn_h2 {
+                let mut h2c = match crate::h2::H2Conn::handshake(tls) {
+                    Ok(c) => c,
+                    Err(e) => return fail(first, e),
+                };
+                serve(&inner, &key, id, first, |job, reused| exchange_h2(&mut h2c, &key, job, reused));
+                let _ = h2c.transport_mut().c.close();
+                return;
+            }
+            #[cfg(not(feature = "h2"))]
+            let _ = alpn_h2;
+            let mut conn = Conn::new(tls);
+            serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
+            let _ = conn.transport.c.close();
+        });
     } else {
         let mut conn = Conn::new(t);
         serve(&inner, &key, id, first, |job, reused| exchange(&mut conn, &key, job, reused));
