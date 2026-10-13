@@ -1300,13 +1300,13 @@ fn show_message(path: &str, reason: &str) {
     if surf.try_reserve_exact(vw * vh).is_err() {
         return;
     }
-    surf.resize(vw * vh, crate::video::theme::opaque(crate::video::theme::content_fill()));
+    surf.resize(vw * vh, crate::video::theme::opaque(crate::video::theme::surface_content()));
     let face = crate::video::text::Face::Body;
     let ch = face.cell_h();
     let l1 = alloc::format!("Cannot show {}", title_of(path));
     let l2 = alloc::format!("reason: {}", reason);
-    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8, l1.as_bytes(), crate::video::theme::content_text(), false, face);
-    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8 + ch + 4, l2.as_bytes(), crate::video::theme::error_text(), false, face);
+    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8, l1.as_bytes(), crate::video::theme::text_primary(), false, face);
+    crate::video::text::draw_text(&mut surf, vw, vw - 8, vh, 8, 8 + ch + 4, l2.as_bytes(), crate::video::theme::ink_critical(), false, face);
     *SURF.lock() = surf;
     match mint(&title_of(path), vw, vh) {
         Ok(id) => {

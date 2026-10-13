@@ -328,20 +328,20 @@ pub fn paint_overlay(m: &Model, px: &mut [u32]) {
         };
         let label: &str = if attr_label.is_empty() { label } else { attr_label.as_str() };
         let (x, w) = if y == 0 { (0, g.w) } else { (li.x, li.w) };
-        fill(px, g, x, y, w, rh, crate::video::theme::field_bg());
+        fill(px, g, x, y, w, rh, crate::video::theme::surface_content());
         keyline(px, g, Rect { x, y, w, h: rh }, theme::accent());
         let mut s: Vec<u8> = Vec::new();
         s.extend_from_slice(label.as_bytes());
         s.extend_from_slice(e.buf.as_bytes());
         s.push(b'_');
-        text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::content_text());
+        text(px, g, x + PAD(), y + g.ts, &s, x + w, theme::text_primary());
     }
     if let Some(mn) = MENU.lock().as_ref() {
         let (w, h) = (menu_w(g), menu_h(g));
-        fill(px, g, mn.x, mn.y, w, h, theme::button_face());
-        keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::frame_line());
+        fill(px, g, mn.x, mn.y, w, h, theme::surface_raised());
+        keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::line_subtle());
         for (i, it) in ITEMS.iter().enumerate() {
-            text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::button_text());
+            text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, it.label().as_bytes(), mn.x + w, theme::text_primary());
         }
     }
     super::getinfo::paint(m, px); // ATTRCOLUMNS (B402): the inspector

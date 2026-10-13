@@ -195,7 +195,7 @@ fn top(sel: Option<usize>, len: usize, vis: usize) -> usize {
 /// Returns the panes on the glass.
 pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
     let g = &m.geom;
-    fill(px, g, li.x, li.y, li.w, li.h, theme::content_fill());
+    fill(px, g, li.x, li.y, li.w, li.h, theme::surface_content());
     let cols = plan(m);
     let l = lay(g, li, &cols);
     let rh = g.row_h();
@@ -205,7 +205,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
         let Some(r) = l.rects[i] else { continue };
         shown += 1;
         if r.x + r.w < li.x + li.w {
-            fill(px, g, r.x + r.w - 1, r.y, 1, r.h, theme::frame_line());
+            fill(px, g, r.x + r.w - 1, r.y, 1, r.h, theme::line_subtle());
         }
         if c.kind == Kind::Preview {
             paint_preview(g, px, r, &c.path);
@@ -213,7 +213,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
         }
         if c.kind == Kind::Focus {
             if let Some(e) = &m.err {
-                text(px, g, r.x + PAD(), r.y + PAD(), e.as_bytes(), r.x + r.w - 1, theme::content_text());
+                text(px, g, r.x + PAD(), r.y + PAD(), e.as_bytes(), r.x + r.w - 1, theme::text_primary());
                 continue;
             }
         }
@@ -225,9 +225,9 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
             let sel = c.sel == Some(j);
             let hot = sel && live && c.kind == Kind::Focus;
             if sel {
-                fill(px, g, r.x, y, r.w - 1, rh, if hot { theme::accent() } else { theme::scroll_thumb() });
+                fill(px, g, r.x, y, r.w - 1, rh, if hot { theme::accent() } else { theme::line_strong() });
             }
-            let ink = if hot { theme::chrome_face() } else { theme::content_text() };
+            let ink = if hot { theme::surface_window() } else { theme::text_primary() };
             text(px, g, r.x + PAD(), y + g.ts, name.as_bytes(), (r.x + r.w).saturating_sub(chev), ink);
             if *dir {
                 text(px, g, (r.x + r.w).saturating_sub(chev) + g.ts, y + g.ts, b">", r.x + r.w - 1, ink);
@@ -236,9 +236,9 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
     }
     if l.first > 0 && l.total > 0 {
         let y = li.y + li.h.saturating_sub(strip_h());
-        fill(px, g, li.x, y, li.w, strip_h(), theme::scroll_track());
+        fill(px, g, li.x, y, li.w, strip_h(), theme::surface_sunken());
         let tw = (li.w * li.w / l.total).max(strip_h());
-        fill(px, g, li.x + li.w * l.off / l.total, y, tw.min(li.w), strip_h(), theme::scroll_thumb());
+        fill(px, g, li.x + li.w * l.off / l.total, y, tw.min(li.w), strip_h(), theme::line_strong());
     }
     let deepest = cols.last().map(|c| c.path.clone()).unwrap_or_default();
     let mut s = SAID.lock();
@@ -267,7 +267,7 @@ fn paint_preview(g: &Geom, px: &mut [u32], r: Rect, path: &str) {
     super::iconview::draw_icon(px, g.w, g.h, r.x + (w - s) / 2, r.y + 4 * PAD(), s, path, false, g.face);
     let leaf = path.rsplit('/').next().unwrap_or(path).as_bytes();
     let tw = leaf.len() * g.cell_w();
-    text(px, g, r.x + w.saturating_sub(tw) / 2, r.y + 6 * PAD() + s, leaf, r.x + w, theme::content_text());
+    text(px, g, r.x + w.saturating_sub(tw) / 2, r.y + 6 * PAD() + s, leaf, r.x + w, theme::text_primary());
     *WANT.lock() = Some((String::from(path), w, h));
 }
 
@@ -283,7 +283,7 @@ pub(super) fn service() {
         serial_println!("[quarry] columns preview DECLINE reason=oom bytes={}", w * h * 4);
         return;
     }
-    surf.resize(w * h, theme::content_fill());
+    surf.resize(w * h, theme::surface_content());
     super::quicklook::render_into(&path, &mut surf, w, h);
     *PREV.lock() = Some(Prev { path, w, h, surf });
     super::repaint();
@@ -422,7 +422,7 @@ pub fn selftest() {
             let (w, h) = (r.w - 1, r.h);
             let mut s: Vec<u32> = alloc::vec![0; w * h];
             let (via, _) = super::quicklook::render_into(&cols[panes - 1].path, &mut s, w, h);
-            (via, s.iter().filter(|&&p| p != theme::content_fill()).count())
+            (via, s.iter().filter(|&&p| p != theme::surface_content()).count())
         }
         _ => ("none", 0),
     };

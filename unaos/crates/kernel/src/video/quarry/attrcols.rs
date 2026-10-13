@@ -301,7 +301,7 @@ pub(super) fn paint_header(px: &mut [u32], g: &Geom, c: &Cols, y: usize, chev: &
             s.push_str(chev);
         }
         let next = c.attrs.get(n + 1).map(|t| t.1).unwrap_or(c.clip).min(c.clip);
-        text(px, g, x, y, s.as_bytes(), next, theme::title_text_inactive());
+        text(px, g, x, y, s.as_bytes(), next, theme::text_secondary());
     }
 }
 
@@ -377,8 +377,8 @@ pub(super) fn paint_menu(m: &Model, px: &mut [u32]) {
     let guard = MENU.lock();
     let Some(mn) = guard.as_ref() else { return };
     let (w, h) = (menu_w(g), mn.items.len() * g.row_h() + 2);
-    fill(px, g, mn.x, mn.y, w, h, theme::button_face());
-    keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::frame_line());
+    fill(px, g, mn.x, mn.y, w, h, theme::surface_raised());
+    keyline(px, g, Rect { x: mn.x, y: mn.y, w, h }, theme::line_subtle());
     for (i, it) in mn.items.iter().enumerate() {
         let s = match it {
             Item::Title => String::from("Add column…"),
@@ -386,7 +386,7 @@ pub(super) fn paint_menu(m: &Model, px: &mut [u32]) {
             Item::Attr(k, t, on) => alloc::format!("{} {} ({})", if *on { "[x]" } else { "[ ]" }, k, t),
             Item::Empty => String::from("  no attributes in this folder"),
         };
-        let ink = if matches!(it, Item::Title | Item::Std(_) | Item::Empty) { theme::title_text_inactive() } else { theme::button_text() };
+        let ink = if matches!(it, Item::Title | Item::Std(_) | Item::Empty) { theme::text_secondary() } else { theme::text_primary() };
         let s = s.replace('…', "...");
         text(px, g, mn.x + PAD(), mn.y + 1 + i * g.row_h() + g.ts, s.as_bytes(), mn.x + w, ink);
     }

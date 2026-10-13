@@ -453,7 +453,7 @@ fn glyph(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, s: usize) {
             let ring = d2 <= r * r && d2 >= (r - 2).max(0) * (r - 2).max(0);
             let stroke = px - cx == py - cy && px > cx + r / 2 && px < x as i32 + s as i32 - 2;
             if ring || stroke {
-                buf[py as usize * w + px as usize] = theme::bevel_light();
+                buf[py as usize * w + px as usize] = theme::surface_raised();
             }
         }
     }
@@ -465,23 +465,23 @@ fn paint(st: &mut St) {
     let lh = ch + 10;
     let pad = 12usize;
     let buf = &mut st.buf;
-    fill(buf, w, h, 0, 0, w, h, theme::chrome_face());
-    fill(buf, w, h, 0, 0, w, 1, theme::frame_line());
-    fill(buf, w, h, 0, h - 1, w, 1, theme::frame_line());
-    fill(buf, w, h, 0, 0, 1, h, theme::frame_line());
-    fill(buf, w, h, w - 1, 0, 1, h, theme::frame_line());
+    fill(buf, w, h, 0, 0, w, h, theme::surface_window());
+    fill(buf, w, h, 0, 0, w, 1, theme::line_subtle());
+    fill(buf, w, h, 0, h - 1, w, 1, theme::line_subtle());
+    fill(buf, w, h, 0, 0, 1, h, theme::line_subtle());
+    fill(buf, w, h, w - 1, 0, 1, h, theme::line_subtle());
     // The field.
     let fy = pad;
     let fh = lh + 8;
-    fill(buf, w, h, pad, fy, w - 2 * pad, fh, theme::bevel_light());
-    fill(buf, w, h, pad, fy + fh - 1, w - 2 * pad, 1, theme::frame_line());
+    fill(buf, w, h, pad, fy, w - 2 * pad, fh, theme::surface_raised());
+    fill(buf, w, h, pad, fy + fh - 1, w - 2 * pad, 1, theme::line_subtle());
     glyph(buf, w, h, pad + 6, fy + (fh - ch) / 2, ch);
     let tx = pad + 12 + ch;
     let ty = fy + (fh - ch) / 2;
     if st.query.is_empty() {
-        text(buf, w, h, "Launcher - programs, files, settings, or a sum", tx, ty, theme::title_text_inactive(), false);
+        text(buf, w, h, "Launcher - programs, files, settings, or a sum", tx, ty, theme::text_secondary(), false);
     } else {
-        text(buf, w, h, &st.query, tx, ty, theme::content_text(), false);
+        text(buf, w, h, &st.query, tx, ty, theme::text_primary(), false);
         let cx = tx + st.query.len() * menubar::BAR_CELL_W() + 1;
         fill(buf, w, h, cx, ty, 2, ch, theme::accent());
     }
@@ -490,14 +490,14 @@ fn paint(st: &mut St) {
     let mut y = fy + fh + 6;
     let mut last: Option<Kind> = None;
     if !st.query.is_empty() && st.items.is_empty() {
-        text(buf, w, h, "No results", pad + 8, y + 4, theme::title_text_inactive(), false);
+        text(buf, w, h, "No results", pad + 8, y + 4, theme::text_secondary(), false);
     }
     for (i, it) in st.items.iter().enumerate() {
         if y + lh > h {
             break;
         }
         if last != Some(it.kind) {
-            text(buf, w, h, it.kind.group(), pad + 4, y + 4, theme::title_text_inactive(), true);
+            text(buf, w, h, it.kind.group(), pad + 4, y + 4, theme::text_secondary(), true);
             y += lh;
             last = Some(it.kind);
             if y + lh > h {
@@ -505,7 +505,7 @@ fn paint(st: &mut St) {
             }
         }
         let on = i == st.sel;
-        let (ink, dim) = if on { (theme::bevel_light(), theme::bevel_light()) } else { (theme::content_text(), theme::title_text_inactive()) };
+        let (ink, dim) = if on { (theme::surface_raised(), theme::surface_raised()) } else { (theme::text_primary(), theme::text_secondary()) };
         if on {
             fill(buf, w, h, pad, y, w - 2 * pad, lh, theme::accent());
         }
@@ -520,8 +520,8 @@ fn paint(st: &mut St) {
                 Kind::Setting => "S",
                 Kind::Math => "=",
             };
-            fill(buf, w, h, ix, iy, ch, ch, if on { theme::bevel_light() } else { theme::frame_line() });
-            text(buf, w, h, mark, ix + ch / 4, iy, if on { theme::accent() } else { theme::bevel_light() }, true);
+            fill(buf, w, h, ix, iy, ch, ch, if on { theme::surface_raised() } else { theme::line_subtle() });
+            text(buf, w, h, mark, ix + ch / 4, iy, if on { theme::accent() } else { theme::surface_raised() }, true);
         }
         let lx = ix + ch + 10;
         text(buf, w, h, &it.label, lx, iy, ink, on);
@@ -570,7 +570,7 @@ pub fn open() -> bool {
     if buf.try_reserve_exact(w * h).is_err() {
         return false;
     }
-    buf.resize(w * h, theme::chrome_face());
+    buf.resize(w * h, theme::surface_window());
     let ox = pw.saturating_sub(w) / 2;
     let oy = (ph / 3).saturating_sub(h / 3).max(ph / 10);
     let mut st = St { query: String::new(), sel: 0, items: Vec::new(), ox, oy, w, h, rows: Vec::new(), buf };

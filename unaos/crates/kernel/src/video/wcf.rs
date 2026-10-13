@@ -677,12 +677,12 @@ fn chrome_probes(
     let strip_x = bx + bw - BORDER() - 2;
     let face_row = BORDER() + TITLE_H() + 8;
     [
-        ("keyline_top", bx + bw / 2, by, super::theme::frame_line()),
+        ("keyline_top", bx + bw / 2, by, super::theme::line_subtle()),
         (
             "bevel_light",
             bx + bw / 2,
             by + super::theme::BEVEL(),
-            super::theme::bevel_light(),
+            super::theme::surface_raised(),
         ),
         (
             "title_top",
@@ -703,7 +703,7 @@ fn chrome_probes(
             "face_left",
             bx + BORDER() - 2,
             by + face_row,
-            super::ceramic::shade(super::theme::chrome_face(), face_row),
+            super::ceramic::shade(super::theme::surface_window(), face_row),
         ),
     ]
 }
@@ -998,7 +998,7 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
         ),
     }
 
-    let face = super::theme::chrome_face();
+    let face = super::theme::surface_window();
     let ceramic_pp = pp(super::ceramic::TILE_H, |k| super::ceramic::shade(face, k));
     let knurl_pp = pp(super::knurl::TILE_W * super::knurl::TILE_H, |k| {
         super::knurl::shade(face, k % super::knurl::TILE_W, k / super::knurl::TILE_W)

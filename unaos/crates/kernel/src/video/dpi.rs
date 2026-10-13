@@ -23,8 +23,12 @@
 //!   the parse KERNELFONT already linked: hactive and the physical width of the preferred timing) times the
 //!   framebuffer's width over that native width, so a GOP mode below the panel's native one reads the density it
 //!   really draws at (the rMBP 15-inch at its native 2880x1800: 221; the 13-inch 2560x1600: 227).
-//! * **scale** — `ppi / 96` rounded to the HALF pixel, carried x2 as an integer (`2` = 1.0 … `8` = 4.0): 221 and
-//!   227 ppi both give 2.5. No EDID (QEMU, a panel without one) or a build without the desktop engine: 1.0.
+//! * **scale** — DESIGNAPPLY (rmbp-ledger B639, R120; DESIGN-LANGUAGE §2.1): `ppi / 110` rounded to the HALF pixel
+//!   (the language's density target, about 110 pt per inch), carried x2 as an integer (`2` = 1.0 … `8` = 4.0): 221
+//!   and 227 ppi both give **2.0** — the rMBP's 2880x1800 draws a 1440x900 logical desktop, as the Mac draws it
+//!   (R120: *"we don't want to make people think we think they're blind"*). It was `ppi / 96` (2.5, a 1152x720
+//!   desktop) until B639. Settings > Display keeps the other steps (1.5 and 2.5 among them, `prefs_core::modes`).
+//!   No EDID (QEMU, a panel without one) or a build without the desktop engine: 1.0.
 //! * The scale is LATCHED once, the first time the console's grid is armed with the panel's width
 //!   ([`latch`]), so every metric derived from it agrees for the whole boot; a reader before that gets the value
 //!   computed from the live panel without latching it.
@@ -36,8 +40,10 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// The reference density: 1 CSS px = 1 device px at 96 ppi.
+/// The reference density: 1 CSS px = 1 device px at 96 ppi (the unit `px` multiplies; a face's size reference).
 pub const BASE_PPI: u32 = 96;
+/// DESIGNAPPLY (B639, R120): the DENSITY TARGET the scale is chosen against — about 110 pt per inch (§2.1).
+pub const DENSITY_PPI: u32 = 110;
 /// Scale x2 bounds: 1.0 ..= 4.0.
 pub const S2_MIN: u32 = 2;
 pub const S2_MAX: u32 = 8;
@@ -70,12 +76,13 @@ pub fn compute(fb_w: usize) -> (u32, u32) {
     (eff, s2_for(eff))
 }
 
-/// `ppi / 96` rounded to the half: `round(ppi * 2 / 96)`, clamped to 1.0 ..= 4.0 (x2).
+/// `ppi / 110` rounded to the half: `round(ppi * 2 / 110)`, clamped to 1.0 ..= 4.0 (x2). DESIGNAPPLY (B639, R120):
+/// 221 ppi (the rMBP 15") -> 4 (2.0); 227 (13") -> 4; 110 -> 2; 192 -> 3 (1.5); 300 -> 5 (2.5).
 pub const fn s2_for(ppi: u32) -> u32 {
     if ppi == 0 {
         return S2_MIN;
     }
-    let s = (ppi * 2 + BASE_PPI / 2) / BASE_PPI;
+    let s = (ppi * 2 + DENSITY_PPI / 2) / DENSITY_PPI;
     if s < S2_MIN {
         S2_MIN
     } else if s > S2_MAX {
@@ -210,4 +217,20 @@ pub fn set_live(s2: u32) -> (u32, u32) {
     PPI.store(ppi, Ordering::Relaxed);
     let before = S2.swap(s2, Ordering::AcqRel);
     (before, s2)
+}
+
+// DESIGNAPPLY (B639) — the rule's arithmetic, checked at compile time: the rMBP panels land on 2.0, the half steps
+// fall where §2.1 says, and the clamp holds.
+const _: () = {
+    assert!(s2_for(221) == 4 && s2_for(227) == 4);
+    assert!(s2_for(110) == 2 && s2_for(165) == 3 && s2_for(192) == 3 && s2_for(275) == 5 && s2_for(300) == 5);
+    assert!(s2_for(1) == S2_MIN && s2_for(2000) == S2_MAX && s2_for(0) == S2_MIN);
+};
+
+/// DESIGNAPPLY (B639): the ppi a FACE should be sized at so text follows the same scale the chrome does —
+/// `scale x 96` (a pt is `scale` device px, §2.1). `video::text` sizes its faces from [`ppi`] (the panel's physical
+/// density, 221 on the rMBP), which now draws text 221/192 = 15 % larger than the 2.0 chrome; the type lane
+/// (FONTSCRAFT) switches `text.rs` to this seam. Pure read of the live scale.
+pub fn face_ppi() -> u32 {
+    s2() * BASE_PPI / 2
 }

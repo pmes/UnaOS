@@ -199,11 +199,11 @@ fn paint(st: &mut St) {
     let shown = ((w.saturating_sub(2 * PAD) + GAP) / slot).min(n).max(1);
     let first = if st.sel >= shown { st.sel + 1 - shown } else { 0 };
     let buf = &mut st.buf;
-    fill(buf, w, h, 0, 0, w, h, theme::chrome_face());
-    fill(buf, w, h, 0, 0, w, 1, theme::frame_line());
-    fill(buf, w, h, 0, h - 1, w, 1, theme::frame_line());
-    fill(buf, w, h, 0, 0, 1, h, theme::frame_line());
-    fill(buf, w, h, w - 1, 0, 1, h, theme::frame_line());
+    fill(buf, w, h, 0, 0, w, h, theme::surface_window());
+    fill(buf, w, h, 0, 0, w, 1, theme::line_subtle());
+    fill(buf, w, h, 0, h - 1, w, 1, theme::line_subtle());
+    fill(buf, w, h, 0, 0, 1, h, theme::line_subtle());
+    fill(buf, w, h, w - 1, 0, 1, h, theme::line_subtle());
     let row_w = shown * slot - GAP;
     let x0 = (w - row_w) / 2;
     for (k, a) in st.apps.iter().enumerate().skip(first).take(shown) {
@@ -213,15 +213,15 @@ fn paint(st: &mut St) {
             fill(buf, w, h, x - GAP / 2, PAD - GAP / 2, s + GAP, s + GAP, theme::selection());
         }
         if !crate::fs::appres::blit_key_icon(buf, w, h, x, PAD, s, &a.key) {
-            fill(buf, w, h, x, PAD, s, s, theme::frame_line());
+            fill(buf, w, h, x, PAD, s, s, theme::line_subtle());
             let mark = &a.name[..a.name.len().min(1)];
-            text(buf, w, h, &mark.to_ascii_uppercase(), x + (s - cw) / 2, PAD + (s - ch) / 2, theme::bevel_light(), true);
+            text(buf, w, h, &mark.to_ascii_uppercase(), x + (s - cw) / 2, PAD + (s - ch) / 2, theme::surface_raised(), true);
         }
         if on {
             let name = &a.name[..a.name.len().min(w / cw - 2)];
             let tw = name.len() * cw;
             let tx = (x + s / 2).saturating_sub(tw / 2).clamp(PAD / 2, w.saturating_sub(tw + PAD / 2));
-            text(buf, w, h, name, tx, PAD + s + 8, theme::content_text(), true);
+            text(buf, w, h, name, tx, PAD + s + 8, theme::text_primary(), true);
         }
     }
 }
@@ -259,7 +259,7 @@ fn open_strip() -> bool {
     if buf.try_reserve_exact(w * h).is_err() {
         return false;
     }
-    buf.resize(w * h, theme::chrome_face());
+    buf.resize(w * h, theme::surface_window());
     st.w = w;
     st.h = h;
     st.buf = buf;

@@ -16,6 +16,12 @@
 
 //! CRISPY-PI — the Crispy desktop theme as a kernel-side `const` table.
 //!
+//! **DESIGNAPPLY (rmbp-ledger B639, R120–R122) supersedes this header for COLOUR.** The palette is DESIGN-LANGUAGE
+//! §2.3's semantic tokens (`palette_core`, named by job, generated in OKLCH), not the kit's 21 material roles; the
+//! gloss, the bevel and the two-stop title gradient the sections below describe are retired, and the window frame
+//! is gone from the compositor (§2.4: a shadow outside the box instead). The kit json stays the record for the
+//! metrics that still follow it. The history below is kept as written.
+//!
 //! # Source of record
 //!
 //! `kits/crispy/theme.json` @ branch `us-crispy-modern`, commit `0787ba9f`. The
@@ -128,172 +134,38 @@
 //! any of this; only the *interpolation between* them carries the same caveat.
 
 // ---------------------------------------------------------------------------
-// Palette — 21 roles, packed 0x00RRGGBB. Every provenance comment below quotes
-// the json triple at `us-crispy-modern` `0787ba9f`; the value is `palette_core`'s (B559), re-exported by name.
+// DESIGNAPPLY (rmbp-ledger B639, R121) — the SEMANTIC tokens, DESIGN-LANGUAGE §2.3.
+//
+// The 21 kit roles that stood here (`chrome_face`, `bevel_light`/`bevel_shadow`, `frame_line`, the two-stop
+// `title_active_*`/`title_inactive_*` gradient, `button_face*`, `content_*`, `scroll_*`, the blue `control_*` ramp,
+// the gloss and its three Q16 scalars) named MATERIALS: they drew an Aqua-era bevelled window, which is the "early
+// X-windows vibe" Peter named (2026-10-14). They are REPLACED, in one commit, by the language's tokens named by
+// JOB; every painter was repointed in that commit (old role -> new token, `docs/dev/evidence/designapply/
+// DESIGNAPPLY.md` §2). Values are `palette_core`'s (B559), `(light, dark)` pairs, re-exported by name. The default
+// accent keeps its name `crispy` (R121) and takes §2.3's periwinkle. The window-control discs are §2.3's own values
+// (OKLCH (0.66 0.19 28), (0.83 0.15 85), (0.74 0.17 150)), no longer macOS's exact hexes. The status colours are
+// fixed (not accent-derived). The gloss is gone (§3.1 "Removed: … the gloss gradient").
 // ---------------------------------------------------------------------------
 
-/// `palette.chrome_face` = `[0.925, 0.925, 0.933]` @ `0787ba9f` — the window body fill.
-pub use palette_core::CHROME_FACE;
+/// `surface.*` — window, sidebar, content, raised, overlay, sunken (`(light, dark)`).
+pub use palette_core::{SURFACE_CONTENT, SURFACE_OVERLAY, SURFACE_RAISED, SURFACE_SIDEBAR, SURFACE_SUNKEN, SURFACE_WINDOW};
+/// `line.*` — subtle (separators, card borders), strong (window outline), control (>= 3:1 control borders).
+pub use palette_core::{LINE_CONTROL, LINE_STRONG, LINE_SUBTLE};
+/// `text.*` — primary, secondary, tertiary, disabled.
+pub use palette_core::{TEXT_DISABLED, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY};
+/// The window-control discs (Una), the same in both sets.
+pub use palette_core::{CTRL_CLOSE, CTRL_MIN, CTRL_ZOOM};
+/// `status.*` — the fixed fills (white label >= 4.5:1) and their Dark inks.
+pub use palette_core::{STATUS_CRITICAL, STATUS_INFO, STATUS_INK_DARK, STATUS_POSITIVE, STATUS_WARNING};
+/// `scrim`, `rim.dark`, the label on a fill.
+pub use palette_core::{ON_FILL, RIM_DARK, RIM_DARK_ALPHA, SCRIM_ALPHA};
+/// The accent ladder (§2.3's accent rule): fill (= [`ACCENTS`]), hover, pressed, ink on Light, ink on Dark.
+pub use palette_core::{ACCENT, ACCENT_HOVER, ACCENT_INK_DARK, ACCENT_INK_LIGHT, ACCENT_PRESSED};
+/// The retiring materials' base tones (`paper`'s engine survives for the wallpaper; §9).
+pub use palette_core::material;
 
-/// `palette.bevel_light` = `[1.0, 1.0, 1.0]` @ `0787ba9f` — top/left bevel edge.
-pub use palette_core::BEVEL_LIGHT;
-
-/// `palette.bevel_shadow` = `[0.667, 0.667, 0.686]` @ `0787ba9f` — bottom/right bevel edge.
-pub use palette_core::BEVEL_SHADOW;
-
-/// `palette.frame_line` = `[0.706, 0.706, 0.725]` @ `0787ba9f` — the outer keyline of the frame.
-pub use palette_core::FRAME_LINE;
-
-/// `palette.title_active_top` = `[0.933, 0.933, 0.945]` @ `0787ba9f` — focused title gradient, top stop.
-pub use palette_core::TITLE_ACTIVE_TOP;
-
-/// `palette.title_active_bottom` = `[0.89, 0.89, 0.91]` @ `0787ba9f` — focused title gradient, bottom stop.
-pub use palette_core::TITLE_ACTIVE_BOTTOM;
-
-/// `palette.title_inactive_top` = `[0.957, 0.957, 0.961]` @ `0787ba9f` — unfocused title gradient, top stop.
-pub use palette_core::TITLE_INACTIVE_TOP;
-
-/// `palette.title_inactive_bottom` = `[0.937, 0.937, 0.945]` @ `0787ba9f` — unfocused title gradient, bottom stop.
-pub use palette_core::TITLE_INACTIVE_BOTTOM;
-
-/// `palette.title_text_active` = `[0.145, 0.149, 0.161]` @ `0787ba9f` — focused title caption ink.
-pub use palette_core::TITLE_TEXT_ACTIVE;
-
-/// `palette.title_text_inactive` = `[0.478, 0.478, 0.494]` @ `0787ba9f` — unfocused title caption ink.
-pub use palette_core::TITLE_TEXT_INACTIVE;
-
-/// `palette.button_face` = `[0.973, 0.973, 0.98]` @ `0787ba9f` — resting button face.
-pub use palette_core::BUTTON_FACE;
-
-/// `palette.button_face_pressed` = `[0.878, 0.878, 0.89]` @ `0787ba9f` — pressed button face.
-pub use palette_core::BUTTON_FACE_PRESSED;
-
-/// `palette.button_text` = `[0.125, 0.129, 0.141]` @ `0787ba9f` — button label ink.
-pub use palette_core::BUTTON_TEXT;
-
-/// `palette.content_fill` = `[0.96, 0.949, 0.918]` @ `0787ba9f` — content-region base fill.
-///
-/// Unchanged across the CRISPY-PI-2 re-lift: iteration 3 kept the paper tone, and
-/// `content_surface.Paper.base_rgb` still agrees with it by construction.
-pub use palette_core::CONTENT_FILL;
-
-/// `palette.content_text` = `[0.129, 0.125, 0.118]` @ `0787ba9f` — content-region ink.
-pub use palette_core::CONTENT_TEXT;
-
-/// `palette.scroll_track` = `[0.949, 0.949, 0.957]` @ `0787ba9f` — scrollbar trough.
-pub use palette_core::SCROLL_TRACK;
-
-/// `palette.scroll_thumb` = `[0.796, 0.796, 0.812]` @ `0787ba9f` — scrollbar thumb.
-pub use palette_core::SCROLL_THUMB;
-
-/// `palette.accent` = `[0.29, 0.451, 0.667]` @ `0787ba9f` — selection / focus accent.
-pub use palette_core::ACCENT;
-
-// ---------------------------------------------------------------------------
-// Title-bar controls. Iteration 3 replaces the single square `CONTROL_BOX` role
-// with three *circular* controls, each with its own fill: a left-to-right ramp of
-// the accent hue from darkest (close) to lightest (zoom). The geometry is still
-// one number — `CONTROL_BOX` below, now read as a circle's diameter.
-// ---------------------------------------------------------------------------
-
-/// `palette.control_close` = `[0.239, 0.373, 0.573]` @ `0787ba9f` — close control fill.
-pub use palette_core::CONTROL_CLOSE;
-
-/// `palette.control_mid` = `[0.404, 0.549, 0.729]` @ `0787ba9f` — middle (minimise) control fill.
-pub use palette_core::CONTROL_MID;
-
-/// `palette.control_zoom` = `[0.573, 0.667, 0.788]` @ `0787ba9f` — zoom control fill.
-pub use palette_core::CONTROL_ZOOM;
-
-// ---------------------------------------------------------------------------
-// SEMANTIC control fills — Peter's ruling, 2026-08-09 (white board Q9, answer
-// "b on a red yellow green top left of window").
-//
-// ⛔ PROVENANCE, STATED PLAINLY: these three are DERIVED, not lifted. They do not
-// appear in any `palette.*` entry of any kit revision, because `kits/crispy/` is
-// not reachable from this repo (white-board Q4, the standing gap; the shared-source
-// law currently rests on in-tree triangulation). They are entered here as the
-// authored source of record and are PENDING RE-LIFT into
-// `kits/crispy/theme.json` — as `palette.ctrl_close` / `_min` / `_zoom` — the
-// moment that kit is reachable. No kit hash is cited above them, deliberately: a
-// fabricated citation would be worse than the gap it papers over.
-//
-// ### The register is APPLE'S, by ruling — superseding this arc's own derivation
-//
-// These three were first entered as MUTED derivations (`#C25F55 / #C89C52 /
-// #5E9468`): the macOS hues pulled down to the Scandinavian-minimal saturation the
-// rest of this table sits in, on the argument that fully saturated signals fight the
-// near-white chrome (`0xEEEEF1`) and the muted `ACCENT` (`0x4A73AA`).
-//
-// Peter is the taste gate and he overruled it, 2026-08-09, verbatim:
-//
-//     "same color as mac but knurled if possible to add more texture"
-//
-// So the values below are now the **macOS standard hues, unmodified**, and the
-// texture that was to have come from restraint comes instead from the material:
-// `video/knurl.rs` mills a diamond crosshatch into the discs at the same
-// 2 %-of-a-channel budget `paper` and `ceramic` share. The earlier muted triple is
-// recorded here rather than deleted, because the argument for it was recorded and a
-// reversed decision should show its own reversal.
-//
-// The three blue `CONTROL_*` roles above are KEPT. They are the kit's own ramp and
-// this arc has no authority to delete a lifted role; nothing in the tree consumes
-// them since `paint_window` moved to the semantic set, so they stand as the record
-// of what the kit says until the re-lift reconciles the two.
-// ---------------------------------------------------------------------------
-
-/// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — CLOSE control fill:
-/// the macOS standard close hue, `#FF5F57`, hue 3°. Supersedes this table's earlier
-/// muted derivation `#C25F55`. Pending re-lift as `palette.ctrl_close`.
-///
-/// Its red channel is already `0xFF`, so `knurl`'s crest CLIPS on this role and the
-/// crosshatch reads there as its trough alone — disclosed in `knurl.rs` and pinned by
-/// that module's leg 4 rather than left as an unchecked note.
-pub use palette_core::CTRL_CLOSE;
-
-/// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — MINIMISE control
-/// fill: the macOS standard minimise hue, `#FEBC2E`, hue 43°. Supersedes this table's
-/// earlier muted derivation `#C89C52`. Pending re-lift as `palette.ctrl_min`.
-pub use palette_core::CTRL_MIN;
-
-/// DERIVED (Peter's ruling, 2026-08-09, *"same color as mac"*) — ZOOM control fill:
-/// the macOS standard zoom hue, `#28C840`, hue 128°. Supersedes this table's earlier
-/// muted derivation `#5E9468`. Pending re-lift as `palette.ctrl_zoom`.
-pub use palette_core::CTRL_ZOOM;
-
-// ---------------------------------------------------------------------------
-// Gloss — `palette.gloss`. A white highlight applied with a two-stop alpha
-// falloff. The three scalars are unit values in the json; they are carried here as
-// **Q16 fixed point** (`value * 65536`, same round-half-up rule) rather than `u8`,
-// because they are ramp *endpoints* fed to an interpolator, not final pixel alphas.
-// See the module header: the gloss ramp is explicitly outside the bit-for-bit
-// claim, and Q16 keeps the endpoint error negligible so the only error left is the
-// interpolator's own. Convert to 0..=255 at the point of use.
-// ---------------------------------------------------------------------------
-
-/// Fixed-point scale for the gloss scalars: `Q16_ONE` represents `1.0`.
+/// Fixed-point scale for a Q16 blend: `Q16_ONE` represents `1.0`.
 pub const Q16_ONE: u32 = 65536;
-
-/// `palette.gloss.highlight` = `[1.0, 1.0, 1.0]` @ `0787ba9f` — the gloss colour.
-///
-/// Unchanged across the CRISPY-PI-2 re-lift; note that iteration 3 also takes
-/// `BEVEL_LIGHT` to pure white, so the two roles now coincide numerically. They stay
-/// separate names because they are separate roles in the json and may diverge again.
-pub use palette_core::GLOSS_HIGHLIGHT;
-
-/// `palette.gloss.top_alpha` = `0.14` @ `0787ba9f` — gloss opacity at the top edge, Q16.
-pub const GLOSS_TOP_ALPHA_Q16: u32 = 9175;
-
-/// `palette.gloss.falloff` = `0.5` @ `0787ba9f` — gloss falloff shape parameter, Q16.
-///
-/// The host stores this as a unit scalar and clamps it to `[0.01, 1.0]` before use.
-pub const GLOSS_FALLOFF_Q16: u32 = 32768;
-
-/// `palette.gloss.bottom_alpha` = `0.0` @ `0787ba9f` — gloss opacity at the bottom edge, Q16.
-///
-/// Iteration 3 takes the ramp to fully transparent at the bottom: the gloss now dies
-/// out entirely rather than leaving CRISPY-PI's `0.06` floor across the lower chrome.
-pub const GLOSS_BOTTOM_ALPHA_Q16: u32 = 0;
 
 // ---------------------------------------------------------------------------
 // Metrics — `metrics.*`, all integral in the json, all pixels unless noted.
@@ -433,102 +305,28 @@ pub const LINE_HEIGHT_PCT: usize = 165;
     const _: () = assert!(LINE_HEIGHT_PCT > 100);
 }
 
-/// Every colour is a packed `0x00RRGGBB`: the alpha byte is zero, because the json
-/// palette carries no per-colour alpha. If a future kit adds alpha, this block is
-/// the tripwire that says so.
+/// DESIGNAPPLY (B639): the token table's shape, checked at compile time — every value a packed `0x00RRGGBB`, the
+/// pairs the language requires to differ differing in both sets (a collapsed pair would erase a job: the window
+/// from its content, the three discs from each other, a disc from the title it sits on).
 const _: () = {
-    const ROLES: [u32; 25] = [
-        CTRL_CLOSE,
-        CTRL_MIN,
-        CTRL_ZOOM,
-        CHROME_FACE,
-        BEVEL_LIGHT,
-        BEVEL_SHADOW,
-        FRAME_LINE,
-        TITLE_ACTIVE_TOP,
-        TITLE_ACTIVE_BOTTOM,
-        TITLE_INACTIVE_TOP,
-        TITLE_INACTIVE_BOTTOM,
-        TITLE_TEXT_ACTIVE,
-        TITLE_TEXT_INACTIVE,
-        BUTTON_FACE,
-        BUTTON_FACE_PRESSED,
-        BUTTON_TEXT,
-        CONTENT_FILL,
-        CONTENT_TEXT,
-        SCROLL_TRACK,
-        SCROLL_THUMB,
-        ACCENT,
-        CONTROL_CLOSE,
-        CONTROL_MID,
-        CONTROL_ZOOM,
-        GLOSS_HIGHLIGHT,
+    const PAIRS: [(u32, u32); 13] = [
+        SURFACE_WINDOW, SURFACE_SIDEBAR, SURFACE_CONTENT, SURFACE_RAISED, SURFACE_OVERLAY, SURFACE_SUNKEN,
+        LINE_SUBTLE, LINE_STRONG, LINE_CONTROL, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY, TEXT_DISABLED,
     ];
     let mut i = 0;
-    while i < ROLES.len() {
-        assert!(ROLES[i] >> 24 == 0);
+    while i < PAIRS.len() {
+        assert!(PAIRS[i].0 >> 24 == 0 && PAIRS[i].1 >> 24 == 0);
+        assert!(PAIRS[i].0 != PAIRS[i].1); // Light and Dark are separate sets, never one value
         i += 1;
     }
-};
-
-/// Roles the json gives distinct values must stay distinct after rounding — a
-/// collapsed pair here means a bevel, a gradient, or a state change has gone
-/// invisible.
-const _: () = {
-    assert!(BEVEL_LIGHT != CHROME_FACE);
-    assert!(BEVEL_SHADOW != CHROME_FACE);
-    assert!(BEVEL_LIGHT != BEVEL_SHADOW);
-    assert!(FRAME_LINE != CHROME_FACE);
-    assert!(TITLE_ACTIVE_TOP != TITLE_ACTIVE_BOTTOM);
-    assert!(TITLE_INACTIVE_TOP != TITLE_INACTIVE_BOTTOM);
-    assert!(TITLE_ACTIVE_TOP != TITLE_INACTIVE_TOP);
-    assert!(TITLE_ACTIVE_BOTTOM != TITLE_INACTIVE_BOTTOM);
-    assert!(TITLE_TEXT_ACTIVE != TITLE_TEXT_INACTIVE);
-    assert!(BUTTON_FACE != BUTTON_FACE_PRESSED);
-    assert!(BUTTON_TEXT != BUTTON_FACE);
-    assert!(CONTENT_TEXT != CONTENT_FILL);
-    assert!(SCROLL_THUMB != SCROLL_TRACK);
-    assert!(ACCENT != CHROME_FACE);
-    // The three circular controls are a ramp: each must be visibly its own step, and
-    // each must stand off the title bar it sits on.
-    assert!(CONTROL_CLOSE != CONTROL_MID);
-    assert!(CONTROL_MID != CONTROL_ZOOM);
-    assert!(CONTROL_CLOSE != CONTROL_ZOOM);
-    assert!(CONTROL_CLOSE != TITLE_ACTIVE_TOP);
-    assert!(CONTROL_MID != TITLE_ACTIVE_TOP);
-    assert!(CONTROL_ZOOM != TITLE_ACTIVE_TOP);
-    // The SEMANTIC set carries the same two obligations, and one more that the blue
-    // ramp never had: three DIFFERENT HUES, not three steps of one. A pair that
-    // collapsed here would put the destructive control and a harmless one in the
-    // same colour, which is the exact failure this set exists to remove.
-    assert!(CTRL_CLOSE != CTRL_MIN);
-    assert!(CTRL_MIN != CTRL_ZOOM);
-    assert!(CTRL_CLOSE != CTRL_ZOOM);
-    assert!(CTRL_CLOSE != TITLE_ACTIVE_TOP);
-    assert!(CTRL_MIN != TITLE_ACTIVE_TOP);
-    assert!(CTRL_ZOOM != TITLE_ACTIVE_TOP);
-    assert!(CTRL_CLOSE != TITLE_INACTIVE_TOP);
-    assert!(CTRL_MIN != TITLE_INACTIVE_TOP);
-    assert!(CTRL_ZOOM != TITLE_INACTIVE_TOP);
-    // The gloss must be lighter than what it glosses, or it is not a highlight.
-    assert!(GLOSS_HIGHLIGHT != CHROME_FACE);
-    // The gloss fades downward. Iteration 3 takes the bottom stop to exactly 0, so
-    // this is the assertion that the ramp still has a direction at all.
-    assert!(GLOSS_TOP_ALPHA_Q16 > GLOSS_BOTTOM_ALPHA_Q16);
-    //
-    // NOTE: `BEVEL_LIGHT == GLOSS_HIGHLIGHT` at this commit (both pure white), so no
-    // distinctness is asserted between them — the json gives them the same value.
-};
-
-/// The gloss scalars are unit values, so no Q16 form may exceed `1.0`, and the
-/// falloff must be inside the `[0.01, 1.0]` band the host clamps it to.
-///
-/// `GLOSS_BOTTOM_ALPHA_Q16` is exactly `0` at this commit; a `<= Q16_ONE` bound on it
-/// would be vacuous, and the direction assertion above is what actually constrains it.
-const _: () = {
-    assert!(GLOSS_TOP_ALPHA_Q16 <= Q16_ONE);
-    assert!(GLOSS_FALLOFF_Q16 <= Q16_ONE);
-    assert!(GLOSS_FALLOFF_Q16 >= Q16_ONE / 100);
+    assert!(SURFACE_WINDOW.0 != SURFACE_SIDEBAR.0 && SURFACE_WINDOW.1 != SURFACE_SIDEBAR.1);
+    assert!(SURFACE_WINDOW.0 != SURFACE_CONTENT.0 && SURFACE_WINDOW.1 != SURFACE_CONTENT.1);
+    assert!(TEXT_PRIMARY.0 != SURFACE_CONTENT.0 && TEXT_PRIMARY.1 != SURFACE_CONTENT.1);
+    assert!(LINE_SUBTLE.0 != SURFACE_WINDOW.0 && LINE_STRONG.0 != LINE_SUBTLE.0);
+    assert!(CTRL_CLOSE != CTRL_MIN && CTRL_MIN != CTRL_ZOOM && CTRL_CLOSE != CTRL_ZOOM);
+    assert!(CTRL_CLOSE != SURFACE_WINDOW.0 && CTRL_MIN != SURFACE_WINDOW.0 && CTRL_ZOOM != SURFACE_WINDOW.0);
+    assert!(CTRL_CLOSE != SURFACE_WINDOW.1 && CTRL_MIN != SURFACE_WINDOW.1 && CTRL_ZOOM != SURFACE_WINDOW.1);
+    assert!(ACCENT == ACCENTS[0]);
 };
 
 // --- KEYMAP (R60, R61) — THE THEME OWNS ITS KEY BINDINGS ---------------------------------------
@@ -798,7 +596,7 @@ pub const TERM_DIM: u8 = 90;
 // `palette_core`'s (PALETTECORE B559 — the table the four ring-3 programs map their roles over too), re-exported
 // by name. The kit roles above stay as the LIGHT set's provenance (and
 // for the const contexts — selftest goldens, const asserts); every PAINTER reads the live value through the role
-// functions below (`chrome_face()` … `accent()`), which index the active set. `unaos/scripts/appearance-check.py`
+// functions below (`surface_window()` … `accent()`), which index the active set. `unaos/scripts/appearance-check.py`
 // certifies [`AUDIT_LITERALS_OUTSIDE`]: the colour literals under `video/` outside this file (before: 103).
 // The preference is Principia's (`system.appearance.*`, `prefs_core::appearance`); `video::appearance` applies it.
 
@@ -903,47 +701,64 @@ fn mix(a: u32, b: u32, num: u32, den: u32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
-#[inline] pub fn chrome_face() -> u32 { tok(Tok::WindowBg) }
-#[inline] pub fn bevel_light() -> u32 { tok(Tok::BevelLight) }
-#[inline] pub fn bevel_shadow() -> u32 { tok(Tok::BevelShadow) }
-#[inline] pub fn frame_line() -> u32 { tok(Tok::FrameLine) }
-#[inline] pub fn title_active_top() -> u32 { tok(Tok::TitleActiveTop) }
-#[inline] pub fn title_active_bottom() -> u32 { tok(Tok::TitleActiveBottom) }
-#[inline] pub fn title_inactive_top() -> u32 { tok(Tok::TitleInactiveTop) }
-#[inline] pub fn title_inactive_bottom() -> u32 { tok(Tok::TitleInactiveBottom) }
-#[inline] pub fn title_text_active() -> u32 { tok(Tok::TitleTextActive) }
-#[inline] pub fn title_text_inactive() -> u32 { tok(Tok::TitleTextInactive) }
-#[inline] pub fn button_face() -> u32 { tok(Tok::ButtonFace) }
-#[inline] pub fn button_face_pressed() -> u32 { tok(Tok::ButtonFacePressed) }
-#[inline] pub fn button_text() -> u32 { tok(Tok::ButtonText) }
-#[inline] pub fn content_fill() -> u32 { tok(Tok::ContentFill) }
-#[inline] pub fn content_text() -> u32 { tok(Tok::ContentText) }
-#[inline] pub fn scroll_track() -> u32 { tok(Tok::ScrollTrack) }
-#[inline] pub fn scroll_thumb() -> u32 { tok(Tok::ScrollThumb) }
-#[inline] pub fn control_close() -> u32 { tok(Tok::ControlClose) }
-#[inline] pub fn control_mid() -> u32 { tok(Tok::ControlMid) }
-#[inline] pub fn control_zoom() -> u32 { tok(Tok::ControlZoom) }
+// DESIGNAPPLY (B639): the role functions are the TOKENS' — one per §2.3 job, indexing the live set. Every painter
+// in the kernel reads these names (the old material functions were repointed in the same commit; the mapping is
+// `docs/dev/evidence/designapply/DESIGNAPPLY.md` §2).
+#[inline] pub fn surface_window() -> u32 { tok(Tok::SurfaceWindow) }
+#[inline] pub fn surface_sidebar() -> u32 { tok(Tok::SurfaceSidebar) }
+#[inline] pub fn surface_content() -> u32 { tok(Tok::SurfaceContent) }
+#[inline] pub fn surface_raised() -> u32 { tok(Tok::SurfaceRaised) }
+#[inline] pub fn surface_overlay() -> u32 { tok(Tok::SurfaceOverlay) }
+#[inline] pub fn surface_sunken() -> u32 { tok(Tok::SurfaceSunken) }
+#[inline] pub fn line_subtle() -> u32 { tok(Tok::LineSubtle) }
+#[inline] pub fn line_strong() -> u32 { tok(Tok::LineStrong) }
+#[inline] pub fn line_control() -> u32 { tok(Tok::LineControl) }
+#[inline] pub fn text_primary() -> u32 { tok(Tok::TextPrimary) }
+#[inline] pub fn text_secondary() -> u32 { tok(Tok::TextSecondary) }
+#[inline] pub fn text_tertiary() -> u32 { tok(Tok::TextTertiary) }
+#[inline] pub fn text_disabled() -> u32 { tok(Tok::TextDisabled) }
 #[inline] pub fn ctrl_close() -> u32 { tok(Tok::CtrlClose) }
 #[inline] pub fn ctrl_min() -> u32 { tok(Tok::CtrlMin) }
 #[inline] pub fn ctrl_zoom() -> u32 { tok(Tok::CtrlZoom) }
-#[inline] pub fn gloss_highlight() -> u32 { tok(Tok::GlossHighlight) }
-#[inline] pub fn field_bg() -> u32 { tok(Tok::FieldBg) }
-#[inline] pub fn error_text() -> u32 { tok(Tok::ErrorText) }
-#[inline] pub fn meter_high() -> u32 { tok(Tok::MeterHigh) }
-#[inline] pub fn meter_mid() -> u32 { tok(Tok::MeterMid) }
-#[inline] pub fn meter_low() -> u32 { tok(Tok::MeterLow) }
+#[inline] pub fn status_positive() -> u32 { tok(Tok::StatusPositive) }
+#[inline] pub fn status_warning() -> u32 { tok(Tok::StatusWarning) }
+#[inline] pub fn status_critical() -> u32 { tok(Tok::StatusCritical) }
+#[inline] pub fn status_info() -> u32 { tok(Tok::StatusInfo) }
+#[inline] pub fn ink_positive() -> u32 { tok(Tok::InkPositive) }
+#[inline] pub fn ink_warning() -> u32 { tok(Tok::InkWarning) }
+#[inline] pub fn ink_critical() -> u32 { tok(Tok::InkCritical) }
+#[inline] pub fn ink_info() -> u32 { tok(Tok::InkInfo) }
 #[inline] pub fn syntax_code() -> u32 { tok(Tok::SyntaxCode) }
 #[inline] pub fn syntax_num() -> u32 { tok(Tok::SyntaxNum) }
 #[inline] pub fn syntax_lit() -> u32 { tok(Tok::SyntaxLit) }
-/// ControlAccent — the default button, the selected segment, the focused control's ring, the slider knob, the
-/// menu highlight: `system.appearance.accent`.
+/// `accent.fill` — the default button, the selected segment, the toggle-on, the slider fill, the menu highlight:
+/// `system.appearance.accent`.
 #[inline] pub fn accent() -> u32 { ACCENTS[accent_index()] }
+/// `accent.hover` (L - 0.04).
+#[inline] pub fn accent_hover() -> u32 { ACCENT_HOVER[accent_index()] }
+/// `accent.pressed` (L - 0.08).
+#[inline] pub fn accent_pressed() -> u32 { ACCENT_PRESSED[accent_index()] }
+/// `accent.ink` — the accent as text or an icon on this set's surfaces.
+#[inline] pub fn accent_ink() -> u32 { if is_dark() { ACCENT_INK_DARK[accent_index()] } else { ACCENT_INK_LIGHT[accent_index()] } }
+/// The accent's light tint (its Dark-set ink, L 0.80) — the lit facet of the crystal mark, in both sets.
+#[inline] pub fn accent_tint() -> u32 { ACCENT_INK_DARK[accent_index()] }
 /// Selection — text selection behind ink: `system.appearance.highlight`, mixed toward the content ground so the
 /// ink stays legible in both sets (5/8 of the way to the ground in Light, 3/8 in Dark).
 #[inline] pub fn selection() -> u32 {
     let (num, den) = if is_dark() { (3, 8) } else { (5, 8) };
-    mix(ACCENTS[highlight_index()], content_fill(), num, den)
+    mix(ACCENTS[highlight_index()], surface_content(), num, den)
 }
+// LEGACY SPELLINGS — the retired material functions, kept ONLY for the consumers outside DESIGNAPPLY's lane
+// (`winmenu.rs`, `crystal.rs`, `notify.rs`: MENUSCRAFT's; `arch/aarch64/display_tegra.rs`: the Orin track's). Each
+// forwards to the token that now does its job; those lanes repoint and delete this block.
+#[inline] pub fn chrome_face() -> u32 { surface_window() }
+#[inline] pub fn bevel_light() -> u32 { surface_raised() }
+#[inline] pub fn bevel_shadow() -> u32 { line_strong() }
+#[inline] pub fn frame_line() -> u32 { line_subtle() }
+#[inline] pub fn title_text_active() -> u32 { text_primary() }
+#[inline] pub fn title_text_inactive() -> u32 { text_secondary() }
+#[inline] pub fn button_face() -> u32 { surface_raised() }
+#[inline] pub fn content_text() -> u32 { text_primary() }
 
 /// SELFTEST VECTORS — pixel values the painters' selftests feed in or expect back (golden rows of the materials,
 /// synthetic window surfaces). Not chrome; here so the glass's sources name no literal (the audit's rule).
@@ -955,9 +770,9 @@ const _: () = {
         assert!(LIGHT[i] >> 24 == 0 && DARK[i] >> 24 == 0);
         i += 1;
     }
-    assert!(LIGHT[Tok::ContentText as usize] != LIGHT[Tok::ContentFill as usize]);
-    assert!(DARK[Tok::ContentText as usize] != DARK[Tok::ContentFill as usize]);
-    assert!(DARK[Tok::WindowBg as usize] != LIGHT[Tok::WindowBg as usize]);
+    assert!(LIGHT[Tok::TextPrimary as usize] != LIGHT[Tok::SurfaceContent as usize]);
+    assert!(DARK[Tok::TextPrimary as usize] != DARK[Tok::SurfaceContent as usize]);
+    assert!(DARK[Tok::SurfaceWindow as usize] != LIGHT[Tok::SurfaceWindow as usize]);
     assert!(Tok::SyntaxLit as usize + 1 == TOKENS);
     assert!(ACCENTS.len() == 8);
     // PALETTECORE (B559): the core spells the accent names (it has no deps); the kernel links both, so the two lists
@@ -1027,40 +842,37 @@ pub const POINTER_SHAPE_INK: [(u32, u32); 8] = [
 pub const HAIRLINE_ALPHA: u32 = 31;
 /// A control's edge (a check box, a field, an unpressed button): one step firmer than a hairline.
 pub const CONTROL_EDGE_ALPHA: u32 = 56;
-/// The focus ring's opacity over the accent.
-pub const FOCUS_RING_ALPHA: u32 = 120;
+/// The focus ring's opacity: opaque (DESIGNAPPLY B639, §2.7: the ring must change >= 3:1, so it is not faded).
+pub const FOCUS_RING_ALPHA: u32 = 255;
 /// A soft (control-sized) shadow's peak opacity, Light / Dark.
 pub const SHADOW_SOFT_ALPHA: (u32, u32) = (46, 110);
 /// A window's shadow's peak opacity, Light / Dark.
 pub const SHADOW_WINDOW_ALPHA: (u32, u32) = (72, 150);
-/// How far a group box's fill is lifted above the window's face, per channel.
+/// How far a group box's fill was lifted above the window's face (retired by DESIGNAPPLY B639: the fill is
+/// `surface.raised`); kept as the record of the GLASSKIT value.
 pub const GROUP_LIFT: u32 = 8;
-
-/// `c` lifted `n` per channel toward white, saturating.
-fn lift(c: u32, n: u32) -> u32 {
-    let ch = |s: u32| (((c >> s) & 0xFF) + n).min(255) << s;
-    ch(16) | ch(8) | ch(0)
-}
-/// The hairline: the content ink at [`HAIRLINE_ALPHA`].
-#[inline] pub fn hairline() -> u32 { content_text() | (HAIRLINE_ALPHA << 24) }
-/// A control's edge: the content ink at [`CONTROL_EDGE_ALPHA`].
-#[inline] pub fn control_edge() -> u32 { content_text() | (CONTROL_EDGE_ALPHA << 24) }
-/// The focus ring: the accent at [`FOCUS_RING_ALPHA`].
-#[inline] pub fn focus_ring() -> u32 { accent() | (FOCUS_RING_ALPHA << 24) }
+/// The hairline: the primary ink at [`HAIRLINE_ALPHA`].
+#[inline] pub fn hairline() -> u32 { text_primary() | (HAIRLINE_ALPHA << 24) }
+/// A control's edge: `line.control` (§2.3: check box, radio, field and toggle-off borders, >= 3:1), opaque.
+#[inline] pub fn control_edge() -> u32 { line_control() | (0xFF << 24) }
+/// The focus ring: `focus.ring` (§2.3) — `accent.fill` in Light, `accent.ink` in Dark — at [`FOCUS_RING_ALPHA`].
+#[inline] pub fn focus_ring() -> u32 { (if is_dark() { ACCENT_INK_DARK[accent_index()] } else { accent() }) | (FOCUS_RING_ALPHA << 24) }
 /// A knob's or a button's shadow (black, the set's soft peak).
 #[inline] pub fn shadow_soft() -> u32 { (if is_dark() { SHADOW_SOFT_ALPHA.1 } else { SHADOW_SOFT_ALPHA.0 }) << 24 }
 /// A window's drop shadow (black, the set's window peak).
 #[inline] pub fn shadow_window() -> u32 { (if is_dark() { SHADOW_WINDOW_ALPHA.1 } else { SHADOW_WINDOW_ALPHA.0 }) << 24 }
-/// An inset group box's fill: the window's face one step lighter.
-#[inline] pub fn group_fill() -> u32 { lift(chrome_face(), GROUP_LIFT) }
-/// An off switch's track, a slider's rail, a segmented control's well: the face a sixth of the way to the ink.
-#[inline] pub fn control_track() -> u32 { mix(chrome_face(), content_text(), 1, 6) }
-/// A knob, an unchecked box, a plain button's face: the field's white on Light, the light ink on Dark.
-#[inline] pub fn knob_face() -> u32 { if is_dark() { content_text() } else { field_bg() } }
-/// Ink drawn ON the accent (a check mark, a selected row's label, the default button's label).
-#[inline] pub fn ink_on_accent() -> u32 { if is_dark() { content_text() } else { field_bg() } }
-/// The secondary ink (a group's title, a caption): the content ink two fifths of the way to the face.
-#[inline] pub fn ink_secondary() -> u32 { mix(content_text(), chrome_face(), 2, 5) }
+/// An inset group box's fill: `surface.raised` (§2.3: grouped-list cards).
+#[inline] pub fn group_fill() -> u32 { surface_raised() }
+/// An off switch's track, a slider's rail, a segmented control's well: `surface.sunken` toward `line.strong` by a
+/// third (§2.3's sunken alone reads too close to the window face for a toggle-off track).
+#[inline] pub fn control_track() -> u32 { mix(surface_sunken(), line_strong(), 1, 3) }
+/// A knob, an unchecked box, a plain button's face: `surface.raised` on Light, the primary ink on Dark.
+#[inline] pub fn knob_face() -> u32 { if is_dark() { text_primary() } else { surface_raised() } }
+/// Ink drawn ON the accent (a check mark, a selected row's label, the default button's label): white in both sets —
+/// every `accent.fill` is solved for >= 4.6:1 white text (§2.3).
+#[inline] pub fn ink_on_accent() -> u32 { ON_FILL }
+/// The secondary ink (a group's title, a caption): `text.secondary`.
+#[inline] pub fn ink_secondary() -> u32 { text_secondary() }
 /// SOFTY (B629): the Softy look's colours, re-exported by name from `palette_core::softy` (PALETTECORE B559: the
 /// values live there); `video::softy::palette` re-exports them beside its dimensions.
 pub use palette_core::softy;

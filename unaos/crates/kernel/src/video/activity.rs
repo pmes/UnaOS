@@ -199,7 +199,7 @@ fn rect(surf: &mut [u32], stride: usize, h: usize, x: usize, y: usize, w: usize,
 }
 
 fn bar_color(pct: i16) -> u32 {
-    if pct >= 85 { crate::video::theme::meter_high() } else if pct >= 50 { crate::video::theme::meter_mid() } else { crate::video::theme::meter_low() }
+    if pct >= 85 { crate::video::theme::ink_critical() } else if pct >= 50 { crate::video::theme::ink_warning() } else { crate::video::theme::ink_positive() }
 }
 
 fn paint(st: &mut State) {
@@ -208,8 +208,8 @@ fn paint(st: &mut State) {
     let cw = super::metrics::lcell_w(face);
     let (w, h) = (st.w, st.h);
     let c = st.cen;
-    for p in st.surf.iter_mut() { *p = theme::content_fill(); }
-    let ink = theme::content_text();
+    for p in st.surf.iter_mut() { *p = theme::surface_content(); }
+    let ink = theme::text_primary();
     let mut y = PAD;
     let line = |surf: &mut [u32], y: &mut usize, b: &Buf, color: u32| {
         super::metrics::text(surf, super::metrics::size(w), super::metrics::size(h), w, PAD, *y, b.bytes(), color, false, face);
@@ -232,7 +232,7 @@ fn paint(st: &mut State) {
         let mut b = Buf::new();
         let _ = write!(b, "cpu{}", i);
         super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), w, PAD, y, b.bytes(), ink, false, face);
-        rect(&mut st.surf, w, h, bx, y + 1, BAR_W, ch - 4, theme::scroll_track());
+        rect(&mut st.surf, w, h, bx, y + 1, BAR_W, ch - 4, theme::surface_sunken());
         let pct = c.busy[i];
         let mut t = Buf::new();
         if pct >= 0 {
@@ -250,7 +250,7 @@ fn paint(st: &mut State) {
     let mut b = Buf::new();
     let _ = write!(b, "heap  used={} KiB  free={} KiB", c.heap_used / 1024, c.heap_free / 1024);
     line(&mut st.surf, &mut y, &b, ink);
-    rect(&mut st.surf, w, h, PAD, y, BAR_W + 6 * cw, ch - 6, theme::scroll_track());
+    rect(&mut st.surf, w, h, PAD, y, BAR_W + 6 * cw, ch - 6, theme::surface_sunken());
     rect(&mut st.surf, w, h, PAD, y, (BAR_W + 6 * cw) * c.heap_used / total, ch - 6, theme::accent());
     y += ch;
     // Compositor.
@@ -274,7 +274,7 @@ fn paint(st: &mut State) {
         if p.cpu >= 0 { let _ = write!(b, "{}", p.cpu); } else { let _ = write!(b, "-"); }
         if i == st.sel {
             rect(&mut st.surf, w, h, 0, y, w, ch, theme::accent());
-            line(&mut st.surf, &mut y, &b, theme::content_fill());
+            line(&mut st.surf, &mut y, &b, theme::surface_content());
         } else {
             line(&mut st.surf, &mut y, &b, ink);
         }
@@ -330,7 +330,7 @@ pub fn open() -> Result<(), &'static str> {
     if surf.try_reserve_exact(len).is_err() {
         return Err("out of memory");
     }
-    surf.resize(len, theme::content_fill());
+    surf.resize(len, theme::surface_content());
     let (_s, ow, oh) = wm::spawn_geometry_native(sw, sh).ok_or("geometry unavailable")?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;

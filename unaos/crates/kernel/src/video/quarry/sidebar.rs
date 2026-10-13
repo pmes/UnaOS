@@ -180,8 +180,8 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     if r.h == 0 {
         return;
     }
-    fill(px, g, r.x, r.y, r.w, r.h, theme::chrome_face());
-    fill(px, g, r.x, r.y + r.h - 1, r.w, 1, theme::frame_line());
+    fill(px, g, r.x, r.y, r.w, r.h, theme::surface_window());
+    fill(px, g, r.x, r.y + r.h - 1, r.w, 1, theme::line_subtle());
     let row_h = g.row_h();
     let side = SIDE.lock();
     let top = scroll_of(g); // QUARRYHOVER (B647): the rows above the offset are scrolled off
@@ -191,7 +191,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
             break;
         }
         if e.path.is_empty() {
-            text(px, g, r.x + PAD(), y + g.ts, e.label.as_bytes(), r.x + r.w, theme::title_text_inactive());
+            text(px, g, r.x + PAD(), y + g.ts, e.label.as_bytes(), r.x + r.w, theme::text_secondary());
             continue;
         }
         let here = m.cwd == e.path;
@@ -201,11 +201,11 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
             super::hover_wash(px, g, r.x + PAD() / 2, y, r.w - PAD(), row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
         }
         let ink = if here {
-            theme::chrome_face()
+            theme::surface_window()
         } else if e.present {
-            theme::content_text()
+            theme::text_primary()
         } else {
-            theme::title_text_inactive()
+            theme::text_secondary()
         };
         let ej = if e.removable { row_h } else { 0 };
         text(px, g, r.x + 3 * PAD(), y + g.ts, e.label.as_bytes(), r.x + r.w - ej, ink);

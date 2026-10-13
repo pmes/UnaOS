@@ -165,9 +165,9 @@ pub fn selftest() {
     let was_dark = theme::is_dark();
     let flipped = install(!was_dark, alt, alt, "tests");
     let ms = REPAINT_MS.load(Ordering::Relaxed);
-    let tok_ok = theme::chrome_face() == if was_dark { theme::LIGHT[theme::Tok::WindowBg as usize] } else { theme::DARK[theme::Tok::WindowBg as usize] }
+    let tok_ok = theme::surface_window() == if was_dark { theme::LIGHT[theme::Tok::SurfaceWindow as usize] } else { theme::DARK[theme::Tok::SurfaceWindow as usize] }
         && theme::accent() == theme::ACCENTS[alt]
-        && theme::content_text() != theme::content_fill();
+        && theme::text_primary() != theme::surface_content();
     let back = apply("tests");
     let restored = theme::is_dark() == was_dark && theme::accent_index() == accent_ix();
     let ok = lits == 0 && flipped && tok_ok && back && restored;

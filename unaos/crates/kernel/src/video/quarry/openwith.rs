@@ -74,13 +74,13 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     let h = n * rh + 2;
     let x = l.x.min(g.w.saturating_sub(w));
     let y = l.y.min(g.h.saturating_sub(h));
-    fill(px, g, x, y, w, h, theme::button_face());
+    fill(px, g, x, y, w, h, theme::surface_raised());
     keyline(px, g, Rect { x, y, w, h }, theme::accent());
     let head = alloc::format!("Open With ({})", l.mime);
-    text(px, g, x + PAD(), y + 1 + g.ts, head.as_bytes(), x + w, theme::content_text());
+    text(px, g, x + PAD(), y + 1 + g.ts, head.as_bytes(), x + w, theme::text_primary());
     if l.rows.is_empty() {
         let s = alloc::format!("(no app opens {})", l.mime);
-        text(px, g, x + PAD(), y + 1 + rh + g.ts, s.as_bytes(), x + w, theme::button_text());
+        text(px, g, x + PAD(), y + 1 + rh + g.ts, s.as_bytes(), x + w, theme::text_primary());
     }
     for (i, r) in l.rows.iter().enumerate() {
         let mut s = r.name.clone();
@@ -90,7 +90,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
         if !super::openers::available(&r.opener) {
             s.push_str("  (not in this build)");
         }
-        text(px, g, x + PAD(), y + 1 + (i + 1) * rh + g.ts, s.as_bytes(), x + w, theme::button_text());
+        text(px, g, x + PAD(), y + 1 + (i + 1) * rh + g.ts, s.as_bytes(), x + w, theme::text_primary());
     }
     if !l.foreign.is_empty() {
         // APPTRUST (B467): the divider, then each foreign program `on <volume>`.
@@ -98,7 +98,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
         fill(px, g, x + PAD(), dy + rh / 2, w.saturating_sub(2 * PAD()), 1, theme::accent());
         for (i, (r, v)) in l.foreign.iter().enumerate() {
             let s = alloc::format!("{}  on {}", r.name, v);
-            text(px, g, x + PAD(), dy + (i + 1) * rh + g.ts, s.as_bytes(), x + w, theme::button_text());
+            text(px, g, x + PAD(), dy + (i + 1) * rh + g.ts, s.as_bytes(), x + w, theme::text_primary());
         }
     }
 }

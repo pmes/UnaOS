@@ -102,7 +102,7 @@ pub const MAX_TITLE: usize = 16;
 /// CRISPYWIRE — **this is `theme::FRAME`.** WC-A's invented `1` is gone. The frame is now thick
 /// enough to carry what Crispy puts in it: an outer keyline, a bevel hairline, and the chrome face
 /// between them. See [`paint_window`] for the layering.
-#[allow(non_snake_case)] #[inline] pub fn BORDER() -> usize { super::theme::FRAME() }
+#[allow(non_snake_case)] #[inline] pub fn BORDER() -> usize { 0 } // DESIGNAPPLY (rmbp-ledger B639, R122; DESIGN-LANGUAGE §2.4): the 5 pt frame is GONE — the box is the head and the content; the window's edge is its shadow OUTSIDE the box (`wm::desktop::track`, the fill's shading) and the resize band lies outside it too (`resize_band_hit`, `rs_band_box`). Was `theme::FRAME()` (5 pt).
 
 /// FONT (GR27) — the caption glyph's ADVANCE, in panel pixels: [`font::CELL_W`], the mono face's
 /// own metric. The unit every width budget (the caption painter's, [`controls`]'s decline
@@ -3042,7 +3042,7 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
             _ => best = Some((r.id, r.owner_asid, r.z)),
         }
     }
-    best
+    resize_band_hit(&t.rows, shell, px, py, best) // DESIGNAPPLY (B639): with no frame the resize band lies OUTSIDE the box (§2.9: a 6 pt band) — a higher window's band wins over what lies under it
 }
 
 /// FOCUS-VIS — **make a focus change VISIBLE.** The one seam the focus owner calls after
@@ -3708,14 +3708,14 @@ pub fn repaint() {
 /// A snapshot, never a handle. It is read without the desktop holding anything of ours, and a window
 /// that moves or closes immediately afterwards is repainted by the mover/closer's own composite.
 pub fn occluders(out: &mut alloc::vec::Vec<(usize, usize, usize, usize)>) -> usize { // WINDOWCAP-2: cleared and grown here
-    let shell = shell_z(); out.clear(); out.reserve(slots());
+    let shell = shell_z(); out.clear(); out.reserve(slots()); let focus = focus_asid(); // DESIGNAPPLY (B639): the focus owner, for the shadow extent below
     let t = table();
     let mut n = 0usize;
     for r in t.rows.iter() {
         if !r.used || r.compat || !above_shell(r, shell) {
             continue;
         }
-        let b = outer_box(r);
+        let b = occluder_box(r, shell, focus); // DESIGNAPPLY (B639): the box AND its shadow margin — the desktop layer's presents never paint over a shadow (only the fill does)
         if b.2 == 0 || b.3 == 0 {
             continue;
         }
@@ -5472,7 +5472,7 @@ fn composite_inner() -> CursorTail {
     let mut disturbed = false;
     // CURSOR-15 — the pass composed through the sprite WITHOUT a session (`defer_nosession`): the
     // arrow is on glass and the tail owes the deferred pixels a `Settle`, never a bracket.
-    let mut deferred = false;
+    let mut deferred = false; shadow_track(); // DESIGNAPPLY (B639): the window shadows — snapshot the casting windows, publish them, queue a background fill over every extent that moved; the drain below paints it in THIS pass. ⚠ LINE-NEUTRAL fold, code first
 
     // WC-L — DRAIN THE DEFERRED ERASES.
     //
@@ -14598,29 +14598,29 @@ fn crispy_witness() {
     }
     use super::theme;
     crate::bootlog_println!(
-        "[crispy] theme=us-crispy-modern@0787ba9f frame={} bevel={} title_h={} radius={} ctrl={} gap={} face={:#08x} keyline={:#08x} bevels={:#08x}/{:#08x} title_act={:#08x}->{:#08x} title_ina={:#08x}->{:#08x} ink={:#08x}/{:#08x} ctrls={:#08x}/{:#08x}/{:#08x} gloss_q16={}/{}/{} desktop={:#08x}",
-        theme::FRAME(),
-        theme::BEVEL(),
+        "[crispy] theme=designlang@B639 frame={} title_h={} radius={} ctrl={} gap={} surfaces={:#08x}/{:#08x}/{:#08x}/{:#08x}/{:#08x} lines={:#08x}/{:#08x}/{:#08x} text={:#08x}/{:#08x}/{:#08x} discs={:#08x}/{:#08x}/{:#08x} accent={:#08x}/{:#08x}/{:#08x} desktop={:#08x}", // DESIGNAPPLY (B639): the semantic tokens (window/sidebar/content/raised/overlay, subtle/strong/control, primary/secondary/tertiary, the discs, fill/hover/pressed); frame=0 (§2.4: no frame, a shadow outside the box)
+        BORDER(),
         theme::TITLE_HEIGHT(),
         theme::CORNER_RADIUS(),
         theme::CONTROL_BOX(),
         theme::GAP(),
-        theme::chrome_face(),
-        theme::frame_line(),
-        theme::bevel_light(),
-        theme::bevel_shadow(),
-        theme::title_active_top(),
-        theme::title_active_bottom(),
-        theme::title_inactive_top(),
-        theme::title_inactive_bottom(),
-        theme::title_text_active(),
-        theme::title_text_inactive(),
-        theme::control_close(),
-        theme::control_mid(),
-        theme::control_zoom(),
-        theme::GLOSS_TOP_ALPHA_Q16,
-        theme::GLOSS_FALLOFF_Q16,
-        theme::GLOSS_BOTTOM_ALPHA_Q16,
+        theme::surface_window(),
+        theme::surface_sidebar(),
+        theme::surface_content(),
+        theme::surface_raised(),
+        theme::surface_overlay(),
+        theme::line_subtle(),
+        theme::line_strong(),
+        theme::line_control(),
+        theme::text_primary(),
+        theme::text_secondary(),
+        theme::text_tertiary(),
+        theme::ctrl_close(),
+        theme::ctrl_min(),
+        theme::ctrl_zoom(),
+        theme::accent(),
+        theme::accent_hover(),
+        theme::accent_pressed(),
         DESKTOP_BG,
     );
     // The resolved title ramp's two ENDPOINT rows, computed by the interpolator that will draw
@@ -14664,7 +14664,7 @@ const fn pack(r: u32, g: u32, b: u32) -> u32 {
 /// half-up in both directions rather than toward negative infinity. **Residual: at most 1/2 LSB per
 /// channel per blend**, i.e. a drawn channel is never more than one 8-bit step from the value the
 /// host's `f32` ramp would round to. No float, no `libm`, and no intermediate that can overflow.
-#[inline]
+#[inline] #[allow(dead_code)] // DESIGNAPPLY (B639): the gloss ramp it served is retired; kept for the record of the Q16 bound
 fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
     let t = t.min(super::theme::Q16_ONE) as i64;
     let (ar, ag, ab) = chans(a);
@@ -14698,35 +14698,35 @@ fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
 /// what the kit's own sample renders show. The alternative reading (falloff as an exponent) would
 /// need a power function, i.e. float or a table, for no gain the kit asks for.
 pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
-    use super::theme;
-    let (top, bot) = if focused {
-        (theme::title_active_top(), theme::title_active_bottom())
-    } else {
-        (theme::title_inactive_top(), theme::title_inactive_bottom())
-    };
-    let span = h.saturating_sub(1).max(1);
-    let t = ((j.min(span) as u64 * theme::Q16_ONE as u64) / span as u64) as u32;
-    let base = blend_q16(top, bot, t);
-    // The gloss band, in rows: `falloff` of the strip height, at least one row so a degenerate
-    // falloff still puts the top stop's highlight somewhere rather than dividing by zero.
-    let band = ((h as u64 * theme::GLOSS_FALLOFF_Q16 as u64) >> 16).max(1) as usize;
-    let g = if j >= band {
-        theme::GLOSS_BOTTOM_ALPHA_Q16
-    } else {
-        let gt = ((j as u64 * theme::Q16_ONE as u64) / band as u64) as u32;
-        // The alpha ramp is itself a Q16 blend — of scalars rather than colours, so it is done
-        // inline: `top + (bottom - top) * gt`, same round-half-up bias as `blend_q16`.
-        let (a, b) = (
-            theme::GLOSS_TOP_ALPHA_Q16 as i64,
-            theme::GLOSS_BOTTOM_ALPHA_Q16 as i64,
-        );
-        (a + (((b - a) * gt as i64 + (1 << 15)) >> 16)).clamp(0, theme::Q16_ONE as i64) as u32
-    };
-    if g == 0 {
-        base
-    } else {
-        blend_q16(base, theme::gloss_highlight(), g)
-    }
+    // DESIGNAPPLY (rmbp-ledger B639, R122; DESIGN-LANGUAGE §3.1 "Removed: … the gloss gradient"): the title bar is
+    // `surface.window`, flat, focused or not — focus is carried by the shadow's size (§2.4 elev.3 / elev.3i) and
+    // the title ink, never by a colour change in the bar. The kit's two-stop gradient and its Q16 gloss band that
+    // this function interpolated are retired with the material tokens they read; the signature stays so the
+    // stock chrome and the `[crispy] ramp` witness keep their call shape (the ramp now reads one value).
+    let _ = (j, h, focused);
+    super::theme::surface_window()
+    //
+    // WHAT THIS FUNCTION DID UNTIL B639, kept as the record (the craft arcs retire a material by deleting it, and a
+    // reversed decision should show its own reversal — the `CTRL_*` note's rule):
+    //  1. the GRADIENT — `t = j / (h - 1)` in Q16, a [`blend_q16`] from the kit's top stop to its bottom stop
+    //     (`title_active_top/bottom` `0xEEEEF1 -> 0xE3E3E8` focused, `title_inactive_top/bottom`
+    //     `0xF4F4F5 -> 0xEFEFF1` not), so row 0 was exactly the top stop and row `h-1` the bottom one;
+    //  2. the GLOSS laid over it — `palette.gloss` (white, `top_alpha` 0.14, `falloff` 0.5, `bottom_alpha` 0.0,
+    //     carried at Q16), read as "the highlight decays over the top `falloff` of the strip": a 14 % white
+    //     band fading to nothing by the strip's middle.
+    // Both were the Aqua-era head the language names as the X-windows vibe (§2.3: "Those names draw an
+    // Aqua-era bevelled window"). Focus now reads from the shadow (elev.3 vs elev.3i, `wm::desktop`) and the
+    // title ink; the two title stops differed by a few LSBs anyway (FOCUS-HL's note on `title_ink`).
+    //
+    // Callers, unchanged: `paint_window`'s stock strip (overpainted by the Una and Softy heads, kept as the
+    // fallback when their scratch row is busy), `crispy_witness`'s `[crispy] ramp` line (row 0 and row N now read
+    // the same value — the line stays so a capture still shows the ramp is flat) and the aarch64 CHROME-TRUTH
+    // probes in `wcf.rs` (whose frame probes are owed a re-derivation, DESIGNAPPLY.md §9).
+    //
+    // `blend_q16` stays (`#[allow(dead_code)]`) with its error bound: the next Q16 ramp in this file — a motion
+    // curve (§2.6's 64-entry Q16 tables) — will want the same half-LSB argument, and it is already written.
+    //
+    // The token's job: `surface.window` — "window body, toolbars, title bar" (§2.3).
 }
 
 /// CRISPYWIRE — the title caption's ink for a focused / unfocused window. `theme::TITLE_TEXT_*`.
@@ -14741,9 +14741,9 @@ pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
 #[inline]
 fn title_ink(focused: bool) -> u32 {
     if focused {
-        super::theme::title_text_active()
+        super::theme::text_primary()
     } else {
-        super::theme::title_text_inactive()
+        super::theme::text_secondary()
     }
 }
 
@@ -20412,7 +20412,7 @@ fn paint_window(
         // (WC-H), still the four-rect subtraction (COMPOSITE-2), and still focus-independent, since
         // the material is a function of the row and nothing else. The cost is per chrome ROW, not
         // per pixel — see `fill_rect_ceramic`.
-        let border = super::theme::chrome_face();
+        let border = super::theme::surface_window();
         crispy_witness();
         // PHASE31 — CHROMEBAND's own loop begins here. `fill_rect_ceramic` stamps `row=` per
         // machined row, so a wedge in the face fill names the row it stopped on.
@@ -20481,42 +20481,42 @@ fn paint_window(
         // is machined. If the taste gate wants the edges machined too, it is one `shade` call on
         // each of `kl`, `bl` and `bs`.
         comp_mark(r.id, mk + PW_FRAME);
-        let bev = super::theme::BEVEL();
-        let kl = super::theme::frame_line();
-        // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
-        // `metrics.bevel` is the kit's hairline metric ("iteration 3 makes the bevel a true
-        // hairline"), and the keyline is the frame's other hairline; there is no second metric in
-        // the table for it, and a bare `1` here would be a compositor number sitting in a wired
-        // path. Identical output at the kit's `bevel = 1`, and it moves with the kit if that
-        // changes. The bevel's own inset is `kw` for the same reason: it is drawn *inside* the
-        // keyline, so the offset is the keyline's width, not the number one.
-        let kw = bev;
-        // Keyline: four `kw`-thick edges of the outer box.
-        fill_rect_v(dst, lbx, lby, bw, kw, kl);
-        fill_rect_v(dst, lbx, lby + bh as isize - kw as isize, bw, kw, kl);
-        fill_rect_v(dst, lbx, lby, kw, bh, kl);
-        fill_rect_v(dst, lbx + bw.saturating_sub(kw), lby, kw, bh, kl);
-        // Bevel, inside the keyline. `theme::BEVEL < theme::FRAME` is a const-assert, so these can
-        // never reach the strip.
-        let (bl, bs) = (super::theme::bevel_light(), super::theme::bevel_shadow());
-        fill_rect_v(dst, lbx + kw, lby + kw as isize, bw.saturating_sub(2 * kw), bev, bl);
-        fill_rect_v(dst, lbx + kw, lby + kw as isize, bev, bh.saturating_sub(2 * kw), bl);
-        fill_rect_v(
-            dst,
-            lbx + kw,
-            lby + bh as isize - kw as isize - bev as isize,
-            bw.saturating_sub(2 * kw),
-            bev,
-            bs,
-        );
-        fill_rect_v(
-            dst,
-            lbx + bw.saturating_sub(kw + bev),
-            lby + kw as isize,
-            bev,
-            bh.saturating_sub(2 * kw),
-            bs,
-        );
+        // DESIGNAPPLY (rmbp-ledger B639, R122; DESIGN-LANGUAGE §2.4 / §3.1 "Removed: the FRAME (5) and BEVEL (1)"):
+        // the four-edge keyline and the two bevel hairlines that stood here are GONE with the frame they were drawn
+        // in — `BORDER()` is 0, the box is the head and the content, and the window's edge on the desktop is its
+        // SHADOW, which lies outside the box (`wm::desktop`, the fill's shading). The arc keyline below keeps one
+        // ink, `line.strong`, for the stock head (the Una and Softy painters draw their own outline over it).
+        let kl = super::theme::line_strong();
+        //
+        // WHAT STOOD HERE UNTIL B639, as the record: a `theme::BEVEL`-thick KEYLINE (`frame_line`) on all four
+        // edges of the outer box, then the two BEVEL hairlines inside it — `bevel_light` along the top and left,
+        // `bevel_shadow` along the bottom and right — with `chrome_face` (ceramic-machined) filling the 5 pt band
+        // between them and the content. CRISPYWIRE-REVIEW had tied the keyline's thickness to `metrics.bevel` so
+        // no bare `1` sat in a wired path; that metric survives (`theme::BEVEL()`) for the probes that still name
+        // it, and so does `ui::base::FRAME` for the metrics census.
+        //
+        // Why it went (R122, Peter 2026-10-14: "4 yes." to "the 5 pt frame and the bevel go"): a 2-3 px keyline
+        // plus a bevel is the look the language is leaving (§2.1: "a 2–3 px 'hairline' is the bevel look we are
+        // leaving"); a window's edge is its SHADOW now (§2.4's elev.3 / elev.3i), with a 1-device-px outline drawn by
+        // the head painters (`line.strong` @ 60 % on Light, `rim.dark` on Dark).
+        //
+        // What moved with it, so nobody has to rediscover it:
+        //  * `BORDER()` = 0, so `outer_box` is the head plus the content, and every `x - BORDER()` / `2 * BORDER()`
+        //    in this file and its callers degenerates to the box itself — no geometry was re-derived by hand.
+        //  * the frame was the RESIZE HANDLE: the band now lies outside the box (`resize_band_hit` in `hit_test`,
+        //    `rs_band_box` in `resize_zone_at`; §2.9's 6 pt band and 12 pt corners). `tests winresize`'s probes sit
+        //    where the frame was, i.e. inside the content now (owed to its file, DESIGNAPPLY.md §9).
+        //  * the band between the box and the shadow's reach is no longer the window's: it is the desktop's, painted
+        //    by the background fill with every window's shadow multiplied in (`wm::desktop::track` queues it on a
+        //    move, a focus change, a theme or scale change; `stage_fill` shades; `occluders` keeps the desktop
+        //    layer's presents off it). DESKTOPCRAFT (B631) had drawn its shadow INSIDE the 5 pt band because the
+        //    compositor repainted only the box; that owed change is this one.
+        //  * the stock corner punch below still fills the arc's outside with `DESKTOP_BG` and lays `kl` along the
+        //    arc; the Una head (`desktop::chrome_row`) overpaints those pixels with the shaded desktop, so the
+        //    punch is only ever seen when that painter declines a pass (no free scratch row).
+        //
+        // The witness that read this keyline (`[wc-j]`'s sliver check against `line_subtle`) now only proves the
+        // old edge is not a keyline colour; `vacated_points` reads the shaded desktop (`bg_expect`).
         // CRISPYWIRE — `theme::CORNER_RADIUS`, on the two TOP corners (the kit says top; the
         // bottom stays square). The pixels outside the arc are painted [`DESKTOP_BG`] and the
         // keyline is re-laid ALONG the arc, so the silhouette actually reads as rounded rather
@@ -20580,9 +20580,9 @@ fn paint_window(
                 // symbol reads as the surface showing through rather than as a fourth colour. It
                 // invents nothing — see the SHARED-SOURCE note above `ctrl_glyph`.
                 let punch = if focused {
-                    super::theme::title_active_top()
+                    super::theme::surface_window()
                 } else {
-                    super::theme::title_inactive_top()
+                    super::theme::surface_window()
                 };
                 //
                 // CERAMIC — the discs are machined too, at `ceramic::CONTROL_GAIN_Q16` (half), so
@@ -21500,7 +21500,7 @@ fn stage_fill(
             pixel_format: info.pixel_format,
         },
     );
-    layer.fill_rect(0, 0, w, 1, color); let wp = color == DESKTOP_BG && wp_active(); // WALLPAPER — the row below is per-scanline when a picture is loaded
+    layer.fill_rect(0, 0, w, 1, color); let sc = shadow_casts_for(color == DESKTOP_BG); let wp = color == DESKTOP_BG && (wp_active() || shadow_on(&sc)); // WALLPAPER — the row below is per-scanline when a picture is loaded; DESIGNAPPLY (B639): and when a window shadow reaches the desktop (the fill shades every pixel it writes)
 
     #[cfg(feature = "witness")]
     let t1 = crate::arch::now_cycles();
@@ -21614,7 +21614,7 @@ fn stage_fill(
     // `[wc-k]` line stops being arch-dependent in meaning. Equals `h` wherever no clip exists.
     let mut blit_calls: usize = 0; let hb = super::beam::hold(y, y + h, info.height, false, true); // BEAM (orin 26) — the fill's bracket: opened here, after the compose and after every `defer!`/`drop_fill!` exit (a declined fill writes no pixel and must not wait for a beam), closed after the rows are cleaned below.
     for r in 0..h {
-        let py = y + r; if wp { wp_row(&layer, py, x, w); } // WALLPAPER — this scanline's pixels into the staged row
+        let py = y + r; if wp { bg_row(&sc, &layer, &mut stage[..row_bytes], bpp, color, py, x, w); } // WALLPAPER — this scanline's pixels into the staged row; DESIGNAPPLY (B639): the flat colour again where no picture, then every shadow over it (`wm::desktop::shade_bytes`)
         let off = py * fb_row + x * bpp;
         if prev != usize::MAX && off != prev + fb_row {
             contig = false;
@@ -22299,7 +22299,7 @@ fn movevacate_selftest() {
     // is the desktop at every one of them and the rule is byte-identical to the one this replaced.
     // `gone` is the KEYLINE rather than the content colour: these three points are on the old box's
     // OUTER EDGE, so an unerased sliver shows `theme::FRAME_LINE`, not the surface.
-    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::frame_line());
+    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::line_subtle());
     // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
     // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
@@ -23450,7 +23450,7 @@ fn vacated_points(pts: &[(usize, usize)], gone: u32) -> (bool, usize, usize) {
         if !desktop {
             covered += 1;
         }
-        if if desktop { got == DESKTOP_BG } else { got != gone } {
+        if if desktop { got == bg_expect(x, y) } else { got != gone } { // DESIGNAPPLY (B639): the desktop's pixel is the backdrop under every window shadow that reaches it (DESKTOP_BG on a bare panel with no shadow there)
             correct += 1;
         } else {
             bad += 1;
@@ -29473,7 +29473,7 @@ fn wp_row(layer: &super::FrameBuffer, py: usize, x: usize, w: usize) { super::wa
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn wp_paint(fb: &super::framebuffer::FrameBuffer) { if super::desktop_scene_owns_backdrop() { super::wallpaper::paint(fb) } }
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-pub fn wp_take_stale() -> bool { super::wallpaper::take_stale() }
+pub fn wp_take_stale() -> bool { let s = super::wallpaper::take_stale(); if s { shadows_stale(); } s } // DESIGNAPPLY (B639): a reloaded picture re-fills every shadow on the next pass
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 /// Queue a whole-panel desktop erase; the drain paints it through `stage_fill` (wallpaper-aware) clipped by the windows.
 pub fn desktop_repaint() { if let Some(pi) = super::panel_info_nonblocking() { erase(&[(0, 0, pi.width, pi.height)]); } }
@@ -29682,7 +29682,7 @@ fn rs_zone_of(ob: (usize, usize, usize, usize), cb: (usize, usize, usize, usize)
     if db < edge { return RS_B; }
     // The side bands stop at the title strip: the strip is the drag handle (`title_bar_hit`), and only
     // its corners (above) are resize.
-    if py >= cb.1 {
+    if py >= cb.1 || px < cb.0 || px >= cb.0 + cb.2 { // DESIGNAPPLY (B639): beside the box (the outside band) the sides run the full height
         if dl < edge { return RS_L; }
         if dr < edge { return RS_R; }
     }
@@ -29697,7 +29697,7 @@ pub fn resize_zone_at(id: WinId, x: i32, y: i32) -> u8 {
     }
     let t = table();
     match row(&t, id) {
-        Some(r) if !r.compat => rs_zone_of(outer_box(r), content_box(r), x as usize, y as usize),
+        Some(r) if !r.compat => rs_zone_of(rs_band_box(r), content_box(r), x as usize, y as usize), // DESIGNAPPLY (B639): the zones are classified over the box grown by the outside band
         _ => 0,
     }
 }
@@ -30463,3 +30463,113 @@ pub mod fbdirect;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[path = "desktop.rs"]
 pub mod desktop;
+
+// DESIGNAPPLY (rmbp-ledger B639, R122; DESIGN-LANGUAGE §2.4, §2.9) — THE FRAMELESS WINDOW's two compositor seams,
+// TAIL-APPENDED so the fold sites above stay line-neutral: (1) the window SHADOW, which is `desktop`'s (the casts,
+// the tiles, the shading) and which the background fill (`stage_fill`, the erase drain) applies to every pixel it
+// writes, with `shadow_track` at the head of `composite_inner` queueing the fills a move/focus/theme change owes;
+// (2) the RESIZE BAND, which with no frame lies OUTSIDE the box (§2.9: an invisible 6 pt band plus the 12 pt corner
+// squares) — `hit_test` answers a press there with the window (`resize_band_hit`) and `resize_zone_at` classifies it
+// over the grown box (`rs_band_box`). Off the desktop engine's gate the shadow seam is a no-op and every fill is
+// exactly what it was.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+type ShadowCasts = desktop::Casts;
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+type ShadowCasts = ();
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+#[inline]
+fn shadow_track() {
+    desktop::track()
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[inline(always)]
+fn shadow_track() {}
+/// The published casts for a fill of the desktop colour (`bg`), none for any other fill.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+#[inline]
+fn shadow_casts_for(bg: bool) -> ShadowCasts {
+    if bg { desktop::casts_now() } else { desktop::Casts::EMPTY }
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[inline(always)]
+fn shadow_casts_for(_bg: bool) -> ShadowCasts {}
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+#[inline]
+fn shadow_on(c: &ShadowCasts) -> bool {
+    !c.is_empty()
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[inline(always)]
+fn shadow_on(_c: &ShadowCasts) -> bool {
+    false
+}
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn shadows_stale() {
+    desktop::shadows_stale()
+}
+/// One background row of a desktop fill into the staged row (`stage`, the panel's format, `layer` over it): the
+/// flat colour again where shadows are shaded (the row is rewritten whole, never darkened twice), the wallpaper's
+/// pixels where one is loaded, then every window shadow that reaches the row.
+#[allow(clippy::too_many_arguments)]
+fn bg_row(sc: &ShadowCasts, layer: &super::FrameBuffer, stage: &mut [u8], bpp: usize, color: u32, py: usize, x: usize, w: usize) {
+    if shadow_on(sc) {
+        layer.fill_rect(0, 0, w, 1, color);
+    }
+    if wp_active() {
+        wp_row(layer, py, x, w);
+    }
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    desktop::shade_bytes(sc, stage, bpp, py as i32, x as i32);
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = (stage, bpp);
+}
+/// The box the desktop layer's presents leave alone for row `r` (`occluders`): its shadow extent where it casts.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn occluder_box(r: &Window, shell: u32, focus: u64) -> (usize, usize, usize, usize) {
+    desktop::occluder_box(r, shell, focus)
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn occluder_box(r: &Window, _shell: u32, _focus: u64) -> (usize, usize, usize, usize) {
+    outer_box(r)
+}
+/// The box grown by the resize band on every side (`RS_EDGE` pt, saturating at the panel's origin).
+fn rs_band_box(r: &Window) -> (usize, usize, usize, usize) {
+    let (x, y, w, h) = outer_box(r);
+    let e = crate::ui::px(RS_EDGE);
+    let (x0, y0) = (x.saturating_sub(e), y.saturating_sub(e));
+    (x0, y0, w.saturating_add(x - x0).saturating_add(e), h.saturating_add(y - y0).saturating_add(e))
+}
+/// `hit_test`'s tail: a point OUTSIDE every box but inside a resizable window's band (§2.9) hits that window when
+/// it is higher than whatever the box test found (`best`). Not the shell's row, not furniture the router declines,
+/// not a zoomed window (no edges to grab).
+fn resize_band_hit(rows: &[Window], shell: u32, px: usize, py: usize, best: Option<(WinId, u64, u32)>) -> Option<(WinId, u64, u32)> {
+    let mut out = best;
+    for r in rows.iter() {
+        if !r.used || r.compat || r.owner_asid == 0 || r.owner_asid == KERNEL_OWNER_DESKTOP || r.zoom_saved.is_some() || !above_shell(r, shell) {
+            continue;
+        }
+        let ob = outer_box(r);
+        if ob.2 == 0 || ob.3 == 0 || in_box(px, py, ob) || !in_box(px, py, rs_band_box(r)) {
+            continue;
+        }
+        match out {
+            Some((oid, _, oz)) if (r.z, r.id) <= (oz, oid) => {}
+            _ => out = Some((r.id, r.owner_asid, r.z)),
+        }
+    }
+    out
+}
+/// What the desktop owns at panel `(x, y)` after a fill: the backdrop (the wallpaper's pixel where one is
+/// published, else [`DESKTOP_BG`]) under every published window shadow — the witnesses' expectation for a vacated
+/// pixel (`vacated_points`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn bg_expect(x: usize, y: usize) -> u32 {
+    let base = if wp_active() { desktop::live_back().map_or(DESKTOP_BG, |b| b.get(x, y)) } else { DESKTOP_BG };
+    let mut px = [base];
+    desktop::shade_words(&desktop::casts_now(), &mut px, y as i32, x as i32);
+    px[0]
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn bg_expect(_x: usize, _y: usize) -> u32 {
+    DESKTOP_BG
+}

@@ -241,7 +241,7 @@ pub fn open(path: &str) -> Result<u32, String> {
     if surf.try_reserve_exact(len).is_err() {
         return Err(String::from("out of memory"));
     }
-    surf.resize(len, theme::content_fill());
+    surf.resize(len, theme::surface_content());
     surf[..oy * w].fill(0);
     if is_open() || STATE.lock().is_some() {
         close("replace");
@@ -742,10 +742,10 @@ fn text(st: &mut State, x: usize, y: usize, s: &str, ink: u32, bold: bool) -> us
 
 fn slider(st: &mut State, x0: usize, x1: usize, y: usize, done: usize, knob: bool) {
     let th = px(4).max(2);
-    fill(st, x0, y - th / 2, x1 - x0, th, theme::scroll_thumb());
+    fill(st, x0, y - th / 2, x1 - x0, th, theme::line_strong());
     fill(st, x0, y - th / 2, done.min(x1) - x0, th, theme::accent());
     if knob {
-        disc(st, done, y, px(8), theme::frame_line());
+        disc(st, done, y, px(8), theme::line_subtle());
         disc(st, done, y, px(7), KNOB_EDGE);
         disc(st, done, y, px(4), theme::accent());
     }
@@ -754,7 +754,7 @@ fn slider(st: &mut State, x0: usize, x1: usize, y: usize, done: usize, knob: boo
 fn paint(st: &mut State) {
     let o = st.oy * st.w; // VIDEOPLAYER (B434): the picture rect above `oy` is the job's, never cleared here
     for p in st.surf[o..].iter_mut() {
-        *p = theme::content_fill();
+        *p = theme::surface_content();
     }
     let (w, h) = (st.w, st.h);
     // the opener's APPRES icon (the player block), a plain tile when the registrar is busy this frame
@@ -762,7 +762,7 @@ fn paint(st: &mut State) {
         fill(st, px(16), px(14), px(ICON_L), px(ICON_L), theme::accent());
     }
     let name = st.name.clone();
-    text(st, px(TEXT_X), px(16), &name, theme::content_text(), true);
+    text(st, px(TEXT_X), px(16), &name, theme::text_primary(), true);
     let info = if let Some(e) = &st.err {
         alloc::format!("cannot play: {}", e)
     } else if st.src == "pending" {
@@ -781,20 +781,20 @@ fn paint(st: &mut State) {
     let done = s0 + if st.dur_ms > 0 { ((s1 - s0) as u64 * el.min(st.dur_ms) / st.dur_ms) as usize } else { 0 };
     slider(st, s0, s1, px(SCRUB_Y), done, st.dur_ms > 0);
     let ty = px(SCRUB_Y).saturating_sub(px(8));
-    text(st, px(16), ty, &mmss(el), theme::content_text(), false);
+    text(st, px(16), ty, &mmss(el), theme::text_primary(), false);
     let rem = alloc::format!("-{}", mmss(st.dur_ms.saturating_sub(el)));
-    text(st, s1 + px(10), ty, &rem, theme::content_text(), false);
+    text(st, s1 + px(10), ty, &rem, theme::text_primary(), false);
     // play / pause
     let (bx, by, bd) = (px(BTN_X), px(BTN_Y), px(BTN_D));
-    disc(st, bx + bd / 2, by + bd / 2, bd / 2, theme::frame_line());
-    disc(st, bx + bd / 2, by + bd / 2, bd / 2 - px(1).max(1), theme::button_face());
+    disc(st, bx + bd / 2, by + bd / 2, bd / 2, theme::line_subtle());
+    disc(st, bx + bd / 2, by + bd / 2, bd / 2 - px(1).max(1), theme::surface_raised());
     if st.playing {
         let (gw, gh) = (px(5), px(16));
-        fill(st, bx + bd / 2 - px(7), by + (bd - gh) / 2, gw, gh, theme::button_text());
-        fill(st, bx + bd / 2 + px(2), by + (bd - gh) / 2, gw, gh, theme::button_text());
+        fill(st, bx + bd / 2 - px(7), by + (bd - gh) / 2, gw, gh, theme::text_primary());
+        fill(st, bx + bd / 2 + px(2), by + (bd - gh) / 2, gw, gh, theme::text_primary());
     } else {
         let g = px(16);
-        wedge(st, bx + (bd - g) / 2 + px(2), by + (bd - g) / 2, g, theme::button_text());
+        wedge(st, bx + (bd - g) / 2 + px(2), by + (bd - g) / 2, g, theme::text_primary());
     }
     // the state word beside the button
     let word = if st.err.is_some() { "stopped" } else if st.ended { "ended" } else if st.playing { "playing" } else { "paused" };
@@ -802,9 +802,9 @@ fn paint(st: &mut State) {
     // mute glyph: a speaker, crossed when muted
     let (lv, muted) = crate::video::status::volume();
     let (mx, my) = (px(MUTE_X), px(CTRL_Y));
-    fill(st, mx, my - px(4), px(6), px(8), theme::button_text());
+    fill(st, mx, my - px(4), px(6), px(8), theme::text_primary());
     for i in 0..px(8) {
-        fill(st, mx + px(6) + i, my - px(4) - i, 1, px(8) + 2 * i, theme::button_text());
+        fill(st, mx + px(6) + i, my - px(4) - i, 1, px(8) + 2 * i, theme::text_primary());
     }
     if muted {
         for i in 0..px(10) {

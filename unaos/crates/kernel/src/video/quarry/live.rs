@@ -1751,10 +1751,10 @@ fn paint_scrollbar(
         w: SBW(),
         h: (inner.y + inner.h).saturating_sub(top),
     };
-    fill(px, g, track.x, track.y, track.w, track.h, theme::scroll_track());
-    fill(px, g, track.x, track.y, 1, track.h, theme::frame_line());
+    fill(px, g, track.x, track.y, track.w, track.h, theme::surface_sunken());
+    fill(px, g, track.x, track.y, 1, track.h, theme::line_subtle());
     if let Some((ty, th)) = thumb(track.h, len, visible, scroll) {
-        fill(px, g, track.x + 2, track.y + ty, track.w.saturating_sub(4), th, theme::scroll_thumb());
+        fill(px, g, track.x + 2, track.y + ty, track.w.saturating_sub(4), th, theme::line_strong());
     }
 }
 
@@ -1768,8 +1768,8 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     let row_h = g.row_h();
 
     // ── the path bar ────────────────────────────────────────────────────────────────────────────
-    fill(px, g, 0, 0, g.w, g.bar_h(), theme::chrome_face());
-    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::frame_line());
+    fill(px, g, 0, 0, g.w, g.bar_h(), theme::surface_window());
+    fill(px, g, 0, g.bar_h() - 1, g.w, 1, theme::line_subtle());
     let mut label: Vec<u8> = Vec::new();
     label.extend_from_slice(m.cwd.as_bytes());
     if m.list_truncated {
@@ -1781,13 +1781,13 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         label.extend_from_slice(b"  -  ");
         label.extend_from_slice(s.as_bytes());
     }
-    text(px, g, PAD(), g.ts, &label, g.w - PAD(), theme::title_text_active());
+    text(px, g, PAD(), g.ts, &label, g.w - PAD(), theme::text_primary());
 
     // ── the tree pane ───────────────────────────────────────────────────────────────────────────
     let tp = g.tree_pane();
     let ti = tp.inner();
-    fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::content_fill());
-    keyline(px, g, tp, theme::frame_line());
+    fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::surface_content());
+    keyline(px, g, tp, theme::line_subtle());
     let tvis = m.tree_visible();
     let tsb = if m.tree.len() > tvis { SBW() } else { 0 };
     for r in 0..tvis {
@@ -1799,15 +1799,15 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         let y = ti.y + r * row_h;
         let sel = i == m.tree_sel;
         if sel {
-            let c = if m.focus == Pane::Tree { theme::accent() } else { theme::scroll_thumb() };
+            let c = if m.focus == Pane::Tree { theme::accent() } else { theme::line_strong() };
             fill(px, g, ti.x, y, ti.w - tsb, row_h, c);
         } else if m.hover == Hover::Tree(i) {
             hover_wash(px, g, ti.x, y, ti.w - tsb, row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
         }
         let ink = if sel && m.focus == Pane::Tree {
-            theme::chrome_face()
+            theme::surface_window()
         } else {
-            theme::content_text()
+            theme::text_primary()
         };
         let indent = PAD() + row.depth * mark_w;
         // Both triangle forms have their centre at `y + 4 * ts` by construction (column/row `i`
@@ -1827,13 +1827,13 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     paint_scrollbar(px, g, ti, ti.y, m.tree.len(), tvis, m.tree_scroll);
 
     // ── the divider ─────────────────────────────────────────────────────────────────────────────
-    fill(px, g, tp.x + tp.w, tp.y, 1, tp.h, theme::frame_line());
+    fill(px, g, tp.x + tp.w, tp.y, 1, tp.h, theme::line_subtle());
 
     // ── the list pane ───────────────────────────────────────────────────────────────────────────
     let lp = g.list_pane();
     let li = lp.inner();
-    fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::content_fill());
-    keyline(px, g, lp, theme::frame_line());
+    fill(px, g, lp.x, lp.y, lp.w, lp.h, theme::surface_content());
+    keyline(px, g, lp, theme::line_subtle());
     let lvis = m.list_visible();
     let lsb = if m.list.len() > lvis { SBW() } else { 0 };
     let body_y = columns::paint_list(m, px, li, lsb, lvis); // QUARRY2 (B336): the header (sortable, with a chevron) and the NAME SIZE MODIFIED TYPE ORIGIN columns
@@ -4676,7 +4676,7 @@ fn jobs_status(m: &Model, px: &mut [u32]) {
         return;
     }
     let py = l.path.y + l.path.h.saturating_sub(g.cell_h()) / 2;
-    text(px, g, x, py, line.as_bytes(), g.w - PAD(), theme::title_text_inactive());
+    text(px, g, x, py, line.as_bytes(), g.w - PAD(), theme::text_secondary());
     let now = if crate::fs::jobs::counts().is_some() { 2 } else { 1 };
     if JOBS_DRAWN.swap(now, Ordering::Relaxed) != now {
         serial_println!("[jobsui] quarry status={} text={}", if now == 2 { "landed" } else { "pending" }, line);
@@ -4749,7 +4749,7 @@ pub fn quarry3_selftest() {
                 m.navigate(dir);
                 let mut px: Vec<u32> = alloc::vec![0; g.w * g.h];
                 repaint_locked(&m, &mut px);
-                let list_ink = px.iter().filter(|&&p| p != theme::content_fill()).count();
+                let list_ink = px.iter().filter(|&&p| p != theme::surface_content()).count();
                 let li = g.list_pane().inner();
                 let drawn = iconview::paint(&m, &mut px, li);
                 let all_hit = (0..drawn).all(|i| iconview::centre_of(&g, li, m.list.len(), m.list_scroll, i).and_then(|(x, y)| iconview::hit(&g, li, m.list.len(), m.list_scroll, x, y)) == Some(i));
