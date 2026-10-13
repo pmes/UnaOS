@@ -1683,7 +1683,7 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
         if s.is_app_box(k) {
             continue;
         }
-        let ink = if open { theme::bevel_light() } else { theme::title_text_active() };
+        let ink = if open { theme::ink_on_accent() } else { theme::text_primary() };
         // SO2 — the BAR'S weight. See [`BOLD`].
         super::text::draw_row(out, w, s.label_of(k), x0 + TPAD(), j - ty0, ink, BOLD, FACE);
     }

@@ -661,50 +661,44 @@ const CHROME_TRUTH_DEFER_BUDGET: usize = 32;
 /// both derive their points from this one arithmetic, so the line the operator reads can never
 /// describe a pixel other than the one the verdict was computed from. Pure — no reads, no writes.
 ///
-/// Three of the five expectations are the MATERIAL's, not the palette's: `title_top`, `title_bot` and
-/// `face_left` are `ceramic::shade` of the role colour at the row the painter used, so the ceramic
-/// grain is part of what is asserted rather than something the witness has to be blind to. The other
-/// two are flat by the painter's own decision — `wm::draw_window` states in as many words that the
-/// keyline and the two bevel hairlines are NOT machined ("a single-pixel edge has no room to show a
-/// grain") — so a flat expectation there is the texture spec's own answer, not an approximation of it.
+/// DESIGNFIX (rmbp-ledger B649): the probes read the FRAMELESS chrome DESIGNAPPLY (B639) paints —
+/// `wm::desktop::chrome_row`: the head is a flat `surface.window` band (`draw::fill_rrect`, exact at
+/// full coverage), its outline one device px at `x = 0`, `x = bw - 1` and row 0 only (`stroke_rrect`,
+/// width 1, blended — never probed), the `line.subtle` rule on the strip's last row (`hairline_h`, an
+/// opaque fill), the discs left-aligned and the title centred inside a reserve that mirrors the
+/// cluster. `wm::BORDER()` is 0, so "one px inside the box's edge" is the strip's own face: that IS
+/// the 0 px border on glass. The retired keyline / bevel / ceramic strip this read until B639 are
+/// gone from `paint_window`, and the Una head is painted OVER the stock strip, so nothing here is
+/// machined: every expectation is a token, exact. `_foc` is kept for the call shape: the strip is
+/// flat whatever the focus (B639: focus is the shadow's level and the title ink, never the band).
+///
+/// Columns: `mid` (`bw / 2`) clears both corner arcs; `right` (`bw - TITLE_H - 2`) clears the right
+/// arc (`head_radius <= TITLE_H`) and the title (the reserve is at least the cluster, > `TITLE_H`).
+/// Rows: `1` and `TITLE_H - 2` are under the outline and above the rule, and clear of the title's
+/// cell (`(TITLE_H - cell_h) / 2 >= 2`) and of the discs (centred, left-aligned). `TITLE_H / 2 >=
+/// head_radius`, so the two edge columns are past the arcs too.
 fn chrome_probes(
     bx: usize,
     by: usize,
     bw: usize,
-    foc: bool,
+    _foc: bool,
 ) -> [(&'static str, usize, usize, u32); 5] {
-    use super::wm::{title_row_color, BORDER, TITLE_H};
-    let strip_x = bx + bw - BORDER() - 2;
-    let face_row = BORDER() + TITLE_H() + 8;
+    use super::wm::TITLE_H;
+    let t = TITLE_H();
+    let face = super::theme::surface_window();
+    let mid = bx + bw / 2;
+    let right = bx + bw.saturating_sub(t + 2).max(1);
     [
-        ("keyline_top", bx + bw / 2, by, super::theme::line_subtle()),
-        (
-            "bevel_light",
-            bx + bw / 2,
-            by + super::theme::BEVEL(),
-            super::theme::surface_raised(),
-        ),
-        (
-            "title_top",
-            strip_x,
-            by + BORDER(),
-            super::ceramic::shade(title_row_color(0, TITLE_H(), foc), BORDER()),
-        ),
-        (
-            "title_bot",
-            strip_x,
-            by + BORDER() + TITLE_H() - 1,
-            super::ceramic::shade(
-                title_row_color(TITLE_H() - 1, TITLE_H(), foc),
-                BORDER() + TITLE_H() - 1,
-            ),
-        ),
-        (
-            "face_left",
-            bx + BORDER() - 2,
-            by + face_row,
-            super::ceramic::shade(super::theme::surface_window(), face_row),
-        ),
+        // The 0 px border: one px inside the box's left and right edges is the strip's face — no
+        // keyline, no bevel, no frame band between the outline and the title strip.
+        ("edge_left", bx + 1, by + t / 2, face),
+        ("edge_right", bx + bw.saturating_sub(2), by + t / 2, face),
+        // The strip's first row under the outline and its last row above the rule (indices 2 and 3:
+        // `title_grad` is their widest channel difference, read off glass — 0 for the flat band).
+        ("strip_top", right, by + 1, face),
+        ("strip_bot", right, by + t.saturating_sub(2), face),
+        // The rule between the title band and the content, mid-width.
+        ("title_rule", mid, by + t.saturating_sub(1), super::theme::line_subtle()),
     ]
 }
 
@@ -735,20 +729,23 @@ fn chrome_probes(
 ///
 /// | probe | coordinate | what a MISS would mean |
 /// |---|---|---|
-/// | `keyline_top` | box top edge, mid-width | the outer keyline (`theme::FRAME_LINE`, UNMACHINED — an exact constant) never landed |
-/// | `bevel_light` | one `theme::BEVEL` in | the frame's hairline structure is absent |
-/// | `title_top` | strip row 0, right end | the title gradient's top stop under `ceramic::shade` |
-/// | `title_bot` | strip row `TITLE_H-1` | the gradient's bottom stop — the pair pins the whole ramp |
-/// | `face_left` | left frame, below the strip | the machined `CHROME_FACE` surface itself |
+/// | `edge_left` | `x = 1`, strip mid-row | a frame, keyline or bevel came back between the outline and the strip (the border is not 0 px) |
+/// | `edge_right` | `x = bw - 2`, strip mid-row | the same on the right edge |
+/// | `strip_top` | strip row 1, right end | the flat `surface.window` band never landed (or the stock ceramic strip shows through) |
+/// | `strip_bot` | strip row `TITLE_H - 2`, right end | the band's foot — the pair pins the strip FLAT (`title_grad` 0) |
+/// | `title_rule` | strip row `TITLE_H - 1`, mid-width | the `line.subtle` rule between the head and the content is absent |
 ///
-/// The title probes take the strip's RIGHT end (`bw - BORDER - 2`) rather than its middle, because
-/// the control cluster is LEFT-aligned and the caption follows it: mid-strip is where a glyph lives.
-/// The face probe takes `bx + BORDER - 2`, inside the frame and clear of both the keyline (`kw` =
-/// `theme::BEVEL` wide) and the bevel beside it.
+/// (DESIGNFIX B649 re-derived these against `desktop::chrome_row`; until then the five read the
+/// retired 5 pt frame — `keyline_top`, `bevel_light`, the machined `face_left` — which B639 deleted.)
+/// The strip probes take the RIGHT end (`bw - TITLE_H - 2`) rather than the middle, because the
+/// control cluster is LEFT-aligned and the caption is centred: mid-strip is where a glyph lives.
 ///
 /// A sixth reading, `content`, carries NO expectation and is reported as `APP`: those pixels belong
 /// to a ring-3 surface and the kernel has no business predicting them. It is printed anyway because
-/// "is there anything in the well at all" is the other half of what an operator is looking at.
+/// "is there anything in the well at all" is the other half of what an operator is looking at. A
+/// seventh, `band`, reads the resize band OUTSIDE the box (B639, §2.9: `wm::RS_EDGE` past the left
+/// edge): no chrome pixel lives there — it is the desktop under the window's own shadow — so it is
+/// reported as `BAND`, never judged.
 ///
 /// ## The desktop reading is REPORTED BUT NOT JUDGED
 ///
@@ -840,9 +837,10 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
             continue;
         }
         let (bx, by, bw, bh) = outer_box(r);
-        // Every probe below indexes at most `BORDER + TITLE_H + 8` rows down and `bw - BORDER - 2`
-        // across; a box that cannot hold them is skipped rather than probed off its own edge.
-        if bw < 2 * BORDER() + 4 || bh < BORDER() + TITLE_H() + 10 || bx + bw > pw || by + bh > ph {
+        // Every probe below indexes at most `BORDER + TITLE_H + 4` rows down and `bw - 2` across, and
+        // the strip column is `bw - TITLE_H - 2`; a box that cannot hold them is skipped rather than
+        // probed off its own edge.
+        if bw < TITLE_H() + 4 || bh < BORDER() + TITLE_H() + 10 || bx + bw > pw || by + bh > ph {
             continue;
         }
         if wins >= slots.len() {
@@ -949,9 +947,22 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
             cpt.1,
             fb.read_pixel(cpt.0, cpt.1).unwrap_or(0)
         );
-        // The gradient the operator's eye is actually offered, measured off glass rather than
-        // derived from the constants: the widest per-channel difference between the strip's first
-        // and last row.
+        // The outside resize band (DESIGNFIX B649; B639 §2.9): mid-band past the left edge, the desktop
+        // under this window's own shadow. No expectation — reported, like the content.
+        let e = crate::ui::px(super::wm::RS_EDGE);
+        if bx > e {
+            let bpt = (bx - 1 - e / 2, by + TITLE_H() / 2);
+            serial_println!(
+                "[chrome-truth] win={} pt=band at=({},{}) want=desktop got={:#08x} -> BAND (the resize band lies OUTSIDE the box)",
+                r.id,
+                bpt.0,
+                bpt.1,
+                fb.read_pixel(bpt.0, bpt.1).unwrap_or(0)
+            );
+        }
+        // The strip's flatness, measured off glass rather than derived from the constants: the widest
+        // per-channel difference between its first and last probed row (DESIGNFIX B649: `strip_top` /
+        // `strip_bot`; the B639 band is flat, so 0 is the reading — the kit's retired gradient read ~5).
         for shift in [16u32, 8, 0] {
             grad_max = grad_max.max(((got_top >> shift) & 0xFF).abs_diff((got_bot >> shift) & 0xFF));
         }

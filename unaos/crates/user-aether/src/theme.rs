@@ -77,28 +77,28 @@ pub struct Theme {
 impl Theme {
     pub const fn of(l: Look) -> Theme {
         let p = palette_core::Theme::of(l);
-        let status = p.tok(Tok::TitleActiveBottom);
+        let status = p.tok(Tok::SurfaceWindow);
         Theme {
             look: l,
             status_bg: status,
-            status_alert: mix(p.tok(Tok::ErrorText), status, 1, 2),
-            status_rule: p.tok(Tok::FrameLine),
-            status_ink: p.tok(Tok::ContentText),
+            status_alert: mix(p.tok(Tok::InkCritical), status, 1, 2),
+            status_rule: p.tok(Tok::LineSubtle),
+            status_ink: p.tok(Tok::TextPrimary),
             focus: p.accent,
             sel_bg: p.highlight,
             sel_ink: PAGE_BG,
             find_bg: mix(ACCENTS[3], PAGE_BG, 3, 8),
             find_cur_bg: mix(ACCENTS[4], PAGE_BG, 1, 4),
-            chrome_bg: l.tok(Tok::WindowBg),
-            chrome_rule: l.tok(Tok::FrameLine),
+            chrome_bg: l.tok(Tok::SurfaceWindow),
+            chrome_rule: l.tok(Tok::LineSubtle),
             tab_bg: status,
-            tab_active: l.tok(Tok::ContentFill),
-            chrome_ink: l.tok(Tok::ContentText),
-            chrome_dim: l.tok(Tok::TitleTextInactive),
-            field_bg: l.tok(Tok::FieldBg),
-            field_ink: l.tok(Tok::ContentText),
-            hot_bg: mix(l.tok(Tok::WindowBg), l.accent(), 1, 5),
-            field_sel: mix(ACCENTS[l.hl as usize % 8], l.tok(Tok::FieldBg), 1, 2),
+            tab_active: l.tok(Tok::SurfaceContent),
+            chrome_ink: l.tok(Tok::TextPrimary),
+            chrome_dim: l.tok(Tok::TextSecondary),
+            field_bg: l.tok(Tok::SurfaceContent),
+            field_ink: l.tok(Tok::TextPrimary),
+            hot_bg: mix(l.tok(Tok::SurfaceWindow), l.accent(), 1, 5),
+            field_sel: mix(ACCENTS[l.hl as usize % 8], l.tok(Tok::SurfaceContent), 1, 2),
         }
     }
 }
