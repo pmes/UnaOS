@@ -148,7 +148,19 @@ pub fn selftest() {
     if ok && !m3 {
         why(if drive.tails[0].is_none() { "no-focus-line" } else if !drive.hover { "no-hover" } else if drive.select == 0 { "no-selection" } else { "no-nav" });
     }
+    net_drive();
     verdict_m3(window, painted, lines, &drive, if ok && m3 { "PASS" } else { "FAIL" });
+}
+
+/// AETHERNET (LEDGER SR110): the network leg of `tests aether`. AETHER.ELF fetches http:// and https:// pages over the
+/// ring-3 socket ABI (crates/user-aether/src/net.rs, `:: AETHER: net url=… status=… bytes=… ms=… tls=… -> …`), and the
+/// drive would aim it at a page the KERNEL serves, so the leg needs no outside network. On x86 there is none: no
+/// in-kernel HTTP responder exists and smolnet carries no loopback interface a ring-3 socket reaches (the one in-kernel
+/// HTTP loopback is aarch64 genet.rs's NET-GATE battery, kernel-side only, and AETHER.ELF is not on that loader yet).
+/// So the leg is a SKIP by name, never a pass; the program's own line is the proof on a networked boot (`aether <url>`).
+#[cfg(target_arch = "x86_64")]
+fn net_drive() {
+    serial_println!(":: AETHERNET: drive=SKIP(no-server) reason=no-kernel-served-page (x86: no in-kernel HTTP responder, no ring-3 loopback) proof=aether-url-on-a-networked-boot ::");
 }
 
 /// AETHERMETAL M3 (SR96): what the drive read back — each step's verdict tail (focus, hover, select, clip, nav)

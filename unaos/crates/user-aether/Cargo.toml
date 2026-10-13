@@ -39,7 +39,18 @@ css_core = { path = "../../libs/web/css_core" }
 font_core = { path = "../../libs/text/font_core" }
 layout_core = { path = "../../libs/web/layout_core" }
 font8x8 = { version = "0.3.1", default-features = false }
+# AETHERNET (LEDGER SR110): pages off the NETWORK — the ring-3 socket ABI, the kernel resolver and verified TLS through
+# vein_ring3 (the transport LUMEN.ELF and NET.ELF use: tls_core over CRYPTOCORE, /system/trust/roots.pem at SYS_TIME);
+# HTTP/1.1, redirects, content codings and the cookie jar through http_core (no_std + alloc, the SAME core the host
+# engine's gneiss_pal transport drives); cookie and partition sites through psl_core (no_std, no alloc).
+vein_core = { path = "../../libs/sys/vein_core", default-features = false }
+vein_ring3 = { path = "../../libs/sys/vein_ring3" }
+http_core = { path = "../../libs/net/http_core" }
+psl_core = { path = "../../libs/net/psl_core" }
 
-# SR66: `cryptocore` is RESERVED (the media build line is Lumen's; M1 opens no connection, so it gates nothing).
+# AETHERNET (SR110): `cryptocore` is the product crypto provider under tls_core (Lumen's line). It is ON BY DEFAULT here
+# because arroyo's build_user_aether_x86 / _aarch64 pass no --features (Lumen's builds pass `--features cryptocore`):
+# without it the program runs, and every https:// page refuses with `reason=tls-no-provider` — never an unverified one.
 [features]
-cryptocore = []
+default = ["cryptocore"]
+cryptocore = ["vein_ring3/cryptocore"]

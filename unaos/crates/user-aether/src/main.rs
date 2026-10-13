@@ -67,6 +67,7 @@
 extern crate alloc;
 
 mod heap;
+mod net; // AETHERNET (LEDGER SR110): http:// and https:// pages — the net module's head has the mechanism
 mod paint;
 mod style;
 mod sys;
@@ -422,8 +423,11 @@ fn esc(s: &str) -> String {
 
 /// Resolve `href` against the page at `cur` (`file://<cur>`, WHATWG URL): the volume path and the fragment.
 fn resolve(cur: &str, href: &str) -> Result<(String, Option<String>), &'static [u8]> {
-    let base = alloc::format!("file://{}", cur);
+    let base = if net::is_net(cur) { String::from(cur) } else { alloc::format!("file://{}", cur) }; // AETHERNET: a network page is its own base
     let u = html_core::url::Url::parse_str_with_base(href, Some(&base)).map_err(|_| b"bad-url" as &[u8])?;
+    if net::is_net_scheme(u.scheme()) {
+        return Ok((u.serialize(true), u.fragment().map(String::from))); // AETHERNET (SR110): fetched by net::fetch
+    }
     if u.scheme() != "file" {
         return Err(b"not-a-file-url");
     }
@@ -434,6 +438,9 @@ fn resolve(cur: &str, href: &str) -> Result<(String, Option<String>), &'static [
 /// Read `path` off the volume (its `/boot` twin when the root is the card): (bytes, the path that answered) or the
 /// first refusal's code.
 fn fetch(path: &str) -> Result<(Vec<u8>, String), i64> {
+    if net::is_net(path) {
+        return net::fetch(path); // AETHERNET (SR110): (body, final URL) off the network
+    }
     let mut err = 0i64;
     let twin = alloc::format!("/boot{}", path);
     let tries: [&str; 2] = [path, if path.starts_with("/system/") { twin.as_str() } else { "" }];
@@ -759,6 +766,7 @@ pub extern "C" fn _start() -> ! {
     app.hist.push(page.path.clone());
     let mut cv = paint::Canvas::new(app.w, app.h);
     let mut reported = false;
+    let mut start_url = net::arg_url(); // AETHERNET (SR110): `aether <url>` opens it once the volume page is reported
 
     loop {
         let mut k = 0;
@@ -955,6 +963,9 @@ pub extern "C" fn _start() -> ! {
             overlay(&app, &page, &mut cv, &fonts);
             app.blit(&cv);
             app.dirty = false;
+        }
+        if let Some(u) = start_url.take_if(|_| reported) {
+            follow(&mut app, &mut page, &mut fonts, &u, b"argv");
         }
         sleep_ms(16);
     }
