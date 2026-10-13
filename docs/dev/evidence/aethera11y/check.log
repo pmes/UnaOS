@@ -1,0 +1,27 @@
+# AETHERA11Y (SR119) compile record — the one compile per commit (R107)
+# check1 (b7800478): CARGO_TARGET_DIR=/root/unaos-bench/scratch/cloud/wave28/target cargo check -p aether -p prefs_core -p css_core --tests
+# check2 (db3770c1), check3 (02b3a26b), check4 (ba9933f8): CARGO_TARGET_DIR=/root/unaos-bench/scratch/cloud/wave28/target cargo check -p aether --tests
+# python3 tools/prefs-schema-check.py: declared=56 referenced=54 undeclared=0 -> PASS (rc=0)
+# Warnings: only the tree's existing ones (tls_core, js_core, layout_core, aether js/mod.rs timer_count, main.rs load_url); none in a11y/, render/focusring.rs, devtools/accessibility.rs, tests/a11y.rs.
+
+## check1
+    Checking css_core v0.1.0 (/home/user/exec/aethera11y/unaos/libs/web/css_core)
+    Checking prefs_core v0.1.0 (/home/user/exec/aethera11y/unaos/libs/sys/prefs_core)
+    Checking aether v0.1.0 (/home/user/exec/aethera11y/handlers/aether)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.97s
+rc=0
+
+## check2
+    Checking aether v0.1.0 (/home/user/exec/aethera11y/handlers/aether)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.00s
+rc=0
+
+## check3
+    Checking aether v0.1.0 (/home/user/exec/aethera11y/handlers/aether)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.75s
+rc=0
+
+## check4
+    Checking aether v0.1.0 (/home/user/exec/aethera11y/handlers/aether)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.95s
+rc=0
