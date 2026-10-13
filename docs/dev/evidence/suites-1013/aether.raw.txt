@@ -1,0 +1,899 @@
+ Downloading crates ...
+  Downloaded imgref v1.12.3
+  Downloaded wasm-bindgen-shared v0.2.129
+  Downloaded siphasher v1.0.4
+  Downloaded wasm-bindgen-macro v0.2.129
+  Downloaded either v1.18.0
+  Downloaded profiling v1.0.18
+  Downloaded bytemuck_derive v1.12.1
+  Downloaded font-types v0.12.6
+  Downloaded zune-core v0.5.3
+  Downloaded simd-adler32 v0.3.10
+  Downloaded imagesize v0.15.0
+  Downloaded crossbeam-deque v0.8.8
+  Downloaded bumpalo v3.20.3
+  Downloaded crossbeam-epoch v0.9.21
+  Downloaded bytemuck v1.25.2
+  Downloaded flate2 v1.1.10
+  Downloaded wasm-bindgen v0.2.129
+  Downloaded miniz_oxide v0.9.1
+  Downloaded resvg v0.48.1
+  Downloaded fontdb v0.24.0
+  Downloaded wasm-bindgen-macro-support v0.2.129
+  Downloaded zerocopy-derive v0.8.59
+  Downloaded usvg v0.48.1
+  Downloaded zlib-rs v0.6.8
+  Downloaded skrifa v0.44.0
+  Downloaded harfrust v0.12.0
+  Downloaded read-fonts v0.41.0
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling cfg-if v1.0.5
+   Compiling autocfg v1.5.1
+   Compiling smallvec v1.16.2
+   Compiling crossbeam-utils v0.8.23
+   Compiling memchr v2.8.3
+   Compiling version_check v0.9.5
+   Compiling arrayvec v0.7.8
+   Compiling simd-adler32 v0.3.10
+   Compiling log v0.4.34
+   Compiling adler2 v2.0.1
+   Compiling anyhow v1.0.104
+   Compiling bitflags v2.13.2
+   Compiling crc32fast v1.5.2
+   Compiling crossbeam-epoch v0.9.21
+   Compiling crossbeam-deque v0.8.8
+   Compiling paste v1.0.15
+   Compiling pin-project-lite v0.2.17
+   Compiling rayon-core v1.13.0
+   Compiling parking_lot_core v0.9.12
+   Compiling miniz_oxide v0.9.1
+   Compiling either v1.18.0
+   Compiling serde_core v1.0.229
+   Compiling zerocopy v0.8.59
+   Compiling stable_deref_trait v1.2.1
+   Compiling thiserror v2.0.21
+   Compiling as-slice v0.2.1
+   Compiling miniz_oxide v0.8.9
+   Compiling libm v0.2.16
+   Compiling parking v2.2.1
+   Compiling zmij v1.0.23
+   Compiling built v0.8.1
+   Compiling quick-error v2.0.1
+   Compiling av-scenechange v0.14.1
+   Compiling once_cell v1.21.4
+   Compiling scopeguard v1.2.0
+   Compiling float-cmp v0.9.0
+   Compiling nom v8.0.0
+   Compiling no_std_io2 v0.9.4
+   Compiling lock_api v0.4.14
+   Compiling event-listener v5.4.2
+   Compiling flate2 v1.1.10
+   Compiling strict-num v0.1.1
+   Compiling aligned v0.4.3
+   Compiling polycool v0.4.0
+   Compiling fdeflate v0.3.7
+   Compiling y4m v0.8.0
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+   Compiling slotmap v1.1.1
+   Compiling pulp v0.22.3
+   Compiling serde_json v1.0.154
+   Compiling num-traits v0.2.19
+   Compiling weezl v0.1.12
+   Compiling futures-core v0.3.34
+   Compiling roxmltree v0.20.0
+   Compiling zune-core v0.5.3
+   Compiling serde v1.0.229
+   Compiling pastey v0.1.1
+   Compiling arrayref v0.3.9
+   Compiling utf8parse v0.2.2
+   Compiling zune-jpeg v0.5.15
+   Compiling png v0.18.1
+   Compiling rayon v1.12.0
+   Compiling anstyle-parse v1.0.0
+   Compiling num-integer v0.1.47
+   Compiling errno v0.3.14
+   Compiling rav1e v0.8.1
+   Compiling signal-hook-registry v1.4.8
+   Compiling memmap2 v0.9.11
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.4
+   Compiling parking_lot v0.12.5
+   Compiling num-bigint v0.4.8
+   Compiling fontconfig-parser v0.5.8
+   Compiling kurbo v0.13.1
+   Compiling concurrent-queue v2.5.0
+   Compiling simd_helpers v0.1.0
+   Compiling event-listener-strategy v0.5.4
+   Compiling bitstream-io v4.10.0
+   Compiling itertools v0.14.0
+   Compiling raw-cpuid v11.6.0
+   Compiling maybe-rayon v0.1.1
+   Compiling itoa v1.0.18
+   Compiling iana-time-zone v0.1.65
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling pulp-wasm-simd-flag v0.1.1
+   Compiling elf_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/elf_core)
+   Compiling reborrow v0.5.5
+   Compiling tinyvec v1.13.3
+   Compiling num-rational v0.4.2
+   Compiling vp8_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/vp8_core)
+   Compiling anstyle v1.0.14
+   Compiling bytes v1.12.1
+   Compiling noop_proc_macro v0.3.0
+   Compiling imgref v1.12.3
+   Compiling anstyle-query v1.1.5
+   Compiling byteorder-lite v0.1.0
+   Compiling colorchoice v1.0.5
+   Compiling color_quant v1.1.0
+   Compiling siphasher v1.0.4
+   Compiling raw_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/raw_core)
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/crypto_core)
+   Compiling new_debug_unreachable v1.0.6
+   Compiling image-webp v0.2.4
+   Compiling svgtypes v0.16.1
+   Compiling gif v0.14.2
+   Compiling anstream v1.0.0
+   Compiling loop9 v0.1.5
+   Compiling pixel_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/pixel_core)
+   Compiling fontdb v0.24.0
+   Compiling type_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/type_core)
+   Compiling chrono v0.4.45
+   Compiling async-channel v2.5.0
+   Compiling roxmltree v0.21.1
+   Compiling avif-serialize v0.8.9
+   Compiling simplecss v0.2.2
+   Compiling zune-inflate v0.2.54
+   Compiling tls_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/sys/tls_core)
+   Compiling slab v0.4.12
+   Compiling html_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/html_core)
+   Compiling clap_lex v1.1.1
+   Compiling fax v0.2.7
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling pxfm v0.1.30
+   Compiling demux_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/demux_core)
+   Compiling base64 v0.23.1
+   Compiling strsim v0.11.1
+   Compiling bit_field v0.10.3
+   Compiling unicode-bidi v0.3.18
+   Compiling data-url v0.3.2
+   Compiling unicode-script v0.5.8
+   Compiling option-ext v0.2.0
+   Compiling imagesize v0.15.0
+   Compiling psl_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/net/psl_core)
+   Compiling unicode-vo v0.1.0
+   Compiling pico-args v0.5.0
+   Compiling xmlwriter v0.1.0
+   Compiling futures-task v0.3.34
+   Compiling heck v0.5.0
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/text/font_core)
+   Compiling lebe v0.5.3
+   Compiling http_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/net/http_core)
+   Compiling dirs-sys v0.5.0
+   Compiling audio_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/media/audio_core)
+   Compiling clap_builder v4.6.7
+   Compiling taffy v0.15.0
+   Compiling css_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/css_core)
+   Compiling directories v6.0.0
+   Compiling js_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/js_core)
+   Compiling kvstore_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/fs/kvstore_core)
+warning: `tls_core` (lib) generated 1 warning
+   Compiling moxcms v0.8.1
+   Compiling layout_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/unaos/libs/web/layout_core)
+   Compiling text_host v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/libs/text_host)
+warning: unreachable pattern
+    --> unaos/libs/web/layout_core/src/css.rs:1408:9
+     |
+1359 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1408 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `is_arrow` is never read
+  --> unaos/libs/web/js_core/src/parser/mod.rs:65:9
+   |
+50 | pub(crate) struct Ctx {
+   |                   --- field in this struct
+...
+65 |     pub is_arrow: bool,
+   |         ^^^^^^^^
+   |
+   = note: `Ctx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Params` is never constructed
+  --> unaos/libs/web/js_core/src/parser/mod.rs:86:5
+   |
+77 | pub(crate) enum ScopeKind {
+   |                 --------- variant in this enum
+...
+86 |     Params,
+   |     ^^^^^^
+   |
+   = note: `ScopeKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `ui` is never read
+   --> unaos/libs/web/js_core/src/regexp/parser.rs:215:5
+    |
+202 | struct P<'a> {
+    |        - field in this struct
+...
+215 |     ui: bool,
+    |     ^^
+
+warning: field `is_switch` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:44:48
+   |
+44 |     Target { labels: Vec<Atom>, is_loop: bool, is_switch: bool, breaks: Vec<usize>, continues: Vec<usize>, scope: u32, labelled_only...
+   |     ------ field in this variant               ^^^^^^^^^
+
+warning: field `kind` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:65:9
+   |
+55 | pub(crate) struct FnState {
+   |                   ------- field in this struct
+...
+65 |     pub kind: FnKind,
+   |         ^^^^
+
+warning: enum `Flow` is never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:13:6
+   |
+13 | enum Flow {
+   |      ^^^^
+
+warning: methods `fr` and `frm` are never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:29:8
+   |
+19 | impl Vm {
+   | ------- methods in this implementation
+...
+29 |     fn fr(&self) -> &Frame {
+   |        ^^
+...
+33 |     fn frm(&mut self) -> &mut Frame {
+   |        ^^^
+
+warning: `layout_core` (lib) generated 1 warning
+   Compiling bytemuck_derive v1.12.1
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling clap_derive v4.6.7
+   Compiling equator-macro v0.4.2
+   Compiling zerocopy-derive v0.8.59
+   Compiling arg_enum_proc_macro v0.3.4
+   Compiling profiling-procmacros v1.0.18
+   Compiling num-derive v0.4.2
+   Compiling profiling v1.0.18
+   Compiling equator v0.4.2
+   Compiling tokio v1.53.2
+   Compiling aligned-vec v0.6.4
+   Compiling v_frame v0.3.9
+   Compiling av1-grain v0.2.5
+   Compiling futures-util v0.3.34
+   Compiling bytemuck v1.25.2
+warning: `js_core` (lib) generated 7 warnings
+   Compiling font-types v0.12.6
+   Compiling num-complex v0.4.6
+   Compiling rgb v0.8.53
+   Compiling tiny-skia-path v0.12.0
+   Compiling qoi v0.4.1
+   Compiling read-fonts v0.41.0
+   Compiling tiny-skia v0.12.0
+   Compiling clap v4.6.7
+   Compiling bandy v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/libs/bandy)
+   Compiling gneiss_pal v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/libs/gneiss_pal)
+   Compiling ravif v0.13.0
+   Compiling skrifa v0.44.0
+   Compiling harfrust v0.12.0
+   Compiling half v2.7.1
+   Compiling tiff v0.11.3
+   Compiling exr v1.74.2
+   Compiling usvg v0.48.1
+   Compiling resvg v0.48.1
+   Compiling image v0.25.10
+   Compiling aether v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/handlers/aether)
+warning: field `timer_count` is never read
+   --> handlers/aether/src/js/mod.rs:258:9
+    |
+189 | pub(crate) struct PageState {
+    |                   --------- field in this struct
+...
+258 |     pub timer_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aether` (lib) generated 1 warning
+warning: use of deprecated method `aether::AetherEngine::load_url`: use aether::net::fetch_document and engine.load_html instead to prevent borrow panics
+  --> handlers/aether/src/main.rs:73:48
+   |
+73 |                         if let Err(e) = engine.load_url(&url).await {
+   |                                                ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: `aether` (bin "aether" test) generated 1 warning (1 duplicate)
+warning: `aether` (bin "aether") generated 1 warning
+warning: `aether` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6m 17s
+     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/c59cfdc969d88636/out/aether-c59cfdc969d88636)
+
+running 201 tests
+test api::uievents::tests::keys ... ok
+test chrome::find::tests::matching_folds_case_and_does_not_overlap ... ok
+test chrome::find::tests::the_state_steps_and_wraps ... ok
+test chrome::history::tests::push_state_entries_traverse_without_a_load_and_documents_do ... ok
+test chrome::omnibox::tests::a_search_fills_the_template_urlencoded ... ok
+test chrome::omnibox::tests::urls_and_searches_split_where_a_browser_splits_them ... ok
+test chrome::tabs::tests::open_close_select_and_step_keep_one_active_tab ... ok
+test chrome::zoom::tests::the_ladder_steps_and_sticks_at_its_ends ... ok
+test css::tests::test_color_functions ... ok
+test css::tests::test_font_size_and_weight_parsing ... ok
+test dom::tests::cross_document_append_imports ... ok
+test css::tests::test_viewport_units ... ok
+test chrome::bookmarks::tests::the_file_round_trips_and_toggle_flips ... ok
+test chrome::downloads::tests::disposition_and_type_decide_a_download ... ok
+test chrome::downloads::tests::the_file_name_is_rfc6266s_and_cannot_escape_the_folder ... ok
+test dom::tests::inner_html_is_a_context_fragment_parse ... ok
+test engine_tests::tests::aethersee_flex_shorthand_grammar ... ok
+test dom::tests::selectors_match_like_the_engine ... ok
+test dom::tests::parse_navigate_mutate_serialize ... ok
+test engine_tests::tests::edit_caret_moves_by_grapheme_kat ... ok
+test engine_tests::tests::edit_insert_delete_select_words_kat ... ok
+test engine_tests::tests::prefetched_external_scripts_run_in_document_order_with_their_own_current_script ... ok
+test engine_tests::tests::test_absolute_without_insets_stays_in_flow ... ok
+test engine_tests::tests::aethersee_display_flex_is_a_row_with_flex_properties ... ok
+test css::tests::test_escaped_utility_classes ... ok
+test engine_tests::tests::test_background_image_parse_and_url_collection ... ok
+test engine_tests::tests::test_block_width_kat ... ok
+test engine_tests::tests::dataset_is_a_live_view_over_data_attributes ... ok
+test css::tests::test_selector_list_validity ... ok
+test css::tests::test_custom_properties_per_element ... ok
+test engine_tests::tests::test_css_image_refs_sheet_base ... ok
+test engine_tests::tests::test_css_math_functions ... ok
+test engine_tests::tests::test_css_math_kat ... ok
+test engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with ... FAILED
+test engine_tests::tests::test_abort_domparser_and_crypto ... ok
+test engine_tests::tests::canceled_submit_event_stages_no_navigation ... ok
+test engine_tests::tests::dom_interface_constructors_form_a_chain ... ok
+test engine_tests::tests::test_css_selectors_and_specified_only_application ... ok
+test engine_tests::tests::aethersee_sole_text_run_wraps_inside_its_box ... ok
+test engine_tests::tests::test_custom_property_resolution ... ok
+test engine_tests::tests::test_float_approximation ... ok
+test engine_tests::tests::test_display_block_on_inline_tag ... ok
+test engine_tests::tests::keys_scroll_the_page_unless_a_field_is_focused ... ok
+test engine_tests::tests::test_focus_visible_within ... ok
+test engine_tests::tests::test_form_control_metrics_kat ... ok
+test engine_tests::tests::aethersee_body_background_fills_the_canvas ... ok
+test engine_tests::tests::test_empty_shell_boxes_cost_nothing ... ok
+test engine_tests::tests::test_form_urlencoded ... ok
+test engine_tests::tests::test_generated_before_after_boxes ... ok
+test engine_tests::tests::test_generated_counters ... FAILED
+test engine_tests::tests::test_font_relative_units_kat ... ok
+test engine_tests::tests::test_generated_quotes ... ok
+test engine_tests::tests::test_generated_url_image ... ok
+test engine_tests::tests::test_heading_em_sizes ... ok
+test engine_tests::tests::click_submits_and_toggles_checkables ... FAILED
+test engine_tests::tests::test_generated_suppression ... ok
+test engine_tests::tests::test_hidden_input_generates_no_box ... ok
+test css::tests::test_selectors4_match ... ok
+test css::tests::test_media_queries ... ok
+test engine_tests::tests::test_generated_marker ... ok
+test engine_tests::tests::test_html_parsing_and_layout ... ok
+test engine_tests::tests::test_image_decode_channel_order_matches_across_formats ... ok
+test engine_tests::tests::focused_field_paints_caret_and_ring ... ok
+test engine_tests::tests::test_important_cascade_tier ... ok
+test engine_tests::tests::test_inline_beats_normal_rules ... ok
+test css::tests::test_selectors4_specificity ... ok
+test engine_tests::tests::test_fetch_wrapper_shape ... ok
+test engine_tests::tests::test_inline_formatting_context_kat ... ok
+test engine_tests::tests::test_ledger_dump_is_one_record_per_line ... ok
+test engine_tests::tests::test_clear_timeout_cancels ... ok
+test engine_tests::tests::test_line_metrics_kat ... ok
+test engine_tests::tests::test_margin_collapsing_kat ... ok
+test engine_tests::tests::test_marker_text_kat ... ok
+test engine_tests::tests::test_mask_geometry_fits_box ... ok
+test engine_tests::tests::test_max_height_overflow_clip ... ok
+test engine_tests::tests::test_js_dom_mutations_are_real ... ok
+test engine_tests::tests::test_form_submission_builds_get_url ... ok
+test engine_tests::tests::test_cursor_follows_the_hovered_element ... ok
+test engine_tests::tests::test_mixed_inline_and_block_children_share_a_line ... ok
+test engine_tests::tests::test_hover_applies_on_the_pointer_path_only ... ok
+test engine_tests::tests::test_click_dispatch_and_relayout ... ok
+test engine_tests::tests::test_modern_selector_syntax_lowered ... ok
+test engine_tests::tests::test_noscript_iframe_hidden ... FAILED
+test engine_tests::tests::test_boot_timers_drain_before_layout ... ok
+test engine_tests::tests::test_opacity_and_transparent_border_override ... ok
+test engine_tests::tests::test_paint_effects_kat ... ok
+test engine_tests::tests::test_font_family_classes ... ok
+test engine_tests::tests::test_hit_test_is_paint_order ... ok
+test engine_tests::tests::test_dom_methods_with_detached_this_do_not_panic ... ok
+test engine_tests::tests::edit_engine_textarea_typing_and_paste ... ok
+test engine_tests::tests::test_paint_translates_with_scroll ... ok
+test engine_tests::tests::test_select_options_produce_no_boxes ... ok
+test engine_tests::tests::test_render_paint_assertions ... ok
+test engine_tests::tests::test_input_events_and_navigation ... ok
+test engine_tests::tests::test_media_sources_for_stria ... ok
+test engine_tests::tests::test_hover_restyles_only_when_the_path_changes ... ok
+test engine_tests::tests::test_headless_render_writes_png_and_ledger ... ok
+test engine_tests::tests::test_shell_borrow_panic_prevention ... ok
+test engine_tests::tests::test_raf_drain_is_bounded_and_isolates_throwing_callbacks ... ok
+test engine_tests::tests::test_side_borders_decoration_nowrap ... ok
+test engine_tests::tests::test_sprite_background_declarations_reach_paint ... ok
+test engine_tests::tests::test_create_element_direct_construction_and_platform_breadth ... ok
+test engine_tests::tests::test_raf_bounded_drain_and_xhr ... ok
+test engine_tests::tests::test_storage_path_sanitization ... ok
+test engine_tests::tests::test_stacking_context_kat ... ok
+test engine_tests::tests::test_sup_grows_line_box ... ok
+test engine_tests::tests::test_message_channel_delivers_through_timer_queue ... ok
+test engine_tests::tests::test_supports_mask_branch_and_calc_icon_box ... ok
+test engine_tests::tests::test_svg_decode ... ok
+test engine_tests::tests::test_set_interval_repeats_until_cleared ... ok
+test engine_tests::tests::test_ua_margins_and_longhands ... ok
+test engine_tests::tests::test_table_layout_kat ... ok
+test engine_tests::tests::test_visibility_hidden_paints_nothing ... ok
+test engine_tests::tests::test_z_index_and_fixed_kat ... ok
+test engine_tests::tests::test_table_spans_kat ... ok
+test engine_tests::tests::test_document_cookie_round_trips_through_the_jar ... ok
+test fonts::lines::tests::continuation_kat ... ok
+test fonts::lines::tests::letter_spacing_kat ... ok
+test fonts::lines::tests::uax14_soft_wraps_kat ... ok
+test fonts::lines::tests::white_space_kat ... ok
+test fonts::shape::tests::kerning_ligatures_and_spacing_kat ... ok
+test fonts::shape::tests::rtl_runs_come_out_in_visual_order ... ok
+test fonts::tests::decoration_metrics_kat ... ok
+test fonts::tests::family_list_parse_and_serialize_kat ... ok
+test fonts::lines::tests::word_breaking_kat ... ok
+test fonts::webfont::tests::descriptors_kat ... ok
+test engine_tests::tests::test_selection_word_block_shift_and_select_all ... ok
+test fonts::webfont::tests::font_face_rules_kat ... ok
+test engine_tests::tests::test_mouse_enter_leave_do_not_bubble ... ok
+test fonts::webfont::tests::woff1_zlib_table ... ok
+test fonts::webfont::tests::woff1_roundtrip ... ok
+test engine_tests::tests::test_self_rearming_timer_fires_one_generation_per_tick ... ok
+test engine_tests::tests::test_console_log_with_throwing_tostring_does_not_panic ... ok
+test engine_tests::tests::test_url_and_text_codec_platform_apis ... ok
+test media::tests::fetch_uses_byte_ranges_resumes_a_partial_file_and_falls_back_to_one_get ... ok
+test engine_tests::tests::test_mouse_boundary_events_follow_ui_events_order ... ok
+test media::tests::audio_controls_asks_for_metadata_paints_chromiums_control_and_follows_the_meters ... ok
+test js::idb::tests::transaction_ordering_kat ... ok
+test engine_tests::tests::test_style_assignment_and_traversal ... ok
+test engine_tests::tests::test_ledger_records_unimplemented_apis ... ok
+test media::tests::object_fit_geometry ... ok
+test engine_tests::tests::test_lifecycle_srcset_scroll_clamp ... ok
+test engine_tests::tests::test_script_pipeline_and_dom_surface ... ok
+test fonts::tests::stacks_resolve_like_chromium ... ok
+test media::tests::layout_fires_media_poster_and_paints_the_first_frame ... ok
+test media::tests::controls_strip_paints_play_then_pause ... ok
+test net::tests::test_collect_stylesheet_urls ... ok
+test net::tests::test_cookie_jar_round_trip ... ok
+test net::tests::test_css_image_refs_extensionless ... ok
+test net::tests::test_favicon_url ... ok
+test net::tests::test_ico_decoder_is_available ... ok
+test net::tests::test_loader_priority_order_and_dedup ... ok
+test net::tests::test_normalize_url ... ok
+test net::tests::test_sniff_image_kind ... ok
+test render::boxpaint::tests::dash_and_dot_fit_kat ... ok
+test render::boxpaint::tests::rounded_ring_paint_kat ... ok
+test engine_tests::tests::test_stack_overflow_in_promise_reaction_rejects_the_chain ... ok
+test render::effects::tests::box_shadow_parse_kat ... ok
+test render::boxpaint::tests::used_radii_kat ... ok
+test engine_tests::tests::wrapped_nodes_inherit_their_interface_and_currentscript_is_real ... ok
+test render::effects::tests::gradient_parse_and_stops_kat ... ok
+test render::effects::tests::radial_gradient_kat ... ok
+test engine_tests::tests::test_stack_overflow_in_timer_callback_is_catchable ... ok
+test security::cors::tests::checks ... ok
+test security::cors::tests::safelists_and_preflight ... ok
+test security::csp::tests::frame_ancestors_and_flags ... ok
+test security::csp::tests::inline_and_eval ... ok
+test security::csp::tests::source_lists ... FAILED
+test security::mixed::tests::active_blocked_passive_upgraded ... ok
+test security::origin::tests::origins ... FAILED
+test security::origin::tests::sec_fetch_and_coop ... ok
+test security::origin::tests::sites ... ok
+test security::referrer::tests::parsing ... ok
+test security::sri::tests::strongest_wins ... ok
+test selection::tests::align_collapsed_fragments_kat ... ok
+test security::tests::navigation_and_endpoints ... ok
+test security::tests::embedding ... ok
+test selection::tests::uax29_words_kat ... ok
+test security::referrer::tests::the_eight_policies ... ok
+test selection::tests::utf16_offsets_kat ... ok
+test storage::cache::tests::vary_and_search_matching ... ok
+test storage::idb::tests::scheduler_orders_overlapping_transactions ... ok
+test workers::sw::tests::the_24h_rule ... ok
+test workers::sw::tests::scope_directory ... ok
+test storage::locks::tests::exclusive_then_shared_queue_in_order ... ok
+test engine_tests::tests::test_selection_script_api_and_selectionchange ... ok
+test media::tests::preload_none_waits_for_play_and_mute_follows_the_opening_request ... ok
+test media::tests::media_error_text_paints_in_the_box ... ok
+test media::tests::poster_attribute_wins_until_playback ... ok
+test media::tests::navigation_stops_the_previous_pages_sessions ... ok
+test engine_tests::tests::test_media_click_stages_playmedia ... ok
+test media::tests::object_fit_cover_paints_clipped_to_the_box ... ok
+test engine_tests::tests::test_selection_drag_paints_and_copies ... ok
+test media::tests::play_paints_each_frame_then_ended_keeps_the_last ... ok
+test engine_tests::tests::test_runaway_task_is_terminated_by_the_budget ... ok
+test media::tests::source_selection_skips_types_stria_cannot_play ... ok
+test engine_tests::tests::test_history_back_forward ... ok
+test media::tests::click_toggles_pause_and_seek_paints_the_target ... ok
+test media::tests::autoplay_policy_muted_runs_bare_does_not ... ok
+test media::tests::video_with_source_children_keeps_its_attribute_size ... ok
+test media::tests::http_media_is_cached_then_handed_to_stria_as_a_file_and_a_failure_paints ... ok
+
+failures:
+
+---- engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with stdout ----
+
+thread 'engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with' (175726) panicked at handlers/aether/src/engine_tests.rs:2463:9:
+bold run measured with the bold face (194 vs 194)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- engine_tests::tests::test_generated_counters stdout ----
+
+thread 'engine_tests::tests::test_generated_counters' (176447) panicked at handlers/aether/src/engine_tests.rs:3080:9:
+assertion `left == right` failed
+  left: ["iii/C/03/•", "v/E/05/•", "vii/G/07/•", "απ0"]
+ right: ["iii/C/03/•", "v/E/05/•", "vii/G/07/•", "μ0"]
+
+---- engine_tests::tests::click_submits_and_toggles_checkables stdout ----
+
+thread 'engine_tests::tests::click_submits_and_toggles_checkables' (175728) panicked at handlers/aether/src/engine_tests.rs:3359:9:
+a label click toggles its control
+
+---- engine_tests::tests::test_noscript_iframe_hidden stdout ----
+
+thread 'engine_tests::tests::test_noscript_iframe_hidden' (176597) panicked at handlers/aether/src/engine_tests.rs:1328:17:
+iframe content must produce no box
+
+---- security::csp::tests::source_lists stdout ----
+
+thread 'security::csp::tests::source_lists' (176975) panicked at handlers/aether/src/security/csp.rs:699:9:
+assertion failed: url_matches_list(&l("b.example:8443"), "https://b.example:8443/", &so, false)
+
+---- security::origin::tests::origins stdout ----
+
+thread 'security::origin::tests::origins' (176977) panicked at handlers/aether/src/security/origin.rs:281:9:
+assertion `left == right` failed
+  left: "blob://"
+ right: "https://a.example"
+
+
+failures:
+    engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with
+    engine_tests::tests::click_submits_and_toggles_checkables
+    engine_tests::tests::test_generated_counters
+    engine_tests::tests::test_noscript_iframe_hidden
+    security::csp::tests::source_lists
+    security::origin::tests::origins
+
+test result: FAILED. 195 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.03s
+
+error: test failed, to rerun pass `-p aether --lib`
+     Running unittests src/main.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/f29de9221a8cd0da/out/aether-f29de9221a8cd0da)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dom_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/bb3070b72603838d/out/dom_oracle-bb3070b72603838d)
+
+running 1 test
+test eyes_corpus_dom_equals_html_core_and_chromium ... FAILED
+
+failures:
+
+---- eyes_corpus_dom_equals_html_core_and_chromium stdout ----
+
+thread 'eyes_corpus_dom_equals_html_core_and_chromium' (177351) panicked at handlers/aether/tests/dom_oracle.rs:28:5:
+assertion `left == right` failed: the 22 EYES pages (17-21: AETHERINLINE's cases, 22: AETHERFONT's)
+  left: 25
+ right: 22
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    eyes_corpus_dom_equals_html_core_and_chromium
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p aether --test dom_oracle`
+     Running tests/forms_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/9cc21d3d9d9cbd85/out/forms_oracle-9cc21d3d9d9cbd85)
+
+running 1 test
+test submissions_match_chromium_byte_for_byte ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.91s
+
+     Running tests/innertext.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/3be33e53ee5af4e6/out/innertext-3be33e53ee5af4e6)
+
+running 1 test
+test whole_document_selection_text_equals_chromium_inner_text ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.34s
+
+     Running tests/net.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/adf9241231683da1/out/net-adf9241231683da1)
+
+running 7 tests
+test websocket_close_code_matrix_and_failures ... ok
+test eventsource_reconnects_with_last_event_id ... ok
+test fetch_body_mixins_abort_and_errors ... ok
+test xhr_states_headers_json_sync_abort_timeout ... ok
+test fetch_streams_chunks_before_eof ... ok
+test websocket_echo_fragments_and_ping_during_send ... ok
+test storage_event_reaches_the_other_documents_of_the_origin ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.89s
+
+     Running tests/script_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/63f05e789b90fe5e/out/script_oracle-63f05e789b90fe5e)
+
+running 1 test
+test script_pages_serialize_like_chromium ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.16s
+
+     Running tests/service_worker.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/3f0456f26585449d/out/service_worker-3f0456f26585449d)
+
+running 10 tests
+test offline_the_worker_answers_from_its_cache ... FAILED
+test navigation_is_answered_by_respond_with ... ok
+test navigation_without_respond_with_falls_through_to_the_network ... ok
+test clients_claim_takes_an_open_page ... ok
+test the_worker_reads_and_writes_the_cache_api ... FAILED
+test policy_refuses_opaque_answers_to_navigations_and_cors_requests ... ok
+test a_controlled_documents_subresources_go_to_its_worker ... ok
+test post_message_between_a_page_and_its_worker ... ok
+test the_update_check_on_navigation_byte_compares_the_script ... ok
+test install_waiting_active_and_skip_waiting ... ok
+
+failures:
+
+---- offline_the_worker_answers_from_its_cache stdout ----
+[aether-sw] error: Uncaught     at <anonymous>
+    at fire
+    at <anonymous>
+[aether-sw] error: respondWith: caches is not defined
+
+thread 'offline_the_worker_answers_from_its_cache' (185674) panicked at handlers/aether/tests/service_worker.rs:480:61:
+the cached offline page: "Service worker network error: The service worker answered 'http://127.0.0.1:46873/app/live' with a network error."
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- the_worker_reads_and_writes_the_cache_api stdout ----
+[aether-sw] error: Uncaught     at <anonymous>
+    at fire
+    at <anonymous>
+
+thread 'the_worker_reads_and_writes_the_cache_api' (185678) panicked at handlers/aether/tests/service_worker.rs:422:5:
+assertion `left == right` failed: addAll fetched the asset once
+  left: 0
+ right: 1
+
+
+failures:
+    offline_the_worker_answers_from_its_cache
+    the_worker_reads_and_writes_the_cache_api
+
+test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.67s
+
+error: test failed, to rerun pass `-p aether --test service_worker`
+     Running tests/style_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/8377ce2b6a32cfd7/out/style_oracle-8377ce2b6a32cfd7)
+
+running 1 test
+test aether_computed_values_vs_chromium ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+     Running tests/style_time.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/36488857672bf117/out/style_time-36488857672bf117)
+
+running 3 tests
+test rule_index_exact_on_wikipedia ... ok
+test style_time_wikipedia ... ok
+test style_time_eyes_01 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.52s
+
+     Running tests/text_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/970f7d0ea7726069/out/text_oracle-970f7d0ea7726069)
+
+running 2 tests
+test text_rasters_and_widths_vs_chromium_live ... ok
+test text_widths_vs_chromium_frozen ... FAILED
+
+failures:
+
+---- text_widths_vs_chromium_frozen stdout ----
+text oracle widths: 63/200 within 0.5 px, worst 400.8528 px
+
+thread 'text_widths_vs_chromium_frozen' (187733) panicked at handlers/aether/tests/text_oracle.rs:179:5:
+widths off by more than 0.5 px:
+12px #0 "The quick brown fox jumps over the lazy dog": aether 251.160 chromium 237.453
+12px #2 "office affluent baffle flagship efficient": aether 210.336 chromium 192.594
+12px #3 "Pack my box with five dozen liquor jugs!": aether 224.868 chromium 212.766
+12px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 226.368 chromium 220.422
+12px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 276.420 chromium 270.375
+12px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 269.844 chromium 262.125
+12px #7 "Bold Headline Text With Kerning AV Ty": aether 214.848 chromium 220.125
+12px #8 "Italic emphasis in a running sentence": aether 210.108 chromium 197.453
+12px #9 "Bold italic: Waffles & Yogurt": aether 155.184 chromium 160.250
+12px #10 "The quick brown fox jumps over the lazy dog": aether 251.160 chromium 219.281
+12px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 219.024 chromium 206.328
+12px #12 "office affluent baffle flagship efficient": aether 210.336 chromium 183.047
+12px #13 "Sphinx of black quartz, judge my vow.": aether 212.064 chromium 185.859
+12px #14 "Bold Serif Heading: Victory Over Time": aether 211.224 chromium 201.000
+12px #15 "Italic serif: a journey of a thousand miles": aether 228.108 chromium 198.984
+12px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 224.448 chromium 198.672
+12px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 202.236 chromium 302.453
+12px #18 "SELECT * FROM fonts WHERE id = 7;": aether 200.040 chromium 237.641
+12px #32 "Japanese: こんにちは世界": aether 107.556 chromium 144.125
+12px #33 "Chinese: 你好，世界。": aether 98.851 chromium 122.703
+12px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 193.236 chromium 206.344
+12px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 96.468 chromium 101.891
+12px #36 "Bold fallback: 世界 Ж Ω": aether 118.596 chromium 133.156
+12px #37 "Serif generic: Times-like metrics": aether 178.872 chromium 157.641
+12px #38 "Serif italic generic: Quixotic": aether 152.808 chromium 137.625
+12px #40 "Sans generic: Arial-like metrics": aether 171.864 chromium 164.062
+12px #41 "Helvetica falls to Arial: Wallpaper": aether 184.236 chromium 174.297
+12px #42 "Times New Roman alias: Journal": aether 179.928 chromium 159.547
+12px #43 "No such font: the standard font": aether 176.760 chromium 148.969
+12px #44 "FreeSans: another sans face, kerned AV": aether 220.992 chromium 208.641
+12px #45 "FreeSerif: another serif face, fi fl": aether 179.460 chromium 154.906
+12px #46 "Tight letters: illiterate millimetre": aether 180.912 chromium 164.938
+12px #47 "Wide letters: MMMWWW mwmwmw": aether 205.068 chromium 193.312
+12px #48 "Question? Exclamation! Semicolon; Colon:": aether 235.140 chromium 209.641
+16px #0 "The quick brown fox jumps over the lazy dog": aether 334.880 chromium 316.609
+16px #2 "office affluent baffle flagship efficient": aether 280.448 chromium 256.781
+16px #3 "Pack my box with five dozen liquor jugs!": aether 299.824 chromium 283.688
+16px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 301.824 chromium 293.891
+16px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 368.560 chromium 360.484
+16px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 359.792 chromium 349.484
+16px #7 "Bold Headline Text With Kerning AV Ty": aether 286.464 chromium 293.500
+16px #8 "Italic emphasis in a running sentence": aether 280.144 chromium 263.266
+16px #9 "Bold italic: Waffles & Yogurt": aether 206.912 chromium 213.656
+16px #10 "The quick brown fox jumps over the lazy dog": aether 334.880 chromium 292.375
+16px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 292.032 chromium 275.094
+16px #12 "office affluent baffle flagship efficient": aether 280.448 chromium 244.047
+16px #13 "Sphinx of black quartz, judge my vow.": aether 282.752 chromium 247.812
+16px #14 "Bold Serif Heading: Victory Over Time": aether 281.632 chromium 267.984
+16px #15 "Italic serif: a journey of a thousand miles": aether 304.144 chromium 265.312
+16px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 299.264 chromium 264.891
+16px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 269.648 chromium 403.266
+16px #18 "SELECT * FROM fonts WHERE id = 7;": aether 266.720 chromium 316.859
+16px #32 "Japanese: こんにちは世界": aether 143.408 chromium 192.156
+16px #33 "Chinese: 你好，世界。": aether 131.801 chromium 163.594
+16px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 257.648 chromium 275.109
+16px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 128.624 chromium 135.844
+16px #36 "Bold fallback: 世界 Ж Ω": aether 158.128 chromium 177.531
+16px #37 "Serif generic: Times-like metrics": aether 238.496 chromium 210.188
+16px #38 "Serif italic generic: Quixotic": aether 203.744 chromium 183.500
+16px #40 "Sans generic: Arial-like metrics": aether 229.152 chromium 218.750
+16px #41 "Helvetica falls to Arial: Wallpaper": aether 245.648 chromium 232.391
+16px #42 "Times New Roman alias: Journal": aether 239.904 chromium 212.734
+16px #43 "No such font: the standard font": aether 235.680 chromium 198.625
+16px #44 "FreeSans: another sans face, kerned AV": aether 294.656 chromium 278.188
+16px #45 "FreeSerif: another serif face, fi fl": aether 239.280 chromium 206.531
+16px #46 "Tight letters: illiterate millimetre": aether 241.216 chromium 219.906
+16px #47 "Wide letters: MMMWWW mwmwmw": aether 273.424 chromium 257.750
+16px #48 "Question? Exclamation! Semicolon; Colon:": aether 313.520 chromium 279.516
+24px #0 "The quick brown fox jumps over the lazy dog": aether 502.320 chromium 474.906
+24px #2 "office affluent baffle flagship efficient": aether 420.672 chromium 385.172
+24px #3 "Pack my box with five dozen liquor jugs!": aether 449.736 chromium 425.531
+24px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 452.736 chromium 440.844
+24px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 552.840 chromium 540.734
+24px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 539.688 chromium 524.234
+24px #7 "Bold Headline Text With Kerning AV Ty": aether 429.696 chromium 440.250
+24px #8 "Italic emphasis in a running sentence": aether 420.216 chromium 394.906
+24px #9 "Bold italic: Waffles & Yogurt": aether 310.368 chromium 320.484
+24px #10 "The quick brown fox jumps over the lazy dog": aether 502.320 chromium 438.562
+24px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 438.048 chromium 412.641
+24px #12 "office affluent baffle flagship efficient": aether 420.672 chromium 366.078
+24px #13 "Sphinx of black quartz, judge my vow.": aether 424.128 chromium 371.719
+24px #14 "Bold Serif Heading: Victory Over Time": aether 422.448 chromium 401.984
+24px #15 "Italic serif: a journey of a thousand miles": aether 456.216 chromium 397.969
+24px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 448.896 chromium 397.344
+24px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 404.472 chromium 604.906
+24px #18 "SELECT * FROM fonts WHERE id = 7;": aether 400.080 chromium 475.281
+24px #32 "Japanese: こんにちは世界": aether 215.112 chromium 288.234
+24px #33 "Chinese: 你好，世界。": aether 197.701 chromium 245.391
+24px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 386.472 chromium 412.672
+24px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 192.936 chromium 203.766
+24px #36 "Bold fallback: 世界 Ж Ω": aether 237.192 chromium 266.297
+24px #37 "Serif generic: Times-like metrics": aether 357.744 chromium 315.281
+24px #38 "Serif italic generic: Quixotic": aether 305.616 chromium 275.250
+24px #40 "Sans generic: Arial-like metrics": aether 343.728 chromium 328.125
+24px #41 "Helvetica falls to Arial: Wallpaper": aether 368.472 chromium 348.594
+24px #42 "Times New Roman alias: Journal": aether 359.856 chromium 319.094
+24px #43 "No such font: the standard font": aether 353.520 chromium 297.938
+24px #44 "FreeSans: another sans face, kerned AV": aether 441.984 chromium 417.266
+24px #45 "FreeSerif: another serif face, fi fl": aether 358.920 chromium 309.797
+24px #46 "Tight letters: illiterate millimetre": aether 361.824 chromium 329.859
+24px #47 "Wide letters: MMMWWW mwmwmw": aether 410.136 chromium 386.625
+24px #48 "Question? Exclamation! Semicolon; Colon:": aether 470.280 chromium 419.266
+48px #0 "The quick brown fox jumps over the lazy dog": aether 1004.640 chromium 949.812
+48px #1 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 876.096 chromium 875.250
+48px #2 "office affluent baffle flagship efficient": aether 841.344 chromium 770.344
+48px #3 "Pack my box with five dozen liquor jugs!": aether 899.472 chromium 851.062
+48px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 905.472 chromium 881.672
+48px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 1105.680 chromium 1081.453
+48px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 1079.376 chromium 1048.453
+48px #7 "Bold Headline Text With Kerning AV Ty": aether 859.392 chromium 880.500
+48px #8 "Italic emphasis in a running sentence": aether 840.432 chromium 789.797
+48px #9 "Bold italic: Waffles & Yogurt": aether 620.736 chromium 640.969
+48px #10 "The quick brown fox jumps over the lazy dog": aether 1004.640 chromium 877.125
+48px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 876.096 chromium 825.281
+48px #12 "office affluent baffle flagship efficient": aether 841.344 chromium 732.141
+48px #13 "Sphinx of black quartz, judge my vow.": aether 848.256 chromium 743.422
+48px #14 "Bold Serif Heading: Victory Over Time": aether 844.896 chromium 803.953
+48px #15 "Italic serif: a journey of a thousand miles": aether 912.432 chromium 795.922
+48px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 897.792 chromium 794.672
+48px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 808.944 chromium 1209.797
+48px #18 "SELECT * FROM fonts WHERE id = 7;": aether 800.160 chromium 950.562
+48px #32 "Japanese: こんにちは世界": aether 430.224 chromium 576.469
+48px #33 "Chinese: 你好，世界。": aether 395.403 chromium 490.781
+48px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 772.944 chromium 825.328
+48px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 385.872 chromium 407.516
+48px #36 "Bold fallback: 世界 Ж Ω": aether 474.384 chromium 532.594
+48px #37 "Serif generic: Times-like metrics": aether 715.488 chromium 630.547
+48px #38 "Serif italic generic: Quixotic": aether 611.232 chromium 550.500
+48px #40 "Sans generic: Arial-like metrics": aether 687.456 chromium 656.234
+48px #41 "Helvetica falls to Arial: Wallpaper": aether 736.944 chromium 697.172
+48px #42 "Times New Roman alias: Journal": aether 719.712 chromium 638.188
+48px #43 "No such font: the standard font": aether 707.040 chromium 595.875
+48px #44 "FreeSans: another sans face, kerned AV": aether 883.968 chromium 834.531
+48px #45 "FreeSerif: another serif face, fi fl": aether 717.840 chromium 619.594
+48px #46 "Tight letters: illiterate millimetre": aether 723.648 chromium 659.719
+48px #47 "Wide letters: MMMWWW mwmwmw": aether 820.272 chromium 773.234
+48px #48 "Question? Exclamation! Semicolon; Colon:": aether 940.560 chromium 838.531
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    text_widths_vs_chromium_frozen
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.34s
+
+error: test failed, to rerun pass `-p aether --test text_oracle`
+     Running tests/wpt_dom.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/6d78c5620f2deb8e/out/wpt_dom-6d78c5620f2deb8e)
+
+running 12 tests
+test wpt_dom_lists ... ok
+test wpt_dom_events ... ok
+test wpt_dom_nodes ... ok
+test wpt_dom_collections ... ok
+test wpt_dom_ranges ... ok
+test wpt_dom_traversal ... ok
+test wpt_eventsource ... ok
+test wpt_html_dom ... ok
+test wpt_html_semantics_forms ... ok
+test wpt_html_webappapis ... ok
+test wpt_websockets ... ok
+test wpt_xhr ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aether
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 4 targets failed:
+    `-p aether --lib`
+    `-p aether --test dom_oracle`
+    `-p aether --test service_worker`
+    `-p aether --test text_oracle`
+rc=101 wall=417s

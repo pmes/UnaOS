@@ -327,10 +327,12 @@ fn run(suite_name: &str, args: &[String]) -> ExitCode {
                 "PLAYWRIGHT_BROWSERS_PATH",
                 std::env::var("PLAYWRIGHT_BROWSERS_PATH").unwrap_or("/opt/pw-browsers".into()),
             )
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            eprintln!("eyes: chromium oracle reported failures (above)");
+            .status();
+        match ok {
+            Ok(s) if s.success() => {}
+            Ok(_) => eprintln!("eyes: chromium oracle reported failures (above)"),
+            // No `node` on PATH printed nothing "above": say so, and that every chromium case is unscored.
+            Err(e) => eprintln!("eyes: chromium oracle could not start `node`: {e} (no reference frames this run)"),
         }
     }
 

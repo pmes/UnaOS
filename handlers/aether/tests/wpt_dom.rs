@@ -89,7 +89,15 @@ fn target_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
 }
 
+/// One locate per process: every `#[test]` runs on its own thread, and on a fresh target dir twelve threads
+/// raced the sparse clone into the same `target/wpt` — the losers saw a half-made checkout and returned None,
+/// so eleven of twelve directories printed "skipped (no checkout, offline)" and PASSED with nothing run.
 fn locate() -> Option<PathBuf> {
+    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(locate_once).clone()
+}
+
+fn locate_once() -> Option<PathBuf> {
     if std::env::var("AETHER_WPT_OFFLINE").is_ok() {
         return None;
     }

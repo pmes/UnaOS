@@ -1,0 +1,560 @@
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `tls_core` (lib) generated 1 warning
+warning: field `is_arrow` is never read
+  --> unaos/libs/web/js_core/src/parser/mod.rs:65:9
+   |
+50 | pub(crate) struct Ctx {
+   |                   --- field in this struct
+...
+65 |     pub is_arrow: bool,
+   |         ^^^^^^^^
+   |
+   = note: `Ctx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Params` is never constructed
+  --> unaos/libs/web/js_core/src/parser/mod.rs:86:5
+   |
+77 | pub(crate) enum ScopeKind {
+   |                 --------- variant in this enum
+...
+86 |     Params,
+   |     ^^^^^^
+   |
+   = note: `ScopeKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `ui` is never read
+   --> unaos/libs/web/js_core/src/regexp/parser.rs:215:5
+    |
+202 | struct P<'a> {
+    |        - field in this struct
+...
+215 |     ui: bool,
+    |     ^^
+
+warning: field `is_switch` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:44:48
+   |
+44 |     Target { labels: Vec<Atom>, is_loop: bool, is_switch: bool, breaks: Vec<usize>, continues: Vec<usize>, scope: u32, labelled_only...
+   |     ------ field in this variant               ^^^^^^^^^
+
+warning: field `kind` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:65:9
+   |
+55 | pub(crate) struct FnState {
+   |                   ------- field in this struct
+...
+65 |     pub kind: FnKind,
+   |         ^^^^
+
+warning: enum `Flow` is never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:13:6
+   |
+13 | enum Flow {
+   |      ^^^^
+
+warning: methods `fr` and `frm` are never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:29:8
+   |
+19 | impl Vm {
+   | ------- methods in this implementation
+...
+29 |     fn fr(&self) -> &Frame {
+   |        ^^
+...
+33 |     fn frm(&mut self) -> &mut Frame {
+   |        ^^^
+
+warning: `js_core` (lib) generated 7 warnings
+warning: unreachable pattern
+    --> unaos/libs/web/layout_core/src/css.rs:1408:9
+     |
+1359 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1408 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `layout_core` (lib) generated 1 warning
+warning: field `timer_count` is never read
+   --> handlers/aether/src/js/mod.rs:258:9
+    |
+189 | pub(crate) struct PageState {
+    |                   --------- field in this struct
+...
+258 |     pub timer_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aether` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running unittests src/lib.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/c59cfdc969d88636/out/aether-c59cfdc969d88636)
+
+running 3 tests
+test engine_tests::tests::test_noscript_iframe_hidden ... FAILED
+test engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with ... FAILED
+test engine_tests::tests::click_submits_and_toggles_checkables ... FAILED
+
+failures:
+
+---- engine_tests::tests::test_noscript_iframe_hidden stdout ----
+
+thread 'engine_tests::tests::test_noscript_iframe_hidden' (243636) panicked at handlers/aether/src/engine_tests.rs:1328:17:
+iframe content must produce no box
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with stdout ----
+
+thread 'engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with' (243634) panicked at handlers/aether/src/engine_tests.rs:2463:9:
+bold run measured with the bold face (194 vs 194)
+
+---- engine_tests::tests::click_submits_and_toggles_checkables stdout ----
+
+thread 'engine_tests::tests::click_submits_and_toggles_checkables' (243635) panicked at handlers/aether/src/engine_tests.rs:3361:9:
+a label click toggles its control
+
+
+failures:
+    engine_tests::tests::aethersee_text_is_measured_with_the_face_it_is_painted_with
+    engine_tests::tests::click_submits_and_toggles_checkables
+    engine_tests::tests::test_noscript_iframe_hidden
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 198 filtered out; finished in 0.85s
+
+error: test failed, to rerun pass `-p aether --lib`
+lib rc=101
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `tls_core` (lib) generated 1 warning
+warning: field `is_arrow` is never read
+  --> unaos/libs/web/js_core/src/parser/mod.rs:65:9
+   |
+50 | pub(crate) struct Ctx {
+   |                   --- field in this struct
+...
+65 |     pub is_arrow: bool,
+   |         ^^^^^^^^
+   |
+   = note: `Ctx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Params` is never constructed
+  --> unaos/libs/web/js_core/src/parser/mod.rs:86:5
+   |
+77 | pub(crate) enum ScopeKind {
+   |                 --------- variant in this enum
+...
+86 |     Params,
+   |     ^^^^^^
+   |
+   = note: `ScopeKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `ui` is never read
+   --> unaos/libs/web/js_core/src/regexp/parser.rs:215:5
+    |
+202 | struct P<'a> {
+    |        - field in this struct
+...
+215 |     ui: bool,
+    |     ^^
+
+warning: field `is_switch` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:44:48
+   |
+44 |     Target { labels: Vec<Atom>, is_loop: bool, is_switch: bool, breaks: Vec<usize>, continues: Vec<usize>, scope: u32, labelled_only...
+   |     ------ field in this variant               ^^^^^^^^^
+
+warning: field `kind` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:65:9
+   |
+55 | pub(crate) struct FnState {
+   |                   ------- field in this struct
+...
+65 |     pub kind: FnKind,
+   |         ^^^^
+
+warning: enum `Flow` is never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:13:6
+   |
+13 | enum Flow {
+   |      ^^^^
+
+warning: methods `fr` and `frm` are never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:29:8
+   |
+19 | impl Vm {
+   | ------- methods in this implementation
+...
+29 |     fn fr(&self) -> &Frame {
+   |        ^^
+...
+33 |     fn frm(&mut self) -> &mut Frame {
+   |        ^^^
+
+warning: `js_core` (lib) generated 7 warnings
+warning: unreachable pattern
+    --> unaos/libs/web/layout_core/src/css.rs:1408:9
+     |
+1359 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1408 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `layout_core` (lib) generated 1 warning
+warning: field `timer_count` is never read
+   --> handlers/aether/src/js/mod.rs:258:9
+    |
+189 | pub(crate) struct PageState {
+    |                   --------- field in this struct
+...
+258 |     pub timer_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aether` (lib) generated 1 warning
+warning: use of deprecated method `aether::AetherEngine::load_url`: use aether::net::fetch_document and engine.load_html instead to prevent borrow panics
+  --> handlers/aether/src/main.rs:73:48
+   |
+73 |                         if let Err(e) = engine.load_url(&url).await {
+   |                                                ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+   Compiling aether v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/handlers/aether)
+warning: `aether` (bin "aether") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.83s
+     Running tests/service_worker.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/3f0456f26585449d/out/service_worker-3f0456f26585449d)
+
+running 10 tests
+test post_message_between_a_page_and_its_worker ... ok
+test the_worker_reads_and_writes_the_cache_api ... FAILED
+test offline_the_worker_answers_from_its_cache ... FAILED
+test clients_claim_takes_an_open_page ... ok
+test a_controlled_documents_subresources_go_to_its_worker ... ok
+test policy_refuses_opaque_answers_to_navigations_and_cors_requests ... ok
+test navigation_is_answered_by_respond_with ... ok
+test navigation_without_respond_with_falls_through_to_the_network ... ok
+test the_update_check_on_navigation_byte_compares_the_script ... ok
+test install_waiting_active_and_skip_waiting ... ok
+
+failures:
+
+---- the_worker_reads_and_writes_the_cache_api stdout ----
+[aether-sw] error: Uncaught     at <anonymous>
+    at fire
+    at <anonymous>
+
+thread 'the_worker_reads_and_writes_the_cache_api' (244307) panicked at handlers/aether/tests/service_worker.rs:422:5:
+assertion `left == right` failed: addAll fetched the asset once
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- offline_the_worker_answers_from_its_cache stdout ----
+[aether-sw] error: Uncaught     at <anonymous>
+    at fire
+    at <anonymous>
+[aether-sw] error: respondWith: caches is not defined
+
+thread 'offline_the_worker_answers_from_its_cache' (244297) panicked at handlers/aether/tests/service_worker.rs:480:61:
+the cached offline page: "Service worker network error: The service worker answered 'http://127.0.0.1:41643/app/live' with a network error."
+
+
+failures:
+    offline_the_worker_answers_from_its_cache
+    the_worker_reads_and_writes_the_cache_api
+
+test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.66s
+
+error: test failed, to rerun pass `-p aether --test service_worker`
+sw rc=101
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `tls_core` (lib) generated 1 warning
+warning: field `is_arrow` is never read
+  --> unaos/libs/web/js_core/src/parser/mod.rs:65:9
+   |
+50 | pub(crate) struct Ctx {
+   |                   --- field in this struct
+...
+65 |     pub is_arrow: bool,
+   |         ^^^^^^^^
+   |
+   = note: `Ctx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Params` is never constructed
+  --> unaos/libs/web/js_core/src/parser/mod.rs:86:5
+   |
+77 | pub(crate) enum ScopeKind {
+   |                 --------- variant in this enum
+...
+86 |     Params,
+   |     ^^^^^^
+   |
+   = note: `ScopeKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `ui` is never read
+   --> unaos/libs/web/js_core/src/regexp/parser.rs:215:5
+    |
+202 | struct P<'a> {
+    |        - field in this struct
+...
+215 |     ui: bool,
+    |     ^^
+
+warning: field `is_switch` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:44:48
+   |
+44 |     Target { labels: Vec<Atom>, is_loop: bool, is_switch: bool, breaks: Vec<usize>, continues: Vec<usize>, scope: u32, labelled_only...
+   |     ------ field in this variant               ^^^^^^^^^
+
+warning: field `kind` is never read
+  --> unaos/libs/web/js_core/src/compiler/mod.rs:65:9
+   |
+55 | pub(crate) struct FnState {
+   |                   ------- field in this struct
+...
+65 |     pub kind: FnKind,
+   |         ^^^^
+
+warning: enum `Flow` is never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:13:6
+   |
+13 | enum Flow {
+   |      ^^^^
+
+warning: methods `fr` and `frm` are never used
+  --> unaos/libs/web/js_core/src/vm/interp.rs:29:8
+   |
+19 | impl Vm {
+   | ------- methods in this implementation
+...
+29 |     fn fr(&self) -> &Frame {
+   |        ^^
+...
+33 |     fn frm(&mut self) -> &mut Frame {
+   |        ^^^
+
+warning: `js_core` (lib) generated 7 warnings
+warning: unreachable pattern
+    --> unaos/libs/web/layout_core/src/css.rs:1408:9
+     |
+1359 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1408 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `layout_core` (lib) generated 1 warning
+warning: field `timer_count` is never read
+   --> handlers/aether/src/js/mod.rs:258:9
+    |
+189 | pub(crate) struct PageState {
+    |                   --------- field in this struct
+...
+258 |     pub timer_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aether` (lib) generated 1 warning
+warning: use of deprecated method `aether::AetherEngine::load_url`: use aether::net::fetch_document and engine.load_html instead to prevent borrow panics
+  --> handlers/aether/src/main.rs:73:48
+   |
+73 |                         if let Err(e) = engine.load_url(&url).await {
+   |                                                ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+   Compiling aether v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-hw-pi4/.claude/worktrees/agent-a73e1222aac645efa/handlers/aether)
+warning: `aether` (bin "aether") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.48s
+     Running tests/text_oracle.rs (/home/pmes/unaos-bench/scratch/rmbp-0915/local1/suites/target/debug/build/aether/970f7d0ea7726069/out/text_oracle-970f7d0ea7726069)
+
+running 2 tests
+test text_rasters_and_widths_vs_chromium_live ... ok
+test text_widths_vs_chromium_frozen ... FAILED
+
+failures:
+
+---- text_widths_vs_chromium_frozen stdout ----
+text oracle widths: 63/200 within 0.5 px, worst 400.8528 px
+
+thread 'text_widths_vs_chromium_frozen' (245387) panicked at handlers/aether/tests/text_oracle.rs:179:5:
+widths off by more than 0.5 px:
+12px #0 "The quick brown fox jumps over the lazy dog": aether 251.160 chromium 237.453
+12px #2 "office affluent baffle flagship efficient": aether 210.336 chromium 192.594
+12px #3 "Pack my box with five dozen liquor jugs!": aether 224.868 chromium 212.766
+12px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 226.368 chromium 220.422
+12px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 276.420 chromium 270.375
+12px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 269.844 chromium 262.125
+12px #7 "Bold Headline Text With Kerning AV Ty": aether 214.848 chromium 220.125
+12px #8 "Italic emphasis in a running sentence": aether 210.108 chromium 197.453
+12px #9 "Bold italic: Waffles & Yogurt": aether 155.184 chromium 160.250
+12px #10 "The quick brown fox jumps over the lazy dog": aether 251.160 chromium 219.281
+12px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 219.024 chromium 206.328
+12px #12 "office affluent baffle flagship efficient": aether 210.336 chromium 183.047
+12px #13 "Sphinx of black quartz, judge my vow.": aether 212.064 chromium 185.859
+12px #14 "Bold Serif Heading: Victory Over Time": aether 211.224 chromium 201.000
+12px #15 "Italic serif: a journey of a thousand miles": aether 228.108 chromium 198.984
+12px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 224.448 chromium 198.672
+12px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 202.236 chromium 302.453
+12px #18 "SELECT * FROM fonts WHERE id = 7;": aether 200.040 chromium 237.641
+12px #32 "Japanese: こんにちは世界": aether 107.556 chromium 144.125
+12px #33 "Chinese: 你好，世界。": aether 98.851 chromium 122.703
+12px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 193.236 chromium 206.344
+12px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 96.468 chromium 101.891
+12px #36 "Bold fallback: 世界 Ж Ω": aether 118.596 chromium 133.156
+12px #37 "Serif generic: Times-like metrics": aether 178.872 chromium 157.641
+12px #38 "Serif italic generic: Quixotic": aether 152.808 chromium 137.625
+12px #40 "Sans generic: Arial-like metrics": aether 171.864 chromium 164.062
+12px #41 "Helvetica falls to Arial: Wallpaper": aether 184.236 chromium 174.297
+12px #42 "Times New Roman alias: Journal": aether 179.928 chromium 159.547
+12px #43 "No such font: the standard font": aether 176.760 chromium 148.969
+12px #44 "FreeSans: another sans face, kerned AV": aether 220.992 chromium 208.641
+12px #45 "FreeSerif: another serif face, fi fl": aether 179.460 chromium 154.906
+12px #46 "Tight letters: illiterate millimetre": aether 180.912 chromium 164.938
+12px #47 "Wide letters: MMMWWW mwmwmw": aether 205.068 chromium 193.312
+12px #48 "Question? Exclamation! Semicolon; Colon:": aether 235.140 chromium 209.641
+16px #0 "The quick brown fox jumps over the lazy dog": aether 334.880 chromium 316.609
+16px #2 "office affluent baffle flagship efficient": aether 280.448 chromium 256.781
+16px #3 "Pack my box with five dozen liquor jugs!": aether 299.824 chromium 283.688
+16px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 301.824 chromium 293.891
+16px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 368.560 chromium 360.484
+16px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 359.792 chromium 349.484
+16px #7 "Bold Headline Text With Kerning AV Ty": aether 286.464 chromium 293.500
+16px #8 "Italic emphasis in a running sentence": aether 280.144 chromium 263.266
+16px #9 "Bold italic: Waffles & Yogurt": aether 206.912 chromium 213.656
+16px #10 "The quick brown fox jumps over the lazy dog": aether 334.880 chromium 292.375
+16px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 292.032 chromium 275.094
+16px #12 "office affluent baffle flagship efficient": aether 280.448 chromium 244.047
+16px #13 "Sphinx of black quartz, judge my vow.": aether 282.752 chromium 247.812
+16px #14 "Bold Serif Heading: Victory Over Time": aether 281.632 chromium 267.984
+16px #15 "Italic serif: a journey of a thousand miles": aether 304.144 chromium 265.312
+16px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 299.264 chromium 264.891
+16px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 269.648 chromium 403.266
+16px #18 "SELECT * FROM fonts WHERE id = 7;": aether 266.720 chromium 316.859
+16px #32 "Japanese: こんにちは世界": aether 143.408 chromium 192.156
+16px #33 "Chinese: 你好，世界。": aether 131.801 chromium 163.594
+16px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 257.648 chromium 275.109
+16px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 128.624 chromium 135.844
+16px #36 "Bold fallback: 世界 Ж Ω": aether 158.128 chromium 177.531
+16px #37 "Serif generic: Times-like metrics": aether 238.496 chromium 210.188
+16px #38 "Serif italic generic: Quixotic": aether 203.744 chromium 183.500
+16px #40 "Sans generic: Arial-like metrics": aether 229.152 chromium 218.750
+16px #41 "Helvetica falls to Arial: Wallpaper": aether 245.648 chromium 232.391
+16px #42 "Times New Roman alias: Journal": aether 239.904 chromium 212.734
+16px #43 "No such font: the standard font": aether 235.680 chromium 198.625
+16px #44 "FreeSans: another sans face, kerned AV": aether 294.656 chromium 278.188
+16px #45 "FreeSerif: another serif face, fi fl": aether 239.280 chromium 206.531
+16px #46 "Tight letters: illiterate millimetre": aether 241.216 chromium 219.906
+16px #47 "Wide letters: MMMWWW mwmwmw": aether 273.424 chromium 257.750
+16px #48 "Question? Exclamation! Semicolon; Colon:": aether 313.520 chromium 279.516
+24px #0 "The quick brown fox jumps over the lazy dog": aether 502.320 chromium 474.906
+24px #2 "office affluent baffle flagship efficient": aether 420.672 chromium 385.172
+24px #3 "Pack my box with five dozen liquor jugs!": aether 449.736 chromium 425.531
+24px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 452.736 chromium 440.844
+24px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 552.840 chromium 540.734
+24px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 539.688 chromium 524.234
+24px #7 "Bold Headline Text With Kerning AV Ty": aether 429.696 chromium 440.250
+24px #8 "Italic emphasis in a running sentence": aether 420.216 chromium 394.906
+24px #9 "Bold italic: Waffles & Yogurt": aether 310.368 chromium 320.484
+24px #10 "The quick brown fox jumps over the lazy dog": aether 502.320 chromium 438.562
+24px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 438.048 chromium 412.641
+24px #12 "office affluent baffle flagship efficient": aether 420.672 chromium 366.078
+24px #13 "Sphinx of black quartz, judge my vow.": aether 424.128 chromium 371.719
+24px #14 "Bold Serif Heading: Victory Over Time": aether 422.448 chromium 401.984
+24px #15 "Italic serif: a journey of a thousand miles": aether 456.216 chromium 397.969
+24px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 448.896 chromium 397.344
+24px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 404.472 chromium 604.906
+24px #18 "SELECT * FROM fonts WHERE id = 7;": aether 400.080 chromium 475.281
+24px #32 "Japanese: こんにちは世界": aether 215.112 chromium 288.234
+24px #33 "Chinese: 你好，世界。": aether 197.701 chromium 245.391
+24px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 386.472 chromium 412.672
+24px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 192.936 chromium 203.766
+24px #36 "Bold fallback: 世界 Ж Ω": aether 237.192 chromium 266.297
+24px #37 "Serif generic: Times-like metrics": aether 357.744 chromium 315.281
+24px #38 "Serif italic generic: Quixotic": aether 305.616 chromium 275.250
+24px #40 "Sans generic: Arial-like metrics": aether 343.728 chromium 328.125
+24px #41 "Helvetica falls to Arial: Wallpaper": aether 368.472 chromium 348.594
+24px #42 "Times New Roman alias: Journal": aether 359.856 chromium 319.094
+24px #43 "No such font: the standard font": aether 353.520 chromium 297.938
+24px #44 "FreeSans: another sans face, kerned AV": aether 441.984 chromium 417.266
+24px #45 "FreeSerif: another serif face, fi fl": aether 358.920 chromium 309.797
+24px #46 "Tight letters: illiterate millimetre": aether 361.824 chromium 329.859
+24px #47 "Wide letters: MMMWWW mwmwmw": aether 410.136 chromium 386.625
+24px #48 "Question? Exclamation! Semicolon; Colon:": aether 470.280 chromium 419.266
+48px #0 "The quick brown fox jumps over the lazy dog": aether 1004.640 chromium 949.812
+48px #1 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 876.096 chromium 875.250
+48px #2 "office affluent baffle flagship efficient": aether 841.344 chromium 770.344
+48px #3 "Pack my box with five dozen liquor jugs!": aether 899.472 chromium 851.062
+48px #4 "0123456789 +-×÷= $€£¥ %‰ (1/2) [3] {4}": aether 905.472 chromium 881.672
+48px #5 "“Quotes”, ‘apostrophes’ — dashes – and… ellipses": aether 1105.680 chromium 1081.453
+48px #6 "Accents: façade, naïve, Øresund, Ångström, Ærø": aether 1079.376 chromium 1048.453
+48px #7 "Bold Headline Text With Kerning AV Ty": aether 859.392 chromium 880.500
+48px #8 "Italic emphasis in a running sentence": aether 840.432 chromium 789.797
+48px #9 "Bold italic: Waffles & Yogurt": aether 620.736 chromium 640.969
+48px #10 "The quick brown fox jumps over the lazy dog": aether 1004.640 chromium 877.125
+48px #11 "AVA Tobacco WAVY Type Yoga LT Wo Te": aether 876.096 chromium 825.281
+48px #12 "office affluent baffle flagship efficient": aether 841.344 chromium 732.141
+48px #13 "Sphinx of black quartz, judge my vow.": aether 848.256 chromium 743.422
+48px #14 "Bold Serif Heading: Victory Over Time": aether 844.896 chromium 803.953
+48px #15 "Italic serif: a journey of a thousand miles": aether 912.432 chromium 795.922
+48px #16 "1st 2nd 3rd 4th — 1984, 2026 & 3.14159": aether 897.792 chromium 794.672
+48px #17 "fn main() { let x = 42; println!(\"{x}\"); }": aether 808.944 chromium 1209.797
+48px #18 "SELECT * FROM fonts WHERE id = 7;": aether 800.160 chromium 950.562
+48px #32 "Japanese: こんにちは世界": aether 430.224 chromium 576.469
+48px #33 "Chinese: 你好，世界。": aether 395.403 chromium 490.781
+48px #34 "Mixed: Aether エーテル Эфир Αιθέρας": aether 772.944 chromium 825.328
+48px #35 "Thai: สว\u{e31}สด\u{e35}ชาวโลก": aether 385.872 chromium 407.516
+48px #36 "Bold fallback: 世界 Ж Ω": aether 474.384 chromium 532.594
+48px #37 "Serif generic: Times-like metrics": aether 715.488 chromium 630.547
+48px #38 "Serif italic generic: Quixotic": aether 611.232 chromium 550.500
+48px #40 "Sans generic: Arial-like metrics": aether 687.456 chromium 656.234
+48px #41 "Helvetica falls to Arial: Wallpaper": aether 736.944 chromium 697.172
+48px #42 "Times New Roman alias: Journal": aether 719.712 chromium 638.188
+48px #43 "No such font: the standard font": aether 707.040 chromium 595.875
+48px #44 "FreeSans: another sans face, kerned AV": aether 883.968 chromium 834.531
+48px #45 "FreeSerif: another serif face, fi fl": aether 717.840 chromium 619.594
+48px #46 "Tight letters: illiterate millimetre": aether 723.648 chromium 659.719
+48px #47 "Wide letters: MMMWWW mwmwmw": aether 820.272 chromium 773.234
+48px #48 "Question? Exclamation! Semicolon; Colon:": aether 940.560 chromium 838.531
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    text_widths_vs_chromium_frozen
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.76s
+
+error: test failed, to rerun pass `-p aether --test text_oracle`
+text_oracle rc=101
