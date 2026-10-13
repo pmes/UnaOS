@@ -70,6 +70,8 @@ pub mod mutation;
 pub mod navigation;
 /// AETHERWPT3 (SR138): pointer capture (Pointer Events §10).
 pub mod pointer;
+/// AETHERWPT5 (SR144): the WebDriver automation queue behind WPT's testdriver.js.
+pub mod testdriver;
 /// AETHERMEDIA2 (SR134): Media Source Extensions.
 pub mod mse;
 pub mod ports;
@@ -796,6 +798,7 @@ impl Engine {
         crate::dom::custom::reset(document.arena());
         internals::reset();
         pointer::reset();
+        testdriver::reset();
         page(|p| p.time_origin = crate::event_loop::now_ms());
         let mut vm = Vm::new(Box::new(host::AetherHost::default()));
         vm.track_rejections = true;
@@ -823,6 +826,7 @@ impl Engine {
         custom::install(&mut vm);
         internals::install(&mut vm);
         pointer::install(&mut vm);
+        testdriver::install(&mut vm); // AETHERWPT5 (SR144): `__td_queue` / `__td_node` for testdriver-vendor.js
         canvas::install(&mut vm);
         // WEBGL1 (SR136): WebGLRenderingContext over gl_core (after canvas: the same surface store).
         webgl::install(&mut vm);

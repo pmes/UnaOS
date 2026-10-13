@@ -2296,3 +2296,287 @@ fn hit_context(cx: &HitCtx, node: taffy::prelude::NodeId, parent: (f32, f32), cl
     }
     entries.first().and_then(hit_entry)
 }
+
+// =================================================================================================
+// AETHERWPT5 (SR144): WebDriver automation for WPT's testdriver.js, through the shell's input path
+// =================================================================================================
+
+/// The modifiers a WebDriver key sequence holds (Element Send Keys toggles them for the rest of the sequence;
+/// a Perform Actions key source holds one from its `keyDown` to its `keyUp`).
+#[derive(Default, Clone, Copy)]
+struct HeldMods {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    meta: bool,
+}
+
+impl HeldMods {
+    /// The shell's key string for `key` under these modifiers (`Ctrl+Shift+a`; a shifted letter is its
+    /// uppercase, WebDriver §17.2's shifted key value), and the text a printable key inserts (none when Ctrl,
+    /// Alt or Meta is held — the shell sends `Text` only for an unmodified printable key).
+    fn shell_key(&self, key: &str) -> (String, Option<String>) {
+        let mut k = key.to_string();
+        let mut it = key.chars();
+        let single = match (it.next(), it.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        };
+        if let Some(c) = single {
+            if self.shift && c.is_ascii_lowercase() {
+                k = c.to_ascii_uppercase().to_string();
+            }
+        }
+        let mut out = String::new();
+        if self.ctrl {
+            out.push_str("Ctrl+");
+        }
+        if self.alt {
+            out.push_str("Alt+");
+        }
+        if self.shift && single.map_or(true, |c| !c.is_ascii_alphabetic()) {
+            out.push_str("Shift+");
+        }
+        if self.meta {
+            out.push_str("Meta+");
+        }
+        let text = single.filter(|c| !c.is_control() && !self.ctrl && !self.alt && !self.meta).map(|_| k.clone());
+        out.push_str(&k);
+        (out, text)
+    }
+
+    /// Toggles the modifier a named key stands for; true when `key` is one.
+    fn toggle(&mut self, key: &str, down: bool) -> bool {
+        match key {
+            "Shift" => self.shift = down,
+            "Control" => self.ctrl = down,
+            "Alt" => self.alt = down,
+            "Meta" => self.meta = down,
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl AetherEngine {
+    /// Runs every WebDriver command `testdriver-vendor.js` queued (`js::testdriver`) and settles its promise.
+    /// Called by a host between event-loop slices (the WPT runner); the shell never queues one. Returns how
+    /// many ran. Each command goes through the input path the shell drives:
+    ///
+    /// - Element Click (WebDriver §12.4.1): the pointer moves to the in-view centre the vendor computed, then
+    ///   the primary button goes down and up there — `pointerdown` / `mousedown`, `pointerup` / `mouseup`, the
+    ///   `click` with its activation behaviour, exactly `MouseDown` + `MouseUp` from the shell;
+    /// - Element Send Keys (§12.5.1): the element takes focus (the vendor ran its focusing steps; the engine's
+    ///   caret goes to the end of a text control's value), then per code point `keydown`, the default action
+    ///   (editing, activation), the `Text` insertion of an unmodified printable key, and `keyup`; a modifier
+    ///   code point (`\u{E008}` Shift, …) is held for the rest of the sequence and released at its end;
+    /// - Perform Actions (§15.5): the sources' actions tick by tick — pointer `pointerMove` (viewport, pointer
+    ///   or element origin: the element's centre from its layout box) / `pointerDown` / `pointerUp`, key
+    ///   `keyDown` / `keyUp`, wheel `scroll` (the pointer moves to the origin point, a `wheel` fires there, the
+    ///   viewport or the scroll container under it scrolls unless canceled), `pause` (the ticks are virtual);
+    /// - Set Permission (Permissions §3.2): the state recorded for the Permissions API;
+    /// - Get All Cookies / Get Named Cookie / Delete All Cookies (§16): the engine's jar.
+    pub fn pump_automation(&mut self) -> usize {
+        let cmds = js::testdriver::take();
+        let n = cmds.len();
+        for cmd in cmds {
+            let result = self.run_automation(&cmd.kind, &cmd.json);
+            let (err, res) = match result {
+                Ok(v) => ("null".to_string(), v.unwrap_or_else(|| "null".into())),
+                Err(e) => (serde_json::to_string(&e).unwrap_or_else(|_| "\"error\"".into()), "null".to_string()),
+            };
+            if let Some(js_engine) = &mut self.js_engine {
+                let _ = js_engine.eval_string(&format!("typeof __td_settle === 'function' && __td_settle({}, {err}, {res})", cmd.ticket));
+                if js::take_mutated() {
+                    self.relayout();
+                }
+            }
+        }
+        n
+    }
+
+    fn run_automation(&mut self, kind: &str, json: &serde_json::Value) -> Result<Option<String>, String> {
+        let f = |k: &str| json.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        match kind {
+            "click" => {
+                let (x, y) = (f("x"), f("y"));
+                self.handle_event(api::events::Event::MouseMove(x, y));
+                self.handle_event(api::events::Event::MouseDown(x, y));
+                self.handle_event(api::events::Event::MouseUp(x, y));
+                Ok(None)
+            }
+            "keys" => {
+                let keys = json.get("keys").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if let Some(id) = json.get("target").and_then(|v| v.as_u64()) {
+                    let node = js::dom::node_ref(id as usize);
+                    self.set_focus(Some(node.clone()));
+                    if forms::is_text_editable(&node) {
+                        self.edit = forms::edit::EditState::at(forms::control_value(&node).len());
+                    }
+                }
+                let mut mods = HeldMods::default();
+                for ch in keys.chars() {
+                    let name = js::testdriver::key_name(ch).map(str::to_string).unwrap_or_else(|| ch.to_string());
+                    if mods.toggle(&name, true) {
+                        self.automation_key(true, &name, &mods);
+                        continue;
+                    }
+                    self.automation_key(true, &name, &mods);
+                    self.automation_key(false, &name, &mods);
+                }
+                for m in ["Shift", "Control", "Alt", "Meta"] {
+                    let held = matches!((m, mods), ("Shift", HeldMods { shift: true, .. }) | ("Control", HeldMods { ctrl: true, .. }) | ("Alt", HeldMods { alt: true, .. }) | ("Meta", HeldMods { meta: true, .. }));
+                    if held {
+                        mods.toggle(m, false);
+                        self.automation_key(false, m, &mods);
+                    }
+                }
+                Ok(None)
+            }
+            "actions" => {
+                let sources = json.get("sources").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let ticks = sources.iter().map(|s| s.get("actions").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0)).max().unwrap_or(0);
+                let mut mods = HeldMods::default();
+                for t in 0..ticks {
+                    for src in &sources {
+                        let Some(a) = src.get("actions").and_then(|a| a.as_array()).and_then(|a| a.get(t)) else { continue };
+                        let ty = a.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let g = |k: &str| a.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        match ty {
+                            "pause" => {}
+                            "keyDown" | "keyUp" => {
+                                let value = a.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                                let Some(ch) = value.chars().next() else { continue };
+                                let name = js::testdriver::key_name(ch).map(str::to_string).unwrap_or_else(|| ch.to_string());
+                                let down = ty == "keyDown";
+                                mods.toggle(&name, down);
+                                self.automation_key(down, &name, &mods);
+                            }
+                            "pointerMove" | "scroll" => {
+                                let (ox, oy) = self.automation_origin(a.get("origin"))?;
+                                let (x, y) = (ox + g("x"), oy + g("y"));
+                                self.pointer_moved(x, y);
+                                if ty == "scroll" {
+                                    let (dx, dy) = (g("deltaX"), g("deltaY"));
+                                    let ok = match (self.hit_test(x, y), &mut self.js_engine) {
+                                        (Some(node), Some(js_engine)) => {
+                                            js_engine.set_viewport(self.width as f32, self.height as f32, (self.scroll_x, self.scroll_y));
+                                            let ok = js::events::user_wheel(&mut js_engine.vm, node.id().0, (x, y), (dx, dy));
+                                            if js::take_mutated() {
+                                                self.relayout();
+                                            }
+                                            ok
+                                        }
+                                        _ => true,
+                                    };
+                                    if ok {
+                                        self.handle_event(api::events::Event::Scroll(dx, dy));
+                                    }
+                                }
+                            }
+                            "pointerDown" | "pointerUp" => {
+                                let (x, y) = self.pointer.unwrap_or((0.0, 0.0));
+                                if ty == "pointerDown" {
+                                    self.handle_event(api::events::Event::MouseDown(x, y));
+                                } else {
+                                    self.handle_event(api::events::Event::MouseUp(x, y));
+                                }
+                            }
+                            _ => return Err(format!("unknown action type {ty}")),
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            "permission" => {
+                let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let state = json.get("state").and_then(|v| v.as_str()).unwrap_or("prompt");
+                if !matches!(state, "granted" | "denied" | "prompt") {
+                    return Err(format!("invalid permission state {state}"));
+                }
+                js::testdriver::set_permission(name, state);
+                Ok(None)
+            }
+            "cookies_get" | "cookie_named" => {
+                let url = js::page_url();
+                let host = html_core::url::Url::parse(&url).map(|u| u.hostname().to_ascii_lowercase()).unwrap_or_default();
+                let want = json.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                let jar = net::cookie_jar();
+                let jar = jar.lock().map_err(|_| "cookie jar".to_string())?;
+                let mut out = Vec::new();
+                for c in jar.cookies() {
+                    let d = c.domain.to_ascii_lowercase();
+                    if !(d == host || host.ends_with(&format!(".{d}"))) {
+                        continue;
+                    }
+                    if want.as_deref().is_some_and(|w| w != c.name) {
+                        continue;
+                    }
+                    let mut o = serde_json::Map::new();
+                    o.insert("name".into(), c.name.clone().into());
+                    o.insert("value".into(), c.value.clone().into());
+                    o.insert("path".into(), c.path.clone().into());
+                    o.insert("domain".into(), c.domain.clone().into());
+                    o.insert("secure".into(), c.secure_only.into());
+                    o.insert("httpOnly".into(), c.http_only.into());
+                    if c.persistent {
+                        o.insert("expiry".into(), c.expiry.into());
+                    }
+                    out.push(serde_json::Value::Object(o));
+                }
+                if kind == "cookie_named" {
+                    return match out.into_iter().next() {
+                        Some(c) => Ok(Some(c.to_string())),
+                        None => Err("no such cookie".into()),
+                    };
+                }
+                Ok(Some(serde_json::Value::Array(out).to_string()))
+            }
+            "cookies_clear" => {
+                if let Ok(mut jar) = net::cookie_jar().lock() {
+                    jar.clear();
+                }
+                Ok(None)
+            }
+            other => Err(format!("{other}() is not implemented by Aether's testdriver-vendor.js")),
+        }
+    }
+
+    /// WebDriver §15.4.3 "get coordinates relative to an origin": the viewport (0, 0), the pointer's current
+    /// position, or an element's in-view centre (its layout box, document coordinates less the scroll).
+    fn automation_origin(&self, origin: Option<&serde_json::Value>) -> Result<(f64, f64), String> {
+        match origin {
+            None => Ok((0.0, 0.0)),
+            Some(serde_json::Value::String(s)) if s == "viewport" => Ok((0.0, 0.0)),
+            Some(serde_json::Value::String(s)) if s == "pointer" => Ok(self.pointer.unwrap_or((0.0, 0.0))),
+            Some(v) => {
+                let Some(id) = v.get("node").and_then(|n| n.as_u64()) else { return Err("invalid argument: origin".into()) };
+                let node = js::dom::node_ref(id as usize);
+                let Some((bx, by, w, h)) = self.box_of(&node) else { return Err("move target out of bounds".into()) };
+                let x = (bx + w / 2.0) as f64 - self.scroll_x;
+                let y = (by + h / 2.0) as f64 - self.scroll_y;
+                if x < 0.0 || y < 0.0 || x > self.width as f64 || y > self.height as f64 {
+                    return Err("move target out of bounds".into());
+                }
+                Ok((x, y))
+            }
+        }
+    }
+
+    /// One key transition of a WebDriver command: `keydown` then the default action and the text an
+    /// unmodified printable key inserts (the shell's `KeyDown` + `Text`), or `keyup`.
+    fn automation_key(&mut self, down: bool, key: &str, mods: &HeldMods) {
+        let (shell, text) = mods.shell_key(key);
+        if down {
+            media::note_user_activation();
+            if self.key_event("keydown", &shell) {
+                self.key_default(shell.clone());
+                if let Some(t) = text {
+                    self.insert_text(&t);
+                }
+            }
+        } else {
+            self.key_event("keyup", &shell);
+        }
+    }
+}
