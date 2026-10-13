@@ -44,3 +44,28 @@ Expected wire (QEMU, not `tests-at-boot`): `:: sdhc: w2 armed=1 lba=… n=4 veri
 reason=none -> ok ::` at boot; no DRAINCAP/SERWIT-1B/PWRDRAIN/SERWIRE/SERIALTX line before the announce;
 `:: VERDICTS: before_deferred=0 moved=22 reworded=19 announced=1 tags=- -> PASS ::`; `tests smallfix7` →
 `verdicts=0:-`; `tests draincap` → `:: TESTS: run draincap ::` then the DRAINCAP line.
+
+## 2. The serial door's route word (B567's wording item)
+
+What the wire said. serial.log:953-958: `[serialdoor] key=printable win_focus=0x0 ring=0x0 -> shell(headless)` on a QEMU
+boot with no Kepler takeover, then `tests door` read `headless=0 ran=0 window=0 lines=0`: the bytes never reached the
+headless door.
+
+Mechanism. The witness is printed by `wc_route_event` (arch/x86_64/syscall.rs:7312) with `serialdoor::route_word()`
+(serialdoor.rs:44), which read only `SHELL_WIN`. The byte's real route is decided by the render service's key arm
+(main.rs:6814-6830): `desktop` (main.rs:6380, `desktop_owns_backdrop()` = `desktop_uefi::is_active()`, main.rs:6225)
+false hands it to the BACKDROP console's `handle_key`; true with a shell window to that window; true with none to
+`serialdoor::key` (the headless door).
+
+The change. `route_word` asks `desktop_uefi::is_active()` first: false → `backdrop-console`, else `window`/`headless`
+as before (one line, LINE-NEUTRAL). The witness reads `-> shell(backdrop-console)` on QEMU. The bare form
+`-> backdrop-console` would need the format string in arch/x86_64/syscall.rs:7312 (`-> shell({})`), outside this arc's
+list; the exact change, if wanted: `"[serialdoor] key={} win_focus={:#x} ring={:#x} -> {}"` with `route_word()`
+returning `shell(window)`, `shell(headless)`, `backdrop-console`. Limit: `desktop` is latched once at the render
+service's entry (main.rs:6380) and `is_active` is read per key; they differ only if the takeover lands after the
+render service started, which the boot order (takeover during PCI enumeration) does not do.
+
+Specs. The only row on this witness is x86-witness.spec:1490, `PENDING \[serialdoor\] key=0x[0-9a-f]+ … -> shell`
+(PENDING, not REQUIRE; its `key=0x…` already does not match the current `key=printable` class word). The new word
+keeps the `-> shell` prefix, so the row's reading is unchanged. x86-wc.spec:229/230/234 pin `:: SERIALDOOR:` (the
+fixture's verdict), not this witness.
