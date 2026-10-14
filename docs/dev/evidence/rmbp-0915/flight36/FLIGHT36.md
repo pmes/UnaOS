@@ -1,10 +1,12 @@
-# FLIGHT 36 — image 28 on the UNAFS CARD IMAGE (rmbp12flight36, hw-rmbp@1719fe54), 2026-10-14, main bench — IN PROGRESS
+# FLIGHT 36 — image 28 on the UNAFS CARD IMAGE (rmbp12flight36, hw-rmbp@1719fe54), 2026-10-14, main bench
 
 Medium: `UnaOS-rmbp-esp-rmbp12flight36-20261013T2355Z-1719fe5` (.card.img sha256 2404415b…). Tree = the cloud tip 1719fe54: the flight-35 fix wave (GATESTEAL B657, DONGLEBOOT B658, WINEDGE B659, SOFTY dark, dragmouse) + STARFIELD B661 + TEMPLE's core. Line = image 27h's 56 knobs.
 
 ## Peter, verbatim (the glass)
 - "next boot ready"
 - "i can only sort of see the wallpaper through the flawed window borders. boot was the same"
+
+Captures: `f36-boot1.log`, `f36-boot2.log` (both pinned).
 
 ## 1. Boot 1 (fresh card, dongle out)
 `:: LOADER: 12659ms/3135ms`; `[starfield] gen wall_ms=152 stars=2997 lensed=2457 streams=3991 facets=17`; `:: BOOT: total=20817ms`; `[font] face=Inter`; login 00:09:11; `[desktop] built at=login ok bar_ms=44 … pins=11 held_ms=12`. **The screenshot (Cmd-Shift-3 at 00:10:11) SURVIVED: `PRTSCR: slice n=1..` streamed, `PRTSCR: SCREEN0.PNG 2880x1800 314346 bytes -> OK … bytes_written=314346 chunks=5`** — no steal, no wedge (flight 35's trigger). Typed: **DESKTOPCRAFT `corners=ok shadow=ok edge=ok(1px) hairline=ok black=ok -> PASS`** (+ cost UNDER); **STARFIELD `gen_ms=150 stars=2997 lensed=ok streams=3991 zircon=ok(facets=17) beam=ok shimmer_us=27 -> PASS`**; **SOFTY `… dark=19/19 accent=table pressed=ok -> PASS`** (the fold seam closed); SHOTZIP, SHOTMOUNT, IMGVIEW, AETHER PASS.
@@ -14,3 +16,24 @@ Medium: `UnaOS-rmbp-esp-rmbp12flight36-20261013T2355Z-1719fe5` (.card.img sha256
 **The look (Peter):** "i can only sort of see the wallpaper through the flawed window borders. boot was the same" — WINEDGE's 1 px edge passes its own fixture (`edge=ok(1px)`) and does NOT read as a window border to Peter; the starfield is there but the windows' borders are the flaw he sees. His eyes rule (R89): the window frame is still owed as he sees it, not as the fixture measures it.
 
 Not reached on boot 1 (the door died at dragmouse): winresize, menuscraft, menubar, statustray, dockpins, notify, doorsplit, ptrpress, filetypes, **gen7, kgr, wifi**, stria, quarryhover, motion, the standing list.
+
+## 2. Boot 2 (Peter's reboot through the power menu, THE DONGLE PLUGGED AT POWER-ON) — DONGLEBOOT fixed; the three big reads land; the pump dies a third way
+`POWER: action=reboot`; `[login] screen open … power_row=1`; login 00:13:49; **`[desktop] built at=login ok bar_ms=376 … pins=11 held_ms=348`** and **`[desktop] starter after-bar who=usbnet waited_ms=0 why=settled`**, `USBNET: up kind=ax88179 slot=3 … -> armed` — with the dongle in from power-on the desktop built (flight 35's boot 2 never did): DONGLEBOOT landed. DHCP this boot: no bound row in the capture (the list's usbnetrx never typed)
+
+**The list (the three big reads FIRST, the seat's reorder — the steal hits during softy):**
+- **THE FIRST TRIANGLE: `[gen7] r10 draw=3dprimitive r9=verified rows_cited=37/37 ring=rcs cand=mt prim=trilist verts=3 rt=32x32:b8g8r8a8 color=0xFF00FF00 fence=0x3D10C0DE read=0x3D10C0DE pixels=496 inside=496/496 edge=0 outside=0 other=0 rt0=0xFF00FF00 landed=1 … gpu_us=21 us=102 -> r10-triangle-verified`** (GEN7R10 B638 PROVEN — the first 3D draw on the Ivy Bridge RCS under UnaOS); `[gen7] r11 draw=quad r10=r10-triangle-verified rows_cited=17/17 writes=0 -> REFUSED reason=no-window` (R11 needs a window — the next rung); GEN7LADDER, GEN7R8 PASS.
+- **THE FALCONS: `[kgr] ucode fuc409c … -> pinned` ×4 (the four digests match the card's set), `[kgr] ucode limits fecs hwcfg=20402050 imem=20480 dmem=4096 gpccs hwcfg=20201028 imem=10240 dmem=2048 set 16896/1792/9728/1536 -> fits`, `[kgr] ucode start fecs cpuctl=00000010->00000020 gpccs cpuctl=00000010->00000020 mailbox=00000001 ready_us=2 watchdog=7FFFFFFF ctx_size=0x11c00 size_us=25 -> running`, `[kgr] fecs chipset=E7 class=A097 … -> running`**, `:: KGR4: … set_object=gated … fecs=running ucode=running ctx_size=0x11c00 -> DECLINED reason=no-golden-context ::` (KEPLERUCODE+KEPLERCUT PROVEN: NVIDIA's own FECS/GPCCS firmware runs on the GK107 from the bunker's set; the golden context is the next rung, as predicted).
+- **THE TRANSMIT: `:: wifi10: tx NOT ATTEMPTED reason=no-station-mac — S2r read no plausible il0macaddr this boot; nothing written ::`** — WIFI10 declined cleanly: the station MAC read from the core was not plausible, so no frame was emitted; the first emission waits on the MAC read (S2r), not the TX path. WIFI1 PASS.
+- MENUSCRAFT PASS (now `dock_menu=ok quarry_menu=ok wallpaper_gen=ok band_exact=ok` — the fold closed its owed lines); MENUBAR PASS; **STATUSTRAY-T `… input=ok … -> PASS`** (SOFTY2's assert fixed); DOCKPINS `pins=9 direct=9 … -> PASS`; SETTINGS, ACTIVITY PASS; `tests dragmouse`/`winresize` → TESTS SKIP / NOT-FOUND rows (read the capture for which).
+
+**The third wedge (00:16:28, during `tests dockpins`, step `net-hda`):** `PUMPWEDGE: age_ms=2171 last_step=net-hda holder=- rehome=none -> FAIL :: pump=9@cpu7`, `W5: nmi core=c7 taken=y`, the census `c4=37 c7=10`, the cable rescue from 00:16:28 — and NO `[pump] REHOME` this time (`rehome=none`): the watch did not re-home at all. The door died at dockpins; the rest of the list (notify … standing list, usbnetrx, screenshot) not reached.
+
+## 3. Findings
+- **PROVEN on metal:** GEN7R10 (the first triangle), KEPLERUCODE/KEPLERCUT (the falcons running from the bunker's pinned set), STARFIELD (the wallpaper, 150 ms), WINEDGE's fixture (`edge=ok(1px)`), SOFTY `dark=19/19`, DONGLEBOOT (the desktop builds with the dongle at power-on; the usbnet starter settles at 0 ms), the screenshot's sliced write (314 KB, OK, no steal), MENUSCRAFT's owed lines, STATUSTRAY's assert, FIRSTLOGIN on the fresh card (44 ms).
+- **GATESTEAL, two-thirds open:** three steals in two boots (steps: store-services during softy; net-hda during dockpins; the earlier bootlog/prtscr). Boot 1: the re-home ran twice and moved the queues but the pump — the dead core's CURRENT task — stayed on the corpse. Boot 2: `rehome=none`, no re-home at all. The pump dies on every W5 steal still; the door and xHCI input with it (the EHCI keyboard/trackpad survive). The remaining work: (1) re-home the dead core's current task; (2) why the watch did not re-home on boot 2; (3) why the gate is held >1.5 s on the pump's core at all (store-services, net-hda, bootlog, prtscr — the pump's long steps on the compositor's gate).
+- **WIFI10 blocked on S2r:** `no-station-mac` — the MAC read, not the transmit.
+- **The look (Peter):** the window borders are still "flawed", the wallpaper only "sort of" visible through them; WINEDGE's 1 px fixture-pass is not what he sees — his eyes rule (R89).
+- R11 refused for want of a window (expected: the quad needs a real window).
+
+## 4. Owed (the cloud's, in Peter's order)
+GATESTEAL's remaining two-thirds (the current task's re-home; the missing re-home on boot 2; the pump's long steps off the gate) BEFORE EVERYTHING; the window frame as Peter sees it (WINEDGE2); WIFI10's S2r MAC read; KEPLERGOLD (the golden context); R11's window; the unreached list. A two-boot metal-shaped leg stays in every fold.
