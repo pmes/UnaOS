@@ -5,6 +5,7 @@ Medium: `UnaOS-rmbp-esp-rmbp12flight36-20261013T2355Z-1719fe5` (.card.img sha256
 ## Peter, verbatim (the glass)
 - "next boot ready"
 - "i can only sort of see the wallpaper through the flawed window borders. boot was the same"
+- "machine is going again can other tests be run where it left off" / "desktop" / **"THE VIDEO PLAYED!!!!"** (boot 3)
 
 Captures: `f36-boot1.log`, `f36-boot2.log` (both pinned).
 
@@ -28,8 +29,11 @@ Not reached on boot 1 (the door died at dragmouse): winresize, menuscraft, menub
 
 **The third wedge (00:16:28, during `tests dockpins`, step `net-hda`):** `PUMPWEDGE: age_ms=2171 last_step=net-hda holder=- rehome=none -> FAIL :: pump=9@cpu7`, `W5: nmi core=c7 taken=y`, the census `c4=37 c7=10`, the cable rescue from 00:16:28 — and NO `[pump] REHOME` this time (`rehome=none`): the watch did not re-home at all. The door died at dockpins; the rest of the list (notify … standing list, usbnetrx, screenshot) not reached.
 
+## 2b. Boot 3 (Peter's reboot; the rest of the list from where boot 2 stopped)
+`[desktop] built at=login ok bar_ms=31 … held_ms=1`. **THE VIDEO PLAYED (Peter's glass and ears):** `:: STRIA: open path=/system/test-f/TEST.WEBM tracks=v:vp8 a:vorbis dur_ms=2744 size=320x240 bytes=219229 ::`, `STRIA: audio handle=1 rate=44100 underruns=0 state=open`, `STRIA: frame n=30 pts_ms=1001 late_ms=0`, `frame n=60 pts_ms=2002 late_ms=9`, **`:: STRIA: end -> PASS frames=81 audio=ok drift_ms=2 late_max_ms=27 dropped=1 clock=audio ::`**, `[audio] close … frames=121024 underruns=0` — STRIAMETAL on metal: VP8 video with Vorbis audio, audio-clocked, 2 ms drift, one dropped frame in 81, in a window on the glass. (The rest of boot 3's list: see the capture; the typer ran notify onward.)
+
 ## 3. Findings
-- **PROVEN on metal:** GEN7R10 (the first triangle), KEPLERUCODE/KEPLERCUT (the falcons running from the bunker's pinned set), STARFIELD (the wallpaper, 150 ms), WINEDGE's fixture (`edge=ok(1px)`), SOFTY `dark=19/19`, DONGLEBOOT (the desktop builds with the dongle at power-on; the usbnet starter settles at 0 ms), the screenshot's sliced write (314 KB, OK, no steal), MENUSCRAFT's owed lines, STATUSTRAY's assert, FIRSTLOGIN on the fresh card (44 ms).
+- **PROVEN on metal:** STRIAMETAL (the first video with sound: `STRIA: end -> PASS frames=81 audio=ok drift_ms=2` — "THE VIDEO PLAYED!!!!"), GEN7R10 (the first triangle), KEPLERUCODE/KEPLERCUT (the falcons running from the bunker's pinned set), STARFIELD (the wallpaper, 150 ms), WINEDGE's fixture (`edge=ok(1px)`), SOFTY `dark=19/19`, DONGLEBOOT (the desktop builds with the dongle at power-on; the usbnet starter settles at 0 ms), the screenshot's sliced write (314 KB, OK, no steal), MENUSCRAFT's owed lines, STATUSTRAY's assert, FIRSTLOGIN on the fresh card (44 ms).
 - **GATESTEAL, two-thirds open:** three steals in two boots (steps: store-services during softy; net-hda during dockpins; the earlier bootlog/prtscr). Boot 1: the re-home ran twice and moved the queues but the pump — the dead core's CURRENT task — stayed on the corpse. Boot 2: `rehome=none`, no re-home at all. The pump dies on every W5 steal still; the door and xHCI input with it (the EHCI keyboard/trackpad survive). The remaining work: (1) re-home the dead core's current task; (2) why the watch did not re-home on boot 2; (3) why the gate is held >1.5 s on the pump's core at all (store-services, net-hda, bootlog, prtscr — the pump's long steps on the compositor's gate).
 - **WIFI10 blocked on S2r:** `no-station-mac` — the MAC read, not the transmit.
 - **The look (Peter):** the window borders are still "flawed", the wallpaper only "sort of" visible through them; WINEDGE's 1 px fixture-pass is not what he sees — his eyes rule (R89).
