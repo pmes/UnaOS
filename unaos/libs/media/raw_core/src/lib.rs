@@ -21,8 +21,12 @@
 //! The output surface is pixel_core's: straight RGBA8, row-major, sRGB-encoded ([`color`]).
 //! RAWVIEW (B711): a raw with NO embedded preview still shows — [`half_rgba`] / [`Binner`] at `k = 2` with a
 //! [`WbTone`]: each 2x2 cell one RGB, the as-shot white balance ([`wb`]: AsShotNeutral, else Sony's SR2 levels),
-//! a pure 2.2 gamma. Owed until a real file has been read: the per-model colour matrix, `Compression 7`
-//! (lossless JPEG), packed 12-bit and the A100's ARW1. Design: `docs/dev/evidence/rmbp-1005/rawcore.md`.
+//! a pure 2.2 gamma. RAWCOLOR (B724): the colour matrix ([`matrix`]: DNG ColorMatrix2, else dcraw's Sony rows) between
+//! the white balance and the gamma; Canon CR2 ([`cr2`], the lossless-JPEG strip and its slices) and Nikon NEF
+//! ([`nef`], Huffman-coded or uncompressed, through the maker note's linearisation curve) into the same u16 Bayer
+//! plane, read IN ORDER through a [`decode::Source`] ([`RowDecoder::stream`]). Owed until a real file has been read:
+//! `Compression 7` (DNG lossless JPEG), Sony packed 12-bit, the A100's ARW1, Canon's masked-border black and crop.
+//! Design: `docs/dev/evidence/rmbp-1005/rawcore.md`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -32,18 +36,22 @@ extern crate alloc;
 extern crate std;
 
 pub mod color;
+pub mod cr2;
 pub mod decode;
 pub mod demosaic;
 pub mod exif;
+pub mod matrix;
+pub mod nef;
 pub mod synth;
 pub mod tiff;
 pub mod wb;
 
-pub use decode::RowDecoder;
+pub use decode::{RowDecoder, SliceSource, Source};
 pub use demosaic::{bilinear_linear, bilinear_rgba, half_rgba, Binner, Tone, ToneMap, WbTone};
+pub use matrix::MatrixSource;
 pub use wb::{Wb, WbSource};
 pub use exif::Facts;
-pub use tiff::{parse, RawInfo, Strip};
+pub use tiff::{parse, Fmt, RawInfo, Strip};
 
 /// Most IFDs one walk visits (IFD0's chain, its SubIFDs, the EXIF IFD).
 pub const MAX_IFDS: usize = 16;
@@ -94,21 +102,24 @@ pub fn is_tiff(b: &[u8]) -> bool {
 }
 
 pub const MIME_ARW: &str = "image/x-sony-arw";
+pub const MIME_CR2: &str = "image/x-canon-cr2";
+pub const MIME_NEF: &str = "image/x-nikon-nef";
 pub const MIME_TIFF: &str = "image/tiff";
 
-/// The MIME type of a TIFF head: `image/x-sony-arw` when IFD0's Make is SONY and a raw strip or the ARW
-/// SubIFD is named, else `image/tiff`. `None` for anything that is not a TIFF whose IFD0 parses. Pure.
+/// The MIME type of a TIFF head: `image/x-canon-cr2` when the header names CR2, `image/x-sony-arw` when IFD0's Make
+/// is SONY, `image/x-nikon-nef` when it is NIKON…, else `image/tiff`. `None` for anything that is not a TIFF. Pure.
 pub fn mime_of(head: &[u8]) -> Option<&'static str> {
     if !is_tiff(head) {
         return None;
     }
     // A TIFF whose IFD0 (or its Make) lies past this head is still a TIFF; a longer head decides the make.
     let Ok(info) = parse(head) else { return Some(MIME_TIFF) };
-    if info.facts.make.as_deref().map(|m| m.trim().eq_ignore_ascii_case("SONY")).unwrap_or(false) {
-        Some(MIME_ARW)
-    } else {
-        Some(MIME_TIFF)
-    }
+    Some(match info.fmt {
+        Fmt::Arw => MIME_ARW,
+        Fmt::Cr2 => MIME_CR2,
+        Fmt::Nef => MIME_NEF,
+        Fmt::Tiff => MIME_TIFF,
+    })
 }
 
 /// A zeroed `Vec<T>` of `n`, reserved fallibly.

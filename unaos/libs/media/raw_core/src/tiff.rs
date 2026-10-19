@@ -34,6 +34,32 @@ pub mod tag {
     pub const SONY_BLACK: u16 = 0x7310;
     /// Sony: WhiteLevel, one to three shorts.
     pub const SONY_WHITE: u16 = 0x787f;
+    /// DNG ColorMatrix2: XYZ -> camera under the second calibration illuminant (D65), nine SRATIONALs (B724).
+    pub const COLOR_MATRIX2: u16 = 50722;
+    /// Canon CR2: the raw strip's slice table `[n, sw, slast]` (B724).
+    pub const CR2_SLICE: u16 = 0xC640;
+}
+
+/// Which raw format a TIFF container is (B724): named by its header (`CR\x02` at byte 8: Canon CR2) or IFD0's Make.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fmt {
+    #[default]
+    Tiff,
+    Arw,
+    Cr2,
+    Nef,
+}
+
+impl Fmt {
+    /// The wire word: `tiff`, `arw`, `cr2`, `nef`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Fmt::Tiff => "tiff",
+            Fmt::Arw => "arw",
+            Fmt::Cr2 => "cr2",
+            Fmt::Nef => "nef",
+        }
+    }
 }
 
 /// `PhotometricInterpretation` of a colour-filter mosaic (TIFF-EP).
@@ -140,12 +166,13 @@ impl<'a> Reader<'a> {
 }
 
 /// The raw strip: where the mosaic is and how it is coded.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Strip {
     pub width: u32,
     pub height: u32,
     pub bits: u16,
-    /// 1 = uncompressed 16-bit containers; 32767 = Sony (`bits` 8: cRAW).
+    /// 1 = uncompressed (16-bit containers, or packed); 32767 = Sony (`bits` 8: cRAW); 6 = Canon CR2's lossless
+    /// JPEG; 34713 = Nikon NEF's Huffman coding.
     pub compression: u16,
     /// File offset and byte length of the (contiguous) strip data.
     pub offset: u64,
@@ -159,6 +186,10 @@ pub struct Strip {
     pub curve: Option<[u16; 4]>,
     /// The file's byte order (uncompressed samples are stored in it).
     pub le: bool,
+    /// Canon CR2's slice table (tag 0xC640), when present (B724).
+    pub slices: Option<[u16; 3]>,
+    /// Nikon NEF's maker-note decoding data (tag 0x96), for `Compression 34713` (B724).
+    pub nikon: Option<crate::nef::Meta>,
 }
 
 /// What [`parse`] learned from a raw file's head.
@@ -174,6 +205,11 @@ pub struct RawInfo {
     pub facts: Facts,
     /// The as-shot white balance (AsShotNeutral, else Sony's SR2 levels) — RAWVIEW (B711), [`crate::wb`].
     pub wb: Option<crate::wb::Wb>,
+    /// The raw format (B724).
+    pub fmt: Fmt,
+    /// Camera RGB -> linear sRGB (D65), Q12, each row summing to 4096 — RAWCOLOR (B724), [`crate::matrix`].
+    pub matrix: Option<[[i32; 3]; 3]>,
+    pub matrix_source: Option<crate::matrix::MatrixSource>,
 }
 
 #[derive(Default)]
@@ -190,6 +226,9 @@ struct Ifd {
     curve: Option<[u16; 4]>,
     black: Option<u16>,
     white: Option<u16>,
+    slices: Option<[u16; 3]>,
+    cm2: Option<[(i32, i32); 9]>,
+    exif: Option<u32>,
 }
 
 /// The strip extent named by StripOffsets/StripByteCounts: one span, or several that are contiguous.
@@ -245,6 +284,26 @@ fn read_ifd(r: &Reader, ents: &[Entry], info: &mut RawInfo, queue: &mut Vec<u32>
                 }
             }
             tag::SONY_WHITE => d.white = u(0).map(|v| v as u16),
+            tag::CR2_SLICE if e.count >= 3 => {
+                if let (Some(a), Some(b), Some(c)) = (u(0), u(1), u(2)) {
+                    d.slices = Some([a as u16, b as u16, c as u16]);
+                }
+            }
+            tag::COLOR_MATRIX2 if e.count == 9 && matches!(e.typ, 5 | 10) => {
+                if let Some((s, _)) = r.value_span(e) {
+                    let mut m = [(0i32, 0i32); 9];
+                    let ok = (0..9).all(|i| match (r.u32(s + 8 * i), r.u32(s + 8 * i + 4)) {
+                        (Some(n), Some(dd)) => {
+                            m[i] = if e.typ == 10 { (n as i32, dd as i32) } else { (n.min(i32::MAX as u32) as i32, dd.min(i32::MAX as u32) as i32) };
+                            true
+                        }
+                        _ => false,
+                    });
+                    if ok {
+                        d.cm2 = Some(m);
+                    }
+                }
+            }
             // RAWVIEW (B711): AsShotNeutral outranks Sony's levels wherever it is met.
             crate::wb::tag::AS_SHOT_NEUTRAL => {
                 if let Some(w) = crate::wb::neutral(r, e).and_then(crate::wb::Wb::from_neutral) {
@@ -261,6 +320,7 @@ fn read_ifd(r: &Reader, ents: &[Entry], info: &mut RawInfo, queue: &mut Vec<u32>
                 tag::EXIF_IFD => {
                     if let Some(o) = u(0) {
                         info.ifds += exif::read(r, o as usize, &mut info.facts) as u32;
+                        d.exif = Some(o);
                     }
                 }
                 crate::wb::tag::DNG_PRIVATE if info.wb.is_none() => info.wb = crate::wb::sony_sr2(r, e),
@@ -296,6 +356,11 @@ pub fn parse(head: &[u8]) -> Result<RawInfo, Error> {
     let mut chain_next = Some(ifd0);
     let mut qi = 0;
     let mut ifd0_dims: Option<(u32, u32)> = None;
+    // RAWCOLOR (B724): a CR2 names itself in the header; its raw is IFD3 of IFD0's chain, its big JPEG IFD0's strip.
+    let is_cr2 = head.get(8..11) == Some(b"CR\x02");
+    let mut chain: Vec<u32> = Vec::new();
+    let mut cm2: Option<[(i32, i32); 9]> = None;
+    let mut exif_at: Option<u32> = None;
     while qi < queue.len() && seen.len() < MAX_IFDS {
         let off = queue[qi];
         qi += 1;
@@ -311,14 +376,40 @@ pub fn parse(head: &[u8]) -> Result<RawInfo, Error> {
         info.ifds += 1;
         // IFD0's chain (IFD1, …) is followed; SubIFDs' own next pointers are not part of the walk.
         if chain_next == Some(off) {
+            chain.push(off);
             chain_next = (next != 0).then_some(next);
             if let Some(n) = chain_next {
                 queue.push(n);
             }
         }
-        let d = read_ifd(&r, &ents, &mut info, &mut queue, off == ifd0);
+        let mut d = read_ifd(&r, &ents, &mut info, &mut queue, off == ifd0);
         if off == ifd0 && d.width > 0 && d.height > 0 {
             ifd0_dims = Some((d.width, d.height));
+        }
+        if cm2.is_none() {
+            cm2 = d.cm2;
+        }
+        if d.exif.is_some() {
+            exif_at = d.exif;
+        }
+        let chain_idx = chain.iter().position(|&c| c == off);
+        if is_cr2 && chain_idx == Some(0) && d.compression == 6 {
+            // CR2's full-size JPEG is IFD0's strip, not a 513/514 pair.
+            if let Some((o, l)) = d.strip {
+                if l > 2 && info.preview.map(|(_, pl)| l > pl).unwrap_or(true) && head.get(o as usize..o as usize + 2).map(|s| s == [0xFF, 0xD8]).unwrap_or(true) {
+                    info.preview = Some((o, l));
+                }
+            }
+        }
+        let cr2_raw = is_cr2 && d.compression == 6 && d.strip.is_some() && (d.slices.is_some() || chain_idx == Some(3));
+        if cr2_raw && (d.width == 0 || d.height == 0) {
+            // The geometry is the lossless JPEG's SOF3 — read here when the strip lies in the head, else by the decoder.
+            if let Some((o, _)) = d.strip {
+                if let Some(f) = head.get(o as usize..).and_then(|b| crate::cr2::frame(b).ok()) {
+                    let (w, h) = f.dims();
+                    (d.width, d.height, d.bits) = (w, h, f.bits as u16);
+                }
+            }
         }
         if let (Some(o), Some(l)) = d.jpeg {
             if l > 2 && info.preview.map(|(_, pl)| (l as u64) > pl).unwrap_or(true) && head.get(o as usize..o as usize + 2).map(|s| s == [0xFF, 0xD8]).unwrap_or(true) {
@@ -326,19 +417,21 @@ pub fn parse(head: &[u8]) -> Result<RawInfo, Error> {
             }
         }
         let cfa = d.photometric == PHOTOMETRIC_CFA;
-        let rawish = cfa || (d.photometric == 0 && d.compression == 32767);
+        let rawish = cfa || cr2_raw || (d.photometric == 0 && d.compression == 32767);
         if rawish && (d.strip.is_some() || d.strip_err.is_some()) {
             let px = d.width as u64 * d.height as u64;
-            if d.width == 0 || d.height == 0 || d.width > MAX_DIM || d.height > MAX_DIM || px > MAX_PIXELS {
+            let unknown = cr2_raw && px == 0; // a CR2 whose strip is past the head: the decoder fences it
+            if !unknown && (d.width == 0 || d.height == 0 || d.width > MAX_DIM || d.height > MAX_DIM || px > MAX_PIXELS) {
                 fence = Some(Error::TooLarge);
                 continue;
             }
+            let pri = cfa || cr2_raw;
             let better = match &best {
                 None => true,
-                Some((b, bc)) => (cfa && !bc) || (cfa == *bc && px > b.width as u64 * b.height as u64),
+                Some((b, bc)) => (pri && !bc) || (pri == *bc && px > b.width as u64 * b.height as u64),
             };
             if better {
-                best = Some((d, cfa));
+                best = Some((d, pri));
             }
         }
     }
@@ -359,14 +452,43 @@ pub fn parse(head: &[u8]) -> Result<RawInfo, Error> {
             white: d.white.unwrap_or(0),
             curve: d.curve,
             le: r.le,
+            slices: d.slices,
+            nikon: None,
         });
-        info.facts.width = Some(d.width);
-        info.facts.height = Some(d.height);
+        if d.width > 0 && d.height > 0 {
+            info.facts.width = Some(d.width);
+            info.facts.height = Some(d.height);
+        }
     } else if let Some(e) = fence {
         return Err(e);
     } else if let Some((w, h)) = ifd0_dims {
         info.facts.width = Some(w);
         info.facts.height = Some(h);
+    }
+    // RAWCOLOR (B724): the format, Nikon's maker-note decoding data, the colour matrix.
+    let make = info.facts.make.as_deref().map(str::trim).unwrap_or("");
+    info.fmt = if is_cr2 {
+        Fmt::Cr2
+    } else if make.eq_ignore_ascii_case("SONY") {
+        Fmt::Arw
+    } else if make.len() >= 5 && make[..5].eq_ignore_ascii_case("NIKON") {
+        Fmt::Nef
+    } else {
+        Fmt::Tiff
+    };
+    if let (Fmt::Nef, Some(s), Some(x)) = (info.fmt, info.strip.as_mut(), exif_at) {
+        let (m, black) = crate::nef::maker(&r, x as usize, s.bits);
+        if s.compression == 34713 {
+            s.nikon = m;
+        }
+        if s.black == 0 {
+            s.black = black.unwrap_or(0);
+        }
+    }
+    if let Some(m) = cm2.as_ref().and_then(crate::matrix::from_rationals) {
+        (info.matrix, info.matrix_source) = (Some(m), Some(crate::matrix::MatrixSource::Dng));
+    } else if let Some(m) = crate::matrix::table(info.facts.make.as_deref(), info.facts.model.as_deref()).as_ref().and_then(crate::matrix::from_table) {
+        (info.matrix, info.matrix_source) = (Some(m), Some(crate::matrix::MatrixSource::Table));
     }
     Ok(info)
 }

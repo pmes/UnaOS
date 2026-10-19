@@ -37,6 +37,8 @@ pub use type_core::{
     AUDIO_WAV, DIRECTORY, EXT_TABLE, GZIP, IMAGE_ARW, IMAGE_BMP, IMAGE_GIF, IMAGE_JPEG, IMAGE_PNG, IMAGE_QOI, IMAGE_SVG, IMAGE_TIFF, IMAGE_WEBP, LINUX_ELF, OCTET, TAR,
     TEXT_MARKDOWN, TEXT_PLAIN, UNAOS_BIN, UNAOS_ELF, VIDEO_MATROSKA, VIDEO_MP4, VIDEO_WEBM,
 };
+pub const IMAGE_CR2: &str = pixel_core::raw::raw_core::MIME_CR2; // RAWCOLOR (B724): raw_core types a CR2 by its header
+pub const IMAGE_NEF: &str = pixel_core::raw::raw_core::MIME_NEF; // RAWCOLOR (B724): raw_core types a NEF by IFD0's Make
 
 /// How many leading bytes the sniff reads (`ustar` sits at 257..262, so a tar needs 263).
 pub const SNIFF_LEN: usize = 512;

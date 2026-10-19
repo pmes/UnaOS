@@ -14,7 +14,9 @@
 //! balance — Facet's FULL path, the camera's native RGB, flat and greenish) or [`WbTone`] (RAWVIEW, B711: the
 //! as-shot white balance per channel, then a pure 2.2 gamma). [`half_rgba`] is the half-size demosaic: the
 //! [`Binner`] at `k = 2`, each 2x2 CFA cell one RGB pixel (R and B their own sample, G the mean of the two), so a
-//! raw with no embedded preview still shows. No colour matrix yet (owed).
+//! raw with no embedded preview still shows. RAWCOLOR (B724): [`WbTone::with_matrix`] puts the colour matrix
+//! ([`crate::matrix`], camera RGB -> linear sRGB, Q12) between the white balance and the gamma — a whole-pixel map
+//! ([`ToneMap::map_px`]), which the [`Binner`] calls once per output pixel.
 
 use alloc::vec::Vec;
 
@@ -54,6 +56,11 @@ impl Tone {
 /// A raw sample of colour `c` (0 R, 1 G, 2 B) -> a display byte.
 pub trait ToneMap {
     fn map_c(&self, c: usize, v: u32) -> u8;
+    /// One pixel's three raw means -> RGB bytes (per channel unless the map mixes channels).
+    #[inline]
+    fn map_px(&self, v: [u32; 3]) -> [u8; 3] {
+        [self.map_c(0, v[0]), self.map_c(1, v[1]), self.map_c(2, v[2])]
+    }
 }
 
 impl ToneMap for Tone {
@@ -70,11 +77,25 @@ pub struct WbTone {
     lut: [Vec<u8>; 3],
     /// The gains applied, Q10, smallest = 1024 (the wire's and the KAT's).
     pub gain: [u32; 3],
+    /// RAWCOLOR (B724): the matrix path — per channel the white-balanced linear value in Q16 (`black..white` x gain),
+    /// the Q12 matrix, the 2.2 encoder over Q16.
+    mat: Option<Mat>,
+}
+
+struct Mat {
+    m: [[i32; 3]; 3],
+    lin: [Vec<u32>; 3],
+    enc: Vec<u8>,
 }
 
 impl WbTone {
     /// `white == 0` takes `max_code`; `wb == None` is unity gains.
     pub fn new(black: u16, white: u16, max_code: u16, wb: Option<&crate::Wb>) -> Result<Self, Error> {
+        Self::with_matrix(black, white, max_code, wb, None)
+    }
+
+    /// [`new`](Self::new) with the colour matrix (`None`: the camera's native RGB, B711's output to the byte).
+    pub fn with_matrix(black: u16, white: u16, max_code: u16, wb: Option<&crate::Wb>, matrix: Option<&[[i32; 3]; 3]>) -> Result<Self, Error> {
         let white = if white == 0 { max_code } else { white }.max(1);
         let black = if black >= white { 0 } else { black };
         let mul = wb.map(|w| w.mul).unwrap_or([crate::wb::ONE; 3]);
@@ -96,7 +117,30 @@ impl WbTone {
                 l[v] = code as u8;
             }
         }
-        Ok(WbTone { lut, gain })
+        let mat = match matrix {
+            None => None,
+            Some(m) => {
+                let n = white as usize + 1;
+                let mut lin = [crate::zeroed::<u32>(n)?, crate::zeroed::<u32>(n)?, crate::zeroed::<u32>(n)?];
+                let spanq = (white - black) as u64 * crate::wb::ONE as u64;
+                for (c, l) in lin.iter_mut().enumerate() {
+                    for v in black as usize..n {
+                        l[v] = ((v - black as usize) as u64 * gain[c] as u64 * 65535 / spanq) as u32;
+                    }
+                }
+                let mut enc = crate::zeroed::<u8>(65536)?;
+                let mut code = 0usize;
+                for (x, e) in enc.iter_mut().enumerate() {
+                    let lv = x as f64 / 65535.0;
+                    while code < 255 && t[code] <= lv {
+                        code += 1;
+                    }
+                    *e = code as u8;
+                }
+                Some(Mat { m: *m, lin, enc })
+            }
+        };
+        Ok(WbTone { lut, gain, mat })
     }
 }
 
@@ -105,6 +149,13 @@ impl ToneMap for WbTone {
     fn map_c(&self, c: usize, v: u32) -> u8 {
         let l = &self.lut[c.min(2)];
         l[(v as usize).min(l.len() - 1)]
+    }
+
+    #[inline]
+    fn map_px(&self, v: [u32; 3]) -> [u8; 3] {
+        let Some(m) = &self.mat else { return [self.map_c(0, v[0]), self.map_c(1, v[1]), self.map_c(2, v[2])] };
+        let cam = [0, 1, 2].map(|c| m.lin[c][(v[c] as usize).min(m.lin[c].len() - 1)]);
+        crate::matrix::apply(&m.m, cam).map(|x| m.enc[x as usize])
     }
 }
 
@@ -237,11 +288,12 @@ impl Binner {
     fn flush<T: ToneMap>(&mut self, oy: usize, tone: &T) {
         for ox in 0..self.ow {
             let o = (oy * self.ow + ox) * 4;
-            for c in 0..3 {
+            let mut v = [0u32; 3];
+            for (c, vc) in v.iter_mut().enumerate() {
                 let n = self.cnt[ox][c] as u64;
-                let v = if n > 0 { (self.acc[ox][c] + n / 2) / n } else { 0 };
-                self.rgba[o + c] = tone.map_c(c, v as u32);
+                *vc = if n > 0 { ((self.acc[ox][c] + n / 2) / n) as u32 } else { 0 };
             }
+            self.rgba[o..o + 3].copy_from_slice(&tone.map_px(v));
             self.rgba[o + 3] = 255;
             self.acc[ox] = [0; 3];
             self.cnt[ox] = [0; 3];

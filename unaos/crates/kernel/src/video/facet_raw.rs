@@ -3,26 +3,30 @@
 //
 //! CHARTER: Facet — shared-core
 //!
-//! RAWCORE (rmbp-ledger B444) — Facet opens a camera raw (Sony ARW; a plain TIFF by its preview). The decoder
+//! RAWCORE (rmbp-ledger B444) — Facet opens a camera raw (Sony ARW, Canon CR2, Nikon NEF; a plain TIFF by its
+//! preview). The decoder
 //! is `raw_core` (the `no_std` core lux re-exports on the host), reached through `pixel_core::raw` — the seam;
 //! this file only moves bytes from the VFS into it, so the kernel holds no second parser.
 //!
-//! * FULL ([`develop`], Facet's open): the IFDs are read from the file's head; the raw strip is STREAMED in
-//!   `CHUNK`-sized runs of rows through `raw_core::RowDecoder` into `raw_core::Binner` at the window's integer
+//! * FULL ([`develop`], Facet's open): the IFDs are read from the file's head; the raw strip is STREAMED through
+//!   `raw_core::RowDecoder::stream` (runs of rows, or — CR2's lossless JPEG, NEF's Huffman coding, RAWCOLOR B724 —
+//!   the bit stream in windows, rows handed out in order) into `raw_core::Binner` at the window's integer
 //!   scale `k` — one row of samples and one accumulator row are held, never the 24-to-60-megapixel mosaic
 //!   (a 48 MiB kernel heap could not). A raw that fits the window (`k == 1`) is demosaiced bilinear whole.
 //! * FAST ([`preview`], Quick Look and the wallpaper through `decode_file`): the embedded JPEG, decoded by
 //!   pixel_core's JPEG decoder, box-reduced by the viewer's own `reduce_rgba`.
 //! * HALF (RAWVIEW, B711 — the one call in [`preview`] when the file carries NO embedded JPEG): the strip streamed
-//!   through `raw_core::Binner` at `k = 2 * j` with a `raw_core::WbTone` (the as-shot white balance, a 2.2 gamma) —
-//!   the half-size demosaic, reduced by `j` only when the half image is larger than the asked box.
+//!   through `raw_core::Binner` at `k = 2 * j` with a `raw_core::WbTone` (the as-shot white balance, RAWCOLOR's colour
+//!   matrix when the file or the table names one, a 2.2 gamma) — the half-size demosaic, reduced by `j` only when
+//!   the half image is larger than the asked box.
 //!
 //! Wire: `[facet] raw path=<p> w=<n> h=<n> compression=<1 or 32767> preview=<ok|none> demosaic_ms=<n> k=<n>`;
-//! `[raw] arw=<craw|plain> mosaic=<w>x<h> bits=<n> demosaic=half ms=<n> half=<w>x<h> j=<n> wb=<asshot|sony|none>`.
+//! `[raw] fmt=<arw|cr2|nef> mosaic=<w>x<h> bits=<n> matrix=<dng|table|none> demosaic=half ms=<n> coding=<craw|plain|packed|ljpeg|nikon>
+//! half=<w>x<h> j=<n> wb=<asshot|sony|none> path=<p>`.
 //! `tests rawcore` writes the synthetic ARWs (`raw_core::synth`) to the home, or — a home no fixture may write
 //! (QEMU's FAT root) — runs the same legs on the bytes in RAM (UNAFSGROW's `img=ram` leg), opens them all three
-//! ways, reads their facts: `:: RAWCORE: preview=ok mosaic=ok half=<w>x<h> store=<home|ram> … -> PASS ::`. R80:
-//! run only when asked. CR2 and NEF stay typed-only (`image/tiff` by their container): no decoder for them here.
+//! ways, reads their facts: `:: RAWCORE: preview=ok mosaic=ok half=<w>x<h> store=<home|ram> … cr2=ok nef=ok
+//! matrix=ok -> PASS ::` (the CR2/NEF legs on synthetic files in RAM). R80: run only when asked.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -83,6 +87,32 @@ fn rd(src: &Src, off: u64, len: usize) -> Result<Vec<u8>, FacetError> {
     Ok(out)
 }
 
+/// RAWCOLOR (B724): the strip of `src` at `base` as a `raw_core::Source` (strip-relative fetches); the first VFS
+/// error is kept for the caller, the core sees `Truncated`.
+struct StripSrc<'a, 'b> {
+    src: &'a Src<'b>,
+    base: u64,
+    err: Option<FacetError>,
+}
+
+impl raw_core::Source for StripSrc<'_, '_> {
+    fn fetch(&mut self, off: u64, len: usize) -> Result<Vec<u8>, raw_core::Error> {
+        rd(self.src, self.base + off, len).map_err(|e| {
+            if self.err.is_none() {
+                self.err = Some(e);
+            }
+            raw_core::Error::Truncated
+        })
+    }
+}
+
+impl StripSrc<'_, '_> {
+    /// A core error, or the VFS error that caused it.
+    fn why(&mut self, e: raw_core::Error) -> FacetError {
+        self.err.take().unwrap_or(FacetError::Pixel(map_err(e)))
+    }
+}
+
 fn info_of(src: &Src, size: u64) -> Result<raw_core::RawInfo, FacetError> {
     let head = rd(src, 0, core::cmp::min(size, HEAD) as usize)?;
     raw_core::parse(&head).map_err(|e| FacetError::Pixel(map_err(e)))
@@ -119,28 +149,17 @@ fn develop_src(src: &Src, size: u64, bw: usize, bh: usize) -> Result<(Ihdr, usiz
     develop_with(src, size, bw, bh, &info)
 }
 
-/// Stream mosaic rows `0..rows` of strip `s` through `d`, `CHUNK`-sized runs at a time, handing each decoded row
-/// to `f` — one row of samples held, never the mosaic.
-fn stream_rows(src: &Src, s: &raw_core::Strip, d: &raw_core::RowDecoder, rows: usize, mut f: impl FnMut(usize, &[u16])) -> Result<(), FacetError> {
-    let px_err = |e: raw_core::Error| FacetError::Pixel(map_err(e));
-    let mut row: Vec<u16> = Vec::new();
-    if row.try_reserve_exact(d.width).is_err() {
-        return Err(FacetError::OutOfMemory(d.width * 2));
-    }
-    row.resize(d.width, 0);
-    let rb = d.row_bytes();
-    let per = core::cmp::max(1, CHUNK / rb.max(1));
-    let mut y = 0usize;
-    while y < rows {
-        let n = core::cmp::min(per, rows - y);
-        let run = rd(src, s.offset + (y * rb) as u64, n * rb)?;
-        for i in 0..n {
-            d.row(&run[i * rb..(i + 1) * rb], &mut row).map_err(px_err)?;
-            f(y + i, &row[..]);
-        }
-        y += n;
-    }
-    Ok(())
+/// The decoder of strip `s` (a CR2's geometry read from its strip's head).
+fn open_strip(src: &Src, s: &raw_core::Strip) -> Result<raw_core::RowDecoder, FacetError> {
+    let mut ss = StripSrc { src, base: s.offset, err: None };
+    raw_core::RowDecoder::open(s, &mut ss).map_err(|e| ss.why(e))
+}
+
+/// Stream mosaic rows `0..rows` of strip `s` through `d` (`raw_core::RowDecoder::stream`: runs of rows, or a bit
+/// stream in windows), handing each decoded row to `f` in order — one row of samples held, never the mosaic.
+fn stream_rows(src: &Src, s: &raw_core::Strip, d: &raw_core::RowDecoder, rows: usize, f: impl FnMut(usize, &[u16])) -> Result<(), FacetError> {
+    let mut ss = StripSrc { src, base: s.offset, err: None };
+    d.stream(&mut ss, rows, f).map_err(|e| ss.why(e))
 }
 
 fn pack(rgba: &[u8], n: usize) -> Result<Vec<u32>, FacetError> {
@@ -161,17 +180,19 @@ fn half_with(src: &Src, size: u64, bw: usize, bh: usize, info: &raw_core::RawInf
     if s.offset.checked_add(s.len).map(|e| e > size).unwrap_or(true) {
         return Err(px_err(raw_core::Error::Truncated));
     }
-    let d = raw_core::RowDecoder::new(s).map_err(px_err)?;
-    let tone = raw_core::WbTone::new(s.black, s.white, d.max_code, info.wb.as_ref()).map_err(px_err)?;
+    let d = open_strip(src, s)?;
+    let tone = raw_core::WbTone::with_matrix(s.black, s.white, d.max_code, info.wb.as_ref(), info.matrix.as_ref()).map_err(px_err)?;
     let (hw, hh) = (d.width / 2, d.height / 2);
     let (j, ow, oh) = fit(hw as u32, hh as u32, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
     let k = 2 * j;
     let mut bin = raw_core::Binner::new(k, ow, oh, s.cfa).map_err(px_err)?;
     stream_rows(src, s, &d, oh * k, |y, row| bin.row(y, row, &tone))?;
     let px = pack(&bin.rgba, ow * oh)?;
+    let bits = if d.max_code == 0 { s.bits as u32 } else { 16 - d.max_code.leading_zeros() };
     serial_println!(
-        "[raw] arw={} mosaic={}x{} bits={} demosaic=half ms={} half={}x{} j={} wb={} path={}",
-        d.coding(), s.width, s.height, s.bits, crate::arch::ms().saturating_sub(t0), hw, hh, j, raw_core::Wb::name(info.wb.as_ref()), src.name()
+        "[raw] fmt={} mosaic={}x{} bits={} matrix={} demosaic=half ms={} coding={} half={}x{} j={} wb={} path={}",
+        info.fmt.name(), d.width, d.height, bits, raw_core::MatrixSource::name(info.matrix_source), crate::arch::ms().saturating_sub(t0), d.coding(), hw, hh, j,
+        raw_core::Wb::name(info.wb.as_ref()), src.name()
     );
     Ok((Ihdr { width: hw as u32, height: hh as u32, depth: 8, colour: 6, interlaced: false }, j, ow, oh, px))
 }
@@ -183,14 +204,19 @@ fn develop_with(src: &Src, size: u64, bw: usize, bh: usize, info: &raw_core::Raw
     if s.offset.checked_add(s.len).map(|e| e > size).unwrap_or(true) {
         return Err(px_err(raw_core::Error::Truncated));
     }
-    let d = raw_core::RowDecoder::new(s).map_err(px_err)?;
+    let d = open_strip(src, s)?;
     let tone = raw_core::Tone::new(s.black, s.white, d.max_code).map_err(px_err)?;
-    let (k, ow, oh) = fit(s.width, s.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
-    let rb = d.row_bytes();
+    let (mw, mh) = (d.width as u32, d.height as u32);
+    let (k, ow, oh) = fit(mw, mh, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
     let rgba: Vec<u8> = if k == 1 {
-        let strip = rd(src, s.offset, rb * d.height)?;
-        let m = d.all(&strip).map_err(px_err)?;
-        drop(strip);
+        let n = d.width * d.height;
+        let mut m: Vec<u16> = Vec::new();
+        if m.try_reserve_exact(n).is_err() {
+            return Err(FacetError::OutOfMemory(n * 2));
+        }
+        m.resize(n, 0);
+        let w = d.width;
+        stream_rows(src, s, &d, d.height, |y, row| m[y * w..(y + 1) * w].copy_from_slice(&row[..w]))?;
         let full = raw_core::bilinear_rgba(&m, d.width, d.height, &s.cfa, &tone).map_err(px_err)?;
         // `fit` drops nothing at k == 1, so the full image is the base.
         full
@@ -200,13 +226,13 @@ fn develop_with(src: &Src, size: u64, bw: usize, bh: usize, info: &raw_core::Raw
         stream_rows(src, s, &d, oh * k, |y, row| bin.row(y, row, &tone))?;
         bin.rgba
     };
-    let (w, h) = if k == 1 { (s.width as usize, s.height as usize) } else { (ow, oh) };
+    let (w, h) = if k == 1 { (mw as usize, mh as usize) } else { (ow, oh) };
     let px = pack(&rgba, w * h)?;
     serial_println!(
         "[facet] raw path={} w={} h={} compression={} preview={} demosaic_ms={} k={}",
-        src.name(), s.width, s.height, s.compression, if info.preview_in(size).is_some() { "ok" } else { "none" }, crate::arch::ms().saturating_sub(t0), k
+        src.name(), mw, mh, s.compression, if info.preview_in(size).is_some() { "ok" } else { "none" }, crate::arch::ms().saturating_sub(t0), k
     );
-    Ok((Ihdr { width: s.width, height: s.height, depth: 8, colour: 6, interlaced: false }, k, w, h, px))
+    Ok((Ihdr { width: mw, height: mh, depth: 8, colour: 6, interlaced: false }, k, w, h, px))
 }
 
 // ── `tests rawcore` ─────────────────────────────────────────────────────────────────────────────────
@@ -219,7 +245,12 @@ fn develop_with(src: &Src, size: u64, bw: usize, bh: usize, info: &raw_core::Raw
 /// pixel_core's JPEG decoder), the FULL path at k=1 and k=2 and C's cRAW, the MOSAIC (every sample of A's 14-bit
 /// strip and C's delta blocks against the codes written), the HALF path (Quick Look on B: 32x16, white-balanced
 /// grey, R = G = B), and ATTRCOLUMNS's facts (stored on a writable home, computed otherwise). R80: only when asked.
-/// No real Sony file is involved: a real ARW's first flight is the `[facet] raw` / `[raw]` line on Peter's card.
+/// RAWCOLOR (B724) legs, on synthetic files in RAM: a 64x32 CR2 with no preview and a sliced lossless-JPEG strip
+/// (`[1, 40, 24]`), a 14-bit lossless NEF and a 12-bit NEF through a linearisation curve — each typed
+/// (`image/x-canon-cr2`, `image/x-nikon-nef`), its mosaic decoded sample for sample, Quick Look's half path 32x16;
+/// the matrix: B takes dcraw's `ILCE-7` row (`matrix=table`, rows summing to 4096, grey kept), a twin carrying a
+/// DNG ColorMatrix2 takes it (`matrix=dng`, grey kept).
+/// No real camera file is involved: a real raw's first flight is the `[facet] raw` / `[raw]` line on Peter's card.
 pub fn selftest() {
     use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
     use raw_core::synth::{self, Coding, Opts};
@@ -286,6 +317,40 @@ pub fn selftest() {
         (i.width, i.height, k, ow, oh, grey)
     });
     let wb_b = raw_core::parse(&bare).ok().and_then(|i| i.wb);
+    // RAWCOLOR (B724): CR2 and NEF in RAM — typed, the mosaic sample for sample, Quick Look's half path.
+    let grey_of = |px: &[u32]| px.iter().all(|&p| (p >> 16) & 0xff == p & 0xff && (p >> 8) & 0xff == p & 0xff);
+    let cm = synth::ramp_even(64, 32);
+    let cr2f = synth::cr2(64, 32, &cm, synth::Cr2Opts { preview: false, slices: Some([1, 40, 24]) });
+    let nefl = synth::nef(64, 32, &cm, synth::NefCoding::Lossless14);
+    let nefc = synth::nef(64, 32, &cm, synth::NefCoding::Curve12);
+    let leg = |f: &[u8], want: &str| -> (bool, String) {
+        let typed = crate::fs::filetype::sniff(f) == Some(want);
+        let mosaic = decode_all(f).as_deref() == Some(&cm[..]);
+        let half = preview_src(&Src::Mem(f), f.len() as u64, 128, 128).map(|(i, k, ow, oh, _)| (i.width, i.height, k, ow, oh));
+        let ok = typed && mosaic && matches!(half, Ok((32, 16, 1, 32, 16)));
+        (ok, alloc::format!("typed={} mosaic={} half={:?}", typed, mosaic, half.map_err(|e| e.reason())))
+    };
+    let (cr2_ok, cr2_why) = leg(&cr2f, crate::fs::filetype::IMAGE_CR2);
+    let (nefl_ok, nefl_why) = leg(&nefl, crate::fs::filetype::IMAGE_NEF);
+    let (nefc_ok, nefc_why) = leg(&nefc, crate::fs::filetype::IMAGE_NEF);
+    let nef_ok = nefl_ok && nefc_ok;
+    // The matrix: B by the table (half_ok's grey ran through it), a DNG twin by its ColorMatrix2.
+    let dngf = synth::arw_with(w, h, &synth::grey(w, h, lv), Coding::Plain14, Opts { preview: false, wb_rggb: Some(lv), color_matrix2: Some([4913, -541, -202, -6130, 13513, 2906, -1564, 2151, 7183]), ..Opts::default() });
+    let ib = raw_core::parse(&bare).ok();
+    let idng = raw_core::parse(&dngf).ok();
+    let rows_q = |m: Option<[[i32; 3]; 3]>| m.map(|m| m.iter().all(|r| r.iter().sum::<i32>() == raw_core::matrix::Q)).unwrap_or(false);
+    let dng_half = preview_src(&Src::Mem(&dngf), dngf.len() as u64, 128, 128).map(|(.., px)| grey_of(&px)).unwrap_or(false);
+    let src_b = ib.as_ref().and_then(|i| i.matrix_source);
+    let src_dng = idng.as_ref().and_then(|i| i.matrix_source);
+    let matrix_ok = src_b == Some(raw_core::MatrixSource::Table)
+        && rows_q(ib.as_ref().and_then(|i| i.matrix))
+        && src_dng == Some(raw_core::MatrixSource::Dng)
+        && rows_q(idng.as_ref().and_then(|i| i.matrix))
+        && dng_half;
+    serial_println!(
+        "[rawcore] cr2 {} | nef lossless {} | nef curve {} | matrix b={} dng={} dng_grey={}",
+        cr2_why, nefl_why, nefc_why, raw_core::MatrixSource::name(src_b), raw_core::MatrixSource::name(src_dng), dng_half
+    );
     let half_ok = matches!(half, Ok((32, 16, 1, 32, 16, true))) && wb_b.map(|x| x.src) == Some(raw_core::WbSource::Sony);
     let (hw, hh) = half.as_ref().map(|t| (t.0, t.1)).unwrap_or((0, 0));
     let r = if on_home { Some(crate::fs::attrfacts::refresh_in(&mt, &pa, true)) } else { None };
@@ -308,11 +373,12 @@ pub fn selftest() {
         half.as_ref().map_err(|e| e.reason()), r
     );
     let typed = mime == crate::fs::filetype::IMAGE_ARW && mime_b == crate::fs::filetype::IMAGE_ARW;
-    let ok = typed && tiff_ok && ifds == 4 && preview_ok && demosaic_ok && mosaic_ok && half_ok && facts >= 8 && attrs_ok;
+    let ok = typed && tiff_ok && ifds == 4 && preview_ok && demosaic_ok && mosaic_ok && half_ok && facts >= 8 && attrs_ok && cr2_ok && nef_ok && matrix_ok;
+    let okw = |b: bool| if b { "ok" } else { "fail" };
     serial_println!(
-        ":: RAWCORE: preview={} mosaic={} half={}x{} store={} type={} tiff={} ifds={} demosaic={} wb={} facts={} -> {} :: source=synthetic(no real ARW yet) cr2=typed-only nef=typed-only",
-        if preview_ok { "ok" } else { "fail" }, if mosaic_ok { "ok" } else { "fail" }, hw, hh, if on_home { "home" } else { "ram" }, mime,
-        if tiff_ok { "ok" } else { "fail" }, ifds, if demosaic_ok { "ok" } else { "fail" }, raw_core::Wb::name(wb_b.as_ref()), facts,
-        if ok { "PASS" } else { "FAIL" }
+        ":: RAWCORE: preview={} mosaic={} half={}x{} store={} type={} tiff={} ifds={} demosaic={} wb={} facts={} cr2={} nef={} matrix={} -> {} :: source=synthetic(no real camera file yet)",
+        okw(preview_ok), okw(mosaic_ok), hw, hh, if on_home { "home" } else { "ram" }, mime,
+        okw(tiff_ok), ifds, okw(demosaic_ok), raw_core::Wb::name(wb_b.as_ref()), facts,
+        okw(cr2_ok), okw(nef_ok), okw(matrix_ok), if ok { "PASS" } else { "FAIL" }
     );
 }
