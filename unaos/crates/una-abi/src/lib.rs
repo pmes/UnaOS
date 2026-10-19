@@ -2748,7 +2748,7 @@ const _: () = assert!(
 //   zero-padded).
 // A page holds at most [`A11Y_PAGE_MAX`] nodes; a reader pages with `first` until it has `total`. Appended at the
 // tail so no existing line moves.
-// =================================================================================================
+// ==========================================================================================
 
 /// Bus verb: the accessibility tree (see the block above).
 pub const BUS_VERB_A11Y_TREE: u8 = 25; // 24 is BUS_VERB_DROP_GET
@@ -2943,3 +2943,15 @@ mod a11ytree_tests {
         assert_eq!(a11y_u16(70_000), u16::MAX);
     }
 }
+=======
+// ABIELF (rmbp-ledger B693, BP-bar-13, BP-ring3-15) — THE ABI VERSION. A program built against this crate at
+// version N runs unchanged on every later build: `unaos/fixtures/ABIPROBE-v<N>.ELF` is that program, built ONCE
+// and committed (with its .sha256), staged by the builder as APPS/ABIPROBE.ELF and run by `tests abielf`. The
+// RULE (docs/dev/blueprint/ring3.md BP-ring3-15): an ADDITIVE change (a new number, flag, verb tag or errno at
+// the file tail) keeps N. An INCOMPATIBLE change — a number re-meant, an argument moved, a layout or a documented
+// answer changed — bumps N in the same commit AND commits a new fixture ELF beside the old one; the old fixture
+// must still PASS, or the sheet says which surface it lost and why. Appended at the file tail; no line above moves.
+// =================================================================================================
+
+/// The una-abi version the tree speaks. `tests abielf` refuses a fixture that claims a higher one.
+pub const ABI_VERSION: u32 = 1;

@@ -52,6 +52,27 @@ fn stage_trust(src: &std::path::Path, volume: &std::path::Path) -> bool {
     true
 }
 
+/// ABIELF (rmbp-ledger B693, BP-bar-13, BP-ring3-15): stage the COMMITTED ABI fixture `fixtures/ABIPROBE-v1.ELF` — bytes
+/// an older tree built, never a rebuild — as `<apps>/ABIPROBE.ELF`, after its sha256 is checked against the pin beside it
+/// (`fixtures/ABIPROBE-v1.ELF.sha256`, the stage_trust shape). `tests abielf` runs it. A pin mismatch panics (the build
+/// stops: the fixture is the gate, and a fixture that silently changed gates nothing); an absent fixture is said.
+fn stage_abiprobe(workspace: &std::path::Path, apps: &std::path::Path) -> bool {
+    const FIXTURE: &str = "ABIPROBE-v1.ELF"; // the una_abi::ABI_VERSION it was built at (v1); a bump adds a file, never edits this one
+    let src = workspace.join("fixtures").join(FIXTURE);
+    let Ok(elf) = std::fs::read(&src) else {
+        println!("   ABIPROBE: fixtures/{FIXTURE} absent — no APPS/ABIPROBE.ELF (`tests abielf` SKIPs)");
+        return false;
+    };
+    let pin_file = src.with_file_name(format!("{FIXTURE}.sha256"));
+    let pin = std::fs::read_to_string(&pin_file).unwrap_or_default();
+    let pin = pin.split_whitespace().next().unwrap_or("").to_string();
+    let have: String = crypto_core::sha2::sha256(&elf).iter().map(|b| format!("{:02x}", b)).collect();
+    assert!(have == pin, "fixtures/{} sha256 {} != pin {} ({}): the committed ABI fixture changed", FIXTURE, have, pin, pin_file.display());
+    std::fs::write(apps.join("ABIPROBE.ELF"), &elf).unwrap();
+    println!("   ABIPROBE: staged fixtures/{FIXTURE} as {}/ABIPROBE.ELF ({} B, sha256 {} = pin; tests abielf)", apps.display(), elf.len(), have);
+    true
+}
+
 /// KERNELFONT (rmbp-ledger B359): the UI faces the kernel's `video::text` loads from `/system/fonts/`, staged as
 /// DATA from the HOST's font packages (KERNELFONT vendored nothing; FONTSCRAFT vendors three OFL families, below). (file, family). A face is staged
 /// only with its licence beside it (`system/fonts/LICENSES/<family>.txt`); `system/fonts/MANIFEST.txt` records
@@ -1416,6 +1437,8 @@ fn main() {
     } else {
         println!("   BIG: target/BIG-X86.ELF absent — ESP has no BIG.ELF (run via ./arroyo esp-x86)");
     }
+    // ABIELF (B693): the committed ABI fixture, pinned — `tests abielf` reads /apps/ABIPROBE.ELF.
+    let _ = stage_abiprobe(&workspace_dir, &esp_apps);
 
     // LUMENAPP (B323, R82): Lumen is ONE program — the ring-3 chat app that talks to the provider itself
     // (crates/user-lumen linking vein_core + vein_ring3; built by arroyo's build_user_lumen_x86 to
@@ -1593,6 +1616,10 @@ fn main() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
             staged_data.push(dst);
         }
+    }
+    // ABIELF (B693): the committed ABI fixture rides the DATA volume too — `tests abielf` reads it there.
+    if stage_abiprobe(&workspace_dir, &data_apps) {
+        staged_data.push("ABIPROBE.ELF");
     }
     // SELFDIAG M2 (B324): the owners table rides the DATA volume too (system/witness-owners.txt).
     if target_dir.join("witness-owners.txt").exists() {

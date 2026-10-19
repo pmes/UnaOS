@@ -552,7 +552,7 @@ refs/heads/exec-rmbp-k2p 78f2e833 FOLDED-BY-HAND (batch, legs at this commit) 20
 refs/heads/exec-rmbp-idlenet 32b7fefc FOLDED-BY-HAND (batch 2, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-settingsmap 74775a01 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-toastcap 050749b0 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
-refs/heads/exec-rmbp-a11ytree 5e9b7026 IN-FLIGHT cloud wave36 A11YTREE
+refs/heads/exec-rmbp-a11ytree 2a4e9c6d FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-glyphs e0932932 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-memline 8133fe47 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-applaunch b55a7bc2 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
@@ -565,15 +565,15 @@ refs/heads/exec-rmbp-volkey     2303f8fb FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-wxn64 f2650f66 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-shimmeridle 72f50c42 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-uvccam f232a34e FOLDED-BY-HAND (batch 2, legs at this commit) 2026-10-19
-refs/heads/exec-rmbp-ptpcam 5e9b7026 IN-FLIGHT cloud wave36 PTPCAM
-refs/heads/exec-rmbp-keyboot    e1c9dcd0 IN-FLIGHT cloud wave36 KEYBOOT (B688)
-refs/heads/exec-rmbp-xts        e1c9dcd0 IN-FLIGHT cloud wave36 XTS (B689)
-refs/heads/exec-rmbp-stageverb  e1c9dcd0 IN-FLIGHT cloud wave36 STAGEVERB (B690)
-refs/heads/exec-rmbp-sleep      e1c9dcd0 IN-FLIGHT cloud wave36 SLEEP (B691)
-refs/heads/exec-rmbp-trashrm    bb32b284 IN-FLIGHT cloud wave36 TRASHRM (B692)
-refs/heads/exec-rmbp-abielf     bb32b284 IN-FLIGHT cloud wave36 ABIELF (B693)
-refs/heads/exec-rmbp-geodemeta  bb32b284 IN-FLIGHT cloud wave36 GEODEMETA (SR)
-refs/heads/exec-rmbp-softydark  bb32b284 IN-FLIGHT cloud wave36 SOFTYDARK (B694)
+refs/heads/exec-rmbp-ptpcam f2bd7491 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-keyboot    dc3c1fec FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-xts        6887330a FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-stageverb  c71c19dd FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-sleep      99147346 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-trashrm    82d87f97 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-abielf     87e7cb92 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-geodemeta  f410d189 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-softydark  3171a098 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-aging        96ed4711 IN-FLIGHT cloud wave36 AGING
 refs/heads/exec-rmbp-veilcost     96ed4711 IN-FLIGHT cloud wave36 VEILCOST
 refs/heads/exec-rmbp-notelemetry  96ed4711 IN-FLIGHT cloud wave36 NOTELEMETRY
