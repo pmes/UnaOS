@@ -2067,21 +2067,12 @@ fn autolock_selftest() {
     let reopened = entered && !lock::active() && !login::is_open() && is_una(&mut nb); let (painted, hole_ms) = lock2_unlocked(l2); let resumed = lock::last_resumed(); // LOCK2 (B728): it paints within one frame of the unlock, then is closed before the fingerprint (file tail). LINE-NEUTRAL fold, code first.
     let after = lock::fingerprint();
     let same = before == after;
-<<<<<<< HEAD
-    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let gets = lockchanged_leg(); // LOCKCHANGED (B758): the lock's GETs per lock-key and per other-key change (file tail). LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0; // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
+    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let gets = lockchanged_leg(); let deleted = lockdeleted_leg(); // PREFSDELETED (B755): the deleted-domain leg (file tail). // LOCKCHANGED (B758): the lock's GETs per lock-key and per other-key change (file tail). LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0 && deleted.0; // PREFSDELETED (B755): + deleted. // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
-        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} gets={}",
+        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} gets={} deleted={}",
         entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
-        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8, gets.1
-=======
-    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let deleted = lockdeleted_leg(); // PREFSDELETED (B755): a deleted lock domain is the lock's defaults within one pass (file tail). LOCKPREFS (B748): LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && deleted.0; // PREFSDELETED (B755): + the deleted-domain leg. // LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
-    serial_println!(
-        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} deleted={}",
-        entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
-        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8, deleted.1
->>>>>>> exec-rmbp-prefsdeleted
+        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8, gets.1, deleted.1
     );
 }
 
@@ -4770,7 +4761,6 @@ fn softymic_selftest() {
     );
 }
 
-<<<<<<< HEAD
 // LOCKCHANGED (rmbp-ledger B758, BP-security-18) — TAIL-APPENDED, so no line above moves. `tests autolock`'s `gets=` leg,
 // folded onto its lines (the field is the line's LAST): the lock re-reads its policy only on a PrefChanged that names one
 // of its three keys (`lock::prefs_pass` through `prefs_client::changed_since`). Counted with `lock::gets()` (the GETs
@@ -4814,7 +4804,7 @@ fn lockchanged_leg() -> (bool, alloc::string::String) {
         crate::prefs_client::last_changed().map_or(alloc::string::String::from("-"), |(_, a)| a), crate::prefs_client::last_via(), if ok { "ok" } else { "bad" }
     );
     (ok, alloc::format!("{}/{}", lock_gets, other_gets))
-=======
+}
 
 // PREFSDELETED (rmbp-ledger B755, BP-security-18) — TAIL-APPENDED, so no line above moves. `tests autolock`'s `deleted=`
 // leg, folded onto its lines after `prefs=`: a settings domain the user deletes resets its keys to their defaults (R98's
@@ -4859,5 +4849,4 @@ fn lockdeleted_leg() -> (bool, &'static str) {
         d, want, moved as u8, gone as u8, reread as u8, seen.0, seen.1 as u8, seen.2 as u8, restored as u8, if ok { "ok" } else { "bad" }
     );
     (ok, if ok { "ok" } else { "FAIL" })
->>>>>>> exec-rmbp-prefsdeleted
 }
