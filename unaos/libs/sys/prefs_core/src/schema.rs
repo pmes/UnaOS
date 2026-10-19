@@ -266,6 +266,22 @@ pub static SCHEMA: &[Key] = &[
         writers: &[Writer::Settings, Writer::Dock, Writer::Program], reader: "kernel dock",
         doc: "The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock.",
     },
+    // ── TZLOCALE (rmbp-ledger B701, BP-bar-17): the ONE locale authority — how a civil second is printed ─────────
+    Key {
+        ns: "system", key: "locale.first_day", kind: Kind::Enum(&["mon", "sun", "sat"]), default: Default::Str("mon"),
+        writers: &[Writer::Settings], reader: "kernel `clock::locale`",
+        doc: "The week's first day (calendars). Edited in Settings > Date & Time.",
+    },
+    Key {
+        ns: "system", key: "locale.region", kind: Kind::Enum(&["ymd-24", "ymd-12", "dmy-24", "dmy-12", "mdy-24", "mdy-12"]), default: Default::Str("ymd-24"),
+        writers: &[Writer::Settings], reader: "kernel `clock::locale`",
+        doc: "The date order (`ymd` YYYY-MM-DD, `dmy` DD/MM/YYYY, `mdy` MM/DD/YYYY) and the hour cycle (24 or 12) every civil print uses. Edited in Settings > Date & Time.",
+    },
+    Key {
+        ns: "system", key: "locale.tz", kind: Kind::Str { max_len: 40, printable: true }, default: Default::Str("UTC"),
+        writers: &[Writer::Settings], reader: "kernel `clock::locale` (the zone table `clock/tz.rs`)",
+        doc: "The time zone, an IANA name from the kernel's compiled table (fixed DST rules); the civil anchor stays UTC and the zone is applied when a second is printed. An unknown name reads as UTC. Edited in Settings > Date & Time.",
+    },
     Key {
         ns: "system", key: "login.items", kind: Kind::Str { max_len: crate::login::VALUE_MAX, printable: true },
         default: Default::Str(""),
@@ -315,9 +331,9 @@ pub static SCHEMA: &[Key] = &[
         doc: "Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18).",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 10 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 11 }, default: Default::Int(0),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy, Date & Time).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {

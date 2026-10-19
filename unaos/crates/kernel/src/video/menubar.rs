@@ -1013,9 +1013,9 @@ fn clock_hhmm() -> Option<[u8; CLOCK_GLYPHS]> {
     // also what a never-anchored clock reads, so a momentary contention is indistinguishable from
     // "no time yet" and neither fabricates one.
     let secs = crate::clock::try_unix_now()?;
-    let (_, _, _, h, m, _) = crate::clock::civil_from_unix(secs);
-    let d = |v: u32, k: u32| b'0' + ((v / k) % 10) as u8;
-    Some([d(h, 10), d(h, 1), b':', d(m, 10), d(m, 1)])
+    let mut c = [b' '; CLOCK_GLYPHS];
+    crate::clock::locale::fmt_time(crate::clock::locale::Painter::Bar, secs, &mut c); // TZLOCALE (B701): the zone and the hour cycle are Principia's `system.locale.*`; UTC + ymd-24 paints the `HH:MM` it always did
+    Some(c)
 }
 
 // ---------------------------------------------------------------------------

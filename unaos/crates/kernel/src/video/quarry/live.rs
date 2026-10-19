@@ -1704,7 +1704,9 @@ fn mtime_field(ts: Option<&VfsTime>) -> String {
     match ts {
         None => String::from("       -        "),
         Some(t) => {
-            alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.min)
+            // TZLOCALE (B701): the stamp is UTC civil; the one locale prints it (UTC + ymd-24 = the old `YYYY-MM-DD HH:MM`).
+            let u = crate::clock::unix_from_civil(t.year as i64, t.month as u32, t.day as u32, t.hour as u32, t.min as u32, t.sec as u32);
+            crate::clock::locale::fmt_stamp(crate::clock::locale::Painter::Quarry, u)
         }
     }
 }
