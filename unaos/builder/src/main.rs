@@ -1176,6 +1176,10 @@ fn main() {
     // delta. Default OFF => the feature is absent and the image is byte-identical
     // (`./arroyo knoboff uvc`). Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_UVC").is_ok() { feats.push("uvc"); }
+    // UACMIC (rmbp-ledger B723): UNAOS_UAC=1 arms the USB Audio Class 1 driver (playback + capture, the mic
+    // dot) as its own feature; Cargo.toml has `uac` imply `uvc` (the isochronous engine). Kept in sync with
+    // arroyo's mapping (which also attaches QEMU's usb-audio) — the three places in step.
+    if std::env::var("UNAOS_UAC").is_ok() { feats.push("uac"); }
     // IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms `arch/x86_64/ioapic.rs` — the Intel 82093AA
     // redirection table, so a PCI function with no usable MSI capability can have its INTx routed
     // to a vector instead of staying POLLED (rmbp flight 11: `ISRARM REFUSED … no IOAPIC`).

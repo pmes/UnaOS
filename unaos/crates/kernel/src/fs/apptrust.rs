@@ -931,3 +931,10 @@ fn net_app_of_asid(asid: u64) -> Option<String> {
     let p = crate::video::wm::program_name(w);
     if p.is_empty() { None } else { Some(String::from(p)) }
 }
+
+// ── UACMIC (rmbp-ledger B723, BP-bar-12, R130) — the microphone is a grant, the camera's ask ──────────────────────────
+// ONE domain word for REASK's store: a ring-3 program reaches `audio::source` only with `system.decisions.microphone.
+// <app>` kept as `allow` (the same ask as the camera: `<app> wants the microphone`, Not now · Allow); the kernel's own
+// recorder fixture names `audio::KERNEL_RECORDER` and is not asked. Settings > Privacy lists it with every decision.
+/// The decisions' `<domain>` segment for the microphone (`system.decisions.microphone.*`).
+pub const MIC_DOMAIN: &str = "microphone";
