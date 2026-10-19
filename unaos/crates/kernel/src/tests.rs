@@ -3455,8 +3455,8 @@ fn kelfstage_cuts() -> KelfCuts {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn hwtab_leg(n: usize) -> (bool, alloc::string::String, alloc::string::String) {
     let (tab, listed, painted, press, note) = crate::video::settings::hwtab_probe();
-    let ok = tab == crate::video::settings::HW_TAB && listed == n && painted == listed && press;
-    (ok, format!("tab={} rows_painted={}", tab, painted), format!("listed={} press={} note=\"{}\"", listed, if press { "ok" } else { "bad" }, note))
+    let (clip, report) = hwtab2_leg(); let ok = tab == crate::video::settings::HW_TAB && listed == n && painted == listed && press && clip == "ok" && !report.starts_with("FAIL"); // HWTAB2 (B759): the clipboard and the report legs (file END). LINE-NEUTRAL fold, code before the comment.
+    (ok, format!("tab={} rows_painted={}", tab, painted), format!("listed={} press={} note=\"{}\" clip={} report={}", listed, if press { "ok" } else { "bad" }, note, clip, report))
 }
 
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -4744,4 +4744,14 @@ fn softymic_selftest() {
         ":: SOFTYMIC: on={} off={} looks={} privacy={} -> {} :: live={} ::",
         yn(on), yn(off), looks, yn(privacy), if pass { "PASS" } else { "FAIL" }, live
     );
+}
+
+// HWTAB2 (rmbp-ledger B759, BP-bar-25, BP-video-32) — TAIL-APPENDED, so no line above moves. `tests hwreport`'s
+// HWTAB2 legs, folded onto `hwtab_leg`'s tail: a census line's press puts the line on the clipboard (read back equal,
+// the note says copied; the user's clipboard put back), and `Report…`'s save writes `<home>/hardware-report.txt`
+// through the VFS (read back: the image line, the features line, every census line; its toast posted). The PASS line
+// ends `clip=ok report=ok`; a home that vetoes writes reads `report=skip(home-not-writable:<k>)` and does not fail.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn hwtab2_leg() -> (alloc::string::String, alloc::string::String) {
+    crate::video::settings::hwtab2_probe()
 }
