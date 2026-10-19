@@ -804,6 +804,14 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 ## 8. Communication with Peter
 
+- **Peter is asked two things only: to run the metal, and what the glass looks like.** (Peter 2026-10-19: "more and more
+  all i should be here for is to run the metal tests"; the same day, on an executor's `RULE ON IT` note about the FPU
+  for ring 3 that the seat relayed to him: "there was no question".) Every engineering decision — a mechanism, a
+  target, a context switch, a crate, an ABI field, which of two designs — is the SEAT's, made on the blueprint and
+  the ledgers and written into the commit; an executor's `RULE ON IT`, `needs Peter`, or `open question` is a note
+  TO THE SEAT and the seat answers it in the next arc. Peter's rulings (RULINGS.md) are about how the OS looks and
+  behaves for a person, and what to build next; never about how. A question to Peter that he could answer only by
+  reading code is the seat's own failure, and the seat answers it itself.
 - **Report outcomes, not process** (orin 23 close). **"What is your status" means the full arc
   report on the first ask** (Peter 2026-09-09): tree state, what flew, what is fixed and gated, what
   is half done per branch, what is not started, peers, pushes owed. Never the last five minutes,
