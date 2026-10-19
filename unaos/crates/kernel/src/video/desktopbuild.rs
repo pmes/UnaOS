@@ -119,7 +119,7 @@ fn say(bar_ms: u64) {
         if at_login { "login ok" } else { "stage" }, bar_ms, battery, if dock { "painted" } else { "unpainted" }, super::dock::pins_pinned(),
         HELD_MS.load(Relaxed), BATT_MS.load(Relaxed), GAP_MAX_MS.load(Relaxed), m.heap_kb, m.high_kb, Kb(m.furniture_kb), m.delta_pct // KVMLAT2 (B576): where the bar's span went
     ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] steps::say(bar_ms); // FIRSTLOGIN (B636): `[desktop] bar steps=…`, only past STEPS_OVER_MS. LINE-NEUTRAL append, code first
-    if !FIRST_SAID.swap(true, AcqRel) {
+    if !FIRST_SAID.swap(true, AcqRel) { #[cfg(feature = "login")] crate::boot::oldest_say(); // OLDEST (rmbp-ledger B682, BP-bar-1): the boot's first build names the line's oldest machine and the net it had. LINE-NEUTRAL append, code first
         let prebuilt = PREBUILT.load(Relaxed);
         #[cfg(feature = "login")]
         let swept = super::crystal::login::swept_n();
