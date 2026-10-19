@@ -17,12 +17,12 @@
 //!   already answer `true` for every key and press while it is up (BP-security-5).
 //! * **Entered by** idle (no key or pointer event for `after_idle_min`, DIMIDLE's activity clock
 //!   `dimidle::last_activity_ms`), the lid closing (`power::sleep::enter`, before the state's line), any other sleep
-//!   entry (`on_sleep`), and Win+L (`keymap::resolve_edge`'s fallback -> the router's `LockScreen` arm ->
+//!   entry (`on_sleep`), and Win+L (`keymap::resolve_chord`'s fallback, so every keyboard path -> the router's `LockScreen` arm ->
 //!   `login::lock` -> [`enter`]`(Key)`; ⌘L / Ctrl+Alt+L / the menu's Lock take the same door).
 //! * **A wrong password** is the login screen's one answer (BP-security-4); here it is COUNTED and the card SHAKES
 //!   (six 30 ms steps, none under Reduce motion).
 //! * Wire: `[lock] enter cause=<idle|lid|sleep|key> windows_hidden=<n>` · `[lock] wrong n=<n> shake=<…>` ·
-//!   `[lock] open ms=<n> wrong=<n>` · `tests autolock` -> `:: AUTOLOCK: entered=1 leaked_keys=0 reopened=ok
+//!   `[lock] open ms=<n> wrong=<n> resumed=<n>` · `tests autolock` -> `:: AUTOLOCK: entered=1 leaked_keys=0 reopened=ok
 //!   table_same=1 ms=<n> -> PASS ::` (the fixture body is `tests.rs`'s tail).
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -60,6 +60,10 @@ static OPENS: AtomicU32 = AtomicU32::new(0);
 /// The last [`opened`]'s cost: the right password's verdict applied -> the restoring composite returned (ms).
 static LAST_OPEN_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 static ENTER_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// LOCK2 (B728): app owners the last [`opened`]'s resume pass (`wm::lock_resume`) brought back.
+static RESUMED: AtomicU32 = AtomicU32::new(0);
+/// LOCK2 (B728): the civil minute the locked card last painted its clock for (`unix / 60`; 0 = none yet).
+static CLOCK_MIN: AtomicU64 = AtomicU64::new(0);
 
 /// The policy in force (the store's, read once a second; a Settings press sets it at once).
 static AFTER_IDLE_MIN: AtomicU32 = AtomicU32::new(IDLE_MIN_DEFAULT);
@@ -103,6 +107,11 @@ pub fn wrong_count() -> u32 {
 pub fn last_open_ms() -> Option<u64> {
     let v = LAST_OPEN_MS.load(Ordering::Relaxed);
     if v == u64::MAX { None } else { Some(v) }
+}
+
+/// App owners the last unlock resumed (LOCK2, `wm::lock_resume`).
+pub fn last_resumed() -> u32 {
+    RESUMED.load(Ordering::Relaxed)
 }
 
 /// Windows the last lock hid.
@@ -249,6 +258,10 @@ fn wipe() {
 
 /// The right password (the login screen's verdict, `apply_unlock`, after its row is down): the veil off, every row
 /// damaged, ONE composite — the table was never touched, so the focus and the z-order are the ones the lock found.
+/// LOCK2 (B728): before that composite, the resume pass (`wm::lock_resume`): every app owner the table shows on the
+/// glass again is published unhidden (its wake edge; a program the veil paused runs again) and the whole panel is
+/// queued as wallpaper-aware desktop damage, so the card's vacated rect is repainted by this same pass, not by the
+/// desktop's next tick (up to a second).
 pub fn opened() {
     if !ACTIVE.load(Ordering::Acquire) {
         return;
@@ -256,6 +269,9 @@ pub fn opened() {
     let t0 = crate::arch::ms();
     SHAKE_STEP.store(0, Ordering::Relaxed);
     ACTIVE.store(false, Ordering::Release);
+    let resumed = super::wm::lock_resume();
+    RESUMED.store(resumed as u32, Ordering::Relaxed);
+    CLOCK_MIN.store(0, Ordering::Relaxed);
     if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
         let (w, h) = (fb.width(), fb.height());
         let _ = super::wm::damage_intersecting(0, 0, w, h);
@@ -266,7 +282,7 @@ pub fn opened() {
     LAST_OPEN_MS.store(ms, Ordering::Relaxed);
     OPENS.fetch_add(1, Ordering::Relaxed);
     IDLE_TRIED.store(super::dimidle::last_activity_ms(), Ordering::Relaxed);
-    serial_println!("[lock] open ms={} wrong={}", ms, WRONG.load(Ordering::Relaxed));
+    serial_println!("[lock] open ms={} wrong={} resumed={}", ms, WRONG.load(Ordering::Relaxed), resumed);
 }
 
 /// A wrong password on the locked screen (`apply_unlock`'s refusal; the screen says its one answer): counted, and the
@@ -322,6 +338,7 @@ pub fn service() {
         if SHAKE_STEP.load(Ordering::Acquire) != 0 {
             shake_step(now);
         }
+        clock_tick();
         if !super::crystal::login::is_locked() {
             let mut nb = [0u8; crate::fs::users::NAME_MAX];
             if crate::fs::users::whoami(&mut nb).is_some() && !super::crystal::login::is_open() && super::crystal::login::lock_screen() {
@@ -416,4 +433,15 @@ pub fn fingerprint() -> u64 {
         None => eat(u64::MAX),
     }
     h
+}
+
+/// LOCK2 (B728): the locked card prints the civil clock (`login`'s painter, through `clock::locale::fmt_time`, the one
+/// formatter); this repaints the card once per civil minute while the veil is on (one card repaint a minute, never per
+/// frame). `try_unix_now`: a contended or unanchored clock skips this pass.
+fn clock_tick() {
+    let Some(secs) = crate::clock::try_unix_now() else { return };
+    let m = secs / 60 + 1;
+    if CLOCK_MIN.swap(m, Ordering::Relaxed) != m {
+        super::crystal::login::font_repaint();
+    }
 }

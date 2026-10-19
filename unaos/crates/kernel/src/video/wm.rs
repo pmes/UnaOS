@@ -31176,3 +31176,40 @@ fn lock_veiled(r: &Window) -> bool {
         false
     }
 }
+
+// LOCK2 (rmbp-ledger B728, BP-video-28) — TAIL-APPENDED, so no line above moves. THE UNLOCK'S RESUME PASS, one walk over
+// the table at `lock::opened` (the veil is already off, so `above_shell` is the trunk's predicate again): every live row
+// damaged (the one composite `opened` runs repaints it), every ring-3 owner the table now shows ABOVE the shell published
+// `hidden=false` through `vugmin_publish` (the unhide is the wake edge `set_hidden` delivers: a program the veil
+// suppressed — `present` answered `Suppressed`, the program parked on `WIN_PRESENT_HIDDEN`, or a shell arm run while
+// veiled published it hidden — runs again; nobody is published hidden here, the shell arm stays the only place a
+// hidden bit is SET, VUGMIN-C), and the whole panel queued as wallpaper-aware deferred desktop damage (`erase`, drained
+// at the head of that same composite, clipped by the windows) so the login card's vacated rect is the picture in the
+// unlock's own pass instead of at the desktop's next tick. Returns how many app owners it resumed.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn lock_resume() -> usize {
+    let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
+    let mut marks: alloc::vec::Vec<(u64, bool)> = alloc::vec::Vec::new();
+    {
+        let mut t = table();
+        for r in t.rows.iter_mut() {
+            if r.used {
+                r.damage_all();
+            }
+        }
+        let n = vugmin_scan(&t, shell, &mut marks);
+        marks.truncate(n);
+    }
+    let mut resumed = 0usize;
+    for &(asid, hid) in marks.iter() {
+        if hid || is_kernel_owner(asid) {
+            continue;
+        }
+        vugmin_publish(asid, false, "cause=unlock");
+        resumed += 1;
+    }
+    if let Some(pi) = super::panel_info_nonblocking() {
+        erase(&[(0, 0, pi.width, pi.height)]);
+    }
+    resumed
+}
