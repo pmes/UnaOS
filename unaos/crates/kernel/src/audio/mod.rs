@@ -57,7 +57,7 @@ fn chosen() -> u8 {
         0 => {
             let v = match crate::prefs::text(PREF_KEY) {
                 Some(s) if s.starts_with("usb") => 2,
-                _ => 1,
+                Some(_) => 1, None => return 1, // CRAWLC: nothing read (the store not loaded yet, or the key unset) is answered, never cached — a kept `usb` read later still counts (BP-audio-2)
             };
             CHOSEN.store(v, Ordering::Release);
             v

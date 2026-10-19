@@ -2,9 +2,9 @@
 
 ## 1. What it is
 - `unaos/arroyo` is the one build/test entry point (a bash script; verbs at its `case` near the file tail).
-- `./arroyo check` type-checks both arches (every kernel cfg leg) and runs GATE-LEDGER (`unaos/arroyo:8814`, `unaos/arroyo:9440-9477`).
-- `./arroyo gates` runs every host gate in `GATES_SET` (no cargo, ~30 s), one `gate=<name> rc=<n>` line each, then `GATES: <n> run <n> green -> PASS|FAIL`; exit = the worst rc (`unaos/arroyo:14335-14353`).
-- Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU), `knoboff <feature>` (knob-off byte identity, `unaos/arroyo:13848`).
+- `./arroyo check` type-checks both arches (every kernel cfg leg) and runs GATE-LEDGER (`unaos/arroyo:8854`, `unaos/arroyo:9480-9517`).
+- `./arroyo gates` runs every host gate in `GATES_SET` (no cargo, ~30 s), one `gate=<name> rc=<n>` line each, then `GATES: <n> run <n> green -> PASS|FAIL`; exit = the worst rc (`unaos/arroyo:14383-14401`).
+- Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU), `knoboff <feature>` (knob-off byte identity, `unaos/arroyo:13888`).
 - Records: ledgers (`docs/dev/LEDGER.md`, `docs/dev/OS/rmbp-ledger.md` and its pi/orin siblings), queues (`docs/dev/QUEUE.md`, `docs/dev/OS/rmbp-queue.md` …), status rows (`docs/dev/STATUS.tsv`), evidence (`docs/dev/evidence/`).
 
 ## 2. Invariants
@@ -25,7 +25,7 @@
 | BP-gates-13 | No fn reachable from the `video/` furniture (menubar, dock, crystal, notify, strip, settings, login) calls `smolnet`, `net_fetch`, `net_dns` or `netring3`, save a local read-only accessor on the gate's ALLOW table with its reason (BP-bar-10). | `unaos/scripts/nonet-check.py:29-34` | `gates` row `nonet` (a call walk over `use` aliases and paths; control: a synthetic dock -> helper -> `smolnet` chain) |
 | BP-gates-14 | No fn anywhere under `video/` REACHES an outbound act — a socket opened, an active connect, the stack's outbound ledger (BP-net-11), a DNS query built, `http_core`/`tls_core` — through path calls into any module, net modules included (a read-only accessor is reached freely; the act is the sink, not the module name); a user verb's entry would sit on the gate's BOUNDARY table with its reason (none today) (BP-bar-10). | `unaos/scripts/nonet-reach.py:1-30` | `gates` row `nonetreach` (`NONET-REACH: roots= edges= reach=0 -> PASS`; control: a synthetic dock -> helper -> socket-open tree and a DNS alias, judged exactly; plant: a video fn -> a helper outside `video/` -> `smolnet::stack_open_tcp`) |
 
-## 3. The host gates (`GATES_SET`, `unaos/arroyo:14279`)
+## 3. The host gates (`GATES_SET`, `unaos/arroyo:14319`)
 | row | script | holds |
 |---|---|---|
 | charter | `unaos/scripts/charter-check.sh` | CHARTER lines, no dotfile prefs (BP-shape-8) |

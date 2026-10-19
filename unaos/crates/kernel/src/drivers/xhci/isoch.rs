@@ -228,7 +228,7 @@ static OPIPE_DCI: AtomicU8 = AtomicU8::new(0);
 static ST_O_TDS: AtomicU32 = AtomicU32::new(0);
 static ST_O_MISSED: AtomicU32 = AtomicU32::new(0);
 static ST_O_UNDERRUN: AtomicU32 = AtomicU32::new(0);
-static ST_O_EVENTS: AtomicU64 = AtomicU64::new(0);
+static ST_O_EVENTS: AtomicU64 = AtomicU64::new(0); static ST_O_DUP: AtomicU32 = AtomicU32::new(0);
 
 /// UAC1: the OUT pipe's counters (TDs retired, retired-not-sent, controller ring underruns, events).
 pub fn out_stats() -> (u32, u32, u32, u64) {
@@ -477,8 +477,8 @@ fn claim_out(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
     let n_ev = ST_O_EVENTS.fetch_add(1, Ordering::Relaxed);
     let mut g = OPIPE.lock();
     let Some(p) = g.as_mut() else { return true };
-    if cc == 14 || cc == 15 {
-        ST_O_UNDERRUN.fetch_add(1, Ordering::Relaxed); // §4.10.3.1: the controller found no TD in time
+    if cc == 14 {
+        ST_O_UNDERRUN.fetch_add(1, Ordering::Relaxed); // §4.10.3.1: the controller found no TD in time (CRAWLC: cc 14 Ring Underrun only — 15, Ring Overrun, is an IN pipe's)
     }
     if (n_ev as u32) < FIRST_WITNESSED {
         serial_println!(
@@ -490,7 +490,7 @@ fn claim_out(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
         if i < p.nslots {
             let dist = (i + p.nslots - p.deq) % p.nslots;
             if dist >= p.outstanding {
-                ST_DUP.fetch_add(1, Ordering::Relaxed);
+                ST_O_DUP.fetch_add(1, Ordering::Relaxed); // CRAWLC: the OUT pipe's own count, not the IN pipe's `dup=`
                 return true;
             }
             for k in 0..=dist {
@@ -886,7 +886,7 @@ impl XhciController {
             return;
         }
         let slot = pop_candidate();
-        let (slot, audio) = if slot != 0 { (slot, false) } else { (pop_audio(), true) }; // UAC1 (B706): a camera first, else an audio device
+        let (slot, audio) = if slot != 0 { (slot, false) } else if crate::boot::services_up() { (pop_audio(), true) } else { (0, true) }; // CRAWLC: an audio stream is a service — it waits in its queue for the services gate, as HDA does (BP-boot-3). UAC1 (B706): a camera first, else an audio device
         if slot == 0 {
             return;
         }

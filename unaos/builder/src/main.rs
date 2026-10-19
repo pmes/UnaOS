@@ -120,7 +120,6 @@ const KFONT_DIRS: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu",
     "/usr/share/fonts/truetype/noto",
     "/usr/share/fonts/opentype/noto",
-    "/usr/share/fonts/opentype/noto",
     "/usr/share/fonts/dejavu-sans-fonts",
     "/usr/share/fonts/dejavu-sans-mono-fonts",
     "/usr/share/fonts/dejavu-serif-fonts",

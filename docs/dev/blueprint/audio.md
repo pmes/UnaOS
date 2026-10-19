@@ -4,7 +4,7 @@
 - ONE seam: `unaos/crates/kernel/src/audio/mod.rs` (cfg `uvc` or `hda-tone`). `audio::sink(name)` chooses where sound goes, `audio::tone_on(sink, hz, ms)` plays to it; the choice is Principia's `system.audio.output` (`hda` | `usb`).
 - HDA (x86, `hda` + `hda-tone`): the Intel HDA controller walk and the output stream (`unaos/crates/kernel/src/drivers/hda.rs`, `hda_stream.rs`, `hda_play.rs`, `hda_amp.rs`); the tone is a test (R77), `tests hda`.
 - USB Audio Class 1 playback (cfg `uvc`): `unaos/crates/kernel/src/drivers/usb/uac.rs` over the host-neutral `uvc::IsoHost`, carried by xHCI isochronous OUT in `unaos/crates/kernel/src/drivers/xhci/isoch.rs` (the XHCIISO engine, B534, now both directions).
-- Settings > General, the Sound box's Mute row: the output picker `HDA internal | USB <vid:pid>` (`unaos/crates/kernel/src/video/settings.rs:952` paint, `:1718` press).
+- Settings > General, the Sound box's Mute row: the output picker `HDA internal | USB <vid:pid>` (`unaos/crates/kernel/src/video/settings.rs:984` paint, `:1753` press).
 - The decoders (WAV/FLAC/Ogg/MP3/AAC) are `audio_core` (shared, no_std); the Player and Stria feed the HDA stream (`drivers/hda_play.rs`).
 
 ## 2. Invariants
@@ -21,7 +21,7 @@
 
 ## 3. Seams
 - `audio` may call: `drivers::hda` (one call), `drivers::usb::uac` (begin/write/finish/queued/counters), `prefs` (the one key).
-- `uac` may call: `uvc::IsoHost` (its host), `audio::usb_arrived` / `usb_gone`. `isoch` calls `uac::pull` / `out_td_len` / `cfg_has_audio` / `probe`.
+- `uac` may call: `uvc::IsoHost` (its host), `audio::usb_arrived` / `usb_gone`. `isoch` calls `uac::pull` / `out_td_len` / `cfg_has_audio` / `probe` / `cfg_has_hid` / `disconnect`.
 - Settings calls `audio::picker` and `audio::sink` only.
 
 ## 4. Wire
