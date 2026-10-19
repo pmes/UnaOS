@@ -641,3 +641,4 @@ refs/heads/exec-rmbp-lockprefs      3bbd2569 IN-FLIGHT cloud wave36 LOCKPREFS
 refs/heads/exec-rmbp-rootincompat   3bbd2569 IN-FLIGHT cloud wave36 ROOTINCOMPAT
 refs/heads/exec-rmbp-qvbar          3bbd2569 IN-FLIGHT cloud wave36 QVBAR
 refs/heads/exec-rmbp-softymic       3bbd2569 IN-FLIGHT cloud wave36 SOFTYMIC
+refs/heads/exec-rmbp-a2dpknob       1fbef588 IN-FLIGHT cloud wave36 A2DPKNOB
