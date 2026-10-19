@@ -599,7 +599,7 @@ refs/heads/exec-rmbp-mtpphone     50b81ddc FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-undomove     70b7e441 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-keychars      b71c7fa8 IN-FLIGHT cloud wave36 KEYCHARS
 refs/heads/exec-rmbp-clockpainters b71c7fa8 IN-FLIGHT cloud wave36 CLOCKPAINTERS
-refs/heads/exec-rmbp-kelfstage     b71c7fa8 IN-FLIGHT cloud wave36 KELFSTAGE
+refs/heads/exec-rmbp-kelfstage     7d549210 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-softydots     b71c7fa8 IN-FLIGHT cloud wave36 SOFTYDOTS
 refs/heads/exec-rmbp-raiseverb     b71c7fa8 IN-FLIGHT cloud wave36 RAISEVERB
 refs/heads/exec-rmbp-net6grant     b71c7fa8 IN-FLIGHT cloud wave36 NET6GRANT
@@ -614,3 +614,4 @@ refs/heads/exec-rmbp-helpsearch    b71c7fa8 IN-FLIGHT cloud wave36 HELPSEARCH
 refs/heads/exec-rmbp-fontkit       35f53609 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-audiomix      b71c7fa8 IN-FLIGHT cloud wave36 AUDIOMIX
 refs/heads/exec-rmbp-quarryversions 95240ae0 IN-FLIGHT cloud wave36 QUARRYVERSIONS (B732)
+refs/heads/exec-rmbp-stagewindow  658415ad IN-FLIGHT cloud wave36 STAGEWINDOW (B733)
