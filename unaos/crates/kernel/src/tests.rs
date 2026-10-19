@@ -2948,7 +2948,7 @@ fn hwreport_selftest() {
     let driven = c.driven();
     let on = |b: &[&str]| c.rows.iter().filter(|r| b.contains(&r.bus)).count();
     let shaped = c.rows.iter().all(|r| !r.bus.is_empty() && !r.id.is_empty() && !r.driver.is_empty() && !r.state.is_empty() && !r.name.is_empty());
-    let reg = c.reg;
+    let reg = c.reg; let (tab_ok, tab_kv, tab_tail) = hwtab_leg(n); // HWTAB (B737): the Hardware tab paints the census's rows (file tail). LINE-NEUTRAL fold, code before the comment.
     let why = if c.busy {
         Some("registry-held")
     } else if !shaped {
@@ -2967,7 +2967,7 @@ fn hwreport_selftest() {
         None
     };
     match why {
-        None => serial_println!(":: HWREPORT: devices={} driven={} none={} rows_ok=1 -> PASS ::", n, driven, n - driven),
+        None if tab_ok => serial_println!(":: HWREPORT: devices={} driven={} none={} rows_ok=1 {} -> PASS :: {}", n, driven, n - driven, tab_kv, tab_tail), None => serial_println!(":: HWREPORT: devices={} driven={} none={} rows_ok=1 {} -> FAIL why=tab :: {}", n, driven, n - driven, tab_kv, tab_tail), // HWTAB (B737). LINE-NEUTRAL fold
         Some(w) => serial_println!(
             ":: HWREPORT: devices={} driven={} none={} rows_ok=0 pci={}/{} usb={}/{} block={}/{} -> FAIL why={} ::",
             n, driven, n - driven, on(&["pci"]), reg.pci, on(&["usb"]), reg.usb, on(&["sata", "sd"]), reg.block, w
@@ -3175,4 +3175,21 @@ fn lock2_unlocked(l: (crate::video::wm::WinId, bool)) -> (bool, Option<u64>) {
     let _ = wm::close_owner(LOCK2_OWNER);
     serial_println!("[lock] fixture row={} suppressed_while_locked={} clean_ms={} presents_again={}", id, suppressed as u8, hole.map_or(-1i64, |m| m as i64), again as u8);
     (suppressed && hole.is_some() && again, hole)
+}
+
+// HWTAB (rmbp-ledger B737, BP-video-32, BP-bar-25) — TAIL-APPENDED, so no line above moves. `tests hwreport`'s tab
+// leg: the Settings Hardware tab (`settings::HW_TAB`) painted offscreen page by page paints one inked line per census
+// row (`rows_painted` == the rows `hw::last` holds == the fixture's census), and a press on a line resolves back to
+// that row with its note (`No driver yet — tell us: <bus> <id>` for a `none` driver). A build without the Settings
+// window (no desktop family) has no tab: the leg reads `tab=- rows_painted=-` and does not fail the census line.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn hwtab_leg(n: usize) -> (bool, alloc::string::String, alloc::string::String) {
+    let (tab, listed, painted, press, note) = crate::video::settings::hwtab_probe();
+    let ok = tab == crate::video::settings::HW_TAB && listed == n && painted == listed && press;
+    (ok, format!("tab={} rows_painted={}", tab, painted), format!("listed={} press={} note=\"{}\"", listed, if press { "ok" } else { "bad" }, note))
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn hwtab_leg(_n: usize) -> (bool, alloc::string::String, alloc::string::String) {
+    (true, alloc::string::String::from("tab=- rows_painted=-"), alloc::string::String::from("press=- (no Settings window in this build)"))
 }
