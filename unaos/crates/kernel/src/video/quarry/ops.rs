@@ -1147,14 +1147,9 @@ fn ver_read(np: &str, n: usize) -> Option<Vec<u8>> {
 }
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn ver_restore(np: &str, n: usize) -> Result<(), &'static str> {
-    // QVBAR: `fs::unafs::restore_version`'s body (the restore, the discard of a failed one inside the hold, crawl B
-    // 10) with the crate's error kept, so the face can say WHY (`restore_refusal`).
-    use crate::fs::unafs::{request_mount_discard, restore_version_on, with_unafs};
-    match with_unafs(|fs| restore_version_on(fs, np, n).map_err(|e| { request_mount_discard(); e })) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(restore_refusal(&e).unwrap_or(REFUSED_OTHER)),
-        Err(_) => Err("no volume is mounted"),
-    }
+    // RESTORERESULT (SR161): the ONE restore path (`fs::unafs::restore_version`: the restore, the discard of a failed
+    // one inside the hold, crawl B 10) returns the crate's error; `restore_refusal` is the one place it becomes text.
+    crate::fs::unafs::restore_version(np, n).map_err(|e| restore_refusal(&e).unwrap_or(REFUSED_OTHER))
 }
 #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
 fn ver_list(_: &str) -> Option<Vec<(u64, u64, u64)>> {

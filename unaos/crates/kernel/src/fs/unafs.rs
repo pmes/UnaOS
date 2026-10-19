@@ -3698,9 +3698,16 @@ pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
     with_unafs(|fs| read_version_on(fs, path, n).ok()).ok().flatten()
 }
 
-/// FILEVERSIONS (B714): [`restore_version_on`] on THE mount (`true` once committed).
-pub fn restore_version(path: &str, n: usize) -> bool {
-    matches!(with_unafs(|fs| restore_version_on(fs, path, n).map_err(|_| request_mount_discard()).is_ok()), Ok(true)) // crawl B 10: a failed restore's in-RAM references are discarded inside the hold, as `diskfull::write_root` does
+/// FILEVERSIONS (B714): [`restore_version_on`] on THE mount (`Ok` once committed). RESTORERESULT (SR161): the ONE
+/// restore path, and it keeps the reason — the crate's refusal comes back whole (`ReadOnly`, `CorruptVolume`, ...)
+/// for the caller's classifier (Quarry's `ops::restore_refusal`); a mount that never ran the restore (no volume, the
+/// device `Busy` past the restart budget) is a `Storage(Io("mount: <MountError>"))`, never an `Ok`.
+pub fn restore_version(path: &str, n: usize) -> Result<(), FileSystemError> {
+    match with_unafs(|fs| restore_version_on(fs, path, n).map_err(|e| { request_mount_discard(); e })) { // crawl B 10: a failed restore's in-RAM references are discarded inside the hold, as `diskfull::write_root` does
+        Ok(r) => r,
+        Err(MountError::Fs(e)) => Err(e),
+        Err(m) => Err(FileSystemError::Storage(::unafs::storage::Error::Io(format!("mount: {:?}", m)))),
+    }
 }
 
 /// KEYBOOT (crawl B 2, TAIL-APPENDED): `users::keyboot_key_root`'s hand-off — the first administrator just keyed THE

@@ -649,7 +649,7 @@ refs/heads/exec-rmbp-dndtrash       9b171dff FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-quarrylaunch   253f0c2c IN-FLIGHT cloud wave36 QUARRYLAUNCH
 refs/heads/exec-rmbp-prefsdeleted   253f0c2c IN-FLIGHT cloud wave36 PREFSDELETED
 refs/heads/exec-rmbp-helpverbdoc    253f0c2c IN-FLIGHT cloud wave36 HELPVERBDOC
-refs/heads/exec-rmbp-restoreresult  5582f4a8 IN-FLIGHT cloud wave36 RESTORERESULT
+refs/heads/exec-rmbp-restoreresult  ba143e98 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-orinsupchar    5582f4a8 IN-FLIGHT cloud wave36 ORINSUPCHAR
 refs/heads/exec-rmbp-undodocs       677f3802 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-lockchanged    5582f4a8 IN-FLIGHT cloud wave36 LOCKCHANGED
