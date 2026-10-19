@@ -180,6 +180,11 @@ pub static SCHEMA: &[Key] = &[
         doc: "Minimise non-essential motion: the glass's slides (the Settings pill, toggle knobs, segmented thumbs) become one-frame cuts (DESIGN-LANGUAGE §2.6, A11YPANE B655), and the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119).",
     },
     Key {
+        ns: "system", key: "accessibility.show_performance", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel compositor (`video/perfhud.rs`: the overlay pass in `wm::composite_pass_half`), Settings > Accessibility (`settings::a11y_load`); Win+F12 toggles it and the Settings service pass writes it back",
+        doc: "The performance overlay in the top-right of the desktop: frame time p50/p99, missed vblanks per minute, input-to-photon p99, heap used/limit, windows, processes, the render and service cores' load and the last OVER boot step, refreshed twice a second (PERFHUD, B710).",
+    },
+    Key {
         ns: "system", key: "accessibility.text_size", kind: Kind::Enum(&["default", "large", "larger", "largest"]), default: Default::Str("default"),
         writers: &[Writer::Settings, Writer::Program], reader: "Settings > Accessibility (`settings::a11y_load`), applied by writing `system.display.font_size` (13 / 16 / 20 / 26 CSS px), which `video::text` sizes its faces from (CSS px x the panel's ppi / 96)",
         doc: "Larger UI text in four steps: `default` (13 px, the body size), `large` (x1.25), `larger` (x1.5), `largest` (x2, the HIG's 200 %). A step is applied on change by writing `display.font_size`; the store carries both (A11YPANE, B655).",

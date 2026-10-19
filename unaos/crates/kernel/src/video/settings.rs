@@ -3108,7 +3108,7 @@ fn a11y_load(via: &str) {
     let rm = flag(key::A11Y_REDUCE_MOTION).unwrap_or(draw::motion::REDUCE_MOTION);
     let ic = flag(key::A11Y_INCREASE_CONTRAST).unwrap_or(false);
     let cq = sys_get(key::A11Y_CURSOR_SIZE).and_then(|v| v.as_float()).map_or(A11Y_CURSOR_MIN_Q, a11y_cursor_q_of);
-    let ts = text(key::A11Y_TEXT_SIZE).and_then(|s| A11Y_TEXT_NAMES.iter().position(|n| *n == s)).unwrap_or(0) as u8;
+    let ts = text(key::A11Y_TEXT_SIZE).and_then(|s| A11Y_TEXT_NAMES.iter().position(|n| *n == s)).unwrap_or(0) as u8; let _ = super::perfhud::latch(flag(key::A11Y_SHOW_PERF).unwrap_or(false), via); // PERFHUD (B710): the overlay's toggle follows the store (no write-back). LINE-NEUTRAL append, code first
     let (rm0, ic0, cq0, ts0) = (A11Y_REDUCE.swap(rm, Ordering::Relaxed), A11Y_CONTRAST.swap(ic, Ordering::Relaxed), A11Y_CURSOR_Q.swap(cq, Ordering::Relaxed), A11Y_TEXT.swap(ts, Ordering::Relaxed));
     let moved = (rm0 != rm) as u8 + (ic0 != ic) as u8 + (cq0 != cq) as u8 + (ts0 != ts) as u8;
     if via != "login" && ts0 != ts { A11Y_PERSIST.fetch_or(1 << 3, Ordering::AcqRel); }
@@ -3125,6 +3125,7 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); let _ = super::theme::set_contrast(val != 0); /* CONTRAST (B664): the theme takes the set and bumps its epoch, so chrome, menus and the generated wallpaper redraw as an accent change does. ⚠ LINE-NEUTRAL append. */ ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
         2 => { let q = (val.min(255) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q); A11Y_CURSOR_Q.store(q, Ordering::Relaxed); ("cursor_size", alloc::format!("x{}", a11y_cursor_str(q)), super::cursor::armed()) }
         3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
+        4 => { let _ = super::perfhud::set_visible(val != 0, "settings"); ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
         _ => return,
     };
     if store {
@@ -3141,7 +3142,7 @@ fn a11y_service() {
         a11y_load("prefchanged");
         if is_open() && cur_tab() == A11Y_TAB { repaint(); }
     }
-    let owed = A11Y_PERSIST.swap(0, Ordering::AcqRel);
+    let owed = A11Y_PERSIST.swap(0, Ordering::AcqRel) | if super::perfhud::take_owed() { 1 << 4 } else { 0 }; // PERFHUD (B710): the chord's toggle is written back here too
     if owed == 0 { return; }
     use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys;
     if owed & 1 != 0 { set_sys(key::A11Y_REDUCE_MOTION, P::Bool(A11Y_REDUCE.load(Ordering::Relaxed))); }
@@ -3152,10 +3153,11 @@ fn a11y_service() {
         set_sys(key::A11Y_TEXT_SIZE, P::Str(String::from(A11Y_TEXT_NAMES[s])));
         set_sys(key::FONT_SIZE, P::Int(A11Y_TEXT_PX[s]));
     }
+    if owed & 16 != 0 { set_sys(key::A11Y_SHOW_PERF, P::Bool(super::perfhud::visible())); }
 }
 
 fn paint_a11y(st: &mut State) {
-    groups(st, &[(0, 1), (2, 3)]);
+    groups(st, &[(0, 1), (2, 3), (4, 4)]);
     let (rm, ic, q) = (reduce_motion(), increase_contrast(), A11Y_CURSOR_Q.load(Ordering::Relaxed));
     txt(st, LABEL_X, 0, "Reduce motion");
     tog(st, 0, TOG_X, rm, false); // SETTINGSCRAFT: the kit's switch, right-aligned (a press anywhere on the row flips it)
@@ -3171,8 +3173,12 @@ fn paint_a11y(st: &mut State) {
     let step = a11y_text_step_of(px).unwrap_or(A11Y_TEXT.load(Ordering::Relaxed) as usize).min(A11Y_TEXT_NAMES.len() - 1);
     seg(st, 3, &[b"Default", b"Large", b"Larger", b"Largest"], step, false);
     txt2(st, VAL_X, 3, &alloc::format!("{} px", px));
-    txt2(st, LABEL_X, 4, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
-    txt2(st, LABEL_X, 5, "Text size sets the UI font size the faces follow; contrast raises the secondary ink and the lines.");
+    let hud = super::perfhud::visible(); // PERFHUD (B710): the overlay's switch
+    txt(st, LABEL_X, 4, "Show performance");
+    tog(st, 4, TOG_X, hud, false);
+    txt2(st, TRACK_X, 4, if hud { "Frame times, latency and memory, top right" } else { "Off (Win+F12 toggles it)" });
+    txt2(st, LABEL_X, 5, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
+    txt2(st, LABEL_X, 6, "Text size sets the UI font size the faces follow; contrast raises the secondary ink and the lines.");
 }
 
 /// A press on the Accessibility tab: a toggle row flips, the cursor slider captures (a drag), a text segment sets.
@@ -3182,6 +3188,7 @@ fn press_a11y(row: usize, cx: usize) {
         1 => a11y_set(1, (!increase_contrast()) as usize, true),
         2 => { if cx + 6 >= TRACK_X && cx <= TRACK_X + TRACK_W + 6 { drag_begin(A11Y_CURSOR_CTRL, cx); } }
         3 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(3, ((cx - TRACK_X) / (TRACK_W / A11Y_TEXT_NAMES.len())).min(A11Y_TEXT_NAMES.len() - 1), true); } }
+        4 => a11y_set(4, (!super::perfhud::visible()) as usize, true), // PERFHUD (B710)
         _ => {}
     }
 }
@@ -3355,7 +3362,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 32] = {
+pub const MAP: [MapRow; 33] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3396,6 +3403,7 @@ pub const MAP: [MapRow; 32] = {
         mr(&[A11Y_INCREASE_CONTRAST], A11Y_TAB, 1, "Increase contrast", NO_CTRL),
         mr(&[A11Y_CURSOR_SIZE], A11Y_TAB, 2, "Cursor size", NO_CTRL),
         mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
+        mr(&[A11Y_SHOW_PERF], A11Y_TAB, 4, "Show performance", NO_CTRL), // PERFHUD (B710)
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
         mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
         // The tab column
