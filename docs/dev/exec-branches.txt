@@ -611,5 +611,6 @@ refs/heads/exec-rmbp-mtpwrite      b71c7fa8 IN-FLIGHT cloud wave36 MTPWRITE
 refs/heads/exec-rmbp-lock2         b71c7fa8 IN-FLIGHT cloud wave36 LOCK2
 refs/heads/exec-rmbp-diskreserve   b71c7fa8 IN-FLIGHT cloud wave36 DISKRESERVE
 refs/heads/exec-rmbp-helpsearch    b71c7fa8 IN-FLIGHT cloud wave36 HELPSEARCH
-refs/heads/exec-rmbp-fontkit       b71c7fa8 IN-FLIGHT cloud wave36 FONTKIT
+refs/heads/exec-rmbp-fontkit       35f53609 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-audiomix      b71c7fa8 IN-FLIGHT cloud wave36 AUDIOMIX
+refs/heads/exec-rmbp-quarryversions 95240ae0 IN-FLIGHT cloud wave36 QUARRYVERSIONS (B732)
