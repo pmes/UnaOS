@@ -4660,7 +4660,7 @@ fn a11y_filter_moved() {
 // whose free space holds the home's `.geode` archive, measured), `Restore from…` (it lists the `*.geode` files at the
 // sticks' roots; a pick unpacks into `<home>/Restored <stem>`, a taken name refused), and the note row (`Backing up:
 // 12 of 340 files`, then the outcome). The press only latches; the settings service pass submits the job to the
-// `geode` worker task (`fs::unafs::geodew::job`), never running it on the render task; the painter reads the job's
+// `geode` worker task (`fs::geodew::job`), never running it on the render task; the painter reads the job's
 // atomics and its model by `try_lock`. Versions are not carried (v1): the note says so after a backup.
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))]
 pub(crate) mod backup {

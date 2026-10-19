@@ -644,7 +644,7 @@ refs/heads/exec-rmbp-softymic       4e9c92be FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-a2dpknob       27716037 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-oneinstance2   771334b4 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-a2dpenv        28172aa4 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-geodedep       253f0c2c IN-FLIGHT cloud wave36 GEODEDEP
+refs/heads/exec-rmbp-geodedep       82481d69 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-dndtrash       9b171dff FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-quarrylaunch   253f0c2c IN-FLIGHT cloud wave36 QUARRYLAUNCH
 refs/heads/exec-rmbp-prefsdeleted   253f0c2c IN-FLIGHT cloud wave36 PREFSDELETED
@@ -652,7 +652,7 @@ refs/heads/exec-rmbp-helpverbdoc    253f0c2c IN-FLIGHT cloud wave36 HELPVERBDOC
 refs/heads/exec-rmbp-restoreresult  ba143e98 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-orinsupchar    5582f4a8 IN-FLIGHT cloud wave36 ORINSUPCHAR
 refs/heads/exec-rmbp-undodocs       677f3802 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-lockchanged    5582f4a8 IN-FLIGHT cloud wave36 LOCKCHANGED
+refs/heads/exec-rmbp-lockchanged    c68b67f0 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-hwtab2         5582f4a8 IN-FLIGHT cloud wave36 HWTAB2
 refs/heads/exec-rmbp-fsearchicons   5582f4a8 IN-FLIGHT cloud wave36 FSEARCHICONS
 refs/heads/exec-rmbp-sbcframe       6f79b4d5 FOLDED-BY-HAND (this commit) 2026-10-19

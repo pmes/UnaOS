@@ -7,7 +7,7 @@ description = "Geode's core: the .geode v1 archive's ONE encoder and decoder (st
 
 # GEODEMOD (LEDGER SR157, BP-storage-28, BP-handlers-4): the midden_core/trash_core shape — `#![no_std]` + `alloc`,
 # `#![forbid(unsafe_code)]`, a member of the ROOT host workspace (handlers/geode links it, the host tests run here).
-# The kernel compiles `src/archive.rs` by path (the KELFSTAGE shape, install/abimage.rs), so the codec is one file.
+# The kernel links this crate as a normal dependency (GEODEDEP SR160: optional under `unafs` on x86, unconditional on aarch64).
 # Its only dependency is the store's own §R1 codec and FNV-1a (`unafs`, no_std): never a second encoder.
 [dependencies]
 unafs = { path = "../unafs", default-features = false }

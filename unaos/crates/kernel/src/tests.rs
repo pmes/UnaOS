@@ -3869,7 +3869,7 @@ fn filesearch_selftest() {
 }
 
 // GEODEBACKUP (rmbp-ledger B740, BP-bar-1/14, BP-storage-28) — TAIL-APPENDED, so no line above moves. `tests geodebackup`:
-// the kernel's `.geode` v1 writer and reader (`fs::unafs::geodew`) round-trip a home, in RAM. Home `a` (40 files in four
+// the kernel's `.geode` v1 writer and reader (`fs::geodew`) round-trip a home, in RAM. Home `a` (40 files in four
 // folders; every file carries attributes — strings, ints, floats every third, a vector every seventh, a spilled 6000-byte
 // blob every fifth — and every entry distinct ctime/mtime/atime) is backed up to a RAM stick; the bytes must equal an
 // independent whole-record encoding in the host crate's `write_archive` order (`fmt`), and their length the walk's
