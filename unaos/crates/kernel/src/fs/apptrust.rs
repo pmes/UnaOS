@@ -718,7 +718,7 @@ fn net_say(app: &str, task: u64, ip: [u8; 4], port: u16, d: u8) {
     }
     *g = Some((task, ip, port, d));
     drop(g);
-    match net_name_of(ip) { Some(nm) => serial_println!("[net] grant app={} dst={}({}.{}.{}.{}:{}) decision={}", app, nm, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]), None => serial_println!("[net] grant app={} dst={}.{}.{}.{}:{} decision={}", app, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]) } // NET6GRANT (SR151): the host the program resolved, from SYS_RESOLVE's reverse cache (in-place edit, line count kept)
+    net_seen_note(app, ip); match net_name_of(ip) { Some(nm) => serial_println!("[net] grant app={} dst={}({}.{}.{}.{}:{}) decision={}", app, nm, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]), None => serial_println!("[net] grant app={} dst={}.{}.{}.{}:{} decision={}", app, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]) } // NET6GRANT (SR151): the host the program resolved, from SYS_RESOLVE's reverse cache (in-place edit, line count kept)
 }
 
 /// The program a ring-3 socket's slot runs, by the launcher's name (module note above); `None` = a kernel fixture blob.
@@ -746,7 +746,7 @@ fn net_app_of(row: usize) -> Option<String> {
 /// `Err(-EPERM)` = refused; `Err(-EINPROGRESS | -EAGAIN)` = asking, nothing queued, ring 3 polls again.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub fn net_gate(row: usize, ip: [u8; 4], port: u16, stream: bool) -> Result<(), i64> {
-    let Some(app) = net_app_of(row) else { return Ok(()) };
+    let Some(app) = net_app_of(row) else { return Ok(()) }; net_path_note(&app); // GRANTNAMES (B742): the program's own path off its args page, for Settings > Privacy's volume (in-place fold, code before this comment)
     let task = crate::arch::sched::current_id().unwrap_or(0);
     net_gate_for(&app, task, row as u64 + 1, ip, port, stream)
 }
@@ -938,3 +938,156 @@ fn net_app_of_asid(asid: u64) -> Option<String> {
 // recorder fixture names `audio::KERNEL_RECORDER` and is not asked. Settings > Privacy lists it with every decision.
 /// The decisions' `<domain>` segment for the microphone (`system.decisions.microphone.*`).
 pub const MIC_DOMAIN: &str = "microphone";
+
+// ── GRANTNAMES (rmbp-ledger B742, BP-security-17, BP-net-12, BP-bar-12) — TAIL-APPENDED: the name on x86, the Privacy row, the revoke ──
+//
+// M1 — x86's `SYS_RESOLVE` body (`netring3::resolve`'s smolnet arm) records each answer through [`net_name_note`], the
+// call aarch64's `sys_resolve` already makes (NET6GRANT M2), so the x86 ask reads `<app> wants to reach <name> (<ip:port>)`
+// and the wire `[net] grant … dst=<name>(<ip:port>)`. Display only: the name never enters the decision key.
+//
+// M2 — Settings > Privacy's net row says WHICH program and WHERE it went: [`net_row`] gives `(<program>, <host> (<ip>))`
+// from this boot's record ([`NET_SEEN`]: per app, the last destination [`net_say`] said and its name, and on x86 the
+// program's own path off its kernel-written args page, [`net_path_note`]). The program reads `<FILE> on <volume>` when that
+// path is not on the system's storage ([`is_foreign`], [`volume_of`]) — resolved on Settings' service pass
+// ([`net_rows_settle`]), never on the IF-masked syscall path — else the app's name. A decision kept from an earlier boot
+// with nothing recorded this boot reads as the app's name alone. Settings > Privacy's Revoke of a `net` decision also drops
+// that app's rows in this run's answers ([`net_revoked`] on `NET_RUN`): the store said Always, the run row said allow,
+// and without the drop the running task would pass unasked after the user revoked it (BP-security-15: revoked = asked).
+
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+/// One program's record this boot (display only, never a decision).
+#[derive(Clone)]
+struct NetSeen {
+    app: String,
+    /// The last destination said for it (`0.0.0.0` = none yet).
+    ip: [u8; 4],
+    /// The name SYS_RESOLVE answered `ip` with, when it did.
+    name: Option<String>,
+    /// argv[0] when it is an absolute path naming this program (x86).
+    path: Option<String>,
+    /// `None` = not resolved yet; `Some(None)` = the system's storage; `Some(Some(v))` = the volume `v`.
+    vol: Option<Option<String>>,
+}
+
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+/// The programs recorded (oldest dropped).
+static NET_SEEN: crate::sync::Mutex<Vec<NetSeen>> = crate::sync::Mutex::new(Vec::new());
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+const NET_SEEN_MAX: usize = 32;
+
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+/// `app`'s row, made when absent (the caller holds the lock).
+fn net_seen_row<'a>(g: &'a mut Vec<NetSeen>, app: &str) -> &'a mut NetSeen {
+    if let Some(i) = g.iter().position(|s| s.app == app) {
+        return &mut g[i];
+    }
+    if g.len() >= NET_SEEN_MAX {
+        g.remove(0);
+    }
+    g.push(NetSeen { app: String::from(app), ip: [0; 4], name: None, path: None, vol: None });
+    let last = g.len() - 1;
+    &mut g[last]
+}
+
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+/// [`net_say`]'s record: `app` was answered for `ip` (try_lock: the syscall path never spins; busy = not recorded).
+fn net_seen_note(app: &str, ip: [u8; 4]) {
+    let name = net_name_of(ip);
+    let Some(mut g) = NET_SEEN.try_lock() else { return };
+    let s = net_seen_row(&mut g, app);
+    s.ip = ip;
+    s.name = name;
+}
+
+/// x86 [`net_gate`]'s record: the caller's argv[0] when it is an absolute path to `app` (the launcher's page, ring-3 RO).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn net_path_note(app: &str) {
+    let Some(mut g) = NET_SEEN.try_lock() else { return };
+    if g.iter().any(|s| s.app == app && s.path.is_some()) {
+        return;
+    }
+    // As `net_app_of`: the caller's CR3 is live and its args page is mapped at `USER_ARGS_VA` for every slot.
+    let va = una_abi::USER_ARGS_VA;
+    let page = unsafe { core::slice::from_raw_parts(va as *const u8, 4096) };
+    let Some(a) = una_abi::Args::parse(page, va) else { return };
+    let Some(w) = a.get(0).and_then(|w| core::str::from_utf8(w).ok()) else { return };
+    if !w.starts_with('/') || !crate::video::wm::program_name(w).eq_ignore_ascii_case(app) {
+        return;
+    }
+    let s = net_seen_row(&mut g, app);
+    s.path = Some(String::from(w));
+    s.vol = None;
+}
+
+/// Settings' service pass: the volume of each program path recorded and not yet placed (the mount table is read here,
+/// never in a syscall). `true` = a row changed (the open Privacy pane repaints).
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+pub fn net_rows_settle() -> bool {
+    let pending: Vec<String> = match NET_SEEN.try_lock() {
+        Some(g) => g.iter().filter(|s| s.vol.is_none()).filter_map(|s| s.path.clone()).collect(),
+        None => return false,
+    };
+    if pending.is_empty() {
+        return false;
+    }
+    let mt = crate::shell::vfs_mount_table();
+    let placed: Vec<(String, Option<String>)> = pending.into_iter().map(|p| { let v = if is_foreign(&mt, &p) { Some(volume_of(&mt, &p)) } else { None }; (p, v) }).collect();
+    let mut g = NET_SEEN.lock();
+    for (p, v) in placed {
+        for s in g.iter_mut().filter(|s| s.vol.is_none() && s.path.as_deref() == Some(p.as_str())) {
+            s.vol = Some(v.clone());
+        }
+    }
+    true
+}
+#[cfg(not(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64"))))]
+pub fn net_rows_settle() -> bool {
+    false
+}
+
+/// Settings > Privacy's net row for the decision's subject `app`: `(<program>, <host> (<ip>) | <ip>)` — the program is
+/// `<FILE> on <volume>` when it ran from a volume that is not the system's, else `app`; the destination is this boot's
+/// last, `None` when nothing was recorded (or the record is busy: the next paint reads it).
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+pub fn net_row(app: &str) -> (String, Option<String>) {
+    let Some(g) = NET_SEEN.try_lock() else { return (String::from(app), None) };
+    let Some(s) = g.iter().find(|s| s.app == app) else { return (String::from(app), None) };
+    let prog = match (&s.path, &s.vol) {
+        (Some(p), Some(Some(v))) => alloc::format!("{} on {}", p.rsplit('/').next().unwrap_or(p), v),
+        _ => String::from(app),
+    };
+    let ip = s.ip;
+    let dst = if ip == [0, 0, 0, 0] {
+        None
+    } else {
+        Some(match &s.name {
+            Some(n) => alloc::format!("{} ({}.{}.{}.{})", n, ip[0], ip[1], ip[2], ip[3]),
+            None => alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+        })
+    };
+    (prog, dst)
+}
+#[cfg(not(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64"))))]
+pub fn net_row(app: &str) -> (String, Option<String>) {
+    (String::from(app), None)
+}
+
+/// Settings > Privacy's Revoke, for the running programs: a revoked `net` decision's key also drops every row this run
+/// holds for that app (`Allow Once` and the run copy of the revoked answer), so the next reach asks. The rows dropped.
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+pub fn net_revoked(key: &str) -> usize {
+    let mut r = NET_RUN.lock();
+    let n = r.len();
+    r.retain(|(_, a, _)| crate::prefs::decision_key(crate::prefs::decide::NET, a) != key);
+    let dropped = n - r.len();
+    drop(r);
+    if dropped > 0 {
+        serial_println!("[netgrant] revoke key={} run_rows={}", key, dropped);
+    }
+    dropped
+}
+#[cfg(not(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64"))))]
+pub fn net_revoked(key: &str) -> usize {
+    let _ = key;
+    0
+}

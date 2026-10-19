@@ -42,7 +42,7 @@ pub fn resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
         }
         let s = core::str::from_utf8(name).map_err(|_| EINVAL)?; let _idl = crate::net_tick::scope(crate::net_tick::Who::Ring3); // IDLENET (B672): ring 3's lookup is Ring3's on the ledger (LINE-NEUTRAL append)
         return match crate::smolnet::resolve(s) {
-            Some(ip) => {
+            Some(ip) => { crate::fs::apptrust::net_name_note(name, ip); // GRANTNAMES (B742): the answer recorded for the ask (ip -> the name asked), aarch64 sys_resolve's call. LINE-NEUTRAL append, code before this comment
                 let mut out = [0u8; RESOLVE_OUT_LEN];
                 out[..4].copy_from_slice(&ip);
                 Ok(out)
