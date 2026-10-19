@@ -262,7 +262,7 @@ fn ensure_ring3win() {
     #[cfg(target_arch = "x86_64")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); register("window", crate::window2::selftest); } // WINDOW2 (B361): `tests window`
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); register("window", crate::window2::selftest); #[cfg(feature = "wc")] register("applaunch", applaunch_selftest); } // WINDOW2 (B361): `tests window`
     }
 }
 
@@ -628,4 +628,88 @@ pub fn defer_polled(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
         register(name, f);
     }
     true
+}
+
+// APPLAUNCH (rmbp-ledger B678, BP-bar-7) — TAIL-APPENDED. `tests applaunch`: the SMALLEST windowed ring-3 ELF under
+// `/apps` (sizes from the listing, smallest first; the first whose `.note.unaos.app` declares WINDOWED), launched N
+// times COLD (a fresh process and slot each time, through the operator's own `bg` launcher), each span read from the
+// slot's `[app] … exec->frame ms=` stamp (`procslot::launch::frame_ms`), then the program killed and reaped before the
+// next. Nearest-rank p50/p99 over the N spans against BP-bar-7's 400 ms. SKIP (never a pin) with no panel or no
+// windowed program staged; a launch that never reaches its first frame within 5 s is a FAIL named by count.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn applaunch_selftest() {
+    const N: usize = 5;
+    const BAR_MS: u64 = 400;
+    const WAIT_MS: u64 = 5_000;
+    if !crate::video::WRITER.lock().is_ready() {
+        serial_println!(":: APPLAUNCH: app=- n={} bar_ms={} -> SKIP reason=no-panel ::", N, BAR_MS);
+        return;
+    }
+    let mt = crate::shell::vfs_mount_table();
+    let dir = crate::shell::vfs_path("/apps");
+    let mut cands: alloc::vec::Vec<(u64, alloc::string::String)> = match mt.read_dir(&dir) {
+        Ok(v) => v
+            .into_iter()
+            .filter(|e| matches!(e.kind, crate::fs::vfs::NodeKind::File) && e.size > 0 && e.size as usize <= crate::arch::syscall::user_image_cap())
+            .filter(|e| e.name.len() > 4 && e.name[e.name.len() - 4..].eq_ignore_ascii_case(".ELF"))
+            .map(|e| (e.size, e.name))
+            .collect(),
+        Err(_) => {
+            serial_println!(":: APPLAUNCH: app=- n={} bar_ms={} -> SKIP reason=no-apps-dir ::", N, BAR_MS);
+            return;
+        }
+    };
+    cands.sort();
+    let mut pick: Option<(alloc::string::String, alloc::vec::Vec<u8>)> = None;
+    for (size, leaf) in cands.iter() {
+        let path = format!("{}/{}", dir.trim_end_matches('/'), leaf);
+        if let Ok(b) = mt.read(&path, 0, *size as usize) {
+            if b.len() as u64 == *size && crate::arch::elf::app_flags(&b) & una_abi::APP_FLAG_WINDOWED != 0 {
+                pick = Some((path, b));
+                break;
+            }
+        }
+    }
+    let Some((path, bytes)) = pick else {
+        serial_println!(":: APPLAUNCH: app=- n={} bar_ms={} -> SKIP reason=no-windowed-elf ::", N, BAR_MS);
+        return;
+    };
+    let name = crate::video::wm::program_name(&path);
+    let mut spans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for run in 0..N {
+        match crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[name]) {
+            Ok((pid, slot, _)) => {
+                let dl = crate::arch::ticks() + WAIT_MS;
+                let mut got = None;
+                while crate::arch::ticks() < dl {
+                    got = crate::procslot::launch::frame_ms(slot as usize);
+                    if got.is_some() {
+                        break;
+                    }
+                    crate::arch::sched::yield_now();
+                }
+                let kill = crate::arch::syscall::bg_kill(pid, slot);
+                let _ = crate::arch::syscall::bg_poll(pid, true);
+                serial_println!("[applaunch] run={} app={} bytes={} pid={} slot={} frame_ms={:?} kill={}", run, name, bytes.len(), pid, slot, got, kill);
+                if let Some(ms) = got {
+                    spans.push(ms);
+                }
+            }
+            Err(why) => serial_println!("[applaunch] run={} app={} refused={}", run, name, why),
+        }
+    }
+    spans.sort();
+    let rank = |q: usize| -> Option<u64> {
+        if spans.is_empty() { None } else { Some(spans[((q * spans.len() + 99) / 100).max(1) - 1]) }
+    };
+    let (p50, p99) = (rank(50), rank(99));
+    let show = |v: Option<u64>| v.map_or(alloc::string::String::from("-"), |x| format!("{}", x));
+    let verdict = if spans.len() != N {
+        format!("FAIL reason=frames-{}/{}", spans.len(), N)
+    } else if p99.unwrap_or(u64::MAX) > BAR_MS {
+        alloc::string::String::from("FAIL reason=over-bar")
+    } else {
+        alloc::string::String::from("PASS")
+    };
+    serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
 }
