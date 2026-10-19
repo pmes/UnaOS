@@ -137,6 +137,60 @@ const _: () = {
     assert!(offset_of!(LoaderStages, last_status) == 112, "ABI-LOCK: LoaderStages field offset moved — see the ABI-LOCK note at the top of this file.");
 };
 
+/// KELFHASH (rmbp-ledger B709): `KelfVerdict::magic` when the loader wrote the verdict ("KELF").
+pub const KELF_VERDICT_MAGIC: u32 = 0x4B45_4C46;
+/// `KelfVerdict::hash`: the slot's bytes are the bytes the build's `KELF.SHA` row names.
+pub const KELF_HASH_OK: u8 = 1;
+/// `KelfVerdict::hash`: no row to compare against (no `KELF.SHA`, no row for the slot, or a row for another
+/// image) — the loader jumped anyway (no lockout, BP-bar-1).
+pub const KELF_HASH_UNVERIFIED: u8 = 0;
+/// `KelfVerdict::slot` letters, indexed by the slot (0 = A = `KERNEL.ELF`, 1 = B = `KERNEL.NEW`).
+pub const KELF_SLOT_NAMES: [&str; 2] = ["A", "B"];
+/// `KelfVerdict::why` words, indexed by the code (`crates/bootloader/src/kelfsha.rs` `Check::why_code`).
+pub const KELF_WHY_NAMES: [&str; 5] = ["ok", "no-record", "no-row", "stale", "mismatch"];
+
+/// KELFHASH (rmbp-ledger B709): the loader's verdict on the kernel it jumped to. The x86 UEFI loader sha256s the
+/// bytes it read and compares them with the builder's `KELF.SHA` row for that slot BEFORE the jump
+/// (`crates/bootloader/src/kelfsha.rs`); a mismatch falls to the other slot, both bad halts the loader. The kernel
+/// prints `[boot] kelf slot=<A|B> hash=<ok|unverified> sha=<8 hex>` and `tests kelfhash` reads it back.
+/// `magic != KELF_VERDICT_MAGIC` is the absent sentinel (a `bootloader.efi` older than KELFHASH).
+///
+/// ABI-LOCK: carried by value inside `BootInfo`; its layout is pinned below.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct KelfVerdict {
+    /// `KELF_VERDICT_MAGIC` when written; anything else = absent.
+    pub magic: u32,
+    /// The slot jumped to: 0 = A (`KERNEL.ELF`), 1 = B (`KERNEL.NEW`).
+    pub slot: u8,
+    /// `KELF_HASH_OK` or `KELF_HASH_UNVERIFIED`.
+    pub hash: u8,
+    /// Index into `KELF_WHY_NAMES` for the slot jumped to.
+    pub why: u8,
+    /// Slots whose bytes did NOT match their row: bit 0 = A, bit 1 = B (a fallback leaves the first bit set).
+    pub bad: u8,
+    /// sha256 of the bytes jumped to.
+    pub sha: [u8; 32],
+}
+
+impl KelfVerdict {
+    /// The absent verdict (magic 0).
+    pub const EMPTY: KelfVerdict = KelfVerdict { magic: 0, slot: 0, hash: 0, why: 0, bad: 0, sha: [0; 32] };
+    /// Whether a loader wrote this verdict.
+    pub fn present(&self) -> bool {
+        self.magic == KELF_VERDICT_MAGIC && self.slot <= 1 && self.hash <= 1 && (self.why as usize) < KELF_WHY_NAMES.len()
+    }
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(core::mem::size_of::<KelfVerdict>() == 40, "ABI-LOCK: KelfVerdict size changed — it sits by value inside BootInfo. See the ABI-LOCK note at the top of this file.");
+    assert!(core::mem::align_of::<KelfVerdict>() == 4, "ABI-LOCK: KelfVerdict alignment changed — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(KelfVerdict, slot) == 4, "ABI-LOCK: KelfVerdict field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(KelfVerdict, bad) == 7, "ABI-LOCK: KelfVerdict field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(KelfVerdict, sha) == 8, "ABI-LOCK: KelfVerdict field offset moved — see the ABI-LOCK note at the top of this file.");
+};
+
 /// The information passed from the UEFI bootloader to the Kernel.
 ///
 /// ABI-LOCK: `#[repr(C)]`, layout pinned by the `const` assertions at the bottom of this file.
@@ -262,6 +316,10 @@ pub struct BootInfo {
     /// `magic != LOADER_STAGES_MAGIC` is the absent sentinel (a pre-LOADERSTALL `bootloader.efi`).
     #[cfg(target_arch = "x86_64")]
     pub loader_stages: LoaderStages,
+    /// KELFHASH (rmbp-ledger B709): the loader's hash verdict on the kernel it jumped to (see [`KelfVerdict`]).
+    /// x86_64 only, for the BOOTCLOCK reason above; appended after `loader_stages`, so every older offset holds.
+    #[cfg(target_arch = "x86_64")]
+    pub kelf: KelfVerdict,
 
     #[cfg(feature = "unaos_ivb")]
     pub igpu_trace_0: [u32; 11],
@@ -343,6 +401,7 @@ const _: () = {
     assert!(offset_of!(BootInfo, tsc_loader_read) == 264, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
     assert!(offset_of!(BootInfo, tsc_loader_jump) == 272, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
     assert!(offset_of!(BootInfo, loader_stages) == 280, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
+    assert!(offset_of!(BootInfo, kelf) == 424, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
 };
 
 /// The size of the common prefix — everything above the `unaos_ivb` fields, and also
@@ -354,7 +413,7 @@ const _: () = {
 /// `unaos_ivb` tail's first assertion is written against, so keeping it honest per arch is what
 /// keeps THAT check meaningful rather than merely true.
 #[cfg(target_arch = "x86_64")]
-pub const BOOT_INFO_COMMON_LEN: usize = 424; // LOADERSTALL (B490): 280 + the 144-byte LoaderStages record
+pub const BOOT_INFO_COMMON_LEN: usize = 464; // LOADERSTALL (B490): 280 + the 144-byte LoaderStages record. KELFHASH (B709): + the 40-byte KelfVerdict
 #[cfg(not(target_arch = "x86_64"))]
 pub const BOOT_INFO_COMMON_LEN: usize = 256;
 
@@ -385,14 +444,14 @@ const _: () = {
     // one-sided `unaos_ivb` arm non-catastrophic. If it ever fails, the two feature legs have
     // diverged in their shared region and the loader and kernel no longer see the same fields.
     assert!(offset_of!(BootInfo, igpu_trace_0) == BOOT_INFO_COMMON_LEN, "ABI-LOCK: the unaos_ivb tail no longer starts at the end of the common prefix — the two feature legs have diverged. See the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_0) == 424, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_1) == 468, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_2) == 512, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, gmux_trace_0) == 556, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_valid) == 584, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, kdisp_trace_0) == 588, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, kdisp_trace_valid) == 616, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(core::mem::size_of::<BootInfo>() == 624, "ABI-LOCK: BootInfo size changed on an unaos_ivb build — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_0) == 464, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_1) == 508, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_2) == 552, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, gmux_trace_0) == 596, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_valid) == 624, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_0) == 628, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_valid) == 656, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(core::mem::size_of::<BootInfo>() == 664, "ABI-LOCK: BootInfo size changed on an unaos_ivb build — see the ABI-LOCK note at the top of this file.");
 };
 
 #[cfg(all(feature = "unaos_ivb", not(target_arch = "x86_64")))]

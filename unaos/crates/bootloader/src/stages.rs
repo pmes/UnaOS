@@ -262,6 +262,13 @@ fn say(row: u32, text: &str) {
     uart_line(text);
 }
 
+/// KELFHASH (B709): the loader's last word before it halts — the watchdog closed first (no TIMEOUT line paints over
+/// it), then `text` on the panel's TIMEOUT row and the UART.
+pub fn fatal(text: &str) {
+    disarm();
+    say(TIMEOUT_ROW, text);
+}
+
 // ---- the stages -------------------------------------------------------------------------------
 
 /// Closes the watchdog on every return to the firmware (its notify function lives in this image).
