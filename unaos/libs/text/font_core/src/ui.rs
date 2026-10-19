@@ -25,7 +25,8 @@
 //! FONTSCRAFT (rmbp-ledger B640, R124, DESIGN-LANGUAGE §2.2) adds what the language's raster needs:
 //! * Variable faces instanced per draw ([`Font::set_variation`]): `wght` from [`Style::weight`] (or
 //!   [`Engine::bold_weight`], 600, when `bold` asks a variable slot for a weight it was not loaded at) and `opsz`
-//!   set automatically to the size in pt ([`Engine::set_px_per_pt`]).
+//!   set automatically to the size in pt ([`Engine::set_px_per_pt`]) unless [`Style::opsz`] names one (FVAR, SR150:
+//!   [`Style::with_axes`] is the (wght, opsz) lever; its defaults are the render above).
 //! * OpenType features on request ([`Style::features`]: `tnum`, `zero`, `ss01`, `ss02`, `cv01`, `cv05`, `cv08`,
 //!   `case`), `kern`/`liga`/`calt` always on; tracking ([`Style::tracking`], em).
 //! * Per-role cached ATLASES: the glyph cache is split by (role, bold, weight, size) — one atlas per type role at
@@ -110,12 +111,31 @@ pub struct Style {
     pub features: u8,
     /// Letter spacing in em (DESIGN-LANGUAGE §2.2's tracking column: +0.5 % = 0.005).
     pub tracking: f32,
+    /// FVAR (SR150): `opsz` for a variable face, in pt; 0 = automatic (`size / px_per_pt`, today's render).
+    pub opsz: f32,
 }
 
 impl Style {
     /// A style with no weight override, no extra features and no tracking (KERNELFONT's three fields).
     pub const fn new(role: Role, bold: bool, size: f32) -> Self {
-        Style { role, bold, size, weight: 0, features: 0, tracking: 0.0 }
+        Style { role, bold, size, weight: 0, features: 0, tracking: 0.0, opsz: 0.0 }
+    }
+    /// FVAR (SR150): the variation lever — an optional `wght` (100–900) and an optional `opsz` (pt). `None` keeps the
+    /// default each field already has (`wght` by `bold`, `opsz` from the size), so `with_axes(None, None)` draws
+    /// exactly what [`Style::new`] draws.
+    pub const fn with_axes(mut self, wght: Option<u16>, opsz: Option<f32>) -> Self {
+        if let Some(w) = wght {
+            self.weight = w;
+        }
+        if let Some(o) = opsz {
+            self.opsz = o;
+        }
+        self
+    }
+    /// FVAR (SR150): an explicit `opsz` in pt (0 = from the size).
+    pub const fn with_opsz(mut self, o: f32) -> Self {
+        self.opsz = o;
+        self
     }
     pub const fn with_weight(mut self, w: u16) -> Self {
         self.weight = w;
@@ -191,6 +211,8 @@ struct AtlasKey {
     bold: bool,
     weight: u16,
     size_64: u32,
+    /// FVAR (SR150): an explicit `opsz` (64ths of a pt; 0 = from the size), so an override never shares an atlas.
+    opsz_64: u32,
 }
 
 struct Atlas {
@@ -342,7 +364,8 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Slot `face` instanced for `style`: `wght` per [`Engine::weight_for`], `opsz` from the size in pt.
+    /// Slot `face` instanced for `style`: `wght` per [`Engine::weight_for`], `opsz` = [`Style::opsz`] when set (FVAR,
+    /// SR150), else the size in pt.
     fn instance(&self, face: usize, style: &Style) -> Font<'a> {
         let s = &self.slots[face];
         let mut f = s.font;
@@ -351,7 +374,7 @@ impl<'a> Engine<'a> {
             f.set_variation(WGHT, w as f32);
         }
         if f.has_axis(OPSZ) {
-            f.set_variation(OPSZ, style.size / self.px_per_pt);
+            f.set_variation(OPSZ, if style.opsz > 0.0 { style.opsz } else { style.size / self.px_per_pt });
         }
         f
     }
@@ -442,6 +465,7 @@ impl<'a> Engine<'a> {
                 && r.style.weight == style.weight
                 && r.style.features == style.features
                 && r.style.tracking == style.tracking
+                && r.style.opsz == style.opsz
                 && r.text == text
         }) {
             return Some(i);
@@ -523,7 +547,8 @@ impl<'a> Engine<'a> {
 
     /// The atlas index for `style` (created, or the least recently used one recycled, on a miss).
     fn atlas_for(&mut self, style: &Style) -> usize {
-        let key = AtlasKey { role: style.role, bold: style.bold, weight: style.weight, size_64: floor(style.size * 64.0 + 0.5) as u32 };
+        let opsz_64 = if style.opsz > 0.0 { floor(style.opsz * 64.0 + 0.5) as u32 } else { 0 };
+        let key = AtlasKey { role: style.role, bold: style.bold, weight: style.weight, size_64: floor(style.size * 64.0 + 0.5) as u32, opsz_64 };
         self.tick += 1;
         if let Some(i) = self.atlases.iter().position(|a| a.key == key) {
             self.atlases[i].used = self.tick;

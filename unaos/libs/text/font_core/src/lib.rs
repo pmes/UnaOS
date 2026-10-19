@@ -20,7 +20,8 @@
 //!   [`normalize`] (UAX #15 NFC/NFD), [`linebreak`] (UAX #14, every class) — tables generated from UCD 17.0.0
 //!   ([`ucd`]) and proven on Unicode's conformance files in full (FONTBIDI, SR56).
 //! - [`var`] (FONTSCRAFT, B640): variable fonts — `fvar` axes, `avar` maps, `gvar` outlines, `HVAR` advances,
-//!   GPOS/GDEF device deltas — instanced per [`Font`] with [`Font::set_variation`] / [`Font::with_variations`].
+//!   GPOS/GDEF device deltas — instanced per [`Font`] with [`Font::set_variation`] / [`Font::with_variations`];
+//!   FVAR (SR150): `fvar` named instances and [`Font::instance`] (one user coordinate per axis; [`VarFont`]).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -55,6 +56,7 @@ pub mod var;
 
 pub use cache::GlyphCache;
 pub use font::{Error, Font, Os2, Outlines, Post};
+pub use var::{NamedInstance, VarFont};
 pub use path::{OutlineSink, Path, PathCmd};
 pub use raster::{rasterize_glyph, rasterize_glyph_mode, GlyphBitmap, RenderMode};
 pub use bidi::Direction;
