@@ -192,7 +192,7 @@ pub const BAR_BOLD: bool = BOLD;
 pub const BAR_FONT_NAME: &str = "chrome20-bold";
 
 /// The clock's rendered width in glyphs: `HH:MM`. FONTS2 (B650): the clock draws with TABULAR figures (`text::tabular` — the run opens with a digit), so its advance no longer moves from minute to minute and the right-aligned clock stops jittering.
-const CLOCK_GLYPHS: usize = 5;
+const CLOCK_GLYPHS: usize = 8; // crawl A 18: `H:MM AM` / `HH:MM PM` on a 12-hour region (`clock::locale::fmt_time` drops the AM/PM under 8 bytes); a 24-hour `HH:MM` right-aligns in it
 
 /// The longest title the bar will show, in glyphs — the whole stored caption. Unlike the dock (which
 /// caps at 8 because it draws many tiles across one strip), the bar draws exactly ONE caption and has
@@ -943,7 +943,7 @@ impl Model {
         // the SMC transaction that produced this number ran ten seconds ago on the device-service
         // task (`super::status::poll`). A bar that read the SMC here would wait on six bounded
         // handshakes with interrupts off.
-        m.batt = super::status::bar_item(); m.tray = super::status::tray(); // STATUSTRAY (B426): the tray, read with the rest of the model (relaxed loads) // BEZEL (B405): the bar's `BRT nn/16` item and the caption's `vol=N/16` / `muted` are retired — the bezel is the readout
+        m.batt = super::status::bar_item(); m.tray = super::status::tray(); #[cfg(feature = "login")] if super::lock::veiled() { m.batt = None; m.tray = None; m.title_len = 0; m.cap_owner = wm::WIN_NONE; m.menu_owner = wm::WIN_NONE; } // crawl A 13: under the session lock the bar shows its clock only (BP-video-28). STATUSTRAY (B426): the tray, read with the rest of the model (relaxed loads) // BEZEL (B405): the bar's `BRT nn/16` item and the caption's `vol=N/16` / `muted` are retired — the bezel is the readout
         m.clock = clock_hhmm(); #[cfg(feature = "sntp6")] if m.clock.is_none() { barclock_note(None); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the UNSYNCED half of the bar's clock witness, latched to one line per boot at the file tail. It is reported from the MODEL, not the painter, because the painter's clock branch never runs when there is nothing to draw — which is precisely the state this half exists to say aloud.
         (m, clobbered)
     }
@@ -2006,7 +2006,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // x and a second copy of `w - PAD - CLOCK_GLYPHS * CELL_W` is how a clock ends up in two places
     // at once. Same arithmetic, same guard, one definition — and it is the definition the fixture's
     // `clock=` term and [`batt_slot`] both read.
-    if let (c, Some(cx)) = (m.clock.unwrap_or(*b"--:--"), clock_slot(w)) {
+    if let (c, Some(cx)) = (m.clock.unwrap_or(*b"   --:--"), clock_slot(w)) {
         super::text::draw_row(out, w, &c, (cx + CLOCK_GLYPHS * CELL_W()).saturating_sub(super::text::advance(&c, false, FACE)), sy, theme::text_secondary(), false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W(), CELL_H()))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
     }
 }
@@ -2908,7 +2908,7 @@ fn persist_build(kind: u8) -> Model {
         const CAP: &[u8] = b"Persist";
         m.title[..CAP.len()].copy_from_slice(CAP);
         m.title_len = CAP.len();
-        m.clock = Some(if kind == 2 { *b"12:34" } else { *b"12:35" });
+        m.clock = Some(if kind == 2 { *b"   12:34" } else { *b"   12:35" });
         m.batt = Some(super::status::BarItem { percent: 82, charging: true });
     }
     m
@@ -3087,7 +3087,7 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
     crate::census_println!(
         ":: CLOCKBAR: anchored={} text={} from={} drawn=1 -> PASS ::",
         anchored as u8,
-        core::str::from_utf8(c).unwrap_or("?????"),
+        core::str::from_utf8(c).map(|s| s.trim_start()).unwrap_or("?????"), // crawl A 18: the 8-glyph cell is right-aligned; no space on the wire
         // The anchor's real source: `sntp` (a reply), `verb` (`date -s`), `placeholder` (the bar shows a
         // time with NO anchor behind it — a bug the line now names; `rtc` = the CMOS clock read at boot, RTCCLOCK).
         match crate::clock::try_source() {
@@ -3167,7 +3167,7 @@ fn tray_slot(i: u8, w: usize) -> Option<(usize, usize)> {
 /// The tray's left edge (the input slot's x), once the tray has been published and the panel seats it.
 fn tray_left(w: usize) -> Option<usize> {
     super::status::tray()?;
-    tray_slot(super::status::ITEM_INPUT, w)
+    super::status::disk_low().and_then(|_| tray_slot(super::status::ITEM_DISK, w)).or_else(|| tray_slot(super::status::ITEM_INPUT, w)) // crawl A 4: DISKFULL's disk item is the leftmost slot while it shows
         .or_else(|| tray_slot(super::status::ITEM_NET, w))
         .or_else(|| tray_slot(super::status::ITEM_VOLUME, w))
         .map(|(x, _)| x)
@@ -3799,7 +3799,7 @@ pub mod camdot {
     /// The dot's box `(x0, width)` in a bar `w` wide: one ITEM_GAP left of the leftmost seated status item, else
     /// (no room before the titles' floor) over that item. `None` only when the bar seats no status item at all.
     pub fn seat(w: usize) -> Option<(usize, usize)> {
-        let left = FLOW.iter().rev().find_map(|&i| flow_slot(i, w).map(|(x, _)| x))?;
+        let left = FLOW.iter().rev().filter(|&&i| i != crate::video::status::ITEM_DISK || crate::video::status::disk_low().is_some()).find_map(|&i| flow_slot(i, w).map(|(x, _)| x))?; // crawl A 19: the disk slot is seated only while it shows
         let iw = ICON_HIT();
         let x0 = left.checked_sub(ITEM_GAP() + iw).filter(|&x| x >= TITLE_X0() + CELL_W()).unwrap_or(left);
         if x0 + iw > w {

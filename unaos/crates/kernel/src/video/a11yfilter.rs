@@ -9,7 +9,7 @@
 //! `docs/dev/evidence/rmbp-1005/KCOMP.md` §M1: the window present, the occluded spans, the cursor sprite, the strips,
 //! the erase/wallpaper fill, `Screen::flush`). A post-pass over the scanout would re-filter every pixel the pass did
 //! NOT repaint (invert twice is the identity; a CVD matrix twice compounds) and would read BAR1 uncached (~1.7 us a
-//! probe). So the rule is BP-video-20: every writer to the scanout filters at the copy, from a source that is never
+//! probe). So the rule is BP-video-25: every writer to the scanout filters at the copy, from a source that is never
 //! filtered. The window present takes [`super::Op::CopyFilter`] (the CPU blitter runs it; the copy engines refuse
 //! it, and `run_on` falls back), the row writers call [`each`] / [`in_place`], the painters of solid colours call
 //! [`color`]. The splash and fbcon stay out (pre-desktop; the keys load at login).

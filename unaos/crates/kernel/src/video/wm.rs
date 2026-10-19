@@ -21249,7 +21249,7 @@ fn stage_window(
             for &(sx0, sx1) in spans[..ns].iter() {
                 let off = (sx0 - bx) * bpp;
                 let len = (sx1 - sx0) * bpp;
-                let d = py * fb_row + sx0 * bpp; super::blitter::a11yfilter::each(fb.info().pixel_format, bpp, &stage[src + off..src + off + len], |i, c| blit_traced(fb, d + i, c)); // A11YFILTERS (B705): each unoccluded span filtered at the copy (BP-video-20; LINE-NEUTRAL fold, code first)
+                let d = py * fb_row + sx0 * bpp; super::blitter::a11yfilter::each(fb.info().pixel_format, bpp, &stage[src + off..src + off + len], |i, c| blit_traced(fb, d + i, c)); // A11YFILTERS (B705): each unoccluded span filtered at the copy (BP-video-25; LINE-NEUTRAL fold, code first)
                 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     row_written += (sx1 - sx0) as u64;
@@ -30881,7 +30881,7 @@ pub fn owner_rows(owner_asid: u64) -> usize {
 
 
 // =================================================================================================
-// FOCUSSTEAL (rmbp-ledger B698; BP-video-20, BP-bar-18) — TAIL-APPENDED: a definition inserted higher
+// FOCUSSTEAL (rmbp-ledger B698; BP-video-23, BP-bar-18) — TAIL-APPENDED: a definition inserted higher
 // up renumbers every `core::panic::Location` below it. Reached only from same-line folds:
 // `spawn_focus_arm` (note_arm), `spawn_focus_take` (judge), `spawn_focus_forget` (forget) and
 // `create_inner`'s publish line (hold_under). Knob-off (`wc` off, and every aarch64 build) compiles
@@ -31161,7 +31161,7 @@ pub mod focussteal {
     }
 }
 
-// AUTOLOCK (rmbp-ledger B712, BP-video-21) — TAIL-APPENDED, so no line above moves. The lock is a VEIL over the table,
+// AUTOLOCK (rmbp-ledger B712, BP-video-28) — TAIL-APPENDED, so no line above moves. The lock is a VEIL over the table,
 // never a teardown: [`above_shell`] asks this once per row, and it answers `true` (hide) for every row but the pinned
 // modal one while `video::lock` holds the session locked. Two atomic loads, no lock — it runs under `TABLE`. With no
 // lock module in the build (no `login`, or no desktop) it is `false`, so the predicate is the trunk's.

@@ -301,6 +301,16 @@ pub static SCHEMA: &[Key] = &[
     },
     // ── TZLOCALE (rmbp-ledger B701, BP-bar-17): the ONE locale authority — how a civil second is printed ─────────
     Key {
+        ns: "system", key: "keyboard.compose", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard",
+        doc: "A tap of Right Alt (down and up alone) is the Compose key: the next two characters compose (s s = ß, = e = €, \" u = ü); Right Alt held with a key stays AltGr (KEYMAPS B704).",
+    },
+    Key {
+        ns: "system", key: "keyboard.layout", kind: Kind::Enum(&["us", "gb", "de", "fr", "es", "it", "se", "ch"]), default: Default::Str("us"),
+        writers: &[Writer::Settings], reader: "kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard",
+        doc: "The keyboard layout keys type on: U.S., British, German, French, Spanish, Italian, Swedish / Finnish, Swiss German, with their dead keys and AltGr characters (KEYMAPS B704).",
+    },
+    Key {
         ns: "system", key: "locale.first_day", kind: Kind::Enum(&["mon", "sun", "sat"]), default: Default::Str("mon"),
         writers: &[Writer::Settings], reader: "kernel `clock::locale`",
         doc: "The week's first day (calendars). Edited in Settings > Date & Time.",
@@ -314,16 +324,6 @@ pub static SCHEMA: &[Key] = &[
         ns: "system", key: "locale.tz", kind: Kind::Str { max_len: 40, printable: true }, default: Default::Str("UTC"),
         writers: &[Writer::Settings], reader: "kernel `clock::locale` (the zone table `clock/tz.rs`)",
         doc: "The time zone, an IANA name from the kernel's compiled table (fixed DST rules); the civil anchor stays UTC and the zone is applied when a second is printed. An unknown name reads as UTC. Edited in Settings > Date & Time.",
-    },
-    Key {
-        ns: "system", key: "keyboard.compose", kind: Kind::Bool, default: Default::Bool(false),
-        writers: &[Writer::Settings], reader: "kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard",
-        doc: "A tap of Right Alt (down and up alone) is the Compose key: the next two characters compose (s s = ß, = e = €, \" u = ü); Right Alt held with a key stays AltGr (KEYMAPS B704).",
-    },
-    Key {
-        ns: "system", key: "keyboard.layout", kind: Kind::Enum(&["us", "gb", "de", "fr", "es", "it", "se", "ch"]), default: Default::Str("us"),
-        writers: &[Writer::Settings], reader: "kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard",
-        doc: "The keyboard layout keys type on: U.S., British, German, French, Spanish, Italian, Swedish / Finnish, Swiss German, with their dead keys and AltGr characters (KEYMAPS B704).",
     },
     Key { ns: "system", key: "lock.after_idle_min", kind: Kind::Int { min: 0, max: 1440 }, default: Default::Int(10), writers: &[Writer::Settings], reader: "kernel AUTOLOCK (`video/lock.rs`), Settings > Security", doc: "Minutes with no key or pointer event before the session locks (the window table veiled, the login screen's password field opens it, nothing closed); 0 = never (AUTOLOCK B712)." }, Key { ns: "system", key: "lock.on_lid", kind: Kind::Bool, default: Default::Bool(true), writers: &[Writer::Settings], reader: "kernel AUTOLOCK (`video/lock.rs`), Settings > Security", doc: "Lock the session when the lid closes, before the sleep state (AUTOLOCK B712)." }, Key { ns: "system", key: "lock.on_sleep", kind: Kind::Bool, default: Default::Bool(true), writers: &[Writer::Settings], reader: "kernel AUTOLOCK (`video/lock.rs`), Settings > Security", doc: "Lock the session before any other sleep entry (the lid has its own key) (AUTOLOCK B712)." }, // AUTOLOCK (B712): three rows on one line, so no row below moves
     Key {
@@ -479,6 +479,12 @@ pub static SCHEMA: &[Key] = &[
         doc: "Vertex region for embeddings.",
     },
     Key {
+        ns: "vein", key: "gemini.key_file", kind: Kind::Str { max_len: 40, printable: true },
+        default: Default::Consumer("unset: Gemini has no key on the image; the Echo provider answers"),
+        writers: OP, reader: "vein_ring3 key (LUMEN.ELF, a Gemini conversation)",
+        doc: "LUMEN2 (SR121): absolute path of the Gemini API key file on the UnaFS volume, the Gemini twin of `key_file` (same bound and FAT refusal).",
+    },
+    Key {
         ns: "vein", key: "gemini.project", kind: NAME,
         default: Default::Consumer("none: gcloud auth refuses without one"),
         writers: OP, reader: "gneiss_pal ProviderConfig, EmbedConfig",
@@ -488,12 +494,6 @@ pub static SCHEMA: &[Key] = &[
         ns: "vein", key: "gemini.region", kind: NAME, default: Default::Str("global"),
         writers: OP, reader: "gneiss_pal ProviderConfig",
         doc: "Vertex region for chat.",
-    },
-    Key {
-        ns: "vein", key: "gemini.key_file", kind: Kind::Str { max_len: 40, printable: true },
-        default: Default::Consumer("unset: Gemini has no key on the image; the Echo provider answers"),
-        writers: OP, reader: "vein_ring3 key (LUMEN.ELF, a Gemini conversation)",
-        doc: "LUMEN2 (SR121): absolute path of the Gemini API key file on the UnaFS volume, the Gemini twin of `key_file` (same bound and FAT refusal).",
     },
     Key {
         ns: "vein", key: "key_file", kind: Kind::Str { max_len: 40, printable: true },
@@ -773,7 +773,7 @@ pub fn render_markdown() -> String {
         let _ = write!(o, " | {} | {} | {} |\n", r3, k.reader, k.doc);
     }
     o.push_str("\n## Decisions (REASK B681, R130 law 2)\n\n");
-    o.push_str("`system.decisions.<domain>.<stem>-<fnv64>` (domains `apptrust`, `opener`, `firmware`, `sysfiles`, `notice`) is a\n");
+    o.push_str("`system.decisions.<domain>.<stem>-<fnv64>` (domains `apptrust`, `opener`, `firmware`, `sysfiles`, `notice`, `net` — NETGRANT B707: a ring-3 program's outbound reach, subject = the program's name, answer `always`/`never`) is a\n");
     o.push_str("string `\"<answer> <at> <bind> <who>\"`: the user's answer to an ask, the civil second it was given (0 = the clock was\n");
     o.push_str("unset), what it is bound to (`-` = nothing; a program's volume and stamp), and the subject. Written by the kernel's ask\n");
     o.push_str("seams (`prefs::decide`: apptrust's Open, a refusal alert, FWPIN's toast) while `system.privacy.remember` is on,\n");

@@ -247,7 +247,7 @@ fn wipe() {
         return;
     }
     if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
-        fb.fill_screen(super::wm::DESKTOP_BG);
+        fb.fill_screen(super::blitter::a11yfilter::color(super::wm::DESKTOP_BG)); // crawl A 17: the scanout writer filters at the copy (BP-video-25)
         fb.flush_all();
         let (w, h) = (fb.width(), fb.height());
         let _ = super::wm::damage_intersecting(0, 0, w, h);

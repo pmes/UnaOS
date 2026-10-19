@@ -146,7 +146,7 @@ struct Model {
     /// SOFTYDOTS: a camera stream is open (the driver's count), and the root's free percent + 1 while low (0 = not).
     cam: bool,
     disk: u8,
-    clock: [u8; 5],
+    clock: [u8; 8], // crawl A 18: room for the 12-hour AM/PM
     date: [u8; 10],
     clock_set: bool,
     hot: u8,
@@ -175,7 +175,7 @@ struct Layout {
 impl Model {
     fn read(rows: &[wm::DockEntry]) -> Model {
         let mut m = Model {
-            n: 0, t: [Tile::empty(); k::TILES_MAX], net: 0, vol: 0, bat: 0, cam: false, disk: 0, clock: [b' '; 5], date: [b' '; 10],
+            n: 0, t: [Tile::empty(); k::TILES_MAX], net: 0, vol: 0, bat: 0, cam: false, disk: 0, clock: [b' '; 8], date: [b' '; 10],
             clock_set: false, hot: HOT_NONE, pressed: HOT_NONE, start_open: super::startmenu::open_kind() == 1,
             cal_open: super::startmenu::open_kind() == 2, qs_open: super::startmenu::open_kind() == 3,
         };
