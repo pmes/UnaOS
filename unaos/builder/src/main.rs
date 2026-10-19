@@ -1500,6 +1500,7 @@ fn main() {
         }
     }
     let _ = stage_welcome(&workspace_dir, &esp_dir);
+    let _ = stage_help(&workspace_dir, &esp_dir); // HELPSEARCH (B729): the help index rides the ESP beside the fonts
     // STRIAMETAL (LEDGER SR139): Stria, the A/V handler, as ONE ring-3 program (crates/user-stria, built by arroyo's
     // build_user_stria_x86 to target/STRIA-X86.ELF), staged as APPS/STRIA.ELF — `stria <file>`, or a Quarry
     // double-click on a video or a sound (its APPRES doctypes), plays it in a window.
@@ -1661,6 +1662,10 @@ fn main() {
     if stage_welcome(&workspace_dir, &data_dir) {
         staged_data.push("system/doc/welcome.html");
         staged_data.push("system/doc/keys.html"); // AETHERMETAL M3 (SR96): the navigation fixture's target
+    }
+    // HELPSEARCH (B729): the help index rides the DATA volume too — the Launcher and the Help window read /system/help there.
+    if stage_help(&workspace_dir, &data_dir) {
+        staged_data.push("system/help/HELP.IDX");
     }
     // KERNELFONT (B359): the faces ride the DATA volume too — `video::text` reads /system/fonts there.
     if !stage_fonts(&kfont_dirs_env(), &data_dir).is_empty() {
@@ -2868,6 +2873,103 @@ mod kernelfont_tests {
         }
         let _ = std::fs::remove_dir_all(&out);
     }
+}
+
+/// HELPSEARCH (rmbp-ledger B729, BP-bar-2/3, research C §8): the words the help index leaves out — they find every page.
+const HELP_STOP: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from", "has", "have", "how", "i", "if", "in", "is", "it",
+    "its", "my", "no", "not", "of", "on", "or", "so", "that", "the", "then", "this", "to", "up", "was", "what", "when", "where", "which",
+    "with", "you", "your",
+];
+
+/// HELPSEARCH: the index's words of `s` — lowercase ASCII letter/digit runs of 2 bytes or more, stop words out.
+fn help_words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() >= 2 && !HELP_STOP.contains(&w.as_str()))
+        .collect()
+}
+
+/// HELPSEARCH: pack `docs/help/*.md` into ONE index, `HELP.IDX` — the format the kernel's no_std reader
+/// (`crates/kernel/src/help/index.rs`) parses:
+///
+/// ```text
+/// UNAHELP 1 pages=<n> words=<n>
+/// P\t<slug>\t<title>\t<app>\t<key,key>\t<body offset>\t<body length>      (one per page, slug order)
+/// W\t<word>\t<page>[*] <page>[*] ...                                      (one per word, byte order; * = in the title)
+/// B
+/// <the bodies, back to back; offsets count from the byte after "B\n">
+/// ```
+///
+/// A page is `# <title>`, then `key: value` lines up to the first blank line (`app`: the program whose F1 opens it;
+/// `settings`: the Principia keys its "Open the setting" links name; `also`: more words it is found by), then the
+/// body. The build STOPS on a page that breaks the shape (no title, an unknown key, a tab, a byte outside printable
+/// ASCII — the kernel draws bytes) or on more than 40 pages. Returns `(bytes, pages, words)`; `None` = no corpus.
+fn pack_help(dir: &std::path::Path) -> Option<(Vec<u8>, usize, usize)> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+    files.sort();
+    if files.is_empty() {
+        return None;
+    }
+    assert!(files.len() <= 40, "HELPSEARCH: {} pages under {} (the corpus is at most 40 short pages)", files.len(), dir.display());
+    let mut rows = String::new();
+    let mut bodies = String::new();
+    let mut index: std::collections::BTreeMap<String, std::collections::BTreeMap<usize, bool>> = std::collections::BTreeMap::new();
+    for (i, f) in files.iter().enumerate() {
+        let slug = f.file_stem().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("HELPSEARCH: {}: {}", f.display(), e));
+        assert!(text.bytes().all(|b| b == b'\n' || (0x20..=0x7e).contains(&b)), "HELPSEARCH: {} carries a tab or a byte outside printable ASCII", f.display());
+        let mut lines = text.lines();
+        let title = lines.next().and_then(|l| l.strip_prefix("# ")).unwrap_or_else(|| panic!("HELPSEARCH: {} does not open with `# <title>`", f.display())).trim().to_string();
+        let (mut app, mut keys, mut also) = (String::new(), String::new(), String::new());
+        for l in lines.by_ref() {
+            if l.trim().is_empty() {
+                break;
+            }
+            let (k, v) = l.split_once(':').unwrap_or_else(|| panic!("HELPSEARCH: {}: `{}` is not `key: value`", f.display(), l));
+            let v = v.trim();
+            match k.trim() {
+                "app" => app = v.to_string(),
+                "settings" => keys = v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(","),
+                "also" => also = v.to_string(),
+                other => panic!("HELPSEARCH: {}: unknown key `{}` (app, settings, also)", f.display(), other),
+            }
+        }
+        let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+        assert!(!body.is_empty(), "HELPSEARCH: {} has no body", f.display());
+        rows.push_str(&format!("P\t{}\t{}\t{}\t{}\t{}\t{}\n", slug, title, app, keys, bodies.len(), body.len()));
+        bodies.push_str(&body);
+        for w in help_words(&title).into_iter().chain(help_words(&slug)) {
+            index.entry(w).or_default().insert(i, true);
+        }
+        for w in help_words(&also).into_iter().chain(help_words(&body)) {
+            index.entry(w).or_default().entry(i).or_insert(false);
+        }
+    }
+    let mut out = format!("UNAHELP 1 pages={} words={}\n", files.len(), index.len());
+    out.push_str(&rows);
+    for (w, pages) in &index {
+        let list: Vec<String> = pages.iter().map(|(p, t)| if *t { format!("{}*", p) } else { p.to_string() }).collect();
+        out.push_str(&format!("W\t{}\t{}\n", w, list.join(" ")));
+    }
+    out.push_str("B\n");
+    out.push_str(&bodies);
+    Some((out.into_bytes(), files.len(), index.len()))
+}
+
+/// HELPSEARCH: stage the packed index as `<volume>/system/help/HELP.IDX` (the kernel reads `/system/help/HELP.IDX`, or
+/// `/boot/system/help/HELP.IDX` when the card is at `/boot`, as the fonts). Returns whether it was.
+fn stage_help(workspace_dir: &std::path::Path, volume: &std::path::Path) -> bool {
+    let src = workspace_dir.join("../docs/help");
+    let Some((bytes, pages, words)) = pack_help(&src) else {
+        println!("   HELP: {} absent or empty — no system/help/HELP.IDX on {}", src.display(), volume.display());
+        return false;
+    };
+    let dir = volume.join("system/help");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("HELP.IDX"), &bytes).unwrap();
+    println!("   HELP: packed system/help/HELP.IDX pages={} words={} bytes={} into {}", pages, words, bytes.len(), volume.display());
+    true
 }
 
 #[cfg(test)]

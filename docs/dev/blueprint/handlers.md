@@ -19,6 +19,7 @@
 | BP-handlers-7 | Helm decides pass/ask/refuse from Principia's safety levels before any machine moves; the human override outranks everything. | `docs/CODEX.md:33` `docs/CODEX.md:73-79` | unheld (no kernel caller) |
 | BP-handlers-8 | Vein runs when a caller needs it; no always-on system service (R82). | R82 | unheld |
 | BP-handlers-9 | The host bus (`bandy`, in-process `SMessage` broadcast) is not the on-UnaOS wire; it migrates to the v1 format in a host arc. | `unaos/crates/kernel/src/bus.rs:12-18` | unheld |
+| BP-handlers-10 | Help has no CODEX handler (the manifest is LOCKED and names none): the in-OS manual is kernel furniture (`CHARTER: Kernel — wm`, HELPSEARCH B729), its corpus is a tree directory packed at build time, never a handler's store or a server; the shell verbs' docs stay ONE table, `help::DOCS`, read by `help`, `man`, the Launcher and the Help window. | `docs/help/help.md`; `unaos/crates/kernel/src/help/index.rs:1`; `unaos/crates/kernel/src/help.rs:30` | `gates` row `charter`; `tests helpdoc`, `tests helpsearch` |
 
 ## 3. The manifest (CODEX §2) and where each one is
 | handler | domain | `handlers/` dir | on UnaOS at HEAD |
