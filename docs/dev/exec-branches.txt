@@ -615,7 +615,7 @@ refs/heads/exec-rmbp-fontkit       35f53609 FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-audiomix      51b9dc3b FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-quarryversions 673856f6 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-stagewindow  658415ad IN-FLIGHT cloud wave36 STAGEWINDOW (B733)
-refs/heads/exec-rmbp-crawlb       3287fafc IN-FLIGHT cloud wave36 CRAWLB (the fs/storage/security crawl fixes)
+refs/heads/exec-rmbp-crawlb       800b70ad FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-oneinstance  bfc63a86 IN-FLIGHT cloud wave36 ONEINSTANCE (B734)
 refs/heads/exec-rmbp-crawlc       093803b2 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-pinchzoom    996f1f6f IN-FLIGHT cloud wave36 PINCHZOOM (B735)
