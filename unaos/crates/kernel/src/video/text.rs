@@ -591,7 +591,7 @@ mod tt {
     pub fn restyle(t: &mut Tt) {
         // FONTSCRAFT (B640): a variable face's `opsz` is the size in pt — device px over the dpi scale.
         let s2 = crate::video::dpi::s2().max(1);
-        t.eng.set_px_per_pt(s2 as f32 / 2.0);
+        t.eng.set_px_per_pt(s2 as f32 / 2.0); t.eng.bold_weight = type_role(TypeRole::BodyStrong, crate::video::look::is_softy()).weight; // FONTKIT (B730): a `bold` run (the bar, menus, window titles) draws `type.body-strong`'s `wght` from theme's ONE table (600, the engine's former constant); LINE-NEUTRAL fold, code first
         let eng = &t.eng;
         let fam = if eng.has(t.family) { t.family } else { Role::Sans };
         let mono = if eng.has(Role::Mono) { Role::Mono } else { Role::Sans };
@@ -613,7 +613,7 @@ mod tt {
         let t2 = type_role(TypeRole::Title2, crate::video::look::is_softy());
         let (title_px, title_line) = (t2.size_pt as f32 * s2 as f32 / 2.0, super::title_cell().1);
         let title = (
-            Style::new(fam, true, title_px).with_weight(t2.weight).with_tracking(t2.tracking_em()),
+            Style::new(fam, true, title_px).with_axes(t2.axes().0, t2.axes().1).with_tracking(t2.tracking_em()), // FONTKIT (B730): the role's (wght, opsz) from theme's ONE table
             eng.baseline_in_line(fam, title_px, title_line as f32),
         );
         t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, gh), mk(mono, grid, gh), title];
@@ -1292,4 +1292,69 @@ fn glyphs_fixture() {
         ":: GLYPHS: arabic={} devanagari={} cjk={} thai={} notdef={} rtl={} pseudo_clipped={} -> {} ::",
         words[0], words[1], words[2], words[3], notdef_all, if rtl_ok { "ok" } else { "fail" }, clipped, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ------------------------------------------------------------------------------------------------ FONTKIT (B730)
+// The file tail again (FONTS2's rule: no line above moves). The probe `tests fontkit` (`tests.rs` tail) reads: the
+// type roles' axes from theme's ONE table, and the variable UI face rendering them. Desktop builds only.
+
+/// FONTKIT (rmbp-ledger B730): what `tests fontkit` scores.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub struct FontkitProbe {
+    /// Rows of `theme::TYPE_RAMP` whose `(wght, opsz)` hold in BOTH looks: a proportional row names `wght` 100..=900
+    /// and `opsz` = its size in pt; the mono row names no axis.
+    pub roles: usize,
+    pub rows: usize,
+    /// The primary UI sans face carries both `wght` and `opsz` (Inter Variable loaded).
+    pub variable: bool,
+    /// `Face::Title`'s live style carries `type.title2`'s axes (the pass-through in `tt::restyle`).
+    pub title_ok: bool,
+    /// Ink coverage (sum of A8 coverage) of `Title` at `type.title2`'s size: `wght` 600, then 400.
+    pub ink_600: u64,
+    pub ink_400: u64,
+    /// The advance of `Title` at the same size and `wght` 400: `opsz` 14, then 28 (px).
+    pub w_opsz14: f32,
+    pub w_opsz28: f32,
+    pub face: &'static str,
+    pub size: f32,
+}
+
+/// FONTKIT (B730): measure the role table and the variable face through the one engine; `None` when no face loaded
+/// (or the engine lock stayed busy).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn fontkit_probe() -> Option<FontkitProbe> {
+    use crate::video::theme::{type_role, TypeRole, TYPE_RAMP};
+    use font_core::ui::{Role, Style};
+    let row_ok = |s: crate::video::theme::TypeStep| {
+        if s.mono {
+            s.axes() == (None, None)
+        } else {
+            s.axes() == (Some(s.weight), Some(s.size_pt as f32)) && (100..=900).contains(&s.weight)
+        }
+    };
+    let roles = TYPE_RAMP.iter().filter(|r| row_ok(r.1) && row_ok(r.2)).count();
+    tt::service();
+    if !tt::ready() {
+        return None;
+    }
+    let ink = crate::video::theme::fixture::INK;
+    tt::with(|t| {
+        let t2 = type_role(TypeRole::Title2, crate::video::look::is_softy());
+        let live = t.styles[4].0;
+        let title_ok = live.weight == t2.weight && live.opsz == t2.opsz as f32;
+        let size = live.size;
+        let base = Style::new(Role::Sans, false, size);
+        let variable = t.eng.primary_instance(&base).is_some_and(|f| f.has_axis(*b"wght") && f.has_axis(*b"opsz"));
+        let mut cover = |st: Style| {
+            let mut sum = 0u64;
+            t.eng.draw_with(b"Title", st, 0.0, size * 1.5, None, None, ink, &mut |_, _, a| sum += a as u64);
+            sum
+        };
+        let ink_600 = cover(base.with_axes(Some(600), Some(t2.opsz as f32)));
+        let ink_400 = cover(base.with_axes(Some(400), Some(t2.opsz as f32)));
+        let w_opsz14 = t.eng.measure(b"Title", base.with_axes(Some(400), Some(14.0)));
+        let w_opsz28 = t.eng.measure(b"Title", base.with_axes(Some(400), Some(28.0)));
+        let face = t.eng.primary_name(Role::Sans, false).unwrap_or("none");
+        FontkitProbe { roles, rows: TYPE_RAMP.len(), variable, title_ok, ink_600, ink_400, w_opsz14, w_opsz28, face, size }
+    })
 }
