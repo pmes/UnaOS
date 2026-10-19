@@ -34,6 +34,7 @@ chosen file is missing the loader opens the other slot and says `[loader] slot=<
    `KERNEL.NEW` in 1 MiB chunks, re-read it against its CRC-32, `SHUTDOWN.REC := why=staged` (a stale `why=user`
    never arms this stage), write `STAGE.REC`. `[update] staged kelf=<max_vaddr> bytes= crc= from=`. `kelf` is the
    loader's `KELF max=` computed over the PT_LOAD headers by `elf_core::read_phdrs` (at most 8 PT_LOADs).
+   The operator's verb is `stage <path>` (STAGEVERB B690: `install::abimage::verb`; administrator only, the gate in the `shell.rs` arm), printing `stage <p>: staged kelf=… bytes=… crc=…` or `stage <p>: refused (<why>)`.
 2. **The user's restart / shut down** (`power::prelude`, the funnel of the shell verbs and the crystal menu; the panic
    screen's reset bypasses it): when staged, `SHUTDOWN.REC := why=user` and `[update] shutdown record why=user act=`.
 3. **Promote** `desktop_built(pass)` at the boot's DESKTOPBUILT verdict: only on a TRIAL boot (staged and `why=trial`,
@@ -44,7 +45,7 @@ chosen file is missing the loader opens the other slot and says `[loader] slot=<
 
 **OWED (outside this arc's files):** the call of `desktop_built` from the DESKTOPBUILT verdict in
 `unaos/crates/kernel/src/video/desktopbuild.rs` (`say`, the `);` closing the `:: DESKTOPBUILT:` print) — until it
-lands a trial boot is never promoted and the next boot falls back. No operator verb calls `stage_image` yet.
+lands a trial boot is never promoted and the next boot falls back.
 
 ## Wire, in order (a stage, a user restart, a good NEW)
 
@@ -54,5 +55,5 @@ lands a trial boot is never promoted and the next boot falls back. No operator v
 `[loader] fallback from=NEW reason=no-desktopbuilt` + `[loader] slot=ELF why=fallback` and the old `KELF max=`.
 
 `tests abimage`: `[update] abimage case=<unstaged|user|trial|crash> slot= why= -> ok` ×4, then
-`:: ABIMAGE: decide=4/4 stage=staged kelf=0x… record=ok unstaged=1 -> PASS ::` (it stages a copy of `/boot/KERNEL.ELF`
+`:: ABIMAGE: decide=4/4 stage=staged kelf=0x… record=ok verb=ok unstaged=1 -> PASS ::` (it stages a copy of `/boot/KERNEL.ELF`
 and removes it).

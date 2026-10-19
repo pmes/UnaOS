@@ -16,8 +16,11 @@
 //!   OLD, remove `STAGE.REC`, `SHUTDOWN.REC := why=promoted`. The loader opens the other slot when its pick is
 //!   missing, so a promotion torn between the two renames still boots the image that just passed.
 //!
+//! * [`verb`]: `stage <path>` (STAGEVERB B690) — the operator's word over [`stage_image`]; it prints what was staged
+//!   or why it was refused, and the switch stays the loader's after the user's own restart.
+//!
 //! `tests abimage`: stage a copy of the running kernel, assert the record, assert `abslot::decide`'s four cases,
-//! then remove the stage it made.
+//! then remove the stage it made; then the same through the `stage` verb (its printed line and the record it left).
 
 use alloc::format;
 use alloc::string::String;
@@ -138,6 +141,19 @@ pub fn stage_image(path: &str) -> Result<Staged, &'static str> {
     Ok(Staged { kelf, bytes: st.size, crc })
 }
 
+/// `stage <path>` (STAGEVERB B690, BP-bar-8): stage a kernel ELF as `KERNEL.NEW` through [`stage_image`]. The shell's
+/// arm (`shell.rs`) and `tests abimage`'s verb leg call this one fn; `out` is the console line.
+pub fn verb(out: &mut dyn FnMut(&str), args: &[&str]) {
+    let [path] = args else {
+        out("usage: stage <path>   (copies a kernel ELF to /boot/KERNEL.NEW; your next Restart boots it, and the current image comes back if it never reaches the desktop)");
+        return;
+    };
+    match stage_image(path) {
+        Ok(s) => out(&format!("stage {}: staged kelf={:#x} bytes={} crc={:#010x} — Restart when you choose; nothing restarts on its own", path, s.kelf, s.bytes, s.crc)),
+        Err(w) => out(&format!("stage {}: refused ({}) — no new image armed", path, w)),
+    }
+}
+
 /// Remove a stage (`tests abimage`'s cleanup; also an operator's "never mind").
 pub fn unstage() -> Result<(), &'static str> {
     let mt = crate::shell::vfs_mount_table();
@@ -216,7 +232,7 @@ fn promote(mt: &MountTable) -> Result<(), &'static str> {
 }
 
 /// `tests abimage` — stage a copy of the running kernel, assert the record, assert the loader's decision function's
-/// four cases, remove the stage.
+/// four cases, remove the stage; stage it again through [`verb`], assert its line and record, remove that stage.
 pub fn selftest() {
     let s = abslot::REC_STAGED;
     let cases: [(&str, Option<&[u8]>, Option<&[u8]>, Slot, Why, Write); 4] = [
@@ -249,9 +265,21 @@ pub fn selftest() {
         Err(e) => (format!("refused:{}", e), false, 0),
     };
     let cleaned = unstage().is_ok();
-    let pass = dec_ok == 4 && rec_ok && cleaned;
+    // STAGEVERB (B690): the operator's verb on a copy of the same image — its line names the kelf the record holds.
+    let mut said = String::new();
+    verb(&mut |s: &str| said.push_str(s), &[src.as_str()]);
+    let verb_ok = {
+        let mt = crate::shell::vfs_mount_table();
+        let rec = read_rec(&mt, abslot::STAGE);
+        let r = rec.as_deref();
+        let k = r.and_then(|r| abslot::field(r, b"kelf")).and_then(abslot::parse_hex);
+        abslot::staged(r) && k.is_some_and(|k| said.contains(&format!("staged kelf={:#x} ", k)))
+    };
+    serial_println!("[update] abimage verb=stage said=\"{}\" -> {}", said, if verb_ok { "ok" } else { "WRONG" });
+    let cleaned = unstage().is_ok() && cleaned;
+    let pass = dec_ok == 4 && rec_ok && verb_ok && cleaned;
     serial_println!(
-        ":: ABIMAGE: decide={}/4 stage={} kelf={:#x} record={} unstaged={} -> {} ::",
-        dec_ok, stage_w, kelf, if rec_ok { "ok" } else { "bad" }, cleaned as u8, if pass { "PASS" } else { "FAIL" }
+        ":: ABIMAGE: decide={}/4 stage={} kelf={:#x} record={} verb={} unstaged={} -> {} ::",
+        dec_ok, stage_w, kelf, if rec_ok { "ok" } else { "bad" }, if verb_ok { "ok" } else { "bad" }, cleaned as u8, if pass { "PASS" } else { "FAIL" }
     );
 }

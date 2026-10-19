@@ -84,7 +84,7 @@ fn install(mut new: Option<Wall>) {
     };
     let old = {
         let mut g = WALL.lock();
-        SNAP.store(snap, Ordering::Release);
+        SNAP.store(snap, Ordering::Release); #[cfg(target_arch = "x86_64")] crate::video::wm::desktop::veil_cache_invalidate();
         core::mem::replace(&mut *g, new)
     };
     *RETIRED.lock() = old;
