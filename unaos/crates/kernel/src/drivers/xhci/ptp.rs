@@ -50,6 +50,11 @@ use super::trb::Trb;
 use super::{dma_coherency, ring, XhciController};
 use crate::sync::Mutex;
 
+/// MTPPHONE (rmbp-ledger B715): MTP, the PTP superset a phone speaks — a child module so it reads this
+/// file's session, table and transport without widening them, and `drivers/xhci/mod.rs` is untouched.
+#[path = "mtp.rs"]
+pub mod mtp;
+
 // ── The numbers, each with its source (docs/dev/OS/07_USB_STORAGE/ptp.md carries the table) ─────────
 
 /// Operation codes. 0x1xxx: ISO 15740 §10.4 (libgphoto2 `camlibs/ptp2/ptp.h` `PTP_OC_*`, same values).
@@ -244,6 +249,21 @@ pub mod codec {
             let s = self.b.get(self.at..self.at + 4)?;
             self.at += 4;
             Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        }
+        /// MTPPHONE: UINT64 (an MTP ObjectSize, a StorageInfo capacity).
+        pub fn u64(&mut self) -> Option<u64> {
+            let lo = self.u32()? as u64;
+            let hi = self.u32()? as u64;
+            Some(lo | (hi << 32))
+        }
+        /// MTPPHONE: read past `n` bytes (a property value this reader does not keep).
+        pub fn skip(&mut self, n: usize) -> Option<()> {
+            let end = self.at.checked_add(n)?;
+            if end > self.b.len() {
+                return None;
+            }
+            self.at = end;
+            Some(())
         }
         pub fn string(&mut self) -> Option<String> {
             let n = self.u8()? as usize;
@@ -555,6 +575,7 @@ const ST_CONFIGURING: u8 = 2; // root path: Configure-Endpoint issued, completio
 const ST_CONFIGURED: u8 = 3; // endpoints live; session bring-up pending (service pass)
 const ST_OPEN: u8 = 4; // session open; the volume is mounted
 const ST_FAILED: u8 = 5; // named on the wire once; replug to retry
+const ST_VENDOR: u8 = 6; // MTPPHONE: a root-port vendor-class (0xFF/0xFF/0x00) candidate awaiting its OS-descriptor probe (service pass)
 
 static STATE: AtomicU8 = AtomicU8::new(ST_ABSENT);
 static SLOT: AtomicU8 = AtomicU8::new(0);
@@ -565,6 +586,7 @@ static PENDING_CFG: AtomicU8 = AtomicU8::new(0);
 // The walk (one configuration at a time).
 static CFG_VALUE: AtomicU8 = AtomicU8::new(1);
 static IN_PTP: AtomicBool = AtomicBool::new(false); // the interface being walked is class 0x06/0x01/0x01
+static VENDOR: AtomicBool = AtomicBool::new(false); // MTPPHONE: the taken interface is vendor-class 0xFF/0xFF/0x00 (MTP only by its OS descriptor)
 static IFACE: AtomicU8 = AtomicU8::new(0xFF);
 static IN_EP: AtomicU8 = AtomicU8::new(0);
 static IN_MPS: AtomicU16 = AtomicU16::new(0);
@@ -607,6 +629,8 @@ struct Info {
     serial: String,
     volume: String,
     storages: Vec<u32>,
+    /// MTPPHONE: an MTP session's storage folder names (always top-level folders); empty for PTP.
+    storage_names: Vec<String>,
 }
 static INFO: Mutex<Option<Info>> = Mutex::new(None);
 
@@ -668,6 +692,7 @@ fn walk_open() -> bool {
 }
 fn walk_reset() {
     IN_PTP.store(false, Ordering::Relaxed);
+    VENDOR.store(false, Ordering::Relaxed);
     IFACE.store(0xFF, Ordering::Relaxed);
     for a in [&IN_EP, &OUT_EP, &INT_EP] {
         a.store(0, Ordering::Relaxed);
@@ -687,6 +712,7 @@ pub fn note_device(slot: u8, vid: u16, pid: u16) {
     VID.store(vid, Ordering::Relaxed);
     PID.store(pid, Ordering::Relaxed);
     STATE.store(ST_ABSENT, Ordering::Relaxed);
+    mtp::OS_DESC_MTP.store(false, Ordering::Relaxed);
     walk_reset();
 }
 
@@ -700,16 +726,21 @@ pub fn note_config_header(slot: u8, cfg_value: u8) {
 }
 
 /// An INTERFACE descriptor. Still Image class = 0x06/0x01/0x01 (USB Still Image Capture Device Definition
-/// 1.0 §4.3); the first one found is the one used.
+/// 1.0 §4.3); the first one found is the one used. MTPPHONE: OR the vendor-class interface 0xFF/0xFF/0x00
+/// an Android-style MTP responder exposes — taken only if the Microsoft OS descriptor names it "MTP"
+/// (`mtp::mtp_os_probe`, run where synchronous EP0 is legal).
 pub fn note_interface(slot: u8, iface: u8, class: u8, sub: u8, proto: u8) {
     if SLOT.load(Ordering::Relaxed) != slot || !walk_open() {
         return;
     }
     let first = IFACE.load(Ordering::Relaxed) == 0xFF;
-    let is = class == 0x06 && sub == 0x01 && proto == 0x01 && first;
+    let still = class == 0x06 && sub == 0x01 && proto == 0x01;
+    let vendor = class == 0xFF && sub == 0xFF && proto == 0x00;
+    let is = (still || vendor) && first;
     IN_PTP.store(is, Ordering::Relaxed);
     if is {
         IFACE.store(iface, Ordering::Relaxed);
+        VENDOR.store(vendor, Ordering::Relaxed);
     }
 }
 
@@ -748,6 +779,9 @@ fn walk_candidate(slot: u8) -> Option<(u8, u16, u8, u16)> {
         serial_println!("[ptp] interface {} on slot {} has no bulk pair (in={:#04x} out={:#04x}) — not taken", IFACE.load(Ordering::Relaxed), slot, ia, oa);
         return None;
     }
+    if VENDOR.load(Ordering::Relaxed) && INT_EP.load(Ordering::Relaxed) == 0 {
+        return None; // MTPPHONE: a vendor interface without MTP's interrupt-IN event pipe is not an MTP candidate
+    }
     STATE.store(ST_CANDIDATE, Ordering::Relaxed);
     serial_println!(
         "[ptp] candidate slot={} dev={:04x}:{:04x} iface={} in={:#04x}/{} out={:#04x}/{} int={:#04x}/{} hub={}",
@@ -785,6 +819,7 @@ pub fn disconnect(slot: u8) {
     HUBBED.store(false, Ordering::Relaxed);
     XF_ARMED.store(false, Ordering::Relaxed);
     EV_ARMED.store(false, Ordering::Relaxed);
+    mtp::forget();
     *EV_RING.lock() = None; // the slot is disabled with it; the controller holds no pointer into it now
     let vol = INFO.lock().take().map(|i| i.volume);
     {
@@ -863,6 +898,13 @@ impl XhciController {
     pub(super) fn ptp_after_walk(&mut self, slot: u8) -> bool {
         HUBBED.store(false, Ordering::Relaxed);
         let Some((ia, im, oa, om)) = walk_candidate(slot) else { return false };
+        if VENDOR.load(Ordering::Relaxed) {
+            // MTPPHONE: no synchronous EP0 inside the event dispatch — park the candidate; the service
+            // pass asks its OS descriptor and configures it then. The root FSM goes on as before.
+            STATE.store(ST_VENDOR, Ordering::Relaxed);
+            serial_println!("[mtp] vendor interface slot={} iface={} — the OS descriptor is asked on the service pass", slot, IFACE.load(Ordering::Relaxed));
+            return false;
+        }
         STATE.store(ST_CONFIGURING, Ordering::Relaxed);
         PENDING_CFG.store(slot, Ordering::Relaxed);
         self.configure_endpoints(slot, ia, im, oa, om);
@@ -914,6 +956,13 @@ impl XhciController {
             HUBBED.store(false, Ordering::Relaxed);
             return false;
         };
+        if VENDOR.load(Ordering::Relaxed) && !self.mtp_os_probe(slot, IFACE.load(Ordering::Relaxed)) {
+            // MTPPHONE: not MTP — release the walk so usbnet's downstream walk (next in mod.rs) sees the slot.
+            STATE.store(ST_ABSENT, Ordering::Relaxed);
+            HUBBED.store(false, Ordering::Relaxed);
+            walk_reset();
+            return false;
+        }
         if !self.configure_bulk_endpoints_sync(slot, ia, im, oa, om) {
             fail("configure-endpoint(hub)", "refused");
             return true;
@@ -933,6 +982,7 @@ impl XhciController {
         }
         match STATE.load(Ordering::Relaxed) {
             ST_CONFIGURED if crate::boot::services_up() => self.ptp_bringup(slot),
+            ST_VENDOR if crate::boot::services_up() => self.mtp_vendor_claim(slot),
             ST_OPEN => {
                 self.ptp_events(slot);
                 self.ptp_fill(slot);
@@ -941,7 +991,32 @@ impl XhciController {
         }
     }
 
+    /// MTPPHONE: a parked root-port vendor candidate (ST_VENDOR) — its OS descriptor asked now that EP0
+    /// may be driven synchronously; MTP → the hub path's own synchronous Configure-Endpoint → ST_CONFIGURED
+    /// (bring-up on the next pass); anything else is released to the stock path.
+    fn mtp_vendor_claim(&mut self, slot: u8) {
+        let release = || {
+            STATE.store(ST_ABSENT, Ordering::Relaxed);
+            SLOT.store(0, Ordering::Relaxed);
+            walk_reset();
+        };
+        #[cfg(feature = "usbnet")]
+        if super::usbnet::is_link_slot(slot) {
+            return release(); // the link driver holds this slot (an AX88179 is 0xFF/0xFF/0x00 too)
+        }
+        if !self.mtp_os_probe(slot, IFACE.load(Ordering::Relaxed)) {
+            return release();
+        }
+        let (ia, im) = (IN_EP.load(Ordering::Relaxed), IN_MPS.load(Ordering::Relaxed));
+        let (oa, om) = (OUT_EP.load(Ordering::Relaxed), OUT_MPS.load(Ordering::Relaxed));
+        if !self.configure_bulk_endpoints_sync(slot, ia, im, oa, om) {
+            return fail("configure-endpoint(mtp)", "refused");
+        }
+        STATE.store(ST_CONFIGURED, Ordering::Relaxed);
+    }
+
     fn ptp_bringup(&mut self, slot: u8) {
+        let t0 = now_ms();
         let cfg = CFG_VALUE.load(Ordering::Relaxed).max(1);
         if !matches!(self.sync_control(slot, 0x00, 0x09, cfg as u16, 0, 0, 0, false), Ok(1)) {
             fail("SET_CONFIGURATION", "refused");
@@ -1001,12 +1076,25 @@ impl XhciController {
                 return;
             }
         };
-        let handles = self.ptp_handles();
+        // MTPPHONE: a phone (never a Sony body: its PTPCAM path above is untouched) lists its tree by MTP.
+        let mtp_l = if !is_sony && mtp::is_mtp(&di, mtp::OS_DESC_MTP.load(Ordering::Relaxed)) {
+            match mtp::enumerate(self, &di, &storages) {
+                Ok(l) => Some(l),
+                Err(e) => return fail("MTP enumerate", e),
+            }
+        } else {
+            None
+        };
+        let handles = match &mtp_l {
+            Some(l) => l.objs.iter().map(|o| o.handle).collect(),
+            None => self.ptp_handles(),
+        };
         if STATE.load(Ordering::Relaxed) == ST_FAILED {
             return;
         }
         let model = if di.model.is_empty() { String::from("camera") } else { di.model.clone() };
-        let volume = volume_name_of(&model);
+        let volume = volume_name_of(mtp_l.as_ref().and_then(|l| l.friendly.as_deref()).unwrap_or(&model));
+        let storage_names: Vec<String> = mtp_l.as_ref().map(|l| l.storages.iter().map(|s| s.1.clone()).collect()).unwrap_or_default();
         serial_println!(
             "[ptp] dev={:04x}:{:04x} model={} storages={} objects={}",
             vid, PID.load(Ordering::Relaxed), model, storages.len(), handles.len()
@@ -1022,7 +1110,10 @@ impl XhciController {
             t.infos.clear();
             t.failed.clear();
         }
-        *INFO.lock() = Some(Info { model, manufacturer: di.manufacturer, serial: di.serial, volume: volume.clone(), storages });
+        if let Some(l) = mtp_l {
+            mtp::install(l, t0, vid, PID.load(Ordering::Relaxed), &volume);
+        }
+        *INFO.lock() = Some(Info { model, manufacturer: di.manufacturer, serial: di.serial, volume: volume.clone(), storages, storage_names });
         STATE.store(ST_OPEN, Ordering::Relaxed);
         crate::fs::vfs::register_hotplug(crate::fs::vfs::ptpfs::provide);
         let _ = crate::fs::ns_bump::<(), ()>(Ok(()));
@@ -1103,6 +1194,9 @@ impl XhciController {
     /// Fill the object table, FILL_PER_PASS GetObjectInfo per pass; an event that asked for a re-list
     /// re-reads the handles first and keeps every info still valid.
     fn ptp_fill(&mut self, _slot: u8) {
+        if mtp::walk_pending() {
+            return self.mtp_walk_step(); // MTPPHONE: the per-folder walk (a body without a usable 0x9805)
+        }
         if REFRESH.swap(false, Ordering::Relaxed) {
             let handles = self.ptp_handles();
             if STATE.load(Ordering::Relaxed) != ST_OPEN {
@@ -1391,9 +1485,29 @@ impl XhciController {
         match phase {
             Phase::None => {}
             Phase::Out(data) => {
+                // MTPPHONE: a container longer than one TD is streamed — header + the first bytes, then
+                // full TDs (multiples of wMaxPacketSize, so no short packet mid-phase), a ZLP only after
+                // the last when the whole container is a multiple of wMaxPacketSize (§7.2). One TD's worth
+                // is exactly the old single `ptp_out`.
                 let all = unsafe { core::slice::from_raw_parts_mut(buf, XFER_MAX) };
-                let n = codec::container(all, ctype::DATA, op_code, tid, data).ok_or("data phase larger than one TD")?;
-                self.ptp_out(slot, phys, n)?;
+                let total = codec::HDR + data.len();
+                let first = data.len().min(XFER_MAX - codec::HDR);
+                codec::container(all, ctype::DATA, op_code, tid, &data[..first]).ok_or("data container")?;
+                all[0..4].copy_from_slice(&(if total > u32::MAX as usize { u32::MAX } else { total as u32 }).to_le_bytes());
+                let mps = OUT_MPS.load(Ordering::Relaxed) as usize;
+                let (mut sent, mut n) = (first, codec::HDR + first);
+                loop {
+                    let last = sent >= data.len();
+                    self.ptp_xfer(slot, false, phys, n, last && mps != 0 && total % mps == 0)?;
+                    if last {
+                        break;
+                    }
+                    let k = (data.len() - sent).min(XFER_MAX);
+                    let all = unsafe { core::slice::from_raw_parts_mut(buf, XFER_MAX) };
+                    all[..k].copy_from_slice(&data[sent..sent + k]);
+                    sent += k;
+                    n = k;
+                }
             }
             Phase::In { cap, into } => {
                 let n = self.ptp_in_container(slot, phys, XFER_MAX)?;
@@ -1456,9 +1570,8 @@ impl XhciController {
         }
         let len = len.min((size - off) as usize);
         if PARTIAL_OK.load(Ordering::Relaxed) && off <= u32::MAX as u64 {
-            let mut v = Vec::with_capacity(len);
-            let r = self.ptp_txn(op::GET_PARTIAL_OBJECT, &[handle, off as u32, len as u32], Phase::In { cap: len, into: &mut v })?;
-            return if r.code == rc::OK { Ok(v) } else { Err("GetPartialObject refused") };
+            // MTPPHONE: in chunks of at most 64 MiB (a range that fits one is the old single transaction).
+            return mtp::read_partial(self, handle, off, len, mtp::READ_CHUNK);
         }
         {
             let c = OBJ_CACHE.lock();
@@ -1582,7 +1695,7 @@ pub fn describe() -> Option<(String, String)> {
     let n = TABLE.lock().handles.len();
     let (v, p) = vid_pid();
     Some((
-        alloc::format!("ptp {:04x}:{:04x} {} ({}) storages={} objects={}{}", v, p, i.model, i.manufacturer, i.storages.len(), n, if sony_ready() { " liveview" } else { "" }),
+        alloc::format!("{} {:04x}:{:04x} {} ({}) storages={} objects={}{}", if i.storage_names.is_empty() { "ptp" } else { "mtp" }, v, p, i.model, i.manufacturer, i.storages.len(), n, if sony_ready() { " liveview" } else { "" }),
         alloc::format!("{:04x}:{:04x}:{}:{}", v, p, i.model, i.serial),
     ))
 }
@@ -1610,6 +1723,25 @@ fn storages() -> Vec<u32> {
     INFO.lock().as_ref().map(|i| i.storages.clone()).unwrap_or_default()
 }
 
+/// MTPPHONE: the session is MTP (its storages are named top-level folders, and it takes writes).
+pub fn is_mtp_session() -> bool {
+    is_open() && INFO.lock().as_ref().map(|i| !i.storage_names.is_empty()).unwrap_or(false)
+}
+
+/// The volume root's storage folders: an MTP session's names (always, even for one storage); else
+/// PTPCAM's `slot<n>` when the camera holds two or more; else none (the one storage IS the root).
+fn storage_dirs() -> Vec<String> {
+    let g = INFO.lock();
+    let Some(i) = g.as_ref() else { return Vec::new() };
+    if !i.storage_names.is_empty() {
+        return i.storage_names.clone();
+    }
+    if i.storages.len() > 1 {
+        return (0..i.storages.len()).map(|n| alloc::format!("slot{}", n + 1)).collect();
+    }
+    Vec::new()
+}
+
 /// The objects directly inside (`storage`, `parent`): `parent = None` is a storage's root — ParentObject 0
 /// or 0xFFFFFFFF, or a parent that is not a listed association.
 fn children_of(t: &Table, storage: Option<u32>, parent: Option<u32>) -> Vec<Obj> {
@@ -1632,7 +1764,8 @@ pub fn lookup(rel: &str) -> Option<Node> {
         return None;
     }
     let st = storages();
-    let multi = st.len() > 1;
+    let dirs = storage_dirs();
+    let multi = !dirs.is_empty();
     let mut parts = rel.split('/').filter(|c| !c.is_empty() && *c != ".");
     let mut storage = None;
     let mut first = parts.next();
@@ -1641,8 +1774,8 @@ pub fn lookup(rel: &str) -> Option<Node> {
     }
     if multi {
         let c = first?;
-        let ix = c.strip_prefix("slot").and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1 && *n <= st.len())?;
-        storage = Some(st[ix - 1]);
+        let ix = dirs.iter().position(|d| d.eq_ignore_ascii_case(c)).filter(|&i| i < st.len())?;
+        storage = Some(st[ix]);
         first = parts.next();
         if first.is_none() {
             return Some(Node::Dir { storage, handle: None });
@@ -1670,12 +1803,12 @@ pub fn lookup(rel: &str) -> Option<Node> {
 /// The listing of a directory node (what the table holds right now; a card still being listed shows
 /// the objects read so far).
 pub fn list(storage: Option<u32>, handle: Option<u32>) -> Vec<Row> {
-    let st = storages();
+    let dirs = storage_dirs();
     let mut rows = Vec::new();
     if storage.is_none() && handle.is_none() {
-        if st.len() > 1 {
-            for i in 0..st.len() {
-                rows.push(Row { name: alloc::format!("slot{}", i + 1), dir: true, size: 0, mtime: None });
+        if !dirs.is_empty() {
+            for name in dirs {
+                rows.push(Row { name, dir: true, size: 0, mtime: None });
             }
             return rows;
         }

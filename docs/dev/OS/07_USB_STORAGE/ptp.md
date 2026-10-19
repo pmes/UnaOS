@@ -132,5 +132,64 @@ PC-Remote mode `stream=ok(<n>B)` is one live-view JPEG over the cable.
 * The 0xFFFFC001 capture download after the shutter.
 * Space reaching the Camera window: `|| crate::drivers::xhci::uvc::key_route(ev)` (under `#[cfg(feature =
   "uvc")]`) in `video/quarry/live.rs`'s key chain.
-* Endpoint-halt recovery (CLEAR_FEATURE + Reset Endpoint) instead of closing the session; MTP-only devices
-  (class 0xFF + the "MTP" OS descriptor); CloseSession on detach.
+* Endpoint-halt recovery (CLEAR_FEATURE + Reset Endpoint) on the bulk pipes instead of closing the session;
+  CloseSession on detach. (MTP-only devices — class 0xFF + the "MTP" OS descriptor — are §9, MTPPHONE.)
+
+## 9. MTP — the phone (MTPPHONE, rmbp-ledger B715)
+
+A phone in File-transfer mode speaks MTP (Media Transfer Protocol 1.1, USB-IF 2011), the PTP superset: the same
+containers, session and object model as §2-§3, plus object PROPERTIES. Code: `unaos/crates/kernel/src/drivers/xhci/mtp.rs`
+(CHARTER Comscan — driver), a child module of `ptp.rs` (declared there by `#[path]`), so it reads PTPCAM's session, object
+table and transport without widening them. Same knob (`UNAOS_UVC=1`). A Sony body never enters MTP mode: §5's path is
+unchanged.
+
+**Enumeration.** `ptp::note_interface` takes the Still Image interface (0x06/0x01/0x01) OR the vendor interface
+0xFF/0xFF/0x00 an Android-style responder exposes, the latter only with an interrupt-IN and only if the Microsoft OS
+descriptor names it MTP: string descriptor 0xEE = "MSFT100" + bMS_VendorCode, then the Extended Compat ID (vendor request
+bRequest = that code, wIndex 4; device recipient 0xC0, then interface recipient 0xC1) whose compatibleID is "MTP". The probe
+is synchronous EP0, so it runs only on the hub path (`ptp_downstream`, before its Configure-Endpoint; a "no" hands the slot on
+to usbnet's walk) and on the service pass for a root-port device (the walk parks it as `ST_VENDOR`; `mtp_vendor_claim` probes,
+then `configure_bulk_endpoints_sync`). A slot usbnet holds is never probed. A STALL on 0xEE halts the xHCI control endpoint:
+the probe un-halts it (Reset Endpoint DCI 1 + Set TR Dequeue to the ep0 ring's enqueue). At bring-up the session is MTP when
+the OS descriptor said so, or DeviceInfo's VendorExtensionID is 6, or its VendorExtensionDesc carries "microsoft.com".
+
+**The volume.** `/volumes/<DeviceFriendlyName, else model>` through the same hot-plug seam (§4); every storage is a top-level
+folder named by its StorageInfo StorageDescription (e.g. `Internal shared storage`, `SD card`; deduplicated; `storage<n>`
+when blank) — even a phone with one storage, so the layout does not move when a card is inserted.
+
+**The tree in one pass.** GetObjectPropList (0x9805) with ObjectHandle 0, ObjectFormat 0, all properties (0xFFFFFFFF),
+group 0, depth 0xFFFFFFFF: every object of every storage in ONE transaction (the StorageID property sorts the rows). A body
+that answers SpecificationByDepth_Unsupported (0xA808; Android takes depth 0/1 only) is asked once with handle 0xFFFFFFFF,
+depth 0 (MTP's "all objects"). `mtp::prop_list` parses the dataset (u32 count, then handle / u16 property / u16 datatype /
+value) in one pass, sizing every datatype (INT8..UINT128, the arrays, STR) so an unknown property is skipped, never misread.
+A body without 0x9805, or one that refuses both forms: `mtp::Walker`, GetObjectHandles(storage, 0, folder) from each
+storage root (0xFFFFFFFF) and GetObjectInfo per handle, 32 transactions per service pass. Files are read on demand:
+GetPartialObject (0x101B) in chunks of at most 64 MiB (`mtp::read_partial`), else GetObject (§4).
+
+**Writes.** `mtp::write_file(dir, name, data)` = SendObjectInfo (0x100C, storage + parent; 0xFFFFFFFF = the storage root;
+format by extension) then SendObject (0x100D); `mtp::delete(path)` = DeleteObject (0x100B; a folder takes its subtree). The
+OUT data phase streams a container longer than one TD (32 KiB TDs, a ZLP only after the last when the container is a
+multiple of wMaxPacketSize). OWED: `fs/ptpfs.rs` still answers `write_veto` for every device volume, so Quarry's copy onto the
+phone reaches `write_file` only when ptpfs maps `create`/`write`/`unlink` onto it for an MTP session (B715's row);
+SendObjectPropList (0x9808, its dataset encoder exists) for a file of 4 GiB or more; GetPartialObject64 past 4 GiB.
+
+| code | name | used for | source |
+|---|---|---|---|
+| 0x1005 | GetStorageInfo | the storage folder's name | ISO 15740 §10.5.5, dataset §5.5.3 |
+| 0x100B | DeleteObject (handle, 0) | delete | §10.5.11 |
+| 0x100C / 0x100D | SendObjectInfo (storage, parent) / SendObject | write | §10.5.12-13 |
+| 0x1015 | GetDevicePropValue (0xD402 DeviceFriendlyName) | the volume's name | §10.5.21; MTP 1.1 Appendix C |
+| 0x9801 | GetObjectPropsSupported (0x3000) | counted on the session line | MTP 1.1 §5.3.1.1 |
+| 0x9805 | GetObjectPropList (0, 0, 0xFFFFFFFF, 0, 0xFFFFFFFF) | the tree in one transaction | MTP 1.1 §5.3.1.6, dataset Appendix E.2.1.1 |
+| 0x9808 | SendObjectPropList | recognised (>= 4 GiB writes owed) | MTP 1.1 §5.3.1.9 |
+| 0xA807 / 0xA808 | Specification_By_Group / _By_Depth_Unsupported | retry with the all-objects form | MTP 1.1 Appendix F |
+| 0xDC01 0xDC02 0xDC04 0xDC07 0xDC08 0xDC09 0xDC0B 0xDC44 | StorageID, ObjectFormat, ObjectSize (UINT64), ObjectFileName, DateCreated, DateModified, ParentObject, Name | the rows | MTP 1.1 Appendix B |
+| string 0xEE, wIndex 4 | "MSFT100" + vendor code; Extended Compat ID "MTP" | admits a vendor-class interface | Microsoft OS 1.0 Descriptors Specification; libmtp `libusb1-glue.c` |
+
+Wire: `[mtp] vendor interface slot= iface= …` · `[mtp] slot= iface= os-descriptor=MSFT100 vendor_code= compat=<MTP|other>` ·
+`[mtp] ep0 un-halt slot= reset= cc= set_deq=` · `[mtp] session storages=[…] friendly= props_supported= list=` ·
+`[mtp] dev=<vid:pid> name=<s> storages=<n> objects=<n> props=<fast|walk> ms=<n>` · `[mtp] write name= bytes= storage= parent=
+handle= ms=` · `[mtp] delete path= handle= rows_removed=`. `tests mtpphone` (QEMU has no MTP device): the driver against a
+synthetic responder over an in-RAM transport (two storages, 40 objects, a 3 MB object):
+`:: MTPPHONE: enumerated=1 storages=2 objects=40 read=ok write=ok delete=ok ms=<n> -> PASS ::`. The bench: a phone in
+File-transfer mode on the rMBP's USB port.
