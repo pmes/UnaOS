@@ -597,3 +597,19 @@ refs/heads/exec-rmbp-zoom         8369dd06 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-fileversions 73acb28b IN-FLIGHT cloud wave36 FILEVERSIONS (B714)
 refs/heads/exec-rmbp-mtpphone     50b81ddc FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-undomove     70b7e441 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-keychars      b71c7fa8 IN-FLIGHT cloud wave36 KEYCHARS
+refs/heads/exec-rmbp-clockpainters b71c7fa8 IN-FLIGHT cloud wave36 CLOCKPAINTERS
+refs/heads/exec-rmbp-kelfstage     b71c7fa8 IN-FLIGHT cloud wave36 KELFSTAGE
+refs/heads/exec-rmbp-softydots     b71c7fa8 IN-FLIGHT cloud wave36 SOFTYDOTS
+refs/heads/exec-rmbp-raiseverb     b71c7fa8 IN-FLIGHT cloud wave36 RAISEVERB
+refs/heads/exec-rmbp-net6grant     b71c7fa8 IN-FLIGHT cloud wave36 NET6GRANT
+refs/heads/exec-rmbp-uacmic        b71c7fa8 IN-FLIGHT cloud wave36 UACMIC
+refs/heads/exec-rmbp-rawcolor      b71c7fa8 IN-FLIGHT cloud wave36 RAWCOLOR
+refs/heads/exec-rmbp-hwreport      b71c7fa8 IN-FLIGHT cloud wave36 HWREPORT
+refs/heads/exec-rmbp-updateui      b71c7fa8 IN-FLIGHT cloud wave36 UPDATEUI
+refs/heads/exec-rmbp-mtpwrite      b71c7fa8 IN-FLIGHT cloud wave36 MTPWRITE
+refs/heads/exec-rmbp-lock2         b71c7fa8 IN-FLIGHT cloud wave36 LOCK2
+refs/heads/exec-rmbp-diskreserve   b71c7fa8 IN-FLIGHT cloud wave36 DISKRESERVE
+refs/heads/exec-rmbp-helpsearch    b71c7fa8 IN-FLIGHT cloud wave36 HELPSEARCH
+refs/heads/exec-rmbp-fontkit       b71c7fa8 IN-FLIGHT cloud wave36 FONTKIT
+refs/heads/exec-rmbp-audiomix      b71c7fa8 IN-FLIGHT cloud wave36 AUDIOMIX
