@@ -919,7 +919,7 @@ pub enum TypeRole {
 pub struct TypeStep {
     pub size_pt: u8,
     pub line_pt: u8,
-    pub weight: u16,
+    pub weight: u16, pub opsz: u8, // FONTKIT (B730): `opsz` in pt beside `wght` — 0 = no axis named (the mono row); LINE-NEUTRAL fold, code first
     pub tracking_bp: i16,
     pub mono: bool,
 }
@@ -931,8 +931,8 @@ impl TypeStep {
     }
 }
 
-const fn ts(size_pt: u8, line_pt: u8, weight: u16, tracking_bp: i16) -> TypeStep {
-    TypeStep { size_pt, line_pt, weight, tracking_bp, mono: false }
+const fn ts(size_pt: u8, line_pt: u8, weight: u16, opsz: u8, tracking_bp: i16) -> TypeStep {
+    TypeStep { size_pt, line_pt, weight, opsz, tracking_bp, mono: false }
 }
 
 /// The base step of each look: (Una's body, Softy's body), in pt.
@@ -940,16 +940,16 @@ pub const TYPE_BASE_PT: (u8, u8) = (13, 14);
 
 /// DESIGN-LANGUAGE §2.2, row for row: (role, Una, Softy).
 pub const TYPE_RAMP: [(TypeRole, TypeStep, TypeStep); 10] = [
-    (TypeRole::Caption, ts(11, 14, 400, 50), ts(12, 16, 400, 50)),
-    (TypeRole::Footnote, ts(12, 16, 400, 25), ts(12, 16, 400, 25)),
-    (TypeRole::Body, ts(13, 18, 400, 0), ts(14, 20, 400, 0)),
-    (TypeRole::BodyStrong, ts(13, 18, 600, 0), ts(14, 20, 600, 0)),
-    (TypeRole::Headline, ts(15, 20, 600, -25), ts(16, 22, 600, -25)),
-    (TypeRole::Title3, ts(17, 22, 600, -50), ts(18, 24, 600, -50)),
-    (TypeRole::Title2, ts(20, 26, 600, -75), ts(20, 28, 600, -75)),
-    (TypeRole::Title1, ts(26, 32, 700, -100), ts(28, 36, 700, -100)),
-    (TypeRole::Display, ts(40, 48, 700, -150), ts(40, 52, 700, -150)),
-    (TypeRole::Mono, TypeStep { mono: true, ..ts(12, 18, 400, 0) }, TypeStep { mono: true, ..ts(13, 20, 400, 0) }),
+    (TypeRole::Caption, ts(11, 14, 450, 11, 50), ts(12, 16, 450, 12, 50)),
+    (TypeRole::Footnote, ts(12, 16, 400, 12, 25), ts(12, 16, 400, 12, 25)),
+    (TypeRole::Body, ts(13, 18, 400, 13, 0), ts(14, 20, 400, 14, 0)),
+    (TypeRole::BodyStrong, ts(13, 18, 600, 13, 0), ts(14, 20, 600, 14, 0)),
+    (TypeRole::Headline, ts(15, 20, 600, 15, -25), ts(16, 22, 600, 16, -25)),
+    (TypeRole::Title3, ts(17, 22, 600, 17, -50), ts(18, 24, 600, 18, -50)),
+    (TypeRole::Title2, ts(20, 26, 600, 20, -75), ts(20, 28, 600, 20, -75)),
+    (TypeRole::Title1, ts(26, 32, 700, 26, -100), ts(28, 36, 700, 28, -100)),
+    (TypeRole::Display, ts(40, 48, 700, 40, -150), ts(40, 52, 700, 40, -150)),
+    (TypeRole::Mono, TypeStep { mono: true, ..ts(12, 18, 400, 0, 0) }, TypeStep { mono: true, ..ts(13, 20, 400, 0, 0) }),
 ];
 
 /// The step of `role` in the Una look (`softy == false`) or the Softy look.
@@ -1061,4 +1061,20 @@ pub fn contrast_selftest() {
         if on_ok { "ok" } else { "LOW" }, min / 100, (min % 100) / 10, if off_ok { "ok" } else { "MOVED" }, bumps,
         if pass { "PASS" } else { "FAIL" }, if dark { "dark" } else { "light" }, e0, e1, e2
     );
+}
+
+// ── FONTKIT (rmbp-ledger B730): every type role carries its variation axes in the ONE table above ─────────────────
+// FVAR (SR150) gave `font_core::ui::Style::with_axes(wght, opsz)`; this is what a painter hands it for a role. The
+// ramp's `weight` is the `wght` and its `opsz` the optical size in pt (= the role's size, so a role drawn at its own
+// size draws the instance FVAR's default already drew; the face clamps it to its axis, Inter 14..32). The mono row
+// names no axis (`(None, None)`): JetBrains Mono draws as loaded, unchanged. A static face has neither axis and
+// `font_core` ignores both (`Engine::weight_for`, `Engine::instance`). Appended at the file tail so no line above moves.
+impl TypeStep {
+    /// `(wght, opsz)` for `Style::with_axes`; `(None, None)` for the mono row.
+    pub fn axes(self) -> (Option<u16>, Option<f32>) {
+        if self.mono {
+            return (None, None);
+        }
+        (Some(self.weight), if self.opsz == 0 { None } else { Some(self.opsz as f32) })
+    }
 }
