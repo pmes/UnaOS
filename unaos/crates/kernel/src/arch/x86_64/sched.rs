@@ -454,6 +454,11 @@ pub struct Task {
     /// eligibility, and giving this field any authority would quietly recreate the two-class
     /// distinction the arc removed.
     hint_placed: bool,
+    /// FPU (rmbp-ledger B666): this task's x87/SSE register file as a 512-byte FXSAVE image, 16-aligned
+    /// (`FpuArea` is `align(16)`, so the `Box<Task>` is). Live in the registers while the task runs;
+    /// `fpu::switch_out` saves it here at every switch-back and `fpu::dispatch` restores it at every
+    /// dispatch, on whichever core that is. Only ring-3 tasks use it (kernel code is soft-float).
+    fpu: fpu::FpuArea,
 
     // ── R1 / rtpi: PRIORITY-INHERITANCE state (feature-gated so a knob-off `Task` is byte-identical) ──
     //
@@ -2453,6 +2458,7 @@ fn spawn_inner(
         steal_esc: 0,
         migrate_ms: 0,
         hint_placed: false,
+        fpu: fpu::FpuArea::INIT, // FPU (B666): a fresh task starts from the initial x87/SSE image
         #[cfg(feature = "rtpi")]
         held: [const { AtomicU64::new(0) }; PI_HELD_MAX],
     });
@@ -2572,6 +2578,11 @@ extern "C" fn user_task_trampoline() -> ! {
         }
     }
 
+    // FPU (B666): enter a UnaOS program AS IF CALLED — rsp = 8 (mod 16), what a SysV `extern "C"` entry
+    // (`_start`, a SYS_THREAD_SPAWN worker) assumes. The loaders and SYS_THREAD_SPAWN hand a 16-aligned
+    // top; hardware-float code spills with `movaps`, which would #GP one slot off. A Linux task keeps its
+    // exact rsp (argc lives at [rsp]). See `fpu::entry_pad`.
+    let user_rsp = user_rsp - fpu::entry_pad(unsafe { (*raw).name });
     // Drop to ring 3. `swapgs` parks this CPU's PerCpuData pointer in the GS shadow for the syscall
     // path; the `iretq` frame is [SS, RSP, RFLAGS, CS, RIP] (RIP pushed LAST so `iretq` pops it
     // first). Interrupts are masked HERE, so the swapgs/iretq window can't take an IRQ; a preemptible
@@ -2740,6 +2751,7 @@ fn spawn_user_inner(
         steal_esc: 0,
         migrate_ms: 0,
         hint_placed: false,
+        fpu: fpu::FpuArea::INIT, // FPU (B666): a fresh task starts from the initial x87/SSE image
         #[cfg(feature = "rtpi")]
         held: [const { AtomicU64::new(0) }; PI_HELD_MAX],
     });
@@ -2995,6 +3007,7 @@ pub fn spawn_user_thread(
         migrate_ms: 0,
         // VUGSPREAD (review F16): this core came from ring 3's `place` argument. Attribution only.
         hint_placed: true,
+        fpu: fpu::FpuArea::INIT, // FPU (B666): a thread starts from the initial x87/SSE image, never its creator's
         #[cfg(feature = "rtpi")]
         held: [const { AtomicU64::new(0) }; PI_HELD_MAX],
     });
@@ -6383,7 +6396,7 @@ fn run() -> ! {
                     let uc = unsafe { (*raw).user_cr3 };
                     { #[cfg(feature = "linuxabi")] if uc != 0 { crate::arch::linuxabi::on_dispatch(uc); } /* LINUXABI2: re-assert this process's FS_BASE per switch-in */ if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() } }
                 };
-                #[cfg(feature = "linuxabi")] crate::arch::linuxabi::fpu::dispatch(cpu, unsafe { (*raw).user_cr3 }, unsafe { (*raw).name }, unsafe { (*raw).user_entry } != 0); // LINUXABI3: a Linux task gets CR4.OSFXSR + its FXSAVE image; a UnaOS ring-3 task gets OSFXSR cleared (its SSE #UD fence).
+                fpu::dispatch(cpu, raw); // FPU (B666): every ring-3 task gets CR4.OSFXSR + its FXSAVE image (a UnaOS task its `Task::fpu`, a Linux task its LINUXABI3 slot); kernel tasks change nothing.
                 //
                 // VUGSPREAD adds one counter and no branch. `CR3_RELOADS` already counted the RARE
                 // arm — the generation-behind revalidation — but the arm that a MIGRATION actually
@@ -6472,7 +6485,7 @@ fn run() -> ! {
                 // free it is below).
                 stack_guard_check(cpu, raw);
 
-                #[cfg(feature = "linuxabi")] crate::arch::linuxabi::fpu::switch_out(cpu); // LINUXABI3: save a Linux task's x87/XMM file and scrub it before anything else runs on this core.
+                fpu::switch_out(cpu); // FPU (B666): save the ring-3 task's x87/XMM file (its own `Task::fpu`, or a Linux task's slot) and scrub it before anything else runs on this core. LINUXABI3's hook rides inside.
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
                 SCHED[cpu].current_prio.store(PRIO_IDLE, Ordering::Release);
@@ -8020,4 +8033,230 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
         r.current.map_or(-1i64, |t| t as i64)
     );
     r
+}
+
+// ── FPU (rmbp-ledger B666): the x87/SSE context of every ring-3 task — ONE mechanism for both kinds ──────────
+//
+// The kernel target (`unaos/x86_64-unaos.json`) is soft-float with MMX/SSE off, so no kernel code touches the x87/XMM
+// file or MXCSR: what a ring-3 task left there is still there when the scheduler runs. EAGER: `dispatch` (the one
+// dispatch site in `run`, IF=0, before the switch in) sets CR4.OSFXSR and `fxrstor64`s the incoming ring-3 task's
+// image; `switch_out` (the first statement after any task returns to the scheduler: yield, preempt, block, exit; IF=0;
+// the Task box still live) `fxsave64`s it and loads the initial image, so no x87/XMM residue reaches the next task.
+// Lazy CR0.TS/#NM is not used: there is no #NM handler (interrupts.rs wires #MF/#XM only), and the U2.5 first-entry
+// `fninit` scrub in `user_task_trampoline` runs at CPL 0, where TS would itself trap. The SYSCALL stub
+// (`unaos_syscall_entry`, syscall.rs) moves GPRs only and calls soft-float Rust: a syscall that does not block leaves
+// XMM/MXCSR/x87 untouched; one that blocks or yields goes through `switch_out`. FXSAVE, not XSAVE: CR4.OSXSAVE and
+// XCR0 stay clear, so AVX/VEX is a clean #UD and the ring-3 target enables sse,sse2 only.
+// A UnaOS ring-3 task (and SYS_THREAD_SPAWN thread) keeps its image in `Task::fpu`; a Linux-ABI task keeps the
+// LINUXABI3 slot keyed by PML4/thread (fork copies it before the child task exists) — `linuxabi::fpu` calls these
+// primitives and owns only its table.
+pub mod fpu {
+    use super::Task;
+    use crate::arch::gdt::MAX_CPUS;
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+
+    const CR0_MP: u64 = 1 << 1;
+    const CR0_EM: u64 = 1 << 2;
+    const CR0_TS: u64 = 1 << 3;
+    const CR0_NE: u64 = 1 << 5;
+    const CR4_OSFXSR: u64 = 1 << 9;
+    const CR4_OSXMMEXCPT: u64 = 1 << 10;
+    /// Initial MXCSR: every SSE exception masked, round-to-nearest, no flags (Linux's too).
+    pub const MXCSR_INIT: u32 = 0x1F80;
+    /// The context size every ring-3 task owns.
+    pub const CTX_BYTES: usize = core::mem::size_of::<FpuArea>();
+
+    /// One FXSAVE image (Intel SDM Vol. 1 §10.5.1): 512 bytes, 16-aligned.
+    #[repr(C, align(16))]
+    pub struct FpuArea(pub [u8; 512]);
+    const _: () = assert!(core::mem::size_of::<FpuArea>() == 512 && core::mem::align_of::<FpuArea>() == 16);
+
+    impl FpuArea {
+        /// The initial FP state as an FXSAVE image: FCW 0x37F (all x87 exceptions masked, 64-bit precision), empty
+        /// tags, MXCSR 0x1F80, every register zero.
+        pub const INIT: FpuArea = {
+            let mut a = [0u8; 512];
+            a[0] = 0x7F;
+            a[1] = 0x03;
+            a[24] = (MXCSR_INIT & 0xFF) as u8;
+            a[25] = (MXCSR_INIT >> 8) as u8;
+            FpuArea(a)
+        };
+    }
+    /// The scrub image `switch_out` loads (an address for `fxrstor64`).
+    pub static INIT: FpuArea = FpuArea::INIT;
+
+    /// Per core: the `Task::fpu` whose state is LIVE in this core's registers (0 = none — a kernel task, or a Linux
+    /// task whose live state the LINUXABI3 table tracks).
+    static LIVE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// Per core: shadow of CR4.OSFXSR as last written here (exact once `core_init` ran); one-time CR0/CR4 init done.
+    static CR4_ON: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+    static CORE_INIT: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+    /// UnaOS ring-3 images saved / restored (the Linux box counts its own in `linuxabi::fpu`).
+    pub static SAVES: AtomicU64 = AtomicU64::new(0);
+    pub static RESTORES: AtomicU64 = AtomicU64::new(0);
+    /// CR4.OSFXSR writes after a core's init (only a slotless Linux task clears it now).
+    pub static CR4_FLIPS: AtomicU64 = AtomicU64::new(0);
+
+    /// FXSR + SSE + SSE2 (CPUID.1:EDX bits 24/25/26) — every x86_64 part has them; checked anyway, fail closed.
+    pub fn supported() -> bool {
+        // 0 = not probed, 1 = yes, 2 = no. Cached: CPUID is serialising (and a VM exit under a hypervisor).
+        static PROBE: AtomicU8 = AtomicU8::new(0);
+        match PROBE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let ok = core::arch::x86_64::__cpuid(1).edx & (7 << 24) == 7 << 24;
+                PROBE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+                ok
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn fxsave(a: *mut FpuArea) {
+        unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) a, options(nostack, preserves_flags)) };
+    }
+
+    #[inline(always)]
+    pub unsafe fn fxrstor(a: *const FpuArea) {
+        unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) a, options(nostack, preserves_flags, readonly)) };
+    }
+
+    /// Once per core, before the first ring-3 FP image is loaded there: CR0.MP|NE set, EM|TS clear (native x87 errors,
+    /// no #NM), CR4.OSXMMEXCPT|OSFXSR set (SSE on, unmasked SSE exceptions as #XM). The AP trampoline leaves CR4 = PAE
+    /// only and the BSP keeps firmware's, so the shadow is made exact here rather than assumed.
+    pub fn core_init(cpu: usize) {
+        if cpu >= MAX_CPUS || CORE_INIT[cpu].load(Ordering::Relaxed) || !supported() {
+            return;
+        }
+        use x86_64::registers::control::{Cr0, Cr4};
+        unsafe {
+            let cr0 = Cr0::read_raw() as u64;
+            Cr0::write_raw(((cr0 | CR0_MP | CR0_NE) & !(CR0_EM | CR0_TS)) as _);
+            Cr4::write_raw((Cr4::read_raw() as u64 | CR4_OSXMMEXCPT | CR4_OSFXSR) as _);
+        }
+        CR4_ON[cpu].store(true, Ordering::Relaxed);
+        CORE_INIT[cpu].store(true, Ordering::Relaxed);
+    }
+
+    /// Set or clear CR4.OSFXSR on this core (one write per change, shadowed).
+    pub fn set_osfxsr(cpu: usize, on: bool) {
+        if cpu >= MAX_CPUS || CR4_ON[cpu].load(Ordering::Relaxed) == on || (on && !supported()) {
+            return;
+        }
+        use x86_64::registers::control::Cr4;
+        unsafe {
+            let cr4 = Cr4::read_raw() as u64;
+            Cr4::write_raw((if on { cr4 | CR4_OSFXSR } else { cr4 & !CR4_OSFXSR }) as _);
+        }
+        CR4_ON[cpu].store(on, Ordering::Relaxed);
+        CR4_FLIPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cores whose CR4.OSFXSR is set (by the shadow) — the `tests fpu` detail line.
+    pub fn osfxsr_cores() -> usize {
+        CR4_ON.iter().filter(|b| b.load(Ordering::Relaxed)).count()
+    }
+
+    /// `user_task_trampoline`'s entry pad: 8 for a UnaOS program (enter as if called), 0 for a Linux-ABI task.
+    pub fn entry_pad(name: &str) -> u64 {
+        #[cfg(feature = "linuxabi")]
+        if name == crate::arch::linuxabi::TASK_NAME {
+            return 0;
+        }
+        let _ = name;
+        8
+    }
+
+    /// The scheduler's dispatch hook (IF=0, `current` published, before the switch into `t`).
+    pub(super) fn dispatch(cpu: usize, t: *mut Task) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        let (ring3, cr3, name) = unsafe { ((*t).user_entry != 0, (*t).user_cr3, (*t).name) };
+        #[cfg(feature = "linuxabi")]
+        if crate::arch::linuxabi::fpu::dispatch(cpu, cr3, name) {
+            return; // a Linux task: its slot restored, or OSFXSR cleared (no slot — fail closed)
+        }
+        let _ = (cr3, name);
+        if !ring3 || !supported() {
+            return; // a kernel task touches no FP state; without FXSR a ring-3 SSE instruction stays #UD
+        }
+        core_init(cpu);
+        set_osfxsr(cpu, true);
+        let a = unsafe { core::ptr::addr_of_mut!((*t).fpu) };
+        unsafe { fxrstor(a) };
+        LIVE[cpu].store(a as u64, Ordering::Relaxed);
+        RESTORES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The scheduler's switch-back hook (IF=0, the task just returned to the scheduler, its Box not yet requeued,
+    /// parked or freed). One relaxed load when no ring-3 FP state is live.
+    pub(super) fn switch_out(cpu: usize) {
+        if cpu < MAX_CPUS {
+            let p = LIVE[cpu].load(Ordering::Relaxed);
+            if p != 0 {
+                LIVE[cpu].store(0, Ordering::Relaxed);
+                unsafe {
+                    fxsave(p as *mut FpuArea);
+                    fxrstor(&INIT); // the scrub: no ring-3 x87/XMM residue reaches the next task
+                }
+                SAVES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        #[cfg(feature = "linuxabi")]
+        crate::arch::linuxabi::fpu::switch_out(cpu);
+    }
+
+    /// `tests fpu` (M3): BIG.ELF's `fpu` verb — two ring-3 tasks of one process (the program and one SYS_THREAD_SPAWN
+    /// worker on its core) each load xmm0..xmm15 and their own MXCSR, yield, and read them back, 64 rounds; then one
+    /// hardware-float computation held in registers across yields, checked bit-exactly. Exit status: low byte = pass
+    /// bits (0x80 the verb ran, 0x01 program xmm, 0x02 worker xmm, 0x04 both MXCSRs, 0x08 float math, 0x10 worker
+    /// joined), bits 8..23 = rounds in which the OTHER task moved across the yield (the observed interleave).
+    /// `:: FPU: osfxsr=<0|1> ctx_bytes=512 tasks=<n> switches=<n> xmm_survived=<ok|bad> mode=eager -> PASS|FAIL|SKIP ::`
+    pub fn selftest() {
+        use crate::arch::syscall::RunOutcome;
+        const PATH: &str = "/apps/BIG.ELF";
+        const ALL: u32 = 0x9F;
+        let mt = crate::shell::vfs_mount_table();
+        let full = crate::shell::vfs_path(PATH);
+        let Ok(st) = mt.stat(&full) else {
+            serial_println!(":: FPU: osfxsr=- ctx_bytes={} tasks=0 switches=0 xmm_survived=- mode=eager -> SKIP reason=no-big-bin ::", CTX_BYTES);
+            return;
+        };
+        let bytes = match mt.read(&full, 0, st.size as usize) {
+            Ok(b) if b.len() as u64 == st.size => b,
+            _ => {
+                serial_println!(":: FPU: osfxsr=- ctx_bytes={} tasks=0 switches=0 xmm_survived=- mode=eager -> FAIL reason=read ::", CTX_BYTES);
+                return;
+            }
+        };
+        let (s0, r0) = (SAVES.load(Ordering::Relaxed), RESTORES.load(Ordering::Relaxed));
+        let res = crate::arch::syscall::run_user_image_argv("fpu", &bytes, 10_000, &["big", "fpu"]);
+        let (saves, restores) = (SAVES.load(Ordering::Relaxed).wrapping_sub(s0), RESTORES.load(Ordering::Relaxed).wrapping_sub(r0));
+        let (outcome, status) = match res {
+            Ok((RunOutcome::Exited(s), _)) => ("exited", Some(s as u32)),
+            Ok((RunOutcome::Faulted, _)) => ("faulted", None),
+            Ok((RunOutcome::Timeout, _)) => ("timeout", None),
+            Err(e) => (e, None),
+        };
+        let bits = status.map(|s| s & 0xFF).unwrap_or(0);
+        let switches = status.map(|s| (s >> 8) & 0xFFFF).unwrap_or(0);
+        let tasks = if bits & 0x80 != 0 { 1 + (bits & 0x10 != 0) as u32 } else { 0 };
+        // The program's own SSE instructions ran without #UD: that is CR4.OSFXSR=1 on the cores it ran on.
+        let osfxsr = bits & 0x80 != 0;
+        let xmm_ok = bits & 0x07 == 0x07;
+        // Every yield of either task is one save and one restore here; 2 x 64 rounds is the floor.
+        let pass = bits == ALL && tasks == 2 && switches >= 1 && saves >= 128 && restores >= 128 && CTX_BYTES == 512;
+        serial_println!(
+            "[fpu] outcome={} status={:?} bits={:#x} saves={} restores={} osfxsr_cores={} cr4_flips={}",
+            outcome, status, bits, saves, restores, osfxsr_cores(), CR4_FLIPS.load(Ordering::Relaxed)
+        );
+        serial_println!(
+            ":: FPU: osfxsr={} ctx_bytes={} tasks={} switches={} xmm_survived={} mode=eager -> {} ::",
+            osfxsr as u8, CTX_BYTES, tasks, switches, if xmm_ok { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }
+        );
+    }
 }
