@@ -597,23 +597,23 @@ refs/heads/exec-rmbp-zoom         8369dd06 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-fileversions aea12d08 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-mtpphone     50b81ddc FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-undomove     70b7e441 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-keychars      b71c7fa8 IN-FLIGHT cloud wave36 KEYCHARS
-refs/heads/exec-rmbp-clockpainters b71c7fa8 IN-FLIGHT cloud wave36 CLOCKPAINTERS
+refs/heads/exec-rmbp-keychars      7b4d54dd FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-clockpainters e650105a FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-kelfstage     7d549210 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-softydots     b71c7fa8 IN-FLIGHT cloud wave36 SOFTYDOTS
+refs/heads/exec-rmbp-softydots     557370ca FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-raiseverb     d5cbfcf4 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-net6grant     86048eb9 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-uacmic        fad9ba46 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-rawcolor      b71c7fa8 IN-FLIGHT cloud wave36 RAWCOLOR
-refs/heads/exec-rmbp-hwreport      b71c7fa8 IN-FLIGHT cloud wave36 HWREPORT
+refs/heads/exec-rmbp-hwreport      8f8997c9 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-updateui      16ffa390 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-mtpwrite      4bd35fdd FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-lock2         b71c7fa8 IN-FLIGHT cloud wave36 LOCK2
-refs/heads/exec-rmbp-diskreserve   b71c7fa8 IN-FLIGHT cloud wave36 DISKRESERVE
+refs/heads/exec-rmbp-diskreserve   e5bd3a6a FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-helpsearch    b71c7fa8 IN-FLIGHT cloud wave36 HELPSEARCH
 refs/heads/exec-rmbp-fontkit       35f53609 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-audiomix      b71c7fa8 IN-FLIGHT cloud wave36 AUDIOMIX
-refs/heads/exec-rmbp-quarryversions 95240ae0 IN-FLIGHT cloud wave36 QUARRYVERSIONS (B732)
+refs/heads/exec-rmbp-quarryversions 673856f6 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-stagewindow  658415ad IN-FLIGHT cloud wave36 STAGEWINDOW (B733)
 refs/heads/exec-rmbp-crawlb       3287fafc IN-FLIGHT cloud wave36 CRAWLB (the fs/storage/security crawl fixes)
 refs/heads/exec-rmbp-oneinstance  bfc63a86 IN-FLIGHT cloud wave36 ONEINSTANCE (B734)
