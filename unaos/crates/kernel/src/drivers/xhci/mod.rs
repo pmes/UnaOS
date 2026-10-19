@@ -5197,7 +5197,7 @@ impl XhciController {
                                             // later DROP (full 64-slot ring) can never strand a held key. Pass
                                             // the newest ascii pressed this report and the FULL currently-held
                                             // ascii set; the tracker disarms the moment its key leaves the set.
-                                            #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+                                            #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")))] // ORINREPEAT (SR164): + tegra — the Orin's XUSB keyboards decode in this same `poll_events`, so the Pi's feed is theirs too
                                             {
                                                 let mut held: [u32; 6] = [0; 6];
                                                 let mut hn = 0usize;

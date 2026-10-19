@@ -1607,7 +1607,7 @@ pub fn keyboard_detach_gen() -> u64 {
 // repeat rides the SAME EVENT_QUEUE routing (asid focus, compositor, shell) a real press takes, and the
 // backpressure guard still refuses to inject past a half-full ring.
 #[cfg(any(
-    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
 mod typematic {
@@ -1684,7 +1684,7 @@ mod typematic {
 /// keycodes, so nothing is lost. Order-sensitive by design: a reordered set compares unequal, which only ever
 /// costs a missed latch (the safe direction — the conservative `HOLD_MAX_MS` window stays in force).
 #[cfg(any(
-    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
 fn pack_held(held: &[u32]) -> u64 {
@@ -1702,7 +1702,7 @@ fn pack_held(held: &[u32]) -> u64 {
 /// what closes the UVUG-5 dropped-`KeyUp` hole. A synthesised repeat never comes through here (it is not a HID
 /// report), so the initial delay is honoured exactly once per physical press.
 #[cfg(any(
-    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
 pub fn typematic_note_keys(newest_press: u32, held: &[u32]) { // CHARREPEAT: tokens (`typematic_char_key`); the u8 `typematic_note_report` is the file-tail wrapper
@@ -1806,7 +1806,7 @@ pub fn typematic_note_keys(newest_press: u32, held: &[u32]) { // CHARREPEAT: tok
 /// unplug is accounted exactly like one that ends by release. Silent for a hold that never repeated (a tap),
 /// which is the overwhelming majority of key presses.
 #[cfg(any(
-    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
 fn typematic_hold_rollup() {
@@ -1836,7 +1836,7 @@ fn typematic_hold_rollup() {
 /// the selftest's forced-lapse aid both go through it). Clears the armed slot and PARKS the key, so the next
 /// report that still contains it re-arms instead of the operator having to lift and re-press.
 #[cfg(any(
-    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
 fn typematic_lapse_disarm(k: u32) {
@@ -1849,7 +1849,7 @@ fn typematic_lapse_disarm(k: u32) {
 /// key is held, the repeat is not yet due, the keyboard detached, liveness lapsed, or EVENT_QUEUE is past half
 /// full. Called once per USB pump pass, BEFORE the drain, by the host pump in `main`.
 #[cfg(any(
-    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
 pub fn typematic_tick() -> Option<Event> {
@@ -1924,7 +1924,7 @@ pub fn typematic_tick() -> Option<Event> {
 
 /// UVUG-6 test aid — force the next repeat "due" now, so the QEMU selftest can exercise the inject/suppress
 /// decision deterministically without waiting out the real delay. Not used on any boot path.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), all(target_arch = "x86_64", feature = "ehcihid")))] // CHARREPEAT: the tracker's own cfg (was aarch64+baremetal), so `tests keychars` drives it on x86 too
+#[cfg(any(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")), all(target_arch = "x86_64", feature = "ehcihid")))] // ORINREPEAT (SR164): + tegra, the Orin feeds it too. CHARREPEAT: the tracker's own cfg (was aarch64+baremetal), so `tests keychars` drives it on x86 too
 pub fn typematic_test_force_due() {
     use core::sync::atomic::Ordering;
     typematic::NEXT_MS.store(crate::arch::ms(), Ordering::Relaxed);
@@ -1941,7 +1941,7 @@ pub fn typematic_test_streams_latched() -> bool {
 
 /// UVUG-9 test aid — clear all typematic tracker state so a selftest leg starts from a known baseline
 /// (equivalent to a fresh keyboard, without faking a detach generation). Not used on any boot path.
-#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), all(target_arch = "x86_64", feature = "ehcihid")))] // CHARREPEAT: the tracker's own cfg (was aarch64+baremetal), so `tests keychars` drives it on x86 too
+#[cfg(any(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")), all(target_arch = "x86_64", feature = "ehcihid")))] // ORINREPEAT (SR164): + tegra, the Orin feeds it too. CHARREPEAT: the tracker's own cfg (was aarch64+baremetal), so `tests keychars` drives it on x86 too
 pub fn typematic_test_reset() {
     use core::sync::atomic::Ordering;
     typematic::KEY_P1.store(0, Ordering::Relaxed);
