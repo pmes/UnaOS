@@ -95,7 +95,7 @@ pub fn current() -> Locale {
 
 /// The painters that print a civil second through this file. The bit of each lands in [`painted`] when it draws.
 /// CLOCKPAINTERS (B719) repointed the seven that still split the UTC second themselves (`Bar` … `Quarry` are
-/// TZLOCALE's three; `BarDate` … `Login` are B719's).
+/// TZLOCALE's three; `BarDate` … `Login` are B719's). CIVILREST (B738) repointed the last three: `Taken` … `Appearance`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Painter {
     /// The Una menu bar's clock (`video/menubar.rs` `clock_hhmm`).
@@ -119,9 +119,15 @@ pub enum Painter {
     Notify = 8,
     /// The login screen's civil line under the card (`video/login.rs`).
     Login = 9,
+    /// A photo's Taken attribute as a person reads it: Get Info's row and Quarry's column (`fs/attrfacts.rs` `fmt_value`).
+    Taken = 10,
+    /// The Privacy tab's kept decisions, the date each was answered (`video/settings.rs` `paint_privacy`).
+    Privacy = 11,
+    /// The local hour `auto` appearance and the notification quiet hours read (`video/appearance.rs` `local_hour`).
+    Appearance = 12,
 }
 /// How many painters [`Painter`] names.
-pub const PAINTERS: usize = 10;
+pub const PAINTERS: usize = 13;
 static PAINTED: AtomicU16 = AtomicU16::new(0);
 
 /// The painters that have drawn through this file this boot (bit = `Painter as u8`).
