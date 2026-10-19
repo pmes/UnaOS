@@ -577,7 +577,7 @@ refs/heads/exec-rmbp-softydark  3171a098 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-aging        11b1cb6f DONE-awaiting-fold cloud wave36 AGING (B695)
 refs/heads/exec-rmbp-veilcost     d332b763 DONE-awaiting-fold cloud wave36 VEILCOST (B696)
 refs/heads/exec-rmbp-notelemetry  96ed4711 IN-FLIGHT cloud wave36 NOTELEMETRY
-refs/heads/exec-rmbp-focussteal   96ed4711 IN-FLIGHT cloud wave36 FOCUSSTEAL
+refs/heads/exec-rmbp-focussteal   f75e26a3 DONE-awaiting-fold cloud wave36 FOCUSSTEAL (B698)
 refs/heads/exec-rmbp-diskfull     96ed4711 IN-FLIGHT cloud wave36 DISKFULL
 refs/heads/exec-rmbp-appfault     96ed4711 IN-FLIGHT cloud wave36 APPFAULT
 refs/heads/exec-rmbp-tzlocale     96ed4711 IN-FLIGHT cloud wave36 TZLOCALE
@@ -596,3 +596,4 @@ refs/heads/exec-rmbp-autolock     363d83a9 IN-FLIGHT cloud wave36 AUTOLOCK (B712
 refs/heads/exec-rmbp-zoom         c7bf61ed IN-FLIGHT cloud wave36 ZOOM (B713)
 refs/heads/exec-rmbp-fileversions 73acb28b IN-FLIGHT cloud wave36 FILEVERSIONS (B714)
 refs/heads/exec-rmbp-mtpphone     4312754e IN-FLIGHT cloud wave36 MTPPHONE (B715)
+refs/heads/exec-rmbp-undomove     2f265fa0 IN-FLIGHT cloud wave36 UNDOMOVE (B716)
