@@ -608,7 +608,7 @@ refs/heads/exec-rmbp-rawcolor      b71c7fa8 IN-FLIGHT cloud wave36 RAWCOLOR
 refs/heads/exec-rmbp-hwreport      8f8997c9 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-updateui      16ffa390 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-mtpwrite      4bd35fdd FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-lock2         b71c7fa8 IN-FLIGHT cloud wave36 LOCK2
+refs/heads/exec-rmbp-lock2         0238981d FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-diskreserve   e5bd3a6a FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-helpsearch    b71c7fa8 IN-FLIGHT cloud wave36 HELPSEARCH
 refs/heads/exec-rmbp-fontkit       35f53609 FOLDED-BY-HAND (this commit) 2026-10-19
