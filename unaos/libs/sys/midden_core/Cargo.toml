@@ -32,3 +32,7 @@ login = []
 # `installdemo` feature (`installdemo = ["midden_core/installdemo"]`), so a knob-off image carries the
 # pre-INSTALLVERB table byte for byte. Same shape as `login` above. Default OFF.
 installdemo = []
+# PTPCAM (rmbp-ledger B687): the `ptp` host verb (status / view / shutter / frame of a PTP camera) exists where the
+# PTP class driver is built — the camera knob, forwarded by the kernel's `uvc` feature (`uvc = ["midden_core/uvc"]`).
+# Same shape as `login` / `installdemo`. Default OFF.
+uvc = []

@@ -531,9 +531,9 @@ impl Default for MountTable {
 }
 
 impl MountTable {
-    pub const fn new() -> Self {
+    #[cfg(not(feature = "uvc"))] pub const fn new() -> Self {
         Self { mounts: Vec::new() }
-    }
+    } #[cfg(feature = "uvc")] pub fn new() -> Self { let mut t = Self { mounts: Vec::new() }; hotplug_attach(&mut t); t } // PTPCAM (rmbp-ledger B687): with the camera knob every table is built WITH the hot-plug volumes registered at `register_hotplug` (file tail) — a PTP camera's `/volumes/<model>`; knob-off this is the old `const fn`. LINE-NEUTRAL fold: this file's panic Locations are line-pinned.
 
     /// Bind `backend` at namespace `prefix`. A prefix already present is
     /// replaced (a re-mount). `prefix` is canonicalized: a missing leading `/`
@@ -3862,5 +3862,47 @@ pub fn home_unwritable(mt: &MountTable, path: &str) -> Option<&'static str> {
             _ => None,
         },
         Err(_) => None,
+    }
+}
+
+// ===================== PTPCAM (rmbp-ledger B687, R130 law 3) — THE HOT-PLUG BACKEND SEAM =====================
+//
+// A volume that exists only while a device is attached (a PTP camera's card) registers a PROVIDER here
+// once; every `MountTable::new()` then asks each provider and binds what it answers, so the mount table
+// stays the ONE name authority (BP-storage-1) with no second store of names: the provider holds no
+// table, it answers "my prefix and a fresh backend" or `None` (device gone). A prefix a table already
+// holds is never displaced. `#[cfg(feature = "uvc")]` (the camera knob), so the knob-off image is unchanged.
+#[cfg(feature = "uvc")]
+#[path = "ptpfs.rs"]
+pub mod ptpfs;
+
+/// A hot-plug provider: `Some((prefix, backend))` while its device is attached.
+#[cfg(feature = "uvc")]
+pub type HotplugProvider = fn() -> Option<(String, Box<dyn VfsBackend>)>;
+
+#[cfg(feature = "uvc")]
+static HOTPLUG: crate::sync::Mutex<Vec<HotplugProvider>> = crate::sync::Mutex::new(Vec::new());
+
+/// Register `p` (idempotent: the same provider twice is one row).
+#[cfg(feature = "uvc")]
+pub fn register_hotplug(p: HotplugProvider) {
+    let mut g = HOTPLUG.lock();
+    if !g.iter().any(|q| core::ptr::fn_addr_eq(*q, p)) {
+        g.push(p);
+    }
+}
+
+/// Bind every attached hot-plug volume into a table being built. The providers are copied out first, so
+/// no provider runs under this lock.
+#[cfg(feature = "uvc")]
+fn hotplug_attach(t: &mut MountTable) {
+    let ps: Vec<HotplugProvider> = HOTPLUG.lock().clone();
+    for p in ps {
+        if let Some((prefix, backend)) = p() {
+            let prefix = canonical_prefix(&prefix);
+            if !t.mounts.iter().any(|m| m.prefix == prefix) {
+                t.mounts.push(Mount { prefix, backend });
+            }
+        }
     }
 }

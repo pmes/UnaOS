@@ -19,7 +19,7 @@ pub mod ring;
 pub mod event;
 pub mod context;
 pub mod dma_coherency;
-pub mod ftdi; #[cfg(feature = "usbnet")] pub mod usbnet; #[cfg(feature = "uvc")] pub mod isoch; #[cfg(feature = "uvc")] pub mod uvc; // XHCIISO (rmbp-ledger B534): isochronous IN + the 4 KiB EP0 buffer + the UVC hand-off, cfg-erased whole like usbnet; every site below is a same-line cfg-gated append. // USBNET (LEDGER SO56) — a USB Ethernet link on this bus (CDC-ECM first, the AX88179 front-end owed); a `#[cfg]`-erased module, and every site of it in this file is a same-line cfg-gated append or an `#[inline(always)] false` helper, so the knob-off image is unchanged
+pub mod ftdi; #[cfg(feature = "usbnet")] pub mod usbnet; #[cfg(feature = "uvc")] pub mod isoch; #[cfg(feature = "uvc")] pub mod uvc; #[cfg(feature = "uvc")] pub mod ptp; // XHCIISO (rmbp-ledger B534): isochronous IN + the 4 KiB EP0 buffer + the UVC hand-off, cfg-erased whole like usbnet; every site below is a same-line cfg-gated append. // USBNET (LEDGER SO56) — a USB Ethernet link on this bus (CDC-ECM first, the AX88179 front-end owed); a `#[cfg]`-erased module, and every site of it in this file is a same-line cfg-gated append or an `#[inline(always)] false` helper, so the knob-off image is unchanged
 // STOR-1: the interrupt-driven storage service task + BlockRequest submit/complete. x86_64 + the
 // `irqstorage` knob only — the default build never links it, so the staged storage path is untouched.
 #[cfg(all(target_arch = "x86_64", feature = "irqstorage"))]
@@ -4138,7 +4138,7 @@ impl XhciController {
                                 // (a safe, non-event context, like storage). Kept in its OWN field
                                 // so this is not misclaimed by the storage branch above or the
                                 // address-device (`ours`) branch below.
-                                else if self.usbnet_cfg_done(slot_id as u8) { self.start_next_port(); } else if self.ftdi_configuring_slot == slot_id as u8 { // USBNET: the link's Configure-Endpoint completion, ahead of the FTDI's; knob-off the helper is `#[inline(always)] false`
+                                else if self.usbnet_cfg_done(slot_id as u8) || ptp_cfg_done(slot_id as u8) { self.start_next_port(); } else if self.ftdi_configuring_slot == slot_id as u8 { // USBNET: the link's Configure-Endpoint completion, ahead of the FTDI's; knob-off the helper is `#[inline(always)] false`
                                     crate::bootlog_println!("xHCI: FTDI Endpoints Configured (Slot {}). Console bring-up pending.", slot_id);
                                     self.ftdi_configuring_slot = 0;
                                     self.ftdi_slot = slot_id as u8;
@@ -4458,7 +4458,7 @@ impl XhciController {
                                     }
                                 }
                             }
-                        } #[cfg(feature = "ftdirx")] { if ftdi::ftdirx::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } #[cfg(feature = "usbnet")] { if usbnet::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } #[cfg(feature = "uvc")] { if isoch::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } // XHCIISO: the armed isochronous IN endpoint's completions (every code — Missed Service and Ring Overrun included), claimed by (slot, DCI) beside the usbnet/ftdirx claims. // USBNET: the link's bulk-IN completion, claimed beside the FTDI's for the same reason. // FTDIRX (rmbp A9) — THE BULK-IN COMPLETION, claimed BESIDE its bulk-OUT twin above and for the same reason: the FTDI slot is distinct from the storage slot, so slot_id + the IN dci disambiguate this event from any BOT transfer, and the armed TRB address (or any error on our endpoint) claims exactly our own Normal TRB before the async enumeration FSM below can drop it as stale. `claim` stores four relaxed words and returns — LOCKFIX: `push_event` takes the event-queue lock and MUST NOT be reached from inside the event-ring dispatch, so the bytes are delivered by `service_ftdi_rx` on the next main-loop pass instead. ⚠ LINE-NEUTRAL append: this file is compiled into the Pi kernel8.img and a line added anywhere in it moves every panic `Location` below it; the knob-off byte-identity of BOTH arches is what `./arroyo knoboff ftdirx` measures.
+                        } #[cfg(feature = "ftdirx")] { if ftdi::ftdirx::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } #[cfg(feature = "usbnet")] { if usbnet::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } #[cfg(feature = "uvc")] { if isoch::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } #[cfg(feature = "uvc")] { if ptp::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } // PTPCAM: the camera's bulk TD and event-pipe completions, claimed by (slot, DCI, TRB) beside the isoch claim. // XHCIISO: the armed isochronous IN endpoint's completions (every code — Missed Service and Ring Overrun included), claimed by (slot, DCI) beside the usbnet/ftdirx claims. // USBNET: the link's bulk-IN completion, claimed beside the FTDI's for the same reason. // FTDIRX (rmbp A9) — THE BULK-IN COMPLETION, claimed BESIDE its bulk-OUT twin above and for the same reason: the FTDI slot is distinct from the storage slot, so slot_id + the IN dci disambiguate this event from any BOT transfer, and the armed TRB address (or any error on our endpoint) claims exactly our own Normal TRB before the async enumeration FSM below can drop it as stale. `claim` stores four relaxed words and returns — LOCKFIX: `push_event` takes the event-queue lock and MUST NOT be reached from inside the event-ring dispatch, so the bytes are delivered by `service_ftdi_rx` on the next main-loop pass instead. ⚠ LINE-NEUTRAL append: this file is compiled into the Pi kernel8.img and a line added anywhere in it moves every panic `Location` below it; the knob-off byte-identity of BOTH arches is what `./arroyo knoboff ftdirx` measures.
 
                         // An EP0 transfer for the port being ENUMERATED failed (STALL on a
                         // descriptor fetch / SET_CONFIGURATION, babble, transaction error...).
@@ -4683,7 +4683,7 @@ impl XhciController {
                                     // meaningless on a config event, guarded for the same reason.
                                     let class_code = desc_data[4];
                                     let subclass = desc_data[5];
-                                    let protocol = desc_data[6]; #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 { usbnet::note_device(slot_id as u8, class_code, desc_data[17], vid, pid); } } // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
+                                    let protocol = desc_data[6]; #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 { usbnet::note_device(slot_id as u8, class_code, desc_data[17], vid, pid); } } #[cfg(feature = "uvc")] { if desc_data[1] == 0x01 { ptp::note_device(slot_id as u8, vid, pid); } } // PTPCAM: the camera candidate's identity (a PTP body reports class 0x00 or 0x06 here; its interface says 0x06/0x01/0x01). // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
 
                                     if desc_data[1] == 0x01 {
                                         crate::bootlog_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
@@ -4702,7 +4702,7 @@ impl XhciController {
                                         crate::bootlog_println!("xHCI: >>> HUB DETECTED (slot {}) <<<", slot_id);
                                         self.hubs_pending.push(slot_id as u8);
                                         self.start_next_port();
-                                    } else if class_code == 0x00 || usbnet_dev_class(desc_data[1], class_code) { // USBNET: a Communications device (0x02) reports its class at the DEVICE level; the helper answers only for a DEVICE descriptor (byte 1 == 0x01) because this same chain runs on the CONFIGURATION descriptor's completion, where byte 4 is bNumInterfaces (measured: 2 here looped the request); knob-off the helper is `#[inline(always)] false`
+                                    } else if class_code == 0x00 || usbnet_dev_class(desc_data[1], class_code) || ptp_dev_class(desc_data[1], class_code) { // PTPCAM: a device-level Still Image class (0x06) is walked like a composite; knob-off the helper is `#[inline(always)] false`. // USBNET: a Communications device (0x02) reports its class at the DEVICE level; the helper answers only for a DEVICE descriptor (byte 1 == 0x01) because this same chain runs on the CONFIGURATION descriptor's completion, where byte 4 is bNumInterfaces (measured: 2 here looped the request); knob-off the helper is `#[inline(always)] false`
                                         // Class 0 means "Look at Interface Descriptor" (Common for Flash Drives too)
                                         crate::bootlog_println!("xHCI: Composite Device. Requesting Configuration Descriptor...");
                                         self.request_configuration_descriptor(slot_id as u8);
@@ -4727,7 +4727,7 @@ impl XhciController {
                                         // U2.5: FTDI FT232 tracking — its vendor-specific interface
                                         // (class 0xFF) carries the same bulk IN/OUT pair as MSC, so it
                                         // reuses the bulk-collection arm below.
-                                        let mut is_ftdi = false; #[cfg(feature = "usbnet")] let mut is_usbnet = false; #[cfg(not(feature = "usbnet"))] let is_usbnet = false; #[cfg(feature = "usbnet")] usbnet::note_config_header(slot_id as u8, desc_data[5]); // USBNET: bConfigurationValue (byte 5) of the configuration this walk describes; knob-off `is_usbnet` is a constant false the compiler folds
+                                        let mut is_ftdi = false; #[cfg(feature = "usbnet")] let mut is_usbnet = false; #[cfg(not(feature = "usbnet"))] let is_usbnet = false; #[cfg(feature = "usbnet")] usbnet::note_config_header(slot_id as u8, desc_data[5]); #[cfg(feature = "uvc")] ptp::note_config_header(slot_id as u8, desc_data[5]); // PTPCAM: the same per-walk reset for the camera. // USBNET: bConfigurationValue (byte 5) of the configuration this walk describes; knob-off `is_usbnet` is a constant false the compiler folds
                                         let mut bulk_in: Option<(u8, u16)> = None;
                                         let mut bulk_out: Option<(u8, u16)> = None;
 
@@ -4741,7 +4741,7 @@ impl XhciController {
                                                 if offset + 7 >= 256 { break; }
                                                 current_intf_class = desc_data[offset + 5];
                                                 let intf_subclass = desc_data[offset + 6];
-                                                current_intf_protocol = desc_data[offset + 7]; #[cfg(feature = "usbnet")] { if usbnet::note_interface(slot_id as u8, desc_data[offset + 2], desc_data[offset + 3], current_intf_class, intf_subclass, current_intf_protocol) { is_usbnet = true; } } // USBNET: the ECM DATA interface (0x0A, after a 0x02/0x06 control interface) — its bulk pair is collected below exactly as storage's and the FTDI's
+                                                current_intf_protocol = desc_data[offset + 7]; #[cfg(feature = "usbnet")] { if usbnet::note_interface(slot_id as u8, desc_data[offset + 2], desc_data[offset + 3], current_intf_class, intf_subclass, current_intf_protocol) { is_usbnet = true; } } #[cfg(feature = "uvc")] ptp::note_interface(slot_id as u8, desc_data[offset + 2], current_intf_class, intf_subclass, current_intf_protocol); // PTPCAM: Still Image 0x06/0x01/0x01 — its bulk pair and interrupt-IN are noted by `ptp::note_ep` on the endpoint line below. // USBNET: the ECM DATA interface (0x0A, after a 0x02/0x06 control interface) — its bulk pair is collected below exactly as storage's and the FTDI's
                                                 crate::bootlog_println!("xHCI: Interface: Class={:#x} Sub={:#x} Proto={:#x}",
                                                     current_intf_class, intf_subclass, current_intf_protocol);
 
@@ -4787,7 +4787,7 @@ impl XhciController {
                                                     }
                                                 }
                                             }
-                                            #[cfg(feature = "usbnet")] { if desc_type == 0x24 && offset + length <= 256 { usbnet::note_cs(slot_id as u8, &desc_data[offset..offset + length]); } } offset += length; // USBNET: CS_INTERFACE (0x24) — the Ethernet Networking Functional Descriptor names iMACAddress and wMaxSegmentSize
+                                            #[cfg(feature = "usbnet")] { if desc_type == 0x24 && offset + length <= 256 { usbnet::note_cs(slot_id as u8, &desc_data[offset..offset + length]); } } offset += length; #[cfg(feature = "uvc")] { let o = offset - length; if desc_type == 0x05 && o + 7 <= 256 { ptp::note_ep(slot_id as u8, desc_data[o + 2], desc_data[o + 3], (desc_data[o + 4] as u16) | ((desc_data[o + 5] as u16) << 8), desc_data[o + 6]); } } // PTPCAM: every endpoint of the walk is offered; `note_ep` keeps the PTP interface's bulk pair + interrupt-IN only. // USBNET: CS_INTERFACE (0x24) — the Ethernet Networking Functional Descriptor names iMACAddress and wMaxSegmentSize
                                         }
 
                                         // Arm EVERY HID interrupt-IN interface (keyboard and/or pointer)
@@ -4828,7 +4828,7 @@ impl XhciController {
                                                     self.start_next_port();
                                                 }
                                             }
-                                        } #[cfg(feature = "usbnet")] { if !is_mass_storage && !is_ftdi { self.usbnet_after_walk(slot_id as u8, is_usbnet, bulk_in, bulk_out); } } // USBNET: the third bulk-pair arm — take the ECM candidate, or ask for the device's other configuration (RNDIS-first devices), or leave the slot exactly as the stock path would
+                                        } #[cfg(feature = "usbnet")] { if !is_mass_storage && !is_ftdi { self.usbnet_after_walk(slot_id as u8, is_usbnet, bulk_in, bulk_out); } } #[cfg(feature = "uvc")] { if !is_mass_storage && !is_ftdi { let _ = self.ptp_after_walk(slot_id as u8); } } // PTPCAM: the camera arm (appended, code before this comment) — a PTP candidate gets its bulk pair configured (completion: `ptp_cfg_done` above); any other device is untouched. // USBNET: the third bulk-pair arm — take the ECM candidate, or ask for the device's other configuration (RNDIS-first devices), or leave the slot exactly as the stock path would
                                     } else if desc_data[1] == 0x01 {
                                         // ORIN-P7: a DEVICE descriptor whose class we have no driver
                                         // for (e.g. 0xE0 Wireless Controller — the AzureWave 13d3:3549
@@ -6359,7 +6359,7 @@ impl XhciController {
             // the unpark rule applied) against state the clear has not yet flattened.
             self.bot_park_note_disconnect(i as u8);
             self.bot_rescue_clear(i as u8);
-            #[cfg(feature = "uvc")] isoch::disconnect(i as u8); #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { // USBNET: the link forgets a slot the same instant the FTDI does
+            #[cfg(feature = "uvc")] { isoch::disconnect(i as u8); ptp::disconnect(i as u8); } #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { // USBNET: the link forgets a slot the same instant the FTDI does
                 self.ftdi_configuring_slot = 0;
             }
             if self.ftdi_slot == i as u8 {
@@ -6565,7 +6565,7 @@ impl XhciController {
             // `ftdi_configuring_slot == slot_id` BEFORE the HID branch, so a reused slot would be
             // misrouted into the FTDI console path and its real HID/MSC setup skipped. Guarded on the
             // disposed slot `i`, so a healthy console on another slot is never disturbed.
-            #[cfg(feature = "uvc")] isoch::disconnect(i as u8); #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { // USBNET: the link forgets a slot the same instant the FTDI does
+            #[cfg(feature = "uvc")] { isoch::disconnect(i as u8); ptp::disconnect(i as u8); } #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { // USBNET: the link forgets a slot the same instant the FTDI does
                 self.ftdi_configuring_slot = 0;
             }
             if self.ftdi_slot == i as u8 {
@@ -13608,7 +13608,7 @@ impl XhciController {
             crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
-        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); #[cfg(feature = "uvc")] uvc::pump(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
+        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); #[cfg(feature = "uvc")] uvc::pump(); #[cfg(feature = "uvc")] self.service_ptp(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
     }
 
     /// PTBURST — bytes staged into ONE bulk-OUT transfer. **64, the FT232's full-speed bulk max packet
@@ -14913,7 +14913,7 @@ impl XhciController {
             self.bot_park_note_disconnect(i as u8);
             self.bot_rescue_clear(i as u8);
             if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
-            #[cfg(feature = "uvc")] isoch::disconnect(i as u8); #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; } // USBNET: same forgetting on this reset path
+            #[cfg(feature = "uvc")] { isoch::disconnect(i as u8); ptp::disconnect(i as u8); } #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; } // USBNET: same forgetting on this reset path
             if self.ftdi_slot == i as u8 {
                 self.ftdi_slot = 0;
                 self.ftdi_pending_bringup = false;
@@ -15334,7 +15334,7 @@ impl XhciController {
         // kbd+mouse dongle: keyboard on iface0, mouse on iface1) that lands behind a hub arms
         // both, not just the first interface. Then configure them together in one
         // Configure-Endpoint (root_fsm = false: this is the hub-downstream FSM).
-        #[cfg(feature = "uvc")] isoch::note_downstream(slot_id, buf); #[cfg(feature = "uvc")] uvc::note_dev(slot_id, self.slots[slot_id as usize].vid, self.slots[slot_id as usize].pid); #[cfg(feature = "usbnet")] { if self.usbnet_downstream(slot_id as u8) { return; } } if self.record_hid_interfaces(slot_id, buf) { // XHCIISO: a hubbed camera (video IAD in this 64-byte window) is queued for the UVC service — no traffic here
+        #[cfg(feature = "uvc")] isoch::note_downstream(slot_id, buf); #[cfg(feature = "uvc")] uvc::note_dev(slot_id, self.slots[slot_id as usize].vid, self.slots[slot_id as usize].pid); #[cfg(feature = "uvc")] { if self.ptp_downstream(slot_id) { return; } } #[cfg(feature = "usbnet")] { if self.usbnet_downstream(slot_id as u8) { return; } } if self.record_hid_interfaces(slot_id, buf) { // XHCIISO: a hubbed camera (video IAD in this 64-byte window) is queued for the UVC service — no traffic here
             self.configure_hid_endpoints(slot_id, false);
         } else {
             crate::bootlog_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id);
@@ -17980,3 +17980,21 @@ impl XhciController {
         }
     }
 }
+
+// ===================== PTPCAM (rmbp-ledger B687) — the two enumeration-line helpers =====================
+// The configure-endpoint completion and the device-class test sit in `else if` chains that take no
+// `#[cfg]`, so each has a knob-off twin that is a constant `false` (USBNET's shape). See `xhci/ptp.rs`.
+#[cfg(feature = "uvc")]
+#[inline]
+fn ptp_cfg_done(slot_id: u8) -> bool { ptp::cfg_done(slot_id) }
+#[cfg(not(feature = "uvc"))]
+#[inline(always)]
+fn ptp_cfg_done(_slot_id: u8) -> bool { false }
+/// A device-level Still Image class (0x06) is walked for its PTP interface; only on a DEVICE descriptor
+/// (this chain also runs on the configuration descriptor's completion, where byte 4 is bNumInterfaces).
+#[cfg(feature = "uvc")]
+#[inline]
+fn ptp_dev_class(desc_type: u8, c: u8) -> bool { desc_type == 0x01 && c == 0x06 }
+#[cfg(not(feature = "uvc"))]
+#[inline(always)]
+fn ptp_dev_class(_desc_type: u8, _c: u8) -> bool { false }
