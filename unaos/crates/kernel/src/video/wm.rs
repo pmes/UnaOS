@@ -576,7 +576,7 @@ pub fn spawn_focus_arm(owner: u64) -> bool {
     }
     // Already armed — nothing to do. Checked before claiming so the common relaunch case does not
     // consume a second cell for an owner that is still waiting for its first window.
-    let _ = Ordering::Relaxed; let mut t = SPAWN_FOCUS.lock(); // WINDOWCAP-2: a leaf lock over a growable list
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] focussteal::note_arm(owner); let _ = Ordering::Relaxed; let mut t = SPAWN_FOCUS.lock(); // FOCUSSTEAL (B698): the arm's cause + time (file tail; LINE-NEUTRAL append, code before comment). WINDOWCAP-2: a leaf lock over a growable list
     if t.iter().any(|&c| c == owner) {
         return true;
     }
@@ -604,7 +604,7 @@ pub fn spawn_focus_take(owner: u64) -> bool {
     }
     let _ = Ordering::Relaxed; let mut t = SPAWN_FOCUS.lock();
     match t.iter().position(|&c| c == owner) {
-        Some(i) => { t[i] = 0; true }
+        Some(i) => { t[i] = 0; #[cfg(all(target_arch = "x86_64", feature = "wc"))] let ok = focussteal::judge(owner); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let ok = true; ok } // FOCUSSTEAL (B698): the token is a grant only on the user's verb (2 s) or the focused window's spawn (file tail; LINE-NEUTRAL)
         None => false,
     }
 }
@@ -617,7 +617,7 @@ pub fn spawn_focus_take(owner: u64) -> bool {
 /// the desktop app, or anything the operator did not ask for — would consume it and take the
 /// keyboard. That is the exact failure this table exists to prevent, arriving through the back door.
 pub fn spawn_focus_forget(owner: u64) {
-    let _ = spawn_focus_take(owner);
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] focussteal::forget(owner); let _ = spawn_focus_take(owner); // FOCUSSTEAL (B698): the record goes first, so a teardown judges and prints nothing (LINE-NEUTRAL append)
 }
 
 // ---- WINTITLE: the ONE rule that mints a window's title ------------------------------------------
@@ -23608,7 +23608,7 @@ fn create_inner(
     // This is `wcn_forget`'s precedent — WC-N clears its per-slot cell under the table lock, at the
     // point where the id demonstrably names something new, for the same class of reason.
     controls_declined_rearm(id);
-    t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); let _dockstamp = win_stamp_bump(slot); reassert_modal_top(&mut t, id); // LOGINZ (B223) — ⚠ SAME-LINE fold, line-NEUTRAL, BEFORE the comment: a row born after the login screen or the set-password alert opened is pushed back under it (flight 15: `win=5/6 z=6..10` covered the input-taker); under the guard, beside the publish, so no pass sees the newcomer on top even once. // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE CLAIM SITE IS WHERE THE STAMP IS MINTED, and it is minted INSIDE the guard, beside the generation.** This is the one line in the kernel at which a window row becomes a window, and the stamp has to be taken here or it is not an allocation order at all: taken later it would order the DISCOVERY of rows, which is precisely the defect DOCKID2 fixed one layer up (a rank that was the arrival of the first reconcile pass to SEE a window, not the window's own arrival). Under the guard rather than after it, on `controls_declined_rearm`'s argument at the top of this block: no painter and no `dock_scan` can observe `t.rows[slot]` until the guard drops, so a row can never be scanned with a stale or zero stamp — publish-then-stamp would open exactly that window, and a row read inside it would sort as UNSTAMPED and take table order, which is the bug. It is bound and dropped rather than used: the value the dock wants is read back from the row's slot by [`win_stamp_of`], so nothing in `create`'s ABI moves and no caller learns a new number. The bump is UNCONDITIONAL here and gated in the callee (the twin at this file's tail), which is `winid_slot_bump`'s own shape and keeps this line one call wide. // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
+    t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); let _dockstamp = win_stamp_bump(slot); #[cfg(all(target_arch = "x86_64", feature = "wc"))] focussteal::hold_under(&mut t, owner_asid); reassert_modal_top(&mut t, id); // FOCUSSTEAL (B698): a held map lands BEHIND the focused window, before the modal's re-assert (file tail; LINE-NEUTRAL append). LOGINZ (B223) — ⚠ SAME-LINE fold, line-NEUTRAL, BEFORE the comment: a row born after the login screen or the set-password alert opened is pushed back under it (flight 15: `win=5/6 z=6..10` covered the input-taker); under the guard, beside the publish, so no pass sees the newcomer on top even once. // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE CLAIM SITE IS WHERE THE STAMP IS MINTED, and it is minted INSIDE the guard, beside the generation.** This is the one line in the kernel at which a window row becomes a window, and the stamp has to be taken here or it is not an allocation order at all: taken later it would order the DISCOVERY of rows, which is precisely the defect DOCKID2 fixed one layer up (a rank that was the arrival of the first reconcile pass to SEE a window, not the window's own arrival). Under the guard rather than after it, on `controls_declined_rearm`'s argument at the top of this block: no painter and no `dock_scan` can observe `t.rows[slot]` until the guard drops, so a row can never be scanned with a stale or zero stamp — publish-then-stamp would open exactly that window, and a row read inside it would sort as UNSTAMPED and take table order, which is the bug. It is bound and dropped rather than used: the value the dock wants is read back from the row's slot by [`win_stamp_of`], so nothing in `create`'s ABI moves and no caller learns a new number. The bump is UNCONDITIONAL here and gated in the callee (the twin at this file's tail), which is `winid_slot_bump`'s own shape and keeps this line one call wide. // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
     drop(t); winid_alloc_witness(id, winid_generation, owner_asid, &minted[..minted_len], title_src); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::note(id, wmem); // WINID + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`. ONE call and ONE line: the title rides the alloc witness rather than a second `serial_println!` beside it, because a second print here costs the furniture its compose passes for the rest of the boot — measured, see `winid_alloc_witness`.
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
@@ -30867,4 +30867,252 @@ pub fn owner_rows(owner_asid: u64) -> usize {
     }
     let t = table();
     t.rows.iter().filter(|r| r.used && r.owner_asid == owner_asid).count()
+}
+
+
+// =================================================================================================
+// FOCUSSTEAL (rmbp-ledger B698; BP-video-20, BP-bar-18) — TAIL-APPENDED: a definition inserted higher
+// up renumbers every `core::panic::Location` below it. Reached only from same-line folds:
+// `spawn_focus_arm` (note_arm), `spawn_focus_take` (judge), `spawn_focus_forget` (forget) and
+// `create_inner`'s publish line (hold_under). Knob-off (`wc` off, and every aarch64 build) compiles
+// none of the decision; the attention pulse below is compiled wherever the dock is.
+// =================================================================================================
+
+/// FOCUSSTEAL — how long the dock tile of a window that was REFUSED focus pulses (one dim beat).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub const ATTN_MS: u64 = 600;
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static ATTN_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static ATTN_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static ATTN_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// FOCUSSTEAL — `owner`'s window asked for the keyboard (a map or a raise) and was refused: its dock
+/// tile pulses ONCE for [`ATTN_MS`]. No toast, no raise, no focus. One owner at a time — a newer
+/// refusal takes the beat. `why` is the witness field (`for=map` / `for=raise`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn attention(owner: u64, why: &'static str) {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        return;
+    }
+    ATTN_T0.store(crate::arch::ms(), Ordering::Relaxed);
+    ATTN_OWNER.store(owner, Ordering::Release);
+    serial_println!("[wm] pulse owner={} {} ms={}", owner, why, ATTN_MS);
+}
+
+/// The owner whose pulse is live at `now` (0 = none).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn attn_live(now: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let o = ATTN_OWNER.load(Ordering::Acquire);
+    if o != 0 && now.wrapping_sub(ATTN_T0.load(Ordering::Relaxed)) < ATTN_MS { o } else { 0 }
+}
+
+/// Is `owner`'s tile pulsing now? (The dock's pip reads this.)
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn attention_lit(owner: u64) -> bool {
+    owner != 0 && attn_live(crate::arch::ms()) == owner
+}
+
+/// The pulse's part of the dock's damage signature: the live owner, or 0.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn attention_sig() -> u64 {
+    attn_live(crate::arch::ms())
+}
+
+/// The dock's service pass: `true` when the pulse started or ended since the last call (the strip owes a
+/// composite). An expired owner is cleared here, so a pulse is exactly one beat.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn attention_tick(now: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let live = attn_live(now);
+    if live == 0 {
+        let o = ATTN_OWNER.load(Ordering::Acquire);
+        if o != 0 {
+            let _ = ATTN_OWNER.compare_exchange(o, 0, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+    ATTN_SEEN.swap(live, Ordering::AcqRel) != live
+}
+
+/// FOCUSSTEAL — **a window that opens while the user is typing elsewhere does not take the keyboard.**
+///
+/// A NEW window gets focus only if (a) its launch was the user's verb — the dock, Quarry, the Win-key
+/// launcher (all `origin::Glass`) or a typed line (`origin::Door`) — and it maps within
+/// [`VERB_WINDOW_MS`] of that launch, or (b) the window that holds focus spawned it. Anything else maps
+/// BEHIND the focused window and its dock tile pulses once ([`attention`]). A window that asks to be
+/// raised while another holds focus gets the pulse, not the focus ([`raise_request`]).
+///
+/// The cause is read at the token's ARMING (`spawn_focus_arm`, inside the spawn, before the task
+/// exists): `origin::current()` is the explicit provenance DIALOG2 carries, and the spawning slot is the
+/// live CR3's (`arch::memory::current_slot`, the caller of a ring-3 `SYS_SPAWN_PATH`). The verdict is
+/// decided ONCE, at the row's publish ([`hold_under`], under the TABLE guard), so the z the panel shows
+/// and the focus the seam grants cannot disagree; [`judge`] reads it back at `spawn_focus_take`.
+///
+/// Locks: `ARMS` is a leaf. `hold_under` takes it under TABLE; `judge` takes it under SPAWN_FOCUS and
+/// releases it before printing; nothing holds it while taking another lock.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod focussteal {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The user's verb buys focus for the window that maps within this long of the launch.
+    pub const VERB_WINDOW_MS: u64 = 2000;
+
+    /// Why a window was mapped — the `cause=` field.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Cause {
+        /// The user's verb: the glass (dock, Quarry, launcher) or a typed line.
+        Verb,
+        /// The focused window spawned it.
+        Spawn,
+        /// Nobody the user is talking to asked for it.
+        Unsolicited,
+    }
+
+    impl Cause {
+        /// The witness token, field name joined on (one literal in the image — WINTITLE-LATE's reason).
+        pub const fn token(self) -> &'static str {
+            match self {
+                Cause::Verb => "cause=verb",
+                Cause::Spawn => "cause=spawn",
+                Cause::Unsolicited => "cause=unsolicited",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Arm {
+        owner: u64,
+        t_ms: u64,
+        cause: Cause,
+        spawner: u64,
+        /// 0 undecided, 1 given, 2 held — set once by [`hold_under`].
+        verdict: u8,
+    }
+
+    static ARMS: crate::sync::Mutex<alloc::vec::Vec<Arm>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+    /// The owner [`judge`] most recently held (0 = none) — for the seam's weak idle grant ([`held_now`]).
+    static LAST_HELD: AtomicU64 = AtomicU64::new(0);
+
+    /// `spawn_focus_arm`'s fold: record the arming with its cause. The spawner is the caller's slot when
+    /// the spawn runs on a ring-3 process's CR3 (`SYS_SPAWN_PATH`); a kernel spawn has none.
+    pub fn note_arm(owner: u64) {
+        let s = crate::arch::memory::current_slot().map(|s| s as u64 + 1).unwrap_or(0);
+        note_arm_by(owner, if s == owner { 0 } else { s });
+    }
+
+    /// [`note_arm`] with the spawner named (the fixture's entry; `note_arm` is the kernel's).
+    pub fn note_arm_by(owner: u64, spawner: u64) {
+        if owner == 0 {
+            return;
+        }
+        let cause = match crate::origin::current() {
+            crate::origin::Origin::Glass | crate::origin::Origin::Door => Cause::Verb,
+            crate::origin::Origin::System => {
+                if spawner != 0 && spawner == super::focus_asid() { Cause::Spawn } else { Cause::Unsolicited }
+            }
+        };
+        let rec = Arm { owner, t_ms: crate::arch::ms(), cause, spawner, verdict: 0 };
+        let mut a = ARMS.lock();
+        match a.iter().position(|r| r.owner == owner) {
+            Some(i) => a[i] = rec,
+            None => {
+                if a.try_reserve(1).is_ok() {
+                    a.push(rec);
+                }
+            }
+        }
+    }
+
+    /// The rule itself: given, or held.
+    fn decide(r: &Arm, now: u64, focus: u64) -> bool {
+        match r.cause {
+            Cause::Verb => now.wrapping_sub(r.t_ms) <= VERB_WINDOW_MS,
+            Cause::Spawn => r.spawner != 0 && r.spawner == focus,
+            Cause::Unsolicited => false,
+        }
+    }
+
+    /// `create_inner`'s fold, under the TABLE guard, beside the publish: decide `owner`'s first map once;
+    /// if it is HELD, bump the focused owner's visible rows above the newcomer (their order kept), so the
+    /// new window is born behind the focused one and never shown on top. An owner with no arming (kernel
+    /// apps, the desktop app, an app's later windows) is left exactly as before. The shell (focus 0) is
+    /// a z floor (BP-video-6) and is not moved.
+    pub(super) fn hold_under(t: &mut super::Table, owner: u64) {
+        let focus = super::focus_asid();
+        let held = {
+            let mut a = ARMS.lock();
+            let Some(r) = a.iter_mut().find(|r| r.owner == owner && r.verdict == 0) else { return };
+            let given = decide(r, crate::arch::ms(), focus);
+            r.verdict = if given { 1 } else { 2 };
+            !given
+        };
+        if !held || focus == 0 || focus == owner {
+            return;
+        }
+        let shell = super::shell_z();
+        let mut up: alloc::vec::Vec<(u32, usize)> = alloc::vec::Vec::new();
+        for (i, r) in t.rows.iter().enumerate() {
+            if r.used && !r.compat && r.owner_asid == focus && super::above_shell(r, shell) {
+                up.push((r.z, i));
+            }
+        }
+        up.sort_unstable();
+        for (_, i) in up {
+            let z = t.next_z;
+            t.next_z = t.next_z.wrapping_add(1).max(1);
+            t.rows[i].z = z;
+            t.rows[i].damage_all();
+        }
+    }
+
+    /// `spawn_focus_take`'s fold, the token found: consume the arming, print the map line, pulse a held
+    /// window, return the verdict (the seam grants both halves of focus, or neither). No record — the
+    /// list could not grow — keeps the token's old meaning (a grant) and prints nothing.
+    pub fn judge(owner: u64) -> bool {
+        let focus = super::focus_asid();
+        let rec = {
+            let mut a = ARMS.lock();
+            a.iter().position(|r| r.owner == owner).map(|i| a.swap_remove(i))
+        };
+        let Some(r) = rec else { return true };
+        let given = match r.verdict {
+            1 => true,
+            2 => false,
+            _ => decide(&r, crate::arch::ms(), focus),
+        };
+        serial_println!("[wm] map owner={} {} {}", owner, if given { "focus=given" } else { "focus=held" }, r.cause.token());
+        if !given {
+            LAST_HELD.store(owner, Ordering::Release);
+            super::attention(owner, "for=map");
+        }
+        given
+    }
+
+    /// `spawn_focus_forget`'s fold: drop `owner`'s arming unjudged (slot teardown; owners are recycled).
+    pub fn forget(owner: u64) {
+        let mut a = ARMS.lock();
+        if let Some(i) = a.iter().position(|r| r.owner == owner) {
+            a.swap_remove(i);
+        }
+    }
+
+    /// Was `owner`'s map just HELD? Consumes the mark. The seam's weak "first window, shell was idle"
+    /// grant must ask this before it fires (the fold is owed in `arch/x86_64/syscall.rs`, B698).
+    pub fn held_now(owner: u64) -> bool {
+        owner != 0 && LAST_HELD.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }
+
+    /// A window asks to be raised (the policy a ring-3 raise verb calls; none exists at B698): only the
+    /// owner that already holds focus is answered yes; any other gets the pulse, not the focus.
+    pub fn raise_request(owner: u64) -> bool {
+        if owner != 0 && owner == super::focus_asid() {
+            return true;
+        }
+        serial_println!("[wm] raise owner={} focus=held {}", owner, Cause::Unsolicited.token());
+        super::attention(owner, "for=raise");
+        false
+    }
 }

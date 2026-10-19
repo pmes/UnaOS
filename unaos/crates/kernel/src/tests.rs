@@ -188,7 +188,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); register("focussteal", focussteal_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1502,4 +1502,97 @@ fn notelemetry_selftest() {
         window_s,
         if uncaused == 0 { "PASS" } else { "FAIL" }
     );
+}
+
+/// FOCUSSTEAL (rmbp-ledger B698; BP-video-20, BP-bar-18) — `tests focussteal`: three windows with
+/// synthetic ring-3-band owners through the REAL arm -> create -> take path (`wm::spawn_focus_arm`,
+/// `wm::create`, `wm::spawn_focus_take`), each take followed by the seam's own grant (`focus_changed`)
+/// exactly when it answers yes:
+///  1. user-launched (`origin::Glass`): given.
+///  2. unsolicited (`origin::System`, no spawner) while window 1 holds focus: held — born BEHIND window 1,
+///     the seam's held mark set, its raise request refused, its tile pulsing, and 8 keystrokes routed by
+///     the focus word all land on window 1 (`stolen_keys=0`).
+///  3. spawned by the focused window (spawner named = window 1's owner): given.
+/// The spawner is named here (`note_arm_by`); the live CR3 lookup is reached only by a real ring-3 spawn.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn focussteal_selftest() {
+    use crate::origin::{with, Origin};
+    use crate::video::wm::{self, focussteal};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    static SURF: [u32; 64] = [0; 64];
+    const A: u64 = 0xF5A;
+    const B: u64 = 0xF5B;
+    const C: u64 = 0xF5C;
+    const _: () = assert!(!wm::is_kernel_owner(A) && !wm::is_kernel_owner(B) && !wm::is_kernel_owner(C));
+    const KEYS: usize = 8;
+    let surf = &raw const SURF as usize;
+    let len = core::mem::size_of_val(&SURF);
+    let saved = wm::focus_asid();
+    // 1 — the user's verb.
+    with(Origin::Glass, || wm::spawn_focus_arm(A));
+    let wa = wm::create(A, surf, len, 8, 8, 32, b"fs-verb");
+    if wa == wm::WIN_NONE {
+        wm::spawn_focus_forget(A);
+        serial_println!(":: FOCUSSTEAL: -> SKIP (window table full) ::");
+        return;
+    }
+    let g1 = wm::spawn_focus_take(A);
+    if g1 {
+        wm::focus_changed(A);
+    }
+    // 2 — nobody asked, while window 1 holds the keyboard.
+    with(Origin::System, || wm::spawn_focus_arm(B));
+    let wb = wm::create(B, surf, len, 8, 8, 32, b"fs-unsolicited");
+    let g2 = wb != wm::WIN_NONE && wm::spawn_focus_take(B);
+    if wb == wm::WIN_NONE {
+        wm::spawn_focus_forget(B);
+    }
+    if g2 {
+        wm::focus_changed(B);
+    }
+    let held_mark = focussteal::held_now(B);
+    let raise = focussteal::raise_request(B);
+    if raise {
+        wm::focus_changed(B);
+    }
+    let pulse = wm::attention_lit(B);
+    let (mut stolen, mut old) = (0usize, 0usize);
+    for _ in 0..KEYS {
+        match wm::focus_asid() {
+            o if o == B => stolen += 1,
+            o if o == A => old += 1,
+            _ => {}
+        }
+    }
+    let z = |id: wm::WinId| wm::info(id).map(|i| i.z).unwrap_or(0);
+    let behind = wb != wm::WIN_NONE && z(wb) < z(wa);
+    // 3 — the focused window's own spawn.
+    with(Origin::System, || {
+        wm::spawn_focus_arm(C);
+        focussteal::note_arm_by(C, A);
+    });
+    let wc = wm::create(C, surf, len, 8, 8, 32, b"fs-spawn");
+    let g3 = wc != wm::WIN_NONE && wm::spawn_focus_take(C);
+    if wc == wm::WIN_NONE {
+        wm::spawn_focus_forget(C);
+    }
+    if g3 {
+        wm::focus_changed(C);
+    }
+    let given = g1 as u32 + g2 as u32 + g3 as u32;
+    let held = 3 - given;
+    let ok = g1 && !g2 && g3 && held_mark && !raise && pulse && behind && stolen == 0 && old == KEYS;
+    serial_println!(
+        ":: FOCUSSTEAL: given={} held={} stolen_keys={} behind={} pulse={} raise={} -> {} ::",
+        given, held, stolen, behind as u8, pulse as u8, if raise { "given" } else { "held" }, if ok { "PASS" } else { "FAIL" }
+    );
+    wm::focus_changed(saved);
+    for id in [wc, wb, wa] {
+        if id != wm::WIN_NONE {
+            wm::close(id);
+        }
+    }
 }

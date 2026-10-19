@@ -3917,7 +3917,7 @@ impl Layout {
 fn dock2_sig() -> u64 {
     let pend = LAUNCH_APP.load(Ordering::Relaxed) as u64;
     let phase = if pend != 0 { LAUNCH_PHASE.load(Ordering::Relaxed) as u64 & 1 } else { 0 };
-    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | (DND_HOT.load(Ordering::Relaxed) as u64) << 4 | pend << 8 | (DND_APP.load(Ordering::Relaxed) & 0xFFFF) << 40 // DRAGDROP (B440): the hovered Trash relights
+    (position() as u64) | (TRASH_FULL.load(Ordering::Relaxed) as u64) << 2 | phase << 3 | (DND_HOT.load(Ordering::Relaxed) as u64) << 4 | pend << 8 | (DND_APP.load(Ordering::Relaxed) & 0xFFFF) << 40 ^ wm::attention_sig() // FOCUSSTEAL (B698): the refused window's one-beat pulse is part of what was painted (LINE-NEUTRAL append). DRAGDROP (B440): the hovered Trash relights
 }
 
 /// The pin id of the pending launch's tile, or `WIN_NONE`.
@@ -3979,10 +3979,10 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
             for i in px0..(px0 + d).min(l.w) { if strip::in_disc(i, j, px0, py0, d) { out[i] = theme::accent(); } }
             continue;
         }
-        if pip_band && (r.id == TRASH_PIN_ID || (pend != wm::WIN_NONE && r.id == pend)) {
+        if pip_band && (r.id == TRASH_PIN_ID || (pend != wm::WIN_NONE && r.id == pend) || wm::attention_lit(r.owner_asid)) { // FOCUSSTEAL (B698): a window refused focus pulses its tile once (`wm::attention`; LINE-NEUTRAL append)
             let d = IND_D();
             let (px0, py0) = (bx + tw / 2 - d / 2, by + th + (PAD() - d) / 2);
-            let lit = LAUNCH_PHASE.load(Ordering::Relaxed) & 1 == 0;
+            let lit = LAUNCH_PHASE.load(Ordering::Relaxed) & 1 == 0 && !wm::attention_lit(r.owner_asid); // FOCUSSTEAL (B698): the pulse is the running dot DIMMED for one beat (LINE-NEUTRAL append)
             let ink = if r.id == TRASH_PIN_ID { ceramic::shade(theme::surface_window(), j) } else if lit { theme::accent() } else { theme::line_strong() };
             for i in px0.saturating_sub(1)..(px0 + d + 1).min(l.w) {
                 if strip::in_disc(i, j, px0, py0, d) || r.id == TRASH_PIN_ID { out[i] = ink; }
@@ -4157,7 +4157,7 @@ fn dock2_service(now: u64) {
             }
         }
     }
-    if PASS_OWED.swap(false, Ordering::AcqRel) { wm::composite(); }
+    if wm::attention_tick(now) { PASS_OWED.store(true, Ordering::Release); } if PASS_OWED.swap(false, Ordering::AcqRel) { wm::composite(); } // FOCUSSTEAL (B698): the pulse's start and end owe the strip a pass (LINE-NEUTRAL append)
 }
 
 /// The dock's service pass, DOCK2's half (from [`dockpin_service`]): the Trash's state, the Trash / Show in
