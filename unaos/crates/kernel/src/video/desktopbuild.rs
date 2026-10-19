@@ -235,7 +235,7 @@ mod steps {
     /// Starters held behind the bar since the last ask (bits of [`STARTERS`]).
     static HELD: AtomicU32 = AtomicU32::new(0);
     /// Starters whose release line was said (once per boot each).
-    static SAID: AtomicU32 = AtomicU32::new(0);
+    static SAID: AtomicU32 = AtomicU32::new(0); pub(super) fn held_or_said() -> u32 { SAID.load(Relaxed) | HELD.load(Relaxed) } pub(super) fn bit_of(who: &str) -> u32 { bit(who) } // IDLENET (B672): the held-starter census for `net_starters_held` (LINE-NEUTRAL append)
     /// The first hold's stamp (`ms().max(1)`, 0 = none yet): the bound runs from here.
     static HOLD_T0: AtomicU64 = AtomicU64::new(0);
 
@@ -564,4 +564,13 @@ pub fn memline_selftest() {
         ":: MEMLINE: heap_kb={} high_kb={} furniture_kb={} bar_kb={} under={} logout_delta_pct={} -> {} :: src={} builds={} first_high_kb={}",
         used / 1024, high_kb, Kb(if furn_read { Some(furn_kb) } else { None }), BAR_KB, under as u8, delta, if pass { "PASS" } else { "FAIL" }, src, builds, MEM_FIRST_HIGH.load(Relaxed) / 1024
     );
+}
+
+/// IDLENET (rmbp-ledger B672) — `tests nicabsent`'s census: how many of `names` the bar held this boot (said released
+/// after a hold — the `[desktop] starter after-bar who=` line — or held now — `held_starters=`). A name the bar does not
+/// know counts as the `other` starter.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn net_starters_held(names: &[&str]) -> u32 {
+    let b = steps::held_or_said();
+    names.iter().filter(|n| b & steps::bit_of(n) != 0).count() as u32
 }

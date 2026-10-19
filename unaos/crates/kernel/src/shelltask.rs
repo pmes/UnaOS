@@ -274,7 +274,7 @@ mod imp {
             }
             let (t0, l0, d0) = (crate::arch::ms(), JOB_LINES.load(Relaxed), DROPPED.load(Relaxed));
             let origin = if glass { crate::origin::Origin::Glass } else { crate::origin::Origin::Door };
-            let watched = verb(&line) == "tests"; if watched { crate::tests_watch::arm(&line); } let _ = crate::origin::with(origin, || crate::shell::dispatch_command(&line, &mut con, &mut pal)); if watched { crate::tests_watch::disarm(); } // TESTWATCH (B532 QUEUEWEDGE): a `tests` line is watched from a sibling core while it runs (LINE-NEUTRAL fold)
+            #[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "sntp6", feature = "net6", target_arch = "aarch64")))] let _idl = crate::net_tick::scope(if verb(&line) == "fetch" { crate::net_tick::Who::Fetch } else { crate::net_tick::Who::Shell }); /* IDLENET (B672): a routed verb's sends carry its name */ let watched = verb(&line) == "tests"; if watched { crate::tests_watch::arm(&line); } let _ = crate::origin::with(origin, || crate::shell::dispatch_command(&line, &mut con, &mut pal)); if watched { crate::tests_watch::disarm(); } // TESTWATCH (B532 QUEUEWEDGE): a `tests` line is watched from a sibling core while it runs (LINE-NEUTRAL fold)
             serial_println!("[shelltask] done verb={} tid={} ms={} lines={} dropped={}", verb(&line), tid,
                 crate::arch::ms().saturating_sub(t0), JOB_LINES.load(Relaxed).wrapping_sub(l0), DROPPED.load(Relaxed).wrapping_sub(d0));
         }
