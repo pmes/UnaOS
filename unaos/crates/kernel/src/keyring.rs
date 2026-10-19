@@ -426,12 +426,12 @@ pub fn ringlogin_selftest() {
     let rekey = rekey_fixture(); // RINGLOGIN2 (B479)
     let arm = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86" };
     let settings = settings_rekey_word(); // SETTINGSREKEY (B483)
-    let pass = reconnect && rekey && settings != "FAIL";
+    let pass = reconnect && rekey && settings != "FAIL"; let skip = if pass || !rekey || settings == "FAIL" { None } else { no_ring_home() }; // QEMUCLASS2 (B590): the login leg on a home the door refuses (file tail) is SKIP; the rekey legs still decide
     serial_println!(
-        ":: RINGLOGIN: ring={} at={} reconnect_before_unlock={} rekey={} settings_rekey={} settings_rekeyed={} arm={} passwd_rekeyed={} door={} posted={} taken={} report={} -> {} ::",
-        ring, if at_login { "login" } else { "none" }, if reconnect { "ok" } else { "FAIL" }, if rekey { "ok" } else { "FAIL" }, settings, RL_REKEYED_SETTINGS.load(Relaxed), arm,
+        ":: RINGLOGIN: ring={} at={} reconnect_before_unlock={} rekey={} settings_rekey={} settings_rekeyed={} arm={} passwd_rekeyed={} door={} posted={} taken={} report={} -> {}{} ::",
+        ring, if at_login { "login" } else { "none" }, if reconnect { "ok" } else if skip.is_some() { "-" } else { "FAIL" }, if rekey { "ok" } else { "FAIL" }, settings, RL_REKEYED_SETTINGS.load(Relaxed), arm,
         RL_REKEYED.load(Relaxed), made, posted, taken,
-        if st == i32::MIN { "none" } else { status_word_short(st) }, if pass { "PASS" } else { "FAIL" }
+        if st == i32::MIN { "none" } else { status_word_short(st) }, if pass { "PASS" } else if skip.is_some() { "SKIP reason=" } else { "FAIL" }, skip.as_deref().unwrap_or("")
     );
 }
 
@@ -672,4 +672,26 @@ fn settings_rekey_word() -> &'static str {
     {
         "no-form"
     }
+}
+
+// QEMUCLASS2 (rmbp-ledger B590) — TAIL-APPENDED. QEMUIMAGE26 read `:: RINGLOGIN: ring=no-holocron at=none
+// reconnect_before_unlock=FAIL … door=none posted=0 … -> FAIL ::`, and earlier on the same wire `[holocron] door none
+// reason=home-not-unafs`: the login's half ([`ring_login`]) posts the ring key only when the session home has inode ids
+// (`mt.stat(home)` `id.is_some()` — the ring lives on UnaFS), and [`after_login`] starts no Holocron without a ring or a
+// create waiting in the door. QEMU's root is a FAT ESP (`fat:rw:`, no UnaFS): the login leg cannot run there, and the
+// fixture printed FAIL for the environment. It now asks the door's own predicate and says SKIP with QEMUSKIP's (B613)
+// word: `home-not-writable(<k>)` when `fs::vfs::home_unwritable` names the refusing volume, else the door's own
+// `home-not-unafs`. A UnaFS home runs the leg as before; the RINGLOGIN2/SETTINGSREKEY legs still FAIL the line.
+
+/// `Some(reason)` when the session's home is one [`ring_login`] refuses (no inode ids: not UnaFS); `None` otherwise.
+fn no_ring_home() -> Option<String> {
+    let (_, _, home) = session()?;
+    let mt = crate::shell::vfs_mount_table();
+    if matches!(mt.stat(&home), Ok(st) if st.id.is_some()) {
+        return None;
+    }
+    Some(match crate::fs::vfs::home_unwritable(&mt, &home) {
+        Some(k) => alloc::format!("home-not-writable({})", k),
+        None => String::from("home-not-unafs"),
+    })
 }

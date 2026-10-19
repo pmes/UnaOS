@@ -175,12 +175,12 @@ pub fn nethang_selftest() {
             interrupts::enable();
         }
         let mut held = 0u32;
-        if !crate::smolnet::stack_lock_free() {
+        if held_across(|| !crate::smolnet::stack_lock_free()) { // QEMUCLASS2 (B581): held = never seen free across the probe window (file tail), not busy at one instant
             held += 1;
         }
         #[cfg(feature = "usbnet")]
-        if matches!(crate::drivers::xhci::claim(), Err(crate::drivers::xhci::XhciClaimError::Busy)) {
-            held += 1; // the shell runs on the main loop's core: a Busy loan here was left behind
+        if held_across(|| matches!(crate::drivers::xhci::claim(), Err(crate::drivers::xhci::XhciClaimError::Busy))) {
+            held += 1; // a loan this call left behind stays Busy the whole window; another core's pump (xhci-poll, the door, hid-pump) returns it within a pass
         }
         let bounded = el <= budget.saturating_mul(3); // sendto cap + recvfrom cap + one controller pass
         let hz = crate::arch::apic::tsc_hz();
@@ -219,5 +219,37 @@ fn net6_resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
             out[..4].copy_from_slice(&ip);
             Ok(out)
         }
+    }
+}
+
+// QEMUCLASS2 (rmbp-ledger B581) — TAIL-APPENDED. QEMUIMAGE26 read `:: NETHANG: path=resolve held_locks=1 bounded=1 link=1
+// … ms=1999 … rc=no-answer -> FAIL ::` on a 6-vCPU KVM boot. `held_locks` was ONE instant's `try_lock` of smolnet's
+// `STACK` and ONE `xhci::claim()`, taken from the shell's core right after the resolve. Both are shared on purpose: the
+// resolve's pump releases `STACK` between chunks so `net_tick` can take it (smolnet.rs `stack_recvfrom_bounded`,
+// "NETHANG: the receive pump with `STACK` released between chunks"), and the xHCI loan is claimed every pass by the
+// `xhci-poll` task, the FTDI door's pump and the usbnet lease's pump on other cores (QUEUESLEEP B512's `claim_noted`).
+// So the probe read a lock in legitimate use elsewhere as one this call left behind — it could not tell the boot-20
+// shape (a call that returned holding it) from SMP. The boot-20 shape is a hold that never ends; it now has to stay
+// held across [`HELD_PROBE_MS`] (sampled between yields), and a lock seen free once in that window is not this call's.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const HELD_PROBE_MS: u64 = 250;
+
+/// `true` iff `held()` answers held at every sample across [`HELD_PROBE_MS`] (IF as the caller left it; a core with no
+/// calibrated TSC samples 1000 times).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn held_across(held: impl Fn() -> bool) -> bool {
+    let hz = crate::arch::apic::tsc_hz();
+    let t0 = crate::arch::now_cycles();
+    let mut n = 0u32;
+    loop {
+        if !held() {
+            return false;
+        }
+        n += 1;
+        let el = crate::arch::now_cycles().wrapping_sub(t0);
+        if (hz != 0 && el.saturating_mul(1000) / hz >= HELD_PROBE_MS) || (hz == 0 && n >= 1000) {
+            return true;
+        }
+        crate::arch::sched::yield_now();
     }
 }
