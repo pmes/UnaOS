@@ -4874,7 +4874,7 @@ pub fn unplug_click() -> bool {
     removed_click() && !is_open()
 }
 
-// UNDOMOVE (rmbp-ledger B716): the one undo journal — every namespace verb's inverse; Ctrl+Z / Ctrl+Shift+Z in `key_route`.
+// UNDOMOVE (rmbp-ledger B716): the one undo journal — every namespace verb's inverse; ⌘Z / ⌘⇧Z are the keymap rows `Action::Undo` / `Action::Redo`, reaching it through `ops::action`.
 #[path = "undo.rs"]
 pub mod undo;
 
