@@ -22,8 +22,19 @@
 //! Paint: row-composed through `strip::paint` (`softy::paint` facade on one scanline), damage-driven by one
 //! signature exactly as the dock is. No heap on the pass: the window scan reuses a warm pool.
 //!
+//! SOFTYDOTS (rmbp-ledger B721) — the Una bar's three honest signals, in the Softy look's paint (one mechanism, two
+//! paints): the CAMERA in-use light (a camera glyph with the `accent` dot, the tray's first item, while
+//! `drivers::xhci::uvc::open_streams` is not 0 — the driver's count read at paint time, never a model a fixture or an
+//! app publishes into, BP-video-24), the DISK item (a drive glyph with the warning dot while `status::disk_low()`
+//! names a free percent, DISKFULL B699) and the ATTENTION pulse (the tile of a window refused focus dims its pip for
+//! `wm::ATTN_MS` — the same `wm::attention` beat the Una dock reads, FOCUSSTEAL B698; the dock's service pass owes the
+//! strip a pass at its start and end). While the session is LOCKED (`video::lock`, AUTOLOCK B712) the band paints
+//! nothing and takes no press: its pixels are vacated once and the login card owns the glass.
+//!
 //! Wire: `[softy] taskbar built tiles=<n> tray=<n> h=<px>` on every change of the band's make-up;
-//! `[softy] tile press app=<name> -> <launch <how>|raise win=<id>|minimise win=<id>>`.
+//! `[softy] tile press app=<name> -> <launch <how>|raise win=<id>|minimise win=<id>>`;
+//! `[softy] tray cam=<on|off> disk=<pct|-> pulse=<owner|0>` on every change of the three signals;
+//! `[softy] taskbar hidden reason=lock` once per lock.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,6 +45,10 @@ use crate::video::{dock, strip, text::Face, wm};
 static SLOT: strip::Slot = strip::Slot::new();
 /// The last `(tiles, tray, h)` announced, packed; `u64::MAX` = never.
 static BUILT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// SOFTYDOTS: the last `(cam, disk, pulse owner)` the wire said, packed; `u64::MAX` = never.
+static DOTS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// SOFTYDOTS: the pip's alpha while its tile pulses (the dock's "running dot dimmed for one beat").
+const PULSE_A: u8 = 64;
 /// The warm window-scan buffer (grown once, reused every pass).
 static ROWS: crate::sync::Mutex<alloc::vec::Vec<wm::DockEntry>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
 /// Fixture: tile presses that launched / raised, and the last outcome word.
@@ -66,13 +81,15 @@ struct Tile {
     running: bool,
     focused: bool,
     visible: bool,
+    /// SOFTYDOTS: a window of this tile was refused focus within `wm::ATTN_MS` (`wm::attention_lit`).
+    pulse: bool,
     title: [u8; wm::MAX_TITLE],
     tlen: u8,
 }
 
 impl Tile {
     const fn empty() -> Self {
-        Tile { pin: NO_PIN, win: wm::WIN_NONE, owner: 0, running: false, focused: false, visible: false, title: [0; wm::MAX_TITLE], tlen: 0 }
+        Tile { pin: NO_PIN, win: wm::WIN_NONE, owner: 0, running: false, focused: false, visible: false, pulse: false, title: [0; wm::MAX_TITLE], tlen: 0 }
     }
     fn name(&self) -> &[u8] {
         if self.pin != NO_PIN { dock::DP_PINS[self.pin as usize].name.as_bytes() } else { &self.title[..self.tlen as usize] }
@@ -126,6 +143,9 @@ struct Model {
     net: u8,
     vol: u8,
     bat: u16,
+    /// SOFTYDOTS: a camera stream is open (the driver's count), and the root's free percent + 1 while low (0 = not).
+    cam: bool,
+    disk: u8,
     clock: [u8; 5],
     date: [u8; 10],
     clock_set: bool,
@@ -155,7 +175,7 @@ struct Layout {
 impl Model {
     fn read(rows: &[wm::DockEntry]) -> Model {
         let mut m = Model {
-            n: 0, t: [Tile::empty(); k::TILES_MAX], net: 0, vol: 0, bat: 0, clock: [b' '; 5], date: [b' '; 10],
+            n: 0, t: [Tile::empty(); k::TILES_MAX], net: 0, vol: 0, bat: 0, cam: false, disk: 0, clock: [b' '; 5], date: [b' '; 10],
             clock_set: false, hot: HOT_NONE, pressed: HOT_NONE, start_open: super::startmenu::open_kind() == 1,
             cal_open: super::startmenu::open_kind() == 2, qs_open: super::startmenu::open_kind() == 3,
         };
@@ -196,7 +216,15 @@ impl Model {
             }
             t.running = true;
             t.focused |= e.focused;
+            t.pulse |= wm::attention_lit(e.owner_asid);
         }
+        // SOFTYDOTS: the camera light from the DRIVER'S count (the menu bar's `camdot` reads the same call), the disk
+        // item from the status owner's one fact.
+        #[cfg(feature = "uvc")]
+        {
+            m.cam = crate::drivers::xhci::uvc::open_streams() != 0;
+        }
+        m.disk = crate::video::status::disk_low().map_or(0, |p| p.min(100) + 1);
         // The tray.
         if let Some(tr) = crate::video::status::tray() {
             m.net = match tr.net { None => 0, Some(n) if n.up || n.ip.is_some() => 2, Some(_) => 1 };
@@ -215,7 +243,12 @@ impl Model {
     }
 
     fn tray_n(&self) -> usize {
-        (self.net != 0) as usize + (self.vol != 0) as usize + (self.bat != 0) as usize
+        self.cam as usize + (self.disk != 0) as usize + (self.net != 0) as usize + (self.vol != 0) as usize + (self.bat != 0) as usize
+    }
+
+    /// SOFTYDOTS: the live pulse's owner on this band (0 = none), for the wire.
+    fn pulse_owner(&self) -> u64 {
+        self.t[..self.n].iter().find(|t| t.pulse).map(|t| t.owner).unwrap_or(0)
     }
 
     fn layout(&self, pw: usize) -> Layout {
@@ -259,12 +292,12 @@ impl Model {
     fn signature(&self, r: strip::Rect) -> u64 {
         let mut h = strip::fnv1a_u64(strip::FNV_BASIS, ((r.2 as u64) << 32) | r.3 as u64);
         for t in self.t[..self.n].iter() {
-            h = strip::fnv1a_u64(h, (t.pin as u64) | (t.win as u64) << 8 | (t.running as u64) << 40 | (t.focused as u64) << 41 | (t.visible as u64) << 42);
+            h = strip::fnv1a_u64(h, (t.pin as u64) | (t.win as u64) << 8 | (t.running as u64) << 40 | (t.focused as u64) << 41 | (t.visible as u64) << 42 | (t.pulse as u64) << 43);
             for &b in t.name() {
                 h = strip::fnv1a(h, b);
             }
         }
-        h = strip::fnv1a_u64(h, self.net as u64 | (self.vol as u64) << 8 | (self.bat as u64) << 16 | (self.hot as u64) << 32 | (self.pressed as u64) << 40);
+        h = strip::fnv1a_u64(h, self.net as u64 | (self.vol as u64) << 8 | (self.bat as u64) << 16 | (self.hot as u64) << 32 | (self.pressed as u64) << 40 | (self.cam as u64) << 48 | (self.disk as u64) << 56);
         // SOFTY2: the quick-settings state, and the appearance epoch (dark / accent) — a theme change repaints the band.
         h = strip::fnv1a_u64(h, (self.start_open as u64) | (self.cal_open as u64) << 1 | (self.clock_set as u64) << 2 | (self.qs_open as u64) << 3 | (crate::video::theme::epoch() as u64) << 32);
         for &b in self.clock.iter().chain(self.date.iter()) {
@@ -361,6 +394,47 @@ pub(super) fn glyph_bat(s: &mut Surf, x: usize, y: usize, d: usize, pct: u16, ch
     }
 }
 
+/// SOFTYDOTS: the badge of a tray glyph `d` square at `(x, y)` — a disc `(bx, by, b)` at its top-right corner.
+fn badge(x: usize, y: usize, d: usize) -> (usize, usize, usize) {
+    let b = (d * 3 / 8).max(3);
+    (x + d - b, y, b)
+}
+
+/// SOFTYDOTS: tray item `n`'s glyph box `(x, y, d)` (0 = the leftmost) in layout `l` — the painter's and the fixture's
+/// one placement.
+fn tray_item(l: &Layout, n: usize) -> (usize, usize, usize) {
+    let (ic, ig) = (k::px(k::TRAY_ICON), k::px(k::TRAY_GAP));
+    (l.tray_x + k::px(k::TRAY_PAD) + n * (ic + ig), l.ty + (l.th - ic) / 2, ic)
+}
+
+/// SOFTYDOTS: the camera in-use light — our video-camera glyph (a rounded body, the lens's flare) in `ink`, the
+/// `accent` dot at its top right (the menu bar's `camdot` glyph, drawn with this look's facade).
+pub(super) fn glyph_cam(s: &mut Surf, x: usize, y: usize, d: usize, ink: u32) {
+    let t = k::px(1);
+    let (bw, bh) = (d * 5 / 8, d / 2);
+    let by = y + d * 3 / 8;
+    p::stroke_rrect(s, (x, by, bw, bh), k::px(2), ink, 255);
+    let lx = x + bw;
+    let mid = by + bh / 2;
+    p::line(s, lx, mid, x + d - 1, by, t, ink, 255);
+    p::line(s, lx, mid, x + d - 1, by + bh - 1, t, ink, 255);
+    p::hairline_v(s, x + d - 1, by, bh, ink, 255);
+    let (bx, byy, b) = badge(x, y, d);
+    p::disc(s, bx, byy, b, k::ACCENT(), 255);
+}
+
+/// SOFTYDOTS: the disk item — a drive (a rounded box, its activity light) in `ink`, the warning dot (`CLOSE_HOT`, the
+/// low battery's red) at its top right while the root is under the low line.
+pub(super) fn glyph_disk(s: &mut Surf, x: usize, y: usize, d: usize, ink: u32) {
+    let (w, h) = (d - d / 8, d / 2);
+    let by = y + d * 3 / 8;
+    p::stroke_rrect(s, (x, by, w, h), k::px(2), ink, 255);
+    let led = (d / 8).max(1);
+    p::fill(s, (x + w - 2 * led - k::px(1), by + (h - led) / 2, led, led), ink, 255);
+    let (bx, byy, b) = badge(x, y, d);
+    p::disc(s, bx, byy, b, k::CLOSE_HOT(), 255);
+}
+
 /// Compose strip row `j` of the band at panel rect `r`: the face (SOFTYDARK B694: in Dark, `SURFACE` at the VEIL's
 /// tint over the blurred wallpaper, DESIGN-LANGUAGE §2.4; flat in Light), then the hairline and the items.
 fn paint_row(out: &mut [u32], m: &Model, l: &Layout, r: strip::Rect, j: usize) {
@@ -392,7 +466,7 @@ fn paint_row(out: &mut [u32], m: &Model, l: &Layout, r: strip::Rect, j: usize) {
             let pw = k::px(if t.focused { k::PIP_W_ON } else { k::PIP_W });
             let ph = k::px(k::PIP_H);
             let py = l.ty + l.th - ph - k::px(1);
-            p::rrect(&mut s, (x + (l.tw - pw) / 2, py, pw, ph), ph / 2, if t.focused { k::ACCENT_INK() } else { k::PIP() }, 255);
+            p::rrect(&mut s, (x + (l.tw - pw) / 2, py, pw, ph), ph / 2, if t.focused { k::ACCENT_INK() } else { k::PIP() }, if t.pulse { PULSE_A } else { 255 }); // SOFTYDOTS: a refused window's tile dims its pip for one beat
         }
     }
     // The tray group.
@@ -402,18 +476,30 @@ fn paint_row(out: &mut [u32], m: &Model, l: &Layout, r: strip::Rect, j: usize) {
         } else if m.hot == HOT_TRAY || m.qs_open {
             p::rrect(&mut s, (l.tray_x, l.ty, l.tray_w, l.th), k::px(k::TILE_R), k::HOVER(), if m.qs_open && m.hot != HOT_TRAY { k::HOVER_A() / 2 } else { k::HOVER_A() });
         }
-        let (ic, ig) = (k::px(k::TRAY_ICON), k::px(k::TRAY_GAP));
-        let mut x = l.tray_x + k::px(k::TRAY_PAD);
-        let y = l.ty + (l.th - ic) / 2;
+        // SOFTYDOTS: the camera light and the disk item lead the group (the leftmost, as on the Una bar).
+        let mut n = 0;
+        if m.cam {
+            let (x, y, ic) = tray_item(l, n);
+            glyph_cam(&mut s, x, y, ic, k::TEXT());
+            n += 1;
+        }
+        if m.disk != 0 {
+            let (x, y, ic) = tray_item(l, n);
+            glyph_disk(&mut s, x, y, ic, k::TEXT());
+            n += 1;
+        }
         if m.net != 0 {
+            let (x, y, ic) = tray_item(l, n);
             glyph_net(&mut s, x, y, ic, m.net == 2, k::TEXT());
-            x += ic + ig;
+            n += 1;
         }
         if m.vol != 0 {
+            let (x, y, ic) = tray_item(l, n);
             glyph_vol(&mut s, x, y, ic, (m.vol & 0x7F) - 1, m.vol & 0x80 != 0, k::TEXT());
-            x += ic + ig;
+            n += 1;
         }
         if m.bat != 0 {
+            let (x, y, ic) = tray_item(l, n);
             glyph_bat(&mut s, x, y, ic, (m.bat & 0x7FFF) - 1, m.bat & 0x8000 != 0, k::TEXT());
         }
     }
@@ -455,12 +541,41 @@ fn announce(m: &Model, h: usize) {
     if BUILT.swap(key, Ordering::Relaxed) != key {
         serial_println!("[softy] taskbar built tiles={} tray={} h={}", m.n + 1, m.tray_n() + 1, h);
     }
+    // SOFTYDOTS: the three signals' edges.
+    let o = m.pulse_owner();
+    let dk = (m.cam as u64) | (m.disk as u64) << 1 | (o & 0xFFFF_FFFF) << 16;
+    if DOTS.swap(dk, Ordering::Relaxed) != dk {
+        let mut pct = [b'-'; 3];
+        let pl = if m.disk == 0 { 1 } else { let v = m.disk - 1; if v >= 100 { pct = *b"100"; 3 } else if v >= 10 { pct[0] = b'0' + v / 10; pct[1] = b'0' + v % 10; 2 } else { pct[0] = b'0' + v; 1 } };
+        serial_println!("[softy] tray cam={} disk={} pulse={}", if m.cam { "on" } else { "off" }, core::str::from_utf8(&pct[..pl]).unwrap_or("-"), o);
+    }
+}
+
+/// SOFTYDOTS: the session is locked (`video::lock`'s veil) — the band leaves the glass, the login card owns it.
+#[inline]
+fn locked() -> bool {
+    #[cfg(feature = "login")]
+    {
+        return crate::video::lock::veiled();
+    }
+    #[allow(unreachable_code)]
+    {
+        false
+    }
 }
 
 /// **The band's pass** (from `dock::compose` under Softy, inside `strip::compose_all`). `true` = it painted.
 pub fn compose() -> bool {
     let Some(fb) = crate::video::panel_snapshot().filter(|f| f.is_ready()) else { return false };
     let (pw, ph) = (fb.width(), fb.height());
+    // SOFTYDOTS (M2): one lock, two paints — under Softy the locked view has no taskbar (vacated once per lock).
+    if locked() {
+        if SLOT.packed() != 0 {
+            serial_println!("[softy] taskbar hidden reason=lock");
+            return vacate();
+        }
+        return false;
+    }
     let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
     super::chrome::hover_track(cx, cy);
     let r = rect(pw, ph);
@@ -525,7 +640,7 @@ fn panel() -> Option<(usize, usize)> {
 
 /// **The band's press arm** (from `dock::press_at` under Softy, inside `strip::press_route`): `true` = consumed.
 pub fn press_at(x: i32, y: i32) -> bool {
-    if x < 0 || y < 0 {
+    if x < 0 || y < 0 || locked() {
         return false;
     }
     let Some((pw, ph)) = panel() else { return false };
@@ -631,4 +746,100 @@ pub fn probe_hot(pw: usize, ph: usize, which: u8) -> Option<(usize, usize)> {
         3 if l.tray_w > 0 => Some((r.0 + l.tray_x + l.tray_w / 2, y)),
         _ => None,
     }
+}
+
+// ── SOFTYDOTS (rmbp-ledger B721) fixture probes: the painter's own model, layout and row painter, offscreen ──────────
+
+/// The band's live model (the press arm's read, no hover).
+#[cfg(feature = "witness")]
+fn model_now() -> Model {
+    let mut rows = ROWS.lock();
+    let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+    Model::read(&rows[..n])
+}
+
+/// Strip-local pixel `(x, y)` of the band painted from model `m` on a `pw` x `ph` panel (one row, offscreen: the glass
+/// is not touched).
+#[cfg(feature = "witness")]
+fn px_at(m: &Model, pw: usize, ph: usize, x: usize, y: usize) -> u32 {
+    let Some(r) = rect(pw, ph) else { return 0 };
+    let l = m.layout(pw);
+    let mut row = alloc::vec![0u32; r.2];
+    paint_row(&mut row, m, &l, r, y);
+    row.get(x).copied().unwrap_or(0)
+}
+
+/// What `tests softydots` reads: each signal's pixel painted ON and OFF from the live model with that one input
+/// changed (a synthetic stream count, a forced low disk, a pulsing tile), the colour each must be, and the live reads.
+#[cfg(feature = "witness")]
+pub struct Dots {
+    pub cam_on: u32,
+    pub cam_off: u32,
+    pub accent: u32,
+    pub disk_on: u32,
+    pub disk_off: u32,
+    pub warn: u32,
+    pub pip_on: u32,
+    pub pip_off: u32,
+    pub pip: u32,
+    /// The live model's camera light agrees with the driver's count.
+    pub cam_live: bool,
+    /// A live tile's owner given the beat (`wm::attention`) reads `pulse` back (`None`: no running tile).
+    pub pulse_live: Option<bool>,
+}
+
+/// SOFTYDOTS fixture (M3): the three signals through [`paint_row`] on a `pw` x `ph` panel. `None` when the panel
+/// cannot host the band.
+#[cfg(feature = "witness")]
+pub fn dots_probe(pw: usize, ph: usize) -> Option<Dots> {
+    rect(pw, ph)?;
+    let mut base = model_now();
+    #[cfg(feature = "uvc")]
+    let cam_live = base.cam == (crate::drivers::xhci::uvc::open_streams() != 0);
+    #[cfg(not(feature = "uvc"))]
+    let cam_live = !base.cam;
+    base.hot = HOT_NONE;
+    base.pressed = HOT_NONE;
+    let centre = |m: &Model| {
+        let l = m.layout(pw);
+        let (x, y, d) = tray_item(&l, 0);
+        let (bx, by, b) = badge(x, y, d);
+        (bx + b / 2, by + b / 2)
+    };
+    // 1. The camera: a synthetic count of 1 -> the accent dot at the tray's first item; 0 -> no dot there.
+    let (mut on, mut off) = (base, base);
+    on.cam = true;
+    off.cam = false;
+    let (cx, cy) = centre(&on);
+    let (cam_on, cam_off) = (px_at(&on, pw, ph, cx, cy), px_at(&off, pw, ph, cx, cy));
+    // 2. The disk: forced low (3 % free) with no camera -> the warning dot leads the tray; not low -> none.
+    let (mut on, mut off) = (base, base);
+    on.cam = false;
+    on.disk = 4;
+    off.cam = false;
+    off.disk = 0;
+    let (dx, dy) = centre(&on);
+    let (disk_on, disk_off) = (px_at(&on, pw, ph, dx, dy), px_at(&off, pw, ph, dx, dy));
+    // 3. The pulse: the first tile running and unfocused, its pip's centre with the beat off and on.
+    let mut m = base;
+    if m.n == 0 {
+        m.n = 1;
+        m.t[0] = Tile::empty();
+    }
+    m.t[0].running = true;
+    m.t[0].focused = false;
+    let l = m.layout(pw);
+    let ph_ = k::px(k::PIP_H);
+    let (px, py) = (l.x0 + l.pitch + l.tw / 2, l.ty + l.th - ph_ - k::px(1) + ph_ / 2);
+    m.t[0].pulse = false;
+    let pip_off = px_at(&m, pw, ph, px, py);
+    m.t[0].pulse = true;
+    let pip_on = px_at(&m, pw, ph, px, py);
+    // 4. The live beat: a running tile's owner given `wm::attention` reads back pulsing (the dock's own state).
+    let pulse_live = base.t[..base.n].iter().find(|t| t.running && t.owner != 0).map(|t| t.owner).map(|o| {
+        wm::attention(o, "for=tests");
+        let m2 = model_now();
+        m2.t[..m2.n].iter().any(|t| t.owner == o && t.pulse)
+    });
+    Some(Dots { cam_on, cam_off, accent: k::ACCENT(), disk_on, disk_off, warn: k::CLOSE_HOT(), pip_on, pip_off, pip: k::PIP(), cam_live, pulse_live })
 }
