@@ -487,7 +487,7 @@ pub fn arg() -> Option<alloc::string::String> { ARG.lock().clone() }
 /// the fixtures SKIP or FAIL with their reason from the mounted tree.
 fn ensure_volumes() {
     static DONE: AtomicBool = AtomicBool::new(false);
-    if !DONE.swap(true, Ordering::AcqRel) { register("volumes", crate::fs::volumes::selftest); register("testf", crate::fs::volumes::testf_selftest); register("rootdisk", crate::fs::rootdisk::selftest); register("bootfat", crate::fs::bootfat::selftest); register("bootfatseam", crate::fs::bootfat::bootfatseam_selftest); }
+    if !DONE.swap(true, Ordering::AcqRel) { register("volumes", crate::fs::volumes::selftest); register("testf", crate::fs::volumes::testf_selftest); register("rootdisk", crate::fs::rootdisk::selftest); register("bootfat", crate::fs::bootfat::selftest); register("bootfatseam", crate::fs::bootfat::bootfatseam_selftest); register("unplug", unplug_selftest); }
 }
 
 // BOOTVERDICTS (rmbp-ledger B472, R80) — TAIL-APPENDED. A verdict word before the deferred line is a test
@@ -1801,5 +1801,108 @@ pub fn aging_selftest() {
         done, bar_drift_pct, heap_drift_kb, leaked_windows, leaked_procs, if pass { "PASS" } else { "FAIL" },
         bf / q as i64, bl / q as i64, hf / q as i64, hl / q as i64, heap_drift_pct, q,
         if reason.is_some() { " reason=" } else { "" }, reason.as_deref().unwrap_or("")
+    );
+}
+
+/// UNPLUG (rmbp-ledger B703) — TAIL-APPENDED: `tests unplug`. QEMU has no hot-remove seam in the harness (no
+/// `device_del`/monitor verb in `arroyo`), so the detach is the DRIVER's own: `block::unpublish_usb_geometry` — the
+/// exact call `xhci::dispose_disconnected_slots` makes on a CSC with CCS=0 — and the replug is the attach path's
+/// `publish_usb_geometry_lun` with the same record. Needs a removable FAT volume (`UNAOS_USB2=sf`); none = SKIP.
+/// Legs: a write (the volume goes dirty), the pull (`[storage] pull … -> unsafe dirty=1`), five VFS verbs on the
+/// departed volume each -ENODEV, the name gone from `/volumes`, Quarry's window marked `Removed: <name>` and closed
+/// by a click (when Quarry can open), the replug back under the SAME name, then Eject (`[storage] eject … -> safe`).
+/// `:: UNPLUG: detached=1 enodev=<n> panics=0 windows_marked=<n> replug=ok eject=safe -> PASS|SKIP|FAIL ::`.
+fn unplug_selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    // Quarry's doors exist only with the desktop family; without it there is no window to mark (quarry=none).
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    let (q_open, q_mark, q_click): (fn(&str) -> bool, fn() -> Option<alloc::string::String>, fn() -> bool) =
+        (crate::video::quarry::unplug_open, crate::video::quarry::unplug_mark, crate::video::quarry::unplug_click);
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let (q_open, q_mark, q_click): (fn(&str) -> bool, fn() -> Option<alloc::string::String>, fn() -> bool) = (|_| false, || None, || false);
+    let settle = |want: &dyn Fn() -> bool| -> bool {
+        let dl = crate::arch::ms() + 2_000;
+        loop {
+            crate::fs::removable::service();
+            if want() {
+                return true;
+            }
+            if crate::arch::ms() >= dl {
+                return false;
+            }
+            crate::arch::sched::yield_now();
+        }
+    };
+    crate::fs::removable::service();
+    let Some((name, ix)) = crate::fs::removable::unplug_target() else {
+        serial_println!(":: UNPLUG: detached=0 enodev=0 panics=0 windows_marked=0 replug=- eject=- -> SKIP :: reason=no-removable-fat-volume (UNAOS_USB2=sf) ::");
+        return;
+    };
+    let Some(disk) = crate::drivers::block::usb_disk(ix) else {
+        serial_println!(":: UNPLUG: detached=0 enodev=0 panics=0 windows_marked=0 replug=- eject=- -> FAIL :: reason=registry-empty vol={} ix={} ::", name, ix);
+        return;
+    };
+    let point = format!("{}/{}", crate::fs::bootdisk::VOLUMES, name);
+    let file = format!("{}/UNPLUG.TMP", point);
+    // 1. a write: the volume is now dirty (counted, and FAT[1]'s clean bit cleared on disk)
+    let t = crate::shell::vfs_mount_table();
+    let wrote = t.create(&file, NodeKind::File, P).is_ok() && t.write(&file, 0, b"unplug", P).is_ok();
+    drop(t);
+    let quarry = q_open(&point);
+    // 2. the pull — the driver's own retraction, then the main-loop reconcile
+    let detached = crate::drivers::block::unpublish_usb_geometry(disk.info.slot_id, crate::drivers::block::usb_publish_gen())
+        && settle(&|| crate::fs::removable::departed(&point));
+    let pull_dirty = crate::fs::removable::last_pull().filter(|(n, _)| *n == name).map(|(_, d)| d);
+    // 3. every verb over the departed volume answers -ENODEV, at once (the block layer refuses a dead slot anyway)
+    let t = crate::shell::vfs_mount_table();
+    let errs = [
+        t.read_dir(&point).err(),
+        t.stat(&file).err(),
+        t.read(&file, 0, 6).err(),
+        t.write(&file, 0, b"x", P).err(),
+        t.create(&format!("{}/NEW.TMP", point), NodeKind::File, P).err(),
+    ];
+    drop(t);
+    let enodev = errs.iter().flatten().filter(|e| crate::fs::attrsys::errno_of(e) == una_abi::ENODEV).count();
+    let listed = match crate::shell::vfs_ls_collect(crate::fs::bootdisk::VOLUMES) {
+        Ok((_, rows)) => rows.iter().any(|e| e.name == name),
+        Err(_) => false,
+    } || crate::fs::removable::mounted_names().iter().any(|n| *n == name);
+    // 4. Quarry: marked in place, closed by a click
+    let marked = quarry && q_mark().as_deref() == Some(name.as_str());
+    let closed = marked && q_click();
+    // 5. the replug: same record, back under the same name
+    let _ = crate::drivers::block::publish_usb_geometry_lun(disk.info, disk.lun);
+    let replug = settle(&|| crate::fs::removable::mounted_names().iter().any(|n| *n == name))
+        && !crate::fs::removable::departed(&point)
+        && crate::shell::vfs_mount_table().stat(&point).is_ok();
+    // 6. Eject (the sidebar's verb): a write first (the scratch file goes), then the flush
+    let _ = crate::shell::vfs_mount_table().unlink(&file, P);
+    let ejected = replug && crate::fs::removable::eject(&name);
+    let eject = crate::fs::removable::last_eject().filter(|(n, _, _)| ejected && *n == name);
+    let safe = eject.as_ref().map(|e| e.2).unwrap_or(false);
+    let ok = wrote && detached && enodev == errs.len() && !listed && replug && safe && (!quarry || closed);
+    let reason = if !wrote {
+        "write"
+    } else if !detached {
+        "detach"
+    } else if enodev != errs.len() {
+        "not-enodev"
+    } else if listed {
+        "still-listed"
+    } else if quarry && !closed {
+        "quarry-window"
+    } else if !replug {
+        "replug"
+    } else if !safe {
+        "eject"
+    } else {
+        "-"
+    };
+    serial_println!(
+        ":: UNPLUG: detached={} enodev={} panics=0 windows_marked={} replug={} eject={} -> {} :: vol={} pull=unsafe dirty={} flushed={} listed={} quarry={} reason={} ::",
+        detached as u8, enodev, marked as u8, if replug { "ok" } else { "no" }, if safe { "safe" } else { "unsafe" },
+        if ok { "PASS" } else { "FAIL" }, name, pull_dirty.map(|d| d as u8 as i32).unwrap_or(-1),
+        eject.as_ref().map(|e| e.1 as i64).unwrap_or(-1), listed as u8, if quarry { "open" } else { "none" }, reason
     );
 }

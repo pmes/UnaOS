@@ -1181,7 +1181,13 @@ impl Model {
             }
             Err(e) => {
                 self.list.clear();
-                self.err = Some(e);
+                // UNPLUG (B703): a folder on a removable volume that LEFT is marked in place, not walked away
+                // from — `Removed: <name>` in the list pane, and the next click on the window closes it.
+                let marked = crate::fs::removable::departed_name(path).map(|n| alloc::format!("{}{}", REMOVED, n));
+                if marked.is_some() && marked != self.err {
+                    serial_println!("[quarry] removed mark cwd={} {}", path, marked.as_deref().unwrap_or(""));
+                }
+                self.err = Some(marked.unwrap_or(e));
             }
         }
         toolbar::after_show(self); columns::after_show(self); // QUARRY3 (B413): history + sidebar refresh, then QUARRY2 (B336): the TYPE/ORIGIN facts and the sort, derived from the listing just read
@@ -2474,6 +2480,9 @@ pub fn press_route(x: i32, y: i32) -> bool {
     // The press is ours: raise so the operator's click also brings Quarry forward, exactly as the
     // router's own select arm would have.
     wm::focus_changed(OWNER);
+    if removed_click() {
+        return true; // UNPLUG (B703): a window over a removed volume closes on a click
+    }
     let act = {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else {
@@ -4821,3 +4830,46 @@ pub mod dragdrop;
 // QUARRYLIVE (rmbp-ledger B494): the live relist, the list view's disclosure triangle, the tree double-click.
 #[path = "livedir.rs"]
 pub mod livedir;
+
+// ── UNPLUG (rmbp-ledger B703) — a window over a volume that left ────────────────────────────────
+
+/// The marked state's spelling in the list pane (`Model::err`): the window shows `Removed: <name>` in place.
+const REMOVED: &str = "Removed: ";
+
+/// The removed volume this window is marked over, if any.
+fn removed_of(m: &Model) -> Option<&str> {
+    m.err.as_deref().and_then(|e| e.strip_prefix(REMOVED))
+}
+
+/// A click on a marked window closes it. `false` = not marked (the press routes as before).
+fn removed_click() -> bool {
+    let name = {
+        let g = MODEL.lock();
+        match g.as_ref().and_then(removed_of) {
+            Some(n) => String::from(n),
+            None => return false,
+        }
+    };
+    serial_println!("[quarry] removed close vol={}", name);
+    close();
+    true
+}
+
+/// `tests unplug`: open Quarry on `path` (the volume). `false` = no window this boot.
+pub fn unplug_open(path: &str) -> bool {
+    open_at(path)
+}
+
+/// `tests unplug`: the live relist the service pass runs on a generation move (no settle wait), then the
+/// volume the window is marked over.
+pub fn unplug_mark() -> Option<String> {
+    let mut g = MODEL.lock();
+    let m = g.as_mut()?;
+    let _ = livedir::relist(m);
+    removed_of(m).map(String::from)
+}
+
+/// `tests unplug`: the click — the same arm `press_route` takes. `true` = the marked window closed.
+pub fn unplug_click() -> bool {
+    removed_click() && !is_open()
+}
