@@ -949,7 +949,7 @@ fn paint_general(st: &mut State, v: &Values) {
     slider(st, 0, v.vol as usize, 16, fo(1));
     txt2(st, VAL_X, 0, &alloc::format!("{}/16", v.vol));
     txt(st, LABEL_X, 1, "Mute");
-    tog(st, 1, TOG_X, v.mute, fo(2));
+    tog(st, 1, TOG_X, v.mute, fo(2)); #[cfg(any(feature = "uvc", feature = "hda-tone"))] { let (a, b, k) = crate::audio::picker(); seg(st, 1, &[a.as_bytes(), b.as_bytes()], k, false); } // UAC1 (rmbp-ledger B706): the Sound box's output picker, HDA internal | USB <vid:pid>, in the Mute row's free track (LINE-NEUTRAL append, code first)
     txt(st, LABEL_X, 2, "Pointer");
     btn_f(st, 2, TRACK_X, "Trackpad", false, fo(4)); // TRACKPADPANE (B412): the R75 3-step became the Trackpad tab's speed slider
     txt2(st, TRACK_X + BTN_W + 12, 2, &alloc::format!("speed {}/10", TPV.lock().speed));
@@ -1715,7 +1715,7 @@ fn press_general(row: usize, cx: usize) {
     // BRIGHTFLOOR M5: rows moved up one (Brightness is on the Display tab).
     match row {
         0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); drag_begin(1, cx); } // PREFSUI (R93): press-and-drag
-        1 => { select(2); if cx >= TOG_X && cx < TOG_X + draw::DIMS.toggle_w { let m = CUR.lock().mute; set(2, (!m) as usize); } } // SETTINGSCRAFT: the switch, right-aligned
+        1 => { select(2); if cx >= TOG_X && cx < TOG_X + draw::DIMS.toggle_w { let m = CUR.lock().mute; set(2, (!m) as usize); } #[cfg(any(feature = "uvc", feature = "hda-tone"))] { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { let _ = crate::audio::sink(if cx < TRACK_X + TRACK_W / 2 { "hda" } else { "usb" }); repaint(); } } } // UAC1 (B706): a click on the output picker chooses the sink (Principia `system.audio.output`); LINE-NEUTRAL append, code first. SETTINGSCRAFT: the switch, right-aligned
         2 => { if cx >= TRACK_X && cx < TRACK_X + BTN_W { switch_tab(TP_TAB); } } // TRACKPADPANE (B412): the Trackpad tab holds the speed now
         3 => select(5),
         4 => {

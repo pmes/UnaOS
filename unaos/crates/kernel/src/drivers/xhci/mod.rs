@@ -4828,7 +4828,7 @@ impl XhciController {
                                                     self.start_next_port();
                                                 }
                                             }
-                                        } #[cfg(feature = "usbnet")] { if !is_mass_storage && !is_ftdi { self.usbnet_after_walk(slot_id as u8, is_usbnet, bulk_in, bulk_out); } } // USBNET: the third bulk-pair arm — take the ECM candidate, or ask for the device's other configuration (RNDIS-first devices), or leave the slot exactly as the stock path would
+                                        } #[cfg(feature = "usbnet")] { if !is_mass_storage && !is_ftdi { self.usbnet_after_walk(slot_id as u8, is_usbnet, bulk_in, bulk_out); } } #[cfg(feature = "uvc")] { if !is_mass_storage && !is_ftdi && !is_usbnet && isoch::note_audio_root(slot_id as u8, desc_buf as u64) && !self.slots[slot_id as usize].is_downstream { self.start_next_port(); } } // UAC1 (rmbp-ledger B706): a class-0 device with an Audio Control interface is queued for the isochronous service and, with no HID interface in the window, its root port is released here (nothing else would). LINE-NEUTRAL append, before this comment. USBNET: the third bulk-pair arm — take the ECM candidate, or ask for the device's other configuration (RNDIS-first devices), or leave the slot exactly as the stock path would
                                     } else if desc_data[1] == 0x01 {
                                         // ORIN-P7: a DEVICE descriptor whose class we have no driver
                                         // for (e.g. 0xE0 Wireless Controller — the AzureWave 13d3:3549

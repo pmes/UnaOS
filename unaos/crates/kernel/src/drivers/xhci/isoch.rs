@@ -25,6 +25,11 @@
 //!   against MFINDEX, then rings the doorbell. The ring is therefore kept ahead by the claim path itself, which
 //!   every event-draining loop in this driver reaches (the 1 ms `xhci-poll` task, and the sync EP0/command/BOT
 //!   pumps) — no main-loop hook and no added line in `poll_events`.
+//! * **Isochronous OUT** (UAC1, rmbp-ledger B706) — the same engine, the other direction: an `IsoEp` whose address
+//!   has bit 7 clear is configured as EP Type 1 at DCI ep*2 into its own pipe (`OPIPE`), each produced TD is
+//!   filled from `drivers::usb::uac::pull` before its TRB is written, and `claim_out` retires and refills it. Audio
+//!   candidates (an Audio Control interface in the configuration window, `note_audio_root` / `note_downstream`)
+//!   wait in their own queue; `service_uvc` takes a camera first, else one of them, and hands it to `uac::probe`.
 //!
 //! # SOURCES (DRIVERS-METHOD §5 — each constant on its line carries what it has)
 //!
@@ -55,6 +60,11 @@ const TRB_LINK: u32 = 6;
 const TRB_CONFIGURE_EP: u32 = 12;
 /// Endpoint Context EP Type 5 = Isoch IN (§6.2.3, Table 6-9 EP Type encoding: 1 Isoch Out … 5 Isoch In).
 const EP_TYPE_ISOCH_IN: u32 = 5;
+/// Endpoint Context EP Type 1 = Isoch OUT (same table). UAC1 (rmbp-ledger B706).
+const EP_TYPE_ISOCH_OUT: u32 = 1;
+/// UAC1: the OUT pipe's lead — 32 TDs (32 ms at one TD per full-speed frame). A playback stream wants a short
+/// lead (the latency from `audio` write to the wire), not the IN path's 1 MiB budget.
+const OUT_TDS: usize = 32;
 /// Isoch TRB control bits (§6.4.1.3): ISP bit 2, IOC bit 5, TBC bits 8:7, BEI bit 9, TLBPC bits 19:16,
 /// Frame ID bits 30:20, SIA bit 31.
 const ISO_ISP: u32 = 1 << 2;
@@ -111,6 +121,48 @@ fn pop_candidate() -> u8 {
     0
 }
 
+// UAC1 (rmbp-ledger B706): audio candidates — a second queue, taken by `service_uvc` when no camera waits.
+static PENDING_AUDIO: crate::sync::Mutex<[u8; 4]> = crate::sync::Mutex::new([0; 4]);
+
+fn push_audio(slot: u8, path: &str) {
+    let mut q = PENDING_AUDIO.lock();
+    if q.contains(&slot) {
+        return;
+    }
+    match q.iter_mut().find(|s| **s == 0) {
+        Some(s) => {
+            *s = slot;
+            crate::bootlog_println!("[usb-iso] audio candidate slot={} path={} queued", slot, path);
+        }
+        None => serial_println!("[usb-iso] audio candidate slot={} path={} DROPPED reason=queue-full(4)", slot, path),
+    }
+}
+
+fn pop_audio() -> u8 {
+    let mut q = PENDING_AUDIO.lock();
+    for s in q.iter_mut() {
+        if *s != 0 {
+            return core::mem::replace(s, 0);
+        }
+    }
+    0
+}
+
+/// UAC1: the root config walk (drivers/xhci/mod.rs, the fold after the bulk-pair arms). `buf` is the slot's
+/// descriptor buffer holding the configuration descriptor just read. Queues an audio candidate when the first
+/// 64 bytes carry an Audio Control interface; returns true when the ROOT PORT must be released here — the
+/// window has no HID interface (a HID interface in the same 64 bytes is armed by `record_hid_interfaces`, whose
+/// completion advances the port itself).
+pub fn note_audio_root(slot: u8, buf: u64) -> bool {
+    // SAFETY: `buf` is the slot's 256-byte descriptor buffer and the walk that called us just read it.
+    let win = unsafe { core::slice::from_raw_parts(buf as *const u8, 64) };
+    if slot == 0 || !crate::drivers::usb::uac::cfg_has_audio(win) {
+        return false;
+    }
+    push_audio(slot, "root");
+    !crate::drivers::usb::uac::cfg_has_hid(win)
+}
+
 /// Root FSM, "no driver for device class": a Miscellaneous/IAD device (class 0xEF) is a camera candidate.
 pub fn note_root(slot: u8, class: u8) {
     if class == 0xEF && slot != 0 {
@@ -125,6 +177,9 @@ pub fn note_downstream(slot: u8, buf: u64) {
     if slot != 0 && uvc::cfg_has_video_iad(win) {
         push_candidate(slot, "hub");
     }
+    if slot != 0 && crate::drivers::usb::uac::cfg_has_audio(win) {
+        push_audio(slot, "hub"); // UAC1 (B706): a hubbed audio device — the hub FSM releases nothing, so no port to free
+    }
 }
 
 // ── The armed pipe ──────────────────────────────────────────────────────────────────────────────────────
@@ -132,6 +187,8 @@ pub fn note_downstream(slot: u8, buf: u64) {
 struct Pipe {
     slot: u8,
     dci: u8,
+    /// UAC1 (B706): an isochronous OUT pipe — each produced TD is filled from `uac::pull` first.
+    out: bool,
     /// Ring: `nslots` TRBs, data slots 0..nslots-1, the Link at `nslots`.
     ring: *mut Trb,
     ring_phys: u64,
@@ -164,6 +221,19 @@ unsafe impl Send for Pipe {}
 static PIPE: crate::sync::Mutex<Option<Pipe>> = crate::sync::Mutex::new(None);
 static PIPE_SLOT: AtomicU8 = AtomicU8::new(0);
 static PIPE_DCI: AtomicU8 = AtomicU8::new(0);
+// UAC1 (B706): the isochronous OUT pipe — its own armed word, so a camera and a speaker stream side by side.
+static OPIPE: crate::sync::Mutex<Option<Pipe>> = crate::sync::Mutex::new(None);
+static OPIPE_SLOT: AtomicU8 = AtomicU8::new(0);
+static OPIPE_DCI: AtomicU8 = AtomicU8::new(0);
+static ST_O_TDS: AtomicU32 = AtomicU32::new(0);
+static ST_O_MISSED: AtomicU32 = AtomicU32::new(0);
+static ST_O_UNDERRUN: AtomicU32 = AtomicU32::new(0);
+static ST_O_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// UAC1: the OUT pipe's counters (TDs retired, retired-not-sent, controller ring underruns, events).
+pub fn out_stats() -> (u32, u32, u32, u64) {
+    (ST_O_TDS.load(Ordering::Relaxed), ST_O_MISSED.load(Ordering::Relaxed), ST_O_UNDERRUN.load(Ordering::Relaxed), ST_O_EVENTS.load(Ordering::Relaxed))
+}
 
 static ST_TDS: AtomicU32 = AtomicU32::new(0);
 static ST_MISSED: AtomicU32 = AtomicU32::new(0);
@@ -302,9 +372,16 @@ impl Pipe {
     fn produce(&mut self) {
         let i = self.enq;
         let buf = self.bufs as u64 + (i * self.stride) as u64;
+        if self.out {
+            // UAC1 (B706): the TD's payload, from the class driver's ring (silence where it is short).
+            // SAFETY: TD buffer `i` is `stride` >= td_len bytes inside the pipe's allocation, and slot `i` is free
+            // (the controller retired its previous TD before `outstanding` dropped below the target).
+            crate::drivers::usb::uac::pull(unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, self.td_len as usize) });
+        }
         dma_coherency::clean(buf as usize, self.td_len as usize);
         let bei = if i % 8 != 7 { ISO_BEI } else { 0 };
-        let ctl = (TRB_ISOCH << 10) | ISO_ISP | ISO_IOC | bei | self.burst_fields() | self.schedule() | (self.cycle as u32);
+        let isp = if self.out { 0 } else { ISO_ISP }; // §6.4.1.3: Interrupt-on-Short-Packet is an IN notion
+        let ctl = (TRB_ISOCH << 10) | isp | ISO_IOC | bei | self.burst_fields() | self.schedule() | (self.cycle as u32);
         self.write_trb(i, Trb { parameter: buf, status: self.td_len & 0x1FFFF, control: ctl });
         self.enq += 1;
         if self.enq == self.nslots {
@@ -334,6 +411,9 @@ impl Pipe {
 
 /// THE TRANSFER-EVENT CLAIM — every event on the armed (slot, DCI), whatever its code. `true` = consumed.
 pub fn claim(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
+    if slot != 0 && OPIPE_SLOT.load(Ordering::Acquire) == slot && OPIPE_DCI.load(Ordering::Relaxed) == dci {
+        return claim_out(slot, dci, param, cc, residual); // UAC1 (B706): the isochronous OUT pipe
+    }
     if slot == 0 || PIPE_SLOT.load(Ordering::Acquire) != slot || PIPE_DCI.load(Ordering::Relaxed) != dci {
         return false;
     }
@@ -390,6 +470,52 @@ pub fn claim(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
     true
 }
 
+/// UAC1 (B706) — THE OUT CLAIM: every event on the armed OUT (slot, DCI). Retires TDs in ring order through the
+/// TRB the event names (the duplicate/stale guard of `claim`), counts the ones not sent, and tops the ring up —
+/// each new TD pulls the next payload from the class driver's ring. No lock but the pipe's own is taken.
+fn claim_out(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
+    let n_ev = ST_O_EVENTS.fetch_add(1, Ordering::Relaxed);
+    let mut g = OPIPE.lock();
+    let Some(p) = g.as_mut() else { return true };
+    if cc == 14 || cc == 15 {
+        ST_O_UNDERRUN.fetch_add(1, Ordering::Relaxed); // §4.10.3.1: the controller found no TD in time
+    }
+    if (n_ev as u32) < FIRST_WITNESSED {
+        serial_println!(
+            "[usb-iso] event n={} slot={} dci={} dir=out cc={} ({}) trb={:#x} residual={} mfindex={} outstanding={}",
+            n_ev, slot, dci, cc, cc_name(cc), param, residual, p.mfindex(), p.outstanding
+        );
+    }
+    if let Some(i) = p.index_of(param) {
+        if i < p.nslots {
+            let dist = (i + p.nslots - p.deq) % p.nslots;
+            if dist >= p.outstanding {
+                ST_DUP.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            for k in 0..=dist {
+                ST_O_TDS.fetch_add(1, Ordering::Relaxed);
+                if k == dist && cc == 1 {
+                    p.delivered = p.delivered.wrapping_add(1);
+                } else {
+                    ST_O_MISSED.fetch_add(1, Ordering::Relaxed);
+                    p.missed_since_start = p.missed_since_start.wrapping_add(1);
+                }
+            }
+            p.deq = (i + 1) % p.nslots;
+            p.outstanding -= dist + 1;
+        }
+    }
+    if !p.sia && p.delivered == 0 && p.missed_since_start >= SIA_FALLBACK_MISSED {
+        p.sia = true;
+        serial_println!("[usb-iso] sched frameid->sia dir=out reason=missed={} delivered=0 (SIA from the next TD)", p.missed_since_start);
+    }
+    if p.top_up() != 0 || cc == 14 || cc == 15 {
+        p.doorbell();
+    }
+    true
+}
+
 /// The device left: forget the candidate and the pipe. The ring and TD buffers are deliberately NOT freed —
 /// the controller may still hold the TR Dequeue Pointer until the slot is disabled, so they are leaked, one
 /// stream's worth (≤ 1 MiB + 4 KiB) per camera detach. The assembler is dropped (it is ours alone).
@@ -413,6 +539,22 @@ pub fn disconnect(slot: u8) {
         uvc::stream_disarm();
         serial_println!("[uvc-iso] disconnect slot={} — stream disarmed", slot);
     }
+    {
+        let mut q = PENDING_AUDIO.lock(); // UAC1 (B706): the audio queue and the OUT pipe forget the slot too
+        for s in q.iter_mut() {
+            if *s == slot {
+                *s = 0;
+            }
+        }
+    }
+    if OPIPE_SLOT.load(Ordering::Acquire) == slot {
+        OPIPE_SLOT.store(0, Ordering::Release);
+        if let Some(p) = OPIPE.lock().take() {
+            core::mem::forget(p); // as above: the controller may still hold the dequeue pointer
+        }
+        serial_println!("[usb-iso] disconnect slot={} dir=out — stream disarmed", slot);
+    }
+    crate::drivers::usb::uac::disconnect(slot);
 }
 
 /// The 4 KiB EP0 buffer, allocated once per boot (4 KiB-aligned, never freed).
@@ -546,11 +688,13 @@ impl IsoHost for XhciUvc<'_> {
     }
 
     fn iso_configure(&mut self, ep: &IsoEp) -> Result<(), (u8, &'static str)> {
-        if PIPE_SLOT.load(Ordering::Acquire) != 0 {
+        let out = ep.addr & 0x80 == 0; // UAC1 (B706): an OUT endpoint is a playback pipe (DCI ep*2, EP Type 1)
+        let tag = if out { "[usb-iso]" } else { "[uvc-iso]" };
+        if (if out { OPIPE_SLOT.load(Ordering::Acquire) } else { PIPE_SLOT.load(Ordering::Acquire) }) != 0 {
             return Err((0, "one-stream-already-armed"));
         }
         let speed = self.speed();
-        let dci = (ep.addr & 0x0F) as u32 * 2 + 1;
+        let dci = (ep.addr & 0x0F) as u32 * 2 + if out { 0 } else { 1 };
         let ss = speed >= 4;
         if speed == 2 {
             return Err((0, "low-speed-has-no-isochronous"));
@@ -572,9 +716,16 @@ impl IsoHost for XhciUvc<'_> {
         let biv = ep.interval.clamp(1, 16) as u32;
         let ivl = if speed >= 3 { biv - 1 } else { biv - 1 + 3 };
         let interval_uf = 1u32 << ivl;
+        // UAC1 (B706): an OUT TD carries the bytes one interval plays (the class driver's figure), never more
+        // than the ESIT the endpoint context reserves; an IN TD is the whole ESIT, as before.
+        let td_len = if out { crate::drivers::usb::uac::out_td_len(interval_uf) } else { esit };
+        if td_len == 0 || td_len > esit {
+            return Err((0, "payload-over-esit"));
+        }
         // The ring and TD buffers, before the command: the TR Dequeue Pointer is part of the context.
         let stride = (esit as usize).next_power_of_two().max(64);
         let target = (TD_BUDGET / stride).clamp(8, 255 - RING_SLACK);
+        let target = if out { target.min(OUT_TDS) } else { target };
         let nslots = target + RING_SLACK;
         let rl = core::alloc::Layout::from_size_align((nslots + 1) * 16, 4096).map_err(|_| (0u8, "layout"))?;
         let bl = core::alloc::Layout::from_size_align(nslots * stride, stride).map_err(|_| (0u8, "layout"))?;
@@ -600,24 +751,24 @@ impl IsoHost for XhciUvc<'_> {
         //   DW4 AverageTRBLength[15:0] (one TRB per TD → the ESIT) MaxESITPayloadLo[31:16].
         let ctx = [
             (mult << 8) | (ivl << 16) | ((esit >> 16) << 24),
-            (EP_TYPE_ISOCH_IN << 3) | (burst << 8) | (mps << 16),
+            ((if out { EP_TYPE_ISOCH_OUT } else { EP_TYPE_ISOCH_IN }) << 3) | (burst << 8) | (mps << 16),
             (ring_phys as u32) | 1,
             (ring_phys >> 32) as u32,
-            (esit & 0xFFFF) | ((esit & 0xFFFF) << 16),
+            (td_len & 0xFFFF) | ((esit & 0xFFFF) << 16), // Average TRB Length = the TD (== the ESIT on IN)
         ];
         let before = self.c.ep_state_of(self.slot, dci as u8);
         let r = self.configure(dci, true, ctx);
         let after = self.c.ep_state_of(self.slot, dci as u8);
         let (d0, d1, d4) = self.out_ep(dci);
         serial_println!(
-            "[uvc-iso] cfg-ep slot={} dci={} speed={} type=isoch-in mps={} burst={} mult={} esit={} interval_enc={} ({} uframes) ring={:#x} slots={} epstate={}({})->{}({}) result={}",
-            self.slot, dci, speed, mps, burst + 1, mult + 1, esit, ivl, interval_uf, ring_phys, nslots,
+            "{} cfg-ep slot={} dci={} speed={} type={} mps={} burst={} mult={} esit={} interval_enc={} ({} uframes) ring={:#x} slots={} epstate={}({})->{}({}) result={}",
+            tag, self.slot, dci, speed, if out { "isoch-out" } else { "isoch-in" }, mps, burst + 1, mult + 1, esit, ivl, interval_uf, ring_phys, nslots,
             before, ep_state_name(before), after, ep_state_name(after),
             match r { Ok(()) => "cc=1 (Success)", Err((_, n)) => n }
         );
         serial_println!(
-            "[uvc-iso] cfg-ep out dw0={:#010x}[state={} mult={} interval={} esit_hi={}] dw1={:#010x}[type={} burst={} mps={}] dw4={:#010x}[avg={} esit_lo={}]",
-            d0, d0 & 7, (d0 >> 8) & 3, (d0 >> 16) & 0xFF, d0 >> 24, d1, (d1 >> 3) & 7, (d1 >> 8) & 0xFF, d1 >> 16, d4, d4 & 0xFFFF, d4 >> 16
+            "{} cfg-ep out dw0={:#010x}[state={} mult={} interval={} esit_hi={}] dw1={:#010x}[type={} burst={} mps={}] dw4={:#010x}[avg={} esit_lo={}]",
+            tag, d0, d0 & 7, (d0 >> 8) & 3, (d0 >> 16) & 0xFF, d0 >> 24, d1, (d1 >> 3) & 7, (d1 >> 8) & 0xFF, d1 >> 16, d4, d4 & 0xFFFF, d4 >> 16
         );
         if let Err(e) = r {
             // The ring was never handed to a running endpoint: it is ours to drop.
@@ -644,6 +795,7 @@ impl IsoHost for XhciUvc<'_> {
             pipe: Pipe {
                 slot: self.slot,
                 dci: dci as u8,
+                out,
                 ring,
                 ring_phys,
                 nslots,
@@ -654,7 +806,7 @@ impl IsoHost for XhciUvc<'_> {
                 target,
                 bufs,
                 stride,
-                td_len: esit,
+                td_len,
                 mps,
                 ss_burst: burst,
                 ss,
@@ -683,11 +835,19 @@ impl IsoHost for XhciUvc<'_> {
         let first_frame = (now + pipe.ist_uf + START_MARGIN_UF) >> 3 & 0x7FF;
         let lead = pipe.target as u32 * pipe.interval_uf;
         serial_println!(
-            "[uvc-iso] start slot={} dci={} tds={} slack={} stride={} td_len={} interval_uf={} ist_uf={} mfindex={} first_frame~{} lead_uframes={} sched=frameid ring={:#x} bufs={:#x}",
-            pipe.slot, pipe.dci, n, RING_SLACK, pipe.stride, pipe.td_len, pipe.interval_uf, pipe.ist_uf, now, first_frame, lead,
+            "{} start slot={} dci={} tds={} slack={} stride={} td_len={} interval_uf={} ist_uf={} mfindex={} first_frame~{} lead_uframes={} sched=frameid ring={:#x} bufs={:#x}",
+            if pipe.out { "[usb-iso]" } else { "[uvc-iso]" }, pipe.slot, pipe.dci, n, RING_SLACK, pipe.stride, pipe.td_len, pipe.interval_uf, pipe.ist_uf, now, first_frame, lead,
             pipe.ring_phys, pipe.bufs as u64
         );
         let (slot, dci) = (pipe.slot, pipe.dci);
+        if pipe.out {
+            // UAC1 (B706): the OUT pipe publishes to its own word; the IN statics are untouched.
+            *OPIPE.lock() = Some(pipe);
+            OPIPE_DCI.store(dci, Ordering::Relaxed);
+            OPIPE_SLOT.store(slot, Ordering::Release);
+            self.c.ring_doorbell(slot, dci as u32);
+            return Ok((n as u32, lead, "frameid"));
+        }
         *PIPE.lock() = Some(pipe);
         ST_SIA.store(false, Ordering::Relaxed);
         PIPE_DCI.store(dci, Ordering::Relaxed);
@@ -697,10 +857,12 @@ impl IsoHost for XhciUvc<'_> {
     }
 
     fn iso_drop(&mut self, ep: &IsoEp) {
-        let dci = (ep.addr & 0x0F) as u32 * 2 + 1;
-        if PIPE_SLOT.load(Ordering::Acquire) == self.slot {
-            PIPE_SLOT.store(0, Ordering::Release);
-            if let Some(p) = PIPE.lock().take() {
+        let out = ep.addr & 0x80 == 0; // UAC1 (B706): the pipe of the endpoint's direction
+        let dci = (ep.addr & 0x0F) as u32 * 2 + if out { 0 } else { 1 };
+        let (word, pipe) = if out { (&OPIPE_SLOT, &OPIPE) } else { (&PIPE_SLOT, &PIPE) };
+        if word.load(Ordering::Acquire) == self.slot {
+            word.store(0, Ordering::Release);
+            if let Some(p) = pipe.lock().take() {
                 core::mem::forget(p); // see `disconnect`: the controller may still point at it
             }
         }
@@ -709,8 +871,8 @@ impl IsoHost for XhciUvc<'_> {
         }
         let r = self.configure(dci, false, [0; 5]);
         serial_println!(
-            "[uvc-iso] drop-ep slot={} dci={} result={} epstate={}",
-            self.slot, dci, match r { Ok(()) => "cc=1 (Success)", Err((_, n)) => n }, self.c.ep_state_of(self.slot, dci as u8)
+            "{} drop-ep slot={} dci={} result={} epstate={}",
+            if out { "[usb-iso]" } else { "[uvc-iso]" }, self.slot, dci, match r { Ok(()) => "cc=1 (Success)", Err((_, n)) => n }, self.c.ep_state_of(self.slot, dci as u8)
         );
     }
 }
@@ -724,6 +886,7 @@ impl XhciController {
             return;
         }
         let slot = pop_candidate();
+        let (slot, audio) = if slot != 0 { (slot, false) } else { (pop_audio(), true) }; // UAC1 (B706): a camera first, else an audio device
         if slot == 0 {
             return;
         }
@@ -748,14 +911,19 @@ impl XhciController {
         win[..got].copy_from_slice(unsafe { core::slice::from_raw_parts(buf as *const u8, got) });
         let cfg_value = win[5]; // bConfigurationValue (USB 2.0 Table 9-10)
         crate::bootlog_println!("[uvc-iso] service slot={} vid={:04x} pid={:04x} cfg_value={}", slot, self.slots[s].vid, self.slots[s].pid, cfg_value);
+        let (vid, pid) = (self.slots[s].vid, self.slots[s].pid);
         let mut host = XhciUvc { c: self, slot, buf, built: None };
-        uvc::probe_iso(0, slot, &win[..got], cfg_value, &mut host);
+        if audio {
+            crate::drivers::usb::uac::probe(slot, vid, pid, &win[..got], cfg_value, &mut host); // UAC1 (B706)
+        } else {
+            uvc::probe_iso(0, slot, &win[..got], cfg_value, &mut host);
+        }
         if let Some(b) = host.built.take() {
-            // `iso_configure` succeeded but no `iso_start`/`iso_drop` followed (an early return in probe_iso):
+            // `iso_configure` succeeded but no `iso_start`/`iso_drop` followed (an early return in the probe):
             // drop the endpoint so the reserved bandwidth is returned.
-            let dci = b.pipe.dci;
+            let (dci, out) = (b.pipe.dci, b.pipe.out);
             core::mem::forget(b);
-            let ep = IsoEp { addr: 0x80 | ((dci - 1) / 2), ..IsoEp::default() };
+            let ep = IsoEp { addr: if out { dci / 2 } else { 0x80 | ((dci - 1) / 2) }, ..IsoEp::default() };
             host.iso_drop(&ep);
         }
     }

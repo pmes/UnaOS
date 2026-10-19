@@ -26,7 +26,7 @@ extern crate alloc;
 #[macro_use]
 pub mod arch;
 
-pub mod drivers;
+pub mod drivers; #[cfg(any(feature = "uvc", feature = "hda-tone"))] pub mod audio; // UAC1 (rmbp-ledger B706): the ONE audio sink seam (audio/mod.rs) — HDA internal | USB; LINE-NEUTRAL append, knob off => never lexed
 pub mod fs;
 
 // NET-PHY: the shared, arch-neutral smoltcp phy::Device adapter (SmoltcpPhy<N: RawNic>). Hosts the
