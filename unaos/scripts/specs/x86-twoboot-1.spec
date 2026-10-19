@@ -25,6 +25,8 @@ REQUIRE \[boot\] phase=desktop from=setter why=session
 REQUIRE \[login\] desktop bare: furniture=none \(R88\) why=session
 # SESSIONWEDGE's missing lines: the desktop object built, then the services.
 REQUIRE \[desktop\] built at=
+# OLDEST (rmbp-ledger B682, BP-bar-1, BP-boot-15): the line's oldest machine, printed by `boot::oldest_say` at the boot's first build.
+REQUIRE :: OLDEST: board=rmbp12 year=2012 image=[^ ]+ net=(absent|present) -> BOOTS ::
 FORBID :: LOGIN: users\+session -> FAIL
 FORBID :: FIRSTBOOT: .* -> incoherent
 COMPLETE \[boot\] services up first=

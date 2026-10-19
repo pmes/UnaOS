@@ -406,3 +406,54 @@ pub fn ignite_from() -> &'static str {
         _ => "none",
     }
 }
+
+// ── OLDEST (rmbp-ledger B682; BP-bar-1, BP-boot-15) ─────────────────────────────────────────────────────────────────
+// Peter, 2026-10-19 (BP-bar-1): "locking people into hardware and software that's been given an expiration date user is
+// not privileged to". Every image line names the OLDEST machine it is for, and the boot that reaches that line's desktop
+// says so, with whether any network was there when it did: `:: OLDEST: board=<rmbp12|pi4|orin> year=<2012|2019|2023>
+// image=<build sha> net=<absent|present> -> BOOTS ::`, once, at the boot's first `[desktop] built`
+// (`desktopbuild::say`). FILE-TAIL append (nothing above moves). `login` only: every image line (image-line.env,
+// image-line-pi.env, image-line-orin.env) arms UNAOS_LOGIN, and a build without it (the QEMU lanes) is byte-identical.
+// The Orin's const is held for its line; its desktop is not reached yet (BP-boot-14, `tegra_early_stop`).
+
+/// `(board, year)`: the oldest machine this build's line is for — one const per board (image-line.env's header).
+#[cfg(all(feature = "login", target_arch = "x86_64"))]
+pub const OLDEST: (&str, u16) = ("rmbp12", 2012);
+#[cfg(all(feature = "login", target_arch = "aarch64", feature = "tegra"))]
+pub const OLDEST: (&str, u16) = ("orin", 2023);
+#[cfg(all(feature = "login", target_arch = "aarch64", not(feature = "tegra")))]
+pub const OLDEST: (&str, u16) = ("pi4", 2019);
+
+/// `present` when, at the desktop's build, a NIC is registered (x86 e1000), a USB Ethernet link is up, or any stack
+/// has settled an address; otherwise `absent` — the desktop was reached with no network (the services that bring it
+/// up open after the desktop, BP-boot-3). Reads atomics and the e1000 registry's short lock only.
+#[cfg(feature = "login")]
+fn oldest_net() -> &'static str {
+    #[allow(unused_mut)]
+    let mut up = false;
+    #[cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet", feature = "net6"))]
+    {
+        up |= crate::net_phy::settled_ipv4().is_some();
+    }
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    {
+        up |= crate::drivers::e1000::nic_present();
+    }
+    #[cfg(feature = "usbnet")]
+    {
+        up |= crate::drivers::xhci::usbnet::link_up();
+    }
+    if up { "present" } else { "absent" }
+}
+
+/// The OLDEST line (`desktopbuild::say`, the boot's first build only).
+#[cfg(feature = "login")]
+pub fn oldest_say() {
+    serial_println!(
+        ":: OLDEST: board={} year={} image={} net={} -> BOOTS ::",
+        OLDEST.0,
+        OLDEST.1,
+        crate::fs::bootdisk::BUILD_SHA,
+        oldest_net()
+    );
+}
