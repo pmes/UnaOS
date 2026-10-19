@@ -152,7 +152,7 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
             );
             alloc::format!("Linux programs run at the shell: linux {}", path)
         }
-        prog if prog.starts_with('/') => {
+        prog if prog.starts_with('/') => { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if let Some(s) = program_running(prog, path, mime) { return s; } // ONEINSTANCE2 (rmbp-ledger B751): a RUNNING program is raised and handed the file as OPEN_ARG, nothing launched (file tail); LINE-NEUTRAL fold, code before this line's first `//`.
             let r = open("launch", prog, crate::fs::filetype::UNAOS_ELF);
             let slot = JOBS.lock().iter().rev().find(|j| j.name == prog).map(|j| j.asid);
             match slot {
@@ -180,4 +180,16 @@ pub fn open(id: &str, path: &str, mime: &str) -> String {
             alloc::format!("unknown opener {}", other)
         }
     }
+}
+
+// ONEINSTANCE2 (rmbp-ledger B751; BP-ring3-18) — TAIL-APPENDED, so no line above moves. The program arm asks the arch's
+// one-instance check FIRST, as the glass (`origin::with(Glass, …)`: a Quarry open is the user's verb): a running `prog`
+// is raised and handed `path` as one `BUS_VERB_OPEN_ARG` frame — the frame a launch with that argument sends — and
+// nothing is launched. Not running: `None`, and the arm launches it and hands the file over as before (NOTICE on x86).
+// Wire: `[quarry] open PROGRAM prog=<p> file=<f> type=<t> -> running; file delivered as BUS_VERB_OPEN_ARG rc=<n>`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn program_running(prog: &str, path: &str, mime: &str) -> Option<String> {
+    let rc = crate::origin::with(crate::origin::Origin::Glass, || crate::arch::syscall::oneinstance_open_arg(prog, path))?;
+    serial_println!("[quarry] open PROGRAM prog={} file={} type={} -> running; file delivered as BUS_VERB_OPEN_ARG rc={}", prog, path, mime, rc);
+    Some(alloc::format!("opening {} in {}", super::leaf(path), crate::video::wm::program_name(prog)))
 }

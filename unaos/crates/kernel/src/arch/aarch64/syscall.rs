@@ -8311,7 +8311,7 @@ pub enum BgPoll {
 /// `run_user_image`'s front half exactly — same bounds, same console-cap endowment, same EXEC1-M
 /// publish order — and diverges only where the contract block above says it does.
 pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> { spawn_user_image_bg_piped(bytes, argv, None, false) } fn spawn_user_image_bg_piped(bytes: &[u8], argv: &[&str], pipe: Option<usize>, ring3: bool) -> Result<(u64, u64, u64), &'static str> { // ARMPIPE (A108): the bg body with SYS_SPAWN_PATH's two extras — the reserved pipe bound before the task exists, and the caller's principal rule; the shell's `bg` passes neither. ⚠ LINE-NEUTRAL fold.
-    if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window
+    #[cfg(feature = "desktop_firmware")] if oneinstance_gate(argv, pipe.is_some()).is_some() { return Err(ONEINSTANCE_RAISED); } if bytes.len() > super::xwin::IMAGE_CAP { // RING3ABI2 M5: the 4 MiB ELF window. ONEINSTANCE2 (rmbp-ledger B751): a second launch of a running program by the user's verb raises it instead of spawning (file tail), BEFORE anything is claimed; LINE-NEUTRAL fold, code before this line's first `//`.
         return Err("image larger than the user image cap (USER_WINDOW_BYTES)");
     }
     if !super::xwin::argv_fits(argv) {
@@ -23132,7 +23132,7 @@ fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
     let asid = current_asid();
     let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
     let ppid = current_principal();
-    sys_msend_for(asid, agen, ppid, &frame)
+    let rc = sys_msend_for(asid, agen, ppid, &frame); #[cfg(feature = "desktop_firmware")] bus_open_sent(asid, &frame, rc); rc // ONEINSTANCE2 (rmbp-ledger B751): an accepted REQUEST is a call IN FLIGHT until its reply is received — an OPEN_ARG met meanwhile is held, not lost (file tail); LINE-NEUTRAL fold, code before this line's first `//`.
 }
 
 /// SYS_MRECV(buf_ptr, buf_len) — dequeue the oldest reply (blocking while empty). buf_len must
@@ -23155,7 +23155,7 @@ fn sys_mrecv(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 { // PREFCHANGED (B5
         return EFAULT;
     }
     loop {
-        if let Some(msg) = bus_mbox_pop(asid) {
+        #[cfg(feature = "desktop_firmware")] let popped = bus_open_pop(asid, flags == una_abi::MRECV_NOWAIT); #[cfg(not(feature = "desktop_firmware"))] let popped = bus_mbox_pop(asid); if let Some(msg) = popped { // ONEINSTANCE2 (rmbp-ledger B751): the pop that holds an OPEN_ARG across a call in flight and hands it out on the receive after (file tail); knob-off the trunk's pop. LINE-NEUTRAL fold, code before this line's first `//`.
             // Range validated above; copy the exact frame.
             if copy_to_user(buf_ptr, &msg.frame, msg.frame.len()).is_err() {
                 return EFAULT; // unreachable after the up-front check; fail closed
@@ -27322,4 +27322,200 @@ pub fn arm_appmenu_selftest() {
         let reaped = rst == 0 && after.is_empty() && !crate::video::appmenu::has(owner);
         serial_println!(":: APPMENU: owner={} reaped empty={} -> {} ::", owner, reaped, if reaped { "PASS" } else { "FAIL" });
     }
+}
+
+// ONEINSTANCE2 (rmbp-ledger B751; BP-ring3-18, BP-video-23) — TAIL-APPENDED, so no line above moves. The aarch64 twin of
+// ONEINSTANCE (x86 B734), under `desktop_firmware` (the aarch64 desktop knob; knob-off every statement is cfg-erased).
+// (a) ONE check at the funnel every aarch64 detached launch shares (`spawn_user_image_bg_piped`: the shell's `bg` and bare
+// name, the dock, Quarry, `SYS_SPAWN_PATH`), before anything is claimed: a launch by the USER'S VERB (`origin::current()`
+// Glass or Door) of a program already running with a window, same session, same user, spawns nothing. `wm::focussteal`
+// is x86's, so the instance is found here with the calls both arches have: an owner (== ASID, `wm::owner_of_launch`)
+// whose armed name (`wm::app_name_of`) is `program_name(argv[0])` or APPRES's launch name (ASCII case folded, MAX_TITLE
+// cut — `raise_instance`'s match), with a live window (`wm::owner_rows`), running as the session's user. The verb names
+// it, so the raise is given (`cause=verb`) and granted as RAISEVERB grants it (`user_input_set_active` only on a real
+// arrival, then `focus_changed`); argv[1] goes to its mailbox as one `BUS_VERB_OPEN_ARG` frame (kind REPLY, corr 0)
+// and the launcher reads `Err(ONEINSTANCE_RAISED)`. A SPAWN_PIPE child and an unscoped (System) spawn are never gated.
+// (b) Quarry's opener asks it first ([`oneinstance_open_arg`]). (c) The OPEN_ARG hold across a call in flight —
+// x86's block of the same name, over `BUS_MBOX`/`ASID_GEN`.
+// Wire: `[app] launch path=<p> instance=new arg=<n>` / `[wm] raise owner=<o> focus=given cause=verb` +
+// `[app] launch path=<p> instance=raised arg=<n> owner=<o> focus=given delivered=<0|-errno>`.
+
+/// What a launcher reads when its launch raised the running instance instead of spawning one.
+#[cfg(feature = "desktop_firmware")]
+pub const ONEINSTANCE_RAISED: &str = "already running: its window was raised";
+
+/// The check (see the block above). `Some(delivered rc)` = the running instance was raised: the launch must not spawn.
+#[cfg(feature = "desktop_firmware")]
+fn oneinstance_gate(argv: &[&str], piped: bool) -> Option<i64> {
+    let path = argv.first().copied().unwrap_or("");
+    if piped || path.is_empty() || !matches!(crate::origin::current(), crate::origin::Origin::Glass | crate::origin::Origin::Door) {
+        return None; // not the user's verb: spawned as before, no line
+    }
+    let arg = argv.get(1).copied().unwrap_or("");
+    let launch_name = crate::fs::appres::launch_name(path);
+    let names = [crate::video::wm::program_name(path), launch_name.as_deref().unwrap_or("")];
+    let Some(owner) = oneinstance_find(&names) else {
+        serial_println!("[app] launch path={} instance=new arg={}", path, arg.len());
+        return None;
+    };
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) != owner {
+        user_input_set_active(owner);
+    }
+    crate::video::wm::focus_changed(owner);
+    serial_println!("[wm] raise owner={} focus=given cause=verb", owner);
+    let rc = if arg.is_empty() { 0 } else { bus_open_arg_to(owner, arg.as_bytes()) };
+    serial_println!("[app] launch path={} instance=raised arg={} owner={} focus=given delivered={}", path, arg.len(), owner, rc);
+    Some(rc)
+}
+
+/// The running instance for `names`: a live-windowed owner whose armed name matches, as the session's user.
+#[cfg(feature = "desktop_firmware")]
+fn oneinstance_find(names: &[&str]) -> Option<u64> {
+    use crate::video::wm::MAX_TITLE;
+    if names.iter().all(|n| n.is_empty()) {
+        return None;
+    }
+    let cut = |n: &str| n.len().min(MAX_TITLE);
+    let mut buf = [0u8; MAX_TITLE];
+    (1..=crate::procslot::SLOT_ID_MAX as u64).find(|&o| {
+        let n = crate::video::wm::app_name_of(o, &mut buf);
+        n > 0
+            && names.iter().any(|w| cut(w) == n && buf[..n].eq_ignore_ascii_case(&w.as_bytes()[..n]))
+            && crate::video::wm::owner_rows(o) > 0
+            && oneinstance_same_user(o)
+    })
+}
+
+/// Does `asid` run as the session's user? Every launch with a session open is restamped to it (`session_restamp`), and
+/// `slot_ppid_of` reads a closed session's stamp as anonymous (SO37). No session open: one user.
+#[cfg(all(feature = "desktop_firmware", feature = "login"))]
+fn oneinstance_same_user(asid: u64) -> bool {
+    let s = {
+        let _irq = IrqGuard::mask_save();
+        *SESSION.lock()
+    };
+    s.kind != PRIN_USER || slot_ppid_of(asid) == s
+}
+#[cfg(all(feature = "desktop_firmware", not(feature = "login")))]
+fn oneinstance_same_user(_asid: u64) -> bool {
+    true
+}
+
+/// One OPEN_ARG frame into `asid`'s mailbox: 0, or `EINVAL` (no such row, body empty or over `OPEN_ARG_MAX`) /
+/// `EAGAIN` (mailbox full).
+#[cfg(feature = "desktop_firmware")]
+fn bus_open_arg_to(asid: u64, body: &[u8]) -> i64 {
+    if asid == 0 || (asid as usize) >= BUS_MBOX.len() || body.is_empty() || body.len() > una_abi::OPEN_ARG_MAX {
+        return EINVAL;
+    }
+    bus_sem_init_once();
+    if !bus_mbox_has_room(asid) {
+        return EAGAIN;
+    }
+    bus_reply_enqueue(asid, 0, una_abi::BUS_VERB_OPEN_ARG, 0, body)
+}
+
+/// [`oneinstance_gate`] for Quarry's opener (`quarry::live::openers::program_running`): `Some(delivered rc)` = `prog`
+/// was running and is raised, `file` handed to it; `None` = not running. The caller scopes the user's verb.
+#[cfg(feature = "desktop_firmware")]
+pub fn oneinstance_open_arg(prog: &str, file: &str) -> Option<i64> {
+    oneinstance_gate(&[prog, file], false)
+}
+
+/// One ASID's hold: the generation it belongs to, its calls in flight, and the one OPEN_ARG held across them.
+#[cfg(feature = "desktop_firmware")]
+struct BusOpenHold {
+    tenancy: u64,
+    inflight: u32,
+    held: Option<BusMsg>,
+}
+
+#[cfg(feature = "desktop_firmware")]
+impl BusOpenHold {
+    const EMPTY: Self = BusOpenHold { tenancy: 0, inflight: 0, held: None };
+}
+
+#[cfg(feature = "desktop_firmware")]
+const BUS_INFLIGHT_MAX: u32 = 64;
+
+/// Per-ASID holds, beside `BUS_MBOX` (taken AFTER its row lock, never before; leaf).
+#[cfg(feature = "desktop_firmware")]
+static BUS_OPEN: crate::procslot::SlotVec<SpinMutex<BusOpenHold>> = crate::procslot::SlotVec::new_asid(|| SpinMutex::new(BusOpenHold::EMPTY), SpinMutex::new(BusOpenHold::EMPTY));
+
+#[cfg(feature = "desktop_firmware")]
+fn bus_open_fresh(h: &mut BusOpenHold, cur: u64) {
+    if h.tenancy != cur {
+        *h = BusOpenHold { tenancy: cur, inflight: 0, held: None };
+    }
+}
+
+/// Does this queued frame answer an ask (a REPLY that is not one of the kernel's corr-0 pushes)?
+#[cfg(feature = "desktop_firmware")]
+fn bus_answers_ask(frame: &[u8]) -> bool {
+    if frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REPLY {
+        return false;
+    }
+    let push = frame[8..12] == [0u8; 4] && matches!(frame[6], crate::bus::BUS_VERB_NOTICE | una_abi::BUS_VERB_PREF_CHANGED | una_abi::BUS_VERB_OPEN_ARG);
+    !push
+}
+
+/// SYS_MSEND's fold: an accepted REQUEST (rc 0) is one call in flight.
+#[cfg(feature = "desktop_firmware")]
+fn bus_open_sent(asid: u64, frame: &[u8], rc: i64) {
+    if rc != 0 || frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REQUEST || (asid as usize) >= BUS_MBOX.len() {
+        return;
+    }
+    let cur = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    let cell = &BUS_OPEN[asid as usize];
+    let _irq = IrqGuard::mask_save();
+    let mut h = cell.lock();
+    bus_open_fresh(&mut h, cur);
+    h.inflight = (h.inflight + 1).min(BUS_INFLIGHT_MAX);
+}
+
+/// SYS_MRECV's pop (the fold): x86's `busx_open_take` rule over `asid`'s queue and hold.
+#[cfg(feature = "desktop_firmware")]
+fn bus_open_pop(asid: u64, nowait: bool) -> Option<BusMsg> {
+    let cur = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    let cell = &BUS_OPEN[asid as usize];
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUS_MBOX[asid as usize].lock();
+    let mut h = cell.lock();
+    bus_open_fresh(&mut h, cur);
+    if h.inflight == 0 {
+        if let Some(m) = h.held.take() {
+            if m.agen == cur {
+                return Some(m);
+            }
+        }
+    }
+    while mb.count > 0 {
+        let head = mb.head;
+        let msg = mb.slots[head].take();
+        mb.head = (head + 1) % BUS_MBOX_DEPTH;
+        mb.count -= 1;
+        let Some(m) = msg else { continue };
+        if m.agen != cur {
+            continue;
+        }
+        if una_abi::open_arg_body(&m.frame).is_some() {
+            if h.inflight > 0 {
+                h.held = Some(m);
+                continue;
+            }
+            return Some(m);
+        }
+        if bus_answers_ask(&m.frame) {
+            h.inflight = h.inflight.saturating_sub(1);
+        }
+        return Some(m);
+    }
+    if nowait {
+        if let Some(m) = h.held.take() {
+            if m.agen == cur {
+                return Some(m);
+            }
+        }
+    }
+    None
 }
