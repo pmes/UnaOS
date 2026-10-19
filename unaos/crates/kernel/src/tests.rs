@@ -188,7 +188,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ #[cfg(feature = "quarry")] register("undomove", undomove_selftest); /* UNDOMOVE (B716): move, rename, Trash, new folder through Quarry's journal, four undos, four redos, one refused (`tests.rs` tail, LINE-NEUTRAL append) */ }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -937,5 +937,66 @@ fn abielf_selftest() {
     serial_println!(
         ":: ABIELF: elf=ABIPROBE.ELF bytes={} abi={} kernel_abi={} syscalls={} ok={} outcome={} -> {} ::",
         bytes.len(), abi, k, n, ok, outcome, if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// UNDOMOVE (rmbp-ledger B716, BP-bar-14): `:: UNDOMOVE: pushed=4 undone=4 redone=4 refused=1 leftovers=0 -> PASS ::` —
+/// Quarry's journal (`video/quarry/undo.rs`) driven through the SAME wrappers the menu, the keys and the drop call, on a
+/// scratch folder under the user's home through the mount table (the namespace Quarry's ops are confined to): a move, a
+/// rename, a Trash and a new folder push four entries; four undos put every object back (checked by stat), four redos
+/// re-apply them; a file put into the new folder makes the next undo REFUSED (`not-empty`) and drops that entry. The
+/// session's own journal is set aside for the run and put back. `leftovers` = the scratch folder still present after the
+/// clean-up + Trash entries still pointing into it.
+#[cfg(all(feature = "quarry", feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn undomove_selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    use crate::video::quarry::live::ops;
+    use crate::video::quarry::undo;
+    let t = crate::shell::vfs_mount_table();
+    let home = crate::fs::trash::home_base();
+    if t.stat(&home).is_err() {
+        let _ = t.create(&home, NodeKind::Dir, P);
+    }
+    let base = format!("{}/UndoMoveTest", home);
+    let _ = ops::op_delete(&base);
+    let saved = undo::fixture_take();
+    let (a, b) = (format!("{}/A", base), format!("{}/B", base));
+    let (mv, mv_to) = (format!("{}/MOVE.TXT", a), format!("{}/MOVE.TXT", b));
+    let (rn, rn_to) = (format!("{}/OLD.TXT", a), format!("{}/NEW.TXT", a));
+    let gone = format!("{}/GONE.TXT", a);
+    let nf = format!("{}/NEWDIR", a);
+    let mk = |p: &str| t.create(p, NodeKind::File, P).and_then(|_| t.write(p, 0, p.as_bytes(), P)).is_ok();
+    let made = ops::op_mkdir(&base).is_ok() && ops::op_mkdir(&a).is_ok() && ops::op_mkdir(&b).is_ok() && mk(&mv) && mk(&rn) && mk(&gone);
+    let at = |p: &str| t.stat(p).is_ok();
+    let fwd = || at(&mv_to) && !at(&mv) && at(&rn_to) && !at(&rn) && !at(&gone) && at(&nf);
+    let back = || at(&mv) && !at(&mv_to) && at(&rn) && !at(&rn_to) && at(&gone) && !at(&nf);
+    // the four verbs, through the journal's wrappers
+    let verbs_ok = made && undo::rename(&mv, &mv_to).is_ok() && undo::rename(&rn, &rn_to).is_ok() && undo::trash(&gone).is_ok() && undo::mkdir(&nf).is_ok();
+    let pushed = undo::depth().0;
+    let fwd1 = verbs_ok && fwd();
+    // four undos, newest first: the folder goes, the Trash restores, the rename and the move go back
+    let undone = (0..4).filter(|_| undo::undo().is_ok()).count();
+    let back_ok = back();
+    // four redos
+    let redone = (0..4).filter(|_| undo::redo().is_ok()).count();
+    let fwd2 = fwd();
+    // the refused undo: the new folder is no longer empty
+    let filled = mk(&format!("{}/X.TXT", nf));
+    let before = undo::depth().0;
+    let refused = (filled && undo::undo() == Err("not-empty") && undo::depth().0 + 1 == before && at(&nf)) as u32;
+    // clean-up: the trashed file out of the Trash, then the scratch tree
+    for e in crate::fs::trash::entries().into_iter().filter(|e| e.orig.starts_with(&base)) {
+        if crate::fs::trash::restore(&e.name).is_ok() {
+            let _ = ops::op_delete(&e.orig);
+        }
+    }
+    let _ = ops::op_delete(&base);
+    let leftovers = at(&base) as usize + crate::fs::trash::entries().iter().filter(|e| e.orig.starts_with(&base)).count();
+    undo::fixture_put(saved);
+    serial_println!("[undomove] made={} verbs={} fwd={} back={} fwd_again={} filled={} base={}", made, verbs_ok, fwd1, back_ok, fwd2, filled, base);
+    let pass = pushed == 4 && fwd1 && undone == 4 && back_ok && redone == 4 && fwd2 && refused == 1 && leftovers == 0;
+    serial_println!(
+        ":: UNDOMOVE: pushed={} undone={} redone={} refused={} leftovers={} -> {} ::",
+        pushed, undone, redone, refused, leftovers, if pass { "PASS" } else { "FAIL" }
     );
 }

@@ -1167,7 +1167,7 @@ fn drop_extent(items: &[MenuItem], name_len: usize) -> (usize, usize) {
             continue;
         }
         h += ITEM_H();
-        let g = item_glyphs(it, name_len);
+        let g = item_glyphs(it, name_len); #[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))] let g = g.max(undo_glyphs(it)); // UNDOMOVE (B716): sized for the widest live Undo/Redo label (LINE-NEUTRAL append)
         if g > widest {
             widest = g;
         }
@@ -1514,7 +1514,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
                         return true;
                     }
                 };
-                let owner = if s.is_wm_box(k) && !s.is_win_box(k) { s.app_owner } else { s.owner }; // APPMENU2
+                let owner = if s.is_wm_box(k) && !s.is_win_box(k) { s.app_owner } else { s.owner }; #[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))] if let Some(i) = item_at_row(items, py - my, mh) { if undo_pick(&items[i]) { return true; } } // UNDOMOVE (B716): a live Undo/Redo row runs Quarry's journal (LINE-NEUTRAL append, code before this comment). APPMENU2
                 return match item_at_row(items, py - my, mh) {
                     Some(i)
                         if items[i].flags & (FLAG_SEPARATOR | FLAG_DISABLED) == 0 =>
@@ -1861,7 +1861,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     let Some(idx) = item_at_row(items, j, h) else {
         return;
     };
-    let it = items[idx];
+    let it = items[idx]; #[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))] let it = undo_item(it); // UNDOMOVE (B716): Quarry's live `Undo <verb>` / `Redo <verb>` row (LINE-NEUTRAL append, code before this comment)
     let top = item_top(items, idx);
     if it.flags & FLAG_SEPARATOR != 0 {
         crystal::sheet::separator(out, w, j, top + SEP_H() / 2);
@@ -3094,7 +3094,81 @@ fn sheet_hover(s: &BarSnapshot, r: strip::Rect, pw: usize, ph: usize) -> usize {
             }
         }
         _ => 0,
-    };
+    }; #[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))] let hot = undo_hover(s, r, pw, ph, hot); // UNDOMOVE (B716): a live Undo/Redo row lights like any pickable row (LINE-NEUTRAL append)
     HOVER.store(hot, Ordering::Relaxed);
     hot
+}
+
+// ── UNDOMOVE (rmbp-ledger B716) — the WM Edit menu's Undo/Redo rows, live while Quarry holds the keyboard ─────────────
+//
+// The rows stay `FLAG_DISABLED` in `EDIT_MENU_DEFAULT` (a const table every image carries); with Quarry focused and its
+// journal non-empty, the painter, the hover and the press see a copy of the row with the verb in its label and the
+// flag cleared. Appended at the file's end and gated on the furniture family + `quarry`, so the knob-off build lexes
+// these lines and compiles none of them; the call sites are cfg'd statements appended to existing lines.
+
+/// The live label of a WM Edit `Undo`/`Redo` row (`None` = the greyed default stands).
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))]
+fn undo_row(it: &MenuItem) -> Option<&'static str> {
+    match it.id {
+        EDIT_ITEM_UNDO if it.label == "Undo" => crate::video::quarry::undo::menu_label(false),
+        EDIT_ITEM_REDO if it.label == "Redo" => crate::video::quarry::undo::menu_label(true),
+        _ => None,
+    }
+}
+
+/// The row as painted: `Undo <verb>`, enabled, when live.
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))]
+fn undo_item(it: MenuItem) -> MenuItem {
+    match undo_row(&it) {
+        Some(label) => MenuItem { id: it.id, label, flags: it.flags & !FLAG_DISABLED },
+        None => it,
+    }
+}
+
+/// The glyphs the Undo/Redo rows may need (the widest verb label), `0` for any other row.
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))]
+fn undo_glyphs(it: &MenuItem) -> usize {
+    if (it.id == EDIT_ITEM_UNDO && it.label == "Undo") || (it.id == EDIT_ITEM_REDO && it.label == "Redo") {
+        crate::video::quarry::undo::LABEL_MAX
+    } else {
+        0
+    }
+}
+
+/// A press on a live Undo/Redo row: dismiss the menu and step Quarry's journal. `false` = not a live row.
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))]
+fn undo_pick(it: &MenuItem) -> bool {
+    let Some(label) = undo_row(it) else { return false };
+    PICKS.fetch_add(1, Ordering::Relaxed);
+    dismiss("pick");
+    let redo = it.id == EDIT_ITEM_REDO;
+    let r = if redo { crate::video::quarry::undo::redo() } else { crate::video::quarry::undo::undo() };
+    serial_println!("[winmenu] pick owner=wm id={} label={} -> quarry-{} {}", it.id, label, if redo { "redo" } else { "undo" }, if r.is_ok() { "ok" } else { "refused" });
+    true
+}
+
+/// The hover over the open WM Edit dropdown's live Undo/Redo row (the static table calls it disabled).
+#[cfg(all(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), feature = "quarry"))]
+fn undo_hover(s: &BarSnapshot, r: strip::Rect, pw: usize, ph: usize, hot: usize) -> usize {
+    if hot != 0 || s.open == 0 {
+        return hot;
+    }
+    let k = s.open - 1;
+    if s.is_win_box(k) || s.is_app_box(k) || s.kind_of(k) != KIND_EDIT {
+        return hot;
+    }
+    let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
+    let (bx, by, bw, bh) = crystal::sheet::body(r);
+    let inset = crystal::sheet::INSET();
+    if cx < 0 || cy < 0 {
+        return hot;
+    }
+    let (px, py) = (cx as usize, cy as usize);
+    if !(px >= bx + inset && px + inset < bx + bw && py >= by && py < by + bh) {
+        return hot;
+    }
+    match item_at_row(EDIT_MENU_DEFAULT, py - by, bh) {
+        Some(i) if undo_row(&EDIT_MENU_DEFAULT[i]).is_some() => i + 1,
+        _ => hot,
+    }
 }
