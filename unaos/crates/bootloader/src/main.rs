@@ -9,7 +9,7 @@ use uefi::mem::memory_map::MemoryMap;
 use uefi::proto::console::gop::GraphicsOutput;
 use unaos_boot_info::{BootInfo, FrameBufferInfo, PixelFormat, MemoryRegion, MemoryRegionKind};
 
-use uefi::proto::media::file::{File, FileAttribute, FileMode};
+#[cfg_attr(target_arch = "x86_64", allow(unused_imports))] use uefi::proto::media::file::{File, FileAttribute, FileMode}; // ABIMAGE (B683): x86 opens the kernel through `slots::open`, which imports its own
 use uefi::proto::unsafe_protocol;
 
 // EDID — how a monitor reports its own native/preferred resolution. The first Detailed Timing
@@ -706,7 +706,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         Err(e) => return boot_fail(fb_addr, fb_size, e.status(), "open root volume"),
     };
 
-    let mut kernel_file = match root.open(cstr16!("kernel.elf"), FileMode::Read, FileAttribute::empty()) {
+    let mut kernel_file = match { #[cfg(target_arch = "x86_64")] let r = slots::open(&mut root); #[cfg(not(target_arch = "x86_64"))] let r = root.open(cstr16!("kernel.elf"), FileMode::Read, FileAttribute::empty()); r } { // ABIMAGE (B683): x86 opens the slot `abslot::decide` chose over STAGE.REC + SHUTDOWN.REC (KERNEL.ELF or KERNEL.NEW; the other when the pick is missing) and says `[loader] slot=<ELF|NEW> why=…`. LINE-NEUTRAL, x86-gated — see the fold note on `fn main`.
         Ok(file) => match file.into_regular_file() {
             Some(f) => f,
             None => return boot_fail(fb_addr, fb_size, Status::LOAD_ERROR, "kernel.elf is not a regular file"),
@@ -1534,3 +1534,88 @@ pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
 
 // LOADERSTALL (rmbp-ledger B490): the loader's own lines and stage record — x86 only, so the aarch64 loader does not move.
 #[cfg(target_arch = "x86_64")] mod stages;
+
+// ABIMAGE (rmbp-ledger B683) — the A/B kernel slots. FILE-TAIL append (nothing above moves), x86-gated like `stages`.
+// The records and the decision are the kernel's `install/abslot.rs`, compiled here by path so the kernel's
+// `tests abimage` asserts the very function this loader runs. Mechanism: docs/dev/OS/10_INSTALL/ab-image.md.
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+#[path = "../../kernel/src/install/abslot.rs"]
+mod abslot;
+
+#[cfg(target_arch = "x86_64")]
+mod slots {
+    use super::abslot::{self, Slot, Write};
+    use uefi::proto::media::file::{Directory, File, FileAttribute, FileHandle, FileMode};
+    use uefi::{cstr16, CStr16};
+
+    const ELF: &CStr16 = cstr16!("KERNEL.ELF");
+    const NEW: &CStr16 = cstr16!("KERNEL.NEW");
+    const STAGE: &CStr16 = cstr16!("STAGE.REC");
+    const SHUTDOWN: &CStr16 = cstr16!("SHUTDOWN.REC");
+
+    /// One record (at most `REC_MAX` bytes); `None` when absent or unreadable.
+    fn read_rec(root: &mut Directory, name: &CStr16, buf: &mut [u8; abslot::REC_MAX]) -> Option<usize> {
+        let mut f = root.open(name, FileMode::Read, FileAttribute::empty()).ok()?.into_regular_file()?;
+        f.read(buf).ok()
+    }
+
+    /// Replace a record: delete, create, write, flush. `true` only when every step held.
+    fn put_rec(root: &mut Directory, name: &CStr16, bytes: &[u8]) -> bool {
+        if let Ok(f) = root.open(name, FileMode::ReadWrite, FileAttribute::empty()) {
+            if f.delete().is_err() {
+                return false;
+            }
+        }
+        let Some(mut f) = root.open(name, FileMode::CreateReadWrite, FileAttribute::empty()).ok().and_then(|f| f.into_regular_file()) else {
+            return false;
+        };
+        f.write(bytes).is_ok() && f.flush().is_ok()
+    }
+
+    fn drop_rec(root: &mut Directory, name: &CStr16) -> bool {
+        match root.open(name, FileMode::ReadWrite, FileAttribute::empty()) {
+            Ok(f) => f.delete().is_ok(),
+            Err(_) => true,
+        }
+    }
+
+    /// Decide, write the record the decision owes BEFORE the jump, open the slot.
+    pub fn open(root: &mut Directory) -> uefi::Result<FileHandle> {
+        let (mut sb, mut hb) = ([0u8; abslot::REC_MAX], [0u8; abslot::REC_MAX]);
+        let sn = read_rec(root, STAGE, &mut sb);
+        let hn = read_rec(root, SHUTDOWN, &mut hb);
+        let mut d = abslot::decide(sn.map(|n| &sb[..n]), hn.map(|n| &hb[..n]));
+        match d.write {
+            Write::None => {}
+            // A trial the loader cannot MARK is never taken: a NEW that died unmarked would be picked again forever.
+            Write::Trial => {
+                if !put_rec(root, SHUTDOWN, abslot::REC_TRIAL) {
+                    log::info!("[loader] trial unmarked (ESP write failed): staying on ELF");
+                    d = abslot::Decision { slot: Slot::Elf, why: abslot::Why::Normal, write: Write::None };
+                }
+            }
+            Write::Fallback => {
+                log::info!("[loader] fallback from=NEW reason=no-desktopbuilt");
+                let w = put_rec(root, SHUTDOWN, abslot::REC_FALLBACK) & drop_rec(root, STAGE);
+                if !w {
+                    log::info!("[loader] fallback record write failed");
+                }
+            }
+        }
+        log::info!("[loader] slot={} why={}", d.slot.word(), d.why.word());
+        let (pick, other, other_word) = match d.slot {
+            Slot::Elf => (ELF, NEW, "NEW"),
+            Slot::New => (NEW, ELF, "ELF"),
+        };
+        match root.open(pick, FileMode::Read, FileAttribute::empty()) {
+            Ok(h) => Ok(h),
+            Err(e) => {
+                // A promotion torn between its two renames leaves KERNEL.NEW (the image that just passed) and no
+                // KERNEL.ELF; a removed KERNEL.NEW under a live trial leaves the converse. Boot what is there.
+                log::info!("[loader] slot={} missing: opening slot={}", d.slot.word(), other_word);
+                root.open(other, FileMode::Read, FileAttribute::empty()).map_err(|_| e)
+            }
+        }
+    }
+}
