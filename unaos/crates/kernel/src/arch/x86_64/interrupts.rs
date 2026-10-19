@@ -482,8 +482,8 @@ unsafe fn ring3_fault_kill(vec: u8, err: u64, rip: u64, cr2: u64) -> ! {
         name, vec, err, rip, cr2, if vec == 14 { super::elf::fault_seg(cr2) } else { "none" }
     );
     #[cfg(feature = "lumen")] crate::lumen::note_ring3_fault(vec, rip); // LUMENCRASH M3 (B326): the faulting task's pid, vector and rip, for `tests lumen`'s spawn step
-    #[cfg(feature = "linuxabi")] crate::arch::linuxabi::note_fault_rip(rip); crate::arch::syscall::record_ring3_kill(name, vec, err, cr2); if !(name.len() > 1 && name.as_bytes()[0] == b'u' && name.as_bytes()[1].is_ascii_digit()) { #[cfg(feature = "login")] crate::fs::users::screen_notice(b"Program stopped", name.as_bytes()); } // NOTICE: queue only (fixtures u1.. u4x are silent)
-    crate::arch::sched::exit() // never returns; switches to the scheduler on this task's kstack
+    #[cfg(feature = "linuxabi")] crate::arch::linuxabi::note_fault_rip(rip); // APPFAULT (B700): `record_ring3_kill` and the "stopped" notice moved into `sched::terminate` — one teardown path, one toast at the slot's free edge (a slotless u1.. u4x fixture frees no slot, so it stays silent as before)
+    crate::arch::sched::terminate(crate::arch::sched::current_id().unwrap_or(0), crate::arch::sched::Cause::Fault { vec, err, rip, cr2 }) // APPFAULT (B700): never returns — records the kill, dooms the address space (siblings follow), then `sched::exit` on this task's kstack
 }
 
 extern "x86-interrupt" fn page_fault_handler(
