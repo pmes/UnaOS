@@ -622,7 +622,7 @@ refs/heads/exec-rmbp-pinchzoom    ee83f696 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-crawla       ac4440da FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-micring3     953d2efb FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-hwtab         9401ac88 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-keycharsarm   e448dc14 IN-FLIGHT cloud wave36 KEYCHARSARM
+refs/heads/exec-rmbp-keycharsarm   18223530 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-civilrest     c2f2cf0e FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-versionscompat 7f33eba0 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-a2dp          e448dc14 IN-FLIGHT cloud wave36 A2DP

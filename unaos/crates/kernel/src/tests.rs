@@ -2777,10 +2777,10 @@ fn mtpwrite_vfs(miss: &mut impl FnMut(&'static str, bool) -> bool) -> (bool, boo
 /// (`INPUT_EV_CHAR`, or `INPUT_EV_KEY_DOWN` for the ASCII `@`) (`window=`), and typed into a scratch Quarry edit
 /// field through `ops::key_char`'s body (`field=`). `altgr=ok`: every press claimed on de (so `hid_key_ascii` skips
 /// it), Right Alt cleared from the chord modifiers on de and kept on us, AltGr+Q claimed on de and not on us.
-/// `:: KEYCHARS: layout=de chars=5 window=5 field=5 altgr=ok -> PASS :: claimed=6/6 routed=5 ring=5`
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+/// `:: KEYCHARS: layout=de chars=5 window=5 field=5 altgr=ok arch=<arch> wake=ok repeat=owed -> PASS :: claimed=6/6 routed=5 ring=5` — KEYCHARSARM (SR153): both desktops; aarch64 reads the window back by ring depth (`keychars_arm`, tail); `wake=`/`repeat_byte=` bodies at the tail
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn keychars_selftest() {
-    use crate::arch::x86_64::syscall as sc;
+    #[cfg(target_arch = "x86_64")] use crate::arch::x86_64::syscall as sc; #[cfg(target_arch = "aarch64")] use keychars_arm as sc; // KEYCHARSARM (SR153): the arch's ring router
     use crate::drivers::xhci as hx;
     use crate::pal::Event;
     use crate::video::keymap::layouts::{self as kl, KbdState, RALT};
@@ -2813,7 +2813,7 @@ pub fn keychars_selftest() {
     let typed: alloc::vec::Vec<char> = evs.iter().filter_map(|e| match *e { Event::Key(b) => Some(b as char), Event::Char(c) => Some(c), _ => None }).collect();
     let chars_n = if typed.len() == WANT.len() { count(&typed) } else { 0 };
     // AltGr: the chord modifiers and the claim on de, then on us.
-    let altgr_de = hx::hid_chord_mods(RALT | 0x02) == 0x02 && hx::hid_layout_claim(0x14, RALT, false) == Some(b'@');
+    let altgr_de = hx::hid_chord_mods(RALT | 0x02) == 0x02 && hx::hid_layout_claim(0x14, RALT, false) == Some(b'@'); let repeat_byte = keychars_repeat_byte(); // KEYCHARSARM: on de, the bytes the typematic feeds hand the tracker
     let _ = kl::fixture_swap(us, false, KbdState::new().pack());
     let altgr_us = hx::hid_chord_mods(RALT) == RALT && hx::hid_layout_claim(0x14, RALT, false).is_none();
     kl::fixture_swap(saved.0, saved.1, saved.2);
@@ -2835,18 +2835,18 @@ pub fn keychars_selftest() {
             _ => None,
         })
         .collect();
-    let window_n = count(&win);
+    #[cfg(target_arch = "x86_64")] let window_n = count(&win); #[cfg(target_arch = "aarch64")] let window_n = { let _ = &win; if rn == routed { routed } else { 0 } }; // KEYCHARSARM: aarch64 has no ring read-back; queued by the real router AND the ring grew by as many
     // The kernel text field: Quarry's edit field, a scratch rename (none while a person has a field open).
     #[cfg(feature = "quarry")]
     let field: Option<alloc::string::String> = crate::video::quarry::live::ops::key_char_fixture(&typed);
     #[cfg(not(feature = "quarry"))]
     let field: Option<alloc::string::String> = None;
     let field_n = field.as_deref().map(|f| { let v: alloc::vec::Vec<char> = f.chars().collect(); if v.len() == WANT.len() { count(&v) } else { 0 } }).unwrap_or(0);
-    let pass = chars_n == 5 && window_n == 5 && field_n == 5 && altgr;
+    let wake = keychars_wake(); let pass = chars_n == 5 && window_n == 5 && field_n == 5 && altgr && wake && repeat_byte; // KEYCHARSARM: the Char repeat (`repeat=owed`) rides a u8 tracker (pal.rs) outside the arc
     serial_println!(
-        ":: KEYCHARS: layout=de chars={} window={} field={} altgr={} -> {} :: claimed={}/{} routed={} ring={} field_state={}",
-        chars_n, window_n, field_n, if altgr { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" },
-        claimed, SEQ.len(), routed, rn, if field.is_some() { "scratch" } else { "busy-or-absent" }
+        ":: KEYCHARS: layout=de chars={} window={} field={} altgr={} arch={} wake={} repeat=owed -> {} :: claimed={}/{} routed={} ring={} field_state={} repeat_byte={} window_by={}",
+        chars_n, window_n, field_n, if altgr { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" }, if wake { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" },
+        claimed, SEQ.len(), routed, rn, if field.is_some() { "scratch" } else { "busy-or-absent" }, if repeat_byte { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "depth" } else { "payload" }
     );
 }
 
@@ -4085,4 +4085,55 @@ fn micring3_selftest() {
     }
     #[cfg(not(all(feature = "uac", target_arch = "x86_64", feature = "wc")))]
     serial_println!(":: MICRING3: asked=- opened=- read_bytes=- revoked=- terminate=- -> SKIP :: reason=no-uac-x86-desktop (the `uac` knob on an x86 `wc` image) ::");
+}
+
+// ══════════════ KEYCHARSARM (LEDGER SR153) — `tests keychars` on aarch64, the wake and repeat legs — TAIL-APPENDED ══════════════
+
+/// KEYCHARSARM: the aarch64 ring router as `keychars_selftest`'s `sc`. `user_input_route` is the real seam
+/// (`user_input_enqueue`: the Esc / Quarry / Tab doors, then `pack_input`'s `Char` arm into the focused ring). aarch64
+/// has no ring read-back (`user_input_take` is x86's), so `user_input_take` here writes nothing and returns how far the
+/// fixture slot's ring GREW since the fixture focused it (`user_input_depth`, the CLICK-SWALLOW witness read); the
+/// fixture counts the window only when that equals the events the router queued (`window_by=depth`).
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "desktop_firmware"))]
+mod keychars_arm {
+    use crate::arch::aarch64::syscall as a;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static DEPTH0: AtomicU32 = AtomicU32::new(0);
+    pub fn user_input_active() -> u64 { a::user_input_active() }
+    pub fn user_input_set_active(asid: u64) {
+        a::user_input_set_active(asid);
+        if asid as usize == crate::procslot::SLOT_ID_MAX { DEPTH0.store(a::user_input_depth(asid), Ordering::Relaxed); }
+    }
+    pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
+        if a::user_input_enqueue(ev) { crate::pal::Event::Unknown } else { ev }
+    }
+    pub fn user_input_take(asid: u64, out: &mut [u64]) -> usize {
+        (a::user_input_depth(asid).wrapping_sub(DEPTH0.load(Ordering::Relaxed)) as usize).min(out.len())
+    }
+}
+
+/// KEYCHARSARM `wake=`: a layout character is ACTIVITY to the idle blank (`dimidle::gate`'s press arm). Waits out the
+/// millisecond the last stamp may share (bounded 50 ms), offers `Char('ü')`, and asks that the idle clock moved, that the
+/// gate dropped it only if the panel was blank (the waking key is swallowed, BP-bar-20), and that the panel is not blank.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn keychars_wake() -> bool {
+    use crate::video::dimidle;
+    let before = dimidle::last_activity_ms();
+    let t0 = crate::arch::ms();
+    while crate::arch::ms() <= t0 && crate::arch::ms().wrapping_sub(t0) < 50 { core::hint::spin_loop(); }
+    let blank0 = dimidle::blanked();
+    let dropped = dimidle::gate(crate::pal::Event::Char('ü'));
+    let after = dimidle::last_activity_ms();
+    let ok = after > before && after > t0 && dropped == blank0 && !dimidle::blanked();
+    serial_println!("[keychars] wake before={} after={} blank0={} dropped={} -> {}", before, after, blank0 as u8, dropped as u8, if ok { "ok" } else { "bad" });
+    ok
+}
+
+/// KEYCHARSARM `repeat_byte=` (asked while `de` is live): the byte a HELD key hands the typematic tracker is the
+/// layout's — usage 0x1C (US `y`) claims `z`, and `ü` (0x2F) claims 0, so neither EHCI's feed nor the aarch64 xHCI feed
+/// forges the US byte (`y`, `[`). Repeating the `ü` itself is owed: the tracker carries one ASCII byte (pal.rs).
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn keychars_repeat_byte() -> bool {
+    use crate::drivers::xhci as hx;
+    hx::hid_layout_claim(0x1C, 0, false) == Some(b'z') && hx::hid_layout_claim(0x2F, 0, false) == Some(0)
 }
