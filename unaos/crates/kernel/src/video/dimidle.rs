@@ -55,7 +55,7 @@ fn threshold_ms() -> u64 {
 /// waking key/button/wheel, and that key's release).
 pub fn gate(ev: Event) -> bool {
     let (input, press) = match ev {
-        Event::Key(_) | Event::Button(_) | Event::Wheel(_) => (true, true),
+        Event::Key(_) | Event::Char(_) | Event::Button(_) | Event::Wheel(_) => (true, true), // KEYCHARSARM (SR153): a layout character is a key press
         Event::KeyUp(_) => (true, false),
         Event::Mouse { .. } | Event::MouseAbsolute { .. } => (true, false),
         _ => (false, false),
