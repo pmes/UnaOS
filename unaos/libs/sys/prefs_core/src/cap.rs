@@ -82,6 +82,49 @@ mod tests {
         assert!(!may_set(Caller::Program("system"), "system", "login.items") && !may_set(Caller::Program("app"), "app", "x.y"));
         assert!(may_declare(l, "lumen") && !may_declare(l, "vug") && !may_declare(Caller::Anon, "lumen"));
         assert!(may_declare(Caller::Kernel, "sftest") && may_declare(Caller::Program("prefs"), "lumen"));
-        assert_eq!(settable_count(), 18);
+        // PREFSTESTS (SR158): every settable row BY NAME, so a row added to or dropped from the schema's
+        // `ring 3` column fails here with its name, not a count.
+        for k in schema::SCHEMA.iter().filter(|k| k.writers.contains(&Writer::Program)) {
+            let name = std::format!("{}.{}", k.ns, k.key);
+            assert!(SETTABLE.contains(&name.as_str()), "{name} is ring-3 settable in the schema but not listed in SETTABLE");
+        }
+        for name in SETTABLE {
+            let (ns, key) = name.split_once('.').unwrap();
+            assert!(settable(ns, key), "{name} is listed in SETTABLE but the schema does not mark it `ring 3`");
+        }
+        assert_eq!(settable_count(), SETTABLE.len());
     }
+
+    /// The schema's `ring 3 = yes` rows (docs/dev/PREFS-SCHEMA.md, writer `program`), in schema order.
+    /// Regenerate from the blessed table: the rows whose `ring 3` column reads `yes`.
+    const SETTABLE: &[&str] = &[
+        "system.accessibility.cursor_size",
+        "system.accessibility.cvd",
+        "system.accessibility.increase_contrast",
+        "system.accessibility.invert",
+        "system.accessibility.reduce_motion",
+        "system.accessibility.text_size",
+        "system.accessibility.zoom",
+        "system.accessibility.zoom_follow",
+        "system.appearance.accent",
+        "system.appearance.highlight",
+        "system.appearance.mode",
+        "system.audio.mute",
+        "system.audio.output",
+        "system.audio.volume",
+        "system.display.brightness",
+        "system.display.font",
+        "system.display.font_size",
+        "system.dock.autohide",
+        "system.dock.position",
+        "system.look",
+        "system.notify.dnd",
+        "system.pointer.speed",
+        "system.settings.tab",
+        "system.trackpad.natural_scroll",
+        "system.trackpad.secondary_click",
+        "system.trackpad.speed",
+        "system.trackpad.tap_to_click",
+        "system.trackpad.three_finger_drag",
+    ];
 }
