@@ -674,7 +674,7 @@ pub enum Refusal {
     Short(VolId, String, usize, usize),
     /// PRTSCR2 — another task's capture holds the door ([`IN_FLIGHT`]). The verb reports it and
     /// stops; [`service`] re-arms the request and runs it once the door opens.
-    InFlight,
+    InFlight, RecoveryWords, // KEYBOOT (B688): the recovery words are on the glass — no capture may hold them
     /// PRTSCR-ASYNC/UNPLUG — the USB volume this capture was writing left (or was replaced by a
     /// different disk on a recycled xHCI slot) between two slices: `(target, name, bytes reached,
     /// wanted)` — and the target is the one the capture OPENED, which is the whole point of naming
@@ -738,7 +738,7 @@ impl Refusal {
                 ":: PRTSCR: {} short write {} of {} bytes — capture INCOMPLETE :: source={} serial=0x{:08X} ::",
                 name, written, wanted, v.source, v.serial
             ),
-            Refusal::InFlight => serial_println!(
+            Refusal::RecoveryWords => serial_println!(":: PRTSCR: REFUSED (reason=recovery-words) — the recovery key is on the glass and is never written; NOTHING WRITTEN — capture skipped ::"), Refusal::InFlight => serial_println!( // KEYBOOT (B688)
                 ":: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::"
             ),
             Refusal::Vanished(v, name, done, total) => serial_println!(
@@ -780,7 +780,7 @@ impl Refusal {
             Refusal::Short(_, name, written, wanted) => {
                 alloc::format!("screenshot: {}: short write {} of {} bytes", name, written, wanted)
             }
-            Refusal::InFlight => {
+            Refusal::RecoveryWords => String::from("screenshot: refused (recovery-words) — the recovery key is on the screen"), Refusal::InFlight => { // KEYBOOT (B688)
                 String::from("screenshot: a capture is already in flight — retry after its verdict")
             }
             Refusal::Vanished(_, name, done, total) => alloc::format!(
@@ -1187,7 +1187,7 @@ impl Job {
         //    the PRTSCR-VOL ladder, must not choose a name, and must not create a directory entry.
         //    Putting the check here is what makes "zero bytes written" a structural property rather
         //    than a claim: on a no-session boot this returns before any of the three can happen.
-        let plan = live_plan()?;
+        #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] if crate::video::crystal::login::words_up() { return Err(Refusal::RecoveryWords); } let plan = live_plan()?; // KEYBOOT (B688): FIRST of all, while the recovery words are on the glass nothing is captured (LINE-NEUTRAL append, before this comment)
 
         // 1. The panel — through the sanctioned door, and only for the HANDLE. See the module note.
         let panel = crate::video::panel_snapshot().ok_or(Refusal::NoPanel)?;

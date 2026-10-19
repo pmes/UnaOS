@@ -2354,7 +2354,7 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             #[cfg(feature = "lumen")]
             if verdict.is_ok() {
                 if rekey {
-                    crate::keyring::ring_rekey(name, &o[..ol], &a[..al]); keyboot_rekey(name); // KEYBOOT (B688): the root's re-wrap is owed — said (LINE-NEUTRAL append, before this comment). RINGLOGIN2 (B479): the ring follows the password
+                    crate::keyring::ring_rekey(name, &o[..ol], &a[..al]); keyboot_rekey(name, &o[..ol], &a[..al]); // KEYBOOT (B688): a keyed root follows the password — the slot re-wrapped (LINE-NEUTRAL append, before this comment). RINGLOGIN2 (B479): the ring follows the password
                 } else {
                     crate::keyring::ring_kept_admin_reset(name);
                 }
@@ -3840,7 +3840,7 @@ fn home_kernel_rows(mt: &crate::fs::vfs::MountTable, home: &str, leaf: &str, own
 // KEYBOOT (rmbp-ledger B688) — the keyed root's PRE-BOOT UNLOCK hold, the first administrator KEYS the root, and
 // the recovery words' one showing. TAIL-APPENDED; the call sites are line-neutral folds: [`service`]'s store-ready
 // line (the hold), [`installer_create_user`]'s witness line (the keying), `passwd`'s ring_rekey line and the login
-// screen's change form (the rekey, owed).
+// screen's change form (the rekey: the slot re-wrapped for the new password).
 //
 // THE HOLD. The users store loads from the boot FAT and the root binds after it (`boot80_root_and_seed`, the first
 // `vfs_mount_table`). On the first store-ready pass [`keyboot_hold`] asks `unafs::keyboot_probe` whether the root
@@ -3981,21 +3981,38 @@ pub fn keyboot_words_park(w: ::unafs::RecoveryWords) -> bool {
     true
 }
 
-/// KEYBOOT: a password change of a user on a KEYED root. The re-wrap is OWED (the crate has no re-wrap and
-/// `set_key_slot` refuses a keyed volume — KEYBOOT's STOP), so the change says, on the wire and on the glass,
-/// that the disk still opens with the previous password or the recovery words.
-pub fn keyboot_rekey(name: &[u8]) {
+/// KEYBOOT: a password change on a KEYED root — the slot's password wrap is re-made for `new`
+/// (`KeySlot::rewrap_password`: the data key unwrapped with `old`, sealed under Argon2id(`new`); the recovery words
+/// unchanged) and written through the ONE mount (`replace_key_slot`). Both Argon2id runs happen OFF the mount's
+/// masked hold, on the caller's thread (the login worker or the `passwd` prompt); the slot is replaced only if it is
+/// still the one that was read. `old` not opening the slot (another administrator keyed it) re-wraps nothing and says so.
+pub fn keyboot_rekey(name: &[u8], old: &[u8], new: &[u8]) {
     #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         if role_of(name) != Some(Role::Admin) || !crate::fs::sysleaf::active() {
             return;
         }
-        if !crate::fs::unafs::with_unafs(|fs| fs.key_slot().is_some()).unwrap_or(false) {
-            return;
+        let Ok(Some(slot)) = crate::fs::unafs::with_unafs(|fs| fs.key_slot().cloned()) else {
+            return; // unkeyed (or no mount): nothing follows the password
+        };
+        let t0 = crate::arch::ms();
+        let next = slot.rewrap_password(&::unafs::Unlock::Password(old), new, &mut |b: &mut [u8]| {
+            let _ = crate::rand::drbg_fill(b);
+        });
+        let ms = crate::arch::ms().saturating_sub(t0);
+        let verdict = match next {
+            Err(::unafs::KeySlotError::KeyRefused) => "kept (the old password does not open the slot: another administrator keyed this disk)",
+            Err(_) => "FAILED (the KDF refused: the disk keeps the previous password)",
+            Ok(n) => match crate::fs::unafs::with_unafs(|fs| if fs.key_slot() == Some(&slot) { fs.replace_key_slot(n.clone()).is_ok() } else { false }) {
+                Ok(true) => "ok",
+                _ => "FAILED (the slot moved or did not write: the disk keeps the previous password)",
+            },
+        };
+        serial_println!("[keyboot] rekey user={} ms={} -> {}", wire_name(name), ms, verdict);
+        if verdict != "ok" {
+            screen_notice(b"Disk key unchanged", b"The disk still unlocks with your previous\npassword or your recovery words");
         }
-        serial_println!("[keyboot] rekey OWED user={} (no re-wrap in the crate: the root still unlocks with the previous password or the recovery words)", wire_name(name));
-        screen_notice(b"Disk key unchanged", b"The disk still unlocks with your previous\npassword or your recovery words");
     }
     #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
-    let _ = name;
+    let _ = (name, old, new);
 }

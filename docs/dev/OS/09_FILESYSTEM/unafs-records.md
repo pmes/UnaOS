@@ -142,10 +142,11 @@ M2's cipher will need its own INCOMPAT stamp (the seat's decision, see below).
   login screen (a Continue that needs a click) and dropped. On every later boot the root is keyed before anyone
   types, so the boot HOLDS before the root binds: `unafs::keyboot_probe` reads this sector (no mount), the login
   screen's unlock form takes the password or the words, and `unafs::unlock_root` opens the volume with
-  `mount_with` and binds it as the one mount. Owed (STOPs, outside the kernel files): a RE-WRAP under a new
-  password (`KeySlot::rewrap_password` keeping bytes 0..48 — the recovery wrap's AAD binds them — and
-  `UnaFS::replace_key_slot`), so a password change today leaves the slot under the previous password (the change
-  says so); and a REBIND of an unlocked keyed root (a remount needs the key again).
+  `KeySlot::unwrap` then `UnaFS::mount_with_key` and binds it as the one mount; that key stays with the open
+  root (RAM, wiped on drop) so a rebind re-opens it. A password change of the keying administrator RE-WRAPS the
+  slot: `KeySlot::rewrap_password` keeps bytes 0..48 (the recovery wrap's AAD binds them) and re-seals the data
+  key under Argon2id(new) with a fresh nonce; `UnaFS::replace_key_slot` writes it (sector 0 byte-identical). The
+  recovery words and the data key do not change.
 
 ## §R3 Inode block (one 4096 B block per inode)
 

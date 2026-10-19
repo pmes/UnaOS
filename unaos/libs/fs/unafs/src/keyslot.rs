@@ -403,6 +403,26 @@ impl KeySlot {
         }
     }
 
+    /// KEYBOOT (B688): the same slot with its PASSWORD wrap re-made for `new` — the data key unwrapped with `old`
+    /// (the current password or the recovery words; a wrong one answers [`KeySlotError::KeyRefused`]) and sealed under
+    /// Argon2id(`new`) with a fresh nonce. Bytes 0..48 (version, cipher, costs, salt) are kept, because the recovery
+    /// wrap's AAD binds them: the recovery words and the data key are unchanged. The key is wiped before returning.
+    pub fn rewrap_password(&self, old: &Unlock<'_>, new: &[u8], rng: &mut dyn FnMut(&mut [u8])) -> Result<KeySlot, KeySlotError> {
+        let key = self.unwrap(old)?;
+        let mut s = self.clone();
+        rng(&mut s.pw_nonce);
+        let hdr = s.header();
+        let mut kek = password_kek(new, &s.salt, s.kdf)?;
+        let mut buf = *key.bytes();
+        drop(key);
+        let t = crypto_core::chacha20poly1305::seal_in_place(&kek, &s.pw_nonce, &aad(AAD_PW, &hdr, &[]), &mut buf);
+        kek.zeroize();
+        s.pw_wrapped = buf;
+        buf.zeroize();
+        s.pw_tag = t.map_err(|_| KeySlotError::Unsupported)?;
+        Ok(s)
+    }
+
     /// The password KDF's salt (not secret: it is on the disk) — `tests volkey` derives the same KEK through
     /// `SYS_KDF`'s body with it.
     pub fn salt(&self) -> &[u8; 16] {

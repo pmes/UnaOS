@@ -834,16 +834,43 @@ pub fn volkey_selftest() {
 // (`volkey_seal` + `set_key_slot`), then a remount without the key and with a wrong one is REFUSED (the gate every
 // lazy bind of a locked root meets), the password and the 24 words each OPEN it (the two modes of the unlock form's
 // `mount_with`) with the witness file read back, a second keying is refused, and the words go through the SAME
-// one-shot hand-over the keying uses (`users::keyboot_words_park/take`): taken once, never again. The REKEY leg is
-// owed — the crate has no re-wrap (KEYBOOT's STOP) — so it reads `owed` and the verdict FAILs until it lands. Floor
-// KDF costs; no secret on the wire.
+// one-shot hand-over the keying uses (`users::keyboot_words_park/take`): taken once, never again. The REKEY leg
+// re-wraps the slot for a new password (`rewrap_password` + `replace_key_slot`, `users::keyboot_rekey`'s calls): the
+// old password is refused, the new one and the unchanged words open it. Floor KDF costs; no secret on the wire.
 // =================================================================================================
 
-/// KEYBOOT: the rekey leg — `owed` until the crate re-wraps a slot under a new password (KEYBOOT's STOP: a
-/// `KeySlot::rewrap_password` and an `UnaFS::replace_key_slot`).
+/// KEYBOOT: the rekey leg — open the keyed volume with `pw`, re-wrap its slot for `new` (`rewrap_password`, the
+/// call `users::keyboot_rekey` makes) and replace it; then the old password is refused, the new one opens the volume
+/// and the unchanged recovery words still do. `ok` or the first leg that failed.
 #[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))]
-fn keyboot_rekey_leg(_bytes: &[u8]) -> &'static str {
-    "owed"
+fn keyboot_rekey_leg(bytes: &[u8], pw: &[u8], new: &[u8], words: &str) -> &'static str {
+    use ::unafs::fs::FileSystemError;
+    use ::unafs::{KeySlotError, MemDevice, UnaFS, Unlock};
+    let Ok(mut fs) = UnaFS::mount_with(MemDevice::from_bytes(bytes.to_vec()), &Unlock::Password(pw)) else {
+        return "open-FAIL";
+    };
+    let Some(slot) = fs.key_slot().cloned() else {
+        return "unkeyed-FAIL";
+    };
+    let Ok(next) = slot.rewrap_password(&Unlock::Password(pw), new, &mut |b: &mut [u8]| {
+        let _ = crate::rand::drbg_fill(b);
+    }) else {
+        return "rewrap-FAIL";
+    };
+    if fs.replace_key_slot(next).is_err() {
+        return "write-FAIL";
+    }
+    let after = core::mem::take(&mut fs.device).into_bytes();
+    drop(fs);
+    let old_refused = matches!(UnaFS::mount_with(MemDevice::from_bytes(after.clone()), &Unlock::Password(pw)), Err(FileSystemError::KeySlot(KeySlotError::KeyRefused)));
+    let new_opens = UnaFS::mount_with(MemDevice::from_bytes(after.clone()), &Unlock::Password(new)).is_ok();
+    let words_open = UnaFS::mount_with(MemDevice::from_bytes(after), &Unlock::Recovery(words)).is_ok();
+    match (old_refused, new_opens, words_open) {
+        (true, true, true) => "ok",
+        (false, _, _) => "old-OPENS",
+        (_, false, _) => "new-FAIL",
+        _ => "words-FAIL",
+    }
 }
 
 /// `tests keyboot` (see the section head).
@@ -880,7 +907,7 @@ pub fn keyboot_selftest() {
         read_back(&mut m) && matches!(m.set_key_slot(slot.clone()), Err(FileSystemError::KeySlot(KeySlotError::AlreadyKeyed)))
     });
     let unlock_words = UnaFS::mount_with(MemDevice::from_bytes(bytes.clone()), &Unlock::Recovery(words.as_str())).is_ok_and(|mut m| read_back(&mut m));
-    let rekey = keyboot_rekey_leg(&bytes);
+    let rekey = keyboot_rekey_leg(&bytes, PW, b"keyboot-fixture-new", words.as_str());
     // ── the words' one showing: the keying's own hand-over, taken once and never again ─────────────────────────
     let taken0 = crate::fs::users::keyboot_words_taken();
     let parked = crate::fs::users::keyboot_words_park(words);
@@ -897,6 +924,6 @@ pub fn keyboot_selftest() {
     serial_println!(
         ":: KEYBOOT: keyed={} refused={} unlock_pw={} unlock_words={} rekey={} words_shown_once={} -> {} ::",
         keyed as u8, refused as u8, if unlock_pw { "ok" } else { "FAIL" }, if unlock_words { "ok" } else { "FAIL" }, rekey, once as u8,
-        if pass { "PASS" } else if rekey == "owed" { "FAIL (rekey owed: the crate has no re-wrap — KEYBOOT STOP)" } else { "FAIL" }
+        if pass { "PASS" } else { "FAIL" }
     );
 }

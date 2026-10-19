@@ -449,7 +449,7 @@ pub fn mount_on(handle: block::BlockHandle) -> Result<KernelUnaFS, MountError> {
     partition_witness(handle, &span); #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_span(handle, &span); // HIDSTALL2 (B670): the span this handle's volume sits at, for the split read (LINE-NEUTRAL append, before this comment)
     let dev = SdSectorDevice::open_on(handle)?;
     let adapter = BlockAdapter::for_partition(dev, &span);
-    UnaFS::mount(adapter).map_err(MountError::Fs)
+    keyboot_mount(handle, adapter).map_err(MountError::Fs) // KEYBOOT (B688): the unlocked keyed root re-opens with the key its open mount carries (body at the tail); every other volume is `UnaFS::mount` as before
 }
 
 /// PARTITION (GR9): cross-check the located UnaFS span against the kernel block layer's own MBR
@@ -3367,16 +3367,17 @@ pub mod splitread {
 // [`keyboot_probe`] names the ROOT CANDIDATE — the first handle, in the bind's own order (the AHCI root grant,
 // then `Global`, then the admitted probes), whose partition table carries a UnaFS volume — and says whether its
 // block 0 carries a key slot (§R2a), reading two sectors and mounting nothing. [`unlock_root`] opens THAT volume
-// with the typed secret through `UnaFS::mount_with` — the Argon2id runs here, UNMASKED, on the caller's thread
-// (the login worker) — and only then takes the masked `MOUNT` hold to install it as the bound mount. Building the
+// with the typed secret — `KeySlot::unwrap` (the Argon2id, UNMASKED, on the caller's thread: the login worker), then
+// `UnaFS::mount_with_key` — and only then takes the masked `MOUNT` hold to install it as the bound mount. Building the
 // mount outside the hold is sound for exactly this volume: while it is keyed and locked every other bind stops at
-// block 0, so no second live mount of it exists (K4). The unwrapped data key is dropped (wiped) inside
-// `mount_with`; the kernel keeps no secret (BP-security-11, -14).
+// block 0, so no second live mount of it exists (K4). The unwrapped data key stays with the open root (below).
 //
-// NOT here (KEYBOOT's STOPs, reported with the exact change): a REBIND of an unlocked keyed root (a
-// `force_remount`, a K9 discard) needs the key again and refuses `KeyRequired` (an `Unlock::Key` in the crate,
-// or a seat decision); and `bootdisk::survey` caches a root bound while the keyed root is still locked
-// ([`root_locked`] is the predicate it would consult).
+// THE REBIND (seat, wave 36). A `force_remount`, a K9 discard or a contention restart drops the bound mount and the
+// next `with_unafs` rebinds through `mount_on` (:452), which for THE unlocked root hands the crate the unwrapped data
+// key (`UnaFS::mount_with_key`, [`keyboot_mount`]) instead of refusing `KeyRequired`. That key ([`KB_KEY`]) is the
+// open root's: it exists only from the unlock while the root is open, in RAM, wiped on drop — never in a store, on
+// a disk or on the wire (BP-security-11 as security.md now states it; M2's cipher needs the same key in the mount).
+// `bootdisk::survey` does not cache an answer while [`root_locked`] (the hold) is true.
 // =================================================================================================
 
 /// KEYBOOT: the root candidate [`keyboot_probe`] named (the volume [`unlock_root`] opens).
@@ -3385,6 +3386,18 @@ static KB_HANDLE: Mutex<Option<block::BlockHandle>> = Mutex::new(None);
 static KB_KEYED: AtomicBool = AtomicBool::new(false);
 /// KEYBOOT: the keyed root was opened with its key this boot.
 static KB_UNLOCKED: AtomicBool = AtomicBool::new(false);
+/// KEYBOOT: the OPEN root's unwrapped data key (wiped on drop) — what a rebind of that root opens it with.
+static KB_KEY: Mutex<Option<::unafs::VolumeKey>> = Mutex::new(None);
+
+/// KEYBOOT: `mount_on`'s open — with the open root's key for THE unlocked root's handle, `UnaFS::mount` otherwise.
+fn keyboot_mount(handle: block::BlockHandle, adapter: BlockAdapter<SdSectorDevice>) -> Result<KernelUnaFS, FileSystemError> {
+    if *KB_HANDLE.lock() == Some(handle) {
+        if let Some(k) = KB_KEY.lock().as_ref() {
+            return UnaFS::mount_with_key(adapter, k);
+        }
+    }
+    UnaFS::mount(adapter)
+}
 
 /// KEYBOOT: every handle the bind may take the root from, in the bind's order ([`bind_mount`]).
 fn keyboot_candidates() -> Vec<block::BlockHandle> {
@@ -3430,8 +3443,15 @@ pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
     partition_witness(handle, &span);
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     splitread::note_span(handle, &span);
+    // The slot, read off the medium and unwrapped HERE (the one Argon2id), then the mount with that key.
+    let mut b0 = [0u8; 1024];
+    if handle_read(handle, span.base_lba, &mut b0[..512]).is_err() || handle_read(handle, span.base_lba + 1, &mut b0[512..]).is_err() {
+        return Err(MountError::NoVolume);
+    }
+    let slot = ::unafs::KeySlot::parse(&b0).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?.ok_or(MountError::NoVolume)?;
+    let key = slot.unwrap(u).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?;
     let dev = SdSectorDevice::open_on(handle)?;
-    let mut fs = Some(UnaFS::mount_with(BlockAdapter::for_partition(dev, &span), u).map_err(MountError::Fs)?);
+    let mut fs = Some(UnaFS::mount_with_key(BlockAdapter::for_partition(dev, &span), &key).map_err(MountError::Fs)?);
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
         return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait, as every MOUNT taker on the render task
@@ -3449,9 +3469,10 @@ pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
         true
     });
     drop(fs);
+    *KB_KEY.lock() = Some(key); // the open root's key: a rebind re-opens it (`keyboot_mount`); wiped on drop
     KB_UNLOCKED.store(true, Ordering::Release);
     serial_println!(
-        "[keyboot] root unlocked handle={} via={} bound={} (the data key unwrapped and dropped; the kernel keeps no key)",
+        "[keyboot] root unlocked handle={} via={} bound={} (the data key lives only with the open root, in RAM, wiped on drop)",
         handle_kind_name(handle),
         match u {
             ::unafs::Unlock::Password(_) => "password",

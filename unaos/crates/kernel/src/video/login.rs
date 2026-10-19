@@ -2792,7 +2792,7 @@ fn setpw_change(n: &[u8], p: &[u8], o: &[u8], chg: u8) -> Result<(), &'static st
     #[cfg(feature = "lumen")]
     if written.is_ok() {
         match chg {
-            CHG_OWN => { crate::keyring::ring_rekey_at(n, o, p, "settings"); users::keyboot_rekey(n) } // KEYBOOT (B688): the root's re-wrap is owed — said
+            CHG_OWN => { crate::keyring::ring_rekey_at(n, o, p, "settings"); users::keyboot_rekey(n, o, p) } // KEYBOOT (B688): a keyed root follows the password (the slot re-wrapped)
             CHG_RESET => crate::keyring::ring_kept_admin_reset_at(n, "settings"),
             _ => {}
         }
@@ -3441,6 +3441,11 @@ fn kb_words_pending(after: u8) -> bool {
     }
     let _ = after;
     false
+}
+
+/// KEYBOOT: the words screen is up — `prtscr` refuses every capture while it is (`reason=recovery-words`).
+pub fn words_up() -> bool {
+    FORM.lock().state == State::Words
 }
 
 /// KEYBOOT: Continue — the drawn words are wiped off the RAM surface (it outlives the row), the words dropped
