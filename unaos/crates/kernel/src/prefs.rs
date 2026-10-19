@@ -1420,7 +1420,7 @@ pub mod decide {
     /// `video::dialog::WHAT_SYSTEM_FILES`: a write to the system trees refused.
     pub const SYSFILES: &str = "sysfiles";
     /// Any other refusal routed through `dialog::refused`.
-    pub const NOTICE: &str = "notice";
+    pub const NOTICE: &str = "notice"; /** `fs::apptrust::net_gate`: a ring-3 program's outbound reach, answered `always`/`never` (NETGRANT B707; the key's subject is the program's name). */ pub const NET: &str = "net"; // NETGRANT (B707): LINE-NEUTRAL append, code before this comment (this file is lexed into every image)
 }
 
 /// A subject is kept to this many bytes (the value stays one short line in `settings/general`).

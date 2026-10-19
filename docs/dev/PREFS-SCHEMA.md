@@ -82,7 +82,7 @@ Rows: 61.
 
 ## Decisions (REASK B681, R130 law 2)
 
-`system.decisions.<domain>.<stem>-<fnv64>` (domains `apptrust`, `opener`, `firmware`, `sysfiles`, `notice`) is a
+`system.decisions.<domain>.<stem>-<fnv64>` (domains `apptrust`, `opener`, `firmware`, `sysfiles`, `notice`, `net` — NETGRANT B707: a ring-3 program's outbound reach, subject = the program's name, answer `always`/`never`) is a
 string `"<answer> <at> <bind> <who>"`: the user's answer to an ask, the civil second it was given (0 = the clock was
 unset), what it is bound to (`-` = nothing; a program's volume and stamp), and the subject. Written by the kernel's ask
 seams (`prefs::decide`: apptrust's Open, a refusal alert, FWPIN's toast) while `system.privacy.remember` is on,

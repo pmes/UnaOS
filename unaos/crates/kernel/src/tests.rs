@@ -252,7 +252,7 @@ fn ensure_netring3() {
     #[cfg(feature = "netring3")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); register("nethang", crate::netring3::nethang_selftest); } // NETHANG: `tests nethang` (code first)
+        if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); register("nethang", crate::netring3::nethang_selftest); register("netgrant", netgrant_selftest); } // NETHANG: `tests nethang` (code first). NETGRANT (B707): `tests netgrant` (LINE-NEUTRAL append, before this comment)
     }
 }
 
@@ -788,4 +788,103 @@ pub fn applaunch_selftest() {
         alloc::string::String::from("PASS")
     };
     serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
+}
+
+// NETGRANT (rmbp-ledger B707, BP-security-16, BP-net-12) — TAIL-APPENDED. `tests netgrant`: a probe program's connect
+// through THE door's check (`fs::apptrust::net_gate_for`, the body `sys_connect` calls) and then the stack
+// (`smolnet::stack_connect`), exactly as `sys_connect` sequences them, on a socket a non-kernel row owns (a kernel
+// socket would be the kernel's own traffic). Headless (model-only dialogs). Legs:
+// * Never — the first connect asks (one dialog, `-EINPROGRESS`, nothing queued); answered Never (the default); the next
+//   two connects are `-EPERM` from the store with no second ask; the stack's ring-3 connects+sends moved 0.
+// * Always — the decision revoked (Settings > Privacy's call), a new run asks, answered Always: the connect reaches the
+//   stack and its SYN is counted (`allowed=1`).
+// * persisted — the decisions flushed and the store read back (`prefs::reload_from_store`, REASK's reboot): Always
+//   answers a third run with no ask.
+// `:: NETGRANT: asked=1 denied_pkts=0 allowed=1 persisted=1 -> PASS ::`. Everything the probe recorded is revoked.
+#[cfg(feature = "netring3")]
+fn netgrant_selftest() {
+    #[cfg(all(feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
+    {
+        use crate::fs::apptrust::{net_asks, net_forget, net_gate_for, NET_EPERM};
+        use crate::video::dialog::{self, Answer};
+        const APP: &str = "NGPROBE";
+        const IP: [u8; 4] = [10, 0, 2, 2];
+        const PORT: u16 = 9;
+        // Three runs of the probe: task keys no live task carries (tids count up from 1).
+        const RUN1: u64 = u64::MAX - 0x4e47;
+        const RUN2: u64 = RUN1 - 1;
+        const RUN3: u64 = RUN1 - 2;
+        if dialog::is_up() {
+            serial_println!(":: NETGRANT: -> SKIP reason=dialog-up ::");
+            return;
+        }
+        net_forget(APP);
+        let Some(sid) = crate::smolnet::stack_open_tcp(crate::procslot::SHARED_ROW) else {
+            serial_println!(":: NETGRANT: -> SKIP reason=no-stack (no NIC) ::");
+            return;
+        };
+        let was = dialog::headless(true);
+        // What reached the stack: every connect (a SYN, whoever's scope is open on this task — the shell's verb scope may
+        // name it) plus the ring-3 bucket's sends. The kernel's own sends (SNTP's datagrams) are not the probe's.
+        let ring3 = |c: &crate::net_tick::Census| c.connects() + c.send[crate::net_tick::Who::Ring3 as usize];
+        // `sys_connect`'s order: the grant, then the stack.
+        let connect = |task: u64| -> i64 {
+            match net_gate_for(APP, task, 0, IP, PORT, true) {
+                Err(e) => e,
+                Ok(()) => match crate::smolnet::stack_connect(sid, IP, PORT) {
+                    crate::smolnet::ConnectOutcome::Established => 0,
+                    crate::smolnet::ConnectOutcome::InProgress => -115,
+                    crate::smolnet::ConnectOutcome::Refused => -111,
+                },
+            }
+        };
+        let key = crate::prefs::decision_key(crate::prefs::decide::NET, APP);
+
+        // Never.
+        let c0 = crate::net_tick::LEDGER.census();
+        let tx0 = crate::net_phy::tx_emission_counts().0;
+        let a0 = net_asks();
+        let r1 = connect(RUN1);
+        dialog::open_now();
+        let up = dialog::is_up();
+        dialog::answer(Answer::Default); // Never
+        let r2 = connect(RUN1);
+        let r3 = connect(RUN2); // another run: refused from the store, no ask
+        let asked = net_asks() - a0;
+        let denied_pkts = ring3(&crate::net_tick::LEDGER.census().since(&c0));
+        let tx_frames = crate::net_phy::tx_emission_counts().0.wrapping_sub(tx0);
+        let never_kept = crate::prefs::decided(crate::prefs::decide::NET, APP, "-").as_deref() == Some("never");
+
+        // Always: revoked (Settings > Privacy), a new run asks, answered Always.
+        let revoked = crate::prefs::revoke(&key);
+        let c1 = crate::net_tick::LEDGER.census();
+        let a1 = net_asks();
+        let r4 = connect(RUN2);
+        dialog::open_now();
+        dialog::answer(Answer::Button(0)); // Always
+        let r5 = connect(RUN2);
+        let reasks_always = net_asks() - a1;
+        let allowed = ring3(&crate::net_tick::LEDGER.census().since(&c1)).min(1);
+
+        // persisted: the store read back, a third run passes unasked.
+        let flushed = crate::prefs::decisions_flush();
+        let keys = crate::prefs::reload_from_store();
+        let a2 = net_asks();
+        let kept = crate::prefs::decided(crate::prefs::decide::NET, APP, "-").as_deref() == Some("always");
+        let r6 = net_gate_for(APP, RUN3, 0, IP, PORT, true);
+        let persisted = (kept && r6.is_ok() && net_asks() == a2) as u32;
+
+        crate::smolnet::stack_close(sid);
+        net_forget(APP);
+        dialog::headless(was);
+        let pending = -115;
+        let ok = asked == 1 && up && r1 == pending && r2 == NET_EPERM && r3 == NET_EPERM && never_kept && denied_pkts == 0
+            && revoked && r4 == pending && reasks_always == 1 && r5 != NET_EPERM && allowed == 1 && persisted == 1;
+        serial_println!(
+            ":: NETGRANT: asked={} denied_pkts={} allowed={} persisted={} -> {} :: r={}/{}/{}/{}/{} never_kept={} revoked={} reask_after_revoke={} flushed={} keys={} tx_frames_in_never_leg={} key={}",
+            asked, denied_pkts, allowed, persisted, if ok { "PASS" } else { "FAIL" }, r1, r2, r3, r4, r5, never_kept as u8, revoked as u8, reasks_always, flushed, keys, tx_frames, key
+        );
+    }
+    #[cfg(not(all(feature = "smolnet", feature = "wc", target_arch = "x86_64")))]
+    serial_println!(":: NETGRANT: -> SKIP reason=x86-smolnet-wc-only ::");
 }

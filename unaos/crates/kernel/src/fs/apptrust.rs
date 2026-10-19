@@ -652,3 +652,202 @@ pub fn ensure_tests() {
         crate::tests::register("apptrust", selftest);
     }
 }
+
+// ── NETGRANT (rmbp-ledger B707, BP-security-16, BP-net-12, BP-bar-10/12) — the network is a grant, not a default ─────
+//
+// Research B §4 ("network is a grant, not a default") and R130 law 2: a ring-3 program's first outbound reach ASKS once —
+// `<app> wants to reach <ip:port>` · `Always` · `Allow Once` · `Never` (Never the default, rightmost; Esc dismisses = this
+// run is refused, nothing kept) — and `Always`/`Never` are the user's word, kept in Principia's store through REASK's one
+// path (`prefs::decide`, `system.decisions.net.<app>`, bind `-`), consulted before the ask is raised, listed on Settings
+// > Privacy with a Revoke (the list is domain-generic: `net: <app>` is one more kind of row). `Allow Once` (and a Never
+// or an Always while `system.privacy.remember` is off) is THIS RUN's: a RAM row keyed by the asking task.
+//
+// **The seam** — x86 `sys_connect` (SYS_CONNECT 44) and `sys_sendto` (SYS_SENDTO 42), the only doors a ring-3 socket has
+// to the wire, call [`net_gate`] BEFORE `smolnet::stack_connect` / `stack_sendto` (a LINE-NEUTRAL fold each, the
+// syscall.rs tail rule): a refusal returns `-EPERM` and the stack is never entered, so no SYN and no datagram is queued
+// (held at the socket layer by `tests netgrant`: the stack's outbound ledger, `net_tick::LEDGER`, moves 0). While the
+// ask is up the door answers the non-blocking verbs' own retry word (`-EINPROGRESS` for a connect, `-EAGAIN` for a
+// datagram) and nothing is queued. Kernel-origin traffic never reaches this gate: SNTP, DHCP, the kernel's resolver
+// (`SYS_RESOLVE` included — the kernel resolves for ring 3, BP-net-6) and the shell verbs call smolnet directly.
+//
+// **Who asks** — the program the launcher named: `wm::app_name_of(slot + 1)` (every `bg`, bare-name, Quarry and
+// `SYS_SPAWN_PATH` launch arms it), else the program name of `argv[0]` on the slot's args page (a foreground `run`;
+// the page is kernel-written and read-only to ring 3). A slot with neither is a kernel fixture blob (the SOCK ladder,
+// `SYS_SPAWN`'s fixed child): no user launched it, nothing names it, it is not asked.
+//
+// Wire: `[net] grant app=<name> dst=<ip:port> decision=<once|always|never|asked>` (said when the answer for a task and
+// destination changes, not per poll), `[netgrant] answer=<always|once|never|dismissed> app= kept=<0|1>`.
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// `-EPERM` (Linux 1): the user said Never — the refusal on the wire (una-abi names no EPERM yet).
+pub const NET_EPERM: i64 = -1;
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// The asks posted (the fixture's count).
+static NET_ASKS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// The ask on the glass: the program, the asking task, the destination.
+#[derive(Clone)]
+struct NetAsk {
+    app: String,
+    task: u64,
+    dst: String,
+}
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+static NET_ASKING: crate::sync::Mutex<Option<NetAsk>> = crate::sync::Mutex::new(None);
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// This run's answers: `(task, app, allow)` — `Allow Once`, a dismissal, and any answer the store did not keep.
+static NET_RUN: crate::sync::Mutex<Vec<(u64, String, bool)>> = crate::sync::Mutex::new(Vec::new());
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// Run rows kept at most (oldest dropped; a dropped row only means that run is asked again).
+const NET_RUN_MAX: usize = 64;
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// The last `[net] grant` line said: `(task, ip, port, decision)`.
+static NET_SAID: crate::sync::Mutex<Option<(u64, [u8; 4], u16, u8)>> = crate::sync::Mutex::new(None);
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+const NET_WORDS: [&str; 4] = ["once", "always", "never", "asked"];
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// Say the decision for `task` → `ip:port` once per change (the door is polled; the wire is not).
+fn net_say(app: &str, task: u64, ip: [u8; 4], port: u16, d: u8) {
+    let Some(mut g) = NET_SAID.try_lock() else { return };
+    if *g == Some((task, ip, port, d)) {
+        return;
+    }
+    *g = Some((task, ip, port, d));
+    drop(g);
+    serial_println!("[net] grant app={} dst={}.{}.{}.{}:{} decision={}", app, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]);
+}
+
+/// The program a ring-3 socket's slot runs, by the launcher's name (module note above); `None` = a kernel fixture blob.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn net_app_of(row: usize) -> Option<String> {
+    if row >= crate::procslot::SHARED_ROW {
+        return None;
+    }
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    let n = crate::video::wm::app_name_of(row as u64 + 1, &mut nb);
+    if n > 0 {
+        return core::str::from_utf8(&nb[..n]).ok().map(String::from);
+    }
+    // The caller's own CR3 is live (syscall context): its args page is mapped at `USER_ARGS_VA` for every slot
+    // (`memory::args_map`, ring-3 RO + NX), written only by the launcher.
+    let va = una_abi::USER_ARGS_VA;
+    let page = unsafe { core::slice::from_raw_parts(va as *const u8, 4096) };
+    let a = una_abi::Args::parse(page, va)?;
+    let w = core::str::from_utf8(a.get(0)?).ok()?;
+    let p = crate::video::wm::program_name(w);
+    if p.is_empty() { None } else { Some(String::from(p)) }
+}
+
+/// THE door's check (x86 `sys_connect` with `stream`, `sys_sendto` without): `Ok` = the stack may be entered;
+/// `Err(-EPERM)` = refused; `Err(-EINPROGRESS | -EAGAIN)` = asking, nothing queued, ring 3 polls again.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn net_gate(row: usize, ip: [u8; 4], port: u16, stream: bool) -> Result<(), i64> {
+    let Some(app) = net_app_of(row) else { return Ok(()) };
+    let task = crate::arch::sched::current_id().unwrap_or(0);
+    net_gate_for(&app, task, row as u64 + 1, ip, port, stream)
+}
+
+/// [`net_gate`]'s body for a named program: the store's decision, then this run's answer, then the ask.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn net_gate_for(app: &str, task: u64, owner: u64, ip: [u8; 4], port: u16, stream: bool) -> Result<(), i64> {
+    let wait = if stream { -115 } else { una_abi::EAGAIN }; // EINPROGRESS: the connect's own retry word
+    // try_lock throughout: this runs in the IF-masked syscall path and never spins (a busy lock = poll again).
+    match crate::prefs::decided_quiet(crate::prefs::decide::NET, app, "-").as_deref() {
+        Some("always") => {
+            net_say(app, task, ip, port, 1);
+            return Ok(());
+        }
+        Some("never") => {
+            net_say(app, task, ip, port, 2);
+            return Err(NET_EPERM);
+        }
+        _ => {}
+    }
+    let Some(run) = NET_RUN.try_lock() else { return Err(wait) };
+    if let Some(&(_, _, allow)) = run.iter().rev().find(|(t, a, _)| *t == task && a == app) {
+        drop(run);
+        net_say(app, task, ip, port, if allow { 0 } else { 2 });
+        return if allow { Ok(()) } else { Err(NET_EPERM) };
+    }
+    drop(run);
+    let Some(mut asking) = NET_ASKING.try_lock() else { return Err(wait) };
+    if asking.is_some() {
+        return Err(wait); // this program's ask (or another's) is on the glass: wait for the answer
+    }
+    let dst = alloc::format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
+    #[cfg(feature = "wc")]
+    {
+        use crate::video::dialog::{self, Act, Dlg, Icon};
+        let msg = alloc::format!("{} wants to reach {}", app, dst);
+        let info = alloc::format!("Always and Never are kept; Settings > Privacy revokes them.\nAllow Once lets this run of {} through.", app);
+        let mut d = Dlg::new(Icon::Caution, b"Network", msg.as_bytes(), info.as_bytes(), &[b"Always", b"Allow Once", b"Never"]);
+        d.cancel = Some(2); // Esc is a refusal of this run, never the leftmost `Always`
+        d.owner = owner;
+        d.act = Act::Hook(net_answer as fn(bool) as usize);
+        if !dialog::post(d) {
+            return Err(wait); // another alert holds the queue: this ask is posted on a later poll
+        }
+        *asking = Some(NetAsk { app: String::from(app), task, dst });
+        drop(asking);
+        NET_ASKS.fetch_add(1, Ordering::Relaxed);
+        net_say(app, task, ip, port, 3);
+        Err(wait)
+    }
+    #[cfg(not(feature = "wc"))]
+    {
+        // No dialog in this build: nobody can be asked, so nothing reaches the wire without a kept Always.
+        let _ = (owner, &mut asking);
+        serial_println!("[net] grant app={} dst={} decision=never why=no-dialog", app, dst);
+        Err(NET_EPERM)
+    }
+}
+
+/// DIALOG's answer (press/key route; queue-only): `Always` 0 · `Allow Once` 1 · `Never` 2 (the default, `ok`); Esc
+/// resolves to Never's index with `ok = false` — a dismissal, this run refused, nothing kept.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64", feature = "wc"))]
+fn net_answer(ok: bool) {
+    let Some(a) = NET_ASKING.lock().take() else { return };
+    let word = match (ok, crate::video::dialog::last_button()) {
+        (_, 0) => "always",
+        (_, 1) => "once",
+        (true, _) => "never",
+        _ => "dismissed",
+    };
+    if word == "always" || word == "never" {
+        crate::prefs::decide(crate::prefs::decide::NET, &a.app, "-", word); // REASK's one path (queue-only here)
+    }
+    let kept = crate::prefs::decisions().iter().any(|d| d.key == crate::prefs::decision_key(crate::prefs::decide::NET, &a.app));
+    {
+        let mut r = NET_RUN.lock();
+        r.retain(|(t, n, _)| !(*t == a.task && *n == a.app));
+        if r.len() >= NET_RUN_MAX {
+            r.remove(0);
+        }
+        r.push((a.task, a.app.clone(), word == "always" || word == "once"));
+    }
+    serial_println!("[netgrant] answer={} app={} dst={} kept={}", word, a.app, a.dst, kept as u8);
+}
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// The asks posted since boot (`tests netgrant`).
+pub fn net_asks() -> u32 {
+    NET_ASKS.load(Ordering::Relaxed)
+}
+
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+/// `tests netgrant`'s clean slate: `app`'s kept decision revoked, its run rows and any ask of its dropped.
+pub fn net_forget(app: &str) {
+    let k = crate::prefs::decision_key(crate::prefs::decide::NET, app);
+    if crate::prefs::decisions().iter().any(|d| d.key == k) {
+        let _ = crate::prefs::revoke(&k);
+    }
+    NET_RUN.lock().retain(|(_, n, _)| n != app);
+    let mut g = NET_ASKING.lock();
+    if g.as_ref().map(|x| x.app == app).unwrap_or(false) {
+        *g = None;
+    }
+}
