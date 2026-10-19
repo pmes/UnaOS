@@ -173,7 +173,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] { static SL: AtomicBool = AtomicBool::new(false); if !SL.swap(true, Ordering::AcqRel) { register("smartline", smartline_selftest); } } /* SMARTLINE (B708): `tests smartline` */ /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -788,4 +788,51 @@ pub fn applaunch_selftest() {
         alloc::string::String::from("PASS")
     };
     serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
+}
+
+/// SMARTLINE (rmbp-ledger B708, BP-bar-1): `tests smartline` — the disk's own health over AHCI. Leg 1: the SMART parse on
+/// a synthetic page (`smart::parse_selftest`). Leg 2: every disk the probe published — the IDENTIFY half (sectors > 0, a
+/// model) and SMART re-read LIVE through `ahci::smart_at`, whose attribute ids must equal the boot read's. A disk that
+/// answers ABORTED (or does not advertise SMART) passes on the IDENTIFY half with `smart=unsupported`. No disk: SKIP.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn smartline_selftest() {
+    use crate::drivers::ahci::smart::{self, Health, Smart};
+    let parse = smart::parse_selftest();
+    let boot = smart::disks();
+    if boot.is_empty() {
+        let v = if parse.is_ok() { "SKIP reason=no-ahci-disk" } else { "FAIL reason=parse" };
+        serial_println!(":: SMARTLINE: disks=0 parse={} -> {} ::", parse.err().unwrap_or("ok"), v);
+        return;
+    }
+    let (mut ident_ok, mut read, mut same, mut attrs, mut warn, mut ok) = (true, 0usize, true, 0usize, false, 0usize);
+    for d in &boot {
+        ident_ok &= d.ident.sectors != 0 && !d.ident.model().is_empty();
+        let live = smart::read(d.ix, d.port, d.ident);
+        smart::say(&live);
+        if let (Smart::Read(a, _), Smart::Read(b, _)) = (&d.smart, &live.smart) {
+            read += 1;
+            attrs += b.n;
+            same &= a.n == b.n && a.attrs[..a.n].iter().zip(b.attrs[..b.n].iter()).all(|(x, y)| x.id == y.id);
+        } else if matches!(d.smart, Smart::Read(..)) != matches!(live.smart, Smart::Read(..)) {
+            same = false;
+        }
+        match live.sum.health { Health::Warn(_) => warn = true, Health::Ok => ok += 1, Health::Na => {} }
+    }
+    let smart_w = if read == boot.len() { "ok" } else { "unsupported" };
+    let health = if warn { "warn" } else if ok > 0 { "ok" } else { "na" };
+    let verdict = if parse.is_err() {
+        "FAIL reason=parse"
+    } else if !ident_ok {
+        "FAIL reason=identify"
+    } else if !same {
+        "FAIL reason=reread"
+    } else if read > 0 && attrs == 0 {
+        "FAIL reason=no-attrs"
+    } else {
+        "PASS"
+    };
+    serial_println!(
+        ":: SMARTLINE: disks={} smart={} attrs={} health={} -> {} :: read={} parse={} reread_same={}",
+        boot.len(), smart_w, attrs, health, verdict, read, parse.err().unwrap_or("ok"), same as u8
+    );
 }

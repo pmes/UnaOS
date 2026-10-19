@@ -19,6 +19,9 @@
 //! the installer's `PartitionTarget` mints after its census. The plain block-layer write twin in
 //! `drivers/block.rs` keeps refusing in BOTH polarities. Prove the polarity on the artifact, never
 //! here: `LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35' <elf>` is 1 hit armed and 0 hits unarmed.
+//! SMARTLINE (rmbp-ledger B708) adds ATA `SMART` (0xB0) with exactly two features, both READ-ONLY:
+//! READ DATA (0xD0) and RETURN STATUS (0xDA) — [`smart_at`] at this file's tail; no feature that
+//! changes the device's state (ENABLE/DISABLE/SAVE/EXECUTE) is compiled. The parse is `smart.rs`.
 //!
 //! **Does NOT — 2: no installer reaches this device except through a grant.** Unarmed, `install/`'s
 //! two `Ahci` arms both refuse (rmbp-ledger B91: the bench rMBP's internal SSD carries a live
@@ -144,6 +147,8 @@ const DET_PRESENT: u32 = 3;
 // ── ATA opcodes. THE COMPLETE SET THIS FILE CAN ISSUE — see the SCOPE block. ─────────────────────
 const ATA_IDENTIFY_DEVICE: u8 = 0xEC;
 const ATA_READ_DMA_EXT: u8 = 0x25;
+/// SMARTLINE (B708): ATA8-ACS `SMART`, issued only by [`smart_at`] with a read-only feature.
+const ATA_SMART: u8 = 0xB0;
 
 /// AHCI 1.3.1 §3.3.1: `PxCLB` must be 1 KiB aligned and the list is 32 headers of 32 bytes.
 const CMDLIST_BYTES: usize = 32 * 32;
@@ -477,6 +482,12 @@ fn port_start(abar: u64, port: u8) -> bool {
 /// `count` is in SECTORS and is capped at 1 by every caller in this arc. `lba` is a 48-bit LBA;
 /// `IDENTIFY DEVICE` ignores both and passes zero.
 fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool) -> Result<(), ()> {
+    issue_f(p, cmd, 0, lba, count, bytes, write)
+}
+
+/// [`issue`] with the FIS's features byte: 0 for every command above, the SMART feature for
+/// [`smart_at`] (SMARTLINE B708) — the one register discipline, one copy.
+fn issue_f(p: &AhciPort, cmd: u8, feat: u8, lba: u64, count: u16, bytes: usize, write: bool) -> Result<(), ()> {
     let abar = p.abar;
     let port = p.port; if dongle::marked(port) { dongle::refused_marked(port, cmd); return Err(()); } // DONGLEBOOT (B658): a port that missed its bound is never issued another command this boot
 
@@ -497,7 +508,7 @@ fn issue(p: &AhciPort, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
         ct.add(0).write_volatile(0x27);
         ct.add(1).write_volatile(0x80);
         ct.add(2).write_volatile(cmd);
-        ct.add(3).write_volatile(0); // features (low)
+        ct.add(3).write_volatile(feat); // features (low): 0, or the SMART feature (SMARTLINE B708)
         ct.add(4).write_volatile((lba & 0xFF) as u8);
         ct.add(5).write_volatile(((lba >> 8) & 0xFF) as u8);
         ct.add(6).write_volatile(((lba >> 16) & 0xFF) as u8);
@@ -826,6 +837,7 @@ fn bring_up_port(abar: u64, port: u8, cap: u32, next_ix: usize) -> Option<usize>
     // ── Publish ─────────────────────────────────────────────────────────────────────────────────
     if identify_ok {
         crate::drivers::block::register_ahci(next_ix, port, id.sectors, &id.model);
+        smart::boot(next_ix, port, &idbuf, id.sectors); // SMARTLINE (B708): SMART READ DATA + RETURN STATUS once per published disk, the `[disk] smart` line
     } else {
         // Roll the entry back: a disk whose IDENTIFY decoded to zero sectors has no addressable
         // range, so an entry for it would be a device every bound check rejects one call later.
@@ -1253,4 +1265,50 @@ pub mod dongle {
     pub fn census() -> (u32, u32, u32, u64) {
         (TIMEOUTS.load(Relaxed), RENDER_REFUSED.load(Relaxed), BUSY_REFUSED.load(Relaxed), MAX_HOLD_US.load(Relaxed) / 1000)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// SMARTLINE (rmbp-ledger B708, BP-bar-1) — ATA SMART, read-only: the disk's own health, the user's to see.
+//
+// ATA8-ACS `SMART` (0xB0) carries its key in LBA mid/high = 0x4F/0xC2 — as the 48-bit `lba` [`issue_f`]
+// splits, 0x00C2_4F00 (FIS bytes 5 and 6). READ DATA (feature 0xD0) is one 512-byte PIO data-in sector
+// through the same single PRDT entry IDENTIFY uses; RETURN STATUS (0xDA) is non-data (PRDTL 0, as FLUSH
+// CACHE EXT) and answers in the D2H Register FIS the HBA posts at RFIS+0x40 (AHCI 1.3.1 §4.2.1): byte 5 LBA
+// mid, byte 6 LBA high — 0x4F/0xC2 thresholds not exceeded, 0xF4/0x2C exceeded (`smart::status_of`).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+#[path = "smart.rs"]
+pub mod smart;
+
+const SMART_READ_DATA: u8 = 0xD0;
+const SMART_RETURN_STATUS: u8 = 0xDA;
+/// The SMART key in the LBA bytes: LBA mid 0x4F, LBA high 0xC2.
+const SMART_KEY_LBA: u64 = 0x00C2_4F00;
+/// The D2H Register FIS's offset inside the received-FIS area (AHCI 1.3.1 §4.2.1).
+const RFIS_D2H: u64 = 0x40;
+
+/// SMARTLINE: SMART READ DATA into `page`, then SMART RETURN STATUS, on the disk at registry index `port_ix`.
+/// `Err` = READ DATA refused (the device ABORTed it, the port is marked or absent); `Ok(Some((mid, high)))` the
+/// status FIS's LBA mid/high, `Ok(None)` when RETURN STATUS itself failed (the page still stands). The hold is
+/// [`dongle::with_port`]'s — masked, bounded, never a render wait — so this is safe from any non-render task.
+pub(crate) fn smart_at(port_ix: usize, page: &mut [u8; SECTOR_BYTES]) -> Result<Option<(u8, u8)>, ()> {
+    if port_ix >= MAX_AHCI_DISKS {
+        return Err(());
+    }
+    dongle::with_port(port_ix, 0, |p| {
+        issue_f(p, ATA_SMART, SMART_READ_DATA, SMART_KEY_LBA, 1, SECTOR_BYTES, false)?;
+        unsafe { core::ptr::copy_nonoverlapping(p.dma as *const u8, page.as_mut_ptr(), SECTOR_BYTES) };
+        // The received-FIS base, read back from the port (the struct keeps no copy). Zero the two answer bytes
+        // first so a stale FIS can never read as this command's answer.
+        let fb = (pr32(p.abar, p.port, P_FB) as u64) | ((pr32(p.abar, p.port, P_FBU) as u64) << 32);
+        let d2h = (fb + RFIS_D2H) as *mut u8;
+        unsafe {
+            d2h.add(5).write_volatile(0);
+            d2h.add(6).write_volatile(0);
+        }
+        if issue_f(p, ATA_SMART, SMART_RETURN_STATUS, SMART_KEY_LBA, 0, 0, false).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(unsafe { (d2h.add(5).read_volatile(), d2h.add(6).read_volatile()) }))
+    })
 }
