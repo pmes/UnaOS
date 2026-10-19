@@ -31,6 +31,8 @@
 //!   samples), built once per wallpaper by `video::wallpaper`. STARFIELD (B661, R128): the default is the scene —
 //!   dark matter on ultra black, lensed stars, the zircon and the beam — and its sparse SHIMMER, re-tinted per tick by
 //!   [`shimmer_tick`] from [`track`]'s tail; `tests starfield` ([`starfield_selftest`]).
+//! * [`VeilCache`] — VEILCOST (rmbp-ledger B690, BP-bar-23): each veiled strip's composed field (the menu bar's,
+//!   the dock's plate), kept once per picture x theme epoch x rect, so a repaint is a row copy.
 //! * [`selftest`] — `tests desktopcraft` (R80: a verb, never at boot).
 //!
 //! THE SHADOW AND THE COMPOSITOR (DESIGNAPPLY B639, R122, DESIGN-LANGUAGE §2.4). The 5 pt frame and the bevel are
@@ -241,6 +243,127 @@ fn back_soft(b: Option<&Back>, out: &mut [u32], x0: usize, y: usize) {
         Some(b) => b.soft(out, x0, y),
         None => out.fill(theme::DESKTOP_BG),
     }
+}
+
+// ── the VEIL cache (VEILCOST B690, BP-bar-23: beauty costs no more than a solid fill) ───────────────────────────────
+
+/// What a veiled field's pixels depend on: the picture (its buffers, size and a 32-cell fingerprint of its VEIL, so a
+/// new picture allocated where an old one lay is still a new key), [`veil_cache_invalidate`]'s generation (the
+/// wallpaper install), the theme epoch and the live face/tint/hairline (set, accent, contrast), and the strip's rect
+/// plus one strip word (`extra`: the dock's corner radius, which follows the scale).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VeilKey {
+    wgen: u32,
+    pic: (usize, usize, usize, usize, u64),
+    epoch: u32,
+    look: (u32, u32, u32),
+    rect: (usize, usize, usize, usize),
+    extra: usize,
+}
+
+/// Bumped by [`veil_cache_invalidate`] (the wallpaper install): every cached field is stale.
+static VEIL_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// Drop every cached veiled field (the next repaint of each strip composes once and keeps it).
+pub fn veil_cache_invalidate() {
+    VEIL_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+fn veil_key(b: Option<&Back>, rect: (usize, usize, usize, usize), extra: usize) -> VeilKey {
+    let pic = match b {
+        None => (0, 0, 0, 0, 0),
+        Some(b) => {
+            let n = b.veil.len();
+            let mut f = 0xcbf2_9ce4_8422_2325u64 ^ (((b.w as u64) << 32) | b.h as u64);
+            if n > 0 {
+                for i in 0..32 {
+                    f = (f ^ b.veil[i * (n - 1) / 31] as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            (b.px.as_ptr() as usize, b.veil.as_ptr() as usize, b.vw, b.vh, f)
+        }
+    };
+    VeilKey { wgen: VEIL_GEN.load(Ordering::Acquire), pic, epoch: theme::epoch(), look: (theme::surface_window(), veil_tint(), theme::hairline()), rect, extra }
+}
+
+/// One strip's composed veiled field, `w` x `h` (`rows`, row-major) with a filled flag per row. A miss composes the
+/// row and keeps it; a hit is one row copy. The buffer is `try_reserve`d (a refusal paints uncached, never fails).
+pub struct VeilCache {
+    key: Option<VeilKey>,
+    w: usize,
+    h: usize,
+    rows: alloc::vec::Vec<u32>,
+    have: alloc::vec::Vec<bool>,
+}
+
+impl VeilCache {
+    pub const fn new() -> Self {
+        Self { key: None, w: 0, h: 0, rows: alloc::vec::Vec::new(), have: alloc::vec::Vec::new() }
+    }
+
+    /// The bytes this cache holds (its field and its row flags).
+    pub fn bytes(&self) -> usize {
+        self.rows.capacity() * 4 + self.have.capacity()
+    }
+
+    fn reset(&mut self, key: VeilKey, w: usize, h: usize) -> bool {
+        self.key = None;
+        let n = w * h;
+        if self.rows.len() != n {
+            self.rows = alloc::vec::Vec::new();
+            if self.rows.try_reserve_exact(n).is_err() {
+                return false;
+            }
+            self.rows.resize(n, 0);
+        }
+        self.have.clear();
+        if self.have.try_reserve_exact(h).is_err() {
+            return false;
+        }
+        self.have.resize(h, false);
+        (self.key, self.w, self.h) = (Some(key), w, h);
+        true
+    }
+
+    /// Row `j` of the field keyed `key` into `out[..w]`: the kept row (returns `true`), else `paint(out)` and keep it.
+    fn row(&mut self, key: VeilKey, out: &mut [u32], w: usize, h: usize, j: usize, paint: impl FnOnce(&mut [u32])) -> bool {
+        if j >= h || out.len() < w || ((self.key != Some(key) || self.w != w || self.h != h) && !self.reset(key, w, h)) {
+            paint(out);
+            return false;
+        }
+        let o = j * w;
+        if self.have[j] {
+            out[..w].copy_from_slice(&self.rows[o..o + w]);
+            return true;
+        }
+        paint(out);
+        self.rows[o..o + w].copy_from_slice(&out[..w]);
+        self.have[j] = true;
+        false
+    }
+}
+
+/// The live menu bar's and dock plate's fields (try-locked: a contended pass paints uncached, never waits).
+static BAR_VEIL: crate::sync::Mutex<VeilCache> = crate::sync::Mutex::new(VeilCache::new());
+static DOCK_VEIL: crate::sync::Mutex<VeilCache> = crate::sync::Mutex::new(VeilCache::new());
+
+/// The bytes the live veiled strips' caches hold: `(bar, dock)`.
+pub fn veil_cache_bytes() -> (usize, usize) {
+    (BAR_VEIL.try_lock().map_or(0, |c| c.bytes()), DOCK_VEIL.try_lock().map_or(0, |c| c.bytes()))
+}
+
+/// [`bar_row`] through `c`: `true` when the row was the kept one (a hit).
+#[allow(clippy::too_many_arguments)]
+pub fn bar_row_cached(c: &mut VeilCache, out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize, back: Option<&Back>) -> bool {
+    let k = veil_key(back, (x0, y0, w, h), 0);
+    c.row(k, out, w, h, j, |o| bar_row(o, x0, y0, w, h, j, back))
+}
+
+/// [`dock_plate_row`] through `c`: `true` on a hit.
+#[allow(clippy::too_many_arguments)]
+pub fn dock_plate_row_cached(c: &mut VeilCache, out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize, back: Option<&Back>) -> bool {
+    let k = veil_key(back, (x0, y0, w, h), d(CRAFT.dock_radius) as usize);
+    c.row(k, out, w, h, j, |o| dock_plate_row(o, x0, y0, w, h, j, back))
 }
 
 // ── the shadow (DESIGNAPPLY B639, §2.4): the margins, the tiles, the casts ──────────────────────────────────────────
@@ -1033,7 +1156,12 @@ pub fn bar_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usi
 /// [`bar_row`] over the live wallpaper (the menu bar's compose).
 pub fn bar_field_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize) {
     let back = live_back();
-    bar_row(out, x0, y0, w, h, j, back.as_ref());
+    match BAR_VEIL.try_lock() {
+        Some(mut c) => {
+            bar_row_cached(&mut c, out, x0, y0, w, h, j, back.as_ref());
+        }
+        None => bar_row(out, x0, y0, w, h, j, back.as_ref()),
+    }
 }
 
 /// Row `j` of the battery item at `x0`: a rounded outline with a fill level and a nub, centred in a bar `h`
@@ -1107,7 +1235,12 @@ pub fn dock_plate_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize,
 /// [`dock_plate_row`] over the live wallpaper (the dock's compose).
 pub fn dock_field_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize) {
     let back = live_back();
-    dock_plate_row(out, x0, y0, w, h, j, back.as_ref());
+    match DOCK_VEIL.try_lock() {
+        Some(mut c) => {
+            dock_plate_row_cached(&mut c, out, x0, y0, w, h, j, back.as_ref());
+        }
+        None => dock_plate_row(out, x0, y0, w, h, j, back.as_ref()),
+    }
 }
 
 /// Row `j` of one dock tile at strip-local `(x, y)`, `tw` x `th`, below which `pad` px hold the running dot:
@@ -2881,7 +3014,7 @@ fn shadow_dark_look(buf: &mut [u32], w: usize, h: usize, dark: bool, bases: (boo
 /// against the 60 Hz frame (16 667 us):
 ///
 /// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) shadow_dark=ok(outer=eq inner=-<n>) hairline=ok black=ok veil=ok(<veil_us>/<fill_us>) windows=3 surface=<w>x<h> -> PASS ::`
-/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> shimmer_us=<n> veil_us=<n> fill_us=<n> -> UNDER|OVER ::`
+/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> shimmer_us=<n> veil_us=<n> fill_us=<n> veil_cache=<hit|miss> -> UNDER|OVER ::`
 ///
 /// * **corners** — the focused window's top-left box pixel (outside the rounded head) is the desktop under the
 ///   shadows (exactly the fill's value there), and the head's face one radius in is not;
@@ -2911,9 +3044,10 @@ fn shadow_dark_look(buf: &mut [u32], w: usize, h: usize, dark: bool, bases: (boo
 /// * **black** — no run of pure `#000000` longer than 2 px outside a glyph zone;
 /// * **veil** — VEILCOST (rmbp-ledger B690, BP-bar-23: beauty costs no more than a solid fill): the menu bar's box
 ///   repainted as a strip repaints it (each row composed into the scratch row, then copied out — `strip::paint`'s
-///   shape, here into the staged frame) once over the VEIL ([`bar_row`]) and once as a solid `surface.window` fill;
-///   best of 3, interleaved. Asserted `veil_us <= fill_us x 1.05 + 50` (in ns); printed `veil=ok(<veil>/<fill>)` or
-///   `veil=OVER(<veil>/<fill>)`, and both on the cost line.
+///   shape, here into the staged frame) once over the VEIL through a [`VeilCache`] ([`bar_row_cached`], the live
+///   bar's path) and once as a solid `surface.window` fill; best of 3, interleaved (the first veiled pass fills the
+///   cache, the later ones copy it). Asserted `veil_us <= fill_us x 1.05 + 50` (in ns); printed `veil=ok(<veil>/<fill>)`
+///   or `veil=OVER(<veil>/<fill>)`, and both on the cost line with `veil_cache=hit` when the last pass was all kept rows.
 pub fn selftest() {
     let mut dims = [(2880usize, 1800usize), (1440, 900)].into_iter();
     let (pw, ph, mut wall, mut frame) = loop {
@@ -3176,6 +3310,8 @@ pub fn selftest() {
     // bar's rows end veiled, as the frame had them.
     let face = theme::surface_window();
     let (mut veil_ns, mut fill_ns) = (u64::MAX, u64::MAX);
+    let mut vc = VeilCache::new();
+    let mut vc_hit = false;
     for _ in 0..3 {
         let (a, _) = now_ns();
         for j in 0..bar_h {
@@ -3183,15 +3319,18 @@ pub fn selftest() {
             frame[j * pw..(j + 1) * pw].copy_from_slice(&row[..pw]);
         }
         let (b, _) = now_ns();
+        let mut hit = true;
         for j in 0..bar_h {
-            bar_row(&mut row, 0, 0, pw, bar_h, j, Some(&back));
+            hit &= bar_row_cached(&mut vc, &mut row, 0, 0, pw, bar_h, j, Some(&back));
             frame[j * pw..(j + 1) * pw].copy_from_slice(&row[..pw]);
         }
         let (c, _) = now_ns();
+        vc_hit = hit;
         fill_ns = fill_ns.min(b.saturating_sub(a));
         veil_ns = veil_ns.min(c.saturating_sub(b));
     }
     let veil_ok = veil_ns.saturating_mul(100) <= fill_ns.saturating_mul(105).saturating_add(5_000_000);
+    drop(vc);
     let veil_s = alloc::format!("{}({}/{})", if veil_ok { "ok" } else { "OVER" }, veil_ns / 1000, fill_ns / 1000);
     // shadow_dark (WINEDGE2 B668): both looks, the margin against the backdrop beside it, on this boot's two bases.
     let bases = live_bases();
@@ -3243,7 +3382,7 @@ pub fn selftest() {
     let (mt, ms, mb) = margins(ELEV_WINDOW, dark, s2);
     let (it, is, ib) = margins(ELEV_IDLE, dark, s2);
     serial_println!(
-        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} ramp_a={}/{} ramp_dark={}/{} frame={} track_fills={} black_runs={} shimmer_us={} veil_us={} fill_us={} -> {} ::",
+        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} ramp_a={}/{} ramp_dark={}/{} frame={} track_fills={} black_runs={} shimmer_us={} veil_us={} fill_us={} veil_cache={} -> {} ::",
         clock,
         frame_us,
         BUDGET_US,
@@ -3272,6 +3411,7 @@ pub fn selftest() {
         shim_us,
         veil_ns / 1000,
         fill_ns / 1000,
+        if vc_hit { "hit" } else { "miss" },
         if frame_us <= BUDGET_US { "UNDER" } else { "OVER" }
     );
 }
