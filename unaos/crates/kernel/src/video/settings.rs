@@ -124,8 +124,8 @@ const TOP: usize = PANE_Y;
 const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
-pub const TABS: usize = 15;
-pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time", "Keyboard", "Storage", "Security"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE · TZLOCALE (B701) 11 · KEYMAPS (B704) 12 · SMARTLINE (B708) 13 · AUTOLOCK (B712) 14
+pub const TABS: usize = 16;
+pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time", "Keyboard", "Storage", "Security", "Hardware"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE · TZLOCALE (B701) 11 · KEYMAPS (B704) 12 · SMARTLINE (B708) 13 · AUTOLOCK (B712) 14 · HWTAB (B737) 15
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -500,7 +500,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); about_service(); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); hw_service(); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -798,7 +798,7 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
             fill_rrect(s, Rect::new(x + f(34), y + f(46), f(32), sw), 0, bg);
             fill_rrect(s, Rect::new(x + f(34), y + f(60), f(22), sw), 0, bg);
         }
-        SEC_TAB => { stroke_rrect(s, Rect::new(x + f(26), y + f(14), f(48), f(70)), f(14), sw, ink); fill_rrect(s, Rect::new(cx - f(5), y + f(30), f(10).max(1), f(26)), f(5), ink); fill_circle(s, cx, y + f(64), f(6).max(1), ink); } /* Security (AUTOLOCK B712): a shield — its outline, a bar and a dot (the lock's mark). LINE-NEUTRAL fold. */ PRIV_TAB => {
+        HW_TAB => { fill_rrect(s, Rect::new(x + f(28), y + f(28), f(44), f(44)), f(6), ink); for i in 0..3i32 { let p = f(34 + 13 * i); fill_rrect(s, Rect::new(x + p, y + f(16), f(6).max(1), f(12)), 0, ink); fill_rrect(s, Rect::new(x + p, y + f(72), f(6).max(1), f(12)), 0, ink); fill_rrect(s, Rect::new(x + f(16), y + p, f(12), f(6).max(1)), 0, ink); fill_rrect(s, Rect::new(x + f(72), y + p, f(12), f(6).max(1)), 0, ink); } fill_rrect(s, Rect::new(x + f(40), y + f(40), f(20), f(20)), f(3), bg); } SEC_TAB => { stroke_rrect(s, Rect::new(x + f(26), y + f(14), f(48), f(70)), f(14), sw, ink); fill_rrect(s, Rect::new(cx - f(5), y + f(30), f(10).max(1), f(26)), f(5), ink); fill_circle(s, cx, y + f(64), f(6).max(1), ink); } /* Hardware (HWTAB B737): a chip — the body, three pins a side, the die in the tile's colour. Security (AUTOLOCK B712): a shield — its outline, a bar and a dot (the lock's mark). LINE-NEUTRAL fold. */ PRIV_TAB => {
             // Privacy: a padlock — the shackle's arch, the body, the keyhole in the tile's colour (REASK B681).
             stroke_rrect(s, Rect::new(x + f(32), y + f(16), f(36), f(44)), f(18), sw, ink);
             fill_rrect(s, Rect::new(x + f(22), y + f(44), f(56), f(40)), f(8), ink);
@@ -961,7 +961,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == DT_TAB => paint_datetime(st), // TZLOCALE (B701)
         t if t as usize == KB_TAB => paint_keyboard(st), // KEYMAPS (B704)
         t if t as usize == STORAGE_TAB => paint_storage(st), // SMARTLINE (B708)
-        t if t as usize == SEC_TAB => paint_security(st), // AUTOLOCK (B712)
+        t if t as usize == SEC_TAB => paint_security(st), t if t as usize == HW_TAB => paint_hardware(st), // AUTOLOCK (B712) · HWTAB (B737): the census list, its own tab. LINE-NEUTRAL fold
         _ => paint_about(st),
     }
     if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
@@ -1083,7 +1083,7 @@ fn paint_about(st: &mut State) { #[cfg(all(target_arch = "x86_64", feature = "in
         text_at(st, cx + 8, y, CTRL_R, val, theme::text_primary(), false, uf);
         y += uc + 10; #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] { y -= sysimg::FACT_TIGHTEN; } // UPDATEUI (B726): the compact card's facts. LINE-NEUTRAL fold
     }
-    #[cfg(not(all(target_arch = "x86_64", feature = "installdemo")))] paint_hardware(st); // the fold: UPDATEUI (B726) holds About rows 5..8 on the image line; the list gets its own tab (HWTAB, owed)
+    // HWTAB (B737): the Hardware list left About for its own tab (`HW_TAB`, file tail); About keeps the card and the System image group
 }
 
 // ── Users tab (M2) ────────────────────────────────────────────────────────────────────────────
@@ -1503,7 +1503,7 @@ fn wheel(d: i8) -> bool {
         FT_PAGE.store(next, Ordering::Relaxed);
         ("pane", next != page)
     } else {
-        if cur_tab() == ABOUT_TAB { hw_wheel(d, step) } else { ("pane", false) } // HWREPORT (B725): the Hardware list scrolls under the wheel
+        if cur_tab() == HW_TAB { hw_wheel(d, step) } else { ("pane", false) } // HWREPORT (B725) -> HWTAB (B737): the Hardware list scrolls under the wheel, on its own tab
     };
     serial_println!("[settings] wheel area={} d={} moved={}", area, d, moved as u8);
     if moved { repaint(); }
@@ -1727,7 +1727,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         t if t == PRIV_TAB => press_privacy(row, cx), // REASK (B681)
         t if t == DT_TAB => press_datetime(row, cx), // TZLOCALE (B701)
         t if t == KB_TAB => press_keyboard(row, cx), // KEYMAPS (B704)
-        t if t == SEC_TAB => press_security(row, cx), // AUTOLOCK (B712)
+        t if t == SEC_TAB => press_security(row, cx), t if t == HW_TAB => hw_press(row, cy, cx), // AUTOLOCK (B712) · HWTAB (B737): Refresh, or a device line copied to the console. LINE-NEUTRAL fold
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -3489,7 +3489,7 @@ pub fn selftest_a11yfilters() {
 pub const PRIV_TAB: usize = 10;
 /// SMARTLINE (B708): the Storage tab; AUTOLOCK (B712): Security after it, the last.
 pub const STORAGE_TAB: usize = 13;
-const _: () = assert!(SEC_TAB == TABS - 1 && STORAGE_TAB + 1 == SEC_TAB && KB_TAB + 1 == STORAGE_TAB && DT_TAB + 1 == KB_TAB && PRIV_TAB + 1 == DT_TAB && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB); // the fold: 11, 12, 13, 14
+const _: () = assert!(HW_TAB == TABS - 1 && SEC_TAB + 1 == HW_TAB && STORAGE_TAB + 1 == SEC_TAB && KB_TAB + 1 == STORAGE_TAB && DT_TAB + 1 == KB_TAB && PRIV_TAB + 1 == DT_TAB && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB); // the fold: 11, 12, 13, 14, 15 (HWTAB B737)
 /// Decision rows shown.
 const PRIV_ROWS: usize = 8;
 /// The Revoke button's x (right-aligned in the row).
@@ -4132,7 +4132,7 @@ fn paint_storage(st: &mut State) {
 // `video::lock::set_policy` (the lock reads it on its next pass) and owes the store write, made by
 // [`security_service`] on the service pass (`lock::persist`, never in the router). A fourth line says what locks now.
 
-/// The Security tab's index on the strip: the last tab (14 since the fold).
+/// The Security tab's index on the strip (14 since the fold); Hardware (HWTAB B737) follows it, the last.
 pub const SEC_TAB: usize = 14;
 /// The three rows' labels, as painted and as MAP names them.
 const SEC_ROW_NAMES: [&str; 3] = ["Lock after idle", "Lock when the lid closes", "Lock before sleep"];
@@ -4428,31 +4428,43 @@ pub(crate) mod sysimg {
         }
     }
 }
-// ── HWREPORT (rmbp-ledger B725, BP-bar-25) — About's Hardware list — TAIL-APPENDED ──────────────────────────────────
-// Under the About card, one line per device `hw::census` found: what it is, its bus, ids and place, the driver's module
-// name and its state; a device no driver claimed says `No driver yet`. The paint reads `hw::last` (`try_lock`, never a
+// ── HWREPORT (rmbp-ledger B725, BP-bar-25) -> HWTAB (rmbp-ledger B737) — the Hardware tab — TAIL-APPENDED ─────────────
+// The tab (`HW_TAB`, the last): row 0 a group with the census's summary and a `Refresh` button; rows 1..8 the list, one
+// line per device `hw::census` found: what it is, its bus, ids and place, the driver's module name and its state; a
+// device no driver claimed says `No driver yet`; row 9 the note. The paint reads `hw::last` (`try_lock`, never a
 // census, never a register): a missing or stale census (older than [`HW_STALE_MS`]) is asked for, and the settings
-// service pass ([`about_service`]) builds it without waiting (a held USB loan = ask again next pass). The wheel over
-// the pane scrolls the list ([`hw_wheel`]); a thumb shows where the visible lines sit.
+// service pass ([`hw_service`]) builds it without waiting (a held USB loan = ask again next pass). The wheel over the
+// pane scrolls the list ([`hw_wheel`]); a thumb shows where the visible lines sit. A press on a line copies it to the
+// console as `[hw] row <line>` and says on the note line what to do with it ([`hw_press`], BP-bar-25's honest line).
 
-/// The About tab's index on the strip.
-const ABOUT_TAB: usize = 3;
-/// The About card's rows; the Hardware list takes the rows under them.
-const ABOUT_ROWS: usize = 4;
-/// A census older than this is asked for again while About is shown.
+/// HWTAB (B737): the Hardware tab's index on the strip, the last.
+pub const HW_TAB: usize = 15;
+/// The summary row and the list's first and last rows; the note goes on the row after the list.
+const HW_SUM_ROW: usize = 0;
+const HW_LIST_ROW: usize = 1;
+const HW_NOTE_ROW: usize = ROWS - 1;
+/// The Refresh button's x (right-aligned in the summary row).
+const HW_REFRESH_X: usize = CTRL_R - BTN_W;
+/// A census older than this is asked for again while the tab is shown.
 const HW_STALE_MS: u64 = 15_000;
 static HW_TOP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static HW_WANT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static HW_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The note line: what the last press copied, or the honest line for a device with no driver.
+static HW_NOTE: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 
-/// The list's geometry: `(heading top, box top, box bottom, line pitch, visible lines)`, logical px.
-fn hw_geom() -> (usize, usize, usize, usize, usize) {
+/// The list's geometry: `(box top, box bottom, line pitch, visible lines)`, logical px.
+fn hw_geom() -> (usize, usize, usize, usize) {
     let uc = super::metrics::lcell_h(super::text::Face::Ui);
-    let head = row_top(ABOUT_ROWS) + GAP;
-    let top = head + uc + 8;
-    let bot = row_top(ROWS) - GAP;
+    let top = row_top(HW_LIST_ROW) + GAP;
+    let bot = row_top(HW_NOTE_ROW) - GAP;
     let lh = uc + 8;
-    (head, top, bot, lh, (bot.saturating_sub(top + 8) / lh).max(1))
+    (top, bot, lh, (bot.saturating_sub(top + 8) / lh).max(1))
+}
+
+/// The list's first shown line for `n` lines (HW_TOP clamped to the last page).
+fn hw_first(n: usize) -> usize {
+    HW_TOP.load(Ordering::Relaxed).min(n.saturating_sub(hw_geom().3))
 }
 
 fn paint_hardware(st: &mut State) {
@@ -4462,22 +4474,27 @@ fn paint_hardware(st: &mut State) {
         HW_WANT.store(true, Ordering::Relaxed);
     }
     let face = super::text::Face::Ui;
-    let (head, top, bot, lh, vis) = hw_geom();
-    text_at(st, LABEL_X, head, CTRL_R, "Hardware", theme::text_primary(), true, face);
+    let (top, bot, lh, vis) = hw_geom();
+    groups(st, &[(HW_SUM_ROW, HW_SUM_ROW)]);
     {
         let mut s = sf(st);
         draw::group_box(&mut s, Rect::new(e(BOX_X), e(top), ew(BOX_X, BOX_W), e(bot) - e(top)), b"");
     }
+    btn(st, HW_SUM_ROW, HW_REFRESH_X, "Refresh");
+    let note = HW_NOTE.try_lock().map(|g| g.clone()).unwrap_or_default();
+    if note.is_empty() {
+        txt2(st, LABEL_X, HW_NOTE_ROW, "Press a device to copy its line to the console.");
+    } else {
+        txt(st, LABEL_X, HW_NOTE_ROW, &note);
+    }
     let Some(c) = c else {
-        text_at(st, LABEL_X, top + 8, CTRL_R, "Reading the devices...", theme::ink_secondary(), false, face);
+        txt2(st, LABEL_X, HW_SUM_ROW, "Reading the devices...");
         return;
     };
     let n = c.rows.len();
     let d = c.driven();
-    let sum = alloc::format!("{} devices  -  {} with a driver  -  {} without", n, d, n - d);
-    let sw = super::metrics::ladvance(sum.as_bytes(), false, face);
-    text_at(st, CTRL_R.saturating_sub(sw).max(LABEL_X + 120), head, CTRL_R, &sum, theme::ink_secondary(), false, face);
-    let first = HW_TOP.load(Ordering::Relaxed).min(n.saturating_sub(vis));
+    txt(st, LABEL_X, HW_SUM_ROW, &alloc::format!("{} devices  -  {} with a driver  -  {} without", n, d, n - d));
+    let first = hw_first(n);
     HW_TOP.store(first, Ordering::Relaxed);
     let (where_x, drv_x, st_x) = (LABEL_X + 230, CTRL_R - 190, CTRL_R - 96);
     for (k, r) in c.rows.iter().enumerate().skip(first).take(vis) {
@@ -4501,19 +4518,65 @@ fn paint_hardware(st: &mut State) {
     }
 }
 
-/// A wheel detent over the About pane: scroll the Hardware list (positive = toward the top, QSCROLL's sign).
+/// A wheel detent over the Hardware pane: scroll the list (positive = toward the top, QSCROLL's sign).
 fn hw_wheel(d: i8, step: usize) -> (&'static str, bool) {
     let n = crate::hw::last().map(|c| c.rows.len()).unwrap_or(0);
-    let vis = hw_geom().4;
+    let vis = hw_geom().3;
     let cur = HW_TOP.load(Ordering::Relaxed);
     let next = (if d > 0 { cur.saturating_sub(step) } else { cur + step }).min(n.saturating_sub(vis));
     HW_TOP.store(next, Ordering::Relaxed);
     ("hardware", next != cur)
 }
 
-/// The service pass: a census the About pane asked for, built without waiting (a held registry asks again next pass).
-fn about_service() {
-    if !HW_WANT.load(Ordering::Relaxed) || !is_open() || cur_tab() != ABOUT_TAB {
+/// The census line under the logical `(cx, cy)` in a list of `n`, if a line is painted there.
+fn hw_line_at(cy: usize, cx: usize, n: usize) -> Option<usize> {
+    let (top, bot, lh, vis) = hw_geom();
+    if cx < BOX_X || cx >= BOX_X + BOX_W || cy < top + 8 || cy >= bot {
+        return None;
+    }
+    let i = (cy - top - 8) / lh;
+    let k = hw_first(n) + i;
+    (i < vis && k < n).then_some(k)
+}
+
+/// The note a press on `r` leaves: the honest line for a device no driver claimed (BP-bar-25), else what was copied.
+fn hw_note(r: &crate::hw::Row) -> String {
+    if r.driver == "none" {
+        alloc::format!("No driver yet — tell us: {} {}", r.bus, r.id)
+    } else {
+        alloc::format!("Copied to the console: {}", r.name)
+    }
+}
+
+/// A press in the Hardware pane: `Refresh` asks for a census (the service pass builds it); a line copies the device's
+/// `hw::line` to the console (the terminal ring, wait-free, and the serial wire) and sets the note.
+fn hw_press(row: usize, cy: usize, cx: usize) {
+    if row == HW_SUM_ROW {
+        if cx >= HW_REFRESH_X && cx < HW_REFRESH_X + BTN_W {
+            HW_AT.store(0, Ordering::Relaxed);
+            HW_WANT.store(true, Ordering::Relaxed);
+            serial_println!("[hw] refresh asked");
+        }
+        repaint();
+        return;
+    }
+    let Some(c) = crate::hw::last() else { repaint(); return };
+    if let Some(k) = hw_line_at(cy, cx, c.rows.len()) {
+        let r = &c.rows[k];
+        let l = crate::hw::line(r);
+        let _ = crate::termring::console_out(format_args!("[hw] row {}", l));
+        serial_println!("[hw] row {}", l);
+        let note = hw_note(r);
+        if let Some(mut g) = HW_NOTE.try_lock() {
+            *g = note;
+        }
+    }
+    repaint();
+}
+
+/// The service pass: a census the Hardware pane asked for, built without waiting (a held registry asks again next pass).
+fn hw_service() {
+    if !HW_WANT.load(Ordering::Relaxed) || !is_open() || cur_tab() != HW_TAB {
         return;
     }
     let c = crate::hw::census(false);
@@ -4522,4 +4585,62 @@ fn about_service() {
         HW_AT.store(crate::arch::ms(), Ordering::Relaxed);
         repaint();
     }
+}
+
+/// `tests hwreport`'s tab leg (HWTAB B737): the Hardware tab painted OFFSCREEN (a fresh `State`, the live window
+/// untouched) page by page through the list's scroll, and each census line whose band carries ink counted once; then
+/// the press leg: the first `none` row (else the first row) scrolled into view, its line's centre resolved back to it
+/// by the press router's own [`hw_line_at`], and its note read. HW_TOP is put back. Returns
+/// `(tab, listed, rows_painted, press_ok, note)`; `listed` = `hw::last`'s rows (0 when the census is held).
+pub fn hwtab_probe() -> (usize, usize, usize, bool, String) {
+    let Some(c) = crate::hw::last() else { return (HW_TAB, 0, 0, false, String::from("no-census")) };
+    let n = c.rows.len();
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let mut buf: Vec<u32> = Vec::new();
+    if buf.try_reserve_exact(pw * ph).is_err() {
+        return (HW_TAB, n, 0, false, String::from("oom"));
+    }
+    buf.resize(pw * ph, 0);
+    let top0 = HW_TOP.load(Ordering::Relaxed);
+    let (top, _, lh, vis) = hw_geom();
+    let uc = super::metrics::lcell_h(super::text::Face::Ui);
+    let mut v = CUR.lock().clone();
+    v.tab = HW_TAB as u8;
+    let mut seen: Vec<bool> = alloc::vec![false; n];
+    let mut page = 0;
+    loop {
+        HW_TOP.store(page, Ordering::Relaxed);
+        let mut st = State::new(WIN_W, WIN_H, core::mem::take(&mut buf), 1, true, 0);
+        paint(&mut st, &v);
+        buf = core::mem::take(&mut st.surf);
+        let first = hw_first(n);
+        let px = |x: i32, y: i32| buf.get(y as usize * pw + x as usize).map_or(u32::MAX, |p| p & 0x00FF_FFFF);
+        for (i, k) in (first..n).take(vis).enumerate() {
+            let y = top + 8 + i * lh;
+            let (y0, y1) = (e(y), e(y + uc));
+            let ground = px(e(BOX_X + 2), y0);
+            let inked = (y0..y1).any(|yy| (e(LABEL_X)..e(LABEL_X + 200)).any(|xx| px(xx, yy) != ground));
+            if inked {
+                seen[k] = true;
+            }
+        }
+        if first + vis >= n {
+            break;
+        }
+        page = first + vis;
+    }
+    let painted = seen.iter().filter(|&&b| b).count();
+    let k = c.rows.iter().position(|r| r.driver == "none").unwrap_or(0);
+    let (press, note) = if n == 0 {
+        (false, String::from("empty"))
+    } else {
+        HW_TOP.store(k, Ordering::Relaxed);
+        let i = k - hw_first(n);
+        let hit = hw_line_at(top + 8 + i * lh + lh / 2, LABEL_X + 4, n);
+        let note = hw_note(&c.rows[k]);
+        let want = if c.rows[k].driver == "none" { note.starts_with("No driver yet — tell us: ") } else { note.starts_with("Copied") };
+        (hit == Some(k) && want, note)
+    };
+    HW_TOP.store(top0, Ordering::Relaxed);
+    (HW_TAB, n, painted, press, note)
 }
