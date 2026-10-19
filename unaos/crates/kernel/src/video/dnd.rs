@@ -285,18 +285,34 @@ fn on_release(x: i32, y: i32) {
     serial_println!("[dnd] drop to={} action={} ok={}", t.word(), a.name(), ok as u8);
 }
 
-/// `drop(kind, payload)` to the participant that owns `t`.
-fn deliver(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
+/// `drop(kind, payload)` to the participant that owns `t`. `pub(crate)` for `tests trashtoast`'s `dnd=` leg.
+pub(crate) fn deliver(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
     match t {
         Target::Trash => {
+            // DNDTRASH (rmbp-ledger B753; BP-video-29): a drop of N items on the dock's Trash tile is ONE Trash verb —
+            // Quarry's journal batch (TRASHTOAST B747): one entry, one `Undo` toast; one item is the classic entry and
+            // toast. The dock's own re-poll/repaint (`dock::dnd_trashed`) follows once something moved.
+            #[cfg(feature = "quarry")]
+            crate::video::quarry::undo::batch_begin();
             let mut ok = true;
             for path in p.paths.iter() {
-                match crate::video::dock::dnd_drop(path) {
+                #[cfg(feature = "quarry")]
+                let r = crate::video::quarry::undo::trash(path);
+                #[cfg(not(feature = "quarry"))]
+                let r = crate::video::dock::dnd_drop(path);
+                match r {
                     Ok(name) => *LAST_TRASHED.lock() = Some(name),
                     Err(e) => {
                         serial_println!("[dnd] trash path={} error={}", path, e);
                         ok = false;
                     }
+                }
+            }
+            #[cfg(feature = "quarry")]
+            {
+                if let Some(seq) = crate::video::quarry::undo::batch_end() {
+                    crate::video::dock::dnd_trashed();
+                    serial_println!("[dnd] trash journal asked={} seq={}", p.paths.len(), seq);
                 }
             }
             (Action::Trash, ok)
