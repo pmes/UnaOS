@@ -4941,6 +4941,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bandy",
+ "crypto_core",
  "gneiss_pal",
  "libm",
  "memmap2",

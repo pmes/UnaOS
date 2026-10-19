@@ -119,3 +119,81 @@ impl<T: 'static> SlotVec<T> {
         if self.asid_keyed { ROW_ID_MAX + 1 } else { SHARED_ROW + 1 }
     }
 }
+
+// APPLAUNCH (rmbp-ledger B678, BP-bar-7, BP-ring3-14) — TAIL-APPENDED (no line above moves; knob-off the module is
+// `#[cfg]`-erased). The launch-time sidecar: one row per slot carrying the EXEC stamp (TSC cycles, taken by the x86
+// launcher before `load_program_common` maps the ELF into the slot), the program's name, and the measured exec→frame
+// span once the slot's FIRST `wm::present` has taken the stamp. Writers: `exec_stamp` (process context, before the
+// task exists — so a row is warm before any present can read it); readers: `take` (the present path, `peek` only,
+// never allocates) and `frame_ms` (`tests applaunch`). The stamp is TAKEN (`swap(0)`), so one exec prints one line.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod launch {
+    use super::{SlotVec, SLOT_ID_MAX};
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Bytes of the program name kept per slot (two words; a longer name is cut, never refused).
+    pub const NAME_MAX: usize = 16;
+
+    pub struct Row {
+        /// Exec stamp in TSC cycles; 0 = no launch pending a first frame.
+        exec: AtomicU64,
+        /// The measured exec→frame span in ms, plus one; 0 = no frame yet for the current exec.
+        frame: AtomicU64,
+        name: [AtomicU64; 2],
+    }
+
+    const fn row_zero() -> Row {
+        Row { exec: AtomicU64::new(0), frame: AtomicU64::new(0), name: [AtomicU64::new(0), AtomicU64::new(0)] }
+    }
+
+    fn row_init() -> Row {
+        row_zero()
+    }
+
+    static ROWS: SlotVec<Row> = SlotVec::new(row_init, row_zero());
+
+    /// The launcher's stamp: slot `slot` was exec'd at cycle `t0` as `name`. Called before the task is spawned.
+    pub fn exec_stamp(slot: usize, name: &str, t0: u64) {
+        if slot >= SLOT_ID_MAX {
+            return;
+        }
+        let r = &ROWS[slot];
+        let mut b = [0u8; NAME_MAX];
+        let n = name.len().min(NAME_MAX);
+        b[..n].copy_from_slice(&name.as_bytes()[..n]);
+        r.frame.store(0, Ordering::Relaxed);
+        r.name[0].store(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]), Ordering::Relaxed);
+        r.name[1].store(u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]), Ordering::Relaxed);
+        r.exec.store(t0.max(1), Ordering::Release);
+    }
+
+    /// The first present's take: `Some((name, len, ms))` exactly once per exec of `slot`, `None` otherwise.
+    pub fn take(slot: usize) -> Option<([u8; NAME_MAX], usize, u64)> {
+        if slot >= SLOT_ID_MAX {
+            return None;
+        }
+        let r = ROWS.peek(slot)?;
+        let t0 = r.exec.swap(0, Ordering::AcqRel);
+        if t0 == 0 {
+            return None;
+        }
+        let ms = crate::video::strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0)) / 1000;
+        let mut b = [0u8; NAME_MAX];
+        b[..8].copy_from_slice(&r.name[0].load(Ordering::Relaxed).to_le_bytes());
+        b[8..].copy_from_slice(&r.name[1].load(Ordering::Relaxed).to_le_bytes());
+        let len = b.iter().position(|&c| c == 0).unwrap_or(NAME_MAX);
+        r.frame.store(ms + 1, Ordering::Release);
+        Some((b, len, ms))
+    }
+
+    /// The exec→frame span of `slot`'s current exec, once its first present has landed.
+    pub fn frame_ms(slot: usize) -> Option<u64> {
+        if slot >= SLOT_ID_MAX {
+            return None;
+        }
+        match ROWS.peek(slot)?.frame.load(Ordering::Acquire) {
+            0 => None,
+            v => Some(v - 1),
+        }
+    }
+}

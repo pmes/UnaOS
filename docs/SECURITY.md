@@ -436,44 +436,55 @@ tracking code growth until M3b clears `W` from `.text`, at which point the W∧X
 code-size figure finally decouple. Everything the paragraph above says about the `W` column is
 unchanged and still current.
 
-#### aarch64 W^X map audit (H1, M6c — report only; WXN not enabled)
+#### aarch64 W^X map — WXN enforced (H1/M6c audit, closed by WXN64, rmbp-ledger B685)
 
-Walk of the EL1&0 boot page tables as built in `arch/aarch64/boot.rs` (`build_l1`,
-`protect_user_code`; TTBR0_EL1 → one L1 of 1 GiB blocks, with L1[0] demoted to L2_USER/L3_USER for
-the 4 KiB EL0 window). `AP[7:6]`: `0b00` = EL1-RW/EL0-none, `0b01` = EL1+EL0 RW, `0b11` = RO at both
-ELs. `UXN` = bit 54 (EL0 execute-never), `PXN` = bit 53 (EL1 execute-never).
+Read at `e1c9dcd0` + the WXN64 commit. The M6c audit (report only) found the only W∧X memory was the
+kernel's own coarse identity RAM — `AP=0b00`, PXN=0, UXN=0 on every RAM block of every aarch64 EL1&0
+root (the Pi's `boot::build_l1`, `boot_virt::build_l1`, `mmu_tegra`'s `L1_EL1`) — so `.text` shared one
+RWX attribute set with heap/stack/BSS/data, and `SCTLR_EL1.WXN` could not be set (the next kernel fetch
+would have aborted). WXN64 (`arch/aarch64/mmu_wxn.rs`) does the split M6c named as the prerequisite and
+then sets WXN, on all three aarch64 regimes.
 
-| Region (VA == PA) | Descriptor | Attr | AP | EL1 | EL0 | UXN/PXN | W∧X? |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 0–1 GiB general RAM (L2_USER blocks + L3_USER pages outside `USER_REGION`) | 2 MiB block / 4 KiB page | Normal | `0b00` | RW+X | — | 0/0 | **yes (EL1 RWX)** |
-| `USER_REGION` code page `[0x100000,0x101000)` after `protect_user_code` | 4 KiB page | Normal | `0b11` | RO, no-X | R+X | 0/1 | no |
-| `USER_REGION` data/stack `[0x101000,0x104000)` | 4 KiB page | Normal | `0b01` | RW, no-X | RW, no-X | 1/1 | no |
-| 1–2 GiB RAM (L1[1]) | 1 GiB block | Normal | `0b00` | RW+X | — | 0/0 | **yes (EL1 RWX)** |
-| 2–3 GiB RAM (L1[2]) | 1 GiB block | Normal | `0b00` | RW+X | — | 0/0 | **yes (EL1 RWX)** |
-| 3–4 GiB Device (L1[3]) | 1 GiB block | Device | `0b00` | RW, no-X | — | 1/1 | no |
+**The carve** runs once per boot on the EL1 root, after its RAM/Device/carveout entries are written and
+before it is live (Pi: end of `boot::build_l1`, MMU off; virt: `boot_virt::build_l1`, at EL2 with the
+EL1 regime dormant; Orin: `mmu_tegra::init` after `install_carveout_holes`, on `L1_EL1`, or on `L1` at
+the EL1 fallback) — no live translation is edited, so no break-before-make is owed.
+1. The executable span `[lo, hi)`: on virt/Orin the page-rounded union of the image's PF_X PT_LOADs,
+   read from its own program headers through `__ehdr_start` (the x86 M3b mechanism, same UEFI loader);
+   on the Pi `[_start, __rx_end)`, `__rx_end` being the page-aligned end of `.text`+`.rodata` that
+   `pi-baremetal.ld` places before `.data`. Refused — nothing written, WXN left off, `tests wxaudit`
+   naming why — if the bounds are malformed, a writable segment (or the Pi's `.data` probe static) lies
+   inside, or the carving function itself lies outside.
+2. Each 1 GiB block the span touches is demoted to an L2 of 2 MiB blocks (a GiB already split — the
+   Pi's `L2_USER`, the Orin's carveout `L2_POOL_EL1` — is used as is), each touched 2 MiB block to an L3:
+   pages in `[lo, hi)` become `AP=0b10` (EL1 read-only, no EL0), PXN=0, UXN=1.
+3. Every other leaf writable at any EL gains PXN|UXN; every read-only leaf EL0 cannot access gains UXN
+   (an `AP=0b00`/`0b10` leaf with UXN=0 is EL0-execute-only, and the per-task slot roots copy L1).
+4. `SCTLR_EL1.WXN` (bit 19) is OR'd into every EL1 SCTLR write: `boot::enable_mmu` (every Pi core),
+   `boot_virt::enable_el1_regime`, `boot_tegra::enable_el1_regime` (the Orin BSP and its EL1-seat APs),
+   `mmu_tegra::enable_el1`; RAM leaves `mmu_tegra` writes later (`map_fb_region`, `repair_fb_l2`) are
+   PXN|UXN too.
 
-Transient: the code page is a data page (`0b01`, UXN=PXN=1, RW no-X) during the blob copy, then
-`protect_user_code` flips it to the row above — so it is never W∧X, at either EL, at any point.
+| Region (EL1&0, after WXN64) | AP | EL1 | EL0 | UXN/PXN | W∧X? |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Kernel image executable pages `[lo, hi)` (4 KiB) | `0b10` | RO+X | — | 1/0 | no |
+| All other RAM (image data/BSS, heap, stacks, other blocks) | `0b00` | RW, no-X | — | 1/1 | no |
+| Device / Normal-NC windows | `0b00` | RW, no-X | — | 1/1 | no |
+| EL0 code page(s) after `protect_user_code` (nG) | `0b11` | RO, no-X | R+X | 0/1 | no |
+| EL0 data/stack/FB pages (nG) | `0b01` | RW, no-X | RW, no-X | 1/1 | no |
+| EL0 FB info page (nG) | `0b11` | RO, no-X | R, no-X | 1/1 | no |
 
-Since M6d the two `USER_REGION` rows are also **non-global (`nG=1`)** and replicated per task: the shared
-window is the ASID-0 boot context, and up to 8 per-task slots (`boot::alloc_user_slot`, ASID 1..8) map the
-same two VAs to their own frames with identical AP/UXN/PXN. The W^X properties of both rows are unchanged
-(nG affects only TLB ASID-tagging, not access permission); the VAs shown are illustrative and shift with
-the kernel image size (the pool adds ~224 KiB BSS). Kernel rows stay Global (`nG=0`).
+The EL0 rows are unchanged from M6b-M6d (the transient code page is a data page during the blob copy,
+never W∧X); the shared window is the ASID-0 context and each per-task slot (ASID 1..) maps its own frames
+with the same AP/UXN/PXN.
 
-**Every EL0-reachable page already satisfies W^X**: the user code page is R+X but read-only, and the
-data/stack pages are RW but execute-never. The only W∧X coincidences are in the **kernel's own coarse
-RWX identity RAM** (0–3 GiB, `AP=0b00`, PXN=0): the kernel image `.text` (which must be executable)
-shares one RWX attribute set with the heap/stack/BSS/data (which must be writable).
-
-**SCTLR_EL1.WXN feasibility.** With `WXN=1` the EL1&0 regime forces "writable ⇒ execute-never":
-EL1-writable regions become PXN, EL0-writable regions become UXN. The EL0 window is unaffected (the
-code page is not writable at either EL; data/stack are already XN). But the kernel executes from the
-`AP=0b00`, PXN=0 identity RAM above — under WXN that RAM becomes EL1-non-executable and the next
-kernel instruction fetch faults, so the kernel cannot boot. Enabling WXN therefore requires FIRST
-splitting the identity map into a read-only-executable kernel text/rodata region and RW-execute-never
-data/heap/stack/BSS regions (a linker-symbol-driven map, mirroring the 4 KiB EL0 code/data split M6b
-already performs). That refactor is a separate, review-gated change; **WXN is not enabled in M6c.**
+**The census** (`tests wxaudit`; fired at boot by `mmu_tegra_el0::install` on virt/Orin EL0 builds)
+walks the boot root and every slot root, folds APTable/PXNTable/UXNTable, counts pages writable at any
+EL AND executable at any EL from the descriptor bits alone (WXN not credited), probes its own code page
+(EL1 RX) and a static (RW XN), and runs a classifier negative control:
+`:: WXAUDIT: wxn=<0|1> wx_pages=<n> -> PASS|FAIL ::` (PASS = `wxn=1 wx_pages=0` and every probe). At EL2
+(the GICv2 `virt` run, which never drops to EL1) it reads `-> SKIP reason=el2-regime`. Status: compiled,
+QEMU and metal witness owed to the fold (ledger B685).
 
 - [x] **Fail-CLOSED block-backend selection — no silent device substitution (USBFALL F1, 2026-07-26, QEMU-verified; metal-pending).** Found by the P64-day pi4 USB-write/FAT lock-span audit (`pi4-usbwrite-audit-r23s1o`). On `aarch64 + baremetal` the canonical `Default` backend is the microSD: `emmc2::probe()` runs on the BSP synchronously and `register_sd` flips `BACKEND` to `BACKEND_SD` before any FAT-writing consumer exists. **If the card fails identify, `BACKEND` stayed `BACKEND_XHCI`** — and a later-enumerated USB stick populates the global `BLOCK_DEVICE` through `publish_usb_geometry`, after which **every `BlockSource::Default` WRITE silently landed on whatever stick was plugged in**: one physical device substituted for another, with no error, no witness, and no way for a caller to tell. That is an integrity failure in both directions (the boot volume's writes go missing; a foreign, possibly untrusted, removable device is scribbled on by the boot filesystem). Closed by `drivers::block::guard_default_write_backend`, called first in `write_block`: with no SD registered it returns `BlockError::NotReady` and emits `:: USBFALL: no SD backend registered — refusing Default WRITE … ::` once. `FatBackend::read_only()` reflects the same condition, so a `Default` mount on a no-SD Pi answers "read-only volume" up front (`VfsError::Unsupported`) instead of failing late with an opaque `Io` on every write. The guard was `baremetal`-gated on the premise that on x86 the enumerated USB device **is** the legitimate canonical backend, so there was nothing to substitute away from. **SDHC-4b killed that premise and Boot AI-2 proved it dead on metal — see the FRGUARD row below.** On QEMU-virt aarch64 (no SD backend compiled) the gating and the byte-identity still hold. **Residual, stated honestly: READS still fall through to the USB path.** A read cannot corrupt the wrong device and the USB mount reaches the stick through its own `read_block_usb` handle regardless, but it does mean a no-SD Pi can still *read* a `Default`-sourced volume off a stick — so a substituted device could still supply CONTENT (the M6g/M7 loader's untrusted-program posture already governs what that content may do; it is size-bounded, EL0-contained, and **not** signature-checked — see the shared code-signing item). Metal-only evidence still owed: whether a bench card has ever failed `emmc2::probe` identify.
 - [x] **Fail-CLOSED `Default` writes on x86 — the boot-medium substitution (FRGUARD, GR21, 2026-08-07; QEMU-reproduced both polarities, metal-pending).** SDHC-4b gave x86 an internal SD backend that registers as handle `Sdhc` and deliberately leaves the global `BLOCK_DEVICE` empty, so an x86 machine can boot from a volume that is **not** the `Default` target. **Boot AI-2 is the metal proof:** booted from the internal card, the global slot stayed empty for 296 s, the operator hot-plugged a Panasonic card to READ it, that card claimed `Default` unopposed, and 15.7 s later the flight recorder created and wrote a 262 656-byte `/UNAOS.LOG` onto it (`reserved … reused=false @cluster 2` — the internal card's FAT32 cluster 2 is its root directory and cannot hold a file, so the target was provably the USB medium). Closed by re-keying `drivers::block::default_writable` for `x86_64 + sdhcblk` onto the **boot volume's identity**: the UEFI loader already reads `BS_VolID` off LBA 0 of its own loaded-image device (`read_boot_volume_serial`, LoadedImage → DeviceHandle → BlockIO) and passes it in `BootInfo::boot_volume_serial` — the same handoff INSTALL-SELF uses. A `Default` WRITE is refused **only** in the state where the boot serial is positively located on the `Sdhc` handle and absent from the `Default` slot (`BM_SUBSTITUTED`); a serial of 0, a serial found on neither handle, and no registered `Sdhc` card all FAIL OPEN with a witness, because a guard that silently kills the flight recorder is worse than the hazard. Guards **both** `write_block` and `write_blocks` — `fs/fat.rs::write_sectors` routes to the counted path, which is what the recorder's `write_grow`/`write_at` actually use. **Two refuted predicates are recorded here so they are not re-proposed:** (a) "an `Sdhc` handle exists" alone — Boots AH and AI-1 also had one (the operator's 29 MiB card sat in the internal slot) and their writes were correct; (b) "the device was queued by a hot-plug edge rather than the boot port scan" — on the rMBP the boot stick is on a USB3 port that trains ~1.6 s late, **misses the initial CCS scan and is recovered via CSC on 30 of 30 captured boots** (`ccs-margin LATE port=5 … result=CCSMARGIN-LATE`), so that axis carries no signal and would have refused the recorder on every normal boot. **Residual:** READS are unguarded (same reasoning as USBFALL F1), and the guard cannot act on a machine whose boot medium is unreachable through the block layer — which is the normal QEMU state, where the boot ESP is a separate `ide-hd`.

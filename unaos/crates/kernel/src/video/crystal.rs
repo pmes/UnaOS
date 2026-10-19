@@ -1880,3 +1880,19 @@ pub mod sheet {
         }
     }
 }
+
+// ── GLYPHS (rmbp-ledger B676) — the shard menu's labels and their boxes, for `tests glyphs`' pseudo-locale pass ──
+// At the FILE TAIL so no line above moves; desktop builds only (the one caller, `video::text`'s fixture, is).
+
+/// GLYPHS (B676): every item label of the shard menu with the box it draws in, as `(surface, label, box px, bold,
+/// face)` — the body's width ([`MENU_W`]; `sheet::body` of the published rect) less `BORDER + PADX()` on both sides,
+/// since `compose_row` draws each label at `BORDER + PADX()`. [`MENU_W`] is sized from the labels' GLYPH COUNT x
+/// `CELL_W`, not their shaped width, so a longer translation can pass it: that is what the pass measures. Measurement
+/// only — no layout reads this.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn label_boxes(out: &mut alloc::vec::Vec<(&'static str, alloc::string::String, usize, bool, super::text::Face)>) {
+    let inner = MENU_W().saturating_sub(2 * (BORDER + PADX()));
+    for r in ROWS.iter().filter(|r| r.verb.is_some()) {
+        out.push(("crystal", alloc::string::String::from(r.label), inner, false, FACE));
+    }
+}

@@ -147,9 +147,9 @@ unsafe fn build_l1(mask: u64) {
             l1.add(i).write_volatile(desc);
         }
         // WXN64 (B685): carve the image's RX span out of the RAM blocks and make every other leaf
-        // execute-never (`tests::wxn64::carve`). The regime is still dormant, so nothing is live; a refusal
+        // execute-never (`mmu_wxn::carve`). The regime is still dormant, so nothing is live; a refusal
         // writes nothing and leaves WXN off, which `tests wxaudit` reports.
-        crate::tests::wxn64::carve(l1);
+        super::mmu_wxn::carve(l1);
     }
     unsafe { clean_l1_to_poc() };
 }
@@ -189,7 +189,7 @@ unsafe fn enable_el1_regime() {
             mair = in(reg) MAIR_VAL,
             tcr = in(reg) TCR_EL1_VAL,
             ttbr0 = in(reg) ttbr0,
-            sctlr = in(reg) SCTLR_EL1_VAL | crate::tests::wxn64::sctlr_wxn(), // WXN64 (B685)
+            sctlr = in(reg) SCTLR_EL1_VAL | super::mmu_wxn::sctlr_wxn(), // WXN64 (B685)
             options(nostack, preserves_flags),
         );
     }

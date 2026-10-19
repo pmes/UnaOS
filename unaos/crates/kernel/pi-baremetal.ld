@@ -3,7 +3,8 @@
 
    The VideoCore GPU ROM loads kernel8.img RAW (no ELF parsing, no relocation) to the load address
    and jumps to its first byte. So we link NON-position-independent at a fixed address, with `_start`
-   placed first, and expose __bss_start/__bss_end (for the entry to zero BSS) and __stack_top. */
+   placed first, and expose __bss_start/__bss_end (for the entry to zero BSS), __stack_top, and
+   __rx_end (the page-aligned end of text+rodata, for the W^X carve). */
 
 ENTRY(_start)
 
@@ -15,6 +16,13 @@ SECTIONS
     .text.boot : { KEEP(*(.text.boot)) }   /* the raw entry MUST be first in the image */
     .text      : { *(.text .text.*) }
     .rodata    : { *(.rodata .rodata.*) }
+
+    /* WXN64 (rmbp-ledger B685): the end of the read-only image, page-aligned, so the W^X carve
+       (arch/aarch64/mmu_wxn.rs) can map [_start, __rx_end) EL1 read-only + executable and everything
+       from .data up writable + execute-never. Nothing writable may be placed before this point. */
+    . = ALIGN(4096);
+    __rx_end = .;
+
     .data      : { *(.data .data.*) }
 
     . = ALIGN(16);

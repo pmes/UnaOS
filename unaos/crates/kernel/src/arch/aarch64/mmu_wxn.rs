@@ -43,17 +43,16 @@
 // code page EL1-RX and a static of this module RW-XN, and the classifier's negative control. At EL2 (the
 // GICv2 `virt` run, which never drops) the EL1&0 regime is not the running one: SKIP, with that reason.
 //
-// THE PI (`baremetal`) IS NOT CARVED HERE. `kernel8.img` is a raw objcopy (no ELF header in RAM) and
-// `pi-baremetal.ld` defines a SECTIONS layout, so LLD synthesises no `_etext`/`__ehdr_start` for it and
-// `.data` follows `.rodata` with no page alignment. The Pi carve needs a page-aligned end-of-read-only
-// symbol in that script; until it lands, `tests wxaudit` on the Pi reads `wxn=0 … -> FAIL` — the truth.
-//
-// Declared from `tests.rs` (`crate::tests::wxn64`) because that file compiles on every aarch64 build;
-// its home is `arch/aarch64/mod.rs` (one `pub mod` line) — owed to the fold.
+// THE PI (`baremetal`). `kernel8.img` is a raw objcopy (no ELF header in RAM) and `pi-baremetal.ld` has
+// a SECTIONS layout (LLD synthesises no `_etext` for it), so step 1 reads the script's own bounds instead:
+// `[_start, __rx_end)`, where `__rx_end` is the page-aligned end of `.text` + `.rodata` the script places
+// before `.data`. Refused if `__rx_end` is unaligned or a `.data` probe static lies below it. The carve
+// runs at the end of `boot::build_l1` (MMU off, BSP, before any core walks the table) and
+// `boot::enable_mmu` adds WXN on EVERY core — the secondaries read `ARMED` with their MMU off, from DRAM,
+// where the BSP's MMU-off store already sits.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
-#[cfg(not(feature = "baremetal"))]
 const PAGE: u64 = 0x1000;
 const ADDR: u64 = 0x0000_FFFF_FFFF_F000; // next-level table / output address, bits [47:12]
 const TYPE: u64 = 0b11;
@@ -61,7 +60,6 @@ const BLOCK: u64 = 0b01; // L1/L2 block
 const TABLE: u64 = 0b11; // L1/L2 table, and the L3 PAGE encoding
 const AP_RO: u64 = 1 << 7; // AP[2]: read-only
 const AP_EL0: u64 = 1 << 6; // AP[1]: EL0 access
-#[cfg(not(feature = "baremetal"))]
 const CONTIG: u64 = 1 << 52;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
@@ -72,18 +70,13 @@ const T_AP1: u64 = 1 << 62; // APTable[1]: no write below
 const SCTLR_WXN: u64 = 1 << 19;
 
 /// Fresh L2s for 1 GiB RAM blocks the image span touches (an image straddles at most one GiB boundary).
-#[cfg(not(feature = "baremetal"))]
 const L2_N: usize = 2;
 /// Fresh L3s, one per 2 MiB block the image span touches: 32 MiB of executable image, ample.
-#[cfg(not(feature = "baremetal"))]
 const L3_N: usize = 16;
 
-#[cfg(not(feature = "baremetal"))]
 #[repr(C, align(4096))]
 struct Tbl([u64; 512]);
-#[cfg(not(feature = "baremetal"))]
 static mut KIMG_L2: [Tbl; L2_N] = [const { Tbl([0; 512]) }; L2_N];
-#[cfg(not(feature = "baremetal"))]
 static mut KIMG_L3: [Tbl; L3_N] = [const { Tbl([0; 512]) }; L3_N];
 
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -133,8 +126,8 @@ fn rd64(a: u64) -> u64 {
     unsafe { core::ptr::read_unaligned(a as *const u64) }
 }
 
-/// The runtime page-rounded `[lo, hi)` of the image's PF_X PT_LOADs, or the `CARVE_NAMES` index of why not.
 #[cfg(not(feature = "baremetal"))]
+/// The runtime page-rounded `[lo, hi)` of the image's PF_X PT_LOADs, or the `CARVE_NAMES` index of why not.
 fn image_rx() -> Result<(u64, u64), u8> {
     const PT_LOAD: u32 = 1;
     const PF_X: u32 = 1;
@@ -185,8 +178,41 @@ fn image_rx() -> Result<(u64, u64), u8> {
     Ok((lo, hi))
 }
 
+#[cfg(feature = "baremetal")]
+unsafe extern "C" {
+    // `pi-baremetal.ld`: `_start` is the first byte of `.text.boot` at the load address, `__rx_end` the
+    // page-aligned end of `.text` + `.rodata` (everything from `.data` up is writable).
+    static _start: u8;
+    static __rx_end: u8;
+}
+
+/// A `.data` static (non-zero initialiser, interior mutability): the carve refuses if the linker ever
+/// places writable data below `__rx_end`.
+#[cfg(feature = "baremetal")]
+static DATA_PROBE: AtomicU64 = AtomicU64::new(0x5758_4E36_3400_0001);
+
+/// The Pi's executable span `[_start, __rx_end)` — `kernel8.img` is a raw objcopy with no ELF header in
+/// RAM, so the bounds are the linker script's — or the `CARVE_NAMES` index of why not.
+#[cfg(feature = "baremetal")]
+fn image_rx() -> Result<(u64, u64), u8> {
+    let lo = (&raw const _start as u64) & !(PAGE - 1);
+    let hi = &raw const __rx_end as u64;
+    if hi & (PAGE - 1) != 0 || hi <= lo {
+        return Err(3);
+    }
+    let data = &raw const DATA_PROBE as u64;
+    if data < hi && DATA_PROBE.load(Ordering::Relaxed) != 0 {
+        return Err(4);
+    }
+    let me = image_rx as *const () as usize as u64;
+    let bss = &raw const RX_LO as u64;
+    if !(lo <= me && me < hi) || (lo <= bss && bss < hi) {
+        return Err(5);
+    }
+    Ok((lo, hi))
+}
+
 /// Clean one 4 KiB table to the Point of Coherency (`dc cvac` per line), the callers' own discipline.
-#[cfg(not(feature = "baremetal"))]
 unsafe fn clean_page(base: u64) {
     let mut off = 0u64;
     while off < PAGE {
@@ -196,7 +222,6 @@ unsafe fn clean_page(base: u64) {
 }
 
 /// Step 3 of the carve: make every leaf below `table` W^X by its own bits (see the module header).
-#[cfg(not(feature = "baremetal"))]
 unsafe fn harden(table: u64, level: u32) {
     let t = table as *mut u64;
     for i in 0..512 {
@@ -229,12 +254,6 @@ unsafe fn harden(table: u64, level: u32) {
 /// `l1` is the identity-mapped PA of a 512-entry EL1&0 L1 table (4 KiB granule, T0SZ=25) that no core
 /// is translating through, whose table descriptors point at identity-mapped tables.
 pub unsafe fn carve(l1: *mut u64) -> bool {
-    #[cfg(feature = "baremetal")]
-    let r: Result<(u64, u64), u8> = {
-        let _ = l1;
-        Err(0)
-    };
-    #[cfg(not(feature = "baremetal"))]
     let r = unsafe { carve_inner(l1) };
     match r {
         Ok((lo, hi)) => {
@@ -251,7 +270,6 @@ pub unsafe fn carve(l1: *mut u64) -> bool {
     }
 }
 
-#[cfg(not(feature = "baremetal"))]
 unsafe fn carve_inner(l1: *mut u64) -> Result<(u64, u64), u8> {
     let (lo, hi) = image_rx()?;
     let (c_lo, c_hi) = (lo >> 21, (hi - 1) >> 21); // the 2 MiB blocks the span touches
@@ -432,7 +450,7 @@ fn current_el() -> u64 {
 
 /// `tests wxaudit` — the aarch64 W^X census of the live EL1&0 maps (module header, THE AUDIT). Called at
 /// boot from `mmu_tegra_el0::install` (the EL0 window is the last boot-time map) in the QUIETBOOT shape,
-/// and registered by `tests.rs` for every aarch64 build.
+/// and registered by `tests.rs` for every aarch64 build (the Pi has no `install` call site).
 pub fn wxaudit_fixture() {
     if crate::tests::defer("wxaudit", wxaudit_fixture) {
         return;
