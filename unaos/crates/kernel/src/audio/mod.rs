@@ -294,13 +294,21 @@ pub fn source(app: &str) -> Result<Source, &'static str> {
 /// [`source`] with the ask raised or only said (`ask = false`: the fixture's grant leg).
 #[cfg(feature = "uac")]
 pub(crate) fn open(app: &str, ask: bool) -> Result<Source, &'static str> {
+    let (g, ch, rate) = grant_open(app, ask)?;
+    serial_println!("[audio] source app={} grant={} fmt=pcm16/{}/{} opened", app, g, ch, rate);
+    Ok(Source { app: String::from(app), ch, rate })
+}
+
+/// The grant, then the driver's open: `Ok((grant, channels, rate))` with the wanted count raised (the caller owes
+/// one `uac::capture_close`). Shared by [`open`] (a `Source`) and the ring-3 table ([`bus_source`], MICRING3).
+#[cfg(feature = "uac")]
+fn grant_open(app: &str, ask: bool) -> Result<(&'static str, u8, u32), &'static str> {
     let g = mic_grant(app, ask);
     if g == "asked" {
         return Err("asked");
     }
     let (ch, rate) = crate::drivers::usb::uac::capture_open()?;
-    serial_println!("[audio] source app={} grant={} fmt=pcm16/{}/{} opened", app, g, ch, rate);
-    Ok(Source { app: String::from(app), ch, rate })
+    Ok((g, ch, rate))
 }
 
 /// The kept answer's word.
@@ -347,4 +355,248 @@ fn mic_answer(ok: bool) {
         crate::prefs::decide(crate::fs::apptrust::MIC_DOMAIN, &app, "-", MIC_ALLOW);
     }
     serial_println!("[mic] answer={} app={}", if allow { MIC_ALLOW } else { "not-now" }, app);
+}
+
+// ── MICRING3 (rmbp-ledger B736, BP-audio-12): the ring-3 way in — one source per program over the one seam ─────────────
+// The bus verbs `una_abi::BUS_VERB_AUDIO_SOURCE_{OPEN,READ,CLOSE}` (40..42) reach [`bus_source`] from the x86 bus
+// dispatch arm. The program is named by the launcher (`wm::app_name_of(slot + 1)`, else `argv[0]` on the slot's
+// kernel-written args page — NETGRANT's rule), never by the caller; its grant is [`mic_grant`]'s, the camera's ask. The
+// open source is ONE per-slot word, [`PROG_SRC`] (the handle, 0 = none): every close — the CLOSE verb, Settings >
+// Privacy's Revoke ([`source_revoked`], through `fs::apptrust::mic_revoked`), the program's end ([`slot_gone`], from
+// `sched::term_release_edge`) — is a swap of that word to 0 followed by ONE `uac::capture_close`, so exactly one of
+// them closes it. The driver's service pass then sees the wanted count fall and closes the pipe (the dot goes out).
+// The slot tables are TYPE-bounded (`procslot::SLOT_ID_MAX`, the APPFAULT shape), not a pool; nothing here allocates
+// on the terminate path (IF=0).
+
+/// Slots a ring-3 source can belong to (the slot's type bound).
+#[cfg(feature = "uac")]
+const PROG_SLOTS: usize = crate::procslot::SLOT_ID_MAX;
+/// Per slot: the open source's handle (0 = none). Swapped to 0 by whichever close comes first.
+#[cfg(feature = "uac")]
+static PROG_SRC: [AtomicU32; PROG_SLOTS] = [const { AtomicU32::new(0) }; PROG_SLOTS];
+/// Per slot: the handle a revoke closed — READ answers -EPERM on it until CLOSE or the next OPEN.
+#[cfg(feature = "uac")]
+static PROG_REVOKED: [AtomicU32; PROG_SLOTS] = [const { AtomicU32::new(0) }; PROG_SLOTS];
+/// `(slot, program)` for each slot that opened a source (the revoke's match and the wire). A row whose source closed
+/// stays until that slot's next open replaces it: it names nothing open ([`PROG_SRC`] is the fact).
+#[cfg(feature = "uac")]
+static PROG_NAME: crate::sync::Mutex<alloc::vec::Vec<(usize, String)>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+/// The last handle given (handles are never 0).
+#[cfg(feature = "uac")]
+static PROG_HSEQ: AtomicU32 = AtomicU32::new(0);
+/// `tests micring3`'s counts: asks posted, opens, PCM bytes read, closes by revoke / by terminate / by the verb,
+/// opens refused for want of a microphone.
+#[cfg(feature = "uac")]
+static R3_COUNTS: [core::sync::atomic::AtomicU64; 7] = [const { core::sync::atomic::AtomicU64::new(0) }; 7];
+#[cfg(feature = "uac")]
+const R3_ASKED: usize = 0;
+#[cfg(feature = "uac")]
+const R3_OPENED: usize = 1;
+#[cfg(feature = "uac")]
+const R3_READ: usize = 2;
+#[cfg(feature = "uac")]
+const R3_REVOKED: usize = 3;
+#[cfg(feature = "uac")]
+const R3_TERM: usize = 4;
+#[cfg(feature = "uac")]
+const R3_CLOSED: usize = 5;
+#[cfg(feature = "uac")]
+const R3_NODEV: usize = 6;
+
+#[cfg(feature = "uac")]
+fn r3_add(i: usize, n: u64) {
+    R3_COUNTS[i].fetch_add(n, Ordering::Relaxed);
+}
+
+/// `[asked, opened, read_bytes, revoked, terminated, closed, nodev]` since boot (`tests micring3` reads deltas).
+#[cfg(feature = "uac")]
+pub fn ring3_counts() -> [u64; 7] {
+    core::array::from_fn(|i| R3_COUNTS[i].load(Ordering::Relaxed))
+}
+
+/// Slot `s`'s open handle (0 = none).
+#[cfg(feature = "uac")]
+pub fn ring3_open(s: usize) -> u32 {
+    if s < PROG_SLOTS { PROG_SRC[s].load(Ordering::Acquire) } else { 0 }
+}
+
+/// THE close: slot `s`'s word to 0, then the driver's count down once. Returns the handle closed (0 = nothing open).
+#[cfg(feature = "uac")]
+fn prog_close(s: usize) -> u32 {
+    let h = PROG_SRC[s].swap(0, Ordering::AcqRel);
+    if h != 0 {
+        crate::drivers::usb::uac::capture_close();
+    }
+    h
+}
+
+/// Is `app`'s microphone ask on the glass now? (Its OPEN polls quietly until it is answered.)
+#[cfg(feature = "uac")]
+fn mic_asking(app: &str) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        return MIC_ASKING.lock().as_deref() == Some(app);
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        let _ = app;
+        false
+    }
+}
+
+/// The program slot `row` runs, by the launcher's name; `None` = a kernel fixture blob (nobody launched it by name).
+#[cfg(all(feature = "uac", target_arch = "x86_64"))]
+fn prog_name(row: usize) -> Option<String> {
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    let n = crate::video::wm::app_name_of(row as u64 + 1, &mut nb);
+    if n > 0 {
+        return core::str::from_utf8(&nb[..n]).ok().map(String::from);
+    }
+    // The args page is read only under the caller's own CR3 (a ring-3 SYS_MSEND): `USER_ARGS_VA` is mapped for every
+    // slot (`memory::args_map`, ring-3 RO + NX) and written only by the launcher.
+    if crate::arch::memory::current_slot() != Some(row) {
+        return None;
+    }
+    let va = una_abi::USER_ARGS_VA;
+    // SAFETY: the live CR3 is slot `row`'s (checked above), which maps its 4 KiB args page at `USER_ARGS_VA`.
+    let page = unsafe { core::slice::from_raw_parts(va as *const u8, 4096) };
+    let a = una_abi::Args::parse(page, va)?;
+    let w = core::str::from_utf8(a.get(0)?).ok()?;
+    let p = crate::video::wm::program_name(w);
+    if p.is_empty() { None } else { Some(String::from(p)) }
+}
+
+/// The program on slot `s` as the table last named it (`-` when unnamed or the table is busy: never spins).
+#[cfg(feature = "uac")]
+fn say_close(s: usize, by: &str) {
+    let g = PROG_NAME.try_lock();
+    let app = match &g {
+        Some(t) => t.iter().find(|e| e.0 == s).map(|e| e.1.as_str()).unwrap_or("-"),
+        None => "-",
+    };
+    serial_println!("[audio] source app={} slot={} closed by={}", app, s, by);
+}
+
+/// THE ring-3 verbs (x86 bus dispatch, the caller's slot `row`): see una-abi's MICRING3 block for the wire.
+#[cfg(all(feature = "uac", target_arch = "x86_64"))]
+pub fn bus_source(row: usize, verb: u8, body: &[u8], text: &mut alloc::vec::Vec<u8>) -> i64 {
+    use una_abi::{EAGAIN, EBADF, EBUSY, EINVAL, ENODEV, EPERM};
+    if row >= PROG_SLOTS {
+        return EPERM; // the shared row: a kernel task, no program
+    }
+    match verb {
+        una_abi::BUS_VERB_AUDIO_SOURCE_OPEN => {
+            if !body.is_empty() {
+                return EINVAL;
+            }
+            let Some(app) = prog_name(row) else {
+                serial_println!("[audio] source slot={} refused=unnamed (no launcher name: not asked)", row);
+                return EPERM;
+            };
+            if app == KERNEL_RECORDER {
+                serial_println!("[audio] source app={} slot={} refused=reserved-name", app, row);
+                return EPERM; // the recorder's grant is the kernel's, never a program's
+            }
+            if PROG_SRC[row].load(Ordering::Acquire) != 0 {
+                return EBUSY;
+            }
+            if mic_asking(&app) {
+                return EAGAIN; // its ask is up: poll quietly until the user answers
+            }
+            let (g, ch, rate) = match grant_open(&app, true) {
+                Ok(x) => x,
+                Err("asked") => {
+                    if mic_asking(&app) {
+                        r3_add(R3_ASKED, 1);
+                    }
+                    return EAGAIN;
+                }
+                Err(e) => {
+                    r3_add(R3_NODEV, 1);
+                    serial_println!("[audio] source app={} slot={} refused={}", app, row, e);
+                    return ENODEV;
+                }
+            };
+            let mut h = PROG_HSEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            if h == 0 {
+                h = PROG_HSEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            }
+            {
+                let mut t = PROG_NAME.lock();
+                t.retain(|e| e.0 != row);
+                t.push((row, app.clone()));
+            }
+            PROG_REVOKED[row].store(0, Ordering::Release);
+            PROG_SRC[row].store(h, Ordering::Release);
+            r3_add(R3_OPENED, 1);
+            serial_println!("[audio] source app={} grant={} fmt=pcm16/{}/{} opened slot={} handle={}", app, g, ch, rate, row, h);
+            text.extend_from_slice(&una_abi::audio_source_open_reply(ch, rate, h));
+            0
+        }
+        una_abi::BUS_VERB_AUDIO_SOURCE_READ => {
+            let Some(h) = una_abi::audio_source_handle_parse(body) else { return EINVAL };
+            if PROG_SRC[row].load(Ordering::Acquire) != h {
+                return if PROG_REVOKED[row].load(Ordering::Acquire) == h { EPERM } else { EBADF };
+            }
+            text.resize(una_abi::AUDIO_SOURCE_READ_MAX, 0);
+            let n = crate::drivers::usb::uac::read_capture(&mut text[..]);
+            text.truncate(n);
+            r3_add(R3_READ, n as u64);
+            0
+        }
+        una_abi::BUS_VERB_AUDIO_SOURCE_CLOSE => {
+            let Some(h) = una_abi::audio_source_handle_parse(body) else { return EINVAL };
+            if PROG_REVOKED[row].compare_exchange(h, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return 0; // the revoke closed it already
+            }
+            if PROG_SRC[row].compare_exchange(h, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                return EBADF;
+            }
+            crate::drivers::usb::uac::capture_close();
+            r3_add(R3_CLOSED, 1);
+            say_close(row, "verb");
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
+/// MICRING3 M2 — Settings > Privacy revoked decision `key` (called through `fs::apptrust::mic_revoked`, BEFORE the
+/// store write — the camera's order): every slot whose program that microphone decision names has its source closed
+/// now; the driver's next service pass closes the pipe and the dot goes out. Service context (it allocates).
+#[cfg(feature = "uac")]
+pub fn source_revoked(key: &str) {
+    let t = PROG_NAME.lock();
+    let mut n = 0u32;
+    for (s, app) in t.iter() {
+        if crate::prefs::decision_key(crate::fs::apptrust::MIC_DOMAIN, app) != key {
+            continue;
+        }
+        let h = prog_close(*s);
+        if h == 0 {
+            continue;
+        }
+        PROG_REVOKED[*s].store(h, Ordering::Release);
+        r3_add(R3_REVOKED, 1);
+        n += 1;
+        serial_println!("[audio] source app={} revoked -> closed", app);
+    }
+    if n == 0 {
+        serial_println!("[mic] revoke key={} open=0 (no program source open; the next open asks)", key);
+    }
+}
+
+/// MICRING3 — slot `s` lost its last holder (`sched::term_release_edge`, IF=0): its source, if any, closes. Atomics and
+/// a `try_lock` only; allocates nothing.
+#[cfg(feature = "uac")]
+pub fn slot_gone(s: usize) {
+    if s >= PROG_SLOTS {
+        return;
+    }
+    PROG_REVOKED[s].store(0, Ordering::Release);
+    if prog_close(s) == 0 {
+        return;
+    }
+    r3_add(R3_TERM, 1);
+    say_close(s, "terminate");
 }

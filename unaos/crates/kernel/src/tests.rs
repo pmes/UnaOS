@@ -173,7 +173,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); register("micring3", micring3_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); register("pinchzoom", pinchzoom_selftest); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
@@ -3941,4 +3941,148 @@ fn geodebackup_selftest() {
         files, if attrs { "ok" } else { "FAIL" }, if times { "ok" } else { "FAIL" }, if restore { "ok" } else { "FAIL" }, refused_taken,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// MICRING3 (rmbp-ledger B736, BP-audio-12) — TAIL-APPENDED. `tests micring3`: the microphone from ring 3 — the fixture
+// program `APPS/MICRING3.ELF` (`unaos/crates/user-micring3`) speaks the three bus verbs (una-abi's MICRING3 block) from
+// three runs: (1) `micring3` OPENs — the grant is asked once, the ask answered Allow (its default) — READs 100 ms and
+// CLOSEs; (2) `micring3 hold` OPENs (the kept grant: no ask) and READs until Settings > Privacy's Revoke, driven in the
+// tab's order (`fs::apptrust::mic_revoked`, then `prefs::revoke`), closes its source and the pipe goes idle on the
+// driver's service pass; (3) `micring3 exit` OPENs and exits without CLOSE — the terminate edge closes it.
+// `:: MICRING3: asked=1 opened=1 read_bytes=<n> revoked=closed terminate=closed -> PASS|SKIP|FAIL ::` (SKIP with the
+// reason when the image stages no fixture, or no microphone has a capture alternate — QEMU's `usb-audio`).
+fn micring3_selftest() {
+    #[cfg(all(feature = "uac", target_arch = "x86_64", feature = "wc"))]
+    {
+        use crate::arch::syscall::BgPoll;
+        use crate::video::dialog::{self, Answer};
+        const PATH: &str = "/apps/MICRING3.ELF";
+        const APP: &str = "micring3";
+        const ASKED: usize = 0;
+        const OPENED: usize = 1;
+        const READ: usize = 2;
+        const REVOKED: usize = 3;
+        const TERM: usize = 4;
+        const CLOSED: usize = 5;
+        const NODEV: usize = 6;
+        let skip = |why: &str| serial_println!(":: MICRING3: asked=- opened=- read_bytes=- revoked=- terminate=- -> SKIP :: reason={} ::", why);
+        if dialog::is_up() {
+            return skip("dialog-up");
+        }
+        let mt = crate::shell::vfs_mount_table();
+        let full = crate::shell::vfs_path(PATH);
+        let Ok(st) = mt.stat(&full) else { return skip("no-fixture (the image stages no APPS/MICRING3.ELF)") };
+        let bytes = match mt.read(&full, 0, st.size as usize) {
+            Ok(b) if b.len() as u64 == st.size => b,
+            _ => return skip("fixture-read"),
+        };
+        let key = crate::prefs::decision_key(crate::fs::apptrust::MIC_DOMAIN, APP);
+        let forget = || {
+            if crate::prefs::decisions().iter().any(|d| d.key == key) {
+                let _ = crate::prefs::revoke(&key);
+            }
+        };
+        let wait = |ms: u64, f: &dyn Fn() -> bool| -> bool {
+            let dl = crate::arch::ticks() + ms;
+            while crate::arch::ticks() < dl {
+                if f() {
+                    return true;
+                }
+                crate::arch::sched::yield_now();
+            }
+            f()
+        };
+        // A run to its end: `Some(status)` when it exited by itself in 8 s (else it is killed); always reaped.
+        let finish = |pid: u64, slot: u64| -> Option<i32> {
+            wait(8_000, &|| !matches!(crate::arch::syscall::bg_poll(pid, false), BgPoll::Running));
+            let st = match crate::arch::syscall::bg_poll(pid, false) {
+                BgPoll::Exited(s) => Some(s),
+                BgPoll::Running => {
+                    let _ = crate::arch::syscall::bg_kill(pid, slot);
+                    None
+                }
+                _ => None,
+            };
+            let _ = crate::arch::syscall::bg_poll(pid, true);
+            st
+        };
+        let idle = || wait(1_500, &|| crate::drivers::usb::uac::capture_armed() == 0);
+        forget();
+        let was = dialog::headless(true);
+        let c0 = crate::audio::ring3_counts();
+        let d = |i: usize| crate::audio::ring3_counts()[i] - c0[i];
+
+        // (1) read: asked once, Allow, 100 ms, CLOSE.
+        let r1 = match crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[APP]) {
+            Ok((pid, slot, _)) => {
+                if wait(3_000, &|| d(ASKED) > 0 || d(NODEV) > 0 || !matches!(crate::arch::syscall::bg_poll(pid, false), BgPoll::Running)) && d(ASKED) > 0 {
+                    dialog::open_now();
+                    dialog::answer(Answer::Default); // Allow, the ask's default: kept in Principia
+                }
+                finish(pid, slot)
+            }
+            Err(why) => {
+                serial_println!("[micring3] run=read refused={}", why);
+                None
+            }
+        };
+        let (asked, opened, read_bytes, closed) = (d(ASKED), d(OPENED), d(READ), d(CLOSED));
+        let idle1 = idle();
+        serial_println!("[micring3] run=read status={:?} asked={} opened={} read_bytes={} closed={} idle={}", r1, asked, opened, read_bytes, closed, idle1 as u8);
+        if d(NODEV) > 0 && opened == 0 {
+            forget();
+            dialog::headless(was);
+            serial_println!(":: MICRING3: asked={} opened=0 read_bytes=0 revoked=- terminate=- -> SKIP :: reason=no-capture-device (QEMU's usb-audio has no capture alternate) ::", asked);
+            return;
+        }
+
+        // (2) hold: the kept grant opens unasked; the Privacy tab's Revoke closes it within one service pass.
+        let o2 = d(OPENED);
+        let mut revoked_ok = false;
+        let mut rv_ms = u64::MAX;
+        match crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[APP, "hold"]) {
+            Ok((pid, slot, _)) => {
+                if wait(3_000, &|| crate::audio::ring3_open(slot as usize) != 0) {
+                    let t0 = crate::arch::ms();
+                    crate::fs::apptrust::mic_revoked(&key); // the tab's order: the hook BEFORE the store write
+                    let dropped = crate::prefs::revoke(&key);
+                    let shut = crate::audio::ring3_open(slot as usize) == 0 && d(REVOKED) == 1;
+                    let idle2 = idle();
+                    rv_ms = crate::arch::ms().wrapping_sub(t0);
+                    let st = finish(pid, slot);
+                    let saw = st.is_some_and(|s| s & (1 << 22) != 0);
+                    revoked_ok = dropped && shut && idle2 && saw;
+                    serial_println!("[micring3] run=hold status={:?} store_revoked={} source_closed={} idle={} program_saw_eperm={} ms={}", st, dropped as u8, shut as u8, idle2 as u8, saw as u8, rv_ms);
+                } else {
+                    let st = finish(pid, slot);
+                    serial_println!("[micring3] run=hold status={:?} opened={} (no source in 3 s)", st, d(OPENED) - o2);
+                }
+            }
+            Err(why) => serial_println!("[micring3] run=hold refused={}", why),
+        }
+
+        // (3) exit: granted again (a second Allow), opened, ended without CLOSE — the terminate edge closes it.
+        crate::prefs::decide(crate::fs::apptrust::MIC_DOMAIN, APP, "-", "allow");
+        let mut term_ok = false;
+        match crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[APP, "exit"]) {
+            Ok((pid, slot, _)) => {
+                let st = finish(pid, slot);
+                let edge = wait(2_000, &|| d(TERM) >= 1);
+                let idle3 = idle();
+                term_ok = edge && d(TERM) == 1 && crate::audio::ring3_open(slot as usize) == 0 && idle3;
+                serial_println!("[micring3] run=exit status={:?} term_closed={} idle={}", st, d(TERM), idle3 as u8);
+            }
+            Err(why) => serial_println!("[micring3] run=exit refused={}", why),
+        }
+        forget();
+        dialog::headless(was);
+        let pass = asked == 1 && opened == 1 && read_bytes > 0 && closed == 1 && idle1 && revoked_ok && term_ok && d(ASKED) == 1;
+        serial_println!(
+            ":: MICRING3: asked={} opened={} read_bytes={} revoked={} terminate={} -> {} :: revoke_ms={} opens={} ::",
+            asked, opened, read_bytes, if revoked_ok { "closed" } else { "open" }, if term_ok { "closed" } else { "open" },
+            if pass { "PASS" } else { "FAIL" }, rv_ms, d(OPENED)
+        );
+    }
+    #[cfg(not(all(feature = "uac", target_arch = "x86_64", feature = "wc")))]
+    serial_println!(":: MICRING3: asked=- opened=- read_bytes=- revoked=- terminate=- -> SKIP :: reason=no-uac-x86-desktop (the `uac` knob on an x86 `wc` image) ::");
 }

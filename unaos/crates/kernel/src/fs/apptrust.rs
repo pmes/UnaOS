@@ -1091,3 +1091,14 @@ pub fn net_revoked(key: &str) -> usize {
     let _ = key;
     0
 }
+
+/// MICRING3 (rmbp-ledger B736, BP-security-15) — THE REVOKE HOOK for the microphone: Settings > Privacy's Revoke of
+/// `key` (`system.decisions.<domain>.<stem>-<hash>`), called BEFORE the store write as the camera's `uvc::revoked` is.
+/// A microphone decision closes that program's open ring-3 source now (`audio::source_revoked`); any other domain's
+/// key is not the microphone's and passes untouched.
+#[cfg(feature = "uac")]
+pub fn mic_revoked(key: &str) {
+    if key.rsplit('.').nth(1) == Some(MIC_DOMAIN) {
+        crate::audio::source_revoked(key);
+    }
+}

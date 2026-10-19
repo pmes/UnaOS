@@ -8714,7 +8714,7 @@ impl core::fmt::Write for TermBuf<'_> {
 /// Runs where `user_space_release` runs (the dying task's `exit`, IF=0, or the scheduler's reap); takes the wm
 /// table and name locks the free itself takes, in the same order; allocates nothing.
 fn term_release_edge(s: usize, cr3: u64, id: u64) {
-    let owner = s as u64 + 1; // `wm::owner_of_launch(s)` on x86: a slot's windows are owned by `slot + 1`
+    let owner = s as u64 + 1; #[cfg(feature = "uac")] crate::audio::slot_gone(s); // `wm::owner_of_launch(s)` on x86: a slot's windows are owned by `slot + 1`. MICRING3 (B736): the program's microphone source closes at its end (one call, atomics only); LINE-NEUTRAL fold, code before this line's first `//`.
     let windows = crate::video::wm::owner_rows(owner);
     let freed_kb = crate::arch::memory::xwin_slot_pages(s) * 4;
     let mut nm = [0u8; crate::video::wm::MAX_TITLE];

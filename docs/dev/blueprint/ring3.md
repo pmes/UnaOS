@@ -13,7 +13,7 @@
 | BP-ring3-1 | `una-abi` holds only what crosses the boundary (numbers, flags, packed layouts, shared magics), is `const`-only with no dependencies, and a number means the same verb on every arch (unimplemented = `-ENOSYS`). | `unaos/crates/una-abi/src/lib.rs:4-31` | compile; `gates` row `verbs` (`unaos/scripts/verb-roots.sh`) for shell verbs |
 | BP-ring3-2 | Per-arch differences in the ABI are a documented `cfg` in una-abi itself (e.g. `GETINFO_TICK_HZ` 1000 x86 / 250 aarch64; callers convert with `getinfo_ticks_to_ms`). | `unaos/crates/una-abi/src/lib.rs:36-50` | compile |
 | BP-ring3-3 | The bus wire is UnaOS-native (R17), frozen by self-authored goldens; the largest allocation a hostile frame can force is `BUS_FRAME_MAX` = 4148 bytes. Both arches run the codec KATs every boot. | `unaos/crates/kernel/src/bus.rs:1-30`; `unaos/crates/kernel/src/lib.rs:244` | `bus_codec_selftest`, `bus_codec2_selftest` |
-| BP-ring3-4 | Bus verb ranges: 1-26 fixed verbs (fs, menus, attrs, prefs 16-19, dialog/sheet/toast 20-22, PrefDeclare 23, DropGet 24, A11yTree 25, WindowRaise 26 — RAISEVERB rmbp-ledger B722, the arc's line, ABI stays 1); 127 REGISTER; ≥128 the registrable/fulfilled range (only under `busreg`); Holocron 144-151. | `unaos/crates/una-abi/src/lib.rs:645-909` `unaos/crates/una-abi/src/lib.rs:1732-1733` `unaos/crates/una-abi/src/lib.rs:1839-1843` `unaos/crates/una-abi/src/lib.rs:1941` `unaos/crates/una-abi/src/lib.rs:2384`; `unaos/crates/kernel/src/bus.rs:88` | compile |
+| BP-ring3-4 | Bus verb ranges: 1-26 fixed verbs (fs, menus, attrs, prefs 16-19, dialog/sheet/toast 20-22, PrefDeclare 23, DropGet 24, A11yTree 25, WindowRaise 26 — RAISEVERB rmbp-ledger B722, the arc's line, ABI stays 1; 27..39 left to AUDIOMIX's playback verbs; AudioSourceOpen/Read/Close 40..42 — MICRING3 rmbp-ledger B736, the arc's line, ABI stays 1, x86 `uac` only); 127 REGISTER; ≥128 the registrable/fulfilled range (only under `busreg`); Holocron 144-151. | `unaos/crates/una-abi/src/lib.rs:645-909` `unaos/crates/una-abi/src/lib.rs:1732-1733` `unaos/crates/una-abi/src/lib.rs:1839-1843` `unaos/crates/una-abi/src/lib.rs:1941` `unaos/crates/una-abi/src/lib.rs:2384` `unaos/crates/una-abi/src/lib.rs:3103`; `unaos/crates/kernel/src/bus.rs:88` | compile |
 | BP-ring3-5 | The kernel's own desktop speaks to Principia's store as a BUS CLIENT through the same `frame_parse`/`request_validate` a ring-3 frame passes. | `unaos/crates/kernel/src/prefs_client.rs:1-12` | `gates` row `prefs` |
 | BP-ring3-6 | Ring 3 is not capped by a pool: per-slot sidecars are heap-grown `SlotVec`s; the only bound is the slot type and `wincap` (BP-video-7). | `unaos/crates/kernel/src/procslot.rs:1-14`; R90 | `[wm] limit … procs=` line |
 | BP-ring3-7 | The ELF segment plan is ONE shared core both loaders use (`elf_core`); the dynamic loader core is `ldso_core`. | `Cargo.toml:35,37` (members comments); `unaos/crates/kernel/Cargo.toml:3941` `unaos/crates/kernel/Cargo.toml:3947` | compile |
@@ -30,7 +30,7 @@
 
 ## 3. Seams
 - Ring 3 may call: `una-abi` syscalls only; the bus for handler verbs; the shared `*_core` crates it links.
-- The kernel fulfils: prefs (16-19, 23; 128-130 for ring-3 fulfilment), attrs (11-15), menus (7-9), dialogs (20-22). Registered ring-3 fulfillers own ≥128 (Holocron 144-151).
+- The kernel fulfils: prefs (16-19, 23; 128-130 for ring-3 fulfilment), attrs (11-15), menus (7-9), dialogs (20-22), the microphone source (40-42, `audio::bus_source`, audio.md BP-audio-12). Registered ring-3 fulfillers own ≥128 (Holocron 144-151).
 - Placement of ring-3 tasks: cores.md BP-cores-1, -5.
 
 ## 4. The ring-3 ELFs built (`unaos/arroyo:6161-6186` USER_CHECK_MATRIX, plus `build_user_holocron_x86` at `:4442`)
@@ -45,6 +45,8 @@
 | VUG (+VUGX/VUGC/VUGK variants) | yes | yes | Vug |
 | PREFS, NET, DIAG, BIG | yes | no aarch64 recipe found | probes/fixtures (owner `unverified`) |
 | ABIPROBE | committed fixture (`unaos/fixtures/ABIPROBE-v1.ELF`), never rebuilt by the image | no | the ABI gate (`tests abielf`, B693) |
+| MICRING3 | owed (staged by no recipe yet) | no | `tests micring3` fixture (`unaos/crates/user-micring3`, B736) |
+| ABIPROBE | committed fixture (`unaos/fixtures/ABIPROBE-v1.ELF`), never rebuilt by the image | no | the ABI gate (BP-ring3-15) |
 | STAT, PULSE | yes | yes | instruments |
 | blob / elf / blob-x86 | flat test blobs | | fixtures |
 

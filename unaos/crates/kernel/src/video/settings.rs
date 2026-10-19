@@ -3564,7 +3564,7 @@ fn privacy_service() {
     if v != u32::MAX {
         crate::prefs::set_sys(crate::prefs::key::PRIVACY_REMEMBER, crate::prefs::PrefValue::Bool(v != 0));
     }
-    let Some(k) = PRIV_REVOKE.try_lock().and_then(|mut g| g.take()) else { return }; #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::revoked(&k); crate::fs::apptrust::net_revoked(&k); /* GRANTNAMES (B742): a revoked net decision drops the app's run rows too (Allow Once), so the running task asks again */ // CAMDOT (B702): the camera's decision stops its stream BEFORE the store write (the viewer's next 8 ms pass), so the revoke is inside one frame and the bar's dot goes out with it. LINE-NEUTRAL append, code first.
+    let Some(k) = PRIV_REVOKE.try_lock().and_then(|mut g| g.take()) else { return }; #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::revoked(&k); #[cfg(feature = "uac")] crate::fs::apptrust::mic_revoked(&k); crate::fs::apptrust::net_revoked(&k); /* GRANTNAMES (B742): a revoked net decision drops the app's run rows too (Allow Once), so the running task asks again */ // CAMDOT (B702): the camera's decision stops its stream BEFORE the store write (the viewer's next 8 ms pass), so the revoke is inside one frame and the bar's dot goes out with it. LINE-NEUTRAL append, code first.
     let ok = crate::prefs::revoke(&k);
     serial_println!("[settings] privacy revoke key={} ok={}", k, ok as u8);
     if is_open() && cur_tab() == PRIV_TAB {
