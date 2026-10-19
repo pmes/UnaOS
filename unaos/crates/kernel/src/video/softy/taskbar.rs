@@ -144,7 +144,7 @@ struct Model {
     vol: u8,
     bat: u16,
     /// SOFTYDOTS: a camera stream is open (the driver's count), and the root's free percent + 1 while low (0 = not).
-    cam: bool,
+    cam: bool, #[cfg(feature = "uac")] mic: bool, // SOFTYMIC (B749): the microphone's capture pipe runs (the driver's count). LINE-NEUTRAL fold, code first.
     disk: u8,
     clock: [u8; 8], // crawl A 18: room for the 12-hour AM/PM
     date: [u8; 10],
@@ -175,7 +175,7 @@ struct Layout {
 impl Model {
     fn read(rows: &[wm::DockEntry]) -> Model {
         let mut m = Model {
-            n: 0, t: [Tile::empty(); k::TILES_MAX], net: 0, vol: 0, bat: 0, cam: false, disk: 0, clock: [b' '; 8], date: [b' '; 10],
+            n: 0, t: [Tile::empty(); k::TILES_MAX], net: 0, vol: 0, bat: 0, cam: false, #[cfg(feature = "uac")] mic: false, disk: 0, clock: [b' '; 8], date: [b' '; 10],
             clock_set: false, hot: HOT_NONE, pressed: HOT_NONE, start_open: super::startmenu::open_kind() == 1,
             cal_open: super::startmenu::open_kind() == 2, qs_open: super::startmenu::open_kind() == 3,
         };
@@ -222,7 +222,7 @@ impl Model {
         // item from the status owner's one fact.
         #[cfg(feature = "uvc")]
         {
-            m.cam = crate::drivers::xhci::uvc::open_streams() != 0;
+            m.cam = crate::drivers::xhci::uvc::open_streams() != 0; #[cfg(feature = "uac")] { m.mic = crate::drivers::usb::uac::capture_armed() != 0; } // SOFTYMIC (B749): the mic light from the DRIVER'S count (the menu bar's `micdot` reads the same call). LINE-NEUTRAL fold, code first.
         }
         m.disk = crate::video::status::disk_low().map_or(0, |p| p.min(100) + 1);
         // The tray.
@@ -243,7 +243,7 @@ impl Model {
     }
 
     fn tray_n(&self) -> usize {
-        self.cam as usize + (self.disk != 0) as usize + (self.net != 0) as usize + (self.vol != 0) as usize + (self.bat != 0) as usize
+        let n = self.cam as usize + (self.disk != 0) as usize + (self.net != 0) as usize + (self.vol != 0) as usize + (self.bat != 0) as usize; #[cfg(feature = "uac")] let n = n + self.mic as usize; n // SOFTYMIC (B749): the mic light is a tray item while lit. LINE-NEUTRAL fold, code first.
     }
 
     /// SOFTYDOTS: the live pulse's owner on this band (0 = none), for the wire.
@@ -297,7 +297,7 @@ impl Model {
                 h = strip::fnv1a(h, b);
             }
         }
-        h = strip::fnv1a_u64(h, self.net as u64 | (self.vol as u64) << 8 | (self.bat as u64) << 16 | (self.hot as u64) << 32 | (self.pressed as u64) << 40 | (self.cam as u64) << 48 | (self.disk as u64) << 56);
+        h = strip::fnv1a_u64(h, self.net as u64 | (self.vol as u64) << 8 | (self.bat as u64) << 16 | (self.hot as u64) << 32 | (self.pressed as u64) << 40 | (self.cam as u64) << 48 | (self.disk as u64) << 56); #[cfg(feature = "uac")] { h = strip::fnv1a_u64(h, self.mic as u64); } // SOFTYMIC (B749): the mic light repaints the band the pass the count moves. LINE-NEUTRAL fold, code first.
         // SOFTY2: the quick-settings state, and the appearance epoch (dark / accent) — a theme change repaints the band.
         h = strip::fnv1a_u64(h, (self.start_open as u64) | (self.cal_open as u64) << 1 | (self.clock_set as u64) << 2 | (self.qs_open as u64) << 3 | (crate::video::theme::epoch() as u64) << 32);
         for &b in self.clock.iter().chain(self.date.iter()) {
@@ -477,7 +477,7 @@ fn paint_row(out: &mut [u32], m: &Model, l: &Layout, r: strip::Rect, j: usize) {
             p::rrect(&mut s, (l.tray_x, l.ty, l.tray_w, l.th), k::px(k::TILE_R), k::HOVER(), if m.qs_open && m.hot != HOT_TRAY { k::HOVER_A() / 2 } else { k::HOVER_A() });
         }
         // SOFTYDOTS: the camera light and the disk item lead the group (the leftmost, as on the Una bar).
-        let mut n = 0;
+        let mut n = 0; #[cfg(feature = "uac")] { if m.mic { let (x, y, ic) = tray_item(l, n); glyph_mic(&mut s, x, y, ic, k::TEXT()); n += 1; } } // SOFTYMIC (B749): the mic light leads the tray, left of the camera's (the Una bar's order). LINE-NEUTRAL fold, code first.
         if m.cam {
             let (x, y, ic) = tray_item(l, n);
             glyph_cam(&mut s, x, y, ic, k::TEXT());
@@ -543,7 +543,7 @@ fn announce(m: &Model, h: usize) {
     }
     // SOFTYDOTS: the three signals' edges.
     let o = m.pulse_owner();
-    let dk = (m.cam as u64) | (m.disk as u64) << 1 | (o & 0xFFFF_FFFF) << 16;
+    let dk = (m.cam as u64) | (m.disk as u64) << 1 | (o & 0xFFFF_FFFF) << 16; #[cfg(feature = "uac")] mic_wire(m.mic); // SOFTYMIC (B749): `[mic] dot=<on|off> by= look=softy` on each edge (file tail). LINE-NEUTRAL fold, code first.
     if DOTS.swap(dk, Ordering::Relaxed) != dk {
         let mut pct = [b'-'; 3];
         let pl = if m.disk == 0 { 1 } else { let v = m.disk - 1; if v >= 100 { pct = *b"100"; 3 } else if v >= 10 { pct[0] = b'0' + v / 10; pct[1] = b'0' + v % 10; 2 } else { pct[0] = b'0' + v; 1 } };
@@ -799,7 +799,7 @@ pub fn dots_probe(pw: usize, ph: usize) -> Option<Dots> {
     #[cfg(not(feature = "uvc"))]
     let cam_live = !base.cam;
     base.hot = HOT_NONE;
-    base.pressed = HOT_NONE;
+    base.pressed = HOT_NONE; #[cfg(feature = "uac")] { base.mic = false; } // SOFTYMIC (B749): a live mic light would take tray item 0 from the camera and disk legs. LINE-NEUTRAL fold, code first.
     let centre = |m: &Model| {
         let l = m.layout(pw);
         let (x, y, d) = tray_item(&l, 0);
@@ -842,4 +842,69 @@ pub fn dots_probe(pw: usize, ph: usize) -> Option<Dots> {
         m2.t[..m2.n].iter().any(|t| t.owner == o && t.pulse)
     });
     Some(Dots { cam_on, cam_off, accent: k::ACCENT(), disk_on, disk_off, warn: k::CLOSE_HOT(), pip_on, pip_off, pip: k::PIP(), cam_live, pulse_live })
+}
+
+// ── SOFTYMIC (rmbp-ledger B749, BP-video-24) — TAIL-APPENDED: the microphone's in-use light in the Softy look ──────────
+// The camera light's shape for the microphone: while the USB Audio Class capture pipe runs (`uac::capture_armed`, the
+// driver's own count — the menu bar's `micdot` reads the same call) the tray's first item is a microphone glyph with
+// the `accent` badge, left of the camera's light. Erased whole with `uac` off (every call site is a same-line fold).
+
+/// The last mic-light state `[mic] dot=` said (`0` = off: nothing is said before the first light).
+#[cfg(feature = "uac")]
+static MIC_SAID: AtomicU64 = AtomicU64::new(0);
+
+/// SOFTYMIC: the microphone — a capsule, its cradle, the stem and the foot in `ink`, the `accent` badge at its top right
+/// (the menu bar's `micdot` glyph, drawn with this look's facade).
+#[cfg(feature = "uac")]
+pub(super) fn glyph_mic(s: &mut Surf, x: usize, y: usize, d: usize, ink: u32) {
+    let t = k::px(1);
+    let (cw, ch) = ((d * 5 / 16).max(2), d * 9 / 16);
+    let cx0 = x + d * 5 / 16;
+    let mx = cx0 + cw / 2;
+    p::stroke_rrect(s, (cx0, y + d / 8, cw, ch), cw / 2, ink, 255);
+    let (side, lip, low) = (d * 9 / 32, y + d * 7 / 16, y + d * 11 / 16);
+    let (lx, rx) = (mx.saturating_sub(side), mx + side);
+    let bot = y + d * 12 / 16;
+    p::line(s, lx, lip, lx + d / 16, low, t, ink, 255);
+    p::line(s, lx + d / 16, low, mx, bot, t, ink, 255);
+    p::line(s, mx, bot, rx - d / 16, low, t, ink, 255);
+    p::line(s, rx - d / 16, low, rx, lip, t, ink, 255);
+    p::hairline_v(s, mx, bot, d * 3 / 16, ink, 255);
+    p::hairline_h(s, mx.saturating_sub(d / 8), y + d * 15 / 16, d / 4, ink, 255);
+    let (bx, byy, b) = badge(x, y, d);
+    p::disc(s, bx, byy, b, k::ACCENT(), 255);
+}
+
+/// SOFTYMIC: `[mic] dot=<on|off> by=<app|-> look=softy` on each edge of the band's mic light.
+#[cfg(feature = "uac")]
+fn mic_wire(on: bool) {
+    if MIC_SAID.swap(on as u64, Ordering::Relaxed) == on as u64 {
+        return;
+    }
+    let mut nb = [0u8; 32];
+    let (_, n) = crate::audio::mic_holder(&mut nb);
+    let by = core::str::from_utf8(&nb[..n]).ok().filter(|b| !b.is_empty()).unwrap_or("-");
+    serial_println!("[mic] dot={} by={} look=softy", if on { "on" } else { "off" }, by);
+}
+
+/// SOFTYMIC fixture (M3): the tray's first item painted through [`paint_row`] from the live model with the mic light
+/// on and off (camera off, so the mic leads), offscreen: `(badge centre on, off, accent, live model agrees with the
+/// driver)`. `None` when the panel cannot host the band.
+#[cfg(all(feature = "uac", feature = "witness"))]
+pub fn mic_probe(pw: usize, ph: usize) -> Option<(u32, u32, u32, bool)> {
+    rect(pw, ph)?;
+    let mut base = model_now();
+    let live = base.mic == (crate::drivers::usb::uac::capture_armed() != 0);
+    base.hot = HOT_NONE;
+    base.pressed = HOT_NONE;
+    let (mut on, mut off) = (base, base);
+    on.mic = true;
+    on.cam = false;
+    off.mic = false;
+    off.cam = false;
+    let l = on.layout(pw);
+    let (x, y, d) = tray_item(&l, 0);
+    let (bx, by, b) = badge(x, y, d);
+    let (cx, cy) = (bx + b / 2, by + b / 2);
+    Some((px_at(&on, pw, ph, cx, cy), px_at(&off, pw, ph, cx, cy), k::ACCENT(), live))
 }

@@ -3895,6 +3895,8 @@ pub mod micdot {
     static OFF: AtomicU32 = AtomicU32::new(0);
     static AT_X: AtomicU64 = AtomicU64::new(0);
     static SAID: AtomicU64 = AtomicU64::new(0);
+    /// SOFTYMIC (B749): the last painted state the `[mic] dot=` line said (off before the first).
+    static SAID_DOT: AtomicBool = AtomicBool::new(false);
 
     #[inline]
     fn open() -> u32 {
@@ -3904,7 +3906,12 @@ pub mod micdot {
     /// The dot's box while capture runs: left of the lit camera dot (over it when the titles' floor leaves no room),
     /// else the camera's own seat.
     pub fn slot(w: usize) -> Option<(usize, usize)> {
-        if open() == 0 {
+        slot_at(w, open())
+    }
+
+    /// [`slot`] for an `open` count (the live count, or SOFTYMIC's offscreen probe).
+    fn slot_at(w: usize, open: u32) -> Option<(usize, usize)> {
+        if open == 0 {
             return None;
         }
         let iw = ICON_HIT();
@@ -3932,6 +3939,11 @@ pub mod micdot {
             }
             AT_X.store(s.map(|(x, _)| x as u64).unwrap_or(0), Ordering::Relaxed);
         }
+        draw(out, w, h, j, s);
+    }
+
+    /// Row `j` of the glyph at box `s` (nothing when `None`) — the live [`row`]'s and the probe's one painter.
+    fn draw(out: &mut [u32], w: usize, h: usize, j: usize, s: Option<(usize, usize)>) {
         let Some((x0, sw)) = s else { return };
         let g = ICON();
         let by = (h.saturating_sub(g) / 2) as i32;
@@ -3969,6 +3981,13 @@ pub mod micdot {
             return;
         }
         serial_println!("[mic] dot painted={} open={} x={}", if p { "on" } else { "off" }, open(), x);
+        // SOFTYMIC (B749): the light's edge in this look, with who holds the microphone.
+        if SAID_DOT.swap(p, Ordering::Relaxed) != p {
+            let mut nb = [0u8; 32];
+            let (_, n) = crate::audio::mic_holder(&mut nb);
+            let by = core::str::from_utf8(&nb[..n]).ok().filter(|b| !b.is_empty()).unwrap_or("-");
+            serial_println!("[mic] dot={} by={} look=crispy", if p { "on" } else { "off" }, by);
+        }
     }
 
     /// The painter's state: is the mic dot on the glass now?
@@ -3979,5 +3998,26 @@ pub mod micdot {
     /// `(on edges, off edges)` the painter drew since boot.
     pub fn counts() -> (u32, u32) {
         (ON.load(Ordering::Relaxed), OFF.load(Ordering::Relaxed))
+    }
+
+    /// SOFTYMIC (B749) fixture: the bar's row through the dot's centre painted offscreen with a synthetic open count
+    /// of 1 and of 0 (the painter's own seat and glyph; the glass is not touched): `(pixel on, pixel off, accent)`.
+    /// `None` when the bar `w` wide seats no status item to stand beside.
+    #[cfg(feature = "witness")]
+    pub fn probe(w: usize) -> Option<(u32, u32, u32)> {
+        let h = super::BAR_H();
+        let (x0, sw) = slot_at(w, 1)?;
+        let g = ICON();
+        let (bx, by) = (x0 + sw.saturating_sub(g) / 2, h.saturating_sub(g) / 2);
+        let (cx, j) = (bx + 13 * g / 16, by + 3 * g / 16);
+        if cx >= w {
+            return None;
+        }
+        let mut row = alloc::vec![0u32; w];
+        draw(&mut row, w, h, j, slot_at(w, 1));
+        let on = row[cx];
+        row.fill(0);
+        draw(&mut row, w, h, j, slot_at(w, 0));
+        Some((on, row[cx], theme::accent()))
     }
 }

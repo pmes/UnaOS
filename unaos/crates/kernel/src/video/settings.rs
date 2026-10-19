@@ -3529,7 +3529,7 @@ fn paint_privacy(st: &mut State) {
             let n = crate::clock::locale::fmt_date(crate::clock::locale::Painter::Privacy, x.at, &mut b);
             String::from(core::str::from_utf8(&b[..n]).unwrap_or(""))
         };
-        match &dst { Some(d) => txt2(st, TRACK_X, 1 + k, &alloc::format!("{} · {}", d, x.answer)), None => txt2(st, TRACK_X, 1 + k, &alloc::format!("{} ({})", x.answer, when)) } // GRANTNAMES (B742): `<host> (<ip>) · <answer>` for a net row this boot recorded (in-place edit)
+        #[cfg(feature = "uac")] { if let Some(u) = softymic::in_use(&x.key) { txt2(st, TRACK_X, 1 + k, &u); btn(st, 1 + k, PRIV_REVOKE_X, "Revoke"); continue; } } match &dst { Some(d) => txt2(st, TRACK_X, 1 + k, &alloc::format!("{} · {}", d, x.answer)), None => txt2(st, TRACK_X, 1 + k, &alloc::format!("{} ({})", x.answer, when)) } // GRANTNAMES (B742): `<host> (<ip>) · <answer>` for a net row this boot recorded (in-place edit)
         btn(st, 1 + k, PRIV_REVOKE_X, "Revoke");
     }
     if d.len() > PRIV_ROWS {
@@ -3560,7 +3560,7 @@ fn press_privacy(row: usize, cx: usize) {
 
 /// The service pass: run a latched Revoke, repaint the open Privacy pane.
 fn privacy_service() {
-    let v = PRIV_REMEMBER_OWED.swap(u32::MAX, Ordering::AcqRel); if crate::fs::apptrust::net_rows_settle() && is_open() && cur_tab() == PRIV_TAB { repaint(); } // GRANTNAMES (B742): the net rows' volumes placed off the syscall path. LINE-NEUTRAL append, code first
+    let v = PRIV_REMEMBER_OWED.swap(u32::MAX, Ordering::AcqRel); if crate::fs::apptrust::net_rows_settle() && is_open() && cur_tab() == PRIV_TAB { repaint(); } #[cfg(feature = "uac")] softymic::service(); // SOFTYMIC (B749): the open Privacy pane repaints on each edge of the mic light (file tail). GRANTNAMES (B742): the net rows' volumes placed off the syscall path. LINE-NEUTRAL append, code first
     if v != u32::MAX {
         crate::prefs::set_sys(crate::prefs::key::PRIVACY_REMEMBER, crate::prefs::PrefValue::Bool(v != 0));
     }
@@ -4829,6 +4829,53 @@ pub(crate) mod backup {
         let (phase, done, _, g) = job::progress();
         let key = ((g as u64) << 40) | ((phase as u64) << 32) | done as u64;
         if SEEN.swap(key, Ordering::Relaxed) != key {
+            super::repaint();
+        }
+    }
+}
+
+// ── SOFTYMIC (rmbp-ledger B749, BP-video-24) — TAIL-APPENDED: the Privacy tab names who holds the microphone ─────────────
+// While the microphone's in-use light is lit (`uac::capture_armed`, the driver's count the menu bar and the Softy tray
+// paint from), the microphone decision row whose key is `decision_key(MIC_DOMAIN, <holder>)` reads `in use by <holder>`
+// in place of its answer and date (`paint_privacy`'s fold); the holder is `audio::mic_holder`'s name. The kernel
+// recorder holds no decision, so it labels no row. `privacy_service` repaints the open pane on each edge of the light.
+#[cfg(feature = "uac")]
+pub mod softymic {
+    use alloc::string::String;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// The light as the last service pass saw it.
+    static LIT: AtomicBool = AtomicBool::new(false);
+
+    /// PURE: decision row `key`'s note — `in use by <holder>` while `lit` and `key` is `holder`'s microphone decision.
+    pub fn note(key: &str, lit: bool, holder: &str) -> Option<String> {
+        if !lit || holder.is_empty() || holder == "-" {
+            return None;
+        }
+        if crate::prefs::decision_key(crate::fs::apptrust::MIC_DOMAIN, holder) != key {
+            return None;
+        }
+        Some(alloc::format!("in use by {}", holder))
+    }
+
+    /// The live note for decision row `key` (the painter's read).
+    pub fn in_use(key: &str) -> Option<String> {
+        if key.rsplit('.').nth(1) != Some(crate::fs::apptrust::MIC_DOMAIN) {
+            return None;
+        }
+        let lit = crate::drivers::usb::uac::capture_armed() != 0;
+        if !lit {
+            return None;
+        }
+        let mut nb = [0u8; 32];
+        let (_, n) = crate::audio::mic_holder(&mut nb);
+        note(key, lit, core::str::from_utf8(&nb[..n]).unwrap_or(""))
+    }
+
+    /// The settings service pass: an edge of the light repaints the open Privacy pane.
+    pub(super) fn service() {
+        let lit = crate::drivers::usb::uac::capture_armed() != 0;
+        if LIT.swap(lit, Ordering::AcqRel) != lit && super::is_open() && super::cur_tab() == super::PRIV_TAB {
             super::repaint();
         }
     }

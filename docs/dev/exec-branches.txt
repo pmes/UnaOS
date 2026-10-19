@@ -640,6 +640,6 @@ refs/heads/exec-rmbp-trashtoast     880decfa FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-lockprefs      7527d4c8 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-rootincompat   f286ce55 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-qvbar          eaf30444 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-softymic       3bbd2569 IN-FLIGHT cloud wave36 SOFTYMIC
+refs/heads/exec-rmbp-softymic       4e9c92be FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-a2dpknob       1fbef588 IN-FLIGHT cloud wave36 A2DPKNOB
 refs/heads/exec-rmbp-oneinstance2   f2ee3bef IN-FLIGHT cloud wave36 ONEINSTANCE2

@@ -264,7 +264,7 @@ impl Source {
 #[cfg(feature = "uac")]
 impl Drop for Source {
     fn drop(&mut self) {
-        crate::drivers::usb::uac::capture_close();
+        crate::drivers::usb::uac::capture_close(); ksrc_closed(); // SOFTYMIC (B749): the kernel source leaves `mic_holder`'s count (file tail). LINE-NEUTRAL fold, code first.
         serial_println!("[audio] source app={} closed", self.app);
     }
 }
@@ -296,7 +296,7 @@ pub fn source(app: &str) -> Result<Source, &'static str> {
 pub(crate) fn open(app: &str, ask: bool) -> Result<Source, &'static str> {
     let (g, ch, rate) = grant_open(app, ask)?;
     serial_println!("[audio] source app={} grant={} fmt=pcm16/{}/{} opened", app, g, ch, rate);
-    Ok(Source { app: String::from(app), ch, rate })
+    ksrc_opened(app); Ok(Source { app: String::from(app), ch, rate }) // SOFTYMIC (B749): the kernel source's count and name for `mic_holder` (file tail). LINE-NEUTRAL fold, code first.
 }
 
 /// The grant, then the driver's open: `Ok((grant, channels, rate))` with the wanted count raised (the caller owes
@@ -705,4 +705,65 @@ fn bt_tone(hz: u32, ms: u32) -> Result<(u64, u32), &'static str> {
     }
     let (f1, u1) = a2dp::counters();
     Ok((f1.wrapping_sub(f0), u1.wrapping_sub(u0)))
+}
+
+
+// ── SOFTYMIC (rmbp-ledger B749, BP-video-24, BP-audio-12) — TAIL-APPENDED: who holds the microphone ──────────────────────
+// The in-use light paints from the driver's fact (`uac::capture_armed`, BP-audio-10); the NAME beside it (the light's
+// wire, Settings > Privacy's `in use by <app>`) comes from here: the live kernel `Source`s ([`KSRC`], raised in `open`,
+// lowered in `Drop`) and the ring-3 slots whose `PROG_SRC` word is non-zero (MICRING3). Readers run in paint context
+// (the menu bar's witness is masked in the composite chain): atomics and `try_lock` only, no allocation.
+
+/// Live kernel `Source`s (the recorder, or a kernel app holding a grant).
+#[cfg(feature = "uac")]
+static KSRC: AtomicU32 = AtomicU32::new(0);
+/// The last kernel opener's app name (written in task context at the open; read with `try_lock`).
+#[cfg(feature = "uac")]
+static KSRC_NAME: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
+
+#[cfg(feature = "uac")]
+fn ksrc_opened(app: &str) {
+    {
+        let mut g = KSRC_NAME.lock();
+        g.clear();
+        g.push_str(app);
+    }
+    KSRC.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(feature = "uac")]
+fn ksrc_closed() {
+    let _ = KSRC.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+}
+
+#[cfg(feature = "uac")]
+fn name_into(out: &mut [u8], b: &[u8]) -> usize {
+    let n = b.len().min(out.len());
+    out[..n].copy_from_slice(&b[..n]);
+    n
+}
+
+/// SOFTYMIC — THE one read of who holds the microphone: `(open sources, bytes of the holder's name written to out)`.
+/// Open sources = live kernel `Source`s + ring-3 slots with an open source. The name is the first open ring-3 slot's
+/// launcher name, else the last kernel opener's; 0 bytes = nobody open, or the name table busy this instant (never
+/// spins). Paint-context safe: atomics and `try_lock`, no allocation.
+#[cfg(feature = "uac")]
+pub fn mic_holder(out: &mut [u8]) -> (u32, usize) {
+    let k = KSRC.load(Ordering::Acquire);
+    let mut n = k;
+    let mut first: Option<usize> = None;
+    for (s, w) in PROG_SRC.iter().enumerate() {
+        if w.load(Ordering::Acquire) != 0 {
+            n += 1;
+            if first.is_none() {
+                first = Some(s);
+            }
+        }
+    }
+    let len = match first {
+        Some(s) => PROG_NAME.try_lock().and_then(|t| t.iter().find(|e| e.0 == s).map(|e| name_into(out, e.1.as_bytes()))).unwrap_or(0),
+        None if k != 0 => KSRC_NAME.try_lock().map(|g| name_into(out, g.as_bytes())).unwrap_or(0),
+        None => 0,
+    };
+    (n, len)
 }
