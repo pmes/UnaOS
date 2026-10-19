@@ -1348,9 +1348,9 @@ fn smartline_selftest() {
 fn netgrant_selftest() {
     #[cfg(all(feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
     {
-        use crate::fs::apptrust::{net_asks, net_forget, net_gate_for, NET_EPERM};
+        use crate::fs::apptrust::{net_asking_dst, net_asks, net_forget, net_gate_for, net_name_note, NET_EPERM}; // GRANTNAMES (B742): the name leg's two calls (in-place edit)
         use crate::video::dialog::{self, Answer};
-        const APP: &str = "NGPROBE";
+        const APP: &str = "NGPROBE"; const NAME: &str = "netgrant.probe"; // GRANTNAMES (B742): the name x86's SYS_RESOLVE would record (in-place fold)
         const IP: [u8; 4] = [10, 0, 2, 2];
         const PORT: u16 = 9;
         // Three runs of the probe: task keys no live task carries (tids count up from 1).
@@ -1366,7 +1366,7 @@ fn netgrant_selftest() {
             serial_println!(":: NETGRANT: -> SKIP reason=no-stack (no NIC) ::");
             return;
         };
-        let was = dialog::headless(true);
+        let was = dialog::headless(true); net_name_note(NAME.as_bytes(), IP); // GRANTNAMES (B742): SYS_RESOLVE's record, the call `netring3::resolve` makes (in-place fold)
         // What reached the stack: every connect (a SYN, whoever's scope is open on this task — the shell's verb scope may
         // name it) plus the ring-3 bucket's sends. The kernel's own sends (SNTP's datagrams) are not the probe's.
         let ring3 = |c: &crate::net_tick::Census| c.connects() + c.send[crate::net_tick::Who::Ring3 as usize];
@@ -1387,7 +1387,7 @@ fn netgrant_selftest() {
         let c0 = crate::net_tick::LEDGER.census();
         let tx0 = crate::net_phy::tx_emission_counts().0;
         let a0 = net_asks();
-        let r1 = connect(RUN1);
+        let r1 = connect(RUN1); let dst = net_asking_dst().unwrap_or_default(); let named = netgrant_named(&dst, APP, NAME, IP, PORT); // GRANTNAMES (B742): the ask on the glass, and the Privacy row, name the host (in-place fold)
         dialog::open_now();
         let up = dialog::is_up();
         dialog::answer(Answer::Default); // Never
@@ -1415,17 +1415,17 @@ fn netgrant_selftest() {
         let a2 = net_asks();
         let kept = crate::prefs::decided(crate::prefs::decide::NET, APP, "-").as_deref() == Some("always");
         let r6 = net_gate_for(APP, RUN3, 0, IP, PORT, true);
-        let persisted = (kept && r6.is_ok() && net_asks() == a2) as u32;
+        let persisted = (kept && r6.is_ok() && net_asks() == a2) as u32; let revoke_run = netgrant_revoke_run(&connect, &key, RUN2); // GRANTNAMES (B742): Privacy's Revoke drops the run's allow row too (in-place fold)
 
         crate::smolnet::stack_close(sid);
         net_forget(APP);
         dialog::headless(was);
         let pending = -115;
-        let ok = asked == 1 && up && r1 == pending && r2 == NET_EPERM && r3 == NET_EPERM && never_kept && denied_pkts == 0
+        let ok = named && revoke_run && asked == 1 && up && r1 == pending && r2 == NET_EPERM && r3 == NET_EPERM && never_kept && denied_pkts == 0
             && revoked && r4 == pending && reasks_always == 1 && r5 != NET_EPERM && allowed == 1 && persisted == 1;
         serial_println!(
-            ":: NETGRANT: asked={} denied_pkts={} allowed={} persisted={} -> {} :: r={}/{}/{}/{}/{} never_kept={} revoked={} reask_after_revoke={} flushed={} keys={} tx_frames_in_never_leg={} key={}",
-            asked, denied_pkts, allowed, persisted, if ok { "PASS" } else { "FAIL" }, r1, r2, r3, r4, r5, never_kept as u8, revoked as u8, reasks_always, flushed, keys, tx_frames, key
+            ":: NETGRANT: asked={} denied_pkts={} allowed={} persisted={} named={} -> {} :: r={}/{}/{}/{}/{} dst={} row={} revoke_run={} never_kept={} revoked={} reask_after_revoke={} flushed={} keys={} tx_frames_in_never_leg={} key={}",
+            asked, denied_pkts, allowed, persisted, named as u8, if ok { "PASS" } else { "FAIL" }, r1, r2, r3, r4, r5, dst, crate::fs::apptrust::net_row(APP).1.unwrap_or_default(), revoke_run as u8, never_kept as u8, revoked as u8, reasks_always, flushed, keys, tx_frames, key
         );
     }
     #[cfg(not(all(feature = "smolnet", feature = "wc", target_arch = "x86_64")))]
@@ -3562,4 +3562,32 @@ fn pinchzoom_selftest() {
         ":: PINCHZOOM: pinch={} scroll={} swipe={} contacts={} -> {} :: z={} steps={} scale={}.{:02} scroll_dy={} end={:?}",
         ok(pinch_ok), ok(scroll_ok), swipe, contacts, verdict, z, steps, scale / 100, scale % 100, sum.1, end
     );
+}
+
+// GRANTNAMES (rmbp-ledger B742, BP-security-17, BP-net-12, BP-bar-12) — TAIL-APPENDED. `tests netgrant`'s x86 legs, called
+// from the x86 body above (folded, line count kept). `named`: the ask on the glass reads `dst=<name>(<ip:port>)` for the
+// ip SYS_RESOLVE answered, and Settings > Privacy's net row reads `<name> (<ip>)`. `revoke_run`: with Always kept AND this
+// run's allow row present (the Always leg's answer), Privacy's Revoke (`apptrust::net_revoked`, then `prefs::revoke`, the
+// order `settings::privacy_service` runs them) drops the run row, so the same run's next connect ASKS (`-EINPROGRESS`, one
+// more ask) instead of passing on the stale row; the ask is answered Never and `net_forget` clears it after.
+// `:: NETGRANT: asked=1 denied_pkts=0 allowed=1 persisted=1 named=1 -> PASS :: … revoke_run=1 …`.
+#[cfg(all(feature = "netring3", feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
+fn netgrant_named(dst: &str, app: &str, name: &str, ip: [u8; 4], port: u16) -> bool {
+    let ask = alloc::format!("{}({}.{}.{}.{}:{})", name, ip[0], ip[1], ip[2], ip[3], port);
+    let row = alloc::format!("{} ({}.{}.{}.{})", name, ip[0], ip[1], ip[2], ip[3]);
+    dst == ask && crate::fs::apptrust::net_row(app).1.as_deref() == Some(row.as_str())
+}
+
+#[cfg(all(feature = "netring3", feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
+fn netgrant_revoke_run(connect: &dyn Fn(u64) -> i64, key: &str, run: u64) -> bool {
+    use crate::video::dialog::{self, Answer};
+    let dropped = crate::fs::apptrust::net_revoked(key);
+    let revoked = crate::prefs::revoke(key);
+    let a = crate::fs::apptrust::net_asks();
+    let r = connect(run);
+    let asked = crate::fs::apptrust::net_asks() - a;
+    dialog::open_now();
+    dialog::answer(Answer::Default); // Never; the fixture's `net_forget` revokes it
+    serial_println!("[netgrant] fixture revoke_run dropped={} revoked={} r={} asked={}", dropped, revoked as u8, r, asked);
+    dropped >= 1 && revoked && r == -115 && asked == 1
 }

@@ -3520,7 +3520,7 @@ fn paint_privacy(st: &mut State) {
     }
     for (k, x) in d.iter().take(PRIV_ROWS).enumerate() {
         let leaf = x.who.trim_end_matches('/').rsplit('/').next().unwrap_or(&x.who);
-        let leaf: String = leaf.chars().take(28).collect();
+        let leaf: String = leaf.chars().take(28).collect(); let (leaf, dst) = if x.domain == crate::prefs::decide::NET { let (p, d) = crate::fs::apptrust::net_row(&x.who); (p.chars().take(28).collect::<String>(), d) } else { (leaf, None) }; // GRANTNAMES (B742): a net row names the program (`<FILE> on <volume>` off the system's storage) and where it went; in-place fold
         txt(st, LABEL_X, 1 + k, &alloc::format!("{}: {}", x.domain, leaf));
         let when = if x.at == 0 {
             String::from("date unknown")
@@ -3529,7 +3529,7 @@ fn paint_privacy(st: &mut State) {
             let n = crate::clock::locale::fmt_date(crate::clock::locale::Painter::Privacy, x.at, &mut b);
             String::from(core::str::from_utf8(&b[..n]).unwrap_or(""))
         };
-        txt2(st, TRACK_X, 1 + k, &alloc::format!("{} ({})", x.answer, when));
+        match &dst { Some(d) => txt2(st, TRACK_X, 1 + k, &alloc::format!("{} · {}", d, x.answer)), None => txt2(st, TRACK_X, 1 + k, &alloc::format!("{} ({})", x.answer, when)) } // GRANTNAMES (B742): `<host> (<ip>) · <answer>` for a net row this boot recorded (in-place edit)
         btn(st, 1 + k, PRIV_REVOKE_X, "Revoke");
     }
     if d.len() > PRIV_ROWS {
@@ -3560,11 +3560,11 @@ fn press_privacy(row: usize, cx: usize) {
 
 /// The service pass: run a latched Revoke, repaint the open Privacy pane.
 fn privacy_service() {
-    let v = PRIV_REMEMBER_OWED.swap(u32::MAX, Ordering::AcqRel);
+    let v = PRIV_REMEMBER_OWED.swap(u32::MAX, Ordering::AcqRel); if crate::fs::apptrust::net_rows_settle() && is_open() && cur_tab() == PRIV_TAB { repaint(); } // GRANTNAMES (B742): the net rows' volumes placed off the syscall path. LINE-NEUTRAL append, code first
     if v != u32::MAX {
         crate::prefs::set_sys(crate::prefs::key::PRIVACY_REMEMBER, crate::prefs::PrefValue::Bool(v != 0));
     }
-    let Some(k) = PRIV_REVOKE.try_lock().and_then(|mut g| g.take()) else { return }; #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::revoked(&k); // CAMDOT (B702): the camera's decision stops its stream BEFORE the store write (the viewer's next 8 ms pass), so the revoke is inside one frame and the bar's dot goes out with it. LINE-NEUTRAL append, code first.
+    let Some(k) = PRIV_REVOKE.try_lock().and_then(|mut g| g.take()) else { return }; #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::revoked(&k); crate::fs::apptrust::net_revoked(&k); /* GRANTNAMES (B742): a revoked net decision drops the app's run rows too (Allow Once), so the running task asks again */ // CAMDOT (B702): the camera's decision stops its stream BEFORE the store write (the viewer's next 8 ms pass), so the revoke is inside one frame and the bar's dot goes out with it. LINE-NEUTRAL append, code first.
     let ok = crate::prefs::revoke(&k);
     serial_println!("[settings] privacy revoke key={} ok={}", k, ok as u8);
     if is_open() && cur_tab() == PRIV_TAB {
