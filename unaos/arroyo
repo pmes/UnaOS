@@ -2846,6 +2846,21 @@ fi
 # USB-host driver has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
 [ -n "${UNAOS_UVC:-}" ] && _feats="${_feats}uvc,"
+# UAC1 (rmbp-ledger B706): UNAOS_USBAUDIO=1 attaches QEMU's `usb-audio` on the xHCI (full-speed USB Audio Class 1:
+# AS interface 1 alt 1, isochronous OUT 0x01, 192-byte packets at 48 kHz stereo) with a silent `none` audiodev,
+# through UNAOS_QEMU_EXTRA (the builder appends it whitespace-split, main.rs:1523). It maps NO feature, so there is
+# no builder line to keep in step: the driver (drivers/usb/uac.rs) rides `uvc`'s isochronous engine (XHCIISO), and
+# the leg is `UNAOS_UVC=1 UNAOS_USBAUDIO=1 UNAOS_WC=1 ./arroyo test 240` with `tests uac1` scoring
+# `:: UAC1: enumerated=1 stream=ok frames=<n> underruns=0 -> PASS ::` (SKIP with the reason when no device came up).
+if [ -n "${UNAOS_USBAUDIO:-}" ]; then
+    case " ${UNAOS_QEMU_EXTRA:-} " in
+        *" usb-audio,"*) ;;
+        *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -audiodev none,id=uac0 -device usb-audio,audiodev=uac0,bus=xhci.0" ;;
+    esac
+    if [ -z "${UNAOS_UVC:-}" ]; then
+        echo "arroyo: UNAOS_USBAUDIO=1 without UNAOS_UVC=1: the usb-audio device is attached but the UAC1 driver (feature uvc) is not built" >&2
+    fi
+fi
 # IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms arch/x86_64/ioapic.rs — the Intel 82093AA I/O APIC
 # redirection table, WHICH THIS KERNEL HAS NEVER HAD. `arch/x86_64/apic.rs` drives the LOCAL APIC
 # only (xAPIC MMIO + x2APIC MSRs) and `drivers/pci.rs` can enable MSI and MSI-X, so a PCI function

@@ -43,6 +43,7 @@ BLUEPRINT: sheets=<a>,<b>  keeps=BP-<A>-1,BP-<A>-4,…  changes=BP-<B>-3 (R<n> |
 | [input.md](input.md) | HID decoders → `pal::Event` → keymap → login/router → ring-3 input ring; trackpad | `unaos/crates/kernel/src/pal.rs`, `unaos/crates/kernel/src/video/keymap.rs`, `unaos/crates/kernel/src/drivers/xhci/mod.rs` (HID), `drivers/ehci/**`, `arch/*/syscall.rs` (input ring) |
 | [ring3.md](ring3.md) | una-abi, syscalls, bus codec and verbs, ELF load, slots, window ABI, FPU/SSE state | `unaos/crates/una-abi/`, `unaos/crates/kernel/src/bus.rs`, `arch/*/syscall.rs`, `unaos/crates/kernel/src/procslot.rs`, `unaos/crates/kernel/src/ring3abi.rs`, `unaos/crates/kernel/src/prefs_client.rs`, `unaos/crates/kernel/src/netring3.rs`, the `user-*` crates under `unaos/crates/` |
 | [storage.md](storage.md) | block handles, AHCI/USB/SD, FAT, UnaFS, VFS mount table, root by content, boot FAT, prefs store, users store, install, Trash, name index | `drivers/{block,ahci}.rs`, `fs/**`, `install/**`, `unaos/crates/kernel/src/prefs.rs`, the `unaos/libs/fs/` cores |
+| [audio.md](audio.md) | the ONE sink seam (`audio::sink`, Principia `system.audio.output`), HDA's tone reached by one call, USB Audio Class 1 playback over xHCI isochronous OUT (UAC1, B706), the Settings output picker | `unaos/crates/kernel/src/audio/mod.rs`, `unaos/crates/kernel/src/drivers/usb/uac.rs`, `drivers/hda*.rs`, the OUT half of `unaos/crates/kernel/src/drivers/xhci/isoch.rs` |
 | [net.md](net.md) | NIC drivers, usbnet, smoltcp vs the hand-rolled stack, DNS/SNTP, wifi ladder, ring-3 net | `unaos/crates/kernel/src/smolnet.rs`, `net_*.rs`, `unaos/crates/kernel/src/netring3.rs`, `unaos/crates/kernel/src/drivers/xhci/usbnet.rs`, `unaos/crates/kernel/src/drivers/bcma.rs`, `wifi/**`, `unaos/crates/net/` |
 | [security.md](security.md) | users, login, sessions, principals, handles/ACL, keyring/Holocron, apptrust, Helm, root rules | `unaos/crates/kernel/src/fs/users.rs`, `unaos/crates/kernel/src/video/login.rs`, `unaos/crates/kernel/src/keyring.rs`, `fs/{apptrust,rootacl,holocron}.rs`, `unaos/crates/kernel/src/rand.rs`, `unaos/libs/sys/helm/` |
 | [handlers.md](handlers.md) | CODEX manifest, host userspace (libs, handlers, vessels, tools), which handlers run as ring-3 ELFs on UnaOS | `handlers/`, `libs/`, `vessels/`, `tools/`, `docs/CODEX.md` §2-§3 |
@@ -51,7 +52,7 @@ BLUEPRINT: sheets=<a>,<b>  keeps=BP-<A>-1,BP-<A>-4,…  changes=BP-<B>-3 (R<n> |
 
 ## Not covered by any sheet yet (seat to decide)
 
-Audio (`drivers/hda*.rs`, the doc in `docs/dev/OS/11_AUDIO/`), GPU driver ladders (`drivers/gpu/**`, the Kepler and gen7
+GPU driver ladders (`drivers/gpu/**`, the Kepler and gen7
 rungs: R101, R127), the compatibility box (`unaos/crates/kernel/src/arch/x86_64/linuxabi/`, `docs/dev/OS/03_COMPATIBILITY_BOX/`), selfhost
 (`unaos/crates/kernel/src/selfhost/`). Each is a candidate sheet. (Power/SMC: power.md, SLEEP B691.)
 
