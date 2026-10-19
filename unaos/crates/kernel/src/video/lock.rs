@@ -6,8 +6,10 @@
 //! and lid lock the glass, the password opens it, nothing else is touched").
 //!
 //! * **One key set** (Principia, `system.lock.*`, Settings > Security, one row each): `after_idle_min` (0 = never,
-//!   default 10), `on_lid` (default on), `on_sleep` (default on). Read here once a second ([`service`]); the Settings
-//!   rows write through [`set_policy`] / [`persist`].
+//!   default 10), `on_lid` (default on), `on_sleep` (default on). LOCKPREFS (B748): read over the bus
+//!   (`prefs_client::sys_int` / `sys_flag`, Principia's client, never `crate::prefs`) on the service pass that first sees
+//!   a PrefChanged (`prefs_client::CHANGED_N` moved) or a login-generation move ([`prefs_pass`]) — no clock poll; the
+//!   Settings rows write through [`set_policy`] / [`persist`] (`prefs_client::sys_set`).
 //! * **The LOCK state** is a VEIL, not a teardown: [`veiled`] is a term of `wm::above_shell` (one fold, `lock_veiled`
 //!   at the file tail), so the compositor, the desktop's occluders, the hit test and the a11y tree all read every row
 //!   but the modal one (the login screen in its locked mode) as below the shell — the rows, their surfaces, their z
@@ -22,8 +24,9 @@
 //! * **A wrong password** is the login screen's one answer (BP-security-4); here it is COUNTED and the card SHAKES
 //!   (six 30 ms steps, none under Reduce motion).
 //! * Wire: `[lock] enter cause=<idle|lid|sleep|key> windows_hidden=<n>` · `[lock] wrong n=<n> shake=<…>` ·
-//!   `[lock] open ms=<n> wrong=<n> resumed=<n>` · `tests autolock` -> `:: AUTOLOCK: entered=1 leaked_keys=0 reopened=ok
-//!   table_same=1 ms=<n> -> PASS ::` (the fixture body is `tests.rs`'s tail).
+//!   `[lock] open ms=<n> wrong=<n> resumed=<n>` · `[lock] policy after_idle_min=<n> on_lid=<0|1> on_sleep=<0|1> via=` ·
+//!   `tests autolock` -> `:: AUTOLOCK: entered=1 leaked_keys=0 reopened=ok table_same=1 ms=<n> … prefs=client -> PASS ::`
+//!   (the fixture body is `tests.rs`'s tail).
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// What locked the glass.
@@ -69,7 +72,11 @@ static CLOCK_MIN: AtomicU64 = AtomicU64::new(0);
 static AFTER_IDLE_MIN: AtomicU32 = AtomicU32::new(IDLE_MIN_DEFAULT);
 static ON_LID: AtomicBool = AtomicBool::new(true);
 static ON_SLEEP: AtomicBool = AtomicBool::new(true);
-static POLICY_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// LOCKPREFS (B748): the PrefChanged count (`prefs_client::CHANGED_N`) and the login generation
+/// (`fs::users::SESSION_GEN`) the policy was last read under; [`prefs_pass`] re-reads when either moved.
+static SEEN_CHANGED: AtomicU32 = AtomicU32::new(0);
+static SEEN_GEN: AtomicU32 = AtomicU32::new(0);
+static PRIMED: AtomicBool = AtomicBool::new(false);
 /// Store writes owed by a Settings press: bit 0 after_idle_min, bit 1 on_lid, bit 2 on_sleep. While any is owed the
 /// once-a-second read does not overwrite the press with the store's older value.
 static OWED: AtomicU8 = AtomicU8::new(0);
@@ -141,23 +148,61 @@ pub fn set_policy(after_idle_min: Option<u32>, on_lid: Option<bool>, on_sleep: O
     }
 }
 
-/// The owed store writes (Principia's `system.lock.*`), from the Settings service pass — never from a router.
+/// The owed store writes (Principia's `system.lock.*`), from the Settings service pass — never from a router. LOCKPREFS
+/// (B748): through the bus client (`prefs_client::sys_set`: from the render task the PrefSet runs on a worker, and
+/// `sys_get` answers the queued value meanwhile); the store's PrefChanged then reaches [`prefs_pass`].
 pub fn persist() {
-    use crate::prefs::{key, set_sys, PrefValue};
+    use crate::prefs::key;
+    use crate::prefs_client::{sys_set as set_sys, PrefValue};
     let o = OWED.swap(0, Ordering::AcqRel);
     if o & 1 != 0 { set_sys(key::LOCK_AFTER_IDLE_MIN, PrefValue::Int(AFTER_IDLE_MIN.load(Ordering::Relaxed) as i64)); }
     if o & 2 != 0 { set_sys(key::LOCK_ON_LID, PrefValue::Bool(ON_LID.load(Ordering::Relaxed))); }
     if o & 4 != 0 { set_sys(key::LOCK_ON_SLEEP, PrefValue::Bool(ON_SLEEP.load(Ordering::Relaxed))); }
 }
 
-/// Read the three keys from the store (the schema's defaults where unset).
+/// LOCKPREFS (B748): the policy's half of a service pass. Re-reads the three keys over the bus when a PrefChanged
+/// landed since the last read (`prefs_client::CHANGED_N`: every accepted store write, whoever wrote it, while a kernel
+/// subscriber is registered — the lock registers itself on its first pass) or the session moved (a login or logout
+/// swaps the store's home and fires no PrefChanged); otherwise three atomic loads and out. While a Settings press is
+/// owed the press is newer than the store: nothing is read and the edge is kept for the pass after [`persist`].
+/// The mark is taken BEFORE the read, so a write that lands mid-read moves the count again and the next pass re-reads.
+/// `true` = it re-read.
+pub fn prefs_pass() -> bool {
+    if !PRIMED.load(Ordering::Acquire) {
+        crate::prefs_client::subscribe();
+    }
+    if OWED.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    let n = crate::prefs_client::CHANGED_N.load(Ordering::Acquire);
+    let g = crate::fs::users::SESSION_GEN.load(Ordering::Acquire);
+    if PRIMED.load(Ordering::Acquire) && SEEN_CHANGED.load(Ordering::Relaxed) == n && SEEN_GEN.load(Ordering::Relaxed) == g {
+        return false;
+    }
+    SEEN_CHANGED.store(n, Ordering::Relaxed);
+    SEEN_GEN.store(g, Ordering::Relaxed);
+    PRIMED.store(true, Ordering::Release);
+    refresh();
+    true
+}
+
+/// Read the three keys over the bus (Principia's client; the schema's defaults where unset or out of range) and make
+/// them the policy in force. One line when a value moved.
 fn refresh() {
     use crate::prefs::key;
-    if OWED.load(Ordering::Acquire) != 0 { return; }
-    let m = crate::prefs::peek_int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).map(|v| v as u32);
-    if let Some(m) = m { AFTER_IDLE_MIN.store(m, Ordering::Relaxed); } else if crate::prefs::int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).is_none() { AFTER_IDLE_MIN.store(IDLE_MIN_DEFAULT, Ordering::Relaxed); }
-    ON_LID.store(crate::prefs::flag(key::LOCK_ON_LID).unwrap_or(true), Ordering::Relaxed);
-    ON_SLEEP.store(crate::prefs::flag(key::LOCK_ON_SLEEP).unwrap_or(true), Ordering::Relaxed);
+    use crate::prefs_client::{sys_flag, sys_int};
+    let m = sys_int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).map_or(IDLE_MIN_DEFAULT, |v| v as u32);
+    let lid = sys_flag(key::LOCK_ON_LID).unwrap_or(true);
+    let slp = sys_flag(key::LOCK_ON_SLEEP).unwrap_or(true);
+    if OWED.load(Ordering::Acquire) != 0 {
+        return; // a Settings press landed during the read: it is newer than what the store answered
+    }
+    let m0 = AFTER_IDLE_MIN.swap(m, Ordering::Relaxed);
+    let lid0 = ON_LID.swap(lid, Ordering::Relaxed);
+    let slp0 = ON_SLEEP.swap(slp, Ordering::Relaxed);
+    if (m0, lid0, slp0) != (m, lid, slp) {
+        serial_println!("[lock] policy after_idle_min={} on_lid={} on_sleep={} via={} (prefs_client, PrefChanged)", m, lid as u8, slp as u8, crate::prefs_client::last_via());
+    }
 }
 
 /// Is there a session the lock could close over, with the screen down? (No lock line for a refusal nobody asked for.)
@@ -325,15 +370,12 @@ pub fn before_sleep(via: &str) {
     let _ = enter(cause);
 }
 
-/// The render pulse (`login::submit_drain`'s head): the policy once a second, the idle lock, the shake's steps, and
+/// The render pulse (`login::submit_drain`'s head): the policy on a PrefChanged ([`prefs_pass`]), the idle lock, the shake's steps, and
 /// the screen's own guard — the veil never outlives the card while a session is open (a card closed by another path
 /// is put back; with no session the veil lifts: nothing is left under it to hide).
 pub fn service() {
     let now = crate::arch::ms();
-    if now.wrapping_sub(POLICY_AT_MS.load(Ordering::Relaxed)) >= 1000 {
-        POLICY_AT_MS.store(now.max(1), Ordering::Relaxed);
-        refresh();
-    }
+    let _ = prefs_pass();
     if ACTIVE.load(Ordering::Acquire) {
         if SHAKE_STEP.load(Ordering::Acquire) != 0 {
             shake_step(now);
