@@ -122,6 +122,13 @@ name = "font_core"
 version = "0.1.0"
 
 [[package]]
+name = "geode_core"
+version = "0.1.0"
+dependencies = [
+ "unafs",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,6 +507,7 @@ dependencies = [
  "fdt",
  "font8x8",
  "font_core",
+ "geode_core",
  "holocron_core",
  "jobs_core",
  "lazy_static",
