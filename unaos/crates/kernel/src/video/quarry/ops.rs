@@ -229,6 +229,8 @@ enum Item {
     Copy,
     Paste,
     Info,
+    /// QUARRYVERSIONS (B732): 'Previous versions…' — the file's version ring (FILEVERSIONS B714) in the inspector.
+    Versions,
     ShowTrash,
     Restore,
     EmptyTrash,
@@ -249,6 +251,7 @@ impl Item {
             Item::Copy => "Copy",
             Item::Paste => "Paste",
             Item::Info => "Get Info",
+            Item::Versions => "Previous versions\u{2026}", // QUARRYVERSIONS (B732)
             Item::ShowTrash => "Show Trash",
             Item::Restore => "Restore",
             Item::EmptyTrash => "",
@@ -256,7 +259,7 @@ impl Item {
     }
 }
 
-const ITEMS: [Item; 12] = [Item::Open, Item::OpenWith, Item::Rename, Item::Delete, Item::DeletePerm, Item::NewFolder, Item::Copy, Item::Paste, Item::Info, Item::ShowTrash, Item::Restore, Item::EmptyTrash];
+const ITEMS: [Item; 13] = [Item::Open, Item::OpenWith, Item::Rename, Item::Delete, Item::DeletePerm, Item::NewFolder, Item::Copy, Item::Paste, Item::Info, Item::Versions, Item::ShowTrash, Item::Restore, Item::EmptyTrash];
 
 /// TRASH (R75) — `Empty Trash` is a TWO-STEP (no yes/no alert exists; `login::open_alert` is OK-only): the
 /// first press arms it (uptime seconds + 1), a second within [`EMPTY_WINDOW_S`] empties.
@@ -566,9 +569,19 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     }
     if super::getinfo::is_up() {
         // ATTRCOLUMNS (B402): any press dismisses the inspector; one inside Quarry is consumed by it.
-        super::getinfo::dismiss();
+        // QUARRYVERSIONS (B732): except a press on a version row's Restore or Open, which runs it (the hit is read
+        // under MODEL then the panel leaf, `paint`'s order; the verb runs with neither held).
+        let hit = to_source(x, y);
+        let pick = match (hit, MODEL.lock().as_ref()) {
+            (Some(h), Some(m)) => super::getinfo::version_hit(&m.geom, h),
+            _ => None,
+        };
+        match pick {
+            Some((path, seq, restore)) => version_press(&path, seq, restore),
+            None => super::getinfo::dismiss(),
+        }
         repaint();
-        return to_source(x, y).is_some();
+        return hit.is_some();
     }
     if !MENU_UP.load(Ordering::Acquire) {
         return false;
@@ -631,6 +644,7 @@ fn run_item(it: Item) {
         Item::Copy => do_copy(),
         Item::Paste => do_paste(),
         Item::Info => do_info(),
+        Item::Versions => do_versions(), // QUARRYVERSIONS (B732)
         Item::OpenWith => {} // FILETYPES (B423): taken in `menu_press` (it needs the menu's origin)
     }
     repaint();
@@ -1055,4 +1069,190 @@ pub fn key_char_fixture(chars: &[char]) -> Option<String> {
         let _ = edit_char(c);
     }
     EDIT.lock().take().map(|e| e.buf)
+}
+
+// ── QUARRYVERSIONS (rmbp-ledger B732): 'Previous versions…' — the face of FILEVERSIONS (B714) ──────────────────────
+//
+// BP-bar-14 / BP-storage-24: an overwrite is never the only copy, and the user reaches the copies from the file. The
+// menu row (`Item::Versions`, after Get Info) opens the inspector (`getinfo::open_versions`) on one row per version,
+// newest first: the date it was replaced (`clock::locale::fmt_stamp`), its size, Restore and Open. A folder has no
+// list (the row says so and opens nothing); a file with none says 'No previous versions'.
+//
+// * The path: Quarry holds MOUNT-TABLE paths; the three seams (`fs::unafs::{versions, read_version,
+//   restore_version}`) take the NATIVE volume's. [`native_path`] asks the table which backend claims the path (the
+//   ROOTDISK alias `/volumes/UnaOS/…` included) and lifts the remainder to the volume through the backend's own
+//   `on_volume` — the one mount-space → volume-space definition; a non-native volume (FAT, a stick) keeps none.
+// * Restore ([`op_restore_version`]) names the version by its `seq` (the ring's index shifts under a later write),
+//   is confined to the home (DIRNS, as every op), and is ITSELF a versioned write — the crate keeps the current
+//   contents as the newest version — so it is undone by restoring that version: no undo-journal entry is pushed
+//   (UNDOMOVE's journal is the namespace's; this changes no name). It bypasses the VFS write dispatch, so it bumps
+//   the namespace generation itself (the size a listing prints changed), refreshes the folder, re-lists, and toasts
+//   'Restored the version from <date>'.
+// * Open ([`op_open_version`]) reads the version whole and writes it to `<home>/.Trash/.versions/<stem> (version
+//   <seq>)<.ext>` — the extension kept so the type and opener route as the file's — then hands that path to the ONE
+//   opener dispatch. Why there: BP-bar-14 allows no hidden folder under the home but `.Trash`; a copy is not the
+//   user's document, so it must not land in the folder they are looking at; and Empty Trash removes it (trash_core
+//   lists only stamped/indexed objects, so the scratch never shows as a Trash item, but `empty` deletes everything).
+//
+// Wire: `[quarry] versions path=<p> native=<p|-> listed=<n>`, `[quarry] op=version-restore src=<p> dst=seq<k> ok=
+// reason=`, `[quarry] version restored path=<p> seq=<k> from=<date>`, `[quarry] op=version-open src=<p> dst=<tmp> ok=
+// reason=`.
+
+/// QUARRYVERSIONS (B732): the native volume's path for the mount-table `path`, or `None` when another volume claims it.
+pub fn native_path(path: &str) -> Option<String> {
+    let t = mt();
+    let (b, rel) = t.resolve(path).ok()?;
+    if b.volume_name() != "native" {
+        return None;
+    }
+    let v = b.on_volume(rel);
+    Some(if v.is_empty() { String::from("/") } else if v.starts_with('/') { v } else { alloc::format!("/{}", v) })
+}
+
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn ver_list(np: &str) -> Option<Vec<(u64, u64, u64)>> {
+    crate::fs::unafs::versions(np).map(|v| v.iter().map(|i| (i.seq, i.mtime, i.size)).collect())
+}
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn ver_read(np: &str, n: usize) -> Option<Vec<u8>> {
+    crate::fs::unafs::read_version(np, n)
+}
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn ver_restore(np: &str, n: usize) -> bool {
+    crate::fs::unafs::restore_version(np, n)
+}
+#[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+fn ver_list(_: &str) -> Option<Vec<(u64, u64, u64)>> {
+    None
+}
+#[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+fn ver_read(_: &str, _: usize) -> Option<Vec<u8>> {
+    None
+}
+#[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+fn ver_restore(_: &str, _: usize) -> bool {
+    false
+}
+
+/// QUARRYVERSIONS (B732): the versions of the file at `path`, newest first, as `(seq, replaced-at unix s, size)`.
+pub fn version_rows(path: &str) -> Result<Vec<(u64, u64, u64)>, &'static str> {
+    let np = native_path(path).ok_or("this volume keeps none")?;
+    ver_list(&np).ok_or("unreadable")
+}
+
+/// The ring index of the version stamped `seq` and its replaced-at time.
+fn version_at(np: &str, seq: u64) -> Result<(usize, u64), String> {
+    let rows = ver_list(np).ok_or_else(|| String::from("the versions are unreadable"))?;
+    rows.iter().position(|r| r.0 == seq).map(|n| (n, rows[n].1)).ok_or_else(|| String::from("that version is no longer kept"))
+}
+
+/// The date a person reads for a version.
+pub fn version_date(unix: u64) -> String {
+    if unix == 0 { String::from("an unknown date") } else { crate::clock::locale::fmt_stamp(crate::clock::locale::Painter::Quarry, unix) }
+}
+
+/// QUARRYVERSIONS (B732): make the version stamped `seq` the contents of `path` again. Returns its replaced-at time.
+pub fn op_restore_version(path: &str, seq: u64) -> Result<u64, String> {
+    ns_check(path, false)?;
+    let np = native_path(path).ok_or_else(|| String::from("this volume keeps no versions"))?;
+    let (n, when) = version_at(&np, seq)?;
+    if !ver_restore(&np, n) {
+        return Err(String::from("the file system refused the restore"));
+    }
+    let _ = crate::fs::ns_bump(Ok::<(), ()>(())); // the bytes changed behind the VFS write dispatch: a listing change
+    Ok(when)
+}
+
+/// QUARRYVERSIONS (B732): the scratch folder an opened version is written to (BP-bar-14: under `.Trash`, the one hidden folder).
+pub fn versions_scratch() -> String {
+    join(&crate::fs::trash::trash_dir(), ".versions")
+}
+
+/// QUARRYVERSIONS (B732): write the version stamped `seq` of `path` to the scratch folder; returns the copy's path.
+pub fn op_open_version(path: &str, seq: u64) -> Result<String, String> {
+    ns_check(path, false)?;
+    let np = native_path(path).ok_or_else(|| String::from("this volume keeps no versions"))?;
+    let (n, _) = version_at(&np, seq)?;
+    let bytes = ver_read(&np, n).ok_or_else(|| String::from("the version is unreadable"))?;
+    let t = mt();
+    let (td, dir) = (crate::fs::trash::trash_dir(), versions_scratch());
+    for d in [&td, &dir] {
+        if !exists(&t, d) {
+            t.create(d, NodeKind::Dir, P).map_err(err_s)?;
+        }
+    }
+    let name = leaf(path);
+    let copy = match name.rfind('.') {
+        Some(i) if i > 0 => alloc::format!("{} (version {}){}", &name[..i], seq, &name[i..]),
+        _ => alloc::format!("{} (version {})", name, seq),
+    };
+    let dst = join(&dir, &copy);
+    if exists(&t, &dst) {
+        t.unlink(&dst, P).map_err(err_s)?;
+    }
+    t.create(&dst, NodeKind::File, P).map_err(err_s)?;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let end = (off + COPY_CHUNK).min(bytes.len());
+        t.write(&dst, off as u64, &bytes[off..end], P).map_err(err_s)?;
+        off = end;
+    }
+    Ok(dst)
+}
+
+/// The menu row: open the version list for the selected FILE (a folder has none: M2).
+fn do_versions() {
+    let Some((_, path, is_dir)) = selection() else { return };
+    if is_dir {
+        log_op("versions", &path, "-", &Err(String::from("folder")));
+        say(String::from("a folder keeps no previous versions"));
+        return;
+    }
+    super::getinfo::open_versions(&path);
+}
+
+/// QUARRYVERSIONS (B732): a version row's button — what the inspector's press runs (and `tests fileversions` drives).
+/// Restore: the restore, the folder refreshed, the list re-read, the toast. Open: the copy, then the opener.
+pub fn version_press(path: &str, seq: u64, restore: bool) {
+    let tag = alloc::format!("seq{}", seq);
+    if restore {
+        let r = op_restore_version(path, seq);
+        log_op("version-restore", path, &tag, &r.clone().map(|_| ()));
+        match r {
+            Ok(when) => {
+                let date = version_date(when);
+                let title = alloc::format!("Restored the version from {}", date);
+                serial_println!("[quarry] version restored path={} seq={} from={}", path, seq, date);
+                let _ = crate::video::notify::post_full(b"Quarry", title.as_bytes(), leaf(path).as_bytes(), b"", crate::video::notify::ACT_NONE, &[]);
+                refresh(Some(&leaf(path)));
+                say(title);
+                super::getinfo::open_versions(path);
+            }
+            Err(e) => {
+                refuse_notice(&e);
+                say(alloc::format!("restore refused ({})", e));
+            }
+        }
+    } else {
+        let r = op_open_version(path, seq);
+        log_op("version-open", path, r.as_deref().unwrap_or("-"), &r.clone().map(|_| ()));
+        super::getinfo::dismiss();
+        match r {
+            Ok(copy) => {
+                let (mime, opener) = route(&mt(), &copy);
+                run_act(super::openers::act(opener, copy, mime));
+            }
+            Err(e) => {
+                refuse_notice(&e);
+                say(alloc::format!("open refused ({})", e));
+            }
+        }
+    }
+}
+
+/// QUARRYVERSIONS (B732): `tests fileversions`' `menu=` leg — the row is in the menu, right after Get Info, and says so.
+pub fn versions_item_probe() -> bool {
+    let at = ITEMS.iter().position(|&i| i == Item::Versions);
+    let info = ITEMS.iter().position(|&i| i == Item::Info);
+    matches!((at, info), (Some(a), Some(i)) if a == i + 1) && Item::Versions.label() == "Previous versions\u{2026}"
 }
