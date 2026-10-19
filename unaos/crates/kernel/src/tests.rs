@@ -226,7 +226,7 @@ fn ensure_unafsx86() {
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
         static GROW: AtomicBool = AtomicBool::new(false);
-        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); register("diskfull", diskfull_selftest); register("fileversions", fileversions_selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
+        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); register("diskfull", diskfull_selftest); register("fileversions", fileversions_selftest); register("geodebackup", geodebackup_selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
     }
 }
 
@@ -3779,5 +3779,166 @@ fn filesearch_selftest() {
     serial_println!(
         ":: FILESEARCH: index={} hits_ok={} recent={} kind={} ms={} -> {} ::",
         index, hits_ok, if recent_ok { "ok" } else { "FAIL" }, if kind_ok { "ok" } else { "FAIL" }, ms, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// GEODEBACKUP (rmbp-ledger B740, BP-bar-1/14, BP-storage-28) — TAIL-APPENDED, so no line above moves. `tests geodebackup`:
+// the kernel's `.geode` v1 writer and reader (`fs::unafs::geodew`) round-trip a home, in RAM. Home `a` (40 files in four
+// folders; every file carries attributes — strings, ints, floats every third, a vector every seventh, a spilled 6000-byte
+// blob every fifth — and every entry distinct ctime/mtime/atime) is backed up to a RAM stick; the bytes must equal an
+// independent whole-record encoding in the host crate's `write_archive` order (`fmt`), and their length the walk's
+// measure (`measured`); the stick restores into home `b` of a second RAM volume and every record must be equal (kind,
+// bytes, the attribute set, the three times); a second restore into `b` is refused (`taken`) with nothing written; a
+// one-byte-damaged archive is refused before any write; a restore into a new folder (`make`) succeeds.
+// `:: GEODEBACKUP: files=40 attrs=ok times=ok restore=ok refused_taken=1 -> PASS|FAIL ::`
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+type GbRecord = (alloc::string::String, ::unafs::FileKind, u64, u64, u64, alloc::collections::BTreeMap<alloc::string::String, ::unafs::AttributeValue>, alloc::vec::Vec<u8>);
+
+/// GEODEBACKUP: every record under inode `id` in pre-order, siblings in `ls` order — read whole, independently of the writer.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn gb_records<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>, id: u64, rel: &str, out: &mut alloc::vec::Vec<GbRecord>) -> Result<(), ::unafs::fs::FileSystemError> {
+    use ::unafs::FileKind;
+    for c in fs.ls(id)? {
+        let p = if rel.is_empty() { c.name.clone() } else { alloc::format!("{}/{}", rel, c.name) };
+        let ino = fs.read_inode(c.inode_id)?;
+        let mut attrs = ino.attributes.clone();
+        for k in ino.large_attributes.keys() {
+            if let Some(v) = fs.get_attribute(c.inode_id, k)? {
+                attrs.insert(k.clone(), v);
+            }
+        }
+        let data = if ino.kind == FileKind::File && ino.size > 0 { fs.read_data(c.inode_id, 0, ino.size)? } else { alloc::vec::Vec::new() };
+        out.push((p.clone(), ino.kind, ino.ctime, ino.mtime, ino.atime, attrs, data));
+        if ino.kind == FileKind::Directory {
+            gb_records(fs, c.inode_id, &p, out)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn geodebackup_selftest() {
+    use crate::fs::unafs::geodew::{self, Bytes};
+    use ::unafs::codec::{Encode, Writer};
+    use ::unafs::fs::FileSystemError;
+    use ::unafs::{AttributeValue as A, FileKind, MemDevice, UnaFS};
+    use alloc::format;
+    use alloc::vec::Vec;
+    const BLOCKS: u64 = 1024;
+    let (Ok(mut a), Ok(mut b)) = (UnaFS::format(MemDevice::with_blocks(BLOCKS), 0), UnaFS::format(MemDevice::with_blocks(BLOCKS), 0)) else {
+        serial_println!(":: GEODEBACKUP: files=0 attrs=- times=- restore=- refused_taken=0 -> FAIL reason=format ::");
+        return;
+    };
+    // Home a: four folders, 40 files with attributes, then the times on every entry (after every create).
+    let made = (|| -> Result<(), FileSystemError> {
+        let root = a.superblock.root_inode;
+        let home = a.mkdir(root, "home".into())?;
+        let ha = a.mkdir(home, "a".into())?;
+        let docs = a.mkdir(ha, "Documents".into())?;
+        let pics = a.mkdir(ha, "Pictures".into())?;
+        let music = a.mkdir(ha, "Music".into())?;
+        let albums = a.mkdir(music, "Albums".into())?;
+        a.set_attribute(docs, "geode.view".into(), A::String("list".into()))?;
+        let mut ids = alloc::vec![docs, pics, music, albums];
+        let parents = [ha, docs, pics, albums];
+        for i in 0..40u64 {
+            let id = a.create_file(parents[(i % 4) as usize], format!("file-{:02}.dat", i))?;
+            let len = if i == 13 { 200_000 } else { (i * 701) as usize };
+            let data: Vec<u8> = (0..len).map(|k| (k as u64 * 31 + i) as u8).collect();
+            if !data.is_empty() {
+                a.write_data(id, 0, &data)?;
+            }
+            a.set_attribute(id, "geode.note".into(), A::String(format!("note {}", i)))?;
+            a.set_attribute(id, "geode.rank".into(), A::Int(i as i64 - 20))?;
+            if i % 3 == 0 {
+                a.set_attribute(id, "geode.weight".into(), A::Float(i as f64 * 0.5))?;
+            }
+            if i % 5 == 0 {
+                a.set_attribute(id, "geode.thumb".into(), A::Blob((0..6000usize).map(|k| (k + i as usize) as u8).collect()))?;
+            }
+            if i % 7 == 0 {
+                a.set_attribute(id, "geode.vec".into(), A::Vector((0..16).map(|k| k as f32 * 0.25 + i as f32).collect()))?;
+            }
+            ids.push(id);
+        }
+        for (k, id) in ids.iter().enumerate() {
+            let t = 1_600_000_000 + k as u64 * 10;
+            a.set_times(*id, t, t + 1, t + 2)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = made {
+        serial_println!(":: GEODEBACKUP: files=0 attrs=- times=- restore=- refused_taken=0 -> FAIL reason=populate({:?}) ::", e);
+        return;
+    }
+    let mut want: Vec<GbRecord> = Vec::new();
+    let _ = a.resolve_path("/home/a").and_then(|id| gb_records(&mut a, id, "", &mut want));
+    // The reference: the host crate's write_archive over the whole records.
+    let reference = {
+        let mut w = Writer::new();
+        w.raw(b"GEODEAR1");
+        w.u32(1);
+        w.u64(want.len() as u64);
+        for (p, kind, c, m, t, attrs, data) in &want {
+            w.str(p);
+            kind.encode(&mut w);
+            w.u64(*c);
+            w.u64(*m);
+            w.u64(*t);
+            w.map(attrs);
+            w.bytes(data);
+        }
+        let mut out = w.into_bytes();
+        let sum = ::unafs::hash::hash_bytes(&out);
+        out.extend_from_slice(b"GEODEEND");
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    };
+    let measured = geodew::plan(&mut a, "/home/a").map(|p| p.archive_bytes).unwrap_or(0);
+    let mut stick: Vec<u8> = Vec::new();
+    let backed = geodew::backup_to(&mut a, "/home/a", &mut stick);
+    let fmt = backed.is_ok() && stick == reference;
+    let measured_ok = measured == stick.len() as u64;
+    // Restore into home b of the second volume.
+    let target = (|| -> Result<u64, FileSystemError> {
+        let root = b.superblock.root_inode;
+        let h = b.mkdir(root, "home".into())?;
+        b.mkdir(h, "b".into())
+    })();
+    let r1 = if target.is_ok() { geodew::restore(&mut b, &mut Bytes(&stick), "/home/b", false, &mut |_: u32, _: u32| {}) } else { Err("target") };
+    let mut got: Vec<GbRecord> = Vec::new();
+    let _ = b.resolve_path("/home/b").and_then(|id| gb_records(&mut b, id, "", &mut got));
+    let same_len = got.len() == want.len() && !want.is_empty();
+    let restore = r1.is_ok() && same_len && got.iter().zip(want.iter()).all(|(g, w)| g.0 == w.0 && g.1 == w.1 && g.6 == w.6);
+    let attrs = same_len && got.iter().zip(want.iter()).all(|(g, w)| g.5 == w.5);
+    let times = same_len && got.iter().zip(want.iter()).all(|(g, w)| (g.2, g.3, g.4) == (w.2, w.3, w.4));
+    let files = got.iter().filter(|g| g.1 == FileKind::File).count();
+    // A second restore into b: every top-level name is taken; nothing written.
+    let r2 = geodew::restore(&mut b, &mut Bytes(&stick), "/home/b", false, &mut |_: u32, _: u32| {});
+    let mut after: Vec<GbRecord> = Vec::new();
+    let _ = b.resolve_path("/home/b").and_then(|id| gb_records(&mut b, id, "", &mut after));
+    let refused_taken = (r2 == Err("taken") && after.len() == got.len()) as u32;
+    // A damaged archive (one data byte flipped) is refused before anything is written (its folder is not made).
+    let mut bad = stick.clone();
+    let mid = bad.len() / 2;
+    if let Some(x) = bad.get_mut(mid) {
+        *x ^= 0x40;
+    }
+    let r3 = geodew::restore(&mut b, &mut Bytes(&bad), "/home/c", true, &mut |_: u32, _: u32| {});
+    let corrupt = r3.is_err() && b.resolve_path("/home/c").is_err();
+    // A restore into a new folder.
+    let r4 = geodew::restore(&mut b, &mut Bytes(&stick), "/home/d", true, &mut |_: u32, _: u32| {});
+    let make = r4.is_ok_and(|r| r.files == 40);
+    serial_println!(
+        "[geodebackup] archive_bytes={} measured={} fmt={} restored={:?} corrupt={} make={} fsck={}",
+        stick.len(), if measured_ok { "ok" } else { "FAIL" }, if fmt { "ok" } else { "FAIL" }, r1.map(|r| (r.files, r.dirs, r.attrs, r.bytes)),
+        match r3 { Err(w) => w, Ok(_) => "ACCEPTED" }, if make { "ok" } else { "FAIL" },
+        if b.fsck(false).is_ok_and(|r| r.is_clean()) { "clean" } else { "FAIL" }
+    );
+    let pass = files == 40 && attrs && times && restore && refused_taken == 1 && fmt && measured_ok && corrupt && make;
+    serial_println!(
+        ":: GEODEBACKUP: files={} attrs={} times={} restore={} refused_taken={} -> {} ::",
+        files, if attrs { "ok" } else { "FAIL" }, if times { "ok" } else { "FAIL" }, if restore { "ok" } else { "FAIL" }, refused_taken,
+        if pass { "PASS" } else { "FAIL" }
     );
 }

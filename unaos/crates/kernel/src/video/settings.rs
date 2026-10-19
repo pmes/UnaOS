@@ -500,7 +500,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); hw_service(); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); hw_service(); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))] backup::service(); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -960,7 +960,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == PRIV_TAB => paint_privacy(st), // REASK (B681)
         t if t as usize == DT_TAB => paint_datetime(st), // TZLOCALE (B701)
         t if t as usize == KB_TAB => paint_keyboard(st), // KEYMAPS (B704)
-        t if t as usize == STORAGE_TAB => paint_storage(st), // SMARTLINE (B708)
+        t if t as usize == STORAGE_TAB => { paint_storage(st); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))] backup::paint(st); } // SMARTLINE (B708)
         t if t as usize == SEC_TAB => paint_security(st), t if t as usize == HW_TAB => paint_hardware(st), // AUTOLOCK (B712) · HWTAB (B737): the census list, its own tab. LINE-NEUTRAL fold
         _ => paint_about(st),
     }
@@ -1727,7 +1727,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         t if t == PRIV_TAB => press_privacy(row, cx), // REASK (B681)
         t if t == DT_TAB => press_datetime(row, cx), // TZLOCALE (B701)
         t if t == KB_TAB => press_keyboard(row, cx), // KEYMAPS (B704)
-        t if t == SEC_TAB => press_security(row, cx), t if t == HW_TAB => hw_press(row, cy, cx), // AUTOLOCK (B712) · HWTAB (B737): Refresh, or a device line copied to the console. LINE-NEUTRAL fold
+        t if t == SEC_TAB => press_security(row, cx), t if t == HW_TAB => hw_press(row, cy, cx), #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))] t if t == STORAGE_TAB => backup::press(row, cx), // AUTOLOCK (B712) · HWTAB (B737): Refresh, or a device line copied to the console. LINE-NEUTRAL fold
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -4056,7 +4056,7 @@ fn press_keyboard(row: usize, cx: usize) {
 // `drivers::ahci::smart`'s boot snapshot, copied under `try_lock` — the render task never issues a disk command.
 
 /// Cards the pane shows (three rows each, inside ROWS).
-const STORAGE_CARDS: usize = 3;
+const STORAGE_CARDS: usize = if cfg!(all(target_arch = "x86_64", feature = "wc", feature = "unafs")) { 2 } else { 3 }; // GEODEBACKUP (B740): rows 7..9 are the backup group under the knob
 
 /// One disk's card, as text: the head, the facts, the verdict and its level (0 not reported, 1 OK, 2 WARN).
 struct StorageCard {
@@ -4124,7 +4124,7 @@ fn paint_storage(st: &mut State) {
         txt_ink(st, LABEL_X, r + 2, &c.health, ink);
     }
     if cards.len() > shown {
-        txt2(st, LABEL_X, ROWS - 1, &alloc::format!("+{} more", cards.len() - shown));
+        txt2(st, LABEL_X, if cfg!(all(target_arch = "x86_64", feature = "wc", feature = "unafs")) { STORAGE_CARDS * 3 } else { ROWS - 1 }, &alloc::format!("+{} more", cards.len() - shown)); // GEODEBACKUP (B740): above the backup group
     }
 }
 // ── AUTOLOCK (rmbp-ledger B712, BP-bar-15/20) — the Security tab — TAIL-APPENDED, so no line above moves ──────────────
@@ -4654,4 +4654,182 @@ fn a11y_filter_moved() {
     super::theme::bump_epoch();
     let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
     super::screen::request_full_present();
+}
+// ── GEODEBACKUP (rmbp-ledger B740, BP-bar-1/14, BP-video-37) — Storage > Back up / Restore — TAIL-APPENDED ─────────────
+// Under the disk cards (two under this knob), three rows: `Back up Home to…` (it lists the writable removable volumes
+// whose free space holds the home's `.geode` archive, measured), `Restore from…` (it lists the `*.geode` files at the
+// sticks' roots; a pick unpacks into `<home>/Restored <stem>`, a taken name refused), and the note row (`Backing up:
+// 12 of 340 files`, then the outcome). The press only latches; the settings service pass submits the job to the
+// `geode` worker task (`fs::unafs::geodew::job`), never running it on the render task; the painter reads the job's
+// atomics and its model by `try_lock`. Versions are not carried (v1): the note says so after a backup.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))]
+pub(crate) mod backup {
+    use super::{btn_at, groups, mid_y, txt2, txt_ink, State, BTN_H, LABEL_X, ROWS};
+    use crate::fs::unafs::geodew::job::{self, Req, BACKING_UP, MEASURING, RESTORING};
+    use crate::video::theme;
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    /// The rows: Back up, Restore, the note (the pane's last three).
+    const R_BACK: usize = ROWS - 3;
+    const R_REST: usize = ROWS - 2;
+    const R_NOTE: usize = ROWS - 1;
+    const OPEN_W: usize = 200;
+    const PICK_W: usize = 170;
+    const SMALL_W: usize = 100;
+    /// At most this many volumes / archives are offered in a row.
+    const PICK_MAX: usize = 3;
+
+    /// Which list is open: 0 none, 1 the backup volumes, 2 the archives.
+    static PICK: AtomicU8 = AtomicU8::new(0);
+    /// What the press owes the service pass: 0 none, 1 survey, 2 back up to pick `ARG`, 3 restore pick `ARG`.
+    static OWED: AtomicU8 = AtomicU8::new(0);
+    static ARG: AtomicU8 = AtomicU8::new(0);
+    /// The job's `(generation, phase, done)` the pane last painted.
+    static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// The note row's text from the job's progress and its last outcome (one fn for the painter and the fixture).
+    pub fn note_of(phase: u8, done: u32, total: u32, said: &str) -> String {
+        match phase {
+            MEASURING => String::from("Measuring Home and the volumes…"),
+            BACKING_UP => format!("Backing up: {} of {} files", done, total),
+            RESTORING if total > 0 => format!("Restoring: {} of {} files", done, total),
+            RESTORING => String::from("Checking the archive…"),
+            _ => String::from(said),
+        }
+    }
+
+    /// The session's home as the mount table names it.
+    fn home() -> Option<(String, String)> {
+        #[cfg(feature = "login")]
+        {
+            let mut b = [0u8; 32];
+            let n = crate::arch::x86_64::syscall::session_name(&mut b)?;
+            let mut h = [0u8; crate::fs::users::HOME_MAX];
+            let k = crate::fs::users::home_of(&b[..n], &mut h)?;
+            let user = core::str::from_utf8(&b[..n]).ok()?;
+            let home = core::str::from_utf8(&h[..k]).ok()?;
+            return Some((String::from(user), String::from(home)));
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    fn mb(b: u64) -> u64 {
+        (b + 999_999) / 1_000_000
+    }
+
+    pub(super) fn paint(st: &mut State) {
+        let (phase, done, total, _) = job::progress();
+        let pick = PICK.load(Ordering::Relaxed);
+        let (vols, archives, need, surveyed, said) = match job::model() {
+            Some(m) => (
+                m.vols.iter().take(PICK_MAX).map(|(v, f)| format!("{} ({} MB free)", v, mb(*f))).collect::<Vec<_>>(),
+                m.archives.iter().take(PICK_MAX).map(|(v, f)| format!("{}: {}", v, f)).collect::<Vec<_>>(),
+                m.need,
+                m.surveyed,
+                m.said.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), 0, false, String::new()),
+        };
+        groups(st, &[(R_BACK, R_NOTE)]);
+        let busy = phase != job::IDLE;
+        let picker = |st: &mut State, r: usize, items: &[String], empty: &str| {
+            let y = mid_y(r, BTN_H);
+            if !surveyed {
+                txt2(st, LABEL_X, r, "Measuring…");
+                return;
+            }
+            if items.is_empty() {
+                txt2(st, LABEL_X + SMALL_W + 10, r, empty);
+            }
+            for (k, it) in items.iter().enumerate() {
+                btn_at(st, LABEL_X + k * (PICK_W + 10), y, PICK_W, it, false, false);
+            }
+            let x = if items.is_empty() { LABEL_X } else { LABEL_X + items.len() * (PICK_W + 10) };
+            btn_at(st, x, y, SMALL_W, "Cancel", false, false);
+        };
+        if pick == 1 && !busy {
+            let empty = if need == 0 { String::from("Home could not be measured") } else { format!("No removable volume has room for Home ({} MB)", mb(need)) };
+            picker(st, R_BACK, &vols, &empty);
+        } else {
+            btn_at(st, LABEL_X, mid_y(R_BACK, BTN_H), OPEN_W, "Back up Home to…", false, false);
+        }
+        if pick == 2 && !busy {
+            picker(st, R_REST, &archives, "No removable volume carries a .geode archive");
+        } else {
+            btn_at(st, LABEL_X, mid_y(R_REST, BTN_H), OPEN_W, "Restore from…", false, false);
+        }
+        let note = note_of(phase, done, total, &said);
+        if busy { txt_ink(st, LABEL_X, R_NOTE, &note, theme::text_primary()); } else { txt2(st, LABEL_X, R_NOTE, &note); }
+    }
+
+    /// A press in the Storage pane: only the two button rows act; the work is owed to [`service`].
+    pub(super) fn press(row: usize, cx: usize) {
+        if (row != R_BACK && row != R_REST) || cx < LABEL_X || job::progress().0 != job::IDLE {
+            return;
+        }
+        let x = cx - LABEL_X;
+        let want = if row == R_BACK { 1 } else { 2 };
+        let pick = PICK.load(Ordering::Relaxed);
+        if pick != want {
+            if x < OPEN_W {
+                PICK.store(want, Ordering::Relaxed);
+                job::stale();
+                OWED.store(1, Ordering::Release);
+            }
+        } else {
+            let n = job::model().map(|m| if want == 1 { m.vols.len() } else { m.archives.len() }.min(PICK_MAX)).unwrap_or(0);
+            let k = x / (PICK_W + 10);
+            if n > 0 && k < n && x % (PICK_W + 10) < PICK_W {
+                ARG.store(k as u8, Ordering::Relaxed);
+                OWED.store(if want == 1 { 2 } else { 3 }, Ordering::Release);
+                PICK.store(0, Ordering::Relaxed);
+            } else if (n == 0 && x < SMALL_W) || (n > 0 && k == n && x % (PICK_W + 10) < SMALL_W) {
+                PICK.store(0, Ordering::Relaxed);
+            }
+        }
+        super::repaint();
+    }
+
+    /// The settings service pass: submit what the press owes; repaint while the job moves.
+    pub(super) fn service() {
+        let owed = OWED.swap(0, Ordering::AcqRel);
+        if owed != 0 {
+            let r = match home() {
+                None => Err("no-session"),
+                Some((user, home)) => {
+                    let k = ARG.load(Ordering::Relaxed) as usize;
+                    let req = match owed {
+                        1 => Some(Req::Survey { home }),
+                        2 => job::model().and_then(|m| m.vols.get(k).map(|(v, _)| v.clone())).map(|vol| Req::Backup { home, user, vol }),
+                        _ => job::model().and_then(|m| m.archives.get(k).cloned()).map(|(vol, file)| Req::Restore { home, vol, file }),
+                    };
+                    match req {
+                        Some(q) => job::submit(q),
+                        None => Err("gone"),
+                    }
+                }
+            };
+            if let Err(w) = r {
+                serial_println!("[backup] ask={} -> refused:{}", owed, w);
+                if let Some(mut m) = job::model() {
+                    m.said = format!("Not started: {}", w);
+                    m.surveyed = true;
+                }
+                PICK.store(0, Ordering::Relaxed);
+            }
+            super::repaint();
+        }
+        if !super::is_open() || super::cur_tab() != super::STORAGE_TAB {
+            return;
+        }
+        let (phase, done, _, g) = job::progress();
+        let key = ((g as u64) << 40) | ((phase as u64) << 32) | done as u64;
+        if SEEN.swap(key, Ordering::Relaxed) != key {
+            super::repaint();
+        }
+    }
 }
