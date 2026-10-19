@@ -1,0 +1,13 @@
+[package]
+name = "sbc_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "A2DP (rmbp-ledger B739): the SBC encoder (the A2DP mandatory codec) written from the A2DP specification's SBC chapter and appendix — 4/8-subband analysis filter, scale factors, joint stereo, loudness/SNR bit allocation, the frame CRC — no_std, no alloc, shared by Ring 0 and Ring 3."
+
+# A2DP (B739, R83): `#![no_std]`, no `alloc`, `#![forbid(unsafe_code)]`, and NO dependencies — the vp9_core shape: a
+# member of the ROOT host workspace (`cargo test -p sbc_core` runs the KAT and the round trip). The kernel does not
+# take a Cargo dependency on it: `drivers/bt/avdtp.rs` includes `src/sbc.rs` by `#[path]` (the `install/abimage.rs`
+# -> `bootloader/src/kelfsha.rs` shape), so ONE source is the encoder in both places and the kernel's Cargo.toml is
+# untouched. Integer arithmetic only (the kernel target is soft-float).
+[dependencies]
