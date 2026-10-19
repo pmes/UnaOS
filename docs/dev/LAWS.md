@@ -103,7 +103,14 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 ## 3. Arcs, git, lanes
 
 - **One arc per session, multi-milestone,** each green and committed before the next; no adjacent
-  improvements. DONE gate: the brief's outputs, `./arroyo check` both arches, the track's OWN-BOARD QEMU suite
+  improvements.
+- **The blueprint is the front gate** (Peter 2026-10-19: "a set of blueprints … to keep the os architecture
+  stable and work as a front-side gate so that coding efforts are not wasted on some accidental tangent"; "only
+  what's necessary is contextualized"). `docs/dev/blueprint/` holds one short sheet per subsystem with its
+  invariants (`BP-<sheet>-<n>`, each anchored `path:line`). A brief names the sheets its arc touches; the seat and
+  the executor read only those before the first edit; an invariant changes only by an arc that says so and edits
+  the sheet in the same commit. GATE-BLUEPRINT (`./arroyo gates`) holds the sheets to the tree: anchors exist,
+  ids unique, sheets listed and short, no claim words. DONE gate: the brief's outputs, `./arroyo check` both arches, the track's OWN-BOARD QEMU suite
   once per staged image, the named doc update.
 - **Commit only on your own track or executor branch.** Message `subsystem: imperative summary`
   plus the model's `Co-Authored-By`; a message carrying code goes through `git commit -F`.

@@ -50,4 +50,12 @@ MANDATORY HEAD (docs/dev/EXECUTOR-BRIEF.md):
    expects to find again) is Principia's: it goes in Principia's store, never a new `<home>/.name`
    file — the gate reds a dotfile literal with no allowlist row. If the owner is live on the host and
    you are not sharing its core, STOP and say so in your design before writing the duplicate.
+12. THE BLUEPRINT IS THE FRONT GATE (GATE-BLUEPRINT; Peter, 2026-10-19: "a set of blueprints for you and the
+   executors to look over … a front-side gate so that coding efforts are not wasted on some accidental tangent" /
+   "only what's necessary is contextualized"): `docs/dev/blueprint/INDEX.md` lists one SHEET per subsystem. The
+   brief names the 1-3 sheets the arc touches; read ONLY those, whole, before the first edit. Every `BP-<sheet>-<n>`
+   on them is an invariant you KEEP unless the brief says the arc CHANGES it — then the arc edits the sheet in the
+   same commit (the new anchor, the R-id or the seat's line). REPORT's second line:
+   `blueprint: <sheets> kept=<ids> changed=<ids|none>`. Anything the brief and the sheets do not name is a tangent:
+   STOP, report it as a one-line proposal, do not build it.
 ```

@@ -22,7 +22,9 @@ worktree `../UnaOS` (main), tracks `../UnaOS-orin` (hw-jetson), `../UnaOS-hw-pi4
 ## 1. Work a queue item with an executor
 1. Cut a branch and worktree from the track tip:
    `git -C ../UnaOS-orin worktree add ~/unaos-bench/scratch/<name> -b exec-<platform>-<name> <track-tip>`
-2. Brief = the EXECUTOR-BRIEF head verbatim (fill track, tip, who, ledger id) + intent, invariants, anchors
+2. Brief = the EXECUTOR-BRIEF head verbatim (fill track, tip, who, ledger id) + the BLUEPRINT SHEETS the arc
+   touches (`docs/dev/blueprint/INDEX.md`; 1-3 sheets, the BP-ids it keeps and the ones it changes — the seat reads
+   them first, the front gate, measure twice) + intent, invariants, anchors
    (file:line), the DONE gate as a numbered command list with `cmd > log 2>&1; echo rc=$?`, the files it may
    touch, the ledger row it opens (next free `A<n>` in the arch ledger or `SO<n>` in LEDGER.md — grep both
    branches first), and "report by final message: sha, parent, `git show --stat`, rc list, wire shape".
