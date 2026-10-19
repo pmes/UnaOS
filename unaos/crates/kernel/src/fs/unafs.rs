@@ -3451,7 +3451,7 @@ pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
     let slot = ::unafs::KeySlot::parse(&b0).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?.ok_or(MountError::NoVolume)?;
     let key = slot.unwrap(u).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?;
     let dev = SdSectorDevice::open_on(handle)?;
-    let mut fs = Some(UnaFS::mount_with_key(BlockAdapter::for_partition(dev, &span), &key).map(versions_armed).map_err(MountError::Fs)?);
+    let mut fs = Some(UnaFS::mount_with_key(BlockAdapter::for_partition(dev, &span), &key).map(versions_armed).map_err(|e| { if let FileSystemError::Incompatible(bits) = &e { serial_println!("[unafs] mount refused incompat={:#x}", bits); } MountError::Fs(e) })?); // ROOTINCOMPAT (SR159): the keyed mount says the refusal too
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
         return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait, as every MOUNT taker on the render task

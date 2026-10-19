@@ -635,10 +635,10 @@ refs/heads/exec-rmbp-micstage       0d9e2b5d FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-geodemod       3bbd2569 IN-FLIGHT cloud wave36 GEODEMOD
 refs/heads/exec-rmbp-filesearch2    3bbd2569 IN-FLIGHT cloud wave36 FILESEARCH2
 refs/heads/exec-rmbp-prefstests     f572fd8e FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-helpf1         3bbd2569 IN-FLIGHT cloud wave36 HELPF1
-refs/heads/exec-rmbp-trashtoast     3bbd2569 IN-FLIGHT cloud wave36 TRASHTOAST
+refs/heads/exec-rmbp-helpf1         87039314 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-trashtoast     880decfa FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-lockprefs      7527d4c8 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-rootincompat   3bbd2569 IN-FLIGHT cloud wave36 ROOTINCOMPAT
+refs/heads/exec-rmbp-rootincompat   f286ce55 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-qvbar          eaf30444 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-softymic       3bbd2569 IN-FLIGHT cloud wave36 SOFTYMIC
 refs/heads/exec-rmbp-a2dpknob       1fbef588 IN-FLIGHT cloud wave36 A2DPKNOB
