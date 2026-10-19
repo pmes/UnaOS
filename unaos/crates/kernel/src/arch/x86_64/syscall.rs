@@ -31463,7 +31463,7 @@ pub fn launch_depth(handle: u64) -> u32 {
 //   SLOT_GEN), with `pipe_alive` as the liveness compare the device-service tick runs to reap a stream whose owner
 //   exited — the same (row, generation) pair B609's pipes are reclaimed by, never a hook in the teardown.
 // * The PCM is copied in through `copy_from_user` (the whole range validated first), at most AUDIO_WRITE_MAX per call.
-// * Without UNAOS_HDATONE (`hda-tone`) this kernel has no output stream: the open is refused BY NAME,
+// * AUDIOMIX (B731): the verbs land in `audio::mixer`'s `r3_*` doors, one mixer source per program. Without `hda-tone` or `uvc` the open is refused BY NAME,
 //   `refused=no-hda-stream`, -ENODEV, and the other three verbs answer -EBADF (no handle can exist).
 // =================================================================================================
 
@@ -31476,9 +31476,9 @@ fn audio_pid(row: usize) -> u64 {
 fn sys_audio_open(rate: u64, ch: u64, bits: u64) -> i64 {
     let row = caller_row();
     let pid = audio_pid(row);
-    #[cfg(feature = "hda-tone")]
+    #[cfg(any(feature = "hda-tone", feature = "uvc"))]
     {
-        match crate::drivers::hda::play::r3_open(row, pipe_gen(row), pipe_alive, pid, rate, ch, bits) {
+        match crate::audio::mixer::r3_open(row, pipe_gen(row), pipe_alive, pid, rate, ch, bits) {
             Ok(h) => {
                 serial_println!("[audio] open pid={} rate={} ch={} bits={} -> ok handle={}", pid, rate, ch, bits, h);
                 h as i64
@@ -31489,7 +31489,7 @@ fn sys_audio_open(rate: u64, ch: u64, bits: u64) -> i64 {
             }
         }
     }
-    #[cfg(not(feature = "hda-tone"))]
+    #[cfg(not(any(feature = "hda-tone", feature = "uvc")))]
     {
         serial_println!("[audio] open pid={} rate={} ch={} bits={} -> refused=no-hda-stream (this kernel was built without UNAOS_HDATONE)", pid, rate, ch, bits);
         una_abi::ENODEV
@@ -31498,7 +31498,7 @@ fn sys_audio_open(rate: u64, ch: u64, bits: u64) -> i64 {
 
 /// STRIAMETAL: `SYS_AUDIO_WRITE(handle, buf, len)` — PCM in (`len == 0` = end of stream).
 fn sys_audio_write(handle: u64, buf: u64, len: u64) -> i64 {
-    #[cfg(feature = "hda-tone")]
+    #[cfg(any(feature = "hda-tone", feature = "uvc"))]
     {
         let row = caller_row();
         let n = (len as usize).min(una_abi::AUDIO_WRITE_MAX);
@@ -31508,9 +31508,9 @@ fn sys_audio_write(handle: u64, buf: u64, len: u64) -> i64 {
                 return e;
             }
         }
-        crate::drivers::hda::play::r3_write(handle, row, pipe_gen(row), &k)
+        crate::audio::mixer::r3_write(handle, row, pipe_gen(row), &k)
     }
-    #[cfg(not(feature = "hda-tone"))]
+    #[cfg(not(any(feature = "hda-tone", feature = "uvc")))]
     {
         let _ = (handle, buf, len);
         una_abi::EBADF
@@ -31519,12 +31519,12 @@ fn sys_audio_write(handle: u64, buf: u64, len: u64) -> i64 {
 
 /// STRIAMETAL: `SYS_AUDIO_CLOSE(handle)` — stop now, free the output.
 fn sys_audio_close(handle: u64) -> i64 {
-    #[cfg(feature = "hda-tone")]
+    #[cfg(any(feature = "hda-tone", feature = "uvc"))]
     {
         let row = caller_row();
-        crate::drivers::hda::play::r3_close(handle, row, pipe_gen(row))
+        crate::audio::mixer::r3_close(handle, row, pipe_gen(row))
     }
-    #[cfg(not(feature = "hda-tone"))]
+    #[cfg(not(any(feature = "hda-tone", feature = "uvc")))]
     {
         let _ = handle;
         una_abi::EBADF
@@ -31533,12 +31533,12 @@ fn sys_audio_close(handle: u64) -> i64 {
 
 /// STRIAMETAL: `SYS_AUDIO_POS(handle, what)` — frames played (the A/V clock) or the underrun count.
 fn sys_audio_pos(handle: u64, what: u64) -> i64 {
-    #[cfg(feature = "hda-tone")]
+    #[cfg(any(feature = "hda-tone", feature = "uvc"))]
     {
         let row = caller_row();
-        crate::drivers::hda::play::r3_pos(handle, row, pipe_gen(row), what)
+        crate::audio::mixer::r3_pos(handle, row, pipe_gen(row), what)
     }
-    #[cfg(not(feature = "hda-tone"))]
+    #[cfg(not(any(feature = "hda-tone", feature = "uvc")))]
     {
         let _ = (handle, what);
         una_abi::EBADF

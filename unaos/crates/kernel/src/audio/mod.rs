@@ -15,9 +15,14 @@
 //!   build-time 440 Hz / 1 s and its own `:: HDA-TONE ::` verdict); the USB sink is fed here, an integer sine written
 //!   into the class driver's ring (`drivers::usb::uac::write`) at the rate the isochronous stream drains it.
 //! * The USB sink registers itself when its stream starts ([`usb_arrived`]) and leaves with the device ([`usb_gone`]).
+//! * AUDIOMIX (rmbp-ledger B731): [`mixer`] is the sink's one producer — N sources (a ring-3 program's
+//!   `SYS_AUDIO_*` stream, a kernel source), each PCM16/2/48k with its own gain, mixed per 10 ms period with the
+//!   master volume and mute into the current sink (the USB ring, or the HDA output stream through `hda::play`'s door).
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+
+pub mod mixer;
 
 /// Where sound goes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,7 +153,7 @@ fn usb_tone(_hz: u32, _ms: u32) -> Result<(u64, u32), &'static str> {
 }
 
 /// Q15 sine of `phase` in 1/1024 turns: a 5th-order odd polynomial on the first quadrant, mirrored (no float).
-#[cfg(feature = "uvc")]
+/// AUDIOMIX (B731): also the mixer's test tones (`mixer::selftest`), so it is built with either path.
 fn sin_q15(phase: u64) -> i32 {
     const Q: u64 = 256;
     let p = phase % (4 * Q);
