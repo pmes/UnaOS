@@ -23,7 +23,7 @@
 | BP-gates-11 | On the rMBP track the gate is the compile legs plus the doc gates; QEMU legs are not run per arc (R78, R113; R114 a one-time exception). The metal boot is the proof. | R78, R113, R114 (`docs/dev/RULINGS.md`) | review |
 | BP-gates-12 | The design is written in the commit body BEFORE the code; the executor compiles what it touched and runs `./arroyo gates` (R106). | R106; `docs/dev/PLAYBOOK.md:32-35` | review |
 | BP-gates-13 | No fn reachable from the `video/` furniture (menubar, dock, crystal, notify, strip, settings, login) calls `smolnet`, `net_fetch`, `net_dns` or `netring3`, save a local read-only accessor on the gate's ALLOW table with its reason (BP-bar-10). | `unaos/scripts/nonet-check.py:29-34` | `gates` row `nonet` (a call walk over `use` aliases and paths; control: a synthetic dock -> helper -> `smolnet` chain) |
-| BP-gates-14 | The ABI gate is a COMMITTED binary, not a rebuild: fixtures/ABIPROBE-v&lt;N&gt;.ELF with its `.sha256` pin; the builder refuses to stage a fixture whose bytes left the pin, and `tests abielf` runs what it staged. A fixture is never re-built in place; an ABI bump adds one (BP-ring3-15). | `unaos/builder/src/main.rs:59`; `unaos/fixtures/ABIPROBE-v1.ELF.sha256`; `unaos/crates/kernel/src/tests.rs:802` | the builder's pin assert; `tests abielf` |
+| BP-gates-14 | No fn anywhere under `video/` REACHES an outbound act — a socket opened, an active connect, the stack's outbound ledger (BP-net-11), a DNS query built, `http_core`/`tls_core` — through path calls into any module, net modules included (a read-only accessor is reached freely; the act is the sink, not the module name); a user verb's entry would sit on the gate's BOUNDARY table with its reason (none today) (BP-bar-10). | `unaos/scripts/nonet-reach.py:1-30` | `gates` row `nonetreach` (`NONET-REACH: roots= edges= reach=0 -> PASS`; control: a synthetic dock -> helper -> socket-open tree and a DNS alias, judged exactly; plant: a video fn -> a helper outside `video/` -> `smolnet::stack_open_tcp`) |
 
 ## 3. The host gates (`GATES_SET`, `unaos/arroyo:14279`)
 | row | script | holds |
@@ -44,6 +44,7 @@
 | mbench-selftest, specscore | `unaos/scripts/mbench.py`, `unaos/scripts/orin-specscore.py` | the scorers' self-tests |
 | blueprint (added by `dee2d6ed`) | `unaos/scripts/blueprint-check.py` | these sheets: anchors exist, ids unique and stem-named, sheets listed, ≤ 120 lines, no claim words |
 | nonet (B672) | `unaos/scripts/nonet-check.py` | BP-gates-13 |
+| nonetreach (B697) | `unaos/scripts/nonet-reach.py` (imports nonet-check.py's walker) | BP-gates-14 |
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
 `check` · `state` · `gates [--list|--selftest]` · `test` / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·

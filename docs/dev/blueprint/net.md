@@ -22,6 +22,7 @@
 | BP-net-10 | The entropy source (RDRAND/RNDR or a declared timer-jitter fallback) is said once per boot; a DRBG sits on top for ring 3. | `unaos/crates/kernel/src/lib.rs:112`; `unaos/crates/kernel/src/netring3.rs:13-20` | `[rand] source=` line |
 | BP-net-11 | Every outbound connect/send the stack counts names its starter: the sending task's open `net_tick::scope` (DHCP, the SOCK ladder, SNTP; a routed shell verb as `fetch`/`shell`; ring 3's resolve as `ring3`), else the site's own name (a ring-3-owned socket is `ring3`), else `nobody`, which stays 0 after login with no user verb (BP-bar-1). x86 counts at smolnet's `stack_connect`/`stack_sendto_inner`/`stack_send`; aarch64 NET6 at the SNTP/DNS builders. | `unaos/crates/kernel/src/net_tick.rs:111-123` `unaos/crates/kernel/src/net_tick.rs:282` | `tests idlenet` (`:: IDLENET: window_s=60 connects= unattributed=0 sends= -> PASS ::`) |
 | BP-net-12 | A ring-3 socket reaches the stack only through the user's grant (BP-security-16): x86 `sys_connect`/`sys_sendto` call `apptrust::net_gate` before `smolnet::stack_connect`/`stack_sendto`; while the ask is up the door answers the verb's own retry word (`-EINPROGRESS`/`-EAGAIN`) with nothing queued, a refusal is `-EPERM`. Kernel sockets (owner `usize::MAX`) and the kernel resolver are not gated. | `unaos/crates/kernel/src/arch/x86_64/syscall.rs:9357` `unaos/crates/kernel/src/arch/x86_64/syscall.rs:9437`; `unaos/crates/kernel/src/fs/apptrust.rs:748` | `tests netgrant`; wire `[net] grant app= dst= decision=<once,always,never,asked>` |
+| BP-net-13 | smoltcp's one outbound-connect point on x86, `smolnet::stack_connect`'s SYN, says its cause there: `[net] connect cause=<verb or sntp or dns or dhcp or none> dst=<ip:port> by=<starter>`, the cause read back from the ledger slot that SYN moved (BP-net-11's rule); the starter-to-cause match is exhaustive (a new starter, e.g. the owed update stage, gets a cause before it compiles). `none` stays 0 after login with no user verb (BP-bar-10). The hand-rolled stack's `drivers/e1000.rs` connect (`nc`, `curl`, the SOCK ladder's inline drive) is not on it: verb-only, uncounted (B672). | `unaos/crates/kernel/src/smolnet.rs:2292-2328` | `tests notelemetry [secs]` (`:: NOTELEMETRY: connects= uncaused=0 window_s= -> PASS ::`) |
 
 ## 3. Seams
 - Net may call: the NIC drivers through `RawNic`, `usbnet_core`, `wifi_core`, `http_core`/`tls_core` (ring-3 side), `rand`.
@@ -29,7 +30,7 @@
 - NIC drivers sit under the services gate (BP-net-4) and the xHCI placement rule (cores.md BP-cores-1).
 
 ## 4. Wire
-`[net] …` · `[usbnet] …` · `[idlenet] boot|window by=` · `:: IDLENET: …` · `:: NICABSENT: …` · `[rand] source=` · `:: wifi2: upload verify words=…` (ST1, f13) · `:: wifi9: end … shm-ctl-restored=` · `:: wifi10: … tx= heard= ::` · `:: NET6: fixture: n/n` (aarch64).
+`[net] …` · `[usbnet] …` · `[idlenet] boot|window by=` · `:: IDLENET: …` · `[net] connect cause= dst= by=` · `[notelemetry] boot|window` · `:: NOTELEMETRY: …` · `:: NICABSENT: …` · `[rand] source=` · `:: wifi2: upload verify words=…` (ST1, f13) · `:: wifi9: end … shm-ctl-restored=` · `:: wifi10: … tx= heard= ::` · `:: NET6: fixture: n/n` (aarch64).
 
 ## 5. Ruled, unbuilt / open
 - NETCORE (the hand-rolled stack as the default): gated on R111's condition.

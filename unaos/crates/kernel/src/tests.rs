@@ -173,7 +173,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -1425,4 +1425,81 @@ fn netgrant_selftest() {
 #[cfg(feature = "uvc")]
 fn uac1_fixture() {
     crate::drivers::usb::uac::fixture();
+}
+
+// NOTELEMETRY (rmbp-ledger B697, BP-bar-10, BP-net-11) — TAIL-APPENDED. `tests notelemetry [secs]`: every outbound
+// connect over an idle window after login carries a cause (`smolnet::connect_said` says each as `[net] connect cause=
+// dst= by=`); a connect with none fails it. Registered beside `tests sock` (the verb only; the window sleeps on the
+// shell job). The window scales: 60 s on QEMU, `tests notelemetry 3600` on the bench (BP-bar-10's hour).
+// Wire: `[notelemetry] boot …`, `[notelemetry] window …`, `:: NOTELEMETRY: connects=<n> uncaused=<n> window_s=<n> -> PASS|FAIL ::`.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn notelemetry_selftest() {
+    use crate::net_tick::{Who, LEDGER};
+    let window_s = arg().and_then(|a| a.parse::<u64>().ok()).filter(|s| (1..=3600).contains(s)).unwrap_or(crate::net_tick::IDLE_WINDOW_S);
+    // Control: the cause of a one-connect delta in every ledger slot, against this table (a wrong row is a FAIL).
+    let zero = {
+        let mut c = LEDGER.census();
+        c.conn.iter_mut().for_each(|v| *v = 0);
+        c.send.iter_mut().for_each(|v| *v = 0);
+        c
+    };
+    let nobody = zero.conn.len() - 1;
+    let want: [(usize, &str); 8] = [
+        (Who::Dhcp as usize, "dhcp"),
+        (Who::Dns as usize, "dns"),
+        (Who::Sntp as usize, "sntp"),
+        (Who::Fetch as usize, "verb"),
+        (Who::Witness as usize, "verb"),
+        (Who::Ring3 as usize, "verb"),
+        (Who::Shell as usize, "verb"),
+        (nobody, "none"),
+    ];
+    let one = |i: usize, n: u64| {
+        let mut d = zero;
+        d.conn[i] = n;
+        d
+    };
+    let ok = want.iter().filter(|(i, c)| crate::smolnet::connect_cause(&one(*i, 1)).0 == *c).count()
+        + (crate::smolnet::connect_cause(&zero).0 == "none") as usize;
+    let rows = want.len() + 1;
+    if ok != rows || want.len() != zero.conn.len() {
+        serial_println!(":: NOTELEMETRY: control table={}/{} slots={} -> FAIL ::", ok, rows, zero.conn.len());
+        return;
+    }
+    if !crate::boot::desktop() {
+        serial_println!(":: NOTELEMETRY: window_s={} -> SKIP reason=no-session ::", window_s);
+        return;
+    }
+    if crate::arch::sched::current_id().is_none() {
+        serial_println!(":: NOTELEMETRY: window_s={} -> SKIP reason=not-a-task (the window sleeps; the shell job is a task) ::", window_s);
+        return;
+    }
+    let boot = LEDGER.census();
+    serial_println!("[notelemetry] boot by={} table={}/{} (connects/sends since boot, by starter)", boot.by(), ok, rows);
+    let t0 = crate::arch::ms();
+    while crate::arch::ms().saturating_sub(t0) < window_s * 1000 {
+        crate::arch::sched::sleep_ms(1000);
+    }
+    let w = LEDGER.census().since(&boot);
+    let mut causes: [(&str, u64); 6] = [("verb", 0), ("sntp", 0), ("dns", 0), ("dhcp", 0), ("update", 0), ("none", 0)];
+    for i in 0..w.conn.len() {
+        let c = crate::smolnet::connect_cause(&one(i, 1)).0;
+        if let Some(e) = causes.iter_mut().find(|e| e.0 == c) {
+            e.1 += w.conn[i];
+        }
+    }
+    let mut cs = alloc::string::String::new();
+    for (k, (c, n)) in causes.iter().enumerate() {
+        cs.push_str(&alloc::format!("{}{}:{}", if k > 0 { "," } else { "" }, c, n));
+    }
+    let connects: u64 = w.conn.iter().sum();
+    let uncaused = w.conn[nobody];
+    serial_println!("[notelemetry] window causes={} by={} counted_at=smolnet:stack_connect", cs, w.by());
+    serial_println!(
+        ":: NOTELEMETRY: connects={} uncaused={} window_s={} -> {} ::",
+        connects,
+        uncaused,
+        window_s,
+        if uncaused == 0 { "PASS" } else { "FAIL" }
+    );
 }
