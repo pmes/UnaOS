@@ -17,7 +17,8 @@ Companion documents: the B+tree node (`btree.md`, referenced from §R11a), the p
 * Block size 4096 B, fixed (`Superblock.block_size` must be 4096). Block `n` lives at byte
   `n × 4096` of the volume (the partition, or the whole disk on a superfloppy; a partition adapter
   remaps, it never re-encodes).
-* Block 0 — the superblock (§R2) at byte 0, zero padding to 4096.
+* Block 0 — the superblock (§R2) at byte 0, zero padding to 4096; on a KEYED volume the key slot
+  (§R2a) at byte 512 (sector 1). Zero bytes at 512 = unkeyed (every volume before VOLKEY).
 * Block 1 — the two root slots: slot A = sector 0 (bytes 0..512), slot B = sector 1 (512..1024),
   each a root record (§R12) at the sector's head, zero padding. Bytes 1024..4096 are zero.
 * Every other block is reached from the active root: map leaves and index nodes (§R13), inode
@@ -88,6 +89,52 @@ migration rewrites `version` (with root flag MIGRATE). The superblock is all fix
 of any 37 bytes succeeds — validity is the magic + version + geometry check, never the decode.
 KAT: `Superblock::new(4096)` v7 = `554e414653 07000000 00100000 0010000000000000 0100000000000000
 0200000000000000`.
+
+## §R2a Key slot (block 0, sector 1, 184 bytes; VOLKEY, rmbp-ledger B684)
+
+Hand-packed (not a §R1 record), little-endian, magic-discriminated; written by
+`UnaFS::set_key_slot` (`unafs::keyslot`), never by format. Its presence makes the volume KEYED:
+`UnaFS::mount` refuses it (`KeyRequired`) after reading block 0 and before reading anything else;
+`UnaFS::mount_with(Unlock::Password | Unlock::Recovery)` opens it only when the key unwraps the data
+key. The superblock version does NOT change (a keyed volume is still v7, BP-storage-6): an older
+reader ignores sector 1 and mounts the volume — true at M1 because the data blocks are plaintext;
+M2's cipher will need its own INCOMPAT stamp (the seat's decision, see below).
+
+| off | len | field | notes |
+| ---: | ---: | :--- | :--- |
+| 0 | 8 | magic | `"UNAFSKS1"` |
+| 8 | 4 | version `u32` | 1; any other is refused (`Unsupported`) |
+| 12 | 4 | cipher `u32` | 0 = none (M1: data blocks plaintext); 1 = AES-256-XTS (M2, reserved — this build refuses it) |
+| 16 | 4 | kdf `u32` | 2 = Argon2id v1.3 |
+| 20 | 4 | m_kib `u32` | Argon2 memory, 19456..=65536 (SYS_KDF's bounds; a hostile slot cannot ask for more) |
+| 24 | 4 | t `u32` | passes, 2..=10 |
+| 28 | 4 | p `u32` | lanes, 1..=8, m ≥ 8p |
+| 32 | 16 | salt | password KDF salt (random) |
+| 48 | 12 | pw_nonce | ChaCha20-Poly1305 nonce (random) |
+| 60 | 32 | pw_wrapped | data key under KEK_pw |
+| 92 | 16 | pw_tag | Poly1305 tag |
+| 108 | 16 | rc_salt | recovery HKDF salt (random) |
+| 124 | 12 | rc_nonce | nonce (random) |
+| 136 | 32 | rc_wrapped | data key under KEK_rc |
+| 168 | 16 | rc_tag | Poly1305 tag |
+
+* Data key: 32 random bytes per volume (the kernel's DRBG; the host's `/dev/urandom`). Never on disk,
+  never on the wire; an unwrapped key (`VolumeKey`) is wiped on drop. M2 expands it by HKDF into
+  XTS's two 256-bit keys.
+* KEK_pw = Argon2id(password, salt, m_kib, t, p) → 32 B — the `crypto_core::argon2` call `SYS_KDF`'s
+  body makes (`tests volkey` checks the two agree). AAD = `"UnaFS volkey password v1"` ‖ bytes 0..48.
+* Recovery key: 24 words from `unafs::keyslot::WORDS` (256 words, one per byte; sorted; unique in
+  the first four letters, so a word may be typed cut to four) = 22 random bytes ‖ the first 2 bytes of
+  SHA-256(`"UnaFS volkey words v1"` ‖ those 22). KEK_rc = HKDF-SHA256(salt = rc_salt, ikm = the 22
+  bytes, info = `"UnaFS volkey recovery v1"`). AAD = that info ‖ bytes 0..48 ‖ rc_salt. A checksum
+  miss is refused before any key work (`BadRecovery`); a wrong key of either kind, and any edit of
+  bytes 0..48 or of a wrap, fails the tag (`KeyRefused`, one answer).
+* Writing: block 0 is rewritten whole with sector 0 byte-identical, then flushed; every later
+  rewrite of block 0 (GROW, the v6→v7 migration) is built by the same `block0` and keeps the slot.
+* What M1 is NOT: the data blocks are plaintext, so a raw read of the medium sees them, and erasing
+  sector 1 makes the volume mount unkeyed. The slot gates every reader that goes through the crate
+  (the kernel, `tools/unafs`, the installer). M2 (per-block AES-256-XTS, tweak = block number) closes
+  both; `crypto_core` has AES-256 (`aes::Aes`, forward and inverse) but no XTS mode yet.
 
 ## §R3 Inode block (one 4096 B block per inode)
 
