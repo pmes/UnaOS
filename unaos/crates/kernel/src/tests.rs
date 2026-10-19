@@ -2067,12 +2067,12 @@ fn autolock_selftest() {
     let reopened = entered && !lock::active() && !login::is_open() && is_una(&mut nb); let (painted, hole_ms) = lock2_unlocked(l2); let resumed = lock::last_resumed(); // LOCK2 (B728): it paints within one frame of the unlock, then is closed before the fingerprint (file tail). LINE-NEUTRAL fold, code first.
     let after = lock::fingerprint();
     let same = before == after;
-    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); // LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0; // LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
+    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let deleted = lockdeleted_leg(); // PREFSDELETED (B755): a deleted lock domain is the lock's defaults within one pass (file tail). LOCKPREFS (B748): LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && deleted.0; // PREFSDELETED (B755): + the deleted-domain leg. // LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
-        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={}",
+        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} deleted={}",
         entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
-        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8
+        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8, deleted.1
     );
 }
 
@@ -4744,4 +4744,50 @@ fn softymic_selftest() {
         ":: SOFTYMIC: on={} off={} looks={} privacy={} -> {} :: live={} ::",
         yn(on), yn(off), looks, yn(privacy), if pass { "PASS" } else { "FAIL" }, live
     );
+}
+
+
+// PREFSDELETED (rmbp-ledger B755, BP-security-18) — TAIL-APPENDED, so no line above moves. `tests autolock`'s `deleted=`
+// leg, folded onto its lines after `prefs=`: a settings domain the user deletes resets its keys to their defaults (R98's
+// delete watch) AND posts a PrefChanged per cleared key, so the lock re-reads in ONE `lock::prefs_pass` with no clock
+// poll. The fixture keeps the lock domain's file bytes, writes `system.lock.after_idle_min` over the bus client to a
+// non-default (1440, or 1439 when the operator already holds 1440; no idle stretch reaches it), lets the lock take it,
+// deletes the domain file as Quarry would and runs THE delete watch (`prefs::delete_domain_watched`), runs ONE
+// `prefs_pass` and asks `lock::policy()` for the three defaults (10, on, on); then the file is put back byte for byte
+// (`prefs::restore_domain`, which posts its keys) and the lock is asked to follow back to the operator's policy.
+// `deleted=ok` = the defaults seen in one pass and the operator's policy back; `deleted=skip` (home not writable, or the
+// domain not on disk / held) does not fail the line; anything else is `deleted=FAIL`.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn lockdeleted_leg() -> (bool, &'static str) {
+    use crate::prefs::key;
+    use crate::prefs_client::{pref_set, PrefValue};
+    use crate::video::lock;
+    if crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()).is_some() {
+        serial_println!("[lock] deleted leg skipped: the home is not writable");
+        return (true, "skip");
+    }
+    let d = crate::prefs::domain_of_key(crate::prefs::NS, key::LOCK_AFTER_IDLE_MIN);
+    let _ = lock::prefs_pass();
+    let orig = lock::policy();
+    let Some(bytes) = crate::prefs::domain_bytes(&d) else {
+        serial_println!("[lock] deleted leg skipped: settings/{} is not on disk (or held)", d);
+        return (true, "skip");
+    };
+    let want: u32 = if orig.0 == 1440 { 1439 } else { 1440 };
+    let set_ok = pref_set(crate::prefs::NS, key::LOCK_AFTER_IDLE_MIN, PrefValue::Int(want as i64)).is_ok();
+    let _ = lock::prefs_pass();
+    let moved = lock::policy().0 == want;
+    let gone = crate::prefs::delete_domain_watched(&d);
+    let reread = lock::prefs_pass();
+    let seen = lock::policy();
+    let defaults = seen == (lock::IDLE_MIN_DEFAULT as u32, true, true);
+    let back_ok = crate::prefs::restore_domain(&d, &bytes);
+    let _ = lock::prefs_pass();
+    let restored = lock::policy() == orig;
+    let ok = set_ok && moved && gone && defaults && back_ok && restored;
+    serial_println!(
+        "[lock] deleted leg domain={} want={} moved={} gone={} reread={} seen={}/{}/{} restored={} -> {}",
+        d, want, moved as u8, gone as u8, reread as u8, seen.0, seen.1 as u8, seen.2 as u8, restored as u8, if ok { "ok" } else { "bad" }
+    );
+    (ok, if ok { "ok" } else { "FAIL" })
 }
