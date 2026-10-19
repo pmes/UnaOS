@@ -173,7 +173,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -2242,4 +2242,80 @@ fn mtpphone_selftest() {
             enumerated as u8, nst, nobj, okf(read_ok), okf(write_ok), okf(delete_ok), ms, why.unwrap_or("-")
         );
     }
+}
+
+// UPDATEUI (rmbp-ledger B726, BP-bar-8) — TAIL-APPENDED. Settings > About > System image (`video/settings.rs` `sysimg`,
+// `install/abimage.rs`): the loader's KELF verdict kept by `kelf_note` is read back here for the row.
+
+/// The loader's verdict as `kelf_note` kept it (`None` before the boot line ran).
+#[cfg(target_arch = "x86_64")]
+pub fn kelf_kept() -> Option<unaos_boot_info::KelfVerdict> {
+    *KELF_KEPT.lock()
+}
+
+/// `tests updateui`: `:: UPDATEUI: listed=1 staged=1 refused=1 text=ok -> PASS ::` — the System image pane's model driven
+/// through its own latches (`sysimg::pick` / `remove`, run by `sysimg::run_in`, the service pass's body) over two RAM
+/// sticks in the fixture's own mount table (`abimage::fixture_table`: `UPDTEST` = a copy of the running kernel + a
+/// `SRC.SHA` stamp, `NOSHA` = a kernel and no stamp): (1) the list offers `UPDTEST` alone; (2) a pick stages it (the
+/// `stage` verb's path) and the rows read `7e57ab1e from UPDTEST` and "Restart to try it — …"; (3) a pick of `NOSHA` is
+/// refused (`no-src-sha`) and changes nothing; (4) the loader's fallback write is stood in for, the next boot's note
+/// taken, and the rows read "… set aside (boot <n>)"; (5) Remove leaves no stage and nothing set aside. SKIP when the
+/// user has a stage (the fixture never replaces it).
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))]
+fn updateui_selftest() {
+    use crate::install::abimage;
+    use crate::video::settings::sysimg;
+    let pre = abimage::status();
+    if pre.staged.is_some() || pre.set_aside.is_some() {
+        serial_println!(":: UPDATEUI: listed=- staged=- refused=- text=- -> SKIP :: reason=a-stage-exists (the fixture never replaces the user's stage) ::");
+        return;
+    }
+    let (t, vols) = match abimage::fixture_table() {
+        Ok(x) => x,
+        Err(w) => {
+            serial_println!(":: UPDATEUI: listed=0 staged=0 refused=0 text=- -> FAIL :: reason={} ::", w);
+            return;
+        }
+    };
+    let (good, bad) = (vols[0].as_str(), vols[1].as_str());
+    // (1) the list
+    sysimg::stale();
+    sysimg::run_in(&t, Some(&vols));
+    let (offered, _) = sysimg::listed();
+    let listed = offered.len();
+    let list_ok = listed == 1 && offered[0] == good;
+    // (2) the stage through the pane
+    sysimg::pick(good);
+    sysimg::run_in(&t, Some(&vols));
+    let st = abimage::status();
+    let staged = st.staged.as_ref().is_some_and(|s| s.src == good && s.sha == "7e57ab1e");
+    let rows1 = sysimg::lines();
+    let text1 = rows1[1].starts_with("7e57ab1e from UPDTEST") && rows1[2] == sysimg::NOTE_STAGED;
+    // (3) the refusal: no SRC.SHA on the stick; the stage made in (2) is untouched
+    sysimg::pick(bad);
+    sysimg::run_in(&t, Some(&vols));
+    let (_, said) = sysimg::listed();
+    let kept = abimage::status().staged.is_some_and(|s| s.src == good);
+    let refused = said.ends_with("not staged: no-src-sha") && kept;
+    // (4) the loader's fallback (stood in for), the next boot's note, the row
+    let n = abimage::fixture_fallback();
+    sysimg::run_in(&t, Some(&vols));
+    let rows2 = sysimg::lines();
+    let text2 = n.is_some() && rows2[1] == "set aside" && rows2[2].starts_with("The staged image did not reach the desktop and was set aside (boot ");
+    // (5) Remove
+    sysimg::remove();
+    sysimg::run_in(&t, Some(&vols));
+    let after = abimage::status();
+    let clean = after.staged.is_none() && after.set_aside.is_none();
+    if !clean {
+        let _ = abimage::unstage();
+    }
+    sysimg::stale();
+    serial_println!("[update] ui fixture staged_row=\"{}\" note=\"{}\" aside_note=\"{}\" removed={}", rows1[1], rows1[2], rows2[2], clean as u8);
+    let text = text1 && text2 && clean;
+    let pass = list_ok && staged && refused && text;
+    serial_println!(
+        ":: UPDATEUI: listed={} staged={} refused={} text={} -> {} ::",
+        listed, staged as u8, refused as u8, if text { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }
+    );
 }
