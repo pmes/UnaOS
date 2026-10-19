@@ -708,7 +708,7 @@ pub fn selftest() {
     };
     let openwith = registrants_in(&mt, ft::TEXT_PLAIN).len();
     let resolved = why.clone().unwrap_or_else(|| String::from("ok"));
-    let pass = why.is_none() && matches!(amend, "ok" | "skip") && matches!(sticky, "ok" | "skip") && openwith >= 2 && cost_ok;
+    let pass = why.is_none() && matches!(amend, "ok" | "skip") && matches!(sticky, "ok" | "skip") && openwith >= 2 && cost_ok; let word = if pass { "PASS" } else if !attrs && why.is_none() && openwith >= 2 { "SKIP reason=no-attr-root" } else { "FAIL" }; // QEMUCLASS1 (B570): a root that takes no attributes builds no registry (`build_stamped` :934 notes `failed` on enotsup), so the cost legs have no subject; the resolution legs still decide (ASSOCSTAMP's word)
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     let bar_ms = crate::video::desktopbuild::last_bar_ms();
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -716,7 +716,7 @@ pub fn selftest() {
     let bar = bar_ms.map_or(String::from("none"), |b| alloc::format!("{}", b));
     serial_println!(
         ":: FILETYPES: types={} build_ms={} blocks={} masked_max_ms={} -> {} :: login={} worker={} on={} login_ms={} login_blocks={} bound_ms={} masked_bound_ms={} bar_ms={} preferred={} resolved={} registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
-        types.len(), build_ms, blocks, masked, if pass { "PASS" } else { "FAIL" }, login, wstate, won, login_ms, login_blocks, BUILD_MS_BOUND, MASKED_MS_BOUND, bar,
+        types.len(), build_ms, blocks, masked, word, login, wstate, won, login_ms, login_blocks, BUILD_MS_BOUND, MASKED_MS_BOUND, bar,
         preferred, resolved, if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
     );
 }
