@@ -1180,7 +1180,7 @@ pub fn stack_connect(sid: usize, ip: [u8; 4], port: u16) -> ConnectOutcome {
             if sock.connect(iface.context(), remote, le).is_err() {
                 return ConnectOutcome::Refused;
             }
-            kick(); crate::net_tick::note_connect(own); // IDLENET (B672): the SYN is the connect, counted once (a re-call while SYN-SENT issues none). NETCLOCK: the SYN is queued — poll now
+            kick(); connect_said(own, ip, port); // IDLENET (B672): the SYN is the connect, counted once (a re-call while SYN-SENT issues none). NETCLOCK: the SYN is queued — poll now. NOTELEMETRY (B697): counted through `connect_said`, which says its cause and dst (LINE-NEUTRAL, code before this comment)
         }
     }
     // (2) Pump chunked (lock released between chunks) chasing ESTABLISHED.
@@ -2287,4 +2287,42 @@ fn idle_own(stack: &SmolStack, sid: usize) -> Option<crate::net_tick::Who> {
         Some((_, owner, _)) if *owner != usize::MAX => Some(crate::net_tick::Who::Ring3),
         _ => None,
     }
+}
+
+// NOTELEMETRY (rmbp-ledger B697, BP-bar-10, BP-net-11) — TAIL-APPENDED. The one socket-open point (`stack_connect`'s
+// SYN, the only `note_connect` caller on x86) says WHY it connects: `[net] connect cause=<c> dst=<ip:port> by=<starter>`.
+// The cause is the starter IDLENET's ledger credits (the task's open `net_tick::scope`, else the site's own name, else
+// nobody), read back as the one conn slot this call moved — exact, because the SYN is issued and counted under `STACK`
+// and no other x86 site counts a connect. Causes: `verb` (a user's command: the fetch verb, a routed shell verb, a
+// ring-3 program the user launched, the SOCK ladder `tests sock` arms), `sntp`, `dns` (a lookup outside a verb; one a
+// verb starts is the verb's — the outer scope wins), `dhcp`, else `none` — the `uncaused=` `tests notelemetry` must read
+// 0. `update` (the A/B stage, B683) has no starter yet: the stage verb is owed, so nothing connects for it. The match
+// over `Who` is exhaustive: a new starter does not compile until it is given a cause.
+
+/// The cause and starter name of the one connect a ledger delta `d` holds (`("none", "nobody")` for the unattributed
+/// slot, or a delta that moved nothing).
+pub fn connect_cause(d: &crate::net_tick::Census) -> (&'static str, &'static str) {
+    use crate::net_tick::Who;
+    let Some(i) = d.conn.iter().position(|&n| n > 0) else { return ("none", "nobody") };
+    for w in [Who::Dhcp, Who::Dns, Who::Sntp, Who::Fetch, Who::Witness, Who::Ring3, Who::Shell] {
+        if w as usize == i {
+            let cause = match w {
+                Who::Fetch | Who::Shell | Who::Ring3 | Who::Witness => "verb",
+                Who::Sntp => "sntp",
+                Who::Dns => "dns",
+                Who::Dhcp => "dhcp",
+            };
+            return (cause, w.name());
+        }
+    }
+    ("none", "nobody")
+}
+
+/// Count one outbound connect on IDLENET's ledger (exactly as `note_connect` did) and say its cause and destination.
+/// Called with `STACK` held (`stack_connect` step 1).
+fn connect_said(own: Option<crate::net_tick::Who>, ip: [u8; 4], port: u16) {
+    let before = crate::net_tick::LEDGER.census();
+    crate::net_tick::note_connect(own);
+    let (cause, by) = connect_cause(&crate::net_tick::LEDGER.census().since(&before));
+    serial_println!("[net] connect cause={} dst={}.{}.{}.{}:{} by={}", cause, ip[0], ip[1], ip[2], ip[3], port, by);
 }
