@@ -25,6 +25,9 @@
 //!   the per-folder `Walker` when the body refuses it; `read_partial` in bounded chunks.
 //! * M3: `send_object` (SendObjectInfo + SendObject), `delete_object`; the kernel surface
 //!   `write_file` / `delete` under the controller loan.
+//! * MTPWRITE (rmbp-ledger B727): `announce` = SendObjectPropList at 4 GiB and over; `send_folder` /
+//!   `make_folder` (SendObjectInfo, format 0x3001); GetPartialObject64 past 4 GiB in `read_partial`;
+//!   `read_object` for `fs/ptpfs.rs`; `with_transport` (the controller, or the attached fixture).
 //!
 //! Everything that talks is generic over [`Transport`]: the controller implements it with
 //! `ptp_txn`, and `tests mtpphone` implements it with a synthetic responder ([`fixture`]) whose every
@@ -57,6 +60,9 @@ pub mod mop {
     pub const GET_OBJECT_PROPS_SUPPORTED: u16 = 0x9801;
     pub const GET_OBJECT_PROP_LIST: u16 = 0x9805;
     pub const SEND_OBJECT_PROP_LIST: u16 = 0x9808;
+    /// MTPWRITE: Android's MTP extension GetPartialObject64 (libmtp ptp.h `PTP_OC_ANDROID_GetPartialObject64`):
+    /// handle, offset low, offset high, max bytes. (0x95C4 in that table is BeginEditObject.)
+    pub const GET_PARTIAL_OBJECT_64: u16 = 0x95C1;
 }
 
 /// MTP response codes this module reads (MTP 1.1 §F.3).
@@ -370,7 +376,7 @@ pub struct Listing {
     pub walker: Option<Walker>,
 }
 
-fn ok_in<T: Transport>(t: &mut T, op_code: u16, params: &[u32], cap: usize) -> Result<Option<Vec<u8>>, &'static str> {
+fn ok_in<T: Transport + ?Sized>(t: &mut T, op_code: u16, params: &[u32], cap: usize) -> Result<Option<Vec<u8>>, &'static str> {
     let mut raw = Vec::new();
     let r = t.txn(op_code, params, Phase::In { cap, into: &mut raw })?;
     Ok(if r.code == rc::OK { Some(raw) } else { None })
@@ -408,7 +414,7 @@ fn storage_names(raw: Vec<Option<String>>) -> Vec<String> {
 
 /// The tree in one transaction: depth 0xFFFFFFFF from handle 0, then (a body that refuses depth) the
 /// all-objects form, handle 0xFFFFFFFF depth 0. `None` = refused or unparseable: the caller walks.
-pub fn list_fast<T: Transport>(t: &mut T) -> Result<Option<Vec<Obj>>, &'static str> {
+pub fn list_fast<T: Transport + ?Sized>(t: &mut T) -> Result<Option<Vec<Obj>>, &'static str> {
     for (h, depth) in [(0u32, 0xFFFF_FFFFu32), (0xFFFF_FFFF, 0)] {
         let mut raw = Vec::new();
         let r = t.txn(mop::GET_OBJECT_PROP_LIST, &[h, 0, 0xFFFF_FFFF, 0, depth], Phase::In { cap: PROPLIST_CAP, into: &mut raw })?;
@@ -423,7 +429,7 @@ pub fn list_fast<T: Transport>(t: &mut T) -> Result<Option<Vec<Obj>>, &'static s
 }
 
 /// M1 + M2: storages and their names, the friendly name, the property count, the tree (or a walker).
-pub fn enumerate<T: Transport>(t: &mut T, di: &DeviceInfo, storages: &[u32]) -> Result<Listing, &'static str> {
+pub fn enumerate<T: Transport + ?Sized>(t: &mut T, di: &DeviceInfo, storages: &[u32]) -> Result<Listing, &'static str> {
     let mut raw_names = Vec::new();
     for &s in storages {
         let n = if di.ops.contains(&mop::GET_STORAGE_INFO) { ok_in(t, mop::GET_STORAGE_INFO, &[s], 4096)?.and_then(|p| storage_desc(&p)) } else { None };
@@ -470,7 +476,7 @@ impl Walker {
         (self.folders.is_empty() && self.pending.is_empty()) || self.found >= super::MAX_OBJECTS
     }
     /// At most `budget` transactions; the objects they found.
-    pub fn step<T: Transport>(&mut self, t: &mut T, budget: usize) -> Result<Vec<Obj>, &'static str> {
+    pub fn step<T: Transport + ?Sized>(&mut self, t: &mut T, budget: usize) -> Result<Vec<Obj>, &'static str> {
         let mut out = Vec::new();
         for _ in 0..budget {
             if self.done() {
@@ -499,16 +505,18 @@ impl Walker {
 
 /// `len` bytes of `handle` from `off` by GetPartialObject in chunks of at most `chunk`; a chunk that
 /// comes back short ends the read (the object's end). One chunk = PTPCAM's single transaction.
-pub fn read_partial<T: Transport>(t: &mut T, handle: u32, off: u64, len: usize, chunk: usize) -> Result<Vec<u8>, &'static str> {
+pub fn read_partial<T: Transport + ?Sized>(t: &mut T, handle: u32, off: u64, len: usize, chunk: usize) -> Result<Vec<u8>, &'static str> {
     let mut v = Vec::with_capacity(len.min(READ_CHUNK));
     while v.len() < len {
         let at = off + v.len() as u64;
-        if at > u32::MAX as u64 {
-            return Err("offset past 4 GiB (GetPartialObject64 owed)");
-        }
         let want = (len - v.len()).min(chunk.max(1));
         let mut part = Vec::with_capacity(want); // fresh per chunk: Phase::In's cap counts what `into` holds
-        let r = t.txn(op::GET_PARTIAL_OBJECT, &[handle, at as u32, want as u32], Phase::In { cap: want, into: &mut part })?;
+        let r = if at > u32::MAX as u64 {
+            // MTPWRITE: an offset past 4 GiB — GetPartialObject64 (handle, offset low, offset high, max).
+            t.txn(mop::GET_PARTIAL_OBJECT_64, &[handle, at as u32, (at >> 32) as u32, want as u32], Phase::In { cap: want, into: &mut part })?
+        } else {
+            t.txn(op::GET_PARTIAL_OBJECT, &[handle, at as u32, want as u32], Phase::In { cap: want, into: &mut part })?
+        };
         if r.code != rc::OK {
             return Err("GetPartialObject refused");
         }
@@ -525,16 +533,8 @@ pub fn read_partial<T: Transport>(t: &mut T, handle: u32, off: u64, len: usize, 
 
 /// SendObjectInfo + SendObject: `data` as `name` inside (`storage`, `parent`; 0xFFFFFFFF = the root).
 /// The new object's handle (the SendObjectInfo response's third parameter).
-pub fn send_object<T: Transport>(t: &mut T, storage: u32, parent: u32, name: &str, data: &[u8]) -> Result<u32, &'static str> {
-    if data.len() as u64 > 0xFFFF_FFFE {
-        return Err("a file of 4 GiB or more needs SendObjectPropList (owed)");
-    }
-    let info = enc_object_info(storage, parent, format_for(name), data.len() as u64, name);
-    let r = t.txn(mop::SEND_OBJECT_INFO, &[storage, parent], Phase::Out(&info))?;
-    if r.code != rc::OK || r.n < 3 {
-        return Err("SendObjectInfo refused");
-    }
-    let handle = r.params[2];
+pub fn send_object<T: Transport + ?Sized>(t: &mut T, storage: u32, parent: u32, name: &str, data: &[u8]) -> Result<u32, &'static str> {
+    let handle = announce(t, storage, parent, name, data.len() as u64)?;
     let r = t.txn(mop::SEND_OBJECT, &[], Phase::Out(data))?;
     if r.code != rc::OK {
         return Err("SendObject refused");
@@ -542,7 +542,35 @@ pub fn send_object<T: Transport>(t: &mut T, storage: u32, parent: u32, name: &st
     Ok(handle)
 }
 
-pub fn delete_object<T: Transport>(t: &mut T, handle: u32) -> Result<(), &'static str> {
+/// MTPWRITE: the object's announcement, the half of a send before SendObject. Below 4 GiB SendObjectInfo
+/// (ObjectInfo's size is 32 bits); at 4 GiB and over SendObjectPropList (MTP 1.1 §5.3.3.4: storage, parent,
+/// format, size high, size low; the dataset `enc_send_props`; the response's third parameter is the handle).
+pub fn announce<T: Transport + ?Sized>(t: &mut T, storage: u32, parent: u32, name: &str, size: u64) -> Result<u32, &'static str> {
+    let r = if size >= 0xFFFF_FFFF {
+        let props = enc_send_props(name, size);
+        t.txn(mop::SEND_OBJECT_PROP_LIST, &[storage, parent, format_for(name) as u32, (size >> 32) as u32, size as u32], Phase::Out(&props))?
+    } else {
+        let info = enc_object_info(storage, parent, format_for(name), size, name);
+        t.txn(mop::SEND_OBJECT_INFO, &[storage, parent], Phase::Out(&info))?
+    };
+    if r.code != rc::OK || r.n < 3 {
+        return Err(if size >= 0xFFFF_FFFF { "SendObjectPropList refused" } else { "SendObjectInfo refused" });
+    }
+    Ok(r.params[2])
+}
+
+/// MTPWRITE: a folder — SendObjectInfo with format 0x3001 (association, generic folder) and no SendObject
+/// (an association carries no data; libmtp's folder create sends the info alone). The new handle.
+pub fn send_folder<T: Transport + ?Sized>(t: &mut T, storage: u32, parent: u32, name: &str) -> Result<u32, &'static str> {
+    let info = enc_object_info(storage, parent, fmt::ASSOCIATION, 0, name);
+    let r = t.txn(mop::SEND_OBJECT_INFO, &[storage, parent], Phase::Out(&info))?;
+    if r.code != rc::OK || r.n < 3 {
+        return Err("SendObjectInfo (folder) refused");
+    }
+    Ok(r.params[2])
+}
+
+pub fn delete_object<T: Transport + ?Sized>(t: &mut T, handle: u32) -> Result<(), &'static str> {
     let r = t.txn(mop::DELETE_OBJECT, &[handle, 0], Phase::None)?;
     if r.code == rc::OK { Ok(()) } else { Err("DeleteObject refused") }
 }
@@ -554,6 +582,19 @@ pub(super) static OS_DESC_MTP: AtomicBool = AtomicBool::new(false);
 static T0: AtomicU64 = AtomicU64::new(0);
 static WALKER: Mutex<Option<Walker>> = Mutex::new(None);
 static LINE: Mutex<Option<String>> = Mutex::new(None);
+/// MTPWRITE: the synthetic responder while `tests mtpphone` has it attached (`fixture::attach`).
+static FIXTURE: Mutex<Option<fixture::Responder>> = Mutex::new(None);
+
+/// MTPWRITE: run `f` on the session's transport — the attached fixture, else the controller under the loan.
+fn with_transport<R>(f: impl FnOnce(&mut dyn Transport) -> Result<R, &'static str>) -> Result<R, &'static str> {
+    {
+        let mut g = FIXTURE.lock();
+        if let Some(r) = g.as_mut() {
+            return f(r);
+        }
+    }
+    super::with_controller(|c| f(c))
+}
 
 pub(super) fn forget() {
     OS_DESC_MTP.store(false, Ordering::Relaxed);
@@ -676,37 +717,63 @@ impl super::super::XhciController {
 /// Copy `data` onto the phone as `name` inside the folder `dir_rel` (volume-relative; a storage folder
 /// or any folder below one). The new handle; the table holds the row at once.
 pub fn write_file(dir_rel: &str, name: &str, data: &[u8]) -> Result<u32, &'static str> {
+    let (storage, parent) = place(dir_rel, name)?;
+    let t0 = super::now_ms();
+    let h = with_transport(|c| send_object(c, storage, parent, name, data))?;
+    add_row(h, storage, parent, format_for(name), data.len() as u64, name);
+    serial_println!("[mtp] write name={} bytes={} storage={:#010x} parent={:#010x} handle={:#010x} ms={}", name, data.len(), storage, parent, h, super::now_ms().saturating_sub(t0));
+    Ok(h)
+}
+
+/// MTPWRITE: where a new `name` inside the folder `dir_rel` goes — (StorageID, parent handle; 0xFFFFFFFF =
+/// the storage's root) — or why it cannot.
+pub fn place(dir_rel: &str, name: &str) -> Result<(u32, u32), &'static str> {
     if !super::is_mtp_session() {
         return Err("not an MTP session (the camera volume is read-only)");
     }
-    let (storage, parent) = match super::lookup(dir_rel).ok_or("no such folder")? {
+    let at = match super::lookup(dir_rel).ok_or("no such folder")? {
         super::Node::Dir { storage: Some(s), handle } => (s, handle.unwrap_or(0xFFFF_FFFF)),
         super::Node::Dir { storage: None, .. } => return Err("write into a storage folder, not the volume root"),
         _ => return Err("not a folder"),
     };
-    let leaf = super::sanitize(name, 0);
-    if leaf != name {
+    if name.is_empty() || super::sanitize(name, 0) != name {
         return Err("name is not a path component");
     }
-    let t0 = super::now_ms();
-    let h = super::with_controller(|c| send_object(c, storage, parent, name, data))?;
-    let row = Obj {
-        handle: h,
-        storage,
-        parent: if parent == 0xFFFF_FFFF { 0 } else { parent },
-        format: format_for(name),
-        size: data.len() as u64,
-        name: String::from(name),
-        mtime: None,
-    };
+    Ok(at)
+}
+
+/// The table holds a new object's row at once (the listing never waits for a re-list).
+fn add_row(h: u32, storage: u32, parent: u32, format: u16, size: u64, name: &str) {
+    let row = Obj { handle: h, storage, parent: if parent == 0xFFFF_FFFF { 0 } else { parent }, format, size, name: String::from(name), mtime: None };
     {
         let mut t = super::TABLE.lock();
         t.handles.push(h);
         t.infos.insert(h, row);
     }
     let _ = crate::fs::ns_bump::<(), ()>(Ok(()));
-    serial_println!("[mtp] write name={} bytes={} storage={:#010x} parent={:#010x} handle={:#010x} ms={}", name, data.len(), storage, parent, h, super::now_ms().saturating_sub(t0));
+}
+
+/// MTPWRITE: a folder `name` inside `dir_rel` (SendObjectInfo, format 0x3001). The new handle.
+pub fn make_folder(dir_rel: &str, name: &str) -> Result<u32, &'static str> {
+    let (storage, parent) = place(dir_rel, name)?;
+    let h = with_transport(|c| send_folder(c, storage, parent, name))?;
+    add_row(h, storage, parent, fmt::ASSOCIATION, 0, name);
+    serial_println!("[mtp] mkdir name={} storage={:#010x} parent={:#010x} handle={:#010x}", name, storage, parent, h);
     Ok(h)
+}
+
+/// MTPWRITE: `len` bytes of an MTP object from `off` for the volume's read. A range starting past 4 GiB
+/// goes by GetPartialObject64 (`read_partial`); the rest is PTPCAM's path unchanged (`ptp::read_object`),
+/// except under the attached fixture, which answers every range by `read_partial`.
+pub fn read_object(handle: u32, size: u64, off: u64, len: usize) -> Result<Vec<u8>, &'static str> {
+    if off >= size || len == 0 {
+        return Ok(Vec::new());
+    }
+    let len = len.min((size - off) as usize);
+    if FIXTURE.lock().is_some() || (off > u32::MAX as u64 && super::PARTIAL_OK.load(Ordering::Relaxed)) {
+        return with_transport(|c| read_partial(c, handle, off, len, READ_CHUNK));
+    }
+    super::read_object(handle, size, off, len)
 }
 
 /// Delete the object at `rel` (a file, or a folder with what it holds — the phone deletes the subtree).
@@ -719,7 +786,7 @@ pub fn delete(rel: &str) -> Result<(), &'static str> {
         super::Node::Dir { handle: Some(h), .. } => h,
         _ => return Err("a storage folder cannot be deleted"),
     };
-    super::with_controller(|c| delete_object(c, h))?;
+    with_transport(|c| delete_object(c, h))?;
     let gone = {
         let mut t = super::TABLE.lock();
         let mut gone: alloc::collections::BTreeSet<u32> = alloc::collections::BTreeSet::new();
@@ -757,6 +824,9 @@ pub mod fixture {
     pub const BIG_SIZE: u64 = 3 << 20;
     pub const DOWNLOAD: u32 = 3;
     pub const OBJECTS: usize = 40;
+    /// MTPWRITE: the 5 GiB sparse object `with_big` adds (Download/BIG.MOV); its bytes are `pat`.
+    pub const HUGE: u32 = 50;
+    pub const HUGE_SIZE: u64 = 5 << 30;
 
     struct FObj {
         storage: u32,
@@ -806,6 +876,17 @@ pub mod fixture {
 
         pub fn holds(&self, h: u32) -> bool {
             self.objs.contains_key(&h)
+        }
+
+        /// MTPWRITE: the phone with one more object, a 5 GiB sparse `BIG.MOV` in Download (never materialised).
+        pub fn with_big(mut self) -> Self {
+            self.objs.insert(HUGE, FObj { storage: S1, parent: DOWNLOAD, format: 0x3000, name: String::from("BIG.MOV"), size: HUGE_SIZE, data: None });
+            self
+        }
+
+        /// MTPWRITE: an object's (format, size, name), as the responder holds it.
+        pub fn info_of(&self, h: u32) -> Option<(u16, u64, String)> {
+            self.objs.get(&h).map(|f| (f.format, f.size, f.name.clone()))
         }
 
         pub fn bytes_of(&self, h: u32) -> Option<Vec<u8>> {
@@ -972,6 +1053,36 @@ pub mod fixture {
                     self.pending = Some((s, par, h));
                     (rc::OK, alloc::vec![s, par, h], None)
                 }
+                mop::GET_PARTIAL_OBJECT_64 => {
+                    // MTPWRITE: handle, offset low, offset high, max bytes; a sparse object answers `pat`.
+                    let h = arg(0);
+                    let Some(f) = self.objs.get(&h) else { return (rc::INVALID_OBJECT_HANDLE, Vec::new(), None) };
+                    let off = (arg(1) as u64) | ((arg(2) as u64) << 32);
+                    let end = (off + arg(3) as u64).min(f.size);
+                    let b: Vec<u8> = match &f.data {
+                        Some(d) => d[(off.min(end) as usize).min(d.len())..(end as usize).min(d.len())].to_vec(),
+                        None => (off.min(end)..end).map(|i| pat(h, i)).collect(),
+                    };
+                    let n = b.len() as u32;
+                    (rc::OK, alloc::vec![n], Some(b))
+                }
+                mop::SEND_OBJECT_PROP_LIST => {
+                    // MTPWRITE: storage, parent, format, size high, size low; the dataset names the object.
+                    let Some(d) = out else { return (0x2002, Vec::new(), None) };
+                    let (s, parent) = (arg(0), arg(1));
+                    let size = ((arg(3) as u64) << 32) | arg(4) as u64;
+                    let Some(rows) = super::prop_list(&d) else { return (0x2002, Vec::new(), None) };
+                    let Some(row) = rows.into_iter().next() else { return (0x2002, Vec::new(), None) };
+                    if (s != S1 && s != S2) || row.size != size {
+                        return (0x2002, Vec::new(), None);
+                    }
+                    let h = self.next;
+                    self.next += 1;
+                    let par = if parent == 0xFFFF_FFFF { 0 } else { parent };
+                    self.objs.insert(h, FObj { storage: s, parent: par, format: arg(2) as u16, name: row.name, size, data: None });
+                    self.pending = Some((s, par, h));
+                    (rc::OK, alloc::vec![s, par, h], None)
+                }
                 mop::SEND_OBJECT => {
                     let (Some(d), Some((_, _, h))) = (out, self.pending.take()) else { return (0x2002, Vec::new(), None) };
                     match self.objs.get_mut(&h) {
@@ -1048,6 +1159,61 @@ pub mod fixture {
             let rn = codec::container(&mut r, ctype::RESPONSE, code, tid, &pb[..k * 4]).ok_or("response")?;
             codec::response(&r[..rn]).ok_or("response decode")
         }
+    }
+
+    /// MTPWRITE: the responder as THE session's phone, so `tests mtpphone` reaches it through the VFS
+    /// (`MountTable::new()` -> `fs/ptpfs.rs` -> this module's kernel surface -> `with_transport`). Only when
+    /// no PTP/MTP device is known (STATE absent, SLOT 0): `service_ptp` then stays a no-op and `ptp_txn`
+    /// refuses, so the controller is never asked. Bring-up's own steps over the responder; the volume name.
+    pub fn attach(mut r: Responder) -> Result<String, &'static str> {
+        use super::super::{Info, INFO, SLOT, STATE, ST_ABSENT, ST_OPEN, TABLE};
+        use core::sync::atomic::Ordering;
+        if STATE.load(Ordering::Relaxed) != ST_ABSENT || SLOT.load(Ordering::Relaxed) != 0 || super::FIXTURE.lock().is_some() {
+            return Err("a PTP/MTP device is attached");
+        }
+        let _ = r.txn(op::OPEN_SESSION, &[1], Phase::None)?;
+        let mut raw = Vec::new();
+        r.txn(op::GET_DEVICE_INFO, &[], Phase::In { cap: 64 << 10, into: &mut raw })?;
+        let di = codec::device_info(&raw).ok_or("deviceinfo")?;
+        let mut raw = Vec::new();
+        r.txn(op::GET_STORAGE_IDS, &[], Phase::In { cap: 4096, into: &mut raw })?;
+        let storages = codec::u32_array(&raw).ok_or("storage ids")?;
+        let l = super::enumerate(&mut r, &di, &storages)?;
+        let model = di.model.clone();
+        let volume = super::super::volume_name_of(l.friendly.as_deref().unwrap_or(&model));
+        let storage_names: Vec<String> = l.storages.iter().map(|s| s.1.clone()).collect();
+        {
+            let mut t = TABLE.lock();
+            t.handles.clear();
+            t.infos.clear();
+            t.failed.clear();
+        }
+        super::install(l, super::super::now_ms(), 0, 0, &volume);
+        *INFO.lock() = Some(Info { model, manufacturer: di.manufacturer, serial: di.serial, volume: volume.clone(), storages, storage_names });
+        *super::FIXTURE.lock() = Some(r);
+        STATE.store(ST_OPEN, Ordering::Relaxed);
+        crate::fs::vfs::register_hotplug(crate::fs::vfs::ptpfs::provide);
+        let _ = crate::fs::ns_bump::<(), ()>(Ok(()));
+        Ok(volume)
+    }
+
+    /// MTPWRITE: the session closed as a detach closes it; the responder back for inspection.
+    pub fn detach() -> Option<Responder> {
+        use super::super::{INFO, OBJ_CACHE, STATE, ST_ABSENT, TABLE};
+        use core::sync::atomic::Ordering;
+        let r = super::FIXTURE.lock().take()?;
+        STATE.store(ST_ABSENT, Ordering::Relaxed);
+        *INFO.lock() = None;
+        {
+            let mut t = TABLE.lock();
+            t.handles.clear();
+            t.infos.clear();
+            t.failed.clear();
+        }
+        *OBJ_CACHE.lock() = None;
+        super::forget();
+        let _ = crate::fs::ns_bump::<(), ()>(Ok(()));
+        Some(r)
     }
 
     /// Hand-written OS descriptors: string 0xEE (vendor code 0x54) and an Extended Compat ID naming MTP.

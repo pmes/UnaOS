@@ -2132,7 +2132,12 @@ fn undomove_selftest() {
 // Extended Compat ID "MTP", and a non-MTP twin refused); enumerate -> the tree in ONE GetObjectPropList; a responder that
 // refuses 0x9805 -> the per-folder walk -> the same 40 rows; the 3 MB object read by 64 KiB GetPartialObject chunks, byte for
 // byte; a 100 000-byte SendObjectInfo + SendObject into Download, read back; DeleteObject and the handle gone.
-// `:: MTPPHONE: enumerated=1 storages=2 objects=40 read=ok write=ok delete=ok ms=<n> -> PASS ::`
+// MTPWRITE (rmbp-ledger B727): a 5 GiB object announced by SendObjectPropList; then the responder ATTACHED as the session's
+// phone (`mtp::fixture::attach`, only with no PTP/MTP device present) and driven THROUGH THE VFS (`MountTable::new()` ->
+// `fs/ptpfs.rs`): a 100 000-byte copy in 32 KiB writes (the short tail sends it), stat's id = the handle, read back; a folder
+// made (an association on the responder) with a pending file listed inside it and dropped; rmdir; unlink; a 5 GiB sparse object
+// read at 4 GiB + 1 (GetPartialObject64) and across 4 GiB.
+// `:: MTPPHONE: enumerated=1 storages=2 objects=40 read=ok write=ok delete=ok ms=<n> vfs_write=ok mkdir=ok big_read=ok -> PASS ::`
 #[cfg(feature = "uvc")]
 fn mtpphone_selftest() {
     use crate::drivers::xhci::ptp::mtp::{self, fixture, Transport};
@@ -2229,17 +2234,94 @@ fn mtpphone_selftest() {
         }
         None => miss("delete", false),
     };
+    // MTPWRITE M2: a file of 4 GiB and over is announced by SendObjectPropList (64-bit size), never ObjectInfo's 32 bits.
+    let big_h = mtp::announce(&mut r, fixture::S1, fixture::DOWNLOAD, "BIG5.MOV", fixture::HUGE_SIZE).ok();
+    let big_sent = big_h.and_then(|h| r.info_of(h)).map(|(_, size, name)| size == fixture::HUGE_SIZE && name == "BIG5.MOV").unwrap_or(false);
+    let big_tail = big_h.and_then(|h| mtp::read_partial(&mut r, h, fixture::HUGE_SIZE - 10, 64, 64 << 10).ok().map(|v| v.len() == 10 && v.iter().enumerate().all(|(i, b)| *b == fixture::pat(h, fixture::HUGE_SIZE - 10 + i as u64)))).unwrap_or(false);
+    miss("big-send", big_sent && big_tail);
+    // MTPWRITE M3: the same phone THROUGH THE VFS.
+    let (vfs_write, mkdir, big_read) = mtpwrite_vfs(&mut miss);
     let counts = miss("counts", nst == 2 && nobj == fixture::OBJECTS);
     let ms = crate::arch::ms().saturating_sub(t0);
     serial_println!("[mtp] fixture txns={} walk_txns={} fast_rows={} walk_rows={} whole={} written={}", r.txns, w.txns, fast_rows.len(), walk_rows.len(), whole.len(), data.len());
-    let pass = enumerated && counts && read_ok && write_ok && delete_ok && why.is_none();
+    let pass = enumerated && counts && read_ok && write_ok && delete_ok && vfs_write && mkdir && big_read && why.is_none();
     let okf = |b: bool| if b { "ok" } else { "fail" };
     if pass {
-        serial_println!(":: MTPPHONE: enumerated=1 storages={} objects={} read=ok write=ok delete=ok ms={} -> PASS ::", nst, nobj, ms);
+        serial_println!(":: MTPPHONE: enumerated=1 storages={} objects={} read=ok write=ok delete=ok ms={} vfs_write=ok mkdir=ok big_read=ok -> PASS ::", nst, nobj, ms);
     } else {
         serial_println!(
-            ":: MTPPHONE: enumerated={} storages={} objects={} read={} write={} delete={} ms={} -> FAIL why={} ::",
-            enumerated as u8, nst, nobj, okf(read_ok), okf(write_ok), okf(delete_ok), ms, why.unwrap_or("-")
+            ":: MTPPHONE: enumerated={} storages={} objects={} read={} write={} delete={} ms={} vfs_write={} mkdir={} big_read={} -> FAIL why={} ::",
+            enumerated as u8, nst, nobj, okf(read_ok), okf(write_ok), okf(delete_ok), ms, okf(vfs_write), okf(mkdir), okf(big_read), why.unwrap_or("-")
         );
     }
+}
+
+/// MTPWRITE (B727): `tests mtpphone`'s VFS legs — (vfs_write, mkdir, big_read). The responder is attached as the session's
+/// phone for the legs and detached before the verdict (its objects are then read back from it directly).
+#[cfg(feature = "uvc")]
+fn mtpwrite_vfs(miss: &mut impl FnMut(&'static str, bool) -> bool) -> (bool, bool, bool) {
+    use crate::drivers::xhci::ptp::mtp::fixture;
+    use crate::fs::vfs::{MountTable, NodeKind};
+    const P: &str = "root";
+    let vol = match fixture::attach(fixture::Responder::new(false).with_big()) {
+        Ok(v) => v,
+        Err(e) => {
+            serial_println!("[mtpwrite] attach refused: {}", e);
+            miss("attach", false);
+            return (false, false, false);
+        }
+    };
+    let t = MountTable::new();
+    let dl = alloc::format!("/volumes/{}/Internal shared storage/Download", vol);
+    let veto_open = t.write_veto(&dl).map(|v| v.is_none()).unwrap_or(false);
+    // The copy: Quarry's shape (create, then 32 KiB writes; the short tail sends), then stat (the handle) and a read back.
+    let data: alloc::vec::Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(29) >> 2) as u8).collect();
+    let f = alloc::format!("{}/UNA-VFS.TXT", dl);
+    let mut wrote = t.create(&f, NodeKind::File, P).is_ok();
+    for (k, c) in data.chunks(32 << 10).enumerate() {
+        wrote &= t.write(&f, (k * (32 << 10)) as u64, c, P).map(|n| n == c.len()).unwrap_or(false);
+    }
+    let st = t.stat(&f).ok();
+    let fh = st.as_ref().and_then(|s| s.id).map(|i| i as u32);
+    let back = t.read(&f, 0, 200_000).unwrap_or_default();
+    let listed = t.read_dir(&dl).map(|v| v.iter().any(|e| e.name == "UNA-VFS.TXT" && e.size == 100_000)).unwrap_or(false);
+    // The folder: made, listed as a folder; a pending file inside it listed then dropped (never sent); rmdir.
+    let d = alloc::format!("{}/UnaFolder", dl);
+    let made = t.create(&d, NodeKind::Dir, P).ok();
+    let dh = made.as_ref().and_then(|s| s.id).map(|i| i as u32);
+    let dir_listed = t.read_dir(&dl).map(|v| v.iter().any(|e| e.name == "UnaFolder" && matches!(e.kind, NodeKind::Dir))).unwrap_or(false);
+    let inner = alloc::format!("{}/NOTE.TXT", d);
+    let inner_ok = t.create(&inner, NodeKind::File, P).is_ok() && t.write(&inner, 0, b"una note\n", P).is_ok() && t.read_dir(&d).map(|v| v.len() == 1 && v[0].size == 9).unwrap_or(false);
+    let inner_gone = t.unlink(&inner, P).is_ok() && t.read_dir(&d).map(|v| v.is_empty()).unwrap_or(false);
+    let rmdir = t.remove_dir(&d, P).is_ok() && t.stat(&d).is_err();
+    // The delete of the copied file, through the VFS.
+    let unlinked = t.unlink(&f, P).is_ok() && t.stat(&f).is_err();
+    // 5 GiB sparse: a read at 4 GiB + 1, and one across 4 GiB.
+    let b = alloc::format!("{}/BIG.MOV", dl);
+    let size_ok = t.stat(&b).map(|s| s.size == fixture::HUGE_SIZE).unwrap_or(false);
+    let at = (4u64 << 30) + 1;
+    let hi = t.read(&b, at, 4096).unwrap_or_default();
+    let hi_ok = hi.len() == 4096 && hi.iter().enumerate().all(|(i, x)| *x == fixture::pat(fixture::HUGE, at + i as u64));
+    let across_at = (4u64 << 30) - 100;
+    let across = t.read(&b, across_at, 200).unwrap_or_default();
+    let across_ok = across.len() == 200 && across.iter().enumerate().all(|(i, x)| *x == fixture::pat(fixture::HUGE, across_at + i as u64));
+    drop(t);
+    let r = fixture::detach();
+    let on_phone = match (&r, fh) {
+        // after the unlink the responder no longer holds the copy; the bytes were checked by the VFS read above
+        (Some(r), Some(h)) => !r.holds(h),
+        _ => false,
+    };
+    let folder_on_phone = match (&r, dh) {
+        (Some(r), Some(h)) => !r.holds(h), // made (a handle came back) and removed by rmdir
+        _ => false,
+    };
+    serial_println!(
+        "[mtpwrite] vol={} veto_open={} wrote={} id={:?} back={} listed={} mkdir_handle={:?} dir_listed={} inner={} inner_gone={} rmdir={} unlinked={} big_size={} hi={} across={}",
+        vol, veto_open as u8, wrote as u8, fh, back.len(), listed as u8, dh, dir_listed as u8, inner_ok as u8, inner_gone as u8, rmdir as u8, unlinked as u8, size_ok as u8, hi_ok as u8, across_ok as u8
+    );
+    let vfs_write = miss("vfs-write", veto_open && wrote && fh.is_some() && back == data && listed && unlinked && on_phone);
+    let mkdir = miss("mkdir", dh.is_some() && dir_listed && inner_ok && inner_gone && rmdir && folder_on_phone);
+    let big_read = miss("big-read", size_ok && hi_ok && across_ok);
+    (vfs_write, mkdir, big_read)
 }
