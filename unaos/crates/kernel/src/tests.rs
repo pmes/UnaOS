@@ -323,7 +323,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); } // SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
     }
 }
 

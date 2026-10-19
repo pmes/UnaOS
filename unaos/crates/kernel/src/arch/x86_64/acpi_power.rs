@@ -671,3 +671,178 @@ pub fn reboot() -> ! { let _ = crate::drivers::xhci::ftdi_flush_sync(crate::arch
 pub(crate) fn s5_ring_flush() -> (u64, usize) {
     crate::serial_ring::power_drain("pwrshutoff")
 }
+
+// =================================================================================================
+// SLEEP (rmbp-ledger B691, docs/dev/blueprint/power.md) — the S3 census and the fixed power button
+// =================================================================================================
+//
+// FILE-TAIL append under `lidsleep`, so no line above moves and a knob-off build carries none of it.
+// Two READ-ONLY facts the sleep lane needs from the FADT, and one write-1-to-clear:
+//   * `s3_census` — what ACPI S3 would need from the firmware (the FACS and its waking vector, the
+//     `\_S3_` package, whether `_PTS`/`_WAK` are named in the DSDT). It ENTERS nothing: the tree has no
+//     AML interpreter to run `_PTS`/`_WAK`, no BSP resume path, no Kepler re-POST and no xHCI/AHCI
+//     save/restore, so S3 is unreachable whatever this finds. The census puts the firmware's half on
+//     the wire so the walls are named by fact, not by guess.
+//   * `pwrbtn_take` — the FIXED-FEATURE power button (ACPI §4.8.3.1.1): PM1x_STS bit 8 (PWRBTN_STS)
+//     latches on a press whether or not PWRBTN_EN is set, so it can be polled with no SCI handler. A
+//     FADT that flags PWR_BUTTON (flags bit 4) has a control-method button instead (AML + a GPE); that
+//     waker is then absent and the line says so. Clearing writes ONLY bit 8 (W1C; zeros are no-ops).
+
+/// FADT u32 FIRMWARE_CTRL (the FACS, physical) and its ACPI 2.0+ u64 twin.
+#[cfg(feature = "lidsleep")]
+const FADT_FIRMWARE_CTRL: usize = 36;
+#[cfg(feature = "lidsleep")]
+const FADT_X_FIRMWARE_CTRL: usize = 132;
+/// FADT u32 PM1a/PM1b event blocks (status is the first half) and their GAS twins.
+#[cfg(feature = "lidsleep")]
+const FADT_PM1A_EVT_BLK: usize = 56;
+#[cfg(feature = "lidsleep")]
+const FADT_PM1B_EVT_BLK: usize = 60;
+#[cfg(feature = "lidsleep")]
+const FADT_X_PM1A_EVT_BLK: usize = 148;
+#[cfg(feature = "lidsleep")]
+const FADT_X_PM1B_EVT_BLK: usize = 160;
+/// FADT u32 flags; bit 4 PWR_BUTTON: 1 = the power button is a control-method device.
+#[cfg(feature = "lidsleep")]
+const FADT_FLAGS_OFF: usize = 112;
+#[cfg(feature = "lidsleep")]
+const FADT_FLAG_PWR_BUTTON: u32 = 1 << 4;
+/// PM1_STS bit 8.
+#[cfg(feature = "lidsleep")]
+const PM1_STS_PWRBTN: u16 = 1 << 8;
+
+/// What the firmware offers toward S3 (read only).
+#[cfg(feature = "lidsleep")]
+#[derive(Clone, Copy, Debug)]
+pub struct S3Census {
+    /// FACS physical address (0 = none named, or no "FACS" signature there).
+    pub facs: u64,
+    /// The FACS waking vector as the firmware left it (X_ when the FACS carries it and it is non-zero).
+    pub waking_vec: u64,
+    /// `\_S3_` SLP_TYPa/b, when a recognisable package is in the DSDT or an SSDT.
+    pub s3: Option<(u8, u8)>,
+    /// `_PTS` / `_WAK` named in the DSDT (the bytes; this tree runs neither).
+    pub pts: bool,
+    pub wak: bool,
+}
+
+/// Scan one AML table for `NameOp [RootChar] <seg>` followed by a sleep-type package (the `_S5_` grammar).
+#[cfg(feature = "lidsleep")]
+unsafe fn scan_sx(table_addr: u64, seg: &[u8; 4]) -> Option<(u8, u8)> {
+    let len = acpi::table_len(table_addr);
+    if len <= acpi::SDT_HEADER_LEN { return None; }
+    let body = &core::slice::from_raw_parts(table_addr as *const u8, len)[acpi::SDT_HEADER_LEN..];
+    let mut i = 0usize;
+    while i + 4 <= body.len() {
+        if &body[i..i + 4] == seg {
+            let introduced = (i >= 1 && body[i - 1] == 0x08) || (i >= 2 && body[i - 2] == 0x08 && body[i - 1] == 0x5C);
+            if introduced { if let Some(t) = parse_s5_package(&body[i + 4..]) { return Some(t); } }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The four bytes `seg` occur in the table body.
+#[cfg(feature = "lidsleep")]
+unsafe fn names(table_addr: u64, seg: &[u8; 4]) -> bool {
+    let len = acpi::table_len(table_addr);
+    if len <= acpi::SDT_HEADER_LEN { return false; }
+    let body = &core::slice::from_raw_parts(table_addr as *const u8, len)[acpi::SDT_HEADER_LEN..];
+    body.windows(4).any(|w| w == seg)
+}
+
+/// Read the firmware's half of S3. `None` = no RSDP or no FADT. Nothing is written.
+#[cfg(feature = "lidsleep")]
+pub fn s3_census() -> Option<S3Census> {
+    let (sdt, es) = acpi::root_sdt(acpi::rsdp_addr())?;
+    // SAFETY: firmware tables (and the FACS, in ACPI NVS) sit on the firmware's identity map; every read is
+    // bounded by a table's own length or the FACS's fixed 32-byte head, and the FACS is read only when its
+    // signature matches.
+    unsafe {
+        let fadt = acpi::find_table(sdt, es, b"FACP")?;
+        let fl = acpi::table_len(fadt);
+        let mut facs: u64 = 0;
+        if fl >= FADT_X_FIRMWARE_CTRL + 8 { facs = ((fadt as usize + FADT_X_FIRMWARE_CTRL) as *const u64).read_unaligned(); }
+        if facs == 0 && fl >= FADT_FIRMWARE_CTRL + 4 { facs = ((fadt as usize + FADT_FIRMWARE_CTRL) as *const u32).read_unaligned() as u64; }
+        let mut waking_vec = 0u64;
+        if facs != 0 && facs < (1u64 << 32) && &*(facs as *const [u8; 4]) == b"FACS" {
+            let flen = ((facs + 4) as *const u32).read_unaligned() as u64;
+            waking_vec = ((facs + 12) as *const u32).read_unaligned() as u64;
+            if flen >= 32 { let x = ((facs + 24) as *const u64).read_unaligned(); if x != 0 { waking_vec = x; } }
+        } else {
+            facs = 0;
+        }
+        let mut dsdt: u64 = 0;
+        if fl >= FADT_X_DSDT + 8 { dsdt = ((fadt as usize + FADT_X_DSDT) as *const u64).read_unaligned(); }
+        if dsdt == 0 && fl >= FADT_DSDT + 4 { dsdt = ((fadt as usize + FADT_DSDT) as *const u32).read_unaligned() as u64; }
+        let mut s3 = if dsdt != 0 { scan_sx(dsdt, b"_S3_") } else { None };
+        if s3.is_none() {
+            acpi::each_table(sdt, es, |addr, sig| { if sig == b"SSDT" { s3 = scan_sx(addr, b"_S3_"); } s3.is_some() });
+        }
+        let (pts, wak) = if dsdt != 0 { (names(dsdt, b"_PTS"), names(dsdt, b"_WAK")) } else { (false, false) };
+        Some(S3Census { facs, waking_vec, s3, pts, wak })
+    }
+}
+
+/// PM1a/PM1b status ports (`a | b << 16`); `u32::MAX` = not yet discovered; 0 = no fixed power button.
+#[cfg(feature = "lidsleep")]
+static PB_PORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// Why there is no fixed power button (index into `PB_WHY`), or 0 = fixed.
+#[cfg(feature = "lidsleep")]
+static PB_KIND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "lidsleep")]
+const PB_WHY: [&str; 5] = ["fixed", "no-fadt", "control-method", "no-pm1-evt", "no-rsdp"];
+
+#[cfg(feature = "lidsleep")]
+fn pwrbtn_ports() -> (u16, u16) {
+    use core::sync::atomic::Ordering;
+    let v = PB_PORTS.load(Ordering::Relaxed);
+    if v != u32::MAX { return (v as u16, (v >> 16) as u16); }
+    let (a, b, kind) = (|| -> (u16, u16, u32) {
+        let Some((sdt, es)) = acpi::root_sdt(acpi::rsdp_addr()) else { return (0, 0, 4) };
+        // SAFETY: as `discover`: identity-mapped FADT, reads bounded by its length, no write.
+        unsafe {
+            let Some(fadt) = acpi::find_table(sdt, es, b"FACP") else { return (0, 0, 1) };
+            let fl = acpi::table_len(fadt);
+            let flags = if fl >= FADT_FLAGS_OFF + 4 { ((fadt as usize + FADT_FLAGS_OFF) as *const u32).read_unaligned() } else { 0 };
+            if flags & FADT_FLAG_PWR_BUTTON != 0 { return (0, 0, 2); }
+            let port = |x: usize, l: usize| -> u16 {
+                let mut p = if fl >= x + 12 { gas_io_port(fadt as usize + x).unwrap_or(0) } else { 0 };
+                if p == 0 && fl >= l + 4 { let v = ((fadt as usize + l) as *const u32).read_unaligned(); if v != 0 && v <= 0xFFFF { p = v as u16; } }
+                p
+            };
+            let a = port(FADT_X_PM1A_EVT_BLK, FADT_PM1A_EVT_BLK);
+            if a == 0 { return (0, 0, 3); }
+            (a, port(FADT_X_PM1B_EVT_BLK, FADT_PM1B_EVT_BLK), 0)
+        }
+    })();
+    PB_KIND.store(kind, Ordering::Relaxed);
+    PB_PORTS.store(a as u32 | (b as u32) << 16, Ordering::Relaxed);
+    (a, b)
+}
+
+/// The fixed power button's kind on this firmware: `fixed`, or why there is none.
+#[cfg(feature = "lidsleep")]
+pub fn pwrbtn_kind() -> &'static str {
+    let _ = pwrbtn_ports();
+    PB_WHY[(PB_KIND.load(core::sync::atomic::Ordering::Relaxed) as usize).min(PB_WHY.len() - 1)]
+}
+
+/// Take a latched power-button press: `Some(true)` = PWRBTN_STS was set (and is now cleared), `Some(false)` =
+/// not set, `None` = no fixed power button on this firmware. Lock-free; two port reads at most.
+#[cfg(feature = "lidsleep")]
+pub fn pwrbtn_take() -> Option<bool> {
+    let (a, b) = pwrbtn_ports();
+    if a == 0 { return None; }
+    let mut hit = false;
+    for p in [a, b] {
+        if p == 0 { continue; }
+        // SAFETY: the FADT's own PM1x status port; the only write is PWRBTN_STS's write-1-to-clear.
+        unsafe {
+            let mut port: Port<u16> = Port::new(p);
+            if port.read() & PM1_STS_PWRBTN != 0 { port.write(PM1_STS_PWRBTN); hit = true; }
+        }
+    }
+    Some(hit)
+}
