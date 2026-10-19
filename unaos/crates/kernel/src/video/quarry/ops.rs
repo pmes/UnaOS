@@ -962,7 +962,7 @@ pub fn action(a: crate::video::keymap::Action) -> bool {
     match a {
         Action::Copy => do_copy(),
         Action::Paste => do_paste(),
-        Action::GetInfo => do_info(), // ATTRCOLUMNS (B402): Cmd-I
+        Action::GetInfo => do_info(), Action::Undo => { let _ = crate::video::quarry::undo::undo(); } Action::Redo => { let _ = crate::video::quarry::undo::redo(); } // ATTRCOLUMNS (B402): Cmd-I. UNDOKEYS (B743): ⌘Z / ⌘⇧Z, the journal's two verbs (the Edit menu's rows call the same pair)
         _ => return false,
     }
     repaint();
