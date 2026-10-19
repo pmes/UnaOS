@@ -9434,7 +9434,7 @@ fn sys_connect(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let port = u16::from_le_bytes([hdr[4], hdr[5]]);
     if port == 0 {
         return EINVAL;
-    } if let Err(e) = crate::fs::apptrust::net_gate(row, ip, port, true) { return e; } // NETGRANT (B707, BP-security-16): the user's grant BEFORE the SYN — Never = -EPERM and the stack is never entered; asking = -EINPROGRESS, nothing queued. ⚠ LINE-NEUTRAL append, code before this comment
+    } if let Err(e) = crate::fs::apptrust::net_gate(row, ip, port, true) { return e; } // NETGRANT (B707, BP-security-17): the user's grant BEFORE the SYN — Never = -EPERM and the stack is never entered; asking = -EINPROGRESS, nothing queued. ⚠ LINE-NEUTRAL append, code before this comment
     match crate::smolnet::stack_connect(sid, ip, port) {
         crate::smolnet::ConnectOutcome::Established => 0,
         crate::smolnet::ConnectOutcome::InProgress => EINPROGRESS,

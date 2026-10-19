@@ -42,7 +42,7 @@
 | LUMEN | yes | yes | vessel `lumen` (Vein's face; `vein_ring3`) |
 | VUG (+VUGX/VUGC/VUGK variants) | yes | yes | Vug |
 | PREFS, NET, DIAG, BIG | yes | no aarch64 recipe found | probes/fixtures (owner `unverified`) |
-| ABIPROBE | committed fixture (`unaos/fixtures/ABIPROBE-v1.ELF`), never rebuilt by the image | no | the ABI gate (BP-ring3-15) |
+| ABIPROBE | committed fixture (`unaos/fixtures/ABIPROBE-v1.ELF`), never rebuilt by the image | no | the ABI gate (`tests abielf`, B693) |
 | STAT, PULSE | yes | yes | instruments |
 | blob / elf / blob-x86 | flat test blobs | | fixtures |
 

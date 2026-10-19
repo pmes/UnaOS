@@ -31103,16 +31103,16 @@ pub mod focussteal {
 
     /// `spawn_focus_forget`'s fold: drop `owner`'s arming unjudged (slot teardown; owners are recycled).
     pub fn forget(owner: u64) {
-        let mut a = ARMS.lock();
+        let _ = LAST_HELD.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed); let mut a = ARMS.lock(); // crawl B 24: the held mark ends with the owner (owners are recycled)
         if let Some(i) = a.iter().position(|r| r.owner == owner) {
             a.swap_remove(i);
         }
     }
 
-    /// Was `owner`'s map just HELD? Consumes the mark. The seam's weak "first window, shell was idle"
-    /// grant must ask this before it fires (the fold is owed in `arch/x86_64/syscall.rs`, B698).
+    /// Was `owner`'s map HELD? NOT consumed (crawl B 24): the mark stands for the held owner's later windows until [`forget`] (slot
+    /// teardown) or another hold replaces it — the seam's weak idle grant asks it, so a held app's SECOND window never takes the focus.
     pub fn held_now(owner: u64) -> bool {
-        owner != 0 && LAST_HELD.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        owner != 0 && LAST_HELD.load(Ordering::Acquire) == owner
     }
 
     /// A window asks to be raised (the policy a ring-3 raise verb calls; none exists at B698): only the

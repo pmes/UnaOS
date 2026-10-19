@@ -154,7 +154,7 @@ pub fn selftest() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// NAMEINDEXTX (rmbp-ledger B680, BP-storage-15, BP-bar-14) — the name index cannot drift.
+// NAMEINDEXTX (rmbp-ledger B680, BP-storage-16, BP-bar-14) — the name index cannot drift.
 //
 // The hook is the shared core's, BELOW the VFS: every name-changing primitive the native backend calls
 // (`vfs.rs` `NativeBackend::create` → `UnaFS::create_file`/`mkdir` → `add_entry`, fs.rs:1864-1865;

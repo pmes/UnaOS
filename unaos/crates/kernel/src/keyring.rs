@@ -6,7 +6,7 @@
 //! HOLOCRON2 (rmbp-ledger B355) — the KERNEL's three small parts of the metal secrets handler. Holocron
 //! itself is `APPS/HOLOCRON.ELF` (crates/user-holocron), a ring-3 fulfiller of verbs 144..=151 linking
 //! `holocron_core` — the ONE implementation of the formats, the ring and the policy. Nothing here keeps a
-//! secret or answers a verb:
+//! secret or answers a verb (the ONE key kernel RAM holds — the OPEN keyed root's data key — is KEYBOOT's `KB_KEY` in `fs/unafs.rs`, BP-security-11):
 //!
 //! 1. [`kdf`] — the body of `SYS_KDF` (66): Argon2id with CRYPTOCORE's `crypto_core::argon2`, the exact call
 //!    `holocron_core::cc::CryptoCore::derive_key` makes. HOLOCRON2 needed it because the ring key's memory
@@ -708,7 +708,7 @@ fn no_ring_home() -> Option<String> {
 // The kernel mounts the root before anyone can type (USERS.DAT is on it, BP-storage-13), and three mount sites
 // outside this arc's files (`fs/unafs.rs:452` is in it; `install/unafsmirror.rs:149/161` and
 // `arch/aarch64/sdmmc_tegra.rs:2333` are not) would answer `KeyRequired` for a keyed root on the next boot.
-// The pre-boot unlock comes first; until then no code path writes a slot to a volume the kernel boots from.
+// KEYBOOT (B688) built that unlock (`fs::unafs::unlock_root`): `users::keyboot_key_root` now keys the LIVE root with the first administrator's password.
 // =================================================================================================
 
 /// VOLKEY: a key slot for `password` at `kdf` — a fresh 32-byte data key and recovery key from the kernel DRBG,

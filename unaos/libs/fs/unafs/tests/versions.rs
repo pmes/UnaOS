@@ -21,7 +21,8 @@
 //! block of a versioned volume whose stamp is still 7.
 
 use unafs::inode::{INODE_SPILL_MAGIC, INODE_VERSIONS_MAGIC, IndirectTrailer};
-use unafs::{BLOCK_SIZE, BlockDevice, FileKind, Inode, MemDevice, RING_MAX, UnaFS};
+use unafs::fs::FileSystemError;
+use unafs::{BLOCK_SIZE, BlockDevice, FileKind, Inode, MemDevice, RING_MAX, ReclaimEntry, UnaFS};
 
 fn vol(blocks: u64) -> UnaFS<MemDevice> {
     let mut fs = UnaFS::format(MemDevice::with_blocks(blocks), 0).expect("format");
@@ -280,4 +281,72 @@ fn a_v7_reader_opens_the_versioned_volume() {
     let r = fs.fsck(false).unwrap();
     assert!(r.is_clean(), "{r:?}");
     assert_eq!(r.versions, 2);
+}
+
+// ── crawl B (wave 36): the fixer's proofs for findings 6, 5 and 11 ──────────────────────────────────────
+
+#[test]
+fn a_version_index_past_usize_is_not_found_never_a_panic() {
+    let mut fs = vol(1024);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "doc.txt".into()).unwrap();
+    fs.write_data(id, 0, &content(1, 100)).unwrap();
+    fs.write_data(id, 0, &content(2, 100)).unwrap();
+    assert_eq!(fs.versions(id).unwrap().len(), 1);
+    assert!(fs.read_version(id, usize::MAX, 0, 1).is_err());
+    assert!(fs.restore_version(id, usize::MAX).is_err());
+    assert!(fs.restore_version(id, 1).is_err());
+    assert_eq!(fs.read_data(id, 0, 100).unwrap(), content(2, 100));
+}
+
+#[test]
+fn restore_refuses_a_version_whose_blocks_lost_their_references() {
+    let mut fs = vol(2048);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "doc.txt".into()).unwrap();
+    let blk = BLOCK_SIZE as usize;
+    fs.write_data(id, 0, &content(1, 3 * blk)).unwrap();
+    fs.write_data(id, 0, &content(2, 3 * blk)).unwrap(); // one version: three blocks only the ring holds
+    let ring = unafs::fs::versions::decode_ring(&fs.read_inode(id).unwrap().versions).unwrap();
+    assert_eq!(ring.len(), 1);
+    let blocks: Vec<u64> =
+        ring[0].extents.iter().flat_map(|e| (0..e.length.div_ceil(BLOCK_SIZE)).map(move |i| e.physical_block + i)).collect();
+    assert_eq!(blocks.len(), 3);
+    // What a pre-B714 `fsck --repair` leaves: the ring still names the blocks, their references are gone.
+    fs.reclaim_enqueue(ReclaimEntry { generation: 0, blocks }).unwrap();
+    fs.reclaim_drain().unwrap();
+    assert!(matches!(fs.restore_version(id, 0), Err(FileSystemError::CorruptVolume(_))), "refused, not restored onto free blocks");
+    assert_eq!(fs.read_data(id, 0, 3 * blk as u64).unwrap(), content(2, 3 * blk), "the live file is untouched");
+    assert_eq!(fs.versions(id).unwrap().len(), 1);
+}
+
+#[test]
+fn a_full_volume_spends_the_oldest_version_before_it_refuses_an_overwrite() {
+    let mut fs = vol(512);
+    let root = fs.superblock.root_inode;
+    let doc = fs.create_file(root, "doc.bin".into()).unwrap();
+    let blk = BLOCK_SIZE as usize;
+    fs.write_data(doc, 0, &content(1, 30 * blk)).unwrap();
+    fs.write_data(doc, 0, &content(2, 30 * blk)).unwrap(); // one version: 30 blocks kept
+    assert_eq!(fs.version_ledger().unwrap().kept(), 30);
+    // Fill the volume to a dozen free blocks with versioning off (so the filler spends no version): too few for
+    // a 20-block overwrite, enough for the drop's own metadata transaction (a volume at 0 free cannot run one).
+    fs.set_versioning(false);
+    let fill = fs.create_file(root, "fill.bin".into()).unwrap();
+    let mut at = 0u64;
+    while fs.free_blocks() > 12 {
+        fs.write_data(fill, at, &content(9, blk)).unwrap();
+        at += BLOCK_SIZE;
+    }
+    fs.set_versioning(true);
+    assert!(fs.free_blocks() < 20, "the volume is full: {}", fs.free_blocks());
+    fs.write_data(doc, 0, &content(3, 20 * blk)).expect("the oldest version gives its room to the overwrite");
+    let mut want = content(3, 20 * blk);
+    want.extend_from_slice(&content(2, 30 * blk)[20 * blk..]);
+    assert_eq!(fs.read_data(doc, 0, 30 * blk as u64).unwrap(), want);
+    let v = fs.versions(doc).unwrap();
+    assert_eq!(v.len(), 1, "the old version went; the overwrite kept its own");
+    assert_eq!(fs.read_version(doc, 0, 0, 30 * blk as u64).unwrap(), content(2, 30 * blk));
+    let r = fs.fsck(false).unwrap();
+    assert!(r.is_clean(), "{r:?}");
 }

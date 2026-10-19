@@ -653,7 +653,7 @@ pub fn ensure_tests() {
     }
 }
 
-// ── NETGRANT (rmbp-ledger B707, BP-security-16, BP-net-12, BP-bar-10/12) — the network is a grant, not a default ─────
+// ── NETGRANT (rmbp-ledger B707, BP-security-17, BP-net-12, BP-bar-10/12) — the network is a grant, not a default ─────
 //
 // Research B §4 ("network is a grant, not a default") and R130 law 2: a ring-3 program's first outbound reach ASKS once —
 // `<app> wants to reach <ip:port>` · `Always` · `Allow Once` · `Never` (Never the default, rightmost; Esc dismisses = this
@@ -800,8 +800,8 @@ pub fn net_gate_for(app: &str, task: u64, owner: u64, ip: [u8; 4], port: u16, st
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         // No dialog in this build: nobody can be asked, so nothing reaches the wire without a kept Always.
-        let _ = (owner, &mut asking);
-        serial_println!("[net] grant app={} dst={} decision=never why=no-dialog", app, dst);
+        let _ = (owner, &mut asking, &dst);
+        net_say(app, task, ip, port, 2); // crawl B 31: once per change, not per polled refusal (the door is polled; the wire is not)
         Err(NET_EPERM)
     }
 }

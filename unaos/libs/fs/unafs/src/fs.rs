@@ -1589,15 +1589,49 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     /// Write data to an Inode (grow-only size semantics, like the pre-K8
-    /// path). One transaction.
+    /// path). One transaction. FILEVERSIONS (B714): a full volume spends the
+    /// oldest versions before it refuses the write ([`nospace_room`](Self::nospace_room)).
     pub fn write_data(
         &mut self,
         inode_id: u64,
         offset: u64,
         data: &[u8],
     ) -> Result<(), FileSystemError> {
-        self.write_data_inner(inode_id, offset, data)?;
-        self.maybe_commit()
+        let need = (data.len() as u64).div_ceil(BLOCK_SIZE).saturating_add(1);
+        self.nospace_room(need, |fs| {
+            fs.write_data_inner(inode_id, offset, data)?;
+            fs.maybe_commit()
+        })
+    }
+
+    /// FILEVERSIONS (B714): run `op` (one whole transaction, its commit included). While it finds the volume
+    /// full (`NoSpace`) on a versioned autocommit mount, and the versions together keep enough to make room
+    /// for `need` blocks, the failed attempt is unwound (the committed root reloaded, [`txn_unwind`](Self::txn_unwind):
+    /// nothing of it stays in RAM), the OLDEST version anywhere is dropped in its own committed transaction,
+    /// and `op` runs again — at most [`RING_MAX`](crate::RING_MAX) times. The versions' bound (10 %) is the
+    /// overwrite's reserve, never a reason to refuse it. Versioning off, or a caller's open transaction
+    /// (autocommit off): `op` once, exactly as before.
+    fn nospace_room(
+        &mut self,
+        need: u64,
+        mut op: impl FnMut(&mut Self) -> Result<(), FileSystemError>,
+    ) -> Result<(), FileSystemError> {
+        let mut r = op(self);
+        let mut tries = 0;
+        while matches!(r, Err(FileSystemError::NoSpace)) && self.versioning && self.autocommit && tries < crate::RING_MAX {
+            self.txn_unwind();
+            let room = self.version_ledger().map(|l| l.kept()).unwrap_or(0);
+            if room == 0 || self.free_blocks().saturating_add(room) < need {
+                break;
+            }
+            if !matches!(self.version_drop_oldest(), Ok(true)) || self.commit().is_err() {
+                self.txn_unwind();
+                break;
+            }
+            tries += 1;
+            r = op(self);
+        }
+        r
     }
 
     /// Set an inode's logical size to exactly `new_size`, IN PLACE: the inode
@@ -1607,7 +1641,15 @@ impl<D: BlockDevice> UnaFS<D> {
     /// `write_data`; shrinking releases every block past the new end and CoWs
     /// a partial tail block with the bytes past `new_size` zeroed, so a later
     /// grow reads zeros, never the old tail. One transaction.
+    /// FILEVERSIONS (B714): a full volume spends the oldest versions first, as
+    /// [`write_data`](Self::write_data) does.
     pub fn truncate_data(&mut self, inode_id: u64, new_size: u64) -> Result<(), FileSystemError> {
+        let size = self.read_inode(inode_id)?.size;
+        let need = new_size.saturating_sub(size).div_ceil(BLOCK_SIZE).saturating_add(2);
+        self.nospace_room(need, |fs| fs.truncate_data_once(inode_id, new_size))
+    }
+
+    fn truncate_data_once(&mut self, inode_id: u64, new_size: u64) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(inode_id)?;
         if new_size == inode.size {
             return Ok(());
@@ -1618,7 +1660,8 @@ impl<D: BlockDevice> UnaFS<D> {
             }
             let add = usize::try_from(new_size - inode.size).map_err(|_| FileSystemError::NoSpace)?;
             let zeros = alloc::vec![0u8; add];
-            return self.write_data(inode_id, inode.size, &zeros);
+            self.write_data_inner(inode_id, inode.size, &zeros)?;
+            return self.maybe_commit();
         }
         let old_blocks = inode.size.div_ceil(BLOCK_SIZE);
         let keep = new_size.div_ceil(BLOCK_SIZE);
@@ -3806,7 +3849,8 @@ fn set_stamp(block0: &mut [u8], version: u32) {
 ///
 /// A copy, never in place: a cut mid-way leaves `src` whole and `dst` without a superblock (block 0 is
 /// written last), so no crash can leave a half-ciphered volume. The caller makes `dst` the volume
-/// afterwards (`tools/unafs key --cipher`: a sibling file, then an atomic rename). `src` must be
+/// afterwards (`tools/unafs key --cipher`: a sibling file, then an atomic rename). `key` is CALLER-TRUSTED:
+/// nothing here checks it against `slot` (both come from one `seal_ciphered`). `src` must be
 /// committed (unmounted, or mounted and idle) and v7: an older volume migrates first. Returns the blocks
 /// written.
 pub fn encipher<S: BlockDevice, T: BlockDevice>(
