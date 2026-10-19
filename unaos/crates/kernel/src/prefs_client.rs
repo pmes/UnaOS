@@ -173,7 +173,7 @@ pub fn on_changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
     let mut f = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
     let n = crate::bus::build_reply(una_abi::BUS_VERB_PREF_CHANGED, 0, 0, kernel_reply_principal(), &body, &mut f);
     f.truncate(n);
-    let frame = f.into_boxed_slice(); r3_deliver(ns, k, &frame); if !kq { return; } // PREFCHANGED (B558): the same frame of record into every subscribed ring-3 owner's mailbox (file tail). LINE-NEUTRAL append.
+    let frame = f.into_boxed_slice(); r3_deliver(ns, k, &frame); if !kq { return; } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] note_changed(ns, k); // LOCKCHANGED (B758): the key beside CHANGED_N (file tail). PREFCHANGED (B558): the same frame of record into every subscribed ring-3 owner's mailbox (file tail). LINE-NEUTRAL append.
     locked(|| {
         let mut q = CHANGES.lock();
         if q.len() >= Q_CAP {
@@ -753,3 +753,102 @@ fn row_prefixes(row: usize) -> usize {
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware", feature = "aarch64_el0"))))]
 #[path = "prefchanged_fx.rs"]
 mod fx;
+
+// ══════════════ LOCKCHANGED (rmbp-ledger B758, BP-security-18) — the last-changed key — TAIL-APPENDED ══════════════
+// The kernel PrefChanged queue has ONE drainer (Settings' `bus_changes_inner`), so a second consumer (the lock) cannot
+// read the frames; it learned only that SOMETHING changed (`CHANGED_N`) and paid three bus GETs per change. `on_changed`
+// now also stamps the frame's `<ns>.<key>` into a small ring beside `CHANGED_N` (same moment, same `kq` gate), and a
+// consumer asks [`changed_since`] whether a change after its mark named a key it reads. A change the ring no longer
+// holds answers `true`: a lost key is a re-read, never a skipped change.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub use lastkey::{changed_mark, changed_since, last_changed};
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+use lastkey::note_changed;
+
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+mod lastkey {
+    use alloc::string::String;
+
+    /// The newest changes kept (a burst longer than this re-reads).
+    const KEYS: usize = 8;
+    /// An address slot; a longer `<ns>.<key>` is kept as "unknown" (always a hit).
+    const ADDR_MAX: usize = 64;
+    const UNKNOWN: u8 = u8::MAX;
+
+    struct Ring {
+        /// The sequence of the newest change (0 = none yet); entry `seq % KEYS` holds it.
+        seq: u32,
+        addr: [[u8; ADDR_MAX]; KEYS],
+        len: [u8; KEYS],
+    }
+
+    static RING: crate::sync::Mutex<Ring> = crate::sync::Mutex::new(Ring { seq: 0, addr: [[0; ADDR_MAX]; KEYS], len: [0; KEYS] });
+
+    /// `on_changed`'s half: the frame of record for `<ns>.<k>` entered the kernel queue.
+    pub(super) fn note_changed(ns: &str, k: &str) {
+        super::locked(|| {
+            let mut r = RING.lock();
+            let seq = r.seq.wrapping_add(1);
+            let i = seq as usize % KEYS;
+            let n = ns.len() + 1 + k.len();
+            if n <= ADDR_MAX {
+                r.addr[i][..ns.len()].copy_from_slice(ns.as_bytes());
+                r.addr[i][ns.len()] = b'.';
+                r.addr[i][ns.len() + 1..n].copy_from_slice(k.as_bytes());
+                r.len[i] = n as u8;
+            } else {
+                r.len[i] = UNKNOWN;
+            }
+            r.seq = seq;
+        });
+    }
+
+    /// The change sequence now (a consumer's starting mark).
+    pub fn changed_mark() -> u32 {
+        super::locked(|| RING.lock().seq)
+    }
+
+    /// Did any PrefChanged after `mark` name an address `hit(ns, key)` accepts? Returns the new mark (the sequence now)
+    /// and the answer. More changes since `mark` than the ring holds, or an address too long for its slot, answer
+    /// `true`. Same mark = no change = `false`.
+    pub fn changed_since(mark: u32, hit: impl Fn(&str, &str) -> bool) -> (u32, bool) {
+        super::locked(|| {
+            let r = RING.lock();
+            let gap = r.seq.wrapping_sub(mark);
+            if gap == 0 {
+                return (r.seq, false);
+            }
+            if gap as usize > KEYS {
+                return (r.seq, true);
+            }
+            let mut any = false;
+            for d in 0..gap {
+                let i = r.seq.wrapping_sub(d) as usize % KEYS;
+                let l = r.len[i];
+                if l == UNKNOWN {
+                    any = true;
+                    break;
+                }
+                let a = core::str::from_utf8(&r.addr[i][..l as usize]).ok().and_then(crate::prefs::split_addr);
+                if a.map_or(true, |(ns, k)| hit(ns, k)) {
+                    any = true;
+                    break;
+                }
+            }
+            (r.seq, any)
+        })
+    }
+
+    /// The newest change: `(seq, "<ns>.<key>")` (`None` before the first, or when its address did not fit).
+    pub fn last_changed() -> Option<(u32, String)> {
+        super::locked(|| {
+            let r = RING.lock();
+            let i = r.seq as usize % KEYS;
+            let l = r.len[i];
+            if r.seq == 0 || l == UNKNOWN {
+                return None;
+            }
+            core::str::from_utf8(&r.addr[i][..l as usize]).ok().map(|a| (r.seq, String::from(a)))
+        })
+    }
+}

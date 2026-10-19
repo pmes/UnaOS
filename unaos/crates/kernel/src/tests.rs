@@ -2067,12 +2067,12 @@ fn autolock_selftest() {
     let reopened = entered && !lock::active() && !login::is_open() && is_una(&mut nb); let (painted, hole_ms) = lock2_unlocked(l2); let resumed = lock::last_resumed(); // LOCK2 (B728): it paints within one frame of the unlock, then is closed before the fingerprint (file tail). LINE-NEUTRAL fold, code first.
     let after = lock::fingerprint();
     let same = before == after;
-    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); // LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0; // LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
+    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let gets = lockchanged_leg(); // LOCKCHANGED (B758): the lock's GETs per lock-key and per other-key change (file tail). LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0; // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
-        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={}",
+        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} gets={}",
         entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
-        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8
+        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8, gets.1
     );
 }
 
@@ -4759,4 +4759,49 @@ fn softymic_selftest() {
         ":: SOFTYMIC: on={} off={} looks={} privacy={} -> {} :: live={} ::",
         yn(on), yn(off), looks, yn(privacy), if pass { "PASS" } else { "FAIL" }, live
     );
+}
+
+// LOCKCHANGED (rmbp-ledger B758, BP-security-18) — TAIL-APPENDED, so no line above moves. `tests autolock`'s `gets=` leg,
+// folded onto its lines (the field is the line's LAST): the lock re-reads its policy only on a PrefChanged that names one
+// of its three keys (`lock::prefs_pass` through `prefs_client::changed_since`). Counted with `lock::gets()` (the GETs
+// `lock::refresh` makes): a bus write of `system.lock.after_idle_min` (1440 or 1439: no idle stretch reaches it) and ONE
+// pass cost <= 3 (3 whether this pass or the render task's took the edge — the claim is exclusive); `system.settings.tab`
+// moved to another tab and back, one pass after each, costs 0; then the delay is put back. `gets=<lock>/<other>`;
+// `gets=skip` (the home not writable: a set would be refused) does not fail the line.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn lockchanged_leg() -> (bool, alloc::string::String) {
+    use crate::prefs::key;
+    use crate::prefs_client::{pref_set, sys_int, PrefValue};
+    use crate::video::lock;
+    if crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()).is_some() {
+        serial_println!("[lock] gets leg skipped: the home is not writable (a set would be refused)");
+        return (true, alloc::string::String::from("skip"));
+    }
+    let set = |k: &str, v: i64| pref_set(crate::prefs::NS, k, PrefValue::Int(v)).is_ok();
+    let _ = lock::prefs_pass(); // settle: every earlier change is behind the mark
+    let orig = sys_int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).unwrap_or(lock::IDLE_MIN_DEFAULT as i64);
+    let want: i64 = if orig == 1440 { 1439 } else { 1440 };
+    let g0 = lock::gets();
+    let set_ok = set(key::LOCK_AFTER_IDLE_MIN, want);
+    let _ = lock::prefs_pass();
+    let lock_gets = lock::gets().wrapping_sub(g0);
+    let seen = lock::policy().0 as i64 == want;
+    let tab = sys_int(key::SETTINGS_TAB, 0, 255).unwrap_or(0);
+    let other_tab = if tab == 0 { 1 } else { 0 };
+    let g1 = lock::gets();
+    let o1 = set(key::SETTINGS_TAB, other_tab);
+    let r1 = lock::prefs_pass();
+    let o2 = set(key::SETTINGS_TAB, tab);
+    let r2 = lock::prefs_pass();
+    let other_gets = lock::gets().wrapping_sub(g1);
+    let back_ok = set(key::LOCK_AFTER_IDLE_MIN, orig);
+    let _ = lock::prefs_pass();
+    let restored = lock::policy().0 as i64 == orig;
+    let ok = set_ok && seen && lock_gets <= 3 && o1 && o2 && !r1 && !r2 && other_gets == 0 && back_ok && restored;
+    serial_println!(
+        "[lock] gets leg lock_key={} other_key={} (tab {}->{}->{}) seen={} restored={} last={} via={} -> {}",
+        lock_gets, other_gets, tab, other_tab, tab, seen as u8, restored as u8,
+        crate::prefs_client::last_changed().map_or(alloc::string::String::from("-"), |(_, a)| a), crate::prefs_client::last_via(), if ok { "ok" } else { "bad" }
+    );
+    (ok, alloc::format!("{}/{}", lock_gets, other_gets))
 }
