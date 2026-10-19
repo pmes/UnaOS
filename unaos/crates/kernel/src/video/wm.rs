@@ -1636,7 +1636,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     let mut probe: Option<(usize, usize)> = None;
     // VUGMIN-B — is the presenting owner hidden? Read under the same guard that marks the row, so the
     // answer and the mark are taken against one table state.
-    let skip;
+    let skip; #[cfg(all(target_arch = "x86_64", feature = "wc"))] let app_owner; // APPLAUNCH (B678): the presenting owner, for the first-present stamp below. ⚠ LINE-NEUTRAL fold.
     // WPACE-PANEL — is this row exempt from the present pacer? Kernel furniture (the console, the
     // shell, the desktop — anything in the reserved owner band) and the compat row (owner 0)
     // composite on every present exactly as before; only ring-3 presents are panel-paced. Read in
@@ -1709,8 +1709,8 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
         {
             pace_exempt = owner == 0 || is_kernel_owner(owner);
         }
-        skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
-    }
+        skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { app_owner = owner; }
+    } #[cfg(all(target_arch = "x86_64", feature = "wc"))] app_first_present(app_owner); // APPLAUNCH (B678): table released — the slot's first present takes its exec stamp and prints `[app]`. ⚠ LINE-NEUTRAL fold.
     // WPACE-PANEL — the pace decision, taken BEFORE `wcg::on_present` (review MAJOR 1). A coalesced
     // present must not run `on_present`: that call declares "the owner has finished this surface"
     // (bumps `APP_SEQ`, stores `cks_app`), but a coalesced owner returns immediately and keeps
@@ -30572,4 +30572,18 @@ fn bg_expect(x: usize, y: usize) -> u32 {
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn bg_expect(_x: usize, _y: usize) -> u32 {
     DESKTOP_BG
+}
+
+// APPLAUNCH (rmbp-ledger B678, BP-bar-7, BP-ring3-14) — TAIL-APPENDED. The FRAME stamp: called from `present_banded`
+// once the window table is released, with the presenting row's owner. A ring-3 row's owner is the `+1`-biased slot
+// (`owner_of_launch`); compat (0) and the kernel band are not launches. The slot's first present after an exec TAKES
+// the launcher's stamp (`procslot::launch::take`, a `swap(0)`), so the line prints once per launch; every later
+// present finds 0 and costs one atomic. Not on the WCSER composite path: this runs before the pass is decided.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn app_first_present(owner: u64) {
+    if owner == 0 || is_kernel_owner(owner) {
+        return;
+    }
+    let Some((name, len, ms)) = crate::procslot::launch::take((owner - 1) as usize) else { return };
+    serial_println!("[app] {} exec->frame ms={}", core::str::from_utf8(&name[..len]).unwrap_or("?"), ms);
 }
