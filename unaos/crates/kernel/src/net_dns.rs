@@ -101,7 +101,7 @@ pub fn build_query(out: &mut [u8], txid: u16, host: &str) -> Option<usize> {
     if w + 5 > out.len() {
         return None;
     }
-    out[w] = 0; #[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "sntp6", feature = "net6", target_arch = "aarch64")))] crate::net_tick::note_send(Some(crate::net_tick::Who::Dns)); // IDLENET (B672): past the last refusal, the query is built — the one the resolver sends (the open scope, e.g. SNTP's pool.ntp.org lookup, wins). LINE-NEUTRAL append, code first. root label
+    out[w] = 0; #[cfg(all(feature = "sntp6", feature = "net6", target_arch = "aarch64"))] crate::net_tick::note_send(Some(crate::net_tick::Who::Dns)); // IDLENET (B672): on aarch64 (NET6) past the last refusal the query is built — the one the resolver sends (the open scope, e.g. SNTP's pool.ntp.org lookup, wins); x86 counts at smolnet's sockets. LINE-NEUTRAL append, code first. root label
     w += 1;
     out[w..w + 2].copy_from_slice(&DNS_TYPE_A.to_be_bytes()); // QTYPE = A
     w += 2;

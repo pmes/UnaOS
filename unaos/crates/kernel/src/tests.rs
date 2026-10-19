@@ -672,9 +672,9 @@ fn nicabsent_judge(nic: bool, built: bool, waited: Option<u32>) -> &'static str 
 
 /// NICABSENT — `tests nicabsent`: a boot with no e1000 and no USB Ethernet reached `[desktop] built` and its bar held no
 /// net starter (no `[desktop] starter after-bar who=usbnet|wifi`, no `held_starters=` naming one). The held-starter
-/// census lives in `video/desktopbuild.rs` (`steps::SAID` / `HELD`, private): until that file exports it
-/// (ledger B672, owed), the verdict is `SKIP reason=starter-census-owed` — never a PASS on an unread input. The judge's
-/// own table runs first (a wrong row is a FAIL).
+/// census is `video::desktopbuild::net_starters_held` over `steps::SAID | HELD` (a `None` census, which no caller passes
+/// now, stays `SKIP reason=starter-census-owed` — never a PASS on an unread input). The judge's own table runs first
+/// (a wrong row is a FAIL).
 /// `:: NICABSENT: nic=<0|1> built=<0|1> bar_ms=<n|none> net_starters_waited=<n|owed> table=<ok>/<n> -> PASS|FAIL|SKIP ::`
 #[cfg(all(feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
 fn nicabsent_selftest() {
@@ -692,9 +692,8 @@ fn nicabsent_selftest() {
     #[cfg(not(feature = "usbnet"))]
     let dongle = false;
     let bar = crate::video::desktopbuild::last_bar_ms();
-    let waited: Option<u32> = None; // owed: `video::desktopbuild::net_starters_held(&NET_STARTERS)` (ledger B672)
+    let waited: Option<u32> = Some(crate::video::desktopbuild::net_starters_held(&NET_STARTERS));
     let verdict = if ok != table.len() { "FAIL reason=judge-table" } else { nicabsent_judge(e1000 || dongle, bar.is_some(), waited) };
-    let _ = NET_STARTERS;
     serial_println!(
         ":: NICABSENT: nic={} built={} bar_ms={} net_starters_waited={} table={}/{} -> {} ::",
         (e1000 || dongle) as u8,

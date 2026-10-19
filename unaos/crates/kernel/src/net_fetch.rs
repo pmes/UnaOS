@@ -54,17 +54,8 @@ pub fn basename(path: &str) -> &str {
     }
 }
 
-/// Build the HTTP/1.0 GET request for `u` (the `Host:` header carries the URL's host text). IDLENET (B672): `shell_fetch`
-/// builds it once per ESTABLISHED connection, right before the send, so this is where the `fetch` verb's connect and
-/// send are counted, under its own name; the fixture's text is [`request_text`], uncounted.
+/// Build the HTTP/1.0 GET request for `u` (the `Host:` header carries the URL's host text).
 pub fn build_request(u: &Url) -> String {
-    crate::net_tick::note_connect(Some(crate::net_tick::Who::Fetch));
-    crate::net_tick::note_send(Some(crate::net_tick::Who::Fetch));
-    request_text(u)
-}
-
-/// The request's text (no count): what [`build_request`] sends and what `parse_gate` compares.
-fn request_text(u: &Url) -> String {
     alloc::format!(
         "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: UnaOS-fetch\r\nConnection: close\r\n\r\n",
         u.path, u.host
@@ -98,7 +89,7 @@ pub fn parse_gate() -> bool {
         && parse_url("http://h:0/").is_none() && parse_url("http://h:99999/").is_none();
     let d_ok = basename("/a/b.txt?q=1") == "b.txt" && basename("/") == "index.html";
     let req_ok = match &a {
-        Some(u) => request_text(u)
+        Some(u) => build_request(u)
             == "GET /a/b.txt HTTP/1.0\r\nHost: 10.0.2.2\r\nUser-Agent: UnaOS-fetch\r\nConnection: close\r\n\r\n",
         None => false,
     };

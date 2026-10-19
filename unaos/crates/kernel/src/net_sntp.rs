@@ -110,7 +110,7 @@ pub fn parse(pkt: &[u8]) -> Sntp {
 /// RFC 4330 §5 for a client-only request).
 pub fn build_request(out: &mut [u8; SNTP_LEN]) {
     *out = [0u8; SNTP_LEN];
-    out[0] = SNTP_REQ_B0; #[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "sntp6", feature = "net6", target_arch = "aarch64")))] crate::net_tick::note_send(Some(crate::net_tick::Who::Sntp)); // IDLENET (B672): a request built is the one the SNTP client sends; the open scope (the starter) wins over this name. LINE-NEUTRAL append, code first (net_tick exists only where a client does)
+    out[0] = SNTP_REQ_B0; #[cfg(all(feature = "sntp6", feature = "net6", target_arch = "aarch64"))] crate::net_tick::note_send(Some(crate::net_tick::Who::Sntp)); // IDLENET (B672): on aarch64 (NET6, no smolnet socket count) a request built is the one the SNTP client sends; the open scope (the starter) wins over this name; x86 counts at smolnet's sockets. LINE-NEUTRAL append, code first
 }
 
 /// Build a well-formed SNTP server reply for `unix_secs` with the given `li`/`vn`/`mode`/`stratum` —

@@ -111,13 +111,13 @@ pub fn polls() -> u64 {
 // ── IDLENET (rmbp-ledger B672, BP-bar-1, BP-bar-10, BP-net-11) — THE STACK'S OUTBOUND LEDGER ─────────────────────────
 // "an idle boot logs zero `[net]` connects not caused by a user verb" (docs/dev/blueprint/bar.md BP-bar-1). Every
 // outbound connect and send the stack counts carries WHO started it: the open [`scope`] of the task that sent it (the
-// starter: `tick_body` opens DHCP, the SOCK ladder and SNTP around their drives), else the counting site's own name
-// (a protocol builder is only reached by its own client: `net_sntp::build_request`, `net_dns::build_query`,
-// `net_fetch::build_request` — the `fetch` verb's), else NOBODY: the unattributed bucket `tests idlenet` must read 0.
-// Counted at: the three builders and the scopes above. The socket choke points (`smolnet::stack_connect` /
-// `stack_sendto` / `stack_send`, the ring-3 socket door in `netring3`) count through the same [`note_connect`] /
-// [`note_send`] with `None` once those files carry the one-line call (owed, ledger B672) — until then a ring-3
-// program's connect is not on this ledger, and `[idlenet] window` says what is counted (`counted_at=`).
+// starter: `tick_body` opens DHCP, the SOCK ladder and SNTP around their drives; `shelltask` opens `fetch` / `shell`
+// around a routed verb; `netring3::resolve` opens `ring3`), else the counting site's own name, else NOBODY: the
+// unattributed bucket `tests idlenet` must read 0.
+// Counted at (x86): smoltcp's socket choke points — `smolnet::stack_connect` (the SYN), `stack_sendto_inner` (a
+// datagram), `stack_send` (a stream write); a ring-3-owned socket's own name is `ring3`, a kernel socket's is none.
+// (aarch64 NET6): the SNTP request and DNS query builders, named `sntp` / `dns`. Not on the ledger: smoltcp's own DHCP
+// socket and the raw ICMP/ARP pumps (no socket call), said as `uncounted=` on the window line.
 
 /// Who started an outbound connect or send. A user verb's sends carry the verb's name (`Fetch`, `Shell`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -167,10 +167,7 @@ impl Ledger {
     }
     /// One outbound event: the open scope of this task wins, then `own`, then nobody.
     pub fn note(&self, connect: bool, own: Option<Who>) {
-        let i = match open_starter().or(own) {
-            Some(w) => w as usize,
-            None => WHO_N,
-        };
+        let i = pick(open_starter(), own);
         let row = if connect { &self.conn } else { &self.send };
         row[i].fetch_add(1, Ordering::Relaxed);
     }
@@ -181,6 +178,14 @@ impl Ledger {
             c.send[i] = self.send[i].load(Ordering::Relaxed);
         }
         c
+    }
+}
+
+/// The attribution rule: the open scope, then the site's own name, then nobody (`WHO_N`).
+fn pick(open: Option<Who>, own: Option<Who>) -> usize {
+    match open.or(own) {
+        Some(w) => w as usize,
+        None => WHO_N,
     }
 }
 
@@ -293,24 +298,25 @@ pub const IDLE_WINDOW_S: u64 = 60;
 
 /// IDLENET — `tests idlenet`: after login, every connect/send the stack counts over [`IDLE_WINDOW_S`] with no user verb
 /// (the fixture's own shell job is the only verb running; a verb's sends would carry its name). Control first, on a
-/// private [`Ledger`]: an event with no scope and no site name lands in `nobody`; under `scope(Sntp)` a DNS-site event
-/// is SNTP's; after the scope drops it is DNS's again — a control that fails is a FAIL, never a green.
+/// attribution rule (no scope and no site name -> `nobody`; a site name -> it; a scope over a site name -> the scope)
+/// and the scope table on this task (an inner scope keeps the outer starter; its drop restores it) — a control that
+/// fails is a FAIL, never a green.
 /// Wire: `[idlenet] boot by=<starter:c/s,…>` (since boot, by name: the boot's SNTP / DHCP / DNS), `[idlenet] window
 /// by=… counted_at=…`, then `:: IDLENET: window_s=<n> connects=<n> unattributed=<n> sends=<n> -> PASS|FAIL ::`
 /// (PASS = unattributed 0).
 #[cfg(target_arch = "x86_64")]
 pub fn idlenet_selftest() {
     let window_s = crate::tests::arg().and_then(|a| a.parse::<u64>().ok()).filter(|s| (1..=3600).contains(s)).unwrap_or(IDLE_WINDOW_S);
-    let probe = Ledger::new();
-    probe.note(false, None);
-    let nobody_ok = probe.census().unattributed() == 1;
-    {
+    // The rule, pure: scope wins, then the site's own name, then nobody.
+    let nobody_ok = pick(None, None) == WHO_N && pick(None, Some(Who::Dns)) == Who::Dns as usize && pick(Some(Who::Sntp), Some(Who::Dns)) == Who::Sntp as usize;
+    // The scope table on THIS task (the fixture runs under shelltask's own `shell` scope): an inner scope keeps the
+    // outer starter, and dropping it restores exactly what was open before.
+    let outer = open_starter();
+    let inner = {
         let _s = scope(Who::Sntp);
-        probe.note(true, Some(Who::Dns));
-    }
-    probe.note(false, Some(Who::Dns));
-    let c = probe.census();
-    let scope_ok = c.conn[Who::Sntp as usize] == 1 && c.conn[Who::Dns as usize] == 0 && c.send[Who::Dns as usize] == 1 && c.unattributed() == 1;
+        open_starter()
+    };
+    let scope_ok = inner == outer.or(Some(Who::Sntp)) && open_starter() == outer;
     if !(nobody_ok && scope_ok) {
         serial_println!(":: IDLENET: control nobody={} scope={} -> FAIL ::", nobody_ok as u8, scope_ok as u8);
         return;
@@ -331,7 +337,7 @@ pub fn idlenet_selftest() {
     }
     let w = LEDGER.census().since(&boot);
     serial_println!(
-        "[idlenet] window by={} counted_at=builders(sntp,dns,fetch)+scopes(dhcp,witness,sntp) owed=sockets(smolnet,netring3)",
+        "[idlenet] window by={} counted_at=sockets(smolnet:connect,sendto,send) uncounted=dhcp-socket,icmp,arp",
         w.by()
     );
     serial_println!(
