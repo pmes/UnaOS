@@ -380,7 +380,7 @@ pub fn cycles_to_us(dt: u64) -> u64 {
 pub fn present_band(win: u32, fb: &FrameBuffer, layer: &FrameBuffer, dx: usize, dy: usize, w: usize, h: usize) -> bool {
     ignite();
     let rect = [Rect { sx: 0, sy: 0, dx, dy, w, h }];
-    // A11YFILTERS (B705): with a colour filter on, the present is a `CopyFilter` (BP-video-20: filtered at the copy).
+    // A11YFILTERS (B705): with a colour filter on, the present is a `CopyFilter` (BP-video-25: filtered at the copy).
     let op = if a11yfilter::active() { a11yfilter::note_present(); Op::CopyFilter } else { Op::Copy };
     let job = BlitJob { src: Surface::ram(*layer), dst: Surface::scanout(*fb), rects: &rect, op };
     let t0 = crate::arch::now_cycles();

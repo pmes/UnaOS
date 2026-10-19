@@ -1516,7 +1516,7 @@ fn notelemetry_selftest() {
     );
 }
 
-/// FOCUSSTEAL (rmbp-ledger B698; BP-video-20, BP-bar-18) — `tests focussteal`: three windows with
+/// FOCUSSTEAL (rmbp-ledger B698; BP-video-23, BP-bar-18) — `tests focussteal`: three windows with
 /// synthetic ring-3-band owners through the REAL arm -> create -> take path (`wm::spawn_focus_arm`,
 /// `wm::create`, `wm::spawn_focus_take`), each take followed by the seam's own grant (`focus_changed`)
 /// exactly when it answers yes:
