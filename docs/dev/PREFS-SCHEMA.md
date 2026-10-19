@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 66.
+Rows: 67.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -32,6 +32,7 @@ Rows: 66.
 | `system.appearance.mode` | enum `light \| dark \| auto` | `"light"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | Light or Dark appearance; `auto` is dark 19:00-07:00 by the local clock (the RTC until NETCLOCK gives a real time) (APPEARANCE B408). |
 | `system.audio.amp_holdoff_ms` | int `0..=600000` | consumer: `hda_amp::AMP_HOLDOFF_MS`, 5000 ms | operator | — | kernel HDA amp (`drivers/hda_amp.rs`) | Milliseconds of silence before the speaker amp powers down (PREFSKERNEL: declared from the kernel scan). |
 | `system.audio.mute` | bool | `false` | settings, keys, program | yes | kernel settings (audio) | Output muted. |
+| `system.audio.output` | enum `hda \| usb` | `"hda"` | settings, program | — | kernel audio sink seam (`audio/mod.rs`), Settings > General (Sound) | Where the kernel's sound goes: the internal HDA codec or the USB audio device (UAC1 B706); USB holds only while one is streaming. |
 | `system.audio.volume` | int `0..=16` | `12` | settings, keys, program | yes | kernel settings (audio) | Output level in sixteenths. |
 | `system.display.brightness` | int `1..=16` | `12` | settings, keys, program | yes | kernel settings, backlight | Panel level in sixteenths; never 0 (BRIGHTFLOOR: the backlight's OFF belongs to the idle blank). |
 | `system.display.font` | enum `sans \| serif \| mono` | `"sans"` | program | yes | kernel `video::text` (KERNELFONT) | The UI typeface family for captions, menus and running text: DejaVu Sans, Serif or Sans Mono (KERNELFONT B359; the console grid is always mono). |

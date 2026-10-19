@@ -211,6 +211,11 @@ pub static SCHEMA: &[Key] = &[
         doc: "Output muted.",
     },
     Key {
+        ns: "system", key: "audio.output", kind: Kind::Enum(&["hda", "usb"]), default: Default::Str("hda"),
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel audio sink seam (`audio/mod.rs`), Settings > General (Sound)",
+        doc: "Where the kernel's sound goes: the internal HDA codec or the USB audio device (UAC1 B706); USB holds only while one is streaming.",
+    },
+    Key {
         ns: "system", key: "audio.volume", kind: Kind::Int { min: 0, max: 16 }, default: Default::Int(12),
         writers: &[Writer::Settings, Writer::Keys, Writer::Program], reader: "kernel settings (audio)",
         doc: "Output level in sixteenths.",
