@@ -10,9 +10,9 @@
 //!   changes, a rename when it does not —, [`copy`] — a duplicate when the folder is the source's own —, [`mkdir`],
 //!   [`trash`], [`restore`]), which runs the SAME op body the menu ran before (`ops::op_*`, `fs::trash::*`) and, on
 //!   success, pushes `{verb, from, to, inode, when}`. A push clears the redo stack.
-//! * Ctrl+Z ([`undo`]) pops the newest entry and applies its inverse: a move/rename renames back, a Trash restores
+//! * ⌘Z (`Action::Undo`, [`undo`]) pops the newest entry and applies its inverse: a move/rename renames back, a Trash restores
 //!   (trash_core's own `restore`), a Restore goes back to the Trash, a copy's copy goes to the Trash, a new folder is
-//!   removed while it is still empty. Ctrl+Shift+Z ([`redo`]) re-applies the verb. The inverse runs the op bodies
+//!   removed while it is still empty. ⌘⇧Z (`Action::Redo`, [`redo`]) re-applies the verb. The inverse runs the op bodies
 //!   directly, never the wrappers, so applying it never pushes.
 //! * An inverse that no longer applies — the object is gone, its inode is not the one the verb left, the name it
 //!   would take is occupied, the folder is no longer empty, the Trash no longer holds it — is REFUSED: a toast says
@@ -465,12 +465,12 @@ fn step(back: bool, seq: Option<u64>) -> Result<Verb, &'static str> {
     }
 }
 
-/// Ctrl+Z / Edit > Undo: the newest entry's inverse.
+/// ⌘Z (`Action::Undo`) / Edit > Undo: the newest entry's inverse.
 pub fn undo() -> Result<Verb, &'static str> {
     step(true, None)
 }
 
-/// Ctrl+Shift+Z / Edit > Redo: the newest undone entry again.
+/// ⌘⇧Z (`Action::Redo`) / Edit > Redo: the newest undone entry again.
 pub fn redo() -> Result<Verb, &'static str> {
     step(false, None)
 }
@@ -520,7 +520,7 @@ pub fn fixture_put(saved: Journal) {
 }
 
 /// crawl A 1 — Log Out (`desktopbuild::teardown`): the journal is the SESSION's. Both stacks dropped, so the next
-/// user's Ctrl+Z / Edit > Undo can never replay the previous user's renames, Trash restores or folder removals on
+/// user's ⌘Z / Edit > Undo can never replay the previous user's renames, Trash restores or folder removals on
 /// their paths. The seq counter keeps counting (an old toast's `Undo` then finds no entry: `refused:nothing`).
 pub fn clear() {
     let mut j = JOURNAL.lock();
