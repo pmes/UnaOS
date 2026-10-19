@@ -683,15 +683,43 @@ fn do_delete() {
     refresh(None);
 }
 
-/// TRASH (R75): Delete = move to `.Trash` (index line appended).
+/// TRASH (R75): Delete = move to `.Trash` (index line appended). TRASHTOAST (B747): the verb carries the selection
+/// (the DRAGDROP2 marks plus the selected row, `dragdrop::selected_paths`) inside ONE undo batch: one journal entry,
+/// one `Undo` toast; a single row is the classic entry, toast and status line.
 fn do_trash() {
-    let Some((_, path, _)) = selection() else { return };
-    match crate::video::quarry::undo::trash(&path) {
-        Ok(n) => say(alloc::format!("moved to Trash as {}", n)),
-        Err(e) => {
-            refuse_notice(&e);
-            say(alloc::format!("trash refused ({})", e));
+    use crate::video::quarry::undo;
+    let paths = match MODEL.lock().as_ref() {
+        Some(m) => super::dragdrop::selected_paths(m),
+        None => return,
+    };
+    if paths.is_empty() {
+        return;
+    }
+    undo::batch_begin();
+    let mut moved: Vec<String> = Vec::new();
+    let mut refused: Option<String> = None;
+    for p in paths.iter() {
+        match undo::trash(p) {
+            Ok(n) => moved.push(n),
+            Err(e) => {
+                if refused.is_none() {
+                    refused = Some(e);
+                }
+            }
         }
+    }
+    let _ = undo::batch_end();
+    if !moved.is_empty() {
+        super::dragdrop::marks_clear();
+    }
+    if let Some(e) = &refused {
+        refuse_notice(e);
+    }
+    match (moved.len(), refused) {
+        (0, Some(e)) => say(alloc::format!("trash refused ({})", e)),
+        (0, None) => {}
+        (1, _) => say(alloc::format!("moved to Trash as {}", moved[0])),
+        (k, _) => say(alloc::format!("moved {} items to Trash", k)),
     }
     refresh(None);
 }

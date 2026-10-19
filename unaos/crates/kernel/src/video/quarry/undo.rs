@@ -20,6 +20,8 @@
 //! * The Trash toast carries `Undo` (notify `ACT_UNDO`, the entry's seq as its argument; TOASTCAP's 5 s card); a press
 //!   undoes that entry while it is still the newest. The Edit menu's Undo/Redo rows read [`menu_label`].
 //!
+//! * TRASHTOAST (B747): a Trash verb over several items is ONE entry and ONE toast ([`batch_begin`]/[`batch_end`]).
+//!
 //! Wire: `[quarry] undo push verb=<v> from=<p> to=<p> depth=<n> at_ms=<t>`, `[quarry] undo verb=<v> from=<p> to=<p>
 //! -> ok|refused:<why>`, `[quarry] redo verb=<v> from=<p> to=<p> -> ok|refused:<why>`. `tests undomove` (the
 //! `tests.rs` tail) → `:: UNDOMOVE: pushed=4 undone=4 redone=4 refused=1 leftovers=0 -> PASS ::`.
@@ -106,6 +108,9 @@ pub struct Entry {
     /// Uptime ms at the push.
     pub when: u64,
     held: String,
+    /// TRASHTOAST (B747): a Trash verb over several items is ONE entry — `(original path, name in the Trash)` per
+    /// item, in the order trashed (empty for every other entry, and for a one-item Trash).
+    members: Vec<(String, String)>,
 }
 
 /// The two stacks. `undo` newest last; `redo` newest last.
@@ -136,6 +141,10 @@ fn id_of(t: &MountTable, p: &str) -> Option<u64> {
 
 /// Push a verb's entry (a new verb clears the redo stack). Returns the entry's seq.
 fn push(verb: Verb, from: &str, to: &str, inode: Option<u64>) -> u64 {
+    push_with(verb, from, to, inode, Vec::new())
+}
+
+fn push_with(verb: Verb, from: &str, to: &str, inode: Option<u64>, members: Vec<(String, String)>) -> u64 {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let when = crate::arch::ms();
     let depth = {
@@ -143,7 +152,7 @@ fn push(verb: Verb, from: &str, to: &str, inode: Option<u64>) -> u64 {
         if j.undo.len() >= DEPTH {
             j.undo.remove(0);
         }
-        j.undo.push(Entry { seq, verb, from: String::from(from), to: String::from(to), inode, when, held: String::new() });
+        j.undo.push(Entry { seq, verb, from: String::from(from), to: String::from(to), inode, when, held: String::new(), members });
         j.redo.clear();
         mirror(&j);
         j.undo.len()
@@ -178,11 +187,73 @@ pub fn mkdir(path: &str) -> Result<(), String> {
 }
 
 /// Move `path` to the Trash (`fs::trash::trash`, trash_core). Returns the trashed name. The toast carries `Undo`.
+/// Inside a [`batch_begin`]/[`batch_end`] pair the item is recorded silently: the batch is ONE entry and ONE toast.
 pub fn trash(path: &str) -> Result<String, String> {
     let name = crate::fs::trash::trash(path)?;
+    {
+        let mut b = BATCH.lock();
+        if let Some(v) = b.as_mut() {
+            v.push((String::from(path), name.clone()));
+            let n = v.len();
+            drop(b);
+            serial_println!("[quarry] trash batch add path={} name={} n={}", path, name, n);
+            return Ok(name);
+        }
+    }
     let seq = push(Verb::Trash, path, &name, None);
-    let _ = crate::video::notify::post_full(b"Quarry", b"Moved to Trash", leaf(path).as_bytes(), b"Undo", crate::video::notify::ACT_UNDO, &seq.to_le_bytes());
+    trash_toast(b"Moved to Trash", leaf(path).as_bytes(), seq);
     Ok(name)
+}
+
+// ── TRASHTOAST (rmbp-ledger B747; crawl A 26) — one toast and one entry per Trash verb ──────────────────────────
+// A verb over N items (`ops::do_trash` over the selection) opens a batch; each `trash` records `(path, name)`
+// silently; `batch_end` pushes ONE entry (a one-item batch is exactly the classic entry and toast) and posts ONE
+// toast whose `Undo` (the entry's seq, BP-video-29) restores every item, newest first. `BATCH` is a leaf lock.
+
+static BATCH: crate::sync::Mutex<Option<Vec<(String, String)>>> = crate::sync::Mutex::new(None);
+/// Trash toasts posted (every one goes through [`trash_toast`]) — `tests trashtoast`'s `toasts=`.
+static TRASH_TOASTS: AtomicU64 = AtomicU64::new(0);
+
+fn trash_toast(title: &[u8], line: &[u8], seq: u64) {
+    TRASH_TOASTS.fetch_add(1, Ordering::Relaxed);
+    let _ = crate::video::notify::post_full(b"Quarry", title, line, b"Undo", crate::video::notify::ACT_UNDO, &seq.to_le_bytes());
+}
+
+/// Trash toasts posted so far this boot.
+pub fn trash_toasts() -> u64 {
+    TRASH_TOASTS.load(Ordering::Relaxed)
+}
+
+/// Open a Trash batch (an already-open batch stays the one batch).
+pub fn batch_begin() {
+    let mut b = BATCH.lock();
+    if b.is_none() {
+        *b = Some(Vec::new());
+    }
+}
+
+/// Close the batch: nothing trashed = nothing; one item = the classic entry and toast; N items = ONE entry and ONE
+/// toast `Moved <n> items to Trash` / `Undo`. Returns the entry's seq (`None` = nothing was trashed).
+pub fn batch_end() -> Option<u64> {
+    let v = BATCH.lock().take()?;
+    match v.len() {
+        0 => None,
+        1 => {
+            let (path, name) = &v[0];
+            let seq = push(Verb::Trash, path, name, None);
+            trash_toast(b"Moved to Trash", leaf(path).as_bytes(), seq);
+            Some(seq)
+        }
+        n => {
+            let first = v[0].0.clone();
+            let title = alloc::format!("Moved {} items to Trash", n);
+            let line = leaf(&parent(&first));
+            let seq = push_with(Verb::Trash, &first, &alloc::format!("items:{}", n), None, v);
+            trash_toast(title.as_bytes(), line.as_bytes(), seq);
+            serial_println!("[quarry] trash batch items={} toasts=1 seq={}", n, seq);
+            Some(seq)
+        }
+    }
 }
 
 /// Restore the trashed `name` to its original path (`fs::trash::restore`). Returns that path.
@@ -256,6 +327,31 @@ fn apply(e: &mut Entry, back: bool) -> Result<(), &'static str> {
                 ops::op_mkdir(&e.to).map_err(|_| "mkdir-failed")?;
                 e.inode = id_of(&t, &e.to);
                 Ok(())
+            }
+        }
+        Verb::Trash if !e.members.is_empty() => {
+            // TRASHTOAST (B747): the whole verb — every original must be free / present before anything moves.
+            if back {
+                if e.members.iter().any(|(orig, _)| t.stat(orig).is_ok()) {
+                    return Err("occupied");
+                }
+                let mut ok = true;
+                for (_, name) in e.members.iter().rev() {
+                    ok &= crate::fs::trash::restore(name).is_ok();
+                }
+                if ok { Ok(()) } else { Err("not-in-trash") }
+            } else {
+                if e.members.iter().any(|(orig, _)| t.stat(orig).is_err()) {
+                    return Err("gone");
+                }
+                let mut ok = true;
+                for (orig, name) in e.members.iter_mut() {
+                    match crate::fs::trash::trash(orig) {
+                        Ok(n) => *name = n,
+                        Err(_) => ok = false,
+                    }
+                }
+                if ok { Ok(()) } else { Err("trash-refused") }
             }
         }
         Verb::Trash => {
@@ -430,4 +526,6 @@ pub fn clear() {
     let mut j = JOURNAL.lock();
     *j = Journal::default();
     mirror(&j);
+    drop(j);
+    *BATCH.lock() = None;
 }
