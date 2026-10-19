@@ -4665,7 +4665,7 @@ fn a11y_filter_moved() {
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))]
 pub(crate) mod backup {
     use super::{btn_at, groups, mid_y, txt2, txt_ink, State, BTN_H, LABEL_X, ROWS};
-    use crate::fs::unafs::geodew::job::{self, Req, BACKING_UP, MEASURING, RESTORING};
+    use crate::fs::geodew::job::{self, Req, BACKING_UP, MEASURING, RESTORING};
     use crate::video::theme;
     use alloc::format;
     use alloc::string::String;

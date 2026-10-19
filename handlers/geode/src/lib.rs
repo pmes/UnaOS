@@ -27,39 +27,23 @@
 //! is not carried: the target volume allocates its own, and the small/large split is re-decided by the
 //! same `set_attribute` rule, so it lands the same. An archive is parsed and checked whole (checksum, every
 //! path, every parent) before either unpack writes anything.
+//!
+//! The encoder and decoder are `geode_core`'s (GEODEMOD SR157, `unaos/libs/fs/geode_core`): ONE codec, which the
+//! kernel's backup (`unaos/crates/kernel/src/fs/geodew.rs`) compiles from the same file.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-use unafs::codec::{Decode, Reader, Writer};
 use unafs::fs::FileSystemError;
-use unafs::{AttributeValue, BlockDevice, FileKind, UnaFS};
+use unafs::{BlockDevice, FileKind, UnaFS};
 
-/// The header magic.
-pub const MAGIC: &[u8; 8] = b"GEODEAR1";
-/// The trailer magic.
-pub const END: &[u8; 8] = b"GEODEEND";
-/// The format version this build writes and reads.
-pub const VERSION: u32 = 1;
+// GEODEMOD (LEDGER SR157): the format's ONE encoder and decoder is `geode_core` (no_std), which the kernel's
+// `fs/geodew.rs` compiles too; this crate keeps what needs std and a volume (pack, unpack, plain extraction).
+pub use geode_core::{END, Entry, MAGIC, VERSION, leaf, parent_of, write_archive};
+
 /// Deepest directory nesting a pack walks before calling the volume corrupt (unafs's own path bound).
 pub const MAX_DEPTH: usize = unafs::fs::MAX_PATH_DEPTH;
-
-/// One archived entry: the portable part of a UnaFS record.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Entry {
-    /// Relative path under the packed directory, '/'-joined.
-    pub path: String,
-    /// `File` or `Directory`.
-    pub kind: FileKind,
-    pub ctime: u64,
-    pub mtime: u64,
-    pub atime: u64,
-    /// Every attribute of the inode, small and spilled.
-    pub attributes: BTreeMap<String, AttributeValue>,
-    /// A file's contents (empty for a directory).
-    pub data: Vec<u8>,
-}
 
 /// What can go wrong.
 #[derive(Debug)]
@@ -107,115 +91,13 @@ fn bad(why: impl Into<String>) -> GeodeError {
 }
 
 // ---------------------------------------------------------------------------
-// Encode / decode
+// Decode (the encoder is `geode_core::write_archive`, re-exported above)
 // ---------------------------------------------------------------------------
 
-/// Encode entries as a `.geode` v1 archive.
-pub fn write_archive(entries: &[Entry]) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.raw(MAGIC);
-    w.u32(VERSION);
-    w.u64(entries.len() as u64);
-    for e in entries {
-        w.str(&e.path);
-        unafs::codec::Encode::encode(&e.kind, &mut w);
-        w.u64(e.ctime);
-        w.u64(e.mtime);
-        w.u64(e.atime);
-        w.map(&e.attributes);
-        w.bytes(&e.data);
-    }
-    let mut out = w.into_bytes();
-    let sum = unafs::hash::hash_bytes(&out);
-    out.extend_from_slice(END);
-    out.extend_from_slice(&sum.to_le_bytes());
-    out
-}
-
-/// Parse and check a whole archive: magic, version, checksum, every record, every path and its parent.
+/// Parse and check a whole archive: magic, version, checksum, every record, every path and its parent — the shared
+/// core's decoder (`geode_core::read_archive`); its refusal word is the `Format` reason.
 pub fn read_archive(bytes: &[u8]) -> Result<Vec<Entry>, GeodeError> {
-    if bytes.len() < MAGIC.len() + 4 + 8 + END.len() + 8 {
-        return Err(bad("shorter than a header and a trailer"));
-    }
-    let (body, trailer) = bytes.split_at(bytes.len() - 16);
-    if &trailer[..8] != END {
-        return Err(bad("trailer magic missing (truncated?)"));
-    }
-    let want = u64::from_le_bytes(trailer[8..].try_into().expect("8 bytes"));
-    let got = unafs::hash::hash_bytes(body);
-    if want != got {
-        return Err(bad(format!("checksum {got:016x} != trailer {want:016x}")));
-    }
-    let mut r = Reader::new(body, body.len(), "Geode");
-    let magic: [u8; 8] = r.array("Geode.magic").map_err(|e| bad(e.to_string()))?;
-    if &magic != MAGIC {
-        return Err(bad("header magic"));
-    }
-    let version = r.u32("Geode.version").map_err(|e| bad(e.to_string()))?;
-    if version != VERSION {
-        return Err(bad(format!("version {version} (this build reads {VERSION})")));
-    }
-    let count = r.u64("Geode.entries").map_err(|e| bad(e.to_string()))?;
-    // Each entry is at least 8 + 4 + 24 + 8 + 8 bytes: a count past that is refused before any allocation.
-    if count > (r.remaining() / 52) as u64 {
-        return Err(bad(format!("entries={count} cannot fit the {} bytes left", r.remaining())));
-    }
-    let mut entries = Vec::with_capacity(count as usize);
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for _ in 0..count {
-        let path = r.string("Geode.path").map_err(|e| bad(e.to_string()))?;
-        let kind = FileKind::decode(&mut r).map_err(|e| bad(e.to_string()))?;
-        let ctime = r.u64("Geode.ctime").map_err(|e| bad(e.to_string()))?;
-        let mtime = r.u64("Geode.mtime").map_err(|e| bad(e.to_string()))?;
-        let atime = r.u64("Geode.atime").map_err(|e| bad(e.to_string()))?;
-        let attributes = r.map::<AttributeValue>("Geode.attrs").map_err(|e| bad(e.to_string()))?;
-        let data = r.bytes("Geode.data").map_err(|e| bad(e.to_string()))?;
-        check_path(&path)?;
-        if !matches!(kind, FileKind::File | FileKind::Directory) {
-            return Err(GeodeError::Unsupported { path, kind });
-        }
-        if kind == FileKind::Directory && !data.is_empty() {
-            return Err(bad(format!("{path}: a directory carries data")));
-        }
-        if let Some((parent, _)) = path.rsplit_once('/') {
-            if !dirs.contains(parent) {
-                return Err(bad(format!("{path}: parent {parent} is not an earlier directory entry")));
-            }
-        }
-        if !seen.insert(path.clone()) {
-            return Err(bad(format!("{path}: repeated")));
-        }
-        if kind == FileKind::Directory {
-            dirs.insert(path.clone());
-        }
-        entries.push(Entry { path, kind, ctime, mtime, atime, attributes, data });
-    }
-    if r.remaining() != 0 {
-        return Err(bad(format!("{} bytes after the last entry", r.remaining())));
-    }
-    Ok(entries)
-}
-
-/// A path the archive may name: relative, '/'-joined, every component a real name.
-fn check_path(path: &str) -> Result<(), GeodeError> {
-    if path.is_empty() {
-        return Err(bad("an empty path"));
-    }
-    for c in path.split('/') {
-        if c.is_empty() || c == "." || c == ".." || c.contains('\0') || c.contains('\\') {
-            return Err(bad(format!("path {path:?}: component {c:?} refused")));
-        }
-    }
-    Ok(())
-}
-
-fn leaf(path: &str) -> &str {
-    path.rsplit_once('/').map(|(_, l)| l).unwrap_or(path)
-}
-
-fn parent_of(path: &str) -> &str {
-    path.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+    geode_core::read_archive(bytes).map_err(bad)
 }
 
 // ---------------------------------------------------------------------------

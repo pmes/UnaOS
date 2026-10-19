@@ -1795,7 +1795,15 @@ dependencies = [
 name = "geode"
 version = "0.1.0"
 dependencies = [
+ "geode_core",
  "una-abi",
+ "unafs",
+]
+
+[[package]]
+name = "geode_core"
+version = "0.1.0"
+dependencies = [
  "unafs",
 ]
 

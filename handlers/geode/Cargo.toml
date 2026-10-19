@@ -12,6 +12,8 @@ path = "src/lib.rs"
 # The store and its record codec (docs/dev/OS/09_FILESYSTEM/unafs-records.md §R1/§R5): the archive's attribute
 # bytes ARE the §R5 bytes, written and read by unafs::codec, never a second encoder.
 unafs = { path = "../../unaos/libs/fs/unafs" }
+# GEODEMOD (LEDGER SR157): the format's ONE encoder/decoder, no_std, which the kernel's fs/geodew.rs compiles too.
+geode_core = { path = "../../unaos/libs/fs/geode_core" }
 
 [dev-dependencies]
 # GATE-ATTRKEYS: the tests name registered keys by their constants, never by a literal.

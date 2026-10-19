@@ -18,6 +18,7 @@ members = [
     "unaos/libs/sys/palette_core", # PALETTECORE (B559): the one no_std palette table the kernel and the four ring-3 programs link
     "unaos/libs/fs/kvstore_core", # AETHERSTORAGE (SR94): the no_std ordered KV store (one log file per database, undoable txns, IDB key encoding) Aether storage links
     "unaos/libs/fs/trash_core", # TRASHCORE (B449): the one Trash core Matrix's VaultTrash and the kernel's fs/trash.rs share
+    "unaos/libs/fs/geode_core", # GEODEMOD (SR157): the one .geode v1 encoder/decoder handlers/geode and the kernel's fs/geodew.rs share
     "unaos/libs/fs/matrix_core", # MATRIXCORE (SR99): the no_std Map core (tree model, ignore rules, Finder listing, token indexer, query) handlers/matrix and UNA.ELF link
     "unaos/libs/sys/wifi_core",
     "unaos/libs/sys/usbnet_core", # NETFRAME (B368): the USB Ethernet rx framing core the kernel driver and the host KATs share

@@ -371,7 +371,7 @@ v2 inode ids are physical block ids; `legacy::LegacyVolume` reads it, nothing wr
 * `tools/unafs dump --records <image>` prints every record of a volume, field by field, in this
   page's names and order.
 * The `.geode` v1 archive (Geode, GEODEMETA SR148) carries these records whole in the §R1 codec: the host
-  crate `handlers/geode` packs and unpacks it; the KERNEL's writer and reader is
+  crate `handlers/geode` packs and unpacks it, its ONE encoder/decoder `unaos/libs/fs/geode_core` (GEODEMOD SR157) both rings link; the KERNEL's writer and reader is
   `unaos/crates/kernel/src/fs/geodew.rs` (GEODEBACKUP, rmbp-ledger B740: Settings > Storage backs the home up to a
   removable volume and restores it, streaming, a chunk per mount hold). Neither carries a file's previous
   versions (§R17 `una:versions`): v1 has no field for them.

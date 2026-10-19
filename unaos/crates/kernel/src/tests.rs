@@ -3904,7 +3904,7 @@ fn gb_records<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>, id: u64, rel:
 
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn geodebackup_selftest() {
-    use crate::fs::unafs::geodew::{self, Bytes};
+    use crate::fs::geodew::{self, Bytes};
     use ::unafs::codec::{Encode, Writer};
     use ::unafs::fs::FileSystemError;
     use ::unafs::{AttributeValue as A, FileKind, MemDevice, UnaFS};

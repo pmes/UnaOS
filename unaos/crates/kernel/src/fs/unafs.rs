@@ -3720,8 +3720,8 @@ pub fn keyboot_adopt(handle: block::BlockHandle, key: Option<::unafs::VolumeKey>
 // =================================================================================================
 // GEODEBACKUP (rmbp-ledger B740, BP-storage-28) — TAIL-APPENDED, so no line above moves. The record read seam the
 // kernel's `.geode` writer (`geodew`, below) archives: an inode's WHOLE attribute set — its small `attributes` and
-// every spilled `large_attributes` value read back (the host crate's `entry_of` rule, handlers/geode). The module
-// is declared here, under this file's cfg, because `fs/mod.rs` is outside the arc's files.
+// every spilled `large_attributes` value read back (the host crate's `entry_of` rule, handlers/geode). GEODEMOD
+// (SR157): the module is declared in `fs/mod.rs` under this file's cfg; re-exported here so `fs::unafs::geodew` holds.
 // =================================================================================================
 
 /// GEODEBACKUP (B740): every attribute of inode `id` (`ino` = its record), small and spilled, keys ascending.
@@ -3739,5 +3739,4 @@ pub fn record_attrs_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, id: u64, ino:
 }
 
 /// GEODEBACKUP (B740): the kernel's `.geode` v1 writer and reader, and the Settings face's worker.
-#[path = "geodew.rs"]
-pub mod geodew;
+pub use super::geodew;

@@ -41,7 +41,7 @@ pub mod bootdisk;
 pub mod sdhc4c;
 
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))] // UNAFSX86: x86 arms it with UNAOS_UNAFS=1
-pub mod unafs;
+pub mod unafs; #[cfg(any(target_arch = "aarch64", feature = "unafs"))] pub mod geodew; // GEODEMOD (SR157): GEODEBACKUP's .geode writer/reader (B740), unafs's cfg; folded LINE-NEUTRAL
 
 /// VFS-1: the unifying virtual-filesystem spine (mount table + resolver + the
 /// backend trait, with thin adapters over FAT and native UnaFS). Design of
