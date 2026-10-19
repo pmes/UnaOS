@@ -1,4 +1,4 @@
-//! CHARTER: Geode — shared-core (the `.geode` v1 codec is `unaos/libs/fs/geode_core`, compiled here by path from the file `handlers/geode` links: ONE encoder, ONE decoder; GEODEMOD SR157)
+//! CHARTER: Geode — shared-core (the `.geode` v1 codec is `unaos/libs/fs/geode_core`, the crate `handlers/geode` links, a normal kernel dependency: ONE encoder, ONE decoder; GEODEMOD SR157, GEODEDEP SR160)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //!
@@ -8,8 +8,8 @@
 //!
 //! GEODEMOD (LEDGER SR157): the format — header, entry heads, trailer, the bounded streaming decoder and the
 //! archive's structural rules — is [`geode_core`], the very file the host handler (`handlers/geode`) links
-//! (`unaos/libs/fs/geode_core/src/archive.rs`, compiled here by `#[path]`: the KELFSTAGE shape,
-//! `install/abimage.rs`). This module keeps only what is the kernel's: the volume walk, the mount holds and the
+//! (`unaos/libs/fs/geode_core`, a normal kernel dependency since GEODEDEP SR160; GEODEMOD's `#[path]` is
+//! retired). This module keeps only what is the kernel's: the volume walk, the mount holds and the
 //! Settings face's worker.
 //!
 //! * **The writer streams.** [`plan`] walks the directory in the crate's order (pre-order, siblings in `ls` order)
@@ -35,10 +35,10 @@ use alloc::vec::Vec;
 use ::unafs::fs::{DirEntry, FileSystemError};
 use ::unafs::{BlockDevice, FileKind, UnaFS};
 
-/// GEODEMOD (SR157): the shared `.geode` v1 codec — the host handler's own file.
-#[allow(dead_code)]
-#[path = "../../../../libs/fs/geode_core/src/archive.rs"]
-pub mod geode_core;
+// GEODEMOD (SR157): the shared `.geode` v1 codec — the host handler's own crate. GEODEDEP (SR160): a normal
+// dependency (crates/kernel/Cargo.toml, `geode_core` under `unafs` and the aarch64 deps), no longer `#[path]`;
+// re-exported under its old name so `fs::geodew::geode_core` and every `geode_core::…` below hold unchanged.
+pub use ::geode_core;
 
 pub use self::geode_core::{Bytes, Sink, Src, Why, CHUNK};
 use self::geode_core::{leaf, parent_of, Decoder, Encoder, HEADER_LEN, TRAILER_LEN};

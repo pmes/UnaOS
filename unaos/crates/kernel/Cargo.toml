@@ -3622,7 +3622,7 @@ root-prefer-sdhc = []
 # `any(target_arch = "aarch64", feature = "unafs")`), so Pi/Orin images are unchanged with or without it;
 # on x86 the dependency is `optional` and default OFF keeps the x86 image byte-identical (the K3-N1 size
 # band). See docs/dev/evidence/rmbp-1001/UNAFSX86.md.
-unafs = ["dep:unafs"]
+unafs = ["dep:unafs", "dep:geode_core"] # GEODEDEP (SR160): the .geode v1 codec rides the same knob
 # AHCIROOT (rmbp-ledger B332, R82): `UNAOS_AHCIROOT=1` — the rMBP's internal SSD becomes the UnaFS root. The
 # kernel-held SATA write grant (`block::AHCI_LIVE_GRANT`, one port, one LBA range, held only by
 # `install ssd --write` for the verb's lifetime, by the boot's root bind over an OURS disk's UnaFS p2, or by
@@ -3981,6 +3981,9 @@ av1_core = { path = "../../libs/media/av1_core", optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 unafs = { path = "../../libs/fs/unafs", default-features = false }
+# GEODEDEP (SR160, BP-storage-28): Geode's shared core, the ONE `.geode` v1 encoder/decoder handlers/geode links;
+# unconditional here because fs/geodew.rs is (aarch64 carries the unafs module unconditionally).
+geode_core = { path = "../../libs/fs/geode_core" }
 # BeFS-K3: the native UnaFS filesystem, no_std core only (on-disk types, codec,
 # BlockDevice/SectorDevice adapter seam). The default `std` feature would pull
 # host-native backends (FileDevice/mmap/bandy/query) — never enable it here.
@@ -4001,6 +4004,8 @@ unaos-xusb-fw = { path = "../xusb-fw", optional = true }
 smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "multicast"], optional = true }
 # UNAFSX86: the same no_std UnaFS core, OPTIONAL on x86 — pulled only by the `unafs` feature (UNAOS_UNAFS=1).
 unafs = { path = "../../libs/fs/unafs", default-features = false, optional = true }
+# GEODEDEP (SR160): the `.geode` v1 codec fs/geodew.rs uses, a normal dependency (was `#[path]`), pulled only by `unafs`.
+geode_core = { path = "../../libs/fs/geode_core", optional = true }
 x86_64 = "0.15.5"
 uart_16550 = "0.9.0"
 # SOCK-1: mature TCP/IP stack (0BSD, #![no_std], heap-optional). x86-only + optional so aarch64 and
