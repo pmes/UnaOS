@@ -111,23 +111,29 @@ pub fn back() -> Option<crate::video::wm::desktop::Back<'static>> {
 /// file was found. Off the paint path (the
 /// default probe's worker on x86). Witness: `:: WALLPAPER: src=procedural WxH=<w>x<h> scaled=<w>x<h> letterbox=0 ms=<n> -> PASS ::`.
 fn generate() -> bool {
+    let Some(pi) = crate::video::panel_info_nonblocking() else { return false };
+    generate_sized(pi.width, pi.height, None).is_some()
+}
+
+/// The generation itself at `pw` x `ph`; `tap` sees the finished picture before it is installed (STARTSCENE: the boot
+/// splash copies it into its hold store). Returns the generator's `wall_ms`.
+fn generate_sized(pw: usize, ph: usize, tap: Option<&mut dyn FnMut(&[u32])>) -> Option<u64> {
     let t0 = crate::arch::ms();
     let epoch = crate::video::theme::epoch(); // MENUSCRAFT (B642): the accent this picture is drawn in
-    let Some(pi) = crate::video::panel_info_nonblocking() else { return false };
-    let (pw, ph) = (pi.width, pi.height);
+    let dark = crate::video::theme::is_dark(); // STARTSCENE (B662): the Light/Dark set the scene's pairs were read in
     if pw == 0 || ph == 0 {
-        return false;
+        return None;
     }
     let mut buf: Vec<u32> = Vec::new();
     if buf.try_reserve_exact(pw * ph).is_err() {
-        return false;
+        return None;
     }
     buf.resize(pw * ph, DESKTOP_BG);
     let scene = crate::video::wm::desktop::wall_gen(&mut buf, pw, ph);
     let wall_ms = crate::arch::ms().saturating_sub(t0);
-    let Some((veil, vw, vh)) = crate::video::wm::desktop::veil_gen(&buf, pw, ph) else { return false };
+    let (veil, vw, vh) = crate::video::wm::desktop::veil_gen(&buf, pw, ph)?;
     if OFF.load(Ordering::Relaxed) || (active() && !PROCEDURAL.load(Ordering::Relaxed)) {
-        return false; // `wallpaper off`, or a picture file, arrived while this ran
+        return None; // `wallpaper off`, or a picture file, arrived while this ran
     }
     match scene.as_ref() {
         Some(sc) => serial_println!(
@@ -137,17 +143,25 @@ fn generate() -> bool {
         ),
         None => serial_println!("[starfield] gen wall_ms={} scene=none surface={}x{}", wall_ms, pw, ph),
     }
+    if let Some(t) = tap {
+        t(&buf);
+    }
+    if let Some(sc) = scene.as_ref() {
+        *STAR_SAMPLE.lock() = (sc.sample, sc.nsample); // STARTSCENE (B662): what the GOP stage must have lit
+    }
     let shim = scene.map(|sc| alloc::boxed::Box::new(sc.shimmer));
     install(Some(Wall { w: pw, h: ph, px: buf, veil, vw, vh, shim }));
+    GEN_COUNT.fetch_add(1, Ordering::AcqRel); // STARTSCENE (B662)
     PROCEDURAL.store(true, Ordering::Relaxed);
     GEN_EPOCH.store(epoch, Ordering::Release); // MENUSCRAFT
+    GEN_DARK.store(dark, Ordering::Release); // STARTSCENE (B662): the one theme input the scene reads
     STALE.store(true, Ordering::Release);
     crate::video::wm::desktop_repaint();
     crate::census_println!(
         ":: WALLPAPER: src=procedural WxH={}x{} scaled={}x{} letterbox=0 ms={} -> PASS ::",
         pw, ph, pw, ph, crate::arch::ms().saturating_sub(t0)
     );
-    true
+    Some(wall_ms)
 }
 
 static WALL: crate::sync::Mutex<Option<Wall>> = crate::sync::Mutex::new(None);
@@ -206,7 +220,7 @@ pub fn paint(fb: &FrameBuffer) {
 pub fn take_stale() -> bool {
     regen_on_theme(); // MENUSCRAFT (B642): a theme or accent change redraws the generated default and its VEIL
     poll();
-    crate::video::desktop_scene_owns_backdrop() && STALE.swap(false, Ordering::AcqRel)
+    owns_backdrop() && STALE.swap(false, Ordering::AcqRel) // STARTSCENE (B662): from the splash on, not only after REALDESK's latch
 }
 
 /// Re-arm the default probe (a new session user has a new `~/Desktop`).
@@ -263,9 +277,12 @@ fn probe(cpu: Option<usize>) {
     // witness after MAX_TRIES * RETRY_MS); painting is what `desktop_scene_owns_backdrop` gates, not probing.
     let n = TRIES.fetch_add(1, Ordering::Relaxed) + 1;
     let found = !crate::shell::vfs_mount_table().prefixes().is_empty() && load_default(); let found_or_made = found || (!active() && !OFF.load(Ordering::Relaxed) && generate()); let _ = found_or_made; // DESKTOPCRAFT (B631): no picture file -> the generated default, on this same try (the worker on x86); a file found on a later try replaces it
+    // STARTSCENE (B662): the generated picture already installed at this panel's size (the boot splash's) is KEPT —
+    // `!active()` above declines the second generation; a theme change is `regen_on_theme`'s, by epoch.
+    let kept = if !found && PROCEDURAL.load(Ordering::Relaxed) && fits_panel() { " kept=generated" } else { "" };
     match cpu {
-        Some(c) => serial_println!("[wallpaper] probe try={} found={} on=worker cpu={} ms={}", n, found as u8, c, crate::arch::ms().saturating_sub(t0)),
-        None => serial_println!("[wallpaper] probe try={} found={} on=inline ms={}", n, found as u8, crate::arch::ms().saturating_sub(t0)),
+        Some(c) => serial_println!("[wallpaper] probe try={} found={}{} on=worker cpu={} ms={}", n, found as u8, kept, c, crate::arch::ms().saturating_sub(t0)),
+        None => serial_println!("[wallpaper] probe try={} found={}{} on=inline ms={}", n, found as u8, kept, crate::arch::ms().saturating_sub(t0)),
     }
     if found || n >= MAX_TRIES {
         DONE.store(true, Ordering::Release);
@@ -406,6 +423,8 @@ pub fn probe_tries() -> u32 {
 
 /// The theme epoch the installed generated picture was drawn at (`u32::MAX` = none generated yet).
 static GEN_EPOCH: AtomicU32 = AtomicU32::new(u32::MAX);
+/// STARTSCENE (B662): the Light/Dark set the installed generated picture was drawn in.
+static GEN_DARK: AtomicBool = AtomicBool::new(false);
 /// The last regeneration try (ms), the rate limit.
 static REGEN_MS: AtomicU64 = AtomicU64::new(0);
 /// A regeneration is in flight on its worker.
@@ -417,6 +436,14 @@ fn regen_on_theme() {
     }
     let had = GEN_EPOCH.load(Ordering::Acquire);
     if had == u32::MAX || had == crate::video::theme::epoch() {
+        return;
+    }
+    // STARTSCENE (B662) M4: the scene reads only the Light/Dark set (`SfPal::live`, never the accent), so an epoch that
+    // moved only the accent or the highlight keeps the installed picture (the splash's): adopt the epoch, no second
+    // generation. A Light/Dark change still regenerates.
+    if GEN_DARK.load(Ordering::Acquire) == crate::video::theme::is_dark() {
+        GEN_EPOCH.store(crate::video::theme::epoch(), Ordering::Release);
+        serial_println!("[wallpaper] regen epoch={}->{} kept=generated reason=accent-only", had, crate::video::theme::epoch());
         return;
     }
     let now = crate::arch::ms() as u64;
@@ -443,4 +470,94 @@ fn regen_on_theme() {
 fn regen_task(_cpu: usize) {
     let _ = generate();
     REGENERATING.store(false, Ordering::Release);
+}
+
+// ── STARTSCENE (rmbp-ledger B662, R128) — ONE picture from the splash to the desktop ──────────────────────────────
+//
+// The boot splash's hold (`splash::hold_prepare`, on the boot core during the takeover: the heap is up, the panel size
+// known, the theme live) runs THE generation and installs it here, so the hold store, the login backdrop and the
+// desktop show the same pixels and the default probe keeps it (`kept=generated`). From that install the picture owns
+// the backdrop (`owns_backdrop`): x86 never sets REALDESK's latch (`retire_desktop_chrome` is the Pi's and the
+// Orin's), so `wm::wp_paint`, `take_stale` and the live shimmer were dark there. Design: STARFIELD.md §9.
+
+/// Generations installed this boot (the fixture's `gen_count`).
+static GEN_COUNT: AtomicU32 = AtomicU32::new(0);
+/// The splash's installed picture buffer (0 = the splash generated none).
+static SPLASH_PX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// The splash installed the scene: the picture owns the backdrop from here on.
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+/// The installed scene's 16 sampled star pixels (`wm::desktop::Scene::sample`).
+static STAR_SAMPLE: crate::sync::Mutex<([(u16, u16); 16], usize)> = crate::sync::Mutex::new(([(0, 0); 16], 0));
+
+/// STARTSCENE (B662): **the boot splash's generation** at `w` x `h` (the hold store's size): the scene is generated
+/// ONCE, `tap` copies it into the hold store, and it is INSTALLED as the wallpaper. Returns the generator's `wall_ms`,
+/// or `None` (a picture already installed, `wallpaper off`, or no memory) — the splash then paints its own frame.
+pub fn generate_splash(w: usize, h: usize, mut tap: impl FnMut(&[u32])) -> Option<u64> {
+    if OFF.load(Ordering::Relaxed) || active() {
+        return None;
+    }
+    let ms = generate_sized(w, h, Some(&mut tap))?;
+    let p = SNAP.load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: a published `Snap` is never freed (see [`Snap`]).
+        SPLASH_PX.store(unsafe { (*p).px } as usize, Ordering::Release);
+    }
+    CLAIMED.store(true, Ordering::Release);
+    serial_println!("[startscene] splash gen wall_ms={} surface={}x{} on=boot", ms, w, h);
+    Some(ms)
+}
+
+/// STARTSCENE (B662): does the installed picture (or the flat colour, once `off`) own the backdrop — REALDESK's latch,
+/// or the splash's install. Read by `wm::wp_paint`, [`take_stale`] and the live shimmer.
+pub fn owns_backdrop() -> bool {
+    crate::video::desktop_scene_owns_backdrop() || CLAIMED.load(Ordering::Acquire)
+}
+
+/// The installed picture is the panel's size.
+fn fits_panel() -> bool {
+    let p = SNAP.load(Ordering::Acquire);
+    let Some(pi) = crate::video::panel_info_nonblocking() else { return false };
+    // SAFETY: a published `Snap` is never freed (see [`Snap`]).
+    !p.is_null() && unsafe { (*p).w == pi.width && (*p).h == pi.height }
+}
+
+/// **`tests startscene`** (R80: a verb, never at boot) — the start scene was ONE picture: generated once (the
+/// installed buffer is the one the splash installed), the splash showed it, the hold shimmered, the GOP stage's stars
+/// are the picture's (all 16 sampled star pixels lit by `stars_into` on an offscreen `VOID` buffer), and the backdrop
+/// under the login screen is the picture.
+///
+/// `:: STARTSCENE: detail installed=<0|1> held_ms=<n> lit=<n>/<m> surface=<w>x<h> ::`
+/// `:: STARTSCENE: gen_count=1 splash_scene=1 gop_stars=ok hold_ticks=<n> login_backdrop=picture -> PASS ::`
+pub fn startscene_selftest() {
+    let gens = GEN_COUNT.load(Ordering::Acquire);
+    let p = SNAP.load(Ordering::Acquire);
+    // SAFETY: a published `Snap` is never freed (see [`Snap`]).
+    let (inst, w, h) = if p.is_null() { (0usize, 0usize, 0usize) } else { unsafe { ((*p).px as usize, (*p).w, (*p).h) } };
+    let splash_px = SPLASH_PX.load(Ordering::Acquire);
+    let installed = splash_px != 0 && inst == splash_px && PROCEDURAL.load(Ordering::Relaxed);
+    let gen_ok = gens == 1 && installed;
+    let splash_scene = crate::splash::scene_painted();
+    let (ticks, held_ms) = crate::splash::hold_stats();
+    let ticks_ok = held_ms < 66 || ticks > 0;
+    let (sample, ns) = *STAR_SAMPLE.lock();
+    let mut lit = 0usize;
+    let void = crate::video::wm::desktop::scene_void();
+    if w * h > 0 && ns > 0 {
+        let mut buf: Vec<u32> = Vec::new();
+        if buf.try_reserve_exact(w * h).is_ok() {
+            buf.resize(w * h, void);
+            if crate::video::wm::desktop::stars_into(&mut buf, w, h, crate::video::wm::desktop::STAR_SEED).is_some() {
+                let d = |a: u32, b: u32| [16u32, 8, 0].iter().map(|&s| (((a >> s) & 255) as i32 - ((b >> s) & 255) as i32).unsigned_abs()).sum::<u32>();
+                lit = sample[..ns.min(16)].iter().filter(|&&(x, y)| d(buf[y as usize * w + x as usize], void) >= 12).count();
+            }
+        }
+    }
+    let gop_ok = ns == 16 && lit == ns;
+    let backdrop = owns_backdrop() && active();
+    let ok = gen_ok && splash_scene && ticks_ok && gop_ok && backdrop;
+    serial_println!(":: STARTSCENE: detail installed={} held_ms={} lit={}/{} surface={}x{} ::", installed as u8, held_ms, lit, ns, w, h);
+    serial_println!(
+        ":: STARTSCENE: gen_count={} splash_scene={} gop_stars={} hold_ticks={} login_backdrop={} -> {} ::",
+        gens, splash_scene as u8, if gop_ok { "ok" } else { "FAIL" }, ticks, if backdrop { "picture" } else { "flat" }, if ok { "PASS" } else { "FAIL" }
+    );
 }

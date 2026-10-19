@@ -29471,7 +29471,7 @@ fn wp_active() -> bool { super::wallpaper::active() }
 #[inline]
 fn wp_row(layer: &super::FrameBuffer, py: usize, x: usize, w: usize) { super::wallpaper::row(layer, py, x, w) }
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-pub fn wp_paint(fb: &super::framebuffer::FrameBuffer) { if super::desktop_scene_owns_backdrop() { super::wallpaper::paint(fb) } }
+pub fn wp_paint(fb: &super::framebuffer::FrameBuffer) { if super::wallpaper::owns_backdrop() { super::wallpaper::paint(fb) } } // STARTSCENE (B662): REALDESK's latch OR the boot splash's install of the scene — the login screen's backdrop is the picture
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn wp_take_stale() -> bool { let s = super::wallpaper::take_stale(); if s { shadows_stale(); } s } // DESIGNAPPLY (B639): a reloaded picture re-fills every shadow on the next pass
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]

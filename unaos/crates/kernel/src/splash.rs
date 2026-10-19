@@ -748,16 +748,16 @@ pub fn hold_prepare() {
     }
     store.resize(len, 0);
     let t0 = crate::arch::ms();
-    // Same BGR/4-byte store the console window uses: the little-endian word 0x00RRGGBB wm reads.
-    paint(
-        store.as_mut_ptr() as usize,
-        len,
+    // Same BGR/4-byte store the console window uses: the little-endian word 0x00RRGGBB wm reads. STARTSCENE (B662): the
+    #[cfg(feature = "facet")] let scene = scene_into(&mut store, w, h); #[cfg(not(feature = "facet"))] let scene: Option<u64> = None; // SCENE, generated ONCE here and installed as the wallpaper (file foot); without the generator, the crystal as before
+    if scene.is_none() { paint( // the crystal is the fallback (no memory for the scene, or no generator in this build)
+        store.as_mut_ptr() as usize, len,
         FrameBufferInfo { width: w, height: h, stride: w, bytes_per_pixel: 4, pixel_format: unaos_boot_info::PixelFormat::Bgr },
         false,
-    );
+    ); }
     let ms = crate::arch::ms().saturating_sub(t0);
     *HOLD_SURF.lock() = Some((store, w, h));
-    serial_println!(":: SPLASH: arch={} WxH={}x{} ms={} -> painted ::", ARCH_NAME, w, h, ms);
+    serial_println!(":: SPLASH: arch={} WxH={}x{} ms={} scene={} wall_ms={} -> painted ::", ARCH_NAME, w, h, ms, scene.is_some() as u8, scene.unwrap_or(0));
 }
 
 /// Park the prepared surface as the topmost chromeless row. Called AFTER the desktop-clear and BEFORE the
@@ -790,23 +790,23 @@ pub fn hold_release(by: &str) {
         return;
     }
     HOLD_GLASS.store(false, Ordering::Relaxed);
-    let t_rel = crate::arch::ms();
+    let t_rel = crate::arch::ms(); HOLD_HELD.store(t_rel.saturating_sub(HOLD_T0.load(Ordering::Relaxed)), Ordering::Relaxed); // STARTSCENE (B662): for `tests startscene`
     crate::video::wm::clear_modal_top(id);
     crate::video::wm::close(id);
     *HOLD_SURF.lock() = None; #[cfg(all(target_arch = "x86_64", feature = "wc"))] PANEL_LIVE.store(false, Ordering::Release); // after the row is gone: nothing reads the surface any more. RESOLVEHANG2 (B531): the panel witness ends HERE, after `wm::close` returned (HOLD_WIN went to 0 at this function's top, so a step hung inside the close is still painted by `over_panel`)
     OVER_UP.store(false, Ordering::Relaxed); crate::fs::bootstep::splash_released(by); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { crate::video::wm::fbdirect::clear(crate::video::wm::fbdirect::SPLASH_WORD); } // FBDIRECT (B536): the word's end, AFTER `wm::close` returned — its band handed back to the compositor (windows beneath + backdrop), never left on the glass. SPLASHSTALL (B510): the splash's waits (`store-wait`, `first-screen`) end with the glass
     crate::bootlog_println!(
-        "[splash] held_ms={} released_by={} fade_ms={}",
+        "[splash] held_ms={} released_by={} fade_ms={} hold_ticks={}",
         t_rel.saturating_sub(HOLD_T0.load(Ordering::Relaxed)),
         by,
-        crate::arch::ms().saturating_sub(t_rel)
+        crate::arch::ms().saturating_sub(t_rel), HOLD_TICKS.load(Ordering::Relaxed) // STARTSCENE (B662): the hold's shimmer ticks
     );
 }
 
 /// The 5 s bound: a store that never answers must not strand the splash. Polled from the device-service pass.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn hold_service() {
-    if HOLD_WIN.load(Ordering::Relaxed) != 0 && crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) >= 5000 && !resolve_waiting_any() { // RESOLVEHANG2 (B531): not while stage-resolve waits (bounded, 8 s) for the console — the splash and its watchdog witness stay up through the step
+    #[cfg(feature = "facet")] hold_shimmer(); /* STARTSCENE (B662) M2: the held scene shimmers (file foot); same-line fold */ if HOLD_WIN.load(Ordering::Relaxed) != 0 && crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) >= 5000 && !resolve_waiting_any() { // RESOLVEHANG2 (B531): not while stage-resolve waits (bounded, 8 s) for the console — the splash and its watchdog witness stay up through the step
         hold_release("timeout");
     }
 }
@@ -825,10 +825,10 @@ pub fn hold_service() {
 pub fn gop_stage(base: usize, len: usize, info: FrameBufferInfo) {
     let t0 = crate::arch::ms();
     #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
-    boot_splash(base, len, info);
+    { #[cfg(not(all(feature = "wc", feature = "facet")))] boot_splash(base, len, info); #[cfg(all(feature = "wc", feature = "facet"))] if !gop_scene(base, len, info) { boot_splash(base, len, info); } } // STARTSCENE (B662): the scene's GROUND (VOID + the picture's stars) instead of the shards; same-line fold
     #[cfg(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))]
     {
-        paint(base, len, info, false);
+        #[cfg(not(all(feature = "wc", feature = "facet")))] paint(base, len, info, false); #[cfg(all(feature = "wc", feature = "facet"))] if !gop_scene(base, len, info) { paint(base, len, info, false); } // STARTSCENE (B662): same-line fold
         SPLASH_UP.store(true, Ordering::Relaxed);
     }
     serial_println!(":: SPLASH: stage=gop at_ms={} paint_ms={} WxH={}x{} ::", t0, crate::arch::ms().saturating_sub(t0), info.width, info.height);
@@ -1023,3 +1023,147 @@ pub fn step_label(_text: &str) {}
 fn resolve_waiting_any() -> bool { crate::fs::users::resolve_waiting() }
 #[cfg(not(feature = "login"))]
 fn resolve_waiting_any() -> bool { false }
+
+// =================================================================================================
+// STARTSCENE (rmbp-ledger B662, R128 — "i meant the both combined") — the START SCENE is on the glass from the first
+// frame. Design record: docs/dev/OS/05_USER_EXPERIENCE/STARFIELD.md §9. Everything here is appended at the foot, and
+// every call into it is a same-line fold or a line-count-equal rewrite inside a `wc`-gated body, so no knob-off line
+// moves and the knob-off image (no `wc`, so no `wm::desktop`) still paints the crystal.
+//
+//   GOP stage (pre-heap)  `gop_scene`: the scene's GROUND only — `VOID` and the picture's own lensed stars
+//                         (`wm::desktop::stars_onto`: the field in a static scratch, VRAM never read back).
+//   hold (heap, theme)    `scene_into`: THE generation (`wallpaper::generate_splash`), copied into the hold store and
+//                         installed as the wallpaper — one picture for the hold, the login screen and the desktop.
+//   hold shimmer          `hold_shimmer` (from `hold_service`, the ~1 kHz device-service pass): one `shimmer_tick`
+//                         per 33 ms into the HOLD STORE, the caption bands occluded, the boxes damaged and composited.
+// The shards stay for the builds without the generator and as the hold's no-memory fallback; in a scene build `advance`
+// keeps its SPLASHRETIRE seam and witness and paints nothing (`ANIM` armed, `SPLASH_FB` never published).
+
+/// GOP stage: fill the scene's `VOID` and lay the picture's stars on the boot framebuffer. `false` when the handle is
+/// not usable (the crystal paints instead).
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
+fn gop_scene(base: usize, len: usize, info: FrameBufferInfo) -> bool {
+    let t0 = crate::arch::ms();
+    let mut fb = FrameBuffer::new();
+    fb.init(base, len, info);
+    if !fb.is_ready() {
+        return false;
+    }
+    let (w, h) = (fb.width(), fb.height());
+    fb.fill_screen(crate::video::wm::desktop::scene_void());
+    let stars = crate::video::wm::desktop::stars_onto(w, h, |x, y, c| fb.put_pixel(x, y, c));
+    SPLASH_UP.store(true, Ordering::Relaxed);
+    #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+    ANIM.store(true, Ordering::Relaxed); // the SPLASHRETIRE seam and the `gui` backstop still run; no `SPLASH_FB`, so no edge is painted
+    SCENE_GROUND.store(true, Ordering::Relaxed);
+    serial_println!("[splash] gop scene=ground stars={} ms={} WxH={}x{}", stars.unwrap_or(0), crate::arch::ms().saturating_sub(t0), w, h);
+    true
+}
+
+/// The GOP stage painted the scene's ground.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
+static SCENE_GROUND: AtomicBool = AtomicBool::new(false);
+/// The hold store carries the generated scene (not the crystal).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static SCENE_HOLD: AtomicBool = AtomicBool::new(false);
+/// Shimmer ticks run into the hold store, and how long the hold lasted (ms; set at release).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static HOLD_TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static HOLD_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The hold shimmer's last tick (ms) and its star-cell cursor.
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+static HOLD_SHIM_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+static HOLD_SHIM_CUR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Hold: generate the scene into the hold store (`store`, `w * h` BGR words) and install it as the wallpaper.
+/// `Some(wall_ms)`, or `None` when the generator declined (the crystal paints instead).
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn scene_into(store: &mut alloc::vec::Vec<u8>, w: usize, h: usize) -> Option<u64> {
+    let ms = crate::video::wallpaper::generate_splash(w, h, |px| {
+        for (d, &c) in store.chunks_exact_mut(4).zip(px.iter()) {
+            d.copy_from_slice(&c.to_le_bytes());
+        }
+    })?;
+    SCENE_HOLD.store(true, Ordering::Release);
+    Some(ms)
+}
+
+/// Hold shimmer (M2): one tick of the installed scene's shimmer into the HOLD STORE (never the picture), at most once
+/// per `SHIMMER_MS`, while the held row is open; the caption bands (`step_label`'s word, the OVER line) are the
+/// occluder; each re-tinted box is damaged on the row and one composite puts it on the glass.
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn hold_shimmer() {
+    if HOLD_WIN.load(Ordering::Acquire) == 0 || !SCENE_HOLD.load(Ordering::Acquire) {
+        return;
+    }
+    let now = crate::arch::ms();
+    if now.wrapping_sub(HOLD_SHIM_MS.load(Ordering::Relaxed)) < crate::video::wm::desktop::SHIMMER_MS {
+        return;
+    }
+    HOLD_SHIM_MS.store(now, Ordering::Relaxed);
+    let mut boxes = [(0usize, 0usize, 0usize, 0usize); 16];
+    let mut nb = 0usize;
+    let ticked = {
+        let Some(mut g) = HOLD_SURF.try_lock() else { return };
+        let Some((surf, w, h)) = g.as_mut() else { return };
+        let (w, h) = (*w, *h);
+        if surf.len() < w * h * 4 {
+            return;
+        }
+        let band = crate::video::font::Face::Chrome.cell_h() * 2 * 3;
+        let occ = [(0usize, h.saturating_sub(band), w, band.min(h))];
+        let cur = HOLD_SHIM_CUR.load(Ordering::Relaxed);
+        crate::video::wallpaper::shimmer_with(|s, _px, _pw, _ph| {
+            if s.w != w || s.h != h {
+                return None;
+            }
+            let (c, _, _, _) = crate::video::wm::desktop::shimmer_tick(
+                s,
+                now,
+                &occ,
+                cur,
+                |x, y, c| {
+                    let o = (y * w + x) * 4;
+                    if o + 4 <= surf.len() {
+                        surf[o..o + 4].copy_from_slice(&c.to_le_bytes());
+                    }
+                },
+                |x, y, bw, bh| {
+                    if nb < boxes.len() {
+                        boxes[nb] = (x, y, bw, bh);
+                        nb += 1;
+                    }
+                },
+            );
+            Some(c)
+        })
+        .flatten()
+    };
+    let Some(c) = ticked else { return };
+    HOLD_SHIM_CUR.store(c, Ordering::Relaxed);
+    HOLD_TICKS.fetch_add(1, Ordering::Relaxed);
+    for &(x, y, bw, bh) in boxes[..nb].iter() {
+        crate::video::wm::damage_intersecting(x, y, bw, bh);
+    }
+    if nb > 0 {
+        crate::video::wm::composite();
+    }
+}
+
+/// `tests startscene`: the hold store carried the scene (and, on x86, the GOP stage painted its ground).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn scene_painted() -> bool {
+    let hold = SCENE_HOLD.load(Ordering::Acquire);
+    #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
+    let hold = hold && SCENE_GROUND.load(Ordering::Relaxed);
+    hold
+}
+
+/// `tests startscene`: the hold shimmer's ticks and how long the hold lasted (ms; while it is still up, so far).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn hold_stats() -> (u32, u64) {
+    let held = if HOLD_WIN.load(Ordering::Acquire) != 0 { crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) } else { HOLD_HELD.load(Ordering::Relaxed) };
+    (HOLD_TICKS.load(Ordering::Relaxed), held)
+}

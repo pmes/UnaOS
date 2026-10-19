@@ -1273,6 +1273,13 @@ fn sf_plot(px: &mut [u32], w: usize, h: usize, x: i64, y: i64, col: u32, a: u32)
 /// Blend `col` at the Q8 sub-pixel point `(x, y)`, spread bilinearly over its four pixels.
 #[inline]
 fn sf_splat(px: &mut [u32], w: usize, h: usize, x: i64, y: i64, col: u32, a: u32) {
+    sf_splat_with(&mut |x, y, c, a| sf_plot(px, w, h, x, y, c, a), x, y, col, a);
+}
+
+/// STARTSCENE (B662): [`sf_splat`] through any plot sink `plot(x, y, colour, alpha of 256)` — the picture's buffer, an
+/// offscreen buffer, or the write-only GOP framebuffer before the heap ([`stars_onto`]).
+#[inline]
+fn sf_splat_with(plot: &mut impl FnMut(i64, i64, u32, u32), x: i64, y: i64, col: u32, a: u32) {
     if a == 0 || x < 0 || y < 0 {
         return;
     }
@@ -1280,7 +1287,7 @@ fn sf_splat(px: &mut [u32], w: usize, h: usize, x: i64, y: i64, col: u32, a: u32
     let (fx, fy) = ((x & 255) as u32, (y & 255) as u32);
     let ws = [(256 - fx) * (256 - fy), fx * (256 - fy), (256 - fx) * fy, fx * fy];
     for (k, &wt) in ws.iter().enumerate() {
-        sf_plot(px, w, h, ix + (k & 1) as i64, iy + (k >> 1) as i64, col, (a.min(256) * wt) >> 16);
+        plot(ix + (k & 1) as i64, iy + (k >> 1) as i64, col, (a.min(256) * wt) >> 16);
     }
 }
 
@@ -1304,68 +1311,97 @@ const SF_VORTEX: [(i64, i64, i64, i64); 3] = [(340, 300, 200, 60), (620, 160, 11
 
 impl SfField {
     fn build(w: usize, h: usize) -> Option<SfField> {
-        let c = (h as i64 / 72).max(8);
-        let (gw, gh) = (w / c as usize + 4, h / c as usize + 4);
+        let (c, gw, gh) = sf_field_dims(w, h);
         let n = gw * gh;
         let (mut dens, mut phi, mut tmp) = (sf_vec(n)?, sf_vec(n)?, sf_vec(n)?);
         let (mut ux, mut uy, mut gx, mut gy) = (sf_vec(n)?, sf_vec(n)?, sf_vec(n)?, sf_vec(n)?);
-        let (ww, hh) = (w as i64, h as i64);
-        let l1 = (hh * 10 / 25).max(16);
-        let (l2, l3, l0) = ((l1 * 10 / 21).max(8), (l1 * 10 / 44).max(4), (hh * 10 / 16).max(16));
-        let ridge = |v: i64| {
-            let r = 4095 - (2 * v - 4095).abs();
-            let r = (r * r) >> 12;
-            (r * r) >> 12
-        };
-        let node = |i: usize, j: usize| ((i as i64 - 1) * c, (j as i64 - 1) * c);
+        let gmax = sf_field_fill(w, h, (c, gw, gh), &mut dens, &mut phi, &mut tmp, Some((&mut ux[..], &mut uy[..])), &mut gx, &mut gy);
+        Some(SfField { c, gw, gh, dens, phi, ux, uy, gx, gy, gmax })
+    }
+
+    /// STARTSCENE (B662): the lens view the stars read (the gradient tables and their maximum).
+    fn lens(&self) -> SfLens<'_> {
+        SfLens { c: self.c, gw: self.gw, gh: self.gh, gx: &self.gx, gy: &self.gy, gmax: self.gmax }
+    }
+
+    /// Table `v` bilinearly at the Q8 pixel point `(xq, yq)`.
+    #[inline]
+    fn at(&self, v: &[i32], xq: i64, yq: i64) -> i64 {
+        sf_at(self.c, self.gw, self.gh, v, xq, yq)
+    }
+}
+
+/// STARTSCENE (B662): the field's node grid for a `w` x `h` panel — `(cell px, columns, rows)`.
+fn sf_field_dims(w: usize, h: usize) -> (i64, usize, usize) {
+    let c = (h as i64 / 72).max(8);
+    (c, w / c as usize + 4, h / c as usize + 4)
+}
+
+/// STARTSCENE (B662): THE FIELD into caller-owned tables of `gw * gh` nodes — the heap's for the picture
+/// ([`SfField::build`]), a static scratch before the heap exists ([`stars_into`] / [`stars_onto`], the boot splash's GOP
+/// stage). One body, so the lens and therefore every star lands on the same pixel either way. `flow` (the stream
+/// function's curl, which only the strokes read) is skipped when `None`; `tmp` is scratch. Returns `Gmax` (at least 1).
+#[allow(clippy::too_many_arguments)]
+fn sf_field_fill(w: usize, h: usize, (c, gw, gh): (i64, usize, usize), dens: &mut [i32], phi: &mut [i32], tmp: &mut [i32], mut flow: Option<(&mut [i32], &mut [i32])>, gx: &mut [i32], gy: &mut [i32]) -> i64 {
+    let (ww, hh) = (w as i64, h as i64);
+    let l1 = (hh * 10 / 25).max(16);
+    let (l2, l3, l0) = ((l1 * 10 / 21).max(8), (l1 * 10 / 44).max(4), (hh * 10 / 16).max(16));
+    let ridge = |v: i64| {
+        let r = 4095 - (2 * v - 4095).abs();
+        let r = (r * r) >> 12;
+        (r * r) >> 12
+    };
+    let node = |i: usize, j: usize| ((i as i64 - 1) * c, (j as i64 - 1) * c);
+    for j in 0..gh {
+        for i in 0..gw {
+            let (x, y) = node(i, j);
+            let (r1, r2, r3) = (ridge(sf_vn(x, y, l1, 1)), ridge(sf_vn(x, y, l2, 2)), ridge(sf_vn(x, y, l3, 3)));
+            let d = (5 * r1 + 3 * ((r2 * (r1 + 1024)) >> 12) + 2 * ((r3 * (r2 + 1024)) >> 12)) / 10;
+            dens[j * gw + i] = d.clamp(0, 4095) as i32;
+        }
+    }
+    // The potential: the density blurred four times by [1 2 1] each way (the lens sees a smoother mass).
+    phi.copy_from_slice(dens);
+    for _ in 0..4 {
         for j in 0..gh {
             for i in 0..gw {
-                let (x, y) = node(i, j);
-                let (r1, r2, r3) = (ridge(sf_vn(x, y, l1, 1)), ridge(sf_vn(x, y, l2, 2)), ridge(sf_vn(x, y, l3, 3)));
-                let d = (5 * r1 + 3 * ((r2 * (r1 + 1024)) >> 12) + 2 * ((r3 * (r2 + 1024)) >> 12)) / 10;
-                dens[j * gw + i] = d.clamp(0, 4095) as i32;
+                let (l, r) = (i.saturating_sub(1), (i + 1).min(gw - 1));
+                tmp[j * gw + i] = (phi[j * gw + l] + 2 * phi[j * gw + i] + phi[j * gw + r]) / 4;
             }
         }
-        // The potential: the density blurred four times by [1 2 1] each way (the lens sees a smoother mass).
-        phi.copy_from_slice(&dens);
-        for _ in 0..4 {
-            for j in 0..gh {
-                for i in 0..gw {
-                    let (l, r) = (i.saturating_sub(1), (i + 1).min(gw - 1));
-                    tmp[j * gw + i] = (phi[j * gw + l] + 2 * phi[j * gw + i] + phi[j * gw + r]) / 4;
-                }
-            }
-            for j in 0..gh {
-                let (u, d) = (j.saturating_sub(1), (j + 1).min(gh - 1));
-                for i in 0..gw {
-                    phi[j * gw + i] = (tmp[u * gw + i] + 2 * tmp[j * gw + i] + tmp[d * gw + i]) / 4;
-                }
-            }
-        }
-        // The stream function: the potential, a coarse drift and the vortices.
-        for j in 0..gh {
-            for i in 0..gw {
-                let (x, y) = node(i, j);
-                let mut p = phi[j * gw + i] as i64 + (sf_vn(x, y, l0, 4) - 2048) / 2;
-                for &(vx, vy, vr, va) in SF_VORTEX.iter() {
-                    let (cx, cy, rr) = (ww * vx / 1000, hh * vy / 1000, (hh * vr / 1000).max(1));
-                    let (dx, dy) = (x - cx, y - cy);
-                    let r2 = dx * dx + dy * dy;
-                    if r2 < rr * rr {
-                        let q = 4096 - r2 * 4096 / (rr * rr);
-                        p += va * rr * q / 4096 * q / 4096;
-                    }
-                }
-                tmp[j * gw + i] = p as i32;
-            }
-        }
-        // The flow (the curl, normalised to Q12) and the lens gradient (per cell).
-        let mut gm = 0i64;
         for j in 0..gh {
             let (u, d) = (j.saturating_sub(1), (j + 1).min(gh - 1));
             for i in 0..gw {
-                let (l, r) = (i.saturating_sub(1), (i + 1).min(gw - 1));
-                let k = j * gw + i;
+                phi[j * gw + i] = (tmp[u * gw + i] + 2 * tmp[j * gw + i] + tmp[d * gw + i]) / 4;
+            }
+        }
+    }
+    // The stream function: the potential, a coarse drift and the vortices (the strokes' input only).
+    let rows = if flow.is_some() { gh } else { 0 };
+    for j in 0..rows {
+        for i in 0..gw {
+            let (x, y) = node(i, j);
+            let mut p = phi[j * gw + i] as i64 + (sf_vn(x, y, l0, 4) - 2048) / 2;
+            for &(vx, vy, vr, va) in SF_VORTEX.iter() {
+                let (cx, cy, rr) = (ww * vx / 1000, hh * vy / 1000, (hh * vr / 1000).max(1));
+                let (dx, dy) = (x - cx, y - cy);
+                let r2 = dx * dx + dy * dy;
+                if r2 < rr * rr {
+                    let q = 4096 - r2 * 4096 / (rr * rr);
+                    p += va * rr * q / 4096 * q / 4096;
+                }
+            }
+            tmp[j * gw + i] = p as i32;
+        }
+    }
+    // The flow (the curl, normalised to Q12) and the lens gradient (per cell).
+    let mut gm = 0i64;
+    for j in 0..gh {
+        let (u, d) = (j.saturating_sub(1), (j + 1).min(gh - 1));
+        for i in 0..gw {
+            let (l, r) = (i.saturating_sub(1), (i + 1).min(gw - 1));
+            let k = j * gw + i;
+            if let Some((ux, uy)) = flow.as_mut() {
                 let (dpx, dpy) = ((tmp[j * gw + r] - tmp[j * gw + l]) as i64, (tmp[d * gw + i] - tmp[u * gw + i]) as i64);
                 let (vx, vy) = (dpy, -dpx);
                 let m = sf_isqrt(vx * vx + vy * vy);
@@ -1376,32 +1412,50 @@ impl SfField {
                     ux[k] = 4096;
                     uy[k] = 0;
                 }
-                let (a, b) = (((phi[j * gw + r] - phi[j * gw + l]) / 2) as i64, ((phi[d * gw + i] - phi[u * gw + i]) / 2) as i64);
-                gx[k] = a as i32;
-                gy[k] = b as i32;
-                if i > 0 && j > 0 && i + 1 < gw && j + 1 < gh {
-                    gm = gm.max(sf_isqrt(a * a + b * b));
-                }
+            }
+            let (a, b) = (((phi[j * gw + r] - phi[j * gw + l]) / 2) as i64, ((phi[d * gw + i] - phi[u * gw + i]) / 2) as i64);
+            gx[k] = a as i32;
+            gy[k] = b as i32;
+            if i > 0 && j > 0 && i + 1 < gw && j + 1 < gh {
+                gm = gm.max(sf_isqrt(a * a + b * b));
             }
         }
-        Some(SfField { c, gw, gh, dens, phi, ux, uy, gx, gy, gmax: gm.max(1) })
     }
+    gm.max(1)
+}
 
-    /// Table `v` bilinearly at the Q8 pixel point `(xq, yq)`.
+/// STARTSCENE (B662): what the stars read of the field — the lens gradient and its maximum (borrowed, so the GOP
+/// stage's static tables and the picture's heap tables serve the same star pass).
+struct SfLens<'a> {
+    c: i64,
+    gw: usize,
+    gh: usize,
+    gx: &'a [i32],
+    gy: &'a [i32],
+    gmax: i64,
+}
+
+impl SfLens<'_> {
     #[inline]
     fn at(&self, v: &[i32], xq: i64, yq: i64) -> i64 {
-        let cq = self.c << 8;
-        let (u, s) = (xq + cq, yq + cq);
-        let i = (u.max(0) / cq).min(self.gw as i64 - 2);
-        let j = (s.max(0) / cq).min(self.gh as i64 - 2);
-        let fx = ((u - i * cq) * 256 / cq).clamp(0, 256);
-        let fy = ((s - j * cq) * 256 / cq).clamp(0, 256);
-        let (i, j, g) = (i as usize, j as usize, self.gw);
-        let (a, b, c, d) = (v[j * g + i] as i64, v[j * g + i + 1] as i64, v[(j + 1) * g + i] as i64, v[(j + 1) * g + i + 1] as i64);
-        let t = a * 256 + (b - a) * fx;
-        let bo = c * 256 + (d - c) * fx;
-        (t * 256 + (bo - t) * fy) >> 16
+        sf_at(self.c, self.gw, self.gh, v, xq, yq)
     }
+}
+
+/// Table `v` (a `gw` x `gh` node grid of `c` px) bilinearly at the Q8 pixel point `(xq, yq)`.
+#[inline]
+fn sf_at(c: i64, gw: usize, gh: usize, v: &[i32], xq: i64, yq: i64) -> i64 {
+    let cq = c << 8;
+    let (u, s) = (xq + cq, yq + cq);
+    let i = (u.max(0) / cq).min(gw as i64 - 2);
+    let j = (s.max(0) / cq).min(gh as i64 - 2);
+    let fx = ((u - i * cq) * 256 / cq).clamp(0, 256);
+    let fy = ((s - j * cq) * 256 / cq).clamp(0, 256);
+    let (i, j, g) = (i as usize, j as usize, gw);
+    let (a, b, c, d) = (v[j * g + i] as i64, v[j * g + i + 1] as i64, v[(j + 1) * g + i] as i64, v[(j + 1) * g + i + 1] as i64);
+    let t = a * 256 + (b - a) * fx;
+    let bo = c * 256 + (d - c) * fx;
+    (t * 256 + (bo - t) * fy) >> 16
 }
 
 /// 1. THE GROUND AND THE HAZE: ultra black, the dark-matter web as a faint glow (`v^2`, `v = (3 D + Phi) / 4`), a
@@ -1525,14 +1579,29 @@ pub struct SfProbe {
 /// `t = b + delta`; stretched into an arc `1 + |G| Smax / Gmax` px along the tangent `(-Gy, Gx)`; magnified by
 /// `1 + 0.75 |G| / Gmax`. Returns `(drawn, displaced by >= 1 px)`.
 fn sf_stars(px: &mut [u32], w: usize, h: usize, f: &SfField, p: &SfPal, out: &mut alloc::vec::Vec<SfStar>) -> Option<(u32, u32)> {
+    out.try_reserve_exact(sf_nstars(w, h)).ok()?;
+    Some(sf_stars_core(w, h, &f.lens(), p, STAR_SEED, &mut |x, y, c, a| sf_plot(px, w, h, x, y, c, a), &mut |s| out.push(s)))
+}
+
+/// STARTSCENE (B662): the stars' seed — the picture's and the GOP stage's are the same stars.
+pub const STAR_SEED: u64 = 21;
+
+/// How many star sources a `w` x `h` panel draws (about 3000 at 2880x1800).
+fn sf_nstars(w: usize, h: usize) -> usize {
+    ((3000 * w as i64 * h as i64) / (2880 * 1800)).max(300) as usize
+}
+
+/// STARTSCENE (B662): the star pass itself, allocation-free — every pixel through `plot(x, y, colour, alpha of 256)`,
+/// every drawn star to `each`. [`sf_stars`] (the picture) and [`stars_into`] / [`stars_onto`] (the GOP stage, the
+/// fixture) call it with the same field and seed. Returns `(drawn, displaced by >= 1 px)`.
+fn sf_stars_core(w: usize, h: usize, f: &SfLens, p: &SfPal, seed: u64, plot: &mut impl FnMut(i64, i64, u32, u32), each: &mut impl FnMut(SfStar)) -> (u32, u32) {
     let (ww, hh) = (w as i64, h as i64);
-    let n = ((3000 * ww * hh) / (2880 * 1800)).max(300) as usize;
-    out.try_reserve_exact(n).ok()?;
+    let n = sf_nstars(w, h);
     let (dmax, smax) = ((hh / 100).max(2), (hh / 225).max(1));
     let (rh, sk) = ((hh * 4 / 1800).max(2), (hh * 10 / 1800).max(3));
     let (mut drawn, mut lensed) = (0u32, 0u32);
     for k in 0..n as i64 {
-        let r = sf_hash(k, 7, 21);
+        let r = sf_hash(k, 7, seed);
         let bq = (((r % ww as u64) as i64) << 8 | 128, (((r >> 24) % hh as u64) as i64) << 8 | 128);
         let (gx, gy) = (f.at(&f.gx, bq.0, bq.1), f.at(&f.gy, bq.0, bq.1));
         let gm = sf_isqrt(gx * gx + gy * gy);
@@ -1557,13 +1626,13 @@ fn sf_stars(px: &mut [u32], w: usize, h: usize, f: &SfField, p: &SfPal, out: &mu
             let steps = l * 2;
             for i in -steps..=steps {
                 let e = 256 - i.abs() * 256 / (steps + 1);
-                sf_splat(px, w, h, tq.0 + tx * i / 2, tq.1 + ty * i / 2, col, ((b as i64 * e) >> 8) as u32 * 3 / 4);
+                sf_splat_with(plot, tq.0 + tx * i / 2, tq.1 + ty * i / 2, col, ((b as i64 * e) >> 8) as u32 * 3 / 4);
             }
         } else {
-            sf_splat(px, w, h, tq.0, tq.1, col, b);
+            sf_splat_with(plot, tq.0, tq.1, col, b);
             if class >= 1 {
                 for (ox, oy) in [(256i64, 0i64), (-256, 0), (0, 256), (0, -256)] {
-                    sf_splat(px, w, h, tq.0 + ox, tq.1 + oy, col, b / 3);
+                    sf_splat_with(plot, tq.0 + ox, tq.1 + oy, col, b / 3);
                 }
             }
         }
@@ -1574,21 +1643,21 @@ fn sf_stars(px: &mut [u32], w: usize, h: usize, f: &SfField, p: &SfPal, out: &mu
                     let d2 = ox * ox + oy * oy;
                     if d2 <= rh * rh {
                         let q = 256 - d2 * 256 / (rh * rh + 1);
-                        sf_plot(px, w, h, cx + ox, cy + oy, col, ((b as i64 * q * q) >> 16) as u32 / 3);
+                        plot(cx + ox, cy + oy, col, ((b as i64 * q * q) >> 16) as u32 / 3);
                     }
                 }
             }
             for i in 1..=sk {
                 let a = (b as i64 * (sk + 1 - i) / (sk + 1)) as u32 / 2;
                 for (sx, sy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
-                    sf_plot(px, w, h, cx + sx * i, cy + sy * i, col, a);
+                    plot(cx + sx * i, cy + sy * i, col, a);
                 }
             }
         }
         drawn += 1;
-        out.push(SfStar { bq, tq, g: (gx, gy), b, class, stretched });
+        each(SfStar { bq, tq, g: (gx, gy), b, class, stretched });
     }
-    Some((drawn, lensed))
+    (drawn, lensed)
 }
 
 /// The zircon as drawn: its silhouette's per-column top and bottom (`i32::MAX` / -1 where it is absent), its box,
@@ -1930,6 +1999,10 @@ pub struct Scene {
     pub nprobes: usize,
     /// The lens's largest displacement, px (`H/100`).
     pub dmax: i64,
+    /// STARTSCENE (B662): up to 16 star pixels (bright, compact, evenly spaced over the drawn stars; each the pixel its
+    /// splat weighs most) — the fixture checks the GOP stage lit the same ones.
+    pub sample: [(u16, u16); 16],
+    pub nsample: usize,
 }
 
 /// The shimmer's caps (STARFIELD.md §8): all glints, the beam's, the twinkles', the lensed-drift entries (pairs).
@@ -2130,6 +2203,16 @@ pub fn wall_gen(px: &mut [u32], w: usize, h: usize) -> Option<Scene> {
         }
     }
     let nprobes = best.iter().filter(|&&m| m >= 0).count();
+    // STARTSCENE (B662): the star sample the GOP stage must reproduce.
+    let elig = |s: &&SfStar| s.class >= 1 && !s.stretched && s.b >= 100;
+    let step = (stars.iter().filter(elig).count() / 16).max(1);
+    let (mut sample, mut nsample) = ([(0u16, 0u16); 16], 0usize);
+    for s in stars.iter().filter(elig).step_by(step) {
+        if nsample < 16 {
+            sample[nsample] = ((((s.tq.0 + 128) >> 8).clamp(0, ww - 1)) as u16, (((s.tq.1 + 128) >> 8).clamp(0, hh - 1)) as u16);
+            nsample += 1;
+        }
+    }
     Some(Scene {
         shimmer,
         stars: nstars,
@@ -2141,6 +2224,80 @@ pub fn wall_gen(px: &mut [u32], w: usize, h: usize) -> Option<Scene> {
         probes,
         nprobes,
         dmax: (hh / 100).max(2),
+        sample,
+        nsample,
+    })
+}
+
+// ── STARTSCENE (rmbp-ledger B662, R128) — the scene's GROUND before the heap ──────────────────────────────────────
+//
+// The boot splash's GOP stage (`splash::gop_stage`, pre-heap, allocation-free) cannot run the generator, so it paints
+// the scene's ground only: `VOID` and the SAME lensed stars (the field computed into this static scratch by the
+// picture's own `sf_field_fill`, the stars by its own `sf_stars_core`, the same seed). The web, the gem and the beam
+// arrive with the hold's full paint (`splash::hold_prepare` -> `wallpaper::generate_splash`): a fade-in, not a cut.
+// Design record: `docs/dev/OS/05_USER_EXPERIENCE/STARFIELD.md` §9.
+
+/// The static field scratch's capacity in nodes (2880x1800 needs 119 x 76 = 9044; 3840x2160 needs 10032).
+const SF_SCRATCH_NODES: usize = 12_288;
+/// Five tables (density, potential, scratch, the gradient's two components) — no heap.
+static SF_SCRATCH: crate::sync::Mutex<[i32; 5 * SF_SCRATCH_NODES]> = crate::sync::Mutex::new([0; 5 * SF_SCRATCH_NODES]);
+/// [`stars_onto`]'s read cache over a write-only target: `(pixel index << 32) | value written`, direct-mapped.
+static SF_ONTO: crate::sync::Mutex<[u64; 4096]> = crate::sync::Mutex::new([0; 4096]);
+
+/// The scene's ground colour in the live set (`theme::starfield::VOID`).
+pub fn scene_void() -> u32 {
+    SfPal::live().void
+}
+
+/// The star pass over the static scratch field. `None` off range or when the grid outgrows the scratch.
+fn sf_stars_static(w: usize, h: usize, seed: u64, plot: &mut impl FnMut(i64, i64, u32, u32)) -> Option<u32> {
+    if w < 64 || h < 64 || w > 16_384 || h > 16_384 {
+        return None;
+    }
+    let dims = sf_field_dims(w, h);
+    let n = dims.1 * dims.2;
+    if n > SF_SCRATCH_NODES {
+        return None;
+    }
+    let mut g = SF_SCRATCH.lock();
+    let (dens, rest) = g.split_at_mut(SF_SCRATCH_NODES);
+    let (phi, rest) = rest.split_at_mut(SF_SCRATCH_NODES);
+    let (tmp, rest) = rest.split_at_mut(SF_SCRATCH_NODES);
+    let (gx, gy) = rest.split_at_mut(SF_SCRATCH_NODES);
+    let (gx, gy) = (&mut gx[..n], &mut gy[..n]);
+    let gmax = sf_field_fill(w, h, dims, &mut dens[..n], &mut phi[..n], &mut tmp[..n], None, gx, gy);
+    let lens = SfLens { c: dims.0, gw: dims.1, gh: dims.2, gx, gy, gmax };
+    let (drawn, _) = sf_stars_core(w, h, &lens, &SfPal::live(), seed, plot, &mut |_| {});
+    Some(drawn)
+}
+
+/// STARTSCENE (B662): **the stars alone**, allocation-free, blended into `px` (`w` x `h`) exactly where the generated
+/// picture draws them (`seed` = [`STAR_SEED`] for the picture's stars). Returns the stars drawn.
+pub fn stars_into(px: &mut [u32], w: usize, h: usize, seed: u64) -> Option<u32> {
+    if px.len() < w * h {
+        return None;
+    }
+    sf_stars_static(w, h, seed, &mut |x, y, c, a| sf_plot(px, w, h, x, y, c, a))
+}
+
+/// STARTSCENE (B662): [`stars_into`] onto a WRITE-ONLY target (the GOP framebuffer: VRAM is never read back — see
+/// `FrameBuffer::get_pixel`) already filled with [`scene_void`]: each pixel's last written value is kept in a small
+/// direct-mapped cache so overlapping splats accumulate as they do in the picture (an evicted pixel blends over
+/// `VOID` again). `put(x, y, colour)` writes; it is only called in bounds. Returns the stars drawn.
+pub fn stars_onto(w: usize, h: usize, mut put: impl FnMut(usize, usize, u32)) -> Option<u32> {
+    let void = scene_void();
+    let mut cache = SF_ONTO.lock();
+    cache.fill(u64::MAX);
+    sf_stars_static(w, h, STAR_SEED, &mut |x, y, col, a| {
+        if a == 0 || x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+            return;
+        }
+        let idx = (y as u64) * w as u64 + x as u64;
+        let slot = (idx.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize;
+        let e = cache[slot];
+        let v = sf_mix(if e >> 32 == idx { e as u32 } else { void }, col, a);
+        cache[slot] = (idx << 32) | v as u64;
+        put(x as usize, y as usize, v);
     })
 }
 
@@ -2221,7 +2378,7 @@ static SHIM_BUSY: AtomicBool = AtomicBool::new(false);
 /// cursor bracket).
 #[cfg(feature = "facet")]
 fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
-    if super::DEFER_N.load(Ordering::Relaxed) != 0 || !crate::video::desktop_scene_owns_backdrop() {
+    if super::DEFER_N.load(Ordering::Relaxed) != 0 || !crate::video::wallpaper::owns_backdrop() { // STARTSCENE (B662): the scene owns the backdrop from the splash on (x86 never sets the REALDESK latch)
         return;
     }
     let now = crate::arch::ms();
