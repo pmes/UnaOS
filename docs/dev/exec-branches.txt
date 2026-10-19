@@ -610,22 +610,22 @@ refs/heads/exec-rmbp-updateui      16ffa390 FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-mtpwrite      4bd35fdd FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-lock2         0238981d FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-diskreserve   e5bd3a6a FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-helpsearch    b71c7fa8 IN-FLIGHT cloud wave36 HELPSEARCH
+refs/heads/exec-rmbp-helpsearch    620a283f FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-fontkit       35f53609 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-audiomix      51b9dc3b FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-quarryversions 673856f6 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-stagewindow  658415ad IN-FLIGHT cloud wave36 STAGEWINDOW (B733)
+refs/heads/exec-rmbp-stagewindow  92b1fcc2 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-crawlb       800b70ad FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-oneinstance  bfc63a86 IN-FLIGHT cloud wave36 ONEINSTANCE (B734)
 refs/heads/exec-rmbp-crawlc       093803b2 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-pinchzoom    996f1f6f IN-FLIGHT cloud wave36 PINCHZOOM (B735)
+refs/heads/exec-rmbp-pinchzoom    ee83f696 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-crawla       bc6f934b IN-FLIGHT cloud wave36 CRAWLA (the video/settings/prefs crawl fixes)
 refs/heads/exec-rmbp-micring3     2e8a3cd1 IN-FLIGHT cloud wave36 MICRING3 (B736)
-refs/heads/exec-rmbp-hwtab         e448dc14 IN-FLIGHT cloud wave36 HWTAB
+refs/heads/exec-rmbp-hwtab         9401ac88 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-keycharsarm   e448dc14 IN-FLIGHT cloud wave36 KEYCHARSARM
-refs/heads/exec-rmbp-civilrest     e448dc14 IN-FLIGHT cloud wave36 CIVILREST
+refs/heads/exec-rmbp-civilrest     c2f2cf0e FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-versionscompat e448dc14 IN-FLIGHT cloud wave36 VERSIONSCOMPAT
 refs/heads/exec-rmbp-a2dp          e448dc14 IN-FLIGHT cloud wave36 A2DP
 refs/heads/exec-rmbp-geodebackup   e448dc14 IN-FLIGHT cloud wave36 GEODEBACKUP
 refs/heads/exec-rmbp-filesearch    e448dc14 IN-FLIGHT cloud wave36 FILESEARCH
-refs/heads/exec-rmbp-grantnames    e448dc14 IN-FLIGHT cloud wave36 GRANTNAMES
+refs/heads/exec-rmbp-grantnames    116bb415 FOLDED-BY-HAND (this commit) 2026-10-19
