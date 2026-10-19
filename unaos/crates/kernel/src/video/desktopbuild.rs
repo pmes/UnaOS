@@ -574,3 +574,11 @@ pub fn net_starters_held(names: &[&str]) -> u32 {
     let b = steps::held_or_said();
     names.iter().filter(|n| b & steps::bit_of(n) != 0).count() as u32
 }
+
+/// AGING (rmbp-ledger B695, BP-bar-9) — `tests aging`'s read of one cycle's build: `(build lines said this boot, the
+/// last build's bar_ms, the last build's high-water KiB)`. The counter is stored last in [`say`] (`mem_note`, Release),
+/// so a count read past the cycle's pre-login value carries that build's `bar_ms` and `high_kb`.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))]
+pub fn aging_reading() -> (u32, Option<u64>, u64) {
+    (MEM_BUILDS.load(Acquire), last_bar_ms(), MEM_HIGH.load(Relaxed) / 1024)
+}

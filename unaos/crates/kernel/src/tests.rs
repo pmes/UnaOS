@@ -188,7 +188,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); register("focussteal", focussteal_selftest); register("veilcost", veilcost_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); register("focussteal", focussteal_selftest); register("veilcost", veilcost_selftest); register("aging", aging_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1656,4 +1656,150 @@ fn veilcost_selftest() {
         ratio / 100, ratio % 100, worst, if veil_ok && shim_ok { "PASS" } else { "FAIL" }
     );
     crate::video::veilcost::line();
+}
+
+// AGING (rmbp-ledger B695, BP-bar-9 "nothing accumulates: `bar_ms` on day 180 within ±10 % of day 1 … the heap
+// high-water returns") — TAIL-APPENDED. `tests aging`: N=20 Log Out -> login -> desktop-built cycles in ONE boot,
+// through the real paths only — Log Out is `login::reopen_after_logout` (the crystal row's and `logout`'s entry: the
+// session's programs ended, every row closed, `desktopbuild::teardown`, the screen up), login is the keys a person
+// types into `login::consume_key` (name, Tab, password, Return -> the submit worker -> `close_into_session` ->
+// `desktopbuild::build("login ok")`), built is the build's own `[desktop] built` line (`desktopbuild::aging_reading`).
+// Per cycle: `[aging] cycle=<i> bar_ms=<n> heap_hw=<kb> windows=<n> procs=<n>` (bar_ms and heap_hw from that build's
+// line; windows and procs read at the logged-out point). Verdict over the first and last quarter (Q=5): drift is
+// GROWTH (one-sided), <= 10 % for both (bar: or at most one 1 ms tick on the mean), and the last logged-out census
+// equals cycle 0's. The account is the QEMU lanes' fixture account (`una`/`correct-horse`, twoboot.sh, users.rs
+// loginst); where it does not verify the fixture SKIPs — it never logs out a person it cannot log back in.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))]
+pub fn aging_selftest() {
+    use crate::fs::users;
+    use crate::video::crystal::login;
+    const N: usize = 20;
+    const Q: usize = N / 4;
+    const DRIFT_PCT: i64 = 10;
+    const LOGIN_WAIT_MS: u64 = 20_000; // the submit worker's own bound is 15 s (login.rs SUBMIT_BOUND_MS)
+    const BUILD_WAIT_MS: u64 = 5_000;
+    const NAME: &[u8] = b"una";
+    const PW: &[u8] = b"correct-horse";
+    if !RUNNING.load(Ordering::Acquire) {
+        serial_println!(":: AGING: cycles=0 -> SKIP :: reason=not-the-verb (twenty Log Outs run only on `tests aging`, BP-boot-4)");
+        return;
+    }
+    if !users::verify(NAME, PW) {
+        serial_println!(":: AGING: cycles=0 -> SKIP :: reason=no-fixture-account (the QEMU lanes' account does not verify on this store)");
+        return;
+    }
+    let mut nb = [0u8; users::NAME_MAX];
+    let is_fixture = |nb: &mut [u8; users::NAME_MAX]| matches!(users::whoami(nb), Some(n) if &nb[..n] == NAME);
+    let in_session = is_fixture(&mut nb);
+    let at_screen = !in_session && login::is_open() && users::whoami(&mut nb).is_none() && !users::root_session();
+    if !in_session && !at_screen {
+        serial_println!(":: AGING: cycles=0 -> SKIP :: reason=no-fixture-session (neither the fixture account's session nor the login screen)");
+        return;
+    }
+    // One login through the screen: the keys, then the outcome drained until the session is the fixture account's.
+    let log_in = || -> bool {
+        for &b in NAME {
+            let _ = login::consume_key(b);
+        }
+        let _ = login::consume_key(b'\t');
+        for &b in PW {
+            let _ = login::consume_key(b);
+        }
+        let _ = login::consume_key(b'\n');
+        let t0 = crate::arch::ms();
+        let mut nb = [0u8; users::NAME_MAX];
+        loop {
+            login::submit_drain();
+            if !login::is_open() && matches!(users::whoami(&mut nb), Some(n) if &nb[..n] == NAME) {
+                return true;
+            }
+            if crate::arch::ms().saturating_sub(t0) >= LOGIN_WAIT_MS {
+                return false;
+            }
+            crate::arch::sched::yield_now();
+        }
+    };
+    // The build the login asked for: a `[desktop] built` line past `b0`, and nothing owed or pending.
+    let built_past = |b0: u32| -> Option<(u64, u64)> {
+        let t0 = crate::arch::ms();
+        loop {
+            let (b, bar, hw) = crate::video::desktopbuild::aging_reading();
+            if b > b0 && crate::video::desktopbuild::settled() {
+                return bar.map(|ms| (ms, hw));
+            }
+            if crate::arch::ms().saturating_sub(t0) >= BUILD_WAIT_MS {
+                return None;
+            }
+            crate::arch::sched::yield_now();
+        }
+    };
+    let mut reason: Option<alloc::string::String> = None;
+    if at_screen {
+        let b0 = crate::video::desktopbuild::aging_reading().0;
+        if !log_in() || built_past(b0).is_none() {
+            serial_println!(":: AGING: cycles=0 bar_drift_pct=0 heap_drift_kb=0 leaked_windows=0 leaked_procs=0 -> FAIL :: reason=prelogin");
+            return;
+        }
+    }
+    let (mut bars, mut hws, mut wins, mut procs) = (alloc::vec::Vec::new(), alloc::vec::Vec::new(), alloc::vec::Vec::new(), alloc::vec::Vec::new());
+    for i in 0..N {
+        login::reopen_after_logout();
+        let w = crate::video::wm::live_window_count();
+        let (_, running, exited, _) = crate::arch::syscall::proc_table_headroom();
+        if !login::is_open() || users::whoami(&mut nb).is_some() {
+            reason = Some(format!("cycle-{}-logout", i));
+            break;
+        }
+        let b0 = crate::video::desktopbuild::aging_reading().0;
+        if !log_in() {
+            reason = Some(format!("cycle-{}-login", i));
+            break;
+        }
+        let Some((bar, hw)) = built_past(b0) else {
+            reason = Some(format!("cycle-{}-build", i));
+            break;
+        };
+        serial_println!("[aging] cycle={} bar_ms={} heap_hw={} windows={} procs={}", i, bar, hw, w, running + exited);
+        bars.push(bar);
+        hws.push(hw);
+        wins.push(w);
+        procs.push(running + exited);
+    }
+    let done = bars.len();
+    let q = Q.min(done / 2).max(1);
+    let sum = |v: &[u64]| v.iter().sum::<u64>() as i64;
+    let (bf, bl, hf, hl) = if done == 0 {
+        (0, 0, 0, 0)
+    } else {
+        (sum(&bars[..q.min(done)]), sum(&bars[done - q.min(done)..]), sum(&hws[..q.min(done)]), sum(&hws[done - q.min(done)..]))
+    };
+    let pct = |first: i64, last: i64| (last - first) * 100 / first.max(1);
+    let bar_drift_pct = pct(bf, bl);
+    let heap_drift_pct = pct(hf, hl);
+    let heap_drift_kb = (hl - hf) / q as i64;
+    let leaked = |v: &[usize]| match (v.first(), v.last()) {
+        (Some(&a), Some(&b)) => b.saturating_sub(a),
+        _ => 0,
+    };
+    let (leaked_windows, leaked_procs) = (leaked(&wins), leaked(&procs));
+    let bar_ok = bar_drift_pct <= DRIFT_PCT || bl - bf <= q as i64; // the span is stamped by a 1 ms clock: a mean that moved by one tick is no drift
+    let pass = done == N && bar_ok && heap_drift_pct <= DRIFT_PCT && leaked_windows == 0 && leaked_procs == 0;
+    if reason.is_none() && !pass {
+        let mut r = alloc::string::String::new();
+        for (bad, word) in [(!bar_ok, "bar-drift"), (heap_drift_pct > DRIFT_PCT, "heap-drift"), (leaked_windows != 0, "leaked-windows"), (leaked_procs != 0, "leaked-procs")] {
+            if bad {
+                if !r.is_empty() {
+                    r.push('+');
+                }
+                r.push_str(word);
+            }
+        }
+        reason = Some(r);
+    }
+    serial_println!(
+        ":: AGING: cycles={} bar_drift_pct={} heap_drift_kb={} leaked_windows={} leaked_procs={} -> {} :: bar_first_ms={} bar_last_ms={} hw_first_kb={} hw_last_kb={} heap_drift_pct={} q={}{}{}",
+        done, bar_drift_pct, heap_drift_kb, leaked_windows, leaked_procs, if pass { "PASS" } else { "FAIL" },
+        bf / q as i64, bl / q as i64, hf / q as i64, hl / q as i64, heap_drift_pct, q,
+        if reason.is_some() { " reason=" } else { "" }, reason.as_deref().unwrap_or("")
+    );
 }
