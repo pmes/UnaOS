@@ -634,7 +634,7 @@ refs/heads/exec-rmbp-charrepeat     3bbd2569 IN-FLIGHT cloud wave36 CHARREPEAT
 refs/heads/exec-rmbp-micstage       3bbd2569 IN-FLIGHT cloud wave36 MICSTAGE
 refs/heads/exec-rmbp-geodemod       3bbd2569 IN-FLIGHT cloud wave36 GEODEMOD
 refs/heads/exec-rmbp-filesearch2    3bbd2569 IN-FLIGHT cloud wave36 FILESEARCH2
-refs/heads/exec-rmbp-prefstests     3bbd2569 IN-FLIGHT cloud wave36 PREFSTESTS
+refs/heads/exec-rmbp-prefstests     f572fd8e FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-helpf1         3bbd2569 IN-FLIGHT cloud wave36 HELPF1
 refs/heads/exec-rmbp-trashtoast     3bbd2569 IN-FLIGHT cloud wave36 TRASHTOAST
 refs/heads/exec-rmbp-lockprefs      3bbd2569 IN-FLIGHT cloud wave36 LOCKPREFS

@@ -375,10 +375,25 @@ mod tests {
                 assert_eq!(run(&mut s, VERB_SET, &set_body(k.ns, k.key, &v), true), (0, Vec::new()), "{}", k.key);
             }
         }
-        const GOLDEN: &[u8] = b"system.appearance.accent = \"crispy\"\n\
+        // PREFSTESTS (SR158): regenerated from docs/dev/PREFS-SCHEMA.md (the blessed table): every `system.*` row
+        // whose default is a literal (not `consumer: …`), as `<key> = <default>`, in schema order (the tree's
+        // sorted order, which the alphabetical schema shares). A new defaulted system row adds its line here.
+        const GOLDEN: &[u8] = b"system.accessibility.contrast = \"no-preference\"\n\
+system.accessibility.cursor_size = 1.0\n\
+system.accessibility.cvd = \"none\"\n\
+system.accessibility.forced_colors = false\n\
+system.accessibility.increase_contrast = false\n\
+system.accessibility.invert = false\n\
+system.accessibility.reduce_motion = false\n\
+system.accessibility.show_performance = false\n\
+system.accessibility.text_size = \"default\"\n\
+system.accessibility.zoom = 0\n\
+system.accessibility.zoom_follow = \"pointer\"\n\
+system.appearance.accent = \"crispy\"\n\
 system.appearance.highlight = \"accent\"\n\
 system.appearance.mode = \"light\"\n\
 system.audio.mute = false\n\
+system.audio.output = \"hda\"\n\
 system.audio.volume = 12\n\
 system.display.brightness = 12\n\
 system.display.font = \"sans\"\n\
@@ -387,11 +402,21 @@ system.display.idle_min = 10\n\
 system.display.wallpaper = \"\"\n\
 system.dock.autohide = false\n\
 system.dock.position = \"bottom\"\n\
+system.keyboard.compose = false\n\
+system.keyboard.layout = \"us\"\n\
+system.locale.first_day = \"mon\"\n\
+system.locale.region = \"ymd-24\"\n\
+system.locale.tz = \"UTC\"\n\
+system.lock.after_idle_min = 10\n\
+system.lock.on_lid = true\n\
+system.lock.on_sleep = true\n\
 system.login.items = \"\"\n\
+system.look = \"una\"\n\
 system.notify.dnd = false\n\
 system.notify.dnd_from = 0\n\
 system.notify.dnd_until = 0\n\
 system.pointer.speed = 1\n\
+system.privacy.remember = true\n\
 system.settings.tab = 0\n\
 system.trackpad.natural_scroll = true\n\
 system.trackpad.secondary_click = \"two-finger\"\n\
