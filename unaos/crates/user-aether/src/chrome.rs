@@ -1956,3 +1956,13 @@ pub fn blit(app: &App, cv: &Canvas, fonts: &Fonts) {
     }
     sys(una_abi::SYS_WIN_PRESENT, app.win as u64, 0, 0, 0);
 }
+
+/// ONEINSTANCE (rmbp-ledger B734): a second launch's argument (a URL or a file path) opens in a NEW tab, the omnibox left
+/// unfocused (the page is the point); `follow` resolves it as a typed address does. `:: AETHER: open_arg n= tabs= ::`.
+pub fn open_arg_tab(app: &mut App, page: &mut Page, fonts: &mut Fonts, arg: &str) {
+    new_tab(app, page, fonts);
+    app.ch.omni = None;
+    crate::follow(app, page, fonts, arg, b"open-arg");
+    app.dirty = true;
+    Line::new(b":: AETHER: open_arg n=").dec(arg.len() as i64).put(b" tabs=").dec(app.ch.strip.len() as i64).put(b" ::").wire();
+}

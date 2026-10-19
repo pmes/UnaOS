@@ -118,7 +118,11 @@ fn call(verb: u8, body: &[u8], out: &mut [u8]) -> Result<usize, i64> {
         if n < 0 {
             return Err(n);
         }
-        let n = n as usize;
+        let n = (n as usize).min(rx.len());
+        if let Some(a) = una_abi::open_arg_body(&rx[..n]) {
+            open_arg_keep(a); // ONEINSTANCE (B734): a launch's argument met while waiting for this reply is kept, not lost
+            continue;
+        }
         if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY {
             continue;
         }
@@ -246,13 +250,15 @@ pub fn due(now_ms: u64) -> bool {
             HINT = true;
         }
         let rx = &mut *core::ptr::addr_of_mut!(RX);
-        while SUB == 0 {
+        while SUB <= 0 { // ONEINSTANCE (B734): drained even when the subscription was refused — an OPEN_ARG still arrives
             let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, una_abi::MRECV_NOWAIT, 0);
             if n < BUS_HDR_LEN as i64 {
                 break; // -EAGAIN: the mailbox is empty
             }
             if rx[0..4] == BUS_MAGIC && rx[5] == BUS_KIND_REPLY && rx[6] == BUS_VERB_PREF_CHANGED && rx[8..12] == [0; 4] {
                 HINT = true;
+            } else if let Some(a) = una_abi::open_arg_body(&rx[..(n as usize).min(BUS_FRAME_MAX)]) {
+                open_arg_keep(a); // ONEINSTANCE (B734): the loop arm — the main loop takes it ([`take_open_arg`])
             }
         }
         if now_ms >= NEXT {
@@ -271,4 +277,28 @@ pub fn due(now_ms: u64) -> bool {
         HINT = false;
     }
     true
+}
+
+// ONEINSTANCE (rmbp-ledger B734) — a second launch of this program by the user's verb raised THIS window and handed its
+// argument (a file path or a URL) here as one `BUS_VERB_OPEN_ARG` frame. The mailbox drains above keep it (the newest
+// replaces an untaken one); the frame loop takes it once.
+static mut OPEN_ARG: [u8; una_abi::OPEN_ARG_MAX] = [0; una_abi::OPEN_ARG_MAX];
+static mut OPEN_ARG_N: usize = 0;
+
+fn open_arg_keep(a: &[u8]) {
+    let n = a.len().min(una_abi::OPEN_ARG_MAX);
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(OPEN_ARG))[..n].copy_from_slice(&a[..n]);
+        OPEN_ARG_N = n;
+    }
+}
+
+/// The kept launch argument, once: its length copied into `out` (0 = none).
+pub fn take_open_arg(out: &mut [u8; una_abi::OPEN_ARG_MAX]) -> usize {
+    unsafe {
+        let n = OPEN_ARG_N;
+        OPEN_ARG_N = 0;
+        out[..n].copy_from_slice(&(&*core::ptr::addr_of!(OPEN_ARG))[..n]);
+        n
+    }
 }

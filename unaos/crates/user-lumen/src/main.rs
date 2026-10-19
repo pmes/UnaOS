@@ -2826,6 +2826,7 @@ pub extern "C" fn _start() -> ! {
         if send {
             submit();
         }
+        open_arg(); // ONEINSTANCE (B734): a second launch's file, handed to this window (kept by the last frame's drain)
         let a = app();
         if a.flash_n > 0 && now_ms() >= a.flash_until {
             a.flash_n = 0;
@@ -2954,5 +2955,30 @@ fn raise_self() {
         }
     }
     l.put(b" ::");
+    l.wire();
+}
+
+// ONEINSTANCE (rmbp-ledger B734) — Lumen is a single-instance program: a second `lumen <file>` (or a glass launch with a
+// file) raises THIS window and the kernel hands the file over as one `BUS_VERB_OPEN_ARG` frame (`theme`'s mailbox drain
+// keeps it). Lumen opens it the way a dropped file opens: `open <path>` in the composer at the caret, for the user to
+// send. `:: LUMEN: open_arg n=<bytes> ::`.
+fn open_arg() {
+    let mut b = [0u8; una_abi::OPEN_ARG_MAX];
+    let n = theme::take_open_arg(&mut b);
+    if n == 0 {
+        return;
+    }
+    let a = app();
+    for &c in b"open " {
+        a.insert(c);
+    }
+    for &c in &b[..n] {
+        if (0x20..0x7f).contains(&c) {
+            a.insert(c);
+        }
+    }
+    a.dirty = true;
+    let mut l = Line::new(b":: LUMEN: open_arg n=");
+    l.dec(n as i64).put(b" ::");
     l.wire();
 }

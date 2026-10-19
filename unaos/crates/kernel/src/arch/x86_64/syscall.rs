@@ -16994,7 +16994,7 @@ fn spawn_user_image_bg_inner(
     no_autofocus: bool,
     argv: &[&str], as_row: Option<usize>, pipe: Option<usize>,
 ) -> Result<(u64, u64, u64), &'static str> {
-    let _ = no_autofocus; #[cfg(feature = "wc")] let app_t0 = crate::arch::now_cycles(); // APPLAUNCH (B678): the exec stamp, before the ELF load. ⚠ LINE-NEUTRAL fold. — // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
+    let _ = no_autofocus; #[cfg(feature = "wc")] let app_t0 = crate::arch::now_cycles(); #[cfg(feature = "wc")] if oneinstance_gate(no_autofocus, argv, as_row, pipe.is_some()) { return Err(ONEINSTANCE_RAISED); } // APPLAUNCH (B678): the exec stamp, before the ELF load. ⚠ LINE-NEUTRAL fold. ONEINSTANCE (B734): a second launch of a running program by the user's verb raises it instead of spawning (file tail), BEFORE any slot exists; LINE-NEUTRAL fold, code before this line's first `//`. — // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists
     let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; #[cfg(feature = "wc")] crate::procslot::launch::exec_stamp(mapped.slot, crate::video::wm::program_name(argv.first().copied().unwrap_or("-")), app_t0); /* APPLAUNCH (B678) */ // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
@@ -31878,4 +31878,120 @@ fn busx_window_raise(row: usize, body: &[u8], text: &mut alloc::vec::Vec<u8>) ->
         }
         Err(e) => e,
     }
+}
+
+// ONEINSTANCE (rmbp-ledger B734; BP-ring3-16, BP-video-23, BP-bar-7/18) — TAIL-APPENDED, so no line above moves. ONE check
+// at the funnel every launch shares (`spawn_user_image_bg_inner`: the dock's direct launch, the launcher's and the system
+// menu's program lines, Quarry, the shell's `bg` and bare name, `SYS_SPAWN_PATH`), before the ELF is mapped: a launch by
+// the USER'S VERB (`origin::current()` = Glass or Door — FOCUSSTEAL's verb) of a program already running for this session
+// as the same user, with a window, is not spawned again. The running instance (`wm::focussteal::raise_instance`: a live
+// ring-3 row whose armed program name is this launch's `program_name(argv[0])` or APPRES's launch name for it, admitted
+// by the same-user test below) is
+// raised under the focus-steal rule — the user's verb names it, so the answer is given — and the grant is both halves,
+// as RAISEVERB's seam grants them (`user_input_set_active` only on a real arrival, then `focus_changed`, which also
+// brings a minimised window back). A launch argument (argv[1]: a file path or a URL) is delivered to that instance as
+// one `BUS_VERB_OPEN_ARG` frame (kind REPLY, corr 0 — `bus_notice_to`'s enqueue). The launcher then reads
+// `Err(ONEINSTANCE_RAISED)`: no slot, no window, its refusal line names the raise. Not the user's verb (a service, the
+// desktop app, a kernel fixture), a pipe child (SPAWN_PIPE: a console job of its shell), or `new=1`
+// ([`spawn_user_image_bg_argv_new`]: the dock's Shift-click, the tile menu's `New Window`): spawned exactly as before.
+// Wire: `[app] launch path=<p> instance=new arg=<n> [new=1]` or `[app] launch path=<p> instance=raised arg=<n> owner=<o>
+// focus=<given|pulsed> delivered=<0|-errno>`.
+
+/// What a launcher reads when its launch raised the running instance instead of spawning one.
+#[cfg(feature = "wc")]
+pub const ONEINSTANCE_RAISED: &str = "already running: its window was raised (Shift-click or New Window opens another)";
+
+/// `new=1` for the launch in flight: armed by [`spawn_user_image_bg_argv_new`], consumed by [`oneinstance_gate`].
+#[cfg(feature = "wc")]
+static ONEINST_NEW: AtomicBool = AtomicBool::new(false);
+/// The last raise: the owner raised (0 = none yet), the focus verdict, the OPEN_ARG delivery's rc — `tests oneinstance`.
+#[cfg(feature = "wc")]
+static ONEINST_LAST_OWNER: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wc")]
+static ONEINST_LAST_GIVEN: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wc")]
+static ONEINST_LAST_RC: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// [`spawn_user_image_bg_argv`] with `new=1`: the user asked for ANOTHER copy (Shift-click on a dock tile, the tile
+/// menu's `New Window`), so the one-instance check spawns it even while one runs.
+#[cfg(feature = "wc")]
+pub fn spawn_user_image_bg_argv_new(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
+    ONEINST_NEW.store(true, Ordering::Release);
+    let r = spawn_user_image_bg_inner(bytes, false, argv, None, None);
+    ONEINST_NEW.store(false, Ordering::Release);
+    r
+}
+
+/// `(owner, given, delivered rc)` of the last raise — `tests oneinstance`.
+#[cfg(feature = "wc")]
+pub fn oneinstance_last() -> (u64, bool, i64) {
+    (ONEINST_LAST_OWNER.load(Ordering::Acquire), ONEINST_LAST_GIVEN.load(Ordering::Acquire), ONEINST_LAST_RC.load(Ordering::Acquire))
+}
+
+/// The check (see the block above). `true` = the running instance was raised and the launch must not spawn.
+#[cfg(feature = "wc")]
+fn oneinstance_gate(no_autofocus: bool, argv: &[&str], as_row: Option<usize>, piped: bool) -> bool {
+    let new = ONEINST_NEW.swap(false, Ordering::AcqRel);
+    let path = argv.first().copied().unwrap_or("");
+    if no_autofocus || piped || path.is_empty() || !matches!(crate::origin::current(), crate::origin::Origin::Glass | crate::origin::Origin::Door) {
+        return false; // not the user's verb: spawned as before, no line
+    }
+    let arg = argv.get(1).copied().unwrap_or("");
+    let user = oneinstance_user(as_row);
+    let keep = |owner: u64| oneinstance_same_user(owner, user);
+    let launch_name = crate::fs::appres::launch_name(path); // the name a dock launch arms (`wm::app_name_arm_launch`)
+    let names = [crate::video::wm::program_name(path), launch_name.as_deref().unwrap_or("")];
+    let found = if new { None } else { crate::video::wm::focussteal::raise_instance(&names, &keep) };
+    let Some((owner, given)) = found else {
+        serial_println!("[app] launch path={} instance=new arg={}{}", path, arg.len(), if new { " new=1" } else { "" });
+        return false;
+    };
+    if given {
+        if USER_INPUT_ACTIVE.load(Ordering::Acquire) != owner {
+            user_input_set_active(owner);
+        }
+        crate::video::wm::focus_changed(owner);
+    }
+    let rc = if arg.is_empty() { 0 } else { busx_open_arg_to((owner - 1) as usize, arg.as_bytes()) };
+    ONEINST_LAST_GIVEN.store(given, Ordering::Release);
+    ONEINST_LAST_RC.store(rc, Ordering::Release);
+    ONEINST_LAST_OWNER.store(owner, Ordering::Release);
+    serial_println!("[app] launch path={} instance=raised arg={} owner={} focus={} delivered={}", path, arg.len(), owner, if given { "given" } else { "pulsed" }, rc);
+    true
+}
+
+/// The user this launch would run as: the calling slot's (a `SYS_SPAWN_PATH` child inherits it), else the session's.
+#[cfg(all(feature = "wc", feature = "login"))]
+fn oneinstance_user(as_row: Option<usize>) -> u32 {
+    match as_row {
+        Some(r) => slot_user_live(r),
+        None => SESSION_USER.load(Ordering::Acquire),
+    }
+}
+#[cfg(all(feature = "wc", not(feature = "login")))]
+fn oneinstance_user(_as_row: Option<usize>) -> u32 {
+    0
+}
+
+/// Does owner `owner` (`slot + 1`) run as `user` in the LIVE session? Without `login` there is one user.
+#[cfg(all(feature = "wc", feature = "login"))]
+fn oneinstance_same_user(owner: u64, user: u32) -> bool {
+    owner != 0 && slot_user_live((owner - 1) as usize) == user
+}
+#[cfg(all(feature = "wc", not(feature = "login")))]
+fn oneinstance_same_user(owner: u64, _user: u32) -> bool {
+    owner != 0
+}
+
+/// One OPEN_ARG frame into `row`'s mailbox: `bus_notice_to`'s enqueue with verb 27. 0, or `EINVAL` (row out of range,
+/// body over `OPEN_ARG_MAX`) / `EAGAIN` (mailbox full).
+#[cfg(feature = "wc")]
+fn busx_open_arg_to(row: usize, body: &[u8]) -> i64 {
+    if row >= BUSX_MBOX.len() || body.is_empty() || body.len() > una_abi::OPEN_ARG_MAX {
+        return EINVAL;
+    }
+    if !busx_mbox_has_room(row) {
+        return EAGAIN;
+    }
+    busx_reply_enqueue(row, 0, una_abi::BUS_VERB_OPEN_ARG, 0, body)
 }

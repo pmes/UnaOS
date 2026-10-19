@@ -1117,7 +1117,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     };
     if l.is_overflow(t) { return overflow_press(x, y, t, &rows[t..n]); } // WINDOWCAP-2 (R90): the `+<k>` group lists the rest
     let r = rows[t]; crate::video::lag::launch_routed(); // GLASSLAG M1 (B370): a tile press is a launch, an open request or a raise.
-    if r.id == TRASH_PIN_ID { return trash_press(x, y, t, n); } // DOCK2 (B394): the Trash opens in Quarry
+    if r.id == TRASH_PIN_ID { return trash_press(x, y, t, n); } if shift_new_press(&r, x, y, t, n) { return true; } // DOCK2 (B394): the Trash opens in Quarry. ONEINSTANCE (B734): Shift on a running program's tile launches ANOTHER copy (new=1), file tail; LINE-NEUTRAL fold, code before this line's first `//`
     if pin_press_defer(&r, x, y) { return true; } // DOCK2 M6: a pin launches on RELEASE (a moved press is a drag)
     reorder_arm(&r); launch_arm(&r); // DOCK2: an app-band tile can be dragged to a new place; a pin press starts the launch pulse
     // APPPIN — a PIN tile names no row: nothing to raise, nothing to focus yet. POST a launch for the
@@ -3012,7 +3012,7 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     let (tx, ty, _, _) = l.tile(t)?;
     let band_px = super::crystal::sheet::BAND(); // MENUS2 (B652): the published rect is the OUTER one — the sheet's shadow band on the body's right and at its foot (MENUSCRAFT §2); every hit test below reads `sheet::body`
     let mw = (18 * CELL_W() + 2 * PAD() + band_px).min(if l.vert { MAX_STRIP_W } else { l.w }); // PREFSUI: `[x] Open at Login` is the widest row
-    let nrows = if owner == TRASH_OWNER { 1 } else { MENU_ITEMS + menu_win_rows(owner) }; // WINDOWLIST M3; DOCK2 M6 the Trash's one item — one extra row per window when the app has more than one
+    let nrows = if owner == TRASH_OWNER { 1 } else { MENU_ITEMS + menu_win_rows(owner) + menu_new_rows(owner) }; // ONEINSTANCE (B734): + the `New Window` row after the window rows (file tail). WINDOWLIST M3; DOCK2 M6 the Trash's one item — one extra row per window when the app has more than one
     let mh = nrows * TILE_H() + band_px;
     let band = if l.vert { 0 } else { mh + PAD() }; // DOCK2: a side dock's menu stands BESIDE the tile, as its own rect
     if l.y < band { return None; }
@@ -3055,7 +3055,7 @@ fn menu_box(out: &mut [u32], ow: usize, bx: usize, g: MenuGeo, j: usize, under: 
         if hot { sheet::pill(&mut out[bx..bx + g.mw], bw, j, row * TILE_H(), TILE_H()); }
         let ink = if hot { sheet::on_accent() } else { sheet::text_primary() };
         let mut wbuf = [0u8; wm::MAX_TITLE];
-        let label: &[u8] = if g.owner == TRASH_OWNER { b"Empty Trash..." } else if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3; DOCK2 the six items
+        let label: &[u8] = if g.owner == TRASH_OWNER { b"Empty Trash..." } else if row < MENU_ITEMS { menu_label(row, g.keep, open_at_login(g.owner)) } else if row - MENU_ITEMS >= menu_win_rows(g.owner) { b"New Window" } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // ONEINSTANCE (B734): the row after the window rows is `New Window`. WINDOWLIST M3; DOCK2 the six items
         if sy0 >= 0 { super::text::draw_row(out, (bx + bw).min(ow), label, bx + sheet::INSET() + PAD(), sy0 as usize, ink, false, FACE); }
     }
     sheet::seal_row(&mut out[bx..bx + g.mw]);
@@ -3143,7 +3143,7 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     if px < mx || px >= mx + mw || py < my || py >= my + mh { return false; }
     let owner = MENU_OWNER.load(Ordering::Relaxed);
     let prow = (py - my) / TILE_H();
-    if owner == TRASH_OWNER { empty_trash_ask(); return true; } // DOCK2 M6
+    if owner == TRASH_OWNER { empty_trash_ask(); return true; } if prow >= MENU_ITEMS && prow - MENU_ITEMS >= menu_win_rows(owner) { menu_new_window(owner); return true; } // ONEINSTANCE (B734): `New Window` (file tail). DOCK2 M6
     if prow >= MENU_ITEMS { // WINDOWLIST M3 — a per-window row raises and focuses that window
         let mut wb = [0u8; wm::MAX_TITLE];
         let (win, _) = menu_win_row(owner, prow - MENU_ITEMS, &mut wb);
@@ -4873,7 +4873,7 @@ fn dp_path_launch(pin: Option<usize>, path: &str, on: &str) -> Result<(u64, u64)
     crate::prof::launching(path);
     if let Some(i) = pin { DP_DIRECT_DONE.fetch_or(1 << i, Ordering::AcqRel); } // before the spawn: the child may land its window before we return
     let t_spawn = crate::arch::ms();
-    match crate::origin::with(crate::origin::Origin::Glass, || crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[path])) {
+    match crate::origin::with(crate::origin::Origin::Glass, || dp_spawn(pin, &bytes, path)) {
         Ok((pid, slot, _entry)) => {
             let spawn_ms = crate::arch::ms().saturating_sub(t_spawn);
             wm::app_name_arm_launch(wm::owner_of_launch(slot), path);
@@ -5153,4 +5153,81 @@ pub fn a11y_tiles(pw: usize, ph: usize, out: &mut alloc::vec::Vec<([u8; wm::MAX_
         out.push((cap, len, bx));
     }
     true
+}
+
+// ONEINSTANCE (rmbp-ledger B734; BP-ring3-16, BP-video-23) — TAIL-APPENDED. The kernel launches a running program ONCE per
+// user verb (`arch::syscall`'s one check: a second launch raises the running instance and hands it the argument); the
+// dock is where the user asks for ANOTHER copy (`new=1`): Shift held on a running program's tile, or the tile menu's
+// `New Window` row (after the window rows; path pins only — a program the dock launches directly). Both POST the pin's
+// direct launch with its `DP_DIRECT_NEW` bit; the drain spawns through `spawn_user_image_bg_argv_new`.
+// Wire: `[dock] press at (<x>,<y>) tile=<t>/<n> app=<a> shift=1 -> launch new-posted`, `[dock] menu new-window
+// owner=<o> app=<a> -> new-posted`, then the kernel's `[app] launch path=<p> instance=new arg=0 new=1`.
+
+/// Path pins whose next direct launch is `new=1` (bit = table index); set with the post, taken by the drain.
+static DP_DIRECT_NEW: AtomicU32 = AtomicU32::new(0);
+
+/// The path pin `o`'s program is (a live owner, never a pin tile's synthetic one): the pin's own cached owner, else the
+/// armed program name (a second copy's owner is not the pin's cache).
+fn dp_direct_of_owner(o: u64) -> Option<usize> {
+    if o == 0 || (o >= DP_PIN_OWNER && o < DP_PIN_OWNER + DP_PINS.len() as u64) {
+        return None;
+    }
+    if let Some(i) = dp_spec_of_owner(o).filter(|&i| dp_is_direct(i)) {
+        return Some(i);
+    }
+    let mut b = [0u8; wm::MAX_TITLE];
+    let n = wm::app_name_of(o, &mut b);
+    if n == 0 {
+        return None;
+    }
+    (0..DP_PINS.len()).find(|&i| dp_available(i) && dp_is_direct(i) && DP_PINS[i].name.as_bytes().eq_ignore_ascii_case(&b[..n]))
+}
+
+/// POST path pin `i`'s launch as `new=1`.
+fn dp_new_post(i: usize) -> &'static str {
+    DP_DIRECT_NEW.fetch_or(1 << i, Ordering::AcqRel);
+    let _ = dp_direct_post(i);
+    "new-posted"
+}
+
+/// The direct launch's spawn: `new=1` when pin `pin`'s bit is set (taken), else the ordinary launch.
+#[cfg(target_arch = "x86_64")]
+fn dp_spawn(pin: Option<usize>, bytes: &[u8], path: &str) -> Result<(u64, u64, u64), &'static str> {
+    #[cfg(feature = "wc")]
+    if let Some(i) = pin {
+        if DP_DIRECT_NEW.fetch_and(!(1u32 << i), Ordering::AcqRel) & (1 << i) != 0 {
+            return crate::arch::syscall::spawn_user_image_bg_argv_new(bytes, &[path]);
+        }
+    }
+    #[cfg(not(feature = "wc"))]
+    let _ = pin;
+    crate::arch::syscall::spawn_user_image_bg_argv(bytes, &[path])
+}
+
+/// Shift held on a running program's tile: `new=1` (the press is consumed; nothing is raised).
+fn shift_new_press(r: &wm::DockEntry, x: i32, y: i32, t: usize, n: usize) -> bool {
+    if !cfg!(feature = "wc") || !row_running(r) || !crate::video::keymap::shift_held() {
+        return false;
+    }
+    let Some(i) = dp_direct_of_owner(r.owner_asid) else { return false };
+    PRESS_OUTCOME.store(DOCK_OUT_LAUNCH_PIN, Ordering::Relaxed);
+    let how = dp_new_post(i);
+    serial_println!("[dock] press at ({},{}) tile={}/{} app={} shift=1 -> launch {}", x, y, t, n, DP_PINS[i].name, how);
+    true
+}
+
+/// The tile menu's `New Window` row: 1 for a running path-pin program, else 0.
+fn menu_new_rows(owner: u64) -> usize {
+    if cfg!(feature = "wc") && owner != TRASH_OWNER && dp_direct_of_owner(owner).is_some() { 1 } else { 0 }
+}
+
+/// `New Window` pressed: `new=1`.
+fn menu_new_window(owner: u64) {
+    match dp_direct_of_owner(owner).filter(|_| menu_new_rows(owner) == 1) {
+        Some(i) => {
+            let how = dp_new_post(i);
+            serial_println!("[dock] menu new-window owner={:#x} app={} -> {}", owner, DP_PINS[i].name, how);
+        }
+        None => serial_println!("[dock] menu new-window owner={:#x} -> no-app", owner),
+    }
 }

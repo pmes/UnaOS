@@ -1008,6 +1008,7 @@ pub extern "C" fn _start() -> ! {
         }
         let moved = theme::due(now_ms());
         chrome::prefs(&mut app, moved); // AETHERSIDETABS2 (SR143): `aether.tabs.layout` — the tabs' side, live
+        open_arg(&mut app, &mut page, &mut fonts); // ONEINSTANCE (B734): a second launch's URL, in a new tab of THIS window
         if moved && theme::load() {
             app.dirty = true; // UNAKEYS (B552): the store moved — repaint in the new look
             theme_wire();
@@ -1077,3 +1078,18 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[used]
 #[link_section = ".note.unaos.app"]
 static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WINDOWED);
+
+/// ONEINSTANCE (rmbp-ledger B734): Aether is a single-instance program — a second `aether <url>` (or a glass launch with
+/// a URL or a file) raises THIS window and the kernel hands the argument over as one `BUS_VERB_OPEN_ARG` frame (`theme`'s
+/// mailbox drain keeps it); it opens in a NEW TAB (`chrome::open_arg_tab`). `:: AETHER: open_arg n=<bytes> tabs=<n> ::`.
+fn open_arg(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts) {
+    let mut b = [0u8; una_abi::OPEN_ARG_MAX];
+    let n = theme::take_open_arg(&mut b);
+    if n == 0 {
+        return;
+    }
+    match core::str::from_utf8(&b[..n]) {
+        Ok(u) => chrome::open_arg_tab(app, page, fonts, u),
+        Err(_) => Line::new(b":: AETHER: open_arg -> FAIL reason=not-utf8 n=").dec(n as i64).put(b" ::").wire(),
+    }
+}
