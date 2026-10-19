@@ -2876,7 +2876,7 @@ pub fn user_space_retain(cr3: u64) {
 /// The count is decremented with a saturating CAS loop rather than `fetch_sub`, so a stray extra
 /// release (a path that retained nothing) cannot wrap the counter to `u32::MAX` and make the slot
 /// immortal — the fail-closed direction here is "free it", not "leak it forever".
-fn user_space_release(cr3: u64) {
+fn user_space_release(cr3: u64, id: u64) { // APPFAULT (B700): `id` = the releasing task, named on the `[task] terminate` line
     let Some(s) = cr3_slot(cr3) else {
         // Not one of ours (a CR3 that is not a live slot root — nothing to free, nothing to count).
         return;
@@ -2893,7 +2893,7 @@ fn user_space_release(cr3: u64) {
             // Last holder: free the slot for real. `free_user_space_by_cr3` retires the slot's
             // compositor windows, drops its FB leaves, clears its handle/file rows and releases the
             // used-flag — the clear-before-release discipline it already documents.
-            crate::arch::memory::free_user_space_by_cr3(cr3);
+            term_release_edge(s, cr3, id); // APPFAULT (B700): the free (`free_user_space_by_cr3`) inside the ONE edge that reads the windows/frames first and prints `[task] terminate`
             return;
         }
         match USER_SPACE_REFS[s].compare_exchange_weak(
@@ -3727,7 +3727,7 @@ pub fn exit() -> ! {
             crate::arch::memory::restore_kernel_cr3();
             // VUGSPREAD: keep the `cr3_live` shadow honest across a teardown restore — see `SchedCpu::cr3_live`.
             SCHED[cpu].cr3_live.store(crate::arch::memory::kernel_cr3(), Ordering::Relaxed);
-            user_space_release(user_cr3);
+            user_space_release(user_cr3, (*raw).id);
         }
         // DRAINRESCUE — release any window-manager drain barrier this task raised and can no longer
         // lower. `exit()` is this arch's single voluntary terminus (kernel trampoline return,
@@ -6599,13 +6599,13 @@ fn reap_killed(task: Box<Task>) {
         // Armed here rather than at the requester — a `bg_kill` names a pid, and the set of tasks that
         // pid's program owns is knowable only from the slot. Idempotent, so a sibling reaping after us
         // simply re-arms the same flag; the flag is cleared on the slot's real free edge.
-        doom_address_space(task.user_cr3);
+        doom_address_space(task.user_cr3); term_stash(task.user_cr3, 0, Cause::Kill); // APPFAULT (B700): a reaped task ends as `cause=kill` unless a fault/OOM already named the slot (first cause wins)
         crate::arch::memory::restore_kernel_cr3();
         // VUGSPREAD: keep the `cr3_live` shadow honest across a teardown restore — see `SchedCpu::cr3_live`.
         SCHED[percpu::this_cpu().cpu_index as usize]
             .cr3_live
             .store(crate::arch::memory::kernel_cr3(), Ordering::Relaxed);
-        user_space_release(task.user_cr3);
+        user_space_release(task.user_cr3, task.id);
     }
     if let Some(k) = &task.kill {
         k.mark_reaped(); // through the Arc — the requester's clone keeps it live
@@ -8555,4 +8555,209 @@ fn gatesteal2_selftest() {
         if revenant2 { "exited" } else { "stuck" },
         deaths
     );
+}
+
+// =================================================================================================
+// APPFAULT (rmbp-ledger B700, BP-ring3-15, BP-bar-24; research A §3 "one app must never take the desktop
+// down") — ONE TEARDOWN PATH FOR A RING-3 PROGRAM. TAIL-APPENDED: no line above moves.
+//
+// Every way a ring-3 program ends now names itself through ONE seam, [`terminate`], and every end reaches ONE
+// edge, [`term_release_edge`] — the 1->0 free of its address-space slot inside `user_space_release`:
+//   * a CPL-3 fault: `interrupts::ring3_fault_kill` -> `terminate(id, Cause::Fault{..})`;
+//   * an OOM: `memory::sys_sbrk` past the slot's heap ceiling (or the kernel heap refusing a frame) ->
+//     `terminate(id, Cause::Oom{kb})` — the ASKER is the one terminated, never the desktop;
+//   * the task's own exit: `SYS_EXIT` -> `exit()` reaches the same edge with the default cause `exit`;
+//   * a kill (`bg_kill`, a `run` deadline, the close box): `reap_killed` stashes `Cause::Kill`.
+// The edge reads what the slot holds (its wm rows, its ELF-window frames, its armed name), frees it — windows
+// closed, handles cleared, heap frames returned, slot claimable (`memory::free_user_space_by_cr3`, unchanged) —
+// and prints ONE line, `[task] terminate id=<n> name=<s> cause=<c> freed_kb=<n> windows=<n>`, then posts ONE
+// toast `<name> stopped: <cause>` for a fault or an OOM (`video::notify`, queue only). The edge allocates
+// nothing (an OOM end must not ask the heap that just said no): the cause is printed through `CauseFmt`, the
+// toast is written into a stack buffer.
+//
+// Fault and OOM DOOM the address space (TEARDOWN-1's flag) and wake its parked siblings, so a threaded program
+// dies whole and the slot actually reaches its free edge. The per-slot words are `[_; SLOT_ID_MAX]` atomics —
+// the slot TYPE bound (`procslot::SLOT_ID_MAX`), never a pool width — so a fault ISR never allocates.
+// =================================================================================================
+
+/// APPFAULT: why a ring-3 program ended — the `cause=` word of `[task] terminate`.
+#[derive(Clone, Copy)]
+pub enum Cause {
+    /// The program called `SYS_EXIT` (the default when nothing else named the slot).
+    Exit,
+    /// A CPL-3 exception: vector, error code, faulting rip, CR2 (#PF only).
+    Fault { vec: u8, err: u64, rip: u64, cr2: u64 },
+    /// The program's heap crossed its ceiling (or the kernel heap refused it) at `kb` KiB.
+    Oom { kb: u64 },
+    /// Retired by a kill request (`bg_kill`, a `run` deadline, the close box).
+    Kill,
+}
+
+/// APPFAULT: the vector `record_ring3_kill` is handed for an OOM — 0xFF is no x86 exception vector.
+pub const VEC_OOM: u8 = 0xFF;
+
+const TERM_EXIT: u64 = 1;
+const TERM_FAULT: u64 = 2;
+const TERM_OOM: u64 = 3;
+const TERM_KILL: u64 = 4;
+const TERM_LOW: u64 = 0xFFFF_FFFF_FFFF;
+
+impl Cause {
+    /// Packed: kind in bits 56..64, vector in 48..56, rip / KiB in 0..48 (a ring-3 rip is a lower-half VA).
+    fn word(self) -> u64 {
+        match self {
+            Cause::Exit => TERM_EXIT << 56,
+            Cause::Fault { vec, rip, .. } => (TERM_FAULT << 56) | ((vec as u64) << 48) | (rip & TERM_LOW),
+            Cause::Oom { kb } => (TERM_OOM << 56) | (kb & TERM_LOW),
+            Cause::Kill => TERM_KILL << 56,
+        }
+    }
+}
+
+/// APPFAULT: the `cause=` text of a packed word, written without the heap.
+pub struct CauseFmt(pub u64);
+
+impl core::fmt::Display for CauseFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let w = self.0;
+        match w >> 56 {
+            TERM_FAULT => write!(f, "fault:{}:{:#x}", (w >> 48) & 0xFF, w & TERM_LOW),
+            TERM_OOM => write!(f, "oom:{}", w & TERM_LOW),
+            TERM_KILL => f.write_str("kill"),
+            _ => f.write_str("exit"),
+        }
+    }
+}
+
+/// APPFAULT: the kind word of a packed cause, by name (`tests appfault` judges on it).
+pub fn term_kind(w: u64) -> &'static str {
+    match w >> 56 {
+        TERM_FAULT => "fault",
+        TERM_OOM => "oom",
+        TERM_KILL => "kill",
+        _ => "exit",
+    }
+}
+
+/// APPFAULT: the fault vector of a packed `fault` cause (meaningless for the other kinds).
+pub fn term_vec(w: u64) -> u8 {
+    ((w >> 48) & 0xFF) as u8
+}
+
+const TERM_SLOTS: usize = crate::procslot::SLOT_ID_MAX;
+/// The cause a slot's program named (0 = none yet; the free edge then says `exit`). First cause wins.
+static TERM_CAUSE: [AtomicU64; TERM_SLOTS] = [const { AtomicU64::new(0) }; TERM_SLOTS];
+/// The task id that named it (the line's `id=`; the releasing task's id when nothing named it).
+static TERM_ID: [AtomicU64; TERM_SLOTS] = [const { AtomicU64::new(0) }; TERM_SLOTS];
+/// The last free edge of each slot, for `tests appfault`: its sequence number, cause, KiB freed, windows closed.
+static END_AT: [AtomicU64; TERM_SLOTS] = [const { AtomicU64::new(0) }; TERM_SLOTS];
+static END_CAUSE: [AtomicU64; TERM_SLOTS] = [const { AtomicU64::new(0) }; TERM_SLOTS];
+static END_KB: [AtomicU64; TERM_SLOTS] = [const { AtomicU64::new(0) }; TERM_SLOTS];
+static END_WIN: [AtomicU64; TERM_SLOTS] = [const { AtomicU64::new(0) }; TERM_SLOTS];
+static END_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// APPFAULT: name the cause of the program in the slot rooted at `cr3` (no-op for a slotless task). First wins.
+fn term_stash(cr3: u64, id: u64, cause: Cause) {
+    if cr3 == 0 {
+        return;
+    }
+    if let Some(s) = cr3_slot(cr3).filter(|&s| s < TERM_SLOTS) {
+        if TERM_CAUSE[s].compare_exchange(0, cause.word(), Ordering::AcqRel, Ordering::Acquire).is_ok() && id != 0 {
+            TERM_ID[s].store(id, Ordering::Release);
+        }
+    }
+}
+
+/// APPFAULT M1 — THE ONE WAY A RING-3 PROGRAM IS ENDED BY THE KERNEL. `id` is the dying task — the CURRENT
+/// task: every caller (the CPL-3 fault net, `SYS_SBRK`'s OOM) runs on the dying task's own kernel stack, the
+/// context `sys_exit` runs in. Records the kill on the program's Proc row (`record_ring3_kill`, so `run`'s
+/// wait and `jobs` settle), names the cause on its slot, dooms the address space for a fault or an OOM (every
+/// sibling thread follows out at its next kill boundary; parked ones are woken), then [`exit`]: the slot's
+/// last holder reaches [`term_release_edge`]. Never returns.
+pub fn terminate(id: u64, cause: Cause) -> ! {
+    let name = current_name().unwrap_or("-");
+    match cause {
+        Cause::Fault { vec, err, cr2, .. } => crate::arch::syscall::record_ring3_kill(name, vec, err, cr2),
+        Cause::Oom { kb } => crate::arch::syscall::record_ring3_kill(name, VEC_OOM, 0, kb),
+        Cause::Exit | Cause::Kill => {}
+    }
+    let cr3 = current_user_cr3().unwrap_or(0);
+    term_stash(cr3, id, cause);
+    if cr3 != 0 && matches!(cause, Cause::Fault { .. } | Cause::Oom { .. }) {
+        doom_address_space(cr3);
+        let _ = kill_wake_parked();
+    }
+    exit()
+}
+
+/// A fixed buffer `core::fmt::Write` fills (cut at the end, never refused) — the toast's text without the heap.
+struct TermBuf<'a> {
+    b: &'a mut [u8],
+    n: usize,
+}
+
+impl core::fmt::Write for TermBuf<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() {
+            if self.n < self.b.len() {
+                self.b[self.n] = c;
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// APPFAULT — THE FREE EDGE: slot `s` (rooted at `cr3`) has lost its last holder, task `id`. Reads what the
+/// program holds BEFORE the free (its wm rows, its ELF-window frames, its armed name — the free forgets all
+/// three), frees it, prints the one `[task] terminate` line and, for a fault or an OOM, posts the one toast.
+/// Runs where `user_space_release` runs (the dying task's `exit`, IF=0, or the scheduler's reap); takes the wm
+/// table and name locks the free itself takes, in the same order; allocates nothing.
+fn term_release_edge(s: usize, cr3: u64, id: u64) {
+    let owner = s as u64 + 1; // `wm::owner_of_launch(s)` on x86: a slot's windows are owned by `slot + 1`
+    let windows = crate::video::wm::owner_rows(owner);
+    let freed_kb = crate::arch::memory::xwin_slot_pages(s) * 4;
+    let mut nm = [0u8; crate::video::wm::MAX_TITLE];
+    let n = crate::video::wm::app_name_of(owner, &mut nm);
+    crate::arch::memory::free_user_space_by_cr3(cr3);
+    if s >= TERM_SLOTS {
+        return;
+    }
+    let w = match TERM_CAUSE[s].swap(0, Ordering::AcqRel) {
+        0 => Cause::Exit.word(),
+        w => w,
+    };
+    let tid = match TERM_ID[s].swap(0, Ordering::AcqRel) {
+        0 => id,
+        t => t,
+    };
+    let name = if n > 0 { core::str::from_utf8(&nm[..n]).unwrap_or("-") } else { current_name().unwrap_or("-") };
+    serial_println!("[task] terminate id={} name={} cause={} freed_kb={} windows={}", tid, name, CauseFmt(w), freed_kb, windows);
+    END_CAUSE[s].store(w, Ordering::Relaxed);
+    END_KB[s].store(freed_kb, Ordering::Relaxed);
+    END_WIN[s].store(windows as u64, Ordering::Relaxed);
+    END_AT[s].store(END_SEQ.fetch_add(1, Ordering::AcqRel) + 1, Ordering::Release);
+    if matches!(w >> 56, TERM_FAULT | TERM_OOM) {
+        let mut b = [0u8; 96];
+        let mut t = TermBuf { b: &mut b, n: 0 };
+        let _ = core::fmt::Write::write_fmt(&mut t, format_args!("{} stopped: {}", name, CauseFmt(w)));
+        let len = t.n;
+        let _ = crate::video::notify(b"", &b[..len], b"", b"", 0, b""); // M3: the one toast (queue only)
+    }
+}
+
+/// APPFAULT: the free-edge sequence number now (`tests appfault` reads it before a launch).
+pub fn term_seq() -> u64 {
+    END_SEQ.load(Ordering::Acquire)
+}
+
+/// APPFAULT: slot `s`'s last free edge: `(seq, cause word, freed_kb, windows)`, or `None` before its first.
+pub fn term_end(s: usize) -> Option<(u64, u64, u64, u64)> {
+    if s >= TERM_SLOTS {
+        return None;
+    }
+    match END_AT[s].load(Ordering::Acquire) {
+        0 => None,
+        q => Some((q, END_CAUSE[s].load(Ordering::Relaxed), END_KB[s].load(Ordering::Relaxed), END_WIN[s].load(Ordering::Relaxed))),
+    }
 }

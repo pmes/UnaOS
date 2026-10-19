@@ -4358,7 +4358,7 @@ pub unsafe fn xwin_free(s: usize) {
 pub fn xwin_set_heap(s: usize, lo: u64, max: u64) {
     XWIN_BRK_LO[s].store(lo, Ordering::Release);
     XWIN_BRK_MAX[s].store(max, Ordering::Release);
-    XWIN_BRK[s].store(lo, Ordering::Release);
+    XWIN_BRK[s].store(lo, Ordering::Release); xwin_ceil_arm(s, lo, max); // APPFAULT (B700): the slot's heap ceiling, from the free heap at this launch (file tail)
 }
 
 /// RING3WIN: `SYS_SBRK(delta)` for the CALLER's slot — returns the OLD break VA, or `ENOMEM`/`EINVAL`.
@@ -4372,7 +4372,7 @@ pub fn sys_sbrk(delta: i64) -> i64 {
     if max == 0 {
         return una_abi::ENOMEM;
     }
-    let new = (cur as i64).wrapping_add(delta);
+    let new = (cur as i64).wrapping_add(delta); if delta > 0 && new > cur as i64 && new as u64 <= max && xwin_over_ceiling(s, lo, new as u64) { let kb = (new as u64 - lo) >> 10; drop(_g); xwin_oom(s, kb, "ceiling"); } // APPFAULT (B700): past the ceiling (inside the window) the ASKER is terminated, never the desktop; the window cap below keeps its -ENOMEM
     if delta < 0 && (new < lo as i64) {
         return una_abi::EINVAL;
     }
@@ -4396,8 +4396,8 @@ pub fn sys_sbrk(delta: i64) -> i64 {
                     q += 4096;
                 }
                 bump_as_gen();
-                serial_println!(":: RING3WIN: sbrk refused slot={} delta={} reason=heap-frames -ENOMEM ::", s, delta);
-                return una_abi::ENOMEM;
+                drop(_g); xwin_oom(s, (new - lo) >> 10, "heap-frames"); // APPFAULT (B700): the kernel heap refused a frame — this call's pages are unwound above; the asker is terminated (was `-ENOMEM`)
+                // (never returns: `sched::terminate` -> `exit`)
             }
             p += 4096;
         }
@@ -4708,4 +4708,53 @@ unsafe fn ovf_map(s: usize, k: usize, pages: usize, on: bool) {
 /// bootloader writes one region per descriptor, unmerged), or `None`. The BSP's firmware stack lives in one.
 pub fn stackguard_reserved_region(addr: u64) -> Option<(u64, u64)> {
     REGIONS.get()?.iter().find(|r| r.kind == MemoryRegionKind::Reserved && r.phys_start <= addr && addr < r.phys_start + r.page_count * 4096).map(|r| (r.phys_start, r.phys_start + r.page_count * 4096))
+}
+
+// =================================================================================================
+// APPFAULT (rmbp-ledger B700, BP-ring3-15) — THE PER-TASK HEAP CEILING. TAIL-APPENDED.
+// A ring-3 program's heap frames come from the KERNEL heap (`xwin_map_page`'s `alloc_zeroed`), the heap the
+// desktop draws from. Each slot's heap is armed with a ceiling at launch by the wincap rule (R90: half the
+// kernel heap free NOW, `allocator::heap_census`), never above the ELF window: a `SYS_SBRK` that would grow the
+// heap past it (inside the window) TERMINATES the asker (`sched::terminate`, `Cause::Oom`) instead of letting
+// one program spend the desktop's memory; the window cap itself still answers `-ENOMEM` (the ABI's answer, and
+// `tests ring3win`'s past-cap probe). `tests appfault` arms a one-shot lower ceiling for its alloc-loop fixture.
+// =================================================================================================
+
+/// APPFAULT: each slot's heap ceiling in bytes above `XWIN_BRK_LO` (0 = none: no heap armed).
+static XWIN_CEIL: crate::procslot::SlotVec<AtomicU64> = crate::procslot::SlotVec::new(|| AtomicU64::new(0), AtomicU64::new(0));
+/// APPFAULT: a one-shot ceiling for the NEXT heap armed (0 = the wincap rule) — `tests appfault` only.
+static XWIN_CEIL_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// APPFAULT: arm slot `s`'s ceiling: the one-shot override if set, else half the free kernel heap now; never
+/// above the window (`max - lo`), never 0 (0 means "no heap").
+fn xwin_ceil_arm(s: usize, lo: u64, max: u64) {
+    let window = max.saturating_sub(lo);
+    let ceil = match XWIN_CEIL_NEXT.swap(0, Ordering::AcqRel) {
+        0 => (crate::allocator::heap_census(4096).free as u64 / 2).min(window),
+        c => c.min(window),
+    };
+    XWIN_CEIL[s].store(ceil.max(4096), Ordering::Release);
+}
+
+/// APPFAULT: would a heap of `new - lo` bytes cross slot `s`'s ceiling?
+fn xwin_over_ceiling(s: usize, lo: u64, new: u64) -> bool {
+    let c = XWIN_CEIL[s].load(Ordering::Acquire);
+    c != 0 && new.saturating_sub(lo) > c
+}
+
+/// APPFAULT: the OOM edge of `SYS_SBRK` — say it, then terminate the CALLER (the program that asked). The caller
+/// has dropped `XWIN_SBRK_LOCK` (this never returns).
+fn xwin_oom(s: usize, kb: u64, why: &str) -> ! {
+    serial_println!("[task] oom slot={} heap_kb={} ceiling_kb={} reason={}", s, kb, XWIN_CEIL[s].load(Ordering::Acquire) >> 10, why);
+    crate::arch::sched::terminate(crate::arch::sched::current_id().unwrap_or(0), crate::arch::sched::Cause::Oom { kb })
+}
+
+/// APPFAULT: arm a one-shot ceiling (bytes) for the next heap the loader arms; 0 disarms (`tests appfault`).
+pub fn xwin_ceiling_next(bytes: u64) {
+    XWIN_CEIL_NEXT.store(bytes, Ordering::Release);
+}
+
+/// APPFAULT: frames slot `s` holds in its ELF window now (the `[task] terminate` line's `freed_kb` / 4).
+pub fn xwin_slot_pages(s: usize) -> u64 {
+    XWIN_PAGES.peek(s).map_or(0, |p| p.load(Ordering::Acquire))
 }

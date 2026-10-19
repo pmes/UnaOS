@@ -30847,3 +30847,16 @@ pub mod k2p {
         }
     }
 }
+
+// APPFAULT (rmbp-ledger B700, BP-ring3-15) — TAIL-APPENDED. The window half of a ring-3 program's end: how many
+// rows `owner` (a slot's `slot + 1`) holds in the table right now. Read by `sched::term_release_edge` BEFORE the
+// slot's free retires them (`syscall::win_close_slot`), so the `[task] terminate` line names the windows that
+// closed. Read-only; takes the table lock the free's own `close` calls take, in the same context. A kernel
+// owner (furniture) is never a program: 0.
+pub fn owner_rows(owner_asid: u64) -> usize {
+    if owner_asid == 0 || is_kernel_owner(owner_asid) {
+        return 0;
+    }
+    let t = table();
+    t.rows.iter().filter(|r| r.used && r.owner_asid == owner_asid).count()
+}

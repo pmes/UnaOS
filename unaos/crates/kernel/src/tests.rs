@@ -262,7 +262,7 @@ fn ensure_ring3win() {
     #[cfg(target_arch = "x86_64")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); register("window", crate::window2::selftest); #[cfg(feature = "wc")] register("applaunch", applaunch_selftest); } // WINDOW2 (B361): `tests window`
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); register("window", crate::window2::selftest); #[cfg(feature = "wc")] register("applaunch", applaunch_selftest); #[cfg(feature = "wc")] register("appfault", appfault_selftest); } // WINDOW2 (B361): `tests window`
     }
 }
 
@@ -788,4 +788,103 @@ pub fn applaunch_selftest() {
         alloc::string::String::from("PASS")
     };
     serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
+}
+
+// APPFAULT (rmbp-ledger B700, BP-ring3-15, BP-bar-24) — TAIL-APPENDED. `tests appfault`: three fixture programs, each a
+// flat ring-3 image launched cold through the operator's own `bg` launcher, each ended through `sched::terminate`'s one
+// edge — (1) a #PF at linear 0 (`xor eax,eax; mov [rax],rax`), (2) an alloc loop (`SYS_SBRK` 1 MiB at a time) under a
+// one-shot 4 MiB ceiling (`memory::xwin_ceiling_next`), (3) a clean `SYS_EXIT 0`. Each slot's free edge is read back
+// (`sched::term_end`: cause, KiB freed, windows); the ELF-window frames and their page tables must return to their
+// count before the launches (`leaked_kb`), and a compositor pass must still land after (`desktop=alive`: the pass
+// counter moves past its value at the end of the three). SKIP with no panel.
+// `:: APPFAULT: fault=<0|1> oom=<0|1> exit=<0|1> leaked_kb=<n> desktop=<alive|stalled> -> PASS|FAIL ::`
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn appfault_selftest() {
+    use crate::arch::syscall::BgPoll;
+    const CEIL: u64 = 4 << 20;
+    const WAIT_MS: u64 = 3_000;
+    if !crate::video::WRITER.lock().is_ready() {
+        serial_println!(":: APPFAULT: fault=0 oom=0 exit=0 leaked_kb=0 desktop=none -> SKIP reason=no-panel ::");
+        return;
+    }
+    // (1) #PF: xor eax,eax ; mov [rax],rax ; jmp $
+    let pf: [u8; 7] = [0x31, 0xC0, 0x48, 0x89, 0x00, 0xEB, 0xFE];
+    // (2) loop: mov eax,58 (SYS_SBRK) ; mov edi,0x100000 ; syscall ; test rax,rax ; jns loop ; mov eax,2 ; mov edi,1 ; syscall ; jmp $
+    let oom: [u8; 31] = [
+        0xB8, 0x3A, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x10, 0x00, 0x0F, 0x05, 0x48, 0x85, 0xC0, 0x79, 0xEF,
+        0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+    ];
+    // (3) mov eax,2 (SYS_EXIT) ; xor edi,edi ; syscall ; jmp $
+    let ok: [u8; 11] = [0xB8, 0x02, 0x00, 0x00, 0x00, 0x31, 0xFF, 0x0F, 0x05, 0xEB, 0xFE];
+    const _: () = assert!(una_abi::SYS_SBRK == 0x3A && una_abi::SYS_EXIT == 2);
+    let live0 = crate::arch::memory::xwin_live_pages();
+    let pt0 = crate::arch::memory::xwin_pt_live();
+    let runs: [(&str, &[u8]); 3] = [("appfault-pf", &pf), ("appfault-oom", &oom), ("appfault-exit", &ok)];
+    let mut ends: [Option<u64>; 3] = [None; 3];
+    for (i, &(tag, img)) in runs.iter().enumerate() {
+        if i == 1 {
+            crate::arch::memory::xwin_ceiling_next(CEIL);
+        }
+        let seq0 = crate::arch::sched::term_seq();
+        match crate::arch::syscall::spawn_user_image_bg_argv(img, &[tag]) {
+            Ok((pid, slot, _)) => {
+                let dl = crate::arch::ticks() + WAIT_MS;
+                while matches!(crate::arch::syscall::bg_poll(pid, false), BgPoll::Running) && crate::arch::ticks() < dl {
+                    crate::arch::sched::yield_now();
+                }
+                let kill = if matches!(crate::arch::syscall::bg_poll(pid, false), BgPoll::Running) { crate::arch::syscall::bg_kill(pid, slot) } else { "-" };
+                let _ = crate::arch::syscall::bg_poll(pid, true);
+                let dl = crate::arch::ticks() + 2_000;
+                let mut end = None;
+                while crate::arch::ticks() < dl {
+                    end = crate::arch::sched::term_end(slot as usize).filter(|e| e.0 > seq0);
+                    if end.is_some() {
+                        break;
+                    }
+                    crate::arch::sched::yield_now();
+                }
+                match end {
+                    Some((_, w, kb, win)) => {
+                        serial_println!("[appfault] run={} pid={} slot={} cause={} freed_kb={} windows={} kill={}", tag, pid, slot, crate::arch::sched::CauseFmt(w), kb, win, kill);
+                        ends[i] = Some(w);
+                    }
+                    None => serial_println!("[appfault] run={} pid={} slot={} cause=- (no free edge in 2 s) kill={}", tag, pid, slot, kill),
+                }
+            }
+            Err(why) => serial_println!("[appfault] run={} refused={}", tag, why),
+        }
+        if i == 1 {
+            crate::arch::memory::xwin_ceiling_next(0); // a refused launch must not leave the one-shot armed for the next program
+        }
+    }
+    let dl = crate::arch::ticks() + 2_000;
+    while (crate::arch::memory::xwin_live_pages() != live0 || crate::arch::memory::xwin_pt_live() != pt0) && crate::arch::ticks() < dl {
+        crate::arch::sched::yield_now();
+    }
+    let leaked_kb = (crate::arch::memory::xwin_live_pages().saturating_sub(live0) + crate::arch::memory::xwin_pt_live().saturating_sub(pt0)) * 4;
+    let p1 = crate::video::wm::comp_scratch_counts().0;
+    let dl = crate::arch::ticks() + 2_000;
+    let mut alive = false;
+    while crate::arch::ticks() < dl {
+        crate::video::wm::composite();
+        if crate::video::wm::comp_scratch_counts().0 != p1 {
+            alive = true;
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    let is = |e: Option<u64>, k: &str| e.is_some_and(|w| crate::arch::sched::term_kind(w) == k);
+    let fault = is(ends[0], "fault") && ends[0].is_some_and(|w| crate::arch::sched::term_vec(w) == 14);
+    let oom = is(ends[1], "oom");
+    let exit = is(ends[2], "exit");
+    let pass = fault && oom && exit && leaked_kb == 0 && alive;
+    serial_println!(
+        ":: APPFAULT: fault={} oom={} exit={} leaked_kb={} desktop={} -> {} ::",
+        fault as u8,
+        oom as u8,
+        exit as u8,
+        leaked_kb,
+        if alive { "alive" } else { "stalled" },
+        if pass { "PASS" } else { "FAIL" }
+    );
 }
