@@ -500,7 +500,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -1045,15 +1045,15 @@ fn paint_display(st: &mut State, v: &Values) {
 pub const SAMPLE: &str = "The quick brown fox jumps over the lazy dog 0123456789";
 
 /// About: one centred card — the mark, the name, the version, then the facts as `label: value` around the centre.
-fn paint_about(st: &mut State) {
+fn paint_about(st: &mut State) { #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::paint(st); // UPDATEUI (B726): the System image rows under the card (drawn first: the card's box ends above them). LINE-NEUTRAL fold
     let ver = option_env!("UNAOS_GIT_SHA").unwrap_or("dev build");
-    let (y0, y1) = (row_top(0) + GAP, row_top(9) - GAP);
-    let mark = 64;
+    let (y0, y1) = (row_top(0) + GAP, row_top(9) - GAP); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] let y1 = y1.min(row_top(sysimg::FIRST) - GAP); // UPDATEUI (B726): the card ends above the System image rows. LINE-NEUTRAL fold
+    let mark = 64; #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] let mark = sysimg::card_mark(mark); // UPDATEUI: the compact card drops the mark. LINE-NEUTRAL fold
     let cx = PANE_X + PANE_W / 2;
     {
         let mut s = sf(st);
         draw::group_box(&mut s, Rect::new(e(BOX_X), e(y0), ew(BOX_X, BOX_W), e(y1) - e(y0)), b"");
-        tab_icon(&mut s, 3, e(cx - mark / 2), e(y0 + 24), ew(cx - mark / 2, mark), Some(theme::accent()));
+        #[cfg(not(all(target_arch = "x86_64", feature = "installdemo")))] tab_icon(&mut s, 3, e(cx - mark / 2), e(y0 + 24), ew(cx - mark / 2, mark), Some(theme::accent())); // UPDATEUI (B726): the compact card (installdemo) draws no mark. LINE-NEUTRAL fold
     }
     let (tf, uf) = (super::text::Face::Title, super::text::Face::Ui); // FONTSCRAFT (B640): the About card's name in the title face
     let (tc, uc) = (super::metrics::lcell_h(tf), super::metrics::lcell_h(uf));
@@ -1084,7 +1084,7 @@ fn paint_about(st: &mut State) {
         let kw = super::metrics::ladvance(k.as_bytes(), false, uf);
         text_at(st, (cx - 8).saturating_sub(kw), y, cx, k, theme::ink_secondary(), false, uf);
         text_at(st, cx + 8, y, CTRL_R, val, theme::text_primary(), false, uf);
-        y += uc + 10;
+        y += uc + 10; #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] { y -= sysimg::FACT_TIGHTEN; } // UPDATEUI (B726): the compact card's facts. LINE-NEUTRAL fold
     }
 }
 
@@ -1720,7 +1720,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
     if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, CTRL_R, LABEL_X) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link
     match cur_tab() {
         0 => press_general(row, cx),
-        1 => press_users(row, cx),
+        1 => press_users(row, cx), #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] 3 => sysimg::press(row, cx), // UPDATEUI (B726): About > System image. LINE-NEUTRAL fold
         4 => press_login(row, cx), 5 => press_appearance(row, cx), // APPEARANCE (B408)
         TP_TAB => press_trackpad(row, cx), // TRACKPADPANE (B412)
         t if t == FT_TAB => press_filetypes(row, cx), // FILETYPES (B423)
@@ -4209,4 +4209,224 @@ fn press_security(row: usize, cx: usize) {
 fn security_service() {
     #[cfg(feature = "login")]
     crate::video::lock::persist();
+}
+
+// ── UPDATEUI (rmbp-ledger B726, BP-bar-8) — About > System image ── TAIL-APPENDED, `installdemo` (x86) only ──────────
+// The running image's KELF verdict, the staged image (its build sha, when, from where) or a set-aside one, and ONE
+// button: `Stage an image from…` (it lists the removable volumes carrying an image and its `SRC.SHA`; a press on one
+// stages it through `install::abimage::stage_from`, the `stage` verb's path) or, after the loader's fallback, `Remove`.
+// Nothing restarts on its own (BP-bar-8): the row says what the user's own Restart will do. Every ESP read and write is
+// on the settings service pass ([`sysimg::service`]); the painter reads the model the pass left.
+#[cfg(all(target_arch = "x86_64", feature = "installdemo"))]
+pub(crate) mod sysimg {
+    use super::{btn_at, groups, mid_y, txt, txt2, txt_ink, State, BTN_H, LABEL_X, ROWS};
+    use crate::install::abimage::{self, Candidate, Status};
+    use crate::video::theme;
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// The About tab's index in `TAB_NAMES`.
+    const ABOUT: usize = 3;
+    /// The first System image row; the card above it ends at `row_top(FIRST)`.
+    pub const FIRST: usize = 5;
+    /// The compact card's fact pitch is this much tighter than the full card's.
+    pub const FACT_TIGHTEN: usize = 6;
+    /// Rows: the running image, the staged one, the sentence, the button(s).
+    const R_RUN: usize = FIRST;
+    const R_STAGED: usize = FIRST + 1;
+    const R_NOTE: usize = FIRST + 2;
+    const R_BTN: usize = FIRST + 3;
+    const _: () = assert!(R_BTN < ROWS - 1); // the last row is the pane's file footer
+    /// The value column (right of the labels).
+    const VAL: usize = LABEL_X + 140;
+    /// The button widths: the stage button, one per listed volume, Cancel / Remove.
+    const STAGE_W: usize = 200;
+    const VOL_W: usize = 150;
+    const SMALL_W: usize = 100;
+    /// At most this many volumes are offered in the row.
+    const VOL_MAX: usize = 3;
+
+    pub const NOTE_STAGED: &str = "Restart to try it — falls back by itself if it does not reach the desktop";
+    pub const NOTE_NONE_FOUND: &str = "No removable volume carries an UnaOS image with its SRC.SHA";
+
+    /// What the service pass owes.
+    enum Owed {
+        None,
+        Stage(String),
+        Remove,
+    }
+
+    struct Model {
+        st: Option<Status>,
+        cands: Vec<Candidate>,
+        /// The volume list is open in the button row.
+        picking: bool,
+        /// The status was read since the tab became visible.
+        fresh: bool,
+        owed: Owed,
+        /// The last action's outcome (a refusal), shown in the sentence row when nothing else is.
+        said: String,
+    }
+
+    static M: crate::sync::Mutex<Model> = crate::sync::Mutex::new(Model { st: None, cands: Vec::new(), picking: false, fresh: false, owed: Owed::None, said: String::new() });
+
+    /// The compact card's mark size (none: the System image rows need its height).
+    pub fn card_mark(_full: usize) -> usize {
+        0
+    }
+
+    /// The three text rows (running, staged, sentence) from `st`; one fn for the painter and `tests updateui`.
+    pub fn text_of(st: Option<&Status>, picking: bool, cands: usize, said: &str) -> [String; 3] {
+        let Some(st) = st else { return [String::from("reading…"), String::new(), String::new()] };
+        let run = match &st.running {
+            Some(r) => format!("slot {} · hash {} · sha256 {}", r.slot, if r.hash_ok { "ok" } else { "unverified" }, r.sha),
+            None => String::from("the loader handed over no verdict"),
+        };
+        let (staged, note) = if let Some(s) = &st.staged {
+            let when = if s.at == 0 { String::from("time unknown") } else { crate::clock::locale::fmt_stamp_in(&crate::clock::locale::current(), s.at) };
+            (format!("{} from {} · {}", s.sha, s.src, when), String::from(NOTE_STAGED))
+        } else if let Some(n) = st.set_aside {
+            let boot = if n == 0 { String::from("boot unknown") } else { format!("boot {}", n) };
+            (String::from("set aside"), format!("The staged image did not reach the desktop and was set aside ({})", boot))
+        } else {
+            (String::from("nothing staged"), String::from(said))
+        };
+        let note = if picking && cands == 0 && st.set_aside.is_none() { String::from(NOTE_NONE_FOUND) } else { note };
+        [run, staged, note]
+    }
+
+    /// The rows: the group box, the labels and values, the button row.
+    pub(super) fn paint(st: &mut State) {
+        let (lines, picking, aside, vols) = {
+            let m = M.lock();
+            let t = text_of(m.st.as_ref(), m.picking, m.cands.len(), &m.said);
+            let aside = m.st.as_ref().is_some_and(|s| s.set_aside.is_some());
+            (t, m.picking, aside, m.cands.iter().take(VOL_MAX).map(|c| format!("{} ({})", c.vol, c.sha)).collect::<Vec<_>>())
+        };
+        groups(st, &[(R_RUN, R_BTN)]);
+        txt(st, LABEL_X, R_RUN, "System image");
+        txt2(st, VAL, R_RUN, &lines[0]);
+        txt(st, LABEL_X, R_STAGED, "Staged");
+        txt2(st, VAL, R_STAGED, &lines[1]);
+        if aside { txt_ink(st, LABEL_X, R_NOTE, &lines[2], theme::text_primary()); } else { txt2(st, LABEL_X, R_NOTE, &lines[2]); }
+        let y = mid_y(R_BTN, BTN_H);
+        if aside {
+            btn_at(st, LABEL_X, y, SMALL_W, "Remove", false, false);
+        } else if picking {
+            for (k, v) in vols.iter().enumerate() {
+                btn_at(st, LABEL_X + k * (VOL_W + 10), y, VOL_W, v, false, false);
+            }
+            btn_at(st, LABEL_X + vols.len() * (VOL_W + 10), y, SMALL_W, "Cancel", false, false);
+        } else {
+            btn_at(st, LABEL_X, y, STAGE_W, "Stage an image from…", false, false);
+        }
+    }
+
+    /// A press in the About pane (logical row and x): only the button row acts; the action is owed to [`service`].
+    pub(super) fn press(row: usize, cx: usize) {
+        if row != R_BTN || cx < LABEL_X {
+            return;
+        }
+        let x = cx - LABEL_X;
+        {
+            let mut m = M.lock();
+            let aside = m.st.as_ref().is_some_and(|s| s.set_aside.is_some());
+            if aside {
+                if x < SMALL_W { m.owed = Owed::Remove; }
+            } else if m.picking {
+                let n = m.cands.len().min(VOL_MAX);
+                let k = x / (VOL_W + 10);
+                if k < n && x % (VOL_W + 10) < VOL_W {
+                    let v = m.cands[k].vol.clone();
+                    m.owed = Owed::Stage(v);
+                    m.picking = false;
+                } else if k == n && x % (VOL_W + 10) < SMALL_W {
+                    m.picking = false;
+                }
+            } else if x < STAGE_W {
+                m.picking = true;
+                m.said.clear();
+                m.fresh = false; // the list is read again on the pass
+            }
+        }
+        super::repaint();
+    }
+
+    /// The pane's choice of a volume (the press's latch; `tests updateui` names one directly).
+    pub fn pick(vol: &str) {
+        M.lock().owed = Owed::Stage(String::from(vol));
+    }
+
+    /// The pane's Remove (the press's latch; `tests updateui` presses it directly).
+    pub fn remove() {
+        M.lock().owed = Owed::Remove;
+    }
+
+    /// Run what is owed against `src` (the namespace, or the fixture's RAM volumes), then read the status and list
+    /// `vols` (`None` = the removable volumes mounted now).
+    pub fn run_in(src: &crate::fs::vfs::MountTable, vols: Option<&[String]>) {
+        let owed = core::mem::replace(&mut M.lock().owed, Owed::None);
+        let said = match owed {
+            Owed::Stage(v) => Some(match abimage::stage_from_in(src, &v) {
+                Ok(_) => String::new(),
+                Err(w) => format!("{} was not staged: {}", v, w),
+            }),
+            Owed::Remove => Some(match abimage::remove_set_aside() {
+                Ok(()) => String::from("The set-aside image was removed"),
+                Err(w) => format!("Remove failed: {}", w),
+            }),
+            Owed::None => None,
+        };
+        let st = abimage::status();
+        let cands = match vols {
+            Some(v) => abimage::candidates_in(src, v),
+            None => abimage::volumes(),
+        };
+        let mut m = M.lock();
+        m.st = Some(st);
+        m.cands = cands;
+        m.fresh = true;
+        if let Some(s) = said {
+            m.said = s;
+        }
+    }
+
+    /// The text rows as the painter would draw them now.
+    pub fn lines() -> [String; 3] {
+        let m = M.lock();
+        text_of(m.st.as_ref(), m.picking, m.cands.len(), &m.said)
+    }
+
+    /// The volumes the list offers (their leaves), and the last action's outcome — what `tests updateui` reads back.
+    pub fn listed() -> (Vec<String>, String) {
+        let m = M.lock();
+        (m.cands.iter().map(|c| c.vol.clone()).collect(), m.said.clone())
+    }
+
+    /// Forget the model (the fixture's clean-up): the next visible pass reads the namespace again.
+    pub fn stale() {
+        let mut m = M.lock();
+        m.fresh = false;
+        m.picking = false;
+        m.said.clear();
+    }
+
+    /// The settings service pass: while About is showing, read the status once and run any owed action.
+    pub(super) fn service() {
+        let vis = super::is_open() && super::cur_tab() == ABOUT;
+        let due = {
+            let mut m = M.lock();
+            if !vis {
+                m.fresh = false;
+                m.picking = false;
+                return;
+            }
+            !m.fresh || !matches!(m.owed, Owed::None)
+        };
+        if due {
+            run_in(&crate::shell::vfs_mount_table(), None);
+            super::repaint();
+        }
+    }
 }

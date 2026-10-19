@@ -28,6 +28,18 @@
 //! row; the unstage drops the B row. The promotion is decided by [`should_promote`]: a trial that the running kernel
 //! is slot B (the loader's verdict) — which is also how the loader's A->B hash fallback (`why=trial`, no stage) ends.
 //! `tests kelfstage` (tests.rs tail).
+//! UPDATEUI (rmbp-ledger B726, BP-bar-8) — the FACE of the above, for Settings > About > System image:
+//! * [`status`]: the running image's KELF verdict (slot, hash, sha256 head; `tests::kelf_kept`), the staged image (its
+//!   `STAGE.REC` plus the [`SIDECAR`] the stage wrote: the stick's build sha, when, from where), and a SET-ASIDE image
+//!   (no stage, `SHUTDOWN.REC why=fallback` — the loader's write — and `KERNEL.NEW` still on the ESP).
+//! * [`volumes`] / [`candidates_in`]: the removable volumes (`fs::removable::mounted_names`, `/volumes/<stick>`) whose
+//!   root carries `KERNEL.ELF` (or an `UnaOS-*.img`) AND `SRC.SHA` (the stick's own build).
+//! * [`stage_from`]`(vol)` / [`stage_from_in`]: the administrator gate the `stage` verb's arm asks, then
+//!   [`stage_image`]'s own path; `[update] ui stage from=<vol> sha=<8> -> staged|refused:<why>`.
+//! * [`SIDECAR`] `UPDATE.REC` (`src= sha= at= kelf= [fell=<boot n>]`): the kernel's note beside the loader's two
+//!   records; written before `STAGE.REC`, read only when its `kelf=` matches; the loader never reads it. `fell=` is
+//!   written once, at the first DESKTOPBUILT after the loader's fallback ([`desktop_built`] -> `settle`).
+//! * [`remove_set_aside`]: the pane's Remove — [`unstage`], said on the wire.
 
 use alloc::format;
 use alloc::string::String;
@@ -35,7 +47,10 @@ use alloc::vec::Vec;
 
 use super::abslot::{self, Slot, Why, Write};
 use crate::fs::bootfat::{self, Writer};
-use crate::fs::vfs::{MountTable, NodeKind, KERNEL_PRINCIPAL};
+use crate::fs::vfs::{DirEnt, MountTable, NodeKind, Stat, VfsBackend, VfsError, KERNEL_PRINCIPAL};
+
+/// UPDATEUI (B726): the kernel's note beside the loader's records — where a stage came from (never read by the loader).
+pub const SIDECAR: &str = "UPDATE.REC";
 
 // KELFSTAGE (B720): the KELF.SHA record — the very file the UEFI loader checks and the builder writes, compiled here by
 // path (`crates/bootloader/src/kelfsha.rs`), so the stage's row and the loader's check cannot disagree.
@@ -154,11 +169,18 @@ pub fn should_promote(staged: bool, trial: bool, booted: Option<u8>) -> bool {
 /// the loader's, after the user's own restart.
 pub fn stage_image(path: &str) -> Result<Staged, &'static str> {
     let mt = crate::shell::vfs_mount_table();
-    let st = mt.stat(path).map_err(|_| "source-missing")?;
+    stage_core(&mt, path, path, "-")
+}
+
+/// [`stage_image`]'s body: the source is read through `src` (the namespace, or the fixture's RAM volume), every ESP
+/// write goes through the namespace's `/boot`. `from` and `sha` land in the [`SIDECAR`] (the pane's "from where").
+fn stage_core(src: &MountTable, path: &str, from: &str, sha: &str) -> Result<Staged, &'static str> {
+    let mt = crate::shell::vfs_mount_table();
+    let st = src.stat(path).map_err(|_| "source-missing")?;
     if st.kind != NodeKind::File || st.size == 0 {
         return Err("source-not-a-file");
     }
-    let head = mt.read(path, 0, (st.size as usize).min(64 << 10)).map_err(|_| "source-read")?;
+    let head = src.read(path, 0, (st.size as usize).min(64 << 10)).map_err(|_| "source-read")?;
     let kelf = kelf_of(&head).ok_or("not-a-kernel-elf")?;
     let _unlock = bootfat::fat_unlock(Writer::Updater, "KERNEL.NEW + KELF.SHA + STAGE.REC");
     if !bootfat::allows() {
@@ -177,7 +199,7 @@ pub fn stage_image(path: &str) -> Result<Staged, &'static str> {
     let mut off = 0u64;
     while off < st.size {
         let want = ((st.size - off) as usize).min(CHUNK);
-        let buf = mt.read(path, off, want).map_err(|_| "source-read")?;
+        let buf = src.read(path, off, want).map_err(|_| "source-read")?;
         if buf.len() != want {
             return Err("source-short");
         }
@@ -208,6 +230,8 @@ pub fn stage_image(path: &str) -> Result<Staged, &'static str> {
     let mut row = [0u8; kelfsha::ROW_MAX];
     let rn = kelfsha::row(&sha, abslot::NEW, kelfsha::SLOT_B, kelfsha::kelf_of(&head).unwrap_or(kelf), &mut row);
     kelf_put_row(&mt, kelfsha::SLOT_B, Some(&row[..rn]))?;
+    let side = format!("src={} sha={} at={} kelf={:#x}\n", clean(from, 40), clean(sha, 8), crate::clock::unix_now().unwrap_or(0), kelf);
+    put(&mt, SIDECAR, side.as_bytes())?; // UPDATEUI (B726): before STAGE.REC, so the record stays the stage's last write
     let mut rec = [0u8; abslot::REC_MAX];
     let n = abslot::stage_record(kelf, st.size, crc, &mut rec);
     put(&mt, abslot::STAGE, &rec[..n])?;
@@ -240,6 +264,7 @@ pub fn unstage() -> Result<(), &'static str> {
     drop_file(&mt, abslot::STAGE)?;
     drop_file(&mt, abslot::NEW)?;
     kelf_put_row(&mt, kelfsha::SLOT_B, None)?; // KELFSTAGE: no KERNEL.NEW, no B row
+    drop_file(&mt, SIDECAR)?;
     drop_file(&mt, abslot::SHUTDOWN)
 }
 
@@ -261,6 +286,7 @@ pub fn note_user_shutdown(action: &str) {
 /// The boot's DESKTOPBUILT verdict. A PASS on the loader's TRIAL boot of `KERNEL.NEW` promotes it to `KERNEL.ELF`.
 pub fn desktop_built(pass: bool) {
     let mt = crate::shell::vfs_mount_table();
+    settle(&mt);
     let stage = read_rec(&mt, abslot::STAGE);
     let staged = abslot::staged(stage.as_deref());
     let shut = read_rec(&mt, abslot::SHUTDOWN);
@@ -312,6 +338,7 @@ fn promote(mt: &MountTable) -> Result<&'static str, &'static str> {
     let k = kelf_promote(mt);
     drop_file(mt, abslot::OLD)?;
     drop_file(mt, abslot::STAGE)?;
+    drop_file(mt, SIDECAR)?; // UPDATEUI (B726)
     put(mt, abslot::SHUTDOWN, abslot::REC_PROMOTED).map(|()| k)
 }
 
@@ -366,4 +393,295 @@ pub fn selftest() {
         ":: ABIMAGE: decide={}/4 stage={} kelf={:#x} record={} verb={} unstaged={} -> {} ::",
         dec_ok, stage_w, kelf, if rec_ok { "ok" } else { "bad" }, if verb_ok { "ok" } else { "bad" }, cleaned as u8, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ── UPDATEUI (rmbp-ledger B726, BP-bar-8) — the System image row's model: status, the sticks, the stage, the set-aside ──
+
+/// A record field's text (`-` when absent).
+fn field_str(rec: Option<&[u8]>, key: &[u8]) -> String {
+    rec.and_then(|r| abslot::field(r, key)).and_then(|v| core::str::from_utf8(v).ok()).map(String::from).unwrap_or_else(|| String::from("-"))
+}
+
+/// A decimal record field.
+fn field_dec(rec: Option<&[u8]>, key: &[u8]) -> Option<u64> {
+    let v = rec.and_then(|r| abslot::field(r, key))?;
+    if v.is_empty() || v.len() > 20 || !v.iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(v.iter().fold(0u64, |a, &c| a.wrapping_mul(10).wrapping_add((c - b'0') as u64)))
+}
+
+/// A record value: `[A-Za-z0-9._/-]` kept, anything else `_` (a space would end the field), at most `max` bytes.
+fn clean(s: &str, max: usize) -> String {
+    let mut o: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-') { c } else { '_' }).take(max).collect();
+    if o.is_empty() {
+        o.push('-');
+    }
+    o
+}
+
+/// The running image, as the loader handed it over (`[boot] kelf slot= hash= sha=`).
+#[derive(Clone, Debug)]
+pub struct Running {
+    pub slot: &'static str,
+    pub hash_ok: bool,
+    /// The first 8 hex of the sha256 the loader computed over the bytes it jumped to.
+    pub sha: String,
+}
+
+/// A staged image: `STAGE.REC` and, when its `kelf=` matches, the [`SIDECAR`]'s provenance.
+#[derive(Clone, Debug)]
+pub struct StageInfo {
+    pub kelf: u64,
+    pub bytes: u64,
+    /// The volume (or path) it was staged from; `-` when the sidecar does not match.
+    pub src: String,
+    /// The stick's build sha (`SRC.SHA`'s `commit`, 8 hex); `-` from the verb.
+    pub sha: String,
+    /// Unix seconds of the stage; 0 = the clock was not set.
+    pub at: u64,
+}
+
+/// What Settings > About > System image shows.
+#[derive(Clone, Debug)]
+pub struct Status {
+    /// `None` = no verdict (a loader older than KELFHASH).
+    pub running: Option<Running>,
+    pub staged: Option<StageInfo>,
+    /// The loader set the trial aside: `Some(boot n)` (0 = the boot is not numbered on this build).
+    pub set_aside: Option<u64>,
+}
+
+/// The System image row's status (a few small ESP reads: the settings service pass, never a painter).
+pub fn status() -> Status {
+    let mt = crate::shell::vfs_mount_table();
+    let running = crate::tests::kelf_kept().filter(|v| v.present()).map(|v| Running {
+        slot: unaos_boot_info::KELF_SLOT_NAMES[v.slot as usize],
+        hash_ok: v.hash == unaos_boot_info::KELF_HASH_OK,
+        sha: format!("{:02x}{:02x}{:02x}{:02x}", v.sha[0], v.sha[1], v.sha[2], v.sha[3]),
+    });
+    let stage = read_rec(&mt, abslot::STAGE);
+    let side = read_rec(&mt, SIDECAR);
+    let shut = read_rec(&mt, abslot::SHUTDOWN);
+    let kelf_of_rec = |r: Option<&[u8]>| r.and_then(|r| abslot::field(r, b"kelf")).and_then(abslot::parse_hex);
+    let staged = abslot::staged(stage.as_deref()).then(|| {
+        let kelf = kelf_of_rec(stage.as_deref()).unwrap_or(0);
+        let mine = kelf_of_rec(side.as_deref()) == Some(kelf);
+        let s = if mine { side.as_deref() } else { None };
+        StageInfo { kelf, bytes: field_dec(stage.as_deref(), b"bytes").unwrap_or(0), src: field_str(s, b"src"), sha: field_str(s, b"sha"), at: field_dec(s, b"at").unwrap_or(0) }
+    });
+    let fell = staged.is_none() && shut.as_deref().and_then(|r| abslot::field(r, b"why")) == Some(&b"fallback"[..]) && exists(&mt, abslot::NEW);
+    let set_aside = fell.then(|| field_dec(side.as_deref(), b"fell").unwrap_or(0));
+    Status { running, staged, set_aside }
+}
+
+/// This boot's number (SELFDIAG's), 0 when the build does not number its boots.
+fn boot_n() -> u64 {
+    #[cfg(feature = "selfdiag")]
+    {
+        crate::bootwit::state().1
+    }
+    #[cfg(not(feature = "selfdiag"))]
+    {
+        0
+    }
+}
+
+/// At the boot's DESKTOPBUILT verdict: the first boot after the loader's fallback notes which boot it was (`fell=` in
+/// the [`SIDECAR`], once) — the row then says "set aside (boot <n>)" on every later boot. `Some(n)` when it wrote.
+fn settle(mt: &MountTable) -> Option<u64> {
+    let stage = read_rec(mt, abslot::STAGE);
+    let shut = read_rec(mt, abslot::SHUTDOWN);
+    if abslot::staged(stage.as_deref()) || shut.as_deref().and_then(|r| abslot::field(r, b"why")) != Some(&b"fallback"[..]) || !exists(mt, abslot::NEW) {
+        return None;
+    }
+    let side = read_rec(mt, SIDECAR);
+    if side.as_deref().and_then(|r| abslot::field(r, b"fell")).is_some() {
+        return None;
+    }
+    let n = boot_n();
+    let base = side.as_deref().map(|r| String::from(core::str::from_utf8(r).unwrap_or("").trim_end())).filter(|s| !s.is_empty()).unwrap_or_else(|| String::from("src=- sha=- at=0 kelf=0x0"));
+    let line = format!("{} fell={}\n", base, n);
+    let _unlock = bootfat::fat_unlock(Writer::Updater, "UPDATE.REC fell=");
+    let r = if bootfat::allows() { put(mt, SIDECAR, line.as_bytes()) } else { Err("esp-locked") };
+    let kelf = side.as_deref().and_then(|r| abslot::field(r, b"kelf")).and_then(abslot::parse_hex).unwrap_or(0);
+    match r {
+        Ok(()) => serial_println!("[update] set aside kelf={:#x} boot={} (the trial never reached the desktop; Settings > About offers Remove)", kelf, n),
+        Err(e) => serial_println!("[update] set aside kelf={:#x} boot={} -> note FAILED {}", kelf, n, e),
+    }
+    r.ok().map(|_| n)
+}
+
+/// A removable volume carrying a stageable image and its build stamp.
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    /// The leaf under `/volumes`.
+    pub vol: String,
+    /// The image's full path.
+    pub image: String,
+    /// The stick's build sha (8 hex): `SRC.SHA`'s `commit` line, else the head of its digest line.
+    pub sha: String,
+}
+
+/// `SRC.SHA` (selfhost's stamp: line 1 `<64 hex>  SRC.TGZ`, then `commit <sha>`): its 8-hex build sha.
+fn src_sha(text: &[u8]) -> Option<String> {
+    let t = core::str::from_utf8(text).ok()?;
+    let mut lines = t.lines();
+    let digest = lines.next()?.split_whitespace().next()?;
+    if digest.len() != 64 || !digest.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let commit = lines.find_map(|l| {
+        let mut it = l.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("commit"), Some(v)) if v.len() >= 8 && v.bytes().all(|c| c.is_ascii_hexdigit()) => Some(v),
+            _ => None,
+        }
+    });
+    Some(String::from(&commit.unwrap_or(digest)[..8]).to_ascii_lowercase())
+}
+
+/// One volume's verdict: its image (`KERNEL.ELF`, else an `UnaOS-*.img`) and its `SRC.SHA`.
+fn probe(src: &MountTable, vol: &str) -> Result<Candidate, &'static str> {
+    let root = format!("/volumes/{}", vol);
+    let rows = src.read_dir(&root).map_err(|_| "volume-unreadable")?;
+    let file = |e: &&DirEnt| e.kind == NodeKind::File;
+    let image = rows.iter().filter(file).find(|e| e.name.eq_ignore_ascii_case(abslot::ELF)).or_else(|| {
+        rows.iter().filter(file).find(|e| {
+            let n = e.name.to_ascii_lowercase();
+            n.starts_with("unaos-") && n.ends_with(".img")
+        })
+    });
+    let image = image.ok_or("no-image")?;
+    let sha = rows.iter().filter(file).find(|e| e.name.eq_ignore_ascii_case("SRC.SHA")).ok_or("no-src-sha")?;
+    let text = src.read(&format!("{}/{}", root, sha.name), 0, 512).map_err(|_| "src-sha-unreadable")?;
+    let sha = src_sha(&text).ok_or("src-sha-bad")?;
+    Ok(Candidate { vol: String::from(vol), image: format!("{}/{}", root, image.name), sha })
+}
+
+/// The volumes among `vols` (leaves under `/volumes` in `src`) that carry a stageable image and its `SRC.SHA`.
+pub fn candidates_in(src: &MountTable, vols: &[String]) -> Vec<Candidate> {
+    vols.iter().filter_map(|v| probe(src, v).ok()).collect()
+}
+
+/// The pane's list: the removable volumes mounted now that carry a stageable image and its `SRC.SHA`.
+pub fn volumes() -> Vec<Candidate> {
+    let mt = crate::shell::vfs_mount_table();
+    candidates_in(&mt, &crate::fs::removable::mounted_names())
+}
+
+/// The pane's stage: `stage_from_in` over the namespace.
+pub fn stage_from(vol: &str) -> Result<Staged, &'static str> {
+    let mt = crate::shell::vfs_mount_table();
+    stage_from_in(&mt, vol)
+}
+
+/// Stage `/volumes/<vol>`'s image through `src`: the administrator gate the `stage` verb's arm asks (R100), the
+/// volume's probe (an image and its `SRC.SHA`), then [`stage_image`]'s own path. One wire line either way.
+pub fn stage_from_in(src: &MountTable, vol: &str) -> Result<Staged, &'static str> {
+    let mut sha = String::from("-");
+    let r = (|| {
+        #[cfg(feature = "login")]
+        crate::fs::users::admin_authority("stage")?;
+        let c = probe(src, vol)?;
+        sha = c.sha.clone();
+        stage_core(src, &c.image, &c.vol, &c.sha)
+    })();
+    match &r {
+        Ok(_) => serial_println!("[update] ui stage from={} sha={} -> staged", vol, sha),
+        Err(w) => serial_println!("[update] ui stage from={} sha={} -> refused:{}", vol, sha, w),
+    }
+    r
+}
+
+/// The pane's Remove on a set-aside image: [`unstage`] (`KERNEL.NEW`, the records and the sidecar go).
+pub fn remove_set_aside() -> Result<(), &'static str> {
+    let r = unstage();
+    match r {
+        Ok(()) => serial_println!("[update] ui remove -> removed"),
+        Err(w) => serial_println!("[update] ui remove -> refused:{}", w),
+    }
+    r
+}
+
+/// `tests updateui`'s RAM volume: a flat, read-only name -> bytes map mounted under `/volumes/<name>` in the fixture's
+/// own table (nothing in the namespace sees it).
+struct RamVol {
+    name: String,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+impl RamVol {
+    fn find(&self, rel: &str) -> Option<&Vec<u8>> {
+        let leaf = rel.trim_start_matches('/');
+        self.files.iter().find(|(n, _)| n.eq_ignore_ascii_case(leaf)).map(|(_, d)| d)
+    }
+}
+
+impl VfsBackend for RamVol {
+    fn volume_name(&self) -> &str {
+        &self.name
+    }
+    fn volume_id(&self) -> Option<u64> {
+        None
+    }
+    fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
+        if !rel.trim_start_matches('/').is_empty() {
+            return Err(VfsError::NoSuchPath);
+        }
+        Ok(self.files.iter().map(|(n, d)| DirEnt { name: n.clone(), kind: NodeKind::File, size: d.len() as u64, mtime: None }).collect())
+    }
+    fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
+        if rel.trim_start_matches('/').is_empty() {
+            return Ok(Stat { kind: NodeKind::Dir, size: 0, id: None, mtime: None });
+        }
+        self.find(rel).map(|d| Stat { kind: NodeKind::File, size: d.len() as u64, id: None, mtime: None }).ok_or(VfsError::NoSuchPath)
+    }
+    fn read(&self, rel: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
+        let d = self.find(rel).ok_or(VfsError::NoSuchPath)?;
+        let a = (offset as usize).min(d.len());
+        Ok(d[a..(a + len).min(d.len())].to_vec())
+    }
+    fn authorize_read(&self, _rel: &str, _principal: &str) -> Result<(), VfsError> {
+        Ok(())
+    }
+}
+
+/// The fixture's two sticks, read-only in RAM: `/volumes/UPDTEST` (a copy of the running `KERNEL.ELF` + a `SRC.SHA`
+/// stamp) and `/volumes/NOSHA` (a kernel and no stamp). Returns the table and the two leaves.
+pub fn fixture_table() -> Result<(MountTable, [String; 2]), &'static str> {
+    let mt = crate::shell::vfs_mount_table();
+    let src = esp(abslot::ELF);
+    let st = mt.stat(&src).map_err(|_| "no-running-kernel")?;
+    let mut elf = Vec::new();
+    let mut off = 0u64;
+    while off < st.size {
+        let want = ((st.size - off) as usize).min(CHUNK);
+        let b = mt.read(&src, off, want).map_err(|_| "kernel-read")?;
+        if b.len() != want {
+            return Err("kernel-short");
+        }
+        elf.extend_from_slice(&b);
+        off += want as u64;
+    }
+    let head = elf[..elf.len().min(64 << 10)].to_vec();
+    let stamp = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  SRC.TGZ\ncommit 7e57ab1e00000000000000000000000000000000\n".to_vec();
+    let (a, b) = (String::from("UPDTEST"), String::from("NOSHA"));
+    let mut t = MountTable::new();
+    t.mount(&format!("/volumes/{}", a), alloc::boxed::Box::new(RamVol { name: a.clone(), files: alloc::vec![(String::from("KERNEL.ELF"), elf), (String::from("SRC.SHA"), stamp)] }));
+    t.mount(&format!("/volumes/{}", b), alloc::boxed::Box::new(RamVol { name: b.clone(), files: alloc::vec![(String::from("KERNEL.ELF"), head)] }));
+    Ok((t, [a, b]))
+}
+
+/// The fixture's stand-in for the LOADER's fallback write (`abslot::Write::Fallback`: `why=fallback`, `STAGE.REC`
+/// removed), then the next boot's [`settle`]. `Some(boot n)` when the note was written.
+pub fn fixture_fallback() -> Option<u64> {
+    let mt = crate::shell::vfs_mount_table();
+    {
+        let _unlock = bootfat::fat_unlock(Writer::Updater, "fixture: the loader's fallback write");
+        if !bootfat::allows() || drop_file(&mt, abslot::STAGE).is_err() || put(&mt, abslot::SHUTDOWN, abslot::REC_FALLBACK).is_err() {
+            return None;
+        }
+    }
+    settle(&mt)
 }
