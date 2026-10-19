@@ -2846,20 +2846,21 @@ fi
 # USB-host driver has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
 [ -n "${UNAOS_UVC:-}" ] && _feats="${_feats}uvc,"
-# UAC1 (rmbp-ledger B706): UNAOS_USBAUDIO=1 attaches QEMU's `usb-audio` on the xHCI (full-speed USB Audio Class 1:
-# AS interface 1 alt 1, isochronous OUT 0x01, 192-byte packets at 48 kHz stereo) with a silent `none` audiodev,
-# through UNAOS_QEMU_EXTRA (the builder appends it whitespace-split, main.rs:1523). It maps NO feature, so there is
-# no builder line to keep in step: the driver (drivers/usb/uac.rs) rides `uvc`'s isochronous engine (XHCIISO), and
-# the leg is `UNAOS_UVC=1 UNAOS_USBAUDIO=1 UNAOS_WC=1 ./arroyo test 240` with `tests uac1` scoring
-# `:: UAC1: enumerated=1 stream=ok frames=<n> underruns=0 -> PASS ::` (SKIP with the reason when no device came up).
-if [ -n "${UNAOS_USBAUDIO:-}" ]; then
+# UACMIC (rmbp-ledger B723): UNAOS_UAC=1 arms the USB Audio Class 1 driver as a feature of its own (`uac`, which
+# implies `uvc` in Cargo.toml: the class rides the isochronous engine, XHCIISO) AND attaches QEMU's `usb-audio` on the
+# xHCI with a silent `none` audiodev, through UNAOS_QEMU_EXTRA (the builder appends it whitespace-split). The three
+# places move in step: this map line, builder/src/main.rs (`UNAOS_UAC` -> `uac`) and crates/kernel/Cargo.toml.
+# `uvc` alone no longer carries UAC1 (B706's playback rode it). UNAOS_USBAUDIO=1 (B706's knob) is kept as an alias
+# that arms UNAOS_UAC, exported so the builder (which re-derives the features from its own env) sees it too.
+# The leg: `UNAOS_UAC=1 UNAOS_WC=1 ./arroyo test 240` with `tests uac1` (playback) and `tests uacmic` (capture, the
+# mic dot, the grant): `:: UACMIC: enumerated=1 capture=ok frames=<n> dot_on=1 dot_off=1 grant=asked -> PASS ::`.
+if [ -n "${UNAOS_USBAUDIO:-}" ] && [ -z "${UNAOS_UAC:-}" ]; then export UNAOS_UAC=1; fi
+[ -n "${UNAOS_UAC:-}" ] && _feats="${_feats}uac,"
+if [ -n "${UNAOS_UAC:-}" ]; then
     case " ${UNAOS_QEMU_EXTRA:-} " in
         *" usb-audio,"*) ;;
         *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -audiodev none,id=uac0 -device usb-audio,audiodev=uac0,bus=xhci.0" ;;
     esac
-    if [ -z "${UNAOS_UVC:-}" ]; then
-        echo "arroyo: UNAOS_USBAUDIO=1 without UNAOS_UVC=1: the usb-audio device is attached but the UAC1 driver (feature uvc) is not built" >&2
-    fi
 fi
 # IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms arch/x86_64/ioapic.rs — the Intel 82093AA I/O APIC
 # redirection table, WHICH THIS KERNEL HAS NEVER HAD. `arch/x86_64/apic.rs` drives the LOCAL APIC
@@ -6642,7 +6643,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,uac"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -8238,7 +8239,7 @@ KERNEL_CFG_MATRIX=(
   # `x86_cfg_universe` gains it from the `[features]` table itself, not from this row. Board legs +1.
   # Read the live board/mix counts off `./arroyo check`, which prints them every run.
   "x86-nousblun ../../x86_64-unaos.json witness,logts,wedge2,sched_demo,skip_xhci,nousblun"
-  "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,uvc"
+  "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,uvc,uac"
   # ── ARMLINE (appended 2026-10-13, LEDGER SR102, wave24arm) — the image-24 line on both aarch64 boards ──
   #
   # Peter: "elevate orin and pi to this level [image 24]". The ten image-24 knobs (login, lumen,
@@ -12488,6 +12489,10 @@ kernel8() {
     if [ -n "${UNAOS_UVC:-}" ]; then
         K8_FEATS="${K8_FEATS},uvc"
         echo -e "${COLOR_YELLOW}  • UNAOS_UVC: the USB Video Class driver (descriptor census, probe/commit, frames)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_UAC:-}" ]; then
+        K8_FEATS="${K8_FEATS},uac"
+        echo -e "${COLOR_YELLOW}  • UNAOS_UAC: the USB Audio Class 1 driver (playback, capture, the mic grant; implies uvc's isochronous engine)${COLOR_RESET}"
     fi
     # TOOLFIX/BANNER: the Pi image's OWN feature banner, printed from the list this build is about to
     # hand cargo — not from the x86/virt `$_feats` map at the top of the script, which is suppressed

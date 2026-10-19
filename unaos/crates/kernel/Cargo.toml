@@ -3732,6 +3732,12 @@ hda-sie = ["hda-tone"]
 # k8-reach.registry`, records why this knob has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
 uvc = ["midden_core/uvc"] # PTPCAM (B687): + the `ptp` host verb row in midden_core (forwarded like `login`)
+# UACMIC (rmbp-ledger B723): `UNAOS_UAC=1` arms the USB Audio Class 1 driver of its own (drivers/usb/uac.rs:
+# playback B706 + capture, the mic dot, `tests uac1` / `tests uacmic`). It IMPLIES `uvc` because the class rides
+# the isochronous engine that knob arms (XHCIISO, drivers/xhci/isoch.rs); `uvc` alone no longer carries UAC1.
+# Wired in three places in step: this line, `unaos/arroyo` (the knob + the QEMU usb-audio device), and
+# `unaos/builder/src/main.rs` (the media feature map).
+uac = ["uvc"]
 # REALSENSE (LEDGER SR92, R112): `UNAOS_SONDE=1` arms Sonde's first probe, the Intel RealSense D435i —
 # `drivers/uvc.rs`'s appended `multi` census (one record per VideoStreaming function: depth Z16, infrared
 # Y8, colour YUY2; every extension unit; the HID interface), a D400's three XU `GET_CUR`s (laser power,

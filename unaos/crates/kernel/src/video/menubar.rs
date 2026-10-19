@@ -994,7 +994,7 @@ impl Model {
             None => h = strip::fnv1a(h, 0),
         }
         h = strip::fnv1a_u64(h, super::notify::bar_sig()); // NOTIFY (B418): the bell's badge and lit state are drawn, so they are in the test
-        h = strip::fnv1a_u64(h, tray_sig(&self.tray)); #[cfg(feature = "uvc")] { h = strip::fnv1a_u64(h, camdot::sig()); } // CAMDOT (B702): the camera dot's drawn state, so it repaints the bar the pass the count moves; LINE-NEUTRAL append, code first. // STATUSTRAY (B426): the tray's DRAWN state
+        h = strip::fnv1a_u64(h, tray_sig(&self.tray)); #[cfg(feature = "uvc")] { h = strip::fnv1a_u64(h, camdot::sig()); } #[cfg(feature = "uac")] { h = strip::fnv1a_u64(h, micdot::sig()); } // CAMDOT (B702): the camera dot's drawn state, so it repaints the bar the pass the count moves; LINE-NEUTRAL append, code first. // STATUSTRAY (B426): the tray's DRAWN state
         strip::seal(h)
     }
 }
@@ -1131,7 +1131,7 @@ pub fn compose() -> bool { if super::look::is_softy() { if SLOT.packed() != 0 { 
     // cost, and a reader grepping `[menubar] battery` should get one line per interval with only
     // the battery on it.
     battery_witness();
-    strip_items_witness(&model, rect); #[cfg(feature = "uvc")] camdot::witness(); // CAMDOT (B702): `[cam] dot painted=` on each painted edge (LINE-NEUTRAL append, code first). BATTLIVE (B492): which items this paint draws, on every change of the set
+    strip_items_witness(&model, rect); #[cfg(feature = "uvc")] camdot::witness(); #[cfg(feature = "uac")] micdot::witness(); // CAMDOT (B702): `[cam] dot painted=` on each painted edge (LINE-NEUTRAL append, code first). BATTLIVE (B492): which items this paint draws, on every change of the set
 
     // The damage conditions, in the order the dock states them: a signature that MATCHES and a pass
     // that did not touch the strip is the common case and returns here having read no pixel.
@@ -1678,7 +1678,7 @@ pub fn menus_right_limit(bar: strip::Rect) -> usize {
     // It is a function of RUNTIME state (is there an item), which is new for this accessor and is
     // accounted for: `Model::signature` folds the item's presence, so an item appearing or going
     // absent repaints the bar and re-lays the titles in the same pass.
-    #[cfg(feature = "uvc")] { if let Some((x0, _)) = camdot::slot(bw) { return bx + x0.saturating_sub(strip::PAD()); } } { let lim = [bell_slot(bw), tray_left(bw)].into_iter().flatten().min(); if let Some(x0) = lim { return bx + x0.saturating_sub(strip::PAD()); } } // NOTIFY (B418) + STATUSTRAY (B426): titles stop before the leftmost status item (the bell or the tray's first reserved slot). CAMDOT (B702): while a camera streams its dot is the leftmost item (LINE-NEUTRAL, the cfg'd block first on the line)
+    #[cfg(feature = "uac")] { if let Some((x0, _)) = micdot::slot(bw) { return bx + x0.saturating_sub(strip::PAD()); } } #[cfg(feature = "uvc")] { if let Some((x0, _)) = camdot::slot(bw) { return bx + x0.saturating_sub(strip::PAD()); } } { let lim = [bell_slot(bw), tray_left(bw)].into_iter().flatten().min(); if let Some(x0) = lim { return bx + x0.saturating_sub(strip::PAD()); } } // NOTIFY (B418) + STATUSTRAY (B426): titles stop before the leftmost status item (the bell or the tray's first reserved slot). CAMDOT (B702): while a camera streams its dot is the leftmost item (LINE-NEUTRAL, the cfg'd block first on the line)
     if super::status::bar_item().is_some() {
         if let Some(x0) = batt_slot(bw) {
             return bx + x0.saturating_sub(strip::PAD());
@@ -1935,7 +1935,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     if let (Some(it), Some(bx0)) = (m.batt, batt_slot(w)) {
         draw_battery_glyph(out, w, h, j, bx0, it);
     }
-    status_glyphs_row(out, w, h, j, &m.tray); #[cfg(feature = "uvc")] camdot::row(out, w, h, j); // CAMDOT (B702): the camera glyph and its accent dot while a UVC stream is open, from the driver's count (LINE-NEUTRAL append, code first). MENUSCRAFT (B642): the bell, network and volume glyphs from the kit, centred in their hit boxes (was NOTIFY's bitmap bell; the tray's speaker and network label)
+    status_glyphs_row(out, w, h, j, &m.tray); #[cfg(feature = "uvc")] camdot::row(out, w, h, j); #[cfg(feature = "uac")] micdot::row(out, w, h, j); // CAMDOT (B702): the camera glyph and its accent dot while a UVC stream is open, from the driver's count (LINE-NEUTRAL append, code first). MENUSCRAFT (B642): the bell, network and volume glyphs from the kit, centred in their hit boxes (was NOTIFY's bitmap bell; the tray's speaker and network label)
 
     // The two texts share a baseline: vertically centred in the bar.
     let ty0 = (h - CELL_H()) / 2;
@@ -3111,7 +3111,7 @@ pub fn volatile_rects(pw: usize, ph: usize) -> (Option<strip::Rect>, Option<stri
     let Some((rx, ry, w, h)) = strip_rect(pw, ph) else { return (None, None) };
     let Some(cx) = clock_slot(w) else { return (None, None) };
     let clock = Some((rx + cx, ry, (CLOCK_GLYPHS * CELL_W()).min(w - cx), h));
-    let gx = tray_left(w).or_else(|| bright_slot(w)).or_else(|| batt_slot(w)); #[cfg(feature = "uvc")] let gx = camdot::slot(w).map(|(x, _)| x).or(gx); // CAMDOT (B702): the camera dot is volatile too (LINE-NEUTRAL append, code first). STATUSTRAY: the tray is volatile too
+    let gx = tray_left(w).or_else(|| bright_slot(w)).or_else(|| batt_slot(w)); #[cfg(feature = "uvc")] let gx = camdot::slot(w).map(|(x, _)| x).or(gx); #[cfg(feature = "uac")] let gx = micdot::slot(w).map(|(x, _)| x).or(gx); // CAMDOT (B702): the camera dot is volatile too (LINE-NEUTRAL append, code first). STATUSTRAY: the tray is volatile too
     let glyphs = gx.map(|x0| (rx + x0, ry, cx.saturating_sub(x0), h));
     (clock, glyphs)
 }
@@ -3793,7 +3793,7 @@ pub mod camdot {
 
     /// The dot's box `(x0, width)` in a bar `w` wide: one ITEM_GAP left of the leftmost seated status item, else
     /// (no room before the titles' floor) over that item. `None` only when the bar seats no status item at all.
-    fn seat(w: usize) -> Option<(usize, usize)> {
+    pub fn seat(w: usize) -> Option<(usize, usize)> {
         let left = FLOW.iter().rev().find_map(|&i| flow_slot(i, w).map(|(x, _)| x))?;
         let iw = ICON_HIT();
         let x0 = left.checked_sub(ITEM_GAP() + iw).filter(|&x| x >= TITLE_X0() + CELL_W()).unwrap_or(left);
@@ -3861,6 +3861,112 @@ pub mod camdot {
     }
 
     /// The painter's state: is the dot on the glass now?
+    pub fn painted() -> bool {
+        PAINTED.load(Ordering::Acquire)
+    }
+
+    /// `(on edges, off edges)` the painter drew since boot.
+    pub fn counts() -> (u32, u32) {
+        (ON.load(Ordering::Relaxed), OFF.load(Ordering::Relaxed))
+    }
+}
+
+// ── UACMIC (rmbp-ledger B723, R130, BP-bar-10/12) — THE MIC DOT: the microphone's in-use light ───────────────────────
+//
+// The camera dot's shape for the microphone: while the USB Audio Class driver's capture pipe runs
+// (`drivers::usb::uac::capture_armed`, the driver's own count from `iso_start` to the endpoint's drop — never a model an
+// app or a fixture publishes) the bar paints a microphone glyph with the accent dot, one ITEM_GAP left of the camera's
+// dot when that is lit, else in the camera's seat (`camdot::seat`). It is the leftmost item while lit, so the titles'
+// limit (`menus_right_limit`) and the volatile rects read it first, and the damage fold carries it. Una's look only in
+// this arc (Softy's chrome is SOFTYDOTS'). Appended, and `#[cfg(feature = "uac")]`-erased whole: every call site above
+// is a same-line cfg'd fold.
+#[cfg(feature = "uac")]
+pub mod micdot {
+    use super::{camdot, icon_stroke, theme, Ico, CELL_W, ICON, ICON_HIT, ITEM_GAP, TITLE_X0};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    static PAINTED: AtomicBool = AtomicBool::new(false);
+    static ON: AtomicU32 = AtomicU32::new(0);
+    static OFF: AtomicU32 = AtomicU32::new(0);
+    static AT_X: AtomicU64 = AtomicU64::new(0);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn open() -> u32 {
+        crate::drivers::usb::uac::capture_armed()
+    }
+
+    /// The dot's box while capture runs: left of the lit camera dot (over it when the titles' floor leaves no room),
+    /// else the camera's own seat.
+    pub fn slot(w: usize) -> Option<(usize, usize)> {
+        if open() == 0 {
+            return None;
+        }
+        let iw = ICON_HIT();
+        match camdot::slot(w) {
+            Some((cx, _)) => {
+                let x0 = cx.checked_sub(ITEM_GAP() + iw).filter(|&x| x >= TITLE_X0() + CELL_W()).unwrap_or(cx);
+                if x0 + iw > w { None } else { Some((x0, iw)) }
+            }
+            None => camdot::seat(w),
+        }
+    }
+
+    /// The damage fold's word.
+    pub fn sig() -> u64 {
+        0x31C00 | open().min(1) as u64
+    }
+
+    /// Row `j` of the bar: the microphone glyph and the accent dot. Row 0 records what this repaint draws.
+    pub fn row(out: &mut [u32], w: usize, h: usize, j: usize) {
+        let s = slot(w);
+        if j == 0 {
+            let on = s.is_some();
+            if PAINTED.swap(on, Ordering::AcqRel) != on {
+                if on { ON.fetch_add(1, Ordering::Relaxed) } else { OFF.fetch_add(1, Ordering::Relaxed) };
+            }
+            AT_X.store(s.map(|(x, _)| x as u64).unwrap_or(0), Ordering::Relaxed);
+        }
+        let Some((x0, sw)) = s else { return };
+        let g = ICON();
+        let by = (h.saturating_sub(g) / 2) as i32;
+        if (j as i32) < by - 2 || j as i32 >= by + g as i32 + 2 {
+            return;
+        }
+        let o = Ico { bx: (x0 + sw.saturating_sub(g) / 2) as i32, by: by - j as i32, g: g as i32 };
+        glyph(&o, out, w);
+    }
+
+    /// A microphone on the 16-pt grid (the capsule, its cradle, the stem and the foot), outline ink; the accent dot
+    /// top right, as the camera's.
+    fn glyph(o: &Ico, out: &mut [u32], w: usize) {
+        use crate::video::draw::{self, Ink, Surf};
+        let ink = Ink::new(theme::title_text_inactive(), 255);
+        let mut s = Surf::new(&mut out[..w], w);
+        let sw = icon_stroke();
+        draw::stroke_rrect(&mut s, o.rect(5, 1, 5, 9), o.u(2).max(1), sw, ink);
+        let lw = sw * draw::SUB;
+        draw::line_aa(&mut s, o.sx(3), o.sy(8), o.sx(4), o.sy(11), lw, ink);
+        draw::line_aa(&mut s, o.sx(4), o.sy(11), o.sx(7), o.sy(12), lw, ink);
+        draw::line_aa(&mut s, o.sx(8), o.sy(12), o.sx(11), o.sy(11), lw, ink);
+        draw::line_aa(&mut s, o.sx(11), o.sy(11), o.sx(12), o.sy(8), lw, ink);
+        draw::line_aa(&mut s, o.sx(7), o.sy(12), o.sx(7), o.sy(15), lw, ink);
+        draw::line_aa(&mut s, o.sx(4), o.sy(15), o.sx(11), o.sy(15), lw, ink);
+        draw::fill_circle(&mut s, o.bx + o.u(13), o.by + o.u(3), o.u(3).max(2), theme::accent());
+    }
+
+    /// `compose`'s tail: `[mic] dot painted=<on|off> open=<n> x=<x>` once per painted edge (never periodic).
+    pub fn witness() {
+        let p = PAINTED.load(Ordering::Acquire);
+        let x = AT_X.load(Ordering::Relaxed);
+        let key = (p as u64) | (x << 1);
+        if SAID.swap(key, Ordering::Relaxed) == key {
+            return;
+        }
+        serial_println!("[mic] dot painted={} open={} x={}", if p { "on" } else { "off" }, open(), x);
+    }
+
+    /// The painter's state: is the mic dot on the glass now?
     pub fn painted() -> bool {
         PAINTED.load(Ordering::Acquire)
     }

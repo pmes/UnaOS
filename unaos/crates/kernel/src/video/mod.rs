@@ -1265,4 +1265,4 @@ pub mod look { #[inline] pub fn is_softy() -> bool { false } }
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod zoom;
 
-pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod perfhud; // PERFHUD (B710): the performance overlay (Win+F12, Settings > Accessibility > Show performance); the toggle on both desktop families, the glass half x86 `wc`. LINE-NEUTRAL fold, code first
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod perfhud; // PERFHUD (B710): the performance overlay (Win+F12, Settings > Accessibility > Show performance); the toggle on both desktop families, the glass half x86 `wc`. LINE-NEUTRAL fold, code first
