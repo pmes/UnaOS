@@ -1,0 +1,60 @@
+# bar — what other OSes get wrong, and the line UnaOS holds instead (R129, R130)
+
+Peter, 2026-10-19: "they should think: wow, this is how computers should have been all along." / "obvious ones are
+locking people into hardware and software that's been given an expiration date user is not privileged to … or the
+whole i know better than the user so i will not even let them attempt this thing." Research (three Opus passes, web +
+tree, 2026-10-19): `docs/dev/evidence/bar-research/A-firstrun-speed-stability.md`,
+`docs/dev/evidence/bar-research/B-privacy-apps-files-security.md`, `docs/dev/evidence/bar-research/C-interface-hardware-a11y-fun.md`.
+Each row below is one of their findings reduced to a LAW (what UnaOS does) and a BAR (the line the bench scores).
+held by: `built` = a gate/fixture exists at 1719fe54 (named); `owed` = the bar is written, the fixture is not.
+
+## The two laws Peter named first
+
+| id | law | bar | held by |
+|---|---|---|---|
+| BP-bar-1 | NO EXPIRY THE USER DOES NOT CONTROL. Nothing in the OS needs a server to keep working; no feature dies on a vendor's date; the 2012 rMBP, the Pi 4 and the Jetson are first-class for as long as they power on; the bunker keeps the proprietary bits the user already owns (R127). | the image line boots the 2012 rMBP to `[desktop] built` and DESKTOPCRAFT prints `UNDER` at 2880x1800; an idle boot logs zero `[net]` connects not caused by a user verb | built (the rmbp track); owed (the idle-net fixture) |
+| BP-bar-2 | NO PATERNALISM. The OS never refuses a user's action because it knows better. Helm's REFUSE is for physical harm only; everything else is ASK with the risk said once, then the user's word is final and Principia remembers it. | a grant made once survives 3 reboots and a 90-day clock: prompt count 0; `tests apptrust` asks ONCE for a foreign-volume program, then runs it at its own path | built (apptrust, BP-security-9); owed (the re-ask fixture) |
+
+## First run, speed, stability (A)
+
+| id | law | bar | held by |
+|---|---|---|---|
+| BP-bar-3 | Setup is one form: name, password, retype. No account, no network, no upsell before the desktop. | twoboot boot 1: `installer: first-user form open` → `session open … role=admin`; zero net/wifi lines before `[boot] services up`; exactly 1 form, 0 extra prompts | built (twoboot; BP-boot-3, -7) |
+| BP-bar-4 | The image is the system. Features join only by a commit to the image line; no update step inside setup; no third-party ring 0. | `held_starters=` identical across N boots and changes only in a commit the `image-line` gate sees | built (BP-boot-11, gate image-line) |
+| BP-bar-5 | Input-to-photon is the kernel's, with a timestamp at each end (HID IRQ → pal::Event → compositor → flip). | `[input] k2p p50= p99=` with p99 ≤ one vblank + scanout; `[wc] missed_vblank=0` over a 60 s drag under load; `[input] drag_age_ms` p99 ≤ 16.7 | owed (the three lines; the 240 fps camera on the bench against Luu's table) |
+| BP-bar-6 | Boot is bracketed and budgeted; a step over budget says OVER; tests are deferred; the splash is bounded. | `KELF` → `[desktop] built … bar_ms=` ≤ 3 s on the rMBP; `[splash] held_ms` < 5000; 0 `OVER`; `:: TESTS: deferred=<n>` | built (bootpace, BP-boot-4, -5, -9) |
+| BP-bar-7 | An app launches straight into a slot: no runtime warm-up, no per-app splash. | `[app] <name> exec->frame ms=` ≤ 400 cold, p99 over 20 launches | owed |
+| BP-bar-8 | No restart the user did not start. An update stages a second image; the loader switches only after a user restart and falls back if the new image never prints DESKTOPBUILT PASS. | `[update] staged kelf=`; `KELF` changes only after a shutdown with `why=user`; a twoboot variant with a panicking image boots the old `KELF` on boot 2 | owed (A/B images: the seat's arc) |
+| BP-bar-9 | Nothing accumulates: apps cannot register autostart; the desktop is built at login and torn down at Log Out. | `bar_ms` on day 180 within ±10 % of day 1; Log Out then log in: `[desktop] built` within ±10 % and the heap high-water returns | built (BP-boot-6); owed (the day-180 score) |
+
+## Privacy, apps, files, security (B)
+
+| id | law | bar | held by |
+|---|---|---|---|
+| BP-bar-10 | No telemetry path exists. Furniture draws only the user's objects; no remote content feed reaches `video/`. | idle 1 h after login: `[net]` connects not caused by a user verb = 0; a grep gate: no http_core call reachable from `video/**` | owed (both gates) |
+| BP-bar-11 | One authority per thing, no shadow copies: the mount table owns names, Principia settings, Holocron secrets, trash_core the Trash. A dotfile literal fails the gate. | install, run, uninstall, diff: leftover files = 0 outside the user's documents; `tests trash`: Quarry and Midden deletes land in one listing and restore to their paths | built (gate charter: dotfiles; BP-storage-11, -14); owed (the uninstall diff) |
+| BP-bar-12 | The grant is the object the user picked, never a category; checked at one SYS_OPEN point; a program is never moved behind the user's back. | an app opening a file it was not handed → `-EPERM` on the wire; a program copied to `/apps` asks 0 times after | built (BP-security-1, -9) |
+| BP-bar-13 | No store as gatekeeper: an unsigned ELF on a stick runs after one ask with 0 network calls; one una-abi, statically linked. | an ELF built at abi vN runs unchanged on the next 3 tagged builds (a fixture ELF kept in the tree) | owed (the fixture ELF) |
+| BP-bar-14 | Files stay where the user put them: one namespace, one home, no hidden folders beyond `.Trash`, no cloud redirect of `/home`; the name index is updated with the write, never rebuilt by hand. | hidden entries under `/home/<u>` other than `.Trash` = 0; create 10k files, search → 10k hits, 0 misses, no rebuild step | built (ROOTDISK2 `links=volumes-only`, BP-storage-8); owed (the 10k search) |
+| BP-bar-15 | Encryption with the key the user holds: the UnaFS volume key wrapped by the login secret's KDF; the recovery key shown locally, never uploaded. | a pulled disk refuses `tools/unafs` without the key; network sends of the key = 0; 100 wrong guesses ≥ 25 s with one refusal text | built (KDF, BP-security-2, -4); owed (volume encryption: the seat's arc) |
+| BP-bar-16 | Protections are never the thing a workaround turns off: weakening SMEP, NXE, WXN or page permissions is a STOP tripwire. | WXAUDIT-CORES clean on every boot; aarch64 WXN enabled (open) | built x86 (BP-security-12); owed aarch64 WXN |
+
+## Interface, hardware, accessibility, fun (C)
+
+| id | law | bar | held by |
+|---|---|---|---|
+| BP-bar-17 | One design era: every painter reads one token table; one Settings row per preference; tabs on the left; no legacy pane. | appearance gate `AUDIT_LITERALS_OUTSIDE = 0`; `:: SETTINGSMAP: keys=N rows=N orphans=0 ::`; any key's label reaches its row in ≤ 2 keystrokes + Return | built (gate appearance, BP-video-1/2/3); owed (SETTINGSMAP) |
+| BP-bar-18 | Window-modal by default; system-modal only with the scrim; one primary button per view; toasts ≤ 3 on screen, 5 s, paused on hover; no ad surface anywhere. | `:: LOGINZ: … PASS ::`; a fixture counts `accent.fill` buttons per dialog, fails above 1; `:: TOAST: shown= dropped= stack_max=3 ::` | built (LOGINZ); owed (the two counts) |
+| BP-bar-19 | Direct manipulation never waits: the cursor and a dragged frame follow the newest sample at each vblank; motion never holds input. | pointer event → moved frame ≤ 16.7 ms (`DESKTOPCRAFT … -> UNDER`) | built (DESKTOPCRAFT, BP-video-12) |
+| BP-bar-20 | Sleep is a measured state with a named waker; the panel is idle when nothing changes (only the sparse shimmer runs). | `:: SLEEP: drain_pct_per_h ≤ 1 wakes=0 unexplained ::` over 8 h; lid-open → first frame ≤ 1000 ms; idle `cpu_idle_pct ≥ 98` with the fan at its floor | owed (no power sheet yet) |
+| BP-bar-21 | Contrast is solved, not tasted: every text token against every surface in OKLCH, 4.5:1 floor, 7:1 with increase_contrast. | `tests contrast`: every text/accent pair on every surface, both looks, ≥ 4.5:1; 4.499 fails | built (CONTRAST B664, wave 36) |
+| BP-bar-22 | Accessibility lives in the window table: the role/name tree, focus-visible ring, reduce-motion and RTL come from the rows the compositor paints. | `:: A11YTREE: windows=N unnamed=0 ::`; Tab through Settings shows a ≥ 2 px ring at every stop; Arabic, Devanagari, CJK, Thai render with `notdef=0`; a +40 % pseudo-locale clips no label | owed (A11YTREE, the glyph fixture) |
+| BP-bar-23 | Delight is free per frame: the start scene runs from the first frame through login to the desktop with no cut; beauty (VEIL, shimmer) costs no more than a solid fill. | the capture shows no `fbcon` frame between splash and `[desktop] built`; `shimmer_us=` ≤ 1 % of the budget; the VEIL frame cost = a solid fill ±5 % | built (STARTSCENE B662, STARFIELD B661); owed (the VEIL cost line) |
+| BP-bar-24 | The desktop costs what it draws: windows and processes limited by free heap, kernel + furniture ≤ 64 MB at the desktop. | `[wm] limit windows= procs= from=`; a memory line at `[desktop] built` ≤ 64 MB | built (wincap, BP-video-7); owed (the memory line) |
+
+## The six decisions the research converged on
+1. Local-first, one-form setup, nothing networked before the desktop (built). 2. The input-to-photon path is the
+kernel's and prints its latency (owed: `k2p`, `missed_vblank`, `drag_age_ms`). 3. The image is the unit of change: A/B
+images, fallback on a failed DESKTOPBUILT, no forced restart (owed). 4. One authority per thing, zero leftovers, counted
+(built in part). 5. The grant is the object, checked at one point, remembered forever (built). 6. Accessibility and
+the two looks come from the one window table and the one token table (built in part; A11YTREE owed).

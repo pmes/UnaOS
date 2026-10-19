@@ -172,7 +172,72 @@ runs at up to 30 Hz; on a desktop where nothing draws, `wm::service_damage` is t
 service pass), so the twinkle steps about once a second. A steady 30 Hz on an idle desktop needs a timer-driven pass
 from the compositor's owner (`wm.rs`, outside this arc's files) — owed, named in the report.
 
-## 9. Files and seams
+## 9. From the first frame (STARTSCENE, rmbp-ledger B662)
+
+R128's "i meant the both combined" asks for ONE picture. STARFIELD built the picture as the generated wallpaper.
+Its fold left one thing owed: the boot splash and the login backdrop did not show it. The boot screen becomes the
+desktop in four steps. Written before the code (R106):
+
+| step | where | painted before | paints now |
+|---|---|---|---|
+| 1. GOP stage | `splash::gop_stage`, at boot entry, pre-heap, allocation-free | the three quartz shards and the spectrum rays | the scene's GROUND: `VOID` and the picture's own lensed stars (`splash::gop_scene` -> `wm::desktop::stars_onto`). `[splash] gop scene=ground stars=<n> ms=<n> WxH=<w>x<h>` |
+| 2. the hold | `splash::hold_prepare` at the Kepler takeover (`fbcon` `takeover_blit`, then `desktop_uefi::activate_on`); parked by `hold_open` as the topmost row until `users::stage_resolve` | the same shards again, re-traced into the hold store | THE generation: `wallpaper::generate_splash` copies the finished scene into the hold store and installs it as the wallpaper. `:: SPLASH: … scene=1 wall_ms=<n> -> painted ::`, `[startscene] splash gen wall_ms=<n> …` |
+| 3. the login screen | `login::open_as` opens its window over the backdrop | the flat `DESKTOP_BG` (no picture was installed yet) | the installed picture: the glass's `stage_fill` and the desktop layer's `wp_paint` both draw it, and the shimmer rides `track` round the login window's occluder box |
+| 4. the desktop | `desktopbuild::build` -> `wallpaper::rearm` -> `probe` | the scene, generated for the first time here, after `[desktop] built` | the same picture, kept: `[wallpaper] probe try=1 found=0 kept=generated`. A found `WALL.PNG` still replaces it. `regen_on_theme` regenerates only on a Light/Dark change (the scene reads no accent), so a session's accent keeps the picture: `[wallpaper] regen … kept=generated reason=accent-only` |
+
+**Where the generation runs.** It runs once, on the boot core, inside `hold_prepare`. That is the first point where
+the heap exists (the hold store is allocated there), the panel's size is known (the `WRITER` handle), and the
+scene's inputs are live (`theme::is_dark` and the `theme::starfield` pairs; the accent is not one of them). The
+cost is §2's `wall_ms`, at most 400 ms at 2880x1800, paid once during the takeover instead of later on the worker
+core. If generation fails (no memory), the hold paints the crystal as before.
+
+**The GOP stage's stars are the picture's stars.** The generator cannot run before the heap. So the field and the
+star pass are factored out of `wall_gen`, and the stage runs them without the heap:
+
+* `sf_field_fill` computes into caller-owned tables: the heap's for the picture, or a static five-table scratch of
+  12 288 nodes for the GOP stage. The stream function is skipped when there are no strokes to read it.
+* `sf_stars_core` draws through a plot sink and uses the same seed (`STAR_SEED`).
+* The arithmetic is identical either way, so every star lands on the same pixel.
+* `stars_onto` writes onto VRAM without ever reading it back. It keeps a 4096-slot cache of what it last wrote, so
+  overlapping splats accumulate as they do in the picture.
+* The web, the gem and the beam arrive with step 2's full paint: a fade-in, not a cut.
+
+**The hold shimmers.** While the hold row covers the panel, `track`'s shimmer skips everything: the row is an
+occluder. So `hold_service` ticks instead. It runs on the ~1 kHz device-service pass, which is fast enough that the
+33 ms floor is what binds; a boot step that holds the pass stalls the twinkle for that long. Each tick:
+
+* is at most one `shimmer_tick` per 33 ms;
+* writes into the HOLD STORE, never the picture;
+* treats the caption bands as the occluder (the step's word and the OVER line, the bottom three band heights);
+* damages each re-tinted box on the row, then makes one `wm::composite`.
+
+aarch64 has no device-service caller of `hold_service`, so there the hold does not shimmer.
+
+**Who owns the backdrop.** `wallpaper::owns_backdrop()` is true when REALDESK's latch is set OR the splash has
+installed the scene. It gates `wm::wp_paint`, `take_stale` and the live shimmer. Finding: on x86 REALDESK's latch is
+never set (`retire_desktop_chrome` runs only on the Pi's and the Orin's render paths). Before this arc, those three
+were therefore dark on x86, including §8's live shimmer.
+
+**The shards.** A scene build (`wc` and `facet`) no longer paints them. `advance` keeps its SPLASHRETIRE seam and
+the `gui` backstop: `ANIM` is armed, `SPLASH_FB` is never published, so it paints nothing. The shard code stays,
+because builds without the generator (knob-off, no `facet`) and the hold's no-memory fallback still call it. Every
+`splash.rs` edit is a same-line fold, a line-count-equal rewrite inside a `wc`-gated body, or an append at the foot,
+so no knob-off line moves.
+
+**Fixture**, `tests startscene`. It checks four things:
+
+* `gen_count=1`, and the installed buffer is the one the splash installed;
+* `splash_scene=1`;
+* `hold_ticks>0` whenever the hold lasted at least 66 ms;
+* `gop_stars=ok`: `stars_into` on an offscreen `VOID` buffer lights all 16 of the picture's sampled star pixels
+  (bright, compact, evenly spaced).
+
+`login_backdrop=picture` is reported when the picture owns the backdrop and is installed.
+
+    :: STARTSCENE: detail installed=<0|1> held_ms=<n> lit=<n>/<m> surface=<w>x<h> ::
+    :: STARTSCENE: gen_count=1 splash_scene=1 gop_stars=ok hold_ticks=<n> login_backdrop=picture -> PASS ::
+
+## 10. Files and seams
 
 * CHARTER: Kernel — wm (`desktop.rs`'s own charter line; the generator is the desktop's paint). No new file in
   `video/`.
@@ -185,7 +250,7 @@ from the compositor's owner (`wm.rs`, outside this arc's files) — owed, named 
   existing table walk and calls the tick before its early return.
 * `tests.rs` — `register("starfield", …)`, a LINE-NEUTRAL append beside `desktopcraft`.
 
-## 10. The wire
+## 11. The wire
 
     [starfield] gen wall_ms=<n> stars=<n> lensed=<n> streams=<n> facets=17 front=<n> glints=<n> groups=<n> surface=<w>x<h>
     :: STARFIELD: detail surface=<w>x<h> glints=<n> groups=<n> zircon_box=<x>,<y>,<w>,<h> front=<n> beam_land=<x>,<y> lens=ok(<dx>,<dy>) lens=ok(<dx>,<dy>) lens=ok(<dx>,<dy>) covered_changed=0 changed=<n> boxes=<n> shimmer_max_us=<n> literals=0 ::
