@@ -5622,7 +5622,7 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         // WHEEL: the delta rides the low byte as a raw two's-complement i8 — ring 3 sign-extends
         // (`payload as u8 as i8`). Cast through `u8` first: `i8 as u64` would sign-extend to
         // 0xFFFF_FFFF_FFFF_FFxx and smear a negative detent across the type field.
-        Event::Wheel(d) => (INPUT_EV_WHEEL, d as u8 as u64), Event::Action(a) => (una_abi::INPUT_EV_ACTION, crate::video::clipboard::action_code(a)), // APPCLIP (R61) — THE RING-3 HALF OF THE DELIVERY, and the arm this EXHAUSTIVE match forces: `pal::Event` gained a third kind (`Event::Action`, the chord `video::keymap::resolve` already judged at the HID decoder), so ring 3 receives a ⌘V exactly the way it receives a key — one `SYS_INPUT_POLL` value, bit 63 clear, type `una_abi::INPUT_EV_ACTION` (7) and the action discriminant in the payload. The mapping is `video::clipboard::action_code`, ONE definition read by both arches' `pack_input`, so the two wires cannot drift; it is in `clipboard.rs` and not in `keymap.rs` because it is an ABI fact about the input ring, not a property of the binding table. Fully qualified (`una_abi::`, `crate::video::`) so the fold touches no `use` list. Nothing here decides anything: an action that reaches this function has already been resolved, and a program with no clipboard ignores the type as it ignores `INPUT_EV_WHEEL`. ⚠ FOLDED onto the `Wheel` arm and given no line of its own — this file is 24k lines of `panic::Location` records that embed line numbers (B94, LEDGER P7), and three peers are editing other regions of it this round; CODE FIRST, then the prose (A10FIX).
+        Event::Wheel(d) => (INPUT_EV_WHEEL, d as u8 as u64), Event::Action(a) => (una_abi::INPUT_EV_ACTION, crate::video::clipboard::action_code(a)), Event::Char(c) => (una_abi::INPUT_EV_CHAR, c as u64), // KEYCHARS (B718): a layout character >= U+0080 rides the ring as INPUT_EV_CHAR, the scalar value in the payload, routed like KEY_DOWN (LINE-NEUTRAL, code first). APPCLIP (R61) — THE RING-3 HALF OF THE DELIVERY, and the arm this EXHAUSTIVE match forces: `pal::Event` gained a third kind (`Event::Action`, the chord `video::keymap::resolve` already judged at the HID decoder), so ring 3 receives a ⌘V exactly the way it receives a key — one `SYS_INPUT_POLL` value, bit 63 clear, type `una_abi::INPUT_EV_ACTION` (7) and the action discriminant in the payload. The mapping is `video::clipboard::action_code`, ONE definition read by both arches' `pack_input`, so the two wires cannot drift; it is in `clipboard.rs` and not in `keymap.rs` because it is an ABI fact about the input ring, not a property of the binding table. Fully qualified (`una_abi::`, `crate::video::`) so the fold touches no `use` list. Nothing here decides anything: an action that reaches this function has already been resolved, and a program with no clipboard ignores the type as it ignores `INPUT_EV_WHEEL`. ⚠ FOLDED onto the `Wheel` arm and given no line of its own — this file is 24k lines of `panic::Location` records that embed line numbers (B94, LEDGER P7), and three peers are editing other regions of it this round; CODE FIRST, then the prose (A10FIX).
         Event::Timer | Event::None | Event::Unknown => return None,
     };
     Some(una_abi::input_ev_pack(ty, payload))
@@ -7315,7 +7315,7 @@ pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { let _lag = 
     // rather than each naming one surface. It consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with nothing down, falls straight through to the chain below.
     // ⚠ LINE-NEUTRAL fold (four comment lines in, four out): this file is x86-only so `kernel8.img`'s panic-`Location` proof is untouched either way, but the idiom is the tree's and is kept.
     // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9), so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
-    #[cfg(feature = "login")] if crate::fs::users::screen_up() && matches!(raw, crate::pal::Event::Key(_) | crate::pal::Event::KeyUp(_)) { if let crate::pal::Event::Key(c) = raw { let _ = crate::fs::users::screen_key(c); } return crate::pal::Event::Unknown; } #[cfg(feature = "wc")] // LOGIN13 M3 (R63) — THE SCREEN IS THE FIRST TAKER OF EVERY KEY while it is up: ahead of the Esc/Quarry doors, the Tab focus ring (`wc_focus_key`) and the focused ring (`user_input_route`). Flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop because every one of those was asked first and the screen was asked last, in the render loop's fallback (`main.rs`, after this router). A key-UP is swallowed too, so no app sees half a keystroke. The SERIALDOOR arm on the signature line stays first: a wire byte is the console's, and the loop's own `screen_key` still hands it to the screen. ⚠ LINE-NEUTRAL fold.
+    #[cfg(feature = "login")] if crate::fs::users::screen_up() && matches!(raw, crate::pal::Event::Key(_) | crate::pal::Event::KeyUp(_) | crate::pal::Event::Char(_)) { if let crate::pal::Event::Key(c) = raw { let _ = crate::fs::users::screen_key(c); } #[cfg(feature = "wc")] if let crate::pal::Event::Char(ch) = raw { if !crate::video::dialog::over_screen() { let _ = crate::video::crystal::login::consume_char(ch); } } return crate::pal::Event::Unknown; } #[cfg(feature = "wc")] // LOGIN13 M3 (R63) — THE SCREEN IS THE FIRST TAKER OF EVERY KEY while it is up: ahead of the Esc/Quarry doors, the Tab focus ring (`wc_focus_key`) and the focused ring (`user_input_route`). Flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop because every one of those was asked first and the screen was asked last, in the render loop's fallback (`main.rs`, after this router). A key-UP is swallowed too, so no app sees half a keystroke. The SERIALDOOR arm on the signature line stays first: a wire byte is the console's, and the loop's own `screen_key` still hands it to the screen. ⚠ LINE-NEUTRAL fold.
     if { let door = crate::video::launcher::key_door(raw) || crate::video::appswitch::key_door(raw) /* APPSWITCH (B428): Cmd-Tab over apps */ || crate::video::shortcuts::overlay_key(raw) || crate::video::shotsel::route(raw) || crate::video::softy::startmenu::key_door(raw) /* WINKEY (B665): Esc closes an open Softy flyout; ESC ONLY, never a Start toggle */ || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw); crate::video::lag::seg(crate::video::lag::S_DOORS); door } { // INPUTSTALL2 M1 (B388): each door of the route is named by a mark after it (the `wm=` stage, flight 25's 92–276 ms clicks), folded in the condition, line-neutral. SHOTREGION: the selection mode is the FIRST door (one atomic load idle): Esc, the press/drag/release and the chords belong to it while it is up.
         return crate::pal::Event::Unknown;
     }
@@ -31878,4 +31878,27 @@ fn busx_window_raise(row: usize, body: &[u8], text: &mut alloc::vec::Vec<u8>) ->
         }
         Err(e) => e,
     }
+}
+
+// KEYCHARS (rmbp-ledger B718) — TAIL-APPENDED, so no line above moves. The `tests keychars` read-back of a ring.
+
+/// KEYCHARS witness read: take up to `out.len()` UNREAD packed events from the ring of the `+1`-biased slot `active`
+/// (the consumer half `sys_input_poll` runs for the slot's own program), oldest first; returns how many. `0` for the
+/// shell slot and anything outside the private-slot range. Fixture-only: a live program's ring is never read here.
+pub fn user_input_take(active: u64, out: &mut [u64]) -> usize {
+    if active == 0 || !slot_in_range((active - 1) as usize) {
+        return 0;
+    }
+    let slot = (active - 1) as usize;
+    let mut n = 0;
+    while n < out.len() {
+        let head = USER_INPUT_HEAD[slot].load(Ordering::Relaxed);
+        if head == USER_INPUT_TAIL[slot].load(Ordering::Acquire) {
+            break;
+        }
+        out[n] = USER_INPUT_BUF[slot][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+        USER_INPUT_HEAD[slot].store(head.wrapping_add(1), Ordering::Release);
+        n += 1;
+    }
+    n
 }

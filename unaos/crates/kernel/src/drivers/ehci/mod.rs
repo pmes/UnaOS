@@ -16732,12 +16732,12 @@ unsafe fn decode_boot_keyboard(
     // keycode went down in THIS report". A keycode the previous report already carried is a RESTATED
     // level, not a new press, and pushing `Event::Key` for it is what doubled characters on metal.
     let mut restated_this_report = 0u32;
-    let mut down_this_report = 0u32;
+    let mut down_this_report = 0u32; { let mut lev = [crate::pal::Event::None; 12]; let ln = super::xhci::hid_layout_push(&cur_keys, prev_keys, modifiers, caps, "EHCI-HID", true, &mut lev); for ev in lev[..ln].iter() { if let crate::pal::Event::Key(b) = *ev { note_press_edge(b); } } } // KEYCHARS (B718): the report's ONE layout call (stamped for `[login] key latency`, DBLSTROKE-counted); its claimed usages are skipped below. LINE-NEUTRAL, code first.
     for &keycode in cur_keys.iter() {
         if keycode <= 1 {
             continue; // no key / ErrorRollOver
         }
-        let ascii = ascii_of(keycode);
+        let ascii = if super::xhci::hid_layout_claim(keycode, modifiers, caps).is_some() { 0 } else { ascii_of(keycode) }; // KEYCHARS (B718): a claimed usage typed through `hid_layout_push`
         if ascii == 0 {
             continue;
         }
@@ -16772,7 +16772,7 @@ unsafe fn decode_boot_keyboard(
             if keycode <= 1 {
                 continue;
             }
-            let ascii = ascii_of(keycode);
+            let ascii = super::xhci::hid_layout_claim(keycode, modifiers, caps).unwrap_or_else(|| ascii_of(keycode)); // KEYCHARS (B718): a claimed usage repeats the byte its layout typed (0 = none: no `[` forged for a held `ü`)
             if ascii != 0 {
                 held[hn] = ascii;
                 hn += 1;

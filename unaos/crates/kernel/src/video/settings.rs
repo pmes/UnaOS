@@ -1607,7 +1607,7 @@ fn strip_step(tab: usize, down: bool) {
 /// match, Esc clears and leaves, Down leaves to the column. Every key is consumed (the field has the keyboard).
 /// SETTINGSMAP (B673): Return opens [`search_best`]'s hit (a row, or a tab); the first listed tab only when none.
 fn search_key(ev: crate::pal::Event) -> bool {
-    let crate::pal::Event::Key(c) = ev else { return true };
+    let (c, ch) = match ev { crate::pal::Event::Key(c) => (c, '\0'), crate::pal::Event::Char(ch) => (0, ch), _ => return true }; // KEYCHARS (B718): a layout character (`ü`, `é`) is typed into the query by the arm below
     let mut pick = None;
     let mut hit = None;
     {
@@ -1624,7 +1624,7 @@ fn search_key(ev: crate::pal::Event) -> bool {
                 if hit.is_none() && n > 0 { pick = Some(list[0] as usize); }
                 x.col_top = 0;
             }
-            0x20..=0x7e => { if x.query.len() < 24 { x.query.push(c as char); x.col_top = 0; } }
+            0x20..=0x7e => { if x.query.len() < 24 { x.query.push(c as char); x.col_top = 0; } } _ if ch != '\0' => { if x.query.len() < 24 { x.query.push(ch); x.col_top = 0; } } // KEYCHARS (B718): the Char arm, same 24-byte bound (LINE-NEUTRAL)
             _ => {}
         }
     }
