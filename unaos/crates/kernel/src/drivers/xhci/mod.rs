@@ -19,7 +19,7 @@ pub mod ring;
 pub mod event;
 pub mod context;
 pub mod dma_coherency;
-pub mod ftdi; #[cfg(feature = "usbnet")] pub mod usbnet; #[cfg(feature = "uvc")] pub mod isoch; // XHCIISO (rmbp-ledger B534): isochronous IN + the 4 KiB EP0 buffer + the UVC hand-off, cfg-erased whole like usbnet; every site below is a same-line cfg-gated append. // USBNET (LEDGER SO56) — a USB Ethernet link on this bus (CDC-ECM first, the AX88179 front-end owed); a `#[cfg]`-erased module, and every site of it in this file is a same-line cfg-gated append or an `#[inline(always)] false` helper, so the knob-off image is unchanged
+pub mod ftdi; #[cfg(feature = "usbnet")] pub mod usbnet; #[cfg(feature = "uvc")] pub mod isoch; #[cfg(feature = "uvc")] pub mod uvc; // XHCIISO (rmbp-ledger B534): isochronous IN + the 4 KiB EP0 buffer + the UVC hand-off, cfg-erased whole like usbnet; every site below is a same-line cfg-gated append. // USBNET (LEDGER SO56) — a USB Ethernet link on this bus (CDC-ECM first, the AX88179 front-end owed); a `#[cfg]`-erased module, and every site of it in this file is a same-line cfg-gated append or an `#[inline(always)] false` helper, so the knob-off image is unchanged
 // STOR-1: the interrupt-driven storage service task + BlockRequest submit/complete. x86_64 + the
 // `irqstorage` knob only — the default build never links it, so the staged storage path is untouched.
 #[cfg(all(target_arch = "x86_64", feature = "irqstorage"))]
@@ -4845,7 +4845,7 @@ impl XhciController {
                                             "xHCI: no driver for device class {:#x} (slot {}, {:04x}:{:04x}); releasing port.",
                                             class_code, slot_id,
                                             self.slots[slot_id as usize].vid,
-                                            self.slots[slot_id as usize].pid); #[cfg(feature = "uvc")] isoch::note_root(slot_id as u8, class_code); // XHCIISO: a class-0xEF (IAD) device is a camera candidate for the main-loop UVC service; the port is still released below
+                                            self.slots[slot_id as usize].pid); #[cfg(feature = "uvc")] isoch::note_root(slot_id as u8, class_code); #[cfg(feature = "uvc")] uvc::note_dev(slot_id as u8, self.slots[slot_id as usize].vid, self.slots[slot_id as usize].pid); // XHCIISO: a class-0xEF (IAD) device is a camera candidate for the main-loop UVC service; the port is still released below
                                         if !self.slots[slot_id as usize].is_downstream {
                                             self.start_next_port();
                                         }
@@ -13608,7 +13608,7 @@ impl XhciController {
             crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
-        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
+        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); #[cfg(feature = "uvc")] uvc::pump(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
     }
 
     /// PTBURST — bytes staged into ONE bulk-OUT transfer. **64, the FT232's full-speed bulk max packet
@@ -15334,7 +15334,7 @@ impl XhciController {
         // kbd+mouse dongle: keyboard on iface0, mouse on iface1) that lands behind a hub arms
         // both, not just the first interface. Then configure them together in one
         // Configure-Endpoint (root_fsm = false: this is the hub-downstream FSM).
-        #[cfg(feature = "uvc")] isoch::note_downstream(slot_id, buf); #[cfg(feature = "usbnet")] { if self.usbnet_downstream(slot_id as u8) { return; } } if self.record_hid_interfaces(slot_id, buf) { // XHCIISO: a hubbed camera (video IAD in this 64-byte window) is queued for the UVC service — no traffic here
+        #[cfg(feature = "uvc")] isoch::note_downstream(slot_id, buf); #[cfg(feature = "uvc")] uvc::note_dev(slot_id, self.slots[slot_id as usize].vid, self.slots[slot_id as usize].pid); #[cfg(feature = "usbnet")] { if self.usbnet_downstream(slot_id as u8) { return; } } if self.record_hid_interfaces(slot_id, buf) { // XHCIISO: a hubbed camera (video IAD in this 64-byte window) is queued for the UVC service — no traffic here
             self.configure_hid_endpoints(slot_id, false);
         } else {
             crate::bootlog_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id);

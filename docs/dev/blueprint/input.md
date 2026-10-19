@@ -22,6 +22,7 @@
 | BP-input-10 | The wheel is read from byte 3 of the relative boot report only when the transfer length says it exists; delivery is to the focused window (no consumer scrolls yet). | `unaos/crates/kernel/src/drivers/xhci/mod.rs:5084`; `docs/PRODUCT.md` (Scrolling row) | `[wheel1]` census |
 | BP-input-11 | Pointer and keyboard never falter; a faltering pointer is a fault named on the wire, not a load (R88, R103). | `unaos/crates/kernel/src/hidstall.rs:1-8`; R88 | `[lag] stall … stage=hid …`; `[hid] stall census` |
 | BP-input-12 | Trackpad gain is Principia's `system.trackpad.speed`, applied after the sub-pixel curve; x86 only (the pad hangs off EHCI). | `docs/dev/OS/05_USER_EXPERIENCE/trackpad.md:1-10` | `tests pointerfeel` |
+| BP-input-13 | A camera (USB Video Class) is a capture device, not an input decoder: it never reaches `pal::push_event`; its frames leave the xHCI claim path only as assembled bytes (`uvc::latest_frame`), are copied OUT under the stream lock and decoded/converted outside it by the `uvc-view` task, which reaches `wm` as a kernel app does (its own row, owner `KERNEL_OWNER_BASE + 0x62`) (UVCCAM B686, R130). | `unaos/crates/kernel/src/drivers/xhci/uvc.rs` (`view::task`, `pump`); `unaos/crates/kernel/src/drivers/uvc.rs:1689` | `tests uvccam`; `[uvc] stream fps= frames= dropped=` |
 
 ## 3. Seams
 - Decoders may call: `pal::push_event` only. They may not call `wm`, `login` or ring-3 code.
