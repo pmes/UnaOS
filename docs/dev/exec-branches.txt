@@ -546,7 +546,7 @@ refs/remotes/origin/exec-orin22-keep13      51f06bea WIP-SURVIVOR - 2026-10-19
 refs/heads/exec-rmbp-fpu        d4cd016f FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-gatesteal2 272ace72 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-winedge2   b3543ae5 IN-FLIGHT cloud wave36 WINEDGE2 (B659 B668)
-refs/heads/exec-rmbp-wifimac    b3543ae5 IN-FLIGHT cloud wave36 WIFIMAC (B669)
+refs/heads/exec-rmbp-wifimac    25bcc638 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-hidstall2b  b3543ae5 IN-FLIGHT cloud wave36 HIDSTALL2 (B670)
 refs/heads/exec-rmbp-k2p 5e9b7026 IN-FLIGHT cloud wave36 K2P
 refs/heads/exec-rmbp-idlenet 5e9b7026 IN-FLIGHT cloud wave36 IDLENET
