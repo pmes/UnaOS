@@ -2842,10 +2842,10 @@ pub fn keychars_selftest() {
     #[cfg(not(feature = "quarry"))]
     let field: Option<alloc::string::String> = None;
     let field_n = field.as_deref().map(|f| { let v: alloc::vec::Vec<char> = f.chars().collect(); if v.len() == WANT.len() { count(&v) } else { 0 } }).unwrap_or(0);
-    let wake = keychars_wake(); let pass = chars_n == 5 && window_n == 5 && field_n == 5 && altgr && wake && repeat_byte; // KEYCHARSARM: the Char repeat (`repeat=owed`) rides a u8 tracker (pal.rs) outside the arc
+    let wake = keychars_wake(); let pass = chars_n == 5 && window_n == 5 && field_n == 5 && altgr && wake && repeat_byte; // CHARREPEAT (SR156): `repeat_byte` now also drives the tracker with a held `ü` and a held de `z` (`keychars_repeat_byte`, tail); `repeat=` is its word
     serial_println!(
-        ":: KEYCHARS: layout=de chars={} window={} field={} altgr={} arch={} wake={} repeat=owed -> {} :: claimed={}/{} routed={} ring={} field_state={} repeat_byte={} window_by={}",
-        chars_n, window_n, field_n, if altgr { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" }, if wake { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" },
+        ":: KEYCHARS: layout=de chars={} window={} field={} altgr={} arch={} wake={} repeat={} -> {} :: claimed={}/{} routed={} ring={} field_state={} repeat_byte={} window_by={}",
+        chars_n, window_n, field_n, if altgr { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" }, if wake { "ok" } else { "bad" }, keychars_repeat_word(), if pass { "PASS" } else { "FAIL" },
         claimed, SEQ.len(), routed, rn, if field.is_some() { "scratch" } else { "busy-or-absent" }, if repeat_byte { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "depth" } else { "payload" }
     );
 }
@@ -4215,13 +4215,65 @@ fn keychars_wake() -> bool {
     ok
 }
 
-/// KEYCHARSARM `repeat_byte=` (asked while `de` is live): the byte a HELD key hands the typematic tracker is the
+/// KEYCHARSARM `repeat_byte=` (asked while `de` is live): the key a HELD usage hands the typematic tracker is the
 /// layout's — usage 0x1C (US `y`) claims `z`, and `ü` (0x2F) claims 0, so neither EHCI's feed nor the aarch64 xHCI feed
-/// forges the US byte (`y`, `[`). Repeating the `ü` itself is owed: the tracker carries one ASCII byte (pal.rs).
+/// forges the US byte (`y`, `[`). CHARREPEAT (LEDGER SR156): the feeds' token (`hid_repeat_key`) is `z` for 0x1C and the
+/// `ü` CHARACTER token for 0x2F, and where the tracker is compiled (`keychars_repeat_tracker`) the tracker repeats them.
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn keychars_repeat_byte() -> bool {
     use crate::drivers::xhci as hx;
-    hx::hid_layout_claim(0x1C, 0, false) == Some(b'z') && hx::hid_layout_claim(0x2F, 0, false) == Some(0)
+    let bytes = hx::hid_layout_claim(0x1C, 0, false) == Some(b'z') && hx::hid_layout_claim(0x2F, 0, false) == Some(0);
+    let (tz, tu) = (hx::hid_repeat_key(0x1C, 0, false, b'y'), hx::hid_repeat_key(0x2F, 0, false, b'['));
+    let tokens = tz == b'z' as u32 && tu == crate::pal::typematic_char_key('\u{fc}');
+    let tracker = keychars_repeat_tracker(tz, tu);
+    let ok = bytes && tokens && tracker.unwrap_or(true);
+    KEYCHARS_REPEAT.store(match tracker { Some(_) if ok => 1, None if ok => 2, _ => 0 }, core::sync::atomic::Ordering::Relaxed);
+    serial_println!("[keychars] repeat bytes={} tokens={} tracker={} -> {}", bytes as u8, tokens as u8, match tracker { Some(true) => "ok", Some(false) => "bad", None => "absent" }, keychars_repeat_word());
+    ok
+}
+
+/// CHARREPEAT: the `repeat=` word — `ok` (tokens right AND the tracker repeated them), `bad`, or `no-tracker` (tokens
+/// right on an image with no host typematic at all: no feed compiles there for ANY key, e.g. a tegra image).
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+static KEYCHARS_REPEAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn keychars_repeat_word() -> &'static str {
+    match KEYCHARS_REPEAT.load(core::sync::atomic::Ordering::Relaxed) { 1 => "ok", 2 => "no-tracker", _ => "bad" }
+}
+
+/// CHARREPEAT: drive the live tracker through its own seams — a held `ü` repeats `Event::Char('ü')`, a held de `z`
+/// repeats `Event::Key(b'z')`, a RELEASED `ü` (its token absent from the next report) repeats nothing in 64 due ticks.
+/// Each hold is retried up to 8 times: on x86 the service core's `x86_typematic_pump` may take a forced-due repeat
+/// between the fixture's force and its tick. The tracker is reset before and after (`typematic_test_reset`).
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc", feature = "ehcihid"), all(target_arch = "aarch64", feature = "desktop_firmware", feature = "baremetal"))))]
+fn keychars_repeat_tracker(tz: u32, tu: u32) -> Option<bool> {
+    use crate::pal::{self, Event};
+    let held_repeats = |tok: u32, want: Event| -> bool {
+        (0..8).any(|_| {
+            pal::typematic_test_reset();
+            pal::typematic_note_keys(tok, &[tok]);
+            pal::typematic_test_force_due();
+            pal::typematic_tick() == Some(want)
+        })
+    };
+    let char_repeats = held_repeats(tu, Event::Char('\u{fc}'));
+    let z_repeats = held_repeats(tz, Event::Key(b'z'));
+    pal::typematic_test_reset();
+    pal::typematic_note_keys(tu, &[tu]);
+    pal::typematic_note_keys(0, &[]); // the `ü` released
+    let released = (0..64).all(|_| {
+        pal::typematic_test_force_due();
+        pal::typematic_tick().is_none()
+    });
+    pal::typematic_test_reset();
+    serial_println!("[keychars] repeat char={} z={} released={}", char_repeats as u8, z_repeats as u8, released as u8);
+    Some(char_repeats && z_repeats && released)
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), not(any(all(target_arch = "x86_64", feature = "ehcihid"), all(target_arch = "aarch64", feature = "baremetal")))))]
+fn keychars_repeat_tracker(_tz: u32, _tu: u32) -> Option<bool> {
+    None
 }
 
 // A2DP (rmbp-ledger B739) — TAIL-APPENDED. `tests a2dp`: the SBC known-answer test (`sbc_core::kat`, the function the

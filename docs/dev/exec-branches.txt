@@ -630,7 +630,7 @@ refs/heads/exec-rmbp-geodebackup   d0b56d0c FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-filesearch    1c8b27a4 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-grantnames    116bb415 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-undokeys       5a8022a6 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-charrepeat     3bbd2569 IN-FLIGHT cloud wave36 CHARREPEAT
+refs/heads/exec-rmbp-charrepeat     260a7e40 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-micstage       0d9e2b5d FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-geodemod       4f3c359b FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-filesearch2    dc930803 FOLDED-BY-HAND (this commit) 2026-10-19
