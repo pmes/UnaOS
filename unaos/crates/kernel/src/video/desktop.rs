@@ -1171,9 +1171,9 @@ struct SfPal {
 }
 
 impl SfPal {
-    fn live() -> SfPal {
+    /// One look's set: [`wall_gen`] passes the live look; WINEDGE2 (B668)'s `shadow_dark=` probe draws both.
+    fn of(dark: bool) -> SfPal {
         use crate::video::theme::starfield as sf;
-        let dark = theme::is_dark();
         let p = |t: (u32, u32)| if dark { t.1 } else { t.0 };
         SfPal {
             void: p(sf::VOID),
@@ -2162,10 +2162,15 @@ fn sf_shimmer(px: &[u32], w: usize, h: usize, p: &SfPal, g: &SfGem, b: &SfBeam, 
 /// `None` when `w`/`h` are out of range or memory refused a table (the picture may then be partly drawn; the caller
 /// installs it without a shimmer).
 pub fn wall_gen(px: &mut [u32], w: usize, h: usize) -> Option<Scene> {
+    wall_gen_look(px, w, h, theme::is_dark())
+}
+
+/// [`wall_gen`] in a named look's set (`dark`), whatever the live one is (WINEDGE2 B668's `shadow_dark=` probe).
+fn wall_gen_look(px: &mut [u32], w: usize, h: usize, dark: bool) -> Option<Scene> {
     if w < 64 || h < 64 || w > 16_384 || h > 16_384 || px.len() < w * h {
         return None;
     }
-    let p = SfPal::live();
+    let p = SfPal::of(dark);
     let f = SfField::build(w, h)?;
     sf_haze(px, w, h, &f, &p)?;
     let mut cand: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
@@ -2246,7 +2251,7 @@ static SF_ONTO: crate::sync::Mutex<[u64; 4096]> = crate::sync::Mutex::new([0; 40
 
 /// The scene's ground colour in the live set (`theme::starfield::VOID`).
 pub fn scene_void() -> u32 {
-    SfPal::live().void
+    SfPal::of(crate::video::theme::is_dark()).void
 }
 
 /// The star pass over the static scratch field. `None` off range or when the grid outgrows the scratch.
@@ -2267,7 +2272,7 @@ fn sf_stars_static(w: usize, h: usize, seed: u64, plot: &mut impl FnMut(i64, i64
     let (gx, gy) = (&mut gx[..n], &mut gy[..n]);
     let gmax = sf_field_fill(w, h, dims, &mut dens[..n], &mut phi[..n], &mut tmp[..n], None, gx, gy);
     let lens = SfLens { c: dims.0, gw: dims.1, gh: dims.2, gx, gy, gmax };
-    let (drawn, _) = sf_stars_core(w, h, &lens, &SfPal::live(), seed, plot, &mut |_| {});
+    let (drawn, _) = sf_stars_core(w, h, &lens, &SfPal::of(crate::video::theme::is_dark()), seed, plot, &mut |_| {});
     Some(drawn)
 }
 
@@ -2671,6 +2676,75 @@ struct FixWin {
     title: &'static [u8],
 }
 
+/// WINEDGE2 (B668) — which base each desktop painter lays on THIS boot, `(desk, fill)`: true = the wallpaper
+/// picture, false = the flat `DESKTOP_BG`. The fill under a shadow (`wm::stage_fill` → `bg_row`) lays the picture
+/// whenever one is installed (`wallpaper::active`); the desktop layer beside it (`Screen`'s back buffer, through
+/// `wm::wp_paint`) only while the scene owns the backdrop (`video::desktop_scene_owns_backdrop`). Flight 36 (x86,
+/// no `[realdesk]` line) ran `(false, true)`: the margin was the only place the picture reached the glass. With no
+/// picture installed both are read over the generated one (the design case).
+fn live_bases() -> (bool, bool) {
+    #[cfg(feature = "facet")]
+    if crate::video::wallpaper::active() {
+        return (crate::video::desktop_scene_owns_backdrop(), true);
+    }
+    (true, true)
+}
+
+/// One look's `shadow_dark=` reading: the margin's outermost pixel equals the backdrop under it (`outer_eq`), and
+/// `inner` — the first pixel outside the box minus the backdrop beside it, mean of three channels, the weaker of the
+/// bottom and left sides (negative = darker; positive = the flight-36 flaw, a margin LIGHTER than the backdrop).
+struct DarkRead {
+    outer_eq: bool,
+    inner: i64,
+    ok: bool,
+}
+
+/// WINEDGE2 (B668): a focused window (`elev.3`) over the generated wallpaper drawn in look `dark` into `buf`
+/// (`w` x `h`), its shadow shaded as the fill shades it over the fill's base, read against the desktop layer's base
+/// (`bases`, [`live_bases`]) at the bottom margin (mid-width) and the left margin (mid-height). `None` when the
+/// picture, the tiles or the margin do not fit.
+fn shadow_dark_look(buf: &mut [u32], w: usize, h: usize, dark: bool, bases: (bool, bool)) -> Option<DarkRead> {
+    if buf.len() < w * h {
+        return None;
+    }
+    buf[..w * h].fill(theme::DESKTOP_BG);
+    wall_gen_look(buf, w, h, dark)?;
+    let t = tiles_for(ELEV_WINDOW, dark, win_radius(false))?;
+    let (x0, y0) = (w as i32 / 6, h as i32 / 8);
+    let (x1, y1) = (x0 + w as i32 / 2, y0 + h as i32 * 5 / 12);
+    if x0 - t.side < 0 || y1 + t.bot > h as i32 || t.bot <= 0 || t.side <= 0 {
+        return None;
+    }
+    let mut one = Casts::EMPTY;
+    one.push(Cast { id: 0xD5E0, x0, y0, x1, y1, t });
+    let buf = &buf[..w * h];
+    let desk = |x: usize, y: usize| if bases.0 { buf[y * w + x] } else { theme::DESKTOP_BG };
+    let fill = |x: usize, y: usize| {
+        let mut p = [if bases.1 { buf[y * w + x] } else { theme::DESKTOP_BG }];
+        shade_words(&one, &mut p, y as i32, x as i32);
+        p[0]
+    };
+    let ch = |c: u32, s: u32| ((c >> s) & 255) as i64;
+    let (mx, my) = (((x0 + x1) / 2) as usize, ((y0 + y1) / 2) as usize);
+    // (inner, outer): the first pixel outside the box, the margin's last pixel — below, then to the left.
+    let pairs = [((mx, y1 as usize), (mx, (y1 + t.bot - 1) as usize)), (((x0 - 1) as usize, my), ((x0 - t.side) as usize, my))];
+    let mut r = DarkRead { outer_eq: true, inner: i64::MIN, ok: true };
+    for &((ix, iy), (ox, oy)) in pairs.iter() {
+        if fill(ox, oy) != desk(ox, oy) {
+            r.outer_eq = false;
+        }
+        let (b, m) = (desk(ix, iy), fill(ix, iy));
+        let lighter = [16u32, 8, 0].iter().any(|&s| ch(m, s) > ch(b, s));
+        let d = [16u32, 8, 0].iter().map(|&s| ch(m, s) - ch(b, s)).sum::<i64>() / 3;
+        if lighter || d >= 0 {
+            r.ok = false;
+        }
+        r.inner = r.inner.max(d);
+    }
+    r.ok &= r.outer_eq;
+    Some(r)
+}
+
 /// **`tests desktopcraft`** — paints the default desktop into an offscreen surface the size of the rMBP panel
 /// (2880x1800; 1440x900 where memory refuses) the way the compositor does: the generated wallpaper and its VEIL,
 /// the desktop under every window's shadow (the fill's own shading, [`shade_words`], over the pre-rendered tiles),
@@ -2678,7 +2752,7 @@ struct FixWin {
 /// the dock's plate with nine tiles. It asserts the invariants and prints the paint cost on the running machine
 /// against the 60 Hz frame (16 667 us):
 ///
-/// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
+/// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) shadow_dark=ok(outer=eq inner=-<n>) hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
 /// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> shimmer_us=<n> -> UNDER|OVER ::`
 ///
 /// * **corners** — the focused window's top-left box pixel (outside the rounded head) is the desktop under the
@@ -2699,6 +2773,12 @@ struct FixWin {
 ///   arc are the ink; one pixel further in is the content (or the head's face), so it is ONE px; and one pixel
 ///   outside, on the left and below, is the shaded desktop (the edge is inside the box, the shadow outside it).
 ///   Printed `edge=ok(1px)`;
+/// * **shadow_dark** — WINEDGE2 (B668, flight 36: the margin painted as a pale box over a dark desktop): on BOTH
+///   looks, a focused window over the generated wallpaper ([`shadow_dark_look`]), the margin as the fill lays it and
+///   the backdrop beside it as the desktop layer lays it on this boot ([`live_bases`]): the margin's outermost pixel
+///   EQUALS the backdrop under it and the first pixel outside the box is darker than the backdrop (no channel
+///   lighter). Printed `shadow_dark=ok(outer=eq inner=-<n>)` (`n`, the weaker look's mean channel darkening), else
+///   `shadow_dark=FAIL(look=<light|dark> outer=<eq|ne> inner=<+-n> bases=<wall|flat>/<wall|flat>)`;
 /// * **hairline** — the dock plate's top edge is a line over the plate;
 /// * **black** — no run of pure `#000000` longer than 2 px outside a glyph zone.
 pub fn selftest() {
@@ -2959,11 +3039,47 @@ pub fn selftest() {
     if runs > 0 {
         black = false;
     }
-    let ok = corners && shadow && edge && hairline && black;
+    // shadow_dark (WINEDGE2 B668): both looks, the margin against the backdrop beside it, on this boot's two bases.
+    let bases = live_bases();
+    let (sw, sh) = (720usize, 480usize);
+    let mut sbuf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let (mut sd_n, mut sd_fail): (i64, Option<(bool, Option<DarkRead>)>) = (i64::MIN, None);
+    if sbuf.try_reserve_exact(sw * sh).is_ok() {
+        sbuf.resize(sw * sh, 0);
+        for look_dark in [false, true] {
+            match shadow_dark_look(&mut sbuf, sw, sh, look_dark, bases) {
+                Some(r) => {
+                    sd_n = sd_n.max(r.inner);
+                    if !r.ok && sd_fail.is_none() {
+                        sd_fail = Some((look_dark, Some(r)));
+                    }
+                }
+                None => {
+                    if sd_fail.is_none() {
+                        sd_fail = Some((look_dark, None));
+                    }
+                }
+            }
+        }
+    } else {
+        sd_fail = Some((dark, None));
+    }
+    drop(sbuf);
+    let wf = |b: bool| if b { "wall" } else { "flat" };
+    let lk = |d: bool| if d { "dark" } else { "light" };
+    let shadow_dark_s = match &sd_fail {
+        None => alloc::format!("ok(outer=eq inner={:+})", sd_n),
+        Some((d, Some(r))) => alloc::format!(
+            "FAIL(look={} outer={} inner={:+} bases={}/{})",
+            lk(*d), if r.outer_eq { "eq" } else { "ne" }, r.inner, wf(bases.0), wf(bases.1)
+        ),
+        Some((d, None)) => alloc::format!("FAIL(look={} no-probe)", lk(*d)),
+    };
+    let ok = corners && shadow && edge && sd_fail.is_none() && hairline && black;
     let fl = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: DESKTOPCRAFT: corners={} shadow={} edge={} hairline={} black={} windows={} surface={}x{} -> {} ::",
-        fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
+        ":: DESKTOPCRAFT: corners={} shadow={} edge={} shadow_dark={} hairline={} black={} windows={} surface={}x{} -> {} ::",
+        fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, shadow_dark_s, fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
     );
     let frame_us = f4.saturating_sub(f0) / 1000;
     // STARFIELD (B661): the shimmer's worst tick over these windows (after every check: it re-tints `wall`).
