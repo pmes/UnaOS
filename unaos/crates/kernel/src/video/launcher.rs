@@ -342,7 +342,7 @@ pub struct Item {
 }
 
 const P_MAX: usize = 5;
-const F_MAX: usize = 6;
+const F_MAX: usize = filesearch::ROWS_MAX; // FILESEARCH (B741): was 6
 const S_MAX: usize = 4;
 const H_MAX: usize = 3;
 const V_MAX: usize = 3;
@@ -371,16 +371,11 @@ fn rank(q: &str, progs: &[Prog], files: &[search::Hit], lru: &[String], help: &[
     n[0] = ps.len();
     out.extend(ps.into_iter().take(P_MAX).map(|x| x.2));
 
-    let mut fs: Vec<(usize, usize, Item)> = Vec::new();
-    for (i, h) in search::filter(files, q, 64).into_iter().enumerate() {
-        let token = alloc::format!("file:{}", h.path);
-        let label = String::from(search::leaf(&h.path));
-        let detail = h.path.clone();
-        fs.push((pos(&token), i, Item { kind: Kind::File, label, detail, target: h.path, token, icon: String::new(), dir: h.dir, launch: None }));
-    }
-    fs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    n[1] = fs.len();
-    out.extend(fs.into_iter().take(F_MAX).map(|x| x.2));
+    // FILESEARCH (B741): the Files section is `filesearch::section` — the name index per keystroke, exact > prefix >
+    // word, recently opened first, `kind:`/`taken:` on the stored facts, at most ROWS_MAX rows (`files` = the walk).
+    let fr = filesearch::section(q, files);
+    n[1] = fr.len();
+    out.extend(fr.into_iter().map(|r| Item { kind: Kind::File, label: String::from(r.leaf()), detail: String::from(r.folder()), token: alloc::format!("file:{}", r.path), target: r.path, icon: r.mime, dir: r.dir, launch: None }));
 
     let mut ss: Vec<(usize, i32, Item)> = Vec::new();
     // HELPSEARCH (B729): the Settings rows by their painted labels first (SETTINGSMAP's one table), then the schema keys
@@ -560,7 +555,7 @@ fn paint(st: &mut St) {
         }
         let ix = pad + 8;
         let iy = y + (lh - ch) / 2;
-        let drew = it.kind == Kind::Program && crate::fs::appres::blit_key_icon(buf, w, h, ix, iy, ch, &it.icon);
+        let drew = (it.kind == Kind::Program && crate::fs::appres::blit_key_icon(buf, w, h, ix, iy, ch, &it.icon)) || (it.kind == Kind::File && filesearch::icon(buf, w, h, ix, iy, ch, &it.icon, it.dir)); // FILESEARCH (B741): the kit icon for the file type
         if !drew {
             let mark = match it.kind {
                 Kind::Program => "P",
@@ -706,6 +701,7 @@ pub fn key_door(ev: crate::pal::Event) -> bool {
                 }
                 b'\r' | b'\n' => {
                     if let Some(it) = take_selected() {
+                        filesearch::latch_reveal(it.kind == Kind::File && super::keymap::shift_held()); // FILESEARCH (B741): Shift-Return reveals in Quarry
                         owe_pick(it);
                     }
                 }
@@ -898,7 +894,7 @@ fn act(it: &Item) -> String {
             }
             None => String::from("refused (no launch)"),
         },
-        Kind::File => open_file(&it.target, it.dir),
+        Kind::File => filesearch::pick(&it.target, it.dir).unwrap_or_else(|| open_file(&it.target, it.dir)), // FILESEARCH (B741): reveal / a folder in Quarry, else the opener
         Kind::Setting => {
             let (tab, ctrl) = super::settings::request_open_at(&it.target);
             alloc::format!("settings tab={} control={} key=system.{}", tab, ctrl, it.target)
@@ -951,18 +947,12 @@ fn rerank() {
     };
     let lru = LRU.lock().clone();
     let help = help_pages(&q);
-    // NAMEINDEX (B432): per keystroke, ONE range scan of the volume's name index; the open-time snapshot is
-    // only the FAT root's (or a still-building index's) fallback.
-    let indexed = if q.is_empty() { None } else { search::query(&q, 64) };
+    // NAMEINDEX (B432) / FILESEARCH (B741): the Files section asks the volume's name index itself (one range scan,
+    // one hold, per keystroke); the open-time snapshot is only the FAT root's (or a still-building index's) fallback.
     let (items, n) = {
         let p = PROGS.lock();
-        match &indexed {
-            Some(f) => rank(&q, &p, f, &lru, &help),
-            None => {
-                let f = FILES.lock();
-                rank(&q, &p, &f, &lru, &help)
-            }
-        }
+        let f = FILES.lock();
+        rank(&q, &p, &f, &lru, &help)
     };
     if let Some(st) = ST.lock().as_mut() {
         if st.query == q {
@@ -1082,3 +1072,8 @@ pub fn ensure_tests() {
     }
 }
 
+// FILESEARCH (rmbp-ledger B741, BP-video-36): the Files section — the name-index engine, the opener's recent list, the
+// filters on the stored facts, Return / Shift-Return and the kit icon. A child module (the `quarry::live::openers` idiom),
+// so the section is one more group of THIS field; CHARTER in its header.
+#[path = "filesearch.rs"]
+pub mod filesearch;
