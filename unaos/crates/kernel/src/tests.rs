@@ -109,7 +109,7 @@ pub fn source_done(bit: u32) {
 
 /// Run one named fixture (`Some`) or all (`None`); returns how many ran.
 pub fn run(name: Option<&str>) -> usize {
-    ensure_shellux(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::sessionwedge::ensure_tests(); // GATESTEAL (B657): `tests gatesteal` (and sessionwedge/setterwedge, which SKIP without an ignition) are reachable on a leg with no session ignition — the lazy registration rode the render task's desktop-phase roll (same-line fold)
+    ensure_shellux(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::sessionwedge::ensure_tests(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::arch::sched::gatesteal2_ensure_tests(); // GATESTEAL (B657): `tests gatesteal` (and sessionwedge/setterwedge, which SKIP without an ignition) are reachable on a leg with no session ignition — the lazy registration rode the render task's desktop-phase roll (same-line fold) GATESTEAL2 (B667): `tests gatesteal2` beside it, same cfg, same reason (same-line fold, code first).
     if RUNNING.swap(true, Ordering::AcqRel) {
         serial_println!(":: TESTS: already running — refused ::");
         return 0;
@@ -146,9 +146,9 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         return;
     }
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
-    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::smallfix7::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] { crate::video::cursor::cursorshape::ensure(); } /* CURSORSHAPE: the module is gated so (cursor.rs tail); ARMVIRT found the ungated call reds every aarch64 kernel without el0 */ // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
+    ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::smallfix7::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); ensure_fpu(); #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] { crate::video::cursor::cursorshape::ensure(); } /* CURSORSHAPE: the module is gated so (cursor.rs tail); ARMVIRT found the ungated call reds every aarch64 kernel without el0 */ // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); #[cfg(target_arch = "x86_64")] crate::loaderstage::ensure_tests(); crate::soundopeners::ensure(); // LOADERSTALL (B490): `tests loader`. FILETYPE (B307): `tests filetype`.
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::wm::k2p::ensure_tests(); // K2P (B671): `tests k2p` — 200 synthetic reports through the input-to-photon carriers (`video/wm.rs` tail). LINE-NEUTRAL append, code before the comment.
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::shotmask::ensure_tests(); crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); crate::video::text::ensure_tests(); crate::video::metrics::ensure_tests(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::menubar::ensure_tests(); // MENUBARSLOTS (B499): `tests menubar`. GLASSEYES (B343): `tests shot`. KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] /* ARMNOEL0: the prefs_client cfg (lib.rs) */ crate::prefs_client::ensure_tests(); #[cfg(feature = "selfdiag")] crate::selfdiag::ensure(); // EXECNAME (B322): `tests exec`. SETTINGSBUS (B337): `tests settingsbus`. SELFDIAG (B324): `tests selfdiag`. (merge12 fold: one line)
     if args.first().copied() == Some("list") {
@@ -172,7 +172,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
@@ -188,7 +188,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -210,7 +210,7 @@ fn ensure_selfinstall() {
     #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); register("install", crate::install::selfinstall::install_selftest); #[cfg(feature = "ahciroot")] register("ahciw", crate::install::ahciroot::ahciw_selftest); #[cfg(all(feature = "ahciroot", feature = "instgui"))] register("instgui", crate::video::instgui::install3::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); register("install", crate::install::selfinstall::install_selftest); register("abimage", crate::install::abimage::selftest); #[cfg(feature = "ahciroot")] register("ahciw", crate::install::ahciroot::ahciw_selftest); #[cfg(all(feature = "ahciroot", feature = "instgui"))] register("instgui", crate::video::instgui::install3::selftest); }
     }
 }
 
@@ -220,7 +220,7 @@ fn ensure_unafsx86() {
     #[cfg(feature = "unafs")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); register("boot80", crate::fs::bootstep::boot80_selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); register("boot80", crate::fs::bootstep::boot80_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("unafslock", crate::fs::unafs::splitread::selftest); } // HIDSTALL2 (B670): `tests unafslock` (LINE-NEUTRAL append, before this comment)
     }
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
@@ -262,7 +262,7 @@ fn ensure_ring3win() {
     #[cfg(target_arch = "x86_64")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); register("window", crate::window2::selftest); } // WINDOW2 (B361): `tests window`
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); register("window", crate::window2::selftest); #[cfg(feature = "wc")] register("applaunch", applaunch_selftest); } // WINDOW2 (B361): `tests window`
     }
 }
 
@@ -430,6 +430,15 @@ fn ensure_ring3abi() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("ring3abi", crate::ring3abi::selftest); }
+    }
+}
+
+/// FPU (rmbp-ledger B666): register `tests fpu` (BIG.ELF's `fpu` verb: two ring-3 tasks keep their XMM/MXCSR across yields) once on x86.
+fn ensure_fpu() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("fpu", crate::arch::sched::fpu::selftest); }
     }
 }
 
@@ -628,4 +637,88 @@ pub fn defer_polled(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
         register(name, f);
     }
     true
+}
+
+// APPLAUNCH (rmbp-ledger B678, BP-bar-7) — TAIL-APPENDED. `tests applaunch`: the SMALLEST windowed ring-3 ELF under
+// `/apps` (sizes from the listing, smallest first; the first whose `.note.unaos.app` declares WINDOWED), launched N
+// times COLD (a fresh process and slot each time, through the operator's own `bg` launcher), each span read from the
+// slot's `[app] … exec->frame ms=` stamp (`procslot::launch::frame_ms`), then the program killed and reaped before the
+// next. Nearest-rank p50/p99 over the N spans against BP-bar-7's 400 ms. SKIP (never a pin) with no panel or no
+// windowed program staged; a launch that never reaches its first frame within 5 s is a FAIL named by count.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn applaunch_selftest() {
+    const N: usize = 5;
+    const BAR_MS: u64 = 400;
+    const WAIT_MS: u64 = 5_000;
+    if !crate::video::WRITER.lock().is_ready() {
+        serial_println!(":: APPLAUNCH: app=- n={} bar_ms={} -> SKIP reason=no-panel ::", N, BAR_MS);
+        return;
+    }
+    let mt = crate::shell::vfs_mount_table();
+    let dir = crate::shell::vfs_path("/apps");
+    let mut cands: alloc::vec::Vec<(u64, alloc::string::String)> = match mt.read_dir(&dir) {
+        Ok(v) => v
+            .into_iter()
+            .filter(|e| matches!(e.kind, crate::fs::vfs::NodeKind::File) && e.size > 0 && e.size as usize <= crate::arch::syscall::user_image_cap())
+            .filter(|e| e.name.len() > 4 && e.name[e.name.len() - 4..].eq_ignore_ascii_case(".ELF"))
+            .map(|e| (e.size, e.name))
+            .collect(),
+        Err(_) => {
+            serial_println!(":: APPLAUNCH: app=- n={} bar_ms={} -> SKIP reason=no-apps-dir ::", N, BAR_MS);
+            return;
+        }
+    };
+    cands.sort();
+    let mut pick: Option<(alloc::string::String, alloc::vec::Vec<u8>)> = None;
+    for (size, leaf) in cands.iter() {
+        let path = format!("{}/{}", dir.trim_end_matches('/'), leaf);
+        if let Ok(b) = mt.read(&path, 0, *size as usize) {
+            if b.len() as u64 == *size && crate::arch::elf::app_flags(&b) & una_abi::APP_FLAG_WINDOWED != 0 {
+                pick = Some((path, b));
+                break;
+            }
+        }
+    }
+    let Some((path, bytes)) = pick else {
+        serial_println!(":: APPLAUNCH: app=- n={} bar_ms={} -> SKIP reason=no-windowed-elf ::", N, BAR_MS);
+        return;
+    };
+    let name = crate::video::wm::program_name(&path);
+    let mut spans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for run in 0..N {
+        match crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[name]) {
+            Ok((pid, slot, _)) => {
+                let dl = crate::arch::ticks() + WAIT_MS;
+                let mut got = None;
+                while crate::arch::ticks() < dl {
+                    got = crate::procslot::launch::frame_ms(slot as usize);
+                    if got.is_some() {
+                        break;
+                    }
+                    crate::arch::sched::yield_now();
+                }
+                let kill = crate::arch::syscall::bg_kill(pid, slot);
+                let _ = crate::arch::syscall::bg_poll(pid, true);
+                serial_println!("[applaunch] run={} app={} bytes={} pid={} slot={} frame_ms={:?} kill={}", run, name, bytes.len(), pid, slot, got, kill);
+                if let Some(ms) = got {
+                    spans.push(ms);
+                }
+            }
+            Err(why) => serial_println!("[applaunch] run={} app={} refused={}", run, name, why),
+        }
+    }
+    spans.sort();
+    let rank = |q: usize| -> Option<u64> {
+        if spans.is_empty() { None } else { Some(spans[((q * spans.len() + 99) / 100).max(1) - 1]) }
+    };
+    let (p50, p99) = (rank(50), rank(99));
+    let show = |v: Option<u64>| v.map_or(alloc::string::String::from("-"), |x| format!("{}", x));
+    let verdict = if spans.len() != N {
+        format!("FAIL reason=frames-{}/{}", spans.len(), N)
+    } else if p99.unwrap_or(u64::MAX) > BAR_MS {
+        alloc::string::String::from("FAIL reason=over-bar")
+    } else {
+        alloc::string::String::from("PASS")
+    };
+    serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
 }

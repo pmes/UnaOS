@@ -4856,7 +4856,7 @@ impl XhciController {
                                 // (BOT completions were already claimed above, before the
                                 // success gate, so only HID interrupt reads arrive here.)
                                 unsafe {
-                                    let slot = &self.slots[slot_id as usize];
+                                    let slot = &self.slots[slot_id as usize]; #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::pal::k2p::decode(); // K2P (B671, BP-input-13): the HID report's decode instant — the first event it pushes carries this stamp to the compositor (`pal::k2p`). ⚠ LINE-NEUTRAL fold, code before the comment.
 
                                     // Compute expected DCI for mouse and keyboard
                                     let mouse_dci = if slot.is_mouse && slot.mouse_ep != 0 {

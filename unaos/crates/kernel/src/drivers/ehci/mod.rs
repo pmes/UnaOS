@@ -14058,7 +14058,7 @@ impl Controller {
                     // pass's own stack scratch on the hand-off arm. `cap` bounds it either way, and on
                     // the hand-off arm `len` is additionally bounded by `ISR_SLOT_LEN` at the producer,
                     // so the slice can never run off either allocation.
-                    let report = core::slice::from_raw_parts(rpt_ptr, cap);
+                    let report = core::slice::from_raw_parts(rpt_ptr, cap); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::pal::k2p::decode(); // K2P (B671, BP-input-13): the HID report's decode instant (boot mouse, keyboard, Wellspring pad) — the first event it pushes carries this stamp to the compositor (`pal::k2p`). ⚠ LINE-NEUTRAL fold, code before the comment.
                     e.reports = e.reports.wrapping_add(1);
                     if let Some(l) = e.layout {
                         if l.vendor_mt {

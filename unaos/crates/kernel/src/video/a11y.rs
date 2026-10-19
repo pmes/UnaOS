@@ -14,10 +14,10 @@
 //! * the MENU BAR (when `menubar::strip_rect` has one — none under Softy) and its title boxes from
 //!   `winmenu::bar_boxes`, THE accessor its painter and its hit test read (the app menu, the published titles, the
 //!   Window menu; the open one SELECTED);
-//! * the DOCK (the taskbar under Softy; `dock::strip_rect`) and one tile per pinned app from the dock's pin table
-//!   (`dock::DP_PINS` x `dp_is_pinned` x `installed_names`). The strip's own tile boxes are the dock's private
-//!   settled model, so a tile carries the strip's rect and [`A11Y_F_PARENT_BOX`]; a running app's tile is its
-//!   window's node below;
+//! * the DOCK (`dock::strip_rect`) and its tiles from `dock::a11y_tiles` — the settled model `press_at` routes over,
+//!   laid out by the same `Layout`, each tile its own box and the painter's caption. Under Softy (the taskbar keeps
+//!   its own boxes) one tile per pinned app from the dock's pin table (`DP_PINS` x `dp_is_pinned` x
+//!   `installed_names`) on the strip's rect with [`A11Y_F_PARENT_BOX`];
 //! * one node per live window row (no compat row, no owner-0 row), FRONT TO BACK (z descending, ties by id —
 //!   the compositor's order read backwards): the role is the OWNER's — a ring-3 program's window, or kernel
 //!   furniture (`is_kernel_owner`) — the name the row's title, else the owner's armed program name; the rect the
@@ -156,10 +156,19 @@ fn build() -> Tree {
     if let Some(dr) = crate::video::dock::strip_rect(pw, ph) {
         let softy = crate::video::look::is_softy();
         let dk = t.push(root, A11Y_ROLE_DOCK, 0, if softy { b"Taskbar" as &[u8] } else { b"Dock" }, dr, WIN_NONE);
-        let installed = crate::video::dock::installed_names();
-        for (i, p) in crate::video::dock::DP_PINS.iter().enumerate() {
-            if crate::video::dock::dp_is_pinned(i) && installed.contains(&p.name) {
-                t.push(dk, A11Y_ROLE_DOCK_TILE, A11Y_F_PARENT_BOX, p.name.as_bytes(), dr, WIN_NONE);
+        let mut tiles = Vec::new();
+        if crate::video::dock::a11y_tiles(pw, ph, &mut tiles) {
+            // The tiles the painter drew and the router hits, each with its own box.
+            for (cap, len, bx) in tiles.iter() {
+                t.push(dk, A11Y_ROLE_DOCK_TILE, 0, &cap[..*len], *bx, WIN_NONE);
+            }
+        } else {
+            // The taskbar (Softy): its tile boxes are its own, so the dock's pin table names the tiles on the strip's rect.
+            let installed = crate::video::dock::installed_names();
+            for (i, p) in crate::video::dock::DP_PINS.iter().enumerate() {
+                if crate::video::dock::dp_is_pinned(i) && installed.contains(&p.name) {
+                    t.push(dk, A11Y_ROLE_DOCK_TILE, A11Y_F_PARENT_BOX, p.name.as_bytes(), dr, WIN_NONE);
+                }
             }
         }
     }

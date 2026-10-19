@@ -3422,6 +3422,26 @@ fn dp_write(mask: u32) -> Result<usize, alloc::string::String> {
     crate::prefs_client::pref_set(crate::prefs::NS, crate::prefs::key::DOCK_PINS, crate::prefs::PrefValue::Str(v)).map(|_| n).map_err(|e| alloc::format!("bus status {}", e)) // SETTINGSBUS (B337): a PrefSet over the bus
 }
 
+/// UNINSTALL (rmbp-ledger B679): the stored `system.dock.pins` text, or the default set rendered when the key is
+/// unset — the list a pin edit starts from (read through the bus, as [`dp_load`]).
+pub fn pins_text() -> alloc::string::String {
+    crate::prefs_client::sys_text(crate::prefs::key::DOCK_PINS).unwrap_or_else(|| dp_render(DP_ALL))
+}
+
+/// UNINSTALL (rmbp-ledger B679): the dock forgets app `name` — its table bit cleared (a table app) and its item
+/// dropped from the stored `system.dock.pins` text (any app: the text is the store, the mask only its parse), the
+/// rest of the list kept in its order. Persisted through the bus like [`dp_write`]. `true` = a pin was removed.
+pub fn unpin_app(name: &str) -> bool {
+    let bit = DP_PINS.iter().position(|s| s.name.eq_ignore_ascii_case(name)).map(|i| 1u32 << i).unwrap_or(0);
+    let had_bit = bit != 0 && DP_MASK.fetch_and(!bit, Ordering::AcqRel) & bit != 0;
+    let text = pins_text();
+    let kept: alloc::vec::Vec<&str> = text.split(|c| c == ',' || c == '\n').map(|t| t.trim()).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(name)).collect();
+    let had_text = text.split(|c| c == ',' || c == '\n').any(|t| t.trim().eq_ignore_ascii_case(name));
+    let saved = if had_text || had_bit { crate::prefs_client::pref_set(crate::prefs::NS, crate::prefs::key::DOCK_PINS, crate::prefs::PrefValue::Str(kept.join(","))).is_ok() } else { true };
+    serial_println!("[dock] uninstall unpin app={} table={} listed={} saved={}", name, had_bit as u8, had_text as u8, saved as u8);
+    (had_bit || had_text) && saved
+}
+
 /// Read `system.dock.pins` into the mask. Unset or no known name = the default set. Returns names loaded (0 = default).
 fn dp_load() -> u32 {
     // SETTINGSBUS (B337): the pins are read with a PrefGet over the bus (the store loads on its first verb).
@@ -4972,7 +4992,7 @@ fn dp_is_window(i: usize) -> bool {
 }
 
 /// The owner of kernel-window pin `i`'s LIVE window, or 0 (atomic reads only: called under the window-table lock).
-/// Settings and Activity share `KERNEL_OWNER_BASE + 7`; each module's own `is_open` disambiguates which is up.
+/// Settings (`KERNEL_OWNER_BASE + 7`) and Activity (`+ 8` since A11YTREE B675; they shared `+ 7` before) each answer through their own module's `is_open`.
 fn dp_window_owner(i: usize) -> u64 {
     match DP_PINS.get(i).map(|s| s.verb) {
         Some("activity") if crate::video::activity::is_open() => crate::video::activity::OWNER,
@@ -5097,5 +5117,40 @@ fn craft_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32, 
         super::text::draw_row(out, l.w, &cap[..cols], bx + PAD(), j - ty0, ink, false, FACE);
     }
     dock2_overlay(out, l, rows, j);
+    true
+}
+
+// A11YTREE (rmbp-ledger B675, BP-bar-22) — the dock's tiles for the accessibility tree (`wm::a11y`): the SAME settled
+// model `press_at` routes over (scan, pins, `settle` without reconciling) laid out by the SAME `Layout::for_glass`, so a
+// reader's tile box is the box the painter drew and the router hits. Captions are the painter's (`+<k>` for the overflow
+// group). TAIL-APPENDED: no line above moves.
+
+/// The dock's tiles on a `pw` x `ph` panel as `(caption, caption length, box)`, written into `out` (cleared here). `false`
+/// with nothing written under the Softy look (the taskbar's tiles are its own) or when there is no strip to lay out.
+pub fn a11y_tiles(pw: usize, ph: usize, out: &mut alloc::vec::Vec<([u8; wm::MAX_TITLE], usize, (usize, usize, usize, usize))>) -> bool {
+    out.clear();
+    if super::look::is_softy() {
+        return false;
+    }
+    let mut rows = ModelBuf::take();
+    let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0)); dp_refresh(&rows, n);
+    let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n);
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); settle(&mut rows, n, false);
+    let Some(l) = Layout::for_glass(n, pw, ph) else { return false };
+    for t in 0..l.n.min(n) {
+        let Some(bx) = l.tile(t) else { break };
+        let mut cap = [0u8; wm::MAX_TITLE];
+        let len = if l.is_overflow(t) {
+            let mut ob = [0u8; 8];
+            let k = overflow_label(l.overflow, &mut ob).min(8);
+            cap[..k].copy_from_slice(&ob[..k]);
+            k
+        } else {
+            let k = rows[t].title_len.min(wm::MAX_TITLE);
+            cap[..k].copy_from_slice(&rows[t].title[..k]);
+            k
+        };
+        out.push((cap, len, bx));
+    }
     true
 }

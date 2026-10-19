@@ -243,3 +243,23 @@ v2 inode ids are physical block ids; `legacy::LegacyVolume` reads it, nothing wr
   `tests/codec_fuzz.rs` (mutated records: never a panic, every refusal typed and field-named).
 * `tools/unafs dump --records <image>` prints every record of a volume, field by field, in this
   page's names and order.
+
+## §R16 The kernel mount lock: what MOUNT guards, and the read that leaves it (HIDSTALL2, rmbp B670)
+
+The kernel keeps ONE live mount of the volume, `MOUNT` (`unaos/crates/kernel/src/fs/unafs.rs:567`), taken
+IRQ-masked by `with_unafs`; every transaction (the lazy bind, a write and its commit, K5B's fused ACL
+persists) runs whole under it, because the in-RAM inode map, refcount map and allocator are one `&mut`
+structure. A file's DATA read no longer does: flight 36 boot 3 measured `[vfs] tx what=read
+path=/apps/AETHER.ELF list_ms=1092` — a 3.2 MB read held MOUNT masked for 1.1 s (LOCKREG `held_max_at=
+unafs.rs:567`, HIDSTALL `masked_max_ms=1092`). `fs::unafs::splitread::read` plans under MOUNT (resolve,
+inode, extents, the root `generation` of §R12, the bound mount's epoch and partition span), reads the
+extents' blocks with MOUNT released through the same block-layer calls the mount's device makes, then
+re-takes MOUNT and checks generation and epoch. The check is sufficient because of this page's format
+rules: a committed block is never written in place, and the blocks of a committed file are re-used
+only after a commit flips the root to a higher generation (§R12), so an unchanged generation means
+the bytes read are the bytes the extents named. Any change, unaligned extent or device refusal runs
+the read again in one hold (`fallbacks=`). `tests unafslock` holds it: `:: UNAFSLOCK: ops=<n>
+held_max_ms=<n> io_under_lock=0 -> PASS ::` (every MOUNT hold of the read and of a concurrent metadata
+loop ≤ 5 ms, bytes equal to a reference read). Built under `wc` on x86; the call site in
+`NativeBackend::read` (`fs/vfs.rs`) is the seat's fold. Writes and directory listings still hold
+MOUNT across their I/O.

@@ -335,7 +335,7 @@ static PRE_HDA: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 /// Run the clean prelude for `action` (`"shutdown"` / `"reboot"`). Idempotent enough: a second call finds nothing to do.
 pub fn prelude(action: &str) {
     use core::sync::atomic::Ordering;
-    let _ = action;
+    let _ = action; #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] crate::install::abimage::note_user_shutdown(action); // ABIMAGE (B683): the user's Restart / Shut Down (shell verbs, crystal menu) arms a staged image — `SHUTDOWN.REC why=user`, before the dirent flush below. LINE-NEUTRAL append, code first
     let flushed = crate::fs::fat::dirent_pending();
     crate::fs::fat::flush_pending_dirent_by("shutdown");
     PRE_FLUSH.store(flushed, Ordering::Relaxed);
