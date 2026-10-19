@@ -18,9 +18,12 @@
 // Exit status: low byte = the pass bits (0x1F = all five; `tests ring3win` reads 0x0F, `tests window` 0x10),
 // bits 8..30 = the checksum's bits 8..30.
 // One line to the console says the same in words.
+//
+// FPU (rmbp-ledger B666): `big fpu` runs ONLY the FPU probe instead (`fpu_verb`, below; `tests fpu` reads it).
 extern crate alloc;
 
-use una_abi::{ENOMEM, SYS_EXIT, SYS_SBRK, SYS_WRITE};
+use core::sync::atomic::{AtomicU32, Ordering};
+use una_abi::{ENOMEM, SYS_EXIT, SYS_SBRK, SYS_THREAD_EXIT, SYS_THREAD_JOIN, SYS_THREAD_SPAWN, SYS_WRITE, SYS_YIELD};
 
 #[inline(always)]
 unsafe fn sys1(n: u64, a0: u64) -> u64 {
@@ -144,6 +147,9 @@ impl Line {
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    if una_abi::args().and_then(|a| a.get(1)) == Some(b"fpu".as_slice()) {
+        fpu_verb(); // FPU (B666): never returns
+    }
     let mut bits = 0u64;
     // 1. static: the BSS must arrive zeroed, then fill + checksum.
     let arr = unsafe { &mut *core::ptr::addr_of_mut!(ARR) };
@@ -215,6 +221,182 @@ pub extern "C" fn _start() -> ! {
     l.put(b"\n");
     write(&l.b[..l.n]);
     exit(((ck as u64) & 0x7FFF_FF00) | bits)
+}
+
+// --- FPU (rmbp-ledger B666): `big fpu` — the x87/SSE context survives a reschedule, per task ---
+//
+// Two ring-3 tasks of this process — the program (task 0) and one SYS_THREAD_SPAWN worker on its core (task 1) — each run
+// FPU_ROUNDS rounds of: write a round-unique pattern, load it into xmm0..xmm15 and the task's OWN MXCSR (task 0 round-to-
+// nearest, task 1 round-toward-zero), SYS_YIELD, store the sixteen registers and MXCSR back, compare. The kernel saves the
+// image at every switch-back and SCRUBS the registers to the initial image, so a missing restore reads back zeros, and a
+// restore of the wrong task reads the other pattern. A round in which the other task's counter moved across the yield is an
+// observed interleave. Then task 0 keeps an f64 accumulator in registers across yields and checks it bit-exactly against
+// the same arithmetic with no yields.
+//
+// Exit status: low byte = 0x80 (the verb ran — its SSE instructions did not #UD) | 0x01 task-0 xmm | 0x02 task-1 xmm |
+// 0x04 both MXCSRs | 0x08 float math | 0x10 worker joined; bits 8..23 = observed interleaves.
+const FPU_ROUNDS: u32 = 64;
+const MXCSR_NEAREST: u32 = 0x1F80;
+const MXCSR_TOWARD_ZERO: u32 = 0x7F80;
+
+/// One task's buffers: the pattern loaded, the registers stored back, MXCSR in and out (offsets the asm names).
+#[repr(C, align(16))]
+struct FpuCtx {
+    pat: [u8; 256],
+    out: [u8; 256],
+    mx_in: u32,
+    mx_out: u32,
+    _pad: [u32; 2],
+}
+static mut FPU_CTX: [FpuCtx; 2] = [const { FpuCtx { pat: [0; 256], out: [0; 256], mx_in: 0, mx_out: 0, _pad: [0; 2] } }; 2];
+static FPU_TICK: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static FPU_WORKER: AtomicU32 = AtomicU32::new(0);
+
+#[repr(C, align(16))]
+struct WorkerStack([u8; 16 * 1024]);
+static mut FPU_STACK: WorkerStack = WorkerStack([0; 16 * 1024]);
+
+#[inline(always)]
+unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let r: u64;
+    unsafe {
+        core::arch::asm!("syscall", inlateout("rax") n => r, inlateout("rdi") a0 => _, inlateout("rsi") a1 => _,
+            inlateout("rdx") a2 => _, inlateout("r10") a3 => _, lateout("rcx") _, lateout("r11") _, lateout("r8") _,
+            lateout("r9") _, options(nostack))
+    };
+    r
+}
+
+/// SYS_YIELD with NO vector clobbers: whatever the compiler keeps in xmm across it must survive the kernel.
+#[inline(always)]
+fn yield_keep() {
+    unsafe {
+        core::arch::asm!("syscall", inlateout("rax") SYS_YIELD => _, lateout("rdi") _, lateout("rsi") _, lateout("rdx") _,
+            lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _, lateout("r10") _, options(nostack))
+    };
+}
+
+/// Task `t`'s rounds: `(xmm ok, mxcsr ok, interleaves)`.
+fn fpu_rounds(t: usize) -> (bool, bool, u32) {
+    let ctx = unsafe { core::ptr::addr_of_mut!(FPU_CTX[t]) };
+    let mx = if t == 0 { MXCSR_NEAREST } else { MXCSR_TOWARD_ZERO };
+    let (mut xmm_ok, mut mx_ok, mut seen) = (true, true, 0u32);
+    for r in 0..FPU_ROUNDS {
+        unsafe {
+            for (k, b) in (*ctx).pat.iter_mut().enumerate() {
+                *b = (k as u8).wrapping_mul(13) ^ (0x5A * t as u8 + 1) ^ (r as u8).wrapping_mul(29);
+            }
+            (*ctx).out = [0; 256];
+            (*ctx).mx_in = mx;
+            (*ctx).mx_out = 0;
+        }
+        let other = FPU_TICK[1 - t].load(Ordering::Acquire);
+        unsafe {
+            core::arch::asm!(
+                "ldmxcsr [{c} + 512]",
+                "movdqa xmm0, [{c}]", "movdqa xmm1, [{c} + 16]", "movdqa xmm2, [{c} + 32]", "movdqa xmm3, [{c} + 48]",
+                "movdqa xmm4, [{c} + 64]", "movdqa xmm5, [{c} + 80]", "movdqa xmm6, [{c} + 96]", "movdqa xmm7, [{c} + 112]",
+                "movdqa xmm8, [{c} + 128]", "movdqa xmm9, [{c} + 144]", "movdqa xmm10, [{c} + 160]", "movdqa xmm11, [{c} + 176]",
+                "movdqa xmm12, [{c} + 192]", "movdqa xmm13, [{c} + 208]", "movdqa xmm14, [{c} + 224]", "movdqa xmm15, [{c} + 240]",
+                "mov eax, {y}",
+                "syscall",
+                "movdqa [{c} + 256], xmm0", "movdqa [{c} + 272], xmm1", "movdqa [{c} + 288], xmm2", "movdqa [{c} + 304], xmm3",
+                "movdqa [{c} + 320], xmm4", "movdqa [{c} + 336], xmm5", "movdqa [{c} + 352], xmm6", "movdqa [{c} + 368], xmm7",
+                "movdqa [{c} + 384], xmm8", "movdqa [{c} + 400], xmm9", "movdqa [{c} + 416], xmm10", "movdqa [{c} + 432], xmm11",
+                "movdqa [{c} + 448], xmm12", "movdqa [{c} + 464], xmm13", "movdqa [{c} + 480], xmm14", "movdqa [{c} + 496], xmm15",
+                "stmxcsr [{c} + 516]",
+                c = in(reg) ctx,
+                y = const SYS_YIELD,
+                // `out`, not `lateout`: the base register must not be one the syscall (or the kernel's return) writes.
+                out("rax") _, out("rcx") _, out("r11") _, out("rdi") _, out("rsi") _, out("rdx") _,
+                out("r8") _, out("r9") _, out("r10") _,
+                out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _, out("xmm5") _, out("xmm6") _,
+                out("xmm7") _, out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _, out("xmm12") _, out("xmm13") _,
+                out("xmm14") _, out("xmm15") _,
+                options(nostack),
+            );
+        }
+        FPU_TICK[t].fetch_add(1, Ordering::Release);
+        if FPU_TICK[1 - t].load(Ordering::Acquire) != other {
+            seen += 1;
+        }
+        unsafe {
+            if (*ctx).out != (*ctx).pat {
+                xmm_ok = false;
+            }
+            // MXCSR may gain sticky exception flags (bits 0..5) from nothing here; compare control bits only.
+            if (*ctx).mx_out & !0x3F != mx & !0x3F {
+                mx_ok = false;
+            }
+        }
+    }
+    unsafe { core::arch::asm!("ldmxcsr [{}]", in(reg) &MXCSR_NEAREST, options(nostack, readonly)) };
+    (xmm_ok, mx_ok, seen)
+}
+
+/// The worker (task 1): its rounds, then its verdict in FPU_WORKER (bit 31 = done), then SYS_THREAD_EXIT.
+extern "C" fn fpu_worker(_arg: u64) -> ! {
+    let (x, m, seen) = fpu_rounds(1);
+    FPU_WORKER.store(1 << 31 | (x as u32) << 30 | (m as u32) << 29 | seen.min(0xFFFF), Ordering::Release);
+    unsafe { sys1(SYS_THREAD_EXIT, 0) };
+    loop {}
+}
+
+/// f64 arithmetic with `yield_keep` between steps (the accumulator may live in xmm across each).
+#[inline(never)]
+fn fpu_math(yields: bool) -> u64 {
+    let mut acc = core::hint::black_box(1.0f64);
+    let mut s = core::hint::black_box(0.0f32);
+    for i in 0..32u32 {
+        acc = acc * 1.000_123_4 + (i as f64) / 7.0;
+        s = s * 0.5 + (i as f32) * 0.25;
+        if yields {
+            yield_keep();
+        }
+    }
+    acc.to_bits() ^ (s.to_bits() as u64) << 1
+}
+
+fn fpu_verb() -> ! {
+    let top = unsafe { core::ptr::addr_of_mut!(FPU_STACK) } as u64 + 16 * 1024;
+    let h = unsafe { sys4(SYS_THREAD_SPAWN, fpu_worker as *const () as u64, top, 1, 0) } as i64;
+    let (x0, m0, seen0) = fpu_rounds(0);
+    let mut bits = 0x80u64;
+    if x0 {
+        bits |= 1;
+    }
+    if h >= 0 && unsafe { sys1(SYS_THREAD_JOIN, h as u64) } as i64 == 0 {
+        bits |= 0x10;
+    }
+    let w = FPU_WORKER.load(Ordering::Acquire);
+    let done = w >> 31 != 0;
+    if done && w & 1 << 30 != 0 {
+        bits |= 2;
+    }
+    if m0 && done && w & 1 << 29 != 0 {
+        bits |= 4;
+    }
+    let math = fpu_math(true) == fpu_math(false);
+    if math {
+        bits |= 8;
+    }
+    let seen = seen0 + if done { w & 0xFFFF } else { 0 };
+    let mut l = Line { b: [0; 200], n: 0 };
+    l.put(b"FPU: tasks=");
+    l.dec(1 + (bits & 0x10 != 0) as u64);
+    l.put(b" rounds=");
+    l.dec(FPU_ROUNDS as u64);
+    l.put(b" interleaves=");
+    l.dec(seen as u64);
+    l.put(b" xmm=");
+    l.put(if bits & 3 == 3 { b"ok".as_slice() } else { b"bad".as_slice() });
+    l.put(b" mxcsr=");
+    l.put(if bits & 4 != 0 { b"ok".as_slice() } else { b"bad".as_slice() });
+    l.put(b" math=");
+    l.put(if math { b"ok".as_slice() } else { b"bad".as_slice() });
+    l.put(b"\n");
+    write(&l.b[..l.n]);
+    exit((seen.min(0xFFFF) as u64) << 8 | bits)
 }
 
 #[panic_handler]

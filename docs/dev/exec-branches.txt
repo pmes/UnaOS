@@ -543,8 +543,26 @@ refs/remotes/origin/exec-rmbp-local-keplercut 5b1be6a9 FOLDED-BY-HAND 45e03964 2
 refs/heads/exec-rmbp-contrast   a18f9237 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-winkey     0ffa91b6 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/remotes/origin/exec-orin22-keep13      51f06bea WIP-SURVIVOR - 2026-10-19
-refs/heads/exec-rmbp-fpu        e2a6a6ca IN-FLIGHT cloud wave36 FPU (B666)
+refs/heads/exec-rmbp-fpu        d4cd016f FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-gatesteal2 b3543ae5 IN-FLIGHT cloud wave36 GATESTEAL2 (B657 B667) (Opus)
 refs/heads/exec-rmbp-winedge2   b3543ae5 IN-FLIGHT cloud wave36 WINEDGE2 (B659 B668)
 refs/heads/exec-rmbp-wifimac    b3543ae5 IN-FLIGHT cloud wave36 WIFIMAC (B669)
 refs/heads/exec-rmbp-hidstall2b  b3543ae5 IN-FLIGHT cloud wave36 HIDSTALL2 (B670)
+refs/heads/exec-rmbp-k2p 5e9b7026 IN-FLIGHT cloud wave36 K2P
+refs/heads/exec-rmbp-idlenet 5e9b7026 IN-FLIGHT cloud wave36 IDLENET
+refs/heads/exec-rmbp-settingsmap 5e9b7026 IN-FLIGHT cloud wave36 SETTINGSMAP
+refs/heads/exec-rmbp-toastcap 5e9b7026 IN-FLIGHT cloud wave36 TOASTCAP
+refs/heads/exec-rmbp-a11ytree 5e9b7026 IN-FLIGHT cloud wave36 A11YTREE
+refs/heads/exec-rmbp-glyphs 5e9b7026 IN-FLIGHT cloud wave36 GLYPHS
+refs/heads/exec-rmbp-memline 5e9b7026 IN-FLIGHT cloud wave36 MEMLINE
+refs/heads/exec-rmbp-applaunch 5e9b7026 IN-FLIGHT cloud wave36 APPLAUNCH
+refs/heads/exec-rmbp-uninstall 5e9b7026 IN-FLIGHT cloud wave36 UNINSTALL
+refs/heads/exec-rmbp-nameindextx 5e9b7026 IN-FLIGHT cloud wave36 NAMEINDEXTX
+refs/heads/exec-rmbp-reask 5e9b7026 IN-FLIGHT cloud wave36 REASK
+refs/heads/exec-rmbp-oldest 5e9b7026 IN-FLIGHT cloud wave36 OLDEST
+refs/heads/exec-rmbp-abimage 5e9b7026 IN-FLIGHT cloud wave36 ABIMAGE
+refs/heads/exec-rmbp-volkey 5e9b7026 IN-FLIGHT cloud wave36 VOLKEY
+refs/heads/exec-rmbp-wxn64 5e9b7026 IN-FLIGHT cloud wave36 WXN64
+refs/heads/exec-rmbp-shimmeridle 5e9b7026 IN-FLIGHT cloud wave36 SHIMMERIDLE
+refs/heads/exec-rmbp-uvccam 5e9b7026 IN-FLIGHT cloud wave36 UVCCAM
+refs/heads/exec-rmbp-ptpcam 5e9b7026 IN-FLIGHT cloud wave36 PTPCAM
