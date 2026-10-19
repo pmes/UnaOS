@@ -191,7 +191,7 @@ fn band_run(job: &BandJob) {
         for y in y0..y1 {
             let off = (y * c.stride + d.x0) * c.bpp;
             if off + seg <= c.back_len {
-                c.front.blit(off, &back[off..off + seg]);
+                super::blitter::a11yfilter::each(c.front.info().pixel_format, c.bpp, &back[off..off + seg], |i, s| c.front.blit(off + i, s)); // A11YFILTERS (B705)
             }
         }
         let span_start = (y0 * c.stride + d.x0) * c.bpp;
@@ -2014,7 +2014,7 @@ impl Screen {
                         let off = (y * stride + xs) * bpp;
                         let seg = (gap_end - xs) * bpp;
                         if off + seg <= self.back_store.len() {
-                            self.front.blit(off, &self.back_store[off..off + seg]);
+                            super::blitter::a11yfilter::each(self.info.pixel_format, bpp, &self.back_store[off..off + seg], |i, c| self.front.blit(off + i, c)); // A11YFILTERS (B705): the desktop layer's span filtered at the copy (BP-video-20)
                             flushed += seg as u64;
                             // WC-I — this span reached glass; fold it into the present's union.
                             // Inside the length guard, so a span the bounds check rejected is not
@@ -2096,7 +2096,7 @@ impl Screen {
                         x >= bx && x < bx.saturating_add(bw) && y >= by && y < by.saturating_add(bh)
                     })
                 },
-                |x, y| back.get_pixel(x, y),
+                |x, y| back.get_pixel(x, y).map(super::blitter::a11yfilter::color), // A11YFILTERS (B705): the save-under is what the panel holds, filtered
             );
         }
         // ORIN-VPAR — the three aarch64 parity verdicts, drained here because this is the one site in

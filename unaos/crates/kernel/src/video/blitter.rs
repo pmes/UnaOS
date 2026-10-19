@@ -71,6 +71,10 @@ pub struct Rect {
 pub enum Op {
     Copy,
     CopyAlpha,
+    /// A11YFILTERS (B705): a straight copy with the Accessibility colour filter applied per pixel on the way
+    /// ([`a11yfilter::each`]; the source is never written). CPU only: the copy engines refuse it (`Unsupported`,
+    /// they accept `Copy` alone) and [`run_on`] re-runs it on the CPU.
+    CopyFilter,
 }
 
 pub struct BlitJob<'a> {
@@ -165,6 +169,15 @@ impl Blitter for CpuBlitter {
             let src = unsafe { core::slice::from_raw_parts((job.src.fb.base_addr() + s0) as *const u8, span) };
             if job.op == Op::CopyAlpha {
                 copy_alpha(&job.dst.fb, src, spitch, d0, dpitch, r.w, r.h);
+                continue;
+            }
+            // A11YFILTERS (B705): filtered row by row through a stack chunk, never through WCPAR's bands (a band
+            // worker copies bytes verbatim). Same `kcomp_row` per chunk the plain row loop below uses.
+            if job.op == Op::CopyFilter {
+                for y in 0..r.h {
+                    let (d, py) = (d0 + y * dpitch, r.dy + y);
+                    a11yfilter::each(di.pixel_format, bpp, &src[y * spitch..y * spitch + rb], |i, c| super::wm::kcomp_row(&job.dst.fb, d + i, c, py));
+                }
                 continue;
             }
             // WCPAR — the band fan-out is this blitter's internal strategy, exactly where the inline
@@ -367,7 +380,9 @@ pub fn cycles_to_us(dt: u64) -> u64 {
 pub fn present_band(win: u32, fb: &FrameBuffer, layer: &FrameBuffer, dx: usize, dy: usize, w: usize, h: usize) -> bool {
     ignite();
     let rect = [Rect { sx: 0, sy: 0, dx, dy, w, h }];
-    let job = BlitJob { src: Surface::ram(*layer), dst: Surface::scanout(*fb), rects: &rect, op: Op::Copy };
+    // A11YFILTERS (B705): with a colour filter on, the present is a `CopyFilter` (BP-video-20: filtered at the copy).
+    let op = if a11yfilter::active() { a11yfilter::note_present(); Op::CopyFilter } else { Op::Copy };
+    let job = BlitJob { src: Surface::ram(*layer), dst: Surface::scanout(*fb), rects: &rect, op };
     let t0 = crate::arch::now_cycles();
     let (r, fell) = run_on(selected(), &job);
     let cyc = crate::arch::now_cycles().saturating_sub(t0);
@@ -541,3 +556,9 @@ pub fn arm_bcs() {
 pub fn demote_bcs() {
     SEL_BCS.store(false, Release);
 }
+
+// ---- A11YFILTERS (B705) — the Accessibility colour filter every scanout writer applies at the copy ----------------
+// Declared from this file (not video/mod.rs, the module root every image lexes — MOTIONKIT's `draw::motion` idiom) so
+// no line of the root moves; it rides every compositing build, as this blitter does.
+#[path = "a11yfilter.rs"]
+pub mod a11yfilter;

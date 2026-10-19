@@ -165,6 +165,11 @@ pub static SCHEMA: &[Key] = &[
         doc: "The pointer's size as a multiple of its 1:1 size: the sprite's block scale is multiplied by it (halves on the slider), capped at the sprite's box (`ui::SCALE_MAX`, x4 at 1:1, x2 at 2:1) (A11YPANE, B655).",
     },
     Key {
+        ns: "system", key: "accessibility.cvd", kind: Kind::Enum(&["none", "protan", "deutan", "tritan", "grayscale"]), default: Default::Str("none"),
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel scanout writers (`video/a11yfilter.rs` through `blitter::a11yfilter::set`: the window present, the strips, the erase fill, the cursor sprite, `Screen::flush`), Settings > Accessibility",
+        doc: "A colour-vision filter over the whole glass: the Machado 2009 severity-1.0 protanopia, deuteranopia or tritanopia matrix, or Rec. 709 grayscale, applied by every writer to the scanout at its copy, never to a source (A11YFILTERS, B705).",
+    },
+    Key {
         ns: "system", key: "accessibility.forced_colors", kind: Kind::Bool, default: Default::Bool(false),
         writers: OP, reader: "aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`forced-colors`)",
         doc: "A user palette replaces page colours: the `forced-colors: active` media feature, and a 3px focus ring (AETHERA11Y, SR119).",
@@ -173,6 +178,11 @@ pub static SCHEMA: &[Key] = &[
         ns: "system", key: "accessibility.increase_contrast", kind: Kind::Bool, default: Default::Bool(false),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs` `tok`: `palette_core::contrast`'s token set in place of the standard pairs), Settings > Accessibility (`settings::increase_contrast`)",
         doc: "High contrast on the glass (DESIGN-LANGUAGE §2.3): the secondary ink reads as the primary and every hairline as the control line (A11YPANE, B655). The web's own switch is `accessibility.contrast`.",
+    },
+    Key {
+        ns: "system", key: "accessibility.invert", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel scanout writers (`video/a11yfilter.rs` through `blitter::a11yfilter::set`), Settings > Accessibility",
+        doc: "Invert every colour on the glass (255 minus each channel, after the colour filter), applied by every writer to the scanout at its copy (A11YFILTERS, B705).",
     },
     Key {
         ns: "system", key: "accessibility.reduce_motion", kind: Kind::Bool, default: Default::Bool(false),

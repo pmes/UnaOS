@@ -57,6 +57,21 @@ pub fn reduced() -> bool {
     crate::video::settings::reduce_motion()
 }
 
+/// A11YFILTERS (B705) — THE motion seam: every animation duration is read through here, `ms` while motion is full,
+/// 0 under Reduce motion (a zero duration is a one-frame cut: [`Glides::to`] jumps, [`Tween::progress`] is done at
+/// once). The Settings pill, toggle knob and segmented thumb read `dur(BASE)`; the desktop's shimmer is off on the
+/// same latch (`desktop::shimmer_idle`). Wire: `[a11y] … motion=<full|reduced>`.
+#[inline]
+pub fn dur(ms: u32) -> u32 {
+    dur_for(ms, reduced())
+}
+
+/// [`dur`] for a given latch (pure; `tests a11yfilters` reads both ends).
+#[inline]
+pub const fn dur_for(ms: u32, reduced: bool) -> u32 {
+    if reduced { 0 } else { ms }
+}
+
 // ── the curves ──────────────────────────────────────────────────────────────────────────────────────────────────
 
 /// A cubic Bézier `(0,0) (x1,y1) (x2,y2) (1,1)` at `s` (all Q16): the x or the y coordinate, by the two control
