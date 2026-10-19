@@ -425,7 +425,7 @@ static LATCH_MS: AtomicU64 = AtomicU64::new(0);
 /// Which clock moved the stamp: the civil clock's own counter, or the fallback.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StampSrc {
-    /// `clock::mono_ticks()` is `Some`: `logts_now` already extrapolated the anchor (aarch64 CNTPCT, x86 invariant TSC).
+    /// `clock::mono_ticks()` is `Some`: `logts_now` already extrapolated the anchor (aarch64 CNTPCT, x86 invariant TSC or the calibrated ms tick — CLOCKX86 B618).
     Counter,
     /// The civil clock has no counter: the anchor's second plus whole `arch::ms()` seconds since its latch.
     ArchMs,

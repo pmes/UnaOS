@@ -10718,8 +10718,8 @@ const CLOCK_X1_SKEW_DIV: u64 = 20;
 /// costs zero and the same fact is proven. It is not a knob: nothing is optional here, the witness
 /// is simply paid later.
 pub fn clock_x1_witness() {
-    // Frozen path: no invariant/calibrated TSC. `uptime_secs()` is `None` exactly when
-    // `clock::monotonic()` is `None`, so this is the honest silent gate — and it leaves the
+    // Frozen path: no invariant/calibrated TSC. `uptime_secs()` gates on the TSC leg only (CLOCKX86 B618: the
+    // civil clock may advance on the ms tick while this stays `None`), so this is the honest silent gate — and it leaves the
     // deferred half disarmed, which is why a machine with no invariant TSC prints NEITHER line.
     let u1 = match crate::clock::uptime_secs() {
         Some(u) => u,

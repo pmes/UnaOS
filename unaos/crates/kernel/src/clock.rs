@@ -11,10 +11,14 @@
 //!
 //! CLOCK-X1 lights the x86_64 twin: the invariant TSC (`rdtsc`), calibrated once at boot against
 //! the ACPI PM timer (`apic::calibrate` → `apic::tsc_hz`), is the free-running counter here, gated
-//! on CPUID's invariant-TSC bit (`apic::tsc_invariant`, leaf 0x8000_0007 EDX[8]). Where the CPU
-//! does NOT advertise an invariant TSC, or calibration never ran / was rejected, `monotonic()`
-//! returns `None` and a set clock stays honestly FROZEN at its seeded value (the pre-CLOCK-X1
-//! behaviour) — the kernel never serves a non-invariant or uncalibrated TSC as a clock.
+//! on CPUID's invariant-TSC bit (`apic::tsc_invariant`, leaf 0x8000_0007 EDX[8]). CLOCKX86 (B618):
+//! where the CPU does NOT advertise an invariant TSC — measured, not hypothetical: the image-26 KVM
+//! vCPU reads `[clock] source=apic hz=1996137621 invariant=0` (docs/dev/evidence/qemu-image26/
+//! serial.log:60) — `monotonic()` serves CLOCKCORE's calibrated 1 kHz millisecond tick
+//! (`arch::ms()`, freq 1000) instead, so the civil clock advances there too. It returns `None` (a
+//! set clock stays honestly FROZEN at its seed) only when neither counter is live: an invariant TSC
+//! not yet calibrated, or a non-invariant machine whose APIC timer was never calibrated. The kernel
+//! never serves a non-invariant TSC, nor an uncalibrated tick, as a clock.
 //!
 //! Range and resolution follow FAT's on-disk format (the consumer this arc serves): years
 //! 1980..=2107, 2-second mtime resolution (the packing truncates the low second bit). Internally
@@ -29,8 +33,8 @@ use crate::sync::Mutex;
 struct Anchor {
     /// Seconds since 1980-01-01 00:00:00 at the moment of `set`.
     base_secs: u64,
-    /// The architectural counter at the moment of `set` (0 where no counter is available — a
-    /// non-invariant or uncalibrated x86 TSC, where `monotonic()` is `None`).
+    /// The architectural counter at the moment of `set` (0 where no counter is available — x86
+    /// before calibration, where `monotonic()` is `None`).
     anchor_ticks: u64,
 }
 
@@ -38,8 +42,8 @@ static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
 
 /// The free-running monotonic counter and its frequency, where the architecture provides one.
 /// aarch64: `CNTPCT_EL0`/`CNTFRQ_EL0` (EL-independent, never stops — the JD3 mechanism).
-/// x86_64: the invariant TSC (`rdtsc`) at its boot-calibrated frequency, gated on the CPUID
-/// invariant-TSC bit and a successful calibration; `None` otherwise (honest frozen clock).
+/// x86_64: the invariant TSC (`rdtsc`) at its boot-calibrated frequency where CPUID advertises
+/// one, else the calibrated millisecond tick (CLOCKX86); `None` only when neither is live.
 #[cfg(target_arch = "aarch64")]
 fn monotonic() -> Option<(u64, u64)> {
     let f = crate::arch::timer::cntfrq();
@@ -49,22 +53,64 @@ fn monotonic() -> Option<(u64, u64)> {
     Some((crate::arch::timer::cntpct(), f))
 }
 
-/// CLOCK-X1 — the x86 twin. `rdtsc` is only served as a clock when the CPU advertises an INVARIANT
-/// TSC (constant rate across P-/C-/T-states, never stops — CPUID leaf 0x8000_0007 EDX[8]) AND the
-/// boot calibration against the ACPI PM timer produced a frequency (`apic::tsc_hz() != 0`). Either
-/// missing → `None`, i.e. the clock stays frozen at its seed rather than run on an untrustworthy or
-/// unscaled counter. Cheap and lock-free (one CPUID + one atomic load + one `rdtsc`), so it is safe
-/// on the shell-verb and FAT-stamp hot paths.
+/// CLOCKX86 (B618) — which counter backs the x86 civil clock this instant. Invariance is a CPUID
+/// constant, so a boot is either a `Tsc` machine or an `Ms` machine for its whole life and one
+/// anchor never mixes the two tick domains; the only transition is `Frozen` → live at calibration.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Civil {
+    /// The invariant TSC at its calibrated Hz.
+    Tsc(u64),
+    /// No invariant TSC: CLOCKCORE's millisecond clock (`arch::ms()`), the BSP's APIC tick.
+    Ms,
+    /// Neither counter is live (calibration has not run, or was aborted/rejected).
+    Frozen,
+}
+
+/// CLOCK-X1/CLOCKX86 — classify. The TSC is served only when the CPU advertises an INVARIANT TSC
+/// (constant rate across P-/C-/T-states, never stops — CPUID leaf 0x8000_0007 EDX[8]) AND the boot
+/// calibration against the ACPI PM timer stored its frequency (`apic::tsc_hz() != 0`). A
+/// non-invariant TSC is never served (it drifts with the core frequency); there the clock rides
+/// `arch::ms()` — `clockcore::ms()`, which on such a machine is `APIC_TICKS`, the BSP heartbeat —
+/// but only once `apic::apic_timer_hz() != 0`: `calibrate` stores it before re-arming the heartbeat
+/// at 1 kHz (apic.rs:301-302), and before that the tick is uncalibrated (~0.8 ms under QEMU,
+/// x86_64/mod.rs:118-120), so an uncalibrated tick is `Frozen`, never a clock.
+#[cfg(target_arch = "x86_64")]
+fn civil() -> Civil {
+    if crate::arch::apic::tsc_invariant() {
+        match crate::arch::apic::tsc_hz() {
+            0 => Civil::Frozen, // invariant TSC, calibration never ran or was rejected
+            hz => Civil::Tsc(hz),
+        }
+    } else if crate::arch::apic::apic_timer_hz() != 0 {
+        Civil::Ms // non-invariant TSC (the KVM vCPU above): the calibrated 1 kHz tick
+    } else {
+        Civil::Frozen
+    }
+}
+
+/// CLOCK-X1 — the x86 twin, CLOCKX86-extended. `Tsc` → `(rdtsc, tsc_hz)`; `Ms` → `(arch::ms(), 1000)`;
+/// `Frozen` → `None`, i.e. the clock stays at its seed rather than run on an untrustworthy or
+/// unscaled counter. Cheap and lock-free (one CPUID + atomic loads + one counter read), so it is safe
+/// on the shell-verb, FAT-stamp and log-prefix hot paths.
 #[cfg(target_arch = "x86_64")]
 fn monotonic() -> Option<(u64, u64)> {
-    if !crate::arch::apic::tsc_invariant() {
-        return None; // non-invariant TSC: never serve it as a clock
+    match civil() {
+        Civil::Tsc(hz) => Some((crate::arch::now_cycles(), hz)),
+        Civil::Ms => Some((crate::arch::ms(), 1000)),
+        Civil::Frozen => None,
     }
-    let hz = crate::arch::apic::tsc_hz();
-    if hz == 0 {
-        return None; // calibration never ran or was rejected — stay honestly frozen
+}
+
+/// CLOCKX86 witness word — `tsc`, `ms` or `frozen`: which counter the civil clock extends its anchor
+/// by right now. For the CLOCKCORE `[clock] source=` boot line (`civil=<word>`).
+#[cfg(target_arch = "x86_64")]
+pub fn civil_counter() -> &'static str {
+    match civil() {
+        Civil::Tsc(_) => "tsc",
+        Civil::Ms => "ms",
+        Civil::Frozen => "frozen",
     }
-    Some((crate::arch::now_cycles(), hz))
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -199,8 +245,16 @@ const UNIX_1980: u64 = 315_532_800;
 /// 0 at boot and never stops — the same JD3 mechanism `now()` extends from). x86_64 (CLOCK-X1): the
 /// boot-calibrated invariant TSC / `tsc_hz` → `Some` once calibrated, else `None` and the `uptime`
 /// verb prints an honest "no calibrated counter on this arch". Purely additive: it reads the same `monotonic()` source but
-/// touches neither the seed anchor nor the `now()`/`fat_stamp()` logic.
+/// touches neither the seed anchor nor the `now()`/`fat_stamp()` logic. CLOCKX86 leaves this on the TSC leg only: the
+/// CLOCK-X1 boot witness (`syscall::clock_x1_witness`) gates on it and prints "TSC invariant", so the ms tick must
+/// not arm it.
 pub fn uptime_secs() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !matches!(civil(), Civil::Tsc(_)) {
+            return None;
+        }
+    }
     monotonic().map(|(ticks, freq)| ticks / freq)
 }
 
@@ -211,7 +265,7 @@ pub fn now() -> Option<WallTime> {
     let a = guard.as_ref()?;
     let elapsed = match monotonic() {
         Some((p, f)) => p.wrapping_sub(a.anchor_ticks) / f,
-        None => 0, // no invariant/calibrated counter: frozen at the seeded value, documented above
+        None => 0, // no calibrated counter (x86 pre-calibration): frozen at the seeded value, documented above
     };
     Some(WallTime::from_secs(a.base_secs.saturating_add(elapsed)))
 }
@@ -223,7 +277,7 @@ pub fn now() -> Option<WallTime> {
 // CLOCK-1 adds the arch-agnostic *civil* clock the rest of the kernel wants: a single Unix-second
 // anchor plus the source that set it, so `time`, log timestamps, and fs mtimes can eventually all
 // read one clock. It shares the SAME arch monotonic seam as JD17 (`monotonic()` above: aarch64
-// CNTPCT/CNTFRQ, x86_64 the CLOCK-X1 invariant TSC), so it works on both arches with no new plumbing.
+// CNTPCT/CNTFRQ, x86_64 the CLOCK-X1 invariant TSC or the CLOCKX86 ms tick), so it works on both arches with no new plumbing.
 //
 // This arc lands the SERVICE + the SNTP migration (pi/genet's PI-NET-16 wall-clock forwards here).
 // Log-timestamp and fs-mtime adoption are each a named follow-up (see docs/dev/OS/02_KERNEL_CORE):
@@ -259,7 +313,7 @@ static UNIX_ANCHOR: Mutex<Option<UnixAnchor>> = Mutex::new(None);
 
 /// Read the shared arch monotonic counter (ticks only), for callers that want to capture the counter
 /// "in the same breath" as a network/operator timestamp and pass it to `set_anchor`. `None` where the
-/// arch provides no trustworthy counter (a non-invariant/uncalibrated x86 TSC, or CNTFRQ==0).
+/// arch provides no trustworthy counter (x86 before calibration, or CNTFRQ==0).
 pub fn mono_ticks() -> Option<u64> {
     monotonic().map(|(ticks, _)| ticks)
 }
@@ -276,12 +330,22 @@ pub fn mono_ticks() -> Option<u64> {
 /// "ms since power-on, firmware included" and disagrees with every BPACE/GPACE `t=` by seconds. A
 /// line printed before the origin exists (or before calibration) gets `None`, which the prefix
 /// renders as an explicit unknown rather than a fabricated zero.
+///
+/// CLOCKX86: on an x86 `Ms` machine the ticks are `arch::ms()`, not TSC cycles, so `origin_cycles()`
+/// (a TSC reading) is not theirs to subtract. The tick counts from 0 at its arming, which is after
+/// the `entry` stamp, so the entry stamp's own ms is 0 and the tick IS the since-entry figure.
 #[cfg(feature = "logts")]
 pub fn logts_now() -> (Option<u64>, Option<u64>) {
     let mono_ms = monotonic().and_then(|(ticks, freq)| {
         let origin = crate::bootpace::origin_cycles();
         if origin == 0 {
             return None; // no `entry` stamp yet — "since entry" does not exist to measure
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if civil() == Civil::Ms {
+                return Some(ticks); // already ms since the tick's arming (entry ms = 0)
+            }
         }
         Some(ticks.wrapping_sub(origin).saturating_mul(1000) / freq)
     });
@@ -314,7 +378,7 @@ pub fn unix_now() -> Option<u64> {
     let a = guard.as_ref()?;
     let elapsed = match monotonic() {
         Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
-        None => 0, // no invariant/calibrated counter: frozen at the anchored value
+        None => 0, // no calibrated counter (x86 pre-calibration): frozen at the anchored value
     };
     Some(a.base_unix.saturating_add(elapsed))
 }
@@ -337,7 +401,7 @@ pub fn try_unix_now() -> Option<u64> {
     let a = guard.as_ref()?;
     let elapsed = match monotonic() {
         Some((ticks, freq)) => ticks.wrapping_sub(a.anchor_ticks) / freq,
-        None => 0, // no invariant/calibrated counter: frozen at the anchored value
+        None => 0, // no calibrated counter (x86 pre-calibration): frozen at the anchored value
     };
     Some(a.base_unix.saturating_add(elapsed))
 }

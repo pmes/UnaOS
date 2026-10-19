@@ -280,10 +280,11 @@ pub fn boot_witness() {
     }
     let cores = online().len();
     serial_println!(
-        "[clock] source={} hz={} invariant={} per_core_tick=1 cores={} skew_max_cycles={} sync_timeouts={} offsets={} (CLOCKCORE)",
+        "[clock] source={} hz={} invariant={} civil={} per_core_tick=1 cores={} skew_max_cycles={} sync_timeouts={} offsets={} (CLOCKCORE)",
         if tsc_clock() { "tsc" } else { "apic" },
         crate::arch::apic::tsc_hz(),
         crate::arch::apic::tsc_invariant() as u8,
+        crate::clock::civil_counter(), // CLOCKX86 (B618): tsc | ms | frozen — which counter the civil clock advances on
         cores,
         SKEW_MAX.load(Relaxed),
         SYNC_TIMEOUTS.load(Relaxed),
