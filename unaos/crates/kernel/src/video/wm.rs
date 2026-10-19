@@ -30586,6 +30586,8 @@ fn app_first_present(owner: u64) {
     }
     let Some((name, len, ms)) = crate::procslot::launch::take((owner - 1) as usize) else { return };
     serial_println!("[app] {} exec->frame ms={}", core::str::from_utf8(&name[..len]).unwrap_or("?"), ms);
+}
+
 // =================================================================================================
 // K2P (rmbp-ledger B671, BP-bar-5) — THE COMPOSITOR HALF OF THE INPUT-TO-PHOTON STAMP.
 // =================================================================================================

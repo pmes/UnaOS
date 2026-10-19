@@ -548,21 +548,21 @@ refs/heads/exec-rmbp-gatesteal2 272ace72 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-winedge2   d399b021 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-wifimac    25bcc638 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-hidstall2b 941715a8 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-k2p 5e9b7026 IN-FLIGHT cloud wave36 K2P
+refs/heads/exec-rmbp-k2p 78f2e833 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-idlenet 5e9b7026 IN-FLIGHT cloud wave36 IDLENET
-refs/heads/exec-rmbp-settingsmap 5e9b7026 IN-FLIGHT cloud wave36 SETTINGSMAP
-refs/heads/exec-rmbp-toastcap 5e9b7026 IN-FLIGHT cloud wave36 TOASTCAP
+refs/heads/exec-rmbp-settingsmap 74775a01 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-toastcap 050749b0 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-a11ytree 5e9b7026 IN-FLIGHT cloud wave36 A11YTREE
-refs/heads/exec-rmbp-glyphs 5e9b7026 IN-FLIGHT cloud wave36 GLYPHS
-refs/heads/exec-rmbp-memline 5e9b7026 IN-FLIGHT cloud wave36 MEMLINE
-refs/heads/exec-rmbp-applaunch 5e9b7026 IN-FLIGHT cloud wave36 APPLAUNCH
-refs/heads/exec-rmbp-uninstall 5e9b7026 IN-FLIGHT cloud wave36 UNINSTALL
-refs/heads/exec-rmbp-nameindextx 5e9b7026 IN-FLIGHT cloud wave36 NAMEINDEXTX
+refs/heads/exec-rmbp-glyphs e0932932 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-memline 8133fe47 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-applaunch b55a7bc2 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-uninstall 09eec873 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-nameindextx 4fca865b FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-reask 5e9b7026 IN-FLIGHT cloud wave36 REASK
-refs/heads/exec-rmbp-oldest 5e9b7026 IN-FLIGHT cloud wave36 OLDEST
-refs/heads/exec-rmbp-abimage 5e9b7026 IN-FLIGHT cloud wave36 ABIMAGE
+refs/heads/exec-rmbp-oldest afe12146 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-abimage d218b9bc FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-volkey 5e9b7026 IN-FLIGHT cloud wave36 VOLKEY
 refs/heads/exec-rmbp-wxn64 5e9b7026 IN-FLIGHT cloud wave36 WXN64
-refs/heads/exec-rmbp-shimmeridle 5e9b7026 IN-FLIGHT cloud wave36 SHIMMERIDLE
+refs/heads/exec-rmbp-shimmeridle 72f50c42 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-uvccam 5e9b7026 IN-FLIGHT cloud wave36 UVCCAM
 refs/heads/exec-rmbp-ptpcam 5e9b7026 IN-FLIGHT cloud wave36 PTPCAM
