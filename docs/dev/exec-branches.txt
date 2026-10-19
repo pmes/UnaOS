@@ -606,7 +606,7 @@ refs/heads/exec-rmbp-net6grant     86048eb9 FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-uacmic        b71c7fa8 IN-FLIGHT cloud wave36 UACMIC
 refs/heads/exec-rmbp-rawcolor      b71c7fa8 IN-FLIGHT cloud wave36 RAWCOLOR
 refs/heads/exec-rmbp-hwreport      b71c7fa8 IN-FLIGHT cloud wave36 HWREPORT
-refs/heads/exec-rmbp-updateui      b71c7fa8 IN-FLIGHT cloud wave36 UPDATEUI
+refs/heads/exec-rmbp-updateui      16ffa390 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-mtpwrite      b71c7fa8 IN-FLIGHT cloud wave36 MTPWRITE
 refs/heads/exec-rmbp-lock2         b71c7fa8 IN-FLIGHT cloud wave36 LOCK2
 refs/heads/exec-rmbp-diskreserve   b71c7fa8 IN-FLIGHT cloud wave36 DISKRESERVE
@@ -618,3 +618,4 @@ refs/heads/exec-rmbp-stagewindow  658415ad IN-FLIGHT cloud wave36 STAGEWINDOW (B
 refs/heads/exec-rmbp-crawlb       3287fafc IN-FLIGHT cloud wave36 CRAWLB (the fs/storage/security crawl fixes)
 refs/heads/exec-rmbp-oneinstance  bfc63a86 IN-FLIGHT cloud wave36 ONEINSTANCE (B734)
 refs/heads/exec-rmbp-crawlc       394e9c16 IN-FLIGHT cloud wave36 CRAWLC (the drivers/audio/loader crawl fixes)
+refs/heads/exec-rmbp-pinchzoom    996f1f6f IN-FLIGHT cloud wave36 PINCHZOOM (B735)
