@@ -777,9 +777,25 @@ impl<D: BlockDevice> UnaFS<D> {
         self.root.generation
     }
 
-    /// Free blocks in the current (in-flight) view.
+    /// Free blocks in the current (in-flight) view that a DATA write may use:
+    /// the refcount map's free count less the metadata reserve
+    /// (DISKRESERVE SR152) — the number a user is shown. The root record keeps
+    /// the map's own count (§R12).
     pub fn free_blocks(&self) -> u64 {
-        self.refmap.free_blocks()
+        self.refmap.free_blocks().saturating_sub(self.reserve_blocks())
+    }
+
+    /// DISKRESERVE (SR152): the metadata reserve of this volume, in blocks
+    /// (`refmap::reserve_for` of the committed size).
+    pub fn reserve_blocks(&self) -> u64 {
+        crate::refmap::reserve_for(self.superblock.block_count)
+    }
+
+    /// DISKRESERVE (SR152): which refusal the last `FileSystemError::NoSpace`
+    /// was — `Reserve` (a data write at the reserve; deletes still work) or
+    /// `Full`. Kept across the failed operation's unwind.
+    pub fn no_space_kind(&self) -> Option<crate::refmap::NoSpaceKind> {
+        self.refmap.no_space_kind()
     }
 
     /// Commit-path benchmark counters.
@@ -1102,6 +1118,30 @@ impl<D: BlockDevice> UnaFS<D> {
 
     fn alloc_block(&mut self) -> Result<u64, FileSystemError> {
         self.refmap.allocate(&mut self.device).ok_or(FileSystemError::NoSpace)
+    }
+
+    /// DISKRESERVE (SR152): a file DATA block — refused at the metadata
+    /// reserve; every other allocation (`alloc_block`) may spend it.
+    fn alloc_data_block(&mut self) -> Result<u64, FileSystemError> {
+        let reserve = self.reserve_blocks();
+        self.refmap.allocate_data(&mut self.device, reserve).ok_or(FileSystemError::NoSpace)
+    }
+
+    /// DISKRESERVE (SR152): run one public mutation; when it fails AFTER it
+    /// changed a count or took an inode id (the refcount map's epoch moved
+    /// and changes are still staged — an inner unwind already reloaded
+    /// otherwise — or the inode map grew), unwind to the
+    /// committed root as `create_files_batch` does. A refusal that staged
+    /// nothing (a missing name, a taken name) unwinds nothing, so an
+    /// auto-commit-off caller keeps its staged work on a plain refusal.
+    fn txn_guard<T>(&mut self, op: impl FnOnce(&mut Self) -> Result<T, FileSystemError>) -> Result<T, FileSystemError> {
+        let (epoch, ids) = (self.refmap.epoch(), self.imap.len());
+        let r = op(self);
+        let grew = self.imap.len() != ids;
+        if r.is_err() && (self.refmap.epoch() != epoch || grew) && (self.refmap.staged() || grew) {
+            self.txn_unwind();
+        }
+        r
     }
 
     /// Write a freshly allocated block, counting it for the bench.
@@ -1429,6 +1469,10 @@ impl<D: BlockDevice> UnaFS<D> {
         &mut self,
         attributes: BTreeMap<String, AttributeValue>,
     ) -> Result<u64, FileSystemError> {
+        self.txn_guard(|fs| fs.create_inode_staged(attributes))
+    }
+
+    fn create_inode_staged(&mut self, attributes: BTreeMap<String, AttributeValue>) -> Result<u64, FileSystemError> {
         let facts: Vec<(String, AttributeValue)> =
             attributes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let id = self.create_inode_inner(FileKind::File, attributes, 0, None)?;
@@ -1566,7 +1610,7 @@ impl<D: BlockDevice> UnaFS<D> {
             buf[(from - block_start) as usize..(to - block_start) as usize].copy_from_slice(src);
 
             // NEVER overwrite in place: fresh block, release the old one.
-            let nb = self.alloc_block()?;
+            let nb = self.alloc_data_block()?;
             self.write_fresh(nb, &buf)?;
             if old != 0 {
                 self.refmap.decref(&mut self.device, old);
@@ -1596,6 +1640,10 @@ impl<D: BlockDevice> UnaFS<D> {
         offset: u64,
         data: &[u8],
     ) -> Result<(), FileSystemError> {
+        self.txn_guard(|fs| fs.write_data_staged(inode_id, offset, data))
+    }
+
+    fn write_data_staged(&mut self, inode_id: u64, offset: u64, data: &[u8]) -> Result<(), FileSystemError> {
         self.write_data_inner(inode_id, offset, data)?;
         self.maybe_commit()
     }
@@ -1608,6 +1656,10 @@ impl<D: BlockDevice> UnaFS<D> {
     /// a partial tail block with the bytes past `new_size` zeroed, so a later
     /// grow reads zeros, never the old tail. One transaction.
     pub fn truncate_data(&mut self, inode_id: u64, new_size: u64) -> Result<(), FileSystemError> {
+        self.txn_guard(|fs| fs.truncate_data_staged(inode_id, new_size))
+    }
+
+    fn truncate_data_staged(&mut self, inode_id: u64, new_size: u64) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(inode_id)?;
         if new_size == inode.size {
             return Ok(());
@@ -1840,10 +1892,18 @@ impl<D: BlockDevice> UnaFS<D> {
     }
 
     pub fn mkdir(&mut self, parent_id: u64, name: String) -> Result<u64, FileSystemError> {
+        self.txn_guard(|fs| fs.mkdir_staged(parent_id, name))
+    }
+
+    fn mkdir_staged(&mut self, parent_id: u64, name: String) -> Result<u64, FileSystemError> {
         self.add_entry(parent_id, name, FileKind::Directory)
     }
 
     pub fn create_file(&mut self, parent_id: u64, name: String) -> Result<u64, FileSystemError> {
+        self.txn_guard(|fs| fs.create_file_staged(parent_id, name))
+    }
+
+    fn create_file_staged(&mut self, parent_id: u64, name: String) -> Result<u64, FileSystemError> {
         self.add_entry(parent_id, name, FileKind::File)
     }
 
@@ -2109,6 +2169,10 @@ impl<D: BlockDevice> UnaFS<D> {
         key: String,
         value: AttributeValue,
     ) -> Result<(), FileSystemError> {
+        self.txn_guard(|fs| fs.set_attribute_staged(inode_id, key, value))
+    }
+
+    fn set_attribute_staged(&mut self, inode_id: u64, key: String, value: AttributeValue) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(inode_id)?;
 
         // The value being replaced (if any) leaves the index: read it BEFORE
@@ -2220,6 +2284,10 @@ impl<D: BlockDevice> UnaFS<D> {
     /// fail with `NotFound` (the map slot is cleared; logical ids are never
     /// recycled, so a stale id can never alias a NEW file).
     pub fn unlink(&mut self, parent_id: u64, name: &str) -> Result<u64, FileSystemError> {
+        self.txn_guard(|fs| fs.unlink_staged(parent_id, name))
+    }
+
+    fn unlink_staged(&mut self, parent_id: u64, name: &str) -> Result<u64, FileSystemError> {
         let mut entries = self.ls(parent_id)?;
         let pos = entries
             .iter()
@@ -2318,6 +2386,10 @@ impl<D: BlockDevice> UnaFS<D> {
     /// BEFORE calling this. A second copy of the rule here is how two divergent
     /// ACLs happen.
     pub fn rmdir(&mut self, parent_id: u64, name: &str) -> Result<u64, FileSystemError> {
+        self.txn_guard(|fs| fs.rmdir_staged(parent_id, name))
+    }
+
+    fn rmdir_staged(&mut self, parent_id: u64, name: &str) -> Result<u64, FileSystemError> {
         let mut entries = self.ls(parent_id)?;
         let pos = entries
             .iter()
@@ -2399,6 +2471,10 @@ impl<D: BlockDevice> UnaFS<D> {
         new_parent_id: u64,
         new_name: &str,
     ) -> Result<(), FileSystemError> {
+        self.txn_guard(|fs| fs.rename_staged(parent_id, old_name, new_parent_id, new_name))
+    }
+
+    fn rename_staged(&mut self, parent_id: u64, old_name: &str, new_parent_id: u64, new_name: &str) -> Result<(), FileSystemError> {
         let same_dir = parent_id == new_parent_id;
         if same_dir && old_name == new_name {
             return Ok(());
@@ -2482,6 +2558,10 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Remove attribute `key` from `inode_id`: the inline or spilled value
     /// and every catalog entry for the (inode, key) pair go, atomically.
     pub fn remove_attribute(&mut self, inode_id: u64, key: &str) -> Result<(), FileSystemError> {
+        self.txn_guard(|fs| fs.remove_attribute_staged(inode_id, key))
+    }
+
+    fn remove_attribute_staged(&mut self, inode_id: u64, key: &str) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(inode_id)?;
         if !inode.attributes.contains_key(key) && !inode.large_attributes.contains_key(key) {
             return Err(FileSystemError::AttributeNotFound);
@@ -2793,7 +2873,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 self.active_slot = loaded.active_slot;
                 self.imap = loaded.imap;
                 self.imap_tree = loaded.imap_tree;
-                self.refmap = loaded.refmap;
+                self.refmap = loaded.refmap.carrying(&self.refmap);
                 self.refmap.set_budget(self.map_budget);
                 self.migrate_pending = loaded.migrate;
                 if loaded.grow_lag {
@@ -3777,6 +3857,10 @@ impl<D: BlockDevice> UnaFS<D> {
     /// facts). A v3–v5 volume has no meta trailer, so there the times are not kept, as on every write.
     /// One transaction.
     pub fn set_times(&mut self, inode_id: u64, ctime: u64, mtime: u64, atime: u64) -> Result<(), FileSystemError> {
+        self.txn_guard(|fs| fs.set_times_staged(inode_id, ctime, mtime, atime))
+    }
+
+    fn set_times_staged(&mut self, inode_id: u64, ctime: u64, mtime: u64, atime: u64) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(inode_id)?;
         inode.ctime = ctime;
         inode.mtime = mtime;
@@ -3898,7 +3982,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// transaction in flight).
     pub fn grow(&mut self, new_block_count: u64) -> Result<GrowReport, FileSystemError> {
         let from = self.superblock.block_count;
-        let free_before = self.refmap.free_blocks();
+        let free_before = self.free_blocks();
         if new_block_count < from {
             return Err(SuperblockError::Geometry("grow refuses a shrink").into());
         }
@@ -3960,7 +4044,7 @@ impl<D: BlockDevice> UnaFS<D> {
             from,
             to: new_block_count,
             free_before,
-            free_after: self.refmap.free_blocks(),
+            free_after: self.free_blocks(),
         })
     }
 

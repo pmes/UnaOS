@@ -66,6 +66,32 @@ const RPL: usize = REFS_PER_LEAF as usize;
 /// may exceed it for the length of one transaction.
 pub const DEFAULT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
+/// DISKRESERVE (SR152): the metadata reserve — blocks a DATA allocation may
+/// not take, so a full volume can still unlink, truncate and rename (each a
+/// copy-on-write of directory records, inodes and the two maps, which needs
+/// fresh blocks before the commit frees the old ones). 2 % of the volume,
+/// at least [`RESERVE_MIN`], at most [`RESERVE_MAX`] blocks — and never more
+/// than an eighth of a toy volume (a 48-block test image keeps room for data;
+/// a volume of 512 blocks or more gets the full 64-block floor).
+pub const RESERVE_MIN: u64 = 64;
+/// DISKRESERVE (SR152): the reserve's ceiling (16 MiB of 4096 B blocks).
+pub const RESERVE_MAX: u64 = 4096;
+
+/// DISKRESERVE (SR152): the reserve for a volume of `block_count` blocks.
+pub fn reserve_for(block_count: u64) -> u64 {
+    (block_count / 50).clamp(RESERVE_MIN, RESERVE_MAX).min(block_count / 8)
+}
+
+/// DISKRESERVE (SR152): which refusal the last `NoSpace` was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoSpaceKind {
+    /// A DATA allocation refused because the free count is at the reserve:
+    /// metadata (unlink, truncate, rename, directory records) still allocates.
+    Reserve,
+    /// No allocatable block at all (or an unreadable leaf): every allocation fails.
+    Full,
+}
+
 /// Cache counters (the bench and the kernel witness read these).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MapStats {
@@ -123,6 +149,11 @@ pub struct RefMap {
     /// The failed-unwind fail-closed state: nothing is allocatable.
     poisoned: bool,
     stats: MapStats,
+    /// DISKRESERVE (SR152): every count change bumps it; a caller compares it
+    /// across an operation to learn whether the operation staged anything.
+    epoch: u64,
+    /// DISKRESERVE (SR152): the kind of the last refused allocation.
+    short: Option<NoSpaceKind>,
 }
 
 impl RefMap {
@@ -148,6 +179,8 @@ impl RefMap {
             fault: None,
             poisoned: false,
             stats: MapStats::default(),
+            epoch: 0,
+            short: None,
         })
     }
 
@@ -359,6 +392,7 @@ impl RefMap {
     /// leaf's used/busy and the map's used total exact.
     fn set_entry(&mut self, leaf: u64, i: usize, new: u32) {
         let in_range = i < self.in_range(leaf);
+        self.epoch = self.epoch.wrapping_add(1);
         let p = self.pages.get_mut(&leaf).expect("resident page");
         let old = p.cur[i];
         let fz = p.frozen.as_ref().map(|f| f[i]).unwrap_or(old);
@@ -394,6 +428,7 @@ impl RefMap {
     /// refuses).
     pub fn allocate<D: BlockDevice>(&mut self, device: &mut D) -> Option<u64> {
         if self.poisoned || self.fault.is_some() {
+            self.short = Some(NoSpaceKind::Full);
             return None;
         }
         let end = self.limit.min(self.block_count);
@@ -406,6 +441,7 @@ impl RefMap {
                 continue;
             }
             if !self.ensure(device, leaf) {
+                self.short = Some(NoSpaceKind::Full);
                 return None;
             }
             let stop = (end - base).min(REFS_PER_LEAF) as usize;
@@ -432,7 +468,44 @@ impl RefMap {
             b = base + REFS_PER_LEAF;
         }
         self.hint = self.hint.max(end);
+        self.short = Some(NoSpaceKind::Full);
         None
+    }
+
+    /// DISKRESERVE (SR152): allocate a DATA block — refused (`None`, kind
+    /// [`NoSpaceKind::Reserve`]) while the current view's free count is at or
+    /// below `reserve`; otherwise exactly [`allocate`](Self::allocate).
+    /// Metadata keeps calling `allocate`, which may spend the reserve to zero.
+    pub fn allocate_data<D: BlockDevice>(&mut self, device: &mut D, reserve: u64) -> Option<u64> {
+        if self.free_blocks() <= reserve {
+            self.short = Some(NoSpaceKind::Reserve);
+            return None;
+        }
+        self.allocate(device)
+    }
+
+    /// DISKRESERVE (SR152): the kind of the last refused allocation.
+    pub fn no_space_kind(&self) -> Option<NoSpaceKind> {
+        self.short
+    }
+
+    /// DISKRESERVE (SR152): the count-change counter (see the field).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// DISKRESERVE (SR152): whether any leaf holds a change since the last
+    /// committed root (false right after a commit or a reload).
+    pub fn staged(&self) -> bool {
+        !self.tree.dirty.is_empty()
+    }
+
+    /// DISKRESERVE (SR152): a map reloaded by the failed-transaction unwind
+    /// keeps the refusal kind of the map it replaces, so the caller of the
+    /// failed operation can still read which `NoSpace` it was.
+    pub fn carrying(mut self, prev: &RefMap) -> Self {
+        self.short = prev.short;
+        self
     }
 
     /// Increment a block's (current) refcount. Out-of-range ids are ignored

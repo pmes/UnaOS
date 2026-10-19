@@ -420,3 +420,32 @@ Proofs: `unaos/libs/fs/unafs/tests/versions.rs` (ten writes keep eight with thei
 oldest anywhere; remount; restore round-trips; unlink releases all; a reproduction of the pre-B714 inode
 decode opens every inode block of a versioned volume — inline and extent-backed-after-spill — stamped 7);
 kernel `tests fileversions` (`:: FILEVERSIONS: writes=10 kept=8 restore=ok bound=ok v7reader=ok -> PASS ::`).
+
+## §R17 The metadata reserve and the failed-write unwind (DISKRESERVE, SR152)
+
+No record changes; this is allocator policy over §R13. A copy-on-write volume needs FRESH blocks to
+delete: an unlink, a truncate and a rename each rewrite a directory record, an inode and the dirty
+leaves of both maps before the commit (§R12) frees the old blocks. So a volume that data filled to the
+last block could refuse the delete that would empty it. The allocator keeps a RESERVE for that:
+
+* `refmap::reserve_for(block_count)` = 2 % of the volume, at least 64 and at most 4096 blocks, and never
+  more than an eighth of a toy volume (under 512 blocks).
+* A DATA block (the bytes of a file, `write_data`: the only caller of `RefMap::allocate_data`) is refused
+  while the current view's free count is at or below the reserve. Every other allocation (inodes,
+  directory records, the catalog and its B+trees, spill blocks, the reclaim queue, the snapshot index,
+  the maps, a truncate's tail CoW) may spend the reserve to zero.
+* The refusal is `FileSystemError::NoSpace` (the one variant every caller already maps to `ENOSPC`);
+  `UnaFS::no_space_kind()` says which: `Reserve` (data at the reserve; deletes still work) or `Full`
+  (no allocatable block at all). The kind survives the unwind below.
+* `UnaFS::free_blocks()` is the USABLE count, the reserve excluded: the number the kernel prints
+  (`[fs] full … free_kb=`) and the bar shows. The root record's `free_blocks` (§R12) keeps the map's
+  own count. `tools/unafs stat` prints `volume blocks= free= reserve=`.
+
+A failed public mutation (`write_data`, `truncate_data`, `create_inode`, `mkdir`, `create_file`,
+`set_attribute`, `remove_attribute`, `set_times`, `unlink`, `rmdir`, `rename`) that changed a count or
+took an inode id is unwound to the committed root (`txn_unwind`, the reload `create_files_batch`,
+`snapshot_create` and the commit already used), so no later commit persists half of it. A refusal that
+staged nothing (a missing name, a taken name) unwinds nothing. As with `create_files_batch`, with
+auto-commit off the unwind discards everything staged since the last commit. Proofs:
+`tests/reserve_logic.rs` (`failed_write_unwinds_to_committed_maps`,
+`full_volume_still_deletes_renames_truncates`).
