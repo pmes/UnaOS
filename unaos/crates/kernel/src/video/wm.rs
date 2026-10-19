@@ -31005,6 +31005,10 @@ pub mod focussteal {
     static ARMS: crate::sync::Mutex<alloc::vec::Vec<Arm>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
     /// The owner [`judge`] most recently held (0 = none) — for the seam's weak idle grant ([`held_now`]).
     static LAST_HELD: AtomicU64 = AtomicU64::new(0);
+    /// RAISEVERB (B722): the owner most recently launched by the user's verb (0 = none) and when — the raise
+    /// verb's "the user asked for this program" leg. Kept apart from [`ARMS`], which the first map consumes.
+    static VERB_OWNER: AtomicU64 = AtomicU64::new(0);
+    static VERB_T: AtomicU64 = AtomicU64::new(0);
 
     /// `spawn_focus_arm`'s fold: record the arming with its cause. The spawner is the caller's slot when
     /// the spawn runs on a ring-3 process's CR3 (`SYS_SPAWN_PATH`); a kernel spawn has none.
@@ -31025,6 +31029,10 @@ pub mod focussteal {
             }
         };
         let rec = Arm { owner, t_ms: crate::arch::ms(), cause, spawner, verdict: 0 };
+        if cause == Cause::Verb {
+            VERB_T.store(rec.t_ms, Ordering::Relaxed);
+            VERB_OWNER.store(owner, Ordering::Release);
+        }
         let mut a = ARMS.lock();
         match a.iter().position(|r| r.owner == owner) {
             Some(i) => a[i] = rec,
@@ -31103,6 +31111,7 @@ pub mod focussteal {
 
     /// `spawn_focus_forget`'s fold: drop `owner`'s arming unjudged (slot teardown; owners are recycled).
     pub fn forget(owner: u64) {
+        let _ = VERB_OWNER.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed);
         let mut a = ARMS.lock();
         if let Some(i) = a.iter().position(|r| r.owner == owner) {
             a.swap_remove(i);
@@ -31115,15 +31124,39 @@ pub mod focussteal {
         owner != 0 && LAST_HELD.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
 
-    /// A window asks to be raised (the policy a ring-3 raise verb calls; none exists at B698): only the
-    /// owner that already holds focus is answered yes; any other gets the pulse, not the focus.
+    /// A window asks to be raised (the policy `BUS_VERB_WINDOW_RAISE` calls, RAISEVERB B722): answered yes only
+    /// when the user is talking to `owner` — it already holds focus, or the user's verb launched it within
+    /// [`VERB_WINDOW_MS`]; any other gets the pulse, not the focus. A yes is the caller's to grant (both halves).
     pub fn raise_request(owner: u64) -> bool {
         if owner != 0 && owner == super::focus_asid() {
+            serial_println!("[wm] raise owner={} focus=given cause=focused", owner);
+            return true;
+        }
+        if owner != 0
+            && VERB_OWNER.load(Ordering::Acquire) == owner
+            && crate::arch::ms().wrapping_sub(VERB_T.load(Ordering::Relaxed)) <= VERB_WINDOW_MS
+        {
+            serial_println!("[wm] raise owner={} focus=given {}", owner, Cause::Verb.token());
             return true;
         }
         serial_println!("[wm] raise owner={} focus=held {}", owner, Cause::Unsolicited.token());
         super::attention(owner, "for=raise");
         false
+    }
+
+    /// RAISEVERB (B722): `BUS_VERB_WINDOW_RAISE`'s body, after the arch seam resolved the window id. `caller` =
+    /// the asking slot's owner (`slot + 1`), `win_owner` = the named window's owner (0 = a free id). Another
+    /// owner's window is -EPERM and touches nothing (no pulse: the asker is not the one the user would look
+    /// for); the caller's own goes to [`raise_request`]. `Ok(true)` = given (the seam grants both halves).
+    pub fn raise_verb(caller: u64, win_owner: u64) -> Result<bool, i64> {
+        if caller == 0 || win_owner == 0 {
+            return Err(una_abi::EBADF);
+        }
+        if win_owner != caller {
+            serial_println!("[wm] raise owner={} refused=EPERM win_owner={}", caller, win_owner);
+            return Err(una_abi::EPERM);
+        }
+        Ok(raise_request(caller))
     }
 }
 

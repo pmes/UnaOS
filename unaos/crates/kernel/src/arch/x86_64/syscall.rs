@@ -25032,7 +25032,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // by-name delete and `SYS_RENAME` call — so these legs cannot drift from the syscall's, there
         // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "wc")] { crate::video::dialog::bus_fulfil(hdr.verb, row as u64 + 1, body) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(row), row as u64 + 1, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "wc", feature = "quarry"))] { crate::video::dnd::bus_drop_get(row as u64 + 1, body, &mut text) } #[cfg(not(all(feature = "wc", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(row, cgen, body), una_abi::BUS_VERB_A11Y_TREE => { #[cfg(feature = "wc")] { crate::video::wm::a11y::bus_tree(pref_caller_in_session(row), body, &mut text) } #[cfg(not(feature = "wc"))] { EINVAL } } // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this row (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key) A11YTREE (B675): verb 25, the accessibility tree from `wm::a11y` under the caller's session test; LINE-NEUTRAL fold, code before this line's first `//`.
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "wc")] { crate::video::dialog::bus_fulfil(hdr.verb, row as u64 + 1, body) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(row), row as u64 + 1, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "wc", feature = "quarry"))] { crate::video::dnd::bus_drop_get(row as u64 + 1, body, &mut text) } #[cfg(not(all(feature = "wc", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(row, cgen, body), una_abi::BUS_VERB_A11Y_TREE => { #[cfg(feature = "wc")] { crate::video::wm::a11y::bus_tree(pref_caller_in_session(row), body, &mut text) } #[cfg(not(feature = "wc"))] { EINVAL } } una_abi::BUS_VERB_WINDOW_RAISE => { #[cfg(feature = "wc")] { busx_window_raise(row, body, &mut text) } #[cfg(not(feature = "wc"))] { EINVAL } } // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this row (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key) A11YTREE (B675): verb 25, the accessibility tree from `wm::a11y` under the caller's session test; LINE-NEUTRAL fold, code before this line's first `//`. RAISEVERB (B722): verb 26, the caller's own window forward under FOCUSSTEAL's rule (`busx_window_raise`, file tail); LINE-NEUTRAL fold, code before this line's first `//`.
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
@@ -31845,4 +31845,37 @@ fn winresize_cursor_leg(w: u32, probes: &[(i32, i32, u8); 8], content: (i32, i32
         );
     }
     (ok, cursor::shape_count())
+}
+
+// RAISEVERB (rmbp-ledger B722; BP-video-23, BP-bar-18) — TAIL-APPENDED, so no line above moves. `BUS_VERB_WINDOW_RAISE`
+// (26) for the caller's row: the body names a window id (`SYS_WIN_CREATE`'s), resolved under `WINDOWS` (IRQ-masked,
+// held only for the read) to its owner; the policy is `wm::focussteal::raise_verb` (EPERM for another's window, the
+// pulse or the grant otherwise), called with `WINDOWS` released. A grant is BOTH halves, in the order every focus
+// owner uses (`user_input_set_active`, then `wm::focus_changed`); the input ring is reset only on a real focus
+// ARRIVAL, so a raise by the window that already holds the keyboard drops none of its queued keys.
+#[cfg(feature = "wc")]
+fn busx_window_raise(row: usize, body: &[u8], text: &mut alloc::vec::Vec<u8>) -> i64 {
+    let Some(win) = una_abi::window_raise_body_parse(body) else { return EINVAL };
+    let owner = row as u64 + 1;
+    let win_owner = {
+        let _irq = IrqGuard::mask_save();
+        let t = WINDOWS.lock();
+        match t.get(win as usize) {
+            Some(e) if e.owner != WIN_OWNER_FREE => e.owner as u64 + 1,
+            _ => 0,
+        }
+    };
+    match crate::video::wm::focussteal::raise_verb(owner, win_owner) {
+        Ok(given) => {
+            if given {
+                if USER_INPUT_ACTIVE.load(Ordering::Acquire) != owner {
+                    user_input_set_active(owner);
+                }
+                crate::video::wm::focus_changed(owner);
+            }
+            text.push(if given { una_abi::WINDOW_RAISE_GIVEN } else { una_abi::WINDOW_RAISE_PULSED });
+            0
+        }
+        Err(e) => e,
+    }
 }

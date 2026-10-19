@@ -2150,6 +2150,7 @@ fn submit() {
     l.put(b" model=").put(&model.as_bytes()[..model.len().min(48)]).put(b" ctx=").dec(used as i64).put(b"/").dec(limit as i64).put(b" ::");
     l.wire();
     app().paint();
+    raise_self(); // RAISEVERB (B722): the answer is in — ask for the window; the kernel pulses the tile when the user is elsewhere
 }
 
 // ---- raster ---------------------------------------------------------------------------------------
@@ -2925,5 +2926,33 @@ fn split_line(t: &[u64; 7], key_holo_ms: u64) {
     l.put(b" win_ms=").dec(d(0)).put(b" bus_ms=").dec(d(1)).put(b" key_ms=").dec(d(2));
     l.put(b" tls_ms=").dec(d(3)).put(b" hist_ms=").dec(d(4)).put(b" font_ms=").dec(d(5));
     l.put(b" key_holo_ms=").dec(key_holo_ms as i64);
+    l.wire();
+}
+
+// RAISEVERB (rmbp-ledger B722) — Lumen is the raise verb's first ring-3 caller: when an answer finishes, Lumen asks for
+// its own window to come forward (`una_abi::window_raise`, `BUS_VERB_WINDOW_RAISE`). The kernel decides: the user is in
+// Lumen (it holds focus) → given; the user is elsewhere → Lumen's dock tile pulses once and nothing moves.
+// `:: LUMEN: raise given|pulsed|fail code=<n> ::`.
+static mut RAISE_RX: [u8; una_abi::BUS_FRAME_MAX] = [0; una_abi::BUS_FRAME_MAX];
+
+fn raise_self() {
+    let win = app().win;
+    if win < 0 {
+        return;
+    }
+    let rx = unsafe { &mut *core::ptr::addr_of_mut!(RAISE_RX) };
+    let mut l = Line::new(b":: LUMEN: raise ");
+    match una_abi::window_raise(win as u32, rx, sys) {
+        Ok(true) => {
+            l.put(b"given");
+        }
+        Ok(false) => {
+            l.put(b"pulsed");
+        }
+        Err(e) => {
+            l.put(b"fail code=").dec(e);
+        }
+    }
+    l.put(b" ::");
     l.wire();
 }
