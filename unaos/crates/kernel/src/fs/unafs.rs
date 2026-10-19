@@ -3357,3 +3357,117 @@ pub mod splitread {
         );
     }
 }
+
+// =================================================================================================
+// KEYBOOT (rmbp-ledger B688) — the PRE-BOOT UNLOCK of a keyed root. TAIL-APPENDED: this module's panic
+// Locations are line-pinned (see `partition_witness`'s note), and nothing above changes. `mount_on` (:452)
+// already refuses a keyed volume with `Fs(KeyRequired)` through `UnaFS::mount` (the crate's gate reads block 0
+// and stops before `load_committed`), so every lazy bind of a locked root refuses and binds nothing.
+//
+// [`keyboot_probe`] names the ROOT CANDIDATE — the first handle, in the bind's own order (the AHCI root grant,
+// then `Global`, then the admitted probes), whose partition table carries a UnaFS volume — and says whether its
+// block 0 carries a key slot (§R2a), reading two sectors and mounting nothing. [`unlock_root`] opens THAT volume
+// with the typed secret through `UnaFS::mount_with` — the Argon2id runs here, UNMASKED, on the caller's thread
+// (the login worker) — and only then takes the masked `MOUNT` hold to install it as the bound mount. Building the
+// mount outside the hold is sound for exactly this volume: while it is keyed and locked every other bind stops at
+// block 0, so no second live mount of it exists (K4). The unwrapped data key is dropped (wiped) inside
+// `mount_with`; the kernel keeps no secret (BP-security-11, -14).
+//
+// NOT here (KEYBOOT's STOPs, reported with the exact change): a REBIND of an unlocked keyed root (a
+// `force_remount`, a K9 discard) needs the key again and refuses `KeyRequired` (an `Unlock::Key` in the crate,
+// or a seat decision); and `bootdisk::survey` caches a root bound while the keyed root is still locked
+// ([`root_locked`] is the predicate it would consult).
+// =================================================================================================
+
+/// KEYBOOT: the root candidate [`keyboot_probe`] named (the volume [`unlock_root`] opens).
+static KB_HANDLE: Mutex<Option<block::BlockHandle>> = Mutex::new(None);
+/// KEYBOOT: the probe saw a key slot on the root candidate.
+static KB_KEYED: AtomicBool = AtomicBool::new(false);
+/// KEYBOOT: the keyed root was opened with its key this boot.
+static KB_UNLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// KEYBOOT: every handle the bind may take the root from, in the bind's order ([`bind_mount`]).
+fn keyboot_candidates() -> Vec<block::BlockHandle> {
+    let mut v = Vec::new();
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+    if let Some(port) = crate::install::ahciroot::ensure_root_grant() {
+        v.push(block::BlockHandle::Ahci { port });
+    }
+    for h in bind_probe_candidates() {
+        if h == block::BlockHandle::Global || bind_probe_admitted(h) {
+            v.push(h);
+        }
+    }
+    v
+}
+
+/// KEYBOOT: the root candidate and whether it is keyed — `Some((handle, true))` keyed, `Some((handle, false))`
+/// unkeyed, `None` when no handle carries a UnaFS volume. A slot this build cannot read counts as keyed (the mount
+/// refuses it too). Reads the partition table and sectors 0..2 of the volume; mounts nothing.
+pub fn keyboot_probe() -> Option<(block::BlockHandle, bool)> {
+    for h in keyboot_candidates() {
+        let Ok(span) = locate_on(h) else {
+            continue;
+        };
+        let mut b = [0u8; 1024];
+        let read = handle_read(h, span.base_lba, &mut b[..512]).is_ok() && handle_read(h, span.base_lba + 1, &mut b[512..]).is_ok();
+        let keyed = read && !matches!(::unafs::KeySlot::parse(&b), Ok(None));
+        *KB_HANDLE.lock() = Some(h);
+        KB_KEYED.store(keyed, Ordering::Release);
+        return Some((h, keyed));
+    }
+    None
+}
+
+/// KEYBOOT: open the probed keyed root with `u` (the password or the 24 recovery words) and bind it as THE mount.
+/// `Ok(())` once bound (or when a mount is already bound: the unlock is then moot); otherwise the crate's answer —
+/// `Fs(KeySlot(KeyRefused))` for a wrong key, `Fs(KeySlot(BadRecovery))` for words that fail their checksum.
+pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
+    let handle = (*KB_HANDLE.lock()).ok_or(MountError::NoVolume)?;
+    install_warn_hook();
+    crate::fs::unafstime::install_clock_hook();
+    let span = locate_on(handle)?;
+    partition_witness(handle, &span);
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    splitread::note_span(handle, &span);
+    let dev = SdSectorDevice::open_on(handle)?;
+    let mut fs = Some(UnaFS::mount_with(BlockAdapter::for_partition(dev, &span), u).map_err(MountError::Fs)?);
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
+        return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait, as every MOUNT taker on the render task
+    }
+    let bound = crate::arch::without_interrupts(|| {
+        let mut g = MOUNT.lock();
+        if g.is_some() {
+            return false;
+        }
+        if let Some(m) = fs.take() {
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            splitread::note_bound(handle);
+            *g = Some(BoundMount { handle, fs: m });
+        }
+        true
+    });
+    drop(fs);
+    KB_UNLOCKED.store(true, Ordering::Release);
+    serial_println!(
+        "[keyboot] root unlocked handle={} via={} bound={} (the data key unwrapped and dropped; the kernel keeps no key)",
+        handle_kind_name(handle),
+        match u {
+            ::unafs::Unlock::Password(_) => "password",
+            ::unafs::Unlock::Recovery(_) => "words",
+        },
+        if bound { "now" } else { "already" }
+    );
+    Ok(())
+}
+
+/// KEYBOOT: the keyed root was opened with its key this boot.
+pub fn root_unlocked() -> bool {
+    KB_UNLOCKED.load(Ordering::Acquire)
+}
+
+/// KEYBOOT: the root candidate is keyed and not opened yet — a bind now would refuse it (`KeyRequired`).
+pub fn root_locked() -> bool {
+    KB_KEYED.load(Ordering::Acquire) && !KB_UNLOCKED.load(Ordering::Acquire)
+}

@@ -826,3 +826,77 @@ pub fn volkey_selftest() {
         wrapped as u8, mount_nokey, if key_ok { "ok" } else { "FAIL" }, if recovery { "ok" } else { "FAIL" }, sends, if pass { "PASS" } else { "FAIL" }
     );
 }
+
+// =================================================================================================
+// KEYBOOT (rmbp-ledger B688) — `tests keyboot`. TAIL-APPENDED, registered beside `volkey` (tests.rs, line-neutral).
+//
+// On a scratch RAM volume, through the crate calls the boot makes: KEY it as the first administrator's keying does
+// (`volkey_seal` + `set_key_slot`), then a remount without the key and with a wrong one is REFUSED (the gate every
+// lazy bind of a locked root meets), the password and the 24 words each OPEN it (the two modes of the unlock form's
+// `mount_with`) with the witness file read back, a second keying is refused, and the words go through the SAME
+// one-shot hand-over the keying uses (`users::keyboot_words_park/take`): taken once, never again. The REKEY leg is
+// owed — the crate has no re-wrap (KEYBOOT's STOP) — so it reads `owed` and the verdict FAILs until it lands. Floor
+// KDF costs; no secret on the wire.
+// =================================================================================================
+
+/// KEYBOOT: the rekey leg — `owed` until the crate re-wraps a slot under a new password (KEYBOOT's STOP: a
+/// `KeySlot::rewrap_password` and an `UnaFS::replace_key_slot`).
+#[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))]
+fn keyboot_rekey_leg(_bytes: &[u8]) -> &'static str {
+    "owed"
+}
+
+/// `tests keyboot` (see the section head).
+#[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))]
+pub fn keyboot_selftest() {
+    use ::unafs::fs::FileSystemError;
+    use ::unafs::{KdfParams, KeySlotError, MemDevice, UnaFS, Unlock};
+    const PW: &[u8] = b"keyboot-fixture-pw";
+    const WRONG: &[u8] = b"keyboot-fixture-pX";
+    const WITNESS: &[u8] = b"KEYBOOT witness: the scratch root opened with its key";
+    let t0 = crate::arch::ms();
+    let fail = |why: &str| serial_println!(":: KEYBOOT: keyed=0 refused=0 unlock_pw=none unlock_words=none rekey=none words_shown_once=0 -> FAIL ({}) ::", why);
+    let mut fs = match UnaFS::format(MemDevice::with_blocks(512), 0) {
+        Ok(f) => f,
+        Err(_) => return fail("format refused"),
+    };
+    let root = fs.superblock.root_inode;
+    let wrote = fs.create_file(root, "w.txt".into()).and_then(|id| fs.write_data(id, 0, WITNESS)).is_ok();
+    let (slot, words) = match volkey_seal(PW, KdfParams::FLOOR) {
+        Ok(x) => x,
+        Err(KeySlotError::NoMemory) => return fail("kdf memory"),
+        Err(_) => return fail("seal refused"),
+    };
+    let keyed = wrote && fs.set_key_slot(slot.clone()).is_ok() && fs.key_slot() == Some(&slot);
+    let bytes = core::mem::take(&mut fs.device).into_bytes();
+    drop(fs);
+    // ── remount without the key, and with a wrong one: refused ─────────────────────────────────────────────────
+    let nokey = matches!(UnaFS::mount(MemDevice::from_bytes(bytes.clone())), Err(FileSystemError::KeyRequired));
+    let wrong = matches!(UnaFS::mount_with(MemDevice::from_bytes(bytes.clone()), &Unlock::Password(WRONG)), Err(FileSystemError::KeySlot(KeySlotError::KeyRefused)));
+    let refused = nokey && wrong;
+    // ── the password opens it (and a second keying is refused); the words open it ──────────────────────────────
+    let read_back = |m: &mut UnaFS<MemDevice>| m.resolve_path("/w.txt").and_then(|id| m.read_data(id, 0, WITNESS.len() as u64)).is_ok_and(|d| d == WITNESS);
+    let unlock_pw = UnaFS::mount_with(MemDevice::from_bytes(bytes.clone()), &Unlock::Password(PW)).is_ok_and(|mut m| {
+        read_back(&mut m) && matches!(m.set_key_slot(slot.clone()), Err(FileSystemError::KeySlot(KeySlotError::AlreadyKeyed)))
+    });
+    let unlock_words = UnaFS::mount_with(MemDevice::from_bytes(bytes.clone()), &Unlock::Recovery(words.as_str())).is_ok_and(|mut m| read_back(&mut m));
+    let rekey = keyboot_rekey_leg(&bytes);
+    // ── the words' one showing: the keying's own hand-over, taken once and never again ─────────────────────────
+    let taken0 = crate::fs::users::keyboot_words_taken();
+    let parked = crate::fs::users::keyboot_words_park(words);
+    let first = crate::fs::users::keyboot_words_take().is_some();
+    let second = crate::fs::users::keyboot_words_take().is_none();
+    let once = parked && first && second && crate::fs::users::keyboot_words_taken() == taken0 + 1;
+    serial_println!(
+        "[keyboot] fx kdf=argon2id m={}KiB t={} p={} nokey={} wrong={} parked={} ms={}",
+        KdfParams::FLOOR.m_kib, KdfParams::FLOOR.t, KdfParams::FLOOR.p,
+        if nokey { "refused" } else { "OPENED" }, if wrong { "refused" } else { "OPENED" },
+        if parked { "yes" } else { "busy" }, crate::arch::ms().saturating_sub(t0)
+    );
+    let pass = keyed && refused && unlock_pw && unlock_words && rekey == "ok" && once;
+    serial_println!(
+        ":: KEYBOOT: keyed={} refused={} unlock_pw={} unlock_words={} rekey={} words_shown_once={} -> {} ::",
+        keyed as u8, refused as u8, if unlock_pw { "ok" } else { "FAIL" }, if unlock_words { "ok" } else { "FAIL" }, rekey, once as u8,
+        if pass { "PASS" } else if rekey == "owed" { "FAIL (rekey owed: the crate has no re-wrap — KEYBOOT STOP)" } else { "FAIL" }
+    );
+}

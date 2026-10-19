@@ -1265,7 +1265,7 @@ pub fn service() {
     // one load and prints nothing. (The VFS mount table is deliberately NOT consulted here at all —
     // LEDGER SO33: `bootdisk::bind` caches its first survey for the boot, and an early call would latch
     // an EMPTY root for every later caller, the shell's own verbs included.)
-    if !store_ready() { crate::fs::bootstep::open("store-wait", "Waiting for the disk"); return; } crate::fs::bootstep::close("store-wait", "ready"); // SPLASHSTALL (B510): the splash up and the store not yet answering is a step too. LOGIN15 (rmbp-ledger B213, flight 13 §1): readiness is "a store volume can mount", NOT the global slot — on the rMBP nothing sets BLOCK_DEVICE (SDHC and AHCI register beside it) and this guard held the whole LOGIN chain shut for two flights; `store_ready` is at this file's tail with its fixture.
+    if !store_ready() { crate::fs::bootstep::open("store-wait", "Waiting for the disk"); return; } crate::fs::bootstep::close("store-wait", "ready"); if keyboot_hold() { return; } // KEYBOOT (B688): a keyed root holds the boot HERE, at the unlock form, before users-load and the root bind (LINE-NEUTRAL append, before this comment; body at the tail). SPLASHSTALL (B510): the splash up and the store not yet answering is a step too. LOGIN15 (rmbp-ledger B213, flight 13 §1): readiness is "a store volume can mount", NOT the global slot — on the rMBP nothing sets BLOCK_DEVICE (SDHC and AHCI register beside it) and this guard held the whole LOGIN chain shut for two flights; `store_ready` is at this file's tail with its fixture.
     #[cfg(feature = "witness")] usersready_fixture(); // LOGIN15: the pure predicate against the three shapes (rMBP, QEMU, none) and the OLD guard as the go-red — once, on the first ready pass.
     // The block registry answers before the volume is quietly mountable: the moment a stick registers,
     // the driver loan is still held by the enumeration pump and `fat::mount()` answers `Busy` (measured on
@@ -2354,7 +2354,7 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             #[cfg(feature = "lumen")]
             if verdict.is_ok() {
                 if rekey {
-                    crate::keyring::ring_rekey(name, &o[..ol], &a[..al]); // RINGLOGIN2 (B479): the ring follows the password
+                    crate::keyring::ring_rekey(name, &o[..ol], &a[..al]); keyboot_rekey(name); // KEYBOOT (B688): the root's re-wrap is owed — said (LINE-NEUTRAL append, before this comment). RINGLOGIN2 (B479): the ring follows the password
                 } else {
                     crate::keyring::ring_kept_admin_reset(name);
                 }
@@ -3179,7 +3179,7 @@ pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'stati
         serial_println!("[login] installer: create-user user={} row made but the password was NOT written (the form stays)", wire_name(name));
         return Err("Could not save the password");
     }
-    serial_println!("[login] installer: create-user user={} id={} home_created={}", wire_name(name), made.0, made.1);
+    keyboot_key_root(name, password); serial_println!("[login] installer: create-user user={} id={} home_created={}", wire_name(name), made.0, made.1); // KEYBOOT (B688): the first administrator's password keys the bound native root (LINE-NEUTRAL append, before this comment; body at the tail)
     Ok(())
 }
 
@@ -3834,4 +3834,168 @@ fn home_kernel_rows(mt: &crate::fs::vfs::MountTable, home: &str, leaf: &str, own
     if stamped + failed > 0 {
         serial_println!("[users] home={} kernel-files stamped={} already={} failed={}", leaf, stamped, already, failed);
     }
+}
+
+// =========================================================================================
+// KEYBOOT (rmbp-ledger B688) — the keyed root's PRE-BOOT UNLOCK hold, the first administrator KEYS the root, and
+// the recovery words' one showing. TAIL-APPENDED; the call sites are line-neutral folds: [`service`]'s store-ready
+// line (the hold), [`installer_create_user`]'s witness line (the keying), `passwd`'s ring_rekey line and the login
+// screen's change form (the rekey, owed).
+//
+// THE HOLD. The users store loads from the boot FAT and the root binds after it (`boot80_root_and_seed`, the first
+// `vfs_mount_table`). On the first store-ready pass [`keyboot_hold`] asks `unafs::keyboot_probe` whether the root
+// candidate carries a key slot. Unkeyed (every volume before KEYBOOT): one line, no hold, the boot as before.
+// Keyed: the login screen's UNLOCK form opens (it is the first screen, so the splash gives the glass up to it) and
+// `service` returns on every pass until `unafs::unlock_root` has bound the root with its key — BEFORE anything
+// binds the root. The hold has no bound: the person at the keyboard types. Boot order is BP-boot's, with the hold
+// between the store-wait and users-load steps.
+//
+// THE KEYING. `installer_create_user` (R100: the first user is the administrator) writes the password, then
+// [`keyboot_key_root`] seals a fresh slot with it (`keyring::volkey_seal` at `RING_KDF_*`, Argon2id on the login
+// worker) and writes it through the ONE mount (`set_key_slot`: sector 0 untouched). Only a native UnaFS root that
+// is bound and unkeyed, only in an image that carries the unlock form (the same gate as the hold — a build that
+// could not unlock never keys). The 24 words wait here, wiped on drop, until the screen takes them ONCE.
+// =========================================================================================
+
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+const KB_PASS: u8 = 1;
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+const KB_HELD: u8 = 2;
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+const KB_OPENED: u8 = 3;
+/// KEYBOOT: 0 unprobed, [`KB_PASS`] (unkeyed or no root: no hold), [`KB_HELD`], [`KB_OPENED`].
+static KB_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static KB_HOLD_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// KEYBOOT: the recovery words of the slot this boot wrote, until the screen takes them (once).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+static KB_WORDS: Mutex<Option<::unafs::RecoveryWords>> = Mutex::new(None);
+/// KEYBOOT: how many times words were taken for the glass.
+static KB_WORDS_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// KEYBOOT: how many times words were taken for the glass this boot (`tests keyboot`'s `words_shown_once=`).
+pub fn keyboot_words_taken() -> u32 {
+    KB_WORDS_TAKEN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// KEYBOOT: `true` while the boot holds at the unlock form (the root is keyed and not opened yet). The first
+/// call probes the root and opens the form; a pass after `unafs::unlock_root` bound the root releases the hold.
+pub fn keyboot_hold() -> bool {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        match KB_HOLD.load(Acquire) {
+            KB_PASS | KB_OPENED => return false,
+            KB_HELD => {
+                if !crate::fs::unafs::root_unlocked() {
+                    return true;
+                }
+                KB_HOLD.store(KB_OPENED, Release);
+                serial_println!(
+                    "[keyboot] hold released held_ms={} (the root is bound with its key; the boot goes on: users-load, root-mount, stage-resolve)",
+                    crate::arch::ms().saturating_sub(KB_HOLD_T0.load(Acquire))
+                );
+                return false;
+            }
+            _ => {}
+        }
+        match crate::fs::unafs::keyboot_probe() {
+            Some((_, true)) => {
+                KB_HOLD_T0.store(crate::arch::ms(), Release);
+                KB_HOLD.store(KB_HELD, Release);
+                serial_println!("[keyboot] hold OPEN root=keyed (the unlock form is up; nothing binds the root until its password or its recovery words open it)");
+                crate::video::crystal::login::open_unlock();
+                true
+            }
+            found => {
+                KB_HOLD.store(KB_PASS, Release);
+                serial_println!("[keyboot] root={} hold=none", if found.is_some() { "unkeyed" } else { "none" });
+                false
+            }
+        }
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    false
+}
+
+/// KEYBOOT: the first administrator's password keys the bound native root (see the section head). Every refusal is
+/// one `[keyboot] root not keyed reason=` line and leaves the volume as it was.
+fn keyboot_key_root(name: &[u8], password: &[u8]) {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let why = |r: &str| serial_println!("[keyboot] root not keyed user={} reason={} (the volume is unchanged)", wire_name(name), r);
+        if role_of(name) != Some(Role::Admin) {
+            return why("not-the-administrator");
+        }
+        if !crate::fs::sysleaf::active() {
+            return why("no-native-root");
+        }
+        let Some(h) = crate::fs::unafs::mount_bound_handle() else {
+            return why("no-bound-root");
+        };
+        match crate::fs::unafs::with_unafs(|fs| fs.key_slot().is_some()) {
+            Ok(false) => {}
+            Ok(true) => return why("already-keyed"),
+            Err(_) => return why("mount"),
+        }
+        let kdf = ::unafs::KdfParams { m_kib: una_abi::RING_KDF_M_KIB, t: una_abi::RING_KDF_T, p: una_abi::RING_KDF_P };
+        let t0 = crate::arch::ms();
+        let (slot, words) = match crate::keyring::volkey_seal(password, kdf) {
+            Ok(x) => x,
+            Err(::unafs::KeySlotError::NoMemory) => return why("kdf-memory"),
+            Err(_) => return why("seal"),
+        };
+        let seal_ms = crate::arch::ms().saturating_sub(t0);
+        if !crate::fs::unafs::with_unafs(|fs| fs.set_key_slot(slot.clone()).is_ok()).unwrap_or(false) {
+            return why("slot-write");
+        }
+        *KB_WORDS.lock() = Some(words);
+        serial_println!(
+            "[keyboot] root keyed user={} handle={:?} kdf=argon2id m={}KiB t={} p={} seal_ms={} words=held-for-the-glass (shown once there; never on the wire)",
+            wire_name(name), h, kdf.m_kib, kdf.t, kdf.p, seal_ms
+        );
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    let _ = (name, password);
+}
+
+/// KEYBOOT: the recovery words for the glass — `Some` once after the keying, `None` ever after (the screen holds
+/// them until Continue, then drops them: wiped).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub fn keyboot_words_take() -> Option<::unafs::RecoveryWords> {
+    let w = KB_WORDS.lock().take();
+    if w.is_some() {
+        KB_WORDS_TAKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    w
+}
+
+/// KEYBOOT (`tests keyboot`): park words exactly as the keying does. `false` (nothing parked) while a real
+/// keying's words still wait for the glass.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub fn keyboot_words_park(w: ::unafs::RecoveryWords) -> bool {
+    let mut g = KB_WORDS.lock();
+    if g.is_some() {
+        return false;
+    }
+    *g = Some(w);
+    true
+}
+
+/// KEYBOOT: a password change of a user on a KEYED root. The re-wrap is OWED (the crate has no re-wrap and
+/// `set_key_slot` refuses a keyed volume — KEYBOOT's STOP), so the change says, on the wire and on the glass,
+/// that the disk still opens with the previous password or the recovery words.
+pub fn keyboot_rekey(name: &[u8]) {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        if role_of(name) != Some(Role::Admin) || !crate::fs::sysleaf::active() {
+            return;
+        }
+        if !crate::fs::unafs::with_unafs(|fs| fs.key_slot().is_some()).unwrap_or(false) {
+            return;
+        }
+        serial_println!("[keyboot] rekey OWED user={} (no re-wrap in the crate: the root still unlocks with the previous password or the recovery words)", wire_name(name));
+        screen_notice(b"Disk key unchanged", b"The disk still unlocks with your previous\npassword or your recovery words");
+    }
+    #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+    let _ = name;
 }

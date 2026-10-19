@@ -163,7 +163,7 @@ enum State {
     /// LOGIN14: the set-password form is up for `Form::name` (root's at boot, a user's at first login).
     SetPw,
     /// FIRSTBOOT (R77): the create-user form — name, password, retype — the Installer's second screen.
-    CreateUser,
+    CreateUser, Unlock, Words, // KEYBOOT (B688): the keyed root's pre-boot unlock form; the recovery words shown once (this file's tail)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -267,7 +267,7 @@ enum Ctl {
     /// that name into the field and moves to the password. The `usize` is the store's row index.
     User(usize),
     /// DIALOG2 (B404, MACPARITY row 33): the power row under the password field — 0 Sleep, 1 Restart, 2 Shut Down.
-    Power(u8),
+    Power(u8), Kb(u8), // KEYBOOT (B688): 0 the unlock form's password/words switch, 1 the words screen's Continue
 }
 
 const LX: usize = 24;
@@ -356,7 +356,7 @@ fn ctl_at(lx: i32, ly: i32, setpw: bool) -> Option<Ctl> {
         let (rx, ry, rw, rh) = ctl_rect(c, setpw);
         rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
     };
-    if cu_form() {
+    if let Some(k) = kb_ctl_at(lx, ly) { return k; } if cu_form() { // KEYBOOT (B688): the unlock and words forms answer from their own rects (this file's tail)
         return [Ctl::NameField, Ctl::PwField, Ctl::Pw2Field, Ctl::Button].into_iter().find(|&c| {
             let (rx, ry, rw, rh) = cu_rect(c);
             rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
@@ -391,7 +391,7 @@ fn ctl_name(c: Option<Ctl>) -> &'static str {
         Some(Ctl::User(_)) => "user-row",
         Some(Ctl::Power(0)) => "power-sleep",
         Some(Ctl::Power(1)) => "power-restart",
-        Some(Ctl::Power(_)) => "power-shutdown",
+        Some(Ctl::Power(_)) => "power-shutdown", Some(Ctl::Kb(0)) => "unlock-mode", Some(Ctl::Kb(_)) => "words-continue", // KEYBOOT (B688)
         None => "none",
     }
 }
@@ -493,7 +493,7 @@ fn repaint() {
     let px: &mut [u32] = surf();
     fill(px, 0, 0, W, H, theme::surface_window());
     // DESKTOPCRAFT (B631): no inner 1 px frame — the window's own chrome (rounded head, shadowed band) is the card's edge.
-    if f.state == State::CreateUser {
+    if matches!(f.state, State::Unlock | State::Words) { kb_paint(px, &f); drop(f); let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { let _ = wm::present(id); } return; } if f.state == State::CreateUser { // KEYBOOT (B688): the unlock and words forms (this file's tail)
         // FIRSTBOOT (R77): "Create your account" — name, password, retype, Create.
         text(px, LX, 14, b"Create your administrator account", theme::text_primary()); // FIRSTUSER (R100): the first user is the administrator
         craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
@@ -666,11 +666,11 @@ pub fn open_create_user() {
 fn open_as(state: State) {
     {
         let mut f = FORM.lock();
-        if f.state == State::Open || f.state == State::SetPw || f.state == State::CreateUser {
+        if f.state == State::Open || f.state == State::SetPw || f.state == State::CreateUser || f.state == State::Unlock || f.state == State::Words { // KEYBOOT (B688): the two forms are screens too
             return;
         }
         f.state = state;
-        f.focus = if state == State::SetPw { Focus::Password } else { Focus::Name };
+        f.focus = if state == State::SetPw || state == State::Unlock { Focus::Password } else { Focus::Name }; // KEYBOOT (B688): the unlock form's one field
         if state != State::SetPw {
             f.name_len = 0; // the set-password form is opened WITH its name (`open_set_password`)
         }
@@ -710,7 +710,7 @@ fn open_as(state: State) {
     // argument gives the login screen a close box and gives a one-click route to a machine with no
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
-    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::CreateUser { b"Create account" } else { b"Log in" };
+    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" };
     let id = wm::create_at_native(OWNER, surf, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
@@ -788,7 +788,7 @@ pub fn reopen_after_logout() {
 }
 
 pub fn is_open() -> bool {
-    let s = FORM.lock().state; matches!(s, State::Open | State::SetPw | State::CreateUser) // DIALOG2 (B404): the Alert state is deleted — a notice is the dialog or a toast, never the screen
+    let s = FORM.lock().state; matches!(s, State::Open | State::SetPw | State::CreateUser | State::Unlock | State::Words) // KEYBOOT (B688): the unlock and words forms take every key and press. DIALOG2 (B404): the Alert state is deleted — a notice is the dialog or a toast, never the screen
 }
 
 /// SO36 + SO44 — **the screen's answer to a PRESS, and it is the same answer everywhere.**
@@ -862,7 +862,7 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
         // there is no second submit path to keep in step with `consume_key`'s.
         Some(Ctl::Button) => { if !submit_busy() { submit() } }
         Some(Ctl::User(i)) => pick_user(i),
-        Some(Ctl::Power(i)) => power_pick(i, "click"),
+        Some(Ctl::Power(i)) => power_pick(i, "click"), Some(Ctl::Kb(i)) => kb_press(i), // KEYBOOT (B688)
         None => {}
     }
     if hit.is_some() {
@@ -932,7 +932,7 @@ fn pick_user(i: usize) {
 fn heal_if_row_gone() -> bool {
     let state = {
         let f = FORM.lock();
-        if !matches!(f.state, State::Open | State::SetPw | State::CreateUser) || !f.windowed {
+        if !matches!(f.state, State::Open | State::SetPw | State::CreateUser | State::Unlock | State::Words) || !f.windowed { // KEYBOOT (B688)
             return false;
         }
         f.state
@@ -967,7 +967,7 @@ pub fn consume_key(c: u8) -> bool {
     if !KEY_SAID.swap(true, Ordering::Relaxed) {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
-    let echo0 = echo_snapshot(c); // LOGINECHO (B611): taken before the key moves anything — a text edit that moves nothing else is echoed into its field's rect
+    if kb_key(c) { return true; } let echo0 = echo_snapshot(c); // KEYBOOT (B688): the unlock and words forms read their own keys (this file's tail). // LOGINECHO (B611): taken before the key moves anything — a text edit that moves nothing else is echoed into its field's rect
     if (0x20..=0x7e).contains(&c) && PFOCUS.load(Ordering::Relaxed) == 0 && ARMED.swap(false, Ordering::Relaxed) { FORM.lock().focus = Focus::Password; } // LOGINWINDOW: typing on an arrow-picked tile opens its field
     match c {
         b'\t' if power_tab() => {} // DIALOG2: Tab walks Name -> Password -> Sleep -> Restart -> Shut Down -> Name
@@ -1154,7 +1154,7 @@ fn apply_create(n: &[u8], made: Result<(), &'static str>, session: bool) {
         true => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
             serial_println!("[login] session open user={} role=admin (R100: the first user is the administrator; root is locked)", who);
-            close_into_session();
+            if kb_words_pending(KB_AFTER_CREATE) { return; } close_into_session(); // KEYBOOT (B688): a root keyed by this password shows its 24 words first; Continue closes into the session
             users::installer_desktop_ignite();
         }
         false => {
@@ -1167,7 +1167,7 @@ fn apply_create(n: &[u8], made: Result<(), &'static str>, session: bool) {
 }
 
 fn submit() {
-    if cu_form() {
+    if kb_submit() { return; } if cu_form() { // KEYBOOT (B688): Enter on the unlock form unlocks; on the words screen it does nothing
         return submit_create();
     }
     if setpw_form() {
@@ -2211,7 +2211,7 @@ enum Job {
     Create,
     Root,
     User,
-    Unlock,
+    Unlock, VolUnlock { words: bool }, // KEYBOOT (B688): the keyed root's unlock, by password or by the recovery words
 }
 
 #[derive(Clone, Copy)]
@@ -2220,7 +2220,7 @@ enum Outcome {
     Create { made: Result<(), &'static str>, session: bool },
     Root { ok: bool },
     User { verified: bool, session: bool },
-    Unlock { verified: bool },
+    Unlock { verified: bool }, VolUnlock { ok: bool, why: &'static str }, // KEYBOOT (B688)
 }
 
 #[derive(Clone, Copy)]
@@ -2266,7 +2266,7 @@ fn job_word(j: Job) -> &'static str {
         Job::Create => "create",
         Job::Root => "root",
         Job::User => "user",
-        Job::Unlock => "unlock",
+        Job::Unlock => "unlock", Job::VolUnlock { .. } => "volunlock", // KEYBOOT (B688)
     }
 }
 
@@ -2304,7 +2304,7 @@ fn compute(w: &Work) -> (Outcome, u64, u64) {
             let session = verified && users::login(n, p).is_ok();
             (Outcome::User { verified, session }, ms().saturating_sub(t), 0)
         }
-        Job::Unlock => {
+        Job::VolUnlock { words } => kb_compute(w, words), Job::Unlock => { // KEYBOOT (B688): the Argon2id of the unlock runs here, on the worker
             let t = ms();
             let verified = users::verify(n, p); #[cfg(feature = "lumen")] if verified { crate::keyring::ring_login(n, p); } // RINGLOGIN (B465): the screen's unlock opens the ring again
             (Outcome::Unlock { verified }, ms().saturating_sub(t), 0)
@@ -2320,7 +2320,7 @@ fn apply(d: &Done) {
         Outcome::Create { made, session } => apply_create(n, made, session),
         Outcome::Root { ok } => apply_root(ok),
         Outcome::User { verified, session } => apply_user(n, verified, session),
-        Outcome::Unlock { verified } => apply_unlock(n, verified),
+        Outcome::Unlock { verified } => apply_unlock(n, verified), Outcome::VolUnlock { ok, why } => kb_apply(ok, why), // KEYBOOT (B688)
     }
 }
 
@@ -2338,7 +2338,7 @@ fn outcome_word(o: &Outcome) -> &'static str {
         Outcome::Create { .. } => "create",
         Outcome::Root { .. } => "root",
         Outcome::User { .. } => "user",
-        Outcome::Unlock { .. } => "unlock",
+        Outcome::Unlock { .. } => "unlock", Outcome::VolUnlock { .. } => "volunlock", // KEYBOOT (B688)
     }
 }
 
@@ -2792,7 +2792,7 @@ fn setpw_change(n: &[u8], p: &[u8], o: &[u8], chg: u8) -> Result<(), &'static st
     #[cfg(feature = "lumen")]
     if written.is_ok() {
         match chg {
-            CHG_OWN => crate::keyring::ring_rekey_at(n, o, p, "settings"),
+            CHG_OWN => { crate::keyring::ring_rekey_at(n, o, p, "settings"); users::keyboot_rekey(n) } // KEYBOOT (B688): the root's re-wrap is owed — said
             CHG_RESET => crate::keyring::ring_kept_admin_reset_at(n, "settings"),
             _ => {}
         }
@@ -3080,4 +3080,382 @@ fn craft_rule(px: &mut [u32], x: usize, y: usize, w: usize) {
     let mut s = Surf::new(&mut px[..n], sw);
     let r = craft_rect(x, y, w, 1);
     draw::hairline_h(&mut s, r.x, r.y, r.w, Ink::argb(theme::hairline()));
+}
+
+// =================================================================================================
+// KEYBOOT (rmbp-ledger B688) — THE UNLOCK FORM and THE WORDS SCREEN. TAIL-APPENDED; every call site above is a
+// same-line fold (`State::{Unlock, Words}`, `Ctl::Kb`, `Job/Outcome::VolUnlock`, the painter, the key and press
+// routes, `submit`, `apply_create`).
+//
+// THE UNLOCK FORM ([`open_unlock`], from `users::keyboot_hold` before the root binds): the set-password form's
+// shape with ONE field — the password, or (Tab, or the switch button) the 24 recovery words. Enter or Unlock hands
+// the secret to the login worker (`Job::VolUnlock`), which calls `unafs::unlock_root` (`UnaFS::mount_with`, the
+// Argon2id at the slot's costs, then the bind). A wrong password and wrong words read ONE text; the form stays and
+// the person retries. Nothing typed is printed (BP-security-5); the words buffer is wiped on success and on every
+// switch. The form is the boot's first screen, so the splash gives the glass up to it (`open_as`).
+//
+// THE WORDS SCREEN ([`kb_words_pending`], from `apply_create` once the first administrator's password keyed the
+// root): the 24 words in a 4 x 6 grid, "write these down", and a Continue that only a CLICK presses — every key is
+// swallowed, so a held Enter cannot skip it. Continue wipes the drawn words off the RAM surface, drops the words
+// (wiped on drop) and closes into the session. `users::keyboot_words_take` hands them over once; never the wire.
+// =================================================================================================
+
+/// KEYBOOT: the words field's capacity — 24 words of at most six letters, their spaces, and slack.
+const KB_WORDS_MAX: usize = 192;
+/// KEYBOOT: what Continue does after the words — close into the first administrator's session.
+const KB_AFTER_CREATE: u8 = 1;
+/// KEYBOOT: the one refusal text (a wrong password and wrong words alike).
+const KB_REFUSED: &str = "Wrong password or recovery key";
+
+struct Kb {
+    words: [u8; KB_WORDS_MAX],
+    wlen: usize,
+    recovery: bool,
+    after: u8,
+}
+
+static KB: crate::sync::Mutex<Kb> = crate::sync::Mutex::new(Kb { words: [0; KB_WORDS_MAX], wlen: 0, recovery: false, after: 0 });
+/// KEYBOOT: the words on the glass, from the take to Continue (wiped on drop).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+static KB_SHOWN: crate::sync::Mutex<Option<::unafs::RecoveryWords>> = crate::sync::Mutex::new(None);
+
+fn kb_wipe_words(k: &mut Kb) {
+    // SAFETY: a plain store into our own buffer; volatile so the scrub is not elided.
+    unsafe { core::ptr::write_volatile(&mut k.words, [0; KB_WORDS_MAX]) };
+    k.wlen = 0;
+}
+
+/// KEYBOOT: open the unlock form (the root is keyed; `users::keyboot_hold`).
+pub fn open_unlock() {
+    {
+        let mut k = KB.lock();
+        kb_wipe_words(&mut k);
+        k.recovery = false;
+    }
+    open_as(State::Unlock);
+    {
+        let mut f = FORM.lock();
+        if f.state == State::Unlock {
+            f.focus = Focus::Password;
+            f.message = "";
+        }
+    }
+    serial_println!("[login] unlock form open (KEYBOOT: the root volume is keyed; its password, or Tab for the 24 recovery words; nothing typed is printed)");
+    repaint();
+}
+
+/// KEYBOOT: the forms' rects — the unlock form's field, Unlock and the switch; the words screen's Continue.
+fn kb_rect(c: Ctl, st: State) -> (usize, usize, usize, usize) {
+    match (st, c) {
+        (State::Unlock, Ctl::PwField) => (FIELD_X, 76, FIELD_W, FIELD_H),
+        (State::Unlock, Ctl::Button) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        (State::Unlock, Ctl::Kb(0)) => (LX, 150, 176, BTN_H),
+        (State::Words, Ctl::Kb(1)) => (W - LX - BTN_W, 236, BTN_W, BTN_H),
+        _ => (0, 0, 0, 0),
+    }
+}
+
+/// KEYBOOT: `Some(hit)` while one of the two forms is up (`ctl_at`'s first question), `None` otherwise.
+fn kb_ctl_at(lx: i32, ly: i32) -> Option<Option<Ctl>> {
+    let st = FORM.lock().state;
+    let cs: &[Ctl] = match st {
+        State::Unlock => &[Ctl::PwField, Ctl::Button, Ctl::Kb(0)],
+        State::Words => &[Ctl::Kb(1)],
+        _ => return None,
+    };
+    Some(cs.iter().copied().find(|&c| {
+        let (rx, ry, rw, rh) = kb_rect(c, st);
+        rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
+    }))
+}
+
+/// KEYBOOT: a push button drawn from [`kb_rect`] (the kit's button, a centred caption).
+fn kb_button(px: &mut [u32], c: Ctl, st: State, label: &[u8], primary: bool) {
+    let (x, y, w, h) = kb_rect(c, st);
+    craft_box(px, x, y, w, h, if primary { Craft::Primary } else { Craft::Button }, false);
+    let tw = super::super::metrics::ladvance(label, false, FACE);
+    text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, label, if primary { theme::surface_raised() } else { theme::text_primary() });
+}
+
+/// KEYBOOT: the painter for both forms (`repaint` holds `FORM`; this takes `KB` after it, never before).
+fn kb_paint(px: &mut [u32], f: &Form) {
+    if f.state == State::Words {
+        return kb_paint_words(px);
+    }
+    let k = KB.lock();
+    text(px, LX, 14, b"This disk is locked", theme::text_primary());
+    craft_rule(px, LX, 36, W - 2 * LX);
+    let lead: &[u8] = if k.recovery { b"Type the 24 words of your recovery key" } else { b"Type your password to start UnaOS" };
+    text(px, LX, 46, lead, theme::text_secondary());
+    let (x, y, w, _) = kb_rect(Ctl::PwField, State::Unlock);
+    text(px, LX, y + 4, if k.recovery { b"Words" } else { b"Password" }, theme::text_secondary());
+    if k.recovery {
+        // The tail of what was typed that fits the field (the field shows at most FIELD_MAX bytes).
+        let typed = &k.words[..k.wlen];
+        let mut s = k.wlen.saturating_sub(FIELD_MAX);
+        while s < typed.len() && super::super::metrics::ladvance(&typed[s..], false, FACE) + 16 > w {
+            s += 1;
+        }
+        field(px, x, y, w, &typed[s..], true, false);
+        let n = typed.split(|&b| b == b' ').filter(|t| !t.is_empty()).count().min(99);
+        let mut line = *b"Words typed: 00 of 24";
+        line[13] = b'0' + (n / 10) as u8;
+        line[14] = b'0' + (n % 10) as u8;
+        text(px, FIELD_X, 112, &line, theme::text_secondary());
+    } else {
+        field(px, x, y, w, &f.pw[..f.pw_len], true, true);
+    }
+    kb_button(px, Ctl::Button, State::Unlock, b"Unlock", true);
+    kb_button(px, Ctl::Kb(0), State::Unlock, if k.recovery { b"Use password" } else { b"Use recovery key" }, false);
+    let hint: &[u8] = if k.recovery { b"Enter unlocks   Tab: password" } else { b"Enter unlocks   Tab: recovery key" };
+    text(px, LX, 186, hint, theme::text_secondary());
+    if !f.message.is_empty() {
+        text(px, LX, 212, f.message.as_bytes(), theme::accent());
+    }
+}
+
+/// KEYBOOT: the words screen — 24 numbered words, column by column, and Continue.
+fn kb_paint_words(px: &mut [u32]) {
+    text(px, LX, 14, b"Your recovery key", theme::text_primary());
+    craft_rule(px, LX, 36, W - 2 * LX);
+    text(px, LX, 44, b"Write these 24 words down. They are shown once.", theme::text_secondary());
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        let g = KB_SHOWN.lock();
+        if let Some(words) = g.as_ref() {
+            let colw = (W - 2 * LX) / 4;
+            for i in 0..::unafs::keyslot::RECOVERY_WORDS {
+                let Some(wd) = words.word(i) else { break };
+                let mut cell = [0u8; 16];
+                let num = i + 1;
+                let mut n = 0;
+                if num >= 10 {
+                    cell[n] = b'0' + (num / 10) as u8;
+                    n += 1;
+                }
+                cell[n] = b'0' + (num % 10) as u8;
+                cell[n + 1] = b' ';
+                n += 2;
+                let m = wd.len().min(cell.len() - n);
+                cell[n..n + m].copy_from_slice(&wd.as_bytes()[..m]);
+                n += m;
+                text(px, LX + (i / 6) * colw, 66 + (i % 6) * 20, &cell[..n], theme::text_primary());
+                // SAFETY: our own stack buffer; volatile so the scrub of the word copy is not elided.
+                unsafe { core::ptr::write_volatile(&mut cell, [0; 16]) };
+            }
+        }
+    }
+    text(px, LX, 192, b"Anyone with these words can open this disk.", theme::text_secondary());
+    kb_button(px, Ctl::Kb(1), State::Words, b"Continue", true);
+}
+
+/// KEYBOOT: switch the unlock form between the password and the words; both buffers are wiped.
+fn kb_toggle() {
+    let rec = {
+        let mut k = KB.lock();
+        k.recovery = !k.recovery;
+        kb_wipe_words(&mut k);
+        k.recovery
+    };
+    let mut f = FORM.lock();
+    f.message = "";
+    clear_passwords(&mut f);
+    drop(f);
+    serial_println!("[login] unlock form mode={} (KEYBOOT)", if rec { "words" } else { "password" });
+}
+
+/// KEYBOOT: the two forms' keys (`consume_key`, after its belt and busy check). `false` = not one of the forms.
+fn kb_key(c: u8) -> bool {
+    let st = FORM.lock().state;
+    match st {
+        State::Words => true, // every key is swallowed: Continue needs a click, so the words are seen, never skipped
+        State::Unlock => {
+            match c {
+                b'\t' => kb_toggle(),
+                b'\n' | b'\r' => submit(),
+                8 | 0x7f => {
+                    let rec = KB.lock().recovery;
+                    if rec {
+                        let mut k = KB.lock();
+                        k.wlen = k.wlen.saturating_sub(1);
+                    } else {
+                        let mut f = FORM.lock();
+                        f.pw_len = f.pw_len.saturating_sub(1);
+                    }
+                }
+                0x20..=0x7e => {
+                    let rec = KB.lock().recovery;
+                    if rec {
+                        let mut k = KB.lock();
+                        if k.wlen < KB_WORDS_MAX {
+                            let i = k.wlen;
+                            k.words[i] = c;
+                            k.wlen += 1;
+                        }
+                    } else {
+                        let mut f = FORM.lock();
+                        if f.pw_len < FIELD_MAX {
+                            let i = f.pw_len;
+                            f.pw[i] = c;
+                            f.pw_len += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            repaint();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// KEYBOOT: a press on one of the two forms' own controls (`press_swallow`).
+fn kb_press(i: u8) {
+    let st = FORM.lock().state;
+    match (st, i) {
+        (State::Unlock, 0) => kb_toggle(),
+        (State::Words, 1) => kb_continue(),
+        _ => {}
+    }
+}
+
+/// KEYBOOT: `submit`'s first question. The unlock form hands its secret to the worker; the words screen ignores
+/// Enter. `false` = not one of the forms.
+fn kb_submit() -> bool {
+    let (st, mut pw, plen) = {
+        let f = FORM.lock();
+        (f.state, f.pw, f.pw_len)
+    };
+    match st {
+        State::Words => {}
+        State::Unlock => {
+            let (recovery, wlen) = {
+                let k = KB.lock();
+                (k.recovery, k.wlen)
+            };
+            if recovery && wlen == 0 {
+                FORM.lock().message = "Type the 24 words";
+            } else if !recovery && plen == 0 {
+                FORM.lock().message = "Type your password";
+            } else {
+                let secret: &[u8] = if recovery { &[] } else { &pw[..plen] }; // the words travel in `KB`, never in the work item
+                dispatch(Job::VolUnlock { words: recovery }, b"", secret);
+            }
+        }
+        _ => return false,
+    }
+    // SAFETY: our own local copy of the password; volatile so the scrub is not elided.
+    unsafe { core::ptr::write_volatile(&mut pw, [0; FIELD_MAX]) };
+    true
+}
+
+/// KEYBOOT: the worker's half — `unafs::unlock_root` with the password (from the work item) or the words (copied
+/// out of the form's buffer and wiped here). The outcome carries a word, never the secret.
+fn kb_compute(w: &Work, words: bool) -> (Outcome, u64, u64) {
+    let t = crate::arch::ms();
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    let (ok, why) = {
+        use crate::fs::unafs::MountError;
+        use ::unafs::fs::FileSystemError;
+        use ::unafs::KeySlotError;
+        let r = if words {
+            let mut buf = [0u8; KB_WORDS_MAX];
+            let n = {
+                let k = KB.lock();
+                buf[..k.wlen].copy_from_slice(&k.words[..k.wlen]);
+                k.wlen
+            };
+            let r = match core::str::from_utf8(&buf[..n]) {
+                Ok(s) => crate::fs::unafs::unlock_root(&::unafs::Unlock::Recovery(s)),
+                Err(_) => Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::BadRecovery))),
+            };
+            // SAFETY: our own stack buffer; volatile so the scrub of the words copy is not elided.
+            unsafe { core::ptr::write_volatile(&mut buf, [0; KB_WORDS_MAX]) };
+            r
+        } else {
+            crate::fs::unafs::unlock_root(&::unafs::Unlock::Password(&w.pw[..w.plen]))
+        };
+        match r {
+            Ok(()) => (true, ""),
+            Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::KeyRefused | KeySlotError::BadRecovery))) => (false, "refused"),
+            Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::Unsupported))) => (false, "unsupported"),
+            Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::NoMemory))) => (false, "memory"),
+            Err(_) => (false, "disk"),
+        }
+    };
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+    let (ok, why) = {
+        let _ = (w, words);
+        (false, "unbuilt")
+    };
+    (Outcome::VolUnlock { ok, why }, crate::arch::ms().saturating_sub(t), 0)
+}
+
+/// KEYBOOT: the render task's half. Opened: the form goes and the hold releases on the next storage pass. Refused:
+/// ONE text for a wrong password and wrong words, the field cleared, the form kept (the words stay for a typo fix).
+fn kb_apply(ok: bool, why: &'static str) {
+    if ok {
+        {
+            let mut k = KB.lock();
+            kb_wipe_words(&mut k);
+            k.recovery = false;
+        }
+        take_down();
+        FORM.lock().state = State::Closed;
+        serial_println!("[login] unlock form closed (KEYBOOT: the root is open; the boot goes on)");
+        return;
+    }
+    serial_println!("[login] unlock refused reason={} (one text on the glass for a wrong password and wrong words)", if why == "refused" { "key" } else { why });
+    let mut f = FORM.lock();
+    f.message = match why {
+        "refused" => KB_REFUSED,
+        "unsupported" => "This disk's key needs a newer UnaOS",
+        "memory" => "Not enough memory - try again",
+        _ => "Could not read the disk - try again",
+    };
+    clear_passwords(&mut f);
+}
+
+/// KEYBOOT: after the create-user form's session opened — `true` when the root was just keyed and its words are now
+/// on the glass (the caller returns; Continue finishes with `after`), `false` otherwise (the caller goes on).
+fn kb_words_pending(after: u8) -> bool {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    if let Some(w) = users::keyboot_words_take() {
+        if !FORM.lock().windowed {
+            drop(w);
+            serial_println!("[login] recovery words NOT shown (headless form: no glass to show them on; dropped, the password still unlocks)");
+            return false;
+        }
+        *KB_SHOWN.lock() = Some(w);
+        KB.lock().after = after;
+        {
+            let mut f = FORM.lock();
+            f.state = State::Words;
+            f.message = "";
+            clear_passwords(&mut f);
+        }
+        serial_println!("[login] recovery words shown (KEYBOOT: 24 words, once, on the glass only; Continue needs a click)");
+        repaint();
+        return true;
+    }
+    let _ = after;
+    false
+}
+
+/// KEYBOOT: Continue — the drawn words are wiped off the RAM surface (it outlives the row), the words dropped
+/// (wiped), and the session the create-user form opened is closed into.
+fn kb_continue() {
+    fill(surf(), 0, 0, W, H, theme::surface_window());
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    drop(KB_SHOWN.lock().take());
+    let after = core::mem::replace(&mut KB.lock().after, 0);
+    serial_println!("[login] recovery words dismissed (Continue; nothing keeps them)");
+    if after == KB_AFTER_CREATE {
+        close_into_session();
+        users::installer_desktop_ignite();
+    } else {
+        take_down();
+        FORM.lock().state = State::Closed;
+    }
 }

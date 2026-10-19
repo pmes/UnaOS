@@ -135,6 +135,17 @@ M2's cipher will need its own INCOMPAT stamp (the seat's decision, see below).
   sector 1 makes the volume mount unkeyed. The slot gates every reader that goes through the crate
   (the kernel, `tools/unafs`, the installer). M2 (per-block AES-256-XTS, tweak = block number) closes
   both; `crypto_core` has AES-256 (`aes::Aes`, forward and inverse) but no XTS mode yet.
+* The LIVE ROOT (KEYBOOT, rmbp-ledger B688). The kernel keys the volume it boots from at ONE moment: the
+  first administrator's account (`users::installer_create_user`, R100) seals a slot with that password at
+  `una_abi::RING_KDF_*` costs and writes it through the bound mount (`set_key_slot`) — only a native UnaFS root,
+  only when it is unkeyed, only in an image that carries the unlock form. The 24 words are shown ONCE on the
+  login screen (a Continue that needs a click) and dropped. On every later boot the root is keyed before anyone
+  types, so the boot HOLDS before the root binds: `unafs::keyboot_probe` reads this sector (no mount), the login
+  screen's unlock form takes the password or the words, and `unafs::unlock_root` opens the volume with
+  `mount_with` and binds it as the one mount. Owed (STOPs, outside the kernel files): a RE-WRAP under a new
+  password (`KeySlot::rewrap_password` keeping bytes 0..48 — the recovery wrap's AAD binds them — and
+  `UnaFS::replace_key_slot`), so a password change today leaves the slot under the previous password (the change
+  says so); and a REBIND of an unlocked keyed root (a remount needs the key again).
 
 ## §R3 Inode block (one 4096 B block per inode)
 
