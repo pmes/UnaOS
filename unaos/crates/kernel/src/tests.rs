@@ -2050,17 +2050,17 @@ fn autolock_selftest() {
     let w0 = lock::wrong_count();
     if entered { feed(WRONG); let _ = crate::fs::users::screen_key(b'\n'); settle(); }
     let wrong = lock::wrong_count().wrapping_sub(w0);
-    let refused = entered && lock::active() && wrong == 1;
+    let refused = entered && lock::active() && wrong == 1; let l2 = lock2_locked(entered); // LOCK2 (B728): a window created while locked (file tail). LINE-NEUTRAL fold, code first.
     if entered { feed(PW); let _ = crate::fs::users::screen_key(b'\n'); settle(); }
-    let reopened = entered && !lock::active() && !login::is_open() && is_una(&mut nb);
+    let reopened = entered && !lock::active() && !login::is_open() && is_una(&mut nb); let (painted, hole_ms) = lock2_unlocked(l2); let resumed = lock::last_resumed(); // LOCK2 (B728): it paints within one frame of the unlock, then is closed before the fingerprint (file tail). LINE-NEUTRAL fold, code first.
     let after = lock::fingerprint();
     let same = before == after;
     let ms = lock::last_open_ms();
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some();
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1; // LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
-        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} -> {} :: chord={} wrong={} windows_hidden={}",
-        entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)),
-        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden
+        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} -> {} :: chord={} wrong={} windows_hidden={} painted={}",
+        entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed",
+        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8
     );
 }
 
@@ -2242,4 +2242,57 @@ fn mtpphone_selftest() {
             enumerated as u8, nst, nobj, okf(read_ok), okf(write_ok), okf(delete_ok), ms, why.unwrap_or("-")
         );
     }
+}
+
+// LOCK2 (rmbp-ledger B728, BP-video-28) — TAIL-APPENDED, so no line above moves. `tests autolock`'s two extra legs, folded
+// onto its lines: while the lock is up a window is minted for a ring-3-shaped owner and presents once (the veil must
+// answer `Suppressed`: it is not on the glass); after the right password the row must be CLEAN (painted by the unlock's
+// own composite) within one 17 ms frame, and a present must reach the compositor again (`resumed=` is the resume pass's
+// count, `lock::last_resumed`). `hole_ms` = ms from the unlock's return to the row clean (0 = clean at the first look).
+// The row is closed before the table fingerprint. The minting seam (`wm::wl_fixture_mint`) is the x86 `wc` + witness
+// fixture's; elsewhere the legs are `-` and fail the line (the desktop fixture runs on that lane).
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+const LOCK2_OWNER: u64 = 0xD53;
+
+/// While locked: mint the row and present it once. `(id, suppressed)`; `id` is `WIN_NONE` when nothing was minted.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn lock2_locked(entered: bool) -> (crate::video::wm::WinId, bool) {
+    use crate::video::wm;
+    #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+    if entered && crate::video::lock::active() {
+        let id = wm::wl_fixture_mint(LOCK2_OWNER, b"lock2");
+        if id != wm::WIN_NONE {
+            let sup = wm::present_outcome(id) == wm::Presented::Suppressed;
+            return (id, sup);
+        }
+    }
+    let _ = entered;
+    (wm::WIN_NONE, false)
+}
+
+/// After the unlock: `(painted, hole_ms)` — the row clean within one frame and presenting again; the row closed.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn lock2_unlocked(l: (crate::video::wm::WinId, bool)) -> (bool, Option<u64>) {
+    use crate::video::wm;
+    let (id, suppressed) = l;
+    if id == wm::WIN_NONE {
+        return (false, None);
+    }
+    let t0 = crate::arch::ms();
+    let mut hole = None;
+    loop {
+        let el = crate::arch::ms().wrapping_sub(t0);
+        if wm::info(id).map_or(false, |i| !i.damaged) {
+            hole = Some(el);
+            break;
+        }
+        if crate::video::lock::active() || el > 17 {
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    let again = !crate::video::lock::active() && wm::present_outcome(id) != wm::Presented::Suppressed;
+    let _ = wm::close_owner(LOCK2_OWNER);
+    serial_println!("[lock] fixture row={} suppressed_while_locked={} clean_ms={} presents_again={}", id, suppressed as u8, hole.map_or(-1i64, |m| m as i64), again as u8);
+    (suppressed && hole.is_some() && again, hole)
 }

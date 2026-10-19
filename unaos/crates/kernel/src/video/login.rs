@@ -560,7 +560,7 @@ fn repaint() {
     // create-first-user title, button label and hint that keyed on `users::count() == 0` are gone.
     let locked = LOCKED.load(Ordering::Relaxed);
     let title: &[u8] = if locked { b"Locked" } else { b"Log in to UnaOS" };
-    text(px, LX, 14, title, theme::text_primary());
+    text(px, LX, 14, title, theme::text_primary()); if locked { if let Some(secs) = crate::clock::try_unix_now() { let mut c = [b' '; 8]; let n = crate::clock::locale::fmt_time(crate::clock::locale::Painter::Bar, secs, &mut c).min(8); let t = &c[8 - n..]; let t = &t[t.iter().position(|&b| b != b' ').unwrap_or(t.len())..]; text(px, (W - LX).saturating_sub(super::super::metrics::ladvance(t, false, FACE)), 14, t, theme::text_secondary()); } } // LOCK2 (B728): the locked card shows the civil clock (the bar's text through `clock::locale::fmt_time`, the one formatter; `video::lock::clock_tick` repaints it once a minute) beside the title; the session's name is the tile and the read-only field below. LINE-NEUTRAL fold, code first.
     craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
     // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
     // picks and the row the painter draws are the same row by construction — the `ctl_rect` argument

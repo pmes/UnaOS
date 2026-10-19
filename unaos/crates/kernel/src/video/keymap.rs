@@ -328,7 +328,7 @@ pub fn resolve_chord(table: &Table, modifiers: u8, usage_edge: u8) -> Option<(Ac
         }
         i += 1;
     }
-    None
+    win_l(modifiers, usage_edge) // LOCK2 (B728): Win+L, asked after every row declined, here in the ONE walk so `resolve` and `resolve_edge` (and every caller of either) answer it alike (file tail). LINE-NEUTRAL fold, code first.
 }
 
 /// The EDGE face, for a HID boot report pair. Walks the usages that are present NOW and absent
@@ -352,7 +352,7 @@ pub fn resolve_edge(
         }
         i += 1;
     }
-    win_l(cur_keys, prev_keys, modifiers) // AUTOLOCK (B712): Win+L, the one chord entry no row can spell on every table (file tail); `None` when it is not Win+L. LINE-NEUTRAL fold, code first.
+    None // AUTOLOCK (B712) -> LOCK2 (B728): Win+L is answered inside `resolve_chord` (the one walk) for every edge above, so this fallback is gone and the chord is listed once (file tail). LINE-NEUTRAL fold.
 }
 
 /// The table the desktop is running. ONE call site for the selection, so a knob that picks
@@ -798,14 +798,16 @@ fn zoom_edge(cur: &[u8; 6], prev: &[u8; 6], modifiers: u8) {
 // role on the live look and keyboard ([`start_role`]: Option on a Mac keyboard under Softy, Win on a PC keyboard under
 // Softy) or, under Una (no Start role), the GUI key (Win on a PC keyboard; ⌘ on a Mac, where ⌘L's row has already
 // answered with the same action). A role-space row cannot say it: no role maps the Win key on the PC table, and the
-// mirrored tables put it under Option. Asked by [`resolve_edge`] only after every row declined, so no row's token moves.
+// mirrored tables put it under Option. Asked by [`resolve_chord`] (LOCK2, B728; was `resolve_edge` alone) only after every row
+// declined, so no row's token moves.
 
-/// Win+L as a press edge of L (0x0F) with the Windows key held: `LockScreen`, token `win-l`. Pure over its arguments
-/// and the live look/keyboard.
-fn win_l(cur: &[u8; 6], prev: &[u8; 6], modifiers: u8) -> Option<(Action, &'static str)> {
+/// Win+L: L (0x0F) going down with the Windows key held: `LockScreen`, token `win-l`. Pure over its arguments and the
+/// live look/keyboard. LOCK2 (B728): asked by [`resolve_chord`] after its rows (so `resolve`'s callers and
+/// `resolve_edge`'s per-edge walk both reach it); the edge itself is the caller's, as for every row.
+fn win_l(modifiers: u8, usage_edge: u8) -> Option<(Action, &'static str)> {
     let role = start_role();
     let win = if role != 0 { role } else { HID_MOD_GUI };
-    if modifiers & win != 0 && cur.contains(&0x0F) && !prev.contains(&0x0F) {
+    if modifiers & win != 0 && usage_edge == 0x0F {
         Some((Action::LockScreen, "win-l"))
     } else {
         None
