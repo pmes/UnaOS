@@ -165,11 +165,14 @@ pub fn arm(slot: u8, w: u16, h: u16, cc: [u8; 4]) {
     GENERATION.fetch_add(1, Ordering::AcqRel);
     ARMED.store(true, Ordering::Release);
     serial_println!("[uvc] view armed slot={} {}x{} fourcc={}", slot, w, h, cc_str(cc).as_str());
+    cam_opened(slot); // CAMDOT (B702): the stream count the menu bar's camera dot is painted from
 }
 
 /// `uvc::stream_disarm`: the stream is gone. The viewer closes its window on its next pass.
 pub fn disarm() {
-    ARMED.store(false, Ordering::Release);
+    if ARMED.swap(false, Ordering::AcqRel) {
+        cam_closed(); // CAMDOT (B702): the count drops with the driver's own disarm, never on an app's word
+    }
 }
 
 /// The controller's service ladder (beside `service_uvc`): start the viewer for an armed stream. Atomics only
@@ -340,6 +343,11 @@ mod view {
     static TASK: AtomicBool = AtomicBool::new(false);
     static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 
+    /// CAMDOT (B702): a viewer task is alive (it, not [`super::revoked`], stops the stream it holds).
+    pub fn running() -> bool {
+        TASK.load(Ordering::Acquire)
+    }
+
     pub fn pump() {
         if ARMED.load(Ordering::Acquire) && !TASK.swap(true, Ordering::AcqRel) {
             crate::arch::sched::spawn_stack("uvc-view", task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, STACK);
@@ -413,6 +421,34 @@ mod view {
         *win = None;
     }
 
+    /// CAMDOT (B702) M2: THE ask — `<app> wants the camera`, Not now · Allow (the default, rightmost; Escape and the
+    /// close box are Not now). QUEUE-ONLY (`dialog::post`); the answer arrives on the press route in [`cam_answer`].
+    fn cam_ask() -> bool {
+        use crate::video::dialog::{self, Act, Dlg, Icon};
+        let msg = alloc::format!("{} wants the camera", CAM_APP);
+        let mut d = Dlg::new(Icon::Caution, b"Camera", msg.as_bytes(), b"The camera dot in the menu bar shows while it is on.\nSettings > Privacy revokes it.", &[b"Not now", b"Allow"]);
+        d.act = Act::Hook(cam_answer as fn(bool) as usize);
+        let posted = dialog::post(d);
+        if posted {
+            ASK_UP.store(true, Ordering::Release);
+            ASKS.fetch_add(1, Ordering::Relaxed);
+        }
+        serial_println!("[cam] ask app={} domain={} posted={}", CAM_APP, CAM_DOMAIN, posted as u8);
+        posted
+    }
+
+    /// The dialog's hook (press/key route; queue-only): Allow is KEPT in Principia (`prefs::decide`, queue-only); Not
+    /// now is not kept — the next stream asks again.
+    fn cam_answer(ok: bool) {
+        ASK_UP.store(false, Ordering::Release);
+        let a = answer_of(ok, crate::video::dialog::last_button());
+        if a == ANS_ALLOW {
+            crate::prefs::decide(CAM_DOMAIN, CAM_APP, "-", ANS_ALLOW_WORD);
+        }
+        serial_println!("[cam] answer={} app={}", if a == ANS_ALLOW { ANS_ALLOW_WORD } else { "not-now" }, CAM_APP);
+        ANSWER.store(a, Ordering::Release);
+    }
+
     fn task(_: usize) {
         let generation = GENERATION.load(Ordering::Acquire);
         let g = GEOM.load(Ordering::Relaxed);
@@ -431,12 +467,37 @@ mod view {
         let mut t_stat = t0;
         let mut cam_stat = CAM.load(Ordering::Relaxed);
         let mut render_us_max = 0u64;
+        // CAMDOT (B702) M2: the app's grant — Principia's kept answer first, else ONE ask; no frame is read before it.
+        let mut granted = cam_consult();
+        let mut ask_try: Option<u64> = None;
         let why = loop {
             if !ARMED.load(Ordering::Acquire) {
                 break "stream-disarmed";
             }
             if GENERATION.load(Ordering::Acquire) != generation {
                 break "stream-rearmed";
+            }
+            if REVOKED.load(Ordering::Acquire) {
+                break "revoked";
+            }
+            if !granted {
+                match ANSWER.load(Ordering::Acquire) {
+                    ANS_ALLOW => {
+                        granted = true;
+                        cam_granted("ask");
+                    }
+                    ANS_NOT_NOW => break "not-now",
+                    _ => {
+                        let now = crate::arch::ms();
+                        let due = ask_try.map(|t| now.wrapping_sub(t) >= ASK_RETRY_MS).unwrap_or(true);
+                        if due && !ASK_UP.load(Ordering::Acquire) && crate::boot::phase() == crate::boot::Phase::Desktop {
+                            ask_try = Some(now);
+                            let _ = cam_ask();
+                        }
+                        crate::arch::sched::sleep_ms(PASS_MS);
+                        continue;
+                    }
+                }
             }
             // A user close (the close disc → `wm::close` clears `WIN` through the holder registry): drop the
             // surface now that no row reads it, and stay closed for this stream.
@@ -551,12 +612,163 @@ mod view {
             crate::arch::sched::sleep_ms(PASS_MS);
         };
         close(&mut win);
+        if why == "revoked" || why == "not-now" {
+            stop_stream(why); // CAMDOT (B702): the user's No / Revoke ends the stream itself, so the dot goes out with it
+        }
         serial_println!(
             "[uvc] view end reason={} frames={} dropped={} bad={} camera_frames={} ms={}",
             why, SHOWN.load(Ordering::Relaxed), DROPPED.load(Ordering::Relaxed), BAD.load(Ordering::Relaxed),
             CAM.load(Ordering::Relaxed), crate::arch::ms().wrapping_sub(t0)
         );
         TASK.store(false, Ordering::Release);
+    }
+}
+
+// ── CAMDOT (rmbp-ledger B702, R130, BP-bar-10/12): the in-use light and the grant ─────────────────────────────────
+//
+// M1 THE COUNT. A stream is OPEN from the class driver's `stream_arm` (the assembler takes the camera's bytes) to its
+// `stream_disarm` — [`arm`] / [`disarm`] above, the driver's own two calls. [`open_streams`] is that count (the class
+// driver holds ONE stream, so 0 or 1); the menu bar's camera item (`video::menubar::camdot`) reads it on every
+// composite and paints the camera glyph and the accent dot while it is not 0. No app holds a handle on the dot: an
+// app can neither paint it nor hide it, and it is on from the first byte the assembler keeps — before the ask is
+// answered — so a picture can never reach RAM with the dot off. Microphone: no seam (HDA has no capture stream in
+// the tree; the codec walk's `capture` reads amp caps only), so there is no mic item.
+//
+// M2 THE GRANT. The app is the viewer (`uvc-view`, the window "Camera"). Before it copies one frame it consults
+// Principia (`prefs::decided("camera", "Camera", "-")`, key `system.decisions.camera.Camera-<fnv64>`); with no kept
+// answer it raises ONE ask (`<app> wants the camera`: Not now · Allow). Allow is kept (`prefs::decide`) and listed on
+// Settings > Privacy with every other decision (REASK's rows); Not now is not kept, and the stream is stopped. A
+// Revoke there calls [`revoked`] BEFORE the store write; the viewer sees it on its next 8 ms pass, closes its window
+// and stops the stream (`uvc::stream_disarm`), so the dot goes out with it. With no viewer alive, [`revoked`]
+// stops the stream itself.
+//
+// M3 THE WIRE. `[cam] stream owner=<uvc or uvc-view or -> open=<n> dot=<on or off>` at every change of owner or
+// count (the judge's answer); the painter's own edge `[cam] dot painted=<on or off> owner= open= x=`;
+// `[cam] revoke app= stopped_ms=`; `tests camdot`.
+
+/// The app the grant is for (the viewer's window title).
+pub const CAM_APP: &str = "Camera";
+/// The decisions' `<domain>` segment (`system.decisions.camera.*`).
+pub const CAM_DOMAIN: &str = "camera";
+/// The kept answer's word.
+const ANS_ALLOW_WORD: &str = "allow";
+/// The ask's state: none yet, Allow, Not now.
+const ANS_NONE: u8 = 0;
+const ANS_ALLOW: u8 = 1;
+const ANS_NOT_NOW: u8 = 2;
+/// A post the dialog queue refused (one already pending) is retried after this long.
+#[allow(dead_code)]
+const ASK_RETRY_MS: u64 = 500;
+/// "Within one frame": a revoke stops the stream inside one 60 Hz frame.
+const REVOKE_FRAME_MS: u64 = 17;
+/// Who holds the open stream: nobody, the driver (no app granted yet), the viewer.
+const OWNER_NONE: u8 = 0;
+const OWNER_DRIVER: u8 = 1;
+const OWNER_VIEW: u8 = 2;
+
+static ANSWER: AtomicU8 = AtomicU8::new(ANS_NONE);
+#[allow(dead_code)]
+static ASK_UP: AtomicBool = AtomicBool::new(false);
+#[allow(dead_code)]
+static ASKS: AtomicU32 = AtomicU32::new(0);
+static REVOKED: AtomicBool = AtomicBool::new(false);
+static REVOKE_AT: AtomicU64 = AtomicU64::new(0);
+/// The last revoke's ms from [`revoked`] to the stream's disarm (`u64::MAX` = none yet).
+static REVOKE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Streams opened since boot (the fixture's `opens=`).
+static OPENS: AtomicU32 = AtomicU32::new(0);
+static OWNER: AtomicU8 = AtomicU8::new(OWNER_NONE);
+
+/// **THE COUNT the menu bar paints from**: open UVC streams (relaxed load; legal from `strip::compose_all`).
+#[inline]
+pub fn open_streams() -> u32 {
+    ARMED.load(Ordering::Acquire) as u32
+}
+
+/// The owning task's name for the wire.
+pub fn owner_name() -> &'static str {
+    match OWNER.load(Ordering::Relaxed) {
+        OWNER_DRIVER => "uvc",
+        OWNER_VIEW => "uvc-view",
+        _ => "-",
+    }
+}
+
+/// The judge: the dot is on while any stream is open. PURE.
+pub fn dot_word(open: u32) -> &'static str {
+    if open != 0 { "on" } else { "off" }
+}
+
+/// The ask's answer from the dialog's `(ok, button)`: the default (Allow, index 1) grants; anything else is Not now.
+/// PURE.
+pub fn answer_of(ok: bool, ix: u8) -> u8 {
+    if ok && ix == 1 { ANS_ALLOW } else { ANS_NOT_NOW }
+}
+
+fn say_stream() {
+    let n = open_streams();
+    serial_println!("[cam] stream owner={} open={} dot={}", owner_name(), n, dot_word(n));
+}
+
+fn cam_opened(slot: u8) {
+    REVOKED.store(false, Ordering::Release);
+    OWNER.store(OWNER_DRIVER, Ordering::Relaxed);
+    let n = OPENS.fetch_add(1, Ordering::Relaxed) + 1;
+    serial_println!("[cam] open slot={} opens={}", slot, n);
+    say_stream();
+}
+
+fn cam_closed() {
+    OWNER.store(OWNER_NONE, Ordering::Relaxed);
+    say_stream();
+}
+
+/// The viewer's first question: is the grant kept? (`[decision] consult …` on the wire when it is.)
+#[allow(dead_code)]
+fn cam_consult() -> bool {
+    ANSWER.store(ANS_NONE, Ordering::Release);
+    let kept = crate::prefs::decided(CAM_DOMAIN, CAM_APP, "-").as_deref() == Some(ANS_ALLOW_WORD);
+    if kept {
+        cam_granted("decision");
+    }
+    kept
+}
+
+#[allow(dead_code)]
+fn cam_granted(via: &str) {
+    OWNER.store(OWNER_VIEW, Ordering::Relaxed);
+    serial_println!("[cam] grant app={} answer={} via={}", CAM_APP, ANS_ALLOW_WORD, via);
+    say_stream();
+}
+
+/// Settings > Privacy's Revoke (the latched key, before the store write): the camera's decision stops the stream.
+pub fn revoked(key: &str) {
+    if key != crate::prefs::decision_key(CAM_DOMAIN, CAM_APP) {
+        return;
+    }
+    if !ARMED.load(Ordering::Acquire) {
+        serial_println!("[cam] revoke app={} open=0 (nothing streaming; the next stream asks)", CAM_APP);
+        return;
+    }
+    REVOKE_AT.store(crate::arch::ms(), Ordering::Relaxed);
+    REVOKED.store(true, Ordering::Release);
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if view::running() {
+        return; // the viewer stops it on its next pass (it holds the frames and the window)
+    }
+    stop_stream("revoked");
+}
+
+/// End the stream (the class driver's own disarm: the assembler and its buffers go, the count drops, the dot goes
+/// out). Task / service context only — never the claim path.
+fn stop_stream(why: &str) {
+    class::stream_disarm();
+    if REVOKED.swap(false, Ordering::AcqRel) {
+        let ms = crate::arch::ms().wrapping_sub(REVOKE_AT.load(Ordering::Relaxed));
+        REVOKE_MS.store(ms, Ordering::Relaxed);
+        serial_println!("[cam] revoke app={} stopped_ms={} why={}", CAM_APP, ms, why);
+    } else {
+        serial_println!("[cam] stop app={} why={}", CAM_APP, why);
     }
 }
 
@@ -612,6 +824,7 @@ pub fn ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("uvccam", fixture);
+        crate::tests::register("camdot", camdot_fixture); // CAMDOT (B702)
     }
 }
 
@@ -783,4 +996,79 @@ fn fixture() {
             ok(parse_ok), c.nfmt, ok(probe_ok), ok(convert_ok), sc.fails, sc.first.0, sc.first.1, sc.first.2, stream
         );
     }
+}
+
+// ── `tests camdot` (CAMDOT B702) ────────────────────────────────────────────────────────────────────────────
+
+/// The pure legs (the judge, the decision's key, the answer map), then — with a camera streaming on x86 `wc` — the
+/// live legs: the menu bar PAINTS the dot (its own edge counter), the Privacy tab's revoke seam ([`revoked`], the
+/// same call the Revoke button makes; the kept decision is not touched) stops the stream inside one frame, and the
+/// bar paints the dot out. The live leg ENDS the stream (replug the camera to stream again). No device (QEMU has no
+/// usb camera in the lanes, and UVCCAM has no synthetic stream): `-> SKIP(no-device)` after the pure legs.
+fn camdot_fixture() {
+    let mut sc = Score { fails: 0, first: ("", 0, 0) };
+    sc.check("judge.off", (dot_word(0) == "off") as u64, 1);
+    sc.check("judge.on", (dot_word(1) == "on") as u64, 1);
+    sc.check("judge.many", (dot_word(3) == "on") as u64, 1);
+    let key = crate::prefs::decision_key(CAM_DOMAIN, CAM_APP);
+    sc.check("key.domain", key.starts_with("decisions.camera.Camera-") as u64, 1);
+    sc.check("key.per_app", (crate::prefs::decision_key(CAM_DOMAIN, "Stria") != key) as u64, 1);
+    sc.check("answer.allow", answer_of(true, 1) as u64, ANS_ALLOW as u64);
+    sc.check("answer.not_now", answer_of(false, 0) as u64, ANS_NOT_NOW as u64);
+    sc.check("answer.close_box", answer_of(false, 1) as u64, ANS_NOT_NOW as u64);
+    let logic = sc.fails == 0;
+    let opens = OPENS.load(Ordering::Relaxed);
+    #[allow(unused_mut)]
+    let mut counts = (0u32, 0u32);
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        counts = crate::video::menubar::camdot::counts();
+    }
+    let ok = |b: bool| if b { "ok" } else { "FAIL" };
+    if !ARMED.load(Ordering::Acquire) {
+        if logic {
+            serial_println!(
+                ":: CAMDOT: opens={} dot_on={} dot_off={} revoke_ms=- logic=ok mic=no-seam -> SKIP(no-device) ::",
+                opens, counts.0, counts.1
+            );
+        } else {
+            serial_println!(
+                ":: CAMDOT: opens={} dot_on={} dot_off={} revoke_ms=- logic=FAIL first={} got={} want={} mic=no-seam -> FAIL ::",
+                opens, counts.0, counts.1, sc.first.0, sc.first.1, sc.first.2
+            );
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        use crate::video::menubar::camdot;
+        let wait = |ms: u64, f: &dyn Fn() -> bool| -> bool {
+            let t0 = crate::arch::ms();
+            while !f() {
+                if crate::arch::ms().wrapping_sub(t0) >= ms {
+                    return false;
+                }
+                crate::arch::sched::sleep_ms(5);
+            }
+            true
+        };
+        let lit = wait(2_000, &|| camdot::painted());
+        REVOKE_MS.store(u64::MAX, Ordering::Relaxed);
+        revoked(&key);
+        let stopped = wait(1_000, &|| !ARMED.load(Ordering::Acquire) && REVOKE_MS.load(Ordering::Relaxed) != u64::MAX);
+        let dark = wait(2_000, &|| !camdot::painted());
+        let ms = REVOKE_MS.load(Ordering::Relaxed);
+        let (on, off) = camdot::counts();
+        let pass = logic && lit && stopped && dark && ms <= REVOKE_FRAME_MS;
+        let ms_s = if ms == u64::MAX { String::from("-") } else { alloc::format!("{}", ms) };
+        serial_println!(
+            ":: CAMDOT: opens={} dot_on={} dot_off={} revoke_ms={} logic={} lit={} stopped={} dark={} mic=no-seam stream=stopped(replug) -> {} ::",
+            opens, on, off, ms_s, ok(logic), ok(lit), ok(stopped), ok(dark), if pass { "PASS" } else { "FAIL" }
+        );
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    serial_println!(
+        ":: CAMDOT: opens={} dot_on={} dot_off={} revoke_ms=- logic={} mic=no-seam -> SKIP(no-bar) ::",
+        opens, counts.0, counts.1, ok(logic)
+    );
 }
