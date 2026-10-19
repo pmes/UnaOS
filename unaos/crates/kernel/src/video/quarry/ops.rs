@@ -672,7 +672,7 @@ fn do_delete() {
 /// TRASH (R75): Delete = move to `.Trash` (index line appended).
 fn do_trash() {
     let Some((_, path, _)) = selection() else { return };
-    match crate::fs::trash::trash(&path) {
+    match crate::video::quarry::undo::trash(&path) {
         Ok(n) => say(alloc::format!("moved to Trash as {}", n)),
         Err(e) => {
             refuse_notice(&e);
@@ -703,7 +703,7 @@ fn do_restore() {
         refuse_notice("Restore works on a row inside the Trash (use Show Trash)");
         return;
     }
-    match crate::fs::trash::restore(&leaf(&path)) {
+    match crate::video::quarry::undo::restore(&leaf(&path)) {
         Ok(p) => say(alloc::format!("restored {}", p)),
         Err(e) => {
             refuse_notice(&e);
@@ -757,7 +757,7 @@ fn do_paste() {
         return;
     };
     let Some(c) = cwd() else { return };
-    let r = op_copy(&src, &c);
+    let r = crate::video::quarry::undo::copy(&src, &c);
     let (dst, res) = match r {
         Ok(d) => (d, Ok(())),
         Err(e) => (c.clone(), Err(e)),
@@ -828,7 +828,7 @@ fn commit_edit() {
         }
         Target::Rename(src) => {
             let dst = join(&parent(&src), e.buf.trim());
-            let r = op_rename(&src, &dst);
+            let r = crate::video::quarry::undo::rename(&src, &dst);
             log_op("rename", &src, &dst, &r);
             if let Err(why) = &r {
                 if why.starts_with("files are") || why.starts_with("a path") {
@@ -843,7 +843,7 @@ fn commit_edit() {
         Target::NewFolder => {
             let c = cwd().unwrap_or_default();
             let dst = join(&c, e.buf.trim());
-            let r = op_mkdir(&dst);
+            let r = crate::video::quarry::undo::mkdir(&dst);
             log_op("mkdir", "-", &dst, &r);
             if let Err(why) = &r {
                 if why.starts_with("files are") || why.starts_with("a path") {

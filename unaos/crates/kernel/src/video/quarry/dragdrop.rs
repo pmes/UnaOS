@@ -232,10 +232,10 @@ pub fn drop(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
             for s in p.paths.iter() {
                 let same = volume_of(&ms, s).eq_ignore_ascii_case(&volume_of(&ms, dir));
                 let r = if same && !option && !matches!(t, Target::Volume { .. }) {
-                    super::ops::op_rename(s, &join(dir, &leaf(s)))
+                    crate::video::quarry::undo::rename(s, &join(dir, &leaf(s)))
                 } else {
                     act = Action::Copy;
-                    super::ops::op_copy(s, dir).map(|_| ())
+                    crate::video::quarry::undo::copy(s, dir).map(|_| ())
                 };
                 if let Err(e) = r {
                     serial_println!("[dnd] {} src={} dst={} reason={}", if act == Action::Copy { "copy" } else { "move" }, s, dir, e);
