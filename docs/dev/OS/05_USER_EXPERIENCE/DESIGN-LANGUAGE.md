@@ -283,6 +283,11 @@ Shadow notation is `x y blur` in pt, black at the stated alpha. Focus changes sh
 do (libadwaita's backdrop transition is 200 ms [S22] [S23]). That gives a focused window a clear lift with no colour
 change in its title.
 
+**The falloff rule (WINEDGE2, rmbp-ledger B668).** A shadow only ever darkens the backdrop the desktop shows beside it, on
+every look: the margin's outermost pixel IS that backdrop's pixel, the innermost is it multiplied down by the level's
+strength (the table above, `palette_core` tokens, never a literal), and a picture under the margin (the starfield's
+stars) stays visible, only dimmed — the fill under a shadow and the desktop layer beside it lay the same base.
+
 **DECISION — shadows are pre-rendered, never computed per frame.** A window's shadow is a 9-slice (four corner tiles
 plus four edge ramps) rendered once per (radius, level, scale, theme) into a cached alpha table and blitted with the
 window. The cost is one alpha-blend pass over the shadow's band, about 40 pt × the perimeter: about 0.5 M pixels (about
