@@ -4077,3 +4077,21 @@ chunk at its offset). `tests una` (`kernel/src/unaapp.rs`) lays `/var/tmp/una/fi
 through argv[1], types `// una⏎`, saves, and reads the bytes back; its witness grows `saved=<1|0|skip>
 highlight=<n>` (the editor's syntax_core token count) and `[unaapp] … acl=<refused|open|n/a>` (the default
 kernel's write path asked to create `/apps/UNAPROBE.TXT` as `anon`).
+
+## FPU — ring 3 gets the x87/SSE unit, one context per task (rmbp-ledger B666, 2026-10-19, x86)
+
+The ring-3 target `unaos/x86_64-unknown-none.json` is hardware-float (`+sse,+sse2`, AVX off, the softfloat ABI
+dropped), so every `user-*` ELF is rebuilt with SSE2 float; the kernel target `x86_64-unaos.json` stays `+soft-float`,
+which is why nothing on the SYSCALL path (`unaos_syscall_entry`, GPRs only) or in an IRQ handler touches XMM, MXCSR or
+x87. Each ring-3 task — a process or a `SYS_THREAD_SPAWN` thread — owns a 512-byte 16-aligned FXSAVE image in its task
+struct (`Task::fpu`, seeded with FCW 0x37F / MXCSR 0x1F80). The scheduler's two hooks (`sched::fpu`) are EAGER: at
+dispatch a core's first ring-3 task sets CR0.MP|NE, clears EM|TS and sets CR4.OSFXSR|OSXMMEXCPT once, then the image is
+`fxrstor64`ed; at switch-back (yield, preempt, block, exit — before the box is requeued, parked or freed) it is
+`fxsave64`d and the registers are scrubbed to the initial image, so a stolen task restores on its new core and no residue
+crosses tasks. Lazy CR0.TS/#NM is not used: no #NM handler exists and the first-entry `fninit` scrub runs at CPL 0. The
+Linux-ABI box keeps its LINUXABI3 PML4-keyed slot table (fork copies into it before the child exists) behind the same two
+hooks; a slotless Linux task still runs with OSFXSR clear. A UnaOS program is now entered at rsp ≡ 8 (mod 16), as if
+called (`user_task_trampoline`): the loaders hand a 16-aligned top and a hardware-float `extern "C"` entry spills with
+`movaps`. Witness: `tests fpu` runs BIG.ELF's `big fpu` (two tasks, 64 yield rounds each, sixteen XMM registers and a
+per-task MXCSR rounding mode compared after every yield, one f64/f32 sum held across yields) →
+`:: FPU: osfxsr=1 ctx_bytes=512 tasks=2 switches=<n> xmm_survived=ok mode=eager -> PASS ::`.

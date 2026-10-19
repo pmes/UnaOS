@@ -590,3 +590,205 @@ pub mod starfield {
     pub const BEAM_CORE: (u32, u32) = (0x00FA_FCFF, 0x00F2_FAFF);
     pub const BEAM_GLOW: (u32, u32) = (0x00B4_D2FA, 0x0060_B0FF);
 }
+
+/// CONTRAST (rmbp-ledger B664) — the INCREASE-CONTRAST variant of the token table (Settings → Accessibility,
+/// `system.accessibility.increase_contrast`): the SAME 27 tokens, the six surfaces, the discs, status, inks and
+/// syntax UNCHANGED, the text ramp and the three lines pushed toward the ends of the OKLCH lightness range so every
+/// text token meets DESIGN-LANGUAGE §2.3's contrast floor for this set, WCAG 1.4.6's enhanced 7:1, against EVERY
+/// surface of its set. Appended at the crate's tail so no line above moves.
+///
+/// DERIVATION (§10's method, rerunnable): a token is OKLCH (L, 0.006, 265) — §2.3's neutral trace of the accent hue —
+/// → OKLab → linear sRGB (Ottosson's matrices) → gamma-encoded and rounded to 8 bits; WCAG 2.x relative luminance
+/// `Y = 0.2126 R + 0.7152 G + 0.0722 B` of the linearised channels (`c <= 0.04045 ? c/12.92 : ((c+0.055)/1.055)^2.4`)
+/// and the ratio `(Y_hi + 0.05) / (Y_lo + 0.05)`, never rounded. In Light, L is the HIGHEST lightness (in 0.001 steps)
+/// whose ratio to the LIGHTEST-ink-hostile surface (the minimum over all six) reaches the target; in Dark, the
+/// LOWEST. Targets: `text.primary` is pinned at the ends (L 0.13 Light, 0.985 Dark); `text.secondary` 9:1 (so the
+/// ramp still steps above the floor); `text.tertiary` 7:1 (the floor); `text.disabled` 4.5:1 (no longer exempt-dim);
+/// `line.subtle` 3:1 (§2.3's control boundary, [S39] — "`line.*` to `line.control`"); `line.strong` 4.5:1;
+/// `line.control` 6:1. Results (L → hex, minimum ratio over the six surfaces):
+///
+/// | token | Light | Dark |
+/// |---|---|---|
+/// | text.primary | 0.130 → 06070A, 17.19 | 0.985 → F8FAFE, 12.63 |
+/// | text.secondary | 0.367 → 3D3F42, 9.01 | 0.875 → D4D6DA, 9.07 |
+/// | text.tertiary | 0.427 → 4D4F52, 7.01 | 0.797 → BBBDC1, 7.01 |
+/// | text.disabled | 0.529 → 6A6B6F, 4.54 | 0.675 → 95979B, 4.51 |
+/// | line.subtle | 0.628 → 87888C, 3.02 | 0.575 → 77797C, 3.02 |
+/// | line.strong | 0.529 → 6A6B6F, 4.54 | 0.675 → 95979B, 4.51 |
+/// | line.control | 0.461 → 57585C, 6.06 | 0.753 → ADAFB3, 6.00 |
+///
+/// SOFTY's Light table is its own (chroma 0, `softy::*`), so its pairs are solved the same way against Softy's five
+/// grounds (SURFACE, SURFACE_IDLE, FLYOUT, FLYOUT_FOOT, FIELD): TEXT L 0.13 → 070707 (17.52), TEXT_2 9:1 → 404040
+/// (9.02), TEXT_IDLE 7:1 → 505050 (7.01), EDGE_IDLE 3:1 → 8A8A8A (3.00), FIELD_LINE 4.5:1 → 6C6C6C (4.57); the idle
+/// pip takes TEXT_IDLE. Softy's Dark reads the Dark column above (its `Sem` seam). The const block at the end of this
+/// module re-derives every ratio from the hex at compile time ([`ratio_x100`]) and fails the build below a floor.
+pub mod contrast {
+    use super::{Tok, TOKENS};
+
+    /// `text.primary` (Light, Dark).
+    pub const TEXT_PRIMARY: (u32, u32) = (0x0006_070A, 0x00F8_FAFE);
+    /// `text.secondary` — 9:1 on every surface.
+    pub const TEXT_SECONDARY: (u32, u32) = (0x003D_3F42, 0x00D4_D6DA);
+    /// `text.tertiary` — the 7:1 floor on every surface.
+    pub const TEXT_TERTIARY: (u32, u32) = (0x004D_4F52, 0x00BB_BDC1);
+    /// `text.disabled` — 4.5:1 on every surface.
+    pub const TEXT_DISABLED: (u32, u32) = (0x006A_6B6F, 0x0095_979B);
+    /// `line.subtle` — 3:1 on every surface.
+    pub const LINE_SUBTLE: (u32, u32) = (0x0087_888C, 0x0077_797C);
+    /// `line.strong` — 4.5:1 on every surface.
+    pub const LINE_STRONG: (u32, u32) = (0x006A_6B6F, 0x0095_979B);
+    /// `line.control` — 6:1 on every surface.
+    pub const LINE_CONTROL: (u32, u32) = (0x0057_585C, 0x00AD_AFB3);
+
+    /// The base set with the seven pushed tokens replaced (`dark` picks the column).
+    const fn push(base: [u32; TOKENS], dark: bool) -> [u32; TOKENS] {
+        const fn c(p: (u32, u32), dark: bool) -> u32 {
+            if dark { p.1 } else { p.0 }
+        }
+        let mut r = base;
+        r[Tok::LineSubtle as usize] = c(LINE_SUBTLE, dark);
+        r[Tok::LineStrong as usize] = c(LINE_STRONG, dark);
+        r[Tok::LineControl as usize] = c(LINE_CONTROL, dark);
+        r[Tok::TextPrimary as usize] = c(TEXT_PRIMARY, dark);
+        r[Tok::TextSecondary as usize] = c(TEXT_SECONDARY, dark);
+        r[Tok::TextTertiary as usize] = c(TEXT_TERTIARY, dark);
+        r[Tok::TextDisabled as usize] = c(TEXT_DISABLED, dark);
+        r
+    }
+
+    /// The LIGHT set under increased contrast.
+    pub const LIGHT: [u32; TOKENS] = push(super::LIGHT, false);
+    /// The DARK set under increased contrast.
+    pub const DARK: [u32; TOKENS] = push(super::DARK, true);
+
+    /// The set a look resolves through: `dark` picks the column, `on` the contrast variant.
+    #[inline]
+    pub const fn rows(dark: bool, on: bool) -> &'static [u32; TOKENS] {
+        match (dark, on) {
+            (false, false) => &super::LIGHT,
+            (true, false) => &super::DARK,
+            (false, true) => &LIGHT,
+            (true, true) => &DARK,
+        }
+    }
+
+    /// SOFTY's own high-contrast pairs (its Light table; see the derivation above).
+    pub mod softy {
+        pub const TEXT: u32 = 0x070707;
+        pub const TEXT_2: u32 = 0x404040;
+        pub const TEXT_IDLE: u32 = 0x505050;
+        pub const EDGE_IDLE: u32 = 0x8A8A8A;
+        pub const FIELD_LINE: u32 = 0x6C6C6C;
+        pub const PIP: u32 = TEXT_IDLE;
+    }
+
+    /// One 8-bit sRGB channel, linearised (WCAG 2.x). `x^2.4 = x^2 * (x^2)^(1/5)`; the fifth root by Newton from 1.0
+    /// (the root lies in (0.27, 1] here, so 40 steps are far past convergence). No libm: `no_std`, const.
+    const fn lin(c: u32) -> f64 {
+        let v = c as f64 / 255.0;
+        if v <= 0.04045 {
+            return v / 12.92;
+        }
+        let x = (v + 0.055) / 1.055;
+        let a = x * x;
+        let mut y = 1.0;
+        let mut i = 0;
+        while i < 40 {
+            let y4 = y * y * y * y;
+            y -= (y4 * y - a) / (5.0 * y4);
+            i += 1;
+        }
+        a * y
+    }
+
+    /// WCAG 2.x relative luminance of a packed `0x00RRGGBB`.
+    pub const fn luminance(c: u32) -> f64 {
+        0.2126 * lin((c >> 16) & 255) + 0.7152 * lin((c >> 8) & 255) + 0.0722 * lin(c & 255)
+    }
+
+    /// The contrast ratio of two colours x100, floored (thresholds are never rounded up: 6.999 is 699).
+    pub const fn ratio_x100(a: u32, b: u32) -> u32 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        ((hi + 0.05) / (lo + 0.05) * 100.0) as u32
+    }
+
+    /// The six surfaces, [`Tok`] order (the grounds every text token is held against).
+    pub const SURFACES: [Tok; 6] =
+        [Tok::SurfaceWindow, Tok::SurfaceSidebar, Tok::SurfaceContent, Tok::SurfaceRaised, Tok::SurfaceOverlay, Tok::SurfaceSunken];
+
+    /// The lowest ratio (x100) of token `t` against the six surfaces of `set`.
+    pub const fn min_on_surfaces(set: &[u32; TOKENS], t: Tok) -> u32 {
+        let mut m = u32::MAX;
+        let mut i = 0;
+        while i < SURFACES.len() {
+            let r = ratio_x100(set[t as usize], set[SURFACES[i] as usize]);
+            if r < m {
+                m = r;
+            }
+            i += 1;
+        }
+        m
+    }
+
+    /// Softy's five Light grounds (the text pairs are held against each).
+    pub const SOFTY_GROUNDS: [u32; 5] =
+        [super::softy::SURFACE, super::softy::SURFACE_IDLE, super::softy::FLYOUT, super::softy::FLYOUT_FOOT, super::softy::FIELD];
+
+    /// The lowest ratio (x100) of `ink` against Softy's five Light grounds.
+    pub const fn softy_min(ink: u32) -> u32 {
+        let mut m = u32::MAX;
+        let mut i = 0;
+        while i < SOFTY_GROUNDS.len() {
+            let r = ratio_x100(ink, SOFTY_GROUNDS[i]);
+            if r < m {
+                m = r;
+            }
+            i += 1;
+        }
+        m
+    }
+
+    // The floors, re-derived from the hex at compile time: a value edited below its target fails the build.
+    const _: () = {
+        let sets = [&LIGHT, &DARK];
+        let mut s = 0;
+        while s < 2 {
+            let set = sets[s];
+            // The surfaces, discs, status, inks and syntax are the base set's: only the seven pushed tokens move.
+            let base = if s == 0 { &super::LIGHT } else { &super::DARK };
+            let mut i = 0;
+            while i < TOKENS {
+                let pushed = i >= Tok::LineSubtle as usize && i <= Tok::TextDisabled as usize;
+                assert!(pushed || set[i] == base[i]);
+                assert!(set[i] <= 0x00FF_FFFF);
+                i += 1;
+            }
+            assert!(min_on_surfaces(set, Tok::TextPrimary) >= 700);
+            assert!(min_on_surfaces(set, Tok::TextSecondary) >= 900);
+            assert!(min_on_surfaces(set, Tok::TextTertiary) >= 700);
+            assert!(min_on_surfaces(set, Tok::TextDisabled) >= 450);
+            assert!(min_on_surfaces(set, Tok::LineSubtle) >= 300);
+            assert!(min_on_surfaces(set, Tok::LineStrong) >= 450);
+            assert!(min_on_surfaces(set, Tok::LineControl) >= 600);
+            // Every pushed token is at least as far from the surfaces as its base value (contrast only rises).
+            let mut t = Tok::LineSubtle as usize;
+            while t <= Tok::TextDisabled as usize {
+                let tok = [Tok::LineSubtle, Tok::LineStrong, Tok::LineControl, Tok::TextPrimary, Tok::TextSecondary, Tok::TextTertiary, Tok::TextDisabled][t - Tok::LineSubtle as usize];
+                assert!(min_on_surfaces(set, tok) >= min_on_surfaces(base, tok));
+                t += 1;
+            }
+            s += 1;
+        }
+        assert!(softy_min(softy::TEXT) >= 700 && softy_min(softy::TEXT_2) >= 900 && softy_min(softy::TEXT_IDLE) >= 700);
+        assert!(softy_min(softy::EDGE_IDLE) >= 300 && softy_min(softy::FIELD_LINE) >= 450);
+        assert!(softy_min(softy::TEXT_2) >= softy_min(super::softy::TEXT_2) && softy_min(softy::TEXT_IDLE) >= softy_min(super::softy::TEXT_IDLE));
+        // The ramp keeps its order (darkest-first in Light, lightest-first in Dark).
+        assert!(luminance(LIGHT[Tok::TextPrimary as usize]) < luminance(LIGHT[Tok::TextSecondary as usize]));
+        assert!(luminance(LIGHT[Tok::TextSecondary as usize]) < luminance(LIGHT[Tok::TextTertiary as usize]));
+        assert!(luminance(DARK[Tok::TextPrimary as usize]) > luminance(DARK[Tok::TextSecondary as usize]));
+        assert!(luminance(DARK[Tok::TextSecondary as usize]) > luminance(DARK[Tok::TextTertiary as usize]));
+        // The method agrees with §2.3's published figure for the base set (text.primary on white, Light: >= 14.7).
+        assert!(ratio_x100(super::TEXT_PRIMARY.0, super::SURFACE_CONTENT.0) >= 1470);
+    };
+}
