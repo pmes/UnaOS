@@ -63,7 +63,7 @@ unsafe impl GlobalAlloc for Locked<Heap> {
         arch::without_interrupts(|| {
             let mut heap = self.inner.lock();
             match heap.allocate_first_fit(layout) {
-                Ok(ptr) => result = ptr.as_ptr(),
+                Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first
                 Err(_) => {}
             }
         });
@@ -160,4 +160,45 @@ pub fn heap_census(align: usize) -> HeapCensus {
 /// panic inside the allocator holds it for good).
 pub fn heap_busy() -> bool {
     ALLOCATOR.inner.is_locked()
+}
+
+// MEMLINE (rmbp-ledger B677, BP-bar-24, BP-bar-9) — THE HEAP'S HIGH-WATER, OVER A WINDOW. EL0MEM's census reads `used` and
+// `free` NOW; the bar's memory line needs the PEAK a span reached (a build that allocates and frees a transient buffer
+// leaves `used` where it found it and the cost unseen). [`high_note`] runs on every granted allocation, inside the heap
+// lock, so a plain load/compare/store is serialised by that lock (no locked RMW on the hot path); [`heap_high_reset`]
+// takes the same lock to open a window at the current `used`. Frees do not lower it: it is a high-water, read by
+// [`heap_high`]. The desktop family only (the one reader is `video::desktopbuild`): a build without the desktop links
+// none of it, and the alloc line above compiles as it did. At the tail: no line above moves.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static HEAP_HIGH: AtomicUsize = AtomicUsize::new(0);
+
+/// A granted allocation left the heap at `used` bytes: raise the window's high-water. Caller holds the heap lock.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+#[inline(always)]
+fn high_note(used: usize) {
+    if used > HEAP_HIGH.load(Ordering::Relaxed) {
+        HEAP_HIGH.store(used, Ordering::Relaxed);
+    }
+}
+
+/// The heap's `used` bytes now (one field read under the lock; never call it from inside an allocation).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn heap_used() -> usize {
+    arch::without_interrupts(|| ALLOCATOR.lock().used())
+}
+
+/// Open a high-water window: the mark restarts at `used` now, which it returns.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn heap_high_reset() -> usize {
+    arch::without_interrupts(|| {
+        let used = ALLOCATOR.lock().used();
+        HEAP_HIGH.store(used, Ordering::Relaxed);
+        used
+    })
+}
+
+/// The most `used` bytes the heap held since the last [`heap_high_reset`] (since boot if none).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn heap_high() -> usize {
+    HEAP_HIGH.load(Ordering::Relaxed)
 }

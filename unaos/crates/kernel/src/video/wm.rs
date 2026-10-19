@@ -1636,7 +1636,7 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     let mut probe: Option<(usize, usize)> = None;
     // VUGMIN-B — is the presenting owner hidden? Read under the same guard that marks the row, so the
     // answer and the mark are taken against one table state.
-    let skip;
+    let skip; #[cfg(all(target_arch = "x86_64", feature = "wc"))] let app_owner; // APPLAUNCH (B678): the presenting owner, for the first-present stamp below. ⚠ LINE-NEUTRAL fold.
     // WPACE-PANEL — is this row exempt from the present pacer? Kernel furniture (the console, the
     // shell, the desktop — anything in the reserved owner band) and the compat row (owner 0)
     // composite on every present exactly as before; only ring-3 presents are panel-paced. Read in
@@ -1709,8 +1709,8 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
         {
             pace_exempt = owner == 0 || is_kernel_owner(owner);
         }
-        skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire));
-    }
+        skip = owner_hidden(&t, owner, SHELL_Z.load(core::sync::atomic::Ordering::Acquire)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { app_owner = owner; }
+    } #[cfg(all(target_arch = "x86_64", feature = "wc"))] app_first_present(app_owner); // APPLAUNCH (B678): table released — the slot's first present takes its exec stamp and prints `[app]`. ⚠ LINE-NEUTRAL fold.
     // WPACE-PANEL — the pace decision, taken BEFORE `wcg::on_present` (review MAJOR 1). A coalesced
     // present must not run `on_present`: that call declares "the owner has finished this surface"
     // (bumps `APP_SEQ`, stores `cks_app`), but a coalesced owner returns immediately and keeps
@@ -4927,7 +4927,7 @@ pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = s
                 }
             }
         }
-        if !stole && (comp_svc_masked_decline() // GATESTEAL (B657): a MASKED composite on the SERVICE core declines before the CAS — never a masked pass on the device core (same-line fold; the `||` below closes it)
+        if !stole && (comp_svc_masked_decline() || pump_lane_decline() // GATESTEAL (B657): a MASKED composite on the SERVICE core declines before the CAS — never a masked pass on the device core (same-line fold; the `||` below closes it)
             || COMP_GATE
                 .compare_exchange(false, true, AcqRel, Relaxed)
                 .is_err())
@@ -10016,7 +10016,7 @@ pub fn comp_dead_core_take() -> Option<usize> {
         .compare_exchange(dead, usize::MAX, AcqRel, Relaxed)
         .ok()
         .map(|_| dead)
-} #[cfg(target_arch = "x86_64")] pub fn comp_dead_core_last() -> Option<usize> { let d = COMP_DEAD_LAST.load(core::sync::atomic::Ordering::Relaxed); if d == usize::MAX { None } else { Some(d) } } #[cfg(target_arch = "x86_64")] pub fn comp_steal_gen() -> u64 { COMP_STEAL_GEN.load(core::sync::atomic::Ordering::Relaxed) } #[cfg(target_arch = "x86_64")] pub fn comp_svc_masked_declined() -> u64 { COMP_SVC_MASKED_DECLINED.load(core::sync::atomic::Ordering::Relaxed) } #[cfg(target_arch = "x86_64")] pub fn comp_gate_hold_fixture(ms: u64) -> (bool, bool) { use core::sync::atomic::Ordering::{AcqRel, Relaxed}; let t0 = crate::arch::ms(); while COMP_GATE.compare_exchange(false, true, AcqRel, Relaxed).is_err() { if crate::arch::ms().saturating_sub(t0) > 1_000 { return (false, false); } crate::arch::sched::sleep_ms(1); } let me = crate::arch::sched::meter_current_cpu(); COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed); COMP_HOLDER_CORE.store(me, Relaxed); COMP_HOLDER_TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed); comp_mark(0, 4); comp_mark_row(1238); let h0 = crate::arch::ms(); while crate::arch::ms().saturating_sub(h0) < ms { crate::arch::sched::sleep_ms(10); } let stolen = COMP_HOLDER_CORE.load(Relaxed) != me; comp_mark(0, 0); comp_gate_release(); (true, stolen) } // GATESTEAL (B657) — ⚠ LINE-NEUTRAL fold. The readers the pump watch and `tests gatesteal` use (`comp_dead_core_last`, `comp_steal_gen`: gauges beside the mailbox, see COMP_DEAD_LAST; `comp_svc_masked_declined`), and the fixture's FORCED LONG STEP: take the gate exactly as `composite` does (CAS, t0, holder core and task, boot 1's own `phase 4 row 1238` breadcrumb), then hold it SLEEPING for `ms` — the pump stays a migratable task (in `SLEEPERS`, never `current`) while the steal fires on its own unmodified timer from a live core, and the release afterwards is the revenant decline `comp_gate_release` already makes. Returns (held, stolen).
+} #[cfg(target_arch = "x86_64")] pub fn comp_dead_core_last() -> Option<usize> { let d = COMP_DEAD_LAST.load(core::sync::atomic::Ordering::Relaxed); if d == usize::MAX { None } else { Some(d) } } #[cfg(target_arch = "x86_64")] pub fn comp_steal_gen() -> u64 { COMP_STEAL_GEN.load(core::sync::atomic::Ordering::Relaxed) } #[cfg(target_arch = "x86_64")] pub fn comp_svc_masked_declined() -> u64 { COMP_SVC_MASKED_DECLINED.load(core::sync::atomic::Ordering::Relaxed) } #[cfg(target_arch = "x86_64")] pub fn comp_gate_hold_fixture(ms: u64) -> (bool, bool) { use core::sync::atomic::Ordering::{AcqRel, Relaxed}; let t0 = crate::arch::ms(); while COMP_GATE.compare_exchange(false, true, AcqRel, Relaxed).is_err() { if crate::arch::ms().saturating_sub(t0) > 1_000 { return (false, false); } crate::arch::sched::sleep_ms(1); } let me = crate::arch::sched::meter_current_cpu(); COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed); COMP_HOLDER_CORE.store(me, Relaxed); COMP_HOLDER_TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed); comp_mark(0, 4); comp_mark_row(1238); let h0 = crate::arch::ms(); while crate::arch::ms().saturating_sub(h0) < ms { crate::arch::sched::sleep_ms(10); } let stolen = COMP_HOLDER_CORE.load(Relaxed) != me; comp_mark(0, 0); comp_gate_release(); (true, stolen) } #[cfg(target_arch = "x86_64")] static PUMP_GATE_OFF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); #[cfg(target_arch = "x86_64")] static PUMP_GATE_DECLINED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); #[cfg(target_arch = "x86_64")] static PUMP_GATE_RELEASED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); #[cfg(target_arch = "x86_64")] static PUMP_GATE_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); #[cfg(target_arch = "x86_64")] pub fn pump_gate_off(step: u8) { use core::sync::atomic::Ordering::{Relaxed, Release}; if let Some(t) = crate::arch::sched::current_id() { PUMP_GATE_DECLINED.store(0, Relaxed); PUMP_GATE_OFF.store((t << 8) | step as u64, Release); } } #[cfg(target_arch = "x86_64")] fn pump_lane_decline() -> bool { use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed}; let w = PUMP_GATE_OFF.load(Acquire); if w == 0 || crate::arch::sched::current_id() != Some(w >> 8) { return false; } PUMP_GATE_DECLINED.fetch_add(1, Relaxed); PUMP_GATE_RELEASED.fetch_or(1u32 << ((w & 0xff) as u32 & 31), AcqRel); true } #[cfg(target_arch = "x86_64")] pub fn pump_gate_on() { use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed}; let w = PUMP_GATE_OFF.load(Acquire); if w == 0 || crate::arch::sched::current_id() != Some(w >> 8) || PUMP_GATE_OFF.compare_exchange(w, 0, AcqRel, Relaxed).is_err() { return; } let n = PUMP_GATE_DECLINED.swap(0, AcqRel); if n == 0 { return; } let step = (w & 0xff) as usize; let bit = 1u32 << (step as u32 & 31); if PUMP_GATE_SAID.fetch_or(bit, AcqRel) & bit == 0 { serial_println!("[wcser] pump step={} gate=released declined={} redriven=1 (GATESTEAL2 B667: a long usb-pump step never holds COMP_GATE; its declined pass is re-driven once at the step boundary)", crate::video::lag::PUMP_NAMES.get(step).copied().unwrap_or("-"), n); } service_damage(); } #[cfg(target_arch = "x86_64")] pub fn pump_gate_released_steps() -> u32 { PUMP_GATE_RELEASED.load(core::sync::atomic::Ordering::Relaxed).count_ones() } #[cfg(target_arch = "x86_64")] pub fn comp_death_publish_fixture(dead: usize) { use core::sync::atomic::Ordering::{AcqRel, Relaxed}; let _ = COMP_DEAD_CORE.compare_exchange(usize::MAX, dead, AcqRel, Relaxed); COMP_DEAD_LAST.store(dead, Relaxed); COMP_STEAL_GEN.fetch_add(1, Relaxed); } // GATESTEAL (B657) — ⚠ LINE-NEUTRAL fold. The readers the pump watch and `tests gatesteal` use (`comp_dead_core_last`, `comp_steal_gen`: gauges beside the mailbox, see COMP_DEAD_LAST; `comp_svc_masked_declined`), and the fixture's FORCED LONG STEP: take the gate exactly as `composite` does (CAS, t0, holder core and task, boot 1's own `phase 4 row 1238` breadcrumb), then hold it SLEEPING for `ms` — the pump stays a migratable task (in `SLEEPERS`, never `current`) while the steal fires on its own unmodified timer from a live core, and the release afterwards is the revenant decline `comp_gate_release` already makes. Returns (held, stolen). GATESTEAL2 (rmbp-ledger B667) — the same LINE-NEUTRAL fold, code before this comment. THE PUMP LANE RELEASES THE GATE AROUND ITS LONG STEPS: `pump_gate_off(step)`/`pump_gate_on()` bracket the usb-pump's store-services, prtscr, bootlog and net-hda steps (main.rs usb_pump); while the word names the CALLING task, `composite` declines before the CAS (`pump_lane_decline`, beside the masked-service decline: COMP_PENDING, damage left on the table, cursor duty deferred), so no long step holds COMP_GATE and W5 has nothing to steal on the pump's core (flight 36 boot 1: `holder_tid=9`, the pump parked holding it, `last_step=store-services`). `pump_gate_on` re-drives a declined pass once at the step boundary (`service_damage`, a one-pass service-core holder, BP-cores-9) and says `[wcser] pump step=<name> gate=released` once per step per boot. `comp_death_publish_fixture` is `tests gatesteal2`'s synthetic death: the steal's own three publishes (mailbox, last, generation) without a gate.
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // WCSER-REMINT — THE SHELL WINDOW DOES NOT STAY A CORPSE ACROSS A REHOME.
@@ -30572,4 +30572,18 @@ fn bg_expect(x: usize, y: usize) -> u32 {
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn bg_expect(_x: usize, _y: usize) -> u32 {
     DESKTOP_BG
+}
+
+// APPLAUNCH (rmbp-ledger B678, BP-bar-7, BP-ring3-14) — TAIL-APPENDED. The FRAME stamp: called from `present_banded`
+// once the window table is released, with the presenting row's owner. A ring-3 row's owner is the `+1`-biased slot
+// (`owner_of_launch`); compat (0) and the kernel band are not launches. The slot's first present after an exec TAKES
+// the launcher's stamp (`procslot::launch::take`, a `swap(0)`), so the line prints once per launch; every later
+// present finds 0 and costs one atomic. Not on the WCSER composite path: this runs before the pass is decided.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn app_first_present(owner: u64) {
+    if owner == 0 || is_kernel_owner(owner) {
+        return;
+    }
+    let Some((name, len, ms)) = crate::procslot::launch::take((owner - 1) as usize) else { return };
+    serial_println!("[app] {} exec->frame ms={}", core::str::from_utf8(&name[..len]).unwrap_or("?"), ms);
 }

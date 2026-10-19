@@ -31,7 +31,9 @@
 //! * Per-role cached ATLASES: the glyph cache is split by (role, bold, weight, size) — one atlas per type role at
 //!   the panel's scale — under the one byte bound; an overflow drops whole atlases least-recently-used first, so
 //!   drawing a 40-pt clock never flushes the 13-pt body.
-//! * The fallback chain primary → [`Role::Fallback`] (Noto Sans, then DejaVu Sans) → [`Role::Script`] faces.
+//! * The fallback chain primary → the [`Role::Fallback`] and [`Role::Script`] faces in LOAD ORDER (GLYPHS, B676: the
+//!   kernel loads Noto Sans, the Noto script faces, then DejaVu Sans — DESIGN-LANGUAGE §2.2's Inter → Noto Sans by
+//!   script → DejaVu); [`Engine::resolve`] names the face (or `.notdef`) each glyph of a run resolved to.
 //!
 //! FONTS2 (rmbp-ledger B650) reads two more variation tables through [`crate::Font`]: `MVAR` (the line metrics,
 //! x-height, cap height and underline of an instance; [`Engine::line_metrics`] takes the regular instance at the
@@ -48,15 +50,16 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// What a face is FOR. The primary of a [`Style`] is the slot with its role (and weight); [`Role::Fallback`]
-/// slots (FONTSCRAFT: Noto Sans, then DejaVu Sans) are tried after it, then the [`Role::Script`] slots.
+/// and [`Role::Script`] slots are tried after it, in load order (GLYPHS, B676: Noto Sans, the Noto script faces,
+/// DejaVu Sans).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Sans,
     Serif,
     Mono,
     Script,
-    /// FONTSCRAFT (B640): the general fallback faces, in load order, after the primary and before the scripts —
-    /// DESIGN-LANGUAGE §2.2's chain Inter → Noto Sans → DejaVu Sans (→ the kernel's bitmap atlas).
+    /// FONTSCRAFT (B640): the general fallback faces, after the primary, in load order with the script faces —
+    /// DESIGN-LANGUAGE §2.2's chain Inter → Noto Sans (script by script) → DejaVu Sans (→ the kernel's bitmap atlas).
     Fallback,
 }
 
@@ -133,6 +136,18 @@ impl Style {
 pub struct Placed {
     pub face: u8,
     pub glyph: u16,
+    pub x: f32,
+    pub y: f32,
+    pub adv: f32,
+}
+
+/// GLYPHS (B676): a glyph of a run as [`Engine::resolve`] resolved it — [`Placed`] plus the source cluster (byte
+/// offset of the first character it stands for).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Resolved {
+    pub face: u8,
+    pub glyph: u16,
+    pub cluster: usize,
     pub x: f32,
     pub y: f32,
     pub adv: f32,
@@ -282,8 +297,9 @@ impl<'a> Engine<'a> {
     }
 
     /// The fallback stack for a style: its primary, then (for serif/mono) the sans face of the same weight, then
-    /// the [`Role::Fallback`] faces of that weight (a variable fallback serves both weights), then every script
-    /// face.
+    /// the [`Role::Fallback`] faces of that weight (a variable fallback serves both weights) and every script face,
+    /// in LOAD ORDER (GLYPHS, B676): the loader's table is the chain, so the kernel's Noto Sans → Noto script faces →
+    /// DejaVu Sans holds and a script a Noto face covers never resolves to DejaVu first (DESIGN-LANGUAGE §2.2).
     fn stack(&self, role: Role, bold: bool) -> Vec<usize> {
         let mut v = Vec::new();
         if let Some(p) = self.primary(role, bold) {
@@ -297,16 +313,18 @@ impl<'a> Engine<'a> {
             }
         }
         for (i, s) in self.slots.iter().enumerate() {
-            if s.role == Role::Fallback && !v.contains(&i) && (s.bold == bold || (!s.bold && s.font.has_axis(WGHT))) {
-                v.push(i);
-            }
-        }
-        for (i, s) in self.slots.iter().enumerate() {
-            if s.role == Role::Script {
+            let fallback = s.role == Role::Fallback && (s.bold == bold || (!s.bold && s.font.has_axis(WGHT)));
+            if (fallback || s.role == Role::Script) && !v.contains(&i) {
                 v.push(i);
             }
         }
         v
+    }
+
+    /// GLYPHS (B676): the names of the faces `style` falls back through, in the order a cluster tries them — what
+    /// a witness prints as the resolved chain (the kernel appends its bitmap atlas, `font8x8`, as the terminal).
+    pub fn chain_names(&self, style: &Style) -> Vec<&'static str> {
+        self.stack(style.role, style.bold).into_iter().map(|i| self.slots[i].name).collect()
     }
 
     /// The `wght` slot `face` is instanced at for `style` (0 = the face as loaded).
@@ -428,6 +446,27 @@ impl<'a> Engine<'a> {
         }) {
             return Some(i);
         }
+        let (resolved, pen) = self.shape_glyphs(text, style, size_64)?;
+        let glyphs = resolved.into_iter().map(|r| Placed { face: r.face, glyph: r.glyph, x: r.x, y: r.y, adv: r.adv }).collect();
+        self.stats.runs_shaped += 1;
+        let run = Run { style, size_64, text: text.to_vec(), glyphs, width: pen };
+        let i = if self.runs.len() < RUN_CAP {
+            self.runs.push(run);
+            self.runs.len() - 1
+        } else {
+            let i = self.run_next % RUN_CAP;
+            self.runs[i] = run;
+            i
+        };
+        self.run_next = (i + 1) % RUN_CAP;
+        Some(i)
+    }
+
+    /// The one shaping path (bidi, script runs, per-cluster fallback over [`Engine::stack`], variable instances,
+    /// features, tracking): the glyphs in visual order with the source cluster each came from, and the pen advance.
+    /// `None` when no face of the role (or sans) is loaded. [`Engine::shape_run`] caches it; [`Engine::resolve`]
+    /// hands it out with the clusters (GLYPHS, B676).
+    fn shape_glyphs(&self, text: &[u8], style: Style, size_64: u32) -> Option<(Vec<Resolved>, f32)> {
         let stack = self.stack(style.role, style.bold);
         if stack.is_empty() {
             return None;
@@ -451,21 +490,19 @@ impl<'a> Engine<'a> {
             if track != 0.0 && g.x_advance != 0 {
                 adv += track;
             }
-            glyphs.push(Placed { face: stack[fi] as u8, glyph: g.glyph, x: pen + g.x_offset as f32 * sc, y: -(g.y_offset as f32) * sc, adv });
+            glyphs.push(Resolved { face: stack[fi] as u8, glyph: g.glyph, cluster: g.cluster, x: pen + g.x_offset as f32 * sc, y: -(g.y_offset as f32) * sc, adv });
             pen += adv;
         }
-        self.stats.runs_shaped += 1;
-        let run = Run { style, size_64, text: text.to_vec(), glyphs, width: pen };
-        let i = if self.runs.len() < RUN_CAP {
-            self.runs.push(run);
-            self.runs.len() - 1
-        } else {
-            let i = self.run_next % RUN_CAP;
-            self.runs[i] = run;
-            i
-        };
-        self.run_next = (i + 1) % RUN_CAP;
-        Some(i)
+        Some((glyphs, pen))
+    }
+
+    /// GLYPHS (B676): `text` in `style` resolved glyph by glyph through the fallback chain — the slot each glyph
+    /// came from, its glyph id (0 = `.notdef`: no face in the chain covers that cluster), its source cluster (byte
+    /// offset) and its pen position, in VISUAL order (an RTL run's clusters descend as `x` grows). The same shaping
+    /// path the draw calls take, uncached. Empty when no face can draw it.
+    pub fn resolve(&self, text: &[u8], style: Style) -> Vec<Resolved> {
+        let size_64 = floor(style.size * 64.0 + 0.5) as u32;
+        self.shape_glyphs(text, style, size_64).map_or_else(Vec::new, |r| r.0)
     }
 
     /// Advance width of `text` in px (unhinted, fractional). 0 when no face can draw it.
