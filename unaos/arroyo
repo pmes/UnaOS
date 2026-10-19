@@ -583,6 +583,7 @@ _feats="${_feats}sdw,"
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
+[ -n "${UNAOS_A2DP:-}" ] && _feats="${_feats}a2dp,"   # A2DPENV (rmbp-ledger B752): the Bluetooth A2DP source (drivers/bt/*, the BTHID hooks, audio's `bt` sink, `tests a2dp`); implies `btc` in Cargo.toml (A2DPKNOB B750). x86-only: stripped by `arm_features` below. Kept in sync with builder/src/main.rs, banner-cert.sh, k8-reach.registry.
 # BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST. Every BR/EDR attempt this project has ever made
 # tested ONE direction — this host paging the speaker — and all of them ended at Connection Complete
 # status=0x04 PAGE TIMEOUT with the controller certifying the full train. Answering an inquiry only
@@ -3192,6 +3193,10 @@ arm_features() {
     # observable change. Stripped => the x86 track can page a speaker without touching Pi or Jetson
     # media at all.
     f="${f//,btc,/,}"
+    # A2DP (A2DPENV B752) rides the same strip: `a2dp` implies `btc`, and every A2DP site is in the x86-gated
+    # BTHID file, `drivers/bt/*` (its #[path] children) or carries `target_arch = "x86_64"` itself (audio/mod.rs,
+    # tests.rs, video/settings.rs) — no aarch64 code, so only the cargo fingerprint would move.
+    f="${f//,a2dp,/,}"
     # BT-DIR rides the same strip, for the same reason and as a consequence of the same fact:
     # `btdir` implies `btc` implies `bt`, whose only code is inside the x86-gated
     # `drivers/ehci/mod.rs`, so `btdir` emits not one byte of aarch64 CODE — but an enabled feature
@@ -6673,7 +6678,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,uac"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,a2dp,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,uac"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

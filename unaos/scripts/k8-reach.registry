@@ -32,6 +32,7 @@ UNAOS_BSPRUN               TODO  seeded 2026-09-06; 5 Pi-live cfg site(s)
 UNAOS_BSPTICK              TODO  seeded 2026-09-06; 8 Pi-live cfg site(s)
 UNAOS_BT                   TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_BTC                  TODO  seeded 2026-09-06; no Pi-live cfg site
+UNAOS_A2DP   NA   --evidence: a2dp 40 sites, 0 Pi-live, 0 negated [implies: bt, btc, ehciconfig, ehcihid, ehciscout] — every site is in drivers/ehci/bthid.rs (a file the aarch64 tree never lexes: drivers/ehci is x86-gated), its three #[path] children drivers/bt/{l2cap,sdp,avdtp}.rs, or carries target_arch = "x86_64" in its own attribute (audio/mod.rs, tests.rs a2dp_selftest + its registration, video/settings.rs picker pair); arroyo arm_features strips ,a2dp, beside ,btc,. The radio is the rMBP BCM USB Bluetooth on the BTHID host; the Pi image has no BTHID host to carry it. Added 2026-10-19 with A2DPENV (rmbp-ledger B752).
 UNAOS_BTDIR                TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_DEADMAN              TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_DESKCASCADE          TODO  seeded 2026-09-06; 417 Pi-live cfg site(s)

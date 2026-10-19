@@ -279,6 +279,12 @@ fi
 # error in `svg_core`, linked only by `pixel_core/svg` and called only through facet's decode (facet needs wc on
 # x86, desktop_firmware on aarch64). prefs_reset has no gated literal (`cfg!` picks a 4-byte word) and is
 # NOWITNESS, the `wedge2` shape. The OFF polarity is read from the cfg, not measured on a knob-off ELF.
+#
+# `a2dp` (A2DPENV, rmbp-ledger B752): token `usage: bt audio <aa:bb:cc:dd:ee:ff`, the refusal of the `bt audio` verb
+# arm (drivers/ehci/bthid.rs `verb`, the arm `#[cfg(feature = "a2dp")] "audio"`); it occurs exactly once in crates/ +
+# libs/. Its caller is shell.rs's `bt` verb under `all(target_arch = "x86_64", feature = "btc")`, which `a2dp` implies
+# (Cargo.toml `a2dp = ["btc"]`), so cond `-` (rule 7(a): no second knob in the chain). The registry's pipe delimiter
+# forbids the rest of the literal (` | #n>`). unmeasured-here: no ELF built for this row; the seat's fold measures it.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -301,6 +307,7 @@ sdwrite|:: SDWRITE-POSTURE: posture=|witness|measured
 irqstorage|:: bx-blockreq: no block device|-|measured(1)
 bt|vendor-classed: RF/Bluetooth subclass+protocol|-|measured
 btc|REACHED — a BR/EDR link was established|-|measured
+a2dp|usage: bt audio <aa:bb:cc:dd:ee:ff|-|unmeasured-here
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
