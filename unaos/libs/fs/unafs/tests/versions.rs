@@ -473,3 +473,102 @@ fn an_unknown_rocompat_bit_mounts_read_only_and_refuses_repair_and_writes() {
     assert_eq!(again.read_data(id, 0, 5000).unwrap(), content(2, 5000));
     assert!(again.read_only());
 }
+
+// ---- ROOTINCOMPAT (SR159): the root record's INCOMPAT word refuses the mount; the dry run names a missing flag ----
+
+use unafs::root::{ROOT_FLAG_GROW, ROOT_FLAG_MIGRATE, ROOT_INCOMPAT_KNOWN, ROOT_INCOMPAT_MASK, ROOT_ROCOMPAT_MASK};
+
+#[test]
+fn an_unknown_incompat_bit_refuses_the_mount_with_the_bits() {
+    // The words do not overlap: protocol bits 0..1, INCOMPAT 2..31, ROCOMPAT 32..63.
+    assert_eq!(ROOT_INCOMPAT_MASK & (ROOT_FLAG_GROW | ROOT_FLAG_MIGRATE), 0);
+    assert_eq!(ROOT_INCOMPAT_MASK & ROOT_ROCOMPAT_MASK, 0);
+    assert_eq!(ROOT_INCOMPAT_MASK | ROOT_ROCOMPAT_MASK | ROOT_FLAG_GROW | ROOT_FLAG_MIGRATE, u64::MAX);
+
+    let mut fs = vol(2048);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "kept.txt".into()).unwrap();
+    for i in 0..3u8 {
+        fs.write_data(id, 0, &content(i, 5000)).unwrap();
+    }
+    let base = fs.device.as_bytes().to_vec();
+
+    // Every INCOMPAT bit this build does not know refuses alone, naming exactly that bit.
+    for bit in 2..32u32 {
+        let b = 1u64 << bit;
+        if b & ROOT_INCOMPAT_KNOWN != 0 {
+            continue;
+        }
+        let bytes = reroot(base.clone(), |f| f | b);
+        match UnaFS::mount(MemDevice::from_bytes(bytes)) {
+            Err(FileSystemError::Incompatible(got)) => assert_eq!(got, b, "bit {bit}"),
+            Err(e) => panic!("bit {bit}: refused with {e:?}, not Incompatible"),
+            Ok(_) => panic!("bit {bit}: an unknown INCOMPAT bit mounted"),
+        }
+    }
+
+    // Several at once, beside an unknown ROCOMPAT bit: the mount is refused (not read-only), the low bits named.
+    let low = (1u64 << 2) | (1 << 17);
+    let bytes = reroot(base.clone(), |f| f | low | (1 << 40));
+    let e = UnaFS::mount(MemDevice::from_bytes(bytes)).err().expect("refused");
+    assert!(matches!(e, FileSystemError::Incompatible(b) if b == low), "{e:?}");
+    assert!(format!("{e}").contains("0x20004"), "the message names the bits: {e}");
+}
+
+#[test]
+fn a_known_low_bit_mounts() {
+    let mut fs = vol(2048);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "kept.txt".into()).unwrap();
+    for i in 0..3u8 {
+        fs.write_data(id, 0, &content(i, 5000)).unwrap();
+    }
+    // MIGRATE on a v7 root is a protocol bit this build knows (it means nothing past v6): the volume mounts
+    // read-write, reads, writes and repairs.
+    let bytes = reroot(fs.device.as_bytes().to_vec(), |f| f | ROOT_FLAG_MIGRATE);
+    let mut fs = UnaFS::mount(MemDevice::from_bytes(bytes)).expect("a known low bit mounts");
+    assert!(!fs.read_only());
+    assert_eq!(fs.read_data(id, 0, 5000).unwrap(), content(2, 5000));
+    fs.write_data(id, 0, &content(9, 5000)).unwrap();
+    assert!(fs.fsck(true).unwrap().reclaimed_blocks == 0);
+    let mut fs = remount(fs);
+    assert_eq!(fs.read_data(id, 0, 5000).unwrap(), content(9, 5000));
+    assert_eq!(disk_flags(&mut fs.device) & ROOT_INCOMPAT_MASK, 0, "this build writes no INCOMPAT bit");
+}
+
+#[test]
+fn the_dry_run_names_a_missing_versions_flag_and_repair_clears_it() {
+    // A never-versioned volume has nothing to flag.
+    let mut plain = vol(2048);
+    let root = plain.superblock.root_inode;
+    let id = plain.create_file(root, "once.txt".into()).unwrap();
+    plain.write_data(id, 0, &content(7, 5000)).unwrap();
+    assert!(!plain.fsck(false).unwrap().versions_flag_missing);
+
+    // Versions kept under a root with no ROCOMPAT word (B714 before SR154).
+    let mut fs = vol(2048);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "old.txt".into()).unwrap();
+    for i in 0..3u8 {
+        fs.write_data(id, 0, &content(i, 6000)).unwrap();
+    }
+    let bytes = reroot(fs.device.as_bytes().to_vec(), |f| f & !ROOT_FLAG_VERSIONS);
+    let mut fs = UnaFS::mount(MemDevice::from_bytes(bytes.clone())).unwrap();
+    let r = fs.fsck(false).unwrap();
+    assert!(r.versions_flag_missing, "{r:?}");
+    assert!(!r.is_clean(), "the finding makes the dry run unclean");
+    assert_eq!(r.versions, 2);
+    assert_eq!(fs.device.as_bytes(), &bytes[..], "the dry run writes nothing");
+
+    // Repair reports what it found and sets the bit; the next dry run is clean, on disk too.
+    let r = fs.fsck(true).unwrap();
+    assert!(r.versions_flag_missing, "repair reports the finding it healed");
+    assert_eq!(r.reclaimed_blocks, 0, "{r:?}");
+    let r = fs.fsck(false).unwrap();
+    assert!(!r.versions_flag_missing && r.is_clean(), "{r:?}");
+    let mut fs = remount(fs);
+    assert_ne!(disk_flags(&mut fs.device) & ROOT_FLAG_VERSIONS, 0);
+    let r = fs.fsck(false).unwrap();
+    assert!(!r.versions_flag_missing && r.is_clean(), "{r:?}");
+    assert_eq!(fs.read_version(id, 1, 0, 6000).unwrap(), content(0, 6000));
+}

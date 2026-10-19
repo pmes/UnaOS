@@ -66,6 +66,18 @@ pub const ROOT_ROCOMPAT_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 pub const ROOT_FLAG_VERSIONS: u64 = 1 << 32;
 /// VERSIONSCOMPAT (SR154): the ROCOMPAT bits this build knows (and so may write under).
 pub const ROOT_ROCOMPAT_KNOWN: u64 = ROOT_FLAG_VERSIONS;
+/// ROOTINCOMPAT (SR159): bits 2..31 of [`RootRecord::flags`] are the INCOMPAT word — features a reader must
+/// KNOW to read the volume at all: a reader that finds a bit here it does not know REFUSES THE MOUNT
+/// (`FileSystemError::Incompatible(<those bits>)`) before the maps are loaded — not read-only, refused, with the
+/// bits named. Bits 0..1 stay the commit-protocol flags ([`ROOT_FLAG_GROW`], [`ROOT_FLAG_MIGRATE`]); bits 32..63
+/// the ROCOMPAT word. A whole-format change still bumps the superblock stamp (BP-storage-6); a bit here is for a
+/// feature a volume TURNS ON. The build that names the first INCOMPAT bit carries it on every commit the way
+/// `UnaFS::rocompat` carries the ROCOMPAT word (this build knows none, so it never mounts a volume carrying one).
+/// Every reader before SR154 ignores bits 2..31; readers from SR154 to SR159 ignore them too (they test bits
+/// 0, 1 and the ROCOMPAT word): the rule binds from SR159 on.
+pub const ROOT_INCOMPAT_MASK: u64 = 0x0000_0000_FFFF_FFFC;
+/// ROOTINCOMPAT (SR159): the INCOMPAT bits this build knows (none yet).
+pub const ROOT_INCOMPAT_KNOWN: u64 = 0;
 /// The atomicity unit of record: one 512 B sector.
 pub const ROOT_SECTOR_SIZE: usize = 512;
 
@@ -120,8 +132,8 @@ pub struct RootRecord {
     /// Free blocks at commit time (refcount == 0 in the committed map).
     pub free_blocks: u64,
     /// Flags: [`ROOT_FLAG_GROW`] (bit 0), [`ROOT_FLAG_MIGRATE`] (bit 1);
-    /// bits 2..31 reserved (0); bits 32..63 the ROCOMPAT word
-    /// ([`ROOT_ROCOMPAT_MASK`]: [`ROOT_FLAG_VERSIONS`], the rest reserved).
+    /// bits 2..31 the INCOMPAT word ([`ROOT_INCOMPAT_MASK`]: none defined, a set bit refuses the mount);
+    /// bits 32..63 the ROCOMPAT word ([`ROOT_ROCOMPAT_MASK`]: [`ROOT_FLAG_VERSIONS`], the rest reserved).
     pub flags: u64,
 }
 
@@ -134,6 +146,16 @@ impl RootRecord {
     /// VERSIONSCOMPAT (SR154): the ROCOMPAT bits this build does not know (non-zero = read-only).
     pub fn rocompat_unknown(&self) -> u64 {
         self.rocompat() & !ROOT_ROCOMPAT_KNOWN
+    }
+
+    /// ROOTINCOMPAT (SR159): the record's INCOMPAT word (bits 2..31 of `flags`, in place).
+    pub fn incompat(&self) -> u64 {
+        self.flags & ROOT_INCOMPAT_MASK
+    }
+
+    /// ROOTINCOMPAT (SR159): the INCOMPAT bits this build does not know (non-zero = the mount is refused).
+    pub fn incompat_unknown(&self) -> u64 {
+        self.incompat() & !ROOT_INCOMPAT_KNOWN
     }
 
     /// Pack the record into an exactly-[`ROOT_RECORD_SIZE`]-byte buffer,
