@@ -133,7 +133,7 @@ fn fixture() {
                 // while blanked the compositor must be refusing on the idle term
                 let refused = super::panel_refuse_term() == Some("idle-blank");
                 if !refused { finish(false, 0); ST.store(3, Ordering::Relaxed); return; }
-                crate::pal::push_event(Event::Key(b'~'));
+                crate::pal::push_event(Event::Key(b'~')); FX_KEY_OWED.store(true, Ordering::Release); // QEMUCLASS2 (B565): the key is owed to the drain; `selftest` drains it when it holds the drainer
                 T0.store(now, Ordering::Relaxed);
                 ST.store(2, Ordering::Relaxed);
             } else if now.wrapping_sub(T0.load(Ordering::Relaxed)) > 6000 {
@@ -153,7 +153,7 @@ fn fixture() {
 }
 
 #[cfg(feature = "witness")]
-fn finish(ok: bool, swallowed: u32) { FX_DONE.store(true, Ordering::Release);
+fn finish(ok: bool, swallowed: u32) { FX_DONE.store(true, Ordering::Release); FX_KEY_OWED.store(false, Ordering::Release);
     THRESH_OVERRIDE_MS.store(0, Ordering::Relaxed);
     LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
     serial_println!(
@@ -206,10 +206,40 @@ pub fn selftest() {
     FX_ARMED.store(true, Ordering::Release);
     if cfg!(feature = "tests-at-boot") { return; }
     let dl = crate::arch::ms() + 12_000;
-    while !FX_DONE.load(Ordering::Acquire) && crate::arch::ms() < dl {
+    while !FX_DONE.load(Ordering::Acquire) && crate::arch::ms() < dl { if FX_KEY_OWED.load(Ordering::Acquire) && crate::gui_watchdog::is_app_active() { drain_own(); } // QEMUCLASS2 (B565): this wait holds the drainer (file tail)
         crate::arch::sched::yield_now();
     }
     if !FX_DONE.load(Ordering::Acquire) {
         serial_println!(":: DIMIDLE: skipped reason=service-silent (armed; the line prints when the service lane runs) ::");
+    }
+}
+
+// QEMUCLASS2 (rmbp-ledger B565) — TAIL-APPENDED. `tests dimidle` typed over the door runs inside `dispatch_command`
+// on the RENDER TASK (main.rs `handle_key`: `[gui] app-enter`, SCREEN_APP_ACTIVE), and the render task is the one
+// that pops `EVENT_QUEUE` (`TargetPal::poll_event` -> `pal::pop_event` -> [`gate`]); while an app owns the screen
+// `pump_usb_into_gui` only peeks and re-queues. So the injected key could reach the swallow only after `selftest`
+// returned — after state 2's 2000 ms bound had already printed `woke_at_ms=0 wake_key_swallowed=0 -> FAIL`
+// (QEMUIMAGE26: the key sat 2542 ms, `[lag] key→echo ms=2542.2 queue=2542.2`). A fixture that waits on its own
+// drainer cannot fire (scheduler.md, WINX7-GO). The wait now does what a full-screen app's own loop does: it drains,
+// through the same `pal::pop_event` (so the swallow is the one [`gate`] under test), until the owed key is
+// swallowed; anything popped ahead of it is pushed back in order, behind the queue's remainder.
+#[cfg(feature = "witness")]
+static FX_KEY_OWED: AtomicBool = AtomicBool::new(false);
+
+/// Drain `EVENT_QUEUE` through the shared pop until the owed key is swallowed or the queue is empty (at most 16
+/// events held; they are pushed back in their order).
+#[cfg(feature = "witness")]
+fn drain_own() {
+    let s0 = SWALLOWED.load(Ordering::Relaxed);
+    let mut held = [Event::None; 16];
+    let mut n = 0;
+    while n < held.len() && SWALLOWED.load(Ordering::Relaxed) == s0 {
+        match crate::pal::next_event() {
+            Some(e) => { held[n] = e; n += 1; }
+            None => break,
+        }
+    }
+    for e in &held[..n] {
+        crate::pal::push_event(*e);
     }
 }

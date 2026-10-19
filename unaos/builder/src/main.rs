@@ -1436,6 +1436,18 @@ fn main() {
     } else {
         println!("   AETHER: target/AETHER-X86.ELF absent — ESP has no AETHER.ELF (run via ./arroyo esp-x86)");
     }
+    // QEMUCLASS1 (rmbp-ledger B566): the QEMU `/apps` is the ESP's APPS (`apps mount /apps = fat boot volume … rooted=APPS`),
+    // and only LUMEN and AETHER were copied there — MIDDEN.ELF and UNA.ELF rode the DATA volume only (below), so the dock
+    // pins read `refused=stat` under `./arroyo test`/`twoboot` (QEMUIMAGE26: `:: DOCKPINS: … landed=2`). Same shape as LUMEN.
+    for (src, dst) in [("MIDDEN-X86.ELF", "MIDDEN.ELF"), ("UNA-X86.ELF", "UNA.ELF")] {
+        let elf = target_dir.join(src);
+        if elf.exists() {
+            std::fs::copy(&elf, esp_apps.join(dst)).unwrap();
+            println!("   {}: copied {} into APPS/ on the ESP", &dst[..dst.len() - 4], dst);
+        } else {
+            println!("   {}: target/{} absent — ESP has no {} (run via ./arroyo esp-x86)", &dst[..dst.len() - 4], src, dst);
+        }
+    }
     let _ = stage_welcome(&workspace_dir, &esp_dir);
     // STRIAMETAL (LEDGER SR139): Stria, the A/V handler, as ONE ring-3 program (crates/user-stria, built by arroyo's
     // build_user_stria_x86 to target/STRIA-X86.ELF), staged as APPS/STRIA.ELF — `stria <file>`, or a Quarry

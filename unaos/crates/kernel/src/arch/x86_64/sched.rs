@@ -6,8 +6,8 @@
 // Built on the SMP foundation already in place: per-CPU GDT/TSS/IST, x2APIC with a per-CPU LVT
 // timer (vector `TIMER_VECTOR`), GS-based per-CPU data (`percpu::this_cpu()`), and the
 // reschedule IPI (vector `IPI_VECTOR`). Each application processor (AP) runs its OWN scheduler
-// loop and drains its OWN run queue; the BSP is deliberately *not* scheduled — it stays the
-// hardware-service core (xHCI / console / storage), exactly as before. APs run scheduled work.
+// loop and drains its OWN run queue; the BSP JOINS the scheduler too (`main.rs` `sched::run_bsp(0)`, the
+// diverging tail of kernel_main — read at 1719fe54; this comment once said the BSP was not scheduled).
 //
 // Model (xv6-style). Every CPU has a private "scheduler context" — the stack it was already
 // running on when it entered `run()`. A runnable kernel thread (a `Task`) is switched *into* by

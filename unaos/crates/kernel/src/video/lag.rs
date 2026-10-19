@@ -192,7 +192,7 @@ pub fn on_enqueue(ev: &Event) {
     let Some((c, kind)) = class_of(ev) else { return };
     let now = now_us();
     pend_enqueued(now); // INPUTSTALL M3: one more key/press waits for the render task
-    let s = &SLOTS[c];
+    let s = &SLOTS[c]; if crate::gui_watchdog::is_app_active() { APP_HELD.fetch_add(1, Relaxed); return; } // QEMUCLASS2 (B574/B575): a press queued while a command owns the render task is the command's, not the router's (file tail)
     if s.stage.compare_exchange(IDLE, ISR, AcqRel, Relaxed).is_ok() {
         s.kind.store(kind, Relaxed);
         s.ring.store(0, Relaxed);
@@ -912,9 +912,9 @@ pub fn inputstall_selftest() {
     let sd = MIN_STRANDS.load(Relaxed) as u64;
     let pct = strand_pct(sd, fr);
     serial_println!(
-        ":: INPUTSTALL: key_queue_max_ms={} comp_max_ms={} hid_gap_max_ms={} strand_pct={} bound={} -> {} :: events={} frames={} strands={} strand_bound_pct={} span={}s via=tests",
+        ":: INPUTSTALL: key_queue_max_ms={} comp_max_ms={} hid_gap_max_ms={} strand_pct={} bound={} -> {} :: events={} frames={} strands={} strand_bound_pct={} span={}s via=tests app_held={}",
         kq, cm, hg, pct, STALL_MS, if verdict(kq, cm, hg, pct) { "PASS" } else { "FAIL" },
-        ev, fr, sd, STRAND_PCT_BOUND, crate::arch::ms().saturating_sub(MIN_T0_MS.load(Relaxed)) / 1000
+        ev, fr, sd, STRAND_PCT_BOUND, crate::arch::ms().saturating_sub(MIN_T0_MS.load(Relaxed)) / 1000, APP_HELD.load(Relaxed)
     );
 }
 
@@ -1425,3 +1425,15 @@ pub fn abandon(ev: &Event) {
     }
     pend_routed();
 }
+
+// QEMUCLASS2 (rmbp-ledger B574 HIDSTALL, B575 INPUTSTALL) — TAIL-APPENDED. The router's key timing ([`on_enqueue`] ->
+// [`route`]) measured presses that were pushed while a shell command owned the render task (main.rs `handle_key`:
+// `[gui] app-enter` ... `dispatch_command` ... `[gui] app-exit`). The render task is the router; while it runs the
+// command no press can be routed, by design (GUI-CLICK-2: input stays in EVENT_QUEUE for the command's own drain),
+// so every press a fixture injects inside `tests <name>` — `tests ehci`'s TERMSEL/APPCLIP/KEYREPEAT keys, DIMIDLE's
+// wake key — was charged to `queue` for the command's whole length (QEMUIMAGE26: `[lag] key→echo ms=1520.0 queue=1520.0`
+// after `tests ehci`, `ms=2542.2` after `tests dimidle`, both `render=handler`), and HIDSTALL's `key_queue_max_ms`
+// (fed from `MIN_KEYQ_US`, `hidstall::note_sec`) and INPUTSTALL's FAILed on the command, not the router. Such a press
+// now starts no timing; it is counted `app_held=` on the `tests inputstall` line. `PEND` still counts it (the render
+// task does owe it a route when the command returns). A wedged command is the GUI watchdog's (`[gui] app-exit … wedged=true`).
+static APP_HELD: AtomicU32 = AtomicU32::new(0);

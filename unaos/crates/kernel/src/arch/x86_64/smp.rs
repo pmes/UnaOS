@@ -13,7 +13,8 @@
 // copied byte-for-byte. It sets up a temporary GDT (32-bit + 64-bit descriptors), enables PAE +
 // the BSP's page tables (CR3) + long mode, and jumps to `ap_entry` on a per-AP stack. From there
 // each AP loads its own per-CPU GDT/TSS (gdt::init_cpu), the shared IDT, and its own local APIC,
-// then idles — the BSP keeps driving xHCI/console/storage.
+// then idles until the scheduler starts; the BSP joins the scheduler at the end of kernel_main
+// (`sched::run_bsp(0)`; read at 1719fe54 — the service work is placed by core role, not pinned to the BSP).
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 

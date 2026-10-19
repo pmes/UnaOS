@@ -537,6 +537,9 @@ refs/heads/exec-rmbp-starfield                    23fe38b3 FOLDED-BY-HAND 7f4c0d
 refs/heads/exec-host-temple                       23fe38b3 FOLDED-BY-HAND 0316f96e
 refs/heads/exec-rmbp-startscene   1719fe54 IN-FLIGHT cloud wave36 STARTSCENE (B662)
 refs/heads/exec-rmbp-clockx86     1719fe54 IN-FLIGHT cloud wave36 CLOCKX86 (B618)
-refs/heads/exec-rmbp-qemuclass1   1719fe54 IN-FLIGHT cloud wave36 QEMUCLASS1 (B566 B569 B570 B583-B586 B588 B591-B594 B596 B604)
-refs/heads/exec-rmbp-qemuclass2   1719fe54 IN-FLIGHT cloud wave36 QEMUCLASS2 (B565 B574 B575 B581 B590 B598)
+refs/heads/exec-rmbp-qemuclass1   78d878a0 FOLDED-BY-HAND 0bf68bb9 (the fold commit carries CLOCKX86's message by the seat's error; the QEMUCLASS1 message is on the next fold commit)
+refs/heads/exec-rmbp-qemuclass2   729dddb7 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/remotes/origin/exec-rmbp-local-keplercut 5b1be6a9 FOLDED-BY-HAND 45e03964 2026-10-19
+refs/heads/exec-rmbp-contrast   0bf68bb9 IN-FLIGHT cloud wave36 CONTRAST (B664)
+refs/heads/exec-rmbp-winkey     0bf68bb9 IN-FLIGHT cloud wave36 WINKEY (B665)
+refs/remotes/origin/exec-orin22-keep13      51f06bea WIP-SURVIVOR orin-track (fs/unafs fits= superblock compare; not folded on this branch, orin's to fold) 2026-10-19
