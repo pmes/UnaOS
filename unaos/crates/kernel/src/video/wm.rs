@@ -3597,7 +3597,7 @@ pub fn focus_release(owner: u64, route: &'static str) {
 /// `z == 0` means [`minimise`] put it there and nothing else. The exemption reads "furniture that
 /// has not been deliberately parked".
 fn above_shell(r: &Window, shell: u32) -> bool {
-    r.compat || r.z > shell || (is_kernel_owner(r.owner_asid) && r.z != PARKED_Z)
+    (r.compat || r.z > shell || (is_kernel_owner(r.owner_asid) && r.z != PARKED_Z)) && !lock_veiled(r) // AUTOLOCK (B712): while the session is locked every row but the modal one (the locked login card) reads below the shell — the compositor, the occluders, the hit test and the a11y tree all skip it; nothing in the row moves (file tail). LINE-NEUTRAL fold, code first.
 }
 
 /// CONSOLEWIN — **the `z` [`minimise`] parks a row at, as a name.** Zero, and the value is
@@ -31123,6 +31123,23 @@ pub mod focussteal {
         }
         serial_println!("[wm] raise owner={} focus=held {}", owner, Cause::Unsolicited.token());
         super::attention(owner, "for=raise");
+        false
+    }
+}
+
+// AUTOLOCK (rmbp-ledger B712, BP-video-21) — TAIL-APPENDED, so no line above moves. The lock is a VEIL over the table,
+// never a teardown: [`above_shell`] asks this once per row, and it answers `true` (hide) for every row but the pinned
+// modal one while `video::lock` holds the session locked. Two atomic loads, no lock — it runs under `TABLE`. With no
+// lock module in the build (no `login`, or no desktop) it is `false`, so the predicate is the trunk's.
+#[inline]
+fn lock_veiled(r: &Window) -> bool {
+    #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        return super::lock::veiled() && r.id != MODAL_WIN.load(core::sync::atomic::Ordering::Acquire);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = r;
         false
     }
 }

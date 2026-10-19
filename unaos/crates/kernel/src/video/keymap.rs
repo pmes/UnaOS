@@ -352,7 +352,7 @@ pub fn resolve_edge(
         }
         i += 1;
     }
-    None
+    win_l(cur_keys, prev_keys, modifiers) // AUTOLOCK (B712): Win+L, the one chord entry no row can spell on every table (file tail); `None` when it is not Win+L. LINE-NEUTRAL fold, code first.
 }
 
 /// The table the desktop is running. ONE call site for the selection, so a knob that picks
@@ -791,5 +791,23 @@ fn zoom_edge(cur: &[u8; 6], prev: &[u8; 6], modifiers: u8) {
                 super::zoom::chord(step);
             }
         }
+    }
+}
+
+// AUTOLOCK (rmbp-ledger B712) — TAIL-APPENDED, so no line above moves. THE Win+L ENTRY: the key that plays the Windows
+// role on the live look and keyboard ([`start_role`]: Option on a Mac keyboard under Softy, Win on a PC keyboard under
+// Softy) or, under Una (no Start role), the GUI key (Win on a PC keyboard; ⌘ on a Mac, where ⌘L's row has already
+// answered with the same action). A role-space row cannot say it: no role maps the Win key on the PC table, and the
+// mirrored tables put it under Option. Asked by [`resolve_edge`] only after every row declined, so no row's token moves.
+
+/// Win+L as a press edge of L (0x0F) with the Windows key held: `LockScreen`, token `win-l`. Pure over its arguments
+/// and the live look/keyboard.
+fn win_l(cur: &[u8; 6], prev: &[u8; 6], modifiers: u8) -> Option<(Action, &'static str)> {
+    let role = start_role();
+    let win = if role != 0 { role } else { HID_MOD_GUI };
+    if modifiers & win != 0 && cur.contains(&0x0F) && !prev.contains(&0x0F) {
+        Some((Action::LockScreen, "win-l"))
+    } else {
+        None
     }
 }

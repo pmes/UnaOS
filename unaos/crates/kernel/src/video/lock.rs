@@ -1,0 +1,378 @@
+//! CHARTER: Kernel — wm (the lock is a veil over the window table the compositor paints; the password field and its verdict are the login screen's, `video/login.rs` SCREENLOCK — reused, never a second widget)
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+//! AUTOLOCK (rmbp-ledger B712, BP-bar-15/20; bar research B §7: "a lock the user sets once and never fights — idle
+//! and lid lock the glass, the password opens it, nothing else is touched").
+//!
+//! * **One key set** (Principia, `system.lock.*`, Settings > Security, one row each): `after_idle_min` (0 = never,
+//!   default 10), `on_lid` (default on), `on_sleep` (default on). Read here once a second ([`service`]); the Settings
+//!   rows write through [`set_policy`] / [`persist`].
+//! * **The LOCK state** is a VEIL, not a teardown: [`veiled`] is a term of `wm::above_shell` (one fold, `lock_veiled`
+//!   at the file tail), so the compositor, the desktop's occluders, the hit test and the a11y tree all read every row
+//!   but the modal one (the login screen in its locked mode) as below the shell — the rows, their surfaces, their z
+//!   and the focus are untouched, so the right password restores the exact desktop in ONE composite ([`opened`]).
+//!   The lock view is the login screen's locked card (the session's tile and name, the password field, Unlock) over
+//!   the backdrop; the menu bar's clock stays. Input goes only to the screen: `users::screen_key` and the press gate
+//!   already answer `true` for every key and press while it is up (BP-security-5).
+//! * **Entered by** idle (no key or pointer event for `after_idle_min`, DIMIDLE's activity clock
+//!   `dimidle::last_activity_ms`), the lid closing (`power::sleep::enter`, before the state's line), any other sleep
+//!   entry (`on_sleep`), and Win+L (`keymap::resolve_edge`'s fallback -> the router's `LockScreen` arm ->
+//!   `login::lock` -> [`enter`]`(Key)`; ⌘L / Ctrl+Alt+L / the menu's Lock take the same door).
+//! * **A wrong password** is the login screen's one answer (BP-security-4); here it is COUNTED and the card SHAKES
+//!   (six 30 ms steps, none under Reduce motion).
+//! * Wire: `[lock] enter cause=<idle|lid|sleep|key> windows_hidden=<n>` · `[lock] wrong n=<n> shake=<…>` ·
+//!   `[lock] open ms=<n> wrong=<n>` · `tests autolock` -> `:: AUTOLOCK: entered=1 leaked_keys=0 reopened=ok
+//!   table_same=1 ms=<n> -> PASS ::` (the fixture body is `tests.rs`'s tail).
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+/// What locked the glass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cause {
+    /// No key or pointer event for `system.lock.after_idle_min`.
+    Idle,
+    /// The lid closed (`system.lock.on_lid`), before the sleep state.
+    Lid,
+    /// Any other sleep entry (`system.lock.on_sleep`): the login window's Sleep, a future verb.
+    Sleep,
+    /// The user asked: Win+L, ⌘L, Ctrl+Alt+L, the menu's Lock.
+    Key,
+}
+
+impl Cause {
+    pub fn word(self) -> &'static str {
+        match self { Cause::Idle => "idle", Cause::Lid => "lid", Cause::Sleep => "sleep", Cause::Key => "key" }
+    }
+}
+
+/// `system.lock.after_idle_min`'s default (the schema's).
+pub const IDLE_MIN_DEFAULT: u32 = 10;
+/// The Settings row's steps (minutes; 0 = never).
+pub const IDLE_STEPS: [u32; 5] = [0, 5, 10, 30, 60];
+
+/// The veil is on (the window table reads hidden). Atomics only: [`veiled`] runs under the window table's lock.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static CAUSE: AtomicU8 = AtomicU8::new(0);
+static WRONG: AtomicU32 = AtomicU32::new(0);
+static HIDDEN: AtomicU32 = AtomicU32::new(0);
+static ENTERS: AtomicU32 = AtomicU32::new(0);
+static OPENS: AtomicU32 = AtomicU32::new(0);
+/// The last [`opened`]'s cost: the right password's verdict applied -> the restoring composite returned (ms).
+static LAST_OPEN_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+static ENTER_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The policy in force (the store's, read once a second; a Settings press sets it at once).
+static AFTER_IDLE_MIN: AtomicU32 = AtomicU32::new(IDLE_MIN_DEFAULT);
+static ON_LID: AtomicBool = AtomicBool::new(true);
+static ON_SLEEP: AtomicBool = AtomicBool::new(true);
+static POLICY_AT_MS: AtomicU64 = AtomicU64::new(0);
+/// Store writes owed by a Settings press: bit 0 after_idle_min, bit 1 on_lid, bit 2 on_sleep. While any is owed the
+/// once-a-second read does not overwrite the press with the store's older value.
+static OWED: AtomicU8 = AtomicU8::new(0);
+/// The activity stamp an idle lock was last tried for (one try per idle stretch, never a loop of refusals).
+static IDLE_TRIED: AtomicU64 = AtomicU64::new(0);
+
+/// The shake: the row, its step (0 = none; 1..=len the offsets, len+1 the exact-restore check), the last step's time
+/// and the row's outer origin before the first step.
+static SHAKE_ID: AtomicU32 = AtomicU32::new(0);
+static SHAKE_STEP: AtomicU8 = AtomicU8::new(0);
+static SHAKE_AT_MS: AtomicU64 = AtomicU64::new(0);
+static SHAKE_FX: AtomicU32 = AtomicU32::new(0);
+static SHAKE_FY: AtomicU32 = AtomicU32::new(0);
+/// Logical px offsets (device-scaled at the step), ending at the origin.
+const SHAKE: [i32; 6] = [-10, 10, -6, 6, -3, 0];
+const SHAKE_STEP_MS: u64 = 30;
+
+/// The veil is on: every row but the modal one reads below the shell (`wm::above_shell`'s lock term).
+#[inline]
+pub fn veiled() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
+
+/// The session is locked (the veil is on).
+pub fn active() -> bool {
+    veiled()
+}
+
+/// Wrong passwords on the current (or last) lock.
+pub fn wrong_count() -> u32 {
+    WRONG.load(Ordering::Relaxed)
+}
+
+/// The last unlock's restore cost in ms (`None` = no unlock yet this boot).
+pub fn last_open_ms() -> Option<u64> {
+    let v = LAST_OPEN_MS.load(Ordering::Relaxed);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Windows the last lock hid.
+pub fn hidden() -> u32 {
+    HIDDEN.load(Ordering::Relaxed)
+}
+
+/// The policy in force: `(after_idle_min, on_lid, on_sleep)`.
+pub fn policy() -> (u32, bool, bool) {
+    (AFTER_IDLE_MIN.load(Ordering::Relaxed), ON_LID.load(Ordering::Relaxed), ON_SLEEP.load(Ordering::Relaxed))
+}
+
+/// A Settings press: apply at once, owe the store write ([`persist`], on the Settings service pass).
+pub fn set_policy(after_idle_min: Option<u32>, on_lid: Option<bool>, on_sleep: Option<bool>) {
+    if let Some(m) = after_idle_min {
+        AFTER_IDLE_MIN.store(m.min(1440), Ordering::Relaxed);
+        IDLE_TRIED.store(0, Ordering::Relaxed);
+        OWED.fetch_or(1, Ordering::AcqRel);
+    }
+    if let Some(v) = on_lid {
+        ON_LID.store(v, Ordering::Relaxed);
+        OWED.fetch_or(2, Ordering::AcqRel);
+    }
+    if let Some(v) = on_sleep {
+        ON_SLEEP.store(v, Ordering::Relaxed);
+        OWED.fetch_or(4, Ordering::AcqRel);
+    }
+}
+
+/// The owed store writes (Principia's `system.lock.*`), from the Settings service pass — never from a router.
+pub fn persist() {
+    use crate::prefs::{key, set_sys, PrefValue};
+    let o = OWED.swap(0, Ordering::AcqRel);
+    if o & 1 != 0 { set_sys(key::LOCK_AFTER_IDLE_MIN, PrefValue::Int(AFTER_IDLE_MIN.load(Ordering::Relaxed) as i64)); }
+    if o & 2 != 0 { set_sys(key::LOCK_ON_LID, PrefValue::Bool(ON_LID.load(Ordering::Relaxed))); }
+    if o & 4 != 0 { set_sys(key::LOCK_ON_SLEEP, PrefValue::Bool(ON_SLEEP.load(Ordering::Relaxed))); }
+}
+
+/// Read the three keys from the store (the schema's defaults where unset).
+fn refresh() {
+    use crate::prefs::key;
+    if OWED.load(Ordering::Acquire) != 0 { return; }
+    let m = crate::prefs::peek_int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).map(|v| v as u32);
+    if let Some(m) = m { AFTER_IDLE_MIN.store(m, Ordering::Relaxed); } else if crate::prefs::int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).is_none() { AFTER_IDLE_MIN.store(IDLE_MIN_DEFAULT, Ordering::Relaxed); }
+    ON_LID.store(crate::prefs::flag(key::LOCK_ON_LID).unwrap_or(true), Ordering::Relaxed);
+    ON_SLEEP.store(crate::prefs::flag(key::LOCK_ON_SLEEP).unwrap_or(true), Ordering::Relaxed);
+}
+
+/// Is there a session the lock could close over, with the screen down? (No lock line for a refusal nobody asked for.)
+fn lockable() -> bool {
+    let mut nb = [0u8; crate::fs::users::NAME_MAX];
+    crate::fs::users::whoami(&mut nb).is_some() && !super::crystal::login::is_open()
+}
+
+/// **Lock the session** (`cause`). The login screen comes up in its locked mode (`login::lock_screen`: the session's
+/// name read-only, the password field, the modal pin) and THEN the veil goes on, so the table is never seen veiled
+/// without the card that opens it. Refused (`false`, one line) when the screen refuses: no session, the screen
+/// already up, or a session user with no password to unlock with (BP-security-4: a lock nobody can lift is a dead
+/// machine). Nothing is closed, swept or moved.
+pub fn enter(cause: Cause) -> bool {
+    if ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+    let n = visible_windows();
+    if !super::crystal::login::lock_screen() {
+        serial_println!("[lock] refused cause={} (no session, the screen already up, or no password to unlock with)", cause.word());
+        return false;
+    }
+    HIDDEN.store(n as u32, Ordering::Relaxed);
+    WRONG.store(0, Ordering::Relaxed);
+    CAUSE.store(cause as u8, Ordering::Relaxed);
+    ENTER_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+    ENTERS.fetch_add(1, Ordering::Relaxed);
+    ACTIVE.store(true, Ordering::Release);
+    wipe();
+    serial_println!("[lock] enter cause={} windows_hidden={}", cause.word(), n);
+    true
+}
+
+/// The app windows on the glass now (the count the veil hides).
+fn visible_windows() -> usize {
+    let mut rows = alloc::vec::Vec::new();
+    let n = super::wm::wl_rows(&mut rows);
+    rows[..n].iter().filter(|r| !r.minimised).count()
+}
+
+/// The veil's first frame: the panel to the desktop colour, every row damaged, one composite (only the modal card
+/// paints), and the desktop layer asked for its full present (the wallpaper back under the card). Skipped while the
+/// panel is refused (the idle blank, the sleep state): their wake repaints through the same veil.
+fn wipe() {
+    if super::panel_refuse_term().is_some() {
+        return;
+    }
+    if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
+        fb.fill_screen(super::wm::DESKTOP_BG);
+        fb.flush_all();
+        let (w, h) = (fb.width(), fb.height());
+        let _ = super::wm::damage_intersecting(0, 0, w, h);
+    }
+    super::wm::composite();
+    super::screen::request_full_present();
+}
+
+/// The right password (the login screen's verdict, `apply_unlock`, after its row is down): the veil off, every row
+/// damaged, ONE composite — the table was never touched, so the focus and the z-order are the ones the lock found.
+pub fn opened() {
+    if !ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let t0 = crate::arch::ms();
+    SHAKE_STEP.store(0, Ordering::Relaxed);
+    ACTIVE.store(false, Ordering::Release);
+    if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
+        let (w, h) = (fb.width(), fb.height());
+        let _ = super::wm::damage_intersecting(0, 0, w, h);
+    }
+    super::wm::composite();
+    super::screen::request_full_present();
+    let ms = crate::arch::ms().saturating_sub(t0);
+    LAST_OPEN_MS.store(ms, Ordering::Relaxed);
+    OPENS.fetch_add(1, Ordering::Relaxed);
+    IDLE_TRIED.store(super::dimidle::last_activity_ms(), Ordering::Relaxed);
+    serial_println!("[lock] open ms={} wrong={}", ms, WRONG.load(Ordering::Relaxed));
+}
+
+/// A wrong password on the locked screen (`apply_unlock`'s refusal; the screen says its one answer): counted, and the
+/// card `id` shakes on the next service passes (none under Reduce motion).
+pub fn wrong(id: u32) {
+    if !ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let n = WRONG.fetch_add(1, Ordering::Relaxed) + 1;
+    let how = if super::settings::reduce_motion() {
+        "reduce-motion"
+    } else if let Some((fx, fy, _, _)) = super::wm::frame_of(id) {
+        SHAKE_ID.store(id, Ordering::Relaxed);
+        SHAKE_FX.store(fx as u32, Ordering::Relaxed);
+        SHAKE_FY.store(fy as u32, Ordering::Relaxed);
+        SHAKE_AT_MS.store(0, Ordering::Relaxed);
+        SHAKE_STEP.store(1, Ordering::Release);
+        "on"
+    } else {
+        "no-row"
+    };
+    serial_println!("[lock] wrong n={} shake={}", n, how);
+}
+
+/// The lid closing or another sleep entry (`power::sleep::enter`, before its line): lock first when the policy says
+/// so. `tests` (the `tests sleep` fixture) never locks; neither does a sleep asked from the screen itself.
+pub fn before_sleep(via: &str) {
+    if via == "tests" || ACTIVE.load(Ordering::Acquire) || !lockable() {
+        return;
+    }
+    let (cause, on, key) = if via == "lid" {
+        (Cause::Lid, ON_LID.load(Ordering::Relaxed), "on_lid")
+    } else {
+        (Cause::Sleep, ON_SLEEP.load(Ordering::Relaxed), "on_sleep")
+    };
+    if !on {
+        serial_println!("[lock] skip cause={} (system.lock.{}=false)", cause.word(), key);
+        return;
+    }
+    let _ = enter(cause);
+}
+
+/// The render pulse (`login::submit_drain`'s head): the policy once a second, the idle lock, the shake's steps, and
+/// the screen's own guard — the veil never outlives the card while a session is open (a card closed by another path
+/// is put back; with no session the veil lifts: nothing is left under it to hide).
+pub fn service() {
+    let now = crate::arch::ms();
+    if now.wrapping_sub(POLICY_AT_MS.load(Ordering::Relaxed)) >= 1000 {
+        POLICY_AT_MS.store(now.max(1), Ordering::Relaxed);
+        refresh();
+    }
+    if ACTIVE.load(Ordering::Acquire) {
+        if SHAKE_STEP.load(Ordering::Acquire) != 0 {
+            shake_step(now);
+        }
+        if !super::crystal::login::is_locked() {
+            let mut nb = [0u8; crate::fs::users::NAME_MAX];
+            if crate::fs::users::whoami(&mut nb).is_some() && !super::crystal::login::is_open() && super::crystal::login::lock_screen() {
+                serial_println!("[lock] screen put back (the card went down without the password; the veil stays)");
+            } else if crate::fs::users::whoami(&mut nb).is_none() {
+                ACTIVE.store(false, Ordering::Release);
+                serial_println!("[lock] lifted reason=no-session");
+            }
+        }
+        return;
+    }
+    let m = AFTER_IDLE_MIN.load(Ordering::Relaxed);
+    if m == 0 {
+        return;
+    }
+    let act = super::dimidle::last_activity_ms();
+    if act == 0 || now.saturating_sub(act) < m as u64 * 60_000 || IDLE_TRIED.load(Ordering::Relaxed) == act {
+        return;
+    }
+    IDLE_TRIED.store(act, Ordering::Relaxed);
+    if lockable() {
+        let _ = enter(Cause::Idle);
+    }
+}
+
+/// One step of the shake: the card's content origin moved by the step's offset (one composite), and after the last
+/// step its outer origin checked against the one recorded and corrected once, so the card ends exactly where it was.
+fn shake_step(now: u64) {
+    if now.wrapping_sub(SHAKE_AT_MS.load(Ordering::Relaxed)) < SHAKE_STEP_MS {
+        return;
+    }
+    SHAKE_AT_MS.store(now.max(1), Ordering::Relaxed);
+    let id = SHAKE_ID.load(Ordering::Relaxed);
+    let st = SHAKE_STEP.load(Ordering::Acquire) as usize;
+    let (fx, fy) = (SHAKE_FX.load(Ordering::Relaxed) as usize, SHAKE_FY.load(Ordering::Relaxed) as usize);
+    let (cx, cy) = (fx + super::wm::BORDER(), fy + super::wm::TITLE_H() + super::wm::BORDER());
+    if st >= 1 && st <= SHAKE.len() {
+        let o = SHAKE[st - 1];
+        let d = super::metrics::size(o.unsigned_abs() as usize);
+        let x = if o < 0 { cx.saturating_sub(d) } else { cx + d };
+        if !super::wm::move_to(id, x, cy) {
+            SHAKE_STEP.store(0, Ordering::Relaxed);
+            return;
+        }
+        super::wm::composite();
+        SHAKE_STEP.store(st as u8 + 1, Ordering::Release);
+        return;
+    }
+    if let Some((x1, y1, _, _)) = super::wm::frame_of(id) {
+        if (x1, y1) != (fx, fy) {
+            let x = (cx + fx).saturating_sub(x1);
+            let y = (cy + fy).saturating_sub(y1);
+            let _ = super::wm::move_to(id, x, y);
+            super::wm::composite();
+        }
+    }
+    SHAKE_STEP.store(0, Ordering::Relaxed);
+}
+
+/// The window table as its read faces show it — every app row's id, owner, minimised bit (its z against the shell),
+/// title and outer frame, then the focused row — folded to FNV-1a 64. `tests autolock` compares it before the lock
+/// and after the unlock.
+pub fn fingerprint() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |v: u64| {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    let mut rows = alloc::vec::Vec::new();
+    let n = super::wm::wl_rows(&mut rows);
+    eat(n as u64);
+    for r in rows[..n].iter() {
+        eat(r.id as u64);
+        eat(r.owner);
+        eat(r.minimised as u64);
+        for &b in &r.title[..r.len] {
+            eat(b as u64);
+        }
+        let (x, y, w, hh) = super::wm::frame_of(r.id).unwrap_or((0, 0, 0, 0));
+        eat(x as u64);
+        eat(y as u64);
+        eat(w as u64);
+        eat(hh as u64);
+    }
+    match super::wm::wl_focused() {
+        Some((id, owner)) => {
+            eat(id as u64);
+            eat(owner);
+        }
+        None => eat(u64::MAX),
+    }
+    h
+}

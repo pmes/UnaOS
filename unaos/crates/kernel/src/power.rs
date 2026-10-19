@@ -410,7 +410,7 @@ pub mod sleep {
     /// The state is entered (`via`: lid, loginwindow, tests …). Atomics and one line; the SMC and ACPI reads are
     /// [`measure_enter`]'s, on the service pass.
     pub fn enter(via: &str, backlight: &str) {
-        if ASLEEP.swap(true, Ordering::AcqRel) { return; }
+        if ASLEEP.swap(true, Ordering::AcqRel) { return; } #[cfg(feature = "login")] crate::video::lock::before_sleep(via); // AUTOLOCK (B712): the lid (system.lock.on_lid) or another sleep (on_sleep) locks the glass BEFORE the state's line; `tests` never locks. LINE-NEUTRAL fold, code first.
         ENTER_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
         ENTER_BATT.store(u32::MAX, Ordering::Relaxed);
         serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb=up s3=unreachable", STATE, via, backlight);
