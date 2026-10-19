@@ -17,6 +17,22 @@
 use std::process::{Command, Stdio};
 
 mod vm_image;
+// KELFHASH (rmbp-ledger B709): the KELF.SHA record — ONE file the UEFI loader (which checks it before the jump) and
+// this builder (which writes it) both compile, so the writer and the reader cannot disagree.
+#[allow(dead_code)]
+#[path = "../../crates/bootloader/src/kelfsha.rs"]
+mod kelfsha;
+
+/// KELFHASH (B709): `KELF.SHA`'s slot-A row for the kernel bytes staged as `kernel.elf` — their sha256 (crypto_core,
+/// the builder's own SHA-256), the file, the slot and the loader's `KELF max=` (`kelfsha::kelf_of`). A kernel that is
+/// not an ELF64 stops the build: the loader would refuse it anyway.
+fn kelf_sha_record(elf: &[u8]) -> Vec<u8> {
+    let sha = crypto_core::sha2::sha256(elf);
+    let kelf = kelfsha::kelf_of(elf).expect("KELFHASH: the staged kernel is not an ELF64 with a PT_LOAD");
+    let mut out = [0u8; kelfsha::ROW_MAX];
+    let n = kelfsha::row(&sha, "KERNEL.ELF", kelfsha::SLOT_A, kelf, &mut out);
+    out[..n].to_vec()
+}
 
 /// VEINTLS (SR36): copy the pinned trust bundle to `<volume>/system/trust/roots.pem`. `false` = no bundle
 /// (nothing staged, said on the console); a sha256 that is not the pin panics (the build stops).
@@ -1227,6 +1243,12 @@ fn main() {
     
     std::fs::copy(&bootloader_bin, boot_dir.join("BOOTX64.EFI")).unwrap();
     std::fs::copy(&kernel_bin, esp_dir.join("kernel.elf")).unwrap();
+    // KELFHASH (B709): the build's own word on the kernel it just staged, beside it on the boot FAT. The x86 loader
+    // sha256s what it read and compares BEFORE the jump (a torn write or a half-flashed stick falls to the other slot
+    // or halts with `KELF: hash mismatch slot=A,B — reflash`); a volume without this file boots `unverified`.
+    let kelf_rec = kelf_sha_record(&std::fs::read(esp_dir.join("kernel.elf")).unwrap());
+    std::fs::write(esp_dir.join(kelfsha::NAME), &kelf_rec).unwrap();
+    println!("   KELFHASH: {} {}", kelfsha::NAME, String::from_utf8_lossy(&kelf_rec).trim_end());
 
     // A small text file so the in-kernel FAT reader has something to `cat` on the real boot stick:
     // after boot, `ls` shows EFI/ + kernel.elf + hello.txt and `cat hello.txt` reads it back off the
@@ -2841,5 +2863,67 @@ mod kernelfont_tests {
             assert!(shipped.lines().any(|l| l.starts_with(&format!("{want} "))), "{want} not in testf.list");
         }
         let _ = std::fs::remove_dir_all(&out);
+    }
+}
+
+#[cfg(test)]
+mod kelfhash_tests {
+    use super::kelfsha::{self, Check};
+
+    /// A little-endian ELF64 fixture: the 64-byte header, two PT_LOAD program headers (vaddr+memsz 0x2000+0x800 and
+    /// 0x1000+0x400, so `KELF max=` 0x2800) and 64 bytes of "code".
+    fn fixture() -> Vec<u8> {
+        let mut e = vec![0u8; 64 + 2 * 56 + 64];
+        e[..4].copy_from_slice(b"\x7fELF");
+        e[4] = 2; // ELFCLASS64
+        e[5] = 1; // little-endian
+        e[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        e[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        e[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+        for (i, (vaddr, memsz)) in [(0x2000u64, 0x800u64), (0x1000, 0x400)].iter().enumerate() {
+            let p = 64 + i * 56;
+            e[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            e[p + 0x10..p + 0x18].copy_from_slice(&vaddr.to_le_bytes());
+            e[p + 0x28..p + 0x30].copy_from_slice(&memsz.to_le_bytes());
+        }
+        for (i, b) in e[64 + 2 * 56..].iter_mut().enumerate() {
+            *b = i as u8 ^ 0x5a;
+        }
+        e
+    }
+
+    /// KELFHASH (B709): the builder's row round-trips through the loader's own check — ok on the bytes it names, a
+    /// flipped code byte is a mismatch, a row for another image is stale, no record and no row are `unverified`.
+    #[test]
+    fn kelf_sha_row_round_trips_through_the_loaders_check() {
+        let elf = fixture();
+        assert_eq!(kelfsha::kelf_of(&elf), Some(0x2800));
+        let rec = super::kelf_sha_record(&elf);
+        let text = String::from_utf8(rec.clone()).unwrap();
+        let sha: String = crypto_core::sha2::sha256(&elf).iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(text, format!("sha256={} file=KERNEL.ELF slot=A kelf=0x2800\n", sha));
+        let row = kelfsha::find(&rec, kelfsha::SLOT_A).expect("slot A row");
+        assert_eq!(row.kelf, 0x2800);
+        assert_eq!(row.sha, crypto_core::sha2::sha256(&elf));
+
+        let sha_ok = crypto_core::sha2::sha256(&elf);
+        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_ok, &elf), Check::Ok);
+        assert_eq!(kelfsha::check(None, kelfsha::SLOT_A, &sha_ok, &elf), Check::NoRecord);
+        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_B, &sha_ok, &elf), Check::NoRow);
+
+        let mut torn = elf.clone();
+        torn[64 + 2 * 56 + 7] ^= 1;
+        let sha_torn = crypto_core::sha2::sha256(&torn);
+        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_torn, &torn), Check::Bad);
+        let mut zeroed = elf.clone();
+        zeroed[..64].fill(0);
+        let sha_zero = crypto_core::sha2::sha256(&zeroed);
+        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_zero, &zeroed), Check::Bad, "unparseable bytes are a mismatch");
+
+        let mut other = elf.clone();
+        other[64 + 0x28..64 + 0x30].copy_from_slice(&0x900u64.to_le_bytes()); // another build: KELF max 0x2900
+        let sha_other = crypto_core::sha2::sha256(&other);
+        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_other, &other), Check::Stale);
+        println!("KELFHASH builder: row={} ok=1 torn=mismatch other=stale -> PASS", text.trim_end());
     }
 }

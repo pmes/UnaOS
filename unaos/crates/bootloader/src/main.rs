@@ -740,7 +740,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
     if let Err(e) = { #[cfg(target_arch = "x86_64")] let r = stages::read_kernel(&mut kernel_file, kernel_buffer); #[cfg(not(target_arch = "x86_64"))] let r = kernel_file.read(kernel_buffer); r } { // LOADERSTALL: x86 reads in 1 MiB chunks, a failed chunk retried
         log::error!("Failed to read kernel.elf: {:?}", e);
         return Status::LOAD_ERROR;
-    } #[cfg(target_arch = "x86_64")] let tsc_loader_read: u64 = unsafe { core::arch::x86_64::_rdtsc() }; #[cfg(target_arch = "x86_64")] stages::end(stages::KERNEL, kernel_size as u32); // BOOTCLOCK stamp 2 of 3 — the TSC once `kernel.elf` is in RAM. `tsc_loader_read - tsc_loader_entry` is the loader's OPEN+READ of the whole image (3.8 MB off the rMBP's SD slot on the bench, one volume in QEMU), which is the term A12 nominates as the plausible growth: the file gets bigger every arc and nothing has ever timed the read. Stamped after the error arm, so a failed read never produces a stamp at all. LINE-NEUTRAL fold on the closing brace, x86-gated — see the fold note on `fn main`.
+    } #[cfg(target_arch = "x86_64")] let tsc_loader_read: u64 = unsafe { core::arch::x86_64::_rdtsc() }; #[cfg(target_arch = "x86_64")] stages::end(stages::KERNEL, kernel_size as u32); #[cfg(target_arch = "x86_64")] let (kernel_buffer, kelf_verdict) = kelfcheck::verify(&mut root, kernel_buffer); // KELFHASH (B709): the bytes just read are sha256'd and checked against the builder's KELF.SHA row for their slot BEFORE anything parses them; a mismatch reads the OTHER slot into a fresh buffer (shadowing `kernel_buffer`), both bad halts with `KELF: hash mismatch slot=A,B — reflash`, no record jumps `unverified` (file tail `mod kelfcheck`). LINE-NEUTRAL fold, x86-gated. BOOTCLOCK stamp 2 of 3 — the TSC once `kernel.elf` is in RAM. `tsc_loader_read - tsc_loader_entry` is the loader's OPEN+READ of the whole image (3.8 MB off the rMBP's SD slot on the bench, one volume in QEMU), which is the term A12 nominates as the plausible growth: the file gets bigger every arc and nothing has ever timed the read. Stamped after the error arm, so a failed read never produces a stamp at all. LINE-NEUTRAL fold on the closing brace, x86-gated — see the fold note on `fn main`.
 
     let elf = match xmas_elf::ElfFile::new(kernel_buffer) {
         Ok(elf) => elf,
@@ -986,7 +986,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         edid_block,
         edid_block_valid,
         edid_total_len,
-        boot_volume_serial, #[cfg(target_arch = "x86_64")] tsc_loader_entry, #[cfg(target_arch = "x86_64")] tsc_loader_read, #[cfg(target_arch = "x86_64")] tsc_loader_jump: 0, #[cfg(target_arch = "x86_64")] loader_stages: unaos_boot_info::LoaderStages::EMPTY, // BOOTCLOCK: stamps 1 and 2 ride the initialiser; stamp 3 is written into the leaked struct after `exit_boot_services`, exactly like `igpu_trace_2` below, so it is seeded 0 here. 0 is also the ABSENT sentinel the kernel prints as `absent`, which is what a pre-BOOTCLOCK `bootloader.efi` sitting on old boot media will produce. LINE-NEUTRAL fold, x86-gated — see the fold note on `fn main`.
+        boot_volume_serial, #[cfg(target_arch = "x86_64")] tsc_loader_entry, #[cfg(target_arch = "x86_64")] tsc_loader_read, #[cfg(target_arch = "x86_64")] tsc_loader_jump: 0, #[cfg(target_arch = "x86_64")] loader_stages: unaos_boot_info::LoaderStages::EMPTY, #[cfg(target_arch = "x86_64")] kelf: kelf_verdict, // KELFHASH (B709): the loader's hash verdict rides the seam. BOOTCLOCK: stamps 1 and 2 ride the initialiser; stamp 3 is written into the leaked struct after `exit_boot_services`, exactly like `igpu_trace_2` below, so it is seeded 0 here. 0 is also the ABSENT sentinel the kernel prints as `absent`, which is what a pre-BOOTCLOCK `bootloader.efi` sitting on old boot media will produce. LINE-NEUTRAL fold, x86-gated — see the fold note on `fn main`.
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_0: t0,
         #[cfg(feature = "unaos_ivb")]
@@ -1546,11 +1546,25 @@ mod abslot;
 #[cfg(target_arch = "x86_64")]
 mod slots {
     use super::abslot::{self, Slot, Write};
+    use core::sync::atomic::{AtomicU8, Ordering};
     use uefi::proto::media::file::{Directory, File, FileAttribute, FileHandle, FileMode};
     use uefi::{cstr16, CStr16};
 
     const ELF: &CStr16 = cstr16!("KERNEL.ELF");
     const NEW: &CStr16 = cstr16!("KERNEL.NEW");
+
+    /// KELFHASH (B709): the slot `open` actually opened — 0 = A (`KERNEL.ELF`), 1 = B (`KERNEL.NEW`).
+    static OPENED: AtomicU8 = AtomicU8::new(0);
+
+    /// The slot `open` opened (0 = A, 1 = B).
+    pub fn opened() -> u8 {
+        OPENED.load(Ordering::Relaxed)
+    }
+
+    /// A slot's file (0 = A = `KERNEL.ELF`, else B = `KERNEL.NEW`).
+    pub fn file(slot: u8) -> &'static CStr16 {
+        if slot == 0 { ELF } else { NEW }
+    }
     const STAGE: &CStr16 = cstr16!("STAGE.REC");
     const SHUTDOWN: &CStr16 = cstr16!("SHUTDOWN.REC");
 
@@ -1608,14 +1622,124 @@ mod slots {
             Slot::Elf => (ELF, NEW, "NEW"),
             Slot::New => (NEW, ELF, "ELF"),
         };
+        let first = if d.slot == Slot::Elf { 0 } else { 1 };
         match root.open(pick, FileMode::Read, FileAttribute::empty()) {
-            Ok(h) => Ok(h),
+            Ok(h) => {
+                OPENED.store(first, Ordering::Relaxed);
+                Ok(h)
+            }
             Err(e) => {
                 // A promotion torn between its two renames leaves KERNEL.NEW (the image that just passed) and no
                 // KERNEL.ELF; a removed KERNEL.NEW under a live trial leaves the converse. Boot what is there.
                 log::info!("[loader] slot={} missing: opening slot={}", d.slot.word(), other_word);
-                root.open(other, FileMode::Read, FileAttribute::empty()).map_err(|_| e)
+                let h = root.open(other, FileMode::Read, FileAttribute::empty()).map_err(|_| e)?;
+                OPENED.store(1 - first, Ordering::Relaxed);
+                Ok(h)
             }
+        }
+    }
+}
+
+// KELFHASH (rmbp-ledger B709) — the loader knows the kernel it jumps to is the one the user's build wrote (BP-bar-4/8).
+// FILE-TAIL append (nothing above moves), x86-gated like `slots`. The record and the decision are `kelfsha.rs`, which
+// the builder compiles by path too; the digest is crypto_core's own SHA-256 (`sha2.rs` + the `ct.rs` it names as
+// `crate::ct`), compiled here by path so the loader takes no new dependency and runs the very code the kernel links.
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+#[path = "kelfsha.rs"]
+mod kelfsha;
+
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code, unexpected_cfgs)]
+#[path = "../../../libs/sys/crypto_core/src/ct.rs"]
+mod ct;
+
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+#[path = "../../../libs/sys/crypto_core/src/sha2.rs"]
+mod sha2;
+
+#[cfg(target_arch = "x86_64")]
+mod kelfcheck {
+    use super::kelfsha::{self, Check};
+    use super::{sha2, slots, stages};
+    use uefi::boot::{self, MemoryType};
+    use uefi::proto::media::file::{Directory, File, FileAttribute, FileMode};
+    use uefi::{cstr16, CStr16};
+    use unaos_boot_info::{KelfVerdict, KELF_HASH_OK, KELF_HASH_UNVERIFIED, KELF_SLOT_NAMES, KELF_VERDICT_MAGIC};
+
+    const RECORD: &CStr16 = cstr16!("KELF.SHA");
+
+    /// `KELF.SHA` (at most `kelfsha::MAX` bytes); `None` when absent or unreadable.
+    fn read_record(root: &mut Directory, buf: &mut [u8; kelfsha::MAX]) -> Option<usize> {
+        let mut f = root.open(RECORD, FileMode::Read, FileAttribute::empty()).ok()?.into_regular_file()?;
+        f.read(buf).ok()
+    }
+
+    /// Read a whole slot into fresh LOADER_DATA pages; `None` when the file is absent or the read fails.
+    fn read_slot(root: &mut Directory, slot: u8) -> Option<&'static mut [u8]> {
+        let mut f = root.open(slots::file(slot), FileMode::Read, FileAttribute::empty()).ok()?.into_regular_file()?;
+        let mut info = [0u8; 128];
+        let size = f.get_info::<uefi::proto::media::file::FileInfo>(&mut info).ok()?.file_size() as usize;
+        if size == 0 {
+            return None;
+        }
+        let p = boot::allocate_pages(boot::AllocateType::AnyPages, MemoryType::LOADER_DATA, (size + 4095) / 4096).ok()?;
+        let buf = unsafe { core::slice::from_raw_parts_mut(p.as_ptr(), size) };
+        let n = stages::read_kernel(&mut f, buf).ok()?;
+        Some(&mut buf[..n])
+    }
+
+    fn verdict(slot: u8, c: Check, sha: [u8; 32], bad: u8) -> KelfVerdict {
+        KelfVerdict {
+            magic: KELF_VERDICT_MAGIC,
+            slot,
+            hash: if c == Check::Ok { KELF_HASH_OK } else { KELF_HASH_UNVERIFIED },
+            why: c.why_code(),
+            bad,
+            sha,
+        }
+    }
+
+    fn say(slot: u8, c: Check, sha: &[u8; 32]) {
+        let s = kelfsha::short(sha);
+        log::info!(
+            "[loader] kelf slot={} hash={} why={} sha={}",
+            KELF_SLOT_NAMES[slot as usize & 1],
+            c.hash_word(),
+            c.why_word(),
+            core::str::from_utf8(&s).unwrap_or("?")
+        );
+    }
+
+    /// THE CHECK BEFORE THE JUMP. `buf` is the slot `slots::open` opened, already read. Returns the bytes to load
+    /// (the same buffer, or the other slot's) and the verdict for the kernel; never returns when both slots are bad.
+    pub fn verify<'a>(root: &mut Directory, buf: &'a mut [u8]) -> (&'a mut [u8], KelfVerdict) {
+        let mut rb = [0u8; kelfsha::MAX];
+        let rn = read_record(root, &mut rb);
+        let rec = rn.map(|n| &rb[..n]);
+        let first = slots::opened() & 1;
+        let sha = sha2::sha256(buf);
+        let c = kelfsha::check(rec, if first == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B }, &sha, buf);
+        say(first, c, &sha);
+        if c != Check::Bad {
+            return (buf, verdict(first, c, sha, 0));
+        }
+        // ABIMAGE's fallback rule: the other slot.
+        let other = 1 - first;
+        log::info!("[loader] kelf slot={} mismatch: trying slot={}", KELF_SLOT_NAMES[first as usize], KELF_SLOT_NAMES[other as usize]);
+        if let Some(nb) = read_slot(root, other) {
+            let sha2v = sha2::sha256(nb);
+            let c2 = kelfsha::check(rec, if other == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B }, &sha2v, nb);
+            say(other, c2, &sha2v);
+            if c2 != Check::Bad {
+                return (nb, verdict(other, c2, sha2v, 1 << first));
+            }
+        }
+        log::error!("KELF: hash mismatch slot=A,B — reflash");
+        stages::fatal("KELF: hash mismatch slot=A,B - reflash");
+        loop {
+            boot::stall(core::time::Duration::from_secs(1));
         }
     }
 }

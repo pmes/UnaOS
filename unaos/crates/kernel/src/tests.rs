@@ -173,7 +173,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -938,4 +938,54 @@ fn abielf_selftest() {
         ":: ABIELF: elf=ABIPROBE.ELF bytes={} abi={} kernel_abi={} syscalls={} ok={} outcome={} -> {} ::",
         bytes.len(), abi, k, n, ok, outcome, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ---- KELFHASH (rmbp-ledger B709): the loader's hash verdict on the kernel it jumped to ---------------------------------
+// The x86 UEFI loader sha256s the kernel bytes it read and compares them with the builder's `KELF.SHA` row BEFORE the
+// jump (`crates/bootloader/src/kelfsha.rs`); the verdict rides `BootInfo::kelf`. `kelf_note` is the boot's ONE line
+// (from `main.rs` at `calib`, beside `:: LOADER:`), and keeps the verdict for `tests kelfhash`.
+
+/// The verdict the loader handed over (None until `kelf_note`).
+#[cfg(target_arch = "x86_64")]
+static KELF_KEPT: crate::sync::Mutex<Option<unaos_boot_info::KelfVerdict>> = crate::sync::Mutex::new(None);
+
+#[cfg(target_arch = "x86_64")]
+fn kelf_short(sha: &[u8; 32]) -> alloc::string::String {
+    format!("{:02x}{:02x}{:02x}{:02x}", sha[0], sha[1], sha[2], sha[3])
+}
+
+/// KELFHASH: `[boot] kelf slot=<A|B> hash=<ok|unverified> sha=<first 8 hex>` — or `record=absent` for a loader older
+/// than KELFHASH. Kept for `tests kelfhash`.
+#[cfg(target_arch = "x86_64")]
+pub fn kelf_note(v: unaos_boot_info::KelfVerdict) {
+    *KELF_KEPT.lock() = Some(v);
+    if !v.present() {
+        serial_println!("[boot] kelf record=absent (a bootloader.efi older than KELFHASH)");
+        return;
+    }
+    serial_println!(
+        "[boot] kelf slot={} hash={} sha={}",
+        unaos_boot_info::KELF_SLOT_NAMES[v.slot as usize],
+        if v.hash == unaos_boot_info::KELF_HASH_OK { "ok" } else { "unverified" },
+        kelf_short(&v.sha)
+    );
+}
+
+/// `tests kelfhash`: `:: KELFHASH: slot=<A|B> hash=ok sha=<8> why=<…> bad=<mask> -> PASS ::` when the loader verified
+/// the kernel it jumped to against the build's `KELF.SHA`; FAIL `reason=absent` (no verdict: an older loader, or the
+/// boot line never ran) or `reason=unverified` (no record or no row for the slot — the build did not write one).
+#[cfg(target_arch = "x86_64")]
+fn kelfhash_selftest() {
+    let kept = *KELF_KEPT.lock();
+    let Some(v) = kept.filter(|v| v.present()) else {
+        serial_println!(":: KELFHASH: slot=- hash=- -> FAIL reason=absent ::");
+        return;
+    };
+    let slot = unaos_boot_info::KELF_SLOT_NAMES[v.slot as usize];
+    let why = unaos_boot_info::KELF_WHY_NAMES[v.why as usize];
+    if v.hash == unaos_boot_info::KELF_HASH_OK {
+        serial_println!(":: KELFHASH: slot={} hash=ok sha={} why={} bad={} -> PASS ::", slot, kelf_short(&v.sha), why, v.bad);
+    } else {
+        serial_println!(":: KELFHASH: slot={} hash=unverified sha={} why={} bad={} -> FAIL reason=unverified ::", slot, kelf_short(&v.sha), why, v.bad);
+    }
 }
