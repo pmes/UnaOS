@@ -549,7 +549,7 @@ refs/heads/exec-rmbp-winedge2   d399b021 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-wifimac    25bcc638 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-hidstall2b 941715a8 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-k2p 78f2e833 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
-refs/heads/exec-rmbp-idlenet 5e9b7026 IN-FLIGHT cloud wave36 IDLENET
+refs/heads/exec-rmbp-idlenet 32b7fefc FOLDED-BY-HAND (batch 2, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-settingsmap 74775a01 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-toastcap 050749b0 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-a11ytree 5e9b7026 IN-FLIGHT cloud wave36 A11YTREE
@@ -558,13 +558,13 @@ refs/heads/exec-rmbp-memline 8133fe47 FOLDED-BY-HAND (batch, legs at this commit
 refs/heads/exec-rmbp-applaunch b55a7bc2 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-uninstall 09eec873 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-nameindextx 4fca865b FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
-refs/heads/exec-rmbp-reask 5e9b7026 IN-FLIGHT cloud wave36 REASK
+refs/heads/exec-rmbp-reask fffed25f FOLDED-BY-HAND (batch 2, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-oldest afe12146 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-abimage d218b9bc FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-volkey     2303f8fb FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-wxn64 5e9b7026 IN-FLIGHT cloud wave36 WXN64
 refs/heads/exec-rmbp-shimmeridle 72f50c42 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
-refs/heads/exec-rmbp-uvccam 5e9b7026 IN-FLIGHT cloud wave36 UVCCAM
+refs/heads/exec-rmbp-uvccam f232a34e FOLDED-BY-HAND (batch 2, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-ptpcam 5e9b7026 IN-FLIGHT cloud wave36 PTPCAM
 refs/heads/exec-rmbp-keyboot    e1c9dcd0 IN-FLIGHT cloud wave36 KEYBOOT (B688)
 refs/heads/exec-rmbp-xts        e1c9dcd0 IN-FLIGHT cloud wave36 XTS (B689)
