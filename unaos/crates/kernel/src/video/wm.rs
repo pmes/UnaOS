@@ -5214,7 +5214,7 @@ fn composite_once() {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] let k2p_pass = k2p::begin(); let owed = composite_pass_half(); // K2P (B671): this frame takes its oldest consumed input and judges its vblank deadline (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
     // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
     #[cfg(not(target_arch = "aarch64"))]
-    cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] crate::video::veilcost::frame(); // K2P (B671): the frame is on the glass — its input's age is recorded (file tail). ⚠ LINE-NEUTRAL fold, code before the comment. VEILCOST (B696): one sample per 500 ms and the `[veil] cost` line (video/veilcost.rs), same fold.
+    cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::on_damage(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] crate::video::veilcost::frame(); // ZOOM (B713): the pass's pixels are in the RAM frame while the lens is live — present them through it before the frame is judged on the glass. K2P (B671): the frame is on the glass — its input's age is recorded (file tail). VEILCOST (B696): the sample. ⚠ LINE-NEUTRAL fold, code before the comment.
     // aarch64: stash and leave — but ONLY when a cash is actually coming, i.e. this pass is a
     // present's, whose epilogue calls `composite_tail_owed` a few instructions from now with IRQs
     // restored. Any other caller cashes inline, exactly as the trunk does. See

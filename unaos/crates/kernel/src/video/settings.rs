@@ -3094,8 +3094,32 @@ static A11Y_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 static A11Y_CONTRAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static A11Y_CURSOR_Q: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(A11Y_CURSOR_MIN_Q);
 static A11Y_TEXT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert).
+/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow).
 static A11Y_PERSIST: AtomicU32 = AtomicU32::new(0);
+/// ZOOM (B713): the magnifier's factor as stored (0 off, 2, 3, 4) and what it follows (0 the pointer, 1 the focus) —
+/// the rows' latch; the lens (`video/zoom.rs`, x86 `wc`) is handed both by [`zoom_apply`].
+static A11Y_ZOOM: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static A11Y_FOLLOW: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The zoom row's segments, in order, and the factor each one is.
+const A11Y_ZOOM_SEGS: [&[u8]; 4] = [b"Off", b"2x", b"3x", b"4x"];
+/// The schema's `accessibility.zoom_follow` spellings (row 5's segments: Pointer, Focus).
+const A11Y_FOLLOW_NAMES: [&str; 2] = ["pointer", "focus"];
+
+/// Segment `i` of the zoom row as a factor (0, 2, 3, 4). Pure.
+fn a11y_zoom_of_seg(i: usize) -> u8 {
+    match i { 0 => 0, 1 => 2, 2 => 3, _ => 4 }
+}
+
+/// A factor as the zoom row's segment. Pure.
+fn a11y_zoom_seg(z: u8) -> usize {
+    match z { 0 | 1 => 0, 2 => 1, 3 => 2, _ => 3 }
+}
+
+/// Hand the latched factor and follow to the lens (x86 `wc`; elsewhere the row stores the keys and no lens exists).
+fn zoom_apply() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    super::zoom::set(A11Y_ZOOM.load(Ordering::Relaxed), A11Y_FOLLOW.load(Ordering::Relaxed));
+}
 /// A PrefChanged named an `accessibility.*` key: the service pass re-reads the four.
 static A11Y_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -3156,6 +3180,11 @@ fn a11y_load(via: &str) {
     af::set(cvd, inv);
     let moved = (rm0 != rm) as u8 + (ic0 != ic) as u8 + (cq0 != cq) as u8 + (ts0 != ts) as u8 + (cvd0 != cvd) as u8 + (inv0 != inv) as u8;
     if via != "login" && ts0 != ts { A11Y_PERSIST.fetch_or(1 << 3, Ordering::AcqRel); }
+    let zm = crate::prefs_client::sys_int(key::A11Y_ZOOM, 0, 4).map_or(0, |v| a11y_zoom_of_seg(a11y_zoom_seg(v as u8))); // ZOOM (B713)
+    let zf = text(key::A11Y_ZOOM_FOLLOW).and_then(|s| A11Y_FOLLOW_NAMES.iter().position(|n| *n == s)).unwrap_or(0) as u8;
+    A11Y_ZOOM.store(zm, Ordering::Relaxed);
+    A11Y_FOLLOW.store(zf, Ordering::Relaxed);
+    zoom_apply();
     if via == "login" || moved > 0 {
         serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via);
         a11y_cost_line(if via == "login" { "load" } else { "change" });
@@ -3188,6 +3217,8 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
         4 => { let m = val.min(af::MODES - 1); af::set(m, af::invert()); ("cvd", String::from(af::NAMES[m]), true) }
         5 => { af::set(af::mode(), val != 0); ("invert", alloc::format!("{}", (val != 0) as u8), true) }
+        6 => { let z = a11y_zoom_of_seg(a11y_zoom_seg(val.min(4) as u8)); A11Y_ZOOM.store(z, Ordering::Relaxed); zoom_apply(); ("zoom", alloc::format!("{}", z), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // ZOOM (B713)
+        7 => { let f = val.min(A11Y_FOLLOW_NAMES.len() - 1); A11Y_FOLLOW.store(f as u8, Ordering::Relaxed); zoom_apply(); ("zoom_follow", alloc::format!("{}", A11Y_FOLLOW_NAMES[f]), cfg!(all(target_arch = "x86_64", feature = "wc"))) }
         _ => return,
     };
     if store {
@@ -3212,6 +3243,21 @@ fn a11y_service() {
         a11y_load("prefchanged");
         if is_open() && cur_tab() == A11Y_TAB { repaint(); }
     }
+    // ZOOM (B713): the lens's own pass (engage / disengage off the input band, owed presents, the `[zoom]` line), then
+    // a chord's step taken into the row's latch and stored like a press — only once the login's load has run.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        super::zoom::service();
+        if LOAD_DONE.load(Ordering::Acquire) {
+            if let Some((z, f)) = super::zoom::take_persist() {
+                A11Y_ZOOM.store(z, Ordering::Relaxed);
+                A11Y_FOLLOW.store(f, Ordering::Relaxed);
+                say("accessibility.zoom", &alloc::format!("{}", z), true);
+                A11Y_PERSIST.fetch_or(1 << 4, Ordering::AcqRel);
+                if is_open() && cur_tab() == A11Y_TAB { repaint(); }
+            }
+        }
+    }
     let owed = A11Y_PERSIST.swap(0, Ordering::AcqRel);
     if owed == 0 { return; }
     use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys;
@@ -3225,6 +3271,11 @@ fn a11y_service() {
     }
     if owed & 16 != 0 { set_sys(key::A11Y_CVD, P::Str(String::from(af::NAMES[af::mode()]))); }
     if owed & 32 != 0 { set_sys(key::A11Y_INVERT, P::Bool(af::invert())); }
+    if owed & 64 != 0 { set_sys(key::A11Y_ZOOM, P::Int(A11Y_ZOOM.load(Ordering::Relaxed) as i64)); } // ZOOM (B713)
+    if owed & 128 != 0 {
+        let f = (A11Y_FOLLOW.load(Ordering::Relaxed) as usize).min(A11Y_FOLLOW_NAMES.len() - 1);
+        set_sys(key::A11Y_ZOOM_FOLLOW, P::Str(String::from(A11Y_FOLLOW_NAMES[f])));
+    }
 }
 
 fn paint_a11y(st: &mut State) {
@@ -3251,8 +3302,14 @@ fn paint_a11y(st: &mut State) {
     txt(st, LABEL_X, 5, "Invert colours");
     tog(st, 5, TOG_X, inv, false);
     txt2(st, TRACK_X, 5, if inv { "Every colour on the glass inverted" } else { "Colours as drawn" });
-    txt2(st, LABEL_X, 6, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
-    txt2(st, LABEL_X, 7, "Text size sets the UI font size the faces follow; the colour filter and invert cover the whole glass.");
+    let (zm, zf) = (A11Y_ZOOM.load(Ordering::Relaxed), (A11Y_FOLLOW.load(Ordering::Relaxed) as usize).min(1)); // ZOOM (B713)
+    txt(st, LABEL_X, 6, "Zoom");
+    seg(st, 6, &A11Y_ZOOM_SEGS, a11y_zoom_seg(zm), false);
+    txt2(st, VAL_X, 6, if zm == 0 { "Win+= zooms in" } else { "Win+- out, Win+0 off" });
+    txt(st, LABEL_X, 7, "Zoom follows");
+    seg(st, 7, &[b"Pointer", b"Focus"], zf, false);
+    txt2(st, LABEL_X, 8, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
+    txt2(st, LABEL_X, 9, "Text size sets the UI font size; the colour filter and invert cover the whole glass; zoom magnifies it around the pointer or the focus.");
 }
 
 /// A11YFILTERS (B705): what row 4's value column says per mode (the segments name the cone each filter simulates).
@@ -3267,6 +3324,8 @@ fn press_a11y(row: usize, cx: usize) {
         3 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(3, ((cx - TRACK_X) / (TRACK_W / A11Y_TEXT_NAMES.len())).min(A11Y_TEXT_NAMES.len() - 1), true); } }
         4 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(4, ((cx - TRACK_X) / (TRACK_W / af::MODES)).min(af::MODES - 1), true); } }
         5 => a11y_set(5, (!af::invert()) as usize, true),
+        6 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(6, a11y_zoom_of_seg((cx - TRACK_X) / (TRACK_W / A11Y_ZOOM_SEGS.len())) as usize, true); } } // ZOOM (B713)
+        7 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(7, ((cx - TRACK_X) / (TRACK_W / A11Y_FOLLOW_NAMES.len())).min(A11Y_FOLLOW_NAMES.len() - 1), true); } }
         _ => {}
     }
 }
@@ -3592,7 +3651,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 39] = {
+pub const MAP: [MapRow; 41] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3635,6 +3694,8 @@ pub const MAP: [MapRow; 39] = {
         mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
         mr(&[A11Y_CVD], A11Y_TAB, 4, "Colour filter", NO_CTRL),
         mr(&[A11Y_INVERT], A11Y_TAB, 5, "Invert colours", NO_CTRL),
+        mr(&[A11Y_ZOOM], A11Y_TAB, 6, "Zoom", NO_CTRL), // ZOOM (B713)
+        mr(&[A11Y_ZOOM_FOLLOW], A11Y_TAB, 7, "Zoom follows", NO_CTRL),
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
         mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
         // Date & Time (TZLOCALE B701): the one locale authority's three keys

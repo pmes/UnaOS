@@ -3034,7 +3034,7 @@ impl RepaintTail {
         if let Some((px, py)) = self.armed_at {
             serial_println!("[cursor] armed x={} y={}", px, py);
         }
-        repair(self.restored);
+        repair(self.restored); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::on_pointer(); // ZOOM (B713): the sprite went into the RAM frame at the pointer's logical position; the lens presents it at its MAGNIFIED one, (p - origin) x z (one relaxed load when off). LINE-NEUTRAL, code before the comment.
     }
 }
 

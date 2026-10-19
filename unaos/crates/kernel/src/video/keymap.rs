@@ -342,7 +342,7 @@ pub fn resolve_edge(
     prev_keys: &[u8; 6],
     modifiers: u8,
 ) -> Option<(Action, &'static str)> {
-    note_keys(cur_keys, prev_keys); let mut i = 0; // SOFTY2 (B641): a key edge spoils a Windows-key tap; an Esc edge is counted for the flyouts. SAME-LINE fold, code first.
+    note_keys(cur_keys, prev_keys); #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_edge(cur_keys, prev_keys, modifiers); let mut i = 0; // ZOOM (B713): Win+= / Win+- / Win+0 through `ZOOM_ROWS` (file tail). SOFTY2 (B641): a key edge spoils a Windows-key tap; an Esc edge is counted for the flyouts. SAME-LINE fold, code first.
     while i < cur_keys.len() {
         let u = cur_keys[i];
         if u != 0 && !prev_keys.contains(&u) {
@@ -763,4 +763,33 @@ pub mod layouts;
 /// does not claim (a chord, a Ctrl fold, a non-printing key) writes nothing and stays on `hid_key_ascii`'s path.
 pub fn layout_report(cur_keys: &[u8; 6], prev_keys: &[u8; 6], modifiers: u8, caps: bool, out: &mut [char; 12]) -> usize {
     layouts::report_live(cur_keys, prev_keys, modifiers, caps, out)
+}
+
+// ══════════════ ZOOM (rmbp-ledger B713) — the magnifier's chord rows — TAIL-APPENDED ══════════════
+//
+// The lens (`video/zoom.rs`) steps on `Win+=` (in: off -> x2 -> x3 -> x4), `Win+-` (out: x4 -> x3 -> x2 -> off) and
+// clears on `Win+0`. The modifier is the PHYSICAL key in the Windows key's position, `HID_MOD_GUI` (Win on a PC
+// keyboard, Command on an Apple one), on every table and both looks: the magnifier is a property of the glass, not
+// of the look's chord dialect, and no shipped table binds GUI with `=`, `-` or `0`. GUI held suppresses the typed
+// character (`hid_key_ascii`), so the chord types nothing; it resolves to no `Action` (nothing is delivered to a
+// window) and costs a Softy Windows-key tap nothing it did not already cost (`note_keys` spoils a tap on any edge).
+// The rows are a TABLE here (BP-input-2), judged at the one seam both HID decoders reach ([`resolve_edge`]).
+
+/// `(HID usage, step)`: `=` steps in, `-` steps out, `0` clears (`zoom::stepped`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub const ZOOM_ROWS: [(u8, i8); 3] = [(0x2E, 1), (0x2D, -1), (0x27, 0)];
+
+/// From [`resolve_edge`]: each press edge of a `ZOOM_ROWS` usage with `HID_MOD_GUI` held is one step (atomics only).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn zoom_edge(cur: &[u8; 6], prev: &[u8; 6], modifiers: u8) {
+    if modifiers & HID_MOD_GUI == 0 {
+        return;
+    }
+    for &u in cur.iter() {
+        if u != 0 && !prev.contains(&u) {
+            if let Some(&(_, step)) = ZOOM_ROWS.iter().find(|r| r.0 == u) {
+                super::zoom::chord(step);
+            }
+        }
+    }
 }

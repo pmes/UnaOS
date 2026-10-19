@@ -1261,3 +1261,6 @@ pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_
 // LOOKSHIM: text.rs asks `look::is_softy()` on every build; without the desktop the answer is "no" (the plain `kernel8` verb, no PIDESK, was red: E0433 at text.rs:309).
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub mod look { #[inline] pub fn is_softy() -> bool { false } }
+// ZOOM (B713): the screen magnifier — the panel composed unfiltered in a RAM frame `WRITER` points at, presented through a lens (x2/x3/x4) that follows the pointer or the focus. x86 `wc` (the compositor it sits under); at the tail so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod zoom;
