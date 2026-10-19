@@ -184,6 +184,19 @@ pub static SCHEMA: &[Key] = &[
         writers: &[Writer::Settings, Writer::Program], reader: "Settings > Accessibility (`settings::a11y_load`), applied by writing `system.display.font_size` (13 / 16 / 20 / 26 CSS px), which `video::text` sizes its faces from (CSS px x the panel's ppi / 96)",
         doc: "Larger UI text in four steps: `default` (13 px, the body size), `large` (x1.25), `larger` (x1.5), `largest` (x2, the HIG's 200 %). A step is applied on change by writing `display.font_size`; the store carries both (A11YPANE, B655).",
     },
+    // ── ZOOM (rmbp-ledger B713): the screen magnifier (research C §10; BP-bar-22). The kernel applies them at the login's
+    //    load and on PrefChanged (`video/settings.rs` `a11y_load` -> `video/zoom.rs` `set`); Win+= / Win+- / Win+0 write
+    //    the factor through the settings pass ──
+    Key {
+        ns: "system", key: "accessibility.zoom", kind: Kind::Int { min: 0, max: 4 }, default: Default::Int(0),
+        writers: &[Writer::Settings, Writer::Keys, Writer::Program], reader: "kernel lens (`video/zoom.rs`: the panel composed in RAM, presented magnified), Settings > Accessibility (`settings::a11y_load`)",
+        doc: "The screen magnifier's factor: 0 = off, 2, 3 or 4 (1 reads as off). The whole glass shows a 1/z window of the desktop scaled by z, nearest while the pointer moves, bilinear once it settles; Win+= steps in, Win+- out, Win+0 clears (ZOOM, B713).",
+    },
+    Key {
+        ns: "system", key: "accessibility.zoom_follow", kind: Kind::Enum(&["pointer", "focus"]), default: Default::Str("pointer"),
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel lens (`video/zoom.rs` `centre`), Settings > Accessibility",
+        doc: "What the magnified window is centred on: the pointer, or the focused window's rect (the row the accessibility tree flags FOCUSED), clamped at the panel's edges (ZOOM, B713).",
+    },
     Key {
         ns: "system", key: "appearance.accent", kind: Kind::Enum(&crate::appearance::ACCENTS), default: Default::Str("crispy"),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs`), Settings > Appearance",
