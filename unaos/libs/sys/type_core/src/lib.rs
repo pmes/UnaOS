@@ -22,6 +22,9 @@ pub const IMAGE_SVG: &str = "image/svg+xml";
 /// RAWCORE (B444): raw_core's types (`pixel_core::mime_of` -> `raw_core::mime_of`): a Sony raw, a plain TIFF.
 /// Carried into the one table at the TYPECORE x RAWCORE merge (SMALLFIX4).
 pub const IMAGE_ARW: &str = "image/x-sony-arw";
+/// RAWCOLOR (B724): Canon and Nikon raw containers.
+pub const IMAGE_CR2: &str = "image/x-canon-cr2";
+pub const IMAGE_NEF: &str = "image/x-nikon-nef";
 pub const IMAGE_TIFF: &str = "image/tiff";
 pub const AUDIO_WAV: &str = "audio/wav";
 pub const AUDIO_FLAC: &str = "audio/flac";
@@ -77,6 +80,7 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("webp", IMAGE_WEBP),
     ("qoi", IMAGE_QOI),
     ("arw", IMAGE_ARW), // RAWCORE (B444)
+    ("cr2", IMAGE_CR2), ("nef", IMAGE_NEF), // RAWCOLOR (B724)
     ("tif", IMAGE_TIFF),
     ("tiff", IMAGE_TIFF),
     ("svg", IMAGE_SVG),
