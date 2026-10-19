@@ -138,6 +138,11 @@ pub enum FileSystemError {
     /// mutation, commit and `fsck --repair` is refused before it reaches the root (unafs-records.md §R12, §R17).
     #[error("The volume is read-only here: it uses features this build does not know (rocompat {0:#x})")]
     ReadOnly(u64),
+    /// ROOTINCOMPAT (SR159): the root record carries INCOMPAT bits this build does not know (the value: those
+    /// bits, `flags & ROOT_INCOMPAT_MASK & !ROOT_INCOMPAT_KNOWN`) — the mount is REFUSED before the maps are
+    /// read (not read-only: nothing of the volume is interpreted) (unafs-records.md §R12).
+    #[error("The volume cannot be opened here: it uses features this build does not know (incompat {0:#x})")]
+    Incompatible(u64),
 }
 
 /// A directory entry pointing to an inode (by stable LOGICAL id).
@@ -597,6 +602,12 @@ impl<D: BlockDevice> UnaFS<D> {
 
         let (root, active_slot) = crate::root::read_active(device)?
             .ok_or(FileSystemError::CorruptVolume("no valid root record"))?;
+        // ROOTINCOMPAT (SR159): an INCOMPAT bit this build does not know means the maps and records below may
+        // not mean what this build would read — refuse before anything else of the root is interpreted.
+        match root.incompat_unknown() {
+            0 => {}
+            unknown => return Err(FileSystemError::Incompatible(unknown)),
+        }
 
         // UNAFSMAP: the maps' shape. v7 is paged; a v6 volume whose root
         // carries MIGRATE is paged too (the migration's superblock rewrite did

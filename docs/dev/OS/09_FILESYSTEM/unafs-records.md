@@ -305,7 +305,7 @@ Reclaim queue (inode 4's data): `Vec<ReclaimEntry>`, `ReclaimEntry` = `generatio
 | 40 | 8 | `refmap_block` — top node of the refcount map |
 | 48 | 8 | `refmap_leaves` |
 | 56 | 8 | `free_blocks` |
-| 64 | 8 | `flags`: bit 0 `GROW` (superblock rewrite may lag a grow), bit 1 `MIGRATE` (maps paged though block 0 may still say v6); bits 2..31 0; bits 32..63 the ROCOMPAT word: bit 32 `VERSIONS` (§R17), bits 33..63 0 |
+| 64 | 8 | `flags`: bit 0 `GROW` (superblock rewrite may lag a grow), bit 1 `MIGRATE` (maps paged though block 0 may still say v6); bits 2..31 the INCOMPAT word (none defined: a set bit refuses the mount); bits 32..63 the ROCOMPAT word: bit 32 `VERSIONS` (§R17), bits 33..63 0 |
 | 72 | 8 | FNV-1a 64 of bytes 0..72 |
 
 Mount takes the valid slot (magic, checksum, generation ≠ 0) with the higher generation; a commit
@@ -325,6 +325,19 @@ write that needs them and never cleared. Every NEW ROCOMPAT feature follows this
 ignores bits 32..63 (it tests bits 0 and 1 only) — the word protects a volume from readers built after
 SR154 that predate a LATER bit, not from the builds before it. `tools/unafs fsck` prints
 `rocompat=<versions|none|unknown:0x…> read_only=<0|1>`.
+
+**The INCOMPAT word** (ROOTINCOMPAT, SR159; `root::ROOT_INCOMPAT_MASK`, bits 2..31). A feature a volume TURNS
+ON whose records a reader must understand even to READ (not a whole-format change: that still bumps the
+superblock stamp, BP-storage-6) takes a bit here. The rule, from SR159 on: a reader that finds an INCOMPAT bit
+it does not know (`flags & ROOT_INCOMPAT_MASK & !ROOT_INCOMPAT_KNOWN ≠ 0`) REFUSES THE MOUNT — not read-only:
+refused, before the maps are loaded — as `FileSystemError::Incompatible(<the unknown bits>)`; the kernel's
+mount prints `[unafs] mount refused incompat=0x…` and `tools/unafs` refuses every mounted command with the same
+words. This build knows no INCOMPAT bit (`ROOT_INCOMPAT_KNOWN = 0`) and writes none; the build that names the
+first one carries it on every commit the way `UnaFS::rocompat` carries the ROCOMPAT word. Honest edge: readers
+before SR159 test bits 0, 1 and (from SR154) the ROCOMPAT word only, so they ignore an INCOMPAT bit; a feature
+that must lock THOSE readers out still needs the stamp. The dry-run fsck also names `versions-flag-missing`
+(`FsckReport::versions_flag_missing`, counted by `is_clean`): rings hold versions under a root without the
+`VERSIONS` bit (a B714 volume); `fsck --repair` sets the bit (SR154) and reports the finding it healed.
 
 ## §R13 Maps (hand-packed raw arrays)
 
@@ -453,7 +466,10 @@ decode opens every inode block of a versioned volume — inline and extent-backe
 SR154: the first version sets `VERSIONS` and `fsck --repair` reclaims nothing and every version reads back
 after the free space is refilled; a pre-flag versioned root gets the bit on repair; a root with an unknown
 ROCOMPAT bit mounts read-only, reads, and refuses writes, the commit and the repair with the device
-byte-identical);
+byte-identical; SR159: every unknown INCOMPAT bit 2..31 refuses the mount naming exactly that bit (with an
+unknown ROCOMPAT bit beside it, still refused, not read-only); a known low bit (`MIGRATE` on v7) mounts
+read-write; the dry run names `versions-flag-missing` on a pre-flag versioned root and writes nothing, repair
+sets the bit and the next dry run, and the one after a remount, are clean);
 kernel `tests fileversions` (`:: FILEVERSIONS: writes=10 kept=8 restore=ok bound=ok v7reader=ok -> PASS ::`).
 
 ## §R17 The metadata reserve and the failed-write unwind (DISKRESERVE, SR152)

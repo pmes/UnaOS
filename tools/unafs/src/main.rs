@@ -112,6 +112,10 @@ fn mount_dev(device: FileDevice, key: &Key) -> Result<FileSystem> {
         unafs::fs::FileSystemError::KeyRequired => anyhow::anyhow!(
             "this volume is KEYED (VOLKEY): it opens only with its key — pass --password-stdin or --recovery-stdin and the key on stdin"
         ),
+        // ROOTINCOMPAT (SR159): an INCOMPAT root bit this build does not know — refused, the bits named.
+        unafs::fs::FileSystemError::Incompatible(bits) => anyhow::anyhow!(
+            "[unafs] mount refused incompat={bits:#x}: this volume uses features this build does not know — it is not opened, not even read-only"
+        ),
         e => anyhow::Error::new(e),
     })
 }
@@ -1192,6 +1196,8 @@ async fn main() -> Result<()> {
                 println!("  blocks reclaimed     : {}", report.reclaimed_blocks);
                 println!("  parent links restamped: {}", report.bad_parent_links.len());
                 println!("  name index reindexed : {}", !report.name_index_missing.is_empty() || !report.name_index_stale.is_empty());
+                // ROOTINCOMPAT (SR159): the dry run's `versions-flag-missing`, healed here (SR154 sets the bit).
+                println!("  versions flag set    : {}", report.versions_flag_missing as u8);
             } else {
                 let report = fs
                     .fsck(false)
@@ -1212,6 +1218,10 @@ async fn main() -> Result<()> {
                     report.version_blocks,
                     if report.version_ledger_stale { "stale" } else { "ok" }
                 );
+                // ROOTINCOMPAT (SR159): a versioned volume whose root lacks the ROCOMPAT `versions` bit.
+                if report.versions_flag_missing {
+                    println!("  finding              : versions-flag-missing (versions kept, root has no ROCOMPAT versions bit — pass --repair to set it)");
+                }
                 let names = fs.name_index_check().map_err(|e| anyhow::anyhow!("name index check failed: {:?}", e))?;
                 println!(
                     "  name index           : ready={} keys={} expected={} missing={} stale={}",

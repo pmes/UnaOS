@@ -84,6 +84,10 @@ pub struct FsckReport {
     /// FILEVERSIONS (B714): the volume's version ledger disagrees with the rings (an older build rewrote
     /// the reclaim-queue inode and dropped it); repair rewrites it from the rings.
     pub version_ledger_stale: bool,
+    /// ROOTINCOMPAT (SR159): the finding `versions-flag-missing` — the volume holds versions but its root lacks
+    /// the ROCOMPAT `versions` bit (one B714 wrote before SR154), so a reader that cannot see the rings is not
+    /// told to stay read-only; repair sets the bit (SR154).
+    pub versions_flag_missing: bool,
 }
 
 impl FsckReport {
@@ -95,6 +99,7 @@ impl FsckReport {
             && self.name_index_missing.is_empty()
             && self.name_index_stale.is_empty()
             && !self.version_ledger_stale
+            && !self.versions_flag_missing
             && !self.dirty_journal
     }
 }
@@ -181,6 +186,7 @@ impl<D: BlockDevice> UnaFS<D> {
             versions: census.versions,
             version_blocks: census.kept,
             version_ledger_stale: ledger_stale,
+            versions_flag_missing: census.versions > 0 && self.rocompat() & crate::root::ROOT_FLAG_VERSIONS == 0,
         };
 
         if !repair {

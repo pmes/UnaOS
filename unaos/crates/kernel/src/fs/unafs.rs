@@ -449,7 +449,7 @@ pub fn mount_on(handle: block::BlockHandle) -> Result<KernelUnaFS, MountError> {
     partition_witness(handle, &span); #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_span(handle, &span); // HIDSTALL2 (B670): the span this handle's volume sits at, for the split read (LINE-NEUTRAL append, before this comment)
     let dev = SdSectorDevice::open_on(handle)?;
     let adapter = BlockAdapter::for_partition(dev, &span);
-    keyboot_mount(handle, adapter).map(versions_armed).map_err(MountError::Fs) // KEYBOOT (B688): the unlocked keyed root re-opens with the key its open mount carries (body at the tail); every other volume is `UnaFS::mount` as before
+    keyboot_mount(handle, adapter).map(versions_armed).map_err(|e| { if let FileSystemError::Incompatible(bits) = &e { serial_println!("[unafs] mount refused incompat={:#x}", bits); } MountError::Fs(e) }) // ROOTINCOMPAT (SR159): an unknown INCOMPAT root bit is refused and said (LINE-NEUTRAL fold, before this comment). KEYBOOT (B688): the unlocked keyed root re-opens with the key its open mount carries (body at the tail); every other volume is `UnaFS::mount` as before
 }
 
 /// PARTITION (GR9): cross-check the located UnaFS span against the kernel block layer's own MBR
