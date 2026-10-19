@@ -30573,3 +30573,10 @@ fn bg_expect(x: usize, y: usize) -> u32 {
 fn bg_expect(_x: usize, _y: usize) -> u32 {
     DESKTOP_BG
 }
+// A11YTREE (rmbp-ledger B675, BP-bar-22): the accessibility role/name tree read from this table and the furniture's
+// tables — `BUS_VERB_A11Y_TREE`'s body and `tests a11ytree`. Declared at this file's tail with `#[path]` (fbdirect's
+// and desktop's precedent) so `video/mod.rs` does not move and it reads the rows' fields: a read-only walk (`table()`
+// dereferenced immutably — no `DMG_GEN` bump — into a buffer reserved before the hold; no WCSER); cfg-erased knob-off.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[path = "a11y.rs"]
+pub mod a11y;

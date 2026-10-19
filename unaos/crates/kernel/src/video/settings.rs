@@ -111,7 +111,7 @@ const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
 pub const TABS: usize = 10;
-const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9
+pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -1167,7 +1167,7 @@ fn paint_users(st: &mut State) {
         for (i, (nm, unset)) in list.iter().enumerate().take(8) {
             let r = 1 + i;
             let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else if users_is_admin(nm) { " (admin)" } else { "" };
-            if i == sel && !st.strip { row_wash(st, r); }
+            if i == sel && !st.strip { row_wash(st, r); if st.kbd { row_ring(st, r); } } // A11YTREE (B675): a Tab stop on the list shows the kit's ring (DESIGN-LANGUAGE §2.7)
             let d = 24;
             avatar(st, LABEL_X, mid_y(r, d), d, nm);
             let ch = super::metrics::lcell_h(face);
@@ -1319,7 +1319,7 @@ fn switch_tab(t: usize) {
     repaint();
 }
 
-fn cur_tab() -> usize { CUR.lock().tab as usize }
+pub(super) fn cur_tab() -> usize { CUR.lock().tab as usize } // A11YTREE (B675): `pub(super)` with TAB_NAMES, so the accessibility tree names the tab rows from this table
 
 // ── SETTINGSTABS (rmbp-ledger B623, R118) — the tab column ────────────────────────────────────────────────────────
 // "settings tabs typically go on the left since there get to be a lot of them." Rows are `COL_ROW` tall from `COL_PAD`;
@@ -3195,4 +3195,81 @@ pub fn selftest_a11y() {
         keys.len(), if declared == keys.len() { "ok" } else { "FAIL" }, if pane { "ok" } else { "FAIL" }, if snap && eases { "ok" } else if snap { "no-ease" } else { "FAIL" },
         if contrast { "ok" } else { "FAIL" }, if cursor { "ok" } else { "FAIL" }, if text { "ok" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ── A11YTREE (rmbp-ledger B675; BP-bar-22: "Tab through Settings shows a ≥ 2 px ring at every stop") ──────────────
+// Every kit control draws DESIGN-LANGUAGE §2.7's ring when it holds the keyboard (`draw::focus_ring`, the
+// `focus_ring` token, `DIMS.focus_ring` logical px device-scaled), and the column's pill does (`st.strip && st.kbd`).
+// The one stop that showed none was a Users row: Tab walks `u.sel` down the list and the row got only its wash.
+// [`row_ring`] is that ring, the kit's arithmetic on the wash's rect. [`ring_probe`] is `tests a11ytree`'s ring leg.
+
+/// The kit's focus ring outside a Users row's wash (row `r`): width `DIMS.focus_ring` at the panel's scale, the radius
+/// the wash's plus that width — what `draw::focus_ring` draws around a control.
+fn row_ring(st: &mut State, r: usize) {
+    let (x, y) = (BOX_X + GAP, row_top(r) + GAP);
+    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H - 2 * GAP));
+    let w = dp(draw::DIMS.focus_ring);
+    draw::stroke_rrect(&mut sf(st), rr.inset(-w), dp(draw::DIMS.row_radius) + w, w, Ink::argb(theme::focus_ring()));
+}
+
+/// `tests a11ytree`'s ring leg. Every stop Tab reaches — on each tab the column (stop 0), then the pane's keyboard
+/// controls (`tab_ctrls`) or, on Users, each listed row — is painted OFFSCREEN holding the keyboard (`kbd`), and the
+/// same tab is painted at rest (focus on the column, no key pressed). The ring is read from the difference: in the
+/// first changed run of its top row, at the run's middle, the changed pixels downward that are the ring's colour (one
+/// anti-aliased pixel skipped at the top). Returns `(stops, rung, ring_px, first stop without a ring as (tab, stop))`,
+/// `ring_px` the thinnest ring seen, in device px. One reused pair of surfaces; a fresh `State` per paint, so no glide
+/// carries between paints.
+#[cfg(feature = "witness")]
+pub fn ring_probe() -> (usize, usize, usize, Option<(usize, usize)>) {
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() {
+        return (0, 0, 0, Some((usize::MAX, 0)));
+    }
+    a.resize(pw * ph, 0);
+    b.resize(pw * ph, 0);
+    let v0 = CUR.lock().clone();
+    let users = user_list().len().min(8);
+    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> Vec<u32> {
+        let mut st = State::new(WIN_W, WIN_H, buf, 1, true, 0);
+        if let Some(k) = stop {
+            st.kbd = true;
+            if k > 0 {
+                st.strip = false;
+                if tab == 1 { st.u.sel = k - 1; } else { st.sel = tab_ctrls(tab)[k - 1]; }
+            }
+        }
+        let mut v = v0.clone();
+        v.tab = tab as u8;
+        paint(&mut st, &v);
+        core::mem::take(&mut st.surf)
+    };
+    let ring = theme::focus_ring() & 0x00FF_FFFF;
+    let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
+    let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, None);
+    for tab in 0..TABS {
+        b = paint_one(b, tab, None);
+        let n = 1 + if tab == 1 { users } else { tab_ctrls(tab).len() };
+        for k in 0..n {
+            a = paint_one(a, tab, Some(k));
+            stops += 1;
+            let ch = |i: usize| (a[i] & 0x00FF_FFFF) != (b[i] & 0x00FF_FFFF);
+            let px = match (0..pw * ph).find(|&i| ch(i)) {
+                None => 0,
+                Some(i0) => {
+                    let (y0, x0) = (i0 / pw, i0 % pw);
+                    let mut x1 = x0;
+                    while x1 + 1 < pw && ch(y0 * pw + x1 + 1) { x1 += 1; }
+                    let xm = (x0 + x1) / 2;
+                    let mut y = y0;
+                    while y < ph && y < y0 + 2 && ch(y * pw + xm) && !near(a[y * pw + xm]) { y += 1; }
+                    let mut run = 0;
+                    while y < ph && ch(y * pw + xm) && near(a[y * pw + xm]) { run += 1; y += 1; }
+                    run
+                }
+            };
+            if px >= 2 { rung += 1; thin = thin.min(px); } else if fail.is_none() { fail = Some((tab, k)); }
+        }
+    }
+    (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail)
 }
