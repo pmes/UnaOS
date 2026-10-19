@@ -13,14 +13,14 @@
 | BP-shape-1 | The syscall ABI is declared once, in `una-abi`; both kernels and every `user-*` crate import it. No crate re-types a number. | `unaos/crates/una-abi/src/lib.rs:4-17`; `unaos/Cargo.toml` members comment | compile (a divergence is a type error) |
 | BP-shape-2 | A capability both rings need is ONE `no_std` core in `unaos/libs/`, linked by the kernel and the host/ring-3 owner (seam `shared-core`). | `Cargo.toml:9-60`; `unaos/crates/kernel/Cargo.toml:3897-3996` | `gates` arch row `sharedcore` leg (`unaos/scripts/arch-check.py:17`) |
 | BP-shape-3 | Kernel targets: x86_64 is `+soft-float` with MMX/SSE/AVX off; aarch64 is `+v8a,+strict-align,+neon`. | `unaos/x86_64-unaos.json:8`; `unaos/aarch64-unaos.json:7` | build |
-| BP-shape-4 | Names in any file both arches compile are subsystem names, never board names (R16). | `docs/dev/LAWS.md:185` | unheld by a gate at 1719fe54 (no GATE-NEUTRAL implementation found in `unaos/arroyo` or `unaos/scripts/`); review |
+| BP-shape-4 | Names in any file both arches compile are subsystem names, never board names (R16). | `docs/dev/LAWS.md:185` | `gates` row `neutral` (`tools/neutral-check.py`, exceptions `tools/neutral.allow`, SR166) |
 | BP-shape-5 | ONE OS: experience-layer code gates on its feature knob, never on `target_arch` without a stated hardware reason. | `docs/dev/LAWS.md:186-188` | unheld (review) |
 | BP-shape-6 | The desktop family is one cfg: x86 `wc` OR aarch64 `desktop_firmware`. A desktop file compiles under exactly that. | `unaos/crates/kernel/src/video/mod.rs:691`; `unaos/crates/kernel/src/splash.rs:708-716` | `./arroyo check` both arches |
 | BP-shape-7 | No board, bus, slot, serial or card geometry in kernel source; the root is found by content. | `docs/dev/LAWS.md:188-189` `docs/dev/LAWS.md:190-228` | unheld (review); see BP-storage-3 |
 | BP-shape-8 | Every new kernel file in `unaos/crates/kernel/src/video/`, `unaos/crates/kernel/src/fs/`, `unaos/crates/kernel/src/install/`, `unaos/crates/kernel/src/selfhost/` and the shell files starts with a `CHARTER:` line naming its owning handler and seam (`wm`/`driver`/`fs-core`/`shared-core`/`fulfiller`/`kernel-by-ruling R<n>`/`owed B<n>`). | `docs/dev/EXECUTOR-BRIEF.md:44-52`; `docs/dev/LAWS.md:35-38` | `gates` row `charter` (`unaos/scripts/charter-check.sh`) |
 | BP-shape-9 | Handler purpose comes from `docs/CODEX.md` §2, never from a README. | `docs/dev/LAWS.md:33-34` | review |
 | BP-shape-10 | Dependencies: built in UnaOS when possible, else latest stable; a crate doing a claimed capability is owed a core (R83). | `docs/dev/LAWS.md:288` | `gates` row `deps` (`tools/deps-audit/run.py`) |
-| BP-shape-11 | GPL-3.0-or-later; no vendor firmware in the tree; vendor sets are staged on media with digests pinned in-tree (R52, R127). | `docs/dev/LAWS.md:292-299`; `unaos/firmware/b43.pins` `unaos/firmware/kepler.pins` `unaos/firmware/fonts.pins` | unheld (the `git ls-files` census is "owed", LAWS.md:299) |
+| BP-shape-11 | GPL-3.0-or-later; no vendor firmware in the tree; vendor sets are staged on media with digests pinned in-tree (R52, R127). | `docs/dev/LAWS.md:292-299`; `unaos/firmware/b43.pins` `unaos/firmware/kepler.pins` `unaos/firmware/fonts.pins` | `gates` row `firmware` (`tools/firmware-census.py`, the `git ls-files` census, SR166) |
 | BP-shape-12 | The Jetson has no QEMU model: an aarch64 `tegra` green means compiles and links, never runs. | `docs/dev/LAWS.md:171-177` | `./arroyo check` (tegra leg) |
 | BP-shape-13 | The hardware census is ONE table read from the drivers' own registries (HWREPORT B725, BP-bar-25): the PCI function table the boot's PCI init records once (config reads, MF-gated), the xHCI slot table (a non-waiting loan), the EHCI endpoint table (`try_lock`), each class driver's own slot or id, the SATA and SD block registries, the SMC and the MADT count. It issues no transfer and no bus walk of its own; a held registry marks the census busy, never guessed. Driver = the claiming module's name or `none`; state = `up` / `held` / `absent` / `refused:<why>`. | `unaos/crates/kernel/src/hw.rs:88` (`census`); `unaos/crates/kernel/src/arch/x86_64/pci.rs:1218` (`functions`) `unaos/crates/kernel/src/arch/x86_64/pci.rs:1173` (the one recording call); `unaos/crates/kernel/src/drivers/xhci/mod.rs:18006` (`census_slots`); `unaos/crates/kernel/src/drivers/ehci/mod.rs:19989` (`census`) | `tests hwreport` (`:: HWREPORT: … rows_ok=1 -> PASS ::`: per-bus rows equal the registries' counts) |
 
@@ -42,7 +42,7 @@
 
 ## 5. Ruled, unbuilt
 - CODEX Amendment IV (Sonde as the 22nd handler) is drafted, not signed: `docs/CODEX.md:15` still says The 21 (R112).
-- The firmware census in ledger-check (BP-shape-11) is owed.
+- The firmware census (BP-shape-11) runs as the `firmware` gates row; its call from ledger-check is owed (SR166).
 
 ## 6. Read further
 - `docs/dev/LAWS.md` §3 — the cross-cutting rules this sheet cites.

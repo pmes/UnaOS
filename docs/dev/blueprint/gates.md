@@ -3,7 +3,7 @@
 ## 1. What it is
 - `unaos/arroyo` is the one build/test entry point (a bash script; verbs at its `case` near the file tail).
 - `./arroyo check` type-checks both arches (every kernel cfg leg) and runs GATE-LEDGER (`unaos/arroyo:8854`, `unaos/arroyo:9480-9517`).
-- `./arroyo gates` runs every host gate in `GATES_SET` (no cargo, ~30 s), one `gate=<name> rc=<n>` line each, then `GATES: <n> run <n> green -> PASS|FAIL`; exit = the worst rc (`unaos/arroyo:14383-14401`).
+- `./arroyo gates` runs every host gate in `GATES_SET` (no cargo, ~30 s), one `gate=<name> rc=<n>` line each, then `GATES: <n> run <n> green -> PASS|FAIL`; exit = the worst rc (`unaos/arroyo:14426-14443`).
 - Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU), `knoboff <feature>` (knob-off byte identity, `unaos/arroyo:13888`).
 - Records: ledgers (`docs/dev/LEDGER.md`, `docs/dev/OS/rmbp-ledger.md` and its pi/orin siblings), queues (`docs/dev/QUEUE.md`, `docs/dev/OS/rmbp-queue.md` …), status rows (`docs/dev/STATUS.tsv`), evidence (`docs/dev/evidence/`).
 
@@ -25,7 +25,7 @@
 | BP-gates-13 | No fn reachable from the `video/` furniture (menubar, dock, crystal, notify, strip, settings, login) calls `smolnet`, `net_fetch`, `net_dns` or `netring3`, save a local read-only accessor on the gate's ALLOW table with its reason (BP-bar-10). | `unaos/scripts/nonet-check.py:29-34` | `gates` row `nonet` (a call walk over `use` aliases and paths; control: a synthetic dock -> helper -> `smolnet` chain) |
 | BP-gates-14 | No fn anywhere under `video/` REACHES an outbound act — a socket opened, an active connect, the stack's outbound ledger (BP-net-11), a DNS query built, `http_core`/`tls_core` — through path calls into any module, net modules included (a read-only accessor is reached freely; the act is the sink, not the module name); a user verb's entry would sit on the gate's BOUNDARY table with its reason (none today) (BP-bar-10). | `unaos/scripts/nonet-reach.py:1-30` | `gates` row `nonetreach` (`NONET-REACH: roots= edges= reach=0 -> PASS`; control: a synthetic dock -> helper -> socket-open tree and a DNS alias, judged exactly; plant: a video fn -> a helper outside `video/` -> `smolnet::stack_open_tcp`) |
 
-## 3. The host gates (`GATES_SET`, `unaos/arroyo:14319`)
+## 3. The host gates (`GATES_SET`, `unaos/arroyo:14354`)
 | row | script | holds |
 |---|---|---|
 | charter | `unaos/scripts/charter-check.sh` | CHARTER lines, no dotfile prefs (BP-shape-8) |
@@ -45,14 +45,16 @@
 | blueprint (added by `dee2d6ed`) | `unaos/scripts/blueprint-check.py` | these sheets: anchors exist, ids unique and stem-named, sheets listed, ≤ 120 lines, no claim words |
 | nonet (B672) | `unaos/scripts/nonet-check.py` | BP-gates-13 |
 | nonetreach (B697) | `unaos/scripts/nonet-reach.py` (imports nonet-check.py's walker) | BP-gates-14 |
+| neutral (SR166) | `tools/neutral-check.py`; ruled exceptions `tools/neutral.allow` (row + reason, shrink-only) | BP-shape-4: no board word part in an identifier or string of `unaos/crates/kernel/src` minus `arch/` (no drivers/ dir is board-specific today) |
+| firmware (SR166) | `tools/firmware-census.py` | BP-shape-11: the `git ls-files` census of `unaos/firmware/` (pins digest rows + a resolving ledger row; no binary) |
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
 `check` · `state` · `gates [--list|--selftest]` · `test` / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·
 `esp-x86` / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) · `kernel8` / `kernel8-run` / `kernel8-test` / `kernel8-install` (Pi) · `foldleg` · `twoboot` · `knoboff` · `bootleg` · `battery` · `mbench` · `jobs-image` · `vm-image` · `fat-img` · `selfup-pak` · `clean`.
 
 ## 5. Ruled, unbuilt / open
-- GATE-NEUTRAL (board names in shared files, BP-shape-4): no implementation found.
-- The firmware `git ls-files` census in ledger-check (BP-shape-11): owed.
+- GATE-NEUTRAL (BP-shape-4): built as the `neutral` row (SR166); 110 findings at fb8ad2f4 sit on `tools/neutral.allow`, each reason naming its owed rename.
+- The firmware census (BP-shape-11): built as the `firmware` row (SR166); a call from `unaos/scripts/ledger-check.sh` (GATE-LEDGER) is owed.
 
 ## 6. Read further
 - `docs/dev/LAWS.md` §5, `docs/dev/PLAYBOOK.md` §1-§3, `docs/dev/EXECUTOR-BRIEF.md`.
