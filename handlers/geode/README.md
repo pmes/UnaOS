@@ -3,10 +3,14 @@
 Archival and packaging handler for UnaOS: compression, signed archives, and a
 lightweight container/runtime format for distributing software.
 
-> **Status: design-stage (not yet implemented).** This document describes the
-> intended design. There is no implementation in this crate yet — no
-> `Cargo.toml`, no source, and no `ignite(...)` entry point. Nothing here
-> reflects working code.
+> **Status: the archive format is built; the rest is design.** GEODEMETA
+> (LEDGER SR148): `src/lib.rs` is the `.geode` v1 format (its byte layout is
+> the crate doc) with `pack` / `unpack` over a UnaFS volume, so UnaFS →
+> `.geode` → UnaFS keeps every entry's attributes and its three times, and
+> `unpack_plain` extracts onto a volume that keeps no UnaFS records (FAT, a
+> host directory) after one warning naming what it drops. Compression,
+> deduplication, signing, capsules and the `ignite(...)` bus entry point below
+> are not built.
 
 ## Responsibility
 

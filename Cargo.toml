@@ -83,6 +83,7 @@ members = [
     "handlers/aether",
     "handlers/principia",
     "handlers/facet",
+    "handlers/geode",
     # "handlers/vug",
     "tools/vertex",
     "tools/play-check",
