@@ -305,11 +305,26 @@ Reclaim queue (inode 4's data): `Vec<ReclaimEntry>`, `ReclaimEntry` = `generatio
 | 40 | 8 | `refmap_block` — top node of the refcount map |
 | 48 | 8 | `refmap_leaves` |
 | 56 | 8 | `free_blocks` |
-| 64 | 8 | `flags`: bit 0 `GROW` (superblock rewrite may lag a grow), bit 1 `MIGRATE` (maps paged though block 0 may still say v6); other bits 0 |
+| 64 | 8 | `flags`: bit 0 `GROW` (superblock rewrite may lag a grow), bit 1 `MIGRATE` (maps paged though block 0 may still say v6); bits 2..31 0; bits 32..63 the ROCOMPAT word: bit 32 `VERSIONS` (§R17), bits 33..63 0 |
 | 72 | 8 | FNV-1a 64 of bytes 0..72 |
 
 Mount takes the valid slot (magic, checksum, generation ≠ 0) with the higher generation; a commit
 writes the other slot as ONE sector — the format's only in-place write.
+
+**The ROCOMPAT word** (VERSIONSCOMPAT, SR154; `root::ROOT_ROCOMPAT_MASK`). A feature whose records a reader
+can ignore while READING but not while WRITING or REPAIRING is not worth an INCOMPAT stamp (BP-storage-6:
+an older reader would refuse the whole volume) and not safe as a bare additive record (an older repair
+would undo it). It takes a bit here instead. The rule, from SR154 on: a reader that finds a ROCOMPAT bit it
+does not know (`flags & ROOT_ROCOMPAT_MASK & !ROOT_ROCOMPAT_KNOWN ≠ 0`) MOUNTS the volume READ-ONLY
+(`UnaFS::read_only`): reads, listings and the dry-run fsck work; every public mutation is refused before it
+stages, every commit before the root flips (what was staged is discarded), and `fsck --repair` before it
+walks — all as `FileSystemError::ReadOnly(<the unknown bits>)`; mount drains no reclaim queue. A reader
+that KNOWS every set bit mounts read-write and carries the word on every commit. Bits are set by the first
+write that needs them and never cleared. Every NEW ROCOMPAT feature follows this path: its bit, its
+`ROOT_ROCOMPAT_KNOWN` entry, and the record that needs it. Honest edge: every reader built before SR154
+ignores bits 32..63 (it tests bits 0 and 1 only) — the word protects a volume from readers built after
+SR154 that predate a LATER bit, not from the builds before it. `tools/unafs fsck` prints
+`rocompat=<versions|none|unknown:0x…> read_only=<0|1>`.
 
 ## §R13 Maps (hand-packed raw arrays)
 
@@ -416,9 +431,24 @@ versioned file's inode drops the trailer (the versions' blocks keep their refere
 versions whose trailer it cannot see — after that, a version read on this build would return reused blocks.
 Run fsck with the build that wrote the versions.
 
+**The flag** (VERSIONSCOMPAT, SR154): the first version kept (`version_keep`: a replacing write, a shrinking
+truncate, a restore) sets the root record's ROCOMPAT bit `VERSIONS` (§R12, flags bit 32), carried by that
+transaction's commit and never cleared; this build's `fsck --repair` sets it on a volume whose rings hold
+versions under a root without it (one B714 wrote before SR154). This build's repair rebuilds every refcount
+WITH the rings (`reachability_counts` bumps each version's extents once, the same reference `version_hold`
+took) and clears nothing: the ring, the ledger and the bit survive it. A reader that does not know the bit
+mounts read-only and refuses `fsck --repair` (§R12's rule) — the repair above that would free every block
+only a ring names. The builds that predate the bit (B714's and everything before it, the tree's own older
+`tools/unafs` included) do not read the word: for them the warning above still stands; the rule binds every
+reader from SR154 on, and any later ROCOMPAT bit gets the same protection from this one.
+
 Proofs: `unaos/libs/fs/unafs/tests/versions.rs` (ten writes keep eight with their bytes; the bound drops the
 oldest anywhere; remount; restore round-trips; unlink releases all; a reproduction of the pre-B714 inode
-decode opens every inode block of a versioned volume — inline and extent-backed-after-spill — stamped 7);
+decode opens every inode block of a versioned volume — inline and extent-backed-after-spill — stamped 7;
+SR154: the first version sets `VERSIONS` and `fsck --repair` reclaims nothing and every version reads back
+after the free space is refilled; a pre-flag versioned root gets the bit on repair; a root with an unknown
+ROCOMPAT bit mounts read-only, reads, and refuses writes, the commit and the repair with the device
+byte-identical);
 kernel `tests fileversions` (`:: FILEVERSIONS: writes=10 kept=8 restore=ok bound=ok v7reader=ok -> PASS ::`).
 
 ## §R17 The metadata reserve and the failed-write unwind (DISKRESERVE, SR152)
