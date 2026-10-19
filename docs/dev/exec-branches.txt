@@ -587,8 +587,9 @@ refs/heads/exec-rmbp-keymaps      96ed4711 IN-FLIGHT cloud wave36 KEYMAPS
 refs/heads/exec-rmbp-a11yfilters  96ed4711 IN-FLIGHT cloud wave36 A11YFILTERS
 refs/heads/exec-rmbp-uac1         96ed4711 IN-FLIGHT cloud wave36 UAC1
 refs/heads/exec-rmbp-rawview      96ed4711 IN-FLIGHT cloud wave36 RAWVIEW
-refs/heads/exec-rmbp-fvar         96ed4711 IN-FLIGHT cloud wave36 FVAR
+refs/heads/exec-rmbp-fvar         5ef17eba DONE-awaiting-fold cloud wave36 FVAR (SR150)
 refs/heads/exec-rmbp-netgrant     96ed4711 IN-FLIGHT cloud wave36 NETGRANT
 refs/heads/exec-rmbp-smartline    96ed4711 IN-FLIGHT cloud wave36 SMARTLINE
 refs/heads/exec-rmbp-kelfhash     96ed4711 IN-FLIGHT cloud wave36 KELFHASH
 refs/heads/exec-rmbp-perfhud      96ed4711 IN-FLIGHT cloud wave36 PERFHUD
+refs/heads/exec-rmbp-autolock     363d83a9 IN-FLIGHT cloud wave36 AUTOLOCK (B712)
