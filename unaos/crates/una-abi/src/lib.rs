@@ -3077,3 +3077,87 @@ mod raiseverb_tests {
         assert_eq!(window_raise_reply(0, &[9]), Err(EIO));
     }
 }
+
+// =================================================================================================
+// MICRING3 (rmbp-ledger B736; BP-audio-9, BP-bar-10/12) — THE MICROPHONE FROM RING 3. Three bus verbs reach the
+// kernel's ONE capture seam (`audio::source`'s grant, Principia's `system.decisions.microphone.<app>`) under the
+// program's own name (the launcher's, never the caller's word). One source per program; it closes on CLOSE, on
+// Settings > Privacy's Revoke of that program's microphone decision, and when the program ends.
+//
+// AUDIO_SOURCE_OPEN  REQUEST body empty. REPLY (status 0): [`AUDIO_SOURCE_OPEN_REPLY_LEN`] bytes — `channels u8, bits
+//   u8 (16), reserved u16 0, rate u32 LE, handle u32 LE` ([`audio_source_open_parse`]). Refusals: -EAGAIN = no kept
+//   grant (the ask `<app> wants the microphone` is on the glass, or was answered Not now: poll again); -EBUSY = this
+//   program holds its source already; -ENODEV = no microphone; -EPERM = the caller has no program name (a kernel
+//   fixture blob) or claims the kernel recorder's.
+// AUDIO_SOURCE_READ  REQUEST body `handle u32 LE`. REPLY (status 0): 0..=[`AUDIO_SOURCE_READ_MAX`] bytes of PCM
+//   16-bit LE, whole frames, interleaved, from the capture ring — zero-timeout: an empty body = nothing captured since
+//   the last read (the pipe opens on the next service pass). -EBADF = not this program's open handle; -EPERM = the
+//   user revoked the grant and the source is closed (CLOSE the handle, or OPEN again: that asks).
+// AUDIO_SOURCE_CLOSE REQUEST body `handle u32 LE`. REPLY status 0 (a revoked handle closes quietly); -EBADF.
+// ADDITIVE (new verb numbers): `ABI_VERSION` stays 1; a kernel with no arm answers -EINVAL. Numbered 40..42, a
+// 13-number gap after RAISEVERB's 26, so AUDIOMIX's playback verbs take 27.. without a collision. Appended at the tail
+// so no existing line moves.
+// =================================================================================================
+
+/// Bus verb: open the program's microphone source (see the block above).
+pub const BUS_VERB_AUDIO_SOURCE_OPEN: u8 = 40;
+/// Bus verb: read captured PCM from the program's source.
+pub const BUS_VERB_AUDIO_SOURCE_READ: u8 = 41;
+/// Bus verb: close the program's source.
+pub const BUS_VERB_AUDIO_SOURCE_CLOSE: u8 = 42;
+const _: () = assert!(
+    BUS_VERB_AUDIO_SOURCE_OPEN > BUS_VERB_WINDOW_RAISE
+        && BUS_VERB_AUDIO_SOURCE_READ == BUS_VERB_AUDIO_SOURCE_OPEN + 1
+        && BUS_VERB_AUDIO_SOURCE_CLOSE == BUS_VERB_AUDIO_SOURCE_READ + 1
+        && BUS_VERB_AUDIO_SOURCE_CLOSE < BUS_VERB_REGISTER
+);
+/// OPEN's reply body: channels, bits, reserved, rate, handle.
+pub const AUDIO_SOURCE_OPEN_REPLY_LEN: usize = 12;
+/// READ's and CLOSE's request body: `handle u32` LE.
+pub const AUDIO_SOURCE_HANDLE_LEN: usize = 4;
+/// The most PCM bytes one READ answers (one bus body).
+pub const AUDIO_SOURCE_READ_MAX: usize = BUS_BODY_MAX;
+
+/// OPEN's reply body for a `channels` x 16-bit stream at `rate` Hz under `handle`.
+pub const fn audio_source_open_reply(channels: u8, rate: u32, handle: u32) -> [u8; AUDIO_SOURCE_OPEN_REPLY_LEN] {
+    let r = rate.to_le_bytes();
+    let h = handle.to_le_bytes();
+    [channels, 16, 0, 0, r[0], r[1], r[2], r[3], h[0], h[1], h[2], h[3]]
+}
+
+/// `(channels, bits, rate, handle)` from OPEN's reply body; `None` when the length is not
+/// [`AUDIO_SOURCE_OPEN_REPLY_LEN`] or the handle is 0.
+pub const fn audio_source_open_parse(body: &[u8]) -> Option<(u8, u8, u32, u32)> {
+    if body.len() != AUDIO_SOURCE_OPEN_REPLY_LEN {
+        return None;
+    }
+    let h = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+    if h == 0 {
+        return None;
+    }
+    Some((body[0], body[1], u32::from_le_bytes([body[4], body[5], body[6], body[7]]), h))
+}
+
+/// The handle from a READ or CLOSE request body; `None` when the length is not [`AUDIO_SOURCE_HANDLE_LEN`] or it is 0.
+pub const fn audio_source_handle_parse(body: &[u8]) -> Option<u32> {
+    if body.len() != AUDIO_SOURCE_HANDLE_LEN {
+        return None;
+    }
+    let h = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    if h == 0 { None } else { Some(h) }
+}
+
+#[cfg(test)]
+mod micring3_tests {
+    use super::*;
+    #[test]
+    fn source_wire_round_trip() {
+        let r = audio_source_open_reply(1, 48_000, 7);
+        assert_eq!(audio_source_open_parse(&r), Some((1, 16, 48_000, 7)));
+        assert_eq!(audio_source_open_parse(&r[..11]), None);
+        assert_eq!(audio_source_open_parse(&audio_source_open_reply(2, 44_100, 0)), None);
+        assert_eq!(audio_source_handle_parse(&7u32.to_le_bytes()), Some(7));
+        assert_eq!(audio_source_handle_parse(&0u32.to_le_bytes()), None);
+        assert_eq!(audio_source_handle_parse(&[7, 0, 0]), None);
+    }
+}

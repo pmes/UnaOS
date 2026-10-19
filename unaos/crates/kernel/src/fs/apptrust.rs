@@ -938,3 +938,14 @@ fn net_app_of_asid(asid: u64) -> Option<String> {
 // recorder fixture names `audio::KERNEL_RECORDER` and is not asked. Settings > Privacy lists it with every decision.
 /// The decisions' `<domain>` segment for the microphone (`system.decisions.microphone.*`).
 pub const MIC_DOMAIN: &str = "microphone";
+
+/// MICRING3 (rmbp-ledger B736, BP-security-15) — THE REVOKE HOOK for the microphone: Settings > Privacy's Revoke of
+/// `key` (`system.decisions.<domain>.<stem>-<hash>`), called BEFORE the store write as the camera's `uvc::revoked` is.
+/// A microphone decision closes that program's open ring-3 source now (`audio::source_revoked`); any other domain's
+/// key is not the microphone's and passes untouched.
+#[cfg(feature = "uac")]
+pub fn mic_revoked(key: &str) {
+    if key.rsplit('.').nth(1) == Some(MIC_DOMAIN) {
+        crate::audio::source_revoked(key);
+    }
+}

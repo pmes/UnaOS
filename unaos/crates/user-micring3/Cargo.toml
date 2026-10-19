@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# MICRING3 (rmbp-ledger B736, BP-audio-12): MICRING3.ELF — the smallest ring-3 program that opens the microphone over
+# the bus verbs (una-abi's MICRING3 block), reads 100 ms of PCM and closes; `tests micring3` runs it three ways (read,
+# hold-until-revoked, exit-without-close). The ABIPROBE shape: no alloc, its own stubs, linked at the ELF window
+# (user-micring3-x86.ld). x86_64 only.
+#
+# The empty [workspace] table makes this crate its OWN workspace root (the user-prefs idiom).
+[workspace]
+
+[package]
+name = "user-micring3"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-micring3"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+[dependencies]
+una-abi = { path = "../una-abi" }
