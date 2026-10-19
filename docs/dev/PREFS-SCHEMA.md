@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 60.
+Rows: 61.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -24,7 +24,7 @@ Rows: 60.
 | `system.accessibility.contrast` | enum `no-preference \| more \| less` | `"no-preference"` | operator | — | aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-contrast`) | More or less contrast than the default: the `prefers-contrast` media feature pages read (`custom` when forced colors are on and this is unset), and a 3px focus ring at `more` (AETHERA11Y, SR119). |
 | `system.accessibility.cursor_size` | float `1.0..=4.0` | `1.0` | settings, program | yes | kernel cursor (`video/cursor.rs` `block_scale` through `settings::cursor_blocks`), Settings > Accessibility | The pointer's size as a multiple of its 1:1 size: the sprite's block scale is multiplied by it (halves on the slider), capped at the sprite's box (`ui::SCALE_MAX`, x4 at 1:1, x2 at 2:1) (A11YPANE, B655). |
 | `system.accessibility.forced_colors` | bool | `false` | operator | — | aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`forced-colors`) | A user palette replaces page colours: the `forced-colors: active` media feature, and a 3px focus ring (AETHERA11Y, SR119). |
-| `system.accessibility.increase_contrast` | bool | `false` | settings, program | yes | kernel theme (`video/theme.rs`, owed: `text.secondary` -> `text.primary`, `line.*` -> `line.control`), Settings > Accessibility (`settings::increase_contrast`) | High contrast on the glass (DESIGN-LANGUAGE §2.3): the secondary ink reads as the primary and every hairline as the control line (A11YPANE, B655). The web's own switch is `accessibility.contrast`. |
+| `system.accessibility.increase_contrast` | bool | `false` | settings, program | yes | kernel theme (`video/theme.rs` `tok`: `palette_core::contrast`'s token set in place of the standard pairs), Settings > Accessibility (`settings::increase_contrast`) | High contrast on the glass (DESIGN-LANGUAGE §2.3): the secondary ink reads as the primary and every hairline as the control line (A11YPANE, B655). The web's own switch is `accessibility.contrast`. |
 | `system.accessibility.reduce_motion` | bool | `false` | settings, program | yes | kernel glass (`video/motion.rs` `reduced()` through `settings::reduce_motion`: every glide a one-frame cut), Settings > Accessibility; aether `a11y::prefs` (`A11yPrefs::from_prefs`), css_core `media` (`prefers-reduced-motion`) | Minimise non-essential motion: the glass's slides (the Settings pill, toggle knobs, segmented thumbs) become one-frame cuts (DESIGN-LANGUAGE §2.6, A11YPANE B655), and the `prefers-reduced-motion: reduce` media feature pages read (AETHERA11Y, SR119). |
 | `system.accessibility.text_size` | enum `default \| large \| larger \| largest` | `"default"` | settings, program | yes | Settings > Accessibility (`settings::a11y_load`), applied by writing `system.display.font_size` (13 / 16 / 20 / 26 CSS px), which `video::text` sizes its faces from (CSS px x the panel's ppi / 96) | Larger UI text in four steps: `default` (13 px, the body size), `large` (x1.25), `larger` (x1.5), `largest` (x2, the HIG's 200 %). A step is applied on change by writing `display.font_size`; the store carries both (A11YPANE, B655). |
 | `system.appearance.accent` | enum `crispy \| teal \| moss \| amber \| clay \| rose \| violet \| slate` | `"crispy"` | settings, program | yes | kernel theme (`video/theme.rs`), Settings > Appearance | The accent colour on the default button, the selection, the focused control's ring, the slider knob and the menu highlight (APPEARANCE B408; eight names, ours). |
@@ -48,9 +48,10 @@ Rows: 60.
 | `system.notify.dnd_from` | int `0..=23` | `0` | settings | — | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it starts (0..23); equal to `notify.dnd_until` = no schedule (NOTIFYPANE B435). |
 | `system.notify.dnd_until` | int `0..=23` | `0` | settings | — | kernel NOTIFYPANE (`video/notifypane.rs`) | Do Not Disturb's schedule: the local hour it ends (0..23, wrapping midnight); equal to `notify.dnd_from` = no schedule (NOTIFYPANE B435). |
 | `system.pointer.speed` | int `0..=2` | `1` | settings, program | yes | kernel settings (pointer) | 0 slow, 1 normal, 2 fast. Legacy (R75): read only while `system.trackpad.speed` is unset (TRACKPADPANE). |
-| `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | operator | — | kernel POWERMENU | Battery percent at which the machine shuts down; 0 = off. |
+| `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | settings | — | kernel POWERMENU, Settings > Display (Low battery shutdown, `settings::lowbat_step`) | Battery percent at which the machine shuts down; 0 = off. |
+| `system.privacy.remember` | bool | `true` | settings | — | kernel `prefs::decide` (REASK), Settings > Privacy | Keep the answer the user gives to an ask (`system.decisions.*`, see Decisions below) so it is not asked again; off = a new answer is not kept and the ask asks every time (REASK B681, R130 law 2). |
 | `system.quarry.favorites` | string ≤512 printable | consumer: none — the sidebar's six built-in favorites only | quarry | — | kernel Quarry sidebar (`video/quarry/sidebar.rs`) | Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18). |
-| `system.settings.tab` | int `0..=8` | `0` | settings, program | yes | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications). |
+| `system.settings.tab` | int `0..=10` | `0` | settings, program | yes | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy). |
 | `system.trackpad.natural_scroll` | bool | `true` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad. |
 | `system.trackpad.secondary_click` | enum `two-finger \| off` | `"two-finger"` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad. |
 | `system.trackpad.speed` | int `1..=10` | `5` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad. |
@@ -78,6 +79,15 @@ Rows: 60.
 | `vein.provider` | enum `claude \| gemini \| claudecode \| echo \| relay` | `"claude"` | operator | — | gneiss_pal ProviderConfig; user-vein (metal: echo | relay) | The chat provider (R81: Claude is the default; Gemini is a preference, never hardwired; claudecode = the installed Claude Code CLI on a subscription, host only, SR38). |
 | `vein.system_prompt` | string ≤2048 printable | consumer: unset: Lumen's built-in system prompt | operator | — | LUMEN.ELF (LUMEN2, SR121); a conversation's own `lumen:set system` block overrides it | The default system prompt for a new conversation. At most 2048 bytes (Lumen's SYS_CAP). |
 | `vein.temperature` | float `0.0..=2.0` | consumer: the provider's own | operator | — | gneiss_pal ProviderConfig | Sampling temperature. |
+
+## Decisions (REASK B681, R130 law 2)
+
+`system.decisions.<domain>.<stem>-<fnv64>` (domains `apptrust`, `opener`, `firmware`, `sysfiles`, `notice`) is a
+string `"<answer> <at> <bind> <who>"`: the user's answer to an ask, the civil second it was given (0 = the clock was
+unset), what it is bound to (`-` = nothing; a program's volume and stamp), and the subject. Written by the kernel's ask
+seams (`prefs::decide`: apptrust's Open, a refusal alert, FWPIN's toast) while `system.privacy.remember` is on,
+consulted before the ask is raised again, never expired, dropped only by Settings > Privacy's Revoke. Filed in
+`settings/general`. Undeclared rows: the keys are made per subject, not by this table.
 
 ## Rules (derived defaults)
 

@@ -40,7 +40,7 @@ pub fn resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
         if crate::drivers::e1000::hw_addr().is_none() {
             return Err(ENODEV); // no e1000 and no USB dongle: a dark NIC, not an error of the name
         }
-        let s = core::str::from_utf8(name).map_err(|_| EINVAL)?;
+        let s = core::str::from_utf8(name).map_err(|_| EINVAL)?; let _idl = crate::net_tick::scope(crate::net_tick::Who::Ring3); // IDLENET (B672): ring 3's lookup is Ring3's on the ledger (LINE-NEUTRAL append)
         return match crate::smolnet::resolve(s) {
             Some(ip) => {
                 let mut out = [0u8; RESOLVE_OUT_LEN];
@@ -53,7 +53,7 @@ pub fn resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
     #[allow(unreachable_code)]
     {
         let _ = ENOENT;
-        #[cfg(all(feature = "net6", target_arch = "aarch64"))] return net6_resolve(name); Err(ENODEV) // ARMRESOLVE (rmbp-ledger B560): on aarch64 the NET6 lane's resolver answers (body at the FILE TAIL; the statement is folded onto this line, code before the `//`, so no line of this file moves and the x86 image's panic::Location rows stay put). Without `net6` there is no NIC surface on this arch: -ENODEV, a dark NIC.
+        #[cfg(all(feature = "sntp6", feature = "net6", target_arch = "aarch64"))] let _idl = crate::net_tick::scope(crate::net_tick::Who::Ring3); #[cfg(all(feature = "net6", target_arch = "aarch64"))] return net6_resolve(name); Err(ENODEV) // ARMRESOLVE (rmbp-ledger B560): on aarch64 the NET6 lane's resolver answers (body at the FILE TAIL; the statement is folded onto this line, code before the `//`, so no line of this file moves and the x86 image's panic::Location rows stay put). Without `net6` there is no NIC surface on this arch: -ENODEV, a dark NIC.
     }
 }
 

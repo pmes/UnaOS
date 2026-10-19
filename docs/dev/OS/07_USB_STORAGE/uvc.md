@@ -481,3 +481,79 @@ that failed (`selftest=FAIL` / `stream_selftest=FAIL`, the first failing field o
 `frames_2s=0 … -> FAIL reason=no-frames` with the counters that say where the bytes stopped.
 `tests sonde`'s `frames_2s>0` (the row's last item) is REALSENSE's fixture and reads this stream
 only once the seat folds the two branches.
+
+## 12. UVCCAM (rmbp-ledger B686, R130) — the picture: frames to a window
+
+R130's second law (no paternalism): Peter's Sony mirrorless shows live view on no Apple machine. The class
+driver (§1–§10, CAMERA1 B143) and the stream (§11, XHCIISO B534) end at `uvc::latest_frame`, the assembler's
+front buffer, and before this arc **nothing read it** — no frame of any camera reached the glass. UVCCAM is
+that consumer. Code: `drivers/xhci/uvc.rs` (new, `CHARTER: Stria — driver`, declared `#[cfg(feature = "uvc")]`
+on `xhci/mod.rs`'s module line); `xhci/mod.rs` gains four same-line folds and no lines (the module, `note_dev`
+on the root "no driver for class" arm and on the hub walk, `pump` beside `service_uvc` on the ladder);
+`tests.rs` one same-line fold (`tests uvccam`). No new knob: everything is under `uvc`.
+
+```
+probe_iso (drivers/uvc.rs)        ── census(slot, &Census) ─→ "[uvc] dev=<vid:pid> formats=<n> mjpeg=<w>x<h>@<fps> yuy2=… frames=<n>"
+  stream_arm(w, h, fourcc)        ── arm(slot, w, h, cc)       (atomics; GENERATION += 1)
+  stream_disarm (unwind, unplug)  ── disarm()
+service_ftdi ladder → service_uvc → uvc::pump()  — starts ONE `uvc-view` task per armed stream (x86 `wc`)
+uvc-view, every 8 ms while armed:
+  latest_frame → memcpy OUT under the stream lock (never an allocation there: the claim path waits on it)
+  SOI FF D8 or fourcc MJPG → pixel_core::decode_jpeg (Annex K.3 tables before any DHT: Motion-JPEG decodes)
+  YUY2 / NV12            → BT.601 limited range (UVC 1.5 §3.9.2.6 defaults), nearest-sampled into the surface
+  first good frame → window "Camera" (aspect kept, never upscaled, ≤ 2/3 of the work area) → wm::present
+  every 5 s: "[uvc] stream fps=<n> frames=<n> dropped=<n> bad=<n> src=<w>x<h> fourcc=<cc> shown=<w>x<h> render_us_max=<n> window=<open|closed-by-user|none-yet>"
+  disarm / re-arm → the row closes, then the surface is freed; "[uvc] view end reason=… frames= dropped= bad= camera_frames="
+```
+
+`fps` is the CAMERA's assembled frames per second (the front buffer's sequence advance); `frames` the frames
+presented; `dropped` the frames completed that a newer one replaced before the window showed them. A close by
+the title-bar disc (`wm::close` clears the id through the holder registry) frees the surface on the next pass
+and keeps counting; the window reopens with the next stream.
+
+### 12.1 The fixture: `tests uvccam`
+
+Over bytes written in the file from the tables, so it runs on QEMU with no camera:
+the census of a 285-byte two-format camera (MJPEG 1920x1080 + 1280x720, YUY2 640x480 + 1280x720, one
+isochronous alternate 1024 x 3) through CAMERA1's own `parse`, ~25 fields and the census line byte for byte;
+a 26-byte PROBE/COMMIT block (Table 4-47) through `parse_probe`, resolved against the census (frame bytes =
+w x h x bpp / 8 = `dwMaxVideoFrameSize`, payload ≤ the alternate's ESIT, a 25-byte runt refused); YUY2 and NV12
+known colours (black, white, BT.601 red) and a 4→2 downscale; the tree's 8x8 JPEG with its four DHT segments
+removed (a Motion-JPEG frame) decoded and sampled; the window box. Then, with a stream armed, 2 s of the
+viewer's counters. Wire:
+
+```
+[uvc] dev=feed:0c0a formats=2 mjpeg=1920x1080@30 yuy2=640x480@30 frames=4
+:: UVCCAM: parse=ok formats=2 probe=ok(static) convert=ok(yuy2,nv12,mjpeg) stream=skip(no-device) -> PASS ::     (QEMU)
+:: UVCCAM: parse=ok formats=2 probe=ok(static) convert=ok(yuy2,nv12,mjpeg) stream=live fps=<n> frames=<n> dropped=<n> -> PASS ::   (bench)
+```
+
+A failed check prints `failures=<n> first=<field> got=<v> want=<v> -> FAIL`.
+
+### 12.2 The four changes in `drivers/uvc.rs` (added to the arc by the seat)
+
+1. `stream_arm`, after `STREAM_ARMED.store(true, …)`: `crate::drivers::xhci::uvc::arm(addr, w, h, cc);`
+2. `stream_disarm`, after `STREAM_ARMED.store(false, …)`: `crate::drivers::xhci::uvc::disarm();`
+3. `probe_iso`, after `print_census(idx, addr, &call);`: `crate::drivers::xhci::uvc::census(addr, &call);`
+   (`addr` is the xHCI slot on this path — `service_uvc` passes it — which is what `note_dev` keyed.)
+4. `probe_iso`'s format pick committed only an UNCOMPRESSED format, so a camera offering MJPEG alone (or an
+   uncompressed default frame past the 4 MiB store, e.g. 4K NV12, which streamed count-only) showed nothing.
+   Now an uncompressed default frame past `STREAM_STORE_MAX` is skipped, and when no uncompressed format is
+   left the first `Kind::Mjpeg` format's default frame is committed with `cc4 = *b"MJPG"`; with neither the
+   line reads `[uvc] probe skipped … reason=no-streamable-format(uncompressed-in-store|mjpeg)`.
+   The assembler needs no change (an MJPEG frame shorter than `dwMaxVideoFrameSize` is counted `short` and
+   still published).
+
+### 12.3 The bench (rMBP, the camera on a USB-A port)
+
+1. The camera's USB connection mode set to its UVC mode (Sony calls it "USB Streaming"), cable to a USB-A port (xHCI; the internal FaceTime HD is EHCI and is not this path).
+2. Boot the image line with `uvc` in it (kfeats carries it) and `UNAOS_WC=1`; at the desktop plug the camera in
+   (or boot with it attached).
+3. Read the wire top to bottom: `[uvc-iso] candidate slot=<n>` → `[uvc] dev=<vid:pid> formats=…` →
+   `[uvc] commit=armed pipe=iso …` → `[uvc] view armed …` → `[uvc] view open win=<n> src=<w>x<h> …` → every
+   5 s `[uvc] stream fps=<n> frames=<n> dropped=<n> …`. The picture is the window titled "Camera".
+4. `tests uvccam` on the console: `stream=live fps=<n> frames=<n> dropped=<n> -> PASS`; `tests uvc` for the
+   transport's own counters (missed / overrun / bad_hdr).
+5. The first line that does not appear is the wall: §11.3's tree up to `commit=armed`; after it,
+   `view armed` missing after `commit=armed` = the §12.2 fold in `stream_arm`; `view open` missing with `stream fps>0` = `[uvc] view decode refused`
+   or `unsupported fourcc` (the line names the FourCC); `fps=0` = §11.3 R6.

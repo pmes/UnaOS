@@ -29,6 +29,13 @@
 //! copy=rootacl -> PASS ::` (APPTRUST2 B478: the grant binds volume, path and stamp — `[apptrust] grant volume= path=
 //! stamp=`; a direct launch asks — `[apptrust] launch prog= -> ask`; Copy to Apps writes `via=rootacl`).
 //! Design: `docs/dev/evidence/rmbp-1005/apptrust.md`, `apptrust2.md`.
+//!
+//! **REASK (B681, R130 law 2)** — `Open` is the user's word, not a session's: [`answer`] records it in Principia's store
+//! (`prefs::decide`, `system.decisions.apptrust.<key>`, BOUND to the program's volume fingerprint and stamp — another
+//! program at the path asks again), and [`request`] consults it (`prefs::decided`) before any ask: `[apptrust] open
+//! prog= file= granted=decision`. It survives reboots and the calendar; only Settings > Privacy's Revoke drops it, and
+//! with no decision a RAM grant for the path is dropped too (the store is the authority). `tests reask` →
+//! `:: REASK: domains=<n> first_ask=1 reasks=0 after_revoke=1 -> PASS ::`.
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -139,6 +146,11 @@ pub fn bind_of(mt: &MountTable, prog: &str) -> Bind {
     let vol = mt.volume_id(prog).ok().flatten();
     let stamp = mt.stat(prog).map(|s| alloc::format!("{}:{}", s.mtime.unwrap_or(0), s.size)).unwrap_or_else(|_| String::from("-"));
     Bind { vol, stamp }
+}
+
+/// REASK (B681): the decision's bind — what the user's `Open` was given to (`vol=<fingerprint>;stamp=<mtime:size>`).
+fn bind_word(b: &Bind) -> String {
+    alloc::format!("vol={};stamp={}", vol_word(b.vol), b.stamp)
 }
 
 fn vol_word(v: Option<u64>) -> String {
@@ -253,12 +265,21 @@ static PENDING: crate::sync::Mutex<Option<(Ask, bool)>> = crate::sync::Mutex::ne
 pub fn request(a: Ask) -> bool {
     use crate::video::dialog::{self, Act, Dlg, Icon};
     let bind = bind_of(&crate::shell::vfs_mount_table(), &a.prog); // APPTRUST2 (B478): what is trusted is bound at the ask
-    if granted_bound(&a.prog, &bind) {
-        serial_println!("[apptrust] open prog={} file={} granted=session", a.prog, a.file);
+    // REASK (B681, R130 law 2): the user's `Open`, kept in Principia's store, answers before any ask.
+    if crate::prefs::decided(crate::prefs::decide::APPTRUST, &a.prog, &bind_word(&bind)).as_deref() == Some("open") {
+        if !granted_bound(&a.prog, &bind) {
+            grant(&a.prog, &a.volume, &bind);
+        }
+        serial_println!("[apptrust] open prog={} file={} granted=decision", a.prog, a.file);
         return true;
     }
+    if granted_bound(&a.prog, &bind) {
+        // No decision for it (revoked, or never persisted): the store is the authority, the RAM grant goes with it.
+        GRANTS.lock().retain(|g| g.path != a.prog);
+        serial_println!("[apptrust] grant dropped prog={} reason=no-decision -> ask", a.prog);
+    }
     let msg = if a.file == a.prog { alloc::format!("Open {} from {}?", leaf(&a.prog), a.volume) } else { alloc::format!("Open {} with {} from {}?", leaf(&a.file), leaf(&a.prog), a.volume) };
-    let info = alloc::format!("{} is on {}, not on the system volume.\nOpen trusts this copy of it until you log out.\nCopy to Apps installs it (administrator).", leaf(&a.prog), a.volume);
+    let info = alloc::format!("{} is on {}, not on the system volume.\nOpen trusts this copy; Settings > Privacy revokes it.\nCopy to Apps installs it (administrator).", leaf(&a.prog), a.volume); // REASK (B681): asked once
     let mut d = Dlg::new(Icon::Caution, b"Open With", msg.as_bytes(), info.as_bytes(), &[b"Copy to Apps", b"Open", b"Cancel"]);
     d.user = true;
     d.act = Act::Hook(answer as fn(bool) as usize);
@@ -292,6 +313,7 @@ fn answer(ok: bool) {
     match word {
         "open" => {
             grant(&a.prog, &a.volume, &bind);
+            crate::prefs::decide(crate::prefs::decide::APPTRUST, &a.prog, &bind_word(&bind), "open"); // REASK (B681): the user's word, kept (queue-only here)
             *PENDING.lock() = Some((a, true));
         }
         "copy" => *PENDING.lock() = Some((a, false)),
@@ -351,6 +373,7 @@ pub fn selftest() {
     let mt = crate::shell::vfs_mount_table();
     let fpath = "/volumes/apptrust-probe/PROBE.ELF";
     let rpath = "/apps/APTPROBE.ELF";
+    forget_probe_decisions(); // REASK (B681): an `Open` from an earlier run is a decision in the store — the probe starts unasked
     let (vol, root) = trust_of(&mt, fpath);
     let (_, apps_root) = trust_of(&mt, rpath);
     let classify = !root && apps_root && vol == "apptrust-probe";
@@ -409,11 +432,22 @@ pub fn selftest() {
     let launch = launch_probe(&mt);
     let (copy, copy_admin) = if attrs { copy_probe(&mt) } else { ("skip", String::from("-(no-attr-root)")) }; // UIREDS26 (B559): `copied`'s precondition — a root that takes no attributes is the read-only boot FAT (R99), nothing to copy into
     GRANTS.lock().retain(|g| !g.path.starts_with("/volumes/apptrust-probe/"));
+    forget_probe_decisions();
 
     let ok = foreign_ok && refused && asked != "FAIL" && copied != "refused" && rebind != "FAIL" && icon == "root" && launch != "FAIL" && copy != "REFUSED";
     serial_println!(":: APPTRUST: foreign={} registrant={} asked={} copied={} rebind={} icon={} launch={} copy={} -> {} :: classify={} volume={} planted={} asks={} grants={} copy_admin={}",
         if foreign_ok { "listed" } else { "MISSING" }, if refused { "refused" } else { "ACCEPTED" }, asked, copied, rebind, icon, launch, copy,
         if ok { "PASS" } else { "FAIL" }, classify, vol, planted, ASKS.load(Ordering::Relaxed), GRANTS.lock().len(), copy_admin);
+}
+
+/// REASK (B681): the probe programs' decisions leave the store (the fixture's `Open` is not the user's).
+fn forget_probe_decisions() {
+    for p in ["PROBE.ELF", "PROBE2.ELF", "PROBE3.ELF", "PROBE4.ELF"] {
+        let k = crate::prefs::decision_key(crate::prefs::decide::APPTRUST, &alloc::format!("/volumes/apptrust-probe/{}", p));
+        if crate::prefs::decisions().iter().any(|d| d.key == k) {
+            let _ = crate::prefs::revoke(&k);
+        }
+    }
 }
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -511,6 +545,103 @@ fn copy_probe(mt: &MountTable) -> (&'static str, String) {
     let _ = mt.unlink(G, KERNEL_PRINCIPAL);
     let _ = mt.unlink(F, KERNEL_PRINCIPAL);
     (if made { "rootacl" } else { "REFUSED" }, alloc::format!("{} anon={}", p, if anon { "refused" } else { "ADMITTED" }))
+}
+
+// ── REASK (rmbp-ledger B681, R130 law 2) — `tests reask` ─────────────────────────────────────────────────────────
+
+/// `tests reask` (R80: run only when asked; headless, model-only dialogs):
+/// `:: REASK: domains=<n> first_ask=1 reasks=0 after_revoke=1 -> PASS ::`.
+/// * `first_ask` — a foreign probe program picked once: ONE ask, answered `Open` (the decision is recorded); the three
+///   refusal seams (`dialog::reask_refusals`: opener, system files, FWPIN's toast) each reach the glass once.
+/// * `reasks` — the decisions persisted, then THREE reboots (the store's RAM cleared and its files read back,
+///   `prefs::reload_from_store`; apptrust's session grants and the refusal router's repeat memory cleared) and the
+///   civil clock 90 days on (a `clock::FixtureClock`, never the live clock): every pick opens with no ask, and no
+///   refusal is shown again. Asks + refusals shown again = 0.
+/// * `after_revoke` — the probe's decision revoked (Settings > Privacy's call): the next pick asks once (Cancel: nothing
+///   recorded).
+/// * `domains` — the seams that held: apptrust plus each refusal domain shown once and never again (4 = all).
+/// Everything the fixture recorded is revoked at the end.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn reask_selftest() {
+    use crate::clock::AnchorSink;
+    use crate::video::dialog::{self, Answer};
+    if dialog::is_up() {
+        serial_println!(":: REASK: -> SKIP reason=dialog-up ::");
+        return;
+    }
+    const PROG: &str = "/volumes/reask-probe/REASK.ELF";
+    let key = crate::prefs::decision_key(crate::prefs::decide::APPTRUST, PROG);
+    let ask = || Ask { prog: String::from(PROG), file: String::from("/tmp/reask.txt"), mime: String::from(PROBE_MIME), volume: String::from("reask-probe") };
+    let forget = || {
+        if crate::prefs::decisions().iter().any(|d| d.key == key) {
+            let _ = crate::prefs::revoke(&key);
+        }
+        dialog::reask_forget();
+        GRANTS.lock().retain(|g| g.path != PROG);
+    };
+    forget();
+    let was = dialog::headless(true);
+    // The fixture's civil clock (CONSOLEFIX M1): anchored at the live second, or the arc's date when the clock is unset.
+    let base = crate::clock::try_unix_now().unwrap_or_else(|| crate::clock::unix_from_civil(2026, 10, 19, 12, 0, 0));
+    let mono = crate::clock::mono_ticks().unwrap_or(0);
+    let mut fc = crate::clock::FixtureClock::new();
+    fc.plant(base, mono, crate::clock::ClockSource::Manual);
+    crate::prefs::decision_clock(fc.unix_now());
+
+    // 1. The first ask, answered Open; each refusal seam shown once.
+    let a0 = ASKS.load(Ordering::Relaxed);
+    let r1 = request(ask());
+    dialog::open_now();
+    dialog::answer(Answer::Button(1)); // Open
+    let _ = take_pending();
+    let first_ask = ASKS.load(Ordering::Relaxed) - a0;
+    let shown = dialog::reask_refusals();
+    let flushed = crate::prefs::decisions_flush();
+
+    // 2. Three reboots, then 90 days on the civil clock: no ask, no refusal shown again.
+    let a1 = ASKS.load(Ordering::Relaxed);
+    let (mut opened, mut reshown) = (0u32, 0u32);
+    for step in 0..4u32 {
+        if step < 3 {
+            GRANTS.lock().retain(|g| g.path != PROG);
+            let keys = crate::prefs::reload_from_store();
+            serial_println!("[reask] reboot={} keys={} (RAM cleared, the store read back)", step + 1, keys);
+        } else {
+            fc.plant(base + 90 * 86_400, mono, crate::clock::ClockSource::Manual);
+            crate::prefs::decision_clock(fc.unix_now());
+            serial_println!("[reask] civil clock +90 d (fixture) now={}", fc.unix_now().unwrap_or(0));
+        }
+        if request(ask()) {
+            opened += 1;
+        } else {
+            dialog::open_now();
+            dialog::answer(Answer::Default); // Cancel
+            let _ = take_pending();
+        }
+        reshown |= dialog::reask_refusals();
+    }
+    let reasks = (ASKS.load(Ordering::Relaxed) - a1) + reshown.count_ones();
+
+    // 3. Revoke: the next pick asks.
+    let revoked = crate::prefs::revoke(&key);
+    let a2 = ASKS.load(Ordering::Relaxed);
+    let r3 = request(ask());
+    dialog::open_now();
+    dialog::answer(Answer::Default); // Cancel: nothing recorded
+    let _ = take_pending();
+    let after_revoke = ASKS.load(Ordering::Relaxed) - a2;
+    let cancel_kept = crate::prefs::decisions().iter().any(|d| d.key == key);
+
+    forget();
+    crate::prefs::decision_clock(None);
+    fc.clear();
+    dialog::headless(was);
+    let legs = dialog::REASK_LEGS.len() as u32;
+    let refusal_held = (shown & !reshown).count_ones();
+    let domains = (first_ask == 1 && opened == 4) as u32 + refusal_held;
+    let ok = !r1 && first_ask == 1 && reasks == 0 && revoked && !r3 && after_revoke == 1 && !cancel_kept && domains == 1 + legs;
+    serial_println!(":: REASK: domains={} first_ask={} reasks={} after_revoke={} -> {} :: opened={}/4 shown={:#x} reshown={:#x} flushed={} revoked={} cancel_recorded={} store={}",
+        domains, first_ask, reasks, after_revoke, if ok { "PASS" } else { "FAIL" }, opened, shown, reshown, flushed, revoked as u8, cancel_kept as u8, crate::prefs::path());
 }
 
 /// `tests apptrust` registration, once (rides `appres::ensure_tests`).
