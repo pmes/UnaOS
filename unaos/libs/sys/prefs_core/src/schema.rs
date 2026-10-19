@@ -171,7 +171,7 @@ pub static SCHEMA: &[Key] = &[
     },
     Key {
         ns: "system", key: "accessibility.increase_contrast", kind: Kind::Bool, default: Default::Bool(false),
-        writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs`, owed: `text.secondary` -> `text.primary`, `line.*` -> `line.control`), Settings > Accessibility (`settings::increase_contrast`)",
+        writers: &[Writer::Settings, Writer::Program], reader: "kernel theme (`video/theme.rs` `tok`: `palette_core::contrast`'s token set in place of the standard pairs), Settings > Accessibility (`settings::increase_contrast`)",
         doc: "High contrast on the glass (DESIGN-LANGUAGE §2.3): the secondary ink reads as the primary and every hairline as the control line (A11YPANE, B655). The web's own switch is `accessibility.contrast`.",
     },
     Key {
@@ -300,8 +300,13 @@ pub static SCHEMA: &[Key] = &[
     Key {
         ns: "system", key: "power.lowbat_shutdown_pct", kind: Kind::Int { min: 0, max: 100 },
         default: Default::Consumer("the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset"),
-        writers: OP, reader: "kernel POWERMENU",
+        writers: &[Writer::Settings], reader: "kernel POWERMENU, Settings > Display (Low battery shutdown, `settings::lowbat_step`)",
         doc: "Battery percent at which the machine shuts down; 0 = off.",
+    },
+    Key {
+        ns: "system", key: "privacy.remember", kind: Kind::Bool, default: Default::Bool(true),
+        writers: &[Writer::Settings], reader: "kernel `prefs::decide` (REASK), Settings > Privacy",
+        doc: "Keep the answer the user gives to an ask (`system.decisions.*`, see Decisions below) so it is not asked again; off = a new answer is not kept and the ask asks every time (REASK B681, R130 law 2).",
     },
     Key {
         ns: "system", key: "quarry.favorites", kind: Kind::Str { max_len: 512, printable: true },
@@ -310,9 +315,9 @@ pub static SCHEMA: &[Key] = &[
         doc: "Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18).",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 8 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 10 }, default: Default::Int(0),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {
@@ -707,6 +712,13 @@ pub fn render_markdown() -> String {
         let r3 = if k.writers.contains(&Writer::Program) { "yes" } else { "—" };
         let _ = write!(o, " | {} | {} | {} |\n", r3, k.reader, k.doc);
     }
+    o.push_str("\n## Decisions (REASK B681, R130 law 2)\n\n");
+    o.push_str("`system.decisions.<domain>.<stem>-<fnv64>` (domains `apptrust`, `opener`, `firmware`, `sysfiles`, `notice`) is a\n");
+    o.push_str("string `\"<answer> <at> <bind> <who>\"`: the user's answer to an ask, the civil second it was given (0 = the clock was\n");
+    o.push_str("unset), what it is bound to (`-` = nothing; a program's volume and stamp), and the subject. Written by the kernel's ask\n");
+    o.push_str("seams (`prefs::decide`: apptrust's Open, a refusal alert, FWPIN's toast) while `system.privacy.remember` is on,\n");
+    o.push_str("consulted before the ask is raised again, never expired, dropped only by Settings > Privacy's Revoke. Filed in\n");
+    o.push_str("`settings/general`. Undeclared rows: the keys are made per subject, not by this table.\n");
     o.push_str("\n## Rules (derived defaults)\n\n");
     for r in Rule::ALL {
         let _ = write!(o, "- `{}` — {}\n", r.name(), r.describe());
