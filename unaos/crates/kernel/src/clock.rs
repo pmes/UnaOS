@@ -228,10 +228,11 @@ pub fn set(t: WallTime) -> Result<(), ()> {
     // anchors advance in lock-step. This does NOT touch the FAT anchor above, so `date`/`fat_stamp`
     // witnesses are byte-identical to JD17.
     set_anchor(base_secs.saturating_add(UNIX_1980), ticks, ClockSource::Manual);
-    // RTCCLOCK (R75): write the CMOS back (shown time minus the display offset) so the clock survives a reboot.
+    // RTCCLOCK (R75): write the CMOS back so the clock survives a reboot. CLOCKPAINTERS (B719): the seed is UTC
+    // (`date -s` converts the typed local time through `locale::utc_of_local`), so the CMOS holds it as is.
     #[cfg(target_arch = "x86_64")]
     {
-        let utc = (base_secs.saturating_add(UNIX_1980) as i64 - TZ_MIN * 60).max(0) as u64;
+        let utc = base_secs.saturating_add(UNIX_1980);
         let (y, mo, d, h, mi, s) = civil_from_unix(utc);
         let ok = crate::arch::rtc::write(y as u32, mo, d, h, mi, s);
         serial_println!("[rtc] written y={} mo={} d={} h={} mi={} s={} ok={}", y, mo, d, h, mi, s, ok as u8);
@@ -454,20 +455,9 @@ pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     (year, month, d, hh, mm, ss)
 }
 
-/// RTCCLOCK: the display offset in minutes east of UTC (`UNAOS_TZ_MIN`, build knob, default 0). The CMOS RTC is
-/// read as UTC; this is added to the anchor so the bar shows local time. `date -s` writes `shown - TZ_MIN` back.
-pub const TZ_MIN: i64 = parse_i64(option_env!("UNAOS_TZ_MIN"));
-const fn parse_i64(v: Option<&str>) -> i64 {
-    let b = match v { Some(s) => s.as_bytes(), None => return 0 };
-    let (mut i, mut neg, mut n) = (0usize, false, 0i64);
-    if !b.is_empty() && (b[0] == b'-' || b[0] == b'+') { neg = b[0] == b'-'; i = 1; }
-    while i < b.len() {
-        if b[i] < b'0' || b[i] > b'9' { return 0; }
-        n = n * 10 + (b[i] - b'0') as i64;
-        i += 1;
-    }
-    if neg { -n } else { n }
-}
+// CLOCKPAINTERS (B719): RTCCLOCK's display-offset build knob is retired. The anchor is UTC from every source (RTC,
+// SNTP, `date -s`); the zone is Principia's `system.locale.tz`, applied only when a second is printed (`clock::locale`,
+// BP-boot-18).
 
 /// Inverse of [`civil_from_unix`] (Hinnant days-from-civil): UTC Unix seconds from a civil date/time.
 pub fn unix_from_civil(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> u64 {
@@ -482,14 +472,13 @@ pub fn unix_from_civil(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> u64 
     if secs < 0 { 0 } else { secs as u64 }
 }
 
-/// RTCCLOCK: anchor the civil clock from the CMOS RTC (`rtc_unix` = the RTC read as UTC), adding [`TZ_MIN`].
+/// RTCCLOCK: anchor the civil clock from the CMOS RTC (`rtc_unix` = the RTC read as UTC; the anchor is UTC).
 /// Lowest priority: declines (returns false) when an SNTP or operator anchor already stands.
 pub fn anchor_from_rtc(rtc_unix: u64) -> bool {
     if matches!(try_source(), ClockSource::Sntp { .. } | ClockSource::Manual) {
         return false;
     }
-    let shown = (rtc_unix as i64 + TZ_MIN * 60).max(0) as u64;
-    set_anchor(shown, mono_ticks().unwrap_or(0), ClockSource::Rtc);
+    set_anchor(rtc_unix, mono_ticks().unwrap_or(0), ClockSource::Rtc);
     true
 }
 
@@ -549,7 +538,7 @@ fn fat_pack(t: &WallTime) -> (u16, u16) {
 /// represent a moment outside that band. Witnessable rule: a pre-1980 anchor pins to the epoch FLOOR, a
 /// post-2107 anchor to the last representable 2-second tick (`23:59:58`). FAT stores wall-clock time with
 /// no timezone; we stamp UTC (`civil_from_unix` is UTC), documented in clock.md.
-fn wall_from_unix_clamped(unix: u64) -> WallTime {
+pub(crate) fn wall_from_unix_clamped(unix: u64) -> WallTime {
     if unix < UNIX_1980 {
         return WallTime { year: 1980, month: 1, day: 1, hour: 0, min: 0, sec: 0 };
     }

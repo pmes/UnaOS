@@ -374,9 +374,12 @@ fn paint_calendar(st: &mut St) {
         p::text(s, pad0, pad + ch + k::px(8), w - 2 * pad0, b"No date to show until a time source answers.", k::TEXT_2(), false, ui);
         return;
     };
-    let (y, mo, d, _, _, _) = crate::clock::civil_from_unix(secs);
-    let days = secs / 86_400;
-    let dow = ((days + 3) % 7) as usize; // Monday-first; 1970-01-01 was a Thursday
+    // CLOCKPAINTERS (B719): the local civil fields and the week's first day are `clock::locale`'s (Principia's
+    // `system.locale.tz` and `.first_day`); `DAYS` / `DAY_HEAD` stay Monday-indexed, so Sunday = 0 maps to 6.
+    let loc = crate::clock::locale::current();
+    let c = crate::clock::locale::civil(crate::clock::locale::Painter::Calendar, secs);
+    let (y, mo, d) = (c.y, c.mo, c.d);
+    let dow = (c.wd as usize + 6) % 7;
     let mut line = [0u8; 48];
     let mut n = 0;
     let mut push = |t: &[u8], line: &mut [u8; 48]| {
@@ -406,12 +409,13 @@ fn paint_calendar(st: &mut St) {
     yy += ch + k::px(12);
     let cell = k::px(k::CAL_CELL);
     let gx = (w - 7 * cell) / 2;
-    for (i, hd) in DAY_HEAD.iter().enumerate() {
+    for i in 0..7 {
+        let hd = DAY_HEAD[(loc.col_wd(i) as usize + 6) % 7];
         let tw = p::text_w(hd.as_bytes(), false, ui);
         p::text(s, gx + i * cell + (cell - tw) / 2, yy, cell, hd.as_bytes(), k::TEXT_2(), false, ui);
     }
     yy += ch + k::px(4);
-    let first = (dow + 35 - ((d as usize - 1) % 7)) % 7;
+    let first = loc.week_col(((c.wd as usize + 35 - (d as usize - 1) % 7) % 7) as u8);
     let nd = month_days(y, mo);
     for day in 1..=nd {
         let i = first + day as usize - 1;

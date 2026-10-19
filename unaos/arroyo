@@ -141,8 +141,9 @@ KERNEL_FP_RUSTFLAGS="-C panic=abort -C force-frame-pointers=yes"
 # configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
 # a build made with them is NOT the flashable default image.
 #
-# RTCCLOCK (R75): UNAOS_TZ_MIN=<minutes east of UTC> is read with `option_env!` by clock.rs (TZ_MIN, default 0); the
-# CMOS RTC is read as UTC and the menubar clock shows it plus this offset. Not a cargo feature.
+# RTCCLOCK (R75) / CLOCKPAINTERS (B719): the display-offset build knob is RETIRED. The CMOS RTC is read and anchored
+# as UTC; the zone is Principia's `system.locale.tz` (Settings > Date & Time), applied when a second is printed
+# (clock/locale.rs). No build knob sets a time zone.
 #
 # PI-V3D-81: UNAOS_V3D81_SETTLE_MS is the same kind of knob — read with `option_env!` by
 # arch/aarch64/v3d.rs, not a cargo feature. It sets how long a reply-less NOTIFY post settles before

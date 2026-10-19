@@ -186,11 +186,6 @@ pub fn lines_for(i: u8, t: Option<Tray>, now: Option<u64>) -> Vec<String> {
 const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-/// Sunday = 0 for a Unix day number (1970-01-01 was a Thursday).
-fn dow(days: u64) -> usize {
-    ((days + 4) % 7) as usize
-}
-
 fn month_len(y: i64, mo: u32) -> u32 {
     match mo {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -199,20 +194,39 @@ fn month_len(y: i64, mo: u32) -> u32 {
     }
 }
 
-/// The clock's menu: the weekday, the long date, the time in UTC, then the month glance (a header row and
-/// one GRID row per week, Sunday first; today's cell is marked).
+/// Two-letter weekday heads, Sunday = 0.
+const HEADS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+
+/// The clock's menu in the live locale: the weekday, the long date, the time with the zone and its offset, then the
+/// month glance (a header row and one GRID row per week, starting on `system.locale.first_day`; today's cell is
+/// marked). CLOCKPAINTERS (B719): every field is `clock::locale`'s.
 pub fn clock_lines(secs: u64, v: &mut Vec<String>) {
-    let (y, mo, d, h, mi, _) = crate::clock::civil_from_unix(secs);
-    let days = secs / 86_400;
-    let mo = mo.clamp(1, 12);
-    v.push(String::from(WEEKDAYS[dow(days)]));
-    v.push(format!("{} {} {}", d, MONTHS[(mo - 1) as usize], y));
-    v.push(format!("{:02}:{:02} UTC (no time zone set)", h, mi));
+    let l = crate::clock::locale::current();
+    let c = crate::clock::locale::civil(crate::clock::locale::Painter::ClockMenu, secs);
+    clock_lines_in(&l, secs, c, v);
+}
+
+/// [`clock_lines`] on locale `l` with `c` = its civil fields of `secs` (pure: the fixtures pass their own locale).
+pub fn clock_lines_in(l: &crate::clock::locale::Locale, secs: u64, c: crate::clock::locale::Civil, v: &mut Vec<String>) {
+    use crate::clock::locale;
+    let (y, mo, d) = (c.y, c.mo, c.d);
+    v.push(String::from(WEEKDAYS[c.wd as usize % 7]));
+    v.push(if l.order() == 2 { format!("{} {}, {}", MONTHS[(mo - 1) as usize], d, y) } else { format!("{} {} {}", d, MONTHS[(mo - 1) as usize], y) });
+    let mut t = [0u8; 8];
+    let tn = locale::fmt_time_in(l, secs, &mut t);
+    let o = locale::off_text(c.off);
+    v.push(format!("{} {} {}{}", core::str::from_utf8(&t[t.len() - tn..]).unwrap_or(""), l.zone().name, core::str::from_utf8(&o).unwrap_or(""), if c.dst { " daylight" } else { "" }));
     let mut hdr = String::new();
     hdr.push(GRID_MARK as char);
-    hdr.push_str("Su|Mo|Tu|We|Th|Fr|Sa");
+    for col in 0..7 {
+        if col > 0 {
+            hdr.push('|');
+        }
+        hdr.push_str(HEADS[l.col_wd(col) as usize]);
+    }
     v.push(hdr);
-    let first_col = dow(days - (d as u64 - 1));
+    // The 1st's weekday: today's, stepped back d-1 days.
+    let first_col = l.week_col(((c.wd as u32 + 35 - (d - 1) % 7) % 7) as u8);
     let len = month_len(y, mo);
     let mut day = 1u32;
     let mut col = 0usize;
@@ -399,11 +413,12 @@ pub fn fixture() {
     let n0 = super::keymap::active().name; let input_ok = panel_press(2, 0, 100) && super::keymap::pc_selected() && super::keymap::active().name != n0 && panel_press(2, 0, 100) && !super::keymap::pc_selected() && super::keymap::active().name == n0; // SOFTY3 (B651): the table's name is the KEYMAP's (R126: `una-pc` under Una, `pc` under Softy), read back, never typed here; LINE-NEUTRAL fold, code first
     // the clock on 2026-10-06 09:41 UTC: a Tuesday; the 1st is a Thursday (column 4); today marked.
     let mut cl = Vec::new();
-    clock_lines(1_791_279_660, &mut cl);
+    let sun = crate::clock::locale::Locale::parse(None, None, Some("sun")); // CLOCKPAINTERS (B719): UTC, Sunday first, a fixture-local locale
+    clock_lines_in(&sun, 1_791_279_660, crate::clock::locale::civil_in(&sun, 1_791_279_660), &mut cl);
     let clock_ok = cl.len() >= 9
         && cl[0] == "Tuesday"
         && cl[1] == "6 October 2026"
-        && cl[2] == "09:41 UTC (no time zone set)"
+        && cl[2] == "09:41 UTC +00:00"
         && cl[4].as_bytes()[1..] == *b"||||1|2|3"
         && cl[5].as_bytes()[1..] == *b"4|5|*6|7|8|9|10";
     let unset_ok = lines_for(ITEM_CLOCK, t, None)[0] == "Clock not set";

@@ -164,17 +164,17 @@ pub fn write(y: u32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> bool {
 }
 
 /// Boot step: read the RTC, print the `:: RTC:` witness, and (when plausible) anchor the civil clock from it
-/// with source `Rtc`. `UNAOS_TZ_MIN` (minutes, signed, default 0) is added for display: the RTC is read as UTC.
+/// with source `Rtc`. The RTC is read as UTC and anchored as UTC; the zone is Principia's (`clock::locale`, B719).
 pub fn boot_anchor() {
     match read_full() {
         None => serial_println!(":: RTC: y=0 mo=0 d=0 h=0 mi=0 s=0 bcd=0 h24=0 century=assumed reads=inconsistent -> FAIL ::"),
         Some(r) => {
             let ok = plausible(&r);
             crate::census_println!(
-                ":: RTC: y={} mo={} d={} h={} mi={} s={} bcd={} h24={} century={} tz_min={} -> {} ::",
+                ":: RTC: y={} mo={} d={} h={} mi={} s={} bcd={} h24={} century={} rtc_zone=UTC -> {} ::",
                 r.y, r.mo, r.d, r.h, r.mi, r.s, r.bcd as u8, r.h24 as u8,
                 if r.century_reg.is_some() { "fadt" } else { "assumed" },
-                crate::clock::TZ_MIN, if ok { "PASS" } else { "FAIL" });
+                if ok { "PASS" } else { "FAIL" });
             if ok {
                 let unix = crate::clock::unix_from_civil(r.y as i64, r.mo, r.d, r.h, r.mi, r.s);
                 crate::clock::anchor_from_rtc(unix);

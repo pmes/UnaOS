@@ -28,6 +28,8 @@ fn domains_of(tab: usize) -> Option<&'static str> {
         4 => Some("login"),
         #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         t if t == super::settings::NP_TAB => Some("notify"), // NOTIFYPANE (B435)
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        t if t == super::settings::DT_TAB => Some("general"), // CLOCKPAINTERS (B719): `system.locale.*` lives in the general domain file
         _ => None,
     }
 }

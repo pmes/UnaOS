@@ -21,6 +21,12 @@ struct Panel {
     note: Option<&'static str>,
 }
 
+/// CLOCKPAINTERS (B719): a date the panel paints, in Principia's locale (`clock::locale::fmt_stamp`); the serial
+/// `[getinfo]` lines keep the UTC `af::fmt_when` form.
+fn stamp(secs: u64) -> String {
+    crate::clock::locale::fmt_stamp(crate::clock::locale::Painter::Info, secs)
+}
+
 static PANEL: crate::sync::Mutex<Option<Panel>> = crate::sync::Mutex::new(None);
 static UP: AtomicBool = AtomicBool::new(false);
 
@@ -44,7 +50,7 @@ pub fn open(path: &str) {
         }
     };
     let kind = if matches!(st.kind, NodeKind::Dir) { "folder" } else { "file" };
-    let when = st.mtime.map(af::fmt_when).unwrap_or_else(|| String::from("-"));
+    let when = st.mtime.map(stamp).unwrap_or_else(|| String::from("-")); // CLOCKPAINTERS (B719): the panel's dates are the locale's
     let head = alloc::format!("{}  {} bytes  modified {}", kind, st.size, when);
     let (mut rows, note) = match af::info_rows(&mt, path) {
         Ok(r) => (r, None),
@@ -96,7 +102,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     for (i, r) in p.rows.iter().enumerate() {
         let mut v = r.val.clone();
         v.truncate(29);
-        let s = alloc::format!("{:<24} {:<7} {:<29} {}", r.key, r.ty, v, r.when.map(af::fmt_when).unwrap_or_else(|| String::from("-")));
+        let s = alloc::format!("{:<24} {:<7} {:<29} {}", r.key, r.ty, v, r.when.map(stamp).unwrap_or_else(|| String::from("-")));
         line(3 + i, &s, theme::text_primary());
     }
 }
