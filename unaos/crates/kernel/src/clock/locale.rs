@@ -18,7 +18,7 @@
 //!   so no fixture writes the live locale or the store.
 //! * [`wire`] extends the `[clock]` boot line: ` at=<local ISO-8601|unset> tz=<name> off_min=<n> dst=<0|1>`.
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 use alloc::string::String;
 
@@ -64,6 +64,18 @@ impl Locale {
     pub fn h24(&self) -> bool {
         self.region % 2 == 0
     }
+    /// The week's first day as a weekday number (Sunday = 0): `mon` 1, `sun` 0, `sat` 6.
+    pub fn first_wd(&self) -> u8 {
+        [1u8, 0, 6][(self.first_day as usize).min(FIRST_DAYS.len() - 1)]
+    }
+    /// The calendar column (0..7) of weekday `wd` (Sunday = 0) in a week that starts on [`Self::first_wd`].
+    pub fn week_col(&self, wd: u8) -> usize {
+        ((wd % 7) as usize + 7 - self.first_wd() as usize) % 7
+    }
+    /// The weekday (Sunday = 0) a calendar column `col` shows.
+    pub fn col_wd(&self, col: usize) -> u8 {
+        ((self.first_wd() as usize + col) % 7) as u8
+    }
     /// The local civil second (UTC + the zone's offset now), the offset in minutes and the daylight bit.
     pub fn local(&self, unix: u64) -> (u64, i32, bool) {
         let (off, dst) = tz::offset(self.zone(), unix);
@@ -82,6 +94,8 @@ pub fn current() -> Locale {
 }
 
 /// The painters that print a civil second through this file. The bit of each lands in [`painted`] when it draws.
+/// CLOCKPAINTERS (B719) repointed the seven that still split the UTC second themselves (`Bar` … `Quarry` are
+/// TZLOCALE's three; `BarDate` … `Login` are B719's).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Painter {
     /// The Una menu bar's clock (`video/menubar.rs` `clock_hhmm`).
@@ -90,19 +104,34 @@ pub enum Painter {
     Taskbar = 1,
     /// Quarry's Modified column (`video/quarry/live.rs` `mtime_field`).
     Quarry = 2,
+    /// The Una menu bar's date on a wide bar (`video/menubar.rs` `clockbar_date`).
+    BarDate = 3,
+    /// The clock item's menu: weekday, long date, time with the zone and offset, the month glance
+    /// (`video/statusmenu.rs` `clock_lines`).
+    ClockMenu = 4,
+    /// The Softy calendar flyout (`video/softy/startmenu.rs` `paint_calendar`).
+    Calendar = 5,
+    /// The shell's `date` verb (`shell.rs`), and the local seed `date -s` takes.
+    DateVerb = 6,
+    /// Quarry's Get Info panel: the modified time and each attribute's change time (`video/quarry/getinfo.rs`).
+    Info = 7,
+    /// The notification centre's item times, an hour and older (`video/notify.rs` `age`).
+    Notify = 8,
+    /// The login screen's civil line under the card (`video/login.rs`).
+    Login = 9,
 }
 /// How many painters [`Painter`] names.
-pub const PAINTERS: usize = 3;
-static PAINTED: AtomicU8 = AtomicU8::new(0);
+pub const PAINTERS: usize = 10;
+static PAINTED: AtomicU16 = AtomicU16::new(0);
 
-/// The painters that have drawn through [`fmt_time`] / [`fmt_date`] this boot (bit = `Painter as u8`).
-pub fn painted() -> u8 {
+/// The painters that have drawn through this file this boot (bit = `Painter as u8`).
+pub fn painted() -> u16 {
     PAINTED.load(Ordering::Relaxed)
 }
 
 #[inline]
 fn mark(p: Painter) {
-    PAINTED.fetch_or(1 << p as u8, Ordering::Relaxed);
+    PAINTED.fetch_or(1u16 << p as u8, Ordering::Relaxed);
 }
 
 /// Two decimal digits.
@@ -192,6 +221,74 @@ pub fn fmt_stamp_in(l: &Locale, unix: u64) -> String {
     s.push(' ');
     s.push_str(core::str::from_utf8(&t[t.len() - tn..]).unwrap_or(""));
     s
+}
+
+/// CLOCKPAINTERS (B719): the local civil fields of one second, for a painter that lays out a calendar or a long date
+/// (weekday Sunday = 0, the offset in minutes, the daylight bit). The split is this file's, never the painter's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Civil {
+    pub y: i64,
+    pub mo: u32,
+    pub d: u32,
+    pub h: u32,
+    pub mi: u32,
+    pub s: u32,
+    pub wd: u8,
+    pub off: i32,
+    pub dst: bool,
+}
+
+/// [`Civil`] of `unix` in the live locale.
+pub fn civil(p: Painter, unix: u64) -> Civil {
+    mark(p);
+    civil_in(&current(), unix)
+}
+
+/// [`civil`] on locale `l` (pure).
+pub fn civil_in(l: &Locale, unix: u64) -> Civil {
+    let (ls, off, dst) = l.local(unix);
+    let (y, mo, d, h, mi, s) = super::civil_from_unix(ls);
+    Civil { y, mo: mo.clamp(1, 12), d, h, mi, s, wd: ((ls / 86_400 + 4) % 7) as u8, off, dst } // 1970-01-01 was a Thursday
+}
+
+/// The long form the shell's `date` prints, in the live locale: the date, the clock with seconds, the zone and its
+/// offset (`2026-10-19 14:05:09 Europe/Berlin UTC+02:00`, `10/19/2026 2:05:09 PM America/New_York UTC-04:00`).
+pub fn fmt_long(p: Painter, unix: u64) -> String {
+    mark(p);
+    fmt_long_in(&current(), unix)
+}
+
+/// [`fmt_long`] on locale `l` (pure).
+pub fn fmt_long_in(l: &Locale, unix: u64) -> String {
+    let c = civil_in(l, unix);
+    let mut d = [0u8; 10];
+    let dn = fmt_date_in(l, unix, &mut d);
+    let o = off_text(c.off);
+    let clock = if l.h24() {
+        alloc::format!("{:02}:{:02}:{:02}", c.h, c.mi, c.s)
+    } else {
+        alloc::format!("{}:{:02}:{:02} {}", match c.h % 12 { 0 => 12, x => x }, c.mi, c.s, if c.h < 12 { "AM" } else { "PM" })
+    };
+    alloc::format!("{} {} {} UTC{}", core::str::from_utf8(&d[..dn]).unwrap_or(""), clock, l.zone().name, core::str::from_utf8(&o).unwrap_or("+00:00"))
+}
+
+/// The UTC second a LOCAL civil second `local` (read as if it were UTC) names in the live locale: what `date -s`
+/// seeds, so the anchor stays UTC (BP-boot-18).
+pub fn utc_of_local(p: Painter, local: u64) -> u64 {
+    mark(p);
+    utc_of_local_in(&current(), local)
+}
+
+/// [`utc_of_local`] on locale `l` (pure): the offset is read at the standard-time guess, then once more at the
+/// result, so a second inside daylight time lands on daylight time. A skipped second (the spring gap) and a repeated
+/// one (the autumn hour) both read as standard time.
+pub fn utc_of_local_in(l: &Locale, local: u64) -> u64 {
+    let z = l.zone();
+    let guess = (local as i64 - z.std_min as i64 * 60).max(0) as u64;
+    let (o1, _) = tz::offset(z, guess);
+    let u1 = (local as i64 - o1 as i64 * 60).max(0) as u64;
+    let (o2, _) = tz::offset(z, u1);
+    (local as i64 - o2 as i64 * 60).max(0) as u64
 }
 
 /// `+HH:MM` / `-HH:MM` for an offset in minutes.

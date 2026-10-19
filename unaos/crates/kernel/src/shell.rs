@@ -5156,11 +5156,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // a flag on the verb that shows the clock and the second word is gone. Everything after
             // `-s` is the old seed argument list, parsed by the same `parse_wallclock`.
             if args.first().copied() == Some("-s") {
-                match parse_wallclock(&args[1..]) {
-                    Some(t) if crate::clock::set(t).is_ok() => {
-                        console.println(&alloc::format!(
-                            "clock set: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                            t.year, t.month, t.day, t.hour, t.min, t.sec));
+                // CLOCKPAINTERS (B719): the typed moment is LOCAL time in Principia's zone; the anchor is UTC.
+                let utc_wall = |t: crate::clock::WallTime| {
+                    use crate::clock::locale::{utc_of_local, Painter};
+                    let local = crate::clock::unix_from_civil(t.year as i64, t.month, t.day, t.hour, t.min, t.sec);
+                    let u = utc_of_local(Painter::DateVerb, local);
+                    (crate::clock::wall_from_unix_clamped(u), u)
+                };
+                match parse_wallclock(&args[1..]).filter(|t| t.is_valid()).map(utc_wall) {
+                    Some((t, u)) if crate::clock::set(t).is_ok() => {
+                        console.println(&alloc::format!("clock set: {}", crate::clock::locale::fmt_long(crate::clock::locale::Painter::DateVerb, u)));
                     }
                     _ => console.println(
                         "date: usage: date -s YYYY-MM-DD HH:MM[:SS]  (year 1980-2107)"),
@@ -5174,17 +5179,15 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // `set_anchor`), so a synced Pi still printed "clock not set" — the bug behind PI-UI-3. Fall back
             // to the FAT anchor, then to the honest UNSET state. `unix_now()` + `civil_from_unix` mirror the
             // `time` verb's path so `date` and `time` never disagree.
-            let ymd = match crate::clock::unix_now() {
-                Some(secs) => {
-                    let (y, mo, d, h, mi, s) = crate::clock::civil_from_unix(secs);
-                    Some((y as u32, mo, d, h, mi, s))
-                }
+            // CLOCKPAINTERS (B719): the civil second prints through `clock::locale` (the region's date order and hour
+            // cycle, the zone and its offset); the JD17 FAT anchor (UTC, no zone) is the fallback.
+            let shown = match crate::clock::unix_now() {
+                Some(secs) => Some(crate::clock::locale::fmt_long(crate::clock::locale::Painter::DateVerb, secs)),
                 None => crate::clock::now()
-                    .map(|t| (t.year, t.month, t.day, t.hour, t.min, t.sec)),
+                    .map(|t| alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", t.year, t.month, t.day, t.hour, t.min, t.sec)),
             };
-            match ymd {
-                Some((y, mo, d, h, mi, s)) => ui3_say(console, "date", &alloc::format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)),
+            match shown {
+                Some(line) => ui3_say(console, "date", &line),
                 None => ui3_say(console, "date", "date: clock not set (date -s YYYY-MM-DD HH:MM:SS)"),
             }
         },

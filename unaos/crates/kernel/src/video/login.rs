@@ -491,6 +491,7 @@ fn repaint() {
     }
     // SAFETY: see `SURF`.
     let px: &mut [u32] = surf();
+    CIVIL_MIN.store(crate::clock::try_unix_now().map_or(u64::MAX, |u| u / 60), Ordering::Relaxed); // CLOCKPAINTERS (B719): the minute this paint shows (`civil_tick`)
     fill(px, 0, 0, W, H, theme::surface_window());
     // DESKTOPCRAFT (B631): no inner 1 px frame — the window's own chrome (rounded head, shadowed band) is the card's edge.
     if matches!(f.state, State::Unlock | State::Words) { kb_paint(px, &f); drop(f); let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { let _ = wm::present(id); } return; } if f.state == State::CreateUser { // KEYBOOT (B688): the unlock and words forms (this file's tail)
@@ -582,6 +583,7 @@ fn repaint() {
     power_row(px, f.state == State::Open); // RESOLVEHANG2 (B531): the caller holds FORM — pass the state in, never re-lock
     let hint: &[u8] = b"Enter or Log In   Tab switches";
     text(px, LX, 186, hint, theme::text_secondary());
+    let civil_w = civil_line(px); // CLOCKPAINTERS (B719): the civil clock under the card, right of the footer
     if !f.message.is_empty() {
         text(px, LX, 212, f.message.as_bytes(), theme::accent());
     } else if !locked {
@@ -589,7 +591,7 @@ fn repaint() {
         let fy = H.saturating_sub(super::super::metrics::lcell_h(crate::video::text::Face::Chrome) + 4); // UIMETRICS: the chrome cell in logical px
         const LONG: &[u8] = b"hold Shift after login to reset display settings";
         const SHORT: &[u8] = b"Shift after login: reset display";
-        let msg = if LX + super::super::metrics::ladvance(LONG, false, crate::video::text::Face::Chrome) <= W { LONG } else { SHORT };
+        let msg = if LX + super::super::metrics::ladvance(LONG, false, crate::video::text::Face::Chrome) + civil_w <= W { LONG } else { SHORT };
         let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, LX, fy, msg, theme::text_secondary(), false, crate::video::text::Face::Chrome);
     }
     drop(f);
@@ -2404,7 +2406,7 @@ fn submit_worker(_: usize) {
 
 /// The render task's drain: apply a landed outcome (called from the render loop's pulse and ahead of every
 /// key the screen reads). One relaxed load when nothing is in flight.
-pub fn submit_drain() { crate::video::lock::service(); // AUTOLOCK (B712): the render pulse — the lock policy, the idle lock, the shake (video/lock.rs). LINE-NEUTRAL fold, code first.
+pub fn submit_drain() { crate::video::lock::service(); civil_tick(); // CLOCKPAINTERS (B719): the civil line's minute. AUTOLOCK (B712): the render pulse — the lock policy, the idle lock, the shake (video/lock.rs). LINE-NEUTRAL fold, code first.
     if !BUSY.load(Ordering::Acquire) {
         return;
     }
@@ -3462,5 +3464,38 @@ fn kb_continue() {
     } else {
         take_down();
         FORM.lock().state = State::Closed;
+    }
+}
+
+// ── CLOCKPAINTERS (rmbp-ledger B719, BP-bar-17) — the login screen's CIVIL LINE ─────────────────────────────────────
+// The first civil print before a session: the date and the clock in Principia's locale (`clock::locale::fmt_stamp`,
+// the zone and the region the machine's store holds), small, right-aligned on the card's footer row on the log-in face
+// (and the locked one). Unset clock: nothing is drawn. The render pulse (`submit_drain`) repaints once when the minute
+// moves; the anchor is read with `try_unix_now`, never a blocking lock.
+
+/// The UTC minute the last paint showed (`u64::MAX` = none yet).
+static CIVIL_MIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Paint the civil line on the footer row; returns the room it took (its width plus a gap, 0 when nothing drew), so
+/// the safe-mode hint picks its short form beside it.
+fn civil_line(px: &mut [u32]) -> usize {
+    let Some(u) = crate::clock::try_unix_now() else { return 0 };
+    let face = crate::video::text::Face::Chrome;
+    let s = crate::clock::locale::fmt_stamp(crate::clock::locale::Painter::Login, u);
+    let w = super::super::metrics::ladvance(s.as_bytes(), false, face);
+    let fy = H.saturating_sub(super::super::metrics::lcell_h(face) + 4);
+    let x = W.saturating_sub(LX + w);
+    let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, x, fy, s.as_bytes(), theme::text_secondary(), false, face);
+    w + 12
+}
+
+/// The render pulse: repaint once when the civil minute moves past the one on the glass (one try-read, one load).
+fn civil_tick() {
+    let last = CIVIL_MIN.load(Ordering::Relaxed);
+    if last == u64::MAX || WIN.load(Ordering::Relaxed) == wm::WIN_NONE {
+        return;
+    }
+    if crate::clock::try_unix_now().is_some_and(|u| u / 60 != last) {
+        repaint();
     }
 }

@@ -172,7 +172,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("clockpainters", clockpainters_selftest); register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
@@ -1096,7 +1096,9 @@ pub fn appfault_selftest() {
 /// painted date, clock and stamp at 2026-07-15 12:34Z in both zones and three regions (the 12 h narrow form, a date
 /// that falls on the previous day in LA), and the three keys each declared, in `prefs::key::ALL` and (desktop builds)
 /// on exactly one Settings row.
-/// `:: TZLOCALE: zones=52 dst_edges_ok=8/8 painted_ok=<n>/<n> painters=3 seen=<bits> orphans=0 -> PASS ::`
+/// CLOCKPAINTERS (B719) extends it: the painters are at least 8, and the clock menu's time line in Berlin
+/// (`14:34 Europe/Berlin +02:00 daylight`, desktop builds) — the `menu=` tail.
+/// `:: TZLOCALE: zones=52 dst_edges_ok=8/8 painted_ok=<n>/<n> painters=10 seen=<bits> orphans=0 -> PASS :: … menu=ok`
 pub fn tzlocale_selftest() {
     use crate::clock::{locale, locale::Locale, tz, unix_from_civil as at};
     let faults = tz::table_faults();
@@ -1151,10 +1153,19 @@ pub fn tzlocale_selftest() {
     let mut orphans = keys.iter().filter(|k| prefs_core::schema::lookup(crate::prefs::NS, k).is_none() || !key::ALL.contains(*k)).count();
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     { orphans += keys.iter().filter(|k| crate::video::settings::MAP.iter().filter(|r| r.keys.contains(*k)).count() != 1).count(); }
-    let ok = zones_ok && dst_ok == 2 * edges.len() && painted_ok == painted.len() && defaults && orphans == 0;
+    #[allow(unused_mut)]
+    let mut menu_ok = true; // CLOCKPAINTERS (B719): the clock menu's zone-and-offset line (desktop builds draw it)
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        let mut cl = alloc::vec::Vec::new();
+        crate::video::statusmenu::clock_lines_in(&be, mid, locale::civil_in(&be, mid), &mut cl);
+        menu_ok = cl.len() > 2 && cl[2] == "14:34 Europe/Berlin +02:00 daylight";
+        if !menu_ok { serial_println!("[tzlocale] menu got={:?}", cl.get(2)); }
+    }
+    let ok = zones_ok && dst_ok == 2 * edges.len() && painted_ok == painted.len() && defaults && orphans == 0 && locale::PAINTERS >= 8 && menu_ok;
     serial_println!(
-        ":: TZLOCALE: zones={} dst_edges_ok={}/{} painted_ok={}/{} painters={} seen={:#05b} orphans={} -> {} :: faults={} defaults={}",
-        tz::ZONES.len(), dst_ok, 2 * edges.len(), painted_ok, painted.len(), locale::PAINTERS, locale::painted(), orphans, if ok { "PASS" } else { "FAIL" }, faults, defaults as u8
+        ":: TZLOCALE: zones={} dst_edges_ok={}/{} painted_ok={}/{} painters={} seen={:#012b} orphans={} -> {} :: faults={} defaults={} menu={}",
+        tz::ZONES.len(), dst_ok, 2 * edges.len(), painted_ok, painted.len(), locale::PAINTERS, locale::painted(), orphans, if ok { "PASS" } else { "FAIL" }, faults, defaults as u8, if menu_ok { "ok" } else { "no" }
     );
 }
 
@@ -2242,4 +2253,91 @@ fn mtpphone_selftest() {
             enumerated as u8, nst, nobj, okf(read_ok), okf(write_ok), okf(delete_ok), ms, why.unwrap_or("-")
         );
     }
+}
+
+// ══════════════ CLOCKPAINTERS (rmbp-ledger B719) — `tests clockpainters` — TAIL-APPENDED ══════════════
+
+/// Occurrences of `needle` in `hay`, at compile time (the FATVERB source-law shape in shell.rs: one forward walk,
+/// a first-byte reject, then the full compare).
+const fn src_count(hay: &[u8], needle: &[u8]) -> usize {
+    let (mut i, mut hits) = (0usize, 0usize);
+    while i + needle.len() <= hay.len() {
+        if hay[i] == needle[0] {
+            let mut k = 0usize;
+            while k < needle.len() && hay[i + k] == needle[k] {
+                k += 1;
+            }
+            if k == needle.len() {
+                hits += 1;
+            }
+        }
+        i += 1;
+    }
+    hits
+}
+
+/// The grep-shaped leg, folded at COMPILE time (the files are read by `include_bytes!` inside a const, so no source
+/// byte reaches the image): the painter files that call the clock module's UTC split themselves. Every civil print in
+/// them goes through `clock::locale`; the split lives only in `clock.rs` and `clock/`.
+#[allow(long_running_const_eval)]
+const CLOCK_UTC_SPLITS: usize = {
+    const N: &[u8] = b"civil_from_unix(";
+    src_count(include_bytes!("video/menubar.rs"), N)
+        + src_count(include_bytes!("video/softy/taskbar.rs"), N)
+        + src_count(include_bytes!("video/quarry/live.rs"), N)
+        + src_count(include_bytes!("video/statusmenu.rs"), N)
+        + src_count(include_bytes!("video/softy/startmenu.rs"), N)
+        + src_count(include_bytes!("shell.rs"), N)
+        + src_count(include_bytes!("video/quarry/getinfo.rs"), N)
+        + src_count(include_bytes!("video/notify.rs"), N)
+        + src_count(include_bytes!("video/login.rs"), N)
+};
+
+/// The retired display-offset knob: named by no kernel reader and no arroyo line (compile time, as above).
+const CLOCK_KNOB_SITES: usize = {
+    const N: &[u8] = b"UNAOS_TZ_MIN";
+    src_count(include_bytes!("clock.rs"), N) + src_count(include_bytes!("arch/x86_64/rtc.rs"), N) + src_count(include_bytes!("../../../arroyo"), N)
+};
+
+/// CLOCKPAINTERS (rmbp-ledger B719, BP-bar-17, BP-boot-18) — `tests clockpainters`: every civil painter prints through
+/// `clock::locale` (`locale::PAINTERS` names them; `utc_splits_left` is the compile-time count of the clock module's
+/// UTC split called from a painter file); the calendars' week starts on `system.locale.first_day` (the column of a
+/// Thursday and the weekday of column 0 for mon/sun/sat, and — desktop builds — the clock menu's month glance on a
+/// Saturday-first locale); the `date -s` seed is local and round-trips to UTC (Berlin summer, Los Angeles' spring gap
+/// reads as standard time); and the build knob is gone. Fixture-local locales only: the live locale and the store are
+/// never written.
+/// `:: CLOCKPAINTERS: painters=10 utc_splits_left=0 first_day=ok knob_gone=1 -> PASS :: seed=ok`
+pub fn clockpainters_selftest() {
+    use crate::clock::{locale, locale::Locale, unix_from_civil as at};
+    let [mon, sun, sat] = [Some("mon"), Some("sun"), Some("sat")].map(|f| Locale::parse(None, None, f));
+    // Thursday (4) and column 0, per first day.
+    #[allow(unused_mut)]
+    let mut first_ok = [(mon, 3usize, 1u8), (sun, 4, 0), (sat, 5, 6)].iter().all(|(l, col, wd0)| l.week_col(4) == *col && l.col_wd(0) == *wd0);
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        // 2026-10-06 09:41 UTC: the 1st is a Thursday — on a Saturday-first week it sits in column 5.
+        let mut cl = alloc::vec::Vec::new();
+        crate::video::statusmenu::clock_lines_in(&sat, 1_791_279_660, locale::civil_in(&sat, 1_791_279_660), &mut cl);
+        let g = crate::video::statusmenu::GRID_MARK;
+        let grid = cl.len() >= 5 && cl[3].as_bytes().first() == Some(&g) && &cl[3].as_bytes()[1..] == b"Sa|Su|Mo|Tu|We|Th|Fr" && &cl[4].as_bytes()[1..] == b"|||||1|2";
+        if !grid { serial_println!("[clockpainters] glance got={:?}", cl.get(3..5)); }
+        first_ok &= grid;
+    }
+    // The seed: local civil -> UTC through the zone in force at that moment.
+    let be = Locale::parse(Some("Europe/Berlin"), None, None);
+    let la = Locale::parse(Some("America/Los_Angeles"), None, None);
+    let seeds = [
+        (locale::utc_of_local_in(&be, at(2026, 7, 15, 14, 34, 0)), at(2026, 7, 15, 12, 34, 0)),
+        (locale::utc_of_local_in(&be, at(2026, 1, 15, 14, 34, 0)), at(2026, 1, 15, 13, 34, 0)),
+        (locale::utc_of_local_in(&la, at(2026, 3, 8, 2, 30, 0)), at(2026, 3, 8, 10, 30, 0)),
+        (locale::utc_of_local_in(&Locale::DEFAULT, at(2026, 7, 15, 14, 34, 0)), at(2026, 7, 15, 14, 34, 0)),
+    ];
+    let seed_ok = seeds.iter().all(|(g, w)| g == w) && locale::fmt_long_in(&be, at(2026, 7, 15, 12, 34, 5)) == "2026-07-15 14:34:05 Europe/Berlin UTC+02:00";
+    if !seed_ok { serial_println!("[clockpainters] seeds={:?} long={}", seeds, locale::fmt_long_in(&be, at(2026, 7, 15, 12, 34, 5))); }
+    let knob_gone = CLOCK_KNOB_SITES == 0;
+    let ok = locale::PAINTERS >= 8 && CLOCK_UTC_SPLITS == 0 && first_ok && knob_gone && seed_ok;
+    serial_println!(
+        ":: CLOCKPAINTERS: painters={} utc_splits_left={} first_day={} knob_gone={} -> {} :: seed={}",
+        locale::PAINTERS, CLOCK_UTC_SPLITS, if first_ok { "ok" } else { "no" }, knob_gone as u8, if ok { "PASS" } else { "FAIL" }, if seed_ok { "ok" } else { "no" }
+    );
 }

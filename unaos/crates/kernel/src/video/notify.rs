@@ -421,9 +421,21 @@ fn center_model(ring: &[Note]) -> (usize, usize, Vec<(bool, usize)>) {
     (ring.len(), apps.len(), rows)
 }
 
+/// An item's time in the Center: `now` and `<n>m` under an hour (relative, no civil second); an hour and older, the
+/// post's own clock time in Principia's locale (CLOCKPAINTERS B719: `clock::locale::fmt_time` into the 5-glyph
+/// column, so a 12 h region drops the meridiem), or `<n>h` while the civil clock is unset.
 fn age(now: u64, at: u64) -> String {
     let sec = now.saturating_sub(at) / 1000;
-    if sec < 60 { String::from("now") } else if sec < 3600 { alloc::format!("{}m", sec / 60) } else { alloc::format!("{}h", sec / 3600) }
+    if sec < 60 { return String::from("now") }
+    if sec < 3600 { return alloc::format!("{}m", sec / 60) }
+    match crate::clock::try_unix_now() {
+        Some(u) => {
+            let mut b = [0u8; 5];
+            let n = crate::clock::locale::fmt_time(crate::clock::locale::Painter::Notify, u.saturating_sub(sec), &mut b);
+            String::from(core::str::from_utf8(&b[b.len() - n..]).unwrap_or("?"))
+        }
+        None => alloc::format!("{}h", sec / 3600),
+    }
 }
 
 /// Paint the Center and publish its item rows for the press router. Returns `(items, apps, shown)` — `shown` the

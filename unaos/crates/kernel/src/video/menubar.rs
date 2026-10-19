@@ -3038,18 +3038,23 @@ const CLOCKBAR_WIDE_CELLS: usize = 130;
 
 static CLOCKBAR_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// UTC `Www DD Mon` from Unix seconds, no heap.
+/// The local `Www DD Mon` (`mdy` regions: `Www Mon DD`) from Unix seconds, no heap. CLOCKPAINTERS (B719): the split is
+/// `clock::locale`'s (Principia's zone and date order), never this painter's.
 fn clockbar_date(secs: u64) -> [u8; CLOCKBAR_DATE_GLYPHS] {
-    const WD: [&[u8; 3]; 7] = [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
+    const WD: [&[u8; 3]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
     const MO: [&[u8; 3]; 12] = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
-    let (_, mo, d, _, _, _) = crate::clock::civil_from_unix(secs);
-    let wd = WD[((secs / 86_400) % 7) as usize];
-    let mn = MO[(mo.clamp(1, 12) - 1) as usize];
+    let c = crate::clock::locale::civil(crate::clock::locale::Painter::BarDate, secs);
+    let mn = MO[(c.mo - 1) as usize];
+    let dd = [b'0' + ((c.d / 10) % 10) as u8, b'0' + (c.d % 10) as u8];
     let mut o = [b' '; CLOCKBAR_DATE_GLYPHS];
-    o[..3].copy_from_slice(wd);
-    o[4] = b'0' + ((d / 10) % 10) as u8;
-    o[5] = b'0' + (d % 10) as u8;
-    o[7..10].copy_from_slice(mn);
+    o[..3].copy_from_slice(WD[c.wd as usize % 7]);
+    if crate::clock::locale::current().order() == 2 {
+        o[4..7].copy_from_slice(mn);
+        o[8..10].copy_from_slice(&dd);
+    } else {
+        o[4..6].copy_from_slice(&dd);
+        o[7..10].copy_from_slice(mn);
+    }
     o
 }
 
