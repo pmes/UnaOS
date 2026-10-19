@@ -29,7 +29,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sink {
     Hda,
-    Usb,
+    Usb, #[cfg(all(target_arch = "x86_64", feature = "btc"))] Bt, // A2DP (rmbp-ledger B739): the paired headset, `drivers/bt/avdtp.rs`'s sink (LINE-NEUTRAL fold, code first)
 }
 
 /// Principia key (namespace `system`): `"hda"` or `"usb"`.
@@ -62,7 +62,7 @@ fn chosen() -> u8 {
     match CHOSEN.load(Ordering::Acquire) {
         0 => {
             let v = match crate::prefs::text(PREF_KEY) {
-                Some(s) if s.starts_with("usb") => 2,
+                Some(s) if s.starts_with("usb") => 2, #[cfg(all(target_arch = "x86_64", feature = "btc"))] Some(s) if s.starts_with("bt") => 3, // A2DP (B739): `bt` (LINE-NEUTRAL fold, code first)
                 _ => 1,
             };
             CHOSEN.store(v, Ordering::Release);
@@ -74,7 +74,7 @@ fn chosen() -> u8 {
 
 /// The sink sound goes to now.
 pub fn current() -> Sink {
-    let usb = USB_PRESENT.load(Ordering::Acquire);
+    let usb = USB_PRESENT.load(Ordering::Acquire); #[cfg(all(target_arch = "x86_64", feature = "btc"))] if chosen() == 3 && bt_ready() { return Sink::Bt; } // A2DP (B739): a `bt` choice holds while a stream runs (LINE-NEUTRAL fold, code first)
     if usb && (chosen() == 2 || !hda_built()) {
         Sink::Usb
     } else {
@@ -85,7 +85,7 @@ pub fn current() -> Sink {
 /// The sink's name as Settings shows it.
 pub fn label(s: Sink) -> String {
     match s {
-        Sink::Hda => String::from("HDA internal"),
+        Sink::Hda => String::from("HDA internal"), #[cfg(all(target_arch = "x86_64", feature = "btc"))] Sink::Bt => bt_label(), // A2DP (B739) (LINE-NEUTRAL fold, code first)
         Sink::Usb => {
             if USB_PRESENT.load(Ordering::Acquire) {
                 let v = USB_ID.load(Ordering::Relaxed);
@@ -101,7 +101,7 @@ pub fn label(s: Sink) -> String {
 pub fn sink(name: &str) -> Result<Sink, &'static str> {
     let s = match name {
         "hda" | "internal" => Sink::Hda,
-        n if n == "usb" || n.starts_with("usb:") => Sink::Usb,
+        n if n == "usb" || n.starts_with("usb:") => Sink::Usb, #[cfg(all(target_arch = "x86_64", feature = "btc"))] n if n == "bt" || n.starts_with("bt:") => return bt_choose(n), // A2DP (B739): `bt` / `bt:<addr>` (LINE-NEUTRAL fold, code first)
         _ => return Err("unknown-sink"),
     };
     if s == Sink::Hda && !hda_built() {
@@ -133,7 +133,7 @@ pub fn tone_on(s: Sink, hz: u32, ms: u32) -> Result<(u64, u32), &'static str> {
     serial_println!("[audio] tone sink={} hz={} ms={}", label(s), hz, ms);
     match s {
         Sink::Hda => hda_tone(),
-        Sink::Usb => usb_tone(hz, ms),
+        Sink::Usb => usb_tone(hz, ms), #[cfg(all(target_arch = "x86_64", feature = "btc"))] Sink::Bt => bt_tone(hz, ms), // A2DP (B739) (LINE-NEUTRAL fold, code first)
     }
 }
 
@@ -154,7 +154,7 @@ fn usb_tone(_hz: u32, _ms: u32) -> Result<(u64, u32), &'static str> {
 }
 
 /// Q15 sine of `phase` in 1/1024 turns: a 5th-order odd polynomial on the first quadrant, mirrored (no float).
-#[cfg(feature = "uac")]
+#[cfg(any(feature = "uac", all(target_arch = "x86_64", feature = "btc")))]
 fn sin_q15(phase: u64) -> i32 {
     const Q: u64 = 256;
     let p = phase % (4 * Q);
@@ -168,7 +168,7 @@ fn sin_q15(phase: u64) -> i32 {
     if quad >= 2 { -s } else { s }
 }
 
-#[cfg(feature = "uac")]
+#[cfg(any(feature = "uac", all(target_arch = "x86_64", feature = "btc")))]
 pub(crate) fn nap(ms: u64) {
     #[cfg(target_arch = "x86_64")]
     crate::arch::sched::sleep_ms(ms);
@@ -342,4 +342,111 @@ fn mic_answer(ok: bool) {
         crate::prefs::decide(crate::fs::apptrust::MIC_DOMAIN, &app, "-", MIC_ALLOW);
     }
     serial_println!("[mic] answer={} app={}", if allow { MIC_ALLOW } else { "not-now" }, app);
+}
+
+// ── A2DP (rmbp-ledger B739): THE BLUETOOTH SINK — TAIL-APPENDED ───────────────────────────────────────────────────────
+// A third sink behind the same seam (BP-audio-1): `sink("bt")` / `sink("bt:<addr>")` chooses it while an A2DP stream
+// runs (`drivers/ehci/bthid::avdtp`, the paired headset); `tone_on(Sink::Bt, ..)` writes the sine into that module's
+// PCM ring (44.1 kHz stereo, the stream's rate) exactly as the USB sink is fed, and the media clock frames it into SBC.
+// The choice is Principia's `system.audio.output` = `bt` (BP-audio-2). The mixer (AUDIOMIX) is not on this tip: this is
+// `audio::sink`'s existing shape, one more arm. Settings > General's Sound picker reads [`outputs`] and presses
+// [`choose`] (a third segment while the device is on a link).
+
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+use crate::drivers::ehci::bthid::avdtp as a2dp;
+
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+fn bt_ready() -> bool {
+    a2dp::streaming()
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+fn bt_label() -> String {
+    a2dp::device().unwrap_or_else(|| String::from("BT (none)"))
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+fn bt_choose(name: &str) -> Result<Sink, &'static str> {
+    if !bt_ready() {
+        serial_println!("[audio] sink={} REFUSED reason=no-a2dp-stream", name);
+        return Err("no-a2dp-stream");
+    }
+    CHOSEN.store(3, Ordering::Release);
+    crate::prefs::set_sys(PREF_KEY, crate::prefs::PrefValue::Str(String::from("bt")));
+    serial_println!("[audio] sink={} chosen", label(Sink::Bt));
+    Ok(Sink::Bt)
+}
+
+/// Settings > General's Sound picker: the labels (HDA, USB, and the A2DP device while one is on a link) and the
+/// selected segment.
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+pub fn outputs() -> (alloc::vec::Vec<String>, usize) {
+    let mut v = alloc::vec![label(Sink::Hda), label(Sink::Usb)];
+    if let Some(d) = a2dp::device() {
+        v.push(d);
+    }
+    let sel = match current() {
+        Sink::Hda => 0,
+        Sink::Usb => 1,
+        Sink::Bt => 2,
+    };
+    let last = v.len() - 1;
+    (v, sel.min(last))
+}
+
+/// The picker's segment `i` pressed.
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+pub fn choose(i: usize) -> Result<Sink, &'static str> {
+    sink(match i {
+        0 => "hda",
+        1 => "usb",
+        _ => "bt",
+    })
+}
+
+/// The Bluetooth sink: `ms` of an `hz` sine at -18 dBFS with 20 ms fades into the A2DP ring at 44.1 kHz, then the
+/// drain awaited — `usb_tone`'s shape.
+#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+fn bt_tone(hz: u32, ms: u32) -> Result<(u64, u32), &'static str> {
+    const AMP: i32 = 4096;
+    const CHUNK: usize = 245; // frames = 5.6 ms
+    let rate = a2dp::RATE as u64;
+    let total = (rate * ms as u64 / 1000) as usize;
+    let fade = (rate / 50) as usize;
+    let (f0, u0) = a2dp::counters();
+    a2dp::begin()?;
+    let mut chunk = [0u8; CHUNK * 4];
+    let (mut f, mut last) = (0usize, crate::arch::ms());
+    while f < total {
+        let n = (total - f).min(CHUNK);
+        for i in 0..n {
+            let fr = f + i;
+            let env = if fr < fade { (fr * 32768 / fade) as i32 } else if fr + fade >= total { ((total - 1 - fr) * 32768 / fade) as i32 } else { 32768 };
+            let s = ((((sin_q15(fr as u64 * hz as u64 * 1024 / rate) * AMP) >> 15) * env) >> 15) as i16;
+            let b = s.to_le_bytes();
+            chunk[i * 4..i * 4 + 4].copy_from_slice(&[b[0], b[1], b[0], b[1]]);
+        }
+        let mut off = 0usize;
+        while off < n * 4 {
+            let w = a2dp::write(&chunk[off..n * 4]);
+            off += w;
+            if w != 0 {
+                last = crate::arch::ms();
+            } else if !a2dp::streaming() || crate::arch::ms().wrapping_sub(last) > 500 {
+                a2dp::finish();
+                serial_println!("[audio] tone sink=bt ABORT reason=stream-stalled written_frames={} of {}", f + off / 4, total);
+                return Err("stream-stalled");
+            } else {
+                nap(2);
+            }
+        }
+        f += n;
+    }
+    a2dp::finish();
+    let t0 = crate::arch::ms();
+    while a2dp::queued() > 0 && crate::arch::ms().wrapping_sub(t0) < 2000 {
+        nap(2);
+    }
+    let (f1, u1) = a2dp::counters();
+    Ok((f1.wrapping_sub(f0), u1.wrapping_sub(u0)))
 }
