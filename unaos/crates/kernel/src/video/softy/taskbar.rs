@@ -206,13 +206,9 @@ impl Model {
             m.bat = 1 + b.percent.min(100) | if b.charging { 0x8000 } else { 0 };
         }
         if let Some(secs) = crate::clock::try_unix_now() {
-            let (y, mo, d, h, mi, _) = crate::clock::civil_from_unix(secs);
-            m.clock = [b'0' + (h / 10) as u8, b'0' + (h % 10) as u8, b':', b'0' + (mi / 10) as u8, b'0' + (mi % 10) as u8];
-            let y = y.clamp(0, 9999) as u32;
-            m.date = [
-                b'0' + (y / 1000 % 10) as u8, b'0' + (y / 100 % 10) as u8, b'0' + (y / 10 % 10) as u8, b'0' + (y % 10) as u8, b'-',
-                b'0' + (mo / 10) as u8, b'0' + (mo % 10) as u8, b'-', b'0' + (d / 10) as u8, b'0' + (d % 10) as u8,
-            ];
+            // TZLOCALE (B701): the clock and the date through the one locale (UTC + ymd-24 paints what it always did).
+            crate::clock::locale::fmt_time(crate::clock::locale::Painter::Taskbar, secs, &mut m.clock);
+            crate::clock::locale::fmt_date(crate::clock::locale::Painter::Taskbar, secs, &mut m.date);
             m.clock_set = true;
         }
         m

@@ -120,8 +120,8 @@ const TOP: usize = PANE_Y;
 const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
-pub const TABS: usize = 11;
-pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9 · REASK (B681) 10
+pub const TABS: usize = 12;
+pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9 · REASK (B681) 10 · TZLOCALE (B701) 11
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -496,7 +496,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -800,6 +800,13 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
             fill_rrect(s, Rect::new(x + f(22), y + f(44), f(56), f(40)), f(8), ink);
             fill_circle(s, cx, y + f(62), f(7).max(1), bg);
         }
+        DT_TAB => {
+            // Date & Time: a clock face — the ring, the hour hand to ten, the minute hand to twelve, the hub (TZLOCALE B701).
+            stroke_circle(s, cx, cy, f(36).max(2), sw, ink);
+            line_aa(s, cx * SUB, cy * SUB, cx * SUB, (y + f(26)) * SUB, sw * SUB, ink);
+            line_aa(s, cx * SUB, cy * SUB, (x + f(32)) * SUB, (y + f(40)) * SUB, sw * SUB, ink);
+            fill_circle(s, cx, cy, f(6).max(1), ink);
+        }
         9 => {
             // Accessibility: the universal-access figure — a ring, the head, the arms across, the two legs (A11YPANE B655).
             stroke_circle(s, cx, cy, f(44).max(2), sw, ink);
@@ -930,6 +937,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == NP_TAB => paint_notifypane(st), // NOTIFYPANE (B435)
         t if t as usize == A11Y_TAB => paint_a11y(st), // A11YPANE (B655)
         t if t as usize == PRIV_TAB => paint_privacy(st), // REASK (B681)
+        t if t as usize == DT_TAB => paint_datetime(st), // TZLOCALE (B701)
         _ => paint_about(st),
     }
     if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
@@ -1695,6 +1703,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         t if t == NP_TAB => press_notifypane(row, cx), // NOTIFYPANE (B435)
         t if t == A11Y_TAB => press_a11y(row, cx), // A11YPANE (B655)
         t if t == PRIV_TAB => press_privacy(row, cx), // REASK (B681)
+        t if t == DT_TAB => press_datetime(row, cx), // TZLOCALE (B701)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -3243,9 +3252,9 @@ pub fn selftest_a11y() {
 // date, a Revoke at the right); the row after them `+<n> more`. Revoke is LATCHED in the click router and run by
 // [`privacy_service`] on the service pass (`prefs::revoke` saves a domain file — never in the router).
 
-/// The Privacy tab's index on the strip: the last tab.
+/// The Privacy tab's index on the strip: the one before Date & Time (TZLOCALE B701).
 pub const PRIV_TAB: usize = 10;
-const _: () = assert!(PRIV_TAB == TABS - 1 && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB);
+const _: () = assert!(DT_TAB == TABS - 1 && PRIV_TAB + 1 == DT_TAB && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB); // TZLOCALE (B701): Date & Time follows Privacy
 /// Decision rows shown.
 const PRIV_ROWS: usize = 8;
 /// The Revoke button's x (right-aligned in the row).
@@ -3327,6 +3336,65 @@ fn privacy_service() {
     }
 }
 
+// ── TZLOCALE (rmbp-ledger B701, BP-bar-17) — the Date & Time tab ──────────────────────────────────────────────────────
+// One row per `system.locale.*` key (BP-bar-17): row 0 Time zone (- / + walk `clock::tz::ZONES`), row 1 Date and time
+// format (the three date orders as segments, the 24-hour switch at the right), row 2 First day of week (segments); row
+// 3 the stamp the painters print now, with its offset. A press applies the choice live (`clock::locale::choose_*`) and
+// the store write is owed to `clock::locale::service` on the service pass (never in the click router).
+
+/// The Date & Time tab's index on the strip: the last tab.
+pub const DT_TAB: usize = 11;
+const DT_ORDERS: [&[u8]; 3] = [b"Y-M-D", b"D/M/Y", b"M/D/Y"];
+const DT_FIRST: [&[u8]; 3] = [b"Monday", b"Sunday", b"Saturday"];
+
+fn paint_datetime(st: &mut State) {
+    use crate::clock::locale;
+    groups(st, &[(0, 0), (1, 2), (3, 3)]);
+    let l = locale::current();
+    txt(st, LABEL_X, 0, "Time zone");
+    btn(st, 0, TRACK_X, "-");
+    btn(st, 0, TRACK_X + BTN_W + 10, "+");
+    txt2(st, TRACK_X + 2 * BTN_W + 24, 0, l.zone().name);
+    txt(st, LABEL_X, 1, "Date and time format");
+    seg(st, 1, &DT_ORDERS, l.order() as usize, false);
+    txt2(st, VAL_X, 1, "24h");
+    tog(st, 1, TOG_X, l.h24(), false);
+    txt(st, LABEL_X, 2, "First day of week");
+    seg(st, 2, &DT_FIRST, l.first_day as usize, false);
+    txt(st, LABEL_X, 3, "Now");
+    let now = match crate::clock::try_unix_now() {
+        Some(u) => {
+            let (_, off, dst) = l.local(u);
+            let o = locale::off_text(off);
+            alloc::format!("{}  UTC{}{}", locale::fmt_stamp_in(&l, u), core::str::from_utf8(&o).unwrap_or(""), if dst { " daylight" } else { "" })
+        }
+        None => String::from("The clock is not set"),
+    };
+    txt2(st, TRACK_X, 3, &now);
+}
+
+/// A press on the Date & Time tab: - / + walk the zones, a segment picks the order or the first day, the switch flips
+/// the hour cycle. Each applies at once; the store write is `clock::locale::service`'s.
+fn press_datetime(row: usize, cx: usize) {
+    use crate::clock::{locale, tz};
+    let l = locale::current();
+    let n = tz::ZONES.len();
+    match row {
+        0 if cx >= TRACK_X && cx < TRACK_X + BTN_W => locale::choose_tz((l.tz as usize + n - 1) % n),
+        0 if cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 => locale::choose_tz((l.tz as usize + 1) % n),
+        1 if cx >= TRACK_X && cx < TRACK_X + TRACK_W => {
+            let o = ((cx - TRACK_X) / (TRACK_W / DT_ORDERS.len())).min(DT_ORDERS.len() - 1);
+            locale::choose_region(o * 2 + (!l.h24()) as usize);
+        }
+        1 if cx >= TOG_X && cx < TOG_X + draw::DIMS.toggle_w => locale::choose_region(l.order() as usize * 2 + l.h24() as usize),
+        2 if cx >= TRACK_X && cx < TRACK_X + TRACK_W => locale::choose_first(((cx - TRACK_X) / (TRACK_W / DT_FIRST.len())).min(DT_FIRST.len() - 1)),
+        _ => return,
+    }
+    let l = locale::current();
+    say("locale", &alloc::format!("{}/{}/{}", l.zone().name, l.region_name(), l.first_day_name()), true);
+    repaint();
+}
+
 // ── SETTINGSMAP (rmbp-ledger B673, BP-bar-17, R118) — one row per preference, and the search that reaches it ─────────
 // "One Settings row per preference" (BAR row 17): [`MAP`] is the ONE table of Settings rows. A row names the Principia
 // keys it edits (`system.<key>`, every one in `prefs::key::ALL`), the tab and row it is painted on, the label it paints
@@ -3355,7 +3423,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 32] = {
+pub const MAP: [MapRow; 35] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3398,6 +3466,10 @@ pub const MAP: [MapRow; 32] = {
         mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
         mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
+        // Date & Time (TZLOCALE B701): the one locale authority's three keys
+        mr(&[LOCALE_TZ], DT_TAB, 0, "Time zone", NO_CTRL),
+        mr(&[LOCALE_REGION], DT_TAB, 1, "Date and time format", NO_CTRL),
+        mr(&[LOCALE_FIRST_DAY], DT_TAB, 2, "First day of week", NO_CTRL),
         // The tab column
         mr(&[SETTINGS_TAB], COLUMN, 0, "Settings tabs", NO_CTRL),
     ]

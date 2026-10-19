@@ -172,7 +172,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
@@ -1086,5 +1086,74 @@ pub fn appfault_selftest() {
         leaked_kb,
         if alive { "alive" } else { "stalled" },
         if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// TZLOCALE (rmbp-ledger B701, BP-bar-17) — `tests tzlocale`: the zone table is well formed; `system.locale.tz` set to
+/// America/Los_Angeles, then Europe/Berlin, through `Locale::parse` (the service's own parse) on a FIXTURE-LOCAL locale
+/// (the live locale and the store are never written): eight DST edges (one second before and at each 2026 edge: the
+/// offset, the daylight bit and the painted clock — each edge also checked against the rule's own derivation), the
+/// painted date, clock and stamp at 2026-07-15 12:34Z in both zones and three regions (the 12 h narrow form, a date
+/// that falls on the previous day in LA), and the three keys each declared, in `prefs::key::ALL` and (desktop builds)
+/// on exactly one Settings row.
+/// `:: TZLOCALE: zones=52 dst_edges_ok=8/8 painted_ok=<n>/<n> painters=3 seen=<bits> orphans=0 -> PASS ::`
+pub fn tzlocale_selftest() {
+    use crate::clock::{locale, locale::Locale, tz, unix_from_civil as at};
+    let faults = tz::table_faults();
+    let la = Locale::parse(Some("America/Los_Angeles"), Some("ymd-24"), None);
+    let be = Locale::parse(Some("Europe/Berlin"), Some("dmy-24"), Some("mon"));
+    let zones_ok = faults == 0 && la.zone().name == "America/Los_Angeles" && be.zone().name == "Europe/Berlin";
+    // The DST edges: (locale, the edge's UTC second, start?, offset before, offset at, clock before, clock at).
+    let edges: [(&Locale, u64, bool, i32, i32, &[u8; 5], &[u8; 5]); 4] = [
+        (&la, at(2026, 3, 8, 10, 0, 0), true, -480, -420, b"01:59", b"03:00"),
+        (&la, at(2026, 11, 1, 9, 0, 0), false, -420, -480, b"01:59", b"01:00"),
+        (&be, at(2026, 3, 29, 1, 0, 0), true, 60, 120, b"01:59", b"03:00"),
+        (&be, at(2026, 10, 25, 1, 0, 0), false, 120, 60, b"02:59", b"02:00"),
+    ];
+    let mut dst_ok = 0usize;
+    for &(l, t, start, ob, oa, cb, ca) in edges.iter() {
+        let derived = tz::edge_of(l.zone(), 2026, start) == Some(t as i64);
+        for (u, off, clk) in [(t - 1, ob, cb), (t, oa, ca)] {
+            let (_, o, d) = l.local(u);
+            let mut c = [0u8; 5];
+            locale::fmt_time_in(l, u, &mut c);
+            let ok = derived && o == off && d == (off != l.zone().std_min) && &c == clk;
+            if ok { dst_ok += 1; } else {
+                serial_println!("[tzlocale] edge zone={} t={} off={} dst={} clock={} want_off={} derived={}", l.zone().name, u, o, d as u8, core::str::from_utf8(&c).unwrap_or("?"), off, derived as u8);
+            }
+        }
+    }
+    // The painted strings: what the bar (5 glyphs), the taskbar date and Quarry's stamp print.
+    let mid = at(2026, 7, 15, 12, 34, 0);
+    let early = at(2026, 7, 15, 3, 0, 0);
+    let us12 = Locale::parse(Some("America/Los_Angeles"), Some("mdy-12"), Some("sun"));
+    let time = |l: &Locale, u: u64, w: usize| { let mut b = [0u8; 8]; locale::fmt_time_in(l, u, &mut b[..w]); alloc::string::String::from(core::str::from_utf8(&b[..w]).unwrap_or("?")) };
+    let date = |l: &Locale, u: u64| { let mut b = [0u8; 10]; let n = locale::fmt_date_in(l, u, &mut b); alloc::string::String::from(core::str::from_utf8(&b[..n]).unwrap_or("?")) };
+    let painted: [(alloc::string::String, &str); 9] = [
+        (time(&la, mid, 5), "05:34"),
+        (date(&la, mid), "2026-07-15"),
+        (date(&la, early), "2026-07-14"),
+        (time(&be, mid, 5), "14:34"),
+        (date(&be, mid), "15/07/2026"),
+        (locale::fmt_stamp_in(&be, mid), "15/07/2026 14:34"),
+        (time(&us12, mid, 8), " 5:34 AM"),
+        (time(&us12, mid, 5), " 5:34"),
+        (locale::fmt_stamp_in(&us12, at(2026, 1, 15, 23, 5, 0)), "01/15/2026 3:05 PM"),
+    ];
+    let mut painted_ok = 0usize;
+    for (got, want) in painted.iter() {
+        if got == want { painted_ok += 1; } else { serial_println!("[tzlocale] painted got={:?} want={:?}", got, want); }
+    }
+    let defaults = Locale::parse(None, None, None) == Locale::DEFAULT && Locale::parse(Some("Mars/Olympus"), Some("x"), Some("y")) == Locale::DEFAULT;
+    // The three keys: declared, in ALL, and (where Settings is built) each on exactly one row.
+    use crate::prefs::key;
+    let keys = [key::LOCALE_TZ, key::LOCALE_REGION, key::LOCALE_FIRST_DAY];
+    let mut orphans = keys.iter().filter(|k| prefs_core::schema::lookup(crate::prefs::NS, k).is_none() || !key::ALL.contains(*k)).count();
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    { orphans += keys.iter().filter(|k| crate::video::settings::MAP.iter().filter(|r| r.keys.contains(*k)).count() != 1).count(); }
+    let ok = zones_ok && dst_ok == 2 * edges.len() && painted_ok == painted.len() && defaults && orphans == 0;
+    serial_println!(
+        ":: TZLOCALE: zones={} dst_edges_ok={}/{} painted_ok={}/{} painters={} seen={:#05b} orphans={} -> {} :: faults={} defaults={}",
+        tz::ZONES.len(), dst_ok, 2 * edges.len(), painted_ok, painted.len(), locale::PAINTERS, locale::painted(), orphans, if ok { "PASS" } else { "FAIL" }, faults, defaults as u8
     );
 }

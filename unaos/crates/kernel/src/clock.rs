@@ -27,6 +27,9 @@
 
 use crate::sync::Mutex;
 
+pub mod locale; // TZLOCALE (B701): the one locale authority's reader and formatter (`fmt_time` / `fmt_date`)
+pub mod tz; // TZLOCALE (B701): the compiled zone table (fixed DST rules)
+
 /// The anchor a `date -s` plants: the seeded wall-clock second paired with the counter reading at
 /// the moment of seeding. `now()` = `base_secs` + (ticks since `anchor_ticks`) / freq. One small
 /// lock (set is a rare operator action; reads are a couple of loads) keeps the pair consistent.
