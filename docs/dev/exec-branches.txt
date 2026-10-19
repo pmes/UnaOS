@@ -643,3 +643,9 @@ refs/heads/exec-rmbp-qvbar          eaf30444 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-softymic       4e9c92be FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-a2dpknob       27716037 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-oneinstance2   771334b4 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-a2dpenv        253f0c2c IN-FLIGHT cloud wave36 A2DPENV
+refs/heads/exec-rmbp-geodedep       253f0c2c IN-FLIGHT cloud wave36 GEODEDEP
+refs/heads/exec-rmbp-dndtrash       253f0c2c IN-FLIGHT cloud wave36 DNDTRASH
+refs/heads/exec-rmbp-quarrylaunch   253f0c2c IN-FLIGHT cloud wave36 QUARRYLAUNCH
+refs/heads/exec-rmbp-prefsdeleted   253f0c2c IN-FLIGHT cloud wave36 PREFSDELETED
+refs/heads/exec-rmbp-helpverbdoc    253f0c2c IN-FLIGHT cloud wave36 HELPVERBDOC
