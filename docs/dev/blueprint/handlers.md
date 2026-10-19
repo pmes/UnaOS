@@ -28,7 +28,7 @@
 | Aulë | Forge | `aule` | selfhost (`unaos/crates/kernel/src/selfhost/`) — owner `unverified` |
 | Comscan | Signals | `comscan` | none found |
 | Facet | Images | `facet` | kernel viewer `unaos/crates/kernel/src/video/facet.rs` (charter Facet) |
-| Geode | Archives | `geode` | none found |
+| Geode | Archives | `geode` | none found (host crate `handlers/geode`: the `.geode` v1 archive carrying UnaFS records whole, GEODEMETA SR148) |
 | Helm | Control | `helm` | `unaos/libs/sys/helm` (host workspace only) |
 | Holocron | Secrets | `holocron` | `APPS/HOLOCRON.ELF`; login screen charter (`unaos/crates/kernel/src/video/login.rs`) |
 | Matrix | Files | `matrix` | Quarry (`video/quarry*.rs`, charter Matrix) |

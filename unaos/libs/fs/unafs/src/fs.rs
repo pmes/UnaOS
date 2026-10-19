@@ -3619,6 +3619,21 @@ impl<D: BlockDevice> UnaFS<D> {
             atime: inode.atime,
         })
     }
+
+    /// GEODEMETA (LEDGER SR148): set an inode's three §R7 times to exactly these values — the one write
+    /// that does not stamp from [`crate::clock::now`]. It is the restore seam of an archive's unpack
+    /// (`handlers/geode`): create, write and `set_attribute` stamp the clock, so the archived times are
+    /// put back last. Nothing else in the record changes and nothing is indexed (times are not catalog
+    /// facts). A v3–v5 volume has no meta trailer, so there the times are not kept, as on every write.
+    /// One transaction.
+    pub fn set_times(&mut self, inode_id: u64, ctime: u64, mtime: u64, atime: u64) -> Result<(), FileSystemError> {
+        let mut inode = self.read_inode(inode_id)?;
+        inode.ctime = ctime;
+        inode.mtime = mtime;
+        inode.atime = atime;
+        self.write_inode(&inode)?;
+        self.maybe_commit()
+    }
 }
 
 // =========================================================================
