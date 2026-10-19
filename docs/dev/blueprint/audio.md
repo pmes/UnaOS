@@ -59,7 +59,7 @@
 - Stria (ring 3) is a mixer source (B731). The kernel Player (and the video player's sound through `play-dec`) and the alert sound still write the HDA stream directly and supersede the mixer's HDA handle; making the Player a mixer source is owed (its A/V clock reads the HDA ring's LPIB, `hda_play.rs` r3_counts/position_ms). Volume/mute on USB: the mixer's master (no feature-unit SET_CUR).
 - The picker has no keyboard control index yet (click only); its own `kernel feature` is `uvc` (no `uac` knob in Cargo.toml).
 - QEMU: `UNAOS_UVC=1 UNAOS_USBAUDIO=1` attaches `usb-audio` (`unaos/arroyo`); the rmbp bench flight with a USB speaker is unflown.
-- Capture from ring 3 (MICRING3 B736, BP-audio-12): built, unflown. Owed outside the arc's files: `bus::verb_valid` must accept 40..42 (`uac` only), Settings > Privacy's `privacy_service` must call `fs::apptrust::mic_revoked(&k)` beside the camera's `uvc::revoked`, and the image must stage `APPS/MICRING3.ELF`. Every reader shares the one capture ring (two open programs split its frames); aarch64 has no arm. The Softy look's mic dot is SOFTYDOTS'.
+- Capture from ring 3 (MICRING3 B736, BP-audio-12): built, unflown. Owed outside the arc's files: `bus::verb_valid` must accept 40..42 (`uac` only), Settings > Privacy's `privacy_service` must call `fs::apptrust::mic_revoked(&k)` beside the camera's `uvc::revoked`, and built and staged by MICSTAGE B744. Every reader shares the one capture ring (two open programs split its frames); aarch64 has no arm. The Softy look's mic dot is SOFTYDOTS'.
 
 ## 6. Read further
 - `docs/dev/OS/11_AUDIO/hda.md` (the HDA walk and tone), `docs/dev/OS/07_USB_STORAGE/uvc.md` (XHCIISO, the IsoHost shape).

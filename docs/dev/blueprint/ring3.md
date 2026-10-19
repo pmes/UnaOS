@@ -46,7 +46,7 @@
 | VUG (+VUGX/VUGC/VUGK variants) | yes | yes | Vug |
 | PREFS, NET, DIAG, BIG | yes | no aarch64 recipe found | probes/fixtures (owner `unverified`) |
 | ABIPROBE | committed fixture (`unaos/fixtures/ABIPROBE-v1.ELF`), never rebuilt by the image | no | the ABI gate (`tests abielf`, B693) |
-| MICRING3 | owed (staged by no recipe yet) | no | `tests micring3` fixture (`unaos/crates/user-micring3`, B736) |
+| MICRING3 | yes (build_user_micring3_x86, B744; builder stages it) | no | `tests micring3` fixture (`unaos/crates/user-micring3`, B736) |
 | ABIPROBE | committed fixture (`unaos/fixtures/ABIPROBE-v1.ELF`), never rebuilt by the image | no | the ABI gate (BP-ring3-15) |
 | STAT, PULSE | yes | yes | instruments |
 | blob / elf / blob-x86 | flat test blobs | | fixtures |

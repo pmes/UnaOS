@@ -1463,6 +1463,14 @@ fn main() {
     } else {
         println!("   BIG: target/BIG-X86.ELF absent — ESP has no BIG.ELF (run via ./arroyo esp-x86)");
     }
+    // MICSTAGE (B744): the `tests micring3` fixture program (arroyo's build_user_micring3_x86 -> target/MICRING3-X86.ELF).
+    let micring3_elf = target_dir.join("MICRING3-X86.ELF");
+    if micring3_elf.exists() {
+        std::fs::copy(&micring3_elf, esp_apps.join("MICRING3.ELF")).unwrap();
+        println!("   MICRING3: copied MICRING3.ELF into APPS/ on the ESP (tests micring3)");
+    } else {
+        println!("   MICRING3: target/MICRING3-X86.ELF absent — ESP has no MICRING3.ELF (run via ./arroyo esp-x86)");
+    }
     // ABIELF (B693): the committed ABI fixture, pinned — `tests abielf` reads /apps/ABIPROBE.ELF.
     let _ = stage_abiprobe(&workspace_dir, &esp_apps);
 
@@ -1630,6 +1638,7 @@ fn main() {
         (target_dir.join("NET-X86.ELF"), "NET.ELF"),
         // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.ELF there.
         (target_dir.join("BIG-X86.ELF"), "BIG.ELF"),
+        (target_dir.join("MICRING3-X86.ELF"), "MICRING3.ELF"), // MICSTAGE (B744): `tests micring3` reads /apps/MICRING3.ELF there
         // SELFDIAG M2 (B324): the diagnosis program rides the DATA volume too — `diag` reads it there.
         (target_dir.join("DIAG-X86.ELF"), "DIAG.ELF"),
         // HOLOCRON2 (B355): the secrets handler rides the DATA volume too — the login launch and `holocron` read it there.
