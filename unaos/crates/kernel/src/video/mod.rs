@@ -1155,7 +1155,7 @@ pub mod brightkeys;
 pub mod dimidle;
 // WALLPAPER (rmbp-0929) — the desktop backdrop picture; rides the `facet` decoder, so it has the same gate.
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-pub mod wallpaper;
+pub mod wallpaper; #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] pub mod veilcost; // VEILCOST (B696, BP-bar-23): the VEIL's cost against a solid fill, `[veil] cost`, `tests veilcost`. LINE-NEUTRAL append, code before the comment.
 // SETTINGS (R75) — the settings window: sliders/toggles over the knobs the OS already has; same gate as fileview.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod settings;

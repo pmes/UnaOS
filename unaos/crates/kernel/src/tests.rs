@@ -188,7 +188,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); register("focussteal", focussteal_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); register("focussteal", focussteal_selftest); register("veilcost", veilcost_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1595,4 +1595,65 @@ pub fn focussteal_selftest() {
             wm::close(id);
         }
     }
+}
+
+/// **`tests veilcost`** (VEILCOST, rmbp-ledger B696, BP-bar-23: "beauty (VEIL, shimmer) costs no more than a solid
+/// fill"). Two halves, R80 (a verb, never at boot):
+/// 1. THE VEIL: 64 samples of `video::veilcost::sample` (the menu bar's rect through `wm::desktop::bar_row` over the
+///    live VEIL, then a solid fill of the same rows) into the compositor's ring; the bar is the sheet's ±5 %:
+///    veil p99 <= fill p99 x 1.05 + 50 us (the arc's 1.25 is withdrawn).
+/// 2. THE SHIMMER: for 1.5 s, the idle seat (`wm::desktop::shimmer_idle`, one ordinary composite when a tick is due
+///    and the glass is idle) timed around each call; a call across which `shimmer_ticks` advanced is a shimmer frame,
+///    and its worst is `shimmer_idle_us` (bar: <= 200 us). A tick another seat ran during a short call only adds a
+///    short sample, which cannot lower the worst.
+/// `:: VEILCOST: detail veil_p50_us=<n> veil_p99_us=<n> fill_p99_us=<n> bar_us=<n> n=<n> shimmer_frames=<n> ::`
+/// `:: VEILCOST: ratio_p99=<x.xx> shimmer_idle_us=<n> -> PASS|FAIL|SKIP ::`
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
+fn veilcost_selftest() {
+    const SAMPLES: usize = 64;
+    const SHIM_WINDOW_MS: u64 = 1_500;
+    const SHIM_BAR_US: u64 = 200;
+    let mut got = 0usize;
+    for _ in 0..SAMPLES * 2 {
+        if crate::video::veilcost::sample().is_some() {
+            got += 1;
+            if got == SAMPLES {
+                break;
+            }
+        }
+        crate::arch::sched::yield_now();
+    }
+    if got == 0 {
+        serial_println!(":: VEILCOST: no wallpaper installed (no VEIL to cost) -> SKIP ::");
+        return;
+    }
+    let (v50, v99, s99, ratio, k) = crate::video::veilcost::stats();
+    let bar_us = s99 as u64 * 105 / 100 + 50;
+    let veil_ok = v99 as u64 <= bar_us;
+    let rm = crate::video::settings::reduce_motion();
+    let (mut worst, mut frames) = (0u64, 0u32);
+    if !rm {
+        let end = crate::arch::ms() + SHIM_WINDOW_MS;
+        while crate::arch::ms() < end {
+            let n0 = crate::video::wm::desktop::shimmer_ticks();
+            let t0 = crate::arch::now_cycles();
+            crate::video::wm::desktop::shimmer_idle();
+            let us = crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
+            if crate::video::wm::desktop::shimmer_ticks() != n0 {
+                frames += 1;
+                worst = worst.max(us);
+            }
+            crate::arch::sched::sleep_ms(5);
+        }
+    }
+    let shim_ok = rm || (frames > 0 && worst <= SHIM_BAR_US);
+    serial_println!(
+        ":: VEILCOST: detail veil_p50_us={} veil_p99_us={} fill_p99_us={} bar_us={} n={} shimmer_frames={}{} ::",
+        v50, v99, s99, bar_us, k, frames, if rm { " reduce_motion=1" } else { "" }
+    );
+    serial_println!(
+        ":: VEILCOST: ratio_p99={}.{:02} shimmer_idle_us={} -> {} ::",
+        ratio / 100, ratio % 100, worst, if veil_ok && shim_ok { "PASS" } else { "FAIL" }
+    );
+    crate::video::veilcost::line();
 }
