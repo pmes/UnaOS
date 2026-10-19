@@ -28,9 +28,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::video::{theme, wm};
 
 /// Kernel-furniture owner slot (`+ 7`, after TEXTEDIT's `+ 6`).
-pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 7;
+pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 8; // A11YTREE (B675): its own slot — `+ 7` was settings::OWNER's too, so an owner-keyed reader (focus, the dock's join, the a11y tree) could not tell the two windows apart; + 8 is the next free in the band
 const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_OWNER_DESKTOP);
-const _: () = assert!(OWNER != super::fileview::OWNER && OWNER != super::textedit::OWNER);
+const _: () = assert!(OWNER != super::fileview::OWNER && OWNER != super::textedit::OWNER && OWNER != super::settings::OWNER);
 
 const WIN_W: usize = 560;
 const WIN_H: usize = 480;

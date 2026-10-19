@@ -4992,7 +4992,7 @@ fn dp_is_window(i: usize) -> bool {
 }
 
 /// The owner of kernel-window pin `i`'s LIVE window, or 0 (atomic reads only: called under the window-table lock).
-/// Settings and Activity share `KERNEL_OWNER_BASE + 7`; each module's own `is_open` disambiguates which is up.
+/// Settings (`KERNEL_OWNER_BASE + 7`) and Activity (`+ 8` since A11YTREE B675; they shared `+ 7` before) each answer through their own module's `is_open`.
 fn dp_window_owner(i: usize) -> u64 {
     match DP_PINS.get(i).map(|s| s.verb) {
         Some("activity") if crate::video::activity::is_open() => crate::video::activity::OWNER,
@@ -5117,5 +5117,40 @@ fn craft_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32, 
         super::text::draw_row(out, l.w, &cap[..cols], bx + PAD(), j - ty0, ink, false, FACE);
     }
     dock2_overlay(out, l, rows, j);
+    true
+}
+
+// A11YTREE (rmbp-ledger B675, BP-bar-22) — the dock's tiles for the accessibility tree (`wm::a11y`): the SAME settled
+// model `press_at` routes over (scan, pins, `settle` without reconciling) laid out by the SAME `Layout::for_glass`, so a
+// reader's tile box is the box the painter drew and the router hits. Captions are the painter's (`+<k>` for the overflow
+// group). TAIL-APPENDED: no line above moves.
+
+/// The dock's tiles on a `pw` x `ph` panel as `(caption, caption length, box)`, written into `out` (cleared here). `false`
+/// with nothing written under the Softy look (the taskbar's tiles are its own) or when there is no strip to lay out.
+pub fn a11y_tiles(pw: usize, ph: usize, out: &mut alloc::vec::Vec<([u8; wm::MAX_TITLE], usize, (usize, usize, usize, usize))>) -> bool {
+    out.clear();
+    if super::look::is_softy() {
+        return false;
+    }
+    let mut rows = ModelBuf::take();
+    let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0)); dp_refresh(&rows, n);
+    let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n);
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); settle(&mut rows, n, false);
+    let Some(l) = Layout::for_glass(n, pw, ph) else { return false };
+    for t in 0..l.n.min(n) {
+        let Some(bx) = l.tile(t) else { break };
+        let mut cap = [0u8; wm::MAX_TITLE];
+        let len = if l.is_overflow(t) {
+            let mut ob = [0u8; 8];
+            let k = overflow_label(l.overflow, &mut ob).min(8);
+            cap[..k].copy_from_slice(&ob[..k]);
+            k
+        } else {
+            let k = rows[t].title_len.min(wm::MAX_TITLE);
+            cap[..k].copy_from_slice(&rows[t].title[..k]);
+            k
+        };
+        out.push((cap, len, bx));
+    }
     true
 }

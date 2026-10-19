@@ -1957,7 +1957,7 @@ pub const BUS_VERB_ALL: &[u8] = &[
     BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET, BUS_VERB_NOTICE, BUS_VERB_ATTR_SET, BUS_VERB_ATTR_GET, BUS_VERB_ATTR_LIST,
     BUS_VERB_ATTR_QUERY, BUS_VERB_ATTR_STAT, BUS_VERB_PREF_GET, BUS_VERB_PREF_SET, BUS_VERB_PREF_LIST,
     BUS_VERB_PREF_CHANGED, BUS_VERB_REGISTER, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST, BUS_VERB_DIALOG,
-    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET,
+    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET, BUS_VERB_A11Y_TREE,
 ];
 /// No two entries equal (and none zero). `const` so the assertion below runs in the compiler.
 pub const fn codes_unique_u64(v: &[u64]) -> bool {
@@ -2731,3 +2731,215 @@ const _: () = assert!(
     SYS_AUDIO_OPEN == SYS_KILL + 1 && SYS_AUDIO_WRITE == SYS_AUDIO_OPEN + 1 && SYS_AUDIO_CLOSE == SYS_AUDIO_WRITE + 1 && SYS_AUDIO_POS == SYS_AUDIO_CLOSE + 1
         && AUDIO_POS_PLAYED != AUDIO_POS_UNDERRUNS && AUDIO_RATE_MIN < AUDIO_RATE_MAX && AUDIO_WRITE_MAX % 4 == 0
 );
+
+// =================================================================================================
+// A11YTREE (rmbp-ledger B675; BP-bar-22: "accessibility lives in the window table") — THE ACCESSIBILITY TREE ON
+// THE BUS. The kernel builds a role/name tree from the window manager's rows (each window's title and its owner's
+// role: a ring-3 app or kernel furniture) and from the furniture's own tables (the menu bar's title boxes, the dock's
+// pins, the Settings tab rows), focus = the window manager's focus; a ring-3 reader (a screen reader) asks for it with
+// `BUS_VERB_A11Y_TREE` and speaks it.
+//
+// REQUEST body: empty (from node 1) or `[first lo, first hi]` — the 1-based node id to start the page at. Any other
+// length is -EINVAL; outside a session the verb is -EACCES (window titles are the session user's).
+// REPLY body: an [`A11Y_HDR_LEN`]-byte header — `total u16, first u16, count u16, focus u16` (LE; `focus` = the id of
+// the focused node, 0 = none: the shell holds the keyboard) — then `count` nodes of [`A11Y_NODE_LEN`] bytes each:
+//   0..2 id u16 (1-based, tree order: a parent precedes its children) · 2..4 parent u16 (0 = the root's) · 4 role ·
+//   5 flags · 6 name_len (<= A11Y_NAME_MAX) · 7 reserved 0 · 8..16 rect x, y, w, h u16 (panel px) · 16..64 name (UTF-8,
+//   zero-padded).
+// A page holds at most [`A11Y_PAGE_MAX`] nodes; a reader pages with `first` until it has `total`. Appended at the
+// tail so no existing line moves.
+// =================================================================================================
+
+/// Bus verb: the accessibility tree (see the block above).
+pub const BUS_VERB_A11Y_TREE: u8 = 25; // 24 is BUS_VERB_DROP_GET
+const _: () = assert!(BUS_VERB_A11Y_TREE > BUS_VERB_DROP_GET && BUS_VERB_A11Y_TREE < BUS_VERB_REGISTER);
+/// A node's name, at most this many UTF-8 bytes (cut at a character boundary).
+pub const A11Y_NAME_MAX: usize = 48;
+/// One node on the wire.
+pub const A11Y_NODE_LEN: usize = 16 + A11Y_NAME_MAX;
+/// The reply header: total, first, count, focus (four LE u16).
+pub const A11Y_HDR_LEN: usize = 8;
+/// The most nodes one reply body carries.
+pub const A11Y_PAGE_MAX: usize = (BUS_BODY_MAX - A11Y_HDR_LEN) / A11Y_NODE_LEN;
+const _: () = assert!(A11Y_NODE_LEN == 64 && A11Y_PAGE_MAX == 63 && A11Y_HDR_LEN + A11Y_PAGE_MAX * A11Y_NODE_LEN <= BUS_BODY_MAX);
+
+/// Role: the desktop (the tree's root; its rect is the panel).
+pub const A11Y_ROLE_DESKTOP: u8 = 1;
+/// Role: a window a ring-3 program owns.
+pub const A11Y_ROLE_WINDOW: u8 = 2;
+/// Role: a window the kernel owns (furniture: the shell, the console, Settings, Quarry, a dialog, …).
+pub const A11Y_ROLE_FURNITURE: u8 = 3;
+/// Role: the menu bar.
+pub const A11Y_ROLE_MENUBAR: u8 = 4;
+/// Role: one menu-bar title (the app menu, a published title, the Window menu).
+pub const A11Y_ROLE_MENU: u8 = 5;
+/// Role: the dock (the taskbar under the Softy look).
+pub const A11Y_ROLE_DOCK: u8 = 6;
+/// Role: one dock tile.
+pub const A11Y_ROLE_DOCK_TILE: u8 = 7;
+/// Role: one Settings tab row.
+pub const A11Y_ROLE_TAB: u8 = 8;
+/// The highest role a reader can meet; above it a reader says "unknown", never guesses.
+pub const A11Y_ROLE_LAST: u8 = A11Y_ROLE_TAB;
+
+/// Flag: the node holds the keyboard focus (the window manager's focus).
+pub const A11Y_F_FOCUSED: u8 = 1 << 0;
+/// Flag: the node is not on the glass (a minimised window, one parked below the shell).
+pub const A11Y_F_HIDDEN: u8 = 1 << 1;
+/// Flag: the node is the selected one of its siblings (the open menu-bar title, the Settings tab shown).
+pub const A11Y_F_SELECTED: u8 = 1 << 2;
+/// Flag: the rect is the CONTAINER's (the dock strip, the Settings tab column) — the node's own box is not published.
+pub const A11Y_F_PARENT_BOX: u8 = 1 << 3;
+
+/// One accessibility node, decoded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct A11yNode {
+    pub id: u16,
+    pub parent: u16,
+    pub role: u8,
+    pub flags: u8,
+    pub name_len: u8,
+    pub name: [u8; A11Y_NAME_MAX],
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl A11yNode {
+    /// The name's bytes.
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_len as usize).min(A11Y_NAME_MAX)]
+    }
+}
+
+/// `v` as a wire u16, saturating.
+pub const fn a11y_u16(v: usize) -> u16 {
+    if v > u16::MAX as usize { u16::MAX } else { v as u16 }
+}
+
+/// The longest prefix of `s` that is at most [`A11Y_NAME_MAX`] bytes and ends on a UTF-8 character boundary.
+pub const fn a11y_name_cut(s: &[u8]) -> usize {
+    if s.len() <= A11Y_NAME_MAX {
+        return s.len();
+    }
+    let mut n = A11Y_NAME_MAX;
+    while n > 0 && (s[n] & 0xC0) == 0x80 {
+        n -= 1;
+    }
+    n
+}
+
+/// Encode the reply header into `out[..A11Y_HDR_LEN]`. `false` (nothing written) when `out` is short.
+pub const fn a11y_hdr_put(total: u16, first: u16, count: u16, focus: u16, out: &mut [u8]) -> bool {
+    if out.len() < A11Y_HDR_LEN {
+        return false;
+    }
+    let v = [total, first, count, focus];
+    let mut i = 0;
+    while i < 4 {
+        let b = v[i].to_le_bytes();
+        out[2 * i] = b[0];
+        out[2 * i + 1] = b[1];
+        i += 1;
+    }
+    true
+}
+
+/// `(total, first, count, focus)` from a reply body, or `None` when it is shorter than the header or its `count`
+/// nodes do not exactly fill the rest.
+pub const fn a11y_hdr_get(body: &[u8]) -> Option<(u16, u16, u16, u16)> {
+    if body.len() < A11Y_HDR_LEN {
+        return None;
+    }
+    let total = u16::from_le_bytes([body[0], body[1]]);
+    let first = u16::from_le_bytes([body[2], body[3]]);
+    let count = u16::from_le_bytes([body[4], body[5]]);
+    let focus = u16::from_le_bytes([body[6], body[7]]);
+    if (count as usize) > A11Y_PAGE_MAX || body.len() != A11Y_HDR_LEN + count as usize * A11Y_NODE_LEN {
+        return None;
+    }
+    Some((total, first, count, focus))
+}
+
+/// Encode `n` into `out[..A11Y_NODE_LEN]`. `false` (nothing written) when `out` is short or the name is too long.
+pub const fn a11y_node_put(n: &A11yNode, out: &mut [u8]) -> bool {
+    if out.len() < A11Y_NODE_LEN || n.name_len as usize > A11Y_NAME_MAX {
+        return false;
+    }
+    let v = [n.id, n.parent];
+    let r = [n.x, n.y, n.w, n.h];
+    let mut i = 0;
+    while i < 2 {
+        let b = v[i].to_le_bytes();
+        out[2 * i] = b[0];
+        out[2 * i + 1] = b[1];
+        i += 1;
+    }
+    out[4] = n.role;
+    out[5] = n.flags;
+    out[6] = n.name_len;
+    out[7] = 0;
+    i = 0;
+    while i < 4 {
+        let b = r[i].to_le_bytes();
+        out[8 + 2 * i] = b[0];
+        out[8 + 2 * i + 1] = b[1];
+        i += 1;
+    }
+    i = 0;
+    while i < A11Y_NAME_MAX {
+        out[16 + i] = if i < n.name_len as usize { n.name[i] } else { 0 };
+        i += 1;
+    }
+    true
+}
+
+/// Decode one node from `b[..A11Y_NODE_LEN]`; `None` when short, the reserved byte is set or the name length is
+/// past [`A11Y_NAME_MAX`].
+pub const fn a11y_node_get(b: &[u8]) -> Option<A11yNode> {
+    if b.len() < A11Y_NODE_LEN || b[7] != 0 || b[6] as usize > A11Y_NAME_MAX {
+        return None;
+    }
+    let mut name = [0u8; A11Y_NAME_MAX];
+    let mut i = 0;
+    while i < b[6] as usize {
+        name[i] = b[16 + i];
+        i += 1;
+    }
+    Some(A11yNode {
+        id: u16::from_le_bytes([b[0], b[1]]),
+        parent: u16::from_le_bytes([b[2], b[3]]),
+        role: b[4],
+        flags: b[5],
+        name_len: b[6],
+        name,
+        x: u16::from_le_bytes([b[8], b[9]]),
+        y: u16::from_le_bytes([b[10], b[11]]),
+        w: u16::from_le_bytes([b[12], b[13]]),
+        h: u16::from_le_bytes([b[14], b[15]]),
+    })
+}
+
+#[cfg(test)]
+mod a11ytree_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn a11y_wire_round_trip() {
+        let mut name = [0u8; A11Y_NAME_MAX];
+        name[..8].copy_from_slice(b"Settings");
+        let n = A11yNode { id: 7, parent: 1, role: A11Y_ROLE_FURNITURE, flags: A11Y_F_FOCUSED, name_len: 8, name, x: 10, y: 20, w: 300, h: 200 };
+        let mut out = [0u8; A11Y_HDR_LEN + A11Y_NODE_LEN];
+        assert!(a11y_hdr_put(9, 7, 1, 7, &mut out));
+        assert!(a11y_node_put(&n, &mut out[A11Y_HDR_LEN..]));
+        assert_eq!(a11y_hdr_get(&out), Some((9, 7, 1, 7)));
+        assert_eq!(a11y_node_get(&out[A11Y_HDR_LEN..]), Some(n));
+        assert_eq!(a11y_node_get(&out[A11Y_HDR_LEN..]).unwrap().name(), b"Settings");
+        assert!(a11y_hdr_get(&out[..A11Y_HDR_LEN + 1]).is_none());
+        let long = "é".repeat(30);
+        let k = a11y_name_cut(long.as_bytes());
+        assert!(k <= A11Y_NAME_MAX && k % 2 == 0 && core::str::from_utf8(&long.as_bytes()[..k]).is_ok());
+        assert_eq!(a11y_u16(70_000), u16::MAX);
+    }
+}
