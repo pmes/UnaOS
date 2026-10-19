@@ -25,7 +25,7 @@ pub const ACTIONS: &[Action] = &[
     Action::WinNudgeRight, Action::WinNudgeUp, Action::WinNudgeDown, Action::WinSizeLeft, Action::WinSizeRight,
     Action::WinSizeUp, Action::WinSizeDown, Action::Minimize, Action::CycleApp, Action::QuitApp, Action::CloseWindow,
     Action::HideApp, Action::OpenSettings, Action::ForceQuit, Action::ClearView, Action::GetInfo, Action::Launcher,
-    Action::Interrupt,
+    Action::Interrupt, Action::Start, // WINKEY (B665)
 ];
 
 /// Exhaustive on purpose (no `_` arm): a new variant does not compile until it is named here — and the
@@ -42,7 +42,7 @@ pub const fn listed(a: Action) -> bool {
         | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp
         | Action::WinSizeDown | Action::Minimize | Action::CycleApp | Action::QuitApp | Action::CloseWindow
         | Action::HideApp | Action::OpenSettings | Action::ForceQuit | Action::ClearView | Action::GetInfo | Action::Launcher
-        | Action::Interrupt => true,
+        | Action::Interrupt | Action::Start /* WINKEY (B665) */ => true,
     }
 }
 

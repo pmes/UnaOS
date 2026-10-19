@@ -1,5 +1,9 @@
 # BLUEPRINT — the UnaOS architecture as it is in the tree
 
+**The bar (Peter, 2026-10-19):** "not just a car — the greatest car ever made. what we are working on is the greatest OS.
+they should think: wow, this is how computers should have been all along." Every sheet below serves that sentence;
+an arc that does not move the glass toward it is a tangent.
+
 Peter, 2026-10-19: "a set of blueprints for you and the executors to look over … keep the os architecture stable and work as a
 front-side gate so that coding efforts are not wasted on some accidental tangent"; "easily digestible so that only what's
 necessary is contextualized". Held to the tree by GATE-BLUEPRINT (`unaos/scripts/blueprint-check.py`, in `./arroyo gates`).

@@ -163,16 +163,24 @@ assert the taskbar is gone, the dock tenant is the dock's again and the menu bar
 
 ## Not yet Windows-like (owed)
 
-* **The Win key.** A bare Command (Win) press is not an event today: it needs a `keymap::Action` row and a
-  modifier-tap in the HID decoders, then ONE line in x86's `wc_route_event` door chain
-  (`arch/x86_64/syscall.rs:7319`): `|| crate::video::softy::startmenu::key_door(raw)` (Esc closes a flyout; a
-  new `Action::Start` arm calls `startmenu::toggle_by_key()`). Not in this arc's files.
-* **The Settings control.** Settings > Appearance needs two lines (`settings.rs` is SETTINGSTABS'/SETTINGSCRAFT's):
-  in `paint_appearance` a row `Look: UnaOS | Softy` (the Light/Dark segment's shape, `look::current()`), and in
-  `press_appearance` an arm calling `super::look::choose(i)`. `look::choose` stores the key and switches.
-* **Soft shadows** under the Start menu, the calendar and windows: the compositor has no under-sample (above).
-* **Pressed states** on the caption buttons (hover only); the taskbar's pressed state is drawn but not latched.
-* **Quick settings** (the tray opens Settings), **task view**, **snap layouts**, **jump lists**, **"All apps"**
-  and a search field that types in place (it opens the Launcher), **desktop icons** (no desktop icon layer exists
-  in the tree, so no hook was made), **rounded bottom window corners**.
-* **Dark Softy**: the palette is light only; `appearance.mode` is not read by Softy yet.
+Replaced 2026-10-19 by WINKEY (rmbp-ledger B665) with SOFTY3's list (`docs/dev/evidence/softy3/SOFTY3.md` §4, dated
+2026-10-13), the Win key's entry corrected:
+
+* DONE in SOFTY2 (B641): the Win key (a bare tap of the key playing the Windows role, R126), Settings > Appearance >
+  Look, soft shadows under the flyouts (`paint::shadow`, elev.2), pressed states (caption buttons, taskbar), quick
+  settings (sound, Wi-Fi, battery), dark Softy (`palette::dark(Sem)`).
+* DONE in SOFTY3 (B651): the clock opens notify's own Center beside the calendar.
+* DONE in WINKEY (B665): **Start's ONE trigger is the tap counter** — `keymap::tap_track` (from `note_mods`, every HID
+  report of both decoders) counts a bare press-and-release of the key that plays the Windows role (Option on a Mac
+  keyboard, Win on a PC one; none under Una), `keymap::note_keys` spoils it on any key edge between (Win+E is a chord),
+  and `startmenu::key_service` (the look's service pass, both arches) toggles Start. Esc closes an open flyout through
+  `startmenu::key_door`, now a door in x86's `wc_route_event` chain (ESC ONLY: the door never toggles Start), and still
+  through `keymap`'s Esc edge on the service pass (both arches). `Action::Start` exists for RING-3 DELIVERY ONLY
+  (`INPUT_EV_ACTION` code 50, `clipboard::action_code`): it is WIRED BUT UNEMITTED — a tap completes on a modifier-only
+  report, where no key edged and the decoders' non-capture arm never runs, so no decoder pushes it. `tests winkey`.
+* OWED (2026-10-19): the decoder push of `Action::Start` to ring 3 (a seam beside `note_mods` that does not reach
+  Start's toggle); the Win-chords (Win+E, Win+D, Win+arrows: a WIN role bit and Softy rows in theme.rs); task view;
+  snap layouts; jump lists; "All apps"; a search field that types in place (it opens the Launcher); desktop icons (no
+  desktop icon layer exists in the tree); rounded bottom window corners; `look::service` repainting Settings on the
+  Look click (SOFTY2 owed 5); the Center's rect under Softy on the Pi (`desktop_firmware`: the same code, unflown
+  there); the Esc door in the aarch64 router (the service-pass Esc edge covers it today).
