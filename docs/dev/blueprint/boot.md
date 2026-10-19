@@ -24,6 +24,8 @@
 | BP-boot-12 | Boot timing uses the free-running counter (rdtsc / CNTVCT_EL0), converted at print time; drop-NEWEST on overflow. | `unaos/crates/kernel/src/bootpace.rs:16-29` | BPACE ledger on the wire |
 | BP-boot-13 | The loader's `KELF min= max=` line is the boot's identity for scoring a capture. | `unaos/crates/bootloader/src/main.rs:795`; `docs/dev/PLAYBOOK.md` §4.6 | bench scoring (unheld in-tree) |
 | BP-boot-14 | Orin (`tegra`) leaves `kernel_main` early at `tegra_early_stop`; the shared GUI path below it is unreachable there. | `unaos/crates/kernel/src/main.rs:72-79` `unaos/crates/kernel/src/main.rs:190` | `./arroyo check` tegra leg |
+| BP-boot-15 | Every image line names its oldest machine (`boot::OLDEST`, one const per board: rmbp12 2012, pi4 2019, orin 2023; `login` builds only, written in each line's tail comment) and the boot's first `[desktop] built` prints `:: OLDEST: board= year= image=<build sha> net=<absent|present> -> BOOTS ::`; BP-bar-1. | `unaos/crates/kernel/src/boot.rs:410-459` `unaos/crates/kernel/src/video/desktopbuild.rs:122`; `unaos/scripts/image-line.env:70` | twoboot boot 1 (`x86-twoboot-1.spec`) |
+| BP-boot-16 | x86 kernel slots (ABIMAGE B683, BP-bar-8): the loader boots `KERNEL.NEW` only when `STAGE.REC` says `stage=1` and `SHUTDOWN.REC` says `why=user` (written only by `power::prelude`, the user's Restart/Shut Down), marking `why=trial` BEFORE the jump; a trial that never reached DESKTOPBUILT PASS falls back to `KERNEL.ELF` on the next boot. The decision is ONE pure fn both the loader and the kernel compile; the loader writes only these two records. | `unaos/crates/kernel/src/install/abslot.rs:118`; `unaos/crates/bootloader/src/main.rs:709` `unaos/crates/bootloader/src/main.rs:1584`; `unaos/crates/kernel/src/install/abimage.rs:85`; `docs/dev/OS/10_INSTALL/ab-image.md` | `tests abimage` (`:: ABIMAGE: decide=4/4 …`); `[loader] slot=<ELF or NEW> why=` line |
 
 ## 3. Seams
 - `boot::phase/services_gate` are asked by: `wm::create_inner`, every service starter, the WC-D valve (`unaos/crates/kernel/src/boot.rs:17-21`).
@@ -56,4 +58,5 @@
 ## 7. Read further
 - `docs/dev/OS/01_BOOT_HAL/bootloader_spec.md`, `bootpace.md` — the loader contract and BPACE.
 - `docs/dev/OS/10_INSTALL/FLIGHT35-INSTALL.md` — the installer on the image.
+- `docs/dev/OS/10_INSTALL/ab-image.md` — the two kernel slots and the loader's decision (BP-boot-15).
 - `docs/dev/evidence/foldbuild/IMAGE-LINE.md` — each knob's derivation.

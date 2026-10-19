@@ -480,7 +480,7 @@ unsafe fn r16(base: u64, off: u64) -> u16 {
 /// in this file is MMIO-read-only, and a convenient `w32` in scope is how that stops being true by
 /// accident. Under `feature = "wifi3"` the upload rung ([`upload_ucode`]) is the second, deliberate
 /// consumer — every write it makes carries the same witness discipline and increments a [`Writes`]
-/// field at the write site.
+/// field at the write site. WIFIMAC (B669) adds a third: `ident::sprom_read`'s ChipCommon CHIPCTL clear + restore (`Writes::cc_chipctl`).
 ///
 /// # Safety
 /// The caller must have mapped and verified the window, must have established by a LIVE `cfg:0x80`
@@ -821,7 +821,7 @@ struct Writes {
     /// the write — and the audited zero becomes an audited count by the same mechanism.
     core_regs: u32,
     /// Microcode bytes streamed into the core. Same argument, same `wifi3` write sites.
-    upload_bytes: u64,
+    upload_bytes: u64, cc_chipctl: u32, // WIFIMAC (B669): S2r's ChipCommon CHIPCTL writes — the 4331 PA-line clear + its pre-image restore (ident::sprom_read)
 }
 
 impl Writes {
@@ -830,7 +830,7 @@ impl Writes {
             cfg80_selftest: 0, cfg80_moves: 0, cfg80_restore: 0,
             cfg_ac_moves: 0, cfg_ac_restore: 0,
             wrapper_writes: 0, wrapper_unwinds: 0,
-            core_regs: 0, upload_bytes: 0,
+            core_regs: 0, upload_bytes: 0, cc_chipctl: 0,
         }
     }
     fn cfg80_total(&self) -> u32 {
@@ -866,12 +866,12 @@ fn end_line(dl: &Deadline, ok: bool, stage: &str, d11: &str, w: &Writes, restore
         "audited — counted at the wifi3 upload rung's sites, the read-only shm-probe select included; RADIO_CONTROL (0x3E2) still has no write site in this file, and wifi4 writes the radio ADDRESS port (0x3F6) instead — counted on the wifi4 end line, not this one; WIFI7's live.rs SHM_CONTROL selects + restore are counted here";
     let (ev, eu) = fmt_dur(dl.elapsed());
     serial_println!(
-        ":: wifi2: end ok={} stage={} d11={} wrote-cfg80={}(selftest={} moves={} restore={}) wrote-cfg0xac={}(moves={} restore={}) wrote-wrapper={}(enable={} unwind={}) wrote-core-regs={}({}) uploaded-bytes={}(audited) restore={} elapsed={}{} ::",
+        ":: wifi2: end ok={} stage={} d11={} wrote-cfg80={}(selftest={} moves={} restore={}) wrote-cfg0xac={}(moves={} restore={}) wrote-wrapper={}(enable={} unwind={}) wrote-core-regs={}({}) uploaded-bytes={}(audited) wrote-cc-chipctl={}(S2r PA-line clear + pre-image restore) restore={} elapsed={}{} ::",
         ok as u8, stage, d11,
         w.cfg80_total(), w.cfg80_selftest, w.cfg80_moves, w.cfg80_restore,
         w.cfg_ac_total(), w.cfg_ac_moves, w.cfg_ac_restore,
         w.wrapper_total(), w.wrapper_writes, w.wrapper_unwinds,
-        w.core_regs, CORE_REGS_NOTE, w.upload_bytes, restore, ev, eu
+        w.core_regs, CORE_REGS_NOTE, w.upload_bytes, w.cc_chipctl, restore, ev, eu
     );
 }
 
@@ -1159,9 +1159,9 @@ fn explore(
         match (chipid >> 28) & 0xF { 0 => "ssb/sb", 1 => "bcma/erom", 2 => "bcma-single", _ => "?" },
         ((chipid & 0xFFFF) as u16 == DEVID_BCM4331) as u8,
     );
-    // WIFI6 (B439): S2r — the SPROM shadow, read while the window ALREADY sits on ChipCommon (no
-    // write of its own). The PCI subsystem device id (config 0x2C, high half) is its corroboration.
-    ident::sprom_read(bar0, (unsafe { read_config_32(bus, dev, func, 0x2C) } >> 16) as u16);
+    // WIFI6 (B439): S2r — the SPROM shadow, read while the window ALREADY sits on ChipCommon; WIFIMAC (B669): the source chosen
+    // and the 4331 PA-line mux cleared around the read (CHIPCTL pre-image restored, counted). The PCI ssid device corroborates.
+    w.cc_chipctl += ident::sprom_read(bar0, (unsafe { read_config_32(bus, dev, func, 0x2C) } >> 16) as u16);
 
     // ── R4: the EROM. ───────────────────────────────────────────────────────────────────────────
     if erom == 0 || erom == ER_ALL_ONES {

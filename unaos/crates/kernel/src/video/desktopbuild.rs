@@ -15,8 +15,8 @@
 //!
 //! Lines: `[desktop] built at=<login ok|stage> bar_ms=<n> battery=<painted|absent|unpainted> dock=<painted|unpainted> pins=<n>`
 //! (every build), `:: DESKTOPBUILT: prebuilt=<0|1> built_at=<login|stage> bar_first_paint_ms=<n> battery=<0|1>
-//! dock=<0|1> swept=<n> -> PASS|FAIL ::` (the boot's first build), `[desktop] torn down why=<w> bar_off=<0|1>`.
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+//! dock=<0|1> swept=<n> -> PASS|FAIL ::` (the boot's first build), `[desktop] torn down why=<w> bar_off=<0|1>`. MEMLINE (B677): the built line ends `heap_kb= high_kb= furniture_kb= high_delta_pct=` (the tail's section).
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}}; // MEMLINE (B677): AtomicI64 for the delta. LINE-NEUTRAL append, code first
 
 static BUILT: AtomicBool = AtomicBool::new(false);
 /// `ms().max(1)` of the build's ask (`login ok`), `0` = no build owed.
@@ -41,7 +41,7 @@ pub fn built() -> bool { #[cfg(all(target_arch = "x86_64", feature = "wc"))] ste
 /// Ask for the desktop (`why` = `login ok` or `stage`). Idempotent while one is built or owed.
 pub fn build(why: &'static str) {
     if !BUILT.load(Acquire) && OWED_AT.compare_exchange(0, crate::arch::ms().max(1), AcqRel, Relaxed).is_ok() {
-        AT_LOGIN.store(why == "login ok", Relaxed);
+        AT_LOGIN.store(why == "login ok", Relaxed); mem_ask(); // MEMLINE (B677): the heap's high-water window opens at the ask. LINE-NEUTRAL append, code first
         probe_reset();
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
@@ -113,13 +113,13 @@ fn say(bar_ms: u64) {
     let no_source = super::status::source() == super::status::Source::None;
     let battery = if bar && has_batt { "painted" } else if no_source { "absent" } else { "unpainted" };
     let dock = super::dock::owns_pixels();
-    let at_login = AT_LOGIN.load(Relaxed);
+    let at_login = AT_LOGIN.load(Relaxed); let m = mem_note(); // MEMLINE (B677): the build's memory, read at its line. LINE-NEUTRAL append, code first
     serial_println!(
-        "[desktop] built at={} bar_ms={} battery={} dock={} pins={} held_ms={} batt_ms={} gap_max_ms={}",
+        "[desktop] built at={} bar_ms={} battery={} dock={} pins={} held_ms={} batt_ms={} gap_max_ms={} heap_kb={} high_kb={} furniture_kb={} high_delta_pct={}",
         if at_login { "login ok" } else { "stage" }, bar_ms, battery, if dock { "painted" } else { "unpainted" }, super::dock::pins_pinned(),
-        HELD_MS.load(Relaxed), BATT_MS.load(Relaxed), GAP_MAX_MS.load(Relaxed) // KVMLAT2 (B576): where the bar's span went
+        HELD_MS.load(Relaxed), BATT_MS.load(Relaxed), GAP_MAX_MS.load(Relaxed), m.heap_kb, m.high_kb, Kb(m.furniture_kb), m.delta_pct // KVMLAT2 (B576): where the bar's span went
     ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] steps::say(bar_ms); // FIRSTLOGIN (B636): `[desktop] bar steps=…`, only past STEPS_OVER_MS. LINE-NEUTRAL append, code first
-    if !FIRST_SAID.swap(true, AcqRel) {
+    if !FIRST_SAID.swap(true, AcqRel) { #[cfg(feature = "login")] crate::boot::oldest_say(); // OLDEST (rmbp-ledger B682, BP-bar-1): the boot's first build names the line's oldest machine and the net it had. LINE-NEUTRAL append, code first
         let prebuilt = PREBUILT.load(Relaxed);
         #[cfg(feature = "login")]
         let swept = super::crystal::login::swept_n();
@@ -129,7 +129,7 @@ fn say(bar_ms: u64) {
         serial_println!(
             ":: DESKTOPBUILT: prebuilt={} built_at={} bar_first_paint_ms={} battery={} dock={} swept={} -> {} ::",
             prebuilt as u8, if at_login { "login" } else { "stage" }, bar_ms, (battery == "painted") as u8, dock as u8, swept, crate::tests::boot_word(pass) // SMALLFIX7 (B501): a record at boot
-        );
+        ); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] crate::install::abimage::desktop_built(pass); // ABIMAGE (B683): a PASS on the loader's trial boot promotes KERNEL.NEW -> KERNEL.ELF. LINE-NEUTRAL append, code first
     }
 }
 
@@ -429,5 +429,139 @@ pub fn dongleboot_selftest() {
     serial_println!(
         ":: DONGLEBOOT: prefs_stat={} ahci_bound={} render_spin={} starter={} -> {} :: device={} wedge_ms={} {}",
         prefs_word, bound_word, spin_word, starter_word, if pass { "PASS" } else { "FAIL" }, dev, steps::RENDER_WEDGE_MS, census
+    );
+}
+
+// MEMLINE (rmbp-ledger B677; BP-bar-24 "the desktop costs what it draws … a memory line at `[desktop] built` ≤ 64 MB",
+// BP-bar-9 "Log Out then log in … the heap high-water returns"). Until this arc the bar's memory half had no line: the
+// kernel had a census (`allocator::heap_census`, EL0MEM) but no high-water, and the build said nothing about memory.
+// THE MECHANISM: the build's ASK ([`build`], the CAS that owes it) opens a high-water window in the allocator
+// ([`mem_ask`] → `allocator::heap_high_reset`); every granted allocation raises the mark under the heap lock; the
+// build's LINE ([`say`]) reads three numbers — `heap_kb` = the heap's `used` at the line, `high_kb` = the most the heap
+// held from the ask to the line (the kernel's whole heap, the back buffer included: the furniture's transients are
+// inside it), `furniture_kb` = the bytes of panel the furniture OWNS (every present `strip::rects` tenant, w x h x the
+// panel's bytes per pixel — the strips compose in a static scratch and write the scan-out, so their cost is the panel
+// they draw, not a heap surface; `?` = the panel writer was busy at the line). The FIRST build's `high_kb` is the
+// boot's reference; every later build (a Log Out then a log in, or the fixture's rebuild) prints `high_delta_pct` =
+// (high - first) x 100 / first, signed, truncated (the first build prints 0 against itself). The bar is 64 MB
+// (`BAR_KB`): `under=1` when `high_kb + furniture_kb <= BAR_KB` — reported, not enforced (QEMU's panel and heap are
+// not the bench's).
+// `tests memline`: a boot whose desktop was never built SKIPs; one with a second build already said (an operator's
+// Log Out then log in) scores that build (`src=logout`); otherwise the fixture rebuilds the DESKTOP OBJECT — the very
+// pair Log Out and login call, [`teardown`] then [`build`] — and waits (bounded) for its line (`src=rebuild`; the
+// session is not ended: the fixture cannot type a password on the bench). PASS = measured (a build line read after the
+// first, the panel read) and `logout_delta_pct <= 2`.
+// `:: MEMLINE: heap_kb=<n> high_kb=<n> furniture_kb=<n> bar_kb=65536 under=<0|1> logout_delta_pct=<n> -> PASS|FAIL ::
+// src=<logout|rebuild> builds=<n> first_high_kb=<n>`.
+/// MEMLINE (B677): the bar's memory line, in KiB (BP-bar-24: kernel + furniture ≤ 64 MB at the desktop).
+pub const BAR_KB: u64 = 64 * 1024;
+/// MEMLINE (B677): the fixture's rebuild gets this long to say its line (the build's own bounds: battery 500 ms, first
+/// paint 500 ms, plus the stage and pump gaps).
+const REBUILD_WAIT_MS: u64 = 3_000;
+/// The first build's high-water, bytes (`0` = no build said yet): the boot's reference.
+static MEM_FIRST_HIGH: AtomicU64 = AtomicU64::new(0);
+/// The last build's readings, bytes; `MEM_FURN` = `u64::MAX` when the panel writer was busy at the line.
+static MEM_USED: AtomicU64 = AtomicU64::new(0);
+static MEM_HIGH: AtomicU64 = AtomicU64::new(0);
+static MEM_FURN: AtomicU64 = AtomicU64::new(u64::MAX);
+static MEM_DELTA: AtomicI64 = AtomicI64::new(0);
+/// Build lines said this boot (every [`say`]).
+static MEM_BUILDS: AtomicU32 = AtomicU32::new(0);
+
+/// One build's memory, as its line prints it.
+struct MemLine {
+    heap_kb: u64,
+    high_kb: u64,
+    furniture_kb: Option<u64>,
+    delta_pct: i64,
+}
+
+/// `<n>` KiB, or `?` when the reading was refused.
+struct Kb(Option<u64>);
+
+impl core::fmt::Display for Kb {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "{}", n),
+            None => f.write_str("?"),
+        }
+    }
+}
+
+/// The build's ask: the heap's high-water window opens here.
+fn mem_ask() {
+    let _ = crate::allocator::heap_high_reset();
+}
+
+/// The panel bytes every present furniture strip owns (`None` = the panel writer busy: no geometry to ask with).
+fn furniture_bytes() -> Option<u64> {
+    let info = super::panel_info_nonblocking()?;
+    let mut rs = [None; super::strip::STRIP_MAX];
+    let _ = super::strip::rects(info.width, info.height, &mut rs);
+    Some(rs.iter().flatten().map(|&(_, _, w, h)| (w as u64) * (h as u64) * (info.bytes_per_pixel as u64)).sum())
+}
+
+/// `(now - first) x 100 / first`, signed, truncated; `0` with no reference.
+fn delta_pct(first: u64, now: u64) -> i64 {
+    if first == 0 {
+        return 0;
+    }
+    (now as i64 - first as i64) * 100 / first as i64
+}
+
+/// The build's line: read the heap and the furniture, fix the boot's reference on the first build, count the build.
+fn mem_note() -> MemLine {
+    let used = crate::allocator::heap_used() as u64;
+    let high = (crate::allocator::heap_high() as u64).max(used);
+    let furn = furniture_bytes();
+    let first = match MEM_FIRST_HIGH.compare_exchange(0, high.max(1), AcqRel, Acquire) {
+        Ok(_) => high.max(1),
+        Err(v) => v,
+    };
+    let delta = delta_pct(first, high);
+    MEM_USED.store(used, Relaxed);
+    MEM_HIGH.store(high, Relaxed);
+    MEM_FURN.store(furn.unwrap_or(u64::MAX), Relaxed);
+    MEM_DELTA.store(delta, Relaxed);
+    MEM_BUILDS.fetch_add(1, Release);
+    MemLine { heap_kb: used / 1024, high_kb: high / 1024, furniture_kb: furn.map(|b| b / 1024), delta_pct: delta }
+}
+
+/// MEMLINE (rmbp-ledger B677) — `tests memline`: the desktop's memory line and the Log Out round trip's high-water
+/// (the section above). `:: MEMLINE: heap_kb=<n> high_kb=<n> furniture_kb=<n> bar_kb=65536 under=<0|1>
+/// logout_delta_pct=<n> -> PASS|FAIL :: src=<logout|rebuild> builds=<n> first_high_kb=<n>`.
+pub fn memline_selftest() {
+    let builds0 = MEM_BUILDS.load(Acquire);
+    if builds0 == 0 {
+        serial_println!(":: MEMLINE: -> SKIP :: reason=no-desktop-built");
+        return;
+    }
+    let src = if builds0 >= 2 {
+        "logout"
+    } else {
+        if !settled() {
+            serial_println!(":: MEMLINE: -> SKIP :: reason=build-in-flight builds={}", builds0);
+            return;
+        }
+        teardown("memline");
+        build("memline");
+        let t0 = crate::arch::ms();
+        while MEM_BUILDS.load(Acquire) == builds0 && crate::arch::ms().saturating_sub(t0) < REBUILD_WAIT_MS {
+            #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+            service(); // no device-service pass off x86: drive the build and its read-back from here
+            crate::arch::sched::yield_now();
+        }
+        "rebuild"
+    };
+    let builds = MEM_BUILDS.load(Acquire);
+    let (used, high, furn, delta) = (MEM_USED.load(Relaxed), MEM_HIGH.load(Relaxed), MEM_FURN.load(Relaxed), MEM_DELTA.load(Relaxed));
+    let furn_read = furn != u64::MAX;
+    let (high_kb, furn_kb) = (high / 1024, if furn_read { furn / 1024 } else { 0 });
+    let measured = builds >= 2 && high > 0 && furn_read;
+    let under = high_kb + furn_kb <= BAR_KB;
+    let pass = measured && delta <= 2;
+    serial_println!(
+        ":: MEMLINE: heap_kb={} high_kb={} furniture_kb={} bar_kb={} under={} logout_delta_pct={} -> {} :: src={} builds={} first_high_kb={}",
+        used / 1024, high_kb, Kb(if furn_read { Some(furn_kb) } else { None }), BAR_KB, under as u8, delta, if pass { "PASS" } else { "FAIL" }, src, builds, MEM_FIRST_HIGH.load(Relaxed) / 1024
     );
 }

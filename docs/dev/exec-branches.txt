@@ -159,45 +159,45 @@ refs/heads/exec-orin18-aclsym              c8eb4038 FOLDED-BY-HAND a62188c9     
 refs/heads/exec-orin18-fslayout            059ccf1d FOLDED-BY-HAND 935d099a                  2026-09-06
 refs/heads/exec-orin18-layoutland          a6a44eec FOLDED-BY-HAND 777c31b0                  2026-09-06
 refs/heads/exec-orin18-panicloc            b476cea5 SUPERSEDED     c4286ff7                  2026-09-06
-refs/heads/exec-orin18-sdmmcrt             cdce5129 SUPERSEDED     3efde934                  2026-09-06
+refs/heads/exec-orin18-sdmmcrt             cdce5129 LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/remotes/origin/exec-orin17-dupguard   28899d5c SUPERSEDED     d78241fa                  2026-09-06
 refs/heads/exec-orin19-aclwit              f50538ae FOLDED-BY-HAND 9ca5103f                  2026-09-07
-refs/heads/exec-orin19-bootns              561c0436 SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin19-bootns              561c0436 LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/heads/exec-orin19-tearscope           76bf3267 FOLDED-BY-HAND f4a17e17                  2026-09-07
 refs/heads/exec-orin19-tickdefault         29027ed6 FOLDED-BY-HAND 98213b7f                  2026-09-07
 refs/heads/exec-orin20-bootidland          a04cc7be SUPERSEDED     b1885dbc                  2026-09-07
-refs/heads/exec-orin20-bootidlive          aec2c604 SUPERSEDED     3efde934                  2026-09-07
-refs/heads/exec-orin20-commentfix          e928202a SUPERSEDED     3efde934                  2026-09-07
-refs/heads/exec-orin20-doctruth            92b27b9b SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin20-bootidlive          aec2c604 LOST           docs/dev/OS/orin-queue.md 2026-10-19
+refs/heads/exec-orin20-commentfix          e928202a LOST           docs/dev/OS/orin-queue.md 2026-10-19
+refs/heads/exec-orin20-doctruth            92b27b9b LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/heads/exec-orin20-evqprint            720d3f76 FOLDED-BY-HAND 74518f1e                  2026-09-07
 refs/heads/exec-orin20-fitsland            086ec38d FOLDED-BY-HAND 51f06bea                  2026-09-07
 refs/heads/exec-orin20-fold                611ad85a FOLDED-BY-HAND 1d87c94a                  2026-09-07
 refs/heads/exec-orin20-integrate           5c1c242a FOLDED-BY-HAND b519cba2                  2026-09-07
-refs/heads/exec-orin20-integrate2          0f06d60c SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin20-integrate2          0f06d60c LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/heads/exec-orin20-panicloc            41e7fbf3 FOLDED-BY-HAND d1bc934c                  2026-09-07
 refs/heads/exec-orin20-panicregate         40dd57b1 FOLDED-BY-HAND d1bc934c                  2026-09-07
 refs/heads/exec-orin20-specarm             f99cd024 FOLDED-BY-HAND 0898fb92                  2026-09-07
 refs/heads/exec-orin20-unafsgrow           74b7f21b FOLDED-BY-HAND eb98ba90                  2026-09-07
 refs/heads/exec-orin20-unafsroot           c3abd946 SUPERSEDED     06759190                  2026-09-07
 refs/heads/exec-orin20-witnessgap          5cb571f9 FOLDED-BY-HAND df64ef5f                  2026-09-07
-refs/heads/exec-orin21-claimcheck          aec2c604 SUPERSEDED     3efde934                  2026-09-07
-refs/remotes/origin/exec-orin20-bootidlive aec2c604 SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin21-claimcheck          aec2c604 LOST           docs/dev/OS/orin-queue.md 2026-10-19
+refs/remotes/origin/exec-orin20-bootidlive aec2c604 LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/remotes/origin/exec-orin20-fitsland   086ec38d FOLDED-BY-HAND 51f06bea                  2026-09-07
-refs/remotes/origin/exec-orin20-integrate2 0f06d60c SUPERSEDED     3efde934                  2026-09-07
+refs/remotes/origin/exec-orin20-integrate2 0f06d60c LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/remotes/origin/exec-orin20-unafsgrow  74b7f21b FOLDED-BY-HAND eb98ba90                  2026-09-07
-refs/remotes/origin/exec-orin21-c15knobs   aec2c604 SUPERSEDED     3efde934                  2026-09-07
-refs/remotes/origin/exec-orin21-claimcheck aec2c604 SUPERSEDED     3efde934                  2026-09-07
-refs/heads/exec-orin21-c15knobs            8db9691c SUPERSEDED     3efde934                  2026-09-08
-refs/heads/exec-orin21-fold                6cf9f13b SUPERSEDED     3efde934                  2026-09-08
+refs/remotes/origin/exec-orin21-c15knobs   aec2c604 LOST           docs/dev/OS/orin-queue.md 2026-10-19
+refs/remotes/origin/exec-orin21-claimcheck aec2c604 LOST           docs/dev/OS/orin-queue.md 2026-10-19
+refs/heads/exec-orin21-c15knobs            8db9691c LOST           docs/dev/OS/orin-queue.md 2026-10-19
+refs/heads/exec-orin21-fold                6cf9f13b LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/heads/exec-orin21-lawsnom             f86cf448 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/heads/exec-orin21-ledger              fc1a2d52 FOLDED-BY-HAND 56423204                  2026-09-22
-refs/heads/exec-orin21-recon               6cf9f13b SUPERSEDED     3efde934                  2026-09-08
+refs/heads/exec-orin21-recon               6cf9f13b LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/heads/exec-orin21-rekey               3894fdc9 LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/heads/exec-orin21-tearfold            45870e80 LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/heads/exec-orin22-lawsnom2            66523c05 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/heads/exec-orin22-matrixpar           5c1f13d0 FOLDED-BY-HAND 83dbb1e1                  2026-09-22
 refs/heads/exec-orin23-ga10b4              e7c8eb24 SUPERSEDED     f2794266                  2026-09-08
-refs/remotes/origin/exec-orin21-fold       6cf9f13b SUPERSEDED     3efde934                  2026-09-08
+refs/remotes/origin/exec-orin21-fold       6cf9f13b LOST           docs/dev/OS/orin-queue.md 2026-10-19
 refs/remotes/origin/exec-orin21-lawsnom    f86cf448 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/remotes/origin/exec-orin21-ledger     fc1a2d52 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/remotes/origin/exec-orin21-rekey      3894fdc9 LOST           docs/dev/OS/orin-queue.md 2026-10-19
@@ -540,11 +540,29 @@ refs/heads/exec-rmbp-clockx86     1719fe54 IN-FLIGHT cloud wave36 CLOCKX86 (B618
 refs/heads/exec-rmbp-qemuclass1   78d878a0 FOLDED-BY-HAND 0bf68bb9 (the fold commit carries CLOCKX86's message by the seat's error; the QEMUCLASS1 message is on the next fold commit)
 refs/heads/exec-rmbp-qemuclass2   729dddb7 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/remotes/origin/exec-rmbp-local-keplercut 5b1be6a9 FOLDED-BY-HAND 45e03964 2026-10-19
-refs/heads/exec-rmbp-contrast   0bf68bb9 IN-FLIGHT cloud wave36 CONTRAST (B664)
+refs/heads/exec-rmbp-contrast   a18f9237 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-winkey     0ffa91b6 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/remotes/origin/exec-orin22-keep13      51f06bea WIP-SURVIVOR - 2026-10-19
-refs/heads/exec-rmbp-fpu        e2a6a6ca IN-FLIGHT cloud wave36 FPU (B666)
-refs/heads/exec-rmbp-gatesteal2 b3543ae5 IN-FLIGHT cloud wave36 GATESTEAL2 (B657 B667) (Opus)
-refs/heads/exec-rmbp-winedge2   b3543ae5 IN-FLIGHT cloud wave36 WINEDGE2 (B659 B668)
-refs/heads/exec-rmbp-wifimac    b3543ae5 IN-FLIGHT cloud wave36 WIFIMAC (B669)
-refs/heads/exec-rmbp-hidstall2b  b3543ae5 IN-FLIGHT cloud wave36 HIDSTALL2 (B670)
+refs/heads/exec-rmbp-fpu        d4cd016f FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-gatesteal2 272ace72 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-winedge2   d399b021 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-wifimac    25bcc638 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-hidstall2b 941715a8 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-k2p 78f2e833 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-idlenet 5e9b7026 IN-FLIGHT cloud wave36 IDLENET
+refs/heads/exec-rmbp-settingsmap 74775a01 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-toastcap 050749b0 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-a11ytree 5e9b7026 IN-FLIGHT cloud wave36 A11YTREE
+refs/heads/exec-rmbp-glyphs e0932932 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-memline 8133fe47 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-applaunch b55a7bc2 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-uninstall 09eec873 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-nameindextx 4fca865b FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-reask 5e9b7026 IN-FLIGHT cloud wave36 REASK
+refs/heads/exec-rmbp-oldest afe12146 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-abimage d218b9bc FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-volkey     2303f8fb FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-wxn64 5e9b7026 IN-FLIGHT cloud wave36 WXN64
+refs/heads/exec-rmbp-shimmeridle 72f50c42 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
+refs/heads/exec-rmbp-uvccam 5e9b7026 IN-FLIGHT cloud wave36 UVCCAM
+refs/heads/exec-rmbp-ptpcam 5e9b7026 IN-FLIGHT cloud wave36 PTPCAM

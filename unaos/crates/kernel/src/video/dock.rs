@@ -3422,6 +3422,26 @@ fn dp_write(mask: u32) -> Result<usize, alloc::string::String> {
     crate::prefs_client::pref_set(crate::prefs::NS, crate::prefs::key::DOCK_PINS, crate::prefs::PrefValue::Str(v)).map(|_| n).map_err(|e| alloc::format!("bus status {}", e)) // SETTINGSBUS (B337): a PrefSet over the bus
 }
 
+/// UNINSTALL (rmbp-ledger B679): the stored `system.dock.pins` text, or the default set rendered when the key is
+/// unset — the list a pin edit starts from (read through the bus, as [`dp_load`]).
+pub fn pins_text() -> alloc::string::String {
+    crate::prefs_client::sys_text(crate::prefs::key::DOCK_PINS).unwrap_or_else(|| dp_render(DP_ALL))
+}
+
+/// UNINSTALL (rmbp-ledger B679): the dock forgets app `name` — its table bit cleared (a table app) and its item
+/// dropped from the stored `system.dock.pins` text (any app: the text is the store, the mask only its parse), the
+/// rest of the list kept in its order. Persisted through the bus like [`dp_write`]. `true` = a pin was removed.
+pub fn unpin_app(name: &str) -> bool {
+    let bit = DP_PINS.iter().position(|s| s.name.eq_ignore_ascii_case(name)).map(|i| 1u32 << i).unwrap_or(0);
+    let had_bit = bit != 0 && DP_MASK.fetch_and(!bit, Ordering::AcqRel) & bit != 0;
+    let text = pins_text();
+    let kept: alloc::vec::Vec<&str> = text.split(|c| c == ',' || c == '\n').map(|t| t.trim()).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(name)).collect();
+    let had_text = text.split(|c| c == ',' || c == '\n').any(|t| t.trim().eq_ignore_ascii_case(name));
+    let saved = if had_text || had_bit { crate::prefs_client::pref_set(crate::prefs::NS, crate::prefs::key::DOCK_PINS, crate::prefs::PrefValue::Str(kept.join(","))).is_ok() } else { true };
+    serial_println!("[dock] uninstall unpin app={} table={} listed={} saved={}", name, had_bit as u8, had_text as u8, saved as u8);
+    (had_bit || had_text) && saved
+}
+
 /// Read `system.dock.pins` into the mask. Unset or no known name = the default set. Returns names loaded (0 = default).
 fn dp_load() -> u32 {
     // SETTINGSBUS (B337): the pins are read with a PrefGet over the bus (the store loads on its first verb).

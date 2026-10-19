@@ -5,7 +5,7 @@ the USB classes in-tree (storage, PTP/MTP, UVC, audio), its files visible, its f
 vendor gate decides what the user's own devices may say to each other." Peter's case is his Sony mirrorless:
 in PC-Remote mode it speaks PTP plus Sony's vendor ops (live view, shutter); in every mode its card is
 readable over PTP/MTP. The bar row is BP-bar-25 (`docs/dev/blueprint/bar.md`); the storage-sheet row is
-BP-storage-15.
+BP-storage-18.
 
 Code: `unaos/crates/kernel/src/drivers/xhci/ptp.rs` (the class driver, CHARTER Comscan — driver),
 `unaos/crates/kernel/src/fs/ptpfs.rs` (the volume, CHARTER Matrix — fs-core), the hot-plug seam at the tail

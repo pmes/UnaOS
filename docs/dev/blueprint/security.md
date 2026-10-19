@@ -23,6 +23,7 @@
 | BP-security-11 | The kernel keeps no secret and answers no Holocron verb; the formats, ring and policy are `holocron_core`, one implementation. | `unaos/crates/kernel/src/keyring.rs:4-12` | compile |
 | BP-security-12 | A workaround that weakens a protection (SMEP, NXE, WXN, page permissions, checksums) is a STOP tripwire, never an executor's call. | `docs/dev/LAWS.md` §3 STOP tripwires | review; `:: WXAUDIT-CORES …` (`unaos/crates/kernel/src/arch/x86_64/smp.rs:199`) |
 | BP-security-13 | The SATA write capability needs a minted grant on one port and LBA range (RAII hold, `-EPERM` without it) AND the operator's typed token for an install write. | `unaos/crates/kernel/src/install/ahciroot.rs:9-12`; `unaos/scripts/image-line.env:13-17` | `tests ahciw` |
+| BP-security-14 | The volume key is the USER's: one random 32-byte data key per volume, kept only WRAPPED (Argon2id of the login secret at the slot's costs, SYS_KDF's call; and the 24-word recovery key, HKDF) behind ChaCha20-Poly1305 tags; the recovery words come from the kernel RNG, are shown once and are never written or sent; an unwrapped key is wiped on drop and the kernel keeps none (BP-security-11). | `unaos/libs/fs/unafs/src/keyslot.rs:330`; `unaos/crates/kernel/src/keyring.rs:717` | `tests volkey` (`wrapped=1 … sends=0`) |
 
 ## 3. Seams
 - Identity flows: `login` → `users::login` → `boot::session_opened` → loader stamps (`slot_user_stamp`/`session_restamp`).
