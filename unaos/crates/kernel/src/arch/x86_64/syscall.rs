@@ -25055,7 +25055,7 @@ fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
     }
     let row = caller_row();
     let cgen = SLOT_GEN[row].load(Ordering::Acquire);
-    busx_msend_for(row, cgen, &frame)
+    let rc = busx_msend_for(row, cgen, &frame); #[cfg(feature = "wc")] busx_open_sent(row, &frame, rc); rc // ONEINSTANCE2 (rmbp-ledger B751): an accepted REQUEST is a call IN FLIGHT until its reply is received — an OPEN_ARG met meanwhile is held, not lost (file tail); LINE-NEUTRAL fold, code before this line's first `//`.
 }
 
 /// SYS_MRECV(buf_ptr, buf_len) — dequeue the oldest reply (blocking while empty). `buf_len` must cover
@@ -25076,7 +25076,7 @@ fn sys_mrecv(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 { // PREFCHANGED (B5
         return e;
     }
     loop {
-        if let Some(msg) = busx_mbox_pop(row) {
+        #[cfg(feature = "wc")] let popped = busx_open_pop(row, flags == una_abi::MRECV_NOWAIT); #[cfg(not(feature = "wc"))] let popped = busx_mbox_pop(row); if let Some(msg) = popped { // ONEINSTANCE2 (rmbp-ledger B751): the pop that holds an OPEN_ARG across a call in flight and hands it out on the receive after (file tail); knob-off the trunk's pop. LINE-NEUTRAL fold, code before this line's first `//`.
             if let Err(e) = copy_to_user(buf_ptr, &msg.frame) {
                 return e; // unreachable after the up-front check; fail closed
             }
@@ -32017,4 +32017,173 @@ fn busx_open_arg_to(row: usize, body: &[u8]) -> i64 {
         return EAGAIN;
     }
     busx_reply_enqueue(row, 0, una_abi::BUS_VERB_OPEN_ARG, 0, body)
+}
+
+// ONEINSTANCE2 (rmbp-ledger B751; BP-ring3-18) — TAIL-APPENDED, so no line above moves. ONEINSTANCE's two owed x86 items.
+// (a) Quarry's program opener asks the one-instance check FIRST ([`oneinstance_open_arg`]: the gate itself, argv
+// `[prog, file]`), so a running program is raised and handed the file as the same OPEN_ARG frame a launch sends.
+// (b) An OPEN_ARG enqueued while its program is INSIDE a blocking bus call (it sent a REQUEST and waits in SYS_MRECV for
+// that reply; its skip loop drops every other frame) is HELD, not lost: `BUSX_OPEN` counts each row's calls in flight
+// (+1 when SYS_MSEND accepts a REQUEST, -1 when SYS_MRECV hands out a REPLY that answers an ask); while one is in
+// flight a popped OPEN_ARG waits in the row's one-frame hold (a newer one replaces it — the bound), and it goes out
+// on the first receive with nothing in flight, or on a NOWAIT receive that finds the queue empty (the frame loop's
+// drain, never inside a call). Generation-stamped: a new tenant starts with nothing held and nothing in flight.
+
+/// [`oneinstance_gate`] for Quarry's opener (`quarry::live::openers::program_running`): `Some(delivered rc)` = `prog`
+/// was running and is raised, `file` handed to it as one OPEN_ARG; `None` = not running (the opener launches it).
+/// The caller scopes the user's verb (`origin::with(Glass, …)`).
+#[cfg(feature = "wc")]
+pub fn oneinstance_open_arg(prog: &str, file: &str) -> Option<i64> {
+    if oneinstance_gate(false, &[prog, file], None, false) {
+        Some(ONEINST_LAST_RC.load(Ordering::Acquire))
+    } else {
+        None
+    }
+}
+
+/// One row's hold: the generation it belongs to, its calls in flight, and the one OPEN_ARG held across them.
+#[cfg(feature = "wc")]
+struct BusxOpenHold {
+    tenancy: u64,
+    inflight: u32,
+    held: Option<BusxMsg>,
+}
+
+#[cfg(feature = "wc")]
+impl BusxOpenHold {
+    const EMPTY: Self = BusxOpenHold { tenancy: 0, inflight: 0, held: None };
+}
+
+/// The count's ceiling (a count past it only releases the hold early — the trunk's behaviour, never a loss of a reply).
+#[cfg(feature = "wc")]
+const BUSX_INFLIGHT_MAX: u32 = 64;
+
+/// Per-row holds, beside `BUSX_MBOX` (taken AFTER its row lock, never before; leaf).
+#[cfg(feature = "wc")]
+static BUSX_OPEN: crate::procslot::SlotVec<SpinMutex<BusxOpenHold>> = crate::procslot::SlotVec::new(|| SpinMutex::new(BusxOpenHold::EMPTY), SpinMutex::new(BusxOpenHold::EMPTY));
+
+/// A hold from another tenancy is reset to nothing.
+#[cfg(feature = "wc")]
+fn busx_open_fresh(h: &mut BusxOpenHold, cur: u64) {
+    if h.tenancy != cur {
+        *h = BusxOpenHold { tenancy: cur, inflight: 0, held: None };
+    }
+}
+
+/// Does this queued frame answer an ask (a REPLY that is not one of the kernel's corr-0 pushes)?
+#[cfg(feature = "wc")]
+fn busx_answers_ask(frame: &[u8]) -> bool {
+    if frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REPLY {
+        return false;
+    }
+    let push = frame[8..12] == [0u8; 4] && matches!(frame[6], crate::bus::BUS_VERB_NOTICE | una_abi::BUS_VERB_PREF_CHANGED | una_abi::BUS_VERB_OPEN_ARG);
+    !push
+}
+
+/// SYS_MSEND's fold: an accepted REQUEST (rc 0 — its reply is queued, or relayed to a fulfiller) is one call in flight.
+#[cfg(feature = "wc")]
+fn busx_open_sent(row: usize, frame: &[u8], rc: i64) {
+    if rc != 0 || frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REQUEST || row >= BUSX_MBOX.len() {
+        return;
+    }
+    let cur = SLOT_GEN[row].load(Ordering::Acquire);
+    let cell = &BUSX_OPEN[row];
+    let _irq = IrqGuard::mask_save();
+    let mut h = cell.lock();
+    busx_open_fresh(&mut h, cur);
+    h.inflight = (h.inflight + 1).min(BUSX_INFLIGHT_MAX);
+}
+
+/// The pop rule over one row's queue and hold (generation `cur`). See the block above.
+#[cfg(feature = "wc")]
+fn busx_open_take(mb: &mut BusxMbox, h: &mut BusxOpenHold, cur: u64, nowait: bool) -> Option<BusxMsg> {
+    busx_open_fresh(h, cur);
+    if h.inflight == 0 {
+        if let Some(m) = h.held.take() {
+            if m.rgen == cur {
+                return Some(m); // the receive after the call: the held OPEN_ARG, before anything queued behind it
+            }
+        }
+    }
+    while mb.count > 0 {
+        let head = mb.head;
+        let msg = mb.slots[head].take();
+        mb.head = (head + 1) % BUSX_MBOX_DEPTH;
+        mb.count -= 1;
+        let Some(m) = msg else { continue };
+        if m.rgen != cur {
+            continue; // a predecessor tenant's frame — discarded, as `busx_mbox_pop` does
+        }
+        if una_abi::open_arg_body(&m.frame).is_some() {
+            if h.inflight > 0 {
+                h.held = Some(m); // a call is in flight: held (one frame; the newer replaces the older)
+                continue;
+            }
+            return Some(m);
+        }
+        if busx_answers_ask(&m.frame) {
+            h.inflight = h.inflight.saturating_sub(1);
+        }
+        return Some(m);
+    }
+    if nowait {
+        if let Some(m) = h.held.take() {
+            if m.rgen == cur {
+                return Some(m); // the frame loop's drain: never inside a call
+            }
+        }
+    }
+    None
+}
+
+/// SYS_MRECV's pop (the fold): the queue and the hold, under the row's mailbox lock.
+#[cfg(feature = "wc")]
+fn busx_open_pop(row: usize, nowait: bool) -> Option<BusxMsg> {
+    let cur = SLOT_GEN[row].load(Ordering::Acquire);
+    let cell = &BUSX_OPEN[row];
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUSX_MBOX[row].lock();
+    let mut h = cell.lock();
+    busx_open_take(&mut mb, &mut h, cur, nowait)
+}
+
+/// `tests oneinstance` `pending=`: the pop rule over a LOCAL mailbox (no live row is touched). A call in flight, then
+/// two OPEN_ARGs and the call's reply queued: the reply comes first, then the newer OPEN_ARG, then nothing — and the
+/// count is back to 0. And with nothing in flight an OPEN_ARG goes straight out.
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn oneinstance_pending_selftest() -> bool {
+    let reply = |verb: u8, corr: u32, body: &[u8]| -> BusxMsg {
+        let mut f = alloc::vec![0u8; crate::bus::BUS_HDR_LEN + body.len()];
+        let _ = crate::bus::build_reply(verb, corr, 0, [0u8; 32], body, &mut f);
+        BusxMsg { rgen: 7, frame: f.into_boxed_slice() }
+    };
+    let push = |mb: &mut BusxMbox, m: BusxMsg| {
+        let tail = (mb.head + mb.count) % BUSX_MBOX_DEPTH;
+        mb.slots[tail] = Some(m);
+        mb.count += 1;
+    };
+    let arg_of = |m: &Option<BusxMsg>| m.as_ref().and_then(|m| una_abi::open_arg_body(&m.frame).map(|b| b.to_vec()));
+    let mut mb = BusxMbox::EMPTY;
+    let mut h = BusxOpenHold::EMPTY;
+    // The program sent PREF_GET (corr 0x51): one call in flight.
+    busx_open_fresh(&mut h, 7);
+    h.inflight = 1;
+    push(&mut mb, reply(una_abi::BUS_VERB_OPEN_ARG, 0, b"/home/a.txt"));
+    push(&mut mb, reply(una_abi::BUS_VERB_OPEN_ARG, 0, b"/home/b.txt"));
+    push(&mut mb, reply(una_abi::BUS_VERB_PREF_GET, 0x51, b"v"));
+    let r1 = busx_open_take(&mut mb, &mut h, 7, false);
+    let first_is_reply = r1.as_ref().is_some_and(|m| m.frame.len() >= crate::bus::BUS_HDR_LEN && m.frame[6] == una_abi::BUS_VERB_PREF_GET);
+    let r2 = busx_open_take(&mut mb, &mut h, 7, false);
+    let second_is_arg = arg_of(&r2).as_deref() == Some(&b"/home/b.txt"[..]);
+    let r3 = busx_open_take(&mut mb, &mut h, 7, true);
+    let drained = r3.is_none() && h.inflight == 0 && h.held.is_none();
+    // Nothing in flight: straight out.
+    push(&mut mb, reply(una_abi::BUS_VERB_OPEN_ARG, 0, b"/home/c.txt"));
+    let r4 = busx_open_take(&mut mb, &mut h, 7, false);
+    let direct = arg_of(&r4).as_deref() == Some(&b"/home/c.txt"[..]);
+    let ok = first_is_reply && second_is_arg && drained && direct;
+    if !ok {
+        serial_println!("[bus] open_arg hold first_reply={} second_arg={} drained={} direct={}", first_is_reply as u8, second_is_arg as u8, drained as u8, direct as u8);
+    }
+    ok
 }
